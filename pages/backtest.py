@@ -103,7 +103,7 @@ def render():
         st.session_state["bt_stats"]  = compute_stats(trades_df)
 
         if bt_save_db:
-            save_backtest_results(trades_df.to_dict("records"))
+            save_backtest_results(trades_df)
             st.success("✅ Results saved to Supabase.")
 
     # ── Load saved if no in-memory results ────────────────────────────────────
