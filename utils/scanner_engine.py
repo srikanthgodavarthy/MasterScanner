@@ -45,6 +45,9 @@ def cci(close: pd.Series, period: int = 20) -> pd.Series:
 def highest(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(period).max()
 
+def lowest(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period).min()
+
 def sma(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(period).mean()
 
@@ -205,8 +208,10 @@ def score_stock(
     prev_close = c.iloc[-2] if len(c) >= 2 else cur_c
     chg = round(((cur_c - prev_close) / prev_close) * 100, 2) if prev_close else 0
 
-    # Relative strength vs Nifty (5-bar change diff)
-    rs = (c.diff(5).iloc[idx] or 0) - (nifty_aligned.diff(5).iloc[idx] or 0)
+    # Relative strength vs Nifty (5-bar change diff) — Pine: ta.change(c,5) - ta.change(nifty,5)
+    _c_chg5 = c.diff(5).iloc[idx]
+    _n_chg5 = nifty_aligned.diff(5).iloc[idx]
+    rs = (0.0 if pd.isna(_c_chg5) else float(_c_chg5)) - (0.0 if pd.isna(_n_chg5) else float(_n_chg5))
 
     # ── QUALIFICATION LAYER ──
     mom1  = (cur_c - c.iloc[-22]) / c.iloc[-22] * 100 if len(c) >= 22 else 0
@@ -257,9 +262,11 @@ def score_stock(
     score = round(score)
 
     # ── LEVELS ──
+    # Pine: sl = round(math.min(ta.lowest(c,10), en - atrVal * 1.2))
+    # ta.lowest(c,10) = lowest CLOSE of last 10 bars (Pine uses close, not low)
     en = round(cur_c)
-    sl_val = min(highest(l, 10).iloc[-1] if len(l) >= 10 else cur_c - cur_atr,
-                 en - cur_atr * 1.2)
+    lowest_c10 = lowest(c, 10).iloc[-1] if len(c) >= 10 else cur_c - cur_atr
+    sl_val = min(lowest_c10, en - cur_atr * 1.2)
     sl = round(sl_val)
     rk = en - sl
     t1 = round(en + rk)
@@ -313,13 +320,13 @@ def run_scanner(
     Runs the scanner on all symbols concurrently.
     Returns a sorted DataFrame ready for display.
     """
-    nifty = fetch_nifty("1y")
+    nifty = fetch_nifty("2y")
     results = []
     total = len(symbols)
     done = 0
 
     def process(sym):
-        df = fetch_ohlcv(sym, period="1y", interval="1d")
+        df = fetch_ohlcv(sym, period="2y", interval="1d")
         if df.empty:
             return None
         row = score_stock(df, nifty, cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os)
