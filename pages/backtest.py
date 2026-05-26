@@ -165,7 +165,7 @@ def render():
 
     PLOT_BG = dict(plot_bgcolor="#111827", paper_bgcolor="#111827",
                    font=dict(color="#94a3b8", family="JetBrains Mono"),
-                   margin=dict(l=10,r=10,t=10,b=10), height=280)
+                   margin=dict(l=10,r=10,t=10,b=10))
 
     with ch1:
         st.markdown("##### 📈 Cumulative PnL %")
@@ -176,7 +176,7 @@ def render():
             line=dict(color="#3b82f6", width=2),
             fillcolor="rgba(59,130,246,0.15)",
         ))
-        fig.update_layout(**PLOT_BG,
+        fig.update_layout(**PLOT_BG, height=280,
             xaxis=dict(showgrid=False, color="#334155"),
             yaxis=dict(showgrid=True, gridcolor="#1e293b", color="#334155"),
         )
