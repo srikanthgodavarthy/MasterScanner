@@ -314,7 +314,13 @@ def load_backtest_runs(limit: int = 5) -> list[dict]:
     except Exception as exc:
         logger.error("load_backtest_runs failed: %s", exc)
         return []
-
+        
+def load_backtest_summary(limit: int = 5) -> pd.DataFrame:
+    """Alias for load_backtest_runs, returns a DataFrame."""
+    rows = load_backtest_runs(limit=limit)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
 
 # ─── SCHEMA SQL ───────────────────────────────────────────────────────────────
 
