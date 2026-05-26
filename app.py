@@ -98,11 +98,13 @@ tab1, tab2, tab3 = st.tabs(["📡 Live Scanner", "📈 Backtest Engine", "⚙️
 from utils.scanner_engine import NIFTY500_SYMBOLS
 
 settings = {
-    "symbols": st.session_state.get("symbols",  NIFTY500_SYMBOLS),
-    "cci_len": st.session_state.get("cci_len",  20),
-    "cci_ob":  st.session_state.get("cci_ob",   100),
-    "cci_os":  st.session_state.get("cci_os",  -100),
-    "workers": st.session_state.get("workers",  10),
+    "symbols":      st.session_state.get("symbols",       NIFTY500_SYMBOLS),
+    "cci_len":      st.session_state.get("cci_len",       20),
+    "cci_ob":       st.session_state.get("cci_ob",        100),
+    "cci_os":       st.session_state.get("cci_os",       -100),
+    "workers":      st.session_state.get("workers",       10),
+    "auto_refresh": st.session_state.get("auto_refresh",  False),
+    "refresh_mins": st.session_state.get("refresh_mins",  5),
 }
 
 with tab1:
