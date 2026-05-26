@@ -175,6 +175,32 @@ def render() -> dict:
     else:
         st.caption("Enable Supabase to see scan history.")
 
+    # ── AUTO-REFRESH ──────────────────────────────────────────────────────────
+    st.subheader("🔄 Auto-Refresh")
+    ar_col1, ar_col2 = st.columns([1, 2])
+    with ar_col1:
+        auto_refresh = st.toggle(
+            "Enable auto-refresh",
+            value=st.session_state.get("auto_refresh", False),
+            help="Automatically re-runs the scanner at the chosen interval.",
+        )
+    with ar_col2:
+        refresh_mins = st.number_input(
+            "Interval (minutes)",
+            min_value=1,
+            max_value=60,
+            value=st.session_state.get("refresh_mins", 5),
+            step=1,
+            disabled=not auto_refresh,
+        )
+    if auto_refresh:
+        st.caption(
+            f"⏱ Scanner will auto-refresh every **{int(refresh_mins)} min** "
+            "when the Live Scanner tab is active."
+        )
+    st.session_state["auto_refresh"]  = bool(auto_refresh)
+    st.session_state["refresh_mins"]  = int(refresh_mins)
+
     # ── CACHE MANAGEMENT ──────────────────────────────────────────────────────
     st.subheader("🗑️ Cache Management")
     if st.button("Clear Data Cache"):
@@ -184,9 +210,11 @@ def render() -> dict:
 
     # Return settings for use by other pages
     return {
-        "symbols": symbols,
-        "cci_len": int(cci_len),
-        "cci_ob":  int(cci_ob),
-        "cci_os":  int(cci_os),
-        "workers": int(workers),
+        "symbols":      symbols,
+        "cci_len":      int(cci_len),
+        "cci_ob":       int(cci_ob),
+        "cci_os":       int(cci_os),
+        "workers":      int(workers),
+        "auto_refresh": bool(auto_refresh),
+        "refresh_mins": int(refresh_mins),
     }
