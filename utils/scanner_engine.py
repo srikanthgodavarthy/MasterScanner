@@ -22,6 +22,17 @@ warnings.filterwarnings("ignore")
 
 
 # ══════════════════════════════════════════════════════════════════
+#  INDEX TIMEZONE HELPER
+# ══════════════════════════════════════════════════════════════════
+
+def _strip_tz(index: pd.Index) -> pd.Index:
+    """Return a tz-naive DatetimeIndex regardless of input timezone."""
+    if hasattr(index, "tz") and index.tz is not None:
+        return index.tz_convert("UTC").tz_localize(None)
+    return index
+
+
+# ══════════════════════════════════════════════════════════════════
 #  INDICATOR HELPERS
 # ══════════════════════════════════════════════════════════════════
 
@@ -262,7 +273,7 @@ def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.Dat
         df = ticker.history(period=period, interval=interval, auto_adjust=True)
         if df.empty or len(df) < 60:
             return pd.DataFrame()
-        df.index = pd.to_datetime(df.index)
+        df.index = _strip_tz(pd.to_datetime(df.index))
         df.columns = [c.lower() for c in df.columns]
         return df[["open", "high", "low", "close", "volume"]]
     except Exception:
@@ -300,7 +311,7 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") 
             df = df.dropna(how="all")
             if df.empty or len(df) < 60:
                 continue
-            df.index = pd.to_datetime(df.index)
+            df.index = _strip_tz(pd.to_datetime(df.index))
             df.columns = [c.lower() for c in df.columns]
             result[sym] = df[["open", "high", "low", "close", "volume"]]
         except Exception:
@@ -312,7 +323,9 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") 
 def fetch_nifty(period: str = "1y") -> pd.Series:
     try:
         df = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
-        return df["Close"].rename("nifty")
+        nifty = df["Close"].rename("nifty")
+        nifty.index = _strip_tz(pd.to_datetime(nifty.index))
+        return nifty
     except Exception:
         return pd.Series(dtype=float)
 
@@ -383,7 +396,11 @@ def score_stock(
     trend_down = cur_c < cur_e200 and cur_e20 < cur_e50
 
     # ── RELATIVE STRENGTH vs Nifty (5-bar) ───────────────────────
-    nifty_aligned = nifty.reindex(c.index, method="ffill")
+    # Ensure both indexes are tz-naive before reindexing
+    _c_index   = _strip_tz(c.index)
+    _nifty     = nifty.copy()
+    _nifty.index = _strip_tz(_nifty.index)
+    nifty_aligned = _nifty.reindex(_c_index, method="ffill")
     rs = np.nan
     if len(c) >= 6 and not nifty_aligned.empty:
         c5    = float(c.iloc[-6])
