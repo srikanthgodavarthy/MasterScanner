@@ -5,6 +5,7 @@ Renders the sorted table and persists results to Supabase.
 
 import streamlit as st
 import pandas as pd
+import time
 from datetime import datetime
 
 from utils.scanner_engine import (
@@ -89,20 +90,27 @@ def render(settings: dict) -> None:
     Parameters
     ----------
     settings : dict with keys
-        symbols  : list[str]
-        cci_len  : int
-        cci_ob   : int
-        cci_os   : int
-        workers  : int
+        symbols       : list[str]
+        cci_len       : int
+        cci_ob        : int
+        cci_os        : int
+        workers       : int
+        auto_refresh  : bool   ← NEW
+        refresh_mins  : int    ← NEW
     """
     st.title("⚡ NSE Master Scanner Pro")
 
-    symbols  = settings.get("symbols",  NIFTY500_SYMBOLS)
-    cci_len  = settings.get("cci_len",  20)
-    cci_ob   = settings.get("cci_ob",   100)
-    cci_os   = settings.get("cci_os",  -100)
-    workers  = settings.get("workers",  10)
+    symbols      = settings.get("symbols",      NIFTY500_SYMBOLS)
+    cci_len      = settings.get("cci_len",      20)
+    cci_ob       = settings.get("cci_ob",       100)
+    cci_os       = settings.get("cci_os",      -100)
+    workers      = settings.get("workers",      10)
+    auto_refresh = settings.get("auto_refresh", False)
+    refresh_secs = settings.get("refresh_mins", 5) * 60
 
+    supabase_ok = _is_available()
+
+    # ── TOP CONTROL BAR ───────────────────────────────────────────────────────
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         run_btn = st.button("🔍 Run Scanner", type="primary", use_container_width=True)
@@ -110,21 +118,30 @@ def render(settings: dict) -> None:
         save_label = st.text_input("Snapshot label (optional)", placeholder="e.g. morning scan")
     with col3:
         st.markdown("<br>", unsafe_allow_html=True)
-        supabase_ok = _is_available()
         st.caption("🟢 Supabase connected" if supabase_ok else "🔴 Supabase not configured")
+
+    # ── AUTO-REFRESH STATUS BADGE ─────────────────────────────────────────────
+    if auto_refresh:
+        st.info(
+            f"🔄 Auto-refresh **ON** — scanner reruns every "
+            f"**{settings.get('refresh_mins', 5)} min**. "
+            "Disable in ⚙️ Settings.",
+            icon="⏱",
+        )
 
     if run_btn:
         st.session_state.pop("scan_df", None)   # clear stale cache
+        st.session_state["last_auto_scan"] = time.time()
 
     if run_btn or "scan_df" not in st.session_state:
         prog = st.progress(0.0, text="Scanning…")
 
         with st.spinner("Fetching data and scoring stocks…"):
             df = run_scanner(
-                symbols   = symbols,
-                cci_len   = cci_len,
-                cci_ob    = cci_ob,
-                cci_os    = cci_os,
+                symbols     = symbols,
+                cci_len     = cci_len,
+                cci_ob      = cci_ob,
+                cci_os      = cci_os,
                 max_workers = workers,
                 progress_cb = lambda p: prog.progress(p, text=f"Scanning… {int(p*100)}%"),
             )
@@ -137,6 +154,7 @@ def render(settings: dict) -> None:
 
         st.session_state["scan_df"] = df
         st.session_state["scan_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        st.session_state.setdefault("last_auto_scan", time.time())
 
         # ── PERSIST TO SUPABASE ───────────────────────────────────────────────
         if supabase_ok:
@@ -146,7 +164,6 @@ def render(settings: dict) -> None:
                 st.success("✅ Scan results saved to Supabase.")
             else:
                 st.warning("⚠️ Supabase save failed — check logs.")
-        # ─────────────────────────────────────────────────────────────────────
 
     df = st.session_state.get("scan_df", pd.DataFrame())
     if df.empty:
@@ -155,6 +172,13 @@ def render(settings: dict) -> None:
 
     ts = st.session_state.get("scan_ts", "")
     st.caption(f"Last scan: {ts}  |  {len(df)} stocks scored")
+
+    # ── STOCK SEARCH ──────────────────────────────────────────────────────────
+    search_query = st.text_input(
+        "🔎 Search stock",
+        placeholder="Type symbol… e.g. RELIANCE, TCS, INFY",
+        help="Filters the table by symbol name (case-insensitive, partial match).",
+    )
 
     # ── FILTER BAR ────────────────────────────────────────────────────────────
     f1, f2, f3 = st.columns(3)
@@ -166,6 +190,11 @@ def render(settings: dict) -> None:
         min_score = st.slider("Min Score", 0, 145, 0)
 
     fdf = df.copy()
+
+    # Apply search first
+    if search_query.strip():
+        fdf = fdf[fdf["Stock"].str.contains(search_query.strip(), case=False, na=False)]
+
     if action_filter != "All":
         fdf = fdf[fdf["Action"] == action_filter]
     if cci_filter != "All":
@@ -177,28 +206,53 @@ def render(settings: dict) -> None:
     # ── TABLE ─────────────────────────────────────────────────────────────────
     _render_table(fdf, cci_ob, cci_os)
 
-    # ── WATCHLIST ADD ─────────────────────────────────────────────────────────
+    # ── WATCHLIST PANEL ───────────────────────────────────────────────────────
     st.divider()
-    st.subheader("➕ Add to Watchlist")
-    wl1, wl2, wl3 = st.columns([2, 3, 1])
-    with wl1:
-        wl_sym = st.text_input("Symbol", placeholder="e.g. RELIANCE")
-    with wl2:
-        wl_note = st.text_input("Note (optional)", placeholder="e.g. breakout setup")
-    with wl3:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("Add", use_container_width=True):
+    wl_col, add_col = st.columns([1, 1])
+
+    with wl_col:
+        st.subheader("⭐ Watchlist")
+        wl: list[dict] = st.session_state.get("watchlist", [])
+        if wl:
+            wl_df = pd.DataFrame(wl)
+            # keep only columns that exist
+            cols = [c for c in ["symbol", "notes"] if c in wl_df.columns]
+            wl_display = wl_df[cols].rename(
+                columns={"symbol": "Symbol", "notes": "Notes"}
+            )
+            st.dataframe(wl_display, use_container_width=True, hide_index=True)
+            # Quick-scan a watchlist stock: highlight it in results
+            wl_syms = [w["symbol"] for w in wl]
+            pick = st.selectbox("Highlight in table", ["— none —"] + wl_syms, key="wl_pick")
+            if pick != "— none —":
+                match = df[df["Stock"] == pick]
+                if not match.empty:
+                    st.markdown(f"**{pick} in current scan:**")
+                    _render_table(match, cci_ob, cci_os)
+                else:
+                    st.caption(f"{pick} not in last scan results.")
+        else:
+            st.info("Watchlist is empty — add stocks below or in ⚙️ Settings.")
+
+    with add_col:
+        st.subheader("➕ Add to Watchlist")
+        wl1, wl2 = st.columns([1, 1])
+        with wl1:
+            wl_sym = st.text_input("Symbol", placeholder="e.g. RELIANCE")
+        with wl2:
+            wl_note = st.text_input("Note (optional)", placeholder="e.g. breakout")
+        if st.button("Add to Watchlist", use_container_width=True):
             if wl_sym.strip():
+                sym = wl_sym.strip().upper()
                 if supabase_ok:
-                    ok = add_to_watchlist(wl_sym.strip().upper(), wl_note)
+                    ok = add_to_watchlist(sym, wl_note)
                     if ok:
-                        st.success(f"✅ {wl_sym.upper()} added to watchlist.")
+                        st.success(f"✅ {sym} added to watchlist.")
+                        st.session_state.pop("watchlist_loaded", None)  # force reload
                     else:
                         st.error("❌ Failed to add — check Supabase.")
                 else:
-                    # Fallback: session_state only
                     wl = st.session_state.setdefault("watchlist", [])
-                    sym = wl_sym.strip().upper()
                     if sym not in [w["symbol"] for w in wl]:
                         wl.append({"symbol": sym, "notes": wl_note})
                         st.success(f"✅ {sym} added (session only — Supabase not configured).")
@@ -216,3 +270,23 @@ def render(settings: dict) -> None:
         file_name=f"scanner_{ts.replace(':', '-').replace(' ', '_')}.csv",
         mime="text/csv",
     )
+
+    # ── AUTO-REFRESH COUNTDOWN ────────────────────────────────────────────────
+    if auto_refresh and "scan_df" in st.session_state:
+        last = st.session_state.get("last_auto_scan", time.time())
+        elapsed = time.time() - last
+        remaining = max(0, int(refresh_secs - elapsed))
+
+        countdown_box = st.empty()
+        if remaining > 0:
+            countdown_box.caption(
+                f"🔄 Auto-refresh in **{remaining // 60}m {remaining % 60:02d}s** "
+                f"— or press **Run Scanner** to refresh now."
+            )
+            time.sleep(1)
+            st.rerun()
+        else:
+            countdown_box.caption("🔄 Auto-refreshing now…")
+            st.session_state.pop("scan_df", None)
+            st.session_state["last_auto_scan"] = time.time()
+            st.rerun()
