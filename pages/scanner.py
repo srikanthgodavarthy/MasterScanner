@@ -41,7 +41,7 @@ def _sidebar_controls():
         )
 
         st.markdown("---")
-        auto_refresh = st.checkbox("⏱ Auto Refresh (5 min)", value=False, key="sc_auto_refresh")
+        auto_refresh = st.checkbox("⏱ Auto Refresh (0.5 min)", value=False, key="sc_auto_refresh")
         save_to_db   = st.checkbox("💾 Save to Supabase",    value=True,  key="sc_save_db")
 
         st.markdown("---")
@@ -287,5 +287,5 @@ def render():
             st.info("Watchlist is empty.")
 
     if cfg["auto_refresh"]:
-        time.sleep(300)
+        time.sleep(30)
         st.rerun()
