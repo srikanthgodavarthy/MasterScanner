@@ -27,7 +27,34 @@ def _cell(val: str, bg: str, fg: str = "#ffffff") -> str:
     return f'<span style="background:{bg};color:{fg};padding:2px 6px;border-radius:4px">{val}</span>'
 
 
-def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int) -> None:
+# Maps display header name → DataFrame column name (for numeric sort)
+_SORT_COLS = {
+    "Stock":     "Stock",
+    "Score":     "Score",
+    "Action":    "Action",
+    "CCI":       "CCI",
+    "CCI State": "CCI State",
+    "CCI Sig":   "CCI Sig",
+    "Qual":      "Qual",
+    "%Chg":      "%Chg",
+    "Entry":     "Entry",
+    "SL":        "SL",
+    "T1":        "T1",
+    "T2":        "T2",
+    "T3":        "T3",
+}
+
+_HEADERS = ["#", "Stock", "Score", "Action", "CCI", "CCI State",
+            "CCI Sig", "Qual", "%Chg", "Entry", "SL", "T1", "T2", "T3"]
+
+
+def _render_table(
+    df: pd.DataFrame,
+    cci_ob: int,
+    cci_os: int,
+    sort_col: str = "Score",
+    sort_asc: bool = False,
+) -> None:
     """Render coloured HTML table matching the TradingView Pine Script style."""
     rows_html = []
     for rank, (_, row) in enumerate(df.iterrows(), start=1):
@@ -63,13 +90,22 @@ def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int) -> None:
             f"</tr>"
         )
 
+    def _th(h: str) -> str:
+        if h == "#":
+            return '<th style="min-width:28px">#</th>'
+        active = (h == sort_col)
+        arrow  = (" ▲" if sort_asc else " ▼") if active else ""
+        style  = (
+            'style="cursor:default;background:#1e3a5f;color:#60a5fa;'
+            'border-bottom:2px solid #3b82f6"'
+            if active else
+            'style="cursor:default"'
+        )
+        return f"<th {style}>{h}{arrow}</th>"
+
     header = (
         "<thead><tr>"
-        + "".join(
-            f"<th>{h}</th>"
-            for h in ["#","Stock","Score","Action","CCI","CCI State",
-                      "CCI Sig","Qual","%Chg","Entry","SL","T1","T2","T3"]
-        )
+        + "".join(_th(h) for h in _HEADERS)
         + "</tr></thead>"
     )
     table_html = (
@@ -203,8 +239,34 @@ def render(settings: dict) -> None:
 
     st.markdown(f"**{len(fdf)} stocks** match filters")
 
+    # ── SORT CONTROLS ─────────────────────────────────────────────────────────
+    sc1, sc2 = st.columns([3, 1])
+    with sc1:
+        sort_col = st.selectbox(
+            "Sort by",
+            options=list(_SORT_COLS.keys()),
+            index=list(_SORT_COLS.keys()).index(
+                st.session_state.get("sort_col", "Score")
+            ),
+            key="sort_col_select",
+            label_visibility="collapsed",
+        )
+    with sc2:
+        sort_asc = st.toggle(
+            "Ascending",
+            value=st.session_state.get("sort_asc", False),
+            key="sort_asc_toggle",
+        )
+    st.session_state["sort_col"] = sort_col
+    st.session_state["sort_asc"] = sort_asc
+
+    # Apply sort to filtered df
+    df_col = _SORT_COLS.get(sort_col, "Score")
+    if df_col in fdf.columns:
+        fdf = fdf.sort_values(df_col, ascending=sort_asc)
+
     # ── TABLE ─────────────────────────────────────────────────────────────────
-    _render_table(fdf, cci_ob, cci_os)
+    _render_table(fdf, cci_ob, cci_os, sort_col=sort_col, sort_asc=sort_asc)
 
     # ── WATCHLIST PANEL ───────────────────────────────────────────────────────
     st.divider()
@@ -228,7 +290,7 @@ def render(settings: dict) -> None:
                 match = df[df["Stock"] == pick]
                 if not match.empty:
                     st.markdown(f"**{pick} in current scan:**")
-                    _render_table(match, cci_ob, cci_os)
+                    _render_table(match, cci_ob, cci_os, sort_col=sort_col, sort_asc=sort_asc)
                 else:
                     st.caption(f"{pick} not in last scan results.")
         else:
