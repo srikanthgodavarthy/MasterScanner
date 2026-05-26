@@ -10,6 +10,7 @@ Fixed to daily-chart mode (equivalent to Pine Script "Swing" mode):
   trailFactor = 2.0
   scoreThreshold adaptive: 65 / 70 / 75 based on ATR trend-strength ratio
   maxScore = 175  (CCI adds up to +20 over original 155)
+  Tier 1 Prime bonus: +20 when all five structural conditions align
 """
 
 import pandas as pd
@@ -107,8 +108,8 @@ def last_value(series: pd.Series) -> float:
 
 def ichimoku(high: pd.Series, low: pd.Series):
     """Returns tenkan, kijun, senkouA, senkouB."""
-    tenkan  = (highest(high, 9)  + lowest(low, 9))  / 2
-    kijun   = (highest(high, 26) + lowest(low, 26)) / 2
+    tenkan   = (highest(high, 9)  + lowest(low, 9))  / 2
+    kijun    = (highest(high, 26) + lowest(low, 26)) / 2
     senkou_a = (tenkan + kijun) / 2
     senkou_b = (highest(high, 52) + lowest(low, 52)) / 2
     return tenkan, kijun, senkou_a, senkou_b
@@ -200,7 +201,7 @@ def detect_abcd(pivots_price, pivots_is_high, close_val, open_val, prev_high):
         valid_bc and valid_cd
     )
 
-    valid_struct = dP > cP and dP > bP and dP > aP
+    valid_struct   = dP > cP and dP > bP and dP > aP
     bearish_candle = (close_val < open_val) or (prev_high is not None and close_val < prev_high)
     abcd_bear = (
         aH and (not bH) and cH and (not dH) and
@@ -272,8 +273,6 @@ NIFTY500_SYMBOLS = [
 # ══════════════════════════════════════════════════════════════════
 #  DATA FETCHING
 # ══════════════════════════════════════════════════════════════════
-
-# ── PER-SYMBOL FALLBACK (used by backtest; scanner uses batch fetch) ──────────
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
@@ -350,15 +349,15 @@ def score_stock(
     cci_len:  int   = 20,
     cci_ob:   int   = 100,
     cci_os:   int   = -100,
-    pvt_lb:   int   = 20,    # pivotDyn for Swing = max(i_pvtLB=8, 20) = 20
-    atr_prox: float = 0.3,   # i_atrProx
+    pvt_lb:   int   = 20,
+    atr_prox: float = 0.3,
 ) -> dict:
     """
     Full port of Pine Script f() scoring + all signal logic.
     Mode fixed to Swing (daily chart).
     Returns dict ready for scanner table, or {} on failure.
     """
-    if df.empty or len(df) < 210:   # need ~200 bars for EMA200 + Ichimoku
+    if df.empty or len(df) < 210:
         return {}
 
     c = df["close"]
@@ -370,7 +369,7 @@ def score_stock(
     e20      = ema(c, 20)
     e50      = ema(c, 50)
     e200     = ema(c, 200)
-    rsi_val  = rsi(c, 21)           # rsiLenDyn = 21 in Swing mode
+    rsi_val  = rsi(c, 21)
     atr_val  = atr(h, l, c, 14)
     cci_val  = cci(c, cci_len)
     vol_avg  = sma(v, 20)
@@ -406,10 +405,9 @@ def score_stock(
     trend_down = cur_c < cur_e200 and cur_e20 < cur_e50
 
     # ── RELATIVE STRENGTH vs Nifty (5-bar) ───────────────────────
-    # Ensure both indexes are tz-naive before reindexing
-    _c_index   = _strip_tz(c.index)
-    _nifty     = nifty.copy()
-    _nifty.index = _strip_tz(_nifty.index)
+    _c_index      = _strip_tz(c.index)
+    _nifty        = nifty.copy()
+    _nifty.index  = _strip_tz(_nifty.index)
     nifty_aligned = _nifty.reindex(_c_index, method="ffill")
     rs = np.nan
     if len(c) >= 6 and not nifty_aligned.empty:
@@ -421,20 +419,19 @@ def score_stock(
     rs = 0.0 if np.isnan(rs) else rs
 
     # ── FIBONACCI LEVELS ─────────────────────────────────────────
-    # Use last 60 bars for swing high/low (pivotDyn = 20 → lookback window)
     lookback = min(pvt_lb * 3, len(c) - 1)
-    sw_hi = float(h.iloc[-lookback:].max())
-    sw_lo = float(l.iloc[-lookback:].min())
+    sw_hi    = float(h.iloc[-lookback:].max())
+    sw_lo    = float(l.iloc[-lookback:].min())
     fib_rng  = sw_hi - sw_lo
 
-    fib236   = sw_hi - fib_rng * 0.236
-    fib382   = sw_hi - fib_rng * 0.382
-    fib500   = sw_hi - fib_rng * 0.500
-    fib618   = sw_hi - fib_rng * 0.618
-    fib786   = sw_hi - fib_rng * 0.786
-    fib_ext127 = sw_hi + fib_rng * 0.272   # 127.2% extension
-    fib_ext161 = sw_hi + fib_rng * 0.618   # 161.8% extension
-    fib_ext261 = sw_hi + fib_rng * 1.618   # 261.8% extension
+    fib236     = sw_hi - fib_rng * 0.236
+    fib382     = sw_hi - fib_rng * 0.382
+    fib500     = sw_hi - fib_rng * 0.500
+    fib618     = sw_hi - fib_rng * 0.618
+    fib786     = sw_hi - fib_rng * 0.786
+    fib_ext127 = sw_hi + fib_rng * 0.272
+    fib_ext161 = sw_hi + fib_rng * 0.618
+    fib_ext261 = sw_hi + fib_rng * 1.618
 
     in_golden = (
         cur_c >= fib618 - cur_atr * atr_prox and
@@ -444,20 +441,19 @@ def score_stock(
     near_ext161 = abs(cur_c - fib_ext161) < cur_atr * atr_prox
 
     # ── CCI SIGNALS ───────────────────────────────────────────────
-    cci_cross_up_os  = prev_cci <= cci_os  and cur_cci > cci_os   # oversold recovery
-    cci_cross_dn_ob  = prev_cci >= cci_ob  and cur_cci < cci_ob   # overbought exit
-    cci_extended     = cur_cci > cci_ob * 2                        # e.g. > +200
-    cci_weakening    = cur_cci < prev_cci  and cur_cci > 0         # falling but above 0
+    cci_cross_up_os = prev_cci <= cci_os and cur_cci > cci_os   # oversold recovery
+    cci_cross_dn_ob = prev_cci >= cci_ob and cur_cci < cci_ob   # overbought exit
+    cci_extended    = cur_cci > cci_ob * 2                       # e.g. > +200
+    cci_weakening   = cur_cci < prev_cci and cur_cci > 0         # falling but above 0
 
-    # CCI-confirmed golden zone (price at fib + CCI oversold)
+    # CCI-confirmed golden zone
     in_golden_cci = in_golden and cur_cci <= cci_os
 
-    # ── PIVOT DETECTION (for harmonics/ABCD) ─────────────────────
+    # ── PIVOT DETECTION ──────────────────────────────────────────
     pvt_lb_use = min(pvt_lb, len(c) // 4)
     ph = pivot_high(h, pvt_lb_use)
     pl = pivot_low(l, pvt_lb_use)
 
-    # Build pivot list (newest first, max 8)
     pivots = []
     for i in range(len(c) - 1, -1, -1):
         if not np.isnan(ph.iloc[i]):
@@ -470,16 +466,13 @@ def score_stock(
     pv_prices  = [p[0] for p in pivots]
     pv_is_high = [p[1] for p in pivots]
 
-    # Harmonic
     harm_dir, harm_name = detect_harmonic(pv_prices, pv_is_high)
     harm_bull = harm_dir == "bull"
     harm_bear = harm_dir == "bear"
 
-    # ABCD
     abcd_bull, abcd_bear = detect_abcd(pv_prices, pv_is_high, cur_c, cur_o, prev_h)
 
     # ── SCORE CALCULATION ─────────────────────────────────────────
-    # Pine Script maxScore = 175 (Swing mode, all components)
     bull_score = 0.0
 
     # Trend (Pine: trendUp ? 25)
@@ -488,47 +481,46 @@ def score_stock(
     # EMA alignment (Pine: e20>e50 → +30, near → +20)
     bull_score += 30 if cur_e20 > cur_e50 else (20 if cur_e20 > cur_e50 * 0.995 else 0)
 
-    # RSI (Pine: r>60→25, >55→20, >50→15, >45→5)
+    # RSI
     bull_score += (25 if cur_r > 60 else 20 if cur_r > 55 else 15 if cur_r > 50 else 5 if cur_r > 45 else 0)
 
-    # Volume (Pine: v>avg*1.2→20, v>avg→10)
+    # Volume
     bull_score += (20 if cur_v > cur_vavg * 1.2 else 10 if cur_v > cur_vavg else 0)
 
-    # Breakout (Pine: c>hh→25, c>hh*0.98→15)  — hh = highest close 10 bars ago
+    # Breakout — hh = highest close 10 bars ago
     hh = float(highest(c, 10).iloc[-2]) if len(c) >= 11 else cur_c
     bull_score += (25 if cur_c > hh else 15 if cur_c > hh * 0.98 else 0)
 
-    # Momentum (Pine: change(c,2)>0 → +10)
+    # Momentum
     bull_score += 10 if len(c) >= 3 and (c.iloc[-1] > c.iloc[-3]) else 0
 
-    # Relative Strength (Pine: rs>0→15, rs>-0.5→5)
-    bull_score += (15 if rs > 0 else 5 if rs > -0.005 else 0)   # rs is a ratio diff
+    # Relative Strength
+    bull_score += (15 if rs > 0 else 5 if rs > -0.005 else 0)
 
-    # Fibonacci Golden Zone (Pine: inGolden → +30)
+    # Fibonacci Golden Zone
     bull_score += 30 if in_golden else 0
 
-    # Fib Extension penalties (Pine: nearE127 → -20, nearE161 → -30)
+    # Fib Extension penalties
     bull_score += -20 if near_ext127 else (-30 if near_ext161 else 0)
 
-    # CCI contribution (Pine: <OS→+20, <0→+10, >OB*2→-15)
+    # CCI contribution
     bull_score += (20 if cur_cci < cci_os else 10 if cur_cci < 0 else -15 if cci_extended else 0)
 
-    # CCI cross-up bonus (Pine: cciCrossUpOS → +15 effectively via isFibBuy_CCI path)
+    # CCI cross-up bonus
     bull_score += 15 if cci_cross_up_os else 0
 
-    # CCI extended penalty (Pine: cciExtended → -10 additional)
+    # CCI extended additional penalty
     bull_score -= 10 if cci_extended else 0
 
-    # ── QUALIFICATION LAYER (Pine: strongHTF + trendStrength) ─────
-    mom1 = (cur_c / float(c.iloc[-22]) - 1) * 100 if len(c) >= 22 else 0
-    mom3 = (cur_c / float(c.iloc[-64]) - 1) * 100 if len(c) >= 64 else 0
+    # ── QUALIFICATION LAYER ───────────────────────────────────────
+    mom1 = (cur_c / float(c.iloc[-22])  - 1) * 100 if len(c) >= 22  else 0
+    mom3 = (cur_c / float(c.iloc[-64])  - 1) * 100 if len(c) >= 64  else 0
     mom6 = (cur_c / float(c.iloc[-127]) - 1) * 100 if len(c) >= 127 else 0
 
     strong_htf   = mom1 > 5 and mom3 > 10 and mom6 > 15
     trend_strong = cur_c > cur_e20 and cur_e20 > cur_e50
     qualified    = strong_htf and trend_strong
 
-    # Pine: qualified → +25, not_qualified → -10
     bull_score += 25 if qualified else -10
 
     # Harmonic / ABCD boosts
@@ -537,22 +529,39 @@ def score_stock(
     if abcd_bull:
         bull_score += 15
 
-    # Ichimoku cloud filter (Pine: allowCloudBuy = aboveCloud or (insideCloud and normX>=65))
-    cloud_penalty = -15 if below_cloud else 0
-    bull_score += cloud_penalty
+    # Ichimoku cloud penalty
+    bull_score += -15 if below_cloud else 0
 
-    # Normalise (maxScore = 175 + harmonic 20 + abcd 15 = 210 absolute max,
-    # but Pine uses 175 as normalization ceiling — keep consistent)
+    # ── TIER 1 PRIME — combination bonus ──────────────────────────
+    # Requires ALL five structural conditions simultaneously:
+    #   trend_up + in_golden + cci_cross_up_os + qualified + above_cloud
+    #
+    # This is the rarest, highest-conviction setup in the engine.
+    # The +20 bonus reflects that no single component grants this alone —
+    # it rewards the convergence of price structure, trend, momentum
+    # catalyst, HTF qualification, and cloud position all aligning.
+    is_tier1_prime = (
+        trend_up        and   # EMA stack: price > EMA200, EMA20 > EMA50
+        in_golden       and   # price inside 50–61.8% fib retracement
+        cci_cross_up_os and   # CCI crossed up through -100 on this bar
+        qualified       and   # mom1>5%, mom3>10%, mom6>15% + trend_strong (⭐)
+        above_cloud           # price above Ichimoku cloud top
+    )
+    bull_score += 20 if is_tier1_prime else 0
+
+    # ── NORMALISE ─────────────────────────────────────────────────
+    # maxScore ceiling kept at 175 for consistent normalisation.
+    # Tier 1 bonus + harmonic + abcd can push raw above 175 → capped at 100.
     max_score  = 175
     norm_score = min(100, int(bull_score * 100 / max_score))
 
-    # ── ADAPTIVE SCORE THRESHOLD (Pine: trendStrength ratio) ──────
+    # ── ADAPTIVE SCORE THRESHOLD ──────────────────────────────────
     atr_sma = float(sma(atr_val, 20).iloc[-1])
     trend_strength_ratio = cur_atr / atr_sma if atr_sma > 0 else 1.0
     score_threshold = 65 if trend_strength_ratio > 1.2 else (75 if trend_strength_ratio < 0.8 else 70)
 
     # ── BUY TYPE CLASSIFICATION ───────────────────────────────────
-    is_fib_buy_base = trend_up and in_golden  and norm_score >= score_threshold
+    is_fib_buy_base = trend_up and in_golden and norm_score >= score_threshold
     is_fib_buy_cci  = trend_up and in_golden_cci and norm_score >= 55 and cci_cross_up_os
     is_fib_buy      = is_fib_buy_base or is_fib_buy_cci
     is_abcd_buy     = trend_up and abcd_bull
@@ -560,17 +569,29 @@ def score_stock(
     is_norm_buy     = trend_up and norm_score >= 65 and not in_golden and not cci_extended
     is_cci_buy      = trend_up and cci_cross_up_os and norm_score >= 55
 
-    # Cloud gate (Pine: buyRaw requires allowCloudBuy)
+    # Cloud gate
     allow_cloud_buy = above_cloud or (inside_cloud and norm_score >= 65)
 
-    any_buy = (is_fib_buy or is_abcd_buy or is_harm_buy or is_norm_buy or is_cci_buy) and allow_cloud_buy
+    any_buy = (
+        is_fib_buy or is_abcd_buy or is_harm_buy or is_norm_buy or is_cci_buy
+    ) and allow_cloud_buy
+
+    # ── TIER CLASSIFICATION ───────────────────────────────────────
+    # Tier 1  — all five pillars align simultaneously (rarest)
+    # Tier 2  — any valid buy signal fires (moderate frequency)
+    # Other   — watch / skip territory
+    tier = (
+        "Tier 1" if is_tier1_prime else
+        "Tier 2" if any_buy        else
+        "Other"
+    )
 
     # ── SELL SIGNALS ──────────────────────────────────────────────
     ema_confirmed_down = cur_e20 < cur_e50
-    recent_sw_hi = float(highest(h, pvt_lb_use * 2).iloc[-1])
-    not_breaking_out = cur_c < recent_sw_hi * 1.005
+    recent_sw_hi       = float(highest(h, pvt_lb_use * 2).iloc[-1])
+    not_breaking_out   = cur_c < recent_sw_hi * 1.005
 
-    prev_c = float(c.iloc[-2]) if len(c) >= 2 else cur_c
+    prev_c          = float(c.iloc[-2]) if len(c) >= 2 else cur_c
     fib_sell_rej127 = prev_h >= fib_ext127 and cur_c < fib_ext127
     fib_sell_rej161 = prev_h >= fib_ext161 and cur_c < fib_ext161
 
@@ -580,39 +601,36 @@ def score_stock(
     is_abcd_sell = ema_confirmed_down and abcd_bear and not_breaking_out
 
     # ── CCI STATE & SIGNAL ────────────────────────────────────────
-    cci_state  = ("OB"   if cur_cci >= cci_ob  else
-                  "OS"   if cur_cci <= cci_os  else
-                  "BULL" if cur_cci > 0        else "BEAR")
-    cci_signal = ("BUY"  if cci_cross_up_os  else
-                  "EXIT" if cci_cross_dn_ob  else
-                  "EXT"  if cci_extended     else "-")
+    cci_state  = ("OB"   if cur_cci >= cci_ob else
+                  "OS"   if cur_cci <= cci_os else
+                  "BULL" if cur_cci > 0       else "BEAR")
+    cci_signal = ("BUY"  if cci_cross_up_os else
+                  "EXIT" if cci_cross_dn_ob else
+                  "EXT"  if cci_extended    else "-")
 
     # ── HIGH PROB ZONE ────────────────────────────────────────────
     high_prob_buy  = trend_up and in_golden and norm_score >= 55
-    high_prob_sell = ema_confirmed_down and (fib_sell_rej127 or fib_sell_rej161 or cci_cross_dn_ob) and below_cloud and not_breaking_out
+    high_prob_sell = (
+        ema_confirmed_down and
+        (fib_sell_rej127 or fib_sell_rej161 or cci_cross_dn_ob) and
+        below_cloud and not_breaking_out
+    )
 
-    # ── TRADE LEVELS ─────────────────────────────────────────────
-    # Pine (Swing mode): atrSLmult=2.5, atrSLwide=4.0
-    # rawSL = entry - atr * 2.5 * 0.85
-    # minSL = entry - atr * 4.0
-    # maxSL = entry - atr * 1.5
-    en   = round(cur_c)
+    # ── TRADE LEVELS ──────────────────────────────────────────────
+    en     = round(cur_c)
     raw_sl = en - cur_atr * 2.5 * 0.85
     min_sl = en - cur_atr * 4.0
     max_sl = en - cur_atr * 1.5
-    sl   = round(max(min_sl, min(raw_sl, max_sl)))
-    rk   = max(en - sl, cur_atr * 0.5)
-    t1   = round(en + rk)
-    t2   = round(en + rk * 2)
-    t3   = round(en + rk * 3)
+    sl     = round(max(min_sl, min(raw_sl, max_sl)))
+    rk     = max(en - sl, cur_atr * 0.5)
+    t1     = round(en + rk)
+    t2     = round(en + rk * 2)
+    t3     = round(en + rk * 3)
 
     # ── ACTION & QUAL ─────────────────────────────────────────────
-    action = "✅ BUY" if norm_score >= score_threshold else ("👁 WATCH" if norm_score >= 50 else "⛔ SKIP")
-
-    # Enhanced qual: star = qualified + any_buy, tick = qualified, cross = not
+    action    = "✅ BUY" if norm_score >= score_threshold else ("👁 WATCH" if norm_score >= 50 else "⛔ SKIP")
     qual_icon = "⭐" if (qualified and any_buy) else ("✔" if qualified else "✖")
 
-    # Detailed buy type tag for display
     buy_type = (
         "Fib+CCI" if is_fib_buy_cci  else
         "Fib"     if is_fib_buy_base else
@@ -622,12 +640,13 @@ def score_stock(
         "Norm"    if is_norm_buy      else "-"
     )
 
-    # %Change
     prev_close = float(c.iloc[-2]) if len(c) >= 2 else cur_c
     chg = round(((cur_c - prev_close) / prev_close) * 100, 2) if prev_close else 0
 
     return {
-        "Stock":        None,   # filled by caller
+        # ── display columns ───────────────────────────────────────
+        "Stock":        None,          # filled by caller
+        "Tier":         tier,
         "Score":        norm_score,
         "Action":       action,
         "Buy Type":     buy_type,
@@ -641,22 +660,23 @@ def score_stock(
         "T1":           t1,
         "T2":           t2,
         "T3":           t3,
-        # internals for colouring / debug
-        "_qualified":   qualified,
-        "_high_prob":   high_prob_buy,
-        "_in_golden":   in_golden,
-        "_in_golden_cci": in_golden_cci,
-        "_above_cloud": above_cloud,
-        "_inside_cloud": inside_cloud,
-        "_harm_bull":   harm_bull,
-        "_abcd_bull":   abcd_bull,
-        "_any_buy":     any_buy,
-        "_rsi":         round(cur_r, 1),
-        "_mom1":        round(mom1, 1),
-        "_mom3":        round(mom3, 1),
-        "_cci_raw":     cur_cci,
-        "_fib618":      round(fib618),
-        "_fib500":      round(fib500),
+        # ── internals for colouring / debug ──────────────────────
+        "_qualified":      qualified,
+        "_high_prob":      high_prob_buy,
+        "_in_golden":      in_golden,
+        "_in_golden_cci":  in_golden_cci,
+        "_above_cloud":    above_cloud,
+        "_inside_cloud":   inside_cloud,
+        "_harm_bull":      harm_bull,
+        "_abcd_bull":      abcd_bull,
+        "_any_buy":        any_buy,
+        "_tier1_prime":    is_tier1_prime,
+        "_rsi":            round(cur_r, 1),
+        "_mom1":           round(mom1, 1),
+        "_mom3":           round(mom3, 1),
+        "_cci_raw":        cur_cci,
+        "_fib618":         round(fib618),
+        "_fib500":         round(fib500),
     }
 
 
@@ -664,31 +684,29 @@ def score_stock(
 #  BATCH SCANNER
 # ══════════════════════════════════════════════════════════════════
 
-# Batch size for yf.download — sweet spot between request overhead & response size
 _BATCH_SIZE = 100
 
 
 def run_scanner(
     symbols:     list,
-    cci_len:     int   = 20,
-    cci_ob:      int   = 100,
-    cci_os:      int   = -100,
-    max_workers: int   = 10,
-    progress_cb  = None,
+    cci_len:     int  = 20,
+    cci_ob:      int  = 100,
+    cci_os:      int  = -100,
+    max_workers: int  = 10,
+    progress_cb       = None,
 ) -> pd.DataFrame:
     """
     Two-phase scanner:
       Phase 1 (0 → 0.5): batch-download OHLCV in chunks of _BATCH_SIZE symbols.
-                          ~10-20x fewer HTTP requests vs per-symbol fetching.
-      Phase 2 (0.5 → 1): parallel scoring with ThreadPoolExecutor (CPU-bound).
+      Phase 2 (0.5 → 1): parallel scoring with ThreadPoolExecutor.
     """
-    total   = len(symbols)
+    total     = len(symbols)
     n_batches = max(1, (total + _BATCH_SIZE - 1) // _BATCH_SIZE)
 
-    # ── PHASE 1 — Batch data download ────────────────────────────────────────
+    # ── PHASE 1 — Batch data download ────────────────────────────
     all_data: dict = {}
     for batch_i, start in enumerate(range(0, total, _BATCH_SIZE)):
-        chunk = tuple(symbols[start : start + _BATCH_SIZE])
+        chunk      = tuple(symbols[start : start + _BATCH_SIZE])
         batch_data = fetch_batch_ohlcv(chunk, period="1y", interval="1d")
         all_data.update(batch_data)
         if progress_cb:
@@ -696,7 +714,7 @@ def run_scanner(
 
     nifty = fetch_nifty("1y")
 
-    # ── PHASE 2 — Parallel scoring (no network I/O) ───────────────────────────
+    # ── PHASE 2 — Parallel scoring ────────────────────────────────
     results = []
     done    = 0
 
