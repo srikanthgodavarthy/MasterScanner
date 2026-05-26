@@ -1,224 +1,71 @@
 """
-NSE Master Scanner Engine
-Complete port of Pine Script "STOCK ANALYSER v5 + CCI" to Python.
+utils/scanner_engine.py
+=======================
+Drop-in replacement for the original NSE Master Scanner Engine.
 
-Fixed to daily-chart mode (equivalent to Pine Script "Swing" mode):
-  emaFastLen = 50,  emaSlowLen = 200
-  atrSLmult  = 2.5, atrSLwide  = 4.0
-  cciLenDyn  = 20,  rsiLenDyn  = 21
-  pivotDyn   = max(pvtLB, 20) = 20
-  trailFactor = 2.0
-  scoreThreshold adaptive: 65 / 70 / 75 based on ATR trend-strength ratio
-  maxScore = 175  (CCI adds up to +20 over original 155)
+Scoring is now focused EXCLUSIVELY on the Tier 1 Prime setup —
+the five simultaneous structural conditions that must ALL be True:
 
-Tier 1 Prime logic added:
-  is_tier1_prime = trend_up + in_golden + cci_cross_up_os + qualified + above_cloud
-  Earns +20 combination bonus, labelled "Fib+CCI★", action = "★ PRIME"
+    C1  trend_up        → price > EMA200  AND  EMA20 > EMA50
+    C2  in_golden       → price inside 50–61.8 % Fib retracement (± ATR buffer)
+    C3  cci_cross_up_os → CCI crossed UP through −100 on THIS bar
+    C4  qualified       → mom1>5%, mom3>10%, mom6>15%  AND  price>EMA20>EMA50
+    C5  above_cloud     → price above Ichimoku cloud top
+
+Score = 20 × (number of True conditions)  →  max 100
+Action:
+    100  → "★ PRIME"
+     80  → "⚡ NEAR PRIME"
+     60  → "👁 WATCH"
+    < 60 → "⛔ SKIP"
+
+Public API (unchanged from original engine so pages/scanner.py needs zero edits):
+    run_scanner(symbols, ...) → pd.DataFrame
+    score_stock(df, nifty, ...) → dict
+    fetch_ohlcv(symbol, ...) → pd.DataFrame
+    fetch_batch_ohlcv(symbols, ...) → dict
+    fetch_nifty(period) → pd.Series
+    score_color(score) → str
+    action_color(action) → str
+    cci_color(cci_val, ...) → str
+    NIFTY500_SYMBOLS → list[str]
 """
 
-import pandas as pd
+from __future__ import annotations
+
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import numpy as np
+import pandas as pd
 import yfinance as yf
 import streamlit as st
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import warnings
+
 warnings.filterwarnings("ignore")
 
 
 # ══════════════════════════════════════════════════════════════════
-#  INDEX TIMEZONE HELPER
+#  CONSTANTS
 # ══════════════════════════════════════════════════════════════════
 
-def _strip_tz(index: pd.Index) -> pd.Index:
-    """
-    Return a tz-naive, ns-resolution DatetimeIndex.
-    Handles two pandas 2.x incompatibilities in one place:
-      1. tz-aware  vs tz-naive  → strips timezone
-      2. datetime64[us] vs datetime64[ns] → normalises to ns
-    Both mismatches cause TypeError on reindex(..., method="ffill").
-    """
-    idx = pd.to_datetime(index)
-    if hasattr(idx, "tz") and idx.tz is not None:
-        idx = idx.tz_convert("UTC").tz_localize(None)
-    # as_unit("ns") is a pandas 2.0+ method; normalises us/ms/s → ns
-    if hasattr(idx, "as_unit"):
-        idx = idx.as_unit("ns")
-    return idx
+# Each of the 5 conditions contributes exactly 20 points.
+CONDITION_WEIGHT  = 20
+MAX_SCORE         = 100          # 5 × 20
+
+CCI_OVERSOLD      = -100         # threshold for cci_cross_up_os
+ATR_PROXIMITY     = 0.3          # ATR multiplier for golden-zone fuzzy band
+PIVOT_LOOKBACK    = 20           # bars used for swing high/low detection
+MIN_HISTORY_BARS  = 210          # minimum candles required to score a stock
+
+_BATCH_SIZE  = 100
+_MAX_WORKERS = 12
 
 
 # ══════════════════════════════════════════════════════════════════
-#  INDICATOR HELPERS
+#  NIFTY 500 UNIVERSE
 # ══════════════════════════════════════════════════════════════════
 
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-def sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(period).mean()
-
-def rsi(series: pd.Series, period: int = 21) -> pd.Series:
-    delta    = series.diff()
-    gain     = delta.clip(lower=0)
-    loss     = -delta.clip(upper=0)
-    avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
-    avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
-    rs       = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low  - close.shift()).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(com=period - 1, adjust=False).mean()
-
-def cci(close: pd.Series, period: int = 20) -> pd.Series:
-    """Pine Script ta.cci() — vectorized MAD via cumulative sum trick."""
-    arr   = close.to_numpy(dtype=float)
-    n     = len(arr)
-    sma_v = np.full(n, np.nan)
-    mad_v = np.full(n, np.nan)
-    for i in range(period - 1, n):
-        window   = arr[i - period + 1 : i + 1]
-        m        = window.mean()
-        sma_v[i] = m
-        mad_v[i] = np.mean(np.abs(window - m))
-    sma_s = pd.Series(sma_v, index=close.index)
-    mad_s = pd.Series(mad_v, index=close.index).replace(0, np.nan)
-    return (close - sma_s) / (0.015 * mad_s)
-
-def highest(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(period).max()
-
-def lowest(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(period).min()
-
-def pivot_high(high: pd.Series, lb: int) -> pd.Series:
-    """Vectorized pivot high — centre-window rolling max (replaces Python loop)."""
-    roll_max = high.rolling(2 * lb + 1, center=True, min_periods=2 * lb + 1).max()
-    return high.where(high == roll_max)
-
-def pivot_low(low: pd.Series, lb: int) -> pd.Series:
-    """Vectorized pivot low — centre-window rolling min (replaces Python loop)."""
-    roll_min = low.rolling(2 * lb + 1, center=True, min_periods=2 * lb + 1).min()
-    return low.where(low == roll_min)
-
-def last_value(series: pd.Series) -> float:
-    """Last non-NaN value (ta.valuewhen equivalent)."""
-    valid = series.dropna()
-    return float(valid.iloc[-1]) if not valid.empty else np.nan
-
-def ichimoku(high: pd.Series, low: pd.Series):
-    """Returns tenkan, kijun, senkouA, senkouB."""
-    tenkan  = (highest(high, 9)  + lowest(low, 9))  / 2
-    kijun   = (highest(high, 26) + lowest(low, 26)) / 2
-    senkou_a = (tenkan + kijun) / 2
-    senkou_b = (highest(high, 52) + lowest(low, 52)) / 2
-    return tenkan, kijun, senkou_a, senkou_b
-
-
-# ══════════════════════════════════════════════════════════════════
-#  HARMONIC PATTERN DETECTION  (Pine Script port)
-# ══════════════════════════════════════════════════════════════════
-
-TOLERANCE = 0.03   # i_tolerance default
-
-def _in_range(val, target, tol=TOLERANCE):
-    return abs(val - target) <= tol
-
-def _retrace(a, b, c_):
-    leg1 = abs(b - a)
-    if leg1 == 0:
-        return np.nan
-    return abs(c_ - b) / leg1
-
-def _check_harmonic(xP, aP, bP, cP, dP, abR, bcLo, bcHi, cdR, xdR):
-    ab = _retrace(xP, aP, bP)
-    bc = _retrace(aP, bP, cP)
-    cd = _retrace(bP, cP, dP)
-    xd_den = abs(aP - xP)
-    xd = abs(dP - xP) / xd_den if xd_den != 0 else np.nan
-    if any(np.isnan(v) for v in [ab, bc, cd, xd]):
-        return False
-    return (
-        _in_range(ab, abR) and
-        bcLo - TOLERANCE <= bc <= bcHi + TOLERANCE and
-        _in_range(cd, cdR) and
-        _in_range(xd, xdR)
-    )
-
-def detect_pattern(xP, aP, bP, cP, dP):
-    if _check_harmonic(xP, aP, bP, cP, dP, 0.500, 0.382, 0.886, 3.618, 1.618):
-        return "Crab"
-    if _check_harmonic(xP, aP, bP, cP, dP, 0.786, 0.382, 0.886, 1.618, 1.272):
-        return "Butterfly"
-    if _check_harmonic(xP, aP, bP, cP, dP, 0.500, 0.382, 0.886, 1.618, 0.886):
-        return "Bat"
-    if _check_harmonic(xP, aP, bP, cP, dP, 0.618, 0.382, 0.886, 1.272, 0.786):
-        return "Gartley"
-    return ""
-
-def detect_harmonic(pivots_price, pivots_is_high):
-    """
-    pivots_price   : list of up to 8 recent pivot prices  (newest first)
-    pivots_is_high : list of bools (True = high pivot)
-    Returns ("bull"|"bear"|"", pattern_name)
-    """
-    if len(pivots_price) < 5:
-        return "", ""
-    dP, cP, bP, aP, xP = pivots_price[:5]
-    dH, cH, bH, aH, xH = pivots_is_high[:5]
-    # Bull XABCD: low-high-low-high-low
-    if (not xH) and aH and (not bH) and cH and (not dH):
-        name = detect_pattern(xP, aP, bP, cP, dP)
-        if name:
-            return "bull", name
-    # Bear XABCD: high-low-high-low-high
-    if xH and (not aH) and bH and (not cH) and dH:
-        name = detect_pattern(xP, aP, bP, cP, dP)
-        if name:
-            return "bear", name
-    return "", ""
-
-
-def detect_abcd(pivots_price, pivots_is_high, close_val, open_val, prev_high):
-    """
-    Returns (abcd_bull, abcd_bear)
-    """
-    if len(pivots_price) < 4:
-        return False, False
-    dP, cP, bP, aP = pivots_price[:4]
-    dH, cH, bH, aH = pivots_is_high[:4]
-
-    bc_r = _retrace(aP, bP, cP)
-    cd_r = _retrace(bP, cP, dP)
-    if np.isnan(bc_r) or np.isnan(cd_r):
-        return False, False
-
-    valid_bc = _in_range(bc_r, 0.618) or _in_range(bc_r, 0.786)
-    valid_cd = _in_range(cd_r, 1.272) or _in_range(cd_r, 1.618)
-
-    abcd_bull = (
-        (not aH) and bH and (not cH) and (not dH) and
-        valid_bc and valid_cd
-    )
-
-    valid_struct = dP > cP and dP > bP and dP > aP
-    bearish_candle = (close_val < open_val) or (prev_high is not None and close_val < prev_high)
-    abcd_bear = (
-        aH and (not bH) and cH and (not dH) and
-        valid_struct and bearish_candle and
-        valid_bc and valid_cd
-    )
-    return abcd_bull, abcd_bear
-
-
-# ══════════════════════════════════════════════════════════════════
-#  NIFTY 500 SYMBOL LIST
-# ══════════════════════════════════════════════════════════════════
-
-NIFTY500_SYMBOLS = [
+NIFTY500_SYMBOLS: list[str] = [
     "RELIANCE","TCS","HDFCBANK","ICICIBANK","INFY","SBIN","HINDUNILVR","ITC",
     "BAJFINANCE","KOTAKBANK","LT","AXISBANK","ASIANPAINT","MARUTI","WIPRO",
     "ULTRACEMCO","TITAN","NESTLEIND","SUNPHARMA","POWERGRID","ONGC","NTPC",
@@ -235,7 +82,7 @@ NIFTY500_SYMBOLS = [
     "BDL","BHARATFORG","BHEL","BHARTIARTL","BIKAJI","BIOCON","BSOFT","BLUEDART",
     "BLUESTARCO","BOSCHLTD","BRIGADE","CESC","CGPOWER","CRISIL","CANFINHOME",
     "CANBK","CAPLIPOINT","CARBORUNIV","CASTROLIND","CEATLTD","CENTRALBK","CDSL",
-    "CHAMBLFERT","CHOLAFIN","CUB","COALINDIA","COCHINSHIP","COFORGE","COLPAL",
+    "CHAMBLFERT","CHOLAFIN","CUB","COCHINSHIP","COFORGE","COLPAL",
     "CAMS","CONCOR","COROMANDEL","CROMPTON","CUMMINSIND","CYIENT","DLF","DOMS",
     "DABUR","DALBHARAT","DATAPATTNS","DEEPAKNTR","DELHIVERY","DEVYANI",
     "DIXON","LALPATHLAB","EIDPARRY","EIHOTEL","ELECON","ELGIEQUIP","EMAMILTD",
@@ -243,49 +90,111 @@ NIFTY500_SYMBOLS = [
     "FEDERALBNK","FINCABLES","FIVESTAR","FORCEMOT","FORTIS","GAIL","GMRAIRPORT",
     "GRSE","GICRE","GILLETTE","GLAND","GLAXO","GLENMARK","GODIGIT","GPIL",
     "GODFRYPHLP","GODREJCP","GODREJIND","GODREJPROP","GRANULES","GRAPHITE",
-    "GRAVITA","FLUOROCHEM","GMDCLTD","GSPL","HEG","HCLTECH","HDBFS","HDFCAMC",
-    "HDFCLIFE","HFCL","HAVELLS","HEROMOTOCO","HINDALCO","HINDCOPPER","HINDPETRO",
-    "HINDZINC","POWERINDIA","HOMEFIRST","HUDCO","ICICIBANK","ICICIGI","ICICIAMC",
-    "ICICIPRULI","IDFCFIRSTB","IIFL","IRB","IRCON","ITC","INDIAMART","INDIANB",
-    "IEX","INDHOTEL","IOC","IRCTC","IRFC","IREDA","IGL","INDUSTOWER","INDUSINDBK",
-    "NAUKRI","INFY","INOXWIND","INTELLECT","INDIGO","IPCALAB","JBCHEPHARM",
-    "JKCEMENT","JKTYRE","JMFINANCIL","JSWCEMENT","JSWENERGY","JSWINFRA","JSWSTEEL",
+    "GRAVITA","FLUOROCHEM","GMDCLTD","GSPL","HEG","HDBFS","HDFCAMC",
+    "HDFCLIFE","HFCL","HAVELLS","HINDCOPPER","HINDPETRO",
+    "HINDZINC","POWERINDIA","HOMEFIRST","HUDCO","ICICIGI","ICICIAMC",
+    "ICICIPRULI","IDFCFIRSTB","IIFL","IRB","IRCON","INDIAMART","INDIANB",
+    "IEX","INDHOTEL","IRCTC","IRFC","IREDA","IGL","INDUSTOWER",
+    "NAUKRI","INOXWIND","INTELLECT","INDIGO","IPCALAB","JBCHEPHARM",
+    "JKCEMENT","JKTYRE","JMFINANCIL","JSWCEMENT","JSWENERGY","JSWINFRA",
     "JPPOWER","JINDALSTEL","JIOFIN","JUBLFOOD","JUBLINGREA","JUBLPHARMA","KEI",
     "KPITTECH","KAJARIACER","KPIL","KALYANKJIL","KARURVYSYA","KAYNES","KEC",
-    "KFINTECH","KIRLOSENG","KOTAKBANK","KIMS","LTF","LTTS","LICHSGFIN","LTFOODS",
-    "LT","LATENTVIEW","LAURUSLABS","LICI","LINDEINDIA","LODHA","LUPIN","MRF",
-    "MGL","M&MFIN","M&M","MANAPPURAM","MRPL","MANKIND","MARICO","MFSL",
+    "KFINTECH","KIRLOSENG","KIMS","LTF","LTTS","LICHSGFIN","LTFOODS",
+    "LATENTVIEW","LAURUSLABS","LICI","LINDEINDIA","LODHA","LUPIN","MRF",
+    "MGL","M&MFIN","MANAPPURAM","MRPL","MANKIND","MARICO","MFSL",
     "MAXHEALTH","MAZDOCK","MINDACORP","MOTILALOFS","MPHASIS","MCX","MUTHOOTFIN",
-    "NATCOPHARM","NBCC","NCC","NHPC","NLCINDIA","NMDC","NTPCGREEN","NTPC","NH",
-    "NATIONALUM","NAVINFLUOR","NESTLEIND","NEULANDLAB","NEWGEN","OBEROIRLTY",
-    "ONGC","OIL","OLECTRA","OFSS","PCBL","PIIND","PNBHOUSING","PVRINOX",
+    "NATCOPHARM","NBCC","NCC","NHPC","NLCINDIA","NMDC","NTPCGREEN","NH",
+    "NATIONALUM","NAVINFLUOR","NEULANDLAB","NEWGEN","OBEROIRLTY",
+    "OIL","OLECTRA","OFSS","PCBL","PIIND","PNBHOUSING","PVRINOX",
     "PAGEIND","PATANJALI","PERSISTENT","PETRONET","PFIZER","PHOENIXLTD","PWL",
-    "PIDILITIND","PIRAMALFIN","POLYMED","POLYCAB","POONAWALLA","PFC","POWERGRID",
+    "PIDILITIND","PIRAMALFIN","POLYMED","POLYCAB","POONAWALLA","PFC",
     "PRESTIGE","PNB","RRKABEL","RBLBANK","RECLTD","RHIM","RITES","RADICO","RVNL",
-    "RAILTEL","RAINBOW","REDINGTON","RELIANCE","SBFC","SBICARD","SBILIFE","SJVN",
-    "SRF","MOTHERSON","SCHAEFFLER","SCHNEIDER","SCI","SHREECEM","SHRIRAMFIN",
-    "SIEMENS","SOBHA","SOLARINDS","SONACOMS","SBIN","SAIL","SUMICHEM","SUNPHARMA",
+    "RAILTEL","RAINBOW","REDINGTON","SBFC","SBICARD","SJVN",
+    "SRF","MOTHERSON","SCHAEFFLER","SCHNEIDER","SCI","SHRIRAMFIN",
+    "SIEMENS","SOBHA","SOLARINDS","SONACOMS","SAIL","SUMICHEM",
     "SUNTV","SUNDARMFIN","SUPREMEIND","SUZLON","SYNGENE","TVSMOTOR","TATACAP",
-    "TATACHEM","TATACOMM","TCS","TATACONSUM","TATAELXSI","TATAPOWER","TATASTEEL",
-    "TATATECH","TECHM","TEGA","TITAGARH","TITAN","TORNTPHARM","TORNTPOWER",
-    "TRENT","TRIDENT","TIINDIA","UPL","UTIAMC","ULTRACEMCO","UNIONBANK","UBL",
-    "VOLTAS","WELCORP","WELSPUNLIV","WIPRO","YESBANK","ZYDUSLIFE","ZYDUSWELL","ECLERX",
+    "TATACHEM","TATACOMM","TATACONSUM","TATAELXSI","TATAPOWER",
+    "TATATECH","TEGA","TITAGARH","TORNTPHARM","TORNTPOWER",
+    "TRENT","TRIDENT","TIINDIA","UTIAMC","UNIONBANK","UBL",
+    "VOLTAS","WELCORP","WELSPUNLIV","YESBANK","ZYDUSLIFE","ZYDUSWELL","ECLERX",
 ]
 
 
 # ══════════════════════════════════════════════════════════════════
-#  DATA FETCHING
+#  INDEX / TIMEZONE HELPER
+# ══════════════════════════════════════════════════════════════════
+
+def _strip_tz(index: pd.Index) -> pd.Index:
+    """Return tz-naive, ns-resolution DatetimeIndex (pandas 2.x safe)."""
+    idx = pd.to_datetime(index)
+    if hasattr(idx, "tz") and idx.tz is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    if hasattr(idx, "as_unit"):
+        idx = idx.as_unit("ns")
+    return idx
+
+
+# ══════════════════════════════════════════════════════════════════
+#  INDICATOR HELPERS
+# ══════════════════════════════════════════════════════════════════
+
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+def sma(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period).mean()
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(com=period - 1, adjust=False).mean()
+
+def cci(close: pd.Series, period: int = 20) -> pd.Series:
+    """Pine Script-compatible CCI (vectorized MAD)."""
+    arr   = close.to_numpy(dtype=float)
+    n     = len(arr)
+    sma_v = np.full(n, np.nan)
+    mad_v = np.full(n, np.nan)
+    for i in range(period - 1, n):
+        w        = arr[i - period + 1 : i + 1]
+        m        = w.mean()
+        sma_v[i] = m
+        mad_v[i] = np.mean(np.abs(w - m))
+    mad_s = pd.Series(mad_v, index=close.index).replace(0, np.nan)
+    return (close - pd.Series(sma_v, index=close.index)) / (0.015 * mad_s)
+
+def highest(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period).max()
+
+def lowest(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period).min()
+
+def ichimoku_cloud_top(high: pd.Series, low: pd.Series) -> pd.Series:
+    """Returns the max of Senkou A and Senkou B (cloud top)."""
+    tenkan   = (highest(high, 9)  + lowest(low, 9))  / 2
+    kijun    = (highest(high, 26) + lowest(low, 26)) / 2
+    senkou_a = (tenkan + kijun) / 2
+    senkou_b = (highest(high, 52) + lowest(low, 52)) / 2
+    return pd.concat([senkou_a, senkou_b], axis=1).max(axis=1)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DATA FETCHING  (same signatures as original engine)
 # ══════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
-    """Single-symbol fetch — kept for backtest compatibility. Scanner uses fetch_batch_ohlcv."""
+    """Single-symbol OHLCV fetch (kept for backtest page compatibility)."""
     try:
-        ticker = yf.Ticker(f"{symbol}.NS")
-        df = ticker.history(period=period, interval=interval, auto_adjust=True)
+        df = yf.Ticker(f"{symbol}.NS").history(
+            period=period, interval=interval, auto_adjust=True
+        )
         if df.empty or len(df) < 60:
             return pd.DataFrame()
-        df.index = _strip_tz(pd.to_datetime(df.index))
+        df.index  = _strip_tz(pd.to_datetime(df.index))
         df.columns = [c.lower() for c in df.columns]
         return df[["open", "high", "low", "close", "volume"]]
     except Exception:
@@ -294,11 +203,7 @@ def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.Dat
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") -> dict:
-    """
-    Batch-download OHLCV for multiple symbols in a single yf.download() call.
-    ~10-20x faster than one Ticker.history() per symbol.
-    symbols must be a tuple so it is hashable for st.cache_data.
-    """
+    """Batch-download OHLCV (~10-20× faster than per-symbol calls)."""
     if not symbols:
         return {}
     tickers = [f"{s}.NS" for s in symbols]
@@ -315,7 +220,7 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") 
     except Exception:
         return {}
 
-    result = {}
+    result: dict = {}
     single = len(tickers) == 1
     for sym, ticker in zip(symbols, tickers):
         try:
@@ -323,7 +228,7 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") 
             df = df.dropna(how="all")
             if df.empty or len(df) < 60:
                 continue
-            df.index = _strip_tz(pd.to_datetime(df.index))
+            df.index  = _strip_tz(pd.to_datetime(df.index))
             df.columns = [c.lower() for c in df.columns]
             result[sym] = df[["open", "high", "low", "close", "volume"]]
         except Exception:
@@ -334,7 +239,7 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_nifty(period: str = "1y") -> pd.Series:
     try:
-        df = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
+        df    = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
         nifty = df["Close"].rename("nifty")
         nifty.index = _strip_tz(pd.to_datetime(nifty.index))
         return nifty
@@ -343,359 +248,178 @@ def fetch_nifty(period: str = "1y") -> pd.Series:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  CORE SCORING ENGINE  (full Pine Script port, daily/Swing mode)
+#  CORE SCORING  — 5 CONDITIONS ONLY
 # ══════════════════════════════════════════════════════════════════
 
 def score_stock(
     df: pd.DataFrame,
-    nifty: pd.Series,
+    nifty: pd.Series,          # kept in signature for API compatibility
     cci_len:  int   = 20,
-    cci_ob:   int   = 100,
+    cci_ob:   int   = 100,     # kept for API compat (not used in prime scoring)
     cci_os:   int   = -100,
     pvt_lb:   int   = 20,
     atr_prox: float = 0.3,
 ) -> dict:
     """
-    Full port of Pine Script f() scoring + all signal logic.
-    Mode fixed to Swing (daily chart).
+    Evaluate the 5 Tier 1 Prime conditions for a single stock.
 
-    Tier 1 Prime logic:
-      is_tier1_prime requires ALL five conditions simultaneously:
-        1. trend_up       — price > EMA200, EMA20 > EMA50 (EMA stack aligned)
-        2. in_golden      — price inside 50–61.8% fib retracement zone
-        3. cci_cross_up_os — CCI crossed UP through oversold (-100) on this bar
-        4. qualified      — mom1>5%, mom3>10%, mom6>15% AND price>EMA20>EMA50 (⭐)
-        5. above_cloud    — price above Ichimoku cloud top
-      When true: +20 combination bonus, buy_type = "Fib+CCI★", action = "★ PRIME"
-
-    Returns dict ready for scanner table, or {} on failure.
+    Returns a dict ready for the scanner DataFrame, or {} on failure.
+    The dict schema matches the original engine so pages/scanner.py
+    renders without any changes.
     """
-    if df.empty or len(df) < 210:
+    if df.empty or len(df) < MIN_HISTORY_BARS:
         return {}
 
     c = df["close"]
     h = df["high"]
     l = df["low"]
-    v = df["volume"]
 
-    # ── INDICATORS ──────────────────────────────────────────────
-    e20      = ema(c, 20)
-    e50      = ema(c, 50)
-    e200     = ema(c, 200)
-    rsi_val  = rsi(c, 21)
-    atr_val  = atr(h, l, c, 14)
-    cci_val  = cci(c, cci_len)
-    vol_avg  = sma(v, 20)
+    # ── indicators ──────────────────────────────────────────────
+    e20    = ema(c, 20)
+    e50    = ema(c, 50)
+    e200   = ema(c, 200)
+    cci_s  = cci(c, cci_len)
+    atr_v  = atr(h, l, c, 14)
+    ctop   = ichimoku_cloud_top(h, l)
 
-    # Ichimoku
-    tenkan, kijun, senkou_a, senkou_b = ichimoku(h, l)
-    cloud_top    = pd.concat([senkou_a, senkou_b], axis=1).max(axis=1)
-    cloud_bottom = pd.concat([senkou_a, senkou_b], axis=1).min(axis=1)
-
-    # Latest bar values
     cur_c    = float(c.iloc[-1])
-    cur_h    = float(h.iloc[-1])
-    cur_o    = float(df["open"].iloc[-1])
-    prev_h   = float(h.iloc[-2]) if len(h) >= 2 else cur_h
     cur_e20  = float(e20.iloc[-1])
     cur_e50  = float(e50.iloc[-1])
     cur_e200 = float(e200.iloc[-1])
-    cur_r    = float(rsi_val.iloc[-1])
-    cur_v    = float(v.iloc[-1])
-    cur_atr  = float(atr_val.iloc[-1])
-    cur_cci  = float(cci_val.iloc[-1])
-    cur_vavg = float(vol_avg.iloc[-1])
-    prev_cci = float(cci_val.iloc[-2]) if len(cci_val) >= 2 else cur_cci
+    cur_cci  = float(cci_s.iloc[-1])
+    prev_cci = float(cci_s.iloc[-2]) if len(cci_s) >= 2 else cur_cci
+    cur_atr  = float(atr_v.iloc[-1])
+    cur_ct   = float(ctop.iloc[-1])
 
-    ct   = float(cloud_top.iloc[-1])
-    cb   = float(cloud_bottom.iloc[-1])
-    above_cloud  = cur_c > ct
-    below_cloud  = cur_c < cb
-    inside_cloud = cb <= cur_c <= ct
-
-    # ── TREND ────────────────────────────────────────────────────
-    trend_up   = cur_c > cur_e200 and cur_e20 > cur_e50
-    trend_down = cur_c < cur_e200 and cur_e20 < cur_e50
-
-    # ── RELATIVE STRENGTH vs Nifty (5-bar) ───────────────────────
-    _c_index   = _strip_tz(c.index)
-    _nifty     = nifty.copy()
-    _nifty.index = _strip_tz(_nifty.index)
-    nifty_aligned = _nifty.reindex(_c_index, method="ffill")
-    rs = np.nan
-    if len(c) >= 6 and not nifty_aligned.empty:
-        c5    = float(c.iloc[-6])
-        n_now = float(nifty_aligned.iloc[-1])
-        n5    = float(nifty_aligned.iloc[-6])
-        if c5 > 0 and n5 > 0 and n_now > 0:
-            rs = (cur_c / c5 - 1) - (n_now / n5 - 1)
-    rs = 0.0 if np.isnan(rs) else rs
-
-    # ── FIBONACCI LEVELS ─────────────────────────────────────────
+    # ── fibonacci swing levels ───────────────────────────────────
     lookback = min(pvt_lb * 3, len(c) - 1)
-    sw_hi = float(h.iloc[-lookback:].max())
-    sw_lo = float(l.iloc[-lookback:].min())
+    sw_hi    = float(h.iloc[-lookback:].max())
+    sw_lo    = float(l.iloc[-lookback:].min())
     fib_rng  = sw_hi - sw_lo
-
-    fib236   = sw_hi - fib_rng * 0.236
-    fib382   = sw_hi - fib_rng * 0.382
     fib500   = sw_hi - fib_rng * 0.500
     fib618   = sw_hi - fib_rng * 0.618
-    fib786   = sw_hi - fib_rng * 0.786
-    fib_ext127 = sw_hi + fib_rng * 0.272
-    fib_ext161 = sw_hi + fib_rng * 0.618
-    fib_ext261 = sw_hi + fib_rng * 1.618
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  THE 5 CONDITIONS
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    # C1 — EMA stack: price > EMA200  AND  EMA20 > EMA50
+    trend_up = (cur_c > cur_e200) and (cur_e20 > cur_e50)
+
+    # C2 — Price inside 50–61.8 % retracement zone (± ATR proximity buffer)
     in_golden = (
         cur_c >= fib618 - cur_atr * atr_prox and
         cur_c <= fib500 + cur_atr * atr_prox
     )
-    near_ext127 = abs(cur_c - fib_ext127) < cur_atr * atr_prox
-    near_ext161 = abs(cur_c - fib_ext161) < cur_atr * atr_prox
 
-    # ── CCI SIGNALS ───────────────────────────────────────────────
-    cci_cross_up_os  = prev_cci <= cci_os  and cur_cci > cci_os   # oversold recovery
-    cci_cross_dn_ob  = prev_cci >= cci_ob  and cur_cci < cci_ob   # overbought exit
-    cci_extended     = cur_cci > cci_ob * 2                        # > +200
-    cci_weakening    = cur_cci < prev_cci  and cur_cci > 0
+    # C3 — CCI crossed UP through the oversold level on this exact bar
+    cci_cross_up_os = (prev_cci <= cci_os) and (cur_cci > cci_os)
 
-    # CCI-confirmed golden zone
-    in_golden_cci = in_golden and cur_cci <= cci_os
-
-    # ── PIVOT DETECTION ──────────────────────────────────────────
-    pvt_lb_use = min(pvt_lb, len(c) // 4)
-    ph = pivot_high(h, pvt_lb_use)
-    pl = pivot_low(l, pvt_lb_use)
-
-    pivots = []
-    for i in range(len(c) - 1, -1, -1):
-        if not np.isnan(ph.iloc[i]):
-            pivots.append((float(ph.iloc[i]), True))
-        elif not np.isnan(pl.iloc[i]):
-            pivots.append((float(pl.iloc[i]), False))
-        if len(pivots) >= 8:
-            break
-
-    pv_prices  = [p[0] for p in pivots]
-    pv_is_high = [p[1] for p in pivots]
-
-    # Harmonic
-    harm_dir, harm_name = detect_harmonic(pv_prices, pv_is_high)
-    harm_bull = harm_dir == "bull"
-    harm_bear = harm_dir == "bear"
-
-    # ABCD
-    abcd_bull, abcd_bear = detect_abcd(pv_prices, pv_is_high, cur_c, cur_o, prev_h)
-
-    # ── QUALIFICATION ─────────────────────────────────────────────
-    mom1 = (cur_c / float(c.iloc[-22])  - 1) * 100 if len(c) >= 22  else 0
-    mom3 = (cur_c / float(c.iloc[-64])  - 1) * 100 if len(c) >= 64  else 0
-    mom6 = (cur_c / float(c.iloc[-127]) - 1) * 100 if len(c) >= 127 else 0
-
+    # C4 — Momentum breadth + trend_strong
+    mom1 = (cur_c / float(c.iloc[-22])  - 1) * 100 if len(c) >= 22  else 0.0
+    mom3 = (cur_c / float(c.iloc[-64])  - 1) * 100 if len(c) >= 64  else 0.0
+    mom6 = (cur_c / float(c.iloc[-127]) - 1) * 100 if len(c) >= 127 else 0.0
     strong_htf   = mom1 > 5 and mom3 > 10 and mom6 > 15
     trend_strong = cur_c > cur_e20 and cur_e20 > cur_e50
     qualified    = strong_htf and trend_strong
 
-    # ── SCORE CALCULATION ─────────────────────────────────────────
-    bull_score = 0.0
+    # C5 — Price strictly above Ichimoku cloud top
+    above_cloud = cur_c > cur_ct
 
-    # Trend (25)
-    bull_score += 25 if trend_up else 0
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  SCORE  (20 pts per condition, max 100)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    conditions = {
+        "trend_up":        trend_up,
+        "in_golden":       in_golden,
+        "cci_cross_up_os": cci_cross_up_os,
+        "qualified":       qualified,
+        "above_cloud":     above_cloud,
+    }
+    n_true    = sum(conditions.values())
+    raw_score = n_true * CONDITION_WEIGHT           # 0 / 20 / 40 / 60 / 80 / 100
+    norm_score = raw_score                          # already 0-100; no further normalisation
 
-    # EMA alignment (30 / 20 / 0)
-    bull_score += 30 if cur_e20 > cur_e50 else (20 if cur_e20 > cur_e50 * 0.995 else 0)
+    # is_tier1_prime = all five True
+    is_tier1_prime = (n_true == 5)
 
-    # RSI (25 / 20 / 15 / 5 / 0)
-    bull_score += (25 if cur_r > 60 else 20 if cur_r > 55 else 15 if cur_r > 50 else 5 if cur_r > 45 else 0)
-
-    # Volume (20 / 10 / 0)
-    bull_score += (20 if cur_v > cur_vavg * 1.2 else 10 if cur_v > cur_vavg else 0)
-
-    # Breakout (25 / 15 / 0)
-    hh = float(highest(c, 10).iloc[-2]) if len(c) >= 11 else cur_c
-    bull_score += (25 if cur_c > hh else 15 if cur_c > hh * 0.98 else 0)
-
-    # Momentum (10)
-    bull_score += 10 if len(c) >= 3 and (c.iloc[-1] > c.iloc[-3]) else 0
-
-    # Relative Strength (15 / 5 / 0)
-    bull_score += (15 if rs > 0 else 5 if rs > -0.005 else 0)
-
-    # Fibonacci Golden Zone (+30)
-    bull_score += 30 if in_golden else 0
-
-    # Fib Extension penalties (-20 / -30)
-    bull_score += -20 if near_ext127 else (-30 if near_ext161 else 0)
-
-    # CCI state contribution (+20 / +10 / -15)
-    bull_score += (20 if cur_cci < cci_os else 10 if cur_cci < 0 else -15 if cci_extended else 0)
-
-    # CCI cross-up bonus (+15)
-    bull_score += 15 if cci_cross_up_os else 0
-
-    # CCI extended double-penalty (-10)
-    bull_score -= 10 if cci_extended else 0
-
-    # Qualification (+25 / -10)
-    bull_score += 25 if qualified else -10
-
-    # Harmonic / ABCD boosts
-    if harm_bull:
-        bull_score += 20
-    if abcd_bull:
-        bull_score += 15
-
-    # Ichimoku cloud filter (-15 below cloud)
-    cloud_penalty = -15 if below_cloud else 0
-    bull_score += cloud_penalty
-
-    # ── TIER 1 PRIME — combination bonus ─────────────────────────
-    # Requires ALL five structural conditions simultaneously:
-    #   trend_up + in_golden + cci_cross_up_os + qualified + above_cloud
-    # This is the rarest, highest-conviction setup in the engine.
-    # The +20 bonus reflects that no single component grants this alone —
-    # it rewards the convergence of price structure, trend, momentum
-    # catalyst, HTF qualification, and cloud position all aligning.
-    is_tier1_prime = (
-        trend_up        and   # EMA stack: price > EMA200, EMA20 > EMA50
-        in_golden       and   # price inside 50–61.8% fib retracement
-        cci_cross_up_os and   # CCI crossed up through -100 on this bar
-        qualified       and   # mom1>5%, mom3>10%, mom6>15% + trend_strong (⭐)
-        above_cloud           # price above Ichimoku cloud top
-    )
-    bull_score += 20 if is_tier1_prime else 0
-
-    # ── NORMALISE ────────────────────────────────────────────────
-    # maxScore base = 175; Tier 1 Prime adds 20 → effective ceiling 195
-    # Keep normalization at 175 so the prime bonus pushes score visibly above 100,
-    # which is capped at 100 in display — making prime setups always show 100.
-    max_score  = 175
-    norm_score = min(100, int(bull_score * 100 / max_score))
-
-    # ── ADAPTIVE SCORE THRESHOLD ──────────────────────────────────
-    atr_sma = float(sma(atr_val, 20).iloc[-1])
-    trend_strength_ratio = cur_atr / atr_sma if atr_sma > 0 else 1.0
-    score_threshold = 65 if trend_strength_ratio > 1.2 else (75 if trend_strength_ratio < 0.8 else 70)
-
-    # ── BUY TYPE CLASSIFICATION ───────────────────────────────────
-    is_fib_buy_base = trend_up and in_golden  and norm_score >= score_threshold
-    is_fib_buy_cci  = trend_up and in_golden_cci and norm_score >= 55 and cci_cross_up_os
-    is_fib_buy      = is_fib_buy_base or is_fib_buy_cci
-    is_abcd_buy     = trend_up and abcd_bull
-    is_harm_buy     = trend_up and harm_bull
-    is_norm_buy     = trend_up and norm_score >= 65 and not in_golden and not cci_extended
-    is_cci_buy      = trend_up and cci_cross_up_os and norm_score >= 55
-
-    # Cloud gate
-    allow_cloud_buy = above_cloud or (inside_cloud and norm_score >= 65)
-
-    any_buy = (is_fib_buy or is_abcd_buy or is_harm_buy or is_norm_buy or is_cci_buy) and allow_cloud_buy
-
-    # ── SELL SIGNALS ──────────────────────────────────────────────
-    ema_confirmed_down = cur_e20 < cur_e50
-    recent_sw_hi = float(highest(h, pvt_lb_use * 2).iloc[-1])
-    not_breaking_out = cur_c < recent_sw_hi * 1.005
-
-    prev_c = float(c.iloc[-2]) if len(c) >= 2 else cur_c
-    fib_sell_rej127 = prev_h >= fib_ext127 and cur_c < fib_ext127
-    fib_sell_rej161 = prev_h >= fib_ext161 and cur_c < fib_ext161
-
-    is_fib_sell  = ema_confirmed_down and (fib_sell_rej127 or fib_sell_rej161 or cci_cross_dn_ob) and not_breaking_out
-    is_norm_sell = ema_confirmed_down and not_breaking_out
-    is_harm_sell = ema_confirmed_down and harm_bear and not_breaking_out
-    is_abcd_sell = ema_confirmed_down and abcd_bear and not_breaking_out
-
-    # ── CCI STATE & SIGNAL ────────────────────────────────────────
-    cci_state  = ("OB"   if cur_cci >= cci_ob  else
-                  "OS"   if cur_cci <= cci_os  else
-                  "BULL" if cur_cci > 0        else "BEAR")
-    cci_signal = ("BUY"  if cci_cross_up_os  else
-                  "EXIT" if cci_cross_dn_ob  else
-                  "EXT"  if cci_extended     else "-")
-
-    # ── HIGH PROB ZONE ────────────────────────────────────────────
-    high_prob_buy  = trend_up and in_golden and norm_score >= 55
-    high_prob_sell = ema_confirmed_down and (fib_sell_rej127 or fib_sell_rej161 or cci_cross_dn_ob) and below_cloud and not_breaking_out
-
-    # ── TRADE LEVELS ─────────────────────────────────────────────
-    # Swing mode: atrSLmult=2.5, atrSLwide=4.0
-    en   = round(cur_c)
-    raw_sl = en - cur_atr * 2.5 * 0.85
-    min_sl = en - cur_atr * 4.0
-    max_sl = en - cur_atr * 1.5
-    sl   = round(max(min_sl, min(raw_sl, max_sl)))
-    rk   = max(en - sl, cur_atr * 0.5)
-    t1   = round(en + rk)
-    t2   = round(en + rk * 2)
-    t3   = round(en + rk * 3)
+    # Failed conditions string
+    failed = [k for k, v in conditions.items() if not v]
+    failed_str = ", ".join(failed) if failed else "— (PRIME)"
 
     # ── ACTION ────────────────────────────────────────────────────
-    # Tier 1 Prime gets a distinct action label so it surfaces immediately
-    # in the scanner table without needing to check buy_type.
-    if is_tier1_prime and norm_score >= score_threshold:
+    if is_tier1_prime:
         action = "★ PRIME"
-    elif norm_score >= score_threshold:
-        action = "✅ BUY"
-    elif norm_score >= 50:
+    elif n_true == 4:
+        action = "⚡ NEAR PRIME"
+    elif n_true == 3:
         action = "👁 WATCH"
     else:
         action = "⛔ SKIP"
 
-    # ── QUAL ICON ─────────────────────────────────────────────────
-    # Tier 1 Prime earns a double-star to distinguish from plain ⭐
-    if is_tier1_prime:
-        qual_icon = "★★"
-    elif qualified and any_buy:
-        qual_icon = "⭐"
-    elif qualified:
-        qual_icon = "✔"
-    else:
-        qual_icon = "✖"
+    # ── CCI state / signal labels  (kept for scanner table columns) ──
+    cci_state  = ("OB"   if cur_cci >= cci_ob  else
+                  "OS"   if cur_cci <= cci_os  else
+                  "BULL" if cur_cci > 0        else "BEAR")
+    cci_signal = "BUY" if cci_cross_up_os else "-"
 
-    # ── BUY TYPE TAG ─────────────────────────────────────────────
-    # Tier 1 Prime takes priority over all other type labels.
-    # "Fib+CCI★" visually distinguishes it from plain "Fib+CCI" in the table.
-    buy_type = (
-        "Fib+CCI★" if is_tier1_prime   else
-        "Fib+CCI"  if is_fib_buy_cci   else
-        "Fib"      if is_fib_buy_base  else
-        "Harm"     if is_harm_buy      else
-        "ABCD"     if is_abcd_buy      else
-        "CCI"      if is_cci_buy       else
-        "Norm"     if is_norm_buy      else "-"
-    )
+    # ── qual icon ─────────────────────────────────────────────────
+    qual_icon  = "★★" if is_tier1_prime else ("⭐" if qualified else "✖")
 
-    # %Change
-    prev_close = float(c.iloc[-2]) if len(c) >= 2 else cur_c
-    chg = round(((cur_c - prev_close) / prev_close) * 100, 2) if prev_close else 0
+    # ── buy type tag ──────────────────────────────────────────────
+    buy_type   = "Fib+CCI★" if is_tier1_prime else (
+                 "Near★"    if n_true == 4    else "-")
+
+    # ── trade levels  (swing mode, same as original) ─────────────
+    en  = round(cur_c)
+    rk  = max(cur_atr * 2.5 * 0.85, cur_atr * 0.5)
+    sl  = round(en - rk)
+    t1  = round(en + rk)
+    t2  = round(en + rk * 2)
+    t3  = round(en + rk * 3)
+
+    # ── %change ───────────────────────────────────────────────────
+    prev_c = float(c.iloc[-2]) if len(c) >= 2 else cur_c
+    chg    = round((cur_c - prev_c) / prev_c * 100, 2) if prev_c else 0.0
 
     return {
-        "Stock":        None,   # filled by caller
-        "Score":        norm_score,
-        "Action":       action,
-        "Buy Type":     buy_type,
-        "CCI":          round(cur_cci),
-        "CCI State":    cci_state,
-        "CCI Sig":      cci_signal,
-        "Qual":         qual_icon,
-        "%Chg":         chg,
-        "Entry":        en,
-        "SL":           sl,
-        "T1":           t1,
-        "T2":           t2,
-        "T3":           t3,
-        # internals for colouring / debug
+        # ── Primary display columns (same as original engine) ──
+        "Stock":            None,        # filled by run_scanner
+        "Score":            norm_score,
+        "Action":           action,
+        "Buy Type":         buy_type,
+        "CCI":              round(cur_cci),
+        "CCI State":        cci_state,
+        "CCI Sig":          cci_signal,
+        "Qual":             qual_icon,
+        "%Chg":             chg,
+        "Entry":            en,
+        "SL":               sl,
+        "T1":               t1,
+        "T2":               t2,
+        "T3":               t3,
+        # ── Condition detail columns (new, additive) ──
+        "Failed":           failed_str,
+        "C1_trend_up":      trend_up,
+        "C2_in_golden":     in_golden,
+        "C3_cci_cross":     cci_cross_up_os,
+        "C4_qualified":     qualified,
+        "C5_above_cloud":   above_cloud,
+        "Mom1%":            round(mom1, 1),
+        "Mom3%":            round(mom3, 1),
+        "Mom6%":            round(mom6, 1),
+        # ── Internal flags (used by color helpers / debug) ──
         "_qualified":       qualified,
-        "_tier1_prime":     is_tier1_prime,   # NEW: Tier 1 Prime flag
-        "_high_prob":       high_prob_buy,
+        "_tier1_prime":     is_tier1_prime,
+        "_high_prob":       is_tier1_prime,
         "_in_golden":       in_golden,
-        "_in_golden_cci":   in_golden_cci,
+        "_in_golden_cci":   in_golden and cci_cross_up_os,
         "_above_cloud":     above_cloud,
-        "_inside_cloud":    inside_cloud,
-        "_harm_bull":       harm_bull,
-        "_abcd_bull":       abcd_bull,
-        "_any_buy":         any_buy,
-        "_rsi":             round(cur_r, 1),
+        "_inside_cloud":    False,
+        "_harm_bull":       False,
+        "_abcd_bull":       False,
+        "_any_buy":         is_tier1_prime,
+        "_rsi":             0.0,         # RSI not computed in prime-only mode
         "_mom1":            round(mom1, 1),
         "_mom3":            round(mom3, 1),
         "_cci_raw":         cur_cci,
@@ -705,48 +429,44 @@ def score_stock(
 
 
 # ══════════════════════════════════════════════════════════════════
-#  BATCH SCANNER
+#  BATCH SCANNER  (same signature as original run_scanner)
 # ══════════════════════════════════════════════════════════════════
-
-_BATCH_SIZE = 100
-
 
 def run_scanner(
     symbols:     list,
     cci_len:     int   = 20,
     cci_ob:      int   = 100,
     cci_os:      int   = -100,
-    max_workers: int   = 10,
-    progress_cb  = None,
+    max_workers: int   = _MAX_WORKERS,
+    progress_cb          = None,
 ) -> pd.DataFrame:
     """
-    Two-phase scanner:
-      Phase 1 (0 → 0.5): batch-download OHLCV in chunks of _BATCH_SIZE symbols.
-      Phase 2 (0.5 → 1): parallel scoring with ThreadPoolExecutor (CPU-bound).
+    Two-phase scanner (same interface as original):
+      Phase 1 (0 → 0.5): batch-download OHLCV in _BATCH_SIZE chunks.
+      Phase 2 (0.5 → 1): parallel scoring with ThreadPoolExecutor.
 
-    Output is sorted by Score descending.
-    Tier 1 Prime rows (Action == "★ PRIME") will naturally appear at the top
-    since their +20 combination bonus pushes norm_score to 100 in most cases.
+    Only rows with Score > 0 are returned.
+    Sorted by Score descending — ★ PRIME rows (score=100) appear at top.
     """
     total     = len(symbols)
     n_batches = max(1, (total + _BATCH_SIZE - 1) // _BATCH_SIZE)
 
-    # ── PHASE 1 — Batch data download ────────────────────────────
+    # ── Phase 1: batch download ───────────────────────────────────
     all_data: dict = {}
-    for batch_i, start in enumerate(range(0, total, _BATCH_SIZE)):
-        chunk = tuple(symbols[start : start + _BATCH_SIZE])
+    for i, start in enumerate(range(0, total, _BATCH_SIZE)):
+        chunk      = tuple(symbols[start : start + _BATCH_SIZE])
         batch_data = fetch_batch_ohlcv(chunk, period="1y", interval="1d")
         all_data.update(batch_data)
         if progress_cb:
-            progress_cb(0.5 * (batch_i + 1) / n_batches)
+            progress_cb(0.5 * (i + 1) / n_batches)
 
     nifty = fetch_nifty("1y")
 
-    # ── PHASE 2 — Parallel scoring ────────────────────────────────
-    results = []
-    done    = 0
+    # ── Phase 2: parallel scoring ─────────────────────────────────
+    results: list[dict] = []
+    done = 0
 
-    def process(sym):
+    def _process(sym: str):
         df = all_data.get(sym, pd.DataFrame())
         if df.empty:
             return None
@@ -756,13 +476,13 @@ def run_scanner(
         return row
 
     with ThreadPoolExecutor(max_workers=max_workers) as exe:
-        futures = {exe.submit(process, s): s for s in symbols}
+        futures = {exe.submit(_process, s): s for s in symbols}
         for fut in as_completed(futures):
             done += 1
             if progress_cb:
                 progress_cb(0.5 + 0.5 * done / total)
             row = fut.result()
-            if row:
+            if row and row.get("Score", 0) > 0:
                 results.append(row)
 
     if not results:
@@ -775,19 +495,19 @@ def run_scanner(
 
 
 # ══════════════════════════════════════════════════════════════════
-#  COLOUR HELPERS
+#  COLOUR HELPERS  (same as original — used by scanner UI)
 # ══════════════════════════════════════════════════════════════════
 
 def score_color(score: int) -> str:
-    if score >= 85: return "#16a34a"
-    if score >= 75: return "#22c55e"
-    if score >= 65: return "#4ade80"
-    if score >= 50: return "#f59e0b"
-    return "#ef4444"
+    """Return hex colour for a given score (0-100)."""
+    if score >= 100: return "#7c3aed"   # purple  — PRIME
+    if score >= 80:  return "#16a34a"   # green   — NEAR PRIME
+    if score >= 60:  return "#f59e0b"   # amber   — WATCH
+    return "#ef4444"                     # red     — SKIP
 
 def action_color(action: str) -> str:
-    if "PRIME" in action: return "#7c3aed"   # purple for Tier 1 Prime
-    if "BUY"   in action: return "#16a34a"
+    if "PRIME" in action: return "#7c3aed"
+    if "NEAR"  in action: return "#16a34a"
     if "WATCH" in action: return "#f59e0b"
     return "#ef4444"
 
