@@ -94,8 +94,19 @@ from pages.settings import render as render_settings
 
 tab1, tab2, tab3 = st.tabs(["📡 Live Scanner", "📈 Backtest Engine", "⚙️ Settings"])
 
+# ── Build settings from session_state (populated by Settings tab) ──────────────
+from utils.scanner_engine import NIFTY500_SYMBOLS
+
+settings = {
+    "symbols": st.session_state.get("symbols",  NIFTY500_SYMBOLS),
+    "cci_len": st.session_state.get("cci_len",  20),
+    "cci_ob":  st.session_state.get("cci_ob",   100),
+    "cci_os":  st.session_state.get("cci_os",  -100),
+    "workers": st.session_state.get("workers",  10),
+}
+
 with tab1:
-    render_scanner()
+    render_scanner(settings)
 
 with tab2:
     render_backtest()
