@@ -231,7 +231,7 @@ def render():
 
     styled_sym = (
         sym_perf.style
-        .applymap(_pnl_color, subset=["Avg_PnL","Total_PnL","Best","Worst"])
+        .map(_pnl_color, subset=["Avg_PnL","Total_PnL","Best","Worst"])
         .set_properties(**{
             "font-family":"'JetBrains Mono',monospace",
             "font-size":"0.78rem","text-align":"center",
@@ -259,7 +259,7 @@ def render():
         styled_log = (
             tlog.style
             .apply(_row_bg, axis=1)
-            .applymap(_pnl_color, subset=["pnl_pct"])
+            .map(_pnl_color, subset=["pnl_pct"])
             .set_properties(**{"font-family":"'JetBrains Mono',monospace",
                                "font-size":"0.74rem","color":"#e2e8f0"})
             .format({"pnl_pct":"{}%"})

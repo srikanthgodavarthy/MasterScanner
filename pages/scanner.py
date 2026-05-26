@@ -115,7 +115,7 @@ def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int):
     styled = (
         df_show.style
         .apply(row_bg, axis=1)
-        .applymap(chg_color, subset=["%Chg"])
+        .map(chg_color, subset=["%Chg"])
         .set_properties(**{
             "font-family": "'JetBrains Mono', monospace",
             "font-size":   "0.78rem",
