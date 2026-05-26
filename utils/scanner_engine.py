@@ -26,10 +26,20 @@ warnings.filterwarnings("ignore")
 # ══════════════════════════════════════════════════════════════════
 
 def _strip_tz(index: pd.Index) -> pd.Index:
-    """Return a tz-naive DatetimeIndex regardless of input timezone."""
-    if hasattr(index, "tz") and index.tz is not None:
-        return index.tz_convert("UTC").tz_localize(None)
-    return index
+    """
+    Return a tz-naive, ns-resolution DatetimeIndex.
+    Handles two pandas 2.x incompatibilities in one place:
+      1. tz-aware  vs tz-naive  → strips timezone
+      2. datetime64[us] vs datetime64[ns] → normalises to ns
+    Both mismatches cause TypeError on reindex(..., method="ffill").
+    """
+    idx = pd.to_datetime(index)
+    if hasattr(idx, "tz") and idx.tz is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    # as_unit("ns") is a pandas 2.0+ method; normalises us/ms/s → ns
+    if hasattr(idx, "as_unit"):
+        idx = idx.as_unit("ns")
+    return idx
 
 
 # ══════════════════════════════════════════════════════════════════
