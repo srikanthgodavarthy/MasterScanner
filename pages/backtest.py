@@ -90,6 +90,7 @@ def render():
             bt_universe,
             cci_len=int(bt_cci_len), cci_ob=int(bt_cci_ob), cci_os=int(bt_cci_os),
             min_score=bt_min_score, hold_days=bt_hold_days,
+            workers=settings["workers"],
             progress_cb=_bt_progress,
         )
         prog.empty()
