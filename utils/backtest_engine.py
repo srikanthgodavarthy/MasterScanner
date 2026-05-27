@@ -14,6 +14,11 @@ BUGS FIXED vs live repo (refs/heads/main as of May 2025):
                 before reindex so RS is never silently NaN.
   #5 [MEDIUM]   Entry-bar gap — future.iloc[0] now checked for gap-down SL.
   #6 [LOW]      Harmonic/ABCD pattern boosts now included in backtest scoring.
+
+ADDED:
+  tier1_only param — when True, only signals where ALL 5 pillars align are
+  simulated: trend_up + in_golden + cci_cross_up_os + qualified + above_cloud.
+  is_tier1_prime column added to signal rows and trade output for stats slicing.
 """
 
 import pandas as pd
@@ -55,19 +60,24 @@ def fetch_full_history(symbol: str, years: int = 3) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════════
 
 def generate_signals_historical(
-    df:        pd.DataFrame,
-    nifty:     pd.Series,
-    cci_len:   int   = 20,
-    cci_ob:    int   = 100,
-    cci_os:    int   = -100,
-    min_score: int   = 70,        # normalised 0-100, same scale as scanner
-    atr_prox:  float = 0.3,
-    pvt_lb:    int   = 20,
+    df:          pd.DataFrame,
+    nifty:       pd.Series,
+    cci_len:     int   = 20,
+    cci_ob:      int   = 100,
+    cci_os:      int   = -100,
+    min_score:   int   = 70,        # normalised 0-100, same scale as scanner
+    atr_prox:    float = 0.3,
+    pvt_lb:      int   = 20,
+    tier1_only:  bool  = False,     # when True: only emit Tier 1 Prime signals
 ) -> pd.DataFrame:
     """
     Walk-forward signal generation.
     Scoring is a complete port of scanner_engine.score_stock() so backtest
     signals match exactly what the live scanner flags as BUY.
+
+    tier1_only=True restricts signals to bars where ALL five structural
+    conditions align simultaneously (rarest, highest-conviction setup):
+        trend_up + in_golden + cci_cross_up_os + qualified + above_cloud
     """
     if df.empty or len(df) < 210:
         return pd.DataFrame()
@@ -158,6 +168,26 @@ def generate_signals_historical(
         trend_strong = cur_c > cur_e20 and cur_e20 > cur_e50
         qualified    = strong_htf and trend_strong
 
+        # ── Cloud position ──────────────────────────────────────────
+        above_cloud  = cur_c > cur_ct
+        inside_cloud = cur_cb <= cur_c <= cur_ct
+        below_cloud  = cur_c < cur_cb
+
+        # ── Tier 1 Prime — exact mirror of scanner_engine ────────────
+        # All five structural conditions must align simultaneously.
+        # This is the rarest, highest-conviction setup in the engine.
+        is_tier1_prime = (
+            trend_up        and   # EMA stack: price > EMA200, EMA20 > EMA50
+            in_golden       and   # price inside 50–61.8% fib retracement
+            cci_cross_up_os and   # CCI crossed up through -100 on this bar
+            qualified       and   # mom1>5%, mom3>10%, mom6>15% + trend_strong
+            above_cloud           # price above Ichimoku cloud top
+        )
+
+        # ── Tier 1 Prime gate (optional) ────────────────────────────
+        if tier1_only and not is_tier1_prime:
+            continue
+
         # ── FIX #6 — Pivot / Harmonic / ABCD ────────────────────────
         pvt_lb_use = min(pvt_lb, i // 4)
         if pvt_lb_use >= 2:
@@ -202,9 +232,6 @@ def generate_signals_historical(
         if harm_bull:  score += 20
         if abcd_bull:  score += 15
 
-        above_cloud  = cur_c > cur_ct
-        inside_cloud = cur_cb <= cur_c <= cur_ct
-        below_cloud  = cur_c < cur_cb
         score += -15 if below_cloud else 0
 
         # FIX #1 — normalise to 0-100 like scanner, then apply adaptive threshold
@@ -231,15 +258,16 @@ def generate_signals_historical(
         t3     = round(en + rk * 3)
 
         signals.append({
-            "date":  df.index[i],
-            "score": norm_score,
-            "entry": cur_c,
-            "sl":    sl,
-            "t1":    t1,
-            "t2":    t2,
-            "t3":    t3,
-            "cci":   round(cur_cci),
-            "rsi":   round(cur_r, 1),
+            "date":         df.index[i],
+            "score":        norm_score,
+            "entry":        cur_c,
+            "sl":           sl,
+            "t1":           t1,
+            "t2":           t2,
+            "t3":           t3,
+            "cci":          round(cur_cci),
+            "rsi":          round(cur_r, 1),
+            "tier1_prime":  is_tier1_prime,   # stored for stats slicing
         })
 
     return pd.DataFrame(signals)
@@ -295,7 +323,6 @@ def simulate_trades(
             bar_high = float(row["high"])
             bar_open = float(row["open"])
 
-            # j==0 is entry bar — only check post-open SL (open already validated above)
             sl_hit = bar_low  <= sl
             t2_hit = bar_high >= t2
             t1_hit = bar_high >= t1
@@ -304,7 +331,6 @@ def simulate_trades(
             if sl_hit and (t2_hit or t1_hit):
                 target = t2 if t2_hit else t1
                 if abs(bar_open - target) < abs(bar_open - sl):
-                    # Open closer to target → target hit first
                     exit_price  = target
                     exit_date   = dt
                     exit_reason = "T2 HIT" if t2_hit else "T1 HIT"
@@ -345,6 +371,7 @@ def simulate_trades(
             "sl":             sig["sl"],
             "t1":             sig["t1"],
             "t2":             sig["t2"],
+            "tier1_prime":    bool(sig.get("tier1_prime", False)),   # propagated
         })
 
         # FIX #2 — block until exit date (not just 5 bars)
@@ -358,14 +385,15 @@ def simulate_trades(
 # ══════════════════════════════════════════════════════════════════
 
 def run_backtest(
-    symbols:    list,
-    cci_len:    int = 20,
-    cci_ob:     int = 100,
-    cci_os:     int = -100,
-    min_score:  int = 70,
-    hold_days:  int = 20,
-    workers:    int = 10,        # ← add this
-    progress_cb = None,
+    symbols:      list,
+    cci_len:      int  = 20,
+    cci_ob:       int  = 100,
+    cci_os:       int  = -100,
+    min_score:    int  = 70,
+    hold_days:    int  = 20,
+    workers:      int  = 10,
+    tier1_only:   bool = False,   # ← Tier 1 Prime gate
+    progress_cb        = None,
 ) -> pd.DataFrame:
     try:
         end   = datetime.now(timezone.utc) + timedelta(days=1)
@@ -392,7 +420,8 @@ def run_backtest(
         if df.empty:
             return None
         signals = generate_signals_historical(
-            df, nifty_close, cci_len, cci_ob, cci_os, min_score
+            df, nifty_close, cci_len, cci_ob, cci_os,
+            min_score, tier1_only=tier1_only
         )
         return simulate_trades(sym, df, signals, hold_days=hold_days)
 
@@ -434,17 +463,22 @@ def compute_stats(trades: pd.DataFrame) -> dict:
     pf           = round(gross_profit / gross_loss, 2) if gross_loss else 0
     rr           = round(abs(avg_win / avg_loss), 2)   if avg_loss   else 0
     expectancy   = round((win_rate/100 * avg_win) - ((100-win_rate)/100 * abs(avg_loss)), 2)
+
+    # Tier 1 Prime trade count (column present only when tier1_only=False)
+    t1_trades = int(trades["tier1_prime"].sum()) if "tier1_prime" in trades.columns else 0
+
     return {
-        "total_trades":   total,
-        "win_rate":       win_rate,
-        "avg_win":        avg_win,
-        "avg_loss":       avg_loss,
-        "avg_pnl":        round(trades["pnl_pct"].mean(), 2),
-        "total_pnl":      round(trades["pnl_pct"].sum(),  2),
-        "risk_reward":    rr,
-        "expectancy":     expectancy,
-        "profit_factor":  pf,
-        "exit_breakdown": trades["exit_reason"].value_counts().to_dict(),
-        "best_trade":     round(trades["pnl_pct"].max(), 2),
-        "worst_trade":    round(trades["pnl_pct"].min(), 2),
+        "total_trades":    total,
+        "win_rate":        win_rate,
+        "avg_win":         avg_win,
+        "avg_loss":        avg_loss,
+        "avg_pnl":         round(trades["pnl_pct"].mean(), 2),
+        "total_pnl":       round(trades["pnl_pct"].sum(),  2),
+        "risk_reward":     rr,
+        "expectancy":      expectancy,
+        "profit_factor":   pf,
+        "exit_breakdown":  trades["exit_reason"].value_counts().to_dict(),
+        "best_trade":      round(trades["pnl_pct"].max(), 2),
+        "worst_trade":     round(trades["pnl_pct"].min(), 2),
+        "t1_prime_trades": t1_trades,
     }
