@@ -667,6 +667,118 @@ def score_stock(
     # Rows with hard_stop=True are dimmed in the UI (opacity 0.45).
     hard_stop = trend_down and below_cloud and norm_score < 30
 
+    # ══════════════════════════════════════════════════════════════
+    #  TIER SUB-CONDITION CLASSIFICATION
+    #  Each tier gets a named setup label so the UI can show WHY
+    #  a stock landed where it did — not just that it did.
+    # ══════════════════════════════════════════════════════════════
+
+    # ── TIER 2 SUB-CONDITIONS ─────────────────────────────────────
+    # All require any_buy = True (cloud gate already cleared).
+    # Ordered by conviction — highest first.
+    #
+    #  Fib+Qual   : golden zone + qualified ⭐, no CCI cross-up yet
+    #              → structure is there, waiting for momentum trigger
+    #  Fib+CCI    : golden zone + CCI cross-up, not all 5 pillars
+    #              → most of T1 but missing qualified or cloud condition
+    #  Harmonic   : XABCD pattern (Crab/Butterfly/Bat/Gartley) confirmed
+    #  ABCD       : AB=CD pattern confirmed at D completion
+    #  CCI Break  : CCI crossed up from OS, price not in golden zone
+    #              → momentum catalyst without the fib price structure
+    #  Norm Strong: trend buy, score ≥ 75, no special pattern
+    #  Norm Buy   : trend buy, score 65–74, no special pattern
+
+    is_t2_fib_qual    = is_fib_buy_base and qualified and not is_tier1_prime
+    is_t2_fib_cci     = is_fib_buy_cci  and not is_tier1_prime
+    is_t2_harmonic    = is_harm_buy
+    is_t2_abcd        = is_abcd_buy
+    is_t2_cci_break   = is_cci_buy and not in_golden
+    is_t2_norm_strong = is_norm_buy and norm_score >= 75
+    is_t2_norm        = is_norm_buy
+
+    # ── TIER 3 SUB-CONDITIONS ─────────────────────────────────────
+    # Developing / near-miss setups in WATCH territory (score 50–64).
+    #
+    #  Near Golden   : price within 1 ATR of the golden zone but not inside it
+    #                  → one more leg down could deliver T1/T2 entry
+    #  CCI Recovery  : CCI rising from below zero toward the zero line
+    #                  → oversold momentum building, no confirmed cross yet
+    #  Cloud Test    : price within 0.5 ATR below cloud bottom (testing support)
+    #                  → cloud could flip to support; watch for close above
+    #  EMA Converge  : EMA20 and EMA50 within 1% of each other from below
+    #                  → golden cross forming; trend flip imminent
+    #  RSI Base      : RSI 45–55, trend up, score ≥ 45
+    #                  → basing phase; no breakout yet but bias is long
+    #  Vol Surge     : volume > 2× avg with trend_up but score not yet ≥ 65
+    #                  → institutional accumulation signal; watch closely
+    #  Developing    : catch-all for WATCH stocks not matching above
+
+    near_golden = (
+        not in_golden and
+        cur_c >= fib618 - cur_atr * 1.0 and
+        cur_c <= fib500 + cur_atr * 1.0
+    )
+    cci_recovering  = (cur_cci < 0 and cur_cci > cci_os and
+                       cur_cci > prev_cci and trend_up)
+    cloud_test      = (not above_cloud and not inside_cloud and
+                       cur_c >= cb - cur_atr * 0.5)
+    ema_converging  = (cur_e20 >= cur_e50 * 0.99 and
+                       cur_e20 <= cur_e50 * 1.01 and
+                       cur_c > cur_e200)
+    rsi_basing      = (45 < cur_r < 55 and trend_up and norm_score >= 45)
+    vol_surge_watch = (cur_v > cur_vavg * 2.0 and trend_up and norm_score < 65)
+
+    # ── TIER 4 SUB-CONDITIONS ─────────────────────────────────────
+    # Risk / structural weakness flags for SKIP stocks.
+    #
+    #  Hard Stop    : trend_down + below cloud + score < 30 (full bear structure)
+    #  Fib Resist   : price at 127.2% or 161.8% fib extension (supply zone)
+    #  CCI Extended : CCI > +200 — parabolic, mean-reversion risk
+    #  Downtrend    : confirmed downtrend (EMA stack inverted + below EMA200)
+    #  Weak Mom     : 1m momentum < -5% or 3m momentum < -10%
+    #  Low Score    : catch-all for stocks that simply don't score well enough
+
+    at_ext_resist    = near_ext127 or near_ext161
+    cci_overextended = cci_extended
+    strong_downtrend = trend_down and below_cloud
+    weak_momentum    = mom1 < -5 or mom3 < -10
+
+    # ── UNIFIED SETUP LABEL ───────────────────────────────────────
+    # One label per stock explaining the specific condition that placed
+    # it in its tier. Shown as a badge column in the scan table.
+    if is_tier1_prime:
+        setup = "All 5 Pillars"
+    elif any_buy:
+        setup = (
+            "Fib+Qual"    if is_t2_fib_qual    else
+            "Fib+CCI"     if is_t2_fib_cci     else
+            "Harmonic"    if is_t2_harmonic    else
+            "ABCD"        if is_t2_abcd        else
+            "CCI Break"   if is_t2_cci_break   else
+            "Norm Strong" if is_t2_norm_strong else
+            "Norm Buy"    if is_t2_norm        else
+            "Buy"
+        )
+    elif norm_score >= 50:      # Tier 3 / WATCH
+        setup = (
+            "Near Golden"  if near_golden      else
+            "CCI Recovery" if cci_recovering   else
+            "Cloud Test"   if cloud_test       else
+            "EMA Converge" if ema_converging   else
+            "RSI Base"     if rsi_basing       else
+            "Vol Surge"    if vol_surge_watch  else
+            "Developing"
+        )
+    else:                       # Tier 4 / SKIP
+        setup = (
+            "Hard Stop"    if hard_stop        else
+            "Fib Resist"   if at_ext_resist    else
+            "CCI Extended" if cci_overextended else
+            "Downtrend"    if strong_downtrend else
+            "Weak Mom"     if weak_momentum    else
+            "Low Score"
+        )
+
     return {
         # ── display columns ───────────────────────────────────────
         "Stock":        None,          # filled by caller
@@ -675,6 +787,7 @@ def score_stock(
         "AccScore":     acc_score,
         "Score":        norm_score,
         "Action":       action,
+        "Setup":        setup,
         "Buy Type":     buy_type,
         "CCI":          round(cur_cci),
         "CCI State":    cci_state,
@@ -698,6 +811,18 @@ def score_stock(
         "_any_buy":        any_buy,
         "_tier1_prime":    is_tier1_prime,
         "_hard_stop":      hard_stop,
+        "_t2_fib_qual":    is_t2_fib_qual,
+        "_t2_fib_cci":     is_t2_fib_cci,
+        "_t2_harmonic":    is_t2_harmonic,
+        "_t2_abcd":        is_t2_abcd,
+        "_t2_cci_break":   is_t2_cci_break,
+        "_t3_near_golden": near_golden,
+        "_t3_cci_rec":     cci_recovering,
+        "_t3_cloud_test":  cloud_test,
+        "_t3_ema_conv":    ema_converging,
+        "_t4_hard_stop":   hard_stop,
+        "_t4_fib_resist":  at_ext_resist,
+        "_t4_downtrend":   strong_downtrend,
         "_rsi":            round(cur_r, 1),
         "_mom1":           round(mom1, 1),
         "_mom3":           round(mom3, 1),
@@ -705,6 +830,7 @@ def score_stock(
         "_fib618":         round(fib618),
         "_fib500":         round(fib500),
     }
+
 
 
 # ══════════════════════════════════════════════════════════════════
