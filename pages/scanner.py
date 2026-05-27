@@ -535,7 +535,7 @@ def render(settings: dict) -> None:
     )
 
     # ── CONTROL ROW ───────────────────────────────────────────────
-    c1, c2, c3 = st.columns([1, 3, 2])
+    c1, c2, c3, c4 = st.columns([1, 3, 2, 2])
     with c1:
         run_btn = st.button("🔍 Run Scan", type="primary", use_container_width=True)
     with c2:
