@@ -1,14 +1,6 @@
 """
-pages/scanner.py — Live scanner UI  (v5 — clean layered layout)
-
-Tier layers (engine-driven, not action-driven):
-  Tier 1  — _tier1_prime = True  (all 5 pillars, ~90%+)
-  Tier 2  — _any_buy = True, not Tier 1
-  Tier 3  — Action = WATCH
-  Tier 4  — SKIP / hard-stop (hidden by default)
-
-Watchlist: highlighted pill badges inline in scan table rows.
-Bottom sticky pill bar: live signal counts.
+pages/scanner.py — Live scanner UI
+Renders the sorted table and persists results to Supabase.
 """
 
 import streamlit as st
@@ -20,7 +12,6 @@ from utils.scanner_engine import (
     run_scanner,
     score_color,
     cci_color,
-    acc_tier_color,
     NIFTY500_SYMBOLS,
 )
 from utils.supabase_client import (
@@ -29,453 +20,136 @@ from utils.supabase_client import (
     _is_available,
 )
 
-# ══════════════════════════════════════════════════════════════════
-#  CSS
-# ══════════════════════════════════════════════════════════════════
-_CSS = """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-html, body, [class*="css"] {
-    font-family: 'Inter', sans-serif !important;
-    font-size: 13px;
-}
+# ─── COLOUR HELPERS ───────────────────────────────────────────────────────────
 
-section.main > div { padding-top: 0.4rem !important; }
+def _cell(val: str, bg: str, fg: str = "#ffffff") -> str:
+    return f'<span style="background:{bg};color:{fg};padding:2px 6px;border-radius:4px">{val}</span>'
 
-/* ── header ── */
-.scanner-header {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 0 6px;
-    border-bottom: 1px solid #1e293b;
-    margin-bottom: 10px;
-}
-.scanner-title {
-    font-family: 'Inter', sans-serif !important;
-    font-size: 16px !important;
-    font-weight: 700 !important;
-    letter-spacing: 0.02em;
-    color: #f1f5f9;
-    margin: 0 !important;
-}
-.scanner-badge {
-    font-size: 11px;
-    padding: 2px 8px;
-    border-radius: 20px;
-    background: #0f2d1a;
-    color: #4ade80;
-    border: 1px solid #166534;
-}
 
-/* ── metric cards ── */
-[data-testid="metric-container"] {
-    background: #0c1520;
-    border: 1px solid #1e293b;
-    border-radius: 8px;
-    padding: 6px 10px !important;
-}
-[data-testid="metric-container"] label {
-    font-size: 10px !important;
-    color: #64748b;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-}
-[data-testid="metric-container"] [data-testid="stMetricValue"] {
-    font-size: 22px !important;
-    font-weight: 600 !important;
-    color: #f1f5f9;
-}
+def _tier_cell(tier: str) -> str:
+    """Purple badge for Tier 1, blue for Tier 2, muted for Other."""
+    colors = {
+        "Tier 1": ("#7c3aed", "#fff"),
+        "Tier 2": ("#0369a1", "#fff"),
+        "Other":  ("#374151", "#9ca3af"),
+    }
+    bg, fg = colors.get(tier, ("#374151", "#9ca3af"))
+    return _cell(tier, bg, fg)
 
-/* ── inputs ── */
-div[data-baseweb="select"] > div,
-div[data-baseweb="input"]  > div {
-    min-height: 32px !important;
-    font-size: 12px !important;
-    background: #0c1520 !important;
-    border-color: #1e293b !important;
+
+# Maps display header → DataFrame column (for sort)
+_SORT_COLS = {
+    "Stock":     "Stock",
+    "Tier":      "Tier",
+    "Score":     "Score",
+    "Action":    "Action",
+    "CCI":       "CCI",
+    "CCI State": "CCI State",
+    "CCI Sig":   "CCI Sig",
+    "Qual":      "Qual",
+    "%Chg":      "%Chg",
+    "Entry":     "Entry",
+    "SL":        "SL",
+    "T1":        "T1",
+    "T2":        "T2",
+    "T3":        "T3",
 }
-label[data-testid="stWidgetLabel"] > div {
-    font-size: 11px !important;
-    color: #64748b !important;
-    margin-bottom: 2px;
-}
-
-/* ── tier expanders ── */
-[data-testid="stExpander"] {
-    background: #080e18 !important;
-    border: 1px solid #1e293b !important;
-    border-radius: 10px !important;
-    margin-bottom: 6px !important;
-}
-details > summary {
-    padding: 8px 14px !important;
-    font-size: 13px !important;
-    font-weight: 600 !important;
-    letter-spacing: 0.03em;
-}
-details > summary:hover { background: rgba(255,255,255,0.03) !important; }
-
-/* ── table rows ── */
-tbody tr:hover td { background: rgba(255,255,255,0.025); }
-tbody td { padding: 5px 6px !important; vertical-align: middle; }
-
-/* ── watchlist pills ── */
-.wl-pill {
-    display: inline-block;
-    padding: 3px 10px;
-    border-radius: 20px;
-    font-size: 12px;
-    font-weight: 500;
-    cursor: pointer;
-    margin: 2px 3px;
-    border: 1px solid #334155;
-    background: #0f172a;
-    color: #94a3b8;
-    transition: all 0.15s;
-}
-.wl-pill.active {
-    background: #1e3a5f;
-    color: #60a5fa;
-    border-color: #3b82f6;
-}
-
-hr { margin: 0.5rem 0 !important; }
-</style>
-"""
-
-# ══════════════════════════════════════════════════════════════════
-#  TABLE HELPERS
-# ══════════════════════════════════════════════════════════════════
-
-def _cell(val, bg, fg="#fff", fs="12px"):
-    return (f'<span style="background:{bg};color:{fg};padding:2px 6px;'
-            f'border-radius:3px;white-space:nowrap;font-size:{fs}">{val}</span>')
-
-def _acc_badge(t):
-    bg, fg = acc_tier_color(t)
-    return _cell(t, bg, fg)
-
-def _stop_cell(reason):
-    if not reason:
-        return ""
-    s = reason.replace("🚫 ", "")[:22] + ("…" if len(reason) > 25 else "")
-    return (f'<span style="background:#7f1d1d;color:#fca5a5;padding:2px 5px;'
-            f'border-radius:3px;font-size:11px;white-space:nowrap" title="{reason}">🚫 {s}</span>')
 
 _HEADERS = [
-    "#", "Stock", "Score", "AccTier", "Buy Type",
-    "CCI", "CCI Sig", "Qual", "%Chg", "Entry", "SL", "T1", "T2", "T3",
+    "#", "Stock", "Tier", "Score", "Action",
+    "CCI", "CCI State", "CCI Sig", "Qual",
+    "%Chg", "Entry", "SL", "T1", "T2", "T3",
 ]
 
-def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int,
-                  watchlist_syms: set = None):
-    if df.empty:
-        st.markdown(
-            '<p style="color:#475569;font-size:12px;padding:8px 4px">No stocks in this tier.</p>',
-            unsafe_allow_html=True,
-        )
-        return
 
-    watchlist_syms = watchlist_syms or set()
-    rows = []
-
-    for rank, (_, row) in enumerate(df.iterrows(), 1):
+def _render_table(
+    df: pd.DataFrame,
+    cci_ob: int,
+    cci_os: int,
+    sort_col: str = "Score",
+    sort_asc: bool = False,
+) -> None:
+    """Render coloured HTML table matching the TradingView Pine Script style."""
+    rows_html = []
+    for rank, (_, row) in enumerate(df.iterrows(), start=1):
         sc   = int(row["Score"])
-        cv   = float(row["CCI"])
+        cci  = float(row["CCI"])
         bg   = score_color(sc)
-        ccib = cci_color(cv, cci_ob, cci_os)
-        stop = bool(row.get("_hard_stop", False))
-        tr_s = ' style="opacity:0.45"' if stop else ""
+        ccib = cci_color(cci, cci_ob, cci_os)
+        tier = str(row.get("Tier", "Other"))
 
-        sym = str(row["Stock"])
-        in_wl = sym in watchlist_syms
+        def sc_cell(v):   return _cell(v, bg, "#000")
+        def cci_cell(v):  return _cell(v, ccib, "#000")
+        def teal_cell(v): return _cell(v, "#0d9488", "#fff")
+        def sl_cell(v):   return _cell(v, "#dc2626", "#fff")
+        def en_cell(v):   return _cell(v, "#1d4ed8", "#fff")
 
-        # watchlist indicator on stock cell
-        wl_dot = (
-            ' <span style="display:inline-block;width:6px;height:6px;'
-            'border-radius:50%;background:#f59e0b;margin-left:4px;vertical-align:middle"></span>'
-            if in_wl else ""
-        )
-        stock_bg = "#1a2d1a" if in_wl else bg
-
-        sc_c  = lambda v, b=bg:   _cell(v, b, "#000")
-        cc_c  = lambda v:         _cell(v, ccib, "#000")
-        tl_c  = lambda v:         _cell(v, "#0d9488", "#fff")
-        sl_c  = lambda v:         _cell(v, "#991b1b", "#fff")
-        en_c  = lambda v:         _cell(v, "#1e3a8a", "#fff")
-
-        at = str(row.get("AccTier", "-"))
-        hs = str(row.get("HardStop", ""))
-
-        qual_icon = "⭐" if row["Qual"] == "⭐" else ("✔" if row["Qual"] == "✔" else "")
-
-        rows.append(
-            f"<tr{tr_s}>"
-            f"<td style='color:#334155;font-size:11px;width:24px'>{rank}</td>"
-            f"<td><span style='background:{stock_bg};color:#000;padding:2px 6px;"
-            f"border-radius:3px;font-size:12px;font-weight:600;white-space:nowrap'>"
-            f"{sym}{wl_dot}</span></td>"
-            f"<td>{sc_c(str(sc))}</td>"
-            f"<td>{_acc_badge(at)}</td>"
-            f"<td>{sc_c(str(row.get('Buy Type', '-')))}</td>"
-            f"<td>{cc_c(str(int(cv)))}</td>"
-            f"<td>{cc_c(str(row['CCI Sig']))}</td>"
-            f"<td style='font-size:13px;text-align:center'>{qual_icon}</td>"
-            f"<td style='color:#94a3b8;font-size:12px'>{row['%Chg']}%</td>"
-            f"<td>{en_c(str(row['Entry']))}</td>"
-            f"<td>{sl_c(str(row['SL']))}</td>"
-            f"<td>{tl_c(str(row['T1']))}</td>"
-            f"<td>{tl_c(str(row['T2']))}</td>"
-            f"<td>{tl_c(str(row['T3']))}</td>"
+        rows_html.append(
+            f"<tr>"
+            f"<td>{rank}</td>"
+            f"<td>{sc_cell(str(row['Stock']))}</td>"
+            f"<td>{_tier_cell(tier)}</td>"
+            f"<td>{sc_cell(str(sc))}</td>"
+            f"<td>{sc_cell(row['Action'])}</td>"
+            f"<td>{cci_cell(str(int(cci)))}</td>"
+            f"<td>{cci_cell(row['CCI State'])}</td>"
+            f"<td>{cci_cell(row['CCI Sig'])}</td>"
+            f"<td>{'⭐' if row['Qual']=='⭐' else '✔' if row['Qual']=='✔' else '✖'}</td>"
+            f"<td>{sc_cell(str(row['%Chg'])+'%')}</td>"
+            f"<td>{en_cell(str(row['Entry']))}</td>"
+            f"<td>{sl_cell(str(row['SL']))}</td>"
+            f"<td>{teal_cell(str(row['T1']))}</td>"
+            f"<td>{teal_cell(str(row['T2']))}</td>"
+            f"<td>{teal_cell(str(row['T3']))}</td>"
             f"</tr>"
         )
 
-    def th(h):
-        return (
-            f'<th style="font-size:10px;color:#475569;font-weight:500;'
-            f'text-transform:uppercase;letter-spacing:0.05em;text-align:left;'
-            f'padding:4px 6px;border-bottom:1px solid #1e293b;white-space:nowrap">{h}</th>'
+    def _th(h: str) -> str:
+        if h == "#":
+            return '<th style="min-width:28px">#</th>'
+        active = (h == sort_col)
+        arrow  = (" ▲" if sort_asc else " ▼") if active else ""
+        style  = (
+            'style="cursor:default;background:#1e3a5f;color:#60a5fa;'
+            'border-bottom:2px solid #3b82f6"'
+            if active else
+            'style="cursor:default"'
         )
+        return f"<th {style}>{h}{arrow}</th>"
 
-    header = "<thead><tr>" + "".join(th(h) for h in _HEADERS) + "</tr></thead>"
-    st.markdown(
-        '<div style="overflow-x:auto;margin-top:2px">'
-        '<table style="border-collapse:collapse;width:100%">'
-        f'{header}<tbody>{"".join(rows)}</tbody>'
-        '</table></div>',
-        unsafe_allow_html=True,
+    header = (
+        "<thead><tr>"
+        + "".join(_th(h) for h in _HEADERS)
+        + "</tr></thead>"
     )
-
-
-# ══════════════════════════════════════════════════════════════════
-#  TIER EXPANDER
-# ══════════════════════════════════════════════════════════════════
-
-_TIER_META = {
-    "Tier 1": {
-        "dot":   "#22c55e",
-        "label": "Tier 1 — Prime  ·  All 5 pillars  ·  ~90%+",
-        "desc":  "trend_up · in_golden · CCI cross-up · qualified ⭐ · above cloud",
-    },
-    "Tier 2": {
-        "dot":   "#22c55e",
-        "label": "Tier 2 — Strong Buy",
-        "desc":  "Any valid buy signal active with cloud gate passed",
-    },
-    "Tier 3": {
-        "dot":   "#f59e0b",
-        "label": "Tier 3 — Watch",
-        "desc":  "Emerging setups — not yet a confirmed buy",
-    },
-    "Tier 4": {
-        "dot":   "#ef4444",
-        "label": "Tier 4 — Skip",
-        "desc":  "Hard stop active or score too low",
-    },
-}
-
-def _tier_expander(tier_key: str, df: pd.DataFrame, cci_ob: int, cci_os: int,
-                   watchlist_syms: set, expanded: bool = False):
-    meta  = _TIER_META[tier_key]
-    dot   = meta["dot"]
-    count = len(df)
-
-    header_html = (
-        f'<span style="display:inline-flex;align-items:center;gap:8px">'
-        f'<span style="width:9px;height:9px;border-radius:50%;'
-        f'background:{dot};display:inline-block;flex-shrink:0"></span>'
-        f'<span style="font-size:13px;font-weight:600">{meta["label"]}</span>'
-        f'<span style="background:#1e293b;color:#94a3b8;padding:1px 8px;'
-        f'border-radius:10px;font-size:11px;font-weight:500">{count}</span>'
-        f'</span>'
+    table_html = (
+        '<div style="overflow-x:auto">'
+        '<table style="border-collapse:collapse;width:100%;font-size:13px">'
+        f"{header}<tbody>{''.join(rows_html)}</tbody>"
+        "</table></div>"
     )
-
-    with st.expander(f"{tier_key}  ·  {count}", expanded=expanded):
-        st.markdown(
-            f'<p style="font-size:11px;color:#475569;margin:0 0 6px">{meta["desc"]}</p>',
-            unsafe_allow_html=True,
-        )
-        _render_table(df, cci_ob, cci_os, watchlist_syms)
+    st.markdown(table_html, unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════════════════════════
-#  SUMMARY PILL BAR  (sticky bottom)
-# ══════════════════════════════════════════════════════════════════
-
-def _summary_bar(df: pd.DataFrame) -> str:
-    if df.empty:
-        t1 = t2 = t3 = t4 = golden = cci_buy = cci_exit = cci_ext = 0
-    else:
-        t1      = int(df.get("_tier1_prime", pd.Series(dtype=bool)).sum()) if "_tier1_prime" in df.columns else 0
-        t2      = int((df["_any_buy"] & ~df["_tier1_prime"]).sum())         if "_any_buy" in df.columns and "_tier1_prime" in df.columns else 0
-        t3      = int((df["Action"] == "👁 WATCH").sum())
-        t4      = int((df["Action"] == "⛔ SKIP").sum())
-        golden  = int(df["_in_golden"].sum())  if "_in_golden" in df.columns else 0
-        cci_buy = int((df["CCI Sig"] == "BUY").sum())
-        cci_exit= int((df["CCI Sig"] == "EXIT").sum())
-        cci_ext = int((df["CCI Sig"] == "EXT").sum())
-
-    pills = [
-        ("#166534", "#4ade80", f"Tier 1 · {t1}"),
-        ("#1e3a5f", "#60a5fa", f"Tier 2 · {t2}"),
-        ("#78350f", "#fcd34d", f"Tier 3 · {t3}"),
-        ("#7f1d1d", "#fca5a5", f"Tier 4 · {t4}"),
-        ("#0f2d2d", "#2dd4bf", f"Golden Zone · {golden}"),
-        ("#2e1065", "#c4b5fd", f"CCI Buy · {cci_buy}"),
-        ("#831843", "#f9a8d4", f"CCI Exit · {cci_exit}"),
-        ("#1c1917", "#a8a29e", f"CCI Ext · {cci_ext}"),
-    ]
-    spans = "".join(
-        f'<span style="background:{bg};color:{fg};padding:4px 12px;border-radius:20px;'
-        f'font-size:12px;font-weight:500;white-space:nowrap;border:1px solid {fg}22">{lbl}</span>'
-        for bg, fg, lbl in pills
-    )
-    return (
-        '<div style="position:sticky;bottom:0;background:#050b14;'
-        'border-top:1px solid #1e293b;padding:8px 2px 6px;'
-        f'display:flex;flex-wrap:wrap;gap:6px;z-index:100">{spans}</div>'
-    )
-
-
-# ══════════════════════════════════════════════════════════════════
-#  METRICS ROW
-# ══════════════════════════════════════════════════════════════════
-
-def _render_metrics(df: pd.DataFrame):
-    if df.empty:
-        return
-    t1  = int(df["_tier1_prime"].sum())       if "_tier1_prime" in df.columns else 0
-    ab  = int(df["_any_buy"].sum())            if "_any_buy"     in df.columns else 0
-    hp  = int(df["_high_prob"].sum())          if "_high_prob"   in df.columns else 0
-    cb  = int((df["CCI Sig"] == "BUY").sum())
-    qs  = int((df["Qual"] == "⭐").sum())
-    buy = int((df["Action"] == "✅ BUY").sum())
-    at1 = int((df["AccTier"] == "T1★").sum()) if "AccTier"    in df.columns else 0
-    aa  = int((df["AccTier"] == "A"  ).sum()) if "AccTier"    in df.columns else 0
-    stp = int(df["_hard_stop"].sum())          if "_hard_stop" in df.columns else 0
-
-    cols = st.columns(9)
-    for col, (lbl, val) in zip(cols, [
-        ("🏆 Tier 1",   t1),
-        ("🥈 Any Buy",  ab),
-        ("🎯 Hi Prob",  hp),
-        ("📡 CCI ↑",    cb),
-        ("⭐ Qual",     qs),
-        ("✅ BUY",      buy),
-        ("T1★ ~90%",   at1),
-        ("A ~85%",      aa),
-        ("🚫 Stops",    stp),
-    ]):
-        col.metric(lbl, val)
-
-
-# ══════════════════════════════════════════════════════════════════
-#  WATCHLIST SECTION
-# ══════════════════════════════════════════════════════════════════
-
-def _render_watchlist(df: pd.DataFrame, cci_ob: int, cci_os: int,
-                      supabase_ok: bool):
-    """
-    Shows watchlist symbols as clickable pill badges.
-    Clicking one highlights its row from the last scan.
-    Add section: single text input + Add button only.
-    """
-    st.markdown(
-        '<p style="font-size:12px;font-weight:600;color:#94a3b8;'
-        'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px">⭐ Watchlist</p>',
-        unsafe_allow_html=True,
-    )
-
-    wl: list[dict] = st.session_state.get("watchlist", [])
-    wl_syms = [w["symbol"] for w in wl]
-
-    left, right = st.columns([3, 1])
-
-    with left:
-        if not wl_syms:
-            st.markdown(
-                '<p style="color:#334155;font-size:12px">No symbols yet — add one →</p>',
-                unsafe_allow_html=True,
-            )
-        else:
-            # Render pill buttons for each watchlist symbol
-            selected = st.session_state.get("wl_selected", None)
-            pills_html = ""
-            for sym in wl_syms:
-                active = "active" if sym == selected else ""
-                pills_html += (
-                    f'<span class="wl-pill {active}">{sym}</span>'
-                )
-            st.markdown(
-                f'<div style="margin-bottom:8px">{pills_html}</div>',
-                unsafe_allow_html=True,
-            )
-
-            # Selectbox drives highlight (invisible label)
-            pick = st.selectbox(
-                "wl_pick_hidden",
-                ["— none —"] + wl_syms,
-                key="wl_pick",
-                label_visibility="collapsed",
-            )
-            st.session_state["wl_selected"] = pick if pick != "— none —" else None
-
-            if pick != "— none —" and not df.empty:
-                match = df[df["Stock"] == pick]
-                if not match.empty:
-                    st.markdown(
-                        f'<p style="font-size:12px;font-weight:600;color:#60a5fa;margin:6px 0 2px">'
-                        f'{pick}</p>',
-                        unsafe_allow_html=True,
-                    )
-                    _render_table(match, cci_ob, cci_os, set(wl_syms))
-                else:
-                    st.caption(f"{pick} — not in last scan.")
-
-    with right:
-        st.markdown(
-            '<p style="font-size:11px;color:#64748b;margin-bottom:4px">Add symbol</p>',
-            unsafe_allow_html=True,
-        )
-        wl_sym = st.text_input("sym_input", placeholder="e.g. RELIANCE",
-                               label_visibility="collapsed", key="wl_sym_input")
-        if st.button("＋ Add", use_container_width=True, key="wl_add_btn"):
-            if wl_sym.strip():
-                sym = wl_sym.strip().upper()
-                if supabase_ok:
-                    ok = add_to_watchlist(sym, "")
-                    st.success(f"✅ {sym} added.") if ok else st.error("❌ Supabase error.")
-                else:
-                    wl = st.session_state.setdefault("watchlist", [])
-                    if sym not in [w["symbol"] for w in wl]:
-                        wl.append({"symbol": sym, "notes": ""})
-                        st.success(f"✅ {sym}")
-                    else:
-                        st.info(f"{sym} already in list.")
-            else:
-                st.warning("Enter a symbol.")
-
-        # Remove button
-        if wl_syms:
-            rm = st.selectbox("Remove", ["—"] + wl_syms,
-                              key="wl_rm", label_visibility="collapsed")
-            if st.button("✕ Remove", use_container_width=True, key="wl_rm_btn"):
-                if rm != "—":
-                    st.session_state["watchlist"] = [
-                        w for w in st.session_state.get("watchlist", [])
-                        if w["symbol"] != rm
-                    ]
-                    st.rerun()
-
-
-# ══════════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════════
+# ─── MAIN PAGE ────────────────────────────────────────────────────────────────
 
 def render(settings: dict) -> None:
-    st.markdown(_CSS, unsafe_allow_html=True)
+    """
+    Called from app.py.
+
+    Parameters
+    ----------
+    settings : dict with keys
+        symbols       : list[str]
+        cci_len       : int
+        cci_ob        : int
+        cci_os        : int
+        workers       : int
+        auto_refresh  : bool
+        refresh_mins  : int
+    """
+    st.title("⚡ NSE Master Scanner Pro")
 
     symbols      = settings.get("symbols",      NIFTY500_SYMBOLS)
     cci_len      = settings.get("cci_len",      20)
@@ -484,137 +158,226 @@ def render(settings: dict) -> None:
     workers      = settings.get("workers",      10)
     auto_refresh = settings.get("auto_refresh", False)
     refresh_secs = settings.get("refresh_mins", 5) * 60
-    supabase_ok  = _is_available()
 
-    # ── HEADER ────────────────────────────────────────────────────
-    st.markdown(
-        '<div class="scanner-header">'
-        '<span style="font-size:18px">⚡</span>'
-        '<span class="scanner-title">NSE Master Scanner</span>'
-        '<span class="scanner-badge">LIVE · Nifty 500</span>'
-        f'<span style="margin-left:auto;font-size:11px;color:{"#4ade80" if supabase_ok else "#f87171"}">'
-        f'{"● Supabase" if supabase_ok else "● Offline"}</span>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
+    supabase_ok = _is_available()
 
-    # ── CONTROL ROW: scan button · search · snapshot ──────────────
-    c1, c2, c3 = st.columns([1, 3, 2])
-    with c1:
-        run_btn = st.button("🔍 Run Scan", type="primary", use_container_width=True)
-    with c2:
-        search = st.text_input("search", placeholder="🔎  Search symbol…  e.g. RELIANCE, TCS",
-                               label_visibility="collapsed", key="search_input")
-    with c3:
-        snap_label = st.text_input("snap", placeholder="Snapshot label (optional)",
-                                   label_visibility="collapsed", key="snap_input")
+    # ── TOP CONTROL BAR ───────────────────────────────────────────
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        run_btn = st.button("🔍 Run Scanner", type="primary", use_container_width=True)
+    with col2:
+        save_label = st.text_input("Snapshot label (optional)", placeholder="e.g. morning scan")
+    with col3:
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.caption("🟢 Supabase connected" if supabase_ok else "🔴 Supabase not configured")
 
+    # ── AUTO-REFRESH BADGE ────────────────────────────────────────
     if auto_refresh:
-        st.info(f"🔄 Auto-refresh every {settings.get('refresh_mins', 5)} min", icon="⏱")
+        st.info(
+            f"🔄 Auto-refresh **ON** — scanner reruns every "
+            f"**{settings.get('refresh_mins', 5)} min**. "
+            "Disable in ⚙️ Settings.",
+            icon="⏱",
+        )
 
-    # ── SCAN ──────────────────────────────────────────────────────
     if run_btn:
         st.session_state.pop("scan_df", None)
         st.session_state["last_auto_scan"] = time.time()
 
     if run_btn or "scan_df" not in st.session_state:
-        prog = st.progress(0.0, text="Initialising…")
-        with st.spinner("Fetching & scoring Nifty 500…"):
-            df_raw = run_scanner(
-                symbols=symbols, cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
-                max_workers=workers,
-                progress_cb=lambda p: prog.progress(p, text=f"Scanning… {int(p*100)}%"),
+        prog = st.progress(0.0, text="Scanning…")
+
+        with st.spinner("Fetching data and scoring stocks…"):
+            df = run_scanner(
+                symbols     = symbols,
+                cci_len     = cci_len,
+                cci_ob      = cci_ob,
+                cci_os      = cci_os,
+                max_workers = workers,
+                progress_cb = lambda p: prog.progress(p, text=f"Scanning… {int(p*100)}%"),
             )
+
         prog.empty()
-        if df_raw.empty:
-            st.warning("No results — check symbols or data source.")
+
+        if df.empty:
+            st.warning("No results — check your symbols or data source.")
             return
-        st.session_state["scan_df"] = df_raw
+
+        st.session_state["scan_df"] = df
         st.session_state["scan_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         st.session_state.setdefault("last_auto_scan", time.time())
+
+        # ── PERSIST TO SUPABASE ───────────────────────────────────
         if supabase_ok:
-            with st.spinner("Saving snapshot…"):
-                ok = save_scan_snapshot(df_raw, label=snap_label)
-            st.toast("✅ Snapshot saved." if ok else "⚠️ Supabase save failed.")
+            with st.spinner("Saving to Supabase…"):
+                ok = save_scan_snapshot(df, label=save_label)
+            if ok:
+                st.success("✅ Scan results saved to Supabase.")
+            else:
+                st.warning("⚠️ Supabase save failed — check logs.")
 
     df = st.session_state.get("scan_df", pd.DataFrame())
     if df.empty:
-        st.markdown(
-            '<div style="text-align:center;padding:60px 0;color:#334155">'
-            '<div style="font-size:32px">📡</div>'
-            '<div style="font-size:14px;margin-top:8px">Press <b>Run Scan</b> to start</div>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
+        st.info("Press **Run Scanner** to start.")
         return
 
     ts = st.session_state.get("scan_ts", "")
-    st.markdown(
-        f'<p style="font-size:11px;color:#334155;margin:0 0 8px">'
-        f'Last scan: <b style="color:#64748b">{ts}</b> · {len(df)} stocks scored</p>',
-        unsafe_allow_html=True,
+    st.caption(f"Last scan: {ts}  |  {len(df)} stocks scored")
+
+    # ── STOCK SEARCH ──────────────────────────────────────────────
+    search_query = st.text_input(
+        "🔎 Search stock",
+        placeholder="Type symbol… e.g. RELIANCE, TCS, INFY",
+        help="Filters the table by symbol name (case-insensitive, partial match).",
     )
 
-    # ── METRICS ───────────────────────────────────────────────────
-    _render_metrics(df)
-    st.divider()
+    # ── FILTER BAR ────────────────────────────────────────────────
+    # Three filters: Tier (replaces min-score slider), Action, CCI State
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        tier_filter = st.selectbox(
+            "Tier",
+            ["All", "Tier 1", "Tier 2"],
+            help=(
+                "**Tier 1** — rarest, highest-conviction: "
+                "trend + golden zone + CCI cross + qualified ⭐ + inside cloud all firing together.\n\n"
+                "**Tier 2** — any valid buy signal (Fib, ABCD, Harmonic, CCI, Norm).\n\n"
+                "**All** — no tier filter."
+            ),
+        )
+    with f2:
+        action_filter = st.selectbox(
+            "Action",
+            ["All", "✅ BUY", "👁 WATCH", "⛔ SKIP"],
+        )
+    with f3:
+        cci_filter = st.selectbox(
+            "CCI State",
+            ["All", "OB", "OS", "BULL", "BEAR"],
+        )
 
-    # ── SEARCH FILTER ─────────────────────────────────────────────
+    # ── APPLY FILTERS ─────────────────────────────────────────────
     fdf = df.copy()
-    if search.strip():
-        fdf = fdf[fdf["Stock"].str.contains(search.strip(), case=False, na=False)]
 
-    # ── PARTITION INTO TIERS ──────────────────────────────────────
-    # Tier 1 — _tier1_prime (all 5 pillars)
-    # Tier 2 — _any_buy and not Tier 1
-    # Tier 3 — WATCH
-    # Tier 4 — SKIP / hard stop
+    if search_query.strip():
+        fdf = fdf[fdf["Stock"].str.contains(search_query.strip(), case=False, na=False)]
 
-    wl_syms_set = set(w["symbol"] for w in st.session_state.get("watchlist", []))
+    if "Tier" in fdf.columns and tier_filter != "All":
+        fdf = fdf[fdf["Tier"] == tier_filter]
 
-    has_t1 = "_tier1_prime" in fdf.columns
-    has_ab = "_any_buy"     in fdf.columns
-    has_hs = "_hard_stop"   in fdf.columns
+    if action_filter != "All":
+        fdf = fdf[fdf["Action"] == action_filter]
 
-    mask_t1 = fdf["_tier1_prime"]               if has_t1 else pd.Series(False, index=fdf.index)
-    mask_ab = fdf["_any_buy"]                   if has_ab else pd.Series(False, index=fdf.index)
+    if cci_filter != "All":
+        fdf = fdf[fdf["CCI State"] == cci_filter]
 
-    df_t1 = fdf[mask_t1].sort_values("AccScore", ascending=False)
-    df_t2 = fdf[mask_ab & ~mask_t1].sort_values("Score", ascending=False)
-    df_t3 = fdf[fdf["Action"] == "👁 WATCH"].sort_values("Score", ascending=False)
-    df_t4 = fdf[fdf["Action"] == "⛔ SKIP"].sort_values("Score", ascending=False)
+    st.markdown(f"**{len(fdf)} stocks** match filters")
 
-    _tier_expander("Tier 1", df_t1, cci_ob, cci_os, wl_syms_set, expanded=True)
-    _tier_expander("Tier 2", df_t2, cci_ob, cci_os, wl_syms_set, expanded=False)
-    _tier_expander("Tier 3", df_t3, cci_ob, cci_os, wl_syms_set, expanded=False)
-    _tier_expander("Tier 4", df_t4, cci_ob, cci_os, wl_syms_set, expanded=False)
+    # ── SORT CONTROLS ─────────────────────────────────────────────
+    sc1, sc2 = st.columns([3, 1])
+    with sc1:
+        sort_col = st.selectbox(
+            "Sort by",
+            options=list(_SORT_COLS.keys()),
+            index=list(_SORT_COLS.keys()).index(
+                st.session_state.get("sort_col", "Score")
+            ),
+            key="sort_col_select",
+            label_visibility="collapsed",
+        )
+    with sc2:
+        sort_asc = st.toggle(
+            "Ascending",
+            value=st.session_state.get("sort_asc", False),
+            key="sort_asc_toggle",
+        )
+    st.session_state["sort_col"] = sort_col
+    st.session_state["sort_asc"] = sort_asc
 
-    # ── SUMMARY PILL BAR ──────────────────────────────────────────
-    st.markdown(_summary_bar(df), unsafe_allow_html=True)
+    df_col = _SORT_COLS.get(sort_col, "Score")
+    if df_col in fdf.columns:
+        fdf = fdf.sort_values(df_col, ascending=sort_asc)
 
+    # ── TABLE ─────────────────────────────────────────────────────
+    _render_table(fdf, cci_ob, cci_os, sort_col=sort_col, sort_asc=sort_asc)
+
+    # ── WATCHLIST PANEL ───────────────────────────────────────────
     st.divider()
+    wl_col, add_col = st.columns([1, 1])
 
-    # ── WATCHLIST ─────────────────────────────────────────────────
-    _render_watchlist(df, cci_ob, cci_os, supabase_ok)
+    with wl_col:
+        st.subheader("⭐ Watchlist")
+        wl: list[dict] = st.session_state.get("watchlist", [])
+        if wl:
+            wl_df      = pd.DataFrame(wl)
+            cols       = [c for c in ["symbol", "notes"] if c in wl_df.columns]
+            wl_display = wl_df[cols].rename(columns={"symbol": "Symbol", "notes": "Notes"})
+            st.dataframe(wl_display, use_container_width=True, hide_index=True)
+            wl_syms = [w["symbol"] for w in wl]
+            pick = st.selectbox("Highlight in table", ["— none —"] + wl_syms, key="wl_pick")
+            if pick != "— none —":
+                match = df[df["Stock"] == pick]
+                if not match.empty:
+                    st.markdown(f"**{pick} in current scan:**")
+                    _render_table(match, cci_ob, cci_os, sort_col=sort_col, sort_asc=sort_asc)
+                else:
+                    st.caption(f"{pick} not in last scan results.")
+        else:
+            st.info("Watchlist is empty — add stocks below or in ⚙️ Settings.")
 
-    st.divider()
+    with add_col:
+        st.subheader("➕ Add to Watchlist")
+        wl1, wl2 = st.columns([1, 1])
+        with wl1:
+            wl_sym = st.text_input("Symbol", placeholder="e.g. RELIANCE")
+        with wl2:
+            wl_note = st.text_input("Note (optional)", placeholder="e.g. breakout")
+        if st.button("Add to Watchlist", use_container_width=True):
+            if wl_sym.strip():
+                sym = wl_sym.strip().upper()
+                if supabase_ok:
+                    ok = add_to_watchlist(sym, wl_note)
+                    if ok:
+                        st.success(f"✅ {sym} added to watchlist.")
+                        st.session_state.pop("watchlist_loaded", None)
+                    else:
+                        st.error("❌ Failed to add — check Supabase.")
+                else:
+                    wl = st.session_state.setdefault("watchlist", [])
+                    if sym not in [w["symbol"] for w in wl]:
+                        wl.append({"symbol": sym, "notes": wl_note})
+                        st.success(f"✅ {sym} added (session only — Supabase not configured).")
+                    else:
+                        st.info(f"{sym} already in watchlist.")
+            else:
+                st.warning("Enter a symbol first.")
 
     # ── CSV DOWNLOAD ──────────────────────────────────────────────
+    st.divider()
     csv = fdf.drop(columns=[c for c in fdf.columns if c.startswith("_")], errors="ignore")
-    fname = f"scan_{ts.replace(':','-').replace(' ','_')}.csv"
-    st.download_button("⬇️ Download CSV", data=csv.to_csv(index=False),
-                       file_name=fname, mime="text/csv")
+    st.download_button(
+        "⬇️ Download CSV",
+        data=csv.to_csv(index=False),
+        file_name=f"scanner_{ts.replace(':', '-').replace(' ', '_')}.csv",
+        mime="text/csv",
+    )
 
-    # ── AUTO-REFRESH ──────────────────────────────────────────────
+    # ── AUTO-REFRESH COUNTDOWN ────────────────────────────────────
     if auto_refresh and "scan_df" in st.session_state:
         last      = st.session_state.get("last_auto_scan", time.time())
-        remaining = max(0, int(refresh_secs - (time.time() - last)))
-        box       = st.empty()
+        elapsed   = time.time() - last
+        remaining = max(0, int(refresh_secs - elapsed))
+
+        countdown_box = st.empty()
         if remaining > 0:
-            box.caption(f"🔄 Refresh in {remaining // 60}m {remaining % 60:02d}s")
+            countdown_box.caption(
+                f"🔄 Auto-refresh in **{remaining // 60}m {remaining % 60:02d}s** "
+                f"— or press **Run Scanner** to refresh now."
+            )
             time.sleep(1)
             st.rerun()
         else:
+            countdown_box.caption("🔄 Auto-refreshing now…")
             st.session_state.pop("scan_df", None)
             st.session_state["last_auto_scan"] = time.time()
             st.rerun()
