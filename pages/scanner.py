@@ -11,6 +11,7 @@ Scoring modes
 • High Prob     — in_golden + trend_up + score ≥ 55 (price-structure focus)
 • CCI Focus     — CCI oversold cross-up + trend_up (momentum catalyst only)
 • Qual Stars    — ⭐ qual icon only (all three HTF momentum bars green)
+• 90% Accuracy  — AccTier T1★ or A only, hard-stop rows excluded
 """
 
 import streamlit as st
@@ -22,6 +23,7 @@ from utils.scanner_engine import (
     run_scanner,
     score_color,
     cci_color,
+    acc_tier_color,
     NIFTY500_SYMBOLS,
 )
 from utils.supabase_client import (
@@ -33,11 +35,6 @@ from utils.supabase_client import (
 
 # ══════════════════════════════════════════════════════════════════
 #  SCORING MODE DEFINITIONS
-#  Each mode is a dict with:
-#    label       – display name shown in the selectbox
-#    description – one-line tooltip / help text
-#    filter_fn   – callable(row) → bool applied AFTER the scan
-#    min_score   – default minimum score override (None = use slider)
 # ══════════════════════════════════════════════════════════════════
 
 SCORING_MODES = {
@@ -102,9 +99,23 @@ SCORING_MODES = {
         "filter_fn":   lambda row: row.get("Qual", "") == "⭐",
         "min_score":   0,
     },
+    "90% Accuracy": {
+        "label":       "🎯 90% Accuracy — T1★ + A tier only",
+        "description": (
+            "Shows only AccTier T1★ (all 5 pillars, ~90%+ accuracy) and\n"
+            "AccTier A (4-pillar combos, ~80–85% accuracy).\n"
+            "Hard-stop rows (cci_extended / below_cloud / near Fib ext / RS lag) are excluded.\n\n"
+            "This is the highest-conviction filtered view. Expect 0–20 results per day.\n"
+            "Always wait for next-bar open confirmation before entry."
+        ),
+        "filter_fn":   lambda row: (
+            row.get("AccTier", "-") in ("T1★", "A") and
+            not row.get("_hard_stop", False)
+        ),
+        "min_score":   0,
+    },
 }
 
-# Mode → badge colour for the metrics strip
 _MODE_COLOURS = {
     "Standard":      "#3b82f6",
     "Tier 1 Prime":  "#f59e0b",
@@ -112,6 +123,7 @@ _MODE_COLOURS = {
     "High Prob Zone":"#0d9488",
     "CCI Focus":     "#ec4899",
     "Qual Stars ⭐": "#eab308",
+    "90% Accuracy":  "#16a34a",
 }
 
 
@@ -134,11 +146,26 @@ def _tier_badge(tier: str) -> str:
     bg, fg = colours.get(tier, ("#64748b", "#fff"))
     return _cell(tier, bg, fg)
 
+def _acc_badge(acc_tier: str) -> str:
+    bg, fg = acc_tier_color(acc_tier)
+    return _cell(acc_tier, bg, fg)
+
+def _hard_stop_cell(reason: str) -> str:
+    if not reason:
+        return ""
+    return (
+        f'<span style="background:#7f1d1d;color:#fca5a5;padding:2px 6px;'
+        f'border-radius:4px;font-size:11px;white-space:nowrap" '
+        f'title="{reason}">{reason[:28]}{"…" if len(reason) > 28 else ""}</span>'
+    )
+
 
 _SORT_COLS = {
     "Stock":     "Stock",
     "Tier":      "Tier",
     "Score":     "Score",
+    "AccTier":   "AccTier",
+    "AccScore":  "AccScore",
     "Action":    "Action",
     "Buy Type":  "Buy Type",
     "CCI":       "CCI",
@@ -154,7 +181,8 @@ _SORT_COLS = {
 }
 
 _HEADERS = [
-    "#", "Stock", "Tier", "Score", "Action", "Buy Type",
+    "#", "Stock", "Tier", "Score", "AccTier", "AccScore", "HardStop",
+    "Action", "Buy Type",
     "CCI", "CCI State", "CCI Sig", "Qual",
     "%Chg", "Entry", "SL", "T1", "T2", "T3",
 ]
@@ -169,10 +197,14 @@ def _render_table(
 ) -> None:
     rows_html = []
     for rank, (_, row) in enumerate(df.iterrows(), start=1):
-        sc   = int(row["Score"])
-        cci  = float(row["CCI"])
-        bg   = score_color(sc)
-        ccib = cci_color(cci, cci_ob, cci_os)
+        sc      = int(row["Score"])
+        cci     = float(row["CCI"])
+        bg      = score_color(sc)
+        ccib    = cci_color(cci, cci_ob, cci_os)
+        is_stop = bool(row.get("_hard_stop", False))
+
+        # Dim entire row if hard stop
+        row_style = ' style="opacity:0.55"' if is_stop else ""
 
         def sc_cell(v):   return _cell(v, bg,        "#000")
         def cci_cell(v):  return _cell(v, ccib,      "#000")
@@ -180,15 +212,21 @@ def _render_table(
         def sl_cell(v):   return _cell(v, "#dc2626", "#fff")
         def en_cell(v):   return _cell(v, "#1d4ed8", "#fff")
 
-        tier = row.get("Tier", "Other")
-        bt   = row.get("Buy Type", "-")
+        tier      = row.get("Tier",     "Other")
+        bt        = row.get("Buy Type", "-")
+        acc_tier  = str(row.get("AccTier",  "-"))
+        acc_score = int(row.get("AccScore", 0))
+        hard_stop = str(row.get("HardStop", ""))
 
         rows_html.append(
-            f"<tr>"
+            f"<tr{row_style}>"
             f"<td>{rank}</td>"
             f"<td>{sc_cell(str(row['Stock']))}</td>"
             f"<td>{_tier_badge(tier)}</td>"
             f"<td>{sc_cell(str(sc))}</td>"
+            f"<td>{_acc_badge(acc_tier)}</td>"
+            f"<td>{sc_cell(str(acc_score)) if acc_score else ''}</td>"
+            f"<td>{_hard_stop_cell(hard_stop)}</td>"
             f"<td>{sc_cell(row['Action'])}</td>"
             f"<td>{sc_cell(bt)}</td>"
             f"<td>{cci_cell(str(int(cci)))}</td>"
@@ -207,6 +245,17 @@ def _render_table(
     def _th(h: str) -> str:
         if h == "#":
             return '<th style="min-width:28px">#</th>'
+        # Highlight new accuracy columns
+        if h in ("AccTier", "AccScore", "HardStop"):
+            active  = (h == sort_col)
+            arrow   = (" ▲" if sort_asc else " ▼") if active else ""
+            style   = (
+                'style="cursor:default;background:#14532d;color:#86efac;'
+                'border-bottom:2px solid #22c55e"'
+                if active else
+                'style="cursor:default;background:#052e16;color:#86efac"'
+            )
+            return f"<th {style}>{h}{arrow}</th>"
         active = (h == sort_col)
         arrow  = (" ▲" if sort_asc else " ▼") if active else ""
         style  = (
@@ -231,18 +280,44 @@ def _render_table(
 
 
 # ══════════════════════════════════════════════════════════════════
+#  ACCURACY LEGEND
+# ══════════════════════════════════════════════════════════════════
+
+def _render_accuracy_legend() -> None:
+    st.markdown(
+        """
+        <div style="display:flex;flex-wrap:wrap;gap:8px;font-size:12px;margin-bottom:8px">
+          <span style="background:#f59e0b;color:#000;padding:2px 8px;border-radius:4px"><b>T1★</b> All 5 pillars · ~90%+</span>
+          <span style="background:#6366f1;color:#fff;padding:2px 8px;border-radius:4px"><b>A</b> 4-pillar combo · ~80–85%</span>
+          <span style="background:#0d9488;color:#fff;padding:2px 8px;border-radius:4px"><b>B</b> 3-pillar combo · ~65–75%</span>
+          <span style="background:#64748b;color:#fff;padding:2px 8px;border-radius:4px"><b>C</b> Any valid buy · ~55–65%</span>
+          <span style="background:#dc2626;color:#fff;padding:2px 8px;border-radius:4px"><b>✖</b> Hard stop — skip regardless of score</span>
+          <span style="background:#374151;color:#fff;padding:2px 8px;border-radius:4px"><b>–</b> No buy signal</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
 #  METRICS STRIP
 # ══════════════════════════════════════════════════════════════════
 
 def _render_metrics(df: pd.DataFrame, mode_colour: str) -> None:
-    """Quick-glance counts across all six modes for the current scan."""
-    t1  = int(df["_tier1_prime"].sum()) if "_tier1_prime" in df.columns else 0
-    t2  = int(df["_any_buy"].sum())     if "_any_buy"     in df.columns else 0
-    hp  = int(df["_high_prob"].sum())   if "_high_prob"   in df.columns else 0
+    t1       = int(df["_tier1_prime"].sum())            if "_tier1_prime" in df.columns else 0
+    t2       = int(df["_any_buy"].sum())                if "_any_buy"     in df.columns else 0
+    hp       = int(df["_high_prob"].sum())              if "_high_prob"   in df.columns else 0
     cci_buys = int((df["CCI Sig"] == "BUY").sum())
-    qs  = int((df["Qual"] == "⭐").sum())
-    buys = int((df["Action"] == "✅ BUY").sum())
+    qs       = int((df["Qual"]    == "⭐").sum())
+    buys     = int((df["Action"]  == "✅ BUY").sum())
 
+    # Accuracy tier counts
+    acc_t1   = int((df["AccTier"] == "T1★").sum()) if "AccTier" in df.columns else 0
+    acc_a    = int((df["AccTier"] == "A"  ).sum()) if "AccTier" in df.columns else 0
+    acc_b    = int((df["AccTier"] == "B"  ).sum()) if "AccTier" in df.columns else 0
+    stops    = int(df["_hard_stop"].sum())          if "_hard_stop" in df.columns else 0
+
+    st.markdown("**Signal counts**")
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("🏆 Tier 1 Prime", t1)
     m2.metric("🥈 Tier 2 Buys",  t2)
@@ -251,25 +326,52 @@ def _render_metrics(df: pd.DataFrame, mode_colour: str) -> None:
     m5.metric("⭐ Qual Stars",   qs)
     m6.metric("✅ BUY Action",   buys)
 
+    st.markdown("**Accuracy tier breakdown**")
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("T1★ ~90%+",   acc_t1)
+    a2.metric("A ~80–85%",   acc_a)
+    a3.metric("B ~65–75%",   acc_b)
+    a4.metric("🚫 Hard Stop", stops)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ACCURACY FILTER SIDEBAR PANEL
+# ══════════════════════════════════════════════════════════════════
+
+def _render_accuracy_filters() -> tuple[list[str], bool]:
+    """
+    Returns (selected_acc_tiers, exclude_hard_stops).
+    Rendered inline (not in sidebar) to keep everything on one page.
+    """
+    st.markdown("**🎯 Accuracy filter**")
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        selected = st.multiselect(
+            "Show accuracy tiers",
+            options=["T1★", "A", "B", "C", "-"],
+            default=["T1★", "A", "B", "C", "-"],
+            key="acc_tier_filter",
+            label_visibility="collapsed",
+            help=(
+                "T1★ = all 5 pillars (~90%+)  |  A = 4-pillar (~80-85%)  |  "
+                "B = 3-pillar (~65-75%)  |  C = any buy (~55-65%)  |  - = no signal"
+            ),
+        )
+    with col2:
+        exclude_stops = st.toggle(
+            "Hide hard stops 🚫",
+            value=True,
+            key="exclude_stops",
+            help="When ON, rows with hard-stop conditions (CCI extended / below cloud / Fib ext) are hidden.",
+        )
+    return selected, exclude_stops
+
 
 # ══════════════════════════════════════════════════════════════════
 #  MAIN PAGE
 # ══════════════════════════════════════════════════════════════════
 
 def render(settings: dict) -> None:
-    """
-    Called from app.py.
-
-    settings keys
-    ─────────────
-    symbols       : list[str]
-    cci_len       : int
-    cci_ob        : int
-    cci_os        : int
-    workers       : int
-    auto_refresh  : bool
-    refresh_mins  : int
-    """
     st.title("⚡ NSE Master Scanner Pro")
 
     symbols      = settings.get("symbols",      NIFTY500_SYMBOLS)
@@ -297,12 +399,14 @@ def render(settings: dict) -> None:
     mode_cfg = SCORING_MODES[selected_mode_key]
     st.caption(f"ℹ️ {mode_cfg['description'].splitlines()[0]}")
 
-    # Expandable full description
     with st.expander("Mode details", expanded=False):
         st.markdown(
             f"**{mode_labels[selected_mode_key]}**\n\n"
             + mode_cfg["description"].replace("\n", "  \n")
         )
+
+    # Show accuracy legend always
+    _render_accuracy_legend()
 
     st.divider()
 
@@ -386,9 +490,11 @@ def render(settings: dict) -> None:
     with f3:
         tier_filter = st.selectbox("Filter Tier", ["All", "Tier 1", "Tier 2", "Other"])
     with f4:
-        # Use mode's default min_score as the slider's initial value
         default_min = mode_cfg.get("min_score", 0)
         min_score = st.slider("Min Score", 0, 100, default_min)
+
+    # ── ACCURACY FILTERS ──────────────────────────────────────────────────────
+    selected_acc_tiers, exclude_stops = _render_accuracy_filters()
 
     # ── APPLY FILTERS ─────────────────────────────────────────────────────────
     fdf = df.copy()
@@ -406,7 +512,15 @@ def render(settings: dict) -> None:
         fdf = fdf[fdf["Tier"] == tier_filter]
     fdf = fdf[fdf["Score"] >= min_score]
 
-    # 3. Scoring-mode filter (applied last — uses internal _ columns)
+    # 3. Accuracy tier filter
+    if "AccTier" in fdf.columns and selected_acc_tiers:
+        fdf = fdf[fdf["AccTier"].isin(selected_acc_tiers)]
+
+    # 4. Hard-stop exclusion
+    if exclude_stops and "_hard_stop" in fdf.columns:
+        fdf = fdf[~fdf["_hard_stop"]]
+
+    # 5. Scoring-mode filter (applied last)
     fdf = fdf[fdf.apply(mode_cfg["filter_fn"], axis=1)]
 
     mode_colour = _MODE_COLOURS[selected_mode_key]
@@ -445,6 +559,26 @@ def render(settings: dict) -> None:
 
     # ── TABLE ─────────────────────────────────────────────────────────────────
     _render_table(fdf, cci_ob, cci_os, sort_col=sort_col, sort_asc=sort_asc)
+
+    # ── 90% ACCURACY QUICK-VIEW ───────────────────────────────────────────────
+    st.divider()
+    with st.expander("🎯 90% Accuracy candidates (T1★ + A tier, no hard stops)", expanded=False):
+        acc_df = df[
+            df["AccTier"].isin(["T1★", "A"]) &
+            ~df["_hard_stop"]
+        ].copy() if "AccTier" in df.columns and "_hard_stop" in df.columns else pd.DataFrame()
+
+        if acc_df.empty:
+            st.info("No T1★ or A-tier signals on this scan. Try again at a different market phase.")
+        else:
+            acc_df = acc_df.sort_values("AccScore", ascending=False)
+            st.caption(
+                f"**{len(acc_df)} candidates** | "
+                f"T1★: {int((acc_df['AccTier']=='T1★').sum())}  "
+                f"A: {int((acc_df['AccTier']=='A').sum())}  "
+                "— Wait for next-bar open confirmation before entry."
+            )
+            _render_table(acc_df, cci_ob, cci_os, sort_col="AccScore", sort_asc=False)
 
     # ── WATCHLIST PANEL ───────────────────────────────────────────────────────
     st.divider()
