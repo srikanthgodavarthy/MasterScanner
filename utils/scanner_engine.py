@@ -643,10 +643,36 @@ def score_stock(
     prev_close = float(c.iloc[-2]) if len(c) >= 2 else cur_c
     chg = round(((cur_c - prev_close) / prev_close) * 100, 2) if prev_close else 0
 
+    # ── ACCURACY TIER (signal confidence grade) ───────────────────
+    # T1★ — Tier 1 Prime: all 5 pillars aligned  (~90%+ win rate target)
+    # A   — qualified ⭐ + any valid buy signal   (~85%)
+    # B   — any valid buy signal, not qualified   (~75%)
+    # C   — WATCH territory (score ≥ 50, no buy) (~60%)
+    # D   — SKIP / insufficient signal
+    acc_tier = (
+        "T1★" if is_tier1_prime              else
+        "A"   if (qualified and any_buy)     else
+        "B"   if any_buy                     else
+        "C"   if norm_score >= 50            else
+        "D"
+    )
+
+    # AccScore — composite for sorting within tiers
+    # Adds Tier 1 bonus + qualified bonus on top of norm_score so
+    # the best setups always float to the top inside each expander.
+    acc_score = norm_score + (20 if is_tier1_prime else 0) + (10 if qualified else 0)
+
+    # ── HARD STOP ────────────────────────────────────────────────
+    # Structural red flag: confirmed downtrend + below cloud + weak score.
+    # Rows with hard_stop=True are dimmed in the UI (opacity 0.45).
+    hard_stop = trend_down and below_cloud and norm_score < 30
+
     return {
         # ── display columns ───────────────────────────────────────
         "Stock":        None,          # filled by caller
         "Tier":         tier,
+        "AccTier":      acc_tier,
+        "AccScore":     acc_score,
         "Score":        norm_score,
         "Action":       action,
         "Buy Type":     buy_type,
@@ -671,6 +697,7 @@ def score_stock(
         "_abcd_bull":      abcd_bull,
         "_any_buy":        any_buy,
         "_tier1_prime":    is_tier1_prime,
+        "_hard_stop":      hard_stop,
         "_rsi":            round(cur_r, 1),
         "_mom1":           round(mom1, 1),
         "_mom3":           round(mom3, 1),
@@ -766,3 +793,20 @@ def cci_color(cci_val: float, ob: int = 100, os: int = -100) -> str:
     if cci_val >= ob: return "#ef4444"
     if cci_val <= os: return "#22c55e"
     return "#3b82f6"
+
+def acc_tier_color(t: str) -> tuple:
+    """
+    Returns (background, foreground) hex pair for AccTier badge.
+      T1★ — purple  (~90%+ conviction)
+      A   — blue    (~85%)
+      B   — green   (~75%)
+      C   — amber   (~60%)
+      D   — muted grey (skip)
+    """
+    return {
+        "T1★": ("#4c1d95", "#c4b5fd"),
+        "A":   ("#1e3a5f", "#60a5fa"),
+        "B":   ("#14532d", "#4ade80"),
+        "C":   ("#78350f", "#fcd34d"),
+        "D":   ("#1c1917", "#78716c"),
+    }.get(t, ("#1c1917", "#78716c"))
