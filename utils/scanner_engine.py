@@ -577,7 +577,7 @@ def score_stock(
     is_tier1_prime = (
         trend_up              and   # EMA stack: price > EMA200, EMA20 > EMA50
         in_golden_relaxed     and   # price inside 38.2–61.8% fib retracement
-        recent_cci_recovery   and   # CCI crossed up through oversold in last 5 bars
+        # recent_cci_recovery   and   # CCI crossed up through oversold in last 5 bars
         qualified             and   # mom1>5%, mom3>10%, mom6>15% + trend_strong
         allow_cloud                 # price above OR inside Ichimoku cloud
     )
