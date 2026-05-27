@@ -181,7 +181,14 @@ def _group_expander(label: str, dot_color: str, df: pd.DataFrame,
 # ══════════════════════════════════════════════════════════════════
 
 def _summary_bar(df: pd.DataFrame) -> str:
-    strong  = int(((df.get("AccTier",pd.Series()) if "AccTier" in df.columns else pd.Series(dtype=str)).isin(["T1★","A"])) & (~df.get("_hard_stop", pd.Series(False, index=df.index)))).sum() if not df.empty else 0
+    if df.empty:
+        strong = 0
+    elif "AccTier" in df.columns and "_hard_stop" in df.columns:
+        strong = int((df["AccTier"].isin(["T1★","A"]) & ~df["_hard_stop"]).sum())
+    elif "AccTier" in df.columns:
+        strong = int(df["AccTier"].isin(["T1★","A"]).sum())
+    else:
+        strong = 0
     buys    = int((df["Action"]=="✅ BUY").sum())  if not df.empty else 0
     watch   = int((df["Action"]=="👁 WATCH").sum()) if not df.empty else 0
     skip    = int((df["Action"]=="⛔ SKIP").sum())  if not df.empty else 0
