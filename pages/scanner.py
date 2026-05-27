@@ -1,5 +1,13 @@
 """
-pages/scanner.py — Live scanner UI  (v3 — compact layout)
+pages/scanner.py — Live scanner UI  (v4 — layered grouped layout)
+
+Groups results into collapsible sections:
+  🟢 STRONG BUY  — AccTier T1★ or A, no hard stop
+  🟢 BUY         — Action = ✅ BUY (not in Strong Buy)
+  🟡 WATCH       — Action = 👁 WATCH
+  🔴 SELL / SKIP — Action = ⛔ SKIP or hard stop
+
+Summary pill bar at the bottom shows live counts + key signal stats.
 """
 
 import streamlit as st
@@ -20,299 +28,219 @@ from utils.supabase_client import (
     _is_available,
 )
 
-
 # ══════════════════════════════════════════════════════════════════
-#  PAGE CONFIG  — call once, before any other st.* call
+#  CSS
 # ══════════════════════════════════════════════════════════════════
-
-# Inject compact CSS overrides once
 _CSS = """
 <style>
-/* tighter page padding */
-section.main > div { padding-top: 0.6rem !important; }
+section.main > div { padding-top: 0.5rem !important; }
+h1,h2,h3 { margin: 0 !important; padding: 0 !important; }
+h3 { font-size: 1rem !important; font-weight: 600 !important; }
 
-/* smaller default font */
-html, body, [class*="css"] { font-size: 13px; }
-
-/* compact metric cards */
+/* metric cards */
 [data-testid="metric-container"] {
-    background: #0f1923;
-    border: 1px solid #1e3a5f;
-    border-radius: 8px;
-    padding: 6px 10px !important;
+    background:#0f1923; border:1px solid #1e3a5f;
+    border-radius:8px; padding:5px 10px !important;
 }
-[data-testid="metric-container"] label { font-size: 11px !important; color: #94a3b8; }
-[data-testid="metric-container"] [data-testid="stMetricValue"] { font-size: 22px !important; }
+[data-testid="metric-container"] label          { font-size:10px !important; color:#94a3b8; }
+[data-testid="metric-container"] [data-testid="stMetricValue"] { font-size:20px !important; }
 
-/* hide default streamlit title top-margin */
-h1 { margin-top: 0 !important; padding-top: 0 !important; font-size: 1.15rem !important; font-weight: 600 !important; }
-
-/* shrink selectbox / text_input height */
+/* shrink inputs */
 div[data-baseweb="select"] > div,
-div[data-baseweb="input"] > div { min-height: 34px !important; font-size: 12px !important; }
+div[data-baseweb="input"]  > div { min-height:32px !important; font-size:12px !important; }
+label[data-testid="stWidgetLabel"] > div { font-size:11px !important; color:#94a3b8; margin-bottom:1px; }
 
-/* tighter label */
-label[data-testid="stWidgetLabel"] > div { font-size: 11px !important; color: #94a3b8; margin-bottom: 2px; }
+/* expander tighter */
+details > summary { padding: 6px 12px !important; font-size:13px !important; font-weight:500; }
+details > summary:hover { background: rgba(255,255,255,0.04) !important; }
+[data-testid="stExpander"] { border-radius:8px !important; margin-bottom:4px !important; }
 
-/* divider spacing */
-hr { margin: 0.5rem 0 !important; }
-
-/* expander header */
-details summary { font-size: 12px !important; }
+hr { margin: 0.4rem 0 !important; }
 </style>
 """
 
-
 # ══════════════════════════════════════════════════════════════════
-#  SCORING MODE DEFINITIONS
+#  SCORING MODES
 # ══════════════════════════════════════════════════════════════════
-
 SCORING_MODES = {
-    "Standard": {
-        "label":     "🔵 Standard",
-        "desc_short": "All signals — full engine output",
-        "description": "Full engine output. All buy types shown.",
-        "filter_fn": lambda row: True,
-    },
-    "Tier 1 Prime": {
-        "label":     "🏆 Tier 1 Prime",
-        "desc_short": "All 5 pillars fire simultaneously (~90%+)",
-        "description": (
-            "trend_up · in_golden · cci_cross_up_os · qualified ⭐ · above_cloud\n"
-            "Rarest setup — expect 0–5 hits per day."
-        ),
-        "filter_fn": lambda row: row.get("_tier1_prime", False),
-    },
-    "Tier 2+": {
-        "label":     "🥈 Tier 2+",
-        "desc_short": "Any valid buy signal fires",
-        "description": "Fib / Fib+CCI / ABCD / Harmonic / CCI / Norm. Cloud gate must pass.",
-        "filter_fn": lambda row: row.get("_any_buy", False),
-    },
-    "High Prob Zone": {
-        "label":     "🎯 High Prob",
-        "desc_short": "50–61.8% Fib golden zone + trend_up",
-        "description": "Price inside the Fibonacci golden zone AND trend_up. No CCI catalyst needed.",
-        "filter_fn": lambda row: row.get("_high_prob", False),
-    },
-    "CCI Focus": {
-        "label":     "📡 CCI Focus",
-        "desc_short": "CCI crossed up through −100 + trend_up",
-        "description": "Momentum catalyst only — great for catching early reversals.",
-        "filter_fn": lambda row: (
-            row.get("CCI Sig", "") == "BUY" and
-            row.get("Action",  "") != "⛔ SKIP"
-        ),
-    },
-    "Qual Stars ⭐": {
-        "label":     "⭐ Qual Stars",
-        "desc_short": "HTF momentum confirmed + valid buy signal",
-        "description": "mom1>5% · mom3>10% · mom6>15% · price>EMA20>EMA50 — all active.",
-        "filter_fn": lambda row: row.get("Qual", "") == "⭐",
-    },
-    "90% Accuracy": {
-        "label":     "🎯 90% Accuracy",
-        "desc_short": "AccTier T1★ + A only, no hard stops",
-        "description": (
-            "T1★ (~90%+) and A-tier (4-pillar, ~80–85%) only.\n"
-            "Hard-stop conditions excluded. Wait for next-bar open confirmation."
-        ),
-        "filter_fn": lambda row: (
-            row.get("AccTier", "-") in ("T1★", "A") and
-            not row.get("_hard_stop", False)
-        ),
-    },
+    "Standard":      {"label": "🔵 Standard",      "filter_fn": lambda r: True},
+    "Tier 1 Prime":  {"label": "🏆 Tier 1 Prime",  "filter_fn": lambda r: r.get("_tier1_prime", False)},
+    "Tier 2+":       {"label": "🥈 Tier 2+",        "filter_fn": lambda r: r.get("_any_buy", False)},
+    "High Prob Zone":{"label": "🎯 High Prob",      "filter_fn": lambda r: r.get("_high_prob", False)},
+    "CCI Focus":     {"label": "📡 CCI Focus",      "filter_fn": lambda r: r.get("CCI Sig","")=="BUY" and r.get("Action","")!="⛔ SKIP"},
+    "Qual Stars ⭐": {"label": "⭐ Qual Stars",     "filter_fn": lambda r: r.get("Qual","")=="⭐"},
+    "90% Accuracy":  {"label": "🎯 90% Accuracy",   "filter_fn": lambda r: r.get("AccTier","-") in ("T1★","A") and not r.get("_hard_stop", False)},
 }
 
 _MODE_COLOURS = {
-    "Standard":      "#3b82f6",
-    "Tier 1 Prime":  "#f59e0b",
-    "Tier 2+":       "#6366f1",
-    "High Prob Zone":"#0d9488",
-    "CCI Focus":     "#ec4899",
-    "Qual Stars ⭐": "#eab308",
-    "90% Accuracy":  "#16a34a",
+    "Standard":"#3b82f6","Tier 1 Prime":"#f59e0b","Tier 2+":"#6366f1",
+    "High Prob Zone":"#0d9488","CCI Focus":"#ec4899",
+    "Qual Stars ⭐":"#eab308","90% Accuracy":"#16a34a",
 }
-
 
 # ══════════════════════════════════════════════════════════════════
 #  TABLE HELPERS
 # ══════════════════════════════════════════════════════════════════
+def _cell(val, bg, fg="#fff", fs="12px"):
+    return (f'<span style="background:{bg};color:{fg};padding:2px 6px;'
+            f'border-radius:3px;white-space:nowrap;font-size:{fs}">{val}</span>')
 
-def _cell(val: str, bg: str, fg: str = "#ffffff") -> str:
-    return (
-        f'<span style="background:{bg};color:{fg};padding:2px 5px;'
-        f'border-radius:3px;white-space:nowrap;font-size:12px">{val}</span>'
-    )
+def _tier_badge(t):
+    c = {"Tier 1":("#f59e0b","#000"),"Tier 2":("#6366f1","#fff"),"Other":("#334155","#94a3b8")}
+    bg,fg = c.get(t,("#334155","#94a3b8"))
+    return _cell(t,bg,fg)
 
-def _tier_badge(tier: str) -> str:
-    colours = {
-        "Tier 1": ("#f59e0b", "#000"),
-        "Tier 2": ("#6366f1", "#fff"),
-        "Other":  ("#334155", "#94a3b8"),
-    }
-    bg, fg = colours.get(tier, ("#334155", "#94a3b8"))
-    return _cell(tier, bg, fg)
+def _acc_badge(t):
+    bg,fg = acc_tier_color(t)
+    return _cell(t,bg,fg)
 
-def _acc_badge(acc_tier: str) -> str:
-    bg, fg = acc_tier_color(acc_tier)
-    return _cell(acc_tier, bg, fg)
+def _stop_cell(reason):
+    if not reason: return ""
+    s = reason.replace("🚫 ","")[:20]+("…" if len(reason)>23 else "")
+    return (f'<span style="background:#7f1d1d;color:#fca5a5;padding:2px 5px;'
+            f'border-radius:3px;font-size:11px;white-space:nowrap" title="{reason}">🚫 {s}</span>')
 
-def _hard_stop_cell(reason: str) -> str:
-    if not reason:
-        return ""
-    short = reason.replace("🚫 ", "")[:22] + ("…" if len(reason) > 25 else "")
-    return (
-        f'<span style="background:#7f1d1d;color:#fca5a5;padding:2px 5px;'
-        f'border-radius:3px;font-size:11px;white-space:nowrap" title="{reason}">'
-        f'🚫 {short}</span>'
-    )
+_HEADERS = ["#","Stock","Score","AccTier","Action","Buy Type",
+            "CCI","CCI State","CCI Sig","Qual","%Chg","Entry","SL","T1","T2","T3"]
 
-_SORT_COLS = {
-    "Score": "Score", "AccTier": "AccTier", "AccScore": "AccScore",
-    "Stock": "Stock", "Tier": "Tier", "Action": "Action",
-    "Buy Type": "Buy Type", "CCI": "CCI", "CCI State": "CCI State",
-    "CCI Sig": "CCI Sig", "Qual": "Qual", "%Chg": "%Chg",
-    "Entry": "Entry", "SL": "SL", "T1": "T1", "T2": "T2", "T3": "T3",
-}
+def _render_table(df, cci_ob, cci_os):
+    if df.empty:
+        st.caption("  No stocks in this group.")
+        return
+    rows = []
+    for rank,(_, row) in enumerate(df.iterrows(), 1):
+        sc   = int(row["Score"])
+        cv   = float(row["CCI"])
+        bg   = score_color(sc)
+        ccib = cci_color(cv, cci_ob, cci_os)
+        stop = bool(row.get("_hard_stop", False))
+        rs   = ' style="opacity:0.5"' if stop else ""
 
-_HEADERS = [
-    "#", "Stock", "Tier", "Score", "AccTier", "AccScore", "HardStop",
-    "Action", "Buy Type", "CCI", "CCI State", "CCI Sig", "Qual",
-    "%Chg", "Entry", "SL", "T1", "T2", "T3",
-]
+        sc_c  = lambda v: _cell(v,bg,"#000")
+        cc_c  = lambda v: _cell(v,ccib,"#000")
+        tl_c  = lambda v: _cell(v,"#0d9488","#fff")
+        sl_c  = lambda v: _cell(v,"#dc2626","#fff")
+        en_c  = lambda v: _cell(v,"#1d4ed8","#fff")
 
+        at = str(row.get("AccTier","-"))
+        hs = str(row.get("HardStop",""))
 
-def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int,
-                  sort_col: str = "Score", sort_asc: bool = False) -> None:
-    rows_html = []
-    for rank, (_, row) in enumerate(df.iterrows(), start=1):
-        sc      = int(row["Score"])
-        cci_v   = float(row["CCI"])
-        bg      = score_color(sc)
-        ccib    = cci_color(cci_v, cci_ob, cci_os)
-        is_stop = bool(row.get("_hard_stop", False))
-        rs      = ' style="opacity:0.5"' if is_stop else ""
-
-        def sc_cell(v):   return _cell(v, bg, "#000")
-        def cci_cell(v):  return _cell(v, ccib, "#000")
-        def teal_cell(v): return _cell(v, "#0d9488", "#fff")
-        def sl_cell(v):   return _cell(v, "#dc2626", "#fff")
-        def en_cell(v):   return _cell(v, "#1d4ed8", "#fff")
-
-        acc_tier  = str(row.get("AccTier",  "-"))
-        acc_score = int(row.get("AccScore", 0))
-        hard_stop = str(row.get("HardStop", ""))
-
-        rows_html.append(
+        rows.append(
             f"<tr{rs}>"
-            f"<td>{rank}</td>"
-            f"<td>{sc_cell(str(row['Stock']))}</td>"
-            f"<td>{_tier_badge(str(row.get('Tier','Other')))}</td>"
-            f"<td>{sc_cell(str(sc))}</td>"
-            f"<td>{_acc_badge(acc_tier)}</td>"
-            f"<td>{sc_cell(str(acc_score)) if acc_score else '<span style=\"color:#475569\">—</span>'}</td>"
-            f"<td>{_hard_stop_cell(hard_stop)}</td>"
-            f"<td>{sc_cell(str(row['Action']))}</td>"
-            f"<td>{sc_cell(str(row.get('Buy Type','-')))}</td>"
-            f"<td>{cci_cell(str(int(cci_v)))}</td>"
-            f"<td>{cci_cell(str(row['CCI State']))}</td>"
-            f"<td>{cci_cell(str(row['CCI Sig']))}</td>"
-            f"<td>{'⭐' if row['Qual']=='⭐' else '✔' if row['Qual']=='✔' else '✖'}</td>"
-            f"<td>{sc_cell(str(row['%Chg'])+'%')}</td>"
-            f"<td>{en_cell(str(row['Entry']))}</td>"
-            f"<td>{sl_cell(str(row['SL']))}</td>"
-            f"<td>{teal_cell(str(row['T1']))}</td>"
-            f"<td>{teal_cell(str(row['T2']))}</td>"
-            f"<td>{teal_cell(str(row['T3']))}</td>"
+            f"<td style='color:#475569;font-size:11px'>{rank}</td>"
+            f"<td>{sc_c(str(row['Stock']))}</td>"
+            f"<td>{sc_c(str(sc))}</td>"
+            f"<td>{_acc_badge(at)}</td>"
+            f"<td>{sc_c(str(row['Action']))}</td>"
+            f"<td>{sc_c(str(row.get('Buy Type','-')))}</td>"
+            f"<td>{cc_c(str(int(cv)))}</td>"
+            f"<td>{cc_c(str(row['CCI State']))}</td>"
+            f"<td>{cc_c(str(row['CCI Sig']))}</td>"
+            f"<td style='font-size:13px'>{'⭐' if row['Qual']=='⭐' else '✔' if row['Qual']=='✔' else '✖'}</td>"
+            f"<td>{sc_c(str(row['%Chg'])+'%')}</td>"
+            f"<td>{en_c(str(row['Entry']))}</td>"
+            f"<td>{sl_c(str(row['SL']))}</td>"
+            f"<td>{tl_c(str(row['T1']))}</td>"
+            f"<td>{tl_c(str(row['T2']))}</td>"
+            f"<td>{tl_c(str(row['T3']))}</td>"
             f"</tr>"
         )
 
-    def _th(h: str) -> str:
-        if h == "#":
-            return '<th style="min-width:22px;font-size:11px">#</th>'
-        active = (h == sort_col)
-        arrow  = (" ▲" if sort_asc else " ▼") if active else ""
-        is_acc = h in ("AccTier", "AccScore", "HardStop")
-        if active:
-            bg_s = "#14532d" if is_acc else "#1e3a5f"
-            fg_s = "#86efac" if is_acc else "#60a5fa"
-            bd_s = "#22c55e" if is_acc else "#3b82f6"
-            style = f'style="background:{bg_s};color:{fg_s};border-bottom:2px solid {bd_s};font-size:11px"'
-        elif is_acc:
-            style = 'style="background:#052e16;color:#86efac;font-size:11px"'
-        else:
-            style = 'style="font-size:11px"'
-        return f"<th {style}>{h}{arrow}</th>"
+    def th(h):
+        style = 'style="font-size:11px;color:#64748b;font-weight:500;text-align:left;padding:4px 6px;border-bottom:1px solid #1e293b"'
+        return f"<th {style}>{h}</th>"
 
-    header = "<thead><tr>" + "".join(_th(h) for h in _HEADERS) + "</tr></thead>"
+    header = "<thead><tr>" + "".join(th(h) for h in _HEADERS) + "</tr></thead>"
     st.markdown(
-        '<div style="overflow-x:auto">'
+        '<div style="overflow-x:auto;margin-top:4px">'
         '<table style="border-collapse:collapse;width:100%;font-size:12px">'
-        f"{header}<tbody>{''.join(rows_html)}</tbody>"
-        "</table></div>",
+        f'{header}<tbody>{"".join(rows)}</tbody>'
+        '</table></div>',
         unsafe_allow_html=True,
     )
 
 
 # ══════════════════════════════════════════════════════════════════
-#  ACCURACY LEGEND  (single compact line)
+#  GROUP EXPANDERS
 # ══════════════════════════════════════════════════════════════════
 
-def _accuracy_legend_html() -> str:
-    items = [
-        ("#f59e0b", "#000", "T1★", "~90%+"),
-        ("#6366f1", "#fff", "A",   "~85%"),
-        ("#0d9488", "#fff", "B",   "~70%"),
-        ("#64748b", "#fff", "C",   "~60%"),
-        ("#dc2626", "#fff", "✖",   "Hard stop"),
+def _group_expander(label: str, dot_color: str, df: pd.DataFrame,
+                    cci_ob: int, cci_os: int, expanded: bool = False):
+    """Renders one collapsible group section."""
+    count = len(df)
+    with st.expander(
+        f"{'🟢' if dot_color=='green' else '🟡' if dot_color=='yellow' else '🔴'}"
+        f"  {label} · {count}",
+        expanded=expanded,
+    ):
+        _render_table(df, cci_ob, cci_os)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  BOTTOM SUMMARY PILL BAR
+# ══════════════════════════════════════════════════════════════════
+
+def _summary_bar(df: pd.DataFrame) -> str:
+    strong  = int(((df.get("AccTier",pd.Series()) if "AccTier" in df.columns else pd.Series(dtype=str)).isin(["T1★","A"])) & (~df.get("_hard_stop", pd.Series(False, index=df.index)))).sum() if not df.empty else 0
+    buys    = int((df["Action"]=="✅ BUY").sum())  if not df.empty else 0
+    watch   = int((df["Action"]=="👁 WATCH").sum()) if not df.empty else 0
+    skip    = int((df["Action"]=="⛔ SKIP").sum())  if not df.empty else 0
+    golden  = int(df["_in_golden"].sum())           if "_in_golden"  in df.columns else 0
+    cci_buy = int((df["CCI Sig"]=="BUY").sum())     if "CCI Sig"     in df.columns else 0
+    cci_exit= int((df["CCI Sig"]=="EXIT").sum())    if "CCI Sig"     in df.columns else 0
+    cci_ext = int((df["CCI Sig"]=="EXT").sum())     if "CCI Sig"     in df.columns else 0
+
+    pills = [
+        ("#16a34a","#fff",  f"⭐ {strong} STRONG BUY"),
+        ("#22c55e","#000",  f"✅ {buys} BUY"),
+        ("#f59e0b","#000",  f"👁 {watch} WATCH"),
+        ("#dc2626","#fff",  f"🔴 {skip} SKIP"),
+        ("#0d9488","#fff",  f"+ {golden} In Golden Zone"),
+        ("#6366f1","#fff",  f"CCI Buy {cci_buy}"),
+        ("#ec4899","#fff",  f"CCI Exit {cci_exit}"),
+        ("#64748b","#fff",  f"CCI Ext {cci_ext}"),
     ]
     spans = "".join(
-        f'<span style="background:{bg};color:{fg};padding:1px 7px;border-radius:3px;'
-        f'font-size:11px;white-space:nowrap"><b>{lbl}</b> {desc}</span>'
-        for bg, fg, lbl, desc in items
+        f'<span style="background:{bg};color:{fg};padding:3px 10px;border-radius:20px;'
+        f'font-size:12px;font-weight:500;white-space:nowrap">{lbl}</span>'
+        for bg,fg,lbl in pills
     )
-    return f'<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">{spans}</div>'
+    return (
+        '<div style="position:sticky;bottom:0;background:#0a0f1a;border-top:1px solid #1e293b;'
+        f'padding:8px 0 6px;display:flex;flex-wrap:wrap;gap:6px;z-index:100">{spans}</div>'
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
-#  METRICS  (compact 4+4 grid)
+#  METRICS ROW
 # ══════════════════════════════════════════════════════════════════
 
-def _render_metrics(df: pd.DataFrame) -> None:
-    t1       = int(df["_tier1_prime"].sum())       if "_tier1_prime" in df.columns else 0
-    t2       = int(df["_any_buy"].sum())            if "_any_buy"     in df.columns else 0
-    hp       = int(df["_high_prob"].sum())          if "_high_prob"   in df.columns else 0
-    cci_buys = int((df["CCI Sig"] == "BUY").sum())
-    qs       = int((df["Qual"]    == "⭐").sum())
-    buys     = int((df["Action"]  == "✅ BUY").sum())
-    acc_t1   = int((df["AccTier"] == "T1★").sum()) if "AccTier"    in df.columns else 0
-    acc_a    = int((df["AccTier"] == "A"  ).sum()) if "AccTier"    in df.columns else 0
-    stops    = int(df["_hard_stop"].sum())          if "_hard_stop" in df.columns else 0
-    acc_b    = int((df["AccTier"] == "B"  ).sum()) if "AccTier"    in df.columns else 0
+def _render_metrics(df: pd.DataFrame):
+    if df.empty: return
+    t1   = int(df["_tier1_prime"].sum())       if "_tier1_prime" in df.columns else 0
+    t2   = int(df["_any_buy"].sum())            if "_any_buy"     in df.columns else 0
+    hp   = int(df["_high_prob"].sum())          if "_high_prob"   in df.columns else 0
+    cb   = int((df["CCI Sig"]=="BUY").sum())
+    qs   = int((df["Qual"]=="⭐").sum())
+    buy  = int((df["Action"]=="✅ BUY").sum())
+    at1  = int((df["AccTier"]=="T1★").sum())   if "AccTier"   in df.columns else 0
+    aa   = int((df["AccTier"]=="A"  ).sum())   if "AccTier"   in df.columns else 0
+    stp  = int(df["_hard_stop"].sum())          if "_hard_stop" in df.columns else 0
 
     cols = st.columns(9)
-    data = [
-        ("🏆 T1 Prime",  t1),
-        ("🥈 T2 Buys",   t2),
-        ("🎯 High Prob", hp),
-        ("📡 CCI ↑",     cci_buys),
-        ("⭐ Qual",      qs),
-        ("✅ BUY",       buys),
-        ("T1★ ~90%",    acc_t1),
-        ("A ~85%",       acc_a),
-        ("🚫 Stops",     stops),
-    ]
-    for col, (label, val) in zip(cols, data):
-        col.metric(label, val)
+    for col,(lbl,val) in zip(cols,[
+        ("🏆 T1 Prime",t1),("🥈 T2 Buys",t2),("🎯 Hi Prob",hp),
+        ("📡 CCI ↑",cb),("⭐ Qual",qs),("✅ BUY",buy),
+        ("T1★ ~90%",at1),("A ~85%",aa),("🚫 Stops",stp),
+    ]):
+        col.metric(lbl,val)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  MAIN PAGE
+#  MAIN
 # ══════════════════════════════════════════════════════════════════
 
 def render(settings: dict) -> None:
-    # ── CSS ───────────────────────────────────────────────────────
     st.markdown(_CSS, unsafe_allow_html=True)
 
     symbols      = settings.get("symbols",      NIFTY500_SYMBOLS)
@@ -324,70 +252,68 @@ def render(settings: dict) -> None:
     refresh_secs = settings.get("refresh_mins", 5) * 60
     supabase_ok  = _is_available()
 
-    # ── COMPACT HEADER ROW ────────────────────────────────────────
-    h1, h2 = st.columns([3, 1])
-    with h1:
+    # ── HEADER ROW ────────────────────────────────────────────────
+    ha, hb = st.columns([5, 1])
+    with ha:
         st.markdown("### ⚡ NSE Master Scanner Pro")
-    with h2:
-        st.caption(
-            "🟢 Supabase" if supabase_ok else "🔴 Supabase offline",
-        )
+    with hb:
+        st.caption("🟢 Supabase" if supabase_ok else "🔴 Supabase offline")
 
-    # ── ROW 1: mode selector + run button + snapshot label ────────
-    r1a, r1b, r1c = st.columns([3, 1, 1])
-    with r1a:
+    # ── CONTROL ROW: mode · snapshot label · run button ──────────
+    ca, cb_, cc = st.columns([3, 1, 1])
+    with ca:
         mode_labels = {k: v["label"] for k, v in SCORING_MODES.items()}
-        selected_mode_key = st.selectbox(
-            "Mode",
-            options=list(mode_labels.keys()),
-            format_func=lambda k: mode_labels[k],
-            key="scoring_mode",
-        )
-    with r1b:
-        save_label = st.text_input("Snapshot label", placeholder="e.g. morning")
-    with r1c:
+        sel = st.selectbox("Mode", options=list(mode_labels.keys()),
+                           format_func=lambda k: mode_labels[k], key="scoring_mode")
+    with cb_:
+        snap_label = st.text_input("Snapshot", placeholder="morning scan")
+    with cc:
         st.markdown("<div style='margin-top:20px'>", unsafe_allow_html=True)
         run_btn = st.button("🔍 Run Scanner", type="primary", use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    mode_cfg = SCORING_MODES[selected_mode_key]
-    st.caption(f"ℹ️ {mode_cfg['desc_short']}")
-
-    # Accuracy legend — compact single line
-    st.markdown(_accuracy_legend_html(), unsafe_allow_html=True)
+    mode_cfg = SCORING_MODES[sel]
 
     if auto_refresh:
-        st.info(f"🔄 Auto-refresh every {settings.get('refresh_mins',5)} min — disable in ⚙️ Settings.", icon="⏱")
+        st.info(f"🔄 Auto-refresh every {settings.get('refresh_mins',5)} min", icon="⏱")
 
-    st.divider()
+    # ── FILTER ROW ────────────────────────────────────────────────
+    fa, fb, fc, fd, fe = st.columns([2, 1, 1, 1, 1])
+    with fa:
+        search = st.text_input("🔎 Search", placeholder="RELIANCE, TCS…")
+    with fb:
+        act_f  = st.selectbox("Action", ["All","✅ BUY","👁 WATCH","⛔ SKIP"])
+    with fc:
+        cci_f  = st.selectbox("CCI State", ["All","OB","OS","BULL","BEAR"])
+    with fd:
+        tier_f = st.selectbox("Tier", ["All","Tier 1","Tier 2","Other"])
+    with fe:
+        hide_stops = st.toggle("Hide 🚫 stops", value=True, key="hide_stops")
 
-    # ── SCAN TRIGGER ─────────────────────────────────────────────
+    # ── SCAN ──────────────────────────────────────────────────────
     if run_btn:
         st.session_state.pop("scan_df", None)
         st.session_state["last_auto_scan"] = time.time()
 
     if run_btn or "scan_df" not in st.session_state:
         prog = st.progress(0.0, text="Scanning…")
-        with st.spinner("Fetching data and scoring stocks…"):
-            df = run_scanner(
-                symbols     = symbols,
-                cci_len     = cci_len,
-                cci_ob      = cci_ob,
-                cci_os      = cci_os,
-                max_workers = workers,
-                progress_cb = lambda p: prog.progress(p, text=f"Scanning… {int(p*100)}%"),
+        with st.spinner("Fetching & scoring…"):
+            df_raw = run_scanner(
+                symbols=symbols, cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
+                max_workers=workers,
+                progress_cb=lambda p: prog.progress(p, text=f"Scanning… {int(p*100)}%"),
             )
         prog.empty()
-        if df.empty:
+        if df_raw.empty:
             st.warning("No results — check symbols or data source.")
             return
-        st.session_state["scan_df"] = df
+        st.session_state["scan_df"] = df_raw
         st.session_state["scan_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         st.session_state.setdefault("last_auto_scan", time.time())
         if supabase_ok:
-            with st.spinner("Saving to Supabase…"):
-                ok = save_scan_snapshot(df, label=save_label)
-            st.success("✅ Saved to Supabase.") if ok else st.warning("⚠️ Supabase save failed.")
+            with st.spinner("Saving…"):
+                ok = save_scan_snapshot(df_raw, label=snap_label)
+            (st.success("✅ Saved.") if ok else st.warning("⚠️ Supabase save failed."))
 
     df = st.session_state.get("scan_df", pd.DataFrame())
     if df.empty:
@@ -399,99 +325,52 @@ def render(settings: dict) -> None:
 
     # ── METRICS ───────────────────────────────────────────────────
     _render_metrics(df)
-
     st.divider()
-
-    # ── FILTER ROW 1: search · action · CCI · tier ────────────────
-    fa, fb, fc, fd = st.columns([2, 1, 1, 1])
-    with fa:
-        search_query = st.text_input("🔎 Search", placeholder="Symbol… RELIANCE, TCS")
-    with fb:
-        action_filter = st.selectbox("Action", ["All", "✅ BUY", "👁 WATCH", "⛔ SKIP"])
-    with fc:
-        cci_filter = st.selectbox("CCI State", ["All", "OB", "OS", "BULL", "BEAR"])
-    with fd:
-        tier_filter = st.selectbox("Tier", ["All", "Tier 1", "Tier 2", "Other"])
-
-    # ── FILTER ROW 2: acc tiers · hard stop toggle · sort ─────────
-    fe, ff, fg_, fh = st.columns([2, 1, 2, 1])
-    with fe:
-        selected_acc_tiers = st.multiselect(
-            "Acc Tier",
-            options=["T1★", "A", "B", "C", "-"],
-            default=["T1★", "A", "B", "C", "-"],
-            key="acc_tier_filter",
-        )
-    with ff:
-        exclude_stops = st.toggle("Hide 🚫 stops", value=True, key="exclude_stops")
-    with fg_:
-        sort_col = st.selectbox(
-            "Sort by",
-            options=list(_SORT_COLS.keys()),
-            index=0,
-            key="sort_col_select",
-        )
-    with fh:
-        sort_asc = st.toggle("Asc ↑", value=False, key="sort_asc_toggle")
-
-    st.session_state["sort_col"] = sort_col
-    st.session_state["sort_asc"] = sort_asc
 
     # ── APPLY FILTERS ─────────────────────────────────────────────
     fdf = df.copy()
-    if search_query.strip():
-        fdf = fdf[fdf["Stock"].str.contains(search_query.strip(), case=False, na=False)]
-    if action_filter != "All":
-        fdf = fdf[fdf["Action"] == action_filter]
-    if cci_filter != "All":
-        fdf = fdf[fdf["CCI State"] == cci_filter]
-    if tier_filter != "All":
-        fdf = fdf[fdf["Tier"] == tier_filter]
-    if "AccTier" in fdf.columns and selected_acc_tiers:
-        fdf = fdf[fdf["AccTier"].isin(selected_acc_tiers)]
-    if exclude_stops and "_hard_stop" in fdf.columns:
+    if search.strip():
+        fdf = fdf[fdf["Stock"].str.contains(search.strip(), case=False, na=False)]
+    if act_f  != "All": fdf = fdf[fdf["Action"]    == act_f]
+    if cci_f  != "All": fdf = fdf[fdf["CCI State"] == cci_f]
+    if tier_f != "All": fdf = fdf[fdf["Tier"]       == tier_f]
+    if hide_stops and "_hard_stop" in fdf.columns:
         fdf = fdf[~fdf["_hard_stop"]]
     fdf = fdf[fdf.apply(mode_cfg["filter_fn"], axis=1)]
 
-    df_col = _SORT_COLS.get(sort_col, "Score")
-    if df_col in fdf.columns:
-        fdf = fdf.sort_values(df_col, ascending=sort_asc)
+    # ── PARTITION INTO GROUPS ─────────────────────────────────────
+    # Strong Buy  = AccTier T1★ or A  AND  Action = BUY  AND  no hard stop
+    # Buy         = Action BUY (remaining)
+    # Watch       = Action WATCH
+    # Sell/Skip   = Action SKIP or hard stop (only shown if hide_stops is OFF)
 
-    # Result count badge
-    mc = _MODE_COLOURS[selected_mode_key]
-    st.markdown(
-        f'<div style="margin:6px 0 4px">'
-        f'<span style="background:{mc};color:#fff;padding:2px 10px;border-radius:4px;font-size:12px">'
-        f'<b>{mode_labels[selected_mode_key]}</b></span>'
-        f'&nbsp;<span style="color:#94a3b8;font-size:12px">{len(fdf)} stocks match</span>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
+    has_acc = "AccTier" in fdf.columns
+    has_hs  = "_hard_stop" in fdf.columns
 
-    # ── MAIN TABLE ────────────────────────────────────────────────
-    _render_table(fdf, cci_ob, cci_os, sort_col=sort_col, sort_asc=sort_asc)
+    if has_acc and has_hs:
+        mask_strong = fdf["AccTier"].isin(["T1★","A"]) & (fdf["Action"]=="✅ BUY") & ~fdf["_hard_stop"]
+    elif has_acc:
+        mask_strong = fdf["AccTier"].isin(["T1★","A"]) & (fdf["Action"]=="✅ BUY")
+    else:
+        mask_strong = pd.Series(False, index=fdf.index)
 
-    # ── 90% ACCURACY QUICK-VIEW ───────────────────────────────────
-    st.divider()
-    with st.expander("🎯 90% Accuracy shortlist (T1★ + A, no hard stops)", expanded=False):
-        acc_df = (
-            df[df["AccTier"].isin(["T1★", "A"]) & ~df["_hard_stop"]].copy()
-            if "AccTier" in df.columns and "_hard_stop" in df.columns
-            else pd.DataFrame()
-        )
-        if acc_df.empty:
-            st.info("No T1★ or A-tier signals this scan.")
-        else:
-            acc_df = acc_df.sort_values("AccScore", ascending=False)
-            t1c = int((acc_df["AccTier"] == "T1★").sum())
-            ac  = int((acc_df["AccTier"] == "A"  ).sum())
-            st.caption(
-                f"**{len(acc_df)} candidates** — T1★: {t1c} · A: {ac} "
-                "· Wait for next-bar open before entry."
-            )
-            _render_table(acc_df, cci_ob, cci_os, sort_col="AccScore", sort_asc=False)
+    df_strong = fdf[mask_strong].sort_values("AccScore", ascending=False) if has_acc else fdf[mask_strong]
+    df_buy    = fdf[~mask_strong & (fdf["Action"]=="✅ BUY")].sort_values("Score", ascending=False)
+    df_watch  = fdf[fdf["Action"]=="👁 WATCH"].sort_values("Score", ascending=False)
+    df_skip   = fdf[fdf["Action"]=="⛔ SKIP"].sort_values("Score", ascending=False)
 
-    # ── WATCHLIST ─────────────────────────────────────────────────
+    # ── GROUPED EXPANDERS ─────────────────────────────────────────
+    _group_expander("STRONG BUY",  "green",  df_strong, cci_ob, cci_os, expanded=True)
+    _group_expander("BUY",         "green",  df_buy,    cci_ob, cci_os, expanded=False)
+    _group_expander("WATCH",       "yellow", df_watch,  cci_ob, cci_os, expanded=False)
+    if not hide_stops:
+        _group_expander("SELL / SKIP", "red", df_skip,  cci_ob, cci_os, expanded=False)
+
+    # ── SUMMARY PILL BAR ──────────────────────────────────────────
+    # Compute on full df (not filtered) for global context
+    st.markdown(_summary_bar(df), unsafe_allow_html=True)
+
+    # ── WATCHLIST & ADD ───────────────────────────────────────────
     st.divider()
     wl_col, add_col = st.columns(2)
 
@@ -499,16 +378,13 @@ def render(settings: dict) -> None:
         st.markdown("**⭐ Watchlist**")
         wl: list[dict] = st.session_state.get("watchlist", [])
         if wl:
-            wl_df    = pd.DataFrame(wl)
-            cols     = [c for c in ["symbol", "notes"] if c in wl_df.columns]
-            st.dataframe(
-                wl_df[cols].rename(columns={"symbol": "Symbol", "notes": "Notes"}),
-                use_container_width=True, hide_index=True,
-            )
-            wl_syms = [w["symbol"] for w in wl]
-            pick    = st.selectbox("Highlight", ["— none —"] + wl_syms, key="wl_pick")
+            wl_df = pd.DataFrame(wl)
+            cols  = [c for c in ["symbol","notes"] if c in wl_df.columns]
+            st.dataframe(wl_df[cols].rename(columns={"symbol":"Symbol","notes":"Notes"}),
+                         use_container_width=True, hide_index=True)
+            pick = st.selectbox("Highlight", ["— none —"]+[w["symbol"] for w in wl], key="wl_pick")
             if pick != "— none —":
-                match = df[df["Stock"] == pick]
+                match = df[df["Stock"]==pick]
                 if not match.empty:
                     st.markdown(f"**{pick}:**")
                     _render_table(match, cci_ob, cci_os)
@@ -520,10 +396,8 @@ def render(settings: dict) -> None:
     with add_col:
         st.markdown("**➕ Add to Watchlist**")
         wa, wb = st.columns(2)
-        with wa:
-            wl_sym  = st.text_input("Symbol", placeholder="RELIANCE")
-        with wb:
-            wl_note = st.text_input("Note", placeholder="breakout")
+        with wa: wl_sym  = st.text_input("Symbol", placeholder="RELIANCE")
+        with wb: wl_note = st.text_input("Note",   placeholder="breakout")
         if st.button("Add", use_container_width=True):
             if wl_sym.strip():
                 sym = wl_sym.strip().upper()
@@ -546,7 +420,7 @@ def render(settings: dict) -> None:
     st.download_button(
         "⬇️ Download CSV",
         data=csv.to_csv(index=False),
-        file_name=f"scan_{selected_mode_key.replace(' ','_')}_{ts.replace(':','-').replace(' ','_')}.csv",
+        file_name=f"scan_{sel.replace(' ','_')}_{ts.replace(':','-').replace(' ','_')}.csv",
         mime="text/csv",
     )
 
