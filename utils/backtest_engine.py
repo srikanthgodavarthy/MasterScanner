@@ -17,8 +17,16 @@ BUGS FIXED vs live repo (refs/heads/main as of May 2025):
 
 ADDED:
   tier1_only param — when True, only signals where ALL 5 pillars align are
-  simulated: trend_up + in_golden + cci_cross_up_os + qualified + above_cloud.
+  simulated: trend_up + in_golden_relaxed + recent_cci_recovery + qualified
+  + allow_cloud.
   is_tier1_prime column added to signal rows and trade output for stats slicing.
+
+TIER 1 PRIME GATE — RELAXED vs STRICT:
+  cci_cross_up_os   → recent_cci_recovery  (5-bar lookback window)
+  in_golden         → in_golden_relaxed    (38.2–61.8% fib retracement)
+  above_cloud       → allow_cloud          (above OR inside Ichimoku cloud)
+  trend_up          — unchanged
+  qualified         — unchanged
 """
 
 import pandas as pd
@@ -77,7 +85,13 @@ def generate_signals_historical(
 
     tier1_only=True restricts signals to bars where ALL five structural
     conditions align simultaneously (rarest, highest-conviction setup):
-        trend_up + in_golden + cci_cross_up_os + qualified + above_cloud
+        trend_up + in_golden_relaxed + recent_cci_recovery + qualified
+        + allow_cloud
+
+    Tier 1 Prime gate is RELAXED vs the original strict gate:
+        cci_cross_up_os  → recent_cci_recovery  (any cross in last 5 bars)
+        in_golden        → in_golden_relaxed    (38.2–61.8% retracement)
+        above_cloud      → allow_cloud          (above OR inside cloud)
     """
     if df.empty or len(df) < 210:
         return pd.DataFrame()
@@ -140,17 +154,24 @@ def generate_signals_historical(
                 rs = (cur_c / c5 - 1) - (n_now / n5 - 1)
 
         # ── Fibonacci ───────────────────────────────────────────────
-        win_s  = max(0, i - lookback)
-        sw_hi  = float(h.iloc[win_s:i].max())   # excludes bar i → no look-ahead
-        sw_lo  = float(l.iloc[win_s:i].min())
+        win_s   = max(0, i - lookback)
+        sw_hi   = float(h.iloc[win_s:i].max())   # excludes bar i → no look-ahead
+        sw_lo   = float(l.iloc[win_s:i].min())
         fib_rng = sw_hi - sw_lo
+        fib382  = sw_hi - fib_rng * 0.382        # upper bound for relaxed zone
         fib500  = sw_hi - fib_rng * 0.500
         fib618  = sw_hi - fib_rng * 0.618
         fib_ext127 = sw_hi + fib_rng * 0.272
         fib_ext161 = sw_hi + fib_rng * 0.618
 
-        in_golden   = (cur_c >= fib618 - cur_atr * atr_prox and
-                       cur_c <= fib500 + cur_atr * atr_prox)
+        # Original strict golden zone (50–61.8%) — kept for score calculation
+        in_golden = (cur_c >= fib618 - cur_atr * atr_prox and
+                     cur_c <= fib500 + cur_atr * atr_prox)
+
+        # Relaxed golden zone (38.2–61.8%) — used for Tier 1 Prime gate
+        in_golden_relaxed = (cur_c >= fib618 - cur_atr * atr_prox and
+                             cur_c <= fib382 + cur_atr * atr_prox)
+
         near_ext127 = abs(cur_c - fib_ext127) < cur_atr * atr_prox
         near_ext161 = abs(cur_c - fib_ext161) < cur_atr * atr_prox
 
@@ -159,6 +180,15 @@ def generate_signals_historical(
         cci_cross_dn_ob = prev_cci >= cci_ob and cur_cci < cci_ob
         cci_extended    = cur_cci > cci_ob * 2
         in_golden_cci   = in_golden and cur_cci <= cci_os
+
+        # Relaxed CCI signal: true if CCI crossed up through oversold level
+        # on any bar within the last 5 bars (including current bar i).
+        # This catches setups where the recovery happened 1–4 bars before
+        # the fib/cloud conditions aligned on the same bar.
+        recent_cci_recovery = any(
+            float(cci_s.iloc[j - 1]) <= cci_os and float(cci_s.iloc[j]) > cci_os
+            for j in range(max(1, i - 4), i + 1)
+        )
 
         # ── Qualification ───────────────────────────────────────────
         mom1 = (cur_c / float(c.iloc[i-21])  - 1) * 100 if i >= 21  else 0
@@ -173,15 +203,20 @@ def generate_signals_historical(
         inside_cloud = cur_cb <= cur_c <= cur_ct
         below_cloud  = cur_c < cur_cb
 
-        # ── Tier 1 Prime — exact mirror of scanner_engine ────────────
-        # All five structural conditions must align simultaneously.
-        # This is the rarest, highest-conviction setup in the engine.
+        # Relaxed cloud gate: above OR inside cloud (was: above_cloud only)
+        allow_cloud  = above_cloud or inside_cloud
+
+        # ── Tier 1 Prime — relaxed gate ──────────────────────────────
+        # Three conditions relaxed vs the original strict gate:
+        #   cci_cross_up_os  → recent_cci_recovery  (5-bar lookback)
+        #   in_golden        → in_golden_relaxed    (38.2–61.8% fib)
+        #   above_cloud      → allow_cloud          (above OR inside cloud)
         is_tier1_prime = (
-            trend_up        and   # EMA stack: price > EMA200, EMA20 > EMA50
-            in_golden       and   # price inside 50–61.8% fib retracement
-            cci_cross_up_os and   # CCI crossed up through -100 on this bar
-            qualified       and   # mom1>5%, mom3>10%, mom6>15% + trend_strong
-            above_cloud           # price above Ichimoku cloud top
+            trend_up              and   # EMA stack: price > EMA200, EMA20 > EMA50
+            in_golden_relaxed     and   # price inside 38.2–61.8% fib retracement
+            recent_cci_recovery   and   # CCI crossed up through oversold in last 5 bars
+            qualified             and   # mom1>5%, mom3>10%, mom6>15% + trend_strong
+            allow_cloud                 # price above OR inside Ichimoku cloud
         )
 
         # ── Tier 1 Prime gate (optional) ────────────────────────────
@@ -240,7 +275,7 @@ def generate_signals_historical(
         ts_ratio  = cur_atr / cur_atr_sma if cur_atr_sma > 0 else 1.0
         threshold = 65 if ts_ratio > 1.2 else (75 if ts_ratio < 0.8 else 70)
 
-        # Cloud gate
+        # Cloud gate — uses original above_cloud / inside_cloud for non-T1 signals
         allow_cloud_buy = above_cloud or (inside_cloud and norm_score >= 65)
 
         if norm_score < min_score or not allow_cloud_buy:
@@ -392,7 +427,7 @@ def run_backtest(
     min_score:    int  = 70,
     hold_days:    int  = 20,
     workers:      int  = 10,
-    tier1_only:   bool = False,   # ← Tier 1 Prime gate
+    tier1_only:   bool = False,   # ← Tier 1 Prime gate (relaxed)
     progress_cb        = None,
 ) -> pd.DataFrame:
     try:
