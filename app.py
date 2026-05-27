@@ -111,7 +111,7 @@ with tab1:
     render_scanner(settings)
 
 with tab2:
-    render_backtest()
+    render_backtest(settings)
 
 with tab3:
     render_settings()
