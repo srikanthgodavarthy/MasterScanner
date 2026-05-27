@@ -35,7 +35,7 @@ def render():
         st.markdown("### 🧪 Backtest Settings")
         bt_universe = st.multiselect(
             "Symbols to Backtest", options=NIFTY500_SYMBOLS,
-            default=settings["symbols"], key="bt_universe",
+            default=settings.get("symbols", NIFTY500_SYMBOLS) if settings else NIFTY500_SYMBOLS, key="bt_universe",
         )
         bt_min_score = st.slider("Min Score for Entry", 50, 100, 70, step=5, key="bt_min_score")
         bt_hold_days = st.slider("Max Hold Days",         5,  60, 20, step=5, key="bt_hold_days")
