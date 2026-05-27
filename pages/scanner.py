@@ -542,9 +542,11 @@ def render(settings: dict) -> None:
         search = st.text_input("search", placeholder="🔎  Search symbol…  e.g. RELIANCE, TCS",
                                label_visibility="collapsed", key="search_input")
     with c3:
+       hi_prob_only = st.toggle("🎯 Hi Prob", value=False, key="hi_prob_toggle",
+                             help="trend_up · in_golden · score ≥ 55")
+    with c4:
         snap_label = st.text_input("snap", placeholder="Snapshot label (optional)",
                                    label_visibility="collapsed", key="snap_input")
-
     if auto_refresh:
         st.info(f"🔄 Auto-refresh every {settings.get('refresh_mins', 5)} min", icon="⏱")
 
@@ -599,7 +601,8 @@ def render(settings: dict) -> None:
     fdf = df.copy()
     if search.strip():
         fdf = fdf[fdf["Stock"].str.contains(search.strip(), case=False, na=False)]
-
+    if hi_prob_only and "_high_prob" in fdf.columns:
+      fdf = fdf[fdf["_high_prob"] == True]
     # ── PARTITION INTO TIERS ──────────────────────────────────────
     wl_syms_set = set(w["symbol"] for w in st.session_state.get("watchlist", []))
 
