@@ -11,6 +11,13 @@ Fixed to daily-chart mode (equivalent to Pine Script "Swing" mode):
   scoreThreshold adaptive: 65 / 70 / 75 based on ATR trend-strength ratio
   maxScore = 175  (CCI adds up to +20 over original 155)
   Tier 1 Prime bonus: +20 when all five structural conditions align
+
+TIER 1 PRIME GATE — RELAXED vs STRICT:
+  cci_cross_up_os   → recent_cci_recovery  (any cross in last 5 bars)
+  in_golden         → in_golden_relaxed    (38.2–61.8% fib retracement)
+  above_cloud       → allow_cloud          (above OR inside Ichimoku cloud)
+  trend_up          — unchanged
+  qualified         — unchanged
 """
 
 import pandas as pd
@@ -400,6 +407,9 @@ def score_stock(
     below_cloud  = cur_c < cb
     inside_cloud = cb <= cur_c <= ct
 
+    # Relaxed cloud gate: above OR inside cloud
+    allow_cloud  = above_cloud or inside_cloud
+
     # ── TREND ────────────────────────────────────────────────────
     trend_up   = cur_c > cur_e200 and cur_e20 > cur_e50
     trend_down = cur_c < cur_e200 and cur_e20 < cur_e50
@@ -433,21 +443,41 @@ def score_stock(
     fib_ext161 = sw_hi + fib_rng * 0.618
     fib_ext261 = sw_hi + fib_rng * 1.618
 
+    # Original strict golden zone (50–61.8%) — used for score calculation
+    # and buy-type classification
     in_golden = (
         cur_c >= fib618 - cur_atr * atr_prox and
         cur_c <= fib500 + cur_atr * atr_prox
     )
+
+    # Relaxed golden zone (38.2–61.8%) — used for Tier 1 Prime gate only
+    in_golden_relaxed = (
+        cur_c >= fib618 - cur_atr * atr_prox and
+        cur_c <= fib382 + cur_atr * atr_prox
+    )
+
     near_ext127 = abs(cur_c - fib_ext127) < cur_atr * atr_prox
     near_ext161 = abs(cur_c - fib_ext161) < cur_atr * atr_prox
 
     # ── CCI SIGNALS ───────────────────────────────────────────────
-    cci_cross_up_os = prev_cci <= cci_os and cur_cci > cci_os   # oversold recovery
+    cci_cross_up_os = prev_cci <= cci_os and cur_cci > cci_os   # oversold recovery this bar
     cci_cross_dn_ob = prev_cci >= cci_ob and cur_cci < cci_ob   # overbought exit
     cci_extended    = cur_cci > cci_ob * 2                       # e.g. > +200
     cci_weakening   = cur_cci < prev_cci and cur_cci > 0         # falling but above 0
 
-    # CCI-confirmed golden zone
+    # CCI-confirmed golden zone (strict — for buy-type labels)
     in_golden_cci = in_golden and cur_cci <= cci_os
+
+    # Relaxed CCI signal: true if CCI crossed up through oversold on any
+    # of the last 5 bars (bars [-5] through [-1] relative to current bar).
+    # This catches setups where the momentum cross happened 1–4 bars before
+    # the fib and cloud conditions aligned, which is common on NSE dailies.
+    recent_cci_recovery = False
+    if len(cci_val) >= 6:
+        recent_cci_recovery = any(
+            float(cci_val.iloc[-(k + 1)]) <= cci_os and float(cci_val.iloc[-k]) > cci_os
+            for k in range(1, 6)   # k=1 → bar[-1] crossed; k=5 → bar[-5] crossed
+        )
 
     # ── PIVOT DETECTION ──────────────────────────────────────────
     pvt_lb_use = min(pvt_lb, len(c) // 4)
@@ -497,7 +527,7 @@ def score_stock(
     # Relative Strength
     bull_score += (15 if rs > 0 else 5 if rs > -0.005 else 0)
 
-    # Fibonacci Golden Zone
+    # Fibonacci Golden Zone (strict 50–61.8% used for score)
     bull_score += 30 if in_golden else 0
 
     # Fib Extension penalties
@@ -506,7 +536,7 @@ def score_stock(
     # CCI contribution
     bull_score += (20 if cur_cci < cci_os else 10 if cur_cci < 0 else -15 if cci_extended else 0)
 
-    # CCI cross-up bonus
+    # CCI cross-up bonus (strict single-bar — for score only)
     bull_score += 15 if cci_cross_up_os else 0
 
     # CCI extended additional penalty
@@ -532,20 +562,24 @@ def score_stock(
     # Ichimoku cloud penalty
     bull_score += -15 if below_cloud else 0
 
-    # ── TIER 1 PRIME — combination bonus ──────────────────────────
-    # Requires ALL five structural conditions simultaneously:
-    #   trend_up + in_golden + cci_cross_up_os + qualified + above_cloud
+    # ── TIER 1 PRIME — relaxed combination gate ───────────────────
+    # Requires ALL five structural conditions simultaneously, but with
+    # three of them relaxed vs the original strict definition:
     #
-    # This is the rarest, highest-conviction setup in the engine.
-    # The +20 bonus reflects that no single component grants this alone —
-    # it rewards the convergence of price structure, trend, momentum
-    # catalyst, HTF qualification, and cloud position all aligning.
+    #   trend_up            — unchanged (EMA stack + price > EMA200)
+    #   in_golden_relaxed   — was in_golden (38.2–61.8% vs 50–61.8%)
+    #   recent_cci_recovery — was cci_cross_up_os (5-bar window vs single bar)
+    #   qualified           — unchanged (mom1>5%, mom3>10%, mom6>15%)
+    #   allow_cloud         — was above_cloud (above OR inside cloud)
+    #
+    # The +20 bonus rewards convergence of price structure, trend,
+    # momentum catalyst, HTF qualification, and cloud position.
     is_tier1_prime = (
-        trend_up        and   # EMA stack: price > EMA200, EMA20 > EMA50
-        in_golden       and   # price inside 50–61.8% fib retracement
-        cci_cross_up_os and   # CCI crossed up through -100 on this bar
-        qualified       and   # mom1>5%, mom3>10%, mom6>15% + trend_strong (⭐)
-        above_cloud           # price above Ichimoku cloud top
+        trend_up              and   # EMA stack: price > EMA200, EMA20 > EMA50
+        in_golden_relaxed     and   # price inside 38.2–61.8% fib retracement
+        recent_cci_recovery   and   # CCI crossed up through oversold in last 5 bars
+        qualified             and   # mom1>5%, mom3>10%, mom6>15% + trend_strong
+        allow_cloud                 # price above OR inside Ichimoku cloud
     )
     bull_score += 20 if is_tier1_prime else 0
 
@@ -569,7 +603,7 @@ def score_stock(
     is_norm_buy     = trend_up and norm_score >= 65 and not in_golden and not cci_extended
     is_cci_buy      = trend_up and cci_cross_up_os and norm_score >= 55
 
-    # Cloud gate
+    # Cloud gate (original above_cloud / inside_cloud for non-T1 buy signals)
     allow_cloud_buy = above_cloud or (inside_cloud and norm_score >= 65)
 
     any_buy = (
@@ -577,8 +611,8 @@ def score_stock(
     ) and allow_cloud_buy
 
     # ── TIER CLASSIFICATION ───────────────────────────────────────
-    # Tier 1  — all five pillars align simultaneously (rarest)
-    # Tier 2  — any valid buy signal fires (moderate frequency)
+    # Tier 1  — all five pillars align (relaxed gate)
+    # Tier 2  — any valid buy signal fires
     # Other   — watch / skip territory
     tier = (
         "Tier 1" if is_tier1_prime else
@@ -644,10 +678,10 @@ def score_stock(
     chg = round(((cur_c - prev_close) / prev_close) * 100, 2) if prev_close else 0
 
     # ── ACCURACY TIER (signal confidence grade) ───────────────────
-    # T1★ — Tier 1 Prime: all 5 pillars aligned  (~90%+ win rate target)
-    # A   — qualified ⭐ + any valid buy signal   (~85%)
-    # B   — any valid buy signal, not qualified   (~75%)
-    # C   — WATCH territory (score ≥ 50, no buy) (~60%)
+    # T1★ — Tier 1 Prime (relaxed gate): all 5 pillars aligned (~90%+ target)
+    # A   — qualified ⭐ + any valid buy signal               (~85%)
+    # B   — any valid buy signal, not qualified               (~75%)
+    # C   — WATCH territory (score ≥ 50, no buy)             (~60%)
     # D   — SKIP / insufficient signal
     acc_tier = (
         "T1★" if is_tier1_prime              else
@@ -658,36 +692,16 @@ def score_stock(
     )
 
     # AccScore — composite for sorting within tiers
-    # Adds Tier 1 bonus + qualified bonus on top of norm_score so
-    # the best setups always float to the top inside each expander.
     acc_score = norm_score + (20 if is_tier1_prime else 0) + (10 if qualified else 0)
 
     # ── HARD STOP ────────────────────────────────────────────────
-    # Structural red flag: confirmed downtrend + below cloud + weak score.
-    # Rows with hard_stop=True are dimmed in the UI (opacity 0.45).
     hard_stop = trend_down and below_cloud and norm_score < 30
 
     # ══════════════════════════════════════════════════════════════
     #  TIER SUB-CONDITION CLASSIFICATION
-    #  Each tier gets a named setup label so the UI can show WHY
-    #  a stock landed where it did — not just that it did.
     # ══════════════════════════════════════════════════════════════
 
     # ── TIER 2 SUB-CONDITIONS ─────────────────────────────────────
-    # All require any_buy = True (cloud gate already cleared).
-    # Ordered by conviction — highest first.
-    #
-    #  Fib+Qual   : golden zone + qualified ⭐, no CCI cross-up yet
-    #              → structure is there, waiting for momentum trigger
-    #  Fib+CCI    : golden zone + CCI cross-up, not all 5 pillars
-    #              → most of T1 but missing qualified or cloud condition
-    #  Harmonic   : XABCD pattern (Crab/Butterfly/Bat/Gartley) confirmed
-    #  ABCD       : AB=CD pattern confirmed at D completion
-    #  CCI Break  : CCI crossed up from OS, price not in golden zone
-    #              → momentum catalyst without the fib price structure
-    #  Norm Strong: trend buy, score ≥ 75, no special pattern
-    #  Norm Buy   : trend buy, score 65–74, no special pattern
-
     is_t2_fib_qual    = is_fib_buy_base and qualified and not is_tier1_prime
     is_t2_fib_cci     = is_fib_buy_cci  and not is_tier1_prime
     is_t2_harmonic    = is_harm_buy
@@ -697,22 +711,6 @@ def score_stock(
     is_t2_norm        = is_norm_buy
 
     # ── TIER 3 SUB-CONDITIONS ─────────────────────────────────────
-    # Developing / near-miss setups in WATCH territory (score 50–64).
-    #
-    #  Near Golden   : price within 1 ATR of the golden zone but not inside it
-    #                  → one more leg down could deliver T1/T2 entry
-    #  CCI Recovery  : CCI rising from below zero toward the zero line
-    #                  → oversold momentum building, no confirmed cross yet
-    #  Cloud Test    : price within 0.5 ATR below cloud bottom (testing support)
-    #                  → cloud could flip to support; watch for close above
-    #  EMA Converge  : EMA20 and EMA50 within 1% of each other from below
-    #                  → golden cross forming; trend flip imminent
-    #  RSI Base      : RSI 45–55, trend up, score ≥ 45
-    #                  → basing phase; no breakout yet but bias is long
-    #  Vol Surge     : volume > 2× avg with trend_up but score not yet ≥ 65
-    #                  → institutional accumulation signal; watch closely
-    #  Developing    : catch-all for WATCH stocks not matching above
-
     near_golden = (
         not in_golden and
         cur_c >= fib618 - cur_atr * 1.0 and
@@ -729,25 +727,15 @@ def score_stock(
     vol_surge_watch = (cur_v > cur_vavg * 2.0 and trend_up and norm_score < 65)
 
     # ── TIER 4 SUB-CONDITIONS ─────────────────────────────────────
-    # Risk / structural weakness flags for SKIP stocks.
-    #
-    #  Hard Stop    : trend_down + below cloud + score < 30 (full bear structure)
-    #  Fib Resist   : price at 127.2% or 161.8% fib extension (supply zone)
-    #  CCI Extended : CCI > +200 — parabolic, mean-reversion risk
-    #  Downtrend    : confirmed downtrend (EMA stack inverted + below EMA200)
-    #  Weak Mom     : 1m momentum < -5% or 3m momentum < -10%
-    #  Low Score    : catch-all for stocks that simply don't score well enough
-
     at_ext_resist    = near_ext127 or near_ext161
     cci_overextended = cci_extended
     strong_downtrend = trend_down and below_cloud
     weak_momentum    = mom1 < -5 or mom3 < -10
 
     # ── UNIFIED SETUP LABEL ───────────────────────────────────────
-    # One label per stock explaining the specific condition that placed
-    # it in its tier. Shown as a badge column in the scan table.
+    # (R) suffix on Tier 1 label indicates the relaxed gate fired
     if is_tier1_prime:
-        setup = "All 5 Pillars"
+        setup = "All 5 Pillars (R)"
     elif any_buy:
         setup = (
             "Fib+Qual"    if is_t2_fib_qual    else
@@ -800,35 +788,39 @@ def score_stock(
         "T2":           t2,
         "T3":           t3,
         # ── internals for colouring / debug ──────────────────────
-        "_qualified":      qualified,
-        "_high_prob":      high_prob_buy,
-        "_in_golden":      in_golden,
-        "_in_golden_cci":  in_golden_cci,
-        "_above_cloud":    above_cloud,
-        "_inside_cloud":   inside_cloud,
-        "_harm_bull":      harm_bull,
-        "_abcd_bull":      abcd_bull,
-        "_any_buy":        any_buy,
-        "_tier1_prime":    is_tier1_prime,
-        "_hard_stop":      hard_stop,
-        "_t2_fib_qual":    is_t2_fib_qual,
-        "_t2_fib_cci":     is_t2_fib_cci,
-        "_t2_harmonic":    is_t2_harmonic,
-        "_t2_abcd":        is_t2_abcd,
-        "_t2_cci_break":   is_t2_cci_break,
-        "_t3_near_golden": near_golden,
-        "_t3_cci_rec":     cci_recovering,
-        "_t3_cloud_test":  cloud_test,
-        "_t3_ema_conv":    ema_converging,
-        "_t4_hard_stop":   hard_stop,
-        "_t4_fib_resist":  at_ext_resist,
-        "_t4_downtrend":   strong_downtrend,
-        "_rsi":            round(cur_r, 1),
-        "_mom1":           round(mom1, 1),
-        "_mom3":           round(mom3, 1),
-        "_cci_raw":        cur_cci,
-        "_fib618":         round(fib618),
-        "_fib500":         round(fib500),
+        "_qualified":         qualified,
+        "_high_prob":         high_prob_buy,
+        "_in_golden":         in_golden,
+        "_in_golden_relaxed": in_golden_relaxed,
+        "_in_golden_cci":     in_golden_cci,
+        "_above_cloud":       above_cloud,
+        "_inside_cloud":      inside_cloud,
+        "_allow_cloud":       allow_cloud,
+        "_harm_bull":         harm_bull,
+        "_abcd_bull":         abcd_bull,
+        "_any_buy":           any_buy,
+        "_tier1_prime":       is_tier1_prime,
+        "_recent_cci_rec":    recent_cci_recovery,
+        "_hard_stop":         hard_stop,
+        "_t2_fib_qual":       is_t2_fib_qual,
+        "_t2_fib_cci":        is_t2_fib_cci,
+        "_t2_harmonic":       is_t2_harmonic,
+        "_t2_abcd":           is_t2_abcd,
+        "_t2_cci_break":      is_t2_cci_break,
+        "_t3_near_golden":    near_golden,
+        "_t3_cci_rec":        cci_recovering,
+        "_t3_cloud_test":     cloud_test,
+        "_t3_ema_conv":       ema_converging,
+        "_t4_hard_stop":      hard_stop,
+        "_t4_fib_resist":     at_ext_resist,
+        "_t4_downtrend":      strong_downtrend,
+        "_rsi":               round(cur_r, 1),
+        "_mom1":              round(mom1, 1),
+        "_mom3":              round(mom3, 1),
+        "_cci_raw":           cur_cci,
+        "_fib618":            round(fib618),
+        "_fib500":            round(fib500),
+        "_fib382":            round(fib382),
     }
 
 
@@ -923,7 +915,7 @@ def cci_color(cci_val: float, ob: int = 100, os: int = -100) -> str:
 def acc_tier_color(t: str) -> tuple:
     """
     Returns (background, foreground) hex pair for AccTier badge.
-      T1★ — purple  (~90%+ conviction)
+      T1★ — purple  (~90%+ conviction, relaxed gate)
       A   — blue    (~85%)
       B   — green   (~75%)
       C   — amber   (~60%)
