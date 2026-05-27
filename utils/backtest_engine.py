@@ -364,6 +364,7 @@ def run_backtest(
     cci_os:     int = -100,
     min_score:  int = 70,
     hold_days:  int = 20,
+    workers:    int = 10,        # ← add this
     progress_cb = None,
 ) -> pd.DataFrame:
     try:
@@ -377,21 +378,40 @@ def run_backtest(
     except Exception:
         nifty_close = pd.Series(dtype=float)
 
-    all_trades = []
-    total = len(symbols)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
 
-    for i, sym in enumerate(symbols):
-        if progress_cb:
-            progress_cb((i + 1) / total, sym)
+    counter_lock = threading.Lock()
+    completed    = [0]
+    total        = len(symbols)
+    all_trades   = []
+    trades_lock  = threading.Lock()
+
+    def _process(sym):
         df = fetch_full_history(sym, years=3)
         if df.empty:
-            continue
+            return None
         signals = generate_signals_historical(
             df, nifty_close, cci_len, cci_ob, cci_os, min_score
         )
-        trades = simulate_trades(sym, df, signals, hold_days=hold_days)
-        if not trades.empty:
-            all_trades.append(trades)
+        return simulate_trades(sym, df, signals, hold_days=hold_days)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_process, sym): sym for sym in symbols}
+        for future in as_completed(futures):
+            sym = futures[future]
+            with counter_lock:
+                completed[0] += 1
+                n = completed[0]
+            if progress_cb:
+                progress_cb(n / total, sym)
+            try:
+                result = future.result()
+                if result is not None and not result.empty:
+                    with trades_lock:
+                        all_trades.append(result)
+            except Exception:
+                pass   # silently skip failed symbols
 
     return pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
 
