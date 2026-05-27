@@ -164,8 +164,43 @@ def _stop_cell(reason):
     return (f'<span style="background:#7f1d1d;color:#fca5a5;padding:2px 5px;'
             f'border-radius:3px;font-size:11px;white-space:nowrap" title="{reason}">🚫 {s}</span>')
 
+# Setup badge colours — keyed by setup label
+_SETUP_COLORS = {
+    # Tier 1
+    "All 5 Pillars": ("#4c1d95", "#c4b5fd"),
+    # Tier 2
+    "Fib+Qual":      ("#1e3a5f", "#93c5fd"),
+    "Fib+CCI":       ("#1e3a5f", "#60a5fa"),
+    "Harmonic":      ("#0f172a", "#818cf8"),
+    "ABCD":          ("#0f172a", "#a5b4fc"),
+    "CCI Break":     ("#172554", "#7dd3fc"),
+    "Norm Strong":   ("#14532d", "#86efac"),
+    "Norm Buy":      ("#14532d", "#4ade80"),
+    "Buy":           ("#14532d", "#4ade80"),
+    # Tier 3
+    "Near Golden":   ("#78350f", "#fde68a"),
+    "CCI Recovery":  ("#7c2d12", "#fdba74"),
+    "Cloud Test":    ("#713f12", "#fcd34d"),
+    "EMA Converge":  ("#365314", "#bef264"),
+    "RSI Base":      ("#1a2e05", "#a3e635"),
+    "Vol Surge":     ("#1e1b4b", "#c7d2fe"),
+    "Developing":    ("#1e293b", "#94a3b8"),
+    # Tier 4
+    "Hard Stop":     ("#7f1d1d", "#fca5a5"),
+    "Fib Resist":    ("#7c2d12", "#fed7aa"),
+    "CCI Extended":  ("#4a1942", "#f0abfc"),
+    "Downtrend":     ("#450a0a", "#f87171"),
+    "Weak Mom":      ("#422006", "#fb923c"),
+    "Low Score":     ("#1c1917", "#78716c"),
+}
+
+def _setup_cell(setup: str) -> str:
+    bg, fg = _SETUP_COLORS.get(setup, ("#1e293b", "#94a3b8"))
+    return (f'<span style="background:{bg};color:{fg};padding:2px 6px;'
+            f'border-radius:3px;font-size:11px;font-weight:500;white-space:nowrap">{setup}</span>')
+
 _HEADERS = [
-    "#", "Stock", "Score", "AccTier", "Buy Type",
+    "#", "Stock", "Score", "AccTier", "Setup",
     "CCI", "CCI Sig", "Qual", "%Chg", "Entry", "SL", "T1", "T2", "T3",
 ]
 
@@ -216,7 +251,7 @@ def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int,
             f"{sym}{wl_dot}</span></td>"
             f"<td>{sc_c(str(sc))}</td>"
             f"<td>{_acc_badge(at)}</td>"
-            f"<td>{sc_c(str(row.get('Buy Type', '-')))}</td>"
+            f"<td>{_setup_cell(str(row.get('Setup', '-')))}</td>"
             f"<td>{cc_c(str(int(cv)))}</td>"
             f"<td>{cc_c(str(row['CCI Sig']))}</td>"
             f"<td style='font-size:13px;text-align:center'>{qual_icon}</td>"
@@ -255,35 +290,59 @@ _TIER_META = {
         "dot":   "#22c55e",
         "label": "Tier 1 — Prime  ·  All 5 pillars  ·  ~90%+",
         "desc":  "trend_up · in_golden · CCI cross-up · qualified ⭐ · inside cloud",
+        "setups": ["All 5 Pillars"],
     },
     "Tier 2": {
         "dot":   "#22c55e",
-        "label": "Tier 2 — Strong Buy",
-        "desc":  "Any valid buy signal active with cloud gate passed",
+        "label": "Tier 2 — Strong Buy  ·  Any valid buy signal",
+        "desc":  "Fib+Qual · Fib+CCI · Harmonic · ABCD · CCI Break · Norm Strong · Norm Buy",
+        "setups": ["Fib+Qual","Fib+CCI","Harmonic","ABCD","CCI Break","Norm Strong","Norm Buy"],
     },
     "Tier 3": {
         "dot":   "#f59e0b",
-        "label": "Tier 3 — Watch",
-        "desc":  "Emerging setups — not yet a confirmed buy",
+        "label": "Tier 3 — Watch  ·  Developing setups",
+        "desc":  "Near Golden · CCI Recovery · Cloud Test · EMA Converge · RSI Base · Vol Surge",
+        "setups": ["Near Golden","CCI Recovery","Cloud Test","EMA Converge","RSI Base","Vol Surge","Developing"],
     },
     "Tier 4": {
         "dot":   "#ef4444",
-        "label": "Tier 4 — Skip",
-        "desc":  "Hard stop active or score too low",
+        "label": "Tier 4 — Skip  ·  Structural weakness",
+        "desc":  "Hard Stop · Fib Resist · CCI Extended · Downtrend · Weak Mom · Low Score",
+        "setups": ["Hard Stop","Fib Resist","CCI Extended","Downtrend","Weak Mom","Low Score"],
     },
 }
 
+def _setup_legend(setups: list, df: pd.DataFrame) -> str:
+    """Pill bar showing count per setup label for this tier."""
+    if df.empty or "Setup" not in df.columns:
+        return ""
+    counts = df["Setup"].value_counts().to_dict()
+    pills  = ""
+    for s in setups:
+        n = counts.get(s, 0)
+        if n == 0:
+            continue
+        bg, fg = _SETUP_COLORS.get(s, ("#1e293b", "#94a3b8"))
+        pills += (
+            f'<span style="background:{bg};color:{fg};padding:2px 9px;border-radius:12px;font-size:11px;font-weight:500;white-space:nowrap;border:1px solid {fg}33">{s} <b>{n}</b></span> '
+        )
+    return f'<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px">{pills}</div>'
+
+
 def _tier_expander(tier_key: str, df: pd.DataFrame, cci_ob: int, cci_os: int,
                    watchlist_syms: set, expanded: bool = False):
-    meta  = _TIER_META[tier_key]
-    dot   = meta["dot"]
-    count = len(df)
+    meta   = _TIER_META[tier_key]
+    count  = len(df)
+    setups = meta.get("setups", [])
 
     with st.expander(f"{tier_key}  ·  {count}", expanded=expanded):
         st.markdown(
             f'<p style="font-size:11px;color:#475569;margin:0 0 6px">{meta["desc"]}</p>',
             unsafe_allow_html=True,
         )
+        legend = _setup_legend(setups, df)
+        if legend:
+            st.markdown(legend, unsafe_allow_html=True)
         _render_table(df, cci_ob, cci_os, watchlist_syms)
 
 
