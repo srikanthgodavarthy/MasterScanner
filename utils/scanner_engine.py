@@ -226,7 +226,7 @@ def classify_accuracy(
     in_golden:       bool,
     cci_cross_up_os: bool,
     qualified:       bool,
-    above_cloud:     bool,
+    :     bool,
     # pattern flags
     harm_bull:       bool,
     abcd_bull:       bool,
@@ -283,19 +283,19 @@ def classify_accuracy(
 
     # ── 4. FOUR-PILLAR COMBOS (A tier) ───────────────────────────
     pillar_count = sum([
-        trend_up, in_golden, cci_cross_up_os, qualified, above_cloud
+        trend_up, in_golden, cci_cross_up_os, qualified, 
     ])
 
     # Fib + CCI + Cloud + HTF  (best 4-pillar combo)
-    if in_golden and cci_cross_up_os and above_cloud and qualified and trend_up:
+    if in_golden and cci_cross_up_os and  and qualified and trend_up:
         return "A", 85, False, ""
 
     # Fib + CCI + Cloud + Trend  (no HTF qual)
-    if in_golden and cci_cross_up_os and above_cloud and trend_up:
+    if in_golden and cci_cross_up_os and  and trend_up:
         return "A", 83, False, ""
 
     # Harm/ABCD + Cloud + HTF + Trend
-    if (harm_bull or abcd_bull) and above_cloud and qualified and trend_up:
+    if (harm_bull or abcd_bull) and  and qualified and trend_up:
         return "A", 81, False, ""
 
     # Fib + Harm + Trend + positive RS
@@ -308,7 +308,7 @@ def classify_accuracy(
 
     # ── 5. THREE-PILLAR COMBOS (B tier) ──────────────────────────
     # CCI cross + trend + not below cloud
-    if cci_cross_up_os and trend_up and above_cloud:
+    if cci_cross_up_os and trend_up and :
         return "B", 72, False, ""
 
     # Golden zone + trend + score gate already passed (High Prob Zone)
@@ -320,7 +320,7 @@ def classify_accuracy(
         return "B", 68, False, ""
 
     # Pattern + trend (ABCD or Harmonic with cloud)
-    if (harm_bull or abcd_bull) and trend_up and above_cloud:
+    if (harm_bull or abcd_bull) and trend_up and :
         return "B", 65, False, ""
 
     # Generic 3-pillar
@@ -621,7 +621,7 @@ def score_stock(
         in_golden       and
         cci_cross_up_os and
         qualified       and
-        above_cloud
+        inside_cloud 
     )
     bull_score += 20 if is_tier1_prime else 0
 
