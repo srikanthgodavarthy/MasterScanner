@@ -30,6 +30,22 @@ def _pnl_color(val):
 
 
 def render(settings=None):
+    # ── Hoist widget state before sidebar so values are always in scope ───────
+    # Streamlit executes widgets top-to-bottom on every rerun; reading from
+    # session_state here ensures bt_tier1_only (and friends) are defined even
+    # after the `with st.sidebar:` block closes and during the results section.
+    bt_universe   = st.session_state.get(
+        "bt_universe",
+        settings.get("symbols", NIFTY500_SYMBOLS) if settings else NIFTY500_SYMBOLS,
+    )
+    bt_tier1_only = st.session_state.get("bt_tier1_only", False)
+    bt_min_score  = st.session_state.get("bt_min_score",  70)
+    bt_hold_days  = st.session_state.get("bt_hold_days",  20)
+    bt_cci_len    = st.session_state.get("bt_cci_len",    st.session_state.get("cci_len", 20))
+    bt_cci_ob     = st.session_state.get("bt_cci_ob",     st.session_state.get("cci_ob",  100))
+    bt_cci_os     = st.session_state.get("bt_cci_os",     st.session_state.get("cci_os", -100))
+    bt_save_db    = st.session_state.get("bt_save_db",    True)
+
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
         st.markdown("### 🧪 Backtest Settings")
