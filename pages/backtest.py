@@ -14,11 +14,6 @@ from utils.scanner_engine import NIFTY500_SYMBOLS
 from utils.backtest_engine import run_backtest, compute_stats
 from utils.supabase_client import save_backtest_results, load_backtest_summary
 
-# ── Default symbol list for backtest ──────────────────────────────────────────
-DEFAULT_BT_SYMS = [
-    "RELIANCE","TCS","HDFCBANK","INFY","SBIN","ICICIBANK","AXISBANK",
-    "WIPRO","MARUTI","LT","HAL","BEL","DLF","AMBUJACEM","ULTRACEMCO",
-]
 
 # ── Tier metadata ─────────────────────────────────────────────────────────────
 TIER_COLOR = {1: "#3b82f6", 2: "#a78bfa"}
@@ -100,22 +95,24 @@ def render(settings=None):
 
         st.markdown("---")
 
-        # ── Universe selector with NSE500 shortcut ────────────────────────────
-        use_all_nse500 = st.checkbox(
-            "🌐 All NSE500",
+        # ── Universe selector — NSE500 by default, custom is opt-in ─────────
+        use_custom = st.checkbox(
+            "✏️ Custom symbols",
             value=False,
-            key="bt_all_nse500",
-            help="Run backtest on all 500 NSE symbols. "
-                 "Works best with ⚡ Tier-1 engine for speed.",
+            key="bt_use_custom",
+            help="By default all NSE500 symbols are used. Enable to pick a custom subset.",
         )
-        if use_all_nse500:
-            bt_universe = NIFTY500_SYMBOLS
-            st.caption(f"📊 {len(NIFTY500_SYMBOLS)} symbols selected")
-        else:
-            bt_universe  = st.multiselect(
+        if use_custom:
+            bt_universe = st.multiselect(
                 "Symbols to Backtest", options=NIFTY500_SYMBOLS,
-                default=DEFAULT_BT_SYMS, key="bt_universe",
+                default=[], key="bt_universe",
             )
+            if not bt_universe:
+                st.caption("⚠️ No symbols selected — will fall back to all NSE500.")
+                bt_universe = NIFTY500_SYMBOLS
+        else:
+            bt_universe = NIFTY500_SYMBOLS
+            st.caption(f"📊 All {len(NIFTY500_SYMBOLS)} NSE500 symbols")
         bt_min_score = st.slider("Min Score for Entry", 50, 100, 70, step=5, key="bt_min_score")
         bt_hold_days = st.slider("Max Hold Days",         5,  60, 20, step=5, key="bt_hold_days")
         bt_cci_len   = st.number_input("CCI Length",     5,  50,
@@ -179,10 +176,6 @@ def render(settings=None):
 
     # ── Run ───────────────────────────────────────────────────────────────────
     if run_bt:
-        if not bt_universe:
-            st.error("Select at least one symbol.")
-            return
-
         prog       = st.progress(0, text="Starting backtest…")
         sym_status = st.empty()
 
