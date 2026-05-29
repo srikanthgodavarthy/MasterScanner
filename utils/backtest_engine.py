@@ -9,9 +9,14 @@ Fixes:
 - Swing-mode parameters throughout (rsiLen=21, atrSLmult=2.5)
 
 Tier support:
-- Tier-1: exit at first target hit (T1) or T2, SL, or timeout (original behaviour)
-- Tier-2: trail to breakeven after T1, then ride to T2 and T3 with 3-part position
-           tracking; produces richer exit_breakdown (T1/T2/T3/BE STOP/SL/TIMEOUT).
+- Tier-1 : All qualifying signals. Exit at SL → T1 → T2 or Timeout.
+           Optional "Tier-1 Prime" sub-mode: only Fib+CCI / Fib confirmed
+           signals (highest quality, fewest trades).
+- Tier-2 : 3-tranche trail strategy on every qualifying signal.
+           50 % exits at T1 (SL trails to breakeven),
+           30 % exits at T2 (SL trails to T1),
+           20 % exits at T3.
+           Blended PnL per trade. Richer exit_breakdown.
 """
 
 import pandas as pd
@@ -57,17 +62,22 @@ def fetch_full_history(symbol: str, years: int = 3) -> pd.DataFrame:
 def generate_signals_historical(
     df: pd.DataFrame,
     nifty: pd.Series,
-    cci_len:   int   = 20,
-    cci_ob:    int   = 100,
-    cci_os:    int   = -100,
-    min_score: int   = 70,
-    atr_prox:  float = 0.3,
-    pvt_lb:    int   = 20,
+    cci_len:      int   = 20,
+    cci_ob:       int   = 100,
+    cci_os:       int   = -100,
+    min_score:    int   = 70,
+    atr_prox:     float = 0.3,
+    pvt_lb:       int   = 20,
+    prime_only:   bool  = False,   # Tier-1 Prime: Fib/CCI confirmed signals only
 ) -> pd.DataFrame:
     """
     Walk forward day-by-day generating BUY signals using the same
     scoring as scanner_engine.score_stock() (Swing/daily mode).
     No look-ahead bias — each bar only uses data up to that bar.
+
+    prime_only=True  → only emit signals where in_golden AND
+                        (cci_cross_up_os OR cur_cci <= cci_os).
+                        Mirrors "Tier 1 Prime" / isFibBuy_CCI path.
     """
     if df.empty or len(df) < 210:
         return pd.DataFrame()
@@ -76,13 +86,12 @@ def generate_signals_historical(
     h  = df["high"]
     l  = df["low"]
     v  = df["volume"]
-    o  = df["open"]
 
     # Pre-compute full series
     e20      = ema(c, 20)
     e50      = ema(c, 50)
     e200     = ema(c, 200)
-    rsi_s    = rsi(c, 21)          # Swing mode rsiLenDyn=21
+    rsi_s    = rsi(c, 21)
     atr_s    = atr(h, l, c, 14)
     cci_s    = cci(c, cci_len)
     vol_avg  = sma(v, 20)
@@ -94,23 +103,23 @@ def generate_signals_historical(
 
     nifty_a = nifty.reindex(c.index, method="ffill")
 
-    signals = []
+    signals  = []
     lookback = pvt_lb * 3
 
     for i in range(210, len(df)):
-        cur_c    = float(c.iloc[i])
-        cur_e20  = float(e20.iloc[i])
-        cur_e50  = float(e50.iloc[i])
-        cur_e200 = float(e200.iloc[i])
-        cur_r    = float(rsi_s.iloc[i])
-        cur_v    = float(v.iloc[i])
-        cur_atr  = float(atr_s.iloc[i])
-        cur_cci  = float(cci_s.iloc[i])
-        cur_va   = float(vol_avg.iloc[i])
+        cur_c       = float(c.iloc[i])
+        cur_e20     = float(e20.iloc[i])
+        cur_e50     = float(e50.iloc[i])
+        cur_e200    = float(e200.iloc[i])
+        cur_r       = float(rsi_s.iloc[i])
+        cur_v       = float(v.iloc[i])
+        cur_atr     = float(atr_s.iloc[i])
+        cur_cci     = float(cci_s.iloc[i])
+        cur_va      = float(vol_avg.iloc[i])
         cur_atr_sma = float(atr_sma.iloc[i]) if not np.isnan(atr_sma.iloc[i]) else cur_atr
-        prev_cci = float(cci_s.iloc[i - 1])
-        cur_ct   = float(cloud_top.iloc[i])
-        cur_cb   = float(cloud_bottom.iloc[i])
+        prev_cci    = float(cci_s.iloc[i - 1])
+        cur_ct      = float(cloud_top.iloc[i])
+        cur_cb      = float(cloud_bottom.iloc[i])
 
         # ── Trend ─────────────────────────────────────────────────
         trend_up = cur_c > cur_e200 and cur_e20 > cur_e50
@@ -118,19 +127,19 @@ def generate_signals_historical(
         # ── Relative Strength (5-bar) ─────────────────────────────
         rs = 0.0
         if i >= 5:
-            c5 = float(c.iloc[i - 5])
+            c5    = float(c.iloc[i - 5])
             n_now = float(nifty_a.iloc[i])
             n5    = float(nifty_a.iloc[i - 5])
             if c5 > 0 and n5 > 0 and n_now > 0:
                 rs = (cur_c / c5 - 1) - (n_now / n5 - 1)
 
-        # ── Fibonacci levels (rolling window) ────────────────────
-        win_start = max(0, i - lookback)
-        sw_hi = float(h.iloc[win_start:i].max())
-        sw_lo = float(l.iloc[win_start:i].min())
-        fib_rng = sw_hi - sw_lo
-        fib500  = sw_hi - fib_rng * 0.500
-        fib618  = sw_hi - fib_rng * 0.618
+        # ── Fibonacci levels (rolling window) ─────────────────────
+        win_start  = max(0, i - lookback)
+        sw_hi      = float(h.iloc[win_start:i].max())
+        sw_lo      = float(l.iloc[win_start:i].min())
+        fib_rng    = sw_hi - sw_lo
+        fib500     = sw_hi - fib_rng * 0.500
+        fib618     = sw_hi - fib_rng * 0.618
         fib_ext127 = sw_hi + fib_rng * 0.272
         fib_ext161 = sw_hi + fib_rng * 0.618
 
@@ -144,9 +153,16 @@ def generate_signals_historical(
         cci_extended    = cur_cci > cci_ob * 2
         in_golden_cci   = in_golden and cur_cci <= cci_os
 
+        # ── Tier-1 Prime gate (applied before scoring cost) ───────
+        if prime_only:
+            # Must be in the Fibonacci golden zone AND have CCI oversold confirmation
+            is_prime = in_golden and (cci_cross_up_os or cur_cci <= cci_os) and trend_up
+            if not is_prime:
+                continue
+
         # ── Qualification ─────────────────────────────────────────
-        mom1 = (cur_c / float(c.iloc[i - 21]) - 1) * 100 if i >= 21  else 0
-        mom3 = (cur_c / float(c.iloc[i - 63]) - 1) * 100 if i >= 63  else 0
+        mom1 = (cur_c / float(c.iloc[i - 21])  - 1) * 100 if i >= 21  else 0
+        mom3 = (cur_c / float(c.iloc[i - 63])  - 1) * 100 if i >= 63  else 0
         mom6 = (cur_c / float(c.iloc[i - 126]) - 1) * 100 if i >= 126 else 0
         strong_htf   = mom1 > 5 and mom3 > 10 and mom6 > 15
         trend_strong = cur_c > cur_e20 and cur_e20 > cur_e50
@@ -164,7 +180,7 @@ def generate_signals_historical(
         score += 10 if i >= 2 and cur_c > float(c.iloc[i - 2]) else 0
         score += (15 if rs > 0 else 5 if rs > -0.005 else 0)
 
-        score += 30 if in_golden   else 0
+        score += 30 if in_golden else 0
         score += -20 if near_ext127 else (-30 if near_ext161 else 0)
 
         score += (20 if cur_cci < cci_os else 10 if cur_cci < 0 else -15 if cci_extended else 0)
@@ -182,7 +198,7 @@ def generate_signals_historical(
         norm_score = min(100, int(score * 100 / 175))
 
         # Adaptive threshold
-        ts_ratio = cur_atr / cur_atr_sma if cur_atr_sma > 0 else 1.0
+        ts_ratio  = cur_atr / cur_atr_sma if cur_atr_sma > 0 else 1.0
         threshold = 65 if ts_ratio > 1.2 else (75 if ts_ratio < 0.8 else 70)
 
         # Cloud gate
@@ -202,23 +218,34 @@ def generate_signals_historical(
         t2     = round(en + rk * 2)
         t3     = round(en + rk * 3)
 
+        # Buy-type tag (for trade log)
+        if in_golden_cci and cci_cross_up_os:
+            buy_type = "Fib+CCI"
+        elif in_golden:
+            buy_type = "Fib"
+        elif cci_cross_up_os:
+            buy_type = "CCI"
+        else:
+            buy_type = "Norm"
+
         signals.append({
-            "date":  df.index[i],
-            "score": norm_score,
-            "entry": cur_c,
-            "sl":    sl,
-            "t1":    t1,
-            "t2":    t2,
-            "t3":    t3,
-            "cci":   round(cur_cci),
-            "rsi":   round(cur_r, 1),
+            "date":     df.index[i],
+            "score":    norm_score,
+            "entry":    cur_c,
+            "sl":       sl,
+            "t1":       t1,
+            "t2":       t2,
+            "t3":       t3,
+            "cci":      round(cur_cci),
+            "rsi":      round(cur_r, 1),
+            "buy_type": buy_type,
         })
 
     return pd.DataFrame(signals)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  TRADE SIMULATION — Tier-1 (original) & Tier-2 (trail + T3)
+#  TRADE SIMULATION — Tier-1 (standard / prime) & Tier-2 (trail)
 # ══════════════════════════════════════════════════════════════════
 
 def _simulate_tier1(
@@ -228,8 +255,9 @@ def _simulate_tier1(
     hold_days: int = 20,
 ) -> pd.DataFrame:
     """
-    Tier-1: original behaviour.
-    Exit at SL → T1 → T2, or TIMEOUT. Single exit per signal.
+    Tier-1: single exit per signal.
+    Order of priority: SL hit → T2 hit → T1 hit → Timeout.
+    Works for both standard and Prime signal sets.
     """
     trades     = []
     used_dates = set()
@@ -243,6 +271,7 @@ def _simulate_tier1(
         if len(future) < 2:
             continue
 
+        entry_bar   = future.index[0]
         entry_price = float(future["open"].iloc[0])
         window      = future.iloc[1: hold_days + 1]
 
@@ -275,7 +304,7 @@ def _simulate_tier1(
 
         trades.append({
             "symbol":         symbol,
-            "entry_date":     future.index[0].date(),
+            "entry_date":     entry_bar.date(),
             "entry_price":    round(entry_price, 2),
             "exit_date":      exit_date.date(),
             "exit_price":     round(exit_price, 2),
@@ -284,6 +313,7 @@ def _simulate_tier1(
             "pnl_abs":        round(exit_price - entry_price, 2),
             "score_at_entry": sig["score"],
             "cci_at_entry":   sig["cci"],
+            "buy_type":       sig.get("buy_type", "-"),
             "sl":             sig["sl"],
             "t1":             sig["t1"],
             "t2":             sig["t2"],
@@ -304,21 +334,21 @@ def _simulate_tier2(
     hold_days: int = 20,
 ) -> pd.DataFrame:
     """
-    Tier-2: 3-tranche position with trailing logic.
+    Tier-2: 3-tranche position with automatic SL trailing.
 
-    Position split: 50% @ T1, 30% @ T2, 20% @ T3.
-    After T1 hit  → trail SL to breakeven (entry price).
-    After T2 hit  → trail SL to T1.
-    After T3 hit  → full position closed.
-    SL / Timeout  → close remaining at SL or last close.
+    Position split  : 50 % @ T1 | 30 % @ T2 | 20 % @ T3
+    SL trail rules  : T1 hit → SL moves to entry (breakeven)
+                      T2 hit → SL moves to T1
+                      T3 hit → full position closed
+    Stop labels     : 'BE STOP' if trail_SL >= entry, else 'SL HIT'
 
-    Each signal produces ONE blended-PnL trade row with
-    exit_reason showing the highest target reached.
+    Each signal → ONE blended-PnL trade row.
+    exit_reason reflects the *highest* target reached before stop/timeout.
     """
+    WEIGHTS = {1: 0.50, 2: 0.30, 3: 0.20}
+
     trades     = []
     used_dates = set()
-
-    WEIGHTS = {1: 0.50, 2: 0.30, 3: 0.20}   # tranche weights
 
     for _, sig in signals.iterrows():
         entry_date = sig["date"]
@@ -333,93 +363,73 @@ def _simulate_tier2(
         window      = future.iloc[1: hold_days + 1]
 
         sl_orig  = sig["sl"]
-        t1       = sig["t1"]
-        t2       = sig["t2"]
-        t3       = sig["t3"]
+        t1, t2, t3 = sig["t1"], sig["t2"], sig["t3"]
 
-        # State machine
-        trail_sl     = sl_orig          # dynamic SL that steps up
-        t1_hit       = False
-        t2_hit       = False
-        t3_hit       = False
-
-        # PnL contributions per tranche
-        pnl_parts    = {}
+        trail_sl = sl_orig
+        t1_hit = t2_hit = t3_hit = False
+        pnl_parts = {}          # tranche → (exit_px, weight, label)
 
         exit_date   = window.index[-1]
         exit_reason = "TIMEOUT"
-        remaining_weight = 1.0
 
         for dt, row in window.iterrows():
             lo = float(row["low"])
             hi = float(row["high"])
 
-            # Check SL first (affects remaining tranches only)
+            # ── SL check (remaining tranches) ─────────────────────
             if lo <= trail_sl:
-                # Close all remaining
-                sl_exit_px = trail_sl
                 label = "BE STOP" if trail_sl >= entry_price else "SL HIT"
-                for tranche, w in WEIGHTS.items():
-                    if tranche not in pnl_parts:
-                        pnl_parts[tranche] = (sl_exit_px, w, label)
-                        remaining_weight -= w
+                for tr, w in WEIGHTS.items():
+                    if tr not in pnl_parts:
+                        pnl_parts[tr] = (trail_sl, w, label)
                 exit_date   = dt
                 exit_reason = label
                 break
 
-            # T3 (20%)
+            # ── T3 (20 %) ─────────────────────────────────────────
             if not t3_hit and hi >= t3:
                 pnl_parts[3] = (t3, WEIGHTS[3], "T3 HIT")
                 t3_hit = True
-                # Close all remaining at T3
-                for tranche, w in WEIGHTS.items():
-                    if tranche not in pnl_parts:
-                        pnl_parts[tranche] = (t3, w, "T3 HIT")
+                for tr, w in WEIGHTS.items():
+                    if tr not in pnl_parts:
+                        pnl_parts[tr] = (t3, w, "T3 HIT")
                 exit_date   = dt
                 exit_reason = "T3 HIT"
                 break
 
-            # T2 (30%)
+            # ── T2 (30 %) ─────────────────────────────────────────
             if not t2_hit and hi >= t2:
                 pnl_parts[2] = (t2, WEIGHTS[2], "T2 HIT")
-                t2_hit = True
-                trail_sl = t1          # trail to T1 after T2 hit
+                t2_hit  = True
+                trail_sl = t1          # trail SL up to T1
 
-            # T1 (50%)
+            # ── T1 (50 %) ─────────────────────────────────────────
             if not t1_hit and hi >= t1:
                 pnl_parts[1] = (t1, WEIGHTS[1], "T1 HIT")
-                t1_hit = True
-                trail_sl = entry_price  # trail to breakeven after T1
+                t1_hit   = True
+                trail_sl = entry_price  # trail SL to breakeven
 
         else:
-            # Window exhausted — TIMEOUT: close remaining at last close
+            # Window exhausted — close remaining at last close
             last_close = float(window["close"].iloc[-1])
-            for tranche, w in WEIGHTS.items():
-                if tranche not in pnl_parts:
-                    pnl_parts[tranche] = (last_close, w, "TIMEOUT")
-            exit_reason = "TIMEOUT"
-            exit_date   = window.index[-1]
+            for tr, w in WEIGHTS.items():
+                if tr not in pnl_parts:
+                    pnl_parts[tr] = (last_close, w, "TIMEOUT")
 
-        # Compute blended PnL
-        blended_pnl = 0.0
-        final_exit_px = 0.0
-        for tranche, (px, w, _) in sorted(pnl_parts.items()):
+        # Blended PnL
+        blended_pnl   = 0.0
+        final_exit_px = entry_price
+        for tr, (px, w, _) in sorted(pnl_parts.items()):
             blended_pnl  += (px - entry_price) / entry_price * 100 * w
-            final_exit_px = px   # last tranche exit as representative price
+            final_exit_px = px
 
-        blended_pnl = round(blended_pnl, 2)
-
-        # Highest target label
+        # Best exit label
         if t3_hit:
             exit_reason = "T3 HIT"
-        elif t2_hit:
+        elif t2_hit and exit_reason not in ("BE STOP", "SL HIT"):
             exit_reason = "T2 HIT"
-        elif t1_hit and exit_reason not in ("SL HIT",):
-            # T1 partial then stop
-            if "BE STOP" in exit_reason or "SL HIT" in exit_reason:
-                exit_reason = exit_reason   # keep the stop label
-            else:
-                exit_reason = "T1 PARTIAL"
+        elif t1_hit and exit_reason not in ("BE STOP", "SL HIT"):
+            exit_reason = "T1 PARTIAL"   # T1 hit but stopped before T2
 
         trades.append({
             "symbol":         symbol,
@@ -428,10 +438,11 @@ def _simulate_tier2(
             "exit_date":      exit_date.date(),
             "exit_price":     round(final_exit_px, 2),
             "exit_reason":    exit_reason,
-            "pnl_pct":        blended_pnl,
+            "pnl_pct":        round(blended_pnl, 2),
             "pnl_abs":        round(final_exit_px - entry_price, 2),
             "score_at_entry": sig["score"],
             "cci_at_entry":   sig["cci"],
+            "buy_type":       sig.get("buy_type", "-"),
             "sl":             sig["sl"],
             "t1":             sig["t1"],
             "t2":             sig["t2"],
@@ -453,6 +464,8 @@ def simulate_trades(
     tier:      int = 1,
 ) -> pd.DataFrame:
     """Dispatch to Tier-1 or Tier-2 simulator."""
+    if signals.empty or df_full.empty:
+        return pd.DataFrame()
     if tier == 2:
         return _simulate_tier2(symbol, df_full, signals, hold_days)
     return _simulate_tier1(symbol, df_full, signals, hold_days)
@@ -464,12 +477,13 @@ def simulate_trades(
 
 def run_backtest(
     symbols:     list,
-    cci_len:     int = 20,
-    cci_ob:      int = 100,
-    cci_os:      int = -100,
-    min_score:   int = 70,
-    hold_days:   int = 20,
-    tier:        int = 1,
+    cci_len:     int  = 20,
+    cci_ob:      int  = 100,
+    cci_os:      int  = -100,
+    min_score:   int  = 70,
+    hold_days:   int  = 20,
+    tier:        int  = 1,       # 1 = standard / prime,  2 = 3-tranche trail
+    prime_only:  bool = False,   # True = Tier-1 Prime (Fib+CCI gate)
     progress_cb  = None,
 ) -> pd.DataFrame:
     try:
@@ -484,7 +498,7 @@ def run_backtest(
         nifty_close = pd.Series(dtype=float)
 
     all_trades = []
-    total = len(symbols)
+    total      = len(symbols)
 
     for i, sym in enumerate(symbols):
         if progress_cb:
@@ -495,7 +509,10 @@ def run_backtest(
             continue
 
         signals = generate_signals_historical(
-            df, nifty_close, cci_len, cci_ob, cci_os, min_score
+            df, nifty_close,
+            cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
+            min_score=min_score,
+            prime_only=prime_only,
         )
         trades = simulate_trades(sym, df, signals, hold_days=hold_days, tier=tier)
         if not trades.empty:
@@ -524,8 +541,8 @@ def compute_stats(trades: pd.DataFrame) -> dict:
     avg_loss  = round(losses["pnl_pct"].mean(), 2) if len(losses) else 0
     total_pnl = round(trades["pnl_pct"].sum(),  2)
 
-    gross_profit = wins["pnl_pct"].sum()   if len(wins)   else 0
-    gross_loss   = abs(losses["pnl_pct"].sum()) if len(losses) else 1
+    gross_profit = wins["pnl_pct"].sum()            if len(wins)   else 0
+    gross_loss   = abs(losses["pnl_pct"].sum())     if len(losses) else 1
     pf           = round(gross_profit / gross_loss, 2) if gross_loss else 0
 
     rr = round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else 0
@@ -533,25 +550,7 @@ def compute_stats(trades: pd.DataFrame) -> dict:
         (win_rate / 100 * avg_win) - ((100 - win_rate) / 100 * abs(avg_loss)), 2
     )
 
-    # Tier-2 partial stats
-    extra = {}
-    if "tier" in trades.columns and trades["tier"].iloc[0] == 2:
-        reasons = trades["exit_reason"].value_counts().to_dict()
-        t1_p = reasons.get("T1 PARTIAL", 0)
-        t2_h = reasons.get("T2 HIT", 0)
-        t3_h = reasons.get("T3 HIT", 0)
-        total_wins_advanced = t1_p + t2_h + t3_h
-        extra["t1_partial"]    = t1_p
-        extra["t2_hit_count"]  = t2_h
-        extra["t3_hit_count"]  = t3_h
-        extra["t2_rate"]       = round((t2_h + t3_h) / total * 100, 1) if total else 0
-        extra["t3_rate"]       = round(t3_h / total * 100, 1) if total else 0
-        avg_t2 = round(
-            trades[trades["exit_reason"].isin(["T2 HIT", "T3 HIT"])]["pnl_pct"].mean(), 2
-        ) if (t2_h + t3_h) > 0 else 0
-        extra["avg_t2_plus_pnl"] = avg_t2
-
-    return {
+    base = {
         "total_trades":   total,
         "win_rate":       win_rate,
         "avg_win":        avg_win,
@@ -564,5 +563,26 @@ def compute_stats(trades: pd.DataFrame) -> dict:
         "exit_breakdown": trades["exit_reason"].value_counts().to_dict(),
         "best_trade":     round(trades["pnl_pct"].max(), 2),
         "worst_trade":    round(trades["pnl_pct"].min(), 2),
-        **extra,
     }
+
+    # ── Tier-2 extra metrics ──────────────────────────────────────
+    if "tier" in trades.columns and (trades["tier"] == 2).any():
+        reasons   = trades["exit_reason"].value_counts().to_dict()
+        t1_p      = reasons.get("T1 PARTIAL", 0)
+        t2_h      = reasons.get("T2 HIT", 0)
+        t3_h      = reasons.get("T3 HIT", 0)
+        t2_plus   = t2_h + t3_h
+        avg_t2_px = round(
+            trades[trades["exit_reason"].isin(["T2 HIT", "T3 HIT"])]["pnl_pct"].mean(), 2
+        ) if t2_plus > 0 else 0
+
+        base.update({
+            "t1_partial":      t1_p,
+            "t2_hit_count":    t2_h,
+            "t3_hit_count":    t3_h,
+            "t2_rate":         round(t2_plus / total * 100, 1) if total else 0,
+            "t3_rate":         round(t3_h    / total * 100, 1) if total else 0,
+            "avg_t2_plus_pnl": avg_t2_px,
+        })
+
+    return base
