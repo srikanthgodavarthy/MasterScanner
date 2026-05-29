@@ -673,40 +673,61 @@ def render(settings: dict) -> None:
     )
 
     # ── CONTROL ROW ───────────────────────────────────────────────
-    c1, c2, c3, c4 = st.columns([1, 3, 2, 2])
+    c1, c2, c3, c4, c5 = st.columns([1, 3, 2, 2, 2])
     with c1:
         run_btn = st.button("🔍 Run Scan", type="primary", use_container_width=True)
     with c2:
         search = st.text_input("search", placeholder="🔎  Search symbol…  e.g. RELIANCE, TCS",
                                label_visibility="collapsed", key="search_input")
     with c3:
+        scan_mode = st.radio(
+            "scan_mode",
+            options=["tier1", "thesis"],
+            format_func=lambda x: "⚡ Tier-1 (Fast)" if x == "tier1" else "🔬 Thesis Tiers",
+            horizontal=True,
+            label_visibility="collapsed",
+            key="scan_mode",
+            help=(
+                "⚡ Tier-1 (Fast): ~3-5× faster — scores all NSE500 using Tier-1 engine only.\n"
+                "🔬 Thesis Tiers: full Thesis engine (T2★/T2A/T2B/T2C) — slower, ~3-5× more compute per stock."
+            ),
+        )
+        enable_thesis = (scan_mode == "thesis")
+    with c4:
        hi_prob_only = st.toggle("🎯 Hi Prob", value=False, key="hi_prob_toggle",
                              help="trend_up · in_golden · score ≥ 55")
-    with c4:
+    with c5:
         snap_label = st.text_input("snap", placeholder="Snapshot label (optional)",
                                    label_visibility="collapsed", key="snap_input")
     if auto_refresh:
         st.info(f"🔄 Auto-refresh every {settings.get('refresh_mins', 5)} min", icon="⏱")
 
     # ── SCAN ──────────────────────────────────────────────────────
+    # Invalidate cache if scan mode changed since last run
+    if st.session_state.get("_last_scan_mode") != scan_mode:
+        st.session_state.pop("scan_df", None)
+
     if run_btn:
         st.session_state.pop("scan_df", None)
         st.session_state["last_auto_scan"] = time.time()
 
     if run_btn or "scan_df" not in st.session_state:
-        prog = st.progress(0.0, text="Initialising…")
-        with st.spinner("Fetching & scoring Nifty 500…"):
+        mode_label = "Thesis Tiers" if enable_thesis else "Tier-1"
+        prog = st.progress(0.0, text=f"Initialising… ({mode_label} mode)")
+        with st.spinner(f"Fetching & scoring Nifty 500 [{mode_label}]…"):
             df_raw = run_scanner(
                 symbols=symbols, cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
                 max_workers=workers,
+                enable_thesis=enable_thesis,
                 progress_cb=lambda p: prog.progress(p, text=f"Scanning… {int(p*100)}%"),
             )
         prog.empty()
         if df_raw.empty:
             st.warning("No results — check symbols or data source.")
             return
-        st.session_state["scan_df"] = df_raw
-        st.session_state["scan_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        st.session_state["scan_df"]         = df_raw
+        st.session_state["scan_ts"]         = datetime.now().strftime("%Y-%m-%d %H:%M")
+        st.session_state["_last_scan_mode"] = scan_mode
         st.session_state.setdefault("last_auto_scan", time.time())
         if supabase_ok:
             with st.spinner("Saving snapshot…"):

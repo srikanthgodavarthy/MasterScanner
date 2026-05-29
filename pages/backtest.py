@@ -50,18 +50,36 @@ def render(settings=None):
     with st.sidebar:
         st.markdown("### 🧪 Backtest Settings")
 
-        # ── Tier selector ─────────────────────────────────────────────────────
-        bt_tier = st.radio(
-            "Backtest Tier",
-            options=[1, 2],
-            format_func=lambda x: f"Tier-{x}",
+        # ── Scan Engine selector ───────────────────────────────────────────────
+        bt_engine = st.radio(
+            "Scoring Engine",
+            options=["tier1", "thesis"],
+            format_func=lambda x: "⚡ Tier-1 (Fast)" if x == "tier1" else "🔬 Thesis Tiers",
             index=0,
             horizontal=True,
-            key="bt_tier",
+            key="bt_engine",
+            help=(
+                "⚡ Tier-1: fast scoring, supports full NSE500.\n"
+                "🔬 Thesis Tiers: T2★/T2A/T2B/T2C signals — slower."
+            ),
         )
+        bt_enable_thesis = (bt_engine == "thesis")
 
-        # Tier-1 Prime toggle (only relevant for Tier-1)
-        if bt_tier == 1:
+        # ── Tier simulator (only relevant for Tier-1 engine) ──────────────────
+        if not bt_enable_thesis:
+            bt_tier = st.radio(
+                "Backtest Tier",
+                options=[1, 2],
+                format_func=lambda x: f"Tier-{x}",
+                index=0,
+                horizontal=True,
+                key="bt_tier",
+            )
+        else:
+            bt_tier = 1   # Thesis engine uses Tier-1 simulator
+
+        # Tier-1 Prime toggle (only relevant for Tier-1 engine, Tier-1 simulator)
+        if not bt_enable_thesis and bt_tier == 1:
             bt_prime = st.checkbox(
                 "🏆 Tier 1 Prime signals only",
                 value=False,
@@ -78,14 +96,26 @@ def render(settings=None):
                     unsafe_allow_html=True,
                 )
         else:
-            bt_prime = False   # Prime mode N/A for Tier-2
+            bt_prime = False   # Prime mode N/A for Tier-2 or Thesis
 
         st.markdown("---")
 
-        bt_universe  = st.multiselect(
-            "Symbols to Backtest", options=NIFTY500_SYMBOLS,
-            default=DEFAULT_BT_SYMS, key="bt_universe",
+        # ── Universe selector with NSE500 shortcut ────────────────────────────
+        use_all_nse500 = st.checkbox(
+            "🌐 All NSE500",
+            value=False,
+            key="bt_all_nse500",
+            help="Run backtest on all 500 NSE symbols. "
+                 "Works best with ⚡ Tier-1 engine for speed.",
         )
+        if use_all_nse500:
+            bt_universe = NIFTY500_SYMBOLS
+            st.caption(f"📊 {len(NIFTY500_SYMBOLS)} symbols selected")
+        else:
+            bt_universe  = st.multiselect(
+                "Symbols to Backtest", options=NIFTY500_SYMBOLS,
+                default=DEFAULT_BT_SYMS, key="bt_universe",
+            )
         bt_min_score = st.slider("Min Score for Entry", 50, 100, 70, step=5, key="bt_min_score")
         bt_hold_days = st.slider("Max Hold Days",         5,  60, 20, step=5, key="bt_hold_days")
         bt_cci_len   = st.number_input("CCI Length",     5,  50,
@@ -97,9 +127,17 @@ def render(settings=None):
         bt_save_db   = st.checkbox("💾 Save to Supabase", True, key="bt_save_db")
 
     # ── Header ────────────────────────────────────────────────────────────────
-    tc   = TIER_COLOR[bt_tier]
-    tlbl = "Tier-1 Prime Mode" if (bt_tier == 1 and bt_prime) else f"Tier-{bt_tier}"
-    t_icon = "🏆" if (bt_tier == 1 and bt_prime) else ("⚡" if bt_tier == 2 else "🎯")
+    tc   = TIER_COLOR.get(bt_tier, "#3b82f6")
+    if bt_enable_thesis:
+        tlbl   = "Thesis Tiers Mode"
+        t_icon = "🔬"
+        tc     = "#a855f7"
+    elif bt_tier == 1 and bt_prime:
+        tlbl   = "Tier-1 Prime Mode"
+        t_icon = "🏆"
+    else:
+        tlbl   = f"Tier-{bt_tier}"
+        t_icon = "⚡" if bt_tier == 2 else "🎯"
 
     st.markdown(
         f"### 🧪 Backtest Engine &nbsp;"
@@ -116,11 +154,14 @@ def render(settings=None):
     st.markdown("")
 
     # ── Run bar ───────────────────────────────────────────────────────────────
-    mode_label = (
-        "Tier-1 Prime only" if (bt_tier == 1 and bt_prime)
-        else ("Tier-2 trail"  if bt_tier == 2
-              else "All signals")
-    )
+    if bt_enable_thesis:
+        mode_label = "Thesis Tiers"
+    elif bt_tier == 1 and bt_prime:
+        mode_label = "Tier-1 Prime only"
+    elif bt_tier == 2:
+        mode_label = "Tier-2 trail"
+    else:
+        mode_label = "All signals"
 
     col_run, col_info = st.columns([2, 5])
     with col_run:
@@ -154,27 +195,29 @@ def render(settings=None):
 
         trades_df = run_backtest(
             bt_universe,
-            cci_len   = int(bt_cci_len),
-            cci_ob    = int(bt_cci_ob),
-            cci_os    = int(bt_cci_os),
-            min_score = bt_min_score,
-            hold_days = bt_hold_days,
-            tier      = bt_tier,
-            prime_only= bt_prime,
-            progress_cb = _bt_progress,
+            cci_len        = int(bt_cci_len),
+            cci_ob         = int(bt_cci_ob),
+            cci_os         = int(bt_cci_os),
+            min_score      = bt_min_score,
+            hold_days      = bt_hold_days,
+            tier           = bt_tier,
+            prime_only     = bt_prime,
+            enable_thesis  = bt_enable_thesis,
+            progress_cb    = _bt_progress,
         )
         prog.empty()
         sym_status.empty()
 
         if trades_df.empty:
             msg = (
-                "No Tier-1 Prime signals generated. Try a wider symbol universe "
+                "No Thesis-tier signals generated. Try a wider symbol universe "
+                "or lower Min Score." if bt_enable_thesis
+                else "No Tier-1 Prime signals generated. Try a wider symbol universe "
                 "or lower Min Score." if bt_prime
                 else "No trades generated. Try lowering Min Score or adding more symbols."
             )
             st.warning(msg)
             return
-
         st.session_state["bt_trades"]     = trades_df
         st.session_state["bt_stats"]      = compute_stats(trades_df)
         st.session_state["bt_tier_saved"] = bt_tier
