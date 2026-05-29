@@ -38,7 +38,11 @@ def render(settings=None):
         "bt_universe",
         settings.get("symbols", NIFTY500_SYMBOLS) if settings else NIFTY500_SYMBOLS,
     )
-    bt_tier1_only = st.session_state.get("bt_tier1_only", False)
+    # bt_tier1_radio maps to bt_tier1_only via _TIER1_VALUES in sidebar
+    _t1_opts_hoist = [False, "strict", "relax", "any"]
+    _t1_radio_hoist = st.session_state.get("bt_tier1_radio", "All signals (no Tier 1 filter)")
+    _t1_opts_labels = ["All signals (no Tier 1 filter)", "🏆 Tier 1 Strict only (T1★)", "🥈 Tier 1 Relaxed only (T1)", "🏅 Any Tier 1 (T1★ + T1)"]
+    bt_tier1_only = _t1_opts_hoist[_t1_opts_labels.index(_t1_radio_hoist)] if _t1_radio_hoist in _t1_opts_labels else False
     bt_min_score  = st.session_state.get("bt_min_score",  70)
     bt_hold_days  = st.session_state.get("bt_hold_days",  20)
     bt_cci_len    = st.session_state.get("bt_cci_len",    st.session_state.get("cci_len", 20))
@@ -57,31 +61,55 @@ def render(settings=None):
         )
 
         # ── Tier 1 Prime filter ───────────────────────────────────────────────
-        bt_tier1_only = st.checkbox(
-            "🏆 Tier 1 Prime signals only",
-            value=False,
-            key="bt_tier1_only",
+        _TIER1_OPTIONS = [
+            "All signals (no Tier 1 filter)",
+            "🏆 Tier 1 Strict only (T1★)",
+            "🥈 Tier 1 Relaxed only (T1)",
+            "🏅 Any Tier 1 (T1★ + T1)",
+        ]
+        _TIER1_VALUES = [False, "strict", "relax", "any"]
+
+        _tier1_radio = st.radio(
+            "Tier 1 Signal Filter",
+            options=_TIER1_OPTIONS,
+            index=0,
+            key="bt_tier1_radio",
             help=(
-                "Restrict backtest to signals where ALL 5 structural pillars "
-                "align simultaneously:\n\n"
-                "• trend_up (price > EMA200, EMA20 > EMA50)\n"
-                "• in_golden (price at 50–61.8% fib retracement)\n"
-                "• cci_cross_up_os (CCI crossed up through -100)\n"
-                "• qualified (mom1>5%, mom3>10%, mom6>15%)\n"
-                "• above_cloud (price above Ichimoku cloud)\n\n"
-                "This is the rarest, highest-conviction setup. "
-                "Expect fewer trades but cleaner win-rate data."
+                "**All signals** — no Tier 1 gate, Min Score controls entry.\n\n"
+                "**T1★ Strict** — ALL 5 pillars at full thresholds "
+                "(mom1>5%, mom3>10%, mom6>15%, above_cloud, in_golden).\n\n"
+                "**T1 Relaxed** — ALL 5 pillars with lower momentum thresholds "
+                "(mom1>2%, mom3>5%, mom6>8%) and relaxed golden-zone proximity. "
+                "More trades than Strict, still high-conviction.\n\n"
+                "**Any Tier 1** — either Strict or Relaxed qualifies."
             ),
         )
+        bt_tier1_only = _TIER1_VALUES[_TIER1_OPTIONS.index(_tier1_radio)]
 
-        if bt_tier1_only:
+        _tier1_hints = {
+            "strict": (
+                "#1e1040", "#4c1d95", "#c4b5fd",
+                "⚠️ <b>T1★ Strict only</b> — rarest setup, fewest trades. "
+                "Use Nifty 200+ for a meaningful sample size."
+            ),
+            "relax": (
+                "#0f2027", "#155e75", "#67e8f9",
+                "ℹ️ <b>T1 Relaxed only</b> — lower momentum thresholds, "
+                "more trades than Strict while still requiring all 5 pillars."
+            ),
+            "any": (
+                "#0f1f0f", "#14532d", "#86efac",
+                "ℹ️ <b>Any Tier 1 (T1★ + T1)</b> — combines both gates. "
+                "Best balance of conviction and trade count."
+            ),
+        }
+        if bt_tier1_only and bt_tier1_only in _tier1_hints:
+            _bg, _border, _text, _msg = _tier1_hints[bt_tier1_only]
             st.markdown(
-                "<div style='background:#1e1040;border:1px solid #4c1d95;"
-                "border-radius:6px;padding:0.5rem 0.7rem;margin-top:-0.3rem;"
-                "font-size:0.75rem;color:#c4b5fd;line-height:1.5;'>"
-                "⚠️ <b>Tier 1 only</b> — all other buy types are excluded. "
-                "Use Nifty 200 or wider universe to get meaningful sample size."
-                "</div>",
+                f"<div style='background:{_bg};border:1px solid {_border};"
+                f"border-radius:6px;padding:0.5rem 0.7rem;margin-top:-0.3rem;"
+                f"font-size:0.75rem;color:{_text};line-height:1.5;'>"
+                f"{_msg}</div>",
                 unsafe_allow_html=True,
             )
 
@@ -101,11 +129,17 @@ def render(settings=None):
     st.markdown("### 🧪 Backtest Engine")
 
     # Active mode badge
-    if bt_tier1_only:
+    _badge_map = {
+        "strict": ("#4c1d95", "#c4b5fd", "🏆 Tier 1 Strict Mode (T1★)"),
+        "relax":  ("#155e75", "#67e8f9", "🥈 Tier 1 Relaxed Mode (T1)"),
+        "any":    ("#14532d", "#86efac", "🏅 Any Tier 1 Mode (T1★ + T1)"),
+    }
+    if bt_tier1_only and bt_tier1_only in _badge_map:
+        _bbg, _bfg, _blabel = _badge_map[bt_tier1_only]
         st.markdown(
-            "<div style='display:inline-block;background:#4c1d95;color:#c4b5fd;"
-            "border-radius:6px;padding:0.3rem 0.8rem;font-size:0.8rem;"
-            "font-weight:600;margin-bottom:0.5rem;'>🏆 Tier 1 Prime Mode</div>",
+            f"<div style='display:inline-block;background:{_bbg};color:{_bfg};"
+            f"border-radius:6px;padding:0.3rem 0.8rem;font-size:0.8rem;"
+            f"font-weight:600;margin-bottom:0.5rem;'>{_blabel}</div>",
             unsafe_allow_html=True,
         )
 
@@ -121,7 +155,8 @@ def render(settings=None):
     with col_run:
         run_bt = st.button("▶ Run Backtest", use_container_width=True, key="btn_run_bt")
     with col_info:
-        mode_label = "Tier 1 Prime only" if bt_tier1_only else f"Min Score: <b>{bt_min_score}</b>"
+        _ml_map = {"strict": "🏆 T1★ Strict only", "relax": "🥈 T1 Relaxed only", "any": "🏅 Any Tier 1"}
+        mode_label = _ml_map.get(bt_tier1_only, f"Min Score: <b>{bt_min_score}</b>")
         st.markdown(
             f"<div style='padding:0.55rem 0;color:#64748b;font-size:0.78rem;'>"
             f"Symbols: <b>{len(bt_universe)}</b> &nbsp;|&nbsp; "
@@ -159,12 +194,13 @@ def render(settings=None):
         sym_status.empty()
 
         if trades_df.empty:
-            if bt_tier1_only:
-                st.warning(
-                    "No Tier 1 Prime signals found. "
-                    "Try expanding the symbol universe (Nifty 200+) or "
-                    "lowering Min Score. Tier 1 Prime fires very rarely by design."
-                )
+            _t1_warn = {
+                "strict": "No T1★ Strict signals found. Expand universe (Nifty 200+) — Strict fires very rarely.",
+                "relax":  "No T1 Relaxed signals found. Try expanding the symbol universe or lowering Min Score.",
+                "any":    "No Tier 1 signals found (Strict or Relaxed). Try a wider universe.",
+            }
+            if bt_tier1_only and bt_tier1_only in _t1_warn:
+                st.warning(_t1_warn[bt_tier1_only])
             else:
                 st.warning("No trades generated. Try lowering Min Score or adding more symbols.")
             return
