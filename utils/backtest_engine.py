@@ -484,8 +484,13 @@ def run_backtest(
     hold_days:   int  = 20,
     tier:        int  = 1,       # 1 = standard / prime,  2 = 3-tranche trail
     prime_only:  bool = False,   # True = Tier-1 Prime (Fib+CCI gate)
+    enable_thesis: bool = False, # True = use Thesis-tier signal filter
     progress_cb  = None,
 ) -> pd.DataFrame:
+    # ── Conditionally import thesis scorer ───────────────────────
+    if enable_thesis:
+        from utils.scanner_engine import score_stock as _score_stock_full, fetch_nifty
+
     try:
         end   = datetime.now(timezone.utc) + timedelta(days=1)
         start = end - timedelta(days=3 * 365 + 5)
@@ -496,6 +501,14 @@ def run_backtest(
         )
     except Exception:
         nifty_close = pd.Series(dtype=float)
+
+    # Pre-fetch 1-year Nifty series once for thesis scoring
+    nifty_1y = None
+    if enable_thesis:
+        try:
+            nifty_1y = fetch_nifty("1y")
+        except Exception:
+            nifty_1y = nifty_close
 
     all_trades = []
     total      = len(symbols)
@@ -514,6 +527,30 @@ def run_backtest(
             min_score=min_score,
             prime_only=prime_only,
         )
+
+        # ── Thesis filter: keep only signals with a thesis buy tier ──
+        # Scores the sub-frame up to each signal date; retains signals
+        # where T2_Tier is T2★, T2A, T2B, or T2C.
+        if enable_thesis and not signals.empty and nifty_1y is not None:
+            kept = []
+            for _, sig_row in signals.iterrows():
+                sig_date = sig_row["date"]
+                sub = df[df.index <= sig_date]
+                if len(sub) < 50:
+                    continue
+                try:
+                    result = _score_stock_full(
+                        sub, nifty_1y,
+                        cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
+                        enable_thesis=True,
+                    )
+                    t2_tier = result.get("T2_Tier", "-") if result else "-"
+                except Exception:
+                    t2_tier = "-"
+                if t2_tier in ("T2★", "T2A", "T2B", "T2C"):
+                    kept.append(sig_row)
+            signals = pd.DataFrame(kept).reset_index(drop=True) if kept else pd.DataFrame()
+
         trades = simulate_trades(sym, df, signals, hold_days=hold_days, tier=tier)
         if not trades.empty:
             all_trades.append(trades)
