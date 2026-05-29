@@ -6,4 +6,4 @@ plotly>=5.22.0
 supabase>=2.5.0
 python-dotenv>=1.0.0
 requests>=2.31.0
-git+https://github.com/srikanthgodavarthy/MasterScanner.git@T_27May_V01_Tier1Final
+
