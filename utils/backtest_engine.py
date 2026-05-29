@@ -15,18 +15,29 @@ BUGS FIXED vs live repo (refs/heads/main as of May 2025):
   #5 [MEDIUM]   Entry-bar gap — future.iloc[0] now checked for gap-down SL.
   #6 [LOW]      Harmonic/ABCD pattern boosts now included in backtest scoring.
 
-ADDED:
-  tier1_only param — when True, only signals where ALL 5 pillars align are
-  simulated: trend_up + in_golden_relaxed + recent_cci_recovery + qualified
-  + allow_cloud.
-  is_tier1_prime column added to signal rows and trade output for stats slicing.
+ADDED / UPDATED:
+  Dual T1 grading — synced with scanner_engine:
+    T1★ — all 5 pillars with STRICT qualified  (mom1>5, mom3>10, mom6>15)
+    T1  — all 5 pillars with RELAXED qualified (lower thresholds +
+           ATR contraction + breakout proximity)
 
-TIER 1 PRIME GATE — RELAXED vs STRICT:
-  cci_cross_up_os   → recent_cci_recovery  (5-bar lookback window)
-  in_golden         → in_golden_relaxed    (38.2–61.8% fib retracement)
-  above_cloud       → allow_cloud          (above OR inside Ichimoku cloud)
-  trend_up          — unchanged
-  qualified         — unchanged
+  tier1_only param:
+    False (default) — all signals above min_score
+    "strict"        — only T1★ signals
+    "relax"         — only T1 (relaxed) signals
+    "any"           — T1★ OR T1 signals (both gates)
+    True            — backwards-compat alias for "strict"
+
+  tier1_grade column added to trade output ("T1★", "T1", or "").
+
+RELAXED QUALIFIED GATE (qualified_relax):
+  mom1 > 2%  (was 5%)
+  mom3 > 5%  (was 10%)
+  mom6 > 8%  (was 15%)
+  cur_c > cur_e200 * 0.97    (3% buffer below EMA200)
+  cur_e20 > cur_e50 * 0.995  (0.5% buffer — catches imminent golden cross)
+  cur_atr < 20-bar ATR mean  (volatility contraction filter)
+  cur_c > 10-bar high * 0.97 (breakout proximity: within 3% of recent high)
 """
 
 import pandas as pd
@@ -73,28 +84,33 @@ def generate_signals_historical(
     cci_len:     int   = 20,
     cci_ob:      int   = 100,
     cci_os:      int   = -100,
-    min_score:   int   = 70,        # normalised 0-100, same scale as scanner
+    min_score:   int   = 70,
     atr_prox:    float = 0.3,
     pvt_lb:      int   = 20,
-    tier1_only:  bool  = False,     # when True: only emit Tier 1 Prime signals
+    tier1_only         = False,   # False | True | "strict" | "relax" | "any"
 ) -> pd.DataFrame:
     """
     Walk-forward signal generation.
-    Scoring is a complete port of scanner_engine.score_stock() so backtest
-    signals match exactly what the live scanner flags as BUY.
 
-    tier1_only=True restricts signals to bars where ALL five structural
-    conditions align simultaneously (rarest, highest-conviction setup):
-        trend_up + in_golden_relaxed + recent_cci_recovery + qualified
-        + allow_cloud
-
-    Tier 1 Prime gate is RELAXED vs the original strict gate:
-        cci_cross_up_os  → recent_cci_recovery  (any cross in last 5 bars)
-        in_golden        → in_golden_relaxed    (38.2–61.8% retracement)
-        above_cloud      → allow_cloud          (above OR inside cloud)
+    tier1_only controls which signals are emitted:
+      False      — all signals above min_score (default)
+      True       — backwards-compat alias for "strict"
+      "strict"   — only T1★ (strict qualified, all 5 pillars)
+      "relax"    — only T1  (relaxed qualified, all 5 pillars)
+      "any"      — T1★ OR T1 (either gate)
     """
     if df.empty or len(df) < 210:
         return pd.DataFrame()
+
+    # normalise tier1_only to a frozenset of allowed grades
+    if tier1_only is True or tier1_only == "strict":
+        _allowed = {"T1★"}
+    elif tier1_only == "relax":
+        _allowed = {"T1"}
+    elif tier1_only == "any":
+        _allowed = {"T1★", "T1"}
+    else:
+        _allowed = None   # all grades pass
 
     c = df["close"];  h = df["high"]
     l = df["low"];    v = df["volume"]
@@ -106,7 +122,7 @@ def generate_signals_historical(
     atr_s   = atr(h, l, c, 14)
     cci_s   = cci(c, cci_len)
     vol_avg = sma(v, 20)
-    atr_sma = sma(atr_s, 20)
+    atr_sma = sma(atr_s, 20)          # 20-bar ATR mean for contraction filter
 
     tenkan, kijun, senkou_a, senkou_b = ichimoku(h, l)
     cloud_top    = pd.concat([senkou_a, senkou_b], axis=1).max(axis=1)
@@ -144,7 +160,7 @@ def generate_signals_historical(
         # ── Trend ──────────────────────────────────────────────────
         trend_up = cur_c > cur_e200 and cur_e20 > cur_e50
 
-        # ── RS (FIX #4 — guaranteed non-NaN after _strip_tz) ───────
+        # ── RS (FIX #4) ─────────────────────────────────────────────
         rs = 0.0
         if i >= 5:
             c5    = float(c.iloc[i - 5])
@@ -155,42 +171,35 @@ def generate_signals_historical(
 
         # ── Fibonacci ───────────────────────────────────────────────
         win_s   = max(0, i - lookback)
-        sw_hi   = float(h.iloc[win_s:i].max())   # excludes bar i → no look-ahead
+        sw_hi   = float(h.iloc[win_s:i].max())
         sw_lo   = float(l.iloc[win_s:i].min())
         fib_rng = sw_hi - sw_lo
-        fib382  = sw_hi - fib_rng * 0.382        # upper bound for relaxed zone
+        fib382  = sw_hi - fib_rng * 0.382
         fib500  = sw_hi - fib_rng * 0.500
         fib618  = sw_hi - fib_rng * 0.618
         fib_ext127 = sw_hi + fib_rng * 0.272
         fib_ext161 = sw_hi + fib_rng * 0.618
 
-        # Original strict golden zone (50–61.8%) — kept for score calculation
         in_golden = (cur_c >= fib618 - cur_atr * atr_prox and
                      cur_c <= fib500 + cur_atr * atr_prox)
-
-        # Relaxed golden zone (38.2–61.8%) — used for Tier 1 Prime gate
         in_golden_relaxed = (cur_c >= fib618 - cur_atr * atr_prox and
                              cur_c <= fib382 + cur_atr * atr_prox)
 
         near_ext127 = abs(cur_c - fib_ext127) < cur_atr * atr_prox
         near_ext161 = abs(cur_c - fib_ext161) < cur_atr * atr_prox
 
-        # ── CCI signals ─────────────────────────────────────────────
+        # ── CCI ─────────────────────────────────────────────────────
         cci_cross_up_os = prev_cci <= cci_os and cur_cci > cci_os
         cci_cross_dn_ob = prev_cci >= cci_ob and cur_cci < cci_ob
         cci_extended    = cur_cci > cci_ob * 2
         in_golden_cci   = in_golden and cur_cci <= cci_os
 
-        # Relaxed CCI signal: true if CCI crossed up through oversold level
-        # on any bar within the last 5 bars (including current bar i).
-        # This catches setups where the recovery happened 1–4 bars before
-        # the fib/cloud conditions aligned on the same bar.
         recent_cci_recovery = any(
             float(cci_s.iloc[j - 1]) <= cci_os and float(cci_s.iloc[j]) > cci_os
             for j in range(max(1, i - 4), i + 1)
         )
 
-        # ── Qualification ───────────────────────────────────────────
+        # ── Qualification — STRICT ──────────────────────────────────
         mom1 = (cur_c / float(c.iloc[i-21])  - 1) * 100 if i >= 21  else 0
         mom3 = (cur_c / float(c.iloc[i-63])  - 1) * 100 if i >= 63  else 0
         mom6 = (cur_c / float(c.iloc[i-126]) - 1) * 100 if i >= 126 else 0
@@ -198,30 +207,58 @@ def generate_signals_historical(
         trend_strong = cur_c > cur_e20 and cur_e20 > cur_e50
         qualified    = strong_htf and trend_strong
 
-        # ── Cloud position ──────────────────────────────────────────
+        # ── Qualification — RELAXED ─────────────────────────────────
+        # Lower momentum thresholds + ATR contraction + breakout proximity.
+        atr_contracting  = cur_atr < cur_atr_sma
+        recent_10_high   = float(c.iloc[max(0, i-11):i].max())   # [1]-offset like scanner
+        near_breakout    = cur_c > recent_10_high * 0.97
+
+        strong_htf_relax = mom1 > 2 and mom3 > 5 and mom6 > 8
+        trend_relax      = (
+            cur_c > cur_e200 * 0.97 and
+            cur_e20 > cur_e50 * 0.995
+        )
+        qualified_relax  = (
+            strong_htf_relax and
+            trend_relax      and
+            atr_contracting  and
+            near_breakout
+        )
+
+        # ── Cloud ───────────────────────────────────────────────────
         above_cloud  = cur_c > cur_ct
         inside_cloud = cur_cb <= cur_c <= cur_ct
         below_cloud  = cur_c < cur_cb
-
-        # Relaxed cloud gate: above OR inside cloud (was: above_cloud only)
         allow_cloud  = above_cloud or inside_cloud
 
-        # ── Tier 1 Prime — relaxed gate ──────────────────────────────
-        # Three conditions relaxed vs the original strict gate:
-        #   cci_cross_up_os  → recent_cci_recovery  (5-bar lookback)
-        #   in_golden        → in_golden_relaxed    (38.2–61.8% fib)
-        #   above_cloud      → allow_cloud          (above OR inside cloud)
-        is_tier1_prime = (
-            trend_up              and   # EMA stack: price > EMA200, EMA20 > EMA50
-            in_golden_relaxed     and   # price inside 38.2–61.8% fib retracement
-            recent_cci_recovery   and   # CCI crossed up through oversold in last 5 bars
-            qualified             and   # mom1>5%, mom3>10%, mom6>15% + trend_strong
-            allow_cloud                 # price above OR inside Ichimoku cloud
+        # ── Tier 1 — STRICT gate (T1★) ──────────────────────────────
+        is_t1_strict = (
+            trend_up              and
+            in_golden_relaxed     and
+            recent_cci_recovery   and
+            qualified             and   # strict: mom1>5, mom3>10, mom6>15
+            allow_cloud
         )
 
-        # ── Tier 1 Prime gate (optional) ────────────────────────────
-        if tier1_only and not is_tier1_prime:
-            continue
+        # ── Tier 1 — RELAXED gate (T1) ──────────────────────────────
+        is_t1_relax = (
+            not is_t1_strict      and   # strict already handled
+            trend_up              and
+            in_golden_relaxed     and
+            recent_cci_recovery   and
+            qualified_relax       and   # relaxed: lower thresholds + filters
+            allow_cloud
+        )
+
+        is_tier1_prime = is_t1_strict or is_t1_relax
+
+        # ── Grade ───────────────────────────────────────────────────
+        tier1_grade = "T1★" if is_t1_strict else ("T1" if is_t1_relax else "")
+
+        # ── Tier 1 gate filter ───────────────────────────────────────
+        if _allowed is not None:
+            if tier1_grade not in _allowed:
+                continue
 
         # ── FIX #6 — Pivot / Harmonic / ABCD ────────────────────────
         pvt_lb_use = min(pvt_lb, i // 4)
@@ -251,37 +288,39 @@ def generate_signals_historical(
         score += (25 if cur_r > 60 else 20 if cur_r > 55 else 15 if cur_r > 50 else 5 if cur_r > 45 else 0)
         score += (20 if cur_v > cur_va * 1.2 else 10 if cur_v > cur_va else 0)
 
-        hh = float(c.iloc[max(0, i-11):i].max())   # matches Pine [1] offset
+        hh = float(c.iloc[max(0, i-11):i].max())
         score += (25 if cur_c > hh else 15 if cur_c > hh * 0.98 else 0)
         score += 10 if i >= 2 and cur_c > float(c.iloc[i-2]) else 0
         score += (15 if rs > 0 else 5 if rs > -0.005 else 0)
 
         score += 30 if in_golden    else 0
         score += -20 if near_ext127 else (-30 if near_ext161 else 0)
-
         score += (20 if cur_cci < cci_os else 10 if cur_cci < 0 else -15 if cci_extended else 0)
         score += 15 if cci_cross_up_os else 0
         score -= 10 if cci_extended    else 0
+
+        # Strict qualified for score — keeps score meaning consistent
         score += 25 if qualified else -10
 
         if harm_bull:  score += 20
         if abcd_bull:  score += 15
-
         score += -15 if below_cloud else 0
 
-        # FIX #1 — normalise to 0-100 like scanner, then apply adaptive threshold
+        # T1★ strict bonus (same as scanner)
+        score += 20 if is_t1_strict else 0
+
+        # FIX #1 — normalise to 0-100
         norm_score = min(100, int(score * 100 / 175))
 
         ts_ratio  = cur_atr / cur_atr_sma if cur_atr_sma > 0 else 1.0
         threshold = 65 if ts_ratio > 1.2 else (75 if ts_ratio < 0.8 else 70)
 
-        # Cloud gate — uses original above_cloud / inside_cloud for non-T1 signals
         allow_cloud_buy = above_cloud or (inside_cloud and norm_score >= 65)
 
         if norm_score < min_score or not allow_cloud_buy:
             continue
 
-        # ── Trade levels (Swing mode: atrSLmult=2.5, atrSLwide=4.0) ──
+        # ── Trade levels ────────────────────────────────────────────
         en     = round(cur_c)
         raw_sl = en - cur_atr * 2.5 * 0.85
         min_sl = en - cur_atr * 4.0
@@ -293,23 +332,26 @@ def generate_signals_historical(
         t3     = round(en + rk * 3)
 
         signals.append({
-            "date":         df.index[i],
-            "score":        norm_score,
-            "entry":        cur_c,
-            "sl":           sl,
-            "t1":           t1,
-            "t2":           t2,
-            "t3":           t3,
-            "cci":          round(cur_cci),
-            "rsi":          round(cur_r, 1),
-            "tier1_prime":  is_tier1_prime,   # stored for stats slicing
+            "date":           df.index[i],
+            "score":          norm_score,
+            "entry":          cur_c,
+            "sl":             sl,
+            "t1":             t1,
+            "t2":             t2,
+            "t3":             t3,
+            "cci":            round(cur_cci),
+            "rsi":            round(cur_r, 1),
+            "tier1_prime":    is_tier1_prime,    # True if either gate
+            "tier1_grade":    tier1_grade,        # "T1★" | "T1" | ""
+            "t1_strict":      is_t1_strict,
+            "t1_relax":       is_t1_relax,
         })
 
     return pd.DataFrame(signals)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  TRADE SIMULATION  (all simulate_trades bugs fixed)
+#  TRADE SIMULATION
 # ══════════════════════════════════════════════════════════════════
 
 def simulate_trades(
@@ -327,7 +369,6 @@ def simulate_trades(
     for _, sig in signals.iterrows():
         entry_signal_date = sig["date"]
 
-        # FIX #2 — skip until previous trade has exited
         if entry_signal_date <= blocked_until:
             continue
 
@@ -350,7 +391,6 @@ def simulate_trades(
         exit_date   = future.index[min(hold_days, len(future) - 1)]
         exit_reason = "TIMEOUT"
 
-        # FIX #5 — check entry bar (j=0) AND subsequent bars
         window = future.iloc[0: hold_days + 1]
 
         for j, (dt, row) in enumerate(window.iterrows()):
@@ -362,7 +402,7 @@ def simulate_trades(
             t2_hit = bar_high >= t2
             t1_hit = bar_high >= t1
 
-            # FIX #3 — same-bar conflict: use open proximity as intraday heuristic
+            # FIX #3 — same-bar conflict
             if sl_hit and (t2_hit or t1_hit):
                 target = t2 if t2_hit else t1
                 if abs(bar_open - target) < abs(bar_open - sl):
@@ -406,10 +446,12 @@ def simulate_trades(
             "sl":             sig["sl"],
             "t1":             sig["t1"],
             "t2":             sig["t2"],
-            "tier1_prime":    bool(sig.get("tier1_prime", False)),   # propagated
+            "tier1_prime":    bool(sig.get("tier1_prime", False)),
+            "tier1_grade":    str(sig.get("tier1_grade", "")),    # "T1★" | "T1" | ""
+            "t1_strict":      bool(sig.get("t1_strict", False)),
+            "t1_relax":       bool(sig.get("t1_relax", False)),
         })
 
-        # FIX #2 — block until exit date (not just 5 bars)
         blocked_until = exit_date
 
     return pd.DataFrame(trades)
@@ -427,9 +469,17 @@ def run_backtest(
     min_score:    int  = 70,
     hold_days:    int  = 20,
     workers:      int  = 10,
-    tier1_only:   bool = False,   # ← Tier 1 Prime gate (relaxed)
+    tier1_only         = False,   # False | True | "strict" | "relax" | "any"
     progress_cb        = None,
 ) -> pd.DataFrame:
+    """
+    tier1_only values:
+      False      — all signals (default)
+      True       — backwards-compat alias for "strict"
+      "strict"   — only T1★ signals
+      "relax"    — only T1 (relaxed gate) signals
+      "any"      — T1★ OR T1 signals
+    """
     try:
         end   = datetime.now(timezone.utc) + timedelta(days=1)
         start = end - timedelta(days=3 * 365 + 5)
@@ -475,7 +525,7 @@ def run_backtest(
                     with trades_lock:
                         all_trades.append(result)
             except Exception:
-                pass   # silently skip failed symbols
+                pass
 
     return pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
 
@@ -487,6 +537,7 @@ def run_backtest(
 def compute_stats(trades: pd.DataFrame) -> dict:
     if trades.empty:
         return {}
+
     total  = len(trades)
     wins   = trades[trades["pnl_pct"] > 0]
     losses = trades[trades["pnl_pct"] <= 0]
@@ -499,8 +550,23 @@ def compute_stats(trades: pd.DataFrame) -> dict:
     rr           = round(abs(avg_win / avg_loss), 2)   if avg_loss   else 0
     expectancy   = round((win_rate/100 * avg_win) - ((100-win_rate)/100 * abs(avg_loss)), 2)
 
-    # Tier 1 Prime trade count (column present only when tier1_only=False)
-    t1_trades = int(trades["tier1_prime"].sum()) if "tier1_prime" in trades.columns else 0
+    # Grade-level breakdowns
+    t1_strict_trades = int(trades["t1_strict"].sum()) if "t1_strict" in trades.columns else 0
+    t1_relax_trades  = int(trades["t1_relax"].sum())  if "t1_relax"  in trades.columns else 0
+    t1_total_trades  = int(trades["tier1_prime"].sum()) if "tier1_prime" in trades.columns else 0
+
+    # Per-grade win rates (for comparison)
+    grade_stats = {}
+    if "tier1_grade" in trades.columns:
+        for grade in ["T1★", "T1", ""]:
+            subset = trades[trades["tier1_grade"] == grade]
+            if not subset.empty:
+                g_wins = subset[subset["pnl_pct"] > 0]
+                grade_stats[grade if grade else "Other"] = {
+                    "count":    len(subset),
+                    "win_rate": round(len(g_wins) / len(subset) * 100, 1),
+                    "avg_pnl":  round(subset["pnl_pct"].mean(), 2),
+                }
 
     return {
         "total_trades":    total,
@@ -515,5 +581,8 @@ def compute_stats(trades: pd.DataFrame) -> dict:
         "exit_breakdown":  trades["exit_reason"].value_counts().to_dict(),
         "best_trade":      round(trades["pnl_pct"].max(), 2),
         "worst_trade":     round(trades["pnl_pct"].min(), 2),
-        "t1_prime_trades": t1_trades,
+        "t1_prime_trades": t1_total_trades,
+        "t1_strict_trades": t1_strict_trades,
+        "t1_relax_trades":  t1_relax_trades,
+        "grade_stats":      grade_stats,   # per-grade breakdown for UI
     }
