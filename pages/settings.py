@@ -61,6 +61,52 @@ def render() -> dict:
     st.session_state["cci_os"]  = int(cci_os)
     st.session_state["workers"] = int(workers)
 
+    # ── BACKTEST SIGNAL FILTER ────────────────────────────────────────────────
+    st.subheader("🎯 Backtest Signal Filter")
+    st.caption(
+        "Controls which signals the backtest engine simulates. "
+        "T1★ (strict) uses the original full-momentum gate. "
+        "T1 (relaxed) uses lower momentum thresholds + ATR contraction + breakout proximity. "
+        "See AccTier column in scanner results for live grades."
+    )
+
+    _tier1_labels = [
+        "All signals (no filter)",
+        "T1★ only — strict qualified (mom1>5, mom3>10, mom6>15)",
+        "T1 only — relaxed qualified (mom1>2, mom3>5, mom6>8 + ATR contraction + breakout)",
+        "T1★ + T1 — any Tier 1 gate",
+    ]
+    _tier1_values = [False, "strict", "relax", "any"]
+
+    # Reverse-map stored value → index for the selectbox default
+    _stored = st.session_state.get("tier1_mode", False)
+    try:
+        _default_idx = _tier1_values.index(_stored)
+    except ValueError:
+        _default_idx = 0
+
+    _selected_label = st.selectbox(
+        "Signal filter",
+        options=_tier1_labels,
+        index=_default_idx,
+        key="tier1_mode_select",
+    )
+    tier1_mode = _tier1_values[_tier1_labels.index(_selected_label)]
+    st.session_state["tier1_mode"] = tier1_mode
+
+    # Inline description so the user knows exactly what each mode means
+    _descriptions = {
+        False:    "ℹ️ All signals above the minimum score threshold are simulated.",
+        "strict": "ℹ️ Only T1★ trades — all five pillars with full momentum qualification. "
+                  "Highest conviction (~90%+ target win rate).",
+        "relax":  "ℹ️ Only T1 (relaxed) trades — lower momentum thresholds, but ATR must be "
+                  "contracting and price must be within 3% of the 10-bar high. "
+                  "Catches early-stage movers (~80% target win rate).",
+        "any":    "ℹ️ T1★ OR T1 — both gates. "
+                  "Useful for comparing strict vs relaxed side-by-side in the trade log.",
+    }
+    st.caption(_descriptions[tier1_mode])
+
     # ── UNIVERSE MANAGER ──────────────────────────────────────────────────────
     st.subheader("📋 Stock Universe")
 
@@ -88,10 +134,9 @@ def render() -> dict:
 
     supabase_ok = _is_available()
 
-    # Always sync from Supabase on first load
     if "watchlist_loaded" not in st.session_state:
         if supabase_ok:
-            rows = load_watchlist()          # [{"symbol": ..., "notes": ..., "added_at": ...}]
+            rows = load_watchlist()
             st.session_state["watchlist"] = rows
         else:
             st.session_state.setdefault("watchlist", [])
@@ -105,7 +150,6 @@ def render() -> dict:
         )
         st.dataframe(wl_df, use_container_width=True, hide_index=True)
 
-        # Remove a symbol
         syms_in_wl = [w["symbol"] for w in wl]
         rem_sym = st.selectbox("Remove from watchlist", ["— select —"] + syms_in_wl)
         if rem_sym != "— select —":
@@ -129,7 +173,6 @@ def render() -> dict:
     else:
         st.info("Watchlist is empty.")
 
-    # Bulk-replace watchlist
     st.markdown("**Bulk edit watchlist** (replaces entire list)")
     bulk_raw = st.text_area(
         "One symbol per line",
@@ -140,16 +183,14 @@ def render() -> dict:
     if st.button("💾 Save Watchlist", type="primary"):
         new_symbols = [s.strip().upper() for s in bulk_raw.splitlines() if s.strip()]
         if supabase_ok:
-            ok = save_watchlist(new_symbols)         # ← actual DB write
+            ok = save_watchlist(new_symbols)
             if ok:
-                # Reload from DB to reflect truth
                 rows = load_watchlist()
                 st.session_state["watchlist"] = rows
                 st.success(f"✅ Watchlist saved ({len(new_symbols)} symbols).")
             else:
                 st.error("❌ Supabase save failed — check logs.")
         else:
-            # Session-state fallback
             st.session_state["watchlist"] = [{"symbol": s, "notes": ""} for s in new_symbols]
             st.success(f"✅ Watchlist updated in session ({len(new_symbols)} symbols). "
                        "Configure Supabase to persist across sessions.")
@@ -208,7 +249,34 @@ def render() -> dict:
         st.session_state.pop("scan_df", None)
         st.success("Cache cleared.")
 
-    # Return settings for use by other pages
+    # ── ACC TIER LEGEND ───────────────────────────────────────────────────────
+    st.subheader("📖 AccTier Grade Reference")
+    grade_data = {
+        "Grade":       ["T1★", "T1", "A", "B", "C", "D"],
+        "Gate":        [
+            "All 5 pillars — strict qualified",
+            "All 5 pillars — relaxed qualified",
+            "Strict qualified + any buy signal",
+            "Any buy signal (not strictly qualified)",
+            "Watch territory (score ≥ 50)",
+            "Skip",
+        ],
+        "Target win rate": ["~90%+", "~80%", "~85%", "~75%", "~60%", "—"],
+        "Qualified gate": [
+            "mom1>5, mom3>10, mom6>15 + trend_strong",
+            "mom1>2, mom3>5, mom6>8 + ATR contraction + breakout proximity",
+            "mom1>5, mom3>10, mom6>15 + trend_strong",
+            "—",
+            "—",
+            "—",
+        ],
+    }
+    st.dataframe(
+        pd.DataFrame(grade_data),
+        use_container_width=True,
+        hide_index=True,
+    )
+
     return {
         "symbols":      symbols,
         "cci_len":      int(cci_len),
@@ -217,4 +285,5 @@ def render() -> dict:
         "workers":      int(workers),
         "auto_refresh": bool(auto_refresh),
         "refresh_mins": int(refresh_mins),
+        "tier1_mode":   tier1_mode,   # False | "strict" | "relax" | "any"
     }
