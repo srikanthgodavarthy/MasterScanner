@@ -45,7 +45,7 @@ def _pnl_color(val):
         return ""
 
 
-def render():
+def render(settings=None):
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
         st.markdown("### 🧪 Backtest Settings")
