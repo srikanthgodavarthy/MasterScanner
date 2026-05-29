@@ -17,7 +17,26 @@ TIER 1 PRIME GATE — RELAXED vs STRICT:
   in_golden         → in_golden_relaxed    (38.2–61.8% fib retracement)
   above_cloud       → allow_cloud          (above OR inside Ichimoku cloud)
   trend_up          — unchanged
-  qualified         — unchanged
+  qualified         — unchanged  (strict gate)
+  qualified_relax   — NEW        (relaxed gate: lower mom thresholds +
+                                  ATR contraction + breakout proximity)
+
+DUAL T1 GRADING:
+  T1★  — all 5 pillars with STRICT qualified  (~90%+ conviction)
+  T1   — all 5 pillars with RELAXED qualified (~80%+ conviction)
+  A    — qualified(strict) + any valid buy signal
+  B    — any valid buy signal, not strictly qualified
+  C    — WATCH territory (score ≥ 50, no buy)
+  D    — SKIP
+
+RELAXED QUALIFIED GATE (qualified_relax):
+  mom1 > 2%  (was 5%)
+  mom3 > 5%  (was 10%)
+  mom6 > 8%  (was 15%)
+  cur_c > cur_e200 * 0.97    (3% buffer below EMA200)
+  cur_e20 > cur_e50 * 0.995  (0.5% buffer — catches imminent golden cross)
+  cur_atr < atr_20bar_mean   (ATR contraction: volatility compressing)
+  cur_c > recent_10bar_high * 0.97  (breakout proximity: within 3% of high)
 """
 
 import pandas as pd
@@ -44,7 +63,6 @@ def _strip_tz(index: pd.Index) -> pd.Index:
     idx = pd.to_datetime(index)
     if hasattr(idx, "tz") and idx.tz is not None:
         idx = idx.tz_convert("UTC").tz_localize(None)
-    # as_unit("ns") is a pandas 2.0+ method; normalises us/ms/s → ns
     if hasattr(idx, "as_unit"):
         idx = idx.as_unit("ns")
     return idx
@@ -99,17 +117,16 @@ def lowest(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(period).min()
 
 def pivot_high(high: pd.Series, lb: int) -> pd.Series:
-    """Vectorized pivot high — centre-window rolling max (replaces Python loop)."""
+    """Vectorized pivot high — centre-window rolling max."""
     roll_max = high.rolling(2 * lb + 1, center=True, min_periods=2 * lb + 1).max()
     return high.where(high == roll_max)
 
 def pivot_low(low: pd.Series, lb: int) -> pd.Series:
-    """Vectorized pivot low — centre-window rolling min (replaces Python loop)."""
+    """Vectorized pivot low — centre-window rolling min."""
     roll_min = low.rolling(2 * lb + 1, center=True, min_periods=2 * lb + 1).min()
     return low.where(low == roll_min)
 
 def last_value(series: pd.Series) -> float:
-    """Last non-NaN value (ta.valuewhen equivalent)."""
     valid = series.dropna()
     return float(valid.iloc[-1]) if not valid.empty else np.nan
 
@@ -126,7 +143,7 @@ def ichimoku(high: pd.Series, low: pd.Series):
 #  HARMONIC PATTERN DETECTION  (Pine Script port)
 # ══════════════════════════════════════════════════════════════════
 
-TOLERANCE = 0.03   # i_tolerance default
+TOLERANCE = 0.03
 
 def _in_range(val, target, tol=TOLERANCE):
     return abs(val - target) <= tol
@@ -164,21 +181,14 @@ def detect_pattern(xP, aP, bP, cP, dP):
     return ""
 
 def detect_harmonic(pivots_price, pivots_is_high):
-    """
-    pivots_price   : list of up to 8 recent pivot prices  (newest first)
-    pivots_is_high : list of bools (True = high pivot)
-    Returns ("bull"|"bear"|"", pattern_name)
-    """
     if len(pivots_price) < 5:
         return "", ""
     dP, cP, bP, aP, xP = pivots_price[:5]
     dH, cH, bH, aH, xH = pivots_is_high[:5]
-    # Bull XABCD: low-high-low-high-low
     if (not xH) and aH and (not bH) and cH and (not dH):
         name = detect_pattern(xP, aP, bP, cP, dP)
         if name:
             return "bull", name
-    # Bear XABCD: high-low-high-low-high
     if xH and (not aH) and bH and (not cH) and dH:
         name = detect_pattern(xP, aP, bP, cP, dP)
         if name:
@@ -187,9 +197,6 @@ def detect_harmonic(pivots_price, pivots_is_high):
 
 
 def detect_abcd(pivots_price, pivots_is_high, close_val, open_val, prev_high):
-    """
-    Returns (abcd_bull, abcd_bear)
-    """
     if len(pivots_price) < 4:
         return False, False
     dP, cP, bP, aP = pivots_price[:4]
@@ -310,7 +317,6 @@ NIFTY500_SYMBOLS = [
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
-    """Single-symbol fetch — kept for backtest compatibility. Scanner uses fetch_batch_ohlcv."""
     try:
         ticker = yf.Ticker(f"{symbol}.NS")
         df = ticker.history(period=period, interval=interval, auto_adjust=True)
@@ -325,11 +331,6 @@ def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.Dat
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") -> dict:
-    """
-    Batch-download OHLCV for multiple symbols in a single yf.download() call.
-    ~10-20x faster than one Ticker.history() per symbol.
-    symbols must be a tuple so it is hashable for st.cache_data.
-    """
     if not symbols:
         return {}
     tickers = [f"{s}.NS" for s in symbols]
@@ -389,6 +390,12 @@ def score_stock(
     """
     Full port of Pine Script f() scoring + all signal logic.
     Mode fixed to Swing (daily chart).
+
+    Dual T1 grading:
+      T1★ — all 5 pillars with STRICT qualified  (mom1>5, mom3>10, mom6>15)
+      T1  — all 5 pillars with RELAXED qualified (lower thresholds +
+             ATR contraction + breakout proximity)
+
     Returns dict ready for scanner table, or {} on failure.
     """
     if df.empty or len(df) < 210:
@@ -407,6 +414,7 @@ def score_stock(
     atr_val  = atr(h, l, c, 14)
     cci_val  = cci(c, cci_len)
     vol_avg  = sma(v, 20)
+    atr_sma20 = sma(atr_val, 20)   # 20-bar ATR mean for contraction filter
 
     # Ichimoku
     tenkan, kijun, senkou_a, senkou_b = ichimoku(h, l)
@@ -427,14 +435,13 @@ def score_stock(
     cur_cci  = float(cci_val.iloc[-1])
     cur_vavg = float(vol_avg.iloc[-1])
     prev_cci = float(cci_val.iloc[-2]) if len(cci_val) >= 2 else cur_cci
+    cur_atr_sma20 = float(atr_sma20.iloc[-1]) if not np.isnan(float(atr_sma20.iloc[-1])) else cur_atr
 
     ct   = float(cloud_top.iloc[-1])
     cb   = float(cloud_bottom.iloc[-1])
     above_cloud  = cur_c > ct
     below_cloud  = cur_c < cb
     inside_cloud = cb <= cur_c <= ct
-
-    # Relaxed cloud gate: above OR inside cloud
     allow_cloud  = above_cloud or inside_cloud
 
     # ── TREND ────────────────────────────────────────────────────
@@ -470,14 +477,10 @@ def score_stock(
     fib_ext161 = sw_hi + fib_rng * 0.618
     fib_ext261 = sw_hi + fib_rng * 1.618
 
-    # Original strict golden zone (50–61.8%) — used for score calculation
-    # and buy-type classification
     in_golden = (
         cur_c >= fib618 - cur_atr * atr_prox and
         cur_c <= fib500 + cur_atr * atr_prox
     )
-
-    # Relaxed golden zone (38.2–61.8%) — used for Tier 1 Prime gate only
     in_golden_relaxed = (
         cur_c >= fib618 - cur_atr * atr_prox and
         cur_c <= fib382 + cur_atr * atr_prox
@@ -487,23 +490,18 @@ def score_stock(
     near_ext161 = abs(cur_c - fib_ext161) < cur_atr * atr_prox
 
     # ── CCI SIGNALS ───────────────────────────────────────────────
-    cci_cross_up_os = prev_cci <= cci_os and cur_cci > cci_os   # oversold recovery this bar
-    cci_cross_dn_ob = prev_cci >= cci_ob and cur_cci < cci_ob   # overbought exit
-    cci_extended    = cur_cci > cci_ob * 2                       # e.g. > +200
-    cci_weakening   = cur_cci < prev_cci and cur_cci > 0         # falling but above 0
+    cci_cross_up_os = prev_cci <= cci_os and cur_cci > cci_os
+    cci_cross_dn_ob = prev_cci >= cci_ob and cur_cci < cci_ob
+    cci_extended    = cur_cci > cci_ob * 2
+    cci_weakening   = cur_cci < prev_cci and cur_cci > 0
 
-    # CCI-confirmed golden zone (strict — for buy-type labels)
     in_golden_cci = in_golden and cur_cci <= cci_os
 
-    # Relaxed CCI signal: true if CCI crossed up through oversold on any
-    # of the last 5 bars (bars [-5] through [-1] relative to current bar).
-    # This catches setups where the momentum cross happened 1–4 bars before
-    # the fib and cloud conditions aligned, which is common on NSE dailies.
     recent_cci_recovery = False
     if len(cci_val) >= 6:
         recent_cci_recovery = any(
             float(cci_val.iloc[-(k + 1)]) <= cci_os and float(cci_val.iloc[-k]) > cci_os
-            for k in range(1, 6)   # k=1 → bar[-1] crossed; k=5 → bar[-5] crossed
+            for k in range(1, 6)
         )
 
     # ── PIVOT DETECTION ──────────────────────────────────────────
@@ -529,96 +527,100 @@ def score_stock(
 
     abcd_bull, abcd_bear = detect_abcd(pv_prices, pv_is_high, cur_c, cur_o, prev_h)
 
-    # ── SCORE CALCULATION ─────────────────────────────────────────
-    bull_score = 0.0
-
-    # Trend (Pine: trendUp ? 25)
-    bull_score += 25 if trend_up else 0
-
-    # EMA alignment (Pine: e20>e50 → +30, near → +20)
-    bull_score += 30 if cur_e20 > cur_e50 else (20 if cur_e20 > cur_e50 * 0.995 else 0)
-
-    # RSI
-    bull_score += (25 if cur_r > 60 else 20 if cur_r > 55 else 15 if cur_r > 50 else 5 if cur_r > 45 else 0)
-
-    # Volume
-    bull_score += (20 if cur_v > cur_vavg * 1.2 else 10 if cur_v > cur_vavg else 0)
-
-    # Breakout — hh = highest close 10 bars ago
-    hh = float(highest(c, 10).iloc[-2]) if len(c) >= 11 else cur_c
-    bull_score += (25 if cur_c > hh else 15 if cur_c > hh * 0.98 else 0)
-
-    # Momentum
-    bull_score += 10 if len(c) >= 3 and (c.iloc[-1] > c.iloc[-3]) else 0
-
-    # Relative Strength
-    bull_score += (15 if rs > 0 else 5 if rs > -0.005 else 0)
-
-    # Fibonacci Golden Zone (strict 50–61.8% used for score)
-    bull_score += 30 if in_golden else 0
-
-    # Fib Extension penalties
-    bull_score += -20 if near_ext127 else (-30 if near_ext161 else 0)
-
-    # CCI contribution
-    bull_score += (20 if cur_cci < cci_os else 10 if cur_cci < 0 else -15 if cci_extended else 0)
-
-    # CCI cross-up bonus (strict single-bar — for score only)
-    bull_score += 15 if cci_cross_up_os else 0
-
-    # CCI extended additional penalty
-    bull_score -= 10 if cci_extended else 0
-
-    # ── QUALIFICATION LAYER ───────────────────────────────────────
+    # ── MOMENTUM (HTF) ────────────────────────────────────────────
     mom1 = (cur_c / float(c.iloc[-22])  - 1) * 100 if len(c) >= 22  else 0
     mom3 = (cur_c / float(c.iloc[-64])  - 1) * 100 if len(c) >= 64  else 0
     mom6 = (cur_c / float(c.iloc[-127]) - 1) * 100 if len(c) >= 127 else 0
 
-    strong_htf   = mom1 > 5 and mom3 > 10 and mom6 > 15
+    # ── STRICT QUALIFIED GATE ─────────────────────────────────────
+    # Original thresholds — unchanged. Used for T1★ grade and AccTier "A".
+    strong_htf   = mom1 > 5  and mom3 > 10 and mom6 > 15
     trend_strong = cur_c > cur_e20 and cur_e20 > cur_e50
     qualified    = strong_htf and trend_strong
 
+    # ── RELAXED QUALIFIED GATE ────────────────────────────────────
+    # Lower momentum thresholds + two structural quality filters:
+    #   atr_contracting : volatility compressing into the setup
+    #                     (cur ATR below its own 20-bar mean)
+    #   near_breakout   : price within 3% of the 10-bar closing high
+    #                     (ensures a catalyst is nearby, not a dead range)
+    # Both filters partially compensate for the weaker momentum bar.
+    atr_contracting  = cur_atr < cur_atr_sma20
+    recent_10bar_high = float(highest(c, 10).iloc[-2]) if len(c) >= 11 else cur_c
+    near_breakout    = cur_c > recent_10bar_high * 0.97
+
+    strong_htf_relax = mom1 > 2 and mom3 > 5 and mom6 > 8
+    trend_relax      = (
+        cur_c > cur_e200 * 0.97 and      # 3% buffer below EMA200
+        cur_e20 > cur_e50 * 0.995         # 0.5% buffer — catches imminent golden cross
+    )
+    qualified_relax  = (
+        strong_htf_relax and
+        trend_relax      and
+        atr_contracting  and              # only take low-vol compression setups
+        near_breakout                     # must be near breakout level
+    )
+
+    # ── SCORE CALCULATION ─────────────────────────────────────────
+    bull_score = 0.0
+
+    bull_score += 25 if trend_up else 0
+    bull_score += 30 if cur_e20 > cur_e50 else (20 if cur_e20 > cur_e50 * 0.995 else 0)
+    bull_score += (25 if cur_r > 60 else 20 if cur_r > 55 else 15 if cur_r > 50 else 5 if cur_r > 45 else 0)
+    bull_score += (20 if cur_v > cur_vavg * 1.2 else 10 if cur_v > cur_vavg else 0)
+
+    hh = float(highest(c, 10).iloc[-2]) if len(c) >= 11 else cur_c
+    bull_score += (25 if cur_c > hh else 15 if cur_c > hh * 0.98 else 0)
+    bull_score += 10 if len(c) >= 3 and (c.iloc[-1] > c.iloc[-3]) else 0
+    bull_score += (15 if rs > 0 else 5 if rs > -0.005 else 0)
+    bull_score += 30 if in_golden else 0
+    bull_score += -20 if near_ext127 else (-30 if near_ext161 else 0)
+    bull_score += (20 if cur_cci < cci_os else 10 if cur_cci < 0 else -15 if cci_extended else 0)
+    bull_score += 15 if cci_cross_up_os else 0
+    bull_score -= 10 if cci_extended else 0
+
+    # Use strict qualified for score contribution (keeps score meaning consistent)
     bull_score += 25 if qualified else -10
 
-    # Harmonic / ABCD boosts
-    if harm_bull:
-        bull_score += 20
-    if abcd_bull:
-        bull_score += 15
-
-    # Ichimoku cloud penalty
+    if harm_bull: bull_score += 20
+    if abcd_bull: bull_score += 15
     bull_score += -15 if below_cloud else 0
 
-    # ── TIER 1 PRIME — relaxed combination gate ───────────────────
-    # Requires ALL five structural conditions simultaneously, but with
-    # three of them relaxed vs the original strict definition:
-    #
-    #   trend_up            — unchanged (EMA stack + price > EMA200)
-    #   in_golden_relaxed   — was in_golden (38.2–61.8% vs 50–61.8%)
-    #   recent_cci_recovery — was cci_cross_up_os (5-bar window vs single bar)
-    #   qualified           — unchanged (mom1>5%, mom3>10%, mom6>15%)
-    #   allow_cloud         — was above_cloud (above OR inside cloud)
-    #
-    # The +20 bonus rewards convergence of price structure, trend,
-    # momentum catalyst, HTF qualification, and cloud position.
-    is_tier1_prime = (
-        trend_up              and   # EMA stack: price > EMA200, EMA20 > EMA50
-        in_golden_relaxed     and   # price inside 38.2–61.8% fib retracement
-        recent_cci_recovery   and   # CCI crossed up through oversold in last 5 bars
-        qualified             and   # mom1>5%, mom3>10%, mom6>15% + trend_strong
-        allow_cloud                 # price above OR inside Ichimoku cloud
+    # ── TIER 1 PRIME — strict gate (T1★) ─────────────────────────
+    # All five pillars with STRICT qualified.
+    # This is unchanged from the original gate logic.
+    is_tier1_prime_strict = (
+        trend_up              and
+        in_golden_relaxed     and
+        recent_cci_recovery   and
+        qualified             and   # strict: mom1>5, mom3>10, mom6>15
+        allow_cloud
     )
-    bull_score += 20 if is_tier1_prime else 0
+    bull_score += 20 if is_tier1_prime_strict else 0
+
+    # ── TIER 1 PRIME — relaxed gate (T1) ─────────────────────────
+    # All five pillars with RELAXED qualified.
+    # Fires when strict qualified fails but relaxed passes.
+    # Does NOT add another +20 to score (avoids double-counting);
+    # the score contribution from qualified_relax comes through the
+    # trend_relax partial EMA alignment (+30 for cur_e20>cur_e50 already
+    # captured in EMA block above).
+    is_tier1_prime_relax = (
+        not is_tier1_prime_strict and   # strict already handled above
+        trend_up              and       # still requires full EMA stack
+        in_golden_relaxed     and
+        recent_cci_recovery   and
+        qualified_relax       and       # relaxed: lower thresholds + filters
+        allow_cloud
+    )
 
     # ── NORMALISE ─────────────────────────────────────────────────
-    # maxScore ceiling kept at 175 for consistent normalisation.
-    # Tier 1 bonus + harmonic + abcd can push raw above 175 → capped at 100.
     max_score  = 175
     norm_score = min(100, int(bull_score * 100 / max_score))
 
     # ── ADAPTIVE SCORE THRESHOLD ──────────────────────────────────
-    atr_sma = float(sma(atr_val, 20).iloc[-1])
-    trend_strength_ratio = cur_atr / atr_sma if atr_sma > 0 else 1.0
+    atr_sma_val = float(sma(atr_val, 20).iloc[-1])
+    trend_strength_ratio = cur_atr / atr_sma_val if atr_sma_val > 0 else 1.0
     score_threshold = 65 if trend_strength_ratio > 1.2 else (75 if trend_strength_ratio < 0.8 else 70)
 
     # ── BUY TYPE CLASSIFICATION ───────────────────────────────────
@@ -630,7 +632,6 @@ def score_stock(
     is_norm_buy     = trend_up and norm_score >= 65 and not in_golden and not cci_extended
     is_cci_buy      = trend_up and cci_cross_up_os and norm_score >= 55
 
-    # Cloud gate (original above_cloud / inside_cloud for non-T1 buy signals)
     allow_cloud_buy = above_cloud or (inside_cloud and norm_score >= 65)
 
     any_buy = (
@@ -638,9 +639,11 @@ def score_stock(
     ) and allow_cloud_buy
 
     # ── TIER CLASSIFICATION ───────────────────────────────────────
-    # Tier 1  — all five pillars align (relaxed gate)
-    # Tier 2  — any valid buy signal fires
-    # Other   — watch / skip territory
+    # Tier 1  — strict OR relaxed T1 prime gate fires
+    # Tier 2  — any valid buy signal
+    # Other   — watch / skip
+    is_tier1_prime = is_tier1_prime_strict or is_tier1_prime_relax
+
     tier = (
         "Tier 1" if is_tier1_prime else
         "Tier 2" if any_buy        else
@@ -690,7 +693,7 @@ def score_stock(
 
     # ── ACTION & QUAL ─────────────────────────────────────────────
     action    = "✅ BUY" if norm_score >= score_threshold else ("👁 WATCH" if norm_score >= 50 else "⛔ SKIP")
-    qual_icon = "⭐" if (qualified and any_buy) else ("✔" if qualified else "✖")
+    qual_icon = "⭐" if (qualified and any_buy) else ("✔" if qualified else ("✦" if qualified_relax else "✖"))
 
     buy_type = (
         "Fib+CCI" if is_fib_buy_cci  else
@@ -705,30 +708,33 @@ def score_stock(
     chg = round(((cur_c - prev_close) / prev_close) * 100, 2) if prev_close else 0
 
     # ── ACCURACY TIER (signal confidence grade) ───────────────────
-    # T1★ — Tier 1 Prime (relaxed gate): all 5 pillars aligned (~90%+ target)
-    # A   — qualified ⭐ + any valid buy signal               (~85%)
-    # B   — any valid buy signal, not qualified               (~75%)
-    # C   — WATCH territory (score ≥ 50, no buy)             (~60%)
+    # T1★ — Tier 1 Prime, STRICT qualified (all 5 pillars, ~90%+ conviction)
+    # T1  — Tier 1 Prime, RELAXED qualified (lower mom + ATR + breakout, ~80%)
+    # A   — strict qualified + any valid buy signal               (~85%)
+    # B   — any valid buy signal, not strictly qualified          (~75%)
+    # C   — WATCH territory (score ≥ 50, no buy)                 (~60%)
     # D   — SKIP / insufficient signal
     acc_tier = (
-        "T1★" if is_tier1_prime              else
-        "A"   if (qualified and any_buy)     else
-        "B"   if any_buy                     else
-        "C"   if norm_score >= 50            else
+        "T1★" if is_tier1_prime_strict          else
+        "T1"  if is_tier1_prime_relax           else
+        "A"   if (qualified and any_buy)        else
+        "B"   if any_buy                        else
+        "C"   if norm_score >= 50               else
         "D"
     )
 
     # AccScore — composite for sorting within tiers
-    acc_score = norm_score + (20 if is_tier1_prime else 0) + (10 if qualified else 0)
+    acc_score = (
+        norm_score +
+        (20 if is_tier1_prime_strict else 10 if is_tier1_prime_relax else 0) +
+        (10 if qualified else 5 if qualified_relax else 0)
+    )
 
     # ── HARD STOP ────────────────────────────────────────────────
     hard_stop = trend_down and below_cloud and norm_score < 30
 
-    # ══════════════════════════════════════════════════════════════
-    #  TIER SUB-CONDITION CLASSIFICATION
-    # ══════════════════════════════════════════════════════════════
+    # ── TIER SUB-CONDITION CLASSIFICATION ────────────────────────
 
-    # ── TIER 2 SUB-CONDITIONS ─────────────────────────────────────
     is_t2_fib_qual    = is_fib_buy_base and qualified and not is_tier1_prime
     is_t2_fib_cci     = is_fib_buy_cci  and not is_tier1_prime
     is_t2_harmonic    = is_harm_buy
@@ -737,7 +743,6 @@ def score_stock(
     is_t2_norm_strong = is_norm_buy and norm_score >= 75
     is_t2_norm        = is_norm_buy
 
-    # ── TIER 3 SUB-CONDITIONS ─────────────────────────────────────
     near_golden = (
         not in_golden and
         cur_c >= fib618 - cur_atr * 1.0 and
@@ -753,15 +758,16 @@ def score_stock(
     rsi_basing      = (45 < cur_r < 55 and trend_up and norm_score >= 45)
     vol_surge_watch = (cur_v > cur_vavg * 2.0 and trend_up and norm_score < 65)
 
-    # ── TIER 4 SUB-CONDITIONS ─────────────────────────────────────
     at_ext_resist    = near_ext127 or near_ext161
     cci_overextended = cci_extended
     strong_downtrend = trend_down and below_cloud
     weak_momentum    = mom1 < -5 or mom3 < -10
 
     # ── UNIFIED SETUP LABEL ───────────────────────────────────────
-    # (R) suffix on Tier 1 label indicates the relaxed gate fired
-    if is_tier1_prime:
+    # (R) = relaxed gate fired; (★) = strict gate fired
+    if is_tier1_prime_strict:
+        setup = "All 5 Pillars (★)"
+    elif is_tier1_prime_relax:
         setup = "All 5 Pillars (R)"
     elif any_buy:
         setup = (
@@ -774,7 +780,7 @@ def score_stock(
             "Norm Buy"    if is_t2_norm        else
             "Buy"
         )
-    elif norm_score >= 50:      # Tier 3 / WATCH
+    elif norm_score >= 50:
         setup = (
             "Near Golden"  if near_golden      else
             "CCI Recovery" if cci_recovering   else
@@ -784,7 +790,7 @@ def score_stock(
             "Vol Surge"    if vol_surge_watch  else
             "Developing"
         )
-    else:                       # Tier 4 / SKIP
+    else:
         setup = (
             "Hard Stop"    if hard_stop        else
             "Fib Resist"   if at_ext_resist    else
@@ -796,7 +802,7 @@ def score_stock(
 
     return {
         # ── display columns ───────────────────────────────────────
-        "Stock":        None,          # filled by caller
+        "Stock":        None,
         "Tier":         tier,
         "AccTier":      acc_tier,
         "AccScore":     acc_score,
@@ -814,42 +820,46 @@ def score_stock(
         "T1":           t1,
         "T2":           t2,
         "T3":           t3,
-        # ── internals for colouring / debug ──────────────────────
-        "_qualified":         qualified,
-        "_high_prob":         high_prob_buy,
-        "_in_golden":         in_golden,
-        "_in_golden_relaxed": in_golden_relaxed,
-        "_in_golden_cci":     in_golden_cci,
-        "_above_cloud":       above_cloud,
-        "_inside_cloud":      inside_cloud,
-        "_allow_cloud":       allow_cloud,
-        "_harm_bull":         harm_bull,
-        "_abcd_bull":         abcd_bull,
-        "_any_buy":           any_buy,
-        "_tier1_prime":       is_tier1_prime,
-        "_recent_cci_rec":    recent_cci_recovery,
-        "_hard_stop":         hard_stop,
-        "_t2_fib_qual":       is_t2_fib_qual,
-        "_t2_fib_cci":        is_t2_fib_cci,
-        "_t2_harmonic":       is_t2_harmonic,
-        "_t2_abcd":           is_t2_abcd,
-        "_t2_cci_break":      is_t2_cci_break,
-        "_t3_near_golden":    near_golden,
-        "_t3_cci_rec":        cci_recovering,
-        "_t3_cloud_test":     cloud_test,
-        "_t3_ema_conv":       ema_converging,
-        "_t4_hard_stop":      hard_stop,
-        "_t4_fib_resist":     at_ext_resist,
-        "_t4_downtrend":      strong_downtrend,
-        "_rsi":               round(cur_r, 1),
-        "_mom1":              round(mom1, 1),
-        "_mom3":              round(mom3, 1),
-        "_cci_raw":           cur_cci,
-        "_fib618":            round(fib618),
-        "_fib500":            round(fib500),
-        "_fib382":            round(fib382),
+        # ── internals ────────────────────────────────────────────
+        "_qualified":           qualified,
+        "_qualified_relax":     qualified_relax,
+        "_atr_contracting":     atr_contracting,
+        "_near_breakout":       near_breakout,
+        "_high_prob":           high_prob_buy,
+        "_in_golden":           in_golden,
+        "_in_golden_relaxed":   in_golden_relaxed,
+        "_in_golden_cci":       in_golden_cci,
+        "_above_cloud":         above_cloud,
+        "_inside_cloud":        inside_cloud,
+        "_allow_cloud":         allow_cloud,
+        "_harm_bull":           harm_bull,
+        "_abcd_bull":           abcd_bull,
+        "_any_buy":             any_buy,
+        "_tier1_strict":        is_tier1_prime_strict,
+        "_tier1_relax":         is_tier1_prime_relax,
+        "_tier1_prime":         is_tier1_prime,
+        "_recent_cci_rec":      recent_cci_recovery,
+        "_hard_stop":           hard_stop,
+        "_t2_fib_qual":         is_t2_fib_qual,
+        "_t2_fib_cci":          is_t2_fib_cci,
+        "_t2_harmonic":         is_t2_harmonic,
+        "_t2_abcd":             is_t2_abcd,
+        "_t2_cci_break":        is_t2_cci_break,
+        "_t3_near_golden":      near_golden,
+        "_t3_cci_rec":          cci_recovering,
+        "_t3_cloud_test":       cloud_test,
+        "_t3_ema_conv":         ema_converging,
+        "_t4_hard_stop":        hard_stop,
+        "_t4_fib_resist":       at_ext_resist,
+        "_t4_downtrend":        strong_downtrend,
+        "_rsi":                 round(cur_r, 1),
+        "_mom1":                round(mom1, 1),
+        "_mom3":                round(mom3, 1),
+        "_cci_raw":             cur_cci,
+        "_fib618":              round(fib618),
+        "_fib500":              round(fib500),
+        "_fib382":              round(fib382),
     }
-
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -869,13 +879,12 @@ def run_scanner(
 ) -> pd.DataFrame:
     """
     Two-phase scanner:
-      Phase 1 (0 → 0.5): batch-download OHLCV in chunks of _BATCH_SIZE symbols.
+      Phase 1 (0 → 0.5): batch-download OHLCV in chunks of _BATCH_SIZE.
       Phase 2 (0.5 → 1): parallel scoring with ThreadPoolExecutor.
     """
     total     = len(symbols)
     n_batches = max(1, (total + _BATCH_SIZE - 1) // _BATCH_SIZE)
 
-    # ── PHASE 1 — Batch data download ────────────────────────────
     all_data: dict = {}
     for batch_i, start in enumerate(range(0, total, _BATCH_SIZE)):
         chunk      = tuple(symbols[start : start + _BATCH_SIZE])
@@ -886,7 +895,6 @@ def run_scanner(
 
     nifty = fetch_nifty("1y")
 
-    # ── PHASE 2 — Parallel scoring ────────────────────────────────
     results = []
     done    = 0
 
@@ -942,16 +950,18 @@ def cci_color(cci_val: float, ob: int = 100, os: int = -100) -> str:
 def acc_tier_color(t: str) -> tuple:
     """
     Returns (background, foreground) hex pair for AccTier badge.
-      T1★ — purple  (~90%+ conviction, relaxed gate)
-      A   — blue    (~85%)
-      B   — green   (~75%)
-      C   — amber   (~60%)
-      D   — muted grey (skip)
+      T1★ — deep purple   (~90%+ conviction, strict gate)
+      T1  — violet        (~80%+ conviction, relaxed gate)
+      A   — blue          (~85%)
+      B   — green         (~75%)
+      C   — amber         (~60%)
+      D   — muted grey    (skip)
     """
     return {
-        "T1★": ("#4c1d95", "#c4b5fd"),
-        "A":   ("#1e3a5f", "#60a5fa"),
-        "B":   ("#14532d", "#4ade80"),
-        "C":   ("#78350f", "#fcd34d"),
-        "D":   ("#1c1917", "#78716c"),
+        "T1★": ("#4c1d95", "#c4b5fd"),   # deep purple
+        "T1":  ("#5b21b6", "#ddd6fe"),   # violet (relaxed)
+        "A":   ("#1e3a5f", "#60a5fa"),   # blue
+        "B":   ("#14532d", "#4ade80"),   # green
+        "C":   ("#78350f", "#fcd34d"),   # amber
+        "D":   ("#1c1917", "#78716c"),   # grey
     }.get(t, ("#1c1917", "#78716c"))
