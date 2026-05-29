@@ -77,9 +77,6 @@ def render() -> dict:
             placeholder="RELIANCE\nTCS\nINFY",
         )
         symbols = [s.strip().upper() for s in raw.splitlines() if s.strip()]
-        if not symbols:
-            st.caption("⚠️ No symbols entered — falling back to all NSE500.")
-            symbols = NIFTY500_SYMBOLS
         st.session_state["custom_symbols"] = symbols
     else:
         symbols = NIFTY500_SYMBOLS

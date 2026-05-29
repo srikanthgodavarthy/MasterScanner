@@ -14,22 +14,11 @@ from utils.scanner_engine import NIFTY500_SYMBOLS
 from utils.backtest_engine import run_backtest, compute_stats
 from utils.supabase_client import save_backtest_results, load_backtest_summary
 
-
-# ── Tier metadata ─────────────────────────────────────────────────────────────
-TIER_COLOR = {1: "#3b82f6", 2: "#a78bfa"}
-
-TIER_DESC = {
-    1: "Walk-forward simulation on 3 years of daily data. "
-       "Signals use the same scoring logic as the live scanner.",
-    2: "Walk-forward simulation on 3 years of daily data. "
-       "Tier-2 splits each trade into 3 tranches (T1 50 %, T2 30 %, T3 20 %) "
-       "with automatic SL trailing after each target hit.",
-}
-
-PRIME_WARNING = (
-    "⚠️ Tier 1 Prime only — all other buy types are excluded. "
-    "Use Nifty 200 or wider universe to get meaningful sample size."
-)
+# ── Default symbol list for backtest ──────────────────────────────────────────
+DEFAULT_BT_SYMS = [
+    "RELIANCE","TCS","HDFCBANK","INFY","SBIN","ICICIBANK","AXISBANK",
+    "WIPRO","MARUTI","LT","HAL","BEL","DLF","AMBUJACEM","ULTRACEMCO",
+]
 
 
 def _pnl_color(val):
@@ -45,78 +34,43 @@ def render(settings=None):
     with st.sidebar:
         st.markdown("### 🧪 Backtest Settings")
 
-        # ── Scan Engine selector ───────────────────────────────────────────────
-        bt_engine = st.radio(
-            "Scoring Engine",
-            options=["tier1", "thesis"],
-            format_func=lambda x: "⚡ Tier-1 (Fast)" if x == "tier1" else "🔬 Thesis Tiers",
-            index=0,
-            horizontal=True,
-            key="bt_engine",
+        bt_universe = st.multiselect(
+            "Symbols to Backtest", options=NIFTY500_SYMBOLS,
+            default=settings.get("symbols", NIFTY500_SYMBOLS) if settings else NIFTY500_SYMBOLS,
+            key="bt_universe",
+        )
+
+        # ── Tier 1 Prime filter ───────────────────────────────────────────────
+        bt_tier1_only = st.checkbox(
+            "🏆 Tier 1 Prime signals only",
+            value=False,
+            key="bt_tier1_only",
             help=(
-                "⚡ Tier-1: fast scoring, supports full NSE500.\n"
-                "🔬 Thesis Tiers: T2★/T2A/T2B/T2C signals — slower."
+                "Restrict backtest to signals where ALL 5 structural pillars "
+                "align simultaneously:\n\n"
+                "• trend_up (price > EMA200, EMA20 > EMA50)\n"
+                "• in_golden (price at 50–61.8% fib retracement)\n"
+                "• cci_cross_up_os (CCI crossed up through -100)\n"
+                "• qualified (mom1>5%, mom3>10%, mom6>15%)\n"
+                "• above_cloud (price above Ichimoku cloud)\n\n"
+                "This is the rarest, highest-conviction setup. "
+                "Expect fewer trades but cleaner win-rate data."
             ),
         )
-        bt_enable_thesis = (bt_engine == "thesis")
 
-        # ── Tier simulator (only relevant for Tier-1 engine) ──────────────────
-        if not bt_enable_thesis:
-            bt_tier = st.radio(
-                "Backtest Tier",
-                options=[1, 2],
-                format_func=lambda x: f"Tier-{x}",
-                index=0,
-                horizontal=True,
-                key="bt_tier",
+        if bt_tier1_only:
+            st.markdown(
+                "<div style='background:#1e1040;border:1px solid #4c1d95;"
+                "border-radius:6px;padding:0.5rem 0.7rem;margin-top:-0.3rem;"
+                "font-size:0.75rem;color:#c4b5fd;line-height:1.5;'>"
+                "⚠️ <b>Tier 1 only</b> — all other buy types are excluded. "
+                "Use Nifty 200 or wider universe to get meaningful sample size."
+                "</div>",
+                unsafe_allow_html=True,
             )
-        else:
-            bt_tier = 1   # Thesis engine uses Tier-1 simulator
-
-        # Tier-1 Prime toggle (only relevant for Tier-1 engine, Tier-1 simulator)
-        if not bt_enable_thesis and bt_tier == 1:
-            bt_prime = st.checkbox(
-                "🏆 Tier 1 Prime signals only",
-                value=False,
-                key="bt_prime",
-                help="Fib golden-zone + CCI oversold confirmed signals only. "
-                     "Highest conviction, fewer trades.",
-            )
-            if bt_prime:
-                st.markdown(
-                    f"<div style='background:#f59e0b22;border:1px solid #f59e0b44;"
-                    f"border-radius:6px;padding:0.5rem 0.7rem;"
-                    f"color:#f59e0b;font-size:0.75rem;margin-bottom:0.4rem;'>"
-                    f"{PRIME_WARNING}</div>",
-                    unsafe_allow_html=True,
-                )
-        else:
-            bt_prime = False   # Prime mode N/A for Tier-2 or Thesis
 
         st.markdown("---")
 
-        # ── Universe — NSE500 by default, optional custom override ───────────
-        use_custom = st.checkbox(
-            "✏️ Custom symbols",
-            value=False,
-            key="bt_use_custom",
-            help="By default all NSE500 symbols are used. Enable to pick a custom subset.",
-        )
-        if use_custom:
-            bt_universe = st.multiselect(
-                "Symbols to Backtest", options=NIFTY500_SYMBOLS,
-                default=NIFTY500_SYMBOLS, key="bt_universe_custom",
-            )
-            if not bt_universe:
-                bt_universe = NIFTY500_SYMBOLS
-                st.caption("⚠️ Nothing selected — using all NSE500.")
-            else:
-                st.caption(f"📊 {len(bt_universe)} symbols selected")
-        else:
-            # Nuke any stale bt_universe_custom session key so switching back is clean
-            st.session_state.pop("bt_universe_custom", None)
-            bt_universe = NIFTY500_SYMBOLS
-            st.caption(f"📊 All {len(NIFTY500_SYMBOLS)} NSE500 symbols")
         bt_min_score = st.slider("Min Score for Entry", 50, 100, 70, step=5, key="bt_min_score")
         bt_hold_days = st.slider("Max Hold Days",         5,  60, 20, step=5, key="bt_hold_days")
         bt_cci_len   = st.number_input("CCI Length",     5,  50,
@@ -128,51 +82,34 @@ def render(settings=None):
         bt_save_db   = st.checkbox("💾 Save to Supabase", True, key="bt_save_db")
 
     # ── Header ────────────────────────────────────────────────────────────────
-    tc   = TIER_COLOR.get(bt_tier, "#3b82f6")
-    if bt_enable_thesis:
-        tlbl   = "Thesis Tiers Mode"
-        t_icon = "🔬"
-        tc     = "#a855f7"
-    elif bt_tier == 1 and bt_prime:
-        tlbl   = "Tier-1 Prime Mode"
-        t_icon = "🏆"
-    else:
-        tlbl   = f"Tier-{bt_tier}"
-        t_icon = "⚡" if bt_tier == 2 else "🎯"
+    st.markdown("### 🧪 Backtest Engine")
+
+    # Active mode badge
+    if bt_tier1_only:
+        st.markdown(
+            "<div style='display:inline-block;background:#4c1d95;color:#c4b5fd;"
+            "border-radius:6px;padding:0.3rem 0.8rem;font-size:0.8rem;"
+            "font-weight:600;margin-bottom:0.5rem;'>🏆 Tier 1 Prime Mode</div>",
+            unsafe_allow_html=True,
+        )
 
     st.markdown(
-        f"### 🧪 Backtest Engine &nbsp;"
-        f"<span style='font-size:0.75rem;background:{tc}22;"
-        f"color:{tc};border:1px solid {tc}55;"
-        f"border-radius:4px;padding:2px 9px;vertical-align:middle;'>"
-        f"{t_icon} {tlbl}</span>",
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        f"<span style='color:#64748b;font-size:0.82rem;'>{TIER_DESC[bt_tier]}</span>",
+        "<span style='color:#64748b;font-size:0.82rem;'>"
+        "Walk-forward simulation on 3 years of daily data. "
+        "Signals use the same scoring logic as the live scanner.</span>",
         unsafe_allow_html=True,
     )
     st.markdown("")
-
-    # ── Run bar ───────────────────────────────────────────────────────────────
-    if bt_enable_thesis:
-        mode_label = "Thesis Tiers"
-    elif bt_tier == 1 and bt_prime:
-        mode_label = "Tier-1 Prime only"
-    elif bt_tier == 2:
-        mode_label = "Tier-2 trail"
-    else:
-        mode_label = "All signals"
 
     col_run, col_info = st.columns([2, 5])
     with col_run:
         run_bt = st.button("▶ Run Backtest", use_container_width=True, key="btn_run_bt")
     with col_info:
+        mode_label = "Tier 1 Prime only" if bt_tier1_only else f"Min Score: <b>{bt_min_score}</b>"
         st.markdown(
             f"<div style='padding:0.55rem 0;color:#64748b;font-size:0.78rem;'>"
             f"Symbols: <b>{len(bt_universe)}</b> &nbsp;|&nbsp; "
-            f"Mode: <b style='color:{tc};'>{mode_label}</b> &nbsp;|&nbsp; "
-            f"Min Score: <b>{bt_min_score}</b> &nbsp;|&nbsp; "
+            f"{mode_label} &nbsp;|&nbsp; "
             f"Hold: <b>{bt_hold_days}d</b> &nbsp;|&nbsp; Data: <b>3y daily</b>"
             f"</div>",
             unsafe_allow_html=True,
@@ -180,6 +117,10 @@ def render(settings=None):
 
     # ── Run ───────────────────────────────────────────────────────────────────
     if run_bt:
+        if not bt_universe:
+            st.error("Select at least one symbol.")
+            return
+
         prog       = st.progress(0, text="Starting backtest…")
         sym_status = st.empty()
 
@@ -192,43 +133,36 @@ def render(settings=None):
 
         trades_df = run_backtest(
             bt_universe,
-            cci_len        = int(bt_cci_len),
-            cci_ob         = int(bt_cci_ob),
-            cci_os         = int(bt_cci_os),
-            min_score      = bt_min_score,
-            hold_days      = bt_hold_days,
-            tier           = bt_tier,
-            prime_only     = bt_prime,
-            enable_thesis  = bt_enable_thesis,
-            progress_cb    = _bt_progress,
+            cci_len=int(bt_cci_len), cci_ob=int(bt_cci_ob), cci_os=int(bt_cci_os),
+            min_score=bt_min_score, hold_days=bt_hold_days,
+            workers=settings["workers"],
+            tier1_only=bt_tier1_only,   # ← Tier 1 Prime gate
+            progress_cb=_bt_progress,
         )
         prog.empty()
         sym_status.empty()
 
         if trades_df.empty:
-            msg = (
-                "No Thesis-tier signals generated. Try a wider symbol universe "
-                "or lower Min Score." if bt_enable_thesis
-                else "No Tier-1 Prime signals generated. Try a wider symbol universe "
-                "or lower Min Score." if bt_prime
-                else "No trades generated. Try lowering Min Score or adding more symbols."
-            )
-            st.warning(msg)
+            if bt_tier1_only:
+                st.warning(
+                    "No Tier 1 Prime signals found. "
+                    "Try expanding the symbol universe (Nifty 200+) or "
+                    "lowering Min Score. Tier 1 Prime fires very rarely by design."
+                )
+            else:
+                st.warning("No trades generated. Try lowering Min Score or adding more symbols.")
             return
-        st.session_state["bt_trades"]     = trades_df
-        st.session_state["bt_stats"]      = compute_stats(trades_df)
-        st.session_state["bt_tier_saved"] = bt_tier
-        st.session_state["bt_prime_saved"]= bt_prime
+
+        st.session_state["bt_trades"] = trades_df
+        st.session_state["bt_stats"]  = compute_stats(trades_df)
 
         if bt_save_db:
             save_backtest_results(trades_df)
             st.success("✅ Results saved to Supabase.")
 
     # ── Load saved if no in-memory results ────────────────────────────────────
-    trades_df    = st.session_state.get("bt_trades",      pd.DataFrame())
-    stats        = st.session_state.get("bt_stats",       {})
-    saved_tier   = st.session_state.get("bt_tier_saved",  bt_tier)
-    saved_prime  = st.session_state.get("bt_prime_saved", bt_prime)
+    trades_df = st.session_state.get("bt_trades", pd.DataFrame())
+    stats     = st.session_state.get("bt_stats",  {})
 
     if trades_df.empty:
         with st.expander("📂 Load Previous Results from Supabase", expanded=False):
@@ -254,14 +188,28 @@ def render(settings=None):
     st.markdown("#### 📊 Performance Summary")
     s = stats
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    # ── Tier 1 Prime badge (shown when mixed-mode run contains T1 trades) ─────
+    t1_count = s.get("t1_prime_trades", 0)
+    if t1_count > 0 and not bt_tier1_only:
+        t1_pct = round(t1_count / s.get("total_trades", 1) * 100, 1)
+        st.markdown(
+            f"<div style='display:inline-block;background:#4c1d95;color:#c4b5fd;"
+            f"border-radius:6px;padding:0.3rem 0.8rem;font-size:0.78rem;"
+            f"margin-bottom:0.6rem;'>"
+            f"🏆 Tier 1 Prime within results: <b>{t1_count}</b> trades "
+            f"({t1_pct}% of total)"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
     for col, label, val, color in [
-        (c1, "Total Trades",  s.get("total_trades", 0),        "#3b82f6"),
-        (c2, "Win Rate",      f"{s.get('win_rate',0)}%",        "#22c55e"),
-        (c3, "Avg Win",       f"{s.get('avg_win',0)}%",         "#4ade80"),
-        (c4, "Avg Loss",      f"{s.get('avg_loss',0)}%",        "#f87171"),
-        (c5, "Profit Factor", s.get("profit_factor", 0),        "#a78bfa"),
-        (c6, "Expectancy",    f"{s.get('expectancy',0)}%",      "#f59e0b"),
+        (c1, "Total Trades",  s.get("total_trades", 0),         "#3b82f6"),
+        (c2, "Win Rate",      f"{s.get('win_rate',0)}%",         "#22c55e"),
+        (c3, "Avg Win",       f"{s.get('avg_win',0)}%",          "#4ade80"),
+        (c4, "Avg Loss",      f"{s.get('avg_loss',0)}%",         "#f87171"),
+        (c5, "Profit Factor", s.get("profit_factor", 0),         "#a78bfa"),
+        (c6, "Expectancy",    f"{s.get('expectancy',0)}%",       "#f59e0b"),
     ]:
         with col:
             st.markdown(
@@ -273,43 +221,43 @@ def render(settings=None):
             )
 
     st.markdown("<div style='margin-top:1rem'></div>", unsafe_allow_html=True)
-    r1, r2, r3, r4 = st.columns(4)
+    r1,r2,r3,r4 = st.columns(4)
     with r1: st.metric("Risk/Reward", s.get("risk_reward", 0))
     with r2: st.metric("Best Trade",  f"{s.get('best_trade',0)}%")
     with r3: st.metric("Worst Trade", f"{s.get('worst_trade',0)}%")
     with r4: st.metric("Total PnL",   f"{s.get('total_pnl',0)}%")
 
-    # ── Tier-2 advanced metrics row ───────────────────────────────────────────
-    if saved_tier == 2 and s.get("t2_hit_count") is not None:
-        st.markdown("<div style='margin-top:0.6rem'></div>", unsafe_allow_html=True)
-        st.markdown(
-            "<span style='color:#a78bfa;font-size:0.8rem;font-weight:600;'>"
-            "⚡ Tier-2 Advanced Metrics</span>",
-            unsafe_allow_html=True,
-        )
-        e1, e2, e3, e4, e5 = st.columns(5)
-        with e1: st.metric("T1 Partial",   s.get("t1_partial", 0))
-        with e2: st.metric("T2 Hit",       s.get("t2_hit_count", 0))
-        with e3: st.metric("T3 Hit",       s.get("t3_hit_count", 0))
-        with e4: st.metric("T2+ Rate",     f"{s.get('t2_rate', 0)}%")
-        with e5: st.metric("Avg T2+ PnL",  f"{s.get('avg_t2_plus_pnl', 0)}%")
+    # ── Tier 1 Prime isolated stats (only when mixed mode) ────────────────────
+    if (t1_count > 0 and not bt_tier1_only and
+            "tier1_prime" in trades_df.columns):
+        with st.expander("🏆 Tier 1 Prime — Isolated Performance", expanded=False):
+            t1_df   = trades_df[trades_df["tier1_prime"] == True]
+            t1_rest = trades_df[trades_df["tier1_prime"] == False]
+            t1_stats = compute_stats(t1_df)
+            r_stats  = compute_stats(t1_rest)
+            cA, cB = st.columns(2)
+            with cA:
+                st.markdown("**Tier 1 Prime trades**")
+                st.metric("Win Rate",      f"{t1_stats.get('win_rate',0)}%")
+                st.metric("Expectancy",    f"{t1_stats.get('expectancy',0)}%")
+                st.metric("Profit Factor", t1_stats.get("profit_factor", 0))
+                st.metric("Avg Win",       f"{t1_stats.get('avg_win',0)}%")
+                st.metric("Avg Loss",      f"{t1_stats.get('avg_loss',0)}%")
+            with cB:
+                st.markdown("**All other trades**")
+                st.metric("Win Rate",      f"{r_stats.get('win_rate',0)}%")
+                st.metric("Expectancy",    f"{r_stats.get('expectancy',0)}%")
+                st.metric("Profit Factor", r_stats.get("profit_factor", 0))
+                st.metric("Avg Win",       f"{r_stats.get('avg_win',0)}%")
+                st.metric("Avg Loss",      f"{r_stats.get('avg_loss',0)}%")
 
     # ── Charts ────────────────────────────────────────────────────────────────
     st.markdown("---")
     ch1, ch2 = st.columns(2)
 
-    PLOT_BG = dict(
-        plot_bgcolor  = "#111827",
-        paper_bgcolor = "#111827",
-        font          = dict(color="#94a3b8", family="JetBrains Mono"),
-        margin        = dict(l=10, r=10, t=10, b=10),
-    )
-    line_color = TIER_COLOR[saved_tier]
-    fill_alpha  = "0.15"
-    # Convert hex to rgba for fill
-    hex_c = line_color.lstrip("#")
-    r_c, g_c, b_c = int(hex_c[0:2],16), int(hex_c[2:4],16), int(hex_c[4:6],16)
-    fill_color = f"rgba({r_c},{g_c},{b_c},{fill_alpha})"
+    PLOT_BG = dict(plot_bgcolor="#111827", paper_bgcolor="#111827",
+                   font=dict(color="#94a3b8", family="JetBrains Mono"),
+                   margin=dict(l=10,r=10,t=10,b=10))
 
     with ch1:
         st.markdown("##### 📈 Cumulative PnL %")
@@ -317,8 +265,8 @@ def render(settings=None):
         fig = go.Figure(go.Scatter(
             x=list(range(len(cum))), y=cum.values,
             mode="lines", fill="tozeroy",
-            line=dict(color=line_color, width=2),
-            fillcolor=fill_color,
+            line=dict(color="#3b82f6", width=2),
+            fillcolor="rgba(59,130,246,0.15)",
         ))
         fig.update_layout(**PLOT_BG, height=280,
             xaxis=dict(showgrid=False, color="#334155"),
@@ -330,19 +278,11 @@ def render(settings=None):
         st.markdown("##### 🎯 Exit Breakdown")
         exit_data = pd.Series(s.get("exit_breakdown", {}))
         if not exit_data.empty:
-            clr_map = {
-                "T1 HIT":    "#22c55e",
-                "T2 HIT":    "#4ade80",
-                "T3 HIT":    "#86efac",
-                "T1 PARTIAL":"#a78bfa",
-                "BE STOP":   "#f59e0b",
-                "SL HIT":    "#ef4444",
-                "TIMEOUT":   "#94a3b8",
-            }
+            clr_map = {"T1 HIT":"#22c55e","T2 HIT":"#4ade80","SL HIT":"#ef4444","TIMEOUT":"#f59e0b"}
             fig2 = go.Figure(go.Pie(
                 labels=exit_data.index.tolist(), values=exit_data.values.tolist(),
                 hole=0.55,
-                marker=dict(colors=[clr_map.get(k, "#64748b") for k in exit_data.index]),
+                marker=dict(colors=[clr_map.get(k,"#64748b") for k in exit_data.index]),
                 textinfo="label+percent",
                 textfont=dict(family="JetBrains Mono", size=11),
             ))
@@ -352,7 +292,8 @@ def render(settings=None):
     st.markdown("##### 📊 PnL Distribution")
     fig3 = go.Figure(go.Histogram(
         x=trades_df["pnl_pct"], nbinsx=40,
-        marker_color=["#22c55e" if v > 0 else "#ef4444" for v in trades_df["pnl_pct"]],
+        marker_color=["#22c55e" if v > 0 else "#ef4444"
+                      for v in trades_df["pnl_pct"]],
         opacity=0.8,
     ))
     fig3.add_vline(x=0, line_dash="dash", line_color="#64748b", line_width=1)
@@ -362,20 +303,26 @@ def render(settings=None):
     )
     st.plotly_chart(fig3, use_container_width=True)
 
-    # ── Tier-2 target progression chart ──────────────────────────────────────
-    if saved_tier == 2:
-        st.markdown("##### 🏹 Tier-2 Target Progression")
-        bd     = s.get("exit_breakdown", {})
-        labels = ["SL HIT", "BE STOP", "TIMEOUT", "T1 PARTIAL", "T2 HIT", "T3 HIT"]
-        values = [bd.get(l, 0) for l in labels]
-        colors = ["#ef4444","#f59e0b","#94a3b8","#a78bfa","#4ade80","#86efac"]
-        fig4   = go.Figure(go.Bar(
-            x=labels, y=values,
-            marker_color=colors,
-            text=values, textposition="outside",
-            textfont=dict(family="JetBrains Mono", size=11, color="#e2e8f0"),
+    # ── Tier 1 Prime cumulative PnL overlay (mixed mode) ─────────────────────
+    if (t1_count > 0 and not bt_tier1_only and
+            "tier1_prime" in trades_df.columns):
+        st.markdown("##### 🏆 Tier 1 Prime vs Rest — Cumulative PnL")
+        t1_cum   = (trades_df[trades_df["tier1_prime"] == True]
+                    .sort_values("entry_date")["pnl_pct"].cumsum())
+        rest_cum = (trades_df[trades_df["tier1_prime"] == False]
+                    .sort_values("entry_date")["pnl_pct"].cumsum())
+        fig4 = go.Figure()
+        fig4.add_trace(go.Scatter(
+            x=list(range(len(t1_cum))), y=t1_cum.values,
+            mode="lines", name="Tier 1 Prime",
+            line=dict(color="#a78bfa", width=2),
         ))
-        fig4.update_layout(**PLOT_BG, height=240, showlegend=False,
+        fig4.add_trace(go.Scatter(
+            x=list(range(len(rest_cum))), y=rest_cum.values,
+            mode="lines", name="Other trades",
+            line=dict(color="#475569", width=1.5, dash="dot"),
+        ))
+        fig4.update_layout(**PLOT_BG, height=260,
             xaxis=dict(showgrid=False, color="#334155"),
             yaxis=dict(showgrid=True, gridcolor="#1e293b", color="#334155"),
         )
@@ -389,11 +336,11 @@ def render(settings=None):
         trades_df.groupby("symbol")
         .agg(
             Trades   =("pnl_pct","count"),
-            Win_Rate =("pnl_pct", lambda x: round((x>0).mean()*100, 1)),
-            Avg_PnL  =("pnl_pct", lambda x: round(x.mean(), 2)),
-            Total_PnL=("pnl_pct", lambda x: round(x.sum(),  2)),
-            Best     =("pnl_pct", lambda x: round(x.max(),  2)),
-            Worst    =("pnl_pct", lambda x: round(x.min(),  2)),
+            Win_Rate =("pnl_pct", lambda x: round((x>0).mean()*100,1)),
+            Avg_PnL  =("pnl_pct", lambda x: round(x.mean(),2)),
+            Total_PnL=("pnl_pct", lambda x: round(x.sum(),2)),
+            Best     =("pnl_pct", lambda x: round(x.max(),2)),
+            Worst    =("pnl_pct", lambda x: round(x.min(),2)),
         )
         .reset_index()
         .sort_values("Total_PnL", ascending=False)
@@ -403,11 +350,9 @@ def render(settings=None):
         sym_perf.style
         .map(_pnl_color, subset=["Avg_PnL","Total_PnL","Best","Worst"])
         .set_properties(**{
-            "font-family": "'JetBrains Mono',monospace",
-            "font-size":   "0.78rem",
-            "text-align":  "center",
-            "background-color": "#111827",
-            "color":       "#e2e8f0",
+            "font-family":"'JetBrains Mono',monospace",
+            "font-size":"0.78rem","text-align":"center",
+            "background-color":"#111827","color":"#e2e8f0",
         })
         .set_table_styles([{"selector":"th","props":[
             ("background-color","#0f1e3d"),("color","#93c5fd"),
@@ -417,36 +362,33 @@ def render(settings=None):
     )
     st.dataframe(styled_sym, use_container_width=True, height=400)
 
-    # ── Full trade log ────────────────────────────────────────────────────────
+    # ── Trade log ─────────────────────────────────────────────────────────────
     with st.expander("📜 Full Trade Log", expanded=False):
-        base_cols = ["symbol","entry_date","entry_price","exit_date","exit_price",
+        show_cols = ["symbol","entry_date","entry_price","exit_date","exit_price",
                      "exit_reason","pnl_pct","score_at_entry","cci_at_entry",
-                     "buy_type","sl","t1","t2","t3"]
-        show_cols = [c for c in base_cols if c in trades_df.columns]
-        tlog = trades_df[show_cols].copy().sort_values("entry_date", ascending=False)
+                     "sl","t1","t2","tier1_prime"]
+        tlog = trades_df[[c for c in show_cols if c in trades_df.columns]].copy()
+        tlog = tlog.sort_values("entry_date", ascending=False)
 
         def _row_bg(row):
+            if row.get("tier1_prime", False):
+                return [f"background-color:#2e1065"]*len(row)   # purple tint for T1
             color = "#22c55e22" if row["pnl_pct"] > 0 else "#ef444422"
-            return [f"background-color:{color}"] * len(row)
+            return [f"background-color:{color}"]*len(row)
 
         styled_log = (
             tlog.style
             .apply(_row_bg, axis=1)
             .map(_pnl_color, subset=["pnl_pct"])
-            .set_properties(**{
-                "font-family": "'JetBrains Mono',monospace",
-                "font-size":   "0.74rem",
-                "color":       "#e2e8f0",
-            })
+            .set_properties(**{"font-family":"'JetBrains Mono',monospace",
+                               "font-size":"0.74rem","color":"#e2e8f0"})
             .format({"pnl_pct":"{}%"})
         )
         st.dataframe(styled_log, use_container_width=True, height=400)
 
-        mode_tag  = "prime" if saved_prime else f"tier{saved_tier}"
-        csv_bt    = trades_df.to_csv(index=False)
+        csv_bt = trades_df.to_csv(index=False)
         st.download_button(
             "⬇️ Download Trade Log CSV", data=csv_bt,
-            file_name=f"backtest_{mode_tag}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv",
-            key="btn_dl_bt_csv",
+            file_name=f"backtest_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv", key="btn_dl_bt_csv",
         )
