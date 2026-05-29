@@ -95,7 +95,7 @@ def render(settings=None):
 
         st.markdown("---")
 
-        # ── Universe selector — NSE500 by default, custom is opt-in ─────────
+        # ── Universe — NSE500 by default, optional custom override ───────────
         use_custom = st.checkbox(
             "✏️ Custom symbols",
             value=False,
@@ -105,12 +105,16 @@ def render(settings=None):
         if use_custom:
             bt_universe = st.multiselect(
                 "Symbols to Backtest", options=NIFTY500_SYMBOLS,
-                default=[], key="bt_universe",
+                default=NIFTY500_SYMBOLS, key="bt_universe_custom",
             )
             if not bt_universe:
-                st.caption("⚠️ No symbols selected — will fall back to all NSE500.")
                 bt_universe = NIFTY500_SYMBOLS
+                st.caption("⚠️ Nothing selected — using all NSE500.")
+            else:
+                st.caption(f"📊 {len(bt_universe)} symbols selected")
         else:
+            # Nuke any stale bt_universe_custom session key so switching back is clean
+            st.session_state.pop("bt_universe_custom", None)
             bt_universe = NIFTY500_SYMBOLS
             st.caption(f"📊 All {len(NIFTY500_SYMBOLS)} NSE500 symbols")
         bt_min_score = st.slider("Min Score for Entry", 50, 100, 70, step=5, key="bt_min_score")
