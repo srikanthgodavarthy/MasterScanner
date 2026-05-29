@@ -1229,43 +1229,127 @@ def _confluence(cur_c, e20, e50, e200, rsi_v, cci_v, cur_v, vol_avg,
 #  ThesisScore (0-100) + ThesisTier — completely independent
 # ══════════════════════════════════════════════════════════════════
 
-def _thesis_tier(ts, yield_gate_open, d_star, wvf_bot_tier,
-                 is_pullback, norm_mom, conf_score):
+def _thesis_tier(
+    yield_gate_open, d_star, wvf_bot_tier,
+    is_throwback, is_pullback, norm_mom, conf_score,
+    sq_off, sq_bull, near_ext127, near_ext161, mom3,
+    ts,                # kept for T2C fallback only
+):
     """
-    Map ThesisScore → ThesisTier using quality gate conditions.
+    Signal-based ThesisTier classification (from images T2★/T2A/T2B/T2C).
 
-    T2★ — Thesis Prime  (all gates open + high score + primary signal)
-    T2A  — Strong       (yield + D* positive + score >= 58)
-    T2B  — Moderate     (yield gate open + score >= 42)
-    T2C  — Watch        (score >= 28, gate may be closed)
-    -    — No signal
+    T2★ — Thesis Prime  : ALL of —
+        throwback
+        mom3 > 10               (3-month trend confirmation)
+        not (near_ext127 or near_ext161)
+        sq_off                  (compression released)
+        sq_bull                 (momentum firing upward)
+        wvf_bot_tier >= 3       (high-conviction volume)
+        norm_mom > 20           (strong normalised momentum)
+        confluence >= 7         (7+ of 10 signals aligned)
+        d_star > 0              (reward > risk)
+        yield_signal            (|Y| > ε_L)
+
+    T2A — Strong : same set but relaxed thresholds —
+        throwback
+        mom3 > 5
+        not (near_ext127 or near_ext161)
+        sq_off
+        sq_bull
+        wvf_bot_tier >= 2
+        norm_mom > 15
+        confluence >= 6
+        d_star > 0
+        yield_signal
+
+    T2B — Watch : either throwback OR (sq_off and sq_bull), plus —
+        mom3 > 0
+        wvf_bot_tier >= 1
+        norm_mom > 10
+        confluence >= 5
+        d_star > 0
+        yield_signal
+
+    T2C — Weak Watch : minimum viable signal —
+        (sq_off or wvf_bot_tier >= 2 or pullback)
+        norm_mom > 5
+        confluence >= 4
+        d_star > 0
+        yield_signal
+
+    -   — No signal
     """
-    primary_ok = (
-        (isinstance(wvf_bot_tier, (int,float)) and wvf_bot_tier >= 3)
-        or (is_pullback and isinstance(norm_mom, float) and norm_mom > 10)
-    )
     d_pos = isinstance(d_star, float) and not np.isnan(d_star) and d_star > 0
+    no_ext = not (near_ext127 or near_ext161)
 
-    if ts >= 72 and yield_gate_open and d_pos and primary_ok and conf_score >= 6:
+    # ── T2★ ───────────────────────────────────────────────────────
+    if (
+        is_throwback
+        and mom3 > 10
+        and no_ext
+        and sq_off
+        and sq_bull
+        and wvf_bot_tier >= 3
+        and norm_mom > 20
+        and conf_score >= 7
+        and d_pos
+        and yield_gate_open
+    ):
         return "T2★"
-    if ts >= 58 and yield_gate_open and d_pos:
+
+    # ── T2A ───────────────────────────────────────────────────────
+    if (
+        is_throwback
+        and mom3 > 5
+        and no_ext
+        and sq_off
+        and sq_bull
+        and wvf_bot_tier >= 2
+        and norm_mom > 15
+        and conf_score >= 6
+        and d_pos
+        and yield_gate_open
+    ):
         return "T2A"
-    if ts >= 42 and yield_gate_open:
+
+    # ── T2B ───────────────────────────────────────────────────────
+    trigger_tb = is_throwback or (sq_off and sq_bull)
+    if (
+        trigger_tb
+        and mom3 > 0
+        and wvf_bot_tier >= 1
+        and norm_mom > 10
+        and conf_score >= 5
+        and d_pos
+        and yield_gate_open
+    ):
         return "T2B"
-    if ts >= 28:
+
+    # ── T2C ───────────────────────────────────────────────────────
+    gate_open = sq_off or (wvf_bot_tier >= 2) or is_pullback
+    if (
+        gate_open
+        and norm_mom > 5
+        and conf_score >= 4
+        and d_pos
+        and yield_gate_open
+    ):
         return "T2C"
+
     return "-"
 
 
 def _thesis_action(tier):
-    if tier in ("T2★","T2A"): return "✅ T2 BUY"
-    if tier in ("T2B","T2C"): return "👁 T2 WATCH"
+    if tier == "T2★":  return "✅ T2★ BUY"
+    if tier == "T2A":  return "✅ T2A BUY"
+    if tier in ("T2B", "T2C"): return "👁 T2 WATCH"
     return "⛔ T2 SKIP"
 
 
 def _evaluate_thesis(df, entry, sl_price, t1_price,
                      fib618, fib382, cur_atr, atr_prox,
                      e20, e50, e200, rsi_v, cci_v, cloud_top,
+                     near_ext127=False, near_ext161=False, mom3=0.0,
                      enable_pbo=False):
     """
     Compute all thesis signals and return a self-contained dict.
@@ -1414,7 +1498,21 @@ def _evaluate_thesis(df, entry, sl_price, t1_price,
     result["T2_Score"] = ts
 
     # ── ThesisTier ────────────────────────────────────────────────
-    t_tier   = _thesis_tier(ts, yield_open, d_star, wvf_bot, is_pb, norm_mom, conf_score)
+    t_tier   = _thesis_tier(
+        yield_gate_open=yield_open,
+        d_star=d_star,
+        wvf_bot_tier=wvf_bot,
+        is_throwback=is_tb,
+        is_pullback=is_pb,
+        norm_mom=norm_mom,
+        conf_score=conf_score,
+        sq_off=sq_off,
+        sq_bull=sq_bull,
+        near_ext127=near_ext127,
+        near_ext161=near_ext161,
+        mom3=mom3,
+        ts=ts,
+    )
     t_action = _thesis_action(t_tier)
     result.update({"T2_Tier":t_tier, "T2_Action":t_action})
 
@@ -1510,10 +1608,19 @@ def score_stock(
     fib_rng = sw_hi - sw_lo
     fib618  = sw_hi - fib_rng*0.618; fib382 = sw_hi - fib_rng*0.382
 
+    fib_ext127 = sw_hi + fib_rng * 0.272
+    fib_ext161 = sw_hi + fib_rng * 0.618
+    cur_c_val  = float(c.iloc[-1])
+    near_ext127_val = abs(cur_c_val - fib_ext127) < atr_v * atr_prox
+    near_ext161_val = abs(cur_c_val - fib_ext161) < atr_v * atr_prox
+
     thesis = _evaluate_thesis(
         df, en, sl_, t1_,
         fib618, fib382, atr_v, atr_prox,
         e20, e50, e200, rsi_v, cci_v, ct,
+        near_ext127=near_ext127_val,
+        near_ext161=near_ext161_val,
+        mom3=base.get("_mom3", 0.0),
         enable_pbo=enable_pbo,
     )
     return {**base, **thesis}
