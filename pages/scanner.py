@@ -574,8 +574,10 @@ def render(settings: dict) -> None:
     auto_refresh = settings.get("auto_refresh", False)
     refresh_secs = settings.get("refresh_mins", 5) * 60
     # FIX #7: read tier1_mode from settings (was never consumed here)
-    tier1_mode   = settings.get("tier1_mode",   False)
-    supabase_ok  = _is_available()
+    tier1_mode      = settings.get("tier1_mode",      False)
+    # enable_t1_relax — passed to engine so relaxed gate can be fully suppressed
+    enable_t1_relax = settings.get("enable_t1_relax", True)
+    supabase_ok     = _is_available()
 
     # ── HEADER ────────────────────────────────────────────────────
     st.markdown(
@@ -616,6 +618,7 @@ def render(settings: dict) -> None:
             df_raw = run_scanner(
                 symbols=symbols, cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
                 max_workers=workers,
+                enable_t1_relax=enable_t1_relax,
                 progress_cb=lambda p: prog.progress(p, text=f"Scanning… {int(p*100)}%"),
             )
         prog.empty()
