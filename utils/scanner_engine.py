@@ -1580,16 +1580,25 @@ def score_stock(
     pvt_lb:   int   = 20,
     atr_prox: float = 0.3,
     enable_pbo: bool = False,
+    enable_thesis: bool = False,   # ← NEW: Thesis engine is OPT-IN for speed
 ) -> dict:
     """
-    Original score_stock() + Thesis Tier 2 fields appended.
+    Original score_stock() + optional Thesis Tier 2 fields appended.
     All original keys are byte-for-byte identical to the original.
     New keys are prefixed T2_ to make the boundary explicit.
-    enable_pbo=True activates CSCV (~0.2 s extra per stock).
+
+    enable_thesis=False  (default) → Tier-1 only, ~3-5× faster for full NSE500.
+    enable_thesis=True             → appends all T2_ fields.
+    enable_pbo=True                → activates CSCV (~0.2 s extra per stock,
+                                     only relevant when enable_thesis=True).
     """
     base = _score_stock_original(df, nifty, cci_len, cci_ob, cci_os, pvt_lb, atr_prox)
     if not base:
         return {}
+
+    # ── Fast path — Tier-1 only, skip Thesis computation ────────
+    if not enable_thesis:
+        return base
 
     # Re-derive the scalars that _evaluate_thesis needs from the
     # already-computed original values stored in base["_*"] internals.
@@ -1627,18 +1636,24 @@ def score_stock(
 
 
 def run_scanner(
-    symbols:     list,
-    cci_len:     int  = 20,
-    cci_ob:      int  = 100,
-    cci_os:      int  = -100,
-    max_workers: int  = 10,
-    progress_cb       = None,
-    enable_pbo:  bool = False,
+    symbols:        list,
+    cci_len:        int  = 20,
+    cci_ob:         int  = 100,
+    cci_os:         int  = -100,
+    max_workers:    int  = 20,   # raised default: yfinance is I/O-bound, more threads = faster
+    progress_cb          = None,
+    enable_pbo:     bool = False,
+    enable_thesis:  bool = False,   # ← NEW: set True for Thesis Tier mode
 ) -> pd.DataFrame:
     """
-    Batch scanner — same architecture as original.
-    Sorted by AccScore (Tier 1) then T2_Score within non-Tier-1 rows.
-    enable_pbo=True adds CSCV to each stock (~0.2 s extra/stock).
+    Two-phase batch scanner.
+      Phase 1 (0 → 0.5): batch-download OHLCV in chunks of _BATCH_SIZE symbols.
+      Phase 2 (0.5 → 1): parallel scoring with ThreadPoolExecutor.
+
+    enable_thesis=False (default) → Tier-1 scoring only, ~3-5× faster.
+                                     Safe to run all NSE500 in ~60-90 s.
+    enable_thesis=True            → Full Thesis Tier 2 scoring appended.
+                                     Roughly 3-5× slower per stock.
     """
     total     = len(symbols)
     n_batches = max(1, (total + _BATCH_SIZE - 1) // _BATCH_SIZE)
@@ -1652,8 +1667,8 @@ def run_scanner(
     def process(sym):
         df_=all_data.get(sym,pd.DataFrame())
         if df_.empty: return None
-        row=score_stock(df_,nifty,cci_len=cci_len,cci_ob=cci_ob,cci_os=cci_os,
-                        enable_pbo=enable_pbo)
+        row=score_stock(df_, nifty, cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
+                        enable_pbo=enable_pbo, enable_thesis=enable_thesis)
         if row: row["Stock"]=sym
         return row
     with ThreadPoolExecutor(max_workers=max_workers) as exe:
@@ -1665,7 +1680,11 @@ def run_scanner(
             if row: results.append(row)
     if not results: return pd.DataFrame()
     df_out = pd.DataFrame(results)
-    df_out = df_out.sort_values(["AccScore","T2_Score"], ascending=[False,False])
+    # Sort: Thesis mode → AccScore then T2_Score; Tier-1 mode → AccScore only
+    if enable_thesis and "T2_Score" in df_out.columns:
+        df_out = df_out.sort_values(["AccScore","T2_Score"], ascending=[False,False])
+    else:
+        df_out = df_out.sort_values("AccScore", ascending=False)
     df_out = df_out.reset_index(drop=True); df_out.index += 1
     return df_out
 
