@@ -21,6 +21,9 @@ from utils.scanner_engine import (
     score_color,
     cci_color,
     acc_tier_color,
+    thesis_tier_color,
+    thesis_score_color,
+    wvf_bot_color,
     NIFTY500_SYMBOLS,
 )
 from utils.supabase_client import (
@@ -167,7 +170,8 @@ def _stop_cell(reason):
 # Setup badge colours — keyed by setup label
 _SETUP_COLORS = {
     # Tier 1
-    "All 5 Pillars": ("#4c1d95", "#c4b5fd"),
+    "All 5 Pillars":     ("#4c1d95", "#c4b5fd"),
+    "All 5 Pillars (R)": ("#3b0764", "#e9d5ff"),  # relaxed gate — lighter purple
     # Tier 2
     "Fib+Qual":      ("#1e3a5f", "#93c5fd"),
     "Fib+CCI":       ("#1e3a5f", "#60a5fa"),
@@ -201,6 +205,7 @@ def _setup_cell(setup: str) -> str:
 
 _HEADERS = [
     "#", "Stock", "Score", "AccTier", "Setup",
+    "T2Tier", "T2Score", "T2Setup",
     "CCI", "CCI Sig", "Qual", "%Chg", "Entry", "SL", "T1", "T2", "T3",
 ]
 
@@ -243,6 +248,27 @@ def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int,
         at        = str(row.get("AccTier", "-"))
         qual_icon = "⭐" if row["Qual"] == "⭐" else ("✔" if row["Qual"] == "✔" else "")
 
+        # Thesis tier cells
+        t2_tier  = str(row.get("T2_Tier",  "-"))
+        t2_score = row.get("T2_Score", None)
+        t2_setup = str(row.get("T2_Setup", ""))
+        t2t_bg, t2t_fg = thesis_tier_color(t2_tier)
+        t2_tier_cell = (
+            f'<span style="background:{t2t_bg};color:{t2t_fg};padding:2px 6px;'
+            f'border-radius:3px;font-size:11px;font-weight:600;white-space:nowrap">{t2_tier}</span>'
+        )
+        if t2_score is not None:
+            ts_bg = thesis_score_color(int(t2_score))
+            t2_score_cell = _cell(str(int(t2_score)), ts_bg, "#000")
+        else:
+            t2_score_cell = '<span style="color:#334155">—</span>'
+        # Truncate long T2 setup strings
+        t2_setup_short = (t2_setup[:28] + "…") if len(t2_setup) > 30 else t2_setup
+        t2_setup_cell = (
+            f'<span style="color:#64748b;font-size:11px;white-space:nowrap" title="{t2_setup}">'
+            f'{t2_setup_short}</span>'
+        ) if t2_setup else '<span style="color:#334155">—</span>'
+
         rows.append(
             f"<tr{tr_s}>"
             f"<td style='color:#334155;font-size:11px;width:24px'>{rank}</td>"
@@ -252,6 +278,9 @@ def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int,
             f"<td>{sc_c(str(sc))}</td>"
             f"<td>{_acc_badge(at)}</td>"
             f"<td>{_setup_cell(str(row.get('Setup', '-')))}</td>"
+            f"<td>{t2_tier_cell}</td>"
+            f"<td>{t2_score_cell}</td>"
+            f"<td>{t2_setup_cell}</td>"
             f"<td>{cc_c(str(int(cv)))}</td>"
             f"<td>{cc_c(str(row['CCI Sig']))}</td>"
             f"<td style='font-size:13px;text-align:center'>{qual_icon}</td>"
@@ -289,8 +318,8 @@ _TIER_META = {
     "Tier 1": {
         "dot":   "#22c55e",
         "label": "Tier 1 — Prime  ·  All 5 pillars  ·  ~90%+",
-        "desc":  "trend_up · in_golden · CCI cross-up · qualified ⭐ · inside cloud",
-        "setups": ["All 5 Pillars"],
+        "desc":  "trend_up · in_golden (relaxed) · CCI cross-up (5-bar) · qualified ⭐ · above/inside cloud",
+        "setups": ["All 5 Pillars", "All 5 Pillars (R)"],
     },
     "Tier 2": {
         "dot":   "#22c55e",
@@ -309,6 +338,30 @@ _TIER_META = {
         "label": "Tier 4 — Skip  ·  Structural weakness",
         "desc":  "Hard Stop · Fib Resist · CCI Extended · Downtrend · Weak Mom · Low Score",
         "setups": ["Hard Stop","Fib Resist","CCI Extended","Downtrend","Weak Mom","Low Score"],
+    },
+}
+
+# Thesis tier meta — for the independent T2 expander section
+_THESIS_TIER_META = {
+    "T2★": {
+        "dot":   "#4ade80",
+        "label": "T2★ — Thesis Prime  ·  All conditions met",
+        "desc":  "throwback · mom3>10 · no fib ext · sq_off · sq_bull · WVF≥3 · norm_mom>20 · conf≥7 · D*>0 · yield_signal",
+    },
+    "T2A": {
+        "dot":   "#60a5fa",
+        "label": "T2A — Strong  ·  Relaxed thresholds",
+        "desc":  "throwback · mom3>5 · no fib ext · sq_off · sq_bull · WVF≥2 · norm_mom>15 · conf≥6 · D*>0 · yield_signal",
+    },
+    "T2B": {
+        "dot":   "#fcd34d",
+        "label": "T2B — Watch  ·  Either trigger fires",
+        "desc":  "(throwback OR sq_off+sq_bull) · mom3>0 · WVF≥1 · norm_mom>10 · conf≥5 · D*>0 · yield_signal",
+    },
+    "T2C": {
+        "dot":   "#f9a8d4",
+        "label": "T2C — Weak Watch  ·  Minimum viable signal",
+        "desc":  "(sq_off OR WVF≥2 OR pullback) · norm_mom>5 · conf≥4 · D*>0 · yield_signal",
     },
 }
 
@@ -346,6 +399,39 @@ def _tier_expander(tier_key: str, df: pd.DataFrame, cci_ob: int, cci_os: int,
         _render_table(df, cci_ob, cci_os, watchlist_syms)
 
 
+def _thesis_tier_expander(df: pd.DataFrame, cci_ob: int, cci_os: int,
+                           watchlist_syms: set):
+    """Expander grouping stocks by T2_Tier with sub-expanders per tier."""
+    if "T2_Tier" not in df.columns:
+        return
+
+    tier_order = ["T2★", "T2A", "T2B", "T2C"]
+    total_thesis = int((df["T2_Tier"] != "-").sum())
+
+    with st.expander(f"Thesis Tiers  ·  {total_thesis}", expanded=False):
+        st.markdown(
+            '<p style="font-size:11px;color:#475569;margin:0 0 8px">'
+            'Independent signal layer — squeeze · WVF · pullback · momentum · confluence · D* · yield gate</p>',
+            unsafe_allow_html=True,
+        )
+        for tk in tier_order:
+            meta  = _THESIS_TIER_META[tk]
+            tdf   = df[df["T2_Tier"] == tk].copy()
+            count = len(tdf)
+            if count == 0:
+                continue
+            dot   = meta["dot"]
+            with st.expander(
+                f'{"●"} {tk}  ·  {count}',
+                expanded=(tk in ("T2★", "T2A")),
+            ):
+                st.markdown(
+                    f'<p style="font-size:11px;color:#475569;margin:0 0 6px">{meta["desc"]}</p>',
+                    unsafe_allow_html=True,
+                )
+                _render_table(tdf, cci_ob, cci_os, watchlist_syms)
+
+
 # ══════════════════════════════════════════════════════════════════
 #  SUMMARY PILL BAR
 # ══════════════════════════════════════════════════════════════════
@@ -353,6 +439,7 @@ def _tier_expander(tier_key: str, df: pd.DataFrame, cci_ob: int, cci_os: int,
 def _summary_bar(df: pd.DataFrame) -> str:
     if df.empty:
         t1 = t2 = t3 = t4 = golden = cci_buy = cci_exit = cci_ext = 0
+        tt_prime = tt_strong = tt_watch = tt_weak = 0
     else:
         t1       = int(df["_tier1_prime"].sum())                      if "_tier1_prime" in df.columns else 0
         t2       = int((df["_any_buy"] & ~df["_tier1_prime"]).sum())  if "_any_buy" in df.columns and "_tier1_prime" in df.columns else 0
@@ -362,6 +449,14 @@ def _summary_bar(df: pd.DataFrame) -> str:
         cci_buy  = int((df["CCI Sig"] == "BUY").sum())
         cci_exit = int((df["CCI Sig"] == "EXIT").sum())
         cci_ext  = int((df["CCI Sig"] == "EXT").sum())
+        # Thesis tier counts
+        if "T2_Tier" in df.columns:
+            tt_prime  = int((df["T2_Tier"] == "T2★").sum())
+            tt_strong = int((df["T2_Tier"] == "T2A").sum())
+            tt_watch  = int((df["T2_Tier"] == "T2B").sum())
+            tt_weak   = int((df["T2_Tier"] == "T2C").sum())
+        else:
+            tt_prime = tt_strong = tt_watch = tt_weak = 0
 
     pills = [
         ("#166534", "#4ade80", f"Tier 1 · {t1}"),
@@ -372,6 +467,11 @@ def _summary_bar(df: pd.DataFrame) -> str:
         ("#2e1065", "#c4b5fd", f"CCI Buy · {cci_buy}"),
         ("#831843", "#f9a8d4", f"CCI Exit · {cci_exit}"),
         ("#1c1917", "#a8a29e", f"CCI Ext · {cci_ext}"),
+        # Thesis tiers
+        ("#1a3a1a", "#4ade80", f"T2★ · {tt_prime}"),
+        ("#1e3a5f", "#60a5fa", f"T2A · {tt_strong}"),
+        ("#78350f", "#fcd34d", f"T2B · {tt_watch}"),
+        ("#3b1f2b", "#f9a8d4", f"T2C · {tt_weak}"),
     ]
     spans = "".join(
         f'<span style="background:{bg};color:{fg};padding:4px 12px;border-radius:20px;'
@@ -401,7 +501,16 @@ def _render_metrics(df: pd.DataFrame):
     at1 = int((df["AccTier"] == "T1★").sum())  if "AccTier"    in df.columns else 0
     aa  = int((df["AccTier"] == "A"  ).sum())  if "AccTier"    in df.columns else 0
     stp = int(df["_hard_stop"].sum())           if "_hard_stop" in df.columns else 0
+    # Thesis tiers
+    if "T2_Tier" in df.columns:
+        tt_prime  = int((df["T2_Tier"] == "T2★").sum())
+        tt_strong = int((df["T2_Tier"] == "T2A").sum())
+        tt_watch  = int((df["T2_Tier"] == "T2B").sum())
+        tt_weak   = int((df["T2_Tier"] == "T2C").sum())
+    else:
+        tt_prime = tt_strong = tt_watch = tt_weak = 0
 
+    # Row 1 — original metrics
     cols = st.columns(9)
     for col, (lbl, val) in zip(cols, [
         ("🏆 Tier 1",  t1),
@@ -413,6 +522,21 @@ def _render_metrics(df: pd.DataFrame):
         ("T1★ ~90%",  at1),
         ("A ~85%",     aa),
         ("🚫 Stops",   stp),
+    ]):
+        col.metric(lbl, val)
+
+    # Row 2 — thesis tier metrics
+    st.markdown(
+        '<p style="font-size:10px;color:#334155;text-transform:uppercase;'
+        'letter-spacing:0.06em;margin:6px 0 2px">Thesis Tiers</p>',
+        unsafe_allow_html=True,
+    )
+    t_cols = st.columns(4)
+    for col, (lbl, val) in zip(t_cols, [
+        ("T2★ Prime",  tt_prime),
+        ("T2A Strong", tt_strong),
+        ("T2B Watch",  tt_watch),
+        ("T2C Weak",   tt_weak),
     ]):
         col.metric(lbl, val)
 
@@ -623,6 +747,7 @@ def render(settings: dict) -> None:
     _tier_expander("Tier 2", df_t2, cci_ob, cci_os, wl_syms_set, expanded=False)
     _tier_expander("Tier 3", df_t3, cci_ob, cci_os, wl_syms_set, expanded=False)
     _tier_expander("Tier 4", df_t4, cci_ob, cci_os, wl_syms_set, expanded=False)
+    _thesis_tier_expander(fdf, cci_ob, cci_os, wl_syms_set)
 
     # ── SUMMARY PILL BAR ──────────────────────────────────────────
     st.markdown(_summary_bar(df), unsafe_allow_html=True)
