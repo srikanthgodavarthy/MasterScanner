@@ -160,26 +160,26 @@ with st.sidebar:
 
     ss_min_score = st.slider(
         "Min Score", 0, 95,
-        st.session_state.get("ss_min_score", 0), step=5, key="ss_min_score",
+        st.session_state.get("ss_min_score_bridge", st.session_state.get("ss_min_score", 0)), step=5, key="ss_min_score",
         help="Hide results below this score. 0 = show all.",
     )
     ss_cci_len = st.slider(
         "CCI Length", 10, 40,
-        st.session_state.get("ss_cci_len", 20), step=5, key="ss_cci_len",
+        st.session_state.get("ss_cci_len_bridge",   st.session_state.get("ss_cci_len", 20)), step=5, key="ss_cci_len",
     )
     ss_cci_os = st.slider(
         "CCI Oversold", -200, -50,
-        st.session_state.get("ss_cci_os", -100), step=10, key="ss_cci_os",
+        st.session_state.get("ss_cci_os_bridge",    st.session_state.get("ss_cci_os", -100)), step=10, key="ss_cci_os",
     )
     ss_atr_prox = st.slider(
         "ATR Proximity", 0.10, 0.80,
-        float(st.session_state.get("ss_atr_prox", 0.3)),
+        float(st.session_state.get("ss_atr_prox_bridge", st.session_state.get("ss_atr_prox", 0.3))),
         step=0.05, format="%.2f", key="ss_atr_prox",
         help="Golden-zone width: ATR × this value on each side of 50–61.8% Fib.",
     )
     ss_pvt_lb = st.slider(
         "Pivot Lookback", 5, 40,
-        st.session_state.get("ss_pvt_lb", 20), step=5, key="ss_pvt_lb",
+        st.session_state.get("ss_pvt_lb_bridge",   st.session_state.get("ss_pvt_lb", 20)), step=5, key="ss_pvt_lb",
         help="Bars for swing hi/lo detection. Lower = more recent swings.",
     )
 
@@ -188,12 +188,12 @@ with st.sidebar:
 
     ss_min_score_bt = st.slider(
         "Min Score (backtest entry)", 50, 95,
-        st.session_state.get("ss_min_score_bt", 70), step=5, key="ss_min_score_bt",
+        st.session_state.get("ss_min_score_bt_bridge", st.session_state.get("ss_min_score_bt", 70)), step=5, key="ss_min_score_bt",
         help="Minimum score required to generate a backtest trade entry.",
     )
     ss_hold_days = st.slider(
         "Max Hold Days", 5, 60,
-        st.session_state.get("ss_hold_days", 20), step=5, key="ss_hold_days",
+        st.session_state.get("ss_hold_days_bridge", st.session_state.get("ss_hold_days", 20)), step=5, key="ss_hold_days",
     )
     ss_cci_ob = st.number_input(
         "CCI Overbought", 50, 300,
@@ -255,14 +255,14 @@ with st.sidebar:
             "Any T1":      "🏅 Any Tier 1 (T1★ + T1)",
         }
         if st.button("✅ Apply to both Scanner & Backtest", key="ex_apply", use_container_width=True):
-            st.session_state["ss_min_score"]    = ex_score
-            st.session_state["ss_min_score_bt"] = ex_score
-            st.session_state["ss_hold_days"]    = ex_hold
-            st.session_state["ss_cci_len"]      = ex_cci_len
-            st.session_state["ss_cci_os"]       = ex_cci_os
-            st.session_state["ss_atr_prox"]     = ex_atr
-            st.session_state["ss_pvt_lb"]       = ex_pvt
-            st.session_state["ss_tier1_bridge"] = _ex_tier_map[_ex_tier]
+            st.session_state["ss_min_score_bridge"]    = ex_score
+            st.session_state["ss_min_score_bt_bridge"] = ex_score
+            st.session_state["ss_hold_days_bridge"]    = ex_hold
+            st.session_state["ss_cci_len_bridge"]      = ex_cci_len
+            st.session_state["ss_cci_os_bridge"]       = ex_cci_os
+            st.session_state["ss_atr_prox_bridge"]     = ex_atr
+            st.session_state["ss_pvt_lb_bridge"]       = ex_pvt
+            st.session_state["ss_tier1_bridge"]        = _ex_tier_map[_ex_tier]
             st.rerun()
 
 # ── Build shared settings dict read by both pages ─────────────────────────────
