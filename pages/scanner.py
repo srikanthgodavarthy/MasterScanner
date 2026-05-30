@@ -566,19 +566,19 @@ def _render_watchlist(df: pd.DataFrame, cci_ob: int, cci_os: int,
 def render(settings: dict) -> None:
     st.markdown(_CSS, unsafe_allow_html=True)
 
+    # ── All parameters from shared settings (unified sidebar in app.py) ─────────
     symbols         = settings.get("symbols",         NIFTY500_SYMBOLS)
     cci_len         = settings.get("cci_len",         20)
     cci_ob          = settings.get("cci_ob",          100)
     cci_os          = settings.get("cci_os",         -100)
-    workers         = settings.get("workers",         10)
-    auto_refresh    = settings.get("auto_refresh",    False)
-    refresh_secs    = settings.get("refresh_mins",    5) * 60
-    tier1_mode      = settings.get("tier1_mode",      False)
-    enable_t1_relax = settings.get("enable_t1_relax", True)
     atr_prox        = settings.get("atr_prox",        0.3)
     pvt_lb          = settings.get("pvt_lb",          20)
     min_score       = settings.get("min_score",       0)
-    supabase_ok     = _is_available()
+    tier1_mode      = settings.get("tier1_mode",      False)
+    enable_t1_relax = settings.get("enable_t1_relax", True)
+    workers         = settings.get("workers",         10)
+    auto_refresh    = settings.get("auto_refresh",    False)
+    refresh_secs    = settings.get("refresh_mins",    5) * 60
 
     # ── HEADER ────────────────────────────────────────────────────
     st.markdown(
