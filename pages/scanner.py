@@ -581,13 +581,14 @@ def render(settings: dict) -> None:
     refresh_secs    = settings.get("refresh_mins",    5) * 60
 
     # ── HEADER ────────────────────────────────────────────────────
+    _sb_color = "#4ade80" if supabase_ok else "#f87171"
+    _sb_label = "● Supabase" if supabase_ok else "● Offline"
     st.markdown(
         '<div class="scanner-header">'
         '<span style="font-size:18px">⚡</span>'
         '<span class="scanner-title">NSE Master Scanner</span>'
         '<span class="scanner-badge">LIVE · Nifty 500</span>'
-        f'<span style="margin-left:auto;font-size:11px;color:{"#4ade80" if supabase_ok else "#f87171"}">'
-        f'{"● Supabase" if supabase_ok else "● Offline"}</span>'
+        f'<span style="margin-left:auto;font-size:11px;color:{_sb_color}">{_sb_label}</span>'
         '</div>',
         unsafe_allow_html=True,
     )
