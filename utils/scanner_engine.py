@@ -638,7 +638,7 @@ def score_stock(
 
     any_buy = (
         is_fib_buy or is_abcd_buy or is_harm_buy or is_norm_buy or is_cci_buy
-    ) and allow_cloud_buy and cur_cci <= 100
+    ) and allow_cloud_buy and cur_cci <= cci_ob
 
     # ── TIER CLASSIFICATION ───────────────────────────────────────
     # Tier 1  — strict OR relaxed T1 prime gate fires
