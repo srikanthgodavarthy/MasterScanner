@@ -381,11 +381,12 @@ def fetch_nifty(period: str = "1y") -> pd.Series:
 def score_stock(
     df: pd.DataFrame,
     nifty: pd.Series,
-    cci_len:  int   = 20,
-    cci_ob:   int   = 100,
-    cci_os:   int   = -100,
-    pvt_lb:   int   = 20,
-    atr_prox: float = 0.3,
+    cci_len:         int   = 20,
+    cci_ob:          int   = 100,
+    cci_os:          int   = -100,
+    pvt_lb:          int   = 20,
+    atr_prox:        float = 0.3,
+    enable_t1_relax: bool  = True,
 ) -> dict:
     """
     Full port of Pine Script f() scoring + all signal logic.
@@ -606,11 +607,12 @@ def score_stock(
     # trend_relax partial EMA alignment (+30 for cur_e20>cur_e50 already
     # captured in EMA block above).
     is_tier1_prime_relax = (
-        not is_tier1_prime_strict and   # strict already handled above
-        trend_up              and       # still requires full EMA stack
-        in_golden_relaxed     and
-        recent_cci_recovery   and
-        qualified_relax       and       # relaxed: lower thresholds + filters
+        enable_t1_relax               and   # suppressed when caller sets False
+        not is_tier1_prime_strict     and   # strict already handled above
+        trend_up                      and   # still requires full EMA stack
+        in_golden_relaxed             and
+        recent_cci_recovery           and
+        qualified_relax               and   # relaxed: lower thresholds + filters
         allow_cloud
     )
 
@@ -870,17 +872,26 @@ _BATCH_SIZE = 100
 
 
 def run_scanner(
-    symbols:     list,
-    cci_len:     int  = 20,
-    cci_ob:      int  = 100,
-    cci_os:      int  = -100,
-    max_workers: int  = 10,
-    progress_cb       = None,
+    symbols:         list,
+    cci_len:         int   = 20,
+    cci_ob:          int   = 100,
+    cci_os:          int   = -100,
+    max_workers:     int   = 10,
+    progress_cb            = None,
+    atr_prox:        float = 0.3,
+    pvt_lb:          int   = 20,
+    enable_t1_relax: bool  = True,
+    min_score:       int   = 0,
 ) -> pd.DataFrame:
     """
     Two-phase scanner:
       Phase 1 (0 → 0.5): batch-download OHLCV in chunks of _BATCH_SIZE.
       Phase 2 (0.5 → 1): parallel scoring with ThreadPoolExecutor.
+
+    atr_prox        — ATR multiplier for golden-zone width (default 0.3)
+    pvt_lb          — pivot lookback bars for swing hi/lo detection (default 20)
+    enable_t1_relax — when False, the relaxed T1 gate is suppressed entirely
+    min_score       — hide rows with norm_score below this floor (0 = show all)
     """
     total     = len(symbols)
     n_batches = max(1, (total + _BATCH_SIZE - 1) // _BATCH_SIZE)
@@ -902,7 +913,12 @@ def run_scanner(
         df = all_data.get(sym, pd.DataFrame())
         if df.empty:
             return None
-        row = score_stock(df, nifty, cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os)
+        row = score_stock(
+            df, nifty,
+            cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
+            pvt_lb=pvt_lb,   atr_prox=atr_prox,
+            enable_t1_relax=enable_t1_relax,
+        )
         if row:
             row["Stock"] = sym
         return row
@@ -922,6 +938,8 @@ def run_scanner(
 
     df_out = pd.DataFrame(results)
     df_out = df_out.sort_values("Score", ascending=False).reset_index(drop=True)
+    if min_score > 0 and "Score" in df_out.columns:
+        df_out = df_out[df_out["Score"] >= min_score].reset_index(drop=True)
     df_out.index += 1
     return df_out
 

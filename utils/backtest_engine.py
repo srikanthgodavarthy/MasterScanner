@@ -463,14 +463,16 @@ def simulate_trades(
 
 def run_backtest(
     symbols:      list,
-    cci_len:      int  = 20,
-    cci_ob:       int  = 100,
-    cci_os:       int  = -100,
-    min_score:    int  = 70,
-    hold_days:    int  = 20,
-    workers:      int  = 10,
-    tier1_only         = False,   # False | True | "strict" | "relax" | "any"
-    progress_cb        = None,
+    cci_len:      int   = 20,
+    cci_ob:       int   = 100,
+    cci_os:       int   = -100,
+    min_score:    int   = 70,
+    hold_days:    int   = 20,
+    workers:      int   = 10,
+    tier1_only          = False,   # False | True | "strict" | "relax" | "any"
+    progress_cb         = None,
+    atr_prox:     float = 0.3,
+    pvt_lb:       int   = 20,
 ) -> pd.DataFrame:
     """
     tier1_only values:
@@ -506,7 +508,8 @@ def run_backtest(
             return None
         signals = generate_signals_historical(
             df, nifty_close, cci_len, cci_ob, cci_os,
-            min_score, tier1_only=tier1_only
+            min_score, atr_prox=atr_prox, pvt_lb=pvt_lb,
+            tier1_only=tier1_only,
         )
         return simulate_trades(sym, df, signals, hold_days=hold_days)
 
