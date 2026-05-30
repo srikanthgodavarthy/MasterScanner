@@ -581,16 +581,17 @@ def render(settings: dict) -> None:
     supabase_ok     = _is_available()
 
     # ── HEADER ────────────────────────────────────────────────────
-    st.markdown(
+    _hdr_color = "#4ade80" if supabase_ok else "#f87171"
+    _hdr_db    = "&#9679; Supabase" if supabase_ok else "&#9679; Offline"
+    _hdr_html  = (
         '<div class="scanner-header">'
-        '<span style="font-size:18px">⚡</span>'
+        '<span style="font-size:18px">&#9889;</span>'
         '<span class="scanner-title">NSE Master Scanner</span>'
-        '<span class="scanner-badge">LIVE · Nifty 500</span>'
-        '<span style="margin-left:auto;font-size:11px;color:' + ("#4ade80" if supabase_ok else "#f87171") + ';">' \
-        + ("&#9679; Supabase" if supabase_ok else "&#9679; Offline") + '</span>'
-        '</div>',
-        unsafe_allow_html=True,
+        '<span class="scanner-badge">LIVE &middot; Nifty 500</span>'
+        f'<span style="margin-left:auto;font-size:11px;color:{_hdr_color};">{_hdr_db}</span>'
+        '</div>'
     )
+    st.markdown(_hdr_html, unsafe_allow_html=True)
 
     # ── CONTROL ROW ───────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns([1, 3, 2, 2])
