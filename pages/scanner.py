@@ -566,7 +566,6 @@ def _render_watchlist(df: pd.DataFrame, cci_ob: int, cci_os: int,
 def render(settings: dict) -> None:
     st.markdown(_CSS, unsafe_allow_html=True)
 
-    # ── All parameters from shared settings (unified sidebar in app.py) ─────────
     symbols         = settings.get("symbols",         NIFTY500_SYMBOLS)
     cci_len         = settings.get("cci_len",         20)
     cci_ob          = settings.get("cci_ob",          100)
@@ -582,14 +581,13 @@ def render(settings: dict) -> None:
     supabase_ok     = _is_available()
 
     # ── HEADER ────────────────────────────────────────────────────
-    _sb_color = "#4ade80" if supabase_ok else "#f87171"
-    _sb_label = "● Supabase" if supabase_ok else "● Offline"
     st.markdown(
         '<div class="scanner-header">'
         '<span style="font-size:18px">⚡</span>'
         '<span class="scanner-title">NSE Master Scanner</span>'
         '<span class="scanner-badge">LIVE · Nifty 500</span>'
-        f'<span style="margin-left:auto;font-size:11px;color:{_sb_color}">{_sb_label}</span>'
+        '<span style="margin-left:auto;font-size:11px;color:' + ("#4ade80" if supabase_ok else "#f87171") + ';">' \
+        + ("&#9679; Supabase" if supabase_ok else "&#9679; Offline") + '</span>'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -625,7 +623,7 @@ def render(settings: dict) -> None:
                 pvt_lb=pvt_lb,
                 enable_t1_relax=enable_t1_relax,
                 min_score=min_score,
-                progress_cb=lambda p: prog.progress(p, text=f"Scanning… {int(p*100)}%"),
+                progress_cb=lambda p: prog.progress(p, text=f"Scanning... {int(p*100)}%"),
             )
         prog.empty()
         if df_raw.empty:
