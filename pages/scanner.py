@@ -579,6 +579,7 @@ def render(settings: dict) -> None:
     workers         = settings.get("workers",         10)
     auto_refresh    = settings.get("auto_refresh",    False)
     refresh_secs    = settings.get("refresh_mins",    5) * 60
+    supabase_ok     = _is_available()
 
     # ── HEADER ────────────────────────────────────────────────────
     _sb_color = "#4ade80" if supabase_ok else "#f87171"
