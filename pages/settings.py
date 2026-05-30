@@ -42,24 +42,68 @@ def render() -> dict:
 
     # ── SCANNER SETTINGS ──────────────────────────────────────────────────────
     st.subheader("🔧 Scanner Parameters")
+
+    st.caption("CCI & execution")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         cci_len = st.number_input("CCI Length", min_value=5, max_value=50,
-                                  value=st.session_state.get("cci_len", 20), step=1)
+                                  value=st.session_state.get("cci_len", 20), step=1,
+                                  help="Lookback period for CCI calculation. Default 20.")
     with c2:
         cci_ob = st.number_input("CCI Overbought", min_value=50, max_value=300,
-                                 value=st.session_state.get("cci_ob", 100), step=10)
+                                 value=st.session_state.get("cci_ob", 100), step=10,
+                                 help="CCI level above which the stock is considered overbought. Default 100.")
     with c3:
         cci_os = st.number_input("CCI Oversold", min_value=-300, max_value=-50,
-                                 value=st.session_state.get("cci_os", -100), step=10)
+                                 value=st.session_state.get("cci_os", -100), step=10,
+                                 help="CCI level below which the stock is considered oversold. Default -100.")
     with c4:
         workers = st.number_input("Parallel Workers", min_value=1, max_value=20,
-                                  value=st.session_state.get("workers", 10), step=1)
+                                  value=st.session_state.get("workers", 10), step=1,
+                                  help="Thread count for parallel symbol scoring.")
 
-    st.session_state["cci_len"] = int(cci_len)
-    st.session_state["cci_ob"]  = int(cci_ob)
-    st.session_state["cci_os"]  = int(cci_os)
-    st.session_state["workers"] = int(workers)
+    st.caption("Entry filters — applied to both Live Scanner and Backtest")
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        min_score = st.slider(
+            "Min Score (floor)", min_value=0, max_value=90,
+            value=st.session_state.get("min_score", 0), step=5,
+            help=(
+                "Hide any stock scoring below this threshold. "
+"0 = show everything (default). "
+"Set to 60–70 to suppress noise from Tier 3/4 in live scans."
+            ),
+        )
+    with d2:
+        atr_prox = st.slider(
+            "ATR Proximity (golden zone width)", min_value=0.10, max_value=0.80,
+            value=float(st.session_state.get("atr_prox", 0.3)), step=0.05,
+            format="%.2f",
+            help=(
+                "ATR multiplier that controls how wide the Fibonacci golden zone "
+"(50–61.8%% retracement) is on both sides. "
+"0.30 = default tight zone. "
+"0.50+ = wider net, more signals, noisier entries."
+            ),
+        )
+    with d3:
+        pvt_lb = st.slider(
+            "Pivot Lookback", min_value=5, max_value=40,
+            value=int(st.session_state.get("pvt_lb", 20)), step=5,
+            help=(
+                "Number of bars used to detect swing highs/lows for Fibonacci "
+"retracement levels and harmonic/ABCD patterns. "
+"Lower = more recent swings. Higher = larger structural levels."
+            ),
+        )
+
+    st.session_state["cci_len"]   = int(cci_len)
+    st.session_state["cci_ob"]    = int(cci_ob)
+    st.session_state["cci_os"]    = int(cci_os)
+    st.session_state["workers"]   = int(workers)
+    st.session_state["min_score"] = int(min_score)
+    st.session_state["atr_prox"]  = float(atr_prox)
+    st.session_state["pvt_lb"]    = int(pvt_lb)
 
     # ── TIER 1 GATE — applies to BOTH live scanner and backtest ───────────────
     st.subheader("🎯 Tier 1 Gate")
@@ -336,6 +380,9 @@ def render() -> dict:
         "workers":          int(workers),
         "auto_refresh":     bool(auto_refresh),
         "refresh_mins":     int(refresh_mins),
-        "tier1_mode":       tier1_mode,       # False | "strict" | "relax" | "any"
-        "enable_t1_relax":  bool(enable_t1_relax),  # passed to scanner + backtest engine
+        "tier1_mode":       tier1_mode,        # False | "strict" | "relax" | "any"
+        "enable_t1_relax":  bool(enable_t1_relax),
+        "min_score":        int(min_score),     # score floor for both scanner + backtest
+        "atr_prox":         float(atr_prox),    # golden-zone ATR width
+        "pvt_lb":           int(pvt_lb),        # swing pivot lookback
     }

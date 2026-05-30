@@ -566,17 +566,18 @@ def _render_watchlist(df: pd.DataFrame, cci_ob: int, cci_os: int,
 def render(settings: dict) -> None:
     st.markdown(_CSS, unsafe_allow_html=True)
 
-    symbols      = settings.get("symbols",      NIFTY500_SYMBOLS)
-    cci_len      = settings.get("cci_len",      20)
-    cci_ob       = settings.get("cci_ob",       100)
-    cci_os       = settings.get("cci_os",      -100)
-    workers      = settings.get("workers",      10)
-    auto_refresh = settings.get("auto_refresh", False)
-    refresh_secs = settings.get("refresh_mins", 5) * 60
-    # FIX #7: read tier1_mode from settings (was never consumed here)
+    symbols         = settings.get("symbols",         NIFTY500_SYMBOLS)
+    cci_len         = settings.get("cci_len",         20)
+    cci_ob          = settings.get("cci_ob",          100)
+    cci_os          = settings.get("cci_os",         -100)
+    workers         = settings.get("workers",         10)
+    auto_refresh    = settings.get("auto_refresh",    False)
+    refresh_secs    = settings.get("refresh_mins",    5) * 60
     tier1_mode      = settings.get("tier1_mode",      False)
-    # enable_t1_relax — passed to engine so relaxed gate can be fully suppressed
     enable_t1_relax = settings.get("enable_t1_relax", True)
+    atr_prox        = settings.get("atr_prox",        0.3)
+    pvt_lb          = settings.get("pvt_lb",          20)
+    min_score       = settings.get("min_score",       0)
     supabase_ok     = _is_available()
 
     # ── HEADER ────────────────────────────────────────────────────
@@ -618,7 +619,10 @@ def render(settings: dict) -> None:
             df_raw = run_scanner(
                 symbols=symbols, cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
                 max_workers=workers,
+                atr_prox=atr_prox,
+                pvt_lb=pvt_lb,
                 enable_t1_relax=enable_t1_relax,
+                min_score=min_score,
                 progress_cb=lambda p: prog.progress(p, text=f"Scanning… {int(p*100)}%"),
             )
         prog.empty()
