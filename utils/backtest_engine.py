@@ -213,7 +213,7 @@ def generate_signals_historical(
         recent_10_high   = float(c.iloc[max(0, i-11):i].max())   # [1]-offset like scanner
         near_breakout    = cur_c > recent_10_high * 0.97
 
-        strong_htf_relax = mom1 > 2 and mom3 > 5 and mom6 > 8
+        strong_htf_relax = mom1 > 4 and mom3 > 8 and mom6 > 12
         trend_relax      = (
             cur_c > cur_e200 * 0.97 and
             cur_e20 > cur_e50 * 0.995
@@ -322,7 +322,7 @@ def generate_signals_historical(
 
         # ── Trade levels ────────────────────────────────────────────
         en     = round(cur_c)
-        raw_sl = en - cur_atr * 2.5 * 0.85
+        raw_sl = en - cur_atr * 3.0 * 0.85
         min_sl = en - cur_atr * 4.0
         max_sl = en - cur_atr * 1.5
         sl     = round(max(min_sl, min(raw_sl, max_sl)))

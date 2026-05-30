@@ -550,7 +550,7 @@ def score_stock(
     recent_10bar_high = float(highest(c, 10).iloc[-2]) if len(c) >= 11 else cur_c
     near_breakout    = cur_c > recent_10bar_high * 0.97
 
-    strong_htf_relax = mom1 > 2 and mom3 > 5 and mom6 > 8
+    strong_htf_relax = mom1 > 4 and mom3 > 8 and mom6 > 12
     trend_relax      = (
         cur_c > cur_e200 * 0.97 and      # 3% buffer below EMA200
         cur_e20 > cur_e50 * 0.995         # 0.5% buffer — catches imminent golden cross
