@@ -317,7 +317,7 @@ def generate_signals_historical(
 
         allow_cloud_buy = above_cloud or (inside_cloud and norm_score >= 65)
 
-        if norm_score < min_score or not allow_cloud_buy or cur_cci > 100:
+        if norm_score < min_score or not allow_cloud_buy or cur_cci > cci_ob:
             continue
 
         # ── Trade levels ────────────────────────────────────────────
