@@ -46,6 +46,23 @@ SS = st.session_state   # shorthand
 
 
 def render() -> dict:
+    _DEFAULTS = dict(
+        cfg_min_score=70, cfg_hold_days=20, cfg_atr_prox=0.30,
+        cfg_pvt_lb=20,   cfg_cci_len=20,  cfg_cci_ob=100,
+        cfg_cci_os=-100, cfg_workers=10,
+        cfg_t1s_mom1=5,  cfg_t1s_mom3=10, cfg_t1s_mom6=15,
+        cfg_t1s_enabled=True,
+        cfg_t1r_mom1=4,  cfg_t1r_mom3=8,  cfg_t1r_mom6=12,
+        cfg_t1r_atr_pctile=0.35, cfg_t1r_breakout_buf=3.0,
+        cfg_t1r_enabled=True,
+        cfg_t2_min_score=55, cfg_t2_fib_score=65,
+        cfg_t2_cci_score=55, cfg_t2_enabled=True,
+    )
+    # Apply pending reset *before* any widgets render so Streamlit allows the write
+    if SS.pop("_pending_reset", False):
+        for k, v in _DEFAULTS.items():
+            SS[k] = v
+
     st.markdown(
         "<h2 style='font-family:Syne,sans-serif;margin-bottom:0.2rem'>"
         "⚙️ Strategy Settings</h2>"
