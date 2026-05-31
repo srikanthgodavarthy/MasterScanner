@@ -1,16 +1,5 @@
 """
-pages/scanner.py — Live scanner UI  (v6 — all audit fixes applied)
-
-Changes from v5:
-  1. _SETUP_COLORS  — added "All 5 Pillars (★)" and "All 5 Pillars (R)" keys
-  2. _TIER_META     — Tier 1 setups list updated to match engine output
-  3. qual_icon      — ✦ (relaxed) and ✖ (unqualified) no longer silently dropped
-  4. CCI State      — added to _HEADERS and _render_table
-  5. AccScore sort  — applied consistently across all four tiers (was T1 only)
-  6. Metrics row    — T1 (R) card added alongside T1★
-  7. tier1_mode     — read from settings and applied to Tier 1 partition;
-                      inline caption shown when a filter is active
-  8. Score cell     — AccScore surfaced as tooltip on hover
+pages/scanner.py — Live scanner UI  (v5 — clean layered layout)
 
 Tier layers (engine-driven, not action-driven):
   Tier 1  — _tier1_prime = True  (all 5 pillars, ~90%+)
@@ -25,8 +14,7 @@ Bottom sticky pill bar: live signal counts.
 import streamlit as st
 import pandas as pd
 import time
-from datetime import datetime, timezone, timedelta
-IST = timezone(timedelta(hours=5, minutes=30))
+from datetime import datetime
 
 from utils.scanner_engine import (
     run_scanner,
@@ -161,10 +149,9 @@ hr { margin: 0.5rem 0 !important; }
 #  TABLE HELPERS
 # ══════════════════════════════════════════════════════════════════
 
-def _cell(val, bg, fg="#fff", fs="12px", title=""):
-    title_attr = f' title="{title}"' if title else ""
+def _cell(val, bg, fg="#fff", fs="12px"):
     return (f'<span style="background:{bg};color:{fg};padding:2px 6px;'
-            f'border-radius:3px;white-space:nowrap;font-size:{fs}"{title_attr}>{val}</span>')
+            f'border-radius:3px;white-space:nowrap;font-size:{fs}">{val}</span>')
 
 def _acc_badge(t):
     bg, fg = acc_tier_color(t)
@@ -177,13 +164,10 @@ def _stop_cell(reason):
     return (f'<span style="background:#7f1d1d;color:#fca5a5;padding:2px 5px;'
             f'border-radius:3px;font-size:11px;white-space:nowrap" title="{reason}">🚫 {s}</span>')
 
-# ── Setup badge colours — keyed by exact engine setup label ──────
-# FIX #1: keys now match engine output ("All 5 Pillars (★)" / "(R)")
+# Setup badge colours — keyed by setup label
 _SETUP_COLORS = {
-    # Tier 1 — two variants the engine actually emits
-    "All 5 Pillars (★)": ("#4c1d95", "#c4b5fd"),   # strict gate — deep purple
-    "All 5 Pillars (R)": ("#5b21b6", "#ddd6fe"),   # relaxed gate — violet
-    "All 5 Pillars":     ("#4c1d95", "#c4b5fd"),   # fallback if engine ever omits suffix
+    # Tier 1
+    "All 5 Pillars": ("#4c1d95", "#c4b5fd"),
     # Tier 2
     "Fib+Qual":      ("#1e3a5f", "#93c5fd"),
     "Fib+CCI":       ("#1e3a5f", "#60a5fa"),
@@ -215,19 +199,10 @@ def _setup_cell(setup: str) -> str:
     return (f'<span style="background:{bg};color:{fg};padding:2px 6px;'
             f'border-radius:3px;font-size:11px;font-weight:500;white-space:nowrap">{setup}</span>')
 
-# FIX #4: CCI State added to headers
 _HEADERS = [
     "#", "Stock", "Score", "AccTier", "Setup",
-    "CCI", "CCI State", "CCI Sig", "Qual", "%Chg", "Entry", "SL", "T1", "T2", "T3",
+    "CCI", "CCI Sig", "Qual", "%Chg", "Entry", "SL", "T1", "T2", "T3",
 ]
-
-# CCI State colours
-_CCI_STATE_COLORS = {
-    "OB":   "#ef4444",
-    "OS":   "#22c55e",
-    "BULL": "#3b82f6",
-    "BEAR": "#f59e0b",
-}
 
 def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int,
                   watchlist_syms: set = None):
@@ -265,30 +240,8 @@ def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int,
         sl_c = lambda v:       _cell(v, "#991b1b", "#fff")
         en_c = lambda v:       _cell(v, "#1e3a8a", "#fff")
 
-        at = str(row.get("AccTier", "-"))
-
-        # FIX #3: ✦ (relaxed qual) and ✖ (unqualified) no longer dropped
-        _qual_raw = str(row.get("Qual", ""))
-        if _qual_raw == "⭐":
-            qual_icon  = "⭐"
-            qual_color = "inherit"
-        elif _qual_raw == "✔":
-            qual_icon  = "✔"
-            qual_color = "#4ade80"
-        elif _qual_raw == "✦":
-            qual_icon  = "✦"
-            qual_color = "#a78bfa"   # violet — relaxed qual
-        else:
-            qual_icon  = "✖"
-            qual_color = "#ef4444"   # red — unqualified
-
-        # FIX #8: AccScore as tooltip on Score badge
-        acc_score  = int(row["AccScore"]) if "AccScore" in row.index else sc
-        score_cell = _cell(str(sc), bg, "#000", title=f"AccScore: {acc_score}")
-
-        # FIX #4: CCI State cell
-        cci_state       = str(row.get("CCI State", "-"))
-        cci_state_color = _CCI_STATE_COLORS.get(cci_state, "#475569")
+        at        = str(row.get("AccTier", "-"))
+        qual_icon = "⭐" if row["Qual"] == "⭐" else ("✔" if row["Qual"] == "✔" else "")
 
         rows.append(
             f"<tr{tr_s}>"
@@ -296,13 +249,12 @@ def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int,
             f"<td><span style='background:{stock_bg};color:#000;padding:2px 6px;"
             f"border-radius:3px;font-size:12px;font-weight:600;white-space:nowrap'>"
             f"{sym}{wl_dot}</span></td>"
-            f"<td>{score_cell}</td>"
+            f"<td>{sc_c(str(sc))}</td>"
             f"<td>{_acc_badge(at)}</td>"
             f"<td>{_setup_cell(str(row.get('Setup', '-')))}</td>"
             f"<td>{cc_c(str(int(cv)))}</td>"
-            f"<td style='font-size:11px;font-weight:600;color:{cci_state_color}'>{cci_state}</td>"
             f"<td>{cc_c(str(row['CCI Sig']))}</td>"
-            f"<td style='font-size:13px;text-align:center;color:{qual_color}'>{qual_icon}</td>"
+            f"<td style='font-size:13px;text-align:center'>{qual_icon}</td>"
             f"<td style='color:#94a3b8;font-size:12px'>{row['%Chg']}%</td>"
             f"<td>{en_c(str(row['Entry']))}</td>"
             f"<td>{sl_c(str(row['SL']))}</td>"
@@ -333,13 +285,12 @@ def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int,
 #  TIER EXPANDER
 # ══════════════════════════════════════════════════════════════════
 
-# FIX #2: setups list updated to match exact engine output strings
 _TIER_META = {
     "Tier 1": {
         "dot":   "#22c55e",
         "label": "Tier 1 — Prime  ·  All 5 pillars  ·  ~90%+",
         "desc":  "trend_up · in_golden · CCI cross-up · qualified ⭐ · inside cloud",
-        "setups": ["All 5 Pillars (★)", "All 5 Pillars (R)"],
+        "setups": ["All 5 Pillars"],
     },
     "Tier 2": {
         "dot":   "#22c55e",
@@ -373,9 +324,7 @@ def _setup_legend(setups: list, df: pd.DataFrame) -> str:
             continue
         bg, fg = _SETUP_COLORS.get(s, ("#1e293b", "#94a3b8"))
         pills += (
-            f'<span style="background:{bg};color:{fg};padding:2px 9px;border-radius:12px;'
-            f'font-size:11px;font-weight:500;white-space:nowrap;border:1px solid {fg}33">'
-            f'{s} <b>{n}</b></span> '
+            f'<span style="background:{bg};color:{fg};padding:2px 9px;border-radius:12px;font-size:11px;font-weight:500;white-space:nowrap;border:1px solid {fg}33">{s} <b>{n}</b></span> '
         )
     return f'<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px">{pills}</div>'
 
@@ -443,30 +392,27 @@ def _summary_bar(df: pd.DataFrame) -> str:
 def _render_metrics(df: pd.DataFrame):
     if df.empty:
         return
-    t1   = int(df["_tier1_prime"].sum())        if "_tier1_prime" in df.columns else 0
-    ab   = int(df["_any_buy"].sum())             if "_any_buy"     in df.columns else 0
-    hp   = int(df["_high_prob"].sum())           if "_high_prob"   in df.columns else 0
-    cb   = int((df["CCI Sig"] == "BUY").sum())
-    qs   = int((df["Qual"] == "⭐").sum())
-    buy  = int((df["Action"] == "✅ BUY").sum())
-    at1s = int((df["AccTier"] == "T1★").sum())  if "AccTier" in df.columns else 0
-    # FIX #6: T1 (relaxed) card — was previously missing
-    at1r = int((df["AccTier"] == "T1" ).sum())  if "AccTier" in df.columns else 0
-    aa   = int((df["AccTier"] == "A"  ).sum())  if "AccTier" in df.columns else 0
-    stp  = int(df["_hard_stop"].sum())           if "_hard_stop" in df.columns else 0
+    t1  = int(df["_tier1_prime"].sum())        if "_tier1_prime" in df.columns else 0
+    ab  = int(df["_any_buy"].sum())             if "_any_buy"     in df.columns else 0
+    hp  = int(df["_high_prob"].sum())           if "_high_prob"   in df.columns else 0
+    cb  = int((df["CCI Sig"] == "BUY").sum())
+    qs  = int((df["Qual"] == "⭐").sum())
+    buy = int((df["Action"] == "✅ BUY").sum())
+    at1 = int((df["AccTier"] == "T1★").sum())  if "AccTier"    in df.columns else 0
+    aa  = int((df["AccTier"] == "A"  ).sum())  if "AccTier"    in df.columns else 0
+    stp = int(df["_hard_stop"].sum())           if "_hard_stop" in df.columns else 0
 
-    cols = st.columns(10)
+    cols = st.columns(9)
     for col, (lbl, val) in zip(cols, [
-        ("🏆 Tier 1",   t1),
-        ("🥈 Any Buy",  ab),
-        ("🎯 Hi Prob",  hp),
-        ("📡 CCI ↑",    cb),
-        ("⭐ Qual",     qs),
-        ("✅ BUY",      buy),
-        ("T1★ ~90%",   at1s),
-        ("T1(R) ~80%", at1r),   # ← new
-        ("A ~85%",      aa),
-        ("🚫 Stops",    stp),
+        ("🏆 Tier 1",  t1),
+        ("🥈 Any Buy", ab),
+        ("🎯 Hi Prob", hp),
+        ("📡 CCI ↑",   cb),
+        ("⭐ Qual",    qs),
+        ("✅ BUY",     buy),
+        ("T1★ ~90%",  at1),
+        ("A ~85%",     aa),
+        ("🚫 Stops",   stp),
     ]):
         col.metric(lbl, val)
 
@@ -567,32 +513,26 @@ def _render_watchlist(df: pd.DataFrame, cci_ob: int, cci_os: int,
 def render(settings: dict) -> None:
     st.markdown(_CSS, unsafe_allow_html=True)
 
-    symbols         = settings.get("symbols",         NIFTY500_SYMBOLS)
-    cci_len         = settings.get("cci_len",         20)
-    cci_ob          = settings.get("cci_ob",          100)
-    cci_os          = settings.get("cci_os",         -100)
-    atr_prox        = settings.get("atr_prox",        0.3)
-    pvt_lb          = settings.get("pvt_lb",          20)
-    min_score       = settings.get("min_score",       0)
-    tier1_mode      = settings.get("tier1_mode",      False)
-    enable_t1_relax = settings.get("enable_t1_relax", True)
-    workers         = settings.get("workers",         10)
-    auto_refresh    = settings.get("auto_refresh",    False)
-    refresh_secs    = settings.get("refresh_mins",    5) * 60
-    supabase_ok     = _is_available()
+    symbols      = settings.get("symbols",      NIFTY500_SYMBOLS)
+    cci_len      = settings.get("cci_len",      20)
+    cci_ob       = settings.get("cci_ob",       100)
+    cci_os       = settings.get("cci_os",      -100)
+    workers      = settings.get("workers",      10)
+    auto_refresh = settings.get("auto_refresh", False)
+    refresh_secs = settings.get("refresh_mins", 5) * 60
+    supabase_ok  = _is_available()
 
     # ── HEADER ────────────────────────────────────────────────────
-    _hdr_color = "#4ade80" if supabase_ok else "#f87171"
-    _hdr_db    = "&#9679; Supabase" if supabase_ok else "&#9679; Offline"
-    _hdr_html  = (
+    st.markdown(
         '<div class="scanner-header">'
-        '<span style="font-size:18px">&#9889;</span>'
+        '<span style="font-size:18px">⚡</span>'
         '<span class="scanner-title">NSE Master Scanner</span>'
-        '<span class="scanner-badge">LIVE &middot; Nifty 500</span>'
-        f'<span style="margin-left:auto;font-size:11px;color:{_hdr_color};">{_hdr_db}</span>'
-        '</div>'
+        '<span class="scanner-badge">LIVE · Nifty 500</span>'
+        f'<span style="margin-left:auto;font-size:11px;color:{"#4ade80" if supabase_ok else "#f87171"}">'
+        f'{"● Supabase" if supabase_ok else "● Offline"}</span>'
+        '</div>',
+        unsafe_allow_html=True,
     )
-    st.markdown(_hdr_html, unsafe_allow_html=True)
 
     # ── CONTROL ROW ───────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns([1, 3, 2, 2])
@@ -602,8 +542,8 @@ def render(settings: dict) -> None:
         search = st.text_input("search", placeholder="🔎  Search symbol…  e.g. RELIANCE, TCS",
                                label_visibility="collapsed", key="search_input")
     with c3:
-        hi_prob_only = st.toggle("🎯 Hi Prob", value=False, key="hi_prob_toggle",
-                                 help="trend_up · in_golden · score ≥ 55")
+       hi_prob_only = st.toggle("🎯 Hi Prob", value=False, key="hi_prob_toggle",
+                             help="trend_up · in_golden · score ≥ 55")
     with c4:
         snap_label = st.text_input("snap", placeholder="Snapshot label (optional)",
                                    label_visibility="collapsed", key="snap_input")
@@ -621,41 +561,14 @@ def render(settings: dict) -> None:
             df_raw = run_scanner(
                 symbols=symbols, cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
                 max_workers=workers,
-                atr_prox=atr_prox,
-                pvt_lb=pvt_lb,
-                enable_t1_relax=enable_t1_relax,
-                min_score=min_score,
-                progress_cb=lambda p: prog.progress(p, text=f"Scanning... {int(p*100)}%"),
-                t1s_mom1=settings.get("t1s_mom1", 5.0),
-                t1s_mom3=settings.get("t1s_mom3", 10.0),
-                t1s_mom6=settings.get("t1s_mom6", 15.0),
-                t1r_mom1=settings.get("t1r_mom1", 4.0),
-                t1r_mom3=settings.get("t1r_mom3", 8.0),
-                t1r_mom6=settings.get("t1r_mom6", 12.0),
-                t1r_atr_pctile=settings.get("t1r_atr_pctile", 0.35),
-                t1r_breakout_buf=settings.get("t1r_breakout_buf", 0.03),
-                t2_enabled=settings.get("t2_enabled", True),
-                t2_min_score=settings.get("t2_min_score", 55),
-                t2_fib_score=settings.get("t2_fib_score", 65),
-                t2_cci_score=settings.get("t2_cci_score", 55),
-                t2_sq_len=settings.get("t2_sq_len", 20),
-                t2_sq_mult_bb=settings.get("t2_sq_mult_bb", 2.0),
-                t2_sq_mult_kc=settings.get("t2_sq_mult_kc", 1.5),
-                t2_sq_min_bars=settings.get("t2_sq_min_bars", 5),
-                t2_sq_enabled=settings.get("t2_sq_enabled", True),
-                t2_wvf_len=settings.get("t2_wvf_len", 22),
-                t2_wvf_bb_mult=settings.get("t2_wvf_bb_mult", 2.0),
-                t2_wvf_pctile=settings.get("t2_wvf_pctile", 0.95),
-                t2_wvf_enabled=settings.get("t2_wvf_enabled", True),
-                t2_min_rr=settings.get("t2_min_rr", 1.5),
-                t2_rr_enabled=settings.get("t2_rr_enabled", True),
+                progress_cb=lambda p: prog.progress(p, text=f"Scanning… {int(p*100)}%"),
             )
         prog.empty()
         if df_raw.empty:
             st.warning("No results — check symbols or data source.")
             return
         st.session_state["scan_df"] = df_raw
-        st.session_state["scan_ts"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M")
+        st.session_state["scan_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         st.session_state.setdefault("last_auto_scan", time.time())
         if supabase_ok:
             with st.spinner("Saving snapshot…"):
@@ -684,55 +597,27 @@ def render(settings: dict) -> None:
     _render_metrics(df)
     st.divider()
 
-    # ── SEARCH / HI-PROB FILTER ───────────────────────────────────
+    # ── SEARCH FILTER ─────────────────────────────────────────────
     fdf = df.copy()
     if search.strip():
         fdf = fdf[fdf["Stock"].str.contains(search.strip(), case=False, na=False)]
     if hi_prob_only and "_high_prob" in fdf.columns:
-        fdf = fdf[fdf["_high_prob"] == True]
-
+      fdf = fdf[fdf["_high_prob"] == True]
     # ── PARTITION INTO TIERS ──────────────────────────────────────
     wl_syms_set = set(w["symbol"] for w in st.session_state.get("watchlist", []))
 
-    has_t1 = "_tier1_prime"  in fdf.columns
-    has_ab = "_any_buy"      in fdf.columns
-    has_ts = "_tier1_strict" in fdf.columns
-    has_tr = "_tier1_relax"  in fdf.columns
+    has_t1 = "_tier1_prime" in fdf.columns
+    has_ab = "_any_buy"     in fdf.columns
 
-    # FIX #7: apply tier1_mode to Tier 1 partition
-    # Default mask covers both strict and relaxed (_tier1_prime).
-    # When a specific mode is set, narrow to the relevant sub-flag.
-    if tier1_mode == "strict" and has_ts:
-        mask_t1 = fdf["_tier1_strict"]
-    elif tier1_mode == "relax" and has_tr:
-        mask_t1 = fdf["_tier1_relax"]
-    elif has_t1:
-        # "any", False, or missing sub-flags → use combined flag
-        mask_t1 = fdf["_tier1_prime"]
-    else:
-        mask_t1 = pd.Series(False, index=fdf.index)
+    mask_t1 = fdf["_tier1_prime"] if has_t1 else pd.Series(False, index=fdf.index)
+    mask_ab = fdf["_any_buy"]     if has_ab else pd.Series(False, index=fdf.index)
 
-    mask_ab = fdf["_any_buy"] if has_ab else pd.Series(False, index=fdf.index)
-
-    # FIX #5: AccScore used as sort key for ALL tiers (was T1 only)
     sort_col = "AccScore" if "AccScore" in fdf.columns else "Score"
 
     df_t1 = fdf[mask_t1].sort_values(sort_col, ascending=False)
-    df_t2 = fdf[mask_ab & ~mask_t1].sort_values(sort_col, ascending=False)
-    df_t3 = fdf[fdf["Action"] == "👁 WATCH"].sort_values(sort_col, ascending=False)
-    df_t4 = fdf[fdf["Action"] == "⛔ SKIP"].sort_values(sort_col, ascending=False)
-
-    # FIX #7: show inline caption when Tier 1 is filtered
-    if tier1_mode == "strict":
-        st.caption(
-            "🔽 Tier 1 showing **T1★ only** (strict gate) — "
-            "change in Settings → Signal Filter"
-        )
-    elif tier1_mode == "relax":
-        st.caption(
-            "🔽 Tier 1 showing **T1 (relaxed) only** — "
-            "change in Settings → Signal Filter"
-        )
+    df_t2 = fdf[mask_ab & ~mask_t1].sort_values("Score", ascending=False)
+    df_t3 = fdf[fdf["Action"] == "👁 WATCH"].sort_values("Score", ascending=False)
+    df_t4 = fdf[fdf["Action"] == "⛔ SKIP"].sort_values("Score", ascending=False)
 
     _tier_expander("Tier 1", df_t1, cci_ob, cci_os, wl_syms_set, expanded=True)
     _tier_expander("Tier 2", df_t2, cci_ob, cci_os, wl_syms_set, expanded=False)

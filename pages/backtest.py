@@ -7,8 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime, timezone, timedelta
-IST = timezone(timedelta(hours=5, minutes=30))
+from datetime import datetime
 import plotly.graph_objects as go
 
 from utils.scanner_engine import NIFTY500_SYMBOLS
@@ -31,34 +30,66 @@ def _pnl_color(val):
 
 
 def render(settings=None):
-    # ── Read all parameters from shared settings (set by unified sidebar in app.py)
-    bt_universe   = settings.get("symbols",      NIFTY500_SYMBOLS)
-    bt_tier1_only = settings.get("tier1_mode",   False)
-    bt_min_score  = settings.get("min_score_bt", 70)
-    bt_hold_days  = settings.get("hold_days",    20)
-    bt_cci_len    = settings.get("cci_len",      20)
-    bt_cci_ob     = settings.get("cci_ob",       100)
-    bt_cci_os     = settings.get("cci_os",      -100)
-    bt_atr_prox   = settings.get("atr_prox",     0.3)
-    bt_pvt_lb     = settings.get("pvt_lb",       20)
-    bt_save_db    = settings.get("save_db",      True)
-
     # ── Sidebar ───────────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("### 🧪 Backtest Settings")
+
+        bt_universe = st.multiselect(
+            "Symbols to Backtest", options=NIFTY500_SYMBOLS,
+            default=settings.get("symbols", NIFTY500_SYMBOLS) if settings else NIFTY500_SYMBOLS,
+            key="bt_universe",
+        )
+
+        # ── Tier 1 Prime filter ───────────────────────────────────────────────
+        bt_tier1_only = st.checkbox(
+            "🏆 Tier 1 Prime signals only",
+            value=False,
+            key="bt_tier1_only",
+            help=(
+                "Restrict backtest to signals where ALL 5 structural pillars "
+                "align simultaneously:\n\n"
+                "• trend_up (price > EMA200, EMA20 > EMA50)\n"
+                "• in_golden (price at 50–61.8% fib retracement)\n"
+                "• cci_cross_up_os (CCI crossed up through -100)\n"
+                "• qualified (mom1>5%, mom3>10%, mom6>15%)\n"
+                "• above_cloud (price above Ichimoku cloud)\n\n"
+                "This is the rarest, highest-conviction setup. "
+                "Expect fewer trades but cleaner win-rate data."
+            ),
+        )
+
+        if bt_tier1_only:
+            st.markdown(
+                "<div style='background:#1e1040;border:1px solid #4c1d95;"
+                "border-radius:6px;padding:0.5rem 0.7rem;margin-top:-0.3rem;"
+                "font-size:0.75rem;color:#c4b5fd;line-height:1.5;'>"
+                "⚠️ <b>Tier 1 only</b> — all other buy types are excluded. "
+                "Use Nifty 200 or wider universe to get meaningful sample size."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("---")
+
+        bt_min_score = st.slider("Min Score for Entry", 50, 100, 70, step=5, key="bt_min_score")
+        bt_hold_days = st.slider("Max Hold Days",         5,  60, 20, step=5, key="bt_hold_days")
+        bt_cci_len   = st.number_input("CCI Length",     5,  50,
+                                        st.session_state.get("cci_len", 20), key="bt_cci_len")
+        bt_cci_ob    = st.number_input("CCI Overbought", 50, 300,
+                                        st.session_state.get("cci_ob", 100), key="bt_cci_ob")
+        bt_cci_os    = st.number_input("CCI Oversold",  -300, 0,
+                                        st.session_state.get("cci_os", -100), key="bt_cci_os")
+        bt_save_db   = st.checkbox("💾 Save to Supabase", True, key="bt_save_db")
+
     # ── Header ────────────────────────────────────────────────────────────────
     st.markdown("### 🧪 Backtest Engine")
 
     # Active mode badge
-    _badge_map = {
-        "strict": ("#4c1d95", "#c4b5fd", "🏆 Tier 1 Strict Mode (T1★)"),
-        "relax":  ("#155e75", "#67e8f9", "🥈 Tier 1 Relaxed Mode (T1)"),
-        "any":    ("#14532d", "#86efac", "🏅 Any Tier 1 Mode (T1★ + T1)"),
-    }
-    if bt_tier1_only and bt_tier1_only in _badge_map:
-        _bbg, _bfg, _blabel = _badge_map[bt_tier1_only]
+    if bt_tier1_only:
         st.markdown(
-            f"<div style='display:inline-block;background:{_bbg};color:{_bfg};"
-            f"border-radius:6px;padding:0.3rem 0.8rem;font-size:0.8rem;"
-            f"font-weight:600;margin-bottom:0.5rem;'>{_blabel}</div>",
+            "<div style='display:inline-block;background:#4c1d95;color:#c4b5fd;"
+            "border-radius:6px;padding:0.3rem 0.8rem;font-size:0.8rem;"
+            "font-weight:600;margin-bottom:0.5rem;'>🏆 Tier 1 Prime Mode</div>",
             unsafe_allow_html=True,
         )
 
@@ -74,8 +105,7 @@ def render(settings=None):
     with col_run:
         run_bt = st.button("▶ Run Backtest", use_container_width=True, key="btn_run_bt")
     with col_info:
-        _ml_map = {"strict": "🏆 T1★ Strict only", "relax": "🥈 T1 Relaxed only", "any": "🏅 Any Tier 1"}
-        mode_label = _ml_map.get(bt_tier1_only, f"Min Score: <b>{bt_min_score}</b>")
+        mode_label = "Tier 1 Prime only" if bt_tier1_only else f"Min Score: <b>{bt_min_score}</b>"
         st.markdown(
             f"<div style='padding:0.55rem 0;color:#64748b;font-size:0.78rem;'>"
             f"Symbols: <b>{len(bt_universe)}</b> &nbsp;|&nbsp; "
@@ -104,46 +134,21 @@ def render(settings=None):
         trades_df = run_backtest(
             bt_universe,
             cci_len=int(bt_cci_len), cci_ob=int(bt_cci_ob), cci_os=int(bt_cci_os),
-            min_score=bt_min_score,  hold_days=bt_hold_days,
+            min_score=bt_min_score, hold_days=bt_hold_days,
             workers=settings["workers"],
-            tier1_only=bt_tier1_only,
-            atr_prox=float(bt_atr_prox),
-            pvt_lb=int(bt_pvt_lb),
+            tier1_only=bt_tier1_only,   # ← Tier 1 Prime gate
             progress_cb=_bt_progress,
-            t1s_mom1=settings.get("t1s_mom1", 5.0),
-            t1s_mom3=settings.get("t1s_mom3", 10.0),
-            t1s_mom6=settings.get("t1s_mom6", 15.0),
-            t1r_mom1=settings.get("t1r_mom1", 4.0),
-            t1r_mom3=settings.get("t1r_mom3", 8.0),
-            t1r_mom6=settings.get("t1r_mom6", 12.0),
-            t1r_atr_pctile=settings.get("t1r_atr_pctile", 0.35),
-            t1r_breakout_buf=settings.get("t1r_breakout_buf", 0.03),
-            t2_enabled=settings.get("t2_enabled", True),
-            t2_fib_score=settings.get("t2_fib_score", 65),
-            t2_cci_score=settings.get("t2_cci_score", 55),
-            t2_sq_len=settings.get("t2_sq_len", 20),
-            t2_sq_mult_bb=settings.get("t2_sq_mult_bb", 2.0),
-            t2_sq_mult_kc=settings.get("t2_sq_mult_kc", 1.5),
-            t2_sq_min_bars=settings.get("t2_sq_min_bars", 5),
-            t2_sq_enabled=settings.get("t2_sq_enabled", True),
-            t2_wvf_len=settings.get("t2_wvf_len", 22),
-            t2_wvf_bb_mult=settings.get("t2_wvf_bb_mult", 2.0),
-            t2_wvf_pctile=settings.get("t2_wvf_pctile", 0.95),
-            t2_wvf_enabled=settings.get("t2_wvf_enabled", True),
-            t2_min_rr=settings.get("t2_min_rr", 1.5),
-            t2_rr_enabled=settings.get("t2_rr_enabled", True),
         )
         prog.empty()
         sym_status.empty()
 
         if trades_df.empty:
-            _t1_warn = {
-                "strict": "No T1★ Strict signals found. Expand universe (Nifty 200+) — Strict fires very rarely.",
-                "relax":  "No T1 Relaxed signals found. Try expanding the symbol universe or lowering Min Score.",
-                "any":    "No Tier 1 signals found (Strict or Relaxed). Try a wider universe.",
-            }
-            if bt_tier1_only and bt_tier1_only in _t1_warn:
-                st.warning(_t1_warn[bt_tier1_only])
+            if bt_tier1_only:
+                st.warning(
+                    "No Tier 1 Prime signals found. "
+                    "Try expanding the symbol universe (Nifty 200+) or "
+                    "lowering Min Score. Tier 1 Prime fires very rarely by design."
+                )
             else:
                 st.warning("No trades generated. Try lowering Min Score or adding more symbols.")
             return
@@ -384,6 +389,6 @@ def render(settings=None):
         csv_bt = trades_df.to_csv(index=False)
         st.download_button(
             "⬇️ Download Trade Log CSV", data=csv_bt,
-            file_name=f"backtest_{datetime.now(IST).strftime('%Y%m%d_%H%M')}.csv",
+            file_name=f"backtest_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv", key="btn_dl_bt_csv",
         )
