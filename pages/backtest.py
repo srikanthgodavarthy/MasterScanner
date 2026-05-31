@@ -109,8 +109,6 @@ def render(settings=None):
             tier1_only=bt_tier1_only,
             atr_prox=float(bt_atr_prox),
             pvt_lb=int(bt_pvt_lb),
-            use_regime=settings.get("use_regime", True),
-            enable_t1_relax=settings.get("enable_t1_relax", True),
             progress_cb=_bt_progress,
             t1s_mom1=settings.get("t1s_mom1", 5.0),
             t1s_mom3=settings.get("t1s_mom3", 10.0),
@@ -123,6 +121,17 @@ def render(settings=None):
             t2_enabled=settings.get("t2_enabled", True),
             t2_fib_score=settings.get("t2_fib_score", 65),
             t2_cci_score=settings.get("t2_cci_score", 55),
+            t2_sq_len=settings.get("t2_sq_len", 20),
+            t2_sq_mult_bb=settings.get("t2_sq_mult_bb", 2.0),
+            t2_sq_mult_kc=settings.get("t2_sq_mult_kc", 1.5),
+            t2_sq_min_bars=settings.get("t2_sq_min_bars", 5),
+            t2_sq_enabled=settings.get("t2_sq_enabled", True),
+            t2_wvf_len=settings.get("t2_wvf_len", 22),
+            t2_wvf_bb_mult=settings.get("t2_wvf_bb_mult", 2.0),
+            t2_wvf_pctile=settings.get("t2_wvf_pctile", 0.95),
+            t2_wvf_enabled=settings.get("t2_wvf_enabled", True),
+            t2_min_rr=settings.get("t2_min_rr", 1.5),
+            t2_rr_enabled=settings.get("t2_rr_enabled", True),
         )
         prog.empty()
         sym_status.empty()
@@ -354,54 +363,21 @@ def render(settings=None):
                      "exit_reason","pnl_pct","score_at_entry","cci_at_entry",
                      "sl","t1","t2","tier1_prime"]
         tlog = trades_df[[c for c in show_cols if c in trades_df.columns]].copy()
-        tlog = tlog.sort_values("entry_date", ascending=False).reset_index(drop=True)
-
-        # Rename columns for clarity
-        tlog = tlog.rename(columns={
-            "entry_date":     "Entry Date",
-            "entry_price":    "Entry ₹",
-            "exit_date":      "Exit Date",
-            "exit_price":     "Exit ₹",
-            "exit_reason":    "Exit",
-            "pnl_pct":        "P&L %",
-            "score_at_entry": "Score",
-            "cci_at_entry":   "CCI",
-            "sl":             "Stop ₹",
-            "t1":             "Target 1 ₹",
-            "t2":             "Target 2 ₹",
-            "tier1_prime":    "Grade",
-        })
-
-        # Convert tier1_prime bool → readable grade
-        if "Grade" in tlog.columns:
-            tlog["Grade"] = tlog["Grade"].map(lambda x: "T1★" if x else "T2")
-
-        # Round price columns
-        for col in ["Entry ₹", "Exit ₹", "Stop ₹", "Target 1 ₹", "Target 2 ₹"]:
-            if col in tlog.columns:
-                tlog[col] = tlog[col].round(2)
-
-        # Format P&L
-        if "P&L %" in tlog.columns:
-            tlog["P&L %"] = tlog["P&L %"].round(2)
+        tlog = tlog.sort_values("entry_date", ascending=False)
 
         def _row_bg(row):
-            pnl = row.get("P&L %", 0)
-            color = "#22c55e18" if pnl > 0 else "#ef444418"
-            return [f"background-color:{color}"] * len(row)
-
-        fmt = {"P&L %": "{:.2f}%"}
-        for col in ["Entry ₹", "Exit ₹", "Stop ₹", "Target 1 ₹", "Target 2 ₹"]:
-            if col in tlog.columns:
-                fmt[col] = "{:.2f}"
+            if row.get("tier1_prime", False):
+                return [f"background-color:#2e1065"]*len(row)   # purple tint for T1
+            color = "#22c55e22" if row["pnl_pct"] > 0 else "#ef444422"
+            return [f"background-color:{color}"]*len(row)
 
         styled_log = (
             tlog.style
             .apply(_row_bg, axis=1)
-            .map(_pnl_color, subset=["P&L %"] if "P&L %" in tlog.columns else [])
-            .set_properties(**{"font-family": "'JetBrains Mono',monospace",
-                               "font-size": "0.74rem", "color": "#e2e8f0"})
-            .format(fmt)
+            .map(_pnl_color, subset=["pnl_pct"])
+            .set_properties(**{"font-family":"'JetBrains Mono',monospace",
+                               "font-size":"0.74rem","color":"#e2e8f0"})
+            .format({"pnl_pct":"{}%"})
         )
         st.dataframe(styled_log, use_container_width=True, height=400)
 

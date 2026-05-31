@@ -625,7 +625,6 @@ def render(settings: dict) -> None:
                 pvt_lb=pvt_lb,
                 enable_t1_relax=enable_t1_relax,
                 min_score=min_score,
-                use_regime=settings.get("use_regime", True),
                 progress_cb=lambda p: prog.progress(p, text=f"Scanning... {int(p*100)}%"),
                 t1s_mom1=settings.get("t1s_mom1", 5.0),
                 t1s_mom3=settings.get("t1s_mom3", 10.0),
@@ -639,6 +638,17 @@ def render(settings: dict) -> None:
                 t2_min_score=settings.get("t2_min_score", 55),
                 t2_fib_score=settings.get("t2_fib_score", 65),
                 t2_cci_score=settings.get("t2_cci_score", 55),
+                t2_sq_len=settings.get("t2_sq_len", 20),
+                t2_sq_mult_bb=settings.get("t2_sq_mult_bb", 2.0),
+                t2_sq_mult_kc=settings.get("t2_sq_mult_kc", 1.5),
+                t2_sq_min_bars=settings.get("t2_sq_min_bars", 5),
+                t2_sq_enabled=settings.get("t2_sq_enabled", True),
+                t2_wvf_len=settings.get("t2_wvf_len", 22),
+                t2_wvf_bb_mult=settings.get("t2_wvf_bb_mult", 2.0),
+                t2_wvf_pctile=settings.get("t2_wvf_pctile", 0.95),
+                t2_wvf_enabled=settings.get("t2_wvf_enabled", True),
+                t2_min_rr=settings.get("t2_min_rr", 1.5),
+                t2_rr_enabled=settings.get("t2_rr_enabled", True),
             )
         prog.empty()
         if df_raw.empty:
@@ -672,18 +682,6 @@ def render(settings: dict) -> None:
 
     # ── METRICS ───────────────────────────────────────────────────
     _render_metrics(df)
-
-    # ── NIFTY REGIME BANNER ───────────────────────────────────────
-    if "_nifty_bearish" in df.columns and df["_nifty_bearish"].any():
-        st.error(
-            "🔴 **Nifty regime: BEARISH** — Nifty is below both EMA50 and EMA200. "            "Only T1★ (strict, all-5-pillar) setups are shown in Tier 1. "            "Tier 2 is blocked. Valid signals appear in Tier 3 as Watch candidates.",
-            icon=None,
-        )
-    elif "_nifty_choppy" in df.columns and df["_nifty_choppy"].any():
-        st.warning(
-            "⚠️ **Nifty regime: CHOPPY** — Nifty is below EMA50 but above EMA200. "            "Tier 1 signals are active. Tier 2 requires score ≥ 70. "            "Lower-score setups appear in Tier 3 as Watch candidates.",
-            icon=None,
-        )
     st.divider()
 
     # ── SEARCH / HI-PROB FILTER ───────────────────────────────────
@@ -721,9 +719,7 @@ def render(settings: dict) -> None:
 
     df_t1 = fdf[mask_t1].sort_values(sort_col, ascending=False)
     df_t2 = fdf[mask_ab & ~mask_t1].sort_values(sort_col, ascending=False)
-    # Tier 3: WATCH-action stocks OR regime-suppressed signals (Tier col == "Tier 3")
-    mask_t3 = (fdf["Action"] == "👁 WATCH") | (fdf.get("Tier", pd.Series("", index=fdf.index)) == "Tier 3")
-    df_t3 = fdf[mask_t3 & ~mask_t1 & ~mask_ab].sort_values(sort_col, ascending=False)
+    df_t3 = fdf[fdf["Action"] == "👁 WATCH"].sort_values(sort_col, ascending=False)
     df_t4 = fdf[fdf["Action"] == "⛔ SKIP"].sort_values(sort_col, ascending=False)
 
     # FIX #7: show inline caption when Tier 1 is filtered
