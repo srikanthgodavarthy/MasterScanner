@@ -746,8 +746,8 @@ def score_stock(
     _prov_en  = cur_c
     _prov_sl  = _prov_en - cur_atr * 3.0 * 0.85
     _prov_rk  = max(_prov_en - _prov_sl, cur_atr * 0.5)
-    _prov_t1  = _prov_en + _prov_rk
-    _rr_ratio = _prov_rk / max(_prov_en - _prov_sl, 0.01)
+    _prov_t2  = _prov_en + _prov_rk * 2          # reward = 2R (T2 target)
+    _rr_ratio = (_prov_t2 - _prov_en) / max(_prov_rk, 0.01)   # = reward / risk
     yield_ok  = (not t2_rr_enabled) or (_rr_ratio >= t2_min_rr)
 
     any_buy = _t2_signals and allow_cloud_buy and cur_cci <= cci_ob and nifty_trending and yield_ok
