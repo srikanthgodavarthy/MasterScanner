@@ -402,8 +402,20 @@ def score_stock(
     t2_min_score:     int   = 55,
     t2_fib_score:     int   = 65,
     t2_cci_score:     int   = 55,
-    # Regime
-    use_regime:       bool  = True,
+    # Tier 2 — Squeeze
+    t2_sq_len:        int   = 20,    # BB/KC lookback
+    t2_sq_mult_bb:    float = 2.0,   # BB std multiplier
+    t2_sq_mult_kc:    float = 1.5,   # KC ATR multiplier
+    t2_sq_min_bars:   int   = 5,     # min squeeze bars before sq_in fires
+    t2_sq_enabled:    bool  = True,
+    # Tier 2 — WVF
+    t2_wvf_len:       int   = 22,    # WVF highest-close lookback
+    t2_wvf_bb_mult:   float = 2.0,   # WVF Bollinger mult
+    t2_wvf_pctile:    float = 0.95,  # WVF percentile rank threshold
+    t2_wvf_enabled:   bool  = True,
+    # Tier 2 — Yield (R:R gate)
+    t2_min_rr:        float = 1.5,   # minimum reward:risk ratio
+    t2_rr_enabled:    bool  = True,
 ) -> dict:
     """
     Full port of Pine Script f() scoring + all signal logic.
@@ -435,6 +447,35 @@ def score_stock(
     atr_sma20  = sma(atr_val, 20)   # 20-bar ATR mean for contraction filter
     atr_roll50 = atr_val.rolling(50).rank(pct=True)  # ATR percentile over 50 bars
 
+    # ── SQUEEZE MOMENTUM (TTM Squeeze) ──────────────────────────
+    # BB upper/lower
+    _sq_mid  = sma(c, t2_sq_len)
+    _sq_std  = c.rolling(t2_sq_len).std(ddof=0)
+    _bb_up   = _sq_mid + t2_sq_mult_bb * _sq_std
+    _bb_dn   = _sq_mid - t2_sq_mult_bb * _sq_std
+    # KC upper/lower (uses ATR)
+    _kc_atr  = atr(h, l, c, t2_sq_len)
+    _kc_up   = _sq_mid + t2_sq_mult_kc * _kc_atr
+    _kc_dn   = _sq_mid - t2_sq_mult_kc * _kc_atr
+    # Squeeze state: True = BB inside KC (compression), False = released
+    _sq_on   = (_bb_up < _kc_up) & (_bb_dn > _kc_dn)
+    # Momentum histogram: linear-regression residual of (close - mid_kc)
+    _kc_mid  = (_kc_up + _kc_dn) / 2.0
+    _delta   = c - _kc_mid
+    _sq_mom  = _delta.rolling(t2_sq_len).apply(
+        lambda x: np.polyfit(range(len(x)), x, 1)[0] * (len(x)-1) + np.polyfit(range(len(x)), x, 1)[1],
+        raw=True
+    )
+
+    # ── WILLIAMS VIX FIX (WVF) ──────────────────────────────────
+    # WVF = (highest_close_N - low) / highest_close_N * 100
+    _hc_n   = c.rolling(t2_wvf_len).max()
+    _wvf    = (_hc_n - l) / _hc_n * 100.0
+    _wvf_bb_mid = sma(_wvf, t2_sq_len)
+    _wvf_bb_std = _wvf.rolling(t2_sq_len).std(ddof=0)
+    _wvf_bb_up  = _wvf_bb_mid + t2_wvf_bb_mult * _wvf_bb_std
+    _wvf_prank  = _wvf.rolling(50).rank(pct=True)
+
     # Ichimoku
     tenkan, kijun, senkou_a, senkou_b = ichimoku(h, l)
     cloud_top    = pd.concat([senkou_a, senkou_b], axis=1).max(axis=1)
@@ -457,6 +498,32 @@ def score_stock(
     cur_atr_sma20  = float(atr_sma20.iloc[-1])  if not np.isnan(float(atr_sma20.iloc[-1]))  else cur_atr
     cur_atr_pctile = float(atr_roll50.iloc[-1]) if not np.isnan(float(atr_roll50.iloc[-1])) else 0.5
 
+    # Squeeze current values
+    cur_sq_on    = bool(_sq_on.iloc[-1])
+    prev_sq_on   = bool(_sq_on.iloc[-2]) if len(_sq_on) >= 2 else cur_sq_on
+    cur_sq_mom   = float(_sq_mom.iloc[-1])   if not np.isnan(float(_sq_mom.iloc[-1]))   else 0.0
+    prev_sq_mom  = float(_sq_mom.iloc[-2])   if not np.isnan(float(_sq_mom.iloc[-2]))   else 0.0
+    # Count consecutive squeeze bars
+    sq_bar_count = int((_sq_on[::-1]).cumsum().idxmax() if _sq_on.any() else 0)
+    try:
+        _rev = _sq_on.iloc[::-1].reset_index(drop=True)
+        sq_bar_count = int(_rev[~_rev].index[0]) if (~_rev).any() else len(_rev)
+    except Exception:
+        sq_bar_count = 0
+
+    # sq_off_bull: squeeze just released AND momentum positive and rising
+    sq_off_bull  = (not cur_sq_on) and prev_sq_on and cur_sq_mom > 0 and cur_sq_mom > prev_sq_mom
+    # sq_in: currently in squeeze AND momentum positive (coiling bullishly)
+    sq_in        = cur_sq_on and cur_sq_mom > 0 and sq_bar_count >= t2_sq_min_bars and trend_up
+
+    # WVF current values
+    cur_wvf      = float(_wvf.iloc[-1])       if not np.isnan(float(_wvf.iloc[-1]))      else 0.0
+    prev_wvf     = float(_wvf.iloc[-2])       if not np.isnan(float(_wvf.iloc[-2]))      else 0.0
+    cur_wvf_bb   = float(_wvf_bb_up.iloc[-1]) if not np.isnan(float(_wvf_bb_up.iloc[-1])) else 0.0
+    cur_wvf_prk  = float(_wvf_prank.iloc[-1]) if not np.isnan(float(_wvf_prank.iloc[-1])) else 0.0
+    # WVF bottom: spike above BB (high fear) then falls back below — capitulation reversal
+    wvf_bottom   = (prev_wvf > cur_wvf_bb) and (cur_wvf < cur_wvf_bb) and trend_up and (cur_wvf_prk >= t2_wvf_pctile)
+
     ct   = float(cloud_top.iloc[-1])
     cb   = float(cloud_bottom.iloc[-1])
     above_cloud  = cur_c > ct
@@ -469,20 +536,12 @@ def score_stock(
     trend_down = cur_c < cur_e200 and cur_e20 < cur_e50
 
     # ── NIFTY REGIME FILTER ──────────────────────────────────────
-    # Three-state regime: trending / choppy / bearish.
-    #   trending  — Nifty > EMA50 > EMA200         (full signals)
-    #   choppy    — Nifty < EMA50 but > EMA200     (T1 allowed; T2 needs higher score)
-    #   bearish   — Nifty < EMA50 and < EMA200     (T1★ only; T2 blocked)
-    _n_idx    = _strip_tz(nifty.index)
-    _n_ser    = nifty.copy(); _n_ser.index = _n_idx
-    _n_e50    = _n_ser.ewm(span=50, adjust=False).mean()
-    _n_e200   = _n_ser.ewm(span=200, adjust=False).mean()
-    _n_last   = float(_n_ser.iloc[-1])
-    _n_e50v   = float(_n_e50.iloc[-1])
-    _n_e200v  = float(_n_e200.iloc[-1])
-    nifty_trending = _n_last > _n_e50v                          # above EMA50
-    nifty_bearish  = _n_last < _n_e50v and _n_last < _n_e200v  # below both EMAs
-    nifty_choppy   = _n_last < _n_e50v and not nifty_bearish   # below EMA50 only
+    # Only allow signals when Nifty is in a trending phase (above its EMA50).
+    # Suppresses entries during choppy/rotational market phases.
+    _n_idx   = _strip_tz(nifty.index)
+    _n_ser   = nifty.copy(); _n_ser.index = _n_idx
+    _n_e50   = _n_ser.ewm(span=50, adjust=False).mean()
+    nifty_trending = float(_n_ser.iloc[-1]) > float(_n_e50.iloc[-1])
 
     # ── RELATIVE STRENGTH vs Nifty (blended 5-bar + 20-bar) ────────
     _c_index      = _strip_tz(c.index)
@@ -501,66 +560,11 @@ def score_stock(
             rs   = 0.4 * rs5 + 0.6 * rs20   # blend: 40% short-term, 60% medium-term
     rs = 0.0 if np.isnan(rs) else rs
 
-    # ── FIBONACCI LEVELS — alternating pivot detection ────────────
-    # Uses proper swing pivot logic (high must come after low) so the
-    # measured range is always a genuine upswing, not a random lookback
-    # max/min that could span a downswing.
-    lookback   = min(pvt_lb * 3, len(c) - 1)
-    _tol_abs   = cur_atr * 0.15          # swing tolerance: 0.15 × ATR (Swing mode)
-    _wing      = 4                        # pivot wing width
-
-    # Find alternating swing pivots over the lookback window
-    _h_arr = h.iloc[-lookback:].values.astype(float)
-    _l_arr = l.iloc[-lookback:].values.astype(float)
-    _mid   = (_h_arr + _l_arr) / 2.0
-    _n     = len(_mid)
-
-    _raw_pivots: list = []
-    for _i in range(_wing, _n - _wing):
-        _w = _mid[_i - _wing: _i + _wing + 1]
-        if _mid[_i] >= np.max(_w) - _tol_abs:
-            _raw_pivots.append((_i, float(_h_arr[_i]), "H"))
-        elif _mid[_i] <= np.min(_w) + _tol_abs:
-            _raw_pivots.append((_i, float(_l_arr[_i]), "L"))
-
-    # Enforce alternating H/L — keep the stronger pivot on runs of same type
-    _alt: list = []
-    for _p in _raw_pivots:
-        if _alt and _alt[-1][2] == _p[2]:
-            if (_p[2] == "H" and _p[1] > _alt[-1][1]) or \
-               (_p[2] == "L" and _p[1] < _alt[-1][1]):
-                _alt[-1] = _p
-        else:
-            _alt.append(_p)
-
-    # Find the most recent valid swing: last H preceded by an L
-    sw_hi = sw_lo = fib_rng = None
-    _sw_hi_idx = _sw_lo_idx = None
-    for _k in range(len(_alt) - 1, 0, -1):
-        if _alt[_k][2] == "H":
-            # Look for preceding L
-            for _j in range(_k - 1, -1, -1):
-                if _alt[_j][2] == "L":
-                    _candidate_hi  = _alt[_k][1]
-                    _candidate_lo  = _alt[_j][1]
-                    _candidate_rng = _candidate_hi - _candidate_lo
-                    if _candidate_rng >= cur_atr * 0.5:   # meaningful swing only
-                        sw_hi      = _candidate_hi
-                        sw_lo      = _candidate_lo
-                        fib_rng    = _candidate_rng
-                        _sw_hi_idx = _alt[_k][0]          # relative to lookback window
-                        _sw_lo_idx = _alt[_j][0]
-                    break
-            if sw_hi is not None:
-                break
-
-    # Fallback to simple max/min if no valid alternating swing found
-    if sw_hi is None:
-        sw_hi   = float(h.iloc[-lookback:].max())
-        sw_lo   = float(l.iloc[-lookback:].min())
-        fib_rng = sw_hi - sw_lo
-        _sw_hi_idx = None
-        _sw_lo_idx = None
+    # ── FIBONACCI LEVELS ─────────────────────────────────────────
+    lookback = min(pvt_lb * 3, len(c) - 1)
+    sw_hi    = float(h.iloc[-lookback:].max())
+    sw_lo    = float(l.iloc[-lookback:].min())
+    fib_rng  = sw_hi - sw_lo
 
     fib236     = sw_hi - fib_rng * 0.236
     fib382     = sw_hi - fib_rng * 0.382
@@ -582,62 +586,6 @@ def score_stock(
 
     near_ext127 = abs(cur_c - fib_ext127) < cur_atr * atr_prox
     near_ext161 = abs(cur_c - fib_ext161) < cur_atr * atr_prox
-
-    # ── FIB PULLBACK QUALITY ──────────────────────────────────────
-    # Only meaningful when we have a valid alternating swing
-    fib_quality      = 0
-    fib_grade        = "POOR"
-    fib_depth_ok     = False
-    fib_vol_ok       = False
-    fib_recovery_ok  = False
-    fib_level_label  = "—"
-
-    if _sw_hi_idx is not None and _sw_lo_idx is not None and fib_rng > 0:
-        # Slice arrays relative to the lookback window start
-        _post_hi_h   = _h_arr[_sw_hi_idx:]
-        _post_hi_l   = _l_arr[_sw_hi_idx:]
-        _post_hi_c   = c.iloc[-lookback:].values[_sw_hi_idx:]
-        _post_hi_v   = v.iloc[-lookback:].values[_sw_hi_idx:].astype(float)
-        _adv_v_slice = v.iloc[-lookback:].values[_sw_lo_idx: _sw_hi_idx + 1].astype(float)
-
-        if len(_post_hi_l) > 0 and len(_adv_v_slice) > 0:
-            _post_lo   = float(np.min(_post_hi_l))
-            _post_cl   = float(c.iloc[-1])
-            _tol_pct   = (_tol_abs / fib_rng) * 100
-            _depth_pct = (sw_hi - _post_lo) / fib_rng * 100
-
-            # Depth score
-            def _in_zone(lo_p, hi_p):
-                return (lo_p - _tol_pct) <= _depth_pct <= (hi_p + _tol_pct)
-            if _in_zone(38.2, 50.0):   _ds = 40; fib_depth_ok = True;  fib_level_label = "38.2–50%"
-            elif _in_zone(50.0, 61.8): _ds = 30; fib_depth_ok = True;  fib_level_label = "50–61.8%"
-            elif _in_zone(23.6, 38.2): _ds = 15; fib_depth_ok = False; fib_level_label = "23.6–38.2%"
-            elif _in_zone(61.8, 78.6): _ds = 10; fib_depth_ok = False; fib_level_label = "61.8–78.6%"
-            else:                      _ds = 0;  fib_depth_ok = False; fib_level_label = "Outside"
-
-            # Volume score — pullback vol vs advance vol
-            _adv_v_mean = float(np.mean(_adv_v_slice)) if len(_adv_v_slice) > 0 else 1.0
-            _pb_v_mean  = float(np.mean(_post_hi_v))   if len(_post_hi_v) > 0   else _adv_v_mean
-            _vr         = _pb_v_mean / (_adv_v_mean + 1e-10)
-            _vs         = 30 if _vr <= 0.60 else (20 if _vr <= 0.75 else (10 if _vr <= 0.90 else 0))
-            fib_vol_ok  = _vr <= 0.75
-
-            # Recovery score — has price closed back above Fib500?
-            _overshoot = max(0.0, fib500 - _post_lo)
-            if _post_cl > fib500 - _tol_abs and _overshoot <= _tol_abs * 2:
-                _rs = 30; fib_recovery_ok = True
-            elif _post_cl > fib618 - _tol_abs:
-                _rs = 15; fib_recovery_ok = False
-            else:
-                _rs = 0;  fib_recovery_ok = False
-
-            fib_quality = _ds + _vs + _rs
-            fib_grade   = (
-                "EXCELLENT" if fib_quality >= 80 else
-                "GOOD"      if fib_quality >= 60 else
-                "FAIR"      if fib_quality >= 40 else
-                "POOR"
-            )
 
     # ── CCI SIGNALS ───────────────────────────────────────────────
     cci_cross_up_os = prev_cci <= cci_os and cur_cci > cci_os
@@ -702,8 +650,8 @@ def score_stock(
 
     strong_htf_relax = mom1 > t1r_mom1 and mom3 > t1r_mom3 and mom6 > t1r_mom6
     trend_relax      = (
-        cur_c > cur_e200 and             # hard: must be above EMA200, no buffer
-        cur_e20 > cur_e50                # confirmed golden cross only, no buffer
+        cur_c > cur_e200 * 0.97 and      # 3% buffer below EMA200
+        cur_e20 > cur_e50 * 0.995         # 0.5% buffer — catches imminent golden cross
     )
     qualified_relax  = (
         strong_htf_relax and
@@ -726,12 +674,6 @@ def score_stock(
     bull_score += (15 if rs > 0 else 5 if rs > -0.005 else 0)
     bull_score += 30 if in_golden else 0
     bull_score += -20 if near_ext127 else (-30 if near_ext161 else 0)
-
-    # Fib pullback quality bonus — rewards proper retracement structure
-    # EXCELLENT(≥80): +20  GOOD(≥60): +12  FAIR(≥40): +5  POOR: 0
-    bull_score += (20 if fib_quality >= 80 else
-                   12 if fib_quality >= 60 else
-                    5 if fib_quality >= 40 else 0)
     bull_score += (20 if cur_cci < cci_os else 10 if cur_cci < 0 else -15 if cci_extended else 0)
     bull_score += 15 if cci_cross_up_os else 0
     bull_score -= 10 if cci_extended else 0
@@ -773,7 +715,7 @@ def score_stock(
     )
 
     # ── NORMALISE ─────────────────────────────────────────────────
-    max_score  = 195   # +20 added for Fib quality bonus (EXCELLENT grade)
+    max_score  = 175
     norm_score = min(100, int(bull_score * 100 / max_score))
 
     # ── ADAPTIVE SCORE THRESHOLD ──────────────────────────────────
@@ -792,40 +734,34 @@ def score_stock(
 
     allow_cloud_buy = above_cloud or (inside_cloud and norm_score >= 65)
 
-    _t2_signals = is_fib_buy or is_abcd_buy or is_harm_buy or is_norm_buy or is_cci_buy
-    _raw_signal = _t2_signals and allow_cloud_buy and cur_cci <= cci_ob
+    # ── TIER 2 NEW SIGNALS ───────────────────────────────────────
+    is_sq_in       = t2_sq_enabled  and sq_in       and trend_up and allow_cloud
+    is_sq_off_bull = t2_sq_enabled  and sq_off_bull  and trend_up and allow_cloud
+    is_wvf_bottom  = t2_wvf_enabled and wvf_bottom
 
-    # ── REGIME-AWARE SIGNAL GATE ──────────────────────────────────
-    # trending  → full signals for T1 and T2
-    # choppy    → T1 always allowed; T2 requires higher score (≥70) for caution
-    # bearish   → T1★ (strict) only; T2 blocked entirely
-    # When use_regime=False, bypass all regime gates (treat as always trending)
-    if use_regime:
-        t2_regime_ok = (
-            nifty_trending or                                  # full green
-            (nifty_choppy and norm_score >= 70)                # choppy: raise bar for T2
-        )
-        t1_regime_ok = not nifty_bearish
-    else:
-        t2_regime_ok = True
-        t1_regime_ok = True
+    _t2_signals = (is_fib_buy or is_abcd_buy or is_harm_buy or is_norm_buy or is_cci_buy
+                   or is_sq_in or is_sq_off_bull or is_wvf_bottom)
 
-    any_buy        = _raw_signal and t2_regime_ok
-    any_buy_signal = _raw_signal   # raw, for display purposes
+    # ── YIELD GATE (R:R filter applied after signal) ──────────────
+    # Compute provisional levels for gate check (uses same ATR formula as final levels)
+    _prov_en  = cur_c
+    _prov_sl  = _prov_en - cur_atr * 3.0 * 0.85
+    _prov_rk  = max(_prov_en - _prov_sl, cur_atr * 0.5)
+    _prov_t1  = _prov_en + _prov_rk
+    _rr_ratio = _prov_rk / max(_prov_en - _prov_sl, 0.01)
+    yield_ok  = (not t2_rr_enabled) or (_rr_ratio >= t2_min_rr)
+
+    any_buy = _t2_signals and allow_cloud_buy and cur_cci <= cci_ob and nifty_trending and yield_ok
 
     # ── TIER CLASSIFICATION ───────────────────────────────────────
-    # Tier 1  — strict OR relaxed T1 prime gate fires (regime: not bearish)
-    # Tier 2  — valid buy signal, regime-gated
-    # Tier 3  — valid signals present but regime-suppressed → Watch
+    # Tier 1  — strict OR relaxed T1 prime gate fires
+    # Tier 2  — any valid buy signal
     # Other   — watch / skip
-    is_tier1_prime = (is_tier1_prime_strict or is_tier1_prime_relax) and t1_regime_ok
-    # In bearish regime, T1★ still allowed (it has the strongest stock-level filters)
-    is_tier1_prime = is_tier1_prime or (is_tier1_prime_strict and nifty_bearish)
+    is_tier1_prime = is_tier1_prime_strict or is_tier1_prime_relax
 
     tier = (
         "Tier 1" if is_tier1_prime else
         "Tier 2" if any_buy        else
-        "Tier 3" if any_buy_signal else   # regime-suppressed: Watch
         "Other"
     )
 
@@ -875,12 +811,15 @@ def score_stock(
     qual_icon = "⭐" if (qualified and any_buy) else ("✔" if qualified else ("✦" if qualified_relax else "✖"))
 
     buy_type = (
-        "Fib+CCI" if is_fib_buy_cci  else
-        "Fib"     if is_fib_buy_base else
-        "Harm"    if is_harm_buy      else
-        "ABCD"    if is_abcd_buy      else
-        "CCI"     if is_cci_buy       else
-        "Norm"    if is_norm_buy      else "-"
+        "Fib+CCI"    if is_fib_buy_cci   else
+        "Fib"        if is_fib_buy_base  else
+        "Harm"       if is_harm_buy       else
+        "ABCD"       if is_abcd_buy       else
+        "SqOff"      if is_sq_off_bull    else
+        "SqIn"       if is_sq_in          else
+        "WVF"        if is_wvf_bottom     else
+        "CCI"        if is_cci_buy        else
+        "Norm"       if is_norm_buy       else "-"
     )
 
     prev_close = float(c.iloc[-2]) if len(c) >= 2 else cur_c
@@ -921,6 +860,9 @@ def score_stock(
     is_t2_cci_break   = is_cci_buy and not in_golden
     is_t2_norm_strong = is_norm_buy and norm_score >= 75
     is_t2_norm        = is_norm_buy
+    is_t2_sq_in       = is_sq_in
+    is_t2_sq_off      = is_sq_off_bull
+    is_t2_wvf         = is_wvf_bottom
 
     near_golden = (
         not in_golden and
@@ -957,6 +899,9 @@ def score_stock(
             "CCI Break"   if is_t2_cci_break   else
             "Norm Strong" if is_t2_norm_strong else
             "Norm Buy"    if is_t2_norm        else
+            "SqOff Bull"  if is_t2_sq_off      else
+            "Sq In"       if is_t2_sq_in       else
+            "WVF Bottom"  if is_t2_wvf         else
             "Buy"
         )
     elif norm_score >= 50:
@@ -1007,12 +952,6 @@ def score_stock(
         "_high_prob":           high_prob_buy,
         "_in_golden":           in_golden,
         "_in_golden_relaxed":   in_golden_relaxed,
-        "_fib_quality":         fib_quality,
-        "_fib_grade":           fib_grade,
-        "_fib_depth_ok":        fib_depth_ok,
-        "_fib_vol_ok":          fib_vol_ok,
-        "_fib_recovery_ok":     fib_recovery_ok,
-        "_fib_level":           fib_level_label,
         "_in_golden_cci":       in_golden_cci,
         "_above_cloud":         above_cloud,
         "_inside_cloud":        inside_cloud,
@@ -1020,10 +959,6 @@ def score_stock(
         "_harm_bull":           harm_bull,
         "_abcd_bull":           abcd_bull,
         "_any_buy":             any_buy,
-        "_any_buy_signal":      any_buy_signal,
-        "_nifty_trending":      nifty_trending,
-        "_nifty_choppy":        nifty_choppy,
-        "_nifty_bearish":       nifty_bearish,
         "_tier1_strict":        is_tier1_prime_strict,
         "_tier1_relax":         is_tier1_prime_relax,
         "_tier1_prime":         is_tier1_prime,
@@ -1034,6 +969,15 @@ def score_stock(
         "_t2_harmonic":         is_t2_harmonic,
         "_t2_abcd":             is_t2_abcd,
         "_t2_cci_break":        is_t2_cci_break,
+        "_t2_sq_in":            is_t2_sq_in,
+        "_t2_sq_off":           is_t2_sq_off,
+        "_t2_wvf":              is_t2_wvf,
+        "_sq_bar_count":        sq_bar_count,
+        "_sq_mom":              round(cur_sq_mom, 4),
+        "_wvf":                 round(cur_wvf, 2),
+        "_wvf_prank":           round(cur_wvf_prk, 2),
+        "_rr_ratio":            round(_rr_ratio, 2),
+        "_yield_ok":            yield_ok,
         "_t3_near_golden":      near_golden,
         "_t3_cci_rec":          cci_recovering,
         "_t3_cloud_test":       cloud_test,
@@ -1081,7 +1025,6 @@ def run_scanner(
     t2_min_score:     int   = 55,
     t2_fib_score:     int   = 65,
     t2_cci_score:     int   = 55,
-    use_regime:       bool  = True,
 ) -> pd.DataFrame:
     """
     Two-phase scanner:
@@ -1118,7 +1061,6 @@ def run_scanner(
             cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
             pvt_lb=pvt_lb,   atr_prox=atr_prox,
             enable_t1_relax=enable_t1_relax,
-            use_regime=use_regime,
             t1s_mom1=t1s_mom1, t1s_mom3=t1s_mom3, t1s_mom6=t1s_mom6,
             t1r_mom1=t1r_mom1, t1r_mom3=t1r_mom3, t1r_mom6=t1r_mom6,
             t1r_atr_pctile=t1r_atr_pctile, t1r_breakout_buf=t1r_breakout_buf,
