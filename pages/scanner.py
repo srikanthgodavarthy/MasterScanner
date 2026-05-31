@@ -671,6 +671,18 @@ def render(settings: dict) -> None:
 
     # ── METRICS ───────────────────────────────────────────────────
     _render_metrics(df)
+
+    # ── NIFTY REGIME BANNER ───────────────────────────────────────
+    if "_nifty_bearish" in df.columns and df["_nifty_bearish"].any():
+        st.error(
+            "🔴 **Nifty regime: BEARISH** — Nifty is below both EMA50 and EMA200. "            "Only T1★ (strict, all-5-pillar) setups are shown in Tier 1. "            "Tier 2 is blocked. Valid signals appear in Tier 3 as Watch candidates.",
+            icon=None,
+        )
+    elif "_nifty_choppy" in df.columns and df["_nifty_choppy"].any():
+        st.warning(
+            "⚠️ **Nifty regime: CHOPPY** — Nifty is below EMA50 but above EMA200. "            "Tier 1 signals are active. Tier 2 requires score ≥ 70. "            "Lower-score setups appear in Tier 3 as Watch candidates.",
+            icon=None,
+        )
     st.divider()
 
     # ── SEARCH / HI-PROB FILTER ───────────────────────────────────
@@ -708,7 +720,9 @@ def render(settings: dict) -> None:
 
     df_t1 = fdf[mask_t1].sort_values(sort_col, ascending=False)
     df_t2 = fdf[mask_ab & ~mask_t1].sort_values(sort_col, ascending=False)
-    df_t3 = fdf[fdf["Action"] == "👁 WATCH"].sort_values(sort_col, ascending=False)
+    # Tier 3: WATCH-action stocks OR regime-suppressed signals (Tier col == "Tier 3")
+    mask_t3 = (fdf["Action"] == "👁 WATCH") | (fdf.get("Tier", pd.Series("", index=fdf.index)) == "Tier 3")
+    df_t3 = fdf[mask_t3 & ~mask_t1 & ~mask_ab].sort_values(sort_col, ascending=False)
     df_t4 = fdf[fdf["Action"] == "⛔ SKIP"].sort_values(sort_col, ascending=False)
 
     # FIX #7: show inline caption when Tier 1 is filtered
