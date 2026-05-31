@@ -7,7 +7,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+IST = timezone(timedelta(hours=5, minutes=30))
 import plotly.graph_objects as go
 
 from utils.scanner_engine import NIFTY500_SYMBOLS
@@ -109,6 +110,17 @@ def render(settings=None):
             atr_prox=float(bt_atr_prox),
             pvt_lb=int(bt_pvt_lb),
             progress_cb=_bt_progress,
+            t1s_mom1=settings.get("t1s_mom1", 5.0),
+            t1s_mom3=settings.get("t1s_mom3", 10.0),
+            t1s_mom6=settings.get("t1s_mom6", 15.0),
+            t1r_mom1=settings.get("t1r_mom1", 4.0),
+            t1r_mom3=settings.get("t1r_mom3", 8.0),
+            t1r_mom6=settings.get("t1r_mom6", 12.0),
+            t1r_atr_pctile=settings.get("t1r_atr_pctile", 0.35),
+            t1r_breakout_buf=settings.get("t1r_breakout_buf", 0.03),
+            t2_enabled=settings.get("t2_enabled", True),
+            t2_fib_score=settings.get("t2_fib_score", 65),
+            t2_cci_score=settings.get("t2_cci_score", 55),
         )
         prog.empty()
         sym_status.empty()
@@ -361,6 +373,6 @@ def render(settings=None):
         csv_bt = trades_df.to_csv(index=False)
         st.download_button(
             "⬇️ Download Trade Log CSV", data=csv_bt,
-            file_name=f"backtest_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            file_name=f"backtest_{datetime.now(IST).strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv", key="btn_dl_bt_csv",
         )

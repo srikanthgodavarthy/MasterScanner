@@ -25,7 +25,8 @@ Bottom sticky pill bar: live signal counts.
 import streamlit as st
 import pandas as pd
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+IST = timezone(timedelta(hours=5, minutes=30))
 
 from utils.scanner_engine import (
     run_scanner,
@@ -625,13 +626,25 @@ def render(settings: dict) -> None:
                 enable_t1_relax=enable_t1_relax,
                 min_score=min_score,
                 progress_cb=lambda p: prog.progress(p, text=f"Scanning... {int(p*100)}%"),
+                t1s_mom1=settings.get("t1s_mom1", 5.0),
+                t1s_mom3=settings.get("t1s_mom3", 10.0),
+                t1s_mom6=settings.get("t1s_mom6", 15.0),
+                t1r_mom1=settings.get("t1r_mom1", 4.0),
+                t1r_mom3=settings.get("t1r_mom3", 8.0),
+                t1r_mom6=settings.get("t1r_mom6", 12.0),
+                t1r_atr_pctile=settings.get("t1r_atr_pctile", 0.35),
+                t1r_breakout_buf=settings.get("t1r_breakout_buf", 0.03),
+                t2_enabled=settings.get("t2_enabled", True),
+                t2_min_score=settings.get("t2_min_score", 55),
+                t2_fib_score=settings.get("t2_fib_score", 65),
+                t2_cci_score=settings.get("t2_cci_score", 55),
             )
         prog.empty()
         if df_raw.empty:
             st.warning("No results — check symbols or data source.")
             return
         st.session_state["scan_df"] = df_raw
-        st.session_state["scan_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        st.session_state["scan_ts"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M")
         st.session_state.setdefault("last_auto_scan", time.time())
         if supabase_ok:
             with st.spinner("Saving snapshot…"):
