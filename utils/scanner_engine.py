@@ -498,16 +498,13 @@ def score_stock(
     cur_atr_sma20  = float(atr_sma20.iloc[-1])  if not np.isnan(float(atr_sma20.iloc[-1]))  else cur_atr
     cur_atr_pctile = float(atr_roll50.iloc[-1]) if not np.isnan(float(atr_roll50.iloc[-1])) else 0.5
 
-    # trend_up must be defined before squeeze/WVF blocks that reference it
-    trend_up   = cur_c > cur_e200 and cur_e20 > cur_e50
-    trend_down = cur_c < cur_e200 and cur_e20 < cur_e50
-
     # Squeeze current values
     cur_sq_on    = bool(_sq_on.iloc[-1])
     prev_sq_on   = bool(_sq_on.iloc[-2]) if len(_sq_on) >= 2 else cur_sq_on
     cur_sq_mom   = float(_sq_mom.iloc[-1])   if not np.isnan(float(_sq_mom.iloc[-1]))   else 0.0
     prev_sq_mom  = float(_sq_mom.iloc[-2])   if not np.isnan(float(_sq_mom.iloc[-2]))   else 0.0
-    # Count consecutive squeeze bars (reset index so positional lookup is safe)
+    # Count consecutive squeeze bars
+    sq_bar_count = int((_sq_on[::-1]).cumsum().idxmax() if _sq_on.any() else 0)
     try:
         _rev = _sq_on.iloc[::-1].reset_index(drop=True)
         sq_bar_count = int(_rev[~_rev].index[0]) if (~_rev).any() else len(_rev)
@@ -533,6 +530,10 @@ def score_stock(
     below_cloud  = cur_c < cb
     inside_cloud = cb <= cur_c <= ct
     allow_cloud  = above_cloud or inside_cloud
+
+    # ── TREND ────────────────────────────────────────────────────
+    trend_up   = cur_c > cur_e200 and cur_e20 > cur_e50
+    trend_down = cur_c < cur_e200 and cur_e20 < cur_e50
 
     # ── NIFTY REGIME FILTER ──────────────────────────────────────
     # Only allow signals when Nifty is in a trending phase (above its EMA50).
@@ -746,17 +747,17 @@ def score_stock(
     _prov_en  = cur_c
     _prov_sl  = _prov_en - cur_atr * 3.0 * 0.85
     _prov_rk  = max(_prov_en - _prov_sl, cur_atr * 0.5)
-    _prov_t2  = _prov_en + _prov_rk * 2          # reward = 2R (T2 target)
-    _rr_ratio = (_prov_t2 - _prov_en) / max(_prov_rk, 0.01)   # = reward / risk
+    _prov_t1  = _prov_en + _prov_rk
+    _rr_ratio = _prov_rk / max(_prov_en - _prov_sl, 0.01)
     yield_ok  = (not t2_rr_enabled) or (_rr_ratio >= t2_min_rr)
 
-    any_buy = _t2_signals and allow_cloud_buy and cur_cci <= cci_ob and yield_ok
+    any_buy = _t2_signals and allow_cloud_buy and cur_cci <= cci_ob and nifty_trending and yield_ok
 
     # ── TIER CLASSIFICATION ───────────────────────────────────────
     # Tier 1  — strict OR relaxed T1 prime gate fires
     # Tier 2  — any valid buy signal
     # Other   — watch / skip
-    is_tier1_prime = (is_tier1_prime_strict or is_tier1_prime_relax) and nifty_trending
+    is_tier1_prime = is_tier1_prime_strict or is_tier1_prime_relax
 
     tier = (
         "Tier 1" if is_tier1_prime else
@@ -1024,20 +1025,6 @@ def run_scanner(
     t2_min_score:     int   = 55,
     t2_fib_score:     int   = 65,
     t2_cci_score:     int   = 55,
-    # Tier 2 — Squeeze
-    t2_sq_len:        int   = 20,
-    t2_sq_mult_bb:    float = 2.0,
-    t2_sq_mult_kc:    float = 1.5,
-    t2_sq_min_bars:   int   = 5,
-    t2_sq_enabled:    bool  = True,
-    # Tier 2 — WVF
-    t2_wvf_len:       int   = 22,
-    t2_wvf_bb_mult:   float = 2.0,
-    t2_wvf_pctile:    float = 0.95,
-    t2_wvf_enabled:   bool  = True,
-    # Tier 2 — Yield (R:R gate)
-    t2_min_rr:        float = 1.5,
-    t2_rr_enabled:    bool  = True,
 ) -> pd.DataFrame:
     """
     Two-phase scanner:
@@ -1079,12 +1066,6 @@ def run_scanner(
             t1r_atr_pctile=t1r_atr_pctile, t1r_breakout_buf=t1r_breakout_buf,
             t2_enabled=t2_enabled, t2_min_score=t2_min_score,
             t2_fib_score=t2_fib_score, t2_cci_score=t2_cci_score,
-            t2_sq_len=t2_sq_len, t2_sq_mult_bb=t2_sq_mult_bb,
-            t2_sq_mult_kc=t2_sq_mult_kc, t2_sq_min_bars=t2_sq_min_bars,
-            t2_sq_enabled=t2_sq_enabled,
-            t2_wvf_len=t2_wvf_len, t2_wvf_bb_mult=t2_wvf_bb_mult,
-            t2_wvf_pctile=t2_wvf_pctile, t2_wvf_enabled=t2_wvf_enabled,
-            t2_min_rr=t2_min_rr, t2_rr_enabled=t2_rr_enabled,
         )
         if row:
             row["Stock"] = sym
