@@ -402,6 +402,8 @@ def score_stock(
     t2_min_score:     int   = 55,
     t2_fib_score:     int   = 65,
     t2_cci_score:     int   = 55,
+    # Regime
+    use_regime:       bool  = True,
 ) -> dict:
     """
     Full port of Pine Script f() scoring + all signal logic.
@@ -589,8 +591,8 @@ def score_stock(
 
     strong_htf_relax = mom1 > t1r_mom1 and mom3 > t1r_mom3 and mom6 > t1r_mom6
     trend_relax      = (
-        cur_c > cur_e200 * 0.97 and      # 3% buffer below EMA200
-        cur_e20 > cur_e50 * 0.995         # 0.5% buffer — catches imminent golden cross
+        cur_c > cur_e200 and             # hard: must be above EMA200, no buffer
+        cur_e20 > cur_e50                # confirmed golden cross only, no buffer
     )
     qualified_relax  = (
         strong_htf_relax and
@@ -680,12 +682,16 @@ def score_stock(
     # trending  → full signals for T1 and T2
     # choppy    → T1 always allowed; T2 requires higher score (≥70) for caution
     # bearish   → T1★ (strict) only; T2 blocked entirely
-    t2_regime_ok = (
-        nifty_trending or                                      # full green
-        (nifty_choppy and norm_score >= 70)                    # choppy: raise bar for T2
-    )
-    # T1 is allowed in trending + choppy; blocked only in full bearish
-    t1_regime_ok = not nifty_bearish
+    # When use_regime=False, bypass all regime gates (treat as always trending)
+    if use_regime:
+        t2_regime_ok = (
+            nifty_trending or                                  # full green
+            (nifty_choppy and norm_score >= 70)                # choppy: raise bar for T2
+        )
+        t1_regime_ok = not nifty_bearish
+    else:
+        t2_regime_ok = True
+        t1_regime_ok = True
 
     any_buy        = _raw_signal and t2_regime_ok
     any_buy_signal = _raw_signal   # raw, for display purposes
@@ -952,6 +958,7 @@ def run_scanner(
     t2_min_score:     int   = 55,
     t2_fib_score:     int   = 65,
     t2_cci_score:     int   = 55,
+    use_regime:       bool  = True,
 ) -> pd.DataFrame:
     """
     Two-phase scanner:
@@ -988,6 +995,7 @@ def run_scanner(
             cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
             pvt_lb=pvt_lb,   atr_prox=atr_prox,
             enable_t1_relax=enable_t1_relax,
+            use_regime=use_regime,
             t1s_mom1=t1s_mom1, t1s_mom3=t1s_mom3, t1s_mom6=t1s_mom6,
             t1r_mom1=t1r_mom1, t1r_mom3=t1r_mom3, t1r_mom6=t1r_mom6,
             t1r_atr_pctile=t1r_atr_pctile, t1r_breakout_buf=t1r_breakout_buf,
