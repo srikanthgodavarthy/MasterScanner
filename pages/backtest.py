@@ -352,21 +352,54 @@ def render(settings=None):
                      "exit_reason","pnl_pct","score_at_entry","cci_at_entry",
                      "sl","t1","t2","tier1_prime"]
         tlog = trades_df[[c for c in show_cols if c in trades_df.columns]].copy()
-        tlog = tlog.sort_values("entry_date", ascending=False)
+        tlog = tlog.sort_values("entry_date", ascending=False).reset_index(drop=True)
+
+        # Rename columns for clarity
+        tlog = tlog.rename(columns={
+            "entry_date":     "Entry Date",
+            "entry_price":    "Entry ₹",
+            "exit_date":      "Exit Date",
+            "exit_price":     "Exit ₹",
+            "exit_reason":    "Exit",
+            "pnl_pct":        "P&L %",
+            "score_at_entry": "Score",
+            "cci_at_entry":   "CCI",
+            "sl":             "Stop ₹",
+            "t1":             "Target 1 ₹",
+            "t2":             "Target 2 ₹",
+            "tier1_prime":    "Grade",
+        })
+
+        # Convert tier1_prime bool → readable grade
+        if "Grade" in tlog.columns:
+            tlog["Grade"] = tlog["Grade"].map(lambda x: "T1★" if x else "T2")
+
+        # Round price columns
+        for col in ["Entry ₹", "Exit ₹", "Stop ₹", "Target 1 ₹", "Target 2 ₹"]:
+            if col in tlog.columns:
+                tlog[col] = tlog[col].round(2)
+
+        # Format P&L
+        if "P&L %" in tlog.columns:
+            tlog["P&L %"] = tlog["P&L %"].round(2)
 
         def _row_bg(row):
-            if row.get("tier1_prime", False):
-                return [f"background-color:#2e1065"]*len(row)   # purple tint for T1
-            color = "#22c55e22" if row["pnl_pct"] > 0 else "#ef444422"
-            return [f"background-color:{color}"]*len(row)
+            pnl = row.get("P&L %", 0)
+            color = "#22c55e18" if pnl > 0 else "#ef444418"
+            return [f"background-color:{color}"] * len(row)
+
+        fmt = {"P&L %": "{:.2f}%"}
+        for col in ["Entry ₹", "Exit ₹", "Stop ₹", "Target 1 ₹", "Target 2 ₹"]:
+            if col in tlog.columns:
+                fmt[col] = "{:.2f}"
 
         styled_log = (
             tlog.style
             .apply(_row_bg, axis=1)
-            .map(_pnl_color, subset=["pnl_pct"])
-            .set_properties(**{"font-family":"'JetBrains Mono',monospace",
-                               "font-size":"0.74rem","color":"#e2e8f0"})
-            .format({"pnl_pct":"{}%"})
+            .map(_pnl_color, subset=["P&L %"] if "P&L %" in tlog.columns else [])
+            .set_properties(**{"font-family": "'JetBrains Mono',monospace",
+                               "font-size": "0.74rem", "color": "#e2e8f0"})
+            .format(fmt)
         )
         st.dataframe(styled_log, use_container_width=True, height=400)
 
