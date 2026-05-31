@@ -750,13 +750,13 @@ def score_stock(
     _rr_ratio = (_prov_t2 - _prov_en) / max(_prov_rk, 0.01)   # = reward / risk
     yield_ok  = (not t2_rr_enabled) or (_rr_ratio >= t2_min_rr)
 
-    any_buy = _t2_signals and allow_cloud_buy and cur_cci <= cci_ob and nifty_trending and yield_ok
+    any_buy = _t2_signals and allow_cloud_buy and cur_cci <= cci_ob and yield_ok
 
     # ── TIER CLASSIFICATION ───────────────────────────────────────
     # Tier 1  — strict OR relaxed T1 prime gate fires
     # Tier 2  — any valid buy signal
     # Other   — watch / skip
-    is_tier1_prime = is_tier1_prime_strict or is_tier1_prime_relax
+    is_tier1_prime = (is_tier1_prime_strict or is_tier1_prime_relax) and nifty_trending
 
     tier = (
         "Tier 1" if is_tier1_prime else
