@@ -381,12 +381,27 @@ def fetch_nifty(period: str = "1y") -> pd.Series:
 def score_stock(
     df: pd.DataFrame,
     nifty: pd.Series,
-    cci_len:         int   = 20,
-    cci_ob:          int   = 100,
-    cci_os:          int   = -100,
-    pvt_lb:          int   = 20,
-    atr_prox:        float = 0.3,
-    enable_t1_relax: bool  = True,
+    cci_len:          int   = 20,
+    cci_ob:           int   = 100,
+    cci_os:           int   = -100,
+    pvt_lb:           int   = 20,
+    atr_prox:         float = 0.3,
+    enable_t1_relax:  bool  = True,
+    # T1★ Strict thresholds
+    t1s_mom1:         float = 5.0,
+    t1s_mom3:         float = 10.0,
+    t1s_mom6:         float = 15.0,
+    # T1 Relaxed thresholds
+    t1r_mom1:         float = 4.0,
+    t1r_mom3:         float = 8.0,
+    t1r_mom6:         float = 12.0,
+    t1r_atr_pctile:   float = 0.35,
+    t1r_breakout_buf: float = 0.03,
+    # Tier 2
+    t2_enabled:       bool  = True,
+    t2_min_score:     int   = 55,
+    t2_fib_score:     int   = 65,
+    t2_cci_score:     int   = 55,
 ) -> dict:
     """
     Full port of Pine Script f() scoring + all signal logic.
@@ -415,7 +430,8 @@ def score_stock(
     atr_val  = atr(h, l, c, 14)
     cci_val  = cci(c, cci_len)
     vol_avg  = sma(v, 20)
-    atr_sma20 = sma(atr_val, 20)   # 20-bar ATR mean for contraction filter
+    atr_sma20  = sma(atr_val, 20)   # 20-bar ATR mean for contraction filter
+    atr_roll50 = atr_val.rolling(50).rank(pct=True)  # ATR percentile over 50 bars
 
     # Ichimoku
     tenkan, kijun, senkou_a, senkou_b = ichimoku(h, l)
@@ -436,7 +452,8 @@ def score_stock(
     cur_cci  = float(cci_val.iloc[-1])
     cur_vavg = float(vol_avg.iloc[-1])
     prev_cci = float(cci_val.iloc[-2]) if len(cci_val) >= 2 else cur_cci
-    cur_atr_sma20 = float(atr_sma20.iloc[-1]) if not np.isnan(float(atr_sma20.iloc[-1])) else cur_atr
+    cur_atr_sma20  = float(atr_sma20.iloc[-1])  if not np.isnan(float(atr_sma20.iloc[-1]))  else cur_atr
+    cur_atr_pctile = float(atr_roll50.iloc[-1]) if not np.isnan(float(atr_roll50.iloc[-1])) else 0.5
 
     ct   = float(cloud_top.iloc[-1])
     cb   = float(cloud_bottom.iloc[-1])
@@ -449,18 +466,29 @@ def score_stock(
     trend_up   = cur_c > cur_e200 and cur_e20 > cur_e50
     trend_down = cur_c < cur_e200 and cur_e20 < cur_e50
 
-    # ── RELATIVE STRENGTH vs Nifty (5-bar) ───────────────────────
+    # ── NIFTY REGIME FILTER ──────────────────────────────────────
+    # Only allow signals when Nifty is in a trending phase (above its EMA50).
+    # Suppresses entries during choppy/rotational market phases.
+    _n_idx   = _strip_tz(nifty.index)
+    _n_ser   = nifty.copy(); _n_ser.index = _n_idx
+    _n_e50   = _n_ser.ewm(span=50, adjust=False).mean()
+    nifty_trending = float(_n_ser.iloc[-1]) > float(_n_e50.iloc[-1])
+
+    # ── RELATIVE STRENGTH vs Nifty (blended 5-bar + 20-bar) ────────
     _c_index      = _strip_tz(c.index)
     _nifty        = nifty.copy()
     _nifty.index  = _strip_tz(_nifty.index)
     nifty_aligned = _nifty.reindex(_c_index, method="ffill")
     rs = np.nan
-    if len(c) >= 6 and not nifty_aligned.empty:
-        c5    = float(c.iloc[-6])
+    if len(c) >= 21 and not nifty_aligned.empty:
+        c5    = float(c.iloc[-6]);   c20   = float(c.iloc[-21])
         n_now = float(nifty_aligned.iloc[-1])
         n5    = float(nifty_aligned.iloc[-6])
-        if c5 > 0 and n5 > 0 and n_now > 0:
-            rs = (cur_c / c5 - 1) - (n_now / n5 - 1)
+        n20   = float(nifty_aligned.iloc[-21])
+        if c5 > 0 and n5 > 0 and n_now > 0 and c20 > 0 and n20 > 0:
+            rs5  = (cur_c / c5  - 1) - (n_now / n5  - 1)
+            rs20 = (cur_c / c20 - 1) - (n_now / n20 - 1)
+            rs   = 0.4 * rs5 + 0.6 * rs20   # blend: 40% short-term, 60% medium-term
     rs = 0.0 if np.isnan(rs) else rs
 
     # ── FIBONACCI LEVELS ─────────────────────────────────────────
@@ -535,7 +563,7 @@ def score_stock(
 
     # ── STRICT QUALIFIED GATE ─────────────────────────────────────
     # Original thresholds — unchanged. Used for T1★ grade and AccTier "A".
-    strong_htf   = mom1 > 5  and mom3 > 10 and mom6 > 15
+    strong_htf   = mom1 > t1s_mom1 and mom3 > t1s_mom3 and mom6 > t1s_mom6
     trend_strong = cur_c > cur_e20 and cur_e20 > cur_e50
     qualified    = strong_htf and trend_strong
 
@@ -546,11 +574,12 @@ def score_stock(
     #   near_breakout   : price within 3% of the 10-bar closing high
     #                     (ensures a catalyst is nearby, not a dead range)
     # Both filters partially compensate for the weaker momentum bar.
-    atr_contracting  = cur_atr < cur_atr_sma20
+    # Compression: ATR below its 20-bar mean AND in bottom 35th percentile of 50-bar range
+    atr_contracting  = cur_atr < cur_atr_sma20 and cur_atr_pctile < t1r_atr_pctile
     recent_10bar_high = float(highest(c, 10).iloc[-2]) if len(c) >= 11 else cur_c
-    near_breakout    = cur_c > recent_10bar_high * 0.97
+    near_breakout    = cur_c > recent_10bar_high * (1.0 - t1r_breakout_buf)
 
-    strong_htf_relax = mom1 > 4 and mom3 > 8 and mom6 > 12
+    strong_htf_relax = mom1 > t1r_mom1 and mom3 > t1r_mom3 and mom6 > t1r_mom6
     trend_relax      = (
         cur_c > cur_e200 * 0.97 and      # 3% buffer below EMA200
         cur_e20 > cur_e50 * 0.995         # 0.5% buffer — catches imminent golden cross
@@ -632,13 +661,12 @@ def score_stock(
     is_abcd_buy     = trend_up and abcd_bull
     is_harm_buy     = trend_up and harm_bull
     is_norm_buy     = trend_up and norm_score >= 65 and not in_golden and not cci_extended
-    is_cci_buy      = trend_up and cci_cross_up_os and norm_score >= 55
+    is_cci_buy      = trend_up and cci_cross_up_os and norm_score >= t2_cci_score
 
     allow_cloud_buy = above_cloud or (inside_cloud and norm_score >= 65)
 
-    any_buy = (
-        is_fib_buy or is_abcd_buy or is_harm_buy or is_norm_buy or is_cci_buy
-    ) and allow_cloud_buy and cur_cci <= cci_ob
+    _t2_signals = is_fib_buy or is_abcd_buy or is_harm_buy or is_norm_buy or is_cci_buy
+    any_buy = _t2_signals and allow_cloud_buy and cur_cci <= cci_ob and nifty_trending
 
     # ── TIER CLASSIFICATION ───────────────────────────────────────
     # Tier 1  — strict OR relaxed T1 prime gate fires
@@ -872,16 +900,28 @@ _BATCH_SIZE = 100
 
 
 def run_scanner(
-    symbols:         list,
-    cci_len:         int   = 20,
-    cci_ob:          int   = 100,
-    cci_os:          int   = -100,
-    max_workers:     int   = 10,
-    progress_cb            = None,
-    atr_prox:        float = 0.3,
-    pvt_lb:          int   = 20,
-    enable_t1_relax: bool  = True,
-    min_score:       int   = 0,
+    symbols:          list,
+    cci_len:          int   = 20,
+    cci_ob:           int   = 100,
+    cci_os:           int   = -100,
+    max_workers:      int   = 10,
+    progress_cb             = None,
+    atr_prox:         float = 0.3,
+    pvt_lb:           int   = 20,
+    enable_t1_relax:  bool  = True,
+    min_score:        int   = 0,
+    t1s_mom1:         float = 5.0,
+    t1s_mom3:         float = 10.0,
+    t1s_mom6:         float = 15.0,
+    t1r_mom1:         float = 4.0,
+    t1r_mom3:         float = 8.0,
+    t1r_mom6:         float = 12.0,
+    t1r_atr_pctile:   float = 0.35,
+    t1r_breakout_buf: float = 0.03,
+    t2_enabled:       bool  = True,
+    t2_min_score:     int   = 55,
+    t2_fib_score:     int   = 65,
+    t2_cci_score:     int   = 55,
 ) -> pd.DataFrame:
     """
     Two-phase scanner:
@@ -918,6 +958,11 @@ def run_scanner(
             cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
             pvt_lb=pvt_lb,   atr_prox=atr_prox,
             enable_t1_relax=enable_t1_relax,
+            t1s_mom1=t1s_mom1, t1s_mom3=t1s_mom3, t1s_mom6=t1s_mom6,
+            t1r_mom1=t1r_mom1, t1r_mom3=t1r_mom3, t1r_mom6=t1r_mom6,
+            t1r_atr_pctile=t1r_atr_pctile, t1r_breakout_buf=t1r_breakout_buf,
+            t2_enabled=t2_enabled, t2_min_score=t2_min_score,
+            t2_fib_score=t2_fib_score, t2_cci_score=t2_cci_score,
         )
         if row:
             row["Stock"] = sym

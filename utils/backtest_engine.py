@@ -79,15 +79,26 @@ def fetch_full_history(symbol: str, years: int = 3) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════════
 
 def generate_signals_historical(
-    df:          pd.DataFrame,
-    nifty:       pd.Series,
-    cci_len:     int   = 20,
-    cci_ob:      int   = 100,
-    cci_os:      int   = -100,
-    min_score:   int   = 70,
-    atr_prox:    float = 0.3,
-    pvt_lb:      int   = 20,
-    tier1_only         = False,   # False | True | "strict" | "relax" | "any"
+    df:               pd.DataFrame,
+    nifty:            pd.Series,
+    cci_len:          int   = 20,
+    cci_ob:           int   = 100,
+    cci_os:           int   = -100,
+    min_score:        int   = 70,
+    atr_prox:         float = 0.3,
+    pvt_lb:           int   = 20,
+    tier1_only              = False,
+    t1s_mom1:         float = 5.0,
+    t1s_mom3:         float = 10.0,
+    t1s_mom6:         float = 15.0,
+    t1r_mom1:         float = 4.0,
+    t1r_mom3:         float = 8.0,
+    t1r_mom6:         float = 12.0,
+    t1r_atr_pctile:   float = 0.35,
+    t1r_breakout_buf: float = 0.03,
+    t2_enabled:       bool  = True,
+    t2_fib_score:     int   = 65,
+    t2_cci_score:     int   = 55,
 ) -> pd.DataFrame:
     """
     Walk-forward signal generation.
@@ -122,7 +133,8 @@ def generate_signals_historical(
     atr_s   = atr(h, l, c, 14)
     cci_s   = cci(c, cci_len)
     vol_avg = sma(v, 20)
-    atr_sma = sma(atr_s, 20)          # 20-bar ATR mean for contraction filter
+    atr_sma    = sma(atr_s, 20)              # 20-bar ATR mean for contraction filter
+    atr_pctile = atr_s.rolling(50).rank(pct=True)  # ATR percentile over 50 bars
 
     tenkan, kijun, senkou_a, senkou_b = ichimoku(h, l)
     cloud_top    = pd.concat([senkou_a, senkou_b], axis=1).max(axis=1)
@@ -132,7 +144,9 @@ def generate_signals_historical(
     _c_idx  = _strip_tz(c.index)
     _nifty  = nifty.copy()
     _nifty.index = _strip_tz(_nifty.index)
-    nifty_a = _nifty.reindex(_c_idx, method="ffill")
+    nifty_a      = _nifty.reindex(_c_idx, method="ffill")
+    _nifty_e50   = _nifty.ewm(span=50, adjust=False).mean()
+    nifty_e50_a  = _nifty_e50.reindex(_c_idx, method="ffill")
 
     lookback = pvt_lb * 3
     signals  = []
@@ -149,7 +163,10 @@ def generate_signals_historical(
         cur_atr  = float(atr_s.iloc[i])
         cur_cci  = float(cci_s.iloc[i])
         cur_va   = float(vol_avg.iloc[i])
-        cur_atr_sma = float(atr_sma.iloc[i]) if not np.isnan(float(atr_sma.iloc[i])) else cur_atr
+        cur_atr_sma    = float(atr_sma.iloc[i])    if not np.isnan(float(atr_sma.iloc[i]))    else cur_atr
+        nifty_now      = float(nifty_a.iloc[i])    if not np.isnan(float(nifty_a.iloc[i]))    else 0
+        nifty_e50_now  = float(nifty_e50_a.iloc[i]) if not np.isnan(float(nifty_e50_a.iloc[i])) else 0
+        nifty_trending = nifty_now > nifty_e50_now > 0
         prev_cci = float(cci_s.iloc[i - 1]) if i >= 1 else cur_cci
         cur_ct   = float(cloud_top.iloc[i])
         cur_cb   = float(cloud_bottom.iloc[i])
@@ -160,14 +177,17 @@ def generate_signals_historical(
         # ── Trend ──────────────────────────────────────────────────
         trend_up = cur_c > cur_e200 and cur_e20 > cur_e50
 
-        # ── RS (FIX #4) ─────────────────────────────────────────────
+        # ── RS — blended 5-bar + 20-bar ────────────────────────────
         rs = 0.0
-        if i >= 5:
-            c5    = float(c.iloc[i - 5])
-            n_now = float(nifty_a.iloc[i])   if not np.isnan(float(nifty_a.iloc[i]))   else 0
-            n5    = float(nifty_a.iloc[i-5]) if not np.isnan(float(nifty_a.iloc[i-5])) else 0
-            if c5 > 0 and n5 > 0 and n_now > 0:
-                rs = (cur_c / c5 - 1) - (n_now / n5 - 1)
+        if i >= 20:
+            c5    = float(c.iloc[i - 5]);   c20   = float(c.iloc[i - 20])
+            n_now = float(nifty_a.iloc[i])      if not np.isnan(float(nifty_a.iloc[i]))      else 0
+            n5    = float(nifty_a.iloc[i - 5])  if not np.isnan(float(nifty_a.iloc[i - 5]))  else 0
+            n20   = float(nifty_a.iloc[i - 20]) if not np.isnan(float(nifty_a.iloc[i - 20])) else 0
+            if c5 > 0 and n5 > 0 and n_now > 0 and c20 > 0 and n20 > 0:
+                rs5  = (cur_c / c5  - 1) - (n_now / n5  - 1)
+                rs20 = (cur_c / c20 - 1) - (n_now / n20 - 1)
+                rs   = 0.4 * rs5 + 0.6 * rs20
 
         # ── Fibonacci ───────────────────────────────────────────────
         win_s   = max(0, i - lookback)
@@ -203,17 +223,18 @@ def generate_signals_historical(
         mom1 = (cur_c / float(c.iloc[i-21])  - 1) * 100 if i >= 21  else 0
         mom3 = (cur_c / float(c.iloc[i-63])  - 1) * 100 if i >= 63  else 0
         mom6 = (cur_c / float(c.iloc[i-126]) - 1) * 100 if i >= 126 else 0
-        strong_htf   = mom1 > 5 and mom3 > 10 and mom6 > 15
+        strong_htf   = mom1 > t1s_mom1 and mom3 > t1s_mom3 and mom6 > t1s_mom6
         trend_strong = cur_c > cur_e20 and cur_e20 > cur_e50
         qualified    = strong_htf and trend_strong
 
         # ── Qualification — RELAXED ─────────────────────────────────
         # Lower momentum thresholds + ATR contraction + breakout proximity.
-        atr_contracting  = cur_atr < cur_atr_sma
+        cur_atr_pctile   = float(atr_pctile.iloc[i]) if not np.isnan(float(atr_pctile.iloc[i])) else 0.5
+        atr_contracting  = cur_atr < cur_atr_sma and cur_atr_pctile < t1r_atr_pctile
         recent_10_high   = float(c.iloc[max(0, i-11):i].max())   # [1]-offset like scanner
-        near_breakout    = cur_c > recent_10_high * 0.97
+        near_breakout    = cur_c > recent_10_high * (1.0 - t1r_breakout_buf)
 
-        strong_htf_relax = mom1 > 4 and mom3 > 8 and mom6 > 12
+        strong_htf_relax = mom1 > t1r_mom1 and mom3 > t1r_mom3 and mom6 > t1r_mom6
         trend_relax      = (
             cur_c > cur_e200 * 0.97 and
             cur_e20 > cur_e50 * 0.995
@@ -317,7 +338,7 @@ def generate_signals_historical(
 
         allow_cloud_buy = above_cloud or (inside_cloud and norm_score >= 65)
 
-        if norm_score < min_score or not allow_cloud_buy or cur_cci > cci_ob:
+        if norm_score < min_score or not allow_cloud_buy or cur_cci > cci_ob or not nifty_trending:
             continue
 
         # ── Trade levels ────────────────────────────────────────────
@@ -462,17 +483,28 @@ def simulate_trades(
 # ══════════════════════════════════════════════════════════════════
 
 def run_backtest(
-    symbols:      list,
-    cci_len:      int   = 20,
-    cci_ob:       int   = 100,
-    cci_os:       int   = -100,
-    min_score:    int   = 70,
-    hold_days:    int   = 20,
-    workers:      int   = 10,
-    tier1_only          = False,   # False | True | "strict" | "relax" | "any"
-    progress_cb         = None,
-    atr_prox:     float = 0.3,
-    pvt_lb:       int   = 20,
+    symbols:          list,
+    cci_len:          int   = 20,
+    cci_ob:           int   = 100,
+    cci_os:           int   = -100,
+    min_score:        int   = 70,
+    hold_days:        int   = 20,
+    workers:          int   = 10,
+    tier1_only              = False,
+    progress_cb             = None,
+    atr_prox:         float = 0.3,
+    pvt_lb:           int   = 20,
+    t1s_mom1:         float = 5.0,
+    t1s_mom3:         float = 10.0,
+    t1s_mom6:         float = 15.0,
+    t1r_mom1:         float = 4.0,
+    t1r_mom3:         float = 8.0,
+    t1r_mom6:         float = 12.0,
+    t1r_atr_pctile:   float = 0.35,
+    t1r_breakout_buf: float = 0.03,
+    t2_enabled:       bool  = True,
+    t2_fib_score:     int   = 65,
+    t2_cci_score:     int   = 55,
 ) -> pd.DataFrame:
     """
     tier1_only values:
@@ -510,6 +542,10 @@ def run_backtest(
             df, nifty_close, cci_len, cci_ob, cci_os,
             min_score, atr_prox=atr_prox, pvt_lb=pvt_lb,
             tier1_only=tier1_only,
+            t1s_mom1=t1s_mom1, t1s_mom3=t1s_mom3, t1s_mom6=t1s_mom6,
+            t1r_mom1=t1r_mom1, t1r_mom3=t1r_mom3, t1r_mom6=t1r_mom6,
+            t1r_atr_pctile=t1r_atr_pctile, t1r_breakout_buf=t1r_breakout_buf,
+            t2_enabled=t2_enabled, t2_fib_score=t2_fib_score, t2_cci_score=t2_cci_score,
         )
         return simulate_trades(sym, df, signals, hold_days=hold_days)
 

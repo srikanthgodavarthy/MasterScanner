@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+IST = timezone(timedelta(hours=5, minutes=30))
 from typing import Optional
 
 import pandas as pd
@@ -81,7 +83,7 @@ def save_scan_snapshot(df: pd.DataFrame, label: str = "") -> bool:
     if client is None or df.empty:
         return False
 
-    run_ts = datetime.now(timezone.utc).isoformat()
+    run_ts = datetime.now(IST).isoformat()
     top50  = df.head(50)
 
     rows = []
@@ -182,7 +184,7 @@ def add_to_watchlist(symbol: str, notes: str = "") -> bool:
                 {
                     "symbol":   symbol.upper().strip(),
                     "notes":    notes.strip(),
-                    "added_at": datetime.now(timezone.utc).isoformat(),
+                    "added_at": datetime.now(IST).isoformat(),
                 },
                 on_conflict="symbol",          # update notes if symbol exists
             )
@@ -233,7 +235,7 @@ def save_watchlist(symbols: list[str]) -> bool:
             {
                 "symbol":   s.upper().strip(),
                 "notes":    "",
-                "added_at": datetime.now(timezone.utc).isoformat(),
+                "added_at": datetime.now(IST).isoformat(),
             }
             for s in symbols
             if s.strip()
@@ -257,7 +259,7 @@ def save_backtest_results(trades_df: pd.DataFrame, run_label: str = "") -> bool:
     if client is None or trades_df.empty:
         return False
 
-    run_ts = datetime.now(timezone.utc).isoformat()
+    run_ts = datetime.now(IST).isoformat()
 
     def _safe(val):
         if pd.isna(val):
