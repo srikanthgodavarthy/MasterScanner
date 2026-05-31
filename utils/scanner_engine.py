@@ -467,12 +467,20 @@ def score_stock(
     trend_down = cur_c < cur_e200 and cur_e20 < cur_e50
 
     # ── NIFTY REGIME FILTER ──────────────────────────────────────
-    # Only allow signals when Nifty is in a trending phase (above its EMA50).
-    # Suppresses entries during choppy/rotational market phases.
-    _n_idx   = _strip_tz(nifty.index)
-    _n_ser   = nifty.copy(); _n_ser.index = _n_idx
-    _n_e50   = _n_ser.ewm(span=50, adjust=False).mean()
-    nifty_trending = float(_n_ser.iloc[-1]) > float(_n_e50.iloc[-1])
+    # Three-state regime: trending / choppy / bearish.
+    #   trending  — Nifty > EMA50 > EMA200         (full signals)
+    #   choppy    — Nifty < EMA50 but > EMA200     (T1 allowed; T2 needs higher score)
+    #   bearish   — Nifty < EMA50 and < EMA200     (T1★ only; T2 blocked)
+    _n_idx    = _strip_tz(nifty.index)
+    _n_ser    = nifty.copy(); _n_ser.index = _n_idx
+    _n_e50    = _n_ser.ewm(span=50, adjust=False).mean()
+    _n_e200   = _n_ser.ewm(span=200, adjust=False).mean()
+    _n_last   = float(_n_ser.iloc[-1])
+    _n_e50v   = float(_n_e50.iloc[-1])
+    _n_e200v  = float(_n_e200.iloc[-1])
+    nifty_trending = _n_last > _n_e50v                          # above EMA50
+    nifty_bearish  = _n_last < _n_e50v and _n_last < _n_e200v  # below both EMAs
+    nifty_choppy   = _n_last < _n_e50v and not nifty_bearish   # below EMA50 only
 
     # ── RELATIVE STRENGTH vs Nifty (blended 5-bar + 20-bar) ────────
     _c_index      = _strip_tz(c.index)
@@ -666,17 +674,35 @@ def score_stock(
     allow_cloud_buy = above_cloud or (inside_cloud and norm_score >= 65)
 
     _t2_signals = is_fib_buy or is_abcd_buy or is_harm_buy or is_norm_buy or is_cci_buy
-    any_buy = _t2_signals and allow_cloud_buy and cur_cci <= cci_ob and nifty_trending
+    _raw_signal = _t2_signals and allow_cloud_buy and cur_cci <= cci_ob
+
+    # ── REGIME-AWARE SIGNAL GATE ──────────────────────────────────
+    # trending  → full signals for T1 and T2
+    # choppy    → T1 always allowed; T2 requires higher score (≥70) for caution
+    # bearish   → T1★ (strict) only; T2 blocked entirely
+    t2_regime_ok = (
+        nifty_trending or                                      # full green
+        (nifty_choppy and norm_score >= 70)                    # choppy: raise bar for T2
+    )
+    # T1 is allowed in trending + choppy; blocked only in full bearish
+    t1_regime_ok = not nifty_bearish
+
+    any_buy        = _raw_signal and t2_regime_ok
+    any_buy_signal = _raw_signal   # raw, for display purposes
 
     # ── TIER CLASSIFICATION ───────────────────────────────────────
-    # Tier 1  — strict OR relaxed T1 prime gate fires
-    # Tier 2  — any valid buy signal
+    # Tier 1  — strict OR relaxed T1 prime gate fires (regime: not bearish)
+    # Tier 2  — valid buy signal, regime-gated
+    # Tier 3  — valid signals present but regime-suppressed → Watch
     # Other   — watch / skip
-    is_tier1_prime = is_tier1_prime_strict or is_tier1_prime_relax
+    is_tier1_prime = (is_tier1_prime_strict or is_tier1_prime_relax) and t1_regime_ok
+    # In bearish regime, T1★ still allowed (it has the strongest stock-level filters)
+    is_tier1_prime = is_tier1_prime or (is_tier1_prime_strict and nifty_bearish)
 
     tier = (
         "Tier 1" if is_tier1_prime else
         "Tier 2" if any_buy        else
+        "Tier 3" if any_buy_signal else   # regime-suppressed: Watch
         "Other"
     )
 
@@ -865,6 +891,10 @@ def score_stock(
         "_harm_bull":           harm_bull,
         "_abcd_bull":           abcd_bull,
         "_any_buy":             any_buy,
+        "_any_buy_signal":      any_buy_signal,
+        "_nifty_trending":      nifty_trending,
+        "_nifty_choppy":        nifty_choppy,
+        "_nifty_bearish":       nifty_bearish,
         "_tier1_strict":        is_tier1_prime_strict,
         "_tier1_relax":         is_tier1_prime_relax,
         "_tier1_prime":         is_tier1_prime,
