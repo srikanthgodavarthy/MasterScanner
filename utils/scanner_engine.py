@@ -503,8 +503,7 @@ def score_stock(
     prev_sq_on   = bool(_sq_on.iloc[-2]) if len(_sq_on) >= 2 else cur_sq_on
     cur_sq_mom   = float(_sq_mom.iloc[-1])   if not np.isnan(float(_sq_mom.iloc[-1]))   else 0.0
     prev_sq_mom  = float(_sq_mom.iloc[-2])   if not np.isnan(float(_sq_mom.iloc[-2]))   else 0.0
-    # Count consecutive squeeze bars
-    sq_bar_count = int((_sq_on[::-1]).cumsum().idxmax() if _sq_on.any() else 0)
+    # Count consecutive squeeze bars (reset index so positional lookup is safe)
     try:
         _rev = _sq_on.iloc[::-1].reset_index(drop=True)
         sq_bar_count = int(_rev[~_rev].index[0]) if (~_rev).any() else len(_rev)
