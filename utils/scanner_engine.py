@@ -501,11 +501,66 @@ def score_stock(
             rs   = 0.4 * rs5 + 0.6 * rs20   # blend: 40% short-term, 60% medium-term
     rs = 0.0 if np.isnan(rs) else rs
 
-    # ── FIBONACCI LEVELS ─────────────────────────────────────────
-    lookback = min(pvt_lb * 3, len(c) - 1)
-    sw_hi    = float(h.iloc[-lookback:].max())
-    sw_lo    = float(l.iloc[-lookback:].min())
-    fib_rng  = sw_hi - sw_lo
+    # ── FIBONACCI LEVELS — alternating pivot detection ────────────
+    # Uses proper swing pivot logic (high must come after low) so the
+    # measured range is always a genuine upswing, not a random lookback
+    # max/min that could span a downswing.
+    lookback   = min(pvt_lb * 3, len(c) - 1)
+    _tol_abs   = cur_atr * 0.15          # swing tolerance: 0.15 × ATR (Swing mode)
+    _wing      = 4                        # pivot wing width
+
+    # Find alternating swing pivots over the lookback window
+    _h_arr = h.iloc[-lookback:].values.astype(float)
+    _l_arr = l.iloc[-lookback:].values.astype(float)
+    _mid   = (_h_arr + _l_arr) / 2.0
+    _n     = len(_mid)
+
+    _raw_pivots: list = []
+    for _i in range(_wing, _n - _wing):
+        _w = _mid[_i - _wing: _i + _wing + 1]
+        if _mid[_i] >= np.max(_w) - _tol_abs:
+            _raw_pivots.append((_i, float(_h_arr[_i]), "H"))
+        elif _mid[_i] <= np.min(_w) + _tol_abs:
+            _raw_pivots.append((_i, float(_l_arr[_i]), "L"))
+
+    # Enforce alternating H/L — keep the stronger pivot on runs of same type
+    _alt: list = []
+    for _p in _raw_pivots:
+        if _alt and _alt[-1][2] == _p[2]:
+            if (_p[2] == "H" and _p[1] > _alt[-1][1]) or \
+               (_p[2] == "L" and _p[1] < _alt[-1][1]):
+                _alt[-1] = _p
+        else:
+            _alt.append(_p)
+
+    # Find the most recent valid swing: last H preceded by an L
+    sw_hi = sw_lo = fib_rng = None
+    _sw_hi_idx = _sw_lo_idx = None
+    for _k in range(len(_alt) - 1, 0, -1):
+        if _alt[_k][2] == "H":
+            # Look for preceding L
+            for _j in range(_k - 1, -1, -1):
+                if _alt[_j][2] == "L":
+                    _candidate_hi  = _alt[_k][1]
+                    _candidate_lo  = _alt[_j][1]
+                    _candidate_rng = _candidate_hi - _candidate_lo
+                    if _candidate_rng >= cur_atr * 0.5:   # meaningful swing only
+                        sw_hi      = _candidate_hi
+                        sw_lo      = _candidate_lo
+                        fib_rng    = _candidate_rng
+                        _sw_hi_idx = _alt[_k][0]          # relative to lookback window
+                        _sw_lo_idx = _alt[_j][0]
+                    break
+            if sw_hi is not None:
+                break
+
+    # Fallback to simple max/min if no valid alternating swing found
+    if sw_hi is None:
+        sw_hi   = float(h.iloc[-lookback:].max())
+        sw_lo   = float(l.iloc[-lookback:].min())
+        fib_rng = sw_hi - sw_lo
+        _sw_hi_idx = None
+        _sw_lo_idx = None
 
     fib236     = sw_hi - fib_rng * 0.236
     fib382     = sw_hi - fib_rng * 0.382
@@ -527,6 +582,62 @@ def score_stock(
 
     near_ext127 = abs(cur_c - fib_ext127) < cur_atr * atr_prox
     near_ext161 = abs(cur_c - fib_ext161) < cur_atr * atr_prox
+
+    # ── FIB PULLBACK QUALITY ──────────────────────────────────────
+    # Only meaningful when we have a valid alternating swing
+    fib_quality      = 0
+    fib_grade        = "POOR"
+    fib_depth_ok     = False
+    fib_vol_ok       = False
+    fib_recovery_ok  = False
+    fib_level_label  = "—"
+
+    if _sw_hi_idx is not None and _sw_lo_idx is not None and fib_rng > 0:
+        # Slice arrays relative to the lookback window start
+        _post_hi_h   = _h_arr[_sw_hi_idx:]
+        _post_hi_l   = _l_arr[_sw_hi_idx:]
+        _post_hi_c   = c.iloc[-lookback:].values[_sw_hi_idx:]
+        _post_hi_v   = v.iloc[-lookback:].values[_sw_hi_idx:].astype(float)
+        _adv_v_slice = v.iloc[-lookback:].values[_sw_lo_idx: _sw_hi_idx + 1].astype(float)
+
+        if len(_post_hi_l) > 0 and len(_adv_v_slice) > 0:
+            _post_lo   = float(np.min(_post_hi_l))
+            _post_cl   = float(c.iloc[-1])
+            _tol_pct   = (_tol_abs / fib_rng) * 100
+            _depth_pct = (sw_hi - _post_lo) / fib_rng * 100
+
+            # Depth score
+            def _in_zone(lo_p, hi_p):
+                return (lo_p - _tol_pct) <= _depth_pct <= (hi_p + _tol_pct)
+            if _in_zone(38.2, 50.0):   _ds = 40; fib_depth_ok = True;  fib_level_label = "38.2–50%"
+            elif _in_zone(50.0, 61.8): _ds = 30; fib_depth_ok = True;  fib_level_label = "50–61.8%"
+            elif _in_zone(23.6, 38.2): _ds = 15; fib_depth_ok = False; fib_level_label = "23.6–38.2%"
+            elif _in_zone(61.8, 78.6): _ds = 10; fib_depth_ok = False; fib_level_label = "61.8–78.6%"
+            else:                      _ds = 0;  fib_depth_ok = False; fib_level_label = "Outside"
+
+            # Volume score — pullback vol vs advance vol
+            _adv_v_mean = float(np.mean(_adv_v_slice)) if len(_adv_v_slice) > 0 else 1.0
+            _pb_v_mean  = float(np.mean(_post_hi_v))   if len(_post_hi_v) > 0   else _adv_v_mean
+            _vr         = _pb_v_mean / (_adv_v_mean + 1e-10)
+            _vs         = 30 if _vr <= 0.60 else (20 if _vr <= 0.75 else (10 if _vr <= 0.90 else 0))
+            fib_vol_ok  = _vr <= 0.75
+
+            # Recovery score — has price closed back above Fib500?
+            _overshoot = max(0.0, fib500 - _post_lo)
+            if _post_cl > fib500 - _tol_abs and _overshoot <= _tol_abs * 2:
+                _rs = 30; fib_recovery_ok = True
+            elif _post_cl > fib618 - _tol_abs:
+                _rs = 15; fib_recovery_ok = False
+            else:
+                _rs = 0;  fib_recovery_ok = False
+
+            fib_quality = _ds + _vs + _rs
+            fib_grade   = (
+                "EXCELLENT" if fib_quality >= 80 else
+                "GOOD"      if fib_quality >= 60 else
+                "FAIR"      if fib_quality >= 40 else
+                "POOR"
+            )
 
     # ── CCI SIGNALS ───────────────────────────────────────────────
     cci_cross_up_os = prev_cci <= cci_os and cur_cci > cci_os
@@ -615,6 +726,12 @@ def score_stock(
     bull_score += (15 if rs > 0 else 5 if rs > -0.005 else 0)
     bull_score += 30 if in_golden else 0
     bull_score += -20 if near_ext127 else (-30 if near_ext161 else 0)
+
+    # Fib pullback quality bonus — rewards proper retracement structure
+    # EXCELLENT(≥80): +20  GOOD(≥60): +12  FAIR(≥40): +5  POOR: 0
+    bull_score += (20 if fib_quality >= 80 else
+                   12 if fib_quality >= 60 else
+                    5 if fib_quality >= 40 else 0)
     bull_score += (20 if cur_cci < cci_os else 10 if cur_cci < 0 else -15 if cci_extended else 0)
     bull_score += 15 if cci_cross_up_os else 0
     bull_score -= 10 if cci_extended else 0
@@ -656,7 +773,7 @@ def score_stock(
     )
 
     # ── NORMALISE ─────────────────────────────────────────────────
-    max_score  = 175
+    max_score  = 195   # +20 added for Fib quality bonus (EXCELLENT grade)
     norm_score = min(100, int(bull_score * 100 / max_score))
 
     # ── ADAPTIVE SCORE THRESHOLD ──────────────────────────────────
@@ -890,6 +1007,12 @@ def score_stock(
         "_high_prob":           high_prob_buy,
         "_in_golden":           in_golden,
         "_in_golden_relaxed":   in_golden_relaxed,
+        "_fib_quality":         fib_quality,
+        "_fib_grade":           fib_grade,
+        "_fib_depth_ok":        fib_depth_ok,
+        "_fib_vol_ok":          fib_vol_ok,
+        "_fib_recovery_ok":     fib_recovery_ok,
+        "_fib_level":           fib_level_label,
         "_in_golden_cci":       in_golden_cci,
         "_above_cloud":         above_cloud,
         "_inside_cloud":        inside_cloud,
