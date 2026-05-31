@@ -1025,6 +1025,20 @@ def run_scanner(
     t2_min_score:     int   = 55,
     t2_fib_score:     int   = 65,
     t2_cci_score:     int   = 55,
+    # Tier 2 — Squeeze
+    t2_sq_len:        int   = 20,
+    t2_sq_mult_bb:    float = 2.0,
+    t2_sq_mult_kc:    float = 1.5,
+    t2_sq_min_bars:   int   = 5,
+    t2_sq_enabled:    bool  = True,
+    # Tier 2 — WVF
+    t2_wvf_len:       int   = 22,
+    t2_wvf_bb_mult:   float = 2.0,
+    t2_wvf_pctile:    float = 0.95,
+    t2_wvf_enabled:   bool  = True,
+    # Tier 2 — Yield (R:R gate)
+    t2_min_rr:        float = 1.5,
+    t2_rr_enabled:    bool  = True,
 ) -> pd.DataFrame:
     """
     Two-phase scanner:
@@ -1066,6 +1080,12 @@ def run_scanner(
             t1r_atr_pctile=t1r_atr_pctile, t1r_breakout_buf=t1r_breakout_buf,
             t2_enabled=t2_enabled, t2_min_score=t2_min_score,
             t2_fib_score=t2_fib_score, t2_cci_score=t2_cci_score,
+            t2_sq_len=t2_sq_len, t2_sq_mult_bb=t2_sq_mult_bb,
+            t2_sq_mult_kc=t2_sq_mult_kc, t2_sq_min_bars=t2_sq_min_bars,
+            t2_sq_enabled=t2_sq_enabled,
+            t2_wvf_len=t2_wvf_len, t2_wvf_bb_mult=t2_wvf_bb_mult,
+            t2_wvf_pctile=t2_wvf_pctile, t2_wvf_enabled=t2_wvf_enabled,
+            t2_min_rr=t2_min_rr, t2_rr_enabled=t2_rr_enabled,
         )
         if row:
             row["Stock"] = sym
