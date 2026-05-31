@@ -498,6 +498,10 @@ def score_stock(
     cur_atr_sma20  = float(atr_sma20.iloc[-1])  if not np.isnan(float(atr_sma20.iloc[-1]))  else cur_atr
     cur_atr_pctile = float(atr_roll50.iloc[-1]) if not np.isnan(float(atr_roll50.iloc[-1])) else 0.5
 
+    # trend_up must be defined before squeeze/WVF blocks that reference it
+    trend_up   = cur_c > cur_e200 and cur_e20 > cur_e50
+    trend_down = cur_c < cur_e200 and cur_e20 < cur_e50
+
     # Squeeze current values
     cur_sq_on    = bool(_sq_on.iloc[-1])
     prev_sq_on   = bool(_sq_on.iloc[-2]) if len(_sq_on) >= 2 else cur_sq_on
@@ -529,10 +533,6 @@ def score_stock(
     below_cloud  = cur_c < cb
     inside_cloud = cb <= cur_c <= ct
     allow_cloud  = above_cloud or inside_cloud
-
-    # ── TREND ────────────────────────────────────────────────────
-    trend_up   = cur_c > cur_e200 and cur_e20 > cur_e50
-    trend_down = cur_c < cur_e200 and cur_e20 < cur_e50
 
     # ── NIFTY REGIME FILTER ──────────────────────────────────────
     # Only allow signals when Nifty is in a trending phase (above its EMA50).
