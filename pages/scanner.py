@@ -625,6 +625,7 @@ def render(settings: dict) -> None:
                 pvt_lb=pvt_lb,
                 enable_t1_relax=enable_t1_relax,
                 min_score=min_score,
+                use_regime=settings.get("use_regime", True),
                 progress_cb=lambda p: prog.progress(p, text=f"Scanning... {int(p*100)}%"),
                 t1s_mom1=settings.get("t1s_mom1", 5.0),
                 t1s_mom3=settings.get("t1s_mom3", 10.0),

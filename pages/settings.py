@@ -1,5 +1,11 @@
 """
-pages/settings.py — Clean two-panel settings UI
+pages/settings.py — Strategy Settings UI
+Changes:
+  - Removed CCI length and CCI oversold (keep only CCI overbought)
+  - Per-tier min score: T1★ Strict = 80, T1 Relaxed = 75
+  - Nifty regime toggle (use_regime)
+  - T1 parameter reference panel (what each tier actually checks)
+  - EMA200 buffer removed in engine (trend_relax now hard: cur_c > cur_e200)
 """
 from __future__ import annotations
 import streamlit as st
@@ -13,9 +19,11 @@ from utils.scanner_engine import NIFTY500_SYMBOLS
 SS = st.session_state
 
 _DEFAULTS = dict(
-    cfg_min_score=70,  cfg_hold_days=20,  cfg_atr_prox=0.30,
-    cfg_pvt_lb=20,     cfg_cci_len=20,    cfg_cci_ob=100,
-    cfg_cci_os=-100,   cfg_workers=10,
+    cfg_min_score_strict=80,  cfg_min_score_relax=75,  cfg_min_score_other=65,
+    cfg_hold_days=20,         cfg_atr_prox=0.30,
+    cfg_pvt_lb=20,            cfg_cci_ob=100,
+    cfg_workers=10,
+    cfg_use_regime=True,
     cfg_t1s_mom1=5,    cfg_t1s_mom3=10,   cfg_t1s_mom6=15,
     cfg_t1s_enabled=True,
     cfg_t1r_mom1=4,    cfg_t1r_mom3=8,    cfg_t1r_mom6=12,
@@ -52,19 +60,6 @@ _CSS = """
 }
 .impact-key   { color: #e2e8f0; font-weight: 600; }
 .impact-val   { color: #64748b; text-align: right; }
-.tier-btn-row { display: flex; gap: 0.5rem; margin-top: 0.4rem; }
-.tier-btn {
-    flex: 1; padding: 0.5rem 0.2rem;
-    border: 1px solid #334155; border-radius: 8px;
-    background: #1e293b; color: #94a3b8;
-    font-size: 0.72rem; font-weight: 600;
-    text-align: center; cursor: pointer;
-    transition: all 0.15s;
-}
-.tier-btn.active {
-    background: #1d4ed8; border-color: #3b82f6;
-    color: #fff;
-}
 .config-bar {
     background: #0f172a;
     border: 1px solid #1e3a5f;
@@ -75,8 +70,25 @@ _CSS = """
     color: #94a3b8;
 }
 .config-bar b { color: #60a5fa; }
+.t1-ref-box {
+    background: #0f172a;
+    border: 1px solid #1e3a5f;
+    border-radius: 8px;
+    padding: 0.8rem 1rem;
+    margin-top: 0.5rem;
+    font-size: 0.72rem;
+    color: #94a3b8;
+}
+.t1-ref-box .ref-tier { color: #f59e0b; font-weight: 700; font-size: 0.75rem; margin-bottom: 0.3rem; }
+.t1-ref-box .ref-tier-relax { color: #60a5fa; font-weight: 700; font-size: 0.75rem; margin: 0.6rem 0 0.3rem; }
+.t1-ref-box .ref-row { padding: 0.12rem 0; border-bottom: 1px solid #1e293b; }
+.t1-ref-box .ref-key { color: #cbd5e1; }
+.t1-ref-box .ref-val { color: #475569; float: right; }
+.regime-badge-on  { background:#14532d; color:#4ade80; border-radius:6px; padding:2px 8px; font-size:0.7rem; font-weight:700; }
+.regime-badge-off { background:#450a0a; color:#f87171; border-radius:6px; padding:2px 8px; font-size:0.7rem; font-weight:700; }
 </style>
 """
+
 
 def render() -> dict:
     if SS.pop("_pending_reset", False):
@@ -97,19 +109,19 @@ def render() -> dict:
     if t1s_on: _tiers.append("T1★")
     if t1r_on: _tiers.append("T1 Relaxed")
     if t2_on:  _tiers.append("Tier 2")
-    _uni = f"Custom ({len(SS.get('custom_symbols', []))} syms)" if SS.get("custom_symbols") else "Nifty 500"
+    _uni        = f"Custom ({len(SS.get('custom_symbols', []))} syms)" if SS.get("custom_symbols") else "Nifty 500"
+    _regime_str = "ON" if SS.get("cfg_use_regime", True) else "OFF"
     st.markdown(
         f"<div class='config-bar'>"
         f"<b>Active:</b> {' · '.join(_tiers) or '⚠️ none'} &nbsp;"
-        f"<b>Min score:</b> {SS.get('cfg_min_score', 70)} &nbsp;"
+        f"<b>Score T1★/T1:</b> {SS.get('cfg_min_score_strict', 80)}/{SS.get('cfg_min_score_relax', 75)} &nbsp;"
         f"<b>Hold:</b> {SS.get('cfg_hold_days', 20)}d &nbsp;"
+        f"<b>Regime:</b> {_regime_str} &nbsp;"
         f"<b>Universe:</b> {_uni}"
         f"</div>",
         unsafe_allow_html=True,
     )
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # TWO-PANEL MAIN ROW
     # ══════════════════════════════════════════════════════════════════════════
     left, right = st.columns([1, 1], gap="medium")
 
@@ -118,27 +130,35 @@ def render() -> dict:
         st.markdown("<div class='settings-panel'>", unsafe_allow_html=True)
         st.markdown("<div class='settings-panel-label'>Entry Filters</div>", unsafe_allow_html=True)
 
-        min_score = st.slider(
-            "Min score", 0, 95, SS.get("cfg_min_score", 70), step=5,
-            key="cfg_min_score",
-            help="Stocks below this score are hidden from all results.",
-        )
-        cci_len = st.slider(
-            "CCI length", 10, 40, SS.get("cfg_cci_len", 20), step=5,
-            key="cfg_cci_len",
-            help="CCI indicator lookback period.",
-        )
+        # Per-tier min score
+        st.caption("Min score by tier")
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            min_score_strict = st.slider(
+                "T1★ Strict", 50, 95, SS.get("cfg_min_score_strict", 80), step=5,
+                key="cfg_min_score_strict",
+                help="Minimum score for T1★ Strict signals.",
+            )
+        with sc2:
+            min_score_relax = st.slider(
+                "T1 Relaxed", 50, 95, SS.get("cfg_min_score_relax", 75), step=5,
+                key="cfg_min_score_relax",
+                help="Minimum score for T1 Relaxed signals.",
+            )
+        with sc3:
+            min_score_other = st.slider(
+                "Tier 2+", 40, 85, SS.get("cfg_min_score_other", 65), step=5,
+                key="cfg_min_score_other",
+                help="Minimum score for Tier 2 and lower signals.",
+            )
+
+        st.markdown("<div style='margin-top:0.6rem'></div>", unsafe_allow_html=True)
+
         cci_ob = st.slider(
             "CCI overbought", 50, 300, SS.get("cfg_cci_ob", 100), step=10,
             key="cfg_cci_ob",
             help="Block entries when CCI is above this (overbought guard).",
         )
-        cci_os = st.slider(
-            "CCI oversold", -200, -50, SS.get("cfg_cci_os", -100), step=10,
-            key="cfg_cci_os",
-            help="CCI crossover buy signal triggers when CCI crosses up through this level.",
-        )
-        st.markdown("<div style='margin-top:0.6rem'></div>", unsafe_allow_html=True)
         atr_prox = st.slider(
             "ATR proximity", 0.10, 0.80, float(SS.get("cfg_atr_prox", 0.30)),
             step=0.05, format="%.2f",
@@ -151,9 +171,38 @@ def render() -> dict:
             help="Bars used for swing high/low detection.",
         )
 
+        st.markdown("<div style='margin-top:1rem'></div>", unsafe_allow_html=True)
+
+        # T1 Parameter Reference Panel
+        st.markdown("<div class='settings-panel-label'>T1 Gate Reference</div>", unsafe_allow_html=True)
+        _s1 = SS.get("cfg_t1s_mom1", 5);  _s3 = SS.get("cfg_t1s_mom3", 10); _s6 = SS.get("cfg_t1s_mom6", 15)
+        _r1 = SS.get("cfg_t1r_mom1", 4);  _r3 = SS.get("cfg_t1r_mom3", 8);  _r6 = SS.get("cfg_t1r_mom6", 12)
+        _ratr = SS.get("cfg_t1r_atr_pctile", 0.35)
+        _rbuf = SS.get("cfg_t1r_breakout_buf", 3.0)
+        st.markdown(f"""
+<div class='t1-ref-box'>
+  <div class='ref-tier'>T1★ Strict — all must pass</div>
+  <div class='ref-row'><span class='ref-key'>Momentum 1m / 3m / 6m</span><span class='ref-val'>&gt;{_s1}% / {_s3}% / {_s6}%</span></div>
+  <div class='ref-row'><span class='ref-key'>Price above EMA20</span><span class='ref-val'>hard</span></div>
+  <div class='ref-row'><span class='ref-key'>EMA20 above EMA50</span><span class='ref-val'>confirmed cross</span></div>
+  <div class='ref-row'><span class='ref-key'>Fib zone (38.2–61.8%)</span><span class='ref-val'>± ATR×{float(SS.get("cfg_atr_prox", 0.30)):.2f}</span></div>
+  <div class='ref-row'><span class='ref-key'>Buy signal (CCI/Fib/Harm)</span><span class='ref-val'>required</span></div>
+  <div class='ref-row'><span class='ref-key'>Regime</span><span class='ref-val'>not bearish</span></div>
+  <div class='ref-tier-relax'>T1 Relaxed — all must pass</div>
+  <div class='ref-row'><span class='ref-key'>Momentum 1m / 3m / 6m</span><span class='ref-val'>&gt;{_r1}% / {_r3}% / {_r6}%</span></div>
+  <div class='ref-row'><span class='ref-key'>Price above EMA200</span><span class='ref-val'>hard (no buffer)</span></div>
+  <div class='ref-row'><span class='ref-key'>EMA20 above EMA50</span><span class='ref-val'>confirmed cross</span></div>
+  <div class='ref-row'><span class='ref-key'>ATR contracting</span><span class='ref-val'>below SMA20 + &lt;{int(_ratr*100)}th pctile</span></div>
+  <div class='ref-row'><span class='ref-key'>Near breakout</span><span class='ref-val'>within {_rbuf:.1f}% of 10-bar high</span></div>
+  <div class='ref-row'><span class='ref-key'>Fib zone (38.2–61.8%)</span><span class='ref-val'>± ATR×{float(SS.get("cfg_atr_prox", 0.30)):.2f}</span></div>
+  <div class='ref-row'><span class='ref-key'>Buy signal (CCI/Fib/Harm)</span><span class='ref-val'>required</span></div>
+  <div class='ref-row'><span class='ref-key'>Regime</span><span class='ref-val'>not bearish</span></div>
+</div>
+""", unsafe_allow_html=True)
+
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── RIGHT PANEL — Exit, Tier filter, Impact guide ─────────────────────────
+    # ── RIGHT PANEL ───────────────────────────────────────────────────────────
     with right:
         st.markdown("<div class='settings-panel'>", unsafe_allow_html=True)
 
@@ -186,9 +235,35 @@ def render() -> dict:
 
         st.markdown("<div style='margin-top:1rem'></div>", unsafe_allow_html=True)
 
-        # Tier 1 Signal Filter — radio as button row
-        st.markdown("<div class='settings-panel-label'>Tier 1 Signal Filter</div>", unsafe_allow_html=True)
+        # Nifty Regime Toggle
+        st.markdown("<div class='settings-panel-label'>Nifty Regime Gate</div>", unsafe_allow_html=True)
+        use_regime = st.toggle(
+            "Use Nifty regime filter",
+            value=SS.get("cfg_use_regime", True),
+            key="cfg_use_regime",
+            help=(
+                "ON → regime gates active: bearish Nifty blocks T2, suppresses T1 Relaxed. "
+                "OFF → regime ignored, all signals pass regardless of Nifty EMA position."
+            ),
+        )
+        if use_regime:
+            st.markdown(
+                "<div style='font-size:0.72rem;color:#4ade80;margin-top:0.2rem'>"
+                "✅ Trending: all signals &nbsp;·&nbsp; Choppy: T2 needs score ≥70 "
+                "&nbsp;·&nbsp; Bearish: T1★ only</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                "<div style='font-size:0.72rem;color:#f87171;margin-top:0.2rem'>"
+                "⚠️ Regime bypassed — all signals fire regardless of Nifty position</div>",
+                unsafe_allow_html=True,
+            )
 
+        st.markdown("<div style='margin-top:1rem'></div>", unsafe_allow_html=True)
+
+        # Tier 1 Signal Filter
+        st.markdown("<div class='settings-panel-label'>Tier 1 Signal Filter</div>", unsafe_allow_html=True)
         _t1_options  = ["All signals", "T1★ Strict", "T1 Relaxed", "Any T1"]
         _t1_mode_map = {
             "All signals": ("any",    True,  True),
@@ -196,12 +271,9 @@ def render() -> dict:
             "T1 Relaxed":  ("relax",  False, True),
             "Any T1":      ("any",    True,  True),
         }
-        # Infer current selection from session state
         _cur_strict = SS.get("cfg_t1s_enabled", True)
         _cur_relax  = SS.get("cfg_t1r_enabled", True)
-        _cur_t2     = SS.get("cfg_t2_enabled",  True)
-
-        if _cur_strict and _cur_relax and _cur_t2:
+        if _cur_strict and _cur_relax:
             _t1_default = "All signals"
         elif _cur_strict and not _cur_relax:
             _t1_default = "T1★ Strict"
@@ -217,16 +289,13 @@ def render() -> dict:
             label_visibility="collapsed",
             key="tier1_filter_radio",
         )
-
         _tier1_mode, strict_enabled, relax_enabled = _t1_mode_map[tier_choice]
         t2_enabled = (tier_choice == "All signals")
-
-        # Update session state toggles to match (so other pages read correctly)
         SS["cfg_t1s_enabled"] = strict_enabled
         SS["cfg_t1r_enabled"] = relax_enabled
         SS["cfg_t2_enabled"]  = t2_enabled
 
-        # Tier 2 scores (shown only when All signals)
+        # Tier 2 scores
         if t2_enabled:
             with st.expander("Tier 2 score thresholds", expanded=False):
                 tc1, tc2, tc3 = st.columns(3)
@@ -244,7 +313,7 @@ def render() -> dict:
             t2_fib_score = SS.get("cfg_t2_fib_score", 65)
             t2_cci_score = SS.get("cfg_t2_cci_score", 55)
 
-        # Momentum thresholds (collapsed)
+        # Momentum thresholds
         with st.expander("T1 momentum thresholds", expanded=False):
             st.caption("T1★ Strict")
             ms1, ms2, ms3 = st.columns(3)
@@ -284,11 +353,13 @@ def render() -> dict:
         # Parameter Impact Guide
         st.markdown("<div class='settings-panel-label'>Parameter Impact Guide</div>", unsafe_allow_html=True)
         impacts = [
-            ("Min score ↑",    "fewer trades, higher conviction"),
-            ("CCI OS ↑ (e.g. -50)", "looser oversold filter"),
-            ("ATR prox ↑",     "wider golden zone net"),
-            ("Pivot LB ↑",     "uses larger swing highs/lows"),
-            ("Hold days ↑",    "more upside captured, more risk"),
+            ("T1★ score ↑",         "fewer, higher conviction strict signals"),
+            ("T1 Relax score ↑",    "fewer, tighter relaxed signals"),
+            ("CCI OB ↑ (e.g. 150)", "looser overbought guard, more signals"),
+            ("ATR prox ↑",          "wider golden zone net"),
+            ("Pivot LB ↑",          "uses larger swing highs/lows"),
+            ("Hold days ↑",         "more upside captured, more risk"),
+            ("Regime OFF",          "ignores Nifty trend — use with caution"),
         ]
         rows_html = "".join(
             f"<div class='impact-row'>"
@@ -298,11 +369,8 @@ def render() -> dict:
             for k, v in impacts
         )
         st.markdown(rows_html, unsafe_allow_html=True)
-
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # RESET + WORKERS (below panels)
     # ══════════════════════════════════════════════════════════════════════════
     st.markdown("<div style='margin-top:1rem'></div>", unsafe_allow_html=True)
     wcol, rcol, _ = st.columns([2, 2, 6])
@@ -330,8 +398,10 @@ def render() -> dict:
     SS["tier1_mode"]      = tier1_mode
     SS["enable_t1_relax"] = enable_t1_relax
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # ADMIN (collapsed)
+    # Effective min_score for scanner (use lowest of the three so scanner doesn't over-filter;
+    # per-tier gating is handled by the tier1_only / tier filter radio)
+    min_score = min(min_score_strict, min_score_relax, min_score_other)
+
     # ══════════════════════════════════════════════════════════════════════════
     with st.expander("🛠️ Admin & Tools", expanded=False):
         st.markdown("**Auto-Refresh**")
@@ -384,7 +454,7 @@ def render() -> dict:
                     st.error("Supabase save failed.")
             else:
                 SS["watchlist"] = [{"symbol": s, "notes": ""} for s in new_syms]
-                st.success(f"✅ Session only — add Supabase to persist.")
+                st.success("✅ Session only — add Supabase to persist.")
 
         st.markdown("---")
         st.markdown("**Scan History**")
@@ -414,31 +484,35 @@ def render() -> dict:
 
     # ── Return settings dict ──────────────────────────────────────────────────
     return {
-        "min_score":        min_score,
-        "min_score_bt":     min_score,
-        "hold_days":        hold_days,
-        "atr_prox":         atr_prox,
-        "pvt_lb":           pvt_lb,
-        "cci_len":          cci_len,
-        "cci_ob":           cci_ob,
-        "cci_os":           cci_os,
-        "workers":          workers,
-        "tier1_mode":       tier1_mode,
-        "enable_t1_relax":  enable_t1_relax,
-        "t1s_mom1":         t1s_mom1,
-        "t1s_mom3":         t1s_mom3,
-        "t1s_mom6":         t1s_mom6,
-        "t1r_mom1":         t1r_mom1,
-        "t1r_mom3":         t1r_mom3,
-        "t1r_mom6":         t1r_mom6,
-        "t1r_atr_pctile":   t1r_atr_pctile,
-        "t1r_breakout_buf": t1r_breakout_buf / 100.0,
-        "t2_enabled":       t2_enabled,
-        "t2_min_score":     t2_min_score,
-        "t2_fib_score":     t2_fib_score,
-        "t2_cci_score":     t2_cci_score,
-        "symbols":          symbols,
-        "auto_refresh":     SS.get("auto_refresh", False),
-        "refresh_mins":     SS.get("refresh_mins", 5),
-        "save_db":          SS.get("ss_save_db", True),
+        "min_score":          min_score,
+        "min_score_strict":   min_score_strict,
+        "min_score_relax":    min_score_relax,
+        "min_score_other":    min_score_other,
+        "min_score_bt":       min_score,
+        "hold_days":          hold_days,
+        "atr_prox":           atr_prox,
+        "pvt_lb":             pvt_lb,
+        "cci_len":            20,        # fixed — no longer exposed in UI
+        "cci_ob":             cci_ob,
+        "cci_os":             -100,      # fixed — no longer exposed in UI
+        "workers":            workers,
+        "use_regime":         use_regime,
+        "tier1_mode":         tier1_mode,
+        "enable_t1_relax":    enable_t1_relax,
+        "t1s_mom1":           t1s_mom1,
+        "t1s_mom3":           t1s_mom3,
+        "t1s_mom6":           t1s_mom6,
+        "t1r_mom1":           t1r_mom1,
+        "t1r_mom3":           t1r_mom3,
+        "t1r_mom6":           t1r_mom6,
+        "t1r_atr_pctile":     t1r_atr_pctile,
+        "t1r_breakout_buf":   t1r_breakout_buf / 100.0,
+        "t2_enabled":         t2_enabled,
+        "t2_min_score":       t2_min_score,
+        "t2_fib_score":       t2_fib_score,
+        "t2_cci_score":       t2_cci_score,
+        "symbols":            symbols,
+        "auto_refresh":       SS.get("auto_refresh", False),
+        "refresh_mins":       SS.get("refresh_mins", 5),
+        "save_db":            SS.get("ss_save_db", True),
     }
