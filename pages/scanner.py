@@ -543,7 +543,7 @@ def render(settings: dict) -> None:
         # Tier selector — shown inline next to scan button
         tier_filter = st.selectbox(
             "tier",
-            [ "All", "🏆 Tier 1", "📈 Tier 2", "🟡 Tier 3 Recovery", "👁 Tier 4 Watch", "⭐ Watchlist"]
+            [ "All", "🏆 Tier 1", "📈 Tier 2", "🟡 Tier 3 Recovery", "👁 Tier 4 Watch", "⭐ Watchlist"],
             label_visibility="collapsed",
             key="scanner_tier_filter",
         )
