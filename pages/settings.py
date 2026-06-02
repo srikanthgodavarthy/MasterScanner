@@ -1,12 +1,16 @@
 """
-pages/settings.py — Interactive Settings  (v2)
+pages/settings.py — Interactive Settings  (v3)
 
-Three sections rendered as styled tab cards inside the page:
+Five tier sections rendered as styled tab cards inside the page:
   ① Common    — universe, workers, auto-refresh, cache
   ② Tier 1    — persistent_strength thresholds, fib zone, CCI recovery window,
                 EMA alignment toggle, cloud gate, score boost for squeeze
   ③ Tier 2    — compression ATR ratio, compression bars, CCI OB level,
                 volume expansion multiplier
+  ④ Tier 3    — Active Momentum Expansion: RS20, ATR contract, breakout trigger,
+                CCI momentum floor, volume, squeeze bonus
+  ⑤ Tier 4    — Early Recovery: EMA20 transition, RS20 improving, ATR contract,
+                tight range, CCI turning, volume
 
 All sliders / number inputs write immediately to st.session_state so
 scanner.py and backtest.py pick them up on the next run without a page
@@ -54,15 +58,29 @@ DEFAULTS = {
     "t1_fib_lo":        61.8,
     "t1_cci_window":    5,
     "t1_cloud":         True,
-    "t1_squeeze_boost": True,
-    "t1_squeeze_pts":   15,
-    "t1_no_squeeze_pts": 5,
+    "t1_squeeze_boost": False,
+    "t1_squeeze_pts":   0,
+    "t1_no_squeeze_pts": 0,
     "t1_ps_weight":     20,
     "t1_ps_penalty":    -10,
     # Tier 2
     "t2_comp_bars":     10,
     "t2_atr_ratio":     0.85,
     "t2_vol_mult":      1.2,
+    # Tier 3
+    "t3_rs20_min":      3.0,
+    "t3_atr_ratio":     0.90,
+    "t3_breakout_atr":  0.25,
+    "t3_cci_min":       60,
+    "t3_vol_mult":      1.2,
+    "t3_squeeze_bonus": True,
+    "t3_squeeze_pts":   15,
+    # Tier 4
+    "t4_rs20_min":      0.0,
+    "t4_atr_ratio":     0.90,
+    "t4_cci_min":       0,
+    "t4_vol_mult":      1.2,
+    "t4_tight_atr":     1.5,
     # Nifty Regime
     "nifty_regime_filter": False,
 }
@@ -260,6 +278,50 @@ def _preview_common(ss: dict) -> str:
 # ══════════════════════════════════════════════════════════════════
 #  SECTION RENDERERS
 # ══════════════════════════════════════════════════════════════════
+
+def _preview_tier3(ss: dict) -> str:
+    rs20   = ss.get("t3_rs20_min",      3.0)
+    atr_r  = ss.get("t3_atr_ratio",     0.90)
+    brk    = ss.get("t3_breakout_atr",  0.25)
+    cci    = ss.get("t3_cci_min",       60)
+    vol    = ss.get("t3_vol_mult",      1.2)
+    sqz    = ss.get("t3_squeeze_bonus", True)
+    sqzpts = ss.get("t3_squeeze_pts",   15)
+
+    lines = [
+        f'<b>Tier 3 — Active Momentum Expansion Gate</b>',
+        f'  trend_ok          = close > EMA200 <span class="ok">AND</span> EMA20 > EMA50',
+        f'  rs20              > <b>{rs20:.1f}%</b>  (20-bar RS vs Nifty)',
+        f'  atr_contract      = ATR14 < ATR14_SMA20 × <b>{atr_r:.2f}</b>',
+        f'  breakout_trigger  = close > 10d_high <span class="ok">AND</span> (close − 10d_high) / ATR > <b>{brk:.2f}</b>',
+        f'  momentum_expand   = CCI > <b>{cci}</b> <span class="ok">AND</span> CCI rising',
+        f'  volume_expand     = volume > avg × <b>{vol:.1f}</b>',
+        f'',
+        f'  All six must be <span class="ok">True</span> simultaneously',
+        f'  Squeeze release bonus: +<b>{sqzpts}</b> pts' + ('' if sqz else ' <span class="warn">[disabled]</span>'),
+    ]
+    return '<br>'.join(lines)
+
+
+def _preview_tier4(ss: dict) -> str:
+    rs20   = ss.get("t4_rs20_min",   0.0)
+    atr_r  = ss.get("t4_atr_ratio",  0.90)
+    cci    = ss.get("t4_cci_min",    0)
+    vol    = ss.get("t4_vol_mult",   1.2)
+    tatr   = ss.get("t4_tight_atr",  1.5)
+
+    lines = [
+        f'<b>Tier 4 — Early Recovery Gate</b>',
+        f'  close > EMA20  <span class="ok">AND</span>  EMA20 rising',
+        f'  rs20 > <b>{rs20:.1f}%</b>  <span class="ok">AND</span>  rs20 improving (> prev)',
+        f'  atr_contract   = ATR14 < ATR14_SMA20 × <b>{atr_r:.2f}</b>',
+        f'  tight_range    = 5-bar close range < ATR × <b>{tatr:.1f}</b>',
+        f'  CCI > <b>{cci}</b>  <span class="ok">AND</span>  CCI rising',
+        f'  volume_expand  = volume > avg × <b>{vol:.1f}</b>',
+        f'',
+        f'  All nine must be <span class="ok">True</span> simultaneously',
+    ]
+    return '<br>'.join(lines)
 
 def _section_common():
     ss = st.session_state
@@ -627,6 +689,152 @@ def _section_tier2():
     )
 
 
+
+def _section_tier3():
+    ss = st.session_state
+
+    st.markdown(
+        '<div class="cfg-card-title">'        '<span class="dot" style="background:#f59e0b"></span>'        'Tier 3 — Active Momentum Expansion</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("**Relative Strength (20-bar vs Nifty)**")
+    rs20_min = st.slider(
+        "RS20 minimum ( % )", min_value=0.0, max_value=10.0,
+        value=float(ss.get("t3_rs20_min", 3.0)), step=0.5, key="sl_t3_rs20",
+        help="Stock must outperform Nifty by at least this % over 20 bars",
+    )
+    ss["t3_rs20_min"] = float(rs20_min)
+
+    st.divider()
+
+    st.markdown("**ATR Contraction**")
+    st.caption("ATR14 must be below ATR14_SMA20 × ratio — confirms volatility squeeze before breakout")
+    t3_atr = st.slider(
+        "ATR contraction ratio", min_value=0.70, max_value=0.98,
+        value=float(ss.get("t3_atr_ratio", 0.90)), step=0.02, key="sl_t3_atr",
+        format="%.2f",
+    )
+    ss["t3_atr_ratio"] = float(t3_atr)
+
+    st.divider()
+
+    st.markdown("**Breakout Trigger Quality**")
+    st.caption("(close − 10d_high) / ATR14 must exceed this — filters trivial pokes above resistance")
+    brk_atr = st.slider(
+        "Breakout ATR multiple", min_value=0.10, max_value=1.0,
+        value=float(ss.get("t3_breakout_atr", 0.25)), step=0.05, key="sl_t3_brk",
+        format="%.2f",
+    )
+    ss["t3_breakout_atr"] = float(brk_atr)
+
+    st.divider()
+
+    st.markdown("**CCI Momentum Floor**")
+    t3_cci = st.slider(
+        "CCI minimum level", min_value=30, max_value=150,
+        value=int(ss.get("t3_cci_min", 60)), step=10, key="sl_t3_cci",
+        help="CCI must be above this AND still rising",
+    )
+    ss["t3_cci_min"] = int(t3_cci)
+
+    st.divider()
+
+    st.markdown("**Volume Expansion**")
+    t3_vol = st.slider(
+        "Volume > avg × multiplier", min_value=1.0, max_value=3.0,
+        value=float(ss.get("t3_vol_mult", 1.2)), step=0.1, key="sl_t3_vol",
+        format="%.1f",
+    )
+    ss["t3_vol_mult"] = float(t3_vol)
+
+    st.divider()
+
+    st.markdown("**Squeeze Release Bonus** *(score add-on, not a gate)*")
+    sqz_en = st.toggle(
+        "Enable squeeze release bonus",
+        value=bool(ss.get("t3_squeeze_bonus", True)), key="tog_t3_sqz",
+    )
+    ss["t3_squeeze_bonus"] = bool(sqz_en)
+    if sqz_en:
+        sqz_pts = st.slider(
+            "Bonus points on squeeze release", min_value=0, max_value=30,
+            value=int(ss.get("t3_squeeze_pts", 15)), step=5, key="sl_t3_sqzpts",
+        )
+        ss["t3_squeeze_pts"] = int(sqz_pts)
+    else:
+        ss["t3_squeeze_pts"] = 0
+
+    st.markdown(
+        f'<div class="preview-box">{_preview_tier3(ss)}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _section_tier4():
+    ss = st.session_state
+
+    st.markdown(
+        '<div class="cfg-card-title">'        '<span class="dot" style="background:#a78bfa"></span>'        'Tier 4 — Early Recovery</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("**Relative Strength (20-bar vs Nifty)**")
+    st.caption("Must be positive AND improving — ensures leadership is turning, not just neutral")
+    rs20_min = st.slider(
+        "RS20 minimum ( % )", min_value=-2.0, max_value=3.0,
+        value=float(ss.get("t4_rs20_min", 0.0)), step=0.5, key="sl_t4_rs20",
+        help="0 = any positive RS; raise to require meaningful outperformance",
+    )
+    ss["t4_rs20_min"] = float(rs20_min)
+
+    st.divider()
+
+    st.markdown("**ATR Contraction**")
+    t4_atr = st.slider(
+        "ATR contraction ratio", min_value=0.70, max_value=0.98,
+        value=float(ss.get("t4_atr_ratio", 0.90)), step=0.02, key="sl_t4_atr",
+        format="%.2f",
+        help="Volatility must be settling — stock building a base",
+    )
+    ss["t4_atr_ratio"] = float(t4_atr)
+
+    st.divider()
+
+    st.markdown("**Tight Range (base duration)**")
+    st.caption("5-bar close range must be below ATR × multiplier — confirms base is forming")
+    tight_atr = st.slider(
+        "Tight range ATR multiple", min_value=0.5, max_value=3.0,
+        value=float(ss.get("t4_tight_atr", 1.5)), step=0.25, key="sl_t4_tight",
+        format="%.2f",
+    )
+    ss["t4_tight_atr"] = float(tight_atr)
+
+    st.divider()
+
+    st.markdown("**CCI Floor**")
+    t4_cci = st.slider(
+        "CCI minimum level", min_value=-50, max_value=100,
+        value=int(ss.get("t4_cci_min", 0)), step=10, key="sl_t4_cci",
+        help="CCI must be above this AND rising — momentum turning positive",
+    )
+    ss["t4_cci_min"] = int(t4_cci)
+
+    st.divider()
+
+    st.markdown("**Volume Expansion**")
+    t4_vol = st.slider(
+        "Volume > avg × multiplier", min_value=1.0, max_value=3.0,
+        value=float(ss.get("t4_vol_mult", 1.2)), step=0.1, key="sl_t4_vol",
+        format="%.1f",
+    )
+    ss["t4_vol_mult"] = float(t4_vol)
+
+    st.markdown(
+        f'<div class="preview-box">{_preview_tier4(ss)}</div>',
+        unsafe_allow_html=True,
+    )
+
 # ══════════════════════════════════════════════════════════════════
 #  WATCHLIST  (compact version — full management in settings)
 # ══════════════════════════════════════════════════════════════════
@@ -764,7 +972,7 @@ def render() -> dict:
     # ── Section tabs ─────────────────────────────────────────────
     section = st.radio(
         "section",
-        ["⚙️ Common", "🏆 Tier 1", "📈 Tier 2", "⭐ Watchlist", "🗄️ System"],
+        ["⚙️ Common", "🏆 Tier 1", "📈 Tier 2", "📊 Tier 3", "🔄 Tier 4", "⭐ Watchlist", "🗄️ System"],
         label_visibility="collapsed",
         key="settings_section",
     )
@@ -777,6 +985,10 @@ def render() -> dict:
         _section_tier1()
     elif section == "📈 Tier 2":
         _section_tier2()
+    elif section == "📊 Tier 3":
+        _section_tier3()
+    elif section == "🔄 Tier 4":
+        _section_tier4()
     elif section == "⭐ Watchlist":
         _section_watchlist()
         _section_history()
@@ -813,6 +1025,20 @@ def render() -> dict:
         "t2_comp_bars":         ss.get("t2_comp_bars",      10),
         "t2_atr_ratio":         ss.get("t2_atr_ratio",      0.85),
         "t2_vol_mult":          ss.get("t2_vol_mult",       1.2),
+        # Tier 3
+        "t3_rs20_min":          ss.get("t3_rs20_min",      3.0),
+        "t3_atr_ratio":         ss.get("t3_atr_ratio",     0.90),
+        "t3_breakout_atr":      ss.get("t3_breakout_atr",  0.25),
+        "t3_cci_min":           ss.get("t3_cci_min",       60),
+        "t3_vol_mult":          ss.get("t3_vol_mult",      1.2),
+        "t3_squeeze_bonus":     ss.get("t3_squeeze_bonus", True),
+        "t3_squeeze_pts":       ss.get("t3_squeeze_pts",   15),
+        # Tier 4
+        "t4_rs20_min":          ss.get("t4_rs20_min",      0.0),
+        "t4_atr_ratio":         ss.get("t4_atr_ratio",     0.90),
+        "t4_cci_min":           ss.get("t4_cci_min",       0),
+        "t4_vol_mult":          ss.get("t4_vol_mult",      1.2),
+        "t4_tight_atr":         ss.get("t4_tight_atr",     1.5),
         # Nifty regime
         "nifty_regime_filter":  ss.get("nifty_regime_filter", False),
     }
