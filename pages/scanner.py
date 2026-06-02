@@ -292,7 +292,7 @@ _TIER_META = {
         "dot":   "#22c55e",
         "label": "Tier 1 — All 5 Pillars Aligned",
         "desc":  "trend_up · in_golden_relaxed · CCI cross-up · trend_structure · Nifty gate",
-        "setups": ["All 5 Pillars v2"],
+        "setups": ["All 5 Pillars"],
     },
     "Tier 2": {
         "dot":   "#22c55e",
