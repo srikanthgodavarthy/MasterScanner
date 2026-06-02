@@ -73,26 +73,17 @@ def generate_signals_historical(
     ia      = build_indicators(df, nifty, params)
     signals = []
 
-    # Cooldown tracking: how many bars since last Tier-1 signal was emitted
-    bars_since_t1 = 999
-
     for i in range(210, len(df)):
-        r = compute_bar(ia, i, params, bars_since_last=bars_since_t1)
+        r = compute_bar(ia, i, params)
         if r is None:
-            bars_since_t1 = min(bars_since_t1 + 1, 999)
             continue
 
         # Signal acceptance filter
         if tier1_only and not r.tier1_prime:
-            bars_since_t1 = min(bars_since_t1 + 1, 999)
             continue
-
-        # Accept T1, T2, T3; for non-tier signals apply min_score + cloud gate
-        is_actionable = r.tier1_prime or r.tier2_momentum or r.tier3_recovery
-        if not is_actionable:
+        if not r.tier1_prime and not r.tier2_momentum:
             allow_cloud_buy = r.above_cloud or (r.inside_cloud and r.norm_score >= 65)
             if r.norm_score < min_score or not allow_cloud_buy:
-                bars_since_t1 = min(bars_since_t1 + 1, 999)
                 continue
 
         signals.append({
@@ -105,22 +96,12 @@ def generate_signals_historical(
             "t3":              r.t3,
             "cci":             round(r.cur_cci),
             "rsi":             round(r.cur_rsi, 1),
-            "rs20":            round(r.rs20, 2),
             "tier1_prime":     r.tier1_prime,
             "tier2_momentum":  r.tier2_momentum,
-            "tier3_recovery":  r.tier3_recovery,
             "squeeze_release": r.squeeze_release,
-            "atr_contract":    r.atr_contract,
-            "tight_range":     r.tight_range,
             "setup":           r.setup,
             "buy_type":        r.buy_type,
         })
-
-        # Reset cooldown counter when T1 fires
-        if r.tier1_prime:
-            bars_since_t1 = 0
-        else:
-            bars_since_t1 = min(bars_since_t1 + 1, 999)
 
     return pd.DataFrame(signals)
 
@@ -209,9 +190,7 @@ def simulate_trades(
             "buy_type":        sig.get("buy_type", "-"),
             "tier1_prime":     bool(sig.get("tier1_prime",    False)),
             "tier2_momentum":  bool(sig.get("tier2_momentum", False)),
-            "tier3_recovery":  bool(sig.get("tier3_recovery", False)),
             "squeeze_release": bool(sig.get("squeeze_release", False)),
-            "atr_contract":    bool(sig.get("atr_contract",   False)),
         })
 
         blocked_until = exit_date
@@ -358,11 +337,9 @@ def compute_stats(trades: pd.DataFrame) -> dict:
         "exit_breakdown":     trades["exit_reason"].value_counts().to_dict(),
         "t1_prime_trades":    int(trades.get("tier1_prime",    pd.Series([False]*total)).sum()),
         "t2_momentum_trades": int(trades.get("tier2_momentum", pd.Series([False]*total)).sum()),
-        "t3_recovery_trades": int(trades.get("tier3_recovery", pd.Series([False]*total)).sum()),
         "squeeze_trades":     int(trades.get("squeeze_release",pd.Series([False]*total)).sum()),
         "t1_prime_stats":     _slice("tier1_prime"),
         "t2_momentum_stats":  _slice("tier2_momentum"),
-        "t3_recovery_stats":  _slice("tier3_recovery"),
         "squeeze_stats":      _slice("squeeze_release"),
         "setup_stats":        setup_stats,
     }
