@@ -119,6 +119,8 @@ class BarResult:
     tier1_prime:      bool = False
     tier2_momentum:   bool = False
     any_buy:          bool = False
+    tier3_momentum:   bool = False   # Active Momentum Expansion
+    tier4_recovery:   bool = False   # Early Recovery
 
     # ── Score ────────────────────────────────────────────────────
     norm_score:       int  = 0
@@ -189,16 +191,25 @@ class BarResult:
     t2_norm_strong:  bool = False
     t2_norm:         bool = False
 
-    # ── Tier 3 watch sub-conditions ──────────────────────────────
-    t3_near_golden:  bool = False
-    t3_cci_rec:      bool = False
-    t3_cloud_test:   bool = False
-    t3_ema_conv:     bool = False
+    # ── Tier 3 — Active Momentum Expansion sub-conditions ───────
+    t3_trend_ok:         bool = False
+    t3_rs20_strong:      bool = False
+    t3_atr_contract:     bool = False
+    t3_breakout_trigger: bool = False
+    t3_momentum_expand:  bool = False
+    t3_volume_expand:    bool = False
+    t3_squeeze_bonus:    bool = False
 
-    # ── Tier 4 / skip sub-conditions ─────────────────────────────
-    t4_hard_stop:    bool = False
-    t4_fib_resist:   bool = False
-    t4_downtrend:    bool = False
+    # ── Tier 4 — Early Recovery sub-conditions ───────────────────
+    t4_close_above_e20:  bool = False
+    t4_e20_rising:       bool = False
+    t4_rs20_positive:    bool = False
+    t4_rs20_improving:   bool = False
+    t4_atr_contract:     bool = False
+    t4_tight_range:      bool = False
+    t4_cci_positive:     bool = False
+    t4_cci_rising:       bool = False
+    t4_volume_expand:    bool = False
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -498,6 +509,34 @@ def compute_bar(
     trend_strong = cur_c > cur_e20 and cur_e20 > cur_e50
     qualified    = strong_htf and trend_strong
 
+    # ── RS20 — 20-bar RS vs Nifty (Tier 3 / Tier 4 use) ──────────
+    rs20 = 0.0
+    if i >= 20:
+        c20   = float(c.iloc[i - 20])
+        n_now = float(ia.nifty_aligned.iloc[i])    if not np.isnan(float(ia.nifty_aligned.iloc[i]))    else 0
+        n20   = float(ia.nifty_aligned.iloc[i-20]) if not np.isnan(float(ia.nifty_aligned.iloc[i-20])) else 0
+        if c20 > 0 and n20 > 0 and n_now > 0:
+            rs20 = (cur_c / c20 - 1) * 100 - (n_now / n20 - 1) * 100
+    prev_rs20 = 0.0
+    if i >= 21:
+        c20p  = float(c.iloc[i - 21])
+        c1p   = float(c.iloc[i - 1])
+        n1    = float(ia.nifty_aligned.iloc[i-1])  if not np.isnan(float(ia.nifty_aligned.iloc[i-1]))  else 0
+        n21   = float(ia.nifty_aligned.iloc[i-21]) if not np.isnan(float(ia.nifty_aligned.iloc[i-21])) else 0
+        if c20p > 0 and n21 > 0 and n1 > 0:
+            prev_rs20 = (c1p / c20p - 1) * 100 - (n1 / n21 - 1) * 100
+
+    # ── TIGHT RANGE — 5-bar close range < 1.5× ATR (base building) ─
+    if i >= 5:
+        rng5 = float(c.iloc[i-4:i+1].max()) - float(c.iloc[i-4:i+1].min())
+        tight_range = rng5 < cur_atr * 1.5
+    else:
+        tight_range = False
+
+    # ── ATR CONTRACTION (shared Tier 3 / Tier 4) ─────────────────
+    # cur_atr_sma20 already computed; reuse
+    atr_contract = cur_atr < cur_atr_sma20 * 0.90
+
     # ── PIVOTS / HARMONICS / ABCD ─────────────────────────────────
     _, _, harm_bull, harm_bear, abcd_bull, abcd_bear = _get_pivots(ia, i, params.pvt_lb)
 
@@ -608,6 +647,56 @@ def compute_bar(
         prev_squeeze_on          # squeeze context must precede breakout
     )
 
+    # ── TIER 3 — ACTIVE MOMENTUM EXPANSION ──────────────────────
+    # All six conditions must be true simultaneously.
+    t3_trend_ok_flag        = cur_c > cur_e200 and cur_e20 > cur_e50
+    t3_rs20_strong_flag     = rs20 > 3.0
+    t3_atr_contract_flag    = atr_contract
+    t3_10d_high             = float(h.iloc[max(0, i - 10):i].max()) if i >= 1 else float(h.iloc[i])
+    t3_breakout_qual        = (cur_c - t3_10d_high) / cur_atr if cur_atr > 0 else 0.0
+    t3_breakout_trigger_flag = (
+        cur_c > t3_10d_high and
+        cur_c > prev_close  and
+        t3_breakout_qual > 0.25
+    )
+    t3_momentum_expand_flag = cur_cci > 60 and cur_cci > prev_cci
+    t3_volume_expand_flag   = cur_v > cur_vavg * 1.2
+    t3_squeeze_bonus_flag   = squeeze_release   # bonus: not a gate condition
+
+    is_tier3_momentum = (
+        t3_trend_ok_flag         and
+        t3_rs20_strong_flag      and
+        t3_atr_contract_flag     and
+        t3_breakout_trigger_flag and
+        t3_momentum_expand_flag  and
+        t3_volume_expand_flag
+    )
+
+    # ── TIER 4 — EARLY RECOVERY ───────────────────────────────────
+    # All conditions must be true simultaneously.
+    prev_e20_val = float(ia.e20.iloc[i - 1]) if i >= 1 else cur_e20
+    t4_close_above_e20_flag = cur_c > cur_e20
+    t4_e20_rising_flag      = cur_e20 > prev_e20_val
+    t4_rs20_positive_flag   = rs20 > 0.0
+    t4_rs20_improving_flag  = rs20 > prev_rs20
+    t4_atr_contract_flag    = atr_contract
+    t4_tight_range_flag     = tight_range
+    t4_cci_positive_flag    = cur_cci > 0
+    t4_cci_rising_flag      = cur_cci > prev_cci
+    t4_volume_expand_flag   = cur_v > cur_vavg * 1.2
+
+    is_tier4_recovery = (
+        t4_close_above_e20_flag and
+        t4_e20_rising_flag      and
+        t4_rs20_positive_flag   and
+        t4_rs20_improving_flag  and
+        t4_atr_contract_flag    and
+        t4_tight_range_flag     and
+        t4_cci_positive_flag    and
+        t4_cci_rising_flag      and
+        t4_volume_expand_flag
+    )
+
     # ── NORMALISE ─────────────────────────────────────────────────
     norm_score = min(100, int(score * 100 / params.max_score))
 
@@ -634,6 +723,8 @@ def compute_bar(
         "Tier 1" if is_tier1_prime    else
         "Tier 2" if is_tier2_momentum else
         "Tier 2" if any_buy           else
+        "Tier 3" if is_tier3_momentum else
+        "Tier 4" if is_tier4_recovery else
         "Other"
     )
 
@@ -733,6 +824,10 @@ def compute_bar(
             "Norm Buy"    if t2_norm        else
             "Buy"
         )
+    elif is_tier3_momentum:
+        setup = "Momo Expand" + (" +Sqz" if t3_squeeze_bonus_flag else "")
+    elif is_tier4_recovery:
+        setup = "Recovery"
     elif norm_score >= 50:
         setup = (
             "Near Golden"  if near_golden    else
@@ -758,6 +853,8 @@ def compute_bar(
         tier1_prime      = is_tier1_prime,
         tier2_momentum   = is_tier2_momentum,
         any_buy          = any_buy,
+        tier3_momentum   = is_tier3_momentum,
+        tier4_recovery   = is_tier4_recovery,
         norm_score       = norm_score,
         score_threshold  = score_threshold,
         entry  = en,
@@ -813,11 +910,20 @@ def compute_bar(
         t2_cci_break    = t2_cci_break,
         t2_norm_strong  = t2_norm_strong,
         t2_norm         = t2_norm,
-        t3_near_golden  = near_golden,
-        t3_cci_rec      = cci_recovering,
-        t3_cloud_test   = cloud_test,
-        t3_ema_conv     = ema_converging,
-        t4_hard_stop    = hard_stop,
-        t4_fib_resist   = (near_ext127 or near_ext161),
-        t4_downtrend    = (trend_down and below_cloud),
+        t3_trend_ok         = t3_trend_ok_flag,
+        t3_rs20_strong      = t3_rs20_strong_flag,
+        t3_atr_contract     = t3_atr_contract_flag,
+        t3_breakout_trigger = t3_breakout_trigger_flag,
+        t3_momentum_expand  = t3_momentum_expand_flag,
+        t3_volume_expand    = t3_volume_expand_flag,
+        t3_squeeze_bonus    = t3_squeeze_bonus_flag,
+        t4_close_above_e20  = t4_close_above_e20_flag,
+        t4_e20_rising       = t4_e20_rising_flag,
+        t4_rs20_positive    = t4_rs20_positive_flag,
+        t4_rs20_improving   = t4_rs20_improving_flag,
+        t4_atr_contract     = t4_atr_contract_flag,
+        t4_tight_range      = t4_tight_range_flag,
+        t4_cci_positive     = t4_cci_positive_flag,
+        t4_cci_rising       = t4_cci_rising_flag,
+        t4_volume_expand    = t4_volume_expand_flag,
     )
