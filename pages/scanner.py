@@ -302,15 +302,15 @@ _TIER_META = {
     },
     "Tier 3": {
         "dot":   "#f59e0b",
-        "label": "Tier 3 — Watch  ·  Developing setups",
-        "desc":  "Near Golden · CCI Recovery · Cloud Test · EMA Converge · RSI Base · Vol Surge",
-        "setups": ["Near Golden","CCI Recovery","Cloud Test","EMA Converge","RSI Base","Vol Surge","Developing"],
+        "label": "Tier 3 — Active Momentum Expansion",
+        "desc":  "trend_ok · RS20>3 · ATR contract · Breakout trigger · CCI expand · Volume confirm",
+        "setups": ["Momo Expand","Momo Expand +Sqz"],
     },
     "Tier 4": {
-        "dot":   "#ef4444",
-        "label": "Tier 4 — Skip  ·  Structural weakness",
-        "desc":  "Hard Stop · Fib Resist · CCI Extended · Downtrend · Weak Mom · Low Score",
-        "setups": ["Hard Stop","Fib Resist","CCI Extended","Downtrend","Weak Mom","Low Score"],
+        "dot":   "#a78bfa",
+        "label": "Tier 4 — Early Recovery",
+        "desc":  "c>EMA20 rising · RS20 positive+improving · ATR contract · Tight range · CCI rising · Volume",
+        "setups": ["Recovery"],
     },
 }
 
@@ -542,7 +542,7 @@ def render(settings: dict) -> None:
         # Tier selector — shown inline next to scan button
         tier_filter = st.selectbox(
             "tier",
-            ["All", "🏆 Tier 1", "📈 Tier 2", "⭐ Watchlist"],
+            ["All", "🏆 Tier 1", "📈 Tier 2", "📊 Tier 3", "🔄 Tier 4", "⭐ Watchlist"],
             label_visibility="collapsed",
             key="scanner_tier_filter",
         )
@@ -620,18 +620,20 @@ def render(settings: dict) -> None:
     has_t1 = "_tier1_prime" in fdf.columns
     has_ab = "_any_buy"     in fdf.columns
 
-    mask_t1 = fdf["_tier1_prime"] if has_t1 else pd.Series(False, index=fdf.index)
-    mask_ab = fdf["_any_buy"]     if has_ab else pd.Series(False, index=fdf.index)
+    mask_t1 = fdf["_tier1_prime"]    if "_tier1_prime"    in fdf.columns else pd.Series(False, index=fdf.index)
+    mask_ab = fdf["_any_buy"]        if "_any_buy"        in fdf.columns else pd.Series(False, index=fdf.index)
+    mask_t3 = fdf["_tier3_momentum"] if "_tier3_momentum" in fdf.columns else pd.Series(False, index=fdf.index)
+    mask_t4 = fdf["_tier4_recovery"] if "_tier4_recovery" in fdf.columns else pd.Series(False, index=fdf.index)
 
     sort_col = "AccScore" if "AccScore" in fdf.columns else "Score"
 
     df_t1 = fdf[mask_t1].sort_values(sort_col, ascending=False)
     df_t2 = fdf[mask_ab & ~mask_t1].sort_values("Score", ascending=False)
-    df_t3 = fdf[fdf["Action"] == "👁 WATCH"].sort_values("Score", ascending=False)
-    df_t4 = fdf[fdf["Action"] == "⛔ SKIP"].sort_values("Score", ascending=False)
+    df_t3 = fdf[mask_t3 & ~mask_ab & ~mask_t1].sort_values("Score", ascending=False)
+    df_t4 = fdf[mask_t4 & ~mask_t3 & ~mask_ab & ~mask_t1].sort_values("Score", ascending=False)
 
     # Tier badge line — shows counts for active filter
-    t1_n, t2_n = len(df_t1), len(df_t2)
+    t1_n, t2_n, t3_n, t4_n = len(df_t1), len(df_t2), len(df_t3), len(df_t4)
     _tf = st.session_state.get("scanner_tier_filter", "All")
     badge_parts = []
     if _tf in ("All", "🏆 Tier 1"):
@@ -646,17 +648,33 @@ def render(settings: dict) -> None:
             f'border-radius:12px;font-size:11px;font-weight:600;margin-right:4px">'
             f'📈 Tier 2 · {t2_n}</span>'
         )
+    if _tf in ("All", "📊 Tier 3"):
+        badge_parts.append(
+            f'<span style="background:#78350f;color:#fbbf24;padding:3px 10px;'
+            f'border-radius:12px;font-size:11px;font-weight:600;margin-right:4px">'
+            f'📊 Tier 3 · {t3_n}</span>'
+        )
+    if _tf in ("All", "🔄 Tier 4"):
+        badge_parts.append(
+            f'<span style="background:#2e1065;color:#c4b5fd;padding:3px 10px;'
+            f'border-radius:12px;font-size:11px;font-weight:600;margin-right:4px">'
+            f'🔄 Tier 4 · {t4_n}</span>'
+        )
     if badge_parts:
         st.markdown(
             f'<div style="margin-bottom:8px">{"".join(badge_parts)}</div>',
             unsafe_allow_html=True,
         )
 
-    # Render only selected tier(s) — Tier 3 / Tier 4 removed from scanner view
+    # Render selected tier(s)
     if _tf in ("All", "🏆 Tier 1"):
         _tier_expander("Tier 1", df_t1, cci_ob, cci_os, wl_syms_set, expanded=True)
     if _tf in ("All", "📈 Tier 2"):
         _tier_expander("Tier 2", df_t2, cci_ob, cci_os, wl_syms_set, expanded=(_tf == "📈 Tier 2"))
+    if _tf in ("All", "📊 Tier 3"):
+        _tier_expander("Tier 3", df_t3, cci_ob, cci_os, wl_syms_set, expanded=(_tf == "📊 Tier 3"))
+    if _tf in ("All", "🔄 Tier 4"):
+        _tier_expander("Tier 4", df_t4, cci_ob, cci_os, wl_syms_set, expanded=(_tf == "🔄 Tier 4"))
     if _tf == "⭐ Watchlist":
         pass  # watchlist section renders below; skip tier expanders entirely
 
