@@ -679,7 +679,7 @@ def render(settings: dict) -> None:
         prog = st.progress(0.0, text="Initialising…")
         with st.spinner("Fetching & scoring Nifty 500…"):
             df_raw = run_scanner(
-                symbols=symbols, cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
+                symbols=symbols, settings=settings, cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
                 max_workers=workers,
                 progress_cb=lambda p: prog.progress(p, text=f"Scanning… {int(p*100)}%"),
             )
