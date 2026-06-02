@@ -55,8 +55,8 @@ class ScoringParams:
 
     # Tier 1 — squeeze boost
     t1_squeeze_boost:    bool  = True
-    t1_squeeze_pts:      int   = 15   # points on release
-    t1_no_squeeze_pts:   int   = 5    # points when not in squeeze
+    t1_squeeze_pts:      int   = 0    # neutralised — context gate in Tier 2 handles it
+    t1_no_squeeze_pts:   int   = 0    # neutralised
 
     # Tier 1 — persistent_strength score weight
     t1_ps_weight:  int = 20    # added when True
@@ -76,7 +76,7 @@ class ScoringParams:
     nifty_regime_val:    str  = "neutral"   # "bull" | "bear" | "neutral"
 
     # Score normalisation
-    max_score: int = 175
+    max_score: int = 130
 
     @classmethod
     def from_settings(cls, s: dict) -> "ScoringParams":
@@ -94,10 +94,11 @@ class ScoringParams:
             t1_cci_window    = int(s.get("t1_cci_window",        5)),
             t1_cloud         = bool(s.get("t1_cloud",           True)),
             t1_squeeze_boost = bool(s.get("t1_squeeze_boost",   True)),
-            t1_squeeze_pts   = int(s.get("t1_squeeze_pts",      15)),
-            t1_no_squeeze_pts= int(s.get("t1_no_squeeze_pts",    5)),
+            t1_squeeze_pts   = int(s.get("t1_squeeze_pts",       0)),
+            t1_no_squeeze_pts= int(s.get("t1_no_squeeze_pts",    0)),
             t1_ps_weight     = int(s.get("t1_ps_weight",        20)),
             t1_ps_penalty    = int(s.get("t1_ps_penalty",      -10)),
+            max_score        = int(s.get("max_score",          130)),
             t2_comp_bars     = int(s.get("t2_comp_bars",        10)),
             t2_atr_ratio     = float(s.get("t2_atr_ratio",      0.85)),
             t2_vol_mult      = float(s.get("t2_vol_mult",        1.2)),
@@ -501,34 +502,85 @@ def compute_bar(
     _, _, harm_bull, harm_bear, abcd_bull, abcd_bear = _get_pivots(ia, i, params.pvt_lb)
 
     # ── RAW SCORE ─────────────────────────────────────────────────
+    # Budget (max_score = 130):
+    #   Trend structure    25   (trend_up)
+    #   EMA slope          15   (ema_slope — expansion, not overlap)
+    #   RSI rising         15   (rising from 40-60; -5 if ≥70)
+    #   Volume             8    (reduced weight)
+    #   Breakout quality   20   (ATR-relative; penalises extension)
+    #   RS vs Nifty        15   (rs > 0.03 threshold)
+    #   Fibonacci zone     30   (in_golden — unchanged)
+    #   Fib extension     -40/-60  (near_ext127/161)
+    #   CCI               20   (OS = 20, caution at 120, penalty at 200)
+    #   CCI cross OS       15   (unchanged)
+    #   CCI extended      -15   (total -40 at >200)
+    #   Persist. strength  20/-10
+    #   Harmonic/ABCD      5/5  (tie-breaker only)
+    #   Below cloud       -15
+    #   Squeeze           neutralised (0) — gate in Tier 2
+    #   Tier 1 bonus       20
+    # ─────────────────────────────────────────────────────────────
     score = 0.0
 
+    # ① TREND — unchanged, primary pillar (25)
     score += 25 if trend_up else 0
-    score += 30 if cur_e20 > cur_e50 else (20 if cur_e20 > cur_e50 * 0.995 else 0)
-    score += (25 if cur_r > 60 else 20 if cur_r > 55 else 15 if cur_r > 50 else 5 if cur_r > 45 else 0)
-    score += (20 if cur_v > cur_vavg * 1.2 else 10 if cur_v > cur_vavg else 0)
 
+    # ② EMA SLOPE — replaces double-count; rewards active expansion not just alignment (15)
+    prev_e20 = float(ia.e20.iloc[i - 1]) if i >= 1 else cur_e20
+    ema_slope = cur_e20 > prev_e20 and cur_e50 > prev_e50
+    score += 15 if ema_slope else 0
+
+    # ③ RSI — rewards rising RSI from oversold/neutral; penalises overbought (max 15)
+    prev_rsi = float(ia.rsi_s.iloc[i - 1]) if i >= 1 else cur_r
+    rsi_rising_from_os = cur_r > prev_rsi and 40 < cur_r < 60
+    score += (15 if rsi_rising_from_os else 5 if 55 <= cur_r < 65 else -5 if cur_r >= 70 else 0)
+
+    # ④ VOLUME — reduced weight; signal preserved (max 8)
+    score += (8 if cur_v > cur_vavg * 1.5 else 5 if cur_v > cur_vavg * 1.2 else 0)
+
+    # ⑤ BREAKOUT QUALITY — ATR-relative; rewards clean base, penalises extension (max 20)
     hh = float(ia.c.iloc[max(0, i - 10):i].max()) if i >= 1 else cur_c
-    score += (25 if cur_c > hh else 15 if cur_c > hh * 0.98 else 0)
-    score += 10 if i >= 2 and cur_c > float(c.iloc[i - 2]) else 0
+    breakout_quality = (cur_c - hh) / cur_atr if cur_atr > 0 else 0.0
+    score += (20 if 0 <= breakout_quality <= 0.5  else
+              10 if 0.5 < breakout_quality <= 1.5 else
+             -10 if breakout_quality > 1.5         else 0)
+    # dropped: "+10 if up 2 bars" — no structural meaning
 
-    score += (15 if rs > 0 else 5 if rs > -0.005 else 0)
-    score += 30 if in_golden    else 0
-    score += -20 if near_ext127 else (-30 if near_ext161 else 0)
+    # ⑥ RELATIVE STRENGTH — meaningful outperformance required (max 15)
+    score += (15 if rs > 0.03 else 8 if rs > 0.01 else 0 if rs >= 0 else -5)
 
-    score += (20 if cur_cci < params.cci_os else 10 if cur_cci < 0 else -15 if cci_extended else 0)
+    # ⑦ FIBONACCI ZONE — unchanged, core signal (30)
+    score += 30 if in_golden else 0
+
+    # ⑧ FIBONACCI EXTENSION PENALTIES — hardened; compound if also CCI extended (max -40/-60)
+    ext127_penalty = -40 if not cci_extended else -55
+    ext161_penalty = -60 if not cci_extended else -75
+    score += ext127_penalty if near_ext127 else (ext161_penalty if near_ext161 else 0)
+
+    # ⑨ CCI — penalty starts at 120 (caution), hardens at 200 (extended) (max 20)
+    cci_caution = cur_cci > 120 and not cci_extended   # early warning zone
+    score += (20 if cur_cci < params.cci_os else
+              10 if cur_cci < 0             else
+             -10 if cci_caution             else
+             -15 if cci_extended            else 0)
     score += 15 if cci_cross_up_os else 0
-    score -= 10 if cci_extended    else 0
+    score -= 15 if cci_extended    else 0   # total at >200: -30; with ext127/161 compound: far worse
 
+    # ⑩ PERSISTENT STRENGTH — unchanged weight
     score += params.t1_ps_weight if persistent_strength else params.t1_ps_penalty
-    score += 20 if harm_bull else 0
-    score += 15 if abcd_bull else 0
+
+    # ⑪ HARMONIC / ABCD — tie-breaker only; not primary score mass (5 each)
+    score += 5 if harm_bull else 0
+    score += 5 if abcd_bull else 0
+
+    # ⑫ CLOUD — penalty unchanged
     score += -15 if below_cloud else 0
 
-    # Squeeze boost
+    # ⑬ SQUEEZE — neutralised in score; prev_squeeze_on gate added to Tier 2 below
     if params.t1_squeeze_boost:
         score += params.t1_squeeze_pts if squeeze_release else \
                  (params.t1_no_squeeze_pts if not squeeze_on else 0)
+        # With defaults now 0/0 this block is inert; kept so Settings page override still works
 
     # ── TIER 1 PRIME GATE ─────────────────────────────────────────
     # Optional Nifty regime gate: when enabled, Nifty must be in bull
@@ -552,7 +604,8 @@ def compute_bar(
     is_tier2_momentum = (
         compression_break        and
         cci_momentum_break       and
-        cur_v > cur_vavg * params.t2_vol_mult
+        cur_v > cur_vavg * params.t2_vol_mult and
+        prev_squeeze_on          # squeeze context must precede breakout
     )
 
     # ── NORMALISE ─────────────────────────────────────────────────
