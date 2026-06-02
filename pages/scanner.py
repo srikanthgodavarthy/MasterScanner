@@ -673,15 +673,15 @@ def render(settings: dict) -> None:
 
     # Render only selected tier(s) — Tier 3 / Tier 4 removed from scanner view
     if _tf in ("All", "🏆 Tier 1"):
-        _tier_expander("Tier 1", df_t1, cci_ob, cci_os, wl_syms_set, expanded=True)
+      _tier_expander("Tier 1", df_t1, cci_ob, cci_os, wl_syms_set, expanded=True)
     if _tf in ("All", "📈 Tier 2"):
-        _tier_expander("Tier 2", df_t2, cci_ob, cci_os, wl_syms_set, expanded=(_tf == "📈 Tier 2"))
+      _tier_expander("Tier 2", df_t2, cci_ob, cci_os, wl_syms_set, expanded=(_tf == "📈 Tier 2"))
     if _tf == "⭐ Watchlist":
-        pass  # watchlist section renders below; skip tier expanders entirely
+      pass  # watchlist section renders below; skip tier expanders entirely
     if _tf in ("All", "🟡 Tier 3 Recovery"):
-        _tier_expander("Tier 3 Recovery",df_t3_rec,cci_ob,cci_os,wl_syms_set, expanded=False)
+      _tier_expander("Tier 3", df_t3_rec, cci_ob, cci_os, wl_syms_set, expanded=False)
     if _tf in ("All", "👁 Tier 4 Watch"):
-        _tier_expander("Tier 4 Watch",df_t4_watch,cci_ob,cci_os,wl_syms_set,expanded=False)
+      _tier_expander("Tier 4", df_t4_watch, cci_ob, cci_os, wl_syms_set, expanded=False)
     # ── SUMMARY PILL BAR ──────────────────────────────────────────
     st.markdown(_summary_bar(df), unsafe_allow_html=True)
 
