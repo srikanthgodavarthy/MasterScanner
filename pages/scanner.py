@@ -291,7 +291,7 @@ _TIER_META = {
     "Tier 1": {
         "dot":   "#22c55e",
         "label": "Tier 1 — Prime  ·  All 5 pillars  ·  ~90%+",
-        "desc":  "trend_up · in_golden · CCI cross-up · qualified ⭐ · inside cloud",
+        "desc":  "trend_up · in_golden_relaxed · CCI cross-up · trend_structure · Nifty gate",
         "setups": ["All 5 Pillars"],
     },
     "Tier 2": {
@@ -368,8 +368,6 @@ def _summary_bar(df: pd.DataFrame) -> str:
     pills = [
         ("#166534", "#4ade80", f"Tier 1 · {t1}"),
         ("#1e3a5f", "#60a5fa", f"Tier 2 · {t2}"),
-        ("#78350f", "#fcd34d", f"Tier 3 · {t3}"),
-        ("#7f1d1d", "#fca5a5", f"Tier 4 · {t4}"),
         ("#0f2d2d", "#2dd4bf", f"Golden Zone · {golden}"),
         ("#2e1065", "#c4b5fd", f"CCI Buy · {cci_buy}"),
         ("#831843", "#f9a8d4", f"CCI Exit · {cci_exit}"),
@@ -537,16 +535,24 @@ def render(settings: dict) -> None:
     )
 
     # ── CONTROL ROW ───────────────────────────────────────────────
-    c1, c2, c3, c4 = st.columns([1, 3, 2, 2])
+    c1, c2, c3, c4, c5 = st.columns([1, 1.4, 3, 2, 2])
     with c1:
         run_btn = st.button("🔍 Run Scan", type="primary", use_container_width=True)
     with c2:
+        # Tier selector — shown inline next to scan button
+        tier_filter = st.selectbox(
+            "tier",
+            ["All", "🏆 Tier 1", "📈 Tier 2", "⭐ Watchlist"],
+            label_visibility="collapsed",
+            key="scanner_tier_filter",
+        )
+    with c3:
         search = st.text_input("search", placeholder="🔎  Search symbol…  e.g. RELIANCE, TCS",
                                label_visibility="collapsed", key="search_input")
-    with c3:
+    with c4:
        hi_prob_only = st.toggle("🎯 Hi Prob", value=False, key="hi_prob_toggle",
                              help="trend_up · in_golden · score ≥ 55")
-    with c4:
+    with c5:
         snap_label = st.text_input("snap", placeholder="Snapshot label (optional)",
                                    label_visibility="collapsed", key="snap_input")
     if auto_refresh:
@@ -624,10 +630,35 @@ def render(settings: dict) -> None:
     df_t3 = fdf[fdf["Action"] == "👁 WATCH"].sort_values("Score", ascending=False)
     df_t4 = fdf[fdf["Action"] == "⛔ SKIP"].sort_values("Score", ascending=False)
 
-    _tier_expander("Tier 1", df_t1, cci_ob, cci_os, wl_syms_set, expanded=True)
-    _tier_expander("Tier 2", df_t2, cci_ob, cci_os, wl_syms_set, expanded=False)
-    _tier_expander("Tier 3", df_t3, cci_ob, cci_os, wl_syms_set, expanded=False)
-    _tier_expander("Tier 4", df_t4, cci_ob, cci_os, wl_syms_set, expanded=False)
+    # Tier badge line — shows counts for active filter
+    t1_n, t2_n = len(df_t1), len(df_t2)
+    _tf = st.session_state.get("scanner_tier_filter", "All")
+    badge_parts = []
+    if _tf in ("All", "🏆 Tier 1"):
+        badge_parts.append(
+            f'<span style="background:#166534;color:#4ade80;padding:3px 10px;'
+            f'border-radius:12px;font-size:11px;font-weight:600;margin-right:4px">'
+            f'🏆 Tier 1 · {t1_n}</span>'
+        )
+    if _tf in ("All", "📈 Tier 2"):
+        badge_parts.append(
+            f'<span style="background:#1e3a5f;color:#60a5fa;padding:3px 10px;'
+            f'border-radius:12px;font-size:11px;font-weight:600;margin-right:4px">'
+            f'📈 Tier 2 · {t2_n}</span>'
+        )
+    if badge_parts:
+        st.markdown(
+            f'<div style="margin-bottom:8px">{"".join(badge_parts)}</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Render only selected tier(s) — Tier 3 / Tier 4 removed from scanner view
+    if _tf in ("All", "🏆 Tier 1"):
+        _tier_expander("Tier 1", df_t1, cci_ob, cci_os, wl_syms_set, expanded=True)
+    if _tf in ("All", "📈 Tier 2"):
+        _tier_expander("Tier 2", df_t2, cci_ob, cci_os, wl_syms_set, expanded=(_tf == "📈 Tier 2"))
+    if _tf == "⭐ Watchlist":
+        pass  # watchlist section renders below; skip tier expanders entirely
 
     # ── SUMMARY PILL BAR ──────────────────────────────────────────
     st.markdown(_summary_bar(df), unsafe_allow_html=True)

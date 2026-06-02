@@ -40,34 +40,6 @@ def render(settings=None):
             key="bt_universe",
         )
 
-        # ── Tier 1 Prime filter ───────────────────────────────────────────────
-        bt_tier1_only = st.checkbox(
-            "🏆 Tier 1 Prime signals only",
-            value=False,
-            key="bt_tier1_only",
-            help=(
-                "Restrict backtest to signals where ALL 5 structural pillars "
-                "align simultaneously:\n\n"
-                "• trend_up (price > EMA200, EMA20 > EMA50)\n"
-                "• in_golden (price at 50–61.8% fib retracement)\n"
-                "• cci_cross_up_os (CCI crossed up through -100)\n"
-                "• qualified (mom1>5%, mom3>10%, mom6>15%)\n"
-                "• above_cloud (price above Ichimoku cloud)\n\n"
-                "This is the rarest, highest-conviction setup. "
-                "Expect fewer trades but cleaner win-rate data."
-            ),
-        )
-
-        if bt_tier1_only:
-            st.markdown(
-                "<div style='background:#1e1040;border:1px solid #4c1d95;"
-                "border-radius:6px;padding:0.5rem 0.7rem;margin-top:-0.3rem;"
-                "font-size:0.75rem;color:#c4b5fd;line-height:1.5;'>"
-                "⚠️ <b>Tier 1 only</b> — all other buy types are excluded. "
-                "Use Nifty 200 or wider universe to get meaningful sample size."
-                "</div>",
-                unsafe_allow_html=True,
-            )
 
         st.markdown("---")
 
@@ -84,15 +56,6 @@ def render(settings=None):
     # ── Header ────────────────────────────────────────────────────────────────
     st.markdown("### 🧪 Backtest Engine")
 
-    # Active mode badge
-    if bt_tier1_only:
-        st.markdown(
-            "<div style='display:inline-block;background:#4c1d95;color:#c4b5fd;"
-            "border-radius:6px;padding:0.3rem 0.8rem;font-size:0.8rem;"
-            "font-weight:600;margin-bottom:0.5rem;'>🏆 Tier 1 Prime Mode</div>",
-            unsafe_allow_html=True,
-        )
-
     st.markdown(
         "<span style='color:#64748b;font-size:0.82rem;'>"
         "Walk-forward simulation on 3 years of daily data. "
@@ -101,19 +64,32 @@ def render(settings=None):
     )
     st.markdown("")
 
-    col_run, col_info = st.columns([2, 5])
+    col_run, col_tier, col_info = st.columns([1.5, 1.3, 4])
     with col_run:
         run_bt = st.button("▶ Run Backtest", use_container_width=True, key="btn_run_bt")
+    with col_tier:
+        bt_tier_mode = st.selectbox(
+            "tier_mode",
+            ["Both Tiers", "🏆 Tier 1 Only", "📈 Tier 2 Only"],
+            label_visibility="collapsed",
+            key="bt_tier_mode",
+        )
     with col_info:
-        mode_label = "Tier 1 Prime only" if bt_tier1_only else f"Min Score: <b>{bt_min_score}</b>"
+        _tier_lbl = {
+            "Both Tiers":    "Both Tiers",
+            "🏆 Tier 1 Only": "<b style='color:#a78bfa'>Tier 1 Prime only</b>",
+            "📈 Tier 2 Only": "<b style='color:#60a5fa'>Tier 2 only</b>",
+        }[bt_tier_mode]
         st.markdown(
             f"<div style='padding:0.55rem 0;color:#64748b;font-size:0.78rem;'>"
             f"Symbols: <b>{len(bt_universe)}</b> &nbsp;|&nbsp; "
-            f"{mode_label} &nbsp;|&nbsp; "
+            f"{_tier_lbl} &nbsp;|&nbsp; "
+            f"Score ≥ <b>{bt_min_score}</b> &nbsp;|&nbsp; "
             f"Hold: <b>{bt_hold_days}d</b> &nbsp;|&nbsp; Data: <b>3y daily</b>"
             f"</div>",
             unsafe_allow_html=True,
         )
+    bt_tier1_only = bt_tier_mode == "🏆 Tier 1 Only"
 
     # ── Run ───────────────────────────────────────────────────────────────────
     if run_bt:
