@@ -1,33 +1,12 @@
 """
-Backtesting engine for NSE Master Scanner
-Walk-forward simulation — fully synced with scanner_engine.py v2 scoring.
+utils/backtest_engine.py
+─────────────────────────
+Walk-forward backtest — fully synced with scanner via scoring_core.compute_bar().
 
-BUGS FIXED vs live repo (refs/heads/main as of May 2025):
-  #1 [CRITICAL] Score threshold mismatch — backtest was using raw score vs
-                scanner's normalised 0-100 score. Now uses identical
-                norm_score = int(raw * 100 / 175) and same adaptive threshold.
-  #2 [HIGH]     5-bar cooldown → cooldown until actual exit_date so stacked
-                entries on trending stocks are eliminated.
-  #3 [MEDIUM]   Same-bar SL vs T2/T1 conflict — open-proximity heuristic
-                now determines which was hit first intraday.
-  #4 [MEDIUM]   Nifty tz mismatch — _strip_tz() applied to both indexes
-                before reindex so RS is never silently NaN.
-  #5 [MEDIUM]   Entry-bar gap — future.iloc[0] now checked for gap-down SL.
-  #6 [LOW]      Harmonic/ABCD pattern boosts now included in backtest scoring.
-
-v2 CHANGES (synced with scanner_engine.py v2):
-  - persistent_strength  replaces qualified in Tier 1 gate
-      persistent_strength = mom3 > 8 AND mom6 > 12
-  - trend_structure      replaces allow_cloud in Tier 1 gate
-      trend_structure = ema_alignment AND allow_cloud
-      ema_alignment   = EMA20 > EMA50 AND EMA50 rising
-  - Tier 2 momentum gate added:
-      compression_break  = prior-bar ATR compressed AND price > 10-bar range high
-      cci_momentum_break = CCI > 100 AND CCI rising
-      volume_expansion   = volume > vol_avg * 1.2
-  - squeeze_release score boost added (+15 on release, +5 when not in squeeze)
-  - qualified (original strict) retained for AccTier A/B display only
-  - is_tier2_momentum column added to signal rows and trade output
+generate_signals_historical() no longer duplicates scoring logic.
+It calls build_indicators() once per symbol, then compute_bar(ia, i, params)
+for every bar — the exact same function score_stock() calls for the live bar.
+Result: scanner and backtest are guaranteed identical.
 """
 
 import pandas as pd
@@ -35,13 +14,11 @@ import numpy as np
 from datetime import datetime, timezone, timedelta
 import yfinance as yf
 import streamlit as st
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
-from utils.scanner_engine import (
-    _strip_tz,
-    ema, rsi, atr, cci, highest, lowest, sma,
-    ichimoku, pivot_high, pivot_low,
-    detect_harmonic, detect_abcd,
-)
+from utils.scanner_engine import _strip_tz, nifty_regime, ema
+from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -51,13 +28,13 @@ from utils.scanner_engine import (
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_full_history(symbol: str, years: int = 3) -> pd.DataFrame:
     try:
-        end   = datetime.now(timezone.utc) + timedelta(days=1)
-        start = end - timedelta(days=years * 365 + 5)
-        ticker = yf.Ticker(f"{symbol}.NS")
-        df = ticker.history(start=start, end=end, interval="1d", auto_adjust=True)
+        end    = datetime.now(timezone.utc) + timedelta(days=1)
+        start  = end - timedelta(days=years * 365 + 5)
+        df     = yf.Ticker(f"{symbol}.NS").history(
+                     start=start, end=end, interval="1d", auto_adjust=True)
         if df.empty:
             return pd.DataFrame()
-        df.index = _strip_tz(pd.to_datetime(df.index))
+        df.index   = _strip_tz(pd.to_datetime(df.index))
         df.columns = [c.lower() for c in df.columns]
         return df[["open", "high", "low", "close", "volume"]]
     except Exception:
@@ -65,292 +42,65 @@ def fetch_full_history(symbol: str, years: int = 3) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  SIGNAL GENERATION — exact mirror of scanner_engine.score_stock() v2
+#  SIGNAL GENERATION — delegates 100% to scoring_core.compute_bar
 # ══════════════════════════════════════════════════════════════════
 
 def generate_signals_historical(
-    df:          pd.DataFrame,
-    nifty:       pd.Series,
-    cci_len:     int   = 20,
-    cci_ob:      int   = 100,
-    cci_os:      int   = -100,
-    min_score:   int   = 70,
-    atr_prox:    float = 0.3,
-    pvt_lb:      int   = 20,
-    tier1_only:  bool  = False,
+    df:         pd.DataFrame,
+    nifty:      pd.Series,
+    settings:   dict | None = None,
+    # legacy kwargs
+    cci_len:    int   = 20,
+    cci_ob:     int   = 100,
+    cci_os:     int   = -100,
+    min_score:  int   = 70,
+    tier1_only: bool  = False,
 ) -> pd.DataFrame:
     """
-    Walk-forward signal generation — v2.
-    Scoring is a complete port of scanner_engine.score_stock() v2.
-
-    tier1_only=True restricts to bars where all five v2 Tier 1 conditions align:
-        trend_up + in_golden_relaxed + recent_cci_recovery
-        + persistent_strength + trend_structure
-
-    v2 Tier 1 gate changes vs original:
-        qualified      → persistent_strength  (mom3>8, mom6>12)
-        allow_cloud    → trend_structure      (ema_alignment AND allow_cloud)
-        ema_alignment  = EMA20 > EMA50 AND EMA50 rising
+    Walk-forward signal scan over full history.
+    Uses compute_bar() — identical to the live scanner's score_stock().
+    No scoring logic lives here; this is pure loop + filter.
     """
     if df.empty or len(df) < 210:
         return pd.DataFrame()
 
-    c = df["close"];  h = df["high"]
-    l = df["low"];    v = df["volume"]
-    o = df["open"]
+    if settings:
+        params    = ScoringParams.from_settings(settings)
+        min_score = settings.get("min_score", min_score)
+    else:
+        params = ScoringParams(cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os)
 
-    # Pre-compute full series
-    e20      = ema(c, 20);   e50 = ema(c, 50);   e200 = ema(c, 200)
-    rsi_s    = rsi(c, 21)
-    atr_s    = atr(h, l, c, 14)
-    cci_s    = cci(c, cci_len)
-    vol_avg  = sma(v, 20)
-    atr_sma  = sma(atr_s, 20)
-    atr_sma10 = sma(atr_s, 10)
-
-    # Bollinger Bands and Keltner Channels (squeeze)
-    bb_mid    = sma(c, 20)
-    bb_std    = c.rolling(20).std()
-    bb_upper  = bb_mid + 2 * bb_std
-    bb_lower  = bb_mid - 2 * bb_std
-    kc_mid    = ema(c, 20)
-    kc_upper  = kc_mid + 1.5 * atr_s
-    kc_lower  = kc_mid - 1.5 * atr_s
-    squeeze_series = (bb_upper < kc_upper) & (bb_lower > kc_lower)
-
-    tenkan, kijun, senkou_a, senkou_b = ichimoku(h, l)
-    cloud_top    = pd.concat([senkou_a, senkou_b], axis=1).max(axis=1)
-    cloud_bottom = pd.concat([senkou_a, senkou_b], axis=1).min(axis=1)
-
-    # FIX #4
-    _c_idx  = _strip_tz(c.index)
-    _nifty  = nifty.copy()
-    _nifty.index = _strip_tz(_nifty.index)
-    nifty_a = _nifty.reindex(_c_idx, method="ffill")
-
-    lookback = pvt_lb * 3
-    signals  = []
+    ia      = build_indicators(df, nifty, params)
+    signals = []
 
     for i in range(210, len(df)):
-        cur_c    = float(c.iloc[i])
-        cur_o    = float(o.iloc[i])
-        prev_h   = float(h.iloc[i - 1]) if i >= 1 else float(h.iloc[i])
-        cur_e20  = float(e20.iloc[i])
-        cur_e50  = float(e50.iloc[i])
-        prev_e50 = float(e50.iloc[i - 1]) if i >= 1 else cur_e50
-        cur_e200 = float(e200.iloc[i])
-        cur_r    = float(rsi_s.iloc[i])
-        cur_v    = float(v.iloc[i])
-        cur_atr  = float(atr_s.iloc[i])
-        cur_cci  = float(cci_s.iloc[i])
-        cur_va   = float(vol_avg.iloc[i])
-        cur_atr_sma  = float(atr_sma.iloc[i])  if not np.isnan(float(atr_sma.iloc[i]))   else cur_atr
-        prev_cci = float(cci_s.iloc[i - 1]) if i >= 1 else cur_cci
-        cur_ct   = float(cloud_top.iloc[i])
-        cur_cb   = float(cloud_bottom.iloc[i])
-
-        if any(np.isnan(v2) for v2 in [cur_c, cur_e20, cur_e200, cur_cci]):
+        r = compute_bar(ia, i, params)
+        if r is None:
             continue
 
-        # ── Trend ──────────────────────────────────────────────────
-        trend_up = cur_c > cur_e200 and cur_e20 > cur_e50
-
-        # ── EMA alignment (v2) ─────────────────────────────────────
-        ema_alignment = cur_e20 > cur_e50 and cur_e50 > prev_e50
-
-        # ── RS ─────────────────────────────────────────────────────
-        rs = 0.0
-        if i >= 5:
-            c5    = float(c.iloc[i - 5])
-            n_now = float(nifty_a.iloc[i])   if not np.isnan(float(nifty_a.iloc[i]))   else 0
-            n5    = float(nifty_a.iloc[i-5]) if not np.isnan(float(nifty_a.iloc[i-5])) else 0
-            if c5 > 0 and n5 > 0 and n_now > 0:
-                rs = (cur_c / c5 - 1) - (n_now / n5 - 1)
-
-        # ── Fibonacci ───────────────────────────────────────────────
-        win_s   = max(0, i - lookback)
-        sw_hi   = float(h.iloc[win_s:i].max())
-        sw_lo   = float(l.iloc[win_s:i].min())
-        fib_rng = sw_hi - sw_lo
-        fib382  = sw_hi - fib_rng * 0.382
-        fib500  = sw_hi - fib_rng * 0.500
-        fib618  = sw_hi - fib_rng * 0.618
-        fib_ext127 = sw_hi + fib_rng * 0.272
-        fib_ext161 = sw_hi + fib_rng * 0.618
-
-        in_golden = (cur_c >= fib618 - cur_atr * atr_prox and
-                     cur_c <= fib500 + cur_atr * atr_prox)
-
-        in_golden_relaxed = (cur_c >= fib618 - cur_atr * atr_prox and
-                             cur_c <= fib382 + cur_atr * atr_prox)
-
-        near_ext127 = abs(cur_c - fib_ext127) < cur_atr * atr_prox
-        near_ext161 = abs(cur_c - fib_ext161) < cur_atr * atr_prox
-
-        # ── CCI signals ─────────────────────────────────────────────
-        cci_cross_up_os  = prev_cci <= cci_os and cur_cci > cci_os
-        cci_cross_dn_ob  = prev_cci >= cci_ob and cur_cci < cci_ob
-        cci_extended     = cur_cci > cci_ob * 2
-        in_golden_cci    = in_golden and cur_cci <= cci_os
-
-        recent_cci_recovery = any(
-            float(cci_s.iloc[j - 1]) <= cci_os and float(cci_s.iloc[j]) > cci_os
-            for j in range(max(1, i - 4), i + 1)
-        )
-
-        # CCI momentum expansion (Tier 2) — continuation, not recovery
-        cci_momentum_break = cur_cci > cci_ob and cur_cci > prev_cci
-
-        # ── Compression breakout (Tier 2) ───────────────────────────
-        # ATR compression checked on bar i-1 to avoid breakout-bar self-invalidation
-        if i >= 1 and not np.isnan(float(atr_sma10.iloc[i - 1])) and float(atr_sma10.iloc[i - 1]) > 0:
-            prev_atr_compressed = float(atr_s.iloc[i - 1]) < float(atr_sma10.iloc[i - 1]) * 0.85
-        else:
-            prev_atr_compressed = False
-
-        compression_bars = 10
-        comp_start = max(0, i - compression_bars)
-        compression_high = float(h.iloc[comp_start:i].max())   # excludes bar i (no look-ahead)
-        compression_break = prev_atr_compressed and cur_c > compression_high
-
-        # ── Squeeze state ────────────────────────────────────────────
-        squeeze_on      = bool(squeeze_series.iloc[i])
-        prev_squeeze_on = bool(squeeze_series.iloc[i - 1]) if i >= 1 else squeeze_on
-        squeeze_release = prev_squeeze_on and not squeeze_on
-
-        # ── Momentum ─────────────────────────────────────────────────
-        mom1 = (cur_c / float(c.iloc[i-21])  - 1) * 100 if i >= 21  else 0
-        mom3 = (cur_c / float(c.iloc[i-63])  - 1) * 100 if i >= 63  else 0
-        mom6 = (cur_c / float(c.iloc[i-126]) - 1) * 100 if i >= 126 else 0
-
-        # Persistent strength (v2 Tier 1 gate)
-        persistent_strength = mom3 > 8 and mom6 > 12
-
-        # Qualified (original — retained for AccTier display only)
-        strong_htf   = mom1 > 5 and mom3 > 10 and mom6 > 15
-        trend_strong = cur_c > cur_e20 and cur_e20 > cur_e50
-        qualified    = strong_htf and trend_strong
-
-        # ── Cloud position ───────────────────────────────────────────
-        above_cloud  = cur_c > cur_ct
-        inside_cloud = cur_cb <= cur_c <= cur_ct
-        below_cloud  = cur_c < cur_cb
-        allow_cloud  = above_cloud or inside_cloud
-
-        # Trend structure (v2 Tier 1 gate)
-        trend_structure = ema_alignment and allow_cloud
-
-        # ── Tier 1 Prime — v2 gate ────────────────────────────────
-        is_tier1_prime = (
-            trend_up              and
-            in_golden_relaxed     and
-            recent_cci_recovery   and
-            persistent_strength   and   # v2: mom3>8, mom6>12
-            trend_structure             # v2: ema_alignment + allow_cloud
-        )
-
-        # ── Tier 1 only gate ─────────────────────────────────────
-        if tier1_only and not is_tier1_prime:
+        # Signal acceptance filter
+        if tier1_only and not r.tier1_prime:
             continue
-
-        # ── Tier 2 momentum breakout — v2 ──────────────────────
-        is_tier2_momentum = (
-            compression_break   and
-            cci_momentum_break  and
-            cur_v > cur_va * 1.2
-        )
-
-        # ── FIX #6 — Pivot / Harmonic / ABCD ────────────────────
-        pvt_lb_use = min(pvt_lb, i // 4)
-        if pvt_lb_use >= 2:
-            ph_slice = pivot_high(h.iloc[:i+1], pvt_lb_use)
-            pl_slice = pivot_low(l.iloc[:i+1],  pvt_lb_use)
-            pivots = []
-            for j in range(i, max(-1, i - 60), -1):
-                if not np.isnan(float(ph_slice.iloc[j])):
-                    pivots.append((float(ph_slice.iloc[j]), True))
-                elif not np.isnan(float(pl_slice.iloc[j])):
-                    pivots.append((float(pl_slice.iloc[j]), False))
-                if len(pivots) >= 8:
-                    break
-            pv_prices  = [p[0] for p in pivots]
-            pv_is_high = [p[1] for p in pivots]
-            harm_dir, _   = detect_harmonic(pv_prices, pv_is_high)
-            harm_bull      = harm_dir == "bull"
-            abcd_bull, _   = detect_abcd(pv_prices, pv_is_high, cur_c, cur_o, prev_h)
-        else:
-            harm_bull = abcd_bull = False
-
-        # ── Score — FIX #1 + v2 weights ─────────────────────────
-        score = 0.0
-        score += 25 if trend_up else 0
-        score += 30 if cur_e20 > cur_e50 else (20 if cur_e20 > cur_e50 * 0.995 else 0)
-        score += (25 if cur_r > 60 else 20 if cur_r > 55 else 15 if cur_r > 50 else 5 if cur_r > 45 else 0)
-        score += (20 if cur_v > cur_va * 1.2 else 10 if cur_v > cur_va else 0)
-
-        hh = float(c.iloc[max(0, i-11):i].max())
-        score += (25 if cur_c > hh else 15 if cur_c > hh * 0.98 else 0)
-        score += 10 if i >= 2 and cur_c > float(c.iloc[i-2]) else 0
-        score += (15 if rs > 0 else 5 if rs > -0.005 else 0)
-
-        score += 30 if in_golden    else 0
-        score += -20 if near_ext127 else (-30 if near_ext161 else 0)
-
-        score += (20 if cur_cci < cci_os else 10 if cur_cci < 0 else -15 if cci_extended else 0)
-        score += 15 if cci_cross_up_os else 0
-        score -= 10 if cci_extended    else 0
-
-        # v2: persistent_strength weight = +20 (was qualified +25)
-        score += 20 if persistent_strength else -10
-
-        if harm_bull:  score += 20
-        if abcd_bull:  score += 15
-
-        score += -15 if below_cloud else 0
-
-        # Squeeze boost (v2)
-        score += 15 if squeeze_release else (5 if not squeeze_on else 0)
-
-        # Tier 1 Prime bonus
-        score += 20 if is_tier1_prime else 0
-
-        # FIX #1 — normalise to 0-100
-        norm_score = min(100, int(score * 100 / 175))
-
-        ts_ratio  = cur_atr / cur_atr_sma if cur_atr_sma > 0 else 1.0
-        threshold = 65 if ts_ratio > 1.2 else (75 if ts_ratio < 0.8 else 70)
-
-        allow_cloud_buy = above_cloud or (inside_cloud and norm_score >= 65)
-
-        # Accept signal if: Tier 1, Tier 2 momentum, OR score >= min_score with cloud gate
-        if not is_tier1_prime and not is_tier2_momentum:
-            if norm_score < min_score or not allow_cloud_buy:
+        if not r.tier1_prime and not r.tier2_momentum:
+            allow_cloud_buy = r.above_cloud or (r.inside_cloud and r.norm_score >= 65)
+            if r.norm_score < min_score or not allow_cloud_buy:
                 continue
 
-        # ── Trade levels ─────────────────────────────────────────
-        en     = round(cur_c)
-        raw_sl = en - cur_atr * 2.5 * 0.85
-        min_sl = en - cur_atr * 4.0
-        max_sl = en - cur_atr * 1.5
-        sl     = round(max(min_sl, min(raw_sl, max_sl)))
-        rk     = max(en - sl, cur_atr * 0.5)
-        t1     = round(en + rk)
-        t2     = round(en + rk * 2)
-        t3     = round(en + rk * 3)
-
         signals.append({
-            "date":             df.index[i],
-            "score":            norm_score,
-            "entry":            cur_c,
-            "sl":               sl,
-            "t1":               t1,
-            "t2":               t2,
-            "t3":               t3,
-            "cci":              round(cur_cci),
-            "rsi":              round(cur_r, 1),
-            "tier1_prime":      is_tier1_prime,
-            "tier2_momentum":   is_tier2_momentum,
-            "squeeze_release":  squeeze_release,
+            "date":            df.index[i],
+            "score":           r.norm_score,
+            "entry":           r.entry,
+            "sl":              r.sl,
+            "t1":              r.t1,
+            "t2":              r.t2,
+            "t3":              r.t3,
+            "cci":             round(r.cur_cci),
+            "rsi":             round(r.cur_rsi, 1),
+            "tier1_prime":     r.tier1_prime,
+            "tier2_momentum":  r.tier2_momentum,
+            "squeeze_release": r.squeeze_release,
+            "setup":           r.setup,
+            "buy_type":        r.buy_type,
         })
 
     return pd.DataFrame(signals)
@@ -388,6 +138,7 @@ def simulate_trades(
         t1  = float(sig["t1"])
         t2  = float(sig["t2"])
 
+        # Gap-down SL on entry bar
         if entry_price <= sl:
             blocked_until = entry_bar
             continue
@@ -396,9 +147,7 @@ def simulate_trades(
         exit_date   = future.index[min(hold_days, len(future) - 1)]
         exit_reason = "TIMEOUT"
 
-        window = future.iloc[0: hold_days + 1]
-
-        for j, (dt, row) in enumerate(window.iterrows()):
+        for dt, row in future.iloc[: hold_days + 1].iterrows():
             bar_low  = float(row["low"])
             bar_high = float(row["high"])
             bar_open = float(row["open"])
@@ -408,51 +157,40 @@ def simulate_trades(
             t1_hit = bar_high >= t1
 
             if sl_hit and (t2_hit or t1_hit):
-                target = t2 if t2_hit else t1
-                if abs(bar_open - target) < abs(bar_open - sl):
-                    exit_price  = target
-                    exit_date   = dt
-                    exit_reason = "T2 HIT" if t2_hit else "T1 HIT"
-                else:
-                    exit_price  = sl
-                    exit_date   = dt
-                    exit_reason = "SL HIT"
+                # Intraday conflict: whichever is closer to open was hit first
+                target      = t2 if t2_hit else t1
+                exit_price  = target if abs(bar_open - target) < abs(bar_open - sl) else sl
+                exit_reason = ("T2 HIT" if t2_hit else "T1 HIT") if exit_price == target else "SL HIT"
+                exit_date   = dt
                 break
             elif sl_hit:
-                exit_price  = sl
-                exit_date   = dt
-                exit_reason = "SL HIT"
-                break
+                exit_price, exit_date, exit_reason = sl, dt, "SL HIT";  break
             elif t2_hit:
-                exit_price  = t2
-                exit_date   = dt
-                exit_reason = "T2 HIT"
-                break
+                exit_price, exit_date, exit_reason = t2, dt, "T2 HIT";  break
             elif t1_hit:
-                exit_price  = t1
-                exit_date   = dt
-                exit_reason = "T1 HIT"
-                break
+                exit_price, exit_date, exit_reason = t1, dt, "T1 HIT";  break
 
         pnl_pct = round((exit_price - entry_price) / entry_price * 100, 2)
 
         trades.append({
-            "symbol":           symbol,
-            "entry_date":       entry_bar.date(),
-            "entry_price":      round(entry_price, 2),
-            "exit_date":        exit_date.date(),
-            "exit_price":       round(exit_price, 2),
-            "exit_reason":      exit_reason,
-            "pnl_pct":          pnl_pct,
-            "pnl_abs":          round(exit_price - entry_price, 2),
-            "score_at_entry":   sig["score"],
-            "cci_at_entry":     sig["cci"],
-            "sl":               sig["sl"],
-            "t1":               sig["t1"],
-            "t2":               sig["t2"],
-            "tier1_prime":      bool(sig.get("tier1_prime",    False)),
-            "tier2_momentum":   bool(sig.get("tier2_momentum", False)),
-            "squeeze_release":  bool(sig.get("squeeze_release", False)),
+            "symbol":          symbol,
+            "entry_date":      entry_bar.date(),
+            "entry_price":     round(entry_price, 2),
+            "exit_date":       exit_date.date(),
+            "exit_price":      round(exit_price, 2),
+            "exit_reason":     exit_reason,
+            "pnl_pct":         pnl_pct,
+            "pnl_abs":         round(exit_price - entry_price, 2),
+            "score_at_entry":  sig["score"],
+            "cci_at_entry":    sig["cci"],
+            "sl":              sig["sl"],
+            "t1":              sig["t1"],
+            "t2":              sig["t2"],
+            "setup":           sig.get("setup", "-"),
+            "buy_type":        sig.get("buy_type", "-"),
+            "tier1_prime":     bool(sig.get("tier1_prime",    False)),
+            "tier2_momentum":  bool(sig.get("tier2_momentum", False)),
+            "squeeze_release": bool(sig.get("squeeze_release", False)),
         })
 
         blocked_until = exit_date
@@ -465,59 +203,72 @@ def simulate_trades(
 # ══════════════════════════════════════════════════════════════════
 
 def run_backtest(
-    symbols:      list,
-    cci_len:      int  = 20,
-    cci_ob:       int  = 100,
-    cci_os:       int  = -100,
-    min_score:    int  = 70,
-    hold_days:    int  = 20,
-    workers:      int  = 10,
-    tier1_only:   bool = False,
-    progress_cb        = None,
+    symbols:     list,
+    settings:    dict | None = None,
+    cci_len:     int  = 20,
+    cci_ob:      int  = 100,
+    cci_os:      int  = -100,
+    min_score:   int  = 70,
+    hold_days:   int  = 20,
+    workers:     int  = 10,
+    tier1_only:  bool = False,
+    progress_cb       = None,
 ) -> pd.DataFrame:
+    if settings:
+        hold_days  = settings.get("hold_days",  hold_days)
+        workers    = settings.get("workers",    workers)
+        min_score  = settings.get("min_score",  min_score)
+
+    # Fetch Nifty once for the full 3-year window
     try:
         end   = datetime.now(timezone.utc) + timedelta(days=1)
         start = end - timedelta(days=3 * 365 + 5)
-        nifty_df    = yf.Ticker("^NSEI").history(start=start, end=end, auto_adjust=True)
-        nifty_close = pd.Series(
-            nifty_df["Close"].values,
-            index=_strip_tz(pd.to_datetime(nifty_df.index)),
-        )
+        ndf   = yf.Ticker("^NSEI").history(start=start, end=end, auto_adjust=True)
+        nifty = pd.Series(ndf["Close"].values,
+                          index=_strip_tz(pd.to_datetime(ndf.index)))
     except Exception:
-        nifty_close = pd.Series(dtype=float)
+        nifty = pd.Series(dtype=float)
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    import threading
+    # Compute Nifty regime once and inject into settings so every
+    # generate_signals_historical() call uses the same consistent value.
+    regime_val      = nifty_regime(nifty)
+    effective_settings = dict(settings) if settings else {}
+    effective_settings["nifty_regime_val"] = regime_val
 
-    counter_lock = threading.Lock()
-    completed    = [0]
-    total        = len(symbols)
-    all_trades   = []
-    trades_lock  = threading.Lock()
+    total       = len(symbols)
+    completed   = [0]
+    c_lock      = threading.Lock()
+    all_trades  = []
+    t_lock      = threading.Lock()
 
     def _process(sym):
         df = fetch_full_history(sym, years=3)
         if df.empty:
             return None
-        signals = generate_signals_historical(
-            df, nifty_close, cci_len, cci_ob, cci_os,
-            min_score, tier1_only=tier1_only
+        sigs = generate_signals_historical(
+            df, nifty,
+            settings   = effective_settings,
+            cci_len    = cci_len,
+            cci_ob     = cci_ob,
+            cci_os     = cci_os,
+            min_score  = min_score,
+            tier1_only = tier1_only,
         )
-        return simulate_trades(sym, df, signals, hold_days=hold_days)
+        return simulate_trades(sym, df, sigs, hold_days=hold_days)
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(_process, sym): sym for sym in symbols}
-        for future in as_completed(futures):
-            sym = futures[future]
-            with counter_lock:
+    with ThreadPoolExecutor(max_workers=workers) as exe:
+        futures = {exe.submit(_process, s): s for s in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            with c_lock:
                 completed[0] += 1
                 n = completed[0]
             if progress_cb:
                 progress_cb(n / total, sym)
             try:
-                result = future.result()
+                result = fut.result()
                 if result is not None and not result.empty:
-                    with trades_lock:
+                    with t_lock:
                         all_trades.append(result)
             except Exception:
                 pass
@@ -532,25 +283,25 @@ def run_backtest(
 def compute_stats(trades: pd.DataFrame) -> dict:
     if trades.empty:
         return {}
-    total  = len(trades)
-    wins   = trades[trades["pnl_pct"] > 0]
-    losses = trades[trades["pnl_pct"] <= 0]
-    win_rate  = round(len(wins) / total * 100, 1)
-    avg_win   = round(wins["pnl_pct"].mean(),   2) if len(wins)   else 0
-    avg_loss  = round(losses["pnl_pct"].mean(), 2) if len(losses) else 0
-    gross_profit = wins["pnl_pct"].sum()            if len(wins)   else 0
-    gross_loss   = abs(losses["pnl_pct"].sum())     if len(losses) else 1
+
+    total = len(trades)
+    wins  = trades[trades["pnl_pct"] > 0]
+    loss  = trades[trades["pnl_pct"] <= 0]
+
+    win_rate     = round(len(wins) / total * 100, 1)
+    avg_win      = round(wins["pnl_pct"].mean(),  2) if len(wins)  else 0
+    avg_loss     = round(loss["pnl_pct"].mean(),  2) if len(loss)  else 0
+    gross_profit = wins["pnl_pct"].sum()               if len(wins)  else 0
+    gross_loss   = abs(loss["pnl_pct"].sum())          if len(loss)  else 1
     pf           = round(gross_profit / gross_loss, 2) if gross_loss else 0
-    rr           = round(abs(avg_win / avg_loss), 2)   if avg_loss   else 0
-    expectancy   = round((win_rate/100 * avg_win) - ((100-win_rate)/100 * abs(avg_loss)), 2)
+    rr           = round(abs(avg_win / avg_loss),   2) if avg_loss   else 0
+    expectancy   = round(
+        (win_rate / 100 * avg_win) - ((100 - win_rate) / 100 * abs(avg_loss)), 2
+    )
 
-    t1_trades   = int(trades["tier1_prime"].sum())    if "tier1_prime"    in trades.columns else 0
-    t2_trades   = int(trades["tier2_momentum"].sum()) if "tier2_momentum" in trades.columns else 0
-    sq_trades   = int(trades["squeeze_release"].sum()) if "squeeze_release" in trades.columns else 0
-
-    # Per-tier stats slices
-    def _slice_stats(mask):
-        sub = trades[mask]
+    def _slice(col):
+        mask = trades.get(col, pd.Series(False, index=trades.index)).astype(bool)
+        sub  = trades[mask]
         if sub.empty:
             return {"trades": 0, "win_rate": 0, "avg_pnl": 0}
         w = sub[sub["pnl_pct"] > 0]
@@ -560,27 +311,35 @@ def compute_stats(trades: pd.DataFrame) -> dict:
             "avg_pnl":  round(sub["pnl_pct"].mean(), 2),
         }
 
-    t1_stats = _slice_stats(trades.get("tier1_prime",    pd.Series(False, index=trades.index)).astype(bool))
-    t2_stats = _slice_stats(trades.get("tier2_momentum", pd.Series(False, index=trades.index)).astype(bool))
-    sq_stats = _slice_stats(trades.get("squeeze_release", pd.Series(False, index=trades.index)).astype(bool))
+    # Per-setup breakdown
+    setup_stats = {}
+    if "setup" in trades.columns:
+        for setup, grp in trades.groupby("setup"):
+            w = grp[grp["pnl_pct"] > 0]
+            setup_stats[setup] = {
+                "trades":   len(grp),
+                "win_rate": round(len(w) / len(grp) * 100, 1),
+                "avg_pnl":  round(grp["pnl_pct"].mean(), 2),
+            }
 
     return {
-        "total_trades":      total,
-        "win_rate":          win_rate,
-        "avg_win":           avg_win,
-        "avg_loss":          avg_loss,
-        "avg_pnl":           round(trades["pnl_pct"].mean(), 2),
-        "total_pnl":         round(trades["pnl_pct"].sum(),  2),
-        "risk_reward":       rr,
-        "expectancy":        expectancy,
-        "profit_factor":     pf,
-        "exit_breakdown":    trades["exit_reason"].value_counts().to_dict(),
-        "best_trade":        round(trades["pnl_pct"].max(), 2),
-        "worst_trade":       round(trades["pnl_pct"].min(), 2),
-        "t1_prime_trades":   t1_trades,
-        "t2_momentum_trades": t2_trades,
-        "squeeze_trades":    sq_trades,
-        "t1_prime_stats":    t1_stats,
-        "t2_momentum_stats": t2_stats,
-        "squeeze_stats":     sq_stats,
+        "total_trades":       total,
+        "win_rate":           win_rate,
+        "avg_win":            avg_win,
+        "avg_loss":           avg_loss,
+        "avg_pnl":            round(trades["pnl_pct"].mean(), 2),
+        "total_pnl":          round(trades["pnl_pct"].sum(),  2),
+        "risk_reward":        rr,
+        "expectancy":         expectancy,
+        "profit_factor":      pf,
+        "best_trade":         round(trades["pnl_pct"].max(), 2),
+        "worst_trade":        round(trades["pnl_pct"].min(), 2),
+        "exit_breakdown":     trades["exit_reason"].value_counts().to_dict(),
+        "t1_prime_trades":    int(trades.get("tier1_prime",    pd.Series([False]*total)).sum()),
+        "t2_momentum_trades": int(trades.get("tier2_momentum", pd.Series([False]*total)).sum()),
+        "squeeze_trades":     int(trades.get("squeeze_release",pd.Series([False]*total)).sum()),
+        "t1_prime_stats":     _slice("tier1_prime"),
+        "t2_momentum_stats":  _slice("tier2_momentum"),
+        "squeeze_stats":      _slice("squeeze_release"),
+        "setup_stats":        setup_stats,
     }
