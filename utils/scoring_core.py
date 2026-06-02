@@ -50,6 +50,17 @@ class ScoringParams:
     # Tier 1 — CCI recovery window
     t1_cci_window: int = 5     # bars to look back for CCI OS cross
 
+    # Tier 1 — CCI band gate (highest signal-to-noise filter from backtest)
+    # CCI at entry must be <= this value; 0 = CCI still in bearish half (default).
+    # Tighten to -50 in Settings for the OS/recovering zone only.
+    # Set to 999 to disable.
+    t1_cci_band_max: int = 0
+
+    # Tier 1 — BB expanding gate
+    # When True, requires BB to be expanding (not squeezed) at entry.
+    # Expanding BB = BB upper > KC upper OR BB lower < KC lower (opposite of squeeze).
+    t1_bb_expanding: bool = True
+
     # Tier 1 — cloud gate
     t1_cloud: bool = True      # if False, trend_structure ignores cloud
 
@@ -108,6 +119,8 @@ class ScoringParams:
             t1_fib_hi        = float(s.get("t1_fib_hi",         38.2)),
             t1_fib_lo        = float(s.get("t1_fib_lo",         61.8)),
             t1_cci_window    = int(s.get("t1_cci_window",        5)),
+            t1_cci_band_max  = int(s.get("t1_cci_band_max",      0)),
+            t1_bb_expanding  = bool(s.get("t1_bb_expanding",    True)),
             t1_cloud         = bool(s.get("t1_cloud",           True)),
             t1_squeeze_boost = bool(s.get("t1_squeeze_boost",   True)),
             t1_squeeze_pts   = int(s.get("t1_squeeze_pts",       0)),
@@ -524,6 +537,16 @@ def compute_bar(
     prev_squeeze_on = bool(ia.squeeze_series.iloc[i - 1]) if i >= 1 else squeeze_on
     squeeze_release = prev_squeeze_on and not squeeze_on
 
+    # ── BB EXPANDING ───────────────────────────────────────────────
+    # BB expanding = bands are WIDER than the Keltner Channel on the current
+    # bar (the opposite of the squeeze condition).  A single-bar check is
+    # sufficient — it confirms volatility is already opening up at entry.
+    cur_bb_upper = float(ia.bb_upper.iloc[i])
+    cur_bb_lower = float(ia.bb_lower.iloc[i])
+    cur_kc_upper = float(ia.kc_upper.iloc[i])
+    cur_kc_lower = float(ia.kc_lower.iloc[i])
+    bb_expanding = (cur_bb_upper > cur_kc_upper) or (cur_bb_lower < cur_kc_lower)
+
     # ── MOMENTUM ──────────────────────────────────────────────────
     mom1 = (cur_c / float(c.iloc[i - 21])  - 1) * 100 if i >= 21  else 0.0
     mom3 = (cur_c / float(c.iloc[i - 63])  - 1) * 100 if i >= 63  else 0.0
@@ -663,7 +686,14 @@ def compute_bar(
         recent_cci_recovery   and
         persistent_strength   and
         trend_structure       and
-        nifty_allows
+        nifty_allows          and
+        # CCI band: CCI must be in bearish/recovering territory at entry.
+        # Threshold of 0 (rather than -50) preserves most valid setups while
+        # still blocking entries where CCI is already overbought at trigger.
+        # t1_cci_band_max defaults to 0; set to -50 in Settings for a tighter filter.
+        cur_cci <= params.t1_cci_band_max and
+        # BB expanding gate — optional; when disabled (t1_bb_expanding=False) passes all bars.
+        (bb_expanding if params.t1_bb_expanding else True)
     )
     score += 20 if is_tier1_prime else 0
 
@@ -671,8 +701,7 @@ def compute_bar(
     is_tier2_momentum = (
         compression_break        and
         cci_momentum_break       and
-        cur_v > cur_vavg * params.t2_vol_mult and
-        prev_squeeze_on          # squeeze context must precede breakout
+        cur_v > cur_vavg * params.t2_vol_mult
     )
 
     # ── TIER 3 — ACTIVE MOMENTUM EXPANSION ──────────────────────
@@ -801,16 +830,14 @@ def compute_bar(
     )
 
     # ── TIER 1 ENTRY QUALITY GATE ────────────────────────────────────────
-    # Applied after buy_type and trade levels are resolved so all three
-    # inputs are available at point of evaluation:
+    # Applied after buy_type and trade levels are resolved:
     #   • buy_type ≠ "-"   — a recognised buy signal must exist
     #   • risk_pct ≥ 5%    — (entry − SL) / entry ≥ 0.05  (room to breathe)
     #   • norm_score ≥ 75  — high-conviction bar; structural alignment alone
     #                         is not enough
-    # Per-type CCI filters are already baked into classification above:
-    #   Fib+Qual    → cur_cci < 100   (is_fib_buy_base)
-    #   Norm Strong → cur_cci < 50    (is_norm_buy)
-    #   CCI Break   → cur_cci < 100   (is_cci_buy)
+    # Note: a risk_pct upper cap (≤ 8%) was trialled but removed — the backtest
+    # mean of 8.45% means capping at 8% eliminates the majority of valid entries.
+    # Position sizing (not gate rejection) is the right tool for wide-SL setups.
     risk_pct = (en - sl) / en if en > 0 else 0.0
     tier1_entry_quality = (
         buy_type   != "-"  and
