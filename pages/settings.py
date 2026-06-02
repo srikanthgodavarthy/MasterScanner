@@ -31,6 +31,43 @@ from utils.supabase_client import (
 )
 from utils.scanner_engine import NIFTY500_SYMBOLS
 
+# ══════════════════════════════════════════════════════════════════
+#  DEFAULT VALUES  — single source of truth for all settings
+# ══════════════════════════════════════════════════════════════════
+
+DEFAULTS = {
+    # Common
+    "universe_mode":    "Nifty 500 (default)",
+    "custom_symbols":   [],
+    "cci_len":          20,
+    "cci_ob":           100,
+    "cci_os":           -100,
+    "workers":          10,
+    "hold_days":        20,
+    "min_score":        70,
+    "auto_refresh":     False,
+    "refresh_mins":     5,
+    # Tier 1
+    "t1_mom3":          8,
+    "t1_mom6":          12,
+    "t1_fib_hi":        38.2,
+    "t1_fib_lo":        61.8,
+    "t1_cci_window":    5,
+    "t1_cloud":         True,
+    "t1_squeeze_boost": True,
+    "t1_squeeze_pts":   15,
+    "t1_no_squeeze_pts": 5,
+    "t1_ps_weight":     20,
+    "t1_ps_penalty":    -10,
+    # Tier 2
+    "t2_comp_bars":     10,
+    "t2_atr_ratio":     0.85,
+    "t2_vol_mult":      1.2,
+    # Nifty Regime
+    "nifty_regime_filter": False,
+}
+
+
 
 # ══════════════════════════════════════════════════════════════════
 #  CSS
@@ -323,6 +360,27 @@ def _section_common():
         )
     ss["auto_refresh"]  = bool(auto_refresh)
     ss["refresh_mins"]  = int(refresh_mins)
+
+    st.divider()
+
+    # Nifty Regime Gate
+    st.markdown("**Nifty Regime Gate** *(optional Tier 1 extra gate)*")
+    st.caption(
+        "When ON, Tier 1 Prime additionally requires Nifty to be in a bull regime "
+        "(Nifty price > EMA200 AND EMA50 > EMA200). "
+        "In a bear/neutral market this keeps Tier 1 empty — by design."
+    )
+    nifty_regime_filter = st.toggle(
+        "Require bull Nifty regime for Tier 1",
+        value=ss.get("nifty_regime_filter", False),
+        key="tog_nifty_regime",
+    )
+    ss["nifty_regime_filter"] = bool(nifty_regime_filter)
+    if nifty_regime_filter:
+        st.info(
+            "ℹ️ Tier 1 will only fire when Nifty is in a confirmed bull regime. "
+            "In sideways or bear markets Tier 1 count will be 0 — that is expected behaviour."
+        )
 
     st.divider()
 
@@ -704,14 +762,6 @@ def render() -> dict:
     )
 
     # ── Section tabs ─────────────────────────────────────────────
-    section = st.radio(
-        "section",
-        ["⚙️ Common", "🏆 Tier 1", "📈 Tier 2", "⭐ Watchlist", "🗄️ System"],
-        horizontal=True,
-        label_visibility="collapsed",
-        key="settings_section_radio",
-    )
-
     st.markdown('<div class="cfg-card">', unsafe_allow_html=True)
 
     if section == "⚙️ Common":
@@ -756,4 +806,6 @@ def render() -> dict:
         "t2_comp_bars":         ss.get("t2_comp_bars",      10),
         "t2_atr_ratio":         ss.get("t2_atr_ratio",      0.85),
         "t2_vol_mult":          ss.get("t2_vol_mult",       1.2),
+        # Nifty regime
+        "nifty_regime_filter":  ss.get("nifty_regime_filter", False),
     }

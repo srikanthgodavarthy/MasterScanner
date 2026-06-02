@@ -18,6 +18,8 @@ from datetime import datetime
 
 from utils.scanner_engine import (
     run_scanner,
+    nifty_regime,
+    fetch_nifty,
     score_color,
     cci_color,
     acc_tier_color,
@@ -569,6 +571,9 @@ def render(settings: dict) -> None:
             return
         st.session_state["scan_df"] = df_raw
         st.session_state["scan_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        # Cache the Nifty regime that was active when scan ran (for display)
+        _nifty_s = fetch_nifty("1y")
+        st.session_state["last_nifty_regime"] = nifty_regime(_nifty_s)
         st.session_state.setdefault("last_auto_scan", time.time())
         if supabase_ok:
             with st.spinner("Saving snapshot…"):
