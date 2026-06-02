@@ -737,12 +737,12 @@ def compute_bar(
     score_threshold = 65 if ts_ratio > 1.2 else (75 if ts_ratio < 0.8 else 70)
 
     # ── BUY TYPE CLASSIFICATION ───────────────────────────────────
-    is_fib_buy_base = trend_up and in_golden     and norm_score >= score_threshold
+    is_fib_buy_base = trend_up and in_golden     and norm_score >= score_threshold and cur_cci < 100
     is_fib_buy_cci  = trend_up and in_golden_cci and norm_score >= 55 and cci_cross_up_os
     is_abcd_buy     = trend_up and abcd_bull and norm_score >= 35
     is_harm_buy     = trend_up and harm_bull  and norm_score >= 35
-    is_norm_buy     = trend_up and norm_score >= 65 and not in_golden and not cci_extended
-    is_cci_buy      = trend_up and cci_cross_up_os and norm_score >= 55
+    is_norm_buy     = trend_up and norm_score >= 65 and not in_golden and not cci_extended and cur_cci < 50
+    is_cci_buy      = trend_up and cci_cross_up_os and norm_score >= 55 and cur_cci < 100
 
     allow_cloud_buy = above_cloud or (inside_cloud and norm_score >= 65)
     any_buy = (
@@ -801,6 +801,25 @@ def compute_bar(
         "CmpBrk"  if is_tier2_momentum else
         "Norm"    if is_norm_buy       else "-"
     )
+
+    # ── TIER 1 ENTRY QUALITY GATE ────────────────────────────────────────
+    # Applied after buy_type and trade levels are resolved so all three
+    # inputs are available at point of evaluation:
+    #   • buy_type ≠ "-"   — a recognised buy signal must exist
+    #   • risk_pct ≥ 5%    — (entry − SL) / entry ≥ 0.05  (room to breathe)
+    #   • norm_score ≥ 75  — high-conviction bar; structural alignment alone
+    #                         is not enough
+    # Per-type CCI filters are already baked into classification above:
+    #   Fib+Qual    → cur_cci < 100   (is_fib_buy_base)
+    #   Norm Strong → cur_cci < 50    (is_norm_buy)
+    #   CCI Break   → cur_cci < 100   (is_cci_buy)
+    risk_pct = (en - sl) / en if en > 0 else 0.0
+    tier1_entry_quality = (
+        buy_type   != "-"  and
+        risk_pct   >= 0.05 and
+        norm_score >= 75
+    )
+    is_tier1_prime = is_tier1_prime and tier1_entry_quality
 
     acc_tier = (
         "T1★" if is_tier1_prime              else
