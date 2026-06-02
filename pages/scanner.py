@@ -2,7 +2,7 @@
 pages/scanner.py — Live scanner UI  (v5 — clean layered layout)
 
 Tier layers (engine-driven, not action-driven):
-  Tier 1  — _tier1_prime = True  (all 5 pillars, ~90%+)
+  Tier 1  — _tier1_prime = True  (all 5 pillars + entry quality gate)
   Tier 2  — _any_buy = True, not Tier 1
   Tier 3  — Action = WATCH
   Tier 4  — SKIP / hard-stop (hidden by default)
@@ -290,9 +290,9 @@ def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int,
 _TIER_META = {
     "Tier 1": {
         "dot":   "#22c55e",
-        "label": "Tier 1 — Prime  ·  All 5 pillars  ·  ~90%+",
+        "label": "Tier 1 — All 5 Pillars Aligned",
         "desc":  "trend_up · in_golden_relaxed · CCI cross-up · trend_structure · Nifty gate",
-        "setups": ["All 5 Pillars"],
+        "setups": ["All 5 Pillars v2"],
     },
     "Tier 2": {
         "dot":   "#22c55e",
@@ -325,15 +325,16 @@ _TIER_GATES = {
         "bg":     "#052e16",
         "border": "#166534",
         "emoji":  "🏆",
-        "title":  "Tier 1 Prime — All 5 Pillars Aligned",
+        "title":  "Tier 1 — All 5 Pillars Aligned",
         "gates": [
             ("trend_up",          "close > EMA200  AND  EMA20 > EMA50"),
             ("in_golden_relaxed", "Price within Fibonacci 38.2–61.8% retracement zone"),
             ("cci_cross_up_os",   "CCI crossed up from oversold (< −100) within recovery window"),
             ("trend_structure",   "EMA20 > EMA50 > EMA200  (full alignment)"),
             ("above_cloud",       "Price above Ichimoku cloud  (Nifty regime gate)"),
+            ("entry_quality",    "buy_type not blank  AND  risk >= 5%  AND  norm_score >= 75"),
         ],
-        "note": "Max score bonus +20. Only stock meeting ALL five conditions simultaneously.",
+        "note": "All five conditions + entry quality gate must be true simultaneously.",
     },
     "Tier 2": {
         "color":  "#60a5fa",
@@ -520,7 +521,7 @@ def _render_metrics(df: pd.DataFrame):
         ("📡 CCI ↑",   cb),
         ("⭐ Qual",    qs),
         ("✅ BUY",     buy),
-        ("T1★ ~90%",  at1),
+        ("T1★",  at1),
         ("A ~85%",     aa),
         ("🚫 Stops",   stp),
     ]):
