@@ -105,6 +105,10 @@ class ScoringParams:
     # Score normalisation
     max_score: int = 110
 
+    # Score threshold — base value for normal-volatility regime
+    # Adaptive logic offsets ±5 based on ATR ratio; this sets the midpoint.
+    score_base_threshold: int = 70
+
     @classmethod
     def from_settings(cls, s: dict) -> "ScoringParams":
         """Build from the settings dict produced by pages/settings.py."""
@@ -128,6 +132,7 @@ class ScoringParams:
             t1_ps_weight     = int(s.get("t1_ps_weight",        20)),
             t1_ps_penalty    = int(s.get("t1_ps_penalty",      -10)),
             max_score        = int(s.get("max_score",          110)),
+            score_base_threshold = int(s.get("score_base_threshold", 70)),
             t2_comp_bars     = int(s.get("t2_comp_bars",        10)),
             t2_atr_ratio     = float(s.get("t2_atr_ratio",      0.85)),
             t2_vol_mult      = float(s.get("t2_vol_mult",        1.2)),
@@ -763,7 +768,9 @@ def compute_bar(
 
     # ── ADAPTIVE THRESHOLD ────────────────────────────────────────
     ts_ratio        = cur_atr / cur_atr_sma20 if cur_atr_sma20 > 0 else 1.0
-    score_threshold = 65 if ts_ratio > 1.2 else (75 if ts_ratio < 0.8 else 70)
+    score_threshold = (params.score_base_threshold - 5) if ts_ratio > 1.2 else \
+                      (params.score_base_threshold + 5) if ts_ratio < 0.8 else \
+                       params.score_base_threshold
 
     # ── BUY TYPE CLASSIFICATION ───────────────────────────────────
     is_fib_buy_base = trend_up and in_golden     and norm_score >= score_threshold and cur_cci < 100
