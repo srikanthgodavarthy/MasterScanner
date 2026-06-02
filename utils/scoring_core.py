@@ -585,7 +585,7 @@ def compute_bar(
     #   Harmonic/ABCD      5/5  (tie-breaker only)
     #   Below cloud       -15
     #   Squeeze           neutralised (0) — gate in Tier 2
-    #   Tier 1 bonus       20
+    #   Tier 1 gate bonus  20
     # ─────────────────────────────────────────────────────────────
     score = 0.0
 
@@ -859,7 +859,7 @@ def compute_bar(
 
     # ── SETUP LABEL ───────────────────────────────────────────────
     if is_tier1_prime:
-        setup = "All 5 Pillars v2"
+        setup = "All 5 Pillars"
     elif any_buy:
         setup = (
             "Fib+Qual"    if t2_fib_qual    else
