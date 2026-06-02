@@ -314,6 +314,114 @@ _TIER_META = {
     },
 }
 
+
+# ══════════════════════════════════════════════════════════════════
+#  TIER EXPLANATION LAYER
+# ══════════════════════════════════════════════════════════════════
+
+_TIER_GATES = {
+    "Tier 1": {
+        "color":  "#4ade80",
+        "bg":     "#052e16",
+        "border": "#166534",
+        "emoji":  "🏆",
+        "title":  "Tier 1 Prime — All 5 Pillars Aligned",
+        "gates": [
+            ("trend_up",          "close > EMA200  AND  EMA20 > EMA50"),
+            ("in_golden_relaxed", "Price within Fibonacci 38.2–61.8% retracement zone"),
+            ("cci_cross_up_os",   "CCI crossed up from oversold (< −100) within recovery window"),
+            ("trend_structure",   "EMA20 > EMA50 > EMA200  (full alignment)"),
+            ("above_cloud",       "Price above Ichimoku cloud  (Nifty regime gate)"),
+        ],
+        "note": "Max score bonus +20. Only stock meeting ALL five conditions simultaneously.",
+    },
+    "Tier 2": {
+        "color":  "#60a5fa",
+        "bg":     "#0c1a2e",
+        "border": "#1e3a5f",
+        "emoji":  "📈",
+        "title":  "Tier 2 Strong Buy — Any Valid Buy Signal",
+        "gates": [
+            ("Fib + Qual",        "trend_up  AND  in_golden  AND  norm_score ≥ threshold (65–75)"),
+            ("Fib + CCI",         "trend_up  AND  in_golden_cci  AND  cci_cross_up_os  AND  score ≥ 55"),
+            ("Harmonic",          "trend_up  AND  bullish harmonic pattern detected  AND  score ≥ 35"),
+            ("ABCD",              "trend_up  AND  ABCD pattern detected  AND  score ≥ 35"),
+            ("CCI Break",         "Compression break  AND  CCI momentum break  AND  vol > avg×1.2  AND  prior squeeze"),
+            ("Norm Buy",          "trend_up  AND  score ≥ 65  AND  not extended  AND  above/inside cloud"),
+        ],
+        "note": "Any one signal is sufficient. Score threshold adapts to ATR volatility regime.",
+    },
+    "Tier 3": {
+        "color":  "#fbbf24",
+        "bg":     "#1c0f00",
+        "border": "#78350f",
+        "emoji":  "📊",
+        "title":  "Tier 3 — Active Momentum Expansion",
+        "gates": [
+            ("trend_ok",          "close > EMA200  AND  EMA20 > EMA50"),
+            ("rs20 > 3%",         "20-bar RS vs Nifty exceeds +3% (meaningful outperformance)"),
+            ("atr_contract",      "ATR14 < ATR14_SMA20 × 0.90  (volatility contracted before move)"),
+            ("breakout_trigger",  "close > 10d high  AND  (close − 10d high) / ATR > 0.25  AND  close > prev_close"),
+            ("momentum_expand",   "CCI > 60  AND  CCI > CCI_prev  (accelerating, not extended)"),
+            ("volume_expand",     "Volume > 20-bar avg × 1.2  (participation confirms move)"),
+        ],
+        "note": "All six must be True simultaneously. Squeeze release adds bonus score but is not a gate.",
+    },
+    "Tier 4": {
+        "color":  "#c4b5fd",
+        "bg":     "#120a2e",
+        "border": "#2e1065",
+        "emoji":  "🔄",
+        "title":  "Tier 4 — Early Recovery",
+        "gates": [
+            ("close > EMA20",     "Price reclaimed EMA20 from below (trend transition signal)"),
+            ("EMA20 rising",      "EMA20 > EMA20_prev  (slope positive — not just a wick)"),
+            ("rs20 > 0",          "20-bar RS vs Nifty is positive (leadership improving)"),
+            ("rs20 improving",    "rs20 > rs20_prev  (momentum of RS is rising)"),
+            ("atr_contract",      "ATR14 < ATR14_SMA20 × 0.90  (volatility settling into base)"),
+            ("tight_range",       "5-bar close range < ATR × 1.5  (price coiling, not thrashing)"),
+            ("cci > 0",           "CCI above zero (momentum turned positive)"),
+            ("cci rising",        "CCI > CCI_prev  (momentum is accelerating)"),
+            ("volume_expand",     "Volume > 20-bar avg × 1.2  (participation present in recovery)"),
+        ],
+        "note": "All nine must be True simultaneously. Stocks in Tier 4 are earlier-stage — position sizing should reflect higher uncertainty.",
+    },
+}
+
+
+def _tier_info_layer():
+    """Collapsible tier explanation panel — shows gate conditions for all tiers."""
+    with st.expander("ℹ️ Tier Definitions & Gate Conditions", expanded=False):
+        cols = st.columns(2)
+        for idx, (tier_key, info) in enumerate(_TIER_GATES.items()):
+            col = cols[idx % 2]
+            with col:
+                # Tier header card
+                col.markdown(
+                    f'<div style="background:{info["bg"]};border:1px solid {info["border"]};'
+                    f'border-radius:8px;padding:12px 14px;margin-bottom:10px">'                    f'<div style="color:{info["color"]};font-size:13px;font-weight:700;margin-bottom:8px">'
+                    f'{info["emoji"]} {info["title"]}</div>',
+                    unsafe_allow_html=True,
+                )
+                # Gate rows
+                rows_html = ""
+                for condition, description in info["gates"]:
+                    rows_html += (
+                        f'<div style="display:flex;gap:8px;margin-bottom:5px;align-items:flex-start">'                        f'<span style="background:{info["border"]};color:{info["color"]};'
+                        f'padding:1px 7px;border-radius:10px;font-size:10px;font-weight:600;'
+                        f'white-space:nowrap;flex-shrink:0;margin-top:1px">{condition}</span>'
+                        f'<span style="color:#94a3b8;font-size:11px;line-height:1.4">{description}</span>'
+                        f'</div>'
+                    )
+                note_html = (
+                    f'<div style="margin-top:8px;padding-top:7px;border-top:1px solid {info["border"]}40;'
+                    f'color:#64748b;font-size:10px;font-style:italic">{info["note"]}</div>'
+                )
+                col.markdown(
+                    rows_html + note_html + "</div>",
+                    unsafe_allow_html=True,
+                )
+
 def _setup_legend(setups: list, df: pd.DataFrame) -> str:
     """Pill bar showing count per setup label for this tier."""
     if df.empty or "Setup" not in df.columns:
@@ -358,8 +466,8 @@ def _summary_bar(df: pd.DataFrame) -> str:
     else:
         t1       = int(df["_tier1_prime"].sum())                      if "_tier1_prime" in df.columns else 0
         t2       = int((df["_any_buy"] & ~df["_tier1_prime"]).sum())  if "_any_buy" in df.columns and "_tier1_prime" in df.columns else 0
-        t3       = int((df["Action"] == "👁 WATCH").sum())
-        t4       = int((df["Action"] == "⛔ SKIP").sum())
+        t3       = int(df["_tier3_momentum"].sum()) if "_tier3_momentum" in df.columns else 0
+        t4       = int(df["_tier4_recovery"].sum())  if "_tier4_recovery"  in df.columns else 0
         golden   = int(df["_in_golden"].sum())                        if "_in_golden"   in df.columns else 0
         cci_buy  = int((df["CCI Sig"] == "BUY").sum())
         cci_exit = int((df["CCI Sig"] == "EXIT").sum())
@@ -368,6 +476,8 @@ def _summary_bar(df: pd.DataFrame) -> str:
     pills = [
         ("#166534", "#4ade80", f"Tier 1 · {t1}"),
         ("#1e3a5f", "#60a5fa", f"Tier 2 · {t2}"),
+        ("#1c0f00", "#fbbf24", f"Tier 3 · {t3}"),
+        ("#120a2e", "#c4b5fd", f"Tier 4 · {t4}"),
         ("#0f2d2d", "#2dd4bf", f"Golden Zone · {golden}"),
         ("#2e1065", "#c4b5fd", f"CCI Buy · {cci_buy}"),
         ("#831843", "#f9a8d4", f"CCI Exit · {cci_exit}"),
@@ -631,6 +741,9 @@ def render(settings: dict) -> None:
     df_t2 = fdf[mask_ab & ~mask_t1].sort_values("Score", ascending=False)
     df_t3 = fdf[mask_t3 & ~mask_ab & ~mask_t1].sort_values("Score", ascending=False)
     df_t4 = fdf[mask_t4 & ~mask_t3 & ~mask_ab & ~mask_t1].sort_values("Score", ascending=False)
+
+    # Tier info panel
+    _tier_info_layer()
 
     # Tier badge line — shows counts for active filter
     t1_n, t2_n, t3_n, t4_n = len(df_t1), len(df_t2), len(df_t3), len(df_t4)
