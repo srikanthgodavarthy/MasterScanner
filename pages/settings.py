@@ -48,7 +48,7 @@ DEFAULTS = {
     "cci_os":           -100,
     "workers":          10,
     "hold_days":        20,
-    "min_score":        70,
+    "score_base_threshold": 70,
     "auto_refresh":     False,
     "refresh_mins":     5,
     # Tier 1
@@ -232,24 +232,23 @@ def _preview_tier1(ss: dict) -> str:
 
 
 def _preview_tier2(ss: dict) -> str:
-    atr_r  = ss.get("t2_atr_ratio",    0.85)
-    c_bars = ss.get("t2_comp_bars",    10)
-    cci_ob = ss.get("cci_ob",          100)
-    vol_m  = ss.get("t2_vol_mult",     1.2)
+    fib_lo  = ss.get("t1_fib_lo",    61.8)
+    cci_os  = ss.get("cci_os",       -100)
+    cci_ob  = ss.get("cci_ob",        100)
+    win     = ss.get("t1_cci_window",   5)
 
     lines = [
-        f'<b>Tier 2 — Momentum Breakout Gate</b>',
-        f'  compression_break  =',
-        f'    prev ATR < SMA({c_bars}) × <b>{atr_r:.2f}</b>',
-        f'    <span class="ok">AND</span> close > {c_bars}-bar range high (prev bar)',
+        f'<b>Tier 2 — any_buy signals (any one qualifies)</b>',
         f'',
-        f'  cci_momentum_break =',
-        f'    CCI > <b>{cci_ob}</b>  <span class="ok">AND</span>  CCI > prev CCI',
+        f'  <b>Fib + Qual</b>  trend_up  AND  price in Fib 50–{fib_lo:.1f}% zone  AND  score ≥ threshold  AND  CCI &lt; {cci_ob}',
+        f'  <b>Fib + CCI</b>   trend_up  AND  price in Fib zone  AND  CCI ≤ {cci_os}  AND  CCI crossed up from OS',
+        f'  <b>Harmonic</b>    trend_up  AND  bullish harmonic pattern  AND  score ≥ 35',
+        f'  <b>ABCD</b>        trend_up  AND  ABCD pattern  AND  score ≥ 35',
+        f'  <b>CCI Break</b>   trend_up  AND  CCI crossed up from {cci_os}  AND  score ≥ 55  AND  not in Fib zone',
+        f'  <b>Norm Buy</b>    trend_up  AND  score ≥ 65  AND  not in Fib zone  AND  CCI &lt; 50',
         f'',
-        f'  volume_expansion   =',
-        f'    volume > vol_avg × <b>{vol_m:.1f}</b>',
-        f'',
-        f'  All three must be <span class="ok">True</span> simultaneously',
+        f'  All signals also require: price above or inside Ichimoku cloud',
+        f'  CCI recovery window = last {win} bars',
     ]
     return '<br>'.join(lines)
 
@@ -604,91 +603,84 @@ def _section_tier2():
     ss = st.session_state
 
     st.markdown(
-        '<div class="cfg-card-title">'
+        '<div class="cfg-card-title">' 
         '<span class="dot" style="background:#3b82f6"></span>'
-        'Tier 2 — Compression Breakout Gate</div>',
+        'Tier 2 — Buy Signal Thresholds</div>',
         unsafe_allow_html=True,
     )
 
-    # Compression detection
-    st.markdown("**Compression detection**")
-    comp1, comp2 = st.columns(2)
-    with comp1:
-        comp_bars = st.slider(
-            "Compression window (bars)", min_value=5, max_value=20,
-            value=ss.get("t2_comp_bars", 10), step=1, key="sl_comp_bars",
-            help="Number of prior bars to define the range high and ATR baseline",
+    st.caption(
+        "Tier 2 fires when **any one** of the buy signals below is True "
+        "(and price is above/inside Ichimoku cloud). "
+        "These knobs control the thresholds used by those signals."
+    )
+
+    # ── Fibonacci zone ─────────────────────────────────────────────
+    st.markdown("**Fibonacci retracement zone** — used by Fib+Qual and Fib+CCI signals")
+    fz1, fz2 = st.columns(2)
+    with fz1:
+        fib_lo = st.slider(
+            "Deep end of zone (61.8 = classic golden ratio)", min_value=50.0, max_value=70.0,
+            value=float(ss.get("t1_fib_lo", 61.8)), step=0.1, format="%.1f", key="sl_t2_fib_lo",
+            help="Price must be above swing_high − range × (this / 100)",
         )
-    with comp2:
-        atr_ratio = st.slider(
-            "ATR compression ratio", min_value=0.60, max_value=0.95,
-            value=ss.get("t2_atr_ratio", 0.85), step=0.05, key="sl_atr_ratio",
-            format="%.2f",
-            help="prev_bar ATR must be < SMA(ATR, window) × this ratio",
+    with fz2:
+        fib_hi = st.slider(
+            "Shallow end of zone (38.2 = allow shallower pullbacks)", min_value=25.0, max_value=50.0,
+            value=float(ss.get("t1_fib_hi", 38.2)), step=0.1, format="%.1f", key="sl_t2_fib_hi",
+            help="Price must be below swing_high − range × (this / 100)",
         )
-    ss["t2_comp_bars"] = int(comp_bars)
-    ss["t2_atr_ratio"] = float(atr_ratio)
-
-    if atr_ratio > 0.92:
-        st.info("ℹ️ High ratio — almost any bar will qualify as 'compressed'. Expect many false triggers.")
-    elif atr_ratio < 0.70:
-        st.info("ℹ️ Low ratio — only very tight compressions qualify. Fewer but higher-quality signals.")
+    ss["t1_fib_lo"] = float(fib_lo)
+    ss["t1_fib_hi"] = float(fib_hi)
+    st.caption(f"Zone: Fib {fib_lo:.1f}% → {fib_hi:.1f}% of the swing range below the swing high")
 
     st.divider()
 
-    # CCI momentum expansion
-    st.markdown("**`cci_momentum_break` — CCI threshold**")
-    st.caption("CCI must be above this level AND still rising — confirms bullish momentum, not just oversold bounce")
-    cci_ob_t2 = st.slider(
-        "CCI overbought threshold for Tier 2",
-        min_value=50, max_value=200,
-        value=ss.get("cci_ob", 100), step=10, key="sl_t2_cci_ob",
-        help="Synced with CCI OB in Common — change here updates both",
-    )
-    ss["cci_ob"] = int(cci_ob_t2)
+    # ── CCI thresholds ─────────────────────────────────────────────
+    st.markdown("**CCI thresholds** — used by Fib+CCI, CCI Break, and Norm Buy signals")
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        cci_os = st.slider(
+            "CCI oversold level", min_value=-200, max_value=-50,
+            value=int(ss.get("cci_os", -100)), step=10, key="sl_t2_cci_os",
+            help="CCI must cross UP above this level to trigger Fib+CCI and CCI Break",
+        )
+    with cc2:
+        cci_window = st.slider(
+            "CCI recovery window (bars)", min_value=1, max_value=10,
+            value=int(ss.get("t1_cci_window", 5)), step=1, key="sl_t2_cci_win",
+            help="How many bars back to look for a CCI oversold cross (Fib+CCI / CCI Break)",
+        )
+    ss["cci_os"]        = int(cci_os)
+    ss["t1_cci_window"] = int(cci_window)
 
-    if cci_ob_t2 < 80:
-        st.warning("⚠️ CCI threshold below 80 — will capture many borderline momentum readings.")
-    elif cci_ob_t2 > 150:
-        st.info("ℹ️ High CCI threshold — only strong continuation moves will qualify.")
-
-    st.divider()
-
-    # Volume expansion
-    st.markdown("**`volume_expansion` — Volume multiplier**")
-    vol_mult = st.slider(
-        "Volume > avg × multiplier",
-        min_value=1.0, max_value=3.0,
-        value=ss.get("t2_vol_mult", 1.2), step=0.1, key="sl_vol_mult",
-        format="%.1f",
-        help="Current volume must exceed the 20-bar average by this multiple",
-    )
-    ss["t2_vol_mult"] = float(vol_mult)
-
-    if vol_mult < 1.1:
-        st.warning("⚠️ Multiplier below 1.1 is nearly always true — effectively disabling volume gate.")
-    elif vol_mult > 2.0:
-        st.info("ℹ️ Strict volume filter — only high-conviction breakouts will pass.")
+    if cci_os > -80:
+        st.info("ℹ️ Less strict OS level — CCI Break and Fib+CCI signals will trigger more often.")
+    elif cci_os < -150:
+        st.info("ℹ️ Very strict OS level — only deep oversold crosses will qualify.")
 
     st.divider()
 
-    # Score threshold
-    st.markdown("**Score threshold override for Tier 2 legacy signals**")
-    st.caption("Applies to `any_buy` fallback signals — NOT to the compression breakout gate above")
-    min_score = st.slider(
-        "Minimum normalised score (0-100)",
-        min_value=50, max_value=85,
-        value=ss.get("min_score", 70), step=5, key="sl_min_score",
+    # ── Score threshold ────────────────────────────────────────────
+    st.markdown("**Score floor for Fib+Qual and Norm Buy**")
+    st.caption(
+        "The adaptive threshold (65 / 70 / 75) adjusts automatically by ATR regime. "
+        "This slider overrides the base value used in normal-volatility conditions."
     )
-    ss["min_score"] = int(min_score)
+    base_thresh = st.slider(
+        "Base score threshold (normal-volatility regime)",
+        min_value=55, max_value=80,
+        value=int(ss.get("score_base_threshold", 70)), step=5, key="sl_t2_score_thresh",
+        help="High-vol regime uses base−5; low-vol uses base+5",
+    )
+    ss["score_base_threshold"] = int(base_thresh)
+    st.caption(f"Active thresholds → high-vol: **{base_thresh-5}** | normal: **{base_thresh}** | low-vol: **{base_thresh+5}**")
 
     # Preview
     st.markdown(
         f'<div class="preview-box">{_preview_tier2(ss)}</div>',
         unsafe_allow_html=True,
     )
-
-
 
 def _section_tier3():
     ss = st.session_state
@@ -1006,7 +998,7 @@ def render() -> dict:
         "cci_os":               ss.get("cci_os",           -100),
         "workers":              ss.get("workers",           10),
         "hold_days":            ss.get("hold_days",         20),
-        "min_score":            ss.get("min_score",         70),
+        "score_base_threshold": ss.get("score_base_threshold", 70),
         "auto_refresh":         ss.get("auto_refresh",      False),
         "refresh_mins":         ss.get("refresh_mins",      5),
         # Tier 1 tuning
