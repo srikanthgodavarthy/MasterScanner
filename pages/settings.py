@@ -787,6 +787,19 @@ def render() -> dict:
 
     # ── Return settings consumed by scanner/backtest ─────────────
     ss = st.session_state
+    # Persist new v3 keys into returned settings
+    settings_extra = {
+        "t1_rs20_min":  float(st.session_state.get("t1_rs20_min",  5.0)),
+        "t1_atr_ratio": float(st.session_state.get("t1_atr_ratio", 0.90)),
+        "t1_range_pct": float(st.session_state.get("t1_range_pct", 0.12)),
+        "t1_cci_min":   float(st.session_state.get("t1_cci_min",  -50.0)),
+        "t1_cooldown":  int(st.session_state.get("t1_cooldown",    10)),
+        "t1_comp_bars": int(st.session_state.get("t1_comp_bars",   10)),
+        "t2_rs20_min":  float(st.session_state.get("t2_rs20_min",   3.0)),
+        "t2_atr_ratio": float(st.session_state.get("t2_atr_ratio",  0.90)),
+        "t2_cci_min":   float(st.session_state.get("t2_cci_min",   60.0)),
+        "t2_brk_atr":   float(st.session_state.get("t2_brk_atr",   0.25)),
+    }
     return {
         "symbols":              ss.get("symbols",           NIFTY500_SYMBOLS),
         "cci_len":              ss.get("cci_len",           20),

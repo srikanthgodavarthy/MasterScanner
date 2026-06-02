@@ -203,7 +203,7 @@ def _setup_cell(setup: str) -> str:
 
 _HEADERS = [
     "#", "Stock", "Score", "AccTier", "Setup",
-    "CCI", "CCI Sig", "Qual", "%Chg", "Entry", "SL", "T1", "T2", "T3",
+    "RS20", "CCI", "CCI Sig", "Qual", "%Chg", "Entry", "SL", "T1", "T2", "T3",
 ]
 
 def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int,
@@ -254,6 +254,7 @@ def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int,
             f"<td>{sc_c(str(sc))}</td>"
             f"<td>{_acc_badge(at)}</td>"
             f"<td>{_setup_cell(str(row.get('Setup', '-')))}</td>"
+            f"<td style='color:#94a3b8;font-size:12px'>{row.get('RS20', 0)}</td>"
             f"<td>{cc_c(str(int(cv)))}</td>"
             f"<td>{cc_c(str(row['CCI Sig']))}</td>"
             f"<td style='font-size:13px;text-align:center'>{qual_icon}</td>"
@@ -618,6 +619,7 @@ def render(settings: dict) -> None:
     wl_syms_set = set(w["symbol"] for w in st.session_state.get("watchlist", []))
 
     has_t1 = "_tier1_prime" in fdf.columns
+    has_t3 = "_tier3_recovery" in fdf.columns
     has_ab = "_any_buy"     in fdf.columns
 
     mask_t1 = fdf["_tier1_prime"] if has_t1 else pd.Series(False, index=fdf.index)
@@ -626,7 +628,11 @@ def render(settings: dict) -> None:
     sort_col = "AccScore" if "AccScore" in fdf.columns else "Score"
 
     df_t1 = fdf[mask_t1].sort_values(sort_col, ascending=False)
-    df_t2 = fdf[mask_ab & ~mask_t1].sort_values("Score", ascending=False)
+    mask_t2 = fdf["_tier2_momentum"] if "_tier2_momentum" in fdf.columns else pd.Series(False, index=fdf.index)
+    mask_t3 = fdf["_tier3_recovery"]  if "_tier3_recovery"  in fdf.columns else pd.Series(False, index=fdf.index)
+    df_t2 = fdf[mask_t2].sort_values("Score", ascending=False)
+    df_t3_rec = fdf[mask_t3].sort_values("Score", ascending=False)
+    df_t4_watch = fdf[~mask_t1 & ~mask_t2 & ~mask_t3 & (fdf["Action"] == "👁 WATCH")].sort_values("Score", ascending=False)
     df_t3 = fdf[fdf["Action"] == "👁 WATCH"].sort_values("Score", ascending=False)
     df_t4 = fdf[fdf["Action"] == "⛔ SKIP"].sort_values("Score", ascending=False)
 
