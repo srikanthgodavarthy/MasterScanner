@@ -765,7 +765,6 @@ def render() -> dict:
     section = st.radio(
         "section",
         ["⚙️ Common", "🏆 Tier 1", "📈 Tier 2", "⭐ Watchlist", "🗄️ System"],
-        horizontal=True,
         label_visibility="collapsed",
         key="settings_section",
     )
