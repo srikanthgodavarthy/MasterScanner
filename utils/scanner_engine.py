@@ -343,7 +343,7 @@ def score_stock(
     return {
         # ── display columns ──────────────────────────────────────
         "Stock":        None,
-        "Tier":         r.tier,
+        "Tier":         r.tier,    # "Tier 1" | "Tier 2" | "Tier 3" | "Watchlist"
         "AccTier":      r.acc_tier,
         "AccScore":     r.acc_score,
         "Score":        r.norm_score,
@@ -353,6 +353,7 @@ def score_stock(
         "CCI":          round(r.cur_cci),
         "CCI State":    r.cci_state,
         "CCI Sig":      r.cci_signal,
+        "RS20":         round(r.rs20, 1),
         "Qual":         r.qual_icon,
         "%Chg":         r.pct_chg,
         "Entry":        r.entry,
