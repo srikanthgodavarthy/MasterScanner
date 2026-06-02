@@ -789,6 +789,7 @@ def compute_bar(
     # ── TIER CLASSIFICATION ───────────────────────────────────────
     tier = (
         "Tier 1" if is_tier1_prime    else
+        "Tier 2" if is_tier2_momentum else
         "Tier 2" if any_buy           else
         "Tier 3" if is_tier3_momentum else
         "Tier 4" if is_tier4_recovery else
@@ -894,6 +895,8 @@ def compute_bar(
     # ── SETUP LABEL ───────────────────────────────────────────────
     if is_tier1_prime:
         setup = "All 5 Pillars"
+    elif is_tier2_momentum:
+        setup = "Compression Brk"
     elif any_buy:
         setup = (
             "Fib+Qual"    if t2_fib_qual    else
@@ -983,7 +986,7 @@ def compute_bar(
         hard_stop           = hard_stop,
         trend_up            = trend_up,
         trend_down          = trend_down,
-        t2_compression  = False,  # Track A (compression breakout) removed; Track B only
+        t2_compression  = is_tier2_momentum,
         t2_fib_qual     = t2_fib_qual,
         t2_fib_cci      = t2_fib_cci,
         t2_harmonic     = t2_harmonic,
