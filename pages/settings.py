@@ -762,6 +762,14 @@ def render() -> dict:
     )
 
     # ── Section tabs ─────────────────────────────────────────────
+    section = st.radio(
+        "section",
+        ["⚙️ Common", "🏆 Tier 1", "📈 Tier 2", "⭐ Watchlist", "🗄️ System"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="settings_section",
+    )
+
     st.markdown('<div class="cfg-card">', unsafe_allow_html=True)
 
     if section == "⚙️ Common":
