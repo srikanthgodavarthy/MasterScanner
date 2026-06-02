@@ -76,7 +76,7 @@ class ScoringParams:
     nifty_regime_val:    str  = "neutral"   # "bull" | "bear" | "neutral"
 
     # Score normalisation
-    max_score: int = 130
+    max_score: int = 110
 
     @classmethod
     def from_settings(cls, s: dict) -> "ScoringParams":
@@ -98,7 +98,7 @@ class ScoringParams:
             t1_no_squeeze_pts= int(s.get("t1_no_squeeze_pts",    0)),
             t1_ps_weight     = int(s.get("t1_ps_weight",        20)),
             t1_ps_penalty    = int(s.get("t1_ps_penalty",      -10)),
-            max_score        = int(s.get("max_score",          130)),
+            max_score        = int(s.get("max_score",          110)),
             t2_comp_bars     = int(s.get("t2_comp_bars",        10)),
             t2_atr_ratio     = float(s.get("t2_atr_ratio",      0.85)),
             t2_vol_mult      = float(s.get("t2_vol_mult",        1.2)),
@@ -502,7 +502,7 @@ def compute_bar(
     _, _, harm_bull, harm_bear, abcd_bull, abcd_bear = _get_pivots(ia, i, params.pvt_lb)
 
     # ── RAW SCORE ─────────────────────────────────────────────────
-    # Budget (max_score = 130):
+    # Budget (max_score = 110):
     #   Trend structure    25   (trend_up)
     #   EMA slope          15   (ema_slope — expansion, not overlap)
     #   RSI rising         15   (rising from 40-60; -5 if ≥70)
@@ -618,8 +618,8 @@ def compute_bar(
     # ── BUY TYPE CLASSIFICATION ───────────────────────────────────
     is_fib_buy_base = trend_up and in_golden     and norm_score >= score_threshold
     is_fib_buy_cci  = trend_up and in_golden_cci and norm_score >= 55 and cci_cross_up_os
-    is_abcd_buy     = trend_up and abcd_bull
-    is_harm_buy     = trend_up and harm_bull
+    is_abcd_buy     = trend_up and abcd_bull and norm_score >= 35
+    is_harm_buy     = trend_up and harm_bull  and norm_score >= 35
     is_norm_buy     = trend_up and norm_score >= 65 and not in_golden and not cci_extended
     is_cci_buy      = trend_up and cci_cross_up_os and norm_score >= 55
 
