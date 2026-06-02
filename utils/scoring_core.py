@@ -75,6 +75,22 @@ class ScoringParams:
     nifty_regime_filter: bool = False
     nifty_regime_val:    str  = "neutral"   # "bull" | "bear" | "neutral"
 
+    # Tier 3 — Active Momentum Expansion thresholds
+    t3_rs20_min:      float = 3.0    # RS20 > threshold (%)
+    t3_atr_ratio:     float = 0.90   # ATR14 < ATR_SMA20 * ratio
+    t3_breakout_atr:  float = 0.25   # (close - 10d_high) / ATR > threshold
+    t3_cci_min:       int   = 60     # CCI must be above this AND rising
+    t3_vol_mult:      float = 1.2    # volume > avg * mult
+    t3_squeeze_bonus: bool  = True   # add t3_squeeze_pts on squeeze_release
+    t3_squeeze_pts:   int   = 15     # bonus points on squeeze release
+
+    # Tier 4 — Early Recovery thresholds
+    t4_rs20_min:      float = 0.0    # RS20 must exceed this (positive RS)
+    t4_atr_ratio:     float = 0.90   # ATR14 < ATR_SMA20 * ratio
+    t4_cci_min:       int   = 0      # CCI must be above this AND rising
+    t4_vol_mult:      float = 1.2    # volume > avg * mult
+    t4_tight_atr:     float = 1.5    # 5-bar close range < ATR * mult
+
     # Score normalisation
     max_score: int = 110
 
@@ -104,6 +120,18 @@ class ScoringParams:
             t2_vol_mult      = float(s.get("t2_vol_mult",        1.2)),
             nifty_regime_filter = bool(s.get("nifty_regime_filter", False)),
             nifty_regime_val    = str(s.get("nifty_regime_val",  "neutral")),
+            t3_rs20_min         = float(s.get("t3_rs20_min",      3.0)),
+            t3_atr_ratio        = float(s.get("t3_atr_ratio",     0.90)),
+            t3_breakout_atr     = float(s.get("t3_breakout_atr",  0.25)),
+            t3_cci_min          = int(s.get("t3_cci_min",         60)),
+            t3_vol_mult         = float(s.get("t3_vol_mult",      1.2)),
+            t3_squeeze_bonus    = bool(s.get("t3_squeeze_bonus",  True)),
+            t3_squeeze_pts      = int(s.get("t3_squeeze_pts",     15)),
+            t4_rs20_min         = float(s.get("t4_rs20_min",      0.0)),
+            t4_atr_ratio        = float(s.get("t4_atr_ratio",     0.90)),
+            t4_cci_min          = int(s.get("t4_cci_min",         0)),
+            t4_vol_mult         = float(s.get("t4_vol_mult",      1.2)),
+            t4_tight_atr        = float(s.get("t4_tight_atr",     1.5)),
         )
 
 
@@ -529,7 +557,7 @@ def compute_bar(
     # ── TIGHT RANGE — 5-bar close range < 1.5× ATR (base building) ─
     if i >= 5:
         rng5 = float(c.iloc[i-4:i+1].max()) - float(c.iloc[i-4:i+1].min())
-        tight_range = rng5 < cur_atr * 1.5
+        tight_range = rng5 < cur_atr * params.t4_tight_atr
     else:
         tight_range = False
 
@@ -650,18 +678,18 @@ def compute_bar(
     # ── TIER 3 — ACTIVE MOMENTUM EXPANSION ──────────────────────
     # All six conditions must be true simultaneously.
     t3_trend_ok_flag        = cur_c > cur_e200 and cur_e20 > cur_e50
-    t3_rs20_strong_flag     = rs20 > 3.0
-    t3_atr_contract_flag    = atr_contract
+    t3_rs20_strong_flag     = rs20 > params.t3_rs20_min
+    t3_atr_contract_flag    = cur_atr < cur_atr_sma20 * params.t3_atr_ratio
     t3_10d_high             = float(h.iloc[max(0, i - 10):i].max()) if i >= 1 else float(h.iloc[i])
     t3_breakout_qual        = (cur_c - t3_10d_high) / cur_atr if cur_atr > 0 else 0.0
     t3_breakout_trigger_flag = (
         cur_c > t3_10d_high and
         cur_c > prev_close  and
-        t3_breakout_qual > 0.25
+        t3_breakout_qual > params.t3_breakout_atr
     )
-    t3_momentum_expand_flag = cur_cci > 60 and cur_cci > prev_cci
-    t3_volume_expand_flag   = cur_v > cur_vavg * 1.2
-    t3_squeeze_bonus_flag   = squeeze_release   # bonus: not a gate condition
+    t3_momentum_expand_flag = cur_cci > params.t3_cci_min and cur_cci > prev_cci
+    t3_volume_expand_flag   = cur_v > cur_vavg * params.t3_vol_mult
+    t3_squeeze_bonus_flag   = squeeze_release and params.t3_squeeze_bonus   # bonus: not a gate condition
 
     is_tier3_momentum = (
         t3_trend_ok_flag         and
@@ -677,13 +705,13 @@ def compute_bar(
     prev_e20_val = float(ia.e20.iloc[i - 1]) if i >= 1 else cur_e20
     t4_close_above_e20_flag = cur_c > cur_e20
     t4_e20_rising_flag      = cur_e20 > prev_e20_val
-    t4_rs20_positive_flag   = rs20 > 0.0
+    t4_rs20_positive_flag   = rs20 > params.t4_rs20_min
     t4_rs20_improving_flag  = rs20 > prev_rs20
-    t4_atr_contract_flag    = atr_contract
+    t4_atr_contract_flag    = cur_atr < cur_atr_sma20 * params.t4_atr_ratio
     t4_tight_range_flag     = tight_range
-    t4_cci_positive_flag    = cur_cci > 0
+    t4_cci_positive_flag    = cur_cci > params.t4_cci_min
     t4_cci_rising_flag      = cur_cci > prev_cci
-    t4_volume_expand_flag   = cur_v > cur_vavg * 1.2
+    t4_volume_expand_flag   = cur_v > cur_vavg * params.t4_vol_mult
 
     is_tier4_recovery = (
         t4_close_above_e20_flag and
@@ -696,6 +724,10 @@ def compute_bar(
         t4_cci_rising_flag      and
         t4_volume_expand_flag
     )
+
+    # ── TIER 3 SQUEEZE BONUS ─────────────────────────────────────
+    if is_tier3_momentum and t3_squeeze_bonus_flag:
+        score += params.t3_squeeze_pts
 
     # ── NORMALISE ─────────────────────────────────────────────────
     norm_score = min(100, int(score * 100 / params.max_score))
