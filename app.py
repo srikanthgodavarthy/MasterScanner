@@ -120,6 +120,8 @@ settings = {
     "t2_comp_bars":      ss.get("t2_comp_bars",       10),
     "t2_atr_ratio":      ss.get("t2_atr_ratio",       0.85),
     "t2_vol_mult":       ss.get("t2_vol_mult",        1.2),
+    # Nifty regime
+    "nifty_regime_filter": ss.get("nifty_regime_filter", False),
 }
 
 tab1, tab2, tab3 = st.tabs(["📡 Live Scanner", "📈 Backtest Engine", "⚙️ Settings"])
