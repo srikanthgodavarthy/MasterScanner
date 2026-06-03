@@ -3,7 +3,10 @@
 import streamlit as st
 import pandas as pd
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+IST = ZoneInfo("Asia/Kolkata")
 
 from utils.scanner_engine import (
     run_scanner,
@@ -680,7 +683,7 @@ def render(settings: dict) -> None:
             st.warning("No results — check symbols or data source.")
             return
         st.session_state["scan_df"] = df_raw
-        st.session_state["scan_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        st.session_state["scan_ts"] = datetime.now(IST).strftime("%d %b %Y  %H:%M IST")
         # Cache the Nifty regime that was active when scan ran (for display)
         _nifty_s = fetch_nifty("1y")
         st.session_state["last_nifty_regime"] = nifty_regime(_nifty_s)

@@ -8,6 +8,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+IST = ZoneInfo("Asia/Kolkata")
 import plotly.graph_objects as go
 
 from utils.scanner_engine import NIFTY500_SYMBOLS
@@ -365,6 +368,6 @@ def render(settings=None):
         csv_bt = trades_df.to_csv(index=False)
         st.download_button(
             "⬇️ Download Trade Log CSV", data=csv_bt,
-            file_name=f"backtest_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            file_name=f"backtest_{datetime.now(IST).strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv", key="btn_dl_bt_csv",
         )
