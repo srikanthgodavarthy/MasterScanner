@@ -254,7 +254,7 @@ def render(settings=None):
         st.markdown("##### 🎯 Exit Breakdown")
         exit_data = pd.Series(s.get("exit_breakdown", {}))
         if not exit_data.empty:
-            clr_map = {"T1 HIT":"#22c55e","T2 HIT":"#4ade80","SL HIT":"#ef4444","TIMEOUT":"#f59e0b"}
+            clr_map = {"T1 HIT":"#22c55e","T2 HIT":"#4ade80","SL HIT":"#ef4444","TIMEOUT":"#f59e0b","TIME STOP":"#f97316"}
             fig2 = go.Figure(go.Pie(
                 labels=exit_data.index.tolist(), values=exit_data.values.tolist(),
                 hole=0.55,
@@ -341,7 +341,7 @@ def render(settings=None):
     # ── Trade log ─────────────────────────────────────────────────────────────
     with st.expander("📜 Full Trade Log", expanded=False):
         show_cols = ["symbol","entry_date","entry_price","exit_date","exit_price",
-                     "exit_reason","pnl_pct","score_at_entry","cci_at_entry",
+                     "exit_reason","pnl_pct","risk_pct","score_at_entry","cci_at_entry",
                      "sl","t1","t2","tier1_prime"]
         tlog = trades_df[[c for c in show_cols if c in trades_df.columns]].copy()
         tlog = tlog.sort_values("entry_date", ascending=False)
