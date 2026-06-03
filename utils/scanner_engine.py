@@ -63,6 +63,28 @@ def cci(close: pd.Series, period: int = 20) -> pd.Series:
     mad_s = pd.Series(mad_v, index=close.index).replace(0, np.nan)
     return (close - sma_s) / (0.015 * mad_s)
 
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Average Directional Index (Wilder smoothing)."""
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+
+    up_move   = high - high.shift()
+    down_move = low.shift() - low
+
+    plus_dm  = up_move.where((up_move > down_move) & (up_move > 0),   0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    atr_s   = tr.ewm(com=period - 1, adjust=False).mean()
+    plus_di  = 100 * plus_dm.ewm(com=period - 1,  adjust=False).mean() / atr_s.replace(0, np.nan)
+    minus_di = 100 * minus_dm.ewm(com=period - 1, adjust=False).mean() / atr_s.replace(0, np.nan)
+
+    dx_denom = (plus_di + minus_di).replace(0, np.nan)
+    dx       = 100 * (plus_di - minus_di).abs() / dx_denom
+    return dx.ewm(com=period - 1, adjust=False).mean()
+
 def highest(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(period).max()
 
@@ -600,8 +622,9 @@ def score_color(score: int) -> str:
     return "#ef4444"
 
 def action_color(action: str) -> str:
-    if "BUY"   in action: return "#16a34a"
-    if "WATCH" in action: return "#f59e0b"
+    if "STRONG BUY" in action: return "#059669"
+    if "BUY"        in action: return "#16a34a"
+    if "WATCH"      in action: return "#f59e0b"
     return "#ef4444"
 
 def cci_color(cci_val: float, ob: int = 100, os: int = -100) -> str:

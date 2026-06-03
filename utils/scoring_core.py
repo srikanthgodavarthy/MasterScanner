@@ -316,6 +316,9 @@ class IndicatorArrays:
     pivot_ph: pd.Series        # pre-computed pivot highs (full series)
     pivot_pl: pd.Series        # pre-computed pivot lows  (full series)
 
+    adx_s:             pd.Series   # ADX(14)
+    squeeze_duration_s: pd.Series  # bars since squeeze started (0 when not in squeeze)
+
 
 # ══════════════════════════════════════════════════════════════════
 #  SERIES BUILDER  (call once per symbol)
@@ -331,7 +334,7 @@ def build_indicators(
     Imported helpers come from scanner_engine to avoid circular deps.
     """
     from utils.scanner_engine import (
-        ema, sma, rsi, atr, cci, ichimoku, _strip_tz,
+        ema, sma, rsi, atr, cci, ichimoku, _strip_tz, adx as adx_fn,
     )
 
     c = df["close"]
@@ -380,6 +383,21 @@ def build_indicators(
     pivot_ph = pivot_high(h, pvt_lb)
     pivot_pl = pivot_low(l,  pvt_lb)
 
+    # ADX(14)
+    adx_s = adx_fn(h, l, c, 14)
+
+    # Squeeze duration: consecutive bars the squeeze has been ON
+    sq_arr    = squeeze_series.to_numpy()
+    sq_dur    = np.zeros(len(sq_arr), dtype=int)
+    running   = 0
+    for _k in range(len(sq_arr)):
+        if sq_arr[_k]:
+            running += 1
+        else:
+            running = 0
+        sq_dur[_k] = running
+    squeeze_duration_s = pd.Series(sq_dur, index=c.index)
+
     return IndicatorArrays(
         c=c, h=h, l=l, o=o, v=v,
         e20=e20, e50=e50, e200=e200,
@@ -392,6 +410,8 @@ def build_indicators(
         nifty_aligned=nifty_aligned,
         pivot_ph=pivot_ph,
         pivot_pl=pivot_pl,
+        adx_s=adx_s,
+        squeeze_duration_s=squeeze_duration_s,
     )
 
 
@@ -482,6 +502,14 @@ def compute_bar(
     cur_atr_sma20 = float(ia.atr_sma20.iloc[i]) if not np.isnan(float(ia.atr_sma20.iloc[i])) else cur_atr
     cur_ct   = float(ia.cloud_top.iloc[i])
     cur_cb   = float(ia.cloud_bottom.iloc[i])
+
+    # ADX scalars
+    cur_adx  = float(ia.adx_s.iloc[i])    if not np.isnan(float(ia.adx_s.iloc[i]))    else 0.0
+    prev_adx = float(ia.adx_s.iloc[i-1])  if i >= 1 and not np.isnan(float(ia.adx_s.iloc[i-1]))  else cur_adx
+    prev_adx2= float(ia.adx_s.iloc[i-2])  if i >= 2 and not np.isnan(float(ia.adx_s.iloc[i-2]))  else prev_adx
+
+    # Squeeze duration (consecutive bars squeeze has been ON before current bar)
+    squeeze_duration = int(ia.squeeze_duration_s.iloc[i])
 
     # Guard NaNs on essential values
     if any(np.isnan(x) for x in [cur_c, cur_e20, cur_e200, cur_cci]):
@@ -692,30 +720,34 @@ def compute_bar(
         score += params.t1_squeeze_pts if squeeze_release else \
                  (params.t1_no_squeeze_pts if not squeeze_on else 0)
 
-    # ── TIER 1 PRIME GATE ─────────────────────────────────────────
-    # Optional Nifty regime gate: when enabled, Nifty must be in bull
-    # regime (price > EMA200 AND EMA50 > EMA200) for Tier 1 to fire.
-    nifty_allows = (
-        not params.nifty_regime_filter or
-        params.nifty_regime_val == "bull"
-    )
+    # ── ELITE GATE  (structure-first — score ranks picks, not gates entry) ──
+    # highest_10d: 10-bar high of close (breakout confirmation).
+    # Uses close highs (same as existing t3 logic) over the prior 10 bars.
+    highest_10d = float(ia.c.iloc[max(0, i - 10):i].max()) if i >= 1 else cur_c
 
-    is_tier1_prime = (
-        trend_up              and
-        in_golden_relaxed     and
-        recent_cci_recovery   and
-        persistent_strength   and
-        trend_structure       and
-        nifty_allows          and
-        # CCI band: CCI must be in bearish/recovering territory at entry.
-        # Threshold of 0 (rather than -50) preserves most valid setups while
-        # still blocking entries where CCI is already overbought at trigger.
-        # t1_cci_band_max defaults to 0; set to -50 in Settings for a tighter filter.
-        cur_cci <= params.t1_cci_band_max and
-        # BB expanding gate — optional; when disabled (t1_bb_expanding=False) passes all bars.
-        (bb_expanding if params.t1_bb_expanding else True)
+    # All 8 structural conditions must pass simultaneously.
+    is_elite = (
+        # TREND STRUCTURE
+        cur_c > cur_e200 and
+        cur_e20 > cur_e50 > cur_e200 and
+        # ADX TREND EXPANSION  (20–35 keeps out weak moves AND exhausted ones)
+        20.0 <= cur_adx <= 35.0 and
+        cur_adx > prev_adx > prev_adx2 and
+        # CONTROLLED MOMENTUM  (CCI not yet overbought)
+        40.0 <= cur_cci <= 120.0 and
+        # SQUEEZE RELEASE  (compression lasted ≥5 bars, just fired)
+        squeeze_duration >= 5 and
+        squeeze_release and
+        # BREAKOUT CONFIRMATION  (close above 10-day high)
+        cur_c > highest_10d and
+        # HEALTHY EXTENSION  (not too far above EMA20)
+        abs(cur_c - cur_e20) / cur_e20 < 0.06 and
+        # VOLUME PARTICIPATION
+        cur_v > 1.5 * cur_vavg and
+        # RELATIVE STRENGTH vs Nifty (20-bar)
+        rs20 > 0.0
     )
-    score += 20 if is_tier1_prime else 0
+    score += 20 if is_elite else 0
 
     # ── TIER 2 MOMENTUM GATE ──────────────────────────────────────
     is_tier2_momentum = (
@@ -788,14 +820,16 @@ def compute_bar(
                        params.score_base_threshold
 
     # ── BUY TYPE CLASSIFICATION ───────────────────────────────────
-    is_fib_buy_base = trend_up and in_golden     and norm_score >= score_threshold and cur_cci < 100
-    is_fib_buy_cci  = trend_up and in_golden_cci and norm_score >= 55 and cci_cross_up_os
-    is_abcd_buy     = trend_up and abcd_bull and norm_score >= 35
-    is_harm_buy     = trend_up and harm_bull  and norm_score >= 35
-    is_norm_buy     = trend_up and norm_score >= 65 and not in_golden and not cci_extended and cur_cci < 50
-    is_cci_buy      = trend_up and cci_cross_up_os and norm_score >= 55 and cur_cci < 100
+    # Structure-first: score does NOT gate entry into Tier 2.
+    # Score only ranks picks within the tier (via action label + sort order).
+    is_fib_buy_base = trend_up and in_golden     and cur_cci < 100
+    is_fib_buy_cci  = trend_up and in_golden_cci and cci_cross_up_os
+    is_abcd_buy     = trend_up and abcd_bull
+    is_harm_buy     = trend_up and harm_bull
+    is_norm_buy     = trend_up and not in_golden and not cci_extended and cur_cci < 50
+    is_cci_buy      = trend_up and cci_cross_up_os and cur_cci < 100
 
-    allow_cloud_buy = above_cloud or (inside_cloud and norm_score >= 65)
+    allow_cloud_buy = above_cloud or inside_cloud   # cloud position alone -- no score gate
     any_buy = (
         is_fib_buy_base or is_fib_buy_cci or is_abcd_buy or
         is_harm_buy or is_norm_buy or is_cci_buy
@@ -803,7 +837,7 @@ def compute_bar(
 
     # ── TIER CLASSIFICATION ───────────────────────────────────────
     tier = (
-        "Tier 1" if is_tier1_prime    else
+        "Elite"  if is_elite          else
         "Tier 2" if any_buy           else
         "Tier 3" if is_tier3_momentum else
         "Tier 4" if is_tier4_recovery else
@@ -839,7 +873,13 @@ def compute_bar(
     t3_lv  = float(round(en + rk * 3))
 
     # ── LABELS ────────────────────────────────────────────────────
-    action    = "✅ BUY" if norm_score >= score_threshold else ("👁 WATCH" if norm_score >= 50 else "⛔ SKIP")
+    # Action label is score-only (tier gate decides entry; score ranks within tier)
+    action = (
+        "🔥 STRONG BUY" if norm_score >= 90 else
+        "✅ BUY"         if norm_score >= 80 else
+        "👁 WATCH"       if norm_score >= 65 else
+        "⛔ SKIP"
+    )
     qual_icon = "⭐" if (qualified and any_buy) else ("✔" if qualified else "✖")
 
     buy_type = (
@@ -851,23 +891,12 @@ def compute_bar(
         "Norm"    if is_norm_buy       else "-"
     )
 
-    # ── TIER 1 ENTRY QUALITY GATE ─────────────────────────────────────────
-    # buy_type ≠ "-", risk_pct ≥ 5%, norm_score ≥ 90 (highest win-rate bucket)
+    # ── ELITE ENTRY QUALITY GATE ──────────────────────────────────────────
+    # Elite gate is pure structure — score does not gate entry.
+    # The quality check only enforces minimum risk geometry (SL must be real).
     risk_pct = (en - sl) / en if en > 0 else 0.0
-    tier1_entry_quality = (
-        buy_type   != "-"  and
-        risk_pct   >= 0.05 and
-        norm_score >= 90
-    )
-    is_tier1_prime = is_tier1_prime and tier1_entry_quality
-
-    # ── HIGH-SCORE CCI GATE ───────────────────────────────────────
-    high_score_cci_ok = (
-        norm_score < params.high_score_cci_threshold or       # gate only applies to high scores
-        cur_cci    <= params.high_score_cci_max       or       # CCI still deep enough
-        params.high_score_cci_threshold > 100                  # effectively disabled
-    )
-    is_tier1_prime = is_tier1_prime and high_score_cci_ok
+    tier1_entry_quality = risk_pct >= 0.01   # sanity: SL must be at least 1% away
+    is_elite = is_elite and tier1_entry_quality
 
     acc_tier = (
         "A"   if (qualified and any_buy)     else
@@ -875,21 +904,21 @@ def compute_bar(
         "C"   if norm_score >= 50            else
         "D"
     )
-    acc_score = norm_score + (20 if is_tier1_prime else 0) + (10 if qualified else 0)
+    acc_score = norm_score + (20 if is_elite else 0) + (10 if qualified else 0)
     hard_stop = trend_down and below_cloud and norm_score < 30
     pct_chg   = round((cur_c - prev_close) / prev_close * 100, 2) if prev_close else 0.0
 
-    # Hi Prob: in golden zone with a real buy signal — ensures count matches
-    # what appears in Tier 1/2 (not inflated by Tier 3 WATCH-level stocks).
-    high_prob_buy = trend_up and in_golden and norm_score >= 55 and any_buy
+    # Hi Prob: in golden zone with a structural buy signal (Elite or Tier 2 Fib).
+    # Score >= 65 used here only as a quality floor for the dashboard count metric.
+    high_prob_buy = trend_up and in_golden and any_buy and norm_score >= 65
 
     # ── TIER 2 SUB-CONDITIONS ─────────────────────────────────────
-    t2_fib_qual   = is_fib_buy_base and qualified   and not is_tier1_prime
-    t2_fib_cci    = is_fib_buy_cci                  and not is_tier1_prime
+    t2_fib_qual   = is_fib_buy_base and qualified   and not is_elite
+    t2_fib_cci    = is_fib_buy_cci                  and not is_elite
     t2_harmonic   = is_harm_buy
     t2_abcd       = is_abcd_buy
     t2_cci_break  = is_cci_buy and not in_golden
-    t2_norm_strong= is_norm_buy and norm_score >= 75
+    t2_norm_strong= is_norm_buy and norm_score >= 80   # score >= 80 = high-quality Norm
     t2_norm       = is_norm_buy
 
     # ── TIER 3 WATCH SUB-CONDITIONS ──────────────────────────────
@@ -907,8 +936,8 @@ def compute_bar(
     vol_surge_watch= (cur_v > cur_vavg * 2.0 and trend_up and norm_score < 65)
 
     # ── SETUP LABEL ───────────────────────────────────────────────
-    if is_tier1_prime:
-        setup = "All 5 Pillars"
+    if is_elite:
+        setup = "Elite Structure"
     elif any_buy:
         setup = (
             "Fib+Qual"    if t2_fib_qual    else
@@ -946,7 +975,7 @@ def compute_bar(
         )
 
     return BarResult(
-        tier1_prime      = is_tier1_prime,
+        tier1_prime      = is_elite,
         tier2_momentum   = is_tier2_momentum,
         any_buy          = any_buy,
         tier3_momentum   = is_tier3_momentum,
