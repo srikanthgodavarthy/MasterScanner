@@ -160,7 +160,7 @@ def _stop_cell(reason):
 
 # Setup badge colours — keyed by setup label
 _SETUP_COLORS = {
-    # Tier 1
+    # Elite
     "All 5 Pillars": ("#4c1d95", "#c4b5fd"),
     # Tier 2
     "Fib+Qual":      ("#1e3a5f", "#93c5fd"),
@@ -283,9 +283,9 @@ def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int,
 # ══════════════════════════════════════════════════════════════════
 
 _TIER_META = {
-    "Tier 1": {
+    "Elite": {
         "dot":   "#22c55e",
-        "label": "Tier 1 — All 5 Pillars Aligned",
+        "label": "Elite — Structural Breakout",
         "desc":  "trend_up · in_golden_relaxed · CCI cross-up · trend_structure · Nifty gate",
         "setups": ["All 5 Pillars v2"],
     },
@@ -315,12 +315,12 @@ _TIER_META = {
 # ══════════════════════════════════════════════════════════════════
 
 _TIER_GATES = {
-    "Tier 1": {
+    "Elite": {
         "color":  "#4ade80",
         "bg":     "#052e16",
         "border": "#166534",
         "emoji":  "🏆",
-        "title":  "Tier 1 — All 5 Pillars Aligned",
+        "title":  "Elite — Structural Breakout",
         "gates": [
             ("trend_up",          "close > EMA200  AND  EMA20 > EMA50"),
             ("in_golden_relaxed", "Price within Fibonacci 38.2–61.8% retracement zone"),
@@ -471,7 +471,7 @@ def _summary_bar(df: pd.DataFrame) -> str:
         cci_ext  = int((df["CCI Sig"] == "EXT").sum())
 
     pills = [
-        ("#166534", "#4ade80", f"Tier 1 · {t1}"),
+        ("#166534", "#4ade80", f"Elite · {t1}"),
         ("#1e3a5f", "#60a5fa", f"Tier 2 · {t2}"),
         ("#1c0f00", "#fbbf24", f"Tier 3 · {t3}"),
         ("#120a2e", "#c4b5fd", f"Tier 4 · {t4}"),
@@ -511,7 +511,7 @@ def _render_metrics(df: pd.DataFrame):
 
     cols = st.columns(9)
     for col, (lbl, val) in zip(cols, [
-        ("🏆 Tier 1",  t1),
+        ("🏆 Elite",  t1),
         ("🥈 Any Buy", ab),
         ("🎯 Hi Prob", hp),
         ("📡 CCI ↑",   cb),
@@ -649,7 +649,7 @@ def render(settings: dict) -> None:
         # Tier selector — shown inline next to scan button
         tier_filter = st.selectbox(
             "tier",
-            ["All", "🏆 Tier 1", "📈 Tier 2", "📊 Tier 3", "🔄 Tier 4", "⭐ Watchlist"],
+            ["All", "🏆 Elite", "📈 Tier 2", "📊 Tier 3", "🔄 Tier 4", "⭐ Watchlist"],
             label_visibility="collapsed",
             key="scanner_tier_filter",
         )
@@ -746,11 +746,11 @@ def render(settings: dict) -> None:
     t1_n, t2_n, t3_n, t4_n = len(df_t1), len(df_t2), len(df_t3), len(df_t4)
     _tf = st.session_state.get("scanner_tier_filter", "All")
     badge_parts = []
-    if _tf in ("All", "🏆 Tier 1"):
+    if _tf in ("All", "🏆 Elite"):
         badge_parts.append(
             f'<span style="background:#166534;color:#4ade80;padding:3px 10px;'
             f'border-radius:12px;font-size:11px;font-weight:600;margin-right:4px">'
-            f'🏆 Tier 1 · {t1_n}</span>'
+            f'🏆 Elite · {t1_n}</span>'
         )
     if _tf in ("All", "📈 Tier 2"):
         badge_parts.append(
@@ -777,8 +777,8 @@ def render(settings: dict) -> None:
         )
 
     # Render selected tier(s)
-    if _tf in ("All", "🏆 Tier 1"):
-        _tier_expander("Tier 1", df_t1, cci_ob, cci_os, wl_syms_set, expanded=True)
+    if _tf in ("All", "🏆 Elite"):
+        _tier_expander("Elite", df_t1, cci_ob, cci_os, wl_syms_set, expanded=True)
     if _tf in ("All", "📈 Tier 2"):
         _tier_expander("Tier 2", df_t2, cci_ob, cci_os, wl_syms_set, expanded=(_tf == "📈 Tier 2"))
     if _tf in ("All", "📊 Tier 3"):

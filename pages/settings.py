@@ -31,7 +31,7 @@ DEFAULTS = {
     "score_base_threshold": 70,
     "auto_refresh":     False,
     "refresh_mins":     5,
-    # Tier 1
+    # Elite
     "t1_mom3":          8,
     "t1_mom6":          12,
     "t1_fib_hi":        38.2,
@@ -184,31 +184,22 @@ def _chip(label: str, color: str = "#60a5fa") -> str:
 
 
 def _preview_tier1(ss: dict) -> str:
-    mom3  = ss.get("t1_mom3",  8)
-    mom6  = ss.get("t1_mom6",  12)
-    fib_l = ss.get("t1_fib_lo", 61.8)
-    fib_h = ss.get("t1_fib_hi", 38.2)
-    cci_w = ss.get("t1_cci_window", 5)
-    cloud = ss.get("t1_cloud", True)
-    sqz   = ss.get("t1_squeeze_boost", True)
-    sqz_r = ss.get("t1_squeeze_pts", 15)
-    sqz_n = ss.get("t1_no_squeeze_pts", 5)
-
     lines = [
-        f'<b>Tier 1 — Prime Gate</b>',
-        f'  trend_up           = price > EMA200 <span class="ok">AND</span> EMA20 > EMA50',
-        f'  ema_alignment      = EMA20 > EMA50 <span class="ok">AND</span> EMA50 rising',
-        f'  in_golden_relaxed  = fib {fib_l:.1f}% … {fib_h:.1f}% ± ATR',
-        f'  recent_cci_rec     = CCI crossed above -100 in last <b>{cci_w}</b> bars',
-        f'  persistent_str     = mom3 > <b>{mom3}%</b> <span class="ok">AND</span> mom6 > <b>{mom6}%</b>',
-        f'  trend_structure    = ema_alignment <span class="ok">AND</span> '
-            + ('<span class="ok">allow_cloud</span>' if cloud else '<span class="warn">cloud ignored</span>'),
-        '',
-        f'  Score boost   +20 (gate satisfied)',
-        f'  Squeeze boost +<b>{sqz_r}</b> on release / +<b>{sqz_n}</b> neutral'
-            + ('' if sqz else ' <span class="warn">[disabled]</span>'),
+        f'<b>Elite — Structural Gate (all 8 conditions must pass)</b>',
+        f'  1. trend_structure  = price > EMA200 <span class="ok">AND</span> EMA20 > EMA50 > EMA200',
+        f'  2. adx_expansion    = 20 ≤ ADX ≤ 35 <span class="ok">AND</span> ADX rising 2 bars',
+        f'  3. cci_controlled   = 40 ≤ CCI ≤ 120 (momentum, not overbought)',
+        f'  4. squeeze_release  = squeeze ≥ 5 bars <span class="ok">AND</span> just fired',
+        f'  5. breakout_confirm = close > 10-day high',
+        f'  6. healthy_ext      = |close − EMA20| / EMA20 &lt; 6%',
+        f'  7. volume_part      = volume > 1.5× avg_volume',
+        f'  8. rs_positive      = RS20 > 0 (outperforming Nifty)',
+        f'',
+        f'  Score ranks picks within Elite — <b>does not gate entry</b>',
+        f'  Score bonus +20 when Elite fires',
     ]
     return '<br>'.join(lines)
+
 
 
 def _preview_tier2(ss: dict) -> str:
@@ -404,27 +395,6 @@ def _section_common():
 
     st.divider()
 
-    # Nifty Regime Gate
-    st.markdown("**Nifty Regime Gate** *(optional Tier 1 extra gate)*")
-    st.caption(
-        "When ON, Tier 1 Prime additionally requires Nifty to be in a bull regime "
-        "(Nifty price > EMA200 AND EMA50 > EMA200). "
-        "In a bear/neutral market this keeps Tier 1 empty — by design."
-    )
-    nifty_regime_filter = st.toggle(
-        "Require bull Nifty regime for Tier 1",
-        value=ss.get("nifty_regime_filter", False),
-        key="tog_nifty_regime",
-    )
-    ss["nifty_regime_filter"] = bool(nifty_regime_filter)
-    if nifty_regime_filter:
-        st.info(
-            "ℹ️ Tier 1 will only fire when Nifty is in a confirmed bull regime. "
-            "In sideways or bear markets Tier 1 count will be 0 — that is expected behaviour."
-        )
-
-    st.divider()
-
     # Cache
     st.markdown("**Cache**")
     if st.button("🗑️ Clear Data Cache", key="btn_clear_cache"):
@@ -445,132 +415,49 @@ def _section_tier1():
     st.markdown(
         '<div class="cfg-card-title">'
         '<span class="dot" style="background:#22c55e"></span>'
-        'Tier 1 — Prime Gate Thresholds</div>',
+        'Elite — Structural Gate Conditions</div>',
         unsafe_allow_html=True,
     )
 
-    # persistent_strength
-    st.markdown("**`persistent_strength` — Momentum thresholds**")
-    st.caption("mom3 = 3-month price return  ·  mom6 = 6-month price return")
-    ps1, ps2 = st.columns(2)
-    with ps1:
-        mom3 = st.slider(
-            "mom3 > ( % )", min_value=0, max_value=25,
-            value=ss.get("t1_mom3", 8), step=1, key="sl_mom3",
-            help="Lower = more signals; higher = stricter",
+    st.info(
+        "**Elite is a structure-first tier.** All 8 conditions are hardcoded — "
+        "score does not gate entry, it only ranks picks within the Elite set."
+    )
+
+    st.markdown("""
+| # | Condition | Value |
+|---|-----------|-------|
+| 1 | Trend structure | `price > EMA200` and `EMA20 > EMA50 > EMA200` |
+| 2 | ADX expansion | `20 ≤ ADX(14) ≤ 35` and rising for 2 bars |
+| 3 | Controlled momentum | `40 ≤ CCI(20) ≤ 120` |
+| 4 | Squeeze release | BB/KC squeeze ≥ 5 bars, just fired |
+| 5 | Breakout confirmation | `close > 10-day high` |
+| 6 | Healthy extension | `|close − EMA20| / EMA20 < 6%` |
+| 7 | Volume participation | `volume > 1.5× avg_volume(20)` |
+| 8 | Relative strength | `RS20 > 0` (outperforming Nifty over 20 bars) |
+""")
+
+    st.divider()
+
+    st.markdown("**Nifty Regime Gate** *(optional Elite extra gate)*")
+    st.caption(
+        "When ON, Elite additionally requires Nifty to be in a bull regime "
+        "(price > EMA200 AND EMA50 > EMA200). "
+        "In a bear/neutral market this keeps Elite empty — by design."
+    )
+    regime_on = st.toggle(
+        "Require bull Nifty regime for Elite",
+        value=ss.get("nifty_regime_filter", False),
+        key="tog_nifty_regime",
+    )
+    ss["nifty_regime_filter"] = bool(regime_on)
+    if regime_on:
+        st.caption(
+            "ℹ️ Elite will only fire when Nifty is in a confirmed bull regime. "
+            "In sideways or bear markets Elite count will be 0 — that is expected behaviour."
         )
-    with ps2:
-        mom6 = st.slider(
-            "mom6 > ( % )", min_value=0, max_value=40,
-            value=ss.get("t1_mom6", 12), step=1, key="sl_mom6",
-        )
-    ss["t1_mom3"] = int(mom3)
-    ss["t1_mom6"] = int(mom6)
-
-    if mom3 == 0 or mom6 == 0:
-        st.warning("⚠️ Setting either threshold to 0 effectively disables momentum gating.")
-    elif mom3 > 15 or mom6 > 25:
-        st.info("ℹ️ High thresholds — Tier 1 hit rate will be very low.")
 
     st.divider()
-
-    # Fibonacci zone
-    st.markdown("**`in_golden_relaxed` — Fibonacci retracement zone**")
-    st.caption("Price must be between fib_HI% and fib_LO% of the swing range")
-    fb1, fb2 = st.columns(2)
-    with fb1:
-        fib_hi = st.select_slider(
-            "Upper bound (shallower pullback)",
-            options=[23.6, 38.2, 50.0],
-            value=ss.get("t1_fib_hi", 38.2),
-            key="sl_fib_hi",
-            format_func=lambda x: f"{x:.1f}%",
-        )
-    with fb2:
-        fib_lo = st.select_slider(
-            "Lower bound (deeper pullback)",
-            options=[50.0, 61.8, 78.6],
-            value=ss.get("t1_fib_lo", 61.8),
-            key="sl_fib_lo",
-            format_func=lambda x: f"{x:.1f}%",
-        )
-    ss["t1_fib_hi"] = float(fib_hi)
-    ss["t1_fib_lo"] = float(fib_lo)
-
-    if fib_hi >= fib_lo:
-        st.error("❌ Upper bound must be less than lower bound (e.g. 38.2% < 61.8%).")
-
-    st.divider()
-
-    # CCI recovery window
-    st.markdown("**`recent_cci_recovery` — Lookback window**")
-    cci_w = st.slider(
-        "Bars to look back for CCI oversold cross",
-        min_value=1, max_value=10,
-        value=ss.get("t1_cci_window", 5), step=1, key="sl_cci_window",
-        help="1 = strict (must cross today)  ·  10 = very relaxed",
-    )
-    ss["t1_cci_window"] = int(cci_w)
-
-    st.divider()
-
-    # trend_structure — cloud gate
-    st.markdown("**`trend_structure` — Cloud gate**")
-    cloud = st.toggle(
-        "Require above/inside Ichimoku cloud (allow_cloud)",
-        value=ss.get("t1_cloud", True), key="tog_cloud",
-        help="OFF = only EMA alignment required; cloud position ignored",
-    )
-    ss["t1_cloud"] = bool(cloud)
-    if not cloud:
-        st.warning("⚠️ Cloud gate disabled — Tier 1 may fire on stocks below the cloud.")
-
-    st.divider()
-
-    # Squeeze score boost
-    st.markdown("**Squeeze Score Boost** *(optional — not a hard gate)*")
-    sqz_en = st.toggle(
-        "Enable squeeze boost",
-        value=ss.get("t1_squeeze_boost", True), key="tog_squeeze",
-    )
-    ss["t1_squeeze_boost"] = bool(sqz_en)
-
-    if sqz_en:
-        sq1, sq2 = st.columns(2)
-        with sq1:
-            sqz_r = st.slider(
-                "Points on squeeze release", min_value=0, max_value=30,
-                value=ss.get("t1_squeeze_pts", 15), step=5, key="sl_sqz_r",
-                help="BB just exited KC — highest conviction boost",
-            )
-        with sq2:
-            sqz_n = st.slider(
-                "Points when NOT in squeeze", min_value=0, max_value=15,
-                value=ss.get("t1_no_squeeze_pts", 5), step=5, key="sl_sqz_n",
-                help="Neutral: not compressed, no extra signal",
-            )
-        ss["t1_squeeze_pts"]    = int(sqz_r)
-        ss["t1_no_squeeze_pts"] = int(sqz_n)
-    else:
-        ss["t1_squeeze_pts"]    = 0
-        ss["t1_no_squeeze_pts"] = 0
-
-    st.divider()
-
-    # Score weight
-    st.markdown("**Score weight — persistent_strength contribution**")
-    ps_weight = st.slider(
-        "Points added when persistent_strength = True",
-        min_value=5, max_value=30,
-        value=ss.get("t1_ps_weight", 20), step=5, key="sl_ps_weight",
-    )
-    ps_penalty = st.slider(
-        "Points deducted when persistent_strength = False",
-        min_value=-20, max_value=0,
-        value=ss.get("t1_ps_penalty", -10), step=5, key="sl_ps_penalty",
-    )
-    ss["t1_ps_weight"]  = int(ps_weight)
-    ss["t1_ps_penalty"] = int(ps_penalty)
 
     # Preview
     st.markdown(
@@ -944,7 +831,7 @@ def render() -> dict:
     # ── Section tabs ─────────────────────────────────────────────
     section = st.radio(
         "section",
-        ["⚙️ Common", "🏆 Tier 1", "📈 Tier 2", "📊 Tier 3", "🔄 Tier 4", "⭐ Watchlist", "🗄️ System"],
+        ["⚙️ Common", "🏆 Elite", "📈 Tier 2", "📊 Tier 3", "🔄 Tier 4", "⭐ Watchlist", "🗄️ System"],
         label_visibility="collapsed",
         key="settings_section",
     )
@@ -953,7 +840,7 @@ def render() -> dict:
 
     if section == "⚙️ Common":
         _section_common()
-    elif section == "🏆 Tier 1":
+    elif section == "🏆 Elite":
         _section_tier1()
     elif section == "📈 Tier 2":
         _section_tier2()
@@ -981,7 +868,7 @@ def render() -> dict:
         "score_base_threshold": ss.get("score_base_threshold", 70),
         "auto_refresh":         ss.get("auto_refresh",      False),
         "refresh_mins":         ss.get("refresh_mins",      5),
-        # Tier 1 tuning
+        # Elite tuning
         "t1_mom3":              ss.get("t1_mom3",           8),
         "t1_mom6":              ss.get("t1_mom6",           12),
         "t1_fib_hi":            ss.get("t1_fib_hi",         38.2),
