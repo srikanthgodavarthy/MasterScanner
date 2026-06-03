@@ -77,7 +77,7 @@ def render(settings=None):
     with col_info:
         _tier_lbl = {
             "Both Tiers":    "Both Tiers",
-            "🏆 Tier 1 Only": "<b style='color:#a78bfa'>Tier 1 Prime only</b>",
+            "🏆 Tier 1 Only": "<b style='color:#a78bfa'>Tier 1 only</b>",
             "📈 Tier 2 Only": "<b style='color:#60a5fa'>Tier 2 only</b>",
         }[bt_tier_mode]
         st.markdown(
@@ -112,7 +112,7 @@ def render(settings=None):
             cci_len=int(bt_cci_len), cci_ob=int(bt_cci_ob), cci_os=int(bt_cci_os),
             min_score=bt_min_score, hold_days=bt_hold_days,
             workers=settings["workers"],
-            tier1_only=bt_tier1_only,   # ← Tier 1 Prime gate
+            tier1_only=bt_tier1_only,   # ← Tier 1 gate
             progress_cb=_bt_progress,
         )
         prog.empty()
@@ -121,9 +121,9 @@ def render(settings=None):
         if trades_df.empty:
             if bt_tier1_only:
                 st.warning(
-                    "No Tier 1 Prime signals found. "
+                    "No Tier 1 signals found. "
                     "Try expanding the symbol universe (Nifty 200+) or "
-                    "lowering Min Score. Tier 1 Prime fires very rarely by design."
+                    "lowering Min Score. Tier 1 fires very rarely by design."
                 )
             else:
                 st.warning("No trades generated. Try lowering Min Score or adding more symbols.")
@@ -164,7 +164,7 @@ def render(settings=None):
     st.markdown("#### 📊 Performance Summary")
     s = stats
 
-    # ── Tier 1 Prime badge (shown when mixed-mode run contains T1 trades) ─────
+    # ── Tier 1 badge (shown when mixed-mode run contains T1 trades) ─────
     t1_count = s.get("t1_prime_trades", 0)
     if t1_count > 0 and not bt_tier1_only:
         t1_pct = round(t1_count / s.get("total_trades", 1) * 100, 1)
@@ -172,7 +172,7 @@ def render(settings=None):
             f"<div style='display:inline-block;background:#4c1d95;color:#c4b5fd;"
             f"border-radius:6px;padding:0.3rem 0.8rem;font-size:0.78rem;"
             f"margin-bottom:0.6rem;'>"
-            f"🏆 Tier 1 Prime within results: <b>{t1_count}</b> trades "
+            f"🏆 Tier 1 within results: <b>{t1_count}</b> trades "
             f"({t1_pct}% of total)"
             f"</div>",
             unsafe_allow_html=True,
@@ -203,17 +203,17 @@ def render(settings=None):
     with r3: st.metric("Worst Trade", f"{s.get('worst_trade',0)}%")
     with r4: st.metric("Total PnL",   f"{s.get('total_pnl',0)}%")
 
-    # ── Tier 1 Prime isolated stats (only when mixed mode) ────────────────────
+    # ── Tier 1 isolated stats (only when mixed mode) ────────────────────────
     if (t1_count > 0 and not bt_tier1_only and
             "tier1_prime" in trades_df.columns):
-        with st.expander("🏆 Tier 1 Prime — Isolated Performance", expanded=False):
+        with st.expander("🏆 Tier 1 — Isolated Performance", expanded=False):
             t1_df   = trades_df[trades_df["tier1_prime"] == True]
             t1_rest = trades_df[trades_df["tier1_prime"] == False]
             t1_stats = compute_stats(t1_df)
             r_stats  = compute_stats(t1_rest)
             cA, cB = st.columns(2)
             with cA:
-                st.markdown("**Tier 1 Prime trades**")
+                st.markdown("**Tier 1 trades**")
                 st.metric("Win Rate",      f"{t1_stats.get('win_rate',0)}%")
                 st.metric("Expectancy",    f"{t1_stats.get('expectancy',0)}%")
                 st.metric("Profit Factor", t1_stats.get("profit_factor", 0))
@@ -279,10 +279,10 @@ def render(settings=None):
     )
     st.plotly_chart(fig3, use_container_width=True)
 
-    # ── Tier 1 Prime cumulative PnL overlay (mixed mode) ─────────────────────
+    # ── Tier 1 cumulative PnL overlay (mixed mode) ──────────────────────────
     if (t1_count > 0 and not bt_tier1_only and
             "tier1_prime" in trades_df.columns):
-        st.markdown("##### 🏆 Tier 1 Prime vs Rest — Cumulative PnL")
+        st.markdown("##### 🏆 Tier 1 vs Rest — Cumulative PnL")
         t1_cum   = (trades_df[trades_df["tier1_prime"] == True]
                     .sort_values("entry_date")["pnl_pct"].cumsum())
         rest_cum = (trades_df[trades_df["tier1_prime"] == False]
@@ -290,7 +290,7 @@ def render(settings=None):
         fig4 = go.Figure()
         fig4.add_trace(go.Scatter(
             x=list(range(len(t1_cum))), y=t1_cum.values,
-            mode="lines", name="Tier 1 Prime",
+            mode="lines", name="Tier 1",
             line=dict(color="#a78bfa", width=2),
         ))
         fig4.add_trace(go.Scatter(
