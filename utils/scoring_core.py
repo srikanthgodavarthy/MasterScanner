@@ -730,24 +730,35 @@ def compute_bar(
         # TREND STRUCTURE
         cur_c > cur_e200 and
         cur_e20 > cur_e50 > cur_e200 and
-        # ADX TREND EXPANSION  (20–35 keeps out weak moves AND exhausted ones)
-        20.0 <= cur_adx <= 35.0 and
-        cur_adx > prev_adx > prev_adx2 and
-        # CONTROLLED MOMENTUM  (CCI not yet overbought)
-        40.0 <= cur_cci <= 120.0 and
-        # SQUEEZE RELEASE  (compression lasted ≥5 bars, just fired)
-        squeeze_duration >= 5 and
+        # ADX TREND EXPANSION  — primary: ADX > 20; fallback: ATR contracted OR ADX rising from lows
+        cur_adx > 20.0 and
+        (atr_contract or cur_adx > prev_adx) and
+        # CONTROLLED MOMENTUM  (CCI in healthy momentum zone: -20 to +30)
+        -20.0 <= cur_cci <= 30.0 and
+        # SQUEEZE RELEASE  (compression lasted ≥3 bars, just fired)
+        squeeze_duration >= 3 and
         squeeze_release and
         # BREAKOUT CONFIRMATION  (close above 10-day high)
         cur_c > highest_10d and
-        # HEALTHY EXTENSION  (not too far above EMA20)
-        abs(cur_c - cur_e20) / cur_e20 < 0.06 and
+        # HEALTHY EXTENSION  — < 4% ideal, 4–7% acceptable (≥ 8% fails gate)
+        abs(cur_c - cur_e20) / cur_e20 < 0.08 and
         # VOLUME PARTICIPATION
         cur_v > 1.5 * cur_vavg and
         # RELATIVE STRENGTH vs Nifty (20-bar)
         rs20 > 0.0
     )
     score += 20 if is_elite else 0
+
+    # ── EXTENSION QUALITY BONUS / PENALTY (applies when Elite is True) ──
+    # < 4%  = ideal   → +5 bonus
+    # 4–7%  = acceptable → no change
+    # ≥ 8%  = penalty → –10  (gate already blocks ≥ 8% via is_elite)
+    if is_elite:
+        ext_pct = abs(cur_c - cur_e20) / cur_e20
+        if ext_pct < 0.04:
+            score += 5    # ideal tight entry
+        elif ext_pct >= 0.07:
+            score -= 5    # borderline — slight discount (gate already stops ≥ 0.08)
 
     # ── TIER 2 MOMENTUM GATE ──────────────────────────────────────
     is_tier2_momentum = (
