@@ -218,7 +218,7 @@ NIFTY500_SYMBOLS = [
 #  DATA FETCHING
 # ══════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
     try:
         df = yf.Ticker(f"{symbol}.NS").history(period=period, interval=interval, auto_adjust=True)
@@ -230,7 +230,7 @@ def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.Dat
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") -> dict:
     if not symbols:
         return {}
@@ -255,7 +255,7 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") 
             continue
     return result
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_nifty(period: str = "1y") -> pd.Series:
     try:
         df    = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
@@ -326,6 +326,20 @@ def score_stock(
             cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
             pvt_lb=pvt_lb, atr_prox=atr_prox,
         )
+
+    # Fast pre-check: skip full indicator build for stocks in clear downtrend.
+    # Computes only 3 EMAs (~1ms) before the full build_indicators (~15ms).
+    # Tier 3 & 4 can fire without trend_up, so only skip if ALL tier gates fail.
+    c_s   = df["close"]
+    _e20  = c_s.ewm(span=20,  adjust=False).mean()
+    _e50  = c_s.ewm(span=50,  adjust=False).mean()
+    _e200 = c_s.ewm(span=200, adjust=False).mean()
+    _c    = float(c_s.iloc[-1])
+    _trend_up   = _c > float(_e200.iloc[-1]) and float(_e20.iloc[-1]) > float(_e50.iloc[-1])
+    _trend_ok   = _c > float(_e200.iloc[-1])   # Tier 3 only needs close > EMA200
+    _above_e20  = _c > float(_e20.iloc[-1])    # Tier 4 needs close > EMA20
+    if not _trend_up and not _trend_ok and not _above_e20:
+        return {}
 
     ia = build_indicators(df, nifty, params)
     r  = compute_bar(ia, i=-1, params=params)   # -1 = latest bar
@@ -455,14 +469,104 @@ def run_scanner(
     results = []
     done    = 0
 
+    # Build ScoringParams once — reused across all 500 stocks
+    from utils.scoring_core import ScoringParams, build_indicators, compute_bar
+    shared_params = ScoringParams.from_settings(effective_settings)
+
     def process(sym):
         df = all_data.get(sym, pd.DataFrame())
-        if df.empty:
+        if df.empty or len(df) < 210:
             return None
-        row = score_stock(df, nifty_series, settings=effective_settings,
-                          cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os)
-        if row:
-            row["Stock"] = sym
+
+        # Fast EMA pre-check — skip full build for clear downtrends
+        c_s  = df["close"]
+        e20  = c_s.ewm(span=20,  adjust=False).mean()
+        e50  = c_s.ewm(span=50,  adjust=False).mean()
+        e200 = c_s.ewm(span=200, adjust=False).mean()
+        _c   = float(c_s.iloc[-1])
+        if _c <= float(e200.iloc[-1]) and _c <= float(e20.iloc[-1]):
+            return None
+
+        ia = build_indicators(df, nifty_series, shared_params)
+        r  = compute_bar(ia, i=-1, params=shared_params)
+        if r is None:
+            return None
+
+        row = {
+            "Stock":        sym,
+            "Tier":         r.tier,
+            "AccTier":      r.acc_tier,
+            "AccScore":     r.acc_score,
+            "Score":        r.norm_score,
+            "Action":       r.action,
+            "Setup":        r.setup,
+            "Buy Type":     r.buy_type,
+            "CCI":          round(r.cur_cci),
+            "CCI State":    r.cci_state,
+            "CCI Sig":      r.cci_signal,
+            "Qual":         r.qual_icon,
+            "%Chg":         r.pct_chg,
+            "Entry":        r.entry,
+            "SL":           r.sl,
+            "T1":           r.t1,
+            "T2":           r.t2,
+            "T3":           r.t3,
+            "_qualified":           r.qualified,
+            "_persistent_strength": r.persistent_strength,
+            "_high_prob":           r.high_prob,
+            "_in_golden":           r.in_golden,
+            "_in_golden_relaxed":   r.in_golden_relaxed,
+            "_in_golden_cci":       r.in_golden_cci,
+            "_above_cloud":         r.above_cloud,
+            "_inside_cloud":        r.inside_cloud,
+            "_allow_cloud":         r.allow_cloud,
+            "_ema_alignment":       r.ema_alignment,
+            "_trend_structure":     r.trend_structure,
+            "_squeeze_on":          r.squeeze_on,
+            "_squeeze_release":     r.squeeze_release,
+            "_compression_break":   r.compression_break,
+            "_cci_momentum_break":  r.cci_momentum_break,
+            "_harm_bull":           r.harm_bull,
+            "_abcd_bull":           r.abcd_bull,
+            "_any_buy":             r.any_buy,
+            "_tier1_prime":         r.tier1_prime,
+            "_tier2_momentum":      r.tier2_momentum,
+            "_tier3_momentum":      r.tier3_momentum,
+            "_tier4_recovery":      r.tier4_recovery,
+            "_recent_cci_rec":      r.recent_cci_recovery,
+            "_hard_stop":           r.hard_stop,
+            "_t2_compression":      r.t2_compression,
+            "_t2_fib_qual":         r.t2_fib_qual,
+            "_t2_fib_cci":          r.t2_fib_cci,
+            "_t2_harmonic":         r.t2_harmonic,
+            "_t2_abcd":             r.t2_abcd,
+            "_t2_cci_break":        r.t2_cci_break,
+            "_t3_trend_ok":         r.t3_trend_ok,
+            "_t3_rs20_strong":      r.t3_rs20_strong,
+            "_t3_atr_contract":     r.t3_atr_contract,
+            "_t3_breakout_trigger": r.t3_breakout_trigger,
+            "_t3_momentum_expand":  r.t3_momentum_expand,
+            "_t3_volume_expand":    r.t3_volume_expand,
+            "_t3_squeeze_bonus":    r.t3_squeeze_bonus,
+            "_t4_close_above_e20":  r.t4_close_above_e20,
+            "_t4_e20_rising":       r.t4_e20_rising,
+            "_t4_rs20_positive":    r.t4_rs20_positive,
+            "_t4_rs20_improving":   r.t4_rs20_improving,
+            "_t4_atr_contract":     r.t4_atr_contract,
+            "_t4_tight_range":      r.t4_tight_range,
+            "_t4_cci_positive":     r.t4_cci_positive,
+            "_t4_cci_rising":       r.t4_cci_rising,
+            "_t4_volume_expand":    r.t4_volume_expand,
+            "_rsi":                 r.cur_rsi,
+            "_mom1":                r.mom1,
+            "_mom3":                r.mom3,
+            "_mom6":                r.mom6,
+            "_cci_raw":             r.cur_cci,
+            "_fib618":              r.fib618,
+            "_fib500":              r.fib500,
+            "_fib382":              r.fib382,
+            "_nifty_regime":        r.nifty_regime_val,
+        }
         return row
 
     with ThreadPoolExecutor(max_workers=max_workers) as exe:
