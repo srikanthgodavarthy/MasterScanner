@@ -313,6 +313,9 @@ class IndicatorArrays:
 
     nifty_aligned: pd.Series   # Nifty close reindexed to symbol's trading days
 
+    pivot_ph: pd.Series        # pre-computed pivot highs (full series)
+    pivot_pl: pd.Series        # pre-computed pivot lows  (full series)
+
 
 # ══════════════════════════════════════════════════════════════════
 #  SERIES BUILDER  (call once per symbol)
@@ -371,6 +374,12 @@ def build_indicators(
     _nifty.index = _strip_tz(_nifty.index)
     nifty_aligned = _nifty.reindex(_c_idx, method="ffill")
 
+    # Pre-compute pivot series once — avoids O(n²) rescanning inside compute_bar
+    from utils.scanner_engine import pivot_high, pivot_low
+    pvt_lb = params.pvt_lb
+    pivot_ph = pivot_high(h, pvt_lb)
+    pivot_pl = pivot_low(l,  pvt_lb)
+
     return IndicatorArrays(
         c=c, h=h, l=l, o=o, v=v,
         e20=e20, e50=e50, e200=e200,
@@ -381,6 +390,8 @@ def build_indicators(
         squeeze_series=squeeze_series,
         cloud_top=cloud_top, cloud_bottom=cloud_bottom,
         nifty_aligned=nifty_aligned,
+        pivot_ph=pivot_ph,
+        pivot_pl=pivot_pl,
     )
 
 
@@ -389,25 +400,25 @@ def build_indicators(
 # ══════════════════════════════════════════════════════════════════
 
 def _get_pivots(ia: IndicatorArrays, i: int, pvt_lb: int):
-    """Return (pv_prices, pv_is_high) for up to 8 recent pivots ending at bar i."""
-    from utils.scanner_engine import pivot_high, pivot_low, detect_harmonic, detect_abcd
+    """Return pivot-based flags using pre-computed pivot series (O(1) per bar)."""
+    from utils.scanner_engine import detect_harmonic, detect_abcd
 
     if i < 0:
         i = len(ia.c) + i
 
-    pvt_lb_use = min(pvt_lb, i // 4)
-    if pvt_lb_use < 2:
-        return [], [], False, False, False, False
-
-    ph_s = pivot_high(ia.h.iloc[:i + 1], pvt_lb_use)
-    pl_s = pivot_low(ia.l.iloc[:i + 1],  pvt_lb_use)
+    # Use the pre-computed pivot series stored in IndicatorArrays.
+    # Scan backward up to 60 bars for the 8 most recent confirmed pivots.
+    ph_s = ia.pivot_ph
+    pl_s = ia.pivot_pl
 
     pivots = []
     for j in range(i, max(-1, i - 60), -1):
-        if not np.isnan(float(ph_s.iloc[j])):
-            pivots.append((float(ph_s.iloc[j]), True))
-        elif not np.isnan(float(pl_s.iloc[j])):
-            pivots.append((float(pl_s.iloc[j]), False))
+        ph_val = float(ph_s.iloc[j])
+        pl_val = float(pl_s.iloc[j])
+        if not np.isnan(ph_val):
+            pivots.append((ph_val, True))
+        elif not np.isnan(pl_val):
+            pivots.append((pl_val, False))
         if len(pivots) >= 8:
             break
 
