@@ -109,6 +109,34 @@ class ScoringParams:
     # Adaptive logic offsets ±5 based on ATR ratio; this sets the midpoint.
     score_base_threshold: int = 70
 
+    # ── Risk / SL cap ────────────────────────────────────────────
+    # Hard cap on (entry - SL) / entry.  Trades whose ATR-based SL produces
+    # a risk% above this are rejected before entering.  Set to 1.0 to disable.
+    # Backtest shows 4-6% risk bucket has 64% T1 hit rate vs ~38% above 6.5%.
+    sl_max_risk_pct: float = 0.065   # 6.5%
+
+    # ── High-score CCI gate ──────────────────────────────────────
+    # When norm_score >= this level, require CCI < high_score_cci_max at entry.
+    # Prevents late entries on already-recovering stocks that score highly on
+    # structural filters but have lost their CCI edge.
+    # Set high_score_cci_threshold to 101 to disable.
+    high_score_cci_threshold: int   = 90    # applies when score >= this
+    high_score_cci_max:       int   = -50   # CCI must be below this value
+
+    # ── Symbol cooldown after SL ─────────────────────────────────
+    # After a SL hit on a symbol, block re-entry for this many calendar days.
+    # Prevents repeatedly entering the same structurally weak stock.
+    # Set to 0 to disable.
+    sl_cooldown_days: int = 60
+
+    # ── Time-based exit (slow-bleed prevention) ──────────────────
+    # If after time_stop_days the trade P&L is below time_stop_min_pct,
+    # exit at close rather than waiting for the SL or hold_days limit.
+    # 56% of SL hits were slow bleeds held 10+ days to full SL.
+    # Set time_stop_days to 0 to disable.
+    time_stop_days:    int   = 10
+    time_stop_min_pct: float = 2.0   # must be at least +2% by day 10
+
     @classmethod
     def from_settings(cls, s: dict) -> "ScoringParams":
         """Build from the settings dict produced by pages/settings.py."""
@@ -150,6 +178,12 @@ class ScoringParams:
             t4_cci_min          = int(s.get("t4_cci_min",         0)),
             t4_vol_mult         = float(s.get("t4_vol_mult",      1.2)),
             t4_tight_atr        = float(s.get("t4_tight_atr",     1.5)),
+            sl_max_risk_pct          = float(s.get("sl_max_risk_pct",       0.065)),
+            high_score_cci_threshold = int(s.get("high_score_cci_threshold", 90)),
+            high_score_cci_max       = int(s.get("high_score_cci_max",      -50)),
+            sl_cooldown_days         = int(s.get("sl_cooldown_days",         60)),
+            time_stop_days           = int(s.get("time_stop_days",           10)),
+            time_stop_min_pct        = float(s.get("time_stop_min_pct",       2.0)),
         )
 
 
@@ -857,8 +891,19 @@ def compute_bar(
     )
     is_tier1_prime = is_tier1_prime and tier1_entry_quality
 
+    # ── HIGH-SCORE CCI GATE ───────────────────────────────────────
+    # Stocks that score ≥ high_score_cci_threshold but have CCI already
+    # recovering (above high_score_cci_max) are filtered out.  Backtest shows
+    # score 86-100 underperforms lower scores because these entries are late —
+    # structural alignment looks perfect but the CCI bounce is already priced in.
+    high_score_cci_ok = (
+        norm_score < params.high_score_cci_threshold or       # gate only applies to high scores
+        cur_cci    <= params.high_score_cci_max       or       # CCI still deep enough
+        params.high_score_cci_threshold > 100                  # effectively disabled
+    )
+    is_tier1_prime = is_tier1_prime and high_score_cci_ok
+
     acc_tier = (
-        "T1★" if is_tier1_prime              else
         "A"   if (qualified and any_buy)     else
         "B"   if any_buy                     else
         "C"   if norm_score >= 50            else
