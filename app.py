@@ -93,15 +93,36 @@ from pages.settings import render as render_settings
 from utils.scanner_engine import NIFTY500_SYMBOLS
 
 # ── Assemble settings from session_state (written live by Settings tab) ────────
-from pages.settings import DEFAULTS as _DEFAULTS
 ss = st.session_state
 settings = {
-    k: ss.get(k, v) for k, v in _DEFAULTS.items()
+    "symbols":           ss.get("symbols",           NIFTY500_SYMBOLS),
+    "cci_len":           ss.get("cci_len",            20),
+    "cci_ob":            ss.get("cci_ob",             100),
+    "cci_os":            ss.get("cci_os",            -100),
+    "workers":           ss.get("workers",            10),
+    "hold_days":         ss.get("hold_days",          20),
+    "min_score":         ss.get("min_score",          70),
+    "auto_refresh":      ss.get("auto_refresh",       False),
+    "refresh_mins":      ss.get("refresh_mins",       5),
+    # Tier 1 tuning
+    "t1_mom3":           ss.get("t1_mom3",            8),
+    "t1_mom6":           ss.get("t1_mom6",            12),
+    "t1_fib_hi":         ss.get("t1_fib_hi",          38.2),
+    "t1_fib_lo":         ss.get("t1_fib_lo",          61.8),
+    "t1_cci_window":     ss.get("t1_cci_window",      5),
+    "t1_cloud":          ss.get("t1_cloud",           True),
+    "t1_squeeze_boost":  ss.get("t1_squeeze_boost",   True),
+    "t1_squeeze_pts":    ss.get("t1_squeeze_pts",     15),
+    "t1_no_squeeze_pts": ss.get("t1_no_squeeze_pts",  5),
+    "t1_ps_weight":      ss.get("t1_ps_weight",       20),
+    "t1_ps_penalty":     ss.get("t1_ps_penalty",     -10),
+    # Tier 2 tuning
+    "t2_comp_bars":      ss.get("t2_comp_bars",       10),
+    "t2_atr_ratio":      ss.get("t2_atr_ratio",       0.85),
+    "t2_vol_mult":       ss.get("t2_vol_mult",        1.2),
+    # Nifty regime
+    "nifty_regime_filter": ss.get("nifty_regime_filter", False),
 }
-# Always override symbols with live value (may be custom list)
-settings["symbols"] = ss.get("symbols", NIFTY500_SYMBOLS)
-settings["min_score"] = ss.get("min_score", 70)
-settings["hold_days"] = ss.get("hold_days", 20)
 
 tab1, tab2, tab3 = st.tabs(["📡 Live Scanner", "📈 Backtest Engine", "⚙️ Settings"])
 
