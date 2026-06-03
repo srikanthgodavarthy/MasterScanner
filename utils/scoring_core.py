@@ -374,6 +374,9 @@ def _get_pivots(ia: IndicatorArrays, i: int, pvt_lb: int):
     """Return (pv_prices, pv_is_high) for up to 8 recent pivots ending at bar i."""
     from utils.scanner_engine import pivot_high, pivot_low, detect_harmonic, detect_abcd
 
+    if i < 0:
+        i = len(ia.c) + i
+
     pvt_lb_use = min(pvt_lb, i // 4)
     if pvt_lb_use < 2:
         return [], [], False, False, False, False
@@ -427,6 +430,14 @@ def compute_bar(
     """
     c   = ia.c;   h = ia.h;   l = ia.l
     v   = ia.v;   o = ia.o
+
+    # Resolve negative index to a concrete positive offset so that every
+    # iloc[start : i+1] slice works correctly.  Without this, i=-1 makes
+    # i+1=0 and iloc[anything:0] returns an empty Series, silently breaking
+    # Fibonacci levels, momentum lookbacks, RS, harmonic detection, and
+    # every "i >= N" guard (since -1 >= 1 is always False).
+    if i < 0:
+        i = len(c) + i
 
     # ── Scalar extractions ────────────────────────────────────────
     cur_c    = float(c.iloc[i])
