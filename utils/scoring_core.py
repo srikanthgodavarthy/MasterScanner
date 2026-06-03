@@ -103,7 +103,7 @@ class ScoringParams:
     t4_tight_atr:     float = 1.5    # 5-bar close range < ATR * mult
 
     # Score normalisation
-    max_score: int = 110
+    max_score: int = 175
 
     # Score threshold — base value for normal-volatility regime
     # Adaptive logic offsets ±5 based on ATR ratio; this sets the midpoint.
@@ -131,7 +131,7 @@ class ScoringParams:
             t1_no_squeeze_pts= int(s.get("t1_no_squeeze_pts",    0)),
             t1_ps_weight     = int(s.get("t1_ps_weight",        20)),
             t1_ps_penalty    = int(s.get("t1_ps_penalty",      -10)),
-            max_score        = int(s.get("max_score",          110)),
+            max_score        = int(s.get("max_score",          175)),
             score_base_threshold = int(s.get("score_base_threshold", 70)),
             t2_comp_bars     = int(s.get("t2_comp_bars",        10)),
             t2_atr_ratio     = float(s.get("t2_atr_ratio",      0.85)),
@@ -597,85 +597,78 @@ def compute_bar(
     _, _, harm_bull, harm_bear, abcd_bull, abcd_bear = _get_pivots(ia, i, params.pvt_lb)
 
     # ── RAW SCORE ─────────────────────────────────────────────────
-    # Budget (max_score = 110):
+    # Budget (max_score = 175):
     #   Trend structure    25   (trend_up)
-    #   EMA slope          15   (ema_slope — expansion, not overlap)
-    #   RSI rising         15   (rising from 40-60; -5 if ≥70)
-    #   Volume             8    (reduced weight)
-    #   Breakout quality   20   (ATR-relative; penalises extension)
-    #   RS vs Nifty        15   (rs > 0.03 threshold)
+    #   EMA alignment      30   (e20>e50 full; 20 if within 0.5%)
+    #   RSI                25   (graded 45–60+)
+    #   Volume             20   (>1.2x avg)
+    #   HH breakout        25   (close > 10-bar high; +10 if up 2 bars)
+    #   RS vs Nifty        15   (rs > 0; 5 if marginally negative)
     #   Fibonacci zone     30   (in_golden — unchanged)
-    #   Fib extension     -40/-60  (near_ext127/161)
-    #   CCI               20   (OS = 20, caution at 120, penalty at 200)
-    #   CCI cross OS       15   (unchanged)
-    #   CCI extended      -15   (total -40 at >200)
+    #   Fib extension     -20/-30  (near_ext127/161)
+    #   CCI               20   (OS = 20, neutral = 10, extended = -15)
+    #   CCI cross OS       15
     #   Persist. strength  20/-10
-    #   Harmonic/ABCD      5/5  (tie-breaker only)
+    #   Harmonic           20
+    #   ABCD               15
     #   Below cloud       -15
-    #   Squeeze           neutralised (0) — gate in Tier 2
+    #   Squeeze            15/5  (t1_squeeze_pts / t1_no_squeeze_pts)
     #   Tier 1 gate bonus  20
     # ─────────────────────────────────────────────────────────────
     score = 0.0
 
-    # ① TREND — unchanged, primary pillar (25)
+    # ① TREND — primary pillar (25)
     score += 25 if trend_up else 0
 
-    # ② EMA SLOPE — replaces double-count; rewards active expansion not just alignment (15)
+    # ② EMA ALIGNMENT — full points for clear alignment, partial for near (30)
     prev_e20 = float(ia.e20.iloc[i - 1]) if i >= 1 else cur_e20
     ema_slope = cur_e20 > prev_e20 and cur_e50 > prev_e50
-    score += 15 if ema_slope else 0
+    score += (30 if cur_e20 > cur_e50 else 20 if cur_e20 > cur_e50 * 0.995 else 0)
 
-    # ③ RSI — rewards rising RSI from oversold/neutral; penalises overbought (max 15)
+    # ③ RSI — graded; rewards momentum building (max 25)
     prev_rsi = float(ia.rsi_s.iloc[i - 1]) if i >= 1 else cur_r
     rsi_rising_from_os = cur_r > prev_rsi and 40 < cur_r < 60
-    score += (15 if rsi_rising_from_os else 5 if 55 <= cur_r < 65 else -5 if cur_r >= 70 else 0)
+    score += (25 if cur_r > 60 else 20 if cur_r > 55 else 15 if cur_r > 50 else 5 if cur_r > 45 else 0)
 
-    # ④ VOLUME — reduced weight; signal preserved (max 8)
-    score += (8 if cur_v > cur_vavg * 1.5 else 5 if cur_v > cur_vavg * 1.2 else 0)
+    # ④ VOLUME — meaningful expansion signal (max 20)
+    score += (20 if cur_v > cur_vavg * 1.2 else 10 if cur_v > cur_vavg else 0)
 
-    # ⑤ BREAKOUT QUALITY — ATR-relative; rewards clean base, penalises extension (max 20)
+    # ⑤ HIGHER HIGH / BREAKOUT — rewards price making new highs (max 35)
     hh = float(ia.c.iloc[max(0, i - 10):i].max()) if i >= 1 else cur_c
     breakout_quality = (cur_c - hh) / cur_atr if cur_atr > 0 else 0.0
-    score += (20 if 0 <= breakout_quality <= 0.5  else
-              10 if 0.5 < breakout_quality <= 1.5 else
-             -10 if breakout_quality > 1.5         else 0)
-    # dropped: "+10 if up 2 bars" — no structural meaning
+    score += (25 if cur_c > hh else 15 if cur_c > hh * 0.98 else 0)
+    score += (10 if i >= 2 and cur_c > float(ia.c.iloc[i - 2]) else 0)
 
-    # ⑥ RELATIVE STRENGTH — meaningful outperformance required (max 15)
-    score += (15 if rs > 0.03 else 8 if rs > 0.01 else 0 if rs >= 0 else -5)
+    # ⑥ RELATIVE STRENGTH — positive vs Nifty is sufficient signal (max 15)
+    score += (15 if rs > 0 else 5 if rs > -0.005 else 0)
 
     # ⑦ FIBONACCI ZONE — unchanged, core signal (30)
     score += 30 if in_golden else 0
 
-    # ⑧ FIBONACCI EXTENSION PENALTIES — hardened; compound if also CCI extended (max -40/-60)
-    ext127_penalty = -40 if not cci_extended else -55
-    ext161_penalty = -60 if not cci_extended else -75
-    score += ext127_penalty if near_ext127 else (ext161_penalty if near_ext161 else 0)
+    # ⑧ FIBONACCI EXTENSION PENALTIES
+    score += -20 if near_ext127 else (-30 if near_ext161 else 0)
 
-    # ⑨ CCI — penalty starts at 120 (caution), hardens at 200 (extended) (max 20)
-    cci_caution = cur_cci > 120 and not cci_extended   # early warning zone
+    # ⑨ CCI — rewards OS recovery; penalises extended (max 20)
+    cci_caution = cur_cci > 120 and not cci_extended   # kept for flag use below
     score += (20 if cur_cci < params.cci_os else
               10 if cur_cci < 0             else
-             -10 if cci_caution             else
              -15 if cci_extended            else 0)
     score += 15 if cci_cross_up_os else 0
-    score -= 15 if cci_extended    else 0   # total at >200: -30; with ext127/161 compound: far worse
 
     # ⑩ PERSISTENT STRENGTH — unchanged weight
     score += params.t1_ps_weight if persistent_strength else params.t1_ps_penalty
 
-    # ⑪ HARMONIC / ABCD — tie-breaker only; not primary score mass (5 each)
-    score += 5 if harm_bull else 0
-    score += 5 if abcd_bull else 0
+    # ⑪ HARMONIC / ABCD — meaningful signal weight
+    score += 20 if harm_bull else 0
+    score += 15 if abcd_bull else 0
 
     # ⑫ CLOUD — penalty unchanged
     score += -15 if below_cloud else 0
 
-    # ⑬ SQUEEZE — neutralised in score; prev_squeeze_on gate added to Tier 2 below
+    # ⑬ SQUEEZE
     if params.t1_squeeze_boost:
         score += params.t1_squeeze_pts if squeeze_release else \
                  (params.t1_no_squeeze_pts if not squeeze_on else 0)
-        # With defaults now 0/0 this block is inert; kept so Settings page override still works
 
     # ── TIER 1 PRIME GATE ─────────────────────────────────────────
     # Optional Nifty regime gate: when enabled, Nifty must be in bull
