@@ -1,24 +1,4 @@
-"""
-pages/settings.py — Interactive Settings  (v3)
-
-Five tier sections rendered as styled tab cards inside the page:
-  ① Common    — universe, workers, auto-refresh, cache
-  ② Tier 1    — persistent_strength thresholds, fib zone, CCI recovery window,
-                EMA alignment toggle, cloud gate, score boost for squeeze
-  ③ Tier 2    — compression ATR ratio, compression bars, CCI OB level,
-                volume expansion multiplier
-  ④ Tier 3    — Active Momentum Expansion: RS20, ATR contract, breakout trigger,
-                CCI momentum floor, volume, squeeze bonus
-  ⑤ Tier 4    — Early Recovery: EMA20 transition, RS20 improving, ATR contract,
-                tight range, CCI turning, volume
-
-All sliders / number inputs write immediately to st.session_state so
-scanner.py and backtest.py pick them up on the next run without a page
-reload.  A live "Parameter Preview" card shows the current effective
-gate as human-readable conditions.
-
-No sidebar used — sidebar is collapsed by app.py (initial_sidebar_state="collapsed").
-"""
+"""pages/settings.py — Interactive settings for all scanner tiers."""
 
 import streamlit as st
 import pandas as pd

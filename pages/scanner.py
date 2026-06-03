@@ -1,15 +1,4 @@
-"""
-pages/scanner.py — Live scanner UI  (v5 — clean layered layout)
-
-Tier layers (engine-driven, not action-driven):
-  Tier 1  — _tier1_prime = True  (all 5 pillars + entry quality gate)
-  Tier 2  — _any_buy = True, not Tier 1
-  Tier 3  — Action = WATCH
-  Tier 4  — SKIP / hard-stop (hidden by default)
-
-Watchlist: highlighted pill badges inline in scan table rows.
-Bottom sticky pill bar: live signal counts.
-"""
+"""pages/scanner.py — Live scanner UI."""
 
 import streamlit as st
 import pandas as pd
@@ -245,12 +234,15 @@ def _render_table(df: pd.DataFrame, cci_ob: int, cci_os: int,
         at        = str(row.get("AccTier", "-"))
         qual_icon = "⭐" if row["Qual"] == "⭐" else ("✔" if row["Qual"] == "✔" else "")
 
+        tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym}"
         rows.append(
             f"<tr{tr_s}>"
             f"<td style='color:#334155;font-size:11px;width:24px'>{rank}</td>"
-            f"<td><span style='background:{stock_bg};color:#000;padding:2px 6px;"
-            f"border-radius:3px;font-size:12px;font-weight:600;white-space:nowrap'>"
-            f"{sym}{wl_dot}</span></td>"
+            f"<td><a href='{tv_url}' target='_blank' rel='noopener noreferrer' "
+            f"style='background:{stock_bg};color:#000;padding:2px 6px;"
+            f"border-radius:3px;font-size:12px;font-weight:600;white-space:nowrap;"
+            f"text-decoration:none;display:inline-block'>"
+            f"{sym}{wl_dot}</a></td>"
             f"<td>{sc_c(str(sc))}</td>"
             f"<td>{_acc_badge(at)}</td>"
             f"<td>{_setup_cell(str(row.get('Setup', '-')))}</td>"
@@ -332,7 +324,7 @@ _TIER_GATES = {
             ("cci_cross_up_os",   "CCI crossed up from oversold (< −100) within recovery window"),
             ("trend_structure",   "EMA20 > EMA50 > EMA200  (full alignment)"),
             ("above_cloud",       "Price above Ichimoku cloud  (Nifty regime gate)"),
-            ("entry_quality",    "buy_type not blank  AND  risk >= 5%  AND  norm_score >= 75"),
+            ("entry_quality",    "buy_type not blank  AND  risk >= 5%  AND  norm_score >= 90"),
         ],
         "note": "All five conditions + entry quality gate must be true simultaneously.",
     },
