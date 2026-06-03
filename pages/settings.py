@@ -610,40 +610,12 @@ def _section_tier2():
     )
 
     st.caption(
-        "Tier 2 has two tracks: **Track A** (Compression Breakout) and **Track B** (any buy signal). "
-        "Either track qualifies a stock for Tier 2."
+        "Tier 2 fires when **any one** of the buy signals below is True "
+        "(and price is above/inside Ichimoku cloud). "
+        "These knobs control the thresholds used by those signals."
     )
 
-    # ── Track A: Compression Breakout ──────────────────────────────
-    st.markdown("**Track A — Compression Breakout** ()")
-    ca1, ca2, ca3 = st.columns(3)
-    with ca1:
-        comp_bars = st.slider(
-            "Compression window (bars)", min_value=5, max_value=20,
-            value=int(ss.get("t2_comp_bars", 10)), step=1, key="sl_comp_bars",
-            help="Prior bars to define the range high and ATR baseline",
-        )
-    with ca2:
-        atr_ratio = st.slider(
-            "ATR compression ratio", min_value=0.60, max_value=0.95,
-            value=float(ss.get("t2_atr_ratio", 0.85)), step=0.05, key="sl_atr_ratio",
-            format="%.2f",
-            help="prev_bar ATR must be < SMA(ATR, window) × this ratio",
-        )
-    with ca3:
-        vol_mult = st.slider(
-            "Volume multiplier", min_value=1.0, max_value=3.0,
-            value=float(ss.get("t2_vol_mult", 1.2)), step=0.1, key="sl_vol_mult",
-            format="%.1f",
-            help="Current volume must exceed 20-bar avg × this multiple",
-        )
-    ss["t2_comp_bars"] = int(comp_bars)
-    ss["t2_atr_ratio"] = float(atr_ratio)
-    ss["t2_vol_mult"]  = float(vol_mult)
-
-    st.divider()
-
-    # ── Track B: Fibonacci zone ─────────────────────────────────────
+    # ── Fibonacci zone ─────────────────────────────────────────────
     st.markdown("**Fibonacci retracement zone** — used by Fib+Qual and Fib+CCI signals")
     fz1, fz2 = st.columns(2)
     with fz1:
