@@ -1,13 +1,4 @@
-"""
-utils/backtest_engine.py
-─────────────────────────
-Walk-forward backtest — fully synced with scanner via scoring_core.compute_bar().
-
-generate_signals_historical() no longer duplicates scoring logic.
-It calls build_indicators() once per symbol, then compute_bar(ia, i, params)
-for every bar — the exact same function score_stock() calls for the live bar.
-Result: scanner and backtest are guaranteed identical.
-"""
+"""utils/backtest_engine.py — Walk-forward backtest engine."""
 
 import pandas as pd
 import numpy as np

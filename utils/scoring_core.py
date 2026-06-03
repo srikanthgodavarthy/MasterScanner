@@ -1,20 +1,4 @@
-"""
-utils/scoring_core.py
-─────────────────────
-Single source of truth for ALL per-bar scoring logic.
-
-Both scanner_engine.score_stock()  and
-     backtest_engine.generate_signals_historical()
-call compute_bar() for every bar they evaluate.
-
-compute_bar() is pure:
-  • Inputs  — pre-computed indicator Series + scalar bar index i
-              + a ScoringParams dataclass (all tunable thresholds)
-  • Outputs — BarResult dataclass (every flag, score, tier, trade levels)
-  • No I/O, no Streamlit, no yfinance — safe to call from any context.
-
-Adding a new condition means editing ONE place.
-"""
+"""utils/scoring_core.py — Single source of truth for all per-bar scoring logic."""
 
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -642,24 +626,6 @@ def compute_bar(
     _, _, harm_bull, harm_bear, abcd_bull, abcd_bear = _get_pivots(ia, i, params.pvt_lb)
 
     # ── RAW SCORE ─────────────────────────────────────────────────
-    # Budget (max_score = 175):
-    #   Trend structure    25   (trend_up)
-    #   EMA alignment      30   (e20>e50 full; 20 if within 0.5%)
-    #   RSI                25   (graded 45–60+)
-    #   Volume             20   (>1.2x avg)
-    #   HH breakout        25   (close > 10-bar high; +10 if up 2 bars)
-    #   RS vs Nifty        15   (rs > 0; 5 if marginally negative)
-    #   Fibonacci zone     30   (in_golden — unchanged)
-    #   Fib extension     -20/-30  (near_ext127/161)
-    #   CCI               20   (OS = 20, neutral = 10, extended = -15)
-    #   CCI cross OS       15
-    #   Persist. strength  20/-10
-    #   Harmonic           20
-    #   ABCD               15
-    #   Below cloud       -15
-    #   Squeeze            15/5  (t1_squeeze_pts / t1_no_squeeze_pts)
-    #   Tier 1 gate bonus  20
-    # ─────────────────────────────────────────────────────────────
     score = 0.0
 
     # ① TREND — primary pillar (25)
@@ -874,28 +840,17 @@ def compute_bar(
         "Norm"    if is_norm_buy       else "-"
     )
 
-    # ── TIER 1 ENTRY QUALITY GATE ────────────────────────────────────────
-    # Applied after buy_type and trade levels are resolved:
-    #   • buy_type ≠ "-"   — a recognised buy signal must exist
-    #   • risk_pct ≥ 5%    — (entry − SL) / entry ≥ 0.05  (room to breathe)
-    #   • norm_score ≥ 75  — high-conviction bar; structural alignment alone
-    #                         is not enough
-    # Note: a risk_pct upper cap (≤ 8%) was trialled but removed — the backtest
-    # mean of 8.45% means capping at 8% eliminates the majority of valid entries.
-    # Position sizing (not gate rejection) is the right tool for wide-SL setups.
+    # ── TIER 1 ENTRY QUALITY GATE ─────────────────────────────────────────
+    # buy_type ≠ "-", risk_pct ≥ 5%, norm_score ≥ 90 (highest win-rate bucket)
     risk_pct = (en - sl) / en if en > 0 else 0.0
     tier1_entry_quality = (
         buy_type   != "-"  and
         risk_pct   >= 0.05 and
-        norm_score >= 75
+        norm_score >= 90
     )
     is_tier1_prime = is_tier1_prime and tier1_entry_quality
 
     # ── HIGH-SCORE CCI GATE ───────────────────────────────────────
-    # Stocks that score ≥ high_score_cci_threshold but have CCI already
-    # recovering (above high_score_cci_max) are filtered out.  Backtest shows
-    # score 86-100 underperforms lower scores because these entries are late —
-    # structural alignment looks perfect but the CCI bounce is already priced in.
     high_score_cci_ok = (
         norm_score < params.high_score_cci_threshold or       # gate only applies to high scores
         cur_cci    <= params.high_score_cci_max       or       # CCI still deep enough

@@ -1,11 +1,4 @@
-"""
-utils/scanner_engine.py
-────────────────────────
-NSE Master Scanner — data fetch, indicator primitives, and live scanner.
-
-All scoring logic lives in utils/scoring_core.py (compute_bar / BarResult).
-score_stock() here is now a thin wrapper: build_indicators → compute_bar(i=-1).
-"""
+"""utils/scanner_engine.py — Data fetch, indicator primitives, and live scanner."""
 
 import pandas as pd
 import numpy as np
