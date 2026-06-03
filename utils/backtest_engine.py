@@ -115,17 +115,28 @@ def simulate_trades(
     df_full:   pd.DataFrame,
     signals:   pd.DataFrame,
     hold_days: int = 20,
+    params=None,   # ScoringParams — carries sl_max_risk_pct, time_stop_*, sl_cooldown_days
 ) -> pd.DataFrame:
     if signals.empty or df_full.empty:
         return pd.DataFrame()
 
+    from utils.scoring_core import ScoringParams
+    if params is None:
+        params = ScoringParams()
+
     trades        = []
-    blocked_until = pd.Timestamp.min
+    blocked_until = pd.Timestamp.min   # per-symbol general block (existing logic)
+    sl_hit_until  = pd.Timestamp.min   # per-symbol cooldown after SL hit (new)
 
     for _, sig in signals.iterrows():
         entry_signal_date = sig["date"]
 
         if entry_signal_date <= blocked_until:
+            continue
+
+        # ── SL cooldown gate (new) ────────────────────────────────
+        # After a SL hit on this symbol, skip all signals for sl_cooldown_days.
+        if params.sl_cooldown_days > 0 and entry_signal_date <= sl_hit_until:
             continue
 
         future = df_full[df_full.index > entry_signal_date]
@@ -143,14 +154,22 @@ def simulate_trades(
             blocked_until = entry_bar
             continue
 
+        # ── SL distance cap (new) ─────────────────────────────────
+        # Reject trades where ATR-based SL is too wide.
+        # 4-6% risk bucket: 64% T1 hit rate. Above 6.5%: ~38%.
+        risk_pct_actual = (entry_price - sl) / entry_price
+        if params.sl_max_risk_pct < 1.0 and risk_pct_actual > params.sl_max_risk_pct:
+            continue
+
         exit_price  = float(future["close"].iloc[min(hold_days, len(future) - 1)])
         exit_date   = future.index[min(hold_days, len(future) - 1)]
         exit_reason = "TIMEOUT"
 
-        for dt, row in future.iloc[: hold_days + 1].iterrows():
-            bar_low  = float(row["low"])
-            bar_high = float(row["high"])
-            bar_open = float(row["open"])
+        for bar_idx, (dt, row) in enumerate(future.iloc[: hold_days + 1].iterrows()):
+            bar_low   = float(row["low"])
+            bar_high  = float(row["high"])
+            bar_open  = float(row["open"])
+            bar_close = float(row["close"])
 
             sl_hit = bar_low  <= sl
             t2_hit = bar_high >= t2
@@ -160,23 +179,45 @@ def simulate_trades(
                 # Intraday conflict: whichever is closer to open was hit first
                 target      = t2 if t2_hit else t1
                 exit_price  = target if abs(bar_open - target) < abs(bar_open - sl) else sl
-                exit_reason = ("T2 HIT" if t2_hit else "T1 HIT") if exit_price == target else "SL HIT"
+                exit_reason = (("T2 HIT" if t2_hit else "T1 HIT") if exit_price == target
+                               else "SL HIT")
                 exit_date   = dt
                 break
             elif sl_hit:
-                exit_price, exit_date, exit_reason = sl, dt, "SL HIT";  break
+                exit_price, exit_date, exit_reason = sl, dt, "SL HIT"
+                break
             elif t2_hit:
-                exit_price, exit_date, exit_reason = t2, dt, "T2 HIT";  break
+                exit_price, exit_date, exit_reason = t2, dt, "T2 HIT"
+                break
             elif t1_hit:
-                exit_price, exit_date, exit_reason = t1, dt, "T1 HIT";  break
+                exit_price, exit_date, exit_reason = t1, dt, "T1 HIT"
+                break
+
+            # ── Time-based exit / slow-bleed prevention (new) ────
+            # If after time_stop_days the position hasn't moved at least
+            # time_stop_min_pct above entry, exit at today's close.
+            # Eliminates 56% of SL hits that were slow bleeds held 10-19 days.
+            if (params.time_stop_days > 0
+                    and bar_idx >= params.time_stop_days
+                    and exit_reason == "TIMEOUT"):
+                current_pct = (bar_close - entry_price) / entry_price * 100
+                if current_pct < params.time_stop_min_pct:
+                    exit_price  = bar_close
+                    exit_date   = dt
+                    exit_reason = "TIME STOP"
+                    break
 
         pnl_pct = round((exit_price - entry_price) / entry_price * 100, 2)
+
+        # Track SL cooldown: block this symbol after a SL hit
+        if exit_reason == "SL HIT" and params.sl_cooldown_days > 0:
+            sl_hit_until = exit_date + pd.Timedelta(days=params.sl_cooldown_days)
 
         trades.append({
             "symbol":          symbol,
             "entry_date":      entry_bar.date(),
             "entry_price":     round(entry_price, 2),
-            "exit_date":       exit_date.date(),
+            "exit_date":       exit_date.date() if hasattr(exit_date, "date") else exit_date,
             "exit_price":      round(exit_price, 2),
             "exit_reason":     exit_reason,
             "pnl_pct":         pnl_pct,
@@ -186,6 +227,7 @@ def simulate_trades(
             "sl":              sig["sl"],
             "t1":              sig["t1"],
             "t2":              sig["t2"],
+            "risk_pct":        round(risk_pct_actual * 100, 2),
             "setup":           sig.get("setup", "-"),
             "buy_type":        sig.get("buy_type", "-"),
             "tier1_prime":     bool(sig.get("tier1_prime",    False)),
@@ -235,6 +277,10 @@ def run_backtest(
     effective_settings = dict(settings) if settings else {}
     effective_settings["nifty_regime_val"] = regime_val
 
+    # Build ScoringParams once — carries all new gates (SL cap, time-stop,
+    # cooldown, high-score CCI gate) into simulate_trades for every symbol.
+    sim_params = ScoringParams.from_settings(effective_settings) if effective_settings else ScoringParams()
+
     total       = len(symbols)
     completed   = [0]
     c_lock      = threading.Lock()
@@ -254,7 +300,7 @@ def run_backtest(
             min_score  = min_score,
             tier1_only = tier1_only,
         )
-        return simulate_trades(sym, df, sigs, hold_days=hold_days)
+        return simulate_trades(sym, df, sigs, hold_days=hold_days, params=sim_params)
 
     with ThreadPoolExecutor(max_workers=workers) as exe:
         futures = {exe.submit(_process, s): s for s in symbols}
