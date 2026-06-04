@@ -100,18 +100,21 @@ settings = {
     # Execution
     "exec_score_threshold":   ss.get("exec_score_threshold",  70),
     "exec_rsi_min":           ss.get("exec_rsi_min",          52.0),
-    "exec_mom3_min":          ss.get("exec_mom3_min",          5.0),
+    "exec_mom3_min":          ss.get("exec_mom3_min",          7.0),
     "exec_vol_lo":            ss.get("exec_vol_lo",            1.1),
-    "exec_vol_hi":            ss.get("exec_vol_hi",            2.2),
+    "exec_vol_hi":            ss.get("exec_vol_hi",            2.0),
     "exec_prox_lo":           ss.get("exec_prox_lo",           0.5),
-    "exec_prox_hi":           ss.get("exec_prox_hi",           2.5),
+    "exec_prox_hi":           ss.get("exec_prox_hi",           4.0),
     "exec_cci_max":           ss.get("exec_cci_max",          180.0),
     "exec_rsi_max":           ss.get("exec_rsi_max",           72.0),
     "exec_ema20_dist_max":    ss.get("exec_ema20_dist_max",    5.0),
+    # RS filter
+    "exec_rs55_min":          ss.get("exec_rs55_min",          0.0),
+    "exec_rs55_max":          ss.get("exec_rs55_max",         20.0),
     # Watch
     "watch_rsi_min":          ss.get("watch_rsi_min",         48.0),
     "watch_prox_lo":          ss.get("watch_prox_lo",          2.0),
-    "watch_prox_hi":          ss.get("watch_prox_hi",          6.0),
+    "watch_prox_hi":          ss.get("watch_prox_hi",         10.0),
     "watch_rs55_min":         ss.get("watch_rs55_min",        -2.0),
     # Compression
     "atr5_atr20_ratio":       ss.get("atr5_atr20_ratio",      0.90),
@@ -120,11 +123,14 @@ settings = {
     "pvt_lb":                 ss.get("pvt_lb",                20),
     "atr_prox":               ss.get("atr_prox",              0.3),
     "sl_max_risk_pct":        ss.get("sl_max_risk_pct",       0.065),
+    "sl_cooldown_days":       ss.get("sl_cooldown_days",       5),
+    # Backtest / time-stop
+    "hold_days":              ss.get("hold_days",             20),
+    "time_stop_days":         ss.get("time_stop_days",        20),
+    "time_stop_min_pct":      ss.get("time_stop_min_pct",      1.0),
     # Nifty regime
     "nifty_regime_filter":    ss.get("nifty_regime_filter",   False),
     "nifty_regime_val":       ss.get("nifty_regime_val",     "neutral"),
-    # Backtest compat
-    "hold_days":              ss.get("hold_days",             20),
 }
 
 tab1, tab2, tab3 = st.tabs(["📡 Live Scanner", "📈 Backtest Engine", "⚙️ Settings"])
