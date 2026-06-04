@@ -328,12 +328,14 @@ def score_stock(
 
     params = ScoringParams.from_settings(settings) if settings else ScoringParams()
 
-    # Fast pre-check — skip clear downtrends
+    # Fast pre-check — skip clear downtrends.
+    # Mirrors the identical threshold used in run_scanner so single-symbol
+    # lookups and full scans agree on which stocks are eligible.
     c_s   = df["close"]
     _e20  = c_s.ewm(span=20,  adjust=False).mean()
     _e200 = c_s.ewm(span=200, adjust=False).mean()
     _c    = float(c_s.iloc[-1])
-    if _c <= float(_e200.iloc[-1]) and _c <= float(_e20.iloc[-1]):
+    if _c < float(_e200.iloc[-1]) * 0.97:
         return {}
 
     ia = build_indicators(df, nifty, params)

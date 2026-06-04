@@ -9,12 +9,12 @@ Structure (VCP/ABCD/RndBot/NR7)  20      atr_5 < atr_20*0.9 OR range_10d < range
                                          OR bb_width_contracting OR vcp_detected OR nr7_detected
 Relative Strength                15      rs55 > 0 AND rs21 > rs21_prev
 Breakout Readiness               15      0.5 < pct_from_swhi <= 2.5
-Momentum                         10      rsi > 52 AND mom3m > 5 AND cci_momentum_ok
+Momentum                         15      rsi > 52 AND mom3m > 5 AND cci_momentum_ok
 Volume Quality                   10      1.1 <= volume_ratio <= 2.2
 Pullback Quality (bonus)          5      in_golden OR recent_bounce_from_ema20
 Anti-Overextension Filter        hard    cci < 180 AND rsi < 72 AND distance_from_ema20 < 5%
 ─────────────────────────────────────────────────────────────────
-Max raw = 100  →  EXECUTION if >= 70
+Max raw = 105  →  EXECUTION if >= 70
 FibGrade: EXCELLENT / GOOD / FAIR / POOR  (bonus metadata, not in score)
 
 WATCH ENTRY  (structural conditions, no score threshold)
@@ -480,7 +480,10 @@ def compute_bar(
     if i >= 6:
         bar_ranges  = (h.iloc[i-6:i+1] - l.iloc[i-6:i+1]).values
         today_range = float(bar_ranges[-1])
-        nr7_detected = today_range == float(bar_ranges.min()) and today_range > 0
+        # NR7: today's range is strictly narrower than each of the prior 6 bars.
+        # Using < prior-min (not == overall-min) avoids false negatives when
+        # multiple bars share the minimum range.
+        nr7_detected = today_range > 0 and today_range < float(np.min(bar_ranges[:-1]))
 
     # ── VCP: Volatility Contraction Pattern ───────────────────────
     # 3-stage contraction: each stage's range is < 75% of the prior stage.

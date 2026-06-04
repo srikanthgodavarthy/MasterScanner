@@ -340,9 +340,11 @@ def run_backtest(
             with c_lock:
                 completed[0] += 1
                 n = completed[0]
-            if progress_cb:
-                # Reserve first 2% for downloads; remaining 98% for processing
-                progress_cb(0.02 + 0.98 * n / total, sym)
+                # progress_cb is called inside the lock so the counter value
+                # used for the progress fraction is the same one just incremented.
+                if progress_cb:
+                    # Reserve first 2% for downloads; remaining 98% for processing
+                    progress_cb(0.02 + 0.98 * n / total, sym)
             try:
                 result = fut.result()
                 if result is not None and not result.empty:
