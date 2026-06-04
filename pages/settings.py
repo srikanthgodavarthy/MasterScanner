@@ -32,14 +32,14 @@ DEFAULTS = {
     "exec_vol_lo":           1.1,
     "exec_vol_hi":           2.2,
     "exec_prox_lo":          0.5,
-    "exec_prox_hi":          2.5,
+    "exec_prox_hi":          4.0,
     "exec_cci_max":          180.0,
     "exec_rsi_max":          72.0,
     "exec_ema20_dist_max":   5.0,
     # Watch thresholds
     "watch_rsi_min":         48.0,
     "watch_prox_lo":         2.0,
-    "watch_prox_hi":         6.0,
+    "watch_prox_hi":         8.0,
     "watch_rs55_min":        -2.0,
     # Compression
     "atr5_atr20_ratio":      0.90,
@@ -117,10 +117,10 @@ div[data-testid="stSlider"] label { font-size: 11px !important; color: #64748b !
 def _score_preview(ss: dict) -> str:
     components = [
         ("Trend Quality",       25, "#22c55e"),
-        ("Compression/Base",    20, "#3b82f6"),
+        ("Compression/Base",    15, "#3b82f6"),
         ("Breakout Proximity",  15, "#f59e0b"),
         ("Relative Strength",   15, "#8b5cf6"),
-        ("Momentum",            10, "#06b6d4"),
+        ("Momentum",            15, "#06b6d4"),
         ("Volume Quality",      10, "#f97316"),
         ("Pullback Bonus",       5, "#ec4899"),
     ]
@@ -141,8 +141,9 @@ def _score_preview(ss: dict) -> str:
         f'<div style="margin-top:8px;padding-top:7px;border-top:1px solid #1e293b40;'
         f'color:#64748b;font-size:10px">'
         f'Execution threshold: <b style="color:#4ade80">{thr}/100</b> &nbsp;·&nbsp; '
-        f'Anti-overextension filter is a hard gate (CCI &lt; {ss.get("exec_cci_max",180)}, '
-        f'RSI &lt; {ss.get("exec_rsi_max",72)}, EMA20 dist &lt; {ss.get("exec_ema20_dist_max",5)}%)'
+        f'  Anti-overextension filter is a hard gate (CCI &lt; {ss.get("exec_cci_max",180)}, '
+        f'RSI &lt; {ss.get("exec_rsi_max",72)}, EMA20 dist &lt; {ss.get("exec_ema20_dist_max",5)}%). '
+        f'Momentum CCI condition: cci&gt;0 OR (cci&gt;−50 AND rising) OR cci_cross_up_from_OS.'
         f'</div>'
     )
     return f'<div class="score-bar-wrap">{rows}</div>'
@@ -155,7 +156,7 @@ def _watch_preview(ss: dict) -> str:
         f'  1. Trend Developing   close > EMA200 <span class="ok">AND</span> EMA20 rising',
         f'  2. Early Structure    rounded_bottom <span class="ok">OR</span> abcd_detected <span class="ok">OR</span> base_tight <span class="ok">OR</span> vol_contracting',
         f'  3. Momentum Improving RSI &gt; <b>{ss.get("watch_rsi_min",48)}</b> <span class="ok">AND</span> CCI rising',
-        f'  4. Not Yet Expanded   pct_from_swhi in [<b>{ss.get("watch_prox_lo",2)}</b>, <b>{ss.get("watch_prox_hi",6)}</b>]',
+        f'  4. Not Yet Expanded   pct_from_swhi in [<b>{ss.get("watch_prox_lo",2)}</b>, <b>{ss.get("watch_prox_hi",8)}</b>]',
         f'  5. Avoid Weak Stocks  RS55 &gt; <b>{ss.get("watch_rs55_min",-2)}</b>',
         f'',
         f'  No score threshold — structural condition check only.',
@@ -260,9 +261,9 @@ def _section_execution():
         st.number_input("Proximity: % from Hi — Min", 0.0, 2.0,
                         value=float(ss.get("exec_prox_lo", 0.5)),
                         step=0.1, key="exec_prox_lo")
-        st.number_input("Proximity: % from Hi — Max", 1.0, 5.0,
-                        value=float(ss.get("exec_prox_hi", 2.5)),
-                        step=0.1, key="exec_prox_hi")
+        st.number_input("Proximity: % from Hi — Max", 1.0, 8.0,
+                        value=float(ss.get("exec_prox_hi", 4.0)),
+                        step=0.25, key="exec_prox_hi")
 
     st.markdown("**Anti-Overextension Filter (Hard Gate)**")
     c4, c5, c6 = st.columns(3)
@@ -315,9 +316,9 @@ def _section_watch():
                         value=float(ss.get("watch_prox_lo", 2.0)),
                         step=0.25, key="watch_prox_lo")
     with c3:
-        st.number_input("Watch: % from Hi — Max", 3.0, 12.0,
-                        value=float(ss.get("watch_prox_hi", 6.0)),
-                        step=0.25, key="watch_prox_hi")
+        st.number_input("Watch: % from Hi — Max", 3.0, 15.0,
+                        value=float(ss.get("watch_prox_hi", 8.0)),
+                        step=0.5, key="watch_prox_hi")
     with c4:
         st.number_input("Watch: RS55 min (%)", -10.0, 5.0,
                         value=float(ss.get("watch_rs55_min", -2.0)),
@@ -397,10 +398,12 @@ def _section_supabase():
             st.success("Saved!") if ok else st.error("Save failed.")
 
     hist = load_scan_history(limit=5)
-    if hist:
+    # load_scan_history returns a DataFrame — use .empty, not truthiness
+    hist_ok = (hist is not None and hasattr(hist, "empty") and not hist.empty)
+    if hist_ok:
         st.markdown("**Recent snapshots**")
-        for row in hist:
-            st.caption(f"• {row.get('label','—')}  ·  {row.get('created_at','')[:16]}")
+        for _, row in hist.iterrows():
+            st.caption(f"• {row.get('label','—')}  ·  {str(row.get('created_at',''))[:16]}")
 
 
 # ══════════════════════════════════════════════════════════════════
