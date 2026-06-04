@@ -5,29 +5,25 @@ EXECUTION ENTRY  (score >= 70 required, hard gates must all pass)
 Component                        Weight  Gate / Change vs prior version
 ─────────────────────────────────────────────────────────────────────────
 Trend Quality                    25      close > EMA200 AND EMA20 > EMA50 > EMA200 (full 3-MA alignment)
-                                         ← was: e20 > e50 only; EMA200 check was separate
-Structure (VCP/BB-squeeze/NR7)   20      base gate same; VCP now earns +5 bonus (highest-quality base)
-                                         BB squeeze + VCP together flag high_prob = True
+Structure (VCP/BB/NR7)           20      gate = vcp_detected OR nr7_detected OR bb_width_contracting
+                                         ← tightened: generic vol contraction removed from Execution gate
+                                         ← VCP bonus (+5) removed; max stays 110
 Relative Strength                15      rs55 in (0, 20] AND rs21 > rs21_prev
-                                         ← cap configurable (default 20; was 15 in prior version)
 Breakout Readiness               15      0.5 < pct_from_swhi <= 4.0  (unchanged)
 Momentum                         15      rsi > 52 AND 7 < mom3 <= 40 AND cci_momentum_ok
-                                         ← lower bound raised 5 → 7 (weak early momentum poor follow-through)
 Volume Quality                   10      1.1 <= volume_ratio <= 2.0
-                                         ← upper bound tightened 2.2 → 2.0 (extreme vol = exhaustion)
 Pullback Quality                  5      recent_bounce_ema20 OR fib_grade in (EXCELLENT, GOOD)
-                                         ← fib_grade now contributes (was pure metadata)
 Confluence Bonus                  5      4+ component gates passing simultaneously
-                                         ← new: paper's "confluence of indicators" principle
 Anti-Overextension Filter        hard    cci < 180 AND rsi < 72 AND distance_from_ema20 < 5%
 ─────────────────────────────────────────────────────────────────────────
 Max raw = 110  →  EXECUTION if >= 70
-VCP bonus: +5 on top of sc_compression when vcp_detected (max 110)
-Confluence bonus: +5 when 4+ of the 6 main gates fire together
+
+high_prob = vcp_detected AND bb_width_contracting AND rs21 > prev_rs21
+            (all three required — tightened from vcp OR bb)
 
 WATCH ENTRY  (structural conditions, no score threshold)
 ───────────────────────────────────────────────────────────────────
-Same as before; watch_prox_hi widened 8 → 10 to catch earlier setups.
+Vol Contraction kept in Watch only (via volatility_contracting).
 """
 
 from __future__ import annotations
@@ -141,7 +137,7 @@ class BarResult:
     exec_score:           int   = 0
     exec_score_threshold: int   = 70
     sc_trend:             int   = 0   # 0 or 25
-    sc_compression:       int   = 0   # 0 or 20 (+5 VCP bonus possible)
+    sc_compression:       int   = 0   # 0 or 20 (VCP/NR7/BB only — no VCP bonus)
     sc_proximity:         int   = 0   # 0 or 15
     sc_rs:                int   = 0   # 0 or 15
     sc_momentum:          int   = 0   # 0 or 15
@@ -244,6 +240,30 @@ class IndicatorArrays:
 
     nifty_aligned: pd.Series
 
+    # ── Pre-extracted numpy arrays for O(1) bar access ────────────
+    # compute_bar uses these instead of .iloc[i] to avoid pandas
+    # label-lookup overhead on every bar of the walk-forward loop.
+    _c:    np.ndarray = field(default_factory=lambda: np.array([]))
+    _h:    np.ndarray = field(default_factory=lambda: np.array([]))
+    _l:    np.ndarray = field(default_factory=lambda: np.array([]))
+    _o:    np.ndarray = field(default_factory=lambda: np.array([]))
+    _v:    np.ndarray = field(default_factory=lambda: np.array([]))
+    _e20:  np.ndarray = field(default_factory=lambda: np.array([]))
+    _e50:  np.ndarray = field(default_factory=lambda: np.array([]))
+    _e200: np.ndarray = field(default_factory=lambda: np.array([]))
+    _rsi:  np.ndarray = field(default_factory=lambda: np.array([]))
+    _atr:  np.ndarray = field(default_factory=lambda: np.array([]))
+    _atr5: np.ndarray = field(default_factory=lambda: np.array([]))
+    _atr20:np.ndarray = field(default_factory=lambda: np.array([]))
+    _cci:  np.ndarray = field(default_factory=lambda: np.array([]))
+    _vavg: np.ndarray = field(default_factory=lambda: np.array([]))
+    _bbw:  np.ndarray = field(default_factory=lambda: np.array([]))
+    _bbu:  np.ndarray = field(default_factory=lambda: np.array([]))
+    _bbl:  np.ndarray = field(default_factory=lambda: np.array([]))
+    _nifty:np.ndarray = field(default_factory=lambda: np.array([]))
+    _pvt_ph: np.ndarray = field(default_factory=lambda: np.array([]))
+    _pvt_pl: np.ndarray = field(default_factory=lambda: np.array([]))
+
 
 def build_indicators(
     df:     pd.DataFrame,
@@ -292,6 +312,27 @@ def build_indicators(
         bb_upper=bb_upper, bb_lower=bb_lower, bb_width=bb_width,
         pivot_ph=pivot_ph, pivot_pl=pivot_pl,
         nifty_aligned=nifty_aligned,
+        # Pre-extracted numpy arrays — avoids .iloc[i] overhead in the hot loop
+        _c=c.values.astype(float),
+        _h=h.values.astype(float),
+        _l=l.values.astype(float),
+        _o=o.values.astype(float),
+        _v=v.values.astype(float),
+        _e20=e20.values.astype(float),
+        _e50=e50.values.astype(float),
+        _e200=e200.values.astype(float),
+        _rsi=rsi_s.values.astype(float),
+        _atr=atr_s.values.astype(float),
+        _atr5=atr5_s.values.astype(float),
+        _atr20=atr20_s.values.astype(float),
+        _cci=cci_s.values.astype(float),
+        _vavg=vol_avg.values.astype(float),
+        _bbw=bb_width.values.astype(float),
+        _bbu=bb_upper.values.astype(float),
+        _bbl=bb_lower.values.astype(float),
+        _nifty=nifty_aligned.values.astype(float),
+        _pvt_ph=pivot_ph.values.astype(float),
+        _pvt_pl=pivot_pl.values.astype(float),
     )
 
 
@@ -301,12 +342,12 @@ def build_indicators(
 
 def _get_pivots(ia: IndicatorArrays, i: int):
     from utils.scanner_engine import detect_harmonic, detect_abcd
-    ph_s = ia.pivot_ph
-    pl_s = ia.pivot_pl
+    ph_arr = ia._pvt_ph
+    pl_arr = ia._pvt_pl
     pivots = []
     for j in range(i, max(-1, i - 60), -1):
-        ph_val = float(ph_s.iloc[j])
-        pl_val = float(pl_s.iloc[j])
+        ph_val = ph_arr[j]
+        pl_val = pl_arr[j]
         if not np.isnan(ph_val):
             pivots.append((ph_val, True))
         elif not np.isnan(pl_val):
@@ -317,9 +358,9 @@ def _get_pivots(ia: IndicatorArrays, i: int):
     pv_is_high = [p[1] for p in pivots]
     harm_dir, _ = detect_harmonic(pv_prices, pv_is_high)
     harm_bull   = harm_dir == "bull"
-    cur_c  = float(ia.c.iloc[i])
-    cur_o  = float(ia.o.iloc[i])
-    prev_h = float(ia.h.iloc[i - 1]) if i >= 1 else cur_c
+    cur_c  = ia._c[i]
+    cur_o  = ia._o[i]
+    prev_h = ia._h[i - 1] if i >= 1 else cur_c
     abcd_bull, _ = detect_abcd(pv_prices, pv_is_high, cur_c, cur_o, prev_h)
     return harm_bull, abcd_bull
 
@@ -337,27 +378,29 @@ def compute_bar(
     if i < 0:
         i = len(ia.c) + i
 
+    # ── Use pre-extracted numpy arrays for O(1) access ────────────
+    # Avoids pandas .iloc[i] label-lookup overhead on every bar.
     c = ia.c;   h = ia.h;   l = ia.l
     v = ia.v;   o = ia.o
 
     # ── Scalar extractions ────────────────────────────────────────
-    cur_c    = float(c.iloc[i])
-    cur_e20  = float(ia.e20.iloc[i])
-    cur_e50  = float(ia.e50.iloc[i])
-    cur_e200 = float(ia.e200.iloc[i])
-    cur_r    = float(ia.rsi_s.iloc[i])
-    cur_v    = float(v.iloc[i])
-    cur_atr  = float(ia.atr_s.iloc[i])
-    cur_cci  = float(ia.cci_s.iloc[i])
-    cur_vavg = float(ia.vol_avg.iloc[i])
+    cur_c    = ia._c[i]
+    cur_e20  = ia._e20[i]
+    cur_e50  = ia._e50[i]
+    cur_e200 = ia._e200[i]
+    cur_r    = ia._rsi[i]
+    cur_v    = ia._v[i]
+    cur_atr  = ia._atr[i]
+    cur_cci  = ia._cci[i]
+    cur_vavg = ia._vavg[i]
 
     if any(np.isnan(x) for x in [cur_c, cur_e20, cur_e200, cur_cci, cur_r]):
         return None
 
-    prev_e20   = float(ia.e20.iloc[i - 1])   if i >= 1 else cur_e20
-    prev_e50   = float(ia.e50.iloc[i - 1])   if i >= 1 else cur_e50
-    prev_cci   = float(ia.cci_s.iloc[i - 1]) if i >= 1 else cur_cci
-    prev_close = float(c.iloc[i - 1])         if i >= 1 else cur_c
+    prev_e20   = ia._e20[i - 1]  if i >= 1 else cur_e20
+    prev_e50   = ia._e50[i - 1]  if i >= 1 else cur_e50
+    prev_cci   = ia._cci[i - 1]  if i >= 1 else cur_cci
+    prev_close = ia._c[i - 1]    if i >= 1 else cur_c
 
     # ── TREND ─────────────────────────────────────────────────────
     # Full 3-MA alignment required for Execution (was: e20 > e50 only).
@@ -378,8 +421,8 @@ def compute_bar(
     # ── SWING HI / LO for Fibonacci ───────────────────────────────
     lb3   = params.pvt_lb * 3
     win_s = max(0, i - lb3)
-    sw_hi = float(h.iloc[win_s:i + 1].max())
-    sw_lo = float(l.iloc[win_s:i + 1].min())
+    sw_hi = float(ia._h[win_s:i + 1].max())
+    sw_lo = float(ia._l[win_s:i + 1].min())
     rng   = sw_hi - sw_lo
 
     fib618 = sw_hi - rng * 0.618
@@ -390,34 +433,34 @@ def compute_bar(
     pct_from_swhi = ((sw_hi - cur_c) / sw_hi * 100) if sw_hi > 0 else 999.0
 
     # ── RELATIVE STRENGTH — 55-bar and 21-bar ─────────────────────
+    n_now = ia._nifty[i] if not np.isnan(ia._nifty[i]) else 0.0
+
     rs55 = 0.0
     if i >= 55:
-        c55   = float(c.iloc[i - 55])
-        n_now = float(ia.nifty_aligned.iloc[i])    if not np.isnan(float(ia.nifty_aligned.iloc[i]))    else 0
-        n55   = float(ia.nifty_aligned.iloc[i-55]) if not np.isnan(float(ia.nifty_aligned.iloc[i-55])) else 0
+        c55 = ia._c[i - 55]
+        n55 = ia._nifty[i - 55] if not np.isnan(ia._nifty[i - 55]) else 0.0
         if c55 > 0 and n55 > 0 and n_now > 0:
             rs55 = (cur_c / c55 - 1) * 100 - (n_now / n55 - 1) * 100
 
     rs21 = 0.0
     if i >= 21:
-        c21   = float(c.iloc[i - 21])
-        n_now = float(ia.nifty_aligned.iloc[i])    if not np.isnan(float(ia.nifty_aligned.iloc[i]))    else 0
-        n21   = float(ia.nifty_aligned.iloc[i-21]) if not np.isnan(float(ia.nifty_aligned.iloc[i-21])) else 0
+        c21 = ia._c[i - 21]
+        n21 = ia._nifty[i - 21] if not np.isnan(ia._nifty[i - 21]) else 0.0
         if c21 > 0 and n21 > 0 and n_now > 0:
             rs21 = (cur_c / c21 - 1) * 100 - (n_now / n21 - 1) * 100
 
     prev_rs21 = 0.0
     if i >= 22:
-        c22 = float(c.iloc[i - 22])
-        c1  = float(c.iloc[i - 1])
-        n1  = float(ia.nifty_aligned.iloc[i-1])  if not np.isnan(float(ia.nifty_aligned.iloc[i-1]))  else 0
-        n22 = float(ia.nifty_aligned.iloc[i-22]) if not np.isnan(float(ia.nifty_aligned.iloc[i-22])) else 0
+        c22 = ia._c[i - 22]
+        c1  = ia._c[i - 1]
+        n1  = ia._nifty[i - 1]  if not np.isnan(ia._nifty[i - 1])  else 0.0
+        n22 = ia._nifty[i - 22] if not np.isnan(ia._nifty[i - 22]) else 0.0
         if c22 > 0 and n22 > 0 and n1 > 0:
             prev_rs21 = (c1 / c22 - 1) * 100 - (n1 / n22 - 1) * 100
 
     # ── MOMENTUM 3m / 6m ──────────────────────────────────────────
-    mom3 = (cur_c / float(c.iloc[i - 63])  - 1) * 100 if i >= 63  else 0.0
-    mom6 = (cur_c / float(c.iloc[i - 126]) - 1) * 100 if i >= 126 else 0.0
+    mom3 = (cur_c / ia._c[i - 63]  - 1) * 100 if i >= 63  else 0.0
+    mom6 = (cur_c / ia._c[i - 126] - 1) * 100 if i >= 126 else 0.0
 
     # ── VOLUME RATIO ──────────────────────────────────────────────
     volume_ratio = (cur_v / cur_vavg) if cur_vavg > 0 else 0.0
@@ -426,27 +469,27 @@ def compute_bar(
     distance_ema20 = abs(cur_c - cur_e20) / cur_e20 * 100 if cur_e20 > 0 else 0.0
 
     # ── COMPRESSION / BASE FORMATION ─────────────────────────────
-    atr5_val  = float(ia.atr5_s.iloc[i])  if not np.isnan(float(ia.atr5_s.iloc[i]))  else cur_atr
-    atr20_val = float(ia.atr20_s.iloc[i]) if not np.isnan(float(ia.atr20_s.iloc[i])) else cur_atr
+    atr5_val  = ia._atr5[i]  if not np.isnan(ia._atr5[i])  else cur_atr
+    atr20_val = ia._atr20[i] if not np.isnan(ia._atr20[i]) else cur_atr
     comp_a = atr5_val < atr20_val * params.atr5_atr20_ratio
 
-    range_10d = float(h.iloc[max(0,i-9):i+1].max())  - float(l.iloc[max(0,i-9):i+1].min())  if i >= 9  else cur_atr
-    range_30d = float(h.iloc[max(0,i-29):i+1].max()) - float(l.iloc[max(0,i-29):i+1].min()) if i >= 29 else cur_atr * 2
+    range_10d = float(ia._h[max(0,i-9):i+1].max())  - float(ia._l[max(0,i-9):i+1].min())  if i >= 9  else cur_atr
+    range_30d = float(ia._h[max(0,i-29):i+1].max()) - float(ia._l[max(0,i-29):i+1].min()) if i >= 29 else cur_atr * 2
     comp_b = range_30d > 0 and range_10d < range_30d * params.range10_range30_ratio
 
-    bb_w_now = float(ia.bb_width.iloc[i])           if not np.isnan(float(ia.bb_width.iloc[i])) else 0.0
-    bb_w_avg = float(ia.bb_width.iloc[max(0,i-9):i].mean()) if i >= 9 else bb_w_now
+    bb_w_now = ia._bbw[i] if not np.isnan(ia._bbw[i]) else 0.0
+    bb_w_avg = float(ia._bbw[max(0,i-9):i].mean()) if i >= 9 else bb_w_now
     bb_width_contracting = (bb_w_now < bb_w_avg * 0.90) if bb_w_avg > 0 else False
 
-    bb_up = float(ia.bb_upper.iloc[i])
-    bb_lo = float(ia.bb_lower.iloc[i])
+    bb_up = ia._bbu[i]
+    bb_lo = ia._bbl[i]
     squeeze_on = bb_width_contracting
 
     # ── RECENT BOUNCE FROM EMA20 ──────────────────────────────────
     recent_bounce_ema20 = False
     for k in range(max(1, i - 4), i + 1):
         if k >= 1:
-            if float(c.iloc[k-1]) < float(ia.e20.iloc[k-1]) and float(c.iloc[k]) >= float(ia.e20.iloc[k]):
+            if ia._c[k-1] < ia._e20[k-1] and ia._c[k] >= ia._e20[k]:
                 recent_bounce_ema20 = True
                 break
 
@@ -460,13 +503,13 @@ def compute_bar(
     # ── ROUNDED BOTTOM ────────────────────────────────────────────
     rounded_bottom = False
     if i >= 20:
-        win = c.iloc[max(0, i-19):i+1].values
+        win = ia._c[max(0, i-19):i+1]
         mid_idx = len(win) // 2
         if len(win) >= 10:
             left_avg  = win[:mid_idx].mean()
             trough    = win.min()
             right_avg = win[mid_idx:].mean()
-            right_end = float(win[-1])
+            right_end = win[-1]
             rounded_bottom = (trough < left_avg * 0.97 and
                                right_avg > trough * 1.02 and
                                right_end > right_avg * 0.99)
@@ -474,7 +517,7 @@ def compute_bar(
     # ── TIGHT BASE ────────────────────────────────────────────────
     base_tight = False
     if i >= 14:
-        rng5 = float(c.iloc[i-4:i+1].max()) - float(c.iloc[i-4:i+1].min())
+        rng5 = float(ia._c[i-4:i+1].max()) - float(ia._c[i-4:i+1].min())
         base_tight = rng5 < cur_atr * 1.5
 
     # ── VOLATILITY CONTRACTING ────────────────────────────────────
@@ -483,18 +526,16 @@ def compute_bar(
     # ── NR7: Narrow Range 7 ───────────────────────────────────────
     nr7_detected = False
     if i >= 6:
-        bar_ranges  = (h.iloc[i-6:i+1] - l.iloc[i-6:i+1]).values
-        today_range = float(bar_ranges[-1])
+        bar_ranges  = ia._h[i-6:i+1] - ia._l[i-6:i+1]
+        today_range = bar_ranges[-1]
         nr7_detected = today_range > 0 and today_range < float(np.min(bar_ranges[:-1]))
 
     # ── VCP: Volatility Contraction Pattern ───────────────────────
-    # Highest-quality base signal — now earns a bonus score on top of compression.
-    # Paper: Cup & Handle and VCP are the strongest standalone base patterns.
     vcp_detected = False
     if i >= 20:
-        s3_hi = float(h.iloc[i-3:i+1].max());  s3_lo = float(l.iloc[i-3:i+1].min())
-        s2_hi = float(h.iloc[i-9:i-3].max());  s2_lo = float(l.iloc[i-9:i-3].min())
-        s1_hi = float(h.iloc[i-20:i-9].max()); s1_lo = float(l.iloc[i-20:i-9].min())
+        s3_hi = float(ia._h[i-3:i+1].max());  s3_lo = float(ia._l[i-3:i+1].min())
+        s2_hi = float(ia._h[i-9:i-3].max());  s2_lo = float(ia._l[i-9:i-3].min())
+        s1_hi = float(ia._h[i-20:i-9].max()); s1_lo = float(ia._l[i-20:i-9].min())
         r3 = s3_hi - s3_lo; r2 = s2_hi - s2_lo; r1 = s1_hi - s1_lo
         if r1 > 0 and r2 > 0 and r3 > 0:
             vcp_detected = (r2 < r1 * 0.75 and r3 < r2 * 0.75 and
@@ -503,8 +544,9 @@ def compute_bar(
     # ── VCP + BB-squeeze confluence — highest-probability setup ───
     # Both the VCP structure AND Bollinger Band contraction firing together
     # identifies the tightest possible base just before an expansion move.
-    # This combination reactivates high_prob (was retired when based on fib alone).
-    high_prob = vcp_detected and bb_width_contracting
+    # high_prob: all three must fire — VCP structure, BB contraction, AND RS improving.
+    # Tightened from (vcp OR bb) + rs21 to require all three simultaneously.
+    high_prob = vcp_detected and bb_width_contracting and rs21 > prev_rs21
 
     # ── FibGrade ──────────────────────────────────────────────────
     fib_grade = "POOR"
@@ -538,10 +580,11 @@ def compute_bar(
     # VCP earns an extra +5 on top of the 20-point gate because it is the
     # highest-quality base pattern (multi-stage contraction, price holding midpoint).
     # Paper: Cup & Handle / VCP > triangles / flags > head & shoulders for win rate.
-    gate_compression = comp_a or comp_b or bb_width_contracting or vcp_detected or nr7_detected
-    sc_compression_base = 20 if gate_compression else 0
-    sc_vcp_bonus        = 5  if vcp_detected      else 0
-    sc_compression      = sc_compression_base + sc_vcp_bonus   # max 25
+    # Execution compression gate: only high-quality structures qualify.
+    # Generic ATR/range contraction (comp_a, comp_b) removed — too permissive.
+    # Vol contraction is kept in Watch only (via volatility_contracting below).
+    gate_compression = vcp_detected or nr7_detected or bb_width_contracting
+    sc_compression   = 20 if gate_compression else 0
 
     # 3. Breakout Proximity (15)
     gate_proximity = params.exec_prox_lo < pct_from_swhi <= params.exec_prox_hi
@@ -603,9 +646,7 @@ def compute_bar(
     exec_score = (sc_trend + sc_compression + sc_proximity +
                   sc_rs + sc_momentum + sc_volume +
                   sc_pullback + sc_confluence)
-    # max = 25 + 25(VCP) + 15 + 15 + 15 + 10 + 5 + 5 = 115
-    # practical max without VCP bonus = 110
-    # threshold still 70 — more budget available means more signal quality headroom
+    # max = 25 + 20 + 15 + 15 + 15 + 10 + 5 + 5 = 110
 
     # Guard: block pure momentum chases (no structural base)
     _is_momentum_chase = (sc_compression == 0 and gate_momentum and
