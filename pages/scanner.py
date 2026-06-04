@@ -105,6 +105,16 @@ label[data-testid="stWidgetLabel"] > div { font-size:11px !important; color:#647
 #  CELL HELPERS
 # ══════════════════════════════════════════════════════════════════
 
+def _tv_link(sym: str) -> str:
+    """Return an HTML anchor that opens TradingView chart for the symbol."""
+    url = f"https://www.tradingview.com/chart/?symbol=NSE%3A{sym}"
+    return (
+        f'<a href="{url}" target="_blank" rel="noopener noreferrer" '
+        f'title="Open {sym} on TradingView" '
+        f'style="color:inherit;text-decoration:none;">'
+        f'<span style="font-size:10px;opacity:0.55;margin-left:3px">📈</span></a>'
+    )
+
 def _cell(val, bg, fg="#fff", fs="12px"):
     return (f'<span style="background:{bg};color:{fg};padding:2px 6px;'
             f'border-radius:3px;white-space:nowrap;font-size:{fs}">{val}</span>')
@@ -176,8 +186,12 @@ def _setup_cell(setup: str) -> str:
 #  TABLE RENDERER
 # ══════════════════════════════════════════════════════════════════
 
-_EXEC_HEADERS = ["#","Stock","Score","Gates","Setup","CCI","RSI","Vol×","RS55","Mom3M","% Hi","Entry","SL","T1","T2"]
-_WATCH_HEADERS = ["#","Stock","Conds","Setup","CCI","RSI","RS55","Mom3M","% Hi","Entry","SL","T1"]
+_EXEC_HEADERS = ["#","Stock","Score","Gates","Setup","CCI","RSI","Day%","Vol×","RS55","Mom3M",
+                 '<span title="% below the recent swing high (60-day). Lower = closer to breakout point.">% to Hi ⓘ</span>',
+                 "Entry","SL","T1","T2"]
+_WATCH_HEADERS = ["#","Stock","Conds","Setup","CCI","RSI","Day%","RS55","Mom3M",
+                  '<span title="% below the recent swing high (60-day). Lower = closer to breakout point.">% to Hi ⓘ</span>',
+                  "Entry","SL","T1"]
 
 def _render_exec_table(df: pd.DataFrame, watchlist_syms: set):
     if df.empty:
@@ -192,7 +206,12 @@ def _render_exec_table(df: pd.DataFrame, watchlist_syms: set):
         in_wl = sym in watchlist_syms
 
         wl_star = ' <span style="color:#fbbf24">★</span>' if in_wl else ""
-        sym_html = (f'<b style="color:#f1f5f9">{sym}</b>{wl_star}')
+        sym_html = (
+            f'<a href="https://www.tradingview.com/chart/?symbol=NSE%3A{sym}" '
+            f'target="_blank" rel="noopener noreferrer" '
+            f'style="color:#f1f5f9;text-decoration:none;font-weight:700">{sym}</a>'
+            f'{_tv_link(sym)}{wl_star}'
+        )
 
         rows_html += (
             f"<tr>"
@@ -203,6 +222,8 @@ def _render_exec_table(df: pd.DataFrame, watchlist_syms: set):
             f"<td>{_setup_cell(row.get('Setup',''))}</td>"
             f"<td>{_cci_cell(row.get('CCI', 0))}</td>"
             f"<td style='color:#94a3b8'>{row.get('RSI', 0):.1f}</td>"
+            f"<td style='color:{'#4ade80' if float(row.get('%Chg',0)) > 0 else ('#f87171' if float(row.get('%Chg',0)) < 0 else '#64748b')};font-weight:600'>"
+            f"{float(row.get('%Chg',0)):+.2f}%</td>"
             f"<td style='color:{'#4ade80' if float(row.get('Vol Ratio',0)) >= 1.1 else '#64748b'}'>"
             f"{float(row.get('Vol Ratio',0)):.2f}</td>"
             f"<td style='color:{'#4ade80' if float(row.get('RS55',0)) > 0 else '#f87171'}'>"
@@ -238,15 +259,23 @@ def _render_watch_table(df: pd.DataFrame, watchlist_syms: set):
         score = int(row.get("Score", 0))
         in_wl = sym in watchlist_syms
         wl_star = ' <span style="color:#fbbf24">★</span>' if in_wl else ""
+        sym_linked = (
+            f'<a href="https://www.tradingview.com/chart/?symbol=NSE%3A{sym}" '
+            f'target="_blank" rel="noopener noreferrer" '
+            f'style="color:#f1f5f9;text-decoration:none;font-weight:700">{sym}</a>'
+            f'{_tv_link(sym)}{wl_star}'
+        )
 
         rows_html += (
             f"<tr>"
             f"<td style='color:#475569;font-size:11px'>{rank}</td>"
-            f"<td><b style='color:#f1f5f9'>{sym}</b>{wl_star}</td>"
+            f"<td>{sym_linked}</td>"
             f"<td>{_watch_dots(row)}</td>"
             f"<td>{_setup_cell(row.get('Setup',''))}</td>"
             f"<td>{_cci_cell(row.get('CCI', 0))}</td>"
             f"<td style='color:#94a3b8'>{row.get('RSI', 0):.1f}</td>"
+            f"<td style='color:{'#4ade80' if float(row.get('%Chg',0)) > 0 else ('#f87171' if float(row.get('%Chg',0)) < 0 else '#64748b')};font-weight:600'>"
+            f"{float(row.get('%Chg',0)):+.2f}%</td>"
             f"<td style='color:{'#fbbf24' if float(row.get('RS55',0)) > -2 else '#f87171'}'>"
             f"{float(row.get('RS55',0)):+.1f}</td>"
             f"<td style='color:{'#fbbf24' if float(row.get('Mom3M',0)) > 0 else '#94a3b8'}'>"
