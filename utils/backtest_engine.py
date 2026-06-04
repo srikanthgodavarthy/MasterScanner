@@ -16,9 +16,9 @@ Performance optimisations vs prior version
    ≥ threshold (trend, RSI floor, CCI ceiling).  Reduces compute_bar()
    calls by ~60-70 % on typical data.
 
-3. run_backtest: ProcessPoolExecutor (bypasses GIL) for CPU-bound
-   signal-generation + simulation.  Falls back to threads if spawn is
-   unavailable (Streamlit Cloud).
+3. run_backtest: ThreadPoolExecutor — safe for Streamlit's single-process
+   server. The vectorised simulate_trades already gives most of the speedup;
+   true process parallelism is not needed and crashes Streamlit via spawn.
 
 4. Nifty series cached in st.session_state — fetched once per session,
    not on every button click.
@@ -28,7 +28,6 @@ Performance optimisations vs prior version
    also cached for 6 h.
 """
 
-import os, sys
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
@@ -37,9 +36,8 @@ IST = ZoneInfo("Asia/Kolkata")
 
 import yfinance as yf
 import streamlit as st
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-import multiprocessing
 
 from utils.scanner_engine import _strip_tz, nifty_regime, ema
 from utils.scoring_core   import ScoringParams, build_indicators, compute_bar
@@ -376,25 +374,6 @@ def simulate_trades(
 #  RUNNER
 # ══════════════════════════════════════════════════════════════════
 
-def _process_symbol(args: tuple) -> pd.DataFrame | None:
-    """
-    Top-level function (must be picklable for ProcessPoolExecutor).
-    Unpacks args tuple to avoid closure issues across processes.
-    """
-    sym, df, nifty_values, nifty_index, effective_settings, hold_days, exec_only = args
-    try:
-        nifty = pd.Series(nifty_values, index=nifty_index)
-        sigs  = generate_signals_historical(
-            df, nifty,
-            settings  = effective_settings,
-            exec_only = exec_only,
-        )
-        params = ScoringParams.from_settings(effective_settings)
-        return simulate_trades(sym, df, sigs, hold_days=hold_days, params=params)
-    except Exception:
-        return None
-
-
 def run_backtest(
     symbols:     list,
     settings:    dict | None = None,
@@ -424,76 +403,48 @@ def run_backtest(
 
     all_data = fetch_batch_history(tuple(sorted(symbols)), years=3)
 
-    # ── Step 3: Build per-symbol arg list ─────────────────────────
-    # Pass nifty as raw arrays so it survives pickling across processes
-    nifty_values = nifty.values
-    nifty_index  = nifty.index
-
-    task_args = []
-    for sym in symbols:
-        df = all_data.get(sym)
-        if df is None or df.empty:
-            df = fetch_full_history(sym, years=3)
-        if df is not None and not df.empty:
-            task_args.append((
-                sym, df,
-                nifty_values, nifty_index,
-                effective_settings, hold_days, exec_only,
-            ))
-
-    # ── Step 4: Process in parallel ───────────────────────────────
-    # Use ProcessPoolExecutor for CPU-bound work (bypasses GIL).
-    # Fall back to ThreadPoolExecutor on platforms that can't fork
-    # (e.g. some Streamlit Cloud deployments).
-    total     = len(task_args)
+    # ── Step 3: Signal generation + trade simulation (threads) ────
+    # ThreadPoolExecutor is the correct choice for Streamlit — the process
+    # runs inside Streamlit's single-process server and cannot safely spawn
+    # child processes (st.cache_data, session_state, and the script context
+    # are all unpicklable).  The vectorised simulate_trades already provides
+    # the dominant speedup; threads are sufficient for the I/O-bound fallback
+    # fetches and keep GIL contention low during pandas operations.
+    total     = len(symbols)
     completed = [0]
     c_lock    = threading.Lock()
     all_trades: list[pd.DataFrame] = []
     t_lock    = threading.Lock()
 
-    def _submit_with(executor_cls):
-        with executor_cls(max_workers=workers) as exe:
-            futures = {exe.submit(_process_symbol, a): a[0] for a in task_args}
-            for fut in as_completed(futures):
-                sym = futures[fut]
-                with c_lock:
-                    completed[0] += 1
-                    n = completed[0]
-                    if progress_cb:
-                        progress_cb(0.02 + 0.98 * n / total, sym)
-                try:
-                    result = fut.result()
-                    if result is not None and not result.empty:
-                        with t_lock:
-                            all_trades.append(result)
-                except Exception:
-                    pass
+    def _process(sym: str) -> pd.DataFrame | None:
+        df = all_data.get(sym)
+        if df is None or df.empty:
+            df = fetch_full_history(sym, years=3)
+        if df is None or df.empty:
+            return None
+        sigs = generate_signals_historical(
+            df, nifty,
+            settings  = effective_settings,
+            exec_only = exec_only,
+        )
+        return simulate_trades(sym, df, sigs, hold_days=hold_days, params=sim_params)
 
-    try:
-        # ProcessPoolExecutor requires the entry point to be importable
-        # (i.e. __main__ guard is not needed here since we use a top-level fn).
-        # On Streamlit Cloud the spawn context sometimes fails; catch and retry.
-        mp_ctx = multiprocessing.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=min(workers, os.cpu_count() or 4),
-                                  mp_context=mp_ctx) as exe:
-            futures = {exe.submit(_process_symbol, a): a[0] for a in task_args}
-            for fut in as_completed(futures):
-                sym = futures[fut]
-                with c_lock:
-                    completed[0] += 1
-                    n = completed[0]
-                    if progress_cb:
-                        progress_cb(0.02 + 0.98 * n / total, sym)
-                try:
-                    result = fut.result()
-                    if result is not None and not result.empty:
-                        with t_lock:
-                            all_trades.append(result)
-                except Exception:
-                    pass
-    except Exception:
-        # Fallback: threads (still benefits from vectorised simulate_trades)
-        _submit_with(ThreadPoolExecutor)
+    with ThreadPoolExecutor(max_workers=workers) as exe:
+        futures = {exe.submit(_process, s): s for s in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            with c_lock:
+                completed[0] += 1
+                n = completed[0]
+                if progress_cb:
+                    progress_cb(0.02 + 0.98 * n / total, sym)
+            try:
+                result = fut.result()
+                if result is not None and not result.empty:
+                    with t_lock:
+                        all_trades.append(result)
+            except Exception:
+                pass
 
     return pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
 
