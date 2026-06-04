@@ -54,7 +54,7 @@ class ScoringParams:
     exec_vol_lo:          float = 1.1   # volume_ratio lower bound
     exec_vol_hi:          float = 2.2   # volume_ratio upper bound
     exec_prox_lo:         float = 0.5   # pct_from_swhi lower bound
-    exec_prox_hi:         float = 2.5   # pct_from_swhi upper bound
+    exec_prox_hi:         float = 4.0   # pct_from_swhi upper bound
     exec_cci_max:         float = 180.0 # anti-overextension: cci < this
     exec_rsi_max:         float = 72.0  # anti-overextension: rsi < this
     exec_ema20_dist_max:  float = 5.0   # % distance from ema20 (anti-overext)
@@ -62,7 +62,7 @@ class ScoringParams:
     # Watch thresholds
     watch_rsi_min:        float = 48.0  # rsi > this for momentum improving
     watch_prox_lo:        float = 2.0   # pct_from_swhi lower bound
-    watch_prox_hi:        float = 6.0   # pct_from_swhi upper bound (inclusive)
+    watch_prox_hi:        float = 8.0   # pct_from_swhi upper bound (inclusive)
     watch_rs55_min:       float = -2.0  # rs55 > this (avoid weak stocks)
 
     # ATR contraction
@@ -93,13 +93,13 @@ class ScoringParams:
             exec_vol_lo           = float(s.get("exec_vol_lo",           1.1)),
             exec_vol_hi           = float(s.get("exec_vol_hi",           2.2)),
             exec_prox_lo          = float(s.get("exec_prox_lo",          0.5)),
-            exec_prox_hi          = float(s.get("exec_prox_hi",          2.5)),
+            exec_prox_hi          = float(s.get("exec_prox_hi",           4.0)),
             exec_cci_max          = float(s.get("exec_cci_max",         180.0)),
             exec_rsi_max          = float(s.get("exec_rsi_max",          72.0)),
             exec_ema20_dist_max   = float(s.get("exec_ema20_dist_max",   5.0)),
             watch_rsi_min         = float(s.get("watch_rsi_min",         48.0)),
             watch_prox_lo         = float(s.get("watch_prox_lo",          2.0)),
-            watch_prox_hi         = float(s.get("watch_prox_hi",          6.0)),
+            watch_prox_hi         = float(s.get("watch_prox_hi",          8.0)),
             watch_rs55_min        = float(s.get("watch_rs55_min",        -2.0)),
             atr5_atr20_ratio      = float(s.get("atr5_atr20_ratio",      0.90)),
             range10_range30_ratio = float(s.get("range10_range30_ratio", 0.75)),
@@ -477,10 +477,10 @@ def compute_bar(
     gate_trend_quality = (cur_c > cur_e200 and ema20_rising and ema50_rising)
     sc_trend = 25 if gate_trend_quality else 0
 
-    # 2. Compression / Base Formation (20)
-    sc_compression = 20 if gate_compression else 0
+    # 2. Compression / Base Formation (15)
+    sc_compression = 15 if gate_compression else 0
 
-    # 3. Breakout Proximity (15): 0.5 < pct_from_swhi <= 2.5
+    # 3. Breakout Proximity (15): 0.5 < pct_from_swhi <= 4.0
     gate_proximity = params.exec_prox_lo < pct_from_swhi <= params.exec_prox_hi
     sc_proximity   = 15 if gate_proximity else 0
 
@@ -488,11 +488,17 @@ def compute_bar(
     gate_rs = rs55 > 0 and rs21 > prev_rs21
     sc_rs   = 15 if gate_rs else 0
 
-    # 5. Momentum (10): rsi > 52 AND mom3m > 5 AND cci_cross_up_os
+    # 5. Momentum (15): rsi > 52 AND mom3m > 5
+    #    CCI condition relaxed: accept cci_cross_up_os OR (cci > -50 and cci_rising) OR cci > 0
+    cci_momentum_ok = (
+        cci_cross_up_os or
+        (cur_cci > -50 and cci_rising) or
+        cur_cci > 0
+    )
     gate_momentum = (cur_r > params.exec_rsi_min and
                      mom3 > params.exec_mom3_min and
-                     cci_cross_up_os)
-    sc_momentum   = 10 if gate_momentum else 0
+                     cci_momentum_ok)
+    sc_momentum   = 15 if gate_momentum else 0
 
     # 6. Volume Quality (10): 1.1 <= volume_ratio <= 2.2
     gate_volume = params.exec_vol_lo <= volume_ratio <= params.exec_vol_hi
@@ -508,6 +514,7 @@ def compute_bar(
                          distance_ema20 < params.exec_ema20_dist_max)
 
     exec_score = sc_trend + sc_compression + sc_proximity + sc_rs + sc_momentum + sc_volume + sc_pullback
+    # max possible = 25+15+15+15+15+10+5 = 100
 
     # EXECUTION qualifies if score >= threshold AND anti-overext passes AND trend_up
     is_execution = (exec_score >= params.exec_score_threshold and
