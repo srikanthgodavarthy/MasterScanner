@@ -1,18 +1,23 @@
-"""utils/backtest_engine.py — Walk-forward backtest engine."""
+"""utils/backtest_engine.py — Walk-forward backtest engine (two-tier arch).
+
+Signal tiers map directly from scoring_core.BarResult:
+  Execution  ←  r.tier == "Execution"  (score ≥ threshold, anti-overext gate)
+  Watch      ←  r.tier == "Watch"      (structural conditions)
+"""
 
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-
 IST = ZoneInfo("Asia/Kolkata")
+
 import yfinance as yf
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 from utils.scanner_engine import _strip_tz, nifty_regime, ema
-from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
+from utils.scoring_core   import ScoringParams, build_indicators, compute_bar
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -22,10 +27,10 @@ from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicator
 @st.cache_data(ttl=21600, show_spinner=False)
 def fetch_full_history(symbol: str, years: int = 3) -> pd.DataFrame:
     try:
-        end    = datetime.now(timezone.utc) + timedelta(days=1)
-        start  = end - timedelta(days=years * 365 + 5)
-        df     = yf.Ticker(f"{symbol}.NS").history(
-                     start=start, end=end, interval="1d", auto_adjust=True)
+        end   = datetime.now(timezone.utc) + timedelta(days=1)
+        start = end - timedelta(days=years * 365 + 5)
+        df    = yf.Ticker(f"{symbol}.NS").history(
+                    start=start, end=end, interval="1d", auto_adjust=True)
         if df.empty:
             return pd.DataFrame()
         df.index   = _strip_tz(pd.to_datetime(df.index))
@@ -40,72 +45,52 @@ def fetch_full_history(symbol: str, years: int = 3) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════════
 
 def generate_signals_historical(
-    df:         pd.DataFrame,
-    nifty:      pd.Series,
-    settings:   dict | None = None,
-    # legacy kwargs
-    cci_len:    int   = 20,
-    cci_ob:     int   = 100,
-    cci_os:     int   = -100,
-    min_score:  int   = 70,
-    tier1_only: bool  = False,
+    df:            pd.DataFrame,
+    nifty:         pd.Series,
+    settings:      dict | None = None,
+    exec_only:     bool = False,   # True → skip Watch signals
 ) -> pd.DataFrame:
     """
     Walk-forward signal scan over full history.
-    Uses compute_bar() — identical to the live scanner's score_stock().
-    No scoring logic lives here; this is pure loop + filter.
+    Uses compute_bar() — identical to the live scanner.
+    No scoring logic lives here; pure loop + filter.
     """
     if df.empty or len(df) < 210:
         return pd.DataFrame()
 
-    if settings:
-        params    = ScoringParams.from_settings(settings)
-        min_score = settings.get("min_score", min_score)
-    else:
-        params = ScoringParams(cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os)
+    params    = ScoringParams.from_settings(settings) if settings else ScoringParams()
+    ia        = build_indicators(df, nifty, params)
+    signals   = []
 
-    ia      = build_indicators(df, nifty, params)
-    signals = []
-
-    # Fast pre-filter: skip bars where trend_up is impossible
-    # (close < EMA200 means the stock is already in downtrend).
-    # This eliminates ~40-60% of bars before the heavy compute_bar call.
     e200_arr = ia.e200.values
     c_arr    = ia.c.values
     e20_arr  = ia.e20.values
-    e50_arr  = ia.e50.values
 
     for i in range(210, len(df)):
-        # trend_up = close > EMA200 AND EMA20 > EMA50
-        if c_arr[i] <= e200_arr[i] or e20_arr[i] <= e50_arr[i]:
+        # Fast pre-filter: skip confirmed downtrends
+        if c_arr[i] < e200_arr[i] * 0.97:
             continue
         r = compute_bar(ia, i, params)
-        if r is None:
+        if r is None or r.tier == "Other":
             continue
-
-        # Signal acceptance filter
-        if tier1_only and not r.tier1_prime:
+        if exec_only and r.tier != "Execution":
             continue
-        if not r.tier1_prime and not r.tier2_momentum:
-            allow_cloud_buy = r.above_cloud or (r.inside_cloud and r.norm_score >= 65)
-            if r.norm_score < min_score or not allow_cloud_buy:
-                continue
 
         signals.append({
-            "date":            df.index[i],
-            "score":           r.norm_score,
-            "entry":           r.entry,
-            "sl":              r.sl,
-            "t1":              r.t1,
-            "t2":              r.t2,
-            "t3":              r.t3,
-            "cci":             round(r.cur_cci),
-            "rsi":             round(r.cur_rsi, 1),
-            "tier1_prime":     r.tier1_prime,
-            "tier2_momentum":  r.tier2_momentum,
-            "squeeze_release": r.squeeze_release,
-            "setup":           r.setup,
-            "buy_type":        r.buy_type,
+            "date":       df.index[i],
+            "score":      r.exec_score,
+            "entry":      r.entry,
+            "sl":         r.sl,
+            "t1":         r.t1,
+            "t2":         r.t2,
+            "t3":         r.t3,
+            "cci":        round(r.cur_cci),
+            "rsi":        round(r.cur_rsi, 1),
+            "tier":       r.tier,              # "Execution" | "Watch"
+            "setup":      r.setup,
+            "high_prob":  r.high_prob,
+            "rs55":       r.rs55,
+            "mom3":       r.mom3,
         })
 
     return pd.DataFrame(signals)
@@ -120,27 +105,23 @@ def simulate_trades(
     df_full:   pd.DataFrame,
     signals:   pd.DataFrame,
     hold_days: int = 20,
-    params=None,   # ScoringParams — carries sl_max_risk_pct, time_stop_*, sl_cooldown_days
+    params:    ScoringParams | None = None,
 ) -> pd.DataFrame:
     if signals.empty or df_full.empty:
         return pd.DataFrame()
 
-    from utils.scoring_core import ScoringParams
     if params is None:
         params = ScoringParams()
 
     trades        = []
-    blocked_until = pd.Timestamp.min   # per-symbol general block (existing logic)
-    sl_hit_until  = pd.Timestamp.min   # per-symbol cooldown after SL hit (new)
+    blocked_until = pd.Timestamp.min
+    sl_hit_until  = pd.Timestamp.min
 
     for _, sig in signals.iterrows():
         entry_signal_date = sig["date"]
 
         if entry_signal_date <= blocked_until:
             continue
-
-        # ── SL cooldown gate (new) ────────────────────────────────
-        # After a SL hit on this symbol, skip all signals for sl_cooldown_days.
         if params.sl_cooldown_days > 0 and entry_signal_date <= sl_hit_until:
             continue
 
@@ -154,14 +135,12 @@ def simulate_trades(
         t1  = float(sig["t1"])
         t2  = float(sig["t2"])
 
-        # Gap-down SL on entry bar
+        # Gap-down at open
         if entry_price <= sl:
             blocked_until = entry_bar
             continue
 
-        # ── SL distance cap (new) ─────────────────────────────────
-        # Reject trades where ATR-based SL is too wide.
-        # 4-6% risk bucket: 64% T1 hit rate. Above 6.5%: ~38%.
+        # SL distance cap
         risk_pct_actual = (entry_price - sl) / entry_price
         if params.sl_max_risk_pct < 1.0 and risk_pct_actual > params.sl_max_risk_pct:
             continue
@@ -181,7 +160,6 @@ def simulate_trades(
             t1_hit = bar_high >= t1
 
             if sl_hit and (t2_hit or t1_hit):
-                # Intraday conflict: whichever is closer to open was hit first
                 target      = t2 if t2_hit else t1
                 exit_price  = target if abs(bar_open - target) < abs(bar_open - sl) else sl
                 exit_reason = (("T2 HIT" if t2_hit else "T1 HIT") if exit_price == target
@@ -198,10 +176,7 @@ def simulate_trades(
                 exit_price, exit_date, exit_reason = t1, dt, "T1 HIT"
                 break
 
-            # ── Time-based exit / slow-bleed prevention (new) ────
-            # If after time_stop_days the position hasn't moved at least
-            # time_stop_min_pct above entry, exit at today's close.
-            # Eliminates 56% of SL hits that were slow bleeds held 10-19 days.
+            # Time-stop / slow-bleed prevention
             if (params.time_stop_days > 0
                     and bar_idx >= params.time_stop_days
                     and exit_reason == "TIMEOUT"):
@@ -214,30 +189,29 @@ def simulate_trades(
 
         pnl_pct = round((exit_price - entry_price) / entry_price * 100, 2)
 
-        # Track SL cooldown: block this symbol after a SL hit
         if exit_reason == "SL HIT" and params.sl_cooldown_days > 0:
             sl_hit_until = exit_date + pd.Timedelta(days=params.sl_cooldown_days)
 
         trades.append({
-            "symbol":          symbol,
-            "entry_date":      entry_bar.date(),
-            "entry_price":     round(entry_price, 2),
-            "exit_date":       exit_date.date() if hasattr(exit_date, "date") else exit_date,
-            "exit_price":      round(exit_price, 2),
-            "exit_reason":     exit_reason,
-            "pnl_pct":         pnl_pct,
-            "pnl_abs":         round(exit_price - entry_price, 2),
-            "score_at_entry":  sig["score"],
-            "cci_at_entry":    sig["cci"],
-            "sl":              sig["sl"],
-            "t1":              sig["t1"],
-            "t2":              sig["t2"],
-            "risk_pct":        round(risk_pct_actual * 100, 2),
-            "setup":           sig.get("setup", "-"),
-            "buy_type":        sig.get("buy_type", "-"),
-            "tier1_prime":     bool(sig.get("tier1_prime",    False)),
-            "tier2_momentum":  bool(sig.get("tier2_momentum", False)),
-            "squeeze_release": bool(sig.get("squeeze_release", False)),
+            "symbol":         symbol,
+            "entry_date":     entry_bar.date(),
+            "entry_price":    round(entry_price, 2),
+            "exit_date":      exit_date.date() if hasattr(exit_date, "date") else exit_date,
+            "exit_price":     round(exit_price, 2),
+            "exit_reason":    exit_reason,
+            "pnl_pct":        pnl_pct,
+            "pnl_abs":        round(exit_price - entry_price, 2),
+            "score_at_entry": sig["score"],
+            "cci_at_entry":   sig["cci"],
+            "sl":             sig["sl"],
+            "t1":             sig["t1"],
+            "t2":             sig["t2"],
+            "risk_pct":       round(risk_pct_actual * 100, 2),
+            "tier":           sig.get("tier", "Execution"),
+            "setup":          sig.get("setup", "-"),
+            "high_prob":      bool(sig.get("high_prob", False)),
+            "rs55":           sig.get("rs55", 0.0),
+            "mom3":           sig.get("mom3", 0.0),
         })
 
         blocked_until = exit_date
@@ -252,19 +226,15 @@ def simulate_trades(
 def run_backtest(
     symbols:     list,
     settings:    dict | None = None,
-    cci_len:     int  = 20,
-    cci_ob:      int  = 100,
-    cci_os:      int  = -100,
-    min_score:   int  = 70,
     hold_days:   int  = 20,
     workers:     int  = 10,
-    tier1_only:  bool = False,
+    exec_only:   bool = False,
     progress_cb       = None,
 ) -> pd.DataFrame:
+
     if settings:
-        hold_days  = settings.get("hold_days",  hold_days)
-        workers    = settings.get("workers",    workers)
-        min_score  = settings.get("min_score",  min_score)
+        hold_days = settings.get("hold_days",  hold_days)
+        workers   = settings.get("workers",    workers)
 
     # Fetch Nifty once for the full 3-year window
     try:
@@ -276,21 +246,17 @@ def run_backtest(
     except Exception:
         nifty = pd.Series(dtype=float)
 
-    # Compute Nifty regime once and inject into settings so every
-    # generate_signals_historical() call uses the same consistent value.
-    regime_val      = nifty_regime(nifty)
+    regime_val         = nifty_regime(nifty)
     effective_settings = dict(settings) if settings else {}
     effective_settings["nifty_regime_val"] = regime_val
 
-    # Build ScoringParams once — carries all new gates (SL cap, time-stop,
-    # cooldown, high-score CCI gate) into simulate_trades for every symbol.
-    sim_params = ScoringParams.from_settings(effective_settings) if effective_settings else ScoringParams()
+    sim_params = ScoringParams.from_settings(effective_settings)
 
-    total       = len(symbols)
-    completed   = [0]
-    c_lock      = threading.Lock()
-    all_trades  = []
-    t_lock      = threading.Lock()
+    total      = len(symbols)
+    completed  = [0]
+    c_lock     = threading.Lock()
+    all_trades = []
+    t_lock     = threading.Lock()
 
     def _process(sym):
         df = fetch_full_history(sym, years=3)
@@ -298,12 +264,8 @@ def run_backtest(
             return None
         sigs = generate_signals_historical(
             df, nifty,
-            settings   = effective_settings,
-            cci_len    = cci_len,
-            cci_ob     = cci_ob,
-            cci_os     = cci_os,
-            min_score  = min_score,
-            tier1_only = tier1_only,
+            settings  = effective_settings,
+            exec_only = exec_only,
         )
         return simulate_trades(sym, df, sigs, hold_days=hold_days, params=sim_params)
 
@@ -350,8 +312,8 @@ def compute_stats(trades: pd.DataFrame) -> dict:
         (win_rate / 100 * avg_win) - ((100 - win_rate) / 100 * abs(avg_loss)), 2
     )
 
-    def _slice(col):
-        mask = trades.get(col, pd.Series(False, index=trades.index)).astype(bool)
+    def _slice(col, val):
+        mask = trades.get(col, pd.Series([None]*total)) == val
         sub  = trades[mask]
         if sub.empty:
             return {"trades": 0, "win_rate": 0, "avg_pnl": 0}
@@ -373,24 +335,32 @@ def compute_stats(trades: pd.DataFrame) -> dict:
                 "avg_pnl":  round(grp["pnl_pct"].mean(), 2),
             }
 
+    # Per-tier breakdown (Execution vs Watch)
+    tier_stats = {
+        "Execution": _slice("tier", "Execution"),
+        "Watch":     _slice("tier", "Watch"),
+    }
+
+    hi_prob_trades = int(trades.get("high_prob", pd.Series([False]*total)).sum())
+    hi_prob_stats  = _slice("high_prob", True) if hi_prob_trades else {"trades": 0, "win_rate": 0, "avg_pnl": 0}
+
     return {
-        "total_trades":       total,
-        "win_rate":           win_rate,
-        "avg_win":            avg_win,
-        "avg_loss":           avg_loss,
-        "avg_pnl":            round(trades["pnl_pct"].mean(), 2),
-        "total_pnl":          round(trades["pnl_pct"].sum(),  2),
-        "risk_reward":        rr,
-        "expectancy":         expectancy,
-        "profit_factor":      pf,
-        "best_trade":         round(trades["pnl_pct"].max(), 2),
-        "worst_trade":        round(trades["pnl_pct"].min(), 2),
-        "exit_breakdown":     trades["exit_reason"].value_counts().to_dict(),
-        "t1_prime_trades":    int(trades.get("tier1_prime",    pd.Series([False]*total)).sum()),
-        "t2_momentum_trades": int(trades.get("tier2_momentum", pd.Series([False]*total)).sum()),
-        "squeeze_trades":     int(trades.get("squeeze_release",pd.Series([False]*total)).sum()),
-        "t1_prime_stats":     _slice("tier1_prime"),
-        "t2_momentum_stats":  _slice("tier2_momentum"),
-        "squeeze_stats":      _slice("squeeze_release"),
-        "setup_stats":        setup_stats,
+        "total_trades":    total,
+        "win_rate":        win_rate,
+        "avg_win":         avg_win,
+        "avg_loss":        avg_loss,
+        "avg_pnl":         round(trades["pnl_pct"].mean(), 2),
+        "total_pnl":       round(trades["pnl_pct"].sum(),  2),
+        "risk_reward":     rr,
+        "expectancy":      expectancy,
+        "profit_factor":   pf,
+        "best_trade":      round(trades["pnl_pct"].max(), 2),
+        "worst_trade":     round(trades["pnl_pct"].min(), 2),
+        "exit_breakdown":  trades["exit_reason"].value_counts().to_dict(),
+        # Two-tier breakdowns
+        "exec_stats":      tier_stats["Execution"],
+        "watch_stats":     tier_stats["Watch"],
+        "hi_prob_trades":  hi_prob_trades,
+        "hi_prob_stats":   hi_prob_stats,
+        "setup_stats":     setup_stats,
     }
