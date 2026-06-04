@@ -2,18 +2,20 @@
 
 EXECUTION ENTRY  (score >= 70 required, hard gates must all pass)
 ───────────────────────────────────────────────────────────────────
-Component                  Weight  Gate
-─────────────────────────────────────────
-Trend Quality              25      close > EMA200 AND EMA20 > EMA20_prev AND EMA50 > EMA50_prev
-Compression / Base         20      atr_5 < atr_20*0.9 OR range_10d < range_30d*0.75 OR bb_width_contracting
-Breakout Proximity         15      0.5 < pct_from_swhi <= 2.5
-Relative Strength          15      rs55 > 0 AND rs21 > rs21_prev
-Momentum                   10      rsi > 52 AND mom3m > 5 AND cci_cross_up_os
-Volume Quality             10      1.1 <= volume_ratio <= 2.2
-Pullback Quality (bonus)    5      in_golden OR recent_bounce_from_ema20
-Anti-Overextension Filter  hard    cci < 180 AND rsi < 72 AND distance_from_ema20 < 5%
-─────────────────────────────────────────
+Component                        Weight  Gate
+─────────────────────────────────────────────────────────────────
+Trend Quality                    25      close > EMA200 AND EMA20 > EMA20_prev AND EMA50 > EMA50_prev
+Structure (VCP/ABCD/RndBot/NR7)  20      atr_5 < atr_20*0.9 OR range_10d < range_30d*0.75
+                                         OR bb_width_contracting OR vcp_detected OR nr7_detected
+Relative Strength                15      rs55 > 0 AND rs21 > rs21_prev
+Breakout Readiness               15      0.5 < pct_from_swhi <= 2.5
+Momentum                         10      rsi > 52 AND mom3m > 5 AND cci_momentum_ok
+Volume Quality                   10      1.1 <= volume_ratio <= 2.2
+Pullback Quality (bonus)          5      in_golden OR recent_bounce_from_ema20
+Anti-Overextension Filter        hard    cci < 180 AND rsi < 72 AND distance_from_ema20 < 5%
+─────────────────────────────────────────────────────────────────
 Max raw = 100  →  EXECUTION if >= 70
+FibGrade: EXCELLENT / GOOD / FAIR / POOR  (bonus metadata, not in score)
 
 WATCH ENTRY  (structural conditions, no score threshold)
 ───────────────────────────────────────────────────────────────────
@@ -128,7 +130,7 @@ class BarResult:
     exec_score:           int   = 0
     exec_score_threshold: int   = 70
     sc_trend:             int   = 0   # 0 or 25
-    sc_compression:       int   = 0   # 0 or 20
+    sc_compression:       int   = 0   # 0 or 20  (Structure: VCP/ABCD/RndBot/NR7)
     sc_proximity:         int   = 0   # 0 or 15
     sc_rs:                int   = 0   # 0 or 15
     sc_momentum:          int   = 0   # 0 or 10
@@ -189,6 +191,9 @@ class BarResult:
     squeeze_on:          bool = False
     bb_width_contracting: bool = False
     recent_bounce_ema20: bool = False
+    nr7_detected:        bool = False   # Narrow Range 7 — tightest range of last 7 bars
+    vcp_detected:        bool = False   # Volatility Contraction Pattern (3-stage squeeze)
+    fib_grade:           str  = "POOR"  # EXCELLENT | GOOD | FAIR | POOR
 
     # Legacy / display
     nifty_regime_val: str  = "neutral"
@@ -421,7 +426,7 @@ def compute_bar(
     bb_w_avg = float(ia.bb_width.iloc[max(0,i-9):i].mean()) if i >= 9 else bb_w_now
     bb_width_contracting = (bb_w_now < bb_w_avg * 0.90) if bb_w_avg > 0 else False
 
-    gate_compression = comp_a or comp_b or bb_width_contracting
+    # gate_compression is computed later in the scoring section (after NR7/VCP are known)
 
     # ── SQUEEZE (BB inside KC) — for structure type detection ─────
     bb_up = float(ia.bb_upper.iloc[i])
@@ -469,6 +474,49 @@ def compute_bar(
     # ── VOLATILITY CONTRACTING ────────────────────────────────────
     volatility_contracting = comp_a or bb_width_contracting
 
+    # ── NR7: Narrow Range 7 ───────────────────────────────────────
+    # Today's bar range (High-Low) is the narrowest of the last 7 bars
+    nr7_detected = False
+    if i >= 6:
+        bar_ranges  = (h.iloc[i-6:i+1] - l.iloc[i-6:i+1]).values
+        today_range = float(bar_ranges[-1])
+        nr7_detected = today_range == float(bar_ranges.min()) and today_range > 0
+
+    # ── VCP: Volatility Contraction Pattern ───────────────────────
+    # 3-stage contraction: each stage's range is < 75% of the prior stage.
+    # Stage lengths: 10d / 7d / 4d (most recent).  Checks price range only.
+    vcp_detected = False
+    if i >= 20:
+        s3_hi = float(h.iloc[i-3:i+1].max()); s3_lo = float(l.iloc[i-3:i+1].min())
+        s2_hi = float(h.iloc[i-9:i-3].max()); s2_lo = float(l.iloc[i-9:i-3].min())
+        s1_hi = float(h.iloc[i-20:i-9].max()); s1_lo = float(l.iloc[i-20:i-9].min())
+        r3 = s3_hi - s3_lo; r2 = s2_hi - s2_lo; r1 = s1_hi - s1_lo
+        if r1 > 0 and r2 > 0 and r3 > 0:
+            vcp_detected = (r2 < r1 * 0.75 and r3 < r2 * 0.75 and
+                            # price above midpoint of stage 1 — base is holding up
+                            cur_c > (s1_lo + s1_hi) / 2)
+
+    # ── FibGrade: quality of current Fib position ─────────────────
+    # EXCELLENT: in golden zone (61.8–50%)
+    # GOOD:      within 38.2–23.6% retracement (prior support zone)
+    # FAIR:      between 50% and 23.6% but not golden
+    # POOR:      extended above SwHi or deep below 78.6%
+    fib_grade = "POOR"
+    if fib618 > 0 and fib500 > 0 and sw_hi > sw_lo:
+        fib382 = sw_hi - (sw_hi - sw_lo) * 0.382
+        fib236 = sw_hi - (sw_hi - sw_lo) * 0.236
+        fib786 = sw_hi - (sw_hi - sw_lo) * 0.786
+        if in_golden:
+            fib_grade = "EXCELLENT"
+        elif cur_c >= fib382 and cur_c <= fib236:
+            fib_grade = "GOOD"
+        elif cur_c >= fib618 and cur_c <= sw_hi:
+            fib_grade = "FAIR"
+        elif cur_c >= fib786 and cur_c < fib618:
+            fib_grade = "FAIR"
+        else:
+            fib_grade = "POOR"
+
     # ══════════════════════════════════════════════════════════════
     #  EXECUTION SCORING
     # ══════════════════════════════════════════════════════════════
@@ -477,8 +525,9 @@ def compute_bar(
     gate_trend_quality = (cur_c > cur_e200 and ema20_rising and ema50_rising)
     sc_trend = 25 if gate_trend_quality else 0
 
-    # 2. Compression / Base Formation (15)
-    sc_compression = 15 if gate_compression else 0
+    # 2. Structure / Base Formation (20): includes VCP, NR7, ABCD, Rounded Bottom
+    gate_compression = comp_a or comp_b or bb_width_contracting or vcp_detected or nr7_detected
+    sc_compression = 20 if gate_compression else 0
 
     # 3. Breakout Proximity (15): 0.5 < pct_from_swhi <= 4.0
     gate_proximity = params.exec_prox_lo < pct_from_swhi <= params.exec_prox_hi
@@ -514,7 +563,7 @@ def compute_bar(
                          distance_ema20 < params.exec_ema20_dist_max)
 
     exec_score = sc_trend + sc_compression + sc_proximity + sc_rs + sc_momentum + sc_volume + sc_pullback
-    # max possible = 25+15+15+15+15+10+5 = 100
+    # max possible = 25+20+15+15+10+10+5 = 100
 
     # EXECUTION qualifies if score >= threshold AND anti-overext passes AND trend_up
     is_execution = (exec_score >= params.exec_score_threshold and
@@ -664,6 +713,9 @@ def compute_bar(
         squeeze_on          = squeeze_on,
         bb_width_contracting = bb_width_contracting,
         recent_bounce_ema20 = recent_bounce_ema20,
+        nr7_detected        = nr7_detected,
+        vcp_detected        = vcp_detected,
+        fib_grade           = fib_grade,
         nifty_regime_val    = params.nifty_regime_val,
         hard_stop           = hard_stop,
         high_prob           = high_prob,

@@ -399,6 +399,10 @@ def _result_to_dict(r) -> dict:
         "_hard_stop":     r.hard_stop,
         "_is_exec":       r.tier == "Execution",
         "_is_watch":      r.tier == "Watch",
+        # ── Pattern flags ─────────────────────────────────────────
+        "NR7":            r.nr7_detected,
+        "VCP":            r.vcp_detected,
+        "FibGrade":       r.fib_grade,
         # ── Raw values ────────────────────────────────────────────
         "_rsi":           r.cur_rsi,
         "_cci_raw":       r.cur_cci,
