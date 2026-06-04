@@ -64,7 +64,26 @@ def render(settings=None):
             key="bt_universe",
         )
         st.divider()
-        bt_hold_days = st.slider("Max Hold Days", 5, 60, 20, step=5, key="bt_hold_days")
+
+        # Hold days: sidebar slider stays as a quick override; seeds from settings default
+        _settings_hold = int(settings.get("hold_days", 20)) if settings else 20
+        bt_hold_days = st.slider(
+            "Max Hold Days",
+            5, 60, _settings_hold, step=5, key="bt_hold_days",
+            help="Override the value from Settings → Backtest tab.",
+        )
+
+        # Time-stop params: read from settings (Settings → Backtest tab)
+        _ts_days = int(settings.get("time_stop_days",    20)) if settings else 20
+        _ts_pct  = float(settings.get("time_stop_min_pct", 1.0)) if settings else 1.0
+        _sl_cd   = int(settings.get("sl_cooldown_days",   5)) if settings else 5
+        st.caption(
+            f"Time-stop: after {_ts_days}d if PnL < {_ts_pct:.2f}%  "
+            f"· SL cooldown: {_sl_cd}d  "
+            f"_(edit in Settings → Backtest)_"
+        )
+
+        st.divider()
         bt_exec_only = st.toggle("🔥 Execution signals only", value=False, key="bt_exec_only",
                                  help="Skip Watch-tier signals — backtest Execution entries only")
         bt_save_db   = st.checkbox("💾 Save to Supabase", True, key="bt_save_db")
@@ -111,7 +130,12 @@ def render(settings=None):
             sym_box.caption(f"Current: {sym}")
 
         bt_settings = dict(settings) if settings else {}
-        bt_settings["hold_days"] = bt_hold_days
+        bt_settings["hold_days"]         = bt_hold_days
+        # Ensure time-stop params from Settings → Backtest tab are passed through;
+        # they may already be in bt_settings via settings dict, but be explicit.
+        bt_settings.setdefault("time_stop_days",    int(settings.get("time_stop_days",    20)) if settings else 20)
+        bt_settings.setdefault("time_stop_min_pct", float(settings.get("time_stop_min_pct", 1.0)) if settings else 1.0)
+        bt_settings.setdefault("sl_cooldown_days",  int(settings.get("sl_cooldown_days",   5)) if settings else 5)
 
         trades_df = run_backtest(
             bt_universe,

@@ -28,18 +28,21 @@ DEFAULTS = {
     # Execution thresholds
     "exec_score_threshold":  70,
     "exec_rsi_min":          52.0,
-    "exec_mom3_min":         5.0,
+    "exec_mom3_min":         7.0,
     "exec_vol_lo":           1.1,
-    "exec_vol_hi":           2.2,
+    "exec_vol_hi":           2.0,
     "exec_prox_lo":          0.5,
     "exec_prox_hi":          4.0,
     "exec_cci_max":          180.0,
     "exec_rsi_max":          72.0,
     "exec_ema20_dist_max":   5.0,
+    # RS caps
+    "exec_rs55_min":         0.0,
+    "exec_rs55_max":         20.0,   # configurable; tighten to 15 for stricter filter
     # Watch thresholds
     "watch_rsi_min":         48.0,
     "watch_prox_lo":         2.0,
-    "watch_prox_hi":         8.0,
+    "watch_prox_hi":         10.0,
     "watch_rs55_min":        -2.0,
     # Compression
     "atr5_atr20_ratio":      0.90,
@@ -48,6 +51,11 @@ DEFAULTS = {
     "pvt_lb":                20,
     "atr_prox":              0.3,
     "sl_max_risk_pct":       0.065,
+    "sl_cooldown_days":      5,
+    # Backtest / time-stop
+    "hold_days":             20,
+    "time_stop_days":        20,     # bars before time-stop check activates
+    "time_stop_min_pct":     1.0,    # exit if PnL < 1% after time_stop_days bars
     # Nifty regime
     "nifty_regime_filter":   False,
 }
@@ -156,7 +164,7 @@ def _watch_preview(ss: dict) -> str:
         f'  1. Trend Developing   close > EMA200 <span class="ok">AND</span> EMA20 rising',
         f'  2. Early Structure    rounded_bottom <span class="ok">OR</span> abcd_detected <span class="ok">OR</span> base_tight <span class="ok">OR</span> vol_contracting',
         f'  3. Momentum Improving RSI &gt; <b>{ss.get("watch_rsi_min",48)}</b> <span class="ok">AND</span> CCI rising',
-        f'  4. Not Yet Expanded   pct_from_swhi in [<b>{ss.get("watch_prox_lo",2)}</b>, <b>{ss.get("watch_prox_hi",8)}</b>]',
+        f'  4. Not Yet Expanded   pct_from_swhi in [<b>{ss.get("watch_prox_lo",2)}</b>, <b>{ss.get("watch_prox_hi",10)}</b>]',
         f'  5. Avoid Weak Stocks  RS55 &gt; <b>{ss.get("watch_rs55_min",-2)}</b>',
         f'',
         f'  No score threshold — structural condition check only.',
@@ -248,14 +256,14 @@ def _section_execution():
                         value=float(ss.get("exec_rsi_min", 52.0)),
                         step=0.5, key="exec_rsi_min")
         st.number_input("Momentum: Mom3M > (%)", 0.0, 20.0,
-                        value=float(ss.get("exec_mom3_min", 5.0)),
+                        value=float(ss.get("exec_mom3_min", 7.0)),
                         step=0.5, key="exec_mom3_min")
     with c2:
         st.number_input("Volume Ratio Min", 0.5, 2.0,
                         value=float(ss.get("exec_vol_lo", 1.1)),
                         step=0.05, key="exec_vol_lo")
         st.number_input("Volume Ratio Max", 1.5, 5.0,
-                        value=float(ss.get("exec_vol_hi", 2.2)),
+                        value=float(ss.get("exec_vol_hi", 2.0)),
                         step=0.1, key="exec_vol_hi")
     with c3:
         st.number_input("Proximity: % from Hi — Min", 0.0, 2.0,
@@ -279,6 +287,26 @@ def _section_execution():
         st.number_input("EMA20 Distance Max (%)", 2.0, 15.0,
                         value=float(ss.get("exec_ema20_dist_max", 5.0)),
                         step=0.5, key="exec_ema20_dist_max")
+
+    st.markdown("**Relative Strength Filter**")
+    rs1, rs2 = st.columns(2)
+    with rs1:
+        st.number_input(
+            "RS55 Min (rs55 must exceed this)",
+            min_value=-10.0, max_value=10.0,
+            value=float(ss.get("exec_rs55_min", 0.0)),
+            step=0.5, key="exec_rs55_min",
+            help="Stocks with rs55 ≤ 0 are underperforming Nifty — excluded by default.",
+        )
+    with rs2:
+        st.number_input(
+            "RS55 Max (rs55 must be ≤ this)",
+            min_value=10.0, max_value=50.0,
+            value=float(ss.get("exec_rs55_max", 20.0)),
+            step=1.0, key="exec_rs55_max",
+            help="Cap on relative strength. Backtest shows edge weakens above 15–20 "
+                 "(already extended stocks). Default 20; tighten to 15 for stricter filter.",
+        )
 
     st.markdown("**Compression / Base Detection**")
     cc1, cc2 = st.columns(2)
@@ -317,7 +345,7 @@ def _section_watch():
                         step=0.25, key="watch_prox_lo")
     with c3:
         st.number_input("Watch: % from Hi — Max", 3.0, 15.0,
-                        value=float(ss.get("watch_prox_hi", 8.0)),
+                        value=float(ss.get("watch_prox_hi", 10.0)),
                         step=0.5, key="watch_prox_hi")
     with c4:
         st.number_input("Watch: RS55 min (%)", -10.0, 5.0,
@@ -346,6 +374,85 @@ def _section_risk():
         st.number_input("ATR Proximity (Fib zone)", 0.1, 1.0,
                         value=float(ss.get("atr_prox", 0.3)),
                         step=0.05, key="atr_prox")
+
+
+def _section_backtest():
+    ss = st.session_state
+    st.markdown(
+        '<div class="cfg-card-title"><span class="dot" style="background:#f97316"></span>'
+        'BACKTEST / TIME-STOP PARAMETERS</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("**Hold Period**")
+    hc1, hc2 = st.columns(2)
+    with hc1:
+        st.number_input(
+            "Max Hold Days",
+            min_value=5, max_value=60,
+            value=int(ss.get("hold_days", 20)),
+            step=5, key="hold_days",
+            help="Maximum bars a trade stays open before TIMEOUT exit.",
+        )
+    with hc2:
+        st.number_input(
+            "Parallel Workers",
+            min_value=1, max_value=32,
+            value=int(ss.get("workers", 10)),
+            key="workers_bt",
+            help="Thread count for backtest symbol processing.",
+        )
+        ss["workers"] = ss.get("workers_bt", 10)
+
+    st.markdown("**Time-Stop Rules**")
+    st.caption(
+        "Time-stop fires when a trade has been open ≥ *Time-Stop Days* bars "
+        "AND the floating PnL is still below *Min PnL %*. "
+        "Lower Min PnL % to avoid cutting near-winners."
+    )
+    tc1, tc2, tc3 = st.columns(3)
+    with tc1:
+        st.number_input(
+            "Time-Stop Days",
+            min_value=3, max_value=40,
+            value=int(ss.get("time_stop_days", 20)),
+            step=1, key="time_stop_days",
+            help="Bars held before time-stop eligibility begins.",
+        )
+    with tc2:
+        st.number_input(
+            "Time-Stop Min PnL %",
+            min_value=0.0, max_value=5.0,
+            value=float(ss.get("time_stop_min_pct", 1.0)),
+            step=0.25, key="time_stop_min_pct",
+            help="If floating PnL < this % after time_stop_days bars, exit. "
+                 "Set to 0 to only exit losing positions. "
+                 "Was 2.0 (cut near-winners) → lowered to 1.0.",
+        )
+    with tc3:
+        st.number_input(
+            "SL Cooldown Days",
+            min_value=0, max_value=15,
+            value=int(ss.get("sl_cooldown_days", 5)),
+            step=1, key="sl_cooldown_days",
+            help="After an SL hit, block new entries on same symbol for N days.",
+        )
+
+    # Live preview of current time-stop config
+    ts_days = int(ss.get("time_stop_days", 20))
+    ts_pct  = float(ss.get("time_stop_min_pct", 1.0))
+    hold    = int(ss.get("hold_days", 20))
+    st.markdown(
+        f'<div class="preview-box">'
+        f'<b>Current time-stop config</b><br>'
+        f'  Hold window : <b>{hold} bars</b> (TIMEOUT if no exit by then)<br>'
+        f'  Time-stop   : after bar <b>{ts_days}</b>, exit if PnL &lt; '
+        f'<b class="warn">{ts_pct:.2f}%</b><br>'
+        f'  Effect      : trades above {ts_pct:.2f}% on bar {ts_days} are allowed to run '
+        f'up to bar {hold} ({"same" if ts_days == hold else "then TIMEOUT"})'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def _section_regime():
@@ -424,8 +531,8 @@ def render() -> None:
         unsafe_allow_html=True,
     )
 
-    tab_labels = ["🌐 Universe", "📊 Execution", "👁 Watch", "⚠️ Risk", "🌍 Regime", "☁️ Supabase"]
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(tab_labels)
+    tab_labels = ["🌐 Universe", "📊 Execution", "👁 Watch", "⚠️ Risk", "🧪 Backtest", "🌍 Regime", "☁️ Supabase"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(tab_labels)
 
     with tab1:
         st.markdown('<div class="cfg-card">', unsafe_allow_html=True)
@@ -453,10 +560,15 @@ def render() -> None:
 
     with tab5:
         st.markdown('<div class="cfg-card">', unsafe_allow_html=True)
-        _section_regime()
+        _section_backtest()
         st.markdown('</div>', unsafe_allow_html=True)
 
     with tab6:
+        st.markdown('<div class="cfg-card">', unsafe_allow_html=True)
+        _section_regime()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with tab7:
         st.markdown('<div class="cfg-card">', unsafe_allow_html=True)
         _section_supabase()
         st.markdown('</div>', unsafe_allow_html=True)
