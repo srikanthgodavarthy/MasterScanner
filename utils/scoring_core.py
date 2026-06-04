@@ -11,7 +11,7 @@ Relative Strength                15      rs55 > 0 AND rs21 > rs21_prev
 Breakout Readiness               15      0.5 < pct_from_swhi <= 2.5
 Momentum                         15      rsi > 52 AND mom3m > 5 AND cci_momentum_ok
 Volume Quality                   10      1.1 <= volume_ratio <= 2.2
-Pullback Quality (bonus)          5      in_golden OR recent_bounce_from_ema20
+Pullback Quality (bonus)          5      recent_bounce_from_ema20  (in_golden removed — inversely predictive)
 Anti-Overextension Filter        hard    cci < 180 AND rsi < 72 AND distance_from_ema20 < 5%
 ─────────────────────────────────────────────────────────────────
 Max raw = 105  →  EXECUTION if >= 70
@@ -79,7 +79,7 @@ class ScoringParams:
     sl_max_risk_pct:       float = 0.065
     sl_cooldown_days:      int   = 5
     time_stop_days:        int   = 7
-    time_stop_min_pct:     float = 0.0
+    time_stop_min_pct:     float = 2.0   # raised from 0.0: only exit if pnl < +2% at time stop
 
     @classmethod
     def from_settings(cls, s: dict) -> "ScoringParams":
@@ -110,7 +110,7 @@ class ScoringParams:
             sl_max_risk_pct       = float(s.get("sl_max_risk_pct",      0.065)),
             sl_cooldown_days      = int(s.get("sl_cooldown_days",       5)),
             time_stop_days        = int(s.get("time_stop_days",          7)),
-            time_stop_min_pct     = float(s.get("time_stop_min_pct",    0.0)),
+            time_stop_min_pct     = float(s.get("time_stop_min_pct",    2.0)),
         )
 
 
@@ -536,19 +536,22 @@ def compute_bar(
     gate_proximity = params.exec_prox_lo < pct_from_swhi <= params.exec_prox_hi
     sc_proximity   = 15 if gate_proximity else 0
 
-    # 4. Relative Strength (15): rs55 > 0 AND rs21 > rs21_prev
-    gate_rs = rs55 > 0 and rs21 > prev_rs21
+    # 4. Relative Strength (15): rs55 > 0 AND rs55 <= 20 AND rs21 > rs21_prev
+    # Upper cap rs55 <= 20: stocks with RS > 20 are already extended vs Nifty;
+    # backtest data shows 32.2% WR for rs55 > 20 vs 37-38% for lower buckets.
+    gate_rs = rs55 > 0 and rs55 <= 20 and rs21 > prev_rs21
     sc_rs   = 15 if gate_rs else 0
 
-    # 5. Momentum (15): rsi > 52 AND mom3m > 5
+    # 5. Momentum (15): rsi > 52 AND 5 < mom3m <= 40 AND cci_momentum_ok
     #    CCI condition relaxed: accept cci_cross_up_os OR (cci > -50 and cci_rising) OR cci > 0
+    #    Upper cap mom3 <= 40: blowoff momentum (>40%) has 30.3% WR vs 35-36% for normal range.
     cci_momentum_ok = (
         cci_cross_up_os or
         (cur_cci > -50 and cci_rising) or
         cur_cci > 0
     )
     gate_momentum = (cur_r > params.exec_rsi_min and
-                     mom3 > params.exec_mom3_min and
+                     params.exec_mom3_min < mom3 <= 40.0 and
                      cci_momentum_ok)
     sc_momentum   = 15 if gate_momentum else 0
 
@@ -556,8 +559,11 @@ def compute_bar(
     gate_volume = params.exec_vol_lo <= volume_ratio <= params.exec_vol_hi
     sc_volume   = 10 if gate_volume else 0
 
-    # 7. Pullback Quality Bonus (5): in_golden OR recent_bounce_from_ema20
-    gate_pullback = in_golden or recent_bounce_ema20
+    # 7. Pullback Quality Bonus (5): recent_bounce_from_ema20 only.
+    # Removed: `in_golden` (price in Fib 50-61.8% zone).
+    # Backtest shows high_prob=True (in_golden) has 25.3% WR vs 35.6% baseline —
+    # the 60-bar Fib window catches mid-correction stocks, not near-breakout bases.
+    gate_pullback = recent_bounce_ema20
     sc_pullback   = 5 if gate_pullback else 0
 
     # Anti-Overextension Filter (hard gate — must be True for Execution)
@@ -566,12 +572,17 @@ def compute_bar(
                          distance_ema20 < params.exec_ema20_dist_max)
 
     exec_score = sc_trend + sc_compression + sc_proximity + sc_rs + sc_momentum + sc_volume + sc_pullback
-    # max possible = 25+20+15+15+10+10+5 = 100
+    # max possible = 25+20+15+15+15+10+5 = 105
 
-    # EXECUTION qualifies if score >= threshold AND anti-overext passes AND trend_up
+    # EXECUTION qualifies if score >= threshold AND anti-overext passes AND trend_up.
+    # Extra guard: block pure momentum chases (no structural base) — backtest shows
+    # score 80-89 + Momentum Entry (sc_compression=0) has only 26.6% WR.
+    _is_momentum_chase = (sc_compression == 0 and gate_momentum and
+                          not gate_proximity and not gate_rs)
     is_execution = (exec_score >= params.exec_score_threshold and
                     gate_anti_overext and
-                    trend_up)
+                    trend_up and
+                    not _is_momentum_chase)
 
     # ══════════════════════════════════════════════════════════════
     #  WATCH CONDITIONS
@@ -657,8 +668,9 @@ def compute_bar(
     t2_lv  = float(round(en + rk * 2))
     t3_lv  = float(round(en + rk * 3))
 
-    # ── High-prob flag (execution in golden zone) ─────────────────
-    high_prob = is_execution and in_golden
+    # high_prob flag retired: in_golden was inversely predictive (25.3% WR vs 35.6% baseline).
+    # Kept as False to preserve BarResult schema without breaking callers.
+    high_prob = False
 
     # ── Hard stop ─────────────────────────────────────────────────
     hard_stop = trend_down and exec_score < 20
