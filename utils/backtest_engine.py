@@ -21,7 +21,7 @@ from utils.scoring_core   import ScoringParams, build_indicators, compute_bar
 
 
 # ══════════════════════════════════════════════════════════════════
-#  DATA FETCH
+#  DATA FETCH — individual symbol (cached 6 h)
 # ══════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -38,6 +38,56 @@ def fetch_full_history(symbol: str, years: int = 3) -> pd.DataFrame:
         return df[["open", "high", "low", "close", "volume"]]
     except Exception:
         return pd.DataFrame()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  BATCH FETCH — downloads all symbols in one yfinance call (fast)
+# ══════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_batch_history(symbols: tuple, years: int = 3) -> dict[str, pd.DataFrame]:
+    """
+    Download all symbols in a single yfinance batch call.
+    Returns a dict {symbol: OHLCV DataFrame}.
+    ~5-10× faster than one Ticker().history() call per symbol.
+    """
+    end   = datetime.now(timezone.utc) + timedelta(days=1)
+    start = end - timedelta(days=years * 365 + 5)
+    tickers = [f"{s}.NS" for s in symbols]
+
+    try:
+        raw = yf.download(
+            tickers,
+            start=start,
+            end=end,
+            interval="1d",
+            auto_adjust=True,
+            group_by="ticker",
+            threads=True,
+            progress=False,
+        )
+    except Exception:
+        return {}
+
+    result: dict[str, pd.DataFrame] = {}
+    for sym in symbols:
+        ticker = f"{sym}.NS"
+        try:
+            if len(symbols) == 1:
+                df = raw.copy()
+            else:
+                df = raw[ticker].copy() if ticker in raw.columns.get_level_values(0) else pd.DataFrame()
+            if df.empty:
+                continue
+            df.index   = _strip_tz(pd.to_datetime(df.index))
+            df.columns = [c.lower() for c in df.columns]
+            cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+            df = df[cols].dropna(how="all")
+            if not df.empty:
+                result[sym] = df
+        except Exception:
+            continue
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -236,7 +286,9 @@ def run_backtest(
         hold_days = settings.get("hold_days",  hold_days)
         workers   = settings.get("workers",    workers)
 
-    # Fetch Nifty once for the full 3-year window
+    # ── Step 1: Fetch Nifty once ──────────────────────────────────
+    if progress_cb:
+        progress_cb(0.0, "Downloading Nifty index…")
     try:
         end   = datetime.now(timezone.utc) + timedelta(days=1)
         start = end - timedelta(days=3 * 365 + 5)
@@ -249,18 +301,30 @@ def run_backtest(
     regime_val         = nifty_regime(nifty)
     effective_settings = dict(settings) if settings else {}
     effective_settings["nifty_regime_val"] = regime_val
-
     sim_params = ScoringParams.from_settings(effective_settings)
 
-    total      = len(symbols)
-    completed  = [0]
-    c_lock     = threading.Lock()
-    all_trades = []
-    t_lock     = threading.Lock()
+    # ── Step 2: Batch download all symbols in ONE API call ────────
+    # This is the primary speed fix: yf.download() fetches all
+    # tickers concurrently server-side instead of N serial requests.
+    if progress_cb:
+        progress_cb(0.02, f"Batch downloading {len(symbols)} symbols…")
 
-    def _process(sym):
-        df = fetch_full_history(sym, years=3)
-        if df.empty:
+    # Cache key must be a tuple (lists are not hashable for st.cache_data)
+    all_data = fetch_batch_history(tuple(sorted(symbols)), years=3)
+
+    # ── Step 3: Signal generation + trade simulation (parallel) ───
+    total     = len(symbols)
+    completed = [0]
+    c_lock    = threading.Lock()
+    all_trades: list[pd.DataFrame] = []
+    t_lock    = threading.Lock()
+
+    def _process(sym: str) -> pd.DataFrame | None:
+        df = all_data.get(sym)
+        if df is None or df.empty:
+            # Fallback: individual fetch (handles symbols missing from batch)
+            df = fetch_full_history(sym, years=3)
+        if df is None or df.empty:
             return None
         sigs = generate_signals_historical(
             df, nifty,
@@ -277,7 +341,8 @@ def run_backtest(
                 completed[0] += 1
                 n = completed[0]
             if progress_cb:
-                progress_cb(n / total, sym)
+                # Reserve first 2% for downloads; remaining 98% for processing
+                progress_cb(0.02 + 0.98 * n / total, sym)
             try:
                 result = fut.result()
                 if result is not None and not result.empty:
