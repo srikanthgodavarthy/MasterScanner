@@ -55,8 +55,8 @@ class ScoringParams:
 
     # Tier 1 — squeeze boost
     t1_squeeze_boost:    bool  = True
-    t1_squeeze_pts:      int   = 15   # points on release
-    t1_no_squeeze_pts:   int   = 5    # points when not in squeeze
+    t1_squeeze_pts:      int   = 5   # points on release
+    t1_no_squeeze_pts:   int   = 0    # points when not in squeeze
 
     # Tier 1 — persistent_strength score weight
     t1_ps_weight:  int = 20    # added when True
@@ -76,7 +76,7 @@ class ScoringParams:
     nifty_regime_val:    str  = "neutral"   # "bull" | "bear" | "neutral"
 
     # Score normalisation
-    max_score: int = 175
+    max_score: int = 250
 
     @classmethod
     def from_settings(cls, s: dict) -> "ScoringParams":
@@ -506,24 +506,26 @@ def compute_bar(
     score += 25 if trend_up else 0
     score += 30 if cur_e20 > cur_e50 else (20 if cur_e20 > cur_e50 * 0.995 else 0)
     score += (25 if cur_r > 60 else 20 if cur_r > 55 else 15 if cur_r > 50 else 5 if cur_r > 45 else 0)
-    score += (20 if cur_v > cur_vavg * 1.2 else 10 if cur_v > cur_vavg else 0)
+    score += (30 if cur_v > cur_vavg * 2.0 else 20 if cur_v > cur_vavg * 1.5 else 10 if cur_v > cur_vavg * 1.2 else 0)
 
     hh = float(ia.c.iloc[max(0, i - 10):i].max()) if i >= 1 else cur_c
     score += (25 if cur_c > hh else 15 if cur_c > hh * 0.98 else 0)
-    score += 10 if i >= 2 and cur_c > float(c.iloc[i - 2]) else 0
+    score += 10 if i >= 2 and cur_c > float(c.iloc[i - 2]) * 1.01 else 0
 
-    score += (15 if rs > 0 else 5 if rs > -0.005 else 0)
-    score += 30 if in_golden    else 0
+    score += (30 if rs > 0.10 else 20 if rs > 0.05 else 10 if rs > 0 else 0)
+    score += 15 if in_golden    else 0
     score += -20 if near_ext127 else (-30 if near_ext161 else 0)
-
-    score += (20 if cur_cci < params.cci_os else 10 if cur_cci < 0 else -15 if cci_extended else 0)
-    score += 15 if cci_cross_up_os else 0
-    score -= 10 if cci_extended    else 0
-
-    score += params.t1_ps_weight if persistent_strength else params.t1_ps_penalty
+    score += (20 if mom3 > 20 and mom6 > 20 else 10 if mom3 > 10 and mom6 > 10 else 5  if mom3 > 5 and mom6 > 5 else 0)
+     
+    #score += 15 if ema20_slope_now > ema20_slope_mid > ema20_slope_old and ema20_slope_now > 0.3 else 0
+     
+    score += 15 if cur_cci < params.cci_os else 5 if cur_cci < 0 else -15 if cci_extended else 0
+    
     score += 20 if harm_bull else 0
     score += 15 if abcd_bull else 0
     score += -15 if below_cloud else 0
+
+     
 
     # Squeeze boost
     if params.t1_squeeze_boost:
