@@ -541,13 +541,19 @@ def compute_bar(
     )
 
     is_tier1_prime = (
-        trend_up              and
-        in_golden_relaxed     and
-        recent_cci_recovery   and
-        persistent_strength   and
-        trend_structure       and
-        nifty_allows
-    )
+         (
+             trend_up and
+             in_golden_relaxed and
+             recent_cci_recovery and
+             persistent_strength and
+             trend_structure
+         )
+         or
+         (
+             is_norm_buy and
+             norm_score >= 75
+         )
+     ) and nifty_allows
     score += 20 if is_tier1_prime else 0
 
     # ── TIER 2 MOMENTUM GATE ──────────────────────────────────────
