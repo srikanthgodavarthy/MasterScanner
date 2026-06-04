@@ -402,7 +402,7 @@ def _section_backtest():
             key="workers_bt",
             help="Thread count for backtest symbol processing.",
         )
-        ss["workers"] = ss.get("workers_bt", 10)
+
 
     st.markdown("**Time-Stop Rules**")
     st.caption(
