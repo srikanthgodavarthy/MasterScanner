@@ -8,8 +8,8 @@ Trend Quality                    25      close > EMA200 AND EMA20 > EMA50 > EMA2
                                          ← was: e20 > e50 only; EMA200 check was separate
 Structure (VCP/BB-squeeze/NR7)   20      base gate same; VCP now earns +5 bonus (highest-quality base)
                                          BB squeeze + VCP together flag high_prob = True
-Relative Strength                15      rs55 in (0, 15] AND rs21 > rs21_prev
-                                         ← cap lowered 20 → 15 (32.2% WR above 15, vs 37-38% below)
+Relative Strength                15      rs55 in (0, 20] AND rs21 > rs21_prev
+                                         ← cap configurable (default 20; was 15 in prior version)
 Breakout Readiness               15      0.5 < pct_from_swhi <= 4.0  (unchanged)
 Momentum                         15      rsi > 52 AND 7 < mom3 <= 40 AND cci_momentum_ok
                                          ← lower bound raised 5 → 7 (weak early momentum poor follow-through)
@@ -65,9 +65,10 @@ class ScoringParams:
     exec_rsi_max:         float = 72.0  # anti-overextension: rsi < this
     exec_ema20_dist_max:  float = 5.0   # % distance from ema20 (anti-overext)
 
-    # RS caps — tightened upper bound based on backtest WR data
+    # RS caps — configurable; default 20 (backtest showed edge degrades above 15 but
+    # not dramatically; keep 20 as a reasonable default, user can tighten to 15)
     exec_rs55_min:        float = 0.0   # rs55 > this
-    exec_rs55_max:        float = 15.0  # ← new: rs55 <= this (was 20; 32.2% WR above 15)
+    exec_rs55_max:        float = 20.0  # rs55 <= this (configurable in settings)
 
     # Watch thresholds
     watch_rsi_min:        float = 48.0  # rsi > this for momentum improving
@@ -86,8 +87,8 @@ class ScoringParams:
     # Risk / SL
     sl_max_risk_pct:       float = 0.065
     sl_cooldown_days:      int   = 5
-    time_stop_days:        int   = 7
-    time_stop_min_pct:     float = 2.0
+    time_stop_days:        int   = 20   # bars held before time-stop check kicks in
+    time_stop_min_pct:     float = 1.0  # exit if PnL < this% after time_stop_days
 
     @classmethod
     def from_settings(cls, s: dict) -> "ScoringParams":
@@ -108,7 +109,7 @@ class ScoringParams:
             exec_rsi_max          = float(s.get("exec_rsi_max",          72.0)),
             exec_ema20_dist_max   = float(s.get("exec_ema20_dist_max",   5.0)),
             exec_rs55_min         = float(s.get("exec_rs55_min",          0.0)),
-            exec_rs55_max         = float(s.get("exec_rs55_max",         15.0)),
+            exec_rs55_max         = float(s.get("exec_rs55_max",         20.0)),
             watch_rsi_min         = float(s.get("watch_rsi_min",         48.0)),
             watch_prox_lo         = float(s.get("watch_prox_lo",          2.0)),
             watch_prox_hi         = float(s.get("watch_prox_hi",         10.0)),
@@ -118,9 +119,9 @@ class ScoringParams:
             nifty_regime_filter   = bool(s.get("nifty_regime_filter",   False)),
             nifty_regime_val      = str(s.get("nifty_regime_val",    "neutral")),
             sl_max_risk_pct       = float(s.get("sl_max_risk_pct",      0.065)),
-            sl_cooldown_days      = int(s.get("sl_cooldown_days",       5)),
-            time_stop_days        = int(s.get("time_stop_days",          7)),
-            time_stop_min_pct     = float(s.get("time_stop_min_pct",    2.0)),
+            sl_cooldown_days      = int(s.get("sl_cooldown_days",        5)),
+            time_stop_days        = int(s.get("time_stop_days",          20)),
+            time_stop_min_pct     = float(s.get("time_stop_min_pct",     1.0)),
         )
 
 
@@ -547,8 +548,9 @@ def compute_bar(
     sc_proximity   = 15 if gate_proximity else 0
 
     # 4. Relative Strength (15)
-    # Upper cap tightened 20 → 15: backtest shows 32.2% WR for rs55 > 15,
-    # vs 37-38% for rs55 in (0, 15]. Stocks with RS > 15 are already extended.
+    # Upper cap configurable via exec_rs55_max (default 20).
+    # Backtest showed WR degrades above 15 but the cap is exposed in settings
+    # so users can tighten to 15 if they want the stricter filter.
     gate_rs = (params.exec_rs55_min < rs55 <= params.exec_rs55_max) and (rs21 > prev_rs21)
     sc_rs   = 15 if gate_rs else 0
 
