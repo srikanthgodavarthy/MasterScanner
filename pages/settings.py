@@ -1,64 +1,73 @@
-"""pages/settings.py — Settings for the two-tier Execution / Watch scanner."""
+"""
+pages/settings.py — Interactive Settings  (v2)
+
+Three sections rendered as styled tab cards inside the page:
+  ① Common    — universe, workers, auto-refresh, cache
+  ② Tier 1    — persistent_strength thresholds, fib zone, CCI recovery window,
+                EMA alignment toggle, cloud gate, score boost for squeeze
+  ③ Tier 2    — compression ATR ratio, compression bars, CCI OB level,
+                volume expansion multiplier
+
+All sliders / number inputs write immediately to st.session_state so
+scanner.py and backtest.py pick them up on the next run without a page
+reload.  A live "Parameter Preview" card shows the current effective
+gate as human-readable conditions.
+
+No sidebar used — sidebar is collapsed by app.py (initial_sidebar_state="collapsed").
+"""
 
 import streamlit as st
 import pandas as pd
 
 from utils.supabase_client import (
-    get_client, load_watchlist, save_watchlist,
-    add_to_watchlist, remove_from_watchlist,
-    load_scan_history, _is_available, SCHEMA_SQL,
+    get_client,
+    load_watchlist,
+    save_watchlist,
+    add_to_watchlist,
+    remove_from_watchlist,
+    load_scan_history,
+    _is_available,
+    SCHEMA_SQL,
 )
 from utils.scanner_engine import NIFTY500_SYMBOLS
 
 # ══════════════════════════════════════════════════════════════════
-#  DEFAULTS
+#  DEFAULT VALUES  — single source of truth for all settings
 # ══════════════════════════════════════════════════════════════════
 
 DEFAULTS = {
-    # Universe
+    # Common
     "universe_mode":    "Nifty 500 (default)",
     "custom_symbols":   [],
-    "workers":          10,
-    "auto_refresh":     False,
-    "refresh_mins":     5,
-    # CCI
     "cci_len":          20,
     "cci_ob":           100,
     "cci_os":           -100,
-    # Execution thresholds
-    "exec_score_threshold":  70,
-    "exec_rsi_min":          52.0,
-    "exec_mom3_min":         7.0,
-    "exec_vol_lo":           1.1,
-    "exec_vol_hi":           2.0,
-    "exec_prox_lo":          0.5,
-    "exec_prox_hi":          4.0,
-    "exec_cci_max":          180.0,
-    "exec_rsi_max":          72.0,
-    "exec_ema20_dist_max":   5.0,
-    # RS caps
-    "exec_rs55_min":         0.0,
-    "exec_rs55_max":         20.0,   # configurable; tighten to 15 for stricter filter
-    # Watch thresholds
-    "watch_rsi_min":         48.0,
-    "watch_prox_lo":         2.0,
-    "watch_prox_hi":         10.0,
-    "watch_rs55_min":        -2.0,
-    # Compression
-    "atr5_atr20_ratio":      0.90,
-    "range10_range30_ratio": 0.75,
-    # Pivots / risk
-    "pvt_lb":                20,
-    "atr_prox":              0.3,
-    "sl_max_risk_pct":       0.065,
-    "sl_cooldown_days":      5,
-    # Backtest / time-stop
-    "hold_days":             20,
-    "time_stop_days":        20,     # bars before time-stop check activates
-    "time_stop_min_pct":     1.0,    # exit if PnL < 1% after time_stop_days bars
-    # Nifty regime
-    "nifty_regime_filter":   False,
+    "workers":          10,
+    "hold_days":        20,
+    "min_score":        70,
+    "auto_refresh":     False,
+    "refresh_mins":     5,
+    # Tier 1
+    "t1_mom3":          8,
+    "t1_mom6":          12,
+    "t1_fib_hi":        38.2,
+    "t1_fib_lo":        61.8,
+    "t1_cci_window":    5,
+    "t1_cloud":         True,
+    "t1_squeeze_boost": True,
+    "t1_squeeze_pts":   15,
+    "t1_no_squeeze_pts": 5,
+    "t1_ps_weight":     20,
+    "t1_ps_penalty":    -10,
+    # Tier 2
+    "t2_comp_bars":     10,
+    "t2_atr_ratio":     0.85,
+    "t2_vol_mult":      1.2,
+    # Nifty Regime
+    "nifty_regime_filter": False,
 }
+
+
 
 # ══════════════════════════════════════════════════════════════════
 #  CSS
@@ -66,12 +75,14 @@ DEFAULTS = {
 
 _CSS = """
 <style>
+/* ── section card ── */
 .cfg-card {
     background: #0c1520;
     border: 1px solid #1e293b;
     border-radius: 12px;
     padding: 1.2rem 1.5rem 1.4rem;
     margin-bottom: 1.2rem;
+    position: relative;
 }
 .cfg-card-title {
     font-size: 11px;
@@ -84,6 +95,13 @@ _CSS = """
     align-items: center;
     gap: 8px;
 }
+.cfg-card-title span.dot {
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+}
+
+/* ── preview box ── */
 .preview-box {
     background: #050b14;
     border: 1px solid #1e3a5f;
@@ -94,81 +112,147 @@ _CSS = """
     color: #94a3b8;
     font-family: 'JetBrains Mono', monospace;
 }
-.preview-box b  { color: #60a5fa; }
+.preview-box b { color: #60a5fa; }
 .preview-box .ok  { color: #4ade80; }
-.preview-box .warn { color: #fbbf24; }
-.preview-box .bad  { color: #f87171; }
-.score-bar-wrap { margin: 4px 0 10px; }
-.score-bar-row {
-    display: flex; align-items: center;
-    gap: 8px; margin-bottom: 4px;
-    font-size: 11px; color: #64748b;
+.preview-box .warn{ color: #fbbf24; }
+.preview-box .bad { color: #f87171; }
+
+/* ── section tab buttons ── */
+.stRadio > div {
+    display: flex !important;
+    gap: 6px !important;
+    flex-direction: row !important;
 }
-.score-bar-fill {
-    height: 6px; border-radius: 3px;
-    transition: width 0.3s;
+.stRadio > div > label {
+    background: #0c1520;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    padding: 6px 18px !important;
+    font-size: 12px !important;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+    color: #64748b !important;
 }
+.stRadio > div > label:has(input:checked) {
+    background: #1e3a5f !important;
+    border-color: #3b82f6 !important;
+    color: #60a5fa !important;
+}
+
+/* ── sliders ── */
+div[data-testid="stSlider"] label { font-size: 11px !important; color: #64748b !important; }
+
+/* ── number inputs ── */
 div[data-baseweb="input"] > div {
     background: #080e18 !important;
     border-color: #1e293b !important;
     font-size: 13px !important;
 }
-div[data-testid="stSlider"] label { font-size: 11px !important; color: #64748b !important; }
+
+/* ── save button ── */
+.save-row {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 0.8rem;
+}
+
+/* ── param chip ── */
+.param-chip {
+    display: inline-block;
+    padding: 2px 9px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 500;
+    border: 1px solid;
+    white-space: nowrap;
+}
 </style>
 """
 
 
 # ══════════════════════════════════════════════════════════════════
-#  SCORE BAR PREVIEW
+#  HELPERS
 # ══════════════════════════════════════════════════════════════════
 
-def _score_preview(ss: dict) -> str:
-    components = [
-        ("Trend Quality",       25, "#22c55e"),
-        ("Compression/Base",    15, "#3b82f6"),
-        ("Breakout Proximity",  15, "#f59e0b"),
-        ("Relative Strength",   15, "#8b5cf6"),
-        ("Momentum",            15, "#06b6d4"),
-        ("Volume Quality",      10, "#f97316"),
-        ("Pullback Bonus",       5, "#ec4899"),
-    ]
-    thr = ss.get("exec_score_threshold", 70)
-    rows = ""
-    for name, weight, color in components:
-        pct = weight  # each row = its own weight
-        rows += (
-            f'<div class="score-bar-row">'
-            f'<span style="width:140px;flex-shrink:0">{name}</span>'
-            f'<div style="flex:1;background:#1e293b;border-radius:3px;height:6px">'
-            f'<div class="score-bar-fill" style="width:{pct}%;background:{color}"></div></div>'
-            f'<span style="width:28px;text-align:right">{weight}</span>'
-            f'</div>'
-        )
-    thr_pct = thr
-    rows += (
-        f'<div style="margin-top:8px;padding-top:7px;border-top:1px solid #1e293b40;'
-        f'color:#64748b;font-size:10px">'
-        f'Execution threshold: <b style="color:#4ade80">{thr}/100</b> &nbsp;·&nbsp; '
-        f'  Anti-overextension filter is a hard gate (CCI &lt; {ss.get("exec_cci_max",180)}, '
-        f'RSI &lt; {ss.get("exec_rsi_max",72)}, EMA20 dist &lt; {ss.get("exec_ema20_dist_max",5)}%). '
-        f'Momentum CCI condition: cci&gt;0 OR (cci&gt;−50 AND rising) OR cci_cross_up_from_OS.'
-        f'</div>'
+def _chip(label: str, color: str = "#60a5fa") -> str:
+    """Small coloured inline chip."""
+    return (
+        f'<span class="param-chip" '
+        f'style="color:{color};border-color:{color}44;background:{color}11">'
+        f'{label}</span>'
     )
-    return f'<div class="score-bar-wrap">{rows}</div>'
 
 
-def _watch_preview(ss: dict) -> str:
+def _preview_tier1(ss: dict) -> str:
+    mom3  = ss.get("t1_mom3",  8)
+    mom6  = ss.get("t1_mom6",  12)
+    fib_l = ss.get("t1_fib_lo", 61.8)
+    fib_h = ss.get("t1_fib_hi", 38.2)
+    cci_w = ss.get("t1_cci_window", 5)
+    cloud = ss.get("t1_cloud", True)
+    sqz   = ss.get("t1_squeeze_boost", True)
+    sqz_r = ss.get("t1_squeeze_pts", 15)
+    sqz_n = ss.get("t1_no_squeeze_pts", 5)
+
     lines = [
-        f'<b>Watch Entry — all 5 conditions must hold simultaneously</b>',
+        f'<b>Tier 1 — Prime Gate</b>',
+        f'  trend_up           = price > EMA200 <span class="ok">AND</span> EMA20 > EMA50',
+        f'  ema_alignment      = EMA20 > EMA50 <span class="ok">AND</span> EMA50 rising',
+        f'  in_golden_relaxed  = fib {fib_l:.1f}% … {fib_h:.1f}% ± ATR',
+        f'  recent_cci_rec     = CCI crossed above -100 in last <b>{cci_w}</b> bars',
+        f'  persistent_str     = mom3 > <b>{mom3}%</b> <span class="ok">AND</span> mom6 > <b>{mom6}%</b>',
+        f'  trend_structure    = ema_alignment <span class="ok">AND</span> '
+            + ('<span class="ok">allow_cloud</span>' if cloud else '<span class="warn">cloud ignored</span>'),
+        '',
+        f'  Score boost   +20 (gate satisfied)',
+        f'  Squeeze boost +<b>{sqz_r}</b> on release / +<b>{sqz_n}</b> neutral'
+            + ('' if sqz else ' <span class="warn">[disabled]</span>'),
+    ]
+    return '<br>'.join(lines)
+
+
+def _preview_tier2(ss: dict) -> str:
+    atr_r  = ss.get("t2_atr_ratio",    0.85)
+    c_bars = ss.get("t2_comp_bars",    10)
+    cci_ob = ss.get("cci_ob",          100)
+    vol_m  = ss.get("t2_vol_mult",     1.2)
+
+    lines = [
+        f'<b>Tier 2 — Momentum Breakout Gate</b>',
+        f'  compression_break  =',
+        f'    prev ATR < SMA({c_bars}) × <b>{atr_r:.2f}</b>',
+        f'    <span class="ok">AND</span> close > {c_bars}-bar range high (prev bar)',
         f'',
-        f'  1. Trend Developing   close > EMA200 <span class="ok">AND</span> EMA20 rising',
-        f'  2. Early Structure    rounded_bottom <span class="ok">OR</span> abcd_detected <span class="ok">OR</span> base_tight <span class="ok">OR</span> vol_contracting',
-        f'  3. Momentum Improving RSI &gt; <b>{ss.get("watch_rsi_min",48)}</b> <span class="ok">AND</span> CCI rising',
-        f'  4. Not Yet Expanded   pct_from_swhi in [<b>{ss.get("watch_prox_lo",2)}</b>, <b>{ss.get("watch_prox_hi",10)}</b>]',
-        f'  5. Avoid Weak Stocks  RS55 &gt; <b>{ss.get("watch_rs55_min",-2)}</b>',
+        f'  cci_momentum_break =',
+        f'    CCI > <b>{cci_ob}</b>  <span class="ok">AND</span>  CCI > prev CCI',
         f'',
-        f'  No score threshold — structural condition check only.',
-        f'  Stocks here typically transition to <span class="ok">Execution</span> once proximity/momentum conditions tighten.',
+        f'  volume_expansion   =',
+        f'    volume > vol_avg × <b>{vol_m:.1f}</b>',
+        f'',
+        f'  All three must be <span class="ok">True</span> simultaneously',
+    ]
+    return '<br>'.join(lines)
+
+
+def _preview_common(ss: dict) -> str:
+    syms  = ss.get("universe_mode", "Nifty 500 (default)")
+    n     = len(ss.get("custom_symbols", [])) if syms == "Custom" else 500
+    cci_l = ss.get("cci_len",   20)
+    ob    = ss.get("cci_ob",   100)
+    os_   = ss.get("cci_os",  -100)
+    wk    = ss.get("workers",   10)
+    ar    = ss.get("auto_refresh", False)
+    arm   = ss.get("refresh_mins",  5)
+
+    lines = [
+        f'<b>Common Parameters</b>',
+        f'  Universe    = {syms}  (<b>{n}</b> symbols)',
+        f'  CCI Period  = <b>{cci_l}</b>   OB = <b>{ob}</b>   OS = <b>{os_}</b>',
+        f'  Workers     = <b>{wk}</b> parallel threads',
+        f'  Auto-refresh= {"<span class=\'ok\'>ON</span>" if ar else "<span class=\'warn\'>OFF</span>"}  '
+            + (f'every <b>{arm} min</b>' if ar else ''),
     ]
     return '<br>'.join(lines)
 
@@ -177,406 +261,558 @@ def _watch_preview(ss: dict) -> str:
 #  SECTION RENDERERS
 # ══════════════════════════════════════════════════════════════════
 
-def _section_universe():
+def _section_common():
     ss = st.session_state
+
     st.markdown(
-        '<div class="cfg-card-title"><span class="dot" style="background:#60a5fa"></span>'
-        'UNIVERSE & SCAN SETTINGS</div>',
+        '<div class="cfg-card-title">'
+        '<span class="dot" style="background:#3b82f6"></span>'
+        'Common — Universe &amp; Engine</div>',
         unsafe_allow_html=True,
     )
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        mode = st.selectbox(
-            "Symbol Universe",
-            ["Nifty 500 (default)", "Custom"],
-            index=0 if ss.get("universe_mode", "Nifty 500 (default)") == "Nifty 500 (default)" else 1,
-            key="universe_mode",
-        )
-    with c2:
-        st.number_input("Parallel Workers", 1, 32,
-                        value=ss.get("workers", 10), key="workers")
-    with c3:
-        st.toggle("Auto-Refresh", value=ss.get("auto_refresh", False), key="auto_refresh")
-    with c4:
-        st.number_input("Refresh (mins)", 1, 60,
-                        value=ss.get("refresh_mins", 5), key="refresh_mins")
 
-    if mode == "Custom":
+    # Universe
+    st.markdown("**Stock Universe**")
+    universe_mode = st.radio(
+        "Universe mode",
+        ["Nifty 500 (default)", "Custom"],
+        horizontal=True,
+        index=0 if ss.get("universe_mode", "Nifty 500 (default)") == "Nifty 500 (default)" else 1,
+        key="universe_mode_radio",
+        label_visibility="collapsed",
+    )
+    ss["universe_mode"] = universe_mode
+
+    if universe_mode == "Custom":
+        default_syms = "\n".join(ss.get("custom_symbols", []))
         raw = st.text_area(
-            "Custom Symbols (comma-separated)",
-            value=", ".join(ss.get("custom_symbols", [])),
-            height=80,
-            key="custom_sym_raw",
+            "One symbol per line (no .NS suffix)",
+            value=default_syms,
+            height=140,
+            placeholder="RELIANCE\nTCS\nINFY",
+            key="custom_sym_area",
         )
-        syms = [s.strip().upper() for s in raw.split(",") if s.strip()]
-        ss["custom_symbols"] = syms
-        ss["symbols"]        = syms if syms else NIFTY500_SYMBOLS
+        symbols = [s.strip().upper() for s in raw.splitlines() if s.strip()]
+        ss["custom_symbols"] = symbols
+        st.caption(f"**{len(symbols)}** custom symbols.")
     else:
-        ss["symbols"] = NIFTY500_SYMBOLS
+        symbols = NIFTY500_SYMBOLS
+    ss["symbols"] = symbols
 
+    st.divider()
 
-def _section_cci():
-    ss = st.session_state
-    st.markdown(
-        '<div class="cfg-card-title"><span class="dot" style="background:#8b5cf6"></span>'
-        'CCI PARAMETERS</div>',
-        unsafe_allow_html=True,
-    )
+    # CCI parameters
+    st.markdown("**CCI Parameters**")
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.number_input("CCI Period", 5, 50, value=ss.get("cci_len", 20), key="cci_len")
-    with c2:
-        st.number_input("CCI Overbought", 50, 300, value=ss.get("cci_ob", 100), key="cci_ob")
-    with c3:
-        st.number_input("CCI Oversold", -300, -50, value=ss.get("cci_os", -100), key="cci_os")
-
-
-def _section_execution():
-    ss = st.session_state
-    st.markdown(
-        '<div class="cfg-card-title"><span class="dot" style="background:#4ade80"></span>'
-        'EXECUTION ENTRY — SCORING COMPONENTS</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(_score_preview(ss), unsafe_allow_html=True)
-
-    st.markdown("**Score Threshold**")
-    st.number_input(
-        "Execution Score Threshold (0-100)",
-        min_value=50, max_value=95,
-        value=ss.get("exec_score_threshold", 70),
-        key="exec_score_threshold",
-        help="Minimum score to qualify as Execution. Components sum to 100.",
-    )
-
-    st.markdown("**Component Thresholds**")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.number_input("Momentum: RSI > ", 40.0, 65.0,
-                        value=float(ss.get("exec_rsi_min", 52.0)),
-                        step=0.5, key="exec_rsi_min")
-        st.number_input("Momentum: Mom3M > (%)", 0.0, 20.0,
-                        value=float(ss.get("exec_mom3_min", 7.0)),
-                        step=0.5, key="exec_mom3_min")
-    with c2:
-        st.number_input("Volume Ratio Min", 0.5, 2.0,
-                        value=float(ss.get("exec_vol_lo", 1.1)),
-                        step=0.05, key="exec_vol_lo")
-        st.number_input("Volume Ratio Max", 1.5, 5.0,
-                        value=float(ss.get("exec_vol_hi", 2.0)),
-                        step=0.1, key="exec_vol_hi")
-    with c3:
-        st.number_input("Proximity: % from Hi — Min", 0.0, 2.0,
-                        value=float(ss.get("exec_prox_lo", 0.5)),
-                        step=0.1, key="exec_prox_lo")
-        st.number_input("Proximity: % from Hi — Max", 1.0, 8.0,
-                        value=float(ss.get("exec_prox_hi", 4.0)),
-                        step=0.25, key="exec_prox_hi")
-
-    st.markdown("**Anti-Overextension Filter (Hard Gate)**")
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        st.number_input("CCI Max (hard gate)", 100.0, 300.0,
-                        value=float(ss.get("exec_cci_max", 180.0)),
-                        step=10.0, key="exec_cci_max")
-    with c5:
-        st.number_input("RSI Max (hard gate)", 60.0, 85.0,
-                        value=float(ss.get("exec_rsi_max", 72.0)),
-                        step=1.0, key="exec_rsi_max")
-    with c6:
-        st.number_input("EMA20 Distance Max (%)", 2.0, 15.0,
-                        value=float(ss.get("exec_ema20_dist_max", 5.0)),
-                        step=0.5, key="exec_ema20_dist_max")
-
-    st.markdown("**Relative Strength Filter**")
-    rs1, rs2 = st.columns(2)
-    with rs1:
-        st.number_input(
-            "RS55 Min (rs55 must exceed this)",
-            min_value=-10.0, max_value=10.0,
-            value=float(ss.get("exec_rs55_min", 0.0)),
-            step=0.5, key="exec_rs55_min",
-            help="Stocks with rs55 ≤ 0 are underperforming Nifty — excluded by default.",
+        cci_len = st.number_input(
+            "Period", min_value=5, max_value=50,
+            value=ss.get("cci_len", 20), step=1, key="ni_cci_len",
+            help="CCI lookback period (default 20)",
         )
-    with rs2:
-        st.number_input(
-            "RS55 Max (rs55 must be ≤ this)",
-            min_value=10.0, max_value=50.0,
-            value=float(ss.get("exec_rs55_max", 20.0)),
-            step=1.0, key="exec_rs55_max",
-            help="Cap on relative strength. Backtest shows edge weakens above 15–20 "
-                 "(already extended stocks). Default 20; tighten to 15 for stricter filter.",
-        )
-
-    st.markdown("**Compression / Base Detection**")
-    cc1, cc2 = st.columns(2)
-    with cc1:
-        st.number_input("ATR5/ATR20 Ratio (< this = compressed)", 0.5, 1.0,
-                        value=float(ss.get("atr5_atr20_ratio", 0.90)),
-                        step=0.01, key="atr5_atr20_ratio",
-                        help="ATR(5) < ATR(20) × ratio  →  compression signal fires")
-    with cc2:
-        st.number_input("Range10/Range30 Ratio (< this = base)", 0.4, 1.0,
-                        value=float(ss.get("range10_range30_ratio", 0.75)),
-                        step=0.01, key="range10_range30_ratio",
-                        help="10-day range < 30-day range × ratio  →  base formation")
-
-
-def _section_watch():
-    ss = st.session_state
-    st.markdown(
-        '<div class="cfg-card-title"><span class="dot" style="background:#fbbf24"></span>'
-        'WATCH ENTRY CONDITIONS</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        f'<div class="preview-box">{_watch_preview(ss)}</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown("")
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.number_input("Watch: RSI min", 35.0, 60.0,
-                        value=float(ss.get("watch_rsi_min", 48.0)),
-                        step=0.5, key="watch_rsi_min")
     with c2:
-        st.number_input("Watch: % from Hi — Min", 0.5, 4.0,
-                        value=float(ss.get("watch_prox_lo", 2.0)),
-                        step=0.25, key="watch_prox_lo")
-    with c3:
-        st.number_input("Watch: % from Hi — Max", 3.0, 15.0,
-                        value=float(ss.get("watch_prox_hi", 10.0)),
-                        step=0.5, key="watch_prox_hi")
-    with c4:
-        st.number_input("Watch: RS55 min (%)", -10.0, 5.0,
-                        value=float(ss.get("watch_rs55_min", -2.0)),
-                        step=0.5, key="watch_rs55_min")
-
-
-def _section_risk():
-    ss = st.session_state
-    st.markdown(
-        '<div class="cfg-card-title"><span class="dot" style="background:#ef4444"></span>'
-        'RISK & PIVOTS</div>',
-        unsafe_allow_html=True,
-    )
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.number_input("SL Max Risk %", 1.0, 15.0,
-                        value=float(ss.get("sl_max_risk_pct", 0.065)) * 100,
-                        step=0.25, key="_sl_pct_display",
-                        help="Hard cap on (entry-SL)/entry")
-        ss["sl_max_risk_pct"] = st.session_state.get("_sl_pct_display", 6.5) / 100
-    with c2:
-        st.number_input("Pivot Lookback", 5, 50,
-                        value=ss.get("pvt_lb", 20), key="pvt_lb")
-    with c3:
-        st.number_input("ATR Proximity (Fib zone)", 0.1, 1.0,
-                        value=float(ss.get("atr_prox", 0.3)),
-                        step=0.05, key="atr_prox")
-
-
-def _section_backtest():
-    ss = st.session_state
-    st.markdown(
-        '<div class="cfg-card-title"><span class="dot" style="background:#f97316"></span>'
-        'BACKTEST / TIME-STOP PARAMETERS</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("**Hold Period**")
-    hc1, hc2 = st.columns(2)
-    with hc1:
-        st.number_input(
-            "Max Hold Days",
-            min_value=5, max_value=60,
-            value=int(ss.get("hold_days", 20)),
-            step=5, key="hold_days",
-            help="Maximum bars a trade stays open before TIMEOUT exit.",
+        cci_ob = st.number_input(
+            "Overbought", min_value=50, max_value=300,
+            value=ss.get("cci_ob", 100), step=10, key="ni_cci_ob",
         )
-    with hc2:
-        st.number_input(
-            "Parallel Workers",
-            min_value=1, max_value=32,
-            value=int(ss.get("workers", 10)),
-            key="workers_bt",
-            help="Thread count for backtest symbol processing.",
+    with c3:
+        cci_os = st.number_input(
+            "Oversold", min_value=-300, max_value=-50,
+            value=ss.get("cci_os", -100), step=10, key="ni_cci_os",
         )
+    ss["cci_len"] = int(cci_len)
+    ss["cci_ob"]  = int(cci_ob)
+    ss["cci_os"]  = int(cci_os)
 
+    st.divider()
 
-    st.markdown("**Time-Stop Rules**")
+    # Engine
+    st.markdown("**Engine**")
+    ec1, ec2 = st.columns(2)
+    with ec1:
+        workers = st.slider(
+            "Parallel workers", min_value=1, max_value=20,
+            value=ss.get("workers", 10), step=1, key="sl_workers",
+            help="ThreadPoolExecutor workers for batch scoring",
+        )
+    with ec2:
+        hold_days = st.slider(
+            "Backtest hold days", min_value=5, max_value=60,
+            value=ss.get("hold_days", 20), step=5, key="sl_hold",
+        )
+    ss["workers"]   = int(workers)
+    ss["hold_days"] = int(hold_days)
+
+    st.divider()
+
+    # Auto-refresh
+    st.markdown("**Auto-Refresh**")
+    ar1, ar2 = st.columns([1, 2])
+    with ar1:
+        auto_refresh = st.toggle(
+            "Enable", value=ss.get("auto_refresh", False), key="tog_ar",
+        )
+    with ar2:
+        refresh_mins = st.number_input(
+            "Interval (minutes)", min_value=1, max_value=60,
+            value=ss.get("refresh_mins", 5), step=1, key="ni_refresh",
+            disabled=not auto_refresh,
+        )
+    ss["auto_refresh"]  = bool(auto_refresh)
+    ss["refresh_mins"]  = int(refresh_mins)
+
+    st.divider()
+
+    # Nifty Regime Gate
+    st.markdown("**Nifty Regime Gate** *(optional Tier 1 extra gate)*")
     st.caption(
-        "Time-stop fires when a trade has been open ≥ *Time-Stop Days* bars "
-        "AND the floating PnL is still below *Min PnL %*. "
-        "Lower Min PnL % to avoid cutting near-winners."
+        "When ON, Tier 1 Prime additionally requires Nifty to be in a bull regime "
+        "(Nifty price > EMA200 AND EMA50 > EMA200). "
+        "In a bear/neutral market this keeps Tier 1 empty — by design."
     )
-    tc1, tc2, tc3 = st.columns(3)
-    with tc1:
-        st.number_input(
-            "Time-Stop Days",
-            min_value=3, max_value=40,
-            value=int(ss.get("time_stop_days", 20)),
-            step=1, key="time_stop_days",
-            help="Bars held before time-stop eligibility begins.",
-        )
-    with tc2:
-        st.number_input(
-            "Time-Stop Min PnL %",
-            min_value=0.0, max_value=5.0,
-            value=float(ss.get("time_stop_min_pct", 1.0)),
-            step=0.25, key="time_stop_min_pct",
-            help="If floating PnL < this % after time_stop_days bars, exit. "
-                 "Set to 0 to only exit losing positions. "
-                 "Was 2.0 (cut near-winners) → lowered to 1.0.",
-        )
-    with tc3:
-        st.number_input(
-            "SL Cooldown Days",
-            min_value=0, max_value=15,
-            value=int(ss.get("sl_cooldown_days", 5)),
-            step=1, key="sl_cooldown_days",
-            help="After an SL hit, block new entries on same symbol for N days.",
+    nifty_regime_filter = st.toggle(
+        "Require bull Nifty regime for Tier 1",
+        value=ss.get("nifty_regime_filter", False),
+        key="tog_nifty_regime",
+    )
+    ss["nifty_regime_filter"] = bool(nifty_regime_filter)
+    if nifty_regime_filter:
+        st.info(
+            "ℹ️ Tier 1 will only fire when Nifty is in a confirmed bull regime. "
+            "In sideways or bear markets Tier 1 count will be 0 — that is expected behaviour."
         )
 
-    # Live preview of current time-stop config
-    ts_days = int(ss.get("time_stop_days", 20))
-    ts_pct  = float(ss.get("time_stop_min_pct", 1.0))
-    hold    = int(ss.get("hold_days", 20))
+    st.divider()
+
+    # Cache
+    st.markdown("**Cache**")
+    if st.button("🗑️ Clear Data Cache", key="btn_clear_cache"):
+        st.cache_data.clear()
+        ss.pop("scan_df", None)
+        st.success("Cache cleared.")
+
+    # Preview
     st.markdown(
-        f'<div class="preview-box">'
-        f'<b>Current time-stop config</b><br>'
-        f'  Hold window : <b>{hold} bars</b> (TIMEOUT if no exit by then)<br>'
-        f'  Time-stop   : after bar <b>{ts_days}</b>, exit if PnL &lt; '
-        f'<b class="warn">{ts_pct:.2f}%</b><br>'
-        f'  Effect      : trades above {ts_pct:.2f}% on bar {ts_days} are allowed to run '
-        f'up to bar {hold} ({"same" if ts_days == hold else "then TIMEOUT"})'
-        f'</div>',
+        f'<div class="preview-box">{_preview_common(ss)}</div>',
         unsafe_allow_html=True,
     )
 
 
-def _section_regime():
+def _section_tier1():
     ss = st.session_state
+
     st.markdown(
-        '<div class="cfg-card-title"><span class="dot" style="background:#94a3b8"></span>'
-        'NIFTY REGIME FILTER</div>',
+        '<div class="cfg-card-title">'
+        '<span class="dot" style="background:#22c55e"></span>'
+        'Tier 1 — Prime Gate Thresholds</div>',
         unsafe_allow_html=True,
     )
-    c1, c2 = st.columns([1, 3])
-    with c1:
-        st.toggle("Enable Regime Filter", value=ss.get("nifty_regime_filter", False),
-                  key="nifty_regime_filter",
-                  help="When ON, Execution entries also require Nifty in bull regime")
-    with c2:
-        regime = ss.get("nifty_regime_val", "neutral")
-        color  = {"bull": "#4ade80", "bear": "#f87171", "neutral": "#fbbf24"}.get(regime, "#94a3b8")
-        st.markdown(
-            f'<p style="font-size:12px;color:#64748b;margin-top:8px">Current Nifty regime: '
-            f'<b style="color:{color}">{regime.upper()}</b> '
-            f'(computed at scan time)</p>',
-            unsafe_allow_html=True,
+
+    # persistent_strength
+    st.markdown("**`persistent_strength` — Momentum thresholds**")
+    st.caption("mom3 = 3-month price return  ·  mom6 = 6-month price return")
+    ps1, ps2 = st.columns(2)
+    with ps1:
+        mom3 = st.slider(
+            "mom3 > ( % )", min_value=0, max_value=25,
+            value=ss.get("t1_mom3", 8), step=1, key="sl_mom3",
+            help="Lower = more signals; higher = stricter",
         )
+    with ps2:
+        mom6 = st.slider(
+            "mom6 > ( % )", min_value=0, max_value=40,
+            value=ss.get("t1_mom6", 12), step=1, key="sl_mom6",
+        )
+    ss["t1_mom3"] = int(mom3)
+    ss["t1_mom6"] = int(mom6)
 
+    if mom3 == 0 or mom6 == 0:
+        st.warning("⚠️ Setting either threshold to 0 effectively disables momentum gating.")
+    elif mom3 > 15 or mom6 > 25:
+        st.info("ℹ️ High thresholds — Tier 1 hit rate will be very low.")
 
-def _section_supabase():
-    ss     = st.session_state
-    sb_ok  = _is_available()
-    status = "🟢 Connected" if sb_ok else "🔴 Not configured"
+    st.divider()
+
+    # Fibonacci zone
+    st.markdown("**`in_golden_relaxed` — Fibonacci retracement zone**")
+    st.caption("Price must be between fib_HI% and fib_LO% of the swing range")
+    fb1, fb2 = st.columns(2)
+    with fb1:
+        fib_hi = st.select_slider(
+            "Upper bound (shallower pullback)",
+            options=[23.6, 38.2, 50.0],
+            value=ss.get("t1_fib_hi", 38.2),
+            key="sl_fib_hi",
+            format_func=lambda x: f"{x:.1f}%",
+        )
+    with fb2:
+        fib_lo = st.select_slider(
+            "Lower bound (deeper pullback)",
+            options=[50.0, 61.8, 78.6],
+            value=ss.get("t1_fib_lo", 61.8),
+            key="sl_fib_lo",
+            format_func=lambda x: f"{x:.1f}%",
+        )
+    ss["t1_fib_hi"] = float(fib_hi)
+    ss["t1_fib_lo"] = float(fib_lo)
+
+    if fib_hi >= fib_lo:
+        st.error("❌ Upper bound must be less than lower bound (e.g. 38.2% < 61.8%).")
+
+    st.divider()
+
+    # CCI recovery window
+    st.markdown("**`recent_cci_recovery` — Lookback window**")
+    cci_w = st.slider(
+        "Bars to look back for CCI oversold cross",
+        min_value=1, max_value=10,
+        value=ss.get("t1_cci_window", 5), step=1, key="sl_cci_window",
+        help="1 = strict (must cross today)  ·  10 = very relaxed",
+    )
+    ss["t1_cci_window"] = int(cci_w)
+
+    st.divider()
+
+    # trend_structure — cloud gate
+    st.markdown("**`trend_structure` — Cloud gate**")
+    cloud = st.toggle(
+        "Require above/inside Ichimoku cloud (allow_cloud)",
+        value=ss.get("t1_cloud", True), key="tog_cloud",
+        help="OFF = only EMA alignment required; cloud position ignored",
+    )
+    ss["t1_cloud"] = bool(cloud)
+    if not cloud:
+        st.warning("⚠️ Cloud gate disabled — Tier 1 may fire on stocks below the cloud.")
+
+    st.divider()
+
+    # Squeeze score boost
+    st.markdown("**Squeeze Score Boost** *(optional — not a hard gate)*")
+    sqz_en = st.toggle(
+        "Enable squeeze boost",
+        value=ss.get("t1_squeeze_boost", True), key="tog_squeeze",
+    )
+    ss["t1_squeeze_boost"] = bool(sqz_en)
+
+    if sqz_en:
+        sq1, sq2 = st.columns(2)
+        with sq1:
+            sqz_r = st.slider(
+                "Points on squeeze release", min_value=0, max_value=30,
+                value=ss.get("t1_squeeze_pts", 15), step=5, key="sl_sqz_r",
+                help="BB just exited KC — highest conviction boost",
+            )
+        with sq2:
+            sqz_n = st.slider(
+                "Points when NOT in squeeze", min_value=0, max_value=15,
+                value=ss.get("t1_no_squeeze_pts", 5), step=5, key="sl_sqz_n",
+                help="Neutral: not compressed, no extra signal",
+            )
+        ss["t1_squeeze_pts"]    = int(sqz_r)
+        ss["t1_no_squeeze_pts"] = int(sqz_n)
+    else:
+        ss["t1_squeeze_pts"]    = 0
+        ss["t1_no_squeeze_pts"] = 0
+
+    st.divider()
+
+    # Score weight
+    st.markdown("**Score weight — persistent_strength contribution**")
+    ps_weight = st.slider(
+        "Points added when persistent_strength = True",
+        min_value=5, max_value=30,
+        value=ss.get("t1_ps_weight", 20), step=5, key="sl_ps_weight",
+    )
+    ps_penalty = st.slider(
+        "Points deducted when persistent_strength = False",
+        min_value=-20, max_value=0,
+        value=ss.get("t1_ps_penalty", -10), step=5, key="sl_ps_penalty",
+    )
+    ss["t1_ps_weight"]  = int(ps_weight)
+    ss["t1_ps_penalty"] = int(ps_penalty)
+
+    # Preview
     st.markdown(
-        '<div class="cfg-card-title"><span class="dot" style="background:#22d3ee"></span>'
-        f'SUPABASE / WATCHLIST  ·  {status}</div>',
+        f'<div class="preview-box">{_preview_tier1(ss)}</div>',
         unsafe_allow_html=True,
     )
-    if not sb_ok:
-        st.caption("Set SUPABASE_URL and SUPABASE_KEY in environment to enable cloud storage.")
+
+
+def _section_tier2():
+    ss = st.session_state
+
+    st.markdown(
+        '<div class="cfg-card-title">'
+        '<span class="dot" style="background:#3b82f6"></span>'
+        'Tier 2 — Compression Breakout Gate</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Compression detection
+    st.markdown("**Compression detection**")
+    comp1, comp2 = st.columns(2)
+    with comp1:
+        comp_bars = st.slider(
+            "Compression window (bars)", min_value=5, max_value=20,
+            value=ss.get("t2_comp_bars", 10), step=1, key="sl_comp_bars",
+            help="Number of prior bars to define the range high and ATR baseline",
+        )
+    with comp2:
+        atr_ratio = st.slider(
+            "ATR compression ratio", min_value=0.60, max_value=0.95,
+            value=ss.get("t2_atr_ratio", 0.85), step=0.05, key="sl_atr_ratio",
+            format="%.2f",
+            help="prev_bar ATR must be < SMA(ATR, window) × this ratio",
+        )
+    ss["t2_comp_bars"] = int(comp_bars)
+    ss["t2_atr_ratio"] = float(atr_ratio)
+
+    if atr_ratio > 0.92:
+        st.info("ℹ️ High ratio — almost any bar will qualify as 'compressed'. Expect many false triggers.")
+    elif atr_ratio < 0.70:
+        st.info("ℹ️ Low ratio — only very tight compressions qualify. Fewer but higher-quality signals.")
+
+    st.divider()
+
+    # CCI momentum expansion
+    st.markdown("**`cci_momentum_break` — CCI threshold**")
+    st.caption("CCI must be above this level AND still rising — confirms bullish momentum, not just oversold bounce")
+    cci_ob_t2 = st.slider(
+        "CCI overbought threshold for Tier 2",
+        min_value=50, max_value=200,
+        value=ss.get("cci_ob", 100), step=10, key="sl_t2_cci_ob",
+        help="Synced with CCI OB in Common — change here updates both",
+    )
+    ss["cci_ob"] = int(cci_ob_t2)
+
+    if cci_ob_t2 < 80:
+        st.warning("⚠️ CCI threshold below 80 — will capture many borderline momentum readings.")
+    elif cci_ob_t2 > 150:
+        st.info("ℹ️ High CCI threshold — only strong continuation moves will qualify.")
+
+    st.divider()
+
+    # Volume expansion
+    st.markdown("**`volume_expansion` — Volume multiplier**")
+    vol_mult = st.slider(
+        "Volume > avg × multiplier",
+        min_value=1.0, max_value=3.0,
+        value=ss.get("t2_vol_mult", 1.2), step=0.1, key="sl_vol_mult",
+        format="%.1f",
+        help="Current volume must exceed the 20-bar average by this multiple",
+    )
+    ss["t2_vol_mult"] = float(vol_mult)
+
+    if vol_mult < 1.1:
+        st.warning("⚠️ Multiplier below 1.1 is nearly always true — effectively disabling volume gate.")
+    elif vol_mult > 2.0:
+        st.info("ℹ️ Strict volume filter — only high-conviction breakouts will pass.")
+
+    st.divider()
+
+    # Score threshold
+    st.markdown("**Score threshold override for Tier 2 legacy signals**")
+    st.caption("Applies to `any_buy` fallback signals — NOT to the compression breakout gate above")
+    min_score = st.slider(
+        "Minimum normalised score (0-100)",
+        min_value=50, max_value=85,
+        value=ss.get("min_score", 70), step=5, key="sl_min_score",
+    )
+    ss["min_score"] = int(min_score)
+
+    # Preview
+    st.markdown(
+        f'<div class="preview-box">{_preview_tier2(ss)}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+#  WATCHLIST  (compact version — full management in settings)
+# ══════════════════════════════════════════════════════════════════
+
+def _section_watchlist():
+    supabase_ok = _is_available()
+
+    if "watchlist_loaded" not in st.session_state:
+        if supabase_ok:
+            st.session_state["watchlist"] = load_watchlist()
+        else:
+            st.session_state.setdefault("watchlist", [])
+        st.session_state["watchlist_loaded"] = True
+
+    wl: list[dict] = st.session_state.get("watchlist", [])
+
+    st.markdown(
+        '<div class="cfg-card-title">'
+        '<span class="dot" style="background:#f59e0b"></span>'
+        'Watchlist Manager</div>',
+        unsafe_allow_html=True,
+    )
+
+    if wl:
+        wl_df = pd.DataFrame(wl)[["symbol", "notes"]].rename(
+            columns={"symbol": "Symbol", "notes": "Notes"}
+        )
+        st.dataframe(wl_df, use_container_width=True, hide_index=True)
+
+    # Bulk edit
+    st.markdown("**Bulk edit** *(replaces entire list)*")
+    bulk_raw = st.text_area(
+        "One symbol per line",
+        value="\n".join(w["symbol"] for w in wl),
+        height=120, key="bulk_wl",
+        label_visibility="collapsed",
+    )
+    wl_cols = st.columns([1, 1, 3])
+    with wl_cols[0]:
+        if st.button("💾 Save Watchlist", type="primary", key="btn_save_wl"):
+            new_syms = [s.strip().upper() for s in bulk_raw.splitlines() if s.strip()]
+            if supabase_ok:
+                ok = save_watchlist(new_syms)
+                if ok:
+                    st.session_state["watchlist"] = load_watchlist()
+                    st.success(f"✅ Saved {len(new_syms)} symbols.")
+                else:
+                    st.error("❌ Supabase error.")
+            else:
+                st.session_state["watchlist"] = [{"symbol": s, "notes": ""} for s in new_syms]
+                st.success(f"✅ {len(new_syms)} symbols (session only).")
+    with wl_cols[1]:
+        if wl:
+            rm = st.selectbox("Remove", ["—"] + [w["symbol"] for w in wl],
+                              key="wl_rm_sel", label_visibility="collapsed")
+            if st.button("✕ Remove", key="btn_rm_wl"):
+                if rm != "—":
+                    st.session_state["watchlist"] = [
+                        w for w in st.session_state.get("watchlist", []) if w["symbol"] != rm
+                    ]
+                    st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SCAN HISTORY
+# ══════════════════════════════════════════════════════════════════
+
+def _section_history():
+    supabase_ok = _is_available()
+
+    st.markdown(
+        '<div class="cfg-card-title">'
+        '<span class="dot" style="background:#8b5cf6"></span>'
+        'Scan History</div>',
+        unsafe_allow_html=True,
+    )
+
+    if not supabase_ok:
+        st.caption("Enable Supabase to persist and view scan history.")
         return
 
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("🔄 Reload Watchlist", use_container_width=True):
-            wl = load_watchlist()
-            ss["watchlist"] = wl
-            st.success(f"Loaded {len(wl)} symbols")
-
-    with c2:
-        if st.button("☁️ Save Watchlist to Cloud", use_container_width=True):
-            wl = ss.get("watchlist", [])
-            ok = save_watchlist(wl)
-            st.success("Saved!") if ok else st.error("Save failed.")
-
-    hist = load_scan_history(limit=5)
-    # load_scan_history returns a DataFrame — use .empty, not truthiness
-    hist_ok = (hist is not None and hasattr(hist, "empty") and not hist.empty)
-    if hist_ok:
-        st.markdown("**Recent snapshots**")
-        for _, row in hist.iterrows():
-            st.caption(f"• {row.get('label','—')}  ·  {str(row.get('created_at',''))[:16]}")
+    if st.button("Load Last 10 Runs", key="btn_hist"):
+        history = load_scan_history(limit=10)
+        if not history.empty:
+            for ts, grp in history.groupby("run_at"):
+                with st.expander(f"🕐 {ts} — {len(grp)} stocks"):
+                    st.dataframe(
+                        grp[["symbol", "score", "action", "cci", "entry", "sl", "t1"]]
+                        .rename(columns=str.title)
+                        .reset_index(drop=True),
+                        use_container_width=True,
+                    )
+        else:
+            st.info("No scan history found.")
 
 
 # ══════════════════════════════════════════════════════════════════
-#  RENDER
+#  SUPABASE STATUS
 # ══════════════════════════════════════════════════════════════════
 
-def render() -> None:
-    ss = st.session_state
+def _section_supabase():
+    st.markdown(
+        '<div class="cfg-card-title">'
+        '<span class="dot" style="background:#64748b"></span>'
+        'Supabase Connection</div>',
+        unsafe_allow_html=True,
+    )
+    if _is_available():
+        st.success("✅ Supabase connected.")
+    else:
+        st.warning(
+            "Not configured. Add to `.streamlit/secrets.toml`:\n\n"
+            "```toml\nSUPABASE_URL = \"https://xxx.supabase.co\"\n"
+            "SUPABASE_KEY = \"your-anon-key\"\n```"
+        )
+    with st.expander("Database Schema SQL", expanded=False):
+        st.code(SCHEMA_SQL, language="sql")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MAIN RENDER
+# ══════════════════════════════════════════════════════════════════
+
+def render() -> dict:
     st.markdown(_CSS, unsafe_allow_html=True)
 
-    # Seed defaults once
-    for k, v in DEFAULTS.items():
-        ss.setdefault(k, v)
-
     st.markdown(
-        '<p style="font-size:18px;font-weight:700;color:#f1f5f9;margin-bottom:16px">'
-        '⚙️ Scanner Settings</p>',
+        '<h2 style="font-family:Syne,sans-serif;font-size:1.3rem;'
+        'font-weight:700;margin-bottom:0.2rem">⚙️ Settings</h2>'
+        '<p style="font-size:11px;color:#475569;margin-bottom:1rem">'
+        'Changes take effect on the next Run Scan / Backtest run.</p>',
         unsafe_allow_html=True,
     )
 
-    tab_labels = ["🌐 Universe", "📊 Execution", "👁 Watch", "⚠️ Risk", "🧪 Backtest", "🌍 Regime", "☁️ Supabase"]
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(tab_labels)
+    # ── Section tabs ─────────────────────────────────────────────
+    section = st.radio(
+        "section",
+        ["⚙️ Common", "🏆 Tier 1", "📈 Tier 2", "⭐ Watchlist", "🗄️ System"],
+        label_visibility="collapsed",
+        key="settings_section",
+    )
 
-    with tab1:
-        st.markdown('<div class="cfg-card">', unsafe_allow_html=True)
-        _section_universe()
-        st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('<div class="cfg-card">', unsafe_allow_html=True)
 
-        st.markdown('<div class="cfg-card">', unsafe_allow_html=True)
-        _section_cci()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with tab2:
-        st.markdown('<div class="cfg-card">', unsafe_allow_html=True)
-        _section_execution()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with tab3:
-        st.markdown('<div class="cfg-card">', unsafe_allow_html=True)
-        _section_watch()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with tab4:
-        st.markdown('<div class="cfg-card">', unsafe_allow_html=True)
-        _section_risk()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with tab5:
-        st.markdown('<div class="cfg-card">', unsafe_allow_html=True)
-        _section_backtest()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with tab6:
-        st.markdown('<div class="cfg-card">', unsafe_allow_html=True)
-        _section_regime()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with tab7:
-        st.markdown('<div class="cfg-card">', unsafe_allow_html=True)
+    if section == "⚙️ Common":
+        _section_common()
+    elif section == "🏆 Tier 1":
+        _section_tier1()
+    elif section == "📈 Tier 2":
+        _section_tier2()
+    elif section == "⭐ Watchlist":
+        _section_watchlist()
+        _section_history()
+    elif section == "🗄️ System":
         _section_supabase()
-        st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── Reset button
-    st.divider()
-    if st.button("↩ Reset All to Defaults", use_container_width=False):
-        for k, v in DEFAULTS.items():
-            ss[k] = v
-        st.success("Settings reset to defaults.")
-        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Return settings consumed by scanner/backtest ─────────────
+    ss = st.session_state
+    return {
+        "symbols":              ss.get("symbols",           NIFTY500_SYMBOLS),
+        "cci_len":              ss.get("cci_len",           20),
+        "cci_ob":               ss.get("cci_ob",            100),
+        "cci_os":               ss.get("cci_os",           -100),
+        "workers":              ss.get("workers",           10),
+        "hold_days":            ss.get("hold_days",         20),
+        "min_score":            ss.get("min_score",         70),
+        "auto_refresh":         ss.get("auto_refresh",      False),
+        "refresh_mins":         ss.get("refresh_mins",      5),
+        # Tier 1 tuning
+        "t1_mom3":              ss.get("t1_mom3",           8),
+        "t1_mom6":              ss.get("t1_mom6",           12),
+        "t1_fib_hi":            ss.get("t1_fib_hi",         38.2),
+        "t1_fib_lo":            ss.get("t1_fib_lo",         61.8),
+        "t1_cci_window":        ss.get("t1_cci_window",     5),
+        "t1_cloud":             ss.get("t1_cloud",          True),
+        "t1_squeeze_boost":     ss.get("t1_squeeze_boost",  True),
+        "t1_squeeze_pts":       ss.get("t1_squeeze_pts",    15),
+        "t1_no_squeeze_pts":    ss.get("t1_no_squeeze_pts", 5),
+        "t1_ps_weight":         ss.get("t1_ps_weight",      20),
+        "t1_ps_penalty":        ss.get("t1_ps_penalty",    -10),
+        # Tier 2 tuning
+        "t2_comp_bars":         ss.get("t2_comp_bars",      10),
+        "t2_atr_ratio":         ss.get("t2_atr_ratio",      0.85),
+        "t2_vol_mult":          ss.get("t2_vol_mult",       1.2),
+        # Nifty regime
+        "nifty_regime_filter":  ss.get("nifty_regime_filter", False),
+    }
