@@ -229,7 +229,7 @@ NIFTY500_SYMBOLS = [
 #  DATA FETCHING
 # ══════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
     try:
         df = yf.Ticker(f"{symbol}.NS").history(period=period, interval=interval, auto_adjust=True)
@@ -241,7 +241,7 @@ def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.Dat
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") -> dict:
     if not symbols:
         return {}
@@ -266,7 +266,7 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") 
             continue
     return result
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_nifty(period: str = "1y") -> pd.Series:
     try:
         df    = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
@@ -350,6 +350,7 @@ def score_stock(
         "Tier":         r.tier,
         "AccTier":      r.acc_tier,
         "AccScore":     r.acc_score,
+        "_elite_tier":  r.elite_tier,
         "Score":        r.norm_score,
         "Action":       r.action,
         "Setup":        r.setup,

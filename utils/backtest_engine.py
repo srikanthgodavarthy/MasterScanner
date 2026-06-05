@@ -86,17 +86,44 @@ def generate_signals_historical(
         if r is None:
             continue
 
-        # ── Tier filter ───────────────────────────────────────────
-        if tier_filter == "Tier 1" and not r.tier1_prime:
-            continue
-        if tier_filter == "Tier 2" and (r.tier1_prime or not r.any_buy):
-            continue
+        # ── ENTRY GATE — score as ranking, not open filter ────────
+        #
+        # Problem with the old logic: "Both" tier fell through to a
+        # bare norm_score >= min_score check, turning every reasonably-
+        # scored bar into a candidate — score as filter, not ranking.
+        #
+        # New gate hierarchy (strict):
+        #   Tier 1 only  → tier1_prime required, no score floor needed
+        #   Tier 2 only  → tier2_momentum OR (any_buy AND NOT tier1_prime)
+        #                  score must be >= min_score
+        #   Both         → Elite/T1 pass unconditionally;
+        #                  T2 requires any_buy=True AND score >= min_score
+        #                  AND above/inside cloud
+        #   In ALL cases: if neither any_buy nor tier1_prime nor
+        #                 tier2_momentum → skip (no free-floating score entries)
 
-        # ── Score filter ──────────────────────────────────────────
-        if not r.tier1_prime and not r.tier2_momentum:
-            allow_cloud_buy = r.above_cloud or (r.inside_cloud and r.norm_score >= 65)
-            if r.norm_score < min_score or not allow_cloud_buy:
+        if tier_filter == "Tier 1":
+            if not r.tier1_prime:
                 continue
+
+        elif tier_filter == "Tier 2":
+            if r.tier1_prime:
+                continue
+            if not (r.tier2_momentum or r.any_buy):
+                continue
+            allow_cloud = r.above_cloud or (r.inside_cloud and r.norm_score >= 65)
+            if r.norm_score < min_score or not allow_cloud:
+                continue
+
+        else:  # "Both" — Elite + T1 pass free; T2 needs buy signal + score
+            if r.elite_tier or r.tier1_prime:
+                pass  # unconditional
+            elif r.tier2_momentum or r.any_buy:
+                allow_cloud = r.above_cloud or (r.inside_cloud and r.norm_score >= 65)
+                if r.norm_score < min_score or not allow_cloud:
+                    continue
+            else:
+                continue  # no valid buy signal at all — skip
 
         # ── RS positive filter ────────────────────────────────────
         if rs_positive_only and not r.rs_positive:
@@ -118,6 +145,7 @@ def generate_signals_historical(
             "rsi":             round(r.cur_rsi, 1),
             "tier1_prime":     r.tier1_prime,
             "tier2_momentum":  r.tier2_momentum,
+            "elite_tier":      r.elite_tier,
             "squeeze_release": r.squeeze_release,
             "setup":           r.setup,
             "buy_type":        r.buy_type,
@@ -215,6 +243,7 @@ def simulate_trades(
             "tier":            sig.get("tier", "-"),
             "tier1_prime":     bool(sig.get("tier1_prime",    False)),
             "tier2_momentum":  bool(sig.get("tier2_momentum", False)),
+            "elite_tier":      bool(sig.get("elite_tier",     False)),
             "squeeze_release": bool(sig.get("squeeze_release", False)),
             "rs_positive":     bool(sig.get("rs_positive", False)),
             "rs_val":          float(sig.get("rs_val", 0.0)),
@@ -385,10 +414,12 @@ def compute_stats(trades: pd.DataFrame) -> dict:
         "best_trade":         round(trades["pnl_pct"].max(), 2),
         "worst_trade":        round(trades["pnl_pct"].min(), 2),
         "exit_breakdown":     trades["exit_reason"].value_counts().to_dict(),
+        "elite_trades":       int(trades.get("elite_tier",     pd.Series([False]*total)).sum()),
         "t1_prime_trades":    int(trades.get("tier1_prime",    pd.Series([False]*total)).sum()),
         "t2_momentum_trades": int(trades.get("tier2_momentum", pd.Series([False]*total)).sum()),
         "squeeze_trades":     int(trades.get("squeeze_release",pd.Series([False]*total)).sum()),
         "rs_positive_trades": int(trades.get("rs_positive",    pd.Series([False]*total)).sum()),
+        "elite_stats":        _slice("elite_tier"),
         "t1_prime_stats":     _slice("tier1_prime"),
         "t2_momentum_stats":  _slice("tier2_momentum"),
         "squeeze_stats":      _slice("squeeze_release"),

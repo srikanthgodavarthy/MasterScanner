@@ -78,11 +78,11 @@ CATEGORY_SIGNALS: dict[str, list[tuple[str, str, float]]] = {
     ],
 
     "Structure": [
-        ("_in_golden_relaxed",  "bool",  0.30),  # Fib 38.2–61.8 zone
+        ("_compression_break",  "bool",  0.30),  # ATR compression breakout  <- raised from 0.15
         ("_harm_bull",          "bool",  0.25),  # bullish harmonic pattern
         ("_abcd_bull",          "bool",  0.20),  # bullish ABCD pattern
-        ("_compression_break",  "bool",  0.15),  # ATR compression breakout
-        ("_in_golden",          "bool",  0.10),  # strict 50–61.8 zone
+        ("_in_golden_relaxed",  "bool",  0.15),  # Fib 38.2-61.8 zone       <- lowered from 0.30
+        ("_in_golden",          "bool",  0.10),  # strict 50-61.8 zone
     ],
 
     # FIX 1: vol_ratio replaces Score — no double-counting
@@ -115,25 +115,25 @@ for _cat, _sigs in CATEGORY_SIGNALS.items():
 
 REGIME_WEIGHTS: dict[str, dict[str, float]] = {
     "TREND": {
-        "Trend":     0.35,
-        "Momentum":  0.25,
-        "Structure": 0.20,
-        "Volume":    0.12,
-        "Quality":   0.08,
+        "Trend":     0.25,
+        "Momentum":  0.20,
+        "Structure": 0.15,
+        "Volume":    0.10,
+        "Quality":   0.30,
     },
     "RANGE": {
         "Trend":     0.15,
         "Momentum":  0.20,
-        "Structure": 0.35,
-        "Volume":    0.15,
-        "Quality":   0.15,
+        "Structure": 0.25,
+        "Volume":    0.10,
+        "Quality":   0.30,
     },
     "VOLATILE": {
         "Trend":     0.10,
         "Momentum":  0.15,
-        "Structure": 0.30,
-        "Volume":    0.20,
-        "Quality":   0.25,
+        "Structure": 0.20,
+        "Volume":    0.10,
+        "Quality":   0.45,
     },
 }
 
@@ -299,10 +299,13 @@ def compute_composite(
 # ══════════════════════════════════════════════════════════════════
 
 def _classify_tier(row: dict, regime: str, composite: float, threshold: float) -> str:
-    is_t1 = bool(row.get("_tier1_prime",    False))
-    is_t2 = bool(row.get("_tier2_momentum", False)) or bool(row.get("_any_buy", False))
+    is_elite = bool(row.get("_elite_tier",    False))
+    is_t1    = bool(row.get("_tier1_prime",   False))
+    is_t2    = bool(row.get("_tier2_momentum",False)) or bool(row.get("_any_buy", False))
 
     if regime == "TREND":
+        if is_elite and composite >= threshold:
+            return "Elite"
         if is_t1 and composite >= threshold:
             return "Tier-1"
         if is_t2 and composite >= threshold * 0.80:
@@ -506,7 +509,7 @@ def apply_regime_layer(
         cat_scores, _, composite  = compute_composite(rd, ctx.regime, ctx)
 
         tier         = _classify_tier(rd, ctx.regime, composite, ctx.execute_threshold)
-        execute_flag = tier in ("Tier-1", "Tier-2")
+        execute_flag = tier in ("Elite", "Tier-1", "Tier-2")
         ps_mult      = position_size_multiplier(ctx.regime, composite)
         top_cat      = max(cat_scores, key=cat_scores.get)
 
@@ -542,6 +545,7 @@ def apply_regime_layer(
 
 def regime_summary(df_aug: pd.DataFrame, ctx: RegimeContext) -> dict:
     tiers    = df_aug.get("regime_tier", pd.Series(dtype=str))
+    n_elite  = int((tiers == "Elite").sum())
     n_t1     = int((tiers == "Tier-1").sum())
     n_t2     = int((tiers == "Tier-2").sum())
     n_watch  = int((tiers == "Watch").sum())
@@ -559,9 +563,10 @@ def regime_summary(df_aug: pd.DataFrame, ctx: RegimeContext) -> dict:
         "nifty_ema200":    ctx.nifty_above_ema200,
         "nifty_mom3":      ctx.nifty_mom3,
         "nifty_mom6":      ctx.nifty_mom6,
+        "n_elite":         n_elite,
         "n_tier1":         n_t1,
         "n_tier2":         n_t2,
-        "n_execute":       n_t1 + n_t2,
+        "n_execute":       n_elite + n_t1 + n_t2,
         "n_watch":         n_watch,
         "n_skip":          n_skip,
         "n_total":         len(df_aug),

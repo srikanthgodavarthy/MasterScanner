@@ -133,6 +133,7 @@ class BarResult:
     # ── Tier gates ──────────────────────────────────────────────
     tier1_prime:      bool = False
     tier2_momentum:   bool = False
+    elite_tier:       bool = False   # NEW: Elite gate
     any_buy:          bool = False
 
     # ── Score ────────────────────────────────────────────────────
@@ -719,10 +720,25 @@ def compute_bar(
         nifty_allows
     )
 
+    # ── ELITE TIER ────────────────────────────────────────────────
+    # Elite = tier1_prime AND score>=85 AND rs>=0.10 AND vol_ratio>=1.5
+    _vol_ratio_cur = (cur_v / cur_vavg) if cur_vavg > 0 else 0.0
+    is_elite = (
+        is_tier1_prime and
+        norm_score >= 85 and
+        rs >= 0.10 and
+        _vol_ratio_cur >= 1.5
+    )
+
     # ── TIER CLASSIFICATION ───────────────────────────────────────
+    # Fib-only entries (Fib, Fib+CCI) are demoted to Watch (not Tier 2)
+    is_fib_only = (is_fib_buy_base or is_fib_buy_cci) and not is_tier1_prime
+
     tier = (
+        "Elite"  if is_elite          else
         "Tier 1" if is_tier1_prime    else
         "Tier 2" if is_tier2_momentum else
+        "Watch"  if is_fib_only       else
         "Tier 2" if any_buy           else
         "Other"
     )
@@ -769,11 +785,26 @@ def compute_bar(
         "Norm"    if is_norm_buy       else "-"
     )
 
+    # ── EXECUTION TIER FLAG ───────────────────────────────────────
+    # Execution = score>=85 AND rs>=0.10 AND buy_type in [Norm, CmpBrk]
+    # buy_type is computed later so we derive it inline here
+    _exec_buy_type = (
+        "CmpBrk" if is_tier2_momentum else
+        "Norm"   if is_norm_buy       else None
+    )
+    is_execution = (
+        norm_score >= 85 and
+        rs >= 0.10 and
+        _exec_buy_type is not None
+    )
+
     acc_tier = (
-        "T1★" if is_tier1_prime              else
-        "A"   if (qualified and any_buy)     else
-        "B"   if any_buy                     else
-        "C"   if norm_score >= 50            else
+        "Elite"     if is_elite                    else
+        "Execution" if is_execution                else
+        "T1★"       if is_tier1_prime              else
+        "A"         if (qualified and any_buy)     else
+        "B"         if any_buy                     else
+        "C"         if norm_score >= 50            else
         "D"
     )
     acc_score = norm_score + (20 if is_tier1_prime else 0) + (10 if qualified else 0)
@@ -846,6 +877,7 @@ def compute_bar(
     return BarResult(
         tier1_prime      = is_tier1_prime,
         tier2_momentum   = is_tier2_momentum,
+        elite_tier       = is_elite,
         any_buy          = any_buy,
         norm_score       = norm_score,
         score_threshold  = score_threshold,
