@@ -50,6 +50,10 @@ DEFAULTS = {
     "t2_vol_mult":       1.2,
     # Nifty regime original gate
     "nifty_regime_filter": False,
+    # Tier 1 — Relative Strength + ADX / EMA slope strength gate (NEW)
+    "t1_rs_min":   0.0,    # RS > 0 = stock outperforming Nifty
+    "t1_adx_min":  20.0,   # ADX threshold
+    "t1_use_adx":  True,   # True = ADX gate; False = EMA20 slope gate
 }
 
 _CSS = """
@@ -102,6 +106,7 @@ def _preview_tier1(ss):
     cci_w = ss.get("t1_cci_window", 5); cloud = ss.get("t1_cloud", True)
     sqz   = ss.get("t1_squeeze_boost", True)
     sqz_r = ss.get("t1_squeeze_pts", 15); sqz_n = ss.get("t1_no_squeeze_pts", 5)
+    rs_min = ss.get("t1_rs_min", 0.0); adx_min = ss.get("t1_adx_min", 20); use_adx = ss.get("t1_use_adx", True)
     lines = [
         f'<b>Tier 1 — Prime Gate</b>',
         f'  trend_up          = price > EMA200 <span class="ok">AND</span> EMA20 > EMA50',
@@ -265,6 +270,33 @@ def _section_tier1():
 
     st.divider()
     st.markdown("**Squeeze Score Boost** *(optional — not a hard gate)*")
+    # ── NEW: RS + Strength gate ──────────────────────────────────────────────
+    st.markdown("**📈 Tier-1 Strength Gate (RS + ADX / EMA Slope)**")
+    _use_adx = st.toggle(
+        "Use ADX gate (off = EMA20 slope gate)",
+        value=ss.get("t1_use_adx", True), key="tog_use_adx",
+        help="ON: Tier 1 requires ADX > threshold. OFF: requires EMA20 slope positive.",
+    )
+    ss["t1_use_adx"] = bool(_use_adx)
+
+    _rs_col, _adx_col = st.columns(2)
+    with _rs_col:
+        _rs_min = st.number_input(
+            "RS Min (Nifty 5-bar, 0=positive)", -0.05, 0.10,
+            float(ss.get("t1_rs_min", 0.0)), step=0.01, format="%.3f",
+            key="ni_rs_min",
+            help="Stock must outperform Nifty by at least this much over 5 bars. 0 = any positive RS.",
+        )
+        ss["t1_rs_min"] = float(_rs_min)
+    with _adx_col:
+        _adx_min = st.number_input(
+            "ADX Min (when ADX gate on)", 10, 40,
+            int(ss.get("t1_adx_min", 20)), step=1,
+            key="ni_adx_min",
+            help="Minimum ADX value required for Tier 1 (when ADX gate is enabled).",
+        )
+        ss["t1_adx_min"] = int(_adx_min)
+
     sqz_en = st.toggle("Enable squeeze boost", value=ss.get("t1_squeeze_boost", True), key="tog_squeeze")
     ss["t1_squeeze_boost"] = bool(sqz_en)
     if sqz_en:
