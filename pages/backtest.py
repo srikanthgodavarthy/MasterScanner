@@ -1,13 +1,5 @@
 """
 Backtest Engine Page — wrapped in render() for clean import from app.py.
-
-v3 additions:
-  - Sidebar: Buy Type filter (multi-select), Score threshold, RS Positive toggle
-  - Tier filter expanded to "Both / Tier 1 / Tier 2" (was hidden in bt_tier_mode)
-  - Info bar shows all active filters at a glance
-  - Results table shows tier, buy_type, rs_positive columns
-  - RS-positive breakdown stats card
-  - Buy-type performance breakdown table
 """
 
 import sys, os
@@ -22,9 +14,7 @@ from utils.scanner_engine import NIFTY500_SYMBOLS
 from utils.backtest_engine import run_backtest, compute_stats
 from utils.supabase_client import save_backtest_results, load_backtest_summary
 
-# All recognised buy types produced by compute_bar
-ALL_BUY_TYPES = ["Norm", "Fib", "Fib+CCI", "Harm", "ABCD", "CCI", "CmpBrk"]
-
+# ── Default symbol list for backtest ──────────────────────────────────────────
 DEFAULT_BT_SYMS = [
     "RELIANCE","TCS","HDFCBANK","INFY","SBIN","ICICIBANK","AXISBANK",
     "WIPRO","MARUTI","LT","HAL","BEL","DLF","AMBUJACEM","ULTRACEMCO",
@@ -50,47 +40,11 @@ def render(settings=None):
             key="bt_universe",
         )
 
-        st.markdown("---")
-        st.markdown("#### 📋 Signal Filters")
-
-        # ── Tier filter ───────────────────────────────────────────
-        bt_tier_filter = st.selectbox(
-            "Tier Filter",
-            ["Both", "Elite", "Tier 1", "Tier 2"],
-            index=0,
-            key="bt_tier_filter",
-            help="Elite = highest-conviction setups. Tier 1 = Prime setups (RS+ADX confirmed). Tier 2 = Fib/CCI/Norm/Compression. Both = all.",
-        )
-
-        # ── Buy Type filter ───────────────────────────────────────
-        bt_buy_type_filter = st.multiselect(
-            "Buy Type",
-            options=ALL_BUY_TYPES,
-            default=[],
-            key="bt_buy_type",
-            help="Leave empty to include all buy types. Select one or more to restrict.",
-        )
-        buy_type_filter = bt_buy_type_filter if bt_buy_type_filter else None
-
-        # ── Score threshold ───────────────────────────────────────
-        bt_min_score = st.slider(
-            "Min Score for Entry", 50, 100, 70, step=5,
-            key="bt_min_score",
-            help="Signals below this score are excluded (unless Tier 1 Prime).",
-        )
-
-        # ── RS Positive toggle ────────────────────────────────────
-        bt_rs_positive_only = st.checkbox(
-            "RS Positive only",
-            value=False,
-            key="bt_rs_positive_only",
-            help="Only include signals where stock outperformed Nifty over last 5 bars.",
-        )
 
         st.markdown("---")
-        st.markdown("#### ⚙️ Simulation")
 
-        bt_hold_days = st.slider("Max Hold Days",  5,  60, 20, step=5, key="bt_hold_days")
+        bt_min_score = st.slider("Min Score for Entry", 50, 100, 70, step=5, key="bt_min_score")
+        bt_hold_days = st.slider("Max Hold Days",         5,  60, 20, step=5, key="bt_hold_days")
         bt_cci_len   = st.number_input("CCI Length",     5,  50,
                                         st.session_state.get("cci_len", 20), key="bt_cci_len")
         bt_cci_ob    = st.number_input("CCI Overbought", 50, 300,
@@ -101,6 +55,7 @@ def render(settings=None):
 
     # ── Header ────────────────────────────────────────────────────────────────
     st.markdown("### 🧪 Backtest Engine")
+
     st.markdown(
         "<span style='color:#64748b;font-size:0.82rem;'>"
         "Walk-forward simulation on 3 years of daily data. "
@@ -109,35 +64,32 @@ def render(settings=None):
     )
     st.markdown("")
 
-    # ── Run row ───────────────────────────────────────────────────────────────
-    col_run, col_info = st.columns([1.2, 5])
+    col_run, col_tier, col_info = st.columns([1.5, 1.3, 4])
     with col_run:
         run_bt = st.button("▶ Run Backtest", use_container_width=True, key="btn_run_bt")
+    with col_tier:
+        bt_tier_mode = st.selectbox(
+            "tier_mode",
+            ["Both Tiers", "🏆 Tier 1 Only", "📈 Tier 2 Only"],
+            label_visibility="collapsed",
+            key="bt_tier_mode",
+        )
     with col_info:
-        _tier_label = {
-            "Both":   "<b style='color:#94a3b8'>Both Tiers</b>",
-            "Elite":  "<b style='color:#ffd700'>Elite only</b>",
-            "Tier 1": "<b style='color:#a78bfa'>Tier 1 Prime only</b>",
-            "Tier 2": "<b style='color:#60a5fa'>Tier 2 only</b>",
-        }[bt_tier_filter]
-        _bt_tags = [
-            f"Symbols: <b>{len(bt_universe)}</b>",
-            _tier_label,
-            f"Score ≥ <b>{bt_min_score}</b>",
-            f"Hold: <b>{bt_hold_days}d</b>",
-            f"Data: <b>3y daily</b>",
-        ]
-        if buy_type_filter:
-            _bt_tags.append(f"Buy Type: <b>{', '.join(buy_type_filter)}</b>")
-        if bt_rs_positive_only:
-            _bt_tags.append("<b style='color:#22c55e'>RS Positive ✔</b>")
-
+        _tier_lbl = {
+            "Both Tiers":    "Both Tiers",
+            "🏆 Tier 1 Only": "<b style='color:#a78bfa'>Tier 1 only</b>",
+            "📈 Tier 2 Only": "<b style='color:#60a5fa'>Tier 2 only</b>",
+        }[bt_tier_mode]
         st.markdown(
             f"<div style='padding:0.55rem 0;color:#64748b;font-size:0.78rem;'>"
-            + " &nbsp;|&nbsp; ".join(_bt_tags)
-            + "</div>",
+            f"Symbols: <b>{len(bt_universe)}</b> &nbsp;|&nbsp; "
+            f"{_tier_lbl} &nbsp;|&nbsp; "
+            f"Score ≥ <b>{bt_min_score}</b> &nbsp;|&nbsp; "
+            f"Hold: <b>{bt_hold_days}d</b> &nbsp;|&nbsp; Data: <b>3y daily</b>"
+            f"</div>",
             unsafe_allow_html=True,
         )
+    bt_tier1_only = bt_tier_mode == "🏆 Tier 1 Only"
 
     # ── Run ───────────────────────────────────────────────────────────────────
     if run_bt:
@@ -155,39 +107,26 @@ def render(settings=None):
                 unsafe_allow_html=True,
             )
 
-        # Build merged settings dict for run_backtest
-        bt_settings = dict(settings) if settings else {}
-        bt_settings["min_score"]            = bt_min_score
-        bt_settings["hold_days"]            = bt_hold_days
-        bt_settings["bt_tier_filter"]       = bt_tier_filter
-        bt_settings["bt_buy_type_filter"]   = buy_type_filter
-        bt_settings["bt_rs_positive_only"]  = bt_rs_positive_only
-
         trades_df = run_backtest(
             bt_universe,
-            settings         = bt_settings,
-            cci_len          = int(bt_cci_len),
-            cci_ob           = int(bt_cci_ob),
-            cci_os           = int(bt_cci_os),
-            min_score        = bt_min_score,
-            hold_days        = bt_hold_days,
-            workers          = settings.get("workers", 10) if settings else 10,
-            tier_filter      = bt_tier_filter,
-            buy_type_filter  = buy_type_filter,
-            rs_positive_only = bt_rs_positive_only,
-            progress_cb      = _bt_progress,
+            cci_len=int(bt_cci_len), cci_ob=int(bt_cci_ob), cci_os=int(bt_cci_os),
+            min_score=bt_min_score, hold_days=bt_hold_days,
+            workers=settings["workers"],
+            tier1_only=bt_tier1_only,   # ← Tier 1 gate
+            progress_cb=_bt_progress,
         )
         prog.empty()
         sym_status.empty()
 
         if trades_df.empty:
-            msgs = {
-                "Elite":  "No Elite signals found. Try expanding the symbol universe or lowering Min Score.",
-                "Tier 1": "No Tier 1 Prime signals found. Try expanding the symbol universe or lowering Min Score.",
-                "Tier 2": "No Tier 2 signals found. Try lowering Min Score or adjusting Buy Type filter.",
-                "Both":   "No trades generated. Try lowering Min Score or adding more symbols.",
-            }
-            st.warning(msgs.get(bt_tier_filter, msgs["Both"]))
+            if bt_tier1_only:
+                st.warning(
+                    "No Tier 1 signals found. "
+                    "Try expanding the symbol universe (Nifty 200+) or "
+                    "lowering Min Score. Tier 1 fires very rarely by design."
+                )
+            else:
+                st.warning("No trades generated. Try lowering Min Score or adding more symbols.")
             return
 
         st.session_state["bt_trades"] = trades_df
@@ -225,27 +164,19 @@ def render(settings=None):
     st.markdown("#### 📊 Performance Summary")
     s = stats
 
+    # ── Tier 1 badge (shown when mixed-mode run contains T1 trades) ─────
     t1_count = s.get("t1_prime_trades", 0)
-    rs_count = s.get("rs_positive_trades", 0)
-    total_t  = s.get("total_trades", 1)
-
-    badge_html = ""
-    if t1_count > 0:
-        t1_pct = round(t1_count / total_t * 100, 1)
-        badge_html += (
-            f"<span style='display:inline-block;background:#4c1d95;color:#c4b5fd;"
-            f"border-radius:6px;padding:0.3rem 0.8rem;font-size:0.78rem;margin-right:0.5rem;'>"
-            f"🏆 Tier 1 Prime: <b>{t1_count}</b> ({t1_pct}%)</span>"
+    if t1_count > 0 and not bt_tier1_only:
+        t1_pct = round(t1_count / s.get("total_trades", 1) * 100, 1)
+        st.markdown(
+            f"<div style='display:inline-block;background:#4c1d95;color:#c4b5fd;"
+            f"border-radius:6px;padding:0.3rem 0.8rem;font-size:0.78rem;"
+            f"margin-bottom:0.6rem;'>"
+            f"🏆 Tier 1 within results: <b>{t1_count}</b> trades "
+            f"({t1_pct}% of total)"
+            f"</div>",
+            unsafe_allow_html=True,
         )
-    if rs_count > 0:
-        rs_pct = round(rs_count / total_t * 100, 1)
-        badge_html += (
-            f"<span style='display:inline-block;background:#052e16;color:#4ade80;"
-            f"border-radius:6px;padding:0.3rem 0.8rem;font-size:0.78rem;margin-right:0.5rem;'>"
-            f"📈 RS Positive: <b>{rs_count}</b> ({rs_pct}%)</span>"
-        )
-    if badge_html:
-        st.markdown(f"<div style='margin-bottom:0.6rem'>{badge_html}</div>", unsafe_allow_html=True)
 
     c1,c2,c3,c4,c5,c6 = st.columns(6)
     for col, label, val, color in [
@@ -272,16 +203,17 @@ def render(settings=None):
     with r3: st.metric("Worst Trade", f"{s.get('worst_trade',0)}%")
     with r4: st.metric("Total PnL",   f"{s.get('total_pnl',0)}%")
 
-    # ── Tier 1 Prime isolated stats ───────────────────────────────────────────
-    if t1_count > 0 and "tier1_prime" in trades_df.columns:
-        with st.expander("🏆 Tier 1 Prime — Isolated Performance", expanded=False):
+    # ── Tier 1 isolated stats (only when mixed mode) ────────────────────────
+    if (t1_count > 0 and not bt_tier1_only and
+            "tier1_prime" in trades_df.columns):
+        with st.expander("🏆 Tier 1 — Isolated Performance", expanded=False):
             t1_df   = trades_df[trades_df["tier1_prime"] == True]
             t1_rest = trades_df[trades_df["tier1_prime"] == False]
             t1_stats = compute_stats(t1_df)
             r_stats  = compute_stats(t1_rest)
             cA, cB = st.columns(2)
             with cA:
-                st.markdown("**Tier 1 Prime trades**")
+                st.markdown("**Tier 1 trades**")
                 st.metric("Win Rate",      f"{t1_stats.get('win_rate',0)}%")
                 st.metric("Expectancy",    f"{t1_stats.get('expectancy',0)}%")
                 st.metric("Profit Factor", t1_stats.get("profit_factor", 0))
@@ -294,58 +226,6 @@ def render(settings=None):
                 st.metric("Profit Factor", r_stats.get("profit_factor", 0))
                 st.metric("Avg Win",       f"{r_stats.get('avg_win',0)}%")
                 st.metric("Avg Loss",      f"{r_stats.get('avg_loss',0)}%")
-
-    # ── RS Positive isolated stats ────────────────────────────────────────────
-    if rs_count > 0 and "rs_positive" in trades_df.columns:
-        with st.expander("📈 RS Positive — Isolated Performance", expanded=False):
-            rs_df   = trades_df[trades_df["rs_positive"] == True]
-            nrs_df  = trades_df[trades_df["rs_positive"] == False]
-            rs_st   = compute_stats(rs_df)
-            nrs_st  = compute_stats(nrs_df)
-            cA, cB = st.columns(2)
-            with cA:
-                st.markdown("**RS Positive trades**")
-                st.metric("Win Rate",      f"{rs_st.get('win_rate',0)}%")
-                st.metric("Expectancy",    f"{rs_st.get('expectancy',0)}%")
-                st.metric("Profit Factor", rs_st.get("profit_factor", 0))
-                st.metric("Avg Win",       f"{rs_st.get('avg_win',0)}%")
-                st.metric("Avg Loss",      f"{rs_st.get('avg_loss',0)}%")
-            with cB:
-                st.markdown("**RS Negative / Neutral trades**")
-                st.metric("Win Rate",      f"{nrs_st.get('win_rate',0)}%")
-                st.metric("Expectancy",    f"{nrs_st.get('expectancy',0)}%")
-                st.metric("Profit Factor", nrs_st.get("profit_factor", 0))
-                st.metric("Avg Win",       f"{nrs_st.get('avg_win',0)}%")
-                st.metric("Avg Loss",      f"{nrs_st.get('avg_loss',0)}%")
-
-    # ── Buy-Type breakdown table ──────────────────────────────────────────────
-    bt_stats = s.get("buy_type_stats", {})
-    if bt_stats:
-        with st.expander("🏷️ Buy Type — Performance Breakdown", expanded=True):
-            bt_rows = [
-                {
-                    "Buy Type": k,
-                    "Trades":   v["trades"],
-                    "Win Rate": f"{v['win_rate']}%",
-                    "Avg PnL":  f"{v['avg_pnl']}%",
-                }
-                for k, v in sorted(bt_stats.items(), key=lambda x: -x[1]["trades"])
-            ]
-            bt_df = pd.DataFrame(bt_rows)
-            st.dataframe(
-                bt_df.style
-                .set_properties(**{
-                    "font-family": "'JetBrains Mono',monospace",
-                    "font-size": "0.78rem", "text-align": "center",
-                    "background-color": "#111827", "color": "#e2e8f0",
-                })
-                .set_table_styles([{"selector": "th", "props": [
-                    ("background-color", "#0f1e3d"), ("color", "#93c5fd"),
-                    ("font-size", "0.72rem"), ("text-transform", "uppercase"),
-                ]}]),
-                use_container_width=True,
-                hide_index=True,
-            )
 
     # ── Charts ────────────────────────────────────────────────────────────────
     st.markdown("---")
@@ -374,7 +254,7 @@ def render(settings=None):
         st.markdown("##### 🎯 Exit Breakdown")
         exit_data = pd.Series(s.get("exit_breakdown", {}))
         if not exit_data.empty:
-            clr_map = {"T1 HIT":"#22c55e","T2 HIT":"#4ade80","SL HIT":"#ef4444","TIMEOUT":"#f59e0b"}
+            clr_map = {"T1 HIT":"#22c55e","T2 HIT":"#4ade80","SL HIT":"#ef4444","TIMEOUT":"#f59e0b","TIME STOP":"#f97316"}
             fig2 = go.Figure(go.Pie(
                 labels=exit_data.index.tolist(), values=exit_data.values.tolist(),
                 hole=0.55,
@@ -399,9 +279,10 @@ def render(settings=None):
     )
     st.plotly_chart(fig3, use_container_width=True)
 
-    # ── Tier 1 Prime cumulative overlay ──────────────────────────────────────
-    if t1_count > 0 and "tier1_prime" in trades_df.columns:
-        st.markdown("##### 🏆 Tier 1 Prime vs Rest — Cumulative PnL")
+    # ── Tier 1 cumulative PnL overlay (mixed mode) ──────────────────────────
+    if (t1_count > 0 and not bt_tier1_only and
+            "tier1_prime" in trades_df.columns):
+        st.markdown("##### 🏆 Tier 1 vs Rest — Cumulative PnL")
         t1_cum   = (trades_df[trades_df["tier1_prime"] == True]
                     .sort_values("entry_date")["pnl_pct"].cumsum())
         rest_cum = (trades_df[trades_df["tier1_prime"] == False]
@@ -409,7 +290,7 @@ def render(settings=None):
         fig4 = go.Figure()
         fig4.add_trace(go.Scatter(
             x=list(range(len(t1_cum))), y=t1_cum.values,
-            mode="lines", name="Tier 1 Prime",
+            mode="lines", name="Tier 1",
             line=dict(color="#a78bfa", width=2),
         ))
         fig4.add_trace(go.Scatter(
@@ -459,11 +340,9 @@ def render(settings=None):
 
     # ── Trade log ─────────────────────────────────────────────────────────────
     with st.expander("📜 Full Trade Log", expanded=False):
-        show_cols = [
-            "symbol","entry_date","entry_price","exit_date","exit_price",
-            "exit_reason","pnl_pct","score_at_entry","buy_type","tier",
-            "rs_positive","adx_val","sl","t1","t2","tier1_prime",
-        ]
+        show_cols = ["symbol","entry_date","entry_price","exit_date","exit_price",
+                     "exit_reason","pnl_pct","risk_pct","score_at_entry","cci_at_entry",
+                     "sl","t1","t2","tier1_prime"]
         tlog = trades_df[[c for c in show_cols if c in trades_df.columns]].copy()
         tlog = tlog.sort_values("entry_date", ascending=False)
 
