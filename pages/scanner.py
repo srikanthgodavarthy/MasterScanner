@@ -241,6 +241,9 @@ def render(settings: dict | None = None):
 
     # ── Run scan ─────────────────────────────────────────────────
     if run_btn:
+        # Bump run_id to bust fetch caches so %Chg reflects fresh intraday data
+        st.session_state["scan_run_id"] = st.session_state.get("scan_run_id", 0) + 1
+
         # Merge sidebar overrides
         effective = dict(settings)
         effective["workers"]           = st.session_state.get("workers",           settings.get("workers", 10))
@@ -263,6 +266,7 @@ def render(settings: dict | None = None):
                 cci_os           = effective.get("cci_os", -100),
                 max_workers      = effective.get("workers",  10),
                 progress_cb      = _cb,
+                run_id           = st.session_state.get("scan_run_id", 0),
             )
 
         prog.empty()
@@ -273,7 +277,7 @@ def render(settings: dict | None = None):
 
         # ── Regime layer ─────────────────────────────────────────
         with st.spinner("Classifying regime & computing composite scores…"):
-            nifty_series = fetch_nifty("1y")
+            nifty_series = fetch_nifty("1y", _cache_key=st.session_state.get("scan_run_id", 0))
             regime_ctx   = build_regime_context(
                 nifty             = nifty_series,
                 execute_threshold = effective.get("execute_threshold", 70),
@@ -367,7 +371,8 @@ def render(settings: dict | None = None):
             # ── Category score columns styled ────────────────────
             cat_display_cols = ["Trend", "Momentum", "Structure", "Volume", "Quality"]
             format_dict = {c: "{:.0f}" for c in cat_display_cols if c in disp.columns}
-            format_dict.update({"Composite": "{:.1f}", "RS": "{:.1f}", "Size%": "{:.0f}", "%Chg": "{:.2f}"})
+            format_dict.update({"Composite": "{:.1f}", "RS": "{:.1f}", "Size%": "{:.0f}", "%Chg": "{:.2f}",
+                                 "Entry": "{:.0f}", "SL": "{:.0f}", "T1": "{:.0f}", "T2": "{:.0f}"})
 
             def _color_score(val):
                 try:

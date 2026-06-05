@@ -56,10 +56,10 @@ def render(settings=None):
         # ── Tier filter ───────────────────────────────────────────
         bt_tier_filter = st.selectbox(
             "Tier Filter",
-            ["Both", "Tier 1", "Tier 2"],
+            ["Both", "Elite", "Tier 1", "Tier 2"],
             index=0,
             key="bt_tier_filter",
-            help="Tier 1 = Prime setups (RS+ADX confirmed). Tier 2 = Fib/CCI/Norm/Compression. Both = all.",
+            help="Elite = highest-conviction setups. Tier 1 = Prime setups (RS+ADX confirmed). Tier 2 = Fib/CCI/Norm/Compression. Both = all.",
         )
 
         # ── Buy Type filter ───────────────────────────────────────
@@ -116,6 +116,7 @@ def render(settings=None):
     with col_info:
         _tier_label = {
             "Both":   "<b style='color:#94a3b8'>Both Tiers</b>",
+            "Elite":  "<b style='color:#ffd700'>Elite only</b>",
             "Tier 1": "<b style='color:#a78bfa'>Tier 1 Prime only</b>",
             "Tier 2": "<b style='color:#60a5fa'>Tier 2 only</b>",
         }[bt_tier_filter]
@@ -181,6 +182,7 @@ def render(settings=None):
 
         if trades_df.empty:
             msgs = {
+                "Elite":  "No Elite signals found. Try expanding the symbol universe or lowering Min Score.",
                 "Tier 1": "No Tier 1 Prime signals found. Try expanding the symbol universe or lowering Min Score.",
                 "Tier 2": "No Tier 2 signals found. Try lowering Min Score or adjusting Buy Type filter.",
                 "Both":   "No trades generated. Try lowering Min Score or adding more symbols.",
