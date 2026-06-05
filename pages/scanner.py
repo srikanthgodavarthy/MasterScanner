@@ -26,7 +26,7 @@ from utils.regime_engine   import (
     regime_summary,
     REGIME_WEIGHTS,
 )
-from utils.supabase_client import save_scan_results, load_watchlist, add_to_watchlist, _is_available
+from utils.supabase_client import save_scan_snapshot, load_watchlist, add_to_watchlist, _is_available
 
 # ── CONSTANTS ─────────────────────────────────────────────────────
 REGIME_COLORS = {
@@ -232,7 +232,7 @@ def render(settings: dict | None = None):
         st.session_state["scan_time"]    = datetime.now().strftime("%H:%M:%S")
 
         if supabase_ok and save_db:
-            save_scan_results(df_aug)
+            save_scan_snapshot(df_aug)
             st.success("✅ Saved to Supabase.")
 
     # ── Display ──────────────────────────────────────────────────
