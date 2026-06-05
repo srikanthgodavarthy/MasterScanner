@@ -10,7 +10,7 @@ st.set_page_config(
     page_title="NSE Master Scanner Pro",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed",   # sidebar removed — all config in Settings tab
+    initial_sidebar_state="collapsed",
 )
 
 # ── Shared CSS ────────────────────────────────────────────────────
@@ -23,13 +23,9 @@ html, body, [data-testid="stAppViewContainer"] {
     font-family: 'JetBrains Mono', monospace;
     color: #e2e8f0;
 }
-
-/* Hide collapsed sidebar toggle button entirely */
 [data-testid="collapsedControl"] { display: none !important; }
 [data-testid="stSidebar"]        { display: none !important; }
-
 h1,h2,h3 { font-family: 'Syne', sans-serif !important; }
-
 .stButton > button {
     background: linear-gradient(135deg, #3b82f6, #1d4ed8) !important;
     color: white !important; border: none !important;
@@ -48,7 +44,6 @@ h1,h2,h3 { font-family: 'Syne', sans-serif !important; }
 }
 .metric-value { font-size:1.8rem; font-weight:700; font-family:'JetBrains Mono',monospace; }
 .metric-label { font-size:0.7rem; color:#64748b; text-transform:uppercase; letter-spacing:0.1em; margin-top:0.2rem; }
-
 .scanner-header {
     background: linear-gradient(135deg,#0f172a 0%,#1e293b 100%);
     border: 1px solid #1e3a5f; border-radius: 12px;
@@ -71,7 +66,6 @@ h1,h2,h3 { font-family: 'Syne', sans-serif !important; }
     animation:pulse 2s infinite; margin-right:6px;
 }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
-
 div[data-testid="stDataFrame"] { border:1px solid #1e293b !important; border-radius:8px !important; }
 [data-testid="metric-container"] { background:#1a2235; border:1px solid #1e293b; border-radius:8px; padding:0.75rem; }
 .stTabs [data-baseweb="tab"] { font-family:'JetBrains Mono',monospace !important; font-size:0.8rem !important; color:#64748b !important; }
@@ -83,7 +77,7 @@ footer { display:none !important; }
 st.markdown("""
 <div class="scanner-header">
     <p class="scanner-title">⚡ NSE Master Scanner Pro</p>
-    <p class="scanner-subtitle"><span class="status-dot"></span>Live · Nifty 500 · Tier 1 Prime v2 · CCI + Momentum Engine</p>
+    <p class="scanner-subtitle"><span class="status-dot"></span>Live · Nifty 500 · Regime Engine v2 · Trend · Momentum · Structure · Volume · Quality</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -92,36 +86,37 @@ from pages.backtest import render as render_backtest
 from pages.settings import render as render_settings
 from utils.scanner_engine import NIFTY500_SYMBOLS
 
-# ── Assemble settings from session_state (written live by Settings tab) ────────
 ss = st.session_state
 settings = {
-    "symbols":           ss.get("symbols",           NIFTY500_SYMBOLS),
-    "cci_len":           ss.get("cci_len",            20),
-    "cci_ob":            ss.get("cci_ob",             100),
-    "cci_os":            ss.get("cci_os",            -100),
-    "workers":           ss.get("workers",            10),
-    "hold_days":         ss.get("hold_days",          20),
-    "min_score":         ss.get("min_score",          70),
-    "auto_refresh":      ss.get("auto_refresh",       False),
-    "refresh_mins":      ss.get("refresh_mins",       5),
-    # Tier 1 tuning
-    "t1_mom3":           ss.get("t1_mom3",            8),
-    "t1_mom6":           ss.get("t1_mom6",            12),
-    "t1_fib_hi":         ss.get("t1_fib_hi",          38.2),
-    "t1_fib_lo":         ss.get("t1_fib_lo",          61.8),
-    "t1_cci_window":     ss.get("t1_cci_window",      5),
-    "t1_cloud":          ss.get("t1_cloud",           True),
-    "t1_squeeze_boost":  ss.get("t1_squeeze_boost",   True),
-    "t1_squeeze_pts":    ss.get("t1_squeeze_pts",     15),
-    "t1_no_squeeze_pts": ss.get("t1_no_squeeze_pts",  5),
-    "t1_ps_weight":      ss.get("t1_ps_weight",       20),
-    "t1_ps_penalty":     ss.get("t1_ps_penalty",     -10),
-    # Tier 2 tuning
-    "t2_comp_bars":      ss.get("t2_comp_bars",       10),
-    "t2_atr_ratio":      ss.get("t2_atr_ratio",       0.85),
-    "t2_vol_mult":       ss.get("t2_vol_mult",        1.2),
-    # Nifty regime
-    "nifty_regime_filter": ss.get("nifty_regime_filter", False),
+    "symbols":              ss.get("symbols",              NIFTY500_SYMBOLS),
+    "cci_len":              ss.get("cci_len",              20),
+    "cci_ob":               ss.get("cci_ob",               100),
+    "cci_os":               ss.get("cci_os",              -100),
+    "workers":              ss.get("workers",              10),
+    "hold_days":            ss.get("hold_days",            20),
+    "min_score":            ss.get("min_score",            70),
+    "auto_refresh":         ss.get("auto_refresh",         False),
+    "refresh_mins":         ss.get("refresh_mins",         5),
+    # Tier 1
+    "t1_mom3":              ss.get("t1_mom3",              8),
+    "t1_mom6":              ss.get("t1_mom6",              12),
+    "t1_fib_hi":            ss.get("t1_fib_hi",            38.2),
+    "t1_fib_lo":            ss.get("t1_fib_lo",            61.8),
+    "t1_cci_window":        ss.get("t1_cci_window",        5),
+    "t1_cloud":             ss.get("t1_cloud",             True),
+    "t1_squeeze_boost":     ss.get("t1_squeeze_boost",     True),
+    "t1_squeeze_pts":       ss.get("t1_squeeze_pts",       15),
+    "t1_no_squeeze_pts":    ss.get("t1_no_squeeze_pts",    5),
+    "t1_ps_weight":         ss.get("t1_ps_weight",         20),
+    "t1_ps_penalty":        ss.get("t1_ps_penalty",       -10),
+    # Tier 2
+    "t2_comp_bars":         ss.get("t2_comp_bars",         10),
+    "t2_atr_ratio":         ss.get("t2_atr_ratio",         0.85),
+    "t2_vol_mult":          ss.get("t2_vol_mult",          1.2),
+    # Nifty regime (original gate)
+    "nifty_regime_filter":  ss.get("nifty_regime_filter",  False),
+    # Regime engine threshold
+    "execute_threshold":    ss.get("execute_threshold",    70),
 }
 
 tab1, tab2, tab3 = st.tabs(["📡 Live Scanner", "📈 Backtest Engine", "⚙️ Settings"])
