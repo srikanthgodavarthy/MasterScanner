@@ -7,6 +7,12 @@ generate_signals_historical() no longer duplicates scoring logic.
 It calls build_indicators() once per symbol, then compute_bar(ia, i, params)
 for every bar — the exact same function score_stock() calls for the live bar.
 Result: scanner and backtest are guaranteed identical.
+
+v3 changes:
+  - Signal filter supports: tier (T1/T2/Both), buy_type list, rs_positive flag,
+    and score threshold — all pass-through from the backtest UI.
+  - signals DataFrame carries rs_positive, adx_val, ema20_slope for analysis.
+  - Speed: ThreadPoolExecutor workers auto-scaled; Nifty fetched with caching.
 """
 
 import pandas as pd
@@ -46,15 +52,17 @@ def fetch_full_history(symbol: str, years: int = 3) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════════
 
 def generate_signals_historical(
-    df:         pd.DataFrame,
-    nifty:      pd.Series,
-    settings:   dict | None = None,
+    df:              pd.DataFrame,
+    nifty:           pd.Series,
+    settings:        dict | None = None,
     # legacy kwargs
-    cci_len:    int   = 20,
-    cci_ob:     int   = 100,
-    cci_os:     int   = -100,
-    min_score:  int   = 70,
-    tier1_only: bool  = False,
+    cci_len:         int   = 20,
+    cci_ob:          int   = 100,
+    cci_os:          int   = -100,
+    min_score:       int   = 70,
+    tier_filter:     str   = "Both",        # "Both" | "Tier 1" | "Tier 2"
+    buy_type_filter: list  | None = None,   # e.g. ["Norm", "Harm"] — None = all
+    rs_positive_only: bool = False,         # filter to RS > threshold only
 ) -> pd.DataFrame:
     """
     Walk-forward signal scan over full history.
@@ -78,13 +86,25 @@ def generate_signals_historical(
         if r is None:
             continue
 
-        # Signal acceptance filter
-        if tier1_only and not r.tier1_prime:
+        # ── Tier filter ───────────────────────────────────────────
+        if tier_filter == "Tier 1" and not r.tier1_prime:
             continue
+        if tier_filter == "Tier 2" and (r.tier1_prime or not r.any_buy):
+            continue
+
+        # ── Score filter ──────────────────────────────────────────
         if not r.tier1_prime and not r.tier2_momentum:
             allow_cloud_buy = r.above_cloud or (r.inside_cloud and r.norm_score >= 65)
             if r.norm_score < min_score or not allow_cloud_buy:
                 continue
+
+        # ── RS positive filter ────────────────────────────────────
+        if rs_positive_only and not r.rs_positive:
+            continue
+
+        # ── Buy type filter ───────────────────────────────────────
+        if buy_type_filter and r.buy_type not in buy_type_filter:
+            continue
 
         signals.append({
             "date":            df.index[i],
@@ -101,6 +121,11 @@ def generate_signals_historical(
             "squeeze_release": r.squeeze_release,
             "setup":           r.setup,
             "buy_type":        r.buy_type,
+            "tier":            r.tier,
+            "rs_positive":     r.rs_positive,
+            "rs_val":          r.rs_val,
+            "adx_val":         r.adx_val,
+            "ema20_slope":     r.ema20_slope,
         })
 
     return pd.DataFrame(signals)
@@ -157,7 +182,6 @@ def simulate_trades(
             t1_hit = bar_high >= t1
 
             if sl_hit and (t2_hit or t1_hit):
-                # Intraday conflict: whichever is closer to open was hit first
                 target      = t2 if t2_hit else t1
                 exit_price  = target if abs(bar_open - target) < abs(bar_open - sl) else sl
                 exit_reason = ("T2 HIT" if t2_hit else "T1 HIT") if exit_price == target else "SL HIT"
@@ -188,9 +212,13 @@ def simulate_trades(
             "t2":              sig["t2"],
             "setup":           sig.get("setup", "-"),
             "buy_type":        sig.get("buy_type", "-"),
+            "tier":            sig.get("tier", "-"),
             "tier1_prime":     bool(sig.get("tier1_prime",    False)),
             "tier2_momentum":  bool(sig.get("tier2_momentum", False)),
             "squeeze_release": bool(sig.get("squeeze_release", False)),
+            "rs_positive":     bool(sig.get("rs_positive", False)),
+            "rs_val":          float(sig.get("rs_val", 0.0)),
+            "adx_val":         float(sig.get("adx_val", 0.0)),
         })
 
         blocked_until = exit_date
@@ -203,21 +231,29 @@ def simulate_trades(
 # ══════════════════════════════════════════════════════════════════
 
 def run_backtest(
-    symbols:     list,
-    settings:    dict | None = None,
-    cci_len:     int  = 20,
-    cci_ob:      int  = 100,
-    cci_os:      int  = -100,
-    min_score:   int  = 70,
-    hold_days:   int  = 20,
-    workers:     int  = 10,
-    tier1_only:  bool = False,
-    progress_cb       = None,
+    symbols:          list,
+    settings:         dict | None = None,
+    cci_len:          int  = 20,
+    cci_ob:           int  = 100,
+    cci_os:           int  = -100,
+    min_score:        int  = 70,
+    hold_days:        int  = 20,
+    workers:          int  = 10,
+    tier_filter:      str  = "Both",       # "Both" | "Tier 1" | "Tier 2"
+    buy_type_filter:  list | None = None,
+    rs_positive_only: bool = False,
+    progress_cb            = None,
 ) -> pd.DataFrame:
     if settings:
-        hold_days  = settings.get("hold_days",  hold_days)
-        workers    = settings.get("workers",    workers)
-        min_score  = settings.get("min_score",  min_score)
+        hold_days        = settings.get("hold_days",        hold_days)
+        workers          = settings.get("workers",          workers)
+        min_score        = settings.get("min_score",        min_score)
+        tier_filter      = settings.get("bt_tier_filter",   tier_filter)
+        buy_type_filter  = settings.get("bt_buy_type_filter", buy_type_filter)
+        rs_positive_only = bool(settings.get("bt_rs_positive_only", rs_positive_only))
+
+    # Speed: clamp workers to a sensible range
+    workers = max(4, min(workers, 20))
 
     # Fetch Nifty once for the full 3-year window
     try:
@@ -229,8 +265,6 @@ def run_backtest(
     except Exception:
         nifty = pd.Series(dtype=float)
 
-    # Compute Nifty regime once and inject into settings so every
-    # generate_signals_historical() call uses the same consistent value.
     regime_val      = nifty_regime(nifty)
     effective_settings = dict(settings) if settings else {}
     effective_settings["nifty_regime_val"] = regime_val
@@ -247,12 +281,14 @@ def run_backtest(
             return None
         sigs = generate_signals_historical(
             df, nifty,
-            settings   = effective_settings,
-            cci_len    = cci_len,
-            cci_ob     = cci_ob,
-            cci_os     = cci_os,
-            min_score  = min_score,
-            tier1_only = tier1_only,
+            settings         = effective_settings,
+            cci_len          = cci_len,
+            cci_ob           = cci_ob,
+            cci_os           = cci_os,
+            min_score        = min_score,
+            tier_filter      = tier_filter,
+            buy_type_filter  = buy_type_filter,
+            rs_positive_only = rs_positive_only,
         )
         return simulate_trades(sym, df, sigs, hold_days=hold_days)
 
@@ -322,6 +358,20 @@ def compute_stats(trades: pd.DataFrame) -> dict:
                 "avg_pnl":  round(grp["pnl_pct"].mean(), 2),
             }
 
+    # Per-buy-type breakdown
+    buy_type_stats = {}
+    if "buy_type" in trades.columns:
+        for bt, grp in trades.groupby("buy_type"):
+            w = grp[grp["pnl_pct"] > 0]
+            buy_type_stats[bt] = {
+                "trades":   len(grp),
+                "win_rate": round(len(w) / len(grp) * 100, 1),
+                "avg_pnl":  round(grp["pnl_pct"].mean(), 2),
+            }
+
+    # RS positive breakdown
+    rs_stats = _slice("rs_positive")
+
     return {
         "total_trades":       total,
         "win_rate":           win_rate,
@@ -338,8 +388,11 @@ def compute_stats(trades: pd.DataFrame) -> dict:
         "t1_prime_trades":    int(trades.get("tier1_prime",    pd.Series([False]*total)).sum()),
         "t2_momentum_trades": int(trades.get("tier2_momentum", pd.Series([False]*total)).sum()),
         "squeeze_trades":     int(trades.get("squeeze_release",pd.Series([False]*total)).sum()),
+        "rs_positive_trades": int(trades.get("rs_positive",    pd.Series([False]*total)).sum()),
         "t1_prime_stats":     _slice("tier1_prime"),
         "t2_momentum_stats":  _slice("tier2_momentum"),
         "squeeze_stats":      _slice("squeeze_release"),
+        "rs_positive_stats":  rs_stats,
         "setup_stats":        setup_stats,
+        "buy_type_stats":     buy_type_stats,
     }

@@ -14,6 +14,14 @@ compute_bar() is pure:
   • No I/O, no Streamlit, no yfinance — safe to call from any context.
 
 Adding a new condition means editing ONE place.
+
+v3 changes:
+  - Tier-1 gate now requires RS > threshold AND (ADX > 20 OR EMA20 slope positive).
+  - Fib entries (Fib, Fib+CCI) and CCI-cross entry are Tier-2, never Tier-1.
+  - ADX pre-computed in IndicatorArrays; EMA20 slope derived from e20.
+  - ScoringParams gains: t1_rs_min, t1_adx_min, t1_use_adx (use ADX vs EMA slope).
+  - BarResult gains: adx, rs_val, ema20_slope flags for display / backtest filter.
+  - Speed: CCI vectorised in build_indicators; _get_pivots gated by quick pre-check.
 """
 
 from __future__ import annotations
@@ -56,11 +64,18 @@ class ScoringParams:
     # Tier 1 — squeeze boost
     t1_squeeze_boost:    bool  = True
     t1_squeeze_pts:      int   = 5   # points on release
-    t1_no_squeeze_pts:   int   = 0    # points when not in squeeze
+    t1_no_squeeze_pts:   int   = 0   # points when not in squeeze
 
     # Tier 1 — persistent_strength score weight
     t1_ps_weight:  int = 20    # added when True
     t1_ps_penalty: int = -10   # added when False
+
+    # ── NEW: Tier 1 strength filter ─────────────────────────────
+    # RS (relative-strength vs Nifty, 5-bar) must exceed t1_rs_min
+    t1_rs_min:   float = 0.0   # default 0 = just RS positive
+    # ADX threshold (when t1_use_adx=True) OR EMA20 slope (when False)
+    t1_adx_min:  float = 20.0  # ADX must be > this
+    t1_use_adx:  bool  = True  # True=ADX gate, False=EMA20 slope gate
 
     # Tier 2 — compression
     t2_comp_bars:  int   = 10
@@ -70,8 +85,6 @@ class ScoringParams:
     t2_vol_mult:   float = 1.2
 
     # Nifty index regime gate (optional — Tier 1 extra gate)
-    # When nifty_regime_filter=True, Tier 1 requires Nifty to be in bull regime.
-    # nifty_regime_val is computed once by the scanner/backtest caller (not per bar).
     nifty_regime_filter: bool = False
     nifty_regime_val:    str  = "neutral"   # "bull" | "bear" | "neutral"
 
@@ -98,6 +111,9 @@ class ScoringParams:
             t1_no_squeeze_pts= int(s.get("t1_no_squeeze_pts",    5)),
             t1_ps_weight     = int(s.get("t1_ps_weight",        20)),
             t1_ps_penalty    = int(s.get("t1_ps_penalty",      -10)),
+            t1_rs_min        = float(s.get("t1_rs_min",          0.0)),
+            t1_adx_min       = float(s.get("t1_adx_min",        20.0)),
+            t1_use_adx       = bool(s.get("t1_use_adx",         True)),
             t2_comp_bars     = int(s.get("t2_comp_bars",        10)),
             t2_atr_ratio     = float(s.get("t2_atr_ratio",      0.85)),
             t2_vol_mult      = float(s.get("t2_vol_mult",        1.2)),
@@ -151,6 +167,13 @@ class BarResult:
     fib618:     float = 0.0
     fib500:     float = 0.0
     fib382:     float = 0.0
+
+    # ── NEW strength indicators ──────────────────────────────────
+    rs_val:       float = 0.0   # raw RS vs Nifty (5-bar)
+    adx_val:      float = 0.0   # ADX(14)
+    ema20_slope:  float = 0.0   # EMA20[i] - EMA20[i-5], normalised by price
+    rs_positive:  bool  = False  # rs_val > t1_rs_min
+    strength_ok:  bool  = False  # ADX or EMA slope gate passed
 
     # ── Nifty regime ─────────────────────────────────────────────
     nifty_regime_val: str  = "neutral"   # passed through for display
@@ -225,6 +248,7 @@ class IndicatorArrays:
     rsi_s:        pd.Series
     atr_s:        pd.Series
     cci_s:        pd.Series
+    adx_s:        pd.Series   # NEW: ADX(14)
     vol_avg:      pd.Series
     atr_sma20:    pd.Series
     atr_sma_comp: pd.Series   # SMA(ATR, comp_bars) — for compression check
@@ -242,6 +266,64 @@ class IndicatorArrays:
 
 
 # ══════════════════════════════════════════════════════════════════
+#  ADX HELPER  (vectorised — computed once per symbol)
+# ══════════════════════════════════════════════════════════════════
+
+def _adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Vectorised Wilder-smoothed ADX."""
+    h = high.to_numpy(dtype=float)
+    l = low.to_numpy(dtype=float)
+    c = close.to_numpy(dtype=float)
+    n = len(c)
+
+    tr  = np.zeros(n)
+    pdm = np.zeros(n)   # +DM
+    mdm = np.zeros(n)   # -DM
+
+    for i in range(1, n):
+        hl  = h[i] - l[i]
+        hpc = abs(h[i] - c[i - 1])
+        lpc = abs(l[i] - c[i - 1])
+        tr[i] = max(hl, hpc, lpc)
+
+        up   = h[i] - h[i - 1]
+        down = l[i - 1] - l[i]
+        pdm[i] = up   if up > down and up > 0   else 0.0
+        mdm[i] = down if down > up and down > 0 else 0.0
+
+    # Wilder smoothing (EMA with alpha = 1/period)
+    alpha = 1.0 / period
+    atr_w  = np.zeros(n)
+    pdm_w  = np.zeros(n)
+    mdm_w  = np.zeros(n)
+
+    # Seed
+    if n > period:
+        atr_w[period]  = tr[1:period + 1].sum()
+        pdm_w[period]  = pdm[1:period + 1].sum()
+        mdm_w[period]  = mdm[1:period + 1].sum()
+        for i in range(period + 1, n):
+            atr_w[i]  = atr_w[i - 1]  - atr_w[i - 1]  / period + tr[i]
+            pdm_w[i]  = pdm_w[i - 1]  - pdm_w[i - 1]  / period + pdm[i]
+            mdm_w[i]  = mdm_w[i - 1]  - mdm_w[i - 1]  / period + mdm[i]
+
+    pdi = np.where(atr_w > 0, 100 * pdm_w / atr_w, 0.0)
+    mdi = np.where(atr_w > 0, 100 * mdm_w / atr_w, 0.0)
+    dx  = np.where((pdi + mdi) > 0, 100 * np.abs(pdi - mdi) / (pdi + mdi), 0.0)
+
+    # Smooth DX to get ADX
+    adx_arr = np.zeros(n)
+    first = 2 * period
+    if n > first:
+        adx_arr[first] = dx[period + 1: first + 1].mean()
+        for i in range(first + 1, n):
+            adx_arr[i] = (adx_arr[i - 1] * (period - 1) + dx[i]) / period
+
+    adx_arr[:first] = np.nan
+    return pd.Series(adx_arr, index=close.index)
+
+
+# ══════════════════════════════════════════════════════════════════
 #  SERIES BUILDER  (call once per symbol)
 # ══════════════════════════════════════════════════════════════════
 
@@ -253,6 +335,7 @@ def build_indicators(
     """
     Pre-compute every indicator Series for the full OHLCV history.
     Imported helpers come from scanner_engine to avoid circular deps.
+    Speed: CCI is vectorised; ADX computed once here.
     """
     from utils.scanner_engine import (
         ema, sma, rsi, atr, cci, ichimoku, _strip_tz,
@@ -270,6 +353,7 @@ def build_indicators(
     rsi_s    = rsi(c, 21)
     atr_s    = atr(h, l, c, 14)
     cci_s    = cci(c, params.cci_len)
+    adx_s    = _adx(h, l, c, 14)          # NEW: ADX pre-computed
     vol_avg  = sma(v, 20)
     atr_sma20    = sma(atr_s, 20)
     atr_sma_comp = sma(atr_s, params.t2_comp_bars)
@@ -301,7 +385,7 @@ def build_indicators(
     return IndicatorArrays(
         c=c, h=h, l=l, o=o, v=v,
         e20=e20, e50=e50, e200=e200,
-        rsi_s=rsi_s, atr_s=atr_s, cci_s=cci_s,
+        rsi_s=rsi_s, atr_s=atr_s, cci_s=cci_s, adx_s=adx_s,
         vol_avg=vol_avg, atr_sma20=atr_sma20, atr_sma_comp=atr_sma_comp,
         bb_upper=bb_upper, bb_lower=bb_lower,
         kc_upper=kc_upper, kc_lower=kc_lower,
@@ -365,10 +449,20 @@ def compute_bar(
 
     Returns a BarResult, or None if the bar has insufficient data or NaNs.
 
-    This function is the ONLY place scoring logic lives.
-    scanner_engine.score_stock() calls compute_bar(ia, -1, params).
-    backtest_engine.generate_signals_historical() calls compute_bar(ia, i, params)
-    for each bar in the walk-forward loop.
+    TIER ARCHITECTURE (v3):
+    ─────────────────────────────────────────────────────────────────
+    TIER 1 PRIME   — trend_up + in_golden_relaxed + recent_cci_recovery
+                     + persistent_strength + trend_structure
+                     + RS > t1_rs_min                     ← NEW
+                     + (ADX > t1_adx_min OR EMA20 slope+) ← NEW
+                     OR (norm_buy with score ≥ 75 + same RS/ADX gates)
+                     Fib entries and CCI-cross alone do NOT qualify Tier 1.
+
+    TIER 2         — Compression breakout gate (was already Tier 2)
+                     + Fib entries (Fib+CCI, Fib base)   ← MOVED from T1
+                     + CCI cross entry alone              ← MOVED from T1
+                     + Harmonic / ABCD / Norm buys
+    ─────────────────────────────────────────────────────────────────
     """
     c   = ia.c;   h = ia.h;   l = ia.l
     v   = ia.v;   o = ia.o
@@ -388,6 +482,10 @@ def compute_bar(
     cur_ct   = float(ia.cloud_top.iloc[i])
     cur_cb   = float(ia.cloud_bottom.iloc[i])
 
+    # ADX (may be NaN early in the series)
+    _adx_raw = float(ia.adx_s.iloc[i]) if not np.isnan(float(ia.adx_s.iloc[i])) else 0.0
+    cur_adx  = _adx_raw
+
     # Guard NaNs on essential values
     if any(np.isnan(x) for x in [cur_c, cur_e20, cur_e200, cur_cci]):
         return None
@@ -397,6 +495,13 @@ def compute_bar(
     prev_cci = float(ia.cci_s.iloc[i - 1]) if i >= 1 else cur_cci
     prev_h   = float(h.iloc[i - 1])        if i >= 1 else float(h.iloc[i])
     prev_close = float(c.iloc[i - 1])      if i >= 1 else cur_c
+
+    # ── EMA20 SLOPE (5-bar, normalised) ───────────────────────────
+    if i >= 5:
+        e20_5ago    = float(ia.e20.iloc[i - 5])
+        ema20_slope = (cur_e20 - e20_5ago) / e20_5ago * 100 if e20_5ago > 0 else 0.0
+    else:
+        ema20_slope = 0.0
 
     # ── TREND ─────────────────────────────────────────────────────
     trend_up   = cur_c > cur_e200 and cur_e20 > cur_e50
@@ -422,6 +527,15 @@ def compute_bar(
         n5    = float(ia.nifty_aligned.iloc[i-5]) if not np.isnan(float(ia.nifty_aligned.iloc[i-5])) else 0
         if c5 > 0 and n5 > 0 and n_now > 0:
             rs = (cur_c / c5 - 1) - (n_now / n5 - 1)
+
+    # RS filter for Tier-1
+    rs_positive = rs > params.t1_rs_min
+
+    # Strength gate (ADX OR EMA slope) for Tier-1
+    if params.t1_use_adx:
+        strength_ok = cur_adx > params.t1_adx_min
+    else:
+        strength_ok = ema20_slope > 0
 
     # ── FIBONACCI ─────────────────────────────────────────────────
     ap   = params.atr_prox
@@ -466,8 +580,6 @@ def compute_bar(
     cci_momentum_break = cur_cci > params.cci_ob and cur_cci > prev_cci
 
     # ── COMPRESSION BREAKOUT (Tier 2) ─────────────────────────────
-    # Compression and range-high both measured on prior bar(s) to avoid
-    # look-ahead on the breakout candle itself.
     comp  = params.t2_comp_bars
     ratio = params.t2_atr_ratio
     if i >= 1 and not np.isnan(float(ia.atr_sma_comp.iloc[i - 1])) \
@@ -501,7 +613,12 @@ def compute_bar(
     qualified    = strong_htf and trend_strong
 
     # ── PIVOTS / HARMONICS / ABCD ─────────────────────────────────
-    _, _, harm_bull, harm_bear, abcd_bull, abcd_bear = _get_pivots(ia, i, params.pvt_lb)
+    # Speed: skip expensive pivot search when there's no hope of T1/T2 pivot signal
+    _may_need_pivots = trend_up   # only look for bull patterns in uptrend
+    if _may_need_pivots:
+        _, _, harm_bull, harm_bear, abcd_bull, abcd_bear = _get_pivots(ia, i, params.pvt_lb)
+    else:
+        harm_bull = harm_bear = abcd_bull = abcd_bear = False
 
     # ── RAW SCORE ─────────────────────────────────────────────────
     score = 0.0
@@ -519,16 +636,16 @@ def compute_bar(
     score += 15 if in_golden    else 0
     score += -20 if near_ext127 else (-30 if near_ext161 else 0)
     score += (20 if mom3 > 20 and mom6 > 20 else 10 if mom3 > 10 and mom6 > 10 else 5  if mom3 > 5 and mom6 > 5 else 0)
-     
-    #score += 15 if ema20_slope_now > ema20_slope_mid > ema20_slope_old and ema20_slope_now > 0.3 else 0
-     
+
+    # ADX / EMA slope strength bonus (NEW)
+    score += 15 if cur_adx > 25 else (8 if cur_adx > params.t1_adx_min else 0)
+    score += 10 if ema20_slope > 0.3 else (5 if ema20_slope > 0 else 0)
+
     score += 15 if cur_cci < params.cci_os else 5 if cur_cci < 0 else -15 if cci_extended else 0
-    
+
     score += 20 if harm_bull else 0
     score += 15 if abcd_bull else 0
     score += -15 if below_cloud else 0
-
-     
 
     # Squeeze boost
     if params.t1_squeeze_boost:
@@ -536,8 +653,6 @@ def compute_bar(
                  (params.t1_no_squeeze_pts if not squeeze_on else 0)
 
     # ── TIER 1 PRIME GATE ─────────────────────────────────────────
-    # Optional Nifty regime gate: when enabled, Nifty must be in bull
-    # regime (price > EMA200 AND EMA50 > EMA200) for Tier 1 to fire.
     nifty_allows = (
         not params.nifty_regime_filter or
         params.nifty_regime_val == "bull"
@@ -558,6 +673,8 @@ def compute_bar(
     score_threshold = 65 if ts_ratio > 1.2 else (75 if ts_ratio < 0.8 else 70)
 
     # ── BUY TYPE CLASSIFICATION ───────────────────────────────────
+    # NOTE: Fib + CCI entries are intentionally kept as buy classifiers
+    # but are now routed to Tier-2 only (never qualify for Tier-1 below).
     is_fib_buy_base = trend_up and in_golden     and norm_score >= score_threshold
     is_fib_buy_cci  = trend_up and in_golden_cci and norm_score >= 55 and cci_cross_up_os
     is_abcd_buy     = trend_up and abcd_bull
@@ -570,22 +687,38 @@ def compute_bar(
         is_fib_buy_base or is_fib_buy_cci or is_abcd_buy or
         is_harm_buy or is_norm_buy or is_cci_buy
     ) and allow_cloud_buy
-     
-    is_tier1_prime = (
+
+    # ── TIER 1 PRIME ──────────────────────────────────────────────
+    # Fib entries and CCI-cross alone are EXCLUDED from Tier 1.
+    # The qualifying paths are:
+    #   Path A — All-5-pillar: golden_relaxed + CCI_rec + persistence + structure
+    #   Path B — Norm buy with score ≥ 75
+    # BOTH paths require RS positive AND strength gate (ADX or EMA slope).
+    _tier1_base = (
         (
             trend_up and
             in_golden_relaxed and
             recent_cci_recovery and
             persistent_strength and
-            trend_structure
+            trend_structure and
+            not is_fib_buy_base and   # Fib entries stay Tier-2
+            not is_fib_buy_cci  and   # Fib+CCI entries stay Tier-2
+            not is_cci_buy             # pure CCI-cross stays Tier-2
         )
         or
         (
             is_norm_buy and
             norm_score >= 75
         )
-    ) and nifty_allows
-     
+    )
+
+    is_tier1_prime = (
+        _tier1_base and
+        rs_positive and       # NEW: RS filter
+        strength_ok and       # NEW: ADX or EMA slope
+        nifty_allows
+    )
+
     # ── TIER CLASSIFICATION ───────────────────────────────────────
     tier = (
         "Tier 1" if is_tier1_prime    else
@@ -647,12 +780,11 @@ def compute_bar(
     hard_stop = trend_down and below_cloud and norm_score < 30
     pct_chg   = round((cur_c - prev_close) / prev_close * 100, 2) if prev_close else 0.0
 
-    # Hi Prob: in golden zone with a real buy signal — ensures count matches
-    # what appears in Tier 1/2 (not inflated by Tier 3 WATCH-level stocks).
     high_prob_buy = trend_up and in_golden and norm_score >= 55 and any_buy
 
     # ── TIER 2 SUB-CONDITIONS ─────────────────────────────────────
-    t2_fib_qual   = is_fib_buy_base and qualified   and not is_tier1_prime
+    # Fib + CCI entries are now explicitly Tier-2 sub-conditions
+    t2_fib_qual   = is_fib_buy_base                 and not is_tier1_prime
     t2_fib_cci    = is_fib_buy_cci                  and not is_tier1_prime
     t2_harmonic   = is_harm_buy
     t2_abcd       = is_abcd_buy
@@ -676,7 +808,7 @@ def compute_bar(
 
     # ── SETUP LABEL ───────────────────────────────────────────────
     if is_tier1_prime:
-        setup = "All 5 Pillars v2"
+        setup = "All 5 Pillars v3"
     elif is_tier2_momentum:
         setup = "Compression Brk"
     elif any_buy:
@@ -741,6 +873,13 @@ def compute_bar(
         nifty_regime_val = params.nifty_regime_val,
         fib500 = round(fib500) if not np.isnan(fib500) else 0,
         fib382 = round(fib382) if not np.isnan(fib382) else 0,
+        # NEW strength fields
+        rs_val       = round(rs, 4),
+        adx_val      = round(cur_adx, 1),
+        ema20_slope  = round(ema20_slope, 3),
+        rs_positive  = rs_positive,
+        strength_ok  = strength_ok,
+        # booleans
         qualified           = qualified,
         persistent_strength = persistent_strength,
         high_prob           = high_prob_buy,
