@@ -14,27 +14,12 @@ compute_bar() is pure:
   • No I/O, no Streamlit, no yfinance — safe to call from any context.
 
 Adding a new condition means editing ONE place.
-
-v3 changes:
-  - Tier-1 gate now requires RS > threshold AND (ADX > 20 OR EMA20 slope positive).
-  - Fib entries (Fib, Fib+CCI) and CCI-cross entry are Tier-2, never Tier-1.
-  - ADX pre-computed in IndicatorArrays; EMA20 slope derived from e20.
-  - ScoringParams gains: t1_rs_min, t1_adx_min, t1_use_adx (use ADX vs EMA slope).
-  - BarResult gains: adx, rs_val, ema20_slope flags for display / backtest filter.
-  - Speed: CCI vectorised in build_indicators; _get_pivots gated by quick pre-check.
 """
 
 from __future__ import annotations
 from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
-
-# Imported at module level to avoid repeated per-call import overhead.
-# (circular-import-safe: scanner_engine does not import scoring_core at module level)
-from utils.scanner_engine import (
-    ema, sma, rsi, atr, cci, ichimoku, _strip_tz,
-    pivot_high, pivot_low, detect_harmonic, detect_abcd,
-)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -65,24 +50,28 @@ class ScoringParams:
     # Tier 1 — CCI recovery window
     t1_cci_window: int = 5     # bars to look back for CCI OS cross
 
+    # Tier 1 — CCI band gate (highest signal-to-noise filter from backtest)
+    # CCI at entry must be <= this value; 0 = CCI still in bearish half (default).
+    # Tighten to -50 in Settings for the OS/recovering zone only.
+    # Set to 999 to disable.
+    t1_cci_band_max: int = 0
+
+    # Tier 1 — BB expanding gate
+    # When True, requires BB to be expanding (not squeezed) at entry.
+    # Expanding BB = BB upper > KC upper OR BB lower < KC lower (opposite of squeeze).
+    t1_bb_expanding: bool = True
+
     # Tier 1 — cloud gate
     t1_cloud: bool = True      # if False, trend_structure ignores cloud
 
     # Tier 1 — squeeze boost
     t1_squeeze_boost:    bool  = True
-    t1_squeeze_pts:      int   = 5   # points on release
-    t1_no_squeeze_pts:   int   = 0   # points when not in squeeze
+    t1_squeeze_pts:      int   = 0    # neutralised — context gate in Tier 2 handles it
+    t1_no_squeeze_pts:   int   = 0    # neutralised
 
     # Tier 1 — persistent_strength score weight
     t1_ps_weight:  int = 20    # added when True
     t1_ps_penalty: int = -10   # added when False
-
-    # ── NEW: Tier 1 strength filter ─────────────────────────────
-    # RS (relative-strength vs Nifty, 5-bar) must exceed t1_rs_min
-    t1_rs_min:   float = 0.0   # default 0 = just RS positive
-    # ADX threshold (when t1_use_adx=True) OR EMA20 slope (when False)
-    t1_adx_min:  float = 20.0  # ADX must be > this
-    t1_use_adx:  bool  = True  # True=ADX gate, False=EMA20 slope gate
 
     # Tier 2 — compression
     t2_comp_bars:  int   = 10
@@ -92,11 +81,61 @@ class ScoringParams:
     t2_vol_mult:   float = 1.2
 
     # Nifty index regime gate (optional — Tier 1 extra gate)
+    # When nifty_regime_filter=True, Tier 1 requires Nifty to be in bull regime.
+    # nifty_regime_val is computed once by the scanner/backtest caller (not per bar).
     nifty_regime_filter: bool = False
     nifty_regime_val:    str  = "neutral"   # "bull" | "bear" | "neutral"
 
+    # Tier 3 — Active Momentum Expansion thresholds
+    t3_rs20_min:      float = 3.0    # RS20 > threshold (%)
+    t3_atr_ratio:     float = 0.90   # ATR14 < ATR_SMA20 * ratio
+    t3_breakout_atr:  float = 0.25   # (close - 10d_high) / ATR > threshold
+    t3_cci_min:       int   = 60     # CCI must be above this AND rising
+    t3_vol_mult:      float = 1.2    # volume > avg * mult
+    t3_squeeze_bonus: bool  = True   # add t3_squeeze_pts on squeeze_release
+    t3_squeeze_pts:   int   = 15     # bonus points on squeeze release
+
+    # Tier 4 — Early Recovery thresholds
+    t4_rs20_min:      float = 0.0    # RS20 must exceed this (positive RS)
+    t4_atr_ratio:     float = 0.90   # ATR14 < ATR_SMA20 * ratio
+    t4_cci_min:       int   = 0      # CCI must be above this AND rising
+    t4_vol_mult:      float = 1.2    # volume > avg * mult
+    t4_tight_atr:     float = 1.5    # 5-bar close range < ATR * mult
+
     # Score normalisation
-    max_score: int = 250
+    max_score: int = 175
+
+    # Score threshold — base value for normal-volatility regime
+    # Adaptive logic offsets ±5 based on ATR ratio; this sets the midpoint.
+    score_base_threshold: int = 70
+
+    # ── Risk / SL cap ────────────────────────────────────────────
+    # Hard cap on (entry - SL) / entry.  Trades whose ATR-based SL produces
+    # a risk% above this are rejected before entering.  Set to 1.0 to disable.
+    # Backtest shows 4-6% risk bucket has 64% T1 hit rate vs ~38% above 6.5%.
+    sl_max_risk_pct: float = 0.065   # 6.5%
+
+    # ── High-score CCI gate ──────────────────────────────────────
+    # When norm_score >= this level, require CCI < high_score_cci_max at entry.
+    # Prevents late entries on already-recovering stocks that score highly on
+    # structural filters but have lost their CCI edge.
+    # Set high_score_cci_threshold to 101 to disable.
+    high_score_cci_threshold: int   = 90    # applies when score >= this
+    high_score_cci_max:       int   = -50   # CCI must be below this value
+
+    # ── Symbol cooldown after SL ─────────────────────────────────
+    # After a SL hit on a symbol, block re-entry for this many calendar days.
+    # Prevents repeatedly entering the same structurally weak stock.
+    # Set to 0 to disable.
+    sl_cooldown_days: int = 60
+
+    # ── Time-based exit (slow-bleed prevention) ──────────────────
+    # If after time_stop_days the trade P&L is below time_stop_min_pct,
+    # exit at close rather than waiting for the SL or hold_days limit.
+    # 56% of SL hits were slow bleeds held 10+ days to full SL.
+    # Set time_stop_days to 0 to disable.
+    time_stop_days:    int   = 10
+    time_stop_min_pct: float = 2.0   # must be at least +2% by day 10
 
     @classmethod
     def from_settings(cls, s: dict) -> "ScoringParams":
@@ -112,20 +151,39 @@ class ScoringParams:
             t1_fib_hi        = float(s.get("t1_fib_hi",         38.2)),
             t1_fib_lo        = float(s.get("t1_fib_lo",         61.8)),
             t1_cci_window    = int(s.get("t1_cci_window",        5)),
+            t1_cci_band_max  = int(s.get("t1_cci_band_max",      0)),
+            t1_bb_expanding  = bool(s.get("t1_bb_expanding",    True)),
             t1_cloud         = bool(s.get("t1_cloud",           True)),
             t1_squeeze_boost = bool(s.get("t1_squeeze_boost",   True)),
-            t1_squeeze_pts   = int(s.get("t1_squeeze_pts",      15)),
-            t1_no_squeeze_pts= int(s.get("t1_no_squeeze_pts",    5)),
+            t1_squeeze_pts   = int(s.get("t1_squeeze_pts",       0)),
+            t1_no_squeeze_pts= int(s.get("t1_no_squeeze_pts",    0)),
             t1_ps_weight     = int(s.get("t1_ps_weight",        20)),
             t1_ps_penalty    = int(s.get("t1_ps_penalty",      -10)),
-            t1_rs_min        = float(s.get("t1_rs_min",          0.0)),
-            t1_adx_min       = float(s.get("t1_adx_min",        20.0)),
-            t1_use_adx       = bool(s.get("t1_use_adx",         True)),
+            max_score        = int(s.get("max_score",          175)),
+            score_base_threshold = int(s.get("score_base_threshold", 70)),
             t2_comp_bars     = int(s.get("t2_comp_bars",        10)),
             t2_atr_ratio     = float(s.get("t2_atr_ratio",      0.85)),
             t2_vol_mult      = float(s.get("t2_vol_mult",        1.2)),
             nifty_regime_filter = bool(s.get("nifty_regime_filter", False)),
             nifty_regime_val    = str(s.get("nifty_regime_val",  "neutral")),
+            t3_rs20_min         = float(s.get("t3_rs20_min",      3.0)),
+            t3_atr_ratio        = float(s.get("t3_atr_ratio",     0.90)),
+            t3_breakout_atr     = float(s.get("t3_breakout_atr",  0.25)),
+            t3_cci_min          = int(s.get("t3_cci_min",         60)),
+            t3_vol_mult         = float(s.get("t3_vol_mult",      1.2)),
+            t3_squeeze_bonus    = bool(s.get("t3_squeeze_bonus",  True)),
+            t3_squeeze_pts      = int(s.get("t3_squeeze_pts",     15)),
+            t4_rs20_min         = float(s.get("t4_rs20_min",      0.0)),
+            t4_atr_ratio        = float(s.get("t4_atr_ratio",     0.90)),
+            t4_cci_min          = int(s.get("t4_cci_min",         0)),
+            t4_vol_mult         = float(s.get("t4_vol_mult",      1.2)),
+            t4_tight_atr        = float(s.get("t4_tight_atr",     1.5)),
+            sl_max_risk_pct          = float(s.get("sl_max_risk_pct",       0.065)),
+            high_score_cci_threshold = int(s.get("high_score_cci_threshold", 90)),
+            high_score_cci_max       = int(s.get("high_score_cci_max",      -50)),
+            sl_cooldown_days         = int(s.get("sl_cooldown_days",         60)),
+            time_stop_days           = int(s.get("time_stop_days",           10)),
+            time_stop_min_pct        = float(s.get("time_stop_min_pct",       2.0)),
         )
 
 
@@ -140,8 +198,9 @@ class BarResult:
     # ── Tier gates ──────────────────────────────────────────────
     tier1_prime:      bool = False
     tier2_momentum:   bool = False
-    elite_tier:       bool = False   # NEW: Elite gate
     any_buy:          bool = False
+    tier3_momentum:   bool = False   # Active Momentum Expansion
+    tier4_recovery:   bool = False   # Early Recovery
 
     # ── Score ────────────────────────────────────────────────────
     norm_score:       int  = 0
@@ -175,13 +234,6 @@ class BarResult:
     fib618:     float = 0.0
     fib500:     float = 0.0
     fib382:     float = 0.0
-
-    # ── NEW strength indicators ──────────────────────────────────
-    rs_val:       float = 0.0   # raw RS vs Nifty (5-bar)
-    adx_val:      float = 0.0   # ADX(14)
-    ema20_slope:  float = 0.0   # EMA20[i] - EMA20[i-5], normalised by price
-    rs_positive:  bool  = False  # rs_val > t1_rs_min
-    strength_ok:  bool  = False  # ADX or EMA slope gate passed
 
     # ── Nifty regime ─────────────────────────────────────────────
     nifty_regime_val: str  = "neutral"   # passed through for display
@@ -219,19 +271,25 @@ class BarResult:
     t2_norm_strong:  bool = False
     t2_norm:         bool = False
 
-    # ── Tier 3 watch sub-conditions ──────────────────────────────
-    t3_near_golden:  bool = False
-    t3_cci_rec:      bool = False
-    t3_cloud_test:   bool = False
-    t3_ema_conv:     bool = False
+    # ── Tier 3 — Active Momentum Expansion sub-conditions ───────
+    t3_trend_ok:         bool = False
+    t3_rs20_strong:      bool = False
+    t3_atr_contract:     bool = False
+    t3_breakout_trigger: bool = False
+    t3_momentum_expand:  bool = False
+    t3_volume_expand:    bool = False
+    t3_squeeze_bonus:    bool = False
 
-    # ── Tier 4 / skip sub-conditions ─────────────────────────────
-    t4_hard_stop:    bool = False
-    t4_fib_resist:   bool = False
-    t4_downtrend:    bool = False
-
-    # ── Volume ───────────────────────────────────────────────────
-    vol_ratio:       float = 1.0   # cur_v / cur_vavg  (raw, not normalised)
+    # ── Tier 4 — Early Recovery sub-conditions ───────────────────
+    t4_close_above_e20:  bool = False
+    t4_e20_rising:       bool = False
+    t4_rs20_positive:    bool = False
+    t4_rs20_improving:   bool = False
+    t4_atr_contract:     bool = False
+    t4_tight_range:      bool = False
+    t4_cci_positive:     bool = False
+    t4_cci_rising:       bool = False
+    t4_volume_expand:    bool = False
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -256,7 +314,6 @@ class IndicatorArrays:
     rsi_s:        pd.Series
     atr_s:        pd.Series
     cci_s:        pd.Series
-    adx_s:        pd.Series   # NEW: ADX(14)
     vol_avg:      pd.Series
     atr_sma20:    pd.Series
     atr_sma_comp: pd.Series   # SMA(ATR, comp_bars) — for compression check
@@ -272,64 +329,6 @@ class IndicatorArrays:
 
     nifty_aligned: pd.Series   # Nifty close reindexed to symbol's trading days
 
-    # Pre-computed full-history pivot arrays (backtest speed: avoids O(N²) re-rolling)
-    ph_full:  pd.Series   # pivot highs over full history
-    pl_full:  pd.Series   # pivot lows  over full history
-
-
-# ══════════════════════════════════════════════════════════════════
-#  ADX HELPER  (vectorised — computed once per symbol)
-# ══════════════════════════════════════════════════════════════════
-
-def _adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    """Vectorised Wilder-smoothed ADX — TR/DM computed with numpy, no Python loops."""
-    h = high.to_numpy(dtype=float)
-    l = low.to_numpy(dtype=float)
-    c = close.to_numpy(dtype=float)
-    n = len(c)
-
-    # True Range — fully vectorised
-    prev_c = np.empty(n); prev_c[0] = c[0]; prev_c[1:] = c[:-1]
-    tr = np.maximum.reduce([h - l, np.abs(h - prev_c), np.abs(l - prev_c)])
-    tr[0] = 0.0
-
-    # Directional Movement — fully vectorised
-    prev_h = np.empty(n); prev_h[0] = h[0]; prev_h[1:] = h[:-1]
-    prev_l = np.empty(n); prev_l[0] = l[0]; prev_l[1:] = l[:-1]
-    up   = h - prev_h
-    down = prev_l - l
-    pdm = np.where((up > down) & (up > 0),   up,   0.0); pdm[0] = 0.0
-    mdm = np.where((down > up) & (down > 0), down, 0.0); mdm[0] = 0.0
-
-    # Wilder smoothing: seed at bar `period`, then recurrence
-    def _wilder_smooth(arr: np.ndarray) -> np.ndarray:
-        out = np.full(n, np.nan)
-        if n <= period:
-            return out
-        out[period] = arr[1:period + 1].sum()
-        for idx in range(period + 1, n):
-            out[idx] = out[idx - 1] - out[idx - 1] / period + arr[idx]
-        return out
-
-    atr_w = _wilder_smooth(tr)
-    pdm_w = _wilder_smooth(pdm)
-    mdm_w = _wilder_smooth(mdm)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        pdi = np.where(atr_w > 0, 100.0 * pdm_w / atr_w, 0.0)
-        mdi = np.where(atr_w > 0, 100.0 * mdm_w / atr_w, 0.0)
-        dx  = np.where((pdi + mdi) > 0, 100.0 * np.abs(pdi - mdi) / (pdi + mdi), 0.0)
-
-    # Second Wilder pass: DX → ADX
-    adx_arr = np.full(n, np.nan)
-    first = 2 * period
-    if n > first:
-        adx_arr[first] = np.nanmean(dx[period + 1: first + 1])
-        for idx in range(first + 1, n):
-            adx_arr[idx] = (adx_arr[idx - 1] * (period - 1) + dx[idx]) / period
-
-    return pd.Series(adx_arr, index=close.index)
-
 
 # ══════════════════════════════════════════════════════════════════
 #  SERIES BUILDER  (call once per symbol)
@@ -343,8 +342,11 @@ def build_indicators(
     """
     Pre-compute every indicator Series for the full OHLCV history.
     Imported helpers come from scanner_engine to avoid circular deps.
-    Speed: CCI is vectorised; ADX computed once here.
     """
+    from utils.scanner_engine import (
+        ema, sma, rsi, atr, cci, ichimoku, _strip_tz,
+    )
+
     c = df["close"]
     h = df["high"]
     l = df["low"]
@@ -357,7 +359,6 @@ def build_indicators(
     rsi_s    = rsi(c, 21)
     atr_s    = atr(h, l, c, 14)
     cci_s    = cci(c, params.cci_len)
-    adx_s    = _adx(h, l, c, 14)          # NEW: ADX pre-computed
     vol_avg  = sma(v, 20)
     atr_sma20    = sma(atr_s, 20)
     atr_sma_comp = sma(atr_s, params.t2_comp_bars)
@@ -386,26 +387,16 @@ def build_indicators(
     _nifty.index = _strip_tz(_nifty.index)
     nifty_aligned = _nifty.reindex(_c_idx, method="ffill")
 
-    # Pre-compute pivot arrays over the full history once.
-    # _get_pivots reads backwards from bar i — no re-rolling per bar.
-    # Note: pivot_high/low use center=True rolling so bar j is only confirmed
-    # as a pivot once bars j+pvt_lb exist. _get_pivots enforces this by
-    # skipping pivots at j > i - pvt_lb (look-forward still in future).
-    ph_full = pivot_high(h, params.pvt_lb)
-    pl_full = pivot_low (l, params.pvt_lb)
-
     return IndicatorArrays(
         c=c, h=h, l=l, o=o, v=v,
         e20=e20, e50=e50, e200=e200,
-        rsi_s=rsi_s, atr_s=atr_s, cci_s=cci_s, adx_s=adx_s,
+        rsi_s=rsi_s, atr_s=atr_s, cci_s=cci_s,
         vol_avg=vol_avg, atr_sma20=atr_sma20, atr_sma_comp=atr_sma_comp,
         bb_upper=bb_upper, bb_lower=bb_lower,
         kc_upper=kc_upper, kc_lower=kc_lower,
         squeeze_series=squeeze_series,
         cloud_top=cloud_top, cloud_bottom=cloud_bottom,
         nifty_aligned=nifty_aligned,
-        ph_full=ph_full,
-        pl_full=pl_full,
     )
 
 
@@ -414,31 +405,25 @@ def build_indicators(
 # ══════════════════════════════════════════════════════════════════
 
 def _get_pivots(ia: IndicatorArrays, i: int, pvt_lb: int):
-    """Return pivot data for up to 8 confirmed pivots ending at bar i.
+    """Return (pv_prices, pv_is_high) for up to 8 recent pivots ending at bar i."""
+    from utils.scanner_engine import pivot_high, pivot_low, detect_harmonic, detect_abcd
 
-    Uses pre-computed ph_full / pl_full from IndicatorArrays — no re-rolling.
-    Enforces no-lookahead by skipping pivots at j > i - pvt_lb (the center=True
-    rolling window requires pvt_lb bars ahead to confirm a pivot; those bars are
-    in the future relative to bar i during the backtest walk-forward).
-    """
+    if i < 0:
+        i = len(ia.c) + i
+
     pvt_lb_use = min(pvt_lb, i // 4)
     if pvt_lb_use < 2:
         return [], [], False, False, False, False
 
-    # Confirmed pivot boundary: bar j is confirmed only once bar j+pvt_lb exists
-    confirmed_up_to = i - pvt_lb_use   # bars > this index have unconfirmed pivots
-
-    ph_s = ia.ph_full
-    pl_s = ia.pl_full
+    ph_s = pivot_high(ia.h.iloc[:i + 1], pvt_lb_use)
+    pl_s = pivot_low(ia.l.iloc[:i + 1],  pvt_lb_use)
 
     pivots = []
-    for j in range(confirmed_up_to, max(-1, i - 60), -1):
-        ph_val = float(ph_s.iloc[j])
-        pl_val = float(pl_s.iloc[j])
-        if not np.isnan(ph_val):
-            pivots.append((ph_val, True))
-        elif not np.isnan(pl_val):
-            pivots.append((pl_val, False))
+    for j in range(i, max(-1, i - 60), -1):
+        if not np.isnan(float(ph_s.iloc[j])):
+            pivots.append((float(ph_s.iloc[j]), True))
+        elif not np.isnan(float(pl_s.iloc[j])):
+            pivots.append((float(pl_s.iloc[j]), False))
         if len(pivots) >= 8:
             break
 
@@ -472,23 +457,21 @@ def compute_bar(
 
     Returns a BarResult, or None if the bar has insufficient data or NaNs.
 
-    TIER ARCHITECTURE (v3):
-    ─────────────────────────────────────────────────────────────────
-    TIER 1 PRIME   — trend_up + in_golden_relaxed + recent_cci_recovery
-                     + persistent_strength + trend_structure
-                     + RS > t1_rs_min                     ← NEW
-                     + (ADX > t1_adx_min OR EMA20 slope+) ← NEW
-                     OR (norm_buy with score ≥ 75 + same RS/ADX gates)
-                     Fib entries and CCI-cross alone do NOT qualify Tier 1.
-
-    TIER 2         — Compression breakout gate (was already Tier 2)
-                     + Fib entries (Fib+CCI, Fib base)   ← MOVED from T1
-                     + CCI cross entry alone              ← MOVED from T1
-                     + Harmonic / ABCD / Norm buys
-    ─────────────────────────────────────────────────────────────────
+    This function is the ONLY place scoring logic lives.
+    scanner_engine.score_stock() calls compute_bar(ia, -1, params).
+    backtest_engine.generate_signals_historical() calls compute_bar(ia, i, params)
+    for each bar in the walk-forward loop.
     """
     c   = ia.c;   h = ia.h;   l = ia.l
     v   = ia.v;   o = ia.o
+
+    # Resolve negative index to a concrete positive offset so that every
+    # iloc[start : i+1] slice works correctly.  Without this, i=-1 makes
+    # i+1=0 and iloc[anything:0] returns an empty Series, silently breaking
+    # Fibonacci levels, momentum lookbacks, RS, harmonic detection, and
+    # every "i >= N" guard (since -1 >= 1 is always False).
+    if i < 0:
+        i = len(c) + i
 
     # ── Scalar extractions ────────────────────────────────────────
     cur_c    = float(c.iloc[i])
@@ -505,10 +488,6 @@ def compute_bar(
     cur_ct   = float(ia.cloud_top.iloc[i])
     cur_cb   = float(ia.cloud_bottom.iloc[i])
 
-    # ADX (may be NaN early in the series)
-    _adx_raw = float(ia.adx_s.iloc[i]) if not np.isnan(float(ia.adx_s.iloc[i])) else 0.0
-    cur_adx  = _adx_raw
-
     # Guard NaNs on essential values
     if any(np.isnan(x) for x in [cur_c, cur_e20, cur_e200, cur_cci]):
         return None
@@ -518,13 +497,6 @@ def compute_bar(
     prev_cci = float(ia.cci_s.iloc[i - 1]) if i >= 1 else cur_cci
     prev_h   = float(h.iloc[i - 1])        if i >= 1 else float(h.iloc[i])
     prev_close = float(c.iloc[i - 1])      if i >= 1 else cur_c
-
-    # ── EMA20 SLOPE (5-bar, normalised) ───────────────────────────
-    if i >= 5:
-        e20_5ago    = float(ia.e20.iloc[i - 5])
-        ema20_slope = (cur_e20 - e20_5ago) / e20_5ago * 100 if e20_5ago > 0 else 0.0
-    else:
-        ema20_slope = 0.0
 
     # ── TREND ─────────────────────────────────────────────────────
     trend_up   = cur_c > cur_e200 and cur_e20 > cur_e50
@@ -550,15 +522,6 @@ def compute_bar(
         n5    = float(ia.nifty_aligned.iloc[i-5]) if not np.isnan(float(ia.nifty_aligned.iloc[i-5])) else 0
         if c5 > 0 and n5 > 0 and n_now > 0:
             rs = (cur_c / c5 - 1) - (n_now / n5 - 1)
-
-    # RS filter for Tier-1
-    rs_positive = rs > params.t1_rs_min
-
-    # Strength gate (ADX OR EMA slope) for Tier-1
-    if params.t1_use_adx:
-        strength_ok = cur_adx > params.t1_adx_min
-    else:
-        strength_ok = ema20_slope > 0
 
     # ── FIBONACCI ─────────────────────────────────────────────────
     ap   = params.atr_prox
@@ -603,6 +566,8 @@ def compute_bar(
     cci_momentum_break = cur_cci > params.cci_ob and cur_cci > prev_cci
 
     # ── COMPRESSION BREAKOUT (Tier 2) ─────────────────────────────
+    # Compression and range-high both measured on prior bar(s) to avoid
+    # look-ahead on the breakout candle itself.
     comp  = params.t2_comp_bars
     ratio = params.t2_atr_ratio
     if i >= 1 and not np.isnan(float(ia.atr_sma_comp.iloc[i - 1])) \
@@ -622,6 +587,16 @@ def compute_bar(
     prev_squeeze_on = bool(ia.squeeze_series.iloc[i - 1]) if i >= 1 else squeeze_on
     squeeze_release = prev_squeeze_on and not squeeze_on
 
+    # ── BB EXPANDING ───────────────────────────────────────────────
+    # BB expanding = bands are WIDER than the Keltner Channel on the current
+    # bar (the opposite of the squeeze condition).  A single-bar check is
+    # sufficient — it confirms volatility is already opening up at entry.
+    cur_bb_upper = float(ia.bb_upper.iloc[i])
+    cur_bb_lower = float(ia.bb_lower.iloc[i])
+    cur_kc_upper = float(ia.kc_upper.iloc[i])
+    cur_kc_lower = float(ia.kc_lower.iloc[i])
+    bb_expanding = (cur_bb_upper > cur_kc_upper) or (cur_bb_lower < cur_kc_lower)
+
     # ── MOMENTUM ──────────────────────────────────────────────────
     mom1 = (cur_c / float(c.iloc[i - 21])  - 1) * 100 if i >= 21  else 0.0
     mom3 = (cur_c / float(c.iloc[i - 63])  - 1) * 100 if i >= 63  else 0.0
@@ -635,51 +610,135 @@ def compute_bar(
     trend_strong = cur_c > cur_e20 and cur_e20 > cur_e50
     qualified    = strong_htf and trend_strong
 
-    # ── PIVOTS / HARMONICS / ABCD ─────────────────────────────────
-    # Speed: skip expensive pivot search when there's no hope of T1/T2 pivot signal
-    _may_need_pivots = trend_up   # only look for bull patterns in uptrend
-    if _may_need_pivots:
-        _, _, harm_bull, harm_bear, abcd_bull, abcd_bear = _get_pivots(ia, i, params.pvt_lb)
+    # ── RS20 — 20-bar RS vs Nifty (Tier 3 / Tier 4 use) ──────────
+    rs20 = 0.0
+    if i >= 20:
+        c20   = float(c.iloc[i - 20])
+        n_now = float(ia.nifty_aligned.iloc[i])    if not np.isnan(float(ia.nifty_aligned.iloc[i]))    else 0
+        n20   = float(ia.nifty_aligned.iloc[i-20]) if not np.isnan(float(ia.nifty_aligned.iloc[i-20])) else 0
+        if c20 > 0 and n20 > 0 and n_now > 0:
+            rs20 = (cur_c / c20 - 1) * 100 - (n_now / n20 - 1) * 100
+    prev_rs20 = 0.0
+    if i >= 21:
+        c20p  = float(c.iloc[i - 21])
+        c1p   = float(c.iloc[i - 1])
+        n1    = float(ia.nifty_aligned.iloc[i-1])  if not np.isnan(float(ia.nifty_aligned.iloc[i-1]))  else 0
+        n21   = float(ia.nifty_aligned.iloc[i-21]) if not np.isnan(float(ia.nifty_aligned.iloc[i-21])) else 0
+        if c20p > 0 and n21 > 0 and n1 > 0:
+            prev_rs20 = (c1p / c20p - 1) * 100 - (n1 / n21 - 1) * 100
+
+    # ── TIGHT RANGE — 5-bar close range < 1.5× ATR (base building) ─
+    if i >= 5:
+        rng5 = float(c.iloc[i-4:i+1].max()) - float(c.iloc[i-4:i+1].min())
+        tight_range = rng5 < cur_atr * params.t4_tight_atr
     else:
-        harm_bull = harm_bear = abcd_bull = abcd_bear = False
+        tight_range = False
+
+    # ── ATR CONTRACTION (shared Tier 3 / Tier 4) ─────────────────
+    # cur_atr_sma20 already computed; reuse
+    atr_contract = cur_atr < cur_atr_sma20 * 0.90
+
+    # ── PIVOTS / HARMONICS / ABCD ─────────────────────────────────
+    _, _, harm_bull, harm_bear, abcd_bull, abcd_bear = _get_pivots(ia, i, params.pvt_lb)
 
     # ── RAW SCORE ─────────────────────────────────────────────────
+    # Budget (max_score = 175):
+    #   Trend structure    25   (trend_up)
+    #   EMA alignment      30   (e20>e50 full; 20 if within 0.5%)
+    #   RSI                25   (graded 45–60+)
+    #   Volume             20   (>1.2x avg)
+    #   HH breakout        25   (close > 10-bar high; +10 if up 2 bars)
+    #   RS vs Nifty        15   (rs > 0; 5 if marginally negative)
+    #   Fibonacci zone     30   (in_golden — unchanged)
+    #   Fib extension     -20/-30  (near_ext127/161)
+    #   CCI               20   (OS = 20, neutral = 10, extended = -15)
+    #   CCI cross OS       15
+    #   Persist. strength  20/-10
+    #   Harmonic           20
+    #   ABCD               15
+    #   Below cloud       -15
+    #   Squeeze            15/5  (t1_squeeze_pts / t1_no_squeeze_pts)
+    #   Tier 1 gate bonus  20
+    # ─────────────────────────────────────────────────────────────
     score = 0.0
 
+    # ① TREND — primary pillar (25)
     score += 25 if trend_up else 0
-    score += 30 if cur_e20 > cur_e50 else (20 if cur_e20 > cur_e50 * 0.995 else 0)
+
+    # ② EMA ALIGNMENT — full points for clear alignment, partial for near (30)
+    prev_e20 = float(ia.e20.iloc[i - 1]) if i >= 1 else cur_e20
+    ema_slope = cur_e20 > prev_e20 and cur_e50 > prev_e50
+    score += (30 if cur_e20 > cur_e50 else 20 if cur_e20 > cur_e50 * 0.995 else 0)
+
+    # ③ RSI — graded; rewards momentum building (max 25)
+    prev_rsi = float(ia.rsi_s.iloc[i - 1]) if i >= 1 else cur_r
+    rsi_rising_from_os = cur_r > prev_rsi and 40 < cur_r < 60
     score += (25 if cur_r > 60 else 20 if cur_r > 55 else 15 if cur_r > 50 else 5 if cur_r > 45 else 0)
-    score += (30 if cur_v > cur_vavg * 2.0 else 20 if cur_v > cur_vavg * 1.5 else 10 if cur_v > cur_vavg * 1.2 else 0)
 
+    # ④ VOLUME — meaningful expansion signal (max 20)
+    score += (20 if cur_v > cur_vavg * 1.2 else 10 if cur_v > cur_vavg else 0)
+
+    # ⑤ HIGHER HIGH / BREAKOUT — rewards price making new highs (max 35)
     hh = float(ia.c.iloc[max(0, i - 10):i].max()) if i >= 1 else cur_c
+    breakout_quality = (cur_c - hh) / cur_atr if cur_atr > 0 else 0.0
     score += (25 if cur_c > hh else 15 if cur_c > hh * 0.98 else 0)
-    score += 10 if i >= 2 and cur_c > float(c.iloc[i - 2]) * 1.01 else 0
+    score += (10 if i >= 2 and cur_c > float(ia.c.iloc[i - 2]) else 0)
 
-    score += (30 if rs > 0.10 else 20 if rs > 0.05 else 10 if rs > 0 else 0)
-    score += 15 if in_golden    else 0
+    # ⑥ RELATIVE STRENGTH — positive vs Nifty is sufficient signal (max 15)
+    score += (15 if rs > 0 else 5 if rs > -0.005 else 0)
+
+    # ⑦ FIBONACCI ZONE — unchanged, core signal (30)
+    score += 30 if in_golden else 0
+
+    # ⑧ FIBONACCI EXTENSION PENALTIES
     score += -20 if near_ext127 else (-30 if near_ext161 else 0)
-    score += (20 if mom3 > 20 and mom6 > 20 else 10 if mom3 > 10 and mom6 > 10 else 5  if mom3 > 5 and mom6 > 5 else 0)
 
-    # ADX / EMA slope strength bonus (NEW)
-    score += 15 if cur_adx > 25 else (8 if cur_adx > params.t1_adx_min else 0)
-    score += 10 if ema20_slope > 0.3 else (5 if ema20_slope > 0 else 0)
+    # ⑨ CCI — rewards OS recovery; penalises extended (max 20)
+    cci_caution = cur_cci > 120 and not cci_extended   # kept for flag use below
+    score += (20 if cur_cci < params.cci_os else
+              10 if cur_cci < 0             else
+             -15 if cci_extended            else 0)
+    score += 15 if cci_cross_up_os else 0
 
-    score += 15 if cur_cci < params.cci_os else 5 if cur_cci < 0 else -15 if cci_extended else 0
+    # ⑩ PERSISTENT STRENGTH — unchanged weight
+    score += params.t1_ps_weight if persistent_strength else params.t1_ps_penalty
 
+    # ⑪ HARMONIC / ABCD — meaningful signal weight
     score += 20 if harm_bull else 0
     score += 15 if abcd_bull else 0
+
+    # ⑫ CLOUD — penalty unchanged
     score += -15 if below_cloud else 0
 
-    # Squeeze boost
+    # ⑬ SQUEEZE
     if params.t1_squeeze_boost:
         score += params.t1_squeeze_pts if squeeze_release else \
                  (params.t1_no_squeeze_pts if not squeeze_on else 0)
 
     # ── TIER 1 PRIME GATE ─────────────────────────────────────────
+    # Optional Nifty regime gate: when enabled, Nifty must be in bull
+    # regime (price > EMA200 AND EMA50 > EMA200) for Tier 1 to fire.
     nifty_allows = (
         not params.nifty_regime_filter or
         params.nifty_regime_val == "bull"
     )
+
+    is_tier1_prime = (
+        trend_up              and
+        in_golden_relaxed     and
+        recent_cci_recovery   and
+        persistent_strength   and
+        trend_structure       and
+        nifty_allows          and
+        # CCI band: CCI must be in bearish/recovering territory at entry.
+        # Threshold of 0 (rather than -50) preserves most valid setups while
+        # still blocking entries where CCI is already overbought at trigger.
+        # t1_cci_band_max defaults to 0; set to -50 in Settings for a tighter filter.
+        cur_cci <= params.t1_cci_band_max and
+        # BB expanding gate — optional; when disabled (t1_bb_expanding=False) passes all bars.
+        (bb_expanding if params.t1_bb_expanding else True)
+    )
+    score += 20 if is_tier1_prime else 0
 
     # ── TIER 2 MOMENTUM GATE ──────────────────────────────────────
     is_tier2_momentum = (
@@ -688,22 +747,76 @@ def compute_bar(
         cur_v > cur_vavg * params.t2_vol_mult
     )
 
+    # ── TIER 3 — ACTIVE MOMENTUM EXPANSION ──────────────────────
+    # All six conditions must be true simultaneously.
+    t3_trend_ok_flag        = cur_c > cur_e200 and cur_e20 > cur_e50
+    t3_rs20_strong_flag     = rs20 > params.t3_rs20_min
+    t3_atr_contract_flag    = cur_atr < cur_atr_sma20 * params.t3_atr_ratio
+    t3_10d_high             = float(h.iloc[max(0, i - 10):i].max()) if i >= 1 else float(h.iloc[i])
+    t3_breakout_qual        = (cur_c - t3_10d_high) / cur_atr if cur_atr > 0 else 0.0
+    t3_breakout_trigger_flag = (
+        cur_c > t3_10d_high and
+        cur_c > prev_close  and
+        t3_breakout_qual > params.t3_breakout_atr
+    )
+    t3_momentum_expand_flag = cur_cci > params.t3_cci_min and cur_cci > prev_cci
+    t3_volume_expand_flag   = cur_v > cur_vavg * params.t3_vol_mult
+    t3_squeeze_bonus_flag   = squeeze_release and params.t3_squeeze_bonus   # bonus: not a gate condition
+
+    is_tier3_momentum = (
+        t3_trend_ok_flag         and
+        t3_rs20_strong_flag      and
+        t3_atr_contract_flag     and
+        t3_breakout_trigger_flag and
+        t3_momentum_expand_flag  and
+        t3_volume_expand_flag
+    )
+
+    # ── TIER 4 — EARLY RECOVERY ───────────────────────────────────
+    # All conditions must be true simultaneously.
+    prev_e20_val = float(ia.e20.iloc[i - 1]) if i >= 1 else cur_e20
+    t4_close_above_e20_flag = cur_c > cur_e20
+    t4_e20_rising_flag      = cur_e20 > prev_e20_val
+    t4_rs20_positive_flag   = rs20 > params.t4_rs20_min
+    t4_rs20_improving_flag  = rs20 > prev_rs20
+    t4_atr_contract_flag    = cur_atr < cur_atr_sma20 * params.t4_atr_ratio
+    t4_tight_range_flag     = tight_range
+    t4_cci_positive_flag    = cur_cci > params.t4_cci_min
+    t4_cci_rising_flag      = cur_cci > prev_cci
+    t4_volume_expand_flag   = cur_v > cur_vavg * params.t4_vol_mult
+
+    is_tier4_recovery = (
+        t4_close_above_e20_flag and
+        t4_e20_rising_flag      and
+        t4_rs20_positive_flag   and
+        t4_rs20_improving_flag  and
+        t4_atr_contract_flag    and
+        t4_tight_range_flag     and
+        t4_cci_positive_flag    and
+        t4_cci_rising_flag      and
+        t4_volume_expand_flag
+    )
+
+    # ── TIER 3 SQUEEZE BONUS ─────────────────────────────────────
+    if is_tier3_momentum and t3_squeeze_bonus_flag:
+        score += params.t3_squeeze_pts
+
     # ── NORMALISE ─────────────────────────────────────────────────
     norm_score = min(100, int(score * 100 / params.max_score))
 
     # ── ADAPTIVE THRESHOLD ────────────────────────────────────────
     ts_ratio        = cur_atr / cur_atr_sma20 if cur_atr_sma20 > 0 else 1.0
-    score_threshold = 65 if ts_ratio > 1.2 else (75 if ts_ratio < 0.8 else 70)
+    score_threshold = (params.score_base_threshold - 5) if ts_ratio > 1.2 else \
+                      (params.score_base_threshold + 5) if ts_ratio < 0.8 else \
+                       params.score_base_threshold
 
     # ── BUY TYPE CLASSIFICATION ───────────────────────────────────
-    # NOTE: Fib + CCI entries are intentionally kept as buy classifiers
-    # but are now routed to Tier-2 only (never qualify for Tier-1 below).
-    is_fib_buy_base = trend_up and in_golden     and norm_score >= score_threshold
+    is_fib_buy_base = trend_up and in_golden     and norm_score >= score_threshold and cur_cci < 100
     is_fib_buy_cci  = trend_up and in_golden_cci and norm_score >= 55 and cci_cross_up_os
-    is_abcd_buy     = trend_up and abcd_bull
-    is_harm_buy     = trend_up and harm_bull
-    is_norm_buy     = trend_up and norm_score >= 65 and not in_golden and not cci_extended
-    is_cci_buy      = trend_up and cci_cross_up_os and norm_score >= 55
+    is_abcd_buy     = trend_up and abcd_bull and norm_score >= 35
+    is_harm_buy     = trend_up and harm_bull  and norm_score >= 35
+    is_norm_buy     = trend_up and norm_score >= 65 and not in_golden and not cci_extended and cur_cci < 50
+    is_cci_buy      = trend_up and cci_cross_up_os and norm_score >= 55 and cur_cci < 100
 
     allow_cloud_buy = above_cloud or (inside_cloud and norm_score >= 65)
     any_buy = (
@@ -711,57 +824,12 @@ def compute_bar(
         is_harm_buy or is_norm_buy or is_cci_buy
     ) and allow_cloud_buy
 
-    # ── TIER 1 PRIME ──────────────────────────────────────────────
-    # Fib entries and CCI-cross alone are EXCLUDED from Tier 1.
-    # The qualifying paths are:
-    #   Path A — All-5-pillar: golden_relaxed + CCI_rec + persistence + structure
-    #   Path B — Norm buy with score ≥ 75
-    # BOTH paths require RS positive AND strength gate (ADX or EMA slope).
-    _tier1_base = (
-        (
-            trend_up and
-            in_golden_relaxed and
-            recent_cci_recovery and
-            persistent_strength and
-            trend_structure and
-            not is_fib_buy_base and   # Fib entries stay Tier-2
-            not is_fib_buy_cci  and   # Fib+CCI entries stay Tier-2
-            not is_cci_buy             # pure CCI-cross stays Tier-2
-        )
-        or
-        (
-            is_norm_buy and
-            norm_score >= 75
-        )
-    )
-
-    is_tier1_prime = (
-        _tier1_base and
-        rs_positive and       # NEW: RS filter
-        strength_ok and       # NEW: ADX or EMA slope
-        nifty_allows
-    )
-
-    # ── ELITE TIER ────────────────────────────────────────────────
-    # Elite = tier1_prime AND score>=85 AND rs>=0.10 AND vol_ratio>=1.5
-    _vol_ratio_cur = (cur_v / cur_vavg) if cur_vavg > 0 else 0.0
-    is_elite = (
-        is_tier1_prime and
-        norm_score >= 85 and
-        rs >= 0.10 and
-        _vol_ratio_cur >= 1.5
-    )
-
     # ── TIER CLASSIFICATION ───────────────────────────────────────
-    # Fib-only entries (Fib, Fib+CCI) are demoted to Watch (not Tier 2)
-    is_fib_only = (is_fib_buy_base or is_fib_buy_cci) and not is_tier1_prime
-
     tier = (
-        "Elite"  if is_elite          else
         "Tier 1" if is_tier1_prime    else
-        "Tier 2" if is_tier2_momentum else
-        "Watch"  if is_fib_only       else
         "Tier 2" if any_buy           else
+        "Tier 3" if is_tier3_momentum else
+        "Tier 4" if is_tier4_recovery else
         "Other"
     )
 
@@ -803,41 +871,54 @@ def compute_bar(
         "Harm"    if is_harm_buy      else
         "ABCD"    if is_abcd_buy      else
         "CCI"     if is_cci_buy       else
-        "CmpBrk"  if is_tier2_momentum else
         "Norm"    if is_norm_buy       else "-"
     )
 
-    # ── EXECUTION TIER FLAG ───────────────────────────────────────
-    # Execution = score>=85 AND rs>=0.10 AND buy_type in [Norm, CmpBrk]
-    # buy_type is computed later so we derive it inline here
-    _exec_buy_type = (
-        "CmpBrk" if is_tier2_momentum else
-        "Norm"   if is_norm_buy       else None
+    # ── TIER 1 ENTRY QUALITY GATE ────────────────────────────────────────
+    # Applied after buy_type and trade levels are resolved:
+    #   • buy_type ≠ "-"   — a recognised buy signal must exist
+    #   • risk_pct ≥ 5%    — (entry − SL) / entry ≥ 0.05  (room to breathe)
+    #   • norm_score ≥ 75  — high-conviction bar; structural alignment alone
+    #                         is not enough
+    # Note: a risk_pct upper cap (≤ 8%) was trialled but removed — the backtest
+    # mean of 8.45% means capping at 8% eliminates the majority of valid entries.
+    # Position sizing (not gate rejection) is the right tool for wide-SL setups.
+    risk_pct = (en - sl) / en if en > 0 else 0.0
+    tier1_entry_quality = (
+        buy_type   != "-"  and
+        risk_pct   >= 0.05 and
+        norm_score >= 75
     )
-    is_execution = (
-        norm_score >= 85 and
-        rs >= 0.10 and
-        _exec_buy_type is not None
+    is_tier1_prime = is_tier1_prime and tier1_entry_quality
+
+    # ── HIGH-SCORE CCI GATE ───────────────────────────────────────
+    # Stocks that score ≥ high_score_cci_threshold but have CCI already
+    # recovering (above high_score_cci_max) are filtered out.  Backtest shows
+    # score 86-100 underperforms lower scores because these entries are late —
+    # structural alignment looks perfect but the CCI bounce is already priced in.
+    high_score_cci_ok = (
+        norm_score < params.high_score_cci_threshold or       # gate only applies to high scores
+        cur_cci    <= params.high_score_cci_max       or       # CCI still deep enough
+        params.high_score_cci_threshold > 100                  # effectively disabled
     )
+    is_tier1_prime = is_tier1_prime and high_score_cci_ok
 
     acc_tier = (
-        "Elite"     if is_elite                    else
-        "Execution" if is_execution                else
-        "T1★"       if is_tier1_prime              else
-        "A"         if (qualified and any_buy)     else
-        "B"         if any_buy                     else
-        "C"         if norm_score >= 50            else
+        "A"   if (qualified and any_buy)     else
+        "B"   if any_buy                     else
+        "C"   if norm_score >= 50            else
         "D"
     )
     acc_score = norm_score + (20 if is_tier1_prime else 0) + (10 if qualified else 0)
     hard_stop = trend_down and below_cloud and norm_score < 30
     pct_chg   = round((cur_c - prev_close) / prev_close * 100, 2) if prev_close else 0.0
 
+    # Hi Prob: in golden zone with a real buy signal — ensures count matches
+    # what appears in Tier 1/2 (not inflated by Tier 3 WATCH-level stocks).
     high_prob_buy = trend_up and in_golden and norm_score >= 55 and any_buy
 
     # ── TIER 2 SUB-CONDITIONS ─────────────────────────────────────
-    # Fib + CCI entries are now explicitly Tier-2 sub-conditions
-    t2_fib_qual   = is_fib_buy_base                 and not is_tier1_prime
+    t2_fib_qual   = is_fib_buy_base and qualified   and not is_tier1_prime
     t2_fib_cci    = is_fib_buy_cci                  and not is_tier1_prime
     t2_harmonic   = is_harm_buy
     t2_abcd       = is_abcd_buy
@@ -861,9 +942,7 @@ def compute_bar(
 
     # ── SETUP LABEL ───────────────────────────────────────────────
     if is_tier1_prime:
-        setup = "All 5 Pillars v3"
-    elif is_tier2_momentum:
-        setup = "Compression Brk"
+        setup = "All 5 Pillars"
     elif any_buy:
         setup = (
             "Fib+Qual"    if t2_fib_qual    else
@@ -875,6 +954,10 @@ def compute_bar(
             "Norm Buy"    if t2_norm        else
             "Buy"
         )
+    elif is_tier3_momentum:
+        setup = "Momo Expand" + (" +Sqz" if t3_squeeze_bonus_flag else "")
+    elif is_tier4_recovery:
+        setup = "Recovery"
     elif norm_score >= 50:
         setup = (
             "Near Golden"  if near_golden    else
@@ -899,8 +982,9 @@ def compute_bar(
     return BarResult(
         tier1_prime      = is_tier1_prime,
         tier2_momentum   = is_tier2_momentum,
-        elite_tier       = is_elite,
         any_buy          = any_buy,
+        tier3_momentum   = is_tier3_momentum,
+        tier4_recovery   = is_tier4_recovery,
         norm_score       = norm_score,
         score_threshold  = score_threshold,
         entry  = en,
@@ -927,13 +1011,6 @@ def compute_bar(
         nifty_regime_val = params.nifty_regime_val,
         fib500 = round(fib500) if not np.isnan(fib500) else 0,
         fib382 = round(fib382) if not np.isnan(fib382) else 0,
-        # NEW strength fields
-        rs_val       = round(rs, 4),
-        adx_val      = round(cur_adx, 1),
-        ema20_slope  = round(ema20_slope, 3),
-        rs_positive  = rs_positive,
-        strength_ok  = strength_ok,
-        # booleans
         qualified           = qualified,
         persistent_strength = persistent_strength,
         high_prob           = high_prob_buy,
@@ -955,7 +1032,7 @@ def compute_bar(
         hard_stop           = hard_stop,
         trend_up            = trend_up,
         trend_down          = trend_down,
-        t2_compression  = is_tier2_momentum,
+        t2_compression  = False,  # Track A (compression breakout) removed; Track B only
         t2_fib_qual     = t2_fib_qual,
         t2_fib_cci      = t2_fib_cci,
         t2_harmonic     = t2_harmonic,
@@ -963,12 +1040,20 @@ def compute_bar(
         t2_cci_break    = t2_cci_break,
         t2_norm_strong  = t2_norm_strong,
         t2_norm         = t2_norm,
-        t3_near_golden  = near_golden,
-        t3_cci_rec      = cci_recovering,
-        t3_cloud_test   = cloud_test,
-        t3_ema_conv     = ema_converging,
-        t4_hard_stop    = hard_stop,
-        t4_fib_resist   = (near_ext127 or near_ext161),
-        t4_downtrend    = (trend_down and below_cloud),
-        vol_ratio       = (cur_v / cur_vavg) if cur_vavg > 0 else 1.0,
+        t3_trend_ok         = t3_trend_ok_flag,
+        t3_rs20_strong      = t3_rs20_strong_flag,
+        t3_atr_contract     = t3_atr_contract_flag,
+        t3_breakout_trigger = t3_breakout_trigger_flag,
+        t3_momentum_expand  = t3_momentum_expand_flag,
+        t3_volume_expand    = t3_volume_expand_flag,
+        t3_squeeze_bonus    = t3_squeeze_bonus_flag,
+        t4_close_above_e20  = t4_close_above_e20_flag,
+        t4_e20_rising       = t4_e20_rising_flag,
+        t4_rs20_positive    = t4_rs20_positive_flag,
+        t4_rs20_improving   = t4_rs20_improving_flag,
+        t4_atr_contract     = t4_atr_contract_flag,
+        t4_tight_range      = t4_tight_range_flag,
+        t4_cci_positive     = t4_cci_positive_flag,
+        t4_cci_rising       = t4_cci_rising_flag,
+        t4_volume_expand    = t4_volume_expand_flag,
     )

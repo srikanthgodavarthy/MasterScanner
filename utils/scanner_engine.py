@@ -57,11 +57,17 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     return tr.ewm(com=period - 1, adjust=False).mean()
 
 def cci(close: pd.Series, period: int = 20) -> pd.Series:
-    """Vectorised CCI — significantly faster than the original Python loop."""
-    sma_s = close.rolling(period).mean()
-    # mean absolute deviation (vectorised rolling via apply on numpy)
-    mad_s = close.rolling(period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
-    mad_s = mad_s.replace(0, np.nan)
+    arr   = close.to_numpy(dtype=float)
+    n     = len(arr)
+    sma_v = np.full(n, np.nan)
+    mad_v = np.full(n, np.nan)
+    for i in range(period - 1, n):
+        window   = arr[i - period + 1: i + 1]
+        m        = window.mean()
+        sma_v[i] = m
+        mad_v[i] = np.mean(np.abs(window - m))
+    sma_s = pd.Series(sma_v, index=close.index)
+    mad_s = pd.Series(mad_v, index=close.index).replace(0, np.nan)
     return (close - sma_s) / (0.015 * mad_s)
 
 def highest(series: pd.Series, period: int) -> pd.Series:
@@ -161,67 +167,57 @@ def detect_abcd(pivots_price, pivots_is_high, close_val, open_val, prev_high):
 # ══════════════════════════════════════════════════════════════════
 
 NIFTY500_SYMBOLS = [
-    "360ONE","3MINDIA","ABB","ACC","AIAENG","APLAPOLLO","AUBANK","AARTIIND",
-    "AAVAS","ABBOTINDIA","ACE","ADANIENSOL","ADANIENT","ADANIGREEN","ADANIPORTS","ADANIPOWER",
-    "ATGL","AWL","ABCAPITAL","ABFRL","AEGISLOG","AETHER","AFFLE","AJANTPHARM",
-    "APLLTD","ALKEM","ALKYLAMINE","ALLCARGO","ALOKINDS","ARE&M","AMBER","AMBUJACEM",
-    "ANANDRATHI","ANGELONE","ANURAS","APARINDS","APOLLOHOSP","APOLLOTYRE","APTUS","ACI",
-    "ASAHIINDIA","ASHOKLEY","ASIANPAINT","ASTERDM","ASTRAZEN","ASTRAL","ATUL","AUROPHARMA",
-    "AVANTIFEED","DMART","AXISBANK","BEML","BLS","BSE","BAJAJ-AUTO","BAJFINANCE",
-    "BAJAJFINSV","BAJAJHLDNG","BALAMINES","BALKRISIND","BALRAMCHIN","BANDHANBNK","BANKBARODA","BANKINDIA",
-    "MAHABANK","BATAINDIA","BAYERCROP","BERGEPAINT","BDL","BEL","BHARATFORG","BHEL",
-    "BPCL","BHARTIARTL","BIKAJI","BIOCON","BIRLACORPN","BSOFT","BLUEDART","BLUESTARCO",
-    "BBTC","BORORENEW","BOSCHLTD","BRIGADE","BRITANNIA","MAPMYINDIA","CCL","CESC",
-    "CGPOWER","CIEINDIA","CRISIL","CSBBANK","CAMPUS","CANFINHOME","CANBK","CAPLIPOINT",
-    "CGCL","CARBORUNIV","CASTROLIND","CEATLTD","CELLO","CENTRALBK","CDSL","CENTURYPLY",
-    "ABREL","CERA","CHALET","CHAMBLFERT","CHEMPLASTS","CHENNPETRO","CHOLAHLDNG","CHOLAFIN",
-    "CIPLA","CUB","CLEAN","COALINDIA","COCHINSHIP","COFORGE","COLPAL","CAMS",
-    "CONCORDBIO","CONCOR","COROMANDEL","CRAFTSMAN","CREDITACC","CROMPTON","CUMMINSIND","CYIENT",
-    "DCMSHRIRAM","DLF","DOMS","DABUR","DALBHARAT","DATAPATTNS","DEEPAKFERT","DEEPAKNTR",
-    "DELHIVERY","DEVYANI","DIVISLAB","DIXON","LALPATHLAB","DRREDDY","EIDPARRY","EIHOTEL",
-    "EPL","EASEMYTRIP","EICHERMOT","ELECON","ELGIEQUIP","EMAMILTD","ENDURANCE","ENGINERSIN",
-    "EQUITASBNK","ERIS","ESCORTS","ETERNAL","EXIDEIND","FDC","NYKAA","FEDERALBNK","FACT",
-    "FINEORG","FINCABLES","FINPIPE","FSL","FIVESTAR","FORTIS","GAIL","GMMPFAUDLR",
-    "GMRAIRPORT","GRSE","GICRE","GILLETTE","GLAND","GLAXO","ALIVUS","GLENMARK",
-    "MEDANTA","GPIL","GODFRYPHLP","GODREJCP","GODREJIND","GODREJPROP","GRANULES","GRAPHITE",
-    "GRASIM","GESHIP","GRINDWELL","GAEL","FLUOROCHEM","GUJGASLTD","GMDCLTD","GNFC",
-    "GPPL","GSFC","GSPL","HEG","HBLENGINE","HCLTECH","HDFCAMC","HDFCBANK",
-    "HDFCLIFE","HFCL","HAPPSTMNDS","HAPPYFORGE","HAVELLS","HEROMOTOCO","HSCL","HINDALCO",
-    "HAL","HINDCOPPER","HINDPETRO","HINDUNILVR","HINDZINC","POWERINDIA","HOMEFIRST","HONASA",
-    "HONAUT","HUDCO","ICICIBANK","ICICIGI","ICICIPRULI","ISEC","IDBI","IDFCFIRSTB",
-    "IFCI","IIFL","IRB","IRCON","ITC","ITI","INDIACEM","INDIAMART",
-    "INDIANB","IEX","INDHOTEL","IOC","IOB","IRCTC","IRFC","INDIGOPNTS",
-    "IGL","INDUSTOWER","INDUSINDBK","NAUKRI","INFY","INOXWIND","INTELLECT","INDIGO",
-    "IPCALAB","JBCHEPHARM","JKCEMENT","JBMA","JKLAKSHMI","JKPAPER","JMFINANCIL","JSWENERGY",
-    "JSWINFRA","JSWSTEEL","JAIBALAJI","J&KBANK","JINDALSAW","JSL","JINDALSTEL","JIOFIN",
-    "JUBLFOOD","JUBLINGREA","JUBLPHARMA","JWL","JUSTDIAL","JYOTHYLAB","KPRMILL","KEI",
-    "KNRCON","KPITTECH","KRBL","KSB","KAJARIACER","KPIL","KALYANKJIL","KANSAINER",
-    "KARURVYSYA","KAYNES","KEC","KFINTECH","KOTAKBANK","KIMS","LTF","LTTS",
-    "LICHSGFIN","LTM","LT","LATENTVIEW","LAURUSLABS","LXCHEM","LEMONTREE","LICI",
-    "LINDEINDIA","LLOYDSME","LUPIN","MMTC","MRF","MTARTECH","LODHA","MGL",
-    "MAHSEAMLES","M&MFIN","M&M","MHRIL","MAHLIFE","MANAPPURAM","MRPL","MANKIND",
-    "MARICO","MARUTI","MASTEK","MFSL","MAXHEALTH","MAZDOCK","MEDPLUS","METROBRAND",
-    "METROPOLIS","MINDACORP","MSUMI","MOTILALOFS","MPHASIS","MCX","MUTHOOTFIN","NATCOPHARM",
-    "NBCC","NCC","NHPC","NLCINDIA","NMDC","NSLNISP","NTPC","NH",
-    "NATIONALUM","NAVINFLUOR","NESTLEIND","NETWORK18","NAM-INDIA","NUVAMA","NUVOCO","OBEROIRLTY",
-    "ONGC","OIL","OLECTRA","PAYTM","OFSS","POLICYBZR","PCBL","PIIND",
-    "PNBHOUSING","PNCINFRA","PVRINOX","PAGEIND","PATANJALI","PERSISTENT","PETRONET","PHOENIXLTD",
-    "PIDILITIND","PIRAMALFIN","PPLPHARMA","POLYMED","POLYCAB","POONAWALLA","PFC","POWERGRID",
-    "PRAJIND","PRESTIGE","PRINCEPIPE","PRSMJOHNSN","PGHH","PNB","QUESS","RRKABEL",
-    "RBLBANK","RECLTD","RHIM","RITES","RADICO","RVNL","RAILTEL","RAINBOW",
-    "RAJESHEXPO","RKFORGE","RCF","RATNAMANI","RTNINDIA","RAYMOND","REDINGTON","RELIANCE",
-    "RBA","ROUTE","SBFC","SBICARD","SBILIFE","SJVN","SKFINDIA","SRF",
-    "SAFARI","SAMMAANCAP","MOTHERSON","SANOFI","SAPPHIRE","SAREGAMA","SCHAEFFLER","SCHNEIDER",
-    "SHREECEM","RENUKA","SHRIRAMFIN","SHYAMMETL","SIEMENS","SIGNATURE","SOBHA","SOLARINDS",
-    "SONACOMS","SONATSOFTW","STARHEALTH","SBIN","SAIL","SWSOLAR","STLTECH","SUMICHEM",
-    "SPARC","SUNPHARMA","SUNTV","SUNDARMFIN","SUNDRMFAST","SUNTECK","SUPREMEIND","SUZLON",
-    "SYNGENE","TVSMOTOR","TATACAP","TATACHEM","TATACOMM","TCS","TATACONSUM","TATAELXSI",
-    "TATAPOWER","TATASTEEL","TATATECH","TECHM","TEJASNET","TITAN","TORNTPHARM","TORNTPOWER",
+    "RELIANCE","TCS","HDFCBANK","ICICIBANK","INFY","SBIN","HINDUNILVR","ITC",
+    "BAJFINANCE","KOTAKBANK","LT","AXISBANK","ASIANPAINT","MARUTI","WIPRO",
+    "ULTRACEMCO","TITAN","NESTLEIND","SUNPHARMA","POWERGRID","ONGC","NTPC",
+    "BAJAJFINSV","HCLTECH","M&M","TECHM","ADANIENT","ADANIPORTS","TATAMOTORS",
+    "TATASTEEL","JSWSTEEL","COALINDIA","BPCL","IOC","HEROMOTOCO","DIVISLAB",
+    "DRREDDY","CIPLA","EICHERMOT","GRASIM","SHREECEM","BRITANNIA","UPL",
+    "HINDALCO","INDUSINDBK","SBILIFE","HDFCLIFE","BAJAJ-AUTO","HAL","BEL",
+    "ABB","ACC","AIAENG","APLAPOLLO","AUBANK","AARTIIND","ABBOTINDIA",
+    "ADANIGREEN","ADANIPOWER","ATGL","ABCAPITAL","ABFRL","AFFLE","AJANTPHARM",
+    "AKZOINDIA","ALKEM","AMBER","AMBUJACEM","ANGELONE","APARINDS","APOLLOHOSP",
+    "APOLLOTYRE","APTUS","ASHOKLEY","ASTERDM","ASTRAL","ATUL","AUROPHARMA",
+    "DMART","BEML","BSE","BAJAJHLDNG","BALKRISIND","BALRAMCHIN","BANDHANBNK",
+    "BANKBARODA","BANKINDIA","MAHABANK","BATAINDIA","BAYERCROP","BERGEPAINT",
+    "BDL","BHARATFORG","BHEL","BHARTIARTL","BIKAJI","BIOCON","BSOFT","BLUEDART",
+    "BLUESTARCO","BOSCHLTD","BRIGADE","CESC","CGPOWER","CRISIL","CANFINHOME",
+    "CANBK","CAPLIPOINT","CARBORUNIV","CASTROLIND","CEATLTD","CENTRALBK","CDSL",
+    "CHAMBLFERT","CHOLAFIN","CUB","COALINDIA","COCHINSHIP","COFORGE","COLPAL",
+    "CAMS","CONCOR","COROMANDEL","CROMPTON","CUMMINSIND","CYIENT","DLF","DOMS",
+    "DABUR","DALBHARAT","DATAPATTNS","DEEPAKNTR","DELHIVERY","DEVYANI",
+    "DIXON","LALPATHLAB","EIDPARRY","EIHOTEL","ELECON","ELGIEQUIP","EMAMILTD",
+    "EMCURE","ENDURANCE","ENGINERSIN","ERIS","ESCORTS","EXIDEIND","NYKAA",
+    "FEDERALBNK","FINCABLES","FIVESTAR","FORCEMOT","FORTIS","GAIL","GMRAIRPORT",
+    "GRSE","GICRE","GILLETTE","GLAND","GLAXO","GLENMARK","GODIGIT","GPIL",
+    "GODFRYPHLP","GODREJCP","GODREJIND","GODREJPROP","GRANULES","GRAPHITE",
+    "GRAVITA","FLUOROCHEM","GMDCLTD","GSPL","HEG","HCLTECH","HDBFS","HDFCAMC",
+    "HDFCLIFE","HFCL","HAVELLS","HEROMOTOCO","HINDALCO","HINDCOPPER","HINDPETRO",
+    "HINDZINC","POWERINDIA","HOMEFIRST","HUDCO","ICICIBANK","ICICIGI","ICICIAMC",
+    "ICICIPRULI","IDFCFIRSTB","IIFL","IRB","IRCON","ITC","INDIAMART","INDIANB",
+    "IEX","INDHOTEL","IOC","IRCTC","IRFC","IREDA","IGL","INDUSTOWER","INDUSINDBK",
+    "NAUKRI","INFY","INOXWIND","INTELLECT","INDIGO","IPCALAB","JBCHEPHARM",
+    "JKCEMENT","JKTYRE","JMFINANCIL","JSWCEMENT","JSWENERGY","JSWINFRA","JSWSTEEL",
+    "JPPOWER","JINDALSTEL","JIOFIN","JUBLFOOD","JUBLINGREA","JUBLPHARMA","KEI",
+    "KPITTECH","KAJARIACER","KPIL","KALYANKJIL","KARURVYSYA","KAYNES","KEC",
+    "KFINTECH","KIRLOSENG","KOTAKBANK","KIMS","LTF","LTTS","LICHSGFIN","LTFOODS",
+    "LT","LATENTVIEW","LAURUSLABS","LICI","LINDEINDIA","LODHA","LUPIN","MRF",
+    "MGL","M&MFIN","M&M","MANAPPURAM","MRPL","MANKIND","MARICO","MFSL",
+    "MAXHEALTH","MAZDOCK","MINDACORP","MOTILALOFS","MPHASIS","MCX","MUTHOOTFIN",
+    "NATCOPHARM","NBCC","NCC","NHPC","NLCINDIA","NMDC","NTPCGREEN","NTPC","NH",
+    "NATIONALUM","NAVINFLUOR","NESTLEIND","NEULANDLAB","NEWGEN","OBEROIRLTY",
+    "ONGC","OIL","OLECTRA","OFSS","PCBL","PIIND","PNBHOUSING","PVRINOX",
+    "PAGEIND","PATANJALI","PERSISTENT","PETRONET","PFIZER","PHOENIXLTD","PWL",
+    "PIDILITIND","PIRAMALFIN","POLYMED","POLYCAB","POONAWALLA","PFC","POWERGRID",
+    "PRESTIGE","PNB","RRKABEL","RBLBANK","RECLTD","RHIM","RITES","RADICO","RVNL",
+    "RAILTEL","RAINBOW","REDINGTON","RELIANCE","SBFC","SBICARD","SBILIFE","SJVN",
+    "SRF","MOTHERSON","SCHAEFFLER","SCHNEIDER","SCI","SHREECEM","SHRIRAMFIN",
+    "SIEMENS","SOBHA","SOLARINDS","SONACOMS","SBIN","SAIL","SUMICHEM","SUNPHARMA",
+    "SUNTV","SUNDARMFIN","SUPREMEIND","SUZLON","SYNGENE","TVSMOTOR","TATACAP",
+    "TATACHEM","TATACOMM","TCS","TATACONSUM","TATAELXSI","TATAPOWER","TATASTEEL",
+    "TATATECH","TECHM","TEGA","TITAGARH","TITAN","TORNTPHARM","TORNTPOWER",
     "TRENT","TRIDENT","TIINDIA","UPL","UTIAMC","ULTRACEMCO","UNIONBANK","UBL",
     "VOLTAS","WELCORP","WELSPUNLIV","WIPRO","YESBANK","ZYDUSLIFE","ZYDUSWELL","ECLERX",
-    "TMCV","TMPV","EMCURE","GODIGIT","GRAVITA","IREDA","JKTYRE","JPPOWER","NTPCGREEN",
-    "JSWCEMENT","AKZOINDIA","KIRLOSENG","LTFOODS","NEULANDLAB","NEWGEN","PFIZER","SCI",
-    "FORCEMOT","TEGA","TITAGARH","HDBFS","ICICIAMC","PIRAMALFIN","PWL",
 ]
 
 
@@ -229,8 +225,8 @@ NIFTY500_SYMBOLS = [
 #  DATA FETCHING
 # ══════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d", _cache_key: int = 0) -> pd.DataFrame:
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
     try:
         df = yf.Ticker(f"{symbol}.NS").history(period=period, interval=interval, auto_adjust=True)
         if df.empty or len(df) < 60:
@@ -241,8 +237,8 @@ def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d", _cache_ke
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d", _cache_key: int = 0) -> dict:
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") -> dict:
     if not symbols:
         return {}
     tickers = [f"{s}.NS" for s in symbols]
@@ -266,8 +262,8 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d", 
             continue
     return result
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_nifty(period: str = "1y", _cache_key: int = 0) -> pd.Series:
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_nifty(period: str = "1y") -> pd.Series:
     try:
         df    = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
         nifty = df["Close"].rename("nifty")
@@ -350,7 +346,6 @@ def score_stock(
         "Tier":         r.tier,
         "AccTier":      r.acc_tier,
         "AccScore":     r.acc_score,
-        "_elite_tier":  r.elite_tier,
         "Score":        r.norm_score,
         "Action":       r.action,
         "Setup":        r.setup,
@@ -360,10 +355,10 @@ def score_stock(
         "CCI Sig":      r.cci_signal,
         "Qual":         r.qual_icon,
         "%Chg":         r.pct_chg,
-        "Entry":        int(round(r.entry)),
-        "SL":           int(round(r.sl)),
-        "T1":           int(round(r.t1)),
-        "T2":           int(round(r.t2)),
+        "Entry":        r.entry,
+        "SL":           r.sl,
+        "T1":           r.t1,
+        "T2":           r.t2,
         "T3":           r.t3,
         # ── internals ────────────────────────────────────────────
         "_qualified":           r.qualified,
@@ -386,6 +381,8 @@ def score_stock(
         "_any_buy":             r.any_buy,
         "_tier1_prime":         r.tier1_prime,
         "_tier2_momentum":      r.tier2_momentum,
+        "_tier3_momentum":      r.tier3_momentum,
+        "_tier4_recovery":      r.tier4_recovery,
         "_recent_cci_rec":      r.recent_cci_recovery,
         "_hard_stop":           r.hard_stop,
         "_t2_compression":      r.t2_compression,
@@ -394,13 +391,22 @@ def score_stock(
         "_t2_harmonic":         r.t2_harmonic,
         "_t2_abcd":             r.t2_abcd,
         "_t2_cci_break":        r.t2_cci_break,
-        "_t3_near_golden":      r.t3_near_golden,
-        "_t3_cci_rec":          r.t3_cci_rec,
-        "_t3_cloud_test":       r.t3_cloud_test,
-        "_t3_ema_conv":         r.t3_ema_conv,
-        "_t4_hard_stop":        r.t4_hard_stop,
-        "_t4_fib_resist":       r.t4_fib_resist,
-        "_t4_downtrend":        r.t4_downtrend,
+        "_t3_trend_ok":         r.t3_trend_ok,
+        "_t3_rs20_strong":      r.t3_rs20_strong,
+        "_t3_atr_contract":     r.t3_atr_contract,
+        "_t3_breakout_trigger": r.t3_breakout_trigger,
+        "_t3_momentum_expand":  r.t3_momentum_expand,
+        "_t3_volume_expand":    r.t3_volume_expand,
+        "_t3_squeeze_bonus":    r.t3_squeeze_bonus,
+        "_t4_close_above_e20":  r.t4_close_above_e20,
+        "_t4_e20_rising":       r.t4_e20_rising,
+        "_t4_rs20_positive":    r.t4_rs20_positive,
+        "_t4_rs20_improving":   r.t4_rs20_improving,
+        "_t4_atr_contract":     r.t4_atr_contract,
+        "_t4_tight_range":      r.t4_tight_range,
+        "_t4_cci_positive":     r.t4_cci_positive,
+        "_t4_cci_rising":       r.t4_cci_rising,
+        "_t4_volume_expand":    r.t4_volume_expand,
         "_rsi":                 r.cur_rsi,
         "_mom1":                r.mom1,
         "_mom3":                r.mom3,
@@ -410,13 +416,6 @@ def score_stock(
         "_fib500":              r.fib500,
         "_fib382":              r.fib382,
         "_nifty_regime":        r.nifty_regime_val,
-        "_vol_ratio":           round(r.vol_ratio, 3),
-        # ── NEW: Tier-1 strength fields ──────────────────────────
-        "RS":           round(r.rs_val * 100, 2),   # pct vs Nifty, 5-bar
-        "ADX":          round(r.adx_val, 1),
-        "EMA Slope":    round(r.ema20_slope, 2),
-        "_rs_positive": r.rs_positive,
-        "_strength_ok": r.strength_ok,
     }
 
 
@@ -424,7 +423,7 @@ def score_stock(
 #  BATCH SCANNER
 # ══════════════════════════════════════════════════════════════════
 
-_BATCH_SIZE = 150
+_BATCH_SIZE = 100
 
 def run_scanner(
     symbols:     list,
@@ -434,7 +433,6 @@ def run_scanner(
     cci_os:      int  = -100,
     max_workers: int  = 10,
     progress_cb       = None,
-    run_id:      int  = 0,   # increment on every button click to bust cache
 ) -> pd.DataFrame:
     """
     Two-phase scanner.
@@ -448,12 +446,12 @@ def run_scanner(
     all_data: dict = {}
     for batch_i, start in enumerate(range(0, total, _BATCH_SIZE)):
         chunk      = tuple(symbols[start: start + _BATCH_SIZE])
-        batch_data = fetch_batch_ohlcv(chunk, period="1y", interval="1d", _cache_key=run_id)
+        batch_data = fetch_batch_ohlcv(chunk, period="1y", interval="1d")
         all_data.update(batch_data)
         if progress_cb:
             progress_cb(0.5 * (batch_i + 1) / n_batches)
 
-    nifty_series = fetch_nifty("1y", _cache_key=run_id)
+    nifty_series = fetch_nifty("1y")
     regime_val   = nifty_regime(nifty_series)   # bull / bear / neutral — computed once
 
     # Inject regime into settings so ScoringParams picks it up
