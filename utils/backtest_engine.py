@@ -47,6 +47,19 @@ def fetch_full_history(symbol: str, years: int = 3) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_nifty_bt(years: int = 3) -> pd.Series:
+    """Cached 3-year Nifty series for backtest — avoids a live network hit on every re-run."""
+    try:
+        end   = datetime.now(timezone.utc) + timedelta(days=1)
+        start = end - timedelta(days=years * 365 + 5)
+        ndf   = yf.Ticker("^NSEI").history(start=start, end=end, auto_adjust=True)
+        return pd.Series(ndf["Close"].values,
+                         index=_strip_tz(pd.to_datetime(ndf.index)))
+    except Exception:
+        return pd.Series(dtype=float)
+
+
 # ══════════════════════════════════════════════════════════════════
 #  SIGNAL GENERATION — delegates 100% to scoring_core.compute_bar
 # ══════════════════════════════════════════════════════════════════
@@ -102,7 +115,11 @@ def generate_signals_historical(
         #   In ALL cases: if neither any_buy nor tier1_prime nor
         #                 tier2_momentum → skip (no free-floating score entries)
 
-        if tier_filter == "Tier 1":
+        if tier_filter == "Elite":
+            if not r.elite_tier:
+                continue
+
+        elif tier_filter == "Tier 1":
             if not r.tier1_prime:
                 continue
 
@@ -175,18 +192,28 @@ def simulate_trades(
     trades        = []
     blocked_until = pd.Timestamp.min
 
+    # Pre-extract numpy arrays for fast column access
+    df_index  = df_full.index
+    arr_open  = df_full["open"].to_numpy(dtype=float)
+    arr_high  = df_full["high"].to_numpy(dtype=float)
+    arr_low   = df_full["low"].to_numpy(dtype=float)
+    arr_close = df_full["close"].to_numpy(dtype=float)
+
     for _, sig in signals.iterrows():
         entry_signal_date = sig["date"]
 
         if entry_signal_date <= blocked_until:
             continue
 
-        future = df_full[df_full.index > entry_signal_date]
-        if len(future) < 2:
+        # Find entry bar index (first bar after signal date)
+        future_mask = df_index > entry_signal_date
+        future_idx  = np.where(future_mask)[0]
+        if len(future_idx) < 2:
             continue
 
-        entry_bar   = future.index[0]
-        entry_price = float(future["open"].iloc[0])
+        eb          = int(future_idx[0])           # entry bar absolute index
+        entry_bar   = df_index[eb]
+        entry_price = arr_open[eb]
         sl  = float(sig["sl"])
         t1  = float(sig["t1"])
         t2  = float(sig["t2"])
@@ -196,31 +223,46 @@ def simulate_trades(
             blocked_until = entry_bar
             continue
 
-        exit_price  = float(future["close"].iloc[min(hold_days, len(future) - 1)])
-        exit_date   = future.index[min(hold_days, len(future) - 1)]
+        # Slice the hold window as numpy arrays (no pandas overhead)
+        end_idx   = min(eb + hold_days + 1, len(df_index))
+        win_idx   = np.arange(eb, end_idx)
+        win_low   = arr_low  [win_idx]
+        win_high  = arr_high [win_idx]
+        win_open  = arr_open [win_idx]
+        win_close = arr_close[win_idx]
+        win_dates = df_index [win_idx]
+
+        sl_hits = win_low  <= sl
+        t1_hits = win_high >= t1
+        t2_hits = win_high >= t2
+        any_exit = sl_hits | t1_hits | t2_hits
+
+        # Default: timeout at last bar in window
+        last = len(win_idx) - 1
+        exit_price  = float(win_close[last])
+        exit_date   = win_dates[last]
         exit_reason = "TIMEOUT"
 
-        for dt, row in future.iloc[: hold_days + 1].iterrows():
-            bar_low  = float(row["low"])
-            bar_high = float(row["high"])
-            bar_open = float(row["open"])
+        # Find first bar with an exit trigger
+        hit_positions = np.where(any_exit)[0]
+        if len(hit_positions):
+            j = int(hit_positions[0])
+            sl_h = bool(sl_hits[j])
+            t1_h = bool(t1_hits[j])
+            t2_h = bool(t2_hits[j])
+            bo   = float(win_open[j])
+            exit_date = win_dates[j]
 
-            sl_hit = bar_low  <= sl
-            t2_hit = bar_high >= t2
-            t1_hit = bar_high >= t1
-
-            if sl_hit and (t2_hit or t1_hit):
-                target      = t2 if t2_hit else t1
-                exit_price  = target if abs(bar_open - target) < abs(bar_open - sl) else sl
-                exit_reason = ("T2 HIT" if t2_hit else "T1 HIT") if exit_price == target else "SL HIT"
-                exit_date   = dt
-                break
-            elif sl_hit:
-                exit_price, exit_date, exit_reason = sl, dt, "SL HIT";  break
-            elif t2_hit:
-                exit_price, exit_date, exit_reason = t2, dt, "T2 HIT";  break
-            elif t1_hit:
-                exit_price, exit_date, exit_reason = t1, dt, "T1 HIT";  break
+            if sl_h and (t2_h or t1_h):
+                target      = t2 if t2_h else t1
+                exit_price  = target if abs(bo - target) < abs(bo - sl) else sl
+                exit_reason = ("T2 HIT" if t2_h else "T1 HIT") if exit_price == target else "SL HIT"
+            elif sl_h:
+                exit_price, exit_reason = sl, "SL HIT"
+            elif t2_h:
+                exit_price, exit_reason = t2, "T2 HIT"
+            else:
+                exit_price, exit_reason = t1, "T1 HIT"
 
         pnl_pct = round((exit_price - entry_price) / entry_price * 100, 2)
 
@@ -284,14 +326,9 @@ def run_backtest(
     # Speed: clamp workers to a sensible range
     workers = max(4, min(workers, 20))
 
-    # Fetch Nifty once for the full 3-year window
-    try:
-        end   = datetime.now(timezone.utc) + timedelta(days=1)
-        start = end - timedelta(days=3 * 365 + 5)
-        ndf   = yf.Ticker("^NSEI").history(start=start, end=end, auto_adjust=True)
-        nifty = pd.Series(ndf["Close"].values,
-                          index=_strip_tz(pd.to_datetime(ndf.index)))
-    except Exception:
+    # Fetch Nifty once for the full 3-year window (cached — safe to call on every re-run)
+    nifty = _fetch_nifty_bt(years=3)
+    if nifty.empty:
         nifty = pd.Series(dtype=float)
 
     regime_val      = nifty_regime(nifty)

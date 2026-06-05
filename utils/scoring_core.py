@@ -29,6 +29,13 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+# Imported at module level to avoid repeated per-call import overhead.
+# (circular-import-safe: scanner_engine does not import scoring_core at module level)
+from utils.scanner_engine import (
+    ema, sma, rsi, atr, cci, ichimoku, _strip_tz,
+    pivot_high, pivot_low, detect_harmonic, detect_abcd,
+)
+
 
 # ══════════════════════════════════════════════════════════════════
 #  PARAMETER BUNDLE
@@ -265,62 +272,62 @@ class IndicatorArrays:
 
     nifty_aligned: pd.Series   # Nifty close reindexed to symbol's trading days
 
+    # Pre-computed full-history pivot arrays (backtest speed: avoids O(N²) re-rolling)
+    ph_full:  pd.Series   # pivot highs over full history
+    pl_full:  pd.Series   # pivot lows  over full history
+
 
 # ══════════════════════════════════════════════════════════════════
 #  ADX HELPER  (vectorised — computed once per symbol)
 # ══════════════════════════════════════════════════════════════════
 
 def _adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    """Vectorised Wilder-smoothed ADX."""
+    """Vectorised Wilder-smoothed ADX — TR/DM computed with numpy, no Python loops."""
     h = high.to_numpy(dtype=float)
     l = low.to_numpy(dtype=float)
     c = close.to_numpy(dtype=float)
     n = len(c)
 
-    tr  = np.zeros(n)
-    pdm = np.zeros(n)   # +DM
-    mdm = np.zeros(n)   # -DM
+    # True Range — fully vectorised
+    prev_c = np.empty(n); prev_c[0] = c[0]; prev_c[1:] = c[:-1]
+    tr = np.maximum.reduce([h - l, np.abs(h - prev_c), np.abs(l - prev_c)])
+    tr[0] = 0.0
 
-    for i in range(1, n):
-        hl  = h[i] - l[i]
-        hpc = abs(h[i] - c[i - 1])
-        lpc = abs(l[i] - c[i - 1])
-        tr[i] = max(hl, hpc, lpc)
+    # Directional Movement — fully vectorised
+    prev_h = np.empty(n); prev_h[0] = h[0]; prev_h[1:] = h[:-1]
+    prev_l = np.empty(n); prev_l[0] = l[0]; prev_l[1:] = l[:-1]
+    up   = h - prev_h
+    down = prev_l - l
+    pdm = np.where((up > down) & (up > 0),   up,   0.0); pdm[0] = 0.0
+    mdm = np.where((down > up) & (down > 0), down, 0.0); mdm[0] = 0.0
 
-        up   = h[i] - h[i - 1]
-        down = l[i - 1] - l[i]
-        pdm[i] = up   if up > down and up > 0   else 0.0
-        mdm[i] = down if down > up and down > 0 else 0.0
+    # Wilder smoothing: seed at bar `period`, then recurrence
+    def _wilder_smooth(arr: np.ndarray) -> np.ndarray:
+        out = np.full(n, np.nan)
+        if n <= period:
+            return out
+        out[period] = arr[1:period + 1].sum()
+        for idx in range(period + 1, n):
+            out[idx] = out[idx - 1] - out[idx - 1] / period + arr[idx]
+        return out
 
-    # Wilder smoothing (EMA with alpha = 1/period)
-    alpha = 1.0 / period
-    atr_w  = np.zeros(n)
-    pdm_w  = np.zeros(n)
-    mdm_w  = np.zeros(n)
+    atr_w = _wilder_smooth(tr)
+    pdm_w = _wilder_smooth(pdm)
+    mdm_w = _wilder_smooth(mdm)
 
-    # Seed
-    if n > period:
-        atr_w[period]  = tr[1:period + 1].sum()
-        pdm_w[period]  = pdm[1:period + 1].sum()
-        mdm_w[period]  = mdm[1:period + 1].sum()
-        for i in range(period + 1, n):
-            atr_w[i]  = atr_w[i - 1]  - atr_w[i - 1]  / period + tr[i]
-            pdm_w[i]  = pdm_w[i - 1]  - pdm_w[i - 1]  / period + pdm[i]
-            mdm_w[i]  = mdm_w[i - 1]  - mdm_w[i - 1]  / period + mdm[i]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pdi = np.where(atr_w > 0, 100.0 * pdm_w / atr_w, 0.0)
+        mdi = np.where(atr_w > 0, 100.0 * mdm_w / atr_w, 0.0)
+        dx  = np.where((pdi + mdi) > 0, 100.0 * np.abs(pdi - mdi) / (pdi + mdi), 0.0)
 
-    pdi = np.where(atr_w > 0, 100 * pdm_w / atr_w, 0.0)
-    mdi = np.where(atr_w > 0, 100 * mdm_w / atr_w, 0.0)
-    dx  = np.where((pdi + mdi) > 0, 100 * np.abs(pdi - mdi) / (pdi + mdi), 0.0)
-
-    # Smooth DX to get ADX
-    adx_arr = np.zeros(n)
+    # Second Wilder pass: DX → ADX
+    adx_arr = np.full(n, np.nan)
     first = 2 * period
     if n > first:
-        adx_arr[first] = dx[period + 1: first + 1].mean()
-        for i in range(first + 1, n):
-            adx_arr[i] = (adx_arr[i - 1] * (period - 1) + dx[i]) / period
+        adx_arr[first] = np.nanmean(dx[period + 1: first + 1])
+        for idx in range(first + 1, n):
+            adx_arr[idx] = (adx_arr[idx - 1] * (period - 1) + dx[idx]) / period
 
-    adx_arr[:first] = np.nan
     return pd.Series(adx_arr, index=close.index)
 
 
@@ -338,10 +345,6 @@ def build_indicators(
     Imported helpers come from scanner_engine to avoid circular deps.
     Speed: CCI is vectorised; ADX computed once here.
     """
-    from utils.scanner_engine import (
-        ema, sma, rsi, atr, cci, ichimoku, _strip_tz,
-    )
-
     c = df["close"]
     h = df["high"]
     l = df["low"]
@@ -383,6 +386,14 @@ def build_indicators(
     _nifty.index = _strip_tz(_nifty.index)
     nifty_aligned = _nifty.reindex(_c_idx, method="ffill")
 
+    # Pre-compute pivot arrays over the full history once.
+    # _get_pivots reads backwards from bar i — no re-rolling per bar.
+    # Note: pivot_high/low use center=True rolling so bar j is only confirmed
+    # as a pivot once bars j+pvt_lb exist. _get_pivots enforces this by
+    # skipping pivots at j > i - pvt_lb (look-forward still in future).
+    ph_full = pivot_high(h, params.pvt_lb)
+    pl_full = pivot_low (l, params.pvt_lb)
+
     return IndicatorArrays(
         c=c, h=h, l=l, o=o, v=v,
         e20=e20, e50=e50, e200=e200,
@@ -393,6 +404,8 @@ def build_indicators(
         squeeze_series=squeeze_series,
         cloud_top=cloud_top, cloud_bottom=cloud_bottom,
         nifty_aligned=nifty_aligned,
+        ph_full=ph_full,
+        pl_full=pl_full,
     )
 
 
@@ -401,22 +414,31 @@ def build_indicators(
 # ══════════════════════════════════════════════════════════════════
 
 def _get_pivots(ia: IndicatorArrays, i: int, pvt_lb: int):
-    """Return (pv_prices, pv_is_high) for up to 8 recent pivots ending at bar i."""
-    from utils.scanner_engine import pivot_high, pivot_low, detect_harmonic, detect_abcd
+    """Return pivot data for up to 8 confirmed pivots ending at bar i.
 
+    Uses pre-computed ph_full / pl_full from IndicatorArrays — no re-rolling.
+    Enforces no-lookahead by skipping pivots at j > i - pvt_lb (the center=True
+    rolling window requires pvt_lb bars ahead to confirm a pivot; those bars are
+    in the future relative to bar i during the backtest walk-forward).
+    """
     pvt_lb_use = min(pvt_lb, i // 4)
     if pvt_lb_use < 2:
         return [], [], False, False, False, False
 
-    ph_s = pivot_high(ia.h.iloc[:i + 1], pvt_lb_use)
-    pl_s = pivot_low(ia.l.iloc[:i + 1],  pvt_lb_use)
+    # Confirmed pivot boundary: bar j is confirmed only once bar j+pvt_lb exists
+    confirmed_up_to = i - pvt_lb_use   # bars > this index have unconfirmed pivots
+
+    ph_s = ia.ph_full
+    pl_s = ia.pl_full
 
     pivots = []
-    for j in range(i, max(-1, i - 60), -1):
-        if not np.isnan(float(ph_s.iloc[j])):
-            pivots.append((float(ph_s.iloc[j]), True))
-        elif not np.isnan(float(pl_s.iloc[j])):
-            pivots.append((float(pl_s.iloc[j]), False))
+    for j in range(confirmed_up_to, max(-1, i - 60), -1):
+        ph_val = float(ph_s.iloc[j])
+        pl_val = float(pl_s.iloc[j])
+        if not np.isnan(ph_val):
+            pivots.append((ph_val, True))
+        elif not np.isnan(pl_val):
+            pivots.append((pl_val, False))
         if len(pivots) >= 8:
             break
 

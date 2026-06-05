@@ -230,7 +230,7 @@ NIFTY500_SYMBOLS = [
 # ══════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
+def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d", _cache_key: int = 0) -> pd.DataFrame:
     try:
         df = yf.Ticker(f"{symbol}.NS").history(period=period, interval=interval, auto_adjust=True)
         if df.empty or len(df) < 60:
@@ -242,7 +242,7 @@ def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.Dat
         return pd.DataFrame()
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") -> dict:
+def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d", _cache_key: int = 0) -> dict:
     if not symbols:
         return {}
     tickers = [f"{s}.NS" for s in symbols]
@@ -267,7 +267,7 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") 
     return result
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_nifty(period: str = "1y") -> pd.Series:
+def fetch_nifty(period: str = "1y", _cache_key: int = 0) -> pd.Series:
     try:
         df    = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
         nifty = df["Close"].rename("nifty")
@@ -360,10 +360,10 @@ def score_stock(
         "CCI Sig":      r.cci_signal,
         "Qual":         r.qual_icon,
         "%Chg":         r.pct_chg,
-        "Entry":        r.entry,
-        "SL":           r.sl,
-        "T1":           r.t1,
-        "T2":           r.t2,
+        "Entry":        int(round(r.entry)),
+        "SL":           int(round(r.sl)),
+        "T1":           int(round(r.t1)),
+        "T2":           int(round(r.t2)),
         "T3":           r.t3,
         # ── internals ────────────────────────────────────────────
         "_qualified":           r.qualified,
@@ -434,6 +434,7 @@ def run_scanner(
     cci_os:      int  = -100,
     max_workers: int  = 10,
     progress_cb       = None,
+    run_id:      int  = 0,   # increment on every button click to bust cache
 ) -> pd.DataFrame:
     """
     Two-phase scanner.
@@ -447,12 +448,12 @@ def run_scanner(
     all_data: dict = {}
     for batch_i, start in enumerate(range(0, total, _BATCH_SIZE)):
         chunk      = tuple(symbols[start: start + _BATCH_SIZE])
-        batch_data = fetch_batch_ohlcv(chunk, period="1y", interval="1d")
+        batch_data = fetch_batch_ohlcv(chunk, period="1y", interval="1d", _cache_key=run_id)
         all_data.update(batch_data)
         if progress_cb:
             progress_cb(0.5 * (batch_i + 1) / n_batches)
 
-    nifty_series = fetch_nifty("1y")
+    nifty_series = fetch_nifty("1y", _cache_key=run_id)
     regime_val   = nifty_regime(nifty_series)   # bull / bear / neutral — computed once
 
     # Inject regime into settings so ScoringParams picks it up
