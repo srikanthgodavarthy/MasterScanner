@@ -10,7 +10,7 @@ st.set_page_config(
     page_title="NSE Master Scanner Pro",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",   # sidebar visible by default
 )
 
 # ── Shared CSS ────────────────────────────────────────────────────
@@ -23,8 +23,6 @@ html, body, [data-testid="stAppViewContainer"] {
     font-family: 'JetBrains Mono', monospace;
     color: #e2e8f0;
 }
-[data-testid="collapsedControl"] { display: none !important; }
-[data-testid="stSidebar"]        { display: none !important; }
 h1,h2,h3 { font-family: 'Syne', sans-serif !important; }
 .stButton > button {
     background: linear-gradient(135deg, #3b82f6, #1d4ed8) !important;
@@ -117,6 +115,10 @@ settings = {
     "nifty_regime_filter":  ss.get("nifty_regime_filter",  False),
     # Regime engine threshold
     "execute_threshold":    ss.get("execute_threshold",    70),
+    # Tier 1 strength gate
+    "t1_rs_min":            ss.get("t1_rs_min",            0.0),
+    "t1_adx_min":           ss.get("t1_adx_min",           20),
+    "t1_use_adx":           ss.get("t1_use_adx",           True),
 }
 
 tab1, tab2, tab3 = st.tabs(["📡 Live Scanner", "📈 Backtest Engine", "⚙️ Settings"])
