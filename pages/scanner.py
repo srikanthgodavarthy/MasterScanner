@@ -90,53 +90,49 @@ def _regime_panel(summary: dict) -> str:
     weights = summary["weights"]
 
     wt_pills = "".join(
-        f'<span class="wt-pill" style="background:{color}18;border:1px solid {color}44;color:{color}">'
-        f'{k} {int(v*100)}%</span>'
+        '<span class="wt-pill" style="background:' + color + '18;border:1px solid ' + color + '44;color:' + color + '">'
+        + k + " " + str(int(v * 100)) + "%</span>"
         for k, v in weights.items()
     )
 
     gate_color = "#22c55e" if r == "TREND" else "#f59e0b"
     gate_label = "EXECUTE eligible" if r == "TREND" else "WATCH only"
 
-    return f"""
-<div class="regime-panel" style="background:{bg};border:1px solid {border}44;">
-  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
-    <span class="regime-badge" style="background:{color}22;border:1px solid {color};color:{color}">{r}</span>
-    <span style="color:#94a3b8;font-size:12px;">
-      VIX <b style="color:#e2e8f0">{summary['vix']:.1f}</b>
-      &nbsp;·&nbsp; ADX <b style="color:#e2e8f0">{summary['adx']:.0f}</b>
-      &nbsp;·&nbsp; Nifty {'<b style="color:#22c55e">▲ EMA50</b>' if summary['nifty_ema50'] else '<b style="color:#ef4444">▼ EMA50</b>'}
-      {'&nbsp;·&nbsp; <b style="color:#22c55e">▲ EMA200</b>' if summary['nifty_ema200'] else ''}
-    </span>
-    <span style="margin-left:auto;font-size:11px;padding:2px 10px;border-radius:4px;
-          background:{gate_color}18;border:1px solid {gate_color}44;color:{gate_color};font-weight:700;">
-      {gate_label}
-    </span>
-  </div>
-  <div class="regime-weights">{wt_pills}</div>
-  <div style="display:flex;gap:24px;margin-top:12px;">
-    <div style="text-align:center">
-      <div style="font-size:24px;font-weight:800;color:#22c55e">{summary['n_execute']}</div>
-      <div style="font-size:10px;color:#64748b;letter-spacing:1px">EXECUTE</div>
-    </div>
-    <div style="text-align:center">
-      <div style="font-size:24px;font-weight:800;color:#f59e0b">{summary['n_watch']}</div>
-      <div style="font-size:10px;color:#64748b;letter-spacing:1px">WATCH</div>
-    </div>
-    <div style="text-align:center">
-      <div style="font-size:24px;font-weight:800;color:#94a3b8">{summary['n_skip']}</div>
-      <div style="font-size:10px;color:#64748b;letter-spacing:1px">SKIP</div>
-    </div>
-    <div style="text-align:center">
-      <div style="font-size:24px;font-weight:800;color:#818cf8">{summary['avg_composite']}</div>
-      <div style="font-size:10px;color:#64748b;letter-spacing:1px">AVG SCORE</div>
-    </div>
-    <div style="text-align:center">
-      <div style="font-size:24px;font-weight:800;color:#a78bfa">{summary['avg_rs']}</div>
-      <div style="font-size:10px;color:#64748b;letter-spacing:1px">AVG RS</div>
-    </div>
-  </div>
-</div>"""
+    ema50_html  = '<b style="color:#22c55e">▲ EMA50</b>' if summary["nifty_ema50"]  else '<b style="color:#ef4444">▼ EMA50</b>'
+    ema200_html = '&nbsp;·&nbsp; <b style="color:#22c55e">▲ EMA200</b>' if summary["nifty_ema200"] else ""
+
+    vix_val  = "{:.1f}".format(summary["vix"])
+    adx_val  = "{:.0f}".format(summary["adx"])
+    n_ex     = str(summary["n_execute"])
+    n_wa     = str(summary["n_watch"])
+    n_sk     = str(summary["n_skip"])
+    avg_comp = str(summary["avg_composite"])
+    avg_rs   = str(summary["avg_rs"])
+
+    return (
+        '<div class="regime-panel" style="background:' + bg + ';border:1px solid ' + border + '44;">'
+        + '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">'
+        + '<span class="regime-badge" style="background:' + color + '22;border:1px solid ' + color + ';color:' + color + '">' + r + '</span>'
+        + '<span style="color:#94a3b8;font-size:12px;">'
+        + 'VIX <b style="color:#e2e8f0">' + vix_val + '</b>'
+        + '&nbsp;·&nbsp; ADX <b style="color:#e2e8f0">' + adx_val + '</b>'
+        + '&nbsp;·&nbsp; Nifty ' + ema50_html
+        + ema200_html
+        + '</span>'
+        + '<span style="margin-left:auto;font-size:11px;padding:2px 10px;border-radius:4px;'
+        + 'background:' + gate_color + '18;border:1px solid ' + gate_color + '44;'
+        + 'color:' + gate_color + ';font-weight:700;">' + gate_label + '</span>'
+        + '</div>'
+        + '<div class="regime-weights">' + wt_pills + '</div>'
+        + '<div style="display:flex;gap:24px;margin-top:12px;">'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#22c55e">' + n_ex + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">EXECUTE</div></div>'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#f59e0b">' + n_wa + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">WATCH</div></div>'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#94a3b8">' + n_sk + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">SKIP</div></div>'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#818cf8">' + avg_comp + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">AVG SCORE</div></div>'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#a78bfa">' + avg_rs + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">AVG RS</div></div>'
+        + '</div>'
+        + '</div>'
+    )
 
 
 def _build_display_df(df: pd.DataFrame) -> pd.DataFrame:
