@@ -199,6 +199,9 @@ class BarResult:
     t4_fib_resist:   bool = False
     t4_downtrend:    bool = False
 
+    # ── Volume ───────────────────────────────────────────────────
+    vol_ratio:       float = 1.0   # cur_v / cur_vavg  (raw, not normalised)
+
 
 # ══════════════════════════════════════════════════════════════════
 #  PRE-COMPUTED SERIES BUNDLE  (passed into the bar loop once)
@@ -774,4 +777,5 @@ def compute_bar(
         t4_hard_stop    = hard_stop,
         t4_fib_resist   = (near_ext127 or near_ext161),
         t4_downtrend    = (trend_down and below_cloud),
+        vol_ratio       = (cur_v / cur_vavg) if cur_vavg > 0 else 1.0,
     )

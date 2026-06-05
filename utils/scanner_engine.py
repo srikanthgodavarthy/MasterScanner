@@ -415,6 +415,7 @@ def score_stock(
         "_fib500":              r.fib500,
         "_fib382":              r.fib382,
         "_nifty_regime":        r.nifty_regime_val,
+        "_vol_ratio":           round(r.vol_ratio, 3),
     }
 
 
