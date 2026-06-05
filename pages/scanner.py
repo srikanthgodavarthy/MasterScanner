@@ -17,6 +17,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo
+    _IST = ZoneInfo("Asia/Kolkata")
+    def _now_ist(): return datetime.now(_IST)
+except ImportError:
+    import pytz
+    _IST = pytz.timezone("Asia/Kolkata")
+    def _now_ist(): return datetime.now(_IST)
 
 from utils.scanner_engine  import run_scanner, fetch_nifty, NIFTY500_SYMBOLS
 from utils.scoring_core    import ScoringParams
@@ -69,6 +77,7 @@ def _cat_bar(value: float, color: str = "#22c55e") -> str:
 
 def _tier_badge(tier: str) -> str:
     cfg = {
+        "Elite":   ("#ffd700", "#1a1100", "#92400e", "🌟 ELITE"),
         "Tier-1":  ("#22c55e", "#052e16", "#166534", "⚡ EXECUTE T1"),
         "Tier-2":  ("#4ade80", "#052e16", "#166534", "⚡ EXECUTE T2"),
         "Watch":   ("#94a3b8", "#1e293b", "#334155", "👁 WATCH"),
@@ -103,6 +112,7 @@ def _regime_panel(summary: dict) -> str:
 
     vix_val  = "{:.1f}".format(summary["vix"])
     adx_val  = "{:.0f}".format(summary["adx"])
+    n_elite  = str(summary.get("n_elite", 0))
     n_ex     = str(summary["n_execute"])
     n_wa     = str(summary["n_watch"])
     n_sk     = str(summary["n_skip"])
@@ -125,6 +135,7 @@ def _regime_panel(summary: dict) -> str:
         + '</div>'
         + '<div class="regime-weights">' + wt_pills + '</div>'
         + '<div style="display:flex;gap:24px;margin-top:12px;">'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#ffd700">' + n_elite + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">ELITE</div></div>'
         + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#22c55e">' + n_ex + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">EXECUTE</div></div>'
         + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#f59e0b">' + n_wa + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">WATCH</div></div>'
         + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#94a3b8">' + n_sk + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">SKIP</div></div>'
@@ -136,24 +147,26 @@ def _regime_panel(summary: dict) -> str:
 
 
 def _build_display_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Build a clean display DataFrame from the augmented scanner output."""
+    """Build a clean display DataFrame matching the required column ribbon order."""
+    # Ribbon order: Stock, Score, Action, %Chg, Entry, SL, T1, T2,
+    #               Buy Type, Setup, Top Cat, Composite, RS, Size%,
+    #               Trend, Momentum, Structure, Volume, Quality, Tier, CCI
     cols_wanted = [
-        "Stock", "regime_tier", "composite_score", "rs_score",
-        "pos_size_pct", "top_category",
+        "Stock", "Score", "Action", "%Chg", "Entry", "SL", "T1", "T2",
+        "Buy Type", "Setup", "top_category", "composite_score", "rs_score",
+        "pos_size_pct",
         "cat_trend", "cat_momentum", "cat_structure", "cat_volume", "cat_quality",
-        # Original useful columns
-        "Tier", "Score", "CCI", "Action", "Setup", "Buy Type",
-        "%Chg", "Entry", "SL", "T1", "T2",
+        "Tier", "CCI",
+        # keep regime_tier for tab filtering (hidden from display if not in above)
+        "regime_tier",
     ]
     present = [c for c in cols_wanted if c in df.columns]
     out = df[present].copy()
-    # Rename for display
     out = out.rename(columns={
-        "regime_tier":     "R.Tier",
+        "top_category":    "Top Cat",
         "composite_score": "Composite",
         "rs_score":        "RS",
         "pos_size_pct":    "Size%",
-        "top_category":    "Top Cat",
         "cat_trend":       "Trend",
         "cat_momentum":    "Momentum",
         "cat_structure":   "Structure",
@@ -171,25 +184,71 @@ def render(settings: dict | None = None):
 
     supabase_ok = _is_available()
 
+    # ── Sidebar ──────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("### 🎯 Scanner Controls")
+        st.divider()
+
+        # Tier filter
+        tier_filter = st.multiselect(
+            "Show Tiers",
+            options=["Elite", "Tier 1", "Tier 2", "Watch", "Skip"],
+            default=["Elite", "Tier 1", "Tier 2"],
+            key="sidebar_tier_filter",
+        )
+
+        st.divider()
+        st.markdown("**Quick Settings**")
+        workers = st.slider("Workers", 5, 30, settings.get("workers", 10), step=5, key="sb_workers")
+        st.session_state["workers"] = workers
+
+        execute_thr = st.slider("Execute Threshold", 50, 90,
+            settings.get("execute_threshold", 70), step=5, key="sb_exec_thr")
+        st.session_state["execute_threshold"] = execute_thr
+
+        st.divider()
+        st.markdown("**Tier 1 Gates**")
+        t1_rs = st.number_input("RS Min", -0.05, 0.20,
+            float(settings.get("t1_rs_min", 0.0)), step=0.01, format="%.2f", key="sb_t1_rs")
+        st.session_state["t1_rs_min"] = t1_rs
+
+        t1_adx = st.number_input("ADX Min", 10, 40,
+            int(settings.get("t1_adx_min", 20)), step=1, key="sb_t1_adx")
+        st.session_state["t1_adx_min"] = t1_adx
+
+        st.divider()
+        show_skip = st.checkbox("Show Skip tab", value=False, key="sb_show_skip")
+
+        st.divider()
+        if st.button("🗑️ Clear Cache", key="sb_clear_cache"):
+            st.cache_data.clear()
+            st.session_state.pop("scan_df", None)
+            st.success("Cache cleared.")
+
     # ── Controls row ─────────────────────────────────────────────
-    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.2, 1, 1, 3])
+    ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1, 4])
     with ctrl1:
         run_btn = st.button("▶ Run Scan", use_container_width=True, key="btn_run_scan")
     with ctrl2:
         save_db = st.checkbox("💾 Save to DB", value=True, key="chk_save_db")
     with ctrl3:
-        show_skip = st.checkbox("Show Skip", value=False, key="chk_show_skip")
-    with ctrl4:
         st.markdown(
             f"<div style='padding:0.55rem 0;color:#64748b;font-size:0.78rem;'>"
             f"Universe: <b>{len(settings.get('symbols', NIFTY500_SYMBOLS))}</b> symbols"
-            f" &nbsp;·&nbsp; Execute threshold: <b>{settings.get('execute_threshold', 70)}</b>"
-            f" &nbsp;·&nbsp; Workers: <b>{settings.get('workers', 10)}</b></div>",
+            f" &nbsp;·&nbsp; Execute threshold: <b>{st.session_state.get('execute_threshold', settings.get('execute_threshold', 70))}</b>"
+            f" &nbsp;·&nbsp; Workers: <b>{st.session_state.get('workers', settings.get('workers', 10))}</b></div>",
             unsafe_allow_html=True)
 
     # ── Run scan ─────────────────────────────────────────────────
     if run_btn:
-        symbols = settings.get("symbols", NIFTY500_SYMBOLS)
+        # Merge sidebar overrides
+        effective = dict(settings)
+        effective["workers"]           = st.session_state.get("workers",           settings.get("workers", 10))
+        effective["execute_threshold"] = st.session_state.get("execute_threshold", settings.get("execute_threshold", 70))
+        effective["t1_rs_min"]         = st.session_state.get("t1_rs_min",         settings.get("t1_rs_min", 0.0))
+        effective["t1_adx_min"]        = st.session_state.get("t1_adx_min",        settings.get("t1_adx_min", 20))
+
+        symbols = effective.get("symbols", NIFTY500_SYMBOLS)
         prog    = st.progress(0, text="Fetching data…")
 
         def _cb(pct):
@@ -198,11 +257,11 @@ def render(settings: dict | None = None):
         with st.spinner("Running scanner…"):
             df_raw = run_scanner(
                 symbols,
-                settings         = settings,
-                cci_len          = settings.get("cci_len",  20),
-                cci_ob           = settings.get("cci_ob",  100),
-                cci_os           = settings.get("cci_os", -100),
-                max_workers      = settings.get("workers",  10),
+                settings         = effective,
+                cci_len          = effective.get("cci_len",  20),
+                cci_ob           = effective.get("cci_ob",  100),
+                cci_os           = effective.get("cci_os", -100),
+                max_workers      = effective.get("workers",  10),
                 progress_cb      = _cb,
             )
 
@@ -217,7 +276,7 @@ def render(settings: dict | None = None):
             nifty_series = fetch_nifty("1y")
             regime_ctx   = build_regime_context(
                 nifty             = nifty_series,
-                execute_threshold = settings.get("execute_threshold", 70),
+                execute_threshold = effective.get("execute_threshold", 70),
                 auto_fetch_vix    = True,
             )
             df_aug = apply_regime_layer(df_raw, regime_ctx)
@@ -225,7 +284,7 @@ def render(settings: dict | None = None):
         st.session_state["scan_df"]      = df_aug
         st.session_state["regime_ctx"]   = regime_ctx
         st.session_state["scan_summary"] = regime_summary(df_aug, regime_ctx)
-        st.session_state["scan_time"]    = datetime.now().strftime("%H:%M:%S")
+        st.session_state["scan_time"]    = _now_ist().strftime("%H:%M:%S")
 
         if supabase_ok and save_db:
             save_scan_snapshot(df_aug)
@@ -251,26 +310,47 @@ def render(settings: dict | None = None):
         st.caption(f"Last scan: {scan_time} IST")
 
     # ── Split by tier ────────────────────────────────────────────
-    execute_df = df_aug[df_aug["execute_flag"]].copy()
-    watch_df   = df_aug[~df_aug["execute_flag"] & (df_aug.get("regime_tier", "") != "Skip")].copy() \
-                 if "execute_flag" in df_aug.columns else df_aug.copy()
+    # Use sidebar tier filter
+    tier_filter = st.session_state.get("sidebar_tier_filter", ["Elite", "Tier 1", "Tier 2"])
+    show_skip   = st.session_state.get("sb_show_skip", False)
+
+    # Elite: Tier=="Elite" in scanner output
+    elite_df   = df_aug[df_aug.get("Tier", pd.Series()) == "Elite"].copy() \
+                 if "Tier" in df_aug.columns else pd.DataFrame()
+
+    # Execute: execute_flag True (Tier-1 or Tier-2 from regime engine)
+    # Also include Execution acc_tier
+    execute_df = df_aug[
+        df_aug.get("execute_flag", pd.Series(False, index=df_aug.index)) &
+        (df_aug.get("Tier", pd.Series()) != "Elite")
+    ].copy() if "execute_flag" in df_aug.columns else pd.DataFrame()
+
+    watch_df   = df_aug[
+        ~df_aug.get("execute_flag", pd.Series(False, index=df_aug.index)) &
+        (df_aug.get("regime_tier", pd.Series()) != "Skip") &
+        (df_aug.get("Tier", pd.Series()) != "Elite")
+    ].copy() if "execute_flag" in df_aug.columns else df_aug.copy()
+
     skip_df    = df_aug[df_aug.get("regime_tier", pd.Series()) == "Skip"].copy() \
                  if "regime_tier" in df_aug.columns else pd.DataFrame()
 
     # ── Tabs ─────────────────────────────────────────────────────
+    n_elite = len(elite_df)
     n_ex    = len(execute_df)
     n_watch = len(watch_df)
     n_skip  = len(skip_df)
 
-    tab_labels = [f"⚡ EXECUTE ({n_ex})", f"👁 WATCH ({n_watch})"]
+    tab_labels = [f"🌟 ELITE ({n_elite})", f"⚡ EXECUTE ({n_ex})", f"👁 WATCH ({n_watch})"]
+    df_sets    = [elite_df, execute_df, watch_df]
+    set_labels = ["ELITE", "EXECUTE", "WATCH"]
     if show_skip:
         tab_labels.append(f"⛔ SKIP ({n_skip})")
+        df_sets.append(skip_df)
+        set_labels.append("SKIP")
 
     tabs = st.tabs(tab_labels)
 
-    for tab, df_subset, label in zip(tabs,
-            [execute_df, watch_df] + ([skip_df] if show_skip else []),
-            ["EXECUTE", "WATCH", "SKIP"]):
+    for tab, df_subset, label in zip(tabs, df_sets, set_labels):
         with tab:
             if df_subset.empty:
                 if label == "EXECUTE" and summary.get("regime") != "TREND":
@@ -280,11 +360,14 @@ def render(settings: dict | None = None):
                 continue
 
             disp = _build_display_df(df_subset)
+            # Drop internal regime_tier column if present
+            if "regime_tier" in disp.columns:
+                disp = disp.drop(columns=["regime_tier"])
 
             # ── Category score columns styled ────────────────────
             cat_display_cols = ["Trend", "Momentum", "Structure", "Volume", "Quality"]
             format_dict = {c: "{:.0f}" for c in cat_display_cols if c in disp.columns}
-            format_dict.update({"Composite": "{:.1f}", "RS": "{:.1f}", "Size%": "{:.0f}"})
+            format_dict.update({"Composite": "{:.1f}", "RS": "{:.1f}", "Size%": "{:.0f}", "%Chg": "{:.2f}"})
 
             def _color_score(val):
                 try:
@@ -294,9 +377,18 @@ def render(settings: dict | None = None):
                     return "color:#ef4444"
                 except: return ""
 
+            def _color_chg(val):
+                try:
+                    v = float(val)
+                    return "color:#22c55e;font-weight:600" if v > 0 else ("color:#ef4444;font-weight:600" if v < 0 else "")
+                except: return ""
+
+            style_subset_score = [c for c in cat_display_cols + ["Composite", "RS"] if c in disp.columns]
+            styled = disp.style.map(_color_score, subset=style_subset_score)
+            if "%Chg" in disp.columns:
+                styled = styled.map(_color_chg, subset=["%Chg"])
             styled = (
-                disp.style
-                .map(_color_score, subset=[c for c in cat_display_cols + ["Composite", "RS"] if c in disp.columns])
+                styled
                 .set_properties(**{
                     "font-family": "'JetBrains Mono',monospace",
                     "font-size":   "0.78rem",
@@ -330,6 +422,6 @@ def render(settings: dict | None = None):
             csv = df_subset.to_csv(index=False)
             st.download_button(
                 f"⬇️ Download {label} CSV", data=csv,
-                file_name=f"scan_{label.lower()}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                file_name=f"scan_{label.lower()}_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
                 mime="text/csv", key=f"dl_{label}"
             )
