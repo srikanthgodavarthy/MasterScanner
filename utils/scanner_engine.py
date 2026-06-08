@@ -1,735 +1,551 @@
 """
-utils/scanner_engine.py
-────────────────────────
-NSE Master Scanner — data fetch, indicator primitives, and live scanner.
+pages/scanner.py — Live Scanner  (v3 — Regime Engine)
 
-All scoring logic lives in utils/scoring_core.py (compute_bar / BarResult).
-score_stock() here is now a thin wrapper: build_indicators → compute_bar(i=-1).
+Flow:
+  1. run_scanner()          → raw df from scoring_core
+  2. build_regime_context() → classify market regime (VIX + EMA slopes + Nifty)
+  3. apply_regime_layer()   → augment df with composite_score, regime_tier,
+                               execute_flag, pos_size_pct, cat_* columns
+  4. Render regime header panel
+  5. Two tabs: EXECUTE  |  WATCH
+     Each shows category score columns instead of a single Score column
 """
 
-import pandas as pd
-import numpy as np
-import yfinance as yf
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import streamlit as st
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import warnings
-warnings.filterwarnings("ignore")
+import pandas as pd
+from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo
+    _IST = ZoneInfo("Asia/Kolkata")
+    def _now_ist(): return datetime.now(_IST)
+except ImportError:
+    import pytz
+    _IST = pytz.timezone("Asia/Kolkata")
+    def _now_ist(): return datetime.now(_IST)
 
+from utils.scanner_engine  import run_scanner, fetch_nifty, NIFTY500_SYMBOLS
+from utils.scoring_core    import ScoringParams
+from utils.regime_engine   import (
+    build_regime_context,
+    apply_regime_layer,
+    regime_summary,
+    REGIME_WEIGHTS,
+)
+from utils.supabase_client import save_scan_snapshot, load_watchlist, add_to_watchlist, _is_available
 
-# ══════════════════════════════════════════════════════════════════
-#  TIMEZONE HELPER
-# ══════════════════════════════════════════════════════════════════
+# ── CONSTANTS ─────────────────────────────────────────────────────
+REGIME_COLORS = {
+    "TREND":    ("#22c55e", "#052e16", "#166534"),
+    "RANGE":    ("#f59e0b", "#2d1d00", "#92400e"),
+    "VOLATILE": ("#ef4444", "#2d0a0a", "#991b1b"),
+}
 
-def _strip_tz(index: pd.Index) -> pd.Index:
-    idx = pd.to_datetime(index)
-    if hasattr(idx, "tz") and idx.tz is not None:
-        idx = idx.tz_convert("UTC").tz_localize(None)
-    if hasattr(idx, "as_unit"):
-        idx = idx.as_unit("ns")
-    return idx
+CAT_COLS = ["cat_trend", "cat_momentum", "cat_structure", "cat_volume", "cat_quality"]
+CAT_LABELS = {
+    "cat_trend":     "Trend",
+    "cat_momentum":  "Momentum",
+    "cat_structure": "Structure",
+    "cat_volume":    "Volume",
+    "cat_quality":   "Quality",
+}
 
+# ── CSS ───────────────────────────────────────────────────────────
+_CSS = """
+<style>
+.regime-panel { border-radius:12px; padding:14px 20px; margin-bottom:18px; position:relative; }
+.regime-badge { display:inline-block; padding:3px 14px; border-radius:5px; font-weight:800; font-size:13px; letter-spacing:1.5px; }
+.regime-weights { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+.wt-pill { display:inline-block; padding:2px 10px; border-radius:20px; font-size:11px; font-weight:600; font-family:'JetBrains Mono',monospace; }
+.cat-bar-wrap { display:flex; align-items:center; gap:6px; }
+.cat-bar-track { flex:1; height:5px; background:#1e293b; border-radius:3px; overflow:hidden; }
+.cat-bar-fill { height:100%; border-radius:3px; }
+.tier-badge { display:inline-block; padding:2px 10px; border-radius:4px; font-size:11px; font-weight:700; letter-spacing:0.8px; }
+</style>
+"""
 
-# ══════════════════════════════════════════════════════════════════
-#  INDICATOR PRIMITIVES  (imported by scoring_core and backtest)
-# ══════════════════════════════════════════════════════════════════
+# ── HELPERS ───────────────────────────────────────────────────────
 
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
+def _cat_bar(value: float, color: str = "#22c55e") -> str:
+    pct = min(100, max(0, value))
+    return (f'<div class="cat-bar-wrap">'
+            f'<div class="cat-bar-track"><div class="cat-bar-fill" style="width:{pct}%;background:{color}"></div></div>'
+            f'<span style="font-size:11px;color:#94a3b8;width:28px;text-align:right">{pct:.0f}</span>'
+            f'</div>')
 
-def sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(period).mean()
+def _tier_badge(tier: str) -> str:
+    cfg = {
+        "Elite":   ("#ffd700", "#1a1100", "#92400e", "🌟 ELITE"),
+        "Tier-1":  ("#22c55e", "#052e16", "#166534", "⚡ EXECUTE T1"),
+        "Tier-2":  ("#4ade80", "#052e16", "#166534", "⚡ EXECUTE T2"),
+        "Watch":   ("#94a3b8", "#1e293b", "#334155", "👁 WATCH"),
+        "Skip":    ("#475569", "#0f172a", "#1e293b", "⛔ SKIP"),
+    }.get(tier, ("#475569", "#0f172a", "#1e293b", tier))
+    color, bg, border, label = cfg
+    return (f'<span class="tier-badge" style="color:{color};background:{bg};border:1px solid {border}">{label}</span>')
 
-def rsi(series: pd.Series, period: int = 21) -> pd.Series:
-    delta    = series.diff()
-    gain     = delta.clip(lower=0)
-    loss     = -delta.clip(upper=0)
-    avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
-    avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
-    rs       = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+def _pos_size_color(pct: float) -> str:
+    if pct >= 100: return "#22c55e"
+    if pct >= 75:  return "#4ade80"
+    if pct >= 50:  return "#f59e0b"
+    if pct >= 25:  return "#94a3b8"
+    return "#ef4444"
 
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low  - close.shift()).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(com=period - 1, adjust=False).mean()
+def _regime_panel(summary: dict) -> str:
+    r = summary["regime"]
+    color, bg, border = REGIME_COLORS.get(r, ("#94a3b8", "#1e293b", "#334155"))
+    weights = summary["weights"]
 
-def cci(close: pd.Series, period: int = 20) -> pd.Series:
-    """Vectorised CCI — significantly faster than the original Python loop."""
-    sma_s = close.rolling(period).mean()
-    # mean absolute deviation (vectorised rolling via apply on numpy)
-    mad_s = close.rolling(period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
-    mad_s = mad_s.replace(0, np.nan)
-    return (close - sma_s) / (0.015 * mad_s)
-
-def highest(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(period).max()
-
-def lowest(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(period).min()
-
-def pivot_high(high: pd.Series, lb: int) -> pd.Series:
-    roll_max = high.rolling(2 * lb + 1, center=True, min_periods=2 * lb + 1).max()
-    return high.where(high == roll_max)
-
-def pivot_low(low: pd.Series, lb: int) -> pd.Series:
-    roll_min = low.rolling(2 * lb + 1, center=True, min_periods=2 * lb + 1).min()
-    return low.where(low == roll_min)
-
-def ichimoku(high: pd.Series, low: pd.Series):
-    tenkan   = (highest(high, 9)  + lowest(low, 9))  / 2
-    kijun    = (highest(high, 26) + lowest(low, 26)) / 2
-    senkou_a = (tenkan + kijun) / 2
-    senkou_b = (highest(high, 52) + lowest(low, 52)) / 2
-    return tenkan, kijun, senkou_a, senkou_b
-
-def last_value(series: pd.Series) -> float:
-    valid = series.dropna()
-    return float(valid.iloc[-1]) if not valid.empty else np.nan
-
-
-# ══════════════════════════════════════════════════════════════════
-#  HARMONIC / ABCD  (shared via scoring_core._get_pivots)
-# ══════════════════════════════════════════════════════════════════
-
-TOLERANCE = 0.03
-
-def _in_range(val, target, tol=TOLERANCE):
-    return abs(val - target) <= tol
-
-def _retrace(a, b, c_):
-    leg1 = abs(b - a)
-    return np.nan if leg1 == 0 else abs(c_ - b) / leg1
-
-def _check_harmonic(xP, aP, bP, cP, dP, abR, bcLo, bcHi, cdR, xdR):
-    ab = _retrace(xP, aP, bP)
-    bc = _retrace(aP, bP, cP)
-    cd = _retrace(bP, cP, dP)
-    xd_den = abs(aP - xP)
-    xd = abs(dP - xP) / xd_den if xd_den != 0 else np.nan
-    if any(np.isnan(v) for v in [ab, bc, cd, xd]):
-        return False
-    return (
-        _in_range(ab, abR) and
-        bcLo - TOLERANCE <= bc <= bcHi + TOLERANCE and
-        _in_range(cd, cdR) and
-        _in_range(xd, xdR)
+    wt_pills = "".join(
+        '<span class="wt-pill" style="background:' + color + '18;border:1px solid ' + color + '44;color:' + color + '">'
+        + k + " " + str(int(v * 100)) + "%</span>"
+        for k, v in weights.items()
     )
 
-def detect_pattern(xP, aP, bP, cP, dP):
-    if _check_harmonic(xP, aP, bP, cP, dP, 0.500, 0.382, 0.886, 3.618, 1.618): return "Crab"
-    if _check_harmonic(xP, aP, bP, cP, dP, 0.786, 0.382, 0.886, 1.618, 1.272): return "Butterfly"
-    if _check_harmonic(xP, aP, bP, cP, dP, 0.500, 0.382, 0.886, 1.618, 0.886): return "Bat"
-    if _check_harmonic(xP, aP, bP, cP, dP, 0.618, 0.382, 0.886, 1.272, 0.786): return "Gartley"
-    return ""
+    gate_color = "#22c55e" if r == "TREND" else "#f59e0b"
+    gate_label = "EXECUTE eligible" if r == "TREND" else "WATCH only"
 
-def detect_harmonic(pivots_price, pivots_is_high):
-    if len(pivots_price) < 5:
-        return "", ""
-    dP, cP, bP, aP, xP = pivots_price[:5]
-    dH, cH, bH, aH, xH = pivots_is_high[:5]
-    if (not xH) and aH and (not bH) and cH and (not dH):
-        name = detect_pattern(xP, aP, bP, cP, dP)
-        if name: return "bull", name
-    if xH and (not aH) and bH and (not cH) and dH:
-        name = detect_pattern(xP, aP, bP, cP, dP)
-        if name: return "bear", name
-    return "", ""
+    ema50_html  = '<b style="color:#22c55e">▲ EMA50</b>' if summary["nifty_ema50"]  else '<b style="color:#ef4444">▼ EMA50</b>'
+    ema200_html = '&nbsp;·&nbsp; <b style="color:#22c55e">▲ EMA200</b>' if summary["nifty_ema200"] else ""
 
-def detect_abcd(pivots_price, pivots_is_high, close_val, open_val, prev_high):
-    if len(pivots_price) < 4:
-        return False, False
-    dP, cP, bP, aP = pivots_price[:4]
-    dH, cH, bH, aH = pivots_is_high[:4]
-    bc_r = _retrace(aP, bP, cP)
-    cd_r = _retrace(bP, cP, dP)
-    if np.isnan(bc_r) or np.isnan(cd_r):
-        return False, False
-    valid_bc = _in_range(bc_r, 0.618) or _in_range(bc_r, 0.786)
-    valid_cd = _in_range(cd_r, 1.272) or _in_range(cd_r, 1.618)
-    abcd_bull = (not aH) and bH and (not cH) and (not dH) and valid_bc and valid_cd
-    valid_struct   = dP > cP and dP > bP and dP > aP
-    bearish_candle = (close_val < open_val) or (prev_high is not None and close_val < prev_high)
-    abcd_bear = aH and (not bH) and cH and (not dH) and valid_struct and bearish_candle and valid_bc and valid_cd
-    return abcd_bull, abcd_bear
+    vix_val  = "{:.1f}".format(summary["vix"])
+    adx_val  = "{:.0f}".format(summary["adx"])
+    n_total  = max(1, summary.get("n_total", 1))
+    n_elite  = summary.get("n_elite", 0)
+    n_t1     = summary.get("n_tier1", 0)
+    n_t2     = summary.get("n_tier2", 0)
+    n_wa     = summary.get("n_watch", 0)
+    n_sk     = summary.get("n_skip",  0)
+    n_ex     = summary.get("n_execute", 0)
+    avg_comp = str(summary["avg_composite"])
+    avg_rs   = str(summary["avg_rs"])
 
+    # Suggestion 9: tier breakdown bar
+    def _seg(count, total, clr, lbl):
+        pct = count / total * 100
+        return (f'<div style="flex:{pct:.1f} 1 0%;min-width:2px;background:{clr};height:8px;'
+                f'border-radius:2px;margin:0 1px;" title="{lbl}: {count}"></div>')
 
-# ══════════════════════════════════════════════════════════════════
-#  NIFTY 500 SYMBOLS
-# ══════════════════════════════════════════════════════════════════
+    tier_bar = (
+        '<div style="display:flex;width:100%;border-radius:4px;overflow:hidden;margin:10px 0 4px;">' +
+        _seg(n_elite, n_total, "#ffd700", "Elite") +
+        _seg(n_t1,    n_total, "#22c55e", "Tier-1") +
+        _seg(n_t2,    n_total, "#4ade80", "Tier-2") +
+        _seg(n_wa,    n_total, "#f59e0b", "Watch") +
+        _seg(n_sk,    n_total, "#1e293b", "Skip") +
+        '</div>'
+    )
+    tier_legend = (
+        '<div style="font-size:10px;color:#475569;display:flex;gap:10px;margin-bottom:6px;">' +
+        '<span style="color:#ffd700">■ Elite:' + str(n_elite) + '</span>' +
+        '<span style="color:#22c55e">■ T1:' + str(n_t1) + '</span>' +
+        '<span style="color:#4ade80">■ T2:' + str(n_t2) + '</span>' +
+        '<span style="color:#f59e0b">■ Watch:' + str(n_wa) + '</span>' +
+        '<span style="color:#475569">■ Skip:' + str(n_sk) + '</span>' +
+        '</div>'
+    )
 
-NIFTY500_SYMBOLS = [
-    "360ONE","3MINDIA","ABB","ACC","AIAENG","APLAPOLLO","AUBANK","AARTIIND",
-    "AAVAS","ABBOTINDIA","ACE","ADANIENSOL","ADANIENT","ADANIGREEN","ADANIPORTS","ADANIPOWER",
-    "ATGL","AWL","ABCAPITAL","ABFRL","AEGISLOG","AETHER","AFFLE","AJANTPHARM",
-    "APLLTD","ALKEM","ALKYLAMINE","ALLCARGO","ALOKINDS","ARE&M","AMBER","AMBUJACEM",
-    "ANANDRATHI","ANGELONE","ANURAS","APARINDS","APOLLOHOSP","APOLLOTYRE","APTUS","ACI",
-    "ASAHIINDIA","ASHOKLEY","ASIANPAINT","ASTERDM","ASTRAZEN","ASTRAL","ATUL","AUROPHARMA",
-    "AVANTIFEED","DMART","AXISBANK","BEML","BLS","BSE","BAJAJ-AUTO","BAJFINANCE",
-    "BAJAJFINSV","BAJAJHLDNG","BALAMINES","BALKRISIND","BALRAMCHIN","BANDHANBNK","BANKBARODA","BANKINDIA",
-    "MAHABANK","BATAINDIA","BAYERCROP","BERGEPAINT","BDL","BEL","BHARATFORG","BHEL",
-    "BPCL","BHARTIARTL","BIKAJI","BIOCON","BIRLACORPN","BSOFT","BLUEDART","BLUESTARCO",
-    "BBTC","BORORENEW","BOSCHLTD","BRIGADE","BRITANNIA","MAPMYINDIA","CCL","CESC",
-    "CGPOWER","CIEINDIA","CRISIL","CSBBANK","CAMPUS","CANFINHOME","CANBK","CAPLIPOINT",
-    "CGCL","CARBORUNIV","CASTROLIND","CEATLTD","CELLO","CENTRALBK","CDSL","CENTURYPLY",
-    "ABREL","CERA","CHALET","CHAMBLFERT","CHEMPLASTS","CHENNPETRO","CHOLAHLDNG","CHOLAFIN",
-    "CIPLA","CUB","CLEAN","COALINDIA","COCHINSHIP","COFORGE","COLPAL","CAMS",
-    "CONCORDBIO","CONCOR","COROMANDEL","CRAFTSMAN","CREDITACC","CROMPTON","CUMMINSIND","CYIENT",
-    "DCMSHRIRAM","DLF","DOMS","DABUR","DALBHARAT","DATAPATTNS","DEEPAKFERT","DEEPAKNTR",
-    "DELHIVERY","DEVYANI","DIVISLAB","DIXON","LALPATHLAB","DRREDDY","EIDPARRY","EIHOTEL",
-    "EPL","EASEMYTRIP","EICHERMOT","ELECON","ELGIEQUIP","EMAMILTD","ENDURANCE","ENGINERSIN",
-    "EQUITASBNK","ERIS","ESCORTS","ETERNAL","EXIDEIND","FDC","NYKAA","FEDERALBNK","FACT",
-    "FINEORG","FINCABLES","FINPIPE","FSL","FIVESTAR","FORTIS","GAIL","GMMPFAUDLR",
-    "GMRAIRPORT","GRSE","GICRE","GILLETTE","GLAND","GLAXO","ALIVUS","GLENMARK",
-    "MEDANTA","GPIL","GODFRYPHLP","GODREJCP","GODREJIND","GODREJPROP","GRANULES","GRAPHITE",
-    "GRASIM","GESHIP","GRINDWELL","GAEL","FLUOROCHEM","GUJGASLTD","GMDCLTD","GNFC",
-    "GPPL","GSFC","GSPL","HEG","HBLENGINE","HCLTECH","HDFCAMC","HDFCBANK",
-    "HDFCLIFE","HFCL","HAPPSTMNDS","HAPPYFORGE","HAVELLS","HEROMOTOCO","HSCL","HINDALCO",
-    "HAL","HINDCOPPER","HINDPETRO","HINDUNILVR","HINDZINC","POWERINDIA","HOMEFIRST","HONASA",
-    "HONAUT","HUDCO","ICICIBANK","ICICIGI","ICICIPRULI","ISEC","IDBI","IDFCFIRSTB",
-    "IFCI","IIFL","IRB","IRCON","ITC","ITI","INDIACEM","INDIAMART",
-    "INDIANB","IEX","INDHOTEL","IOC","IOB","IRCTC","IRFC","INDIGOPNTS",
-    "IGL","INDUSTOWER","INDUSINDBK","NAUKRI","INFY","INOXWIND","INTELLECT","INDIGO",
-    "IPCALAB","JBCHEPHARM","JKCEMENT","JBMA","JKLAKSHMI","JKPAPER","JMFINANCIL","JSWENERGY",
-    "JSWINFRA","JSWSTEEL","JAIBALAJI","J&KBANK","JINDALSAW","JSL","JINDALSTEL","JIOFIN",
-    "JUBLFOOD","JUBLINGREA","JUBLPHARMA","JWL","JUSTDIAL","JYOTHYLAB","KPRMILL","KEI",
-    "KNRCON","KPITTECH","KRBL","KSB","KAJARIACER","KPIL","KALYANKJIL","KANSAINER",
-    "KARURVYSYA","KAYNES","KEC","KFINTECH","KOTAKBANK","KIMS","LTF","LTTS",
-    "LICHSGFIN","LTM","LT","LATENTVIEW","LAURUSLABS","LXCHEM","LEMONTREE","LICI",
-    "LINDEINDIA","LLOYDSME","LUPIN","MMTC","MRF","MTARTECH","LODHA","MGL",
-    "MAHSEAMLES","M&MFIN","M&M","MHRIL","MAHLIFE","MANAPPURAM","MRPL","MANKIND",
-    "MARICO","MARUTI","MASTEK","MFSL","MAXHEALTH","MAZDOCK","MEDPLUS","METROBRAND",
-    "METROPOLIS","MINDACORP","MSUMI","MOTILALOFS","MPHASIS","MCX","MUTHOOTFIN","NATCOPHARM",
-    "NBCC","NCC","NHPC","NLCINDIA","NMDC","NSLNISP","NTPC","NH",
-    "NATIONALUM","NAVINFLUOR","NESTLEIND","NETWORK18","NAM-INDIA","NUVAMA","NUVOCO","OBEROIRLTY",
-    "ONGC","OIL","OLECTRA","PAYTM","OFSS","POLICYBZR","PCBL","PIIND",
-    "PNBHOUSING","PNCINFRA","PVRINOX","PAGEIND","PATANJALI","PERSISTENT","PETRONET","PHOENIXLTD",
-    "PIDILITIND","PIRAMALFIN","PPLPHARMA","POLYMED","POLYCAB","POONAWALLA","PFC","POWERGRID",
-    "PRAJIND","PRESTIGE","PRINCEPIPE","PRSMJOHNSN","PGHH","PNB","QUESS","RRKABEL",
-    "RBLBANK","RECLTD","RHIM","RITES","RADICO","RVNL","RAILTEL","RAINBOW",
-    "RAJESHEXPO","RKFORGE","RCF","RATNAMANI","RTNINDIA","RAYMOND","REDINGTON","RELIANCE",
-    "RBA","ROUTE","SBFC","SBICARD","SBILIFE","SJVN","SKFINDIA","SRF",
-    "SAFARI","SAMMAANCAP","MOTHERSON","SANOFI","SAPPHIRE","SAREGAMA","SCHAEFFLER","SCHNEIDER",
-    "SHREECEM","RENUKA","SHRIRAMFIN","SHYAMMETL","SIEMENS","SIGNATURE","SOBHA","SOLARINDS",
-    "SONACOMS","SONATSOFTW","STARHEALTH","SBIN","SAIL","SWSOLAR","STLTECH","SUMICHEM",
-    "SPARC","SUNPHARMA","SUNTV","SUNDARMFIN","SUNDRMFAST","SUNTECK","SUPREMEIND","SUZLON",
-    "SYNGENE","TVSMOTOR","TATACAP","TATACHEM","TATACOMM","TCS","TATACONSUM","TATAELXSI",
-    "TATAPOWER","TATASTEEL","TATATECH","TECHM","TEJASNET","TITAN","TORNTPHARM","TORNTPOWER",
-    "TRENT","TRIDENT","TIINDIA","UPL","UTIAMC","ULTRACEMCO","UNIONBANK","UBL",
-    "VOLTAS","WELCORP","WELSPUNLIV","WIPRO","YESBANK","ZYDUSLIFE","ZYDUSWELL","ECLERX",
-    "TMCV","TMPV","EMCURE","GODIGIT","GRAVITA","IREDA","JKTYRE","JPPOWER","NTPCGREEN",
-    "JSWCEMENT","AKZOINDIA","KIRLOSENG","LTFOODS","NEULANDLAB","NEWGEN","PFIZER","SCI",
-    "FORCEMOT","TEGA","TITAGARH","HDBFS","ICICIAMC","PIRAMALFIN","PWL",
-]
-
-
-# ══════════════════════════════════════════════════════════════════
-#  DATA FETCHING
-# ══════════════════════════════════════════════════════════════════
-
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
-    try:
-        df = yf.Ticker(f"{symbol}.NS").history(period=period, interval=interval, auto_adjust=True)
-        if df.empty or len(df) < 60:
-            return pd.DataFrame()
-        df.index   = _strip_tz(pd.to_datetime(df.index))
-        df.columns = [c.lower() for c in df.columns]
-        return df[["open", "high", "low", "close", "volume"]]
-    except Exception:
-        return pd.DataFrame()
-
-@st.cache_data(ttl=30, show_spinner=False)   # 30s TTL — live price patch
-def _fetch_live_prices(symbols: tuple) -> dict:
-    """
-    Fetch today's live bar (partial or complete) using period='5d', interval='1d'.
-    yfinance includes the current intraday bar in this period even during market hours.
-    Returns {sym: (today_date, open, high, low, close, volume)} or {} on failure.
-    """
-    if not symbols:
-        return {}
-    tickers = [f"{s}.NS" for s in symbols]
-    try:
-        raw = yf.download(tickers, period="5d", interval="1d",
-                          auto_adjust=True, group_by="ticker",
-                          threads=True, progress=False)
-    except Exception:
-        return {}
-
-    result = {}
-    single = len(tickers) == 1
-    for sym, ticker in zip(symbols, tickers):
-        try:
-            df = raw if single else raw[ticker]
-            df = df.dropna(how="all")
-            if df.empty:
-                continue
-            df.index   = _strip_tz(pd.to_datetime(df.index))
-            df.columns = [c.lower() for c in df.columns]
-            last = df.iloc[-1]
-            result[sym] = {
-                "date":   df.index[-1],
-                "open":   float(last["open"]),
-                "high":   float(last["high"]),
-                "low":    float(last["low"]),
-                "close":  float(last["close"]),
-                "volume": float(last["volume"]),
-            }
-        except Exception:
-            continue
-    return result
-
-
-def _patch_live_prices(data: dict, live: dict) -> dict:
-    """
-    Overwrite the last row of each symbol's OHLCV DataFrame with the live bar.
-    If today's date is already the last index, update in-place.
-    If today is a new date (market open, new day), append a new row.
-    """
-    from datetime import date
-    today = pd.Timestamp(date.today())
-
-    patched = {}
-    for sym, df in data.items():
-        if sym not in live:
-            patched[sym] = df
-            continue
-        lv = live[sym]
-        lv_date = pd.Timestamp(lv["date"]).normalize()
-        df_copy = df.copy()
-
-        if df_copy.index[-1].normalize() == lv_date:
-            # Same day — update last row with live data
-            df_copy.loc[df_copy.index[-1], "close"]  = lv["close"]
-            df_copy.loc[df_copy.index[-1], "high"]   = max(df_copy.iloc[-1]["high"],  lv["high"])
-            df_copy.loc[df_copy.index[-1], "low"]    = min(df_copy.iloc[-1]["low"],   lv["low"])
-            df_copy.loc[df_copy.index[-1], "volume"] = lv["volume"]
-        else:
-            # New day — append live bar
-            new_row = pd.DataFrame([{
-                "open":   lv["open"],
-                "high":   lv["high"],
-                "low":    lv["low"],
-                "close":  lv["close"],
-                "volume": lv["volume"],
-            }], index=[lv_date])
-            df_copy = pd.concat([df_copy, new_row])
-
-        patched[sym] = df_copy
-    return patched
-
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") -> dict:
-    if not symbols:
-        return {}
-    tickers = [f"{s}.NS" for s in symbols]
-    try:
-        raw = yf.download(tickers, period=period, interval=interval,
-                          auto_adjust=True, group_by="ticker", threads=True, progress=False)
-    except Exception:
-        return {}
-    result = {}
-    single = len(tickers) == 1
-    for sym, ticker in zip(symbols, tickers):
-        try:
-            df = raw if single else raw[ticker]
-            df = df.dropna(how="all")
-            if df.empty or len(df) < 60:
-                continue
-            df.index   = _strip_tz(pd.to_datetime(df.index))
-            df.columns = [c.lower() for c in df.columns]
-            result[sym] = df[["open", "high", "low", "close", "volume"]]
-        except Exception:
-            continue
-    return result
-
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_nifty(period: str = "1y") -> pd.Series:
-    try:
-        df    = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
-        nifty = df["Close"].rename("nifty")
-        nifty.index = _strip_tz(pd.to_datetime(nifty.index))
-        return nifty
-    except Exception:
-        return pd.Series(dtype=float)
-
-
-# ══════════════════════════════════════════════════════════════════
-#  NIFTY REGIME CLASSIFIER
-# ══════════════════════════════════════════════════════════════════
-
-def nifty_regime(nifty: pd.Series) -> str:
-    """
-    Classify Nifty as 'bull', 'bear', or 'neutral' based on price vs EMA50/EMA200.
-    Called once per scanner run; result injected into ScoringParams for all stocks.
-
-    bull   — price > EMA200 AND EMA50 > EMA200 (strong uptrend)
-    bear   — price < EMA200 AND EMA50 < EMA200 (downtrend)
-    neutral — mixed (e.g. EMA crossover in progress)
-    """
-    if nifty.empty or len(nifty) < 200:
-        return "neutral"
-    e50  = ema(nifty, 50)
-    e200 = ema(nifty, 200)
-    cur   = float(nifty.iloc[-1])
-    e50v  = float(e50.iloc[-1])
-    e200v = float(e200.iloc[-1])
-    if cur > e200v and e50v > e200v:
-        return "bull"
-    if cur < e200v and e50v < e200v:
-        return "bear"
-    return "neutral"
-
-
-# ══════════════════════════════════════════════════════════════════
-#  SCORE_STOCK  — thin wrapper around scoring_core.compute_bar
-# ══════════════════════════════════════════════════════════════════
-
-def score_stock(
-    df:       pd.DataFrame,
-    nifty:    pd.Series,
-    settings: dict | None = None,
-    # legacy keyword args kept for backwards compatibility
-    cci_len:  int   = 20,
-    cci_ob:   int   = 100,
-    cci_os:   int   = -100,
-    pvt_lb:   int   = 20,
-    atr_prox: float = 0.3,
-) -> dict:
-    """
-    Evaluate the LATEST bar of df.
-    Returns a flat dict ready for the scanner table, or {} on failure.
-
-    settings dict (from pages/settings.py) takes priority over legacy kwargs.
-    """
-    if df.empty or len(df) < 210:
-        return {}
-
-    from utils.scoring_core import ScoringParams, build_indicators, compute_bar
-
-    if settings:
-        params = ScoringParams.from_settings(settings)
-    else:
-        params = ScoringParams(
-            cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
-            pvt_lb=pvt_lb, atr_prox=atr_prox,
-        )
-
-    ia = build_indicators(df, nifty, params)
-    r  = compute_bar(ia, i=-1, params=params)   # -1 = latest bar
-
-    if r is None:
-        return {}
-
-    return {
-        # ── display columns ──────────────────────────────────────
-        "Stock":        None,
-        "Tier":         r.tier,
-        "AccTier":      r.acc_tier,
-        "AccScore":     r.acc_score,
-        "_elite_tier":  r.elite_tier,
-        "TrendPhase":   r.trend_phase,
-        "BuyType":      r.buy_type,
-        "_cci_rising":  r.cci_rising,
-        "FreshBase":    r.fresh_base_breakout,
-        "TrendAge":     r.trend_age_bars,
-        "TrendFresh":   r.trend_freshness,
-        "RS_Top10":     r.rs_top_decile,
-        "RS1m":         round(r.rs1 * 100, 2),
-        "RS3m":         round(r.rs3 * 100, 2),
-        "RS6m":         round(r.rs6 * 100, 2),
-        "RScomp":       round(r.rs_composite * 100, 2),
-        "Score":        r.norm_score,
-        "Action":       r.action,
-        "Setup":        r.setup,
-        "Buy Type":     r.buy_type,
-        "CCI":          round(r.cur_cci),
-        "CCI State":    r.cci_state,
-        "CCI Sig":      r.cci_signal,
-        "Qual":         r.qual_icon,
-        "%Chg":         r.pct_chg,
-        "Entry":        r.entry,
-        "SL":           r.sl,
-        "T1":           r.t1,
-        "T2":           r.t2,
-        "T3":           r.t3,
-        # ── internals ────────────────────────────────────────────
-        "_qualified":           r.qualified,
-        "_persistent_strength": r.persistent_strength,
-        "_high_prob":           r.high_prob,
-        "_in_golden":           r.in_golden,
-        "_in_golden_relaxed":   r.in_golden_relaxed,
-        "_in_golden_cci":       r.in_golden_cci,
-        "_above_cloud":         r.above_cloud,
-        "_inside_cloud":        r.inside_cloud,
-        "_allow_cloud":         r.allow_cloud,
-        "_ema_alignment":       r.ema_alignment,
-        "_trend_structure":     r.trend_structure,
-        "_squeeze_on":          r.squeeze_on,
-        "_squeeze_release":     r.squeeze_release,
-        "_compression_break":   r.compression_break,
-        "_cci_momentum_break":  r.cci_momentum_break,
-        "_harm_bull":           r.harm_bull,
-        "_abcd_bull":           r.abcd_bull,
-        "_any_buy":             r.any_buy,
-        "_tier1_prime":         r.tier1_prime,
-        "_tier2_momentum":      r.tier2_momentum,
-        "_recent_cci_rec":      r.recent_cci_recovery,
-        "_hard_stop":           r.hard_stop,
-        "_t2_compression":      r.t2_compression,
-        "_t2_fib_qual":         r.t2_fib_qual,
-        "_t2_fib_cci":          r.t2_fib_cci,
-        "_t2_harmonic":         r.t2_harmonic,
-        "_t2_abcd":             r.t2_abcd,
-        "_t2_cci_break":        r.t2_cci_break,
-        "_t3_near_golden":      r.t3_near_golden,
-        "_t3_cci_rec":          r.t3_cci_rec,
-        "_t3_cloud_test":       r.t3_cloud_test,
-        "_t3_ema_conv":         r.t3_ema_conv,
-        "_t4_hard_stop":        r.t4_hard_stop,
-        "_t4_fib_resist":       r.t4_fib_resist,
-        "_t4_downtrend":        r.t4_downtrend,
-        "_rsi":                 r.cur_rsi,
-        "_mom1":                r.mom1,
-        "_mom3":                r.mom3,
-        "_mom6":                r.mom6,
-        "_cci_raw":             r.cur_cci,
-        "_fib618":              r.fib618,
-        "_fib500":              r.fib500,
-        "_fib382":              r.fib382,
-        "_nifty_regime":        r.nifty_regime_val,
-        "_vol_ratio":           round(r.vol_ratio, 3),
-        # ── NEW: Tier-1 strength fields ──────────────────────────
-        "RS":           round(r.rs_val * 100, 2),   # pct vs Nifty, 5-bar
-        "ADX":          round(r.adx_val, 1),
-        "EMA Slope":    round(r.ema20_slope, 2),
-        "_rs_positive": r.rs_positive,
-        "_strength_ok": r.strength_ok,
-        # Suggestion 3: Tier-1 path audit
-        "T1Path":       r.t1_path,
-        # Suggestion 2: score components (kept as _internal — not shown in table)
-        "_score_components": r.score_components,
-        # Suggestion 4: raw BarResult for typed regime engine extraction
-        "_bar_result":  r,
+    # Market condition sentence
+    mkt_sentences = {
+        "TREND":    f"Trending market · {n_ex} execution candidates · Avg RS +{avg_rs}. Full position sizing active.",
+        "RANGE":    "Range-bound market · Execute gate restricted · Half position sizing.",
+        "VOLATILE": "Volatile market · Execute gate closed · No new positions.",
     }
+    mkt_sentence = mkt_sentences.get(r, "")
+
+    return (
+        '<div class="regime-panel" style="background:' + bg + ';border:1px solid ' + border + '44;">'
+        + '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">'
+        + '<span class="regime-badge" style="background:' + color + '22;border:1px solid ' + color + ';color:' + color + '">' + r + '</span>'
+        + '<span style="color:#94a3b8;font-size:12px;">'
+        + 'VIX <b style="color:#e2e8f0">' + vix_val + '</b>'
+        + '&nbsp;·&nbsp; ADX <b style="color:#e2e8f0">' + adx_val + '</b>'
+        + '&nbsp;·&nbsp; Nifty ' + ema50_html
+        + ema200_html
+        + '</span>'
+        + '<span style="margin-left:auto;font-size:11px;padding:2px 10px;border-radius:4px;'
+        + 'background:' + gate_color + '18;border:1px solid ' + gate_color + '44;'
+        + 'color:' + gate_color + ';font-weight:700;">' + gate_label + '</span>'
+        + '</div>'
+        + '<div class="regime-weights">' + wt_pills + '</div>'
+        + tier_bar + tier_legend
+        + '<p style="font-size:10.5px;color:#64748b;margin:4px 0 8px;font-style:italic;">' + mkt_sentence + '</p>'
+        + '<div style="display:flex;gap:24px;margin-top:4px;">'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#ffd700">' + str(n_elite) + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">ELITE</div></div>'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#22c55e">' + str(n_ex) + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">EXECUTE</div></div>'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#f59e0b">' + str(n_wa) + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">WATCH</div></div>'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#94a3b8">' + str(n_sk) + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">SKIP</div></div>'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#818cf8">' + avg_comp + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">AVG SCORE</div></div>'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#a78bfa">' + avg_rs + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">AVG RS</div></div>'
+        + '</div>'
+        + '</div>'
+    )
 
 
-# ══════════════════════════════════════════════════════════════════
-#  BATCH SCANNER
-# ══════════════════════════════════════════════════════════════════
+# ── SUGGESTION 8: Decision view vs Detail view ────────────────────
+# Decision view (default): focused 12 columns — what you need to act
+# Detail view: all diagnostic columns
 
-_BATCH_SIZE = 150
+_DECISION_COLS = [
+    "Stock", "Streak", "Tier", "T1Path", "Score", "TrendPhase",
+    "RS%", "Entry", "SL", "T1", "%Chg", "Size%",
+]
+_DETAIL_EXTRA = [
+    "CCI", "ADX", "EMA Slope", "Age(bars)", "Fresh%", "Base\U0001f525",
+    "RS Rank", "Top Cat", "Composite",
+    "Trend", "Momentum", "Structure", "Volume", "Quality",
+    "Buy Type", "Setup", "T2",
+]
+_RENAME_MAP = {
+    "top_category":    "Top Cat",
+    "composite_score": "Composite",
+    "RScomp":          "RS%",
+    "RS_Rank":         "RS Rank",
+    "pos_size_pct":    "Size%",
+    "cat_trend":       "Trend",
+    "cat_momentum":    "Momentum",
+    "cat_structure":   "Structure",
+    "cat_volume":      "Volume",
+    "cat_quality":     "Quality",
+    "TrendAge":        "Age(bars)",
+    "TrendFresh":      "Fresh%",
+    "FreshBase":       "Base\U0001f525",
+}
 
-def run_scanner(
-    symbols:     list,
-    settings:    dict | None = None,
-    cci_len:     int  = 20,
-    cci_ob:      int  = 100,
-    cci_os:      int  = -100,
-    max_workers: int  = 10,
-    progress_cb       = None,
-) -> pd.DataFrame:
+def _build_display_df(df: pd.DataFrame, detail: bool = False) -> pd.DataFrame:
     """
-    Two-phase scanner.
-    Nifty regime is computed once here from live data, then injected into
-    the settings dict so every score_stock() call uses the same value
-    without redundant per-stock computation.
+    Suggestion 8: two-view display.
+    detail=False → Decision view (12 focused columns for acting on signals)
+    detail=True  → Detail view (all diagnostic columns)
     """
-    total     = len(symbols)
-    n_batches = max(1, (total + _BATCH_SIZE - 1) // _BATCH_SIZE)
+    all_cols = [
+        "Stock", "Score", "Action", "%Chg", "Entry", "SL", "T1", "T2",
+        "Buy Type", "Setup", "TrendPhase", "TrendAge", "TrendFresh", "FreshBase",
+        "RS_Rank", "RScomp", "top_category", "composite_score",
+        "pos_size_pct", "T1Path", "Streak",
+        "cat_trend", "cat_momentum", "cat_structure", "cat_volume", "cat_quality",
+        "Tier", "CCI", "ADX", "EMA Slope", "regime_tier",
+    ]
+    present = [c for c in all_cols if c in df.columns]
+    out = df[present].copy()
+    out = out.rename(columns=_RENAME_MAP)
 
-    all_data: dict = {}
-    for batch_i, start in enumerate(range(0, total, _BATCH_SIZE)):
-        chunk      = tuple(symbols[start: start + _BATCH_SIZE])
-        batch_data = fetch_batch_ohlcv(chunk, period="1y", interval="1d")
-        all_data.update(batch_data)
-        if progress_cb:
-            progress_cb(0.5 * (batch_i + 1) / n_batches)
+    want = _DECISION_COLS + ([c for c in _DETAIL_EXTRA if c in out.columns] if detail else [])
+    want = [c for c in want if c in out.columns]
+    return out[want]
 
-    # ── Patch live prices (today's intraday bar) ──────────────────
-    # FIX: only call _fetch_live_prices when today's bar is missing from the
-    # batch download (avoids a duplicate 500-symbol yf.download on most runs).
-    try:
-        from datetime import date as _date
-        _today = pd.Timestamp(_date.today())
-        _needs_live = any(
-            sym in all_data and all_data[sym].index[-1].normalize() < _today
-            for sym in symbols
-        )
-        if _needs_live:
-            live_prices = _fetch_live_prices(tuple(symbols))
-            all_data    = _patch_live_prices(all_data, live_prices)
-    except Exception:
-        pass   # non-fatal — fall back to cached OHLCV
 
-    nifty_series = fetch_nifty("1y")
-    regime_val   = nifty_regime(nifty_series)   # bull / bear / neutral — computed once
+def _build_display_df_old(df: pd.DataFrame) -> pd.DataFrame:
+    """Build a clean display DataFrame matching the required column ribbon order."""
+    # Ribbon order: Stock, Score, Action, %Chg, Entry, SL, T1, T2,
+    #               Buy Type, Setup, Top Cat, Composite, RS, Size%,
+    #               Trend, Momentum, Structure, Volume, Quality, Tier, CCI
+    cols_wanted = [
+        "Stock", "Score", "Action", "%Chg", "Entry", "SL", "T1", "T2",
+        "Buy Type", "Setup", "TrendPhase", "TrendAge", "TrendFresh", "FreshBase",
+        "RS_Rank", "RScomp", "top_category", "composite_score",
+        "pos_size_pct",
+        "cat_trend", "cat_momentum", "cat_structure", "cat_volume", "cat_quality",
+        "Tier", "CCI",
+        # keep regime_tier for tab filtering (hidden from display if not in above)
+        "regime_tier",
+    ]
+    present = [c for c in cols_wanted if c in df.columns]
+    out = df[present].copy()
+    out = out.rename(columns={
+        "top_category":    "Top Cat",
+        "composite_score": "Composite",
+        "RScomp":          "RS%",
+        "RS_Rank":         "RS Rank",
+        "pos_size_pct":    "Size%",
+        "cat_trend":       "Trend",
+        "cat_momentum":    "Momentum",
+        "cat_structure":   "Structure",
+        "cat_volume":      "Volume",
+        "cat_quality":     "Quality",
+        "TrendAge":        "Age(bars)",
+        "TrendFresh":      "Fresh%",
+        "FreshBase":       "Base🔥",
+    })
+    return out
 
-    # Inject regime into settings so ScoringParams picks it up
-    effective_settings = dict(settings) if settings else {}
-    effective_settings["nifty_regime_val"] = regime_val
-    # nifty_regime_filter already in settings from the UI toggle (defaults False)
 
-    results = []
-    done    = 0
+# ── MAIN RENDER ───────────────────────────────────────────────────
 
-    def process(sym):
-        df = all_data.get(sym, pd.DataFrame())
-        if df.empty:
-            return None
-        row = score_stock(df, nifty_series, settings=effective_settings,
-                          cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os)
-        if row:
-            row["Stock"] = sym
-        return row
+def render(settings: dict | None = None):
+    st.markdown(_CSS, unsafe_allow_html=True)
+    settings = settings or {}
 
-    with ThreadPoolExecutor(max_workers=max_workers) as exe:
-        futures = {exe.submit(process, s): s for s in symbols}
-        for fut in as_completed(futures):
-            done += 1
-            if progress_cb:
-                progress_cb(0.5 + 0.5 * done / total)
-            row = fut.result()
-            if row:
-                results.append(row)
+    supabase_ok = _is_available()
 
-    if not results:
-        return pd.DataFrame()
+    # ── Quick controls (inline expander, no sidebar) ────────────────
+    with st.expander("⚙️ Quick controls", expanded=False):
+        _qr1, _qr2, _qr3, _qr4 = st.columns(4)
+        with _qr1:
+            tier_filter = st.multiselect(
+                "Show Tiers",
+                options=["Elite", "Tier 1", "Tier 2", "Watch", "Skip"],
+                default=st.session_state.get("sidebar_tier_filter", ["Elite", "Tier 1", "Tier 2"]),
+                key="sidebar_tier_filter",
+            )
+        with _qr2:
+            _workers = st.slider("Workers", 5, 30,
+                settings.get("workers", 10), step=5, key="sb_workers")
+            st.session_state["workers"] = _workers
+        with _qr3:
+            _exec_thr = st.slider("Execute threshold", 50, 90,
+                settings.get("execute_threshold", 70), step=5, key="sb_exec_thr")
+            st.session_state["execute_threshold"] = _exec_thr
+        with _qr4:
+            show_skip = st.checkbox("Show Skip tab", value=False, key="sb_show_skip")
 
-    df_out = pd.DataFrame(results)
-    df_out = df_out.sort_values("Score", ascending=False).reset_index(drop=True)
-    df_out.index += 1
+        _qr5, _qr6, _qr7, _qr8 = st.columns(4)
+        with _qr5:
+            _t1_rs = st.number_input("RS Min", -0.05, 0.20,
+                float(settings.get("t1_rs_min", 0.0)), step=0.01, format="%.2f", key="sb_t1_rs")
+            st.session_state["t1_rs_min"] = _t1_rs
+        with _qr6:
+            _t1_adx = st.number_input("ADX Min", 10, 40,
+                int(settings.get("t1_adx_min", 20)), step=1, key="sb_t1_adx")
+            st.session_state["t1_adx_min"] = _t1_adx
+        with _qr7:
+            _force_exec = st.checkbox("Force Execute (ignore regime)",
+                value=st.session_state.get("force_execute", False), key="sb_force_execute")
+            st.session_state["force_execute"] = _force_exec
+        with _qr8:
+            if st.button("🗑️ Clear Cache", key="sb_clear_cache"):
+                st.cache_data.clear()
+                st.session_state.pop("scan_df", None)
+                st.success("Cache cleared.")
 
-    # ── RS Universe Ranking ───────────────────────────────────────
-    # Percentile rank within scanned universe. Top 10% = RS leaders.
-    if "RScomp" in df_out.columns and len(df_out) > 1:
+    # ── Controls row ─────────────────────────────────────────────
+    ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1, 4])
+    with ctrl1:
+        run_btn = st.button("▶ Run Scan", use_container_width=True, key="btn_run_scan")
+    with ctrl2:
+        save_db = st.checkbox("💾 Save to DB", value=True, key="chk_save_db")
+    with ctrl3:
+        st.markdown(
+            f"<div style='padding:0.55rem 0;color:#64748b;font-size:0.78rem;'>"
+            f"Universe: <b>{len(settings.get('symbols', NIFTY500_SYMBOLS))}</b> symbols"
+            f" &nbsp;·&nbsp; Execute threshold: <b>{st.session_state.get('execute_threshold', settings.get('execute_threshold', 70))}</b>"
+            f" &nbsp;·&nbsp; Workers: <b>{st.session_state.get('workers', settings.get('workers', 10))}</b></div>",
+            unsafe_allow_html=True)
+
+    # ── Run scan ─────────────────────────────────────────────────
+    if run_btn:
+        # Merge sidebar overrides
+        effective = dict(settings)
+        effective["workers"]           = st.session_state.get("workers",           settings.get("workers", 10))
+        effective["execute_threshold"] = st.session_state.get("execute_threshold", settings.get("execute_threshold", 70))
+        effective["t1_rs_min"]         = st.session_state.get("t1_rs_min",         settings.get("t1_rs_min", 0.0))
+        effective["t1_adx_min"]        = st.session_state.get("t1_adx_min",        settings.get("t1_adx_min", 20))
+        effective["force_execute"]     = st.session_state.get("force_execute",      False)
+
+        symbols = effective.get("symbols", NIFTY500_SYMBOLS)
+        prog    = st.progress(0, text="Fetching data…")
+
+        def _cb(pct):
+            prog.progress(min(pct, 1.0), text=f"Scanning… {int(pct*100)}%")
+
+        with st.spinner("Running scanner…"):
+            df_raw = run_scanner(
+                symbols,
+                settings         = effective,
+                cci_len          = effective.get("cci_len",  20),
+                cci_ob           = effective.get("cci_ob",  100),
+                cci_os           = effective.get("cci_os", -100),
+                max_workers      = effective.get("workers",  10),
+                progress_cb      = _cb,
+            )
+
+        prog.empty()
+
+        if df_raw.empty:
+            st.warning("No results returned. Check data connection or try fewer symbols.")
+            return
+
+        # ── Regime layer ─────────────────────────────────────────
+        with st.spinner("Classifying regime & computing composite scores…"):
+            nifty_series = fetch_nifty("1y")
+            regime_ctx   = build_regime_context(
+                nifty             = nifty_series,
+                execute_threshold = effective.get("execute_threshold", 70),
+                auto_fetch_vix    = True,
+                force_execute     = effective.get("force_execute", False),
+            )
+            df_aug = apply_regime_layer(df_raw, regime_ctx)
+
+        # Suggestion 11: add persistence streak from scan history
         try:
-            from scipy.stats import rankdata
-            raw_ranks         = rankdata(df_out["RScomp"].fillna(0).values, method="average")
-            df_out["RS_Rank"] = (raw_ranks / len(raw_ranks) * 100).round(1)
-            df_out["RS_Top10"]= df_out["RS_Rank"] >= 90
+            from utils.supabase_client import load_scan_history
+            from utils.scanner_engine  import add_streak_column
+            if supabase_ok:
+                _hist = load_scan_history(limit=50)
+                if not _hist.empty:
+                    df_aug = add_streak_column(df_aug, _hist.to_dict("records"), n_scans=10)
         except Exception:
-            df_out["RS_Rank"] = 50.0
-            df_out["RS_Top10"]= False
-    else:
-        df_out["RS_Rank"] = 50.0
-        df_out["RS_Top10"]= False
+            pass   # non-critical
 
-    return df_out
+        st.session_state["scan_df"]      = df_aug
+        st.session_state["regime_ctx"]   = regime_ctx
+        st.session_state["scan_summary"] = regime_summary(df_aug, regime_ctx)
+        st.session_state["scan_time"]    = _now_ist().strftime("%H:%M:%S")
 
+        if supabase_ok and save_db:
+            save_scan_snapshot(df_aug)
+            st.success("✅ Saved to Supabase.")
 
-# ══════════════════════════════════════════════════════════════════
-#  SUGGESTION 11: SCAN PERSISTENCE COUNTER
-#  Count consecutive scans a symbol has appeared in Elite/Tier-1.
-#  Requires Supabase scan history.  Returns a dict {symbol: streak}.
-# ══════════════════════════════════════════════════════════════════
+    # ── Display ──────────────────────────────────────────────────
+    df_aug    = st.session_state.get("scan_df",      pd.DataFrame())
+    summary   = st.session_state.get("scan_summary", {})
+    scan_time = st.session_state.get("scan_time",    "")
 
-def compute_scan_streaks(
-    scan_history: "list[dict]",
-    tier_col:     str = "tier",
-    sym_col:      str = "symbol",
-    count_tiers:  tuple = ("Elite", "Tier 1"),
-    n_scans:      int   = 10,
-) -> "dict[str, int]":
-    """
-    Given a list of scan snapshot dicts (newest first), return
-    {symbol: consecutive_streak} counting the number of the most
-    recent scans in which the symbol appeared in a qualifying tier.
+    if df_aug.empty:
+        st.markdown("""
+        <div style="text-align:center;padding:4rem 2rem;color:#64748b;">
+            <div style="font-size:3rem">📡</div>
+            <div style="font-size:1.1rem;font-family:'Syne',sans-serif;margin-top:0.5rem;">No scan data</div>
+            <div style="font-size:0.8rem;margin-top:0.3rem;">Configure settings and click <b>Run Scan</b></div>
+        </div>""", unsafe_allow_html=True)
+        return
 
-    Parameters
-    ----------
-    scan_history : list of dicts, each dict has sym_col and tier_col keys.
-                   Ordered newest → oldest (as returned by load_scan_history).
-    tier_col     : column name for tier string in each snapshot row.
-    sym_col      : column name for symbol string.
-    count_tiers  : tuple of tier strings that count toward a streak.
-    n_scans      : how many recent scans to look back (default 10).
+    # ── Regime header panel ──────────────────────────────────────
+    st.markdown(_regime_panel(summary), unsafe_allow_html=True)
+    if scan_time:
+        st.caption(f"Last scan: {scan_time} IST")
 
-    Returns
-    -------
-    dict {symbol: streak_count}  — only symbols with streak >= 1 included.
-    """
-    if not scan_history:
-        return {}
+    # ── Split by tier ────────────────────────────────────────────
+    # Use sidebar tier filter
+    tier_filter = st.session_state.get("sidebar_tier_filter", ["Elite", "Tier 1", "Tier 2"])
+    show_skip   = st.session_state.get("sb_show_skip", False)
 
-    import pandas as pd
-    df = pd.DataFrame(scan_history)
-    if sym_col not in df.columns or tier_col not in df.columns:
-        return {}
+    # Elite: Tier=="Elite" in scanner output
+    elite_df   = df_aug[df_aug.get("Tier", pd.Series()) == "Elite"].copy() \
+                 if "Tier" in df_aug.columns else pd.DataFrame()
 
-    # Group by scan run (if there is a run_at column, use it; else use positional order)
-    run_col = "run_at" if "run_at" in df.columns else None
-    if run_col:
-        runs = [grp for _, grp in df.groupby(run_col, sort=False)]
-    else:
-        # treat each row as its own run (legacy)
-        runs = [df.iloc[[i]] for i in range(len(df))]
+    # Execute: execute_flag True (Tier-1 or Tier-2 from regime engine)
+    # Also include Execution acc_tier
+    execute_df = df_aug[
+        df_aug.get("execute_flag", pd.Series(False, index=df_aug.index)) &
+        (df_aug.get("Tier", pd.Series()) != "Elite")
+    ].copy() if "execute_flag" in df_aug.columns else pd.DataFrame()
 
-    # Keep only the most recent n_scans
-    runs = runs[:n_scans]
+    watch_df   = df_aug[
+        ~df_aug.get("execute_flag", pd.Series(False, index=df_aug.index)) &
+        (df_aug.get("regime_tier", pd.Series()) != "Skip") &
+        (df_aug.get("Tier", pd.Series()) != "Elite")
+    ].copy() if "execute_flag" in df_aug.columns else df_aug.copy()
 
-    # For each symbol track consecutive streak from most recent scan back
-    all_symbols = df[sym_col].unique()
-    streaks: dict[str, int] = {}
+    skip_df    = df_aug[df_aug.get("regime_tier", pd.Series()) == "Skip"].copy() \
+                 if "regime_tier" in df_aug.columns else pd.DataFrame()
 
-    for sym in all_symbols:
-        streak = 0
-        for run_df in runs:
-            sym_rows = run_df[run_df[sym_col] == sym]
-            appeared = not sym_rows.empty and sym_rows[tier_col].isin(count_tiers).any()
-            if appeared:
-                streak += 1
-            else:
-                break   # consecutive streak broken
-        if streak >= 1:
-            streaks[sym] = streak
+    # ── Tabs ─────────────────────────────────────────────────────
+    n_elite = len(elite_df)
+    n_ex    = len(execute_df)
+    n_watch = len(watch_df)
+    n_skip  = len(skip_df)
 
-    return streaks
+    tab_labels = [f"🌟 ELITE ({n_elite})", f"⚡ EXECUTE ({n_ex})", f"👁 WATCH ({n_watch})"]
+    df_sets    = [elite_df, execute_df, watch_df]
+    set_labels = ["ELITE", "EXECUTE", "WATCH"]
+    if show_skip:
+        tab_labels.append(f"⛔ SKIP ({n_skip})")
+        df_sets.append(skip_df)
+        set_labels.append("SKIP")
 
+    tabs = st.tabs(tab_labels)
 
-def add_streak_column(
-    df_scan:      "pd.DataFrame",
-    scan_history: "list[dict]",
-    n_scans:      int = 10,
-) -> "pd.DataFrame":
-    """
-    Add a 'Streak' column to a scanner result DataFrame.
-    Streak = number of recent consecutive scans the stock appeared in T1/Elite.
-    """
-    streaks = compute_scan_streaks(scan_history, n_scans=n_scans)
-    df_scan = df_scan.copy()
-    df_scan["Streak"] = df_scan["Stock"].map(streaks).fillna(0).astype(int)
-    return df_scan
+    for tab, df_subset, label in zip(tabs, df_sets, set_labels):
+        with tab:
+            if df_subset.empty:
+                if label == "EXECUTE" and summary.get("regime") != "TREND":
+                    st.info(f"⛔ Execute gate blocked — regime is {summary.get('regime', '?')} (TREND required)")
+                else:
+                    st.info(f"No {label} candidates.")
+                continue
 
+            # Suggestion 8: decision/detail toggle per tab
+            _show_detail = st.toggle("Detail view", value=False, key=f"detail_{label}")
+            disp = _build_display_df(df_subset, detail=_show_detail)
+            if "regime_tier" in disp.columns:
+                disp = disp.drop(columns=["regime_tier"])
 
-# ══════════════════════════════════════════════════════════════════
-#  COLOUR HELPERS
-# ══════════════════════════════════════════════════════════════════
+            # ── Category score columns styled ────────────────────
+            cat_display_cols = ["Trend", "Momentum", "Structure", "Volume", "Quality"]
+            format_dict = {c: "{:.0f}" for c in cat_display_cols if c in disp.columns}
+            format_dict.update({
+                "Composite": "{:.1f}", "Size%": "{:.0f}", "%Chg": "{:.2f}",
+                "Entry": "{:.2f}", "SL": "{:.2f}", "T1": "{:.2f}", "T2": "{:.2f}", "T3": "{:.2f}",
+                "RS%": "{:.1f}", "RS Rank": "{:.0f}",
+            })
 
-def score_color(score: int) -> str:
-    if score >= 85: return "#16a34a"
-    if score >= 75: return "#22c55e"
-    if score >= 65: return "#4ade80"
-    if score >= 50: return "#f59e0b"
-    return "#ef4444"
+            def _color_score(val):
+                try:
+                    v = float(val)
+                    if v >= 70: return "color:#22c55e;font-weight:700"
+                    if v >= 50: return "color:#f59e0b"
+                    return "color:#ef4444"
+                except: return ""
 
-def action_color(action: str) -> str:
-    if "BUY"   in action: return "#16a34a"
-    if "WATCH" in action: return "#f59e0b"
-    return "#ef4444"
+            def _color_chg(val):
+                try:
+                    v = float(val)
+                    return "color:#22c55e;font-weight:600" if v > 0 else ("color:#ef4444;font-weight:600" if v < 0 else "")
+                except: return ""
 
-def cci_color(cci_val: float, ob: int = 100, os: int = -100) -> str:
-    if cci_val >= ob: return "#ef4444"
-    if cci_val <= os: return "#22c55e"
-    return "#3b82f6"
+            def _color_rs_rank(val):
+                try:
+                    v = float(val)
+                    if v >= 90: return "color:#ffd700;font-weight:800"   # gold = top decile
+                    if v >= 75: return "color:#22c55e;font-weight:600"
+                    if v >= 50: return "color:#94a3b8"
+                    return "color:#ef4444"
+                except: return ""
 
-def acc_tier_color(t: str) -> tuple:
-    return {
-        "T1★": ("#4c1d95", "#c4b5fd"),
-        "A":   ("#1e3a5f", "#60a5fa"),
-        "B":   ("#14532d", "#4ade80"),
-        "C":   ("#78350f", "#fcd34d"),
-        "D":   ("#1c1917", "#78716c"),
-    }.get(t, ("#1c1917", "#78716c"))
+            style_subset_score = [c for c in cat_display_cols + ["Composite"] if c in disp.columns]
+            styled = disp.style.map(_color_score, subset=style_subset_score)
+            if "RS Rank" in disp.columns:
+                styled = styled.map(_color_rs_rank, subset=["RS Rank"])
+            if "%Chg" in disp.columns:
+                styled = styled.map(_color_chg, subset=["%Chg"])
+            styled = (
+                styled
+                .set_properties(**{
+                    "font-family": "'JetBrains Mono',monospace",
+                    "font-size":   "0.78rem",
+                    "text-align":  "center",
+                    "background-color": "#111827",
+                    "color":       "#e2e8f0",
+                })
+                .set_table_styles([{"selector": "th", "props": [
+                    ("background-color", "#0f1e3d"),
+                    ("color", "#93c5fd"),
+                    ("font-size", "0.72rem"),
+                    ("text-transform", "uppercase"),
+                ]}])
+                .format(format_dict, na_rep="—")
+            )
+
+            st.dataframe(styled, use_container_width=True, height=500, hide_index=False)
+
+            # ── Watchlist add ─────────────────────────────────────
+            if supabase_ok and label in ("EXECUTE", "WATCH"):
+                with st.expander("➕ Add to Watchlist"):
+                    syms_in_view = df_subset["Stock"].tolist() if "Stock" in df_subset.columns else []
+                    sel = st.multiselect("Select symbols", syms_in_view, key=f"wl_sel_{label}")
+                    note = st.text_input("Note (optional)", key=f"wl_note_{label}")
+                    if st.button("Add to Watchlist", key=f"wl_add_{label}"):
+                        for s in sel:
+                            add_to_watchlist(s, note)
+                        st.success(f"Added {len(sel)} symbols to watchlist.")
+
+            # ── Download ─────────────────────────────────────────
+            csv = df_subset.to_csv(index=False)
+            st.download_button(
+                f"⬇️ Download {label} CSV", data=csv,
+                file_name=f"scan_{label.lower()}_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv", key=f"dl_{label}"
+            )
