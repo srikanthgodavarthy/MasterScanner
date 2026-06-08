@@ -255,22 +255,6 @@ class BarResult:
 
 @dataclass
 class IndicatorArrays:
-    # ── P1: Precomputed pivot series (full-length, NaN where not a pivot) ─
-    ph_series: pd.Series = None   # pivot highs
-    pl_series: pd.Series = None   # pivot lows
-    # ── Also store raw numpy arrays for P3 (fast scalar access) ──────────
-    _c_arr:   np.ndarray = None
-    _h_arr:   np.ndarray = None
-    _l_arr:   np.ndarray = None
-    _cci_arr: np.ndarray = None
-    _e20_arr: np.ndarray = None
-    _e50_arr: np.ndarray = None
-    _e200_arr: np.ndarray = None
-    _atr_arr: np.ndarray = None
-    _vol_arr: np.ndarray = None
-    _vavg_arr: np.ndarray = None
-    _adx_arr:  np.ndarray = None
-    _nifty_arr: np.ndarray = None
     """
     All full-length indicator Series for a single symbol.
     Built once per symbol, reused across all bars.
@@ -302,6 +286,22 @@ class IndicatorArrays:
     cloud_bottom: pd.Series
 
     nifty_aligned: pd.Series   # Nifty close reindexed to symbol's trading days
+         # ── P1: Precomputed pivot series (full-length, NaN where not a pivot) ─
+    ph_series: pd.Series = None   # pivot highs
+    pl_series: pd.Series = None   # pivot lows
+    # ── Also store raw numpy arrays for P3 (fast scalar access) ──────────
+    _c_arr:   np.ndarray = None
+    _h_arr:   np.ndarray = None
+    _l_arr:   np.ndarray = None
+    _cci_arr: np.ndarray = None
+    _e20_arr: np.ndarray = None
+    _e50_arr: np.ndarray = None
+    _e200_arr: np.ndarray = None
+    _atr_arr: np.ndarray = None
+    _vol_arr: np.ndarray = None
+    _vavg_arr: np.ndarray = None
+    _adx_arr:  np.ndarray = None
+    _nifty_arr: np.ndarray = None
 
 
 # ══════════════════════════════════════════════════════════════════
