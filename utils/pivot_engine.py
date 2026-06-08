@@ -160,7 +160,7 @@ class PivotCache:
     Rebuilds only when ph_series[i] or pl_series[i] is non-NaN (new pivot formed).
     Avoids re-scanning the full pivot series on every bar.
     """
-    __slots__ = ("_ph", "_pl", "_lb3", "_last_rebuild", "_prices", "_is_high")
+    __slots__ = ("_ph", "_pl", "_lb3", "_last_rebuild", "_prices", "_is_high", "__weakref__")
 
     def __init__(self, ph_series: pd.Series, pl_series: pd.Series, pvt_lb: int):
         self._ph          = ph_series.values          # numpy array (float, NaN = not pivot)
