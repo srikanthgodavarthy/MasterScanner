@@ -60,6 +60,56 @@ import pandas as pd
 #    "rs"      → tanh(val/20)    clamped 0–1  (RS score, already 0–100 space)
 # ══════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════
+#  SUGGESTION 4: TYPED BARRESULT EXTRACTION
+#  Regime engine previously consumed score_stock() flat dicts via
+#  .get("_key", 0) — silent failures if a key was renamed.
+#  _bar_result_to_row() converts a BarResult to the canonical dict
+#  the regime engine expects, using typed field access.
+#  If a BarResult is not available, falls back to flat dict (legacy).
+# ══════════════════════════════════════════════════════════════════
+
+def bar_result_to_row(r) -> dict:
+    """
+    Convert a BarResult dataclass → flat dict with the _key names
+    that CATEGORY_SIGNALS and _compute_rs_score expect.
+    Eliminates silent failures from key renames in score_stock().
+    """
+    return {
+        # Trend
+        "_ema_alignment":       r.ema_alignment,
+        "_trend_structure":     r.trend_structure,
+        "_above_cloud":         r.above_cloud,
+        "_trend_up":            r.trend_up,
+        # Momentum
+        "_cci_momentum_break":  r.cci_momentum_break,
+        "_recent_cci_rec":      r.recent_cci_recovery,
+        "_rsi":                 r.cur_rsi,
+        "_mom3":                r.mom3,
+        "_mom6":                r.mom6,
+        # Structure
+        "_compression_break":   r.compression_break,
+        "_harm_bull":           r.harm_bull,
+        "_abcd_bull":           r.abcd_bull,
+        "_in_golden_relaxed":   r.in_golden_relaxed,
+        "_in_golden":           r.in_golden,
+        # Volume
+        "_squeeze_release":     r.squeeze_release,
+        "_squeeze_on":          r.squeeze_on,
+        "_vol_ratio":           r.vol_ratio,
+        # Quality
+        "_persistent_strength": r.persistent_strength,
+        "_qualified":           r.qualified,
+        # Tier gates (used in _classify_tier only, not in scoring)
+        "_elite_tier":          r.elite_tier,
+        "_tier1_prime":         r.tier1_prime,
+        "_tier2_momentum":      r.tier2_momentum,
+        "_any_buy":             r.any_buy,
+        # RS raw fields for _compute_rs_score
+        "_rs_score":            r.rs_composite * 100,   # 0-100 scaled
+    }
+
+
 CATEGORY_SIGNALS: dict[str, list[tuple[str, str, float]]] = {
 
     "Trend": [
@@ -503,7 +553,10 @@ def apply_regime_layer(
 
     records = []
     for _, row in df_scan.iterrows():
-        rd = row.to_dict()
+        # Suggestion 4: use typed extraction if _bar_result present;
+        # otherwise fall back to flat dict (legacy path from old score_stock calls)
+        _br = row.get("_bar_result", None)
+        rd  = bar_result_to_row(_br) if _br is not None else row.to_dict()
 
         rs_score                  = _compute_rs_score(rd, ctx)
         cat_scores, _, composite  = compute_composite(rd, ctx.regime, ctx)

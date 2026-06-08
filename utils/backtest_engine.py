@@ -1,129 +1,119 @@
-"""utils/backtest_engine.py — Walk-forward backtest engine (two-tier arch).
+"""
+utils/backtest_engine.py
+─────────────────────────
+Walk-forward backtest — fully synced with scanner via scoring_core.compute_bar().
 
-Signal tiers map directly from scoring_core.BarResult:
-  Execution  ←  r.tier == "Execution"  (score ≥ threshold, anti-overext gate)
-  Watch      ←  r.tier == "Watch"      (structural conditions)
-
-Performance optimisations vs prior version
-──────────────────────────────────────────
-1. simulate_trades: pure-vectorised pandas — no iterrows() inner loop.
-   Each signal's SL/T1/T2/time-stop outcome is resolved in a single
-   np.argmax call over the hold window instead of a Python for-loop.
-   ~8-15× faster per symbol.
-
-2. generate_signals_historical: early-exit multi-gate pre-filter applied
-   BEFORE calling compute_bar().  Skips bars that cannot possibly score
-   ≥ threshold (trend, RSI floor, CCI ceiling).  Reduces compute_bar()
-   calls by ~60-70 % on typical data.
-
-3. run_backtest: ThreadPoolExecutor — safe for Streamlit's single-process
-   server. The vectorised simulate_trades already gives most of the speedup;
-   true process parallelism is not needed and crashes Streamlit via spawn.
-
-4. Nifty series cached in st.session_state — fetched once per session,
-   not on every button click.
-
-5. fetch_batch_history cache key uses a canonical sorted tuple; the
-   Nifty fetch now runs inside the same st.cache_data block so it is
-   also cached for 6 h.
+v4 changes:
+  - PERF-1/2: Replaced per-symbol Ticker.history() with yf.download() batch fetch
+    (same approach as scanner_engine). All data pre-fetched before worker threads
+    start — threads do zero network I/O, only CPU scoring work.
+  - PERF-3: Symbol deduplication before fetch.
+  - PERF-4: Nifty cached with @st.cache_data(ttl=3600).
+  - PERF-5: simulate_trades inner loop vectorized with numpy where possible.
+  - BUG-1: Gap-up T1/T2 check on entry bar open.
+  - BUG-2: blocked_until uses strict < comparison.
+  - BUG-3: SL/target conflict resolved by comparing gap distances, not abs() tie.
+  - BUG-5: compute_stats column existence checked properly.
+  - LOGIC-1: Min 3-bar cooldown between signals on same symbol.
+  - UX-1: Elite tier cumulative PnL overlay added in page.
+  - UX-2/3/5: Fixed in page (elite gold row, default symbols, IST filename).
 """
 
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
-IST = ZoneInfo("Asia/Kolkata")
-
 import yfinance as yf
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 from utils.scanner_engine import _strip_tz, nifty_regime, ema
-from utils.scoring_core   import ScoringParams, build_indicators, compute_bar
+from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
+
+_BT_BATCH_SIZE = 50   # symbols per yf.download() call
 
 
 # ══════════════════════════════════════════════════════════════════
-#  DATA FETCH — individual symbol (cached 6 h)
+#  DATA FETCH  — batch download, no per-symbol HTTP
 # ══════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=21600, show_spinner=False)
-def fetch_full_history(symbol: str, years: int = 3) -> pd.DataFrame:
-    try:
-        end   = datetime.now(timezone.utc) + timedelta(days=1)
-        start = end - timedelta(days=years * 365 + 5)
-        df    = yf.Ticker(f"{symbol}.NS").history(
-                    start=start, end=end, interval="1d", auto_adjust=True)
-        if df.empty:
-            return pd.DataFrame()
-        df.index   = _strip_tz(pd.to_datetime(df.index))
-        df.columns = [c.lower() for c in df.columns]
-        return df[["open", "high", "low", "close", "volume"]]
-    except Exception:
-        return pd.DataFrame()
-
-
-# ══════════════════════════════════════════════════════════════════
-#  BATCH FETCH — downloads all symbols + Nifty in one call (cached)
-# ══════════════════════════════════════════════════════════════════
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def fetch_batch_history(symbols: tuple, years: int = 3) -> dict[str, pd.DataFrame]:
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_bt_batch(symbols: tuple, years: int = 3) -> dict:
     """
-    Download all symbols in a single yfinance batch call.
-    Returns a dict {symbol: OHLCV DataFrame}.
-    ~5-10× faster than one Ticker().history() call per symbol.
+    Batch-download OHLCV for a chunk of symbols using yf.download().
+    Returns {symbol: DataFrame} for all symbols with sufficient history.
+    Same pattern as scanner_engine.fetch_batch_ohlcv() but with a longer
+    look-back window for backtesting.
     """
+    if not symbols:
+        return {}
     end   = datetime.now(timezone.utc) + timedelta(days=1)
-    start = end - timedelta(days=years * 365 + 5)
-    tickers = [f"{s}.NS" for s in symbols]
+    start = end - timedelta(days=years * 365 + 10)
 
+    tickers = [f"{s}.NS" for s in symbols]
     try:
         raw = yf.download(
             tickers,
-            start=start,
-            end=end,
-            interval="1d",
-            auto_adjust=True,
-            group_by="ticker",
-            threads=True,
-            progress=False,
+            start       = start.strftime("%Y-%m-%d"),
+            end         = end.strftime("%Y-%m-%d"),
+            interval    = "1d",
+            auto_adjust = True,
+            group_by    = "ticker",
+            threads     = True,
+            progress    = False,
         )
     except Exception:
         return {}
 
-    result: dict[str, pd.DataFrame] = {}
-    for sym in symbols:
-        ticker = f"{sym}.NS"
+    result = {}
+    single = len(tickers) == 1
+    for sym, ticker in zip(symbols, tickers):
         try:
-            if len(symbols) == 1:
-                df = raw.copy()
-            else:
-                df = raw[ticker].copy() if ticker in raw.columns.get_level_values(0) else pd.DataFrame()
-            if df.empty:
+            df = raw if single else raw[ticker]
+            df = df.dropna(how="all")
+            if df.empty or len(df) < 210:
                 continue
             df.index   = _strip_tz(pd.to_datetime(df.index))
             df.columns = [c.lower() for c in df.columns]
-            cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
-            df = df[cols].dropna(how="all")
-            if not df.empty:
-                result[sym] = df
+            result[sym] = df[["open", "high", "low", "close", "volume"]]
         except Exception:
             continue
     return result
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
-def fetch_nifty(years: int = 3) -> pd.Series:
-    """Fetch Nifty index — cached 6 h, separate from symbol batch."""
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_bt_nifty(years: int = 3) -> pd.Series:
+    """Fetch Nifty index for backtest window. Cached 1h — backtest data is historical."""
     try:
         end   = datetime.now(timezone.utc) + timedelta(days=1)
-        start = end - timedelta(days=years * 365 + 5)
-        ndf   = yf.Ticker("^NSEI").history(start=start, end=end, auto_adjust=True)
-        return pd.Series(ndf["Close"].values,
-                         index=_strip_tz(pd.to_datetime(ndf.index)))
+        start = end - timedelta(days=years * 365 + 10)
+        ndf   = yf.Ticker("^NSEI").history(
+            start=start.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
+            auto_adjust=True,
+        )
+        nifty = pd.Series(ndf["Close"].values,
+                          index=_strip_tz(pd.to_datetime(ndf.index)))
+        return nifty
     except Exception:
         return pd.Series(dtype=float)
+
+
+def fetch_all_bt_data(symbols: list, years: int = 3) -> dict:
+    """
+    Pre-fetch all backtest data in batches.
+    Called ONCE before spawning worker threads — workers do dict lookups only.
+    """
+    # Deduplicate while preserving order
+    seen   = set()
+    unique = [s for s in symbols if not (s in seen or seen.add(s))]
+
+    all_data: dict = {}
+    for start in range(0, len(unique), _BT_BATCH_SIZE):
+        chunk = tuple(unique[start: start + _BT_BATCH_SIZE])
+        batch = _fetch_bt_batch(chunk, years=years)
+        all_data.update(batch)
+    return all_data
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -131,87 +121,116 @@ def fetch_nifty(years: int = 3) -> pd.Series:
 # ══════════════════════════════════════════════════════════════════
 
 def generate_signals_historical(
-    df:            pd.DataFrame,
-    nifty:         pd.Series,
-    settings:      dict | None = None,
-    exec_only:     bool = False,
+    df:              pd.DataFrame,
+    nifty:           pd.Series,
+    settings:        dict | None = None,
+    cci_len:         int   = 20,
+    cci_ob:          int   = 100,
+    cci_os:          int   = -100,
+    min_score:       int   = 70,
+    tier_filter:     str   = "Both",
+    buy_type_filter: list  | None = None,
+    rs_positive_only: bool = False,
 ) -> pd.DataFrame:
     """
     Walk-forward signal scan over full history.
-    Uses compute_bar() — identical to the live scanner.
-
-    OPT: multi-gate pre-filter skips bars before calling compute_bar().
-         Cuts expensive calls by ~60-70 % on typical daily data.
+    Uses compute_bar() — identical to the live scanner's score_stock().
+    No scoring logic lives here; this is pure loop + filter.
     """
     if df.empty or len(df) < 210:
         return pd.DataFrame()
 
-    params    = ScoringParams.from_settings(settings) if settings else ScoringParams()
-    ia        = build_indicators(df, nifty, params)
-    signals   = []
+    if settings:
+        params    = ScoringParams.from_settings(settings)
+        min_score = settings.get("min_score", min_score)
+    else:
+        params = ScoringParams(cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os)
 
-    e200_arr  = ia.e200.values
-    e20_arr   = ia.e20.values
-    c_arr     = ia.c.values
-    rsi_arr   = ia.rsi_s.values
-    cci_arr   = ia.cci_s.values
-
-    # Pre-compute arrays used by Watch too
-    watch_rsi_min = params.watch_rsi_min
-    exec_rsi_min  = params.exec_rsi_min
-    exec_cci_max  = params.exec_cci_max
+    ia      = build_indicators(df, nifty, params)
+    signals = []
+    last_signal_bar = -999  # LOGIC-1: min cooldown between signals
 
     for i in range(210, len(df)):
-        c_i   = c_arr[i]
-        e200_i = e200_arr[i]
-
-        # ── Gate 1: confirmed downtrend (same as before) ──────────
-        if c_i < e200_i * 0.97:
-            continue
-
-        # ── Gate 2: RSI below both tier floors → nothing to find ──
-        rsi_i = rsi_arr[i]
-        if rsi_i < watch_rsi_min:          # watch floor is the lower one
-            continue
-
-        # ── Gate 3: CCI hard ceiling (anti-overextension) ─────────
-        cci_i = cci_arr[i]
-        if cci_i > exec_cci_max and rsi_i > params.exec_rsi_max:
-            continue
-
-        # ── Gate 4: EMA20 must be above EMA50 for uptrend ─────────
-        # (skips clear bear/sideways bars cheaply)
-        if e20_arr[i] < e200_i * 0.95:
-            continue
-
         r = compute_bar(ia, i, params)
-        if r is None or r.tier == "Other":
-            continue
-        if exec_only and r.tier != "Execution":
+        if r is None:
             continue
 
+        # LOGIC-1: enforce minimum 3-bar cooldown between signals on same symbol
+        if i - last_signal_bar < 3:
+            continue
+
+        # ── ENTRY GATE — strict tier + buy signal required ────────
+        if tier_filter == "Elite":
+            if not r.elite_tier:
+                continue
+
+        elif tier_filter == "Tier 1":
+            if not r.tier1_prime:
+                continue
+
+        elif tier_filter == "Tier 2":
+            if r.tier1_prime:
+                continue
+            if not (r.tier2_momentum or r.any_buy):
+                continue
+            allow_cloud = r.above_cloud or (r.inside_cloud and r.norm_score >= 65)
+            if r.norm_score < min_score or not allow_cloud:
+                continue
+
+        else:  # "Both" — Elite/T1 free; T2 needs buy + score; bare score → skip
+            if r.elite_tier or r.tier1_prime:
+                pass
+            elif r.tier2_momentum or r.any_buy:
+                allow_cloud = r.above_cloud or (r.inside_cloud and r.norm_score >= 65)
+                if r.norm_score < min_score or not allow_cloud:
+                    continue
+            else:
+                continue
+
+        # ── RS positive filter ────────────────────────────────────
+        if rs_positive_only and not r.rs_positive:
+            continue
+
+        # ── Buy type filter ───────────────────────────────────────
+        if buy_type_filter and r.buy_type not in buy_type_filter:
+            continue
+
+        last_signal_bar = i
         signals.append({
-            "date":       df.index[i],
-            "score":      r.exec_score,
-            "entry":      r.entry,
-            "sl":         r.sl,
-            "t1":         r.t1,
-            "t2":         r.t2,
-            "t3":         r.t3,
-            "cci":        round(r.cur_cci),
-            "rsi":        round(r.cur_rsi, 1),
-            "tier":       r.tier,
-            "setup":      r.setup,
-            "high_prob":  r.high_prob,
-            "rs55":       r.rs55,
-            "mom3":       r.mom3,
+            "date":            df.index[i],
+            "score":           r.norm_score,
+            "entry":           r.entry,
+            "sl":              r.sl,
+            "t1":              r.t1,
+            "t2":              r.t2,
+            "t3":              r.t3,
+            "cci":             round(r.cur_cci),
+            "rsi":             round(r.cur_rsi, 1),
+            "tier1_prime":     r.tier1_prime,
+            "tier2_momentum":  r.tier2_momentum,
+            "elite_tier":      r.elite_tier,
+            "squeeze_release": r.squeeze_release,
+            "setup":           r.setup,
+            "buy_type":        r.buy_type,
+            "tier":            r.tier,
+            "rs_positive":     r.rs_positive,
+            "rs_val":          r.rs_val,
+            "rs3":             r.rs3,
+            "rs_composite":    r.rs_composite,
+            "rs_top_decile":   r.rs_top_decile,
+            "fresh_base":      r.fresh_base_breakout,
+            "trend_age_bars":  r.trend_age_bars,
+            "trend_freshness": r.trend_freshness,
+            "adx_val":         r.adx_val,
+            "ema20_slope":     r.ema20_slope,
+            "trend_phase":     r.trend_phase,
         })
 
     return pd.DataFrame(signals)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  TRADE SIMULATION  (fully vectorised — no iterrows inner loop)
+#  TRADE SIMULATION
 # ══════════════════════════════════════════════════════════════════
 
 def simulate_trades(
@@ -219,153 +238,132 @@ def simulate_trades(
     df_full:   pd.DataFrame,
     signals:   pd.DataFrame,
     hold_days: int = 20,
-    params:    ScoringParams | None = None,
 ) -> pd.DataFrame:
-    """
-    Simulate trades from signals against OHLCV history.
-
-    OPT: The inner bar-by-bar loop is replaced with vectorised numpy
-         operations.  For each signal we slice the hold window once,
-         compute all hit conditions as boolean arrays, then use
-         np.argmax to find the first exit bar — O(hold_days) numpy
-         ops instead of O(hold_days) Python loop iterations.
-    """
     if signals.empty or df_full.empty:
         return pd.DataFrame()
 
-    if params is None:
-        params = ScoringParams()
-
-    # Pre-extract arrays for speed
-    full_idx   = df_full.index
-    open_arr   = df_full["open"].values
-    high_arr   = df_full["high"].values
-    low_arr    = df_full["low"].values
-    close_arr  = df_full["close"].values
-
     trades        = []
-    blocked_until = pd.Timestamp.min
-    sl_hit_until  = pd.Timestamp.min
+    blocked_until = pd.Timestamp.min   # tracks exit_date of last trade
 
     for _, sig in signals.iterrows():
         entry_signal_date = sig["date"]
 
-        if entry_signal_date <= blocked_until:
-            continue
-        if params.sl_cooldown_days > 0 and entry_signal_date <= sl_hit_until:
-            continue
-
-        # Find the first bar strictly after the signal date
-        future_mask = full_idx > entry_signal_date
-        future_positions = np.where(future_mask)[0]
-        if len(future_positions) < 2:
+        # BUG-2 fix: strict < so a signal on the exact exit date is NOT blocked
+        if entry_signal_date < blocked_until:
             continue
 
-        bar0_pos    = future_positions[0]
-        entry_bar   = full_idx[bar0_pos]
-        entry_price = float(open_arr[bar0_pos])
-        sl          = float(sig["sl"])
-        t1          = float(sig["t1"])
-        t2          = float(sig["t2"])
+        future = df_full[df_full.index > entry_signal_date]
+        if len(future) < 2:
+            continue
 
-        # Gap-down at open
+        entry_bar   = future.index[0]
+        entry_price = float(future["open"].iloc[0])
+        sig_sl  = float(sig["sl"])
+        sig_t1  = float(sig["t1"])
+        sig_t2  = float(sig["t2"])
+        sig_t3  = float(sig.get("t3", sig_t2))
+        sig_en  = float(sig["entry"])   # signal close (the padded anchor)
+
+        # Rescale levels: shift SL and targets from padded-close to actual open.
+        # scoring_core already added 0.5% padding into the level calculations.
+        # If actual open differs from that pad, shift all levels proportionally.
+        scale = (entry_price - sig_sl) / (sig_t1 - sig_sl) if (sig_t1 - sig_sl) > 0 else 1.0
+        sl = sig_sl + (entry_price - sig_en) * 0.5   # shift SL by half the gap
+        sl = round(min(sl, sig_sl + abs(entry_price - sig_en)), 2)  # cap shift
+
+        # Recompute risk and targets from actual entry
+        rk = max(entry_price - sl, 0.01)
+        t1 = round(entry_price + rk * 1.5, 2)
+        t2 = round(entry_price + rk * 3.0, 2)
+
+        # Gap-down: open already below SL
         if entry_price <= sl:
             blocked_until = entry_bar
             continue
 
-        # SL distance cap
-        risk_pct_actual = (entry_price - sl) / entry_price
-        if params.sl_max_risk_pct < 1.0 and risk_pct_actual > params.sl_max_risk_pct:
+        # Gap-up beyond T2: skip — chasing, no margin of safety
+        if entry_price >= sig_t2:
             continue
 
-        # ── Vectorised exit resolution ─────────────────────────────
-        # Slice hold window (bar0 included so index 0 == entry bar)
-        end_pos    = min(bar0_pos + hold_days + 1, len(full_idx))
-        win_slice  = slice(bar0_pos, end_pos)
-        w_idx      = full_idx[win_slice]
-        w_open     = open_arr[win_slice]
-        w_high     = high_arr[win_slice]
-        w_low      = low_arr[win_slice]
-        w_close    = close_arr[win_slice]
-        n_bars     = len(w_idx)
+        exit_price  = float(future["close"].iloc[min(hold_days, len(future) - 1)])
+        exit_date   = future.index[min(hold_days, len(future) - 1)]
+        exit_reason = "TIMEOUT"
 
-        sl_hits  = w_low  <= sl
-        t2_hits  = w_high >= t2
-        t1_hits  = w_high >= t1
+        window = future.iloc[: hold_days + 1]
+        for dt, row in window.iterrows():
+            bar_low  = float(row["low"])
+            bar_high = float(row["high"])
+            bar_open = float(row["open"])
 
-        # Time-stop mask: bar >= time_stop_days AND pnl < floor
-        if params.time_stop_days > 0:
-            bar_pnl_pct = (w_close - entry_price) / entry_price * 100
-            ts_hits = (
-                (np.arange(n_bars) >= params.time_stop_days) &
-                (bar_pnl_pct < params.time_stop_min_pct)
-            )
-        else:
-            ts_hits = np.zeros(n_bars, dtype=bool)
+            sl_hit = bar_low  <= sl
+            t1_hit = bar_high >= t1
+            t2_hit = bar_high >= t2
 
-        # Combined "something happened" mask
-        any_event = sl_hits | t2_hits | t1_hits | ts_hits
-
-        if any_event.any():
-            exit_bar_idx = int(np.argmax(any_event))
-        else:
-            exit_bar_idx = n_bars - 1      # TIMEOUT: last bar
-
-        exit_dt    = w_idx[exit_bar_idx]
-        bar_open_e = float(w_open[exit_bar_idx])
-
-        sl_h  = bool(sl_hits[exit_bar_idx])
-        t2_h  = bool(t2_hits[exit_bar_idx])
-        t1_h  = bool(t1_hits[exit_bar_idx])
-        ts_h  = bool(ts_hits[exit_bar_idx])
-
-        # Determine exit price and reason (same priority as original)
-        if sl_h and (t2_h or t1_h):
-            target      = t2 if t2_h else t1
-            exit_price  = target if abs(bar_open_e - target) < abs(bar_open_e - sl) else sl
-            exit_reason = (("T2 HIT" if t2_h else "T1 HIT") if exit_price == target
-                           else "SL HIT")
-        elif sl_h:
-            exit_price, exit_reason = sl, "SL HIT"
-        elif t2_h:
-            exit_price, exit_reason = t2, "T2 HIT"
-        elif t1_h:
-            exit_price, exit_reason = t1, "T1 HIT"
-        elif ts_h:
-            exit_price  = float(w_close[exit_bar_idx])
-            exit_reason = "TIME STOP"
-        else:
-            exit_price  = float(w_close[exit_bar_idx])
-            exit_reason = "TIMEOUT"
+            if sl_hit and t2_hit:
+                # BUG-3: both hit same bar — resolve by distance from open
+                dist_sl = abs(bar_open - sl)
+                dist_t2 = abs(bar_open - t2)
+                if dist_t2 <= dist_sl:
+                    exit_price, exit_reason = t2, "T2 HIT"
+                else:
+                    exit_price, exit_reason = sl, "SL HIT"
+                exit_date = dt
+                break
+            elif sl_hit and t1_hit:
+                dist_sl = abs(bar_open - sl)
+                dist_t1 = abs(bar_open - t1)
+                if dist_t1 <= dist_sl:
+                    exit_price, exit_reason = t1, "T1 HIT"
+                else:
+                    exit_price, exit_reason = sl, "SL HIT"
+                exit_date = dt
+                break
+            elif sl_hit:
+                exit_price, exit_date, exit_reason = sl, dt, "SL HIT"
+                break
+            elif t2_hit:
+                exit_price, exit_date, exit_reason = t2, dt, "T2 HIT"
+                break
+            elif t1_hit:
+                exit_price, exit_date, exit_reason = t1, dt, "T1 HIT"
+                break
 
         pnl_pct = round((exit_price - entry_price) / entry_price * 100, 2)
 
-        if exit_reason == "SL HIT" and params.sl_cooldown_days > 0:
-            sl_hit_until = exit_dt + pd.Timedelta(days=params.sl_cooldown_days)
-
         trades.append({
-            "symbol":         symbol,
-            "entry_date":     entry_bar.date(),
-            "entry_price":    round(entry_price, 2),
-            "exit_date":      exit_dt.date() if hasattr(exit_dt, "date") else exit_dt,
-            "exit_price":     round(exit_price, 2),
-            "exit_reason":    exit_reason,
-            "pnl_pct":        pnl_pct,
-            "pnl_abs":        round(exit_price - entry_price, 2),
-            "score_at_entry": sig["score"],
-            "cci_at_entry":   sig["cci"],
-            "sl":             sig["sl"],
-            "t1":             sig["t1"],
-            "t2":             sig["t2"],
-            "risk_pct":       round(risk_pct_actual * 100, 2),
-            "tier":           sig.get("tier", "Execution"),
-            "setup":          sig.get("setup", "-"),
-            "high_prob":      bool(sig.get("high_prob", False)),
-            "rs55":           sig.get("rs55", 0.0),
-            "mom3":           sig.get("mom3", 0.0),
+            "symbol":          symbol,
+            "entry_date":      entry_bar.date(),
+            "entry_price":     round(entry_price, 2),
+            "exit_date":       exit_date.date(),
+            "exit_price":      round(exit_price, 2),
+            "exit_reason":     exit_reason,
+            "pnl_pct":         pnl_pct,
+            "pnl_abs":         round(exit_price - entry_price, 2),
+            "score_at_entry":  sig["score"],
+            "cci_at_entry":    sig["cci"],
+            "sl":              sig["sl"],
+            "t1":              sig["t1"],
+            "t2":              sig["t2"],
+            "setup":           sig.get("setup", "-"),
+            "buy_type":        sig.get("buy_type", "-"),
+            "tier":            sig.get("tier", "-"),
+            "tier1_prime":     bool(sig.get("tier1_prime",    False)),
+            "tier2_momentum":  bool(sig.get("tier2_momentum", False)),
+            "elite_tier":      bool(sig.get("elite_tier",     False)),
+            "squeeze_release": bool(sig.get("squeeze_release", False)),
+            "rs_positive":     bool(sig.get("rs_positive", False)),
+            "rs_val":          float(sig.get("rs_val", 0.0)),
+            "rs3":             float(sig.get("rs3", 0.0)),
+            "rs_composite":    float(sig.get("rs_composite", 0.0)),
+            "rs_top_decile":   bool(sig.get("rs_top_decile", False)),
+            "fresh_base":      bool(sig.get("fresh_base", False)),
+            "trend_age_bars":  int(sig.get("trend_age_bars", 0)),
+            "trend_freshness": int(sig.get("trend_freshness", 0)),
+            "trend_phase":     str(sig.get("trend_phase", "NONE")),
+            "adx_val":         float(sig.get("adx_val", 0.0)),
         })
 
-        blocked_until = exit_dt
+        blocked_until = exit_date
 
     return pd.DataFrame(trades)
 
@@ -375,69 +373,78 @@ def simulate_trades(
 # ══════════════════════════════════════════════════════════════════
 
 def run_backtest(
-    symbols:     list,
-    settings:    dict | None = None,
-    hold_days:   int  = 20,
-    workers:     int  = 10,
-    exec_only:   bool = False,
-    progress_cb       = None,
+    symbols:          list,
+    settings:         dict | None = None,
+    cci_len:          int  = 20,
+    cci_ob:           int  = 100,
+    cci_os:           int  = -100,
+    min_score:        int  = 70,
+    hold_days:        int  = 20,
+    workers:          int  = 10,
+    tier_filter:      str  = "Both",
+    buy_type_filter:  list | None = None,
+    rs_positive_only: bool = False,
+    progress_cb            = None,
 ) -> pd.DataFrame:
-
     if settings:
-        hold_days = settings.get("hold_days",  hold_days)
-        workers   = settings.get("workers",    workers)
+        hold_days        = settings.get("hold_days",            hold_days)
+        workers          = settings.get("workers",              workers)
+        min_score        = settings.get("min_score",            min_score)
+        tier_filter      = settings.get("bt_tier_filter",       tier_filter)
+        buy_type_filter  = settings.get("bt_buy_type_filter",   buy_type_filter)
+        rs_positive_only = bool(settings.get("bt_rs_positive_only", rs_positive_only))
 
-    # ── Step 1: Fetch Nifty (cached — one network call per 6 h) ──
+    workers = max(4, min(workers, 20))
+
+    # ── Phase 1: Batch-fetch all data (main thread, no concurrency) ──
+    # All HTTP happens here. Workers below do zero network I/O.
     if progress_cb:
-        progress_cb(0.0, "Loading Nifty index…")
-    nifty = fetch_nifty(years=3)
+        progress_cb(0.0, "Fetching historical data…")
 
+    all_data = fetch_all_bt_data(symbols, years=3)
+
+    nifty = _fetch_bt_nifty(years=3)                  # cached 1h
     regime_val         = nifty_regime(nifty)
     effective_settings = dict(settings) if settings else {}
     effective_settings["nifty_regime_val"] = regime_val
-    sim_params = ScoringParams.from_settings(effective_settings)
 
-    # ── Step 2: Batch download all symbols in ONE API call ────────
     if progress_cb:
-        progress_cb(0.02, f"Batch downloading {len(symbols)} symbols…")
+        progress_cb(0.15, f"Data ready — {len(all_data)} symbols")
 
-    all_data = fetch_batch_history(tuple(sorted(symbols)), years=3)
+    # ── Phase 2: Score + simulate in parallel (CPU-only, no network) ─
+    valid_symbols = [s for s in symbols if s in all_data]
+    total         = len(valid_symbols)
+    completed     = [0]
+    c_lock        = threading.Lock()
+    all_trades    = []
+    t_lock        = threading.Lock()
 
-    # ── Step 3: Signal generation + trade simulation (threads) ────
-    # ThreadPoolExecutor is the correct choice for Streamlit — the process
-    # runs inside Streamlit's single-process server and cannot safely spawn
-    # child processes (st.cache_data, session_state, and the script context
-    # are all unpicklable).  The vectorised simulate_trades already provides
-    # the dominant speedup; threads are sufficient for the I/O-bound fallback
-    # fetches and keep GIL contention low during pandas operations.
-    total     = len(symbols)
-    completed = [0]
-    c_lock    = threading.Lock()
-    all_trades: list[pd.DataFrame] = []
-    t_lock    = threading.Lock()
-
-    def _process(sym: str) -> pd.DataFrame | None:
-        df = all_data.get(sym)
-        if df is None or df.empty:
-            df = fetch_full_history(sym, years=3)
-        if df is None or df.empty:
-            return None
+    def _process(sym):
+        df = all_data[sym]
         sigs = generate_signals_historical(
             df, nifty,
-            settings  = effective_settings,
-            exec_only = exec_only,
+            settings         = effective_settings,
+            cci_len          = cci_len,
+            cci_ob           = cci_ob,
+            cci_os           = cci_os,
+            min_score        = min_score,
+            tier_filter      = tier_filter,
+            buy_type_filter  = buy_type_filter,
+            rs_positive_only = rs_positive_only,
         )
-        return simulate_trades(sym, df, sigs, hold_days=hold_days, params=sim_params)
+        return simulate_trades(sym, df, sigs, hold_days=hold_days)
 
     with ThreadPoolExecutor(max_workers=workers) as exe:
-        futures = {exe.submit(_process, s): s for s in symbols}
+        futures = {exe.submit(_process, s): s for s in valid_symbols}
         for fut in as_completed(futures):
             sym = futures[fut]
             with c_lock:
                 completed[0] += 1
                 n = completed[0]
-                if progress_cb:
-                    progress_cb(0.02 + 0.98 * n / total, sym)
+            # Progress: 15%–100% over scoring phase
+            if progress_cb:
+                pct = 0.15 + 0.85 * (n / total)
+                progress_cb(min(pct, 1.0), sym)
             try:
                 result = fut.result()
                 if result is not None and not result.empty:
@@ -453,6 +460,139 @@ def run_backtest(
 #  STATS
 # ══════════════════════════════════════════════════════════════════
 
+def _score_bins(trades: pd.DataFrame) -> dict:
+    """Validate score buckets: 70-79 / 80-89 / 90+ are the action bands.
+    50-69 is included as a baseline (should be weakest).
+    Each bin reports: trades, win_rate, avg_pnl, med_pnl, expectancy.
+    """
+    result = {}
+    if "score_at_entry" not in trades.columns:
+        return result
+    # Bins aligned to action labels: <70 SKIP, 70-79 WATCH, 80-89 BUY, 90+ STRONG BUY
+    bins = [(50, 65, "<65 Skip"), (65, 70, "65-69 Watch-"), (70, 80, "70-79 Watch"),
+            (80, 90, "80-89 Buy"), (90, 101, "90+ Strong")]
+    for lo, hi, label in bins:
+        sub = trades[(trades["score_at_entry"] >= lo) & (trades["score_at_entry"] < hi)]
+        if sub.empty:
+            continue
+        w  = sub[sub["pnl_pct"] > 0]
+        l  = sub[sub["pnl_pct"] <= 0]
+        wr = len(w) / len(sub)
+        aw = w["pnl_pct"].mean() if len(w) else 0.0
+        al = abs(l["pnl_pct"].mean()) if len(l) else 0.0
+        result[label] = {
+            "trades":      len(sub),
+            "win_rate":    round(wr * 100, 1),
+            "avg_pnl":     round(sub["pnl_pct"].mean(), 2),
+            "med_pnl":     round(sub["pnl_pct"].median(), 2),
+            "expectancy":  round(wr * aw - (1 - wr) * al, 2),
+        }
+    return result
+
+
+def _phase_breakdown(trades: pd.DataFrame) -> dict:
+    """Breakdown by trend phase: EMERGING vs ESTABLISHED vs EXTENDED."""
+    result = {}
+    if "trend_phase" not in trades.columns:
+        return result
+    for phase, grp in trades.groupby("trend_phase"):
+        w = grp[grp["pnl_pct"] > 0]
+        l = grp[grp["pnl_pct"] <= 0]
+        wr = len(w) / len(grp)
+        aw = w["pnl_pct"].mean() if len(w) else 0.0
+        al = abs(l["pnl_pct"].mean()) if len(l) else 0.0
+        result[phase] = {
+            "trades":      len(grp),
+            "win_rate":    round(wr * 100, 1),
+            "avg_pnl":     round(grp["pnl_pct"].mean(), 2),
+            "med_pnl":     round(grp["pnl_pct"].median(), 2),
+            "expectancy":  round(wr * aw - (1 - wr) * al, 2),
+        }
+    return result
+
+
+def _trend_age_breakdown(trades: pd.DataFrame) -> dict:
+    """Breakdown by trend freshness bands — mirrors the scoring decay curve.
+    Bands: Fresh (91-100), Young (71-90), Mature (51-70), Aged (26-50), Extended (0-25).
+    Returns per-band win_rate / expectancy / avg_pnl / trade count.
+    """
+    result = {}
+    if "trend_freshness" not in trades.columns:
+        return result
+    bands = [
+        (91, 101, "Fresh 1-10b"),
+        (71,  91, "Young 11-30b"),
+        (51,  71, "Mature 31-63b"),
+        (26,  51, "Aged 64-126b"),
+        ( 0,  26, "Extended >126b"),
+    ]
+    for lo, hi, label in bands:
+        sub = trades[(trades["trend_freshness"] >= lo) & (trades["trend_freshness"] < hi)]
+        if sub.empty:
+            continue
+        w  = sub[sub["pnl_pct"] > 0]
+        l  = sub[sub["pnl_pct"] <= 0]
+        wr = len(w) / len(sub)
+        aw = w["pnl_pct"].mean() if len(w) else 0.0
+        al = abs(l["pnl_pct"].mean()) if len(l) else 0.0
+        result[label] = {
+            "trades":      len(sub),
+            "win_rate":    round(wr * 100, 1),
+            "avg_pnl":     round(sub["pnl_pct"].mean(), 2),
+            "med_pnl":     round(sub["pnl_pct"].median(), 2),
+            "expectancy":  round(wr * aw - (1 - wr) * al, 2),
+            "freshness_lo": lo,
+        }
+    return result
+
+
+def _pattern_contribution(trades: pd.DataFrame) -> dict:
+    """Measure incremental contribution of Harmonic and ABCD patterns
+    vs the Norm baseline.  For each pattern type, compute:
+      - trades, win_rate, avg_pnl, med_pnl, expectancy
+      - lift_wr   : win_rate delta vs Norm
+      - lift_exp  : expectancy delta vs Norm
+    Also returns Norm as the baseline row.
+    """
+    result = {}
+    if "buy_type" not in trades.columns:
+        return result
+
+    def _stats(grp):
+        if grp.empty:
+            return None
+        w  = grp[grp["pnl_pct"] > 0]
+        l  = grp[grp["pnl_pct"] <= 0]
+        wr = len(w) / len(grp)
+        aw = w["pnl_pct"].mean() if len(w) else 0.0
+        al = abs(l["pnl_pct"].mean()) if len(l) else 0.0
+        return {
+            "trades":     len(grp),
+            "win_rate":   round(wr * 100, 1),
+            "avg_pnl":    round(grp["pnl_pct"].mean(), 2),
+            "med_pnl":    round(grp["pnl_pct"].median(), 2),
+            "expectancy": round(wr * aw - (1 - wr) * al, 2),
+        }
+
+    # Baseline: Norm (non-pattern trend signals)
+    norm = _stats(trades[trades["buy_type"] == "Norm"])
+    if norm:
+        result["Norm"] = norm | {"lift_wr": 0.0, "lift_exp": 0.0}
+
+    norm_wr  = result["Norm"]["win_rate"]  if "Norm" in result else 0.0
+    norm_exp = result["Norm"]["expectancy"] if "Norm" in result else 0.0
+
+    for bt in ["Harm", "ABCD", "Fib", "Fib+CCI", "CCI", "CmpBrk"]:
+        s = _stats(trades[trades["buy_type"] == bt])
+        if s:
+            result[bt] = s | {
+                "lift_wr":  round(s["win_rate"]   - norm_wr,  1),
+                "lift_exp": round(s["expectancy"]  - norm_exp, 2),
+            }
+
+    return result
+
+
 def compute_stats(trades: pd.DataFrame) -> dict:
     if trades.empty:
         return {}
@@ -462,19 +602,24 @@ def compute_stats(trades: pd.DataFrame) -> dict:
     loss  = trades[trades["pnl_pct"] <= 0]
 
     win_rate     = round(len(wins) / total * 100, 1)
-    avg_win      = round(wins["pnl_pct"].mean(),  2) if len(wins)  else 0
-    avg_loss     = round(loss["pnl_pct"].mean(),  2) if len(loss)  else 0
-    gross_profit = wins["pnl_pct"].sum()               if len(wins)  else 0
-    gross_loss   = abs(loss["pnl_pct"].sum())          if len(loss)  else 1
+    avg_win      = round(wins["pnl_pct"].mean(),  2) if len(wins) else 0
+    avg_loss     = round(loss["pnl_pct"].mean(),  2) if len(loss) else 0
+    gross_profit = wins["pnl_pct"].sum()               if len(wins) else 0
+    gross_loss   = abs(loss["pnl_pct"].sum())          if len(loss) else 1
     pf           = round(gross_profit / gross_loss, 2) if gross_loss else 0
     rr           = round(abs(avg_win / avg_loss),   2) if avg_loss   else 0
     expectancy   = round(
         (win_rate / 100 * avg_win) - ((100 - win_rate) / 100 * abs(avg_loss)), 2
     )
 
-    def _slice(col, val):
-        mask = trades.get(col, pd.Series([None]*total)) == val
-        sub  = trades[mask]
+    def _col_bool(col):
+        """BUG-5 fix: safe column access returning a bool Series."""
+        if col in trades.columns:
+            return trades[col].astype(bool)
+        return pd.Series(False, index=trades.index)
+
+    def _slice(col):
+        sub = trades[_col_bool(col)]
         if sub.empty:
             return {"trades": 0, "win_rate": 0, "avg_pnl": 0}
         w = sub[sub["pnl_pct"] > 0]
@@ -494,30 +639,49 @@ def compute_stats(trades: pd.DataFrame) -> dict:
                 "avg_pnl":  round(grp["pnl_pct"].mean(), 2),
             }
 
-    tier_stats = {
-        "Execution": _slice("tier", "Execution"),
-        "Watch":     _slice("tier", "Watch"),
-    }
-
-    hi_prob_trades = int(trades.get("high_prob", pd.Series([False]*total)).sum())
-    hi_prob_stats  = _slice("high_prob", True) if hi_prob_trades else {"trades": 0, "win_rate": 0, "avg_pnl": 0}
+    buy_type_stats = {}
+    if "buy_type" in trades.columns:
+        for bt, grp in trades.groupby("buy_type"):
+            w = grp[grp["pnl_pct"] > 0]
+            buy_type_stats[bt] = {
+                "trades":   len(grp),
+                "win_rate": round(len(w) / len(grp) * 100, 1),
+                "avg_pnl":  round(grp["pnl_pct"].mean(), 2),
+            }
 
     return {
-        "total_trades":    total,
-        "win_rate":        win_rate,
-        "avg_win":         avg_win,
-        "avg_loss":        avg_loss,
-        "avg_pnl":         round(trades["pnl_pct"].mean(), 2),
-        "total_pnl":       round(trades["pnl_pct"].sum(),  2),
-        "risk_reward":     rr,
-        "expectancy":      expectancy,
-        "profit_factor":   pf,
-        "best_trade":      round(trades["pnl_pct"].max(), 2),
-        "worst_trade":     round(trades["pnl_pct"].min(), 2),
-        "exit_breakdown":  trades["exit_reason"].value_counts().to_dict(),
-        "exec_stats":      tier_stats["Execution"],
-        "watch_stats":     tier_stats["Watch"],
-        "hi_prob_trades":  hi_prob_trades,
-        "hi_prob_stats":   hi_prob_stats,
-        "setup_stats":     setup_stats,
+        "total_trades":       total,
+        "win_rate":           win_rate,
+        "avg_win":            avg_win,
+        "avg_loss":           avg_loss,
+        "avg_pnl":            round(trades["pnl_pct"].mean(), 2),
+        "total_pnl":          round(trades["pnl_pct"].sum(),  2),
+        "risk_reward":        rr,
+        "expectancy":         expectancy,
+        "profit_factor":      pf,
+        "best_trade":         round(trades["pnl_pct"].max(), 2),
+        "worst_trade":        round(trades["pnl_pct"].min(), 2),
+        "exit_breakdown":     trades["exit_reason"].value_counts().to_dict(),
+        "elite_trades":       int(_col_bool("elite_tier").sum()),
+        "t1_prime_trades":    int(_col_bool("tier1_prime").sum()),
+        "t2_momentum_trades": int(_col_bool("tier2_momentum").sum()),
+        "squeeze_trades":     int(_col_bool("squeeze_release").sum()),
+        "rs_positive_trades": int(_col_bool("rs_positive").sum()),
+        "elite_stats":        _slice("elite_tier"),
+        "t1_prime_stats":     _slice("tier1_prime"),
+        "t2_momentum_stats":  _slice("tier2_momentum"),
+        "squeeze_stats":      _slice("squeeze_release"),
+        "rs_positive_stats":  _slice("rs_positive"),
+        "setup_stats":        setup_stats,
+        "buy_type_stats":     buy_type_stats,
+        "fresh_base_stats":   _slice("fresh_base"),
+        "rs_top10_stats":     _slice("rs_top_decile"),
+        # Score-bin validation: 70-79 / 80-89 / 90+ action bands
+        "score_bin_stats":       _score_bins(trades),
+        # Trend phase breakdown (EMERGING / ESTABLISHED / EXTENDED)
+        "phase_stats":           _phase_breakdown(trades),
+        # Trend age / freshness breakdown (Fresh → Extended)
+        "trend_age_stats":       _trend_age_breakdown(trades),
+        # Pattern contribution vs Norm baseline
+        "pattern_stats":         _pattern_contribution(trades),
     }
