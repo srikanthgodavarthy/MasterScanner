@@ -1,651 +1,545 @@
-"""pages/scanner.py — Two-tier Execution / Watch scanner UI."""
+"""
+pages/scanner.py — Live Scanner  (v3 — Regime Engine)
+
+Flow:
+  1. run_scanner()          → raw df from scoring_core
+  2. build_regime_context() → classify market regime (VIX + EMA slopes + Nifty)
+  3. apply_regime_layer()   → augment df with composite_score, regime_tier,
+                               execute_flag, pos_size_pct, cat_* columns
+  4. Render regime header panel
+  5. Two tabs: EXECUTE  |  WATCH
+     Each shows category score columns instead of a single Score column
+"""
+
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
 import pandas as pd
-import time
 from datetime import datetime
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo
+    _IST = ZoneInfo("Asia/Kolkata")
+    def _now_ist(): return datetime.now(_IST)
+except ImportError:
+    import pytz
+    _IST = pytz.timezone("Asia/Kolkata")
+    def _now_ist(): return datetime.now(_IST)
 
-IST = ZoneInfo("Asia/Kolkata")
-
-from utils.scanner_engine import (
-    run_scanner, nifty_regime, fetch_nifty,
-    score_color, tier_color, cci_color,
-    NIFTY500_SYMBOLS,
+from utils.scanner_engine  import run_scanner, fetch_nifty, NIFTY500_SYMBOLS
+from utils.scoring_core    import ScoringParams
+from utils.regime_engine   import (
+    build_regime_context,
+    apply_regime_layer,
+    regime_summary,
+    REGIME_WEIGHTS,
 )
-from utils.supabase_client import (
-    save_scan_snapshot, add_to_watchlist, _is_available,
-)
+from utils.supabase_client import save_scan_snapshot, load_watchlist, add_to_watchlist, _is_available
 
-# ══════════════════════════════════════════════════════════════════
-#  CSS
-# ══════════════════════════════════════════════════════════════════
+# ── CONSTANTS ─────────────────────────────────────────────────────
+REGIME_COLORS = {
+    "TREND":    ("#22c55e", "#052e16", "#166534"),
+    "RANGE":    ("#f59e0b", "#2d1d00", "#92400e"),
+    "VOLATILE": ("#ef4444", "#2d0a0a", "#991b1b"),
+}
 
+CAT_COLS = ["cat_trend", "cat_momentum", "cat_structure", "cat_volume", "cat_quality"]
+CAT_LABELS = {
+    "cat_trend":     "Trend",
+    "cat_momentum":  "Momentum",
+    "cat_structure": "Structure",
+    "cat_volume":    "Volume",
+    "cat_quality":   "Quality",
+}
+
+# ── CSS ───────────────────────────────────────────────────────────
 _CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600;700&display=swap');
-
-html, body, [class*="css"] { font-family:'Inter',sans-serif !important; font-size:13px; }
-section.main > div { padding-top:0.4rem !important; }
-
-.scanner-header {
-    display:flex; align-items:center; gap:10px;
-    padding:10px 0 6px; border-bottom:1px solid #1e293b; margin-bottom:10px;
-}
-.scanner-title {
-    font-size:16px !important; font-weight:700 !important;
-    letter-spacing:0.02em; color:#f1f5f9; margin:0 !important;
-}
-
-/* tier section headings */
-.tier-exec-head {
-    background:#052e16; border:1px solid #166534; border-radius:8px;
-    padding:8px 14px; margin-bottom:6px;
-    display:flex; align-items:center; gap:8px;
-}
-.tier-watch-head {
-    background:#1c0f00; border:1px solid #78350f; border-radius:8px;
-    padding:8px 14px; margin-bottom:6px;
-    display:flex; align-items:center; gap:8px;
-}
-
-/* score pill */
-.score-pill {
-    display:inline-block; padding:2px 8px; border-radius:12px;
-    font-size:11px; font-weight:700; font-family:'JetBrains Mono',monospace;
-    white-space:nowrap;
-}
-
-/* gate indicator bar */
-.gate-bar { display:flex; gap:3px; flex-wrap:nowrap; }
-.gate-dot {
-    width:9px; height:9px; border-radius:50%; flex-shrink:0;
-    display:inline-block;
-}
-
-/* metric cards */
-[data-testid="metric-container"] {
-    background:#0c1520; border:1px solid #1e293b;
-    border-radius:8px; padding:6px 10px !important;
-}
-[data-testid="metric-container"] label { font-size:10px !important; color:#64748b; text-transform:uppercase; }
-[data-testid="metric-container"] [data-testid="stMetricValue"] { font-size:22px !important; font-weight:600 !important; color:#f1f5f9; }
-
-/* table */
-tbody tr:hover td { background:rgba(255,255,255,0.025); }
-tbody td { padding:5px 6px !important; vertical-align:middle; }
-
-/* expanders */
-[data-testid="stExpander"] {
-    background:#080e18 !important; border:1px solid #1e293b !important;
-    border-radius:10px !important; margin-bottom:6px !important;
-}
-details > summary { padding:8px 14px !important; font-size:13px !important; font-weight:600 !important; }
-details > summary:hover { background:rgba(255,255,255,0.03) !important; }
-
-/* watchlist pills */
-.wl-pill {
-    display:inline-block; padding:3px 10px; border-radius:20px;
-    font-size:12px; font-weight:500; cursor:pointer; margin:2px 3px;
-    border:1px solid #334155; background:#0f172a; color:#94a3b8;
-}
-.wl-pill.active { background:#1e3a5f; color:#60a5fa; border-color:#3b82f6; }
-hr { margin:0.5rem 0 !important; }
-
-/* inputs */
-div[data-baseweb="select"] > div, div[data-baseweb="input"] > div {
-    min-height:32px !important; font-size:12px !important;
-    background:#0c1520 !important; border-color:#1e293b !important;
-}
-label[data-testid="stWidgetLabel"] > div { font-size:11px !important; color:#64748b !important; }
+.regime-panel { border-radius:12px; padding:14px 20px; margin-bottom:18px; position:relative; }
+.regime-badge { display:inline-block; padding:3px 14px; border-radius:5px; font-weight:800; font-size:13px; letter-spacing:1.5px; }
+.regime-weights { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+.wt-pill { display:inline-block; padding:2px 10px; border-radius:20px; font-size:11px; font-weight:600; font-family:'JetBrains Mono',monospace; }
+.cat-bar-wrap { display:flex; align-items:center; gap:6px; }
+.cat-bar-track { flex:1; height:5px; background:#1e293b; border-radius:3px; overflow:hidden; }
+.cat-bar-fill { height:100%; border-radius:3px; }
+.tier-badge { display:inline-block; padding:2px 10px; border-radius:4px; font-size:11px; font-weight:700; letter-spacing:0.8px; }
 </style>
 """
 
-# ══════════════════════════════════════════════════════════════════
-#  CELL HELPERS
-# ══════════════════════════════════════════════════════════════════
+# ── HELPERS ───────────────────────────────────────────────────────
 
-def _tv_link(sym: str) -> str:
-    """Return an HTML anchor that opens TradingView chart for the symbol."""
-    url = f"https://www.tradingview.com/chart/?symbol=NSE%3A{sym}"
-    return (
-        f'<a href="{url}" target="_blank" rel="noopener noreferrer" '
-        f'title="Open {sym} on TradingView" '
-        f'style="color:inherit;text-decoration:none;">'
-        f'<span style="font-size:10px;opacity:0.55;margin-left:3px">📈</span></a>'
-    )
-
-def _cell(val, bg, fg="#fff", fs="12px"):
-    return (f'<span style="background:{bg};color:{fg};padding:2px 6px;'
-            f'border-radius:3px;white-space:nowrap;font-size:{fs}">{val}</span>')
-
-def _score_cell(score: int) -> str:
-    bg = score_color(score)
-    return (f'<span class="score-pill" style="background:{bg}22;color:{bg};'
-            f'border:1px solid {bg}55">{score}</span>')
+def _cat_bar(value: float, color: str = "#22c55e") -> str:
+    pct = min(100, max(0, value))
+    return (f'<div class="cat-bar-wrap">'
+            f'<div class="cat-bar-track"><div class="cat-bar-fill" style="width:{pct}%;background:{color}"></div></div>'
+            f'<span style="font-size:11px;color:#94a3b8;width:28px;text-align:right">{pct:.0f}</span>'
+            f'</div>')
 
 def _tier_badge(tier: str) -> str:
-    bg, fg, bd = tier_color(tier)
-    emoji = "🔥" if tier == "Execution" else "👁"
-    return (f'<span style="background:{bg};color:{fg};border:1px solid {bd};'
-            f'padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600">'
-            f'{emoji} {tier}</span>')
+    cfg = {
+        "Elite":   ("#ffd700", "#1a1100", "#92400e", "🌟 ELITE"),
+        "Tier-1":  ("#22c55e", "#052e16", "#166534", "⚡ EXECUTE T1"),
+        "Tier-2":  ("#4ade80", "#052e16", "#166534", "⚡ EXECUTE T2"),
+        "Watch":   ("#94a3b8", "#1e293b", "#334155", "👁 WATCH"),
+        "Skip":    ("#475569", "#0f172a", "#1e293b", "⛔ SKIP"),
+    }.get(tier, ("#475569", "#0f172a", "#1e293b", tier))
+    color, bg, border, label = cfg
+    return (f'<span class="tier-badge" style="color:{color};background:{bg};border:1px solid {border}">{label}</span>')
 
-def _cci_cell(val: float) -> str:
-    color = cci_color(val)
-    return f'<span style="color:{color};font-weight:600;font-family:JetBrains Mono,monospace">{int(val)}</span>'
+def _pos_size_color(pct: float) -> str:
+    if pct >= 100: return "#22c55e"
+    if pct >= 75:  return "#4ade80"
+    if pct >= 50:  return "#f59e0b"
+    if pct >= 25:  return "#94a3b8"
+    return "#ef4444"
 
-def _gate_dots(row: dict) -> str:
-    """7 coloured dots = 7 scoring components. Green=pass, red=fail."""
-    keys = ["_gate_trend","_gate_comp","_gate_prox","_gate_rs","_gate_mom","_gate_vol","_gate_pullback"]
-    titles = ["Trend","Compress","Proximity","RS","Momentum","Volume","Pullback"]
-    dots = ""
-    for k, t in zip(keys, titles):
-        c = "#4ade80" if row.get(k) else "#374151"
-        dots += f'<span class="gate-dot" style="background:{c}" title="{t}"></span>'
-    # Anti-overext dot (hard gate)
-    c = "#4ade80" if row.get("_gate_antiext") else "#ef4444"
-    dots += f'<span class="gate-dot" style="background:{c}" title="Anti-Overext"></span>'
-    return f'<span class="gate-bar">{dots}</span>'
+def _regime_panel(summary: dict) -> str:
+    r = summary["regime"]
+    color, bg, border = REGIME_COLORS.get(r, ("#94a3b8", "#1e293b", "#334155"))
+    weights = summary["weights"]
 
-def _watch_dots(row: dict) -> str:
-    """5 condition dots for Watch."""
-    keys = ["_watch_trend","_watch_struct","_watch_mom","_watch_prox","_watch_rs"]
-    titles = ["Trend Dev","Structure","Momentum","Proximity","RS55"]
-    dots = ""
-    for k, t in zip(keys, titles):
-        c = "#fbbf24" if row.get(k) else "#374151"
-        dots += f'<span class="gate-dot" style="background:{c}" title="{t}"></span>'
-    return f'<span class="gate-bar">{dots}</span>'
+    wt_pills = "".join(
+        '<span class="wt-pill" style="background:' + color + '18;border:1px solid ' + color + '44;color:' + color + '">'
+        + k + " " + str(int(v * 100)) + "%</span>"
+        for k, v in weights.items()
+    )
 
-# Setup badge colours
-_SETUP_COLORS = {
-    "Prime Setup":      ("#052e16", "#4ade80"),
-    "Base Breakout":    ("#1e3a5f", "#60a5fa"),
-    "Fib/EMA Bounce":   ("#2e1065", "#c4b5fd"),
-    "Momentum Entry":   ("#0f172a", "#818cf8"),
-    "Execution":        ("#14532d", "#4ade80"),
-    "Rounded Base":     ("#1c0f00", "#fbbf24"),
-    "ABCD/Harmonic":    ("#0f172a", "#a5b4fc"),
-    "Tight Base":       ("#713f12", "#fcd34d"),
-    "Vol Contraction":  ("#1e1b4b", "#c7d2fe"),
-    "Developing":       ("#1e293b", "#94a3b8"),
-    "Downtrend":        ("#450a0a", "#f87171"),
-    "CCI Extended":     ("#4a1942", "#f0abfc"),
-    "Far from Pivot":   ("#422006", "#fb923c"),
-    "Overextended":     ("#7c2d12", "#fed7aa"),
-    "Low Score":        ("#1c1917", "#78716c"),
+    gate_color = "#22c55e" if r == "TREND" else "#f59e0b"
+    gate_label = "EXECUTE eligible" if r == "TREND" else "WATCH only"
+
+    ema50_html  = '<b style="color:#22c55e">▲ EMA50</b>' if summary["nifty_ema50"]  else '<b style="color:#ef4444">▼ EMA50</b>'
+    ema200_html = '&nbsp;·&nbsp; <b style="color:#22c55e">▲ EMA200</b>' if summary["nifty_ema200"] else ""
+
+    vix_val  = "{:.1f}".format(summary["vix"])
+    adx_val  = "{:.0f}".format(summary["adx"])
+    n_total  = max(1, summary.get("n_total", 1))
+    n_elite  = summary.get("n_elite", 0)
+    n_t1     = summary.get("n_tier1", 0)
+    n_t2     = summary.get("n_tier2", 0)
+    n_wa     = summary.get("n_watch", 0)
+    n_sk     = summary.get("n_skip",  0)
+    n_ex     = summary.get("n_execute", 0)
+    avg_comp = str(summary["avg_composite"])
+    avg_rs   = str(summary["avg_rs"])
+
+    # Suggestion 9: tier breakdown bar
+    def _seg(count, total, clr, lbl):
+        pct = count / total * 100
+        return (f'<div style="flex:{pct:.1f} 1 0%;min-width:2px;background:{clr};height:8px;'
+                f'border-radius:2px;margin:0 1px;" title="{lbl}: {count}"></div>')
+
+    tier_bar = (
+        '<div style="display:flex;width:100%;border-radius:4px;overflow:hidden;margin:10px 0 4px;">' +
+        _seg(n_elite, n_total, "#ffd700", "Elite") +
+        _seg(n_t1,    n_total, "#22c55e", "Tier-1") +
+        _seg(n_t2,    n_total, "#4ade80", "Tier-2") +
+        _seg(n_wa,    n_total, "#f59e0b", "Watch") +
+        _seg(n_sk,    n_total, "#1e293b", "Skip") +
+        '</div>'
+    )
+    tier_legend = (
+        '<div style="font-size:10px;color:#475569;display:flex;gap:10px;margin-bottom:6px;">' +
+        '<span style="color:#ffd700">■ Elite:' + str(n_elite) + '</span>' +
+        '<span style="color:#22c55e">■ T1:' + str(n_t1) + '</span>' +
+        '<span style="color:#4ade80">■ T2:' + str(n_t2) + '</span>' +
+        '<span style="color:#f59e0b">■ Watch:' + str(n_wa) + '</span>' +
+        '<span style="color:#475569">■ Skip:' + str(n_sk) + '</span>' +
+        '</div>'
+    )
+
+    # Market condition sentence
+    mkt_sentences = {
+        "TREND":    f"Trending market · {n_ex} execution candidates · Avg RS +{avg_rs}. Full position sizing active.",
+        "RANGE":    "Range-bound market · Execute gate restricted · Half position sizing.",
+        "VOLATILE": "Volatile market · Execute gate closed · No new positions.",
+    }
+    mkt_sentence = mkt_sentences.get(r, "")
+
+    return (
+        '<div class="regime-panel" style="background:' + bg + ';border:1px solid ' + border + '44;">'
+        + '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">'
+        + '<span class="regime-badge" style="background:' + color + '22;border:1px solid ' + color + ';color:' + color + '">' + r + '</span>'
+        + '<span style="color:#94a3b8;font-size:12px;">'
+        + 'VIX <b style="color:#e2e8f0">' + vix_val + '</b>'
+        + '&nbsp;·&nbsp; ADX <b style="color:#e2e8f0">' + adx_val + '</b>'
+        + '&nbsp;·&nbsp; Nifty ' + ema50_html
+        + ema200_html
+        + '</span>'
+        + '<span style="margin-left:auto;font-size:11px;padding:2px 10px;border-radius:4px;'
+        + 'background:' + gate_color + '18;border:1px solid ' + gate_color + '44;'
+        + 'color:' + gate_color + ';font-weight:700;">' + gate_label + '</span>'
+        + '</div>'
+        + '<div class="regime-weights">' + wt_pills + '</div>'
+        + tier_bar + tier_legend
+        + '<p style="font-size:10.5px;color:#64748b;margin:4px 0 8px;font-style:italic;">' + mkt_sentence + '</p>'
+        + '<div style="display:flex;gap:24px;margin-top:4px;">'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#ffd700">' + str(n_elite) + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">ELITE</div></div>'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#22c55e">' + str(n_ex) + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">EXECUTE</div></div>'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#f59e0b">' + str(n_wa) + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">WATCH</div></div>'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#94a3b8">' + str(n_sk) + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">SKIP</div></div>'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#818cf8">' + avg_comp + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">AVG SCORE</div></div>'
+        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#a78bfa">' + avg_rs + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">AVG RS</div></div>'
+        + '</div>'
+        + '</div>'
+    )
+
+
+# ── SUGGESTION 8: Decision view vs Detail view ────────────────────
+# Decision view (default): focused 12 columns — what you need to act
+# Detail view: all diagnostic columns
+
+_DECISION_COLS = [
+    "Stock", "Streak", "Tier", "T1Path", "Score", "TrendPhase",
+    "RS%", "Entry", "SL", "T1", "%Chg", "Size%",
+]
+_DETAIL_EXTRA = [
+    "CCI", "ADX", "EMA Slope", "Age(bars)", "Fresh%", "Base\U0001f525",
+    "RS Rank", "Top Cat", "Composite",
+    "Trend", "Momentum", "Structure", "Volume", "Quality",
+    "Buy Type", "Setup", "T2",
+]
+_RENAME_MAP = {
+    "top_category":    "Top Cat",
+    "composite_score": "Composite",
+    "RScomp":          "RS%",
+    "RS_Rank":         "RS Rank",
+    "pos_size_pct":    "Size%",
+    "cat_trend":       "Trend",
+    "cat_momentum":    "Momentum",
+    "cat_structure":   "Structure",
+    "cat_volume":      "Volume",
+    "cat_quality":     "Quality",
+    "TrendAge":        "Age(bars)",
+    "TrendFresh":      "Fresh%",
+    "FreshBase":       "Base\U0001f525",
 }
 
-def _setup_cell(setup: str) -> str:
-    bg, fg = _SETUP_COLORS.get(setup, ("#1e293b", "#94a3b8"))
-    return (f'<span style="background:{bg};color:{fg};padding:2px 6px;'
-            f'border-radius:3px;font-size:11px;font-weight:500;white-space:nowrap">{setup}</span>')
-
-# ══════════════════════════════════════════════════════════════════
-#  TABLE RENDERER
-# ══════════════════════════════════════════════════════════════════
-
-_EXEC_HEADERS = ["#","Stock","Score","Gates","Setup","CCI","RSI","Day%","Vol×","RS55","Mom3M",
-                 '<span title="% below the recent swing high (60-day). Lower = closer to breakout point.">% to Hi ⓘ</span>',
-                 "Entry","SL","T1","T2"]
-_WATCH_HEADERS = ["#","Stock","Conds","Setup","CCI","RSI","Day%","RS55","Mom3M",
-                  '<span title="% below the recent swing high (60-day). Lower = closer to breakout point.">% to Hi ⓘ</span>',
-                  "Entry","SL","T1"]
-
-def _render_exec_table(df: pd.DataFrame, watchlist_syms: set):
-    if df.empty:
-        st.caption("No Execution entries found.")
-        return
-
-    header_html = "".join(f"<th>{h}</th>" for h in _EXEC_HEADERS)
-    rows_html   = ""
-    for rank, (_, row) in enumerate(df.iterrows(), 1):
-        sym   = row.get("Stock", "")
-        score = int(row.get("Score", 0))
-        in_wl = sym in watchlist_syms
-
-        wl_star = ' <span style="color:#fbbf24">★</span>' if in_wl else ""
-        sym_html = (
-            f'<a href="https://www.tradingview.com/chart/?symbol=NSE%3A{sym}" '
-            f'target="_blank" rel="noopener noreferrer" '
-            f'style="color:#f1f5f9;text-decoration:none;font-weight:700">{sym}</a>'
-            f'{_tv_link(sym)}{wl_star}'
-        )
-
-        rows_html += (
-            f"<tr>"
-            f"<td style='color:#475569;font-size:11px'>{rank}</td>"
-            f"<td>{sym_html}</td>"
-            f"<td>{_score_cell(score)}</td>"
-            f"<td>{_gate_dots(row)}</td>"
-            f"<td>{_setup_cell(row.get('Setup',''))}</td>"
-            f"<td>{_cci_cell(row.get('CCI', 0))}</td>"
-            f"<td style='color:#94a3b8'>{row.get('RSI', 0):.1f}</td>"
-            f"<td style='color:{'#4ade80' if float(row.get('%Chg',0)) > 0 else ('#f87171' if float(row.get('%Chg',0)) < 0 else '#64748b')};font-weight:600'>"
-            f"{float(row.get('%Chg',0)):+.2f}%</td>"
-            f"<td style='color:{'#4ade80' if float(row.get('Vol Ratio',0)) >= 1.1 else '#64748b'}'>"
-            f"{float(row.get('Vol Ratio',0)):.2f}</td>"
-            f"<td style='color:{'#4ade80' if float(row.get('RS55',0)) > 0 else '#f87171'}'>"
-            f"{float(row.get('RS55',0)):+.1f}</td>"
-            f"<td style='color:{'#4ade80' if float(row.get('Mom3M',0)) > 0 else '#f87171'}'>"
-            f"{float(row.get('Mom3M',0)):+.1f}%</td>"
-            f"<td style='color:#94a3b8'>{float(row.get('% from Hi',0)):.1f}%</td>"
-            f"<td style='color:#60a5fa;font-family:JetBrains Mono,monospace'>{int(row.get('Entry',0)):,}</td>"
-            f"<td style='color:#f87171;font-family:JetBrains Mono,monospace'>{int(row.get('SL',0)):,}</td>"
-            f"<td style='color:#fbbf24;font-family:JetBrains Mono,monospace'>{int(row.get('T1',0)):,}</td>"
-            f"<td style='color:#94a3b8;font-family:JetBrains Mono,monospace'>{int(row.get('T2',0)):,}</td>"
-            f"</tr>"
-        )
-
-    table_html = (
-        f'<table style="width:100%;border-collapse:collapse;font-size:12px">'
-        f'<thead><tr style="color:#475569;font-size:10px;text-transform:uppercase;letter-spacing:0.05em">'
-        f'{header_html}</tr></thead>'
-        f'<tbody>{rows_html}</tbody></table>'
-    )
-    st.markdown(table_html, unsafe_allow_html=True)
-
-
-def _render_watch_table(df: pd.DataFrame, watchlist_syms: set):
-    if df.empty:
-        st.caption("No Watch entries found.")
-        return
-
-    header_html = "".join(f"<th>{h}</th>" for h in _WATCH_HEADERS)
-    rows_html   = ""
-    for rank, (_, row) in enumerate(df.iterrows(), 1):
-        sym   = row.get("Stock", "")
-        score = int(row.get("Score", 0))
-        in_wl = sym in watchlist_syms
-        wl_star = ' <span style="color:#fbbf24">★</span>' if in_wl else ""
-        sym_linked = (
-            f'<a href="https://www.tradingview.com/chart/?symbol=NSE%3A{sym}" '
-            f'target="_blank" rel="noopener noreferrer" '
-            f'style="color:#f1f5f9;text-decoration:none;font-weight:700">{sym}</a>'
-            f'{_tv_link(sym)}{wl_star}'
-        )
-
-        rows_html += (
-            f"<tr>"
-            f"<td style='color:#475569;font-size:11px'>{rank}</td>"
-            f"<td>{sym_linked}</td>"
-            f"<td>{_watch_dots(row)}</td>"
-            f"<td>{_setup_cell(row.get('Setup',''))}</td>"
-            f"<td>{_cci_cell(row.get('CCI', 0))}</td>"
-            f"<td style='color:#94a3b8'>{row.get('RSI', 0):.1f}</td>"
-            f"<td style='color:{'#4ade80' if float(row.get('%Chg',0)) > 0 else ('#f87171' if float(row.get('%Chg',0)) < 0 else '#64748b')};font-weight:600'>"
-            f"{float(row.get('%Chg',0)):+.2f}%</td>"
-            f"<td style='color:{'#fbbf24' if float(row.get('RS55',0)) > -2 else '#f87171'}'>"
-            f"{float(row.get('RS55',0)):+.1f}</td>"
-            f"<td style='color:{'#fbbf24' if float(row.get('Mom3M',0)) > 0 else '#94a3b8'}'>"
-            f"{float(row.get('Mom3M',0)):+.1f}%</td>"
-            f"<td style='color:#94a3b8'>{float(row.get('% from Hi',0)):.1f}%</td>"
-            f"<td style='color:#60a5fa;font-family:JetBrains Mono,monospace'>{int(row.get('Entry',0)):,}</td>"
-            f"<td style='color:#f87171;font-family:JetBrains Mono,monospace'>{int(row.get('SL',0)):,}</td>"
-            f"<td style='color:#fbbf24;font-family:JetBrains Mono,monospace'>{int(row.get('T1',0)):,}</td>"
-            f"</tr>"
-        )
-
-    table_html = (
-        f'<table style="width:100%;border-collapse:collapse;font-size:12px">'
-        f'<thead><tr style="color:#475569;font-size:10px;text-transform:uppercase;letter-spacing:0.05em">'
-        f'{header_html}</tr></thead>'
-        f'<tbody>{rows_html}</tbody></table>'
-    )
-    st.markdown(table_html, unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════════════════════════════
-#  METRICS
-# ══════════════════════════════════════════════════════════════════
-
-def _render_metrics(df: pd.DataFrame):
-    if df.empty:
-        return
-    n_exec    = int((df["Tier"] == "Execution").sum())
-    n_watch   = int((df["Tier"] == "Watch").sum())
-    n_hp      = int(df.get("_high_prob", pd.Series(False)).sum())
-    n_golden  = int(df.get("_in_golden", pd.Series(False)).sum())
-    n_cci     = int(df.get("_cci_cross", pd.Series(False)).sum())
-    avg_score = int(df[df["Tier"] == "Execution"]["Score"].mean()) if n_exec > 0 else 0
-    n_prime   = int((df["Score"] >= 85).sum()) if "Score" in df.columns else 0
-
-    cols = st.columns(7)
-    for col, (lbl, val) in zip(cols, [
-        ("🔥 Execution",   n_exec),
-        ("👁 Watch",        n_watch),
-        ("🎯 Hi Prob",      n_hp),
-        ("🌟 Golden Zone", n_golden),
-        ("📡 CCI Cross",   n_cci),
-        ("⚡ Prime (≥85)", n_prime),
-        ("📊 Avg Score",   avg_score),
-    ]):
-        col.metric(lbl, val)
-
-
-# ══════════════════════════════════════════════════════════════════
-#  SUMMARY PILL BAR
-# ══════════════════════════════════════════════════════════════════
-
-def _summary_bar(df: pd.DataFrame) -> str:
-    if df.empty:
-        return ""
-    n_exec  = int((df["Tier"] == "Execution").sum())
-    n_watch = int((df["Tier"] == "Watch").sum())
-    n_golden = int(df.get("_in_golden", pd.Series(False)).sum())
-    n_cci    = int(df.get("_cci_cross",  pd.Series(False)).sum())
-    n_abcd   = int(df.get("_abcd",       pd.Series(False)).sum())
-    n_harm   = int(df.get("_harm",       pd.Series(False)).sum())
-
-    pills = [
-        ("#052e16", "#4ade80", "#166534", f"🔥 Execution · {n_exec}"),
-        ("#1c0f00", "#fbbf24", "#78350f", f"👁 Watch · {n_watch}"),
-        ("#0f2d2d", "#2dd4bf", "#0d4444", f"🌟 Golden Zone · {n_golden}"),
-        ("#2e1065", "#c4b5fd", "#4c1d95", f"📡 CCI Cross · {n_cci}"),
-        ("#0f172a", "#818cf8", "#1e1b4b", f"🔄 ABCD · {n_abcd}"),
-        ("#0a1628", "#60a5fa", "#1e3a5f", f"🎵 Harmonic · {n_harm}"),
+def _build_display_df(df: pd.DataFrame, detail: bool = False) -> pd.DataFrame:
+    """
+    Suggestion 8: two-view display.
+    detail=False → Decision view (12 focused columns for acting on signals)
+    detail=True  → Detail view (all diagnostic columns)
+    """
+    all_cols = [
+        "Stock", "Score", "Action", "%Chg", "Entry", "SL", "T1", "T2",
+        "Buy Type", "Setup", "TrendPhase", "TrendAge", "TrendFresh", "FreshBase",
+        "RS_Rank", "RScomp", "top_category", "composite_score",
+        "pos_size_pct", "T1Path", "Streak",
+        "cat_trend", "cat_momentum", "cat_structure", "cat_volume", "cat_quality",
+        "Tier", "CCI", "ADX", "EMA Slope", "regime_tier",
     ]
-    spans = "".join(
-        f'<span style="background:{bg};color:{fg};border:1px solid {bd};'
-        f'padding:4px 12px;border-radius:20px;font-size:12px;font-weight:500;white-space:nowrap">'
-        f'{lbl}</span>'
-        for bg, fg, bd, lbl in pills
-    )
-    return (
-        '<div style="position:sticky;bottom:0;background:#050b14;'
-        'border-top:1px solid #1e293b;padding:8px 2px 6px;'
-        f'display:flex;flex-wrap:wrap;gap:6px;z-index:100">{spans}</div>'
-    )
+    present = [c for c in all_cols if c in df.columns]
+    out = df[present].copy()
+    out = out.rename(columns=_RENAME_MAP)
+
+    want = _DECISION_COLS + ([c for c in _DETAIL_EXTRA if c in out.columns] if detail else [])
+    want = [c for c in want if c in out.columns]
+    return out[want]
 
 
-# ══════════════════════════════════════════════════════════════════
-#  TIER INFO PANEL
-# ══════════════════════════════════════════════════════════════════
-
-def _tier_info_layer():
-    with st.expander("ℹ️ Tier Definitions & Scoring Logic", expanded=False):
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown(
-                '<div style="background:#052e16;border:1px solid #166534;border-radius:8px;padding:12px 14px">'
-                '<div style="color:#4ade80;font-size:13px;font-weight:700;margin-bottom:10px">🔥 EXECUTION ENTRY — Score ≥ 70</div>'
-                '<table style="font-size:11px;color:#94a3b8;width:100%;border-collapse:collapse">'
-                '<tr><th style="text-align:left;color:#475569;padding:2px 4px">Component</th>'
-                '<th style="color:#475569;padding:2px 4px">Wt</th>'
-                '<th style="text-align:left;color:#475569;padding:2px 4px">Condition</th></tr>'
-                '<tr><td style="padding:3px 4px">Trend Quality</td><td style="color:#4ade80;text-align:center">25</td><td style="padding:3px 4px">close&gt;EMA200 · EMA20↑ · EMA50↑</td></tr>'
-                '<tr><td style="padding:3px 4px">Compression</td><td style="color:#3b82f6;text-align:center">15</td><td style="padding:3px 4px">ATR5&lt;ATR20×0.9 OR range10&lt;range30×0.75 OR BB contracting</td></tr>'
-                '<tr><td style="padding:3px 4px">Breakout Proximity</td><td style="color:#f59e0b;text-align:center">15</td><td style="padding:3px 4px">0.5% &lt; dist from swing Hi ≤ 4.0%</td></tr>'
-                '<tr><td style="padding:3px 4px">Relative Strength</td><td style="color:#8b5cf6;text-align:center">15</td><td style="padding:3px 4px">RS55&gt;0 AND RS21&gt;RS21_prev</td></tr>'
-                '<tr><td style="padding:3px 4px">Momentum</td><td style="color:#06b6d4;text-align:center">15</td><td style="padding:3px 4px">RSI&gt;52 AND Mom3M&gt;5% AND (CCI&gt;0 OR rising from OS)</td></tr>'
-                '<tr><td style="padding:3px 4px">Volume Quality</td><td style="color:#f97316;text-align:center">10</td><td style="padding:3px 4px">1.1 ≤ vol/avg ≤ 2.2</td></tr>'
-                '<tr><td style="padding:3px 4px">Pullback Bonus</td><td style="color:#ec4899;text-align:center">5</td><td style="padding:3px 4px">In golden zone OR EMA20 bounce</td></tr>'
-                '</table>'
-                '<div style="margin-top:8px;padding-top:6px;border-top:1px solid #16653440;color:#64748b;font-size:10px">'
-                '⛔ Hard Gate: CCI &lt; 180 AND RSI &lt; 72 AND |price−EMA20|/EMA20 &lt; 5%</div>'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-        with c2:
-            st.markdown(
-                '<div style="background:#1c0f00;border:1px solid #78350f;border-radius:8px;padding:12px 14px">'
-                '<div style="color:#fbbf24;font-size:13px;font-weight:700;margin-bottom:10px">👁 WATCH ENTRY — All 5 conditions</div>'
-                '<div style="font-size:11px;color:#94a3b8;line-height:1.9">'
-                '<b style="color:#fbbf24">1. Trend Developing</b><br>'
-                '&nbsp;&nbsp;close &gt; EMA200 AND EMA20 rising<br>'
-                '<b style="color:#fbbf24">2. Early Structure</b><br>'
-                '&nbsp;&nbsp;rounded_bottom OR abcd_detected OR base_tight OR vol_contracting<br>'
-                '<b style="color:#fbbf24">3. Momentum Improving</b><br>'
-                '&nbsp;&nbsp;RSI &gt; 48 AND CCI rising<br>'
-                '<b style="color:#fbbf24">4. Not Yet Expanded</b><br>'
-                '&nbsp;&nbsp;pct_from_swhi between 2% and 8%<br>'
-                '<b style="color:#fbbf24">5. Avoid Weak Stocks</b><br>'
-                '&nbsp;&nbsp;RS55 &gt; −2%'
-                '</div>'
-                '<div style="margin-top:8px;padding-top:6px;border-top:1px solid #78350f40;color:#64748b;font-size:10px">'
-                'No score threshold. Stocks here often become Execution when proximity/momentum tighten.</div>'
-                '</div>',
-                unsafe_allow_html=True,
-            )
+def _build_display_df_old(df: pd.DataFrame) -> pd.DataFrame:
+    """Build a clean display DataFrame matching the required column ribbon order."""
+    # Ribbon order: Stock, Score, Action, %Chg, Entry, SL, T1, T2,
+    #               Buy Type, Setup, Top Cat, Composite, RS, Size%,
+    #               Trend, Momentum, Structure, Volume, Quality, Tier, CCI
+    cols_wanted = [
+        "Stock", "Score", "Action", "%Chg", "Entry", "SL", "T1", "T2",
+        "Buy Type", "Setup", "TrendPhase", "TrendAge", "TrendFresh", "FreshBase",
+        "RS_Rank", "RScomp", "top_category", "composite_score",
+        "pos_size_pct",
+        "cat_trend", "cat_momentum", "cat_structure", "cat_volume", "cat_quality",
+        "Tier", "CCI",
+        # keep regime_tier for tab filtering (hidden from display if not in above)
+        "regime_tier",
+    ]
+    present = [c for c in cols_wanted if c in df.columns]
+    out = df[present].copy()
+    out = out.rename(columns={
+        "top_category":    "Top Cat",
+        "composite_score": "Composite",
+        "RScomp":          "RS%",
+        "RS_Rank":         "RS Rank",
+        "pos_size_pct":    "Size%",
+        "cat_trend":       "Trend",
+        "cat_momentum":    "Momentum",
+        "cat_structure":   "Structure",
+        "cat_volume":      "Volume",
+        "cat_quality":     "Quality",
+        "TrendAge":        "Age(bars)",
+        "TrendFresh":      "Fresh%",
+        "FreshBase":       "Base🔥",
+    })
+    return out
 
 
-# ══════════════════════════════════════════════════════════════════
-#  WATCHLIST
-# ══════════════════════════════════════════════════════════════════
+# ── MAIN RENDER ───────────────────────────────────────────────────
 
-def _render_watchlist(df: pd.DataFrame, supabase_ok: bool):
-    st.markdown(
-        '<p style="font-size:12px;font-weight:600;color:#94a3b8;'
-        'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px">⭐ Watchlist</p>',
-        unsafe_allow_html=True,
-    )
-    wl      = st.session_state.get("watchlist", [])
-    wl_syms = [w["symbol"] for w in wl]
-    left, right = st.columns([3, 1])
-
-    with left:
-        if not wl_syms:
-            st.markdown('<p style="color:#334155;font-size:12px">No symbols yet.</p>', unsafe_allow_html=True)
-        else:
-            pick = st.selectbox("wl_pick", ["— none —"] + wl_syms, key="wl_pick", label_visibility="collapsed")
-            st.session_state["wl_selected"] = pick if pick != "— none —" else None
-            if pick != "— none —" and not df.empty:
-                match = df[df["Stock"] == pick]
-                if not match.empty:
-                    tier = match.iloc[0]["Tier"]
-                    if tier == "Execution":
-                        _render_exec_table(match, set(wl_syms))
-                    else:
-                        _render_watch_table(match, set(wl_syms))
-                else:
-                    st.caption(f"{pick} — not in last scan.")
-
-    with right:
-        wl_sym = st.text_input("sym_input", placeholder="e.g. RELIANCE",
-                               label_visibility="collapsed", key="wl_sym_input")
-        if st.button("＋ Add", use_container_width=True, key="wl_add_btn"):
-            if wl_sym.strip():
-                sym = wl_sym.strip().upper()
-                if supabase_ok:
-                    ok = add_to_watchlist(sym, "")
-                    st.success(f"✅ {sym} added.") if ok else st.error("❌ Supabase error.")
-                else:
-                    wl = st.session_state.setdefault("watchlist", [])
-                    if sym not in [w["symbol"] for w in wl]:
-                        wl.append({"symbol": sym, "notes": ""})
-                        st.success(f"✅ {sym}")
-                    else:
-                        st.info(f"{sym} already in list.")
-        if wl_syms:
-            rm = st.selectbox("Remove", ["—"] + wl_syms, key="wl_rm", label_visibility="collapsed")
-            if st.button("✕ Remove", use_container_width=True, key="wl_rm_btn"):
-                if rm != "—":
-                    st.session_state["watchlist"] = [
-                        w for w in st.session_state.get("watchlist", []) if w["symbol"] != rm
-                    ]
-                    st.rerun()
-
-
-# ══════════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════════
-
-def render(settings: dict) -> None:
+def render(settings: dict | None = None):
     st.markdown(_CSS, unsafe_allow_html=True)
+    settings = settings or {}
 
-    symbols      = settings.get("symbols",      NIFTY500_SYMBOLS)
-    workers      = settings.get("workers",      10)
-    auto_refresh = settings.get("auto_refresh", False)
-    refresh_secs = settings.get("refresh_mins", 5) * 60
-    supabase_ok  = _is_available()
+    supabase_ok = _is_available()
 
-    # ── HEADER ────────────────────────────────────────────────────
-    st.markdown(
-        '<div class="scanner-header">'
-        '<span style="font-size:18px">⚡</span>'
-        '<span class="scanner-title">NSE Master Scanner</span>'
-        '<span style="background:#052e16;color:#4ade80;padding:2px 8px;border-radius:20px;'
-        'font-size:11px;border:1px solid #166534;margin-left:4px">EXECUTION · WATCH · LIVE</span>'
-        f'<span style="margin-left:auto;font-size:11px;color:{"#4ade80" if supabase_ok else "#f87171"}">'
-        f'{"● Supabase" if supabase_ok else "● Offline"}</span>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    # ── CONTROL ROW ───────────────────────────────────────────────
-    c1, c2, c3, c4, c5 = st.columns([1, 1.2, 3, 1.8, 2])
-    with c1:
-        run_btn = st.button("🔍 Run Scan", type="primary", use_container_width=True)
-    with c2:
-        tier_filter = st.selectbox(
-            "tier", ["All", "🔥 Execution", "👁 Watch", "⭐ Watchlist"],
-            label_visibility="collapsed", key="scanner_tier_filter",
-        )
-    with c3:
-        search = st.text_input("search", placeholder="🔎  Search symbol…",
-                               label_visibility="collapsed", key="search_input")
-    with c4:
-        hi_prob_only = st.toggle("🎯 Hi Prob", value=False, key="hi_prob_toggle",
-                                 help="Execution + in golden zone")
-    with c5:
-        snap_label = st.text_input("snap", placeholder="Snapshot label",
-                                   label_visibility="collapsed", key="snap_input")
-
-    if auto_refresh:
-        st.info(f"🔄 Auto-refresh every {settings.get('refresh_mins', 5)} min", icon="⏱")
-
-    # ── SCAN ──────────────────────────────────────────────────────
-    if run_btn:
-        st.session_state.pop("scan_df", None)
-        st.session_state["last_auto_scan"] = time.time()
-
-    if run_btn or "scan_df" not in st.session_state:
-        prog = st.progress(0.0, text="Initialising…")
-        with st.spinner("Fetching & scoring Nifty 500…"):
-            df_raw = run_scanner(
-                symbols=symbols,
-                settings=settings,
-                max_workers=workers,
-                progress_cb=lambda p: prog.progress(p, text=f"Scanning… {int(p*100)}%"),
+    # ── Quick controls (inline expander, no sidebar) ────────────────
+    with st.expander("⚙️ Quick controls", expanded=False):
+        _qr1, _qr2, _qr3, _qr4 = st.columns(4)
+        with _qr1:
+            tier_filter = st.multiselect(
+                "Show Tiers",
+                options=["Elite", "Tier 1", "Tier 2", "Watch", "Skip"],
+                default=st.session_state.get("sidebar_tier_filter", ["Elite", "Tier 1", "Tier 2"]),
+                key="sidebar_tier_filter",
             )
-        prog.empty()
-        if df_raw.empty:
-            st.warning("No results — check symbols or data source.")
-            return
-        st.session_state["scan_df"] = df_raw
-        st.session_state["scan_ts"] = datetime.now(IST).strftime("%d %b %Y  %H:%M IST")
-        _nifty_s = fetch_nifty("1y")
-        st.session_state["last_nifty_regime"] = nifty_regime(_nifty_s)
-        st.session_state.setdefault("last_auto_scan", time.time())
-        if supabase_ok:
-            with st.spinner("Saving snapshot…"):
-                ok = save_scan_snapshot(df_raw, label=snap_label)
-            st.toast("✅ Snapshot saved." if ok else "⚠️ Supabase save failed.")
+        with _qr2:
+            _workers = st.slider("Workers", 5, 30,
+                settings.get("workers", 10), step=5, key="sb_workers")
+            st.session_state["workers"] = _workers
+        with _qr3:
+            _exec_thr = st.slider("Execute threshold", 50, 90,
+                settings.get("execute_threshold", 70), step=5, key="sb_exec_thr")
+            st.session_state["execute_threshold"] = _exec_thr
+        with _qr4:
+            show_skip = st.checkbox("Show Skip tab", value=False, key="sb_show_skip")
 
-    df = st.session_state.get("scan_df", pd.DataFrame())
-    if df.empty:
+        _qr5, _qr6, _qr7 = st.columns(3)
+        with _qr5:
+            _t1_rs = st.number_input("RS Min", -0.05, 0.20,
+                float(settings.get("t1_rs_min", 0.0)), step=0.01, format="%.2f", key="sb_t1_rs")
+            st.session_state["t1_rs_min"] = _t1_rs
+        with _qr6:
+            _t1_adx = st.number_input("ADX Min", 10, 40,
+                int(settings.get("t1_adx_min", 20)), step=1, key="sb_t1_adx")
+            st.session_state["t1_adx_min"] = _t1_adx
+        with _qr7:
+            if st.button("🗑️ Clear Cache", key="sb_clear_cache"):
+                st.cache_data.clear()
+                st.session_state.pop("scan_df", None)
+                st.success("Cache cleared.")
+
+    # ── Controls row ─────────────────────────────────────────────
+    ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1, 4])
+    with ctrl1:
+        run_btn = st.button("▶ Run Scan", use_container_width=True, key="btn_run_scan")
+    with ctrl2:
+        save_db = st.checkbox("💾 Save to DB", value=True, key="chk_save_db")
+    with ctrl3:
         st.markdown(
-            '<div style="text-align:center;padding:60px 0;color:#334155">'
-            '<div style="font-size:32px">📡</div>'
-            '<div style="font-size:14px;margin-top:8px">Press <b>Run Scan</b> to start</div>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
+            f"<div style='padding:0.55rem 0;color:#64748b;font-size:0.78rem;'>"
+            f"Universe: <b>{len(settings.get('symbols', NIFTY500_SYMBOLS))}</b> symbols"
+            f" &nbsp;·&nbsp; Execute threshold: <b>{st.session_state.get('execute_threshold', settings.get('execute_threshold', 70))}</b>"
+            f" &nbsp;·&nbsp; Workers: <b>{st.session_state.get('workers', settings.get('workers', 10))}</b></div>",
+            unsafe_allow_html=True)
+
+    # ── Run scan ─────────────────────────────────────────────────
+    if run_btn:
+        # Merge sidebar overrides
+        effective = dict(settings)
+        effective["workers"]           = st.session_state.get("workers",           settings.get("workers", 10))
+        effective["execute_threshold"] = st.session_state.get("execute_threshold", settings.get("execute_threshold", 70))
+        effective["t1_rs_min"]         = st.session_state.get("t1_rs_min",         settings.get("t1_rs_min", 0.0))
+        effective["t1_adx_min"]        = st.session_state.get("t1_adx_min",        settings.get("t1_adx_min", 20))
+
+        symbols = effective.get("symbols", NIFTY500_SYMBOLS)
+        prog    = st.progress(0, text="Fetching data…")
+
+        def _cb(pct):
+            prog.progress(min(pct, 1.0), text=f"Scanning… {int(pct*100)}%")
+
+        with st.spinner("Running scanner…"):
+            df_raw = run_scanner(
+                symbols,
+                settings         = effective,
+                cci_len          = effective.get("cci_len",  20),
+                cci_ob           = effective.get("cci_ob",  100),
+                cci_os           = effective.get("cci_os", -100),
+                max_workers      = effective.get("workers",  10),
+                progress_cb      = _cb,
+            )
+
+        prog.empty()
+
+        if df_raw.empty:
+            st.warning("No results returned. Check data connection or try fewer symbols.")
+            return
+
+        # ── Regime layer ─────────────────────────────────────────
+        with st.spinner("Classifying regime & computing composite scores…"):
+            nifty_series = fetch_nifty("1y")
+            regime_ctx   = build_regime_context(
+                nifty             = nifty_series,
+                execute_threshold = effective.get("execute_threshold", 70),
+                auto_fetch_vix    = True,
+            )
+            df_aug = apply_regime_layer(df_raw, regime_ctx)
+
+        # Suggestion 11: add persistence streak from scan history
+        try:
+            from utils.supabase_client import load_scan_history
+            from utils.scanner_engine  import add_streak_column
+            if supabase_ok:
+                _hist = load_scan_history(limit=50)
+                if not _hist.empty:
+                    df_aug = add_streak_column(df_aug, _hist.to_dict("records"), n_scans=10)
+        except Exception:
+            pass   # non-critical
+
+        st.session_state["scan_df"]      = df_aug
+        st.session_state["regime_ctx"]   = regime_ctx
+        st.session_state["scan_summary"] = regime_summary(df_aug, regime_ctx)
+        st.session_state["scan_time"]    = _now_ist().strftime("%H:%M:%S")
+
+        if supabase_ok and save_db:
+            save_scan_snapshot(df_aug)
+            st.success("✅ Saved to Supabase.")
+
+    # ── Display ──────────────────────────────────────────────────
+    df_aug    = st.session_state.get("scan_df",      pd.DataFrame())
+    summary   = st.session_state.get("scan_summary", {})
+    scan_time = st.session_state.get("scan_time",    "")
+
+    if df_aug.empty:
+        st.markdown("""
+        <div style="text-align:center;padding:4rem 2rem;color:#64748b;">
+            <div style="font-size:3rem">📡</div>
+            <div style="font-size:1.1rem;font-family:'Syne',sans-serif;margin-top:0.5rem;">No scan data</div>
+            <div style="font-size:0.8rem;margin-top:0.3rem;">Configure settings and click <b>Run Scan</b></div>
+        </div>""", unsafe_allow_html=True)
         return
 
-    ts = st.session_state.get("scan_ts", "")
-    regime = st.session_state.get("last_nifty_regime", "neutral")
-    regime_color = {"bull": "#4ade80", "bear": "#f87171", "neutral": "#fbbf24"}.get(regime, "#94a3b8")
-    st.markdown(
-        f'<p style="font-size:11px;color:#334155;margin:0 0 8px">'
-        f'Last scan: <b style="color:#64748b">{ts}</b> · {len(df)} stocks · '
-        f'Nifty regime: <b style="color:{regime_color}">{regime.upper()}</b></p>',
-        unsafe_allow_html=True,
-    )
+    # ── Regime header panel ──────────────────────────────────────
+    st.markdown(_regime_panel(summary), unsafe_allow_html=True)
+    if scan_time:
+        st.caption(f"Last scan: {scan_time} IST")
 
-    # ── METRICS ───────────────────────────────────────────────────
-    _render_metrics(df)
-    st.divider()
+    # ── Split by tier ────────────────────────────────────────────
+    # Use sidebar tier filter
+    tier_filter = st.session_state.get("sidebar_tier_filter", ["Elite", "Tier 1", "Tier 2"])
+    show_skip   = st.session_state.get("sb_show_skip", False)
 
-    # ── FILTER ────────────────────────────────────────────────────
-    fdf = df.copy()
-    if search.strip():
-        fdf = fdf[fdf["Stock"].str.contains(search.strip(), case=False, na=False)]
-    if hi_prob_only and "_high_prob" in fdf.columns:
-        fdf = fdf[fdf["_high_prob"] == True]
+    # Elite: Tier=="Elite" in scanner output
+    elite_df   = df_aug[df_aug.get("Tier", pd.Series()) == "Elite"].copy() \
+                 if "Tier" in df_aug.columns else pd.DataFrame()
 
-    df_exec  = fdf[fdf["Tier"] == "Execution"].sort_values("Score", ascending=False)
-    df_watch = fdf[fdf["Tier"] == "Watch"].sort_values("Score", ascending=False)
-    wl_syms_set = set(w["symbol"] for w in st.session_state.get("watchlist", []))
+    # Execute: execute_flag True (Tier-1 or Tier-2 from regime engine)
+    # Also include Execution acc_tier
+    execute_df = df_aug[
+        df_aug.get("execute_flag", pd.Series(False, index=df_aug.index)) &
+        (df_aug.get("Tier", pd.Series()) != "Elite")
+    ].copy() if "execute_flag" in df_aug.columns else pd.DataFrame()
 
-    # ── TIER INFO ─────────────────────────────────────────────────
-    _tier_info_layer()
+    watch_df   = df_aug[
+        ~df_aug.get("execute_flag", pd.Series(False, index=df_aug.index)) &
+        (df_aug.get("regime_tier", pd.Series()) != "Skip") &
+        (df_aug.get("Tier", pd.Series()) != "Elite")
+    ].copy() if "execute_flag" in df_aug.columns else df_aug.copy()
 
-    # ── TIER BADGE ROW ────────────────────────────────────────────
-    _tf = st.session_state.get("scanner_tier_filter", "All")
-    badges = []
-    if _tf in ("All", "🔥 Execution"):
-        badges.append(
-            f'<span style="background:#052e16;color:#4ade80;border:1px solid #166534;'
-            f'padding:3px 12px;border-radius:12px;font-size:11px;font-weight:600">🔥 Execution · {len(df_exec)}</span>'
-        )
-    if _tf in ("All", "👁 Watch"):
-        badges.append(
-            f'<span style="background:#1c0f00;color:#fbbf24;border:1px solid #78350f;'
-            f'padding:3px 12px;border-radius:12px;font-size:11px;font-weight:600">👁 Watch · {len(df_watch)}</span>'
-        )
-    if badges:
-        st.markdown(f'<div style="margin-bottom:8px;display:flex;gap:6px">{"".join(badges)}</div>',
-                    unsafe_allow_html=True)
+    skip_df    = df_aug[df_aug.get("regime_tier", pd.Series()) == "Skip"].copy() \
+                 if "regime_tier" in df_aug.columns else pd.DataFrame()
 
-    # ── EXECUTION SECTION ─────────────────────────────────────────
-    if _tf in ("All", "🔥 Execution"):
-        with st.expander(f"🔥 Execution Entries  ·  {len(df_exec)}", expanded=True):
-            st.markdown(
-                '<p style="font-size:11px;color:#475569;margin:0 0 8px">'
-                'Score ≥ 70/100 across 7 weighted components · Anti-overextension hard gate cleared · '
-                'Gate dots: Trend · Compress · Proximity · RS · Momentum · Volume · Pullback · AntiExt</p>',
-                unsafe_allow_html=True,
+    # ── Tabs ─────────────────────────────────────────────────────
+    n_elite = len(elite_df)
+    n_ex    = len(execute_df)
+    n_watch = len(watch_df)
+    n_skip  = len(skip_df)
+
+    tab_labels = [f"🌟 ELITE ({n_elite})", f"⚡ EXECUTE ({n_ex})", f"👁 WATCH ({n_watch})"]
+    df_sets    = [elite_df, execute_df, watch_df]
+    set_labels = ["ELITE", "EXECUTE", "WATCH"]
+    if show_skip:
+        tab_labels.append(f"⛔ SKIP ({n_skip})")
+        df_sets.append(skip_df)
+        set_labels.append("SKIP")
+
+    tabs = st.tabs(tab_labels)
+
+    for tab, df_subset, label in zip(tabs, df_sets, set_labels):
+        with tab:
+            if df_subset.empty:
+                if label == "EXECUTE" and summary.get("regime") != "TREND":
+                    st.info(f"⛔ Execute gate blocked — regime is {summary.get('regime', '?')} (TREND required)")
+                else:
+                    st.info(f"No {label} candidates.")
+                continue
+
+            # Suggestion 8: decision/detail toggle per tab
+            _show_detail = st.toggle("Detail view", value=False, key=f"detail_{label}")
+            disp = _build_display_df(df_subset, detail=_show_detail)
+            if "regime_tier" in disp.columns:
+                disp = disp.drop(columns=["regime_tier"])
+
+            # ── Category score columns styled ────────────────────
+            cat_display_cols = ["Trend", "Momentum", "Structure", "Volume", "Quality"]
+            format_dict = {c: "{:.0f}" for c in cat_display_cols if c in disp.columns}
+            format_dict.update({
+                "Composite": "{:.1f}", "Size%": "{:.0f}", "%Chg": "{:.2f}",
+                "Entry": "{:.2f}", "SL": "{:.2f}", "T1": "{:.2f}", "T2": "{:.2f}", "T3": "{:.2f}",
+                "RS%": "{:.1f}", "RS Rank": "{:.0f}",
+            })
+
+            def _color_score(val):
+                try:
+                    v = float(val)
+                    if v >= 70: return "color:#22c55e;font-weight:700"
+                    if v >= 50: return "color:#f59e0b"
+                    return "color:#ef4444"
+                except: return ""
+
+            def _color_chg(val):
+                try:
+                    v = float(val)
+                    return "color:#22c55e;font-weight:600" if v > 0 else ("color:#ef4444;font-weight:600" if v < 0 else "")
+                except: return ""
+
+            def _color_rs_rank(val):
+                try:
+                    v = float(val)
+                    if v >= 90: return "color:#ffd700;font-weight:800"   # gold = top decile
+                    if v >= 75: return "color:#22c55e;font-weight:600"
+                    if v >= 50: return "color:#94a3b8"
+                    return "color:#ef4444"
+                except: return ""
+
+            style_subset_score = [c for c in cat_display_cols + ["Composite"] if c in disp.columns]
+            styled = disp.style.map(_color_score, subset=style_subset_score)
+            if "RS Rank" in disp.columns:
+                styled = styled.map(_color_rs_rank, subset=["RS Rank"])
+            if "%Chg" in disp.columns:
+                styled = styled.map(_color_chg, subset=["%Chg"])
+            styled = (
+                styled
+                .set_properties(**{
+                    "font-family": "'JetBrains Mono',monospace",
+                    "font-size":   "0.78rem",
+                    "text-align":  "center",
+                    "background-color": "#111827",
+                    "color":       "#e2e8f0",
+                })
+                .set_table_styles([{"selector": "th", "props": [
+                    ("background-color", "#0f1e3d"),
+                    ("color", "#93c5fd"),
+                    ("font-size", "0.72rem"),
+                    ("text-transform", "uppercase"),
+                ]}])
+                .format(format_dict, na_rep="—")
             )
-            _render_exec_table(df_exec, wl_syms_set)
 
-    # ── WATCH SECTION ─────────────────────────────────────────────
-    if _tf in ("All", "👁 Watch"):
-        with st.expander(f"👁 Watch Entries  ·  {len(df_watch)}", expanded=(_tf == "👁 Watch")):
-            st.markdown(
-                '<p style="font-size:11px;color:#475569;margin:0 0 8px">'
-                'All 5 structural conditions met — not yet at Execution threshold. '
-                'Condition dots: Trend Dev · Structure · Momentum · Proximity · RS55</p>',
-                unsafe_allow_html=True,
+            st.dataframe(styled, use_container_width=True, height=500, hide_index=False)
+
+            # ── Watchlist add ─────────────────────────────────────
+            if supabase_ok and label in ("EXECUTE", "WATCH"):
+                with st.expander("➕ Add to Watchlist"):
+                    syms_in_view = df_subset["Stock"].tolist() if "Stock" in df_subset.columns else []
+                    sel = st.multiselect("Select symbols", syms_in_view, key=f"wl_sel_{label}")
+                    note = st.text_input("Note (optional)", key=f"wl_note_{label}")
+                    if st.button("Add to Watchlist", key=f"wl_add_{label}"):
+                        for s in sel:
+                            add_to_watchlist(s, note)
+                        st.success(f"Added {len(sel)} symbols to watchlist.")
+
+            # ── Download ─────────────────────────────────────────
+            csv = df_subset.to_csv(index=False)
+            st.download_button(
+                f"⬇️ Download {label} CSV", data=csv,
+                file_name=f"scan_{label.lower()}_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv", key=f"dl_{label}"
             )
-            _render_watch_table(df_watch, wl_syms_set)
-
-    # ── SUMMARY PILL BAR ──────────────────────────────────────────
-    st.markdown(_summary_bar(df), unsafe_allow_html=True)
-    st.divider()
-
-    # ── WATCHLIST ─────────────────────────────────────────────────
-    if _tf in ("All", "⭐ Watchlist"):
-        _render_watchlist(df, supabase_ok)
-        st.divider()
-
-    # ── CSV DOWNLOAD ──────────────────────────────────────────────
-    csv   = fdf.drop(columns=[c for c in fdf.columns if c.startswith("_")], errors="ignore")
-    fname = f"scan_{ts.replace(':','-').replace(' ','_')}.csv" if ts else "scan.csv"
-    st.download_button("⬇️ Download CSV", data=csv.to_csv(index=False),
-                       file_name=fname, mime="text/csv")
-
-    # ── AUTO-REFRESH ──────────────────────────────────────────────
-    if auto_refresh and "scan_df" in st.session_state:
-        last      = st.session_state.get("last_auto_scan", time.time())
-        remaining = max(0, int(refresh_secs - (time.time() - last)))
-        box       = st.empty()
-        if remaining > 0:
-            box.caption(f"🔄 Refresh in {remaining // 60}m {remaining % 60:02d}s")
-            time.sleep(1)
-            st.rerun()
-        else:
-            st.session_state.pop("scan_df", None)
-            st.session_state["last_auto_scan"] = time.time()
-            st.rerun()
