@@ -232,6 +232,7 @@ class RegimeContext:
     nifty_mom6:         float   # Nifty 6-month momentum %
     category_weights:   dict
     execute_threshold:  float = 70.0   # FIX 5: raised from 60 → 70
+    force_execute:      bool  = False  # bypass TREND-only gate (user setting)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -348,12 +349,16 @@ def compute_composite(
 #  Skip   : everything else
 # ══════════════════════════════════════════════════════════════════
 
-def _classify_tier(row: dict, regime: str, composite: float, threshold: float) -> str:
+def _classify_tier(row: dict, regime: str, composite: float, threshold: float,
+                   force_execute: bool = False) -> str:
     is_elite = bool(row.get("_elite_tier",    False))
     is_t1    = bool(row.get("_tier1_prime",   False))
     is_t2    = bool(row.get("_tier2_momentum",False)) or bool(row.get("_any_buy", False))
 
-    if regime == "TREND":
+    # Execute gate: normally TREND only; force_execute bypasses regime requirement
+    gate_open = (regime == "TREND") or force_execute
+
+    if gate_open:
         if is_elite and composite >= threshold:
             return "Elite"
         if is_t1 and composite >= threshold:
@@ -490,8 +495,9 @@ def build_regime_context(
     nifty:             pd.Series,
     vix:               Optional[float] = None,
     adx:               Optional[float] = None,
-    execute_threshold: float = 70.0,   # FIX 5: raised from 60
+    execute_threshold: float = 70.0,
     auto_fetch_vix:    bool  = True,
+    force_execute:     bool  = False,   # bypass TREND-only Execute gate
 ) -> RegimeContext:
     """
     Build RegimeContext used for the entire scan run.
@@ -502,6 +508,7 @@ def build_regime_context(
     vix               : India VIX. Auto-fetched if None and auto_fetch_vix=True.
     adx               : Nifty ADX. EMA slope proxy used if None.
     execute_threshold : Composite score cutoff for EXECUTE. Default 70.
+    force_execute     : If True, Execute gate opens even in RANGE/VOLATILE regimes.
     """
     if vix is None and auto_fetch_vix:
         vix = fetch_india_vix()
@@ -519,6 +526,7 @@ def build_regime_context(
         nifty_mom6         = nifty_mom6,
         category_weights   = REGIME_WEIGHTS[regime],
         execute_threshold  = execute_threshold,
+        force_execute      = force_execute,
     )
 
 
@@ -561,7 +569,8 @@ def apply_regime_layer(
         rs_score                  = _compute_rs_score(rd, ctx)
         cat_scores, _, composite  = compute_composite(rd, ctx.regime, ctx)
 
-        tier         = _classify_tier(rd, ctx.regime, composite, ctx.execute_threshold)
+        tier         = _classify_tier(rd, ctx.regime, composite, ctx.execute_threshold,
+                                      force_execute=ctx.force_execute)
         execute_flag = tier in ("Elite", "Tier-1", "Tier-2")
         ps_mult      = position_size_multiplier(ctx.regime, composite)
         top_cat      = max(cat_scores, key=cat_scores.get)
