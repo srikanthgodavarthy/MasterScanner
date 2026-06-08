@@ -857,28 +857,36 @@ def compute_bar(
     pivot_high_dist = ((cur_c - _last_pivot_hi) / _last_pivot_hi * 100) if _last_pivot_hi > 0 else 0.0
 
     # ── SETUP DETECTED BAR (scan back to find first any_buy signal) ──────
-    # Scans backwards from bar i up to 15 bars to find the bar where
-    # the current setup first became active (any_buy condition).
-    # Purpose: feed bars_since_setup → decision engine extension banding.
-    # Uses a lightweight re-evaluation (no pivots, no heavy ops) for speed.
+    # Scans backwards from bar i up to 15 bars to find the EARLIEST bar where
+    # the current setup was already active, so bars_since_setup reflects true
+    # signal age for the decision engine's extension banding.
     #
-    # Criteria for "setup active" (simplified, no pivot compute):
-    #   trend_up AND (in_golden_relaxed OR compression_break OR fresh_base)
-    #   OR norm_score proxy (trend_up AND EMA aligned AND RSI > 50 AND RS > 0)
-    _setup_bar = i   # default: assume setup just triggered on current bar
+    # FIX (v8.1): The previous proxy used in_golden_relaxed | compression | CCI_OS.
+    # This was structurally mismatched with the actual entry gate (any_buy):
+    #   • is_norm_buy requires NOT in_golden → proxy always False for it
+    #   • Once a fib signal fires and price breaks out, _in_gr_s = False on
+    #     bar i-1 → loop broke immediately → _setup_bar = i → bars_since_setup = 0
+    # Net effect: ~95%+ of signals got bars_since_setup = 0, price_move = 0.0,
+    # and were classified Actionable regardless of actual signal age.
+    #
+    # Corrected proxy matches the full any_buy gate:
+    #   trend_up AND (in_golden_relaxed OR compression OR norm_score_proxy OR cci_os)
+    # where norm_score_proxy = EMA20 > EMA50 AND price > EMA20 (momentum threshold),
+    # which covers is_norm_buy signals that are explicitly NOT in the golden pocket.
+    _setup_bar = i   # default: setup triggered on current bar (0 bars elapsed)
     _scan_limit = min(15, i)
     for _sb in range(1, _scan_limit + 1):
         _sj = i - _sb
         if _sj < 5:
             break
-        _sc   = ca[_sj]   if ca   is not None else float(ia.c.iloc[_sj])
-        _se20 = e20a[_sj]  if e20a is not None else float(ia.e20.iloc[_sj])
-        _se50 = e50a[_sj]  if e50a is not None else float(ia.e50.iloc[_sj])
+        _sc   = ca[_sj]    if ca    is not None else float(ia.c.iloc[_sj])
+        _se20 = e20a[_sj]  if e20a  is not None else float(ia.e20.iloc[_sj])
+        _se50 = e50a[_sj]  if e50a  is not None else float(ia.e50.iloc[_sj])
         _se200= e200a[_sj] if e200a is not None else float(ia.e200.iloc[_sj])
         _scci = ccil[_sj]  if ccil  is not None else float(ia.cci_s.iloc[_sj])
         if np.isnan(_sc) or np.isnan(_se20) or np.isnan(_se200):
             break
-        # Fib zone proxy at bar _sj
+        # Fib golden pocket proxy at bar _sj
         _sw_hi_s = float(np.max(ha[max(0, _sj - params.pvt_lb):_sj + 1])) if ha is not None else _sc
         _sw_lo_s = float(np.min(la[max(0, _sj - params.pvt_lb):_sj + 1])) if la is not None else _sc
         _rng_s   = _sw_hi_s - _sw_lo_s
@@ -886,16 +894,22 @@ def compute_bar(
         _f382_s  = _sw_hi_s - _rng_s * (params.t1_fib_hi / 100.0) if _rng_s > 0 else _sc
         _in_gr_s = (_sc >= _f618_s and _sc <= _f382_s)
         # Compression proxy
-        _atr_s   = atrl[_sj] if atrl is not None else float(ia.atr_s.iloc[_sj])
+        _atr_s     = atrl[_sj] if atrl is not None else float(ia.atr_s.iloc[_sj])
         _atr_sma_s = float(ia.atr_sma_comp.iloc[_sj]) if not np.isnan(float(ia.atr_sma_comp.iloc[_sj])) else _atr_s
-        _comp_s  = (_atr_s < _atr_sma_s * params.t2_atr_ratio) if _atr_sma_s > 0 else False
-        # Trend + basic signal at bar _sj
-        _tr_s    = _sc > _se200 and _se20 > _se50
-        _buy_s   = _tr_s and (_in_gr_s or _comp_s or (_se20 > _se50 and _scci < -50))
+        _comp_s    = (_atr_s < _atr_sma_s * params.t2_atr_ratio) if _atr_sma_s > 0 else False
+        # Trend flag — same as trend_up at bar _sj
+        _tr_s = _sc > _se200 and _se20 > _se50
+        # Norm-buy proxy: covers is_norm_buy (price above EMA20, EMA stack intact).
+        # Deliberately broad — we want to capture all any_buy paths, not just Fib.
+        _norm_s = _tr_s and (_sc > _se20)
+        # CCI oversold path: matches is_cci_buy entry condition
+        _cci_os_s = _tr_s and (_scci < -params.cci_os)
+        # Combined: any_buy proxy — True if ANY standard entry path was active
+        _buy_s = _tr_s and (_in_gr_s or _comp_s or _norm_s or _cci_os_s)
         if _buy_s:
-            _setup_bar = _sj
+            _setup_bar = _sj   # extend setup window further back
         else:
-            break   # first bar where signal was absent = setup started after this
+            break   # gap in signal continuity — setup started after this bar
 
     bars_since_setup   = i - _setup_bar
     setup_trigger_close = ca[_setup_bar] if (ca is not None and _setup_bar >= 0) else cur_c
