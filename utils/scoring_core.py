@@ -22,6 +22,19 @@ v3 changes:
   - ScoringParams gains: t1_rs_min, t1_adx_min, t1_use_adx (use ADX vs EMA slope).
   - BarResult gains: adx, rs_val, ema20_slope flags for display / backtest filter.
   - Speed: CCI vectorised in build_indicators; _get_pivots gated by quick pre-check.
+
+v8.1 changes (factor attribution rebalance — empirical, backtest-driven):
+  - RS score: rs_top_decile bonus removed (p=0.644, zero edge); breakpoints tightened to
+    composite-only thresholds (max 40→30). Sweet-spot 0.05-0.15 earns 20-25pts.
+  - Trend Age: trend_freshness score contribution replaced with direct trend_age_bars gate.
+    21-50 bar sweet-spot gets +20pts (was +5 via freshness); >100 bars gets -10pts.
+  - ADX: bonus raised at >=40 level (15→20). ADX 25-30 dead zone reduced to 5pts.
+  - CCI: OS pullback bonus raised (15→20). CCI <0 penalty reduced (5→8 for pull).
+  - Squeeze: boost pts reduced (5→2); from_settings default reduced (15→2). Backtest: PF 0.69.
+  - Tier-1 gate: rs_positive (5-bar noise) replaced with rs_composite >= 0.05.
+    Root cause: rs_positive=False group had rs_composite mean=0.141, PF 1.42.
+    5-bar RS flags pullback entries as 'RS negative' — exactly the entries we want.
+  - max_score raised 250→265 to absorb new weight budget.
 """
 
 from __future__ import annotations
@@ -62,8 +75,10 @@ class ScoringParams:
     t1_cloud: bool = True      # if False, trend_structure ignores cloud
 
     # Tier 1 — squeeze boost
+    # [WEIGHT CHANGE v8.1] Reduced: Squeeze Release PF=0.69, Exp=-1.30% in backtest.
+    # Release gets minimal 2pts (not a positive edge). No-squeeze: 0 (neutral).
     t1_squeeze_boost:    bool  = True
-    t1_squeeze_pts:      int   = 5   # points on release
+    t1_squeeze_pts:      int   = 2   # [v8.1] was 5; backtest shows negative edge
     t1_no_squeeze_pts:   int   = 0   # points when not in squeeze
 
     # Tier 1 — persistent_strength score weight
@@ -88,8 +103,9 @@ class ScoringParams:
     nifty_regime_filter: bool = False
     nifty_regime_val:    str  = "neutral"   # "bull" | "bear" | "neutral"
 
-    # Score normalisation
-    max_score: int = 250
+    # Score normalisation — [WEIGHT CHANGE v8.1] raised 250→265 to absorb new weight budget.
+    # RS: -10, trend_age: +5, ADX: +5, CCI_OS: +5 net change in raw max = +5 total.
+    max_score: int = 265
 
     @classmethod
     def from_settings(cls, s: dict) -> "ScoringParams":
@@ -107,8 +123,8 @@ class ScoringParams:
             t1_cci_window    = int(s.get("t1_cci_window",        5)),
             t1_cloud         = bool(s.get("t1_cloud",           True)),
             t1_squeeze_boost = bool(s.get("t1_squeeze_boost",   True)),
-            t1_squeeze_pts   = int(s.get("t1_squeeze_pts",      15)),
-            t1_no_squeeze_pts= int(s.get("t1_no_squeeze_pts",    5)),
+            t1_squeeze_pts   = int(s.get("t1_squeeze_pts",       2)),   # [v8.1] was 15
+            t1_no_squeeze_pts= int(s.get("t1_no_squeeze_pts",    0)),   # [v8.1] was 5
             t1_ps_weight     = int(s.get("t1_ps_weight",        20)),
             t1_ps_penalty    = int(s.get("t1_ps_penalty",      -10)),
             t1_rs_min        = float(s.get("t1_rs_min",          0.0)),
@@ -974,36 +990,50 @@ def compute_bar(
     score += (5 if cur_c > hh * 0.98 and cur_c < hh * 1.01 else 0)  # near high, not breakout
     # Removed: score += 10 if cur_c > close[i-2]*1.01 (2-bar momentum — too noisy)
 
-    # RS score: composite multi-TF RS, not just 1-week gate
-    # Top decile leader gets full 40pts; negative RS penalised
+    # RS score: composite multi-TF RS only — rs_top_decile removed (p=0.644, zero edge).
+    # Breakpoints tightened to match empirical sweet-spot (rs_composite 0.05–0.15 = best zone).
+    # Strong RS (>0.15) earns full 30pts; weak RS (0–0.05) earns only 5pts; negative penalised.
+    # [WEIGHT CHANGE v8.1] Max RS contribution reduced 40→30; low-RS bonus compressed.
     score += (
-        40 if rs_top_decile else
-        30 if rs_composite > 0.04 else
-        20 if rs_composite > 0.02 else
-        10 if rs_composite > 0.00 else
+        30 if rs_composite > 0.15 else
+        25 if rs_composite > 0.10 else
+        20 if rs_composite > 0.05 else
+        5  if rs_composite > 0.00 else
         -10 if rs_composite < -0.03 else 0
     )
     # Fresh base breakout bonus — stage-2 entries earn extra points
     score += 15 if fresh_base_breakout else 0
 
-    # Trend Freshness bonus — rewards early-stage trends, penalises crowded ones
-    # Maps the 0-100 freshness score into a -10 to +15 score contribution.
-    # Breakpoints mirror the freshness bands defined above.
-    if trend_freshness >= 91:       score += 15   # brand-new cross (1-10 bars)
-    elif trend_freshness >= 71:     score += 10   # young trend (11-30 bars)
-    elif trend_freshness >= 51:     score +=  5   # mature (31-63 bars)
-    elif trend_freshness >= 26:     score +=  0   # aged (64-126 bars) — neutral
-    elif trend_freshness >= 1:      score -=  5   # extended (>126 bars)
-    # trend_freshness == 0 (no uptrend) — no change
+    # Trend Age bonus — direct gate on trend_age_bars replacing freshness proxy.
+    # [WEIGHT CHANGE v8.1] Empirical sweet-spot is 21–50 bars (Exp +1.41%, p=0.0003).
+    # Bands:
+    #   1–5 bars   :  -5  — too early; no momentum confirmation yet (PF 0.81)
+    #   6–20 bars  :  +5  — young trend, acceptable (PF 1.14)
+    #   21–50 bars : +20  — sweet spot; peak edge (PF 1.45, WR 51%)
+    #   51–100 bars:   0  — aged, edge fades (PF 0.81)
+    #   >100 bars  : -10  — crowded/extended, mean-reversion risk (PF 0.72)
+    # trend_age_bars == 0 (no trend) — no change
+    if   trend_age_bars == 0:       score +=  0
+    elif trend_age_bars <= 5:       score -=  5   # too early
+    elif trend_age_bars <= 20:      score +=  5   # young
+    elif trend_age_bars <= 50:      score += 20   # sweet spot
+    elif trend_age_bars <= 100:     score +=  0   # aged — neutral
+    else:                           score -= 10   # extended
     score += 15 if in_golden    else 0
     score += -20 if near_ext127 else (-30 if near_ext161 else 0)
     score += (20 if mom3 > 20 and mom6 > 20 else 10 if mom3 > 10 and mom6 > 10 else 5  if mom3 > 5 and mom6 > 5 else 0)
 
-    # ADX / EMA slope strength bonus (NEW)
-    score += 15 if cur_adx > 25 else (8 if cur_adx > params.t1_adx_min else 0)
+    # ADX strength bonus — [WEIGHT CHANGE v8.1]
+    # ADX >= 40: raised 15->20 (PF 1.41, WR 51.6%). ADX 25-30: 5pts only (PF 0.91 dead zone).
+    score += (20 if cur_adx >= 40 else
+              12 if cur_adx >  30 else
+               5 if cur_adx >  25 else 0)
     score += 10 if ema20_slope > 0.3 else (5 if ema20_slope > 0 else 0)
 
-    score += 15 if cur_cci < params.cci_os else 5 if cur_cci < 0 else -15 if cci_extended else 0
+    # CCI state bonus — [WEIGHT CHANGE v8.1]
+    # Sweet-spot is CCI 50-150 (PF 1.17). Raised OS bonus (pullback entry) +15.
+    # CCI < 0 is a mild negative (PF 0.87); extended stays penalised at -15.
+    score += 20 if cur_cci < params.cci_os else 8 if cur_cci < 0 else -15 if cci_extended else 0
 
     # Harmonic/ABCD: halved weight — unvalidated edge, pullback-only
     # Keep signal value but reduce score inflation
@@ -1108,9 +1138,13 @@ def compute_bar(
         )
     )
 
+    # [WEIGHT CHANGE v8.1] rs_positive replaced with rs_composite >= 0.05 in Tier-1 gate.
+    # Root cause: rs_positive used 5-bar (1-week) RS — too noisy for pullback entries.
+    # rs_positive=False group had rs_composite mean=0.141 (strong RS, PF 1.42 in backtest).
+    # Fix: require composite RS > 5% excess — meaningful multi-TF confirmation.
     is_tier1_prime = (
         _tier1_base and
-        rs_positive and
+        rs_composite >= 0.05 and       # [v8.1] was: rs_positive (5-bar noise)
         (strength_ok or (fresh_base_breakout and strength_ok_breakout)) and
         nifty_allows
     )
@@ -1202,15 +1236,15 @@ def compute_bar(
         "rsi":              (25 if cur_r > 60 else 20 if cur_r > 55 else 15 if cur_r > 50 else 5 if cur_r > 45 else 0),
         "volume":           (30 if cur_v > cur_vavg * 2.0 else 20 if cur_v > cur_vavg * 1.5 else 10 if cur_v > cur_vavg * 1.2 else 0),
         "near_high":        (5 if cur_c > hh * 0.98 and cur_c < hh * 1.01 else 0),
-        "rs_composite":     (40 if rs_top_decile else 30 if rs_composite > 0.04 else 20 if rs_composite > 0.02 else 10 if rs_composite > 0.00 else -10 if rs_composite < -0.03 else 0),
+        "rs_composite":     (30 if rs_composite > 0.15 else 25 if rs_composite > 0.10 else 20 if rs_composite > 0.05 else 5 if rs_composite > 0.00 else -10 if rs_composite < -0.03 else 0),  # [v8.1]
         "fresh_base":       15 if fresh_base_breakout else 0,
-        "trend_freshness":  (15 if trend_freshness >= 91 else 10 if trend_freshness >= 71 else 5 if trend_freshness >= 51 else 0 if trend_freshness >= 26 else -5 if trend_freshness >= 1 else 0),
+        "trend_age":        (-5 if trend_age_bars == 0 or trend_age_bars <= 5 else 5 if trend_age_bars <= 20 else 20 if trend_age_bars <= 50 else 0 if trend_age_bars <= 100 else -10),  # [v8.1] was trend_freshness
         "in_golden":        15 if in_golden else 0,
         "fib_ext_penalty":  (-20 if near_ext127 else -30 if near_ext161 else 0),
         "momentum":         (20 if mom3 > 20 and mom6 > 20 else 10 if mom3 > 10 and mom6 > 10 else 5 if mom3 > 5 and mom6 > 5 else 0),
-        "adx_bonus":        (15 if cur_adx > 25 else 8 if cur_adx > params.t1_adx_min else 0),
+        "adx_bonus":        (20 if cur_adx >= 40 else 12 if cur_adx > 30 else 5 if cur_adx > 25 else 0),  # [v8.1]
         "ema_slope_bonus":  (10 if ema20_slope > 0.3 else 5 if ema20_slope > 0 else 0),
-        "cci_state":        (15 if cur_cci < params.cci_os else 5 if cur_cci < 0 else -15 if cci_extended else 0),
+        "cci_state":        (20 if cur_cci < params.cci_os else 8 if cur_cci < 0 else -15 if cci_extended else 0),  # [v8.1]
         "harmonic":         10 if harm_bull else 0,
         "abcd":             8 if abcd_bull else 0,
         "below_cloud":      -15 if below_cloud else 0,
