@@ -235,6 +235,17 @@ def generate_signals_historical(
                 "Late"       if r.bars_since_setup <= 7 else
                 "Extended"
             ),
+            # ── ATR-normalised extension (v9 PRIMARY) ─────────────────
+            "atr_at_setup":       r.atr_at_setup,
+            "extension_atr":      r.extension_atr,
+            "extension_score_atr":r.extension_score_atr,
+            "atr_band":           r.atr_band,           # primary freshness label
+            # pct_band: percentage-based classification for comparison report
+            "pct_band":           (
+                "Actionable" if r.price_move_since_setup <= 2.0 else
+                "Late"       if r.price_move_since_setup <= 6.5 else
+                "Extended"
+            ),
         })
 
     return pd.DataFrame(signals)
@@ -379,6 +390,12 @@ def simulate_trades(
             "price_move_since_setup": float(sig.get("price_move_since_setup", 0.0)),
             "bars_since_setup":       int(sig.get("bars_since_setup",         0)),
             "bars_band":              str(sig.get("bars_band",                "Actionable")),
+            # ATR-normalised extension (v9)
+            "atr_at_setup":           float(sig.get("atr_at_setup",          0.0)),
+            "extension_atr":          float(sig.get("extension_atr",         0.0)),
+            "extension_score_atr":    int(sig.get("extension_score_atr",     0)),
+            "atr_band":               str(sig.get("atr_band",                "Actionable")),
+            "pct_band":               str(sig.get("pct_band",                "Actionable")),
         })
 
         blocked_until = exit_date
@@ -656,6 +673,174 @@ def _bars_band_breakdown(trades: pd.DataFrame) -> dict:
     return result
 
 
+def _atr_band_breakdown(trades: pd.DataFrame) -> dict:
+    """Performance breakdown by ATR-normalised extension band (v9 PRIMARY).
+
+    Answers: do trades where price has moved < 0.5 ATR from trigger (Actionable)
+    outperform those 0.5-2 ATR (Late) or > 2 ATR (Extended)?
+
+    Returns dict keyed by band label: Actionable / Late / Extended.
+    """
+    result = {}
+    if "atr_band" not in trades.columns:
+        return result
+
+    def _stats(grp):
+        if grp.empty:
+            return None
+        w  = grp[grp["pnl_pct"] > 0]
+        l  = grp[grp["pnl_pct"] <= 0]
+        wr = len(w) / len(grp)
+        aw = w["pnl_pct"].mean() if len(w) else 0.0
+        al = abs(l["pnl_pct"].mean()) if len(l) else 0.0
+        gp = w["pnl_pct"].sum() if len(w) else 0.0
+        gl = abs(l["pnl_pct"].sum()) if len(l) else 1.0
+        return {
+            "trades":     len(grp),
+            "win_rate":   round(wr * 100, 1),
+            "avg_pnl":    round(grp["pnl_pct"].mean(), 2),
+            "expectancy": round(wr * aw - (1 - wr) * al, 2),
+            "profit_factor": round(gp / gl, 2) if gl > 0 else 0.0,
+        }
+
+    base = _stats(trades)
+    base_wr  = base["win_rate"]  if base else 0.0
+    base_exp = base["expectancy"] if base else 0.0
+
+    for band in ("Actionable", "Late", "Extended"):
+        grp = trades[trades["atr_band"] == band]
+        s = _stats(grp)
+        if s:
+            result[band] = s | {
+                "lift_wr":  round(s["win_rate"]  - base_wr,  1),
+                "lift_exp": round(s["expectancy"] - base_exp, 2),
+            }
+    return result
+
+
+def _pct_band_breakdown(trades: pd.DataFrame) -> dict:
+    """Performance breakdown by fixed-percentage extension band (comparison reference).
+
+    Thresholds: ≤2% = Actionable, 2-6.5% = Late, >6.5% = Extended.
+    These fixed thresholds are volatility-agnostic (retained for comparison only).
+    """
+    result = {}
+    if "pct_band" not in trades.columns:
+        # Reconstruct from price_move_since_setup if pct_band not captured
+        if "price_move_since_setup" not in trades.columns:
+            return result
+        trades = trades.copy()
+        trades["pct_band"] = trades["price_move_since_setup"].apply(
+            lambda x: "Actionable" if x <= 2.0 else ("Late" if x <= 6.5 else "Extended")
+        )
+
+    def _stats(grp):
+        if grp.empty:
+            return None
+        w  = grp[grp["pnl_pct"] > 0]
+        l  = grp[grp["pnl_pct"] <= 0]
+        wr = len(w) / len(grp)
+        aw = w["pnl_pct"].mean() if len(w) else 0.0
+        al = abs(l["pnl_pct"].mean()) if len(l) else 0.0
+        gp = w["pnl_pct"].sum() if len(w) else 0.0
+        gl = abs(l["pnl_pct"].sum()) if len(l) else 1.0
+        return {
+            "trades":     len(grp),
+            "win_rate":   round(wr * 100, 1),
+            "avg_pnl":    round(grp["pnl_pct"].mean(), 2),
+            "expectancy": round(wr * aw - (1 - wr) * al, 2),
+            "profit_factor": round(gp / gl, 2) if gl > 0 else 0.0,
+        }
+
+    base = _stats(trades)
+    base_wr  = base["win_rate"]  if base else 0.0
+    base_exp = base["expectancy"] if base else 0.0
+
+    for band in ("Actionable", "Late", "Extended"):
+        grp = trades[trades["pct_band"] == band]
+        s = _stats(grp)
+        if s:
+            result[band] = s | {
+                "lift_wr":  round(s["win_rate"]  - base_wr,  1),
+                "lift_exp": round(s["expectancy"] - base_exp, 2),
+            }
+    return result
+
+
+def build_classification_comparison(trades: pd.DataFrame) -> dict:
+    """Generate a three-way comparison report ranking classification methods
+    by predictive power for Win Rate, Average Return, Expectancy, Profit Factor.
+
+    Returns:
+        {
+          "bars_based":   {band: stats, ...},
+          "pct_based":    {band: stats, ...},
+          "atr_based":    {band: stats, ...},
+          "ranking":      {metric: [method_name, ...], ...},   # best→worst
+          "separation":   {method: float, ...},                # spread score
+        }
+    """
+    bars_bd = _bars_band_breakdown(trades)
+    pct_bd  = _pct_band_breakdown(trades)
+    atr_bd  = _atr_band_breakdown(trades)
+
+    def _separation_score(bd: dict) -> dict:
+        """Measure predictive power by computing Actionable - Extended spread
+        across all four metrics. Higher spread = better classification."""
+        act = bd.get("Actionable", {})
+        ext = bd.get("Extended", {})
+        if not act or not ext:
+            return {"wr_spread": 0, "ret_spread": 0, "exp_spread": 0, "pf_spread": 0, "composite": 0}
+        wr_sp  = round(act.get("win_rate",   0) - ext.get("win_rate",   0), 1)
+        ret_sp = round(act.get("avg_pnl",    0) - ext.get("avg_pnl",    0), 2)
+        exp_sp = round(act.get("expectancy", 0) - ext.get("expectancy", 0), 2)
+        pf_sp  = round(act.get("profit_factor", 0) - ext.get("profit_factor", 0), 2)
+        # Composite: normalise each metric and sum (crude but useful rank)
+        composite = round(wr_sp / 10 + ret_sp + exp_sp * 2 + pf_sp / 2, 2)
+        return {
+            "wr_spread":  wr_sp,
+            "ret_spread": ret_sp,
+            "exp_spread": exp_sp,
+            "pf_spread":  pf_sp,
+            "composite":  composite,
+        }
+
+    sep = {
+        "bars_based": _separation_score(bars_bd),
+        "pct_based":  _separation_score(pct_bd),
+        "atr_based":  _separation_score(atr_bd),
+    }
+
+    def _rank(metric: str) -> list[str]:
+        """Rank methods best→worst by Actionable-Extended spread for one metric."""
+        key_map = {
+            "win_rate":      "wr_spread",
+            "avg_return":    "ret_spread",
+            "expectancy":    "exp_spread",
+            "profit_factor": "pf_spread",
+        }
+        k = key_map.get(metric, "composite")
+        scored = [(m, sep[m].get(k, 0)) for m in ("bars_based", "pct_based", "atr_based")]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [m for m, _ in scored]
+
+    ranking = {
+        "win_rate":      _rank("win_rate"),
+        "avg_return":    _rank("avg_return"),
+        "expectancy":    _rank("expectancy"),
+        "profit_factor": _rank("profit_factor"),
+        "overall":       _rank("composite"),
+    }
+
+    return {
+        "bars_based":  bars_bd,
+        "pct_based":   pct_bd,
+        "atr_based":   atr_bd,
+        "separation":  sep,
+        "ranking":     ranking,
+    }
+
+
 def compute_stats(trades: pd.DataFrame) -> dict:
     if trades.empty:
         return {}
@@ -747,6 +932,12 @@ def compute_stats(trades: pd.DataFrame) -> dict:
         "trend_age_stats":       _trend_age_breakdown(trades),
         # Pattern contribution vs Norm baseline
         "pattern_stats":         _pattern_contribution(trades),
-        # Bars-since-setup banding: "Can I still enter today?" (v8)
+        # Bars-since-setup banding: retained as secondary reference (v8)
         "bars_band_stats":        _bars_band_breakdown(trades),
+        # ATR-normalised extension banding (v9 PRIMARY freshness metric)
+        "atr_band_stats":         _atr_band_breakdown(trades),
+        # Percentage-based banding (retained for comparison)
+        "pct_band_stats":         _pct_band_breakdown(trades),
+        # Three-way classification comparison with predictive power ranking
+        "classification_comparison": build_classification_comparison(trades),
     }
