@@ -832,6 +832,40 @@ def render(settings=None):
                 unsafe_allow_html=True
             )
 
+    # ── Bars-Since-Setup Banding: "Can I still enter today?" (v8) ───────────
+    bb_stats = s.get("bars_band_stats", {})
+    if bb_stats:
+        st.markdown("##### ⏱ Entry Timing: Bars Since Setup")
+        _band_cols = st.columns(3)
+        _band_cfg = {
+            "Actionable": ("🟢", "#22c55e", "#052e16", "#166534",
+                           "0–3 bars since signal", "Fresh setup — full opportunity ahead"),
+            "Late":        ("🟡", "#f59e0b", "#1a1100", "#92400e",
+                           "4–7 bars since signal", "Partially consumed — enter with caution"),
+            "Extended":    ("🔴", "#ef4444", "#1a0505", "#991b1b",
+                           "8+ bars since signal", "Stale signal — opportunity may have passed"),
+        }
+        for col_idx, (band, cfg) in enumerate(zip(("Actionable", "Late", "Extended"), _band_cols)):
+            icon, color, bg, border, subtitle, hint = _band_cfg[band]
+            bd = bb_stats.get(band, {})
+            _band_cols[col_idx].markdown(
+                f"<div style='background:{bg};border:1px solid {border}44;"
+                f"border-radius:8px;padding:0.8rem;'>"
+                f"<div style='color:{color};font-size:0.75rem;font-weight:700;'>"
+                f"{icon} {band.upper()}</div>"
+                f"<div style='color:#94a3b8;font-size:0.65rem;margin-bottom:4px;'>{subtitle}</div>"
+                f"<div style='font-size:1.4rem;font-weight:800;color:#e2e8f0;'>"
+                f"{bd.get('win_rate', 0)}% WR</div>"
+                f"<div style='color:#64748b;font-size:0.72rem;'>"
+                f"{bd.get('trades', 0)} trades · avg {bd.get('avg_pnl', 0):+.1f}% · "
+                f"exp {bd.get('expectancy', 0):+.2f}%</div>"
+                f"<div style='color:{color};font-size:0.68rem;margin-top:4px;'>"
+                f"lift: WR {bd.get('lift_wr', 0):+.1f}% · exp {bd.get('lift_exp', 0):+.2f}%</div>"
+                f"<div style='color:#475569;font-size:0.63rem;font-style:italic;margin-top:2px;'>{hint}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
     # ── Per-symbol table ──────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("#### 📋 Per-Symbol Performance")
@@ -873,6 +907,9 @@ def render(settings=None):
             "exit_reason","pnl_pct","score_at_entry","buy_type","tier",
             "trend_freshness","trend_age_bars","trend_phase",
             "rs_positive","adx_val","sl","t1","t2","tier1_prime",
+            # v8: entry timing measurements
+            "bars_band","bars_since_setup","price_move_since_setup",
+            "ema20_pct_dist","ema50_pct_dist","pivot_high_dist",
         ]
         tlog = trades_df[[c for c in show_cols if c in trades_df.columns]].copy()
         tlog = tlog.sort_values("entry_date", ascending=False)

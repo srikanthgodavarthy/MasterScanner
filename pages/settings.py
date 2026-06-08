@@ -692,8 +692,123 @@ def _card_gate_status():
 
 
 # ══════════════════════════════════════════════════════════════════
-#  MAIN RENDER
 # ══════════════════════════════════════════════════════════════════
+#  CARD: TRADING STYLE  (trader-facing, front-and-centre)
+# ══════════════════════════════════════════════════════════════════
+
+_TRADING_STYLE_DEFAULTS = {
+    "trading_style":       "Balanced",
+    "entry_preference":    "Pullback",
+    "extension_tolerance": "Normal",
+    "min_risk_reward":     "2R",
+    "conviction_level":    "Actionable",
+}
+
+def _card_trading_style():
+    _head("Trading Style", "#60a5fa")
+
+    st.markdown(
+        '<p style="font-size:11px;color:#64748b;margin-bottom:0.8rem;">'
+        'These controls define <b>what you want to trade</b>. '
+        'The scanner adapts its decision categories accordingly. '
+        'You do not need to understand ADX thresholds or ATR ratios to use them.</p>',
+        unsafe_allow_html=True,
+    )
+
+    _sec("Trading Style")
+    style = st.radio(
+        "Trading Style",
+        options=["Aggressive", "Balanced", "Conservative"],
+        index=["Aggressive", "Balanced", "Conservative"].index(
+            st.session_state.get("trading_style", _TRADING_STYLE_DEFAULTS["trading_style"])
+        ),
+        horizontal=True, key="trading_style_radio", label_visibility="collapsed",
+    )
+    _s("trading_style", style)
+    style_desc = {
+        "Aggressive":   "Earlier entries · More opportunities · Lower confirmation required.",
+        "Balanced":     "Standard thresholds · Best balance of opportunity and confidence.",
+        "Conservative": "Higher confirmation · Fewer trades · Higher conviction per trade.",
+    }
+    _why(f"<b>{style}</b> — {style_desc[style]}")
+
+    _sec("Entry Preference")
+    entry_pref = st.radio(
+        "Entry Preference",
+        options=["Early", "Pullback", "Breakout"],
+        index=["Early", "Pullback", "Breakout"].index(
+            st.session_state.get("entry_preference", _TRADING_STYLE_DEFAULTS["entry_preference"])
+        ),
+        horizontal=True, key="entry_pref_radio", label_visibility="collapsed",
+    )
+    _s("entry_preference", entry_pref)
+    ep_desc = {
+        "Early":   "Enter before the setup fully confirms. More risk, earlier reward.",
+        "Pullback":"Enter on a controlled retracement to EMA20 or Fib support.",
+        "Breakout":"Enter only on confirmed breakout with volume. Higher confidence, wider SL.",
+    }
+    _why(f"<b>{entry_pref}</b> — {ep_desc[entry_pref]}")
+
+    _sec("Extension Tolerance")
+    ext_tol = st.radio(
+        "Extension Tolerance",
+        options=["Very Strict", "Strict", "Normal", "Loose"],
+        index=["Very Strict", "Strict", "Normal", "Loose"].index(
+            st.session_state.get("extension_tolerance", _TRADING_STYLE_DEFAULTS["extension_tolerance"])
+        ),
+        horizontal=True, key="ext_tol_radio", label_visibility="collapsed",
+    )
+    _s("extension_tolerance", ext_tol)
+    et_desc = {
+        "Very Strict": "Only enter stocks that have barely moved from their base. Very few signals.",
+        "Strict":      "Prefer fresh setups. Tolerate small moves above the base.",
+        "Normal":      "Standard tolerance. Catch most good setups before they become obvious.",
+        "Loose":       "Willing to enter moderately extended stocks if the setup is strong.",
+    }
+    _why(f"<b>{ext_tol}</b> — {et_desc[ext_tol]}")
+
+    _sec("Minimum Risk / Reward")
+    min_rr = st.radio(
+        "Minimum R:R",
+        options=["1.5R", "2R", "3R"],
+        index=["1.5R", "2R", "3R"].index(
+            st.session_state.get("min_risk_reward", _TRADING_STYLE_DEFAULTS["min_risk_reward"])
+        ),
+        horizontal=True, key="min_rr_radio", label_visibility="collapsed",
+    )
+    _s("min_risk_reward", min_rr)
+    rr_desc = {"1.5R": "Minimum acceptable. 60% win rate needed to break even.",
+               "2R":   "Standard. 34% win rate needed to break even.",
+               "3R":   "High bar. 25% win rate needed to break even."}
+    _why(f"<b>{min_rr}</b> — {rr_desc[min_rr]}")
+
+    _sec("Minimum Conviction Level")
+    conv = st.radio(
+        "Conviction Level",
+        options=["Watchlist", "Actionable", "High Conviction", "Elite"],
+        index=["Watchlist", "Actionable", "High Conviction", "Elite"].index(
+            st.session_state.get("conviction_level", _TRADING_STYLE_DEFAULTS["conviction_level"])
+        ),
+        horizontal=True, key="conviction_radio", label_visibility="collapsed",
+    )
+    _s("conviction_level", conv)
+    cv_desc = {
+        "Watchlist":      "Show everything worth watching, including setups still forming.",
+        "Actionable":     "Show only stocks with an actionable entry available.",
+        "High Conviction":"Show only high-probability setups with well-formed structure.",
+        "Elite":          "Show only elite-grade opportunities. Very few signals.",
+    }
+    _why(f"<b>{conv}</b> — {cv_desc[conv]}")
+
+    _prev(
+        f'<b>Style</b>: {style}  ·  <b>Entry</b>: {entry_pref}  '
+        f'·  <b>Extension</b>: {ext_tol}<br>'
+        f'<b>Min R:R</b>: {min_rr}  ·  <b>Conviction</b>: {conv}'
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MAIN RENDER
 # ══════════════════════════════════════════════════════════════════
 
 def render() -> dict:
@@ -704,54 +819,76 @@ def render() -> dict:
         '⚙️ Settings</h2>'
         '<p style="font-size:10.5px;color:#475569;margin-bottom:0.3rem">'
         'Changes take effect on the next Run Scan / Backtest. '
-        'All controls live here — no sidebar.</p>'
-        '<p style="font-size:10px;color:#334155;margin-bottom:1.2rem;border-left:2px solid #1e3a5f;padding-left:0.6rem">'
-        'Each parameter includes a <b style="color:#475569">WHY</b> note explaining the recommended value '
-        'and the reasoning behind it. Defaults have been updated to architecture-review recommendations.</p>',
+        'All controls live here — no sidebar.</p>',
         unsafe_allow_html=True,
     )
 
-    left, right = st.columns(2, gap="large")
-
-    with left:
-        st.markdown('<div class="s-card">', unsafe_allow_html=True)
-        _card_universe()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown('<div class="s-card">', unsafe_allow_html=True)
-        _card_tier2()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown('<div class="s-card">', unsafe_allow_html=True)
-        _card_regime()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown('<div class="s-card">', unsafe_allow_html=True)
-        _card_system()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with right:
-        st.markdown('<div class="s-card">', unsafe_allow_html=True)
-        _card_tier1_gate()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown('<div class="s-card">', unsafe_allow_html=True)
-        _card_tier1_strength()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown('<div class="s-card">', unsafe_allow_html=True)
-        _card_watchlist()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    # Suggestion 12: gate status panel full width under both columns
-    st.markdown("---")
+    # ── SECTION 1: Trading Style (trader-facing, no technical jargon) ──
+    st.markdown(
+        '<p style="font-size:10px;color:#60a5fa;font-weight:700;letter-spacing:0.1em;'
+        'text-transform:uppercase;margin:0.3rem 0 0.6rem;border-left:3px solid #60a5fa;padding-left:0.6rem">'
+        'TRADING DECISIONS — What kind of trades do you want to find?</p>',
+        unsafe_allow_html=True,
+    )
     st.markdown('<div class="s-card">', unsafe_allow_html=True)
-    _card_gate_status()
+    _card_trading_style()
     st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── SECTION 2: Advanced / Technical Controls ──────────────────────
+    st.markdown(
+        '<p style="font-size:10px;color:#475569;font-weight:700;letter-spacing:0.1em;'
+        'text-transform:uppercase;margin:1.2rem 0 0.6rem;border-left:3px solid #334155;padding-left:0.6rem">'
+        'ADVANCED CONFIGURATION — Signal logic, thresholds and engine parameters</p>',
+        unsafe_allow_html=True,
+    )
+    with st.expander("⚙️ Show Advanced Configuration", expanded=False):
+        left, right = st.columns(2, gap="large")
+
+        with left:
+            st.markdown('<div class="s-card">', unsafe_allow_html=True)
+            _card_universe()
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            st.markdown('<div class="s-card">', unsafe_allow_html=True)
+            _card_tier2()
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            st.markdown('<div class="s-card">', unsafe_allow_html=True)
+            _card_regime()
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            st.markdown('<div class="s-card">', unsafe_allow_html=True)
+            _card_system()
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        with right:
+            st.markdown('<div class="s-card">', unsafe_allow_html=True)
+            _card_tier1_gate()
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            st.markdown('<div class="s-card">', unsafe_allow_html=True)
+            _card_tier1_strength()
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            st.markdown('<div class="s-card">', unsafe_allow_html=True)
+            _card_watchlist()
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.markdown('<div class="s-card">', unsafe_allow_html=True)
+        _card_gate_status()
+        st.markdown('</div>', unsafe_allow_html=True)
 
     # ── Return settings dict ────────────────────────────────────────
     ss = st.session_state
     return {
+        # ── Trader-facing settings (new) ─────────────────────────
+        "trading_style":       ss.get("trading_style",       _TRADING_STYLE_DEFAULTS["trading_style"]),
+        "entry_preference":    ss.get("entry_preference",    _TRADING_STYLE_DEFAULTS["entry_preference"]),
+        "extension_tolerance": ss.get("extension_tolerance", _TRADING_STYLE_DEFAULTS["extension_tolerance"]),
+        "min_risk_reward":     ss.get("min_risk_reward",     _TRADING_STYLE_DEFAULTS["min_risk_reward"]),
+        "conviction_level":    ss.get("conviction_level",    _TRADING_STYLE_DEFAULTS["conviction_level"]),
+        # ── Engine settings (unchanged) ──────────────────────────
         "symbols":             ss.get("symbols",             NIFTY500_SYMBOLS),
         "cci_len":             ss.get("cci_len",             DEFAULTS["cci_len"]),
         "cci_ob":              ss.get("cci_ob",              DEFAULTS["cci_ob"]),
