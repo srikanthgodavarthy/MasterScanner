@@ -224,6 +224,17 @@ def generate_signals_historical(
             "adx_val":         r.adx_val,
             "ema20_slope":     r.ema20_slope,
             "trend_phase":     r.trend_phase,
+            # ── Entry Quality / Extension measurements (v8) ──────
+            "ema20_pct_dist":        r.ema20_pct_dist,
+            "ema50_pct_dist":        r.ema50_pct_dist,
+            "pivot_high_dist":       r.pivot_high_dist,
+            "price_move_since_setup":r.price_move_since_setup,
+            "bars_since_setup":      r.bars_since_setup,
+            "bars_band":             (
+                "Actionable" if r.bars_since_setup <= 3 else
+                "Late"       if r.bars_since_setup <= 7 else
+                "Extended"
+            ),
         })
 
     return pd.DataFrame(signals)
@@ -361,6 +372,13 @@ def simulate_trades(
             "trend_freshness": int(sig.get("trend_freshness", 0)),
             "trend_phase":     str(sig.get("trend_phase", "NONE")),
             "adx_val":         float(sig.get("adx_val", 0.0)),
+            # ── Entry Quality / Extension measurements (v8) ──────
+            "ema20_pct_dist":         float(sig.get("ema20_pct_dist",         0.0)),
+            "ema50_pct_dist":         float(sig.get("ema50_pct_dist",         0.0)),
+            "pivot_high_dist":        float(sig.get("pivot_high_dist",        0.0)),
+            "price_move_since_setup": float(sig.get("price_move_since_setup", 0.0)),
+            "bars_since_setup":       int(sig.get("bars_since_setup",         0)),
+            "bars_band":              str(sig.get("bars_band",                "Actionable")),
         })
 
         blocked_until = exit_date
@@ -593,6 +611,51 @@ def _pattern_contribution(trades: pd.DataFrame) -> dict:
     return result
 
 
+def _bars_band_breakdown(trades: pd.DataFrame) -> dict:
+    """Performance breakdown by bars-since-setup banding (v8).
+
+    Answers: do trades entered in 0-3 bars (Actionable) outperform
+    those entered 4-7 bars (Late) or 8+ bars (Extended) after the signal?
+
+    Returns dict keyed by band label: Actionable / Late / Extended.
+    Each value: {trades, win_rate, avg_pnl, expectancy, lift_wr, lift_exp}
+    relative to the overall baseline.
+    """
+    result = {}
+    if "bars_band" not in trades.columns:
+        return result
+
+    def _stats(grp):
+        if grp.empty:
+            return None
+        w  = grp[grp["pnl_pct"] > 0]
+        l  = grp[grp["pnl_pct"] <= 0]
+        wr = len(w) / len(grp)
+        aw = w["pnl_pct"].mean() if len(w) else 0.0
+        al = abs(l["pnl_pct"].mean()) if len(l) else 0.0
+        return {
+            "trades":     len(grp),
+            "win_rate":   round(wr * 100, 1),
+            "avg_pnl":    round(grp["pnl_pct"].mean(), 2),
+            "expectancy": round(wr * aw - (1 - wr) * al, 2),
+        }
+
+    # Baseline = all trades
+    base = _stats(trades)
+    base_wr  = base["win_rate"]  if base else 0.0
+    base_exp = base["expectancy"] if base else 0.0
+
+    for band in ("Actionable", "Late", "Extended"):
+        grp = trades[trades["bars_band"] == band]
+        s = _stats(grp)
+        if s:
+            result[band] = s | {
+                "lift_wr":  round(s["win_rate"]  - base_wr,  1),
+                "lift_exp": round(s["expectancy"] - base_exp, 2),
+            }
+    return result
+
+
 def compute_stats(trades: pd.DataFrame) -> dict:
     if trades.empty:
         return {}
@@ -684,4 +747,6 @@ def compute_stats(trades: pd.DataFrame) -> dict:
         "trend_age_stats":       _trend_age_breakdown(trades),
         # Pattern contribution vs Norm baseline
         "pattern_stats":         _pattern_contribution(trades),
+        # Bars-since-setup banding: "Can I still enter today?" (v8)
+        "bars_band_stats":        _bars_band_breakdown(trades),
     }

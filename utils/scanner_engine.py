@@ -423,7 +423,7 @@ def score_stock(
     if r is None:
         return {}
 
-    return {
+    result = {
         # ── display columns ──────────────────────────────────────
         "Stock":        None,
         "Tier":         r.tier,
@@ -514,6 +514,54 @@ def score_stock(
         # Suggestion 4: raw BarResult for typed regime engine extraction
         "_bar_result":  r,
     }
+
+    # ── Decision Engine (4-score framework) ──────────────────────
+    # Runs AFTER all existing logic; uses only already-computed BarResult fields.
+    try:
+        from utils.decision_engine import compute_decision
+        ds = compute_decision(r, settings or {})
+        result.update({
+            "Leadership":    ds.leadership,
+            "Conviction":    ds.conviction,
+            "EntryQuality":  ds.entry_quality,
+            "Extension":     ds.extension,
+            "Stage":         ds.stage,
+            "Category":      ds.category,
+            "RR":            ds.risk_reward,
+            # ── Bars-since-setup banding (key question: "Can I still enter today?")
+            "BarsBand":      ds.bars_band,         # "Actionable" | "Late" | "Extended"
+            "BarsSince":     ds.bars_since_setup,
+            "MoveSince":     ds.price_move_since_setup,
+            "EMA20Dist":     ds.ema20_pct_dist,
+            "EMA50Dist":     ds.ema50_pct_dist,
+            "PivotDist":     ds.pivot_high_dist,
+            # Sub-scores stored as internals for detail view
+            "_ds_ls_trend":      ds.ls_trend,
+            "_ds_ls_rs":         ds.ls_rs,
+            "_ds_ls_momentum":   ds.ls_momentum,
+            "_ds_ls_volume":     ds.ls_volume,
+            "_ds_ls_freshness":  ds.ls_freshness,
+            "_ds_cv_pattern":    ds.cv_pattern,
+            "_ds_cv_fib":        ds.cv_fib,
+            "_ds_cv_compression":ds.cv_compression,
+            "_ds_cv_rs_lead":    ds.cv_rs_lead,
+            # New entry quality measured sub-scores
+            "_ds_eq_ema20_dist": ds.eq_ema20_dist,
+            "_ds_eq_ema50_dist": ds.eq_ema50_dist,
+            "_ds_eq_pivot_dist": ds.eq_pivot_dist,
+            "_ds_eq_move_since": ds.eq_move_since,
+            "_ds_eq_bars_since": ds.eq_bars_since,
+            # New extension measured sub-scores
+            "_ds_ex_ema20_dist": ds.ex_ema20_dist,
+            "_ds_ex_ema50_dist": ds.ex_ema50_dist,
+            "_ds_ex_pivot_dist": ds.ex_pivot_dist,
+            "_ds_ex_move_since": ds.ex_move_since,
+            "_ds_ex_bars_since": ds.ex_bars_since,
+        })
+    except Exception:
+        pass   # non-critical; existing columns still present
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════

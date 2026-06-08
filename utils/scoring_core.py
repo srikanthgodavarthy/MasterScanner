@@ -89,7 +89,7 @@ class ScoringParams:
     nifty_regime_val:    str  = "neutral"   # "bull" | "bear" | "neutral"
 
     # Score normalisation
-    max_score: int = 195   # 210 - 15: fresh_base_breakout bonus removed (gate-only, not scored)
+    max_score: int = 250
 
     @classmethod
     def from_settings(cls, s: dict) -> "ScoringParams":
@@ -247,6 +247,16 @@ class BarResult:
     rs_composite:       float = 0.0      # weighted composite RS
     trend_age_bars:     int   = 0        # bars since EMA20 first crossed above EMA50
     trend_freshness:    int   = 0        # 0-100: 100=brand-new cross, decays with age
+
+    # ── Entry Quality / Extension: real measurements ──────────────
+    # These are computed in compute_bar() using actual price vs indicator levels.
+    # Passed to decision_engine._entry_quality() and ._extension() for accurate scoring.
+    ema20_pct_dist:     float = 0.0      # % price is above EMA20 (positive = above)
+    ema50_pct_dist:     float = 0.0      # % price is above EMA50
+    pivot_high_dist:    float = 0.0      # % price is above last pivot high (>0 = extended past pivot)
+    price_move_since_setup: float = 0.0  # % move from setup trigger close to current close
+    bars_since_setup:   int   = 0        # bars elapsed since setup_detected_bar
+    setup_detected_bar: int   = -1       # bar index where setup first fired (any_buy)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -537,14 +547,11 @@ def compute_bar(
 
     TIER ARCHITECTURE (v3):
     ─────────────────────────────────────────────────────────────────
-    TIER 1 PRIME   — Path A: ema_alignment + above_cloud + persistent_strength
-                              + rs_positive + trend_freshness>=60 + not EXTENDED
-                              + in_golden_relaxed + recent_cci_recovery
-                     Path B: norm_buy with score ≥ 75 (70 for EMERGING)
-                     Path C: fresh_base_breakout + ema_alignment + (persistence OR rs_composite>0.02)
-                     All paths: rs_positive + strength_ok + nifty_allows
-                     NOTE: trend_up and trend_structure REMOVED from Path A gate —
-                     both were double-counting ema_alignment + above_cloud.
+    TIER 1 PRIME   — trend_up + in_golden_relaxed + recent_cci_recovery
+                     + persistent_strength + trend_structure
+                     + RS > t1_rs_min                     ← NEW
+                     + (ADX > t1_adx_min OR EMA20 slope+) ← NEW
+                     OR (norm_buy with score ≥ 75 + same RS/ADX gates)
                      Fib entries and CCI-cross alone do NOT qualify Tier 1.
 
     TIER 2         — Compression breakout gate (was already Tier 2)
@@ -612,11 +619,8 @@ def compute_bar(
     trend_up   = cur_c > cur_e200 and cur_e20 > cur_e50
     trend_down = cur_c < cur_e200 and cur_e20 < cur_e50
 
-    # ── EMA ALIGNMENT (v3) ────────────────────────────────────────
-    # Full stack: price above all EMAs in correct order.
-    # prev_e50 slope check removed — e50 > e200 is the stronger structural gate.
-    # A rising e50 that's still below e200 is not a confirmed uptrend.
-    ema_alignment = cur_e20 > cur_e50 > cur_e200
+    # ── EMA ALIGNMENT (v2) ────────────────────────────────────────
+    ema_alignment = cur_e20 > cur_e50 and cur_e50 > prev_e50
 
     # trend_phase is computed after momentum (below) — placeholder avoids forward-ref
     trend_phase: str = "NONE"
@@ -656,12 +660,8 @@ def compute_bar(
     # Composite RS: weight 3m most, then 6m, then 1m, then 1w
     rs_composite = rs1 * 0.15 + rs3 * 0.50 + rs6 * 0.25 + rs * 0.10
 
-    # RS filter for Tier-1: composite RS > 0.02 (stock outperforming Nifty by
-    # at least 2% on a weighted multi-TF basis). Replaces the 1-week rs > 0
-    # gate which was too weak — any tiny 5-bar outperformance passed.
-    # t1_rs_min kept as a fallback lower bound (default 0.0) but the primary
-    # gate is now composite-based.
-    rs_positive = rs_composite > max(0.02, params.t1_rs_min)
+    # RS filter for Tier-1: use 1-week RS as fast gate (original behaviour)
+    rs_positive = rs > params.t1_rs_min
 
     # Top-decile RS flag: composite RS is exceptional (used for score bonus + labels)
     # Thresholds calibrated for NSE (Nifty 500 universe, daily):
@@ -826,7 +826,67 @@ def compute_bar(
         trend_freshness = max(0, 25 - (trend_age_bars - 126) // 10)
     trend_freshness = int(round(trend_freshness))
 
-    # Qualified (original — retained for AccTier / display only)
+    # ── REAL MEASUREMENTS (Entry Quality / Extension inputs) ────────────
+    # % distance of current close from EMA20 and EMA50
+    ema20_pct_dist = ((cur_c - cur_e20) / cur_e20 * 100) if cur_e20 > 0 else 0.0
+    ema50_pct_dist = ((cur_c - cur_e50) / cur_e50 * 100) if cur_e50 > 0 else 0.0
+
+    # Last pivot high within pvt_lb lookback — price above pivot = extended past breakout
+    _pvt_lb_half = max(5, params.pvt_lb)
+    _ph_slice = ha[max(0, i - _pvt_lb_half):i] if ha is not None else None
+    if _ph_slice is not None and len(_ph_slice) > 0:
+        _last_pivot_hi = float(np.max(_ph_slice))
+    else:
+        _last_pivot_hi = float(h.iloc[max(0, i - _pvt_lb_half):i].max()) if i > 0 else cur_c
+    pivot_high_dist = ((cur_c - _last_pivot_hi) / _last_pivot_hi * 100) if _last_pivot_hi > 0 else 0.0
+
+    # ── SETUP DETECTED BAR (scan back to find first any_buy signal) ──────
+    # Scans backwards from bar i up to 15 bars to find the bar where
+    # the current setup first became active (any_buy condition).
+    # Purpose: feed bars_since_setup → decision engine extension banding.
+    # Uses a lightweight re-evaluation (no pivots, no heavy ops) for speed.
+    #
+    # Criteria for "setup active" (simplified, no pivot compute):
+    #   trend_up AND (in_golden_relaxed OR compression_break OR fresh_base)
+    #   OR norm_score proxy (trend_up AND EMA aligned AND RSI > 50 AND RS > 0)
+    _setup_bar = i   # default: assume setup just triggered on current bar
+    _scan_limit = min(15, i)
+    for _sb in range(1, _scan_limit + 1):
+        _sj = i - _sb
+        if _sj < 5:
+            break
+        _sc   = ca[_sj]   if ca   is not None else float(ia.c.iloc[_sj])
+        _se20 = e20a[_sj]  if e20a is not None else float(ia.e20.iloc[_sj])
+        _se50 = e50a[_sj]  if e50a is not None else float(ia.e50.iloc[_sj])
+        _se200= e200a[_sj] if e200a is not None else float(ia.e200.iloc[_sj])
+        _scci = ccil[_sj]  if ccil  is not None else float(ia.cci_s.iloc[_sj])
+        if np.isnan(_sc) or np.isnan(_se20) or np.isnan(_se200):
+            break
+        # Fib zone proxy at bar _sj
+        _sw_hi_s = float(np.max(ha[max(0, _sj - params.pvt_lb):_sj + 1])) if ha is not None else _sc
+        _sw_lo_s = float(np.min(la[max(0, _sj - params.pvt_lb):_sj + 1])) if la is not None else _sc
+        _rng_s   = _sw_hi_s - _sw_lo_s
+        _f618_s  = _sw_hi_s - _rng_s * (params.t1_fib_lo / 100.0) if _rng_s > 0 else _sc
+        _f382_s  = _sw_hi_s - _rng_s * (params.t1_fib_hi / 100.0) if _rng_s > 0 else _sc
+        _in_gr_s = (_sc >= _f618_s and _sc <= _f382_s)
+        # Compression proxy
+        _atr_s   = atrl[_sj] if atrl is not None else float(ia.atr_s.iloc[_sj])
+        _atr_sma_s = float(ia.atr_sma_comp.iloc[_sj]) if not np.isnan(float(ia.atr_sma_comp.iloc[_sj])) else _atr_s
+        _comp_s  = (_atr_s < _atr_sma_s * params.t2_atr_ratio) if _atr_sma_s > 0 else False
+        # Trend + basic signal at bar _sj
+        _tr_s    = _sc > _se200 and _se20 > _se50
+        _buy_s   = _tr_s and (_in_gr_s or _comp_s or (_se20 > _se50 and _scci < -50))
+        if _buy_s:
+            _setup_bar = _sj
+        else:
+            break   # first bar where signal was absent = setup started after this
+
+    bars_since_setup   = i - _setup_bar
+    setup_trigger_close = ca[_setup_bar] if (ca is not None and _setup_bar >= 0) else cur_c
+    price_move_since_setup = ((cur_c - setup_trigger_close) / setup_trigger_close * 100
+                               if setup_trigger_close > 0 else 0.0)
+
+
     strong_htf   = mom1 > 5 and mom3 > 10 and mom6 > 15
     trend_strong = cur_c > cur_e20 and cur_e20 > cur_e50
     qualified    = strong_htf and trend_strong
@@ -900,11 +960,9 @@ def compute_bar(
     )
 
     # ── RAW SCORE ─────────────────────────────────────────────────
-    # NOTE: trend_up removed from scoring — it is a strict subset of ema_alignment
-    # (trend_up = c>e200 AND e20>e50; ema_alignment = e20>e50 AND e50 rising).
-    # Keeping both double-counts the ema spread signal.
     score = 0.0
 
+    score += 25 if trend_up else 0
     score += 30 if cur_e20 > cur_e50 else (20 if cur_e20 > cur_e50 * 0.995 else 0)
     score += (25 if cur_r > 60 else 20 if cur_r > 55 else 15 if cur_r > 50 else 5 if cur_r > 45 else 0)
     score += (30 if cur_v > cur_vavg * 2.0 else 20 if cur_v > cur_vavg * 1.5 else 10 if cur_v > cur_vavg * 1.2 else 0)
@@ -925,19 +983,18 @@ def compute_bar(
         10 if rs_composite > 0.00 else
         -10 if rs_composite < -0.03 else 0
     )
-    # Fresh base breakout: GATE ONLY — not scored here.
-    # Path C already uses fresh_base_breakout as its qualification condition.
-    # Scoring it on top double-rewards the same signal: a Path C stock gets
-    # +15 pts simply for meeting the gate it was already admitted through.
-    # The gate is the right control point; the score bonus adds no information.
+    # Fresh base breakout bonus — stage-2 entries earn extra points
+    score += 15 if fresh_base_breakout else 0
 
-    # Trend Freshness: GATE ONLY — not scored here.
-    # Scoring trend_freshness AND gating on it (Path A: >= 60) is double-counting:
-    # a stock already cannot reach Tier 1 Path A with freshness < 60, so the
-    # score bonus would only ever inflate scores of stocks that already pass.
-    # The freshness gate in Path A is the right control point; scoring it
-    # separately adds noise and makes high-freshness stocks look better than
-    # their actual entry quality warrants.
+    # Trend Freshness bonus — rewards early-stage trends, penalises crowded ones
+    # Maps the 0-100 freshness score into a -10 to +15 score contribution.
+    # Breakpoints mirror the freshness bands defined above.
+    if trend_freshness >= 91:       score += 15   # brand-new cross (1-10 bars)
+    elif trend_freshness >= 71:     score += 10   # young trend (11-30 bars)
+    elif trend_freshness >= 51:     score +=  5   # mature (31-63 bars)
+    elif trend_freshness >= 26:     score +=  0   # aged (64-126 bars) — neutral
+    elif trend_freshness >= 1:      score -=  5   # extended (>126 bars)
+    # trend_freshness == 0 (no uptrend) — no change
     score += 15 if in_golden    else 0
     score += -20 if near_ext127 else (-30 if near_ext161 else 0)
     score += (20 if mom3 > 20 and mom6 > 20 else 10 if mom3 > 10 and mom6 > 10 else 5  if mom3 > 5 and mom6 > 5 else 0)
@@ -1026,46 +1083,28 @@ def compute_bar(
 
     _tier1_base = (
         # Path A: established pullback
-        # trend_up + trend_structure REMOVED — double-counted by ema_alignment + above_cloud.
-        # trend_structure = ema_alignment AND above_cloud, so listing it separately was
-        # double-counting both sub-conditions. The gate below is the single clean version.
         (
-            ema_alignment and
-            above_cloud and
-            persistent_strength and
-            rs_positive and
-            trend_freshness >= 60 and
-            trend_phase != "EXTENDED" and
+            trend_up and
             in_golden_relaxed and
             recent_cci_recovery and
+            persistent_strength and
+            trend_structure and
             not is_fib_buy_base and
             not is_fib_buy_cci  and
             not is_cci_buy
         )
         or
         # Path B: momentum/norm buy with score confirmation
-        # Guards added to prevent Path B from bypassing Path A quality checks:
-        # a high norm_score alone is not sufficient — the stock must also have
-        # composite RS leadership, be in a fresh-enough trend, not be EXTENDED,
-        # and show multi-month persistence. Without these, any extended crowded
-        # stock with a volume spike could clear Path B while Path A rejects it.
         (
             is_norm_buy and
-            norm_score >= _norm_score_thresh_t1 and
-            rs_composite > 0.02 and
-            trend_freshness >= 60 and
-            trend_phase != "EXTENDED" and
-            persistent_strength
+            norm_score >= _norm_score_thresh_t1
         )
         or
         # Path C: fresh base / stage-2 breakout
-        # trend_up → ema_alignment: requires full EMA stack (e20>e50>e200),
-        # not just c>e200 AND e20>e50. Consistent with how ema_alignment is
-        # used everywhere else in the tier system.
         (
             fresh_base_breakout and
-            ema_alignment and
-            (persistent_strength or rs_composite > 0.02)
+            trend_up and
+            (persistent_strength or rs >= 0.05)  # either persistence OR strong RS
         )
     )
 
@@ -1158,14 +1197,14 @@ def compute_bar(
 
     # ── Suggestion 2: Score audit dict ───────────────────────────
     _score_components = {
-        # trend_up removed — double-counts ema_alignment (see scoring note above)
+        "trend_up":         25 if trend_up else 0,
         "ema20>ema50":      30 if cur_e20 > cur_e50 else (20 if cur_e20 > cur_e50 * 0.995 else 0),
         "rsi":              (25 if cur_r > 60 else 20 if cur_r > 55 else 15 if cur_r > 50 else 5 if cur_r > 45 else 0),
         "volume":           (30 if cur_v > cur_vavg * 2.0 else 20 if cur_v > cur_vavg * 1.5 else 10 if cur_v > cur_vavg * 1.2 else 0),
         "near_high":        (5 if cur_c > hh * 0.98 and cur_c < hh * 1.01 else 0),
         "rs_composite":     (40 if rs_top_decile else 30 if rs_composite > 0.04 else 20 if rs_composite > 0.02 else 10 if rs_composite > 0.00 else -10 if rs_composite < -0.03 else 0),
-        "fresh_base":       0,  # gate-only — not scored (see scoring note above)
-        "trend_freshness":  0,  # gate-only — not scored (see scoring note above)
+        "fresh_base":       15 if fresh_base_breakout else 0,
+        "trend_freshness":  (15 if trend_freshness >= 91 else 10 if trend_freshness >= 71 else 5 if trend_freshness >= 51 else 0 if trend_freshness >= 26 else -5 if trend_freshness >= 1 else 0),
         "in_golden":        15 if in_golden else 0,
         "fib_ext_penalty":  (-20 if near_ext127 else -30 if near_ext161 else 0),
         "momentum":         (20 if mom3 > 20 and mom6 > 20 else 10 if mom3 > 10 and mom6 > 10 else 5 if mom3 > 5 and mom6 > 5 else 0),
@@ -1183,8 +1222,8 @@ def compute_bar(
     # ── Suggestion 3: t1_path audit ──────────────────────────────
     _t1_path = ""
     if is_tier1_prime:
-        if fresh_base_breakout and ema_alignment and (persistent_strength or rs_composite > 0.02):
-            _t1_path = "C"  # mirrors Path C gate above
+        if fresh_base_breakout and trend_up and (persistent_strength or rs >= 0.05):
+            _t1_path = "C"
         elif is_norm_buy and norm_score >= _norm_score_thresh_t1:
             _t1_path = "B"
         else:
@@ -1214,7 +1253,7 @@ def compute_bar(
     )
     is_execution = (
         norm_score >= 85 and
-        rs_composite > 0.06 and   # top-decile composite RS (was: 5-bar rs >= 0.10, almost never true)
+        rs >= 0.10 and
         _exec_buy_type is not None
     )
 
@@ -1382,4 +1421,11 @@ def compute_bar(
         trend_freshness     = trend_freshness,
         score_components    = _score_components,
         t1_path             = _t1_path,
+        # Real measurements for Entry Quality / Extension engines
+        ema20_pct_dist      = round(ema20_pct_dist, 2),
+        ema50_pct_dist      = round(ema50_pct_dist, 2),
+        pivot_high_dist     = round(pivot_high_dist, 2),
+        price_move_since_setup = round(price_move_since_setup, 2),
+        bars_since_setup    = bars_since_setup,
+        setup_detected_bar  = _setup_bar,
     )
