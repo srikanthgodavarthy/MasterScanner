@@ -259,6 +259,7 @@ class IndicatorArrays:
     All full-length indicator Series for a single symbol.
     Built once per symbol, reused across all bars.
     """
+    # ── Required fields (no defaults) — must come first ───────────────────
     c:            pd.Series   # close
     h:            pd.Series   # high
     l:            pd.Series   # low
@@ -271,7 +272,7 @@ class IndicatorArrays:
     rsi_s:        pd.Series
     atr_s:        pd.Series
     cci_s:        pd.Series
-    adx_s:        pd.Series   # NEW: ADX(14)
+    adx_s:        pd.Series   # ADX(14)
     vol_avg:      pd.Series
     atr_sma20:    pd.Series
     atr_sma_comp: pd.Series   # SMA(ATR, comp_bars) — for compression check
@@ -286,10 +287,12 @@ class IndicatorArrays:
     cloud_bottom: pd.Series
 
     nifty_aligned: pd.Series   # Nifty close reindexed to symbol's trading days
-         # ── P1: Precomputed pivot series (full-length, NaN where not a pivot) ─
+
+    # ── Optional fields (default=None) — must come after required ─────────
+    # P1: Precomputed pivot series (full-length, NaN where not a pivot)
     ph_series: pd.Series = None   # pivot highs
     pl_series: pd.Series = None   # pivot lows
-    # ── Also store raw numpy arrays for P3 (fast scalar access) ──────────
+    # Raw numpy arrays for P3 (fast scalar access)
     _c_arr:   np.ndarray = None
     _h_arr:   np.ndarray = None
     _l_arr:   np.ndarray = None
@@ -547,6 +550,11 @@ def compute_bar(
                      + Harmonic / ABCD / Norm buys
     ─────────────────────────────────────────────────────────────────
     """
+    # ── Resolve negative index (i=-1 means latest bar) ───────────
+    n_bars = len(ia.c)
+    if i < 0:
+        i = n_bars + i   # e.g. -1 → last valid index
+
     c   = ia.c;   h = ia.h;   l = ia.l
     v   = ia.v;   o = ia.o
 
