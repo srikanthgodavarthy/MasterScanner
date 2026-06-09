@@ -28,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 from utils.scanner_engine import _strip_tz, nifty_regime, ema
+from utils.decision_engine import _entry_quality as _eq_fn, _leadership as _ls_fn, _conviction as _cv_fn
 from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
 
 _BT_BATCH_SIZE = 50   # symbols per yf.download() call
@@ -147,7 +148,8 @@ def generate_signals_historical(
         params = ScoringParams(cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os)
 
     ia      = build_indicators(df, nifty, params)
-    signals = []
+    signals   = []
+    rejections = []   # v10: admission gate rejection log
     last_signal_bar = -999  # LOGIC-1: min cooldown between signals
 
     for i in range(210, len(df)):
@@ -194,6 +196,69 @@ def generate_signals_historical(
         # ── Buy type filter ───────────────────────────────────────
         if buy_type_filter and r.buy_type not in buy_type_filter:
             continue
+
+        # ══════════════════════════════════════════════════════════
+        #  ADMISSION GATE v11 — hard pre-score filters
+        #  These are BINARY rejects; they do not reduce score.
+        #  A stock that fails any gate is never added to signals.
+        #
+        #  Gate order (cheapest checks first):
+        #    1. ATR band / staleness / extension  — field lookups, free
+        #    2. Leadership / Conviction            — requires engine call
+        #    3. Entry Quality / RR                 — requires engine call
+        #  Engine calls are skipped entirely if an early gate already fires.
+        # ══════════════════════════════════════════════════════════
+        _rejection_reason: str = ""
+
+        # ── Gate 1: structural extension / staleness ──────────────
+        if r.atr_band == "Extended":
+            _rejection_reason = "EXTENDED_ATR"
+        elif r.bars_since_setup_actual > 7:
+            _rejection_reason = "STALE_SETUP"
+        elif r.extension_score_atr >= 2:
+            _rejection_reason = "HIGH_EXTENSION_SCORE"
+
+        # ── Gates 2–5: engine-scored gates (only if gate 1 passed) ─
+        # Compute all three engines once; reuse values for signal dict.
+        # Initialise here so the rejection-log append below always has values.
+        _eq_val, _rr, _ls_val, _cv_val = 0, 0.0, 0, 0
+        if not _rejection_reason:
+            _eq_val, _, _rr = _eq_fn(r)
+            _ls_val, _      = _ls_fn(r)
+            _cv_val, _      = _cv_fn(r)
+
+            # Gate 2: Leadership must be >= 65
+            # A stock with Leadership < 65 has no RS edge, weak trend, or
+            # poor volume profile.  Admitting it produces noise trades.
+            if _ls_val < 65:
+                _rejection_reason = "WEAK_LEADERSHIP"
+            # Gate 3: Conviction must be >= 65
+            # Conviction < 65 means the setup lacks compression, CCI
+            # confirmation, or momentum alignment.
+            elif _cv_val < 65:
+                _rejection_reason = "WEAK_CONVICTION"
+            # Gate 4: Risk/Reward
+            elif _rr < 2.0:
+                _rejection_reason = "POOR_RR"
+            # Gate 5: Entry Quality
+            elif _eq_val < 60:
+                _rejection_reason = "LOW_ENTRY_QUALITY"
+
+        if _rejection_reason:
+            rejections.append({
+                "date":                   df.index[i],
+                "entry_rejection_reason": _rejection_reason,
+                "atr_band":               r.atr_band,
+                "bars_since_setup_actual":r.bars_since_setup_actual,
+                "bars_since_setup_band":  r.bars_since_setup_band,
+                "extension_score_atr":    r.extension_score_atr,
+                "entry_quality_score":    _eq_val,
+                "risk_reward":            _rr,
+                "norm_score":             r.norm_score,
+                "leadership_score":       _ls_val,
+                "conviction_score":       _cv_val,
+            })
+            continue   # hard reject — do not create a trade signal
 
         last_signal_bar = i
         signals.append({
@@ -246,9 +311,24 @@ def generate_signals_historical(
                 "Late"       if r.price_move_since_setup <= 6.5 else
                 "Extended"
             ),
+            # ── Admission diagnostics (v10) ────────────────────────────
+            "bars_since_setup_actual": r.bars_since_setup_actual,
+            "bars_since_setup_band":   r.bars_since_setup_band,
+            "entry_quality_score":     _eq_val,
+            "entry_quality_band":      (
+                "Good"       if _eq_val >= 75 else
+                "Acceptable" if _eq_val >= 60 else
+                "Poor"       if _eq_val >= 40 else
+                "Reject"
+            ),
+            "entry_rejection_reason":  "",   # empty = admitted; populated only in rejection log
+            "leadership_score":        _ls_val,
+            "conviction_score":        _cv_val,
         })
 
-    return pd.DataFrame(signals)
+    signals_df   = pd.DataFrame(signals)
+    rejections_df = pd.DataFrame(rejections)
+    return signals_df, rejections_df
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -456,7 +536,7 @@ def run_backtest(
 
     def _process(sym):
         df = all_data[sym]
-        sigs = generate_signals_historical(
+        sigs, rejs = generate_signals_historical(
             df, nifty,
             settings         = effective_settings,
             cci_len          = cci_len,
@@ -467,7 +547,14 @@ def run_backtest(
             buy_type_filter  = buy_type_filter,
             rs_positive_only = rs_positive_only,
         )
-        return simulate_trades(sym, df, sigs, hold_days=hold_days)
+        trades = simulate_trades(sym, df, sigs, hold_days=hold_days)
+        if not rejs.empty:
+            rejs.insert(0, "symbol", sym)
+        if not trades.empty:
+            trades["rejection_log"] = None   # placeholder; full log available via rejs
+        return trades, rejs
+
+    all_rejections = []
 
     with ThreadPoolExecutor(max_workers=workers) as exe:
         futures = {exe.submit(_process, s): s for s in valid_symbols}
@@ -481,14 +568,19 @@ def run_backtest(
                 pct = 0.15 + 0.85 * (n / total)
                 progress_cb(min(pct, 1.0), sym)
             try:
-                result = fut.result()
+                result, rejs = fut.result()
                 if result is not None and not result.empty:
                     with t_lock:
                         all_trades.append(result)
+                if rejs is not None and not rejs.empty:
+                    with t_lock:
+                        all_rejections.append(rejs)
             except Exception:
                 pass
 
-    return pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+    trades_df     = pd.concat(all_trades,     ignore_index=True) if all_trades     else pd.DataFrame()
+    rejections_df = pd.concat(all_rejections, ignore_index=True) if all_rejections else pd.DataFrame()
+    return trades_df, rejections_df
 
 
 # ══════════════════════════════════════════════════════════════════
