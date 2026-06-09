@@ -274,6 +274,23 @@ class BarResult:
     bars_since_setup:   int   = 0        # bars elapsed since setup_detected_bar
     setup_detected_bar: int   = -1       # bar index where setup first fired (any_buy)
 
+    # ── ATR-normalised extension (v9 PRIMARY freshness metric) ────
+    # Measures how far price has moved from the setup trigger in ATR units.
+    # Volatility-adjusted: a 3% move in a high-ATR stock is not extended;
+    # the same move in a low-ATR stock may be significantly extended.
+    #
+    # atr_at_setup      : ATR(14) value at the setup trigger bar
+    # extension_atr      : (price_move_since_setup %) / (atr_at_setup / trigger_close * 100)
+    #                      i.e. how many ATRs price has moved since signal fired
+    # extension_score_atr: integer bucket (0=Actionable, 1=Late, 2=Extended)
+    #                      used for fast groupby in backtest reports
+    # atr_band           : string label ("Actionable" | "Late" | "Extended")
+    #                      primary freshness label for _atr_band_breakdown()
+    atr_at_setup:        float = 0.0     # ATR(14) at setup trigger bar
+    extension_atr:       float = 0.0     # price_move / atr_at_setup (in ATR units)
+    extension_score_atr: int   = 0       # 0=Actionable, 1=Late, 2=Extended
+    atr_band:            str   = "Actionable"  # human-readable tier label
+
 
 # ══════════════════════════════════════════════════════════════════
 #  PRE-COMPUTED SERIES BUNDLE  (passed into the bar loop once)
@@ -916,6 +933,36 @@ def compute_bar(
     price_move_since_setup = ((cur_c - setup_trigger_close) / setup_trigger_close * 100
                                if setup_trigger_close > 0 else 0.0)
 
+    # ── ATR-NORMALISED EXTENSION (v9) ─────────────────────────────
+    # Capture the ATR at the setup trigger bar — this is the volatility
+    # context at the moment the signal first fired, not the current ATR.
+    # Using setup-bar ATR avoids distortion from post-breakout ATR expansion.
+    _atr_at_setup = (atrl[_setup_bar] if (atrl is not None and _setup_bar >= 0)
+                     else float(ia.atr_s.iloc[_setup_bar]) if _setup_bar >= 0
+                     else cur_atr)
+    if np.isnan(_atr_at_setup) or _atr_at_setup <= 0:
+        _atr_at_setup = cur_atr   # fallback: current ATR if setup bar has no valid ATR
+
+    # extension_atr: how many ATRs price has moved since the setup triggered.
+    # Formula: (price_move_pct / 100 * trigger_close) / atr_at_setup
+    #          = raw price move in points / ATR at setup bar
+    # This is dimensionless — 1.0 means price moved exactly 1 ATR from trigger.
+    _raw_move_pts = (cur_c - setup_trigger_close) if setup_trigger_close > 0 else 0.0
+    _extension_atr = (_raw_move_pts / _atr_at_setup) if _atr_at_setup > 0 else 0.0
+
+    # Thresholds (empirically chosen to reflect NSE daily volatility):
+    #   < 0.5 ATR  → Actionable  (price barely moved; full reward still available)
+    #   0.5 – 2.0  → Late        (meaningful move; reduced reward/risk profile)
+    #   > 2.0 ATR  → Extended    (overextended; high SL risk, chasing territory)
+    if _extension_atr < 0.5:
+        _atr_band = "Actionable"
+        _extension_score_atr = 0
+    elif _extension_atr < 2.0:
+        _atr_band = "Late"
+        _extension_score_atr = 1
+    else:
+        _atr_band = "Extended"
+        _extension_score_atr = 2
 
     strong_htf   = mom1 > 5 and mom3 > 10 and mom6 > 15
     trend_strong = cur_c > cur_e20 and cur_e20 > cur_e50
@@ -1476,4 +1523,9 @@ def compute_bar(
         price_move_since_setup = round(price_move_since_setup, 2),
         bars_since_setup    = bars_since_setup,
         setup_detected_bar  = _setup_bar,
+        # ATR-normalised extension (v9 PRIMARY freshness metric)
+        atr_at_setup        = round(_atr_at_setup, 4),
+        extension_atr       = round(_extension_atr, 3),
+        extension_score_atr = _extension_score_atr,
+        atr_band            = _atr_band,
     )
