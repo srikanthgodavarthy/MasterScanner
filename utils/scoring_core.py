@@ -271,8 +271,10 @@ class BarResult:
     ema50_pct_dist:     float = 0.0      # % price is above EMA50
     pivot_high_dist:    float = 0.0      # % price is above last pivot high (>0 = extended past pivot)
     price_move_since_setup: float = 0.0  # % move from setup trigger close to current close
-    bars_since_setup:   int   = 0        # bars elapsed since setup_detected_bar
-    setup_detected_bar: int   = -1       # bar index where setup first fired (any_buy)
+    bars_since_setup:        int   = 0        # bars elapsed since setup_detected_bar (uncapped)
+    bars_since_setup_actual: int   = 0        # alias: uncapped value — use for all admission logic
+    bars_since_setup_band:   str   = "Fresh"  # Fresh(0-3) | Actionable(4-7) | Late(8-14) | Extended(>14)
+    setup_detected_bar:      int   = -1       # bar index where setup first fired (any_buy)
 
     # ── ATR-normalised extension (v9 PRIMARY freshness metric) ────
     # Measures how far price has moved from the setup trigger in ATR units.
@@ -891,7 +893,10 @@ def compute_bar(
     # where norm_score_proxy = EMA20 > EMA50 AND price > EMA20 (momentum threshold),
     # which covers is_norm_buy signals that are explicitly NOT in the golden pocket.
     _setup_bar = i   # default: setup triggered on current bar (0 bars elapsed)
-    _scan_limit = min(15, i)
+    # FIX (v10): Removed hard cap of 15.  Previously min(15, i) caused 90%+ of
+    # trades to land at bars_since_setup == 15, destroying stale-setup detection.
+    # Scan up to 60 bars back (≈3 trading months) — sufficient to catch true setup age.
+    _scan_limit = min(60, i)
     for _sb in range(1, _scan_limit + 1):
         _sj = i - _sb
         if _sj < 5:
@@ -1522,6 +1527,13 @@ def compute_bar(
         pivot_high_dist     = round(pivot_high_dist, 2),
         price_move_since_setup = round(price_move_since_setup, 2),
         bars_since_setup    = bars_since_setup,
+        bars_since_setup_actual = bars_since_setup,      # uncapped alias
+        bars_since_setup_band   = (
+            "Fresh"      if bars_since_setup <= 3  else
+            "Actionable" if bars_since_setup <= 7  else
+            "Late"       if bars_since_setup <= 14 else
+            "Extended"
+        ),
         setup_detected_bar  = _setup_bar,
         # ATR-normalised extension (v9 PRIMARY freshness metric)
         atr_at_setup        = round(_atr_at_setup, 4),
