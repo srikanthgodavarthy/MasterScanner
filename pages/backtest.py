@@ -152,7 +152,7 @@ def render(settings=None):
         bt_settings["bt_buy_type_filter"]   = buy_type_filter
         bt_settings["bt_rs_positive_only"]  = bt_rs_positive_only
 
-        trades_df = run_backtest(
+        trades_df, rejections_df = run_backtest(
             bt_universe,
             settings         = bt_settings,
             cci_len          = int(bt_cci_len),
@@ -177,10 +177,15 @@ def render(settings=None):
                 "Both":   "No trades generated. Try lowering Min Score or adding more symbols.",
             }
             st.warning(msgs.get(bt_tier_filter, msgs["Both"]))
+            if not rejections_df.empty:
+                st.info(f"ℹ️ {len(rejections_df)} signals were rejected by the admission gate. Expand below to inspect.")
+                with st.expander("🚫 Admission Gate Rejections"):
+                    st.dataframe(rejections_df, use_container_width=True)
             return
 
-        st.session_state["bt_trades"] = trades_df
-        st.session_state["bt_stats"]  = compute_stats(trades_df)
+        st.session_state["bt_trades"]      = trades_df
+        st.session_state["bt_rejections"]  = rejections_df
+        st.session_state["bt_stats"]       = compute_stats(trades_df)
 
         if bt_save_db:
             save_backtest_results(trades_df)
