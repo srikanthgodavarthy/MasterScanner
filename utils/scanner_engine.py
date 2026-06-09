@@ -561,6 +561,45 @@ def score_stock(
     except Exception:
         pass   # non-critical; existing columns still present
 
+    # ── Conviction Score v1 (backtest-validated weights) ─────────
+    # Pure re-mapping of existing BarResult fields — zero new indicators.
+    # Produces: CV1_Leadership, CV1_Conviction, CV1_EntryQuality, CV1_SignalClass
+    # and all sub-score internals for the detail-view breakdown panel.
+    try:
+        from utils.conviction_score_v1 import compute_conviction_v1
+        cv1 = compute_conviction_v1(r)
+        result.update({
+            "CV1_Leadership":    cv1.leadership,
+            "CV1_Conviction":    cv1.conviction,
+            "CV1_EntryQuality":  cv1.entry_quality,
+            "CV1_Composite":     cv1.composite,
+            "CV1_SignalClass":   cv1.signal_class,
+            # Grade labels
+            "CV1_LS_Grade":      cv1.leadership_grade,
+            "CV1_CV_Grade":      cv1.conviction_grade,
+            "CV1_EQ_Grade":      cv1.entry_quality_grade,
+            # Leadership sub-scores
+            "_cv1_ls_rs":        cv1.ls_rs_composite,
+            "_cv1_ls_age":       cv1.ls_trend_age,
+            "_cv1_ls_adx":       cv1.ls_adx,
+            "_cv1_ls_ps":        cv1.ls_persistent_strength,
+            "_cv1_ls_slope":     cv1.ls_ema20_slope,
+            # Conviction sub-scores
+            "_cv1_cv_structure": cv1.cv_trend_structure,
+            "_cv1_cv_fib":       cv1.cv_fib_zone,
+            "_cv1_cv_cci":       cv1.cv_cci_recovery,
+            "_cv1_cv_volume":    cv1.cv_volume,
+            "_cv1_cv_squeeze":   cv1.cv_squeeze,
+            # Entry Quality sub-scores
+            "_cv1_eq_ema20":     cv1.eq_ema20_dist,
+            "_cv1_eq_ema50":     cv1.eq_ema50_dist,
+            "_cv1_eq_pivot":     cv1.eq_pivot_dist,
+            "_cv1_eq_move":      cv1.eq_move_since_setup,
+            "_cv1_eq_bars":      cv1.eq_bars_since_setup,
+        })
+    except Exception:
+        pass   # non-critical
+
     return result
 
 
