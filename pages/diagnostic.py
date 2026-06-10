@@ -145,9 +145,10 @@ def _build_merged(
     hold_days: int = 20,
     settings:  dict | None = None,
     sym_prog_cb = None,
-) -> tuple[pd.DataFrame, int]:
-    """Returns (merged_df, total_admitted_signals)."""
+) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+    """Returns (merged_df, all_rejections_df, total_admitted_signals)."""
     all_merged: list[pd.DataFrame] = []
+    all_rejs:   list[pd.DataFrame] = []
     settings = settings or {}
     total_sigs = 0
     valid = [s for s in symbols if s in ohlcv]
@@ -158,9 +159,15 @@ def _build_merged(
         df = ohlcv[sym]
 
         try:
-            sigs, _rejs = generate_signals_historical(df, nifty, settings=settings)
+            sigs, rejs = generate_signals_historical(df, nifty, settings=settings)
         except Exception:
             continue
+
+        if not rejs.empty:
+            rejs = rejs.copy()
+            rejs.insert(0, "symbol", sym)
+            all_rejs.append(rejs)
+
         if sigs.empty:
             continue
         total_sigs += len(sigs)
@@ -209,8 +216,10 @@ def _build_merged(
         merged = pd.merge(trades_slim, sigs_slim, on=["symbol","_entry_date"], how="left")
         all_merged.append(merged)
 
+    rejections_df = pd.concat(all_rejs, ignore_index=True) if all_rejs else pd.DataFrame()
+
     if not all_merged:
-        return pd.DataFrame(), total_sigs
+        return pd.DataFrame(), rejections_df, total_sigs
 
     full = pd.concat(all_merged, ignore_index=True)
     full.rename(columns={
@@ -219,7 +228,7 @@ def _build_merged(
         "bars_since_setup_actual": "bars_since_setup",
     }, inplace=True)
     full.drop(columns=["_entry_date"], errors="ignore", inplace=True)
-    return full, total_sigs
+    return full, rejections_df, total_sigs
 
 
 # ══════════════════════════════════════════════════════════════════════════════
