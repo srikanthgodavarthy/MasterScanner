@@ -1361,15 +1361,16 @@ def compute_bar(
     # above swing-low, the structural anchor was silently ignored.
     # New logic: use swing-low minus buffer as the default SL.
     #   ATR floor = never tighter than 1.5 ATR (stops intraday noise hits)
-    #   ATR ceiling = never wider than 4.0 ATR (limits runaway risk)
+    #   ATR ceiling = never wider than 2.5 ATR (FIX: was 4.0 — wide SL pushed
+    #     T1/T2 too far from entry, causing >70% TIMEOUT exits on NSE daily bars)
 
     # Swing-low based SL: lowest low of last pvt_lb bars, minus 0.5*ATR buffer
     _sw_lo_sl = float(l.iloc[max(0, i - params.pvt_lb):i + 1].min()) - cur_atr * 0.5
 
     # ATR-based floor (never tighter than 1.5 ATR below padded entry)
     _atr_floor   = _entry_pad - cur_atr * 1.5
-    # ATR-based ceiling (never wider than 4.0 ATR below padded entry)
-    _atr_ceiling = _entry_pad - cur_atr * 4.0
+    # ATR-based ceiling (never wider than 2.5 ATR below padded entry)
+    _atr_ceiling = _entry_pad - cur_atr * 2.5
 
     # Swing-low is primary; clamp between ATR floor and ATR ceiling
     sl = round(float(np.clip(_sw_lo_sl, _atr_ceiling, _atr_floor)), 2)
