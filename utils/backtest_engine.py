@@ -235,7 +235,7 @@ def generate_signals_historical(
             # Gate 3: Conviction must be >= 65
             # Conviction < 65 means the setup lacks compression, CCI
             # confirmation, or momentum alignment.
-            elif _cv_val < 65:
+            elif _cv_val < 38:
                 _rejection_reason = "WEAK_CONVICTION"
             # Gate 4: Risk/Reward
             elif _rr < 2.0:
