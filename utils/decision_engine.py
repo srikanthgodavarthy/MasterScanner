@@ -272,23 +272,44 @@ def _entry_quality(r: "BarResult") -> tuple[int, dict, float]:
     reward = t2 - entry if t2 > entry else (t1 - entry if t1 > entry else 0)
     rr     = round(reward / risk, 2) if risk > 0 else 0.0
 
+    # ── Entry type: breakout (Norm/CmpBrk/CCIRise) vs pullback (Fib/CCI/Harm/ABCD)
+    # Breakout entries are structurally above EMA20 and past the pivot high.
+    # Pullback entries are expected near EMA20 and below the prior pivot.
+    # Scoring thresholds are calibrated per entry type to avoid penalising
+    # valid breakout entries as "extended" and valid pullbacks as "too close".
+    _is_breakout = r.buy_type in ("Norm", "CmpBrk", "CCIRise", "-")
+
     # ── EMA20 Distance (0-30) ────────────────────────────────────
-    # ema20_pct_dist > 0 means price is above EMA20 (normal for uptrend).
-    # The further above EMA20, the more extended the entry.
-    # Best entry: price at or just above EMA20 (0-3% above).
+    # Pullback entries: best when near EMA20 (0-3% above).
+    # Breakout entries: breakout requires being above EMA20; 0-8% is normal;
+    #   only penalise when genuinely parabolic (>15%).
     ema20d = r.ema20_pct_dist   # % above EMA20 (positive = above)
-    if ema20d <= 0:
-        eq_ema20 = 8    # below EMA20 — not ideal but may be pullback
-    elif ema20d <= 2.0:
-        eq_ema20 = 30   # <= 2% above: excellent — near EMA20 support
-    elif ema20d <= 4.0:
-        eq_ema20 = 22   # 2-4%: good entry
-    elif ema20d <= 6.0:
-        eq_ema20 = 14   # 4-6%: acceptable
-    elif ema20d <= 10.0:
-        eq_ema20 = 6    # 6-10%: stretched
+    if _is_breakout:
+        if ema20d <= 0:
+            eq_ema20 = 8    # below EMA20 — unusual for breakout, weak
+        elif ema20d <= 5.0:
+            eq_ema20 = 30   # 0-5%: excellent breakout — close to EMA20
+        elif ema20d <= 8.0:
+            eq_ema20 = 22   # 5-8%: normal post-breakout extension
+        elif ema20d <= 12.0:
+            eq_ema20 = 14   # 8-12%: stretched but tradeable
+        elif ema20d <= 18.0:
+            eq_ema20 = 6    # 12-18%: extended
+        else:
+            eq_ema20 = 0    # >18%: parabolic — avoid
     else:
-        eq_ema20 = 0    # >10%: very extended from EMA20
+        if ema20d <= 0:
+            eq_ema20 = 8    # below EMA20 — may be pullback
+        elif ema20d <= 2.0:
+            eq_ema20 = 30   # <= 2%: excellent — near EMA20 support
+        elif ema20d <= 4.0:
+            eq_ema20 = 22   # 2-4%: good
+        elif ema20d <= 6.0:
+            eq_ema20 = 14   # 4-6%: acceptable
+        elif ema20d <= 10.0:
+            eq_ema20 = 6    # 6-10%: stretched
+        else:
+            eq_ema20 = 0    # >10%: extended for pullback entry
 
     # ── EMA50 Distance (0-15) ────────────────────────────────────
     # Further from EMA50 = more room to fall; less attractive risk profile.
@@ -305,19 +326,30 @@ def _entry_quality(r: "BarResult") -> tuple[int, dict, float]:
         eq_ema50 = 0    # >20% above EMA50 — structurally extended
 
     # ── Pivot High Distance (0-20) ────────────────────────────────
-    # pivot_high_dist > 0 means price has moved above the last pivot high (chasing).
-    # pivot_high_dist <= 0 means price is still below / at the pivot (ideal entry zone).
+    # Breakout entries: pivot_high_dist > 0 is EXPECTED (that's the breakout).
+    #   Penalise only when chasing far past the pivot (>8%).
+    # Pullback entries: pivot_high_dist <= 0 is ideal (building under pivot).
     pvt_d = r.pivot_high_dist   # % above last pivot high
-    if pvt_d <= -2.0:
-        eq_pivot = 20   # still building under the pivot — ideal
-    elif pvt_d <= 0.5:
-        eq_pivot = 16   # at the pivot / just breaking — valid breakout entry
-    elif pvt_d <= 2.0:
-        eq_pivot = 10   # 0.5-2% past pivot — still acceptable
-    elif pvt_d <= 4.0:
-        eq_pivot = 4    # 2-4% past pivot — late
+    if _is_breakout:
+        if pvt_d <= 2.0:
+            eq_pivot = 20   # at or just above pivot — valid breakout
+        elif pvt_d <= 5.0:
+            eq_pivot = 14   # 2-5% past pivot — normal follow-through
+        elif pvt_d <= 8.0:
+            eq_pivot = 7    # 5-8% past pivot — late but possible
+        else:
+            eq_pivot = 0    # >8% past pivot — chasing
     else:
-        eq_pivot = 0    # >4% past pivot — chasing breakout
+        if pvt_d <= -2.0:
+            eq_pivot = 20   # still building under the pivot — ideal
+        elif pvt_d <= 0.5:
+            eq_pivot = 16   # at the pivot / just breaking — valid
+        elif pvt_d <= 2.0:
+            eq_pivot = 10   # 0.5-2% past pivot — acceptable
+        elif pvt_d <= 4.0:
+            eq_pivot = 4    # 2-4% past pivot — late
+        else:
+            eq_pivot = 0    # >4% past pivot — chasing
 
     # ── Price Move Since Setup Trigger (0-20) ────────────────────
     # If price has moved significantly from the bar where setup was detected,
