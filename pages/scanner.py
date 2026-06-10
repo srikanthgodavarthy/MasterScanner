@@ -1,15 +1,17 @@
 """
-pages/scanner.py — Live Scanner  (v6 — UI redesign)
+pages/scanner.py — Live Scanner  (v7 — reference UI redesign)
 
-UI Changes vs v5:
-  • Market Command Center: gradient bar encodes distribution, regime pill left,
-    counts centre, action badge right — clean left/right split
-  • Default column order: Stock | Signal Class | Leadership | Conviction |
-    Entry Quality | Extension | LTP | Day% | Entry | SL | T1 | R:R
-  • LTP column added to primary display
-  • Score cards: lighter weight typography, consistent 9px label / 22px value
-  • Table: reduced font-weight overrides, two-weight system only
-  • Settings chips/toggles: inline interactive controls replace Streamlit radios
+UI Changes vs v6:
+  • Market status row: compact chip-style layout with Regime pill (solid bg),
+    Nifty price chip, %Chg chip, EMA50 pill, VIX chip, ADX chip, Auto-refresh
+    toggle (right), "Last scan" chip (far right)
+  • Market note: italic standalone text below status row (not inside panel)
+  • Score cards: larger value numbers, cleaner layout, progress bar below value
+  • Signal class counts: colored dot + "LABEL: N" inline pill style
+  • Tab labels: simpler emoji prefix format
+  • EXECUTE/WATCH section header: left-border colored label (unchanged)
+  • Table: added Size% column, row index shown
+  • Controls row: Run Scan (blue), Save to DB checkbox, universe info, clear-cache icon
   • Zero changes to scanner logic, backtest logic, or scoring calculations.
 """
 
@@ -89,29 +91,34 @@ _CSS = """
   --mono: 'JetBrains Mono', 'Fira Code', monospace;
 }
 
-/* ── Market Command Center ── */
-.mcc {
-  background: var(--bg1);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 14px 20px 12px;
-  position: relative;
-  overflow: hidden;
-  margin-bottom: 14px;
-}
-.mcc::before {
-  content: '';
-  position: absolute;
-  top: 0; left: 0; right: 0;
-  height: 2px;
-}
-.mcc-row {
+/* ── Market Status Row ── */
+.msr {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 6px;
   flex-wrap: wrap;
+  margin-bottom: 6px;
 }
-.regime-pill {
+.msr-chip {
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 4px 11px;
+  font-size: 11.5px;
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.msr-chip .chip-label {
+  font-weight: 400;
+  color: var(--muted);
+  font-size: 10px;
+}
+.regime-pill-solid {
   display: inline-block;
   padding: 4px 14px;
   border-radius: 5px;
@@ -121,87 +128,30 @@ _CSS = """
   text-transform: uppercase;
   white-space: nowrap;
 }
-.mcc-pills {
-  display: flex;
-  gap: 5px;
-  flex-wrap: wrap;
+.msr-spacer { flex: 1; }
+.autorefresh-group {
+  display: inline-flex;
   align-items: center;
+  gap: 6px;
+  margin-left: auto;
 }
-.mcc-pill {
-  background: var(--bg2);
+.last-scan-chip {
+  background: var(--bg1);
   border: 1px solid var(--border);
   border-radius: 5px;
-  padding: 3px 10px;
+  padding: 4px 11px;
+  font-size: 10.5px;
+  font-family: var(--mono);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.last-scan-chip b { color: var(--text); }
+.market-note {
   font-size: 11px;
   color: var(--muted);
-  font-family: var(--mono);
-  white-space: nowrap;
-}
-.mcc-pill b { color: var(--text); }
-.mcc-divider {
-  width: 1px;
-  height: 36px;
-  background: var(--border);
-  flex-shrink: 0;
-}
-.mcc-counts {
-  display: flex;
-  gap: 18px;
-  align-items: center;
-}
-.count-item { text-align: center; min-width: 40px; }
-.count-num {
-  font-size: 22px;
-  font-weight: 700;
-  font-family: var(--mono);
-  line-height: 1;
-}
-.count-lbl {
-  font-size: 9px;
-  color: var(--muted);
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  margin-top: 2px;
-}
-.avg-block { text-align: right; }
-.avg-num {
-  font-size: 22px;
-  font-weight: 700;
-  font-family: var(--mono);
-  color: var(--purple);
-  line-height: 1;
-}
-.avg-lbl {
-  font-size: 9px;
-  color: var(--muted);
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  margin-top: 2px;
-}
-.action-badge {
-  padding: 4px 12px;
-  border-radius: 5px;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.5px;
-  white-space: nowrap;
-  text-transform: uppercase;
-}
-.mcc-dist {
-  display: flex;
-  gap: 2px;
-  height: 3px;
-  width: 100%;
-  border-radius: 2px;
-  overflow: hidden;
-  margin: 10px 0 0;
-}
-.dist-seg { height: 100%; }
-.mcc-note {
-  font-size: 10px;
-  color: var(--muted);
   font-style: italic;
-  margin-top: 6px;
+  margin: 2px 0 14px;
+  letter-spacing: 0.01em;
 }
 
 /* ── Score cards ── */
@@ -209,13 +159,13 @@ _CSS = """
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 8px;
-  margin: 0 0 16px;
+  margin: 0 0 14px;
 }
 .score-card {
   background: var(--bg1);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 10px 12px;
+  padding: 12px 14px 10px;
 }
 .sc-title {
   font-size: 9px;
@@ -223,13 +173,14 @@ _CSS = """
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--muted);
-  margin-bottom: 5px;
+  margin-bottom: 6px;
 }
 .sc-value {
-  font-size: 24px;
+  font-size: 28px;
   font-weight: 700;
   font-family: var(--mono);
   line-height: 1;
+  margin-bottom: 6px;
 }
 .sc-bar-track {
   height: 3px;
@@ -240,9 +191,9 @@ _CSS = """
 }
 .sc-bar-fill { height: 100%; border-radius: 2px; }
 .sc-sub {
-  font-size: 10px;
+  font-size: 9.5px;
   color: var(--muted);
-  margin-top: 4px;
+  margin-top: 5px;
 }
 
 /* ── Signal class badge in table ── */
@@ -254,6 +205,43 @@ _CSS = """
   font-weight: 700;
   letter-spacing: 0.06em;
   white-space: nowrap;
+}
+
+/* ── Signal class counts row ── */
+.sc-counts {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin: 4px 0 12px;
+}
+.sc-count-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-family: var(--mono);
+}
+.sc-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.sc-count-label { color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: 0.05em; }
+.sc-count-num   { font-weight: 700; }
+
+/* ── Section label ── */
+.section-label {
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  border-left-width: 2px;
+  border-left-style: solid;
 }
 
 /* ── Breakdown panel ── */
@@ -292,14 +280,6 @@ _CSS = """
   text-transform: uppercase;
   width: 80px;
   flex-shrink: 0;
-}
-
-/* ── Section class counts ── */
-.sc-counts {
-  display: flex;
-  gap: 14px;
-  flex-wrap: wrap;
-  margin: 4px 0 12px;
 }
 </style>
 """
@@ -345,36 +325,34 @@ def _cat_badge(category: str) -> str:
     )
 
 
-# ── REGIME PANEL ──────────────────────────────────────────────────
+# ── MARKET STATUS ROW ──────────────────────────────────────────────
 
-def _regime_panel(summary: dict) -> str:
-    r          = summary.get("regime", "RANGE")
-    color, bg, border_c = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
+def _market_status_row(summary: dict, scan_time: str, nifty_price: float = 0) -> str:
+    r = summary.get("regime", "RANGE")
+    color, _, _ = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
+    regime_label = {"TREND": "TREND", "RANGE": "RANGE", "VOLATILE": "VOLATILE"}.get(r, r)
 
-    regime_label  = {"TREND": "Bull", "RANGE": "Range", "VOLATILE": "Bear"}.get(r, r)
-    ema50_html    = (
-        f'<b style="color:#3fb950">▲ EMA50</b>' if summary.get("nifty_ema50")
-        else f'<b style="color:#f85149">▼ EMA50</b>'
-    )
-    vix_val  = "{:.1f}".format(summary.get("vix", 0))
-    adx_val  = "{:.0f}".format(summary.get("adx", 0))
+    ema50_up   = summary.get("nifty_ema50", False)
+    ema50_txt  = "▲ EMA50" if ema50_up else "▼ EMA50"
+    ema50_col  = "#3fb950" if ema50_up else "#f85149"
 
-    n_elite   = summary.get("n_elite", 0)
-    n_execute = summary.get("n_execute", 0)
-    n_watch   = summary.get("n_watch", 0)
-    n_skip    = summary.get("n_skip", 0)
-    n_total   = max(1, summary.get("n_total", 1))
-    avg_cv    = summary.get("avg_conviction", summary.get("avg_composite", 0))
+    vix_val   = "{:.1f}".format(summary.get("vix", 0))
+    adx_val   = "{:.0f}".format(summary.get("adx", 0))
+    nifty_str = "{:,.0f}".format(nifty_price) if nifty_price else "—"
 
-    # Action badge
-    if n_elite > 0:
-        badge_label, badge_color = "Elite setups", "#f5c542"
-    elif n_execute > 0:
-        badge_label, badge_color = "Execute", "#3fb950"
-    elif n_watch > 0:
-        badge_label, badge_color = "Watch only", "#d29922"
+    # %Chg from summary if available
+    pct_chg = summary.get("nifty_chg_pct", None)
+    if pct_chg is not None:
+        pct_sign  = "+" if pct_chg >= 0 else ""
+        pct_color = "#3fb950" if pct_chg >= 0 else "#f85149"
+        pct_html  = f'<span style="color:{pct_color};font-weight:700">{pct_sign}{pct_chg:.2f}%</span>'
     else:
-        badge_label, badge_color = "No setups", "#484f58"
+        pct_html = '<span style="color:var(--muted)">%Chg</span>'
+
+    scan_chip = (
+        f'<span class="last-scan-chip">Last scan: <b>{scan_time} IST</b></span>'
+        if scan_time else ""
+    )
 
     mkt_text = {
         "TREND":    "Trending market · Full position sizing active.",
@@ -382,47 +360,18 @@ def _regime_panel(summary: dict) -> str:
         "VOLATILE": "Volatile market · Execute gate closed · No new positions.",
     }.get(r, "")
 
-    # Gradient bar percentages
-    p_elite   = n_elite / n_total * 100
-    p_execute = max(0, (n_execute - n_elite)) / n_total * 100
-    p_watch   = n_watch / n_total * 100
-    p_skip    = max(0, n_skip) / n_total * 100
-
-    dist_segs = (
-        f'<div class="dist-seg" style="flex:{p_elite:.1f} 1 0%;background:#f5c542;min-width:{2 if p_elite>0 else 0}px"></div>'
-        f'<div class="dist-seg" style="flex:{p_execute:.1f} 1 0%;background:#3fb950;min-width:{2 if p_execute>0 else 0}px"></div>'
-        f'<div class="dist-seg" style="flex:{p_watch:.1f} 1 0%;background:#d29922;min-width:{2 if p_watch>0 else 0}px"></div>'
-        f'<div class="dist-seg" style="flex:{p_skip:.1f} 1 0%;background:#21262d;min-width:{2 if p_skip>0 else 0}px"></div>'
-    )
-
     return f"""
-<div class="mcc" style="background:{bg};border-color:{border_c}44;">
-  <div class="mcc" style="background:none;border:none;padding:0;margin:0;overflow:visible;">
-    <style>.mcc::before {{ background: linear-gradient(90deg, #f5c542 0 {p_elite:.1f}%, #3fb950 {p_elite:.1f}% {p_elite+p_execute:.1f}%, #d29922 {p_elite+p_execute:.1f}% {p_elite+p_execute+p_watch:.1f}%, #21262d {p_elite+p_execute+p_watch:.1f}% 100%) !important; }}</style>
-  </div>
-  <div class="mcc-row">
-    <span class="regime-pill" style="background:{color}1a;border:1px solid {color}55;color:{color}">{regime_label}</span>
-    <div class="mcc-pills">
-      <span class="mcc-pill">VIX <b>{vix_val}</b></span>
-      <span class="mcc-pill">Nifty {ema50_html}</span>
-      <span class="mcc-pill">ADX <b>{adx_val}</b></span>
-    </div>
-    <div style="margin-left:auto;display:flex;align-items:center;gap:12px;">
-      <div class="mcc-counts">
-        <div class="count-item"><div class="count-num" style="color:#f5c542">{n_elite}</div><div class="count-lbl">Elite</div></div>
-        <div class="count-item"><div class="count-num" style="color:#3fb950">{n_execute}</div><div class="count-lbl">Execute</div></div>
-        <div class="count-item"><div class="count-num" style="color:#d29922">{n_watch}</div><div class="count-lbl">Watch</div></div>
-        <div class="count-item"><div class="count-num" style="color:#484f58">{n_skip}</div><div class="count-lbl">Skip</div></div>
-      </div>
-      <div class="mcc-divider"></div>
-      <div class="avg-block"><div class="avg-num">{avg_cv}</div><div class="avg-lbl">Avg conviction</div></div>
-      <div class="mcc-divider"></div>
-      <span class="action-badge" style="background:{badge_color}18;border:1px solid {badge_color}44;color:{badge_color}">{badge_label}</span>
-    </div>
-  </div>
-  <div class="mcc-dist">{dist_segs}</div>
-  <p class="mcc-note">{mkt_text}</p>
+<div class="msr">
+  <span class="regime-pill-solid" style="background:{color};color:#0d1117">{regime_label}</span>
+  <span class="msr-chip"><span class="chip-label">Nifty</span>{nifty_str}</span>
+  <span class="msr-chip">{pct_html}</span>
+  <span class="msr-chip" style="color:{ema50_col}">{ema50_txt}</span>
+  <span class="msr-chip"><span class="chip-label">VIX</span>{vix_val}</span>
+  <span class="msr-chip"><span class="chip-label">ADX</span>{adx_val}</span>
+  <span class="msr-spacer"></span>
+  {scan_chip}
 </div>
+<p class="market-note">{mkt_text}</p>
 """
 
 
@@ -438,7 +387,7 @@ def _summary_cards(df: pd.DataFrame) -> str:
     cards = [
         ("Leadership",    _avg("CV1_Leadership"),   False, "Market relative strength"),
         ("Conviction",    _avg("CV1_Conviction"),   False, "Likelihood to hit target"),
-        ("Entry quality", _avg("CV1_EntryQuality"), False, "Good entry right now?"),
+        ("Entry Quality", _avg("CV1_EntryQuality"), False, "Good entry right now?"),
         ("Extension",     _avg("Extension"),        True,  "Move already missed"),
     ]
     html = '<div class="card-grid">'
@@ -470,17 +419,19 @@ def _sc_counts_html(df: pd.DataFrame) -> str:
             continue
         color, label = _SC_STYLE.get(sc, ("#484f58", sc))
         parts.append(
-            f'<span style="color:{color};font-size:11px;font-weight:600">'
-            f'{label}: <b>{n}</b></span>'
+            f'<span class="sc-count-pill">'
+            f'<span class="sc-dot" style="background:{color}"></span>'
+            f'<span class="sc-count-label">{label}:</span>'
+            f'<span class="sc-count-num" style="color:{color}">{n}</span>'
+            f'</span>'
         )
-    return '<div class="sc-counts">' + "  ·  ".join(parts) + '</div>'
+    if not parts:
+        return ""
+    return '<div class="sc-counts">' + "".join(parts) + '</div>'
 
 
 # ── DISPLAY COLUMNS ────────────────────────────────────────────────
 
-# Default column order per spec:
-# Stock | Signal Class | Leadership | Conviction | Entry Quality |
-# Extension | LTP | Day% | Entry | SL | T1 | R:R
 _PRIMARY_COLS = [
     "Stock", "CV1_SignalClass",
     "CV1_Leadership", "CV1_Conviction", "CV1_EntryQuality",
@@ -532,7 +483,7 @@ def _build_display_df(df: pd.DataFrame, detail: bool = False) -> pd.DataFrame:
 
     primary_ordered = [
         "Stock", "Signal Class", "Leadership", "Conviction", "Entry Quality",
-        "Extension", "LTP", "%Chg", "Entry", "SL", "T1", "R:R", "Size%",
+        "Extension", "%Chg", "Entry", "SL", "T1", "R:R", "Size%",
     ]
     primary_cols = [c for c in primary_ordered if c in out.columns]
 
@@ -803,6 +754,13 @@ def render(settings: dict | None = None):
         st.session_state["scan_time"]     = _now_ist().strftime("%H:%M:%S")
         st.session_state["scan_settings"] = effective
 
+        # Store last Nifty close for display
+        try:
+            if nifty_series is not None and len(nifty_series) > 0:
+                st.session_state["nifty_price"] = float(nifty_series.iloc[-1])
+        except Exception:
+            pass
+
         if supabase_ok and save_db:
             save_scan_snapshot(df_aug)
             st.success("✅ Saved to Supabase.")
@@ -812,6 +770,7 @@ def render(settings: dict | None = None):
     summary      = st.session_state.get("scan_summary",  {})
     scan_time    = st.session_state.get("scan_time",     "")
     eff_settings = st.session_state.get("scan_settings", settings)
+    nifty_price  = st.session_state.get("nifty_price",   0)
 
     if df_aug.empty:
         st.markdown("""
@@ -822,12 +781,10 @@ def render(settings: dict | None = None):
         </div>""", unsafe_allow_html=True)
         return
 
-    # ── Regime header ────────────────────────────────────────
-    st.markdown(_regime_panel(summary), unsafe_allow_html=True)
-    if scan_time:
-        st.caption(f"Last scan: {scan_time} IST")
+    # ── Market Status Row ────────────────────────────────────────
+    st.markdown(_market_status_row(summary, scan_time, nifty_price), unsafe_allow_html=True)
 
-    # ── Score cards ──────────────────────────────────────────
+    # ── Score cards ──────────────────────────────────────────────
     active_df = (
         df_aug[df_aug["CV1_SignalClass"] != "SKIP"]
         if "CV1_SignalClass" in df_aug.columns else df_aug
@@ -835,17 +792,20 @@ def render(settings: dict | None = None):
     if not active_df.empty:
         st.markdown(_summary_cards(active_df), unsafe_allow_html=True)
 
-    # ── CV1 counts ───────────────────────────────────────────
+    # ── CV1 counts ───────────────────────────────────────────────
     if "CV1_SignalClass" in df_aug.columns:
         st.markdown(_sc_counts_html(df_aug), unsafe_allow_html=True)
 
-    # ── Validation toggle ────────────────────────────────────
+    # ── Validation toggle ────────────────────────────────────────
     val_mode = st.checkbox(
         "🔬 Validation mode — Signal Class vs legacy tier side-by-side",
         value=False, key="chk_validation_mode",
     )
 
-    # ── Split by Signal Class ────────────────────────────────
+    # ── Show SKIP toggle ─────────────────────────────────────────
+    show_skip = st.checkbox("Show SKIP candidates", value=False, key="chk_show_skip")
+
+    # ── Split by Signal Class ────────────────────────────────────
     has_cv1 = "CV1_SignalClass" in df_aug.columns
 
     def _sc_df(sc):
@@ -864,8 +824,6 @@ def render(settings: dict | None = None):
         elite_df   = df_aug[df_aug["Category"] == "Elite Opportunity"].copy() if has_cat else pd.DataFrame()
         execute_df = df_aug[df_aug["Category"].isin(["High Conviction", "Actionable"])].copy() if has_cat else pd.DataFrame()
         watch_df   = df_aug[df_aug["Category"] == "Setup Building"].copy() if has_cat else pd.DataFrame()
-
-    show_skip = st.checkbox("Show SKIP candidates", value=False, key="chk_show_skip")
 
     tab_labels = [
         f"🌟 Elite ({len(elite_df)})",
@@ -894,10 +852,9 @@ def render(settings: dict | None = None):
                     st.info(f"No {sc_key} candidates in this scan.")
                 continue
 
-            # Action label
+            # Section label
             st.markdown(
-                f'<div style="border-left:2px solid {sc_color};padding:3px 10px;'
-                f'margin-bottom:8px;font-size:11px;color:{sc_color};font-weight:600;">'
+                f'<div class="section-label" style="border-left-color:{sc_color};color:{sc_color};">'
                 f'{sc_label}</div>',
                 unsafe_allow_html=True,
             )
