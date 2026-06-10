@@ -293,6 +293,7 @@ def generate_signals_historical(
             "setup":           r.setup,
             "buy_type":        r.buy_type,
             "tier":            r.tier,
+            "structural_entry": r.structural_entry,
             "rs_positive":     r.rs_positive,
             "rs_val":          r.rs_val,
             "rs3":             r.rs3,
@@ -464,6 +465,7 @@ def simulate_trades(
             "setup":           sig.get("setup", "-"),
             "buy_type":        sig.get("buy_type", "-"),
             "tier":            sig.get("tier", "-"),
+            "structural_entry": bool(sig.get("structural_entry", False)),
             "tier1_prime":     bool(sig.get("tier1_prime",    False)),
             "tier2_momentum":  bool(sig.get("tier2_momentum", False)),
             "elite_tier":      bool(sig.get("elite_tier",     False)),
@@ -997,11 +999,46 @@ def compute_stats(trades: pd.DataFrame) -> dict:
     buy_type_stats = {}
     if "buy_type" in trades.columns:
         for bt, grp in trades.groupby("buy_type"):
-            w = grp[grp["pnl_pct"] > 0]
+            w   = grp[grp["pnl_pct"] > 0]
+            l   = grp[grp["pnl_pct"] <= 0]
+            gross_win  = w["pnl_pct"].sum()
+            gross_loss = abs(l["pnl_pct"].sum())
             buy_type_stats[bt] = {
-                "trades":   len(grp),
-                "win_rate": round(len(w) / len(grp) * 100, 1),
-                "avg_pnl":  round(grp["pnl_pct"].mean(), 2),
+                "trades":      len(grp),
+                "win_rate":    round(len(w) / len(grp) * 100, 1),
+                "avg_pnl":     round(grp["pnl_pct"].mean(), 2),
+                "expectancy":  round(
+                    (len(w) / len(grp)) * grp.loc[grp["pnl_pct"] > 0,  "pnl_pct"].mean()
+                    + (len(l) / len(grp)) * grp.loc[grp["pnl_pct"] <= 0, "pnl_pct"].mean()
+                    if len(grp) > 0 else 0, 2),
+                "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else None,
+            }
+
+    # ── T1Pullback (structural entry) diagnostics ─────────────────
+    # Tracks trades where Tier-1 Path A fired but norm_score < 65 left
+    # no momentum buy_type.  Key metrics for the tighten-vs-keep decision.
+    t1pullback_stats: dict = {}
+    if "structural_entry" in trades.columns:
+        _se = trades[trades["structural_entry"] == True]
+        if len(_se) > 0:
+            _se_w = _se[_se["pnl_pct"] > 0]
+            _se_l = _se[_se["pnl_pct"] <= 0]
+            _gw   = _se_w["pnl_pct"].sum()
+            _gl   = abs(_se_l["pnl_pct"].sum())
+            t1pullback_stats = {
+                "trades":        len(_se),
+                "win_rate":      round(len(_se_w) / len(_se) * 100, 1),
+                "avg_pnl":       round(_se["pnl_pct"].mean(), 2),
+                "avg_win":       round(_se_w["pnl_pct"].mean(), 2) if len(_se_w) else 0,
+                "avg_loss":      round(_se_l["pnl_pct"].mean(), 2) if len(_se_l) else 0,
+                "expectancy":    round(
+                    (len(_se_w) / len(_se)) * (_se_w["pnl_pct"].mean() if len(_se_w) else 0)
+                    + (len(_se_l) / len(_se)) * (_se_l["pnl_pct"].mean() if len(_se_l) else 0),
+                    2),
+                "profit_factor": round(_gw / _gl, 2) if _gl > 0 else None,
+                "score_mean":    round(_se["score_at_entry"].mean(), 1) if "score_at_entry" in _se.columns else None,
+                "score_range":   [int(_se["score_at_entry"].min()), int(_se["score_at_entry"].max())] if "score_at_entry" in _se.columns else None,
+                "exit_breakdown": _se["exit_reason"].value_counts().to_dict(),
             }
 
     return {
@@ -1029,6 +1066,8 @@ def compute_stats(trades: pd.DataFrame) -> dict:
         "rs_positive_stats":  _slice("rs_positive"),
         "setup_stats":        setup_stats,
         "buy_type_stats":     buy_type_stats,
+        "t1pullback_stats":   t1pullback_stats,
+        "structural_entry_trades": int(trades["structural_entry"].sum()) if "structural_entry" in trades.columns else 0,
         "fresh_base_stats":   _slice("fresh_base"),
         "rs_top10_stats":     _slice("rs_top_decile"),
         # Score-bin validation: 70-79 / 80-89 / 90+ action bands
