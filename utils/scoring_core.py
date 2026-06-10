@@ -897,35 +897,57 @@ def compute_bar(
     # where the any_buy proxy was continuously active.  bars_since_setup
     # is the distance back to that earliest bar.
     #
-    # Problem: O(N) per bar (60-bar inner loop on each of N bars = O(60N)).
-    # Also conceptually reads future context: at bar i it learns what
-    # happened at bar i-5 only because bar i-5 happened to be part of a run
-    # that eventually led to bar i's signal.
-    #
-    # "signal_dispatch" (candidate replacement)
-    # ──────────────────────────────────────────
+    # "signal_dispatch" (v2 — family-aware, proxy-free)
+    # ──────────────────────────────────────────────────
     # Forward-pass stateful mode.  The caller passes a mutable dict
     # (dispatch_state) into every compute_bar() call for the same symbol.
-    # The dict carries two keys between calls:
-    #   "dispatch_bar"     : bar index when current setup first fired
-    #   "prev_buy_active"  : bool — was any_buy proxy true on the prior bar?
     #
-    # Logic at bar i:
-    #   Build the same any_buy proxy (_buy_s) for bar i only.
-    #   If _buy_s and NOT prev_buy_active  → new dispatch event: record i
-    #   If _buy_s and prev_buy_active      → setup still active: keep dispatch_bar
-    #   If NOT _buy_s                      → no active setup: reset state
-    # bars_since_setup = i - dispatch_bar  (0 on the fire bar)
+    # State carried between bars:
+    #   "dispatch_bar"    : bar index when current signal family first fired
+    #   "active_family"   : buy-type family string of the active signal
+    #   "active_buy_type" : exact buy_type string of the active signal
     #
-    # This is O(1) per bar, and correctly models what a live trading system
-    # sees: the signal was "dispatched" on day X; today is day X+N.
+    # Two-phase execution:
+    #   PHASE 1 (here, before any_buy is computed):
+    #     Read the prior state to determine _setup_bar for this bar.
+    #     any_buy / buy_type are NOT yet available — we use only
+    #     the committed state from the previous bar's write-back.
+    #
+    #   PHASE 2 (after buy_type is assigned, ~line 1411):
+    #     Write new state using the actual any_buy + buy_type computed
+    #     for bar i.  Reset rules (family-aware):
+    #
+    #       any_buy = False          → expire: clear active family
+    #       any_buy = True, same family as prior bar  → continue: age++
+    #       any_buy = True, different family          → reset: dispatch_bar = i
+    #
+    # Buy-type family mapping:
+    #   FIB         → Fib, Fib+CCI
+    #   CCI         → CCI
+    #   NORM        → Norm
+    #   PATTERN     → Harm, ABCD
+    #   COMPRESSION → CmpBrk
+    #
+    # A Fib→Fib continuation is one signal aging.
+    # A Fib→CCI or Fib→Norm transition is a new signal dispatch.
     # ══════════════════════════════════════════════════════════════
 
-    # ── Shared any_buy proxy (used by both modes) ─────────────────
-    # Must be computed BEFORE the mode branch because signal_dispatch
-    # uses it to update state, and legacy uses it in the scan-back check.
+    # ── BUY-TYPE → FAMILY mapping (used by both phases) ──────────
+    _FAMILY_MAP: dict[str, str] = {
+        "Fib":     "FIB",
+        "Fib+CCI": "FIB",
+        "CCI":     "CCI",
+        "CCIRise": "CCI",
+        "Norm":    "NORM",
+        "Harm":    "PATTERN",
+        "ABCD":    "PATTERN",
+        "CmpBrk":  "COMPRESSION",
+    }
+
+    # ── Proxy used exclusively by legacy mode backward scan ───────
+    # signal_dispatch mode does NOT call this function.
     def _buy_proxy_at(j: int) -> bool:
-        """True if bar j satisfies the any_buy proxy condition."""
+        """True if bar j satisfies the any_buy proxy condition (legacy only)."""
         if j < 5:
             return False
         _sc    = ca[j]    if ca    is not None else float(ia.c.iloc[j])
@@ -946,21 +968,23 @@ def compute_bar(
         _atr_sma_j = _atr_j if np.isnan(_atr_sma_j) else _atr_sma_j
         _comp  = (_atr_j < _atr_sma_j * params.t2_atr_ratio) if _atr_sma_j > 0 else False
         _tr    = _sc > _se200 and _se20 > _se50
-        _norm  = _tr and (_sc > _se20)
-        _cci_os = _tr and (_scci < -params.cci_os)
-        return _tr and (_in_gr or _comp or _norm or _cci_os)
+        # Proxy for golden-zone or compression only — avoids the degenerate
+        # _norm = trend_up AND price > EMA20 expansion that plagued v1.
+        return _tr and (_in_gr or _comp)
 
     # ── MODE BRANCH ───────────────────────────────────────────────
     if params.setup_age_mode == "signal_dispatch":
-        # ── SIGNAL_DISPATCH MODE ──────────────────────────────────
-        # Requires a mutable dispatch_state dict passed by the caller.
-        # Falls back to legacy behaviour if no state dict is provided
-        # (e.g. one-shot calls from the live scanner where statefulness
-        # is impossible across independent score_stock() calls).
+        # ── SIGNAL_DISPATCH MODE — PHASE 1 (read prior state) ────
+        #
+        # We cannot evaluate any_buy yet (it requires norm_score, buy flags,
+        # etc. computed later).  Instead we read the dispatch_bar that was
+        # committed by the PREVIOUS bar's Phase 2 write-back.
+        #
+        # If dispatch_state is None (one-shot scanner call with no state
+        # persistence) we fall back to legacy behaviour so the scanner page
+        # remains correct.  The backtest always supplies a state dict.
         if dispatch_state is None:
-            # Graceful fallback: run legacy scan for this bar only.
-            # This ensures scanner page correctness; backtest always
-            # provides a state dict so this path is never hit there.
+            # Graceful fallback: legacy backward scan for this bar only.
             _setup_bar = i
             _scan_limit = min(60, i)
             for _sb in range(1, _scan_limit + 1):
@@ -969,28 +993,18 @@ def compute_bar(
                     break
                 _setup_bar = _sj
         else:
-            # --- Forward-pass stateful dispatch ---
-            _cur_buy = _buy_proxy_at(i)
-            _prev_active = dispatch_state.get("prev_buy_active", False)
-
-            if _cur_buy:
-                if not _prev_active:
-                    # New setup firing — record this bar as dispatch point
-                    dispatch_state["dispatch_bar"] = i
-                # else: continuing run — keep existing dispatch_bar
+            # Read the dispatch_bar committed by the prior bar.
+            # If no prior bar has fired yet, treat this bar as dispatch=i
+            # (age = 0).  Phase 2 will overwrite if any_buy fires.
+            _prior_active = dispatch_state.get("active_family", None) is not None
+            if _prior_active:
                 _setup_bar = dispatch_state.get("dispatch_bar", i)
             else:
-                # Setup not active on this bar — reset state
-                dispatch_state["dispatch_bar"] = i   # sentinel: will be overwritten on next fire
-                _setup_bar = i  # 0 elapsed (no active setup)
-
-            # Update prev_buy_active for next bar
-            dispatch_state["prev_buy_active"] = _cur_buy
+                _setup_bar = i  # no active signal — age = 0 until Phase 2 decides
 
     else:
         # ── LEGACY MODE (default, production) ────────────────────
         # Scans backwards from bar i to find earliest continuous any_buy run.
-        # FIX (v10): scan limit raised from 15 to 60 bars.
         _setup_bar = i
         _scan_limit = min(60, i)
         for _sb in range(1, _scan_limit + 1):
@@ -1409,6 +1423,36 @@ def compute_bar(
         "CmpBrk"  if is_tier2_momentum  else
         "Norm"    if is_norm_buy        else "-"
     )
+
+    # ── SIGNAL_DISPATCH — PHASE 2 (state write-back) ──────────────
+    # Runs after buy_type is assigned so we can use the actual signal
+    # output rather than a proxy.  Only executed in signal_dispatch mode
+    # when a real state dict is available.
+    if (params.setup_age_mode == "signal_dispatch"
+            and dispatch_state is not None):
+        _cur_family = _FAMILY_MAP.get(buy_type, None) if any_buy else None
+        _prior_family = dispatch_state.get("active_family", None)
+
+        if _cur_family is None:
+            # ── No active signal this bar — expire state ──────────
+            dispatch_state["active_family"]   = None
+            dispatch_state["active_buy_type"] = None
+            # dispatch_bar left stale; Phase 1 won't use it while
+            # active_family is None.
+        elif _cur_family == _prior_family:
+            # ── Same family — signal continues, age accumulates ───
+            # dispatch_bar is unchanged (set when this family first fired)
+            dispatch_state["active_buy_type"] = buy_type
+            # _setup_bar already holds the correct prior dispatch_bar from
+            # Phase 1; no adjustment needed.
+        else:
+            # ── Different family — new signal, reset dispatch ─────
+            dispatch_state["dispatch_bar"]    = i
+            dispatch_state["active_family"]   = _cur_family
+            dispatch_state["active_buy_type"] = buy_type
+            # Also fix _setup_bar for the current bar so bars_since_setup
+            # reports 0 on the transition bar, not the prior family's age.
+            _setup_bar = i
 
     # ── EXECUTION TIER FLAG ───────────────────────────────────────
     # Execution = score>=85 AND rs>=0.10 AND buy_type in [Norm, CmpBrk]
