@@ -107,6 +107,14 @@ class ScoringParams:
     # RS: -10, trend_age: +5, ADX: +5, CCI_OS: +5 net change in raw max = +5 total.
     max_score: int = 265
 
+    # ── Setup-age detection mode (A/B feature flag) ──────────────
+    # "legacy"          — scan back up to 60 bars from current bar to find the
+    #                     earliest continuous any_buy run (existing behaviour).
+    # "signal_dispatch" — forward-pass stateful mode: records the exact bar when
+    #                     any_buy first fires and carries it forward. O(1) per bar.
+    #                     Caller must pass a dispatch_state dict into compute_bar().
+    setup_age_mode: str = "legacy"   # "legacy" | "signal_dispatch"
+
     @classmethod
     def from_settings(cls, s: dict) -> "ScoringParams":
         """Build from the settings dict produced by pages/settings.py."""
@@ -135,6 +143,7 @@ class ScoringParams:
             t2_vol_mult      = float(s.get("t2_vol_mult",        1.2)),
             nifty_regime_filter = bool(s.get("nifty_regime_filter", False)),
             nifty_regime_val    = str(s.get("nifty_regime_val",  "neutral")),
+            setup_age_mode      = str(s.get("setup_age_mode",    "legacy")),
         )
 
 
@@ -571,10 +580,11 @@ def _get_pivots(ia: IndicatorArrays, i: int, pvt_lb: int):
 # ══════════════════════════════════════════════════════════════════
 
 def compute_bar(
-    ia:     IndicatorArrays,
-    i:      int,
-    params: ScoringParams,
-) -> BarResult | None:
+    ia:             IndicatorArrays,
+    i:              int,
+    params:         ScoringParams,
+    dispatch_state: dict | None = None,
+) -> "BarResult | None":
     """
     Evaluate bar i of the pre-computed indicator arrays.
 
@@ -875,65 +885,121 @@ def compute_bar(
         _last_pivot_hi = float(h.iloc[max(0, i - _pvt_lb_half):i].max()) if i > 0 else cur_c
     pivot_high_dist = ((cur_c - _last_pivot_hi) / _last_pivot_hi * 100) if _last_pivot_hi > 0 else 0.0
 
-    # ── SETUP DETECTED BAR (scan back to find first any_buy signal) ──────
-    # Scans backwards from bar i up to 15 bars to find the EARLIEST bar where
-    # the current setup was already active, so bars_since_setup reflects true
-    # signal age for the decision engine's extension banding.
+    # ══════════════════════════════════════════════════════════════
+    #  SETUP-AGE DETECTION  (feature-flagged: legacy vs signal_dispatch)
+    # ══════════════════════════════════════════════════════════════
     #
-    # FIX (v8.1): The previous proxy used in_golden_relaxed | compression | CCI_OS.
-    # This was structurally mismatched with the actual entry gate (any_buy):
-    #   • is_norm_buy requires NOT in_golden → proxy always False for it
-    #   • Once a fib signal fires and price breaks out, _in_gr_s = False on
-    #     bar i-1 → loop broke immediately → _setup_bar = i → bars_since_setup = 0
-    # Net effect: ~95%+ of signals got bars_since_setup = 0, price_move = 0.0,
-    # and were classified Actionable regardless of actual signal age.
+    # Two modes controlled by params.setup_age_mode:
     #
-    # Corrected proxy matches the full any_buy gate:
-    #   trend_up AND (in_golden_relaxed OR compression OR norm_score_proxy OR cci_os)
-    # where norm_score_proxy = EMA20 > EMA50 AND price > EMA20 (momentum threshold),
-    # which covers is_norm_buy signals that are explicitly NOT in the golden pocket.
-    _setup_bar = i   # default: setup triggered on current bar (0 bars elapsed)
-    # FIX (v10): Removed hard cap of 15.  Previously min(15, i) caused 90%+ of
-    # trades to land at bars_since_setup == 15, destroying stale-setup detection.
-    # Scan up to 60 bars back (≈3 trading months) — sufficient to catch true setup age.
-    _scan_limit = min(60, i)
-    for _sb in range(1, _scan_limit + 1):
-        _sj = i - _sb
-        if _sj < 5:
-            break
-        _sc   = ca[_sj]    if ca    is not None else float(ia.c.iloc[_sj])
-        _se20 = e20a[_sj]  if e20a  is not None else float(ia.e20.iloc[_sj])
-        _se50 = e50a[_sj]  if e50a  is not None else float(ia.e50.iloc[_sj])
-        _se200= e200a[_sj] if e200a is not None else float(ia.e200.iloc[_sj])
-        _scci = ccil[_sj]  if ccil  is not None else float(ia.cci_s.iloc[_sj])
-        if np.isnan(_sc) or np.isnan(_se20) or np.isnan(_se200):
-            break
-        # Fib golden pocket proxy at bar _sj
-        _sw_hi_s = float(np.max(ha[max(0, _sj - params.pvt_lb):_sj + 1])) if ha is not None else _sc
-        _sw_lo_s = float(np.min(la[max(0, _sj - params.pvt_lb):_sj + 1])) if la is not None else _sc
-        _rng_s   = _sw_hi_s - _sw_lo_s
-        _f618_s  = _sw_hi_s - _rng_s * (params.t1_fib_lo / 100.0) if _rng_s > 0 else _sc
-        _f382_s  = _sw_hi_s - _rng_s * (params.t1_fib_hi / 100.0) if _rng_s > 0 else _sc
-        _in_gr_s = (_sc >= _f618_s and _sc <= _f382_s)
-        # Compression proxy
-        _atr_s     = atrl[_sj] if atrl is not None else float(ia.atr_s.iloc[_sj])
-        _atr_sma_s = float(ia.atr_sma_comp.iloc[_sj]) if not np.isnan(float(ia.atr_sma_comp.iloc[_sj])) else _atr_s
-        _comp_s    = (_atr_s < _atr_sma_s * params.t2_atr_ratio) if _atr_sma_s > 0 else False
-        # Trend flag — same as trend_up at bar _sj
-        _tr_s = _sc > _se200 and _se20 > _se50
-        # Norm-buy proxy: covers is_norm_buy (price above EMA20, EMA stack intact).
-        # Deliberately broad — we want to capture all any_buy paths, not just Fib.
-        _norm_s = _tr_s and (_sc > _se20)
-        # CCI oversold path: matches is_cci_buy entry condition
-        _cci_os_s = _tr_s and (_scci < -params.cci_os)
-        # Combined: any_buy proxy — True if ANY standard entry path was active
-        _buy_s = _tr_s and (_in_gr_s or _comp_s or _norm_s or _cci_os_s)
-        if _buy_s:
-            _setup_bar = _sj   # extend setup window further back
-        else:
-            break   # gap in signal continuity — setup started after this bar
+    # "legacy" (default, production)
+    # ───────────────────────────────
+    # Scans backwards from bar i up to 60 bars to find the EARLIEST bar
+    # where the any_buy proxy was continuously active.  bars_since_setup
+    # is the distance back to that earliest bar.
+    #
+    # Problem: O(N) per bar (60-bar inner loop on each of N bars = O(60N)).
+    # Also conceptually reads future context: at bar i it learns what
+    # happened at bar i-5 only because bar i-5 happened to be part of a run
+    # that eventually led to bar i's signal.
+    #
+    # "signal_dispatch" (candidate replacement)
+    # ──────────────────────────────────────────
+    # Forward-pass stateful mode.  The caller passes a mutable dict
+    # (dispatch_state) into every compute_bar() call for the same symbol.
+    # The dict carries two keys between calls:
+    #   "dispatch_bar"     : bar index when current setup first fired
+    #   "prev_buy_active"  : bool — was any_buy proxy true on the prior bar?
+    #
+    # Logic at bar i:
+    #   Build the same any_buy proxy (_buy_s) for bar i only.
+    #   If _buy_s and NOT prev_buy_active  → new dispatch event: record i
+    #   If _buy_s and prev_buy_active      → setup still active: keep dispatch_bar
+    #   If NOT _buy_s                      → no active setup: reset state
+    # bars_since_setup = i - dispatch_bar  (0 on the fire bar)
+    #
+    # This is O(1) per bar, and correctly models what a live trading system
+    # sees: the signal was "dispatched" on day X; today is day X+N.
+    # ══════════════════════════════════════════════════════════════
 
-    bars_since_setup   = i - _setup_bar
+    # ── Shared any_buy proxy (used by both modes) ─────────────────
+    # Must be computed BEFORE the mode branch because signal_dispatch
+    # uses it to update state, and legacy uses it in the scan-back check.
+    def _buy_proxy_at(j: int) -> bool:
+        """True if bar j satisfies the any_buy proxy condition."""
+        if j < 5:
+            return False
+        _sc    = ca[j]    if ca    is not None else float(ia.c.iloc[j])
+        _se20  = e20a[j]  if e20a  is not None else float(ia.e20.iloc[j])
+        _se50  = e50a[j]  if e50a  is not None else float(ia.e50.iloc[j])
+        _se200 = e200a[j] if e200a is not None else float(ia.e200.iloc[j])
+        _scci  = ccil[j]  if ccil  is not None else float(ia.cci_s.iloc[j])
+        if np.isnan(_sc) or np.isnan(_se20) or np.isnan(_se200):
+            return False
+        _sw_hi = float(np.max(ha[max(0, j - params.pvt_lb):j + 1])) if ha is not None else _sc
+        _sw_lo = float(np.min(la[max(0, j - params.pvt_lb):j + 1])) if la is not None else _sc
+        _rng   = _sw_hi - _sw_lo
+        _f618  = _sw_hi - _rng * (params.t1_fib_lo / 100.0) if _rng > 0 else _sc
+        _f382  = _sw_hi - _rng * (params.t1_fib_hi / 100.0) if _rng > 0 else _sc
+        _in_gr = (_sc >= _f618 and _sc <= _f382)
+        _atr_j     = atrl[j] if atrl is not None else float(ia.atr_s.iloc[j])
+        _atr_sma_j = float(ia.atr_sma_comp.iloc[j])
+        _atr_sma_j = _atr_j if np.isnan(_atr_sma_j) else _atr_sma_j
+        _comp  = (_atr_j < _atr_sma_j * params.t2_atr_ratio) if _atr_sma_j > 0 else False
+        _tr    = _sc > _se200 and _se20 > _se50
+        _norm  = _tr and (_sc > _se20)
+        _cci_os = _tr and (_scci < -params.cci_os)
+        return _tr and (_in_gr or _comp or _norm or _cci_os)
+
+    # ── MODE BRANCH ───────────────────────────────────────────────
+    if params.setup_age_mode == "signal_dispatch":
+        # ── SIGNAL_DISPATCH MODE ──────────────────────────────────
+        # Requires a mutable dispatch_state dict passed by the caller.
+        # Falls back to legacy behaviour if no state dict is provided
+        # (e.g. one-shot calls from the live scanner where statefulness
+        # is impossible across independent score_stock() calls).
+        if dispatch_state is None:
+            # Graceful fallback: run legacy scan for this bar only.
+            # This ensures scanner page correctness; backtest always
+            # provides a state dict so this path is never hit there.
+            _setup_bar = i
+            _scan_limit = min(60, i)
+            for _sb in range(1, _scan_limit + 1):
+                _sj = i - _sb
+                if not _buy_proxy_at(_sj):
+                    break
+                _setup_bar = _sj
+        else:
+            # --- Forward-pass stateful dispatch ---
+            _cur_buy = _buy_proxy_at(i)
+            _prev_active = dispatch_state.get("prev_buy_active", False)
+
+            if _cur_buy:
+                if not _prev_active:
+                    # New setup firing — record this bar as dispatch point
+                    dispatch_state["dispatch_bar"] = i
+                # else: continuing run — keep existing dispatch_bar
+                _setup_bar = dispatch_state.get("dispatch_bar", i)
+            else:
+                # Setup not active on this bar — reset state
+                dispatch_state["dispatch_bar"] = i   # sentinel: will be overwritten on next fire
+                _setup_bar = i  # 0 elapsed (no active setup)
+
+            # Update prev_buy_active for next bar
+            dispatch_state["prev_buy_active"] = _cur_buy
+
+    else:
+        # ── LEGACY MODE (default, production) ────────────────────
+        # Scans backwards from bar i to find earliest continuous any_buy run.
+        # FIX (v10): scan limit raised from 15 to 60 bars.
+        _setup_bar = i
+        _scan_limit = min(60, i)
+        for _sb in range(1, _scan_limit + 1):
+            _sj = i - _sb
+            if not _buy_proxy_at(_sj):
+                break
+            _setup_bar = _sj   # extend window further back
+
+    bars_since_setup    = i - _setup_bar
     setup_trigger_close = ca[_setup_bar] if (ca is not None and _setup_bar >= 0) else cur_c
     price_move_since_setup = ((cur_c - setup_trigger_close) / setup_trigger_close * 100
                                if setup_trigger_close > 0 else 0.0)
