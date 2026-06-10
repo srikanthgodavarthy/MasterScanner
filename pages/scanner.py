@@ -72,8 +72,10 @@ _CSS = """
 /* Regime panel */
 .regime-panel { border-radius:12px; padding:14px 20px; margin-bottom:18px; position:relative; }
 .regime-badge { display:inline-block; padding:3px 14px; border-radius:5px; font-weight:800; font-size:13px; letter-spacing:1.5px; }
-.regime-weights { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
-.wt-pill { display:inline-block; padding:2px 10px; border-radius:20px; font-size:11px; font-weight:600; font-family:'JetBrains Mono',monospace; }
+.mcc-header { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:10px; }
+.mcc-metrics { display:flex; gap:6px; flex-wrap:wrap; margin:8px 0; }
+.mcc-metric { background:#0c1520; border:1px solid #1e293b; border-radius:6px; padding:4px 10px; font-size:11px; color:#94a3b8; font-family:'JetBrains Mono',monospace; }
+.mcc-metric b { color:#e2e8f0; }
 
 /* Score engine blocks */
 .de-grid { display:flex; gap:8px; margin:6px 0; flex-wrap:wrap; }
@@ -184,78 +186,90 @@ def _grade_pill(grade: str) -> str:
 def _regime_panel(summary: dict) -> str:
     r = summary["regime"]
     color, bg, border = REGIME_COLORS.get(r, ("#94a3b8", "#1e293b", "#334155"))
-    weights = summary["weights"]
 
-    wt_pills = "".join(
-        '<span class="wt-pill" style="background:' + color + '18;border:1px solid ' + color + '44;color:' + color + '">'
-        + k + " " + str(int(v * 100)) + "%</span>"
-        for k, v in weights.items()
-    )
-
-    gate_color = "#22c55e" if r == "TREND" else "#f59e0b"
-    gate_label = "EXECUTE eligible" if r == "TREND" else "WATCH only"
-
-    ema50_html  = '<b style="color:#22c55e">▲ EMA50</b>' if summary["nifty_ema50"]  else '<b style="color:#ef4444">▼ EMA50</b>'
-    ema200_html = '&nbsp;·&nbsp; <b style="color:#22c55e">▲ EMA200</b>' if summary["nifty_ema200"] else ""
-
+    # ── Header bar signals ────────────────────────────────────────
+    regime_label = {"TREND": "Bull", "RANGE": "Range", "VOLATILE": "Bear"}.get(r, r)
+    ema50_html   = ('<b style="color:#22c55e">▲ EMA50</b>' if summary["nifty_ema50"]
+                    else '<b style="color:#ef4444">▼ EMA50</b>')
     vix_val  = "{:.1f}".format(summary["vix"])
     adx_val  = "{:.0f}".format(summary["adx"])
-    n_total  = max(1, summary.get("n_total", 1))
-    n_elite  = summary.get("n_elite", 0)
-    n_t1     = summary.get("n_tier1", 0)
-    n_t2     = summary.get("n_tier2", 0)
-    n_wa     = summary.get("n_watch", 0)
-    n_sk     = summary.get("n_skip",  0)
-    avg_comp = str(summary["avg_composite"])
-    avg_rs   = str(summary["avg_rs"])
 
+    # ── Primary status badge ──────────────────────────────────────
+    n_elite   = summary.get("n_elite", 0)
+    n_execute = summary.get("n_execute", 0)
+    n_wa      = summary.get("n_watch", 0)
+    n_sk      = summary.get("n_skip", 0)
+    n_total   = max(1, summary.get("n_total", 1))
+    avg_cv    = summary.get("avg_conviction", summary.get("avg_composite", 0))
+
+    if n_elite > 0:
+        status_label, status_color = "ELITE SETUPS", "#ffd700"
+    elif n_execute > n_elite:
+        status_label, status_color = "EXECUTE", "#22c55e"
+    elif n_wa > 0:
+        status_label, status_color = "WATCH ONLY", "#f59e0b"
+    else:
+        status_label, status_color = "NO SETUPS", "#64748b"
+
+    # ── Market guidance text ──────────────────────────────────────
+    mkt_text = {
+        "TREND":    "Trending market · Full position sizing active.",
+        "RANGE":    "Range-bound market · Gate restricted · Half position sizing.",
+        "VOLATILE": "Volatile market · Execute gate closed · No new positions.",
+    }.get(r, "")
+
+    # ── Distribution bar ──────────────────────────────────────────
     def _seg(count, total, clr, lbl):
         pct = count / total * 100
         return (
-            f'<div style="flex:{pct:.1f} 1 0%;min-width:2px;background:{clr};height:8px;'
+            f'<div style="flex:{pct:.1f} 1 0%;min-width:2px;background:{clr};height:6px;'
             f'border-radius:2px;margin:0 1px;" title="{lbl}: {count}"></div>'
         )
 
-    tier_bar = (
-        '<div style="display:flex;width:100%;border-radius:4px;overflow:hidden;margin:10px 0 4px;">' +
-        _seg(n_elite, n_total, "#ffd700", "Elite") +
-        _seg(n_t1,    n_total, "#22c55e", "Tier-1") +
-        _seg(n_t2,    n_total, "#4ade80", "Tier-2") +
-        _seg(n_wa,    n_total, "#f59e0b", "Watch") +
-        _seg(n_sk,    n_total, "#1e293b", "Skip") +
-        '</div>'
+    dist_bar = (
+        '<div style="display:flex;width:100%;border-radius:4px;overflow:hidden;margin:10px 0 6px;">'
+        + _seg(n_elite,            n_total, "#ffd700", "Elite")
+        + _seg(n_execute - n_elite, n_total, "#22c55e", "Execute")
+        + _seg(n_wa,               n_total, "#f59e0b", "Watch")
+        + _seg(n_sk,               n_total, "#1e293b", "Skip")
+        + '</div>'
     )
-
-    mkt_sentences = {
-        "TREND":    f"Trending market · {n_elite + n_t1 + n_t2} execution candidates · Avg RS +{avg_rs}. Full position sizing active.",
-        "RANGE":    "Range-bound market · Execute gate restricted · Half position sizing.",
-        "VOLATILE": "Volatile market · Execute gate closed · No new positions.",
-    }
 
     return (
         '<div class="regime-panel" style="background:' + bg + ';border:1px solid ' + border + '44;">'
-        + '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">'
-        + '<span class="regime-badge" style="background:' + color + '22;border:1px solid ' + color + ';color:' + color + '">' + r + '</span>'
-        + '<span style="color:#94a3b8;font-size:12px;">'
-        + 'VIX <b style="color:#e2e8f0">' + vix_val + '</b>'
-        + '&nbsp;·&nbsp; ADX <b style="color:#e2e8f0">' + adx_val + '</b>'
-        + '&nbsp;·&nbsp; Nifty ' + ema50_html
-        + ema200_html
-        + '</span>'
-        + '<span style="margin-left:auto;font-size:11px;padding:2px 10px;border-radius:4px;'
-        + 'background:' + gate_color + '18;border:1px solid ' + gate_color + '44;'
-        + 'color:' + gate_color + ';font-weight:700;">' + gate_label + '</span>'
+
+        # ── Title + header metrics ────────────────────────────────
+        + '<div class="mcc-header">'
+        + '<span style="font-size:10px;font-weight:700;letter-spacing:1.5px;color:#64748b;text-transform:uppercase;">Market Command Center</span>'
+        + '<span style="margin-left:auto;"></span>'
         + '</div>'
-        + '<div class="regime-weights">' + wt_pills + '</div>'
-        + tier_bar
-        + '<p style="font-size:10.5px;color:#64748b;margin:4px 0 8px;font-style:italic;">' + mkt_sentences.get(r, "") + '</p>'
-        + '<div style="display:flex;gap:24px;margin-top:4px;">'
-        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#ffd700">' + str(n_elite) + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">ELITE</div></div>'
-        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#22c55e">' + str(n_t1 + n_t2) + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">EXECUTE</div></div>'
-        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#f59e0b">' + str(n_wa) + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">WATCH</div></div>'
-        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#94a3b8">' + str(n_sk) + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">SKIP</div></div>'
-        + '<div style="text-align:center"><div style="font-size:24px;font-weight:800;color:#818cf8">' + avg_comp + '</div><div style="font-size:10px;color:#64748b;letter-spacing:1px">AVG SCORE</div></div>'
+
+        + '<div class="mcc-header" style="margin-bottom:0;">'
+        + '<span class="regime-badge" style="background:' + color + '22;border:1px solid ' + color + ';color:' + color + '">' + regime_label + '</span>'
+        + '<div class="mcc-metrics" style="margin:0;">'
+        + '<span class="mcc-metric">VIX <b>' + vix_val + '</b></span>'
+        + '<span class="mcc-metric">Nifty ' + ema50_html + '</span>'
+        + '<span class="mcc-metric">ADX <b>' + adx_val + '</b></span>'
         + '</div>'
+        + '<span style="margin-left:auto;font-size:11px;padding:3px 12px;border-radius:5px;'
+        + 'background:' + status_color + '18;border:1px solid ' + status_color + '44;'
+        + 'color:' + status_color + ';font-weight:800;letter-spacing:0.8px;">' + status_label + '</span>'
+        + '</div>'
+
+        # ── Distribution bar ──────────────────────────────────────
+        + dist_bar
+
+        # ── Counts row ────────────────────────────────────────────
+        + '<div style="display:flex;gap:20px;margin-top:6px;align-items:flex-end;">'
+        + '<div style="text-align:center"><div style="font-size:26px;font-weight:800;color:#ffd700;font-family:\'JetBrains Mono\',monospace;">' + str(n_elite) + '</div><div style="font-size:9px;color:#64748b;letter-spacing:1px;text-transform:uppercase;">Elite</div></div>'
+        + '<div style="text-align:center"><div style="font-size:26px;font-weight:800;color:#22c55e;font-family:\'JetBrains Mono\',monospace;">' + str(n_execute) + '</div><div style="font-size:9px;color:#64748b;letter-spacing:1px;text-transform:uppercase;">Execute</div></div>'
+        + '<div style="text-align:center"><div style="font-size:26px;font-weight:800;color:#f59e0b;font-family:\'JetBrains Mono\',monospace;">' + str(n_wa) + '</div><div style="font-size:9px;color:#64748b;letter-spacing:1px;text-transform:uppercase;">Watch</div></div>'
+        + '<div style="text-align:center"><div style="font-size:26px;font-weight:800;color:#475569;font-family:\'JetBrains Mono\',monospace;">' + str(n_sk) + '</div><div style="font-size:9px;color:#64748b;letter-spacing:1px;text-transform:uppercase;">Skip</div></div>'
+        + '<div style="text-align:center;margin-left:auto;"><div style="font-size:26px;font-weight:800;color:#818cf8;font-family:\'JetBrains Mono\',monospace;">' + str(avg_cv) + '</div><div style="font-size:9px;color:#64748b;letter-spacing:1px;text-transform:uppercase;">Avg Conviction</div></div>'
+        + '</div>'
+
+        # ── Guidance text ─────────────────────────────────────────
+        + '<p style="font-size:10.5px;color:#64748b;margin:8px 0 2px;font-style:italic;">' + mkt_text + '</p>'
         + '</div>'
     )
 

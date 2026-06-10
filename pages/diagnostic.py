@@ -38,6 +38,16 @@ from utils.backtest_engine import (
     simulate_trades,
 )
 
+try:
+    from zoneinfo import ZoneInfo
+    _IST = ZoneInfo("Asia/Kolkata")
+except ImportError:
+    import pytz
+    _IST = pytz.timezone("Asia/Kolkata")
+
+def _now_ist():
+    return datetime.now(_IST)
+
 # ── Default symbol set (diverse stride across Nifty 500) ─────────────────────
 _ALL_SYMS = list(NIFTY500_SYMBOLS)
 _DEFAULT_N = 60
@@ -624,7 +634,7 @@ def render(settings=None):
     st.download_button(
         "⬇️ Download Merged CSV",
         data     = csv_data,
-        file_name= f"merged_diagnostic_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        file_name= f"merged_diagnostic_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
         mime     = "text/csv",
         key      = "btn_dl_diag_csv",
     )
@@ -648,7 +658,7 @@ def render(settings=None):
     st.markdown(
         "<span style='color:#334155;font-size:0.72rem;'>"
         "🔒 Read-only diagnostic — no scoring logic modified — "
-        f"generated {datetime.now().strftime('%Y-%m-%d %H:%M')} IST"
+        f"generated {_now_ist().strftime('%Y-%m-%d %H:%M')} IST"
         "</span>",
         unsafe_allow_html=True,
     )
