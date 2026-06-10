@@ -302,6 +302,12 @@ class BarResult:
     extension_score_atr: int   = 0       # 0=Actionable, 1=Late, 2=Extended
     atr_band:            str   = "Actionable"  # human-readable tier label
 
+    # ── Structural entry flag ─────────────────────────────────────
+    # True when is_tier1_prime fired via Path A (structural pullback) but
+    # no momentum-based buy_type was assigned.  Used for diagnostics and
+    # to decide whether to tighten Path A's score floor.
+    structural_entry:    bool  = False
+
 
 # ══════════════════════════════════════════════════════════════════
 #  PRE-COMPUTED SERIES BUNDLE  (passed into the bar loop once)
@@ -1424,6 +1430,18 @@ def compute_bar(
         "Norm"    if is_norm_buy        else "-"
     )
 
+    # ── Tier-1 structural entry fallback ─────────────────────────
+    # Path A can fire (trend + Fib zone + CCI recovery + persistence +
+    # structure) on bars where norm_score < 65, making every momentum
+    # classifier False and leaving buy_type == "-".  Label these
+    # explicitly so they appear in analytics rather than as nulls.
+    if buy_type == "-" and is_tier1_prime:
+        buy_type = "T1Pullback"
+
+    # True when this bar is a Tier-1 structural entry (no momentum
+    # classifier matched).  Carry into BarResult for backtest tracking.
+    structural_entry = (is_tier1_prime and buy_type == "T1Pullback")
+
     # ── SIGNAL_DISPATCH — PHASE 2 (state write-back) ──────────────
     # Runs after buy_type is assigned so we can use the actual signal
     # output rather than a proxy.  Only executed in signal_dispatch mode
@@ -1565,6 +1583,7 @@ def compute_bar(
         cci_state  = cci_state,
         cci_signal = cci_signal,
         pct_chg    = pct_chg,
+        structural_entry = structural_entry,
         cur_cci    = cur_cci,
         cur_rsi    = cur_r,
         mom1 = round(mom1, 1),
