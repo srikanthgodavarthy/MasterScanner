@@ -154,9 +154,18 @@ def generate_signals_historical(
 
     # ── Dispatch state for signal_dispatch mode ───────────────────
     # A single mutable dict shared across all bar iterations for this symbol.
-    # compute_bar() updates "dispatch_bar" and "prev_buy_active" in-place.
-    # In legacy mode this dict is passed but ignored inside compute_bar().
-    _dispatch_state: dict = {"dispatch_bar": 0, "prev_buy_active": False}
+    # compute_bar() Phase 2 updates these keys in-place after buy_type is
+    # assigned.  In legacy mode this dict is passed but never written.
+    #
+    # Keys (v2 — family-aware, proxy-free):
+    #   dispatch_bar    : bar index when the current signal family first fired
+    #   active_family   : buy-type family of the active signal (None = no signal)
+    #   active_buy_type : exact buy_type string of the active signal (None = no signal)
+    _dispatch_state: dict = {
+        "dispatch_bar":    0,
+        "active_family":   None,
+        "active_buy_type": None,
+    }
 
     for i in range(210, len(df)):
         r = compute_bar(ia, i, params, dispatch_state=_dispatch_state)
