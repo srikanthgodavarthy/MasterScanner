@@ -211,12 +211,12 @@ def generate_signals_historical(
         _rejection_reason: str = ""
 
         # ── Gate 1: structural extension / staleness ──────────────
-        if r.atr_band == "Extended":
-            _rejection_reason = "EXTENDED_ATR"
-        elif r.bars_since_setup_actual > 7:
-            _rejection_reason = "STALE_SETUP"
-        elif r.extension_score_atr >= 2:
-            _rejection_reason = "HIGH_EXTENSION_SCORE"
+        #if r.atr_band == "Extended":
+        #    _rejection_reason = "EXTENDED_ATR"
+        #elif r.bars_since_setup_actual > 7:
+        #    _rejection_reason = "STALE_SETUP"
+        #elif r.extension_score_atr >= 2:
+        #    _rejection_reason = "HIGH_EXTENSION_SCORE"
 
         # ── Gates 2–5: engine-scored gates (only if gate 1 passed) ─
         # Compute all three engines once; reuse values for signal dict.
