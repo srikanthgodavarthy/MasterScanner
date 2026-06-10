@@ -403,78 +403,8 @@ def _entry_quality(r: "BarResult") -> tuple[int, dict, float]:
     return total, subs, rr
 
 
-#    EMA20 Distance    35  — closer is better (< 2% = excellent, > 8% = late)
-#    Pullback Quality  35  — controlled retracement, low vol pullback
-#    Volatility Pos.   30  — avoid entries after abnormal expansion
-#
-#  Risk/Reward computed from existing trade levels (entry/sl/t1/t2).
-# ══════════════════════════════════════════════════════════════════
-
-def _entry_quality(r: "BarResult") -> tuple[int, dict, float]:
-    """Returns (0-100, sub_scores_dict, risk_reward)."""
-
-    entry = r.entry if r.entry > 0 else 0.0
-    sl    = r.sl    if r.sl    > 0 else 0.0
-    t1    = r.t1    if r.t1    > 0 else 0.0
-    t2    = r.t2    if r.t2    > 0 else 0.0
-
-    # Risk/Reward from existing levels
-    risk   = max(entry - sl, 0.001)
-    reward = t2 - entry if t2 > entry else (t1 - entry if t1 > entry else 0)
-    rr     = round(reward / risk, 2) if risk > 0 else 0.0
-
-    # ── EMA20 Distance (0-35) ─────────────────────────────────────
-    # Computed from existing fields — we proxy via pullback condition signals
-    # In golden zone = price is by definition close to the EMA / Fib levels
-    ema_dist = 0
-    if r.in_golden:            ema_dist = 35   # deep in zone, near EMA
-    elif r.in_golden_relaxed:  ema_dist = 28
-    elif r.t3_near_golden:     ema_dist = 18   # approaching
-    elif r.ema_alignment:      ema_dist = 10   # at least aligned
-    # Penalise if EMA slope is negative (price drifting away from EMA20)
-    if r.ema20_slope < -0.1:   ema_dist = max(ema_dist - 8, 0)
-
-    # ── Pullback Quality (0-35) ───────────────────────────────────
-    pb = 0
-    # CCI recovery = textbook controlled pullback to oversold + bounce
-    if r.recent_cci_recovery:      pb = 35
-    elif r.in_golden_cci:          pb = 30   # in golden AND CCI OS = ideal
-    elif r.cci_rising:             pb = 20   # building momentum (early)
-    elif r.in_golden_relaxed and r.above_cloud: pb = 18
-    elif r.t3_cci_rec:             pb = 12   # CCI recovering below 0
-    elif r.t3_near_golden:         pb = 8
-
-    # Low volume on pullback = controlled (use inverse vol_ratio proxy)
-    # If we're in a pullback zone (not breakout) and vol is low → quality up
-    if r.in_golden_relaxed and r.vol_ratio < 0.8:
-        pb = min(pb + 5, 35)
-
-    # ── Volatility Position (0-30) ────────────────────────────────
-    # Penalise entries after abnormal expansion
-    vp = 0
-    atr_ratio_ok = (r.adx_val > 0)   # proxy: ADX rising = trend, not random expansion
-
-    if r.squeeze_on:               vp = 30   # ideal — in compression, about to expand
-    elif r.squeeze_release:        vp = 22   # just released — still good
-    elif not r.compression_break:  vp = 18   # no abnormal expansion
-    else:                          vp = 8    # compression break may be chasing
-
-    # Penalise if CCI is extremely extended (abnormal expansion)
-    if r.cur_cci > 200:            vp = max(vp - 15, 0)
-    elif r.cur_cci > 150:          vp = max(vp - 8, 0)
-
-    # Hard cap: if trend_phase == EXTENDED, entry quality cannot be > 40
-    total = ema_dist + pb + vp
-    total = min(total, 100)
-    if r.trend_phase == "EXTENDED":
-        total = min(total, 40)
-
-    # R:R gate — poor R:R penalises entry quality
-    if rr < 1.5:     total = max(total - 20, 0)
-    elif rr < 2.0:   total = max(total - 8, 0)
-
-    subs = {"eq_ema_dist": ema_dist, "eq_pullback": pb, "eq_vol_pos": vp}
-    return total, subs, rr
+#    (stale boolean-proxy version removed — superseded by measured-distance
+#     _entry_quality above, which handles both breakout and pullback entries)
 
 
 # ══════════════════════════════════════════════════════════════════
