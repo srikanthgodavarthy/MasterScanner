@@ -581,29 +581,8 @@ def render(settings: dict | None = None):
 
     supabase_ok = _is_available()
 
-    # ── Quick controls ─────────────────────────────────────────────
-    with st.expander("⚙️ Quick controls", expanded=False):
-        _qr1, _qr2, _qr3, _qr4 = st.columns(4)
-        with _qr1:
-            _workers = st.slider("Workers", 5, 30,
-                settings.get("workers", 10), step=5, key="sb_workers")
-            st.session_state["workers"] = _workers
-        with _qr2:
-            _exec_thr = st.slider("Execute threshold", 50, 90,
-                settings.get("execute_threshold", 70), step=5, key="sb_exec_thr")
-            st.session_state["execute_threshold"] = _exec_thr
-        with _qr3:
-            _t1_rs = st.number_input("RS Min", -0.05, 0.20,
-                float(settings.get("t1_rs_min", 0.0)), step=0.01, format="%.2f", key="sb_t1_rs")
-            st.session_state["t1_rs_min"] = _t1_rs
-        with _qr4:
-            if st.button("🗑️ Clear Cache", key="sb_clear_cache"):
-                st.cache_data.clear()
-                st.session_state.pop("scan_df", None)
-                st.success("Cache cleared.")
-
     # ── Controls row ───────────────────────────────────────────────
-    ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1, 4])
+    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.2, 1, 4, 1])
     with ctrl1:
         run_btn = st.button("▶ Run Scan", use_container_width=True, key="btn_run_scan")
     with ctrl2:
@@ -612,16 +591,18 @@ def render(settings: dict | None = None):
         st.markdown(
             f"<div style='padding:0.55rem 0;color:#64748b;font-size:0.78rem;'>"
             f"Universe: <b>{len(settings.get('symbols', NIFTY500_SYMBOLS))}</b> symbols"
-            f" &nbsp;·&nbsp; Execute threshold: <b>{st.session_state.get('execute_threshold', settings.get('execute_threshold', 70))}</b>"
-            f" &nbsp;·&nbsp; Workers: <b>{st.session_state.get('workers', settings.get('workers', 10))}</b></div>",
+            f" &nbsp;·&nbsp; Execute threshold: <b>{settings.get('execute_threshold', 70)}</b>"
+            f" &nbsp;·&nbsp; Workers: <b>{settings.get('workers', 10)}</b></div>",
             unsafe_allow_html=True)
+    with ctrl4:
+        if st.button("🗑️", key="sb_clear_cache", help="Clear data cache"):
+            st.cache_data.clear()
+            st.session_state.pop("scan_df", None)
+            st.toast("Cache cleared.")
 
     # ── Run scan ───────────────────────────────────────────────────
     if run_btn:
         effective = dict(settings)
-        effective["workers"]           = st.session_state.get("workers",           settings.get("workers", 10))
-        effective["execute_threshold"] = st.session_state.get("execute_threshold", settings.get("execute_threshold", 70))
-        effective["t1_rs_min"]         = st.session_state.get("t1_rs_min",         settings.get("t1_rs_min", 0.0))
 
         symbols = effective.get("symbols", NIFTY500_SYMBOLS)
         prog    = st.progress(0, text="Fetching data…")
