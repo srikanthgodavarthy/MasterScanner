@@ -152,8 +152,14 @@ def generate_signals_historical(
     rejections = []   # v10: admission gate rejection log
     last_signal_bar = -999  # LOGIC-1: min cooldown between signals
 
+    # ── Dispatch state for signal_dispatch mode ───────────────────
+    # A single mutable dict shared across all bar iterations for this symbol.
+    # compute_bar() updates "dispatch_bar" and "prev_buy_active" in-place.
+    # In legacy mode this dict is passed but ignored inside compute_bar().
+    _dispatch_state: dict = {"dispatch_bar": 0, "prev_buy_active": False}
+
     for i in range(210, len(df)):
-        r = compute_bar(ia, i, params)
+        r = compute_bar(ia, i, params, dispatch_state=_dispatch_state)
         if r is None:
             continue
 
