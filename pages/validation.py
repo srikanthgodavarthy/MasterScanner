@@ -427,15 +427,41 @@ def render(settings=None):
     with st.expander("⚙️ Experiment Settings", expanded=True):
         c1, c2 = st.columns(2)
         with c1:
+            raw_defaults = (
+                settings.get("bt_symbols", DEFAULT_SYMS)
+                if settings else DEFAULT_SYMS
+            )
+
+            default_syms = [
+                s for s in raw_defaults
+                if s in NIFTY500_SYMBOLS
+            ]
+
+            # Fallback if all defaults are invalid
+            if not default_syms:
+                default_syms = DEFAULT_SYMS[:10]
+
+            # Optional diagnostic
+            invalid_syms = [s for s in raw_defaults if s not in NIFTY500_SYMBOLS]
+            if invalid_syms:
+                st.warning(
+                    f"Removed {len(invalid_syms)} invalid symbols from defaults: "
+                    f"{', '.join(invalid_syms[:10])}"
+                )
+
             val_syms = st.multiselect(
-                "Symbols", options=NIFTY500_SYMBOLS,
-                default=settings.get("bt_symbols", DEFAULT_SYMS) if settings else DEFAULT_SYMS,
+                "Symbols",
+                options=NIFTY500_SYMBOLS,
+                default=default_syms,
                 key="val_syms",
                 help="Use 20+ symbols for statistically meaningful bucket counts.",
             )
+
             val_tier = st.selectbox(
-                "Tier Filter", ["Both","Tier 1","Tier 2","Elite"],
-                index=0, key="val_tier",
+                "Tier Filter",
+                ["Both", "Tier 1", "Tier 2", "Elite"],
+                index=0,
+                key="val_tier",
                 help="Same tier gate as production backtest.",
             )
         with c2:
