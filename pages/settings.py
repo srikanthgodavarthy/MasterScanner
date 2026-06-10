@@ -30,7 +30,7 @@ DEFAULTS = {
     "universe_mode":     "Nifty 500 (default)",
     "custom_symbols":    [],
     "workers":           15,
-    "hold_days":         15,
+    "hold_days":         20,
     "auto_refresh":      False,
     "refresh_mins":      5,
     "min_score":         65,
