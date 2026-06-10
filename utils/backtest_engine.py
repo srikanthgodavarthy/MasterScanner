@@ -245,10 +245,12 @@ def generate_signals_historical(
             # poor volume profile.  Admitting it produces noise trades.
             if _ls_val < 65:
                 _rejection_reason = "WEAK_LEADERSHIP"
-            # Gate 3: Conviction must be >= 65
-            # Conviction < 65 means the setup lacks compression, CCI
-            # confirmation, or momentum alignment.
-            elif _cv_val < 38:
+            # Gate 3: Conviction must be >= 20
+            # Floor of 20 filters only stocks with zero RS contribution
+            # (rs_positive=False, rs_top_decile=False, no composite edge).
+            # Conviction is logged on every admitted signal for factor
+            # attribution analysis — the diagnostic measures its lift.
+            elif _cv_val < 20:
                 _rejection_reason = "WEAK_CONVICTION"
             # Gate 4: Risk/Reward
             elif _rr < 2.0:
