@@ -407,44 +407,72 @@ def simulate_trades(
         exit_date   = future.index[min(hold_days, len(future) - 1)]
         exit_reason = "TIMEOUT"
 
+        # T3 recomputed from actual entry (same R-multiple logic as T1/T2)
+        t3 = round(entry_price + rk * 5.0, 2)
+
+        # Trail state: once T1 is hit, SL moves to breakeven (entry_price).
+        # This converts "T1 then drift to TIMEOUT near 0%" into a small-profit
+        # SL exit, reducing TIMEOUT count and lifting TIMEOUT avg return.
+        active_sl    = sl
+        t1_triggered = False
+
         window = future.iloc[: hold_days + 1]
         for dt, row in window.iterrows():
             bar_low  = float(row["low"])
             bar_high = float(row["high"])
             bar_open = float(row["open"])
 
-            sl_hit = bar_low  <= sl
+            sl_hit = bar_low  <= active_sl
             t1_hit = bar_high >= t1
             t2_hit = bar_high >= t2
+            t3_hit = bar_high >= t3
 
-            if sl_hit and t2_hit:
+            if sl_hit and t3_hit:
+                dist_sl = abs(bar_open - active_sl)
+                dist_t3 = abs(bar_open - t3)
+                if dist_t3 <= dist_sl:
+                    exit_price, exit_reason = t3, "T3 HIT"
+                else:
+                    exit_price, exit_reason = active_sl, "SL HIT"
+                exit_date = dt
+                break
+            elif sl_hit and t2_hit:
                 # BUG-3: both hit same bar — resolve by distance from open
-                dist_sl = abs(bar_open - sl)
+                dist_sl = abs(bar_open - active_sl)
                 dist_t2 = abs(bar_open - t2)
                 if dist_t2 <= dist_sl:
                     exit_price, exit_reason = t2, "T2 HIT"
                 else:
-                    exit_price, exit_reason = sl, "SL HIT"
+                    exit_price, exit_reason = active_sl, "SL HIT"
                 exit_date = dt
                 break
             elif sl_hit and t1_hit:
-                dist_sl = abs(bar_open - sl)
+                dist_sl = abs(bar_open - active_sl)
                 dist_t1 = abs(bar_open - t1)
                 if dist_t1 <= dist_sl:
-                    exit_price, exit_reason = t1, "T1 HIT"
+                    # T1 hit first — trail SL to breakeven, keep running
+                    t1_triggered = True
+                    active_sl    = entry_price
                 else:
-                    exit_price, exit_reason = sl, "SL HIT"
-                exit_date = dt
-                break
+                    exit_price, exit_reason = active_sl, "SL HIT"
+                    exit_date = dt
+                    break
             elif sl_hit:
-                exit_price, exit_date, exit_reason = sl, dt, "SL HIT"
+                exit_price, exit_reason = active_sl, "SL HIT"
+                exit_date = dt
+                if t1_triggered:
+                    exit_reason = "SL TRAIL"   # distinguish breakeven exits
+                break
+            elif t3_hit:
+                exit_price, exit_date, exit_reason = t3, dt, "T3 HIT"
                 break
             elif t2_hit:
                 exit_price, exit_date, exit_reason = t2, dt, "T2 HIT"
                 break
-            elif t1_hit:
-                exit_price, exit_date, exit_reason = t1, dt, "T1 HIT"
-                break
+            elif t1_hit and not t1_triggered:
+                # T1 reached — trail SL to breakeven, continue to T2/T3
+                t1_triggered = True
+                active_sl    = entry_price
 
         pnl_pct = round((exit_price - entry_price) / entry_price * 100, 2)
 
