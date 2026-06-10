@@ -79,9 +79,10 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-from pages.scanner  import render as render_scanner
-from pages.backtest import render as render_backtest
-from pages.settings import render as render_settings
+from pages.scanner     import render as render_scanner
+from pages.backtest    import render as render_backtest
+from pages.settings    import render as render_settings
+from pages.validation  import render as render_validation
 from utils.scanner_engine import NIFTY500_SYMBOLS
 
 ss = st.session_state
@@ -121,7 +122,9 @@ settings = {
     "t1_use_adx":           ss.get("t1_use_adx",           True),
 }
 
-tab1, tab2, tab3 = st.tabs(["📡 Live Scanner", "📈 Backtest Engine", "⚙️ Settings"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📡 Live Scanner", "📈 Backtest Engine", "⚙️ Settings", "🔬 CV/EQ Validation"
+])
 
 with tab1:
     render_scanner(settings)
@@ -131,3 +134,6 @@ with tab2:
 
 with tab3:
     render_settings()
+
+with tab4:
+    render_validation(settings)
