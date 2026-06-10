@@ -593,7 +593,7 @@ def render(settings=None):
     diag_settings = dict(settings) if settings else {}
     diag_settings["min_score"] = diag_score
 
-    merged, total_sigs = _build_merged(
+    merged, rejections_df, total_sigs = _build_merged(
         symbols   = list(ohlcv.keys()),
         ohlcv     = ohlcv,
         nifty     = nifty,
