@@ -347,13 +347,50 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_nifty(period: str = "1y") -> pd.Series:
-    try:
-        df    = yf.Ticker("^CRSLDX").history(period=period, auto_adjust=True)
-        nifty = df["Close"].rename("nifty")
-        nifty.index = _strip_tz(pd.to_datetime(nifty.index))
-        return nifty
-    except Exception:
-        return pd.Series(dtype=float)
+    """Fetch Nifty 500 (^CRSLDX) close series. Falls back to Nifty 50 (^NSEI)."""
+    for ticker in ("^CRSLDX", "^NSEI"):
+        try:
+            df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
+            if df.empty:
+                continue
+            nifty = df["Close"].rename("nifty")
+            nifty.index = _strip_tz(pd.to_datetime(nifty.index))
+            return nifty
+        except Exception:
+            continue
+    return pd.Series(dtype=float)
+
+
+def fetch_nifty_live() -> tuple[float, float | None]:
+    """
+    Return (current_price, day_pct_change) using intraday data so the
+    displayed value reflects today's move, not yesterday's.
+    Falls back to daily close if intraday fetch fails.
+    """
+    for ticker in ("^CRSLDX", "^NSEI"):
+        try:
+            # 2-day 1-min bars gives today's open and latest tick
+            df = yf.Ticker(ticker).history(period="2d", interval="1m", auto_adjust=True)
+            if df.empty:
+                continue
+            df.index = _strip_tz(pd.to_datetime(df.index))
+            today = pd.Timestamp.now().normalize()
+            today_bars = df[df.index.normalize() == today]
+            if today_bars.empty:
+                # Market not yet open — fall back to last two daily closes
+                daily = yf.Ticker(ticker).history(period="5d", auto_adjust=True)
+                if len(daily) >= 2:
+                    last = float(daily["Close"].iloc[-1])
+                    prev = float(daily["Close"].iloc[-2])
+                    return last, round((last - prev) / prev * 100, 2)
+                continue
+            current = float(today_bars["Close"].iloc[-1])
+            prev_close = float(df[df.index.normalize() < today]["Close"].iloc[-1]) if len(df[df.index.normalize() < today]) else None
+            pct = round((current - prev_close) / prev_close * 100, 2) if prev_close else None
+            return current, pct
+        except Exception:
+            continue
+    return 0.0, None
 
 
 # ══════════════════════════════════════════════════════════════════
