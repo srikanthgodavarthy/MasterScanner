@@ -557,6 +557,16 @@ def score_stock(
             "_ds_ex_pivot_dist": ds.ex_pivot_dist,
             "_ds_ex_move_since": ds.ex_move_since,
             "_ds_ex_bars_since": ds.ex_bars_since,
+            # Trend Quality Score (Sprint 1)
+            "TrendQuality":          ds.trend_quality,
+            "_ds_tq_age":            ds.tq_age,
+            "_ds_tq_align":          ds.tq_align,
+            "_ds_tq_rs":             ds.tq_rs,
+            "_ds_tq_pullback":       ds.tq_pullback,
+            # Explainability (Sprint 1) — stored as JSON strings for DataFrame compat
+            "_explain_included":     "|".join(ds.why_included)   if ds.why_included   else "",
+            "_explain_not_higher":   "|".join(ds.why_not_higher) if ds.why_not_higher else "",
+            "_explain_risks":        "|".join(ds.risk_factors)   if ds.risk_factors   else "",
         })
     except Exception:
         pass   # non-critical; existing columns still present

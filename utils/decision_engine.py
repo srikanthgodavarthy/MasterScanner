@@ -101,6 +101,26 @@ class DecisionScores:
     # Bars banding label for UI
     bars_band:             str   = "Actionable"   # "Actionable" | "Late" | "Extended"
 
+    # ── Trend Quality Score (Sprint 1) ────────────────────────────
+    # Composite 0-100: Trend Age (30) + MA Alignment (25) + RS Persistence (25)
+    # + Pullback Health (20).  Used as watchlist ranking key and persistence gate.
+    trend_quality:         int   = 0
+    tq_age:                int   = 0   # trend_freshness contribution
+    tq_align:              int   = 0   # MA stack alignment
+    tq_rs:                 int   = 0   # RS persistence across timeframes
+    tq_pullback:           int   = 0   # pullback/fib zone health
+
+    # ── Explainability (Sprint 1) ─────────────────────────────────
+    # Plain-English reason strings — populated by explain_decision()
+    why_included:   list = None   # type: list[str]
+    why_not_higher: list = None   # type: list[str]
+    risk_factors:   list = None   # type: list[str]
+
+    def __post_init__(self):
+        if self.why_included   is None: object.__setattr__(self, "why_included",   [])
+        if self.why_not_higher is None: object.__setattr__(self, "why_not_higher", [])
+        if self.risk_factors   is None: object.__setattr__(self, "risk_factors",   [])
+
 
 # ══════════════════════════════════════════════════════════════════
 #  LEADERSHIP ENGINE
@@ -428,28 +448,32 @@ def _extension(r: "BarResult") -> tuple[int, dict]:
     """Returns (0-100, sub_scores_dict).  Higher = more extended = avoid.
 
     Uses actual measured distances from BarResult rather than boolean proxies.
-    Factors:
-      EMA20 Distance          25  — % above EMA20 (measured)
+    Factors (sum to 100):
+      EMA20 Distance          32  — % above EMA20 (measured)  [+7 from removed ex_bars_since]
       EMA50 Distance          15  — % above EMA50 (measured)
       Pivot High Distance     20  — % past last pivot high (measured)
-      Price Move Since Setup  25  — % from trigger bar to now (measured)
-      Bars Since Setup        15  — 0-3=low, 4-7=medium, 8+=high
+      Price Move Since Setup  33  — % from trigger bar to now (measured) [+8 from removed ex_bars_since]
+
+    NOTE: bars_since_setup intentionally excluded — it caused double-counting
+    with eq_bars_since in Entry Quality.  Extension measures structural MA
+    distance only; elapsed time is Entry Quality's concern.
     """
 
-    # ── EMA20 Distance (0-25) ─────────────────────────────────────
+    # ── EMA20 Distance (0-32) ─────────────────────────────────────
+    # 7 pts redistributed from removed ex_bars_since component.
     ema20d = r.ema20_pct_dist   # % above EMA20
     if ema20d <= 2.0:
         ex_ema20 = 0
     elif ema20d <= 4.0:
-        ex_ema20 = 5
+        ex_ema20 = 6
     elif ema20d <= 6.0:
-        ex_ema20 = 12
+        ex_ema20 = 14
     elif ema20d <= 10.0:
-        ex_ema20 = 18
+        ex_ema20 = 22
     else:
-        ex_ema20 = 25   # >10% above EMA20 — significantly extended
+        ex_ema20 = 32   # >10% above EMA20 — significantly extended
     if r.t4_fib_resist:
-        ex_ema20 = max(ex_ema20, 22)
+        ex_ema20 = max(ex_ema20, 26)
 
     # ── EMA50 Distance (0-15) ─────────────────────────────────────
     ema50d = r.ema50_pct_dist
@@ -477,32 +501,27 @@ def _extension(r: "BarResult") -> tuple[int, dict]:
     else:
         ex_pivot = 20
 
-    # ── Price Move Since Setup Trigger (0-25) ────────────────────
+    # ── Price Move Since Setup Trigger (0-33) ────────────────────
+    # 8 pts redistributed from removed ex_bars_since component.
     # At 5% target: 3% move = 60% of target consumed.
-    # Spec example: setup at ₹100, now ₹106 → extension score should be high.
     move_pct = r.price_move_since_setup
     if move_pct <= 0.5:
         ex_move = 0
     elif move_pct <= 1.5:
-        ex_move = 4
+        ex_move = 5
     elif move_pct <= 3.0:
-        ex_move = 12
+        ex_move = 15
     elif move_pct <= 5.0:
-        ex_move = 20
+        ex_move = 25
     else:
-        ex_move = 25   # past 5% target — do not chase
+        ex_move = 33   # past 5% target — do not chase
 
-    # ── Bars Since Setup (0-15) ───────────────────────────────────
-    # 0-3 bars = Actionable, 4-7 = Late, 8+ = Extended
-    bss = r.bars_since_setup
-    if bss <= 3:
-        ex_bars = 0
-    elif bss <= 7:
-        ex_bars = 7
-    else:
-        ex_bars = 15
+    # ex_bars_since REMOVED: was causing double-counting with eq_bars_since
+    # in Entry Quality.  Both used bars_since_setup, penalising stocks twice
+    # for setup age and creating an amplified cliff at 8 bars.
+    ex_bars = 0
 
-    total = ex_ema20 + ex_ema50 + ex_pivot + ex_move + ex_bars
+    total = ex_ema20 + ex_ema50 + ex_pivot + ex_move
 
     # Trend phase modifier
     if r.trend_phase == "EXTENDED":
@@ -538,27 +557,19 @@ def _extension(r: "BarResult") -> tuple[int, dict]:
 def _classify_stage(
     leadership: int, conviction: int, entry_quality: int, extension: int,
     r: "BarResult",
-    thresholds: dict | None = None,
 ) -> str:
     """
     Derive lifecycle stage from the four engine scores.
 
     Lifecycle: Leader → Setup Building → Actionable → Extended → Avoid
-
-    ``thresholds`` (from :func:`_get_thresholds`) is accepted so that the
-    EXTENDED gate mirrors the same ``ext_adj`` shift used in
-    ``_classify_category_with_settings``, keeping Stage and Category
-    consistent under non-Normal extension-tolerance settings.
     """
-    ext_adj = (thresholds or {}).get("ext_adj", 0)
-
     # Hard structural failures → Avoid
     if r.t4_hard_stop or r.hard_stop:
         return "AVOID"
     if r.trend_phase == "NONE" and not r.trend_up:
         return "AVOID"
 
-    if extension >= 60 + ext_adj:
+    if extension >= 60:
         return "EXTENDED"
 
     if leadership < 50:
@@ -588,6 +599,35 @@ _CATEGORY_ORDER = [
     "Extended",
     "Avoid",
 ]
+
+def _classify_category(
+    leadership: int, conviction: int, entry_quality: int, extension: int,
+    stage: str, r: "BarResult",
+) -> str:
+    """
+    Decision-oriented category label for the scanner UI.
+    Replaces old tier labels with trader-meaningful names.
+    """
+    if extension >= 60 or stage == "EXTENDED":
+        return "Extended"
+
+    if stage == "AVOID" or leadership < 50:
+        return "Avoid"
+
+    if leadership >= 90 and conviction >= 90 and entry_quality >= 80 and extension <= 25:
+        return "Elite Opportunity"
+
+    if leadership >= 80 and conviction >= 80 and entry_quality >= 60 and extension <= 35:
+        return "High Conviction"
+
+    if leadership >= 70 and conviction >= 60 and entry_quality >= 60 and extension <= 40:
+        return "Actionable"
+
+    if leadership >= 70 and conviction >= 50:
+        return "Setup Building"
+
+    return "Avoid"
+
 
 # ══════════════════════════════════════════════════════════════════
 #  SETTINGS-AWARE THRESHOLDS
@@ -694,6 +734,205 @@ def _rr_ok(rr: float, settings: dict) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════
+#  TREND QUALITY SCORE  (Sprint 1)
+#  Composite 0-100 capturing trend persistence, not just today's state.
+#  Inputs: all pre-existing BarResult fields — no new indicators.
+#
+#  Components (sum to 100):
+#    Trend Age         30 — trend_freshness (0-100 → scaled to 30)
+#    MA Alignment      25 — EMA20/EMA50/EMA200 stack
+#    RS Persistence    25 — multi-timeframe RS composite strength
+#    Pullback Health   20 — stock has proven it can hold / return to Fib zone
+# ══════════════════════════════════════════════════════════════════
+
+def _trend_quality(r: "BarResult") -> tuple[int, dict]:
+    """Compute Trend Quality Score (0-100) from existing BarResult fields.
+
+    Returns (score, sub_scores_dict).
+    All inputs already exist on BarResult — zero new computation.
+    """
+
+    # ── Trend Age (0-30) ─────────────────────────────────────────
+    # trend_freshness is already 0-100 with the right decay curve.
+    tq_age = round(r.trend_freshness * 0.30)
+
+    # ── MA Alignment (0-25) ──────────────────────────────────────
+    # Reward stocks that have held the full MA stack consistently.
+    tq_align = 0
+    if r.trend_up:      tq_align += 10   # EMA20 > EMA50
+    if r.ema_alignment: tq_align += 10   # full stack: EMA20 > EMA50 > EMA200
+    if r.above_cloud:   tq_align += 5    # above Ichimoku cloud
+    tq_align = min(tq_align, 25)
+
+    # ── RS Persistence (0-25) ────────────────────────────────────
+    # Multi-timeframe RS composite.  All-positive = bonus.
+    tq_rs = 0
+    rc = r.rs_composite
+    if rc >= 0.10:    tq_rs = 25
+    elif rc >= 0.06:  tq_rs = 20
+    elif rc >= 0.03:  tq_rs = 14
+    elif rc >= 0.01:  tq_rs = 8
+    elif rc >= 0.0:   tq_rs = 3
+    # Bonus if every timeframe is positive (breadth of outperformance)
+    if r.rs3 > 0 and r.rs6 > 0 and r.rs1 > 0:
+        tq_rs = min(tq_rs + 5, 25)
+
+    # ── Pullback Health (0-20) ────────────────────────────────────
+    # Stocks that have pulled back to the Fib zone AND held have proven
+    # their trend is institutionally supported — strongest signal here.
+    tq_pullback = 0
+    if r.in_golden:              tq_pullback = 20   # in 50-61.8% golden pocket
+    elif r.in_golden_relaxed:    tq_pullback = 14   # in 38.2-61.8% zone
+    elif r.t3_near_golden:       tq_pullback = 8    # approaching the zone
+    elif r.persistent_strength:  tq_pullback = 10   # momentum confirmed, no pullback yet
+
+    total = min(tq_age + tq_align + tq_rs + tq_pullback, 100)
+    subs  = {"tq_age": tq_age, "tq_align": tq_align,
+             "tq_rs":  tq_rs,  "tq_pullback": tq_pullback}
+    return total, subs
+
+
+# ══════════════════════════════════════════════════════════════════
+#  EXPLAINABILITY  (Sprint 1)
+#  Pure formatting function over already-computed DecisionScores.
+#  Zero new computation — reads ds fields and builds plain-English text.
+# ══════════════════════════════════════════════════════════════════
+
+def explain_decision(ds: "DecisionScores") -> dict:
+    """Generate plain-English reasons for a stock's decision output.
+
+    Returns a dict with three lists:
+      why_included   : positive factors that drove inclusion / category
+      why_not_higher : what is missing / limiting a higher category
+      risk_factors   : active risk conditions to be aware of
+
+    This is a pure formatting function over DecisionScores — no new
+    computation.  Safe to call after compute_decision().
+    """
+    included: list[str] = []
+    not_higher: list[str] = []
+    risks: list[str] = []
+
+    ls  = ds.leadership
+    cv  = ds.conviction
+    eq  = ds.entry_quality
+    ext = ds.extension
+    tq  = ds.trend_quality
+    cat = ds.category
+
+    # ── Why included / positive drivers ──────────────────────────
+    if ls >= 90:
+        included.append(f"Leadership {ls}: exceptional market leader — RS and trend among top performers")
+    elif ls >= 80:
+        included.append(f"Leadership {ls}: strong market leader with sustained outperformance")
+    elif ls >= 70:
+        included.append(f"Leadership {ls}: qualified leader — trend and RS above minimum threshold")
+
+    if ds.ls_rs >= 26:
+        included.append(f"RS composite in top decile — institutional sponsorship confirmed")
+    elif ds.ls_rs >= 18:
+        included.append(f"RS composite above market — relative outperformance across timeframes")
+
+    if ds.cv_pattern >= 20:
+        included.append("VCP / base breakout pattern detected — energy accumulation present")
+    if ds.cv_fib >= 14:
+        included.append(f"Fibonacci pullback quality {ds.cv_fib}/20 — controlled retracement to support")
+    if ds.cv_compression >= 18:
+        included.append("Active squeeze compression — volatility contraction with energy building")
+
+    if tq >= 75:
+        included.append(f"Trend Quality {tq}: mature, persistent trend with healthy structure")
+    elif tq >= 50:
+        included.append(f"Trend Quality {tq}: solid trend with reasonable persistence")
+
+    if eq >= 80:
+        included.append(f"Entry Quality {eq}: excellent entry timing — price near support, setup fresh")
+    elif eq >= 60:
+        included.append(f"Entry Quality {eq}: acceptable entry — some distance consumed but still actionable")
+
+    # ── Why not higher category ───────────────────────────────────
+    if cat != "Elite Opportunity":
+        if ls < 90:
+            gap = 90 - ls
+            not_higher.append(f"Not Elite: Leadership {ls} (need ≥90) — {gap} pts gap, likely RS or MA alignment")
+        if cv < 90:
+            not_higher.append(f"Not Elite: Conviction {cv} (need ≥90) — pattern or Fib zone not fully confirmed")
+        if eq < 80 and cat not in ("Extended", "Avoid"):
+            move = ds.price_move_since_setup
+            bss  = ds.bars_since_setup
+            if move > 1.5:
+                not_higher.append(
+                    f"Entry Quality {eq}: price has moved {move:.1f}% since setup "
+                    f"({bss} bars ago) — opportunity cost already paid"
+                )
+            elif bss > 7:
+                not_higher.append(
+                    f"Entry Quality {eq}: setup is {bss} bars old — signal freshness decayed"
+                )
+            elif ds.ema20_pct_dist > 8:
+                not_higher.append(
+                    f"Entry Quality {eq}: {ds.ema20_pct_dist:.1f}% above EMA20 — "
+                    "stretched for a safe entry"
+                )
+
+    if cat == "Setup Building" and cv < 60:
+        not_higher.append(
+            f"Conviction {cv} (need ≥60 for Actionable) — "
+            "no clear pattern or Fib zone yet; setup still forming"
+        )
+
+    if tq < 50 and cat not in ("Avoid", "Extended"):
+        not_higher.append(
+            f"Trend Quality {tq}: trend is newer or less persistent — "
+            "RS or MA alignment not yet fully established"
+        )
+
+    # ── Risk factors ──────────────────────────────────────────────
+    if ext >= 50:
+        risks.append(
+            f"Extension {ext}: significantly extended — "
+            f"{ds.ema20_pct_dist:.1f}% above EMA20, chase risk is high"
+        )
+    elif ext >= 35:
+        risks.append(
+            f"Extension {ext}: partially extended — "
+            f"{ds.ema20_pct_dist:.1f}% above EMA20; wait for pullback if possible"
+        )
+
+    if ds.pivot_high_dist > 5:
+        risks.append(
+            f"Pivot distance {ds.pivot_high_dist:.1f}% past last pivot high — "
+            "entry is chasing a breakout that is already aged"
+        )
+
+    if ds.bars_since_setup > 7:
+        risks.append(
+            f"Setup is {ds.bars_since_setup} bars old ({ds.bars_band}) — "
+            "momentum following the initial signal may be largely exhausted"
+        )
+
+    if ds.risk_reward < 1.5:
+        risks.append(
+            f"R:R {ds.risk_reward:.1f} is below minimum 1.5R — "
+            "unfavourable risk/reward at current price"
+        )
+    elif ds.risk_reward < 2.0:
+        risks.append(f"R:R {ds.risk_reward:.1f} — marginal; target 2R or better")
+
+    if ls < 60 and cat != "Avoid":
+        risks.append(
+            f"Leadership {ls} is borderline — trend or RS weakening; "
+            "monitor for early exit signals"
+        )
+
+    return {
+        "why_included":   included,
+        "why_not_higher": not_higher,
+        "risk_factors":   risks,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
 #  MAIN ENTRY POINT
 # ══════════════════════════════════════════════════════════════════
 
@@ -720,13 +959,14 @@ def compute_decision(r: "BarResult", settings: dict | None = None) -> DecisionSc
     entry_quality, eq_subs, rr = _entry_quality(r)
     extension,     ex_subs  = _extension(r)
 
-    # ── Thresholds (computed first so _classify_stage can use ext_adj) ──
-    thresholds = _get_thresholds(settings)
+    # ── Trend Quality Score (Sprint 1) ────────────────────────────
+    tq_score, tq_subs = _trend_quality(r)
 
     # ── Stage ─────────────────────────────────────────────────────
-    stage = _classify_stage(leadership, conviction, entry_quality, extension, r, thresholds)
+    stage = _classify_stage(leadership, conviction, entry_quality, extension, r)
 
     # ── Category (settings-aware) ─────────────────────────────────
+    thresholds = _get_thresholds(settings)
     category   = _classify_category_with_settings(
         leadership, conviction, entry_quality, extension, stage, r, thresholds
     )
@@ -736,7 +976,7 @@ def compute_decision(r: "BarResult", settings: dict | None = None) -> DecisionSc
         if not _rr_ok(rr, settings):
             category = "Setup Building"
 
-    return DecisionScores(
+    ds = DecisionScores(
         leadership    = leadership,
         conviction    = conviction,
         entry_quality = entry_quality,
@@ -785,7 +1025,21 @@ def compute_decision(r: "BarResult", settings: dict | None = None) -> DecisionSc
             "Late"       if r.bars_since_setup <= 7 else
             "Extended"
         ),
+        # Trend Quality Score (Sprint 1)
+        trend_quality = tq_score,
+        tq_age        = tq_subs["tq_age"],
+        tq_align      = tq_subs["tq_align"],
+        tq_rs         = tq_subs["tq_rs"],
+        tq_pullback   = tq_subs["tq_pullback"],
     )
+
+    # ── Explainability (Sprint 1) — populate after ds is built ───
+    explanation = explain_decision(ds)
+    object.__setattr__(ds, "why_included",   explanation["why_included"])
+    object.__setattr__(ds, "why_not_higher", explanation["why_not_higher"])
+    object.__setattr__(ds, "risk_factors",   explanation["risk_factors"])
+
+    return ds
 
 
 # ══════════════════════════════════════════════════════════════════
