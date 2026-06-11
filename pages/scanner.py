@@ -1,19 +1,16 @@
 """
-pages/scanner.py — Live Scanner  (v8 — rich HTML table + %Chg fix)
+pages/scanner.py — Live Scanner  (v9 — CMP + Tooltips + TradingView links + R:R(CMP→T1))
 
-UI Changes vs v7:
-  • Results table: custom HTML renderer replacing st.dataframe
-      - Signal Class: colored badge (bg-tinted, bordered)
-      - Leadership / Conviction / Entry Quality: number + inline spark bar
-      - Extension: color-coded, 0 = green → red at high values
-      - %Chg: ▲/▼ arrow + green/red color
-      - R:R: tiered color (gold ≥3.0, green ≥2.0, amber ≥1.5, red <1.5)
-      - Stock: left-aligned bold, rank index dim
-      - Entry / SL / T1 / Size%: right-aligned mono
-      - Sticky header, alternating rows, row hover highlight
-      - Size% shown as a small filled-bar chip
-  • %Chg chip in market status row: now computed from nifty series day-over-day
-    and stored in session_state["nifty_chg_pct"] on each scan run
+Changes vs v8:
+  • CMP column  : current market price fetched via yfinance at scan time (fast_info.last_price),
+                  stored in df_aug["CMP"], displayed right-aligned mono between %Chg and Entry.
+  • R:R column  : now R:R(CMP→T1) = (T1 - CMP) / (CMP - SL).  Column label updated to "R:R".
+  • Column order: Stock | Signal Class | Leadership | Conviction | Entry Quality |
+                  Extension | CMP | %Chg | Entry | SL | T1 | R:R | Size%
+  • TradingView : clicking a stock name opens NSE chart on TradingView in a new tab —
+                  no separate button, hyperlink styled to match existing row text.
+  • Tooltips    : hover info on Signal Class, Leadership, Conviction, Entry Quality
+                  column headers AND on each cell badge/value.
   • Zero changes to scanner logic, backtest logic, or scoring calculations.
 """
 
@@ -68,6 +65,42 @@ _CAT_STYLE = {
     "Setup Building":    ("#d29922", "Setup Building"),
     "Extended":          ("#f97316", "Extended"),
     "Avoid":             ("#484f58", "Avoid"),
+}
+
+# ── TOOLTIP DEFINITIONS ───────────────────────────────────────────
+# Each entry: (short label, multi-line description shown on hover)
+_COL_TOOLTIPS = {
+    "Signal Class": (
+        "Signal Class",
+        "ELITE — highest conviction, trend regime only.\n"
+        "EXECUTE — actionable setup, trend/range allowed.\n"
+        "WATCH   — setup building, monitor for entry.\n"
+        "SKIP    — below threshold, do not trade.",
+    ),
+    "Leadership": (
+        "Leadership (0–100)",
+        "Measures relative strength vs the market.\n"
+        "Sub-scores: RS Composite (30), Trend Age (25),\n"
+        "ADX Strength (20), Persistent Strength (15),\n"
+        "EMA20 Slope (10).\n"
+        "≥80 Gold · ≥65 Green · ≥50 Light · ≥35 Amber · <35 Red",
+    ),
+    "Conviction": (
+        "Conviction (0–100)",
+        "Likelihood the trade hits target.\n"
+        "Sub-scores: Trend Structure (30), Fib Pullback (25),\n"
+        "CCI Recovery (25), Volume Sponsorship (15),\n"
+        "Squeeze Release (5).\n"
+        "≥80 Gold · ≥65 Green · ≥50 Light · ≥35 Amber · <35 Red",
+    ),
+    "Entry Quality": (
+        "Entry Quality (0–100)",
+        "Is this a good entry right now?\n"
+        "Sub-scores: EMA20 Distance (30), Pivot Distance (20),\n"
+        "Price Move Since Setup (20), EMA50 Distance (15),\n"
+        "Bars Since Setup (15).\n"
+        "Higher = tighter, lower-risk entry.",
+    ),
 }
 
 # ── CSS ───────────────────────────────────────────────────────────
@@ -295,6 +328,17 @@ _CSS = """
   font-size: 0.78rem;
   min-width: 110px;
 }
+/* TradingView link — matches bold stock text, no underline by default */
+.tv-link {
+  color: var(--text);
+  text-decoration: none;
+  font-weight: 700;
+  transition: color 0.15s;
+}
+.tv-link:hover {
+  color: var(--blue);
+  text-decoration: underline;
+}
 .rt td.col-num {
   font-variant-numeric: tabular-nums;
   text-align: right;
@@ -325,6 +369,70 @@ _CSS = """
   font-weight: 700;
   letter-spacing: 0.07em;
   white-space: nowrap;
+  cursor: help;
+}
+
+/* ── Tooltip system ── */
+.tip-wrap {
+  position: relative;
+  display: inline-block;
+  cursor: help;
+}
+.tip-wrap .tip-box {
+  visibility: hidden;
+  opacity: 0;
+  width: 260px;
+  background: #1c2333;
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 7px;
+  padding: 10px 12px;
+  font-size: 0.70rem;
+  color: var(--text);
+  white-space: pre-line;
+  line-height: 1.55;
+  position: absolute;
+  z-index: 999;
+  top: 130%;
+  left: 50%;
+  transform: translateX(-50%);
+  box-shadow: 0 6px 24px rgba(0,0,0,0.55);
+  pointer-events: none;
+  transition: opacity 0.15s, visibility 0.15s;
+}
+.tip-wrap .tip-box::before {
+  content: "";
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  border: 6px solid transparent;
+  border-bottom-color: rgba(255,255,255,0.14);
+}
+.tip-wrap:hover .tip-box {
+  visibility: visible;
+  opacity: 1;
+}
+/* header tooltip: shown above because table header is at top */
+.rt thead .tip-wrap .tip-box {
+  top: auto;
+  bottom: 130%;
+}
+.rt thead .tip-wrap .tip-box::before {
+  bottom: auto;
+  top: 100%;
+  border-bottom-color: transparent;
+  border-top-color: rgba(255,255,255,0.14);
+}
+.tip-title {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--gold);
+  margin-bottom: 5px;
+  letter-spacing: 0.05em;
+}
+.tip-underline {
+  border-bottom: 1px dashed rgba(255,255,255,0.25);
+  cursor: help;
 }
 
 /* ── Breakdown panel ── */
@@ -388,6 +496,73 @@ def _cat_badge(category: str) -> str:
         f'style="color:{color};background:{color}14;border:1px solid {color}30;font-size:9px">'
         f'{label}</span>'
     )
+
+
+def _tooltip_wrap(inner_html: str, title: str, body: str) -> str:
+    """Wrap any HTML element with a hover tooltip."""
+    safe_title = title.replace('"', "&quot;").replace("'", "&#39;")
+    safe_body  = body.replace('"', "&quot;").replace("'", "&#39;").replace("\n", "&#10;")
+    return (
+        f'<span class="tip-wrap">'
+        f'{inner_html}'
+        f'<span class="tip-box">'
+        f'<div class="tip-title">{safe_title}</div>'
+        f'{safe_body.replace("&#10;", "<br>")}'
+        f'</span>'
+        f'</span>'
+    )
+
+
+def _th_tooltip(label: str, col_key: str) -> str:
+    """Build a <th> with tooltip for a known column."""
+    if col_key in _COL_TOOLTIPS:
+        title, body = _COL_TOOLTIPS[col_key]
+        inner = f'<span class="tip-underline">{label}</span>'
+        return f'<th>{_tooltip_wrap(inner, title, body)}</th>'
+    return f'<th>{label}</th>'
+
+
+def _tv_link(symbol: str) -> str:
+    """Return an anchor that opens TradingView NSE chart in a new tab."""
+    # TradingView NSE symbol format: NSE:SYMBOLNAME
+    tv_sym = f"NSE:{symbol.upper().replace('.NS', '').replace('-EQ', '')}"
+    url = f"https://www.tradingview.com/chart/?symbol={tv_sym}"
+    return (
+        f'<a class="tv-link" href="{url}" target="_blank" '
+        f'title="Open {symbol} on TradingView">{symbol}</a>'
+    )
+
+
+# ── FETCH CMP ─────────────────────────────────────────────────────
+
+def _fetch_cmp_map(symbols: list[str]) -> dict[str, float]:
+    """
+    Fetch current market price for a list of NSE symbols using yfinance fast_info.
+    Returns {symbol_without_NS: price}.  Best-effort — missing symbols → NaN.
+    """
+    import yfinance as yf
+    cmp_map: dict[str, float] = {}
+    # Normalise: add .NS suffix if not present
+    yf_syms = []
+    base_map: dict[str, str] = {}  # yf_sym → base symbol
+    for s in symbols:
+        base = s.replace(".NS", "").replace("-EQ", "").upper()
+        yf_s = base + ".NS"
+        yf_syms.append(yf_s)
+        base_map[yf_s] = base
+
+    try:
+        tickers = yf.Tickers(" ".join(yf_syms))
+        for yf_s, base in base_map.items():
+            try:
+                price = tickers.tickers[yf_s].fast_info.last_price
+                if price and price > 0:
+                    cmp_map[base] = round(float(price), 2)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return cmp_map
 
 
 # ── MARKET STATUS ROW ──────────────────────────────────────────────
@@ -533,10 +708,10 @@ _DETAIL_EXTRA = [
     "Category", "Stage", "Leadership_DE", "Conviction_DE", "EntryQuality_DE",
 ]
 
-# Primary column order for HTML table
+# Primary column order for HTML table (v9: CMP added, R:R is CMP-based)
 _PRIMARY_ORDERED = [
     "Stock", "Signal Class", "Leadership", "Conviction", "Entry Quality",
-    "Extension", "%Chg", "Entry", "SL", "T1", "R:R", "Size%",
+    "Extension", "CMP", "%Chg", "Entry", "SL", "T1", "R:R", "Size%",
 ]
 
 
@@ -561,21 +736,46 @@ def _rr_color(v: float) -> str:
     return "#f85149"
 
 
-def _score_cell(val, invert: bool = False) -> str:
-    """Number + 36px spark bar, vertically stacked."""
+def _compute_cmp_rr(row) -> float | None:
+    """
+    Compute R:R using CMP instead of Entry:
+      R:R(CMP→T1) = (T1 - CMP) / (CMP - SL)
+    Returns None if inputs are invalid.
+    """
+    try:
+        cmp = float(row.get("CMP", 0))
+        sl  = float(row.get("SL",  0))
+        t1  = float(row.get("T1",  0))
+        if cmp <= 0 or sl <= 0 or t1 <= 0:
+            return None
+        denom = cmp - sl
+        if denom <= 0:
+            return None
+        return round((t1 - cmp) / denom, 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _score_cell(val, invert: bool = False, tooltip_key: str | None = None) -> str:
+    """Number + 36px spark bar, vertically stacked. Optional tooltip."""
     try:
         v = float(val)
     except (TypeError, ValueError):
         return '<td class="col-num">—</td>'
     color = _score_color(v, invert)
     pct   = min(100, max(0, int(v)))
-    return (
-        f'<td>'
+    inner = (
         f'<div class="score-cell">'
         f'<span class="score-num" style="color:{color}">{int(v)}</span>'
         f'<div class="score-bar"><div class="score-fill" style="width:{pct}%;background:{color}"></div></div>'
-        f'</div></td>'
+        f'</div>'
     )
+    if tooltip_key and tooltip_key in _COL_TOOLTIPS:
+        title, body = _COL_TOOLTIPS[tooltip_key]
+        # Show score prominently in tooltip
+        full_body = f"Score: {int(v)}/100\n\n{body}"
+        inner = _tooltip_wrap(inner, title, full_body)
+    return f'<td>{inner}</td>'
 
 
 def _chg_cell(val) -> str:
@@ -633,13 +833,26 @@ def _ext_cell(val) -> str:
     return f'<td class="col-num" style="color:{color};font-weight:{"600" if v >= 35 else "400"}">{int(v)}</td>'
 
 
+def _cmp_cell(val) -> str:
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return '<td class="col-num" style="color:var(--muted)">—</td>'
+    return (
+        f'<td class="col-num" style="color:var(--text);font-weight:600;'
+        f'font-variant-numeric:tabular-nums">₹{v:,.2f}</td>'
+    )
+
+
 def _sc_table_badge(signal_class: str) -> str:
     color, label = _SC_STYLE.get(str(signal_class).strip(), ("#484f58", str(signal_class)))
-    return (
-        f'<td><span class="tbl-badge" '
+    title, body = _COL_TOOLTIPS.get("Signal Class", ("Signal Class", ""))
+    badge = (
+        f'<span class="tbl-badge" '
         f'style="color:{color};background:{color}1a;border:1px solid {color}50">'
-        f'{label}</span></td>'
+        f'{label}</span>'
     )
+    return f'<td>{_tooltip_wrap(badge, title, body)}</td>'
 
 
 def _render_html_table(df: pd.DataFrame) -> str:
@@ -648,32 +861,57 @@ def _render_html_table(df: pd.DataFrame) -> str:
 
     cols = list(df.columns)
 
-    # Header
+    # ── Re-compute R:R using CMP ────────────────────────────────
+    # We do this row-by-row in the cell renderer, so we keep CMP, SL, T1 accessible.
+    # We'll pass the full row and compute inline.
+
+    # ── Header ──────────────────────────────────────────────────
     header_cells = '<th class="col-stock">Stock</th>'
     for c in cols:
         if c == "Stock":
             continue
-        header_cells += f'<th>{c}</th>'
+        if c == "R:R":
+            # Special label to indicate CMP-based
+            rr_inner = '<span class="tip-underline">R:R</span>'
+            rr_tip   = _tooltip_wrap(
+                rr_inner,
+                "Risk:Reward (CMP → T1)",
+                "Calculated as:\n(T1 − CMP) / (CMP − SL)\n\nUses live CMP, not Entry price.\n"
+                "Gold ≥3.0 · Green ≥2.0 · Amber ≥1.5 · Red <1.5",
+            )
+            header_cells += f'<th>{rr_tip}</th>'
+        else:
+            header_cells += _th_tooltip(c, c)
 
     rows_html = ""
     for rank, (_, row) in enumerate(df.iterrows(), 1):
         cells = f'<td class="col-rank">{rank}</td>'
-        cells += f'<td class="col-stock">{row.get("Stock", "—")}</td>'
+        stock_sym = row.get("Stock", "—")
+        cells += f'<td class="col-stock">{_tv_link(str(stock_sym)) if stock_sym != "—" else "—"}</td>'
 
         for c in cols:
             if c == "Stock":
                 continue
             val = row.get(c, None)
+
             if c == "Signal Class":
                 cells += _sc_table_badge(str(val) if val is not None else "")
-            elif c in ("Leadership", "Conviction", "Entry Quality"):
-                cells += _score_cell(val, invert=False)
+            elif c == "Leadership":
+                cells += _score_cell(val, invert=False, tooltip_key="Leadership")
+            elif c == "Conviction":
+                cells += _score_cell(val, invert=False, tooltip_key="Conviction")
+            elif c == "Entry Quality":
+                cells += _score_cell(val, invert=False, tooltip_key="Entry Quality")
             elif c == "Extension":
                 cells += _ext_cell(val)
+            elif c == "CMP":
+                cells += _cmp_cell(val)
             elif c == "%Chg":
                 cells += _chg_cell(val)
             elif c == "R:R":
-                cells += _rr_cell(val)
+                # Recompute using CMP
+                cmp_rr = _compute_cmp_rr(row)
+                cells += _rr_cell(cmp_rr if cmp_rr is not None else val)
             elif c == "Size%":
                 cells += _size_cell(val)
             elif c in ("Entry", "SL", "T1", "T2", "LTP"):
@@ -681,7 +919,6 @@ def _render_html_table(df: pd.DataFrame) -> str:
             elif c in ("Score", "Composite", "RS%"):
                 cells += _score_cell(val)
             else:
-                # generic
                 try:
                     v = float(val)
                     cells += f'<td class="col-num">{v:.1f}</td>'
@@ -860,6 +1097,18 @@ def render(settings: dict | None = None):
                     df_aug = add_streak_column(df_aug, _hist.to_dict("records"), n_scans=10)
         except Exception:
             pass
+
+        # ── Fetch CMP ────────────────────────────────────────────
+        with st.spinner("Fetching live prices (CMP)…"):
+            scanned_syms = df_aug["Stock"].tolist() if "Stock" in df_aug.columns else []
+            cmp_map = _fetch_cmp_map(scanned_syms)
+            if cmp_map:
+                def _get_cmp(sym):
+                    base = str(sym).replace(".NS", "").replace("-EQ", "").upper()
+                    return cmp_map.get(base, float("nan"))
+                df_aug["CMP"] = df_aug["Stock"].apply(_get_cmp)
+            else:
+                df_aug["CMP"] = float("nan")
 
         st.session_state["scan_df"]       = df_aug
         st.session_state["regime_ctx"]    = regime_ctx
