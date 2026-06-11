@@ -37,10 +37,7 @@ from utils.regime_engine   import (
     regime_summary,
     REGIME_WEIGHTS,
 )
-from utils.supabase_client import (
-    save_scan_snapshot, load_watchlist, add_to_watchlist, _is_available,
-    upsert_first_seen, load_first_seen,
-)
+from utils.supabase_client import save_scan_snapshot, load_watchlist, add_to_watchlist, _is_available
 
 # ── CONSTANTS ─────────────────────────────────────────────────────
 REGIME_COLORS = {
@@ -684,7 +681,7 @@ _DETAIL_EXTRA = [
 # Primary column order for HTML table (v9: CMP added, R:R is CMP-based)
 _PRIMARY_ORDERED = [
     "Stock", "Signal Class", "Leadership", "Conviction", "Entry Quality",
-    "Extension", "CMP", "%Chg", "Since", "Entry", "SL", "T1", "R:R", "Size%",
+    "Extension", "CMP", "%Chg", "Entry", "SL", "T1", "R:R", "Size%",
 ]
 
 
@@ -827,32 +824,6 @@ def _sc_table_badge(signal_class: str) -> str:
     )
 
 
-def _since_cell(val) -> str:
-    """Render a YYYY-MM-DD first-seen date as a compact 'DD MMM' badge."""
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return '<td class="col-num" style="color:var(--muted)">—</td>'
-    try:
-        from datetime import date as _date
-        d = pd.to_datetime(str(val)).date()
-        today = _date.today()
-        days  = (today - d).days
-        label = d.strftime("%d %b")
-        # colour: fresh (≤3d) gold, recent (≤10d) green, older muted
-        if days <= 3:
-            color = "#f5c542"
-        elif days <= 10:
-            color = "#3fb950"
-        else:
-            color = "#8b949e"
-        tooltip = f"First seen {days}d ago ({d.strftime('%d %b %Y')})"
-        return (
-            f'<td class="col-num" title="{tooltip}" '
-            f'style="color:{color};font-weight:600;cursor:default">{label}</td>'
-        )
-    except Exception:
-        return f'<td class="col-num" style="color:var(--muted)">{val}</td>'
-
-
 def _render_html_table(df: pd.DataFrame) -> str:
     if df.empty:
         return '<div style="padding:2rem;text-align:center;color:#8b949e;font-size:0.8rem;">No data</div>'
@@ -906,8 +877,6 @@ def _render_html_table(df: pd.DataFrame) -> str:
                 cells += _rr_cell(cmp_rr if cmp_rr is not None else val)
             elif c == "Size%":
                 cells += _size_cell(val)
-            elif c == "Since":
-                cells += _since_cell(val)
             elif c in ("Entry", "SL", "T1", "T2", "LTP"):
                 cells += _num_cell(val, "{:.2f}")
             elif c in ("Score", "Composite", "RS%"):
@@ -1116,37 +1085,12 @@ def render(settings: dict | None = None):
             save_scan_snapshot(df_aug)
             st.success("✅ Saved to Supabase.")
 
-        # ── Record first-seen dates for Elite / Execute stocks ─────
-        # Always runs (not gated on save_db) so the date tracking stays
-        # accurate even when the user doesn't save the full snapshot.
-        if supabase_ok and "Category" in df_aug.columns:
-            _elite_exec = df_aug[
-                df_aug["Category"].isin([
-                    "Elite Opportunity", "High Conviction", "Actionable"
-                ])
-            ]
-            if not _elite_exec.empty and "Stock" in _elite_exec.columns:
-                _pairs = list(
-                    zip(_elite_exec["Stock"].tolist(),
-                        _elite_exec["Category"].tolist())
-                )
-                upsert_first_seen(_pairs)
-
     # ── Display ────────────────────────────────────────────────
     df_aug        = st.session_state.get("scan_df",       pd.DataFrame())
     summary       = st.session_state.get("scan_summary",  {})
     scan_time     = st.session_state.get("scan_time",     "")
     nifty_price   = st.session_state.get("nifty_price",   0)
     nifty_chg_pct = st.session_state.get("nifty_chg_pct", None)
-
-    # ── Attach first-seen dates ────────────────────────────────
-    # Load once per page render and join onto df_aug so the "Since" column
-    # is available for Elite / Execute rows.
-    if not df_aug.empty and supabase_ok and "Stock" in df_aug.columns:
-        _fs_map = load_first_seen()
-        if _fs_map:
-            df_aug = df_aug.copy()
-            df_aug["Since"] = df_aug["Stock"].map(_fs_map)
 
     if df_aug.empty:
         st.markdown("""
@@ -1271,6 +1215,49 @@ def render(settings: dict | None = None):
                     if _picked:
                         _row = df_subset[df_subset["Stock"] == _picked].iloc[0]
                         st.markdown(_detail_breakdown_panel(_row), unsafe_allow_html=True)
+
+            # Explainability panel (Sprint 1)
+            if _show_detail and "_explain_included" in df_subset.columns:
+                with st.expander("💡 Why this stock? — Explainability"):
+                    _sel2 = df_subset["Stock"].tolist()[:10] if "Stock" in df_subset.columns else []
+                    _picked2 = st.selectbox("Select stock", _sel2, key=f"explain_sel_{sc_key}")
+                    if _picked2:
+                        _erow = df_subset[df_subset["Stock"] == _picked2].iloc[0]
+                        _included   = [s for s in str(_erow.get("_explain_included",   "")).split("|") if s]
+                        _not_higher = [s for s in str(_erow.get("_explain_not_higher", "")).split("|") if s]
+                        _risks      = [s for s in str(_erow.get("_explain_risks",      "")).split("|") if s]
+                        tq          = int(_erow.get("TrendQuality", 0))
+
+                        st.markdown(
+                            f"<div style='background:#161b22;border:1px solid rgba(255,255,255,0.08);"
+                            f"border-radius:8px;padding:14px;font-size:12px;'>",
+                            unsafe_allow_html=True,
+                        )
+
+                        # Trend Quality badge
+                        tq_color = "#22c55e" if tq >= 70 else ("#f59e0b" if tq >= 45 else "#ef4444")
+                        st.markdown(
+                            f"<div style='margin-bottom:10px;'>"
+                            f"<span style='font-size:10px;color:#8b949e;letter-spacing:0.08em;text-transform:uppercase;'>Trend Quality</span>"
+                            f"<span style='font-size:22px;font-weight:700;color:{tq_color};font-family:monospace;margin-left:8px;'>{tq}</span>"
+                            f"<span style='font-size:10px;color:#8b949e;'>/100</span></div>",
+                            unsafe_allow_html=True,
+                        )
+
+                        if _included:
+                            st.markdown("**✅ Why included:**")
+                            for item in _included:
+                                st.markdown(f"- {item}")
+                        if _not_higher:
+                            st.markdown("**🔼 Why not higher category:**")
+                            for item in _not_higher:
+                                st.markdown(f"- {item}")
+                        if _risks:
+                            st.markdown("**⚠️ Risk factors:**")
+                            for item in _risks:
+                                st.markdown(f"- {item}")
+                        if not _included and not _not_higher and not _risks:
+                            st.info("No explainability data for this stock.")
 
             # Watchlist
             if supabase_ok and sc_key not in ("SKIP",):

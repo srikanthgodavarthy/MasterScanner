@@ -53,10 +53,10 @@ def render(settings=None):
                 help="Default is 15 liquid symbols. Add more for broader coverage.",
             )
             bt_tier_filter = st.selectbox(
-                "Tier Filter",
-                ["Both", "Elite", "Tier 1", "Tier 2"],
+                "Signal Class Filter",
+                ["All", "Elite Opportunity", "High Conviction", "Actionable", "Setup Building"],
                 index=0, key="bt_tier_filter",
-                help="Elite = T1 Prime + score≥85 + RS top-decile + vol≥1.5x",
+                help="Filter backtest trades by scanner Signal Class. 'All' includes every signal.",
             )
             bt_buy_type_filter = st.multiselect(
                 "Buy Type",
@@ -100,11 +100,12 @@ def render(settings=None):
         run_bt = st.button("▶ Run Backtest", use_container_width=True, key="btn_run_bt")
     with col_info:
         _tier_label = {
-            "Both":   "<b style='color:#94a3b8'>Both Tiers</b>",
-            "Elite":  "<b style='color:#ffd700'>Elite only</b>",
-            "Tier 1": "<b style='color:#a78bfa'>Tier 1 Prime only</b>",
-            "Tier 2": "<b style='color:#60a5fa'>Tier 2 only</b>",
-        }[bt_tier_filter]
+            "All":               "<b style='color:#94a3b8'>All Signals</b>",
+            "Elite Opportunity": "<b style='color:#ffd700'>Elite Opportunity only</b>",
+            "High Conviction":   "<b style='color:#22c55e'>High Conviction only</b>",
+            "Actionable":        "<b style='color:#4ade80'>Actionable only</b>",
+            "Setup Building":    "<b style='color:#f59e0b'>Setup Building only</b>",
+        }.get(bt_tier_filter, "<b style='color:#94a3b8'>All Signals</b>")
         _bt_tags = [
             f"Symbols: <b>{len(bt_universe)}</b>",
             _tier_label,
@@ -171,12 +172,13 @@ def render(settings=None):
 
         if trades_df.empty:
             msgs = {
-                "Elite":  "No Elite signals found. Elite requires T1 Prime + score>=85 + RS>=0.10 + vol_ratio>=1.5. Try a broader symbol universe.",
-                "Tier 1": "No Tier 1 Prime signals found. Try expanding the symbol universe or lowering Min Score.",
-                "Tier 2": "No Tier 2 signals found. Try lowering Min Score or adjusting Buy Type filter.",
-                "Both":   "No trades generated. Try lowering Min Score or adding more symbols.",
+                "Elite Opportunity": "No Elite Opportunity signals found. Requires Leadership≥90, Conviction≥90, Entry≥80. Try a broader symbol universe or lower score threshold.",
+                "High Conviction":   "No High Conviction signals found. Try expanding the symbol universe or lowering Min Score.",
+                "Actionable":        "No Actionable signals found. Try lowering Min Score or adjusting Buy Type filter.",
+                "Setup Building":    "No Setup Building signals found. Try lowering Min Score or adding more symbols.",
+                "All":               "No trades generated. Try lowering Min Score or adding more symbols.",
             }
-            st.warning(msgs.get(bt_tier_filter, msgs["Both"]))
+            st.warning(msgs.get(bt_tier_filter, msgs["All"]))
             if not rejections_df.empty:
                 st.info(f"ℹ️ {len(rejections_df)} signals were rejected by the admission gate. Expand below to inspect.")
                 with st.expander("🚫 Admission Gate Rejections"):
