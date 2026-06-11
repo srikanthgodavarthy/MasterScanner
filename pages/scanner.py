@@ -1069,16 +1069,19 @@ def render(settings: dict | None = None):
         st.session_state["scan_time"]     = _now_ist().strftime("%H:%M:%S")
         st.session_state["scan_settings"] = effective
 
-        # Nifty price + day-over-day %Chg
+        # Nifty price + today's live %Chg (intraday)
         try:
-            if nifty_series is not None and len(nifty_series) >= 2:
-                last  = float(nifty_series.iloc[-1])
-                prev  = float(nifty_series.iloc[-2])
+            from utils.scanner_engine import fetch_nifty_live
+            _nifty_price, _nifty_chg = fetch_nifty_live()
+            if _nifty_price:
+                st.session_state["nifty_price"]   = _nifty_price
+                st.session_state["nifty_chg_pct"] = _nifty_chg
+            elif nifty_series is not None and len(nifty_series) >= 2:
+                # Fallback to daily series already fetched
+                last = float(nifty_series.iloc[-1])
+                prev = float(nifty_series.iloc[-2])
                 st.session_state["nifty_price"]   = last
                 st.session_state["nifty_chg_pct"] = round((last - prev) / prev * 100, 2)
-            elif nifty_series is not None and len(nifty_series) == 1:
-                st.session_state["nifty_price"]   = float(nifty_series.iloc[-1])
-                st.session_state["nifty_chg_pct"] = None
         except Exception:
             pass
 
