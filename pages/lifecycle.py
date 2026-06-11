@@ -523,7 +523,7 @@ def render():
     #  TABS
     # ══════════════════════════════════════════════════════════════════
     
-    tab1, tab2, tab3 = st.tabs(["📊 Lifecycle Table", "⚡ Transition Tracker", "📌 Watchlist"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Lifecycle Table", "⚡ Transition Tracker", "📌 Watchlist", "🔒 Frozen Plans"])
     
     
     # ════════════════════════════════════════════════════════════════════════════
@@ -1076,4 +1076,118 @@ def render():
                 file_name=f"watchlist_{date.today()}.csv",
                 mime="text/csv",
                 key="wl_export",
+            )
+
+    # ════════════════════════════════════════════════════════════════════════════
+    #  TAB 4 — FROZEN PLANS  (Setup Lifecycle Persistence audit view)
+    # ════════════════════════════════════════════════════════════════════════════
+
+    with tab4:
+        st.markdown(
+            "<h4 style='margin:0 0 12px'>🔒 Frozen Setup Plans</h4>",
+            unsafe_allow_html=True,
+        )
+
+        # ── Load all plans from Supabase ──────────────────────────────
+        from utils.supabase_client import load_all_setup_plans
+        _fp_df: pd.DataFrame = pd.DataFrame()
+
+        if db_ok:
+            try:
+                _fp_df = load_all_setup_plans(limit=500)
+            except Exception as _e:
+                st.warning(f"⚠️ Could not load setup_plans: {_e}")
+        else:
+            st.info(
+                "Supabase not connected — connect to see persisted frozen plans. "
+                "Plans from the current session scan are shown below if available.",
+                icon="🗄️",
+            )
+
+        # ── Fallback: pull from session scan df ───────────────────────
+        if _fp_df.empty:
+            _sess = st.session_state.get("last_scan_df")
+            if _sess is not None and not _sess.empty and "SetupID" in _sess.columns:
+                _active_mask = _sess["PlanStatus"].astype(str).str.upper() == "ACTIVE"
+                _sub = _sess[_active_mask].copy()
+                if not _sub.empty:
+                    _fp_df = _sub.rename(columns={
+                        "Stock":          "symbol",
+                        "SetupID":        "setup_id",
+                        "EntryLocked":    "entry_locked",
+                        "SLLocked":       "sl_locked",
+                        "DaysActive":     "days_active",
+                        "PlanStatus":     "status",
+                        "TradePlanStatus":"trade_plan_status",
+                        "EntryDriftPct":  "entry_drift_pct",
+                    })
+
+        # ── Summary badges ────────────────────────────────────────────
+        if not _fp_df.empty:
+            _total   = len(_fp_df)
+            _active  = int((_fp_df.get("status", pd.Series(dtype=str)).astype(str).str.upper() == "ACTIVE").sum())
+            _expired = int((_fp_df.get("status", pd.Series(dtype=str)).astype(str).str.upper() == "EXPIRED").sum())
+            _invalid = int((_fp_df.get("status", pd.Series(dtype=str)).astype(str).str.upper() == "INVALIDATED").sum())
+
+            _c1, _c2, _c3, _c4 = st.columns(4)
+            _c1.metric("Total Plans", _total)
+            _c2.metric("🟢 Active",   _active)
+            _c3.metric("🟡 Expired",  _expired)
+            _c4.metric("🔴 Invalidated", _invalid)
+
+            # ── Filter controls ───────────────────────────────────────
+            _status_opts = ["ALL"] + sorted(
+                _fp_df.get("status", pd.Series(dtype=str)).astype(str).str.upper().unique().tolist()
+            )
+            _sel_status = st.selectbox("Filter by status", _status_opts, key="fp_status_filter")
+            if _sel_status != "ALL":
+                _fp_df = _fp_df[_fp_df["status"].astype(str).str.upper() == _sel_status]
+
+            # ── Build display table ───────────────────────────────────
+            _display_cols = {
+                "setup_id":          "SetupID",
+                "symbol":            "Symbol",
+                "entry_locked":      "Locked Entry",
+                "sl_locked":         "Locked SL",
+                "days_active":       "Days Active",
+                "status":            "Plan Status",
+                "trade_plan_status": "Trade Plan Status",
+                "entry_drift_pct":   "Entry Drift %",
+                "first_actionable_date": "First Actionable",
+                "locked_category":   "Locked Category",
+            }
+
+            _avail_cols = {k: v for k, v in _display_cols.items() if k in _fp_df.columns}
+            _show_df = _fp_df[list(_avail_cols.keys())].rename(columns=_avail_cols).copy()
+
+            # Colour-code status column
+            def _colour_status(val):
+                v = str(val).upper()
+                if v == "ACTIVE":      return "background-color:#1a3a1a;color:#3fb950"
+                if v == "EXPIRED":     return "background-color:#2a2a1a;color:#f5c542"
+                if v == "INVALIDATED": return "background-color:#3a1a1a;color:#f85149"
+                return ""
+
+            if "Plan Status" in _show_df.columns:
+                styled = _show_df.style.applymap(_colour_status, subset=["Plan Status"])
+            else:
+                styled = _show_df.style
+
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+
+            # ── Export ────────────────────────────────────────────────
+            _csv = _show_df.to_csv(index=False).encode()
+            st.download_button(
+                "⬇️ Export Frozen Plans CSV",
+                data=_csv,
+                file_name=f"frozen_plans_{date.today()}.csv",
+                mime="text/csv",
+                key="fp_export",
+            )
+
+        else:
+            st.info(
+                "No setup plans found. Run a scan — plans are minted when a symbol "
+                "first reaches an Actionable/HC/Elite category.",
+                icon="🔒",
             )
