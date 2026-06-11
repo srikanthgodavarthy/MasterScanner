@@ -386,6 +386,194 @@ def load_first_seen() -> dict[str, str]:
         return {}
 
 
+# ─── LIFECYCLE STATES ────────────────────────────────────────────────────────
+
+def save_lifecycle_snapshot(rows: list[dict]) -> bool:
+    """
+    Persist a batch of lifecycle state rows to the lifecycle_states table.
+
+    Each dict should contain: symbol, scan_date, stage, category,
+    leadership, conviction, entry_quality, extension, trend_quality, score,
+    action, cci, cci_state, rs_composite, adx, bars_band, bars_since, move_since.
+
+    Uses upsert on (symbol, scan_date) so re-running a scan on the same date
+    updates rather than duplicates.
+    """
+    client = get_client()
+    if client is None or not rows:
+        return False
+
+    def _safe(v):
+        if v is None:
+            return None
+        if isinstance(v, float) and (v != v):   # NaN check
+            return None
+        if isinstance(v, (pd.Timestamp, datetime)):
+            return v.isoformat()
+        return v
+
+    clean = []
+    for r in rows:
+        clean.append({k: _safe(v) for k, v in r.items()})
+
+    try:
+        batch = 500
+        for i in range(0, len(clean), batch):
+            resp = (
+                client.table("lifecycle_states")
+                .upsert(clean[i : i + batch], on_conflict="symbol,scan_date")
+                .execute()
+            )
+            if resp.data is None:
+                return False
+        return True
+    except Exception as exc:
+        logger.error("save_lifecycle_snapshot failed: %s", exc)
+        return False
+
+
+def load_lifecycle_latest() -> pd.DataFrame:
+    """
+    Return the most-recent lifecycle state for every symbol
+    (one row per symbol).
+    """
+    client = get_client()
+    if client is None:
+        return pd.DataFrame()
+
+    try:
+        resp = (
+            client.table("lifecycle_states")
+            .select("*")
+            .order("scan_date", desc=True)
+            .limit(5000)
+            .execute()
+        )
+        if not resp.data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(resp.data)
+        # Keep only the most-recent row per symbol
+        df = (
+            df.sort_values("scan_date", ascending=False)
+            .drop_duplicates(subset=["symbol"], keep="first")
+            .reset_index(drop=True)
+        )
+        return df
+    except Exception as exc:
+        logger.error("load_lifecycle_latest failed: %s", exc)
+        return pd.DataFrame()
+
+
+def load_lifecycle_history(symbol: str, limit_days: int = 90) -> pd.DataFrame:
+    """
+    Return all lifecycle_states rows for a single symbol over the last
+    ``limit_days`` calendar days, ordered by scan_date ascending.
+    """
+    client = get_client()
+    if client is None:
+        return pd.DataFrame()
+
+    from datetime import timezone, timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=limit_days)).date().isoformat()
+
+    try:
+        resp = (
+            client.table("lifecycle_states")
+            .select("*")
+            .eq("symbol", symbol.upper().strip())
+            .gte("scan_date", cutoff)
+            .order("scan_date", desc=False)
+            .execute()
+        )
+        if not resp.data:
+            return pd.DataFrame()
+        return pd.DataFrame(resp.data)
+    except Exception as exc:
+        logger.error("load_lifecycle_history failed: %s", exc)
+        return pd.DataFrame()
+
+
+# ─── LIFECYCLE TRANSITIONS ────────────────────────────────────────────────────
+
+def save_lifecycle_transitions(transitions: list[dict]) -> bool:
+    """
+    Persist detected lifecycle transitions.
+
+    Each dict: symbol, from_stage, to_stage, from_date, to_date, direction.
+    """
+    client = get_client()
+    if client is None or not transitions:
+        return False
+
+    try:
+        batch = 500
+        for i in range(0, len(transitions), batch):
+            resp = (
+                client.table("lifecycle_transitions")
+                .insert(transitions[i : i + batch])
+                .execute()
+            )
+            if resp.data is None:
+                return False
+        return True
+    except Exception as exc:
+        logger.error("save_lifecycle_transitions failed: %s", exc)
+        return False
+
+
+def load_lifecycle_transitions(limit: int = 1000) -> pd.DataFrame:
+    """
+    Return the most-recent lifecycle transition events.
+    """
+    client = get_client()
+    if client is None:
+        return pd.DataFrame()
+
+    try:
+        resp = (
+            client.table("lifecycle_transitions")
+            .select("*")
+            .order("to_date", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        if not resp.data:
+            return pd.DataFrame()
+        return pd.DataFrame(resp.data)
+    except Exception as exc:
+        logger.error("load_lifecycle_transitions failed: %s", exc)
+        return pd.DataFrame()
+
+
+# ─── WATCHLIST ENRICHED ───────────────────────────────────────────────────────
+
+def load_watchlist_enriched() -> pd.DataFrame:
+    """
+    Return the watchlist joined with the latest lifecycle state for each symbol.
+
+    Columns: symbol, notes, added_at, stage, leadership, conviction,
+             entry_quality, trend_quality, score, scan_date  (lifecycle cols may be NaN)
+    """
+    wl = load_watchlist()
+    if not wl:
+        return pd.DataFrame()
+
+    wl_df = pd.DataFrame(wl)
+    lc_df = load_lifecycle_latest()
+
+    if lc_df.empty:
+        return wl_df
+
+    lc_cols = [c for c in [
+        "symbol", "stage", "leadership", "conviction",
+        "entry_quality", "trend_quality", "score", "scan_date",
+    ] if c in lc_df.columns]
+
+    merged = wl_df.merge(lc_df[lc_cols], on="symbol", how="left")
+    return merged
+
+
 # ─── SCHEMA SQL ───────────────────────────────────────────────────────────────
 
 SCHEMA_SQL = """
@@ -443,4 +631,43 @@ CREATE TABLE IF NOT EXISTS signal_first_seen (
     first_seen  date        NOT NULL,
     category    text        NOT NULL DEFAULT ''
 );
+
+-- 5. Lifecycle states (Sprint 2) — one row per symbol per scan date
+CREATE TABLE IF NOT EXISTS lifecycle_states (
+    id            bigserial PRIMARY KEY,
+    symbol        text        NOT NULL,
+    scan_date     date        NOT NULL,
+    stage         text        NOT NULL DEFAULT 'FORMING',
+    category      text        NOT NULL DEFAULT '',
+    leadership    integer     NOT NULL DEFAULT 0,
+    conviction    integer     NOT NULL DEFAULT 0,
+    entry_quality integer     NOT NULL DEFAULT 0,
+    extension     integer     NOT NULL DEFAULT 0,
+    trend_quality integer     NOT NULL DEFAULT 0,
+    score         integer     NOT NULL DEFAULT 0,
+    action        text,
+    cci           integer,
+    cci_state     text,
+    rs_composite  numeric(8,4),
+    adx           numeric(8,4),
+    bars_band     text,
+    bars_since    integer,
+    move_since    numeric(8,4),
+    UNIQUE (symbol, scan_date)
+);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_states_symbol    ON lifecycle_states(symbol);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_states_scan_date ON lifecycle_states(scan_date DESC);
+
+-- 6. Lifecycle transitions (Sprint 2) — detected stage changes
+CREATE TABLE IF NOT EXISTS lifecycle_transitions (
+    id          bigserial PRIMARY KEY,
+    symbol      text        NOT NULL,
+    from_stage  text        NOT NULL,
+    to_stage    text        NOT NULL,
+    from_date   date,
+    to_date     date        NOT NULL,
+    direction   text        NOT NULL DEFAULT 'FORWARD'  -- FORWARD | BACKWARD | LATERAL
+);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_transitions_symbol  ON lifecycle_transitions(symbol);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_transitions_to_date ON lifecycle_transitions(to_date DESC);
 """
