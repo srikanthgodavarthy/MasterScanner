@@ -373,38 +373,13 @@ _CSS = """
 }
 
 /* ── Tooltip triggers ── */
-/* All tooltip logic is JS-driven (floating #ms-tip div at document level).
-   No position:absolute inside overflow:hidden — tooltips are never clipped. */
+/* Tooltip trigger styling — applies to elements in iframe doc */
 [data-tip-title] { cursor: help; }
 .tip-underline {
   border-bottom: 1px dashed rgba(255,255,255,0.25);
   cursor: help;
 }
-/* The floating tooltip div is injected once by _TOOLTIP_JS below */
-#ms-tip {
-  position: fixed;
-  z-index: 999999;
-  pointer-events: none;
-  max-width: 270px;
-  background: #1c2333;
-  border: 1px solid rgba(255,255,255,0.16);
-  border-radius: 7px;
-  padding: 10px 13px;
-  font-family: 'JetBrains Mono', 'Fira Code', monospace;
-  font-size: 0.70rem;
-  color: #e6edf3;
-  line-height: 1.6;
-  box-shadow: 0 8px 28px rgba(0,0,0,0.65);
-  display: none;
-}
-#ms-tip .tip-title {
-  font-size: 0.72rem;
-  font-weight: 700;
-  color: #f5c542;
-  margin-bottom: 6px;
-  letter-spacing: 0.05em;
-  display: block;
-}
+/* #ms-tip styles + div are injected into window.parent.document by _TOOLTIP_JS */
 
 /* ── Breakdown panel ── */
 .breakdown-row {
@@ -429,30 +404,56 @@ _CSS = """
 """
 
 # ── TOOLTIP JS ────────────────────────────────────────────────────
-# Injected once per table render. Creates a single #ms-tip div at body level,
-# so it is never clipped by .rt-wrap's overflow:hidden/auto.
-# Triggers: any element with data-tip-title attribute.
+# Injected once per table render.
+# The tooltip div is appended to window.parent.document.body so it escapes
+# Streamlit's sandboxed iframe and renders at the true browser viewport level.
+# Mouse events are also listened on the parent document so clientX/Y match
+# the fixed-position coordinates of the tooltip div.
 _TOOLTIP_JS = """
-<div id="ms-tip"><span class="tip-title" id="ms-tip-title"></span><span id="ms-tip-body"></span></div>
 <script>
 (function(){
-  if(window._msTipInit) return;
-  window._msTipInit = true;
-  var tip   = document.getElementById('ms-tip');
-  var ttl   = document.getElementById('ms-tip-title');
-  var tbody = document.getElementById('ms-tip-body');
+  // Target the parent (Streamlit host) document so position:fixed works
+  // relative to the real viewport, not the iframe's clipped viewport.
+  var P   = window.parent;
+  var doc = P.document;
+
+  if(P._msTipInit) return;
+  P._msTipInit = true;
+
+  // Inject tooltip div + styles into parent <head> once
+  var style = doc.createElement('style');
+  style.textContent = [
+    '#ms-tip{position:fixed;z-index:999999;pointer-events:none;max-width:270px;',
+    'background:#1c2333;border:1px solid rgba(255,255,255,0.16);border-radius:7px;',
+    'padding:10px 13px;font-family:"JetBrains Mono","Fira Code",monospace;',
+    'font-size:0.70rem;color:#e6edf3;line-height:1.6;',
+    'box-shadow:0 8px 28px rgba(0,0,0,0.65);display:none;}',
+    '#ms-tip .tip-title{font-size:0.72rem;font-weight:700;color:#f5c542;',
+    'margin-bottom:6px;letter-spacing:0.05em;display:block;}'
+  ].join('');
+  doc.head.appendChild(style);
+
+  var tip = doc.createElement('div');
+  tip.id = 'ms-tip';
+  tip.innerHTML = '<span class="tip-title" id="ms-tip-title"></span><span id="ms-tip-body"></span>';
+  doc.body.appendChild(tip);
+
+  var ttl   = doc.getElementById('ms-tip-title');
+  var tbody = doc.getElementById('ms-tip-body');
   var PAD   = 14;
-  document.addEventListener('mouseover', function(e){
+
+  // Listen on the parent document — mouse coords are in parent viewport space
+  doc.addEventListener('mouseover', function(e){
     var el = e.target.closest('[data-tip-title]');
     if(!el){ tip.style.display='none'; return; }
-    ttl.textContent   = el.getAttribute('data-tip-title') || '';
-    tbody.innerHTML   = (el.getAttribute('data-tip-body') || '').replace(/\\n/g,'<br>');
+    ttl.textContent = el.getAttribute('data-tip-title') || '';
+    tbody.innerHTML = (el.getAttribute('data-tip-body') || '').replace(/\\n/g,'<br>');
     tip.style.display = 'block';
   });
-  document.addEventListener('mousemove', function(e){
+  doc.addEventListener('mousemove', function(e){
     if(tip.style.display==='none') return;
     var tw = tip.offsetWidth, th = tip.offsetHeight;
-    var vw = window.innerWidth,  vh = window.innerHeight;
+    var vw = P.innerWidth,  vh = P.innerHeight;
     var x  = e.clientX + PAD;
     var y  = e.clientY + PAD;
     if(x + tw > vw - 4) x = e.clientX - tw - PAD;
@@ -460,7 +461,7 @@ _TOOLTIP_JS = """
     tip.style.left = x + 'px';
     tip.style.top  = y + 'px';
   });
-  document.addEventListener('mouseout', function(e){
+  doc.addEventListener('mouseout', function(e){
     if(!e.target.closest('[data-tip-title]')) tip.style.display='none';
   });
 })();
