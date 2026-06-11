@@ -1169,6 +1169,7 @@ def render():
                 return ""
 
             if "Plan Status" in _show_df.columns:
+                st.write(_show_df.columns.tolist())
                 styled = _show_df.style.applymap(_colour_status, subset=["Plan Status"])
             else:
                 styled = _show_df.style
