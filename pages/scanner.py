@@ -37,7 +37,10 @@ from utils.regime_engine   import (
     regime_summary,
     REGIME_WEIGHTS,
 )
-from utils.supabase_client import save_scan_snapshot, load_watchlist, add_to_watchlist, _is_available
+from utils.supabase_client import (
+    save_scan_snapshot, load_watchlist, add_to_watchlist, _is_available,
+    upsert_first_seen, load_first_seen,
+)
 
 # ── CONSTANTS ─────────────────────────────────────────────────────
 REGIME_COLORS = {
@@ -681,7 +684,7 @@ _DETAIL_EXTRA = [
 # Primary column order for HTML table (v9: CMP added, R:R is CMP-based)
 _PRIMARY_ORDERED = [
     "Stock", "Signal Class", "Leadership", "Conviction", "Entry Quality",
-    "Extension", "CMP", "%Chg", "Entry", "SL", "T1", "R:R", "Size%",
+    "Extension", "CMP", "%Chg", "Since", "Entry", "SL", "T1", "R:R", "Size%",
 ]
 
 
@@ -824,6 +827,32 @@ def _sc_table_badge(signal_class: str) -> str:
     )
 
 
+def _since_cell(val) -> str:
+    """Render a YYYY-MM-DD first-seen date as a compact 'DD MMM' badge."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return '<td class="col-num" style="color:var(--muted)">—</td>'
+    try:
+        from datetime import date as _date
+        d = pd.to_datetime(str(val)).date()
+        today = _date.today()
+        days  = (today - d).days
+        label = d.strftime("%d %b")
+        # colour: fresh (≤3d) gold, recent (≤10d) green, older muted
+        if days <= 3:
+            color = "#f5c542"
+        elif days <= 10:
+            color = "#3fb950"
+        else:
+            color = "#8b949e"
+        tooltip = f"First seen {days}d ago ({d.strftime('%d %b %Y')})"
+        return (
+            f'<td class="col-num" title="{tooltip}" '
+            f'style="color:{color};font-weight:600;cursor:default">{label}</td>'
+        )
+    except Exception:
+        return f'<td class="col-num" style="color:var(--muted)">{val}</td>'
+
+
 def _render_html_table(df: pd.DataFrame) -> str:
     if df.empty:
         return '<div style="padding:2rem;text-align:center;color:#8b949e;font-size:0.8rem;">No data</div>'
@@ -877,6 +906,8 @@ def _render_html_table(df: pd.DataFrame) -> str:
                 cells += _rr_cell(cmp_rr if cmp_rr is not None else val)
             elif c == "Size%":
                 cells += _size_cell(val)
+            elif c == "Since":
+                cells += _since_cell(val)
             elif c in ("Entry", "SL", "T1", "T2", "LTP"):
                 cells += _num_cell(val, "{:.2f}")
             elif c in ("Score", "Composite", "RS%"):
@@ -1085,12 +1116,37 @@ def render(settings: dict | None = None):
             save_scan_snapshot(df_aug)
             st.success("✅ Saved to Supabase.")
 
+        # ── Record first-seen dates for Elite / Execute stocks ─────
+        # Always runs (not gated on save_db) so the date tracking stays
+        # accurate even when the user doesn't save the full snapshot.
+        if supabase_ok and "Category" in df_aug.columns:
+            _elite_exec = df_aug[
+                df_aug["Category"].isin([
+                    "Elite Opportunity", "High Conviction", "Actionable"
+                ])
+            ]
+            if not _elite_exec.empty and "Stock" in _elite_exec.columns:
+                _pairs = list(
+                    zip(_elite_exec["Stock"].tolist(),
+                        _elite_exec["Category"].tolist())
+                )
+                upsert_first_seen(_pairs)
+
     # ── Display ────────────────────────────────────────────────
     df_aug        = st.session_state.get("scan_df",       pd.DataFrame())
     summary       = st.session_state.get("scan_summary",  {})
     scan_time     = st.session_state.get("scan_time",     "")
     nifty_price   = st.session_state.get("nifty_price",   0)
     nifty_chg_pct = st.session_state.get("nifty_chg_pct", None)
+
+    # ── Attach first-seen dates ────────────────────────────────
+    # Load once per page render and join onto df_aug so the "Since" column
+    # is available for Elite / Execute rows.
+    if not df_aug.empty and supabase_ok and "Stock" in df_aug.columns:
+        _fs_map = load_first_seen()
+        if _fs_map:
+            df_aug = df_aug.copy()
+            df_aug["Since"] = df_aug["Stock"].map(_fs_map)
 
     if df_aug.empty:
         st.markdown("""
