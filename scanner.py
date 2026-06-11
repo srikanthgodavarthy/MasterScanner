@@ -1063,6 +1063,7 @@ def render(settings: dict | None = None):
             pass
 
         st.session_state["scan_df"]       = df_aug
+        st.session_state["last_scan_df"]  = df_aug   # Sprint 2: lifecycle page reads this
         st.session_state["regime_ctx"]    = regime_ctx
         st.session_state["scan_summary"]  = regime_summary(df_aug, regime_ctx)
         st.session_state["scan_time"]     = _now_ist().strftime("%H:%M:%S")
@@ -1083,6 +1084,41 @@ def render(settings: dict | None = None):
 
         if supabase_ok and save_db:
             save_scan_snapshot(df_aug)
+            # ── Sprint 2 / 3: persist lifecycle snapshot + transitions ──
+            try:
+                from utils.lifecycle_engine import (
+                    lifecycle_from_scanner_row, detect_transitions,
+                )
+                from utils.supabase_client import (
+                    save_lifecycle_snapshot, save_lifecycle_transitions,
+                    load_lifecycle_latest,
+                )
+                import datetime as _dt
+                _today   = _dt.date.today()
+                _lc_rows = []
+                for _, _srow in df_aug.iterrows():
+                    _sym = str(_srow.get("Stock", ""))
+                    _lr  = lifecycle_from_scanner_row(
+                        _srow.to_dict(), symbol=_sym, scan_date=_today
+                    )
+                    if _lr:
+                        _lc_rows.append(vars(_lr))
+
+                if _lc_rows:
+                    # Load previous snapshot BEFORE saving new one
+                    _prev_df = load_lifecycle_latest()
+                    save_lifecycle_snapshot(_lc_rows)
+
+                    # Detect and persist stage transitions
+                    import pandas as _pd
+                    _curr_df = _pd.DataFrame(_lc_rows)
+                    _transitions = detect_transitions(
+                        _prev_df, _curr_df, scan_date=_today
+                    )
+                    if _transitions:
+                        save_lifecycle_transitions(_transitions)
+            except Exception:
+                pass  # non-critical
             st.success("✅ Saved to Supabase.")
 
     # ── Display ────────────────────────────────────────────────
@@ -1216,9 +1252,9 @@ def render(settings: dict | None = None):
                         _row = df_subset[df_subset["Stock"] == _picked].iloc[0]
                         st.markdown(_detail_breakdown_panel(_row), unsafe_allow_html=True)
 
-            # Explainability panel (Sprint 1) — always visible, no detail toggle required
-            if "_explain_included" in df_subset.columns:
-                with st.expander("💡 Why this stock? — Decision Explainer"):
+            # Explainability panel (Sprint 1)
+            if _show_detail and "_explain_included" in df_subset.columns:
+                with st.expander("💡 Why this stock? — Explainability"):
                     _sel2 = df_subset["Stock"].tolist()[:10] if "Stock" in df_subset.columns else []
                     _picked2 = st.selectbox("Select stock", _sel2, key=f"explain_sel_{sc_key}")
                     if _picked2:
