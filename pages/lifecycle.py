@@ -46,6 +46,7 @@ from utils.supabase_client import (
     load_lifecycle_latest, load_lifecycle_transitions, save_lifecycle_transitions,
     load_watchlist, add_to_watchlist, remove_from_watchlist,
     load_watchlist_enriched,
+    load_active_setup_plans,
 )
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────
@@ -454,9 +455,25 @@ def render():
     #  PAGE HEADER
     # ══════════════════════════════════════════════════════════════════
     
-    st.markdown("""
+    # ── Active setup plan count for header badge ──────────────────────
+    _active_plan_count = 0
+    if _is_available():
+        try:
+            _active_plan_count = len(load_active_setup_plans())
+        except Exception:
+            _active_plan_count = 0
+
+    _plan_badge = (
+        f'<span style="background:#3fb950;color:#0d1117;border-radius:4px;'
+        f'padding:2px 8px;font-size:11px;font-weight:700;margin-left:10px;">'
+        f'🔒 {_active_plan_count} Active Plan{"s" if _active_plan_count != 1 else ""}</span>'
+        if _active_plan_count > 0
+        else '<span style="color:#8b949e;font-size:11px;margin-left:10px;">No active plans</span>'
+    )
+
+    st.markdown(f"""
     <div class="lc-header">
-      <h2>🔄 Lifecycle Tracker</h2>
+      <h2>🔄 Lifecycle Tracker {_plan_badge}</h2>
       <p>Stage classification · Transition detection · Persistence watchlist</p>
     </div>
     """, unsafe_allow_html=True)
