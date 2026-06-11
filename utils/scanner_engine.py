@@ -776,6 +776,8 @@ def _enrich_with_setup_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
             upsert_first_seen,
         )
         from utils.setup_persistence import enrich_scanner_dataframe
+        import logging as _log
+        _logger = _log.getLogger(__name__)
 
         # Load existing frozen plans + first-seen dates
         existing_plans = load_active_setup_plans()  # {symbol: SetupPlan}
@@ -794,6 +796,22 @@ def _enrich_with_setup_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
             for sym, _ in new_symbols:
                 first_seen_map[sym.upper()] = today_str
 
+        # Count symbols qualifying for plan creation before enrichment
+        from utils.setup_persistence import _FREEZE_CATEGORIES
+        qualifying_symbols = [
+            str(row.get("Stock", "")).upper()
+            for _, row in df_out.iterrows()
+            if str(row.get("Category", "")) in _FREEZE_CATEGORIES
+        ]
+        _logger.info(
+            "[SETUP PLAN SCAN] total_rows=%d  qualifying_symbols=%d  categories=%s",
+            len(df_out),
+            len(qualifying_symbols),
+            list(_FREEZE_CATEGORIES),
+        )
+        if qualifying_symbols:
+            _logger.info("[SETUP PLAN SCAN] qualifying_list=%s", qualifying_symbols)
+
         # Enrich DataFrame
         enriched_df, updated_plans = enrich_scanner_dataframe(
             df_out,
@@ -803,6 +821,13 @@ def _enrich_with_setup_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
         )
 
         # Persist changed plans back to Supabase
+        new_plans   = [p for p in updated_plans if p.status == "ACTIVE" and p.first_actionable_date == __import__('datetime').date.today().isoformat()]
+        other_plans = [p for p in updated_plans if p not in new_plans]
+        _logger.info(
+            "[SETUP PLAN PERSIST] updated_total=%d  new_inserts=%d  status_changes=%d",
+            len(updated_plans), len(new_plans), len(other_plans),
+        )
+
         if updated_plans:
             plan_dicts = [p.to_db_dict() for p in updated_plans]
             upsert_setup_plans_batch(plan_dicts)
