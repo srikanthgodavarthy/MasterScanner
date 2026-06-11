@@ -1063,6 +1063,7 @@ def render(settings: dict | None = None):
             pass
 
         st.session_state["scan_df"]       = df_aug
+        st.session_state["last_scan_df"]  = df_aug   # Sprint 2: lifecycle page reads this
         st.session_state["regime_ctx"]    = regime_ctx
         st.session_state["scan_summary"]  = regime_summary(df_aug, regime_ctx)
         st.session_state["scan_time"]     = _now_ist().strftime("%H:%M:%S")
@@ -1083,6 +1084,21 @@ def render(settings: dict | None = None):
 
         if supabase_ok and save_db:
             save_scan_snapshot(df_aug)
+            # ── Sprint 2: persist lifecycle snapshot ──────────────
+            try:
+                from utils.lifecycle_engine import lifecycle_from_scanner_row
+                from utils.supabase_client  import save_lifecycle_snapshot
+                _lc_rows = []
+                _today   = __import__("datetime").date.today()
+                for _, _srow in df_aug.iterrows():
+                    _sym = str(_srow.get("Stock", ""))
+                    _lr  = lifecycle_from_scanner_row(_srow.to_dict(), symbol=_sym, scan_date=_today)
+                    if _lr:
+                        _lc_rows.append(vars(_lr))
+                if _lc_rows:
+                    save_lifecycle_snapshot(_lc_rows)
+            except Exception:
+                pass  # non-critical
             st.success("✅ Saved to Supabase.")
 
     # ── Display ────────────────────────────────────────────────
