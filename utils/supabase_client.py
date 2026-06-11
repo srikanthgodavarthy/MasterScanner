@@ -322,6 +322,70 @@ def load_backtest_summary(limit: int = 5) -> pd.DataFrame:
         return pd.DataFrame()
     return pd.DataFrame(rows)
 
+# ─── SIGNAL FIRST SEEN ────────────────────────────────────────────────────────
+
+def upsert_first_seen(symbol_categories: list[tuple[str, str]]) -> bool:
+    """
+    Record the first date a symbol appeared in Elite / Execute.
+
+    ``symbol_categories`` is a list of (symbol, category) pairs, e.g.
+    [("NESTLEIND", "Elite Opportunity"), ("INFY", "Actionable")].
+
+    Uses INSERT ... ON CONFLICT DO NOTHING so the original date is never
+    overwritten — the stock keeps its earliest "first seen" date forever,
+    even if it drops out and re-enters the scanner.
+
+    Returns True on success, False otherwise.
+    """
+    client = get_client()
+    if client is None or not symbol_categories:
+        return False
+
+    today = datetime.now(timezone.utc).date().isoformat()   # "YYYY-MM-DD"
+    rows  = [
+        {"symbol": sym.upper().strip(), "first_seen": today, "category": cat}
+        for sym, cat in symbol_categories
+        if sym.strip()
+    ]
+    if not rows:
+        return False
+
+    try:
+        # upsert with ignoreDuplicates=True → existing rows are left untouched
+        resp = (
+            client.table("signal_first_seen")
+            .upsert(rows, on_conflict="symbol", ignore_duplicates=True)
+            .execute()
+        )
+        return resp.data is not None
+    except Exception as exc:
+        logger.error("upsert_first_seen failed: %s", exc)
+        return False
+
+
+def load_first_seen() -> dict[str, str]:
+    """
+    Return a dict mapping symbol → first_seen date string ("YYYY-MM-DD").
+    Returns an empty dict if Supabase is unavailable or the table is empty.
+    """
+    client = get_client()
+    if client is None:
+        return {}
+
+    try:
+        resp = (
+            client.table("signal_first_seen")
+            .select("symbol, first_seen")
+            .execute()
+        )
+        if not resp.data:
+            return {}
+        return {row["symbol"]: row["first_seen"] for row in resp.data}
+    except Exception as exc:
+        logger.error("load_first_seen failed: %s", exc)
+        return {}
+
+
 # ─── SCHEMA SQL ───────────────────────────────────────────────────────────────
 
 SCHEMA_SQL = """
@@ -371,5 +435,12 @@ CREATE TABLE IF NOT EXISTS watchlist (
     symbol    text PRIMARY KEY,
     notes     text        NOT NULL DEFAULT '',
     added_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- 4. Signal first seen (Elite / Execute — earliest appearance date per symbol)
+CREATE TABLE IF NOT EXISTS signal_first_seen (
+    symbol      text PRIMARY KEY,
+    first_seen  date        NOT NULL,
+    category    text        NOT NULL DEFAULT ''
 );
 """
