@@ -15,9 +15,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings("ignore")
 
-# Pre-import scoring modules at load time (avoids per-call sys.modules lookup
-# across 500 threaded score_stock() invocations)
-from utils.scoring_core    import ScoringParams, build_indicators, compute_bar
+# Pre-import decision_engine at load time (safe — no circular deps).
+# scoring_core is NOT imported here because build_indicators() imports back
+# from scanner_engine (ema, sma, rsi, etc.) creating a circular import.
+# scoring_core is imported inside score_stock() where Python's import system
+# handles the cycle safely after scanner_engine is fully loaded.
 from utils.decision_engine import compute_decision
 
 
@@ -411,6 +413,8 @@ def score_stock(
     """
     if df.empty or len(df) < 210:
         return {}
+
+    from utils.scoring_core import ScoringParams, build_indicators, compute_bar
 
     if settings:
         params = ScoringParams.from_settings(settings)
