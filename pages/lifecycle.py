@@ -513,38 +513,30 @@ def render():
             # Load the previous scan's lifecycle rows from DB
             _prev_df = load_lifecycle_latest()
             if not _prev_df.empty:
-                _prev_map = {
-                    row["symbol"]: type("LR", (), {
-                        "stage":      row.get("stage", STAGE_FORMING),
-                        "stage_ordinal": _STAGE_ORDER.get(row.get("stage", STAGE_FORMING), 0),
-                        "scan_date":  row.get("scan_date", date.today()),
-                        "leadership": row.get("leadership", 0),
-                        "category":   row.get("category", ""),
-                    })()
-                    for _, row in _prev_df.iterrows()
-                }
-                _curr_map = {}
+                # Build curr_df from session scan rows
+                _curr_rows = []
                 for _, srow in _session_scan.iterrows():
                     sym = str(srow.get("Stock", ""))
                     lc_row = lifecycle_from_scanner_row(srow.to_dict(), symbol=sym)
                     if lc_row:
-                        _curr_map[sym] = lc_row
-    
+                        _curr_rows.append(vars(lc_row))
+                _curr_df = pd.DataFrame(_curr_rows) if _curr_rows else pd.DataFrame()
+
                 from utils.lifecycle_engine import detect_transitions as _dt
-                _ts = _dt(_prev_map, _curr_map)
+                _ts = _dt(_prev_df, _curr_df)
                 for t in _ts:
                     _live_transitions.append({
-                        "symbol":          t.symbol,
-                        "from_stage":      t.from_stage,
-                        "to_stage":        t.to_stage,
-                        "from_date":       str(t.from_date),
-                        "to_date":         str(t.to_date),
-                        "direction":       t.direction,
-                        "delta":           t.delta,
-                        "from_leadership": t.from_leadership,
-                        "to_leadership":   t.to_leadership,
-                        "from_category":   t.from_category,
-                        "to_category":     t.to_category,
+                        "symbol":          t["symbol"],
+                        "from_stage":      t["from_stage"],
+                        "to_stage":        t["to_stage"],
+                        "from_date":       t["from_date"],
+                        "to_date":         t["to_date"],
+                        "direction":       t["direction"],
+                        "delta":           t.get("delta", 0),
+                        "from_leadership": t.get("from_leadership", 0),
+                        "to_leadership":   t.get("to_leadership", 0),
+                        "from_category":   t.get("from_category", ""),
+                        "to_category":     t.get("to_category", ""),
                     })
     
                 if _live_transitions:
