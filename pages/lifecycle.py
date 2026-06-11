@@ -154,6 +154,55 @@ body { background: var(--bg0); color: var(--text); }
 /* stability dots */
 .stab-dot { display: inline-block; width: 8px; height: 8px;
   border-radius: 50%; margin-right: 2px; }
+
+/* ── Setup Persistence Badges ── */
+.freshness-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px; border-radius: 4px;
+  font-size: 10px; font-weight: 700; font-family: var(--mono); white-space: nowrap;
+}
+.freshness-fresh   { background:rgba(63,185,80,0.15);  border:1px solid rgba(63,185,80,0.4);  color:#3fb950; }
+.freshness-mature  { background:rgba(245,197,66,0.12); border:1px solid rgba(245,197,66,0.35); color:#f5c542; }
+.freshness-late    { background:rgba(248,81,73,0.12);  border:1px solid rgba(248,81,73,0.35);  color:#f85149; }
+.freshness-expired { background:rgba(139,148,158,0.1); border:1px solid rgba(139,148,158,0.3); color:#8b949e; }
+.trade-status-badge {
+  display: inline-block; padding: 2px 7px; border-radius: 4px;
+  font-size: 9px; font-weight: 700; font-family: var(--mono); white-space: nowrap;
+}
+.ts-waiting     { background:rgba(88,166,255,0.12); border:1px solid rgba(88,166,255,0.35); color:#58a6ff; }
+.ts-triggered   { background:rgba(63,185,80,0.15);  border:1px solid rgba(63,185,80,0.4);   color:#3fb950; }
+.ts-t1          { background:rgba(163,113,247,0.15);border:1px solid rgba(163,113,247,0.4); color:#a371f7; }
+.ts-t2          { background:rgba(245,197,66,0.15); border:1px solid rgba(245,197,66,0.4);  color:#f5c542; }
+.ts-expired     { background:rgba(139,148,158,0.1); border:1px solid rgba(139,148,158,0.3); color:#8b949e; }
+.ts-invalidated { background:rgba(248,81,73,0.12);  border:1px solid rgba(248,81,73,0.35);  color:#f85149; }
+.locked-plan-grid {
+  display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-top: 8px;
+}
+.locked-level {
+  background: var(--bg1); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 10px; text-align: center; font-family: var(--mono);
+}
+.locked-level .ll-label { font-size: 9px; font-weight: 700; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 4px; }
+.locked-level .ll-value { font-size: 13px; font-weight: 700; }
+.lifecycle-panel {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px 14px; margin-top: 10px;
+}
+.lc-timeline {
+  display: flex; align-items: center; gap: 0; overflow-x: auto; padding-bottom: 4px;
+}
+.lc-node { display: flex; flex-direction: column; align-items: center; min-width: 72px; }
+.lc-node-circle {
+  width: 26px; height: 26px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700; border: 2px solid;
+}
+.lc-node-label  { font-size: 9px; font-weight: 700; margin-top: 4px; text-align: center; }
+.lc-node-date   { font-size: 8px; color: var(--muted); margin-top: 2px; text-align: center; }
+.lc-connector   { flex: 1; height: 2px; min-width: 16px; margin-bottom: 14px; }
+.lc-node.done .lc-node-circle    { opacity: 1; }
+.lc-node.pending .lc-node-circle { opacity: 0.28; }
 </style>
 """
 
@@ -169,6 +218,130 @@ def _n(val, default=0):
 def _ni(val, default=0):
     """Safely coerce to int."""
     return int(_n(val, default))
+
+
+# ── Persistence display helpers ───────────────────────────────────
+
+def _freshness_badge_lc(setup_age_str: str) -> str:
+    s = str(setup_age_str or "").strip()
+    if not s or s == "—":
+        return '<span style="color:var(--muted);font-size:10px">—</span>'
+    if "Fresh" in s:
+        css = "freshness-fresh"
+    elif "Expired" in s or "Invalidated" in s or "✗" in s:
+        css = "freshness-expired"
+    elif "Aging" in s or "🔴" in s:
+        css = "freshness-late"
+    else:
+        css = "freshness-mature"
+    return f'<span class="freshness-badge {css}">{s}</span>'
+
+
+def _trade_status_badge_lc(status_str: str) -> str:
+    s = str(status_str or "").strip()
+    if not s or "Forming" in s or s == "—":
+        return '<span style="color:var(--muted);font-size:9px">Not yet minted</span>'
+    if "Invalidated" in s or "invalidated" in s:
+        css, label = "ts-invalidated", "Invalidated"
+    elif "Expired" in s or "expired" in s:
+        css, label = "ts-expired", "Expired"
+    elif "T2" in s:
+        css, label = "ts-t2", "T2 Achieved"
+    elif "T1" in s:
+        css, label = "ts-t1", "T1 Achieved"
+    elif "triggered" in s.lower():
+        css, label = "ts-triggered", "Entry Triggered"
+    elif "Late" in s or "Aging" in s:
+        css, label = "ts-t1", "Active · Late"
+    elif "Active" in s:
+        css, label = "ts-waiting", "Waiting for Breakout"
+    else:
+        css, label = "ts-waiting", s[:24]
+    return f'<span class="trade-status-badge {css}">{label}</span>'
+
+
+def _locked_plan_html(entry, sl, t1, t2, t3, plan_status: str = "") -> str:
+    is_active  = str(plan_status).upper() == "ACTIVE"
+    lock_icon  = "🔒" if is_active else "🔓"
+    status_note= f' · {plan_status.lower()}' if plan_status else ""
+    def _lv(label, val, color):
+        try:
+            v = float(val); txt = f"₹{v:,.0f}" if v > 0 else "—"
+        except (TypeError, ValueError):
+            txt = "—"
+        return (f'<div class="locked-level"><div class="ll-label">{label}</div>'
+                f'<div class="ll-value" style="color:{color}">{txt}</div></div>')
+    return (
+        f'<div style="margin:10px 0 0">'
+        f'<div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:0.1em;'
+        f'text-transform:uppercase;margin-bottom:6px">{lock_icon} Locked Trade Plan{status_note}</div>'
+        f'<div class="locked-plan-grid">'
+        + _lv("Entry", entry, "#58a6ff")
+        + _lv("SL",    sl,    "#f85149")
+        + _lv("T1",    t1,    "#3fb950")
+        + _lv("T2",    t2,    "#f5c542")
+        + _lv("T3",    t3,    "#a371f7")
+        + '</div></div>'
+    )
+
+
+def _lifecycle_timeline_html(plan_row: dict | None, history_df=None) -> str:
+    nodes = [
+        ("Created",   "🌱", "#58a6ff"),
+        ("Triggered", "⚡", "#3fb950"),
+        ("T1",        "🎯", "#a371f7"),
+        ("T2",        "🏆", "#f5c542"),
+        ("Expired",   "⏳", "#8b949e"),
+    ]
+    timestamps = {}
+    done_set   = set()
+
+    if plan_row:
+        fa = plan_row.get("first_actionable_date") or plan_row.get("FirstActionable", "")
+        if fa:
+            timestamps["Created"] = str(fa)[:10]
+            done_set.add("Created")
+        inv = plan_row.get("invalidated_date") or plan_row.get("InvalidatedDate", "")
+        status = str(plan_row.get("status") or plan_row.get("PlanStatus", "")).upper()
+        if status in ("EXPIRED", "INVALIDATED") and inv:
+            timestamps["Expired"] = str(inv)[:10]
+            done_set.add("Expired")
+        tps = str(plan_row.get("trade_plan_status") or plan_row.get("TradePlanStatus", ""))
+        if "T2" in tps: done_set |= {"Triggered", "T1", "T2"}
+        elif "T1" in tps: done_set |= {"Triggered", "T1"}
+        elif "triggered" in tps.lower(): done_set.add("Triggered")
+
+    # Enrich timestamps from history if available
+    if history_df is not None and not history_df.empty and "scan_date" in history_df.columns:
+        if "category" in history_df.columns:
+            _actionable_cats = {"Elite Opportunity", "High Conviction", "Actionable"}
+            _first = history_df[history_df["category"].isin(_actionable_cats)]
+            if not _first.empty:
+                timestamps["Created"] = str(_first.iloc[0]["scan_date"])[:10]
+                done_set.add("Created")
+
+    html = (
+        '<div class="lifecycle-panel">'
+        '<div style="font-size:10px;font-weight:700;color:var(--muted);letter-spacing:0.1em;'
+        'text-transform:uppercase;margin-bottom:10px">Setup Lifecycle</div>'
+        '<div class="lc-timeline">'
+    )
+    for i, (name, icon, color) in enumerate(nodes):
+        done_cls = "done" if name in done_set else "pending"
+        bg_color = color if name in done_set else "transparent"
+        html += (
+            f'<div class="lc-node {done_cls}">'
+            f'<div class="lc-node-circle" style="background:{bg_color};border-color:{color};'
+            f'color:{"#0d1117" if name in done_set else color}">{icon}</div>'
+            f'<div class="lc-node-label" style="color:{color}">{name}</div>'
+            f'<div class="lc-node-date">{timestamps.get(name, "")}</div>'
+            f'</div>'
+        )
+        if i < len(nodes) - 1:
+            conn_color = color if name in done_set else "rgba(255,255,255,0.08)"
+            html += f'<div class="lc-connector" style="background:{conn_color}"></div>'
+    html += '</div></div>'
+    return html
 
 def render():
     st.markdown(_CSS, unsafe_allow_html=True)
@@ -455,13 +628,13 @@ def render():
                 dc1.metric("Action",    str(row.get("action", "")))
                 dc2.metric("Entry",     f"₹{_n(row.get('entry')):.0f}")
                 dc3.metric("SL",        f"₹{_n(row.get('sl')):.0f}")
-    
+
                 why_raw  = str(row.get("why_included", ""))
                 risk_raw = str(row.get("risk_factors",  ""))
                 trend_phase = str(row.get("trend_phase", ""))
                 cat     = str(row.get("category", ""))
                 bband   = str(row.get("bars_band", ""))
-    
+
                 st.markdown(
                     f"**Category:** `{cat}` &nbsp; **Phase:** `{trend_phase}` &nbsp; "
                     f"**Bars Band:** `{bband}`"
@@ -476,7 +649,110 @@ def render():
                     for line in risk_raw.split("|"):
                         if line.strip():
                             st.markdown(f"  ⚠️ {line.strip()}")
-    
+
+                # ── Setup Persistence Panel ───────────────────────────
+                st.markdown("---")
+                _setup_plan_row: dict | None = None
+                _hist_df = None
+                if db_ok:
+                    try:
+                        from utils.supabase_client import load_setup_plan, load_lifecycle_history
+                        _sp = load_setup_plan(sym)
+                        if _sp is not None:
+                            _setup_plan_row = {
+                                "setup_id":              getattr(_sp, "setup_id", ""),
+                                "first_actionable_date": getattr(_sp, "first_actionable_date", ""),
+                                "invalidated_date":      getattr(_sp, "invalidated_date", ""),
+                                "status":                getattr(_sp, "status", ""),
+                                "entry_locked":          getattr(_sp, "entry_locked", 0),
+                                "sl_locked":             getattr(_sp, "sl_locked", 0),
+                                "t1_locked":             getattr(_sp, "t1_locked", 0),
+                                "t2_locked":             getattr(_sp, "t2_locked", 0),
+                                "t3_locked":             getattr(_sp, "t3_locked", 0),
+                                "days_active":           getattr(_sp, "days_active", 0),
+                                "setup_age":             getattr(_sp, "setup_age", ""),
+                                "trade_plan_status":     getattr(_sp, "trade_plan_status", ""),
+                                "locked_rr":             getattr(_sp, "locked_rr", 0),
+                                "locked_category":       getattr(_sp, "locked_category", ""),
+                            }
+                        _hist_df = load_lifecycle_history(sym, limit_days=60)
+                    except Exception:
+                        pass
+
+                # Fallback to session scan if no DB plan
+                if _setup_plan_row is None:
+                    _sess_df = st.session_state.get("last_scan_df")
+                    if _sess_df is not None and not _sess_df.empty and "Stock" in _sess_df.columns:
+                        _m = _sess_df[_sess_df["Stock"].astype(str) == sym]
+                        if not _m.empty and _m.iloc[0].get("SetupID"):
+                            _r = _m.iloc[0]
+                            _setup_plan_row = {
+                                "setup_id":              _r.get("SetupID", ""),
+                                "first_actionable_date": _r.get("FirstActionable", ""),
+                                "invalidated_date":      "",
+                                "status":                _r.get("PlanStatus", ""),
+                                "entry_locked":          _r.get("EntryLocked", 0),
+                                "sl_locked":             _r.get("SLLocked",    0),
+                                "t1_locked":             _r.get("T1Locked",    0),
+                                "t2_locked":             _r.get("T2Locked",    0),
+                                "t3_locked":             _r.get("T3Locked",    0),
+                                "days_active":           _r.get("DaysActive",  0),
+                                "setup_age":             _r.get("SetupAge",    ""),
+                                "trade_plan_status":     _r.get("TradePlanStatus", ""),
+                                "locked_rr":             0,
+                                "locked_category":       _r.get("Category",    ""),
+                            }
+
+                if _setup_plan_row:
+                    _sid  = _setup_plan_row.get("setup_id",            "")
+                    _age  = _setup_plan_row.get("setup_age",           "")
+                    _tps  = _setup_plan_row.get("trade_plan_status",   "")
+                    _pst  = _setup_plan_row.get("status",              "")
+                    _days = _setup_plan_row.get("days_active",          0)
+                    _rr   = _setup_plan_row.get("locked_rr",            0)
+                    _lcat = _setup_plan_row.get("locked_category",      "")
+
+                    _hdr = (
+                        '<div style="font-size:10px;font-weight:700;color:var(--muted);'
+                        'letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px">'
+                        '🗂️ Setup Persistence</div>'
+                        '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+                        f'<span style="font-size:10px;color:var(--muted)">ID:</span>'
+                        f'<code style="font-size:11px;background:var(--bg0);padding:2px 8px;border-radius:4px;'
+                        f'border:1px solid var(--border);color:#58a6ff">{_sid or "—"}</code>'
+                        f'<span>{_freshness_badge_lc(_age)}</span>'
+                        f'<span>{_trade_status_badge_lc(_tps)}</span>'
+                        f'</div>'
+                    )
+                    _meta = ""
+                    if _days:
+                        _meta += f'<span style="font-size:10px;color:var(--muted)">Age: <b style="color:var(--text)">{_days}d</b></span> &nbsp;·&nbsp; '
+                    if _lcat:
+                        _meta += f'<span style="font-size:10px;color:var(--muted)">Locked at: <b style="color:var(--text)">{_lcat}</b></span> &nbsp;·&nbsp; '
+                    if _rr:
+                        _meta += f'<span style="font-size:10px;color:var(--muted)">R:R locked: <b style="color:#f5c542">{float(_rr):.1f}</b></span>'
+                    st.markdown(_hdr + _meta, unsafe_allow_html=True)
+                    st.markdown(
+                        _locked_plan_html(
+                            _setup_plan_row.get("entry_locked", 0),
+                            _setup_plan_row.get("sl_locked",    0),
+                            _setup_plan_row.get("t1_locked",    0),
+                            _setup_plan_row.get("t2_locked",    0),
+                            _setup_plan_row.get("t3_locked",    0),
+                            plan_status=_pst,
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(
+                        _lifecycle_timeline_html(_setup_plan_row, _hist_df),
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.caption(
+                        "⚠️ No frozen trade plan for this symbol — setup has not yet reached "
+                        "Actionable/HC/Elite, or Supabase is not connected."
+                    )
+
                 # Watchlist add shortcut
                 if st.button(f"➕ Add {sym} to Watchlist", key=f"add_wl_{sym}"):
                     if db_ok:
