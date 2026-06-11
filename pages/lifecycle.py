@@ -157,6 +157,19 @@ body { background: var(--bg0); color: var(--text); }
 </style>
 """
 
+
+def _n(val, default=0):
+    """Safely coerce a potentially-None/NaN/string value to float."""
+    try:
+        v = float(val)
+        return default if (v != v) else v   # NaN check
+    except (TypeError, ValueError):
+        return float(default)
+
+def _ni(val, default=0):
+    """Safely coerce to int."""
+    return int(_n(val, default))
+
 def render():
     st.markdown(_CSS, unsafe_allow_html=True)
     
@@ -411,13 +424,13 @@ def render():
         for _, row in df_view.head(150).iterrows():
             sym   = str(row.get("symbol", ""))
             stage = str(row.get("stage", STAGE_FORMING))
-            ls    = int(row.get("leadership",    0))
-            cv    = int(row.get("conviction",    0))
-            eq    = int(row.get("entry_quality", 0))
-            tq    = int(row.get("trend_quality", 0))
-            adx   = float(row.get("adx", 0))
-            rs    = float(row.get("rs_composite", 0))
-            sc    = int(row.get("score", 0))
+            ls    = _ni(row.get("leadership"))
+            cv    = _ni(row.get("conviction"))
+            eq    = _ni(row.get("entry_quality"))
+            tq    = _ni(row.get("trend_quality"))
+            adx   = _n(row.get("adx"))
+            rs    = _n(row.get("rs_composite"))
+            sc    = _ni(row.get("score"))
     
             st.markdown(
                 f'<div class="lc-row">'
@@ -438,8 +451,8 @@ def render():
             with st.expander(f"▸ {sym} detail", expanded=False):
                 dc1, dc2, dc3 = st.columns(3)
                 dc1.metric("Action",    str(row.get("action", "")))
-                dc2.metric("Entry",     f"₹{row.get('entry', 0):.0f}")
-                dc3.metric("SL",        f"₹{row.get('sl', 0):.0f}")
+                dc2.metric("Entry",     f"₹{_n(row.get('entry')):.0f}")
+                dc3.metric("SL",        f"₹{_n(row.get('sl')):.0f}")
     
                 why_raw  = str(row.get("why_included", ""))
                 risk_raw = str(row.get("risk_factors",  ""))
@@ -709,10 +722,10 @@ def render():
             for _, row in wl_df.iterrows():
                 sym   = str(row.get("symbol", ""))
                 stage = str(row.get("stage", STAGE_FORMING))
-                ls    = int(row.get("leadership",    0))
-                cv    = int(row.get("conviction",    0))
-                eq    = int(row.get("entry_quality", 0))
-                tq    = int(row.get("trend_quality", 0))
+                ls    = _ni(row.get("leadership"))
+                cv    = _ni(row.get("conviction"))
+                eq    = _ni(row.get("entry_quality"))
+                tq    = _ni(row.get("trend_quality"))
                 notes_val = str(row.get("notes", ""))
                 stab  = _stage_stability.get(sym, 1)
                 s_color = _STAGE_COLORS.get(stage, "#555")
@@ -737,8 +750,8 @@ def render():
                 with st.expander(f"▸ {sym}", expanded=False):
                     wdc1, wdc2, wdc3, wdc4 = st.columns(4)
                     wdc1.metric("Action",       str(row.get("action", "—")))
-                    wdc2.metric("Entry",        f"₹{row.get('entry', 0):.0f}" if row.get("entry") else "—")
-                    wdc3.metric("SL",           f"₹{row.get('sl', 0):.0f}"    if row.get("sl")    else "—")
+                    wdc2.metric("Entry",        f"₹{_n(row.get('entry')):.0f}" if row.get("entry") else "—")
+                    wdc3.metric("SL",           f"₹{_n(row.get('sl')):.0f}"    if row.get("sl")    else "—")
                     wdc4.metric("Stage Streak", f"{stab} scan{'s' if stab != 1 else ''}")
     
                     new_note = st.text_area(

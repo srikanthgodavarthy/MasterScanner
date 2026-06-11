@@ -125,6 +125,17 @@ body{background:var(--bg0);color:var(--text);}
 </style>
 """
 
+
+def _n(val, default=0):
+    try:
+        v = float(val)
+        return default if (v != v) else v
+    except (TypeError, ValueError):
+        return float(default)
+
+def _ni(val, default=0):
+    return int(_n(val, default))
+
 def render():
     st.markdown(_CSS, unsafe_allow_html=True)
     
@@ -301,9 +312,9 @@ def render():
             m1, m2, m3, m4, m5 = st.columns(5)
             _stat(m1, _SL.get(str(latest.get("stage", "")), "—"), "Current Stage",
                   _SC.get(str(latest.get("stage", "")), "#fff"))
-            _stat(m2, int(latest.get("leadership",    0)), "Leadership",  "#f5c542")
-            _stat(m3, int(latest.get("conviction",    0)), "Conviction",  "#3fb950")
-            _stat(m4, int(latest.get("entry_quality", 0)), "Entry Qual",  "#58a6ff")
+            _stat(m2, _ni(latest.get("leadership")), "Leadership",  "#f5c542")
+            _stat(m3, _ni(latest.get("conviction")), "Conviction",  "#3fb950")
+            _stat(m4, _ni(latest.get("entry_quality")), "Entry Qual",  "#58a6ff")
             _stat(m5, len(hist_df), "Data Points", "#8b949e")
     
             st.markdown(_stage_band_legend(), unsafe_allow_html=True)
@@ -327,8 +338,8 @@ def render():
                 d = row.get("scan_date")
                 if s != _prev_stage:
                     _stage_runs.append({"stage": s, "date": d,
-                                        "ls": int(row.get("leadership", 0)),
-                                        "cv": int(row.get("conviction", 0))})
+                                        "ls": _ni(row.get("leadership")),
+                                        "cv": _ni(row.get("conviction"))})
                     _prev_stage = s
     
             # Determine direction of each transition
@@ -713,17 +724,17 @@ def render():
     
                     for _, row in sym_stats.iterrows():
                         sym  = str(row.get("Symbol", ""))
-                        n    = int(row.get("Trades",     0))
-                        wr   = float(row.get("Win%",     0))
-                        apnl = float(row.get("Avg PnL R",0))
-                        exp  = float(row.get("Expectancy",0))
-                        best = float(row.get("Best R",   0))
-                        wst  = float(row.get("Worst R",  0))
+                        n    = _ni(row.get("Trades"))
+                        wr   = _n(row.get("Win%"))
+                        apnl = _n(row.get("Avg PnL R"))
+                        exp  = _n(row.get("Expectancy"))
+                        best = _n(row.get("Best R"))
+                        wst  = _n(row.get("Worst R"))
                         stage_html = ""
                         if has_stage:
                             st_val = str(row.get("Stage", "—"))
-                            ls_v   = int(row.get("leadership", 0)) if pd.notna(row.get("leadership")) else 0
-                            cv_v   = int(row.get("conviction", 0)) if pd.notna(row.get("conviction")) else 0
+                            ls_v   = _ni(row.get("leadership")) if pd.notna(row.get("leadership")) else 0
+                            cv_v   = _ni(row.get("conviction")) if pd.notna(row.get("conviction")) else 0
                             s_key  = next((k for k, v in _SL.items() if v == st_val), STAGE_FORMING)
                             stage_html = (
                                 f'<div>{_badge(s_key)}</div>'
