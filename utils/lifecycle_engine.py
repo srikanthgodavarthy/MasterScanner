@@ -237,7 +237,7 @@ def transition_stats(tr_df: pd.DataFrame) -> dict:
     if tr_df.empty:
         return {
             "total": 0, "forward": 0, "backward": 0, "lateral": 0,
-            "breakouts": 0, "breakdowns": 0, "unique_symbols": 0,
+            "breakouts": 0, "breakdowns": 0, "upgrades": 0, "unique_symbols": 0,
             "most_common_from": "—", "most_common_to": "—",
         }
 
@@ -267,6 +267,7 @@ def transition_stats(tr_df: pd.DataFrame) -> dict:
         "lateral": int(lateral),
         "breakouts": int(breakouts),
         "breakdowns": int(breakdowns),
+        "upgrades": int(forward),   # alias: forward transitions = upgrades
         "unique_symbols": int(unique),
         "most_common_from": mcf,
         "most_common_to": mct,
