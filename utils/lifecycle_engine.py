@@ -210,12 +210,17 @@ def detect_transitions(
             direction = "LATERAL"
 
         transitions.append({
-            "symbol":     sym,
-            "from_stage": str(old_s),
-            "to_stage":   new_s,
-            "from_date":  str(old_d) if old_d else scan_date,
-            "to_date":    scan_date,
-            "direction":  direction,
+            "symbol":          sym,
+            "from_stage":      str(old_s),
+            "to_stage":        new_s,
+            "from_date":       str(old_d) if old_d else scan_date,
+            "to_date":         scan_date,
+            "direction":       direction,
+            "delta":           new_ord - old_ord,
+            "from_leadership": int(prev_df.loc[prev_df["symbol"].str.upper() == sym, "leadership"].iloc[0]) if "leadership" in prev_df.columns else 0,
+            "to_leadership":   int(row.get("leadership", 0)) if hasattr(row, "get") else 0,
+            "from_category":   str(prev_df.loc[prev_df["symbol"].str.upper() == sym, "category"].iloc[0]) if "category" in prev_df.columns else "",
+            "to_category":     str(row.get("category", "")) if hasattr(row, "get") else "",
         })
 
     return transitions
