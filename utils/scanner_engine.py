@@ -751,7 +751,76 @@ def run_scanner(
         df_out["RS_Rank"] = 50.0
         df_out["RS_Top10"]= False
 
+    # ── Setup Persistence (frozen trade plans) ────────────────────
+    # Entry / SL / Targets are LOCKED on first Actionable detection.
+    # Subsequent scans READ frozen levels — no daily drift.
+    df_out = _enrich_with_setup_persistence(df_out)
+
     return df_out
+
+
+def _enrich_with_setup_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
+    """
+    Load existing setup plans from Supabase, enrich the scanner DataFrame
+    with frozen trade levels and lifecycle metadata, then persist any new
+    or updated plans back to Supabase.
+
+    Designed to be a silent no-op when Supabase is unavailable.
+    All errors are caught and logged; scanner output is never blocked.
+    """
+    try:
+        from utils.supabase_client import (
+            load_active_setup_plans,
+            load_first_seen,
+            upsert_setup_plans_batch,
+            upsert_first_seen,
+        )
+        from utils.setup_persistence import enrich_scanner_dataframe
+
+        # Load existing frozen plans + first-seen dates
+        existing_plans = load_active_setup_plans()  # {symbol: SetupPlan}
+        first_seen_map = load_first_seen()           # {symbol: "YYYY-MM-DD"}
+
+        # Record first-seen for new entrants before enrichment
+        new_symbols = [
+            (str(row.get("Stock", "")), str(row.get("Category", "")))
+            for _, row in df_out.iterrows()
+            if str(row.get("Stock", "")).upper() not in first_seen_map
+        ]
+        if new_symbols:
+            upsert_first_seen(new_symbols)
+            from datetime import date as _d
+            today_str = _d.today().isoformat()
+            for sym, _ in new_symbols:
+                first_seen_map[sym.upper()] = today_str
+
+        # Enrich DataFrame
+        enriched_df, updated_plans = enrich_scanner_dataframe(
+            df_out,
+            existing_plans,
+            first_seen_map,
+            price_col="Entry",
+        )
+
+        # Persist changed plans back to Supabase
+        if updated_plans:
+            plan_dicts = [p.to_db_dict() for p in updated_plans]
+            upsert_setup_plans_batch(plan_dicts)
+
+        return enriched_df
+
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            "setup_persistence enrichment skipped: %s", exc
+        )
+        for col in ["SetupID", "FirstSeen", "FirstActionable", "DaysActive",
+                    "PlanStatus", "EntryLocked", "SLLocked", "T1Locked",
+                    "T2Locked", "T3Locked", "SetupAge", "TradePlanStatus",
+                    "EntryDriftPct"]:
+            if col not in df_out.columns:
+                df_out[col] = ""
+        return df_out
 
 
 # ══════════════════════════════════════════════════════════════════
