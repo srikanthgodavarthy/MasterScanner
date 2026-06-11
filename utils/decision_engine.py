@@ -538,19 +538,27 @@ def _extension(r: "BarResult") -> tuple[int, dict]:
 def _classify_stage(
     leadership: int, conviction: int, entry_quality: int, extension: int,
     r: "BarResult",
+    thresholds: dict | None = None,
 ) -> str:
     """
     Derive lifecycle stage from the four engine scores.
 
     Lifecycle: Leader → Setup Building → Actionable → Extended → Avoid
+
+    ``thresholds`` (from :func:`_get_thresholds`) is accepted so that the
+    EXTENDED gate mirrors the same ``ext_adj`` shift used in
+    ``_classify_category_with_settings``, keeping Stage and Category
+    consistent under non-Normal extension-tolerance settings.
     """
+    ext_adj = (thresholds or {}).get("ext_adj", 0)
+
     # Hard structural failures → Avoid
     if r.t4_hard_stop or r.hard_stop:
         return "AVOID"
     if r.trend_phase == "NONE" and not r.trend_up:
         return "AVOID"
 
-    if extension >= 60:
+    if extension >= 60 + ext_adj:
         return "EXTENDED"
 
     if leadership < 50:
@@ -580,35 +588,6 @@ _CATEGORY_ORDER = [
     "Extended",
     "Avoid",
 ]
-
-def _classify_category(
-    leadership: int, conviction: int, entry_quality: int, extension: int,
-    stage: str, r: "BarResult",
-) -> str:
-    """
-    Decision-oriented category label for the scanner UI.
-    Replaces old tier labels with trader-meaningful names.
-    """
-    if extension >= 60 or stage == "EXTENDED":
-        return "Extended"
-
-    if stage == "AVOID" or leadership < 50:
-        return "Avoid"
-
-    if leadership >= 90 and conviction >= 90 and entry_quality >= 80 and extension <= 25:
-        return "Elite Opportunity"
-
-    if leadership >= 80 and conviction >= 80 and entry_quality >= 60 and extension <= 35:
-        return "High Conviction"
-
-    if leadership >= 70 and conviction >= 60 and entry_quality >= 60 and extension <= 40:
-        return "Actionable"
-
-    if leadership >= 70 and conviction >= 50:
-        return "Setup Building"
-
-    return "Avoid"
-
 
 # ══════════════════════════════════════════════════════════════════
 #  SETTINGS-AWARE THRESHOLDS
@@ -741,11 +720,13 @@ def compute_decision(r: "BarResult", settings: dict | None = None) -> DecisionSc
     entry_quality, eq_subs, rr = _entry_quality(r)
     extension,     ex_subs  = _extension(r)
 
+    # ── Thresholds (computed first so _classify_stage can use ext_adj) ──
+    thresholds = _get_thresholds(settings)
+
     # ── Stage ─────────────────────────────────────────────────────
-    stage = _classify_stage(leadership, conviction, entry_quality, extension, r)
+    stage = _classify_stage(leadership, conviction, entry_quality, extension, r, thresholds)
 
     # ── Category (settings-aware) ─────────────────────────────────
-    thresholds = _get_thresholds(settings)
     category   = _classify_category_with_settings(
         leadership, conviction, entry_quality, extension, stage, r, thresholds
     )
