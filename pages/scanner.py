@@ -1,17 +1,19 @@
 """
-pages/scanner.py — Live Scanner  (v7 — reference UI redesign)
+pages/scanner.py — Live Scanner  (v8 — rich HTML table + %Chg fix)
 
-UI Changes vs v6:
-  • Market status row: compact chip-style layout with Regime pill (solid bg),
-    Nifty price chip, %Chg chip, EMA50 pill, VIX chip, ADX chip, Auto-refresh
-    toggle (right), "Last scan" chip (far right)
-  • Market note: italic standalone text below status row (not inside panel)
-  • Score cards: larger value numbers, cleaner layout, progress bar below value
-  • Signal class counts: colored dot + "LABEL: N" inline pill style
-  • Tab labels: simpler emoji prefix format
-  • EXECUTE/WATCH section header: left-border colored label (unchanged)
-  • Table: added Size% column, row index shown
-  • Controls row: Run Scan (blue), Save to DB checkbox, universe info, clear-cache icon
+UI Changes vs v7:
+  • Results table: custom HTML renderer replacing st.dataframe
+      - Signal Class: colored badge (bg-tinted, bordered)
+      - Leadership / Conviction / Entry Quality: number + inline spark bar
+      - Extension: color-coded, 0 = green → red at high values
+      - %Chg: ▲/▼ arrow + green/red color
+      - R:R: tiered color (gold ≥3.0, green ≥2.0, amber ≥1.5, red <1.5)
+      - Stock: left-aligned bold, rank index dim
+      - Entry / SL / T1 / Size%: right-aligned mono
+      - Sticky header, alternating rows, row hover highlight
+      - Size% shown as a small filled-bar chip
+  • %Chg chip in market status row: now computed from nifty series day-over-day
+    and stored in session_state["nifty_chg_pct"] on each scan run
   • Zero changes to scanner logic, backtest logic, or scoring calculations.
 """
 
@@ -73,7 +75,6 @@ _CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
 
-/* ── base ── */
 :root {
   --bg0: #0d1117;
   --bg1: #161b22;
@@ -129,12 +130,6 @@ _CSS = """
   white-space: nowrap;
 }
 .msr-spacer { flex: 1; }
-.autorefresh-group {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: auto;
-}
 .last-scan-chip {
   background: var(--bg1);
   border: 1px solid var(--border);
@@ -151,7 +146,6 @@ _CSS = """
   color: var(--muted);
   font-style: italic;
   margin: 2px 0 14px;
-  letter-spacing: 0.01em;
 }
 
 /* ── Score cards ── */
@@ -196,7 +190,7 @@ _CSS = """
   margin-top: 5px;
 }
 
-/* ── Signal class badge in table ── */
+/* ── Signal class badge (counts row + table) ── */
 .sc-badge {
   display: inline-block;
   padding: 2px 8px;
@@ -226,11 +220,7 @@ _CSS = """
   font-size: 11px;
   font-family: var(--mono);
 }
-.sc-dot {
-  width: 7px; height: 7px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
+.sc-dot { width:7px; height:7px; border-radius:50%; flex-shrink:0; }
 .sc-count-label { color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: 0.05em; }
 .sc-count-num   { font-weight: 700; }
 
@@ -244,42 +234,117 @@ _CSS = """
   border-left-style: solid;
 }
 
-/* ── Breakdown panel ── */
-.breakdown-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 0;
+/* ── Rich HTML results table ── */
+.rt-wrap {
+  width: 100%;
+  overflow-x: auto;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  margin-bottom: 10px;
+  max-height: 520px;
+  overflow-y: auto;
+}
+.rt {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 0.76rem;
+}
+.rt thead {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+.rt thead th {
+  background: #1c2333;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 8px 10px;
+  text-align: center;
+  white-space: nowrap;
   border-bottom: 1px solid var(--border);
 }
-.breakdown-label { flex: 1; font-size: 10px; color: var(--muted); }
-.breakdown-bar { flex: 2; height: 5px; background: var(--bg2); border-radius: 3px; overflow: hidden; }
-.breakdown-fill { height: 100%; border-radius: 3px; }
-.breakdown-val {
-  font-size: 10px;
-  font-weight: 600;
-  font-family: var(--mono);
-  width: 36px;
+.rt thead th.col-stock { text-align: left; padding-left: 12px; }
+.rt tbody tr {
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  transition: background 0.12s;
+}
+.rt tbody tr:nth-child(even) { background: rgba(255,255,255,0.02); }
+.rt tbody tr:hover { background: rgba(88,166,255,0.07) !important; }
+.rt td {
+  padding: 7px 10px;
+  text-align: center;
+  color: var(--text);
+  white-space: nowrap;
+}
+.rt td.col-rank {
+  color: var(--muted);
+  font-size: 0.68rem;
+  width: 28px;
+  text-align: right;
+  padding-right: 6px;
+}
+.rt td.col-stock {
+  text-align: left;
+  padding-left: 12px;
+  font-weight: 700;
+  color: var(--text);
+  font-size: 0.78rem;
+  min-width: 110px;
+}
+.rt td.col-num {
+  font-variant-numeric: tabular-nums;
   text-align: right;
 }
+/* score cell: number + mini bar */
+.score-cell { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+.score-num  { font-weight: 600; font-size: 0.76rem; }
+.score-bar  { width: 36px; height: 3px; background: var(--bg3); border-radius: 2px; overflow: hidden; }
+.score-fill { height: 100%; border-radius: 2px; }
+/* size% bar chip */
+.size-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--bg2);
+  border-radius: 4px;
+  padding: 2px 7px;
+  font-size: 0.72rem;
+}
+.size-bar  { width: 28px; height: 3px; background: var(--bg3); border-radius: 2px; overflow: hidden; }
+.size-fill { height: 100%; border-radius: 2px; background: var(--blue); }
+/* signal class badge inside table */
+.tbl-badge {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 4px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  white-space: nowrap;
+}
+
+/* ── Breakdown panel ── */
+.breakdown-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 0; border-bottom: 1px solid var(--border);
+}
+.breakdown-label { flex:1; font-size:10px; color:var(--muted); }
+.breakdown-bar   { flex:2; height:5px; background:var(--bg2); border-radius:3px; overflow:hidden; }
+.breakdown-fill  { height:100%; border-radius:3px; }
+.breakdown-val   { font-size:10px; font-weight:600; font-family:var(--mono); width:36px; text-align:right; }
 
 /* ── Validation strip ── */
 .val-strip {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  padding: 5px 10px;
-  background: var(--bg2);
-  border-radius: 6px;
-  margin: 3px 0;
+  display: flex; gap:10px; align-items:center;
+  padding: 5px 10px; background:var(--bg2); border-radius:6px; margin:3px 0;
 }
 .val-label {
-  font-size: 9px;
-  color: var(--muted);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  width: 80px;
-  flex-shrink: 0;
+  font-size:9px; color:var(--muted); letter-spacing:0.08em;
+  text-transform:uppercase; width:80px; flex-shrink:0;
 }
 </style>
 """
@@ -298,7 +363,7 @@ def _score_color(v: float, invert: bool = False) -> str:
     return "#f85149"
 
 
-def _bar(value: int, color: str, height: int = 3) -> str:
+def _bar(value: int, color: str) -> str:
     pct = min(100, max(0, value))
     return (
         f'<div class="sc-bar-track">'
@@ -327,25 +392,26 @@ def _cat_badge(category: str) -> str:
 
 # ── MARKET STATUS ROW ──────────────────────────────────────────────
 
-def _market_status_row(summary: dict, scan_time: str, nifty_price: float = 0) -> str:
+def _market_status_row(summary: dict, scan_time: str,
+                        nifty_price: float = 0, nifty_chg_pct: float | None = None) -> str:
     r = summary.get("regime", "RANGE")
     color, _, _ = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
     regime_label = {"TREND": "TREND", "RANGE": "RANGE", "VOLATILE": "VOLATILE"}.get(r, r)
 
-    ema50_up   = summary.get("nifty_ema50", False)
-    ema50_txt  = "▲ EMA50" if ema50_up else "▼ EMA50"
-    ema50_col  = "#3fb950" if ema50_up else "#f85149"
+    ema50_up  = summary.get("nifty_ema50", False)
+    ema50_txt = "▲ EMA50" if ema50_up else "▼ EMA50"
+    ema50_col = "#3fb950" if ema50_up else "#f85149"
 
     vix_val   = "{:.1f}".format(summary.get("vix", 0))
     adx_val   = "{:.0f}".format(summary.get("adx", 0))
     nifty_str = "{:,.0f}".format(nifty_price) if nifty_price else "—"
 
-    # %Chg from summary if available
-    pct_chg = summary.get("nifty_chg_pct", None)
-    if pct_chg is not None:
-        pct_sign  = "+" if pct_chg >= 0 else ""
-        pct_color = "#3fb950" if pct_chg >= 0 else "#f85149"
-        pct_html  = f'<span style="color:{pct_color};font-weight:700">{pct_sign}{pct_chg:.2f}%</span>'
+    if nifty_chg_pct is not None:
+        pct_sign  = "+" if nifty_chg_pct >= 0 else ""
+        pct_color = "#3fb950" if nifty_chg_pct >= 0 else "#f85149"
+        arrow     = "▲" if nifty_chg_pct >= 0 else "▼"
+        pct_html  = (f'<span style="color:{pct_color};font-weight:700">'
+                     f'{arrow} {pct_sign}{nifty_chg_pct:.2f}%</span>')
     else:
         pct_html = '<span style="color:var(--muted)">%Chg</span>'
 
@@ -432,31 +498,6 @@ def _sc_counts_html(df: pd.DataFrame) -> str:
 
 # ── DISPLAY COLUMNS ────────────────────────────────────────────────
 
-_PRIMARY_COLS = [
-    "Stock", "CV1_SignalClass",
-    "CV1_Leadership", "CV1_Conviction", "CV1_EntryQuality",
-    "Extension",
-    "LTP", "%Chg",
-    "Entry", "SL", "T1", "RR",
-]
-
-_RENAME_PRIMARY = {
-    "CV1_SignalClass":   "Signal Class",
-    "CV1_Leadership":   "Leadership",
-    "CV1_Conviction":   "Conviction",
-    "CV1_EntryQuality": "Entry Quality",
-    "RR":               "R:R",
-    "LTP":              "LTP",
-}
-
-_DETAIL_EXTRA = [
-    "Score", "RS%", "TrendPhase", "T1Path", "Buy Type", "Setup",
-    "Streak", "Age(bars)", "Fresh%", "Base🔥",
-    "Composite", "Trend", "Momentum", "Structure", "Volume", "Quality",
-    "ADX", "EMA Slope", "CCI",
-    "Category", "Stage", "Leadership_DE", "Conviction_DE", "EntryQuality_DE",
-]
-
 _RENAME_MAP_FULL = {
     "composite_score": "Composite",
     "RScomp":          "RS%",
@@ -476,123 +517,192 @@ _RENAME_MAP_FULL = {
     "EntryQuality":    "EntryQuality_DE",
 }
 
+_RENAME_PRIMARY = {
+    "CV1_SignalClass":   "Signal Class",
+    "CV1_Leadership":   "Leadership",
+    "CV1_Conviction":   "Conviction",
+    "CV1_EntryQuality": "Entry Quality",
+    "RR":               "R:R",
+}
+
+_DETAIL_EXTRA = [
+    "Score", "RS%", "TrendPhase", "T1Path", "Buy Type", "Setup",
+    "Streak", "Age(bars)", "Fresh%", "Base🔥",
+    "Composite", "Trend", "Momentum", "Structure", "Volume", "Quality",
+    "ADX", "EMA Slope", "CCI",
+    "Category", "Stage", "Leadership_DE", "Conviction_DE", "EntryQuality_DE",
+]
+
+# Primary column order for HTML table
+_PRIMARY_ORDERED = [
+    "Stock", "Signal Class", "Leadership", "Conviction", "Entry Quality",
+    "Extension", "%Chg", "Entry", "SL", "T1", "R:R", "Size%",
+]
+
 
 def _build_display_df(df: pd.DataFrame, detail: bool = False) -> pd.DataFrame:
     out = df.rename(columns=_RENAME_MAP_FULL).copy()
     out = out.rename(columns=_RENAME_PRIMARY)
-
-    primary_ordered = [
-        "Stock", "Signal Class", "Leadership", "Conviction", "Entry Quality",
-        "Extension", "%Chg", "Entry", "SL", "T1", "R:R", "Size%",
-    ]
-    primary_cols = [c for c in primary_ordered if c in out.columns]
-
+    primary_cols = [c for c in _PRIMARY_ORDERED if c in out.columns]
     if detail:
         extra = [c for c in _DETAIL_EXTRA if c in out.columns]
         want_final = primary_cols + [c for c in extra if c not in primary_cols]
     else:
         want_final = primary_cols
-
     return out[[c for c in want_final if c in out.columns]]
 
 
-# ── TABLE STYLING ─────────────────────────────────────────────────
+# ── RICH HTML TABLE ────────────────────────────────────────────────
 
-def _style_table(df: pd.DataFrame):
-    def _color_score(val):
-        try:
-            v = float(val)
-            if v >= 80: return "color:#f5c542;font-weight:600"
-            if v >= 65: return "color:#3fb950;font-weight:600"
-            if v >= 50: return "color:#d29922"
-            return "color:#f85149"
-        except:
-            return ""
+def _rr_color(v: float) -> str:
+    if v >= 3.0: return "#f5c542"
+    if v >= 2.0: return "#3fb950"
+    if v >= 1.5: return "#d29922"
+    return "#f85149"
 
-    def _color_ext(val):
-        try:
-            v = float(val)
-            if v >= 60: return "color:#f85149;font-weight:600"
-            if v >= 35: return "color:#d29922"
-            return "color:#3fb950"
-        except:
-            return ""
 
-    def _color_chg(val):
-        try:
-            v = float(val)
-            if v > 0: return "color:#3fb950;font-weight:600"
-            if v < 0: return "color:#f85149;font-weight:600"
-            return ""
-        except:
-            return ""
-
-    def _color_rr(val):
-        try:
-            v = float(val)
-            if v >= 3.0: return "color:#f5c542;font-weight:600"
-            if v >= 2.0: return "color:#3fb950"
-            if v >= 1.5: return "color:#d29922"
-            return "color:#f85149"
-        except:
-            return ""
-
-    def _color_sc(val):
-        styles = {
-            "ELITE":   "color:#f5c542;font-weight:700",
-            "EXECUTE": "color:#3fb950;font-weight:600",
-            "WATCH":   "color:#d29922;font-weight:600",
-            "SKIP":    "color:#484f58",
-        }
-        return styles.get(str(val).strip(), "")
-
-    fmt = {
-        "%Chg":  "{:.2f}",
-        "LTP":   "{:.2f}",
-        "Entry": "{:.2f}",
-        "SL":    "{:.2f}",
-        "T1":    "{:.2f}",
-        "T2":    "{:.2f}",
-        "R:R":   "{:.1f}",
-        "Size%": "{:.0f}",
-        "RS%":   "{:.1f}",
-        "Composite": "{:.1f}",
-    }
-
-    styled = df.style
-    for col in ["Leadership", "Conviction", "Entry Quality",
-                "Leadership_DE", "Conviction_DE", "EntryQuality_DE", "Score", "Composite"]:
-        if col in df.columns:
-            styled = styled.map(_color_score, subset=[col])
-    if "Extension" in df.columns:
-        styled = styled.map(_color_ext, subset=["Extension"])
-    if "%Chg" in df.columns:
-        styled = styled.map(_color_chg, subset=["%Chg"])
-    if "R:R" in df.columns:
-        styled = styled.map(_color_rr, subset=["R:R"])
-    if "Signal Class" in df.columns:
-        styled = styled.map(_color_sc, subset=["Signal Class"])
-
-    styled = (
-        styled
-        .set_properties(**{
-            "font-family": "'JetBrains Mono','Fira Code',monospace",
-            "font-size":   "0.78rem",
-            "text-align":  "center",
-            "background-color": "#161b22",
-            "color":       "#e6edf3",
-        })
-        .set_table_styles([{"selector": "th", "props": [
-            ("background-color", "#1c2333"),
-            ("color", "#8b949e"),
-            ("font-size", "0.70rem"),
-            ("text-transform", "uppercase"),
-            ("letter-spacing", "0.08em"),
-            ("font-weight", "700"),
-        ]}])
-        .format(fmt, na_rep="—")
+def _score_cell(val, invert: bool = False) -> str:
+    """Number + 36px spark bar, vertically stacked."""
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return '<td class="col-num">—</td>'
+    color = _score_color(v, invert)
+    pct   = min(100, max(0, int(v)))
+    return (
+        f'<td>'
+        f'<div class="score-cell">'
+        f'<span class="score-num" style="color:{color}">{int(v)}</span>'
+        f'<div class="score-bar"><div class="score-fill" style="width:{pct}%;background:{color}"></div></div>'
+        f'</div></td>'
     )
-    return styled
+
+
+def _chg_cell(val) -> str:
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return '<td class="col-num">—</td>'
+    color  = "#3fb950" if v > 0 else ("#f85149" if v < 0 else "#8b949e")
+    arrow  = "▲" if v > 0 else ("▼" if v < 0 else "")
+    sign   = "+" if v > 0 else ""
+    return f'<td class="col-num" style="color:{color};font-weight:600">{arrow} {sign}{v:.2f}%</td>'
+
+
+def _rr_cell(val) -> str:
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return '<td class="col-num">—</td>'
+    color = _rr_color(v)
+    weight = "font-weight:700" if v >= 3.0 else ""
+    return f'<td class="col-num" style="color:{color};{weight}">{v:.1f}</td>'
+
+
+def _size_cell(val) -> str:
+    try:
+        v = int(float(val))
+    except (TypeError, ValueError):
+        return '<td class="col-num">—</td>'
+    pct = min(100, max(0, v))
+    return (
+        f'<td>'
+        f'<div class="size-chip">'
+        f'<span style="color:var(--blue);font-weight:600">{v}%</span>'
+        f'<div class="size-bar"><div class="size-fill" style="width:{pct}%"></div></div>'
+        f'</div></td>'
+    )
+
+
+def _num_cell(val, fmt="{:.2f}", color=None) -> str:
+    try:
+        v = float(val)
+        txt = fmt.format(v)
+    except (TypeError, ValueError):
+        return '<td class="col-num">—</td>'
+    style = f'style="color:{color}"' if color else ""
+    return f'<td class="col-num" {style}>{txt}</td>'
+
+
+def _ext_cell(val) -> str:
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return '<td class="col-num">—</td>'
+    color = _score_color(v, invert=True)
+    return f'<td class="col-num" style="color:{color};font-weight:{"600" if v >= 35 else "400"}">{int(v)}</td>'
+
+
+def _sc_table_badge(signal_class: str) -> str:
+    color, label = _SC_STYLE.get(str(signal_class).strip(), ("#484f58", str(signal_class)))
+    return (
+        f'<td><span class="tbl-badge" '
+        f'style="color:{color};background:{color}1a;border:1px solid {color}50">'
+        f'{label}</span></td>'
+    )
+
+
+def _render_html_table(df: pd.DataFrame) -> str:
+    if df.empty:
+        return '<div style="padding:2rem;text-align:center;color:#8b949e;font-size:0.8rem;">No data</div>'
+
+    cols = list(df.columns)
+
+    # Header
+    header_cells = '<th class="col-stock">Stock</th>'
+    for c in cols:
+        if c == "Stock":
+            continue
+        header_cells += f'<th>{c}</th>'
+
+    rows_html = ""
+    for rank, (_, row) in enumerate(df.iterrows(), 1):
+        cells = f'<td class="col-rank">{rank}</td>'
+        cells += f'<td class="col-stock">{row.get("Stock", "—")}</td>'
+
+        for c in cols:
+            if c == "Stock":
+                continue
+            val = row.get(c, None)
+            if c == "Signal Class":
+                cells += _sc_table_badge(str(val) if val is not None else "")
+            elif c in ("Leadership", "Conviction", "Entry Quality"):
+                cells += _score_cell(val, invert=False)
+            elif c == "Extension":
+                cells += _ext_cell(val)
+            elif c == "%Chg":
+                cells += _chg_cell(val)
+            elif c == "R:R":
+                cells += _rr_cell(val)
+            elif c == "Size%":
+                cells += _size_cell(val)
+            elif c in ("Entry", "SL", "T1", "T2", "LTP"):
+                cells += _num_cell(val, "{:.2f}")
+            elif c in ("Score", "Composite", "RS%"):
+                cells += _score_cell(val)
+            else:
+                # generic
+                try:
+                    v = float(val)
+                    cells += f'<td class="col-num">{v:.1f}</td>'
+                except (TypeError, ValueError):
+                    cells += f'<td>{val if val is not None else "—"}</td>'
+
+        rows_html += f"<tr>{cells}</tr>\n"
+
+    return f"""
+<div class="rt-wrap">
+<table class="rt">
+  <thead><tr>
+    <th style="width:28px;text-align:right">#</th>
+    {header_cells}
+  </tr></thead>
+  <tbody>
+    {rows_html}
+  </tbody>
+</table>
+</div>
+"""
 
 
 # ── DETAIL BREAKDOWN PANEL ────────────────────────────────────────
@@ -613,14 +723,13 @@ def _detail_breakdown_panel(row: pd.Series) -> str:
     ls  = int(row.get("CV1_Leadership",   0))
     cv  = int(row.get("CV1_Conviction",   0))
     eq  = int(row.get("CV1_EntryQuality", 0))
-    sc_color = _SC_STYLE.get(sc, ("#484f58", ""))[0]
 
     ls_factors = [
-        ("_cv1_ls_rs",    "RS Composite (multi-TF)",         30, "#a371f7"),
-        ("_cv1_ls_age",   "Trend Age (21–50 bar sweet-spot)", 25, "#a371f7"),
-        ("_cv1_ls_adx",   "ADX Strength (≥40 tier)",          20, "#a371f7"),
-        ("_cv1_ls_ps",    "Persistent Strength",              15, "#a371f7"),
-        ("_cv1_ls_slope", "EMA20 Slope (5-bar velocity)",     10, "#a371f7"),
+        ("_cv1_ls_rs",    "RS Composite (multi-TF)",          30, "#a371f7"),
+        ("_cv1_ls_age",   "Trend Age (21–50 bar sweet-spot)",  25, "#a371f7"),
+        ("_cv1_ls_adx",   "ADX Strength (≥40 tier)",           20, "#a371f7"),
+        ("_cv1_ls_ps",    "Persistent Strength",               15, "#a371f7"),
+        ("_cv1_ls_slope", "EMA20 Slope (5-bar velocity)",      10, "#a371f7"),
     ]
     cv_factors = [
         ("_cv1_cv_structure", "Trend Structure (EMA + Cloud)", 30, "#3fb950"),
@@ -645,13 +754,16 @@ def _detail_breakdown_panel(row: pd.Series) -> str:
         return (
             f'<div style="margin:10px 0;">'
             f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;">'
-            f'<span style="font-size:9px;font-weight:700;color:{sec_color};letter-spacing:0.1em;text-transform:uppercase">{title}</span>'
-            f'<span style="font-size:20px;font-weight:700;color:{sec_color};font-family:\'JetBrains Mono\',monospace">{score}</span>'
+            f'<span style="font-size:9px;font-weight:700;color:{sec_color};letter-spacing:0.1em;'
+            f'text-transform:uppercase">{title}</span>'
+            f'<span style="font-size:20px;font-weight:700;color:{sec_color};'
+            f'font-family:\'JetBrains Mono\',monospace">{score}</span>'
             f'</div>{rows_html}</div>'
         )
 
     html = (
-        f'<div style="background:#161b22;border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:14px;">'
+        f'<div style="background:#161b22;border:1px solid rgba(255,255,255,0.08);'
+        f'border-radius:8px;padding:14px;">'
         f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">'
         f'{_sc_badge(sc)}'
         f'<span style="font-size:10px;color:#8b949e">Conviction Score v1 — sub-score breakdown</span>'
@@ -669,7 +781,8 @@ def _detail_breakdown_panel(row: pd.Series) -> str:
 def _validation_row_html(stock: str, sc: str, category: str) -> str:
     return (
         f'<div class="val-strip">'
-        f'<div style="font-size:11px;font-weight:700;color:#e6edf3;width:80px;font-family:\'JetBrains Mono\',monospace">{stock}</div>'
+        f'<div style="font-size:11px;font-weight:700;color:#e6edf3;width:80px;'
+        f'font-family:\'JetBrains Mono\',monospace">{stock}</div>'
         f'<div class="val-label">CV1</div>'
         f'{_sc_badge(sc)}'
         f'<div class="val-label" style="margin-left:10px;">Legacy</div>'
@@ -716,12 +829,12 @@ def render(settings: dict | None = None):
         with st.spinner("Running scanner…"):
             df_raw = run_scanner(
                 symbols,
-                settings         = effective,
-                cci_len          = effective.get("cci_len",  20),
-                cci_ob           = effective.get("cci_ob",  100),
-                cci_os           = effective.get("cci_os", -100),
-                max_workers      = effective.get("workers",  10),
-                progress_cb      = _cb,
+                settings    = effective,
+                cci_len     = effective.get("cci_len",  20),
+                cci_ob      = effective.get("cci_ob",  100),
+                cci_os      = effective.get("cci_os", -100),
+                max_workers = effective.get("workers",  10),
+                progress_cb = _cb,
             )
         prog.empty()
 
@@ -754,10 +867,16 @@ def render(settings: dict | None = None):
         st.session_state["scan_time"]     = _now_ist().strftime("%H:%M:%S")
         st.session_state["scan_settings"] = effective
 
-        # Store last Nifty close for display
+        # Nifty price + day-over-day %Chg
         try:
-            if nifty_series is not None and len(nifty_series) > 0:
-                st.session_state["nifty_price"] = float(nifty_series.iloc[-1])
+            if nifty_series is not None and len(nifty_series) >= 2:
+                last  = float(nifty_series.iloc[-1])
+                prev  = float(nifty_series.iloc[-2])
+                st.session_state["nifty_price"]   = last
+                st.session_state["nifty_chg_pct"] = round((last - prev) / prev * 100, 2)
+            elif nifty_series is not None and len(nifty_series) == 1:
+                st.session_state["nifty_price"]   = float(nifty_series.iloc[-1])
+                st.session_state["nifty_chg_pct"] = None
         except Exception:
             pass
 
@@ -766,11 +885,11 @@ def render(settings: dict | None = None):
             st.success("✅ Saved to Supabase.")
 
     # ── Display ────────────────────────────────────────────────
-    df_aug       = st.session_state.get("scan_df",       pd.DataFrame())
-    summary      = st.session_state.get("scan_summary",  {})
-    scan_time    = st.session_state.get("scan_time",     "")
-    eff_settings = st.session_state.get("scan_settings", settings)
-    nifty_price  = st.session_state.get("nifty_price",   0)
+    df_aug        = st.session_state.get("scan_df",       pd.DataFrame())
+    summary       = st.session_state.get("scan_summary",  {})
+    scan_time     = st.session_state.get("scan_time",     "")
+    nifty_price   = st.session_state.get("nifty_price",   0)
+    nifty_chg_pct = st.session_state.get("nifty_chg_pct", None)
 
     if df_aug.empty:
         st.markdown("""
@@ -782,7 +901,10 @@ def render(settings: dict | None = None):
         return
 
     # ── Market Status Row ────────────────────────────────────────
-    st.markdown(_market_status_row(summary, scan_time, nifty_price), unsafe_allow_html=True)
+    st.markdown(
+        _market_status_row(summary, scan_time, nifty_price, nifty_chg_pct),
+        unsafe_allow_html=True,
+    )
 
     # ── Score cards ──────────────────────────────────────────────
     active_df = (
@@ -796,13 +918,11 @@ def render(settings: dict | None = None):
     if "CV1_SignalClass" in df_aug.columns:
         st.markdown(_sc_counts_html(df_aug), unsafe_allow_html=True)
 
-    # ── Validation toggle ────────────────────────────────────────
+    # ── Toggles ──────────────────────────────────────────────────
     val_mode = st.checkbox(
         "🔬 Validation mode — Signal Class vs legacy tier side-by-side",
         value=False, key="chk_validation_mode",
     )
-
-    # ── Show SKIP toggle ─────────────────────────────────────────
     show_skip = st.checkbox("Show SKIP candidates", value=False, key="chk_show_skip")
 
     # ── Split by Signal Class ────────────────────────────────────
@@ -880,13 +1000,11 @@ def render(settings: dict | None = None):
                             unsafe_allow_html=True,
                         )
 
-            # Primary table
+            # ── Rich HTML table ──────────────────────────────────
             disp = _build_display_df(df_subset, detail=_show_detail)
             if "regime_tier" in disp.columns:
                 disp = disp.drop(columns=["regime_tier"])
-
-            styled = _style_table(disp)
-            st.dataframe(styled, use_container_width=True, height=500, hide_index=False)
+            st.markdown(_render_html_table(disp), unsafe_allow_html=True)
 
             # Per-stock breakdown
             if _show_detail and has_cv1:
