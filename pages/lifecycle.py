@@ -272,7 +272,9 @@ def render():
         return load_lifecycle_transitions(limit=limit)
     
     def _load_wl_enriched(lc_df: pd.DataFrame) -> pd.DataFrame:
-        return load_watchlist_enriched()
+        # Pass the pre-loaded lc_df to avoid a redundant DB round-trip;
+        # load_watchlist_enriched() treats an empty DataFrame the same as None.
+        return load_watchlist_enriched(lc_df if not lc_df.empty else None)
     
     
     # ══════════════════════════════════════════════════════════════════
