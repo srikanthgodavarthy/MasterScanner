@@ -110,6 +110,12 @@ class DecisionScores:
     tq_rs:                 int   = 0   # RS persistence across timeframes
     tq_pullback:           int   = 0   # pullback/fib zone health
 
+    # ── R:R Rejection tracking ────────────────────────────────────
+    # Set when a stock would have been Actionable/High Conviction/Elite
+    # but was downgraded to Setup Building because R:R < min_rr.
+    # Format: "RR 1.4 < 2.0" (actual vs threshold) — empty string if not rejected.
+    rr_reject_reason: str = ""
+
     # ── Explainability (Sprint 1) ─────────────────────────────────
     # Plain-English reason strings — populated by explain_decision()
     why_included:   list = None   # type: list[str]
@@ -972,8 +978,12 @@ def compute_decision(r: "BarResult", settings: dict | None = None) -> DecisionSc
     )
 
     # If R:R doesn't meet minimum, downgrade from Actionable → Setup Building
+    rr_reject_reason = ""
     if category in ("Elite Opportunity", "High Conviction", "Actionable"):
         if not _rr_ok(rr, settings):
+            min_rr_map = {"1.5R": 1.5, "2R": 2.0, "3R": 3.0}
+            min_rr = min_rr_map.get(settings.get("min_risk_reward", "2R"), 2.0)
+            rr_reject_reason = f"RR {rr:.1f} < {min_rr:.1f}"
             category = "Setup Building"
 
     ds = DecisionScores(
@@ -984,6 +994,7 @@ def compute_decision(r: "BarResult", settings: dict | None = None) -> DecisionSc
         stage         = stage,
         category      = category,
         risk_reward   = rr,
+        rr_reject_reason = rr_reject_reason,
         # Leadership subs
         ls_trend      = ls_subs["ls_trend"],
         ls_rs         = ls_subs["ls_rs"],
