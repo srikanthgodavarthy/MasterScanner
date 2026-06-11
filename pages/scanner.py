@@ -372,67 +372,38 @@ _CSS = """
   cursor: help;
 }
 
-/* ── Tooltip system ── */
-.tip-wrap {
-  position: relative;
-  display: inline-block;
-  cursor: help;
-}
-.tip-wrap .tip-box {
-  visibility: hidden;
-  opacity: 0;
-  width: 260px;
-  background: #1c2333;
-  border: 1px solid rgba(255,255,255,0.14);
-  border-radius: 7px;
-  padding: 10px 12px;
-  font-size: 0.70rem;
-  color: var(--text);
-  white-space: pre-line;
-  line-height: 1.55;
-  position: absolute;
-  z-index: 999;
-  top: 130%;
-  left: 50%;
-  transform: translateX(-50%);
-  box-shadow: 0 6px 24px rgba(0,0,0,0.55);
-  pointer-events: none;
-  transition: opacity 0.15s, visibility 0.15s;
-}
-.tip-wrap .tip-box::before {
-  content: "";
-  position: absolute;
-  bottom: 100%;
-  left: 50%;
-  transform: translateX(-50%);
-  border: 6px solid transparent;
-  border-bottom-color: rgba(255,255,255,0.14);
-}
-.tip-wrap:hover .tip-box {
-  visibility: visible;
-  opacity: 1;
-}
-/* header tooltip: shown above because table header is at top */
-.rt thead .tip-wrap .tip-box {
-  top: auto;
-  bottom: 130%;
-}
-.rt thead .tip-wrap .tip-box::before {
-  bottom: auto;
-  top: 100%;
-  border-bottom-color: transparent;
-  border-top-color: rgba(255,255,255,0.14);
-}
-.tip-title {
-  font-size: 0.72rem;
-  font-weight: 700;
-  color: var(--gold);
-  margin-bottom: 5px;
-  letter-spacing: 0.05em;
-}
+/* ── Tooltip triggers ── */
+/* All tooltip logic is JS-driven (floating #ms-tip div at document level).
+   No position:absolute inside overflow:hidden — tooltips are never clipped. */
+[data-tip-title] { cursor: help; }
 .tip-underline {
   border-bottom: 1px dashed rgba(255,255,255,0.25);
   cursor: help;
+}
+/* The floating tooltip div is injected once by _TOOLTIP_JS below */
+#ms-tip {
+  position: fixed;
+  z-index: 999999;
+  pointer-events: none;
+  max-width: 270px;
+  background: #1c2333;
+  border: 1px solid rgba(255,255,255,0.16);
+  border-radius: 7px;
+  padding: 10px 13px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.70rem;
+  color: #e6edf3;
+  line-height: 1.6;
+  box-shadow: 0 8px 28px rgba(0,0,0,0.65);
+  display: none;
+}
+#ms-tip .tip-title {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #f5c542;
+  margin-bottom: 6px;
+  letter-spacing: 0.05em;
+  display: block;
 }
 
 /* ── Breakdown panel ── */
@@ -455,6 +426,45 @@ _CSS = """
   text-transform:uppercase; width:80px; flex-shrink:0;
 }
 </style>
+"""
+
+# ── TOOLTIP JS ────────────────────────────────────────────────────
+# Injected once per table render. Creates a single #ms-tip div at body level,
+# so it is never clipped by .rt-wrap's overflow:hidden/auto.
+# Triggers: any element with data-tip-title attribute.
+_TOOLTIP_JS = """
+<div id="ms-tip"><span class="tip-title" id="ms-tip-title"></span><span id="ms-tip-body"></span></div>
+<script>
+(function(){
+  if(window._msTipInit) return;
+  window._msTipInit = true;
+  var tip   = document.getElementById('ms-tip');
+  var ttl   = document.getElementById('ms-tip-title');
+  var tbody = document.getElementById('ms-tip-body');
+  var PAD   = 14;
+  document.addEventListener('mouseover', function(e){
+    var el = e.target.closest('[data-tip-title]');
+    if(!el){ tip.style.display='none'; return; }
+    ttl.textContent   = el.getAttribute('data-tip-title') || '';
+    tbody.innerHTML   = (el.getAttribute('data-tip-body') || '').replace(/\\n/g,'<br>');
+    tip.style.display = 'block';
+  });
+  document.addEventListener('mousemove', function(e){
+    if(tip.style.display==='none') return;
+    var tw = tip.offsetWidth, th = tip.offsetHeight;
+    var vw = window.innerWidth,  vh = window.innerHeight;
+    var x  = e.clientX + PAD;
+    var y  = e.clientY + PAD;
+    if(x + tw > vw - 4) x = e.clientX - tw - PAD;
+    if(y + th > vh - 4) y = e.clientY - th - PAD;
+    tip.style.left = x + 'px';
+    tip.style.top  = y + 'px';
+  });
+  document.addEventListener('mouseout', function(e){
+    if(!e.target.closest('[data-tip-title]')) tip.style.display='none';
+  });
+})();
+</script>
 """
 
 # ── HELPERS ───────────────────────────────────────────────────────
@@ -498,27 +508,18 @@ def _cat_badge(category: str) -> str:
     )
 
 
-def _tooltip_wrap(inner_html: str, title: str, body: str) -> str:
-    """Wrap any HTML element with a hover tooltip."""
-    safe_title = title.replace('"', "&quot;").replace("'", "&#39;")
-    safe_body  = body.replace('"', "&quot;").replace("'", "&#39;").replace("\n", "&#10;")
-    return (
-        f'<span class="tip-wrap">'
-        f'{inner_html}'
-        f'<span class="tip-box">'
-        f'<div class="tip-title">{safe_title}</div>'
-        f'{safe_body.replace("&#10;", "<br>")}'
-        f'</span>'
-        f'</span>'
-    )
+def _tip_attrs(title: str, body: str) -> str:
+    """Return data attributes for the JS floating tooltip.  Safe for HTML attribute context."""
+    safe_title = title.replace('"', "&quot;")
+    safe_body  = body.replace('"', "&quot;").replace("\n", "\\n")
+    return f'data-tip-title="{safe_title}" data-tip-body="{safe_body}"'
 
 
 def _th_tooltip(label: str, col_key: str) -> str:
-    """Build a <th> with tooltip for a known column."""
+    """Build a <th> with tooltip data-attrs for a known column."""
     if col_key in _COL_TOOLTIPS:
         title, body = _COL_TOOLTIPS[col_key]
-        inner = f'<span class="tip-underline">{label}</span>'
-        return f'<th>{_tooltip_wrap(inner, title, body)}</th>'
+        return f'<th><span class="tip-underline" {_tip_attrs(title, body)}>{label}</span></th>'
     return f'<th>{label}</th>'
 
 
@@ -757,25 +758,25 @@ def _compute_cmp_rr(row) -> float | None:
 
 
 def _score_cell(val, invert: bool = False, tooltip_key: str | None = None) -> str:
-    """Number + 36px spark bar, vertically stacked. Optional tooltip."""
+    """Number + 36px spark bar, vertically stacked. Optional tooltip via data-attrs."""
     try:
         v = float(val)
     except (TypeError, ValueError):
         return '<td class="col-num">—</td>'
     color = _score_color(v, invert)
     pct   = min(100, max(0, int(v)))
-    inner = (
-        f'<div class="score-cell">'
-        f'<span class="score-num" style="color:{color}">{int(v)}</span>'
-        f'<div class="score-bar"><div class="score-fill" style="width:{pct}%;background:{color}"></div></div>'
-        f'</div>'
-    )
+    tip   = ""
     if tooltip_key and tooltip_key in _COL_TOOLTIPS:
         title, body = _COL_TOOLTIPS[tooltip_key]
-        # Show score prominently in tooltip
-        full_body = f"Score: {int(v)}/100\n\n{body}"
-        inner = _tooltip_wrap(inner, title, full_body)
-    return f'<td>{inner}</td>'
+        full_body   = f"Score: {int(v)}/100\n\n{body}"
+        tip         = _tip_attrs(title, full_body)
+    return (
+        f'<td>'
+        f'<div class="score-cell" {tip}>'
+        f'<span class="score-num" style="color:{color}">{int(v)}</span>'
+        f'<div class="score-bar"><div class="score-fill" style="width:{pct}%;background:{color}"></div></div>'
+        f'</div></td>'
+    )
 
 
 def _chg_cell(val) -> str:
@@ -846,13 +847,12 @@ def _cmp_cell(val) -> str:
 
 def _sc_table_badge(signal_class: str) -> str:
     color, label = _SC_STYLE.get(str(signal_class).strip(), ("#484f58", str(signal_class)))
-    title, body = _COL_TOOLTIPS.get("Signal Class", ("Signal Class", ""))
-    badge = (
-        f'<span class="tbl-badge" '
+    title, body  = _COL_TOOLTIPS.get("Signal Class", ("Signal Class", ""))
+    return (
+        f'<td><span class="tbl-badge" {_tip_attrs(title, body)} '
         f'style="color:{color};background:{color}1a;border:1px solid {color}50">'
-        f'{label}</span>'
+        f'{label}</span></td>'
     )
-    return f'<td>{_tooltip_wrap(badge, title, body)}</td>'
 
 
 def _render_html_table(df: pd.DataFrame) -> str:
@@ -871,15 +871,9 @@ def _render_html_table(df: pd.DataFrame) -> str:
         if c == "Stock":
             continue
         if c == "R:R":
-            # Special label to indicate CMP-based
-            rr_inner = '<span class="tip-underline">R:R</span>'
-            rr_tip   = _tooltip_wrap(
-                rr_inner,
-                "Risk:Reward (CMP → T1)",
-                "Calculated as:\n(T1 − CMP) / (CMP − SL)\n\nUses live CMP, not Entry price.\n"
-                "Gold ≥3.0 · Green ≥2.0 · Amber ≥1.5 · Red <1.5",
-            )
-            header_cells += f'<th>{rr_tip}</th>'
+            rr_title = "Risk:Reward (CMP → T1)"
+            rr_body  = "Calculated as:\n(T1 − CMP) / (CMP − SL)\n\nUses live CMP, not Entry price.\nGold ≥3.0 · Green ≥2.0 · Amber ≥1.5 · Red <1.5"
+            header_cells += f'<th><span class="tip-underline" {_tip_attrs(rr_title, rr_body)}>R:R</span></th>'
         else:
             header_cells += _th_tooltip(c, c)
 
@@ -928,6 +922,7 @@ def _render_html_table(df: pd.DataFrame) -> str:
         rows_html += f"<tr>{cells}</tr>\n"
 
     return f"""
+{_TOOLTIP_JS}
 <div class="rt-wrap">
 <table class="rt">
   <thead><tr>
