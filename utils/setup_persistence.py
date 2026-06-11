@@ -355,7 +355,10 @@ def enrich_scanner_row(
             plan.invalidation_reason= reason
             plan.invalidated_date   = today_str
             plan_was_updated = True
-            logger.info("Setup invalidated %s: %s", symbol, reason)
+            logger.info(
+                "[SETUP PLAN UPDATED] symbol=%s  id=%s  new_status=INVALIDATED  reason=%s",
+                symbol, plan.setup_id, reason,
+            )
 
     # ── 2. Check expiry ────────────────────────────────────────────
     if plan is not None and plan.status == SetupPlanStatus.ACTIVE:
@@ -365,7 +368,10 @@ def enrich_scanner_row(
             plan.invalidation_reason= f"Expired after {days} days"
             plan.invalidated_date   = today_str
             plan_was_updated = True
-            logger.info("Setup expired %s after %d days", symbol, days)
+            logger.info(
+                "[SETUP PLAN UPDATED] symbol=%s  id=%s  new_status=EXPIRED  days_active=%d",
+                symbol, plan.setup_id, days,
+            )
 
     # ── 3. Mint new plan if category qualifies and no active plan ──
     should_create = (
@@ -377,11 +383,26 @@ def enrich_scanner_row(
                                SetupPlanStatus.EXPIRED)
         )
     )
+    # Log SKIPPED when category does not qualify OR plan already active
+    if not should_create:
+        if category not in _FREEZE_CATEGORIES:
+            logger.debug(
+                "[SETUP PLAN SKIPPED] symbol=%s  category=%s  reason=category_not_qualifying",
+                symbol, category,
+            )
+        elif plan is not None and plan.is_active():
+            logger.debug(
+                "[SETUP PLAN SKIPPED] symbol=%s  id=%s  reason=plan_already_active  locked_entry=%.2f",
+                symbol, plan.setup_id, plan.entry_locked,
+            )
     if should_create:
         plan = _create_plan(symbol, scanner_row, first_seen_date, today_str)
         plan_was_updated = True
-        logger.info("Setup plan created %s  id=%s  cat=%s  entry=%.0f",
-                    symbol, plan.setup_id, plan.locked_category, plan.entry_locked)
+        logger.info(
+            "[SETUP PLAN CREATED] symbol=%s  id=%s  category=%s  entry=%.2f  sl=%.2f  t1=%.2f",
+            symbol, plan.setup_id, plan.locked_category,
+            plan.entry_locked, plan.sl_locked, plan.t1_locked,
+        )
 
     # ── 4. Compute display fields on the active plan ───────────────
     if plan is not None and plan.status == SetupPlanStatus.ACTIVE:
