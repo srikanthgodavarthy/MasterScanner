@@ -101,6 +101,30 @@ _COL_TOOLTIPS = {
         "Bars Since Setup (15).\n"
         "Higher = tighter, lower-risk entry.",
     ),
+    "Setup Age": (
+        "Setup Age",
+        "Days since trade plan was first locked.\n"
+        "🟢 Fresh  <5d  — optimal entry window\n"
+        "🟡 Mature 5-10d — entry still valid, monitor\n"
+        "🔴 Late   >10d — elevated risk, plan may expire\n"
+        "Max plan age: 20 days before auto-expiry.",
+    ),
+    "Plan Status": (
+        "Trade Plan Status",
+        "Current state of the frozen trade plan.\n"
+        "Waiting    — setup active, awaiting breakout\n"
+        "Triggered  — entry price breached\n"
+        "T1/T2      — targets achieved\n"
+        "Expired    — no trade within 20 days\n"
+        "Invalidated — SL hit or setup broken",
+    ),
+    "Drift%": (
+        "Entry Drift %",
+        "Live entry vs locked entry price.\n"
+        "Positive = current price moved above locked entry.\n"
+        "Negative = entry pulled back below locked level.\n"
+        "Large positive drift = chasing; use caution.",
+    ),
 }
 
 # ── CSS ───────────────────────────────────────────────────────────
@@ -401,6 +425,74 @@ _CSS = """
   font-size:9px; color:var(--muted); letter-spacing:0.08em;
   text-transform:uppercase; width:80px; flex-shrink:0;
 }
+
+/* ── Setup Persistence Badges ── */
+.freshness-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px; border-radius: 4px;
+  font-size: 10px; font-weight: 700; font-family: var(--mono);
+  white-space: nowrap;
+}
+.freshness-fresh   { background: rgba(63,185,80,0.15);  border: 1px solid rgba(63,185,80,0.4);  color: #3fb950; }
+.freshness-mature  { background: rgba(245,197,66,0.12); border: 1px solid rgba(245,197,66,0.35); color: #f5c542; }
+.freshness-late    { background: rgba(248,81,73,0.12);  border: 1px solid rgba(248,81,73,0.35);  color: #f85149; }
+.freshness-expired { background: rgba(139,148,158,0.1); border: 1px solid rgba(139,148,158,0.3); color: #8b949e; }
+
+.trade-status-badge {
+  display: inline-block; padding: 2px 7px; border-radius: 4px;
+  font-size: 9px; font-weight: 700; font-family: var(--mono);
+  white-space: nowrap; letter-spacing: 0.04em;
+}
+.ts-waiting      { background: rgba(88,166,255,0.12); border:1px solid rgba(88,166,255,0.35); color:#58a6ff; }
+.ts-triggered    { background: rgba(63,185,80,0.15);  border:1px solid rgba(63,185,80,0.4);   color:#3fb950; }
+.ts-t1           { background: rgba(163,113,247,0.15);border:1px solid rgba(163,113,247,0.4); color:#a371f7; }
+.ts-t2           { background: rgba(245,197,66,0.15); border:1px solid rgba(245,197,66,0.4);  color:#f5c542; }
+.ts-expired      { background: rgba(139,148,158,0.1); border:1px solid rgba(139,148,158,0.3); color:#8b949e; }
+.ts-invalidated  { background: rgba(248,81,73,0.12);  border:1px solid rgba(248,81,73,0.35);  color:#f85149; }
+
+/* ── Setup Lifecycle Timeline Panel ── */
+.lifecycle-panel {
+  background: var(--bg1); border: 1px solid var(--border);
+  border-radius: 8px; padding: 14px 16px; margin-top: 8px;
+}
+.lifecycle-title {
+  font-size: 10px; font-weight: 700; color: var(--muted);
+  letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 12px;
+}
+.lc-timeline {
+  display: flex; align-items: center; gap: 0;
+  overflow-x: auto; padding-bottom: 4px;
+}
+.lc-node {
+  display: flex; flex-direction: column; align-items: center;
+  min-width: 80px; position: relative;
+}
+.lc-node-circle {
+  width: 28px; height: 28px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700; border: 2px solid;
+  z-index: 1; position: relative;
+}
+.lc-node-label  { font-size: 9px; font-weight: 700; margin-top: 5px; letter-spacing: 0.05em; text-align: center; }
+.lc-node-date   { font-size: 8px; color: var(--muted); margin-top: 2px; text-align: center; }
+.lc-connector   { flex: 1; height: 2px; min-width: 20px; margin-bottom: 14px; }
+.lc-node.done   .lc-node-circle { opacity: 1; }
+.lc-node.pending .lc-node-circle { opacity: 0.3; }
+
+/* ── Locked Plan Grid ── */
+.locked-plan-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 6px; margin-top: 10px;
+}
+.locked-level {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 10px;
+  text-align: center; font-family: var(--mono);
+}
+.locked-level .ll-label { font-size: 9px; font-weight: 700; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 4px; }
+.locked-level .ll-value { font-size: 14px; font-weight: 700; }
 </style>
 """
 
@@ -660,6 +752,10 @@ _RENAME_MAP_FULL = {
     "Conviction":      "Conviction_DE",
     "EntryQuality":    "EntryQuality_DE",
     "LTP":             "CMP",          # last traded price from scanner → display as CMP
+    # Setup persistence display columns
+    "SetupAge":        "Setup Age",
+    "TradePlanStatus": "Plan Status",
+    "EntryDriftPct":   "Drift%",
 }
 
 _RENAME_PRIMARY = {
@@ -678,10 +774,10 @@ _DETAIL_EXTRA = [
     "Category", "Stage", "Leadership_DE", "Conviction_DE", "EntryQuality_DE",
 ]
 
-# Primary column order for HTML table (v9: CMP added, R:R is CMP-based)
+# Primary column order for HTML table (v10: persistence fields added)
 _PRIMARY_ORDERED = [
-    "Stock", "Signal Class", "Leadership", "Conviction", "Entry Quality",
-    "Extension", "CMP", "%Chg", "Entry", "SL", "T1", "R:R", "Size%",
+    "Stock", "Setup Age", "Plan Status", "Signal Class", "Leadership", "Conviction",
+    "Entry Quality", "Extension", "CMP", "%Chg", "Entry", "SL", "T1", "R:R", "Drift%", "Size%",
 ]
 
 
@@ -824,6 +920,166 @@ def _sc_table_badge(signal_class: str) -> str:
     )
 
 
+def _freshness_badge(setup_age_str: str) -> str:
+    """Render a colour-coded freshness badge from the SetupAge string."""
+    s = str(setup_age_str or "").strip()
+    if not s or s == "—":
+        return '<span style="color:var(--muted);font-size:10px">—</span>'
+    if "Fresh" in s:
+        css = "freshness-fresh"
+    elif "Mature" in s or "Late" in s:
+        # distinguish by emoji prefix used in setup_persistence._format_setup_age
+        if "🔴" in s or "Expired" in s or "Invalidated" in s:
+            css = "freshness-expired"
+        else:
+            css = "freshness-mature"
+    elif "Aging" in s:
+        css = "freshness-late"
+    elif "Expired" in s or "Invalidated" in s or "✗" in s:
+        css = "freshness-expired"
+    else:
+        css = "freshness-mature"
+    return f'<span class="freshness-badge {css}">{s}</span>'
+
+
+def _trade_status_badge(status_str: str) -> str:
+    """Render trade plan status as a small coloured badge."""
+    s = str(status_str or "").strip()
+    if not s or "Forming" in s or s == "—":
+        return '<span style="color:var(--muted);font-size:9px">—</span>'
+    if "Invalidated" in s or "invalidated" in s:
+        css, label = "ts-invalidated", "Invalidated"
+    elif "Expired" in s or "expired" in s:
+        css, label = "ts-expired", "Expired"
+    elif "T2" in s:
+        css, label = "ts-t2", "T2 Achieved"
+    elif "T1" in s:
+        css, label = "ts-t1", "T1 Achieved"
+    elif "triggered" in s.lower() or "Triggered" in s:
+        css, label = "ts-triggered", "Triggered"
+    elif "Late" in s or "Aging" in s:
+        css, label = "ts-t1", "Active · Late"
+    elif "Active" in s:
+        css, label = "ts-waiting", "Waiting"
+    else:
+        css, label = "ts-waiting", s[:20]
+    return f'<span class="trade-status-badge {css}">{label}</span>'
+
+
+def _drift_cell(drift_pct) -> str:
+    """Render entry drift % with +/- colour."""
+    try:
+        v = float(drift_pct)
+    except (TypeError, ValueError):
+        return '<td class="col-num" style="color:var(--muted)">—</td>'
+    color  = "#3fb950" if v < 0 else ("#f85149" if v > 2 else "#d29922")
+    sign   = "+" if v > 0 else ""
+    return f'<td class="col-num" style="color:{color};font-weight:600">{sign}{v:.1f}%</td>'
+
+
+def _locked_plan_panel(row) -> str:
+    """Render the locked trade plan grid (Entry / SL / T1 / T2 / T3)."""
+    def _lv(key, label, color):
+        val = row.get(key, 0)
+        try:
+            v = float(val)
+            txt = f"₹{v:,.0f}" if v > 0 else "—"
+        except (TypeError, ValueError):
+            txt = "—"
+        return (
+            f'<div class="locked-level">'
+            f'<div class="ll-label">{label}</div>'
+            f'<div class="ll-value" style="color:{color}">{txt}</div>'
+            f'</div>'
+        )
+
+    plan_status = str(row.get("PlanStatus", "")).upper()
+    is_active   = plan_status == "ACTIVE"
+    lock_icon   = "🔒" if is_active else "🔓"
+    status_note = f'<span style="font-size:10px;color:var(--muted)"> · plan {plan_status.lower() if plan_status else "not yet minted"}</span>'
+
+    return (
+        f'<div style="margin:10px 0 0;">'
+        f'<div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:0.1em;'
+        f'text-transform:uppercase;margin-bottom:6px">{lock_icon} Locked Trade Plan{status_note}</div>'
+        f'<div class="locked-plan-grid">'
+        + _lv("EntryLocked", "Entry",  "#58a6ff")
+        + _lv("SLLocked",    "SL",     "#f85149")
+        + _lv("T1Locked",    "T1",     "#3fb950")
+        + _lv("T2Locked",    "T2",     "#f5c542")
+        + _lv("T3Locked",    "T3",     "#a371f7")
+        + f'</div>'
+        f'</div>'
+    )
+
+
+def _lifecycle_timeline_panel(history_df=None, plan_row=None) -> str:
+    """
+    Render Created → Triggered → T1 → T2 → Expired timeline.
+    Uses lifecycle history rows (scan_date, category) or plan metadata.
+    """
+    nodes = [
+        ("Created",   "🌱", "#58a6ff"),
+        ("Triggered", "⚡", "#3fb950"),
+        ("T1",        "🎯", "#a371f7"),
+        ("T2",        "🏆", "#f5c542"),
+        ("Expired",   "⏳", "#8b949e"),
+    ]
+
+    # Derive timestamps from plan_row fields if available
+    timestamps = {}
+    if plan_row is not None:
+        fa = plan_row.get("FirstActionable", "") or plan_row.get("first_actionable_date", "")
+        if fa:
+            timestamps["Created"] = str(fa)[:10]
+        inv = plan_row.get("invalidated_date", "") or plan_row.get("InvalidatedDate", "")
+        status = str(plan_row.get("PlanStatus", "")).upper()
+        if status == "EXPIRED" and inv:
+            timestamps["Expired"] = str(inv)[:10]
+        elif status == "INVALIDATED" and inv:
+            timestamps["Expired"] = str(inv)[:10]  # reuse slot
+
+    # Determine which nodes are "done"
+    current_status = str(plan_row.get("PlanStatus", "") if plan_row else "").upper()
+    done_set = {"Created"} if timestamps.get("Created") else set()
+    if current_status in ("ACTIVE",):
+        done_set.add("Created")
+        tps = str(plan_row.get("TradePlanStatus", "") if plan_row else "")
+        if "triggered" in tps.lower() or "T1" in tps or "T2" in tps:
+            done_set.add("Triggered")
+        if "T1" in tps or "T2" in tps:
+            done_set.add("T1")
+        if "T2" in tps:
+            done_set.add("T2")
+    elif current_status in ("EXPIRED", "INVALIDATED"):
+        done_set |= {"Created", "Expired"}
+
+    html = (
+        '<div class="lifecycle-panel">'
+        '<div class="lifecycle-title">Setup Lifecycle</div>'
+        '<div class="lc-timeline">'
+    )
+    for i, (name, icon, color) in enumerate(nodes):
+        done_cls = "done" if name in done_set else "pending"
+        bg_color = color if name in done_set else "transparent"
+        border_c = color
+        ts_label = timestamps.get(name, "")
+        html += (
+            f'<div class="lc-node {done_cls}">'
+            f'<div class="lc-node-circle" style="background:{bg_color};border-color:{border_c};color:{"#0d1117" if name in done_set else color}">'
+            f'{icon}</div>'
+            f'<div class="lc-node-label" style="color:{color}">{name}</div>'
+            f'<div class="lc-node-date">{ts_label}</div>'
+            f'</div>'
+        )
+        if i < len(nodes) - 1:
+            connector_color = color if name in done_set else "rgba(255,255,255,0.08)"
+            html += f'<div class="lc-connector" style="background:{connector_color}"></div>'
+
+    html += '</div></div>'
+    return html
+
+
 def _render_html_table(df: pd.DataFrame) -> str:
     if df.empty:
         return '<div style="padding:2rem;text-align:center;color:#8b949e;font-size:0.8rem;">No data</div>'
@@ -859,6 +1115,12 @@ def _render_html_table(df: pd.DataFrame) -> str:
 
             if c == "Signal Class":
                 cells += _sc_table_badge(str(val) if val is not None else "")
+            elif c == "Setup Age":
+                cells += f'<td>{_freshness_badge(val)}</td>'
+            elif c == "Plan Status":
+                cells += f'<td>{_trade_status_badge(val)}</td>'
+            elif c == "Drift%":
+                cells += _drift_cell(val)
             elif c == "Leadership":
                 cells += _score_cell(val, invert=False, tooltip_key="Leadership")
             elif c == "Conviction":
@@ -1159,11 +1421,20 @@ def render(settings: dict | None = None):
         st.markdown(_sc_counts_html(df_aug), unsafe_allow_html=True)
 
     # ── Toggles ──────────────────────────────────────────────────
-    val_mode = st.checkbox(
-        "🔬 Validation mode — Signal Class vs legacy tier side-by-side",
-        value=False, key="chk_validation_mode",
-    )
-    show_skip = st.checkbox("Show SKIP candidates", value=False, key="chk_show_skip")
+    tgl1, tgl2, tgl3 = st.columns([2, 2, 2])
+    with tgl1:
+        val_mode = st.checkbox(
+            "🔬 Validation mode — Signal Class vs legacy tier side-by-side",
+            value=False, key="chk_validation_mode",
+        )
+    with tgl2:
+        show_skip = st.checkbox("Show SKIP candidates", value=False, key="chk_show_skip")
+    with tgl3:
+        st.selectbox(
+            "Sort by",
+            ["Leadership ↓", "Freshest First 🟢"],
+            key="sort_persistence",
+        )
 
     # ── Split by Signal Class ────────────────────────────────────
     has_cv1 = "CV1_SignalClass" in df_aug.columns
@@ -1171,9 +1442,14 @@ def render(settings: dict | None = None):
     def _sc_df(sc):
         if not has_cv1:
             return pd.DataFrame()
-        return df_aug[df_aug["CV1_SignalClass"] == sc].sort_values(
-            "CV1_Leadership", ascending=False
-        ).copy()
+        _base = df_aug[df_aug["CV1_SignalClass"] == sc].copy()
+        # Apply sort
+        sort_key = st.session_state.get("sort_persistence", "Leadership ↓")
+        if sort_key == "Freshest First 🟢" and "DaysActive" in _base.columns:
+            _base = _base.sort_values("DaysActive", ascending=True)
+        else:
+            _base = _base.sort_values("CV1_Leadership", ascending=False)
+        return _base
 
     elite_df   = _sc_df("ELITE")
     execute_df = _sc_df("EXECUTE")
@@ -1254,6 +1530,49 @@ def render(settings: dict | None = None):
                     if _picked:
                         _row = df_subset[df_subset["Stock"] == _picked].iloc[0]
                         st.markdown(_detail_breakdown_panel(_row), unsafe_allow_html=True)
+
+                        # ── Setup Persistence section ──────────────────
+                        _setup_id   = str(_row.get("SetupID", ""))
+                        _plan_status= str(_row.get("PlanStatus", ""))
+                        _setup_age  = str(_row.get("SetupAge",  _row.get("Setup Age", "")))
+                        _tps        = str(_row.get("TradePlanStatus", _row.get("Plan Status", "")))
+                        _days_active= _row.get("DaysActive", 0)
+                        _drift_pct  = _row.get("EntryDriftPct", _row.get("Drift%", 0))
+
+                        _persist_header = (
+                            '<div style="margin:14px 0 6px;font-size:9px;font-weight:700;'
+                            'color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;">'
+                            '🗂️ Setup Persistence</div>'
+                        )
+                        _setup_meta = (
+                            f'<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">'
+                            f'<span style="font-size:10px;color:var(--muted)">ID:</span>'
+                            f'<code style="font-size:11px;background:var(--bg2);padding:2px 8px;border-radius:4px;'
+                            f'border:1px solid var(--border);color:var(--blue)">{_setup_id or "—"}</code>'
+                            f'<span style="margin-left:8px">{_freshness_badge(_setup_age)}</span>'
+                            f'<span style="margin-left:4px">{_trade_status_badge(_tps)}</span>'
+                            f'</div>'
+                        )
+
+                        try:
+                            _drift_v = float(_drift_pct)
+                            _dc = "#3fb950" if _drift_v < 0 else ("#f85149" if _drift_v > 2 else "#d29922")
+                            _ds = f'{"+" if _drift_v > 0 else ""}{_drift_v:.1f}%'
+                            _drift_html = (
+                                f'<span style="font-size:10px;color:var(--muted)">Entry Drift: </span>'
+                                f'<span style="font-size:11px;font-weight:700;color:{_dc}">{_ds}</span>'
+                                f'<span style="font-size:9px;color:var(--muted);margin-left:6px">'
+                                f'(live vs locked entry)</span>'
+                            )
+                        except (TypeError, ValueError):
+                            _drift_html = ""
+
+                        st.markdown(
+                            _persist_header + _setup_meta + _drift_html,
+                            unsafe_allow_html=True,
+                        )
+                        st.markdown(_locked_plan_panel(_row), unsafe_allow_html=True)
+                        st.markdown(_lifecycle_timeline_panel(plan_row=_row), unsafe_allow_html=True)
 
             # Explainability panel (Sprint 1)
             if _show_detail and "_explain_included" in df_subset.columns:
