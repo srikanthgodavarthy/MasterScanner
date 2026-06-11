@@ -386,12 +386,12 @@ def enrich_scanner_row(
     # Log SKIPPED when category does not qualify OR plan already active
     if not should_create:
         if category not in _FREEZE_CATEGORIES:
-            logger.debug(
+            logger.info(
                 "[SETUP PLAN SKIPPED] symbol=%s  category=%s  reason=category_not_qualifying",
                 symbol, category,
             )
         elif plan is not None and plan.is_active():
-            logger.debug(
+            logger.info(
                 "[SETUP PLAN SKIPPED] symbol=%s  id=%s  reason=plan_already_active  locked_entry=%.2f",
                 symbol, plan.setup_id, plan.entry_locked,
             )
