@@ -548,19 +548,26 @@ def load_lifecycle_transitions(limit: int = 1000) -> pd.DataFrame:
 
 # ─── WATCHLIST ENRICHED ───────────────────────────────────────────────────────
 
-def load_watchlist_enriched() -> pd.DataFrame:
+def load_watchlist_enriched(lc_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Return the watchlist joined with the latest lifecycle state for each symbol.
 
     Columns: symbol, notes, added_at, stage, leadership, conviction,
              entry_quality, trend_quality, score, scan_date  (lifecycle cols may be NaN)
+
+    Parameters
+    ----------
+    lc_df : pd.DataFrame | None
+        Pre-loaded lifecycle DataFrame (e.g. already fetched by the caller).
+        When None (default) the function fetches it via load_lifecycle_latest().
     """
     wl = load_watchlist()
     if not wl:
         return pd.DataFrame()
 
     wl_df = pd.DataFrame(wl)
-    lc_df = load_lifecycle_latest()
+    if lc_df is None:
+        lc_df = load_lifecycle_latest()
 
     if lc_df.empty:
         return wl_df
