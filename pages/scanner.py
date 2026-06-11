@@ -291,6 +291,32 @@ _CSS = """
   border-left-style: solid;
 }
 
+/* ── Qualification Summary ── */
+.qual-summary {
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-left: 3px solid #4ade80;
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin: 8px 0 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.qs-header { margin-bottom: 8px; }
+.qs-title { font-size: 11px; font-weight: 700; color: var(--muted); letter-spacing: 0.06em; text-transform: uppercase; }
+.qs-body { display: flex; flex-direction: column; gap: 6px; }
+.qs-stats { display: flex; gap: 20px; flex-wrap: wrap; align-items: baseline; }
+.qs-stat { display: flex; align-items: baseline; gap: 6px; }
+.qs-num { font-size: 18px; font-weight: 700; line-height: 1; }
+.qs-label { font-size: 10px; color: var(--muted); font-weight: 500; letter-spacing: 0.04em; }
+.qs-reject-block { border-top: 1px solid var(--border); padding-top: 6px; margin-top: 2px; }
+.qs-reject-head { font-size: 10px; font-weight: 600; color: #f85149; text-transform: uppercase; letter-spacing: 0.05em; margin-right: 8px; }
+.qs-reject-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 5px; }
+.qs-reject-item { background: rgba(248,81,73,0.08); border: 1px solid rgba(248,81,73,0.25); border-radius: 5px; padding: 2px 8px; font-size: 11px; }
+.qs-reject-reason { color: #f85149; font-size: 10px; }
+
+
+
 /* ── Rich HTML results table ── */
 .rt-wrap {
   width: 100%;
@@ -732,7 +758,99 @@ def _sc_counts_html(df: pd.DataFrame) -> str:
     return '<div class="sc-counts">' + "".join(parts) + '</div>'
 
 
-# ── DISPLAY COLUMNS ────────────────────────────────────────────────
+# ── QUALIFICATION SUMMARY ──────────────────────────────────────────
+
+def _qualification_summary_html(df: pd.DataFrame, settings: dict) -> str:
+    """
+    Render a compact 'Qualification Summary' panel showing:
+      • Actionable Stocks  — stocks in Execute/Elite signal classes
+      • Qualified Plans    — actionable stocks that ALSO have an ACTIVE locked plan
+      • Rejected           — stocks downgraded by R:R gate (symbol + reason)
+    """
+    if df.empty:
+        return ""
+
+    # ── Actionable count (ELITE + EXECUTE signal classes) ─────────
+    sc_col = "CV1_SignalClass"
+    if sc_col in df.columns:
+        actionable_df = df[df[sc_col].isin(["ELITE", "EXECUTE"])]
+    else:
+        # Fallback: Category-based
+        cat_col = "Category"
+        if cat_col in df.columns:
+            actionable_df = df[df[cat_col].isin(
+                ["Elite Opportunity", "High Conviction", "Actionable"]
+            )]
+        else:
+            actionable_df = pd.DataFrame()
+
+    n_actionable = len(actionable_df)
+
+    # ── Qualified Plans count (actionable + ACTIVE plan) ──────────
+    if not actionable_df.empty and "PlanStatus" in actionable_df.columns:
+        n_plans = int(
+            (actionable_df["PlanStatus"].astype(str).str.upper() == "ACTIVE").sum()
+        )
+    else:
+        n_plans = 0
+
+    # ── Rejected stocks (R:R gate) ─────────────────────────────────
+    reject_col = "RR_RejectReason"
+    rejected_rows = []
+    if reject_col in df.columns:
+        rej_df = df[df[reject_col].astype(str).str.strip() != ""]
+        for _, row in rej_df.iterrows():
+            sym    = str(row.get("Stock", "?"))
+            reason = str(row.get(reject_col, ""))
+            rejected_rows.append((sym, reason))
+
+    # ── Build HTML ─────────────────────────────────────────────────
+    min_rr_map = {"1.5R": 1.5, "2R": 2.0, "3R": 3.0}
+    min_rr = min_rr_map.get(settings.get("min_risk_reward", "2R"), 2.0)
+
+    def _stat(label, val, color):
+        return (
+            f'<div class="qs-stat">'
+            f'<span class="qs-num" style="color:{color}">{val}</span>'
+            f'<span class="qs-label">{label}</span>'
+            f'</div>'
+        )
+
+    reject_html = ""
+    if rejected_rows:
+        items = "".join(
+            f'<span class="qs-reject-item">'
+            f'<b style="color:#e6edf3">{sym}</b>'
+            f'<span class="qs-reject-reason"> — {reason}</span>'
+            f'</span>'
+            for sym, reason in rejected_rows
+        )
+        reject_html = (
+            f'<div class="qs-reject-block">'
+            f'<span class="qs-reject-head">Rejected (R:R &lt; {min_rr:.1f}x):</span>'
+            f'<div class="qs-reject-list">{items}</div>'
+            f'</div>'
+        )
+
+    stats_html = (
+        _stat("Actionable Stocks", n_actionable, "#4ade80" if n_actionable > 0 else "#8b949e")
+        + _stat("Qualified Plans",  n_plans,      "#f59e0b" if n_plans > 0 else "#8b949e")
+    )
+
+    return f"""
+<div class="qual-summary">
+  <div class="qs-header">
+    <span class="qs-title">📋 Qualification Summary</span>
+  </div>
+  <div class="qs-body">
+    <div class="qs-stats">{stats_html}</div>
+    {reject_html}
+  </div>
+</div>
+"""
+
+
+
 
 _RENAME_MAP_FULL = {
     "composite_score": "Composite",
@@ -1419,6 +1537,12 @@ def render(settings: dict | None = None):
     # ── CV1 counts ───────────────────────────────────────────────
     if "CV1_SignalClass" in df_aug.columns:
         st.markdown(_sc_counts_html(df_aug), unsafe_allow_html=True)
+
+    # ── Qualification Summary ─────────────────────────────────────
+    _scan_settings = st.session_state.get("scan_settings", {})
+    _qs_html = _qualification_summary_html(df_aug, _scan_settings)
+    if _qs_html:
+        st.markdown(_qs_html, unsafe_allow_html=True)
 
     # ── Toggles ──────────────────────────────────────────────────
     tgl1, tgl2, tgl3 = st.columns([2, 2, 2])
