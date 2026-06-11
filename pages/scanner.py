@@ -534,38 +534,6 @@ def _tv_link(symbol: str) -> str:
     )
 
 
-# ── FETCH CMP ─────────────────────────────────────────────────────
-
-def _fetch_cmp_map(symbols: list[str]) -> dict[str, float]:
-    """
-    Fetch current market price for a list of NSE symbols using yfinance fast_info.
-    Returns {symbol_without_NS: price}.  Best-effort — missing symbols → NaN.
-    """
-    import yfinance as yf
-    cmp_map: dict[str, float] = {}
-    # Normalise: add .NS suffix if not present
-    yf_syms = []
-    base_map: dict[str, str] = {}  # yf_sym → base symbol
-    for s in symbols:
-        base = s.replace(".NS", "").replace("-EQ", "").upper()
-        yf_s = base + ".NS"
-        yf_syms.append(yf_s)
-        base_map[yf_s] = base
-
-    try:
-        tickers = yf.Tickers(" ".join(yf_syms))
-        for yf_s, base in base_map.items():
-            try:
-                price = tickers.tickers[yf_s].fast_info.last_price
-                if price and price > 0:
-                    cmp_map[base] = round(float(price), 2)
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return cmp_map
-
-
 # ── MARKET STATUS ROW ──────────────────────────────────────────────
 
 def _market_status_row(summary: dict, scan_time: str,
@@ -691,6 +659,7 @@ _RENAME_MAP_FULL = {
     "Leadership":      "Leadership_DE",
     "Conviction":      "Conviction_DE",
     "EntryQuality":    "EntryQuality_DE",
+    "LTP":             "CMP",          # last traded price from scanner → display as CMP
 }
 
 _RENAME_PRIMARY = {
@@ -1092,18 +1061,6 @@ def render(settings: dict | None = None):
                     df_aug = add_streak_column(df_aug, _hist.to_dict("records"), n_scans=10)
         except Exception:
             pass
-
-        # ── Fetch CMP ────────────────────────────────────────────
-        with st.spinner("Fetching live prices (CMP)…"):
-            scanned_syms = df_aug["Stock"].tolist() if "Stock" in df_aug.columns else []
-            cmp_map = _fetch_cmp_map(scanned_syms)
-            if cmp_map:
-                def _get_cmp(sym):
-                    base = str(sym).replace(".NS", "").replace("-EQ", "").upper()
-                    return cmp_map.get(base, float("nan"))
-                df_aug["CMP"] = df_aug["Stock"].apply(_get_cmp)
-            else:
-                df_aug["CMP"] = float("nan")
 
         st.session_state["scan_df"]       = df_aug
         st.session_state["regime_ctx"]    = regime_ctx
