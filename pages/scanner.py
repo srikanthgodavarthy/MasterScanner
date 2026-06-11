@@ -1084,19 +1084,39 @@ def render(settings: dict | None = None):
 
         if supabase_ok and save_db:
             save_scan_snapshot(df_aug)
-            # ── Sprint 2: persist lifecycle snapshot ──────────────
+            # ── Sprint 2 / 3: persist lifecycle snapshot + transitions ──
             try:
-                from utils.lifecycle_engine import lifecycle_from_scanner_row
-                from utils.supabase_client  import save_lifecycle_snapshot
+                from utils.lifecycle_engine import (
+                    lifecycle_from_scanner_row, detect_transitions,
+                )
+                from utils.supabase_client import (
+                    save_lifecycle_snapshot, save_lifecycle_transitions,
+                    load_lifecycle_latest,
+                )
+                import datetime as _dt
+                _today   = _dt.date.today()
                 _lc_rows = []
-                _today   = __import__("datetime").date.today()
                 for _, _srow in df_aug.iterrows():
                     _sym = str(_srow.get("Stock", ""))
-                    _lr  = lifecycle_from_scanner_row(_srow.to_dict(), symbol=_sym, scan_date=_today)
+                    _lr  = lifecycle_from_scanner_row(
+                        _srow.to_dict(), symbol=_sym, scan_date=_today
+                    )
                     if _lr:
                         _lc_rows.append(vars(_lr))
+
                 if _lc_rows:
+                    # Load previous snapshot BEFORE saving new one
+                    _prev_df = load_lifecycle_latest()
                     save_lifecycle_snapshot(_lc_rows)
+
+                    # Detect and persist stage transitions
+                    import pandas as _pd
+                    _curr_df = _pd.DataFrame(_lc_rows)
+                    _transitions = detect_transitions(
+                        _prev_df, _curr_df, scan_date=_today
+                    )
+                    if _transitions:
+                        save_lifecycle_transitions(_transitions)
             except Exception:
                 pass  # non-critical
             st.success("✅ Saved to Supabase.")
