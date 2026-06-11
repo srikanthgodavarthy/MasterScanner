@@ -586,17 +586,7 @@ def render():
             tr_view = tr_view.sort_values("to_date", ascending=False).head(100)
     
             # ── Stats ────────────────────────────────────────────────
-            stats = transition_stats([
-                type("T", (), {
-                    "direction":  r["direction"],
-                    "to_stage":   r["to_stage"],
-                    "from_stage": r["from_stage"],
-                    "is_breakout": (r["from_stage"] in (STAGE_SETUP, STAGE_EMERGING)
-                                    and r["to_stage"] == STAGE_ACTIONABLE),
-                    "is_breakdown": r["to_stage"] == STAGE_DECLINING,
-                })()
-                for _, r in tr_view.iterrows()
-            ])
+            stats = transition_stats(tr_view)
     
             sc1, sc2, sc3, sc4 = st.columns(4)
             sc1.metric("Total (filtered)", stats["total"])
