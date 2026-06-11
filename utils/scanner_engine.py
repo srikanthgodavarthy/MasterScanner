@@ -565,6 +565,7 @@ def score_stock(
             "Stage":         ds.stage,
             "Category":      ds.category,
             "RR":            ds.risk_reward,
+            "RR_RejectReason": ds.rr_reject_reason,
             # ── Bars-since-setup banding (key question: "Can I still enter today?")
             "BarsBand":      ds.bars_band,         # "Actionable" | "Late" | "Extended"
             "BarsSince":     ds.bars_since_setup,
