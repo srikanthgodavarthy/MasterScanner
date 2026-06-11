@@ -316,7 +316,7 @@ def render():
     
         if _session_rows:
             _session_lc = pd.DataFrame(_session_rows)
-            _session_lc["scan_date"] = date.today()
+            _session_lc["scan_date"] = date.today().isoformat()  # str, matches DB format
             # Merge: session data takes priority for today
             if lc_df.empty:
                 lc_df = _session_lc
@@ -409,7 +409,7 @@ def render():
             )
     
         st.markdown(f"**{len(df_view)}** stocks shown after filters · Latest scan: "
-                    f"`{lc_df['scan_date'].max() if 'scan_date' in lc_df.columns else 'N/A'}`")
+                    f"`{lc_df['scan_date'].astype(str).max() if 'scan_date' in lc_df.columns else 'N/A'}`")
         st.markdown("---")
     
         # ── Table header ─────────────────────────────────────────────
