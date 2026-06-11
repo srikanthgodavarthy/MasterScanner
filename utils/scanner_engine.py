@@ -15,26 +15,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings("ignore")
 
-# Pre-import decision_engine at load time (safe — no circular deps).
-# scoring_core is NOT imported here because build_indicators() imports back
-# from scanner_engine (ema, sma, rsi, etc.) creating a circular import.
-# scoring_core is imported inside score_stock() where Python's import system
-# handles the cycle safely after scanner_engine is fully loaded.
-from utils.decision_engine import compute_decision
-
 
 # ══════════════════════════════════════════════════════════════════
 #  TIMEZONE HELPER
 # ══════════════════════════════════════════════════════════════════
 
 def _strip_tz(index: pd.Index) -> pd.Index:
-    """Strip timezone from a DatetimeIndex, preserving IST calendar dates.
-
-    yfinance returns NSE daily bars timestamped at midnight IST (Asia/Kolkata).
-    Converting to UTC first shifts that to 18:30 the *prior* day, causing
-    off-by-one date errors. We convert to IST first so the date component is
-    correct, then drop the tzinfo to produce naive timestamps.
-    """
     idx = pd.to_datetime(index)
     if hasattr(idx, "tz") and idx.tz is not None:
         idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
@@ -362,7 +348,7 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_nifty(period: str = "1y") -> pd.Series:
     try:
-        df    = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
+        df    = yf.Ticker("^CRSLDX").history(period=period, auto_adjust=True)
         nifty = df["Close"].rename("nifty")
         nifty.index = _strip_tz(pd.to_datetime(nifty.index))
         return nifty
@@ -532,6 +518,7 @@ def score_stock(
     # ── Decision Engine (4-score framework) ──────────────────────
     # Runs AFTER all existing logic; uses only already-computed BarResult fields.
     try:
+        from utils.decision_engine import compute_decision
         ds = compute_decision(r, settings or {})
         result.update({
             "Leadership":    ds.leadership,
@@ -574,10 +561,11 @@ def score_stock(
     except Exception:
         pass   # non-critical; existing columns still present
 
-    # ── Conviction Score v1 — disabled in live scan hot path for performance.
-    # Enable only in diagnostic/backtest pages where per-symbol latency is acceptable.
-    if False:  # noqa: SIM210  (kept for reference; re-enable in diagnostic only)
-      try:
+    # ── Conviction Score v1 (backtest-validated weights) ─────────
+    # Pure re-mapping of existing BarResult fields — zero new indicators.
+    # Produces: CV1_Leadership, CV1_Conviction, CV1_EntryQuality, CV1_SignalClass
+    # and all sub-score internals for the detail-view breakdown panel.
+    try:
         from utils.conviction_score_v1 import compute_conviction_v1
         cv1 = compute_conviction_v1(r)
         result.update({
@@ -609,7 +597,7 @@ def score_stock(
             "_cv1_eq_move":      cv1.eq_move_since_setup,
             "_cv1_eq_bars":      cv1.eq_bars_since_setup,
         })
-      except Exception:
+    except Exception:
         pass   # non-critical
 
     return result
@@ -648,8 +636,8 @@ def run_scanner(
             progress_cb(0.5 * (batch_i + 1) / n_batches)
 
     # ── Patch live prices (today's intraday bar) ──────────────────
-    # Only fetch symbols whose last bar predates today — avoids a full
-    # 500-symbol second download when the batch already has today's bar.
+    # FIX: only call _fetch_live_prices when today's bar is missing from the
+    # batch download (avoids a duplicate 500-symbol yf.download on most runs).
     try:
         from datetime import date as _date
         _today = pd.Timestamp(_date.today())

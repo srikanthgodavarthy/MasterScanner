@@ -88,7 +88,7 @@ def _fetch_bt_nifty(years: int = 3) -> pd.Series:
     try:
         end   = datetime.now(timezone.utc) + timedelta(days=1)
         start = end - timedelta(days=years * 365 + 10)
-        ndf   = yf.Ticker("^NSEI").history(
+        ndf   = yf.Ticker("^CRSLDX").history(
             start=start.strftime("%Y-%m-%d"),
             end=end.strftime("%Y-%m-%d"),
             auto_adjust=True,
