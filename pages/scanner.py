@@ -596,10 +596,10 @@ def _summary_cards(df: pd.DataFrame) -> str:
         return 0
 
     cards = [
-        ("Leadership",    _avg("CV1_Leadership"),   False, "Market relative strength"),
-        ("Conviction",    _avg("CV1_Conviction"),   False, "Likelihood to hit target"),
-        ("Entry Quality", _avg("CV1_EntryQuality"), False, "Good entry right now?"),
-        ("Extension",     _avg("Extension"),        True,  "Move already missed"),
+        ("Leadership",    _avg("Leadership"),    False, "Market relative strength"),
+        ("Conviction",    _avg("Conviction"),    False, "Likelihood to hit target"),
+        ("Entry Quality", _avg("EntryQuality"),  False, "Good entry right now?"),
+        ("Extension",     _avg("Extension"),     True,  "Move already missed"),
     ]
     html = '<div class="card-grid">'
     for title, val, invert, sub in cards:
@@ -657,17 +657,14 @@ _RENAME_MAP_FULL = {
     "TrendFresh":      "Fresh%",
     "FreshBase":       "Base🔥",
     "RR":              "R:R",
-    "Leadership":      "Leadership_DE",
-    "Conviction":      "Conviction_DE",
-    "EntryQuality":    "EntryQuality_DE",
+    "Leadership":      "Leadership",
+    "Conviction":      "Conviction",
+    "EntryQuality":    "Entry Quality",
     "LTP":             "CMP",          # last traded price from scanner → display as CMP
 }
 
 _RENAME_PRIMARY = {
     "CV1_SignalClass":   "Signal Class",
-    "CV1_Leadership":   "Leadership",
-    "CV1_Conviction":   "Conviction",
-    "CV1_EntryQuality": "Entry Quality",
     "RR":               "R:R",
 }
 
@@ -676,7 +673,7 @@ _DETAIL_EXTRA = [
     "Streak", "Age(bars)", "Fresh%", "Base🔥",
     "Composite", "Trend", "Momentum", "Structure", "Volume", "Quality",
     "ADX", "EMA Slope", "CCI",
-    "Category", "Stage", "Leadership_DE", "Conviction_DE", "EntryQuality_DE",
+    "Category", "Stage",
 ]
 
 # Primary column order for HTML table (v9: CMP added, R:R is CMP-based)
@@ -1134,7 +1131,7 @@ def render(settings: dict | None = None):
         if not has_cv1:
             return pd.DataFrame()
         return df_aug[df_aug["CV1_SignalClass"] == sc].sort_values(
-            "CV1_Leadership", ascending=False
+            "Leadership", ascending=False
         ).copy()
 
     elite_df   = _sc_df("ELITE")
