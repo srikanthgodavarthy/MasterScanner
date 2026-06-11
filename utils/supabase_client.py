@@ -548,6 +548,203 @@ def load_lifecycle_transitions(limit: int = 1000) -> pd.DataFrame:
 
 # ─── WATCHLIST ENRICHED ───────────────────────────────────────────────────────
 
+# ─── SETUP PLANS (frozen trade levels) ───────────────────────────────────────
+
+def upsert_setup_plan(plan_dict: dict) -> bool:
+    """
+    Persist (insert or update) one SetupPlan to the setup_plans table.
+
+    ``plan_dict`` should be the output of SetupPlan.to_db_dict().
+
+    Uses upsert on setup_id (PRIMARY KEY), so:
+      - New plans are inserted.
+      - Status changes (ACTIVE → INVALIDATED / EXPIRED) are updated.
+      - Frozen trade levels are NEVER overwritten once set (the DB trigger
+        keeps updated_at current, but entry_locked / sl_locked etc. are
+        only written on INSERT).
+
+    Returns True on success.
+    """
+    client = get_client()
+    if client is None or not plan_dict:
+        return False
+
+    def _safe(v):
+        if v is None:
+            return None
+        if isinstance(v, float) and (v != v):
+            return None
+        return v
+
+    row = {k: _safe(v) for k, v in plan_dict.items()}
+
+    try:
+        resp = (
+            client.table("setup_plans")
+            .upsert(row, on_conflict="setup_id")
+            .execute()
+        )
+        return resp.data is not None
+    except Exception as exc:
+        logger.error("upsert_setup_plan failed: %s", exc)
+        return False
+
+
+def upsert_setup_plans_batch(plans: list[dict]) -> bool:
+    """Persist a batch of SetupPlan dicts. Returns True if all batches succeeded."""
+    client = get_client()
+    if client is None or not plans:
+        return False
+
+    def _safe(v):
+        if v is None:
+            return None
+        if isinstance(v, float) and (v != v):
+            return None
+        return v
+
+    clean = [{k: _safe(v) for k, v in p.items()} for p in plans]
+
+    try:
+        batch_size = 200
+        for i in range(0, len(clean), batch_size):
+            resp = (
+                client.table("setup_plans")
+                .upsert(clean[i: i + batch_size], on_conflict="setup_id")
+                .execute()
+            )
+            if resp.data is None:
+                return False
+        return True
+    except Exception as exc:
+        logger.error("upsert_setup_plans_batch failed: %s", exc)
+        return False
+
+
+def load_active_setup_plans() -> dict:
+    """
+    Return all ACTIVE setup plans as a dict: {symbol: SetupPlan}.
+    Called once at the start of each scanner run to seed the in-memory cache.
+    """
+    from utils.setup_persistence import SetupPlan, SetupPlanStatus
+
+    client = get_client()
+    if client is None:
+        return {}
+
+    try:
+        resp = (
+            client.table("setup_plans")
+            .select("*")
+            .eq("status", "ACTIVE")
+            .execute()
+        )
+        if not resp.data:
+            return {}
+
+        result = {}
+        for row in resp.data:
+            plan = SetupPlan(
+                setup_id               = row.get("setup_id",               ""),
+                symbol                 = row.get("symbol",                 ""),
+                first_seen_date        = str(row.get("first_seen_date",    "")),
+                first_actionable_date  = str(row.get("first_actionable_date", "")),
+                entry_locked           = float(row.get("entry_locked",     0) or 0),
+                sl_locked              = float(row.get("sl_locked",        0) or 0),
+                t1_locked              = float(row.get("t1_locked",        0) or 0),
+                t2_locked              = float(row.get("t2_locked",        0) or 0),
+                t3_locked              = float(row.get("t3_locked",        0) or 0),
+                locked_category        = row.get("locked_category",        ""),
+                locked_rr              = float(row.get("locked_rr",        0) or 0),
+                locked_leadership      = int(row.get("locked_leadership",  0) or 0),
+                locked_conviction      = int(row.get("locked_conviction",  0) or 0),
+                locked_entry_quality   = int(row.get("locked_entry_quality",0) or 0),
+                locked_extension       = int(row.get("locked_extension",   0) or 0),
+                status                 = row.get("status", SetupPlanStatus.ACTIVE),
+                invalidation_reason    = row.get("invalidation_reason",    ""),
+                invalidated_date       = str(row.get("invalidated_date",   "") or ""),
+            )
+            result[plan.symbol] = plan
+        return result
+    except Exception as exc:
+        logger.error("load_active_setup_plans failed: %s", exc)
+        return {}
+
+
+def load_all_setup_plans(limit: int = 500) -> "pd.DataFrame":
+    """
+    Return all setup plans (any status) as a DataFrame for history/audit views.
+    Ordered by first_actionable_date descending.
+    """
+    client = get_client()
+    if client is None:
+        return pd.DataFrame()
+
+    try:
+        resp = (
+            client.table("setup_plans")
+            .select("*")
+            .order("first_actionable_date", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        if not resp.data:
+            return pd.DataFrame()
+        return pd.DataFrame(resp.data)
+    except Exception as exc:
+        logger.error("load_all_setup_plans failed: %s", exc)
+        return pd.DataFrame()
+
+
+def load_setup_plan(symbol: str) -> "Optional[object]":
+    """
+    Return the most-recent setup plan for a single symbol (any status).
+    Returns a SetupPlan dataclass or None.
+    """
+    from utils.setup_persistence import SetupPlan, SetupPlanStatus
+
+    client = get_client()
+    if client is None:
+        return None
+
+    try:
+        resp = (
+            client.table("setup_plans")
+            .select("*")
+            .eq("symbol", symbol.upper().strip())
+            .order("first_actionable_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not resp.data:
+            return None
+
+        row = resp.data[0]
+        return SetupPlan(
+            setup_id               = row.get("setup_id",               ""),
+            symbol                 = row.get("symbol",                 ""),
+            first_seen_date        = str(row.get("first_seen_date",    "")),
+            first_actionable_date  = str(row.get("first_actionable_date", "")),
+            entry_locked           = float(row.get("entry_locked",     0) or 0),
+            sl_locked              = float(row.get("sl_locked",        0) or 0),
+            t1_locked              = float(row.get("t1_locked",        0) or 0),
+            t2_locked              = float(row.get("t2_locked",        0) or 0),
+            t3_locked              = float(row.get("t3_locked",        0) or 0),
+            locked_category        = row.get("locked_category",        ""),
+            locked_rr              = float(row.get("locked_rr",        0) or 0),
+            locked_leadership      = int(row.get("locked_leadership",  0) or 0),
+            locked_conviction      = int(row.get("locked_conviction",  0) or 0),
+            locked_entry_quality   = int(row.get("locked_entry_quality",0) or 0),
+            locked_extension       = int(row.get("locked_extension",   0) or 0),
+            status                 = row.get("status", SetupPlanStatus.ACTIVE),
+            invalidation_reason    = row.get("invalidation_reason",    ""),
+            invalidated_date       = str(row.get("invalidated_date",   "") or ""),
+        )
+    except Exception as exc:
+        logger.error("load_setup_plan failed for %s: %s", symbol, exc)
+        return None
+
+
 def load_watchlist_enriched(lc_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Return the watchlist joined with the latest lifecycle state for each symbol.
@@ -677,4 +874,36 @@ CREATE TABLE IF NOT EXISTS lifecycle_transitions (
 );
 CREATE INDEX IF NOT EXISTS idx_lifecycle_transitions_symbol  ON lifecycle_transitions(symbol);
 CREATE INDEX IF NOT EXISTS idx_lifecycle_transitions_to_date ON lifecycle_transitions(to_date DESC);
+"""
+
+
+# Append setup_plans SQL to the canonical SCHEMA_SQL for easy copy-paste
+SCHEMA_SQL += """
+-- 7. Setup Plans — frozen trade levels (entry/SL/targets locked on first Actionable)
+--    Run this in Supabase SQL Editor after the tables above.
+CREATE TABLE IF NOT EXISTS setup_plans (
+    setup_id               text        PRIMARY KEY,
+    symbol                 text        NOT NULL,
+    first_seen_date        date        NOT NULL,
+    first_actionable_date  date        NOT NULL,
+    entry_locked           numeric(12,2) NOT NULL DEFAULT 0,
+    sl_locked              numeric(12,2) NOT NULL DEFAULT 0,
+    t1_locked              numeric(12,2) NOT NULL DEFAULT 0,
+    t2_locked              numeric(12,2) NOT NULL DEFAULT 0,
+    t3_locked              numeric(12,2) NOT NULL DEFAULT 0,
+    locked_category        text        NOT NULL DEFAULT '',
+    locked_rr              numeric(8,4) NOT NULL DEFAULT 0,
+    locked_leadership      integer     NOT NULL DEFAULT 0,
+    locked_conviction      integer     NOT NULL DEFAULT 0,
+    locked_entry_quality   integer     NOT NULL DEFAULT 0,
+    locked_extension       integer     NOT NULL DEFAULT 0,
+    status                 text        NOT NULL DEFAULT 'ACTIVE',
+    invalidation_reason    text        NOT NULL DEFAULT '',
+    invalidated_date       date,
+    created_at             timestamptz NOT NULL DEFAULT now(),
+    updated_at             timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_setup_plans_symbol ON setup_plans(symbol);
+CREATE INDEX IF NOT EXISTS idx_setup_plans_status ON setup_plans(status);
+CREATE INDEX IF NOT EXISTS idx_setup_plans_date   ON setup_plans(first_actionable_date DESC);
 """
