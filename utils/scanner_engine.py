@@ -609,7 +609,7 @@ def score_stock(
             "_cv1_eq_move":      cv1.eq_move_since_setup,
             "_cv1_eq_bars":      cv1.eq_bars_since_setup,
         })
-    except Exception:
+      except Exception:
         pass   # non-critical
 
     return result
