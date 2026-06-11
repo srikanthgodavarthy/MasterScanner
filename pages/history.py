@@ -500,11 +500,23 @@ def render():
                 ]
     
                 if not matrix.empty:
-                    # Render as heatmap using native st.dataframe with background
+                    # Render as heatmap — no matplotlib dependency
                     max_val = matrix.values.max() if matrix.values.max() > 0 else 1
-                    styled  = matrix.style.background_gradient(
-                        cmap="YlGn", vmin=0, vmax=max_val
-                    ).format("{:.0f}")
+
+                    def _green_gradient(col):
+                        styles = []
+                        for val in col:
+                            intensity = int(val / max_val * 200)
+                            r = 255 - intensity
+                            g = 255
+                            b = 255 - intensity
+                            text = "#000" if intensity < 120 else "#000"
+                            styles.append(
+                                f"background-color: rgb({r},{g},{b}); color: {text};"
+                            )
+                        return styles
+
+                    styled = matrix.style.apply(_green_gradient, axis=0).format("{:.0f}")
                     st.dataframe(styled, use_container_width=True)
                     st.caption("Rows = from-stage · Columns = to-stage")
     
