@@ -676,7 +676,7 @@ def _classify_category_with_settings(
     mc   = thresholds["min_conv"]
     emx  = thresholds["ext_max_actionable"]
 
-    if extension >= 60 - thresholds["ext_adj"] or stage == "EXTENDED":
+    if extension >= 60 + thresholds["ext_adj"] or stage == "EXTENDED":
         return "Extended"
 
     if stage == "AVOID" or leadership < max(50, 50 + sa):
