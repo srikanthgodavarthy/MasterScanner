@@ -373,13 +373,38 @@ _CSS = """
 }
 
 /* ── Tooltip triggers ── */
-/* Tooltip trigger styling — applies to elements in iframe doc */
+/* All tooltip logic is JS-driven (floating #ms-tip div at document level).
+   No position:absolute inside overflow:hidden — tooltips are never clipped. */
 [data-tip-title] { cursor: help; }
 .tip-underline {
   border-bottom: 1px dashed rgba(255,255,255,0.25);
   cursor: help;
 }
-/* #ms-tip styles + div are injected into window.parent.document by _TOOLTIP_JS */
+/* The floating tooltip div is injected once by _TOOLTIP_JS below */
+#ms-tip {
+  position: fixed;
+  z-index: 999999;
+  pointer-events: none;
+  max-width: 270px;
+  background: #1c2333;
+  border: 1px solid rgba(255,255,255,0.16);
+  border-radius: 7px;
+  padding: 10px 13px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.70rem;
+  color: #e6edf3;
+  line-height: 1.6;
+  box-shadow: 0 8px 28px rgba(0,0,0,0.65);
+  display: none;
+}
+#ms-tip .tip-title {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #f5c542;
+  margin-bottom: 6px;
+  letter-spacing: 0.05em;
+  display: block;
+}
 
 /* ── Breakdown panel ── */
 .breakdown-row {
@@ -404,56 +429,30 @@ _CSS = """
 """
 
 # ── TOOLTIP JS ────────────────────────────────────────────────────
-# Injected once per table render.
-# The tooltip div is appended to window.parent.document.body so it escapes
-# Streamlit's sandboxed iframe and renders at the true browser viewport level.
-# Mouse events are also listened on the parent document so clientX/Y match
-# the fixed-position coordinates of the tooltip div.
+# Injected once per table render. Creates a single #ms-tip div at body level,
+# so it is never clipped by .rt-wrap's overflow:hidden/auto.
+# Triggers: any element with data-tip-title attribute.
 _TOOLTIP_JS = """
+<div id="ms-tip"><span class="tip-title" id="ms-tip-title"></span><span id="ms-tip-body"></span></div>
 <script>
 (function(){
-  // Target the parent (Streamlit host) document so position:fixed works
-  // relative to the real viewport, not the iframe's clipped viewport.
-  var P   = window.parent;
-  var doc = P.document;
-
-  if(P._msTipInit) return;
-  P._msTipInit = true;
-
-  // Inject tooltip div + styles into parent <head> once
-  var style = doc.createElement('style');
-  style.textContent = [
-    '#ms-tip{position:fixed;z-index:999999;pointer-events:none;max-width:270px;',
-    'background:#1c2333;border:1px solid rgba(255,255,255,0.16);border-radius:7px;',
-    'padding:10px 13px;font-family:"JetBrains Mono","Fira Code",monospace;',
-    'font-size:0.70rem;color:#e6edf3;line-height:1.6;',
-    'box-shadow:0 8px 28px rgba(0,0,0,0.65);display:none;}',
-    '#ms-tip .tip-title{font-size:0.72rem;font-weight:700;color:#f5c542;',
-    'margin-bottom:6px;letter-spacing:0.05em;display:block;}'
-  ].join('');
-  doc.head.appendChild(style);
-
-  var tip = doc.createElement('div');
-  tip.id = 'ms-tip';
-  tip.innerHTML = '<span class="tip-title" id="ms-tip-title"></span><span id="ms-tip-body"></span>';
-  doc.body.appendChild(tip);
-
-  var ttl   = doc.getElementById('ms-tip-title');
-  var tbody = doc.getElementById('ms-tip-body');
+  if(window._msTipInit) return;
+  window._msTipInit = true;
+  var tip   = document.getElementById('ms-tip');
+  var ttl   = document.getElementById('ms-tip-title');
+  var tbody = document.getElementById('ms-tip-body');
   var PAD   = 14;
-
-  // Listen on the parent document — mouse coords are in parent viewport space
-  doc.addEventListener('mouseover', function(e){
+  document.addEventListener('mouseover', function(e){
     var el = e.target.closest('[data-tip-title]');
     if(!el){ tip.style.display='none'; return; }
-    ttl.textContent = el.getAttribute('data-tip-title') || '';
-    tbody.innerHTML = (el.getAttribute('data-tip-body') || '').replace(/\\n/g,'<br>');
+    ttl.textContent   = el.getAttribute('data-tip-title') || '';
+    tbody.innerHTML   = (el.getAttribute('data-tip-body') || '').replace(/\\n/g,'<br>');
     tip.style.display = 'block';
   });
-  doc.addEventListener('mousemove', function(e){
+  document.addEventListener('mousemove', function(e){
     if(tip.style.display==='none') return;
     var tw = tip.offsetWidth, th = tip.offsetHeight;
-    var vw = P.innerWidth,  vh = P.innerHeight;
+    var vw = window.innerWidth,  vh = window.innerHeight;
     var x  = e.clientX + PAD;
     var y  = e.clientY + PAD;
     if(x + tw > vw - 4) x = e.clientX - tw - PAD;
@@ -461,7 +460,7 @@ _TOOLTIP_JS = """
     tip.style.left = x + 'px';
     tip.style.top  = y + 'px';
   });
-  doc.addEventListener('mouseout', function(e){
+  document.addEventListener('mouseout', function(e){
     if(!e.target.closest('[data-tip-title]')) tip.style.display='none';
   });
 })();
@@ -596,10 +595,10 @@ def _summary_cards(df: pd.DataFrame) -> str:
         return 0
 
     cards = [
-        ("Leadership",    _avg("Leadership"),    False, "Market relative strength"),
-        ("Conviction",    _avg("Conviction"),    False, "Likelihood to hit target"),
-        ("Entry Quality", _avg("EntryQuality"),  False, "Good entry right now?"),
-        ("Extension",     _avg("Extension"),     True,  "Move already missed"),
+        ("Leadership",    _avg("CV1_Leadership"),   False, "Market relative strength"),
+        ("Conviction",    _avg("CV1_Conviction"),   False, "Likelihood to hit target"),
+        ("Entry Quality", _avg("CV1_EntryQuality"), False, "Good entry right now?"),
+        ("Extension",     _avg("Extension"),        True,  "Move already missed"),
     ]
     html = '<div class="card-grid">'
     for title, val, invert, sub in cards:
@@ -657,14 +656,17 @@ _RENAME_MAP_FULL = {
     "TrendFresh":      "Fresh%",
     "FreshBase":       "Base🔥",
     "RR":              "R:R",
-    "Leadership":      "Leadership",
-    "Conviction":      "Conviction",
-    "EntryQuality":    "Entry Quality",
+    "Leadership":      "Leadership_DE",
+    "Conviction":      "Conviction_DE",
+    "EntryQuality":    "EntryQuality_DE",
     "LTP":             "CMP",          # last traded price from scanner → display as CMP
 }
 
 _RENAME_PRIMARY = {
     "CV1_SignalClass":   "Signal Class",
+    "CV1_Leadership":   "Leadership",
+    "CV1_Conviction":   "Conviction",
+    "CV1_EntryQuality": "Entry Quality",
     "RR":               "R:R",
 }
 
@@ -673,7 +675,7 @@ _DETAIL_EXTRA = [
     "Streak", "Age(bars)", "Fresh%", "Base🔥",
     "Composite", "Trend", "Momentum", "Structure", "Volume", "Quality",
     "ADX", "EMA Slope", "CCI",
-    "Category", "Stage",
+    "Category", "Stage", "Leadership_DE", "Conviction_DE", "EntryQuality_DE",
 ]
 
 # Primary column order for HTML table (v9: CMP added, R:R is CMP-based)
@@ -1131,7 +1133,7 @@ def render(settings: dict | None = None):
         if not has_cv1:
             return pd.DataFrame()
         return df_aug[df_aug["CV1_SignalClass"] == sc].sort_values(
-            "Leadership", ascending=False
+            "CV1_Leadership", ascending=False
         ).copy()
 
     elite_df   = _sc_df("ELITE")
