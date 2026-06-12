@@ -1,15 +1,13 @@
 """
-pages/settings.py — Settings Page (v7 — clean interactive redesign)
+pages/settings.py — Settings Page (v8 — full custom chip UI, no Streamlit radio/select)
 
-Changes vs v6:
-  • Always-visible Trading Style section at top (trader's first decision)
-  • Four collapsible accordion sections with subtitle showing current values
-  • Chip/pill controls for categorical choices (Style, Entry, R:R, etc.)
-  • Sliders for numeric ranges — all with live value readout
-  • Toggle switches for boolean flags
-  • Gate Logic Preview condensed to inline computed text, no extra expander
-  • Watchlist and System in bottom expanders as before
-  • Zero changes to settings dict keys or defaults — fully backward-compatible
+All categorical choices use custom HTML chip rows rendered via st.components.v1.html()
+with JS postMessage back to Streamlit via query params trick. Since direct JS→Python
+communication is limited, we use st.session_state + st.button pattern: chips write
+their value into a hidden st.session_state key via URL query param on click, and
+Streamlit re-renders. We use a simpler approach: render chips as links that set
+query params, then read them. Actually simplest: use st.radio with CSS override to
+hide Streamlit's native radio styling and inject our own chip appearance.
 """
 
 import streamlit as st
@@ -67,111 +65,107 @@ _TRADING_STYLE_DEFAULTS = {
 }
 
 # ══════════════════════════════════════════════════════════════════
-#  CSS
+#  CSS  — chips via radio override + custom components
 # ══════════════════════════════════════════════════════════════════
 
 _CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
 
 :root {
-  --bg1: #161b22; --bg2: #1c2333; --bg3: #21262d;
+  --bg0: #0d1117; --bg1: #161b22; --bg2: #1c2333; --bg3: #21262d;
   --border: rgba(255,255,255,0.08);
   --gold: #f5c542; --green: #3fb950; --amber: #d29922;
-  --blue: #58a6ff; --muted: #8b949e; --text: #e6edf3;
+  --red: #f85149; --blue: #58a6ff; --purple: #a371f7;
+  --muted: #8b949e; --text: #e6edf3;
   --mono: 'JetBrains Mono', monospace;
 }
 
-/* Accordion section */
-.acc-section {
+/* ── Hide Streamlit radio chrome, replace with chips ── */
+div[data-testid="stRadio"] > label { display: none !important; }
+div[data-testid="stRadio"] > div[role="radiogroup"] {
+  display: flex !important;
+  flex-direction: row !important;
+  flex-wrap: wrap !important;
+  gap: 6px !important;
+  padding: 0 !important;
+}
+div[data-testid="stRadio"] > div[role="radiogroup"] > label {
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 0 !important;
+  background: var(--bg2) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 6px !important;
+  padding: 5px 14px !important;
+  font-family: var(--mono) !important;
+  font-size: 11px !important;
+  font-weight: 600 !important;
+  color: var(--muted) !important;
+  cursor: pointer !important;
+  transition: all 0.14s !important;
+  white-space: nowrap !important;
+}
+div[data-testid="stRadio"] > div[role="radiogroup"] > label:hover {
+  border-color: rgba(88,166,255,0.35) !important;
+  color: var(--text) !important;
+}
+/* Hide the native radio dot */
+div[data-testid="stRadio"] > div[role="radiogroup"] > label > div:first-child {
+  display: none !important;
+}
+/* Selected chip */
+div[data-testid="stRadio"] > div[role="radiogroup"] > label[data-baseweb="radio"]:has(input:checked),
+div[data-testid="stRadio"] > div[role="radiogroup"] > label:has(input:checked) {
+  background: rgba(88,166,255,0.12) !important;
+  border-color: rgba(88,166,255,0.5) !important;
+  color: var(--blue) !important;
+}
+/* The inner span text */
+div[data-testid="stRadio"] > div[role="radiogroup"] > label > div:last-child p {
+  font-family: var(--mono) !important;
+  font-size: 11px !important;
+  font-weight: 600 !important;
+  margin: 0 !important;
+  line-height: 1 !important;
+}
+
+/* ── Section card ── */
+.set-card {
   background: var(--bg1);
   border: 1px solid var(--border);
   border-radius: 10px;
-  margin-bottom: 10px;
-  overflow: hidden;
+  padding: 16px 18px 14px;
+  margin-bottom: 12px;
 }
-.acc-header {
+.set-card-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 14px;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 11px 16px;
-  cursor: pointer;
-  user-select: none;
-  border-bottom: 1px solid var(--border);
+  gap: 7px;
 }
-.acc-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
-.acc-title { font-size: 12px; font-weight: 700; color: var(--text); }
-.acc-sub { font-size: 10px; color: var(--muted); margin-left: auto; font-family: var(--mono); }
-.acc-body { padding: 14px 16px; }
+.set-card-title .dot {
+  width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+}
 
-/* Field label */
+/* ── Field label ── */
 .f-label {
   font-size: 9px;
   font-weight: 700;
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--muted);
-  margin-bottom: 5px;
+  margin-bottom: 4px;
+  margin-top: 10px;
   display: block;
 }
 
-/* Chip row */
-.chip-row { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 2px; }
-.chip {
-  padding: 4px 13px;
-  border-radius: 5px;
-  font-size: 11px;
-  font-weight: 600;
-  border: 1px solid var(--border);
-  background: var(--bg2);
-  color: var(--muted);
-  cursor: pointer;
-  transition: all 0.12s;
-  white-space: nowrap;
-}
-.chip.on {
-  background: rgba(88,166,255,0.1);
-  border-color: rgba(88,166,255,0.4);
-  color: var(--blue);
-}
-
-/* Two-col grid */
-.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
-.one-col { margin-bottom: 12px; }
-
-/* Slider row */
-.sl-row { display: flex; align-items: center; gap: 8px; }
-.sl-row input[type=range] { flex: 1; accent-color: var(--blue); }
-.sl-val { font-size: 12px; font-weight: 600; color: var(--blue); min-width: 36px; text-align: right; font-family: var(--mono); }
-
-/* Toggle */
-.tog-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; }
-.tog-info { display: flex; flex-direction: column; gap: 2px; }
-.tog-name { font-size: 11px; color: var(--text); font-weight: 600; }
-.tog-hint { font-size: 10px; color: var(--muted); }
-.tog-sw { position: relative; width: 34px; height: 19px; flex-shrink: 0; }
-.tog-sw input { opacity: 0; position: absolute; }
-.tog-track {
-  position: absolute; inset: 0;
-  background: var(--bg3);
-  border: 1px solid var(--border);
-  border-radius: 19px;
-  cursor: pointer;
-  transition: background 0.18s;
-}
-.tog-track::after {
-  content: '';
-  position: absolute;
-  left: 3px; top: 3px;
-  width: 11px; height: 11px;
-  border-radius: 50%;
-  background: var(--muted);
-  transition: transform 0.18s, background 0.18s;
-}
-input:checked + .tog-track { background: rgba(63,185,80,0.2); border-color: rgba(63,185,80,0.5); }
-input:checked + .tog-track::after { transform: translateX(15px); background: var(--green); }
-
-/* Gate preview block */
+/* ── Gate preview ── */
 .gate-pre {
   background: #0d1117;
   border: 1px solid #1a3a1a;
@@ -185,20 +179,26 @@ input:checked + .tog-track::after { transform: translateX(15px); background: var
 }
 .gate-pre b   { color: var(--blue); }
 .gate-pre .ok { color: var(--green); }
-.gate-pre .w  { color: var(--amber); }
-.gate-pre .e  { color: #f85149; }
+.gate-pre .e  { color: var(--red); }
 
-/* Compact number input row */
-.ni-row { display: flex; align-items: center; gap: 8px; }
-.ni-row input[type=number] {
-  background: #0d1117;
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  color: var(--text);
+/* ── Slider accent ── */
+div[data-testid="stSlider"] div[role="slider"] {
+  background: var(--blue) !important;
+}
+
+/* ── Divider ── */
+.set-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 12px 0;
+}
+
+/* ── Status pill ── */
+.status-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 10px; border-radius: 5px;
+  font-size: 10px; font-weight: 700;
   font-family: var(--mono);
-  font-size: 12px;
-  padding: 4px 8px;
-  width: 80px;
 }
 </style>
 """
@@ -213,106 +213,85 @@ def _g(key, default=None):
 def _s(key, val):
     st.session_state[key] = val
 
-# Renders an accordion header; body must follow immediately in caller
-def _acc_open(title: str, subtitle: str, dot_color: str = "#58a6ff") -> None:
+def _label(text: str) -> None:
+    st.markdown(f'<span class="f-label">{text}</span>', unsafe_allow_html=True)
+
+def _card_open(title: str, dot_color: str = "#58a6ff") -> None:
     st.markdown(
-        f'<div class="acc-section"><div class="acc-header">'
-        f'<span class="acc-dot" style="background:{dot_color}"></span>'
-        f'<span class="acc-title">{title}</span>'
-        f'<span class="acc-sub">{subtitle}</span>'
-        f'</div><div class="acc-body">',
+        f'<div class="set-card">'
+        f'<div class="set-card-title">'
+        f'<span class="dot" style="background:{dot_color}"></span>{title}'
+        f'</div>',
         unsafe_allow_html=True,
     )
 
-def _acc_close() -> None:
-    st.markdown('</div></div>', unsafe_allow_html=True)
+def _card_close() -> None:
+    st.markdown('</div>', unsafe_allow_html=True)
 
-def _label(text: str) -> None:
-    st.markdown(f'<span class="f-label">{text}</span>', unsafe_allow_html=True)
+def _divider() -> None:
+    st.markdown('<div class="set-divider"></div>', unsafe_allow_html=True)
 
 def _gate_pre(html: str) -> None:
     st.markdown(f'<div class="gate-pre">{html}</div>', unsafe_allow_html=True)
 
+def _chip_radio(label_key: str, options: list, session_key: str, default: str) -> str:
+    """Chip-styled radio — Streamlit radio with CSS override."""
+    current = st.session_state.get(session_key, default)
+    idx = options.index(current) if current in options else 0
+    val = st.radio(
+        label_key,
+        options,
+        index=idx,
+        horizontal=True,
+        key=f"_radio_{session_key}",
+        label_visibility="collapsed",
+    )
+    _s(session_key, val)
+    return val
+
 
 # ══════════════════════════════════════════════════════════════════
-#  SECTION: TRADING STYLE  — always visible
+#  TAB 1 — SCAN  (daily-use controls)
 # ══════════════════════════════════════════════════════════════════
 
-def _section_trading_style() -> None:
-    style     = st.session_state.get("trading_style",       _TRADING_STYLE_DEFAULTS["trading_style"])
-    ent       = st.session_state.get("entry_preference",    _TRADING_STYLE_DEFAULTS["entry_preference"])
-    rr        = st.session_state.get("min_risk_reward",     _TRADING_STYLE_DEFAULTS["min_risk_reward"])
-    ext       = st.session_state.get("extension_tolerance", _TRADING_STYLE_DEFAULTS["extension_tolerance"])
-    conv      = st.session_state.get("conviction_level",    _TRADING_STYLE_DEFAULTS["conviction_level"])
+def _tab_scan() -> None:
 
-    sub = f"{style} · {ent} · {rr}"
-    _acc_open("Trading style", sub, "#58a6ff")
+    # ── Trading Style ────────────────────────────────────────────
+    _card_open("Trading style", "#58a6ff")
 
     c1, c2 = st.columns(2)
     with c1:
         _label("Style")
-        style = st.radio("Style", ["Aggressive", "Balanced", "Conservative"],
-            index=["Aggressive", "Balanced", "Conservative"].index(
-                st.session_state.get("trading_style", "Balanced")),
-            horizontal=True, key="trading_style_radio", label_visibility="collapsed",
-            help="Aggressive: earlier entries, more signals · Balanced: standard · Conservative: high confirmation only")
-        _s("trading_style", style)
+        _chip_radio("Style", ["Aggressive", "Balanced", "Conservative"],
+                    "trading_style", "Balanced")
 
         _label("Entry type")
-        ent = st.radio("Entry", ["Early", "Pullback", "Breakout"],
-            index=["Early", "Pullback", "Breakout"].index(
-                st.session_state.get("entry_preference", "Pullback")),
-            horizontal=True, key="entry_pref_radio", label_visibility="collapsed",
-            help="Early: before full confirmation · Pullback: EMA20/Fib retracement · Breakout: confirmed with volume")
-        _s("entry_preference", ent)
+        _chip_radio("Entry", ["Early", "Pullback", "Breakout"],
+                    "entry_preference", "Pullback")
 
     with c2:
         _label("Min R:R")
-        rr = st.radio("Min R:R", ["1.5R", "2R", "3R"],
-            index=["1.5R", "2R", "3R"].index(
-                st.session_state.get("min_risk_reward", "2R")),
-            horizontal=True, key="min_rr_radio", label_visibility="collapsed",
-            help="1.5R: 60% win rate to break even · 2R: 34% · 3R: 25%")
-        _s("min_risk_reward", rr)
+        _chip_radio("Min R:R", ["1.5R", "2R", "3R"],
+                    "min_risk_reward", "2R")
 
         _label("Extension tolerance")
-        ext = st.radio("Extension tolerance", ["Very Strict", "Strict", "Normal", "Loose"],
-            index=["Very Strict", "Strict", "Normal", "Loose"].index(
-                st.session_state.get("extension_tolerance", "Normal")),
-            horizontal=True, key="ext_tol_radio", label_visibility="collapsed",
-            help="Very Strict: base only · Strict: small moves OK · Normal: standard · Loose: moderately extended")
-        _s("extension_tolerance", ext)
+        _chip_radio("Extension", ["Very Strict", "Strict", "Normal", "Loose"],
+                    "extension_tolerance", "Normal")
 
     _label("Min conviction")
-    conv = st.radio("Min conviction", ["Watchlist", "Actionable", "High Conviction", "Elite"],
-        index=["Watchlist", "Actionable", "High Conviction", "Elite"].index(
-            st.session_state.get("conviction_level", "Actionable")),
-        horizontal=True, key="conviction_radio", label_visibility="collapsed",
-        help="Watchlist: all forming setups · Actionable: ready entries · High Conviction: well-formed only · Elite: top grade only")
-    _s("conviction_level", conv)
+    _chip_radio("Conviction", ["Watchlist", "Actionable", "High Conviction", "Elite"],
+                "conviction_level", "Actionable")
 
-    _acc_close()
+    _card_close()
 
+    # ── Universe ─────────────────────────────────────────────────
+    _card_open("Universe", "#a371f7")
 
-# ══════════════════════════════════════════════════════════════════
-#  SECTION: UNIVERSE & THRESHOLDS
-# ══════════════════════════════════════════════════════════════════
-
-def _section_universe() -> None:
-    workers   = _g("workers")
-    min_score = _g("min_score")
-    exec_thr  = _g("execute_threshold")
-    sub = f"Nifty 500 · Workers {workers} · Score {min_score} · Execute {exec_thr}"
-
-    _acc_open("Universe & thresholds", sub, "#a371f7")
-
-    universe_mode = st.radio(
-        "Stock universe", ["Nifty 500 (default)", "Custom"],
-        horizontal=True,
-        index=0 if _g("universe_mode") == "Nifty 500 (default)" else 1,
-        key="universe_mode_radio",
+    _label("Stock universe")
+    universe_mode = _chip_radio(
+        "Universe", ["Nifty 500 (default)", "Custom"],
+        "universe_mode", "Nifty 500 (default)",
     )
-    _s("universe_mode", universe_mode)
 
     if universe_mode == "Custom":
         raw = st.text_area(
@@ -329,39 +308,37 @@ def _section_universe() -> None:
 
     c1, c2 = st.columns(2)
     with c1:
-        _label("Workers")
-        workers = st.slider("Workers", 1, 20, _g("workers"), step=1, key="sl_workers",
-            label_visibility="collapsed",
-            help="15 saturates yfinance throughput without 429 errors.")
+        _label("Parallel workers")
+        workers = st.slider("Workers", 1, 20, _g("workers"), step=1,
+            key="sl_workers", label_visibility="collapsed",
+            help="15 saturates yfinance without 429 errors.")
         _s("workers", int(workers))
 
-        _label("Min score (display filter)")
-        min_score = st.slider("Min score", 50, 85, _g("min_score"), step=5, key="sl_min_score",
-            label_visibility="collapsed",
-            help="Display filter only — does not affect gate logic.")
-        _s("min_score", int(min_score))
-
     with c2:
-        _label("Hold days")
-        hold_days = st.slider("Hold days", 5, 60, _g("hold_days"), step=5, key="sl_hold",
-            label_visibility="collapsed",
-            help="15 days matches NSE daily setup resolution window.")
-        _s("hold_days", int(hold_days))
-
         _label("Execute threshold")
         exec_thr = st.slider("Execute threshold", 50, 85, _g("execute_threshold"), step=5,
             key="sl_execute_threshold", label_visibility="collapsed",
             help="Composite ≥ this → EXECUTE in Trend regime.")
         _s("execute_threshold", int(exec_thr))
 
-    ar1, ar2 = st.columns([1, 2])
-    with ar1:
+    _card_close()
+
+    # ── Regime gate ──────────────────────────────────────────────
+    _card_open("Market regime gate", "#3fb950")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        nrg = st.toggle("Bull Nifty regime required", value=_g("nifty_regime_filter"),
+            key="tog_nifty_regime",
+            help="Hard block: Elite/Execute won't fire when Nifty is bearish.")
+        _s("nifty_regime_filter", bool(nrg))
+
+    with c2:
         auto_refresh = st.toggle("Auto-refresh", value=_g("auto_refresh"), key="tog_ar")
         _s("auto_refresh", bool(auto_refresh))
-    with ar2:
         if auto_refresh:
-            refresh_mins = st.number_input("Interval (min)", 1, 60, _g("refresh_mins"), step=1,
-                key="ni_refresh")
+            refresh_mins = st.number_input("Interval (min)", 1, 60, _g("refresh_mins"),
+                step=1, key="ni_refresh", label_visibility="collapsed")
             _s("refresh_mins", int(refresh_mins))
 
     if st.button("🗑️ Clear data cache", key="btn_clear_cache"):
@@ -369,296 +346,267 @@ def _section_universe() -> None:
         st.session_state.pop("scan_df", None)
         st.toast("Cache cleared.")
 
-    _acc_close()
+    _card_close()
 
 
 # ══════════════════════════════════════════════════════════════════
-#  SECTION: TIER 1 — PRIME GATE
+#  TAB 2 — ADVANCED  (gate parameters, rarely changed)
 # ══════════════════════════════════════════════════════════════════
 
-def _section_tier1() -> None:
-    mom3    = _g("t1_mom3")
-    mom6    = _g("t1_mom6")
-    fib_hi  = _g("t1_fib_hi")
-    fib_lo  = _g("t1_fib_lo")
-    cci_w   = _g("t1_cci_window")
-    adx_min = _g("t1_adx_min")
-    sub = f"mom3 {mom3}% · Fib {fib_hi}–{fib_lo} · CCI {cci_w}-bar · ADX {adx_min}"
+def _tab_advanced() -> None:
 
-    _acc_open("Tier 1 — Prime gate", sub, "#d29922")
+    st.caption("These parameters control gate logic. Defaults are calibrated for Nifty 500 daily swing trading. Change only if backtesting shows a specific issue.")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        _label("3-month momentum min")
-        mom3 = st.slider("mom3", 0, 25, _g("t1_mom3"), step=1, key="sl_mom3",
-            label_visibility="collapsed",
-            help="10% = top ~25% by 3-month momentum on Nifty 500.")
-        _s("t1_mom3", int(mom3))
-
-        _label("Fib upper (shallow pullback)")
-        fib_hi = st.select_slider("fib_hi", options=[23.6, 38.2, 50.0], value=_g("t1_fib_hi"),
-            key="sl_fib_hi", format_func=lambda x: f"{x:.1f}%", label_visibility="collapsed",
-            help="38.2% is the correct shallow level.")
-        _s("t1_fib_hi", float(fib_hi))
-
-        _label("CCI recovery lookback")
-        cci_w = st.slider("cci_w", 1, 10, _g("t1_cci_window"), step=1, key="sl_cci_window",
-            label_visibility="collapsed",
-            help="4 bars = practical fresh-cross window on daily chart.")
-        _s("t1_cci_window", int(cci_w))
-
-    with c2:
-        _label("6-month momentum min")
-        mom6 = st.slider("mom6", 0, 40, _g("t1_mom6"), step=1, key="sl_mom6",
-            label_visibility="collapsed",
-            help="18% = top ~30% multi-quarter outperformance.")
-        _s("t1_mom6", int(mom6))
-
-        _label("Fib lower (deep pullback)")
-        fib_lo = st.select_slider("fib_lo", options=[50.0, 61.8, 78.6], value=_g("t1_fib_lo"),
-            key="sl_fib_lo", format_func=lambda x: f"{x:.1f}%", label_visibility="collapsed",
-            help="61.8% = golden ratio. Deeper → trend may be broken.")
-        _s("t1_fib_lo", float(fib_lo))
-
-        _label("ADX min")
-        adx_min = st.number_input("ADX min", min_value=10, max_value=40, value=int(_g("t1_adx_min")),
-            step=1, key="ni_adx_min", label_visibility="collapsed",
-            help="23 requires sustained directionality.")
-        _s("t1_adx_min", int(adx_min))
-
-    if fib_hi >= fib_lo:
-        st.error("Upper bound must be < lower bound (e.g. 38.2 upper, 61.8 lower)")
-    if mom3 == 0 or mom6 == 0:
-        st.warning("Setting to 0 disables momentum gating entirely")
-
-    st.divider()
-
-    # Boolean gates
-    c3, c4 = st.columns(2)
-    with c3:
-        cloud = st.toggle("Require above/inside cloud", value=_g("t1_cloud"), key="tog_cloud",
-            help="Always ON. Price below cloud = overhead resistance.")
-        _s("t1_cloud", bool(cloud))
-        if not cloud:
-            st.warning("Cloud gate off — entering into overhead supply")
-
-        nrg = st.toggle("Bull Nifty regime required for Tier 1", value=_g("nifty_regime_filter"),
-            key="tog_nifty_regime",
-            help="Hard block: Tier 1 won't fire when Nifty is bearish.")
-        _s("nifty_regime_filter", bool(nrg))
-
-    with c4:
-        use_adx = st.toggle("Use ADX gate (off = EMA20 slope gate)", value=_g("t1_use_adx"),
-            key="tog_use_adx")
-        _s("t1_use_adx", bool(use_adx))
-
-        sqz_en = st.toggle("Squeeze boost", value=_g("t1_squeeze_boost"), key="tog_squeeze",
-            help="Adds score points when a BB squeeze releases on a Tier-1 pullback setup.")
-        _s("t1_squeeze_boost", bool(sqz_en))
-
-    if sqz_en:
-        sc1, sc2 = st.columns(2)
-        with sc1:
-            _label("Points on squeeze release")
-            sqz_r = st.slider("sqz_r", 0, 30, _g("t1_squeeze_pts"), step=5, key="sl_sqz_r",
+    # ── Tier 1 ───────────────────────────────────────────────────
+    with st.expander("Tier 1 — Prime gate", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            _label("3-month momentum min %")
+            mom3 = st.slider("mom3", 0, 25, _g("t1_mom3"), step=1, key="sl_mom3",
                 label_visibility="collapsed")
-            _s("t1_squeeze_pts", int(sqz_r))
-        with sc2:
-            _label("Points when NOT in squeeze")
-            sqz_n = st.slider("sqz_n", 0, 15, _g("t1_no_squeeze_pts"), step=5, key="sl_sqz_n",
+            _s("t1_mom3", int(mom3))
+
+            _label("Fib upper bound")
+            fib_hi = st.select_slider("fib_hi", options=[23.6, 38.2, 50.0],
+                value=_g("t1_fib_hi"), key="sl_fib_hi",
+                format_func=lambda x: f"{x:.1f}%", label_visibility="collapsed")
+            _s("t1_fib_hi", float(fib_hi))
+
+            _label("CCI recovery lookback (bars)")
+            cci_w = st.slider("cci_w", 1, 10, _g("t1_cci_window"), step=1,
+                key="sl_cci_window", label_visibility="collapsed")
+            _s("t1_cci_window", int(cci_w))
+
+            _label("ADX minimum")
+            adx_min = st.number_input("ADX min", 10, 40, int(_g("t1_adx_min")),
+                step=1, key="ni_adx_min", label_visibility="collapsed")
+            _s("t1_adx_min", int(adx_min))
+
+        with c2:
+            _label("6-month momentum min %")
+            mom6 = st.slider("mom6", 0, 40, _g("t1_mom6"), step=1, key="sl_mom6",
                 label_visibility="collapsed")
-            _s("t1_no_squeeze_pts", int(sqz_n))
+            _s("t1_mom6", int(mom6))
 
-    ps1, ps2 = st.columns(2)
-    with ps1:
-        _label("Persistent strength bonus")
-        ps_w = st.slider("ps_w", 5, 30, _g("t1_ps_weight"), step=5, key="sl_ps_weight",
-            label_visibility="collapsed")
-        _s("t1_ps_weight", int(ps_w))
-    with ps2:
-        _label("Persistent strength penalty")
-        ps_p = st.slider("ps_p", -20, 0, _g("t1_ps_penalty"), step=5, key="sl_ps_penalty",
-            label_visibility="collapsed")
-        _s("t1_ps_penalty", int(ps_p))
+            _label("Fib lower bound")
+            fib_lo = st.select_slider("fib_lo", options=[50.0, 61.8, 78.6],
+                value=_g("t1_fib_lo"), key="sl_fib_lo",
+                format_func=lambda x: f"{x:.1f}%", label_visibility="collapsed")
+            _s("t1_fib_lo", float(fib_lo))
 
-    # Inline gate preview
-    use_adx_val = _g("t1_use_adx")
-    strength_str = f"ADX > {_g('t1_adx_min')}" if use_adx_val else "EMA20 slope positive"
-    cloud_str    = " AND above/inside cloud" if _g("t1_cloud") else " (cloud gate OFF)"
-    nifty_str    = " AND nifty_regime=bull" if _g("nifty_regime_filter") else ""
+            _label("RS minimum")
+            rs_min = st.number_input("RS min", 0.0, 0.1,
+                float(_g("t1_rs_min")), step=0.001, format="%.3f",
+                key="ni_rs_min", label_visibility="collapsed")
+            _s("t1_rs_min", float(rs_min))
 
-    _gate_pre(
-        f'<b>Path A — Pullback to structure</b><br>'
-        f'trend_up <span class="ok">AND</span> in_golden [{_g("t1_fib_lo"):.1f}%..{_g("t1_fib_hi"):.1f}%]{cloud_str}<br>'
-        f'<span class="ok">AND</span> cci_recovery (crossed &gt; {_g("cci_os")} in last <b>{_g("t1_cci_window")}</b> bars)<br>'
-        f'<span class="ok">AND</span> mom3 &gt; <b>{_g("t1_mom3")}%</b> <span class="ok">AND</span> mom6 &gt; <b>{_g("t1_mom6")}%</b><br>'
-        f'<span class="ok">AND</span> {strength_str} <span class="ok">AND</span> rs_5bar &gt; <b>{_g("t1_rs_min"):.3f}</b>{nifty_str}'
-    )
-    _gate_pre(
-        f'<b>Path B — Momentum / Norm buy</b><br>'
-        f'is_norm_buy (trend_up AND score ≥ 65 AND not in Fib)<br>'
-        f'<span class="ok">AND</span> norm_score ≥ <b>75</b> (or <b>70</b> if EMERGING phase)<br>'
-        f'<span class="ok">AND</span> {strength_str} <span class="ok">AND</span> rs_5bar &gt; <b>{_g("t1_rs_min"):.3f}</b>{nifty_str}'
-    )
+        if fib_hi >= fib_lo:
+            st.error("Upper bound must be < lower bound (e.g. 38.2 upper, 61.8 lower)")
 
-    _acc_close()
+        _divider()
 
+        c3, c4 = st.columns(2)
+        with c3:
+            cloud = st.toggle("Require above/inside cloud", value=_g("t1_cloud"), key="tog_cloud")
+            _s("t1_cloud", bool(cloud))
+            use_adx = st.toggle("Use ADX gate", value=_g("t1_use_adx"), key="tog_use_adx",
+                help="Off = use EMA20 slope gate instead.")
+            _s("t1_use_adx", bool(use_adx))
+        with c4:
+            sqz_en = st.toggle("Squeeze boost", value=_g("t1_squeeze_boost"), key="tog_squeeze")
+            _s("t1_squeeze_boost", bool(sqz_en))
 
-# ══════════════════════════════════════════════════════════════════
-#  SECTION: TIER 2 — COMPRESSION BREAKOUT
-# ══════════════════════════════════════════════════════════════════
+        if sqz_en:
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                _label("Points on squeeze release")
+                sqz_r = st.slider("sqz_r", 0, 30, _g("t1_squeeze_pts"), step=5, key="sl_sqz_r",
+                    label_visibility="collapsed")
+                _s("t1_squeeze_pts", int(sqz_r))
+            with sc2:
+                _label("Points when NOT in squeeze")
+                sqz_n = st.slider("sqz_n", 0, 15, _g("t1_no_squeeze_pts"), step=5, key="sl_sqz_n",
+                    label_visibility="collapsed")
+                _s("t1_no_squeeze_pts", int(sqz_n))
 
-def _section_tier2() -> None:
-    comp  = _g("t2_comp_bars")
-    atr   = _g("t2_atr_ratio")
-    vol   = _g("t2_vol_mult")
-    sub   = f"{comp}-bar window · ATR {atr:.2f} · Vol {vol:.1f}×"
+        ps1, ps2 = st.columns(2)
+        with ps1:
+            _label("Persistent strength bonus")
+            ps_w = st.slider("ps_w", 5, 30, _g("t1_ps_weight"), step=5, key="sl_ps_weight",
+                label_visibility="collapsed")
+            _s("t1_ps_weight", int(ps_w))
+        with ps2:
+            _label("Persistent strength penalty")
+            ps_p = st.slider("ps_p", -20, 0, _g("t1_ps_penalty"), step=5, key="sl_ps_penalty",
+                label_visibility="collapsed")
+            _s("t1_ps_penalty", int(ps_p))
 
-    _acc_open("Tier 2 — Compression breakout", sub, "#3fb950")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        _label("Compression window (bars)")
-        comp_bars = st.slider("comp", 5, 20, _g("t2_comp_bars"), step=1, key="sl_comp_bars",
-            label_visibility="collapsed",
-            help="12 bars catches both 2-week coils and 3-week institutional bases.")
-        _s("t2_comp_bars", int(comp_bars))
-
-        _label("CCI breakout threshold")
-        cci_ob_t2 = st.slider("cci_ob_t2", 50, 200, _g("cci_ob"), step=10, key="sl_t2_cci_ob",
-            label_visibility="collapsed",
-            help="CCI must be above this AND rising. 100 is standard.")
-        _s("cci_ob", int(cci_ob_t2))
-
-    with c2:
-        _label("ATR compression ratio")
-        atr_ratio = st.slider("atr", 60, 95, int(_g("t2_atr_ratio") * 100), step=5,
-            key="sl_atr_ratio", label_visibility="collapsed",
-            help="0.80 requires visible range narrowing.",
-            format="%d%%")
-        _s("t2_atr_ratio", atr_ratio / 100.0)
-
-        _label("Volume expansion (× avg)")
-        vol_mult = st.slider("vol", 10, 30, int(_g("t2_vol_mult") * 10), step=1,
-            key="sl_vol_mult", label_visibility="collapsed",
-            help="1.5× requires meaningful participation.",
-            format="%d")
-        _s("t2_vol_mult", vol_mult / 10.0)
-
-    _gate_pre(
-        f'<b>Tier 2 — Compression breakout</b><br>'
-        f'prev ATR &lt; SMA({_g("t2_comp_bars")}) × {_g("t2_atr_ratio"):.2f} AND price breaks base high<br>'
-        f'<span class="ok">AND</span> CCI &gt; {_g("cci_ob")} AND rising<br>'
-        f'<span class="ok">AND</span> volume &gt; avg × <b>{_g("t2_vol_mult"):.1f}</b><br>'
-        f'<span class="e">HARD BLOCK</span> trend_phase == EXTENDED'
-    )
-
-    _acc_close()
-
-
-# ══════════════════════════════════════════════════════════════════
-#  SECTION: CCI PARAMETERS
-# ══════════════════════════════════════════════════════════════════
-
-def _section_cci() -> None:
-    sub = f"Period {_g('cci_len')} · OB {_g('cci_ob')} · OS {_g('cci_os')}"
-    _acc_open("CCI parameters", sub, "#8b949e")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        _label("Period")
-        cci_len = st.number_input("Period", 5, 50, _g("cci_len"), step=1, key="ni_cci_len",
-            label_visibility="collapsed",
-            help="CCI(20) is calibrated for daily NSE swing.")
-        _s("cci_len", int(cci_len))
-    with c2:
-        _label("Overbought")
-        cci_ob = st.number_input("OB", 50, 300, _g("cci_ob"), step=10, key="ni_cci_ob",
-            label_visibility="collapsed",
-            help="±100 is a well-studied level.")
-        _s("cci_ob", int(cci_ob))
-    with c3:
-        _label("Oversold")
-        cci_os = st.number_input("OS", -300, -50, _g("cci_os"), step=10, key="ni_cci_os",
-            label_visibility="collapsed",
-            help="±100 is a well-studied level.")
-        _s("cci_os", int(cci_os))
-
-    _acc_close()
-
-
-# ══════════════════════════════════════════════════════════════════
-#  SECTION: WATCHLIST
-# ══════════════════════════════════════════════════════════════════
-
-def _section_watchlist() -> None:
-    supabase_ok = _is_available()
-    if "watchlist_loaded" not in st.session_state:
-        st.session_state["watchlist"] = load_watchlist() if supabase_ok else []
-        st.session_state["watchlist_loaded"] = True
-
-    wl = st.session_state.get("watchlist", [])
-    if wl:
-        wl_df = pd.DataFrame(wl)[["symbol", "notes"]].rename(
-            columns={"symbol": "Symbol", "notes": "Notes"})
-        st.dataframe(wl_df, use_container_width=True, hide_index=True, height=150)
-
-    bulk_raw = st.text_area("Symbols (one per line)",
-        value="\n".join(w["symbol"] for w in wl),
-        height=80, key="bulk_wl", label_visibility="collapsed")
-
-    wl_c1, wl_c2 = st.columns([1, 1])
-    with wl_c1:
-        if st.button("💾 Save Watchlist", type="primary", key="btn_save_wl"):
-            new_syms = [s.strip().upper() for s in bulk_raw.splitlines() if s.strip()]
-            if supabase_ok:
-                ok = save_watchlist(new_syms)
-                if ok:
-                    st.session_state["watchlist"] = load_watchlist()
-                    st.success(f"✅ Saved {len(new_syms)} symbols.")
-                else:
-                    st.error("❌ Supabase error.")
-            else:
-                st.session_state["watchlist"] = [{"symbol": s, "notes": ""} for s in new_syms]
-                st.success(f"✅ {len(new_syms)} symbols (session only).")
-    with wl_c2:
-        if wl:
-            rm = st.selectbox("Remove", ["—"] + [w["symbol"] for w in wl],
-                key="wl_rm_sel", label_visibility="collapsed")
-            if st.button("✕ Remove", key="btn_rm_wl") and rm != "—":
-                st.session_state["watchlist"] = [
-                    w for w in st.session_state.get("watchlist", []) if w["symbol"] != rm]
-                st.rerun()
-
-
-# ══════════════════════════════════════════════════════════════════
-#  SECTION: SYSTEM
-# ══════════════════════════════════════════════════════════════════
-
-def _section_system() -> None:
-    if _is_available():
-        st.success("✅ Supabase connected.")
-    else:
-        st.warning(
-            "Not configured. Add to `.streamlit/secrets.toml`:\n\n"
-            "```toml\nSUPABASE_URL = \"https://xxx.supabase.co\"\n"
-            "SUPABASE_KEY = \"your-anon-key\"\n```"
+        # Gate preview
+        strength_str = f"ADX > {_g('t1_adx_min')}" if _g("t1_use_adx") else "EMA20 slope positive"
+        cloud_str    = " AND above/inside cloud" if _g("t1_cloud") else " (cloud OFF)"
+        nifty_str    = " AND nifty_regime=bull" if _g("nifty_regime_filter") else ""
+        _gate_pre(
+            f'<b>Path A — Pullback to structure</b><br>'
+            f'trend_up <span class="ok">AND</span> in_golden [{_g("t1_fib_lo"):.1f}%..{_g("t1_fib_hi"):.1f}%]{cloud_str}<br>'
+            f'<span class="ok">AND</span> cci_recovery (crossed &gt; {_g("cci_os")} in last <b>{_g("t1_cci_window")}</b> bars)<br>'
+            f'<span class="ok">AND</span> mom3 &gt; <b>{_g("t1_mom3")}%</b> '
+            f'<span class="ok">AND</span> mom6 &gt; <b>{_g("t1_mom6")}%</b><br>'
+            f'<span class="ok">AND</span> {strength_str} '
+            f'<span class="ok">AND</span> rs_5bar &gt; <b>{_g("t1_rs_min"):.3f}</b>{nifty_str}'
         )
-    with st.expander("Database schema SQL", expanded=False):
+
+    # ── Tier 2 ───────────────────────────────────────────────────
+    with st.expander("Tier 2 — Compression breakout", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            _label("Compression window (bars)")
+            comp_bars = st.slider("comp", 5, 20, _g("t2_comp_bars"), step=1,
+                key="sl_comp_bars", label_visibility="collapsed")
+            _s("t2_comp_bars", int(comp_bars))
+
+            _label("CCI breakout threshold")
+            cci_ob_t2 = st.slider("cci_ob_t2", 50, 200, _g("cci_ob"), step=10,
+                key="sl_t2_cci_ob", label_visibility="collapsed")
+            _s("cci_ob", int(cci_ob_t2))
+
+        with c2:
+            _label("ATR compression ratio")
+            atr_ratio = st.slider("atr", 60, 95, int(_g("t2_atr_ratio") * 100), step=5,
+                key="sl_atr_ratio", label_visibility="collapsed", format="%d%%")
+            _s("t2_atr_ratio", atr_ratio / 100.0)
+
+            _label("Volume expansion (× avg)")
+            vol_mult = st.slider("vol", 10, 30, int(_g("t2_vol_mult") * 10), step=1,
+                key="sl_vol_mult", label_visibility="collapsed")
+            _s("t2_vol_mult", vol_mult / 10.0)
+
+        _gate_pre(
+            f'<b>Tier 2 — Compression breakout</b><br>'
+            f'prev ATR &lt; SMA({_g("t2_comp_bars")}) × {_g("t2_atr_ratio"):.2f} AND price breaks base high<br>'
+            f'<span class="ok">AND</span> CCI &gt; {_g("cci_ob")} AND rising<br>'
+            f'<span class="ok">AND</span> volume &gt; avg × <b>{_g("t2_vol_mult"):.1f}</b><br>'
+            f'<span class="e">HARD BLOCK</span> trend_phase == EXTENDED'
+        )
+
+    # ── CCI ──────────────────────────────────────────────────────
+    with st.expander("CCI parameters", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            _label("Period")
+            cci_len = st.number_input("Period", 5, 50, _g("cci_len"), step=1,
+                key="ni_cci_len", label_visibility="collapsed")
+            _s("cci_len", int(cci_len))
+        with c2:
+            _label("Overbought level")
+            cci_ob = st.number_input("OB", 50, 300, _g("cci_ob"), step=10,
+                key="ni_cci_ob", label_visibility="collapsed")
+            _s("cci_ob", int(cci_ob))
+        with c3:
+            _label("Oversold level")
+            cci_os = st.number_input("OS", -300, -50, _g("cci_os"), step=10,
+                key="ni_cci_os", label_visibility="collapsed")
+            _s("cci_os", int(cci_os))
+
+    # ── Backtest ─────────────────────────────────────────────────
+    with st.expander("Backtest parameters", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            _label("Hold days")
+            hold_days = st.slider("Hold days", 5, 60, _g("hold_days"), step=5,
+                key="sl_hold", label_visibility="collapsed")
+            _s("hold_days", int(hold_days))
+        with c2:
+            _label("Min score (display filter)")
+            min_score = st.slider("Min score", 50, 85, _g("min_score"), step=5,
+                key="sl_min_score", label_visibility="collapsed")
+            _s("min_score", int(min_score))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  TAB 3 — SYSTEM
+# ══════════════════════════════════════════════════════════════════
+
+def _tab_system() -> None:
+    supabase_ok = _is_available()
+
+    # Connection status
+    if supabase_ok:
+        st.markdown(
+            '<span class="status-pill" style="background:rgba(63,185,80,0.12);'
+            'border:1px solid rgba(63,185,80,0.4);color:#3fb950">'
+            '● Supabase connected</span>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<span class="status-pill" style="background:rgba(248,81,73,0.1);'
+            'border:1px solid rgba(248,81,73,0.35);color:#f85149">'
+            '● Supabase not configured</span>',
+            unsafe_allow_html=True,
+        )
+        st.code(
+            'SUPABASE_URL = "https://xxx.supabase.co"\n'
+            'SUPABASE_KEY = "your-anon-key"',
+            language="toml",
+        )
+        st.caption("Add the above to `.streamlit/secrets.toml`")
+
+    st.markdown('<div style="height:10px"></div>', unsafe_allow_html=True)
+
+    with st.expander("📋 Watchlist", expanded=False):
+        if "watchlist_loaded" not in st.session_state:
+            st.session_state["watchlist"] = load_watchlist() if supabase_ok else []
+            st.session_state["watchlist_loaded"] = True
+
+        wl = st.session_state.get("watchlist", [])
+        if wl:
+            wl_df = pd.DataFrame(wl)[["symbol", "notes"]].rename(
+                columns={"symbol": "Symbol", "notes": "Notes"})
+            st.dataframe(wl_df, use_container_width=True, hide_index=True, height=140)
+
+        bulk_raw = st.text_area("Symbols (one per line)",
+            value="\n".join(w["symbol"] for w in wl),
+            height=80, key="bulk_wl", label_visibility="collapsed")
+
+        wl_c1, wl_c2 = st.columns([1, 1])
+        with wl_c1:
+            if st.button("💾 Save Watchlist", type="primary", key="btn_save_wl"):
+                new_syms = [s.strip().upper() for s in bulk_raw.splitlines() if s.strip()]
+                if supabase_ok:
+                    ok = save_watchlist(new_syms)
+                    if ok:
+                        st.session_state["watchlist"] = load_watchlist()
+                        st.success(f"✅ Saved {len(new_syms)} symbols.")
+                    else:
+                        st.error("❌ Supabase error.")
+                else:
+                    st.session_state["watchlist"] = [{"symbol": s, "notes": ""} for s in new_syms]
+                    st.success(f"✅ {len(new_syms)} symbols (session only).")
+        with wl_c2:
+            if wl:
+                rm = st.selectbox("Remove", ["—"] + [w["symbol"] for w in wl],
+                    key="wl_rm_sel", label_visibility="collapsed")
+                if st.button("✕ Remove", key="btn_rm_wl") and rm != "—":
+                    st.session_state["watchlist"] = [
+                        w for w in st.session_state.get("watchlist", []) if w["symbol"] != rm]
+                    st.rerun()
+
+    with st.expander("🗄️ Database schema", expanded=False):
         st.code(SCHEMA_SQL, language="sql")
 
-    if st.button("Load last 10 scan runs", key="btn_hist"):
-        history = load_scan_history(limit=10)
-        if not history.empty:
-            for ts, grp in history.groupby("run_at"):
-                with st.expander(f"🕐 {ts} — {len(grp)} stocks"):
-                    st.dataframe(
-                        grp[["symbol", "score", "action", "cci", "entry", "sl", "t1"]]
-                        .rename(columns=str.title).reset_index(drop=True),
-                        use_container_width=True,
-                    )
-        else:
-            st.info("No scan history found.")
+    with st.expander("🕐 Scan history", expanded=False):
+        if st.button("Load last 10 runs", key="btn_hist"):
+            history = load_scan_history(limit=10)
+            if not history.empty:
+                for ts, grp in history.groupby("run_at"):
+                    with st.expander(f"{ts} — {len(grp)} stocks"):
+                        st.dataframe(
+                            grp[["symbol", "score", "action", "cci", "entry", "sl", "t1"]]
+                            .rename(columns=str.title).reset_index(drop=True),
+                            use_container_width=True,
+                        )
+            else:
+                st.info("No scan history found.")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -669,30 +617,25 @@ def render() -> dict:
     st.markdown(_CSS, unsafe_allow_html=True)
 
     st.markdown(
-        '<h2 style="font-size:1.2rem;font-weight:700;margin-bottom:0.15rem">⚙️ Settings</h2>'
-        '<p style="font-size:10.5px;color:#8b949e;margin-bottom:1rem;">'
-        'Changes take effect on the next Run Scan or Backtest.</p>',
+        '<h2 style="font-size:1.1rem;font-weight:700;margin-bottom:0.1rem;'
+        'font-family:\'JetBrains Mono\',monospace">⚙️ Settings</h2>'
+        '<p style="font-size:10px;color:#8b949e;margin-bottom:1rem;">'
+        'Changes apply on next Run Scan or Backtest.</p>',
         unsafe_allow_html=True,
     )
 
-    # ── Always-visible: Trading Style ───────────────────────────
-    _section_trading_style()
+    tab_scan, tab_adv, tab_sys = st.tabs(["📡 Scan", "🔧 Advanced", "🛠️ System"])
 
-    # ── Collapsible: Advanced ────────────────────────────────────
-    with st.expander("⚙️ Universe, thresholds & gate parameters", expanded=False):
-        _section_universe()
-        _section_cci()
-        _section_tier1()
-        _section_tier2()
+    with tab_scan:
+        _tab_scan()
 
-    # ── Watchlist & System ───────────────────────────────────────
-    with st.expander("📋 Watchlist", expanded=False):
-        _section_watchlist()
+    with tab_adv:
+        _tab_advanced()
 
-    with st.expander("🛠️ System & database", expanded=False):
-        _section_system()
+    with tab_sys:
+        _tab_system()
 
-    # ── Return settings dict ─────────────────────────────────────
+    # ── Return settings dict (unchanged keys) ────────────────────
     ss = st.session_state
     return {
         "trading_style":       ss.get("trading_style",       _TRADING_STYLE_DEFAULTS["trading_style"]),
@@ -729,3 +672,5 @@ def render() -> dict:
         "t1_adx_min":          ss.get("t1_adx_min",          DEFAULTS["t1_adx_min"]),
         "t1_use_adx":          ss.get("t1_use_adx",          DEFAULTS["t1_use_adx"]),
     }
+PYEOF
+echo "written"
