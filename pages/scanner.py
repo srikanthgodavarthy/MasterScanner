@@ -419,16 +419,16 @@ _CSS = """
   font-weight: 700;
   letter-spacing: 0.07em;
   white-space: nowrap;
-  cursor: help;
+  cursor: default;
 }
 
 /* ── Tooltip triggers ── */
 /* All tooltip logic is JS-driven (floating #ms-tip div at document level).
    No position:absolute inside overflow:hidden — tooltips are never clipped. */
-[data-tip-title] { cursor: help; }
+[data-tip-title] { cursor: default; }
 .tip-underline {
-  border-bottom: 1px dashed rgba(255,255,255,0.25);
-  cursor: help;
+  border-bottom: 1px dashed rgba(255,255,255,0.35);
+  cursor: default;
 }
 /* #ms-tip styles are injected into window.parent.document by _TOOLTIP_JS */
 
@@ -899,21 +899,39 @@ def _qualification_summary_html(df: pd.DataFrame, settings: dict) -> str:
                 return " · ".join(reasons) if reasons else "Below threshold"
 
             skip_items = "".join(
-                f'<span class="qs-reject-item">'                f'<b style="color:#e6edf3">{str(r.get("Stock","?"))}</b>'                f'<span class="qs-reject-reason"> — {_top_fail_reason(r)}</span>'                f'</span>'
+                (
+                    '<span class="qs-reject-item">'
+                    f'<b style="color:#e6edf3">{str(r.get("Stock","?"))}</b>'
+                    f'<span class="qs-reject-reason"> — {_top_fail_reason(r)}</span>'
+                    '</span>'
+                )
                 for _, r in skip_stocks.head(12).iterrows()
             )
             skip_html = (
-                f'<div class="qs-reject-block">'                f'<span class="qs-reject-head">Not Qualified — SKIP ({skip_n} stocks):</span>'                f'<div class="qs-reject-list">{skip_items}</div>'                f'</div>'
+                '<div class="qs-reject-block">'
+                f'<span class="qs-reject-head">Not Qualified — SKIP ({skip_n} stocks):</span>'
+                f'<div class="qs-reject-list">{skip_items}</div>'
+                '</div>'
             )
 
         if watch_n > 0:
             watch_stocks = df[df[sc_col] == "WATCH"]
             watch_items = "".join(
-                f'<span style="background:rgba(210,153,34,0.1);border:1px solid rgba(210,153,34,0.3);'                f'border-radius:5px;padding:2px 8px;font-size:11px;font-family:var(--mono)">'                f'<b style="color:#d29922">{str(r.get("Stock","?"))}</b>'                f'<span style="color:#8b949e;font-size:10px"> CV={int(float(r.get("CV1_Conviction",0))) if str(r.get("CV1_Conviction","")).replace(".","").lstrip("-").isdigit() else "—"}</span>'                f'</span>'
+                (
+                    '<span style="background:rgba(210,153,34,0.1);border:1px solid rgba(210,153,34,0.3);'
+                    'border-radius:5px;padding:2px 8px;font-size:11px;font-family:var(--mono)">'
+                    f'<b style="color:#d29922">{str(r.get("Stock","?"))}</b>'
+                    f'<span style="color:#8b949e;font-size:10px"> CV={int(float(r.get("CV1_Conviction",0))) if str(r.get("CV1_Conviction","")).replace(".","").lstrip("-").isdigit() else chr(8212)}</span>'
+                    '</span>'
+                )
                 for _, r in watch_stocks.head(12).iterrows()
             )
             watch_html = (
-                f'<div class="qs-reject-block" style="border-top:1px solid var(--border);padding-top:6px;margin-top:2px;">'                f'<span style="font-size:10px;font-weight:600;color:#d29922;text-transform:uppercase;'                f'letter-spacing:0.05em;margin-right:8px">Watch — Setup Building ({watch_n} stocks):</span>'                f'<div class="qs-reject-list">{watch_items}</div>'                f'</div>'
+                '<div class="qs-reject-block" style="border-top:1px solid var(--border);padding-top:6px;margin-top:2px;">'
+                f'<span style="font-size:10px;font-weight:600;color:#d29922;text-transform:uppercase;'
+                f'letter-spacing:0.05em;margin-right:8px">Watch — Setup Building ({watch_n} stocks):</span>'
+                f'<div class="qs-reject-list">{watch_items}</div>'
+                '</div>'
             )
 
     return f"""
