@@ -75,7 +75,7 @@ footer { display:none !important; }
 st.markdown("""
 <div class="scanner-header">
     <p class="scanner-title">⚡ MasterScanner</p>
-    <p class="scanner-subtitle"><span class="status-dot"></span>Nifty 500 · Regime Engine v2 · Trend · Momentum · Structure · Volume · Quality</p>
+    <p class="scanner-subtitle"><span class="status-dot"></span>Nifty 500 · Regime Engine v2 · Leadership · Conviction · Entry Quality</p>
 </div>
 """, unsafe_allow_html=True)
 
