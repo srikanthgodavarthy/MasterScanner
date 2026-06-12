@@ -508,6 +508,7 @@ def score_stock(
         "_squeeze_release":     r.squeeze_release,
         "_compression_break":   r.compression_break,
         "_cci_momentum_break":  r.cci_momentum_break,
+        "_trend_up":            r.trend_up,
         "_harm_bull":           r.harm_bull,
         "_abcd_bull":           r.abcd_bull,
         "_any_buy":             r.any_buy,
