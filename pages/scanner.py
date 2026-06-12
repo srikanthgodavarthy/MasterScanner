@@ -1483,238 +1483,196 @@ def _validation_row_html(stock: str, sc: str, category: str) -> str:
 
 # ── FIB PULLBACK TAB RENDERER ──────────────────────────────────────────────────
 
+_FIB_PB_BOOST_META = {
+    "fib_grade_excellent": ("#22c55e", "★GZ"),
+    "fib_grade_good":      ("#84cc16", "◎GZ"),
+    "vcp":                 ("#38bdf8", "VCP"),
+    "nr7":                 ("#a78bfa", "NR7"),
+    "harmonic_bull":       ("#f59e0b", "🦋"),
+}
+
 def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None:
     """
-    Dedicated renderer for the 📐 Fib Pullback Opportunities tab.
-
-    Shows stocks that pass SETUP_FIB_PULLBACK criteria:
-        trend_up AND in_golden AND CCI ≤ -100
-    but are NOT in the Elite/Execute bucket — these are the good setups
-    being filtered out by the conviction score gate.
-
-    Optional boost badges: fib_grade_excellent, fib_grade_good, vcp, nr7, harmonic_bull
+    Fib Pullback Opportunities — table styled identically to the main scanner table.
+    Criteria: trend_up AND in_golden AND CCI ≤ -100
     """
-    st.markdown(
-        '<link rel="preconnect" href="https://fonts.googleapis.com">'
-        '<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700'
-        '&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        '<div style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:20px;'
-        'font-weight:700;letter-spacing:.03em;margin-bottom:2px;">'
-        '📐 Fib Pullback Opportunities</div>'
-        '<div style="color:#475569;font-size:11px;margin-bottom:4px;">'
-        'Stocks filtered out of Elite/Execute — recovered by Fib+CCI criteria: '
-        '<code style="color:#f97316;background:#1a1a2e;padding:1px 5px;border-radius:3px;">'
-        'trend_up AND in_golden AND CCI ≤ −100</code></div>',
-        unsafe_allow_html=True,
-    )
-
     if not records:
-        st.info("No stocks meet SETUP_FIB_PULLBACK criteria in this scan. "
-                "Try scanning more symbols or check market conditions.")
+        st.info("No stocks meet SETUP_FIB_PULLBACK criteria in this scan.")
         return
 
-    # ── Boost filter controls ────────────────────────────────────────────────
-    BOOST_LABELS = {
-        "fib_grade_excellent": ("★ Exact Golden", "#22c55e"),
-        "fib_grade_good":      ("◎ Relaxed Golden", "#84cc16"),
-        "vcp":                 ("VCP / Squeeze",   "#38bdf8"),
-        "nr7":                 ("NR7 Compression", "#a78bfa"),
-        "harmonic_bull":       ("🦋 Harmonic Bull", "#f59e0b"),
-    }
-
-    col_f, col_sort = st.columns([3, 1])
-    with col_f:
-        boost_filter = st.multiselect(
-            "Show only stocks with boost(s):",
-            options=list(BOOST_LABELS.keys()),
-            format_func=lambda x: BOOST_LABELS[x][0],
-            key="fib_pb_boost_filter",
-            placeholder="All stocks (no filter)",
-        )
+    # ── Controls row ─────────────────────────────────────────────────────────
+    col_sort, col_dl = st.columns([3, 1])
     with col_sort:
-        sort_mode = st.selectbox("Sort by", ["CCI (most OS)", "Score ↓", "Symbol A→Z"],
-                                 key="fib_pb_sort")
+        sort_mode = st.selectbox(
+            "Sort by",
+            ["CCI (most OS)", "Score ↓", "Symbol A→Z"],
+            key="fib_pb_sort",
+            label_visibility="collapsed",
+        )
 
-    # ── Apply boost filter ───────────────────────────────────────────────────
-    display_records = records
-    if boost_filter:
-        display_records = [r for r in records
-                           if any(b in r.get("_fib_pb_boosts", []) for b in boost_filter)]
-
-    # ── Sort ────────────────────────────────────────────────────────────────
+    display_records = list(records)
     if sort_mode == "CCI (most OS)":
-        display_records = sorted(display_records, key=lambda r: float(r.get("CCI") or r.get("_cci_raw") or 0))
+        display_records.sort(key=lambda r: float(r.get("CCI") or r.get("_cci_raw") or 0))
     elif sort_mode == "Score ↓":
-        display_records = sorted(display_records, key=lambda r: -(float(r.get("Score") or 0)))
+        display_records.sort(key=lambda r: -(float(r.get("Score") or 0)))
     else:
-        display_records = sorted(display_records, key=lambda r: str(r.get("Symbol") or r.get("Stock") or ""))
+        display_records.sort(key=lambda r: str(r.get("Symbol") or r.get("Stock") or ""))
 
-    # ── Summary metrics bar ──────────────────────────────────────────────────
-    n_total     = len(records)
-    n_exact     = sum(1 for r in records if "fib_grade_excellent" in r.get("_fib_pb_boosts", []))
-    n_relaxed   = sum(1 for r in records if "fib_grade_good"      in r.get("_fib_pb_boosts", []))
-    n_harmonic  = sum(1 for r in records if "harmonic_bull"        in r.get("_fib_pb_boosts", []))
-    n_vcp       = sum(1 for r in records if "vcp"                  in r.get("_fib_pb_boosts", []))
-    n_showing   = len(display_records)
+    # ── Cell helpers — mirror the main table's helpers ────────────────────────
+    def _pb_num(v, fmt="{:.2f}", color=None):
+        try:
+            fv = float(v)
+            s  = fmt.format(fv)
+            style = f'style="color:{color}"' if color else ""
+            return f'<td class="col-num" {style}>{s}</td>'
+        except (TypeError, ValueError):
+            return '<td class="col-num">—</td>'
 
-    st.markdown(
-        f'<div style="display:flex;flex-wrap:wrap;gap:8px;padding:10px 0 14px;">'
-        f'<div style="background:#22c55e11;border:1px solid #22c55e33;border-radius:6px;padding:6px 14px;text-align:center;">'
-        f'<div style="font-family:JetBrains Mono,monospace;color:#22c55e;font-size:20px;font-weight:700;">{n_total}</div>'
-        f'<div style="color:#64748b;font-size:8px;">Total FIB_PULLBACK</div></div>'
-        f'<div style="background:#22c55e11;border:1px solid #22c55e33;border-radius:6px;padding:6px 14px;text-align:center;">'
-        f'<div style="font-family:JetBrains Mono,monospace;color:#22c55e;font-size:20px;font-weight:700;">{n_exact}</div>'
-        f'<div style="color:#64748b;font-size:8px;">★ Exact Golden</div></div>'
-        f'<div style="background:#84cc1611;border:1px solid #84cc1633;border-radius:6px;padding:6px 14px;text-align:center;">'
-        f'<div style="font-family:JetBrains Mono,monospace;color:#84cc16;font-size:20px;font-weight:700;">{n_relaxed}</div>'
-        f'<div style="color:#64748b;font-size:8px;">◎ Relaxed Golden</div></div>'
-        f'<div style="background:#f59e0b11;border:1px solid #f59e0b33;border-radius:6px;padding:6px 14px;text-align:center;">'
-        f'<div style="font-family:JetBrains Mono,monospace;color:#f59e0b;font-size:20px;font-weight:700;">{n_harmonic}</div>'
-        f'<div style="color:#64748b;font-size:8px;">🦋 Harmonic</div></div>'
-        f'<div style="background:#38bdf811;border:1px solid #38bdf833;border-radius:6px;padding:6px 14px;text-align:center;">'
-        f'<div style="font-family:JetBrains Mono,monospace;color:#38bdf8;font-size:20px;font-weight:700;">{n_vcp}</div>'
-        f'<div style="color:#64748b;font-size:8px;">VCP/Squeeze</div></div>'
-        f'<div style="margin-left:auto;background:#1a1a2e;border:1px solid #2a2a4e;border-radius:6px;padding:6px 14px;text-align:center;">'
-        f'<div style="font-family:JetBrains Mono,monospace;color:#e2e8f0;font-size:20px;font-weight:700;">{n_showing}</div>'
-        f'<div style="color:#64748b;font-size:8px;">Showing</div></div>'
-        f'</div>',
-        unsafe_allow_html=True,
+    def _pb_chg(v):
+        try:
+            fv = float(v)
+            color = "#3fb950" if fv >= 0 else "#f85149"
+            arrow = "▲" if fv >= 0 else "▼"
+            return f'<td class="col-num" style="color:{color};font-weight:600">{arrow} {abs(fv):.2f}%</td>'
+        except (TypeError, ValueError):
+            return '<td class="col-num">—</td>'
+
+    def _pb_cci(v):
+        try:
+            fv = float(v)
+            color = "#3fb950" if fv <= -150 else "#84cc16" if fv <= -100 else "#f59e0b"
+            return f'<td class="col-num" style="color:{color};font-weight:700">{fv:+.0f}</td>'
+        except (TypeError, ValueError):
+            return '<td class="col-num">—</td>'
+
+    def _pb_score(v):
+        try:
+            fv = float(v)
+            color = "#3fb950" if fv >= 80 else "#d29922" if fv >= 60 else "#f85149"
+            pct   = min(int(fv), 100)
+            return (
+                f'<td class="col-num">'
+                f'<div class="score-cell">'
+                f'<span class="score-num" style="color:{color}">{int(fv)}</span>'
+                f'<div class="score-bar"><div class="score-fill" style="width:{pct}%;background:{color}"></div></div>'
+                f'</div></td>'
+            )
+        except (TypeError, ValueError):
+            return '<td class="col-num">—</td>'
+
+    def _pb_tier(v):
+        color = {"ELITE":"#f5c542","EXECUTE":"#3fb950","WATCH":"#d29922","SKIP":"#8b949e"}.get(str(v), "#8b949e")
+        return (
+            f'<td><span style="background:{color}22;border:1px solid {color}55;color:{color};'
+            f'font-size:0.68rem;padding:1px 7px;border-radius:4px;font-weight:700;">{v or "—"}</span></td>'
+        )
+
+    def _pb_boosts(boosts):
+        if not boosts:
+            return '<td class="col-num" style="color:var(--muted)">—</td>'
+        badges = ""
+        for b in boosts:
+            bc, bl = _FIB_PB_BOOST_META.get(b, ("#8b949e", b))
+            badges += (
+                f'<span style="background:{bc}22;border:1px solid {bc}55;color:{bc};'
+                f'font-size:0.65rem;padding:1px 5px;border-radius:3px;margin-right:3px;'
+                f'font-weight:700;white-space:nowrap;">{bl}</span>'
+            )
+        return f'<td style="white-space:nowrap">{badges}</td>'
+
+    # ── Build thead ───────────────────────────────────────────────────────────
+    _COLS = [
+        ("STOCK",  "col-stock"), ("SCORE",  ""), ("CCI",    ""), ("CCI STATE", ""),
+        ("%CHG",   ""),          ("ENTRY",  ""), ("SL",     ""), ("T1",        ""),
+        ("T2",     ""),          ("RSI",    ""), ("BOOSTS", ""), ("TIER",      ""),
+    ]
+    thead = (
+        '<thead><tr>'
+        '<th style="width:28px;text-align:right">#</th>'
+        + "".join(
+            f'<th class="{cls}">{h}</th>' for h, cls in _COLS
+        )
+        + '</tr></thead>'
     )
 
-    # ── Stock cards ──────────────────────────────────────────────────────────
-    def _pb_card(r: dict) -> str:
-        sym     = r.get("Symbol") or r.get("Stock") or "?"
-        ltp     = float(r.get("LTP") or r.get("CMP") or 0)
-        chg     = float(r.get("%Change") or r.get("%Chg") or 0)
-        cci     = float(r.get("CCI") or r.get("_cci_raw") or 0)
-        score   = float(r.get("Score") or 0)
-        rsi     = float(r.get("RSI") or r.get("_rsi") or 0)
-        sl      = r.get("SL"); t1 = r.get("T1"); t2 = r.get("T2")
-        entry   = r.get("Entry")
-        sector  = r.get("Sector") or r.get("_sector") or ""
-        boosts  = r.get("_fib_pb_boosts") or []
-        adx     = float(r.get("ADX") or 0)
-        tier    = r.get("Tier") or r.get("CV1_SignalClass") or ""
-        trend_phase = r.get("TrendPhase") or ""
+    # ── Build rows ────────────────────────────────────────────────────────────
+    rows_html = ""
+    for rank, r in enumerate(display_records, 1):
+        sym    = r.get("Symbol") or r.get("Stock") or "?"
+        cci    = r.get("CCI") or r.get("_cci_raw") or 0
+        rsi    = r.get("RSI") or r.get("_rsi") or 0
+        tier   = r.get("CV1_SignalClass") or r.get("Tier") or "—"
+        boosts = r.get("_fib_pb_boosts") or []
 
-        chg_col = "#22c55e" if chg >= 0 else "#ef4444"
-        cci_col = "#22c55e" if cci <= -100 else "#f59e0b"
+        # CCI state label — mirrors the main scanner
+        try:
+            cci_f = float(cci)
+            if cci_f <= -150:
+                cci_state = ("DEEP OS", "#3fb950")
+            elif cci_f <= -100:
+                cci_state = ("OVERSOLD", "#84cc16")
+            elif cci_f < 0:
+                cci_state = ("BEAR", "#f59e0b")
+            elif cci_f < 100:
+                cci_state = ("BULL", "#58a6ff")
+            else:
+                cci_state = ("OB", "#f85149")
+        except (TypeError, ValueError):
+            cci_state = ("—", "#8b949e")
 
-        # ── Boost badge strip ──────────────────────────────────────
-        _BOOST_META = {
-            "fib_grade_excellent": ("#22c55e", "★ EXACT GZ"),
-            "fib_grade_good":      ("#84cc16", "◎ RELAXED GZ"),
-            "vcp":                 ("#38bdf8", "VCP"),
-            "nr7":                 ("#a78bfa", "NR7"),
-            "harmonic_bull":       ("#f59e0b", "🦋 HARM"),
-        }
-        boost_html = ""
-        for b in boosts:
-            bc, bl = _BOOST_META.get(b, ("#64748b", b.upper()))
-            boost_html += (
-                f'<span style="background:{bc}1a;border:1px solid {bc}55;'
-                f'color:{bc};font-size:7px;padding:1px 5px;border-radius:3px;'
-                f'font-weight:700;letter-spacing:.04em;">{bl}</span>'
-            )
-
-        def lv(label, val, col):
-            v = f"₹{val:,.0f}" if val else "—"
-            return (
-                f'<div style="text-align:center;">'
-                f'<div style="color:#475569;font-size:7px;">{label}</div>'
-                f'<div style="font-family:JetBrains Mono,monospace;color:{col};'
-                f'font-size:9px;font-weight:600;">{v}</div>'
-                f'</div>'
-            )
-
-        tier_col = {"ELITE":"#f5c542","EXECUTE":"#22c55e","WATCH":"#d29922","SKIP":"#475569"}.get(tier,"#475569")
-        tv_url   = f"https://www.tradingview.com/chart/?symbol=NSE:{sym}"
-
-        return (
-            f'<div style="background:#111120;border:1.5px solid #22c55e44;'
-            f'border-top:3px solid #22c55e;border-radius:10px;overflow:hidden;'
-            f'min-width:220px;max-width:320px;flex:1 1 220px;">'
-            # header
-            f'<div style="padding:8px 12px 4px;background:#0e0e1c;">'
-            f'<div style="display:flex;justify-content:space-between;align-items:flex-start;">'
-            f'<div>'
-            f'<a href="{tv_url}" target="_blank" style="font-family:Syne,sans-serif;'
-            f'color:#e8e8f4;font-size:14px;font-weight:700;text-decoration:none;">{sym}</a>'
-            f'<div style="color:#475569;font-size:7.5px;">{sector} · {trend_phase}</div>'
-            f'</div>'
-            f'<div style="text-align:right;">'
-            f'<div style="font-family:JetBrains Mono,monospace;color:#e2e8f0;font-size:13px;font-weight:600;">₹{ltp:,.1f}</div>'
-            f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};font-size:9px;">{chg:+.2f}%</div>'
-            f'</div></div>'
-            # CCI + score row
-            f'<div style="display:flex;gap:6px;align-items:center;margin-top:5px;flex-wrap:wrap;">'
-            f'<span style="background:{cci_col}22;border:1px solid {cci_col}55;color:{cci_col};'
-            f'font-family:JetBrains Mono,monospace;font-size:11px;font-weight:700;'
-            f'padding:2px 8px;border-radius:5px;">CCI {cci:+.0f}</span>'
-            f'<span style="color:#64748b;font-size:8px;">RSI {rsi:.0f} · ADX {adx:.0f} · Score {score:.0f}</span>'
-            f'<span style="margin-left:auto;background:{tier_col}22;border:1px solid {tier_col}44;'
-            f'color:{tier_col};font-size:7px;padding:1px 5px;border-radius:3px;">{tier}</span>'
-            f'</div>'
-            # boosts
-            + (f'<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:5px;">{boost_html}</div>' if boosts else "")
-            + f'</div>'
-            # levels
-            f'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:0;'
-            f'padding:6px 12px 8px;background:#0a0a18;border-top:1px solid #1a1a30;">'
-            + lv("ENTRY", entry, "#94a3b8")
-            + lv("SL",    sl,    "#ef4444")
-            + lv("T1",    t1,    "#38bdf8")
-            + lv("T2",    t2,    "#22c55e")
-            + f'</div>'
-            # readiness bar
-            f'<div style="padding:0 12px 8px;background:#0a0a18;">'
-            f'<div style="display:flex;justify-content:space-between;'
-            f'margin-bottom:3px;font-size:8px;color:#475569;">'
-            f'<span>SETUP_FIB_PULLBACK</span><span style="color:#22c55e;">{score:.0f}/100</span>'
-            f'</div>'
-            f'<div style="background:#1e2a3a;border-radius:2px;height:3px;">'
-            f'<div style="background:#22c55e;width:{min(score,100):.0f}%;height:3px;border-radius:2px;"></div>'
-            f'</div></div>'
-            f'</div>'
+        cci_state_cell = (
+            f'<td><span style="background:{cci_state[1]}22;border:1px solid {cci_state[1]}55;'
+            f'color:{cci_state[1]};font-size:0.68rem;padding:2px 8px;border-radius:4px;'
+            f'font-weight:700;">{cci_state[0]}</span></td>'
         )
 
-    # Render cards in rows of 3
-    cols_per_row = 3
-    for i in range(0, len(display_records), cols_per_row):
-        chunk = display_records[i:i+cols_per_row]
-        cards_html = (
-            '<div style="display:flex;flex-wrap:wrap;gap:12px;'
-            'align-items:stretch;padding-bottom:4px;">'
-            + "".join(_pb_card(r) for r in chunk)
-            + "</div>"
+        rows_html += (
+            f'<tr>'
+            f'<td class="col-rank">{rank}</td>'
+            f'<td class="col-stock">{_tv_link(sym)}</td>'
+            + _pb_score(r.get("Score"))
+            + _pb_cci(cci)
+            + cci_state_cell
+            + _pb_chg(r.get("%Change") or r.get("%Chg"))
+            + _pb_num(r.get("Entry"), "{:.2f}")
+            + _pb_num(r.get("SL"),    "{:.2f}", color="#f85149")
+            + _pb_num(r.get("T1"),    "{:.2f}", color="#58a6ff")
+            + _pb_num(r.get("T2"),    "{:.2f}", color="#3fb950")
+            + _pb_num(rsi,            "{:.0f}")
+            + _pb_boosts(boosts)
+            + _pb_tier(tier)
+            + '</tr>\n'
         )
-        st.markdown(cards_html, unsafe_allow_html=True)
 
-    # ── Full Fib+CCI Analysis (from fib_tab.py) ──────────────────────────────
-    if _FIB_TAB_OK and display_records:
-        st.markdown("---")
-        st.markdown(
-            '<div style="color:#64748b;font-size:9px;margin-bottom:4px;">'
-            '↓ Detailed Fib + CCI analysis for the stocks above</div>',
-            unsafe_allow_html=True,
-        )
-        with st.spinner("Loading Fib + CCI detail…"):
-            _render_fib_tab(display_records, mode)
-    elif not _FIB_TAB_OK:
-        st.info("Install fib_tab.py in the project root to enable the full Fib+CCI analysis panel.")
+    n = len(display_records)
+    subtitle = (
+        f'<span style="color:var(--muted);font-size:0.72rem;">'
+        f'<code style="color:#f97316;background:var(--bg2);padding:1px 6px;border-radius:3px;">'
+        f'trend_up AND in_golden AND CCI ≤ −100</code>'
+        f'&nbsp;·&nbsp;{n} stock{"s" if n != 1 else ""}</span>'
+    )
+    st.markdown(subtitle, unsafe_allow_html=True)
+
+    table_html = f"""
+<div class="rt-wrap">
+<table class="rt">
+  {thead}
+  <tbody>
+    {rows_html}
+  </tbody>
+</table>
+</div>
+"""
+    st.markdown(table_html, unsafe_allow_html=True)
 
     # Download
-    if not df.empty:
-        csv = df.to_csv(index=False)
-        st.download_button(
-            "⬇️ Download FIB_PULLBACK CSV", data=csv,
-            file_name=f"scan_fib_pullback_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv", key="dl_FIB_PULLBACK",
-        )
+    with col_dl:
+        if not df.empty:
+            st.download_button(
+                "⬇️ CSV", data=df.to_csv(index=False),
+                file_name=f"fib_pullback_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv", key="dl_FIB_PULLBACK",
+            )
 
 
 # ── MAIN RENDER ───────────────────────────────────────────────────
