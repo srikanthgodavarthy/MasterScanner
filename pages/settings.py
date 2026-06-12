@@ -672,5 +672,3 @@ def render() -> dict:
         "t1_adx_min":          ss.get("t1_adx_min",          DEFAULTS["t1_adx_min"]),
         "t1_use_adx":          ss.get("t1_use_adx",          DEFAULTS["t1_use_adx"]),
     }
-PYEOF
-echo "written"
