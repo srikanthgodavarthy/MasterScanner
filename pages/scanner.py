@@ -698,6 +698,229 @@ def _tv_link(symbol: str) -> str:
 
 # ── MARKET STATUS ROW ──────────────────────────────────────────────
 
+def _scoring_explainer_html() -> str:
+    """
+    Static HTML panel: 'How CV1 Scores & Signal Classes are calculated'.
+    Mirrors the style from the reference screenshot — scoring table, grade
+    thresholds, signal class priority table, and note on per-stock breakdown.
+    """
+    # ── Dimension rows ──────────────────────────────────────────────
+    dim_rows = [
+        # (Dimension, colour, sub-factors list)
+        ("Leadership", "#a371f7", [
+            ("RS Composite (multi-TF)",         30),
+            ("Trend Age — 21–50 bar sweet-spot", 25),
+            ("ADX Strength (≥40 tier)",          20),
+            ("Persistent Strength",              15),
+            ("EMA20 Slope (5-bar velocity)",     10),
+        ]),
+        ("Conviction", "#3fb950", [
+            ("Trend Structure (EMA + Cloud)",    30),
+            ("Fibonacci Pullback Zone",          25),
+            ("CCI Recovery / OS Cross",          25),
+            ("Volume Sponsorship",               15),
+            ("Squeeze Release",                   5),
+        ]),
+        ("Entry Quality", "#d29922", [
+            ("EMA20 Distance (% above)",         30),
+            ("Pivot High Distance",              20),
+            ("Price Move Since Setup",           20),
+            ("EMA50 Distance (structural)",      15),
+            ("Bars Since Setup (ATR-band)",      15),
+        ]),
+    ]
+
+    def _dim_block(dim, color, factors):
+        rows = ""
+        for label, pts in factors:
+            rows += (
+                f'<tr>'
+                f'<td style="padding:3px 10px 3px 0;font-size:11px;color:#e6edf3;">{label}</td>'
+                f'<td style="padding:3px 0;font-size:11px;font-weight:700;color:{color};'
+                f'text-align:right;font-family:var(--mono);white-space:nowrap">+{pts}</td>'
+                f'<td style="padding:3px 0 3px 16px;font-size:10px;color:#8b949e;">'
+                f'{"Fully earned or zero" if pts >= 20 else "Partial credit available"}</td>'
+                f'</tr>'
+            )
+        return (
+            f'<div style="margin-bottom:14px;">'
+            f'<div style="font-size:10px;font-weight:700;color:{color};letter-spacing:0.08em;'
+            f'text-transform:uppercase;margin-bottom:5px;">{dim} <span style="font-size:9px;'
+            f'font-weight:400;color:#8b949e">(0–100)</span></div>'
+            f'<table style="border-collapse:collapse;width:100%">{rows}</table>'
+            f'</div>'
+        )
+
+    # ── Grade thresholds ─────────────────────────────────────────────
+    grades = [
+        ("#f5c542", "Leadership ≥ 80",    "Gold · Elite leadership — outpacing the market"),
+        ("#3fb950", "Leadership ≥ 65",    "Green · Required gate for EXECUTE/ELITE"),
+        ("#d29922", "Leadership 35–64",   "Amber · Developing — monitor for improvement"),
+        ("#f85149", "Leadership < 35",    "Red · Weak — below all gate thresholds"),
+        ("#3fb950", "Conviction ≥ 38",    "Green gate — minimum for actionable signal"),
+        ("#d29922", "Entry Quality ≥ 50", "Amber gate — tight entry zone required"),
+    ]
+    grade_html = "".join(
+        f'<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px;">'
+        f'<span style="width:9px;height:9px;border-radius:50%;background:{c};'
+        f'flex-shrink:0;margin-top:2px;display:inline-block"></span>'
+        f'<span style="font-size:11px;color:#e6edf3;font-family:var(--mono)">{label}</span>'
+        f'<span style="font-size:10px;color:#8b949e">&mdash; {desc}</span>'
+        f'</div>'
+        for c, label, desc in grades
+    )
+
+    # ── Signal class table ──────────────────────────────────────────
+    sc_rows_data = [
+        ("ELITE",   "#f5c542", "Highest Conviction",
+         "Leadership ≥ 65 · Conviction ≥ 38 · Entry Quality ≥ 50 · TREND regime only · Extension ≤ 60"),
+        ("EXECUTE", "#3fb950", "Actionable Setup",
+         "Leadership ≥ 65 · Conviction ≥ 38 · Entry Quality ≥ 50 · Any regime · Extension ≤ 80"),
+        ("WATCH",   "#d29922", "Setup Building",
+         "Leadership ≥ 35 OR Conviction ≥ 20 · Not all gates met · Monitor for upgrade"),
+        ("SKIP",    "#484f58", "Below Threshold",
+         "All three dimensions below gate · No actionable setup"),
+    ]
+    sc_rows_html = "".join(
+        f'<tr style="border-bottom:1px solid rgba(255,255,255,0.06)">'
+        f'<td style="padding:6px 12px 6px 0">'
+        f'<span style="background:{c}18;border:1px solid {c}44;color:{c};'
+        f'font-size:10px;font-weight:700;border-radius:4px;padding:2px 8px;'
+        f'font-family:var(--mono)">{sc}</span></td>'
+        f'<td style="padding:6px 12px 6px 0;font-size:11px;color:#e6edf3;white-space:nowrap">{name}</td>'
+        f'<td style="padding:6px 0;font-size:10px;color:#8b949e">{conds}</td>'
+        f'</tr>'
+        for sc, c, name, conds in sc_rows_data
+    )
+
+    return f"""
+<div style="font-family:'JetBrains Mono','Fira Code',monospace;">
+  <p style="font-size:11px;color:#8b949e;margin:0 0 16px;">
+    CV1 scoring uses three independent 0–100 dimensions. Each dimension has
+    5 sub-factors. Sub-factors award partial or full credit — no partial credit
+    on binary gates.
+  </p>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px;margin-bottom:18px;">
+    {"".join(_dim_block(d, c, f) for d, c, f in dim_rows)}
+  </div>
+
+  <div style="border-top:1px solid rgba(255,255,255,0.08);padding-top:14px;margin-bottom:18px;">
+    <div style="font-size:10px;font-weight:700;color:#8b949e;letter-spacing:0.08em;
+    text-transform:uppercase;margin-bottom:8px;">Gate Thresholds</div>
+    {grade_html}
+  </div>
+
+  <div style="border-top:1px solid rgba(255,255,255,0.08);padding-top:14px;margin-bottom:10px;">
+    <div style="font-size:10px;font-weight:700;color:#8b949e;letter-spacing:0.08em;
+    text-transform:uppercase;margin-bottom:8px;">Signal Class — Priority (ELITE &gt; EXECUTE &gt; WATCH &gt; SKIP)</div>
+    <table style="border-collapse:collapse;width:100%">{sc_rows_html}</table>
+  </div>
+
+  <p style="font-size:10px;color:#8b949e;margin:10px 0 0;font-style:italic;">
+    Only the highest-priority class that all gates pass is assigned.
+    Use the per-stock breakdown (inside each tab) to see exactly which sub-factors fired.
+  </p>
+</div>
+"""
+
+
+def _perstock_pills_html(df: pd.DataFrame) -> str:
+    """
+    Render a compact per-stock component pill strip for every stock in df.
+    Shows: symbol · SignalClass badge · then coloured pills for each sub-factor
+    that contributed points, grouped by dimension.
+    """
+    if df.empty:
+        return ""
+
+    # Sub-factor column → (label, max_pts, dim_color)
+    FACTORS = [
+        ("_cv1_ls_rs",       "RS Composite",   30, "#a371f7"),
+        ("_cv1_ls_age",      "Trend Age",       25, "#a371f7"),
+        ("_cv1_ls_adx",      "ADX Str",         20, "#a371f7"),
+        ("_cv1_ls_ps",       "Pers. Strength",  15, "#a371f7"),
+        ("_cv1_ls_slope",    "EMA Slope",       10, "#a371f7"),
+        ("_cv1_cv_structure","Trend Struct",     30, "#3fb950"),
+        ("_cv1_cv_fib",      "Fib Pullback",    25, "#3fb950"),
+        ("_cv1_cv_cci",      "CCI Recovery",    25, "#3fb950"),
+        ("_cv1_cv_volume",   "Vol Sponsor",     15, "#3fb950"),
+        ("_cv1_cv_squeeze",  "Squeeze",          5, "#3fb950"),
+        ("_cv1_eq_ema20",    "EMA20 Dist",      30, "#d29922"),
+        ("_cv1_eq_pivot",    "Pivot Dist",      20, "#d29922"),
+        ("_cv1_eq_move",     "Price Move",      20, "#d29922"),
+        ("_cv1_eq_ema50",    "EMA50 Dist",      15, "#d29922"),
+        ("_cv1_eq_bars",     "Bars Setup",      15, "#d29922"),
+    ]
+    # Filter to columns that actually exist
+    avail = [(col, lbl, mx, clr) for col, lbl, mx, clr in FACTORS if col in df.columns]
+
+    if not avail:
+        return ""
+
+    rows_html = ""
+    for _, row in df.iterrows():
+        stock = str(row.get("Stock", row.get("Symbol", "?")))
+        sc    = str(row.get("CV1_SignalClass", "WATCH"))
+        ls    = int(row.get("CV1_Leadership",   0))
+        cv    = int(row.get("CV1_Conviction",   0))
+        eq    = int(row.get("CV1_EntryQuality", 0))
+        sc_c, _ = _SC_STYLE.get(sc, ("#484f58", sc))
+
+        # Score pills
+        score_html = (
+            f'<span style="font-size:10px;color:#a371f7;font-weight:700">'
+            f'L:{ls}</span>'
+            f'<span style="font-size:10px;color:#8b949e;margin:0 3px">/</span>'
+            f'<span style="font-size:10px;color:#3fb950;font-weight:700">'
+            f'C:{cv}</span>'
+            f'<span style="font-size:10px;color:#8b949e;margin:0 3px">/</span>'
+            f'<span style="font-size:10px;color:#d29922;font-weight:700">'
+            f'EQ:{eq}</span>'
+        )
+
+        # Factor pills — only show factors that earned > 0 pts
+        pills = ""
+        for col, lbl, mx, clr in avail:
+            pts = int(row.get(col, 0))
+            if pts > 0:
+                pills += (
+                    f'<span style="background:{clr}18;border:1px solid {clr}44;'
+                    f'color:{clr};border-radius:4px;padding:1px 7px;font-size:10px;'
+                    f'white-space:nowrap">'
+                    f'{lbl} (+{pts})</span>'
+                )
+
+        _no_factors = '<span style="font-size:10px;color:#8b949e">no sub-factors available</span>'
+        rows_html += (
+            f'<div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;'
+            f'padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.05);">'
+            f'<span style="font-size:12px;font-weight:700;color:#e6edf3;'
+            f'font-family:\'JetBrains Mono\',monospace;min-width:90px">{stock}</span>'
+            f'<span style="background:{sc_c}18;border:1px solid {sc_c}44;color:{sc_c};'
+            f'font-size:9px;font-weight:700;border-radius:4px;padding:1px 7px;'
+            f'white-space:nowrap">{sc}</span>'
+            f'<span style="margin:0 4px 0 2px;">{score_html}</span>'
+            f'·&nbsp;'
+            f'{pills if pills else _no_factors}'
+            f'</div>'
+        )
+
+    if not rows_html:
+        return ""
+
+    return (
+        f'<div style="font-family:\'JetBrains Mono\',\'Fira Code\',monospace;'
+        f'background:#161b22;border:1px solid rgba(255,255,255,0.08);'
+        f'border-radius:8px;padding:10px 14px;margin-top:8px;">'
+        f'<div style="font-size:9px;font-weight:700;color:#8b949e;'
+        f'letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px;">'
+        f'Per-stock breakdown (signalled stocks only)</div>'
+        f'{rows_html}'
+        f'</div>'
+    )
+
+
 def _market_status_row(summary: dict, scan_time: str,
                         nifty_price: float = 0, nifty_chg_pct: float | None = None) -> str:
     r = summary.get("regime", "RANGE")
@@ -1887,7 +2110,7 @@ def render(settings: dict | None = None):
   --border:rgba(255,255,255,0.08);--gold:#f5c542;--green:#3fb950;
   --amber:#d29922;--red:#f85149;--muted:#8b949e;--text:#e6edf3;
   --mono:'JetBrains Mono','Fira Code',monospace;}
-body{background:#0d1117;margin:0;padding:4px 0;}
+body{background:#0d1117;margin:0;padding:4px 0 2px;}
 .qual-summary{background:var(--bg1);border:1px solid var(--border);
   border-left:3px solid #4ade80;border-radius:8px;padding:10px 14px;
   margin:0;font-family:var(--mono);font-size:12px;}
@@ -1906,9 +2129,17 @@ body{background:#0d1117;margin:0;padding:4px 0;}
 .qs-reject-reason{color:#f85149;font-size:10px;}
 </style>
 """
-        _qs_lines = _qs_html.count('qs-reject-item') + _qs_html.count('qs-reject-block') * 2 + 6
-        _qs_height = max(110, min(500, _qs_lines * 26))
+        # Tighter height: base (header + stats) + per-block header + flex-wrapped item rows
+        _n_items  = _qs_html.count('qs-reject-item')
+        _n_blocks = _qs_html.count('qs-reject-block')
+        _item_rows = max(1, (_n_items + 3) // 4)   # ~4 items per flex-wrap row
+        _qs_height = 72 + _n_blocks * 32 + _item_rows * 26
+        _qs_height = max(90, min(480, _qs_height))
         _stc.html(_QS_CSS + _qs_html, height=_qs_height, scrolling=False)
+
+    # ── Scoring Explainer ─────────────────────────────────────────
+    with st.expander("📊 How CV1 Scores & Signal Classes are calculated", expanded=False):
+        st.markdown(_scoring_explainer_html(), unsafe_allow_html=True)
 
     # ── Toggles ──────────────────────────────────────────────────
     tgl1, tgl2, tgl3 = st.columns([2, 2, 2])
@@ -2066,6 +2297,11 @@ body{background:#0d1117;margin:0;padding:4px 0;}
             if "regime_tier" in disp.columns:
                 disp = disp.drop(columns=["regime_tier"])
             st.markdown(_render_html_table(disp), unsafe_allow_html=True)
+
+            # ── Per-stock component pills ─────────────────────────
+            _pills_html = _perstock_pills_html(df_subset)
+            if _pills_html:
+                st.markdown(_pills_html, unsafe_allow_html=True)
 
             # Per-stock breakdown
             if _show_detail and has_cv1:
