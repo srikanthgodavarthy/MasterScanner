@@ -40,6 +40,12 @@ from utils.regime_engine   import (
 )
 from utils.supabase_client import save_scan_snapshot, load_watchlist, add_to_watchlist, _is_available
 
+try:
+    from fib_tab import render_fib_tab as _render_fib_tab
+    _FIB_TAB_OK = True
+except ImportError:
+    _FIB_TAB_OK = False
+
 # ── CONSTANTS ─────────────────────────────────────────────────────
 REGIME_COLORS = {
     "TREND":    ("#3fb950", "#0d1117", "#1a3a1a"),
@@ -1474,6 +1480,243 @@ def _validation_row_html(stock: str, sc: str, category: str) -> str:
     )
 
 
+
+# ── FIB PULLBACK TAB RENDERER ──────────────────────────────────────────────────
+
+def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None:
+    """
+    Dedicated renderer for the 📐 Fib Pullback Opportunities tab.
+
+    Shows stocks that pass SETUP_FIB_PULLBACK criteria:
+        trend_up AND in_golden AND CCI ≤ -100
+    but are NOT in the Elite/Execute bucket — these are the good setups
+    being filtered out by the conviction score gate.
+
+    Optional boost badges: fib_grade_excellent, fib_grade_good, vcp, nr7, harmonic_bull
+    """
+    st.markdown(
+        '<link rel="preconnect" href="https://fonts.googleapis.com">'
+        '<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700'
+        '&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div style="font-family:Syne,sans-serif;color:#e8e8f4;font-size:20px;'
+        'font-weight:700;letter-spacing:.03em;margin-bottom:2px;">'
+        '📐 Fib Pullback Opportunities</div>'
+        '<div style="color:#475569;font-size:11px;margin-bottom:4px;">'
+        'Stocks filtered out of Elite/Execute — recovered by Fib+CCI criteria: '
+        '<code style="color:#f97316;background:#1a1a2e;padding:1px 5px;border-radius:3px;">'
+        'trend_up AND in_golden AND CCI ≤ −100</code></div>',
+        unsafe_allow_html=True,
+    )
+
+    if not records:
+        st.info("No stocks meet SETUP_FIB_PULLBACK criteria in this scan. "
+                "Try scanning more symbols or check market conditions.")
+        return
+
+    # ── Boost filter controls ────────────────────────────────────────────────
+    BOOST_LABELS = {
+        "fib_grade_excellent": ("★ Exact Golden", "#22c55e"),
+        "fib_grade_good":      ("◎ Relaxed Golden", "#84cc16"),
+        "vcp":                 ("VCP / Squeeze",   "#38bdf8"),
+        "nr7":                 ("NR7 Compression", "#a78bfa"),
+        "harmonic_bull":       ("🦋 Harmonic Bull", "#f59e0b"),
+    }
+
+    col_f, col_sort = st.columns([3, 1])
+    with col_f:
+        boost_filter = st.multiselect(
+            "Show only stocks with boost(s):",
+            options=list(BOOST_LABELS.keys()),
+            format_func=lambda x: BOOST_LABELS[x][0],
+            key="fib_pb_boost_filter",
+            placeholder="All stocks (no filter)",
+        )
+    with col_sort:
+        sort_mode = st.selectbox("Sort by", ["CCI (most OS)", "Score ↓", "Symbol A→Z"],
+                                 key="fib_pb_sort")
+
+    # ── Apply boost filter ───────────────────────────────────────────────────
+    display_records = records
+    if boost_filter:
+        display_records = [r for r in records
+                           if any(b in r.get("_fib_pb_boosts", []) for b in boost_filter)]
+
+    # ── Sort ────────────────────────────────────────────────────────────────
+    if sort_mode == "CCI (most OS)":
+        display_records = sorted(display_records, key=lambda r: float(r.get("CCI") or r.get("_cci_raw") or 0))
+    elif sort_mode == "Score ↓":
+        display_records = sorted(display_records, key=lambda r: -(float(r.get("Score") or 0)))
+    else:
+        display_records = sorted(display_records, key=lambda r: str(r.get("Symbol") or r.get("Stock") or ""))
+
+    # ── Summary metrics bar ──────────────────────────────────────────────────
+    n_total     = len(records)
+    n_exact     = sum(1 for r in records if "fib_grade_excellent" in r.get("_fib_pb_boosts", []))
+    n_relaxed   = sum(1 for r in records if "fib_grade_good"      in r.get("_fib_pb_boosts", []))
+    n_harmonic  = sum(1 for r in records if "harmonic_bull"        in r.get("_fib_pb_boosts", []))
+    n_vcp       = sum(1 for r in records if "vcp"                  in r.get("_fib_pb_boosts", []))
+    n_showing   = len(display_records)
+
+    st.markdown(
+        f'<div style="display:flex;flex-wrap:wrap;gap:8px;padding:10px 0 14px;">'
+        f'<div style="background:#22c55e11;border:1px solid #22c55e33;border-radius:6px;padding:6px 14px;text-align:center;">'
+        f'<div style="font-family:JetBrains Mono,monospace;color:#22c55e;font-size:20px;font-weight:700;">{n_total}</div>'
+        f'<div style="color:#64748b;font-size:8px;">Total FIB_PULLBACK</div></div>'
+        f'<div style="background:#22c55e11;border:1px solid #22c55e33;border-radius:6px;padding:6px 14px;text-align:center;">'
+        f'<div style="font-family:JetBrains Mono,monospace;color:#22c55e;font-size:20px;font-weight:700;">{n_exact}</div>'
+        f'<div style="color:#64748b;font-size:8px;">★ Exact Golden</div></div>'
+        f'<div style="background:#84cc1611;border:1px solid #84cc1633;border-radius:6px;padding:6px 14px;text-align:center;">'
+        f'<div style="font-family:JetBrains Mono,monospace;color:#84cc16;font-size:20px;font-weight:700;">{n_relaxed}</div>'
+        f'<div style="color:#64748b;font-size:8px;">◎ Relaxed Golden</div></div>'
+        f'<div style="background:#f59e0b11;border:1px solid #f59e0b33;border-radius:6px;padding:6px 14px;text-align:center;">'
+        f'<div style="font-family:JetBrains Mono,monospace;color:#f59e0b;font-size:20px;font-weight:700;">{n_harmonic}</div>'
+        f'<div style="color:#64748b;font-size:8px;">🦋 Harmonic</div></div>'
+        f'<div style="background:#38bdf811;border:1px solid #38bdf833;border-radius:6px;padding:6px 14px;text-align:center;">'
+        f'<div style="font-family:JetBrains Mono,monospace;color:#38bdf8;font-size:20px;font-weight:700;">{n_vcp}</div>'
+        f'<div style="color:#64748b;font-size:8px;">VCP/Squeeze</div></div>'
+        f'<div style="margin-left:auto;background:#1a1a2e;border:1px solid #2a2a4e;border-radius:6px;padding:6px 14px;text-align:center;">'
+        f'<div style="font-family:JetBrains Mono,monospace;color:#e2e8f0;font-size:20px;font-weight:700;">{n_showing}</div>'
+        f'<div style="color:#64748b;font-size:8px;">Showing</div></div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Stock cards ──────────────────────────────────────────────────────────
+    def _pb_card(r: dict) -> str:
+        sym     = r.get("Symbol") or r.get("Stock") or "?"
+        ltp     = float(r.get("LTP") or r.get("CMP") or 0)
+        chg     = float(r.get("%Change") or r.get("%Chg") or 0)
+        cci     = float(r.get("CCI") or r.get("_cci_raw") or 0)
+        score   = float(r.get("Score") or 0)
+        rsi     = float(r.get("RSI") or r.get("_rsi") or 0)
+        sl      = r.get("SL"); t1 = r.get("T1"); t2 = r.get("T2")
+        entry   = r.get("Entry")
+        sector  = r.get("Sector") or r.get("_sector") or ""
+        boosts  = r.get("_fib_pb_boosts") or []
+        adx     = float(r.get("ADX") or 0)
+        tier    = r.get("Tier") or r.get("CV1_SignalClass") or ""
+        trend_phase = r.get("TrendPhase") or ""
+
+        chg_col = "#22c55e" if chg >= 0 else "#ef4444"
+        cci_col = "#22c55e" if cci <= -100 else "#f59e0b"
+
+        # ── Boost badge strip ──────────────────────────────────────
+        _BOOST_META = {
+            "fib_grade_excellent": ("#22c55e", "★ EXACT GZ"),
+            "fib_grade_good":      ("#84cc16", "◎ RELAXED GZ"),
+            "vcp":                 ("#38bdf8", "VCP"),
+            "nr7":                 ("#a78bfa", "NR7"),
+            "harmonic_bull":       ("#f59e0b", "🦋 HARM"),
+        }
+        boost_html = ""
+        for b in boosts:
+            bc, bl = _BOOST_META.get(b, ("#64748b", b.upper()))
+            boost_html += (
+                f'<span style="background:{bc}1a;border:1px solid {bc}55;'
+                f'color:{bc};font-size:7px;padding:1px 5px;border-radius:3px;'
+                f'font-weight:700;letter-spacing:.04em;">{bl}</span>'
+            )
+
+        def lv(label, val, col):
+            v = f"₹{val:,.0f}" if val else "—"
+            return (
+                f'<div style="text-align:center;">'
+                f'<div style="color:#475569;font-size:7px;">{label}</div>'
+                f'<div style="font-family:JetBrains Mono,monospace;color:{col};'
+                f'font-size:9px;font-weight:600;">{v}</div>'
+                f'</div>'
+            )
+
+        tier_col = {"ELITE":"#f5c542","EXECUTE":"#22c55e","WATCH":"#d29922","SKIP":"#475569"}.get(tier,"#475569")
+        tv_url   = f"https://www.tradingview.com/chart/?symbol=NSE:{sym}"
+
+        return (
+            f'<div style="background:#111120;border:1.5px solid #22c55e44;'
+            f'border-top:3px solid #22c55e;border-radius:10px;overflow:hidden;'
+            f'min-width:220px;max-width:320px;flex:1 1 220px;">'
+            # header
+            f'<div style="padding:8px 12px 4px;background:#0e0e1c;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:flex-start;">'
+            f'<div>'
+            f'<a href="{tv_url}" target="_blank" style="font-family:Syne,sans-serif;'
+            f'color:#e8e8f4;font-size:14px;font-weight:700;text-decoration:none;">{sym}</a>'
+            f'<div style="color:#475569;font-size:7.5px;">{sector} · {trend_phase}</div>'
+            f'</div>'
+            f'<div style="text-align:right;">'
+            f'<div style="font-family:JetBrains Mono,monospace;color:#e2e8f0;font-size:13px;font-weight:600;">₹{ltp:,.1f}</div>'
+            f'<div style="font-family:JetBrains Mono,monospace;color:{chg_col};font-size:9px;">{chg:+.2f}%</div>'
+            f'</div></div>'
+            # CCI + score row
+            f'<div style="display:flex;gap:6px;align-items:center;margin-top:5px;flex-wrap:wrap;">'
+            f'<span style="background:{cci_col}22;border:1px solid {cci_col}55;color:{cci_col};'
+            f'font-family:JetBrains Mono,monospace;font-size:11px;font-weight:700;'
+            f'padding:2px 8px;border-radius:5px;">CCI {cci:+.0f}</span>'
+            f'<span style="color:#64748b;font-size:8px;">RSI {rsi:.0f} · ADX {adx:.0f} · Score {score:.0f}</span>'
+            f'<span style="margin-left:auto;background:{tier_col}22;border:1px solid {tier_col}44;'
+            f'color:{tier_col};font-size:7px;padding:1px 5px;border-radius:3px;">{tier}</span>'
+            f'</div>'
+            # boosts
+            + (f'<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:5px;">{boost_html}</div>' if boosts else "")
+            + f'</div>'
+            # levels
+            f'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:0;'
+            f'padding:6px 12px 8px;background:#0a0a18;border-top:1px solid #1a1a30;">'
+            + lv("ENTRY", entry, "#94a3b8")
+            + lv("SL",    sl,    "#ef4444")
+            + lv("T1",    t1,    "#38bdf8")
+            + lv("T2",    t2,    "#22c55e")
+            + f'</div>'
+            # readiness bar
+            f'<div style="padding:0 12px 8px;background:#0a0a18;">'
+            f'<div style="display:flex;justify-content:space-between;'
+            f'margin-bottom:3px;font-size:8px;color:#475569;">'
+            f'<span>SETUP_FIB_PULLBACK</span><span style="color:#22c55e;">{score:.0f}/100</span>'
+            f'</div>'
+            f'<div style="background:#1e2a3a;border-radius:2px;height:3px;">'
+            f'<div style="background:#22c55e;width:{min(score,100):.0f}%;height:3px;border-radius:2px;"></div>'
+            f'</div></div>'
+            f'</div>'
+        )
+
+    # Render cards in rows of 3
+    cols_per_row = 3
+    for i in range(0, len(display_records), cols_per_row):
+        chunk = display_records[i:i+cols_per_row]
+        cards_html = (
+            '<div style="display:flex;flex-wrap:wrap;gap:12px;'
+            'align-items:stretch;padding-bottom:4px;">'
+            + "".join(_pb_card(r) for r in chunk)
+            + "</div>"
+        )
+        st.markdown(cards_html, unsafe_allow_html=True)
+
+    # ── Full Fib+CCI Analysis (from fib_tab.py) ──────────────────────────────
+    if _FIB_TAB_OK and display_records:
+        st.markdown("---")
+        st.markdown(
+            '<div style="color:#64748b;font-size:9px;margin-bottom:4px;">'
+            '↓ Detailed Fib + CCI analysis for the stocks above</div>',
+            unsafe_allow_html=True,
+        )
+        with st.spinner("Loading Fib + CCI detail…"):
+            _render_fib_tab(display_records, mode)
+    elif not _FIB_TAB_OK:
+        st.info("Install fib_tab.py in the project root to enable the full Fib+CCI analysis panel.")
+
+    # Download
+    if not df.empty:
+        csv = df.to_csv(index=False)
+        st.download_button(
+            "⬇️ Download FIB_PULLBACK CSV", data=csv,
+            file_name=f"scan_fib_pullback_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv", key="dl_FIB_PULLBACK",
+        )
+
+
 # ── MAIN RENDER ───────────────────────────────────────────────────
 
 def render(settings: dict | None = None):
@@ -1717,13 +1960,63 @@ body{background:#0d1117;margin:0;padding:4px 0;}
         execute_df = df_aug[df_aug["Category"].isin(["High Conviction", "Actionable"])].copy() if has_cat else pd.DataFrame()
         watch_df   = df_aug[df_aug["Category"] == "Setup Building"].copy() if has_cat else pd.DataFrame()
 
+    # ── SETUP_FIB_PULLBACK detection ─────────────────────────────────────────────
+    # Rules: trend_up AND in_golden AND cci <= -100
+    # Boosts (optional): fib_grade_good, fib_grade_excellent, vcp, nr7, harmonic_bull
+    # These are the stocks being filtered OUT of Elite/Execute but still high quality.
+    def _is_fib_pullback(row) -> bool:
+        trend_up  = bool(row.get("_trend_up", False)) or (
+            str(row.get("TrendPhase", "NONE")).upper() != "NONE"
+        )
+        in_golden = bool(row.get("_in_golden", False)) or bool(row.get("_in_golden_relaxed", False))
+        cci_val   = float(row.get("CCI") or row.get("_cci_raw") or 0)
+        return trend_up and in_golden and cci_val <= -100
+
+    def _fib_pullback_boosts(row) -> list:
+        """Return list of active boost tags for a FIB_PULLBACK stock."""
+        boosts = []
+        if bool(row.get("_in_golden", False)):
+            boosts.append("fib_grade_excellent")
+        elif bool(row.get("_in_golden_relaxed", False)):
+            boosts.append("fib_grade_good")
+        if bool(row.get("_t2_compression", False)) or bool(row.get("_squeeze_on", False)):
+            boosts.append("vcp")
+        # nr7: proxy via compression_break flag (tight range expansion)
+        if bool(row.get("_compression_break", False)):
+            boosts.append("nr7")
+        if bool(row.get("_harm_bull", False)):
+            boosts.append("harmonic_bull")
+        return boosts
+
+    fib_pb_records = []
+    if not df_aug.empty:
+        for _, row in df_aug.iterrows():
+            if _is_fib_pullback(row):
+                rec = row.to_dict()
+                rec["Setup"] = "FIB_PULLBACK"
+                rec["_fib_pb_boosts"] = _fib_pullback_boosts(row)
+                # Normalise field names for render_fib_tab compatibility
+                rec.setdefault("Symbol",        rec.get("Stock", ""))
+                rec.setdefault("LTP",           rec.get("CMP",   rec.get("Entry", 0)))
+                rec.setdefault("%Change",        rec.get("%Chg",  0))
+                rec.setdefault("InGolden",       rec.get("_in_golden", False))
+                rec.setdefault("TrendUp",        rec.get("_trend_up",
+                    str(rec.get("TrendPhase","NONE")).upper() != "NONE"))
+                rec.setdefault("ReadinessScore", rec.get("Score", 0))
+                rec.setdefault("RSI",            rec.get("_rsi", 0))
+                rec.setdefault("ATR",            0)
+                fib_pb_records.append(rec)
+
+    fib_pb_df = pd.DataFrame(fib_pb_records) if fib_pb_records else pd.DataFrame()
+
     tab_labels = [
         f"🌟 Elite ({len(elite_df)})",
         f"⚡ Execute ({len(execute_df)})",
         f"👁 Watch ({len(watch_df)})",
+        f"📐 Fib Pullback ({len(fib_pb_records)})",
     ]
-    df_sets  = [elite_df, execute_df, watch_df]
-    set_keys = ["ELITE", "EXECUTE", "WATCH"]
+    df_sets  = [elite_df, execute_df, watch_df, fib_pb_df]
+    set_keys = ["ELITE", "EXECUTE", "WATCH", "FIB_PULLBACK"]
 
     if show_skip:
         skip_df = _sc_df("SKIP") if has_cv1 else pd.DataFrame()
@@ -1735,6 +2028,11 @@ body{background:#0d1117;margin:0;padding:4px 0;}
 
     for tab, df_subset, sc_key in zip(tabs, df_sets, set_keys):
         with tab:
+            # ── FIB_PULLBACK tab gets its own rich renderer ──────────────────────
+            if sc_key == "FIB_PULLBACK":
+                _render_fib_pullback_tab(fib_pb_records, df_subset, "Swing")
+                continue
+
             sc_color, sc_label = _SC_STYLE.get(sc_key, ("#484f58", sc_key))
 
             if df_subset.empty:
