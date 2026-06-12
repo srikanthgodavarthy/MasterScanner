@@ -7,7 +7,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 st.set_page_config(
-    page_title="NSE Master Scanner Pro",
+    page_title="MasterScanner — Nifty 500",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",  # sidebar hidden — all controls are inline
@@ -74,8 +74,8 @@ footer { display:none !important; }
 
 st.markdown("""
 <div class="scanner-header">
-    <p class="scanner-title">⚡ NSE Master Scanner Pro</p>
-    <p class="scanner-subtitle"><span class="status-dot"></span>Live · Nifty 500 · Regime Engine v2 · Trend · Momentum · Structure · Volume · Quality</p>
+    <p class="scanner-title">⚡ MasterScanner</p>
+    <p class="scanner-subtitle"><span class="status-dot"></span>Nifty 500 · Regime Engine v2 · Trend · Momentum · Structure · Volume · Quality</p>
 </div>
 """, unsafe_allow_html=True)
 
