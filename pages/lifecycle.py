@@ -602,209 +602,84 @@ def render():
                     f"`{lc_df['scan_date'].astype(str).max() if 'scan_date' in lc_df.columns else 'N/A'}`")
         st.markdown("---")
     
-        # ── Table header ─────────────────────────────────────────────
-        st.markdown(
-            '<div class="lc-row lc-row-header">'
-            '<div>Symbol</div><div>Stage</div><div>Leadership</div>'
-            '<div>Conviction</div><div>Entry Qual</div><div>Trend Quality</div>'
-            '<div>ADX</div><div>RS%</div><div>Score</div>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-    
-        # ── Table rows ────────────────────────────────────────────────
-        for _, row in df_view.head(150).iterrows():
-            sym   = str(row.get("symbol", ""))
-            stage = str(row.get("stage", STAGE_FORMING))
-            ls    = _ni(row.get("leadership"))
-            cv    = _ni(row.get("conviction"))
-            eq    = _ni(row.get("entry_quality"))
-            tq    = _ni(row.get("trend_quality"))
-            adx   = _n(row.get("adx"))
-            rs    = _n(row.get("rs_composite"))
-            sc    = _ni(row.get("score"))
-    
-            st.markdown(
-                f'<div class="lc-row">'
-                f'<div style="font-weight:700">{sym}</div>'
-                f'<div>{_stage_badge(stage)}</div>'
-                f'<div>{_score_pill(ls)}</div>'
-                f'<div>{_score_pill(cv)}</div>'
-                f'<div>{_score_pill(eq)}</div>'
-                f'<div>{_score_pill(tq)}</div>'
-                f'<div style="color:#8b949e">{adx:.0f}</div>'
-                f'<div style="color:#58a6ff">{rs:.1f}%</div>'
-                f'<div>{_score_pill(sc)}</div>'
-                f'</div>',
-                unsafe_allow_html=True,
+        # ── Table ─────────────────────────────────────────────────────
+        def _build_table_html(df: pd.DataFrame) -> str:
+            col_labels = [
+                "Symbol", "Stage", "Category",
+                "Leadership", "Conviction", "Entry Qual", "Trend Quality",
+                "ADX", "RS%", "Score",
+            ]
+            th = "".join(
+                f'<th style="padding:8px 10px;text-align:left;font-size:10px;'
+                f'font-weight:700;color:#8b949e;text-transform:uppercase;'
+                f'letter-spacing:0.06em;border-bottom:1px solid rgba(255,255,255,0.08);'
+                f'white-space:nowrap">{c}</th>'
+                for c in col_labels
             )
-    
-            # ── Expandable detail row ─────────────────────────────────
-            with st.expander(f"▸ {sym} detail", expanded=False):
-                # ── Context tags row ──────────────────────────────────
-                _cat        = str(row.get("category",    ""))
-                _phase      = str(row.get("trend_phase", "")).strip()
-                _bband      = str(row.get("bars_band",   "")).strip()
-                _why_raw    = str(row.get("why_included", ""))
-                _risk_raw   = str(row.get("risk_factors",  ""))
 
-                # Category / Phase / Bars Band — only show non-empty values
-                _tag_parts = []
-                if _cat:   _tag_parts.append(f"**Category** &nbsp;`{_cat}`")
-                if _phase: _tag_parts.append(f"**Phase** &nbsp;`{_phase}`")
-                if _bband: _tag_parts.append(f"**Bars Band** &nbsp;`{_bband}`")
-                if _tag_parts:
-                    st.markdown(" &nbsp;·&nbsp; ".join(_tag_parts))
+            def _pill(val, hi=80, mid=65, lo=50, vlo=35):
+                v = int(val) if val else 0
+                c = ("#f5c542" if v >= hi else "#3fb950" if v >= mid
+                     else "#58a6ff" if v >= lo else "#d29922" if v >= vlo else "#f85149")
+                return (f'<span style="font-size:12px;font-weight:700;'
+                        f'font-family:monospace;color:{c}">{v}</span>')
 
-                # ── Why included / Risk factors — compact ─────────────
-                _why_lines  = [l.strip() for l in _why_raw.split("|")  if l.strip()]
-                _risk_lines = [l.strip() for l in _risk_raw.split("|") if l.strip()]
-                if _why_lines or _risk_lines:
-                    _c1, _c2 = st.columns(2)
-                    if _why_lines:
-                        with _c1:
-                            st.markdown(
-                                "<div style='font-size:11px;font-weight:700;color:#3fb950;"
-                                "text-transform:uppercase;letter-spacing:0.06em;margin-bottom:4px'>"
-                                "Why included</div>" +
-                                "".join(
-                                    f"<div style='font-size:12px;color:#e6edf3;padding:2px 0'>"
-                                    f"✅ {l}</div>" for l in _why_lines
-                                ),
-                                unsafe_allow_html=True,
-                            )
-                    if _risk_lines:
-                        with _c2:
-                            st.markdown(
-                                "<div style='font-size:11px;font-weight:700;color:#f85149;"
-                                "text-transform:uppercase;letter-spacing:0.06em;margin-bottom:4px'>"
-                                "Risk factors</div>" +
-                                "".join(
-                                    f"<div style='font-size:12px;color:#e6edf3;padding:2px 0'>"
-                                    f"⚠️ {l}</div>" for l in _risk_lines
-                                ),
-                                unsafe_allow_html=True,
-                            )
+            rows_html = ""
+            for i, (_, row) in enumerate(df.iterrows()):
+                sym   = str(row.get("symbol", ""))
+                stage = str(row.get("stage", ""))
+                cat   = str(row.get("category", "")).replace("Elite Opportunity", "Elite").replace("High Conviction", "Hi Conv")
+                ls    = _ni(row.get("leadership"))
+                cv    = _ni(row.get("conviction"))
+                eq    = _ni(row.get("entry_quality"))
+                tq    = _ni(row.get("trend_quality"))
+                adx   = _n(row.get("adx"))
+                rs    = _n(row.get("rs_composite"))
+                sc    = _ni(row.get("score"))
 
-                # ── Setup Persistence Panel ───────────────────────────
-                st.divider()
-                _setup_plan_row: dict | None = None
-                _hist_df = None
-                if db_ok:
-                    try:
-                        from utils.supabase_client import load_setup_plan, load_lifecycle_history
-                        _sp = load_setup_plan(sym)
-                        if _sp is not None:
-                            _setup_plan_row = {
-                                "setup_id":              getattr(_sp, "setup_id", ""),
-                                "first_actionable_date": getattr(_sp, "first_actionable_date", ""),
-                                "invalidated_date":      getattr(_sp, "invalidated_date", ""),
-                                "status":                getattr(_sp, "status", ""),
-                                "entry_locked":          getattr(_sp, "entry_locked", 0),
-                                "sl_locked":             getattr(_sp, "sl_locked", 0),
-                                "t1_locked":             getattr(_sp, "t1_locked", 0),
-                                "t2_locked":             getattr(_sp, "t2_locked", 0),
-                                "t3_locked":             getattr(_sp, "t3_locked", 0),
-                                "days_active":           getattr(_sp, "days_active", 0),
-                                "setup_age":             getattr(_sp, "setup_age", ""),
-                                "trade_plan_status":     getattr(_sp, "trade_plan_status", ""),
-                                "locked_rr":             getattr(_sp, "locked_rr", 0),
-                                "locked_category":       getattr(_sp, "locked_category", ""),
-                            }
-                        _hist_df = load_lifecycle_history(sym, limit_days=60)
-                    except Exception:
-                        pass
+                color  = _STAGE_COLORS.get(stage, "#8b949e")
+                bg     = _STAGE_BG.get(stage, "#1c2333")
+                label  = _STAGE_LABELS.get(stage, stage)
+                icon   = _STAGE_ICONS.get(stage, "○")
+                stage_cell = (
+                    f'<span style="display:inline-block;padding:2px 8px;border-radius:4px;'
+                    f'font-size:11px;font-weight:700;font-family:monospace;'
+                    f'color:{color};background:{bg};border:1px solid rgba(255,255,255,0.1)">'
+                    f'{icon} {label}</span>'
+                )
+                cat_cell = (
+                    f'<span style="font-size:11px;color:#8b949e">{cat}</span>'
+                    if cat else '<span style="color:#2d333b">—</span>'
+                )
+                row_bg = "rgba(255,255,255,0.02)" if i % 2 == 0 else "transparent"
+                rows_html += (
+                    f'<tr style="background:{row_bg}">'
+                    f'<td style="padding:7px 10px;font-weight:700;font-size:13px;'
+                    f'font-family:monospace;white-space:nowrap">{sym}</td>'
+                    f'<td style="padding:7px 10px">{stage_cell}</td>'
+                    f'<td style="padding:7px 10px">{cat_cell}</td>'
+                    f'<td style="padding:7px 10px;text-align:center">{_pill(ls)}</td>'
+                    f'<td style="padding:7px 10px;text-align:center">{_pill(cv)}</td>'
+                    f'<td style="padding:7px 10px;text-align:center">{_pill(eq)}</td>'
+                    f'<td style="padding:7px 10px;text-align:center">{_pill(tq)}</td>'
+                    f'<td style="padding:7px 10px;text-align:center;color:#8b949e;'
+                    f'font-size:12px;font-family:monospace">{adx:.0f}</td>'
+                    f'<td style="padding:7px 10px;text-align:center;color:#58a6ff;'
+                    f'font-size:12px;font-family:monospace">{rs:.1f}%</td>'
+                    f'<td style="padding:7px 10px;text-align:center">{_pill(sc, hi=90, mid=80, lo=70, vlo=60)}</td>'
+                    f'</tr>'
+                )
 
-                # Fallback to session scan if no DB plan
-                if _setup_plan_row is None:
-                    _sess_df = st.session_state.get("last_scan_df")
-                    if _sess_df is not None and not _sess_df.empty and "Stock" in _sess_df.columns:
-                        _m = _sess_df[_sess_df["Stock"].astype(str) == sym]
-                        if not _m.empty and _m.iloc[0].get("SetupID"):
-                            _r = _m.iloc[0]
-                            _setup_plan_row = {
-                                "setup_id":              _r.get("SetupID", ""),
-                                "first_actionable_date": _r.get("FirstActionable", ""),
-                                "invalidated_date":      "",
-                                "status":                _r.get("PlanStatus", ""),
-                                "entry_locked":          _r.get("EntryLocked", 0),
-                                "sl_locked":             _r.get("SLLocked",    0),
-                                "t1_locked":             _r.get("T1Locked",    0),
-                                "t2_locked":             _r.get("T2Locked",    0),
-                                "t3_locked":             _r.get("T3Locked",    0),
-                                "days_active":           _r.get("DaysActive",  0),
-                                "setup_age":             _r.get("SetupAge",    ""),
-                                "trade_plan_status":     _r.get("TradePlanStatus", ""),
-                                "locked_rr":             0,
-                                "locked_category":       _r.get("Category",    ""),
-                            }
+            return (
+                '<div style="overflow-x:auto;margin-top:8px">'
+                '<table style="width:100%;border-collapse:collapse;'
+                'font-family:monospace;font-size:12px">'
+                f'<thead><tr style="background:rgba(255,255,255,0.03)">{th}</tr></thead>'
+                f'<tbody>{rows_html}</tbody>'
+                '</table></div>'
+            )
 
-                if _setup_plan_row:
-                    _sid  = _setup_plan_row.get("setup_id",            "")
-                    _age  = _setup_plan_row.get("setup_age",           "")
-                    _tps  = _setup_plan_row.get("trade_plan_status",   "")
-                    _pst  = _setup_plan_row.get("status",              "")
-                    _days = _setup_plan_row.get("days_active",          0)
-                    _rr   = _setup_plan_row.get("locked_rr",            0)
-                    _lcat = _setup_plan_row.get("locked_category",      "")
-
-                    # ── Header row: ID + badges ───────────────────────
-                    _p1, _p2 = st.columns([3, 2])
-                    with _p1:
-                        st.markdown(
-                            "<span style='font-size:10px;font-weight:700;color:#8b949e;"
-                            "text-transform:uppercase;letter-spacing:0.08em'>Setup Plan</span>",
-                            unsafe_allow_html=True,
-                        )
-                        _id_str = f"`{_sid}`" if _sid else "—"
-                        st.markdown(_id_str)
-                    with _p2:
-                        _badges = ""
-                        if _age:  _badges += _freshness_badge_lc(_age) + " "
-                        if _tps:  _badges += _trade_status_badge_lc(_tps)
-                        if _badges:
-                            st.markdown(_badges, unsafe_allow_html=True)
-                        _meta_parts = []
-                        if _days:  _meta_parts.append(f"Age **{_days}d**")
-                        if _lcat:  _meta_parts.append(f"Locked at **{_lcat}**")
-                        if _rr:    _meta_parts.append(f"R:R **{float(_rr):.1f}**")
-                        if _meta_parts:
-                            st.caption("  ·  ".join(_meta_parts))
-
-                    # ── Locked levels ─────────────────────────────────
-                    st.markdown(_locked_plan_html(
-                        _setup_plan_row.get("entry_locked", 0),
-                        _setup_plan_row.get("sl_locked",    0),
-                        _setup_plan_row.get("t1_locked",    0),
-                        _setup_plan_row.get("t2_locked",    0),
-                        _setup_plan_row.get("t3_locked",    0),
-                        plan_status=_pst,
-                    ), unsafe_allow_html=True)
-
-                    # ── Lifecycle timeline ────────────────────────────
-                    st.markdown(
-                        _lifecycle_timeline_html(_setup_plan_row, _hist_df),
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.caption(
-                        "No frozen trade plan — setup has not yet reached "
-                        "Actionable / HC / Elite, or Supabase is not connected."
-                    )
-
-                # Watchlist add shortcut
-                if st.button(f"➕ Add {sym} to Watchlist", key=f"add_wl_{sym}"):
-                    if db_ok:
-                        if add_to_watchlist(sym):
-                            st.success(f"{sym} added to watchlist.")
-                        else:
-                            st.error("Failed to add — check Supabase connection.")
-                    else:
-                        # Session-only fallback
-                        wl_ss = st.session_state.setdefault("watchlist_ss", [])
-                        if sym not in wl_ss:
-                            wl_ss.append(sym)
-                        st.success(f"{sym} added (session only — no DB).")
+        st.markdown(_build_table_html(df_view.head(150)), unsafe_allow_html=True)
     
     
     # ════════════════════════════════════════════════════════════════════════════
@@ -1008,88 +883,112 @@ def render():
             if _ws_col in wl_df.columns:
                 wl_df = wl_df.sort_values(_ws_col, ascending=_ws_asc).reset_index(drop=True)
     
-            # ── Header ────────────────────────────────────────────────
-            st.markdown(
-                '<div class="wl-row wl-header-row">'
-                '<div>Symbol</div><div>Stage</div><div>LS</div><div>CV</div>'
-                '<div>EQ</div><div>TQ</div><div>Notes</div><div>Stability</div>'
-                '</div>',
-                unsafe_allow_html=True,
+
+            # ── Watchlist table ───────────────────────────────────────
+            def _build_wl_table(df: pd.DataFrame, stability: dict) -> str:
+                col_labels = ["Symbol", "Stage", "Category", "LS", "CV", "EQ", "TQ", "Score", "Streak", "Notes"]
+                th = "".join(
+                    f'<th style="padding:8px 10px;text-align:left;font-size:10px;'
+                    f'font-weight:700;color:#8b949e;text-transform:uppercase;'
+                    f'letter-spacing:0.06em;border-bottom:1px solid rgba(255,255,255,0.08);'
+                    f'white-space:nowrap">{c}</th>'
+                    for c in col_labels
+                )
+                def _pill(val, hi=80, mid=65, lo=50, vlo=35):
+                    v = int(val) if val else 0
+                    c = ("#f5c542" if v >= hi else "#3fb950" if v >= mid
+                         else "#58a6ff" if v >= lo else "#d29922" if v >= vlo else "#f85149")
+                    return f'<span style="font-size:12px;font-weight:700;font-family:monospace;color:{c}">{v}</span>'
+
+                rows_html = ""
+                for i, (_, row) in enumerate(df.iterrows()):
+                    sym   = str(row.get("symbol", ""))
+                    stage = str(row.get("stage", ""))
+                    cat   = str(row.get("category", "")).replace("Elite Opportunity", "Elite").replace("High Conviction", "Hi Conv")
+                    ls, cv, eq, tq = _ni(row.get("leadership")), _ni(row.get("conviction")), _ni(row.get("entry_quality")), _ni(row.get("trend_quality"))
+                    sc    = _ni(row.get("score"))
+                    stab  = stability.get(sym, 1)
+                    notes = str(row.get("notes", ""))
+                    color = _STAGE_COLORS.get(stage, "#8b949e")
+                    bg    = _STAGE_BG.get(stage, "#1c2333")
+                    label = _STAGE_LABELS.get(stage, stage)
+                    icon  = _STAGE_ICONS.get(stage, "○")
+                    stage_cell = (
+                        f'<span style="display:inline-block;padding:2px 8px;border-radius:4px;'
+                        f'font-size:11px;font-weight:700;font-family:monospace;'
+                        f'color:{color};background:{bg};border:1px solid rgba(255,255,255,0.1)">'
+                        f'{icon} {label}</span>'
+                    )
+                    cat_cell = f'<span style="font-size:11px;color:#8b949e">{cat}</span>' if cat else '<span style="color:#2d333b">—</span>'
+                    stab_dots = "".join(
+                        f'<span style="display:inline-block;width:7px;height:7px;border-radius:50%;'
+                        f'margin-right:2px;background:{""+color if j < stab else "#2d333b"}"></span>'
+                        for j in range(min(stab, 5))
+                    )
+                    notes_cell = f'<span style="font-size:11px;color:#8b949e">{notes[:35] + "…" if len(notes) > 35 else notes}</span>'
+                    row_bg = "rgba(255,255,255,0.02)" if i % 2 == 0 else "transparent"
+                    rows_html += (
+                        f'<tr style="background:{row_bg}">'
+                        f'<td style="padding:7px 10px;font-weight:700;font-size:13px;font-family:monospace;white-space:nowrap">{sym}</td>'
+                        f'<td style="padding:7px 10px">{stage_cell}</td>'
+                        f'<td style="padding:7px 10px">{cat_cell}</td>'
+                        f'<td style="padding:7px 10px;text-align:center">{_pill(ls)}</td>'
+                        f'<td style="padding:7px 10px;text-align:center">{_pill(cv)}</td>'
+                        f'<td style="padding:7px 10px;text-align:center">{_pill(eq)}</td>'
+                        f'<td style="padding:7px 10px;text-align:center">{_pill(tq)}</td>'
+                        f'<td style="padding:7px 10px;text-align:center">{_pill(sc, hi=90, mid=80, lo=70, vlo=60)}</td>'
+                        f'<td style="padding:7px 10px;text-align:center">{stab_dots}</td>'
+                        f'<td style="padding:7px 10px">{notes_cell}</td>'
+                        f'</tr>'
+                    )
+                return (
+                    '<div style="overflow-x:auto;margin-top:8px">'
+                    '<table style="width:100%;border-collapse:collapse;font-family:monospace;font-size:12px">'
+                    f'<thead><tr style="background:rgba(255,255,255,0.03)">{th}</tr></thead>'
+                    f'<tbody>{rows_html}</tbody>'
+                    '</table></div>'
+                )
+
+            st.markdown(_build_wl_table(wl_df, _stage_stability), unsafe_allow_html=True)
+
+            # ── Per-symbol edit controls (below table, no expanders) ───
+            st.markdown("---")
+            st.caption("Edit notes or remove a symbol:")
+            _edit_sym = st.selectbox(
+                "Select symbol to edit",
+                options=wl_df["symbol"].tolist(),
+                key="wl_edit_sel",
+                label_visibility="collapsed",
             )
-    
-            # ── Rows ──────────────────────────────────────────────────
-            for _, row in wl_df.iterrows():
-                sym   = str(row.get("symbol", ""))
-                stage = str(row.get("stage", STAGE_FORMING))
-                ls    = _ni(row.get("leadership"))
-                cv    = _ni(row.get("conviction"))
-                eq    = _ni(row.get("entry_quality"))
-                tq    = _ni(row.get("trend_quality"))
-                notes_val = str(row.get("notes", ""))
-                stab  = _stage_stability.get(sym, 1)
-                s_color = _STAGE_COLORS.get(stage, "#555")
-                stab_html = _stability_dots(min(stab, 5), s_color)
-    
+            if _edit_sym:
+                _edit_row  = wl_df[wl_df["symbol"] == _edit_sym].iloc[0]
+                _edit_note = str(_edit_row.get("notes", ""))
+                tv_url = f"https://www.tradingview.com/chart/?symbol=NSE%3A{_edit_sym}"
                 st.markdown(
-                    f'<div class="wl-row">'
-                    f'<div style="font-weight:700">{sym}</div>'
-                    f'<div>{_stage_badge(stage)}</div>'
-                    f'<div>{_score_pill(ls)}</div>'
-                    f'<div>{_score_pill(cv)}</div>'
-                    f'<div>{_score_pill(eq)}</div>'
-                    f'<div>{_score_pill(tq)}</div>'
-                    f'<div style="color:#8b949e;font-size:11px;overflow:hidden;text-overflow:ellipsis">'
-                    f'{notes_val[:40] + "…" if len(notes_val) > 40 else notes_val}</div>'
-                    f'<div>{stab_html} <span style="font-size:10px;color:#8b949e">{stab}x</span></div>'
-                    f'</div>',
+                    f'<a href="{tv_url}" target="_blank" style="color:#58a6ff;font-size:11px">'
+                    f'📈 Open {_edit_sym} on TradingView</a>',
                     unsafe_allow_html=True,
                 )
-    
-                # Detail expander
-                with st.expander(f"▸ {sym}", expanded=False):
-                    _wl_cat   = str(row.get("category",    ""))
-                    _wl_phase = str(row.get("trend_phase", "")).strip()
-                    _wl_score = _ni(row.get("score"))
-
-                    # Single info row: category · stage streak · score
-                    _wl_info = []
-                    if _wl_cat:   _wl_info.append(f"**Category** &nbsp;`{_wl_cat}`")
-                    if _wl_phase: _wl_info.append(f"**Phase** &nbsp;`{_wl_phase}`")
-                    _wl_info.append(f"**Streak** &nbsp;{stab} scan{'s' if stab != 1 else ''}")
-                    if _wl_score: _wl_info.append(f"**Score** &nbsp;{_wl_score}")
-                    st.markdown(" &nbsp;·&nbsp; ".join(_wl_info))
-    
-                    new_note = st.text_area(
-                        "Edit notes", value=notes_val,
-                        key=f"note_{sym}", height=60,
-                    )
-                    nc1, nc2 = st.columns([1, 1])
-                    with nc1:
-                        if st.button(f"💾 Save note", key=f"save_note_{sym}"):
-                            if db_ok:
-                                if add_to_watchlist(sym, new_note):
-                                    st.success("Saved.")
-                            else:
-                                st.info("Note saved in memory only (no DB).")
-                    with nc2:
-                        if st.button(f"🗑️ Remove {sym}", key=f"rm_{sym}"):
-                            if db_ok:
-                                if remove_from_watchlist(sym):
-                                    st.success(f"{sym} removed.")
-                                    st.rerun()
-                            else:
-                                ss_wl = st.session_state.get("watchlist_ss", [])
-                                if sym in ss_wl:
-                                    ss_wl.remove(sym)
+                _new_note = st.text_area("Notes", value=_edit_note, key=f"note_{_edit_sym}", height=60, label_visibility="collapsed")
+                _ea, _eb = st.columns([1, 1])
+                with _ea:
+                    if st.button("💾 Save note", key=f"save_note_{_edit_sym}"):
+                        if db_ok:
+                            if add_to_watchlist(_edit_sym, _new_note):
+                                st.success("Saved.")
+                        else:
+                            st.info("Note saved in memory only (no DB).")
+                with _eb:
+                    if st.button(f"🗑️ Remove {_edit_sym}", key=f"rm_{_edit_sym}"):
+                        if db_ok:
+                            if remove_from_watchlist(_edit_sym):
+                                st.success(f"{_edit_sym} removed.")
                                 st.rerun()
-    
-                    # Link to Scanner detail (pass via query param)
-                    tv_url = f"https://www.tradingview.com/chart/?symbol=NSE%3A{sym}"
-                    st.markdown(
-                        f'<a href="{tv_url}" target="_blank" '
-                        f'style="color:#58a6ff;font-size:11px">📈 Open {sym} on TradingView</a>',
-                        unsafe_allow_html=True,
-                    )
+                        else:
+                            ss_wl = st.session_state.get("watchlist_ss", [])
+                            if _edit_sym in ss_wl:
+                                ss_wl.remove(_edit_sym)
+                            st.rerun()
     
         # ── Export ────────────────────────────────────────────────────
         if not wl_df.empty:
