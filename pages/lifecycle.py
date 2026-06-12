@@ -641,34 +641,53 @@ def render():
     
             # ── Expandable detail row ─────────────────────────────────
             with st.expander(f"▸ {sym} detail", expanded=False):
-                dc1, dc2, dc3 = st.columns(3)
-                dc1.metric("Action",    str(row.get("action", "")))
-                dc2.metric("Entry",     f"₹{_n(row.get('entry')):.0f}")
-                dc3.metric("SL",        f"₹{_n(row.get('sl')):.0f}")
+                # ── Context tags row ──────────────────────────────────
+                _cat        = str(row.get("category",    ""))
+                _phase      = str(row.get("trend_phase", "")).strip()
+                _bband      = str(row.get("bars_band",   "")).strip()
+                _why_raw    = str(row.get("why_included", ""))
+                _risk_raw   = str(row.get("risk_factors",  ""))
 
-                why_raw  = str(row.get("why_included", ""))
-                risk_raw = str(row.get("risk_factors",  ""))
-                trend_phase = str(row.get("trend_phase", ""))
-                cat     = str(row.get("category", ""))
-                bband   = str(row.get("bars_band", ""))
+                # Category / Phase / Bars Band — only show non-empty values
+                _tag_parts = []
+                if _cat:   _tag_parts.append(f"**Category** &nbsp;`{_cat}`")
+                if _phase: _tag_parts.append(f"**Phase** &nbsp;`{_phase}`")
+                if _bband: _tag_parts.append(f"**Bars Band** &nbsp;`{_bband}`")
+                if _tag_parts:
+                    st.markdown(" &nbsp;·&nbsp; ".join(_tag_parts))
 
-                st.markdown(
-                    f"**Category:** `{cat}` &nbsp; **Phase:** `{trend_phase}` &nbsp; "
-                    f"**Bars Band:** `{bband}`"
-                )
-                if why_raw:
-                    st.markdown("**Why included:**")
-                    for line in why_raw.split("|"):
-                        if line.strip():
-                            st.markdown(f"  ✅ {line.strip()}")
-                if risk_raw:
-                    st.markdown("**Risk factors:**")
-                    for line in risk_raw.split("|"):
-                        if line.strip():
-                            st.markdown(f"  ⚠️ {line.strip()}")
+                # ── Why included / Risk factors — compact ─────────────
+                _why_lines  = [l.strip() for l in _why_raw.split("|")  if l.strip()]
+                _risk_lines = [l.strip() for l in _risk_raw.split("|") if l.strip()]
+                if _why_lines or _risk_lines:
+                    _c1, _c2 = st.columns(2)
+                    if _why_lines:
+                        with _c1:
+                            st.markdown(
+                                "<div style='font-size:11px;font-weight:700;color:#3fb950;"
+                                "text-transform:uppercase;letter-spacing:0.06em;margin-bottom:4px'>"
+                                "Why included</div>" +
+                                "".join(
+                                    f"<div style='font-size:12px;color:#e6edf3;padding:2px 0'>"
+                                    f"✅ {l}</div>" for l in _why_lines
+                                ),
+                                unsafe_allow_html=True,
+                            )
+                    if _risk_lines:
+                        with _c2:
+                            st.markdown(
+                                "<div style='font-size:11px;font-weight:700;color:#f85149;"
+                                "text-transform:uppercase;letter-spacing:0.06em;margin-bottom:4px'>"
+                                "Risk factors</div>" +
+                                "".join(
+                                    f"<div style='font-size:12px;color:#e6edf3;padding:2px 0'>"
+                                    f"⚠️ {l}</div>" for l in _risk_lines
+                                ),
+                                unsafe_allow_html=True,
+                            )
 
                 # ── Setup Persistence Panel ───────────────────────────
-                st.markdown("---")
+                st.divider()
                 _setup_plan_row: dict | None = None
                 _hist_df = None
                 if db_ok:
@@ -729,45 +748,48 @@ def render():
                     _rr   = _setup_plan_row.get("locked_rr",            0)
                     _lcat = _setup_plan_row.get("locked_category",      "")
 
-                    _hdr = (
-                        '<div style="font-size:10px;font-weight:700;color:var(--muted);'
-                        'letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px">'
-                        '🗂️ Setup Persistence</div>'
-                        '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
-                        f'<span style="font-size:10px;color:var(--muted)">ID:</span>'
-                        f'<code style="font-size:11px;background:var(--bg0);padding:2px 8px;border-radius:4px;'
-                        f'border:1px solid var(--border);color:#58a6ff">{_sid or "—"}</code>'
-                        f'<span>{_freshness_badge_lc(_age)}</span>'
-                        f'<span>{_trade_status_badge_lc(_tps)}</span>'
-                        f'</div>'
-                    )
-                    _meta = ""
-                    if _days:
-                        _meta += f'<span style="font-size:10px;color:var(--muted)">Age: <b style="color:var(--text)">{_days}d</b></span> &nbsp;·&nbsp; '
-                    if _lcat:
-                        _meta += f'<span style="font-size:10px;color:var(--muted)">Locked at: <b style="color:var(--text)">{_lcat}</b></span> &nbsp;·&nbsp; '
-                    if _rr:
-                        _meta += f'<span style="font-size:10px;color:var(--muted)">R:R locked: <b style="color:#f5c542">{float(_rr):.1f}</b></span>'
-                    st.markdown(_hdr + _meta, unsafe_allow_html=True)
-                    st.markdown(
-                        _locked_plan_html(
-                            _setup_plan_row.get("entry_locked", 0),
-                            _setup_plan_row.get("sl_locked",    0),
-                            _setup_plan_row.get("t1_locked",    0),
-                            _setup_plan_row.get("t2_locked",    0),
-                            _setup_plan_row.get("t3_locked",    0),
-                            plan_status=_pst,
-                        ),
-                        unsafe_allow_html=True,
-                    )
+                    # ── Header row: ID + badges ───────────────────────
+                    _p1, _p2 = st.columns([3, 2])
+                    with _p1:
+                        st.markdown(
+                            "<span style='font-size:10px;font-weight:700;color:#8b949e;"
+                            "text-transform:uppercase;letter-spacing:0.08em'>Setup Plan</span>",
+                            unsafe_allow_html=True,
+                        )
+                        _id_str = f"`{_sid}`" if _sid else "—"
+                        st.markdown(_id_str)
+                    with _p2:
+                        _badges = ""
+                        if _age:  _badges += _freshness_badge_lc(_age) + " "
+                        if _tps:  _badges += _trade_status_badge_lc(_tps)
+                        if _badges:
+                            st.markdown(_badges, unsafe_allow_html=True)
+                        _meta_parts = []
+                        if _days:  _meta_parts.append(f"Age **{_days}d**")
+                        if _lcat:  _meta_parts.append(f"Locked at **{_lcat}**")
+                        if _rr:    _meta_parts.append(f"R:R **{float(_rr):.1f}**")
+                        if _meta_parts:
+                            st.caption("  ·  ".join(_meta_parts))
+
+                    # ── Locked levels ─────────────────────────────────
+                    st.markdown(_locked_plan_html(
+                        _setup_plan_row.get("entry_locked", 0),
+                        _setup_plan_row.get("sl_locked",    0),
+                        _setup_plan_row.get("t1_locked",    0),
+                        _setup_plan_row.get("t2_locked",    0),
+                        _setup_plan_row.get("t3_locked",    0),
+                        plan_status=_pst,
+                    ), unsafe_allow_html=True)
+
+                    # ── Lifecycle timeline ────────────────────────────
                     st.markdown(
                         _lifecycle_timeline_html(_setup_plan_row, _hist_df),
                         unsafe_allow_html=True,
                     )
                 else:
                     st.caption(
-                        "⚠️ No frozen trade plan for this symbol — setup has not yet reached "
-                        "Actionable/HC/Elite, or Supabase is not connected."
+                        "No frozen trade plan — setup has not yet reached "
+                        "Actionable / HC / Elite, or Supabase is not connected."
                     )
 
                 # Watchlist add shortcut
@@ -1025,11 +1047,17 @@ def render():
     
                 # Detail expander
                 with st.expander(f"▸ {sym}", expanded=False):
-                    wdc1, wdc2, wdc3, wdc4 = st.columns(4)
-                    wdc1.metric("Action",       str(row.get("action", "—")))
-                    wdc2.metric("Entry",        f"₹{_n(row.get('entry')):.0f}" if row.get("entry") else "—")
-                    wdc3.metric("SL",           f"₹{_n(row.get('sl')):.0f}"    if row.get("sl")    else "—")
-                    wdc4.metric("Stage Streak", f"{stab} scan{'s' if stab != 1 else ''}")
+                    _wl_cat   = str(row.get("category",    ""))
+                    _wl_phase = str(row.get("trend_phase", "")).strip()
+                    _wl_score = _ni(row.get("score"))
+
+                    # Single info row: category · stage streak · score
+                    _wl_info = []
+                    if _wl_cat:   _wl_info.append(f"**Category** &nbsp;`{_wl_cat}`")
+                    if _wl_phase: _wl_info.append(f"**Phase** &nbsp;`{_wl_phase}`")
+                    _wl_info.append(f"**Streak** &nbsp;{stab} scan{'s' if stab != 1 else ''}")
+                    if _wl_score: _wl_info.append(f"**Score** &nbsp;{_wl_score}")
+                    st.markdown(" &nbsp;·&nbsp; ".join(_wl_info))
     
                     new_note = st.text_area(
                         "Edit notes", value=notes_val,
