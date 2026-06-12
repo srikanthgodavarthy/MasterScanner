@@ -68,6 +68,15 @@ def render(settings=None):
             bt_rs_positive_only = st.checkbox(
                 "RS Positive only", value=False, key="bt_rs_positive_only",
             )
+            st.markdown("---")
+            bt_adaptive_targets = st.checkbox(
+                "Adaptive targets", value=True, key="bt_adaptive_targets",
+                help="Scale T1/T2/T3 by signal category (Elite/High Conv/Actionable) and context (trend age, extension). Reduces timeout rate on fresh Elite signals."
+            )
+            bt_momentum_exit = st.checkbox(
+                "Momentum failure exit", value=False, key="bt_momentum_exit",
+                help="Exit post-T1 trades when Close < EMA20 + MACD crossed down + CCI < -100 for 2 consecutive bars. Floors at breakeven — cannot produce a loser."
+            )
 
         with _bc2:
             bt_min_score = st.slider("Min Score for Entry", 50, 100, 70, step=5, key="bt_min_score")
@@ -147,11 +156,13 @@ def render(settings=None):
 
         # Build merged settings dict for run_backtest
         bt_settings = dict(settings) if settings else {}
-        bt_settings["min_score"]            = bt_min_score
-        bt_settings["hold_days"]            = bt_hold_days
-        bt_settings["bt_tier_filter"]       = bt_tier_filter
-        bt_settings["bt_buy_type_filter"]   = buy_type_filter
-        bt_settings["bt_rs_positive_only"]  = bt_rs_positive_only
+        bt_settings["min_score"]              = bt_min_score
+        bt_settings["hold_days"]              = bt_hold_days
+        bt_settings["bt_tier_filter"]         = bt_tier_filter
+        bt_settings["bt_buy_type_filter"]     = buy_type_filter
+        bt_settings["bt_rs_positive_only"]    = bt_rs_positive_only
+        bt_settings["adaptive_targets"]       = bt_adaptive_targets
+        bt_settings["momentum_exit_enabled"]  = bt_momentum_exit
 
         trades_df, rejections_df = run_backtest(
             bt_universe,
