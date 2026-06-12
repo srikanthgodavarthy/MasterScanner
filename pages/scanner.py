@@ -825,100 +825,311 @@ def _scoring_explainer_html() -> str:
 """
 
 
-def _perstock_pills_html(df: pd.DataFrame) -> str:
+def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     """
-    Render a compact per-stock component pill strip for every stock in df.
-    Shows: symbol · SignalClass badge · then coloured pills for each sub-factor
-    that contributed points, grouped by dimension.
+    Render a scrollable sub-factor table for every stock in df.
+
+    Layout
+    ──────
+    Frozen left: Stock name | Signal class badge | L / C / EQ totals
+    Scrollable right: one column per sub-factor, each cell = pts label +
+                      a narrow progress-bar filled to pts/max_pts %.
+
+    Each column header shows the factor name + max weight; hovering reveals
+    the exact scoring bands drawn directly from conviction_score_v1.py.
     """
     if df.empty:
         return ""
 
-    # Sub-factor column → (label, max_pts, dim_color)
+    # ── Factor definitions ─────────────────────────────────────────
+    # (df_col, short_label, max_pts, dim_color, tooltip_lines)
     FACTORS = [
-        ("_cv1_ls_rs",       "RS Composite",   30, "#a371f7"),
-        ("_cv1_ls_age",      "Trend Age",       25, "#a371f7"),
-        ("_cv1_ls_adx",      "ADX Str",         20, "#a371f7"),
-        ("_cv1_ls_ps",       "Pers. Strength",  15, "#a371f7"),
-        ("_cv1_ls_slope",    "EMA Slope",       10, "#a371f7"),
-        ("_cv1_cv_structure","Trend Struct",     30, "#3fb950"),
-        ("_cv1_cv_fib",      "Fib Pullback",    25, "#3fb950"),
-        ("_cv1_cv_cci",      "CCI Recovery",    25, "#3fb950"),
-        ("_cv1_cv_volume",   "Vol Sponsor",     15, "#3fb950"),
-        ("_cv1_cv_squeeze",  "Squeeze",          5, "#3fb950"),
-        ("_cv1_eq_ema20",    "EMA20 Dist",      30, "#d29922"),
-        ("_cv1_eq_pivot",    "Pivot Dist",      20, "#d29922"),
-        ("_cv1_eq_move",     "Price Move",      20, "#d29922"),
-        ("_cv1_eq_ema50",    "EMA50 Dist",      15, "#d29922"),
-        ("_cv1_eq_bars",     "Bars Setup",      15, "#d29922"),
+        # ── LEADERSHIP (purple) ────────────────────────────────────
+        ("_cv1_ls_rs", "RS Composite", 30, "#a371f7",
+         "Multi-TF relative strength vs Nifty 50\n"
+         "RS > 0.15  →  +30 pts  (strong outperformance)\n"
+         "RS 0.10–0.15 →  +25 pts\n"
+         "RS 0.05–0.10 →  +20 pts\n"
+         "RS 0.03–0.05 →  +15 pts\n"
+         "RS 0.00–0.03 →  +10 pts\n"
+         "RS −0.03–0.00 → +4 pts\n"
+         "RS < −0.03   →   0 pts  (lagging the index)"),
+
+        ("_cv1_ls_age", "Trend Age", 25, "#a371f7",
+         "Bars since trend started (EMA structure)\n"
+         "21–50 bars  →  +25 pts  ★ sweet-spot (PF 1.45, WR 51%)\n"
+         "6–20 bars   →  +8 pts   (young, acceptable)\n"
+         "51–100 bars →  +8 pts   (maturing, edge fades)\n"
+         "> 100 bars  →   0 pts   (extended, PF 0.72)\n"
+         "0–5 bars    →   0 pts   (too early)"),
+
+        ("_cv1_ls_adx", "ADX Strength", 20, "#a371f7",
+         "ADX of Nifty 50 (directional strength proxy)\n"
+         "ADX ≥ 40    →  +20 pts  (strong trend, PF 1.41)\n"
+         "ADX 30–40   →  +12 pts\n"
+         "ADX 25–30   →   +5 pts  (dead zone)\n"
+         "ADX < 25    →    0 pts  (no trend)"),
+
+        ("_cv1_ls_ps", "Pers. Strength", 15, "#a371f7",
+         "Persistent momentum: stock must outperform on both lookbacks\n"
+         "mom3 > 8% AND mom6 > 12%  →  +15 pts\n"
+         "Either condition fails     →   0 pts\n"
+         "(3-bar and 6-bar price momentum vs own prior close)"),
+
+        ("_cv1_ls_slope", "EMA20 Slope", 10, "#a371f7",
+         "5-bar velocity of EMA20 (trend acceleration)\n"
+         "Slope > 0.3  →  +10 pts  (strong upward angle)\n"
+         "Slope 0–0.3  →   +5 pts  (positive but shallow)\n"
+         "Slope ≤ 0    →    0 pts  (flat or falling)"),
+
+        # ── CONVICTION (green) ─────────────────────────────────────
+        ("_cv1_cv_structure", "Trend Struct", 30, "#3fb950",
+         "EMA alignment + Ichimoku cloud position\n"
+         "trend_up (price > EMA20 > EMA50)  → +10 pts\n"
+         "ema_alignment (EMA20 > EMA50)     → +10 pts\n"
+         "above_cloud                       →  +7 pts\n"
+         "inside_cloud (transitional)       →  +3 pts\n"
+         "all four confirmed (full pillar)  →  +3 pts bonus\n"
+         "Max: 30 pts"),
+
+        ("_cv1_cv_fib", "Fib Pullback", 25, "#3fb950",
+         "Price retracement depth into Fibonacci zone\n"
+         "in_golden (50–61.8% retrace)       → +25 pts  ★ ideal\n"
+         "in_golden_relaxed (38.2–61.8%)     → +18 pts\n"
+         "near_golden (approaching zone)     →  +8 pts\n"
+         "+5 bonus if CCI also oversold in zone (confluence)\n"
+         "+3 bonus if volume < 0.8× avg during pullback\n"
+         "(controlled retracement = quality entry)"),
+
+        ("_cv1_cv_cci", "CCI Recovery", 25, "#3fb950",
+         "CCI(20) crossing back above oversold level (−100)\n"
+         "recent_cci_recovery (cross above OS within window) → +25 pts\n"
+         "cci_rising (building before cross, early signal)   → +12 pts\n"
+         "t3_cci_rec (CCI recovering but still < 0)          →  +6 pts\n"
+         "No recovery signal                                 →   0 pts"),
+
+        ("_cv1_cv_volume", "Vol Sponsor", 15, "#3fb950",
+         "Today's volume vs 20-bar average (institutional sponsorship)\n"
+         "Vol ≥ 2.5×  →  +15 pts  (strong sponsorship)\n"
+         "Vol 2.0–2.5× → +12 pts\n"
+         "Vol 1.5–2.0× →  +8 pts\n"
+         "Vol 1.2–1.5× →  +5 pts\n"
+         "Vol 1.0–1.2× →  +2 pts\n"
+         "Vol < 1.0×   →   0 pts  (below-avg volume, no sponsorship)"),
+
+        ("_cv1_cv_squeeze", "Squeeze", 5, "#3fb950",
+         "Bollinger Band / Keltner Channel compression release\n"
+         "squeeze_release (BB just broke outside KC) → +5 pts\n"
+         "squeeze_on (BB still inside KC)            → +3 pts\n"
+         "No squeeze                                 →  0 pts\n"
+         "Note: PF 0.69 in backtest — minimal weight (v8.1)"),
+
+        # ── ENTRY QUALITY (amber) ──────────────────────────────────
+        ("_cv1_eq_ema20", "EMA20 Dist", 30, "#d29922",
+         "% distance of price above EMA20 (entry tightness)\n"
+         "≤ 2%   →  +30 pts  ★ excellent (near EMA20 support)\n"
+         "2–4%   →  +22 pts\n"
+         "4–6%   →  +14 pts\n"
+         "6–10%  →   +6 pts  (stretched)\n"
+         "> 10%  →    0 pts  (too extended from EMA20)\n"
+         "Below EMA20 (pullback in progress) → +10 pts"),
+
+        ("_cv1_eq_pivot", "Pivot Dist", 20, "#d29922",
+         "% distance from last 20-bar pivot high\n"
+         "≤ −2%  (below pivot)  →  +20 pts  ★ ideal — still building\n"
+         "−2 to +0.5% (at pivot) → +16 pts  — breaking out\n"
+         "0.5–2% (just past)     → +10 pts  — acceptable\n"
+         "2–4%   (running)       →  +4 pts\n"
+         "> 4%   (chasing)       →   0 pts"),
+
+        ("_cv1_eq_move", "Price Move", 20, "#d29922",
+         "% price move since the setup trigger bar fired\n"
+         "≤ 0.5% →  +20 pts  ★ barely moved — full opportunity ahead\n"
+         "0.5–1.5% → +16 pts\n"
+         "1.5–3.0% → +10 pts  (meaningful portion consumed)\n"
+         "3.0–5.0% →  +3 pts  (at or near T1 target)\n"
+         "> 5.0%  →   0 pts  (opportunity may have passed)"),
+
+        ("_cv1_eq_ema50", "EMA50 Dist", 15, "#d29922",
+         "% distance of price above EMA50 (structural support depth)\n"
+         "≤ 5%   →  +15 pts  ★ strong support nearby\n"
+         "5–10%  →  +10 pts\n"
+         "10–15% →   +5 pts\n"
+         "15–20% →   +2 pts\n"
+         "> 20%  →    0 pts  (structurally extended)"),
+
+        ("_cv1_eq_bars", "Bars Setup", 15, "#d29922",
+         "Signal freshness — bars elapsed since setup trigger\n"
+         "ATR band 'Actionable' (0–3 bars)  →  +15 pts\n"
+         "ATR band 'Late'       (4–7 bars)  →   +6 pts\n"
+         "ATR band 'Extended'   (8+ bars)   →    0 pts\n"
+         "(ATR-normalised band is v9 primary metric)"),
     ]
-    # Filter to columns that actually exist
-    avail = [(col, lbl, mx, clr) for col, lbl, mx, clr in FACTORS if col in df.columns]
+
+    # Filter to columns that actually exist in this df
+    avail = [(col, lbl, mx, clr, tip)
+             for col, lbl, mx, clr, tip in FACTORS if col in df.columns]
 
     if not avail:
         return ""
 
-    rows_html = ""
-    for _, row in df.iterrows():
+    # ── Build header row ───────────────────────────────────────────
+    # Group headers: Leadership / Conviction / Entry Quality spans
+    dim_spans = [
+        ("LEADERSHIP",   "#a371f7", sum(1 for c,_,_,cl,_ in avail if cl == "#a371f7")),
+        ("CONVICTION",   "#3fb950", sum(1 for c,_,_,cl,_ in avail if cl == "#3fb950")),
+        ("ENTRY QUALITY","#d29922", sum(1 for c,_,_,cl,_ in avail if cl == "#d29922")),
+    ]
+    group_header = '<tr>'
+    # frozen cols: Stock + Signal + L + C + EQ = 5
+    group_header += (
+        '<th colspan="5" style="background:#0d1117;position:sticky;left:0;z-index:3;'
+        'border-bottom:1px solid rgba(255,255,255,0.08);"></th>'
+    )
+    for dim_name, dim_col, span in dim_spans:
+        if span == 0:
+            continue
+        group_header += (
+            f'<th colspan="{span}" style="text-align:center;font-size:9px;font-weight:700;'
+            f'color:{dim_col};letter-spacing:0.1em;text-transform:uppercase;'
+            f'border-bottom:2px solid {dim_col}44;padding:5px 4px 4px;'
+            f'background:#0d1117;">{dim_name}</th>'
+        )
+    group_header += '</tr>'
+
+    # Sub-factor header row
+    factor_header = '<tr>'
+    # Frozen: Stock
+    factor_header += (
+        '<th style="position:sticky;left:0;z-index:3;background:#161b22;'
+        'min-width:90px;padding:6px 10px 6px 12px;text-align:left;'
+        'font-size:10px;font-weight:600;color:#8b949e;white-space:nowrap;'
+        'border-right:1px solid rgba(255,255,255,0.10);">Stock</th>'
+    )
+    # Frozen: Signal badge
+    factor_header += (
+        '<th style="position:sticky;left:90px;z-index:3;background:#161b22;'
+        'min-width:62px;padding:6px 8px;text-align:center;'
+        'font-size:10px;font-weight:600;color:#8b949e;white-space:nowrap;'
+        'border-right:1px solid rgba(255,255,255,0.08);">Class</th>'
+    )
+    # Frozen: L / C / EQ
+    for lbl, clr in (("L", "#a371f7"), ("C", "#3fb950"), ("EQ", "#d29922")):
+        factor_header += (
+            f'<th style="position:sticky;z-index:3;background:#161b22;'
+            f'min-width:32px;padding:6px 6px;text-align:center;'
+            f'font-size:10px;font-weight:700;color:{clr};">{lbl}</th>'
+        )
+    # Frozen divider
+    factor_header += (
+        '<th style="position:sticky;z-index:3;background:#161b22;width:1px;'
+        'padding:0;border-right:2px solid rgba(255,255,255,0.14);"></th>'
+    )
+
+    # One column per sub-factor with tooltip
+    for _, lbl, mx, clr, tip in avail:
+        tip_escaped = tip.replace('"', '&quot;').replace('\n', '&#10;')
+        factor_header += (
+            f'<th title="{tip_escaped}" style="min-width:72px;padding:5px 6px;'
+            f'text-align:center;font-size:9px;font-weight:600;color:{clr};'
+            f'white-space:nowrap;cursor:help;border-bottom:2px solid {clr}33;">'
+            f'{lbl}<br>'
+            f'<span style="font-size:8px;font-weight:400;color:#8b949e">(+{mx})</span>'
+            f'</th>'
+        )
+    factor_header += '</tr>'
+
+    # ── Build data rows ────────────────────────────────────────────
+    data_rows = ""
+    for i, (_, row) in enumerate(df.iterrows()):
         stock = str(row.get("Stock", row.get("Symbol", "?")))
         sc    = str(row.get("CV1_SignalClass", "WATCH"))
         ls    = int(row.get("CV1_Leadership",   0))
         cv    = int(row.get("CV1_Conviction",   0))
         eq    = int(row.get("CV1_EntryQuality", 0))
         sc_c, _ = _SC_STYLE.get(sc, ("#484f58", sc))
+        row_bg = "#0d1117" if i % 2 == 0 else "#111820"
 
-        # Score pills
-        score_html = (
-            f'<span style="font-size:10px;color:#a371f7;font-weight:700">'
-            f'L:{ls}</span>'
-            f'<span style="font-size:10px;color:#8b949e;margin:0 3px">/</span>'
-            f'<span style="font-size:10px;color:#3fb950;font-weight:700">'
-            f'C:{cv}</span>'
-            f'<span style="font-size:10px;color:#8b949e;margin:0 3px">/</span>'
-            f'<span style="font-size:10px;color:#d29922;font-weight:700">'
-            f'EQ:{eq}</span>'
+        data_rows += f'<tr style="background:{row_bg}">'
+
+        # Frozen: Stock name
+        data_rows += (
+            f'<td style="position:sticky;left:0;background:{row_bg};'
+            f'padding:6px 10px 6px 12px;font-size:11px;font-weight:700;'
+            f'color:#e6edf3;white-space:nowrap;z-index:2;'
+            f'border-right:1px solid rgba(255,255,255,0.10);">{stock}</td>'
         )
 
-        # Factor pills — only show factors that earned > 0 pts
-        pills = ""
-        for col, lbl, mx, clr in avail:
-            pts = int(row.get(col, 0))
-            if pts > 0:
-                pills += (
-                    f'<span style="background:{clr}18;border:1px solid {clr}44;'
-                    f'color:{clr};border-radius:4px;padding:1px 7px;font-size:10px;'
-                    f'white-space:nowrap">'
-                    f'{lbl} (+{pts})</span>'
-                )
-
-        _no_factors = '<span style="font-size:10px;color:#8b949e">no sub-factors available</span>'
-        rows_html += (
-            f'<div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;'
-            f'padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.05);">'
-            f'<span style="font-size:12px;font-weight:700;color:#e6edf3;'
-            f'font-family:\'JetBrains Mono\',monospace;min-width:90px">{stock}</span>'
+        # Frozen: Signal badge
+        data_rows += (
+            f'<td style="position:sticky;left:90px;background:{row_bg};'
+            f'padding:5px 8px;text-align:center;z-index:2;'
+            f'border-right:1px solid rgba(255,255,255,0.08);">'
             f'<span style="background:{sc_c}18;border:1px solid {sc_c}44;color:{sc_c};'
-            f'font-size:9px;font-weight:700;border-radius:4px;padding:1px 7px;'
-            f'white-space:nowrap">{sc}</span>'
-            f'<span style="margin:0 4px 0 2px;">{score_html}</span>'
-            f'·&nbsp;'
-            f'{pills if pills else _no_factors}'
-            f'</div>'
+            f'font-size:9px;font-weight:700;border-radius:3px;padding:1px 5px;">{sc}</span>'
+            f'</td>'
         )
 
-    if not rows_html:
+        # Frozen: L / C / EQ totals
+        for val, clr in ((ls, "#a371f7"), (cv, "#3fb950"), (eq, "#d29922")):
+            data_rows += (
+                f'<td style="position:sticky;background:{row_bg};'
+                f'padding:5px 6px;text-align:center;z-index:2;">'
+                f'<span style="font-size:11px;font-weight:700;color:{clr}">{val}</span>'
+                f'</td>'
+            )
+
+        # Frozen divider
+        data_rows += (
+            f'<td style="position:sticky;background:{row_bg};z-index:2;'
+            f'width:1px;padding:0;border-right:2px solid rgba(255,255,255,0.14);"></td>'
+        )
+
+        # Sub-factor cells
+        for col, _, mx, clr, _ in avail:
+            pts = int(row.get(col, 0))
+            pct = int(pts / mx * 100) if mx > 0 else 0
+            # Colour the bar: full = bright, partial = mid, zero = dark
+            bar_clr = clr if pct >= 60 else (clr + "99" if pct > 0 else "rgba(255,255,255,0.06)")
+            data_rows += (
+                f'<td style="padding:5px 6px;text-align:center;min-width:72px;">'
+                # pts label
+                f'<div style="font-size:10px;font-weight:{"700" if pts > 0 else "400"};'
+                f'color:{"" + clr if pts > 0 else "#484f58"};margin-bottom:3px;">'
+                f'{"+" if pts > 0 else ""}{pts}</div>'
+                # progress bar
+                f'<div style="height:4px;background:rgba(255,255,255,0.06);'
+                f'border-radius:2px;overflow:hidden;">'
+                f'<div style="height:100%;width:{pct}%;background:{bar_clr};'
+                f'border-radius:2px;transition:width 0.3s;"></div>'
+                f'</div>'
+                f'</td>'
+            )
+
+        data_rows += '</tr>'
+
+    if not data_rows:
         return ""
 
-    return (
-        f'<div style="font-family:\'JetBrains Mono\',\'Fira Code\',monospace;'
-        f'background:#161b22;border:1px solid rgba(255,255,255,0.08);'
-        f'border-radius:8px;padding:10px 14px;margin-top:8px;">'
-        f'<div style="font-size:9px;font-weight:700;color:#8b949e;'
-        f'letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px;">'
-        f'Per-stock breakdown (signalled stocks only)</div>'
-        f'{rows_html}'
-        f'</div>'
-    )
+    return f"""
+<div style="font-family:'JetBrains Mono','Fira Code',monospace;margin-top:10px;">
+  <div style="font-size:9px;font-weight:700;color:#8b949e;letter-spacing:0.1em;
+  text-transform:uppercase;margin-bottom:6px;">
+  📊 Per-stock sub-factor breakdown — hover column headers for scoring conditions
+  </div>
+  <div style="overflow-x:auto;border:1px solid rgba(255,255,255,0.08);border-radius:8px;">
+    <table style="border-collapse:collapse;width:100%;background:#0d1117;">
+      <thead style="background:#161b22;">
+        {group_header}
+        {factor_header}
+      </thead>
+      <tbody>
+        {data_rows}
+      </tbody>
+    </table>
+  </div>
+</div>
+"""
 
 
 def _market_status_row(summary: dict, scan_time: str,
@@ -2298,8 +2509,8 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
                 disp = disp.drop(columns=["regime_tier"])
             st.markdown(_render_html_table(disp), unsafe_allow_html=True)
 
-            # ── Per-stock component pills ─────────────────────────
-            _pills_html = _perstock_pills_html(df_subset)
+            # ── Per-stock component table ─────────────────────────
+            _pills_html = _perstock_breakdown_table(df_subset)
             if _pills_html:
                 st.markdown(_pills_html, unsafe_allow_html=True)
 
