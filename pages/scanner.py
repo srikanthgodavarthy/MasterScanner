@@ -531,55 +531,78 @@ _CSS = """
 _TOOLTIP_JS = """
 <script>
 (function(){
-  var P   = window.parent;
-  var doc = P.document;
+  // Try to attach to parent frame; fall back to current document if cross-origin blocked
+  var ROOT;
+  try { ROOT = window.parent; ROOT.document.body; } catch(e){ ROOT = window; }
+  var doc = ROOT.document;
 
-  if(P._msTipInit) return;
-  P._msTipInit = true;
+  var FLAG = '_msTipInit_v2';
+  if(ROOT[FLAG]) return;
+  ROOT[FLAG] = true;
 
-  // Inject tooltip styles into parent <head> once
-  var style = doc.createElement('style');
-  style.textContent = [
-    '#ms-tip{position:fixed;z-index:999999;pointer-events:none;max-width:270px;',
-    'background:#1c2333;border:1px solid rgba(255,255,255,0.16);border-radius:7px;',
-    'padding:10px 13px;font-family:\"JetBrains Mono\",\"Fira Code\",monospace;',
-    'font-size:0.70rem;color:#e6edf3;line-height:1.6;',
-    'box-shadow:0 8px 28px rgba(0,0,0,0.65);display:none;}',
-    '#ms-tip .tip-title{font-size:0.72rem;font-weight:700;color:#f5c542;',
-    'margin-bottom:6px;letter-spacing:0.05em;display:block;}'
+  var TIP_CSS = [
+    '#ms-tip{position:fixed;z-index:2147483647;pointer-events:none;max-width:280px;',
+    'background:#1c2333;border:1px solid rgba(255,255,255,0.18);border-radius:8px;',
+    'padding:10px 14px;font-family:\"JetBrains Mono\",\"Fira Code\",monospace;',
+    'font-size:0.71rem;color:#e6edf3;line-height:1.65;',
+    'box-shadow:0 10px 32px rgba(0,0,0,0.7);display:none;transition:opacity .1s;}',
+    '#ms-tip .tip-title{font-size:0.73rem;font-weight:700;color:#f5c542;',
+    'margin-bottom:5px;letter-spacing:0.05em;display:block;border-bottom:1px solid rgba(255,255,255,0.1);padding-bottom:5px;}'
   ].join('');
-  doc.head.appendChild(style);
 
-  var tip = doc.createElement('div');
-  tip.id = 'ms-tip';
-  tip.innerHTML = '<span class=\"tip-title\" id=\"ms-tip-title\"></span><span id=\"ms-tip-body\"></span>';
-  doc.body.appendChild(tip);
+  if(!doc.getElementById('ms-tip-style')){
+    var s = doc.createElement('style');
+    s.id  = 'ms-tip-style';
+    s.textContent = TIP_CSS;
+    doc.head.appendChild(s);
+  }
+
+  var tip = doc.getElementById('ms-tip');
+  if(!tip){
+    tip = doc.createElement('div');
+    tip.id = 'ms-tip';
+    tip.innerHTML = '<span class=\"tip-title\" id=\"ms-tip-title\"></span><div id=\"ms-tip-body\"></div>';
+    doc.body.appendChild(tip);
+  }
 
   var ttl   = doc.getElementById('ms-tip-title');
   var tbody = doc.getElementById('ms-tip-body');
-  var PAD   = 14;
+  var PAD   = 16;
 
-  // Listen on the parent document — mouse coords are in parent viewport space
-  doc.addEventListener('mouseover', function(e){
-    var el = e.target.closest('[data-tip-title]');
-    if(!el){ tip.style.display='none'; return; }
+  function _showTip(el, e){
+    if(!el) return;
     ttl.textContent = el.getAttribute('data-tip-title') || '';
     tbody.innerHTML = (el.getAttribute('data-tip-body') || '').replace(/\\n/g,'<br>');
     tip.style.display = 'block';
-  });
-  doc.addEventListener('mousemove', function(e){
-    if(tip.style.display==='none') return;
-    var tw = tip.offsetWidth, th = tip.offsetHeight;
-    var vw = P.innerWidth,  vh = P.innerHeight;
-    var x  = e.clientX + PAD;
-    var y  = e.clientY + PAD;
-    if(x + tw > vw - 4) x = e.clientX - tw - PAD;
-    if(y + th > vh - 4) y = e.clientY - th - PAD;
+    _moveTip(e);
+  }
+
+  function _moveTip(e){
+    if(tip.style.display === 'none') return;
+    var tw = tip.offsetWidth || 200;
+    var th = tip.offsetHeight || 100;
+    var vw = (ROOT.innerWidth  || doc.documentElement.clientWidth)  - 8;
+    var vh = (ROOT.innerHeight || doc.documentElement.clientHeight) - 8;
+    var x  = (e.clientX || 0) + PAD;
+    var y  = (e.clientY || 0) + PAD;
+    if(x + tw > vw) x = (e.clientX || 0) - tw - PAD;
+    if(y + th > vh) y = (e.clientY || 0) - th - PAD;
+    if(x < 4) x = 4;
+    if(y < 4) y = 4;
     tip.style.left = x + 'px';
     tip.style.top  = y + 'px';
+  }
+
+  doc.addEventListener('mouseover', function(e){
+    var el = e.target && e.target.closest ? e.target.closest('[data-tip-title]') : null;
+    if(!el){ tip.style.display='none'; return; }
+    _showTip(el, e);
   });
+  doc.addEventListener('mousemove', _moveTip);
+  doc.addEventListener('mouseleave', function(){ tip.style.display='none'; });
   doc.addEventListener('mouseout', function(e){
-    if(!e.target.closest('[data-tip-title]')) tip.style.display='none';
+    var t = e.relatedTarget;
+    if(!t || !t.closest || !t.closest('[data-tip-title]')) tip.style.display='none';
   });
 })();
 </script>
@@ -587,11 +610,25 @@ _TOOLTIP_JS = """
 
 # ── HELPERS ───────────────────────────────────────────────────────
 
-def _score_color(v: float, invert: bool = False) -> str:
+# Score-column thresholds: above = green (#3fb950), below = amber (#d29922)
+_SCORE_THRESHOLDS = {
+    "Leadership":    65,
+    "Conviction":    38,
+    "Entry Quality": 50,
+}
+
+def _score_color(v: float, invert: bool = False, threshold: float | None = None) -> str:
+    """
+    If `threshold` is supplied: green above threshold, amber below.
+    Otherwise fall back to the legacy 5-band gradient.
+    """
     if invert:
         if v >= 60: return "#f85149"
         if v >= 35: return "#d29922"
         return "#3fb950"
+    if threshold is not None:
+        return "#3fb950" if v >= threshold else "#d29922"
+    # Legacy gradient (used for Extension, score cards, etc.)
     if v >= 80: return "#f5c542"
     if v >= 65: return "#3fb950"
     if v >= 50: return "#4ade80"
@@ -713,14 +750,15 @@ def _summary_cards(df: pd.DataFrame) -> str:
         return 0
 
     cards = [
-        ("Leadership",    _avg("CV1_Leadership"),   False, "Market relative strength"),
-        ("Conviction",    _avg("CV1_Conviction"),   False, "Likelihood to hit target"),
-        ("Entry Quality", _avg("CV1_EntryQuality"), False, "Good entry right now?"),
-        ("Extension",     _avg("Extension"),        True,  "Move already missed"),
+        ("Leadership",    _avg("CV1_Leadership"),   False, "Market relative strength",   "Leadership"),
+        ("Conviction",    _avg("CV1_Conviction"),   False, "Likelihood to hit target",   "Conviction"),
+        ("Entry Quality", _avg("CV1_EntryQuality"), False, "Good entry right now?",      "Entry Quality"),
+        ("Extension",     _avg("Extension"),        True,  "Move already missed",        None),
     ]
     html = '<div class="card-grid">'
-    for title, val, invert, sub in cards:
-        color = _score_color(val, invert)
+    for title, val, invert, sub, tkey in cards:
+        threshold = _SCORE_THRESHOLDS.get(tkey) if tkey else None
+        color = _score_color(val, invert, threshold=threshold)
         html += (
             f'<div class="score-card">'
             f'<div class="sc-title">{title}</div>'
@@ -837,6 +875,47 @@ def _qualification_summary_html(df: pd.DataFrame, settings: dict) -> str:
         + _stat("Qualified Plans",  n_plans,      "#f59e0b" if n_plans > 0 else "#8b949e")
     )
 
+    # ── Not-Qualified breakdown (WATCH + SKIP by reason) ─────────
+    watch_html = ""
+    skip_html  = ""
+    if sc_col in df.columns:
+        watch_n = int((df[sc_col] == "WATCH").sum())
+        skip_n  = int((df[sc_col] == "SKIP").sum())
+
+        # Top reasons for SKIP: lowest conviction, leadership, entry quality
+        skip_stocks = df[df[sc_col] == "SKIP"].copy()
+        if not skip_stocks.empty:
+            def _top_fail_reason(row):
+                reasons = []
+                try:
+                    if float(row.get("CV1_Leadership",   100)) < _SCORE_THRESHOLDS["Leadership"]:
+                        reasons.append(f'RS weak ({int(float(row.get("CV1_Leadership",0)))})')
+                    if float(row.get("CV1_Conviction",   100)) < _SCORE_THRESHOLDS["Conviction"]:
+                        reasons.append(f'Conv low ({int(float(row.get("CV1_Conviction",0)))})')
+                    if float(row.get("CV1_EntryQuality", 100)) < _SCORE_THRESHOLDS["Entry Quality"]:
+                        reasons.append(f'EQ low ({int(float(row.get("CV1_EntryQuality",0)))})')
+                except (TypeError, ValueError):
+                    pass
+                return " · ".join(reasons) if reasons else "Below threshold"
+
+            skip_items = "".join(
+                f'<span class="qs-reject-item">'                f'<b style="color:#e6edf3">{str(r.get("Stock","?"))}</b>'                f'<span class="qs-reject-reason"> — {_top_fail_reason(r)}</span>'                f'</span>'
+                for _, r in skip_stocks.head(12).iterrows()
+            )
+            skip_html = (
+                f'<div class="qs-reject-block">'                f'<span class="qs-reject-head">Not Qualified — SKIP ({skip_n} stocks):</span>'                f'<div class="qs-reject-list">{skip_items}</div>'                f'</div>'
+            )
+
+        if watch_n > 0:
+            watch_stocks = df[df[sc_col] == "WATCH"]
+            watch_items = "".join(
+                f'<span style="background:rgba(210,153,34,0.1);border:1px solid rgba(210,153,34,0.3);'                f'border-radius:5px;padding:2px 8px;font-size:11px;font-family:var(--mono)">'                f'<b style="color:#d29922">{str(r.get("Stock","?"))}</b>'                f'<span style="color:#8b949e;font-size:10px"> CV={int(float(r.get("CV1_Conviction",0))) if str(r.get("CV1_Conviction","")).replace(".","").lstrip("-").isdigit() else "—"}</span>'                f'</span>'
+                for _, r in watch_stocks.head(12).iterrows()
+            )
+            watch_html = (
+                f'<div class="qs-reject-block" style="border-top:1px solid var(--border);padding-top:6px;margin-top:2px;">'                f'<span style="font-size:10px;font-weight:600;color:#d29922;text-transform:uppercase;'                f'letter-spacing:0.05em;margin-right:8px">Watch — Setup Building ({watch_n} stocks):</span>'                f'<div class="qs-reject-list">{watch_items}</div>'                f'</div>'
+            )
+
     return f"""
 <div class="qual-summary">
   <div class="qs-header">
@@ -845,6 +924,8 @@ def _qualification_summary_html(df: pd.DataFrame, settings: dict) -> str:
   <div class="qs-body">
     <div class="qs-stats">{stats_html}</div>
     {reject_html}
+    {watch_html}
+    {skip_html}
   </div>
 </div>
 """
@@ -946,7 +1027,8 @@ def _score_cell(val, invert: bool = False, tooltip_key: str | None = None) -> st
         v = float(val)
     except (TypeError, ValueError):
         return '<td class="col-num">—</td>'
-    color = _score_color(v, invert)
+    threshold = _SCORE_THRESHOLDS.get(tooltip_key) if tooltip_key else None
+    color = _score_color(v, invert, threshold=threshold)
     pct   = min(100, max(0, int(v)))
     tip   = ""
     if tooltip_key and tooltip_key in _COL_TOOLTIPS:
@@ -1041,8 +1123,9 @@ def _sc_table_badge(signal_class: str) -> str:
 def _freshness_badge(setup_age_str: str) -> str:
     """Render a colour-coded freshness badge from the SetupAge string."""
     s = str(setup_age_str or "").strip()
-    if not s or s == "—":
-        return '<span style="color:var(--muted);font-size:10px">—</span>'
+    if not s or s in ("—", "nan", "None", ""):
+        # Show a muted chip instead of blank — makes it obvious the column exists
+        return '<span style="color:var(--muted);font-size:9px;background:rgba(139,148,158,0.08);border:1px solid rgba(139,148,158,0.18);border-radius:4px;padding:1px 6px" title="No active plan — requires Supabase">No plan</span>'
     if "Fresh" in s:
         css = "freshness-fresh"
     elif "Mature" in s or "Late" in s:
@@ -1063,8 +1146,8 @@ def _freshness_badge(setup_age_str: str) -> str:
 def _trade_status_badge(status_str: str) -> str:
     """Render trade plan status as a small coloured badge."""
     s = str(status_str or "").strip()
-    if not s or "Forming" in s or s == "—":
-        return '<span style="color:var(--muted);font-size:9px">—</span>'
+    if not s or s in ("—", "nan", "None", "") or "Forming" in s:
+        return '<span style="color:var(--muted);font-size:9px;background:rgba(139,148,158,0.08);border:1px solid rgba(139,148,158,0.18);border-radius:4px;padding:1px 6px" title="No active plan — requires Supabase">No plan</span>'
     if "Invalidated" in s or "invalidated" in s:
         css, label = "ts-invalidated", "Invalidated"
     elif "Expired" in s or "expired" in s:
