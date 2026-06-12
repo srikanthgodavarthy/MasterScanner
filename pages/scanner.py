@@ -1580,17 +1580,45 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
             )
         return f'<td style="white-space:nowrap">{badges}</td>'
 
+    def _pb_gate_score(v, threshold, label):
+        """Score cell that turns red when below the admission gate threshold."""
+        try:
+            fv    = float(v)
+            fail  = fv < threshold
+            color = "#f85149" if fail else "#3fb950" if fv >= threshold * 1.2 else "#d29922"
+            pct   = min(int(fv), 100)
+            tip   = f'title="Gate: ≥{threshold} — {"FAILING" if fail else "OK"}"'
+            icon  = "✖" if fail else ""
+            return (
+                f'<td class="col-num" {tip}>'
+                f'<div class="score-cell">'
+                f'<span class="score-num" style="color:{color}">{int(fv)}{icon}</span>'
+                f'<div class="score-bar"><div class="score-fill" style="width:{pct}%;background:{color}"></div></div>'
+                f'</div></td>'
+            )
+        except (TypeError, ValueError):
+            return '<td class="col-num">—</td>'
+
     # ── Build thead ───────────────────────────────────────────────────────────
     _COLS = [
-        ("STOCK",  "col-stock"), ("SCORE",  ""), ("CCI",    ""), ("CCI STATE", ""),
-        ("%CHG",   ""),          ("ENTRY",  ""), ("SL",     ""), ("T1",        ""),
-        ("T2",     ""),          ("RSI",    ""), ("BOOSTS", ""), ("TIER",      ""),
+        ("STOCK",      "col-stock"), ("SCORE",      ""),  ("CCI",       ""),
+        ("CCI STATE",  ""),          ("%CHG",        ""),  ("ENTRY",     ""),
+        ("SL",         ""),          ("T1",          ""),  ("T2",        ""),
+        ("LEADERSHIP", ""),          ("CONVICTION",  ""),  ("EQ",        ""),
+        ("BOOSTS",     ""),          ("TIER",        ""),
     ]
+    # Gate threshold tooltips on headers
+    _HEADER_TIPS = {
+        "LEADERSHIP": 'title="Leadership ≥ 65 required (RS, Trend Age, ADX, Persistence, EMA Slope)"',
+        "CONVICTION": 'title="Conviction ≥ 20 required (Trend Structure, Fib Zone, CCI Recovery, Volume)"',
+        "EQ":         'title="Entry Quality ≥ 60 required (EMA20 dist, Pivot dist, Move since setup)"',
+    }
     thead = (
         '<thead><tr>'
         '<th style="width:28px;text-align:right">#</th>'
         + "".join(
-            f'<th class="{cls}">{h}</th>' for h, cls in _COLS
+            f'<th class="{cls}" {_HEADER_TIPS.get(h,"")}>{h}</th>'
+            for h, cls in _COLS
         )
         + '</tr></thead>'
     )
@@ -1603,6 +1631,9 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
         rsi    = r.get("RSI") or r.get("_rsi") or 0
         tier   = r.get("CV1_SignalClass") or r.get("Tier") or "—"
         boosts = r.get("_fib_pb_boosts") or []
+        ls     = r.get("CV1_Leadership",   0)
+        cv     = r.get("CV1_Conviction",   0)
+        eq     = r.get("CV1_EntryQuality", 0)
 
         # CCI state label — mirrors the main scanner
         try:
@@ -1638,7 +1669,9 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
             + _pb_num(r.get("SL"),    "{:.2f}", color="#f85149")
             + _pb_num(r.get("T1"),    "{:.2f}", color="#58a6ff")
             + _pb_num(r.get("T2"),    "{:.2f}", color="#3fb950")
-            + _pb_num(rsi,            "{:.0f}")
+            + _pb_gate_score(ls, 65, "Leadership")
+            + _pb_gate_score(cv, 20, "Conviction")
+            + _pb_gate_score(eq, 60, "EQ")
             + _pb_boosts(boosts)
             + _pb_tier(tier)
             + '</tr>\n'
