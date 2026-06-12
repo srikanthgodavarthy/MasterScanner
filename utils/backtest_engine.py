@@ -28,8 +28,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 from utils.scanner_engine import _strip_tz, nifty_regime, ema
-from utils.decision_engine import _entry_quality as _eq_fn, _leadership as _ls_fn, _conviction as _cv_fn
+from utils.decision_engine import _entry_quality as _eq_fn, _leadership as _ls_fn, _conviction as _cv_fn, _classify_category
 from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
+from utils.adaptive_target_engine import AdaptiveTargetParams, compute_adaptive_targets, check_momentum_exit
 
 _BT_BATCH_SIZE = 50   # symbols per yf.download() call
 
@@ -276,14 +277,50 @@ def generate_signals_historical(
             continue   # hard reject — do not create a trade signal
 
         last_signal_bar = i
+
+        # ── v12: Adaptive targets ────────────────────────────────
+        _at_params   = AdaptiveTargetParams.from_settings(settings or {})
+        _ext_score   = min(100, int(r.extension_score_atr) * 30)
+        _category    = _classify_category(_ls_val, _cv_val, _eq_val, _ext_score, "ACTIONABLE", r)
+        if _at_params.enabled:
+            _entry_pad = round(r.entry * 1.005, 2)
+            _risk      = max(_entry_pad - r.sl, 0.01)
+            _at = compute_adaptive_targets(
+                entry               = _entry_pad,
+                risk                = _risk,
+                category            = _category,
+                leadership          = _ls_val,
+                conviction          = _cv_val,
+                entry_quality       = _eq_val,
+                extension           = _ext_score,
+                trend_age_bars      = r.trend_age_bars,
+                extension_score_atr = r.extension_score_atr,
+                ema20_pct_dist      = r.ema20_pct_dist,
+                params              = _at_params,
+            )
+            _sig_t1, _sig_t2, _sig_t3 = _at.t1, _at.t2, _at.t3
+            _t1m, _t2m, _t3m          = _at.t1_mult, _at.t2_mult, _at.t3_mult
+            _tgt_cat, _tgt_adj        = _at.category, _at.adjustment
+            _tgt_notes                = "; ".join(_at.reasons)
+        else:
+            _sig_t1, _sig_t2, _sig_t3 = r.t1, r.t2, r.t3
+            _t1m, _t2m, _t3m          = 1.5, 3.0, 5.0
+            _tgt_cat, _tgt_adj, _tgt_notes = "Actionable", 0.0, ""
+
         signals.append({
             "date":            df.index[i],
             "score":           r.norm_score,
             "entry":           r.entry,
             "sl":              r.sl,
-            "t1":              r.t1,
-            "t2":              r.t2,
-            "t3":              r.t3,
+            "t1":              _sig_t1,
+            "t2":              _sig_t2,
+            "t3":              _sig_t3,
+            "t1_mult":         _t1m,
+            "t2_mult":         _t2m,
+            "t3_mult":         _t3m,
+            "target_category": _tgt_cat,
+            "target_adj":      _tgt_adj,
+            "target_notes":    _tgt_notes,
             "cci":             round(r.cur_cci),
             "rsi":             round(r.cur_rsi, 1),
             "tier1_prime":     r.tier1_prime,
@@ -355,7 +392,8 @@ def simulate_trades(
     symbol:    str,
     df_full:   pd.DataFrame,
     signals:   pd.DataFrame,
-    hold_days: int = 20,
+    hold_days: int  = 20,
+    momentum_exit_enabled: bool = False,
 ) -> pd.DataFrame:
     if signals.empty or df_full.empty:
         return pd.DataFrame()
@@ -389,10 +427,13 @@ def simulate_trades(
         sl = sig_sl + (entry_price - sig_en) * 0.5   # shift SL by half the gap
         sl = round(min(sl, sig_sl + abs(entry_price - sig_en)), 2)  # cap shift
 
-        # Recompute risk and targets from actual entry
-        rk = max(entry_price - sl, 0.01)
-        t1 = round(entry_price + rk * 1.5, 2)
-        t2 = round(entry_price + rk * 3.0, 2)
+        # Recompute risk and targets from actual entry using adaptive multiples
+        rk   = max(entry_price - sl, 0.01)
+        _t1m = float(sig.get("t1_mult", 1.5))
+        _t2m = float(sig.get("t2_mult", 3.0))
+        _t3m = float(sig.get("t3_mult", 5.0))
+        t1   = round(entry_price + rk * _t1m, 2)
+        t2   = round(entry_price + rk * _t2m, 2)
 
         # Gap-down: open already below SL
         if entry_price <= sl:
@@ -407,14 +448,15 @@ def simulate_trades(
         exit_date   = future.index[min(hold_days, len(future) - 1)]
         exit_reason = "TIMEOUT"
 
-        # T3 recomputed from actual entry (same R-multiple logic as T1/T2)
-        t3 = round(entry_price + rk * 5.0, 2)
+        # T3 uses adaptive multiple (t3_mult stored on signal)
+        t3 = round(entry_price + rk * _t3m, 2)
 
         # Trail state: once T1 is hit, SL moves to breakeven (entry_price).
         # This converts "T1 then drift to TIMEOUT near 0%" into a small-profit
         # SL exit, reducing TIMEOUT count and lifting TIMEOUT avg return.
         active_sl    = sl
         t1_triggered = False
+        _mf_confirm  = False   # v13: 2-bar momentum-fail confirmation arm
 
         window = future.iloc[: hold_days + 1]
         for dt, row in window.iterrows():
@@ -474,6 +516,33 @@ def simulate_trades(
                 t1_triggered = True
                 active_sl    = entry_price
 
+            # ── Momentum failure exit (v13) — 2-bar confirmation ─
+            # Only fires after T1 (SL already at breakeven → cannot lose).
+            # Requires all three conditions on BOTH this bar and the previous
+            # bar to avoid noise exits on a single bad candle.
+            if momentum_exit_enabled and t1_triggered and exit_reason == "TIMEOUT":
+                _c   = float(row["close"])
+                _ema = float(row.get("ema20",        entry_price))
+                _ml  = float(row.get("macd_line",    0.0))
+                _ms  = float(row.get("macd_signal",  0.0))
+                _cci = float(row.get("cci",          0.0))
+                _fired, _ = check_momentum_exit(
+                    close=_c, ema20=_ema,
+                    macd_line=_ml, macd_signal=_ms,
+                    cci=_cci,
+                    t1_triggered=True, entry_price=entry_price,
+                )
+                if _fired:
+                    if _mf_confirm:   # second consecutive bar → exit
+                        exit_price  = max(_c, entry_price)   # floor at BE
+                        exit_date   = dt
+                        exit_reason = "MOMENTUM_FAIL"
+                        break
+                    else:
+                        _mf_confirm = True   # first bar — arm the flag
+                else:
+                    _mf_confirm = False   # reset if conditions clear
+
         pnl_pct = round((exit_price - entry_price) / entry_price * 100, 2)
 
         trades.append({
@@ -521,6 +590,13 @@ def simulate_trades(
             "extension_score_atr":    int(sig.get("extension_score_atr",     0)),
             "atr_band":               str(sig.get("atr_band",                "Actionable")),
             "pct_band":               str(sig.get("pct_band",                "Actionable")),
+            # ── v12: adaptive target provenance ─────────────────
+            "t1_mult":         float(sig.get("t1_mult",         1.5)),
+            "t2_mult":         float(sig.get("t2_mult",         3.0)),
+            "t3_mult":         float(sig.get("t3_mult",         5.0)),
+            "target_category": str(sig.get("target_category",  "Actionable")),
+            "target_adj":      float(sig.get("target_adj",      0.0)),
+            "target_notes":    str(sig.get("target_notes",      "")),
         })
 
         blocked_until = exit_date
@@ -553,6 +629,9 @@ def run_backtest(
         tier_filter      = settings.get("bt_tier_filter",       tier_filter)
         buy_type_filter  = settings.get("bt_buy_type_filter",   buy_type_filter)
         rs_positive_only = bool(settings.get("bt_rs_positive_only", rs_positive_only))
+
+    # v13: momentum failure exit and adaptive targets — read from settings
+    momentum_exit_enabled = bool((settings or {}).get("momentum_exit_enabled", False))
 
     workers = max(4, min(workers, 20))
 
@@ -592,7 +671,8 @@ def run_backtest(
             buy_type_filter  = buy_type_filter,
             rs_positive_only = rs_positive_only,
         )
-        trades = simulate_trades(sym, df, sigs, hold_days=hold_days)
+        trades = simulate_trades(sym, df, sigs, hold_days=hold_days,
+                                 momentum_exit_enabled=momentum_exit_enabled)
         if not rejs.empty:
             rejs.insert(0, "symbol", sym)
         if not trades.empty:
@@ -978,6 +1058,111 @@ def build_classification_comparison(trades: pd.DataFrame) -> dict:
     }
 
 
+def _target_category_breakdown(trades: pd.DataFrame) -> dict:
+    """
+    v12: Performance breakdown by adaptive target category.
+    Shows whether Elite / High Conviction / Actionable targets are
+    delivering meaningfully different outcomes.
+    """
+    result = {}
+    if "target_category" not in trades.columns:
+        return result
+    for cat, grp in trades.groupby("target_category"):
+        w  = grp[grp["pnl_pct"] > 0]
+        l  = grp[grp["pnl_pct"] <= 0]
+        wr = len(w) / len(grp)
+        aw = w["pnl_pct"].mean() if len(w) else 0.0
+        al = abs(l["pnl_pct"].mean()) if len(l) else 0.0
+        gp = w["pnl_pct"].sum() if len(w) else 0.0
+        gl = abs(l["pnl_pct"].sum()) if len(l) else 1.0
+        t_bd = grp["exit_reason"].value_counts().to_dict() if "exit_reason" in grp.columns else {}
+        t_pct = round(t_bd.get("TIMEOUT", 0) / len(grp) * 100, 1) if len(grp) else 0.0
+        mf_pct= round(t_bd.get("MOMENTUM_FAIL", 0) / len(grp) * 100, 1) if len(grp) else 0.0
+        result[cat] = {
+            "trades":         len(grp),
+            "win_rate":       round(wr * 100, 1),
+            "avg_pnl":        round(grp["pnl_pct"].mean(), 2),
+            "expectancy":     round(wr * aw - (1 - wr) * al, 2),
+            "profit_factor":  round(gp / gl, 2) if gl > 0 else 0.0,
+            "timeout_pct":    t_pct,
+            "momentum_fail_pct": mf_pct,
+            "avg_t1_mult":    round(grp["t1_mult"].mean(), 2) if "t1_mult" in grp.columns else 0.0,
+        }
+    return result
+
+
+def _excursion_summary(trades: pd.DataFrame) -> dict:
+    """
+    v13: Lightweight MFE / MAE summary computed from exit reasons.
+    True bar-level excursion data requires price replay; this function
+    approximates from known exit types so it works without replay.
+
+    MFE approximation:
+      T3 HIT         → MFE ≥ t3_mult  R
+      T2 HIT         → MFE ≥ t2_mult  R
+      T1 HIT         → MFE ≥ t1_mult  R
+      SL TRAIL       → MFE ≥ t1_mult  R  (T1 was hit before trail)
+      MOMENTUM_FAIL  → MFE ≈ t1_mult  R  (fired post-T1)
+      SL HIT         → MFE ≈ 0.3 R
+      TIMEOUT        → MFE ≈ pnl / risk  (bounded 0-4R)
+    """
+    import numpy as np
+
+    if trades.empty:
+        return {}
+
+    df = trades.copy()
+
+    def _mfe(row):
+        reason = str(row.get("exit_reason", ""))
+        t1m    = float(row.get("t1_mult", 1.5))
+        t2m    = float(row.get("t2_mult", 3.0))
+        t3m    = float(row.get("t3_mult", 5.0))
+        ep     = float(row.get("entry_price", 1))
+        pnl    = float(row.get("pnl_pct", 0)) / 100 * ep
+        rk_est = ep * 0.03   # ~3% fallback if risk not available
+        if   reason == "T3 HIT":        return t3m
+        elif reason == "T2 HIT":        return t2m
+        elif reason in ("T1 HIT", "SL TRAIL", "MOMENTUM_FAIL"): return t1m
+        elif reason == "SL HIT":        return 0.3
+        return min(4.0, max(0.0, pnl / max(rk_est, 0.01)))
+
+    df["_mfe"] = df.apply(_mfe, axis=1)
+
+    timeout = df[df["exit_reason"] == "TIMEOUT"]
+    tot     = len(df)
+
+    # Timeout decomposition
+    td = {}
+    if not timeout.empty:
+        td["total"]                = len(timeout)
+        td["pct_of_all"]           = round(len(timeout) / tot * 100, 1)
+        td["A_reached_1R"]         = int((timeout["_mfe"] >= 1.0).sum())
+        td["B_reached_2R"]         = int((timeout["_mfe"] >= 2.0).sum())
+        td["C_never_1R"]           = int((timeout["_mfe"] <  1.0).sum())
+        td["profitable_timeouts"]  = int((timeout["pnl_pct"] > 0).sum())
+        td["avg_mfe_r"]            = round(float(timeout["_mfe"].mean()), 2)
+
+    # R-probability curve
+    r_probs = {}
+    for r_lvl in [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]:
+        r_probs[f"{r_lvl}R"] = round(float((df["_mfe"] >= r_lvl).mean() * 100), 1)
+
+    # Exit breakdown with percentages
+    exit_bd  = df["exit_reason"].value_counts().to_dict()
+    exit_pct = {k: round(v / tot * 100, 1) for k, v in exit_bd.items()}
+
+    return {
+        "total_trades":     tot,
+        "mfe_p50":          round(float(np.percentile(df["_mfe"], 50)), 2),
+        "mfe_p75":          round(float(np.percentile(df["_mfe"], 75)), 2),
+        "mfe_p90":          round(float(np.percentile(df["_mfe"], 90)), 2),
+        "r_achieved_probs": r_probs,
+        "timeout_decomp":   td,
+        "exit_pct":         exit_pct,
+    }
+
+
 def compute_stats(trades: pd.DataFrame) -> dict:
     if trades.empty:
         return {}
@@ -1114,4 +1299,7 @@ def compute_stats(trades: pd.DataFrame) -> dict:
         "pct_band_stats":         _pct_band_breakdown(trades),
         # Three-way classification comparison with predictive power ranking
         "classification_comparison": build_classification_comparison(trades),
+        # v12/v13: adaptive target category breakdown + excursion stats
+        "target_category_stats":   _target_category_breakdown(trades),
+        "excursion_stats":         _excursion_summary(trades),
     }
