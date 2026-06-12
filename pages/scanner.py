@@ -18,6 +18,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
+import streamlit.components.v1 as _stc
 import pandas as pd
 from datetime import datetime
 try:
@@ -1643,7 +1644,37 @@ def render(settings: dict | None = None):
     _scan_settings = st.session_state.get("scan_settings", {})
     _qs_html = _qualification_summary_html(df_aug, _scan_settings)
     if _qs_html:
-        st.markdown(_qs_html, unsafe_allow_html=True)
+        # components.v1.html renders in an iframe — CSS vars won't inherit.
+        # Inject a self-contained <style> that resolves all vars inline.
+        _QS_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
+:root{--bg0:#0d1117;--bg1:#161b22;--bg2:#1c2333;--bg3:#21262d;
+  --border:rgba(255,255,255,0.08);--gold:#f5c542;--green:#3fb950;
+  --amber:#d29922;--red:#f85149;--muted:#8b949e;--text:#e6edf3;
+  --mono:'JetBrains Mono','Fira Code',monospace;}
+body{background:#0d1117;margin:0;padding:4px 0;}
+.qual-summary{background:var(--bg1);border:1px solid var(--border);
+  border-left:3px solid #4ade80;border-radius:8px;padding:10px 14px;
+  margin:0;font-family:var(--mono);font-size:12px;}
+.qs-header{margin-bottom:8px;}
+.qs-title{font-size:11px;font-weight:700;color:var(--muted);letter-spacing:0.06em;text-transform:uppercase;}
+.qs-body{display:flex;flex-direction:column;gap:6px;}
+.qs-stats{display:flex;gap:20px;flex-wrap:wrap;align-items:baseline;}
+.qs-stat{display:flex;align-items:baseline;gap:6px;}
+.qs-num{font-size:18px;font-weight:700;line-height:1;}
+.qs-label{font-size:10px;color:var(--muted);font-weight:500;letter-spacing:0.04em;}
+.qs-reject-block{border-top:1px solid var(--border);padding-top:6px;margin-top:2px;}
+.qs-reject-head{font-size:10px;font-weight:600;color:#f85149;text-transform:uppercase;letter-spacing:0.05em;margin-right:8px;}
+.qs-reject-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:5px;}
+.qs-reject-item{background:rgba(248,81,73,0.08);border:1px solid rgba(248,81,73,0.25);
+  border-radius:5px;padding:2px 8px;font-size:11px;}
+.qs-reject-reason{color:#f85149;font-size:10px;}
+</style>
+"""
+        _qs_lines = _qs_html.count('qs-reject-item') + _qs_html.count('qs-reject-block') * 2 + 6
+        _qs_height = max(110, min(500, _qs_lines * 26))
+        _stc.html(_QS_CSS + _qs_html, height=_qs_height, scrolling=False)
 
     # ── Toggles ──────────────────────────────────────────────────
     tgl1, tgl2, tgl3 = st.columns([2, 2, 2])
