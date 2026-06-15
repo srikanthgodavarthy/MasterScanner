@@ -2222,16 +2222,24 @@ def render(settings: dict | None = None):
         # Nifty price + today's live %Chg (intraday)
         try:
             from utils.scanner_engine import fetch_nifty_live
+            # FIX: fetch_nifty_live() now prioritises ^NSEI (Nifty 50) so the
+            # market-status bar shows the familiar ~23 000 level, not CRSLDX.
             _nifty_price, _nifty_chg = fetch_nifty_live()
             if _nifty_price:
                 st.session_state["nifty_price"]   = _nifty_price
                 st.session_state["nifty_chg_pct"] = _nifty_chg
-            elif nifty_series is not None and len(nifty_series) >= 2:
-                # Fallback to daily series already fetched
-                last = float(nifty_series.iloc[-1])
-                prev = float(nifty_series.iloc[-2])
-                st.session_state["nifty_price"]   = last
-                st.session_state["nifty_chg_pct"] = round((last - prev) / prev * 100, 2)
+            else:
+                # Fallback: fetch Nifty 50 daily data directly
+                try:
+                    import yfinance as _yf
+                    _n50 = _yf.Ticker("^NSEI").history(period="5d", auto_adjust=True)
+                    if len(_n50) >= 2:
+                        _last = float(_n50["Close"].iloc[-1])
+                        _prev = float(_n50["Close"].iloc[-2])
+                        st.session_state["nifty_price"]   = _last
+                        st.session_state["nifty_chg_pct"] = round((_last - _prev) / _prev * 100, 2)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2482,7 +2490,8 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
                 unsafe_allow_html=True,
             )
 
-            _show_detail = st.toggle("Detail view", value=False, key=f"detail_{sc_key}")
+            # FIX: Detail view removed — always use compact primary columns
+            _show_detail = False
 
             # Validation strip
             if val_mode and "Category" in df_subset.columns and "CV1_SignalClass" in df_subset.columns:
@@ -2509,10 +2518,11 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
                 disp = disp.drop(columns=["regime_tier"])
             st.markdown(_render_html_table(disp), unsafe_allow_html=True)
 
-            # ── Per-stock component table ─────────────────────────
+            # ── Per-stock component table (collapsed by default) ──
             _pills_html = _perstock_breakdown_table(df_subset)
             if _pills_html:
-                st.markdown(_pills_html, unsafe_allow_html=True)
+                with st.expander("📊 Per-stock sub-factor breakdown", expanded=False):
+                    st.markdown(_pills_html, unsafe_allow_html=True)
 
             # Per-stock breakdown
             if _show_detail and has_cv1:
