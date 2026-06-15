@@ -383,6 +383,30 @@ def _classify_tier(row: dict, regime: str, composite: float, threshold: float,
 #    - Combines into 0–60 ADX-equivalent scale
 # ══════════════════════════════════════════════════════════════════
 
+def compute_nifty_adx(period: int = 14) -> Optional[float]:
+    """
+    Compute a real Wilder-smoothed ADX(14) on the Nifty 500 (^CRSLDX)
+    index OHLCV series.  Returns None if the fetch fails or the series
+    is too short, which lets build_regime_context() fall back to the
+    EMA-slope proxy as before.
+
+    This replaces the previous pattern where `adx=None` was always passed
+    and the proxy was silently used — causing the Market Status Bar to
+    display a synthetic EMA-slope score labelled as "ADX".
+    """
+    try:
+        from utils.scanner_engine import fetch_nifty_ohlcv
+        from utils.scoring_core import _adx as _wilder_adx
+        df = fetch_nifty_ohlcv("1y")
+        if df.empty or len(df) < period * 3:
+            return None
+        adx_series = _wilder_adx(df["high"], df["low"], df["close"], period)
+        val = float(adx_series.dropna().iloc[-1])
+        return round(val, 1)
+    except Exception:
+        return None
+
+
 def _ema_slope_adx_proxy(nifty: pd.Series) -> float:
     """
     EMA slope-based directional strength proxy (0–60 ADX-equivalent).
@@ -512,6 +536,11 @@ def build_regime_context(
     """
     if vix is None and auto_fetch_vix:
         vix = fetch_india_vix()
+
+    # Auto-compute real Wilder ADX(14) on Nifty OHLCV when no value supplied.
+    # Falls back to EMA-slope proxy inside classify_regime() if fetch fails.
+    if adx is None:
+        adx = compute_nifty_adx()   # returns None on failure -> proxy used
 
     regime, vix_used, adx_used, a50, a200 = classify_regime(nifty, vix, adx)
     nifty_mom3, nifty_mom6 = _nifty_momentum(nifty)
