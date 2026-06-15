@@ -846,7 +846,7 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     FACTORS = [
         # ── LEADERSHIP (purple) ────────────────────────────────────
         ("_cv1_ls_rs", "RS Composite", 30, "#a371f7",
-         "Multi-TF relative strength vs Nifty 50\n"
+         "Multi-TF relative strength vs Nifty 500 (^CRSLDX)\n"
          "RS > 0.15  →  +30 pts  (strong outperformance)\n"
          "RS 0.10–0.15 →  +25 pts\n"
          "RS 0.05–0.10 →  +20 pts\n"
@@ -864,7 +864,7 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
          "0–5 bars    →   0 pts   (too early)"),
 
         ("_cv1_ls_adx", "ADX Strength", 20, "#a371f7",
-         "ADX of Nifty 50 (directional strength proxy)\n"
+         "ADX(14) of the individual stock (directional strength proxy)\n"
          "ADX ≥ 40    →  +20 pts  (strong trend, PF 1.41)\n"
          "ADX 30–40   →  +12 pts\n"
          "ADX 25–30   →   +5 pts  (dead zone)\n"
@@ -1173,7 +1173,7 @@ def _market_status_row(summary: dict, scan_time: str,
   <span class="msr-chip">{pct_html}</span>
   <span class="msr-chip" style="color:{ema50_col}">{ema50_txt}</span>
   <span class="msr-chip"><span class="chip-label">VIX</span>{vix_val}</span>
-  <span class="msr-chip"><span class="chip-label">ADX</span>{adx_val}</span>
+  <span class="msr-chip" title="Nifty ADX(14) — directional strength of the index"><span class="chip-label">Nifty ADX</span>{adx_val}</span>
   <span class="msr-spacer"></span>
   {scan_chip}
 </div>
@@ -2222,24 +2222,16 @@ def render(settings: dict | None = None):
         # Nifty price + today's live %Chg (intraday)
         try:
             from utils.scanner_engine import fetch_nifty_live
-            # FIX: fetch_nifty_live() now prioritises ^NSEI (Nifty 50) so the
-            # market-status bar shows the familiar ~23 000 level, not CRSLDX.
             _nifty_price, _nifty_chg = fetch_nifty_live()
             if _nifty_price:
                 st.session_state["nifty_price"]   = _nifty_price
                 st.session_state["nifty_chg_pct"] = _nifty_chg
-            else:
-                # Fallback: fetch Nifty 50 daily data directly
-                try:
-                    import yfinance as _yf
-                    _n50 = _yf.Ticker("^NSEI").history(period="5d", auto_adjust=True)
-                    if len(_n50) >= 2:
-                        _last = float(_n50["Close"].iloc[-1])
-                        _prev = float(_n50["Close"].iloc[-2])
-                        st.session_state["nifty_price"]   = _last
-                        st.session_state["nifty_chg_pct"] = round((_last - _prev) / _prev * 100, 2)
-                except Exception:
-                    pass
+            elif nifty_series is not None and len(nifty_series) >= 2:
+                # Fallback to daily series already fetched
+                last = float(nifty_series.iloc[-1])
+                prev = float(nifty_series.iloc[-2])
+                st.session_state["nifty_price"]   = last
+                st.session_state["nifty_chg_pct"] = round((last - prev) / prev * 100, 2)
         except Exception:
             pass
 
@@ -2490,8 +2482,7 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
                 unsafe_allow_html=True,
             )
 
-            # FIX: Detail view removed — always use compact primary columns
-            _show_detail = False
+            _show_detail = st.toggle("Detail view", value=False, key=f"detail_{sc_key}")
 
             # Validation strip
             if val_mode and "Category" in df_subset.columns and "CV1_SignalClass" in df_subset.columns:
@@ -2518,11 +2509,10 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
                 disp = disp.drop(columns=["regime_tier"])
             st.markdown(_render_html_table(disp), unsafe_allow_html=True)
 
-            # ── Per-stock component table (collapsed by default) ──
+            # ── Per-stock component table ─────────────────────────
             _pills_html = _perstock_breakdown_table(df_subset)
             if _pills_html:
-                with st.expander("📊 Per-stock sub-factor breakdown", expanded=False):
-                    st.markdown(_pills_html, unsafe_allow_html=True)
+                st.markdown(_pills_html, unsafe_allow_html=True)
 
             # Per-stock breakdown
             if _show_detail and has_cv1:
