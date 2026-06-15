@@ -361,6 +361,27 @@ def fetch_nifty(period: str = "1y") -> pd.Series:
     return pd.Series(dtype=float)
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_nifty_ohlcv(period: str = "1y") -> pd.DataFrame:
+    """
+    Fetch full OHLCV for the Nifty index (^CRSLDX → ^NSEI fallback).
+    Used by regime_engine to compute a real Wilder ADX on the index
+    instead of the EMA-slope proxy.
+    Returns an empty DataFrame on failure.
+    """
+    for ticker in ("^CRSLDX", "^NSEI"):
+        try:
+            df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
+            if df.empty:
+                continue
+            df.index   = _strip_tz(pd.to_datetime(df.index))
+            df.columns = [c.lower() for c in df.columns]
+            return df[["open", "high", "low", "close", "volume"]]
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
 def fetch_nifty_live() -> tuple[float, float | None]:
     """
     Return (current_price, day_pct_change) using intraday data so the
