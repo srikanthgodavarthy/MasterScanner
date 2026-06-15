@@ -2312,9 +2312,10 @@ def render(settings: dict | None = None):
     _scan_settings = st.session_state.get("scan_settings", {})
     _qs_html = _qualification_summary_html(df_aug, _scan_settings)
     if _qs_html:
-        # components.v1.html renders in an iframe — CSS vars won't inherit.
-        # Inject a self-contained <style> that resolves all vars inline.
-        _QS_CSS = """
+        with st.expander("📋 Qualification Summary", expanded=False):
+            # components.v1.html renders in an iframe — CSS vars won't inherit.
+            # Inject a self-contained <style> that resolves all vars inline.
+            _QS_CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
 :root{--bg0:#0d1117;--bg1:#161b22;--bg2:#1c2333;--bg3:#21262d;
@@ -2340,13 +2341,13 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
 .qs-reject-reason{color:#f85149;font-size:10px;}
 </style>
 """
-        # Tighter height: base (header + stats) + per-block header + flex-wrapped item rows
-        _n_items  = _qs_html.count('qs-reject-item')
-        _n_blocks = _qs_html.count('qs-reject-block')
-        _item_rows = max(1, (_n_items + 3) // 4)   # ~4 items per flex-wrap row
-        _qs_height = 72 + _n_blocks * 32 + _item_rows * 26
-        _qs_height = max(90, min(480, _qs_height))
-        _stc.html(_QS_CSS + _qs_html, height=_qs_height, scrolling=False)
+            # Tighter height: base (header + stats) + per-block header + flex-wrapped item rows
+            _n_items  = _qs_html.count('qs-reject-item')
+            _n_blocks = _qs_html.count('qs-reject-block')
+            _item_rows = max(1, (_n_items + 3) // 4)   # ~4 items per flex-wrap row
+            _qs_height = 72 + _n_blocks * 32 + _item_rows * 26
+            _qs_height = max(90, min(480, _qs_height))
+            _stc.html(_QS_CSS + _qs_html, height=_qs_height, scrolling=False)
 
     # ── Scoring Explainer ─────────────────────────────────────────
     with st.expander("📊 How CV1 Scores & Signal Classes are calculated", expanded=False):
@@ -2512,7 +2513,8 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
             # ── Per-stock component table ─────────────────────────
             _pills_html = _perstock_breakdown_table(df_subset)
             if _pills_html:
-                st.markdown(_pills_html, unsafe_allow_html=True)
+                with st.expander("🔬 Stock Breakdown Summary", expanded=False):
+                    st.markdown(_pills_html, unsafe_allow_html=True)
 
             # Per-stock breakdown
             if _show_detail and has_cv1:
