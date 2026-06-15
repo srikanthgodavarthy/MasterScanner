@@ -680,8 +680,44 @@ def score_stock(
             "_cv1_eq_move":      cv1.eq_move_since_setup,
             "_cv1_eq_bars":      cv1.eq_bars_since_setup,
         })
+
+        # ── CV1 ACTION GATE ───────────────────────────────────────
+        # The original Action column (✅ BUY / 👁 WATCH / ⛔ SKIP) was
+        # assigned purely from norm_score in compute_bar(), with zero
+        # reference to the Conviction pipeline.  This caused BUY signals
+        # with avg Conviction ≈ 22 (audit finding: lines 523-553 of report).
+        #
+        # Fix: after CV1 is computed we reconcile Action with CV1_SignalClass.
+        # Rule: BUY is only kept when CV1 agrees (ELITE or EXECUTE).
+        #       If CV1 downgrades, we floor Action to the CV1-implied level
+        #       but never *upgrade* beyond what norm_score already decided.
+        #
+        #   CV1=ELITE   → keep/upgrade to BUY  (highest conviction)
+        #   CV1=EXECUTE → keep/upgrade to BUY  (actionable)
+        #   CV1=WATCH   → cap at WATCH          (insufficient conviction for BUY)
+        #   CV1=SKIP    → cap at SKIP           (structural failure)
+        #
+        # The original Action from norm_score is preserved as _action_raw
+        # so we can measure disagreement rate in diagnostics.
+        _action_raw = result.get("Action", r.action)
+        result["_action_raw"] = _action_raw          # for diagnostics
+        sc = cv1.signal_class                        # ELITE | EXECUTE | WATCH | SKIP
+
+        if sc in ("ELITE", "EXECUTE"):
+            # CV1 approves — honour norm_score decision (BUY/WATCH/SKIP)
+            # but promote WATCH→BUY only if norm_score itself was BUY
+            gated_action = _action_raw
+        elif sc == "WATCH":
+            # Cap: BUY becomes WATCH; WATCH/SKIP stay as-is
+            gated_action = "👁 WATCH" if _action_raw == "✅ BUY" else _action_raw
+        else:  # SKIP
+            # Full downgrade: BUY/WATCH both become SKIP
+            gated_action = "⛔ SKIP" if _action_raw in ("✅ BUY", "👁 WATCH") else _action_raw
+
+        result["Action"] = gated_action
+
     except Exception:
-        pass   # non-critical
+        pass   # non-critical; Action column retains norm_score value
 
     return result
 
