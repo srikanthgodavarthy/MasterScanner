@@ -31,6 +31,10 @@ from utils.scanner_engine import _strip_tz, nifty_regime, ema
 from utils.decision_engine import _entry_quality as _eq_fn, _leadership as _ls_fn, _conviction as _cv_fn, _classify_category
 from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
 from utils.adaptive_target_engine import AdaptiveTargetParams, compute_adaptive_targets, check_momentum_exit
+from utils.regime_engine  import (
+    build_regime_context, RegimeContext,
+    bar_result_to_row, compute_composite, _classify_tier,
+)
 
 _BT_BATCH_SIZE = 50   # symbols per yf.download() call
 
@@ -133,6 +137,7 @@ def generate_signals_historical(
     tier_filter:     str   = "Both",
     buy_type_filter: list  | None = None,
     rs_positive_only: bool = False,
+    regime_ctx:      "RegimeContext | None" = None,   # [v8.2] regime filter
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Walk-forward signal scan over full history.
@@ -207,7 +212,20 @@ def generate_signals_historical(
         if rs_positive_only and not r.rs_positive:
             continue
 
-        # ── Buy type filter ───────────────────────────────────────
+        # ── Regime filter (v8.2) ──────────────────────────────────
+        # Mirror the scanner's apply_regime_layer: compute composite score
+        # for this bar and classify its regime tier.  Block signals that the
+        # regime engine would mark as "Skip" — these are the same signals that
+        # the scanner suppresses at live scan time.  Wiring this here ensures
+        # backtest population matches scanner population for threshold calibration.
+        if regime_ctx is not None:
+            _rd              = bar_result_to_row(r)
+            _, _, _composite = compute_composite(_rd, regime_ctx.regime, regime_ctx)
+            _rtier           = _classify_tier(_rd, regime_ctx.regime, _composite,
+                                              regime_ctx.execute_threshold,
+                                              force_execute=regime_ctx.force_execute)
+            if _rtier == "Skip":
+                continue   # regime says avoid — do not create trade signal
         if buy_type_filter and r.buy_type not in buy_type_filter:
             continue
 
@@ -647,6 +665,18 @@ def run_backtest(
     effective_settings = dict(settings) if settings else {}
     effective_settings["nifty_regime_val"] = regime_val
 
+    # [v8.2] Build regime context once so every symbol's signals are filtered
+    # by the same regime rules the live scanner applies.  Avoids calibration
+    # mismatch between scanner population (regime-filtered) and backtest
+    # population (previously unfiltered).
+    _apply_regime = bool(effective_settings.get("bt_regime_filter", True))
+    _regime_ctx: "RegimeContext | None" = None
+    if _apply_regime:
+        try:
+            _regime_ctx = build_regime_context(nifty)
+        except Exception:
+            _regime_ctx = None   # graceful fallback: no regime filter
+
     if progress_cb:
         progress_cb(0.15, f"Data ready — {len(all_data)} symbols")
 
@@ -670,6 +700,7 @@ def run_backtest(
             tier_filter      = tier_filter,
             buy_type_filter  = buy_type_filter,
             rs_positive_only = rs_positive_only,
+            regime_ctx       = _regime_ctx,   # [v8.2] regime population filter
         )
         trades = simulate_trades(sym, df, sigs, hold_days=hold_days,
                                  momentum_exit_enabled=momentum_exit_enabled)
