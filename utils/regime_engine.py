@@ -106,7 +106,11 @@ def bar_result_to_row(r) -> dict:
         "_tier2_momentum":      r.tier2_momentum,
         "_any_buy":             r.any_buy,
         # RS raw fields for _compute_rs_score
-        "_rs_score":            r.rs_composite * 100,   # 0-100 scaled
+        # NOTE: _rs_score is NOT pre-populated here.
+        # compute_composite() injects the correctly computed value (regime_engine
+        # RS, centred at 50) via row["_rs_score"] = _compute_rs_score(row, ctx).
+        # Pre-populating r.rs_composite * 100 (scoring_core RS, ±0–30 range)
+        # would always be overwritten and mislead future readers.
     }
 
 
@@ -385,14 +389,12 @@ def _classify_tier(row: dict, regime: str, composite: float, threshold: float,
 
 def compute_nifty_adx(period: int = 14) -> Optional[float]:
     """
-    Compute a real Wilder-smoothed ADX(14) on the Nifty 500 (^CRSLDX)
-    index OHLCV series.  Returns None if the fetch fails or the series
-    is too short, which lets build_regime_context() fall back to the
-    EMA-slope proxy as before.
-
-    This replaces the previous pattern where `adx=None` was always passed
-    and the proxy was silently used — causing the Market Status Bar to
-    display a synthetic EMA-slope score labelled as "ADX".
+    Compute a real Wilder-smoothed ADX(14) on the broad NSE market.
+    Uses Nifty 500 (^CRSLDX) → Nifty 50 (^NSEI) fallback for OHLCV input,
+    since ADX here is a regime-strength measure (broad market breadth),
+    not the display price shown in the Market Status Bar.
+    Returns None if the fetch fails or the series is too short, which lets
+    build_regime_context() fall back to the EMA-slope proxy.
     """
     try:
         from utils.scanner_engine import fetch_nifty_ohlcv
@@ -471,9 +473,15 @@ def classify_regime(
     Returns (regime, vix_used, adx_used, nifty_above_ema50, nifty_above_ema200).
 
     Priority:
-      VIX > 22           → VOLATILE
-      ADX > 25 + EMA50↑ + VIX ≤ 20  → TREND
-      otherwise          → RANGE
+      VIX > 22              → VOLATILE
+      ADX > 25 + EMA50↑ + EMA200↑ + VIX ≤ 22  → TREND  (full bull structure)
+      otherwise             → RANGE
+
+    Notes:
+      - VIX dead zone (20.1–22.0) is now TREND-eligible if ADX and EMAs confirm.
+        Previously this zone always fell to RANGE regardless of trend strength.
+      - nifty_a200 added: Nifty recovering from a bear (above EMA50, below EMA200)
+        stays in RANGE — full bull confirmation required for TREND.
     """
     from utils.scanner_engine import ema as _ema
 
@@ -493,7 +501,9 @@ def classify_regime(
     # FIX 3: use EMA slope proxy, not abs(price diff)/price
     adx_val = float(adx) if adx is not None else _ema_slope_adx_proxy(nifty)
 
-    if vix_val <= 20.0 and adx_val > 25.0 and nifty_a50:
+    # FIX: VIX dead zone closed — TREND allowed up to 22.0 (not just ≤20.0).
+    # FIX: nifty_a200 added — TREND only in confirmed bull structure (above both EMAs).
+    if vix_val <= 22.0 and adx_val > 25.0 and nifty_a50 and nifty_a200:
         return "TREND", vix_val, adx_val, nifty_a50, nifty_a200
 
     return "RANGE", vix_val, adx_val, nifty_a50, nifty_a200
