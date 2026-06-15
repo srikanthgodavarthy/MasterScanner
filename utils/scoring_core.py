@@ -1239,7 +1239,7 @@ def compute_bar(
     is_fib_buy_cci  = trend_up and in_golden_cci and norm_score >= 55 and cci_cross_up_os
     is_abcd_buy     = trend_up and abcd_bull
     is_harm_buy     = trend_up and harm_bull
-    is_norm_buy     = trend_up and norm_score >= 65 and not in_golden and not cci_extended
+    is_norm_buy     = trend_up and norm_score >= score_threshold and not in_golden and not cci_extended  # [FIX] was hardcoded 65; now uses adaptive score_threshold (65-75)
     is_cci_buy      = trend_up and cci_cross_up_os and norm_score >= 55
 
     allow_cloud_buy = above_cloud or (inside_cloud and norm_score >= 65)
@@ -1407,14 +1407,21 @@ def compute_bar(
     }
 
     # ── Suggestion 3: t1_path audit ──────────────────────────────
+    # Order matches _tier1_base evaluation: A → B → C.
+    # A stock can satisfy multiple paths (e.g. is_norm_buy=True AND fresh_base_breakout=True).
+    # We assign the FIRST path that would have independently caused tier1 to fire,
+    # so Path A (structural pullback) takes priority over B (momentum) over C (base breakout).
+    # [FIX] was C-first — caused mislabelling when B and C both fired simultaneously.
     _t1_path = ""
     if is_tier1_prime:
-        if fresh_base_breakout and trend_up and (persistent_strength or rs >= 0.05):
-            _t1_path = "C"
+        if (trend_up and in_golden_relaxed and recent_cci_recovery
+                and persistent_strength and trend_structure
+                and not is_fib_buy_base and not is_fib_buy_cci and not is_cci_buy):
+            _t1_path = "A"
         elif is_norm_buy and norm_score >= _norm_score_thresh_t1:
             _t1_path = "B"
         else:
-            _t1_path = "A"
+            _t1_path = "C"
 
     # ── LABELS ────────────────────────────────────────────────────
     action    = "✅ BUY" if norm_score >= score_threshold else ("👁 WATCH" if norm_score >= 50 else "⛔ SKIP")
@@ -1474,7 +1481,10 @@ def compute_bar(
             _setup_bar = i
 
     # ── EXECUTION TIER FLAG ───────────────────────────────────────
-    # Execution = score>=85 AND rs>=0.10 AND buy_type in [Norm, CmpBrk]
+    # Execution = score>=85 AND rs_composite>=0.10 AND buy_type in [Norm, CmpBrk]
+    # [FIX v8.1 consistency] was rs >= 0.10 (5-bar RS) — inconsistent with v8.1 fix that
+    # replaced rs_positive with rs_composite in the Tier-1 gate for the same reason.
+    # 5-bar RS is too noisy on pullback entries. Now uses rs_composite >= 0.10.
     # buy_type is computed later so we derive it inline here
     _exec_buy_type = (
         "CmpBrk" if is_tier2_momentum else
@@ -1482,7 +1492,7 @@ def compute_bar(
     )
     is_execution = (
         norm_score >= 85 and
-        rs >= 0.10 and
+        rs_composite >= 0.10 and        # [FIX] was: rs >= 0.10 (5-bar noise)
         _exec_buy_type is not None
     )
 
