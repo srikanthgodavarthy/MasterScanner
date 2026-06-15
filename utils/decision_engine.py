@@ -305,49 +305,54 @@ def _entry_quality(r: "BarResult") -> tuple[int, dict, float]:
     # valid breakout entries as "extended" and valid pullbacks as "too close".
     _is_breakout = r.buy_type in ("Norm", "CmpBrk", "CCIRise", "-")
 
-    # ── EMA20 Distance (0-30) ────────────────────────────────────
+    # ── EMA20 Distance (0-40) ────────────────────────────────────
+    # [v8.2] Weight raised from 30 → 40: +10 pts redistributed from
+    # removed eq_move_since component (see below).  eq_move_since
+    # duplicated price_move_since_setup, which is already owned by
+    # Extension's ex_move_since — double-penalising the same variable.
     # Pullback entries: best when near EMA20 (0-3% above).
     # Breakout entries: breakout requires being above EMA20; 0-8% is normal;
     #   only penalise when genuinely parabolic (>15%).
     ema20d = r.ema20_pct_dist   # % above EMA20 (positive = above)
     if _is_breakout:
         if ema20d <= 0:
-            eq_ema20 = 8    # below EMA20 — unusual for breakout, weak
+            eq_ema20 = 10   # below EMA20 — unusual for breakout, weak
         elif ema20d <= 5.0:
-            eq_ema20 = 30   # 0-5%: excellent breakout — close to EMA20
+            eq_ema20 = 40   # 0-5%: excellent breakout — close to EMA20
         elif ema20d <= 8.0:
-            eq_ema20 = 22   # 5-8%: normal post-breakout extension
+            eq_ema20 = 29   # 5-8%: normal post-breakout extension
         elif ema20d <= 12.0:
-            eq_ema20 = 14   # 8-12%: stretched but tradeable
+            eq_ema20 = 18   # 8-12%: stretched but tradeable
         elif ema20d <= 18.0:
-            eq_ema20 = 6    # 12-18%: extended
+            eq_ema20 = 8    # 12-18%: extended
         else:
             eq_ema20 = 0    # >18%: parabolic — avoid
     else:
         if ema20d <= 0:
-            eq_ema20 = 8    # below EMA20 — may be pullback
+            eq_ema20 = 10   # below EMA20 — may be pullback
         elif ema20d <= 2.0:
-            eq_ema20 = 30   # <= 2%: excellent — near EMA20 support
+            eq_ema20 = 40   # <= 2%: excellent — near EMA20 support
         elif ema20d <= 4.0:
-            eq_ema20 = 22   # 2-4%: good
+            eq_ema20 = 29   # 2-4%: good
         elif ema20d <= 6.0:
-            eq_ema20 = 14   # 4-6%: acceptable
+            eq_ema20 = 18   # 4-6%: acceptable
         elif ema20d <= 10.0:
-            eq_ema20 = 6    # 6-10%: stretched
+            eq_ema20 = 8    # 6-10%: stretched
         else:
             eq_ema20 = 0    # >10%: extended for pullback entry
 
-    # ── EMA50 Distance (0-15) ────────────────────────────────────
-    # Further from EMA50 = more room to fall; less attractive risk profile.
+    # ── EMA50 Distance (0-25) ────────────────────────────────────
+    # [v8.2] Weight raised from 15 → 25: +10 pts redistributed from
+    # removed eq_move_since.  Further from EMA50 = more room to fall.
     ema50d = r.ema50_pct_dist
     if ema50d <= 5.0:
-        eq_ema50 = 15   # within 5% of EMA50 — strong structural support nearby
+        eq_ema50 = 25   # within 5% of EMA50 — strong structural support nearby
     elif ema50d <= 10.0:
-        eq_ema50 = 10
+        eq_ema50 = 16
     elif ema50d <= 15.0:
-        eq_ema50 = 5
+        eq_ema50 = 8
     elif ema50d <= 20.0:
-        eq_ema50 = 2
+        eq_ema50 = 3
     else:
         eq_ema50 = 0    # >20% above EMA50 — structurally extended
 
@@ -377,21 +382,16 @@ def _entry_quality(r: "BarResult") -> tuple[int, dict, float]:
         else:
             eq_pivot = 0    # >4% past pivot — chasing
 
-    # ── Price Move Since Setup Trigger (0-20) ────────────────────
-    # If price has moved significantly from the bar where setup was detected,
-    # the opportunity cost has been paid. Target may already be largely achieved.
-    # At 5% target assumption: 3% move = 60% of target already consumed.
-    move_pct = r.price_move_since_setup   # % from setup bar to now
-    if move_pct <= 0.5:
-        eq_move = 20    # barely moved — full opportunity ahead
-    elif move_pct <= 1.5:
-        eq_move = 16    # < 1.5% — still excellent
-    elif move_pct <= 3.0:
-        eq_move = 10    # 1.5-3% — meaningful portion consumed
-    elif move_pct <= 5.0:
-        eq_move = 3     # 3-5% — at or near 5% target
-    else:
-        eq_move = 0     # > 5% — target may have already occurred
+    # ── Price Move Since Setup (REMOVED — v8.2) ──────────────────
+    # eq_move_since has been removed to eliminate double-counting with
+    # ex_move_since in the Extension engine.  Both used price_move_since_setup
+    # and produced a 42-pt combined swing on the same variable (EQ lost points
+    # as move grew; Extension gained them — stacking penalties rather than
+    # balancing).  Architecture: Extension owns structural distance including
+    # price move; Entry Quality owns proximity via EMA distances (eq_ema20,
+    # eq_ema50) and freshness via bars (eq_bars_since).
+    # 20 pts redistributed: +10 to eq_ema20_dist, +10 to eq_ema50_dist.
+    eq_move = 0
 
     # ── Bars Since Setup (0-15) ───────────────────────────────────
     # 0-3 bars = Actionable (setup fresh, momentum not exhausted)
