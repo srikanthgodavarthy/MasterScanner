@@ -1840,11 +1840,11 @@ def _lifecycle_timeline_panel(history_df=None, plan_row=None) -> str:
             timestamps["Expired"] = str(inv)[:10]  # reuse slot
 
     # Determine which nodes are "done"
-    current_status = str(plan_row.get("PlanStatus", "") if plan_row else "").upper()
+    current_status = str(plan_row.get("PlanStatus", "") if plan_row is not None else "").upper()
     done_set = {"Created"} if timestamps.get("Created") else set()
     if current_status in ("ACTIVE",):
         done_set.add("Created")
-        tps = str(plan_row.get("TradePlanStatus", "") if plan_row else "")
+        tps = str(plan_row.get("TradePlanStatus", "") if plan_row is not None else "")
         if "triggered" in tps.lower() or "T1" in tps or "T2" in tps:
             done_set.add("Triggered")
         if "T1" in tps or "T2" in tps:
