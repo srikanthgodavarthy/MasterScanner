@@ -470,14 +470,16 @@ def _primary_blocker(r, result: dict) -> str:
         ext = int(result.get("Extension", result.get("EntryQuality", 0)) or 0)
         return f"Extended ({ext}) — wait for pullback to EMA/Fib"
 
-    # Pull scores — prefer DE (decision engine) values
-    ls = float(result.get("Leadership",    result.get("DE_Leadership",   0)) or 0)
-    cv = float(result.get("Conviction",    result.get("DE_Conviction",   0)) or 0)
-    eq = float(result.get("EntryQuality",  result.get("DE_EntryQuality", 0)) or 0)
-    ext= float(result.get("Extension",     0) or 0)
+    # Pull scores — use CV1 for Leadership (matches scanner display colours at threshold 65);
+    # fall back to DE values when CV1 is absent.
+    ls = float(result.get("CV1_Leadership",  result.get("Leadership",   result.get("DE_Leadership",   0))) or 0)
+    cv = float(result.get("Conviction",      result.get("DE_Conviction",   0)) or 0)
+    eq = float(result.get("EntryQuality",    result.get("DE_EntryQuality", 0)) or 0)
+    ext= float(result.get("Extension",       0) or 0)
 
-    # Priority 1: Leadership (structural gate — nothing else matters if RS is weak)
-    if ls < 50:
+    # Priority 1: Leadership gate — threshold aligned with _SCORE_THRESHOLDS["Leadership"]=65
+    # and _bucket() in scanner.py so blocker text and score colours are consistent.
+    if ls < 65:
         ls_rs   = int(result.get("_ds_ls_rs",   result.get("_de_ls_rs",   0)) or 0)
         ls_trend= int(result.get("_ds_ls_trend", result.get("_de_ls_trend",0)) or 0)
         detail = "trend below EMA" if ls_trend < 20 else "RS below market"
