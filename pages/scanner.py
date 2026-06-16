@@ -133,6 +133,28 @@ _COL_TOOLTIPS = {
         "Negative = entry pulled back below locked level.\n"
         "Large positive drift = chasing; use caution.",
     ),
+    "Category": (
+        "Decision Category",
+        "Trader-meaningful lifecycle label:\n"
+        "Elite Opportunity — Leadership≥90, Conviction≥90, Entry≥80, Extension≤25\n"
+        "High Conviction   — Leadership≥80, Conviction≥80, Entry≥60, Extension≤35\n"
+        "Actionable        — Leadership≥70, Conviction≥60, Entry≥60, Extension≤40\n"
+        "Setup Building    — Leadership≥70, Conviction≥50 (not yet actionable)\n"
+        "Leader            — Leadership≥70, Conviction<50 (strong RS, no base yet)\n"
+        "Extended          — Extension≥60 (move already made)\n"
+        "Avoid             — Leadership<50 or structural failure",
+    ),
+    "Primary Blocker": (
+        "Primary Blocker",
+        "The single most important reason this stock is not Actionable.\n"
+        "Fix this one thing and the stock upgrades.\n"
+        "Low Conviction  — no Fib zone / CCI recovery / squeeze\n"
+        "Weak RS         — RS composite below threshold\n"
+        "Low Entry Qual  — too extended from EMA or pivot\n"
+        "Extended        — move already made, wait for pullback\n"
+        "Regime Gated    — market not in TREND (Execute gate restricted)\n"
+        "CCI Negative    — momentum not confirmed yet",
+    ),
 }
 
 # ── CSS ───────────────────────────────────────────────────────────
@@ -1182,6 +1204,35 @@ def _market_status_row(summary: dict, scan_time: str,
         "VOLATILE": "Volatile market · Execute gate closed · No new positions.",
     }.get(r, "")
 
+    # ── Regime checklist (4 gate conditions) ─────────────────────
+    ema200_up    = summary.get("nifty_ema200",  False)
+    vix_ok       = float(summary.get("vix", 99)) <= 22.0
+    adx_ok       = float(summary.get("adx", 0))  >= 25.0
+    adx_is_real  = summary.get("adx_is_real", False)
+    adx_note     = "" if adx_is_real else " (proxy)"
+
+    def _gate(ok: bool, label: str, tip: str = "") -> str:
+        icon  = "✅" if ok else "❌"
+        color = "#3fb950" if ok else "#f85149"
+        tip_attr = f' title="{tip}"' if tip else ""
+        return (
+            f'<span{tip_attr} style="font-size:11px;color:{color};'
+            f'white-space:nowrap;cursor:default">{icon} {label}</span>'
+        )
+
+    checklist_html = (
+        f'<div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:4px;">'
+        + _gate(vix_ok,    f"VIX ≤22 ({vix_val})",
+                "India VIX ≤ 22 required — higher VIX closes the Execute gate")
+        + _gate(ema50_up,  "Nifty > EMA50",
+                "Nifty above 50-day EMA — short-term trend intact")
+        + _gate(ema200_up, "Nifty > EMA200",
+                "Nifty above 200-day EMA — long-term uptrend confirmed")
+        + _gate(adx_ok,    f"ADX ≥25 ({adx_val}{adx_note})",
+                f"Nifty ADX(14) ≥ 25 — market trending with direction{adx_note}")
+        + "</div>"
+    )
+
     return f"""
 <div class="msr">
   <span class="regime-pill-solid" style="background:{color};color:#0d1117">{regime_label}</span>
@@ -1193,6 +1244,7 @@ def _market_status_row(summary: dict, scan_time: str,
   <span class="msr-spacer"></span>
   {scan_chip}
 </div>
+{checklist_html}
 <p class="market-note">{mkt_text}</p>
 """
 
@@ -1332,61 +1384,128 @@ def _qualification_summary_html(df: pd.DataFrame, settings: dict) -> str:
         + _stat("Qualified Plans",  n_plans,      "#f59e0b" if n_plans > 0 else "#8b949e")
     )
 
-    # ── Not-Qualified breakdown (WATCH + SKIP by reason) ─────────
+    # ── Not-Qualified breakdown: SKIP grouped by primary blocker ─────
     watch_html = ""
     skip_html  = ""
+    leader_html = ""
     if sc_col in df.columns:
-        watch_n = int((df[sc_col] == "WATCH").sum())
-        skip_n  = int((df[sc_col] == "SKIP").sum())
+        watch_n  = int((df[sc_col] == "WATCH").sum())
+        skip_n   = int((df[sc_col] == "SKIP").sum())
+        # Leader stocks (Category == "Leader", may be in WATCH or SKIP)
+        leader_stocks = df[df.get("Category", pd.Series(dtype=str)) == "Leader"] if "Category" in df.columns else pd.DataFrame()
 
-        # Top reasons for SKIP: lowest conviction, leadership, entry quality
+        # ── SKIP grouped by primary blocker ─────────────────────
         skip_stocks = df[df[sc_col] == "SKIP"].copy()
         if not skip_stocks.empty:
-            def _top_fail_reason(row):
-                reasons = []
+            # Bucket each stock by its worst gate failure
+            def _bucket(row):
                 try:
-                    if float(row.get("CV1_Leadership",   100)) < _SCORE_THRESHOLDS["Leadership"]:
-                        reasons.append(f'RS weak ({int(float(row.get("CV1_Leadership",0)))})')
-                    if float(row.get("CV1_Conviction",   100)) < _SCORE_THRESHOLDS["Conviction"]:
-                        reasons.append(f'Conv low ({int(float(row.get("CV1_Conviction",0)))})')
-                    if float(row.get("CV1_EntryQuality", 100)) < _SCORE_THRESHOLDS["Entry Quality"]:
-                        reasons.append(f'EQ low ({int(float(row.get("CV1_EntryQuality",0)))})')
+                    ls = float(row.get("CV1_Leadership", 100))
+                    cv = float(row.get("CV1_Conviction",  100))
+                    eq = float(row.get("CV1_EntryQuality",100))
+                    pb = str(row.get("Primary Blocker", ""))
                 except (TypeError, ValueError):
-                    pass
-                return " · ".join(reasons) if reasons else "Below threshold"
+                    return "Other"
+                # Use Primary Blocker column if available
+                if pb and pb not in ("", "None", "nan"):
+                    if pb.startswith("Weak Leadership") or pb.startswith("Weak RS"):
+                        return "Weak RS"
+                    if pb.startswith("Low Conviction"):
+                        return "Low Conviction"
+                    if pb.startswith("Low Entry"):
+                        return "Low Entry Quality"
+                    if pb.startswith("Extended"):
+                        return "Extended"
+                    if pb.startswith("CCI"):
+                        return "CCI Negative"
+                # Fall back to score thresholds
+                if ls < _SCORE_THRESHOLDS["Leadership"]:
+                    return "Weak RS"
+                if cv < _SCORE_THRESHOLDS["Conviction"]:
+                    return "Low Conviction"
+                if eq < _SCORE_THRESHOLDS["Entry Quality"]:
+                    return "Low Entry Quality"
+                return "Other"
 
-            skip_items = "".join(
-                (
-                    '<span class="qs-reject-item">'
-                    f'<b style="color:#e6edf3">{str(r.get("Stock","?"))}</b>'
-                    f'<span class="qs-reject-reason"> — {_top_fail_reason(r)}</span>'
-                    '</span>'
+            _BUCKET_COLORS = {
+                "Weak RS":          "#f85149",
+                "Low Conviction":   "#d29922",
+                "Low Entry Quality":"#58a6ff",
+                "Extended":         "#f97316",
+                "CCI Negative":     "#a78bfa",
+                "Other":            "#8b949e",
+            }
+
+            # Group stocks by bucket
+            from collections import defaultdict
+            buckets = defaultdict(list)
+            for _, row in skip_stocks.iterrows():
+                buckets[_bucket(row)].append(str(row.get("Stock", "?")))
+
+            bucket_order = ["Weak RS", "Low Conviction", "Low Entry Quality", "Extended", "CCI Negative", "Other"]
+            groups_html = ""
+            for bname in bucket_order:
+                syms = buckets.get(bname)
+                if not syms:
+                    continue
+                bcolor = _BUCKET_COLORS[bname]
+                sym_tags = "".join(
+                    f'<span style="background:rgba(248,81,73,0.08);border:1px solid {bcolor}44;' 
+                    f'border-radius:4px;padding:1px 6px;font-size:11px;font-family:var(--mono);' 
+                    f'color:#e6edf3">{s}</span> '
+                    for s in syms[:10]
                 )
-                for _, r in skip_stocks.head(12).iterrows()
-            )
+                extra = f' <span style="color:#8b949e;font-size:10px">+{len(syms)-10} more</span>' if len(syms) > 10 else ""
+                groups_html += (
+                    f'<div style="margin-bottom:5px">' 
+                    f'<span style="font-size:10px;font-weight:600;color:{bcolor};' 
+                    f'text-transform:uppercase;letter-spacing:0.05em;margin-right:6px">{bname}:</span>'
+                    f'{sym_tags}{extra}</div>'
+                )
+
             skip_html = (
-                '<div class="qs-reject-block">'
-                f'<span class="qs-reject-head">Not Qualified — SKIP ({skip_n} stocks):</span>'
-                f'<div class="qs-reject-list">{skip_items}</div>'
+                '<div class="qs-reject-block">' 
+                f'<span class="qs-reject-head">Not Qualified — SKIP ({skip_n}):</span>'
+                f'<div style="margin-top:5px">{groups_html}</div>'
                 '</div>'
             )
 
+        # ── Leader stocks (violet — high RS, no base) ────────────
+        if not leader_stocks.empty:
+            leader_n = len(leader_stocks)
+            leader_items = "".join(
+                f'<span style="background:rgba(167,139,250,0.1);border:1px solid rgba(167,139,250,0.3);' 
+                f'border-radius:4px;padding:1px 6px;font-size:11px;font-family:var(--mono);' 
+                f'color:#a78bfa">{str(r.get("Stock","?"))}</span> '
+                for _, r in leader_stocks.head(10).iterrows()
+            )
+            extra = f'<span style="color:#8b949e;font-size:10px">+{leader_n-10} more</span>' if leader_n > 10 else ""
+            leader_html = (
+                '<div class="qs-reject-block" style="border-top:1px solid var(--border);padding-top:6px;margin-top:2px;">' 
+                f'<span style="font-size:10px;font-weight:600;color:#a78bfa;text-transform:uppercase;' 
+                f'letter-spacing:0.05em;margin-right:8px">🏃 Leader — await base ({leader_n}):</span>'
+                f'<div style="margin-top:4px">{leader_items}{extra}</div>'
+                '</div>'
+            )
+
+        # ── WATCH stocks (Setup Building) ────────────────────────
         if watch_n > 0:
             watch_stocks = df[df[sc_col] == "WATCH"]
             watch_items = "".join(
                 (
-                    '<span style="background:rgba(210,153,34,0.1);border:1px solid rgba(210,153,34,0.3);'
-                    'border-radius:5px;padding:2px 8px;font-size:11px;font-family:var(--mono)">'
+                    '<span style="background:rgba(210,153,34,0.1);border:1px solid rgba(210,153,34,0.3);' 
+                    'border-radius:5px;padding:2px 8px;font-size:11px;font-family:var(--mono)">' 
                     f'<b style="color:#d29922">{str(r.get("Stock","?"))}</b>'
-                    f'<span style="color:#8b949e;font-size:10px"> CV={int(float(r.get("CV1_Conviction",0))) if str(r.get("CV1_Conviction","")).replace(".","").lstrip("-").isdigit() else chr(8212)}</span>'
+                    f'<span style="color:#8b949e;font-size:10px"> CV=' 
+                    f'{int(float(r.get("CV1_Conviction",0))) if str(r.get("CV1_Conviction","")).replace(".","").lstrip("-").isdigit() else chr(8212)}</span>'
                     '</span>'
                 )
                 for _, r in watch_stocks.head(12).iterrows()
             )
             watch_html = (
-                '<div class="qs-reject-block" style="border-top:1px solid var(--border);padding-top:6px;margin-top:2px;">'
-                f'<span style="font-size:10px;font-weight:600;color:#d29922;text-transform:uppercase;'
-                f'letter-spacing:0.05em;margin-right:8px">Watch — Setup Building ({watch_n} stocks):</span>'
+                '<div class="qs-reject-block" style="border-top:1px solid var(--border);padding-top:6px;margin-top:2px;">' 
+                f'<span style="font-size:10px;font-weight:600;color:#d29922;text-transform:uppercase;' 
+                f'letter-spacing:0.05em;margin-right:8px">Watch — Setup Building ({watch_n}):</span>'
                 f'<div class="qs-reject-list">{watch_items}</div>'
                 '</div>'
             )
@@ -1399,6 +1518,7 @@ def _qualification_summary_html(df: pd.DataFrame, settings: dict) -> str:
   <div class="qs-body">
     <div class="qs-stats">{stats_html}</div>
     {reject_html}
+    {leader_html}
     {watch_html}
     {skip_html}
   </div>
@@ -1453,7 +1573,8 @@ _DETAIL_EXTRA = [
 
 # Primary column order for HTML table (v10: persistence fields added)
 _PRIMARY_ORDERED = [
-    "Stock", "Setup Age", "Plan Status", "Signal Class", "Leadership", "Conviction",
+    "Stock", "Setup Age", "Plan Status", "Signal Class", "Category", "Primary Blocker",
+    "Leadership", "Conviction",
     "Entry Quality", "Extension", "CMP", "%Chg", "Entry", "SL", "T1", "R:R", "Drift%", "Size%",
 ]
 
@@ -1792,7 +1913,23 @@ def _render_html_table(df: pd.DataFrame) -> str:
                 continue
             val = row.get(c, None)
 
-            if c == "Signal Class":
+            if c == "Category":
+                # Render as a coloured badge using _CAT_STYLE
+                color, label = _CAT_STYLE.get(str(val) if val else "", ("#484f58", str(val) if val else "—"))
+                cells += (
+                    f'<td><span style="background:rgba(0,0,0,0.3);border:1px solid {color}33;'
+                    f'border-radius:4px;padding:2px 7px;font-size:10px;font-weight:600;'
+                    f'color:{color};white-space:nowrap">{label}</span></td>'
+                )
+            elif c == "Primary Blocker":
+                blocker_val = str(val) if val else "—"
+                b_color = "#f85149" if blocker_val not in ("", "—", "None") else "#8b949e"
+                cells += (
+                    f'<td style="font-size:11px;color:{b_color};white-space:nowrap;'
+                    f'max-width:160px;overflow:hidden;text-overflow:ellipsis" '
+                    f'title="{blocker_val}">{blocker_val}</td>'
+                )
+            elif c == "Signal Class":
                 cells += _sc_table_badge(str(val) if val is not None else "")
             elif c == "Setup Age":
                 cells += f'<td>{_freshness_badge(val)}</td>'
@@ -2682,6 +2819,40 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
                             unsafe_allow_html=True,
                         )
 
+                        # ── Elite Gap (Fix 5) ─────────────────────────────
+                        # Show gap to Elite Opportunity for non-elite stocks only.
+                        # When category IS Elite Opportunity, gap = 0 — suppress entirely.
+                        _cat = str(_erow.get("Category", ""))
+                        if _cat != "Elite Opportunity":
+                            try:
+                                _ls  = int(float(_erow.get("CV1_Leadership",   _erow.get("Leadership",   0)) or 0))
+                                _cv  = int(float(_erow.get("CV1_Conviction",   _erow.get("Conviction",   0)) or 0))
+                                _eq  = int(float(_erow.get("CV1_EntryQuality", _erow.get("EntryQuality", 0)) or 0))
+                                _ext = int(float(_erow.get("Extension", 0) or 0))
+                                ls_gap  = max(0, 90 - _ls)
+                                cv_gap  = max(0, 90 - _cv)
+                                eq_gap  = max(0, 80 - _eq)
+                                ext_gap = max(0, _ext - 25)  # extension must come DOWN
+                                total_gap = ls_gap + cv_gap + eq_gap + ext_gap
+                                if total_gap > 0:
+                                    gap_parts = []
+                                    if ls_gap  > 0: gap_parts.append(f"Leadership +{ls_gap}")
+                                    if cv_gap  > 0: gap_parts.append(f"Conviction +{cv_gap}")
+                                    if eq_gap  > 0: gap_parts.append(f"Entry +{eq_gap}")
+                                    if ext_gap > 0: gap_parts.append(f"Extension −{ext_gap}")
+                                    gap_str = "  ·  ".join(gap_parts)
+                                    st.markdown(
+                                        f"<div style='background:rgba(245,197,66,0.06);border:1px solid rgba(245,197,66,0.2);"
+                                        f"border-radius:6px;padding:8px 12px;margin-bottom:8px;font-size:11px;'"
+                                        f" title='Gap required to reach Elite Opportunity thresholds: "
+                                        f"Leadership≥90, Conviction≥90, Entry≥80, Extension≤25'>"
+                                        f"<span style='color:#f5c542;font-weight:700;'>🌟 Elite Gap</span>"
+                                        f"<span style='color:#8b949e;margin-left:8px;'>{gap_str}</span></div>",
+                                        unsafe_allow_html=True,
+                                    )
+                            except (TypeError, ValueError):
+                                pass
+
                         if _included:
                             st.markdown("**✅ Why included:**")
                             for item in _included:
@@ -2694,8 +2865,10 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
                             st.markdown("**⚠️ Risk factors:**")
                             for item in _risks:
                                 st.markdown(f"- {item}")
-                        if not _included and not _not_higher and not _risks:
+                        if not _included and not _not_higher and not _risks and _cat != "Elite Opportunity":
                             st.info("No explainability data for this stock.")
+                        elif _cat == "Elite Opportunity":
+                            st.success("This stock IS Elite Opportunity — all gates met.")
 
             # Watchlist
             if supabase_ok and sc_key not in ("SKIP",):
