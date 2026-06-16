@@ -255,7 +255,7 @@ def should_invalidate(
 
     # Rule 3: Fade (category has been below threshold for N consecutive days)
     if (current_category not in _FREEZE_CATEGORIES
-            and current_category not in ("Setup Building",)  # allow brief dips
+            and current_category not in ("Setup Building", "Leader")  # allow brief dips
             and days_below_threshold >= FADE_CONSECUTIVE_DAYS):
         return True, f"Category faded to '{current_category}' for {days_below_threshold} days"
 

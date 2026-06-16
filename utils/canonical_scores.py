@@ -276,6 +276,7 @@ _TIER_TO_CATEGORY: dict[str, str] = {
     "High Conviction":    "High Conviction",
     "Actionable":         "Actionable",
     "Setup Building":     "Setup Building",
+    "Leader":             "Leader",
     "Extended":           "Extended",
     "Avoid":              "Avoid",
 }
@@ -293,7 +294,8 @@ _CATEGORY_RANK: dict[str, int] = {
     "High Conviction":    4,
     "Actionable":         3,
     "Setup Building":     2,
-    "Extended":           1,
+    "Leader":             1,   # High leadership, conviction < 50 — Runner profile, no base yet
+    "Extended":           1,   # Same rank as Leader: both are watch-only, different reason
     "Avoid":              0,
     "":                   0,
 }

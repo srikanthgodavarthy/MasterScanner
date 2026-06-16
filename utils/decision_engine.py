@@ -602,6 +602,7 @@ _CATEGORY_ORDER = [
     "High Conviction",
     "Actionable",
     "Setup Building",
+    "Leader",           # Stage=LEADER: high leadership, conviction < 50, no setup yet
     "Extended",
     "Avoid",
 ]
@@ -632,11 +633,13 @@ def _classify_category(
     if leadership >= 70 and conviction >= 50:
         return "Setup Building"
 
+    # Stage=LEADER with conviction < 50: strong price leadership, no setup structure yet.
+    # Runner profile — RS/momentum present but no Fib zone or compression base formed.
+    # Distinct from Avoid (structural failure / hard stop / downtrend).
+    if stage == "LEADER":
+        return "Leader"
+
     return "Avoid"
-
-
-# ══════════════════════════════════════════════════════════════════
-#  SETTINGS-AWARE THRESHOLDS
 #  The trader-facing settings (trading_style, entry_preference,
 #  extension_tolerance) shift the classification thresholds.
 # ══════════════════════════════════════════════════════════════════
@@ -724,6 +727,10 @@ def _classify_category_with_settings(
 
     if leadership >= 70 + sa and conviction >= 50:
         return "Setup Building"
+
+    # Stage=LEADER with conviction < 50: strong price leadership, no setup structure yet.
+    if stage == "LEADER":
+        return "Leader"
 
     return "Avoid"
 
@@ -863,7 +870,7 @@ def explain_decision(ds: "DecisionScores") -> dict:
             not_higher.append(f"Not Elite: Leadership {ls} (need ≥90) — {gap} pts gap, likely RS or MA alignment")
         if cv < 90:
             not_higher.append(f"Not Elite: Conviction {cv} (need ≥90) — pattern or Fib zone not fully confirmed")
-        if eq < 80 and cat not in ("Extended", "Avoid"):
+        if eq < 80 and cat not in ("Extended", "Avoid", "Leader"):
             move = ds.price_move_since_setup
             bss  = ds.bars_since_setup
             if move > 1.5:
@@ -880,6 +887,13 @@ def explain_decision(ds: "DecisionScores") -> dict:
                     f"Entry Quality {eq}: {ds.ema20_pct_dist:.1f}% above EMA20 — "
                     "stretched for a safe entry"
                 )
+
+    if cat == "Leader":
+        not_higher.append(
+            f"Conviction {cv} (need ≥50 for Setup Building) — "
+            "strong price leadership present but no Fib pullback zone or compression base yet; "
+            "watch for base formation before entering"
+        )
 
     if cat == "Setup Building" and cv < 60:
         not_higher.append(
@@ -925,7 +939,7 @@ def explain_decision(ds: "DecisionScores") -> dict:
     elif ds.risk_reward < 2.0:
         risks.append(f"R:R {ds.risk_reward:.1f} — marginal; target 2R or better")
 
-    if ls < 60 and cat != "Avoid":
+    if ls < 60 and cat not in ("Avoid", "Leader"):
         risks.append(
             f"Leadership {ls} is borderline — trend or RS weakening; "
             "monitor for early exit signals"
@@ -1077,6 +1091,11 @@ CATEGORY_STYLE: dict[str, dict] = {
         "color": "#f59e0b", "bg": "#2d1d00", "border": "#92400e",
         "icon": "👁", "action": "WATCH — Setup Forming",
         "description": "Strong stock. Setup forming but entry not yet attractive.",
+    },
+    "Leader": {
+        "color": "#a78bfa", "bg": "#1e1333", "border": "#5b21b6",
+        "icon": "🏃", "action": "WATCH — Await Base",
+        "description": "Strong price leader with high RS. No Fib zone or compression base yet. Watch for setup formation.",
     },
     "Extended": {
         "color": "#f97316", "bg": "#2d1200", "border": "#9a3412",

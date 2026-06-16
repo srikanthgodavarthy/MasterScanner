@@ -736,10 +736,9 @@ def score_stock(
     # ConvictionGap = CV1_Conviction - DE_Conviction
     # Positive  → CV1 sees more structural quality than DE (common in momentum runners
     #             with RS/CCI strength but no Fib zone or compression setup).
+    #             These stocks now receive Category='Leader' instead of 'Avoid'.
     # Near zero → both engines agree; Category and CV1_SignalClass should align.
     # Negative  → DE sees more than CV1 (rare; signals a pattern-heavy bar without RS).
-    # Root cause of Category=Avoid despite CV1_SignalClass=EXECUTE is always a large
-    # positive gap (typically >25) combined with DE_Conviction < 50.
     try:
         cv1_cv = result.get("CV1_Conviction")
         de_cv  = result.get("DE_Conviction")
