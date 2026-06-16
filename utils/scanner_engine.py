@@ -491,11 +491,14 @@ def _primary_blocker(r, result: dict) -> str:
 
     # Priority 3: Conviction (setup quality — Fib zone / CCI / squeeze)
     if cv < 50:
-        cv_fib  = int(result.get("_ds_cv_fib",         result.get("_cv1_cv_fib",  0)) or 0)
+        # Prefer CV1's cv_fib_zone which accounts for both pullback AND
+        # continuation paths (stock above Fib 61.8% / above pivot high).
+        # Fall back to DE cv_fib (now also updated with continuation path).
+        cv_fib  = int(result.get("_cv1_cv_fib",  result.get("_ds_cv_fib",  0)) or 0)
         cv_cci  = int(result.get("_ds_cv_pattern",      result.get("_cv1_cv_cci",  0)) or 0)
         cv_sq   = int(result.get("_cv1_cv_squeeze", 0) or 0)
         if cv_fib < 8:
-            sub = "not in Fib zone"
+            sub = "no Fib setup / continuation"
         elif cv_cci < 8:
             sub = "CCI not recovered"
         elif cv_sq < 3:
