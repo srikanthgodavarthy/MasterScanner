@@ -228,11 +228,21 @@ def _conviction(r: "BarResult") -> tuple[int, dict]:
     pat = min(pat, 35)
 
     # ── Fibonacci Quality (0-20) ──────────────────────────────────
-    # Better pullback depth → higher conviction
+    # Two paths: PULLBACK (in zone) or CONTINUATION (above Fib 61.8%)
+    # Absence of a Fib pullback is NOT a penalty when trend is continuing.
     fib = 0
     if r.in_golden:                fib = 20   # 50-61.8% (ideal pullback)
     elif r.in_golden_relaxed:      fib = 14   # 38.2-61.8% (acceptable)
     elif r.t3_near_golden:         fib = 8    # approaching zone
+    elif r.trend_up and (r.pivot_high_dist > 0 or r.fib786 > 0):
+        # CONTINUATION PATH: stock is above Fib 61.8% / above pivot high
+        # — it has broken out and is pressing higher; credit is given for
+        # trend continuation (capped below ideal pullback max of 20).
+        pvtd = r.pivot_high_dist if r.pivot_high_dist > 0 else 0.0
+        if   pvtd <= 2.0:  fib = 13   # just reclaimed pivot: clean continuation entry
+        elif pvtd <= 5.0:  fib = 10   # modest extension: still valid
+        elif pvtd <= 10.0: fib = 7    # extended but trend intact
+        else:              fib = 4    # far extended: reduce credit, not zero
     # CCI oversold in golden = extra confluence
     if r.in_golden_cci:            fib = min(fib + 5, 20)
 
