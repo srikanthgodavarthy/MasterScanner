@@ -14,7 +14,8 @@ Factors present in all three Top-20 lists (ranked by expectancy contribution):
   3. adx_val             — ADX >= 40 tier (PF 1.41, WR 51.6%)
   4. persistent_strength — mom3 > 8% AND mom6 > 12% (Tier-1 gate component)
   5. trend_structure     — EMA alignment + cloud (Tier-1 pillar)
-  6. in_golden_relaxed   — Fib 38.2–61.8% pullback zone
+  6. in_golden_relaxed / pivot_high_dist — Fib 38.2–61.8% pullback zone OR
+                           continuation breakout above pivot high (dual path)
   7. recent_cci_recovery — CCI cross above OS within window (Tier-1 pillar)
   8. vol_ratio           — Volume vs 20-bar avg (sponsorship confirmation)
   9. ema20_slope         — EMA20 5-bar slope (trend velocity, PF lift at >0.3)
@@ -33,8 +34,10 @@ Score architecture
              persistent_strength (15), ema20_slope (10)
 
   Conviction Score  (0-100)  — "How likely to reach target before stop?"
-    Factors: trend_structure (30), in_golden_relaxed (25),
+    Factors: trend_structure (30), fib_zone_or_continuation (25),
              recent_cci_recovery (25), vol_ratio (15), squeeze_release (5)
+    Note: fib_zone factor supports dual paths — pullback (max 25) and
+          continuation above pivot high (max 17). See _conviction() for detail.
 
   Entry Quality Score (0-100) — "Should I enter NOW?"
     Factors: ema20_pct_dist (30), ema50_pct_dist (15), pivot_high_dist (20),
@@ -219,10 +222,11 @@ def _leadership(r: "BarResult") -> tuple[int, dict]:
 #       Core Tier-1 pillar: ema_alignment AND (above/inside cloud)
 #       Absence invalidates almost all entry paths (structural failure)
 #
-#    2. in_golden_relaxed (25 pts) — Fib 38.2-61.8% pullback zone
-#       in_golden (50-61.8%) = highest confidence (max points)
-#       in_golden_relaxed only = good but not ideal
-#       in_golden_cci = extra confluence (+5 capped)
+#    2. fib_zone_or_continuation (25 pts) — Fib pullback zone OR breakout continuation
+#       PULLBACK PATH:  in_golden (50-61.8%) = 25pts (ideal); in_golden_relaxed = 18pts
+#       CONTINUATION:   pivot_high_dist > 0 (above pivot high) = 4-17pts by extension
+#       Deep base building below 38.2%, no pivot reclaim = 0pts
+#       Design: absence of pullback is not penalised; both paths earn meaningful credit.
 #
 #    3. recent_cci_recovery (25 pts) — CCI cross above OS
 #       Tier-1 pillar. Also rewards cci_rising (early momentum signal)
@@ -249,14 +253,48 @@ def _conviction(r: "BarResult") -> tuple[int, dict]:
     cv_ts = min(cv_ts, 30)
 
     # ── 2. Fibonacci Zone (0-25) ──────────────────────────────────
+    # Two valid paths:
+    #   PULLBACK PATH  — price is IN a Fib retracement zone (38.2-61.8%)
+    #   CONTINUATION PATH — price has reclaimed the pivot high and is holding
+    #                       above the entire Fib structure (breakout continuation)
+    #
+    # Design rule: absence of a Fib pullback is NOT a penalty.
+    # Pullback stocks earn up to 25 pts for ideal entry depth.
+    # Continuation stocks earn up to 17 pts for trend strength above structure.
+    # Only stocks deep below the 38.2% level (failed retracement / early base)
+    # earn 0 — they have neither a quality pullback nor confirmed continuation.
     cv_fib = 0
-    if r.in_golden:               cv_fib = 25   # 50-61.8%: ideal pullback depth
-    elif r.in_golden_relaxed:     cv_fib = 18   # 38.2-61.8%: acceptable
-    elif r.t3_near_golden:        cv_fib = 8    # approaching zone: watch
-    # Extra confluence: CCI oversold IN the golden pocket
-    if r.in_golden_cci:           cv_fib = min(cv_fib + 5, 25)
-    # Volume dry-up during pullback = controlled retracement (quality bonus)
-    if r.in_golden_relaxed and r.vol_ratio < 0.80:
+
+    if r.in_golden:                    # 50-61.8%: ideal pullback depth
+        cv_fib = 25
+    elif r.in_golden_relaxed:          # 38.2-61.8%: acceptable pullback
+        cv_fib = 18
+    elif r.t3_near_golden:             # approaching the zone from above (pullback forming)
+        cv_fib = 8
+
+    # CONTINUATION PATH: price has reclaimed/surpassed the last pivot high.
+    # pivot_high_dist > 0 means price is above the pivot — it has left the
+    # Fib structure behind and is extending. This is NOT a failed setup;
+    # it is a continuation breakout.  Grant neutral-to-good credit based on
+    # how well-extended the move is (not too far past pivot = cleaner entry).
+    elif r.pivot_high_dist > 0:
+        # Price is above the pivot high — continuation candidate
+        pvtd = r.pivot_high_dist
+        if   pvtd <= 2.0:  cv_fib = 15   # just reclaimed pivot: clean continuation entry
+        elif pvtd <= 5.0:  cv_fib = 12   # modest extension: still valid
+        elif pvtd <= 10.0: cv_fib = 8    # extended but trend intact
+        else:              cv_fib = 4    # far extended: reduce credit, not zero
+        # Volume confirmation of the continuation move adds conviction
+        if r.vol_ratio >= 1.5:
+            cv_fib = min(cv_fib + 3, 17)  # cap continuation path at 17 (below ideal pullback max)
+
+    # else: price is below the 38.2% level and not above pivot high
+    # (early base building / failed retracement) → cv_fib stays 0
+
+    # Extra confluence bonuses (pullback path only)
+    if r.in_golden_cci:                            # CCI oversold IN golden pocket
+        cv_fib = min(cv_fib + 5, 25)
+    if r.in_golden_relaxed and r.vol_ratio < 0.80: # volume dry-up during pullback
         cv_fib = min(cv_fib + 3, 25)
     cv_fib = min(cv_fib, 25)
 
