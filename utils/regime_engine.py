@@ -237,6 +237,7 @@ class RegimeContext:
     category_weights:   dict
     execute_threshold:  float = 70.0   # FIX 5: raised from 60 → 70
     force_execute:      bool  = False  # bypass TREND-only gate (user setting)
+    adx_is_real:        bool  = False  # True = Wilder ADX; False = EMA-slope proxy
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -552,6 +553,7 @@ def build_regime_context(
     if adx is None:
         adx = compute_nifty_adx()   # returns None on failure -> proxy used
 
+    _adx_real = adx is not None   # True if compute_nifty_adx() returned a real Wilder ADX
     regime, vix_used, adx_used, a50, a200 = classify_regime(nifty, vix, adx)
     nifty_mom3, nifty_mom6 = _nifty_momentum(nifty)
 
@@ -566,6 +568,7 @@ def build_regime_context(
         category_weights   = REGIME_WEIGHTS[regime],
         execute_threshold  = execute_threshold,
         force_execute      = force_execute,
+        adx_is_real        = _adx_real,
     )
 
 
@@ -675,4 +678,5 @@ def regime_summary(df_aug: pd.DataFrame, ctx: RegimeContext) -> dict:
         "avg_rs":          avg_rs,
         "weights":         ctx.category_weights,
         "execute_threshold": ctx.execute_threshold,
+        "adx_is_real":      ctx.adx_is_real,
     }

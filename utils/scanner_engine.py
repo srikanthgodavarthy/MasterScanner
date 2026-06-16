@@ -448,6 +448,86 @@ def nifty_regime(nifty: pd.Series) -> str:
 #  SCORE_STOCK  — thin wrapper around scoring_core.compute_bar
 # ══════════════════════════════════════════════════════════════════
 
+def _primary_blocker(r, result: dict) -> str:
+    """
+    Identify the single most important reason a stock is not Actionable.
+
+    Called from score_stock() after compute_decision() — has access to both
+    the raw BarResult (r) and the full result dict (DecisionScores fields
+    already merged in). Decision engine is kept regime-agnostic; this lives
+    here in the scanner layer.
+
+    Returns a short human-readable string, or "" for Actionable/better.
+    """
+    category = result.get("Category", "Avoid")
+
+    # Nothing to block for already-actionable stocks
+    if category in ("Elite Opportunity", "High Conviction", "Actionable"):
+        return ""
+
+    # Extended is its own blocker — show it directly
+    if category == "Extended":
+        ext = int(result.get("Extension", result.get("EntryQuality", 0)) or 0)
+        return f"Extended ({ext}) — wait for pullback to EMA/Fib"
+
+    # Pull scores — prefer DE (decision engine) values
+    ls = float(result.get("Leadership",    result.get("DE_Leadership",   0)) or 0)
+    cv = float(result.get("Conviction",    result.get("DE_Conviction",   0)) or 0)
+    eq = float(result.get("EntryQuality",  result.get("DE_EntryQuality", 0)) or 0)
+    ext= float(result.get("Extension",     0) or 0)
+
+    # Priority 1: Leadership (structural gate — nothing else matters if RS is weak)
+    if ls < 50:
+        ls_rs   = int(result.get("_ds_ls_rs",   result.get("_de_ls_rs",   0)) or 0)
+        ls_trend= int(result.get("_ds_ls_trend", result.get("_de_ls_trend",0)) or 0)
+        detail = "trend below EMA" if ls_trend < 20 else "RS below market"
+        return f"Weak Leadership ({int(ls)}) — {detail}"
+
+    # Priority 2: Extension (if high, entry quality doesn't matter)
+    if ext >= 60:
+        return f"Extended ({int(ext)}) — wait for pullback"
+
+    # Priority 3: Conviction (setup quality — Fib zone / CCI / squeeze)
+    if cv < 50:
+        cv_fib  = int(result.get("_ds_cv_fib",         result.get("_cv1_cv_fib",  0)) or 0)
+        cv_cci  = int(result.get("_ds_cv_pattern",      result.get("_cv1_cv_cci",  0)) or 0)
+        cv_sq   = int(result.get("_cv1_cv_squeeze", 0) or 0)
+        if cv_fib < 8:
+            sub = "not in Fib zone"
+        elif cv_cci < 8:
+            sub = "CCI not recovered"
+        elif cv_sq < 3:
+            sub = "no squeeze/compression"
+        else:
+            sub = f"score {int(cv)}"
+        return f"Low Conviction ({int(cv)}) — {sub}"
+
+    # Priority 4: Entry Quality (too extended from entry levels)
+    if eq < 60:
+        eq_ema = int(result.get("_ds_eq_ema20_dist", result.get("_cv1_eq_ema20", 0)) or 0)
+        eq_piv = int(result.get("_ds_eq_pivot_dist", result.get("_cv1_eq_piv",  0)) or 0)
+        if eq_ema < 10:
+            sub = "too far above EMA20"
+        elif eq_piv < 8:
+            sub = "too far above pivot"
+        else:
+            sub = f"score {int(eq)}"
+        return f"Low Entry Quality ({int(eq)}) — {sub}"
+
+    # Priority 5: CCI momentum not confirmed
+    try:
+        cci_val = float(getattr(r, "cur_cci", None) or result.get("_cci_raw", 0) or 0)
+        if cci_val < 0:
+            return f"CCI Negative ({int(cci_val)}) — momentum not confirmed"
+    except (TypeError, ValueError):
+        pass
+
+    # Leader / Setup Building with everything borderline
+    if category == "Leader":
+        return f"Leader — conviction {int(cv)} (need 50) · await base"
+    return f"Setup Building — conviction {int(cv)} (need 60) or entry {int(eq)} (need 60)"
+
+
 def score_stock(
     df:       pd.DataFrame,
     nifty:    pd.Series,
@@ -646,6 +726,16 @@ def score_stock(
         })
     except Exception:
         pass   # non-critical; existing columns still present
+
+    # ── Primary Blocker ──────────────────────────────────────────
+    # Computed here (scanner layer) because it needs both DecisionScores and
+    # the raw BarResult.  Decision engine is kept regime-agnostic.
+    try:
+        category = result.get("Category", "Avoid")
+        blocker = _primary_blocker(r, result)
+        result["Primary Blocker"] = blocker if category not in ("Elite Opportunity", "High Conviction", "Actionable") else ""
+    except Exception:
+        pass
 
     # ── Conviction Score v1 (backtest-validated weights) ─────────
     # Pure re-mapping of existing BarResult fields — zero new indicators.
