@@ -390,8 +390,8 @@ def _classify_tier(row: dict, regime: str, composite: float, threshold: float,
 def compute_nifty_adx(period: int = 14) -> Optional[float]:
     """
     Compute a real Wilder-smoothed ADX(14) on the broad NSE market.
-    Uses Nifty 500 (^CRSLDX) → Nifty 50 (^NSEI) fallback for OHLCV input,
-    since ADX here is a regime-strength measure (broad market breadth),
+    Uses Nifty 50 (^NSEI) OHLCV input via fetch_nifty_ohlcv().
+    ADX here is a regime-strength measure based purely on Nifty 50,
     not the display price shown in the Market Status Bar.
     Returns None if the fetch fails or the series is too short, which lets
     build_regime_context() fall back to the EMA-slope proxy.

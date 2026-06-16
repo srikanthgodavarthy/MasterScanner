@@ -89,11 +89,11 @@ def _fetch_bt_batch(symbols: tuple, years: int = 3) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_bt_nifty(years: int = 3) -> pd.Series:
-    """Fetch Nifty index for backtest window. Cached 1h — backtest data is historical."""
+    """Fetch Nifty 50 (^NSEI) for backtest window. Cached 1h — backtest data is historical."""
     try:
         end   = datetime.now(timezone.utc) + timedelta(days=1)
         start = end - timedelta(days=years * 365 + 10)
-        ndf   = yf.Ticker("^CRSLDX").history(
+        ndf   = yf.Ticker("^NSEI").history(
             start=start.strftime("%Y-%m-%d"),
             end=end.strftime("%Y-%m-%d"),
             auto_adjust=True,

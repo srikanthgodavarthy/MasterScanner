@@ -347,38 +347,34 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_nifty(period: str = "1y") -> pd.Series:
-    """Fetch Nifty 500 (^CRSLDX) close series. Falls back to Nifty 50 (^NSEI)."""
-    for ticker in ("^CRSLDX", "^NSEI"):
-        try:
-            df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
-            if df.empty:
-                continue
+    """Fetch Nifty 50 (^NSEI) close series for regime classification."""
+    try:
+        df = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
+        if not df.empty:
             nifty = df["Close"].rename("nifty")
             nifty.index = _strip_tz(pd.to_datetime(nifty.index))
             return nifty
-        except Exception:
-            continue
+    except Exception:
+        pass
     return pd.Series(dtype=float)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_nifty_ohlcv(period: str = "1y") -> pd.DataFrame:
     """
-    Fetch full OHLCV for the Nifty index (^CRSLDX → ^NSEI fallback).
+    Fetch full OHLCV for Nifty 50 (^NSEI).
     Used by regime_engine to compute a real Wilder ADX on the index
     instead of the EMA-slope proxy.
     Returns an empty DataFrame on failure.
     """
-    for ticker in ("^CRSLDX", "^NSEI"):
-        try:
-            df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
-            if df.empty:
-                continue
+    try:
+        df = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
+        if not df.empty:
             df.index   = _strip_tz(pd.to_datetime(df.index))
             df.columns = [c.lower() for c in df.columns]
             return df[["open", "high", "low", "close", "volume"]]
-        except Exception:
-            continue
+    except Exception:
+        pass
     return pd.DataFrame()
 
 
@@ -388,10 +384,6 @@ def fetch_nifty_live() -> tuple[float, float | None]:
 
     Uses IST-aware date comparison so today_bars is always correct
     regardless of server timezone (UTC on cloud, IST locally).
-
-    Ticker order: ^NSEI first (Nifty 50, ~24k) — this is what users expect
-    to see in the Market Status Bar. ^CRSLDX (Nifty 500, ~16k) was previously
-    the primary ticker and caused confusing price display.
     """
     import pytz
     _IST = pytz.timezone("Asia/Kolkata")
@@ -400,31 +392,29 @@ def fetch_nifty_live() -> tuple[float, float | None]:
         """Return today's date in IST as a tz-naive Timestamp (midnight)."""
         return pd.Timestamp.now(tz=_IST).normalize().tz_localize(None)
 
-    for ticker in ("^NSEI", "^CRSLDX"):
-        try:
-            # 2-day 1-min bars gives today's open and latest tick
-            df = yf.Ticker(ticker).history(period="2d", interval="1m", auto_adjust=True)
-            if df.empty:
-                continue
-            df.index = _strip_tz(pd.to_datetime(df.index))
-            today = _today_ist()
-            today_bars = df[df.index.normalize() == today]
-            if today_bars.empty:
-                # Market not yet open — fall back to last two daily closes
-                daily = yf.Ticker(ticker).history(period="5d", auto_adjust=True)
-                if len(daily) >= 2:
-                    last = float(daily["Close"].iloc[-1])
-                    prev = float(daily["Close"].iloc[-2])
-                    return last, round((last - prev) / prev * 100, 2)
-                continue
-            current = float(today_bars["Close"].iloc[-1])
-            prev_day = df[df.index.normalize() < today]
-            prev_close = float(prev_day["Close"].iloc[-1]) if not prev_day.empty else None
-            pct = round((current - prev_close) / prev_close * 100, 2) if prev_close else None
-            return current, pct
-        except Exception:
-            continue
-    return 0.0, None
+    try:
+        # 2-day 1-min bars gives today's open and latest tick
+        df = yf.Ticker("^NSEI").history(period="2d", interval="1m", auto_adjust=True)
+        if df.empty:
+            return 0.0, None
+        df.index = _strip_tz(pd.to_datetime(df.index))
+        today = _today_ist()
+        today_bars = df[df.index.normalize() == today]
+        if today_bars.empty:
+            # Market not yet open — fall back to last two daily closes
+            daily = yf.Ticker("^NSEI").history(period="5d", auto_adjust=True)
+            if len(daily) >= 2:
+                last = float(daily["Close"].iloc[-1])
+                prev = float(daily["Close"].iloc[-2])
+                return last, round((last - prev) / prev * 100, 2)
+            return 0.0, None
+        current = float(today_bars["Close"].iloc[-1])
+        prev_day = df[df.index.normalize() < today]
+        prev_close = float(prev_day["Close"].iloc[-1]) if not prev_day.empty else None
+        pct = round((current - prev_close) / prev_close * 100, 2) if prev_close else None
+        return current, pct
+    except Exception:
+        return 0.0, None
 
 
 # ══════════════════════════════════════════════════════════════════
