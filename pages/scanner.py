@@ -862,7 +862,7 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     FACTORS = [
         # ── LEADERSHIP (purple) ────────────────────────────────────
         ("_cv1_ls_rs", "RS Composite", 30, "#a371f7",
-         "Multi-TF relative strength vs Nifty 500 (^CRSLDX)\n"
+         "Multi-TF relative strength vs Nifty 50 (^NSEI)\n"
          "RS > 0.15  →  +30 pts  (strong outperformance)\n"
          "RS 0.10–0.15 →  +25 pts\n"
          "RS 0.05–0.10 →  +20 pts\n"
