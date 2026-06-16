@@ -1895,6 +1895,57 @@ def _detail_breakdown_panel(row: pd.Series) -> str:
     html += _section("Leadership",    ls, ls_factors, "#a371f7")
     html += _section("Conviction",    cv, cv_factors, "#3fb950")
     html += _section("Entry Quality", eq, eq_factors, "#d29922")
+
+    # ── Decision Engine divergence panel ─────────────────────────
+    # Shows when CV1_SignalClass=EXECUTE but Category=Avoid.
+    # DE uses different factor weights vs CV1 — this panel exposes the gap.
+    de_ls   = int(row.get("DE_Leadership", -1))
+    de_cv   = int(row.get("DE_Conviction", -1))
+    de_stage= str(row.get("DE_Stage", ""))
+    category= str(row.get("Category", ""))
+    if de_ls >= 0:
+        # Highlight divergence: CV1 says EXECUTE/ELITE but DE says Avoid
+        cv1_sc = str(row.get("CV1_SignalClass", ""))
+        divergent = cv1_sc in ("ELITE", "EXECUTE") and category == "Avoid"
+        div_color = "#f85149" if divergent else "#8b949e"
+        div_label = "⚠ DIVERGENCE DETECTED" if divergent else "Decision Engine"
+        # Sub-score breakdown for DE Leadership
+        de_ls_factors = [
+            ("_de_ls_trend",    "Trend Structure (trend_up + EMA align + cloud)", 35, "#58a6ff"),
+            ("_de_ls_rs",       "RS Composite (multi-TF)",                         30, "#58a6ff"),
+            ("_de_ls_momentum", "Momentum (mom3/mom6 % returns)",                  15, "#58a6ff"),
+            ("_de_ls_volume",   "Volume Sponsorship (vol_ratio)",                  10, "#58a6ff"),
+            ("_de_ls_freshness","Trend Freshness (decay curve)",                   10, "#58a6ff"),
+        ]
+        de_rows_html = ""
+        for col, lbl, max_pts, clr in de_ls_factors:
+            pts = int(row.get(col, 0))
+            de_rows_html += _breakdown_row_html(lbl, pts, max_pts, clr)
+
+        html += (
+            f'<div style="margin:10px 0;border-top:1px solid rgba(255,255,255,0.08);padding-top:10px;">'
+            f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
+            f'<span style="font-size:9px;font-weight:700;color:{div_color};letter-spacing:0.1em;'
+            f'text-transform:uppercase">{div_label}</span>'
+            f'</div>'
+            f'<div style="display:flex;gap:16px;margin-bottom:8px;flex-wrap:wrap;">'
+            f'<span style="font-size:10px;color:#8b949e">DE Leadership: '
+            f'<b style="color:{"#f85149" if de_ls < 50 else "#58a6ff"}">{de_ls}</b>'
+            f'{"  ← below 50 → Stage=AVOID" if de_ls < 50 else ""}</span>'
+            f'<span style="font-size:10px;color:#8b949e">DE Conviction: '
+            f'<b style="color:#58a6ff">{de_cv}</b></span>'
+            f'<span style="font-size:10px;color:#8b949e">DE Stage: '
+            f'<b style="color:{"#f85149" if de_stage == "AVOID" else "#3fb950"}">{de_stage}</b></span>'
+            f'<span style="font-size:10px;color:#8b949e">Category: '
+            f'<b style="color:{"#f85149" if category == "Avoid" else "#3fb950"}">{category}</b></span>'
+            f'</div>'
+            f'<div style="font-size:9px;color:#8b949e;margin-bottom:6px;">'
+            f'DE Leadership factors (different from CV1 — explains Category vs SignalClass gap):'
+            f'</div>'
+            f'{de_rows_html}'
+            f'</div>'
+        )
+
     html += '</div>'
     return html
 
