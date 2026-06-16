@@ -643,7 +643,7 @@ _TOOLTIP_JS = """
 # Score-column thresholds: above = green (#3fb950), below = amber (#d29922)
 _SCORE_THRESHOLDS = {
     "Leadership":    65,
-    "Conviction":    38,
+    "Conviction":    50,   # raised from 38 → 50 to match DE Setup Building floor
     "Entry Quality": 50,
 }
 
@@ -795,7 +795,7 @@ def _scoring_explainer_html() -> str:
         ("#3fb950", "Leadership ≥ 65",    "Green · Required gate for EXECUTE/ELITE"),
         ("#d29922", "Leadership 35–64",   "Amber · Developing — monitor for improvement"),
         ("#f85149", "Leadership < 35",    "Red · Weak — below all gate thresholds"),
-        ("#3fb950", "Conviction ≥ 38",    "Green gate — minimum for actionable signal"),
+        ("#3fb950", "Conviction ≥ 50",    "Green gate — DE Setup Building floor (raised from 38)"),
         ("#d29922", "Entry Quality ≥ 50", "Amber gate — tight entry zone required"),
     ]
     grade_html = "".join(
@@ -811,9 +811,9 @@ def _scoring_explainer_html() -> str:
     # ── Signal class table ──────────────────────────────────────────
     sc_rows_data = [
         ("ELITE",   "#f5c542", "Highest Conviction",
-         "Leadership ≥ 65 · Conviction ≥ 38 · Entry Quality ≥ 50 · TREND regime only · Extension ≤ 60"),
+         "Leadership ≥ 65 · Conviction ≥ 50 · Entry Quality ≥ 50 · TREND regime only · Extension ≤ 60"),
         ("EXECUTE", "#3fb950", "Actionable Setup",
-         "Leadership ≥ 65 · Conviction ≥ 38 · Entry Quality ≥ 50 · Any regime · Extension ≤ 80"),
+         "Leadership ≥ 65 · Conviction ≥ 50 · Entry Quality ≥ 50 · Any regime · Extension ≤ 80"),
         ("WATCH",   "#d29922", "Setup Building",
          "Leadership ≥ 35 OR Conviction ≥ 20 · Not all gates met · Monitor for upgrade"),
         ("SKIP",    "#484f58", "Below Threshold",
