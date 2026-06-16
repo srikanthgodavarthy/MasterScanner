@@ -193,6 +193,7 @@ class BarResult:
     fib618:     float = 0.0
     fib500:     float = 0.0
     fib382:     float = 0.0
+    fib786:     float = 0.0    # 78.6% retracement — shallow pullback / near-reclaim zone
 
     # ── NEW strength indicators ──────────────────────────────────
     rs_val:       float = 0.0   # raw RS vs Nifty (5-bar)
@@ -211,6 +212,7 @@ class BarResult:
     in_golden:           bool = False
     in_golden_relaxed:   bool = False
     in_golden_cci:       bool = False
+    above_fib786:        bool = False   # price above 78.6% retracement — shallow zone / near-reclaim
     above_cloud:         bool = False
     inside_cloud:        bool = False
     allow_cloud:         bool = False
@@ -737,6 +739,7 @@ def compute_bar(
     fib382 = sw_hi - rng * (params.t1_fib_hi / 100.0)
     fib500 = sw_hi - rng * 0.500
     fib618 = sw_hi - rng * (params.t1_fib_lo / 100.0)
+    fib786 = sw_hi - rng * 0.214   # 78.6% retracement (1 - 0.786); shallow zone near swing high
     fib_ext127 = sw_hi + rng * 0.272
     fib_ext161 = sw_hi + rng * 0.618
 
@@ -748,6 +751,7 @@ def compute_bar(
         cur_c >= fib618 - cur_atr * ap and
         cur_c <= fib382 + cur_atr * ap
     )
+    above_fib786 = cur_c > fib786   # price has recovered past 78.6% — shallow pullback / continuation zone
     near_ext127 = abs(cur_c - fib_ext127) < cur_atr * ap
     near_ext161 = abs(cur_c - fib_ext161) < cur_atr * ap
 
@@ -1604,6 +1608,7 @@ def compute_bar(
         nifty_regime_val = params.nifty_regime_val,
         fib500 = round(fib500) if not np.isnan(fib500) else 0,
         fib382 = round(fib382) if not np.isnan(fib382) else 0,
+        fib786 = round(fib786) if not np.isnan(fib786) else 0,
         # NEW strength fields
         rs_val       = round(rs_composite, 4),   # composite RS (primary ranking value)
         adx_val      = round(cur_adx, 1),
@@ -1617,6 +1622,7 @@ def compute_bar(
         in_golden           = in_golden,
         in_golden_relaxed   = in_golden_relaxed,
         in_golden_cci       = in_golden_cci,
+        above_fib786        = above_fib786,
         above_cloud         = above_cloud,
         inside_cloud        = inside_cloud,
         allow_cloud         = allow_cloud,
