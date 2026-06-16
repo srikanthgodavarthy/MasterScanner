@@ -670,6 +670,21 @@ def _cat_badge(category: str) -> str:
     )
 
 
+_PROFILE_STYLE = {
+    "Runner":       ("#f0883e", "⚡ Runner"),      # orange — momentum without base
+    "Aligned":      ("#3fb950", "✓ Aligned"),      # green  — both engines agree
+    "Base Builder": ("#58a6ff", "◎ Base Builder"), # blue   — structure ahead of price
+}
+
+def _profile_badge(profile: str) -> str:
+    color, label = _PROFILE_STYLE.get(profile, ("#484f58", profile))
+    return (
+        f'<span class="sc-badge" '
+        f'style="color:{color};background:{color}14;border:1px solid {color}30;font-size:9px">'
+        f'{label}</span>'
+    )
+
+
 def _tip_attrs(title: str, body: str) -> str:
     """Return data attributes for the JS floating tooltip.  Safe for HTML attribute context."""
     safe_title = title.replace('"', "&quot;")
@@ -1422,6 +1437,8 @@ _RENAME_PRIMARY = {
     "CV1_Conviction":   "Conviction",
     "CV1_EntryQuality": "Entry Quality",
     "RR":               "R:R",
+    "ConvictionGap":    "Conv Gap",
+    "ConvictionProfile":"Conv Profile",
 }
 
 _DETAIL_EXTRA = [
@@ -1430,6 +1447,7 @@ _DETAIL_EXTRA = [
     "Composite", "Trend", "Momentum", "Structure", "Volume", "Quality",
     "ADX", "EMA Slope", "CCI",
     "Category", "Stage", "Leadership_DE", "Conviction_DE", "EntryQuality_DE",
+    "Conv Gap", "Conv Profile",
 ]
 
 # Primary column order for HTML table (v10: persistence fields added)
@@ -1803,6 +1821,22 @@ def _render_html_table(df: pd.DataFrame) -> str:
                 cells += _num_cell(val, "{:.2f}")
             elif c in ("Score", "Composite", "RS%"):
                 cells += _score_cell(val)
+            elif c == "Conv Gap":
+                # Colour-code the gap: orange positive (Runner), grey neutral, blue negative
+                try:
+                    g = int(val)
+                    if g >= 25:
+                        color = "#f0883e"
+                    elif g <= -25:
+                        color = "#58a6ff"
+                    else:
+                        color = "#8b949e"
+                    sign = "+" if g > 0 else ""
+                    cells += f'<td class="col-num" style="color:{color};font-weight:600">{sign}{g}</td>'
+                except (TypeError, ValueError):
+                    cells += f'<td>—</td>'
+            elif c == "Conv Profile":
+                cells += f'<td>{_profile_badge(str(val)) if val else "—"}</td>'
             else:
                 try:
                     v = float(val)
