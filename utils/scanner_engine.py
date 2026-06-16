@@ -496,13 +496,10 @@ def _primary_blocker(r, result: dict) -> str:
         # Fall back to DE cv_fib (now also updated with continuation path).
         cv_fib  = int(result.get("_cv1_cv_fib",  result.get("_ds_cv_fib",  0)) or 0)
         cv_cci  = int(result.get("_ds_cv_pattern",      result.get("_cv1_cv_cci",  0)) or 0)
-        cv_sq   = int(result.get("_cv1_cv_squeeze", 0) or 0)
         if cv_fib < 8:
             sub = "no Fib setup / continuation"
         elif cv_cci < 8:
             sub = "CCI not recovered"
-        elif cv_sq < 3:
-            sub = "no squeeze/compression"
         else:
             sub = f"score {int(cv)}"
         return f"Low Conviction ({int(cv)}) — {sub}"
