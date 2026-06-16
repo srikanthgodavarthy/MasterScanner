@@ -732,6 +732,37 @@ def score_stock(
     except Exception:
         pass   # non-critical; Action column retains norm_score value
 
+    # ── Conviction Gap diagnostic field ──────────────────────────
+    # ConvictionGap = CV1_Conviction - DE_Conviction
+    # Positive  → CV1 sees more structural quality than DE (common in momentum runners
+    #             with RS/CCI strength but no Fib zone or compression setup).
+    # Near zero → both engines agree; Category and CV1_SignalClass should align.
+    # Negative  → DE sees more than CV1 (rare; signals a pattern-heavy bar without RS).
+    # Root cause of Category=Avoid despite CV1_SignalClass=EXECUTE is always a large
+    # positive gap (typically >25) combined with DE_Conviction < 50.
+    try:
+        cv1_cv = result.get("CV1_Conviction")
+        de_cv  = result.get("DE_Conviction")
+        if cv1_cv is not None and de_cv is not None:
+            gap = int(cv1_cv) - int(de_cv)
+            result["ConvictionGap"] = gap
+            # Profile interpretation:
+            #   Runner     (gap >= +25) — CV1 sees RS/CCI momentum; DE finds no Fib/compression base.
+            #                             These stocks move on continuation energy, not structure.
+            #                             If backtests show Runners timeout more than Aligned,
+            #                             DE is protecting you. If equal, DE Conviction is too strict.
+            #   Aligned    (-24 to +24) — both engines agree; Category and CV1_SignalClass should match.
+            #   Base Builder (gap <= -25) — DE finds pattern/compression structure CV1 hasn't picked up yet.
+            #                             Rare. Worth watching — base may be forming before RS kicks in.
+            if gap >= 25:
+                result["ConvictionProfile"] = "Runner"
+            elif gap <= -25:
+                result["ConvictionProfile"] = "Base Builder"
+            else:
+                result["ConvictionProfile"] = "Aligned"
+    except Exception:
+        pass
+
     return result
 
 
