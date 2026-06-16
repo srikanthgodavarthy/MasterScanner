@@ -63,13 +63,14 @@ _SC_STYLE = {
 
 _CAT_ORDER = [
     "Elite Opportunity", "High Conviction", "Actionable",
-    "Setup Building", "Extended", "Avoid",
+    "Setup Building", "Leader", "Extended", "Avoid",
 ]
 _CAT_STYLE = {
     "Elite Opportunity": ("#f5c542", "Elite Opportunity"),
     "High Conviction":   ("#3fb950", "High Conviction"),
     "Actionable":        ("#4ade80", "Actionable"),
     "Setup Building":    ("#d29922", "Setup Building"),
+    "Leader":            ("#a78bfa", "🏃 Leader"),   # violet — high RS, no base yet
     "Extended":          ("#f97316", "Extended"),
     "Avoid":             ("#484f58", "Avoid"),
 }
@@ -1940,7 +1941,7 @@ def _detail_breakdown_panel(row: pd.Series) -> str:
     if de_ls >= 0:
         # Highlight divergence: CV1 says EXECUTE/ELITE but DE says Avoid
         cv1_sc = str(row.get("CV1_SignalClass", ""))
-        divergent = cv1_sc in ("ELITE", "EXECUTE") and category == "Avoid"
+        divergent = cv1_sc in ("ELITE", "EXECUTE") and category in ("Avoid", "Leader")
         div_color = "#f85149" if divergent else "#8b949e"
         div_label = "⚠ DIVERGENCE DETECTED" if divergent else "Decision Engine"
         # Sub-score breakdown for DE Leadership
@@ -1971,7 +1972,7 @@ def _detail_breakdown_panel(row: pd.Series) -> str:
             f'<span style="font-size:10px;color:#8b949e">DE Stage: '
             f'<b style="color:{"#f85149" if de_stage == "AVOID" else "#3fb950"}">{de_stage}</b></span>'
             f'<span style="font-size:10px;color:#8b949e">Category: '
-            f'<b style="color:{"#f85149" if category == "Avoid" else "#3fb950"}">{category}</b></span>'
+            f'<b style="color:{"#f85149" if category == "Avoid" else "#a78bfa" if category == "Leader" else "#3fb950"}">{category}</b></span>'
             f'</div>'
             f'<div style="font-size:9px;color:#8b949e;margin-bottom:6px;">'
             f'DE Leadership factors (different from CV1 — explains Category vs SignalClass gap):'
@@ -2477,7 +2478,7 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
         has_cat    = "Category" in df_aug.columns
         elite_df   = df_aug[df_aug["Category"] == "Elite Opportunity"].copy() if has_cat else pd.DataFrame()
         execute_df = df_aug[df_aug["Category"].isin(["High Conviction", "Actionable"])].copy() if has_cat else pd.DataFrame()
-        watch_df   = df_aug[df_aug["Category"] == "Setup Building"].copy() if has_cat else pd.DataFrame()
+        watch_df   = df_aug[df_aug["Category"].isin(["Setup Building", "Leader"])].copy() if has_cat else pd.DataFrame()
 
     # ── SETUP_FIB_PULLBACK detection ─────────────────────────────────────────────
     # Rules: trend_up AND in_golden AND cci <= -100
