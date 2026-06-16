@@ -272,12 +272,14 @@ def _conviction(r: "BarResult") -> tuple[int, dict]:
     elif r.t3_near_golden:             # approaching the zone from above (pullback forming)
         cv_fib = 8
 
-    # CONTINUATION PATH: price has reclaimed/surpassed the last pivot high.
-    # pivot_high_dist > 0 means price is above the pivot — it has left the
-    # Fib structure behind and is extending. This is NOT a failed setup;
-    # it is a continuation breakout.  Grant neutral-to-good credit based on
-    # how well-extended the move is (not too far past pivot = cleaner entry).
-    elif r.pivot_high_dist > 0:
+    # CONTINUATION PATH: price has recovered above the 78.6% retracement level
+    # in an uptrend — it has left the golden zone behind and is pushing toward
+    # or past the swing high.  Two sub-cases:
+    #   (a) Above pivot high (pivot_high_dist > 0): confirmed breakout extension
+    #   (b) Above fib786 but not yet past pivot: near-reclaim, high-quality setup
+    # Neither is a failed setup — both are continuation candidates.
+    # Grant credit scaled by proximity to pivot (closer = cleaner entry).
+    elif r.trend_up and (r.pivot_high_dist > 0 or r.fib786 > 0):
         # Price is above the pivot high — continuation candidate
         pvtd = r.pivot_high_dist
         if   pvtd <= 2.0:  cv_fib = 15   # just reclaimed pivot: clean continuation entry
