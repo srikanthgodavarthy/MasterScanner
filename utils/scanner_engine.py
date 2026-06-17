@@ -669,8 +669,8 @@ def score_stock(
             "Conviction":    ds.conviction,
             "EntryQuality":  ds.entry_quality,
             "Extension":     ds.extension,
-            "Stage":         ds.stage,
-            "Category":      ds.category,
+            "Lifecycle":     ds.lifecycle,     # objective stock state (settings-independent)
+            "Recommendation":ds.recommendation,  # trader-adjusted label (respects settings)
             "RR":            ds.risk_reward,
             "RR_RejectReason": ds.rr_reject_reason,
             # ── Bars-since-setup banding (key question: "Can I still enter today?")
@@ -712,22 +712,20 @@ def score_stock(
             "_explain_included":     "|".join(ds.why_included)   if ds.why_included   else "",
             "_explain_not_higher":   "|".join(ds.why_not_higher) if ds.why_not_higher else "",
             "_explain_risks":        "|".join(ds.risk_factors)   if ds.risk_factors   else "",
-            # ── Debug columns: Decision Engine internals exposed for divergence diagnosis
-            # CV1_SignalClass=EXECUTE but Category=Avoid? Compare DE_Leadership vs CV1_Leadership.
-            # DE uses different factor weights (trend_up/ema_alignment/cloud/vol_ratio/mom)
-            # vs CV1 (rs_composite/trend_age/adx/persistent_strength/ema20_slope).
-            "DE_Leadership":  ds.leadership,    # decision_engine._leadership() result (0-100)
-            "DE_Conviction":  ds.conviction,    # decision_engine._conviction() result (0-100)
-            "DE_Stage":       ds.stage,         # AVOID / ACTIONABLE / SETUP_BUILDING / LEADER
-            # Sub-score breakdown so you can see exactly which bucket hurt DE_Leadership
+            # ── Sub-score breakdown for DE Leadership factor attribution ─────────
             "_de_ls_trend":   ds.ls_trend,      # EMA structure + cloud (0-35) — biggest bucket
             "_de_ls_rs":      ds.ls_rs,         # RS composite (0-30)
             "_de_ls_momentum":ds.ls_momentum,   # mom3/mom6 % returns (0-15)
             "_de_ls_volume":  ds.ls_volume,     # vol_ratio sponsorship (0-10)
             "_de_ls_freshness":ds.ls_freshness, # trend freshness decay (0-10)
         })
-    except Exception:
-        pass   # non-critical; existing columns still present
+    except Exception as _de_exc:           # DE failure: log, never silently swallow
+        import logging as _log
+        _log.warning(
+            "[decision_engine] compute_decision() failed for symbol — "
+            "Leadership/Conviction/Lifecycle/Recommendation/RR will be absent. "
+            "Error: %s", _de_exc, exc_info=True
+        )
 
     # ── Primary Blocker ──────────────────────────────────────────
     # Computed here (scanner layer) because it needs both DecisionScores and
