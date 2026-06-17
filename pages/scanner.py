@@ -1392,7 +1392,8 @@ def _qualification_summary_html(df: pd.DataFrame, settings: dict) -> str:
         watch_n  = int((df[sc_col] == "WATCH").sum())
         skip_n   = int((df[sc_col] == "SKIP").sum())
         # Leader stocks (Category == "Leader", may be in WATCH or SKIP)
-        leader_stocks = df[df.get("Category", pd.Series(dtype=str)) == "Leader"] if "Category" in df.columns else pd.DataFrame()
+        rec_col = "Recommendation" if "Recommendation" in df.columns else "Category"
+        leader_stocks = df[df[rec_col] == "Leader"].copy() if rec_col in df.columns else pd.DataFrame()
 
         # ── SKIP grouped by primary blocker ─────────────────────
         skip_stocks = df[df[sc_col] == "SKIP"].copy()
@@ -2612,10 +2613,11 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
     watch_df   = _sc_df("WATCH")
 
     if not has_cv1:
-        has_cat    = "Category" in df_aug.columns
-        elite_df   = df_aug[df_aug["Category"] == "Elite Opportunity"].copy() if has_cat else pd.DataFrame()
-        execute_df = df_aug[df_aug["Category"].isin(["High Conviction", "Actionable"])].copy() if has_cat else pd.DataFrame()
-        watch_df   = df_aug[df_aug["Category"].isin(["Setup Building", "Leader"])].copy() if has_cat else pd.DataFrame()
+        _rec_col   = "Recommendation" if "Recommendation" in df_aug.columns else "Category"
+        has_cat    = _rec_col in df_aug.columns
+        elite_df   = df_aug[df_aug[_rec_col] == "Elite Opportunity"].copy() if has_cat else pd.DataFrame()
+        execute_df = df_aug[df_aug[_rec_col].isin(["High Conviction", "Actionable"])].copy() if has_cat else pd.DataFrame()
+        watch_df   = df_aug[df_aug[_rec_col].isin(["Setup Building", "Leader"])].copy() if has_cat else pd.DataFrame()
 
     # ── SETUP_FIB_PULLBACK detection ─────────────────────────────────────────────
     # Rules: trend_up AND in_golden AND cci <= -100
@@ -2709,7 +2711,8 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
             _show_detail = st.toggle("Detail view", value=False, key=f"detail_{sc_key}")
 
             # Validation strip
-            if val_mode and "Category" in df_subset.columns and "CV1_SignalClass" in df_subset.columns:
+            if val_mode and ("Recommendation" in df_subset.columns or "Category" in df_subset.columns) and "CV1_SignalClass" in df_subset.columns:
+                _val_rec_col = "Recommendation" if "Recommendation" in df_subset.columns else "Category"
                 with st.expander("🔬 Validation: Signal Class vs legacy Category", expanded=True):
                     st.markdown(
                         '<div style="font-size:10px;color:#8b949e;margin-bottom:6px;">'
@@ -2722,7 +2725,7 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
                             _validation_row_html(
                                 str(vrow.get("Stock", "")),
                                 str(vrow.get("CV1_SignalClass", "WATCH")),
-                                str(vrow.get("Category", "")),
+                                str(vrow.get(_val_rec_col, "")),
                             ),
                             unsafe_allow_html=True,
                         )
@@ -2822,7 +2825,8 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
                         # ── Elite Gap (Fix 5) ─────────────────────────────
                         # Show gap to Elite Opportunity for non-elite stocks only.
                         # When category IS Elite Opportunity, gap = 0 — suppress entirely.
-                        _cat = str(_erow.get("Category", ""))
+                        _rec_col2 = "Recommendation" if "Recommendation" in _erow else "Category"
+                        _cat = str(_erow.get(_rec_col2, ""))
                         if _cat != "Elite Opportunity":
                             try:
                                 _ls  = int(float(_erow.get("CV1_Leadership",   _erow.get("Leadership",   0)) or 0))
