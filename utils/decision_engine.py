@@ -14,13 +14,23 @@ Four Engines
   Entry Quality(0-100) — "Should I enter NOW?"
   Extension    (0-100) — "Has the opportunity already passed?"
 
-Stage (lifecycle label)
-────────────────────────
+Stage / Lifecycle label (settings-independent objective state)
+──────────────────────────────────────────────────────────────
   LEADER        Leadership ≥ 70,  Extension < 40
   SETUP_BUILDING Leadership ≥ 70,  Conviction ≥ 50,  Extension < 50
-  ACTIONABLE    Leadership ≥ 70,  Conviction ≥ 60,  Entry ≥ 60,  Extension ≤ 30
+  ACTIONABLE    Leadership ≥ 70,  Conviction ≥ 60,  Entry ≥ 60,  Extension ≤ 40
   EXTENDED      Extension ≥ 60
   AVOID         Leadership < 50   OR  hard structural failure
+
+  v9.2 Extension changes
+  ─────────────────────
+  Volume climax discount: when vol_ratio >= 1.5 AND (fresh_base_breakout OR
+  compression_break), extension penalties on ex_ema20/ex_pivot/ex_move are
+  discounted 40-75% proportional to volume strength.  High volume alone
+  (no setup quality) receives no discount.
+  Hard cap: fresh_base_breakout stocks capped at Extension=40 (was -10 flat).
+  Breakout Elite path: vol_ratio >= 2.5 + setup quality unlocks Elite at
+  relaxed Extension <= 45 and slightly lower score thresholds.
 
 Decision Category (scanner display label)
 ──────────────────────────────────────────
@@ -572,18 +582,35 @@ def _extension(r: "BarResult") -> tuple[int, dict]:
 
     Uses actual measured distances from BarResult rather than boolean proxies.
     Factors (sum to 100):
-      EMA20 Distance          32  — % above EMA20 (measured)  [+7 from removed ex_bars_since]
+      EMA20 Distance          32  — % above EMA20 (measured)
       EMA50 Distance          15  — % above EMA50 (measured)
       Pivot High Distance     20  — % past last pivot high (measured)
-      Price Move Since Setup  33  — % from trigger bar to now (measured) [+8 from removed ex_bars_since]
+      Price Move Since Setup  33  — % from trigger bar to now (measured)
+
+    Volume Climax Discount (v9.2)
+    ─────────────────────────────
+    Distance from EMA/pivot on a volume climax breakout is NOT staleness —
+    it is institutional confirmation.  When vol_ratio >= 1.5 AND setup quality
+    exists (fresh_base_breakout OR compression_break), ex_move and ex_pivot
+    penalties are discounted proportional to volume strength.
+
+    Discount only applies with setup quality.  High volume alone (momentum
+    chase, no base) does NOT get a discount — that's still a chase.
+
+    Hard cap: fresh_base_breakout stocks are capped at Extension=40.
+    A stock breaking out of a multi-week base cannot be "Extended" by definition.
 
     NOTE: bars_since_setup intentionally excluded — it caused double-counting
-    with eq_bars_since in Entry Quality.  Extension measures structural MA
-    distance only; elapsed time is Entry Quality's concern.
+    with eq_bars_since in Entry Quality.
     """
 
+    # ── Volume climax flag: vol_ratio >= 1.5 AND has setup quality ────
+    # Discount is gated on setup quality to avoid rewarding random momentum spikes.
+    _has_setup_quality = r.fresh_base_breakout or r.compression_break
+    _climax_hi  = _has_setup_quality and r.vol_ratio >= 2.5   # institutional: strong discount
+    _climax_mid = _has_setup_quality and r.vol_ratio >= 1.5   # elevated: moderate discount
+
     # ── EMA20 Distance (0-32) ─────────────────────────────────────
-    # 7 pts redistributed from removed ex_bars_since component.
     ema20d = r.ema20_pct_dist   # % above EMA20
     if ema20d <= 2.0:
         ex_ema20 = 0
@@ -597,6 +624,9 @@ def _extension(r: "BarResult") -> tuple[int, dict]:
         ex_ema20 = 32   # >10% above EMA20 — significantly extended
     if r.t4_fib_resist:
         ex_ema20 = max(ex_ema20, 26)
+    # Volume climax: distance from EMA is expected on breakout — discount
+    if _climax_hi:   ex_ema20 = round(ex_ema20 * 0.35)   # 65% discount — institutional
+    elif _climax_mid:ex_ema20 = round(ex_ema20 * 0.60)   # 40% discount — elevated
 
     # ── EMA50 Distance (0-15) ─────────────────────────────────────
     ema50d = r.ema50_pct_dist
@@ -610,6 +640,9 @@ def _extension(r: "BarResult") -> tuple[int, dict]:
         ex_ema50 = 12
     else:
         ex_ema50 = 15
+    # EMA50 distance less sensitive to volume climax — smaller discount
+    if _climax_hi:   ex_ema50 = round(ex_ema50 * 0.50)
+    elif _climax_mid:ex_ema50 = round(ex_ema50 * 0.75)
 
     # ── Pivot High Distance (0-20) ────────────────────────────────
     pvt_d = r.pivot_high_dist   # % above last pivot high
@@ -623,26 +656,26 @@ def _extension(r: "BarResult") -> tuple[int, dict]:
         ex_pivot = 17
     else:
         ex_pivot = 20
+    # Volume climax: being above pivot is the breakout signal, not staleness
+    if _climax_hi:   ex_pivot = round(ex_pivot * 0.25)   # 75% discount — this IS the entry
+    elif _climax_mid:ex_pivot = round(ex_pivot * 0.50)
 
     # ── Price Move Since Setup Trigger (0-33) ────────────────────
-    # 8 pts redistributed from removed ex_bars_since component.
     # At 5% target: 3% move = 60% of target consumed.
+    # Volume climax discount: move explained by institutional buying — not a chase.
     move_pct = r.price_move_since_setup
     if move_pct <= 0.5:
         ex_move = 0
     elif move_pct <= 1.5:
         ex_move = 5
     elif move_pct <= 3.0:
-        ex_move = 15
+        ex_move = 15  if not _climax_mid else (8  if not _climax_hi else 4)
     elif move_pct <= 5.0:
-        ex_move = 25
+        ex_move = 25  if not _climax_mid else (12 if not _climax_hi else 5)
     else:
-        ex_move = 33   # past 5% target — do not chase
+        ex_move = 33  if not _climax_mid else (18 if not _climax_hi else 10)
 
-    # ex_bars_since REMOVED: was causing double-counting with eq_bars_since
-    # in Entry Quality.  Both used bars_since_setup, penalising stocks twice
-    # for setup age and creating an amplified cliff at 8 bars.
-    ex_bars = 0
+    ex_bars = 0   # removed: double-counted with eq_bars_since in Entry Quality
 
     total = ex_ema20 + ex_ema50 + ex_pivot + ex_move
 
@@ -652,9 +685,13 @@ def _extension(r: "BarResult") -> tuple[int, dict]:
     elif r.trend_phase == "NONE":
         total = min(total + 15, 100)
 
-    # Fresh base breakout = new opportunity, not old move
-    if r.fresh_base_breakout and r.trend_phase in ("ESTABLISHED", "EMERGING"):
-        total = max(total - 10, 0)
+    # Hard cap: fresh base breakout or compression break cannot be "Extended"
+    # by definition — they are at the START of a move, not the end.
+    # Guard: only apply in ESTABLISHED/EMERGING trend phase.  If trend_phase
+    # is EXTENDED, the +20 penalty above was correct and must not be removed.
+    # Cap at 40 = Actionable ceiling, ensuring these stocks remain qualifiable.
+    if (r.fresh_base_breakout or r.compression_break) and r.trend_phase in ("ESTABLISHED", "EMERGING"):
+        total = min(total, 40)
 
     total = min(total, 100)
 
@@ -693,7 +730,11 @@ def _classify_stage(
         return "AVOID"
 
     if extension >= 60:
-        return "EXTENDED"
+        # Volume climax exemption: if institutional volume (>= 2.5x) confirms a
+        # genuine setup breakout, the extension score is explained — not staleness.
+        # Both setup quality AND volume are required; either alone is not enough.
+        if not ((r.fresh_base_breakout or r.compression_break) and r.vol_ratio >= 2.5):
+            return "EXTENDED"
 
     if leadership < 50:
         return "AVOID"
@@ -821,16 +862,36 @@ def _classify_category_with_settings(
     mc   = thresholds["min_conv"]
     emx  = thresholds["ext_max_actionable"]
 
-    if extension >= 60 + thresholds["ext_adj"] or stage == "EXTENDED":
+    # Volume climax exemption: same logic as _classify_stage — setup quality +
+    # institutional volume means extension is confirmation, not staleness.
+    _climax_exempt = (r.fresh_base_breakout or r.compression_break) and r.vol_ratio >= 2.5
+    if (extension >= 60 + thresholds["ext_adj"] or stage == "EXTENDED") and not _climax_exempt:
         return "Extended"
 
     if stage == "AVOID" or leadership < max(50, 50 + sa):
         return "Avoid"
 
+    # ── Standard Elite path (pullback setups) ────────────────────
     if (leadership >= 90 + sa and conviction >= 90
             and entry_quality >= 80 + ea
             and extension <= thresholds["ext_max_elite"]):
         return "Elite Opportunity"
+
+    # ── Breakout Elite path (volume climax breakouts) ─────────────
+    # Breakout stocks structurally cannot hit Extension <= 25 (standard Elite gate)
+    # because they are above EMA/pivot by design.  A separate path qualifies them
+    # when: institutional volume confirms the move (vol_ratio >= 2.5),
+    # setup quality exists (fresh base or compression break),
+    # and all other scores are Elite-grade.
+    # Extension cap is relaxed to 45 — the volume climax discount in _extension()
+    # already brought a genuine breakout down to ~20-40; this cap is a safety net.
+    if (r.fresh_base_breakout or r.compression_break):
+        if (r.vol_ratio >= 2.5
+                and leadership >= 85 + sa
+                and conviction >= 80
+                and entry_quality >= 65 + ea
+                and extension <= 45):
+            return "Elite Opportunity"
 
     if (leadership >= 80 + sa and conviction >= 80
             and entry_quality >= 60 + ea
