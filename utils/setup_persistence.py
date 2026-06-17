@@ -294,7 +294,7 @@ def _create_plan(
         t1_locked             = t1,
         t2_locked             = t2,
         t3_locked             = t3,
-        locked_category       = scanner_row.get("Category", ""),
+        locked_category       = scanner_row.get("Recommendation", scanner_row.get("Category", "")),
         locked_rr             = float(scanner_row.get("RR", 0) or 0),
         locked_leadership     = int(scanner_row.get("Leadership",   0) or 0),
         locked_conviction     = int(scanner_row.get("Conviction",   0) or 0),
@@ -339,7 +339,7 @@ def enrich_scanner_row(
     plan_was_updated  : True if the plan changed and needs to be persisted
     """
     today_str = date.today().isoformat()
-    category  = scanner_row.get("Category", "Avoid")
+    category  = scanner_row.get("Recommendation", scanner_row.get("Category", "Avoid"))
     symbol    = str(scanner_row.get("Stock", "")).upper().strip()
 
     plan_was_updated = False

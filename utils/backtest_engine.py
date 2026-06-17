@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 from utils.scanner_engine import _strip_tz, nifty_regime, ema
-from utils.decision_engine import _entry_quality as _eq_fn, _leadership as _ls_fn, _conviction as _cv_fn, _classify_category
+from utils.decision_engine import _entry_quality as _eq_fn, _leadership as _ls_fn, _conviction as _cv_fn, _classify_category, _classify_category_with_settings, _extension as _ext_fn
 from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
 from utils.adaptive_target_engine import AdaptiveTargetParams, compute_adaptive_targets, check_momentum_exit
 from utils.regime_engine  import (
@@ -298,7 +298,7 @@ def generate_signals_historical(
 
         # ── v12: Adaptive targets ────────────────────────────────
         _at_params   = AdaptiveTargetParams.from_settings(settings or {})
-        _ext_score   = min(100, int(r.extension_score_atr) * 30)
+        _ext_score   = _ext_fn(r)[0]
         _category    = _classify_category(_ls_val, _cv_val, _eq_val, _ext_score, "ACTIONABLE", r)
         if _at_params.enabled:
             _entry_pad = round(r.entry * 1.005, 2)
@@ -731,8 +731,9 @@ def run_backtest(
                 if rejs is not None and not rejs.empty:
                     with t_lock:
                         all_rejections.append(rejs)
-            except Exception:
-                pass
+            except Exception as _exc:
+                import logging
+                logging.getLogger(__name__).warning("backtest inner loop failed for %s: %s", sym, _exc)
 
     trades_df     = pd.concat(all_trades,     ignore_index=True) if all_trades     else pd.DataFrame()
     rejections_df = pd.concat(all_rejections, ignore_index=True) if all_rejections else pd.DataFrame()

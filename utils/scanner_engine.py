@@ -731,7 +731,7 @@ def score_stock(
     # Computed here (scanner layer) because it needs both DecisionScores and
     # the raw BarResult.  Decision engine is kept regime-agnostic.
     try:
-        category = result.get("Category", "Avoid")
+        category = result.get("Recommendation", result.get("Category", "Avoid"))
         blocker = _primary_blocker(r, result)
         result["Primary Blocker"] = blocker if category not in ("Elite Opportunity", "High Conviction", "Actionable") else ""
     except Exception:

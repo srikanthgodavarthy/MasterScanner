@@ -130,14 +130,14 @@ def lifecycle_from_scanner_row(
         return None
 
     # Map decision-engine stage string → lifecycle stage
-    raw_stage = str(row.get("stage", row.get("Stage", "AVOID")))
+    raw_stage = str(row.get("Lifecycle", row.get("stage", row.get("Stage", "AVOID"))))
     lc_stage  = _DE_STAGE_MAP.get(raw_stage.upper(), STAGE_FORMING)
 
     return LifecycleRecord(
         symbol        = sym,
         scan_date     = scan_date,
         stage         = lc_stage,
-        category      = str(row.get("Category",     row.get("category",      ""))),
+        category      = str(row.get("Recommendation", row.get("Category", row.get("category", "")))),
         leadership    = _safe_int(row.get("Leadership",    row.get("leadership",    0))),
         conviction    = _safe_int(row.get("Conviction",    row.get("conviction",    0))),
         entry_quality = _safe_int(row.get("EntryQuality",  row.get("Entry",         row.get("entry_quality", 0)))),
