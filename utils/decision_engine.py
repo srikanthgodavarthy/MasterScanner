@@ -313,13 +313,16 @@ def _conviction(r: "BarResult") -> tuple[int, dict]:
     # compression (e.g. controlled pullback with low vol, shallow extension)
     # still produces meaningful credit for continuation setups (FIX 3).
     #
-    # Tier definitions (mutually exclusive base, additive bonuses below):
+    # Tier definitions (mutually exclusive base, additive bonuses below).
+    # Every tier is strictly >= floor; no tier can penalise vs trend_up floor.
+    #
     #   squeeze_on        20  — BB actively inside KC: maximum energy loading
     #   squeeze_release   17  — BB just exited KC: energy discharged, still valid
     #   compression_break 15  — ATR expanded above compression high (energy released)
-    #   vol_dry_pullback  10  — controlled pullback: low vol in golden/relaxed zone
-    #   shallow_extension  7  — extension_atr < 0.5 with trend intact (FIX 3: partial)
-    #   trend_alive        4  — trend_up only, no compression evidence (floor for leaders)
+    #   vol_dry_golden    13  — Fib zone pullback + vol drying (dual confluence)
+    #   vol_dry_trend     12  — trending + vol drying up, no Fib zone required
+    #   continuation_ctrl 11  — trend intact, extension_atr < 0.5, neutral volume
+    #   trend_alive       10  — floor: clean trend, no compression evidence
     #
     # Additive bonuses (layered on top of base tier):
     #   fresh_base     +5   — long base → higher energy expectation
@@ -336,15 +339,17 @@ def _conviction(r: "BarResult") -> tuple[int, dict]:
     elif r.compression_break:
         comp = 15                           # ATR expanded above compression high
     elif r.in_golden_relaxed and r.vol_ratio < 0.75:
-        comp = 10                           # controlled pullback, volume drying up
-    elif (                                  # FIX 3: partial credit for continuation
+        comp = 13                           # Fib zone pullback + vol drying — dual confluence
+    elif r.trend_up and r.vol_ratio < 0.75:
+        comp = 12                           # trending + vol drying up — controlled, no distribution
+    elif (
         r.trend_up
         and r.extension_atr < 0.5          # price barely moved since setup (low ATR units)
         and r.vol_ratio >= 1.0             # volume at least neutral
     ):
-        comp = 7                            # trend intact, controlled extension
+        comp = 11                           # trend intact, controlled extension, neutral volume
     elif r.trend_up:
-        comp = 4                            # floor: leader with no compression evidence
+        comp = 10                           # floor: clean trending leader, no compression evidence
 
     # Additive bonuses (independent of base tier)
     if r.fresh_base_breakout:
