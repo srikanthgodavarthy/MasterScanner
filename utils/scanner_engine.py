@@ -501,7 +501,7 @@ def _primary_blocker(r, result: dict) -> str:
         elif cv_cci < 8:
             sub = "CCI not recovered"
         else:
-            sub = f"score {int(cv)}"
+            sub = f"DE score {int(cv)}"
         return f"Low Conviction ({int(cv)}) — {sub}"
 
     # Priority 4: Entry Quality (too extended from entry levels)
@@ -513,7 +513,7 @@ def _primary_blocker(r, result: dict) -> str:
         elif eq_piv < 8:
             sub = "too far above pivot"
         else:
-            sub = f"score {int(eq)}"
+            sub = f"DE score {int(eq)}"
         return f"Low Entry Quality ({int(eq)}) — {sub}"
 
     # Priority 5: CCI momentum not confirmed
@@ -526,8 +526,8 @@ def _primary_blocker(r, result: dict) -> str:
 
     # Leader / Setup Building with everything borderline
     if category == "Leader":
-        return f"Leader — conviction {int(cv)} (need 50) · await base"
-    return f"Setup Building — conviction {int(cv)} (need 60) or entry {int(eq)} (need 60)"
+        return f"Leader — DE conviction {int(cv)} (need 50) · await base"
+    return f"Setup Building — DE conviction {int(cv)} (need 60) or DE entry {int(eq)} (need 60)"
 
 
 def score_stock(
