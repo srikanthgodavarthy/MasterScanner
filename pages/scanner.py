@@ -1081,10 +1081,10 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     data_rows = ""
     for i, (_, row) in enumerate(df.iterrows()):
         stock = str(row.get("Stock", row.get("Symbol", "?")))
-        sc    = str(row.get("CV1_SignalClass", "WATCH"))
-        ls    = int(row.get("CV1_Leadership",   0))
-        cv    = int(row.get("CV1_Conviction",   0))
-        eq    = int(row.get("CV1_EntryQuality", 0))
+        sc    = str(row.get("Recommendation", row.get("CV1_SignalClass", "WATCH")))
+        ls    = int(row.get("Leadership",   row.get("Leadership",   0)))
+        cv    = int(row.get("Conviction",   row.get("Conviction",   0)))
+        eq    = int(row.get("EntryQuality", row.get("EntryQuality", 0)))
         sc_c, _ = _SC_STYLE.get(sc, ("#484f58", sc))
         row_bg = "#0d1117" if i % 2 == 0 else "#111820"
 
@@ -1259,9 +1259,9 @@ def _summary_cards(df: pd.DataFrame) -> str:
         return 0
 
     cards = [
-        ("Leadership",    _avg("CV1_Leadership"),   False, "Market relative strength",   "Leadership"),
-        ("Conviction",    _avg("CV1_Conviction"),   False, "Likelihood to hit target",   "Conviction"),
-        ("Entry Quality", _avg("CV1_EntryQuality"), False, "Good entry right now?",      "Entry Quality"),
+        ("Leadership",    _avg("Leadership"),   False, "Market relative strength",   "Leadership"),
+        ("Conviction",    _avg("Conviction"),   False, "Likelihood to hit target",   "Conviction"),
+        ("Entry Quality", _avg("EntryQuality"), False, "Good entry right now?",      "Entry Quality"),
         ("Extension",     _avg("Extension"),        True,  "Move already missed",        None),
     ]
     html = '<div class="card-grid">'
@@ -1283,16 +1283,16 @@ def _summary_cards(df: pd.DataFrame) -> str:
 # ── SIGNAL CLASS COUNTS ────────────────────────────────────────────
 
 def _sc_counts_html(df: pd.DataFrame) -> str:
-    sc_col = "CV1_SignalClass"
+    sc_col = "Recommendation"
     if sc_col not in df.columns:
         return ""
     counts = df[sc_col].value_counts()
     parts = []
-    for sc in _SC_ORDER:
+    for sc in _CAT_ORDER:
         n = counts.get(sc, 0)
         if n == 0:
             continue
-        color, label = _SC_STYLE.get(sc, ("#484f58", sc))
+        color, label = _CAT_STYLE.get(sc, ("#484f58", sc))
         parts.append(
             f'<span class="sc-count-pill">'
             f'<span class="sc-dot" style="background:{color}"></span>'
@@ -1318,7 +1318,7 @@ def _qualification_summary_html(df: pd.DataFrame, settings: dict) -> str:
         return ""
 
     # ── Actionable count (ELITE + EXECUTE signal classes) ─────────
-    sc_col = "CV1_SignalClass"
+    sc_col = "Recommendation"
     if sc_col in df.columns:
         actionable_df = df[df[sc_col].isin(["ELITE", "EXECUTE"])]
     else:
@@ -1401,9 +1401,9 @@ def _qualification_summary_html(df: pd.DataFrame, settings: dict) -> str:
             # Bucket each stock by its worst gate failure
             def _bucket(row):
                 try:
-                    ls = float(row.get("CV1_Leadership", 100))
-                    cv = float(row.get("CV1_Conviction",  100))
-                    eq = float(row.get("CV1_EntryQuality",100))
+                    ls = float(row.get("Leadership", 100))
+                    cv = float(row.get("Conviction",  100))
+                    eq = float(row.get("EntryQuality",100))
                     pb = str(row.get("Primary Blocker", ""))
                 except (TypeError, ValueError):
                     return "Other"
@@ -1498,7 +1498,7 @@ def _qualification_summary_html(df: pd.DataFrame, settings: dict) -> str:
                     'border-radius:5px;padding:2px 8px;font-size:11px;font-family:var(--mono)">' 
                     f'<b style="color:#d29922">{str(r.get("Stock","?"))}</b>'
                     f'<span style="color:#8b949e;font-size:10px"> CV=' 
-                    f'{int(float(r.get("CV1_Conviction",0))) if str(r.get("CV1_Conviction","")).replace(".","").lstrip("-").isdigit() else chr(8212)}</span>'
+                    f'{int(float(r.get("Conviction",0))) if str(r.get("Conviction","")).replace(".","").lstrip("-").isdigit() else chr(8212)}</span>'
                     '</span>'
                 )
                 for _, r in watch_stocks.head(12).iterrows()
@@ -2015,10 +2015,10 @@ def _breakdown_row_html(label: str, pts: int, max_pts: int, color: str) -> str:
 
 
 def _detail_breakdown_panel(row: pd.Series) -> str:
-    sc  = str(row.get("CV1_SignalClass", row.get("Signal Class", "WATCH")))
-    ls  = int(row.get("CV1_Leadership",   0))
-    cv  = int(row.get("CV1_Conviction",   0))
-    eq  = int(row.get("CV1_EntryQuality", 0))
+    sc  = str(row.get("Recommendation", row.get("Signal Class", "Watch")))
+    ls  = int(row.get("Leadership",   0))
+    cv  = int(row.get("Conviction",   0))
+    eq  = int(row.get("EntryQuality", 0))
 
     ls_factors = [
         ("_cv1_ls_rs",    "RS Composite (multi-TF)",          30, "#a371f7"),
@@ -2287,11 +2287,11 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
         sym    = r.get("Symbol") or r.get("Stock") or "?"
         cci    = r.get("CCI") or r.get("_cci_raw") or 0
         rsi    = r.get("RSI") or r.get("_rsi") or 0
-        tier   = r.get("CV1_SignalClass") or r.get("Tier") or "—"
+        tier   = r.get("Recommendation") or r.get("Tier") or "—"
         boosts = r.get("_fib_pb_boosts") or []
-        ls     = r.get("CV1_Leadership",   0)
-        cv     = r.get("CV1_Conviction",   0)
-        eq     = r.get("CV1_EntryQuality", 0)
+        ls     = r.get("Leadership",   0)
+        cv     = r.get("Conviction",   0)
+        eq     = r.get("EntryQuality", 0)
 
         # CCI state label — mirrors the main scanner
         try:
@@ -2522,14 +2522,14 @@ def render(settings: dict | None = None):
 
     # ── Score cards ──────────────────────────────────────────────
     active_df = (
-        df_aug[df_aug["CV1_SignalClass"] != "SKIP"]
-        if "CV1_SignalClass" in df_aug.columns else df_aug
+        df_aug[df_aug["Recommendation"] != "Avoid"]
+        if "Recommendation" in df_aug.columns else df_aug
     )
     if not active_df.empty:
         st.markdown(_summary_cards(active_df), unsafe_allow_html=True)
 
-    # ── CV1 counts ───────────────────────────────────────────────
-    if "CV1_SignalClass" in df_aug.columns:
+    # ── Signal class counts ───────────────────────────────────────
+    if "Recommendation" in df_aug.columns:
         st.markdown(_sc_counts_html(df_aug), unsafe_allow_html=True)
 
     # ── Qualification Summary ─────────────────────────────────────
@@ -2594,23 +2594,22 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
         )
 
     # ── Split by Signal Class ────────────────────────────────────
-    has_cv1 = "CV1_SignalClass" in df_aug.columns
+    has_cv1 = "Recommendation" in df_aug.columns
 
     def _sc_df(sc):
         if not has_cv1:
             return pd.DataFrame()
-        _base = df_aug[df_aug["CV1_SignalClass"] == sc].copy()
-        # Apply sort
+        _base = df_aug[df_aug["Recommendation"] == sc].copy()
         sort_key = st.session_state.get("sort_persistence", "Leadership ↓")
         if sort_key == "Freshest First 🟢" and "DaysActive" in _base.columns:
             _base = _base.sort_values("DaysActive", ascending=True)
         else:
-            _base = _base.sort_values("CV1_Leadership", ascending=False)
+            _base = _base.sort_values("Leadership", ascending=False)
         return _base
 
-    elite_df   = _sc_df("ELITE")
-    execute_df = _sc_df("EXECUTE")
-    watch_df   = _sc_df("WATCH")
+    elite_df   = _sc_df("Elite Opportunity")
+    execute_df = _sc_df("Actionable")
+    watch_df   = _sc_df("Setup Building")
 
     if not has_cv1:
         _rec_col   = "Recommendation" if "Recommendation" in df_aug.columns else "Category"
@@ -2678,7 +2677,7 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
     set_keys = ["ELITE", "EXECUTE", "WATCH", "FIB_PULLBACK"]
 
     if show_skip:
-        skip_df = _sc_df("SKIP") if has_cv1 else pd.DataFrame()
+        skip_df = _sc_df("Avoid") if has_cv1 else pd.DataFrame()
         tab_labels.append(f"⛔ Skip ({len(skip_df)})")
         df_sets.append(skip_df)
         set_keys.append("SKIP")
@@ -2829,9 +2828,9 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
                         _cat = str(_erow.get(_rec_col2, ""))
                         if _cat != "Elite Opportunity":
                             try:
-                                _ls  = int(float(_erow.get("CV1_Leadership",   _erow.get("Leadership",   0)) or 0))
-                                _cv  = int(float(_erow.get("CV1_Conviction",   _erow.get("Conviction",   0)) or 0))
-                                _eq  = int(float(_erow.get("CV1_EntryQuality", _erow.get("EntryQuality", 0)) or 0))
+                                _ls  = int(float(_erow.get("Leadership",   0) or 0))
+                                _cv  = int(float(_erow.get("Conviction",   0) or 0))
+                                _eq  = int(float(_erow.get("EntryQuality", 0) or 0))
                                 _ext = int(float(_erow.get("Extension", 0) or 0))
                                 ls_gap  = max(0, 90 - _ls)
                                 cv_gap  = max(0, 90 - _cv)
