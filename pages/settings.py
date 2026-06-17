@@ -54,6 +54,11 @@ DEFAULTS = {
     "t2_atr_ratio":      0.80,
     "t2_vol_mult":       1.5,
     "nifty_regime_filter": True,
+    # [A/B flag — pending 2-4wk backtest before default-on, see decision review 2026-06-17]
+    # Adds a Fib golden-zone-pullback pattern rung (independent of CCI recovery state)
+    # to the Conviction pattern slot. Targets stocks stuck at pat=8 purely because no
+    # other pattern condition fires despite a clean, controlled Fib pullback.
+    "ENABLE_GOLDEN_PULLBACK_PATTERN": False,
 }
 
 _TRADING_STYLE_DEFAULTS = {
@@ -428,6 +433,20 @@ def _tab_advanced() -> None:
                 sqz_n = st.slider("sqz_n", 0, 15, _g("t1_no_squeeze_pts"), step=5, key="sl_sqz_n",
                     label_visibility="collapsed")
                 _s("t1_no_squeeze_pts", int(sqz_n))
+
+        _divider()
+        gp_en = st.toggle(
+            "🧪 Golden-zone pullback pattern (experimental)",
+            value=_g("ENABLE_GOLDEN_PULLBACK_PATTERN"), key="tog_golden_pullback",
+            help=(
+                "Adds a dedicated Conviction pattern-slot rung for clean Fib golden-zone "
+                "pullbacks (in_golden / in_golden_relaxed + controlled volume), independent "
+                "of CCI recovery state. Targets Watch-stuck setups currently scoring "
+                "pattern=8 only because no other pattern condition fires. "
+                "Off by default — run 2-4 weeks of backtests before enabling for live scans."
+            ),
+        )
+        _s("ENABLE_GOLDEN_PULLBACK_PATTERN", bool(gp_en))
 
         ps1, ps2 = st.columns(2)
         with ps1:
