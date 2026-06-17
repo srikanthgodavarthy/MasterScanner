@@ -200,67 +200,157 @@ def _leadership(r: "BarResult") -> tuple[int, dict]:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  CONVICTION ENGINE
+#  CONVICTION ENGINE  (v9.1)
 #  "How likely is this setup to achieve target before stop loss?"
 #  Evaluates structural quality independent of entry timing.
 #
 #  Factors (weights sum to 100):
-#    Patterns          40  — VCP, Cup&Handle, Compression, Harmonic, ABCD, NR7
-#    Fibonacci Quality 25  — pullback quality (golden zone, relaxed zone)
-#    Compression       20  — ATR / range / volume compression
-#    RS Leadership     15  — RS improvement before price (rs_top_decile + rs3 lead)
+#    Patterns          35  — VCP, Cup&Handle, Continuation, Harmonic, ABCD
+#    Fibonacci Quality 20  — pullback quality (golden zone) OR continuation credit
+#    Compression       25  — continuous ATR-based scale; no setup-type gate
+#    RS Leadership     20  — RS improvement before price (rs_top_decile + rs3 lead)
+#
+#  v9.1 changes vs v9.0
+#  ─────────────────────
+#  FIX 1 — Double-count removed: squeeze_release contributed 25 pts to Pattern
+#           AND 15 pts to Compression from a single binary flag.  Combined swing
+#           from one event was 40 pts; now it lives only in Compression (where it
+#           belongs as an energy-state signal) and Pattern awards setup shape only.
+#
+#  FIX 2 — Continuation pattern credit added: a clean continuation breakout
+#           (trend_up + above pivot within 5% + volume expansion) previously scored
+#           0 Pattern pts.  Now receives 15 pts — the same tier as a compression
+#           break, one tier below a fresh base (20 pts).  This lifts the ceiling
+#           for valid continuation setups from ~41 to ~55–65 without over-rewarding.
+#
+#  FIX 3 — Continuous Compression scale: replaced the binary (0 or 18/25) with a
+#           four-tier continuous scale using extension_atr (ATR-normalised price
+#           move since setup — already on BarResult, no new computation).  A stock
+#           not in full squeeze can still score partial compression credit if it
+#           shows controlled retracement (low vol_ratio, shallow extension_atr).
+#           Importantly, the continuation path gets neutral (not zero) compression.
 # ══════════════════════════════════════════════════════════════════
 
 def _conviction(r: "BarResult") -> tuple[int, dict]:
     """Returns (0-100, sub_scores_dict)."""
 
     # ── Pattern Recognition (0-35) ────────────────────────────────
-    # VCP and compression patterns get highest weight — proven high-probability setups.
-    # Harmonic / ABCD weight reduced: unvalidated edge on NSE universe.
+    # Each condition represents a distinct setup shape.  squeeze_release is
+    # deliberately NOT included here — it is an energy-state signal, not a
+    # pattern-shape signal, and belongs exclusively in Compression (FIX 1).
+    #
+    # Priority ordering (elif chain ensures no double-credit within the
+    # primary pattern slot; additive signals below are independent):
+    #
+    #   fresh_base_breakout  20  — Stage-2 / long base / Cup-with-Handle
+    #   compression_break    18  — ATR expansion above compression high
+    #   continuation_signal  15  — clean continuation breakout (NEW — FIX 2)
+    #   recent_cci_recovery   8  — CCI cross from oversold (NR7 proxy)
+    #   cci_rising            4  — early CCI momentum, not yet confirmed
+    #
+    # Additive (independent of primary slot):
+    #   harm_bull            +5  — harmonic pattern (reduced; low NSE edge)
+    #   abcd_bull            +4  — ABCD structure
+    #
     pat = 0
-    if r.squeeze_release:           pat += 25   # VCP — expansion after contraction (highest)
-    if r.fresh_base_breakout:       pat += 20   # Cup & Handle / flat base
-    elif r.compression_break:       pat += 18   # compression breakout
-    if r.recent_cci_recovery:       pat += 8    # CCI cross / NR7 proxy — meaningful
-    elif r.cci_rising:              pat += 4    # early CCI momentum building
-    if r.harm_bull:                 pat += 5    # harmonic — reduced (low NSE edge)
-    if r.abcd_bull:                 pat += 4    # ABCD — reduced
+
+    # ── Primary pattern slot (mutually exclusive, take highest) ──
+    if r.fresh_base_breakout:
+        pat += 20                           # strongest: multi-week base, full energy load
+    elif r.compression_break:
+        pat += 18                           # ATR expansion above compressed zone
+    elif (                                  # FIX 2: continuation breakout (NEW)
+        r.trend_up
+        and r.pivot_high_dist is not None
+        and 0.0 < r.pivot_high_dist <= 5.0  # above pivot, not chasing (≤5%)
+        and r.vol_ratio >= 1.3              # volume confirming the move
+    ):
+        pat += 15                           # trend continuation with volume — valid setup
+    elif r.recent_cci_recovery:
+        pat += 8                            # CCI cross / NR7 proxy
+    elif r.cci_rising:
+        pat += 4                            # early momentum, pre-confirmation
+
+    # ── Additive pattern signals (independent) ────────────────────
+    if r.harm_bull:     pat += 5            # harmonic — low NSE edge, kept small
+    if r.abcd_bull:     pat += 4            # ABCD structure
+
     pat = min(pat, 35)
 
     # ── Fibonacci Quality (0-20) ──────────────────────────────────
-    # Two paths: PULLBACK (in zone) or CONTINUATION (above Fib 61.8%)
+    # Two paths: PULLBACK (in zone) or CONTINUATION (above Fib 61.8%).
     # Absence of a Fib pullback is NOT a penalty when trend is continuing.
     fib = 0
-    if r.in_golden:                fib = 20   # 50-61.8% (ideal pullback)
-    elif r.in_golden_relaxed:      fib = 14   # 38.2-61.8% (acceptable)
-    elif r.t3_near_golden:         fib = 8    # approaching zone
-    elif r.trend_up and (r.pivot_high_dist > 0 or r.fib786 > 0):
-        # CONTINUATION PATH: stock is above Fib 61.8% / above pivot high
-        # — it has broken out and is pressing higher; credit is given for
-        # trend continuation (capped below ideal pullback max of 20).
+    if r.in_golden:                fib = 20    # 50–61.8% (ideal pullback)
+    elif r.in_golden_relaxed:      fib = 14    # 38.2–61.8% (acceptable)
+    elif r.t3_near_golden:         fib = 8     # approaching zone
+    elif r.trend_up and ((r.pivot_high_dist is not None and r.pivot_high_dist > 0) or r.fib786 > 0):
+        # CONTINUATION PATH: stock is above Fib 61.8% / above pivot high.
+        # Credit for trend continuation, capped below ideal pullback max (20).
         pvtd = r.pivot_high_dist if r.pivot_high_dist > 0 else 0.0
-        if   pvtd <= 2.0:  fib = 13   # just reclaimed pivot: clean continuation entry
-        elif pvtd <= 5.0:  fib = 10   # modest extension: still valid
-        elif pvtd <= 10.0: fib = 7    # extended but trend intact
-        else:              fib = 4    # far extended: reduce credit, not zero
-    # CCI oversold in golden = extra confluence
+        if   pvtd <= 2.0:  fib = 13    # just reclaimed pivot: clean continuation entry
+        elif pvtd <= 5.0:  fib = 10    # modest extension: still valid
+        elif pvtd <= 10.0: fib = 7     # extended but trend intact
+        else:              fib = 4     # far extended: reduce credit, not zero
+    # CCI oversold in golden zone = extra confluence
     if r.in_golden_cci:            fib = min(fib + 5, 20)
 
-    # ── Compression (0-25) ─────────────────────────────────────────
-    # Increased weight: energy accumulation is one of the strongest
-    # predictors of a follow-through move to target.
+    # ── Compression (0-25) — continuous scale (FIX 1 + FIX 3) ────
+    # Energy-state score.  squeeze_release now lives here only (FIX 1).
+    # Uses a four-tier scale rather than a binary gate so that partial
+    # compression (e.g. controlled pullback with low vol, shallow extension)
+    # still produces meaningful credit for continuation setups (FIX 3).
+    #
+    # Tier definitions (mutually exclusive base, additive bonuses below):
+    #   squeeze_on        20  — BB actively inside KC: maximum energy loading
+    #   squeeze_release   17  — BB just exited KC: energy discharged, still valid
+    #   compression_break 15  — ATR expanded above compression high (energy released)
+    #   vol_dry_pullback  10  — controlled pullback: low vol in golden/relaxed zone
+    #   shallow_extension  7  — extension_atr < 0.5 with trend intact (FIX 3: partial)
+    #   trend_alive        4  — trend_up only, no compression evidence (floor for leaders)
+    #
+    # Additive bonuses (layered on top of base tier):
+    #   fresh_base     +5   — long base → higher energy expectation
+    #   vol_dry_golden +3   — volume dry-up specifically in golden zone (tightest pullback)
+    #   vol_surge_cont +2   — vol_ratio ≥ 2.0 on continuation (institutional buying)
+    #
     comp = 0
-    if r.squeeze_on:               comp = 18   # actively building energy (BB inside KC)
-    elif r.squeeze_release:        comp = 15   # just fired — still valid
-    if r.compression_break:        comp = min(comp + 10, 25)
-    # Volume Dry-Up: low vol during pullback = controlled retracement
-    if r.in_golden_relaxed and r.vol_ratio < 0.75:   comp = min(comp + 5, 25)
-    if r.fresh_base_breakout:      comp = min(comp + 6, 25)
+
+    # Base tier — take the highest applicable
+    if r.squeeze_on:
+        comp = 20                           # BB inside KC: peak energy accumulation
+    elif r.squeeze_release:
+        comp = 17                           # just fired: energy has discharged
+    elif r.compression_break:
+        comp = 15                           # ATR expanded above compression high
+    elif r.in_golden_relaxed and r.vol_ratio < 0.75:
+        comp = 10                           # controlled pullback, volume drying up
+    elif (                                  # FIX 3: partial credit for continuation
+        r.trend_up
+        and r.extension_atr < 0.5          # price barely moved since setup (low ATR units)
+        and r.vol_ratio >= 1.0             # volume at least neutral
+    ):
+        comp = 7                            # trend intact, controlled extension
+    elif r.trend_up:
+        comp = 4                            # floor: leader with no compression evidence
+
+    # Additive bonuses (independent of base tier)
+    if r.fresh_base_breakout:
+        comp = min(comp + 5, 25)           # long base = higher energy reservoir
+    if r.in_golden and r.vol_ratio < 0.75:
+        comp = min(comp + 3, 25)           # tight pullback in golden zone
+    if (
+        r.trend_up
+        and r.pivot_high_dist is not None
+        and 0.0 < r.pivot_high_dist <= 5.0
+        and r.vol_ratio >= 2.0
+    ):
+        comp = min(comp + 2, 25)           # institutional-volume continuation
+
     comp = min(comp, 25)
 
     # ── RS Leadership (0-20) ──────────────────────────────────────
-    # Increased weight: RS improving before price = institutional accumulation signal.
-    # This is one of the most reliable leading indicators of follow-through.
+    # RS improving before price = institutional accumulation signal.
     rs_lead = 0
     if r.rs_top_decile:            rs_lead = 20
     elif r.rs3 > 0.06:             rs_lead = 16
@@ -857,11 +947,21 @@ def explain_decision(ds: "DecisionScores") -> dict:
         included.append(f"RS composite above market — relative outperformance across timeframes")
 
     if ds.cv_pattern >= 20:
-        included.append("VCP / base breakout pattern detected — energy accumulation present")
+        included.append("Stage-2 base breakout detected — multi-week energy accumulation confirmed")
+    elif ds.cv_pattern >= 15:
+        included.append("Continuation breakout pattern — trend pressing higher with volume confirmation")
+    elif ds.cv_pattern >= 8:
+        included.append("CCI recovery / compression break detected — momentum building from structure")
     if ds.cv_fib >= 14:
-        included.append(f"Fibonacci pullback quality {ds.cv_fib}/20 — controlled retracement to support")
+        included.append(f"Fibonacci quality {ds.cv_fib}/20 — controlled retracement into support zone")
+    elif ds.cv_fib >= 7:
+        included.append(f"Fibonacci quality {ds.cv_fib}/20 — continuation above pivot, trend intact")
     if ds.cv_compression >= 18:
-        included.append("Active squeeze compression — volatility contraction with energy building")
+        included.append("Active squeeze (BB inside KC) — maximum energy accumulation, awaiting release")
+    elif ds.cv_compression >= 14:
+        included.append("Squeeze fired or compression break — energy has discharged into the move")
+    elif ds.cv_compression >= 7:
+        included.append("Partial compression — controlled pullback or low-ATR extension, trend intact")
 
     if tq >= 75:
         included.append(f"Trend Quality {tq}: mature, persistent trend with healthy structure")
@@ -901,8 +1001,8 @@ def explain_decision(ds: "DecisionScores") -> dict:
     if cat == "Leader":
         not_higher.append(
             f"Conviction {cv} (need ≥50 for Setup Building) — "
-            "strong price leadership present but no Fib pullback zone or compression base yet; "
-            "watch for base formation before entering"
+            "strong price leadership but no confirmed pattern (base, squeeze, or continuation vol signal) "
+            "and no Fib zone yet; watch for base formation or pullback to support before entering"
         )
 
     if cat == "Setup Building" and cv < 60:
