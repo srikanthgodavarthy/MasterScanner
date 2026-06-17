@@ -253,8 +253,19 @@ def _leadership(r: "BarResult") -> tuple[int, dict]:
 #           Importantly, the continuation path gets neutral (not zero) compression.
 # ══════════════════════════════════════════════════════════════════
 
-def _conviction(r: "BarResult") -> tuple[int, dict]:
-    """Returns (0-100, sub_scores_dict)."""
+def _conviction(r: "BarResult", settings: dict | None = None) -> tuple[int, dict]:
+    """Returns (0-100, sub_scores_dict).
+
+    settings : optional dict; reads ENABLE_GOLDEN_PULLBACK_PATTERN (default False).
+               When True, a clean Fib golden-zone pullback (in_golden / in_golden_relaxed
+               with non-surging volume) can claim a dedicated pattern-slot rung, ranked
+               above the CCI-recovery rungs and below continuation_signal. This targets
+               stocks currently stuck at pat=8 (recent_cci_recovery) purely because no
+               other pattern condition fires — see decision review, 2026-06-17.
+               Behind a flag pending 2-4 weeks of backtest validation before default-on.
+    """
+    settings = settings or {}
+    _enable_golden_pullback = bool(settings.get("ENABLE_GOLDEN_PULLBACK_PATTERN", False))
 
     # ── Pattern Recognition (0-35) ────────────────────────────────
     # Each condition represents a distinct setup shape.  squeeze_release is
@@ -288,6 +299,13 @@ def _conviction(r: "BarResult") -> tuple[int, dict]:
         and r.vol_ratio >= 1.3              # volume confirming the move
     ):
         pat += 15                           # trend continuation with volume — valid setup
+    elif (                                  # NEW (flagged): golden-zone pullback pattern
+        _enable_golden_pullback
+        and (r.in_golden or r.in_golden_relaxed)
+        and r.vol_ratio < 1.3               # controlled pullback, not distribution/churn
+    ):
+        pat += 14                           # clean Fib structure — pattern stands on its own,
+                                             # independent of CCI recovery state (see settings doc)
     elif r.recent_cci_recovery:
         pat += 8                            # CCI cross / NR7 proxy
     elif r.cci_rising:
@@ -1163,7 +1181,7 @@ def compute_decision(r: "BarResult", settings: dict | None = None) -> DecisionSc
 
     # ── Compute four engines ──────────────────────────────────────
     leadership,    ls_subs  = _leadership(r)
-    conviction,    cv_subs  = _conviction(r)
+    conviction,    cv_subs  = _conviction(r, settings)
     entry_quality, eq_subs, rr = _entry_quality(r)
     extension,     ex_subs  = _extension(r)
 
