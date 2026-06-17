@@ -257,7 +257,7 @@ def generate_signals_historical(
         if not _rejection_reason:
             _eq_val, _, _rr = _eq_fn(r)
             _ls_val, _      = _ls_fn(r)
-            _cv_val, _      = _cv_fn(r)
+            _cv_val, _      = _cv_fn(r, settings)
 
             # Gate 2: Leadership must be >= 65
             # A stock with Leadership < 65 has no RS edge, weak trend, or
