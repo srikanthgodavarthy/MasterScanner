@@ -175,9 +175,11 @@ _ALIAS_MAP: dict[str, str] = {
 
     # Category / Stage
     "Category":            CAN_CATEGORY,
+    "Recommendation":      CAN_CATEGORY,   # v2 name for Category (settings-aware)
     "category":            CAN_CATEGORY,
     "CV1_SignalClass":     CAN_CATEGORY,
     "Stage":               CAN_STAGE,
+    "Lifecycle":           CAN_STAGE,      # v2 name for Stage (objective)
     "stage":               CAN_STAGE,
 
     # Trade levels
