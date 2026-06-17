@@ -473,8 +473,8 @@ def _primary_blocker(r, result: dict) -> str:
     # Pull scores — use CV1 for Leadership (matches scanner display colours at threshold 65);
     # fall back to DE values when CV1 is absent.
     ls = float(result.get("CV1_Leadership",  result.get("Leadership",   result.get("DE_Leadership",   0))) or 0)
-    cv = float(result.get("Conviction",      result.get("DE_Conviction",   0)) or 0)
-    eq = float(result.get("EntryQuality",    result.get("DE_EntryQuality", 0)) or 0)
+    cv = float(result.get("CV1_Conviction",   result.get("Conviction",   result.get("DE_Conviction",   0))) or 0)
+    eq = float(result.get("CV1_EntryQuality", result.get("EntryQuality", result.get("DE_EntryQuality", 0))) or 0)
     ext= float(result.get("Extension",       0) or 0)
 
     # Priority 1: Leadership gate — threshold aligned with _SCORE_THRESHOLDS["Leadership"]=65
@@ -727,16 +727,6 @@ def score_stock(
             "Error: %s", _de_exc, exc_info=True
         )
 
-    # ── Primary Blocker ──────────────────────────────────────────
-    # Computed here (scanner layer) because it needs both DecisionScores and
-    # the raw BarResult.  Decision engine is kept regime-agnostic.
-    try:
-        category = result.get("Recommendation", result.get("Category", "Avoid"))
-        blocker = _primary_blocker(r, result)
-        result["Primary Blocker"] = blocker if category not in ("Elite Opportunity", "High Conviction", "Actionable") else ""
-    except Exception:
-        pass
-
     # ── Conviction Score v1 (backtest-validated weights) ─────────
     # Pure re-mapping of existing BarResult fields — zero new indicators.
     # Produces: CV1_Leadership, CV1_Conviction, CV1_EntryQuality, CV1_SignalClass
@@ -839,6 +829,22 @@ def score_stock(
                 result["ConvictionProfile"] = "Base Builder"
             else:
                 result["ConvictionProfile"] = "Aligned"
+    except Exception:
+        pass
+
+    # ── Primary Blocker ──────────────────────────────────────────
+    # Computed here (scanner layer) because it needs both DecisionScores and
+    # the raw BarResult.  Decision engine is kept regime-agnostic.
+    # NOTE: must run AFTER the CV1 block above — _primary_blocker() prefers
+    # CV1_Leadership/CV1_Conviction/CV1_EntryQuality (the values shown in the
+    # UI table) and falls back to the legacy DE scores only if CV1 failed.
+    # Running it earlier meant those CV1_* lookups always missed, so the
+    # blocker text silently graded against invisible DE numbers instead of
+    # the scores the user was actually looking at.
+    try:
+        category = result.get("Recommendation", result.get("Category", "Avoid"))
+        blocker = _primary_blocker(r, result)
+        result["Primary Blocker"] = blocker if category not in ("Elite Opportunity", "High Conviction", "Actionable") else ""
     except Exception:
         pass
 
