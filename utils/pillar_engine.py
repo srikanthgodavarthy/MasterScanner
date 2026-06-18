@@ -98,6 +98,7 @@ class PillarResult:
     stoch_cross_up:          bool  = False
     rsi_val:               float = 50.0
     rsi_above_50:           bool  = False
+    m_vwap_cross_up_fresh:  bool  = False
 
     # ── Risk sub-fields (raw distances, informational) ────────────
     dist_from_ema20_pct:   float = 0.0
@@ -337,7 +338,7 @@ def _stochastic(high: pd.Series, low: pd.Series, close: pd.Series,
 
 
 def _score_momentum(high: pd.Series, low: pd.Series, close: pd.Series,
-                     rsi_s: pd.Series) -> tuple[int, dict]:
+                     rsi_s: pd.Series, volume: pd.Series) -> tuple[int, dict]:
     k_s, d_s = _stochastic(high, low, close)
 
     cur_k  = _safe_last(k_s, default=50.0)
@@ -350,12 +351,31 @@ def _score_momentum(high: pd.Series, low: pd.Series, close: pd.Series,
     stoch_from_os     = prev_k <= 20 and cur_k > 20                # re-igniting out of oversold
     rsi_above_50      = cur_rsi > 50
 
+    # --- Fresh VWAP cross-up ------------------------------------------
+    # The chart's dynamic VWAP polyline (anchored from swing points) is
+    # what price tends to break above right before a sharp rally. We
+    # approximate it with the same anchored VWAP used in Pillar 2, and
+    # flag a "fresh" cross: close was at/below VWAP within the last 3
+    # bars and is now above it.
+    vwap_series = _anchored_vwap(high, low, close, volume)
+    cur_vwap = _safe_last(vwap_series)
+    cur_c    = _safe_last(close)
+    price_above_vwap_now = cur_c > cur_vwap
+
+    closes_recent = close.iloc[-4:] if len(close) >= 4 else close
+    vwap_recent   = vwap_series.iloc[-4:] if len(vwap_series) >= 4 else vwap_series
+    was_below_or_at_vwap = False
+    if len(closes_recent) > 1 and len(vwap_recent) == len(closes_recent):
+        was_below_or_at_vwap = bool((closes_recent.iloc[:-1].to_numpy() <= vwap_recent.iloc[:-1].to_numpy()).any())
+    vwap_cross_up_fresh = bool(price_above_vwap_now and was_below_or_at_vwap)
+
     score = 0
-    if stoch_cross_up:               score += 30
-    if stoch_from_os:                 score += 20
-    if cur_k > 50:                     score += 15   # %K already in bullish half of range
-    if rsi_above_50:                  score += 25
+    if stoch_cross_up:               score += 25
+    if stoch_from_os:                 score += 15
+    if cur_k > 50:                     score += 10   # %K already in bullish half of range
+    if rsi_above_50:                  score += 20
     if cur_rsi > 60:                  score += 10   # strong momentum bonus
+    if vwap_cross_up_fresh:           score += 20   # fresh breakout above dynamic VWAP
     score = min(score, 100)
 
     return score, {
@@ -364,6 +384,7 @@ def _score_momentum(high: pd.Series, low: pd.Series, close: pd.Series,
         "stoch_cross_up": bool(stoch_cross_up or stoch_from_os),
         "rsi_val": round(cur_rsi, 1),
         "rsi_above_50": rsi_above_50,
+        "m_vwap_cross_up_fresh": vwap_cross_up_fresh,
     }
 
 
@@ -433,7 +454,7 @@ def compute_pillars_from_ia(df: pd.DataFrame, ia) -> PillarResult:
         s_score, s_sub = _score_structure(close, ia.e20, ia.e50, ia.e200)
         a_score, a_sub = _score_acceptance(close, high, low, volume)
         l_score, l_sub = _score_leadership(close, ia.nifty_aligned)
-        m_score, m_sub = _score_momentum(high, low, close, ia.rsi_s)
+        m_score, m_sub = _score_momentum(high, low, close, ia.rsi_s, volume)
         r_score, r_sub = _score_risk(close, ia.e20, a_sub["vwap"], ia.atr_s)
 
         final = (
