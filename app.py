@@ -86,6 +86,7 @@ from pages.validation  import render as render_validation
 from pages.diagnostic  import render as render_diagnostic
 from pages.lifecycle   import render as render_lifecycle
 from pages.history     import render as render_history
+from pages.agent        import render as render_agent
 from utils.scanner_engine import NIFTY500_SYMBOLS
 
 ss = st.session_state
@@ -125,8 +126,8 @@ settings = {
     "t1_use_adx":           ss.get("t1_use_adx",           True),
 }
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "📡 Live Scanner", "📈 Backtest Engine", "🔄 Lifecycle", "📊 History", "⚙️ Settings", "🔬 CV/EQ Validation", "🧬 Diagnostic"
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    "📡 Live Scanner", "📈 Backtest Engine", "🔄 Lifecycle", "📊 History", "⚙️ Settings", "🔬 CV/EQ Validation", "🧬 Diagnostic", "🤖 Agent"
 ])
 
 with tab1:
@@ -149,3 +150,6 @@ with tab6:
 
 with tab7:
     render_diagnostic(settings)
+
+with tab8:
+    render_agent(settings)
