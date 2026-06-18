@@ -180,9 +180,9 @@ def _build_table_html(df: pd.DataFrame) -> str:
         return '<div class="fp-empty"><div class="icn">📡</div>No candidates in this bucket.</div>'
 
     headers = [
-        "Stock", "Final", "Class", "Structure", "Acceptance",
+        "Stock", "Chg%", "Final", "Class", "Structure", "Acceptance",
         "Leadership", "Momentum", "Risk", "RS 3M", "RS 6M",
-        "POC", "VWAP", "CCI", "RSI",
+        "POC", "VWAP", "Stoch %K", "Stoch %D", "RSI",
     ]
     header_html = "".join(f"<th>{h}</th>" for h in headers)
 
@@ -190,6 +190,7 @@ def _build_table_html(df: pd.DataFrame) -> str:
     for _, row in df.iterrows():
         sym = row.get("Stock", "—")
         cells  = f'<td class="fp-stock">{_tv_link(sym)}</td>'
+        cells += _pct_cell(row.get("%Chg"))
         cells += _final_score_cell(row.get("FP_FinalScore"))
         cells += _class_badge(row.get("FP_Class", ""))
         cells += _pillar_bar(row.get("FP_Structure"))
@@ -201,8 +202,9 @@ def _build_table_html(df: pd.DataFrame) -> str:
         cells += _pct_cell(row.get("FP_RS6m"))
         cells += _num_cell(row.get("FP_POC"))
         cells += _num_cell(row.get("FP_VWAP"))
-        cells += _num_cell(row.get("_fp_cci_raw", row.get("CCI", None)), "{:.0f}")
-        cells += _num_cell(row.get("_rsi", None), "{:.0f}")
+        cells += _num_cell(row.get("FP_StochK"), "{:.0f}")
+        cells += _num_cell(row.get("FP_StochD"), "{:.0f}")
+        cells += _num_cell(row.get("_fp_rsi_val"), "{:.0f}")
         rows_html += f"<tr>{cells}</tr>"
 
     return (
@@ -256,8 +258,8 @@ def _detail_breakdown(row: pd.Series) -> str:
         f"Relative momentum: {row.get('FP_RelMomentum','—')}%",
     ])
     html += _row("4 · Momentum", row.get("FP_Momentum"), "15%", [
-        f"CCI(20): {row.get('_fp_cci_raw', row.get('CCI','—'))} · crossing up: {'✅' if row.get('_fp_cci_cross_up') else '❌'}",
-        f"RSI(14) &gt; 50: {'✅' if row.get('_fp_rsi_above_50') else '❌'}",
+        f"Stoch %K/%D: {row.get('FP_StochK','—')} / {row.get('FP_StochD','—')} · cross/re-ignition: {'✅' if row.get('_fp_stoch_cross_up') else '❌'}",
+        f"RSI(14): {row.get('_fp_rsi_val','—')} · &gt; 50: {'✅' if row.get('_fp_rsi_above_50') else '❌'}",
     ])
     html += _row("5 · Risk (lower risk = higher score)", row.get("FP_Risk"), "10%", [
         f"Distance from EMA20: {row.get('FP_DistEMA20Pct','—')}%",
