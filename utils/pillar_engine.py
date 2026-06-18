@@ -14,7 +14,7 @@ Five pillars
 2. Acceptance  — Anchored VWAP (from start of history) + 60-bar Fixed
                  Range Volume Profile (POC / VAH / VAL)
 3. Leadership  — Relative strength vs NIFTY (3M, 6M) + relative momentum
-4. Momentum    — CCI(20) re-ignition + RSI(14) > 50
+4. Momentum    — Stochastic Oscillator(14,3) re-ignition + RSI(14) > 50
 5. Risk        — Distance from EMA20 / VWAP / ATR extension (lower = safer,
                  scored so LOWER risk gives a HIGHER score)
 
@@ -45,6 +45,9 @@ W_RISK       = 0.10
 VOLUME_PROFILE_BARS = 60   # Fixed Range Volume Profile lookback (bars)
 VALUE_AREA_PCT      = 0.70 # 70% of volume defines the Value Area (standard)
 VP_BINS             = 24   # number of price bins for the volume profile histogram
+
+STOCH_K_PERIOD = 14   # %K lookback (highest high / lowest low window)
+STOCH_D_PERIOD = 3    # %D = SMA(%K, 3) — signal line
 
 CLASS_EXECUTE   = "Execute"
 CLASS_WATCH     = "Watch"
@@ -90,8 +93,9 @@ class PillarResult:
     rel_momentum:        float = 0.0   # relative momentum (acceleration), %
 
     # ── Momentum sub-fields ──────────────────────────────────────
-    cci_val:              float = 0.0
-    cci_cross_up:          bool  = False
+    stoch_k:               float = 0.0
+    stoch_d:                float = 0.0
+    stoch_cross_up:          bool  = False
     rsi_val:               float = 50.0
     rsi_above_50:           bool  = False
 
@@ -320,26 +324,44 @@ def _score_leadership(close: pd.Series, nifty_aligned: pd.Series) -> tuple[int, 
 #  PILLAR 4 — MOMENTUM  (re-ignition)
 # ══════════════════════════════════════════════════════════════════
 
-def _score_momentum(cci_s: pd.Series, rsi_s: pd.Series) -> tuple[int, dict]:
-    cur_cci  = _safe_last(cci_s)
-    prev_cci = _safe_at(cci_s, -2, default=cur_cci)
+def _stochastic(high: pd.Series, low: pd.Series, close: pd.Series,
+                 k_period: int = STOCH_K_PERIOD,
+                 d_period: int = STOCH_D_PERIOD) -> tuple[pd.Series, pd.Series]:
+    """Standard Stochastic Oscillator. %K = (C - LLn)/(HHn - LLn)*100, %D = SMA(%K, d)."""
+    hh = high.rolling(k_period).max()
+    ll = low.rolling(k_period).min()
+    rng = (hh - ll).replace(0, np.nan)
+    k = (close - ll) / rng * 100
+    d = k.rolling(d_period).mean()
+    return k, d
+
+
+def _score_momentum(high: pd.Series, low: pd.Series, close: pd.Series,
+                     rsi_s: pd.Series) -> tuple[int, dict]:
+    k_s, d_s = _stochastic(high, low, close)
+
+    cur_k  = _safe_last(k_s, default=50.0)
+    prev_k = _safe_at(k_s, -2, default=cur_k)
+    cur_d  = _safe_last(d_s, default=50.0)
+    prev_d = _safe_at(d_s, -2, default=cur_d)
     cur_rsi  = _safe_last(rsi_s, default=50.0)
 
-    cci_cross_up = prev_cci <= 0 and cur_cci > 0      # crossing upward through zero line
-    cci_from_os  = prev_cci <= -100 and cur_cci > -100  # re-igniting out of oversold
-    rsi_above_50 = cur_rsi > 50
+    stoch_cross_up   = prev_k <= prev_d and cur_k > cur_d         # %K crossing above %D
+    stoch_from_os     = prev_k <= 20 and cur_k > 20                # re-igniting out of oversold
+    rsi_above_50      = cur_rsi > 50
 
     score = 0
-    if cci_cross_up:                 score += 30
-    if cci_from_os:                  score += 20
-    if cur_cci > 0:                  score += 15   # CCI already in bullish territory
-    if rsi_above_50:                 score += 25
-    if cur_rsi > 60:                 score += 10   # strong momentum bonus
+    if stoch_cross_up:               score += 30
+    if stoch_from_os:                 score += 20
+    if cur_k > 50:                     score += 15   # %K already in bullish half of range
+    if rsi_above_50:                  score += 25
+    if cur_rsi > 60:                  score += 10   # strong momentum bonus
     score = min(score, 100)
 
     return score, {
-        "cci_val": round(cur_cci, 1),
-        "cci_cross_up": bool(cci_cross_up or cci_from_os),
+        "stoch_k": round(cur_k, 1),
+        "stoch_d": round(cur_d, 1),
+        "stoch_cross_up": bool(stoch_cross_up or stoch_from_os),
         "rsi_val": round(cur_rsi, 1),
         "rsi_above_50": rsi_above_50,
     }
@@ -401,7 +423,7 @@ def compute_pillars_from_ia(df: pd.DataFrame, ia) -> PillarResult:
     """
     Compute the Five Pillars score using the raw OHLCV df and the
     IndicatorArrays (`ia`) already built by build_indicators() inside
-    score_stock(). No re-fetching, no re-computation of EMA/RSI/CCI/ATR —
+    score_stock(). No re-fetching, no re-computation of EMA/RSI/ATR —
     only the new pieces (VWAP, Volume Profile, RS-3M/6M, risk distances)
     are computed here.
     """
@@ -411,7 +433,7 @@ def compute_pillars_from_ia(df: pd.DataFrame, ia) -> PillarResult:
         s_score, s_sub = _score_structure(close, ia.e20, ia.e50, ia.e200)
         a_score, a_sub = _score_acceptance(close, high, low, volume)
         l_score, l_sub = _score_leadership(close, ia.nifty_aligned)
-        m_score, m_sub = _score_momentum(ia.cci_s, ia.rsi_s)
+        m_score, m_sub = _score_momentum(high, low, close, ia.rsi_s)
         r_score, r_sub = _score_risk(close, ia.e20, a_sub["vwap"], ia.atr_s)
 
         final = (
@@ -435,14 +457,14 @@ def compute_pillars_from_ia(df: pd.DataFrame, ia) -> PillarResult:
         return PillarResult(error=str(exc))
 
 
-def compute_pillars(df: pd.DataFrame, nifty: pd.Series, cci_len: int = 20) -> PillarResult:
+def compute_pillars(df: pd.DataFrame, nifty: pd.Series) -> PillarResult:
     """
     Standalone path: builds its own minimal indicator set from raw OHLCV.
     Use this only when an IndicatorArrays instance isn't already available
     (e.g. ad-hoc / outside score_stock). Inside score_stock(), prefer
-    compute_pillars_from_ia(df, ia) to avoid recomputing EMA/RSI/CCI/ATR.
+    compute_pillars_from_ia(df, ia) to avoid recomputing EMA/RSI/ATR.
     """
-    from utils.scanner_engine import ema, rsi, atr, cci, _strip_tz
+    from utils.scanner_engine import ema, rsi, atr, _strip_tz
 
     if df.empty or len(df) < 60:
         return PillarResult(error="insufficient history")
@@ -454,7 +476,6 @@ def compute_pillars(df: pd.DataFrame, nifty: pd.Series, cci_len: int = 20) -> Pi
     e200 = ema(close, 200)
     rsi_s = rsi(close, 14)
     atr_s = atr(high, low, close, 14)
-    cci_s = cci(close, cci_len)
 
     c_idx = _strip_tz(close.index)
     nf = nifty.copy()
@@ -466,7 +487,7 @@ def compute_pillars(df: pd.DataFrame, nifty: pd.Series, cci_len: int = 20) -> Pi
     ia = _IA()
     ia.c, ia.h, ia.l, ia.v = close, high, low, volume
     ia.e20, ia.e50, ia.e200 = e20, e50, e200
-    ia.rsi_s, ia.atr_s, ia.cci_s = rsi_s, atr_s, cci_s
+    ia.rsi_s, ia.atr_s = rsi_s, atr_s
     ia.nifty_aligned = nifty_aligned
 
     return compute_pillars_from_ia(df, ia)
