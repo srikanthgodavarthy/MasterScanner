@@ -802,6 +802,55 @@ def score_stock(
     except Exception:
         pass   # non-critical; Action column retains norm_score value
 
+    # ── Five Pillars Ranking Engine ───────────────────────────────
+    # Standalone additive model (Structure/Acceptance/Leadership/Momentum/
+    # Risk). Reuses the already-built IndicatorArrays (ia) — no re-fetch,
+    # no recomputation of EMA/RSI/CCI/ATR. Adds VWAP + Fixed Range Volume
+    # Profile (POC/VAH/VAL), which don't exist anywhere else in the engine.
+    try:
+        from utils.pillar_engine import compute_pillars_from_ia
+        fp = compute_pillars_from_ia(df, ia)
+        if not fp.error:
+            result.update({
+                "FP_Structure":   fp.structure_score,
+                "FP_Acceptance":  fp.acceptance_score,
+                "FP_Leadership":  fp.leadership_score,
+                "FP_Momentum":    fp.momentum_score,
+                "FP_Risk":        fp.risk_score,
+                "FP_FinalScore":  fp.final_score,
+                "FP_Class":       fp.classification,
+                "FP_ClassNote":   fp.classification_note,
+                # Acceptance internals
+                "FP_VWAP":        round(fp.vwap, 2),
+                "FP_POC":         round(fp.poc, 2),
+                "FP_VAH":         round(fp.vah, 2),
+                "FP_VAL":         round(fp.val, 2),
+                "_fp_above_poc":  fp.a_price_above_poc,
+                "_fp_above_vwap": fp.a_price_above_vwap,
+                "_fp_vwap_rising":fp.a_vwap_rising,
+                # Structure internals
+                "_fp_ema_stack":      fp.s_ema_stack,
+                "_fp_price_above_e20":fp.s_price_above_e20,
+                "_fp_ema200_rising":  fp.s_ema200_rising,
+                # Leadership internals
+                "FP_RS3m":        fp.rs_3m,
+                "FP_RS6m":        fp.rs_6m,
+                "FP_RelMomentum": fp.rel_momentum,
+                # Momentum internals
+                "_fp_cci_cross_up": fp.cci_cross_up,
+                "_fp_rsi_above_50": fp.rsi_above_50,
+                # Risk internals
+                "FP_DistEMA20Pct": fp.dist_from_ema20_pct,
+                "FP_DistVWAPPct":  fp.dist_from_vwap_pct,
+                "FP_ATRExtension":fp.atr_extension,
+            })
+    except Exception as _fp_exc:
+        import logging as _log
+        _log.warning(
+            "[pillar_engine] compute_pillars_from_ia() failed for symbol — "
+            "FP_* columns will be absent. Error: %s", _fp_exc, exc_info=True
+        )
+
     # ── Conviction Gap diagnostic field ──────────────────────────
     # ConvictionGap = CV1_Conviction - DE_Conviction
     # Positive  → CV1 sees more structural quality than DE (common in momentum runners
