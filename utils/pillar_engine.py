@@ -18,13 +18,13 @@ Five pillars
 5. Risk        — Distance from EMA20 / VWAP / ATR extension (lower = safer,
                  scored so LOWER risk gives a HIGHER score)
 
-Final Score = 0.30*Structure + 0.25*Acceptance + 0.20*Leadership
-            + 0.15*Momentum  + 0.10*Risk
+Final Score = 0.15*Structure + 0.30*Acceptance + 0.15*Leadership
+            + 0.30*Momentum  + 0.10*Risk
 
 Classification
 ───────────────
-  Execute     Score >= 80   Momentum confirmed
-  Watch       65 <= Score < 80   Structure intact, waiting for trigger
+  Execute     Score >= 90   Momentum confirmed
+  Watch       65 <= Score < 90   Structure intact, waiting for trigger
   Developing  50 <= Score < 65   Trend emerging
   Avoid       Score < 50
 """
@@ -427,7 +427,7 @@ def _score_risk(close: pd.Series, e20: pd.Series, vwap_last: float,
 # ══════════════════════════════════════════════════════════════════
 
 def _classify(final_score: int) -> tuple[str, str]:
-    if final_score >= 80:
+    if final_score >= 90:
         return CLASS_EXECUTE, _CLASS_STYLE[CLASS_EXECUTE][1]
     if final_score >= 65:
         return CLASS_WATCH, _CLASS_STYLE[CLASS_WATCH][1]
