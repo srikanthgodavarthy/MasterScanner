@@ -242,27 +242,27 @@ def _detail_breakdown(row: pd.Series) -> str:
         f'&nbsp;&nbsp;<span style="font-size:20px;font-weight:700;color:{final_color}">{final_disp}</span></div>'
     )
 
-    html += _row("1 · Structure", row.get("FP_Structure"), "30%", [
+    html += _row("1 · Structure", row.get("FP_Structure"), f"{W_STRUCTURE:.0%}", [
         f"EMA20 &gt; EMA50 &gt; EMA200: {'✅' if row.get('_fp_ema_stack') else '❌'}",
         f"Price above EMA20: {'✅' if row.get('_fp_price_above_e20') else '❌'}",
         f"EMA200 rising: {'✅' if row.get('_fp_ema200_rising') else '❌'}",
     ])
-    html += _row("2 · Acceptance", row.get("FP_Acceptance"), "25%", [
+    html += _row("2 · Acceptance", row.get("FP_Acceptance"), f"{W_ACCEPTANCE:.0%}", [
         f"POC {row.get('FP_POC','—')} · VAH {row.get('FP_VAH','—')} · VAL {row.get('FP_VAL','—')}",
         f"Price above POC: {'✅' if row.get('_fp_above_poc') else '❌'}",
         f"Price above rising VWAP: {'✅' if (row.get('_fp_above_vwap') and row.get('_fp_vwap_rising')) else '❌'} (VWAP {row.get('FP_VWAP','—')})",
     ])
-    html += _row("3 · Leadership", row.get("FP_Leadership"), "20%", [
+    html += _row("3 · Leadership", row.get("FP_Leadership"), f"{W_LEADERSHIP:.0%}", [
         f"3M RS vs NIFTY: {row.get('FP_RS3m','—')}%",
         f"6M RS vs NIFTY: {row.get('FP_RS6m','—')}%",
         f"Relative momentum: {row.get('FP_RelMomentum','—')}%",
     ])
-    html += _row("4 · Momentum", row.get("FP_Momentum"), "15%", [
+    html += _row("4 · Momentum", row.get("FP_Momentum"), f"{W_MOMENTUM:.0%}", [
         f"Stoch %K/%D: {row.get('FP_StochK','—')} / {row.get('FP_StochD','—')} · cross/re-ignition: {'✅' if row.get('_fp_stoch_cross_up') else '❌'}",
         f"RSI(14): {row.get('_fp_rsi_val','—')} · &gt; 50: {'✅' if row.get('_fp_rsi_above_50') else '❌'}",
         f"Fresh breakout — crossed up dynamic VWAP (last 3 bars): {'✅' if row.get('_fp_vwap_cross_up_fresh') else '❌'}",
     ])
-    html += _row("5 · Risk (lower risk = higher score)", row.get("FP_Risk"), "10%", [
+    html += _row("5 · Risk (lower risk = higher score)", row.get("FP_Risk"), f"{W_RISK:.0%}", [
         f"Distance from EMA20: {row.get('FP_DistEMA20Pct','—')}%",
         f"Distance from VWAP: {row.get('FP_DistVWAPPct','—')}%",
         f"ATR extension: {row.get('FP_ATRExtension','—')} ATRs",
