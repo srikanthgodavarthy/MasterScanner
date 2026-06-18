@@ -36,10 +36,10 @@ import numpy as np
 import pandas as pd
 
 # ── Weights (Final Ranking Engine) ─────────────────────────────────
-W_STRUCTURE  = 0.30
-W_ACCEPTANCE = 0.25
+W_STRUCTURE  = 0.15
+W_ACCEPTANCE = 0.30
 W_LEADERSHIP = 0.15
-W_MOMENTUM   = 0.20
+W_MOMENTUM   = 0.30
 W_RISK       = 0.10
 
 VOLUME_PROFILE_BARS = 60   # Fixed Range Volume Profile lookback (bars)
