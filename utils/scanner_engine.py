@@ -971,7 +971,7 @@ def _enrich_with_setup_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
     """
     try:
         from utils.supabase_client import (
-            load_active_setup_plans,
+            load_open_setup_plans,
             load_first_seen,
             upsert_setup_plans_batch,
             upsert_first_seen,
@@ -980,13 +980,20 @@ def _enrich_with_setup_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
         import logging as _log
         _logger = _log.getLogger(__name__)
 
-        # Load existing frozen plans + first-seen dates
-        existing_plans = load_active_setup_plans()  # {symbol: SetupPlan}
+        # Load existing OPEN plans (WAITING/ACTIVE/T1_HIT) + first-seen dates.
+        # WAITING plans must be included here too — otherwise a plan that
+        # hasn't triggered yet would never get re-evaluated against the
+        # next day's price and could sit stale forever.
+        existing_plans = load_open_setup_plans()    # {symbol: SetupPlan}
         first_seen_map = load_first_seen()           # {symbol: "YYYY-MM-DD"}
 
-        # Record first-seen for new entrants before enrichment
+        # Record first-seen for new entrants before enrichment.
+        # NOTE: reads "Recommendation" first, falling back to "Category" —
+        # matching what enrich_scanner_row() itself uses to decide whether
+        # to mint a plan. ("Category" alone is rarely populated on this
+        # dict; Recommendation is the field decision_engine.py actually sets.)
         new_symbols = [
-            (str(row.get("Stock", "")), str(row.get("Category", "")))
+            (str(row.get("Stock", "")), str(row.get("Recommendation", row.get("Category", ""))))
             for _, row in df_out.iterrows()
             if str(row.get("Stock", "")).upper() not in first_seen_map
         ]
@@ -997,12 +1004,15 @@ def _enrich_with_setup_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
             for sym, _ in new_symbols:
                 first_seen_map[sym.upper()] = today_str
 
-        # Count symbols qualifying for plan creation before enrichment
+        # Count symbols qualifying for plan creation before enrichment.
+        # This is diagnostic only — the actual creation decision is made
+        # inside enrich_scanner_row(), which is recommendation-aware ONLY
+        # at creation time and never again afterwards.
         from utils.setup_persistence import _FREEZE_CATEGORIES
         qualifying_symbols = [
             str(row.get("Stock", "")).upper()
             for _, row in df_out.iterrows()
-            if str(row.get("Category", "")) in _FREEZE_CATEGORIES
+            if str(row.get("Recommendation", row.get("Category", ""))) in _FREEZE_CATEGORIES
         ]
         _logger.info(
             "[SETUP PLAN SCAN] total_rows=%d  qualifying_symbols=%d  categories=%s",
@@ -1021,8 +1031,15 @@ def _enrich_with_setup_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
             price_col="Entry",
         )
 
-        # Persist changed plans back to Supabase
-        new_plans   = [p for p in updated_plans if p.status == "ACTIVE" and p.first_actionable_date == __import__('datetime').date.today().isoformat()]
+        # Persist changed plans back to Supabase.
+        # New plans are minted in status=WAITING (not ACTIVE — that now
+        # specifically means "entry triggered"), so a freshly-created
+        # plan is identified by WAITING + first_actionable_date == today.
+        _today_str = __import__("datetime").date.today().isoformat()
+        new_plans   = [
+            p for p in updated_plans
+            if p.status == "WAITING" and p.first_actionable_date == _today_str
+        ]
         other_plans = [p for p in updated_plans if p not in new_plans]
         _logger.info(
             "[SETUP PLAN PERSIST] updated_total=%d  new_inserts=%d  status_changes=%d",
@@ -1041,7 +1058,8 @@ def _enrich_with_setup_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
             "setup_persistence enrichment skipped: %s", exc
         )
         for col in ["SetupID", "FirstSeen", "FirstActionable", "DaysActive",
-                    "PlanStatus", "EntryLocked", "SLLocked", "T1Locked",
+                    "PlanStatus", "LockedRecommendation", "ActivatedAt", "T1HitAt", "ClosedAt",
+                    "EntryLocked", "SLLocked", "T1Locked",
                     "T2Locked", "T3Locked", "SetupAge", "TradePlanStatus",
                     "EntryDriftPct"]:
             if col not in df_out.columns:

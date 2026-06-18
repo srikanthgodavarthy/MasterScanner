@@ -557,11 +557,17 @@ def upsert_setup_plan(plan_dict: dict) -> bool:
     ``plan_dict`` should be the output of SetupPlan.to_db_dict().
 
     Uses upsert on setup_id (PRIMARY KEY), so:
-      - New plans are inserted.
-      - Status changes (ACTIVE → INVALIDATED / EXPIRED) are updated.
-      - Frozen trade levels are NEVER overwritten once set (the DB trigger
-        keeps updated_at current, but entry_locked / sl_locked etc. are
-        only written on INSERT).
+      - New plans are inserted (status=WAITING).
+      - Lifecycle transitions (WAITING → ACTIVE → T1_HIT → CLOSED/EXPIRED)
+        are updated. These transitions are driven ONLY by price/entry/
+        sl/target/age (see utils/setup_persistence.advance_lifecycle) —
+        never by Recommendation/Category, which the caller should not
+        even be passing in here.
+      - Frozen trade levels (entry_locked / sl_locked / etc.) and the
+        locked trade thesis (locked_recommendation / locked_leadership /
+        etc.) are part of the upsert payload but the *callers* of this
+        function never change them after creation — that immutability
+        is enforced in setup_persistence.py, not here.
 
     Returns True on success.
     """
@@ -621,13 +627,48 @@ def upsert_setup_plans_batch(plans: list[dict]) -> bool:
         return False
 
 
-def load_active_setup_plans() -> dict:
-    """
-    Return all ACTIVE setup plans as a dict: {symbol: SetupPlan}.
-    Called once at the start of each scanner run to seed the in-memory cache.
-    """
-    from utils.setup_persistence import SetupPlan, SetupPlanStatus
+def _setup_plan_from_row(row: dict) -> "object":
+    """Build a SetupPlan from a raw setup_plans row, normalizing any
+    pre-v9 status values (FORMING/INVALIDATED) onto the new vocabulary."""
+    from utils.setup_persistence import SetupPlan, _normalize_legacy_status
 
+    locked_rec = row.get("locked_recommendation") or row.get("locked_category") or ""
+    return SetupPlan(
+        setup_id               = row.get("setup_id",               ""),
+        symbol                 = row.get("symbol",                 ""),
+        first_seen_date        = str(row.get("first_seen_date",    "")),
+        first_actionable_date  = str(row.get("first_actionable_date", "")),
+        entry_locked            = float(row.get("entry_locked",     0) or 0),
+        sl_locked                = float(row.get("sl_locked",        0) or 0),
+        t1_locked                = float(row.get("t1_locked",        0) or 0),
+        t2_locked                = float(row.get("t2_locked",        0) or 0),
+        t3_locked                = float(row.get("t3_locked",        0) or 0),
+        locked_recommendation   = locked_rec,
+        locked_category          = locked_rec,
+        locked_rr                = float(row.get("locked_rr",        0) or 0),
+        locked_leadership        = int(row.get("locked_leadership",  0) or 0),
+        locked_conviction        = int(row.get("locked_conviction",  0) or 0),
+        locked_entry_quality     = int(row.get("locked_entry_quality",0) or 0),
+        locked_extension         = int(row.get("locked_extension",   0) or 0),
+        status                   = _normalize_legacy_status(row.get("status", "WAITING")),
+        status_reason            = row.get("status_reason") or row.get("invalidation_reason", "") or "",
+        created_at                = str(row.get("created_at", "") or ""),
+        activated_at              = str(row.get("activated_at", "") or ""),
+        t1_hit_at                  = str(row.get("t1_hit_at", "") or ""),
+        closed_at                 = str(row.get("closed_at", "") or ""),
+        invalidation_reason      = row.get("invalidation_reason",    "") or "",
+        invalidated_date          = str(row.get("invalidated_date",   "") or ""),
+    )
+
+
+def load_open_setup_plans() -> dict:
+    """
+    Return every OPEN setup plan (status IN WAITING/ACTIVE/T1_HIT) as a
+    dict: {symbol: SetupPlan}. Called once at the start of each scanner
+    run to seed the in-memory cache that advance_lifecycle() updates —
+    WAITING plans must be included here too, otherwise a plan sitting in
+    WAITING would never get re-evaluated against the next day's price.
+    """
     client = get_client()
     if client is None:
         return {}
@@ -636,39 +677,29 @@ def load_active_setup_plans() -> dict:
         resp = (
             client.table("setup_plans")
             .select("*")
-            .eq("status", "ACTIVE")
+            .in_("status", ["WAITING", "ACTIVE", "T1_HIT"])
             .execute()
         )
         if not resp.data:
             return {}
-
         result = {}
         for row in resp.data:
-            plan = SetupPlan(
-                setup_id               = row.get("setup_id",               ""),
-                symbol                 = row.get("symbol",                 ""),
-                first_seen_date        = str(row.get("first_seen_date",    "")),
-                first_actionable_date  = str(row.get("first_actionable_date", "")),
-                entry_locked           = float(row.get("entry_locked",     0) or 0),
-                sl_locked              = float(row.get("sl_locked",        0) or 0),
-                t1_locked              = float(row.get("t1_locked",        0) or 0),
-                t2_locked              = float(row.get("t2_locked",        0) or 0),
-                t3_locked              = float(row.get("t3_locked",        0) or 0),
-                locked_category        = row.get("locked_category",        ""),
-                locked_rr              = float(row.get("locked_rr",        0) or 0),
-                locked_leadership      = int(row.get("locked_leadership",  0) or 0),
-                locked_conviction      = int(row.get("locked_conviction",  0) or 0),
-                locked_entry_quality   = int(row.get("locked_entry_quality",0) or 0),
-                locked_extension       = int(row.get("locked_extension",   0) or 0),
-                status                 = row.get("status", SetupPlanStatus.ACTIVE),
-                invalidation_reason    = row.get("invalidation_reason",    ""),
-                invalidated_date       = str(row.get("invalidated_date",   "") or ""),
-            )
+            plan = _setup_plan_from_row(row)
             result[plan.symbol] = plan
         return result
     except Exception as exc:
-        logger.error("load_active_setup_plans failed: %s", exc)
+        logger.error("load_open_setup_plans failed: %s", exc)
         return {}
+
+
+def load_active_setup_plans() -> dict:
+    """
+    Deprecated name, kept for backward compatibility with existing call
+    sites (scanner_engine.py, pages/lifecycle.py). Despite the name,
+    this now returns every OPEN plan (WAITING/ACTIVE/T1_HIT), not just
+    status=='ACTIVE' ones — see load_open_setup_plans().
+    """
+    return load_open_setup_plans()
 
 
 def load_all_setup_plans(limit: int = 500) -> "pd.DataFrame":
@@ -701,8 +732,6 @@ def load_setup_plan(symbol: str) -> "Optional[object]":
     Return the most-recent setup plan for a single symbol (any status).
     Returns a SetupPlan dataclass or None.
     """
-    from utils.setup_persistence import SetupPlan, SetupPlanStatus
-
     client = get_client()
     if client is None:
         return None
@@ -718,31 +747,42 @@ def load_setup_plan(symbol: str) -> "Optional[object]":
         )
         if not resp.data:
             return None
-
-        row = resp.data[0]
-        return SetupPlan(
-            setup_id               = row.get("setup_id",               ""),
-            symbol                 = row.get("symbol",                 ""),
-            first_seen_date        = str(row.get("first_seen_date",    "")),
-            first_actionable_date  = str(row.get("first_actionable_date", "")),
-            entry_locked           = float(row.get("entry_locked",     0) or 0),
-            sl_locked              = float(row.get("sl_locked",        0) or 0),
-            t1_locked              = float(row.get("t1_locked",        0) or 0),
-            t2_locked              = float(row.get("t2_locked",        0) or 0),
-            t3_locked              = float(row.get("t3_locked",        0) or 0),
-            locked_category        = row.get("locked_category",        ""),
-            locked_rr              = float(row.get("locked_rr",        0) or 0),
-            locked_leadership      = int(row.get("locked_leadership",  0) or 0),
-            locked_conviction      = int(row.get("locked_conviction",  0) or 0),
-            locked_entry_quality   = int(row.get("locked_entry_quality",0) or 0),
-            locked_extension       = int(row.get("locked_extension",   0) or 0),
-            status                 = row.get("status", SetupPlanStatus.ACTIVE),
-            invalidation_reason    = row.get("invalidation_reason",    ""),
-            invalidated_date       = str(row.get("invalidated_date",   "") or ""),
-        )
+        return _setup_plan_from_row(resp.data[0])
     except Exception as exc:
         logger.error("load_setup_plan failed for %s: %s", symbol, exc)
         return None
+
+
+def close_setup_plan_manually(setup_id: str, reason: str = "Manual exit") -> bool:
+    """
+    Persist a manual trade exit from the 'Active Plans' dashboard.
+    Loads the plan, applies the same close_plan_manually() transition
+    used by the lifecycle engine (ACTIVE/T1_HIT → CLOSED only), and
+    writes it back. Returns False if the plan isn't open or isn't found.
+    """
+    from utils.setup_persistence import close_plan_manually
+
+    client = get_client()
+    if client is None or not setup_id:
+        return False
+
+    try:
+        resp = (
+            client.table("setup_plans")
+            .select("*")
+            .eq("setup_id", setup_id)
+            .limit(1)
+            .execute()
+        )
+        if not resp.data:
+            return False
+        plan = _setup_plan_from_row(resp.data[0])
+        if not close_plan_manually(plan, reason=reason):
+            return False
+        return upsert_setup_plan(plan.to_db_dict())
+    except Exception as exc:
+        logger.error("close_setup_plan_manually failed for %s: %s", setup_id, exc)
+        return False
 
 
 def load_watchlist_enriched(lc_df: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -879,31 +919,76 @@ CREATE INDEX IF NOT EXISTS idx_lifecycle_transitions_to_date ON lifecycle_transi
 
 # Append setup_plans SQL to the canonical SCHEMA_SQL for easy copy-paste
 SCHEMA_SQL += """
--- 7. Setup Plans — frozen trade levels (entry/SL/targets locked on first Actionable)
+-- 7. Setup Plans — frozen trade levels (entry/SL/targets locked once a plan
+--    is minted). Lifecycle (status) is owned entirely by this table and is
+--    driven only by price/entry/sl/target/age — never by Recommendation/
+--    Category, which can only ever CREATE a row here, never modify one.
 --    Run this in Supabase SQL Editor after the tables above.
 CREATE TABLE IF NOT EXISTS setup_plans (
     setup_id               text        PRIMARY KEY,
     symbol                 text        NOT NULL,
     first_seen_date        date        NOT NULL,
     first_actionable_date  date        NOT NULL,
-    entry_locked           numeric(12,2) NOT NULL DEFAULT 0,
-    sl_locked              numeric(12,2) NOT NULL DEFAULT 0,
-    t1_locked              numeric(12,2) NOT NULL DEFAULT 0,
-    t2_locked              numeric(12,2) NOT NULL DEFAULT 0,
-    t3_locked              numeric(12,2) NOT NULL DEFAULT 0,
-    locked_category        text        NOT NULL DEFAULT '',
-    locked_rr              numeric(8,4) NOT NULL DEFAULT 0,
-    locked_leadership      integer     NOT NULL DEFAULT 0,
-    locked_conviction      integer     NOT NULL DEFAULT 0,
-    locked_entry_quality   integer     NOT NULL DEFAULT 0,
-    locked_extension       integer     NOT NULL DEFAULT 0,
-    status                 text        NOT NULL DEFAULT 'ACTIVE',
-    invalidation_reason    text        NOT NULL DEFAULT '',
-    invalidated_date       date,
-    created_at             timestamptz NOT NULL DEFAULT now(),
-    updated_at             timestamptz NOT NULL DEFAULT now()
+
+    -- Frozen trade levels (set once, never recalculated)
+    entry_locked            numeric(12,2) NOT NULL DEFAULT 0,
+    sl_locked                numeric(12,2) NOT NULL DEFAULT 0,
+    t1_locked                numeric(12,2) NOT NULL DEFAULT 0,
+    t2_locked                numeric(12,2) NOT NULL DEFAULT 0,
+    t3_locked                numeric(12,2) NOT NULL DEFAULT 0,
+
+    -- Locked trade thesis (audit trail — set once, never overwritten)
+    locked_recommendation   text        NOT NULL DEFAULT '',
+    locked_category          text        NOT NULL DEFAULT '',   -- deprecated alias
+    locked_rr                numeric(8,4) NOT NULL DEFAULT 0,
+    locked_leadership        integer     NOT NULL DEFAULT 0,
+    locked_conviction        integer     NOT NULL DEFAULT 0,
+    locked_entry_quality     integer     NOT NULL DEFAULT 0,
+    locked_extension         integer     NOT NULL DEFAULT 0,
+
+    -- Lifecycle — WAITING / ACTIVE / T1_HIT / CLOSED / EXPIRED
+    status                   text        NOT NULL DEFAULT 'WAITING',
+    status_reason            text        NOT NULL DEFAULT '',
+    created_at                timestamptz NOT NULL DEFAULT now(),
+    activated_at               timestamptz,
+    t1_hit_at                   timestamptz,
+    closed_at                  timestamptz,
+
+    -- Deprecated aliases, kept for backward-compatible reads
+    invalidation_reason      text        NOT NULL DEFAULT '',
+    invalidated_date           date,
+
+    updated_at                timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_setup_plans_symbol ON setup_plans(symbol);
 CREATE INDEX IF NOT EXISTS idx_setup_plans_status ON setup_plans(status);
 CREATE INDEX IF NOT EXISTS idx_setup_plans_date   ON setup_plans(first_actionable_date DESC);
+"""
+
+
+# ── MIGRATION for an EXISTING setup_plans table created before this v9
+#    lifecycle-separation change. Idempotent — safe to run multiple times.
+#    Run this INSTEAD of the CREATE TABLE above if setup_plans already
+#    exists in your Supabase project. ──────────────────────────────────
+SETUP_PLANS_MIGRATION_SQL = """
+ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS locked_recommendation text NOT NULL DEFAULT '';
+ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS status_reason         text NOT NULL DEFAULT '';
+ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS activated_at          timestamptz;
+ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS t1_hit_at             timestamptz;
+ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS closed_at             timestamptz;
+
+-- Backfill locked_recommendation from the legacy locked_category column.
+UPDATE setup_plans SET locked_recommendation = locked_category
+  WHERE locked_recommendation = '' AND locked_category IS NOT NULL;
+
+-- Backfill status_reason from the legacy invalidation_reason column.
+UPDATE setup_plans SET status_reason = invalidation_reason
+  WHERE status_reason = '' AND invalidation_reason IS NOT NULL;
+
+-- Re-map the old INVALIDATED status onto the new CLOSED status.
+-- (Old ACTIVE / EXPIRED keep their names; FORMING was never persisted —
+-- it meant "no row exists" — so there is nothing to remap for it.)
+UPDATE setup_plans SET status = 'CLOSED' WHERE status = 'INVALIDATED';
+UPDATE setup_plans SET closed_at = invalidated_date::timestamptz
+  WHERE closed_at IS NULL AND invalidated_date IS NOT NULL;
 """
