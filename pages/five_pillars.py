@@ -118,7 +118,7 @@ def _is_valid_num(v) -> bool:
 
 
 def _pillar_color(score: float) -> str:
-    if score >= 80: return "#3fb950"
+    if score >= 90: return "#3fb950"
     if score >= 65: return "#4ade80"
     if score >= 50: return "#d29922"
     return "#f85149"
