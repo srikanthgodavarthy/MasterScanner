@@ -240,31 +240,33 @@ def _freshness_badge_lc(setup_age_str: str) -> str:
 
 def _trade_status_badge_lc(status_str: str) -> str:
     s = str(status_str or "").strip()
-    if not s or "Forming" in s or s == "—":
+    if not s or "No plan" in s or "Forming" in s or s == "—":
         return '<span style="color:var(--muted);font-size:9px">Not yet minted</span>'
-    if "Invalidated" in s or "invalidated" in s:
-        css, label = "ts-invalidated", "Invalidated"
-    elif "Expired" in s or "expired" in s:
+    if s.startswith("⚪ Closed") or s.startswith("Closed"):
+        css, label = "ts-invalidated", "Closed"
+    elif s.startswith("🔴 Expired") or s.startswith("Expired"):
         css, label = "ts-expired", "Expired"
-    elif "T2" in s:
-        css, label = "ts-t2", "T2 Achieved"
-    elif "T1" in s:
-        css, label = "ts-t1", "T1 Achieved"
+    elif s.startswith("🎯 T1 Hit") or s.startswith("T1 Hit"):
+        css, label = "ts-t1", "T1 Hit"
+    elif s.startswith("✅ Active") or s.startswith("Active"):
+        css, label = "ts-triggered", "Active"
+    elif s.startswith("⏳ Waiting") or s.startswith("Waiting"):
+        css, label = "ts-waiting", "Waiting for Entry"
+    elif "Invalidated" in s or "invalidated" in s:
+        css, label = "ts-invalidated", "Closed"
     elif "triggered" in s.lower():
-        css, label = "ts-triggered", "Entry Triggered"
+        css, label = "ts-triggered", "Active"
     elif "Late" in s or "Aging" in s:
         css, label = "ts-t1", "Active · Late"
-    elif "Active" in s:
-        css, label = "ts-waiting", "Waiting for Breakout"
     else:
         css, label = "ts-waiting", s[:24]
     return f'<span class="trade-status-badge {css}">{label}</span>'
 
 
 def _locked_plan_html(entry, sl, t1, t2, t3, plan_status: str = "") -> str:
-    is_active  = str(plan_status).upper() == "ACTIVE"
-    lock_icon  = "🔒" if is_active else "🔓"
-    status_note= f' · {plan_status.lower()}' if plan_status else ""
+    is_open    = str(plan_status).upper() in ("WAITING", "ACTIVE", "T1_HIT")
+    lock_icon  = "🔒" if is_open else "🔓"
+    status_note= f' · {plan_status.lower().replace("_"," ")}' if plan_status else ""
     def _lv(label, val, color):
         try:
             v = float(val); txt = f"₹{v:,.0f}" if v > 0 else "—"
@@ -288,29 +290,40 @@ def _locked_plan_html(entry, sl, t1, t2, t3, plan_status: str = "") -> str:
 
 def _lifecycle_timeline_html(plan_row: dict | None, history_df=None) -> str:
     nodes = [
-        ("Created",   "🌱", "#58a6ff"),
-        ("Triggered", "⚡", "#3fb950"),
-        ("T1",        "🎯", "#a371f7"),
-        ("T2",        "🏆", "#f5c542"),
-        ("Expired",   "⏳", "#8b949e"),
+        ("Created", "🌱", "#58a6ff"),
+        ("Active",  "⚡", "#3fb950"),
+        ("T1 Hit",  "🎯", "#a371f7"),
+        ("Closed",  "🏁", "#f5c542"),
     ]
     timestamps = {}
     done_set   = set()
+    final_label, final_icon, final_color = "Closed", "🏁", "#f5c542"
 
     if plan_row:
         fa = plan_row.get("first_actionable_date") or plan_row.get("FirstActionable", "")
         if fa:
             timestamps["Created"] = str(fa)[:10]
             done_set.add("Created")
-        inv = plan_row.get("invalidated_date") or plan_row.get("InvalidatedDate", "")
+        act = plan_row.get("activated_at") or plan_row.get("ActivatedAt", "")
+        t1  = plan_row.get("t1_hit_at")    or plan_row.get("T1HitAt", "")
+        cl  = plan_row.get("closed_at")    or plan_row.get("ClosedAt", "")
         status = str(plan_row.get("status") or plan_row.get("PlanStatus", "")).upper()
-        if status in ("EXPIRED", "INVALIDATED") and inv:
-            timestamps["Expired"] = str(inv)[:10]
-            done_set.add("Expired")
-        tps = str(plan_row.get("trade_plan_status") or plan_row.get("TradePlanStatus", ""))
-        if "T2" in tps: done_set |= {"Triggered", "T1", "T2"}
-        elif "T1" in tps: done_set |= {"Triggered", "T1"}
-        elif "triggered" in tps.lower(): done_set.add("Triggered")
+
+        if act:
+            timestamps["Active"] = str(act)[:10]
+        if t1:
+            timestamps["T1 Hit"] = str(t1)[:10]
+        if status in ("ACTIVE", "T1_HIT", "CLOSED"):
+            done_set.add("Active")
+        if status in ("T1_HIT", "CLOSED") and t1:
+            done_set.add("T1 Hit")
+        if status == "EXPIRED":
+            final_label, final_icon, final_color = "Expired", "⏳", "#8b949e"
+            done_set.add("Closed")
+            timestamps["Closed"] = str(cl)[:10] if cl else timestamps.get("Closed", "")
+        elif status in ("CLOSED", "INVALIDATED"):
+            done_set.add("Closed")
+            timestamps["Closed"] = str(cl)[:10] if cl else timestamps.get("Closed", "")
 
     # Enrich timestamps from history if available
     if history_df is not None and not history_df.empty and "scan_date" in history_df.columns:
@@ -324,17 +337,20 @@ def _lifecycle_timeline_html(plan_row: dict | None, history_df=None) -> str:
     html = (
         '<div class="lifecycle-panel">'
         '<div style="font-size:10px;font-weight:700;color:var(--muted);letter-spacing:0.1em;'
-        'text-transform:uppercase;margin-bottom:10px">Setup Lifecycle</div>'
+        'text-transform:uppercase;margin-bottom:10px">Trade Lifecycle</div>'
         '<div class="lc-timeline">'
     )
     for i, (name, icon, color) in enumerate(nodes):
+        disp_name  = final_label if name == "Closed" else name
+        disp_icon  = final_icon  if name == "Closed" else icon
+        disp_color = final_color if name == "Closed" else color
         done_cls = "done" if name in done_set else "pending"
-        bg_color = color if name in done_set else "transparent"
+        bg_color = disp_color if name in done_set else "transparent"
         html += (
             f'<div class="lc-node {done_cls}">'
-            f'<div class="lc-node-circle" style="background:{bg_color};border-color:{color};'
-            f'color:{"#0d1117" if name in done_set else color}">{icon}</div>'
-            f'<div class="lc-node-label" style="color:{color}">{name}</div>'
+            f'<div class="lc-node-circle" style="background:{bg_color};border-color:{disp_color};'
+            f'color:{"#0d1117" if name in done_set else disp_color}">{disp_icon}</div>'
+            f'<div class="lc-node-label" style="color:{disp_color}">{disp_name}</div>'
             f'<div class="lc-node-date">{timestamps.get(name, "")}</div>'
             f'</div>'
         )
@@ -455,7 +471,7 @@ def render():
     #  PAGE HEADER
     # ══════════════════════════════════════════════════════════════════
     
-    # ── Active setup plan count for header badge ──────────────────────
+    # ── Open setup plan count for header badge (Waiting/Active/T1 Hit) ──
     _active_plan_count = 0
     if _is_available():
         try:
@@ -466,7 +482,7 @@ def render():
     _plan_badge = (
         f'<span style="background:#3fb950;color:#0d1117;border-radius:4px;'
         f'padding:2px 8px;font-size:11px;font-weight:700;margin-left:10px;">'
-        f'🔒 {_active_plan_count} Active Plan{"s" if _active_plan_count != 1 else ""}</span>'
+        f'🔒 {_active_plan_count} Open Plan{"s" if _active_plan_count != 1 else ""}</span>'
         if _active_plan_count > 0
         else '<span style="color:#8b949e;font-size:11px;margin-left:10px;">No active plans</span>'
     )
@@ -1035,8 +1051,10 @@ def render():
         if _fp_df.empty:
             _sess = st.session_state.get("last_scan_df")
             if _sess is not None and not _sess.empty and "SetupID" in _sess.columns:
-                _active_mask = _sess["PlanStatus"].astype(str).str.upper() == "ACTIVE"
-                _sub = _sess[_active_mask].copy()
+                # Any row with a real SetupID has a frozen plan, regardless
+                # of which lifecycle state it's currently in.
+                _has_plan_mask = _sess["SetupID"].astype(str).str.strip().ne("")
+                _sub = _sess[_has_plan_mask].copy()
                 if not _sub.empty:
                     _fp_df = _sub.rename(columns={
                         "Stock":          "symbol",
@@ -1047,20 +1065,29 @@ def render():
                         "PlanStatus":     "status",
                         "TradePlanStatus":"trade_plan_status",
                         "EntryDriftPct":  "entry_drift_pct",
+                        "LockedRecommendation": "locked_recommendation",
                     })
 
         # ── Summary badges ────────────────────────────────────────────
         if not _fp_df.empty:
+            _status_series = _fp_df.get("status", pd.Series(dtype=str)).astype(str).str.upper()
             _total   = len(_fp_df)
-            _active  = int((_fp_df.get("status", pd.Series(dtype=str)).astype(str).str.upper() == "ACTIVE").sum())
-            _expired = int((_fp_df.get("status", pd.Series(dtype=str)).astype(str).str.upper() == "EXPIRED").sum())
-            _invalid = int((_fp_df.get("status", pd.Series(dtype=str)).astype(str).str.upper() == "INVALIDATED").sum())
+            _waiting = int((_status_series == "WAITING").sum())
+            _active  = int((_status_series == "ACTIVE").sum())
+            _t1hit   = int((_status_series == "T1_HIT").sum())
+            _expired = int((_status_series == "EXPIRED").sum())
+            # "CLOSED" is the current name; "INVALIDATED" is kept here too
+            # so plans written by a pre-lifecycle-separation version of
+            # this app still show up correctly in this audit view.
+            _closed  = int(_status_series.isin(["CLOSED", "INVALIDATED"]).sum())
 
-            _c1, _c2, _c3, _c4 = st.columns(4)
+            _c1, _c2, _c3, _c4, _c5, _c6 = st.columns(6)
             _c1.metric("Total Plans", _total)
-            _c2.metric("🟢 Active",   _active)
-            _c3.metric("🟡 Expired",  _expired)
-            _c4.metric("🔴 Invalidated", _invalid)
+            _c2.metric("⏳ Waiting",  _waiting)
+            _c3.metric("🟢 Active",   _active)
+            _c4.metric("🎯 T1 Hit",   _t1hit)
+            _c5.metric("🔴 Expired",  _expired)
+            _c6.metric("⚪ Closed",   _closed)
 
             # ── Filter controls ───────────────────────────────────────
             _status_opts = ["ALL"] + sorted(
@@ -1081,6 +1108,9 @@ def render():
                 "trade_plan_status": "Trade Plan Status",
                 "entry_drift_pct":   "Entry Drift %",
                 "first_actionable_date": "First Actionable",
+                "activated_at":      "Activated At",
+                "closed_at":         "Closed At",
+                "locked_recommendation": "Locked Recommendation",
                 "locked_category":   "Locked Category",
             }
 
@@ -1090,9 +1120,11 @@ def render():
             # Colour-code status column
             def _colour_status(val):
                 v = str(val).upper()
+                if v == "WAITING":     return "background-color:#1a2a3a;color:#58a6ff"
                 if v == "ACTIVE":      return "background-color:#1a3a1a;color:#3fb950"
+                if v == "T1_HIT":      return "background-color:#2a1a3a;color:#a371f7"
                 if v == "EXPIRED":     return "background-color:#2a2a1a;color:#f5c542"
-                if v == "INVALIDATED": return "background-color:#3a1a1a;color:#f85149"
+                if v in ("CLOSED", "INVALIDATED"): return "background-color:#3a1a1a;color:#f85149"
                 return ""
 
             if "Plan Status" in _show_df.columns:

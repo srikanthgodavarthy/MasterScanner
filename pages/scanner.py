@@ -75,6 +75,29 @@ _CAT_STYLE = {
     "Avoid":             ("#484f58", "Avoid"),
 }
 
+# The "Recommendation" column on scanner rows holds the long-form category
+# text above ("Elite Opportunity", "Actionable", ...), NOT the short
+# ELITE/EXECUTE/WATCH/SKIP tokens used for Signal Class styling. Anywhere
+# that needs to bucket by signal class (e.g. the Qualification Summary
+# panel) must go through this normalization first — comparing the raw
+# Recommendation text directly against "ELITE"/"EXECUTE"/etc. never matches.
+_CATEGORY_TO_SC = {
+    "Elite Opportunity": "ELITE",
+    "High Conviction":   "EXECUTE",
+    "Actionable":        "EXECUTE",
+    "Setup Building":    "WATCH",
+    "Leader":            "WATCH",
+    "Extended":          "SKIP",
+    "Avoid":             "SKIP",
+}
+
+
+def _normalize_signal_class(series: pd.Series) -> pd.Series:
+    """Map a Recommendation/Category column onto ELITE/EXECUTE/WATCH/SKIP.
+    Already-normalized values (e.g. a real CV1_SignalClass column) pass
+    through unchanged since they're not keys in _CATEGORY_TO_SC."""
+    return series.astype(str).map(lambda v: _CATEGORY_TO_SC.get(v, v))
+
 # ── TOOLTIP DEFINITIONS ───────────────────────────────────────────
 # Each entry: (short label, multi-line description shown on hover)
 _COL_TOOLTIPS = {
@@ -505,6 +528,15 @@ _CSS = """
 .ts-t2           { background: rgba(245,197,66,0.15); border:1px solid rgba(245,197,66,0.4);  color:#f5c542; }
 .ts-expired      { background: rgba(139,148,158,0.1); border:1px solid rgba(139,148,158,0.3); color:#8b949e; }
 .ts-invalidated  { background: rgba(248,81,73,0.12);  border:1px solid rgba(248,81,73,0.35);  color:#f85149; }
+
+/* ── Active Plans tab table ── */
+.ap-table { width:100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+.ap-table th {
+  text-align:left; padding:6px 8px; font-size:9px; font-weight:700; color:var(--muted);
+  letter-spacing:0.06em; text-transform:uppercase; border-bottom:1px solid var(--border);
+}
+.ap-table td { padding:6px 8px; border-bottom:1px solid var(--border); }
+.ap-table tr:hover { background: rgba(255,255,255,0.02); }
 
 /* ── Setup Lifecycle Timeline Panel ── */
 .lifecycle-panel {
@@ -1311,16 +1343,23 @@ def _qualification_summary_html(df: pd.DataFrame, settings: dict) -> str:
     """
     Render a compact 'Qualification Summary' panel showing:
       • Actionable Stocks  — stocks in Execute/Elite signal classes
-      • Qualified Plans    — actionable stocks that ALSO have an ACTIVE locked plan
+      • Qualified Plans    — actionable stocks that ALSO have an OPEN
+                              lifecycle plan (Waiting / Active / T1 Hit)
       • Rejected           — stocks downgraded by R:R gate (symbol + reason)
     """
     if df.empty:
         return ""
 
     # ── Actionable count (ELITE + EXECUTE signal classes) ─────────
+    # NOTE: "Recommendation" holds long-form category text ("Elite
+    # Opportunity", "Actionable", ...) — it must be normalized via
+    # _CATEGORY_TO_SC before comparing to ELITE/EXECUTE/WATCH/SKIP
+    # tokens. Comparing the raw text directly (the previous behaviour)
+    # silently produced zero matches forever.
     sc_col = "Recommendation"
     if sc_col in df.columns:
-        actionable_df = df[df[sc_col].isin(["ELITE", "EXECUTE"])]
+        sc_norm = _normalize_signal_class(df[sc_col])
+        actionable_df = df[sc_norm.isin(["ELITE", "EXECUTE"])]
     else:
         # Fallback: Category-based
         cat_col = "Category"
@@ -1333,10 +1372,14 @@ def _qualification_summary_html(df: pd.DataFrame, settings: dict) -> str:
 
     n_actionable = len(actionable_df)
 
-    # ── Qualified Plans count (actionable + ACTIVE plan) ──────────
+    # ── Qualified Plans count (actionable + an OPEN lifecycle plan) ──
+    # An open plan is WAITING / ACTIVE / T1_HIT — not just ACTIVE. A
+    # plan that hasn't triggered yet is still a "qualified plan", just
+    # not yet a live position.
     if not actionable_df.empty and "PlanStatus" in actionable_df.columns:
         n_plans = int(
-            (actionable_df["PlanStatus"].astype(str).str.upper() == "ACTIVE").sum()
+            actionable_df["PlanStatus"].astype(str).str.upper()
+            .isin(["WAITING", "ACTIVE", "T1_HIT"]).sum()
         )
     else:
         n_plans = 0
@@ -1389,14 +1432,15 @@ def _qualification_summary_html(df: pd.DataFrame, settings: dict) -> str:
     skip_html  = ""
     leader_html = ""
     if sc_col in df.columns:
-        watch_n  = int((df[sc_col] == "WATCH").sum())
-        skip_n   = int((df[sc_col] == "SKIP").sum())
+        sc_norm  = _normalize_signal_class(df[sc_col])
+        watch_n  = int((sc_norm == "WATCH").sum())
+        skip_n   = int((sc_norm == "SKIP").sum())
         # Leader stocks (Category == "Leader", may be in WATCH or SKIP)
         rec_col = "Recommendation" if "Recommendation" in df.columns else "Category"
         leader_stocks = df[df[rec_col] == "Leader"].copy() if rec_col in df.columns else pd.DataFrame()
 
         # ── SKIP grouped by primary blocker ─────────────────────
-        skip_stocks = df[df[sc_col] == "SKIP"].copy()
+        skip_stocks = df[sc_norm == "SKIP"].copy()
         if not skip_stocks.empty:
             # Bucket each stock by its worst gate failure
             def _bucket(row):
@@ -1491,7 +1535,7 @@ def _qualification_summary_html(df: pd.DataFrame, settings: dict) -> str:
 
         # ── WATCH stocks (Setup Building) ────────────────────────
         if watch_n > 0:
-            watch_stocks = df[df[sc_col] == "WATCH"]
+            watch_stocks = df[sc_norm == "WATCH"]
             watch_items = "".join(
                 (
                     '<span style="background:rgba(210,153,34,0.1);border:1px solid rgba(210,153,34,0.3);' 
@@ -1726,17 +1770,19 @@ def _freshness_badge(setup_age_str: str) -> str:
     if not s or s in ("—", "nan", "None", ""):
         # Show a muted chip instead of blank — makes it obvious the column exists
         return '<span style="color:var(--muted);font-size:9px;background:rgba(139,148,158,0.08);border:1px solid rgba(139,148,158,0.18);border-radius:4px;padding:1px 6px" title="No active plan — requires Supabase">No plan</span>'
-    if "Fresh" in s:
+    if "🔴" in s or "Expired" in s or "Invalidated" in s:
+        css = "freshness-expired"
+    elif "T1 Hit" in s:
+        css = "freshness-mature"      # target reached — treat like "mature/won"
+    elif "⚪" in s or "Closed" in s:
+        css = "freshness-mature"
+    elif "Active" in s or "Fresh" in s:
         css = "freshness-fresh"
     elif "Mature" in s or "Late" in s:
-        # distinguish by emoji prefix used in setup_persistence._format_setup_age
-        if "🔴" in s or "Expired" in s or "Invalidated" in s:
-            css = "freshness-expired"
-        else:
-            css = "freshness-mature"
+        css = "freshness-mature"
     elif "Aging" in s:
         css = "freshness-late"
-    elif "Expired" in s or "Invalidated" in s or "✗" in s:
+    elif "✗" in s:
         css = "freshness-expired"
     else:
         css = "freshness-mature"
@@ -1744,24 +1790,39 @@ def _freshness_badge(setup_age_str: str) -> str:
 
 
 def _trade_status_badge(status_str: str) -> str:
-    """Render trade plan status as a small coloured badge."""
+    """
+    Render trade plan status as a small coloured badge.
+
+    Matches the exact label prefixes setup_persistence._trade_plan_label()
+    emits for each lifecycle state (WAITING/ACTIVE/T1_HIT/CLOSED/EXPIRED/
+    NO_PLAN), then falls back to legacy fuzzy text matching so badges
+    rendered from an older cached scan (pre-lifecycle-separation) don't
+    break.
+    """
     s = str(status_str or "").strip()
-    if not s or s in ("—", "nan", "None", "") or "Forming" in s:
-        return '<span style="color:var(--muted);font-size:9px;background:rgba(139,148,158,0.08);border:1px solid rgba(139,148,158,0.18);border-radius:4px;padding:1px 6px" title="No active plan — requires Supabase">No plan</span>'
-    if "Invalidated" in s or "invalidated" in s:
-        css, label = "ts-invalidated", "Invalidated"
-    elif "Expired" in s or "expired" in s:
+    if not s or s in ("—", "nan", "None", "") or "No plan" in s or "Forming" in s:
+        return '<span style="color:var(--muted);font-size:9px;background:rgba(139,148,158,0.08);border:1px solid rgba(139,148,158,0.18);border-radius:4px;padding:1px 6px" title="No plan minted yet">No plan</span>'
+
+    # ── New vocabulary (exact prefixes we control) ────────────────
+    if s.startswith("⚪ Closed") or s.startswith("Closed"):
+        css, label = "ts-invalidated", "Closed"
+    elif s.startswith("🔴 Expired") or s.startswith("Expired"):
         css, label = "ts-expired", "Expired"
+    elif s.startswith("🎯 T1 Hit") or s.startswith("T1 Hit"):
+        css, label = "ts-t1", "T1 Hit"
+    elif s.startswith("✅ Active") or s.startswith("Active"):
+        css, label = "ts-triggered", "Active"
+    elif s.startswith("⏳ Waiting") or s.startswith("Waiting"):
+        css, label = "ts-waiting", "Waiting"
+    # ── Legacy fuzzy fallback (pre-v9 cached labels) ───────────────
+    elif "Invalidated" in s or "invalidated" in s:
+        css, label = "ts-invalidated", "Closed"
     elif "T2" in s:
-        css, label = "ts-t2", "T2 Achieved"
-    elif "T1" in s:
-        css, label = "ts-t1", "T1 Achieved"
-    elif "triggered" in s.lower() or "Triggered" in s:
-        css, label = "ts-triggered", "Triggered"
+        css, label = "ts-t1", "T1 Hit"
+    elif "triggered" in s.lower():
+        css, label = "ts-triggered", "Active"
     elif "Late" in s or "Aging" in s:
         css, label = "ts-t1", "Active · Late"
-    elif "Active" in s:
-        css, label = "ts-waiting", "Waiting"
     else:
         css, label = "ts-waiting", s[:20]
     return f'<span class="trade-status-badge {css}">{label}</span>'
@@ -1795,9 +1856,9 @@ def _locked_plan_panel(row) -> str:
         )
 
     plan_status = str(row.get("PlanStatus", "")).upper()
-    is_active   = plan_status == "ACTIVE"
-    lock_icon   = "🔒" if is_active else "🔓"
-    status_note = f'<span style="font-size:10px;color:var(--muted)"> · plan {plan_status.lower() if plan_status else "not yet minted"}</span>'
+    is_open     = plan_status in ("WAITING", "ACTIVE", "T1_HIT")
+    lock_icon   = "🔒" if is_open else "🔓"
+    status_note = f'<span style="font-size:10px;color:var(--muted)"> · plan {plan_status.lower().replace("_"," ") if plan_status and plan_status != "NO_PLAN" else "not yet minted"}</span>'
 
     return (
         f'<div style="margin:10px 0 0;">'
@@ -1816,60 +1877,70 @@ def _locked_plan_panel(row) -> str:
 
 def _lifecycle_timeline_panel(history_df=None, plan_row=None) -> str:
     """
-    Render Created → Triggered → T1 → T2 → Expired timeline.
-    Uses lifecycle history rows (scan_date, category) or plan metadata.
+    Render Created → Active → T1 Hit → Closed/Expired timeline.
+
+    Uses the explicit ActivatedAt / T1HitAt / ClosedAt timestamps and the
+    PlanStatus field that enrich_scanner_row() attaches — no more fuzzy
+    text-parsing of the human-readable status label.
     """
     nodes = [
-        ("Created",   "🌱", "#58a6ff"),
-        ("Triggered", "⚡", "#3fb950"),
-        ("T1",        "🎯", "#a371f7"),
-        ("T2",        "🏆", "#f5c542"),
-        ("Expired",   "⏳", "#8b949e"),
+        ("Created",  "🌱", "#58a6ff"),
+        ("Active",   "⚡", "#3fb950"),
+        ("T1 Hit",   "🎯", "#a371f7"),
+        ("Closed",   "🏁", "#f5c542"),
     ]
 
-    # Derive timestamps from plan_row fields if available
-    timestamps = {}
-    if plan_row is not None:
-        fa = plan_row.get("FirstActionable", "") or plan_row.get("first_actionable_date", "")
-        if fa:
-            timestamps["Created"] = str(fa)[:10]
-        inv = plan_row.get("invalidated_date", "") or plan_row.get("InvalidatedDate", "")
-        status = str(plan_row.get("PlanStatus", "")).upper()
-        if status == "EXPIRED" and inv:
-            timestamps["Expired"] = str(inv)[:10]
-        elif status == "INVALIDATED" and inv:
-            timestamps["Expired"] = str(inv)[:10]  # reuse slot
+    plan_row = plan_row or {}
+    status = str(plan_row.get("PlanStatus", "")).upper()
 
-    # Determine which nodes are "done"
-    current_status = str(plan_row.get("PlanStatus", "") if plan_row is not None else "").upper()
-    done_set = {"Created"} if timestamps.get("Created") else set()
-    if current_status in ("ACTIVE",):
+    fa  = plan_row.get("FirstActionable", "") or plan_row.get("first_actionable_date", "")
+    act = plan_row.get("ActivatedAt", "")     or plan_row.get("activated_at", "")
+    t1  = plan_row.get("T1HitAt", "")          or plan_row.get("t1_hit_at", "")
+    cl  = plan_row.get("ClosedAt", "")          or plan_row.get("closed_at", "")
+    # EXPIRED has no closed_at-style timestamp distinct from the generic
+    # one — same field is reused, just labelled with the right node.
+    is_expired = status == "EXPIRED"
+
+    timestamps = {}
+    if fa:  timestamps["Created"] = str(fa)[:10]
+    if act: timestamps["Active"]  = str(act)[:10]
+    if t1:  timestamps["T1 Hit"]  = str(t1)[:10]
+    if cl:  timestamps["Closed"]  = str(cl)[:10]
+
+    done_set = set()
+    if status not in ("", "NO_PLAN"):
         done_set.add("Created")
-        tps = str(plan_row.get("TradePlanStatus", "") if plan_row is not None else "")
-        if "triggered" in tps.lower() or "T1" in tps or "T2" in tps:
-            done_set.add("Triggered")
-        if "T1" in tps or "T2" in tps:
-            done_set.add("T1")
-        if "T2" in tps:
-            done_set.add("T2")
-    elif current_status in ("EXPIRED", "INVALIDATED"):
-        done_set |= {"Created", "Expired"}
+    if status in ("ACTIVE", "T1_HIT", "CLOSED"):
+        done_set.add("Active")
+    if status in ("T1_HIT", "CLOSED") and t1:
+        done_set.add("T1 Hit")
+    if status == "CLOSED":
+        done_set.add("Closed")
+
+    final_label  = "Expired" if is_expired else "Closed"
+    final_icon   = "⏳" if is_expired else "🏁"
+    final_color  = "#8b949e" if is_expired else "#f5c542"
+    if is_expired:
+        done_set.add("Closed")  # the final node, whatever it's labelled
+        timestamps["Closed"] = str(cl)[:10] if cl else timestamps.get("Closed", "")
 
     html = (
         '<div class="lifecycle-panel">'
-        '<div class="lifecycle-title">Setup Lifecycle</div>'
+        '<div class="lifecycle-title">Trade Lifecycle</div>'
         '<div class="lc-timeline">'
     )
     for i, (name, icon, color) in enumerate(nodes):
-        done_cls = "done" if name in done_set else "pending"
-        bg_color = color if name in done_set else "transparent"
-        border_c = color
-        ts_label = timestamps.get(name, "")
+        disp_name  = final_label if name == "Closed" else name
+        disp_icon  = final_icon  if name == "Closed" else icon
+        disp_color = final_color if name == "Closed" else color
+        done_cls   = "done" if name in done_set else "pending"
+        bg_color   = disp_color if name in done_set else "transparent"
+        ts_label   = timestamps.get(name, "")
         html += (
             f'<div class="lc-node {done_cls}">'
-            f'<div class="lc-node-circle" style="background:{bg_color};border-color:{border_c};color:{"#0d1117" if name in done_set else color}">'
-            f'{icon}</div>'
-            f'<div class="lc-node-label" style="color:{color}">{name}</div>'
+            f'<div class="lc-node-circle" style="background:{bg_color};border-color:{disp_color};'
+            f'color:{"#0d1117" if name in done_set else disp_color}">{disp_icon}</div>'
+            f'<div class="lc-node-label" style="color:{disp_color}">{disp_name}</div>'
             f'<div class="lc-node-date">{ts_label}</div>'
             f'</div>'
         )
@@ -2148,6 +2219,215 @@ _FIB_PB_BOOST_META = {
     "nr7":                 ("#a78bfa", "NR7"),
     "harmonic_bull":       ("#f59e0b", "🦋"),
 }
+
+def _ap_status_badge(status: str) -> str:
+    """Status badge for the Active Plans tab — driven directly by the raw
+    PlanStatus value (WAITING/ACTIVE/T1_HIT/CLOSED/EXPIRED), not fuzzy text."""
+    s = str(status or "").upper()
+    m = {
+        "WAITING": ("ts-waiting",     "⏳ Waiting"),
+        "ACTIVE":  ("ts-triggered",   "✅ Active"),
+        "T1_HIT":  ("ts-t1",          "🎯 T1 Hit"),
+        "CLOSED":  ("ts-invalidated", "⚪ Closed"),
+        "EXPIRED": ("ts-expired",     "🔴 Expired"),
+    }
+    css, label = m.get(s, ("ts-waiting", s or "—"))
+    return f'<span class="trade-status-badge {css}">{label}</span>'
+
+
+def _ap_rec_badge(rec: str) -> str:
+    """Recommendation badge — reuses the same colour scheme as the main
+    scanner table (_CAT_STYLE) so Original vs Current reads consistently."""
+    rec = str(rec or "").strip()
+    if not rec or rec in ("—", "nan", "None"):
+        return '<span style="color:var(--muted);font-size:10px">Not in today\'s scan</span>'
+    color, label = _CAT_STYLE.get(rec, ("#8b949e", rec))
+    return (
+        f'<span style="background:rgba(0,0,0,0.3);border:1px solid {color}33;'
+        f'border-radius:4px;padding:2px 7px;font-size:10px;font-weight:600;'
+        f'color:{color};white-space:nowrap">{label}</span>'
+    )
+
+
+def _ap_pnl_cell(pnl_pct: float) -> str:
+    if pnl_pct is None:
+        return '<td class="col-num" style="color:var(--muted)">—</td>'
+    color = "#3fb950" if pnl_pct > 0 else ("#f85149" if pnl_pct < 0 else "#8b949e")
+    sign  = "+" if pnl_pct > 0 else ""
+    return f'<td class="col-num" style="color:{color};font-weight:700">{sign}{pnl_pct:.1f}%</td>'
+
+
+def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None = None) -> None:
+    """
+    📋 Active Plans — the operational trading dashboard.
+
+    Shows every OPEN SetupPlan (Waiting / Active / T1 Hit) regardless of
+    what the scanner currently recommends for that stock today. This is
+    the entire point of separating Trade Lifecycle from Scanner
+    Recommendation: a stock can fall to SKIP in today's scan and this
+    plan will still sit here, untouched, until price hits SL/target or
+    a trader manually closes it.
+
+    "Original Recommendation" is the locked thesis from the day the plan
+    was minted. "Current Recommendation" is today's live scanner read for
+    that symbol (if it's still in today's scan universe) — shown purely
+    so a drifting recommendation can be cross-referenced against trade
+    outcomes; it is never used to alter the plan itself.
+    """
+    try:
+        from utils.supabase_client import load_open_setup_plans, close_setup_plan_manually, _is_available
+    except Exception:
+        st.warning("Setup persistence isn't available right now.")
+        return
+
+    if not _is_available():
+        st.info("Supabase isn't configured, so Active Plans can't be loaded. Trade lifecycle persistence requires Supabase.")
+        return
+
+    from utils.setup_persistence import compute_pnl_pct
+
+    open_plans = preloaded_plans if preloaded_plans is not None else load_open_setup_plans()
+    if not open_plans:
+        st.info("No open trade plans right now. A plan is minted automatically the first time a stock reaches Elite / High Conviction / Actionable.")
+        return
+
+    # Look up today's live price + current recommendation for symbols
+    # still in today's scan universe. Symbols that have fallen out of the
+    # scan entirely (e.g. delisted from the active universe) simply show
+    # "Not in today's scan" — their locked levels and status are
+    # unaffected either way.
+    live_lookup = {}
+    if df_aug is not None and not df_aug.empty and "Stock" in df_aug.columns:
+        for _, r in df_aug.iterrows():
+            sym = str(r.get("Stock", "")).upper().strip()
+            live_lookup[sym] = {
+                "cmp":         float(r.get("Entry", 0) or 0),
+                "current_rec": str(r.get("Recommendation", r.get("Category", ""))),
+            }
+
+    rows = []
+    for sym, plan in open_plans.items():
+        live   = live_lookup.get(sym, {})
+        cmp_px = live.get("cmp", 0.0)
+        rows.append({
+            "setup_id":     plan.setup_id,
+            "Symbol":       sym,
+            "Status":       plan.status.upper(),
+            "Entry":        plan.entry_locked,
+            "SL":           plan.sl_locked,
+            "T1":           plan.t1_locked,
+            "CurrentPrice": cmp_px,
+            "PnLPct":       compute_pnl_pct(plan.entry_locked, cmp_px) if cmp_px else None,
+            "DaysActive":   _compute_days_active_safe(plan.first_actionable_date),
+            "OriginalRec":  plan.locked_recommendation,
+            "CurrentRec":   live.get("current_rec", ""),
+        })
+
+    rows_df = pd.DataFrame(rows)
+
+    # ── Summary stat row ────────────────────────────────────────────
+    n_waiting = int((rows_df["Status"] == "WAITING").sum())
+    n_active  = int((rows_df["Status"] == "ACTIVE").sum())
+    n_t1      = int((rows_df["Status"] == "T1_HIT").sum())
+    st.markdown(
+        '<div style="display:flex;gap:24px;margin-bottom:10px;font-family:var(--mono);">'
+        f'<div><span style="font-size:18px;font-weight:700;color:#58a6ff">{n_waiting}</span> '
+        f'<span style="font-size:10px;color:var(--muted)">WAITING</span></div>'
+        f'<div><span style="font-size:18px;font-weight:700;color:#3fb950">{n_active}</span> '
+        f'<span style="font-size:10px;color:var(--muted)">ACTIVE</span></div>'
+        f'<div><span style="font-size:18px;font-weight:700;color:#a371f7">{n_t1}</span> '
+        f'<span style="font-size:10px;color:var(--muted)">T1 HIT</span></div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    sort_key = st.selectbox(
+        "Sort by", ["Days Active (oldest first)", "PnL% ↓", "Symbol A→Z"],
+        key="active_plans_sort", label_visibility="collapsed",
+    )
+    if sort_key == "PnL% ↓":
+        rows_df = rows_df.sort_values("PnLPct", ascending=False, na_position="last")
+    elif sort_key == "Symbol A→Z":
+        rows_df = rows_df.sort_values("Symbol")
+    else:
+        rows_df = rows_df.sort_values("DaysActive", ascending=False)
+
+    # ── Table ───────────────────────────────────────────────────────
+    header = (
+        '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th>'
+        '<th>Entry</th><th>SL</th><th>T1</th><th>Current Price</th><th>PnL%</th>'
+        '<th>Days Active</th><th>Original Recommendation</th><th>Current Recommendation</th></tr>'
+    )
+    body = ""
+    for rank, (_, r) in enumerate(rows_df.iterrows(), 1):
+        def _px(v):
+            try:
+                return f"₹{float(v):,.2f}" if float(v) > 0 else "—"
+            except (TypeError, ValueError):
+                return "—"
+        body += (
+            f'<tr><td class="col-rank">{rank}</td>'
+            f'<td class="col-stock">{_tv_link(r["Symbol"])}</td>'
+            f'<td>{_ap_status_badge(r["Status"])}</td>'
+            f'<td class="col-num">{_px(r["Entry"])}</td>'
+            f'<td class="col-num">{_px(r["SL"])}</td>'
+            f'<td class="col-num">{_px(r["T1"])}</td>'
+            f'<td class="col-num">{_px(r["CurrentPrice"])}</td>'
+            + _ap_pnl_cell(r["PnLPct"])
+            + f'<td class="col-num">{int(r["DaysActive"])}d</td>'
+            f'<td>{_ap_rec_badge(r["OriginalRec"])}</td>'
+            f'<td>{_ap_rec_badge(r["CurrentRec"])}</td>'
+            '</tr>'
+        )
+    st.markdown(
+        f'<table class="ap-table"><thead>{header}</thead><tbody>{body}</tbody></table>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Recommendation drift callout ───────────────────────────────
+    drifted = rows_df[
+        (rows_df["OriginalRec"] != "") & (rows_df["CurrentRec"] != "") &
+        (rows_df["OriginalRec"] != rows_df["CurrentRec"])
+    ]
+    if not drifted.empty:
+        with st.expander(f"📉 Recommendation has drifted on {len(drifted)} open plan(s)", expanded=False):
+            st.caption("These trades are still open purely on price/SL/target — the scanner's opinion of them has changed since they were locked. Useful for checking whether a scanner downgrade tends to predict trade failure.")
+            for _, r in drifted.iterrows():
+                st.markdown(
+                    f'**{r["Symbol"]}** — Original: {_ap_rec_badge(r["OriginalRec"])} '
+                    f'→ Current: {_ap_rec_badge(r["CurrentRec"])} · Status: {_ap_status_badge(r["Status"])}',
+                    unsafe_allow_html=True,
+                )
+
+    # ── Manual exit control ─────────────────────────────────────────
+    closeable = rows_df[rows_df["Status"].isin(["ACTIVE", "T1_HIT"])]
+    with st.expander("🚪 Close a trade manually", expanded=False):
+        if closeable.empty:
+            st.caption("No ACTIVE or T1 Hit trades available to manually close. (WAITING plans resolve on their own via entry trigger or expiry.)")
+        else:
+            sym_choice = st.selectbox(
+                "Trade to close", closeable["Symbol"].tolist(), key="ap_close_symbol",
+            )
+            reason = st.text_input(
+                "Reason (optional)", value="Manual exit", key="ap_close_reason",
+            )
+            if st.button("Close trade", key="ap_close_btn", type="primary"):
+                _row = closeable[closeable["Symbol"] == sym_choice].iloc[0]
+                ok = close_setup_plan_manually(_row["setup_id"], reason=reason or "Manual exit")
+                if ok:
+                    st.success(f"{sym_choice} closed.")
+                    st.rerun()
+                else:
+                    st.error(f"Could not close {sym_choice} — it may already be closed.")
+
+
+def _compute_days_active_safe(first_actionable_date: str) -> int:
+    try:
+        from utils.setup_persistence import _compute_days_active
+        return _compute_days_active(first_actionable_date)
+    except Exception:
+        return 0
+
 
 def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None:
     """
@@ -2667,14 +2947,21 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
 
     fib_pb_df = pd.DataFrame(fib_pb_records) if fib_pb_records else pd.DataFrame()
 
+    try:
+        from utils.supabase_client import load_open_setup_plans as _load_open_plans_for_count
+        _open_plans_preview = _load_open_plans_for_count()
+    except Exception:
+        _open_plans_preview = {}
+
     tab_labels = [
         f"🌟 Elite ({len(elite_df)})",
         f"⚡ Execute ({len(execute_df)})",
         f"👁 Watch ({len(watch_df)})",
         f"📐 Fib Pullback ({len(fib_pb_records)})",
+        f"📋 Active Plans ({len(_open_plans_preview)})",
     ]
-    df_sets  = [elite_df, execute_df, watch_df, fib_pb_df]
-    set_keys = ["ELITE", "EXECUTE", "WATCH", "FIB_PULLBACK"]
+    df_sets  = [elite_df, execute_df, watch_df, fib_pb_df, pd.DataFrame()]
+    set_keys = ["ELITE", "EXECUTE", "WATCH", "FIB_PULLBACK", "ACTIVE_PLANS"]
 
     if show_skip:
         skip_df = _sc_df("Avoid") if has_cv1 else pd.DataFrame()
@@ -2689,6 +2976,12 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
             # ── FIB_PULLBACK tab gets its own rich renderer ──────────────────────
             if sc_key == "FIB_PULLBACK":
                 _render_fib_pullback_tab(fib_pb_records, df_subset, "Swing")
+                continue
+
+            # ── ACTIVE_PLANS: the Trade Lifecycle dashboard, independent of
+            #    today's scanner recommendation ───────────────────────────
+            if sc_key == "ACTIVE_PLANS":
+                _render_active_plans_tab(df_aug, preloaded_plans=_open_plans_preview)
                 continue
 
             sc_color, sc_label = _SC_STYLE.get(sc_key, ("#484f58", sc_key))
