@@ -79,14 +79,15 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-from pages.scanner     import render as render_scanner
-from pages.backtest    import render as render_backtest
-from pages.settings    import render as render_settings
-from pages.validation  import render as render_validation
-from pages.diagnostic  import render as render_diagnostic
-from pages.lifecycle   import render as render_lifecycle
-from pages.history     import render as render_history
-from pages.agent        import render as render_agent
+from pages.scanner       import render as render_scanner
+from pages.backtest      import render as render_backtest
+from pages.settings      import render as render_settings
+from pages.validation    import render as render_validation
+from pages.diagnostic    import render as render_diagnostic
+from pages.lifecycle     import render as render_lifecycle
+from pages.history       import render as render_history
+from pages.agent          import render as render_agent
+from pages.five_pillars  import render as render_five_pillars
 from utils.scanner_engine import NIFTY500_SYMBOLS
 
 ss = st.session_state
@@ -126,30 +127,33 @@ settings = {
     "t1_use_adx":           ss.get("t1_use_adx",           True),
 }
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-    "📡 Live Scanner", "📈 Backtest Engine", "🔄 Lifecycle", "📊 History", "⚙️ Settings", "🔬 CV/EQ Validation", "🧬 Diagnostic", "🤖 Agent"
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    "📡 Live Scanner", "🏛️ Five Pillars", "📈 Backtest Engine", "🔄 Lifecycle", "📊 History", "⚙️ Settings", "🔬 CV/EQ Validation", "🧬 Diagnostic", "🤖 Agent"
 ])
 
 with tab1:
     render_scanner(settings)
 
 with tab2:
-    render_backtest(settings)
+    render_five_pillars(settings)
 
 with tab3:
-    render_lifecycle()
+    render_backtest(settings)
 
 with tab4:
-    render_history()
+    render_lifecycle()
 
 with tab5:
-    render_settings()
+    render_history()
 
 with tab6:
-    render_validation(settings)
+    render_settings()
 
 with tab7:
-    render_diagnostic(settings)
+    render_validation(settings)
 
 with tab8:
+    render_diagnostic(settings)
+
+with tab9:
     render_agent(settings)
