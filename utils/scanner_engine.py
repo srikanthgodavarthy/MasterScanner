@@ -841,6 +841,7 @@ def score_stock(
                 "FP_StochK":         fp.stoch_k,
                 "FP_StochD":         fp.stoch_d,
                 "_fp_stoch_cross_up": fp.stoch_cross_up,
+                "_fp_rsi_val":       fp.rsi_val,
                 "_fp_rsi_above_50": fp.rsi_above_50,
                 # Risk internals
                 "FP_DistEMA20Pct": fp.dist_from_ema20_pct,
