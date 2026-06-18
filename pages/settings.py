@@ -570,6 +570,28 @@ def _tab_system() -> None:
         )
         st.caption("Add the above to `.streamlit/secrets.toml`")
 
+    from utils.openai_client import _is_available as _openai_ok
+    if _openai_ok():
+        st.markdown(
+            '<span class="status-pill" style="background:rgba(63,185,80,0.12);'
+            'border:1px solid rgba(63,185,80,0.4);color:#3fb950">'
+            '● Agent (OpenAI) connected</span>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<span class="status-pill" style="background:rgba(248,81,73,0.1);'
+            'border:1px solid rgba(248,81,73,0.35);color:#f85149">'
+            '● Agent (OpenAI) not configured</span>',
+            unsafe_allow_html=True,
+        )
+        st.code(
+            'OPENAI_API_KEY = "sk-..."\n'
+            'OPENAI_MODEL = "gpt-4o-mini"   # optional',
+            language="toml",
+        )
+        st.caption("Add the above to `.streamlit/secrets.toml` to enable the 🤖 Agent tab")
+
     st.markdown('<div style="height:10px"></div>', unsafe_allow_html=True)
 
     with st.expander("📋 Watchlist", expanded=False):
