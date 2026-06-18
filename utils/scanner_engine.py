@@ -805,8 +805,9 @@ def score_stock(
     # ── Five Pillars Ranking Engine ───────────────────────────────
     # Standalone additive model (Structure/Acceptance/Leadership/Momentum/
     # Risk). Reuses the already-built IndicatorArrays (ia) — no re-fetch,
-    # no recomputation of EMA/RSI/CCI/ATR. Adds VWAP + Fixed Range Volume
-    # Profile (POC/VAH/VAL), which don't exist anywhere else in the engine.
+    # no recomputation of EMA/RSI/ATR. Adds VWAP + Fixed Range Volume
+    # Profile (POC/VAH/VAL) and Stochastic Oscillator, which don't exist
+    # anywhere else in the engine.
     try:
         from utils.pillar_engine import compute_pillars_from_ia
         fp = compute_pillars_from_ia(df, ia)
@@ -837,7 +838,9 @@ def score_stock(
                 "FP_RS6m":        fp.rs_6m,
                 "FP_RelMomentum": fp.rel_momentum,
                 # Momentum internals
-                "_fp_cci_cross_up": fp.cci_cross_up,
+                "FP_StochK":         fp.stoch_k,
+                "FP_StochD":         fp.stoch_d,
+                "_fp_stoch_cross_up": fp.stoch_cross_up,
                 "_fp_rsi_above_50": fp.rsi_above_50,
                 # Risk internals
                 "FP_DistEMA20Pct": fp.dist_from_ema20_pct,
