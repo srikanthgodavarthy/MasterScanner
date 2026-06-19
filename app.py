@@ -88,6 +88,7 @@ from pages.lifecycle     import render as render_lifecycle
 from pages.history       import render as render_history
 from pages.agent          import render as render_agent
 from pages.five_pillars  import render as render_five_pillars
+from pages.cci_master    import render as render_cci_master
 from utils.scanner_engine import NIFTY500_SYMBOLS
 
 ss = st.session_state
@@ -127,8 +128,8 @@ settings = {
     "t1_use_adx":           ss.get("t1_use_adx",           True),
 }
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
-    "📡 Live Scanner", "🏛️ Five Pillars", "📈 Backtest Engine", "🔄 Lifecycle", "📊 History", "⚙️ Settings", "🔬 CV/EQ Validation", "🧬 Diagnostic", "🤖 Agent"
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+    "📡 Live Scanner", "🏛️ Five Pillars", "📈 Backtest Engine", "🔄 Lifecycle", "📊 History", "⚙️ Settings", "🔬 CV/EQ Validation", "🧬 Diagnostic", "🤖 Agent", "📐 CCI Master"
 ])
 
 with tab1:
@@ -157,3 +158,6 @@ with tab8:
 
 with tab9:
     render_agent(settings)
+
+with tab10:
+    render_cci_master(settings)
