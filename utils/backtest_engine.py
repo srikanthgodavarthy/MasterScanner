@@ -403,8 +403,239 @@ def generate_signals_historical(
 
 
 # ══════════════════════════════════════════════════════════════════
-#  TRADE SIMULATION
+#  CCI MASTER SIGNAL GENERATOR
+#  Entry: CCI crosses UP through os_level (crossover from BEAR → BUY signal)
+#  Exit signal: CCI crosses DOWN through 0 or OB level
+#  SL   : entry - 1.5× ATR14
+#  T1/T2: entry + 1.5× ATR14 / entry + 3× ATR14
 # ══════════════════════════════════════════════════════════════════
+
+def generate_signals_cci_master(
+    df:       pd.DataFrame,
+    params=None,          # CCIMasterParams or None → defaults
+) -> pd.DataFrame:
+    """
+    Walk-forward signal scan using CCI Master logic (Pine Script port).
+    Returns one row per BUY signal bar with entry/sl/t1/t2 pre-computed.
+    """
+    from utils.cci_master_engine import compute_cci_master, CCIMasterParams
+    from utils.scanner_engine import atr as _atr_fn
+
+    if params is None:
+        params = CCIMasterParams()
+
+    result = compute_cci_master(df, params)
+    if result is None or result.empty:
+        return pd.DataFrame()
+
+    # ATR for SL/target sizing
+    atr_s = _atr_fn(df["high"], df["low"], df["close"], 14)
+
+    signals = []
+    last_signal_bar = -999
+
+    for i in range(params.cci_length + 5, len(result)):
+        if result["cci_signal"].iloc[i] != "BUY":
+            continue
+        if i - last_signal_bar < 3:
+            continue
+
+        close_price = float(result["close"].iloc[i])
+        atr_val     = float(atr_s.iloc[i]) if not pd.isna(atr_s.iloc[i]) else close_price * 0.02
+
+        entry = round(close_price, 2)
+        sl    = round(entry - 1.5 * atr_val, 2)
+        t1    = round(entry + 1.5 * atr_val, 2)
+        t2    = round(entry + 3.0 * atr_val, 2)
+        t3    = round(entry + 5.0 * atr_val, 2)
+
+        if sl >= entry or t1 <= entry:
+            continue
+
+        last_signal_bar = i
+        signals.append({
+            "date":            result.index[i],
+            "score":           float(result["cci_score"].iloc[i]),
+            "entry":           entry,
+            "sl":              sl,
+            "t1":              t1,
+            "t2":              t2,
+            "t3":              t3,
+            "t1_mult":         1.5,
+            "t2_mult":         3.0,
+            "t3_mult":         5.0,
+            "target_category": "CCI Master",
+            "target_adj":      0.0,
+            "target_notes":    f"ATR={round(atr_val,2)}",
+            "cci":             round(float(result["cci"].iloc[i]), 1),
+            "rsi":             0.0,
+            "tier1_prime":     False,
+            "tier2_momentum":  False,
+            "elite_tier":      result["cci_rating"].iloc[i] == "STRONG BUY",
+            "squeeze_release": False,
+            "setup":           "CCI_MASTER",
+            "buy_type":        "CCI",
+            "tier":            "CCI",
+            "structural_entry": False,
+            "rs_positive":     False,
+            "rs_val":          0.0,
+            "rs3":             0.0,
+            "rs_composite":    0.0,
+            "rs_top_decile":   False,
+            "fresh_base":      False,
+            "trend_age_bars":  0,
+            "trend_freshness": 0,
+            "adx_val":         0.0,
+            "trend_phase":     "BULL" if result["cci_state"].iloc[i] == "OB" else "BULL",
+            "ema20_pct_dist":       0.0,
+            "ema50_pct_dist":       0.0,
+            "pivot_high_dist":      0.0,
+            "price_move_since_setup": 0.0,
+            "bars_since_setup":     0,
+            "bars_band":            "Actionable",
+            "atr_at_setup":         round(atr_val, 2),
+            "extension_atr":        0.0,
+            "extension_score_atr":  0,
+            "atr_band":             "Actionable",
+            "pct_band":             "Actionable",
+            "entry_quality_score":  0,
+            "entry_quality_band":   "Acceptable",
+            "entry_rejection_reason": "",
+            "leadership_score":     0,
+            "conviction_score":     0,
+        })
+
+    return pd.DataFrame(signals)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  FIVE PILLARS SIGNAL GENERATOR
+#  Entry: FP final_score crosses ≥ 90 (Execute class)
+#  Exit signal: FP final_score drops below 65 (falls out of Watch class)
+#  SL   : entry - 1.5× ATR14
+#  T1/T2: entry + 1.5× ATR14 / entry + 3× ATR14
+# ══════════════════════════════════════════════════════════════════
+
+def generate_signals_five_pillars(
+    df:    pd.DataFrame,
+    nifty: pd.Series,
+) -> pd.DataFrame:
+    """
+    Walk-forward signal scan using Five Pillars scoring.
+    Computes FP score bar-by-bar (rolling windows) and fires entry when
+    the score crosses from Watch → Execute (≥ 90). Exits on reversion
+    below Watch threshold (< 65) within the simulation window.
+    """
+    from utils.pillar_engine import compute_pillars
+    from utils.scanner_engine import atr as _atr_fn
+
+    if df.empty or len(df) < 60:
+        return pd.DataFrame()
+
+    atr_s = _atr_fn(df["high"], df["low"], df["close"], 14)
+
+    # Compute FP score on a rolling 200-bar window every bar from bar 200 onward.
+    # This is heavier than CCI but Five Pillars uses EMA/RSI/ATR already in pandas.
+    fp_scores: list[float] = []
+    for i in range(len(df)):
+        if i < 59:
+            fp_scores.append(float("nan"))
+            continue
+        window = df.iloc[max(0, i - 199): i + 1]
+        try:
+            r = compute_pillars(window, nifty)
+            fp_scores.append(float(r.final_score) if r.error is None else float("nan"))
+        except Exception:
+            fp_scores.append(float("nan"))
+
+    fp_arr = pd.Series(fp_scores, index=df.index)
+    prev_fp = fp_arr.shift(1)
+
+    signals   = []
+    last_signal_bar = -999
+
+    for i in range(60, len(df)):
+        cur  = fp_arr.iloc[i]
+        prev = prev_fp.iloc[i]
+
+        if pd.isna(cur) or pd.isna(prev):
+            continue
+
+        # Entry: score crosses up into Execute (≥ 90) from below
+        if not (prev < 90 and cur >= 90):
+            continue
+        if i - last_signal_bar < 3:
+            continue
+
+        close_price = float(df["close"].iloc[i])
+        atr_val     = float(atr_s.iloc[i]) if not pd.isna(atr_s.iloc[i]) else close_price * 0.02
+
+        entry = round(close_price, 2)
+        sl    = round(entry - 1.5 * atr_val, 2)
+        t1    = round(entry + 1.5 * atr_val, 2)
+        t2    = round(entry + 3.0 * atr_val, 2)
+        t3    = round(entry + 5.0 * atr_val, 2)
+
+        if sl >= entry or t1 <= entry:
+            continue
+
+        last_signal_bar = i
+        signals.append({
+            "date":            df.index[i],
+            "score":           float(cur),
+            "entry":           entry,
+            "sl":              sl,
+            "t1":              t1,
+            "t2":              t2,
+            "t3":              t3,
+            "t1_mult":         1.5,
+            "t2_mult":         3.0,
+            "t3_mult":         5.0,
+            "target_category": "Five Pillars",
+            "target_adj":      0.0,
+            "target_notes":    f"FP={int(cur)} ATR={round(atr_val,2)}",
+            "cci":             0.0,
+            "rsi":             0.0,
+            "tier1_prime":     False,
+            "tier2_momentum":  False,
+            "elite_tier":      cur >= 95,
+            "squeeze_release": False,
+            "setup":           "FIVE_PILLARS",
+            "buy_type":        "FP",
+            "tier":            "FP Execute",
+            "structural_entry": True,
+            "rs_positive":     False,
+            "rs_val":          0.0,
+            "rs3":             0.0,
+            "rs_composite":    0.0,
+            "rs_top_decile":   False,
+            "fresh_base":      False,
+            "trend_age_bars":  0,
+            "trend_freshness": 0,
+            "adx_val":         0.0,
+            "trend_phase":     "EXECUTE",
+            "ema20_pct_dist":       0.0,
+            "ema50_pct_dist":       0.0,
+            "pivot_high_dist":      0.0,
+            "price_move_since_setup": 0.0,
+            "bars_since_setup":     0,
+            "bars_band":            "Actionable",
+            "atr_at_setup":         round(atr_val, 2),
+            "extension_atr":        0.0,
+            "extension_score_atr":  0,
+            "atr_band":             "Actionable",
+            "pct_band":             "Actionable",
+            "entry_quality_score":  int(cur),
+            "entry_quality_band":   "Good" if cur >= 90 else "Acceptable",
+            "entry_rejection_reason": "",
+            "leadership_score":     0,
+            "conviction_score":     0,
+        })
+
+    return pd.DataFrame(signals)
+
+
+
 
 def simulate_trades(
     symbol:    str,
@@ -639,7 +870,15 @@ def run_backtest(
     buy_type_filter:  list | None = None,
     rs_positive_only: bool = False,
     progress_cb            = None,
-) -> pd.DataFrame:
+    mode:             str  = "scanner",
+) -> tuple:
+    """
+    Walk-forward backtest.
+
+    mode="scanner"      — default; scoring_core.compute_bar() (full engine)
+    mode="cci_master"   — CCI Master crossover signals
+    mode="five_pillars" — Five Pillars FP score crossover signals
+    """
     if settings:
         hold_days        = settings.get("hold_days",            hold_days)
         workers          = settings.get("workers",              workers)
@@ -647,6 +886,7 @@ def run_backtest(
         tier_filter      = settings.get("bt_tier_filter",       tier_filter)
         buy_type_filter  = settings.get("bt_buy_type_filter",   buy_type_filter)
         rs_positive_only = bool(settings.get("bt_rs_positive_only", rs_positive_only))
+        mode             = settings.get("bt_mode",              mode)
 
     # v13: momentum failure exit and adaptive targets — read from settings
     momentum_exit_enabled = bool((settings or {}).get("momentum_exit_enabled", False))
@@ -690,24 +930,44 @@ def run_backtest(
 
     def _process(sym):
         df = all_data[sym]
-        sigs, rejs = generate_signals_historical(
-            df, nifty,
-            settings         = effective_settings,
-            cci_len          = cci_len,
-            cci_ob           = cci_ob,
-            cci_os           = cci_os,
-            min_score        = min_score,
-            tier_filter      = tier_filter,
-            buy_type_filter  = buy_type_filter,
-            rs_positive_only = rs_positive_only,
-            regime_ctx       = _regime_ctx,   # [v8.2] regime population filter
-        )
+
+        # ── Route to the correct signal generator based on mode ───────────
+        if mode == "cci_master":
+            from utils.cci_master_engine import CCIMasterParams
+            _cci_params = CCIMasterParams(
+                cci_length  = int(effective_settings.get("bt_cci_len", 14)),
+                ob_level    = int(effective_settings.get("bt_cci_ob",  100)),
+                os_level    = int(effective_settings.get("bt_cci_os",  -100)),
+                strong_score= int(effective_settings.get("bt_cci_strong_score", 4)),
+                buy_score   = int(effective_settings.get("bt_cci_buy_score",    2)),
+            )
+            sigs = generate_signals_cci_master(df, params=_cci_params)
+            rejs = pd.DataFrame()
+
+        elif mode == "five_pillars":
+            sigs = generate_signals_five_pillars(df, nifty)
+            rejs = pd.DataFrame()
+
+        else:  # default: "scanner"
+            sigs, rejs = generate_signals_historical(
+                df, nifty,
+                settings         = effective_settings,
+                cci_len          = cci_len,
+                cci_ob           = cci_ob,
+                cci_os           = cci_os,
+                min_score        = min_score,
+                tier_filter      = tier_filter,
+                buy_type_filter  = buy_type_filter,
+                rs_positive_only = rs_positive_only,
+                regime_ctx       = _regime_ctx,
+            )
+
         trades = simulate_trades(sym, df, sigs, hold_days=hold_days,
                                  momentum_exit_enabled=momentum_exit_enabled)
         if not rejs.empty:
             rejs.insert(0, "symbol", sym)
         if not trades.empty:
-            trades["rejection_log"] = None   # placeholder; full log available via rejs
+            trades["rejection_log"] = None
         return trades, rejs
 
     all_rejections = []
