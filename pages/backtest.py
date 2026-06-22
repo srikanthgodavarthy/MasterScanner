@@ -40,24 +40,180 @@ def _pnl_color(val):
         return ""
 
 
+def _symbols_from_source(source: str, settings: dict | None) -> tuple[list[str], str]:
+    """
+    Derive the symbol universe and an auto-applied tier_filter from a source selection.
+    Returns (symbols_list, tier_filter_override_or_empty_string).
+    """
+    scan_df = st.session_state.get("scan_df", pd.DataFrame())
+    default_syms = settings.get("bt_symbols", DEFAULT_BT_SYMS) if settings else DEFAULT_BT_SYMS
+
+    def _sym_col(df):
+        for c in ("Stock", "Symbol", "Ticker"):
+            if c in df.columns:
+                return c
+        return None
+
+    if source == "🌟 Elite (Scanner)":
+        if scan_df.empty:
+            st.warning("⚠️ No scanner data — run the Live Scanner first, then return here.", icon="⚠️")
+            return default_syms, "Elite Opportunity"
+        rec_col = "Recommendation" if "Recommendation" in scan_df.columns else "Category"
+        sub = scan_df[scan_df.get(rec_col, pd.Series(dtype=str)) == "Elite Opportunity"]
+        sc = _sym_col(sub)
+        syms = sorted(sub[sc].dropna().unique().tolist()) if sc else default_syms
+        return (syms or default_syms), "Elite Opportunity"
+
+    if source == "⚡ Execute (Scanner)":
+        if scan_df.empty:
+            st.warning("⚠️ No scanner data — run the Live Scanner first, then return here.", icon="⚠️")
+            return default_syms, "Actionable"
+        rec_col = "Recommendation" if "Recommendation" in scan_df.columns else "Category"
+        sub = scan_df[scan_df.get(rec_col, pd.Series(dtype=str)).isin(["High Conviction", "Actionable"])]
+        sc = _sym_col(sub)
+        syms = sorted(sub[sc].dropna().unique().tolist()) if sc else default_syms
+        return (syms or default_syms), "Actionable"
+
+    if source == "📐 Fib Pullback (Scanner)":
+        if scan_df.empty:
+            st.warning("⚠️ No scanner data — run the Live Scanner first, then return here.", icon="⚠️")
+            return default_syms, "All"
+        # Reproduce _is_fib_pullback logic
+        def _is_fib(row):
+            trend_up  = bool(row.get("_trend_up", False)) or (
+                str(row.get("TrendPhase", "NONE")).upper() != "NONE"
+            )
+            in_golden = bool(row.get("_in_golden", False)) or bool(row.get("_in_golden_relaxed", False))
+            cci_val   = float(row.get("CCI") or row.get("_cci_raw") or 0)
+            return trend_up and in_golden and cci_val <= -100
+        sub = scan_df[scan_df.apply(_is_fib, axis=1)]
+        sc = _sym_col(sub)
+        syms = sorted(sub[sc].dropna().unique().tolist()) if sc else default_syms
+        if not syms:
+            st.info("📐 No Fib Pullback stocks in current scan. Using default symbols.")
+            return default_syms, "All"
+        return syms, "All"
+
+    if source == "🏛️ Five Pillars":
+        if scan_df.empty or "FP_Class" not in scan_df.columns:
+            st.warning("⚠️ No Five Pillars data — run the Live Scanner first.", icon="⚠️")
+            return default_syms, "All"
+        sub = scan_df[scan_df["FP_Class"].isin(["Execute", "Watch"])]
+        sc = _sym_col(sub)
+        syms = sorted(sub[sc].dropna().unique().tolist()) if sc else default_syms
+        return (syms or default_syms), "All"
+
+    if source == "📐 CCI Master":
+        cci_df = st.session_state.get("cci_master_df", pd.DataFrame())
+        if cci_df.empty:
+            st.warning("⚠️ No CCI Master data — run CCI Master scan first.", icon="⚠️")
+            return default_syms, "All"
+        sub = cci_df[cci_df["Rating"].isin(["STRONG BUY", "BUY"])]
+        sc = _sym_col(sub)
+        syms = sorted(sub[sc].dropna().unique().tolist()) if sc else default_syms
+        return (syms or default_syms), "All"
+
+    # "Custom" — caller controls universe
+    return default_syms, "All"
+
+
 def render(settings=None):
+    # ── Source selector ────────────────────────────────────────────
+    SOURCE_OPTIONS = [
+        "Custom",
+        "🌟 Elite (Scanner)",
+        "⚡ Execute (Scanner)",
+        "📐 Fib Pullback (Scanner)",
+        "🏛️ Five Pillars",
+        "📐 CCI Master",
+    ]
+    SOURCE_HELP = {
+        "Custom":                  "Manually pick symbols below.",
+        "🌟 Elite (Scanner)":      "Symbols currently in the Elite Opportunity tab of the Live Scanner scan.",
+        "⚡ Execute (Scanner)":    "Symbols in High Conviction / Actionable tab of the Live Scanner.",
+        "📐 Fib Pullback (Scanner)": "Stocks detected as Fib Pullback (trend-up + golden zone + CCI ≤ −100) from the last scan.",
+        "🏛️ Five Pillars":         "Execute + Watch class stocks from the Five Pillars ranking (requires scan data).",
+        "📐 CCI Master":           "STRONG BUY + BUY rated stocks from the last CCI Master scan.",
+    }
+    SOURCE_BADGE = {
+        "Custom":                    "",
+        "🌟 Elite (Scanner)":        "<span style='background:#1a2a00;color:#ffd700;border:1px solid #ffd700;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>auto-filter: Elite Opportunity</span>",
+        "⚡ Execute (Scanner)":      "<span style='background:#001a12;color:#22c55e;border:1px solid #22c55e;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>auto-filter: Actionable</span>",
+        "📐 Fib Pullback (Scanner)": "<span style='background:#0a1628;color:#58a6ff;border:1px solid #58a6ff;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>FIB_PULLBACK detection</span>",
+        "🏛️ Five Pillars":           "<span style='background:#1a1200;color:#d29922;border:1px solid #d29922;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>FP_Class: Execute + Watch</span>",
+        "📐 CCI Master":             "<span style='background:#001a1a;color:#00e676;border:1px solid #00e676;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>Rating: STRONG BUY + BUY</span>",
+    }
+
+    src_col, badge_col = st.columns([3, 5])
+    with src_col:
+        bt_source = st.selectbox(
+            "📡 Symbol Source",
+            SOURCE_OPTIONS,
+            index=0,
+            key="bt_source",
+            help="Choose which pool of stocks to backtest. Scanner / Five Pillars / CCI Master sources auto-populate the symbol list from the last scan.",
+        )
+    with badge_col:
+        st.markdown("<div style='padding-top:1.9rem'></div>", unsafe_allow_html=True)
+        badge = SOURCE_BADGE.get(bt_source, "")
+        if badge:
+            tip = SOURCE_HELP.get(bt_source, "")
+            st.markdown(
+                f"<div style='display:flex;align-items:center;gap:8px;'>{badge}"
+                f"<span style='color:#64748b;font-size:0.75rem;'>{tip}</span></div>",
+                unsafe_allow_html=True,
+            )
+
+    # Derive universe + tier override from source
+    _src_syms, _auto_tier = _symbols_from_source(bt_source, settings)
+
     # ── Inline controls (no sidebar) ───────────────────────────────
     with st.expander("⚙️ Backtest Settings", expanded=True):
         _bc1, _bc2 = st.columns(2)
 
         with _bc1:
-            bt_universe = st.multiselect(
-                "Symbols to Backtest", options=NIFTY500_SYMBOLS,
-                default=settings.get("bt_symbols", DEFAULT_BT_SYMS) if settings else DEFAULT_BT_SYMS,
-                key="bt_universe",
-                help="Default is 15 liquid symbols. Add more for broader coverage.",
-            )
-            bt_tier_filter = st.selectbox(
-                "Signal Class Filter",
-                ["All", "Elite Opportunity", "High Conviction", "Actionable", "Setup Building"],
-                index=0, key="bt_tier_filter",
-                help="Filter backtest trades by scanner Signal Class. 'All' includes every signal.",
-            )
+            # Universe: editable only for Custom; locked (display) for data sources
+            if bt_source == "Custom":
+                bt_universe = st.multiselect(
+                    "Symbols to Backtest", options=NIFTY500_SYMBOLS,
+                    default=settings.get("bt_symbols", DEFAULT_BT_SYMS) if settings else DEFAULT_BT_SYMS,
+                    key="bt_universe",
+                    help="Default is 15 liquid symbols. Add more for broader coverage.",
+                )
+            else:
+                bt_universe = _src_syms
+                _scan_time  = st.session_state.get("scan_time", "—")
+                st.markdown(
+                    f"<div style='background:#0d1117;border:1px solid #21262d;border-radius:6px;"
+                    f"padding:0.55rem 0.75rem;margin-bottom:0.6rem;'>"
+                    f"<div style='font-size:0.72rem;color:#8b949e;margin-bottom:3px;'>Symbols from <b style='color:#e6edf3'>{bt_source}</b></div>"
+                    f"<div style='font-size:0.85rem;color:#e6edf3;font-weight:600;'>{len(bt_universe)} symbol(s)</div>"
+                    f"<div style='font-size:0.7rem;color:#484f58;margin-top:2px;'>Scan at {_scan_time} &nbsp;·&nbsp; "
+                    f"{', '.join(bt_universe[:8])}{'…' if len(bt_universe) > 8 else ''}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+            # Tier filter: locked to auto value when source implies it, else free
+            _tier_choices = ["All", "Elite Opportunity", "High Conviction", "Actionable", "Setup Building"]
+            if _auto_tier and _auto_tier != "All" and bt_source != "Custom":
+                bt_tier_filter = _auto_tier
+                st.markdown(
+                    f"<div style='background:#0d1117;border:1px solid #21262d;border-radius:6px;"
+                    f"padding:0.45rem 0.75rem;margin-bottom:0.6rem;'>"
+                    f"<div style='font-size:0.72rem;color:#8b949e;'>Signal Class Filter <span style='color:#484f58'>(auto)</span></div>"
+                    f"<div style='font-size:0.85rem;color:#ffd700;font-weight:600;'>{_auto_tier}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                bt_tier_filter = st.selectbox(
+                    "Signal Class Filter",
+                    _tier_choices,
+                    index=0, key="bt_tier_filter",
+                    help="Filter backtest trades by scanner Signal Class. 'All' includes every signal.",
+                )
+
             bt_buy_type_filter = st.multiselect(
                 "Buy Type",
                 options=ALL_BUY_TYPES, default=[],
@@ -115,7 +271,16 @@ def render(settings=None):
             "Actionable":        "<b style='color:#4ade80'>Actionable only</b>",
             "Setup Building":    "<b style='color:#f59e0b'>Setup Building only</b>",
         }.get(bt_tier_filter, "<b style='color:#94a3b8'>All Signals</b>")
+        _src_label_map = {
+            "Custom":                    "<b style='color:#94a3b8'>Custom</b>",
+            "🌟 Elite (Scanner)":        "<b style='color:#ffd700'>Elite (Scanner)</b>",
+            "⚡ Execute (Scanner)":      "<b style='color:#22c55e'>Execute (Scanner)</b>",
+            "📐 Fib Pullback (Scanner)": "<b style='color:#58a6ff'>Fib Pullback (Scanner)</b>",
+            "🏛️ Five Pillars":           "<b style='color:#d29922'>Five Pillars</b>",
+            "📐 CCI Master":             "<b style='color:#00e676'>CCI Master</b>",
+        }
         _bt_tags = [
+            f"Source: {_src_label_map.get(bt_source, f'<b>{bt_source}</b>')}",
             f"Symbols: <b>{len(bt_universe)}</b>",
             _tier_label,
             f"Score ≥ <b>{bt_min_score}</b>",
@@ -189,7 +354,15 @@ def render(settings=None):
                 "Setup Building":    "No Setup Building signals found. Try lowering Min Score or adding more symbols.",
                 "All":               "No trades generated. Try lowering Min Score or adding more symbols.",
             }
-            st.warning(msgs.get(bt_tier_filter, msgs["All"]))
+            _src_hints = {
+                "🌟 Elite (Scanner)":        " — Only Elite Opportunity stocks from your last scan were tested.",
+                "⚡ Execute (Scanner)":      " — Only Execute/High Conviction stocks from your last scan were tested.",
+                "📐 Fib Pullback (Scanner)": " — Only Fib Pullback stocks from your last scan were tested.",
+                "🏛️ Five Pillars":           " — Only Execute+Watch FP_Class stocks from your last scan were tested.",
+                "📐 CCI Master":             " — Only STRONG BUY+BUY rated stocks from the last CCI Master scan were tested.",
+            }
+            _hint = _src_hints.get(bt_source, "")
+            st.warning(msgs.get(bt_tier_filter, msgs["All"]) + _hint)
             if not rejections_df.empty:
                 st.info(f"ℹ️ {len(rejections_df)} signals were rejected by the admission gate. Expand below to inspect.")
                 with st.expander("🚫 Admission Gate Rejections"):
