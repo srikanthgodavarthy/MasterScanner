@@ -202,22 +202,49 @@ def _trade_plan_card(row: dict) -> str:
     def _fmt(v):
         return f"{float(v):.2f}" if _is_valid_num(v) else "—"
 
+    breakout_pt = row.get("Breakout_Pt", "—")
+    swing_size  = row.get("Swing_Size",  "—")
+    dip_bars    = row.get("Dip_Bars",    "—")
+
     return f"""
 <div style="background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:1rem 1.2rem;margin-top:0.6rem;font-family:'JetBrains Mono',monospace;font-size:12px;">
-  <div style="font-size:10px;color:#8b949e;margin-bottom:0.6rem;letter-spacing:0.06em;text-transform:uppercase;">Trade Plan</div>
+  <div style="font-size:10px;color:#8b949e;margin-bottom:0.6rem;letter-spacing:0.06em;text-transform:uppercase;">Trade Plan — Measured Move</div>
+
+  <!-- Context row -->
+  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:0.75rem;background:#010409;border-radius:5px;padding:0.5rem 0.75rem;">
+    <div>
+      <div style="font-size:9px;color:#8b949e;">Breakout Point</div>
+      <div style="font-size:12px;font-weight:700;color:#f0f6fc;">{_fmt(breakout_pt)}</div>
+      <div style="font-size:8.5px;color:#484f58;">pre-pullback high</div>
+    </div>
+    <div>
+      <div style="font-size:9px;color:#8b949e;">Prior Swing Size</div>
+      <div style="font-size:12px;font-weight:700;color:#f0f6fc;">{_fmt(swing_size)}</div>
+      <div style="font-size:8.5px;color:#484f58;">prior up-leg height</div>
+    </div>
+    <div>
+      <div style="font-size:9px;color:#8b949e;">Dip Duration</div>
+      <div style="font-size:12px;font-weight:700;color:#f0f6fc;">{dip_bars} bars</div>
+      <div style="font-size:8.5px;color:#484f58;">CCI oversold episode</div>
+    </div>
+  </div>
+
+  <!-- Main levels -->
   <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:0.8rem;">
     <div>
       <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">Entry (Close)</div>
       <div style="font-size:14px;font-weight:700;color:#e6edf3;">{_fmt(close)}</div>
     </div>
     <div>
-      <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">SL <span style="color:#484f58;font-size:8px;">({sl_src})</span></div>
+      <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">SL</div>
       <div style="font-size:14px;font-weight:700;color:#ef5350;">{_fmt(sl)}</div>
-      <div style="font-size:9px;color:#484f58;">Risk: {_fmt(risk_pts)} pts · {_fmt(atr)} ATR</div>
+      <div style="font-size:9px;color:#484f58;">{sl_src}</div>
+      <div style="font-size:9px;color:#484f58;">Risk: {_fmt(risk_pts)} pts</div>
     </div>
     <div>
-      <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">T1 <span style="color:#484f58;font-size:8px;">({t1_src})</span></div>
+      <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">T1 (1× move)</div>
       <div style="font-size:14px;font-weight:700;color:#26c6da;">{_fmt(t1)}</div>
+      <div style="font-size:8.5px;color:#484f58;">breakout + swing</div>
     </div>
     <div>
       <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">Risk/Reward</div>
@@ -226,12 +253,14 @@ def _trade_plan_card(row: dict) -> str:
   </div>
   <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:0.8rem;">
     <div>
-      <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">T2 (1R above T1)</div>
+      <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">T2 (2× move)</div>
       <div style="font-size:13px;font-weight:700;color:#00e676;">{_fmt(t2)}</div>
+      <div style="font-size:8.5px;color:#484f58;">breakout + 2× swing</div>
     </div>
     <div>
-      <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">T3 (3R from entry)</div>
+      <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">T3 (3× move)</div>
       <div style="font-size:13px;font-weight:700;color:#00e676;">{_fmt(t3)}</div>
+      <div style="font-size:8.5px;color:#484f58;">breakout + 3× swing</div>
     </div>
   </div>
   <div style="border-top:1px solid #21262d;padding-top:0.5rem;font-size:9.5px;color:#8b949e;">
@@ -392,9 +421,9 @@ def render(settings: dict | None = None):
                         st.markdown(_trade_plan_card(_r), unsafe_allow_html=True)
                         st.markdown(
                             "<div style='font-size:9.5px;color:#484f58;padding:4px 0 12px;'>"
-                            "SL = swing low of last 10 bars · "
-                            "T1 = swing high resistance (last 20 bars) · "
-                            "T2 = T1 + 1R · T3 = entry + 3R · "
+                            "SL = pullback low − 0.5×ATR (bounded 0.3–3×ATR) · "
+                            "T1 = breakout point + prior swing size (measured move) · "
+                            "T2 = breakout + 2× swing · T3 = breakout + 3× swing · "
                             "RR = (T1−entry)/(entry−SL)"
                             "</div>",
                             unsafe_allow_html=True,
