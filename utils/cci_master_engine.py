@@ -88,71 +88,187 @@ def _cci_hlc3(high: pd.Series, low: pd.Series, close: pd.Series, length: int) ->
     return (tp - sma_s) / (0.015 * mad_s)
 
 
+def _find_cci_swing_context(
+    df: pd.DataFrame,
+    cci: pd.Series,
+    signal_bar: int,
+    atr_val: float,
+    os_level: float = -100,
+    max_lookback: int = 120,
+) -> dict:
+    """
+    For a CCI BUY signal at signal_bar, identify the three structural points
+    that define the pullback context:
+
+        prior_low   : swing low BEFORE the prior rally (base of the up-leg)
+        breakout_pt : highest high BEFORE CCI went oversold (top of the up-leg)
+                      = the point price must break out above = T1 reference
+        pullback_low: lowest low DURING the CCI oversold episode
+                      = the dip low = SL reference
+
+    Measured move:
+        swing_size  = breakout_pt - prior_low   (size of the prior up-leg)
+        T1          = breakout_pt + swing_size   (project the same move above breakout)
+        T2          = T1 + swing_size            (second extension)
+
+    Fallbacks at each step if structure is not cleanly detectable.
+    """
+    entry = float(df["close"].iloc[signal_bar])
+
+    # ── Step 1: find where CCI entered oversold (first bar < os_level) ──
+    # Scan backward from signal_bar to find the start of this oversold episode
+    os_start = signal_bar  # default: signal bar itself
+    for k in range(signal_bar - 1, max(0, signal_bar - max_lookback) - 1, -1):
+        if float(cci.iloc[k]) > os_level:
+            os_start = k + 1   # first bar that went oversold
+            break
+
+    # ── Step 2: breakout_pt = highest high in the bars BEFORE oversold ──
+    # This is the pre-pullback peak — where price was before the dip
+    pre_dip_start = max(0, os_start - max_lookback)
+    pre_dip_highs = df["high"].iloc[pre_dip_start: os_start]
+
+    if not pre_dip_highs.empty:
+        breakout_pt     = float(pre_dip_highs.max())
+        breakout_pt_idx = pre_dip_highs.idxmax()
+        bp_source       = "pre_dip_peak"
+    else:
+        breakout_pt     = entry + 2.0 * atr_val
+        breakout_pt_idx = df.index[max(0, signal_bar - 5)]
+        bp_source       = "atr_fallback"
+
+    # ── Step 3: pullback_low = lowest low DURING the oversold episode ──
+    # (from os_start to signal_bar inclusive)
+    dip_lows    = df["low"].iloc[os_start: signal_bar + 1]
+    if not dip_lows.empty:
+        pullback_low = float(dip_lows.min())
+        sl_source    = "pullback_low"
+    else:
+        pullback_low = entry - 1.5 * atr_val
+        sl_source    = "atr_fallback"
+
+    # ── Step 4: prior_low = swing low BEFORE the rally that preceded the dip ──
+    # The base of the prior up-leg: lowest low in the window before breakout_pt
+    bp_loc       = df.index.get_loc(breakout_pt_idx) if breakout_pt_idx in df.index else os_start
+    prior_window = df["low"].iloc[max(0, bp_loc - max_lookback): bp_loc]
+    if not prior_window.empty:
+        prior_low   = float(prior_window.min())
+        pl_source   = "prior_swing_low"
+    else:
+        prior_low   = breakout_pt - 2.0 * atr_val * 5   # rough fallback
+        pl_source   = "atr_fallback"
+
+    # ── Step 5: swing_size = prior up-leg height ──────────────────
+    swing_size = max(breakout_pt - prior_low, atr_val * 2)   # floor at 2 ATR
+
+    return {
+        "os_start":      os_start,
+        "breakout_pt":   round(breakout_pt, 2),
+        "pullback_low":  round(pullback_low, 2),
+        "prior_low":     round(prior_low, 2),
+        "swing_size":    round(swing_size, 2),
+        "bp_source":     bp_source,
+        "sl_source":     sl_source,
+        "pl_source":     pl_source,
+        "dip_bars":      signal_bar - os_start,
+    }
+
+
 def compute_cci_trade_levels(
     df: pd.DataFrame,
     signal_bar: int,
     atr_val: float,
-    sl_lookback: int = 10,
-    t1_lookback: int = 20,
+    cci: pd.Series | None = None,
+    os_level: float = -100,
 ) -> dict:
     """
-    Compute CCI-native trade levels for a BUY signal at bar index `signal_bar`.
+    Compute CCI-native trade levels using measured-move logic.
 
-    SL  : lowest Low of the last `sl_lookback` bars before the signal bar.
-          Floored at entry - 3×ATR so extreme gaps don't produce huge SL.
-    T1  : highest High of the last `t1_lookback` bars (nearest resistance).
-          If no swing high is above entry, falls back to entry + 1.5×ATR.
-    T2  : T1 + (T1 - SL)   — 1R extension above T1.
-    T3  : entry + 3×(entry - SL)  — 3R extension.
-    RR  : (T1 - entry) / (entry - SL)
+    Context:
+        CCI pullback BUY = price dipped (CCI < os_level) then recovered.
+        The prior up-swing defines the measured move target.
 
-    Returns dict with: entry, sl, t1, t2, t3, rr, sl_source, t1_source, atr
+    SL  : Lowest low DURING the CCI oversold dip − 0.5×ATR buffer.
+          Bounded: never wider than 3×ATR, never tighter than 0.3×ATR.
+          Rationale: if price breaks the dip low, the pullback has failed.
+
+    T1  : breakout_pt + swing_size  (measured move = prior up-leg projected above breakout).
+          breakout_pt = pre-pullback high (where the dip started from).
+          swing_size  = breakout_pt − prior_swing_low (size of prior up-leg).
+          Rationale: pullback continuation trades typically complete a measured
+          move equal to the prior leg.
+
+    T2  : T1 + swing_size  (second measured move extension).
+
+    T3  : T1 + 2 × swing_size  (full extension for strong momentum).
+
+    RR  : (T1 − entry) / (entry − SL).
+
+    Returns dict with all levels plus context metadata for display/debugging.
     """
     close = float(df["close"].iloc[signal_bar])
     entry = round(close, 2)
 
-    # ── SL: swing low ──────────────────────────────────────────────
-    look_start = max(0, signal_bar - sl_lookback)
-    swing_low  = float(df["low"].iloc[look_start:signal_bar + 1].min())
-    sl_floor   = entry - 3.0 * atr_val            # cap at 3 ATR below entry
-    sl         = round(max(swing_low, sl_floor), 2)
-    sl_source  = "swing_low" if swing_low >= sl_floor else "atr_floor"
+    # Need CCI series to find the oversold episode start
+    if cci is None:
+        # Recompute CCI if not supplied (sl_lookback path from _score_one_symbol)
+        cci = _cci_hlc3(df["high"], df["low"], df["close"], 14)
 
-    # Ensure SL is strictly below entry
-    if sl >= entry:
-        sl = round(entry - 1.5 * atr_val, 2)
-        sl_source = "atr_fallback"
+    # ── Identify structural context ────────────────────────────────
+    ctx = _find_cci_swing_context(df, cci, signal_bar, atr_val, os_level)
+
+    # ── SL: pullback low − buffer, bounded ────────────────────────
+    sl_raw    = ctx["pullback_low"] - 0.5 * atr_val
+    sl_floor  = entry - 3.0 * atr_val   # never wider than 3 ATR
+    sl_ceil   = entry - 0.3 * atr_val   # never tighter than 0.3 ATR
+    sl        = round(float(np.clip(sl_raw, sl_floor, sl_ceil)), 2)
+
+    if sl_raw >= sl_floor and sl_raw <= sl_ceil:
+        sl_source = f"pullback_low−0.5ATR ({ctx['dip_bars']}bar dip)"
+    elif sl_raw < sl_floor:
+        sl_source = "atr_floor_3x (dip too deep)"
+    else:
+        sl_source = "atr_ceil_0.3x (dip too shallow)"
 
     risk = max(entry - sl, 0.01)
 
-    # ── T1: nearest swing high (resistance) ───────────────────────
-    look_start_t1 = max(0, signal_bar - t1_lookback)
-    swing_high    = float(df["high"].iloc[look_start_t1:signal_bar + 1].max())
-    if swing_high > entry:
-        t1        = round(swing_high, 2)
-        t1_source = "swing_high"
+    # ── Targets: measured move from breakout_pt ───────────────────
+    bp          = ctx["breakout_pt"]
+    swing_size  = ctx["swing_size"]
+
+    t1 = round(bp + swing_size, 2)         # breakout + 1× prior leg
+    t2 = round(bp + 2 * swing_size, 2)     # breakout + 2× prior leg
+    t3 = round(bp + 3 * swing_size, 2)     # breakout + 3× prior leg
+
+    # If T1 is below entry (can happen if swing was small / price already extended)
+    # fall back to entry + 2×swing_size minimum
+    if t1 <= entry:
+        t1 = round(entry + swing_size, 2)
+        t2 = round(entry + 2 * swing_size, 2)
+        t3 = round(entry + 3 * swing_size, 2)
+        t1_source = "measured_move_from_entry"
     else:
-        t1        = round(entry + 1.5 * atr_val, 2)
-        t1_source = "atr_fallback"
+        t1_source = f"measured_move_from_breakout ({ctx['bp_source']})"
 
-    # ── T2 / T3 ────────────────────────────────────────────────────
-    t2 = round(t1 + (t1 - sl), 2)          # 1R extension above T1
-    t3 = round(entry + 3.0 * risk, 2)       # 3R from entry
-
-    # ── Risk/Reward ────────────────────────────────────────────────
     rr = round((t1 - entry) / risk, 2) if risk > 0 else 0.0
 
     return {
-        "entry":     entry,
-        "sl":        sl,
-        "t1":        t1,
-        "t2":        t2,
-        "t3":        t3,
-        "rr":        rr,
-        "sl_source": sl_source,
-        "t1_source": t1_source,
-        "atr":       round(atr_val, 2),
-        "risk_pts":  round(risk, 2),
+        "entry":        entry,
+        "sl":           sl,
+        "t1":           t1,
+        "t2":           t2,
+        "t3":           t3,
+        "rr":           rr,
+        "sl_source":    sl_source,
+        "t1_source":    t1_source,
+        "atr":          round(atr_val, 2),
+        "risk_pts":     round(risk, 2),
+        # ── Context for display ────────────────────────────────────
+        "breakout_pt":  ctx["breakout_pt"],
+        "swing_size":   ctx["swing_size"],
+        "pullback_low": ctx["pullback_low"],
+        "prior_low":    ctx["prior_low"],
+        "dip_bars":     ctx["dip_bars"],
     }
 
 
@@ -231,7 +347,13 @@ def _score_one_symbol(symbol: str, df: pd.DataFrame, params: CCIMasterParams) ->
     # compute so the table can show levels for WATCH/AVOID too (as context).
     atr_s   = _atr_fn(df["high"], df["low"], df["close"], 14)
     atr_val = float(atr_s.iloc[last_idx]) if not pd.isna(atr_s.iloc[last_idx]) else close * 0.02
-    levels  = compute_cci_trade_levels(df, last_idx, atr_val)
+    # Pass the CCI series so compute_cci_trade_levels can find the oversold episode
+    _cci_series = computed["cci"]
+    levels  = compute_cci_trade_levels(
+        df, last_idx, atr_val,
+        cci=_cci_series,
+        os_level=float(params.os_level),
+    )
 
     return {
         "Stock":        symbol,
@@ -254,6 +376,12 @@ def _score_one_symbol(symbol: str, df: pd.DataFrame, params: CCIMasterParams) ->
         "Risk_Pts":     levels["risk_pts"],
         "SL_Source":    levels["sl_source"],
         "T1_Source":    levels["t1_source"],
+        # ── Measured move context ───────────────────────────────────
+        "Breakout_Pt":  levels.get("breakout_pt",  None),
+        "Swing_Size":   levels.get("swing_size",   None),
+        "Pullback_Low": levels.get("pullback_low", None),
+        "Prior_Low":    levels.get("prior_low",    None),
+        "Dip_Bars":     levels.get("dip_bars",     None),
     }
 
 
