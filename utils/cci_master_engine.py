@@ -36,7 +36,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from utils.scanner_engine import fetch_batch_ohlcv, NIFTY500_SYMBOLS
+from utils.scanner_engine import fetch_batch_ohlcv, NIFTY500_SYMBOLS, atr as _atr_fn
 
 # ── Defaults — match Pine indicator inputs exactly ────────────────────────
 DEFAULT_CCI_LENGTH   = 14
@@ -86,6 +86,74 @@ def _cci_hlc3(high: pd.Series, low: pd.Series, close: pd.Series, length: int) ->
     mad_s = tp.rolling(length).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
     mad_s = mad_s.replace(0, np.nan)
     return (tp - sma_s) / (0.015 * mad_s)
+
+
+def compute_cci_trade_levels(
+    df: pd.DataFrame,
+    signal_bar: int,
+    atr_val: float,
+    sl_lookback: int = 10,
+    t1_lookback: int = 20,
+) -> dict:
+    """
+    Compute CCI-native trade levels for a BUY signal at bar index `signal_bar`.
+
+    SL  : lowest Low of the last `sl_lookback` bars before the signal bar.
+          Floored at entry - 3×ATR so extreme gaps don't produce huge SL.
+    T1  : highest High of the last `t1_lookback` bars (nearest resistance).
+          If no swing high is above entry, falls back to entry + 1.5×ATR.
+    T2  : T1 + (T1 - SL)   — 1R extension above T1.
+    T3  : entry + 3×(entry - SL)  — 3R extension.
+    RR  : (T1 - entry) / (entry - SL)
+
+    Returns dict with: entry, sl, t1, t2, t3, rr, sl_source, t1_source, atr
+    """
+    close = float(df["close"].iloc[signal_bar])
+    entry = round(close, 2)
+
+    # ── SL: swing low ──────────────────────────────────────────────
+    look_start = max(0, signal_bar - sl_lookback)
+    swing_low  = float(df["low"].iloc[look_start:signal_bar + 1].min())
+    sl_floor   = entry - 3.0 * atr_val            # cap at 3 ATR below entry
+    sl         = round(max(swing_low, sl_floor), 2)
+    sl_source  = "swing_low" if swing_low >= sl_floor else "atr_floor"
+
+    # Ensure SL is strictly below entry
+    if sl >= entry:
+        sl = round(entry - 1.5 * atr_val, 2)
+        sl_source = "atr_fallback"
+
+    risk = max(entry - sl, 0.01)
+
+    # ── T1: nearest swing high (resistance) ───────────────────────
+    look_start_t1 = max(0, signal_bar - t1_lookback)
+    swing_high    = float(df["high"].iloc[look_start_t1:signal_bar + 1].max())
+    if swing_high > entry:
+        t1        = round(swing_high, 2)
+        t1_source = "swing_high"
+    else:
+        t1        = round(entry + 1.5 * atr_val, 2)
+        t1_source = "atr_fallback"
+
+    # ── T2 / T3 ────────────────────────────────────────────────────
+    t2 = round(t1 + (t1 - sl), 2)          # 1R extension above T1
+    t3 = round(entry + 3.0 * risk, 2)       # 3R from entry
+
+    # ── Risk/Reward ────────────────────────────────────────────────
+    rr = round((t1 - entry) / risk, 2) if risk > 0 else 0.0
+
+    return {
+        "entry":     entry,
+        "sl":        sl,
+        "t1":        t1,
+        "t2":        t2,
+        "t3":        t3,
+        "rr":        rr,
+        "sl_source": sl_source,
+        "t1_source": t1_source,
+        "atr":       round(atr_val, 2),
+        "risk_pts":  round(risk, 2),
+    }
 
 
 def compute_cci_master(df: pd.DataFrame, params: CCIMasterParams) -> pd.DataFrame | None:
@@ -145,7 +213,8 @@ def _score_one_symbol(symbol: str, df: pd.DataFrame, params: CCIMasterParams) ->
     if computed is None:
         return None
 
-    last = computed.iloc[-1]
+    last      = computed.iloc[-1]
+    last_idx  = len(computed) - 1
     prev_rating = computed.iloc[-2]["cci_rating"] if len(computed) >= 2 else None
 
     cci_v = float(last["cci"]) if not pd.isna(last["cci"]) else float("nan")
@@ -155,6 +224,14 @@ def _score_one_symbol(symbol: str, df: pd.DataFrame, params: CCIMasterParams) ->
     close = float(last["close"])
     prev_close = float(computed.iloc[-2]["close"]) if len(computed) >= 2 else close
     chg_pct = ((close - prev_close) / prev_close * 100.0) if prev_close else 0.0
+
+    # ── Trade levels (SL / T1 / T2 / T3 / RR) ───────────────────
+    # Compute ATR on the underlying df, then derive swing-based levels.
+    # Only meaningful when there is a recent BUY signal — but we always
+    # compute so the table can show levels for WATCH/AVOID too (as context).
+    atr_s   = _atr_fn(df["high"], df["low"], df["close"], 14)
+    atr_val = float(atr_s.iloc[last_idx]) if not pd.isna(atr_s.iloc[last_idx]) else close * 0.02
+    levels  = compute_cci_trade_levels(df, last_idx, atr_val)
 
     return {
         "Stock":        symbol,
@@ -167,6 +244,16 @@ def _score_one_symbol(symbol: str, df: pd.DataFrame, params: CCIMasterParams) ->
         "Rating":       str(last["cci_rating"]),
         "FreshRating":  bool(prev_rating is not None and prev_rating != last["cci_rating"]),
         "Date":         computed.index[-1],
+        # ── Trade plan fields ──────────────────────────────────────
+        "SL":           levels["sl"],
+        "T1":           levels["t1"],
+        "T2":           levels["t2"],
+        "T3":           levels["t3"],
+        "RR":           levels["rr"],
+        "ATR":          levels["atr"],
+        "Risk_Pts":     levels["risk_pts"],
+        "SL_Source":    levels["sl_source"],
+        "T1_Source":    levels["t1_source"],
     }
 
 

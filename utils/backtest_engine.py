@@ -416,9 +416,18 @@ def generate_signals_cci_master(
 ) -> pd.DataFrame:
     """
     Walk-forward signal scan using CCI Master logic (Pine Script port).
-    Returns one row per BUY signal bar with entry/sl/t1/t2 pre-computed.
+
+    Entry : CCI crosses UP through os_level (cci_signal == "BUY")
+    SL    : swing low of last 10 bars (floored at entry − 3×ATR)
+    T1    : swing high resistance of last 20 bars (ATR fallback)
+    T2    : T1 + 1R above T1
+    T3    : entry + 3R
+    Exit  : native EXIT signal stored as "cci_exit_bar" on the signal row
+            so simulate_trades can check it alongside SL/T1/T2.
+
+    Returns one row per BUY signal bar with entry/sl/t1/t2/t3 pre-computed.
     """
-    from utils.cci_master_engine import compute_cci_master, CCIMasterParams
+    from utils.cci_master_engine import compute_cci_master, CCIMasterParams, compute_cci_trade_levels
     from utils.scanner_engine import atr as _atr_fn
 
     if params is None:
@@ -428,7 +437,6 @@ def generate_signals_cci_master(
     if result is None or result.empty:
         return pd.DataFrame()
 
-    # ATR for SL/target sizing
     atr_s = _atr_fn(df["high"], df["low"], df["close"], 14)
 
     signals = []
@@ -443,14 +451,23 @@ def generate_signals_cci_master(
         close_price = float(result["close"].iloc[i])
         atr_val     = float(atr_s.iloc[i]) if not pd.isna(atr_s.iloc[i]) else close_price * 0.02
 
-        entry = round(close_price, 2)
-        sl    = round(entry - 1.5 * atr_val, 2)
-        t1    = round(entry + 1.5 * atr_val, 2)
-        t2    = round(entry + 3.0 * atr_val, 2)
-        t3    = round(entry + 5.0 * atr_val, 2)
+        # Swing-based SL and resistance-based T1
+        levels = compute_cci_trade_levels(df, i, atr_val, sl_lookback=10, t1_lookback=20)
+        entry  = levels["entry"]
+        sl     = levels["sl"]
+        t1     = levels["t1"]
+        t2     = levels["t2"]
+        t3     = levels["t3"]
 
         if sl >= entry or t1 <= entry:
             continue
+
+        # Find next EXIT signal bar index (for backtest to use as hard exit)
+        next_exit_bar = None
+        for j in range(i + 1, min(i + 60, len(result))):
+            if result["cci_signal"].iloc[j] == "EXIT":
+                next_exit_bar = j
+                break
 
         last_signal_bar = i
         signals.append({
@@ -461,12 +478,17 @@ def generate_signals_cci_master(
             "t1":              t1,
             "t2":              t2,
             "t3":              t3,
-            "t1_mult":         1.5,
+            "t1_mult":         levels["rr"] if levels["rr"] > 0 else 1.5,
             "t2_mult":         3.0,
             "t3_mult":         5.0,
             "target_category": "CCI Master",
             "target_adj":      0.0,
-            "target_notes":    f"ATR={round(atr_val,2)}",
+            "target_notes":    (
+                f"SL={levels['sl_source']} T1={levels['t1_source']} "
+                f"ATR={levels['atr']} RR={levels['rr']}"
+            ),
+            # Native exit signal date — simulate_trades will hard-exit on this bar
+            "cci_exit_bar":    result.index[next_exit_bar] if next_exit_bar is not None else None,
             "cci":             round(float(result["cci"].iloc[i]), 1),
             "rsi":             0.0,
             "tier1_prime":     False,
@@ -669,20 +691,32 @@ def simulate_trades(
         sig_t3  = float(sig.get("t3", sig_t2))
         sig_en  = float(sig["entry"])   # signal close (the padded anchor)
 
-        # Rescale levels: shift SL and targets from padded-close to actual open.
-        # scoring_core already added 0.5% padding into the level calculations.
-        # If actual open differs from that pad, shift all levels proportionally.
-        scale = (entry_price - sig_sl) / (sig_t1 - sig_sl) if (sig_t1 - sig_sl) > 0 else 1.0
-        sl = sig_sl + (entry_price - sig_en) * 0.5   # shift SL by half the gap
-        sl = round(min(sl, sig_sl + abs(entry_price - sig_en)), 2)  # cap shift
+        # ── CCI Master mode: use swing-based levels as-is, no rescaling ──
+        # Swing SL and resistance T1 are absolute price levels anchored to
+        # actual bar structure, not to a scored close+0.5% pad.
+        # We also respect the native CCI EXIT signal as a hard exit date.
+        _is_cci_mode = sig.get("setup", "") == "CCI_MASTER"
+        _cci_exit_date = sig.get("cci_exit_bar", None)
 
-        # Recompute risk and targets from actual entry using adaptive multiples
-        rk   = max(entry_price - sl, 0.01)
-        _t1m = float(sig.get("t1_mult", 1.5))
-        _t2m = float(sig.get("t2_mult", 3.0))
-        _t3m = float(sig.get("t3_mult", 5.0))
-        t1   = round(entry_price + rk * _t1m, 2)
-        t2   = round(entry_price + rk * _t2m, 2)
+        if _is_cci_mode:
+            sl  = sig_sl       # swing low — use as-is
+            rk  = max(entry_price - sl, 0.01)
+            t1  = sig_t1       # swing high resistance
+            t2  = sig_t2       # T1 + 1R
+            _t1m = float(sig.get("t1_mult", 1.5))
+            _t2m = float(sig.get("t2_mult", 3.0))
+            _t3m = float(sig.get("t3_mult", 5.0))
+        else:
+            # ── Scanner / Five Pillars mode: rescale from padded-close to open ──
+            scale = (entry_price - sig_sl) / (sig_t1 - sig_sl) if (sig_t1 - sig_sl) > 0 else 1.0
+            sl = sig_sl + (entry_price - sig_en) * 0.5   # shift SL by half the gap
+            sl = round(min(sl, sig_sl + abs(entry_price - sig_en)), 2)  # cap shift
+            rk   = max(entry_price - sl, 0.01)
+            _t1m = float(sig.get("t1_mult", 1.5))
+            _t2m = float(sig.get("t2_mult", 3.0))
+            _t3m = float(sig.get("t3_mult", 5.0))
+            t1   = round(entry_price + rk * _t1m, 2)
+            t2   = round(entry_price + rk * _t2m, 2)
 
         # Gap-down: open already below SL
         if entry_price <= sl:
@@ -707,11 +741,25 @@ def simulate_trades(
         t1_triggered = False
         _mf_confirm  = False   # v13: 2-bar momentum-fail confirmation arm
 
-        window = future.iloc[: hold_days + 1]
+        # CCI Master: cap window at native EXIT signal if it arrives before hold_days
+        if _is_cci_mode and _cci_exit_date is not None:
+            _exit_ts = pd.Timestamp(_cci_exit_date)
+            future_cci = future[future.index <= _exit_ts]
+            window = future_cci.iloc[: hold_days + 1] if not future_cci.empty else future.iloc[: hold_days + 1]
+        else:
+            window = future.iloc[: hold_days + 1]
+
         for dt, row in window.iterrows():
             bar_low  = float(row["low"])
             bar_high = float(row["high"])
             bar_open = float(row["open"])
+
+            # CCI Master native EXIT signal: hard exit at close of this bar
+            if _is_cci_mode and _cci_exit_date is not None and dt >= pd.Timestamp(_cci_exit_date):
+                exit_price  = float(row["close"])
+                exit_date   = dt
+                exit_reason = "CCI_EXIT"
+                break
 
             sl_hit = bar_low  <= active_sl
             t1_hit = bar_high >= t1
