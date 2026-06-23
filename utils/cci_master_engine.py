@@ -94,7 +94,7 @@ def _find_cci_swing_context(
     signal_bar: int,
     atr_val: float,
     os_level: float = -100,
-    max_lookback: int = 120,
+    max_lookback: int = 60,
 ) -> dict:
     """
     For a CCI BUY signal at signal_bar, identify the three structural points
