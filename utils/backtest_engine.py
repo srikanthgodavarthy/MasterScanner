@@ -451,8 +451,12 @@ def generate_signals_cci_master(
         close_price = float(result["close"].iloc[i])
         atr_val     = float(atr_s.iloc[i]) if not pd.isna(atr_s.iloc[i]) else close_price * 0.02
 
-        # Swing-based SL and resistance-based T1
-        levels = compute_cci_trade_levels(df, i, atr_val, sl_lookback=10, t1_lookback=20)
+        # Measured-move SL and target: pass CCI series + os_level
+        levels = compute_cci_trade_levels(
+            df, i, atr_val,
+            cci      = result["cci"],
+            os_level = float(params.os_level),
+        )
         entry  = levels["entry"]
         sl     = levels["sl"]
         t1     = levels["t1"]
@@ -699,10 +703,14 @@ def simulate_trades(
         _cci_exit_date = sig.get("cci_exit_bar", None)
 
         if _is_cci_mode:
-            sl  = sig_sl       # swing low — use as-is
-            rk  = max(entry_price - sl, 0.01)
-            t1  = sig_t1       # swing high resistance
-            t2  = sig_t2       # T1 + 1R
+            # SL stays as absolute swing-low price level (bar structure, not a multiple).
+            # T1 also stays as absolute pivot-high price level.
+            # Recompute rk from actual entry open so the risk unit is accurate.
+            # T2 and T3 shift with actual entry, keeping 1R-above-T1 and 3R intact.
+            sl   = sig_sl                              # absolute swing low — unchanged
+            t1   = sig_t1                              # absolute pivot high — unchanged
+            rk   = max(entry_price - sl, 0.01)         # risk from ACTUAL open, not signal close
+            t2   = round(t1 + rk, 2)                  # 1R above T1, recalculated from actual rk
             _t1m = float(sig.get("t1_mult", 1.5))
             _t2m = float(sig.get("t2_mult", 3.0))
             _t3m = float(sig.get("t3_mult", 5.0))
@@ -853,9 +861,11 @@ def simulate_trades(
             "pnl_abs":         round(exit_price - entry_price, 2),
             "score_at_entry":  sig["score"],
             "cci_at_entry":    sig["cci"],
-            "sl":              sig["sl"],
-            "t1":              sig["t1"],
-            "t2":              sig["t2"],
+            # For CCI mode: sl/t1 are absolute price levels reused as-is;
+            # t2 was recalculated from actual entry rk above — use local vars.
+            "sl":              round(sl, 2),
+            "t1":              round(t1, 2),
+            "t2":              round(t2, 2),
             "setup":           sig.get("setup", "-"),
             "buy_type":        sig.get("buy_type", "-"),
             "tier":            sig.get("tier", "-"),
@@ -894,6 +904,8 @@ def simulate_trades(
             "target_category": str(sig.get("target_category",  "Actionable")),
             "target_adj":      float(sig.get("target_adj",      0.0)),
             "target_notes":    str(sig.get("target_notes",      "")),
+            # Actual RR at entry (from real open, not signal close)
+            "rr_actual":       round((t1 - entry_price) / rk, 2) if rk > 0 else 0.0,
         })
 
         blocked_until = exit_date
