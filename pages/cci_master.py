@@ -22,6 +22,7 @@ import streamlit as st
 
 from utils.cci_master_engine import (
     run_cci_master_scan, get_symbol_cci_history, CCIMasterParams,
+    compute_cci_trade_levels,
     RATING_STRONG_BUY, RATING_BUY, RATING_WATCH, RATING_AVOID,
     RATING_COLORS, STATE_COLORS, SIGNAL_COLORS,
     DEFAULT_CCI_LENGTH, DEFAULT_OB_LEVEL, DEFAULT_OS_LEVEL,
@@ -160,11 +161,95 @@ def _rating_cell(rating: str, fresh: bool) -> str:
     )
 
 
+def _price_cell(val, color="#e6edf3") -> str:
+    if not _is_valid_num(val):
+        return '<td>—</td>'
+    return f'<td style="color:{color};font-weight:600">{float(val):.2f}</td>'
+
+
+def _rr_cell(val) -> str:
+    if not _is_valid_num(val):
+        return '<td>—</td>'
+    v = float(val)
+    color = "#00e676" if v >= 2.0 else ("#ffb300" if v >= 1.0 else "#ef5350")
+    return f'<td style="color:{color};font-weight:700">{v:.1f}R</td>'
+
+
+def _trade_plan_card(row: dict) -> str:
+    """Render a compact trade plan card for a single CCI Master stock."""
+    sl       = row.get("SL",       "—")
+    t1       = row.get("T1",       "—")
+    t2       = row.get("T2",       "—")
+    t3       = row.get("T3",       "—")
+    rr       = row.get("RR",       "—")
+    atr      = row.get("ATR",      "—")
+    risk_pts = row.get("Risk_Pts", "—")
+    sl_src   = row.get("SL_Source","—")
+    t1_src   = row.get("T1_Source","—")
+    close    = row.get("Close",    "—")
+    signal   = row.get("Signal",   "-")
+
+    rr_color = "#00e676" if _is_valid_num(rr) and float(rr) >= 2.0 else (
+        "#ffb300" if _is_valid_num(rr) and float(rr) >= 1.0 else "#ef5350"
+    )
+    sig_color = SIGNAL_COLORS.get(signal, "#8b949e")
+
+    exit_note = (
+        "Exit triggered when CCI crosses DOWN through 0 (BULL→BEAR) "
+        "or crosses DOWN through OB level (OB→BULL)."
+    )
+
+    def _fmt(v):
+        return f"{float(v):.2f}" if _is_valid_num(v) else "—"
+
+    return f"""
+<div style="background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:1rem 1.2rem;margin-top:0.6rem;font-family:'JetBrains Mono',monospace;font-size:12px;">
+  <div style="font-size:10px;color:#8b949e;margin-bottom:0.6rem;letter-spacing:0.06em;text-transform:uppercase;">Trade Plan</div>
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:0.8rem;">
+    <div>
+      <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">Entry (Close)</div>
+      <div style="font-size:14px;font-weight:700;color:#e6edf3;">{_fmt(close)}</div>
+    </div>
+    <div>
+      <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">SL <span style="color:#484f58;font-size:8px;">({sl_src})</span></div>
+      <div style="font-size:14px;font-weight:700;color:#ef5350;">{_fmt(sl)}</div>
+      <div style="font-size:9px;color:#484f58;">Risk: {_fmt(risk_pts)} pts · {_fmt(atr)} ATR</div>
+    </div>
+    <div>
+      <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">T1 <span style="color:#484f58;font-size:8px;">({t1_src})</span></div>
+      <div style="font-size:14px;font-weight:700;color:#26c6da;">{_fmt(t1)}</div>
+    </div>
+    <div>
+      <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">Risk/Reward</div>
+      <div style="font-size:14px;font-weight:700;color:{rr_color};">{_fmt(rr)}R</div>
+    </div>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:0.8rem;">
+    <div>
+      <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">T2 (1R above T1)</div>
+      <div style="font-size:13px;font-weight:700;color:#00e676;">{_fmt(t2)}</div>
+    </div>
+    <div>
+      <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">T3 (3R from entry)</div>
+      <div style="font-size:13px;font-weight:700;color:#00e676;">{_fmt(t3)}</div>
+    </div>
+  </div>
+  <div style="border-top:1px solid #21262d;padding-top:0.5rem;font-size:9.5px;color:#8b949e;">
+    <span style="color:{sig_color};font-weight:700;">CCI EXIT signal</span> — {exit_note}
+  </div>
+</div>
+"""
+
+
 def _build_table_html(df: pd.DataFrame) -> str:
     if df.empty:
         return '<div class="cci-empty"><div class="icn">📡</div>No candidates in this bucket.</div>'
 
+    has_levels = "SL" in df.columns
+
     headers = ["Stock", "Close", "Chg%", "CCI", "State", "Signal", "Score", "Rating"]
+    if has_levels:
+        headers += ["SL", "T1", "T2", "RR"]
     header_html = "".join(f"<th>{h}</th>" for h in headers)
 
     rows_html = ""
@@ -177,6 +262,11 @@ def _build_table_html(df: pd.DataFrame) -> str:
         cells += _signal_cell(str(row.get("Signal", "-")))
         cells += _score_cell(row.get("Score"))
         cells += _rating_cell(str(row.get("Rating", "-")), bool(row.get("FreshRating", False)))
+        if has_levels:
+            cells += _price_cell(row.get("SL"), "#ef5350")
+            cells += _price_cell(row.get("T1"), "#26c6da")
+            cells += _price_cell(row.get("T2"), "#00e676")
+            cells += _rr_cell(row.get("RR"))
         rows_html += f"<tr>{cells}</tr>"
 
     return (
@@ -291,10 +381,26 @@ def render(settings: dict | None = None):
             subset = subset.sort_values(sort_field, ascending=False)
             st.markdown(_build_table_html(subset), unsafe_allow_html=True)
 
-            with st.expander("🔬 CCI Detail — individual stock", expanded=False):
+            with st.expander("🔬 CCI Detail — trade plan & history", expanded=False):
                 picks = subset["Stock"].tolist()[:50]
                 picked = st.selectbox("Select stock", picks, key=f"ccim_detail_sel_{rating}")
                 if picked:
+                    # ── Trade plan from scan row ──────────────────────────
+                    _row_match = subset[subset["Stock"] == picked]
+                    if not _row_match.empty and "SL" in _row_match.columns:
+                        _r = _row_match.iloc[0].to_dict()
+                        st.markdown(_trade_plan_card(_r), unsafe_allow_html=True)
+                        st.markdown(
+                            "<div style='font-size:9.5px;color:#484f58;padding:4px 0 12px;'>"
+                            "SL = swing low of last 10 bars · "
+                            "T1 = swing high resistance (last 20 bars) · "
+                            "T2 = T1 + 1R · T3 = entry + 3R · "
+                            "RR = (T1−entry)/(entry−SL)"
+                            "</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                    # ── CCI history ──────────────────────────────────────
                     hist = get_symbol_cci_history(
                         picked, period="6mo",
                         cci_length=int(cci_length) if run_btn or "ccim_len" in st.session_state else DEFAULT_CCI_LENGTH,
@@ -308,10 +414,10 @@ def render(settings: dict | None = None):
                     else:
                         last = hist.iloc[-1]
                         st.markdown(
-                            f"<div style='font-size:11px;color:#8b949e'>Last 10 bars — "
-                            f"current CCI <b style='color:#e6edf3'>{last['cci']:.1f}</b>, "
-                            f"state <b style='color:#e6edf3'>{last['cci_state']}</b>, "
-                            f"signal <b style='color:#e6edf3'>{last['cci_signal']}</b></div>",
+                            f"<div style='font-size:11px;color:#8b949e;margin-bottom:4px;'>Last 10 bars — "
+                            f"CCI <b style='color:#e6edf3'>{last['cci']:.1f}</b> &nbsp;·&nbsp; "
+                            f"State <b style='color:#e6edf3'>{last['cci_state']}</b> &nbsp;·&nbsp; "
+                            f"Signal <b style='color:#e6edf3'>{last['cci_signal']}</b></div>",
                             unsafe_allow_html=True,
                         )
                         st.dataframe(
