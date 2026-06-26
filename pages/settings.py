@@ -565,70 +565,70 @@ def _tab_advanced() -> None:
         with c1:
             _label("Enable VWAP Reclaim scoring")
             ic_enable = st.toggle("Enable VWAP Reclaim", value=_g("ic_enable_vwap_reclaim"),
-                key="ic_enable_vwap_reclaim")
+                key="w_ic_enable_vwap_reclaim")
             _s("ic_enable_vwap_reclaim", bool(ic_enable))
 
             _label("Enable VWAP / Stoch Confluence bonus")
             ic_conf = st.toggle("Enable Confluence", value=_g("ic_enable_vwap_stoch_conf"),
-                key="ic_enable_vwap_stoch_conf")
+                key="w_ic_enable_vwap_stoch_conf")
             _s("ic_enable_vwap_stoch_conf", bool(ic_conf))
 
             _label("VWAP Touch ATR Multiple")
             ic_atr_mult = st.slider("ATR Mult", 0.05, 1.0,
                 float(_g("ic_vwap_touch_atr_mult")), step=0.05,
-                key="ic_vwap_touch_atr_mult", label_visibility="collapsed")
+                key="w_ic_vwap_touch_atr_mult", label_visibility="collapsed")
             _s("ic_vwap_touch_atr_mult", float(ic_atr_mult))
 
             _label("VWAP Touch Lookback (bars)")
             ic_lookback = st.slider("Lookback", 1, 10,
                 int(_g("ic_vwap_touch_lookback")), step=1,
-                key="ic_vwap_touch_lookback", label_visibility="collapsed")
+                key="w_ic_vwap_touch_lookback", label_visibility="collapsed")
             _s("ic_vwap_touch_lookback", int(ic_lookback))
 
             _label("Reaction Max ATR (100 = this many ATRs)")
             ic_rxn_cap = st.slider("Reaction Max ATR", 0.5, 4.0,
                 float(_g("ic_reaction_max_atr")), step=0.25,
-                key="ic_reaction_max_atr", label_visibility="collapsed")
+                key="w_ic_reaction_max_atr", label_visibility="collapsed")
             _s("ic_reaction_max_atr", float(ic_rxn_cap))
 
             _label("Confluence Window (bars)")
             ic_conf_bars = st.slider("Confluence Window", 1, 5,
                 int(_g("ic_confluence_window")), step=1,
-                key="ic_confluence_window", label_visibility="collapsed")
+                key="w_ic_confluence_window", label_visibility="collapsed")
             _s("ic_confluence_window", int(ic_conf_bars))
 
         with c2:
             _label("Require EMA20 > EMA50 (trend filter)")
             ic_ema_trend = st.toggle("Require EMA Trend", value=_g("ic_require_ema_trend"),
-                key="ic_require_ema_trend")
+                key="w_ic_require_ema_trend")
             _s("ic_require_ema_trend", bool(ic_ema_trend))
 
             _label("Require Rising VWAP")
             ic_rvwap = st.toggle("Require Rising VWAP", value=_g("ic_require_rising_vwap"),
-                key="ic_require_rising_vwap")
+                key="w_ic_require_rising_vwap")
             _s("ic_require_rising_vwap", bool(ic_rvwap))
 
             _label("Require Bullish Return Candle")
             ic_bull = st.toggle("Require Bullish Return", value=_g("ic_require_bullish_return"),
-                key="ic_require_bullish_return")
+                key="w_ic_require_bullish_return")
             _s("ic_require_bullish_return", bool(ic_bull))
 
             _label("Minimum Reaction Score (0–100)")
             ic_min_rs = st.slider("Min Reaction Score", 0, 80,
                 int(_g("ic_min_reaction_score")), step=5,
-                key="ic_min_reaction_score", label_visibility="collapsed")
+                key="w_ic_min_reaction_score", label_visibility="collapsed")
             _s("ic_min_reaction_score", int(ic_min_rs))
 
             _label("Momentum Weight (pts for VWAP Reclaim Quality)")
             ic_mom_w = st.slider("Momentum Weight", 5, 25,
                 int(_g("ic_momentum_weight")), step=1,
-                key="ic_momentum_weight", label_visibility="collapsed")
+                key="w_ic_momentum_weight", label_visibility="collapsed")
             _s("ic_momentum_weight", int(ic_mom_w))
 
             _label("Confluence Weight (pts for VWAP/Stoch confluence)")
             ic_conf_w = st.slider("Confluence Weight", 0, 20,
                 int(_g("ic_confluence_weight")), step=1,
-                key="ic_confluence_weight", label_visibility="collapsed")
+                key="w_ic_confluence_weight", label_visibility="collapsed")
             _s("ic_confluence_weight", int(ic_conf_w))
 
 
@@ -803,4 +803,16 @@ def render() -> dict:
         "t1_rs_min":           ss.get("t1_rs_min",           DEFAULTS["t1_rs_min"]),
         "t1_adx_min":          ss.get("t1_adx_min",          DEFAULTS["t1_adx_min"]),
         "t1_use_adx":          ss.get("t1_use_adx",          DEFAULTS["t1_use_adx"]),
+        "ic_enable_vwap_reclaim":    ss.get("ic_enable_vwap_reclaim",    DEFAULTS["ic_enable_vwap_reclaim"]),
+        "ic_enable_vwap_stoch_conf": ss.get("ic_enable_vwap_stoch_conf", DEFAULTS["ic_enable_vwap_stoch_conf"]),
+        "ic_vwap_touch_atr_mult":    ss.get("ic_vwap_touch_atr_mult",    DEFAULTS["ic_vwap_touch_atr_mult"]),
+        "ic_vwap_touch_lookback":    ss.get("ic_vwap_touch_lookback",    DEFAULTS["ic_vwap_touch_lookback"]),
+        "ic_reaction_max_atr":       ss.get("ic_reaction_max_atr",       DEFAULTS["ic_reaction_max_atr"]),
+        "ic_confluence_window":      ss.get("ic_confluence_window",      DEFAULTS["ic_confluence_window"]),
+        "ic_require_ema_trend":      ss.get("ic_require_ema_trend",      DEFAULTS["ic_require_ema_trend"]),
+        "ic_require_rising_vwap":    ss.get("ic_require_rising_vwap",    DEFAULTS["ic_require_rising_vwap"]),
+        "ic_require_bullish_return": ss.get("ic_require_bullish_return", DEFAULTS["ic_require_bullish_return"]),
+        "ic_min_reaction_score":     ss.get("ic_min_reaction_score",     DEFAULTS["ic_min_reaction_score"]),
+        "ic_momentum_weight":        ss.get("ic_momentum_weight",        DEFAULTS["ic_momentum_weight"]),
+        "ic_confluence_weight":      ss.get("ic_confluence_weight",      DEFAULTS["ic_confluence_weight"]),
     }
