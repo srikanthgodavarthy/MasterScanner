@@ -260,7 +260,10 @@ def _detail_breakdown(row: pd.Series) -> str:
     html += _row("4 · Momentum", row.get("FP_Momentum"), f"{W_MOMENTUM:.0%}", [
         f"Stoch %K/%D: {row.get('FP_StochK','—')} / {row.get('FP_StochD','—')} · cross/re-ignition: {'✅' if row.get('_fp_stoch_cross_up') else '❌'}",
         f"RSI(14): {row.get('_fp_rsi_val','—')} · &gt; 50: {'✅' if row.get('_fp_rsi_above_50') else '❌'}",
-        f"Fresh breakout — crossed up dynamic VWAP (last 3 bars): {'✅' if row.get('_fp_vwap_cross_up_fresh') else '❌'}",
+        f"VWAP touch (last 3 bars, 0.25×ATR band): {'✅' if row.get('_fp_vwap_touched') else '❌'} · "
+        f"reclaimed: {'✅' if row.get('_fp_vwap_reclaimed') else '❌'} · "
+        f"reaction: {row.get('_fp_reaction_strength_atr','—')} ATR",
+        f"VWAP-reclaim × Stoch-cross confluence (≤2 bars apart): {'✅' if row.get('_fp_vwap_stoch_confluence') else '❌'}",
     ])
     html += _row("5 · Risk (lower risk = higher score)", row.get("FP_Risk"), f"{W_RISK:.0%}", [
         f"Distance from EMA20: {row.get('FP_DistEMA20Pct','—')}%",
