@@ -551,6 +551,9 @@ def generate_signals_five_pillars(
     Computes FP score bar-by-bar (rolling windows) and fires entry when
     the score crosses from Watch → Execute (≥ 90). Exits on reversion
     below Watch threshold (< 65) within the simulation window.
+
+    Each signal record now carries full VWAP Reclaim diagnostics for the
+    backtest VWAP Reclaim Analysis report.
     """
     from utils.pillar_engine import compute_pillars
     from utils.scanner_engine import atr as _atr_fn
@@ -560,19 +563,22 @@ def generate_signals_five_pillars(
 
     atr_s = _atr_fn(df["high"], df["low"], df["close"], 14)
 
-    # Compute FP score on a rolling 200-bar window every bar from bar 200 onward.
-    # This is heavier than CCI but Five Pillars uses EMA/RSI/ATR already in pandas.
+    # Compute FP score + pillar result on a rolling 200-bar window.
     fp_scores: list[float] = []
+    fp_results: list = []     # store full PillarResult per bar
     for i in range(len(df)):
         if i < 59:
             fp_scores.append(float("nan"))
+            fp_results.append(None)
             continue
         window = df.iloc[max(0, i - 199): i + 1]
         try:
             r = compute_pillars(window, nifty)
-            fp_scores.append(float(r.final_score) if r.error is None else float("nan"))
+            fp_scores.append(float(r.final_score) if not r.error else float("nan"))
+            fp_results.append(r)
         except Exception:
             fp_scores.append(float("nan"))
+            fp_results.append(None)
 
     fp_arr = pd.Series(fp_scores, index=df.index)
     prev_fp = fp_arr.shift(1)
@@ -605,6 +611,23 @@ def generate_signals_five_pillars(
         if sl >= entry or t1 <= entry:
             continue
 
+        # Extract VWAP Reclaim diagnostics from the PillarResult at this bar
+        _pr = fp_results[i]
+        _vr_vwap_touch        = bool(getattr(_pr, "vwap_touch_found",      False)) if _pr else False
+        _vr_reaction_strength = float(getattr(_pr, "reaction_strength",    0.0))   if _pr else 0.0
+        _vr_reaction_score    = float(getattr(_pr, "reaction_score",       0.0))   if _pr else 0.0
+        _vr_touch_bar         = int(getattr(_pr,   "touch_bar",            0))     if _pr else 0
+        _vr_cross_bar         = int(getattr(_pr,   "cross_bar",            0))     if _pr else 0
+        _vr_confluence        = bool(getattr(_pr,  "m_vwap_stoch_confluence", False)) if _pr else False
+        _vr_pattern_age       = int(getattr(_pr,   "pattern_age",          0))     if _pr else 0
+        _vr_close_pos         = float(getattr(_pr, "close_position_score", 0.0))   if _pr else 0.0
+        _vr_momentum_bonus    = int(getattr(_pr,   "momentum_bonus",       0))     if _pr else 0
+        _vr_acceptance        = int(getattr(_pr,   "acceptance_score",     0))     if _pr else 0
+        _vr_touch_dist_atr    = float(getattr(_pr, "touch_distance_atr",   0.0))   if _pr else 0.0
+        _vr_returned          = bool(getattr(_pr,  "returned_above_vwap",  False)) if _pr else False
+        _vr_stoch_cross_found = bool(getattr(_pr,  "stoch_cross_found",    False)) if _pr else False
+        _vr_vwap_rising       = bool(getattr(_pr,  "a_vwap_rising",        False)) if _pr else False
+
         last_signal_bar = i
         signals.append({
             "date":            df.index[i],
@@ -621,7 +644,7 @@ def generate_signals_five_pillars(
             "target_adj":      0.0,
             "target_notes":    f"FP={int(cur)} ATR={round(atr_val,2)}",
             "cci":             0.0,
-            "rsi":             0.0,
+            "rsi":             float(getattr(_pr, "rsi_val", 0.0)) if _pr else 0.0,
             "tier1_prime":     False,
             "tier2_momentum":  False,
             "elite_tier":      cur >= 95,
@@ -631,8 +654,8 @@ def generate_signals_five_pillars(
             "tier":            "FP Execute",
             "structural_entry": True,
             "rs_positive":     False,
-            "rs_val":          0.0,
-            "rs3":             0.0,
+            "rs_val":          float(getattr(_pr, "rs_3m", 0.0)) if _pr else 0.0,
+            "rs3":             float(getattr(_pr, "rs_3m", 0.0)) if _pr else 0.0,
             "rs_composite":    0.0,
             "rs_top_decile":   False,
             "fresh_base":      False,
@@ -640,22 +663,38 @@ def generate_signals_five_pillars(
             "trend_freshness": 0,
             "adx_val":         0.0,
             "trend_phase":     "EXECUTE",
-            "ema20_pct_dist":       0.0,
-            "ema50_pct_dist":       0.0,
-            "pivot_high_dist":      0.0,
+            "ema20_pct_dist":         float(getattr(_pr, "dist_from_ema20_pct", 0.0)) if _pr else 0.0,
+            "ema50_pct_dist":         0.0,
+            "pivot_high_dist":        0.0,
             "price_move_since_setup": 0.0,
-            "bars_since_setup":     0,
-            "bars_band":            "Actionable",
-            "atr_at_setup":         round(atr_val, 2),
-            "extension_atr":        0.0,
-            "extension_score_atr":  0,
-            "atr_band":             "Actionable",
-            "pct_band":             "Actionable",
-            "entry_quality_score":  int(cur),
-            "entry_quality_band":   "Good" if cur >= 90 else "Acceptable",
+            "bars_since_setup":       0,
+            "bars_band":              "Actionable",
+            "atr_at_setup":           round(atr_val, 2),
+            "extension_atr":          float(getattr(_pr, "atr_extension", 0.0)) if _pr else 0.0,
+            "extension_score_atr":    0,
+            "atr_band":               "Actionable",
+            "pct_band":               "Actionable",
+            "entry_quality_score":    int(cur),
+            "entry_quality_band":     "Good" if cur >= 90 else "Acceptable",
             "entry_rejection_reason": "",
-            "leadership_score":     0,
-            "conviction_score":     0,
+            "leadership_score":       int(getattr(_pr, "leadership_score", 0)) if _pr else 0,
+            "conviction_score":       0,
+            # ── VWAP Reclaim diagnostics (for VWAP Reclaim Analysis report) ──
+            "vwap_touch":             _vr_vwap_touch,
+            "reaction_strength":      _vr_reaction_strength,
+            "reaction_score":         _vr_reaction_score,
+            "touch_bar":              _vr_touch_bar,
+            "cross_bar":              _vr_cross_bar,
+            "confluence":             _vr_confluence,
+            "pattern_age":            _vr_pattern_age,
+            "close_position_score":   _vr_close_pos,
+            "momentum_bonus":         _vr_momentum_bonus,
+            "acceptance_score":       _vr_acceptance,
+            "overall_score":          int(cur),
+            "touch_distance_atr":     _vr_touch_dist_atr,
+            "returned_above_vwap":    _vr_returned,
+            "stoch_cross_found":      _vr_stoch_cross_found,
+            "vwap_rising":            _vr_vwap_rising,
         })
 
     return pd.DataFrame(signals)
@@ -906,6 +945,19 @@ def simulate_trades(
             "target_notes":    str(sig.get("target_notes",      "")),
             # Actual RR at entry (from real open, not signal close)
             "rr_actual":       round((t1 - entry_price) / rk, 2) if rk > 0 else 0.0,
+            # ── VWAP Reclaim trade diagnostics (from signal, preserved on trade) ──
+            "vwap_touch":             bool(sig.get("vwap_touch",           False)),
+            "reaction_strength":      float(sig.get("reaction_strength",   0.0)),
+            "reaction_score":         float(sig.get("reaction_score",      0.0)),
+            "touch_bar":              int(sig.get("touch_bar",             0)),
+            "cross_bar":              int(sig.get("cross_bar",             0)),
+            "confluence":             bool(sig.get("confluence",           False)),
+            "pattern_age":            int(sig.get("pattern_age",           0)),
+            "close_position_score":   float(sig.get("close_position_score", 0.0)),
+            "momentum_bonus":         int(sig.get("momentum_bonus",        0)),
+            "acceptance_score":       int(sig.get("acceptance_score",      0)),
+            "overall_score":          int(sig.get("overall_score",         int(sig.get("score", 0)))),
+            "touch_distance_atr":     float(sig.get("touch_distance_atr",  0.0)),
         })
 
         blocked_until = exit_date
@@ -1654,4 +1706,150 @@ def compute_stats(trades: pd.DataFrame) -> dict:
         # v12/v13: adaptive target category breakdown + excursion stats
         "target_category_stats":   _target_category_breakdown(trades),
         "excursion_stats":         _excursion_summary(trades),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  VWAP RECLAIM ANALYSIS REPORT
+# ══════════════════════════════════════════════════════════════════
+
+def build_vwap_reclaim_analysis(trades: pd.DataFrame) -> dict:
+    """
+    Generate the VWAP Reclaim Analysis report from a completed trades DataFrame.
+
+    Breaks down Win Rate, Profit Factor, Expectancy, Average R, Average Hold Time,
+    Max Drawdown, Timeout%, SL%, T1%, T2%, T3% by:
+      - Reaction Strength bucket  (0-25 / 25-50 / 50-75 / 75-100)
+      - Pattern Age               (0 / 1 / 2 / 3+)
+      - Confluence                (True / False)
+      - ATR Touch Distance        (0-0.10 / 0.10-0.25 / 0.25-0.50)
+      - Trend (EMA20>EMA50)       (True / False)  — proxied by rs_positive field
+      - VWAP Direction            (Rising / Flat / Falling) — from vwap_rising field
+    """
+    if trades.empty:
+        return {"available": False, "reason": "no trades"}
+
+    if "vwap_touch" not in trades.columns:
+        return {"available": False, "reason": "no VWAP reclaim data (non-Five Pillars mode)"}
+
+    def _metrics(subset: pd.DataFrame) -> dict:
+        if subset.empty:
+            return {"count": 0}
+        n         = len(subset)
+        wins      = subset[subset["pnl_pct"] > 0]
+        losses    = subset[subset["pnl_pct"] <= 0]
+        win_rate  = round(len(wins) / n * 100, 1)
+        avg_win   = float(wins["pnl_pct"].mean()) if len(wins) else 0.0
+        avg_loss  = float(losses["pnl_pct"].mean()) if len(losses) else 0.0
+        gross_win = float(wins["pnl_pct"].sum()) if len(wins) else 0.0
+        gross_los = abs(float(losses["pnl_pct"].sum())) if len(losses) else 1e-9
+        pf        = round(gross_win / gross_los, 2) if gross_los > 0 else float("inf")
+        expectancy = round(win_rate / 100 * avg_win + (1 - win_rate / 100) * avg_loss, 2)
+
+        # Hold time
+        def _hold(row):
+            try:
+                return (pd.Timestamp(row["exit_date"]) - pd.Timestamp(row["entry_date"])).days
+            except Exception:
+                return 0
+        holds = subset.apply(_hold, axis=1)
+        avg_hold = round(float(holds.mean()), 1)
+
+        # Exit reason breakdown
+        reasons = subset["exit_reason"].value_counts(normalize=True) * 100
+        timeout_pct = round(float(reasons.get("TIMEOUT", 0)), 1)
+        sl_pct      = round(float(reasons.get("SL HIT",  0)) + float(reasons.get("SL TRAIL", 0)), 1)
+        t1_pct      = round(float(reasons.get("T1 HIT",  0)), 1)
+        t2_pct      = round(float(reasons.get("T2 HIT",  0)), 1)
+        t3_pct      = round(float(reasons.get("T3 HIT",  0)), 1)
+
+        # Max drawdown (simple: worst single trade)
+        max_dd = round(float(subset["pnl_pct"].min()), 2)
+
+        # Average R (pnl / (entry - sl) per trade)
+        if "rr_actual" in subset.columns:
+            avg_r = round(float(subset["rr_actual"].mean()), 2)
+        else:
+            avg_r = 0.0
+
+        return {
+            "count":       n,
+            "win_rate":    win_rate,
+            "profit_factor": pf,
+            "expectancy":  expectancy,
+            "avg_r":       avg_r,
+            "avg_hold":    avg_hold,
+            "max_drawdown": max_dd,
+            "timeout_pct": timeout_pct,
+            "sl_pct":      sl_pct,
+            "t1_pct":      t1_pct,
+            "t2_pct":      t2_pct,
+            "t3_pct":      t3_pct,
+        }
+
+    # ── Reaction Strength buckets ────────────────────────────────────────
+    def _rs_bucket(rs):
+        if rs < 25:   return "0-25"
+        if rs < 50:   return "25-50"
+        if rs < 75:   return "50-75"
+        return "75-100"
+
+    reaction_col = "reaction_strength" if "reaction_strength" in trades.columns else None
+    reaction_breakdown = {}
+    if reaction_col:
+        for bucket in ["0-25", "25-50", "50-75", "75-100"]:
+            sub = trades[trades[reaction_col].apply(_rs_bucket) == bucket]
+            reaction_breakdown[bucket] = _metrics(sub)
+
+    # ── Pattern Age ──────────────────────────────────────────────────────
+    age_breakdown = {}
+    if "pattern_age" in trades.columns:
+        for age_label, mask in [
+            ("0",  trades["pattern_age"] == 0),
+            ("1",  trades["pattern_age"] == 1),
+            ("2",  trades["pattern_age"] == 2),
+            ("3+", trades["pattern_age"] >= 3),
+        ]:
+            age_breakdown[age_label] = _metrics(trades[mask])
+
+    # ── Confluence ───────────────────────────────────────────────────────
+    confluence_breakdown = {}
+    if "confluence" in trades.columns:
+        confluence_breakdown["True"]  = _metrics(trades[trades["confluence"] == True])
+        confluence_breakdown["False"] = _metrics(trades[trades["confluence"] == False])
+
+    # ── Touch Distance (ATR) ─────────────────────────────────────────────
+    dist_breakdown = {}
+    if "touch_distance_atr" in trades.columns:
+        for label, lo, hi in [
+            ("0-0.10",    0.00, 0.10),
+            ("0.10-0.25", 0.10, 0.25),
+            ("0.25-0.50", 0.25, 0.50),
+        ]:
+            sub = trades[(trades["touch_distance_atr"] >= lo) &
+                         (trades["touch_distance_atr"] < hi)]
+            dist_breakdown[label] = _metrics(sub)
+
+    # ── VWAP Direction ───────────────────────────────────────────────────
+    vwap_dir_breakdown = {}
+    if "vwap_rising" in trades.columns:
+        vwap_dir_breakdown["Rising"]  = _metrics(trades[trades["vwap_rising"] == True])
+        vwap_dir_breakdown["Falling"] = _metrics(trades[trades["vwap_rising"] == False])
+
+    # ── VWAP Touch vs No Touch ───────────────────────────────────────────
+    touch_breakdown = {}
+    if "vwap_touch" in trades.columns:
+        touch_breakdown["Touch"]    = _metrics(trades[trades["vwap_touch"] == True])
+        touch_breakdown["No Touch"] = _metrics(trades[trades["vwap_touch"] == False])
+
+    return {
+        "available":           True,
+        "total_trades":        len(trades),
+        "overall":             _metrics(trades),
+        "by_reaction_strength": reaction_breakdown,
+        "by_pattern_age":       age_breakdown,
+        "by_confluence":        confluence_breakdown,
+        "by_touch_distance_atr": dist_breakdown,
+        "by_vwap_direction":    vwap_dir_breakdown,
+        "by_vwap_touch":        touch_breakdown,
     }

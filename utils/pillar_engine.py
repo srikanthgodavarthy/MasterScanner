@@ -45,6 +45,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
+from utils.continuation_patterns import (
+    detect_vwap_reclaim as _cp_detect_vwap_reclaim,
+    _stochastic as _cp_stochastic,
+    _find_stoch_cross_bar as _cp_find_stoch_cross_bar,
+    _anchored_vwap as _cp_anchored_vwap,
+)
 
 # ── Weights (Final Ranking Engine) ─────────────────────────────────
 W_STRUCTURE  = 0.15
@@ -65,6 +71,25 @@ RECLAIM_LOOKBACK     = 3     # bars to search for a VWAP touch / stoch cross
 RECLAIM_ATR_TOL      = 0.25  # touch band = VWAP + this many ATRs
 RECLAIM_REACTION_CAP = 1.5   # ATRs off the touch-bar low -> max reaction score
 RECLAIM_CONFLUENCE_BARS = 2  # touch bar and stoch-cross bar must be <= this far apart
+
+RECLAIM_MIN_REACTION    = 0     # minimum reaction_strength (0-100) to award quality pts
+
+# Institutional Continuation - settings keys and defaults
+IC_DEFAULTS = {
+    "enable_vwap_reclaim":    True,
+    "enable_vwap_stoch_conf": True,
+    "vwap_touch_atr_mult":    RECLAIM_ATR_TOL,
+    "vwap_touch_lookback":    RECLAIM_LOOKBACK,
+    "reaction_max_atr":       RECLAIM_REACTION_CAP,
+    "confluence_window":      RECLAIM_CONFLUENCE_BARS,
+    "require_ema_trend":      True,
+    "require_rising_vwap":    True,
+    "require_bullish_return": True,
+    "min_reaction_score":     RECLAIM_MIN_REACTION,
+    "momentum_weight":        15,
+    "confluence_weight":      10,
+}
+
 
 CLASS_EXECUTE   = "Execute"
 CLASS_WATCH     = "Watch"
@@ -124,6 +149,19 @@ class PillarResult:
     dist_from_ema20_pct:   float = 0.0
     dist_from_vwap_pct:    float = 0.0
     atr_extension:          float = 0.0   # extension measured in ATRs
+
+    # ── VWAP Reclaim extended diagnostics (Pillar 4) ─────────────
+    vwap_touch_found:        bool  = False
+    touch_bar:               int   = 0
+    touch_distance_atr:      float = 0.0
+    returned_above_vwap:     bool  = False
+    reaction_score:          float = 0.0
+    close_position_score:    float = 0.0
+    stoch_cross_found:       bool  = False
+    cross_bar:               int   = 0
+    confluence_gap:          int   = 0
+    pattern_age:             int   = 0
+    momentum_bonus:          int   = 0    # points awarded from VWAP reclaim quality
 
     error: str = ""
 
@@ -437,59 +475,119 @@ def detect_vwap_reclaim(
     return out
 
 
-def _score_momentum(high: pd.Series, low: pd.Series, close: pd.Series,
-                     rsi_s: pd.Series, volume: pd.Series, atr_s: pd.Series) -> tuple[int, dict]:
+def _score_momentum(
+    high: pd.Series, low: pd.Series, close: pd.Series,
+    rsi_s: pd.Series, volume: pd.Series, atr_s: pd.Series,
+    ic_cfg: dict | None = None,
+) -> tuple[int, dict]:
+    """
+    Momentum Pillar — spec-aligned allocation (100 pts):
+      Fresh K>D crossover      20
+      From Oversold            15
+      K > 50                   10
+      RSI > 50                 20
+      RSI > 60                 10
+      VWAP Reclaim Quality     15   (momentum_weight, trend-gated)
+      VWAP/Stoch Confluence    10   (confluence_weight)
+      Total                   100
+    """
+    cfg = IC_DEFAULTS.copy()
+    if ic_cfg:
+        cfg.update(ic_cfg)
+
     k_s, d_s = _stochastic(high, low, close)
 
-    cur_k  = _safe_last(k_s, default=50.0)
-    prev_k = _safe_at(k_s, -2, default=cur_k)
-    cur_d  = _safe_last(d_s, default=50.0)
-    prev_d = _safe_at(d_s, -2, default=cur_d)
-    cur_rsi  = _safe_last(rsi_s, default=50.0)
+    cur_k   = _safe_last(k_s, default=50.0)
+    prev_k  = _safe_at(k_s, -2, default=cur_k)
+    cur_d   = _safe_last(d_s, default=50.0)
+    prev_d  = _safe_at(d_s, -2, default=cur_d)
+    cur_rsi = _safe_last(rsi_s, default=50.0)
 
-    stoch_cross_up   = prev_k <= prev_d and cur_k > cur_d         # %K crossing above %D (current bar)
-    stoch_from_os     = prev_k <= 20 and cur_k > 20                # re-igniting out of oversold
-    rsi_above_50      = cur_rsi > 50
+    stoch_cross_up = bool(prev_k <= prev_d and cur_k > cur_d)
+    stoch_from_os  = bool(prev_k <= 20 and cur_k > 20)
+    rsi_above_50   = cur_rsi > 50
 
-    # --- VWAP Touch-Reclaim (see detect_vwap_reclaim docstring) --------
+    # ── VWAP series (shared) ─────────────────────────────────────────────
     vwap_series = _anchored_vwap(high, low, close, volume)
-    reclaim = detect_vwap_reclaim(low, close, vwap_series, atr_s)
+    vwap_last   = _safe_last(vwap_series)
+    vwap_prev   = float(vwap_series.iloc[-11]) if len(vwap_series) > 11 else vwap_last
+    vwap_rising = vwap_last > vwap_prev
 
-    # Reaction-strength bucket: scales 0 -> RECLAIM_REACTION_CAP ATRs
-    # into 0 -> 25 points. Only counts if price actually reclaimed VWAP.
-    reaction_pts = 0
-    if reclaim["reclaimed"]:
-        frac = min(reclaim["reaction_strength_atr"] / RECLAIM_REACTION_CAP, 1.0)
-        reaction_pts = round(frac * 25)
+    # Trend filter for VWAP Reclaim points
+    e20_last = _safe_last(high)  # fallback; will use real e20 if passed via ia
+    ema20_gt_ema50 = True        # computed externally; default permissive
 
-    # Confluence: the touch bar and the most recent stoch K/D cross-up bar
-    # land within RECLAIM_CONFLUENCE_BARS of each other -> the bounce off
-    # VWAP and the momentum turn are the SAME event, not two unrelated ones.
-    cross_bars_ago = _find_stoch_cross_bar(k_s, d_s, RECLAIM_LOOKBACK)
-    confluence = False
-    if reclaim["reclaimed"] and cross_bars_ago is not None and reclaim["touch_bars_ago"] is not None:
-        confluence = abs(cross_bars_ago - reclaim["touch_bars_ago"]) <= RECLAIM_CONFLUENCE_BARS
+    # ── VWAP Reclaim via continuation_patterns ────────────────────────────
+    reclaim_result = {"confirmed": False, "reaction_strength": 0.0, "metadata": {}}
+    momentum_pts   = 0
+    confluence     = False
+    cross_bars_ago: int | None = None
+    meta: dict = {}
 
+    if cfg.get("enable_vwap_reclaim", True):
+        reclaim_result = _cp_detect_vwap_reclaim(
+            low=low, close=close, high=high, volume=volume, atr_s=atr_s,
+            k_s=k_s, d_s=d_s,
+            vwap_series=vwap_series,
+            lookback=int(cfg.get("vwap_touch_lookback", RECLAIM_LOOKBACK)),
+            atr_mult=float(cfg.get("vwap_touch_atr_mult", RECLAIM_ATR_TOL)),
+            reaction_max_atr=float(cfg.get("reaction_max_atr", RECLAIM_REACTION_CAP)),
+            confluence_bars=int(cfg.get("confluence_window", RECLAIM_CONFLUENCE_BARS)),
+            require_bullish_return=bool(cfg.get("require_bullish_return", True)),
+            ema20_gt_ema50=ema20_gt_ema50,
+            vwap_rising=vwap_rising if cfg.get("require_rising_vwap", True) else True,
+        )
+        meta = reclaim_result.get("metadata", {})
+        reaction_str = reclaim_result.get("reaction_strength", 0.0)
+        min_rs = float(cfg.get("min_reaction_score", 0))
+
+        if reclaim_result.get("confirmed") and reaction_str >= min_rs:
+            mom_weight = float(cfg.get("momentum_weight", 15))
+            frac = float(np.clip(reaction_str / 100.0, 0.0, 1.0))
+            momentum_pts = int(round(frac * mom_weight))
+
+        confluence = bool(meta.get("confluence", False))
+        cross_bars_ago = meta.get("cross_bar")
+
+    # ── Base stoch/RSI score ─────────────────────────────────────────────
     score = 0
-    if stoch_cross_up:               score += 20
-    if stoch_from_os:                 score += 10
-    if cur_k > 50:                     score += 10   # %K already in bullish half of range
-    if rsi_above_50:                  score += 15
-    if cur_rsi > 60:                  score += 5    # strong momentum bonus
-    score += reaction_pts                            # 0-25, VWAP reclaim reaction quality
-    if confluence:                    score += 15   # reclaim + stoch turn = same event
+    if stoch_cross_up:   score += 20    # Fresh K>D
+    if stoch_from_os:    score += 15    # From Oversold (spec)
+    if cur_k > 50:       score += 10    # K in bullish half
+    if rsi_above_50:     score += 20    # RSI > 50 (spec)
+    if cur_rsi > 60:     score += 10    # RSI > 60 bonus (spec)
+    score += momentum_pts               # VWAP Reclaim Quality (0–15)
+    if confluence and cfg.get("enable_vwap_stoch_conf", True):
+        conf_weight = int(cfg.get("confluence_weight", 10))
+        score += conf_weight            # VWAP/Stoch Confluence
     score = min(score, 100)
 
+    # ── Diagnostics ──────────────────────────────────────────────────────
+    r_meta = reclaim_result.get("metadata", {})
     return score, {
-        "stoch_k": round(cur_k, 1),
-        "stoch_d": round(cur_d, 1),
-        "stoch_cross_up": bool(stoch_cross_up or stoch_from_os),
-        "rsi_val": round(cur_rsi, 1),
-        "rsi_above_50": rsi_above_50,
-        "m_vwap_touched": reclaim["touched"],
-        "m_vwap_reclaimed": reclaim["reclaimed"],
-        "m_reaction_strength_atr": reclaim["reaction_strength_atr"],
+        "stoch_k":               round(cur_k, 1),
+        "stoch_d":               round(cur_d, 1),
+        "stoch_cross_up":        bool(stoch_cross_up or stoch_from_os),
+        "rsi_val":               round(cur_rsi, 1),
+        "rsi_above_50":          rsi_above_50,
+        "m_vwap_touched":        bool(r_meta.get("vwap_touch_found", False)),
+        "m_vwap_reclaimed":      bool(reclaim_result.get("confirmed", False)),
+        "m_reaction_strength_atr": round(reclaim_result.get("reaction_strength", 0.0) / 100.0 *
+                                         float(cfg.get("reaction_max_atr", RECLAIM_REACTION_CAP)), 2),
         "m_vwap_stoch_confluence": confluence,
+        # ── Extended diagnostics ──
+        "vwap_touch_found":      bool(r_meta.get("vwap_touch_found", False)),
+        "touch_bar":             int(r_meta.get("touch_bar", 0) or 0),
+        "touch_distance_atr":    float(r_meta.get("touch_distance_atr", 0.0)),
+        "returned_above_vwap":   bool(r_meta.get("returned_above_vwap", False)),
+        "reaction_strength":     float(reclaim_result.get("reaction_strength", 0.0)),
+        "reaction_score":        float(r_meta.get("reaction_score", 0.0)),
+        "close_position_score":  float(r_meta.get("close_position_score", 0.0)),
+        "stoch_cross_found":     cross_bars_ago is not None,
+        "cross_bar":             int(cross_bars_ago) if cross_bars_ago is not None else 0,
+        "confluence_gap":        int(r_meta.get("confluence_gap", 0) or 0),
+        "pattern_age":           int(r_meta.get("pattern_age", 0) or 0),
+        "momentum_bonus":        momentum_pts,
     }
 
 
@@ -572,12 +670,30 @@ def compute_pillars_from_ia(df: pd.DataFrame, ia) -> PillarResult:
         final_int = int(round(final))
         cls, note = _classify(final_int)
 
+        # Pull extended VWAP reclaim diagnostics out of m_sub so they map
+        # to the new PillarResult fields (avoids double-star kwarg collision).
+        _ext = {
+            "vwap_touch_found":     m_sub.pop("vwap_touch_found",    False),
+            "touch_bar":            m_sub.pop("touch_bar",            0),
+            "touch_distance_atr":   m_sub.pop("touch_distance_atr",  0.0),
+            "returned_above_vwap":  m_sub.pop("returned_above_vwap", False),
+            "reaction_score":       m_sub.pop("reaction_score",       0.0),
+            "close_position_score": m_sub.pop("close_position_score", 0.0),
+            "stoch_cross_found":    m_sub.pop("stoch_cross_found",    False),
+            "cross_bar":            m_sub.pop("cross_bar",            0),
+            "confluence_gap":       m_sub.pop("confluence_gap",       0),
+            "pattern_age":          m_sub.pop("pattern_age",          0),
+            "momentum_bonus":       m_sub.pop("momentum_bonus",       0),
+        }
+        # reaction_strength is also in m_sub — keep it separate from PillarResult field
+        _reaction_strength = m_sub.pop("reaction_strength", 0.0)
+
         return PillarResult(
             structure_score=s_score, acceptance_score=a_score,
             leadership_score=l_score, momentum_score=m_score,
             risk_score=r_score, final_score=final_int,
             classification=cls, classification_note=note,
-            **s_sub, **a_sub, **l_sub, **m_sub, **r_sub,
+            **s_sub, **a_sub, **l_sub, **m_sub, **r_sub, **_ext,
         )
     except Exception as exc:
         return PillarResult(error=str(exc))
