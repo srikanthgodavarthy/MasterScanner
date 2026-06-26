@@ -14,9 +14,20 @@ Five pillars
 2. Acceptance  — Anchored VWAP (from start of history) + 60-bar Fixed
                  Range Volume Profile (POC / VAH / VAL)
 3. Leadership  — Relative strength vs NIFTY (3M, 6M) + relative momentum
-4. Momentum    — Stochastic Oscillator(14,3) re-ignition + RSI(14) > 50
+4. Momentum    — Stochastic Oscillator(14,3) re-ignition + RSI(14) > 50 +
+                 VWAP Touch-Reclaim (price dipped to/through anchored VWAP
+                 within an ATR-scaled tolerance and reclaimed it, scored by
+                 reaction strength in ATRs) + a confluence bonus when the
+                 reclaim bar and the %K/%D cross-up land within 2 bars of
+                 each other
 5. Risk        — Distance from EMA20 / VWAP / ATR extension (lower = safer,
                  scored so LOWER risk gives a HIGHER score)
+
+Note on Acceptance vs Momentum split: Acceptance answers "where is price
+relative to value/VWAP right now" (a state). The VWAP Touch-Reclaim pattern
+answers "how did buyers react when price was tested at VWAP" (an event) —
+that's a momentum/reaction signal, not a structural state, so it lives
+entirely in Pillar 4 and Acceptance is left untouched.
 
 Final Score = 0.15*Structure + 0.30*Acceptance + 0.15*Leadership
             + 0.30*Momentum  + 0.10*Risk
@@ -48,6 +59,12 @@ VP_BINS             = 24   # number of price bins for the volume profile histogr
 
 STOCH_K_PERIOD = 14   # %K lookback (highest high / lowest low window)
 STOCH_D_PERIOD = 3    # %D = SMA(%K, 3) — signal line
+
+# VWAP Touch-Reclaim (Pillar 4 — Momentum) ──────────────────────────
+RECLAIM_LOOKBACK     = 3     # bars to search for a VWAP touch / stoch cross
+RECLAIM_ATR_TOL      = 0.25  # touch band = VWAP + this many ATRs
+RECLAIM_REACTION_CAP = 1.5   # ATRs off the touch-bar low -> max reaction score
+RECLAIM_CONFLUENCE_BARS = 2  # touch bar and stoch-cross bar must be <= this far apart
 
 CLASS_EXECUTE   = "Execute"
 CLASS_WATCH     = "Watch"
@@ -98,7 +115,10 @@ class PillarResult:
     stoch_cross_up:          bool  = False
     rsi_val:               float = 50.0
     rsi_above_50:           bool  = False
-    m_vwap_cross_up_fresh:  bool  = False
+    m_vwap_touched:          bool  = False   # close/low tested VWAP within ATR tolerance (lookback window)
+    m_vwap_reclaimed:        bool  = False   # price closed back above VWAP and above the touch-bar close
+    m_reaction_strength_atr: float = 0.0     # (close - touch_bar_low) / ATR — reclaim quality
+    m_vwap_stoch_confluence: bool  = False   # reclaim bar and stoch K/D cross-up bar within RECLAIM_CONFLUENCE_BARS
 
     # ── Risk sub-fields (raw distances, informational) ────────────
     dist_from_ema20_pct:   float = 0.0
@@ -337,8 +357,88 @@ def _stochastic(high: pd.Series, low: pd.Series, close: pd.Series,
     return k, d
 
 
+def _find_stoch_cross_bar(k_s: pd.Series, d_s: pd.Series, lookback: int) -> int | None:
+    """
+    Scan the last `lookback` bars for a %K crossing above %D event
+    (prev_k <= prev_d and cur_k > cur_d). Returns bars-ago (0 = current
+    bar) of the most recent cross, or None if no cross in the window.
+    """
+    n = len(k_s)
+    if n < 2:
+        return None
+    max_back = min(lookback, n - 1)
+    for back in range(0, max_back + 1):
+        i = n - 1 - back
+        if i < 1:
+            break
+        k_now, k_prev = _safe_at(k_s, i), _safe_at(k_s, i - 1)
+        d_now, d_prev = _safe_at(d_s, i), _safe_at(d_s, i - 1)
+        if k_prev <= d_prev and k_now > d_now:
+            return back
+    return None
+
+
+def detect_vwap_reclaim(
+    low: pd.Series, close: pd.Series, vwap_series: pd.Series, atr_s: pd.Series,
+    lookback: int = RECLAIM_LOOKBACK, atr_mult: float = RECLAIM_ATR_TOL,
+) -> dict:
+    """
+    VWAP Touch-Reclaim (momentum/reaction event, not a structural state):
+
+      Touch     — within the last `lookback` bars, bar low came within an
+                  ATR-scaled tolerance of (or under) the anchored VWAP:
+                      low[i] <= vwap[i] + atr_mult * atr[i]
+      Reclaim   — the current close is back above the current VWAP AND
+                  above the touch bar's own close (confirms the touch bar
+                  wasn't just the start of a deeper breakdown).
+      Reaction  — (close_now - low_at_touch) / atr_now, in ATRs. This is
+                  the continuous "how hard did buyers react" quality score
+                  feeding Momentum, rather than a binary flag.
+
+    Returns dict with: touched, touch_bars_ago, reclaimed, reaction_strength_atr.
+    bars_ago = 0 means the touch bar IS the current bar.
+    """
+    n = len(close)
+    out = {"touched": False, "touch_bars_ago": None,
+           "reclaimed": False, "reaction_strength_atr": 0.0}
+    if n < 2:
+        return out
+
+    max_back = min(lookback, n - 1)
+    touch_bars_ago = None
+    for back in range(0, max_back + 1):
+        i = n - 1 - back
+        lo_i, vwap_i, atr_i = _safe_at(low, i), _safe_at(vwap_series, i), _safe_at(atr_s, i)
+        if atr_i <= 0:
+            continue
+        if lo_i <= vwap_i + atr_mult * atr_i:
+            touch_bars_ago = back   # keep overwriting -> ends on the MOST RECENT touch (back=0 first)
+            break  # nearest touch found (loop runs newest -> oldest)
+
+    if touch_bars_ago is None:
+        return out
+
+    touch_idx = n - 1 - touch_bars_ago
+    touch_low   = _safe_at(low, touch_idx)
+    touch_close = _safe_at(close, touch_idx)
+    cur_close   = _safe_last(close)
+    cur_vwap    = _safe_last(vwap_series)
+    cur_atr     = _safe_last(atr_s)
+
+    reclaimed = bool(cur_close > cur_vwap and cur_close > touch_close)
+    reaction_strength = ((cur_close - touch_low) / cur_atr) if cur_atr > 0 else 0.0
+
+    out.update({
+        "touched": True,
+        "touch_bars_ago": touch_bars_ago,
+        "reclaimed": reclaimed,
+        "reaction_strength_atr": round(max(reaction_strength, 0.0), 2),
+    })
+    return out
+
+
 def _score_momentum(high: pd.Series, low: pd.Series, close: pd.Series,
-                     rsi_s: pd.Series, volume: pd.Series) -> tuple[int, dict]:
+                     rsi_s: pd.Series, volume: pd.Series, atr_s: pd.Series) -> tuple[int, dict]:
     k_s, d_s = _stochastic(high, low, close)
 
     cur_k  = _safe_last(k_s, default=50.0)
@@ -347,35 +447,37 @@ def _score_momentum(high: pd.Series, low: pd.Series, close: pd.Series,
     prev_d = _safe_at(d_s, -2, default=cur_d)
     cur_rsi  = _safe_last(rsi_s, default=50.0)
 
-    stoch_cross_up   = prev_k <= prev_d and cur_k > cur_d         # %K crossing above %D
+    stoch_cross_up   = prev_k <= prev_d and cur_k > cur_d         # %K crossing above %D (current bar)
     stoch_from_os     = prev_k <= 20 and cur_k > 20                # re-igniting out of oversold
     rsi_above_50      = cur_rsi > 50
 
-    # --- Fresh VWAP cross-up ------------------------------------------
-    # The chart's dynamic VWAP polyline (anchored from swing points) is
-    # what price tends to break above right before a sharp rally. We
-    # approximate it with the same anchored VWAP used in Pillar 2, and
-    # flag a "fresh" cross: close was at/below VWAP within the last 3
-    # bars and is now above it.
+    # --- VWAP Touch-Reclaim (see detect_vwap_reclaim docstring) --------
     vwap_series = _anchored_vwap(high, low, close, volume)
-    cur_vwap = _safe_last(vwap_series)
-    cur_c    = _safe_last(close)
-    price_above_vwap_now = cur_c > cur_vwap
+    reclaim = detect_vwap_reclaim(low, close, vwap_series, atr_s)
 
-    closes_recent = close.iloc[-4:] if len(close) >= 4 else close
-    vwap_recent   = vwap_series.iloc[-4:] if len(vwap_series) >= 4 else vwap_series
-    was_below_or_at_vwap = False
-    if len(closes_recent) > 1 and len(vwap_recent) == len(closes_recent):
-        was_below_or_at_vwap = bool((closes_recent.iloc[:-1].to_numpy() <= vwap_recent.iloc[:-1].to_numpy()).any())
-    vwap_cross_up_fresh = bool(price_above_vwap_now and was_below_or_at_vwap)
+    # Reaction-strength bucket: scales 0 -> RECLAIM_REACTION_CAP ATRs
+    # into 0 -> 25 points. Only counts if price actually reclaimed VWAP.
+    reaction_pts = 0
+    if reclaim["reclaimed"]:
+        frac = min(reclaim["reaction_strength_atr"] / RECLAIM_REACTION_CAP, 1.0)
+        reaction_pts = round(frac * 25)
+
+    # Confluence: the touch bar and the most recent stoch K/D cross-up bar
+    # land within RECLAIM_CONFLUENCE_BARS of each other -> the bounce off
+    # VWAP and the momentum turn are the SAME event, not two unrelated ones.
+    cross_bars_ago = _find_stoch_cross_bar(k_s, d_s, RECLAIM_LOOKBACK)
+    confluence = False
+    if reclaim["reclaimed"] and cross_bars_ago is not None and reclaim["touch_bars_ago"] is not None:
+        confluence = abs(cross_bars_ago - reclaim["touch_bars_ago"]) <= RECLAIM_CONFLUENCE_BARS
 
     score = 0
-    if stoch_cross_up:               score += 25
-    if stoch_from_os:                 score += 15
+    if stoch_cross_up:               score += 20
+    if stoch_from_os:                 score += 10
     if cur_k > 50:                     score += 10   # %K already in bullish half of range
-    if rsi_above_50:                  score += 20
-    if cur_rsi > 60:                  score += 10   # strong momentum bonus
-    if vwap_cross_up_fresh:           score += 20   # fresh breakout above dynamic VWAP
+    if rsi_above_50:                  score += 15
+    if cur_rsi > 60:                  score += 5    # strong momentum bonus
+    score += reaction_pts                            # 0-25, VWAP reclaim reaction quality
+    if confluence:                    score += 15   # reclaim + stoch turn = same event
     score = min(score, 100)
 
     return score, {
@@ -384,7 +486,10 @@ def _score_momentum(high: pd.Series, low: pd.Series, close: pd.Series,
         "stoch_cross_up": bool(stoch_cross_up or stoch_from_os),
         "rsi_val": round(cur_rsi, 1),
         "rsi_above_50": rsi_above_50,
-        "m_vwap_cross_up_fresh": vwap_cross_up_fresh,
+        "m_vwap_touched": reclaim["touched"],
+        "m_vwap_reclaimed": reclaim["reclaimed"],
+        "m_reaction_strength_atr": reclaim["reaction_strength_atr"],
+        "m_vwap_stoch_confluence": confluence,
     }
 
 
@@ -454,7 +559,7 @@ def compute_pillars_from_ia(df: pd.DataFrame, ia) -> PillarResult:
         s_score, s_sub = _score_structure(close, ia.e20, ia.e50, ia.e200)
         a_score, a_sub = _score_acceptance(close, high, low, volume)
         l_score, l_sub = _score_leadership(close, ia.nifty_aligned)
-        m_score, m_sub = _score_momentum(high, low, close, ia.rsi_s, volume)
+        m_score, m_sub = _score_momentum(high, low, close, ia.rsi_s, volume, ia.atr_s)
         r_score, r_sub = _score_risk(close, ia.e20, a_sub["vwap"], ia.atr_s)
 
         final = (
