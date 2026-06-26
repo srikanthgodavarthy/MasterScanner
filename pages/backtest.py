@@ -1146,3 +1146,144 @@ def render(settings=None):
             file_name=f"backtest_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv", key="btn_dl_bt_csv",
         )
+
+    # ── VWAP Reclaim Analysis ────────────────────────────────────────────────
+    with st.expander("📊 VWAP Reclaim Analysis", expanded=False):
+        from utils.backtest_engine import build_vwap_reclaim_analysis
+        vra = build_vwap_reclaim_analysis(trades_df)
+
+        if not vra.get("available", False):
+            st.info(f"VWAP Reclaim Analysis not available: {vra.get('reason', 'unknown')}")
+        else:
+            st.markdown("#### VWAP Reclaim Pattern — Performance Breakdown")
+            st.caption(
+                f"Total trades in backtest: {vra['total_trades']} | "
+                f"Overall Win Rate: {vra['overall'].get('win_rate','—')}% | "
+                f"Profit Factor: {vra['overall'].get('profit_factor','—')}"
+            )
+
+            def _vra_table(breakdown: dict, title: str) -> None:
+                if not breakdown:
+                    return
+                st.markdown(f"**{title}**")
+                rows = []
+                for label, m in breakdown.items():
+                    if m.get("count", 0) == 0:
+                        continue
+                    rows.append({
+                        "Bucket":          label,
+                        "Trades":          m.get("count", 0),
+                        "Win%":            f"{m.get('win_rate', 0)}%",
+                        "PF":              m.get("profit_factor", "—"),
+                        "Expectancy":      f"{m.get('expectancy', 0)}%",
+                        "Avg R":           m.get("avg_r", "—"),
+                        "Avg Hold (d)":    m.get("avg_hold", "—"),
+                        "Max DD":          f"{m.get('max_drawdown', 0)}%",
+                        "Timeout%":        f"{m.get('timeout_pct', 0)}%",
+                        "SL%":             f"{m.get('sl_pct', 0)}%",
+                        "T1%":             f"{m.get('t1_pct', 0)}%",
+                        "T2%":             f"{m.get('t2_pct', 0)}%",
+                        "T3%":             f"{m.get('t3_pct', 0)}%",
+                    })
+                if rows:
+                    import pandas as _pd
+                    st.dataframe(_pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+            _vra_table(vra.get("by_reaction_strength", {}),    "By Reaction Strength (0–100)")
+            _vra_table(vra.get("by_pattern_age", {}),          "By Pattern Age (bars)")
+            _vra_table(vra.get("by_confluence", {}),           "By Stoch/VWAP Confluence")
+            _vra_table(vra.get("by_touch_distance_atr", {}),   "By Touch Distance (ATR)")
+            _vra_table(vra.get("by_vwap_direction", {}),       "By VWAP Direction")
+            _vra_table(vra.get("by_vwap_touch", {}),           "VWAP Touch vs No Touch")
+
+    # ── Optimization Framework ────────────────────────────────────────────────
+    with st.expander("🔬 VWAP Reclaim Parameter Sensitivity", expanded=False):
+        st.markdown("""
+**Optimization Framework** — evaluate which VWAP Reclaim parameter combinations
+produce the highest Profit Factor and Expectancy. Runs the Five Pillars backtest
+for each combination and outputs a ranked sensitivity table.
+
+> ⚠️ Runs in-process — can take several minutes for large universes.
+""")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            opt_atr_mults  = st.multiselect("ATR Touch Mult", [0.10, 0.15, 0.20, 0.25, 0.35, 0.50],
+                default=[0.15, 0.25, 0.35], key="opt_atr_mults")
+        with c2:
+            opt_lookbacks  = st.multiselect("Touch Lookback", [2, 3, 4, 5],
+                default=[2, 3, 4], key="opt_lookbacks")
+        with c3:
+            opt_rxn_caps   = st.multiselect("Reaction Max ATR", [1.0, 1.5, 2.0, 2.5],
+                default=[1.0, 1.5, 2.0], key="opt_rxn_caps")
+
+        c4, c5 = st.columns(2)
+        with c4:
+            opt_conf_bars  = st.multiselect("Confluence Window", [1, 2, 3],
+                default=[1, 2, 3], key="opt_conf_bars")
+        with c5:
+            opt_min_rs     = st.multiselect("Min Reaction Score", [0, 10, 20, 30],
+                default=[0, 10, 20], key="opt_min_rs")
+
+        if st.button("🚀 Run Sensitivity Sweep", key="btn_opt_sweep"):
+            import itertools
+            import pandas as _pd
+            from utils.backtest_engine import (
+                run_backtest, build_vwap_reclaim_analysis,
+            )
+
+            combos = list(itertools.product(
+                opt_atr_mults or [0.25],
+                opt_lookbacks or [3],
+                opt_rxn_caps or [1.5],
+                opt_conf_bars or [2],
+                opt_min_rs or [0],
+            ))
+            st.info(f"Running {len(combos)} parameter combinations …")
+            prog = st.progress(0)
+            results = []
+
+            for k, (atr_m, lb, rxn, cfb, min_r) in enumerate(combos):
+                ic_override = {
+                    "vwap_touch_atr_mult": atr_m,
+                    "vwap_touch_lookback": lb,
+                    "reaction_max_atr":    rxn,
+                    "confluence_window":   cfb,
+                    "min_reaction_score":  min_r,
+                }
+                try:
+                    _summary, _trades = run_backtest(
+                        mode="five_pillars",
+                        symbols=st.session_state.get("bt_symbols", [])[:30],
+                        hold_days=st.session_state.get("bt_hold_days", 20),
+                        extra_pillar_cfg=ic_override,
+                    )
+                    vra_r = build_vwap_reclaim_analysis(_trades)
+                    ov = vra_r.get("overall", {})
+                    results.append({
+                        "ATR Mult":       atr_m,
+                        "Lookback":       lb,
+                        "Rxn Max ATR":    rxn,
+                        "Conf Bars":      cfb,
+                        "Min RS":         min_r,
+                        "Trades":         ov.get("count", 0),
+                        "Win%":           ov.get("win_rate", 0),
+                        "PF":             ov.get("profit_factor", 0),
+                        "Expectancy":     ov.get("expectancy", 0),
+                        "Timeout%":       ov.get("timeout_pct", 0),
+                    })
+                except Exception as _e:
+                    results.append({"ATR Mult": atr_m, "Lookback": lb,
+                                    "Rxn Max ATR": rxn, "Conf Bars": cfb,
+                                    "Min RS": min_r, "Error": str(_e)})
+                prog.progress((k + 1) / len(combos))
+
+            if results:
+                df_opt = _pd.DataFrame(results).sort_values("PF", ascending=False)
+                st.markdown("**Sensitivity Table — ranked by Profit Factor**")
+                st.dataframe(df_opt, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇️ Download Sensitivity CSV",
+                    data=df_opt.to_csv(index=False),
+                    file_name=f"vwap_reclaim_sensitivity_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv", key="btn_dl_opt_csv",
+                )

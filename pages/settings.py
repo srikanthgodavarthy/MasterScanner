@@ -59,6 +59,19 @@ DEFAULTS = {
     # to the Conviction pattern slot. Targets stocks stuck at pat=8 purely because no
     # other pattern condition fires despite a clean, controlled Fib pullback.
     "ENABLE_GOLDEN_PULLBACK_PATTERN": False,
+    # ── Institutional Continuation (VWAP Reclaim) ──────────────────
+    "ic_enable_vwap_reclaim":    True,
+    "ic_enable_vwap_stoch_conf": True,
+    "ic_vwap_touch_atr_mult":    0.25,
+    "ic_vwap_touch_lookback":    3,
+    "ic_reaction_max_atr":       1.5,
+    "ic_confluence_window":      2,
+    "ic_require_ema_trend":      True,
+    "ic_require_rising_vwap":    True,
+    "ic_require_bullish_return": True,
+    "ic_min_reaction_score":     0,
+    "ic_momentum_weight":        15,
+    "ic_confluence_weight":      10,
 }
 
 _TRADING_STYLE_DEFAULTS = {
@@ -539,6 +552,84 @@ def _tab_advanced() -> None:
             min_score = st.slider("Min score", 50, 85, _g("min_score"), step=5,
                 key="sl_min_score", label_visibility="collapsed")
             _s("min_score", int(min_score))
+
+    # ── Institutional Continuation (VWAP Reclaim) ────────────────
+    with st.expander("Institutional Continuation", expanded=False):
+        st.markdown(
+            "<small style='color:#8b949e'>Controls the VWAP Reclaim + Stochastic "
+            "Confluence pattern in the Momentum Pillar. All parameters apply to "
+            "the Five Pillars scanner and backtest engine.</small>",
+            unsafe_allow_html=True,
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            _label("Enable VWAP Reclaim scoring")
+            ic_enable = st.toggle("Enable VWAP Reclaim", value=_g("ic_enable_vwap_reclaim"),
+                key="ic_enable_vwap_reclaim")
+            _s("ic_enable_vwap_reclaim", bool(ic_enable))
+
+            _label("Enable VWAP / Stoch Confluence bonus")
+            ic_conf = st.toggle("Enable Confluence", value=_g("ic_enable_vwap_stoch_conf"),
+                key="ic_enable_vwap_stoch_conf")
+            _s("ic_enable_vwap_stoch_conf", bool(ic_conf))
+
+            _label("VWAP Touch ATR Multiple")
+            ic_atr_mult = st.slider("ATR Mult", 0.05, 1.0,
+                float(_g("ic_vwap_touch_atr_mult")), step=0.05,
+                key="ic_vwap_touch_atr_mult", label_visibility="collapsed")
+            _s("ic_vwap_touch_atr_mult", float(ic_atr_mult))
+
+            _label("VWAP Touch Lookback (bars)")
+            ic_lookback = st.slider("Lookback", 1, 10,
+                int(_g("ic_vwap_touch_lookback")), step=1,
+                key="ic_vwap_touch_lookback", label_visibility="collapsed")
+            _s("ic_vwap_touch_lookback", int(ic_lookback))
+
+            _label("Reaction Max ATR (100 = this many ATRs)")
+            ic_rxn_cap = st.slider("Reaction Max ATR", 0.5, 4.0,
+                float(_g("ic_reaction_max_atr")), step=0.25,
+                key="ic_reaction_max_atr", label_visibility="collapsed")
+            _s("ic_reaction_max_atr", float(ic_rxn_cap))
+
+            _label("Confluence Window (bars)")
+            ic_conf_bars = st.slider("Confluence Window", 1, 5,
+                int(_g("ic_confluence_window")), step=1,
+                key="ic_confluence_window", label_visibility="collapsed")
+            _s("ic_confluence_window", int(ic_conf_bars))
+
+        with c2:
+            _label("Require EMA20 > EMA50 (trend filter)")
+            ic_ema_trend = st.toggle("Require EMA Trend", value=_g("ic_require_ema_trend"),
+                key="ic_require_ema_trend")
+            _s("ic_require_ema_trend", bool(ic_ema_trend))
+
+            _label("Require Rising VWAP")
+            ic_rvwap = st.toggle("Require Rising VWAP", value=_g("ic_require_rising_vwap"),
+                key="ic_require_rising_vwap")
+            _s("ic_require_rising_vwap", bool(ic_rvwap))
+
+            _label("Require Bullish Return Candle")
+            ic_bull = st.toggle("Require Bullish Return", value=_g("ic_require_bullish_return"),
+                key="ic_require_bullish_return")
+            _s("ic_require_bullish_return", bool(ic_bull))
+
+            _label("Minimum Reaction Score (0–100)")
+            ic_min_rs = st.slider("Min Reaction Score", 0, 80,
+                int(_g("ic_min_reaction_score")), step=5,
+                key="ic_min_reaction_score", label_visibility="collapsed")
+            _s("ic_min_reaction_score", int(ic_min_rs))
+
+            _label("Momentum Weight (pts for VWAP Reclaim Quality)")
+            ic_mom_w = st.slider("Momentum Weight", 5, 25,
+                int(_g("ic_momentum_weight")), step=1,
+                key="ic_momentum_weight", label_visibility="collapsed")
+            _s("ic_momentum_weight", int(ic_mom_w))
+
+            _label("Confluence Weight (pts for VWAP/Stoch confluence)")
+            ic_conf_w = st.slider("Confluence Weight", 0, 20,
+                int(_g("ic_confluence_weight")), step=1,
+                key="ic_confluence_weight", label_visibility="collapsed")
+            _s("ic_confluence_weight", int(ic_conf_w))
 
 
 # ══════════════════════════════════════════════════════════════════

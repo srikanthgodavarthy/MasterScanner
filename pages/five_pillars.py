@@ -260,10 +260,18 @@ def _detail_breakdown(row: pd.Series) -> str:
     html += _row("4 · Momentum", row.get("FP_Momentum"), f"{W_MOMENTUM:.0%}", [
         f"Stoch %K/%D: {row.get('FP_StochK','—')} / {row.get('FP_StochD','—')} · cross/re-ignition: {'✅' if row.get('_fp_stoch_cross_up') else '❌'}",
         f"RSI(14): {row.get('_fp_rsi_val','—')} · &gt; 50: {'✅' if row.get('_fp_rsi_above_50') else '❌'}",
-        f"VWAP touch (last 3 bars, 0.25×ATR band): {'✅' if row.get('_fp_vwap_touched') else '❌'} · "
-        f"reclaimed: {'✅' if row.get('_fp_vwap_reclaimed') else '❌'} · "
-        f"reaction: {row.get('_fp_reaction_strength_atr','—')} ATR",
-        f"VWAP-reclaim × Stoch-cross confluence (≤2 bars apart): {'✅' if row.get('_fp_vwap_stoch_confluence') else '❌'}",
+        f"VWAP touch found: {'✅' if row.get('_fp_vwap_touch_found') else '❌'} · "
+        f"touch bar: {row.get('_fp_touch_bar','—')} bars ago · "
+        f"touch distance: {row.get('_fp_touch_distance_atr','—')} ATR",
+        f"Returned above VWAP: {'✅' if row.get('_fp_returned_above_vwap') else '❌'} · "
+        f"reaction score: {row.get('_fp_reaction_score','—')} / 100 · "
+        f"close position: {row.get('_fp_close_position_score','—')} / 100",
+        f"Stoch cross found: {'✅' if row.get('_fp_stoch_cross_found') else '❌'} · "
+        f"cross bar: {row.get('_fp_cross_bar','—')} bars ago · "
+        f"confluence gap: {row.get('_fp_confluence_gap','—')} bars",
+        f"Confluence: {'✅' if row.get('_fp_vwap_stoch_confluence') else '❌'} · "
+        f"pattern age: {row.get('_fp_pattern_age','—')} bars · "
+        f"momentum bonus: +{row.get('_fp_momentum_bonus', 0)} pts",
     ])
     html += _row("5 · Risk (lower risk = higher score)", row.get("FP_Risk"), f"{W_RISK:.0%}", [
         f"Distance from EMA20: {row.get('FP_DistEMA20Pct','—')}%",
