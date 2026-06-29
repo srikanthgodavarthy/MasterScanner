@@ -1,11 +1,11 @@
 streamlit>=1.35.0
 yfinance>=0.2.40
 pandas>=2.2.0
-numpy>=1.26.0
+numpy==1.26.4
 plotly>=5.22.0
 supabase>=2.5.0
 python-dotenv>=1.0.0
 requests>=2.31.0
-numba
+numba==0.59.1
 scipy
 openai>=1.40.0
