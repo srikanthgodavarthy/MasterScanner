@@ -247,9 +247,14 @@ def _detail_breakdown(row: pd.Series) -> str:
     _swing_label = row.get("FP_SwingLabel", "") or "—"
     _swing_line = f"Swing structure: {_swing_label} (+{row.get('_fp_swing_bonus', 0)} pts)"
     if row.get("FP_SwingLabel") == "LL":
+        _ll_price      = row.get("FP_LLPrice", 0)
+        _ll_prior_low  = row.get("FP_LLPriorLow", 0)
+        _swing_line += f" — LL at {_ll_price} vs prior low {_ll_prior_low}"
         if row.get("FP_LLReclaimed"):
+            _bars = row.get("FP_LLBarsToReclaim", -1)
+            _bars_disp = f"{_bars} bar{'s' if _bars != 1 else ''}" if _bars is not None and _bars >= 0 else "—"
             _swing_line += (
-                f" — LL reclaimed ✅ (confidence {row.get('FP_LLConfidence', 0)}/100"
+                f" — reclaimed ✅ in {_bars_disp} (confidence {row.get('FP_LLConfidence', 0)}/100"
                 f", divergence {'✅' if row.get('_fp_ll_bullish_divergence') else '❌'}"
                 f", volume {'✅' if row.get('_fp_ll_volume_confirmed') else '❌'})"
             )
