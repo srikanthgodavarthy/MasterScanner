@@ -129,7 +129,7 @@ settings = {
 }
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
-    "📡 Live Scanner", "🏛️ Five Pillars", "📈 Backtest Engine", "🔄 Lifecycle", "📊 History", "⚙️ Settings", "🔬 CV/EQ Validation", "🧬 Diagnostic", "🤖 Agent", "📐 CCI Master"
+    "📡 Live Scanner", "📍 Pre-Breakout Scanner", "📈 Backtest Engine", "🔄 Lifecycle", "📊 History", "⚙️ Settings", "🔬 CV/EQ Validation", "🧬 Diagnostic", "🤖 Agent", "📐 CCI Master"
 ])
 
 with tab1:
