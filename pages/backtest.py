@@ -1227,9 +1227,7 @@ for each combination and outputs a ranked sensitivity table.
         if st.button("🚀 Run Sensitivity Sweep", key="btn_opt_sweep"):
             import itertools
             import pandas as _pd
-            from utils.backtest_engine import (
-                run_backtest, build_vwap_reclaim_analysis,
-            )
+            from utils.backtest_engine import build_vwap_reclaim_analysis
 
             combos = list(itertools.product(
                 opt_atr_mults or [0.25],
