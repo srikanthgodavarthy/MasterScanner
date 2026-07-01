@@ -840,6 +840,9 @@ def score_stock(
                 "_fp_ll_bullish_divergence":fp.s_ll_bullish_divergence,
                 "_fp_ll_volume_confirmed":  fp.s_ll_volume_confirmed,
                 "FP_LLConfidence":          fp.s_ll_confidence,
+                "FP_LLPrice":               round(fp.s_ll_price, 2),
+                "FP_LLPriorLow":            round(fp.s_ll_prior_low_price, 2),
+                "FP_LLBarsToReclaim":       fp.s_ll_bars_to_reclaim,
                 # Leadership internals
                 "FP_RS3m":        fp.rs_3m,
                 "FP_RS6m":        fp.rs_6m,
