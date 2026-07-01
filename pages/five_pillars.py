@@ -182,16 +182,22 @@ def _build_table_html(df: pd.DataFrame) -> str:
         return '<div class="fp-empty"><div class="icn">📡</div>No candidates in this bucket.</div>'
 
     headers = [
-        "Stock", "Final", "Leadership", "Structure", "Momentum", "Acceptance",
-        "RSI", "Entry", "SL", "T1", "T2",
+        "Stock", "Final", "LTP", "Chg%", "Leadership", "Structure", "Momentum",
+        "Acceptance", "RSI", "Entry", "SL", "T1", "T2",
     ]
     header_html = "".join(f"<th>{h}</th>" for h in headers)
 
     rows_html = ""
     for _, row in df.iterrows():
         sym = row.get("Stock", "—")
+        # LTP: prefer live CMP if the scan populated it, else fall back to
+        # the signal-close Entry price (same fallback pattern used
+        # elsewhere in the app, e.g. pages/scanner.py's LTP normalisation).
+        ltp = row.get("CMP", row.get("Entry"))
         cells  = f'<td class="fp-stock">{_tv_link(sym)}</td>'
         cells += _final_score_cell(row.get("FP_FinalScore"))
+        cells += _num_cell(ltp)
+        cells += _pct_cell(row.get("%Chg"))
         cells += _pillar_bar(row.get("FP_Leadership"))
         cells += _pillar_bar(row.get("FP_Structure"))
         cells += _pillar_bar(row.get("FP_Momentum"))
