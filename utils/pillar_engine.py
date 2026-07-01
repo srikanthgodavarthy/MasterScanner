@@ -6,31 +6,58 @@ pipeline. Mirrors the integration pattern of decision_engine.py /
 conviction_score_v1.py: pure function of already-available data
 (raw OHLCV df + the IndicatorArrays/BarResult already built in score_stock),
 wrapped in try/except at the call site, merged into the result dict via
-result.update(...). Zero changes to existing scoring/gates/persistence.
+result.update(...). Zero changes to existing signal-detection logic.
 
-Five pillars
+Design philosophy (v2 — early accumulation / trend-initiation model)
+──────────────────────────────────────────────────────────────────
+This engine is tuned to catch EARLY institutional accumulation and trend
+initiation — not mature, already-recognised trend leaders. It is meant to
+surface names that have:
+  • completed a correction or long consolidation,
+  • begun institutional accumulation,
+  • reclaimed value (VWAP / POC),
+  • and are showing fresh momentum re-ignition
+...ahead of long-term trend structure and relative strength fully forming.
+Structure and Leadership therefore lag by design (they measure things that
+only become obvious *after* the move is underway), so they are kept as
+light-touch pillars rather than primary gates.
+
+Four pillars
 ────────────
-1. Structure   — EMA20 > EMA50 > EMA200, price > EMA20, EMA200 rising
-2. Acceptance  — Anchored VWAP (from start of history) + 60-bar Fixed
-                 Range Volume Profile (POC / VAH / VAL)
-3. Leadership  — Relative strength vs NIFTY (3M, 6M) + relative momentum
-4. Momentum    — Stochastic Oscillator(14,3) re-ignition + RSI(14) > 50 +
-                 VWAP Touch-Reclaim (price dipped to/through anchored VWAP
-                 within an ATR-scaled tolerance and reclaimed it, scored by
-                 reaction strength in ATRs) + a confluence bonus when the
-                 reclaim bar and the %K/%D cross-up land within 2 bars of
-                 each other
-5. Risk        — Distance from EMA20 / VWAP / ATR extension (lower = safer,
-                 scored so LOWER risk gives a HIGHER score)
+1. Structure   (10%) — EMA20 > EMA50 > EMA200, price > EMA20, EMA200 rising.
+                 A light confirmation only — it should not heavily penalize
+                 emerging setups whose long-term structure hasn't caught up
+                 yet.
+2. Acceptance  (40%) — Anchored VWAP (from start of history) + 60-bar Fixed
+                 Range Volume Profile (POC / VAH / VAL). The PRIMARY pillar:
+                 price acceptance above POC/VWAP/value area is the earliest
+                 evidence of institutional buying.
+3. Leadership  (10%) — Relative strength vs NIFTY (3M, 6M) + relative
+                 momentum. A minor bonus only — 3M/6M relative strength
+                 naturally lags during new trend initiation, so it can't be
+                 a primary pillar without penalizing exactly the setups this
+                 engine is designed to catch early.
+4. Momentum    (40%) — Execution Quality. Equally weighted with Acceptance:
+                 maximum importance is given to fresh momentum re-ignition
+                 immediately after acceptance is established.
+                 Rewards: Stochastic(14,3) re-ignition, RSI(14) improvement,
+                 VWAP Touch-Reclaim (reaction strength in ATRs), fresh
+                 reclaim/stoch-cross confluence, and recent signal age
+                 (freshness of the reclaim pattern).
+                 Penalizes (former Risk pillar, now merged in): excessive
+                 EMA20 extension, excessive VWAP extension, ATR
+                 overextension, and exhaustion/parabolic candles — so a
+                 high Momentum score reflects quality of the re-ignition,
+                 not just raw speed/extension.
 
-Note on Acceptance vs Momentum split: Acceptance answers "where is price
-relative to value/VWAP right now" (a state). The VWAP Touch-Reclaim pattern
-answers "how did buyers react when price was tested at VWAP" (an event) —
-that's a momentum/reaction signal, not a structural state, so it lives
-entirely in Pillar 4 and Acceptance is left untouched.
+Risk is no longer a standalone pillar — its distance/extension checks are
+now applied as a penalty inside Momentum (see _score_momentum). The
+risk_score / dist_from_ema20_pct / dist_from_vwap_pct / atr_extension
+fields on PillarResult are kept for backward compatibility (informational
+only) but no longer carry independent weight in the final score.
 
-Final Score = 0.15*Structure + 0.30*Acceptance + 0.15*Leadership
-            + 0.30*Momentum  + 0.10*Risk
+Final Score = 0.10*Structure + 0.40*Acceptance + 0.10*Leadership
+            + 0.40*Momentum
 
 Classification
 ───────────────
@@ -53,11 +80,15 @@ from utils.continuation_patterns import (
 )
 
 # ── Weights (Final Ranking Engine) ─────────────────────────────────
-W_STRUCTURE  = 0.15
-W_ACCEPTANCE = 0.30
-W_LEADERSHIP = 0.15
-W_MOMENTUM   = 0.30
-W_RISK       = 0.10
+# v2 — early accumulation / trend-initiation model. Risk is no longer a
+# standalone weighted pillar; its extension checks are merged into
+# Momentum (see _score_momentum). W_RISK is kept at 0.0, purely so any
+# external code that still imports it doesn't break (backward compat).
+W_STRUCTURE  = 0.10
+W_ACCEPTANCE = 0.40
+W_LEADERSHIP = 0.10
+W_MOMENTUM   = 0.40
+W_RISK       = 0.0   # deprecated — Risk merged into Momentum, kept for backward compat imports
 
 VOLUME_PROFILE_BARS = 60   # Fixed Range Volume Profile lookback (bars)
 VALUE_AREA_PCT      = 0.70 # 70% of volume defines the Value Area (standard)
@@ -145,10 +176,14 @@ class PillarResult:
     m_reaction_strength_atr: float = 0.0     # (close - touch_bar_low) / ATR — reclaim quality
     m_vwap_stoch_confluence: bool  = False   # reclaim bar and stoch K/D cross-up bar within RECLAIM_CONFLUENCE_BARS
 
-    # ── Risk sub-fields (raw distances, informational) ────────────
+    # ── Risk sub-fields (raw distances, informational — merged into
+    #    Momentum's penalty; kept here for backward compatibility) ──
     dist_from_ema20_pct:   float = 0.0
     dist_from_vwap_pct:    float = 0.0
     atr_extension:          float = 0.0   # extension measured in ATRs
+    exhaustion_candle:      bool  = False # long upper wick / small body rejection
+    parabolic_move:         bool  = False # multi-bar acceleration >= threshold ATRs
+    extension_penalty:      int   = 0     # total pts subtracted from raw Momentum score
 
     # ── VWAP Reclaim extended diagnostics (Pillar 4) ─────────────
     vwap_touch_found:        bool  = False
@@ -475,13 +510,54 @@ def detect_vwap_reclaim(
     return out
 
 
+def _detect_exhaustion(
+    open_: pd.Series | None, high: pd.Series, low: pd.Series, close: pd.Series,
+    atr_s: pd.Series,
+) -> tuple[bool, bool]:
+    """
+    Lightweight exhaustion / parabolic-move detector (new — feeds the
+    Momentum penalty, does not touch any existing pattern-detection logic).
+
+    exhaustion_candle — current bar has a long upper wick and a small body
+                         relative to its range: buyers pushed price up but
+                         it was rejected and closed well off the high
+                         (classic blow-off / exhaustion signature).
+    parabolic_move     — price has moved an unusually large number of ATRs
+                          over the last 3 bars (vertical, unsustainable
+                          acceleration rather than a controlled re-ignition).
+    """
+    cur_h, cur_l, cur_c = _safe_last(high), _safe_last(low), _safe_last(close)
+    cur_o = _safe_last(open_) if open_ is not None else cur_c
+    rng = cur_h - cur_l
+
+    exhaustion_candle = False
+    if rng > 0:
+        body = abs(cur_c - cur_o)
+        upper_wick = cur_h - max(cur_o, cur_c)
+        upper_wick_ratio = upper_wick / rng
+        body_ratio = body / rng
+        exhaustion_candle = bool(upper_wick_ratio >= 0.5 and body_ratio <= 0.35)
+
+    parabolic_move = False
+    cur_atr = _safe_last(atr_s)
+    if cur_atr > 0 and len(close) >= 4:
+        c_then = _safe_at(close, -4, default=cur_c)
+        move_atrs = (cur_c - c_then) / cur_atr
+        parabolic_move = bool(move_atrs >= 5.0)   # >=5 ATRs of move in 3 bars
+
+    return exhaustion_candle, parabolic_move
+
+
 def _score_momentum(
     high: pd.Series, low: pd.Series, close: pd.Series,
     rsi_s: pd.Series, volume: pd.Series, atr_s: pd.Series,
     ic_cfg: dict | None = None,
+    open_: pd.Series | None = None, e20: pd.Series | None = None,
 ) -> tuple[int, dict]:
     """
-    Momentum Pillar — spec-aligned allocation (100 pts):
+    Momentum Pillar — Execution Quality (0-100).
+
+    Rewards (raw score, capped at 100):
       Fresh K>D crossover      20
       From Oversold            15
       K > 50                   10
@@ -489,7 +565,19 @@ def _score_momentum(
       RSI > 60                 10
       VWAP Reclaim Quality     15   (momentum_weight, trend-gated)
       VWAP/Stoch Confluence    10   (confluence_weight)
-      Total                   100
+      Recent signal age bonus  up to 5   (fresh reclaim/cross, reuses
+                                          existing pattern_age diagnostic)
+      Strong VWAP reaction bonus up to 5 (reuses existing reaction_score)
+      Base total               up to 100 (capped)
+
+    Penalizes (former Risk pillar — merged in here, not a separate
+    weighted pillar anymore):
+      Excessive EMA20 extension
+      Excessive VWAP extension
+      ATR overextension
+      Exhaustion candle / parabolic move
+
+    final momentum score = clip(raw_score - extension_penalty, 0, 100)
     """
     cfg = IC_DEFAULTS.copy()
     if ic_cfg:
@@ -560,7 +648,47 @@ def _score_momentum(
     if confluence and cfg.get("enable_vwap_stoch_conf", True):
         conf_weight = int(cfg.get("confluence_weight", 10))
         score += conf_weight            # VWAP/Stoch Confluence
-    score = min(score, 100)
+
+    # ── Recent signal age bonus (reuses existing pattern_age diagnostic —
+    #    no new detection logic, just rewards freshness of what was
+    #    already detected) ───────────────────────────────────────────────
+    pattern_age = int(meta.get("pattern_age", 0) or 0)
+    if reclaim_result.get("confirmed") and pattern_age <= 2:
+        score += 5
+
+    # ── Strong VWAP reaction bonus (reuses existing reaction_score) ──────
+    reaction_score_val = float(meta.get("reaction_score", 0.0) or 0.0)
+    if reaction_score_val >= 70:
+        score += 5
+
+    raw_score = min(score, 100)
+
+    # ── Merged Risk penalty: excessive extension / exhaustion ────────────
+    cur_c   = _safe_last(close)
+    cur_e20 = _safe_last(e20) if e20 is not None else 0.0
+    cur_atr = _safe_last(atr_s)
+
+    dist_ema20_pct = ((cur_c - cur_e20) / cur_e20 * 100) if cur_e20 > 0 else 0.0
+    dist_vwap_pct  = ((cur_c - vwap_last) / vwap_last * 100) if vwap_last > 0 else 0.0
+    atr_extension  = (cur_c - cur_e20) / cur_atr if (cur_atr > 0 and cur_e20 > 0) else 0.0
+
+    exhaustion_candle, parabolic_move = _detect_exhaustion(open_, high, low, close, atr_s)
+
+    def _penalty(val, thresholds_penalties):
+        for th, pen in thresholds_penalties:
+            if val >= th:
+                return pen
+        return 0
+
+    pen_ema20 = _penalty(abs(dist_ema20_pct), [(15, 20), (10, 14), (6, 8), (3, 4)]) if e20 is not None else 0
+    pen_vwap  = _penalty(abs(dist_vwap_pct),  [(20, 18), (12, 12), (7, 7), (3, 3)])
+    pen_atr   = _penalty(abs(atr_extension),  [(4, 20), (3, 14), (2, 8), (1, 3)]) if e20 is not None else 0
+    pen_exhaustion = 10 if exhaustion_candle else 0
+    pen_parabolic  = 15 if parabolic_move else 0
+
+    extension_penalty = min(pen_ema20 + pen_vwap + pen_atr + pen_exhaustion + pen_parabolic, 40)
+
+    score = max(0, min(raw_score - extension_penalty, 100))
 
     # ── Diagnostics ──────────────────────────────────────────────────────
     r_meta = reclaim_result.get("metadata", {})
@@ -587,12 +715,22 @@ def _score_momentum(
         "cross_bar":             int(cross_bars_ago) if cross_bars_ago is not None else 0,
         "confluence_gap":        int(r_meta.get("confluence_gap", 0) or 0),
         "pattern_age":           int(r_meta.get("pattern_age", 0) or 0),
+        # ── Merged Risk / extension diagnostics ──
+        "dist_from_ema20_pct":   round(dist_ema20_pct, 2),
+        "dist_from_vwap_pct":    round(dist_vwap_pct, 2),
+        "atr_extension":         round(atr_extension, 2),
+        "exhaustion_candle":     exhaustion_candle,
+        "parabolic_move":        parabolic_move,
+        "extension_penalty":     int(extension_penalty),
         "momentum_bonus":        momentum_pts,
     }
 
 
 # ══════════════════════════════════════════════════════════════════
-#  PILLAR 5 — RISK  (avoid late-stage entries; lower risk = higher score)
+#  RISK (legacy, informational only) — no longer a weighted pillar.
+#  Extension/exhaustion penalties now live inside _score_momentum().
+#  This function is kept only to populate the backward-compatible
+#  risk_score field on PillarResult (e.g. FP_Risk column consumers).
 # ══════════════════════════════════════════════════════════════════
 
 def _score_risk(close: pd.Series, e20: pd.Series, vwap_last: float,
@@ -618,11 +756,11 @@ def _score_risk(close: pd.Series, e20: pd.Series, vwap_last: float,
 
     score = max(0, 100 - pen_ema20 - pen_vwap - pen_atr)
 
-    return score, {
-        "dist_from_ema20_pct": round(dist_ema20_pct, 2),
-        "dist_from_vwap_pct": round(dist_vwap_pct, 2),
-        "atr_extension": round(atr_extension, 2),
-    }
+    # Note: dist_from_ema20_pct / dist_from_vwap_pct / atr_extension are no
+    # longer returned here — the authoritative copies now come from
+    # _score_momentum's m_sub (same formulas), which is what feeds the
+    # PillarResult dataclass fields, avoiding a duplicate-kwarg collision.
+    return score, {}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -648,24 +786,30 @@ def compute_pillars_from_ia(df: pd.DataFrame, ia) -> PillarResult:
     Compute the Five Pillars score using the raw OHLCV df and the
     IndicatorArrays (`ia`) already built by build_indicators() inside
     score_stock(). No re-fetching, no re-computation of EMA/RSI/ATR —
-    only the new pieces (VWAP, Volume Profile, RS-3M/6M, risk distances)
-    are computed here.
+    only the new pieces (VWAP, Volume Profile, RS-3M/6M, extension
+    penalties) are computed here.
     """
     try:
         close, high, low, volume = ia.c, ia.h, ia.l, ia.v
+        open_ = getattr(ia, "o", None)
 
         s_score, s_sub = _score_structure(close, ia.e20, ia.e50, ia.e200)
         a_score, a_sub = _score_acceptance(close, high, low, volume)
         l_score, l_sub = _score_leadership(close, ia.nifty_aligned)
-        m_score, m_sub = _score_momentum(high, low, close, ia.rsi_s, volume, ia.atr_s)
-        r_score, r_sub = _score_risk(close, ia.e20, a_sub["vwap"], ia.atr_s)
+        m_score, m_sub = _score_momentum(
+            high, low, close, ia.rsi_s, volume, ia.atr_s,
+            open_=open_, e20=ia.e20,
+        )
+        # Legacy risk_score (informational only — not weighted into final).
+        r_score, _r_sub = _score_risk(close, ia.e20, a_sub["vwap"], ia.atr_s)
 
+        # Risk is no longer a separately weighted pillar — its checks are
+        # merged into Momentum's extension penalty above.
         final = (
             s_score * W_STRUCTURE +
             a_score * W_ACCEPTANCE +
             l_score * W_LEADERSHIP +
-            m_score * W_MOMENTUM +
-            r_score * W_RISK
+            m_score * W_MOMENTUM
         )
         final_int = int(round(final))
         cls, note = _classify(final_int)
@@ -693,7 +837,7 @@ def compute_pillars_from_ia(df: pd.DataFrame, ia) -> PillarResult:
             leadership_score=l_score, momentum_score=m_score,
             risk_score=r_score, final_score=final_int,
             classification=cls, classification_note=note,
-            **s_sub, **a_sub, **l_sub, **m_sub, **r_sub, **_ext,
+            **s_sub, **a_sub, **l_sub, **m_sub, **_r_sub, **_ext,
         )
     except Exception as exc:
         return PillarResult(error=str(exc))
@@ -712,6 +856,7 @@ def compute_pillars(df: pd.DataFrame, nifty: pd.Series) -> PillarResult:
         return PillarResult(error="insufficient history")
 
     close, high, low, volume = df["close"], df["high"], df["low"], df["volume"]
+    open_ = df["open"] if "open" in df.columns else close
 
     e20  = ema(close, 20)
     e50  = ema(close, 50)
@@ -727,7 +872,7 @@ def compute_pillars(df: pd.DataFrame, nifty: pd.Series) -> PillarResult:
     class _IA:
         pass
     ia = _IA()
-    ia.c, ia.h, ia.l, ia.v = close, high, low, volume
+    ia.c, ia.h, ia.l, ia.v, ia.o = close, high, low, volume, open_
     ia.e20, ia.e50, ia.e200 = e20, e50, e200
     ia.rsi_s, ia.atr_s = rsi_s, atr_s
     ia.nifty_aligned = nifty_aligned

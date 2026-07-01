@@ -817,7 +817,6 @@ def score_stock(
                 "FP_Acceptance":  fp.acceptance_score,
                 "FP_Leadership":  fp.leadership_score,
                 "FP_Momentum":    fp.momentum_score,
-                "FP_Risk":        fp.risk_score,
                 "FP_FinalScore":  fp.final_score,
                 "FP_Class":       fp.classification,
                 "FP_ClassNote":   fp.classification_note,
@@ -865,10 +864,19 @@ def score_stock(
                 "FP_Confluence":             fp.m_vwap_stoch_confluence,
                 "FP_PatternAge":             fp.pattern_age,
                 "FP_MomentumBonus":          fp.momentum_bonus,
-                # Risk internals
+                # Risk internals — Risk is no longer a separately weighted
+                # pillar; FP_Risk is kept for backward compatibility
+                # (legacy informational score). The values that actually
+                # drive scoring now live under Momentum (FP_ExtensionPenalty
+                # etc. below), sourced from the same distance/extension
+                # calculations.
+                "FP_Risk":        fp.risk_score,
                 "FP_DistEMA20Pct": fp.dist_from_ema20_pct,
                 "FP_DistVWAPPct":  fp.dist_from_vwap_pct,
                 "FP_ATRExtension":fp.atr_extension,
+                "FP_ExhaustionCandle": fp.exhaustion_candle,
+                "FP_ParabolicMove":    fp.parabolic_move,
+                "FP_ExtensionPenalty": fp.extension_penalty,
             })
     except Exception as _fp_exc:
         import logging as _log
