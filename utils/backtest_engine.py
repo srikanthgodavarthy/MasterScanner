@@ -152,7 +152,7 @@ def generate_signals_historical(
                    POOR_RR, LOW_ENTRY_QUALITY, etc.)
     """
     if df.empty or len(df) < 210:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     if settings:
         params    = ScoringParams.from_settings(settings)
