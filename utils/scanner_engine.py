@@ -832,6 +832,14 @@ def score_stock(
                 "_fp_ema_stack":      fp.s_ema_stack,
                 "_fp_price_above_e20":fp.s_price_above_e20,
                 "_fp_ema200_rising":  fp.s_ema200_rising,
+                # Swing structure (HH/HL/LH/LL) + LL "spring" reversal
+                "FP_SwingLabel":            fp.s_swing_label,
+                "_fp_swing_bonus":          fp.s_swing_bonus,
+                "FP_LLDetected":            fp.s_ll_detected,
+                "FP_LLReclaimed":           fp.s_ll_reclaimed,
+                "_fp_ll_bullish_divergence":fp.s_ll_bullish_divergence,
+                "_fp_ll_volume_confirmed":  fp.s_ll_volume_confirmed,
+                "FP_LLConfidence":          fp.s_ll_confidence,
                 # Leadership internals
                 "FP_RS3m":        fp.rs_3m,
                 "FP_RS6m":        fp.rs_6m,

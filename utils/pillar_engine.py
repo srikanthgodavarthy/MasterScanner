@@ -78,6 +78,7 @@ from utils.continuation_patterns import (
     _find_stoch_cross_bar as _cp_find_stoch_cross_bar,
     _anchored_vwap as _cp_anchored_vwap,
 )
+from utils.swing_structure import compute_swing_labels, detect_ll_reversal
 
 # ── Weights (Final Ranking Engine) ─────────────────────────────────
 # v2 — early accumulation / trend-initiation model. Risk is no longer a
@@ -151,6 +152,15 @@ class PillarResult:
     s_price_above_e20: bool  = False
     s_ema200_rising:   bool  = False
 
+    # ── Swing structure sub-fields (HH/HL/LH/LL + LL "spring" reversal) ──
+    s_swing_label:           str  = ""     # most recent confirmed pivot label: HH/HL/LH/LL/""
+    s_swing_bonus:           int  = 0      # points (0-25) this contributed to Structure score
+    s_ll_detected:           bool = False  # most recent confirmed low IS a Lower Low
+    s_ll_reclaimed:          bool = False  # that LL has since been reclaimed (spring / failed breakdown)
+    s_ll_bullish_divergence: bool = False  # oscillator (CCI) higher at the LL than at the prior low
+    s_ll_volume_confirmed:   bool = False  # reclaim-bar volume > average
+    s_ll_confidence:         int  = 0      # 0-100 informational confidence of the LL "spring" read
+
     # ── Acceptance sub-fields ────────────────────────────────────
     vwap:               float = 0.0
     poc:                 float = 0.0
@@ -222,7 +232,29 @@ def _safe_at(series: pd.Series, idx: int, default: float = 0.0) -> float:
 # ══════════════════════════════════════════════════════════════════
 
 def _score_structure(close: pd.Series, e20: pd.Series, e50: pd.Series,
-                      e200: pd.Series) -> tuple[int, dict]:
+                      e200: pd.Series,
+                      low: pd.Series | None = None,
+                      ph_series: pd.Series | None = None,
+                      pl_series: pd.Series | None = None,
+                      osc: pd.Series | None = None,
+                      volume: pd.Series | None = None,
+                      vol_avg: pd.Series | None = None) -> tuple[int, dict]:
+    """
+    Structure pillar = EMA trend confirmation (75 pts) + swing structure
+    (25 pts, from HH/HL/LH/LL classification of the pivot series).
+
+    Swing-structure scoring deliberately does NOT treat every Lower Low as
+    bearish. A plain LL (still not reclaimed) scores 0 — treat as
+    continuation. But an LL that has already been reclaimed with
+    divergence/volume support (see utils.swing_structure.detect_ll_reversal)
+    is a shakeout / failed-breakdown ("spring") — exactly the kind of early
+    accumulation evidence this engine is designed to reward, so it scores
+    the same as a bullish HH/HL. This mirrors the early-accumulation
+    philosophy described in the module docstring: penalizing every LL
+    would systematically exclude names that already look like the chart
+    the module docstring is comparing against (spring off a Lower Low,
+    then reclaiming it).
+    """
     cur_c    = _safe_last(close)
     cur_e20  = _safe_last(e20)
     cur_e50  = _safe_last(e50)
@@ -237,15 +269,70 @@ def _score_structure(close: pd.Series, e20: pd.Series, e50: pd.Series,
     price_above_e20 = cur_c > cur_e20
 
     score = 0
-    if ema_stack:        score += 45
-    if price_above_e20:  score += 30
-    if ema200_rising:    score += 25
+    if ema_stack:        score += 35
+    if price_above_e20:  score += 25
+    if ema200_rising:    score += 15
+
+    # ── Swing structure (HH/HL/LH/LL) + LL "spring" reversal bonus ──────
+    swing_label           = ""
+    swing_bonus           = 0
+    ll_detected           = False
+    ll_reclaimed          = False
+    ll_bullish_divergence = False
+    ll_volume_confirmed   = False
+    ll_confidence         = 0
+
+    if ph_series is not None and pl_series is not None and len(ph_series) > 0:
+        try:
+            labels = compute_swing_labels(ph_series, pl_series)
+            swing_label = labels["label_ffill"].iloc[-1] or ""
+
+            if swing_label in ("HH", "HL"):
+                swing_bonus = 25
+            elif swing_label == "LH":
+                swing_bonus = 10
+            elif swing_label == "LL" and low is not None and osc is not None:
+                ll_sig = detect_ll_reversal(
+                    close=close, low=low,
+                    volume=volume if volume is not None else pd.Series(0.0, index=close.index),
+                    osc=osc, ph_series=ph_series, pl_series=pl_series,
+                    i=len(close) - 1, vol_avg=vol_avg,
+                )
+                ll_detected           = ll_sig.is_ll
+                ll_reclaimed          = ll_sig.reclaimed
+                ll_bullish_divergence = ll_sig.bullish_divergence
+                ll_volume_confirmed   = ll_sig.volume_confirmed
+                ll_confidence         = ll_sig.confidence
+
+                if ll_sig.reclaimed and ll_sig.confidence >= 50:
+                    swing_bonus = 25   # confirmed "spring" -> treated like bullish structure
+                elif ll_sig.reclaimed and ll_sig.confidence >= 30:
+                    swing_bonus = 15
+                elif ll_sig.reclaimed:
+                    swing_bonus = 8    # reclaimed but weak confirmation
+                else:
+                    swing_bonus = 0    # plain LL, not yet reclaimed -> continuation, no bonus
+            else:
+                swing_bonus = 12       # LL with no low/osc data to test reversal -> neutral
+        except Exception:
+            swing_bonus = 12           # any failure -> neutral, don't penalize
+    else:
+        swing_bonus = 12               # pivot series unavailable -> neutral, don't penalize
+
+    score += swing_bonus
     score = min(score, 100)
 
     return score, {
         "s_ema_stack": ema_stack,
         "s_price_above_e20": price_above_e20,
         "s_ema200_rising": ema200_rising,
+        "s_swing_label": swing_label,
+        "s_swing_bonus": swing_bonus,
+        "s_ll_detected": ll_detected,
+        "s_ll_reclaimed": ll_reclaimed,
+        "s_ll_bullish_divergence": ll_bullish_divergence,
+        "s_ll_volume_confirmed": ll_volume_confirmed,
+        "s_ll_confidence": ll_confidence,
     }
 
 
@@ -793,7 +880,15 @@ def compute_pillars_from_ia(df: pd.DataFrame, ia) -> PillarResult:
         close, high, low, volume = ia.c, ia.h, ia.l, ia.v
         open_ = getattr(ia, "o", None)
 
-        s_score, s_sub = _score_structure(close, ia.e20, ia.e50, ia.e200)
+        s_score, s_sub = _score_structure(
+            close, ia.e20, ia.e50, ia.e200,
+            low=low,
+            ph_series=getattr(ia, "ph_series", None),
+            pl_series=getattr(ia, "pl_series", None),
+            osc=getattr(ia, "cci_s", None),
+            volume=volume,
+            vol_avg=getattr(ia, "vol_avg", None),
+        )
         a_score, a_sub = _score_acceptance(close, high, low, volume)
         l_score, l_sub = _score_leadership(close, ia.nifty_aligned)
         m_score, m_sub = _score_momentum(
@@ -851,6 +946,7 @@ def compute_pillars(df: pd.DataFrame, nifty: pd.Series) -> PillarResult:
     compute_pillars_from_ia(df, ia) to avoid recomputing EMA/RSI/ATR.
     """
     from utils.scanner_engine import ema, rsi, atr, _strip_tz
+    from utils.pivot_engine import build_pivot_series
 
     if df.empty or len(df) < 60:
         return PillarResult(error="insufficient history")
@@ -864,6 +960,13 @@ def compute_pillars(df: pd.DataFrame, nifty: pd.Series) -> PillarResult:
     rsi_s = rsi(close, 14)
     atr_s = atr(high, low, close, 14)
 
+    # Pivot series + volume average — not otherwise built on this standalone
+    # path, but needed for the swing-structure (HH/HL/LH/LL) sub-score.
+    # Falls back to RSI as the oscillator (CCI isn't computed here) — good
+    # enough for the bullish-divergence check inside detect_ll_reversal().
+    ph_series, pl_series = build_pivot_series(high, low, lb=20)
+    vol_avg = volume.rolling(20, min_periods=1).mean()
+
     c_idx = _strip_tz(close.index)
     nf = nifty.copy()
     nf.index = _strip_tz(nf.index)
@@ -876,5 +979,8 @@ def compute_pillars(df: pd.DataFrame, nifty: pd.Series) -> PillarResult:
     ia.e20, ia.e50, ia.e200 = e20, e50, e200
     ia.rsi_s, ia.atr_s = rsi_s, atr_s
     ia.nifty_aligned = nifty_aligned
+    ia.ph_series, ia.pl_series = ph_series, pl_series
+    ia.cci_s   = rsi_s     # oscillator fallback (no CCI computed on this path)
+    ia.vol_avg = vol_avg
 
     return compute_pillars_from_ia(df, ia)
