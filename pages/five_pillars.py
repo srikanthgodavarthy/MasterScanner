@@ -3,11 +3,13 @@ pages/five_pillars.py — Five Pillars Ranking Tab
 ─────────────────────────────────────────────────────────────────────────────
 Reads the Live Scanner's existing scan result (st.session_state["scan_df"])
 and renders it through the Five Pillars lens (Structure / Acceptance /
-Leadership / Momentum / Risk -> Final Score -> Execute/Watch/Developing/
-Avoid). Does NOT trigger its own scan and does NOT touch production
-scanner/decision-engine logic — it is a pure display layer over the FP_*
-columns already attached to df_aug by utils/pillar_engine.py inside
-score_stock().
+Leadership / Momentum -> Final Score -> Execute/Watch/Developing/
+Avoid). Risk is no longer a standalone pillar — its extension/exhaustion
+checks are merged into Momentum (shown in the Momentum breakdown as
+"Execution Quality"). Does NOT trigger its own scan and does NOT touch
+production scanner/decision-engine logic — it is a pure display layer over
+the FP_* columns already attached to df_aug by utils/pillar_engine.py
+inside score_stock().
 
 If the person hasn't run a scan yet (or ran one before this feature was
 added, so FP_* columns are missing), this tab prompts them to run/re-run
@@ -22,7 +24,7 @@ import pandas as pd
 
 from utils.pillar_engine import (
     CLASS_EXECUTE, CLASS_WATCH, CLASS_DEVELOPING, CLASS_AVOID,
-    W_STRUCTURE, W_ACCEPTANCE, W_LEADERSHIP, W_MOMENTUM, W_RISK,
+    W_STRUCTURE, W_ACCEPTANCE, W_LEADERSHIP, W_MOMENTUM,
 )
 
 # ── Visual constants (matches pages/scanner.py dark theme) ─────────
@@ -180,9 +182,8 @@ def _build_table_html(df: pd.DataFrame) -> str:
         return '<div class="fp-empty"><div class="icn">📡</div>No candidates in this bucket.</div>'
 
     headers = [
-        "Stock", "Chg%", "Final", "Class", "Structure", "Acceptance",
-        "Leadership", "Momentum", "Risk", "RS 3M", "RS 6M",
-        "POC", "VWAP", "Stoch %K", "Stoch %D", "RSI",
+        "Stock", "Final", "Leadership", "Structure", "Momentum", "Acceptance",
+        "RSI", "Entry", "SL", "T1", "T2",
     ]
     header_html = "".join(f"<th>{h}</th>" for h in headers)
 
@@ -190,21 +191,16 @@ def _build_table_html(df: pd.DataFrame) -> str:
     for _, row in df.iterrows():
         sym = row.get("Stock", "—")
         cells  = f'<td class="fp-stock">{_tv_link(sym)}</td>'
-        cells += _pct_cell(row.get("%Chg"))
         cells += _final_score_cell(row.get("FP_FinalScore"))
-        cells += _class_badge(row.get("FP_Class", ""))
-        cells += _pillar_bar(row.get("FP_Structure"))
-        cells += _pillar_bar(row.get("FP_Acceptance"))
         cells += _pillar_bar(row.get("FP_Leadership"))
+        cells += _pillar_bar(row.get("FP_Structure"))
         cells += _pillar_bar(row.get("FP_Momentum"))
-        cells += _pillar_bar(row.get("FP_Risk"))
-        cells += _pct_cell(row.get("FP_RS3m"))
-        cells += _pct_cell(row.get("FP_RS6m"))
-        cells += _num_cell(row.get("FP_POC"))
-        cells += _num_cell(row.get("FP_VWAP"))
-        cells += _num_cell(row.get("FP_StochK"), "{:.0f}")
-        cells += _num_cell(row.get("FP_StochD"), "{:.0f}")
+        cells += _pillar_bar(row.get("FP_Acceptance"))
         cells += _num_cell(row.get("_fp_rsi_val"), "{:.0f}")
+        cells += _num_cell(row.get("Entry"))
+        cells += _num_cell(row.get("SL"))
+        cells += _num_cell(row.get("T1"))
+        cells += _num_cell(row.get("T2"))
         rows_html += f"<tr>{cells}</tr>"
 
     return (
@@ -257,7 +253,7 @@ def _detail_breakdown(row: pd.Series) -> str:
         f"6M RS vs NIFTY: {row.get('FP_RS6m','—')}%",
         f"Relative momentum: {row.get('FP_RelMomentum','—')}%",
     ])
-    html += _row("4 · Momentum", row.get("FP_Momentum"), f"{W_MOMENTUM:.0%}", [
+    html += _row("4 · Momentum (Execution Quality)", row.get("FP_Momentum"), f"{W_MOMENTUM:.0%}", [
         f"Stoch %K/%D: {row.get('FP_StochK','—')} / {row.get('FP_StochD','—')} · cross/re-ignition: {'✅' if row.get('_fp_stoch_cross_up') else '❌'}",
         f"RSI(14): {row.get('_fp_rsi_val','—')} · &gt; 50: {'✅' if row.get('_fp_rsi_above_50') else '❌'}",
         f"VWAP touch found: {'✅' if row.get('_fp_vwap_touch_found') else '❌'} · "
@@ -272,11 +268,13 @@ def _detail_breakdown(row: pd.Series) -> str:
         f"Confluence: {'✅' if row.get('_fp_vwap_stoch_confluence') else '❌'} · "
         f"pattern age: {row.get('_fp_pattern_age','—')} bars · "
         f"momentum bonus: +{row.get('_fp_momentum_bonus', 0)} pts",
-    ])
-    html += _row("5 · Risk (lower risk = higher score)", row.get("FP_Risk"), f"{W_RISK:.0%}", [
-        f"Distance from EMA20: {row.get('FP_DistEMA20Pct','—')}%",
-        f"Distance from VWAP: {row.get('FP_DistVWAPPct','—')}%",
+        "— Execution-quality penalty (merged Risk) —",
+        f"Distance from EMA20: {row.get('FP_DistEMA20Pct','—')}% · "
+        f"Distance from VWAP: {row.get('FP_DistVWAPPct','—')}% · "
         f"ATR extension: {row.get('FP_ATRExtension','—')} ATRs",
+        f"Exhaustion candle: {'⚠️ yes' if row.get('FP_ExhaustionCandle') else 'no'} · "
+        f"Parabolic move: {'⚠️ yes' if row.get('FP_ParabolicMove') else 'no'} · "
+        f"Total penalty applied: -{row.get('FP_ExtensionPenalty', 0)} pts",
     ])
     return html
 
@@ -287,7 +285,7 @@ def render(settings: dict | None = None):
         '<div class="fp-wrap">'
         '<div class="fp-header">'
         '<span class="fp-title">🏛️ Five Pillars Ranking</span>'
-        '<span class="fp-subtitle">Structure · Acceptance · Leadership · Momentum · Risk</span>'
+        '<span class="fp-subtitle">Structure · Acceptance · Leadership · Momentum</span>'
         '</div></div>',
         unsafe_allow_html=True,
     )
@@ -308,7 +306,7 @@ def render(settings: dict | None = None):
         st.warning(
             "This scan was run before the Five Pillars engine was added. "
             "Go to **Live Scanner** and click **▶ Run Scan** again to populate "
-            "Structure / Acceptance / Leadership / Momentum / Risk scores."
+            "Structure / Acceptance / Leadership / Momentum scores."
         )
         return
 
@@ -319,7 +317,6 @@ def render(settings: dict | None = None):
         f'<span class="fp-weight-pill">Acceptance <b>{int(W_ACCEPTANCE*100)}%</b></span>'
         f'<span class="fp-weight-pill">Leadership <b>{int(W_LEADERSHIP*100)}%</b></span>'
         f'<span class="fp-weight-pill">Momentum <b>{int(W_MOMENTUM*100)}%</b></span>'
-        f'<span class="fp-weight-pill">Risk <b>{int(W_RISK*100)}%</b></span>'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -344,13 +341,13 @@ def render(settings: dict | None = None):
     with sort_col1:
         sort_by = st.selectbox(
             "Sort by", ["Final Score ↓", "Structure ↓", "Acceptance ↓",
-                        "Leadership ↓", "Momentum ↓", "Risk ↓"],
+                        "Leadership ↓", "Momentum ↓"],
             key="fp_sort_by",
         )
     sort_map = {
         "Final Score ↓": "FP_FinalScore", "Structure ↓": "FP_Structure",
         "Acceptance ↓": "FP_Acceptance", "Leadership ↓": "FP_Leadership",
-        "Momentum ↓": "FP_Momentum", "Risk ↓": "FP_Risk",
+        "Momentum ↓": "FP_Momentum",
     }
     sort_field = sort_map.get(sort_by, "FP_FinalScore")
 
