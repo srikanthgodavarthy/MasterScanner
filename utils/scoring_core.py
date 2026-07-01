@@ -282,10 +282,14 @@ class BarResult:
     ema50_pct_dist:     float = 0.0      # % price is above EMA50
     pivot_high_dist:    float = 0.0      # % price is above last pivot high (>0 = extended past pivot)
     price_move_since_setup: float = 0.0  # % move from setup trigger close to current close
-    bars_since_setup:        int   = 0        # bars elapsed since setup_detected_bar (uncapped)
-    bars_since_setup_actual: int   = 0        # alias: uncapped value — use for all admission logic
-    bars_since_setup_band:   str   = "Fresh"  # Fresh(0-3) | Actionable(4-7) | Late(8-14) | Extended(>14)
-    setup_detected_bar:      int   = -1       # bar index where setup first fired (any_buy)
+    # [FIX v9.1] has_active_setup=False means no genuine setup was found at all —
+    # bars_since_setup/setup_detected_bar are -1 sentinels in that case, NOT 0.
+    # Always check has_active_setup before trusting bars_since_setup==0 as "Fresh".
+    has_active_setup:         bool  = False
+    bars_since_setup:        int   = -1        # bars elapsed since setup_detected_bar; -1 = no active setup
+    bars_since_setup_actual: int   = -1        # alias: uncapped value — use for all admission logic
+    bars_since_setup_band:   str   = "No Signal"  # No Signal | Fresh(0-3) | Actionable(4-7) | Late(8-14) | Extended(>14)
+    setup_detected_bar:      int   = -1       # bar index where setup first fired (any_buy); -1 = none
 
     # ── ATR-normalised extension (v9 PRIMARY freshness metric) ────
     # Measures how far price has moved from the setup trigger in ATR units.
@@ -1023,6 +1027,12 @@ def compute_bar(
                 break
             _setup_bar = _sj   # extend window further back
 
+    # [FIX v9.1] _setup_bar defaults to i (current bar) whenever Phase 1 finds
+    # no genuine prior-setup match — this is indistinguishable from a setup
+    # that genuinely just fired (also bars_since_setup=0) unless we record
+    # the match explicitly here. Resolved into _has_active_setup below, once
+    # any_buy / dispatch phase-2 are known.
+    _setup_bar_matched  = (_setup_bar < i)
     bars_since_setup    = i - _setup_bar
     setup_trigger_close = ca[_setup_bar] if (ca is not None and _setup_bar >= 0) else cur_c
     price_move_since_setup = ((cur_c - setup_trigger_close) / setup_trigger_close * 100
@@ -1484,6 +1494,15 @@ def compute_bar(
             # reports 0 on the transition bar, not the prior family's age.
             _setup_bar = i
 
+    # ── FINAL SETUP-ACTIVITY DETERMINATION  [FIX v9.1] ─────────────
+    # Must run after any_buy / buy_type / dispatch phase-2 are all resolved.
+    # Distinguishes "no active setup at all" from "setup fired this bar"
+    # (both otherwise read as bars_since_setup == 0 / "Fresh").
+    if params.setup_age_mode == "signal_dispatch" and dispatch_state is not None:
+        _has_active_setup = dispatch_state.get("active_family", None) is not None
+    else:
+        _has_active_setup = bool(any_buy) or _setup_bar_matched
+
     # ── EXECUTION TIER FLAG ───────────────────────────────────────
     # Execution = score>=85 AND rs_composite>=0.10 AND buy_type in [Norm, CmpBrk]
     # [FIX v8.1 consistency] was rs >= 0.10 (5-bar RS) — inconsistent with v8.1 fix that
@@ -1672,15 +1691,19 @@ def compute_bar(
         ema50_pct_dist      = round(ema50_pct_dist, 2),
         pivot_high_dist     = round(pivot_high_dist, 2),
         price_move_since_setup = round(price_move_since_setup, 2),
-        bars_since_setup    = bars_since_setup,
-        bars_since_setup_actual = bars_since_setup,      # uncapped alias
+        # [FIX v9.1] -1 sentinel means "no active setup" — was previously
+        # indistinguishable from bars_since_setup=0 ("Fresh, just fired").
+        has_active_setup    = _has_active_setup,
+        bars_since_setup    = (bars_since_setup if _has_active_setup else -1),
+        bars_since_setup_actual = (bars_since_setup if _has_active_setup else -1),
         bars_since_setup_band   = (
+            "No Signal"  if not _has_active_setup  else
             "Fresh"      if bars_since_setup <= 3  else
             "Actionable" if bars_since_setup <= 7  else
             "Late"       if bars_since_setup <= 14 else
             "Extended"
         ),
-        setup_detected_bar  = _setup_bar,
+        setup_detected_bar  = (_setup_bar if _has_active_setup else -1),
         # ATR-normalised extension (v9 PRIMARY freshness metric)
         atr_at_setup        = round(_atr_at_setup, 4),
         extension_atr       = round(_extension_atr, 3),

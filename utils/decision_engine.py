@@ -1251,7 +1251,10 @@ def compute_decision(r: "BarResult", settings: dict | None = None) -> DecisionSc
         pivot_high_dist        = r.pivot_high_dist,
         price_move_since_setup = r.price_move_since_setup,
         bars_since_setup       = r.bars_since_setup,
+        # [FIX v9.1] r.bars_since_setup == -1 means no active setup at all
+        # (scoring_core sentinel) — must not fall into "Actionable" bucket.
         bars_band              = (
+            "No Signal"  if r.bars_since_setup < 0  else
             "Actionable" if r.bars_since_setup <= 3 else
             "Late"       if r.bars_since_setup <= 7 else
             "Extended"

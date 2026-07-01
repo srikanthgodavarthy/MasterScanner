@@ -613,14 +613,30 @@ def enrich_scanner_row(
     #      live recommendation now qualifies. This is the one place
     #      Recommendation is allowed to act — it can only *create*,
     #      never modify or close, a plan. ─────────────────────────
+    # [FIX v9.1] Recommendation/Category ("Actionable", "High Conviction", ...)
+    # is derived from Leadership/Conviction/EntryQuality/Extension only — it
+    # can read "Actionable" even when the underlying buy signal never fired
+    # (Action/CV1_SignalClass == SKIP, _any_buy == False). Confirmed against
+    # a live scan where 4/4 "Actionable"-category stocks had _any_buy=False
+    # and got frozen WAITING plans with a misleading "Fresh (0d)" badge.
+    # Require an actual fired signal, not just the category label, before
+    # minting a plan.
+    has_signal = bool(scanner_row.get("_any_buy", False))
     should_create = (
         recommendation in _FREEZE_CATEGORIES
+        and has_signal
         and (plan is None or plan.is_terminal())
     )
     if not should_create:
         if recommendation not in _FREEZE_CATEGORIES:
             logger.info(
                 "[SETUP PLAN SKIPPED] symbol=%s recommendation=%s reason=recommendation_not_qualifying",
+                symbol, recommendation,
+            )
+        elif not has_signal:
+            logger.info(
+                "[SETUP PLAN SKIPPED] symbol=%s recommendation=%s reason=no_any_buy_signal "
+                "(category qualified but underlying buy condition never fired)",
                 symbol, recommendation,
             )
         elif plan is not None and plan.is_open():
