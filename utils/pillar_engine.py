@@ -160,6 +160,9 @@ class PillarResult:
     s_ll_bullish_divergence: bool = False  # oscillator (CCI) higher at the LL than at the prior low
     s_ll_volume_confirmed:   bool = False  # reclaim-bar volume > average
     s_ll_confidence:         int  = 0      # 0-100 informational confidence of the LL "spring" read
+    s_ll_price:              float = 0.0   # price of the confirmed LL pivot
+    s_ll_prior_low_price:    float = 0.0   # the prior swing low that got undercut (reclaim level)
+    s_ll_bars_to_reclaim:    int   = -1    # bars from LL to reclaim close (-1 if not reclaimed)
 
     # ── Acceptance sub-fields ────────────────────────────────────
     vwap:               float = 0.0
@@ -281,6 +284,9 @@ def _score_structure(close: pd.Series, e20: pd.Series, e50: pd.Series,
     ll_bullish_divergence = False
     ll_volume_confirmed   = False
     ll_confidence         = 0
+    ll_price              = 0.0
+    ll_prior_low_price    = 0.0
+    ll_bars_to_reclaim    = -1
 
     if ph_series is not None and pl_series is not None and len(ph_series) > 0:
         try:
@@ -303,6 +309,9 @@ def _score_structure(close: pd.Series, e20: pd.Series, e50: pd.Series,
                 ll_bullish_divergence = ll_sig.bullish_divergence
                 ll_volume_confirmed   = ll_sig.volume_confirmed
                 ll_confidence         = ll_sig.confidence
+                ll_price              = ll_sig.ll_price
+                ll_prior_low_price    = ll_sig.prior_low_price
+                ll_bars_to_reclaim    = ll_sig.bars_to_reclaim
 
                 if ll_sig.reclaimed and ll_sig.confidence >= 50:
                     swing_bonus = 25   # confirmed "spring" -> treated like bullish structure
@@ -333,6 +342,9 @@ def _score_structure(close: pd.Series, e20: pd.Series, e50: pd.Series,
         "s_ll_bullish_divergence": ll_bullish_divergence,
         "s_ll_volume_confirmed": ll_volume_confirmed,
         "s_ll_confidence": ll_confidence,
+        "s_ll_price": ll_price,
+        "s_ll_prior_low_price": ll_prior_low_price,
+        "s_ll_bars_to_reclaim": ll_bars_to_reclaim,
     }
 
 
