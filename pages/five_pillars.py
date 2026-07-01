@@ -244,10 +244,23 @@ def _detail_breakdown(row: pd.Series) -> str:
         f'&nbsp;&nbsp;<span style="font-size:20px;font-weight:700;color:{final_color}">{final_disp}</span></div>'
     )
 
+    _swing_label = row.get("FP_SwingLabel", "") or "—"
+    _swing_line = f"Swing structure: {_swing_label} (+{row.get('_fp_swing_bonus', 0)} pts)"
+    if row.get("FP_SwingLabel") == "LL":
+        if row.get("FP_LLReclaimed"):
+            _swing_line += (
+                f" — LL reclaimed ✅ (confidence {row.get('FP_LLConfidence', 0)}/100"
+                f", divergence {'✅' if row.get('_fp_ll_bullish_divergence') else '❌'}"
+                f", volume {'✅' if row.get('_fp_ll_volume_confirmed') else '❌'})"
+            )
+        else:
+            _swing_line += " — not yet reclaimed, treated as continuation"
+
     html += _row("1 · Structure", row.get("FP_Structure"), f"{W_STRUCTURE:.0%}", [
         f"EMA20 &gt; EMA50 &gt; EMA200: {'✅' if row.get('_fp_ema_stack') else '❌'}",
         f"Price above EMA20: {'✅' if row.get('_fp_price_above_e20') else '❌'}",
         f"EMA200 rising: {'✅' if row.get('_fp_ema200_rising') else '❌'}",
+        _swing_line,
     ])
     html += _row("2 · Acceptance", row.get("FP_Acceptance"), f"{W_ACCEPTANCE:.0%}", [
         f"POC {row.get('FP_POC','—')} · VAH {row.get('FP_VAH','—')} · VAL {row.get('FP_VAL','—')}",
