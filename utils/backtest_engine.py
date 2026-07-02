@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 from utils.scanner_engine import _strip_tz, nifty_regime, ema
-from utils.decision_engine import _entry_quality as _eq_fn, _leadership as _ls_fn, _conviction as _cv_fn, _classify_category, _classify_category_with_settings, _extension as _ext_fn
+from utils.decision_engine import _entry_quality as _eq_fn, _leadership as _ls_fn, _conviction as _cv_fn, _extension as _ext_fn
 from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
 from utils.adaptive_target_engine import AdaptiveTargetParams, compute_adaptive_targets, check_momentum_exit
 from utils.regime_engine  import (
@@ -125,6 +125,36 @@ def fetch_all_bt_data(symbols: list, years: int = 3) -> dict:
 # ══════════════════════════════════════════════════════════════════
 #  SIGNAL GENERATION — delegates 100% to scoring_core.compute_bar
 # ══════════════════════════════════════════════════════════════════
+
+def _target_category_for_backtest(leadership: int, conviction: int,
+                                   entry_quality: int, extension: int) -> str:
+    """
+    Target-tier label for compute_adaptive_targets(), scoped to trades that
+    have ALREADY cleared the ADMISSION GATE above (Leadership >= 65,
+    Conviction >= 20, RR >= 2.0, Entry Quality >= 60).
+
+    decision_engine._classify_category() is NOT used here on purpose: its
+    lowest non-"Avoid" bucket requires Leadership >= 70 and Conviction >= 50
+    -- stricter than this gate's floor -- so most gate-passed trades fell
+    through to "Avoid" and got the tightest target tier (T1=1.25R) despite
+    having already been judged good enough to trade. That function is still
+    correct for the live scanner, which classifies the *entire* universe
+    (including stocks that would never pass this gate); it's just the wrong
+    tool once a binary pass/fail admission decision has already been made.
+
+    Anything reaching this function passed the gate, so the floor tier here
+    is "Setup Building" (== Actionable's base multiples), never "Avoid".
+    """
+    if extension >= 60:
+        return "Extended"
+    if leadership >= 90 and conviction >= 90 and entry_quality >= 80 and extension <= 25:
+        return "Elite Opportunity"
+    if leadership >= 80 and conviction >= 80 and entry_quality >= 60 and extension <= 35:
+        return "High Conviction"
+    if leadership >= 70 and conviction >= 60 and entry_quality >= 60 and extension <= 40:
+        return "Actionable"
+    return "Setup Building"
+
 
 def generate_signals_historical(
     df:              pd.DataFrame,
@@ -299,7 +329,7 @@ def generate_signals_historical(
         # ── v12: Adaptive targets ────────────────────────────────
         _at_params   = AdaptiveTargetParams.from_settings(settings or {})
         _ext_score   = _ext_fn(r)[0]
-        _category    = _classify_category(_ls_val, _cv_val, _eq_val, _ext_score, "ACTIONABLE", r)
+        _category    = _target_category_for_backtest(_ls_val, _cv_val, _eq_val, _ext_score)
         if _at_params.enabled:
             _entry_pad = round(r.entry * 1.005, 2)
             _risk      = max(_entry_pad - r.sl, 0.01)
