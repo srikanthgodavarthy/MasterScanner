@@ -190,11 +190,13 @@ class PillarResult:
     r_actionable_ll:           bool  = False  # LL spring confirmed (reclaimed)
     r_ll_defended:               bool  = False  # LL remains valid — price never re-broken since
     r_distance_atr_ok:             bool  = False  # distance from LL, ATR-based, in the actionable band
-    r_distance_atr_pts:              int   = 0     # 0-4, graduated by proximity — closer = higher
+    r_distance_atr_pts:              int   = 0     # 0-4, graduated by proximity, pace-adjusted (see _score_reversal)
     r_high_volume_confirmation:        bool  = False  # institutional confirmation (volume at LL)
     r_ll_price:                          float = 0.0
     r_prior_low_price:                    float = 0.0
-    r_bars_to_reclaim:                      int   = -1
+    r_bars_to_reclaim:                      int   = -1   # bars from LL pivot bar to the reclaim-confirmation bar
+    r_bars_since_reclaim:                     int   = -1   # bars from the reclaim-confirmation bar to today — pace context
+    r_vertical_extension:                       bool  = False  # distance covered in very few bars (near-vertical spike, not orderly)
     r_distance_atr:                          float = 0.0   # informational — (close - LL price) / ATR
     r_confidence:                             int   = 0     # informational only
 
@@ -515,7 +517,7 @@ def _find_active_ll(ph_series: pd.Series, pl_series: pd.Series,
     return {
         "ll_bar_pos": ll_bar_pos, "ll_price": ll_price,
         "prior_low_price": prior_low_price,
-        "reclaimed": reclaimed, "bars_to_reclaim": bars_to_reclaim,
+        "reclaimed": reclaimed, "reclaim_bar": reclaim_bar, "bars_to_reclaim": bars_to_reclaim,
         "volume_confirmed": volume_confirmed, "defended": defended,
     }
 
@@ -534,8 +536,10 @@ def _score_reversal(close: pd.Series, low: pd.Series, high: pd.Series,
     ll_price                       = 0.0
     prior_low_price                  = 0.0
     bars_to_reclaim                    = -1
-    distance_atr                         = 0.0
-    confidence                             = 0
+    bars_since_reclaim                   = -1
+    vertical_extension                     = False
+    distance_atr                             = 0.0
+    confidence                                 = 0
 
     if ph_series is not None and pl_series is not None and len(ph_series) > 0:
         info = _find_active_ll(ph_series, pl_series, close, low, volume, vol_avg,
@@ -569,6 +573,29 @@ def _score_reversal(close: pd.Series, low: pd.Series, high: pd.Series,
                 elif 3.0 <= distance_atr <= 4.0:
                     distance_atr_pts = 1     # still actionable, but stretched
 
+                # ── Pace context: HOW price covered that distance ────
+                # Two stocks 0.6 ATR off the actionable LL are not
+                # equivalent — one that took 3 bars to get there is a
+                # near-vertical spike; one that took 18 bars through an
+                # orderly consolidation is a healthier continuation.
+                # Folded into the existing distance component (not a
+                # new pillar, not a new promotion gate) so the Promotion
+                # Engine's LL Opportunity gate stays a single check.
+                reclaim_bar = info.get("reclaim_bar", -1)
+                if reclaim_bar is not None and reclaim_bar >= 0:
+                    bars_since_reclaim = (len(close) - 1) - reclaim_bar
+                    if bars_since_reclaim > 0:
+                        pace = distance_atr / bars_since_reclaim   # ATR covered per bar
+                        # Near-vertical: most of the distance covered in a
+                        # handful of bars — shave a point off the distance
+                        # score even though the raw ATR distance looks "prime".
+                        if bars_since_reclaim <= 3 and pace > 0.35:
+                            vertical_extension = True
+                            distance_atr_pts = max(0, distance_atr_pts - 1)
+                        # Orderly: same distance reached gradually over many
+                        # bars — no penalty; this is the healthier case the
+                        # raw ATR-distance number alone can't distinguish.
+
             confidence = 30
             if info["volume_confirmed"]: confidence += 30
             if info["defended"]:          confidence += 20
@@ -578,7 +605,7 @@ def _score_reversal(close: pd.Series, low: pd.Series, high: pd.Series,
     score = 0
     if actionable_ll:              score += 2
     if ll_defended:                  score += 2
-    score += distance_atr_pts          # 0-4, graduated by proximity to the LL
+    score += distance_atr_pts          # 0-4, graduated by proximity to the LL, pace-adjusted
     if high_volume_confirmation:         score += 2
     score = min(score, PTS_REVERSAL)
 
@@ -591,6 +618,8 @@ def _score_reversal(close: pd.Series, low: pd.Series, high: pd.Series,
         "r_ll_price": ll_price,
         "r_prior_low_price": prior_low_price,
         "r_bars_to_reclaim": bars_to_reclaim,
+        "r_bars_since_reclaim": bars_since_reclaim,
+        "r_vertical_extension": vertical_extension,
         "r_distance_atr": round(distance_atr, 2),
         "r_confidence": confidence,
     }
@@ -880,66 +909,91 @@ def _classify(final_score: int) -> tuple[str, str]:
 # NOT change _classify() or the Execute/Watch/Developing/Avoid
 # thresholds above — a stock still reaches Execute exactly as it does
 # today. Elite is a *further* tier reserved for Execute-tier stocks
-# that also clear four independent super-confidence gates, built
-# entirely from evidence the base engine already computed (no new
-# indicators, no re-fetching, no new data source).
+# that also clear the Promotion Engine, built entirely from evidence
+# the base engine already computed (no new indicators, no re-fetching,
+# no new data source).
 #
-# All four gates below must pass — this is deliberately the strictest
-# read (a single missing confirmation withholds Elite, it does not
-# demote the underlying Execute/BUY call).
+# Design: confidence, not a rigid score. Markets aren't always
+# perfect — an excellent stock with an excellent LL spring and low
+# risk, in a merely neutral market, is still tradeable. So instead of
+# requiring all 4 checks unconditionally, two are CRITICAL (never
+# negotiable) and two are OPTIONAL (at least one must confirm):
 #
-#   1. LL Opportunity            — a confirmed, still-valid, still
-#                                   in-band Lower-Low spring (reuses
-#                                   the Opportunity Quality Bonus
-#                                   sub-fields r_actionable_ll /
-#                                   r_ll_defended / r_distance_atr_ok).
-#   2. Institutional Accumulation— OBV rising AND leading price, the
-#                                   acceptance zone (POC / holding
-#                                   above zone) is held, AND volume
-#                                   confirmed at the LL itself.
-#   3. Market Regime             — market-wide regime (from
-#                                   utils.regime_engine) is TREND.
-#                                   Range/Volatile markets never grant
-#                                   Elite, regardless of the stock's
-#                                   own score.
-#   4. Risk Acceptable           — zero risk flags tripped (FP_Risk /
-#                                   risk_penalty == 0). Any deduction
-#                                   at all — extension, exhaustion,
-#                                   parabolic move, climactic volume —
-#                                   withholds Elite.
+#   CRITICAL (both required)
+#     1. LL Opportunity  — a confirmed, defended spring, AND the
+#        distance-from-LL score is in the "good" band (>=3/4 pts) —
+#        this already folds in pace-of-move (see _score_reversal):
+#        a near-vertical spike loses a point here even at an
+#        identical raw ATR-distance to an orderly one, so a fast,
+#        thin spring will not clear this gate on distance alone.
+#     2. Reward > Risk   — using the trade's own Entry/SL/T1 levels:
+#        (Target - Entry) > (Entry - Stop). A "good enough" score
+#        with a poor payoff structure is not a super-confidence trade.
 #
-# "Sector Leadership" is intentionally NOT a gate: no sector index /
+#   OPTIONAL (>= 1 of 2 required)
+#     3. Institutional Confirmation — OBV rising AND leading price,
+#        the acceptance zone is held, AND volume confirmed at the LL.
+#     4. Market Regime  — market-wide regime (utils.regime_engine) is
+#        TREND. A RANGE/VOLATILE market alone no longer blocks Elite
+#        if Institutional Confirmation is strong enough to carry it.
+#
+#   Promoted  = base_eligible AND gate_ll AND gate_reward_risk
+#               AND (gate_institutional OR gate_regime)
+#
+# Confidence % (informational, always shown) is a separate, simpler
+# read: the plain proportion of all 4 checks that are true (n/4 * 100)
+# — this is "what the trade feels like," independent of which two are
+# load-bearing for the promotion decision itself.
+#
+# "Sector Leadership" remains out of scope: no sector index /
 # membership feed is wired into the data pipeline anywhere in this
-# app (see l_sector_leadership_note on PillarResult), so a real gate
-# can't be built without inventing data. Adding it as a placeholder
-# gate would either always pass (meaningless) or block promotion on
-# a number nobody actually computed — worse than omitting it. Wire in
-# a real sector-benchmark feed later and this becomes a 5th gate.
+# app (see l_sector_leadership_note on PillarResult) — adding it as a
+# placeholder gate would either always pass (meaningless) or block
+# promotion on a number nobody actually computed.
 # ══════════════════════════════════════════════════════════════════
 
 CLASS_ELITE = "Elite"
-_CLASS_STYLE[CLASS_ELITE] = ("#f5c542", "Super-confidence — Execute + all promotion gates")
+_CLASS_STYLE[CLASS_ELITE] = ("#f5c542", "Super-confidence — Execute + Promotion Engine")
 
 PROMOTION_GATE_NAMES = (
     "ll_opportunity",
-    "institutional_accumulation",
+    "reward_risk",
+    "institutional_confirmation",
     "market_regime",
-    "risk_acceptable",
 )
+PROMOTION_CRITICAL_GATES = ("ll_opportunity", "reward_risk")
+PROMOTION_OPTIONAL_GATES = ("institutional_confirmation", "market_regime")
+
+# LL Opportunity gate: minimum distance_atr_pts (0-4, pace-adjusted)
+# required to treat the spring as still "good" rather than merely
+# "in-band". A near-vertical spike gets shaved a point in
+# _score_reversal, which naturally fails it here even at an
+# ATR-distance that would otherwise look prime.
+PROMOTION_LL_MIN_DISTANCE_PTS = 3
+
+# Reward:Risk gate: (Target - Entry) must exceed (Entry - Stop) by at
+# least this multiple. 1.0 = literal "reward > risk"; kept as a named
+# constant so it's a one-line change if you want a stricter bar later.
+PROMOTION_MIN_REWARD_RISK_RATIO = 1.0
 
 
 @dataclass
 class PromotionResult:
     eligible_for_promotion: bool = False   # base gate: final score already >= 90 (Execute)
-    promoted:               bool = False   # eligible AND all 4 gates passed -> Elite
-    gate_ll_opportunity:              bool = False
-    gate_institutional_accumulation:  bool = False
-    gate_market_regime:               bool = False
-    gate_risk_acceptable:             bool = False
-    gates_passed: int = 0
-    gates_total:  int = len(PROMOTION_GATE_NAMES)
-    regime:       str = "UNKNOWN"
-    reasons:      str = ""   # human-readable — why promoted, or why withheld
+    promoted:               bool = False   # eligible AND both critical AND >=1 optional gate
+
+    gate_ll_opportunity:              bool = False   # CRITICAL
+    gate_reward_risk:                 bool = False   # CRITICAL
+    gate_institutional_confirmation:  bool = False   # OPTIONAL (>=1 of 2)
+    gate_market_regime:               bool = False   # OPTIONAL (>=1 of 2)
+
+    gates_passed:  int = 0        # informational — plain count out of 4
+    gates_total:   int = len(PROMOTION_GATE_NAMES)
+    confidence_pct: int = 0       # gates_passed / gates_total * 100 — "what the trade feels like"
+
+    reward_risk_ratio: float = 0.0   # informational — (Target - Entry) / (Entry - Stop)
+    regime:            str   = "UNKNOWN"
+    reasons:            str   = ""   # human-readable — why promoted, or why withheld
 
 
 def _get(row, *keys, default=None):
@@ -961,8 +1015,7 @@ def _get(row, *keys, default=None):
 
 def evaluate_promotion(row, regime: str | None = None) -> PromotionResult:
     """
-    Evaluate the four Promotion Engine gates for one stock and decide
-    Execute -> Elite.
+    Evaluate the Promotion Engine for one stock and decide Execute -> Elite.
 
     `row` may be:
       - a PillarResult instance (in-process, right after compute_pillars*),
@@ -974,66 +1027,89 @@ def evaluate_promotion(row, regime: str | None = None) -> PromotionResult:
     from utils.regime_engine. If the caller already has it (e.g. the
     "regime" column apply_regime_layer() attaches to df_aug), pass it
     explicitly; otherwise it's read from a "regime"/"Regime" key on
-    `row` if present. Unknown regime FAILS the gate closed — Elite is
-    never granted on a missing/unverified regime read.
+    `row` if present. Unknown regime FAILS the gate closed.
     """
     final_score = _get(row, "FP_FinalScore", "final_score", default=0) or 0
     base_eligible = float(final_score) >= 90
 
-    # ── Gate 1 — LL Opportunity ─────────────────────────────────
+    # ── CRITICAL 1 — LL Opportunity ─────────────────────────────
+    # distance_atr_pts already folds in pace-of-move (see
+    # _score_reversal) — a near-vertical spike loses a point here even
+    # at an ATR-distance that would otherwise look prime, so this
+    # single check stays sufficient without a separate "time" gate.
     actionable_ll = bool(_get(row, "_fp_r_actionable_ll", "r_actionable_ll", default=False))
     ll_defended   = bool(_get(row, "_fp_r_ll_defended", "r_ll_defended", default=False))
-    ll_dist_ok    = bool(_get(row, "_fp_r_distance_atr_ok", "r_distance_atr_ok", default=False))
-    gate_ll = actionable_ll and ll_defended and ll_dist_ok
+    dist_pts      = _get(row, "_fp_r_distance_atr_pts", "r_distance_atr_pts", default=0) or 0
+    gate_ll = actionable_ll and ll_defended and (float(dist_pts) >= PROMOTION_LL_MIN_DISTANCE_PTS)
 
-    # ── Gate 2 — Institutional Accumulation ─────────────────────
+    # ── CRITICAL 2 — Reward > Risk ──────────────────────────────
+    entry = _get(row, "Entry", default=None)
+    stop  = _get(row, "SL", default=None)
+    tgt   = _get(row, "T1", default=None)
+    if tgt is None:
+        tgt = _get(row, "T2", default=None)
+    reward_risk_ratio = 0.0
+    gate_reward_risk = False
+    try:
+        entry_f, stop_f, tgt_f = float(entry), float(stop), float(tgt)
+        risk   = entry_f - stop_f
+        reward = tgt_f - entry_f
+        if risk > 0 and reward > 0:
+            reward_risk_ratio = reward / risk
+            gate_reward_risk = reward_risk_ratio > PROMOTION_MIN_REWARD_RISK_RATIO
+    except (TypeError, ValueError):
+        pass   # missing Entry/SL/Target -> gate fails closed
+
+    # ── OPTIONAL 1 — Institutional Confirmation ─────────────────
     obv_rising  = bool(_get(row, "_fp_obv_trend_rising", "a_obv_trend_rising", default=False))
     obv_leading = bool(_get(row, "_fp_obv_leading_price", "a_obv_leading_price", default=False))
     zone_held   = bool(_get(row, "_fp_holding_above_zone", "a_holding_above_zone", default=False))
     vol_confirm = bool(_get(row, "_fp_r_high_volume_confirmation", "r_high_volume_confirmation", default=False))
     gate_institutional = obv_rising and obv_leading and zone_held and vol_confirm
 
-    # ── Gate 3 — Market Regime ──────────────────────────────────
+    # ── OPTIONAL 2 — Market Regime ──────────────────────────────
     regime_val = regime or _get(row, "regime", "Regime", default="UNKNOWN")
     regime_val = str(regime_val or "UNKNOWN").upper()
     gate_regime = regime_val == "TREND"
 
-    # ── Gate 4 — Risk Acceptable ─────────────────────────────────
-    risk_penalty = _get(row, "FP_Risk", "risk_penalty", default=0) or 0
-    gate_risk = float(risk_penalty) == 0
-
     gates = {
         "ll_opportunity":              gate_ll,
-        "institutional_accumulation":  gate_institutional,
+        "reward_risk":                 gate_reward_risk,
+        "institutional_confirmation":  gate_institutional,
         "market_regime":               gate_regime,
-        "risk_acceptable":             gate_risk,
     }
     passed = sum(1 for v in gates.values() if v)
-    promoted = bool(base_eligible and passed == len(gates))
+    confidence_pct = round(passed / len(gates) * 100)
+
+    promoted = bool(
+        base_eligible
+        and gate_ll and gate_reward_risk               # both critical
+        and (gate_institutional or gate_regime)          # >=1 optional
+    )
 
     reasons = []
     if not base_eligible:
         reasons.append(f"Final score {final_score} < 90 — not Execute-tier yet, Promotion Engine not evaluated")
     else:
         if not gate_ll:
-            reasons.append("LL Opportunity: no confirmed & defended, in-band spring")
-        if not gate_institutional:
-            reasons.append("Institutional Accumulation: OBV / zone / volume-at-low not all confirming")
-        if not gate_regime:
-            reasons.append(f"Market Regime: {regime_val}, not TREND")
-        if not gate_risk:
-            reasons.append(f"Risk Acceptable: {risk_penalty} pt risk deduction active")
-    reasons_str = " · ".join(reasons) if reasons else "All gates satisfied — Elite super-confidence"
+            reasons.append("LL Opportunity (critical): no confirmed & defended spring in the good distance band")
+        if not gate_reward_risk:
+            reasons.append(f"Reward > Risk (critical): ratio {reward_risk_ratio:.2f} — payoff doesn't clear risk")
+        if not (gate_institutional or gate_regime):
+            reasons.append("Neither optional gate confirms: Institutional Confirmation and Market Regime both failed")
+    reasons_str = " · ".join(reasons) if reasons else "Both critical gates + at least one optional gate satisfied — Elite"
 
     return PromotionResult(
         eligible_for_promotion=base_eligible,
         promoted=promoted,
         gate_ll_opportunity=gate_ll,
-        gate_institutional_accumulation=gate_institutional,
+        gate_reward_risk=gate_reward_risk,
+        gate_institutional_confirmation=gate_institutional,
         gate_market_regime=gate_regime,
-        gate_risk_acceptable=gate_risk,
         gates_passed=passed,
         gates_total=len(gates),
+        confidence_pct=confidence_pct,
+        reward_risk_ratio=round(reward_risk_ratio, 2),
         regime=regime_val,
         reasons=reasons_str,
     )
