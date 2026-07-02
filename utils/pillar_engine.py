@@ -1,63 +1,69 @@
 """
-utils/pillar_engine.py — Five Pillars Ranking Engine
+utils/pillar_engine.py — Five Pillars Ranking Engine  (v5 — single-owner evidence)
 ─────────────────────────────────────────────────────────────────────────────
 A standalone, additive scoring model layered on top of the existing scanner
-pipeline. Mirrors the integration pattern of decision_engine.py /
-conviction_score_v1.py: pure function of already-available data
-(raw OHLCV df + the IndicatorArrays/BarResult already built in score_stock),
-wrapped in try/except at the call site, merged into the result dict via
-result.update(...). Zero changes to existing signal-detection logic.
+pipeline. Pure function of already-available data (raw OHLCV df + the
+IndicatorArrays already built in score_stock()), wrapped in try/except at
+the call site, merged into the result dict via result.update(...).
 
-Design philosophy (v2 — early accumulation / trend-initiation model)
-──────────────────────────────────────────────────────────────────
-This engine is tuned to catch EARLY institutional accumulation and trend
-initiation — not mature, already-recognised trend leaders. It is meant to
-surface names that have:
-  • completed a correction or long consolidation,
-  • begun institutional accumulation,
-  • reclaimed value (VWAP / POC),
-  • and are showing fresh momentum re-ignition
-...ahead of long-term trend structure and relative strength fully forming.
-Structure and Leadership therefore lag by design (they measure things that
-only become obvious *after* the move is underway), so they are kept as
-light-touch pillars rather than primary gates.
+v5 architecture
+────────────────
+Base Score (90 pts) — four independent pillars, no double counting:
+  1. Structure  (20 pts) — EMA alignment/slope + HH/HL swing structure only.
+                 No VWAP, volume, OBV, Stochastic, LL Spring, or freshness.
+  2. Acceptance (22 pts) — Anchored VWAP + Volume Profile (POC/VAH/VAL) +
+                 OBV trend/leadership. No entry timing, no volume-today
+                 check (that's Momentum's exclusively — see below).
+  3. Leadership (13 pts) — RS vs NIFTY + relative momentum + sector rank
+                 placeholder. No volume-today check (see below).
+  4. Momentum   (35 pts) — TODAY's trigger only: VWAP reaction, return
+                 above VWAP, fresh Stochastic re-ignition, breakout
+                 confirmation, volume expansion. No LL/HH/HL, no EMA, no
+                 OBV (OBV belongs to Acceptance).
 
-Four pillars
-────────────
-1. Structure   (10%) — EMA20 > EMA50 > EMA200, price > EMA20, EMA200 rising.
-                 A light confirmation only — it should not heavily penalize
-                 emerging setups whose long-term structure hasn't caught up
-                 yet.
-2. Acceptance  (40%) — Anchored VWAP (from start of history) + 60-bar Fixed
-                 Range Volume Profile (POC / VAH / VAL). The PRIMARY pillar:
-                 price acceptance above POC/VWAP/value area is the earliest
-                 evidence of institutional buying.
-3. Leadership  (10%) — Relative strength vs NIFTY (3M, 6M) + relative
-                 momentum. A minor bonus only — 3M/6M relative strength
-                 naturally lags during new trend initiation, so it can't be
-                 a primary pillar without penalizing exactly the setups this
-                 engine is designed to catch early.
-4. Momentum    (40%) — Execution Quality. Equally weighted with Acceptance:
-                 maximum importance is given to fresh momentum re-ignition
-                 immediately after acceptance is established.
-                 Rewards: Stochastic(14,3) re-ignition, RSI(14) improvement,
-                 VWAP Touch-Reclaim (reaction strength in ATRs), fresh
-                 reclaim/stoch-cross confluence, and recent signal age
-                 (freshness of the reclaim pattern).
-                 Penalizes (former Risk pillar, now merged in): excessive
-                 EMA20 extension, excessive VWAP extension, ATR
-                 overextension, and exhaustion/parabolic candles — so a
-                 high Momentum score reflects quality of the re-ignition,
-                 not just raw speed/extension.
+Opportunity Quality Bonus (10 pts, layered on top, NOT a base pillar —
+formerly "LL Elite Bonus"):
+  Rewards a defended Lower-Low spring, but only as a bonus on top of an
+  already-decent base score — a stock with no spring can still reach
+  90/100 on the base pillars alone. Measured from the CONFIRMATION point,
+  not the theoretical turning point (institutions buy after the low is
+  confirmed, not at the exact print) — see _score_reversal(). Distance is
+  deliberately the largest single component: opportunity cost is
+  primarily a function of how far price has already moved away from the
+  actionable LL, so a stock 0.4 ATR off the reload scores meaningfully
+  higher than one 2.5 ATR off, even with an identical spring pattern:
+      Actionable LL confirmed                     2 pts
+      LL remains valid (never re-broken)           2 pts
+      Distance from actionable LL (ATR-based,       4 pts  (graduated,
+        graduated by proximity — closer = higher)          not flat)
+      Institutional confirmation (volume at LL)     2 pts
 
-Risk is no longer a standalone pillar — its distance/extension checks are
-now applied as a penalty inside Momentum (see _score_momentum). The
-risk_score / dist_from_ema20_pct / dist_from_vwap_pct / atr_extension
-fields on PillarResult are kept for backward compatibility (informational
-only) but no longer carry independent weight in the final score.
+Risk is an INDEPENDENT engine, deducted after the fact. Max deduction -20.
 
-Final Score = 0.10*Structure + 0.40*Acceptance + 0.10*Leadership
-            + 0.40*Momentum
+Single-owner evidence (no double counting)
+────────────────────────────────────────────
+Every piece of evidence is scored in exactly one pillar:
+  EMA Trend           -> Structure
+  HH/HL                -> Structure
+  POC                    -> Acceptance
+  VWAP                    -> Acceptance
+  OBV                       -> Acceptance
+  Today's Volume Ratio        -> Momentum   (sole owner — see note above)
+  RS vs NIFTY                    -> Leadership
+  Sector Rank                       -> Leadership
+  LL Spring                            -> Opportunity Quality Bonus
+"Today's Volume Ratio" (volume vs its 20d average) used to also be scored
+inside Acceptance (volume_profile_strong) and Leadership
+(l_market_participation) — both removed in v5 so a single high-volume day
+can no longer earn credit in three pillars for the same underlying fact.
+
+CCI is not used as a scoring input anywhere in this file — RSI is used as
+the oscillator wherever an oscillator is needed. CCI remains available as
+a diagnostic-only indicator elsewhere in the app (CCI Master tab).
+
+Final Score = (Structure + Acceptance + Leadership + Momentum)      [<=90]
+              + Opportunity Quality Bonus                                       [<=10]
+              − Risk Penalty                                          [<=20 deduction]
 
 Classification
 ───────────────
@@ -69,27 +75,41 @@ Classification
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 from utils.continuation_patterns import (
     detect_vwap_reclaim as _cp_detect_vwap_reclaim,
-    _stochastic as _cp_stochastic,
-    _find_stoch_cross_bar as _cp_find_stoch_cross_bar,
-    _anchored_vwap as _cp_anchored_vwap,
 )
-from utils.swing_structure import compute_swing_labels, detect_ll_reversal
+from utils.swing_structure import compute_swing_labels
+from utils.obv_analyzer import (
+    compute_obv, obv_trend_rising, obv_leads_price,
+)
 
-# ── Weights (Final Ranking Engine) ─────────────────────────────────
-# v2 — early accumulation / trend-initiation model. Risk is no longer a
-# standalone weighted pillar; its extension checks are merged into
-# Momentum (see _score_momentum). W_RISK is kept at 0.0, purely so any
-# external code that still imports it doesn't break (backward compat).
-W_STRUCTURE  = 0.10
-W_ACCEPTANCE = 0.40
-W_LEADERSHIP = 0.10
-W_MOMENTUM   = 0.40
-W_RISK       = 0.0   # deprecated — Risk merged into Momentum, kept for backward compat imports
+# ── Pillar point budgets (v5 — sum to 100; Risk deducted separately) ──────
+# "Today's Volume Ratio" (volume vs its 20d average) is owned exclusively
+# by Momentum now — it was previously also scored inside Acceptance
+# (volume_profile_strong) and Leadership (l_market_participation), which
+# meant a single high-volume day could earn credit in up to three pillars
+# for the same underlying fact. Removed from both; the freed 5 points
+# (3 from Acceptance, 2 from Leadership) were moved to Momentum's
+# volume_expansion check, which is the only place volume-today is scored.
+PTS_STRUCTURE  = 20
+PTS_ACCEPTANCE = 22
+PTS_REVERSAL   = 10   # "Opportunity Quality Bonus" (formerly "LL Elite Bonus") — layered on top, not a base pillar
+PTS_LEADERSHIP = 13
+PTS_MOMENTUM   = 35
+PTS_RISK_MAX_DEDUCTION = 20
+
+# Backward-compat "weight" constants — under v3 every pillar is scored
+# directly on its own point budget out of 100 (no separate weight
+# multiplication needed), so these are just PTS_* / 100 for any code that
+# still imports/display these as %.
+W_STRUCTURE  = PTS_STRUCTURE  / 100.0
+W_ACCEPTANCE = PTS_ACCEPTANCE / 100.0
+W_LEADERSHIP = PTS_LEADERSHIP / 100.0
+W_MOMENTUM   = PTS_MOMENTUM   / 100.0
+W_RISK       = PTS_RISK_MAX_DEDUCTION / 100.0
 
 VOLUME_PROFILE_BARS = 60   # Fixed Range Volume Profile lookback (bars)
 VALUE_AREA_PCT      = 0.70 # 70% of volume defines the Value Area (standard)
@@ -98,35 +118,24 @@ VP_BINS             = 24   # number of price bins for the volume profile histogr
 STOCH_K_PERIOD = 14   # %K lookback (highest high / lowest low window)
 STOCH_D_PERIOD = 3    # %D = SMA(%K, 3) — signal line
 
-# VWAP Touch-Reclaim (Pillar 4 — Momentum) ──────────────────────────
-RECLAIM_LOOKBACK     = 3     # bars to search for a VWAP touch / stoch cross
-RECLAIM_ATR_TOL      = 0.25  # touch band = VWAP + this many ATRs
-RECLAIM_REACTION_CAP = 1.5   # ATRs off the touch-bar low -> max reaction score
-RECLAIM_CONFLUENCE_BARS = 2  # touch bar and stoch-cross bar must be <= this far apart
+# VWAP Touch-Reclaim (Pillar 5 — Momentum) ──────────────────────────
+RECLAIM_LOOKBACK        = 3     # bars to search for a VWAP touch / stoch cross
+RECLAIM_ATR_TOL         = 0.25  # touch band = VWAP + this many ATRs
+RECLAIM_REACTION_CAP    = 1.5   # ATRs off the touch-bar low -> max reaction score
+RECLAIM_CONFLUENCE_BARS = 2     # touch bar and stoch-cross bar must be <= this far apart
 
-RECLAIM_MIN_REACTION    = 0     # minimum reaction_strength (0-100) to award quality pts
+OBV_TREND_BARS   = 10   # lookback for "OBV rising" check
+OBV_SWING_BARS   = 20   # lookback for "OBV new swing high" / leadership check
 
-# Institutional Continuation - settings keys and defaults
-IC_DEFAULTS = {
-    "enable_vwap_reclaim":    True,
-    "enable_vwap_stoch_conf": True,
-    "vwap_touch_atr_mult":    RECLAIM_ATR_TOL,
-    "vwap_touch_lookback":    RECLAIM_LOOKBACK,
-    "reaction_max_atr":       RECLAIM_REACTION_CAP,
-    "confluence_window":      RECLAIM_CONFLUENCE_BARS,
-    "require_ema_trend":      True,
-    "require_rising_vwap":    True,
-    "require_bullish_return": True,
-    "min_reaction_score":     RECLAIM_MIN_REACTION,
-    "momentum_weight":        15,
-    "confluence_weight":      10,
-}
+BREAKOUT_LOOKBACK = 20  # bars used for the Momentum breakout-confirmation check
+VOLUME_EXPANSION_MULT = 1.5  # Momentum volume-expansion threshold vs 20d avg
 
+LL_MAX_BARS_TO_RECLAIM = 10  # Reversal pillar — see detect_ll_reversal()
 
-CLASS_EXECUTE   = "Execute"
-CLASS_WATCH     = "Watch"
-CLASS_DEVELOPING= "Developing"
-CLASS_AVOID     = "Avoid"
+CLASS_EXECUTE    = "Execute"
+CLASS_WATCH      = "Watch"
+CLASS_DEVELOPING = "Developing"
+CLASS_AVOID      = "Avoid"
 
 _CLASS_STYLE = {
     CLASS_EXECUTE:    ("#3fb950", "Momentum confirmed"),
@@ -138,78 +147,84 @@ _CLASS_STYLE = {
 
 @dataclass
 class PillarResult:
-    structure_score:  int   = 0
-    acceptance_score: int   = 0
-    leadership_score: int   = 0
-    momentum_score:   int   = 0
-    risk_score:       int   = 0
-    final_score:       int   = 0
-    classification:    str   = CLASS_AVOID
+    structure_score:  int = 0
+    acceptance_score: int = 0
+    reversal_score:   int = 0
+    leadership_score: int = 0
+    momentum_score:   int = 0
+    risk_penalty:      int = 0
+    risk_score:         int = 0   # backward-compat alias == risk_penalty
+    final_score:        int = 0
+    classification:      str = CLASS_AVOID
     classification_note: str = ""
 
-    # ── Structure sub-fields ──────────────────────────────────────
-    s_ema_stack:       bool  = False   # EMA20 > EMA50 > EMA200
-    s_price_above_e20: bool  = False
-    s_ema200_rising:   bool  = False
+    # ── Structure sub-fields (20 pts) ─────────────────────────────
+    s_ema_stack:        bool = False   # EMA20 > EMA50 > EMA200
+    s_ema20_rising:      bool = False
+    s_ema50_rising:      bool = False
+    s_ema200_rising:     bool = False
+    s_price_above_e20:   bool = False
+    s_swing_label:        str  = ""     # most recent confirmed pivot label: HH/HL/LH/LL/""
+    s_hh_hl_intact:       bool = False  # swing_label is HH or HL
+    s_no_breakdown:       bool = False  # price still above EMA200 (no long-term breakdown)
 
-    # ── Swing structure sub-fields (HH/HL/LH/LL + LL "spring" reversal) ──
-    s_swing_label:           str  = ""     # most recent confirmed pivot label: HH/HL/LH/LL/""
-    s_swing_bonus:           int  = 0      # points (0-25) this contributed to Structure score
-    s_ll_detected:           bool = False  # most recent confirmed low IS a Lower Low
-    s_ll_reclaimed:          bool = False  # that LL has since been reclaimed (spring / failed breakdown)
-    s_ll_bullish_divergence: bool = False  # oscillator (CCI) higher at the LL than at the prior low
-    s_ll_volume_confirmed:   bool = False  # reclaim-bar volume > average
-    s_ll_confidence:         int  = 0      # 0-100 informational confidence of the LL "spring" read
-    s_ll_price:              float = 0.0   # price of the confirmed LL pivot
-    s_ll_prior_low_price:    float = 0.0   # the prior swing low that got undercut (reclaim level)
-    s_ll_bars_to_reclaim:    int   = -1    # bars from LL to reclaim close (-1 if not reclaimed)
+    # ── Acceptance sub-fields (22 pts) ────────────────────────────
+    vwap:  float = 0.0
+    poc:    float = 0.0
+    vah:    float = 0.0
+    val:    float = 0.0
+    a_above_poc:            bool = False
+    a_above_vwap:            bool = False
+    a_accepted_above_va:      bool = False  # closing above the Value Area High
+    a_holding_above_zone:     bool = False  # sustained (multi-bar) close above POC
+    a_obv_trend_rising:        bool = False
+    a_obv_leading_price:       bool = False
+    obv_value:                 float = 0.0
 
-    # ── Acceptance sub-fields ────────────────────────────────────
-    vwap:               float = 0.0
-    poc:                 float = 0.0
-    vah:                 float = 0.0
-    val:                 float = 0.0
-    a_price_above_poc:   bool  = False
-    a_price_above_vwap:  bool  = False
-    a_vwap_rising:       bool  = False
+    # ── Opportunity Quality Bonus sub-fields (10 pts, layered on the ──
+    # 90pt base — formerly "LL Elite Bonus"). Distance is the largest
+    # single component because opportunity cost is primarily a function
+    # of how far price has already moved away from the actionable LL —
+    # a stock 0.4 ATR off the reload is a meaningfully better entry than
+    # one 2.5 ATR off, even with an identical spring pattern.
+    r_actionable_ll:           bool  = False  # LL spring confirmed (reclaimed)
+    r_ll_defended:               bool  = False  # LL remains valid — price never re-broken since
+    r_distance_atr_ok:             bool  = False  # distance from LL, ATR-based, in the actionable band
+    r_distance_atr_pts:              int   = 0     # 0-4, graduated by proximity — closer = higher
+    r_high_volume_confirmation:        bool  = False  # institutional confirmation (volume at LL)
+    r_ll_price:                          float = 0.0
+    r_prior_low_price:                    float = 0.0
+    r_bars_to_reclaim:                      int   = -1
+    r_distance_atr:                          float = 0.0   # informational — (close - LL price) / ATR
+    r_confidence:                             int   = 0     # informational only
 
-    # ── Leadership sub-fields ────────────────────────────────────
-    rs_3m:               float = 0.0   # excess return vs NIFTY, 3-month, %
-    rs_6m:               float = 0.0   # excess return vs NIFTY, 6-month, %
-    rel_momentum:        float = 0.0   # relative momentum (acceleration), %
+    # ── Leadership sub-fields (13 pts) ────────────────────────────
+    rs_3m:                float = 0.0   # excess return vs NIFTY, 3-month, %
+    rs_6m:                 float = 0.0   # excess return vs NIFTY, 6-month, %
+    rel_momentum:           float = 0.0   # relative momentum (acceleration), %
+    l_sector_leadership_note: str = "no sector benchmark wired in — flat neutral credit"
 
-    # ── Momentum sub-fields ──────────────────────────────────────
-    stoch_k:               float = 0.0
-    stoch_d:                float = 0.0
-    stoch_cross_up:          bool  = False
-    rsi_val:               float = 50.0
-    rsi_above_50:           bool  = False
-    m_vwap_touched:          bool  = False   # close/low tested VWAP within ATR tolerance (lookback window)
-    m_vwap_reclaimed:        bool  = False   # price closed back above VWAP and above the touch-bar close
-    m_reaction_strength_atr: float = 0.0     # (close - touch_bar_low) / ATR — reclaim quality
-    m_vwap_stoch_confluence: bool  = False   # reclaim bar and stoch K/D cross-up bar within RECLAIM_CONFLUENCE_BARS
+    # ── Momentum sub-fields (35 pts) — TODAY's trigger only ────────
+    stoch_k:                float = 0.0
+    stoch_d:                 float = 0.0
+    stoch_cross_up:           bool  = False
+    rsi_val:                  float = 50.0
+    rsi_above_50:              bool  = False
+    m_vwap_reaction_pts:        int   = 0     # 0-7, scaled by reaction quality
+    m_returned_above_vwap:       bool  = False
+    m_fresh_stoch_reignition:     bool  = False
+    m_breakout_confirmed:          bool  = False
+    m_volume_expansion:             bool  = False
+    m_reaction_score:                 float = 0.0
 
-    # ── Risk sub-fields (raw distances, informational — merged into
-    #    Momentum's penalty; kept here for backward compatibility) ──
-    dist_from_ema20_pct:   float = 0.0
-    dist_from_vwap_pct:    float = 0.0
-    atr_extension:          float = 0.0   # extension measured in ATRs
-    exhaustion_candle:      bool  = False # long upper wick / small body rejection
-    parabolic_move:         bool  = False # multi-bar acceleration >= threshold ATRs
-    extension_penalty:      int   = 0     # total pts subtracted from raw Momentum score
-
-    # ── VWAP Reclaim extended diagnostics (Pillar 4) ─────────────
-    vwap_touch_found:        bool  = False
-    touch_bar:               int   = 0
-    touch_distance_atr:      float = 0.0
-    returned_above_vwap:     bool  = False
-    reaction_score:          float = 0.0
-    close_position_score:    float = 0.0
-    stoch_cross_found:       bool  = False
-    cross_bar:               int   = 0
-    confluence_gap:          int   = 0
-    pattern_age:             int   = 0
-    momentum_bonus:          int   = 0    # points awarded from VWAP reclaim quality
+    # ── Risk sub-fields (independent engine, max -20) ──────────────
+    risk_ema20_extension:   bool = False
+    risk_atr_extension:      bool = False
+    risk_exhaustion_candle:   bool = False
+    risk_parabolic_move:       bool = False
+    risk_climactic_volume:       bool = False
+    dist_from_ema20_pct:          float = 0.0
+    atr_extension:                 float = 0.0
 
     error: str = ""
 
@@ -231,125 +246,67 @@ def _safe_at(series: pd.Series, idx: int, default: float = 0.0) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  PILLAR 1 — STRUCTURE
+#  PILLAR 1 — STRUCTURE  (20 pts) — is the primary trend healthy?
+#  Deliberately excludes: VWAP, volume, OBV, Stochastic, the LL Spring,
+#  and momentum freshness — all of those live in other pillars now.
 # ══════════════════════════════════════════════════════════════════
 
 def _score_structure(close: pd.Series, e20: pd.Series, e50: pd.Series,
                       e200: pd.Series,
-                      low: pd.Series | None = None,
                       ph_series: pd.Series | None = None,
-                      pl_series: pd.Series | None = None,
-                      osc: pd.Series | None = None,
-                      volume: pd.Series | None = None,
-                      vol_avg: pd.Series | None = None) -> tuple[int, dict]:
-    """
-    Structure pillar = EMA trend confirmation (75 pts) + swing structure
-    (25 pts, from HH/HL/LH/LL classification of the pivot series).
-
-    Swing-structure scoring deliberately does NOT treat every Lower Low as
-    bearish. A plain LL (still not reclaimed) scores 0 — treat as
-    continuation. But an LL that has already been reclaimed with
-    divergence/volume support (see utils.swing_structure.detect_ll_reversal)
-    is a shakeout / failed-breakdown ("spring") — exactly the kind of early
-    accumulation evidence this engine is designed to reward, so it scores
-    the same as a bullish HH/HL. This mirrors the early-accumulation
-    philosophy described in the module docstring: penalizing every LL
-    would systematically exclude names that already look like the chart
-    the module docstring is comparing against (spring off a Lower Low,
-    then reclaiming it).
-    """
+                      pl_series: pd.Series | None = None) -> tuple[int, dict]:
     cur_c    = _safe_last(close)
     cur_e20  = _safe_last(e20)
     cur_e50  = _safe_last(e50)
     cur_e200 = _safe_last(e200)
 
-    # EMA200 rising: compare to its value 10 bars ago (≈2 trading weeks),
-    # consistent with the slope windows already used elsewhere in the engine.
-    e200_prev = _safe_at(e200, -11, default=cur_e200) if len(e200) > 11 else cur_e200
-    ema200_rising = cur_e200 > e200_prev
+    def _rising(series, default_cur):
+        prev = _safe_at(series, -11, default=default_cur) if len(series) > 11 else default_cur
+        return default_cur > prev
 
-    ema_stack       = cur_e20 > cur_e50 > cur_e200
-    price_above_e20 = cur_c > cur_e20
+    ema_stack        = cur_e20 > cur_e50 > cur_e200
+    ema20_rising      = _rising(e20, cur_e20)
+    ema50_rising       = _rising(e50, cur_e50)
+    ema200_rising        = _rising(e200, cur_e200)
+    price_above_e20         = cur_c > cur_e20
+    no_breakdown               = cur_c > cur_e200   # long-term structure not violated
 
-    score = 0
-    if ema_stack:        score += 35
-    if price_above_e20:  score += 25
-    if ema200_rising:    score += 15
-
-    # ── Swing structure (HH/HL/LH/LL) + LL "spring" reversal bonus ──────
-    swing_label           = ""
-    swing_bonus           = 0
-    ll_detected           = False
-    ll_reclaimed          = False
-    ll_bullish_divergence = False
-    ll_volume_confirmed   = False
-    ll_confidence         = 0
-    ll_price              = 0.0
-    ll_prior_low_price    = 0.0
-    ll_bars_to_reclaim    = -1
-
+    swing_label = ""
+    hh_hl_intact = False
     if ph_series is not None and pl_series is not None and len(ph_series) > 0:
         try:
             labels = compute_swing_labels(ph_series, pl_series)
             swing_label = labels["label_ffill"].iloc[-1] or ""
-
-            if swing_label in ("HH", "HL"):
-                swing_bonus = 25
-            elif swing_label == "LH":
-                swing_bonus = 10
-            elif swing_label == "LL" and low is not None and osc is not None:
-                ll_sig = detect_ll_reversal(
-                    close=close, low=low,
-                    volume=volume if volume is not None else pd.Series(0.0, index=close.index),
-                    osc=osc, ph_series=ph_series, pl_series=pl_series,
-                    i=len(close) - 1, vol_avg=vol_avg,
-                )
-                ll_detected           = ll_sig.is_ll
-                ll_reclaimed          = ll_sig.reclaimed
-                ll_bullish_divergence = ll_sig.bullish_divergence
-                ll_volume_confirmed   = ll_sig.volume_confirmed
-                ll_confidence         = ll_sig.confidence
-                ll_price              = ll_sig.ll_price
-                ll_prior_low_price    = ll_sig.prior_low_price
-                ll_bars_to_reclaim    = ll_sig.bars_to_reclaim
-
-                if ll_sig.reclaimed and ll_sig.confidence >= 50:
-                    swing_bonus = 25   # confirmed "spring" -> treated like bullish structure
-                elif ll_sig.reclaimed and ll_sig.confidence >= 30:
-                    swing_bonus = 15
-                elif ll_sig.reclaimed:
-                    swing_bonus = 8    # reclaimed but weak confirmation
-                else:
-                    swing_bonus = 0    # plain LL, not yet reclaimed -> continuation, no bonus
-            else:
-                swing_bonus = 12       # LL with no low/osc data to test reversal -> neutral
+            hh_hl_intact = swing_label in ("HH", "HL")
         except Exception:
-            swing_bonus = 12           # any failure -> neutral, don't penalize
-    else:
-        swing_bonus = 12               # pivot series unavailable -> neutral, don't penalize
+            swing_label = ""
 
-    score += swing_bonus
-    score = min(score, 100)
+    score = 0
+    if ema_stack:         score += 5
+    if ema20_rising:       score += 3
+    if ema50_rising:        score += 2
+    if ema200_rising:         score += 2
+    if price_above_e20:         score += 2
+    if hh_hl_intact:              score += 4
+    if no_breakdown:                score += 2
+    score = min(score, PTS_STRUCTURE)
 
     return score, {
         "s_ema_stack": ema_stack,
-        "s_price_above_e20": price_above_e20,
+        "s_ema20_rising": ema20_rising,
+        "s_ema50_rising": ema50_rising,
         "s_ema200_rising": ema200_rising,
+        "s_price_above_e20": price_above_e20,
         "s_swing_label": swing_label,
-        "s_swing_bonus": swing_bonus,
-        "s_ll_detected": ll_detected,
-        "s_ll_reclaimed": ll_reclaimed,
-        "s_ll_bullish_divergence": ll_bullish_divergence,
-        "s_ll_volume_confirmed": ll_volume_confirmed,
-        "s_ll_confidence": ll_confidence,
-        "s_ll_price": ll_price,
-        "s_ll_prior_low_price": ll_prior_low_price,
-        "s_ll_bars_to_reclaim": ll_bars_to_reclaim,
+        "s_hh_hl_intact": hh_hl_intact,
+        "s_no_breakdown": no_breakdown,
     }
 
 
 # ══════════════════════════════════════════════════════════════════
-#  PILLAR 2 — ACCEPTANCE  (Anchored VWAP + Fixed Range Volume Profile)
+#  PILLAR 2 — ACCEPTANCE  (22 pts) — Anchored VWAP + Fixed Range
+#  Volume Profile (POC/VAH/VAL) + OBV. Answers only: "are institutions
+#  accumulating and accepting higher prices?" No entry timing here.
 # ══════════════════════════════════════════════════════════════════
 
 def _anchored_vwap(high: pd.Series, low: pd.Series, close: pd.Series,
@@ -391,15 +348,11 @@ def _fixed_range_volume_profile(
     edges = np.linspace(lo, hi, bins + 1)
     bin_vol = np.zeros(bins)
 
-    # Distribute each bar's volume across the price bins its high-low range
-    # spans (proportional to overlap) — a reasonable approximation of a true
-    # tick-level volume profile without intraday data.
     for i in range(window):
         bar_lo, bar_hi, bar_v = l[i], h[i], v[i]
         if bar_v <= 0:
             continue
         if bar_hi <= bar_lo:
-            # single-price bar — credit the nearest bin entirely
             bin_idx = min(int((bar_lo - lo) / (hi - lo) * bins), bins - 1)
             bin_vol[bin_idx] += bar_v
             continue
@@ -417,9 +370,6 @@ def _fixed_range_volume_profile(
         last_c = float(c[-1])
         return last_c, last_c, last_c
 
-    # Expand outward from POC, always adding whichever neighbouring bin
-    # (above/below the current captured range) has more volume, until the
-    # value-area volume threshold is reached.
     target = total_vol * VALUE_AREA_PCT
     lo_i, hi_i = poc_idx, poc_idx
     captured = bin_vol[poc_idx]
@@ -443,31 +393,198 @@ def _score_acceptance(close: pd.Series, high: pd.Series, low: pd.Series,
     vwap_series = _anchored_vwap(high, low, close, volume)
     cur_c    = _safe_last(close)
     cur_vwap = _safe_last(vwap_series)
-    vwap_prev = _safe_at(vwap_series, -11, default=cur_vwap) if len(vwap_series) > 11 else cur_vwap
-    vwap_rising = cur_vwap > vwap_prev
 
     poc, vah, val = _fixed_range_volume_profile(high, low, close, volume)
 
-    price_above_poc  = cur_c > poc
-    price_above_vwap = cur_c > cur_vwap
+    above_poc  = cur_c > poc
+    above_vwap = cur_c > cur_vwap
+    accepted_above_va = cur_c > vah
+
+    # Holding above acceptance zone: sustained (last 3 closes all above POC),
+    # not just today's print.
+    holding_above_zone = False
+    if len(close) >= 3:
+        try:
+            holding_above_zone = bool((close.iloc[-3:] > poc).all())
+        except Exception:
+            holding_above_zone = False
+
+    obv = compute_obv(close, volume)
+    obv_trend = obv_trend_rising(obv, OBV_TREND_BARS)
+    obv_lead  = obv_leads_price(obv, close, OBV_SWING_BARS)
+
+    # NOTE: a "today's volume vs 20d average" check used to live here
+    # (volume_profile_strong) — removed in v5. Volume-today is now scored
+    # exclusively inside Momentum (volume_expansion), so a single
+    # high-volume day is no longer double-counted across pillars.
 
     score = 0
-    if price_above_poc:                  score += 35
-    if price_above_vwap:                 score += 35
-    if vwap_rising:                       score += 20
-    if cur_c >= val and cur_c <= vah:     score += 10   # trading inside accepted value area
-    score = min(score, 100)
+    if above_poc:              score += 5
+    if above_vwap:              score += 4
+    if accepted_above_va:         score += 3
+    if holding_above_zone:          score += 3
+    if obv_trend:                     score += 4
+    if obv_lead:                        score += 3
+    score = min(score, PTS_ACCEPTANCE)
 
     return score, {
         "vwap": cur_vwap, "poc": poc, "vah": vah, "val": val,
-        "a_price_above_poc": price_above_poc,
-        "a_price_above_vwap": price_above_vwap,
-        "a_vwap_rising": vwap_rising,
+        "a_above_poc": above_poc,
+        "a_above_vwap": above_vwap,
+        "a_accepted_above_va": accepted_above_va,
+        "a_holding_above_zone": holding_above_zone,
+        "a_obv_trend_rising": obv_trend,
+        "a_obv_leading_price": obv_lead,
+        "obv_value": round(_safe_last(obv), 0),
     }
 
 
 # ══════════════════════════════════════════════════════════════════
-#  PILLAR 3 — LEADERSHIP  (relative strength vs NIFTY)
+#  OPPORTUNITY QUALITY BONUS  (10 pts, layered on the 90pt base, formerly "LL Elite Bonus") — dedicated
+#  exclusively to a defended Lower-Low spring. Scored from the
+#  CONFIRMATION point, not the theoretical turning point — institutions
+#  buy after the low is confirmed, not at the exact print — so the
+#  "active" LL is allowed to persist for one pivot cycle after price has
+#  already moved on to a fresh HL, rather than disappearing the instant
+#  a newer higher low prints.
+# ══════════════════════════════════════════════════════════════════
+
+def _find_active_ll(ph_series: pd.Series, pl_series: pd.Series,
+                     close: pd.Series, low: pd.Series, volume: pd.Series,
+                     vol_avg: pd.Series | None,
+                     max_bars_to_reclaim: int) -> dict | None:
+    """
+    Locates the most recent Lower-Low pivot that is still "active" —
+    either it's the latest confirmed pivot low, or the very next pivot
+    low after it (i.e. price has since printed exactly one fresh HL
+    confirming the spring resolved). Anything older than that is
+    considered stale and the bonus does not apply.
+    """
+    try:
+        labels = compute_swing_labels(ph_series, pl_series)
+    except Exception:
+        return None
+    lows = labels[labels["pivot_type"] == "L"]
+    if len(lows) < 2:
+        return None
+
+    if lows.iloc[-1]["label"] == "LL":
+        active, prior = lows.iloc[-1], lows.iloc[-2]
+    elif len(lows) >= 3 and lows.iloc[-2]["label"] == "LL":
+        active, prior = lows.iloc[-2], lows.iloc[-3]
+    else:
+        return None
+
+    ll_bar_pos = labels.index.get_loc(active.name)
+    ll_price = float(active["pivot_price"])
+    prior_low_price = float(prior["pivot_price"])
+
+    reclaimed, reclaim_bar, bars_to_reclaim = False, -1, -1
+    window_end = min(len(close) - 1, ll_bar_pos + max_bars_to_reclaim)
+    for j in range(ll_bar_pos, window_end + 1):
+        if float(close.iloc[j]) > prior_low_price:
+            reclaimed, reclaim_bar, bars_to_reclaim = True, j, j - ll_bar_pos
+            break
+
+    volume_confirmed = False
+    if reclaimed and vol_avg is not None:
+        try:
+            volume_confirmed = float(volume.iloc[reclaim_bar]) > float(vol_avg.iloc[reclaim_bar])
+        except Exception:
+            pass
+
+    defended = True
+    try:
+        defended = bool(float(low.iloc[ll_bar_pos:].min()) >= ll_price)
+    except Exception:
+        pass
+
+    return {
+        "ll_bar_pos": ll_bar_pos, "ll_price": ll_price,
+        "prior_low_price": prior_low_price,
+        "reclaimed": reclaimed, "bars_to_reclaim": bars_to_reclaim,
+        "volume_confirmed": volume_confirmed, "defended": defended,
+    }
+
+
+def _score_reversal(close: pd.Series, low: pd.Series, high: pd.Series,
+                     open_: pd.Series | None, volume: pd.Series,
+                     ph_series: pd.Series | None, pl_series: pd.Series | None,
+                     osc: pd.Series | None,
+                     atr_s: pd.Series | None = None,
+                     vol_avg: pd.Series | None = None) -> tuple[int, dict]:
+    actionable_ll        = False
+    ll_defended            = False
+    distance_atr_ok          = False
+    distance_atr_pts           = 0
+    high_volume_confirmation     = False
+    ll_price                       = 0.0
+    prior_low_price                  = 0.0
+    bars_to_reclaim                    = -1
+    distance_atr                         = 0.0
+    confidence                             = 0
+
+    if ph_series is not None and pl_series is not None and len(ph_series) > 0:
+        info = _find_active_ll(ph_series, pl_series, close, low, volume, vol_avg,
+                                LL_MAX_BARS_TO_RECLAIM)
+        if info is not None:
+            ll_price          = info["ll_price"]
+            prior_low_price     = info["prior_low_price"]
+            bars_to_reclaim        = info["bars_to_reclaim"]
+
+            actionable_ll = info["reclaimed"]                       # spring confirmed
+            ll_defended   = info["defended"]                        # never re-broken since
+            high_volume_confirmation = info["volume_confirmed"]
+
+            cur_atr = _safe_last(atr_s) if atr_s is not None else 0.0
+            if cur_atr > 0 and info["reclaimed"]:
+                distance_atr = (_safe_last(close) - ll_price) / cur_atr
+                distance_atr_ok = bool(0.3 <= distance_atr <= 4.0)
+                # Graduated, not flat: opportunity quality decays the further
+                # price has already moved from the actionable LL. A stock
+                # 0.4 ATR off the reload is a materially better entry than
+                # one 2.5 ATR off, even with an identical spring pattern —
+                # distance is the largest single component of this bonus
+                # precisely because it's what "opportunity cost" comes down
+                # to (see module docstring).
+                if 0.3 <= distance_atr < 1.0:
+                    distance_atr_pts = 4     # prime — right at the reload
+                elif 1.0 <= distance_atr < 2.0:
+                    distance_atr_pts = 3
+                elif 2.0 <= distance_atr < 3.0:
+                    distance_atr_pts = 2
+                elif 3.0 <= distance_atr <= 4.0:
+                    distance_atr_pts = 1     # still actionable, but stretched
+
+            confidence = 30
+            if info["volume_confirmed"]: confidence += 30
+            if info["defended"]:          confidence += 20
+            if info["bars_to_reclaim"] >= 0 and info["bars_to_reclaim"] <= 3: confidence += 20
+            confidence = min(confidence, 100)
+
+    score = 0
+    if actionable_ll:              score += 2
+    if ll_defended:                  score += 2
+    score += distance_atr_pts          # 0-4, graduated by proximity to the LL
+    if high_volume_confirmation:         score += 2
+    score = min(score, PTS_REVERSAL)
+
+    return score, {
+        "r_actionable_ll": actionable_ll,
+        "r_ll_defended": ll_defended,
+        "r_distance_atr_ok": distance_atr_ok,
+        "r_distance_atr_pts": distance_atr_pts,
+        "r_high_volume_confirmation": high_volume_confirmation,
+        "r_ll_price": ll_price,
+        "r_prior_low_price": prior_low_price,
+        "r_bars_to_reclaim": bars_to_reclaim,
+        "r_distance_atr": round(distance_atr, 2),
+        "r_confidence": confidence,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  PILLAR 4 — LEADERSHIP  (13 pts) — select the strongest stock.
 # ══════════════════════════════════════════════════════════════════
 
 def _excess_return(close: pd.Series, nifty_aligned: pd.Series, bars: int) -> float:
@@ -487,12 +604,9 @@ def _excess_return(close: pd.Series, nifty_aligned: pd.Series, bars: int) -> flo
 
 def _score_leadership(close: pd.Series, nifty_aligned: pd.Series) -> tuple[int, dict]:
     rs_3m = _excess_return(close, nifty_aligned, 63)    # ~3 months
-    rs_6m = _excess_return(close, nifty_aligned, 126)   # ~6 months
-
-    # Relative momentum: is 1-month excess return accelerating vs the
-    # 3-month excess return (i.e. leadership building, not fading)?
     rs_1m = _excess_return(close, nifty_aligned, 21)
-    rel_momentum = rs_1m - (rs_3m / 3.0)   # vs the implied 1-month run-rate of the 3M trend
+    rs_6m = _excess_return(close, nifty_aligned, 126)   # ~6 months
+    rel_momentum = rs_1m - (rs_3m / 3.0)
 
     def _bucket(val, thresholds_scores):
         for th, sc in thresholds_scores:
@@ -500,11 +614,23 @@ def _score_leadership(close: pd.Series, nifty_aligned: pd.Series) -> tuple[int, 
                 return sc
         return 0
 
-    rs3_pts = _bucket(rs_3m, [(15, 45), (10, 38), (6, 30), (3, 20), (0, 10)])
-    rs6_pts = _bucket(rs_6m, [(25, 35), (15, 28), (8, 20), (3, 12), (0, 6)])
-    mom_pts = _bucket(rel_momentum, [(5, 20), (2, 14), (0, 8), (-3, 3)])
+    rs_pts  = _bucket(rs_3m,        [(15, 8), (10, 7), (6, 5), (3, 3), (0, 1)])
+    mom_pts = _bucket(rel_momentum, [(5, 3), (2, 2), (0, 1)])
 
-    score = min(rs3_pts + rs6_pts + mom_pts, 100)
+    # Sector leadership: NOT computed — no sector-index benchmark series is
+    # currently wired into the data pipeline (per-stock sector metadata
+    # exists in agent_tools.py via yfinance, but fetching it per symbol for
+    # every scanned stock is too slow/network-heavy for a full-universe
+    # scan). Flat neutral credit until a proper sector-benchmark feed is
+    # added — see l_sector_leadership_note on PillarResult.
+    sector_pts = 2   # half of the 4-pt budget, flat/neutral
+
+    # NOTE: a "today's volume vs 20d average" check used to live here
+    # (l_market_participation) — removed in v5, it was scoring the exact
+    # same condition Acceptance/Momentum already score. Volume-today is
+    # now owned exclusively by Momentum (volume_expansion).
+
+    score = min(rs_pts + sector_pts + mom_pts, PTS_LEADERSHIP)
 
     return score, {
         "rs_3m": round(rs_3m, 2),
@@ -514,7 +640,8 @@ def _score_leadership(close: pd.Series, nifty_aligned: pd.Series) -> tuple[int, 
 
 
 # ══════════════════════════════════════════════════════════════════
-#  PILLAR 4 — MOMENTUM  (re-ignition)
+#  PILLAR 5 — MOMENTUM  (35 pts) — ONLY today's trigger. No LL/HH/HL,
+#  no trend age, no EMA scoring, no OBV (OBV belongs to Acceptance).
 # ══════════════════════════════════════════════════════════════════
 
 def _stochastic(high: pd.Series, low: pd.Series, close: pd.Series,
@@ -529,159 +656,11 @@ def _stochastic(high: pd.Series, low: pd.Series, close: pd.Series,
     return k, d
 
 
-def _find_stoch_cross_bar(k_s: pd.Series, d_s: pd.Series, lookback: int) -> int | None:
-    """
-    Scan the last `lookback` bars for a %K crossing above %D event
-    (prev_k <= prev_d and cur_k > cur_d). Returns bars-ago (0 = current
-    bar) of the most recent cross, or None if no cross in the window.
-    """
-    n = len(k_s)
-    if n < 2:
-        return None
-    max_back = min(lookback, n - 1)
-    for back in range(0, max_back + 1):
-        i = n - 1 - back
-        if i < 1:
-            break
-        k_now, k_prev = _safe_at(k_s, i), _safe_at(k_s, i - 1)
-        d_now, d_prev = _safe_at(d_s, i), _safe_at(d_s, i - 1)
-        if k_prev <= d_prev and k_now > d_now:
-            return back
-    return None
-
-
-def detect_vwap_reclaim(
-    low: pd.Series, close: pd.Series, vwap_series: pd.Series, atr_s: pd.Series,
-    lookback: int = RECLAIM_LOOKBACK, atr_mult: float = RECLAIM_ATR_TOL,
-) -> dict:
-    """
-    VWAP Touch-Reclaim (momentum/reaction event, not a structural state):
-
-      Touch     — within the last `lookback` bars, bar low came within an
-                  ATR-scaled tolerance of (or under) the anchored VWAP:
-                      low[i] <= vwap[i] + atr_mult * atr[i]
-      Reclaim   — the current close is back above the current VWAP AND
-                  above the touch bar's own close (confirms the touch bar
-                  wasn't just the start of a deeper breakdown).
-      Reaction  — (close_now - low_at_touch) / atr_now, in ATRs. This is
-                  the continuous "how hard did buyers react" quality score
-                  feeding Momentum, rather than a binary flag.
-
-    Returns dict with: touched, touch_bars_ago, reclaimed, reaction_strength_atr.
-    bars_ago = 0 means the touch bar IS the current bar.
-    """
-    n = len(close)
-    out = {"touched": False, "touch_bars_ago": None,
-           "reclaimed": False, "reaction_strength_atr": 0.0}
-    if n < 2:
-        return out
-
-    max_back = min(lookback, n - 1)
-    touch_bars_ago = None
-    for back in range(0, max_back + 1):
-        i = n - 1 - back
-        lo_i, vwap_i, atr_i = _safe_at(low, i), _safe_at(vwap_series, i), _safe_at(atr_s, i)
-        if atr_i <= 0:
-            continue
-        if lo_i <= vwap_i + atr_mult * atr_i:
-            touch_bars_ago = back   # keep overwriting -> ends on the MOST RECENT touch (back=0 first)
-            break  # nearest touch found (loop runs newest -> oldest)
-
-    if touch_bars_ago is None:
-        return out
-
-    touch_idx = n - 1 - touch_bars_ago
-    touch_low   = _safe_at(low, touch_idx)
-    touch_close = _safe_at(close, touch_idx)
-    cur_close   = _safe_last(close)
-    cur_vwap    = _safe_last(vwap_series)
-    cur_atr     = _safe_last(atr_s)
-
-    reclaimed = bool(cur_close > cur_vwap and cur_close > touch_close)
-    reaction_strength = ((cur_close - touch_low) / cur_atr) if cur_atr > 0 else 0.0
-
-    out.update({
-        "touched": True,
-        "touch_bars_ago": touch_bars_ago,
-        "reclaimed": reclaimed,
-        "reaction_strength_atr": round(max(reaction_strength, 0.0), 2),
-    })
-    return out
-
-
-def _detect_exhaustion(
-    open_: pd.Series | None, high: pd.Series, low: pd.Series, close: pd.Series,
-    atr_s: pd.Series,
-) -> tuple[bool, bool]:
-    """
-    Lightweight exhaustion / parabolic-move detector (new — feeds the
-    Momentum penalty, does not touch any existing pattern-detection logic).
-
-    exhaustion_candle — current bar has a long upper wick and a small body
-                         relative to its range: buyers pushed price up but
-                         it was rejected and closed well off the high
-                         (classic blow-off / exhaustion signature).
-    parabolic_move     — price has moved an unusually large number of ATRs
-                          over the last 3 bars (vertical, unsustainable
-                          acceleration rather than a controlled re-ignition).
-    """
-    cur_h, cur_l, cur_c = _safe_last(high), _safe_last(low), _safe_last(close)
-    cur_o = _safe_last(open_) if open_ is not None else cur_c
-    rng = cur_h - cur_l
-
-    exhaustion_candle = False
-    if rng > 0:
-        body = abs(cur_c - cur_o)
-        upper_wick = cur_h - max(cur_o, cur_c)
-        upper_wick_ratio = upper_wick / rng
-        body_ratio = body / rng
-        exhaustion_candle = bool(upper_wick_ratio >= 0.5 and body_ratio <= 0.35)
-
-    parabolic_move = False
-    cur_atr = _safe_last(atr_s)
-    if cur_atr > 0 and len(close) >= 4:
-        c_then = _safe_at(close, -4, default=cur_c)
-        move_atrs = (cur_c - c_then) / cur_atr
-        parabolic_move = bool(move_atrs >= 5.0)   # >=5 ATRs of move in 3 bars
-
-    return exhaustion_candle, parabolic_move
-
-
 def _score_momentum(
     high: pd.Series, low: pd.Series, close: pd.Series,
     rsi_s: pd.Series, volume: pd.Series, atr_s: pd.Series,
-    ic_cfg: dict | None = None,
-    open_: pd.Series | None = None, e20: pd.Series | None = None,
+    vol_avg: pd.Series | None = None,
 ) -> tuple[int, dict]:
-    """
-    Momentum Pillar — Execution Quality (0-100).
-
-    Rewards (raw score, capped at 100):
-      Fresh K>D crossover      20
-      From Oversold            15
-      K > 50                   10
-      RSI > 50                 20
-      RSI > 60                 10
-      VWAP Reclaim Quality     15   (momentum_weight, trend-gated)
-      VWAP/Stoch Confluence    10   (confluence_weight)
-      Recent signal age bonus  up to 5   (fresh reclaim/cross, reuses
-                                          existing pattern_age diagnostic)
-      Strong VWAP reaction bonus up to 5 (reuses existing reaction_score)
-      Base total               up to 100 (capped)
-
-    Penalizes (former Risk pillar — merged in here, not a separate
-    weighted pillar anymore):
-      Excessive EMA20 extension
-      Excessive VWAP extension
-      ATR overextension
-      Exhaustion candle / parabolic move
-
-    final momentum score = clip(raw_score - extension_penalty, 0, 100)
-    """
-    cfg = IC_DEFAULTS.copy()
-    if ic_cfg:
-        cfg.update(ic_cfg)
-
     k_s, d_s = _stochastic(high, low, close)
 
     cur_k   = _safe_last(k_s, default=50.0)
@@ -692,174 +671,120 @@ def _score_momentum(
 
     stoch_cross_up = bool(prev_k <= prev_d and cur_k > cur_d)
     stoch_from_os  = bool(prev_k <= 20 and cur_k > 20)
-    rsi_above_50   = cur_rsi > 50
+    fresh_stoch_reignition = stoch_cross_up or stoch_from_os
+    rsi_above_50 = cur_rsi > 50
 
-    # ── VWAP series (shared) ─────────────────────────────────────────────
+    # ── VWAP reaction / return-above-VWAP (today's trigger) ──────────────
     vwap_series = _anchored_vwap(high, low, close, volume)
-    vwap_last   = _safe_last(vwap_series)
-    vwap_prev   = float(vwap_series.iloc[-11]) if len(vwap_series) > 11 else vwap_last
-    vwap_rising = vwap_last > vwap_prev
+    reclaim_result = _cp_detect_vwap_reclaim(
+        low=low, close=close, high=high, volume=volume, atr_s=atr_s,
+        k_s=k_s, d_s=d_s, vwap_series=vwap_series,
+        lookback=RECLAIM_LOOKBACK, atr_mult=RECLAIM_ATR_TOL,
+        reaction_max_atr=RECLAIM_REACTION_CAP,
+        confluence_bars=RECLAIM_CONFLUENCE_BARS,
+        require_bullish_return=True, ema20_gt_ema50=True, vwap_rising=True,
+    )
+    meta = reclaim_result.get("metadata", {})
+    reaction_str = float(reclaim_result.get("reaction_strength", 0.0) or 0.0)
+    returned_above_vwap = bool(reclaim_result.get("confirmed", False))
 
-    # Trend filter for VWAP Reclaim points
-    e20_last = _safe_last(high)  # fallback; will use real e20 if passed via ia
-    ema20_gt_ema50 = True        # computed externally; default permissive
+    vwap_reaction_pts = 0
+    if returned_above_vwap:
+        frac = float(np.clip(reaction_str / 100.0, 0.0, 1.0))
+        vwap_reaction_pts = int(round(frac * 7))
 
-    # ── VWAP Reclaim via continuation_patterns ────────────────────────────
-    reclaim_result = {"confirmed": False, "reaction_strength": 0.0, "metadata": {}}
-    momentum_pts   = 0
-    confluence     = False
-    cross_bars_ago: int | None = None
-    meta: dict = {}
+    # ── Breakout confirmation: today's close > prior N-bar high ──────────
+    breakout_confirmed = False
+    if len(high) > BREAKOUT_LOOKBACK:
+        prior_high = float(high.iloc[-(BREAKOUT_LOOKBACK + 1):-1].max())
+        breakout_confirmed = bool(_safe_last(close) > prior_high)
 
-    if cfg.get("enable_vwap_reclaim", True):
-        reclaim_result = _cp_detect_vwap_reclaim(
-            low=low, close=close, high=high, volume=volume, atr_s=atr_s,
-            k_s=k_s, d_s=d_s,
-            vwap_series=vwap_series,
-            lookback=int(cfg.get("vwap_touch_lookback", RECLAIM_LOOKBACK)),
-            atr_mult=float(cfg.get("vwap_touch_atr_mult", RECLAIM_ATR_TOL)),
-            reaction_max_atr=float(cfg.get("reaction_max_atr", RECLAIM_REACTION_CAP)),
-            confluence_bars=int(cfg.get("confluence_window", RECLAIM_CONFLUENCE_BARS)),
-            require_bullish_return=bool(cfg.get("require_bullish_return", True)),
-            ema20_gt_ema50=ema20_gt_ema50,
-            vwap_rising=vwap_rising if cfg.get("require_rising_vwap", True) else True,
-        )
-        meta = reclaim_result.get("metadata", {})
-        reaction_str = reclaim_result.get("reaction_strength", 0.0)
-        min_rs = float(cfg.get("min_reaction_score", 0))
+    # ── Volume expansion: today's volume > 1.5x the 20d average ──────────
+    volume_expansion = False
+    if vol_avg is not None:
+        cur_v, cur_avg = _safe_last(volume), _safe_last(vol_avg)
+        volume_expansion = bool(cur_avg > 0 and cur_v > VOLUME_EXPANSION_MULT * cur_avg)
 
-        if reclaim_result.get("confirmed") and reaction_str >= min_rs:
-            mom_weight = float(cfg.get("momentum_weight", 15))
-            frac = float(np.clip(reaction_str / 100.0, 0.0, 1.0))
-            momentum_pts = int(round(frac * mom_weight))
-
-        confluence = bool(meta.get("confluence", False))
-        cross_bars_ago = meta.get("cross_bar")
-
-    # ── Base stoch/RSI score ─────────────────────────────────────────────
     score = 0
-    if stoch_cross_up:   score += 20    # Fresh K>D
-    if stoch_from_os:    score += 15    # From Oversold (spec)
-    if cur_k > 50:       score += 10    # K in bullish half
-    if rsi_above_50:     score += 20    # RSI > 50 (spec)
-    if cur_rsi > 60:     score += 10    # RSI > 60 bonus (spec)
-    score += momentum_pts               # VWAP Reclaim Quality (0–15)
-    if confluence and cfg.get("enable_vwap_stoch_conf", True):
-        conf_weight = int(cfg.get("confluence_weight", 10))
-        score += conf_weight            # VWAP/Stoch Confluence
+    score += vwap_reaction_pts                       # 0-7
+    if returned_above_vwap:  score += 5               # 5
+    if fresh_stoch_reignition: score += 6              # 6
+    if breakout_confirmed:      score += 6              # 6
+    if volume_expansion:           score += 11            # 11 — sole owner of "volume vs 20d avg" evidence
+    score = min(score, PTS_MOMENTUM)
 
-    # ── Recent signal age bonus (reuses existing pattern_age diagnostic —
-    #    no new detection logic, just rewards freshness of what was
-    #    already detected) ───────────────────────────────────────────────
-    pattern_age = int(meta.get("pattern_age", 0) or 0)
-    if reclaim_result.get("confirmed") and pattern_age <= 2:
-        score += 5
-
-    # ── Strong VWAP reaction bonus (reuses existing reaction_score) ──────
-    reaction_score_val = float(meta.get("reaction_score", 0.0) or 0.0)
-    if reaction_score_val >= 70:
-        score += 5
-
-    raw_score = min(score, 100)
-
-    # ── Merged Risk penalty: excessive extension / exhaustion ────────────
-    cur_c   = _safe_last(close)
-    cur_e20 = _safe_last(e20) if e20 is not None else 0.0
-    cur_atr = _safe_last(atr_s)
-
-    dist_ema20_pct = ((cur_c - cur_e20) / cur_e20 * 100) if cur_e20 > 0 else 0.0
-    dist_vwap_pct  = ((cur_c - vwap_last) / vwap_last * 100) if vwap_last > 0 else 0.0
-    atr_extension  = (cur_c - cur_e20) / cur_atr if (cur_atr > 0 and cur_e20 > 0) else 0.0
-
-    exhaustion_candle, parabolic_move = _detect_exhaustion(open_, high, low, close, atr_s)
-
-    def _penalty(val, thresholds_penalties):
-        for th, pen in thresholds_penalties:
-            if val >= th:
-                return pen
-        return 0
-
-    pen_ema20 = _penalty(abs(dist_ema20_pct), [(15, 20), (10, 14), (6, 8), (3, 4)]) if e20 is not None else 0
-    pen_vwap  = _penalty(abs(dist_vwap_pct),  [(20, 18), (12, 12), (7, 7), (3, 3)])
-    pen_atr   = _penalty(abs(atr_extension),  [(4, 20), (3, 14), (2, 8), (1, 3)]) if e20 is not None else 0
-    pen_exhaustion = 10 if exhaustion_candle else 0
-    pen_parabolic  = 15 if parabolic_move else 0
-
-    extension_penalty = min(pen_ema20 + pen_vwap + pen_atr + pen_exhaustion + pen_parabolic, 40)
-
-    score = max(0, min(raw_score - extension_penalty, 100))
-
-    # ── Diagnostics ──────────────────────────────────────────────────────
-    r_meta = reclaim_result.get("metadata", {})
     return score, {
-        "stoch_k":               round(cur_k, 1),
-        "stoch_d":               round(cur_d, 1),
-        "stoch_cross_up":        bool(stoch_cross_up or stoch_from_os),
-        "rsi_val":               round(cur_rsi, 1),
-        "rsi_above_50":          rsi_above_50,
-        "m_vwap_touched":        bool(r_meta.get("vwap_touch_found", False)),
-        "m_vwap_reclaimed":      bool(reclaim_result.get("confirmed", False)),
-        "m_reaction_strength_atr": round(reclaim_result.get("reaction_strength", 0.0) / 100.0 *
-                                         float(cfg.get("reaction_max_atr", RECLAIM_REACTION_CAP)), 2),
-        "m_vwap_stoch_confluence": confluence,
-        # ── Extended diagnostics ──
-        "vwap_touch_found":      bool(r_meta.get("vwap_touch_found", False)),
-        "touch_bar":             int(r_meta.get("touch_bar", 0) or 0),
-        "touch_distance_atr":    float(r_meta.get("touch_distance_atr", 0.0)),
-        "returned_above_vwap":   bool(r_meta.get("returned_above_vwap", False)),
-        "reaction_strength":     float(reclaim_result.get("reaction_strength", 0.0)),
-        "reaction_score":        float(r_meta.get("reaction_score", 0.0)),
-        "close_position_score":  float(r_meta.get("close_position_score", 0.0)),
-        "stoch_cross_found":     cross_bars_ago is not None,
-        "cross_bar":             int(cross_bars_ago) if cross_bars_ago is not None else 0,
-        "confluence_gap":        int(r_meta.get("confluence_gap", 0) or 0),
-        "pattern_age":           int(r_meta.get("pattern_age", 0) or 0),
-        # ── Merged Risk / extension diagnostics ──
-        "dist_from_ema20_pct":   round(dist_ema20_pct, 2),
-        "dist_from_vwap_pct":    round(dist_vwap_pct, 2),
-        "atr_extension":         round(atr_extension, 2),
-        "exhaustion_candle":     exhaustion_candle,
-        "parabolic_move":        parabolic_move,
-        "extension_penalty":     int(extension_penalty),
-        "momentum_bonus":        momentum_pts,
+        "stoch_k": round(cur_k, 1),
+        "stoch_d": round(cur_d, 1),
+        "stoch_cross_up": fresh_stoch_reignition,
+        "rsi_val": round(cur_rsi, 1),
+        "rsi_above_50": rsi_above_50,
+        "m_vwap_reaction_pts": vwap_reaction_pts,
+        "m_returned_above_vwap": returned_above_vwap,
+        "m_fresh_stoch_reignition": fresh_stoch_reignition,
+        "m_breakout_confirmed": breakout_confirmed,
+        "m_volume_expansion": volume_expansion,
+        "m_reaction_score": float(meta.get("reaction_score", 0.0) or 0.0),
     }
 
 
 # ══════════════════════════════════════════════════════════════════
-#  RISK (legacy, informational only) — no longer a weighted pillar.
-#  Extension/exhaustion penalties now live inside _score_momentum().
-#  This function is kept only to populate the backward-compatible
-#  risk_score field on PillarResult (e.g. FP_Risk column consumers).
+#  INDEPENDENT RISK ENGINE  (max deduction -20) — separate from Momentum.
 # ══════════════════════════════════════════════════════════════════
 
-def _score_risk(close: pd.Series, e20: pd.Series, vwap_last: float,
-                 atr_s: pd.Series) -> tuple[int, dict]:
+def _detect_exhaustion_candle(open_: float, high: float, low: float, close: float) -> bool:
+    rng = high - low
+    if rng <= 0:
+        return False
+    body = abs(close - open_)
+    upper_wick = high - max(open_, close)
+    return bool((upper_wick / rng) >= 0.5 and (body / rng) <= 0.35)
+
+
+def _score_risk(close: pd.Series, high: pd.Series, low: pd.Series,
+                 open_: pd.Series | None, e20: pd.Series, atr_s: pd.Series,
+                 volume: pd.Series, vol_avg: pd.Series | None) -> tuple[int, dict]:
     cur_c   = _safe_last(close)
     cur_e20 = _safe_last(e20)
     cur_atr = _safe_last(atr_s)
 
     dist_ema20_pct = ((cur_c - cur_e20) / cur_e20 * 100) if cur_e20 > 0 else 0.0
-    dist_vwap_pct  = ((cur_c - vwap_last) / vwap_last * 100) if vwap_last > 0 else 0.0
-    atr_extension  = (cur_c - cur_e20) / cur_atr if cur_atr > 0 else 0.0
+    atr_extension_val = (cur_c - cur_e20) / cur_atr if (cur_atr > 0 and cur_e20 > 0) else 0.0
 
-    def _penalty(val, thresholds_penalties):
-        for th, pen in thresholds_penalties:
-            if val >= th:
-                return pen
-        return 0
+    ema20_ext_flag = abs(dist_ema20_pct) > 2.5
+    atr_ext_flag   = abs(atr_extension_val) > 0.8
 
-    # Larger positive distance / extension -> later-stage entry -> bigger penalty.
-    pen_ema20 = _penalty(abs(dist_ema20_pct), [(15, 35), (10, 25), (6, 15), (3, 7)])
-    pen_vwap  = _penalty(abs(dist_vwap_pct),  [(20, 30), (12, 20), (7, 12), (3, 5)])
-    pen_atr   = _penalty(abs(atr_extension),  [(4, 35), (3, 25), (2, 15), (1, 6)])
+    cur_o = _safe_last(open_) if open_ is not None else cur_c
+    cur_h, cur_l = _safe_last(high), _safe_last(low)
+    exhaustion = _detect_exhaustion_candle(cur_o, cur_h, cur_l, cur_c)
 
-    score = max(0, 100 - pen_ema20 - pen_vwap - pen_atr)
+    parabolic = False
+    if cur_atr > 0 and len(close) >= 4:
+        c_then = _safe_at(close, -4, default=cur_c)
+        parabolic = bool((cur_c - c_then) / cur_atr >= 5.0)
 
-    # Note: dist_from_ema20_pct / dist_from_vwap_pct / atr_extension are no
-    # longer returned here — the authoritative copies now come from
-    # _score_momentum's m_sub (same formulas), which is what feeds the
-    # PillarResult dataclass fields, avoiding a duplicate-kwarg collision.
-    return score, {}
+    climactic_volume = False
+    if vol_avg is not None:
+        cur_v, cur_avg = _safe_last(volume), _safe_last(vol_avg)
+        climactic_volume = bool(cur_avg > 0 and cur_v > 3.0 * cur_avg)
+
+    penalty = 0
+    if ema20_ext_flag:      penalty += 5
+    if atr_ext_flag:         penalty += 5
+    if exhaustion:             penalty += 4
+    if parabolic:                penalty += 3
+    if climactic_volume:            penalty += 3
+    penalty = min(penalty, PTS_RISK_MAX_DEDUCTION)
+
+    return penalty, {
+        "risk_ema20_extension": ema20_ext_flag,
+        "risk_atr_extension": atr_ext_flag,
+        "risk_exhaustion_candle": exhaustion,
+        "risk_parabolic_move": parabolic,
+        "risk_climactic_volume": climactic_volume,
+        "dist_from_ema20_pct": round(dist_ema20_pct, 2),
+        "atr_extension": round(atr_extension_val, 2),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -885,66 +810,38 @@ def compute_pillars_from_ia(df: pd.DataFrame, ia) -> PillarResult:
     Compute the Five Pillars score using the raw OHLCV df and the
     IndicatorArrays (`ia`) already built by build_indicators() inside
     score_stock(). No re-fetching, no re-computation of EMA/RSI/ATR —
-    only the new pieces (VWAP, Volume Profile, RS-3M/6M, extension
-    penalties) are computed here.
+    only the new pieces (VWAP, Volume Profile, OBV, RS-3M/6M, breakout/
+    volume-expansion, Risk) are computed here.
     """
     try:
         close, high, low, volume = ia.c, ia.h, ia.l, ia.v
         open_ = getattr(ia, "o", None)
+        vol_avg = getattr(ia, "vol_avg", None)
+        ph_series = getattr(ia, "ph_series", None)
+        pl_series = getattr(ia, "pl_series", None)
+        # RSI used as the oscillator for Reversal's LL-reclaim timing check
+        # — CCI is never used for scoring anywhere in this engine.
+        osc = getattr(ia, "rsi_s", None)
 
-        s_score, s_sub = _score_structure(
-            close, ia.e20, ia.e50, ia.e200,
-            low=low,
-            ph_series=getattr(ia, "ph_series", None),
-            pl_series=getattr(ia, "pl_series", None),
-            osc=getattr(ia, "cci_s", None),
-            volume=volume,
-            vol_avg=getattr(ia, "vol_avg", None),
-        )
+        s_score, s_sub = _score_structure(close, ia.e20, ia.e50, ia.e200, ph_series, pl_series)
         a_score, a_sub = _score_acceptance(close, high, low, volume)
+        r_score, r_sub = _score_reversal(close, low, high, open_, volume,
+                                          ph_series, pl_series, osc, ia.atr_s, vol_avg)
         l_score, l_sub = _score_leadership(close, ia.nifty_aligned)
-        m_score, m_sub = _score_momentum(
-            high, low, close, ia.rsi_s, volume, ia.atr_s,
-            open_=open_, e20=ia.e20,
-        )
-        # Legacy risk_score (informational only — not weighted into final).
-        r_score, _r_sub = _score_risk(close, ia.e20, a_sub["vwap"], ia.atr_s)
+        m_score, m_sub = _score_momentum(high, low, close, ia.rsi_s, volume, ia.atr_s, vol_avg)
+        risk_penalty, risk_sub = _score_risk(close, high, low, open_, ia.e20, ia.atr_s, volume, vol_avg)
 
-        # Risk is no longer a separately weighted pillar — its checks are
-        # merged into Momentum's extension penalty above.
-        final = (
-            s_score * W_STRUCTURE +
-            a_score * W_ACCEPTANCE +
-            l_score * W_LEADERSHIP +
-            m_score * W_MOMENTUM
-        )
-        final_int = int(round(final))
+        pillar_total = s_score + a_score + r_score + l_score + m_score
+        final_int = int(round(max(0, min(100, pillar_total - risk_penalty))))
         cls, note = _classify(final_int)
-
-        # Pull extended VWAP reclaim diagnostics out of m_sub so they map
-        # to the new PillarResult fields (avoids double-star kwarg collision).
-        _ext = {
-            "vwap_touch_found":     m_sub.pop("vwap_touch_found",    False),
-            "touch_bar":            m_sub.pop("touch_bar",            0),
-            "touch_distance_atr":   m_sub.pop("touch_distance_atr",  0.0),
-            "returned_above_vwap":  m_sub.pop("returned_above_vwap", False),
-            "reaction_score":       m_sub.pop("reaction_score",       0.0),
-            "close_position_score": m_sub.pop("close_position_score", 0.0),
-            "stoch_cross_found":    m_sub.pop("stoch_cross_found",    False),
-            "cross_bar":            m_sub.pop("cross_bar",            0),
-            "confluence_gap":       m_sub.pop("confluence_gap",       0),
-            "pattern_age":          m_sub.pop("pattern_age",          0),
-            "momentum_bonus":       m_sub.pop("momentum_bonus",       0),
-        }
-        # reaction_strength is also in m_sub — keep it separate from PillarResult field
-        _reaction_strength = m_sub.pop("reaction_strength", 0.0)
 
         return PillarResult(
             structure_score=s_score, acceptance_score=a_score,
-            leadership_score=l_score, momentum_score=m_score,
-            risk_score=r_score, final_score=final_int,
+            reversal_score=r_score, leadership_score=l_score,
+            momentum_score=m_score, risk_penalty=risk_penalty,
+            risk_score=risk_penalty, final_score=final_int,
             classification=cls, classification_note=note,
-            **s_sub, **a_sub, **l_sub, **m_sub, **_r_sub, **_ext,
+            **s_sub, **a_sub, **r_sub, **l_sub, **m_sub, **risk_sub,
         )
     except Exception as exc:
         return PillarResult(error=str(exc))
@@ -972,10 +869,6 @@ def compute_pillars(df: pd.DataFrame, nifty: pd.Series) -> PillarResult:
     rsi_s = rsi(close, 14)
     atr_s = atr(high, low, close, 14)
 
-    # Pivot series + volume average — not otherwise built on this standalone
-    # path, but needed for the swing-structure (HH/HL/LH/LL) sub-score.
-    # Falls back to RSI as the oscillator (CCI isn't computed here) — good
-    # enough for the bullish-divergence check inside detect_ll_reversal().
     ph_series, pl_series = build_pivot_series(high, low, lb=20)
     vol_avg = volume.rolling(20, min_periods=1).mean()
 
@@ -992,7 +885,6 @@ def compute_pillars(df: pd.DataFrame, nifty: pd.Series) -> PillarResult:
     ia.rsi_s, ia.atr_s = rsi_s, atr_s
     ia.nifty_aligned = nifty_aligned
     ia.ph_series, ia.pl_series = ph_series, pl_series
-    ia.cci_s   = rsi_s     # oscillator fallback (no CCI computed on this path)
     ia.vol_avg = vol_avg
 
     return compute_pillars_from_ia(df, ia)

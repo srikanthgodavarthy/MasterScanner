@@ -815,79 +815,70 @@ def score_stock(
             result.update({
                 "FP_Structure":   fp.structure_score,
                 "FP_Acceptance":  fp.acceptance_score,
+                "FP_Reversal":    fp.reversal_score,
                 "FP_Leadership":  fp.leadership_score,
                 "FP_Momentum":    fp.momentum_score,
+                "FP_Risk":        fp.risk_penalty,
                 "FP_FinalScore":  fp.final_score,
                 "FP_Class":       fp.classification,
                 "FP_ClassNote":   fp.classification_note,
-                # Acceptance internals
+                # Structure internals (20 pts — EMA alignment/slope + HH/HL only)
+                "_fp_ema_stack":       fp.s_ema_stack,
+                "_fp_ema20_rising":    fp.s_ema20_rising,
+                "_fp_ema50_rising":    fp.s_ema50_rising,
+                "_fp_ema200_rising":   fp.s_ema200_rising,
+                "_fp_price_above_e20": fp.s_price_above_e20,
+                "FP_SwingLabel":       fp.s_swing_label,
+                "_fp_hh_hl_intact":    fp.s_hh_hl_intact,
+                "_fp_no_breakdown":    fp.s_no_breakdown,
+                # Acceptance internals (25 pts — VWAP + Volume Profile + OBV)
                 "FP_VWAP":        round(fp.vwap, 2),
                 "FP_POC":         round(fp.poc, 2),
                 "FP_VAH":         round(fp.vah, 2),
                 "FP_VAL":         round(fp.val, 2),
-                "_fp_above_poc":  fp.a_price_above_poc,
-                "_fp_above_vwap": fp.a_price_above_vwap,
-                "_fp_vwap_rising":fp.a_vwap_rising,
-                # Structure internals
-                "_fp_ema_stack":      fp.s_ema_stack,
-                "_fp_price_above_e20":fp.s_price_above_e20,
-                "_fp_ema200_rising":  fp.s_ema200_rising,
-                # Swing structure (HH/HL/LH/LL) + LL "spring" reversal
-                "FP_SwingLabel":            fp.s_swing_label,
-                "_fp_swing_bonus":          fp.s_swing_bonus,
-                "FP_LLDetected":            fp.s_ll_detected,
-                "FP_LLReclaimed":           fp.s_ll_reclaimed,
-                "_fp_ll_bullish_divergence":fp.s_ll_bullish_divergence,
-                "_fp_ll_volume_confirmed":  fp.s_ll_volume_confirmed,
-                "FP_LLConfidence":          fp.s_ll_confidence,
-                "FP_LLPrice":               round(fp.s_ll_price, 2),
-                "FP_LLPriorLow":            round(fp.s_ll_prior_low_price, 2),
-                "FP_LLBarsToReclaim":       fp.s_ll_bars_to_reclaim,
-                # Leadership internals
+                "_fp_above_poc":            fp.a_above_poc,
+                "_fp_above_vwap":            fp.a_above_vwap,
+                "_fp_accepted_above_va":      fp.a_accepted_above_va,
+                "_fp_holding_above_zone":      fp.a_holding_above_zone,
+                "_fp_obv_trend_rising":         fp.a_obv_trend_rising,
+                "_fp_obv_leading_price":         fp.a_obv_leading_price,
+                "FP_OBV":                            round(fp.obv_value, 0),
+                # Opportunity Quality Bonus internals (10 pts, layered on
+                # the 90pt base — formerly "LL Elite Bonus")
+                "_fp_r_actionable_ll":              fp.r_actionable_ll,
+                "_fp_r_ll_defended":                  fp.r_ll_defended,
+                "_fp_r_distance_atr_ok":                fp.r_distance_atr_ok,
+                "_fp_r_distance_atr_pts":                 fp.r_distance_atr_pts,
+                "_fp_r_high_volume_confirmation":         fp.r_high_volume_confirmation,
+                "FP_LLPrice":                                  round(fp.r_ll_price, 2),
+                "FP_LLPriorLow":                                round(fp.r_prior_low_price, 2),
+                "FP_LLBarsToReclaim":                            fp.r_bars_to_reclaim,
+                "FP_LLDistanceATR":                                fp.r_distance_atr,
+                "FP_LLConfidence":                                   fp.r_confidence,
+                # Leadership internals (13 pts)
                 "FP_RS3m":        fp.rs_3m,
                 "FP_RS6m":        fp.rs_6m,
                 "FP_RelMomentum": fp.rel_momentum,
-                # Momentum internals
+                # Momentum internals (35 pts — today's trigger only)
                 "FP_StochK":         fp.stoch_k,
                 "FP_StochD":         fp.stoch_d,
-                "_fp_stoch_cross_up": fp.stoch_cross_up,
-                "_fp_rsi_val":       fp.rsi_val,
-                "_fp_rsi_above_50": fp.rsi_above_50,
-                "_fp_vwap_touched":          fp.m_vwap_touched,
-                "_fp_vwap_reclaimed":        fp.m_vwap_reclaimed,
-                "_fp_reaction_strength_atr": fp.m_reaction_strength_atr,
-                "_fp_vwap_stoch_confluence": fp.m_vwap_stoch_confluence,
-                # Extended VWAP Reclaim diagnostics
-                "_fp_vwap_touch_found":      fp.vwap_touch_found,
-                "_fp_touch_bar":             fp.touch_bar,
-                "_fp_touch_distance_atr":    fp.touch_distance_atr,
-                "_fp_returned_above_vwap":   fp.returned_above_vwap,
-                "_fp_reaction_score":        fp.reaction_score,
-                "_fp_close_position_score":  fp.close_position_score,
-                "_fp_stoch_cross_found":     fp.stoch_cross_found,
-                "_fp_cross_bar":             fp.cross_bar,
-                "_fp_confluence_gap":        fp.confluence_gap,
-                "_fp_pattern_age":           fp.pattern_age,
-                "_fp_momentum_bonus":        fp.momentum_bonus,
-                # Scanner display columns
-                "FP_VWAPReclaim":            fp.m_vwap_reclaimed,
-                "FP_ReactionStrength":       fp.reaction_score,
-                "FP_Confluence":             fp.m_vwap_stoch_confluence,
-                "FP_PatternAge":             fp.pattern_age,
-                "FP_MomentumBonus":          fp.momentum_bonus,
-                # Risk internals — Risk is no longer a separately weighted
-                # pillar; FP_Risk is kept for backward compatibility
-                # (legacy informational score). The values that actually
-                # drive scoring now live under Momentum (FP_ExtensionPenalty
-                # etc. below), sourced from the same distance/extension
-                # calculations.
-                "FP_Risk":        fp.risk_score,
+                "_fp_stoch_cross_up":            fp.stoch_cross_up,
+                "_fp_rsi_val":                     fp.rsi_val,
+                "_fp_rsi_above_50":                 fp.rsi_above_50,
+                "_fp_vwap_reaction_pts":              fp.m_vwap_reaction_pts,
+                "_fp_returned_above_vwap":             fp.m_returned_above_vwap,
+                "_fp_fresh_stoch_reignition":            fp.m_fresh_stoch_reignition,
+                "_fp_breakout_confirmed":                 fp.m_breakout_confirmed,
+                "_fp_volume_expansion":                    fp.m_volume_expansion,
+                "_fp_reaction_score":                       fp.m_reaction_score,
+                # Independent Risk Engine internals (max -20 deduction)
+                "_fp_risk_ema20_extension":   fp.risk_ema20_extension,
+                "_fp_risk_atr_extension":      fp.risk_atr_extension,
+                "_fp_risk_exhaustion_candle":   fp.risk_exhaustion_candle,
+                "_fp_risk_parabolic_move":       fp.risk_parabolic_move,
+                "_fp_risk_climactic_volume":      fp.risk_climactic_volume,
                 "FP_DistEMA20Pct": fp.dist_from_ema20_pct,
-                "FP_DistVWAPPct":  fp.dist_from_vwap_pct,
-                "FP_ATRExtension":fp.atr_extension,
-                "FP_ExhaustionCandle": fp.exhaustion_candle,
-                "FP_ParabolicMove":    fp.parabolic_move,
-                "FP_ExtensionPenalty": fp.extension_penalty,
+                "FP_ATRExtension": fp.atr_extension,
             })
     except Exception as _fp_exc:
         import logging as _log
