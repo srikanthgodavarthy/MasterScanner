@@ -144,14 +144,21 @@ def render(settings=None):
         "📐 CCI Master":             "<span style='background:#001a1a;color:#00e676;border:1px solid #00e676;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>engine: cci_master · BUY crossover → entry</span>",
     }
 
+    _ENGINE_TO_SOURCE = {
+        "scanner":      "Custom",
+        "five_pillars": "🏛️ Five Pillars",
+        "cci_master":   "📐 CCI Master",
+    }
+    _default_source = _ENGINE_TO_SOURCE.get((settings or {}).get("bt_default_engine", "scanner"), "Custom")
+
     src_col, badge_col = st.columns([3, 5])
     with src_col:
         bt_source = st.selectbox(
             "📡 Symbol Source",
             SOURCE_OPTIONS,
-            index=0,
+            index=SOURCE_OPTIONS.index(_default_source) if _default_source in SOURCE_OPTIONS else 0,
             key="bt_source",
-            help="Choose which pool of stocks to backtest. Scanner / Five Pillars / CCI Master sources auto-populate the symbol list from the last scan.",
+            help="Choose which pool of stocks to backtest. Scanner / Five Pillars / CCI Master sources auto-populate the symbol list from the last scan. Defaults from Settings → System → Default Backtest Engine.",
         )
     with badge_col:
         st.markdown("<div style='padding-top:1.9rem'></div>", unsafe_allow_html=True)
@@ -1242,11 +1249,11 @@ for each combination and outputs a ranked sensitivity table.
 
             for k, (atr_m, lb, rxn, cfb, min_r) in enumerate(combos):
                 ic_override = {
-                    "vwap_touch_atr_mult": atr_m,
-                    "vwap_touch_lookback": lb,
-                    "reaction_max_atr":    rxn,
-                    "confluence_window":   cfb,
-                    "min_reaction_score":  min_r,
+                    "ic_vwap_touch_atr_mult": atr_m,
+                    "ic_vwap_touch_lookback": lb,
+                    "ic_reaction_max_atr":    rxn,
+                    "ic_confluence_window":   cfb,
+                    "ic_min_reaction_score":  min_r,
                 }
                 try:
                     _summary, _trades = run_backtest(
