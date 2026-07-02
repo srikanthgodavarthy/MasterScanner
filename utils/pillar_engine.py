@@ -874,6 +874,185 @@ def _classify(final_score: int) -> tuple[str, str]:
 
 
 # ══════════════════════════════════════════════════════════════════
+#  PROMOTION ENGINE  —  Execute (>=90)  ->  Elite
+# ──────────────────────────────────────────────────────────────────
+# Pure additive overlay. Does NOT change the 90-pt base engine, does
+# NOT change _classify() or the Execute/Watch/Developing/Avoid
+# thresholds above — a stock still reaches Execute exactly as it does
+# today. Elite is a *further* tier reserved for Execute-tier stocks
+# that also clear four independent super-confidence gates, built
+# entirely from evidence the base engine already computed (no new
+# indicators, no re-fetching, no new data source).
+#
+# All four gates below must pass — this is deliberately the strictest
+# read (a single missing confirmation withholds Elite, it does not
+# demote the underlying Execute/BUY call).
+#
+#   1. LL Opportunity            — a confirmed, still-valid, still
+#                                   in-band Lower-Low spring (reuses
+#                                   the Opportunity Quality Bonus
+#                                   sub-fields r_actionable_ll /
+#                                   r_ll_defended / r_distance_atr_ok).
+#   2. Institutional Accumulation— OBV rising AND leading price, the
+#                                   acceptance zone (POC / holding
+#                                   above zone) is held, AND volume
+#                                   confirmed at the LL itself.
+#   3. Market Regime             — market-wide regime (from
+#                                   utils.regime_engine) is TREND.
+#                                   Range/Volatile markets never grant
+#                                   Elite, regardless of the stock's
+#                                   own score.
+#   4. Risk Acceptable           — zero risk flags tripped (FP_Risk /
+#                                   risk_penalty == 0). Any deduction
+#                                   at all — extension, exhaustion,
+#                                   parabolic move, climactic volume —
+#                                   withholds Elite.
+#
+# "Sector Leadership" is intentionally NOT a gate: no sector index /
+# membership feed is wired into the data pipeline anywhere in this
+# app (see l_sector_leadership_note on PillarResult), so a real gate
+# can't be built without inventing data. Adding it as a placeholder
+# gate would either always pass (meaningless) or block promotion on
+# a number nobody actually computed — worse than omitting it. Wire in
+# a real sector-benchmark feed later and this becomes a 5th gate.
+# ══════════════════════════════════════════════════════════════════
+
+CLASS_ELITE = "Elite"
+_CLASS_STYLE[CLASS_ELITE] = ("#f5c542", "Super-confidence — Execute + all promotion gates")
+
+PROMOTION_GATE_NAMES = (
+    "ll_opportunity",
+    "institutional_accumulation",
+    "market_regime",
+    "risk_acceptable",
+)
+
+
+@dataclass
+class PromotionResult:
+    eligible_for_promotion: bool = False   # base gate: final score already >= 90 (Execute)
+    promoted:               bool = False   # eligible AND all 4 gates passed -> Elite
+    gate_ll_opportunity:              bool = False
+    gate_institutional_accumulation:  bool = False
+    gate_market_regime:               bool = False
+    gate_risk_acceptable:             bool = False
+    gates_passed: int = 0
+    gates_total:  int = len(PROMOTION_GATE_NAMES)
+    regime:       str = "UNKNOWN"
+    reasons:      str = ""   # human-readable — why promoted, or why withheld
+
+
+def _get(row, *keys, default=None):
+    """Read the first present key from a dict / pandas.Series / PillarResult."""
+    for k in keys:
+        if isinstance(row, dict):
+            if k in row and row[k] is not None:
+                return row[k]
+        elif hasattr(row, "get"):
+            v = row.get(k, None)
+            if v is not None:
+                return v
+        elif hasattr(row, k):
+            v = getattr(row, k)
+            if v is not None:
+                return v
+    return default
+
+
+def evaluate_promotion(row, regime: str | None = None) -> PromotionResult:
+    """
+    Evaluate the four Promotion Engine gates for one stock and decide
+    Execute -> Elite.
+
+    `row` may be:
+      - a PillarResult instance (in-process, right after compute_pillars*),
+      - a dict / pandas.Series from the scanned dataframe (df_aug), using
+        the FP_* / _fp_* column names wired in utils/scanner_engine.py.
+    Both key spellings are checked so this works from either call site.
+
+    `regime`: "TREND" | "RANGE" | "VOLATILE" | None — market-wide regime
+    from utils.regime_engine. If the caller already has it (e.g. the
+    "regime" column apply_regime_layer() attaches to df_aug), pass it
+    explicitly; otherwise it's read from a "regime"/"Regime" key on
+    `row` if present. Unknown regime FAILS the gate closed — Elite is
+    never granted on a missing/unverified regime read.
+    """
+    final_score = _get(row, "FP_FinalScore", "final_score", default=0) or 0
+    base_eligible = float(final_score) >= 90
+
+    # ── Gate 1 — LL Opportunity ─────────────────────────────────
+    actionable_ll = bool(_get(row, "_fp_r_actionable_ll", "r_actionable_ll", default=False))
+    ll_defended   = bool(_get(row, "_fp_r_ll_defended", "r_ll_defended", default=False))
+    ll_dist_ok    = bool(_get(row, "_fp_r_distance_atr_ok", "r_distance_atr_ok", default=False))
+    gate_ll = actionable_ll and ll_defended and ll_dist_ok
+
+    # ── Gate 2 — Institutional Accumulation ─────────────────────
+    obv_rising  = bool(_get(row, "_fp_obv_trend_rising", "a_obv_trend_rising", default=False))
+    obv_leading = bool(_get(row, "_fp_obv_leading_price", "a_obv_leading_price", default=False))
+    zone_held   = bool(_get(row, "_fp_holding_above_zone", "a_holding_above_zone", default=False))
+    vol_confirm = bool(_get(row, "_fp_r_high_volume_confirmation", "r_high_volume_confirmation", default=False))
+    gate_institutional = obv_rising and obv_leading and zone_held and vol_confirm
+
+    # ── Gate 3 — Market Regime ──────────────────────────────────
+    regime_val = regime or _get(row, "regime", "Regime", default="UNKNOWN")
+    regime_val = str(regime_val or "UNKNOWN").upper()
+    gate_regime = regime_val == "TREND"
+
+    # ── Gate 4 — Risk Acceptable ─────────────────────────────────
+    risk_penalty = _get(row, "FP_Risk", "risk_penalty", default=0) or 0
+    gate_risk = float(risk_penalty) == 0
+
+    gates = {
+        "ll_opportunity":              gate_ll,
+        "institutional_accumulation":  gate_institutional,
+        "market_regime":               gate_regime,
+        "risk_acceptable":             gate_risk,
+    }
+    passed = sum(1 for v in gates.values() if v)
+    promoted = bool(base_eligible and passed == len(gates))
+
+    reasons = []
+    if not base_eligible:
+        reasons.append(f"Final score {final_score} < 90 — not Execute-tier yet, Promotion Engine not evaluated")
+    else:
+        if not gate_ll:
+            reasons.append("LL Opportunity: no confirmed & defended, in-band spring")
+        if not gate_institutional:
+            reasons.append("Institutional Accumulation: OBV / zone / volume-at-low not all confirming")
+        if not gate_regime:
+            reasons.append(f"Market Regime: {regime_val}, not TREND")
+        if not gate_risk:
+            reasons.append(f"Risk Acceptable: {risk_penalty} pt risk deduction active")
+    reasons_str = " · ".join(reasons) if reasons else "All gates satisfied — Elite super-confidence"
+
+    return PromotionResult(
+        eligible_for_promotion=base_eligible,
+        promoted=promoted,
+        gate_ll_opportunity=gate_ll,
+        gate_institutional_accumulation=gate_institutional,
+        gate_market_regime=gate_regime,
+        gate_risk_acceptable=gate_risk,
+        gates_passed=passed,
+        gates_total=len(gates),
+        regime=regime_val,
+        reasons=reasons_str,
+    )
+
+
+def effective_classification(row, regime: str | None = None) -> tuple[str, PromotionResult]:
+    """
+    Convenience wrapper: returns (effective_class, PromotionResult).
+    effective_class is CLASS_ELITE when promoted, otherwise the row's
+    existing FP_Class/classification is passed through unchanged — the
+    base engine's Execute/Watch/Developing/Avoid call is never altered.
+    """
+    promo = evaluate_promotion(row, regime=regime)
+    base_class = _get(row, "FP_Class", "classification", default=CLASS_AVOID)
+    eff = CLASS_ELITE if promo.promoted else base_class
+    return eff, promo
+
+
+# ══════════════════════════════════════════════════════════════════
 #  PUBLIC ENTRY POINT
 # ══════════════════════════════════════════════════════════════════
 
