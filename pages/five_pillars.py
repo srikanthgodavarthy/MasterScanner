@@ -379,6 +379,205 @@ def _detail_breakdown(row: pd.Series) -> str:
     return html
 
 
+def _scoring_explainer_html() -> str:
+    """
+    Static HTML panel: 'How Five Pillars Scores & Signal Classes are
+    calculated'. Mirrors the CV1 scoring explainer on the Scanner page
+    (same layout/styling) but reflects this engine's actual weights,
+    pulled straight from utils/pillar_engine.py — four base pillars sum
+    to the 90-pt engine, the Opportunity Quality Bonus (10) layers on
+    top, and the Risk Engine is an independent deduction (max -20).
+    """
+    dim_rows = [
+        ("Structure", "#58a6ff", [
+            ("EMA20 &gt; EMA50 &gt; EMA200 (stack)",  5),
+            ("Swing structure — HH/HL intact",        4),
+            ("EMA20 rising (10-bar)",                 3),
+            ("EMA50 rising / EMA200 rising",       "2+2"),
+            ("Price above EMA20 / No breakdown",   "2+2"),
+        ]),
+        ("Acceptance", "#3fb950", [
+            ("Above POC (volume profile)",            5),
+            ("OBV trend rising",                       4),
+            ("Above anchored VWAP",                     4),
+            ("Holding above zone (3 closes)",             3),
+            ("Accepted above Value Area / OBV leading","3+3"),
+        ]),
+        ("Leadership", "#a371f7", [
+            ("3M RS vs NIFTY (graduated)",         "0–8"),
+            ("Relative momentum (graduated)",      "0–3"),
+            ("Sector leadership",                       2),
+        ]),
+        ("Momentum (today's trigger)", "#d29922", [
+            ("Volume expansion (&gt;1.5x 20d avg)",   11),
+            ("Fresh Stoch reignition / Breakout",  "6+6"),
+            ("Returned above VWAP (confirmed)",        5),
+            ("VWAP reaction strength (graduated)", "0–7"),
+        ]),
+    ]
+
+    def _dim_block(dim, color, factors, total):
+        rows = ""
+        for label, pts in factors:
+            pts_disp = f"+{pts}" if isinstance(pts, int) else pts
+            partial = isinstance(pts, str)
+            rows += (
+                f'<tr>'
+                f'<td style="padding:3px 10px 3px 0;font-size:11px;color:#e6edf3;">{label}</td>'
+                f'<td style="padding:3px 0;font-size:11px;font-weight:700;color:{color};'
+                f'text-align:right;font-family:var(--mono);white-space:nowrap">{pts_disp}</td>'
+                f'<td style="padding:3px 0 3px 16px;font-size:10px;color:#8b949e;">'
+                f'{"Partial credit available" if partial else "Fully earned or zero"}</td>'
+                f'</tr>'
+            )
+        return (
+            f'<div style="margin-bottom:14px;">'
+            f'<div style="font-size:10px;font-weight:700;color:{color};letter-spacing:0.08em;'
+            f'text-transform:uppercase;margin-bottom:5px;">{dim} <span style="font-size:9px;'
+            f'font-weight:400;color:#8b949e">(0–{total} pts)</span></div>'
+            f'<table style="border-collapse:collapse;width:100%">{rows}</table>'
+            f'</div>'
+        )
+
+    dim_totals = {"Structure": PTS_STRUCTURE, "Acceptance": PTS_ACCEPTANCE,
+                  "Leadership": PTS_LEADERSHIP, "Momentum (today's trigger)": PTS_MOMENTUM}
+    pillar_grid = "".join(_dim_block(d, c, f, dim_totals[d]) for d, c, f in dim_rows)
+
+    # ── Opportunity Quality Bonus + Risk Engine (modifiers, not base pillars) ──
+    bonus_rows = [
+        ("Actionable LL confirmed (spring reclaimed)", 2),
+        ("LL remains defended (never re-broken)",       2),
+        ("Institutional confirmation (volume at LL)",    2),
+        ("Distance from LL — ATR-based, pace-adjusted", "0–4"),
+    ]
+    risk_rows = [
+        ("EMA20 extension &gt; 2.5%",                 -5),
+        ("ATR extension &gt; 0.8 ATR",                -5),
+        ("Exhaustion candle",                         -4),
+        ("Parabolic move (≥5 ATR in 3 bars)",          -3),
+        ("Climactic volume (&gt;3x 20d avg)",           -3),
+    ]
+
+    def _modifier_block(title, color, note, rows, total_label):
+        body = ""
+        for label, pts in rows:
+            partial = isinstance(pts, str)
+            pts_disp = pts if partial else (f"+{pts}" if pts > 0 else str(pts))
+            body += (
+                f'<tr>'
+                f'<td style="padding:3px 10px 3px 0;font-size:11px;color:#e6edf3;">{label}</td>'
+                f'<td style="padding:3px 0;font-size:11px;font-weight:700;color:{color};'
+                f'text-align:right;font-family:var(--mono);white-space:nowrap">{pts_disp}</td>'
+                f'<td style="padding:3px 0 3px 16px;font-size:10px;color:#8b949e;">'
+                f'{"Partial credit available" if partial else "Fully earned or zero"}</td>'
+                f'</tr>'
+            )
+        return (
+            f'<div>'
+            f'<div style="font-size:10px;font-weight:700;color:{color};letter-spacing:0.08em;'
+            f'text-transform:uppercase;margin-bottom:3px;">{title} '
+            f'<span style="font-size:9px;font-weight:400;color:#8b949e">({total_label})</span></div>'
+            f'<div style="font-size:9.5px;color:#8b949e;margin-bottom:5px;">{note}</div>'
+            f'<table style="border-collapse:collapse;width:100%">{body}</table>'
+            f'</div>'
+        )
+
+    modifiers_grid = (
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">'
+        + _modifier_block("Opportunity Quality Bonus", "#f5c542",
+                           "Layered on the 90-pt base — LL spring only",
+                           bonus_rows, f"+{PTS_REVERSAL} pts")
+        + _modifier_block("Risk Engine", "#f85149",
+                           "Independent deduction — applies after the base+bonus total",
+                           risk_rows, f"max -{PTS_RISK_MAX_DEDUCTION} pts")
+        + '</div>'
+    )
+
+    # ── Gate thresholds (classification) ────────────────────────────
+    grades = [
+        ("#3fb950", "Final Score ≥ 90",  "Green · Execute — actionable BUY, momentum confirmed"),
+        ("#d29922", "Final Score 65–89", "Amber · Watch — structure intact, waiting for trigger"),
+        ("#58a6ff", "Final Score 50–64", "Blue · Developing — trend emerging, most pillars still forming"),
+        ("#484f58", "Final Score < 50",  "Gray · Avoid — below threshold"),
+        ("#f5c542", "Elite promotion",   "Gold · Execute + Promotion Engine (see below) — super-confidence only"),
+    ]
+    grade_html = "".join(
+        f'<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px;">'
+        f'<span style="width:9px;height:9px;border-radius:50%;background:{c};'
+        f'flex-shrink:0;margin-top:2px;display:inline-block"></span>'
+        f'<span style="font-size:11px;color:#e6edf3;font-family:var(--mono)">{label}</span>'
+        f'<span style="font-size:10px;color:#8b949e">&mdash; {desc}</span>'
+        f'</div>'
+        for c, label, desc in grades
+    )
+
+    # ── Signal class table ──────────────────────────────────────────
+    sc_rows_data = [
+        ("ELITE",      "#f5c542", "Super-Confidence",
+         "Final score ≥ 90 · LL Opportunity ✓ (critical) · Reward &gt; Risk ✓ (critical) "
+         "· + ≥1 of Institutional Confirmation / Market Regime TREND (optional)"),
+        ("EXECUTE",    "#3fb950", "Actionable BUY",
+         "Final score ≥ 90 — Structure + Acceptance + Leadership + Momentum + Opp Bonus − Risk"),
+        ("WATCH",      "#d29922", "Structure Building",
+         "Final score 65–89 · pillars aligning, momentum trigger not yet confirmed"),
+        ("DEVELOPING", "#58a6ff", "Trend Emerging",
+         "Final score 50–64 · early stage, most pillars still forming"),
+        ("AVOID",      "#484f58", "Below Threshold",
+         "Final score &lt; 50 · no actionable setup"),
+    ]
+    sc_rows_html = "".join(
+        f'<tr style="border-bottom:1px solid rgba(255,255,255,0.06)">'
+        f'<td style="padding:6px 12px 6px 0">'
+        f'<span style="background:{c}18;border:1px solid {c}44;color:{c};'
+        f'font-size:10px;font-weight:700;border-radius:4px;padding:2px 8px;'
+        f'font-family:var(--mono)">{sc}</span></td>'
+        f'<td style="padding:6px 12px 6px 0;font-size:11px;color:#e6edf3;white-space:nowrap">{name}</td>'
+        f'<td style="padding:6px 0;font-size:10px;color:#8b949e">{conds}</td>'
+        f'</tr>'
+        for sc, c, name, conds in sc_rows_data
+    )
+
+    return f"""
+<div style="font-family:'JetBrains Mono','Fira Code',monospace;">
+  <p style="font-size:11px;color:#8b949e;margin:0 0 16px;">
+    Five Pillars scoring is a 90-pt base engine — four independent pillars
+    (Structure, Acceptance, Leadership, Momentum) sum to the final score.
+    The Opportunity Quality Bonus (+10) layers on top for a defended LL
+    spring only; the Risk Engine (max -20) is an independent deduction
+    applied after. Most sub-factors are binary — full credit or zero —
+    a few are graduated (RS, VWAP reaction, LL distance) and award
+    partial credit.
+  </p>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:20px;margin-bottom:18px;">
+    {pillar_grid}
+  </div>
+
+  <div style="border-top:1px solid rgba(255,255,255,0.08);padding-top:14px;margin-bottom:18px;">
+    {modifiers_grid}
+  </div>
+
+  <div style="border-top:1px solid rgba(255,255,255,0.08);padding-top:14px;margin-bottom:18px;">
+    <div style="font-size:10px;font-weight:700;color:#8b949e;letter-spacing:0.08em;
+    text-transform:uppercase;margin-bottom:8px;">Gate Thresholds</div>
+    {grade_html}
+  </div>
+
+  <div style="border-top:1px solid rgba(255,255,255,0.08);padding-top:14px;margin-bottom:10px;">
+    <div style="font-size:10px;font-weight:700;color:#8b949e;letter-spacing:0.08em;
+    text-transform:uppercase;margin-bottom:8px;">Signal Class — Priority (ELITE &gt; EXECUTE &gt; WATCH &gt; DEVELOPING &gt; AVOID)</div>
+    <table style="border-collapse:collapse;width:100%">{sc_rows_html}</table>
+  </div>
+
+  <p style="font-size:10px;color:#8b949e;margin:10px 0 0;font-style:italic;">
+    Elite always requires Execute first — the 90-pt base engine is never bypassed, only extended.
+    Only the highest-priority class that all conditions satisfy is assigned.
+    Use the Pillar Breakdown (below each stock) to see exactly which sub-factors fired.
+  </p>
+</div>
+"""
+
+
 def render(settings: dict | None = None):
     st.markdown(_CSS, unsafe_allow_html=True)
     st.markdown(
