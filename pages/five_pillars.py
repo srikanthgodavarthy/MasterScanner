@@ -3,13 +3,11 @@ pages/five_pillars.py — Five Pillars Ranking Tab
 ─────────────────────────────────────────────────────────────────────────────
 Reads the Live Scanner's existing scan result (st.session_state["scan_df"])
 and renders it through the Five Pillars lens (Structure / Acceptance /
-Leadership / Momentum -> Final Score -> Execute/Watch/Developing/
-Avoid). Risk is no longer a standalone pillar — its extension/exhaustion
-checks are merged into Momentum (shown in the Momentum breakdown as
-"Execution Quality"). Does NOT trigger its own scan and does NOT touch
-production scanner/decision-engine logic — it is a pure display layer over
-the FP_* columns already attached to df_aug by utils/pillar_engine.py
-inside score_stock().
+Reversal / Leadership / Momentum, minus an independent Risk deduction ->
+Final Score -> Execute/Watch/Developing/Avoid). Does NOT trigger its own
+scan and does NOT touch production scanner/decision-engine logic — it is
+a pure display layer over the FP_* columns already attached to df_aug by
+utils/pillar_engine.py inside score_stock().
 
 If the person hasn't run a scan yet (or ran one before this feature was
 added, so FP_* columns are missing), this tab prompts them to run/re-run
@@ -24,7 +22,8 @@ import pandas as pd
 
 from utils.pillar_engine import (
     CLASS_EXECUTE, CLASS_WATCH, CLASS_DEVELOPING, CLASS_AVOID,
-    W_STRUCTURE, W_ACCEPTANCE, W_LEADERSHIP, W_MOMENTUM,
+    PTS_STRUCTURE, PTS_ACCEPTANCE, PTS_REVERSAL, PTS_LEADERSHIP, PTS_MOMENTUM,
+    PTS_RISK_MAX_DEDUCTION,
 )
 
 # ── Visual constants (matches pages/scanner.py dark theme) ─────────
@@ -126,16 +125,24 @@ def _pillar_color(score: float) -> str:
     return "#f85149"
 
 
-def _pillar_bar(score) -> str:
+def _pillar_color_pct(pct: float) -> str:
+    if pct >= 90: return "#3fb950"
+    if pct >= 65: return "#4ade80"
+    if pct >= 50: return "#d29922"
+    return "#f85149"
+
+
+def _pillar_bar(score, max_pts: int = 100) -> str:
     if not _is_valid_num(score):
         return '<td>—</td>'
-    s = max(0, min(100, float(score)))
-    color = _pillar_color(s)
+    s = max(0, min(max_pts, float(score)))
+    pct = (s / max_pts * 100) if max_pts else 0
+    color = _pillar_color_pct(pct)
     return (
         f'<td><div class="fp-pillar-bar-wrap">'
         f'<div class="fp-pillar-track"><div class="fp-pillar-fill" '
-        f'style="width:{s}%;background:{color}"></div></div>'
-        f'<span class="fp-pillar-num" style="color:{color}">{int(round(s))}</span>'
+        f'style="width:{pct}%;background:{color}"></div></div>'
+        f'<span class="fp-pillar-num" style="color:{color}">{int(round(s))}/{max_pts}</span>'
         f'</div></td>'
     )
 
@@ -182,7 +189,7 @@ def _build_table_html(df: pd.DataFrame) -> str:
         return '<div class="fp-empty"><div class="icn">📡</div>No candidates in this bucket.</div>'
 
     headers = [
-        "Stock", "Final", "LTP", "Chg%", "Leadership", "Structure", "Momentum",
+        "Stock", "Final", "LTP", "Chg%", "Leadership", "Structure", "Opp Bonus", "Momentum",
         "Acceptance", "RSI", "Entry", "SL", "T1", "T2",
     ]
     header_html = "".join(f"<th>{h}</th>" for h in headers)
@@ -198,10 +205,11 @@ def _build_table_html(df: pd.DataFrame) -> str:
         cells += _final_score_cell(row.get("FP_FinalScore"))
         cells += _num_cell(ltp)
         cells += _pct_cell(row.get("%Chg"))
-        cells += _pillar_bar(row.get("FP_Leadership"))
-        cells += _pillar_bar(row.get("FP_Structure"))
-        cells += _pillar_bar(row.get("FP_Momentum"))
-        cells += _pillar_bar(row.get("FP_Acceptance"))
+        cells += _pillar_bar(row.get("FP_Leadership"), PTS_LEADERSHIP)
+        cells += _pillar_bar(row.get("FP_Structure"), PTS_STRUCTURE)
+        cells += _pillar_bar(row.get("FP_Reversal"), PTS_REVERSAL)
+        cells += _pillar_bar(row.get("FP_Momentum"), PTS_MOMENTUM)
+        cells += _pillar_bar(row.get("FP_Acceptance"), PTS_ACCEPTANCE)
         cells += _num_cell(row.get("_fp_rsi_val"), "{:.0f}")
         cells += _num_cell(row.get("Entry"))
         cells += _num_cell(row.get("SL"))
@@ -244,61 +252,72 @@ def _detail_breakdown(row: pd.Series) -> str:
         f'&nbsp;&nbsp;<span style="font-size:20px;font-weight:700;color:{final_color}">{final_disp}</span></div>'
     )
 
-    _swing_label = row.get("FP_SwingLabel", "") or "—"
-    _swing_line = f"Swing structure: {_swing_label} (+{row.get('_fp_swing_bonus', 0)} pts)"
-    if row.get("FP_SwingLabel") == "LL":
-        _ll_price      = row.get("FP_LLPrice", 0)
-        _ll_prior_low  = row.get("FP_LLPriorLow", 0)
-        _swing_line += f" — LL at {_ll_price} vs prior low {_ll_prior_low}"
-        if row.get("FP_LLReclaimed"):
-            _bars = row.get("FP_LLBarsToReclaim", -1)
-            _bars_disp = f"{_bars} bar{'s' if _bars != 1 else ''}" if _bars is not None and _bars >= 0 else "—"
-            _swing_line += (
-                f" — reclaimed ✅ in {_bars_disp} (confidence {row.get('FP_LLConfidence', 0)}/100"
-                f", divergence {'✅' if row.get('_fp_ll_bullish_divergence') else '❌'}"
-                f", volume {'✅' if row.get('_fp_ll_volume_confirmed') else '❌'})"
-            )
-        else:
-            _swing_line += " — not yet reclaimed, treated as continuation"
-
-    html += _row("1 · Structure", row.get("FP_Structure"), f"{W_STRUCTURE:.0%}", [
+    html += _row("1 · Structure", row.get("FP_Structure"), f"{PTS_STRUCTURE} pts", [
         f"EMA20 &gt; EMA50 &gt; EMA200: {'✅' if row.get('_fp_ema_stack') else '❌'}",
-        f"Price above EMA20: {'✅' if row.get('_fp_price_above_e20') else '❌'}",
+        f"EMA20 rising: {'✅' if row.get('_fp_ema20_rising') else '❌'} · "
+        f"EMA50 rising: {'✅' if row.get('_fp_ema50_rising') else '❌'} · "
         f"EMA200 rising: {'✅' if row.get('_fp_ema200_rising') else '❌'}",
-        _swing_line,
+        f"Price above EMA20: {'✅' if row.get('_fp_price_above_e20') else '❌'}",
+        f"Swing structure: {row.get('FP_SwingLabel', '') or '—'} · "
+        f"HH/HL intact: {'✅' if row.get('_fp_hh_hl_intact') else '❌'} · "
+        f"No breakdown (price &gt; EMA200): {'✅' if row.get('_fp_no_breakdown') else '❌'}",
     ])
-    html += _row("2 · Acceptance", row.get("FP_Acceptance"), f"{W_ACCEPTANCE:.0%}", [
-        f"POC {row.get('FP_POC','—')} · VAH {row.get('FP_VAH','—')} · VAL {row.get('FP_VAL','—')}",
-        f"Price above POC: {'✅' if row.get('_fp_above_poc') else '❌'}",
-        f"Price above rising VWAP: {'✅' if (row.get('_fp_above_vwap') and row.get('_fp_vwap_rising')) else '❌'} (VWAP {row.get('FP_VWAP','—')})",
+    html += _row("2 · Acceptance", row.get("FP_Acceptance"), f"{PTS_ACCEPTANCE} pts", [
+        f"POC {row.get('FP_POC','—')} · VAH {row.get('FP_VAH','—')} · VAL {row.get('FP_VAL','—')} · VWAP {row.get('FP_VWAP','—')}",
+        f"Above POC: {'✅' if row.get('_fp_above_poc') else '❌'} · "
+        f"Above VWAP: {'✅' if row.get('_fp_above_vwap') else '❌'} · "
+        f"Accepted above Value Area: {'✅' if row.get('_fp_accepted_above_va') else '❌'}",
+        f"Holding above acceptance zone (3 bars): {'✅' if row.get('_fp_holding_above_zone') else '❌'}",
+        f"OBV: {row.get('FP_OBV','—')} · rising: {'✅' if row.get('_fp_obv_trend_rising') else '❌'} · "
+        f"leading price: {'✅' if row.get('_fp_obv_leading_price') else '❌'}",
     ])
-    html += _row("3 · Leadership", row.get("FP_Leadership"), f"{W_LEADERSHIP:.0%}", [
-        f"3M RS vs NIFTY: {row.get('FP_RS3m','—')}%",
-        f"6M RS vs NIFTY: {row.get('FP_RS6m','—')}%",
+    html += _row("3 · Leadership", row.get("FP_Leadership"), f"{PTS_LEADERSHIP} pts", [
+        f"3M RS vs NIFTY: {row.get('FP_RS3m','—')}% · 6M RS vs NIFTY: {row.get('FP_RS6m','—')}%",
         f"Relative momentum: {row.get('FP_RelMomentum','—')}%",
+        f"Sector leadership: neutral placeholder (no sector benchmark feed wired in yet)",
+        f"(Volume-vs-20d-avg evidence lives in Momentum only — see below)",
     ])
-    html += _row("4 · Momentum (Execution Quality)", row.get("FP_Momentum"), f"{W_MOMENTUM:.0%}", [
-        f"Stoch %K/%D: {row.get('FP_StochK','—')} / {row.get('FP_StochD','—')} · cross/re-ignition: {'✅' if row.get('_fp_stoch_cross_up') else '❌'}",
+    html += _row("4 · Momentum (today's trigger)", row.get("FP_Momentum"), f"{PTS_MOMENTUM} pts", [
+        f"Stoch %K/%D: {row.get('FP_StochK','—')} / {row.get('FP_StochD','—')} · "
+        f"fresh re-ignition: {'✅' if row.get('_fp_fresh_stoch_reignition') else '❌'}",
         f"RSI(14): {row.get('_fp_rsi_val','—')} · &gt; 50: {'✅' if row.get('_fp_rsi_above_50') else '❌'}",
-        f"VWAP touch found: {'✅' if row.get('_fp_vwap_touch_found') else '❌'} · "
-        f"touch bar: {row.get('_fp_touch_bar','—')} bars ago · "
-        f"touch distance: {row.get('_fp_touch_distance_atr','—')} ATR",
-        f"Returned above VWAP: {'✅' if row.get('_fp_returned_above_vwap') else '❌'} · "
-        f"reaction score: {row.get('_fp_reaction_score','—')} / 100 · "
-        f"close position: {row.get('_fp_close_position_score','—')} / 100",
-        f"Stoch cross found: {'✅' if row.get('_fp_stoch_cross_found') else '❌'} · "
-        f"cross bar: {row.get('_fp_cross_bar','—')} bars ago · "
-        f"confluence gap: {row.get('_fp_confluence_gap','—')} bars",
-        f"Confluence: {'✅' if row.get('_fp_vwap_stoch_confluence') else '❌'} · "
-        f"pattern age: {row.get('_fp_pattern_age','—')} bars · "
-        f"momentum bonus: +{row.get('_fp_momentum_bonus', 0)} pts",
-        "— Execution-quality penalty (merged Risk) —",
-        f"Distance from EMA20: {row.get('FP_DistEMA20Pct','—')}% · "
-        f"Distance from VWAP: {row.get('FP_DistVWAPPct','—')}% · "
-        f"ATR extension: {row.get('FP_ATRExtension','—')} ATRs",
-        f"Exhaustion candle: {'⚠️ yes' if row.get('FP_ExhaustionCandle') else 'no'} · "
-        f"Parabolic move: {'⚠️ yes' if row.get('FP_ParabolicMove') else 'no'} · "
-        f"Total penalty applied: -{row.get('FP_ExtensionPenalty', 0)} pts",
+        f"VWAP reaction: +{row.get('_fp_vwap_reaction_pts', 0)}/7 pts · "
+        f"returned above VWAP: {'✅' if row.get('_fp_returned_above_vwap') else '❌'} · "
+        f"reaction score: {row.get('_fp_reaction_score','—')}/100",
+        f"Breakout confirmed (close &gt; 20-bar high): {'✅' if row.get('_fp_breakout_confirmed') else '❌'}",
+        f"Volume expansion (&gt;1.5x 20d avg — sole owner of volume-today evidence): "
+        f"{'✅' if row.get('_fp_volume_expansion') else '❌'} (+11)",
+    ])
+    _ll_line = f"Swing label: {row.get('FP_SwingLabel', '') or '—'}"
+    if row.get("_fp_r_actionable_ll"):
+        _ll_line += (
+            f" — LL at {row.get('FP_LLPrice', 0)} vs prior low {row.get('FP_LLPriorLow', 0)}"
+            f" (distance {row.get('FP_LLDistanceATR', 0)} ATR · informational confidence {row.get('FP_LLConfidence', 0)}/100)"
+        )
+        _bars = row.get("FP_LLBarsToReclaim", -1)
+        _bars_disp = f"{_bars} bar{'s' if _bars != 1 else ''}" if _bars is not None and _bars >= 0 else "—"
+        _ll_line += f" — spring confirmed, reclaimed in {_bars_disp}"
+    else:
+        _ll_line += " — no actionable LL spring to evaluate (Opportunity Quality Bonus scores 0)"
+    _dist_pts = row.get("_fp_r_distance_atr_pts", 0) or 0
+    html += _row("Opportunity Quality Bonus (layered on the 90pt base)", row.get("FP_Reversal"), f"{PTS_REVERSAL} pts", [
+        _ll_line,
+        f"Actionable LL confirmed: {'✅' if row.get('_fp_r_actionable_ll') else '❌'} (+2) · "
+        f"LL remains valid (never re-broken): {'✅' if row.get('_fp_r_ll_defended') else '❌'} (+2)",
+        f"Distance from actionable LL (ATR-based, graduated by proximity — closer = higher): "
+        f"{'✅ in band' if row.get('_fp_r_distance_atr_ok') else '❌ out of band'} (+{_dist_pts}/4)",
+        f"Institutional confirmation (volume at LL): {'✅' if row.get('_fp_r_high_volume_confirmation') else '❌'} (+2)",
+    ])
+    html += _row("Risk Engine (independent deduction)", -row.get("FP_Risk", 0) if _is_valid_num(row.get("FP_Risk")) else None,
+                 f"max -{PTS_RISK_MAX_DEDUCTION} pts", [
+        f"EMA20 extension &gt; 2.5%: {'⚠️ yes (-5)' if row.get('_fp_risk_ema20_extension') else 'no'} "
+        f"(dist {row.get('FP_DistEMA20Pct','—')}%)",
+        f"ATR extension &gt; 0.8 ATR: {'⚠️ yes (-5)' if row.get('_fp_risk_atr_extension') else 'no'} "
+        f"({row.get('FP_ATRExtension','—')} ATRs)",
+        f"Exhaustion candle: {'⚠️ yes (-4)' if row.get('_fp_risk_exhaustion_candle') else 'no'}",
+        f"Parabolic move: {'⚠️ yes (-3)' if row.get('_fp_risk_parabolic_move') else 'no'}",
+        f"Climactic volume: {'⚠️ yes (-3)' if row.get('_fp_risk_climactic_volume') else 'no'}",
+        f"Total deduction applied: -{row.get('FP_Risk', 0)} pts",
     ])
     return html
 
@@ -309,7 +328,7 @@ def render(settings: dict | None = None):
         '<div class="fp-wrap">'
         '<div class="fp-header">'
         '<span class="fp-title">🏛️ Five Pillars Ranking</span>'
-        '<span class="fp-subtitle">Structure · Acceptance · Leadership · Momentum</span>'
+        '<span class="fp-subtitle">Structure · Acceptance · Reversal · Leadership · Momentum − Risk</span>'
         '</div></div>',
         unsafe_allow_html=True,
     )
@@ -330,17 +349,19 @@ def render(settings: dict | None = None):
         st.warning(
             "This scan was run before the Five Pillars engine was added. "
             "Go to **Live Scanner** and click **▶ Run Scan** again to populate "
-            "Structure / Acceptance / Leadership / Momentum scores."
+            "Structure / Acceptance / Reversal / Leadership / Momentum scores."
         )
         return
 
     # ── Weight legend ────────────────────────────────────────────
     st.markdown(
         '<div class="fp-weights">'
-        f'<span class="fp-weight-pill">Structure <b>{int(W_STRUCTURE*100)}%</b></span>'
-        f'<span class="fp-weight-pill">Acceptance <b>{int(W_ACCEPTANCE*100)}%</b></span>'
-        f'<span class="fp-weight-pill">Leadership <b>{int(W_LEADERSHIP*100)}%</b></span>'
-        f'<span class="fp-weight-pill">Momentum <b>{int(W_MOMENTUM*100)}%</b></span>'
+        f'<span class="fp-weight-pill">Structure <b>{PTS_STRUCTURE} pts</b></span>'
+        f'<span class="fp-weight-pill">Acceptance <b>{PTS_ACCEPTANCE} pts</b></span>'
+        f'<span class="fp-weight-pill">Opp Bonus <b>+{PTS_REVERSAL} pts</b></span>'
+        f'<span class="fp-weight-pill">Leadership <b>{PTS_LEADERSHIP} pts</b></span>'
+        f'<span class="fp-weight-pill">Momentum <b>{PTS_MOMENTUM} pts</b></span>'
+        f'<span class="fp-weight-pill">Risk <b>max -{PTS_RISK_MAX_DEDUCTION} pts</b></span>'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -365,13 +386,13 @@ def render(settings: dict | None = None):
     with sort_col1:
         sort_by = st.selectbox(
             "Sort by", ["Final Score ↓", "Structure ↓", "Acceptance ↓",
-                        "Leadership ↓", "Momentum ↓"],
+                        "Opp Bonus ↓", "Leadership ↓", "Momentum ↓"],
             key="fp_sort_by",
         )
     sort_map = {
         "Final Score ↓": "FP_FinalScore", "Structure ↓": "FP_Structure",
-        "Acceptance ↓": "FP_Acceptance", "Leadership ↓": "FP_Leadership",
-        "Momentum ↓": "FP_Momentum",
+        "Acceptance ↓": "FP_Acceptance", "Opp Bonus ↓": "FP_Reversal",
+        "Leadership ↓": "FP_Leadership", "Momentum ↓": "FP_Momentum",
     }
     sort_field = sort_map.get(sort_by, "FP_FinalScore")
 
