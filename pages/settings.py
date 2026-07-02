@@ -72,6 +72,9 @@ DEFAULTS = {
     "ic_min_reaction_score":     0,
     "ic_momentum_weight":        15,
     "ic_confluence_weight":      10,
+    # ── Backtest engine default (Backtest page reads this to pick its
+    # initial Signal Source; still overridable per-run on that page) ──
+    "bt_default_engine":         "scanner",
 }
 
 _TRADING_STYLE_DEFAULTS = {
@@ -639,6 +642,33 @@ def _tab_advanced() -> None:
 def _tab_system() -> None:
     supabase_ok = _is_available()
 
+    # ── Default Backtest Engine ───────────────────────────────────
+    # Persists which signal source the Backtest page opens with. The
+    # Backtest page's own selector still allows a per-run override —
+    # this only sets the default so it doesn't reset to Scanner every
+    # session.
+    _label("Default Backtest Engine")
+    _ENGINE_OPTIONS = {
+        "scanner":      "📡 Scanner (Decision Engine)",
+        "five_pillars": "🏛️ Five Pillars",
+        "cci_master":   "📐 CCI Master",
+    }
+    _cur_engine = _g("bt_default_engine", "scanner")
+    _engine_choice = st.selectbox(
+        "Default Backtest Engine",
+        options=list(_ENGINE_OPTIONS.keys()),
+        format_func=lambda k: _ENGINE_OPTIONS[k],
+        index=list(_ENGINE_OPTIONS.keys()).index(_cur_engine) if _cur_engine in _ENGINE_OPTIONS else 0,
+        key="w_bt_default_engine",
+        label_visibility="collapsed",
+    )
+    _s("bt_default_engine", _engine_choice)
+    st.caption(
+        "Which engine the Backtest page's Signal Source defaults to. "
+        "Five Pillars and Scanner (Decision Engine) use different scoring "
+        "logic — pick whichever you're actively iterating on."
+    )
+
     # Connection status
     if supabase_ok:
         st.markdown(
@@ -815,4 +845,5 @@ def render() -> dict:
         "ic_min_reaction_score":     ss.get("ic_min_reaction_score",     DEFAULTS["ic_min_reaction_score"]),
         "ic_momentum_weight":        ss.get("ic_momentum_weight",        DEFAULTS["ic_momentum_weight"]),
         "ic_confluence_weight":      ss.get("ic_confluence_weight",      DEFAULTS["ic_confluence_weight"]),
+        "bt_default_engine":         ss.get("bt_default_engine",         DEFAULTS["bt_default_engine"]),
     }
