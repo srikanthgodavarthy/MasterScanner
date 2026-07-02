@@ -21,14 +21,19 @@ import streamlit as st
 import pandas as pd
 
 from utils.pillar_engine import (
-    CLASS_EXECUTE, CLASS_WATCH, CLASS_DEVELOPING, CLASS_AVOID,
+    CLASS_ELITE, CLASS_EXECUTE, CLASS_WATCH, CLASS_DEVELOPING, CLASS_AVOID,
     PTS_STRUCTURE, PTS_ACCEPTANCE, PTS_REVERSAL, PTS_LEADERSHIP, PTS_MOMENTUM,
     PTS_RISK_MAX_DEDUCTION,
+    evaluate_promotion,
 )
 
 # ── Visual constants (matches pages/scanner.py dark theme) ─────────
-_CLASS_ORDER = [CLASS_EXECUTE, CLASS_WATCH, CLASS_DEVELOPING, CLASS_AVOID]
+# Elite sits above Execute — it is never a replacement for the base
+# engine's classification, only an additional tier layered on top of
+# Execute-tier stocks that also clear all four Promotion Engine gates.
+_CLASS_ORDER = [CLASS_ELITE, CLASS_EXECUTE, CLASS_WATCH, CLASS_DEVELOPING, CLASS_AVOID]
 _CLASS_STYLE = {
+    CLASS_ELITE:      ("#f5c542", "🌟 Elite",      "Execute + all Promotion Engine gates — super confidence"),
     CLASS_EXECUTE:    ("#3fb950", "⚡ Execute",    "Momentum confirmed"),
     CLASS_WATCH:      ("#d29922", "👁 Watch",      "Structure intact — waiting for trigger"),
     CLASS_DEVELOPING: ("#58a6ff", "🌱 Developing", "Trend emerging"),
@@ -226,7 +231,7 @@ def _build_table_html(df: pd.DataFrame) -> str:
 def _detail_breakdown(row: pd.Series) -> str:
     sym = row.get("Stock", "—")
     final = row.get("FP_FinalScore", 0)
-    cls   = row.get("FP_Class", "")
+    cls   = row.get("FP_EffectiveClass", row.get("FP_Class", ""))
     color, label, note = _CLASS_STYLE.get(str(cls), ("#484f58", str(cls), ""))
     final_disp = str(int(final)) if _is_valid_num(final) else "—"
     final_color = _pillar_color(float(final)) if _is_valid_num(final) else "#484f58"
@@ -319,6 +324,38 @@ def _detail_breakdown(row: pd.Series) -> str:
         f"Climactic volume: {'⚠️ yes (-3)' if row.get('_fp_risk_climactic_volume') else 'no'}",
         f"Total deduction applied: -{row.get('FP_Risk', 0)} pts",
     ])
+
+    # ── Promotion Engine — Execute -> Elite ─────────────────────
+    promo_passed = row.get("_fp_promo_gates_passed", 0)
+    promo_total  = row.get("_fp_promo_gates_total", 4)
+    promoted     = bool(row.get("FP_Elite", False))
+    regime_val   = row.get("_fp_promo_regime", "UNKNOWN")
+    promo_color  = "#f5c542" if promoted else "#484f58"
+    promo_reason = row.get("_fp_promo_reasons", "")
+    promo_subs = [
+        f"1. LL Opportunity (confirmed + defended + in-band spring): "
+        f"{'✅' if row.get('_fp_promo_gate_ll') else '❌'}",
+        f"2. Institutional Accumulation (OBV rising &amp; leading + zone held + volume at low): "
+        f"{'✅' if row.get('_fp_promo_gate_institutional') else '❌'}",
+        f"3. Market Regime (TREND required — current: {regime_val}): "
+        f"{'✅' if row.get('_fp_promo_gate_regime') else '❌'}",
+        f"4. Risk Acceptable (zero risk deductions): "
+        f"{'✅' if row.get('_fp_promo_gate_risk') else '❌'}",
+        f"Verdict: {promo_reason}",
+    ]
+    promo_subs_html = "".join(
+        f'<div style="font-size:10.5px;color:var(--muted);margin-top:2px">{s}</div>' for s in promo_subs
+    )
+    verdict_disp = "🌟 ELITE" if promoted else f"{promo_passed}/{promo_total}"
+    html += (
+        f'<div style="background:var(--bg1);border:1px solid var(--border);border-radius:8px;'
+        f'padding:10px 14px;margin-bottom:8px;border-left:3px solid {promo_color}">'
+        f'<div style="display:flex;justify-content:space-between;align-items:baseline">'
+        f'<span style="font-size:11px;font-weight:700;color:var(--text)">🚀 Promotion Engine (Execute → Elite)</span>'
+        f'<span style="font-size:10px;color:var(--muted)">{promo_total} gates, all required</span>'
+        f'<span style="font-size:18px;font-weight:700;color:{promo_color}">{verdict_disp}</span>'
+        f'</div>{promo_subs_html}</div>'
+    )
     return html
 
 
@@ -328,7 +365,8 @@ def render(settings: dict | None = None):
         '<div class="fp-wrap">'
         '<div class="fp-header">'
         '<span class="fp-title">🏛️ Five Pillars Ranking</span>'
-        '<span class="fp-subtitle">Structure · Acceptance · Reversal · Leadership · Momentum − Risk</span>'
+        '<span class="fp-subtitle">Structure · Acceptance · Reversal · Leadership · Momentum − Risk '
+        '&nbsp;→&nbsp; 🚀 Promotion Engine (Execute → Elite)</span>'
         '</div></div>',
         unsafe_allow_html=True,
     )
@@ -353,6 +391,38 @@ def render(settings: dict | None = None):
         )
         return
 
+    # ── Promotion Engine — Execute -> Elite ─────────────────────
+    # Pure additive overlay computed here in the display layer: it reads
+    # the FP_*/_fp_* columns scanner_engine.py already attached (no
+    # re-scan, no touching scanner_engine.py/decision_engine.py) plus
+    # the market-wide "regime" column pages/scanner.py already attaches
+    # via apply_regime_layer(). The base FP_Class (Execute/Watch/
+    # Developing/Avoid) from the 90-pt engine is never modified.
+    if "FP_EffectiveClass" not in df_aug.columns:
+        _promo_cols = {
+            "FP_Elite": [], "FP_EffectiveClass": [],
+            "_fp_promo_gate_ll": [], "_fp_promo_gate_institutional": [],
+            "_fp_promo_gate_regime": [], "_fp_promo_gate_risk": [],
+            "_fp_promo_gates_passed": [], "_fp_promo_gates_total": [],
+            "_fp_promo_regime": [], "_fp_promo_reasons": [],
+        }
+        for _, _r in df_aug.iterrows():
+            _promo = evaluate_promotion(_r, regime=_r.get("regime"))
+            _base_cls = _r.get("FP_Class", CLASS_AVOID)
+            _eff_cls = CLASS_ELITE if _promo.promoted else _base_cls
+            _promo_cols["FP_Elite"].append(_promo.promoted)
+            _promo_cols["FP_EffectiveClass"].append(_eff_cls)
+            _promo_cols["_fp_promo_gate_ll"].append(_promo.gate_ll_opportunity)
+            _promo_cols["_fp_promo_gate_institutional"].append(_promo.gate_institutional_accumulation)
+            _promo_cols["_fp_promo_gate_regime"].append(_promo.gate_market_regime)
+            _promo_cols["_fp_promo_gate_risk"].append(_promo.gate_risk_acceptable)
+            _promo_cols["_fp_promo_gates_passed"].append(_promo.gates_passed)
+            _promo_cols["_fp_promo_gates_total"].append(_promo.gates_total)
+            _promo_cols["_fp_promo_regime"].append(_promo.regime)
+            _promo_cols["_fp_promo_reasons"].append(_promo.reasons)
+        for _col, _vals in _promo_cols.items():
+            df_aug[_col] = _vals
+
     # ── Weight legend ────────────────────────────────────────────
     st.markdown(
         '<div class="fp-weights">'
@@ -362,12 +432,13 @@ def render(settings: dict | None = None):
         f'<span class="fp-weight-pill">Leadership <b>{PTS_LEADERSHIP} pts</b></span>'
         f'<span class="fp-weight-pill">Momentum <b>{PTS_MOMENTUM} pts</b></span>'
         f'<span class="fp-weight-pill">Risk <b>max -{PTS_RISK_MAX_DEDUCTION} pts</b></span>'
+        f'<span class="fp-weight-pill" style="border-color:#f5c54255">🌟 Elite <b>Execute + 4/4 gates</b></span>'
         '</div>',
         unsafe_allow_html=True,
     )
 
-    # ── Classification counts ───────────────────────────────────
-    counts = df_aug["FP_Class"].value_counts().to_dict()
+    # ── Classification counts (post-promotion) ───────────────────
+    counts = df_aug["FP_EffectiveClass"].value_counts().to_dict()
     cards_html = '<div class="fp-class-grid">'
     for cls in _CLASS_ORDER:
         color, label, note = _CLASS_STYLE[cls]
@@ -402,7 +473,7 @@ def render(settings: dict | None = None):
 
     for tab, cls in zip(tabs, _CLASS_ORDER):
         with tab:
-            subset = df_aug[df_aug["FP_Class"] == cls].copy()
+            subset = df_aug[df_aug["FP_EffectiveClass"] == cls].copy()
             if subset.empty:
                 st.info(f"No {cls} candidates in this scan.")
                 continue
