@@ -401,9 +401,10 @@ def render(settings: dict | None = None):
     if "FP_EffectiveClass" not in df_aug.columns:
         _promo_cols = {
             "FP_Elite": [], "FP_EffectiveClass": [],
-            "_fp_promo_gate_ll": [], "_fp_promo_gate_institutional": [],
-            "_fp_promo_gate_regime": [], "_fp_promo_gate_risk": [],
+            "_fp_promo_gate_ll": [], "_fp_promo_gate_reward_risk": [],
+            "_fp_promo_gate_institutional": [], "_fp_promo_gate_regime": [],
             "_fp_promo_gates_passed": [], "_fp_promo_gates_total": [],
+            "_fp_promo_confidence_pct": [], "_fp_promo_reward_risk_ratio": [],
             "_fp_promo_regime": [], "_fp_promo_reasons": [],
         }
         for _, _r in df_aug.iterrows():
@@ -413,11 +414,13 @@ def render(settings: dict | None = None):
             _promo_cols["FP_Elite"].append(_promo.promoted)
             _promo_cols["FP_EffectiveClass"].append(_eff_cls)
             _promo_cols["_fp_promo_gate_ll"].append(_promo.gate_ll_opportunity)
-            _promo_cols["_fp_promo_gate_institutional"].append(_promo.gate_institutional_accumulation)
+            _promo_cols["_fp_promo_gate_reward_risk"].append(_promo.gate_reward_risk)
+            _promo_cols["_fp_promo_gate_institutional"].append(_promo.gate_institutional_confirmation)
             _promo_cols["_fp_promo_gate_regime"].append(_promo.gate_market_regime)
-            _promo_cols["_fp_promo_gate_risk"].append(_promo.gate_risk_acceptable)
             _promo_cols["_fp_promo_gates_passed"].append(_promo.gates_passed)
             _promo_cols["_fp_promo_gates_total"].append(_promo.gates_total)
+            _promo_cols["_fp_promo_confidence_pct"].append(_promo.confidence_pct)
+            _promo_cols["_fp_promo_reward_risk_ratio"].append(_promo.reward_risk_ratio)
             _promo_cols["_fp_promo_regime"].append(_promo.regime)
             _promo_cols["_fp_promo_reasons"].append(_promo.reasons)
         for _col, _vals in _promo_cols.items():
