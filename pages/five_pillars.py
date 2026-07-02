@@ -30,10 +30,11 @@ from utils.pillar_engine import (
 # ── Visual constants (matches pages/scanner.py dark theme) ─────────
 # Elite sits above Execute — it is never a replacement for the base
 # engine's classification, only an additional tier layered on top of
-# Execute-tier stocks that also clear all four Promotion Engine gates.
+# Execute-tier stocks that also clear the Promotion Engine (2 critical
+# gates + at least 1 of 2 optional gates — see utils/pillar_engine.py).
 _CLASS_ORDER = [CLASS_ELITE, CLASS_EXECUTE, CLASS_WATCH, CLASS_DEVELOPING, CLASS_AVOID]
 _CLASS_STYLE = {
-    CLASS_ELITE:      ("#f5c542", "🌟 Elite",      "Execute + all Promotion Engine gates — super confidence"),
+    CLASS_ELITE:      ("#f5c542", "🌟 Elite",      "Execute + Promotion Engine (critical gates + confirmation)"),
     CLASS_EXECUTE:    ("#3fb950", "⚡ Execute",    "Momentum confirmed"),
     CLASS_WATCH:      ("#d29922", "👁 Watch",      "Structure intact — waiting for trigger"),
     CLASS_DEVELOPING: ("#58a6ff", "🌱 Developing", "Trend emerging"),
@@ -305,12 +306,22 @@ def _detail_breakdown(row: pd.Series) -> str:
     else:
         _ll_line += " — no actionable LL spring to evaluate (Opportunity Quality Bonus scores 0)"
     _dist_pts = row.get("_fp_r_distance_atr_pts", 0) or 0
+    _bsr = row.get("_fp_r_bars_since_reclaim", -1)
+    _vert = bool(row.get("_fp_r_vertical_extension", False))
+    _pace_line = None
+    if _bsr is not None and _bsr >= 0:
+        _pace_line = (
+            f"Pace since reclaim: {_bsr} bar{'s' if _bsr != 1 else ''} "
+            f"({'⚠️ near-vertical — distance pts shaved -1' if _vert else 'orderly — no adjustment'})"
+        )
+    _dist_subs = [_pace_line] if _pace_line else []
     html += _row("Opportunity Quality Bonus (layered on the 90pt base)", row.get("FP_Reversal"), f"{PTS_REVERSAL} pts", [
         _ll_line,
         f"Actionable LL confirmed: {'✅' if row.get('_fp_r_actionable_ll') else '❌'} (+2) · "
         f"LL remains valid (never re-broken): {'✅' if row.get('_fp_r_ll_defended') else '❌'} (+2)",
-        f"Distance from actionable LL (ATR-based, graduated by proximity — closer = higher): "
+        f"Distance from actionable LL (ATR-based, graduated by proximity, pace-adjusted): "
         f"{'✅ in band' if row.get('_fp_r_distance_atr_ok') else '❌ out of band'} (+{_dist_pts}/4)",
+        *_dist_subs,
         f"Institutional confirmation (volume at LL): {'✅' if row.get('_fp_r_high_volume_confirmation') else '❌'} (+2)",
     ])
     html += _row("Risk Engine (independent deduction)", -row.get("FP_Risk", 0) if _is_valid_num(row.get("FP_Risk")) else None,
@@ -326,33 +337,42 @@ def _detail_breakdown(row: pd.Series) -> str:
     ])
 
     # ── Promotion Engine — Execute -> Elite ─────────────────────
-    promo_passed = row.get("_fp_promo_gates_passed", 0)
-    promo_total  = row.get("_fp_promo_gates_total", 4)
-    promoted     = bool(row.get("FP_Elite", False))
-    regime_val   = row.get("_fp_promo_regime", "UNKNOWN")
-    promo_color  = "#f5c542" if promoted else "#484f58"
-    promo_reason = row.get("_fp_promo_reasons", "")
+    # CRITICAL: LL Opportunity + Reward>Risk (both required).
+    # OPTIONAL: Institutional Confirmation + Market Regime (>=1 of 2).
+    # Confidence % is a separate, simpler read: plain proportion of all
+    # 4 checks true — "what the trade feels like" — shown alongside,
+    # not instead of, the promotion verdict.
+    promoted      = bool(row.get("FP_Elite", False))
+    confidence    = row.get("_fp_promo_confidence_pct", 0)
+    regime_val    = row.get("_fp_promo_regime", "UNKNOWN")
+    rr_ratio      = row.get("_fp_promo_reward_risk_ratio", 0)
+    promo_color   = "#f5c542" if promoted else "#484f58"
+    promo_reason  = row.get("_fp_promo_reasons", "")
+    g_ll   = bool(row.get("_fp_promo_gate_ll"))
+    g_rr   = bool(row.get("_fp_promo_gate_reward_risk"))
+    g_inst = bool(row.get("_fp_promo_gate_institutional"))
+    g_reg  = bool(row.get("_fp_promo_gate_regime"))
     promo_subs = [
-        f"1. LL Opportunity (confirmed + defended + in-band spring): "
-        f"{'✅' if row.get('_fp_promo_gate_ll') else '❌'}",
-        f"2. Institutional Accumulation (OBV rising &amp; leading + zone held + volume at low): "
-        f"{'✅' if row.get('_fp_promo_gate_institutional') else '❌'}",
-        f"3. Market Regime (TREND required — current: {regime_val}): "
-        f"{'✅' if row.get('_fp_promo_gate_regime') else '❌'}",
-        f"4. Risk Acceptable (zero risk deductions): "
-        f"{'✅' if row.get('_fp_promo_gate_risk') else '❌'}",
+        f"CRITICAL · LL Opportunity (confirmed + defended + good distance band, pace-adjusted): "
+        f"{'✅' if g_ll else '❌'}",
+        f"CRITICAL · Reward &gt; Risk (Target−Entry vs Entry−Stop, ratio {rr_ratio}): "
+        f"{'✅' if g_rr else '❌'}",
+        f"OPTIONAL (≥1 of 2) · Institutional Confirmation (OBV rising &amp; leading + zone held + volume at low): "
+        f"{'✅' if g_inst else '❌'}",
+        f"OPTIONAL (≥1 of 2) · Market Regime (TREND required — current: {regime_val}): "
+        f"{'✅' if g_reg else '❌'}",
         f"Verdict: {promo_reason}",
     ]
     promo_subs_html = "".join(
         f'<div style="font-size:10.5px;color:var(--muted);margin-top:2px">{s}</div>' for s in promo_subs
     )
-    verdict_disp = "🌟 ELITE" if promoted else f"{promo_passed}/{promo_total}"
+    verdict_disp = "🌟 ELITE" if promoted else f"{confidence}%"
     html += (
         f'<div style="background:var(--bg1);border:1px solid var(--border);border-radius:8px;'
         f'padding:10px 14px;margin-bottom:8px;border-left:3px solid {promo_color}">'
         f'<div style="display:flex;justify-content:space-between;align-items:baseline">'
         f'<span style="font-size:11px;font-weight:700;color:var(--text)">🚀 Promotion Engine (Execute → Elite)</span>'
-        f'<span style="font-size:10px;color:var(--muted)">{promo_total} gates, all required</span>'
+        f'<span style="font-size:10px;color:var(--muted)">2 critical + 1-of-2 optional</span>'
         f'<span style="font-size:18px;font-weight:700;color:{promo_color}">{verdict_disp}</span>'
         f'</div>{promo_subs_html}</div>'
     )
@@ -435,7 +455,7 @@ def render(settings: dict | None = None):
         f'<span class="fp-weight-pill">Leadership <b>{PTS_LEADERSHIP} pts</b></span>'
         f'<span class="fp-weight-pill">Momentum <b>{PTS_MOMENTUM} pts</b></span>'
         f'<span class="fp-weight-pill">Risk <b>max -{PTS_RISK_MAX_DEDUCTION} pts</b></span>'
-        f'<span class="fp-weight-pill" style="border-color:#f5c54255">🌟 Elite <b>Execute + 4/4 gates</b></span>'
+        f'<span class="fp-weight-pill" style="border-color:#f5c54255">🌟 Elite <b>Execute + critical + 1-of-2</b></span>'
         '</div>',
         unsafe_allow_html=True,
     )
