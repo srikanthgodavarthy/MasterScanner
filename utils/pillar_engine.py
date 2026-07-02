@@ -216,6 +216,19 @@ class PillarResult:
     m_breakout_confirmed:          bool  = False
     m_volume_expansion:             bool  = False
     m_reaction_score:                 float = 0.0
+    # VWAP Reclaim pattern diagnostics (from continuation_patterns.detect_vwap_reclaim's
+    # metadata dict — previously computed but discarded; now exposed so the backtest
+    # engine's VWAP Reclaim Analysis report reflects real values instead of defaults).
+    m_vwap_touch_found:               bool  = False
+    m_touch_bar:                        int   = -1     # bars-ago of the VWAP touch, -1 = none found
+    m_touch_distance_atr:                 float = 0.0
+    m_reaction_strength:                    float = 0.0  # blended 0-100 quality score (VWAP + candle position)
+    m_close_position_score:                   float = 0.0
+    m_cross_bar:                                 int   = -1     # bars-ago of stoch %K/%D crossover, -1 = none
+    m_confluence:                                  bool  = False  # touch bar and stoch-cross bar close together
+    m_pattern_age:                                   int   = -1
+    m_stoch_cross_found:                               bool  = False
+    m_vwap_rising:                                       bool  = False
 
     # ── Risk sub-fields (independent engine, max -20) ──────────────
     risk_ema20_extension:   bool = False
@@ -660,7 +673,21 @@ def _score_momentum(
     high: pd.Series, low: pd.Series, close: pd.Series,
     rsi_s: pd.Series, volume: pd.Series, atr_s: pd.Series,
     vol_avg: pd.Series | None = None,
+    e20: pd.Series | None = None,
+    e50: pd.Series | None = None,
+    cfg:  dict | None = None,
 ) -> tuple[int, dict]:
+    """
+    cfg (optional) lets callers override the VWAP Reclaim pattern's tuning
+    knobs and requirement toggles -- the same values exposed as the
+    "Institutional Continuation (VWAP Reclaim)" settings on the Settings
+    page (ic_* keys). Passing cfg=None reproduces prior behavior except
+    for require_ema_trend/require_rising_vwap, which now compute real
+    flags instead of the previous hardcoded True passthrough -- set
+    ic_require_ema_trend / ic_require_rising_vwap to False to bypass those
+    checks and restore the old lenient behavior.
+    """
+    cfg = cfg or {}
     k_s, d_s = _stochastic(high, low, close)
 
     cur_k   = _safe_last(k_s, default=50.0)
@@ -675,23 +702,57 @@ def _score_momentum(
     rsi_above_50 = cur_rsi > 50
 
     # ── VWAP reaction / return-above-VWAP (today's trigger) ──────────────
-    vwap_series = _anchored_vwap(high, low, close, volume)
-    reclaim_result = _cp_detect_vwap_reclaim(
-        low=low, close=close, high=high, volume=volume, atr_s=atr_s,
-        k_s=k_s, d_s=d_s, vwap_series=vwap_series,
-        lookback=RECLAIM_LOOKBACK, atr_mult=RECLAIM_ATR_TOL,
-        reaction_max_atr=RECLAIM_REACTION_CAP,
-        confluence_bars=RECLAIM_CONFLUENCE_BARS,
-        require_bullish_return=True, ema20_gt_ema50=True, vwap_rising=True,
+    vwap_enabled = bool(cfg.get("ic_enable_vwap_reclaim", True))
+    vwap_series  = _anchored_vwap(high, low, close, volume)
+
+    # Actual computed VWAP direction -- always available as a diagnostic,
+    # regardless of whether it's enforced as a gate below.
+    _vwap_rising_actual = bool(
+        len(vwap_series) > 10
+        and _safe_last(vwap_series) > _safe_at(vwap_series, -11, default=_safe_last(vwap_series))
     )
-    meta = reclaim_result.get("metadata", {})
+
+    if not vwap_enabled:
+        reclaim_result = {"metadata": {}, "reaction_strength": 0.0, "confirmed": False}
+    else:
+        # Real trend-filter inputs (previously hardcoded True regardless of
+        # actual market structure). Each is only enforced when its matching
+        # ic_require_* setting is True; set to False to bypass that check.
+        if bool(cfg.get("ic_require_ema_trend", True)) and e20 is not None and e50 is not None:
+            _ema20_gt_ema50 = bool(_safe_last(e20) > _safe_last(e50))
+        else:
+            _ema20_gt_ema50 = True
+
+        _vwap_rising_gate = _vwap_rising_actual if bool(cfg.get("ic_require_rising_vwap", True)) else True
+
+        reclaim_result = _cp_detect_vwap_reclaim(
+            low=low, close=close, high=high, volume=volume, atr_s=atr_s,
+            k_s=k_s, d_s=d_s, vwap_series=vwap_series,
+            lookback=int(cfg.get("ic_vwap_touch_lookback", RECLAIM_LOOKBACK)),
+            atr_mult=float(cfg.get("ic_vwap_touch_atr_mult", RECLAIM_ATR_TOL)),
+            reaction_max_atr=float(cfg.get("ic_reaction_max_atr", RECLAIM_REACTION_CAP)),
+            confluence_bars=int(cfg.get("ic_confluence_window", RECLAIM_CONFLUENCE_BARS)),
+            require_bullish_return=bool(cfg.get("ic_require_bullish_return", True)),
+            ema20_gt_ema50=_ema20_gt_ema50, vwap_rising=_vwap_rising_gate,
+        )
+
+    meta = reclaim_result.get("metadata", {}) or {}
     reaction_str = float(reclaim_result.get("reaction_strength", 0.0) or 0.0)
     returned_above_vwap = bool(reclaim_result.get("confirmed", False))
+
+    # Optional post-hoc quality floor: ic_min_reaction_score.
+    _min_reaction_score = float(cfg.get("ic_min_reaction_score", 0) or 0)
+    if returned_above_vwap and reaction_str < _min_reaction_score:
+        returned_above_vwap = False
 
     vwap_reaction_pts = 0
     if returned_above_vwap:
         frac = float(np.clip(reaction_str / 100.0, 0.0, 1.0))
         vwap_reaction_pts = int(round(frac * 7))
+
+    _touch_bar  = meta.get("touch_bar")
+    _cross_bar  = meta.get("cross_bar")
+    _confluence = bool(cfg.get("ic_enable_vwap_stoch_conf", True)) and bool(meta.get("confluence", False))
 
     # ── Breakout confirmation: today's close > prior N-bar high ──────────
     breakout_confirmed = False
@@ -725,6 +786,17 @@ def _score_momentum(
         "m_breakout_confirmed": breakout_confirmed,
         "m_volume_expansion": volume_expansion,
         "m_reaction_score": float(meta.get("reaction_score", 0.0) or 0.0),
+        # VWAP Reclaim diagnostics (now real values — see PillarResult docstring)
+        "m_vwap_touch_found":    bool(meta.get("vwap_touch_found", False)),
+        "m_touch_bar":           int(_touch_bar) if _touch_bar is not None else -1,
+        "m_touch_distance_atr":  float(meta.get("touch_distance_atr", 0.0) or 0.0),
+        "m_reaction_strength":   reaction_str,
+        "m_close_position_score":float(meta.get("close_position_score", 0.0) or 0.0),
+        "m_cross_bar":           int(_cross_bar) if _cross_bar is not None else -1,
+        "m_confluence":          _confluence,
+        "m_pattern_age":         int(meta.get("pattern_age")) if meta.get("pattern_age") is not None else -1,
+        "m_stoch_cross_found":   bool(meta.get("stoch_cross_found", False)),
+        "m_vwap_rising":         _vwap_rising_actual,
     }
 
 
@@ -805,13 +877,20 @@ def _classify(final_score: int) -> tuple[str, str]:
 #  PUBLIC ENTRY POINT
 # ══════════════════════════════════════════════════════════════════
 
-def compute_pillars_from_ia(df: pd.DataFrame, ia) -> PillarResult:
+def compute_pillars_from_ia(df: pd.DataFrame, ia, cfg: dict | None = None) -> PillarResult:
     """
     Compute the Five Pillars score using the raw OHLCV df and the
     IndicatorArrays (`ia`) already built by build_indicators() inside
-    score_stock(). No re-fetching, no re-computation of EMA/RSI/ATR —
+    score_stock(). No re-fetching, no re-computation of EMA/RSI/ATR --
     only the new pieces (VWAP, Volume Profile, OBV, RS-3M/6M, breakout/
     volume-expansion, Risk) are computed here.
+
+    cfg (optional): the "Institutional Continuation (VWAP Reclaim)" ic_*
+    settings dict (see pages/settings.py). Pass the live settings dict (or
+    a subset of it) so the Momentum pillar's VWAP Reclaim sub-pattern
+    respects the same tuning the person configured -- the scanner and the
+    Five Pillars backtest should use identical settings for identical
+    scores; without this they silently drift apart.
     """
     try:
         close, high, low, volume = ia.c, ia.h, ia.l, ia.v
@@ -828,7 +907,8 @@ def compute_pillars_from_ia(df: pd.DataFrame, ia) -> PillarResult:
         r_score, r_sub = _score_reversal(close, low, high, open_, volume,
                                           ph_series, pl_series, osc, ia.atr_s, vol_avg)
         l_score, l_sub = _score_leadership(close, ia.nifty_aligned)
-        m_score, m_sub = _score_momentum(high, low, close, ia.rsi_s, volume, ia.atr_s, vol_avg)
+        m_score, m_sub = _score_momentum(high, low, close, ia.rsi_s, volume, ia.atr_s, vol_avg,
+                                          e20=ia.e20, e50=ia.e50, cfg=cfg)
         risk_penalty, risk_sub = _score_risk(close, high, low, open_, ia.e20, ia.atr_s, volume, vol_avg)
 
         pillar_total = s_score + a_score + r_score + l_score + m_score
@@ -847,12 +927,17 @@ def compute_pillars_from_ia(df: pd.DataFrame, ia) -> PillarResult:
         return PillarResult(error=str(exc))
 
 
-def compute_pillars(df: pd.DataFrame, nifty: pd.Series) -> PillarResult:
+def compute_pillars(df: pd.DataFrame, nifty: pd.Series, cfg: dict | None = None) -> PillarResult:
     """
     Standalone path: builds its own minimal indicator set from raw OHLCV.
     Use this only when an IndicatorArrays instance isn't already available
-    (e.g. ad-hoc / outside score_stock). Inside score_stock(), prefer
+    (e.g. ad-hoc / outside score_stock, or the Five Pillars backtest path
+    in utils/backtest_engine.py). Inside score_stock(), prefer
     compute_pillars_from_ia(df, ia) to avoid recomputing EMA/RSI/ATR.
+
+    cfg (optional): see compute_pillars_from_ia docstring -- pass the ic_*
+    settings dict so backtest results reflect the same VWAP Reclaim tuning
+    as the live scanner.
     """
     from utils.scanner_engine import ema, rsi, atr, _strip_tz
     from utils.pivot_engine import build_pivot_series
@@ -887,4 +972,4 @@ def compute_pillars(df: pd.DataFrame, nifty: pd.Series) -> PillarResult:
     ia.ph_series, ia.pl_series = ph_series, pl_series
     ia.vol_avg = vol_avg
 
-    return compute_pillars_from_ia(df, ia)
+    return compute_pillars_from_ia(df, ia, cfg=cfg)
