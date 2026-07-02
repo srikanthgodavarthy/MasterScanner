@@ -853,6 +853,8 @@ def score_stock(
                 "FP_LLPrice":                                  round(fp.r_ll_price, 2),
                 "FP_LLPriorLow":                                round(fp.r_prior_low_price, 2),
                 "FP_LLBarsToReclaim":                            fp.r_bars_to_reclaim,
+                "_fp_r_bars_since_reclaim":                      fp.r_bars_since_reclaim,
+                "_fp_r_vertical_extension":                      fp.r_vertical_extension,
                 "FP_LLDistanceATR":                                fp.r_distance_atr,
                 "FP_LLConfidence":                                   fp.r_confidence,
                 # Leadership internals (13 pts)
