@@ -810,7 +810,7 @@ def score_stock(
     # anywhere else in the engine.
     try:
         from utils.pillar_engine import compute_pillars_from_ia
-        fp = compute_pillars_from_ia(df, ia)
+        fp = compute_pillars_from_ia(df, ia, cfg=settings or {})
         if not fp.error:
             result.update({
                 "FP_Structure":   fp.structure_score,
@@ -871,6 +871,14 @@ def score_stock(
                 "_fp_breakout_confirmed":                 fp.m_breakout_confirmed,
                 "_fp_volume_expansion":                    fp.m_volume_expansion,
                 "_fp_reaction_score":                       fp.m_reaction_score,
+                # VWAP Reclaim pattern diagnostics (now real values)
+                "_fp_vwap_touch_found":    fp.m_vwap_touch_found,
+                "_fp_touch_bar":           fp.m_touch_bar,
+                "_fp_touch_distance_atr":  fp.m_touch_distance_atr,
+                "_fp_reaction_strength":   fp.m_reaction_strength,
+                "_fp_confluence":          fp.m_confluence,
+                "_fp_pattern_age":         fp.m_pattern_age,
+                "_fp_vwap_rising":         fp.m_vwap_rising,
                 # Independent Risk Engine internals (max -20 deduction)
                 "_fp_risk_ema20_extension":   fp.risk_ema20_extension,
                 "_fp_risk_atr_extension":      fp.risk_atr_extension,
@@ -896,7 +904,7 @@ def score_stock(
     # Negative  → DE sees more than CV1 (rare; signals a pattern-heavy bar without RS).
     try:
         cv1_cv = result.get("CV1_Conviction")
-        de_cv  = result.get("DE_Conviction")
+        de_cv  = result.get("Conviction")
         if cv1_cv is not None and de_cv is not None:
             gap = int(cv1_cv) - int(de_cv)
             result["ConvictionGap"] = gap
