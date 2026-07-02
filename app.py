@@ -126,6 +126,21 @@ settings = {
     "t1_rs_min":            ss.get("t1_rs_min",            0.0),
     "t1_adx_min":           ss.get("t1_adx_min",           20),
     "t1_use_adx":           ss.get("t1_use_adx",           True),
+    # ── Institutional Continuation (VWAP Reclaim) — Five Pillars Momentum
+    # pillar tuning. Previously defined on the Settings page but never
+    # forwarded here, so they had no effect on the scanner or backtest.
+    "ic_enable_vwap_reclaim":    ss.get("ic_enable_vwap_reclaim",    True),
+    "ic_enable_vwap_stoch_conf": ss.get("ic_enable_vwap_stoch_conf", True),
+    "ic_vwap_touch_atr_mult":    ss.get("ic_vwap_touch_atr_mult",    0.25),
+    "ic_vwap_touch_lookback":    ss.get("ic_vwap_touch_lookback",    3),
+    "ic_reaction_max_atr":       ss.get("ic_reaction_max_atr",       1.5),
+    "ic_confluence_window":      ss.get("ic_confluence_window",      2),
+    "ic_require_ema_trend":      ss.get("ic_require_ema_trend",      True),
+    "ic_require_rising_vwap":    ss.get("ic_require_rising_vwap",    True),
+    "ic_require_bullish_return": ss.get("ic_require_bullish_return", True),
+    "ic_min_reaction_score":     ss.get("ic_min_reaction_score",     0),
+    # ── Backtest engine default (Settings page → Backtest page) ──────
+    "bt_default_engine":         ss.get("bt_default_engine",         "scanner"),
 }
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
