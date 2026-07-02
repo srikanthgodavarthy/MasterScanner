@@ -148,6 +148,7 @@ def render(settings=None):
         "scanner":      "Custom",
         "five_pillars": "🏛️ Five Pillars",
         "cci_master":   "📐 CCI Master",
+        "fib_pullback": "📐 Fib Pullback (Scanner)",
     }
     _default_source = _ENGINE_TO_SOURCE.get((settings or {}).get("bt_default_engine", "scanner"), "Custom")
 
