@@ -203,7 +203,11 @@ class PillarResult:
     # ── Leadership sub-fields (13 pts) ────────────────────────────
     rs_3m:                float = 0.0   # excess return vs NIFTY, 3-month, %
     rs_6m:                 float = 0.0   # excess return vs NIFTY, 6-month, %
+    rs_1m:                  float = 0.0   # excess return vs NIFTY, 1-month, % (feeds rel_momentum)
     rel_momentum:           float = 0.0   # relative momentum (acceleration), %
+    l_rs_pts:                 int   = 0     # 0-8, bucketed from rs_3m
+    l_mom_pts:                  int   = 0     # 0-3, bucketed from rel_momentum
+    l_sector_pts:                 int   = 0     # flat 2/4 — see l_sector_leadership_note
     l_sector_leadership_note: str = "no sector benchmark wired in — flat neutral credit"
 
     # ── Momentum sub-fields (35 pts) — TODAY's trigger only ────────
@@ -677,7 +681,11 @@ def _score_leadership(close: pd.Series, nifty_aligned: pd.Series) -> tuple[int, 
     return score, {
         "rs_3m": round(rs_3m, 2),
         "rs_6m": round(rs_6m, 2),
+        "rs_1m": round(rs_1m, 2),
         "rel_momentum": round(rel_momentum, 2),
+        "l_rs_pts": rs_pts,
+        "l_mom_pts": mom_pts,
+        "l_sector_pts": sector_pts,
     }
 
 
