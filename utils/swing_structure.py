@@ -47,8 +47,20 @@ def compute_swing_labels(ph_series: pd.Series, pl_series: pd.Series) -> pd.DataF
     with columns:
         pivot_type   : 'H', 'L', or None
         pivot_price  : float or NaN
-        label        : 'HH' | 'LH' | 'HL' | 'LL' | None
+        label        : 'HH' | 'LH' | 'HL' | 'LL' | 'EH' | 'EL' | None
         label_ffill  : label forward-filled (useful for "current structure state")
+
+    NOTE ON EQUAL PIVOTS: a pivot that ties the previous pivot of the same
+    type (within UNDERCUT_EPS) is labeled 'EH'/'EL' (Equal High / Equal
+    Low), NOT folded into HH/LH or HL/LL. A tie is a retest of the same
+    level, not a genuine higher/lower print — mislabeling it as LL in
+    particular was previously causing the LL-spring detector to treat
+    ordinary support retests as fresh institutional reload points (an
+    equal low trivially satisfies "reclaimed", since close on a pivot
+    bar is almost never at that bar's exact low). Callers that only
+    match on 'HH'/'HL' or 'LL' are unaffected either way; callers that
+    want ties treated as continuation of the prior state should check
+    'label_ffill' rather than 'label'.
     """
     n = len(ph_series)
     pivot_type  = np.full(n, None, dtype=object)
@@ -61,6 +73,8 @@ def compute_swing_labels(ph_series: pd.Series, pl_series: pd.Series) -> pd.DataF
     ph_vals = ph_series.values
     pl_vals = pl_series.values
 
+    UNDERCUT_EPS = 0.001  # 0.1% tolerance band for "equal" pivots
+
     for i in range(n):
         ph_v = ph_vals[i]
         pl_v = pl_vals[i]
@@ -69,14 +83,24 @@ def compute_swing_labels(ph_series: pd.Series, pl_series: pd.Series) -> pd.DataF
             pivot_type[i]  = "H"
             pivot_price[i] = ph_v
             if last_ph is not None:
-                label[i] = "HH" if ph_v > last_ph else "LH"
+                if ph_v > last_ph * (1 + UNDERCUT_EPS):
+                    label[i] = "HH"
+                elif ph_v < last_ph * (1 - UNDERCUT_EPS):
+                    label[i] = "LH"
+                else:
+                    label[i] = "EH"
             last_ph = ph_v
 
         elif not np.isnan(pl_v):
             pivot_type[i]  = "L"
             pivot_price[i] = pl_v
             if last_pl is not None:
-                label[i] = "HL" if pl_v > last_pl else "LL"
+                if pl_v > last_pl * (1 + UNDERCUT_EPS):
+                    label[i] = "HL"
+                elif pl_v < last_pl * (1 - UNDERCUT_EPS):
+                    label[i] = "LL"
+                else:
+                    label[i] = "EL"
             last_pl = pl_v
 
     out = pd.DataFrame(
