@@ -1520,6 +1520,57 @@ def _sc_counts_html(df: pd.DataFrame) -> str:
     return '<div class="sc-counts">' + "".join(parts) + '</div>'
 
 
+_RENAME_MAP_FULL = {
+    "composite_score": "Composite",
+    "RScomp":          "RS%",
+    "RS_Rank":         "RS Rank",
+    "pos_size_pct":    "Size%",
+    "cat_trend":       "Trend",
+    "cat_momentum":    "Momentum",
+    "cat_structure":   "Structure",
+    "cat_volume":      "Volume",
+    "cat_quality":     "Quality",
+    "TrendAge":        "Age(bars)",
+    "TrendFresh":      "Fresh%",
+    "FreshBase":       "Base🔥",
+    "RR":              "R:R",
+    "Leadership":      "Leadership_DE",
+    "Conviction":      "Conviction_DE",
+    "EntryQuality":    "EntryQuality_DE",
+    "LTP":             "CMP",          # last traded price from scanner → display as CMP
+    # Setup persistence display columns
+    "SetupAge":        "Setup Age",
+    "TradePlanStatus": "Plan Status",
+    "EntryDriftPct":   "Drift%",
+}
+
+_RENAME_PRIMARY = {
+    "CV1_SignalClass":   "Signal Class",
+    "CV1_Leadership":   "Leadership",
+    "CV1_Conviction":   "Conviction",
+    "CV1_EntryQuality": "Entry Quality",
+    "RR":               "R:R",
+    "ConvictionGap":    "Conv Gap",
+    "ConvictionProfile":"Conv Profile",
+}
+
+_DETAIL_EXTRA = [
+    "Score", "RS%", "TrendPhase", "T1Path", "Buy Type", "Setup",
+    "Streak", "Age(bars)", "Fresh%", "Base🔥",
+    "Composite", "Trend", "Momentum", "Structure", "Volume", "Quality",
+    "ADX", "EMA Slope", "CCI",
+    "Category", "Stage", "Leadership_DE", "Conviction_DE", "EntryQuality_DE",
+    "Conv Gap", "Conv Profile",
+]
+
+# Primary column order for HTML table (v10: persistence fields added)
+_PRIMARY_ORDERED = [
+    "Stock", "Setup Age", "Plan Status", "Signal Class", "Category", "Primary Blocker",
+    "Leadership", "Conviction",
+    "Entry Quality", "Extension", "CMP", "%Chg", "Entry", "SL", "T1", "R:R", "Drift%", "Size%",
+]
+
+
 def _build_display_df(df: pd.DataFrame, detail: bool = False) -> pd.DataFrame:
     out = df.rename(columns=_RENAME_MAP_FULL).copy()
     out = out.rename(columns=_RENAME_PRIMARY)
