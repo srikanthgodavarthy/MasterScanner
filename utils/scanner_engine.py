@@ -858,9 +858,13 @@ def score_stock(
                 "FP_LLDistanceATR":                                fp.r_distance_atr,
                 "FP_LLConfidence":                                   fp.r_confidence,
                 # Leadership internals (13 pts)
+                "FP_RS1m":        fp.rs_1m,
                 "FP_RS3m":        fp.rs_3m,
                 "FP_RS6m":        fp.rs_6m,
                 "FP_RelMomentum": fp.rel_momentum,
+                "_fp_l_rs_pts":     fp.l_rs_pts,
+                "_fp_l_mom_pts":     fp.l_mom_pts,
+                "_fp_l_sector_pts":   fp.l_sector_pts,
                 # Momentum internals (35 pts — today's trigger only)
                 "FP_StochK":         fp.stoch_k,
                 "FP_StochD":         fp.stoch_d,
