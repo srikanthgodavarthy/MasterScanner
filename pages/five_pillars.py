@@ -78,6 +78,31 @@ _CSS = """
 .fp-class-note { font-size:9.5px; color:var(--muted); }
 
 .fp-table-wrap { overflow-x:auto; border:1px solid var(--border); border-radius:8px; }
+
+/* ── Compact pillar strip (Structure/Acceptance/Leadership/Momentum/Risk) ── */
+.fp-strip {
+  display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin-bottom:10px;
+}
+@media (max-width: 900px) { .fp-strip { grid-template-columns:repeat(2,1fr); } }
+.fp-tile {
+  background:var(--bg1); border:1px solid var(--border); border-radius:8px;
+  padding:8px 10px; border-top:3px solid var(--c); min-width:0;
+}
+.fp-tile-top { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px; }
+.fp-tile-name { font-size:10px; font-weight:700; color:var(--text); text-transform:uppercase; letter-spacing:0.03em; }
+.fp-tile-score { font-size:15px; font-weight:700; }
+.fp-tile-max { font-size:9px; color:var(--muted); font-weight:400; }
+.fp-tile-line { font-size:9.5px; color:var(--muted); line-height:1.5; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.fp-tile-line b { color:var(--text); font-weight:600; }
+
+/* ── Stock detail header (current price/levels snapshot) ── */
+.fp-stock-header {
+  background:var(--bg2); border:1px solid var(--border); border-radius:8px;
+  padding:8px 12px; margin-bottom:10px;
+  display:flex; flex-wrap:wrap; gap:14px; align-items:center;
+}
+.fp-sh-item { font-size:10.5px; color:var(--muted); white-space:nowrap; }
+.fp-sh-item b { color:var(--text); font-family:var(--mono); font-weight:700; margin-left:4px; }
 table.fp-table { width:100%; border-collapse:collapse; font-size:11.5px; }
 table.fp-table th {
   background:var(--bg2); color:var(--muted); font-weight:600; text-align:right;
@@ -237,20 +262,6 @@ def _detail_breakdown(row: pd.Series) -> str:
     final_disp = str(int(final)) if _is_valid_num(final) else "—"
     final_color = _pillar_color(float(final)) if _is_valid_num(final) else "#484f58"
 
-    def _row(name, score, weight, sub_lines):
-        c = _pillar_color(float(score)) if _is_valid_num(score) else "#484f58"
-        score_disp = str(int(score)) if _is_valid_num(score) else "—"
-        subs = "".join(f'<div style="font-size:10.5px;color:var(--muted);margin-top:2px">{s}</div>' for s in sub_lines)
-        return (
-            f'<div style="background:var(--bg1);border:1px solid var(--border);border-radius:8px;'
-            f'padding:10px 14px;margin-bottom:8px;border-left:3px solid {c}">'
-            f'<div style="display:flex;justify-content:space-between;align-items:baseline">'
-            f'<span style="font-size:11px;font-weight:700;color:var(--text)">{name}</span>'
-            f'<span style="font-size:10px;color:var(--muted)">weight {weight}</span>'
-            f'<span style="font-size:18px;font-weight:700;color:{c}">{score_disp}</span>'
-            f'</div>{subs}</div>'
-        )
-
     html = (
         f'<div style="margin-bottom:12px"><span style="font-size:14px;font-weight:700">{sym}</span>'
         f'&nbsp; <span class="fp-badge" style="background:rgba(0,0,0,0.3);border:1px solid {color}55;color:{color}">{label}</span>'
@@ -258,42 +269,79 @@ def _detail_breakdown(row: pd.Series) -> str:
         f'&nbsp;&nbsp;<span style="font-size:20px;font-weight:700;color:{final_color}">{final_disp}</span></div>'
     )
 
-    html += _row("1 · Structure", row.get("FP_Structure"), f"{PTS_STRUCTURE} pts", [
-        f"EMA20 &gt; EMA50 &gt; EMA200: {'✅' if row.get('_fp_ema_stack') else '❌'}",
-        f"EMA20 rising: {'✅' if row.get('_fp_ema20_rising') else '❌'} · "
-        f"EMA50 rising: {'✅' if row.get('_fp_ema50_rising') else '❌'} · "
-        f"EMA200 rising: {'✅' if row.get('_fp_ema200_rising') else '❌'}",
-        f"Price above EMA20: {'✅' if row.get('_fp_price_above_e20') else '❌'}",
-        f"Swing structure: {row.get('FP_SwingLabel', '') or '—'} · "
-        f"HH/HL intact: {'✅' if row.get('_fp_hh_hl_intact') else '❌'} · "
-        f"No breakdown (price &gt; EMA200): {'✅' if row.get('_fp_no_breakdown') else '❌'}",
+    # ── Current stock details (price/levels snapshot) ──────────────
+    def _sh(label, val, fmt="{}"):
+        v = fmt.format(val) if _is_valid_num(val) else "—"
+        return f'<span class="fp-sh-item">{label}<b>{v}</b></span>'
+
+    chg = row.get("%Chg", None)
+    chg_color = "var(--green)" if _is_valid_num(chg) and float(chg) >= 0 else "var(--red)"
+    html += (
+        '<div class="fp-stock-header">'
+        + _sh("LTP", row.get("Entry"), "₹{:.2f}")
+        + f'<span class="fp-sh-item">Chg%<b style="color:{chg_color}">'
+          f'{f"{float(chg):+.2f}%" if _is_valid_num(chg) else "—"}</b></span>'
+        + _sh("RSI", row.get("_rsi"), "{:.1f}")
+        + _sh("SL", row.get("SL"), "₹{:.2f}")
+        + _sh("T1", row.get("T1"), "₹{:.2f}")
+        + _sh("T2", row.get("T2"), "₹{:.2f}")
+        + _sh("VWAP", row.get("FP_VWAP"), "₹{:.2f}")
+        + _sh("POC", row.get("FP_POC"), "₹{:.2f}")
+        + _sh("Dist EMA20", row.get("FP_DistEMA20Pct"), "{:.1f}%")
+        + _sh("ATR Ext", row.get("FP_ATRExtension"), "{:.2f}×")
+        + '</div>'
+    )
+
+    # ── Compact 5-tile strip: Structure / Acceptance / Leadership / Momentum / Risk ──
+    def _tile(name, score, max_pts, color, lines):
+        score_disp = str(int(score)) if _is_valid_num(score) else "—"
+        lines_html = "".join(f'<div class="fp-tile-line" title="{l}">{l}</div>' for l in lines)
+        return (
+            f'<div class="fp-tile" style="--c:{color}">'
+            f'<div class="fp-tile-top"><span class="fp-tile-name">{name}</span>'
+            f'<span class="fp-tile-score" style="color:{color}">{score_disp}'
+            f'<span class="fp-tile-max">/{max_pts}</span></span></div>'
+            f'{lines_html}</div>'
+        )
+
+    s_c = _pillar_color(float(row.get("FP_Structure", 0))) if _is_valid_num(row.get("FP_Structure")) else "#484f58"
+    a_c = _pillar_color(float(row.get("FP_Acceptance", 0))) if _is_valid_num(row.get("FP_Acceptance")) else "#484f58"
+    l_c = _pillar_color(float(row.get("FP_Leadership", 0))) if _is_valid_num(row.get("FP_Leadership")) else "#484f58"
+    m_c = _pillar_color(float(row.get("FP_Momentum", 0))) if _is_valid_num(row.get("FP_Momentum")) else "#484f58"
+    risk_ded = row.get("FP_Risk", 0) or 0
+    r_c = "var(--green)" if risk_ded == 0 else ("var(--amber)" if risk_ded <= 8 else "var(--red)")
+
+    strip = '<div class="fp-strip">'
+    strip += _tile("1 · Structure", row.get("FP_Structure"), PTS_STRUCTURE, s_c, [
+        f"EMA stack {'✅' if row.get('_fp_ema_stack') else '❌'} · above E20 {'✅' if row.get('_fp_price_above_e20') else '❌'}",
+        f"Swing: <b>{row.get('FP_SwingLabel','—') or '—'}</b> · HH/HL {'✅' if row.get('_fp_hh_hl_intact') else '❌'}",
+        f"No breakdown {'✅' if row.get('_fp_no_breakdown') else '❌'}",
     ])
-    html += _row("2 · Acceptance", row.get("FP_Acceptance"), f"{PTS_ACCEPTANCE} pts", [
-        f"POC {row.get('FP_POC','—')} · VAH {row.get('FP_VAH','—')} · VAL {row.get('FP_VAL','—')} · VWAP {row.get('FP_VWAP','—')}",
-        f"Above POC: {'✅' if row.get('_fp_above_poc') else '❌'} · "
-        f"Above VWAP: {'✅' if row.get('_fp_above_vwap') else '❌'} · "
-        f"Accepted above Value Area: {'✅' if row.get('_fp_accepted_above_va') else '❌'}",
-        f"Holding above acceptance zone (3 bars): {'✅' if row.get('_fp_holding_above_zone') else '❌'}",
-        f"OBV: {row.get('FP_OBV','—')} · rising: {'✅' if row.get('_fp_obv_trend_rising') else '❌'} · "
-        f"leading price: {'✅' if row.get('_fp_obv_leading_price') else '❌'}",
+    strip += _tile("2 · Acceptance", row.get("FP_Acceptance"), PTS_ACCEPTANCE, a_c, [
+        f"POC {'✅' if row.get('_fp_above_poc') else '❌'} · VWAP {'✅' if row.get('_fp_above_vwap') else '❌'} · VA {'✅' if row.get('_fp_accepted_above_va') else '❌'}",
+        f"Holding 3 bars {'✅' if row.get('_fp_holding_above_zone') else '❌'}",
+        f"OBV rising {'✅' if row.get('_fp_obv_trend_rising') else '❌'} · leading {'✅' if row.get('_fp_obv_leading_price') else '❌'}",
     ])
-    html += _row("3 · Leadership", row.get("FP_Leadership"), f"{PTS_LEADERSHIP} pts", [
-        f"3M RS vs NIFTY: {row.get('FP_RS3m','—')}% · 6M RS vs NIFTY: {row.get('FP_RS6m','—')}%",
-        f"Relative momentum: {row.get('FP_RelMomentum','—')}%",
-        f"Sector leadership: neutral placeholder (no sector benchmark feed wired in yet)",
-        f"(Volume-vs-20d-avg evidence lives in Momentum only — see below)",
+    strip += _tile("3 · Leadership", row.get("FP_Leadership"), PTS_LEADERSHIP, l_c, [
+        f"3M RS <b>{row.get('FP_RS3m','—')}%</b> (+{row.get('_fp_l_rs_pts',0)}/8)",
+        f"1M RS <b>{row.get('FP_RS1m','—')}%</b> · 6M <b>{row.get('FP_RS6m','—')}%</b>",
+        f"Rel. mom <b>{row.get('FP_RelMomentum','—')}%</b> (+{row.get('_fp_l_mom_pts',0)}/3)",
+        f"Sector: flat (+{row.get('_fp_l_sector_pts',0)}/4, no feed)",
     ])
-    html += _row("4 · Momentum (today's trigger)", row.get("FP_Momentum"), f"{PTS_MOMENTUM} pts", [
-        f"Stoch %K/%D: {row.get('FP_StochK','—')} / {row.get('FP_StochD','—')} · "
-        f"fresh re-ignition: {'✅' if row.get('_fp_fresh_stoch_reignition') else '❌'}",
-        f"RSI(14): {row.get('_fp_rsi_val','—')} · &gt; 50: {'✅' if row.get('_fp_rsi_above_50') else '❌'}",
-        f"VWAP reaction: +{row.get('_fp_vwap_reaction_pts', 0)}/7 pts · "
-        f"returned above VWAP: {'✅' if row.get('_fp_returned_above_vwap') else '❌'} · "
-        f"reaction score: {row.get('_fp_reaction_score','—')}/100",
-        f"Breakout confirmed (close &gt; 20-bar high): {'✅' if row.get('_fp_breakout_confirmed') else '❌'}",
-        f"Volume expansion (&gt;1.5x 20d avg — sole owner of volume-today evidence): "
-        f"{'✅' if row.get('_fp_volume_expansion') else '❌'} (+11)",
+    strip += _tile("4 · Momentum", row.get("FP_Momentum"), PTS_MOMENTUM, m_c, [
+        f"Stoch re-ignite {'✅' if row.get('_fp_fresh_stoch_reignition') else '❌'} · RSI&gt;50 {'✅' if row.get('_fp_rsi_above_50') else '❌'}",
+        f"VWAP reaction +{row.get('_fp_vwap_reaction_pts',0)}/7 · reclaim {'✅' if row.get('_fp_returned_above_vwap') else '❌'}",
+        f"Breakout {'✅' if row.get('_fp_breakout_confirmed') else '❌'} · Vol&gt;1.5x {'✅' if row.get('_fp_volume_expansion') else '❌'} (+11)",
     ])
+    strip += _tile("5 · Risk", f"-{risk_ded}" if _is_valid_num(risk_ded) else None, f"max -{PTS_RISK_MAX_DEDUCTION}", r_c, [
+        f"EMA20 ext {'⚠️-5' if row.get('_fp_risk_ema20_extension') else '✅'} · ATR ext {'⚠️-5' if row.get('_fp_risk_atr_extension') else '✅'}",
+        f"Exhaustion {'⚠️-4' if row.get('_fp_risk_exhaustion_candle') else '✅'} · Parabolic {'⚠️-3' if row.get('_fp_risk_parabolic_move') else '✅'}",
+        f"Climactic vol {'⚠️-3' if row.get('_fp_risk_climactic_volume') else '✅'}",
+    ])
+    strip += '</div>'
+    html += strip
+
+    # ── Opportunity Quality Bonus — separate, detailed row ──────────
     _ll_line = f"Swing label: {row.get('FP_SwingLabel', '') or '—'}"
     if row.get("_fp_r_actionable_ll"):
         _ll_line += (
@@ -315,26 +363,31 @@ def _detail_breakdown(row: pd.Series) -> str:
             f"({'⚠️ near-vertical — distance pts shaved -1' if _vert else 'orderly — no adjustment'})"
         )
     _dist_subs = [_pace_line] if _pace_line else []
-    html += _row("Opportunity Quality Bonus (layered on the 90pt base)", row.get("FP_Reversal"), f"{PTS_REVERSAL} pts", [
-        _ll_line,
-        f"Actionable LL confirmed: {'✅' if row.get('_fp_r_actionable_ll') else '❌'} (+2) · "
-        f"LL remains valid (never re-broken): {'✅' if row.get('_fp_r_ll_defended') else '❌'} (+2)",
-        f"Distance from actionable LL (ATR-based, graduated by proximity, pace-adjusted): "
-        f"{'✅ in band' if row.get('_fp_r_distance_atr_ok') else '❌ out of band'} (+{_dist_pts}/4)",
-        *_dist_subs,
-        f"Institutional confirmation (volume at LL): {'✅' if row.get('_fp_r_high_volume_confirmation') else '❌'} (+2)",
-    ])
-    html += _row("Risk Engine (independent deduction)", -row.get("FP_Risk", 0) if _is_valid_num(row.get("FP_Risk")) else None,
-                 f"max -{PTS_RISK_MAX_DEDUCTION} pts", [
-        f"EMA20 extension &gt; 2.5%: {'⚠️ yes (-5)' if row.get('_fp_risk_ema20_extension') else 'no'} "
-        f"(dist {row.get('FP_DistEMA20Pct','—')}%)",
-        f"ATR extension &gt; 0.8 ATR: {'⚠️ yes (-5)' if row.get('_fp_risk_atr_extension') else 'no'} "
-        f"({row.get('FP_ATRExtension','—')} ATRs)",
-        f"Exhaustion candle: {'⚠️ yes (-4)' if row.get('_fp_risk_exhaustion_candle') else 'no'}",
-        f"Parabolic move: {'⚠️ yes (-3)' if row.get('_fp_risk_parabolic_move') else 'no'}",
-        f"Climactic volume: {'⚠️ yes (-3)' if row.get('_fp_risk_climactic_volume') else 'no'}",
-        f"Total deduction applied: -{row.get('FP_Risk', 0)} pts",
-    ])
+
+    opp_c = _pillar_color(float(row.get("FP_Reversal", 0))) if _is_valid_num(row.get("FP_Reversal")) else "#484f58"
+    opp_score = row.get("FP_Reversal")
+    opp_score_disp = str(int(opp_score)) if _is_valid_num(opp_score) else "—"
+    opp_subs = "".join(
+        f'<div style="font-size:10.5px;color:var(--muted);margin-top:2px">{s}</div>'
+        for s in [
+            _ll_line,
+            f"Actionable LL confirmed: {'✅' if row.get('_fp_r_actionable_ll') else '❌'} (+2) · "
+            f"LL remains valid (never re-broken): {'✅' if row.get('_fp_r_ll_defended') else '❌'} (+2)",
+            f"Distance from actionable LL (ATR-based, graduated by proximity, pace-adjusted): "
+            f"{'✅ in band' if row.get('_fp_r_distance_atr_ok') else '❌ out of band'} (+{_dist_pts}/4)",
+            *_dist_subs,
+            f"Institutional confirmation (volume at LL): {'✅' if row.get('_fp_r_high_volume_confirmation') else '❌'} (+2)",
+        ]
+    )
+    html += (
+        f'<div style="background:var(--bg1);border:1px solid var(--border);border-radius:8px;'
+        f'padding:10px 14px;margin-bottom:8px;border-left:3px solid {opp_c}">'
+        f'<div style="display:flex;justify-content:space-between;align-items:baseline">'
+        f'<span style="font-size:11px;font-weight:700;color:var(--text)">Opportunity Quality Bonus (layered on the 90pt base)</span>'
+        f'<span style="font-size:10px;color:var(--muted)">{PTS_REVERSAL} pts</span>'
+        f'<span style="font-size:18px;font-weight:700;color:{opp_c}">{opp_score_disp}</span>'
+        f'</div>{opp_subs}</div>'
+    )
 
     # ── Promotion Engine — Execute -> Elite ─────────────────────
     # CRITICAL: LL Opportunity + Reward>Risk (both required).
