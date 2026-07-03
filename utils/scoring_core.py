@@ -128,16 +128,6 @@ class ScoringParams:
     ll_bonus_max:           int  = 8    # 0-8 pts — defended/actionable LL spring, graded by ATR distance
     stoch_bonus_max:        int  = 7    # 0-7 pts — fresh stoch re-ignition confluent with a VWAP reclaim
 
-    # Institutional Continuation (VWAP Reclaim) tuning — Settings page's
-    # "Institutional Continuation" panel (ic_* keys). Previously only
-    # consumed by the retired Five Pillars Momentum pillar; now wired
-    # directly into score_stochastic_convergence() so that panel keeps
-    # working for the (now single) scoring engine.
-    ic_vwap_touch_lookback: int   = 3
-    ic_vwap_touch_atr_mult: float = 0.25
-    ic_reaction_max_atr:    float = 1.5
-    ic_confluence_window:   int   = 2
-
     @classmethod
     def from_settings(cls, s: dict) -> "ScoringParams":
         """Build from the settings dict produced by pages/settings.py."""
@@ -170,10 +160,6 @@ class ScoringParams:
             enable_ll_stoch_bonus = bool(s.get("enable_ll_stoch_bonus", True)),
             ll_bonus_max          = int(s.get("ll_bonus_max",     8)),
             stoch_bonus_max       = int(s.get("stoch_bonus_max",  7)),
-            ic_vwap_touch_lookback= int(s.get("ic_vwap_touch_lookback", 3)),
-            ic_vwap_touch_atr_mult= float(s.get("ic_vwap_touch_atr_mult", 0.25)),
-            ic_reaction_max_atr   = float(s.get("ic_reaction_max_atr", 1.5)),
-            ic_confluence_window  = int(s.get("ic_confluence_window", 2)),
         )
 
 
@@ -357,17 +343,6 @@ class BarResult:
     stoch_confluence:        bool  = False   # stoch cross lines up with a VWAP touch/reclaim
     stoch_bonus_pts:           int   = 0       # 0..params.stoch_bonus_max
     opportunity_bonus_pts:       int   = 0       # ll_bonus_pts + stoch_bonus_pts, already applied to norm_score
-    # ── VWAP Reclaim diagnostics (migrated off the retired Five Pillars
-    # engine so the Backtest page's VWAP Reclaim Analysis report can be fed
-    # from scanner-mode trades too — see utils/stoch_convergence.py) ──────
-    stoch_vwap_touch_found:       bool  = False
-    stoch_touch_bar:                int   = -1
-    stoch_cross_bar:                  int   = -1
-    stoch_reaction_strength:            float = 0.0
-    stoch_pattern_age:                    int   = -1
-    stoch_touch_distance_atr:               float = 0.0
-    stoch_vwap_rising:                        bool  = False
-    stoch_close_position_score:                 float = 0.0
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1310,13 +1285,6 @@ def compute_bar(
     stoch_k_v = stoch_d_v = 0.0
     stoch_reignition = stoch_confluence = False
     stoch_bonus = 0
-    stoch_vwap_touch_found_v = False
-    stoch_touch_bar_v = stoch_cross_bar_v = -1
-    stoch_reaction_strength_v = 0.0
-    stoch_pattern_age_v = -1
-    stoch_touch_distance_atr_v = 0.0
-    stoch_vwap_rising_v = False
-    stoch_close_position_score_v = 0.0
 
     if params.enable_ll_stoch_bonus and i >= max(40, params.pvt_lb * 2):
         try:
@@ -1348,24 +1316,12 @@ def compute_bar(
             _stoch_sig = score_stochastic_convergence(
                 high=_high_i, low=_low_i, close=_close_i, volume=_vol_i,
                 atr_s=_atr_i, max_bonus=params.stoch_bonus_max,
-                lookback=params.ic_vwap_touch_lookback,
-                atr_mult=params.ic_vwap_touch_atr_mult,
-                reaction_max_atr=params.ic_reaction_max_atr,
-                confluence_bars=params.ic_confluence_window,
             )
             stoch_k_v        = _stoch_sig.stoch_k
             stoch_d_v         = _stoch_sig.stoch_d
             stoch_reignition    = _stoch_sig.reignition
             stoch_confluence       = _stoch_sig.confluence
             stoch_bonus               = _stoch_sig.bonus_pts
-            stoch_vwap_touch_found_v  = _stoch_sig.vwap_touch_found
-            stoch_touch_bar_v         = _stoch_sig.touch_bar
-            stoch_cross_bar_v         = _stoch_sig.cross_bar
-            stoch_reaction_strength_v = _stoch_sig.reaction_strength
-            stoch_pattern_age_v       = _stoch_sig.pattern_age
-            stoch_touch_distance_atr_v= _stoch_sig.touch_distance_atr
-            stoch_vwap_rising_v       = _stoch_sig.vwap_rising
-            stoch_close_position_score_v = _stoch_sig.close_position_score
         except Exception:
             pass   # non-critical; bonus stays 0, norm_score falls back to pre-migration value
 
@@ -1756,14 +1712,6 @@ def compute_bar(
         ll_distance_atr        = round(ll_distance_atr, 2),
         ll_price                = ll_price_v,
         ll_bonus_pts             = ll_bonus,
-        stoch_vwap_touch_found    = stoch_vwap_touch_found_v,
-        stoch_touch_bar           = stoch_touch_bar_v,
-        stoch_cross_bar           = stoch_cross_bar_v,
-        stoch_reaction_strength   = stoch_reaction_strength_v,
-        stoch_pattern_age         = stoch_pattern_age_v,
-        stoch_touch_distance_atr  = stoch_touch_distance_atr_v,
-        stoch_vwap_rising         = stoch_vwap_rising_v,
-        stoch_close_position_score= stoch_close_position_score_v,
         stoch_k                   = stoch_k_v,
         stoch_d                    = stoch_d_v,
         stoch_reignition             = stoch_reignition,

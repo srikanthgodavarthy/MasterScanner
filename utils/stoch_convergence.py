@@ -61,14 +61,6 @@ class StochConvergenceSignal:
     cross_bar:                         int   = -1
     reaction_strength:                   float = 0.0   # 0-100
     bonus_pts:                             int   = 0      # final 0-10 convergence score
-    # ── Extra diagnostics (added when the VWAP Reclaim Analysis report was
-    # migrated off the retired Five Pillars engine onto this shared module —
-    # these were already present in detect_vwap_reclaim()'s metadata dict but
-    # previously discarded here) ─────────────────────────────────────────
-    pattern_age:                             int   = -1     # bars since the touch/cross pattern formed
-    touch_distance_atr:                        float = 0.0   # ATR distance of the VWAP touch bar's low
-    vwap_rising:                                 bool  = False
-    close_position_score:                          float = 0.0   # 0-100, candle close position quality
 
     def as_dict(self) -> dict:
         return {
@@ -82,10 +74,6 @@ class StochConvergenceSignal:
             "stoch_cross_bar":           self.cross_bar,
             "stoch_reaction_strength":   self.reaction_strength,
             "stoch_bonus_pts":           self.bonus_pts,
-            "stoch_pattern_age":         self.pattern_age,
-            "stoch_touch_distance_atr":  self.touch_distance_atr,
-            "stoch_vwap_rising":         self.vwap_rising,
-            "stoch_close_position_score":self.close_position_score,
         }
 
 
@@ -139,14 +127,6 @@ def score_stochastic_convergence(
     sig.touch_bar           = int(meta.get("touch_bar")) if meta.get("touch_bar") is not None else -1
     sig.cross_bar           = int(meta.get("cross_bar")) if meta.get("cross_bar") is not None else -1
     sig.reaction_strength   = float(meta.get("reaction_strength", 0.0) or 0.0)
-    sig.pattern_age          = int(meta.get("pattern_age")) if meta.get("pattern_age") is not None else -1
-    sig.touch_distance_atr    = float(meta.get("touch_distance_atr", 0.0) or 0.0)
-    sig.close_position_score   = float(meta.get("close_position_score", 0.0) or 0.0)
-    _vwap_series_tail = vwap_series
-    sig.vwap_rising = bool(
-        len(_vwap_series_tail) > 10
-        and _safe_last(_vwap_series_tail) > _safe_at(_vwap_series_tail, -11, default=_safe_last(_vwap_series_tail))
-    )
 
     raw = 0
     if sig.reignition:            raw += 4
