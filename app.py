@@ -87,6 +87,7 @@ from pages.diagnostic    import render as render_diagnostic
 from pages.lifecycle     import render as render_lifecycle
 from pages.history       import render as render_history
 from pages.agent          import render as render_agent
+from pages.five_pillars  import render as render_five_pillars
 from pages.cci_master    import render as render_cci_master
 from utils.scanner_engine import NIFTY500_SYMBOLS
 
@@ -125,8 +126,9 @@ settings = {
     "t1_rs_min":            ss.get("t1_rs_min",            0.0),
     "t1_adx_min":           ss.get("t1_adx_min",           20),
     "t1_use_adx":           ss.get("t1_use_adx",           True),
-    # ── Institutional Continuation (VWAP Reclaim) — Momentum's Stochastic
-    # Convergence bonus in the scanner engine (utils/stoch_convergence.py).
+    # ── Institutional Continuation (VWAP Reclaim) — Five Pillars Momentum
+    # pillar tuning. Previously defined on the Settings page but never
+    # forwarded here, so they had no effect on the scanner or backtest.
     "ic_enable_vwap_reclaim":    ss.get("ic_enable_vwap_reclaim",    True),
     "ic_enable_vwap_stoch_conf": ss.get("ic_enable_vwap_stoch_conf", True),
     "ic_vwap_touch_atr_mult":    ss.get("ic_vwap_touch_atr_mult",    0.25),
@@ -141,33 +143,36 @@ settings = {
     "bt_default_engine":         ss.get("bt_default_engine",         "scanner"),
 }
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
-    "📡 Live Scanner", "📈 Backtest Engine", "🔄 Lifecycle", "📊 History", "⚙️ Settings", "🔬 CV/EQ Validation", "🧬 Diagnostic", "🤖 Agent", "📐 CCI Master"
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+    "📡 Live Scanner", "📍 Pre-Breakout Scanner", "📈 Backtest Engine", "🔄 Lifecycle", "📊 History", "⚙️ Settings", "🔬 CV/EQ Validation", "🧬 Diagnostic", "🤖 Agent", "📐 CCI Master"
 ])
 
 with tab1:
     render_scanner(settings)
 
 with tab2:
-    render_backtest(settings)
+    render_five_pillars(settings)
 
 with tab3:
-    render_lifecycle()
+    render_backtest(settings)
 
 with tab4:
-    render_history()
+    render_lifecycle()
 
 with tab5:
-    render_settings()
+    render_history()
 
 with tab6:
-    render_validation(settings)
+    render_settings()
 
 with tab7:
-    render_diagnostic(settings)
+    render_validation(settings)
 
 with tab8:
-    render_agent(settings)
+    render_diagnostic(settings)
 
 with tab9:
+    render_agent(settings)
+
+with tab10:
     render_cci_master(settings)
