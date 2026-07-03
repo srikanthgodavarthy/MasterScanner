@@ -1279,6 +1279,25 @@ def compute_bar(
     # backtest-tuned raw-score budget above. Bar-indexed: every input
     # Series is sliced to :i+1 so this can never see future bars — the
     # same guarantee swing_structure.detect_ll_reversal documents.
+    #
+    # Two INDEPENDENT gates, not one shared one — they have different
+    # structural minimums and conflating them silently suppresses valid
+    # early signals:
+    #   LL     needs at least one pivot to exist at all: a centred pivot
+    #          window is 2*pvt_lb+1 bars, so nothing can be detected
+    #          before that regardless of config. Below it, ll_opportunity's
+    #          own compute_swing_labels() call would just find zero pivots
+    #          and return the default zero signal — same outcome, but this
+    #          skips the wasted call. (It typically needs a bit more than
+    #          this floor for a SECOND pivot low to exist for comparison,
+    #          but score_ll_opportunity() already handles that internally
+    #          and returns a graceful zero bonus rather than an error.)
+    #   Stoch  has nothing to do with pvt_lb — it only needs enough bars
+    #          for %K (14) + %D (3) to produce a real value, plus a small
+    #          margin for cross-detection. Tying it to the LL/pivot gate
+    #          was the bug: a stock with a real stochastic re-ignition at
+    #          bar 20 got silently zeroed out just because pvt_lb=20 made
+    #          the (wrong, shared) gate demand 40 bars.
     ll_actionable = ll_defended = False
     ll_distance_atr = ll_price_v = 0.0
     ll_bonus = 0
@@ -1286,44 +1305,45 @@ def compute_bar(
     stoch_reignition = stoch_confluence = False
     stoch_bonus = 0
 
-    if params.enable_ll_stoch_bonus and i >= max(40, params.pvt_lb * 2):
-        try:
-            from utils.ll_opportunity import score_ll_opportunity
-            from utils.stoch_convergence import score_stochastic_convergence
+    _ll_min_bars    = 2 * params.pvt_lb + 1   # first bar a pivot can structurally exist
+    _stoch_min_bars = 20                       # %K(14)+%D(3) warm-up + cross-detection margin
 
-            _sl = slice(0, i + 1)
-            _close_i  = ia.c.iloc[_sl]
-            _low_i    = ia.l.iloc[_sl]
-            _high_i   = ia.h.iloc[_sl]
-            _vol_i    = ia.v.iloc[_sl]
-            _atr_i    = ia.atr_s.iloc[_sl]
-            _vavg_i   = ia.vol_avg.iloc[_sl]
-            _ph_i     = ia.ph_series.iloc[_sl] if ia.ph_series is not None else None
-            _pl_i     = ia.pl_series.iloc[_sl] if ia.pl_series is not None else None
+    if params.enable_ll_stoch_bonus:
+        _sl = slice(0, i + 1)
 
-            _ll_sig = score_ll_opportunity(
-                close=_close_i, low=_low_i, volume=_vol_i,
-                ph_series=_ph_i, pl_series=_pl_i,
-                atr_s=_atr_i, vol_avg=_vavg_i,
-                max_bonus=params.ll_bonus_max,
-            )
-            ll_actionable   = _ll_sig.actionable_ll
-            ll_defended     = _ll_sig.ll_defended
-            ll_distance_atr = _ll_sig.distance_atr
-            ll_price_v      = _ll_sig.ll_price
-            ll_bonus        = _ll_sig.bonus_pts
+        if i >= _ll_min_bars:
+            try:
+                from utils.ll_opportunity import score_ll_opportunity
+                _ll_sig = score_ll_opportunity(
+                    close=ia.c.iloc[_sl], low=ia.l.iloc[_sl], volume=ia.v.iloc[_sl],
+                    ph_series=ia.ph_series.iloc[_sl] if ia.ph_series is not None else None,
+                    pl_series=ia.pl_series.iloc[_sl] if ia.pl_series is not None else None,
+                    atr_s=ia.atr_s.iloc[_sl], vol_avg=ia.vol_avg.iloc[_sl],
+                    max_bonus=params.ll_bonus_max,
+                )
+                ll_actionable   = _ll_sig.actionable_ll
+                ll_defended     = _ll_sig.ll_defended
+                ll_distance_atr = _ll_sig.distance_atr
+                ll_price_v      = _ll_sig.ll_price
+                ll_bonus        = _ll_sig.bonus_pts
+            except Exception:
+                pass   # non-critical; bonus stays 0, norm_score falls back to pre-migration value
 
-            _stoch_sig = score_stochastic_convergence(
-                high=_high_i, low=_low_i, close=_close_i, volume=_vol_i,
-                atr_s=_atr_i, max_bonus=params.stoch_bonus_max,
-            )
-            stoch_k_v        = _stoch_sig.stoch_k
-            stoch_d_v         = _stoch_sig.stoch_d
-            stoch_reignition    = _stoch_sig.reignition
-            stoch_confluence       = _stoch_sig.confluence
-            stoch_bonus               = _stoch_sig.bonus_pts
-        except Exception:
-            pass   # non-critical; bonus stays 0, norm_score falls back to pre-migration value
+        if i >= _stoch_min_bars:
+            try:
+                from utils.stoch_convergence import score_stochastic_convergence
+                _stoch_sig = score_stochastic_convergence(
+                    high=ia.h.iloc[_sl], low=ia.l.iloc[_sl], close=ia.c.iloc[_sl],
+                    volume=ia.v.iloc[_sl], atr_s=ia.atr_s.iloc[_sl],
+                    max_bonus=params.stoch_bonus_max,
+                )
+                stoch_k_v        = _stoch_sig.stoch_k
+                stoch_d_v        = _stoch_sig.stoch_d
+                stoch_reignition = _stoch_sig.reignition
+                stoch_confluence = _stoch_sig.confluence
+                stoch_bonus      = _stoch_sig.bonus_pts
+            except Exception:
+                pass
 
     opportunity_bonus = ll_bonus + stoch_bonus
     norm_score = min(100, norm_score + opportunity_bonus)
