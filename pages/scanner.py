@@ -776,16 +776,162 @@ def _tv_link(symbol: str) -> str:
 
 def _scoring_explainer_html() -> str:
     """
-    Static HTML panel: 'How CV1 Scores & Signal Classes are calculated'.
+    Static HTML panel: 'Scoring & Thresholds'.
 
-    [FIX] Rewritten to match utils/decision_engine.py's actual current logic —
-    the previous version (Leadership 30/25/20/15/10, gates at 65/50/50) was
-    written for an earlier revision and had drifted badly out of sync with
-    the v8.1-v9.2 tightening: real weights, gates, and category thresholds
-    are all different now. Pulled directly from _leadership(), _conviction(),
-    _entry_quality(), _extension(), and _classify_category_with_settings().
+    [REBUILT] Was 'How CV1 Scores & Signal Classes are calculated' — documented
+    only the Decision Engine (Leadership/Conviction/Entry Quality/Extension).
+    There are actually TWO independent scoring systems in this codebase, and
+    this panel now documents both, plus the bonus layer that sits between them:
+
+      A) Raw Score / Action / Tier  (utils/scoring_core.py compute_bar())
+         — the original, backtest-tuned engine. Feeds the "Score", "Action",
+         "Tier", "Buy Type" columns.
+      B) Opportunity Bonus  (utils/ll_opportunity.py + utils/stoch_convergence.py)
+         — LL Spring + VWAP Reclaim, layered on top of (A)'s norm_score,
+         up to +15 pts combined.
+      C) Decision Engine  (utils/decision_engine.py compute_decision())
+         — a second, independent 4-score framework. Feeds "Leadership",
+         "Conviction", "Entry Quality", "Extension", and the "Recommendation"
+         / Category (Elite Opportunity / High Conviction / ... / Avoid).
+
+    A stock's Score/Action/Tier (A+B) and its Recommendation/Category (C)
+    come from two different pipelines and can disagree — that's expected,
+    not a bug: (A) is a single blended score, (C) is a 4-dimension shape.
     """
-    # ── Dimension rows (weights sum to 100 in each) ──────────────────
+
+    def _section_head(title, color, subtitle=""):
+        sub = f'<div style="font-size:10.5px;color:#8b949e;margin-top:2px">{subtitle}</div>' if subtitle else ""
+        return (
+            f'<div style="margin:22px 0 10px;padding-top:16px;border-top:2px solid {color}33;">'
+            f'<div style="font-size:13px;font-weight:700;color:{color};letter-spacing:0.04em;">{title}</div>'
+            f'{sub}</div>'
+        )
+
+    def _mini_table(rows, cols=("Component", "Points", "Condition")):
+        head = "".join(f'<th style="text-align:left;padding:4px 10px 4px 0;font-size:9.5px;color:#8b949e;'
+                        f'text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid rgba(255,255,255,0.08)">{c}</th>' for c in cols)
+        body = ""
+        for r in rows:
+            tds = "".join(
+                f'<td style="padding:4px 10px 4px 0;font-size:11px;color:{"#e6edf3" if i != 1 else "#4ade80"};'
+                f'font-family:var(--mono);white-space:nowrap;vertical-align:top">{v}</td>'
+                for i, v in enumerate(r)
+            )
+            body += f'<tr>{tds}</tr>'
+        return f'<table style="border-collapse:collapse;width:100%;margin-bottom:10px">' \
+               f'<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>'
+
+    def _note(text):
+        return f'<p style="font-size:10.5px;color:#8b949e;margin:4px 0 12px;">{text}</p>'
+
+    # ══════════════════════════════════════════════════════════════
+    # SECTION A — Raw Score / Action / Tier
+    # ══════════════════════════════════════════════════════════════
+    sec_a = _section_head(
+        "A · Raw Score, Action &amp; Tier", "#58a6ff",
+        "utils/scoring_core.py compute_bar() — backtest-tuned, feeds Score / Action / Tier / Buy Type columns",
+    )
+    sec_a += _note(
+        "Raw points sum against a 265-pt budget, then normalized: "
+        "<b>norm_score = min(100, raw_score &times; 100 / 265)</b>. "
+        "Weights below were tuned empirically against backtest profit-factor data (v8.1), not fixed a priori."
+    )
+    sec_a += _mini_table([
+        ("trend_up",          "+25 / 0",              "EMA alignment trending up"),
+        ("EMA20 vs EMA50",    "+30 / +20 / 0",         "EMA20&gt;EMA50 (full) / within 0.5% (partial) / below"),
+        ("RSI",               "+25/20/15/5/0",         "&gt;60 / &gt;55 / &gt;50 / &gt;45 / else"),
+        ("Volume",            "+30/20/10/0",           "vol &ge;2.0&times; avg / &ge;1.5&times; / &ge;1.2&times; / below"),
+        ("RS Composite",      "+30/25/20/5/-10/0",     "&gt;15% / &gt;10% / &gt;5% / &gt;0% / &lt;-3% / else"),
+        ("Trend Age",         "-5/+5/+20/0/-10",       "0-5 bars / 6-20 / <b>21-50 (sweet spot)</b> / 51-100 / &gt;100"),
+        ("ADX(14)",           "+20/12/5/0",            "&ge;40 / &gt;30 / &gt;25 / else"),
+        ("EMA20 Slope",       "+10/5/0",               "&gt;0.3 / &gt;0 / else"),
+        ("CCI State",         "+20/8/-15/0",           "&lt; CCI oversold / &lt;0 / extended / else"),
+        ("Fresh Base Breakout","+15 / 0",              "Stage-2 / long-base breakout detected"),
+        ("In Golden Zone",    "+15 / 0",                "50-61.8% Fib pullback zone"),
+        ("Fib Extension Penalty","-20/-30/0",           "near 127% ext / near 161% ext / else"),
+        ("Momentum (3M &amp; 6M)","+20/10/5/0",         "both &gt;20% / both &gt;10% / both &gt;5% / else"),
+        ("Harmonic / ABCD",   "+10 / +8",               "pattern confirmed (additive)"),
+        ("Below Cloud",       "-15 / 0",                "price below Ichimoku cloud"),
+        ("Squeeze",           "settings-tunable",       "BB/KC squeeze release or no-squeeze bonus"),
+        ("CCI Rising",        "+8 / 0",                 "CCI building below -50, positive slope"),
+        ("Phase Modifier",    "&times;0.70 / &times;0.90","EXTENDED phase / EMERGING phase (multiplies raw score)"),
+    ])
+    sec_a += _note(
+        "<b>Adaptive Score Threshold</b> (used by Buy Type / Tier-1 Path B gates): "
+        "<b>65</b> if ATR/ATR-SMA20 &gt; 1.2 (volatile regime) &middot; "
+        "<b>75</b> if &lt; 0.8 (quiet regime) &middot; <b>70</b> otherwise."
+    )
+
+    # ══════════════════════════════════════════════════════════════
+    # SECTION B — Opportunity Bonus
+    # ══════════════════════════════════════════════════════════════
+    sec_b = _section_head(
+        "B · Opportunity Bonus (+15 max, layered on Section A)", "#f5c542",
+        "utils/ll_opportunity.py + utils/stoch_convergence.py — migrated off the retired Five Pillars engine",
+    )
+    sec_b += _note(
+        "<b>opportunity_bonus = ll_bonus (0-10) + stoch_bonus (0-10)</b>, capped so "
+        "<b>norm_score = min(100, norm_score + opportunity_bonus)</b>. Only computed once enough "
+        "history exists (bar index &ge; max(40, pivot_lookback&times;2)); toggle: Settings &rarr; "
+        "\"enable_ll_stoch_bonus\" (default ON)."
+    )
+    sec_b += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">'
+    sec_b += (
+        '<div><div style="font-size:10px;font-weight:700;color:#f5c542;text-transform:uppercase;'
+        'letter-spacing:0.05em;margin-bottom:5px">LL Spring (0-10)</div>'
+        + _mini_table([
+            ("Actionable LL confirmed",      "+2", "close reclaimed prior low within 10 bars of the LL print"),
+            ("LL defended",                  "+2", "LL price never re-broken since"),
+            ("Distance from LL (graduated)", "+0-4", "0.3-1.0 ATR&rarr;4 &middot; 1.0-2.0&rarr;3 &middot; 2.0-3.0&rarr;2 &middot; 3.0-4.0&rarr;1"),
+            ("Institutional volume",         "+2", "reclaim-bar volume &gt; 20d average"),
+            ("Pace penalty",                 "-1", "reclaimed in &le;3 bars at &gt;0.35 ATR/bar (near-vertical)"),
+        ], cols=("Check", "Pts", "Condition"))
+        + '</div>'
+    )
+    sec_b += (
+        '<div><div style="font-size:10px;font-weight:700;color:#f5c542;text-transform:uppercase;'
+        'letter-spacing:0.05em;margin-bottom:5px">VWAP Reclaim / Stoch Convergence (0-10)</div>'
+        + _mini_table([
+            ("Fresh %K/%D re-ignition", "+4", "cross-up, or %K crosses back above 20 from oversold"),
+            ("Returned above VWAP",     "+3", "price reclaimed session-anchored VWAP"),
+            ("Confluence",              "+3", "VWAP touch &amp; stoch cross within confluence_bars (default 2) of each other"),
+        ], cols=("Check", "Pts", "Condition"))
+        + '<div style="font-size:9.5px;color:#8b949e;margin-top:2px">Tunable in Settings &rarr; '
+          'Institutional Continuation: touch lookback (3 bars), ATR touch tolerance (0.25&times;ATR), '
+          'reaction cap (1.5&times;ATR), confluence window (2 bars).</div>'
+        + '</div>'
+    )
+    sec_b += '</div>'
+
+    # ══════════════════════════════════════════════════════════════
+    # SECTION C — Tier Gates
+    # ══════════════════════════════════════════════════════════════
+    sec_c = _section_head(
+        "C · Tier Gates (Tier-1 Prime / Tier-2 Momentum / Elite)", "#3fb950",
+        "Structural gates on top of Score+Bonus — determine Action (BUY/WATCH/SKIP) and Tier label",
+    )
+    sec_c += (
+        '<div style="font-size:11px;color:#e6edf3;margin-bottom:6px"><b>Tier-1 Prime</b> — any ONE path, '
+        'plus <b>RS Composite &ge; 5%</b>, <b>strength gate</b> (ADX&ge;20 OR EMA20 slope&gt;0), and Nifty regime allows:</div>'
+    )
+    sec_c += _mini_table([
+        ("Path A — Pullback",    "trend_up + Fib golden zone (relaxed) + recent CCI recovery + persistent strength + trend structure"),
+        ("Path B — Momentum",    "is_norm_buy (score &ge; adaptive threshold) AND score &ge; 75 (or 70 if trend phase EMERGING)"),
+        ("Path C — Fresh Base",  "fresh_base_breakout + trend_up + (persistent strength OR RS &ge; 5%) — relaxed strength gate"),
+    ], cols=("Path", "Condition"))
+    sec_c += _mini_table([
+        ("Tier-2 Momentum",  "—", "compression_break AND cci_momentum_break AND volume &gt; 1.2&times; avg AND trend phase &ne; EXTENDED (hard block)"),
+        ("Elite Tier",       "—", "Tier-1 Prime AND score &ge; 85 AND RS top-decile AND vol_ratio &ge; 1.5"),
+    ], cols=("Gate", "—", "Condition"))
+    sec_c += _note(
+        "<b>Buy Type</b> (any_buy) fires when any of: Fib pullback+score&ge;threshold, Fib+CCI cross+score&ge;55, "
+        "ABCD, Harmonic, Norm/momentum+score&ge;threshold, or CCI cross+score&ge;55 — AND price clears the cloud gate "
+        "(above cloud, or inside cloud with score&ge;65)."
+    )
+
+    # ══════════════════════════════════════════════════════════════
+    # SECTION D — Decision Engine
+    # ══════════════════════════════════════════════════════════════
     dim_rows = [
         ("Leadership", "#a371f7", [
             ("Trend Quality (EMA align + cloud + trend_up)", 35),
@@ -833,29 +979,62 @@ def _scoring_explainer_html() -> str:
             f'</div>'
         )
 
-    # ── Category thresholds — Balanced style, default settings ───────
-    # trading_style shifts Leadership/Conviction gates by +/-8; extension_tolerance
-    # shifts the Extension caps by -15/-8/0/+15; conviction_level sets the
-    # Actionable Conviction floor (40/60/75/85); entry_preference shifts Entry
-    # Quality by -10/0/+5. Numbers below are the Balanced/Actionable/Normal
-    # defaults — see Settings -> Trading Style for how they move.
+    sec_d = _section_head(
+        "D · Decision Engine", "#d29922",
+        "utils/decision_engine.py compute_decision() — independent 4-score framework, feeds Leadership / Conviction / Entry Quality / Extension / Recommendation columns",
+    )
+    sec_d += f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:16px;margin-bottom:8px;">' \
+              f'{"".join(_dim_block(d, c, f) for d, c, f in dim_rows)}</div>'
+
+    # Internal parameter detail — EMA20 Distance bands (EQ + Extension), RS Composite tiers
+    sec_d += '<div style="font-size:10px;font-weight:700;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em;margin:10px 0 6px">Internal Parameters — key bands</div>'
+    sec_d += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">'
+    sec_d += (
+        '<div><div style="font-size:10px;font-weight:700;color:#d29922;margin-bottom:4px">Entry Quality — EMA20 Distance (breakout entries)</div>'
+        + _mini_table([
+            ("&le;0%",    "+10", "below EMA20 — unusual for breakout"),
+            ("0-5%",      "+40", "excellent — close to EMA20"),
+            ("5-8%",      "+29", "normal post-breakout extension"),
+            ("8-12%",     "+18", "stretched but tradeable"),
+            ("12-18%",    "+8",  "extended"),
+            ("&gt;18%",   "+0",  "parabolic — avoid"),
+        ], cols=("EMA20 dist", "Pts", "Read"))
+        + '</div>'
+    )
+    sec_d += (
+        '<div><div style="font-size:10px;font-weight:700;color:#a371f7;margin-bottom:4px">Leadership — Relative Strength (composite)</div>'
+        + _mini_table([
+            ("&ge;12%",      "+30 (+4 top-decile)", "elite RS"),
+            ("8-12%",        "+26", "strong"),
+            ("5-8%",         "+22", "good"),
+            ("3-5%",         "+18", "positive"),
+            ("1-3%",         "+13", "modest"),
+            ("0-1%",         "+8",  "flat"),
+            ("-2-0%",        "+3",  "weak"),
+            ("&lt;-2%",      "+0",  "negative RS"),
+        ], cols=("RS composite", "Pts", "Read"))
+        + '</div>'
+    )
+    sec_d += '</div>'
+
+    # ── Category thresholds ─────────────────────────────────────────
     grades = [
         ("#f5c542", "Elite Opportunity — pullback path",
-         "Leadership >= 90 · Conviction >= 90 · Entry Quality >= 80 · Extension <= 25"),
+         "Leadership &ge; 90 &middot; Conviction &ge; 90 &middot; Entry Quality &ge; 80 &middot; Extension &le; 25"),
         ("#f5c542", "Elite Opportunity — breakout path",
-         "Fresh base/compression break + Vol >= 2.5x · Leadership >= 85 · Conviction >= 80 · EQ >= 65 · Extension <= 45"),
+         "Fresh base/compression break + Vol &ge; 2.5&times; &middot; Leadership &ge; 85 &middot; Conviction &ge; 80 &middot; EQ &ge; 65 &middot; Extension &le; 45"),
         ("#3fb950", "High Conviction",
-         "Leadership >= 80 · Conviction >= 80 · Entry Quality >= 60 · Extension <= 35"),
+         "Leadership &ge; 80 &middot; Conviction &ge; 80 &middot; Entry Quality &ge; 60 &middot; Extension &le; 35"),
         ("#4ade80", "Actionable",
-         "Leadership >= 70 · Conviction >= 60 · Entry Quality >= 60 · Extension <= 40"),
+         "Leadership &ge; 70 &middot; Conviction &ge; 60 &middot; Entry Quality &ge; 60 &middot; Extension &le; 40"),
         ("#d29922", "Setup Building",
-         "Leadership >= 70 · Conviction >= 50 — not all Actionable gates met"),
+         "Leadership &ge; 70 &middot; Conviction &ge; 50 — not all Actionable gates met"),
         ("#a78bfa", "Leader",
-         "Leadership >= 70 · Conviction < 50 — RS/momentum present, no setup structure yet"),
+         "Leadership &ge; 70 &middot; Conviction &lt; 50 — RS/momentum present, no setup structure yet"),
         ("#f97316", "Extended",
-         "Extension >= 60 — unless volume-climax exempt (fresh base/compression + Vol >= 2.5x)"),
+         "Extension &ge; 60 — unless volume-climax exempt (fresh base/compression + Vol &ge; 2.5&times;)"),
         ("#f85149", "Avoid",
-         "Leadership < 50, or hard stop / no trend / downtrend"),
+         "Leadership &lt; 50, or hard stop / no trend / downtrend"),
     ]
     grade_html = "".join(
         f'<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px;">'
@@ -866,13 +1045,19 @@ def _scoring_explainer_html() -> str:
         f'</div>'
         for c, label, desc in grades
     )
+    sec_d += (
+        f'<div style="border-top:1px solid rgba(255,255,255,0.08);padding-top:14px;margin:14px 0;">'
+        f'<div style="font-size:10px;font-weight:700;color:#8b949e;letter-spacing:0.08em;'
+        f'text-transform:uppercase;margin-bottom:8px;">Category Thresholds '
+        f'<span style="font-size:9px;font-weight:400">(Balanced style, default settings — shift with Trading Style / Extension Tolerance / Conviction Level)</span></div>'
+        f'{grade_html}</div>'
+    )
 
-    # ── Signal class table (ELITE/EXECUTE/WATCH/SKIP = table-display grouping) ──
     sc_rows_data = [
         ("ELITE",   "#f5c542", "Elite Opportunity",
-         "Highest conviction · either Elite path above · R:R must clear your Min Risk:Reward setting"),
+         "Highest conviction &middot; either Elite path above &middot; R:R must clear your Min Risk:Reward setting"),
         ("EXECUTE", "#3fb950", "High Conviction + Actionable",
-         "Actionable setup, tradeable now · R:R must clear your Min Risk:Reward setting"),
+         "Actionable setup, tradeable now &middot; R:R must clear your Min Risk:Reward setting"),
         ("WATCH",   "#d29922", "Setup Building + Leader",
          "Gates partially met — monitor for upgrade, or RS leader awaiting a base"),
         ("SKIP",    "#484f58", "Extended + Avoid",
@@ -889,34 +1074,26 @@ def _scoring_explainer_html() -> str:
         f'</tr>'
         for sc, c, name, conds in sc_rows_data
     )
+    sec_d += (
+        f'<div style="border-top:1px solid rgba(255,255,255,0.08);padding-top:14px;">'
+        f'<div style="font-size:10px;font-weight:700;color:#8b949e;letter-spacing:0.08em;'
+        f'text-transform:uppercase;margin-bottom:8px;">Signal Class — Priority (ELITE &gt; EXECUTE &gt; WATCH &gt; SKIP)</div>'
+        f'<table style="border-collapse:collapse;width:100%">{sc_rows_html}</table></div>'
+    )
 
     return f"""
 <div style="font-family:'JetBrains Mono','Fira Code',monospace;">
-  <p style="font-size:11px;color:#8b949e;margin:0 0 16px;">
-    Decision Engine scoring uses four independent 0-100 dimensions
-    (Leadership, Conviction, Entry Quality, Extension — Extension being
-    lower-is-better). Category and R:R gates below are shown for
-    <b>Balanced</b> trading style with default settings; Settings -> Trading
-    Style / Extension Tolerance / Conviction Level shift these thresholds.
+  <p style="font-size:11px;color:#8b949e;margin:0 0 8px;">
+    Two independent scoring systems run for every stock — <b style="color:#58a6ff">A/B/C</b> below
+    (Score / Action / Tier + the Opportunity Bonus layered on it) and
+    <b style="color:#d29922">D</b> (the Decision Engine's Leadership/Conviction/Entry Quality/Extension
+    &rarr; Recommendation). They can disagree on the same stock — that is expected, not a bug.
   </p>
-
-  <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:16px;margin-bottom:18px;">
-    {"".join(_dim_block(d, c, f) for d, c, f in dim_rows)}
-  </div>
-
-  <div style="border-top:1px solid rgba(255,255,255,0.08);padding-top:14px;margin-bottom:18px;">
-    <div style="font-size:10px;font-weight:700;color:#8b949e;letter-spacing:0.08em;
-    text-transform:uppercase;margin-bottom:8px;">Category Thresholds</div>
-    {grade_html}
-  </div>
-
-  <div style="border-top:1px solid rgba(255,255,255,0.08);padding-top:14px;margin-bottom:10px;">
-    <div style="font-size:10px;font-weight:700;color:#8b949e;letter-spacing:0.08em;
-    text-transform:uppercase;margin-bottom:8px;">Signal Class — Priority (ELITE &gt; EXECUTE &gt; WATCH &gt; SKIP)</div>
-    <table style="border-collapse:collapse;width:100%">{sc_rows_html}</table>
-  </div>
-
-  <p style="font-size:10px;color:#8b949e;margin:10px 0 0;font-style:italic;">
+  {sec_a}
+  {sec_b}
+  {sec_c}
+  {sec_d}
+  <p style="font-size:10px;color:#8b949e;margin:14px 0 0;font-style:italic;">
     A category that fails the Min Risk:Reward gate (Elite/High Conviction/Actionable
     only) is downgraded to Setup Building, with the reason shown in Qualification
     Summary's Rejected list. Use the per-stock breakdown (inside each tab) to see
@@ -2885,7 +3062,7 @@ body{background:#0d1117;margin:0;padding:4px 0 2px;}
             _stc.html(_QS_CSS + _qs_html, height=_qs_height, scrolling=False)
 
     # ── Scoring Explainer ─────────────────────────────────────────
-    with st.expander("📊 How CV1 Scores & Signal Classes are calculated", expanded=False):
+    with st.expander("📊 Scoring & Thresholds", expanded=False):
         st.markdown(_scoring_explainer_html(), unsafe_allow_html=True)
 
     # ── Toggles ──────────────────────────────────────────────────
