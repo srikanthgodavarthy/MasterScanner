@@ -1,0 +1,1327 @@
+"""
+utils/scanner_engine.py
+────────────────────────
+NSE Master Scanner — data fetch, indicator primitives, and live scanner.
+
+All scoring logic lives in utils/scoring_core.py (compute_bar / BarResult).
+score_stock() here is now a thin wrapper: build_indicators → compute_bar(i=-1).
+"""
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import streamlit as st
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import warnings
+warnings.filterwarnings("ignore")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  TIMEZONE HELPER
+# ══════════════════════════════════════════════════════════════════
+
+def _strip_tz(index: pd.Index) -> pd.Index:
+    idx = pd.to_datetime(index)
+    if hasattr(idx, "tz") and idx.tz is not None:
+        idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
+    if hasattr(idx, "as_unit"):
+        idx = idx.as_unit("ns")
+    return idx
+
+
+# ══════════════════════════════════════════════════════════════════
+#  INDICATOR PRIMITIVES  (imported by scoring_core and backtest)
+# ══════════════════════════════════════════════════════════════════
+
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+def sma(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period).mean()
+
+def rsi(series: pd.Series, period: int = 21) -> pd.Series:
+    delta    = series.diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
+    avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
+    rs       = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(com=period - 1, adjust=False).mean()
+
+def stochastic(high: pd.Series, low: pd.Series, close: pd.Series,
+                k_period: int = 14, d_period: int = 3) -> tuple[pd.Series, pd.Series]:
+    """
+    Standard Stochastic Oscillator. %K = (C - LLn)/(HHn - LLn)*100, %D = SMA(%K, d).
+
+    Single-owner home for this primitive (architecture cleanup): it used to
+    be a private copy (_stochastic) living only inside utils/pillar_engine.py.
+    Moved here, next to the other shared indicator primitives (ema/sma/rsi/
+    atr/cci), so utils/scoring_core.py (the main scanner engine) can use the
+    real Stochastic Oscillator too instead of not having one at all.
+    pillar_engine now imports this function rather than defining its own.
+    """
+    hh  = high.rolling(k_period).max()
+    ll  = low.rolling(k_period).min()
+    rng = (hh - ll).replace(0, np.nan)
+    k   = (close - ll) / rng * 100
+    d   = k.rolling(d_period).mean()
+    return k, d
+
+
+def cci(close: pd.Series, period: int = 20) -> pd.Series:
+    """Vectorised CCI — significantly faster than the original Python loop."""
+    sma_s = close.rolling(period).mean()
+    # mean absolute deviation (vectorised rolling via apply on numpy)
+    mad_s = close.rolling(period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
+    mad_s = mad_s.replace(0, np.nan)
+    return (close - sma_s) / (0.015 * mad_s)
+
+def highest(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period).max()
+
+def lowest(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period).min()
+
+def pivot_high(high: pd.Series, lb: int) -> pd.Series:
+    roll_max = high.rolling(2 * lb + 1, center=True, min_periods=2 * lb + 1).max()
+    return high.where(high == roll_max)
+
+def pivot_low(low: pd.Series, lb: int) -> pd.Series:
+    roll_min = low.rolling(2 * lb + 1, center=True, min_periods=2 * lb + 1).min()
+    return low.where(low == roll_min)
+
+def ichimoku(high: pd.Series, low: pd.Series):
+    tenkan   = (highest(high, 9)  + lowest(low, 9))  / 2
+    kijun    = (highest(high, 26) + lowest(low, 26)) / 2
+    senkou_a = (tenkan + kijun) / 2
+    senkou_b = (highest(high, 52) + lowest(low, 52)) / 2
+    return tenkan, kijun, senkou_a, senkou_b
+
+def last_value(series: pd.Series) -> float:
+    valid = series.dropna()
+    return float(valid.iloc[-1]) if not valid.empty else np.nan
+
+
+# ══════════════════════════════════════════════════════════════════
+#  HARMONIC / ABCD  (shared via scoring_core._get_pivots)
+# ══════════════════════════════════════════════════════════════════
+
+TOLERANCE = 0.03
+
+def _in_range(val, target, tol=TOLERANCE):
+    return abs(val - target) <= tol
+
+def _retrace(a, b, c_):
+    leg1 = abs(b - a)
+    return np.nan if leg1 == 0 else abs(c_ - b) / leg1
+
+def _check_harmonic(xP, aP, bP, cP, dP, abR, bcLo, bcHi, cdR, xdR):
+    ab = _retrace(xP, aP, bP)
+    bc = _retrace(aP, bP, cP)
+    cd = _retrace(bP, cP, dP)
+    xd_den = abs(aP - xP)
+    xd = abs(dP - xP) / xd_den if xd_den != 0 else np.nan
+    if any(np.isnan(v) for v in [ab, bc, cd, xd]):
+        return False
+    return (
+        _in_range(ab, abR) and
+        bcLo - TOLERANCE <= bc <= bcHi + TOLERANCE and
+        _in_range(cd, cdR) and
+        _in_range(xd, xdR)
+    )
+
+def detect_pattern(xP, aP, bP, cP, dP):
+    if _check_harmonic(xP, aP, bP, cP, dP, 0.500, 0.382, 0.886, 3.618, 1.618): return "Crab"
+    if _check_harmonic(xP, aP, bP, cP, dP, 0.786, 0.382, 0.886, 1.618, 1.272): return "Butterfly"
+    if _check_harmonic(xP, aP, bP, cP, dP, 0.500, 0.382, 0.886, 1.618, 0.886): return "Bat"
+    if _check_harmonic(xP, aP, bP, cP, dP, 0.618, 0.382, 0.886, 1.272, 0.786): return "Gartley"
+    return ""
+
+def detect_harmonic(pivots_price, pivots_is_high):
+    if len(pivots_price) < 5:
+        return "", ""
+    dP, cP, bP, aP, xP = pivots_price[:5]
+    dH, cH, bH, aH, xH = pivots_is_high[:5]
+    if (not xH) and aH and (not bH) and cH and (not dH):
+        name = detect_pattern(xP, aP, bP, cP, dP)
+        if name: return "bull", name
+    if xH and (not aH) and bH and (not cH) and dH:
+        name = detect_pattern(xP, aP, bP, cP, dP)
+        if name: return "bear", name
+    return "", ""
+
+def detect_abcd(pivots_price, pivots_is_high, close_val, open_val, prev_high):
+    if len(pivots_price) < 4:
+        return False, False
+    dP, cP, bP, aP = pivots_price[:4]
+    dH, cH, bH, aH = pivots_is_high[:4]
+    bc_r = _retrace(aP, bP, cP)
+    cd_r = _retrace(bP, cP, dP)
+    if np.isnan(bc_r) or np.isnan(cd_r):
+        return False, False
+    valid_bc = _in_range(bc_r, 0.618) or _in_range(bc_r, 0.786)
+    valid_cd = _in_range(cd_r, 1.272) or _in_range(cd_r, 1.618)
+    abcd_bull = (not aH) and bH and (not cH) and (not dH) and valid_bc and valid_cd
+    valid_struct   = dP > cP and dP > bP and dP > aP
+    bearish_candle = (close_val < open_val) or (prev_high is not None and close_val < prev_high)
+    abcd_bear = aH and (not bH) and cH and (not dH) and valid_struct and bearish_candle and valid_bc and valid_cd
+    return abcd_bull, abcd_bear
+
+
+# ══════════════════════════════════════════════════════════════════
+#  NIFTY 500 SYMBOLS
+# ══════════════════════════════════════════════════════════════════
+
+NIFTY500_SYMBOLS = [
+    "360ONE","3MINDIA","ABB","ACC","AIAENG","APLAPOLLO","AUBANK","AARTIIND",
+    "AAVAS","ABBOTINDIA","ACE","ADANIENSOL","ADANIENT","ADANIGREEN","ADANIPORTS","ADANIPOWER",
+    "ATGL","AWL","ABCAPITAL","ABFRL","AEGISLOG","AETHER","AFFLE","AJANTPHARM",
+    "APLLTD","ALKEM","ALKYLAMINE","ALLCARGO","ALOKINDS","ARE&M","AMBER","AMBUJACEM",
+    "ANANDRATHI","ANGELONE","ANURAS","APARINDS","APOLLOHOSP","APOLLOTYRE","APTUS","ACI",
+    "ASAHIINDIA","ASHOKLEY","ASIANPAINT","ASTERDM","ASTRAZEN","ASTRAL","ATUL","AUROPHARMA",
+    "AVANTIFEED","DMART","AXISBANK","BEML","BLS","BSE","BAJAJ-AUTO","BAJFINANCE",
+    "BAJAJFINSV","BAJAJHLDNG","BALAMINES","BALKRISIND","BALRAMCHIN","BANDHANBNK","BANKBARODA","BANKINDIA",
+    "MAHABANK","BATAINDIA","BAYERCROP","BERGEPAINT","BDL","BEL","BHARATFORG","BHEL",
+    "BPCL","BHARTIARTL","BIKAJI","BIOCON","BIRLACORPN","BSOFT","BLUEDART","BLUESTARCO",
+    "BBTC","BORORENEW","BOSCHLTD","BRIGADE","BRITANNIA","MAPMYINDIA","CCL","CESC",
+    "CGPOWER","CIEINDIA","CRISIL","CSBBANK","CAMPUS","CANFINHOME","CANBK","CAPLIPOINT",
+    "CGCL","CARBORUNIV","CASTROLIND","CEATLTD","CELLO","CENTRALBK","CDSL","CENTURYPLY",
+    "ABREL","CERA","CHALET","CHAMBLFERT","CHEMPLASTS","CHENNPETRO","CHOLAHLDNG","CHOLAFIN",
+    "CIPLA","CUB","CLEAN","COALINDIA","COCHINSHIP","COFORGE","COLPAL","CAMS",
+    "CONCORDBIO","CONCOR","COROMANDEL","CRAFTSMAN","CREDITACC","CROMPTON","CUMMINSIND","CYIENT",
+    "DCMSHRIRAM","DLF","DOMS","DABUR","DALBHARAT","DATAPATTNS","DEEPAKFERT","DEEPAKNTR",
+    "DELHIVERY","DEVYANI","DIVISLAB","DIXON","LALPATHLAB","DRREDDY","EIDPARRY","EIHOTEL",
+    "EPL","EASEMYTRIP","EICHERMOT","ELECON","ELGIEQUIP","EMAMILTD","ENDURANCE","ENGINERSIN",
+    "EQUITASBNK","ERIS","ESCORTS","ETERNAL","EXIDEIND","FDC","NYKAA","FEDERALBNK","FACT",
+    "FINEORG","FINCABLES","FINPIPE","FSL","FIVESTAR","FORTIS","GAIL","GMMPFAUDLR",
+    "GMRAIRPORT","GRSE","GICRE","GILLETTE","GLAND","GLAXO","ALIVUS","GLENMARK",
+    "MEDANTA","GPIL","GODFRYPHLP","GODREJCP","GODREJIND","GODREJPROP","GRANULES","GRAPHITE",
+    "GRASIM","GESHIP","GRINDWELL","GAEL","FLUOROCHEM","GUJGASLTD","GMDCLTD","GNFC",
+    "GPPL","GSFC","GSPL","HEG","HBLENGINE","HCLTECH","HDFCAMC","HDFCBANK",
+    "HDFCLIFE","HFCL","HAPPSTMNDS","HAPPYFORGE","HAVELLS","HEROMOTOCO","HSCL","HINDALCO",
+    "HAL","HINDCOPPER","HINDPETRO","HINDUNILVR","HINDZINC","POWERINDIA","HOMEFIRST","HONASA",
+    "HONAUT","HUDCO","ICICIBANK","ICICIGI","ICICIPRULI","ISEC","IDBI","IDFCFIRSTB",
+    "IFCI","IIFL","IRB","IRCON","ITC","ITI","INDIACEM","INDIAMART",
+    "INDIANB","IEX","INDHOTEL","IOC","IOB","IRCTC","IRFC","INDIGOPNTS",
+    "IGL","INDUSTOWER","INDUSINDBK","NAUKRI","INFY","INOXWIND","INTELLECT","INDIGO",
+    "IPCALAB","JBCHEPHARM","JKCEMENT","JBMA","JKLAKSHMI","JKPAPER","JMFINANCIL","JSWENERGY",
+    "JSWINFRA","JSWSTEEL","JAIBALAJI","J&KBANK","JINDALSAW","JSL","JINDALSTEL","JIOFIN",
+    "JUBLFOOD","JUBLINGREA","JUBLPHARMA","JWL","JUSTDIAL","JYOTHYLAB","KPRMILL","KEI",
+    "KNRCON","KPITTECH","KRBL","KSB","KAJARIACER","KPIL","KALYANKJIL","KANSAINER",
+    "KARURVYSYA","KAYNES","KEC","KFINTECH","KOTAKBANK","KIMS","LTF","LTTS",
+    "LICHSGFIN","LTM","LT","LATENTVIEW","LAURUSLABS","LXCHEM","LEMONTREE","LICI",
+    "LINDEINDIA","LLOYDSME","LUPIN","MMTC","MRF","MTARTECH","LODHA","MGL",
+    "MAHSEAMLES","M&MFIN","M&M","MHRIL","MAHLIFE","MANAPPURAM","MRPL","MANKIND",
+    "MARICO","MARUTI","MASTEK","MFSL","MAXHEALTH","MAZDOCK","MEDPLUS","METROBRAND",
+    "METROPOLIS","MINDACORP","MSUMI","MOTILALOFS","MPHASIS","MCX","MUTHOOTFIN","NATCOPHARM",
+    "NBCC","NCC","NHPC","NLCINDIA","NMDC","NSLNISP","NTPC","NH",
+    "NATIONALUM","NAVINFLUOR","NESTLEIND","NETWORK18","NAM-INDIA","NUVAMA","NUVOCO","OBEROIRLTY",
+    "ONGC","OIL","OLECTRA","PAYTM","OFSS","POLICYBZR","PCBL","PIIND",
+    "PNBHOUSING","PNCINFRA","PVRINOX","PAGEIND","PATANJALI","PERSISTENT","PETRONET","PHOENIXLTD",
+    "PIDILITIND","PIRAMALFIN","PPLPHARMA","POLYMED","POLYCAB","POONAWALLA","PFC","POWERGRID",
+    "PRAJIND","PRESTIGE","PRINCEPIPE","PRSMJOHNSN","PGHH","PNB","QUESS","RRKABEL",
+    "RBLBANK","RECLTD","RHIM","RITES","RADICO","RVNL","RAILTEL","RAINBOW",
+    "RAJESHEXPO","RKFORGE","RCF","RATNAMANI","RTNINDIA","RAYMOND","REDINGTON","RELIANCE",
+    "RBA","ROUTE","SBFC","SBICARD","SBILIFE","SJVN","SKFINDIA","SRF",
+    "SAFARI","SAMMAANCAP","MOTHERSON","SANOFI","SAPPHIRE","SAREGAMA","SCHAEFFLER","SCHNEIDER",
+    "SHREECEM","RENUKA","SHRIRAMFIN","SHYAMMETL","SIEMENS","SIGNATURE","SOBHA","SOLARINDS",
+    "SONACOMS","SONATSOFTW","STARHEALTH","SBIN","SAIL","SWSOLAR","STLTECH","SUMICHEM",
+    "SPARC","SUNPHARMA","SUNTV","SUNDARMFIN","SUNDRMFAST","SUNTECK","SUPREMEIND","SUZLON",
+    "SYNGENE","TVSMOTOR","TATACAP","TATACHEM","TATACOMM","TCS","TATACONSUM","TATAELXSI",
+    "TATAPOWER","TATASTEEL","TATATECH","TECHM","TEJASNET","TITAN","TORNTPHARM","TORNTPOWER",
+    "TRENT","TRIDENT","TIINDIA","UPL","UTIAMC","ULTRACEMCO","UNIONBANK","UBL",
+    "VOLTAS","WELCORP","WELSPUNLIV","WIPRO","YESBANK","ZYDUSLIFE","ZYDUSWELL","ECLERX",
+    "TMCV","TMPV","EMCURE","GODIGIT","GRAVITA","IREDA","JKTYRE","JPPOWER","NTPCGREEN",
+    "JSWCEMENT","AKZOINDIA","KIRLOSENG","LTFOODS","NEULANDLAB","NEWGEN","PFIZER","SCI",
+    "FORCEMOT","TEGA","TITAGARH","HDBFS","ICICIAMC","PIRAMALFIN","PWL",
+]
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DATA FETCHING
+# ══════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
+    try:
+        df = yf.Ticker(f"{symbol}.NS").history(period=period, interval=interval, auto_adjust=True)
+        if df.empty or len(df) < 60:
+            return pd.DataFrame()
+        df.index   = _strip_tz(pd.to_datetime(df.index))
+        df.columns = [c.lower() for c in df.columns]
+        return df[["open", "high", "low", "close", "volume"]]
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=30, show_spinner=False)   # 30s TTL — live price patch
+def _fetch_live_prices(symbols: tuple) -> dict:
+    """
+    Fetch today's live bar (partial or complete) using period='5d', interval='1d'.
+    yfinance includes the current intraday bar in this period even during market hours.
+    Returns {sym: (today_date, open, high, low, close, volume)} or {} on failure.
+    """
+    if not symbols:
+        return {}
+    tickers = [f"{s}.NS" for s in symbols]
+    try:
+        raw = yf.download(tickers, period="5d", interval="1d",
+                          auto_adjust=True, group_by="ticker",
+                          threads=True, progress=False)
+    except Exception:
+        return {}
+
+    result = {}
+    single = len(tickers) == 1
+    for sym, ticker in zip(symbols, tickers):
+        try:
+            df = raw if single else raw[ticker]
+            df = df.dropna(how="all")
+            if df.empty:
+                continue
+            df.index   = _strip_tz(pd.to_datetime(df.index))
+            df.columns = [c.lower() for c in df.columns]
+            last = df.iloc[-1]
+            result[sym] = {
+                "date":   df.index[-1],
+                "open":   float(last["open"]),
+                "high":   float(last["high"]),
+                "low":    float(last["low"]),
+                "close":  float(last["close"]),
+                "volume": float(last["volume"]),
+            }
+        except Exception:
+            continue
+    return result
+
+
+def _patch_live_prices(data: dict, live: dict) -> dict:
+    """
+    Overwrite the last row of each symbol's OHLCV DataFrame with the live bar.
+    If today's date is already the last index, update in-place.
+    If today is a new date (market open, new day), append a new row.
+    """
+    from datetime import date
+    today = pd.Timestamp(date.today())
+
+    patched = {}
+    for sym, df in data.items():
+        if sym not in live:
+            patched[sym] = df
+            continue
+        lv = live[sym]
+        lv_date = pd.Timestamp(lv["date"]).normalize()
+        df_copy = df.copy()
+
+        if df_copy.index[-1].normalize() == lv_date:
+            # Same day — update last row with live data
+            df_copy.loc[df_copy.index[-1], "close"]  = lv["close"]
+            df_copy.loc[df_copy.index[-1], "high"]   = max(df_copy.iloc[-1]["high"],  lv["high"])
+            df_copy.loc[df_copy.index[-1], "low"]    = min(df_copy.iloc[-1]["low"],   lv["low"])
+            df_copy.loc[df_copy.index[-1], "volume"] = lv["volume"]
+        else:
+            # New day — append live bar
+            new_row = pd.DataFrame([{
+                "open":   lv["open"],
+                "high":   lv["high"],
+                "low":    lv["low"],
+                "close":  lv["close"],
+                "volume": lv["volume"],
+            }], index=[lv_date])
+            df_copy = pd.concat([df_copy, new_row])
+
+        patched[sym] = df_copy
+    return patched
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") -> dict:
+    if not symbols:
+        return {}
+    tickers = [f"{s}.NS" for s in symbols]
+    try:
+        raw = yf.download(tickers, period=period, interval=interval,
+                          auto_adjust=True, group_by="ticker", threads=True, progress=False)
+    except Exception:
+        return {}
+    result = {}
+    single = len(tickers) == 1
+    for sym, ticker in zip(symbols, tickers):
+        try:
+            df = raw if single else raw[ticker]
+            df = df.dropna(how="all")
+            if df.empty or len(df) < 60:
+                continue
+            df.index   = _strip_tz(pd.to_datetime(df.index))
+            df.columns = [c.lower() for c in df.columns]
+            result[sym] = df[["open", "high", "low", "close", "volume"]]
+        except Exception:
+            continue
+    return result
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_nifty(period: str = "1y") -> pd.Series:
+    """Fetch Nifty 50 (^NSEI) close series for regime classification."""
+    try:
+        df = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
+        if not df.empty:
+            nifty = df["Close"].rename("nifty")
+            nifty.index = _strip_tz(pd.to_datetime(nifty.index))
+            return nifty
+    except Exception:
+        pass
+    return pd.Series(dtype=float)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_nifty_ohlcv(period: str = "1y") -> pd.DataFrame:
+    """
+    Fetch full OHLCV for Nifty 50 (^NSEI).
+    Used by regime_engine to compute a real Wilder ADX on the index
+    instead of the EMA-slope proxy.
+    Returns an empty DataFrame on failure.
+    """
+    try:
+        df = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
+        if not df.empty:
+            df.index   = _strip_tz(pd.to_datetime(df.index))
+            df.columns = [c.lower() for c in df.columns]
+            return df[["open", "high", "low", "close", "volume"]]
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def fetch_nifty_live() -> tuple[float, float | None]:
+    """
+    Return (current_price, day_pct_change) for Nifty 50 (^NSEI).
+
+    Uses IST-aware date comparison so today_bars is always correct
+    regardless of server timezone (UTC on cloud, IST locally).
+    """
+    import pytz
+    _IST = pytz.timezone("Asia/Kolkata")
+
+    def _today_ist() -> pd.Timestamp:
+        """Return today's date in IST as a tz-naive Timestamp (midnight)."""
+        return pd.Timestamp.now(tz=_IST).normalize().tz_localize(None)
+
+    try:
+        # 2-day 1-min bars gives today's open and latest tick
+        df = yf.Ticker("^NSEI").history(period="2d", interval="1m", auto_adjust=True)
+        if df.empty:
+            return 0.0, None
+        df.index = _strip_tz(pd.to_datetime(df.index))
+        today = _today_ist()
+        today_bars = df[df.index.normalize() == today]
+        if today_bars.empty:
+            # Market not yet open — fall back to last two daily closes
+            daily = yf.Ticker("^NSEI").history(period="5d", auto_adjust=True)
+            if len(daily) >= 2:
+                last = float(daily["Close"].iloc[-1])
+                prev = float(daily["Close"].iloc[-2])
+                return last, round((last - prev) / prev * 100, 2)
+            return 0.0, None
+        current = float(today_bars["Close"].iloc[-1])
+        prev_day = df[df.index.normalize() < today]
+        prev_close = float(prev_day["Close"].iloc[-1]) if not prev_day.empty else None
+        pct = round((current - prev_close) / prev_close * 100, 2) if prev_close else None
+        return current, pct
+    except Exception:
+        return 0.0, None
+
+
+# ══════════════════════════════════════════════════════════════════
+#  NIFTY REGIME CLASSIFIER
+# ══════════════════════════════════════════════════════════════════
+
+def nifty_regime(nifty: pd.Series) -> str:
+    """
+    Classify Nifty as 'bull', 'bear', or 'neutral' based on price vs EMA50/EMA200.
+    Called once per scanner run; result injected into ScoringParams for all stocks.
+
+    bull   — price > EMA200 AND EMA50 > EMA200 (strong uptrend)
+    bear   — price < EMA200 AND EMA50 < EMA200 (downtrend)
+    neutral — mixed (e.g. EMA crossover in progress)
+    """
+    if nifty.empty or len(nifty) < 200:
+        return "neutral"
+    e50  = ema(nifty, 50)
+    e200 = ema(nifty, 200)
+    cur   = float(nifty.iloc[-1])
+    e50v  = float(e50.iloc[-1])
+    e200v = float(e200.iloc[-1])
+    if cur > e200v and e50v > e200v:
+        return "bull"
+    if cur < e200v and e50v < e200v:
+        return "bear"
+    return "neutral"
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SCORE_STOCK  — thin wrapper around scoring_core.compute_bar
+# ══════════════════════════════════════════════════════════════════
+
+def _primary_blocker(r, result: dict) -> str:
+    """
+    Identify the single most important reason a stock is not Actionable.
+
+    Called from score_stock() after compute_decision() — has access to both
+    the raw BarResult (r) and the full result dict (DecisionScores fields
+    already merged in). Decision engine is kept regime-agnostic; this lives
+    here in the scanner layer.
+
+    Returns a short human-readable string, or "" for Actionable/better.
+    """
+    category = result.get("Category", "Avoid")
+
+    # Nothing to block for already-actionable stocks
+    if category in ("Elite Opportunity", "High Conviction", "Actionable"):
+        return ""
+
+    # Extended is its own blocker — show it directly
+    if category == "Extended":
+        ext = int(result.get("Extension", result.get("EntryQuality", 0)) or 0)
+        return f"Extended ({ext}) — wait for pullback to EMA/Fib"
+
+    # Pull scores — use CV1 for Leadership (matches scanner display colours at threshold 65);
+    # fall back to DE values when CV1 is absent.
+    ls = float(result.get("CV1_Leadership",  result.get("Leadership",   result.get("DE_Leadership",   0))) or 0)
+    cv = float(result.get("CV1_Conviction",   result.get("Conviction",   result.get("DE_Conviction",   0))) or 0)
+    eq = float(result.get("CV1_EntryQuality", result.get("EntryQuality", result.get("DE_EntryQuality", 0))) or 0)
+    ext= float(result.get("Extension",       0) or 0)
+
+    # Priority 1: Leadership gate — threshold aligned with _SCORE_THRESHOLDS["Leadership"]=65
+    # and _bucket() in scanner.py so blocker text and score colours are consistent.
+    if ls < 65:
+        ls_rs   = int(result.get("_ds_ls_rs",   result.get("_de_ls_rs",   0)) or 0)
+        ls_trend= int(result.get("_ds_ls_trend", result.get("_de_ls_trend",0)) or 0)
+        detail = "trend below EMA" if ls_trend < 20 else "RS below market"
+        return f"Weak Leadership ({int(ls)}) — {detail}"
+
+    # Priority 2: Extension (if high, entry quality doesn't matter)
+    if ext >= 60:
+        return f"Extended ({int(ext)}) — wait for pullback"
+
+    # Priority 3: Conviction (setup quality — Fib zone / CCI / squeeze)
+    if cv < 50:
+        # Prefer CV1's cv_fib_zone which accounts for both pullback AND
+        # continuation paths (stock above Fib 61.8% / above pivot high).
+        # Fall back to DE cv_fib (now also updated with continuation path).
+        cv_fib  = int(result.get("_cv1_cv_fib",  result.get("_ds_cv_fib",  0)) or 0)
+        cv_cci  = int(result.get("_ds_cv_pattern",      result.get("_cv1_cv_cci",  0)) or 0)
+        if cv_fib < 8:
+            sub = "no Fib setup / continuation"
+        elif cv_cci < 8:
+            sub = "CCI not recovered"
+        else:
+            sub = f"DE score {int(cv)}"
+        return f"Low Conviction ({int(cv)}) — {sub}"
+
+    # Priority 4: Entry Quality (too extended from entry levels)
+    if eq < 60:
+        eq_ema = int(result.get("_ds_eq_ema20_dist", result.get("_cv1_eq_ema20", 0)) or 0)
+        eq_piv = int(result.get("_ds_eq_pivot_dist", result.get("_cv1_eq_piv",  0)) or 0)
+        if eq_ema < 10:
+            sub = "too far above EMA20"
+        elif eq_piv < 8:
+            sub = "too far above pivot"
+        else:
+            sub = f"DE score {int(eq)}"
+        return f"Low Entry Quality ({int(eq)}) — {sub}"
+
+    # Priority 5: CCI momentum not confirmed
+    try:
+        cci_val = float(getattr(r, "cur_cci", None) or result.get("_cci_raw", 0) or 0)
+        if cci_val < 0:
+            return f"CCI Negative ({int(cci_val)}) — momentum not confirmed"
+    except (TypeError, ValueError):
+        pass
+
+    # Leader / Setup Building with everything borderline
+    if category == "Leader":
+        return f"Leader — DE conviction {int(cv)} (need 50) · await base"
+    return f"Setup Building — DE conviction {int(cv)} (need 60) or DE entry {int(eq)} (need 60)"
+
+
+def score_stock(
+    df:       pd.DataFrame,
+    nifty:    pd.Series,
+    settings: dict | None = None,
+    # legacy keyword args kept for backwards compatibility
+    cci_len:  int   = 20,
+    cci_ob:   int   = 100,
+    cci_os:   int   = -100,
+    pvt_lb:   int   = 20,
+    atr_prox: float = 0.3,
+) -> dict:
+    """
+    Evaluate the LATEST bar of df.
+    Returns a flat dict ready for the scanner table, or {} on failure.
+
+    settings dict (from pages/settings.py) takes priority over legacy kwargs.
+    """
+    if df.empty or len(df) < 210:
+        return {}
+
+    from utils.scoring_core import ScoringParams, build_indicators, compute_bar
+
+    if settings:
+        params = ScoringParams.from_settings(settings)
+    else:
+        params = ScoringParams(
+            cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
+            pvt_lb=pvt_lb, atr_prox=atr_prox,
+        )
+
+    ia = build_indicators(df, nifty, params)
+    r  = compute_bar(ia, i=-1, params=params)   # -1 = latest bar
+
+    if r is None:
+        return {}
+
+    result = {
+        # ── display columns ──────────────────────────────────────
+        "Stock":        None,
+        "Tier":         r.tier,
+        "AccTier":      r.acc_tier,
+        "AccScore":     r.acc_score,
+        "_elite_tier":  r.elite_tier,
+        "TrendPhase":   r.trend_phase,
+        "BuyType":      r.buy_type,
+        "_cci_rising":  r.cci_rising,
+        "FreshBase":    r.fresh_base_breakout,
+        "TrendAge":     r.trend_age_bars,
+        "TrendFresh":   r.trend_freshness,
+        "RS_Top10":     r.rs_top_decile,
+        "RS1m":         round(r.rs1 * 100, 2),
+        "RS3m":         round(r.rs3 * 100, 2),
+        "RS6m":         round(r.rs6 * 100, 2),
+        "RScomp":       round(r.rs_composite * 100, 2),
+        "Score":        r.norm_score,
+        "Action":       r.action,
+        "Setup":        r.setup,
+        "Buy Type":     r.buy_type,
+        "CCI":          round(r.cur_cci),
+        "CCI State":    r.cci_state,
+        "CCI Sig":      r.cci_signal,
+        "Qual":         r.qual_icon,
+        "%Chg":         r.pct_chg,
+        "Entry":        r.entry,
+        "SL":           r.sl,
+        "T1":           r.t1,
+        "T2":           r.t2,
+        "T3":           r.t3,
+        # ── internals ────────────────────────────────────────────
+        "_qualified":           r.qualified,
+        "_persistent_strength": r.persistent_strength,
+        "_high_prob":           r.high_prob,
+        "_in_golden":           r.in_golden,
+        "_in_golden_relaxed":   r.in_golden_relaxed,
+        "_in_golden_cci":       r.in_golden_cci,
+        "_above_cloud":         r.above_cloud,
+        "_inside_cloud":        r.inside_cloud,
+        "_allow_cloud":         r.allow_cloud,
+        "_ema_alignment":       r.ema_alignment,
+        "_trend_structure":     r.trend_structure,
+        "_squeeze_on":          r.squeeze_on,
+        "_squeeze_release":     r.squeeze_release,
+        "_compression_break":   r.compression_break,
+        "_cci_momentum_break":  r.cci_momentum_break,
+        "_trend_up":            r.trend_up,
+        "_harm_bull":           r.harm_bull,
+        "_abcd_bull":           r.abcd_bull,
+        "_any_buy":             r.any_buy,
+        "_tier1_prime":         r.tier1_prime,
+        "_tier2_momentum":      r.tier2_momentum,
+        "_recent_cci_rec":      r.recent_cci_recovery,
+        "_hard_stop":           r.hard_stop,
+        "_t2_compression":      r.t2_compression,
+        "_t2_fib_qual":         r.t2_fib_qual,
+        "_t2_fib_cci":          r.t2_fib_cci,
+        "_t2_harmonic":         r.t2_harmonic,
+        "_t2_abcd":             r.t2_abcd,
+        "_t2_cci_break":        r.t2_cci_break,
+        "_t3_near_golden":      r.t3_near_golden,
+        "_t3_cci_rec":          r.t3_cci_rec,
+        "_t3_cloud_test":       r.t3_cloud_test,
+        "_t3_ema_conv":         r.t3_ema_conv,
+        "_t4_hard_stop":        r.t4_hard_stop,
+        "_t4_fib_resist":       r.t4_fib_resist,
+        "_t4_downtrend":        r.t4_downtrend,
+        "_rsi":                 r.cur_rsi,
+        "_mom1":                r.mom1,
+        "_mom3":                r.mom3,
+        "_mom6":                r.mom6,
+        "_cci_raw":             r.cur_cci,
+        "_fib618":              r.fib618,
+        "_fib500":              r.fib500,
+        "_fib382":              r.fib382,
+        "_nifty_regime":        r.nifty_regime_val,
+        "_vol_ratio":           round(r.vol_ratio, 3),
+        # ── NEW: Tier-1 strength fields ──────────────────────────
+        "RS":           round(r.rs_val * 100, 2),   # pct vs Nifty, 5-bar
+        "ADX":          round(r.adx_val, 1),
+        "EMA Slope":    round(r.ema20_slope, 2),
+        "_rs_positive": r.rs_positive,
+        "_strength_ok": r.strength_ok,
+        # ── LL Opportunity + Stochastic Convergence (migrated from Five
+        #    Pillars — native scanner fields now, not just FP_* display-only
+        #    columns; already folded into Score/Action above). See
+        #    utils/ll_opportunity.py and utils/stoch_convergence.py.
+        "LL_Actionable":     r.ll_actionable,
+        "LL_Defended":       r.ll_defended,
+        "LL_DistanceATR":    r.ll_distance_atr,
+        "LL_Price":          r.ll_price,
+        "LL_BonusPts":       r.ll_bonus_pts,
+        "StochK":            r.stoch_k,
+        "StochD":            r.stoch_d,
+        "Stoch_Reignition":  r.stoch_reignition,
+        "Stoch_Confluence":  r.stoch_confluence,
+        "Stoch_BonusPts":    r.stoch_bonus_pts,
+        "OpportunityBonus":  r.opportunity_bonus_pts,
+        # Suggestion 3: Tier-1 path audit
+        "T1Path":       r.t1_path,
+        # Suggestion 2: score components (kept as _internal — not shown in table)
+        "_score_components": r.score_components,
+        # Suggestion 4: raw BarResult for typed regime engine extraction
+        "_bar_result":  r,
+    }
+
+    # ── Decision Engine (4-score framework) ──────────────────────
+    # Runs AFTER all existing logic; uses only already-computed BarResult fields.
+    try:
+        from utils.decision_engine import compute_decision
+        ds = compute_decision(r, settings or {})
+        result.update({
+            "Leadership":    ds.leadership,
+            "Conviction":    ds.conviction,
+            "EntryQuality":  ds.entry_quality,
+            "Extension":     ds.extension,
+            "Lifecycle":     ds.lifecycle,     # objective stock state (settings-independent)
+            "Recommendation":ds.recommendation,  # trader-adjusted label (respects settings)
+            "RR":            ds.risk_reward,
+            "RR_RejectReason": ds.rr_reject_reason,
+            # ── Bars-since-setup banding (key question: "Can I still enter today?")
+            "BarsBand":      ds.bars_band,         # "Actionable" | "Late" | "Extended"
+            "BarsSince":     ds.bars_since_setup,
+            "MoveSince":     ds.price_move_since_setup,
+            "EMA20Dist":     ds.ema20_pct_dist,
+            "EMA50Dist":     ds.ema50_pct_dist,
+            "PivotDist":     ds.pivot_high_dist,
+            # Sub-scores stored as internals for detail view
+            "_ds_ls_trend":      ds.ls_trend,
+            "_ds_ls_rs":         ds.ls_rs,
+            "_ds_ls_momentum":   ds.ls_momentum,
+            "_ds_ls_volume":     ds.ls_volume,
+            "_ds_ls_freshness":  ds.ls_freshness,
+            "_ds_cv_pattern":    ds.cv_pattern,
+            "_ds_cv_fib":        ds.cv_fib,
+            "_ds_cv_compression":ds.cv_compression,
+            "_ds_cv_rs_lead":    ds.cv_rs_lead,
+            # New entry quality measured sub-scores
+            "_ds_eq_ema20_dist": ds.eq_ema20_dist,
+            "_ds_eq_ema50_dist": ds.eq_ema50_dist,
+            "_ds_eq_pivot_dist": ds.eq_pivot_dist,
+            "_ds_eq_move_since": ds.eq_move_since,
+            "_ds_eq_bars_since": ds.eq_bars_since,
+            # New extension measured sub-scores
+            "_ds_ex_ema20_dist": ds.ex_ema20_dist,
+            "_ds_ex_ema50_dist": ds.ex_ema50_dist,
+            "_ds_ex_pivot_dist": ds.ex_pivot_dist,
+            "_ds_ex_move_since": ds.ex_move_since,
+            "_ds_ex_bars_since": ds.ex_bars_since,
+            # Trend Quality Score (Sprint 1)
+            "TrendQuality":          ds.trend_quality,
+            "_ds_tq_age":            ds.tq_age,
+            "_ds_tq_align":          ds.tq_align,
+            "_ds_tq_rs":             ds.tq_rs,
+            "_ds_tq_pullback":       ds.tq_pullback,
+            # Explainability (Sprint 1) — stored as JSON strings for DataFrame compat
+            "_explain_included":     "|".join(ds.why_included)   if ds.why_included   else "",
+            "_explain_not_higher":   "|".join(ds.why_not_higher) if ds.why_not_higher else "",
+            "_explain_risks":        "|".join(ds.risk_factors)   if ds.risk_factors   else "",
+            # ── Sub-score breakdown for DE Leadership factor attribution ─────────
+            "_de_ls_trend":   ds.ls_trend,      # EMA structure + cloud (0-35) — biggest bucket
+            "_de_ls_rs":      ds.ls_rs,         # RS composite (0-30)
+            "_de_ls_momentum":ds.ls_momentum,   # mom3/mom6 % returns (0-15)
+            "_de_ls_volume":  ds.ls_volume,     # vol_ratio sponsorship (0-10)
+            "_de_ls_freshness":ds.ls_freshness, # trend freshness decay (0-10)
+        })
+    except Exception as _de_exc:           # DE failure: log, never silently swallow
+        import logging as _log
+        _log.warning(
+            "[decision_engine] compute_decision() failed for symbol — "
+            "Leadership/Conviction/Lifecycle/Recommendation/RR will be absent. "
+            "Error: %s", _de_exc, exc_info=True
+        )
+
+    # ── Conviction Score v1 (backtest-validated weights) ─────────
+    # Pure re-mapping of existing BarResult fields — zero new indicators.
+    # Produces: CV1_Leadership, CV1_Conviction, CV1_EntryQuality, CV1_SignalClass
+    # and all sub-score internals for the detail-view breakdown panel.
+    try:
+        from utils.conviction_score_v1 import compute_conviction_v1
+        cv1 = compute_conviction_v1(r)
+        result.update({
+            "CV1_Leadership":    cv1.leadership,
+            "CV1_Conviction":    cv1.conviction,
+            "CV1_EntryQuality":  cv1.entry_quality,
+            "CV1_Composite":     cv1.composite,
+            "CV1_SignalClass":   cv1.signal_class,
+            # Grade labels
+            "CV1_LS_Grade":      cv1.leadership_grade,
+            "CV1_CV_Grade":      cv1.conviction_grade,
+            "CV1_EQ_Grade":      cv1.entry_quality_grade,
+            # Leadership sub-scores
+            "_cv1_ls_rs":        cv1.ls_rs_composite,
+            "_cv1_ls_age":       cv1.ls_trend_age,
+            "_cv1_ls_adx":       cv1.ls_adx,
+            "_cv1_ls_ps":        cv1.ls_persistent_strength,
+            "_cv1_ls_slope":     cv1.ls_ema20_slope,
+            # Conviction sub-scores
+            "_cv1_cv_structure": cv1.cv_trend_structure,
+            "_cv1_cv_fib":       cv1.cv_fib_zone,
+            "_cv1_cv_cci":       cv1.cv_cci_recovery,
+            "_cv1_cv_volume":    cv1.cv_volume,
+            "_cv1_cv_squeeze":   cv1.cv_squeeze,
+            # Entry Quality sub-scores
+            "_cv1_eq_ema20":     cv1.eq_ema20_dist,
+            "_cv1_eq_ema50":     cv1.eq_ema50_dist,
+            "_cv1_eq_pivot":     cv1.eq_pivot_dist,
+            "_cv1_eq_move":      cv1.eq_move_since_setup,
+            "_cv1_eq_bars":      cv1.eq_bars_since_setup,
+        })
+
+        # ── CV1 ACTION GATE ───────────────────────────────────────
+        # The original Action column (✅ BUY / 👁 WATCH / ⛔ SKIP) was
+        # assigned purely from norm_score in compute_bar(), with zero
+        # reference to the Conviction pipeline.  This caused BUY signals
+        # with avg Conviction ≈ 22 (audit finding: lines 523-553 of report).
+        #
+        # Fix: after CV1 is computed we reconcile Action with CV1_SignalClass.
+        # Rule: BUY is only kept when CV1 agrees (ELITE or EXECUTE).
+        #       If CV1 downgrades, we floor Action to the CV1-implied level
+        #       but never *upgrade* beyond what norm_score already decided.
+        #
+        #   CV1=ELITE   → keep/upgrade to BUY  (highest conviction)
+        #   CV1=EXECUTE → keep/upgrade to BUY  (actionable)
+        #   CV1=WATCH   → cap at WATCH          (insufficient conviction for BUY)
+        #   CV1=SKIP    → cap at SKIP           (structural failure)
+        #
+        # The original Action from norm_score is preserved as _action_raw
+        # so we can measure disagreement rate in diagnostics.
+        _action_raw = result.get("Action", r.action)
+        result["_action_raw"] = _action_raw          # for diagnostics
+        sc = cv1.signal_class                        # ELITE | EXECUTE | WATCH | SKIP
+
+        if sc in ("ELITE", "EXECUTE"):
+            # CV1 approves — honour norm_score decision (BUY/WATCH/SKIP)
+            # but promote WATCH→BUY only if norm_score itself was BUY
+            gated_action = _action_raw
+        elif sc == "WATCH":
+            # Cap: BUY becomes WATCH; WATCH/SKIP stay as-is
+            gated_action = "👁 WATCH" if _action_raw == "✅ BUY" else _action_raw
+        else:  # SKIP
+            # Full downgrade: BUY/WATCH both become SKIP
+            gated_action = "⛔ SKIP" if _action_raw in ("✅ BUY", "👁 WATCH") else _action_raw
+
+        result["Action"] = gated_action
+
+    except Exception:
+        pass   # non-critical; Action column retains norm_score value
+
+    # ── Five Pillars Ranking Engine ───────────────────────────────
+    # Standalone additive model (Structure/Acceptance/Leadership/Momentum/
+    # Risk). Reuses the already-built IndicatorArrays (ia) — no re-fetch,
+    # no recomputation of EMA/RSI/ATR. Adds VWAP + Fixed Range Volume
+    # Profile (POC/VAH/VAL) and Stochastic Oscillator, which don't exist
+    # anywhere else in the engine.
+    #
+    # NOTE (architecture cleanup): this FP_*/_fp_* block is display-only —
+    # it feeds pages/five_pillars.py and nothing else; it does NOT influence
+    # Score/Action/Conviction above. Its Stochastic Oscillator and LL Spring
+    # (Reversal pillar) detectors are now the same shared, single-owner
+    # implementations (utils.scanner_engine.stochastic, utils.ll_opportunity)
+    # that scoring_core.compute_bar() uses natively above to produce the
+    # LL_*/Stoch_* columns and fold them into Score/Action — so the two
+    # engines can no longer silently disagree on what a "Stochastic
+    # Convergence" or "LL Opportunity" is, only on how heavily each one
+    # weights it.
+    try:
+        from utils.pillar_engine import compute_pillars_from_ia
+        fp = compute_pillars_from_ia(df, ia, cfg=settings or {})
+        if not fp.error:
+            result.update({
+                "FP_Structure":   fp.structure_score,
+                "FP_Acceptance":  fp.acceptance_score,
+                "FP_Reversal":    fp.reversal_score,
+                "FP_Leadership":  fp.leadership_score,
+                "FP_Momentum":    fp.momentum_score,
+                "FP_Risk":        fp.risk_penalty,
+                "FP_FinalScore":  fp.final_score,
+                "FP_Class":       fp.classification,
+                "FP_ClassNote":   fp.classification_note,
+                # Structure internals (20 pts — EMA alignment/slope + HH/HL only)
+                "_fp_ema_stack":       fp.s_ema_stack,
+                "_fp_ema20_rising":    fp.s_ema20_rising,
+                "_fp_ema50_rising":    fp.s_ema50_rising,
+                "_fp_ema200_rising":   fp.s_ema200_rising,
+                "_fp_price_above_e20": fp.s_price_above_e20,
+                "FP_SwingLabel":       fp.s_swing_label,
+                "_fp_hh_hl_intact":    fp.s_hh_hl_intact,
+                "_fp_no_breakdown":    fp.s_no_breakdown,
+                # Acceptance internals (25 pts — VWAP + Volume Profile + OBV)
+                "FP_VWAP":        round(fp.vwap, 2),
+                "FP_POC":         round(fp.poc, 2),
+                "FP_VAH":         round(fp.vah, 2),
+                "FP_VAL":         round(fp.val, 2),
+                "_fp_above_poc":            fp.a_above_poc,
+                "_fp_above_vwap":            fp.a_above_vwap,
+                "_fp_accepted_above_va":      fp.a_accepted_above_va,
+                "_fp_holding_above_zone":      fp.a_holding_above_zone,
+                "_fp_obv_trend_rising":         fp.a_obv_trend_rising,
+                "_fp_obv_leading_price":         fp.a_obv_leading_price,
+                "FP_OBV":                            round(fp.obv_value, 0),
+                # Opportunity Quality Bonus internals (10 pts, layered on
+                # the 90pt base — formerly "LL Elite Bonus")
+                "_fp_r_actionable_ll":              fp.r_actionable_ll,
+                "_fp_r_ll_defended":                  fp.r_ll_defended,
+                "_fp_r_distance_atr_ok":                fp.r_distance_atr_ok,
+                "_fp_r_distance_atr_pts":                 fp.r_distance_atr_pts,
+                "_fp_r_high_volume_confirmation":         fp.r_high_volume_confirmation,
+                "FP_LLPrice":                                  round(fp.r_ll_price, 2),
+                "FP_LLPriorLow":                                round(fp.r_prior_low_price, 2),
+                "FP_LLBarsToReclaim":                            fp.r_bars_to_reclaim,
+                "_fp_r_bars_since_reclaim":                      fp.r_bars_since_reclaim,
+                "_fp_r_vertical_extension":                      fp.r_vertical_extension,
+                "FP_LLDistanceATR":                                fp.r_distance_atr,
+                "FP_LLConfidence":                                   fp.r_confidence,
+                # Leadership internals (13 pts)
+                "FP_RS1m":        fp.rs_1m,
+                "FP_RS3m":        fp.rs_3m,
+                "FP_RS6m":        fp.rs_6m,
+                "FP_RelMomentum": fp.rel_momentum,
+                "_fp_l_rs_pts":     fp.l_rs_pts,
+                "_fp_l_mom_pts":     fp.l_mom_pts,
+                "_fp_l_sector_pts":   fp.l_sector_pts,
+                # Momentum internals (35 pts — today's trigger only)
+                "FP_StochK":         fp.stoch_k,
+                "FP_StochD":         fp.stoch_d,
+                "_fp_stoch_cross_up":            fp.stoch_cross_up,
+                "_fp_rsi_val":                     fp.rsi_val,
+                "_fp_rsi_above_50":                 fp.rsi_above_50,
+                "_fp_vwap_reaction_pts":              fp.m_vwap_reaction_pts,
+                "_fp_returned_above_vwap":             fp.m_returned_above_vwap,
+                "_fp_fresh_stoch_reignition":            fp.m_fresh_stoch_reignition,
+                "_fp_breakout_confirmed":                 fp.m_breakout_confirmed,
+                "_fp_volume_expansion":                    fp.m_volume_expansion,
+                "_fp_reaction_score":                       fp.m_reaction_score,
+                # VWAP Reclaim pattern diagnostics (now real values)
+                "_fp_vwap_touch_found":    fp.m_vwap_touch_found,
+                "_fp_touch_bar":           fp.m_touch_bar,
+                "_fp_touch_distance_atr":  fp.m_touch_distance_atr,
+                "_fp_reaction_strength":   fp.m_reaction_strength,
+                "_fp_confluence":          fp.m_confluence,
+                "_fp_pattern_age":         fp.m_pattern_age,
+                "_fp_vwap_rising":         fp.m_vwap_rising,
+                # Independent Risk Engine internals (max -20 deduction)
+                "_fp_risk_ema20_extension":   fp.risk_ema20_extension,
+                "_fp_risk_atr_extension":      fp.risk_atr_extension,
+                "_fp_risk_exhaustion_candle":   fp.risk_exhaustion_candle,
+                "_fp_risk_parabolic_move":       fp.risk_parabolic_move,
+                "_fp_risk_climactic_volume":      fp.risk_climactic_volume,
+                "FP_DistEMA20Pct": fp.dist_from_ema20_pct,
+                "FP_ATRExtension": fp.atr_extension,
+            })
+    except Exception as _fp_exc:
+        import logging as _log
+        _log.warning(
+            "[pillar_engine] compute_pillars_from_ia() failed for symbol — "
+            "FP_* columns will be absent. Error: %s", _fp_exc, exc_info=True
+        )
+
+    # ── Conviction Gap diagnostic field ──────────────────────────
+    # ConvictionGap = CV1_Conviction - DE_Conviction
+    # Positive  → CV1 sees more structural quality than DE (common in momentum runners
+    #             with RS/CCI strength but no Fib zone or compression setup).
+    #             These stocks now receive Category='Leader' instead of 'Avoid'.
+    # Near zero → both engines agree; Category and CV1_SignalClass should align.
+    # Negative  → DE sees more than CV1 (rare; signals a pattern-heavy bar without RS).
+    try:
+        cv1_cv = result.get("CV1_Conviction")
+        de_cv  = result.get("Conviction")
+        if cv1_cv is not None and de_cv is not None:
+            gap = int(cv1_cv) - int(de_cv)
+            result["ConvictionGap"] = gap
+            # Profile interpretation:
+            #   Runner     (gap >= +25) — CV1 sees RS/CCI momentum; DE finds no Fib/compression base.
+            #                             These stocks move on continuation energy, not structure.
+            #                             If backtests show Runners timeout more than Aligned,
+            #                             DE is protecting you. If equal, DE Conviction is too strict.
+            #   Aligned    (-24 to +24) — both engines agree; Category and CV1_SignalClass should match.
+            #   Base Builder (gap <= -25) — DE finds pattern/compression structure CV1 hasn't picked up yet.
+            #                             Rare. Worth watching — base may be forming before RS kicks in.
+            if gap >= 25:
+                result["ConvictionProfile"] = "Runner"
+            elif gap <= -25:
+                result["ConvictionProfile"] = "Base Builder"
+            else:
+                result["ConvictionProfile"] = "Aligned"
+    except Exception:
+        pass
+
+    # ── Primary Blocker ──────────────────────────────────────────
+    # Computed here (scanner layer) because it needs both DecisionScores and
+    # the raw BarResult.  Decision engine is kept regime-agnostic.
+    # NOTE: must run AFTER the CV1 block above — _primary_blocker() prefers
+    # CV1_Leadership/CV1_Conviction/CV1_EntryQuality (the values shown in the
+    # UI table) and falls back to the legacy DE scores only if CV1 failed.
+    # Running it earlier meant those CV1_* lookups always missed, so the
+    # blocker text silently graded against invisible DE numbers instead of
+    # the scores the user was actually looking at.
+    try:
+        category = result.get("Recommendation", result.get("Category", "Avoid"))
+        blocker = _primary_blocker(r, result)
+        result["Primary Blocker"] = blocker if category not in ("Elite Opportunity", "High Conviction", "Actionable") else ""
+    except Exception:
+        pass
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
+#  BATCH SCANNER
+# ══════════════════════════════════════════════════════════════════
+
+_BATCH_SIZE = 150
+
+def run_scanner(
+    symbols:     list,
+    settings:    dict | None = None,
+    cci_len:     int  = 20,
+    cci_ob:      int  = 100,
+    cci_os:      int  = -100,
+    max_workers: int  = 10,
+    progress_cb       = None,
+) -> pd.DataFrame:
+    """
+    Two-phase scanner.
+    Nifty regime is computed once here from live data, then injected into
+    the settings dict so every score_stock() call uses the same value
+    without redundant per-stock computation.
+    """
+    total     = len(symbols)
+    n_batches = max(1, (total + _BATCH_SIZE - 1) // _BATCH_SIZE)
+
+    all_data: dict = {}
+    for batch_i, start in enumerate(range(0, total, _BATCH_SIZE)):
+        chunk      = tuple(symbols[start: start + _BATCH_SIZE])
+        batch_data = fetch_batch_ohlcv(chunk, period="1y", interval="1d")
+        all_data.update(batch_data)
+        if progress_cb:
+            progress_cb(0.5 * (batch_i + 1) / n_batches)
+
+    # ── Patch live prices (today's intraday bar) ──────────────────
+    # FIX: only call _fetch_live_prices when today's bar is missing from the
+    # batch download (avoids a duplicate 500-symbol yf.download on most runs).
+    try:
+        from datetime import date as _date
+        _today = pd.Timestamp(_date.today())
+        stale_syms = tuple(
+            sym for sym in symbols
+            if sym in all_data and all_data[sym].index[-1].normalize() < _today
+        )
+        if stale_syms:
+            live_prices = _fetch_live_prices(stale_syms)
+            all_data    = _patch_live_prices(all_data, live_prices)
+    except Exception:
+        pass   # non-fatal — fall back to cached OHLCV
+
+    nifty_series = fetch_nifty("1y")
+    regime_val   = nifty_regime(nifty_series)   # bull / bear / neutral — computed once
+
+    # Inject regime into settings so ScoringParams picks it up
+    effective_settings = dict(settings) if settings else {}
+    effective_settings["nifty_regime_val"] = regime_val
+    # nifty_regime_filter already in settings from the UI toggle (defaults False)
+
+    results = []
+    done    = 0
+
+    def process(sym):
+        df = all_data.get(sym, pd.DataFrame())
+        if df.empty:
+            return None
+        row = score_stock(df, nifty_series, settings=effective_settings,
+                          cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os)
+        if row:
+            row["Stock"] = sym
+        return row
+
+    with ThreadPoolExecutor(max_workers=max_workers) as exe:
+        futures = {exe.submit(process, s): s for s in symbols}
+        for fut in as_completed(futures):
+            done += 1
+            if progress_cb:
+                progress_cb(0.5 + 0.5 * done / total)
+            row = fut.result()
+            if row:
+                results.append(row)
+
+    if not results:
+        return pd.DataFrame()
+
+    df_out = pd.DataFrame(results)
+    df_out = df_out.sort_values("Score", ascending=False).reset_index(drop=True)
+    df_out.index += 1
+
+    # ── RS Universe Ranking ───────────────────────────────────────
+    # Percentile rank within scanned universe. Top 10% = RS leaders.
+    if "RScomp" in df_out.columns and len(df_out) > 1:
+        try:
+            from scipy.stats import rankdata
+            raw_ranks         = rankdata(df_out["RScomp"].fillna(0).values, method="average")
+            df_out["RS_Rank"] = (raw_ranks / len(raw_ranks) * 100).round(1)
+            df_out["RS_Top10"]= df_out["RS_Rank"] >= 90
+        except Exception:
+            df_out["RS_Rank"] = 50.0
+            df_out["RS_Top10"]= False
+    else:
+        df_out["RS_Rank"] = 50.0
+        df_out["RS_Top10"]= False
+
+    # ── Setup Persistence (frozen trade plans) ────────────────────
+    # Entry / SL / Targets are LOCKED on first Actionable detection.
+    # Subsequent scans READ frozen levels — no daily drift.
+    df_out = _enrich_with_setup_persistence(df_out)
+
+    return df_out
+
+
+def _enrich_with_setup_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
+    """
+    Load existing setup plans from Supabase, enrich the scanner DataFrame
+    with frozen trade levels and lifecycle metadata, then persist any new
+    or updated plans back to Supabase.
+
+    Designed to be a silent no-op when Supabase is unavailable.
+    All errors are caught and logged; scanner output is never blocked.
+    """
+    try:
+        from utils.supabase_client import (
+            load_open_setup_plans,
+            load_first_seen,
+            upsert_setup_plans_batch,
+            upsert_first_seen,
+        )
+        from utils.setup_persistence import enrich_scanner_dataframe
+        import logging as _log
+        _logger = _log.getLogger(__name__)
+
+        # Load existing OPEN plans (WAITING/ACTIVE/T1_HIT) + first-seen dates.
+        # WAITING plans must be included here too — otherwise a plan that
+        # hasn't triggered yet would never get re-evaluated against the
+        # next day's price and could sit stale forever.
+        existing_plans = load_open_setup_plans()    # {symbol: SetupPlan}
+        first_seen_map = load_first_seen()           # {symbol: "YYYY-MM-DD"}
+
+        # Record first-seen for new entrants before enrichment.
+        # NOTE: reads "Recommendation" first, falling back to "Category" —
+        # matching what enrich_scanner_row() itself uses to decide whether
+        # to mint a plan. ("Category" alone is rarely populated on this
+        # dict; Recommendation is the field decision_engine.py actually sets.)
+        new_symbols = [
+            (str(row.get("Stock", "")), str(row.get("Recommendation", row.get("Category", ""))))
+            for _, row in df_out.iterrows()
+            if str(row.get("Stock", "")).upper() not in first_seen_map
+        ]
+        if new_symbols:
+            upsert_first_seen(new_symbols)
+            from datetime import date as _d
+            today_str = _d.today().isoformat()
+            for sym, _ in new_symbols:
+                first_seen_map[sym.upper()] = today_str
+
+        # Count symbols qualifying for plan creation before enrichment.
+        # This is diagnostic only — the actual creation decision is made
+        # inside enrich_scanner_row(), which is recommendation-aware ONLY
+        # at creation time and never again afterwards.
+        from utils.setup_persistence import _FREEZE_CATEGORIES
+        qualifying_symbols = [
+            str(row.get("Stock", "")).upper()
+            for _, row in df_out.iterrows()
+            if str(row.get("Recommendation", row.get("Category", ""))) in _FREEZE_CATEGORIES
+        ]
+        _logger.info(
+            "[SETUP PLAN SCAN] total_rows=%d  qualifying_symbols=%d  categories=%s",
+            len(df_out),
+            len(qualifying_symbols),
+            list(_FREEZE_CATEGORIES),
+        )
+        if qualifying_symbols:
+            _logger.info("[SETUP PLAN SCAN] qualifying_list=%s", qualifying_symbols)
+
+        # Enrich DataFrame
+        enriched_df, updated_plans = enrich_scanner_dataframe(
+            df_out,
+            existing_plans,
+            first_seen_map,
+            price_col="Entry",
+        )
+
+        # Persist changed plans back to Supabase.
+        # New plans are minted in status=WAITING (not ACTIVE — that now
+        # specifically means "entry triggered"), so a freshly-created
+        # plan is identified by WAITING + first_actionable_date == today.
+        _today_str = __import__("datetime").date.today().isoformat()
+        new_plans   = [
+            p for p in updated_plans
+            if p.status == "WAITING" and p.first_actionable_date == _today_str
+        ]
+        other_plans = [p for p in updated_plans if p not in new_plans]
+        _logger.info(
+            "[SETUP PLAN PERSIST] updated_total=%d  new_inserts=%d  status_changes=%d",
+            len(updated_plans), len(new_plans), len(other_plans),
+        )
+
+        if updated_plans:
+            plan_dicts = [p.to_db_dict() for p in updated_plans]
+            upsert_setup_plans_batch(plan_dicts)
+
+        return enriched_df
+
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            "setup_persistence enrichment skipped: %s", exc
+        )
+        for col in ["SetupID", "FirstSeen", "FirstActionable", "DaysActive",
+                    "PlanStatus", "LockedRecommendation", "ActivatedAt", "T1HitAt", "ClosedAt",
+                    "EntryLocked", "SLLocked", "T1Locked",
+                    "T2Locked", "T3Locked", "SetupAge", "TradePlanStatus",
+                    "EntryDriftPct"]:
+            if col not in df_out.columns:
+                df_out[col] = ""
+        return df_out
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SUGGESTION 11: SCAN PERSISTENCE COUNTER
+#  Count consecutive scans a symbol has appeared in Elite/Tier-1.
+#  Requires Supabase scan history.  Returns a dict {symbol: streak}.
+# ══════════════════════════════════════════════════════════════════
+
+def compute_scan_streaks(
+    scan_history: "list[dict]",
+    tier_col:     str = "tier",
+    sym_col:      str = "symbol",
+    count_tiers:  tuple = ("Elite", "Tier 1"),
+    n_scans:      int   = 10,
+) -> "dict[str, int]":
+    """
+    Given a list of scan snapshot dicts (newest first), return
+    {symbol: consecutive_streak} counting the number of the most
+    recent scans in which the symbol appeared in a qualifying tier.
+
+    Parameters
+    ----------
+    scan_history : list of dicts, each dict has sym_col and tier_col keys.
+                   Ordered newest → oldest (as returned by load_scan_history).
+    tier_col     : column name for tier string in each snapshot row.
+    sym_col      : column name for symbol string.
+    count_tiers  : tuple of tier strings that count toward a streak.
+    n_scans      : how many recent scans to look back (default 10).
+
+    Returns
+    -------
+    dict {symbol: streak_count}  — only symbols with streak >= 1 included.
+    """
+    if not scan_history:
+        return {}
+
+    import pandas as pd
+    df = pd.DataFrame(scan_history)
+    if sym_col not in df.columns or tier_col not in df.columns:
+        return {}
+
+    # Group by scan run (if there is a run_at column, use it; else use positional order)
+    run_col = "run_at" if "run_at" in df.columns else None
+    if run_col:
+        runs = [grp for _, grp in df.groupby(run_col, sort=False)]
+    else:
+        # treat each row as its own run (legacy)
+        runs = [df.iloc[[i]] for i in range(len(df))]
+
+    # Keep only the most recent n_scans
+    runs = runs[:n_scans]
+
+    # For each symbol track consecutive streak from most recent scan back
+    all_symbols = df[sym_col].unique()
+    streaks: dict[str, int] = {}
+
+    for sym in all_symbols:
+        streak = 0
+        for run_df in runs:
+            sym_rows = run_df[run_df[sym_col] == sym]
+            appeared = not sym_rows.empty and sym_rows[tier_col].isin(count_tiers).any()
+            if appeared:
+                streak += 1
+            else:
+                break   # consecutive streak broken
+        if streak >= 1:
+            streaks[sym] = streak
+
+    return streaks
+
+
+def add_streak_column(
+    df_scan:      "pd.DataFrame",
+    scan_history: "list[dict]",
+    n_scans:      int = 10,
+) -> "pd.DataFrame":
+    """
+    Add a 'Streak' column to a scanner result DataFrame.
+    Streak = number of recent consecutive scans the stock appeared in T1/Elite.
+    """
+    streaks = compute_scan_streaks(scan_history, n_scans=n_scans)
+    df_scan = df_scan.copy()
+    df_scan["Streak"] = df_scan["Stock"].map(streaks).fillna(0).astype(int)
+    return df_scan
+
+
+# ══════════════════════════════════════════════════════════════════
+#  COLOUR HELPERS
+# ══════════════════════════════════════════════════════════════════
+
+def score_color(score: int) -> str:
+    if score >= 85: return "#16a34a"
+    if score >= 75: return "#22c55e"
+    if score >= 65: return "#4ade80"
+    if score >= 50: return "#f59e0b"
+    return "#ef4444"
+
+def action_color(action: str) -> str:
+    if "BUY"   in action: return "#16a34a"
+    if "WATCH" in action: return "#f59e0b"
+    return "#ef4444"
+
+def cci_color(cci_val: float, ob: int = 100, os: int = -100) -> str:
+    if cci_val >= ob: return "#ef4444"
+    if cci_val <= os: return "#22c55e"
+    return "#3b82f6"
+
+def acc_tier_color(t: str) -> tuple:
+    return {
+        "T1★": ("#4c1d95", "#c4b5fd"),
+        "A":   ("#1e3a5f", "#60a5fa"),
+        "B":   ("#14532d", "#4ade80"),
+        "C":   ("#78350f", "#fcd34d"),
+        "D":   ("#1c1917", "#78716c"),
+    }.get(t, ("#1c1917", "#78716c"))
