@@ -94,15 +94,6 @@ def _symbols_from_source(source: str, settings: dict | None) -> tuple[list[str],
             return default_syms, "All"
         return syms, "All"
 
-    if source == "🏛️ Five Pillars":
-        if scan_df.empty or "FP_Class" not in scan_df.columns:
-            st.warning("⚠️ No Five Pillars data — run the Live Scanner first.", icon="⚠️")
-            return default_syms, "All"
-        sub = scan_df[scan_df["FP_Class"].isin(["Execute", "Watch"])]
-        sc = _sym_col(sub)
-        syms = sorted(sub[sc].dropna().unique().tolist()) if sc else default_syms
-        return (syms or default_syms), "All"
-
     if source == "📐 CCI Master":
         cci_df = st.session_state.get("cci_master_df", pd.DataFrame())
         if cci_df.empty:
@@ -124,7 +115,6 @@ def render(settings=None):
         "🌟 Elite (Scanner)",
         "⚡ Execute (Scanner)",
         "📐 Fib Pullback (Scanner)",
-        "🏛️ Five Pillars",
         "📐 CCI Master",
     ]
     SOURCE_HELP = {
@@ -132,7 +122,6 @@ def render(settings=None):
         "🌟 Elite (Scanner)":        "Scanner engine · symbols from Elite Opportunity tab of last scan.",
         "⚡ Execute (Scanner)":      "Scanner engine · symbols from High Conviction / Actionable tab of last scan.",
         "📐 Fib Pullback (Scanner)": "Scanner engine · Fib Pullback stocks (trend-up + golden zone + CCI ≤ −100) from last scan.",
-        "🏛️ Five Pillars":           "Five Pillars engine · entry when FP score crosses ≥ 90 (Execute class), exit < 65.",
         "📐 CCI Master":             "CCI Master engine · entry on CCI crossover from oversold, exit on crossunder 0/OB.",
     }
     SOURCE_BADGE = {
@@ -140,13 +129,11 @@ def render(settings=None):
         "🌟 Elite (Scanner)":        "<span style='background:#1a2a00;color:#ffd700;border:1px solid #ffd700;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>engine: scanner</span>",
         "⚡ Execute (Scanner)":      "<span style='background:#001a12;color:#22c55e;border:1px solid #22c55e;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>engine: scanner</span>",
         "📐 Fib Pullback (Scanner)": "<span style='background:#0a1628;color:#58a6ff;border:1px solid #58a6ff;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>engine: scanner</span>",
-        "🏛️ Five Pillars":           "<span style='background:#1a1200;color:#d29922;border:1px solid #d29922;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>engine: five_pillars · FP ≥ 90 → entry</span>",
         "📐 CCI Master":             "<span style='background:#001a1a;color:#00e676;border:1px solid #00e676;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>engine: cci_master · BUY crossover → entry</span>",
     }
 
     _ENGINE_TO_SOURCE = {
         "scanner":      "Custom",
-        "five_pillars": "🏛️ Five Pillars",
         "cci_master":   "📐 CCI Master",
         "fib_pullback": "📐 Fib Pullback (Scanner)",
     }
@@ -159,7 +146,7 @@ def render(settings=None):
             SOURCE_OPTIONS,
             index=SOURCE_OPTIONS.index(_default_source) if _default_source in SOURCE_OPTIONS else 0,
             key="bt_source",
-            help="Choose which pool of stocks to backtest. Scanner / Five Pillars / CCI Master sources auto-populate the symbol list from the last scan. Defaults from Settings → System → Default Backtest Engine.",
+            help="Choose which pool of stocks to backtest. Scanner / CCI Master sources auto-populate the symbol list from the last scan. Defaults from Settings → System → Default Backtest Engine.",
         )
     with badge_col:
         st.markdown("<div style='padding-top:1.9rem'></div>", unsafe_allow_html=True)
@@ -284,7 +271,6 @@ def render(settings=None):
             "🌟 Elite (Scanner)":        "<b style='color:#ffd700'>Elite (Scanner)</b>",
             "⚡ Execute (Scanner)":      "<b style='color:#22c55e'>Execute (Scanner)</b>",
             "📐 Fib Pullback (Scanner)": "<b style='color:#58a6ff'>Fib Pullback (Scanner)</b>",
-            "🏛️ Five Pillars":           "<b style='color:#d29922'>Five Pillars</b>",
             "📐 CCI Master":             "<b style='color:#00e676'>CCI Master</b>",
         }
         _bt_tags = [
@@ -333,7 +319,6 @@ def render(settings=None):
             "🌟 Elite (Scanner)":        "scanner",
             "⚡ Execute (Scanner)":      "scanner",
             "📐 Fib Pullback (Scanner)": "scanner",
-            "🏛️ Five Pillars":           "five_pillars",
             "📐 CCI Master":             "cci_master",
         }
         _bt_mode = _SOURCE_MODE.get(bt_source, "scanner")
@@ -383,7 +368,6 @@ def render(settings=None):
                 "🌟 Elite (Scanner)":        " — Only Elite Opportunity stocks from your last scan were tested.",
                 "⚡ Execute (Scanner)":      " — Only Execute/High Conviction stocks from your last scan were tested.",
                 "📐 Fib Pullback (Scanner)": " — Only Fib Pullback stocks from your last scan were tested.",
-                "🏛️ Five Pillars":           " — Only Execute+Watch FP_Class stocks from your last scan were tested.",
                 "📐 CCI Master":             " — Only STRONG BUY+BUY rated stocks from the last CCI Master scan were tested.",
             }
             _hint = _src_hints.get(bt_source, "")
@@ -1208,8 +1192,10 @@ def render(settings=None):
     with st.expander("🔬 VWAP Reclaim Parameter Sensitivity", expanded=False):
         st.markdown("""
 **Optimization Framework** — evaluate which VWAP Reclaim parameter combinations
-produce the highest Profit Factor and Expectancy. Runs the Five Pillars backtest
-for each combination and outputs a ranked sensitivity table.
+produce the highest Profit Factor and Expectancy. Runs the scanner engine backtest
+for each combination (VWAP Reclaim is scored inside Momentum's Stochastic
+Convergence bonus — see Settings → Institutional Continuation) and outputs a
+ranked sensitivity table.
 
 > ⚠️ Runs in-process — can take several minutes for large universes.
 """)
@@ -1224,13 +1210,10 @@ for each combination and outputs a ranked sensitivity table.
             opt_rxn_caps   = st.multiselect("Reaction Max ATR", [1.0, 1.5, 2.0, 2.5],
                 default=[1.0, 1.5, 2.0], key="opt_rxn_caps")
 
-        c4, c5 = st.columns(2)
+        c4, = st.columns(1)
         with c4:
             opt_conf_bars  = st.multiselect("Confluence Window", [1, 2, 3],
                 default=[1, 2, 3], key="opt_conf_bars")
-        with c5:
-            opt_min_rs     = st.multiselect("Min Reaction Score", [0, 10, 20, 30],
-                default=[0, 10, 20], key="opt_min_rs")
 
         if st.button("🚀 Run Sensitivity Sweep", key="btn_opt_sweep"):
             import itertools
@@ -1242,26 +1225,24 @@ for each combination and outputs a ranked sensitivity table.
                 opt_lookbacks or [3],
                 opt_rxn_caps or [1.5],
                 opt_conf_bars or [2],
-                opt_min_rs or [0],
             ))
             st.info(f"Running {len(combos)} parameter combinations …")
             prog = st.progress(0)
             results = []
 
-            for k, (atr_m, lb, rxn, cfb, min_r) in enumerate(combos):
+            for k, (atr_m, lb, rxn, cfb) in enumerate(combos):
                 ic_override = {
                     "ic_vwap_touch_atr_mult": atr_m,
                     "ic_vwap_touch_lookback": lb,
                     "ic_reaction_max_atr":    rxn,
                     "ic_confluence_window":   cfb,
-                    "ic_min_reaction_score":  min_r,
                 }
                 try:
                     _summary, _trades = run_backtest(
-                        mode="five_pillars",
+                        mode="scanner",
                         symbols=st.session_state.get("bt_symbols", [])[:30],
                         hold_days=st.session_state.get("bt_hold_days", 20),
-                        extra_pillar_cfg=ic_override,
+                        settings=ic_override,
                     )
                     vra_r = build_vwap_reclaim_analysis(_trades)
                     ov = vra_r.get("overall", {})
@@ -1270,7 +1251,6 @@ for each combination and outputs a ranked sensitivity table.
                         "Lookback":       lb,
                         "Rxn Max ATR":    rxn,
                         "Conf Bars":      cfb,
-                        "Min RS":         min_r,
                         "Trades":         ov.get("count", 0),
                         "Win%":           ov.get("win_rate", 0),
                         "PF":             ov.get("profit_factor", 0),
@@ -1280,7 +1260,7 @@ for each combination and outputs a ranked sensitivity table.
                 except Exception as _e:
                     results.append({"ATR Mult": atr_m, "Lookback": lb,
                                     "Rxn Max ATR": rxn, "Conf Bars": cfb,
-                                    "Min RS": min_r, "Error": str(_e)})
+                                    "Error": str(_e)})
                 prog.progress((k + 1) / len(combos))
 
             if results:
