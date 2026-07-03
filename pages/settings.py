@@ -560,8 +560,8 @@ def _tab_advanced() -> None:
     with st.expander("Institutional Continuation", expanded=False):
         st.markdown(
             "<small style='color:#8b949e'>Controls the VWAP Reclaim + Stochastic "
-            "Confluence pattern used by the Momentum bonus in the scanner "
-            "engine (utils/stoch_convergence.py).</small>",
+            "Confluence pattern in the Momentum Pillar. All parameters apply to "
+            "the Five Pillars scanner and backtest engine.</small>",
             unsafe_allow_html=True,
         )
         c1, c2 = st.columns(2)
@@ -650,6 +650,7 @@ def _tab_system() -> None:
     _label("Default Backtest Engine")
     _ENGINE_OPTIONS = {
         "scanner":      "📡 Scanner (Decision Engine)",
+        "five_pillars": "🏛️ Five Pillars",
         "cci_master":   "📐 CCI Master",
     }
     _cur_engine = _g("bt_default_engine", "scanner")
@@ -663,7 +664,9 @@ def _tab_system() -> None:
     )
     _s("bt_default_engine", _engine_choice)
     st.caption(
-        "Which engine the Backtest page's Signal Source defaults to."
+        "Which engine the Backtest page's Signal Source defaults to. "
+        "Five Pillars and Scanner (Decision Engine) use different scoring "
+        "logic — pick whichever you're actively iterating on."
     )
 
     # Connection status

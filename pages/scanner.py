@@ -1113,15 +1113,7 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     data_rows = ""
     for i, (_, row) in enumerate(df.iterrows()):
         stock = str(row.get("Stock", row.get("Symbol", "?")))
-        # [FIX] This table is entirely CV1-sourced (_cv1_ls_*/_cv1_cv_*/_cv1_eq_*
-        # sub-factors, header "Class"). It must show the real CV1_SignalClass
-        # (ELITE/EXECUTE/WATCH/SKIP — the only keys _SC_STYLE recognises), not
-        # DE's long-form Recommendation text ("Elite Opportunity", "Actionable",
-        # ...). The old `row.get("Recommendation", row.get("CV1_SignalClass",...))`
-        # always resolved to Recommendation because that key is always present,
-        # so CV1_SignalClass was never actually read — the badge silently fell
-        # through to _SC_STYLE's gray default and displayed the wrong label.
-        sc    = str(row.get("CV1_SignalClass", row.get("Recommendation", "WATCH")))
+        sc    = str(row.get("Recommendation", row.get("CV1_SignalClass", "WATCH")))
         ls    = int(row.get("Leadership",   row.get("Leadership",   0)))
         cv    = int(row.get("Conviction",   row.get("Conviction",   0)))
         eq    = int(row.get("EntryQuality", row.get("EntryQuality", 0)))
@@ -2094,11 +2086,7 @@ def _breakdown_row_html(label: str, pts: int, max_pts: int, color: str) -> str:
 
 
 def _detail_breakdown_panel(row: pd.Series) -> str:
-    # [FIX] same bug as the Signal Factor Matrix above: this panel is titled
-    # "Conviction Score v1 — sub-score breakdown" and must badge the real
-    # CV1_SignalClass, not DE's Recommendation text (see comment at the
-    # Signal Factor Matrix call site for the full explanation).
-    sc  = str(row.get("CV1_SignalClass", row.get("Signal Class", row.get("Recommendation", "WATCH"))))
+    sc  = str(row.get("Recommendation", row.get("Signal Class", "Watch")))
     ls  = int(row.get("Leadership",   0))
     cv  = int(row.get("Conviction",   0))
     eq  = int(row.get("EntryQuality", 0))
