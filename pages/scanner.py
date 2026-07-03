@@ -18,7 +18,6 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
-import streamlit.components.v1 as _stc
 import pandas as pd
 from datetime import datetime
 try:
@@ -78,9 +77,9 @@ _CAT_STYLE = {
 # The "Recommendation" column on scanner rows holds the long-form category
 # text above ("Elite Opportunity", "Actionable", ...), NOT the short
 # ELITE/EXECUTE/WATCH/SKIP tokens used for Signal Class styling. Anywhere
-# that needs to bucket by signal class (e.g. the Qualification Summary
-# panel) must go through this normalization first — comparing the raw
-# Recommendation text directly against "ELITE"/"EXECUTE"/etc. never matches.
+# that needs to bucket by signal class must go through this normalization
+# first — comparing the raw Recommendation text directly against
+# "ELITE"/"EXECUTE"/etc. never matches.
 _CATEGORY_TO_SC = {
     "Elite Opportunity": "ELITE",
     "High Conviction":   "EXECUTE",
@@ -343,32 +342,6 @@ _CSS = """
   border-left-width: 2px;
   border-left-style: solid;
 }
-
-/* ── Qualification Summary ── */
-.qual-summary {
-  background: var(--bg1);
-  border: 1px solid var(--border);
-  border-left: 3px solid #4ade80;
-  border-radius: 8px;
-  padding: 10px 14px;
-  margin: 8px 0 12px;
-  font-family: var(--mono);
-  font-size: 12px;
-}
-.qs-header { margin-bottom: 8px; }
-.qs-title { font-size: 11px; font-weight: 700; color: var(--muted); letter-spacing: 0.06em; text-transform: uppercase; }
-.qs-body { display: flex; flex-direction: column; gap: 6px; }
-.qs-stats { display: flex; gap: 20px; flex-wrap: wrap; align-items: baseline; }
-.qs-stat { display: flex; align-items: baseline; gap: 6px; }
-.qs-num { font-size: 18px; font-weight: 700; line-height: 1; }
-.qs-label { font-size: 10px; color: var(--muted); font-weight: 500; letter-spacing: 0.04em; }
-.qs-reject-block { border-top: 1px solid var(--border); padding-top: 6px; margin-top: 2px; }
-.qs-reject-head { font-size: 10px; font-weight: 600; color: #f85149; text-transform: uppercase; letter-spacing: 0.05em; margin-right: 8px; }
-.qs-reject-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 5px; }
-.qs-reject-item { background: rgba(248,81,73,0.08); border: 1px solid rgba(248,81,73,0.25); border-radius: 5px; padding: 2px 8px; font-size: 11px; }
-.qs-reject-reason { color: #f85149; font-size: 10px; }
-
-
 
 /* ── Rich HTML results table ── */
 .rt-wrap {
@@ -676,9 +649,9 @@ _TOOLTIP_JS = """
 # [FIX] These were 65/50/50 — stale vs decision_engine.py's actual Actionable
 # gate, which requires Leadership>=70, Conviction>=60 (conviction_level
 # "Actionable" default), Entry Quality>=60 (_classify_category_with_settings).
-# Kept in sync with those three numbers so the score-column coloring and the
-# Qualification Summary's SKIP-bucketing agree with what actually qualifies
-# a stock, rather than an older, looser cut that predates the v8-v9 tightening.
+# Kept in sync with those three numbers so the score-column coloring agrees
+# with what actually qualifies a stock, rather than an older, looser cut
+# that predates the v8-v9 tightening.
 _SCORE_THRESHOLDS = {
     "Leadership":    70,
     "Conviction":    60,
@@ -871,8 +844,10 @@ def _scoring_explainer_html() -> str:
     )
     sec_b += _note(
         "<b>opportunity_bonus = ll_bonus (0-10) + stoch_bonus (0-10)</b>, capped so "
-        "<b>norm_score = min(100, norm_score + opportunity_bonus)</b>. Only computed once enough "
-        "history exists (bar index &ge; max(40, pivot_lookback&times;2)); toggle: Settings &rarr; "
+        "<b>norm_score = min(100, norm_score + opportunity_bonus)</b>. Each half has its own "
+        "independent warm-up gate — LL needs bar index &ge; 2&times;pivot_lookback+1 (first bar a "
+        "pivot can structurally exist); Stoch Convergence needs bar index &ge; 20 (%K/%D warm-up), "
+        "regardless of pivot_lookback. Toggle: Settings &rarr; "
         "\"enable_ll_stoch_bonus\" (default ON)."
     )
     sec_b += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">'
@@ -1095,9 +1070,9 @@ def _scoring_explainer_html() -> str:
   {sec_d}
   <p style="font-size:10px;color:#8b949e;margin:14px 0 0;font-style:italic;">
     A category that fails the Min Risk:Reward gate (Elite/High Conviction/Actionable
-    only) is downgraded to Setup Building, with the reason shown in Qualification
-    Summary's Rejected list. Use the per-stock breakdown (inside each tab) to see
-    exactly which sub-factors fired.
+    only) is downgraded to Setup Building — see "Primary Blocker" in the results
+    table. Use the per-stock breakdown (inside each tab) to see exactly which
+    sub-factors fired.
   </p>
 </div>
 """
@@ -1543,293 +1518,6 @@ def _sc_counts_html(df: pd.DataFrame) -> str:
     if not parts:
         return ""
     return '<div class="sc-counts">' + "".join(parts) + '</div>'
-
-
-# ── QUALIFICATION SUMMARY ──────────────────────────────────────────
-
-def _qualification_summary_html(df: pd.DataFrame, settings: dict) -> str:
-    """
-    Render a compact 'Qualification Summary' panel showing:
-      • Actionable Stocks  — stocks in Execute/Elite signal classes
-      • Qualified Plans    — actionable stocks that ALSO have an OPEN
-                              lifecycle plan (Waiting / Active / T1 Hit)
-      • Rejected           — stocks downgraded by R:R gate (symbol + reason)
-    """
-    if df.empty:
-        return ""
-
-    # ── Actionable count (ELITE + EXECUTE signal classes) ─────────
-    # NOTE: "Recommendation" holds long-form category text ("Elite
-    # Opportunity", "Actionable", ...) — it must be normalized via
-    # _CATEGORY_TO_SC before comparing to ELITE/EXECUTE/WATCH/SKIP
-    # tokens. Comparing the raw text directly (the previous behaviour)
-    # silently produced zero matches forever.
-    sc_col = "Recommendation"
-    if sc_col in df.columns:
-        sc_norm = _normalize_signal_class(df[sc_col])
-        actionable_df = df[sc_norm.isin(["ELITE", "EXECUTE"])]
-    else:
-        # Fallback: Category-based
-        cat_col = "Category"
-        if cat_col in df.columns:
-            actionable_df = df[df[cat_col].isin(
-                ["Elite Opportunity", "High Conviction", "Actionable"]
-            )]
-        else:
-            actionable_df = pd.DataFrame()
-
-    n_actionable = len(actionable_df)
-
-    # ── Qualified Plans count (actionable + an OPEN lifecycle plan) ──
-    # An open plan is WAITING / ACTIVE / T1_HIT — not just ACTIVE. A
-    # plan that hasn't triggered yet is still a "qualified plan", just
-    # not yet a live position.
-    if not actionable_df.empty and "PlanStatus" in actionable_df.columns:
-        n_plans = int(
-            actionable_df["PlanStatus"].astype(str).str.upper()
-            .isin(["WAITING", "ACTIVE", "T1_HIT"]).sum()
-        )
-    else:
-        n_plans = 0
-
-    # ── Rejected stocks (R:R gate) ─────────────────────────────────
-    reject_col = "RR_RejectReason"
-    rejected_rows = []
-    if reject_col in df.columns:
-        rej_df = df[df[reject_col].astype(str).str.strip() != ""]
-        for _, row in rej_df.iterrows():
-            sym    = str(row.get("Stock", "?"))
-            reason = str(row.get(reject_col, ""))
-            rejected_rows.append((sym, reason))
-
-    # ── Build HTML ─────────────────────────────────────────────────
-    min_rr_map = {"1.5R": 1.5, "2R": 2.0, "3R": 3.0}
-    min_rr = min_rr_map.get(settings.get("min_risk_reward", "2R"), 2.0)
-
-    def _stat(label, val, color):
-        return (
-            f'<div class="qs-stat">'
-            f'<span class="qs-num" style="color:{color}">{val}</span>'
-            f'<span class="qs-label">{label}</span>'
-            f'</div>'
-        )
-
-    reject_html = ""
-    if rejected_rows:
-        items = "".join(
-            f'<span class="qs-reject-item">'
-            f'<b style="color:#e6edf3">{sym}</b>'
-            f'<span class="qs-reject-reason"> — {reason}</span>'
-            f'</span>'
-            for sym, reason in rejected_rows
-        )
-        reject_html = (
-            f'<div class="qs-reject-block">'
-            f'<span class="qs-reject-head">Rejected (R:R &lt; {min_rr:.1f}x):</span>'
-            f'<div class="qs-reject-list">{items}</div>'
-            f'</div>'
-        )
-
-    stats_html = (
-        _stat("Actionable Stocks", n_actionable, "#4ade80" if n_actionable > 0 else "#8b949e")
-        + _stat("Qualified Plans",  n_plans,      "#f59e0b" if n_plans > 0 else "#8b949e")
-    )
-
-    # ── Not-Qualified breakdown: SKIP grouped by primary blocker ─────
-    watch_html = ""
-    skip_html  = ""
-    leader_html = ""
-    if sc_col in df.columns:
-        sc_norm  = _normalize_signal_class(df[sc_col])
-        watch_n  = int((sc_norm == "WATCH").sum())
-        skip_n   = int((sc_norm == "SKIP").sum())
-        # Leader stocks (Category == "Leader", may be in WATCH or SKIP)
-        rec_col = "Recommendation" if "Recommendation" in df.columns else "Category"
-        leader_stocks = df[df[rec_col] == "Leader"].copy() if rec_col in df.columns else pd.DataFrame()
-
-        # ── SKIP grouped by primary blocker ─────────────────────
-        skip_stocks = df[sc_norm == "SKIP"].copy()
-        if not skip_stocks.empty:
-            # Bucket each stock by its worst gate failure
-            def _bucket(row):
-                try:
-                    ls = float(row.get("Leadership", 100))
-                    cv = float(row.get("Conviction",  100))
-                    eq = float(row.get("EntryQuality",100))
-                    pb = str(row.get("Primary Blocker", ""))
-                except (TypeError, ValueError):
-                    return "Other"
-                # Use Primary Blocker column if available
-                if pb and pb not in ("", "None", "nan"):
-                    if pb.startswith("Weak Leadership") or pb.startswith("Weak RS"):
-                        return "Weak RS"
-                    if pb.startswith("Low Conviction"):
-                        return "Low Conviction"
-                    if pb.startswith("Low Entry"):
-                        return "Low Entry Quality"
-                    if pb.startswith("Extended"):
-                        return "Extended"
-                    if pb.startswith("CCI"):
-                        return "CCI Negative"
-                # Fall back to score thresholds
-                if ls < _SCORE_THRESHOLDS["Leadership"]:
-                    return "Weak RS"
-                if cv < _SCORE_THRESHOLDS["Conviction"]:
-                    return "Low Conviction"
-                if eq < _SCORE_THRESHOLDS["Entry Quality"]:
-                    return "Low Entry Quality"
-                return "Other"
-
-            _BUCKET_COLORS = {
-                "Weak RS":          "#f85149",
-                "Low Conviction":   "#d29922",
-                "Low Entry Quality":"#58a6ff",
-                "Extended":         "#f97316",
-                "CCI Negative":     "#a78bfa",
-                "Other":            "#8b949e",
-            }
-
-            # Group stocks by bucket
-            from collections import defaultdict
-            buckets = defaultdict(list)
-            for _, row in skip_stocks.iterrows():
-                buckets[_bucket(row)].append(str(row.get("Stock", "?")))
-
-            bucket_order = ["Weak RS", "Low Conviction", "Low Entry Quality", "Extended", "CCI Negative", "Other"]
-            groups_html = ""
-            for bname in bucket_order:
-                syms = buckets.get(bname)
-                if not syms:
-                    continue
-                bcolor = _BUCKET_COLORS[bname]
-                sym_tags = "".join(
-                    f'<span style="background:rgba(248,81,73,0.08);border:1px solid {bcolor}44;' 
-                    f'border-radius:4px;padding:1px 6px;font-size:11px;font-family:var(--mono);' 
-                    f'color:#e6edf3">{s}</span> '
-                    for s in syms[:10]
-                )
-                extra = f' <span style="color:#8b949e;font-size:10px">+{len(syms)-10} more</span>' if len(syms) > 10 else ""
-                groups_html += (
-                    f'<div style="margin-bottom:5px">' 
-                    f'<span style="font-size:10px;font-weight:600;color:{bcolor};' 
-                    f'text-transform:uppercase;letter-spacing:0.05em;margin-right:6px">{bname}:</span>'
-                    f'{sym_tags}{extra}</div>'
-                )
-
-            skip_html = (
-                '<div class="qs-reject-block">' 
-                f'<span class="qs-reject-head">Not Qualified — SKIP ({skip_n}):</span>'
-                f'<div style="margin-top:5px">{groups_html}</div>'
-                '</div>'
-            )
-
-        # ── Leader stocks (violet — high RS, no base) ────────────
-        if not leader_stocks.empty:
-            leader_n = len(leader_stocks)
-            leader_items = "".join(
-                f'<span style="background:rgba(167,139,250,0.1);border:1px solid rgba(167,139,250,0.3);' 
-                f'border-radius:4px;padding:1px 6px;font-size:11px;font-family:var(--mono);' 
-                f'color:#a78bfa">{str(r.get("Stock","?"))}</span> '
-                for _, r in leader_stocks.head(10).iterrows()
-            )
-            extra = f'<span style="color:#8b949e;font-size:10px">+{leader_n-10} more</span>' if leader_n > 10 else ""
-            leader_html = (
-                '<div class="qs-reject-block" style="border-top:1px solid var(--border);padding-top:6px;margin-top:2px;">' 
-                f'<span style="font-size:10px;font-weight:600;color:#a78bfa;text-transform:uppercase;' 
-                f'letter-spacing:0.05em;margin-right:8px">🏃 Leader — await base ({leader_n}):</span>'
-                f'<div style="margin-top:4px">{leader_items}{extra}</div>'
-                '</div>'
-            )
-
-        # ── WATCH stocks (Setup Building) ────────────────────────
-        if watch_n > 0:
-            watch_stocks = df[sc_norm == "WATCH"]
-            watch_items = "".join(
-                (
-                    '<span style="background:rgba(210,153,34,0.1);border:1px solid rgba(210,153,34,0.3);' 
-                    'border-radius:5px;padding:2px 8px;font-size:11px;font-family:var(--mono)">' 
-                    f'<b style="color:#d29922">{str(r.get("Stock","?"))}</b>'
-                    f'<span style="color:#8b949e;font-size:10px"> CV=' 
-                    f'{int(float(r.get("Conviction",0))) if str(r.get("Conviction","")).replace(".","").lstrip("-").isdigit() else chr(8212)}</span>'
-                    '</span>'
-                )
-                for _, r in watch_stocks.head(12).iterrows()
-            )
-            watch_html = (
-                '<div class="qs-reject-block" style="border-top:1px solid var(--border);padding-top:6px;margin-top:2px;">' 
-                f'<span style="font-size:10px;font-weight:600;color:#d29922;text-transform:uppercase;' 
-                f'letter-spacing:0.05em;margin-right:8px">Watch — Setup Building ({watch_n}):</span>'
-                f'<div class="qs-reject-list">{watch_items}</div>'
-                '</div>'
-            )
-
-    return f"""
-<div class="qual-summary">
-  <div class="qs-header">
-    <span class="qs-title">📋 Qualification Summary</span>
-  </div>
-  <div class="qs-body">
-    <div class="qs-stats">{stats_html}</div>
-    {reject_html}
-    {leader_html}
-    {watch_html}
-    {skip_html}
-  </div>
-</div>
-"""
-
-
-
-
-_RENAME_MAP_FULL = {
-    "composite_score": "Composite",
-    "RScomp":          "RS%",
-    "RS_Rank":         "RS Rank",
-    "pos_size_pct":    "Size%",
-    "cat_trend":       "Trend",
-    "cat_momentum":    "Momentum",
-    "cat_structure":   "Structure",
-    "cat_volume":      "Volume",
-    "cat_quality":     "Quality",
-    "TrendAge":        "Age(bars)",
-    "TrendFresh":      "Fresh%",
-    "FreshBase":       "Base🔥",
-    "RR":              "R:R",
-    "Leadership":      "Leadership_DE",
-    "Conviction":      "Conviction_DE",
-    "EntryQuality":    "EntryQuality_DE",
-    "LTP":             "CMP",          # last traded price from scanner → display as CMP
-    # Setup persistence display columns
-    "SetupAge":        "Setup Age",
-    "TradePlanStatus": "Plan Status",
-    "EntryDriftPct":   "Drift%",
-}
-
-_RENAME_PRIMARY = {
-    "CV1_SignalClass":   "Signal Class",
-    "CV1_Leadership":   "Leadership",
-    "CV1_Conviction":   "Conviction",
-    "CV1_EntryQuality": "Entry Quality",
-    "RR":               "R:R",
-    "ConvictionGap":    "Conv Gap",
-    "ConvictionProfile":"Conv Profile",
-}
-
-_DETAIL_EXTRA = [
-    "Score", "RS%", "TrendPhase", "T1Path", "Buy Type", "Setup",
-    "Streak", "Age(bars)", "Fresh%", "Base🔥",
-    "Composite", "Trend", "Momentum", "Structure", "Volume", "Quality",
-    "ADX", "EMA Slope", "CCI",
-    "Category", "Stage", "Leadership_DE", "Conviction_DE", "EntryQuality_DE",
-    "Conv Gap", "Conv Profile",
-]
-
-# Primary column order for HTML table (v10: persistence fields added)
-_PRIMARY_ORDERED = [
-    "Stock", "Setup Age", "Plan Status", "Signal Class", "Category", "Primary Blocker",
-    "Leadership", "Conviction",
-    "Entry Quality", "Extension", "CMP", "%Chg", "Entry", "SL", "T1", "R:R", "Drift%", "Size%",
-]
 
 
 def _build_display_df(df: pd.DataFrame, detail: bool = False) -> pd.DataFrame:
@@ -3019,47 +2707,6 @@ def render(settings: dict | None = None):
     # ── Signal class counts ───────────────────────────────────────
     if "Recommendation" in df_aug.columns:
         st.markdown(_sc_counts_html(df_aug), unsafe_allow_html=True)
-
-    # ── Qualification Summary ─────────────────────────────────────
-    _scan_settings = st.session_state.get("scan_settings", {})
-    _qs_html = _qualification_summary_html(df_aug, _scan_settings)
-    if _qs_html:
-        with st.expander("📋 Qualification Summary", expanded=False):
-            # components.v1.html renders in an iframe — CSS vars won't inherit.
-            # Inject a self-contained <style> that resolves all vars inline.
-            _QS_CSS = """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
-:root{--bg0:#0d1117;--bg1:#161b22;--bg2:#1c2333;--bg3:#21262d;
-  --border:rgba(255,255,255,0.08);--gold:#f5c542;--green:#3fb950;
-  --amber:#d29922;--red:#f85149;--muted:#8b949e;--text:#e6edf3;
-  --mono:'JetBrains Mono','Fira Code',monospace;}
-body{background:#0d1117;margin:0;padding:4px 0 2px;}
-.qual-summary{background:var(--bg1);border:1px solid var(--border);
-  border-left:3px solid #4ade80;border-radius:8px;padding:10px 14px;
-  margin:0;font-family:var(--mono);font-size:12px;}
-.qs-header{margin-bottom:8px;}
-.qs-title{font-size:11px;font-weight:700;color:var(--muted);letter-spacing:0.06em;text-transform:uppercase;}
-.qs-body{display:flex;flex-direction:column;gap:6px;}
-.qs-stats{display:flex;gap:20px;flex-wrap:wrap;align-items:baseline;}
-.qs-stat{display:flex;align-items:baseline;gap:6px;}
-.qs-num{font-size:18px;font-weight:700;line-height:1;}
-.qs-label{font-size:10px;color:var(--muted);font-weight:500;letter-spacing:0.04em;}
-.qs-reject-block{border-top:1px solid var(--border);padding-top:6px;margin-top:2px;}
-.qs-reject-head{font-size:10px;font-weight:600;color:#f85149;text-transform:uppercase;letter-spacing:0.05em;margin-right:8px;}
-.qs-reject-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:5px;}
-.qs-reject-item{background:rgba(248,81,73,0.08);border:1px solid rgba(248,81,73,0.25);
-  border-radius:5px;padding:2px 8px;font-size:11px;}
-.qs-reject-reason{color:#f85149;font-size:10px;}
-</style>
-"""
-            # Tighter height: base (header + stats) + per-block header + flex-wrapped item rows
-            _n_items  = _qs_html.count('qs-reject-item')
-            _n_blocks = _qs_html.count('qs-reject-block')
-            _item_rows = max(1, (_n_items + 3) // 4)   # ~4 items per flex-wrap row
-            _qs_height = 72 + _n_blocks * 32 + _item_rows * 26
-            _qs_height = max(90, min(480, _qs_height))
-            _stc.html(_QS_CSS + _qs_html, height=_qs_height, scrolling=False)
 
     # ── Scoring Explainer ─────────────────────────────────────────
     with st.expander("📊 Scoring & Thresholds", expanded=False):
