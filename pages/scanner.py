@@ -673,10 +673,16 @@ _TOOLTIP_JS = """
 # ── HELPERS ───────────────────────────────────────────────────────
 
 # Score-column thresholds: above = green (#3fb950), below = amber (#d29922)
+# [FIX] These were 65/50/50 — stale vs decision_engine.py's actual Actionable
+# gate, which requires Leadership>=70, Conviction>=60 (conviction_level
+# "Actionable" default), Entry Quality>=60 (_classify_category_with_settings).
+# Kept in sync with those three numbers so the score-column coloring and the
+# Qualification Summary's SKIP-bucketing agree with what actually qualifies
+# a stock, rather than an older, looser cut that predates the v8-v9 tightening.
 _SCORE_THRESHOLDS = {
-    "Leadership":    65,
-    "Conviction":    50,   # raised from 38 → 50 to match DE Setup Building floor
-    "Entry Quality": 50,
+    "Leadership":    70,
+    "Conviction":    60,
+    "Entry Quality": 60,
 }
 
 def _score_color(v: float, invert: bool = False, threshold: float | None = None) -> str:
@@ -771,32 +777,40 @@ def _tv_link(symbol: str) -> str:
 def _scoring_explainer_html() -> str:
     """
     Static HTML panel: 'How CV1 Scores & Signal Classes are calculated'.
-    Mirrors the style from the reference screenshot — scoring table, grade
-    thresholds, signal class priority table, and note on per-stock breakdown.
+
+    [FIX] Rewritten to match utils/decision_engine.py's actual current logic —
+    the previous version (Leadership 30/25/20/15/10, gates at 65/50/50) was
+    written for an earlier revision and had drifted badly out of sync with
+    the v8.1-v9.2 tightening: real weights, gates, and category thresholds
+    are all different now. Pulled directly from _leadership(), _conviction(),
+    _entry_quality(), _extension(), and _classify_category_with_settings().
     """
-    # ── Dimension rows ──────────────────────────────────────────────
+    # ── Dimension rows (weights sum to 100 in each) ──────────────────
     dim_rows = [
-        # (Dimension, colour, sub-factors list)
         ("Leadership", "#a371f7", [
-            ("RS Composite (multi-TF)",         30),
-            ("Trend Age — 21–50 bar sweet-spot", 25),
-            ("ADX Strength (≥40 tier)",          20),
-            ("Persistent Strength",              15),
-            ("EMA20 Slope (5-bar velocity)",     10),
+            ("Trend Quality (EMA align + cloud + trend_up)", 35),
+            ("Relative Strength (multi-TF composite)",       30),
+            ("Momentum (3M + 6M return tiers)",               15),
+            ("Volume Sponsorship (+2 on squeeze release)",    10),
+            ("Trend Freshness (decays with age)",             10),
         ]),
         ("Conviction", "#3fb950", [
-            ("Trend Structure (EMA + Cloud)",    30),
-            ("Fibonacci Pullback Zone",          25),
-            ("CCI Recovery / OS Cross",          25),
-            ("Volume Sponsorship",               15),
-            ("Squeeze Release",                   5),
+            ("Pattern Recognition (base/compression/continuation)", 35),
+            ("Compression (continuous ATR-based energy scale)",     25),
+            ("Fibonacci Quality (pullback zone OR continuation)",   20),
+            ("RS Leadership (RS improving ahead of price)",         20),
         ]),
         ("Entry Quality", "#d29922", [
-            ("EMA20 Distance (% above)",         30),
-            ("Pivot High Distance",              20),
-            ("Price Move Since Setup",           20),
-            ("EMA50 Distance (structural)",      15),
-            ("Bars Since Setup (ATR-band)",      15),
+            ("EMA20 Distance (breakout/pullback-aware bands)", 40),
+            ("EMA50 Distance (structural)",                    25),
+            ("Pivot High Distance",                            20),
+            ("Bars Since Setup (0-3 Actionable, 8+ Extended)", 15),
+        ]),
+        ("Extension", "#f97316", [
+            ("Price Move Since Setup (trigger to now)",        33),
+            ("EMA20 Distance (volume-climax discounted)",     32),
+            ("Pivot High Distance (volume-climax discounted)", 20),
+            ("EMA50 Distance",                                15),
         ]),
     ]
 
@@ -808,27 +822,40 @@ def _scoring_explainer_html() -> str:
                 f'<td style="padding:3px 10px 3px 0;font-size:11px;color:#e6edf3;">{label}</td>'
                 f'<td style="padding:3px 0;font-size:11px;font-weight:700;color:{color};'
                 f'text-align:right;font-family:var(--mono);white-space:nowrap">+{pts}</td>'
-                f'<td style="padding:3px 0 3px 16px;font-size:10px;color:#8b949e;">'
-                f'{"Fully earned or zero" if pts >= 20 else "Partial credit available"}</td>'
                 f'</tr>'
             )
         return (
             f'<div style="margin-bottom:14px;">'
             f'<div style="font-size:10px;font-weight:700;color:{color};letter-spacing:0.08em;'
             f'text-transform:uppercase;margin-bottom:5px;">{dim} <span style="font-size:9px;'
-            f'font-weight:400;color:#8b949e">(0–100)</span></div>'
+            f'font-weight:400;color:#8b949e">(0-100{" - lower is better" if dim == "Extension" else ""})</span></div>'
             f'<table style="border-collapse:collapse;width:100%">{rows}</table>'
             f'</div>'
         )
 
-    # ── Grade thresholds ─────────────────────────────────────────────
+    # ── Category thresholds — Balanced style, default settings ───────
+    # trading_style shifts Leadership/Conviction gates by +/-8; extension_tolerance
+    # shifts the Extension caps by -15/-8/0/+15; conviction_level sets the
+    # Actionable Conviction floor (40/60/75/85); entry_preference shifts Entry
+    # Quality by -10/0/+5. Numbers below are the Balanced/Actionable/Normal
+    # defaults — see Settings -> Trading Style for how they move.
     grades = [
-        ("#f5c542", "Leadership ≥ 80",    "Gold · Elite leadership — outpacing the market"),
-        ("#3fb950", "Leadership ≥ 65",    "Green · Required gate for EXECUTE/ELITE"),
-        ("#d29922", "Leadership 35–64",   "Amber · Developing — monitor for improvement"),
-        ("#f85149", "Leadership < 35",    "Red · Weak — below all gate thresholds"),
-        ("#3fb950", "Conviction ≥ 50",    "Green gate — DE Setup Building floor (raised from 38)"),
-        ("#d29922", "Entry Quality ≥ 50", "Amber gate — tight entry zone required"),
+        ("#f5c542", "Elite Opportunity — pullback path",
+         "Leadership >= 90 · Conviction >= 90 · Entry Quality >= 80 · Extension <= 25"),
+        ("#f5c542", "Elite Opportunity — breakout path",
+         "Fresh base/compression break + Vol >= 2.5x · Leadership >= 85 · Conviction >= 80 · EQ >= 65 · Extension <= 45"),
+        ("#3fb950", "High Conviction",
+         "Leadership >= 80 · Conviction >= 80 · Entry Quality >= 60 · Extension <= 35"),
+        ("#4ade80", "Actionable",
+         "Leadership >= 70 · Conviction >= 60 · Entry Quality >= 60 · Extension <= 40"),
+        ("#d29922", "Setup Building",
+         "Leadership >= 70 · Conviction >= 50 — not all Actionable gates met"),
+        ("#a78bfa", "Leader",
+         "Leadership >= 70 · Conviction < 50 — RS/momentum present, no setup structure yet"),
+        ("#f97316", "Extended",
+         "Extension >= 60 — unless volume-climax exempt (fresh base/compression + Vol >= 2.5x)"),
+        ("#f85149", "Avoid",
+         "Leadership < 50, or hard stop / no trend / downtrend"),
     ]
     grade_html = "".join(
         f'<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px;">'
@@ -840,16 +867,16 @@ def _scoring_explainer_html() -> str:
         for c, label, desc in grades
     )
 
-    # ── Signal class table ──────────────────────────────────────────
+    # ── Signal class table (ELITE/EXECUTE/WATCH/SKIP = table-display grouping) ──
     sc_rows_data = [
-        ("ELITE",   "#f5c542", "Highest Conviction",
-         "Leadership ≥ 65 · Conviction ≥ 50 · Entry Quality ≥ 50 · TREND regime only · Extension ≤ 60"),
-        ("EXECUTE", "#3fb950", "Actionable Setup",
-         "Leadership ≥ 65 · Conviction ≥ 50 · Entry Quality ≥ 50 · Any regime · Extension ≤ 80"),
-        ("WATCH",   "#d29922", "Setup Building",
-         "Leadership ≥ 35 OR Conviction ≥ 20 · Not all gates met · Monitor for upgrade"),
-        ("SKIP",    "#484f58", "Below Threshold",
-         "All three dimensions below gate · No actionable setup"),
+        ("ELITE",   "#f5c542", "Elite Opportunity",
+         "Highest conviction · either Elite path above · R:R must clear your Min Risk:Reward setting"),
+        ("EXECUTE", "#3fb950", "High Conviction + Actionable",
+         "Actionable setup, tradeable now · R:R must clear your Min Risk:Reward setting"),
+        ("WATCH",   "#d29922", "Setup Building + Leader",
+         "Gates partially met — monitor for upgrade, or RS leader awaiting a base"),
+        ("SKIP",    "#484f58", "Extended + Avoid",
+         "Chase risk too high, or structural gates failed — no actionable setup"),
     ]
     sc_rows_html = "".join(
         f'<tr style="border-bottom:1px solid rgba(255,255,255,0.06)">'
@@ -866,18 +893,20 @@ def _scoring_explainer_html() -> str:
     return f"""
 <div style="font-family:'JetBrains Mono','Fira Code',monospace;">
   <p style="font-size:11px;color:#8b949e;margin:0 0 16px;">
-    CV1 scoring uses three independent 0–100 dimensions. Each dimension has
-    5 sub-factors. Sub-factors award partial or full credit — no partial credit
-    on binary gates.
+    Decision Engine scoring uses four independent 0-100 dimensions
+    (Leadership, Conviction, Entry Quality, Extension — Extension being
+    lower-is-better). Category and R:R gates below are shown for
+    <b>Balanced</b> trading style with default settings; Settings -> Trading
+    Style / Extension Tolerance / Conviction Level shift these thresholds.
   </p>
 
-  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px;margin-bottom:18px;">
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:16px;margin-bottom:18px;">
     {"".join(_dim_block(d, c, f) for d, c, f in dim_rows)}
   </div>
 
   <div style="border-top:1px solid rgba(255,255,255,0.08);padding-top:14px;margin-bottom:18px;">
     <div style="font-size:10px;font-weight:700;color:#8b949e;letter-spacing:0.08em;
-    text-transform:uppercase;margin-bottom:8px;">Gate Thresholds</div>
+    text-transform:uppercase;margin-bottom:8px;">Category Thresholds</div>
     {grade_html}
   </div>
 
@@ -888,8 +917,10 @@ def _scoring_explainer_html() -> str:
   </div>
 
   <p style="font-size:10px;color:#8b949e;margin:10px 0 0;font-style:italic;">
-    Only the highest-priority class that all gates pass is assigned.
-    Use the per-stock breakdown (inside each tab) to see exactly which sub-factors fired.
+    A category that fails the Min Risk:Reward gate (Elite/High Conviction/Actionable
+    only) is downgraded to Setup Building, with the reason shown in Qualification
+    Summary's Rejected list. Use the per-stock breakdown (inside each tab) to see
+    exactly which sub-factors fired.
   </p>
 </div>
 """
