@@ -56,6 +56,24 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     ], axis=1).max(axis=1)
     return tr.ewm(com=period - 1, adjust=False).mean()
 
+def stochastic(high: pd.Series, low: pd.Series, close: pd.Series,
+                k_period: int = 14, d_period: int = 3) -> tuple[pd.Series, pd.Series]:
+    """
+    Standard Stochastic Oscillator. %K = (C - LLn)/(HHn - LLn)*100, %D = SMA(%K, d).
+
+    Single-owner home for this primitive, next to the other shared indicator
+    primitives (ema/sma/rsi/atr/cci), so utils/scoring_core.py (the main
+    scanner engine) and utils/stoch_convergence.py can both use the real
+    Stochastic Oscillator.
+    """
+    hh  = high.rolling(k_period).max()
+    ll  = low.rolling(k_period).min()
+    rng = (hh - ll).replace(0, np.nan)
+    k   = (close - ll) / rng * 100
+    d   = k.rolling(d_period).mean()
+    return k, d
+
+
 def cci(close: pd.Series, period: int = 20) -> pd.Series:
     """Vectorised CCI — significantly faster than the original Python loop."""
     sma_s = close.rolling(period).mean()
@@ -651,6 +669,21 @@ def score_stock(
         "EMA Slope":    round(r.ema20_slope, 2),
         "_rs_positive": r.rs_positive,
         "_strength_ok": r.strength_ok,
+        # ── LL Opportunity + Stochastic Convergence (migrated from Five
+        #    Pillars — native scanner fields now, not just FP_* display-only
+        #    columns; already folded into Score/Action above). See
+        #    utils/ll_opportunity.py and utils/stoch_convergence.py.
+        "LL_Actionable":     r.ll_actionable,
+        "LL_Defended":       r.ll_defended,
+        "LL_DistanceATR":    r.ll_distance_atr,
+        "LL_Price":          r.ll_price,
+        "LL_BonusPts":       r.ll_bonus_pts,
+        "StochK":            r.stoch_k,
+        "StochD":            r.stoch_d,
+        "Stoch_Reignition":  r.stoch_reignition,
+        "Stoch_Confluence":  r.stoch_confluence,
+        "Stoch_BonusPts":    r.stoch_bonus_pts,
+        "OpportunityBonus":  r.opportunity_bonus_pts,
         # Suggestion 3: Tier-1 path audit
         "T1Path":       r.t1_path,
         # Suggestion 2: score components (kept as _internal — not shown in table)
@@ -801,105 +834,6 @@ def score_stock(
 
     except Exception:
         pass   # non-critical; Action column retains norm_score value
-
-    # ── Five Pillars Ranking Engine ───────────────────────────────
-    # Standalone additive model (Structure/Acceptance/Leadership/Momentum/
-    # Risk). Reuses the already-built IndicatorArrays (ia) — no re-fetch,
-    # no recomputation of EMA/RSI/ATR. Adds VWAP + Fixed Range Volume
-    # Profile (POC/VAH/VAL) and Stochastic Oscillator, which don't exist
-    # anywhere else in the engine.
-    try:
-        from utils.pillar_engine import compute_pillars_from_ia
-        fp = compute_pillars_from_ia(df, ia, cfg=settings or {})
-        if not fp.error:
-            result.update({
-                "FP_Structure":   fp.structure_score,
-                "FP_Acceptance":  fp.acceptance_score,
-                "FP_Reversal":    fp.reversal_score,
-                "FP_Leadership":  fp.leadership_score,
-                "FP_Momentum":    fp.momentum_score,
-                "FP_Risk":        fp.risk_penalty,
-                "FP_FinalScore":  fp.final_score,
-                "FP_Class":       fp.classification,
-                "FP_ClassNote":   fp.classification_note,
-                # Structure internals (20 pts — EMA alignment/slope + HH/HL only)
-                "_fp_ema_stack":       fp.s_ema_stack,
-                "_fp_ema20_rising":    fp.s_ema20_rising,
-                "_fp_ema50_rising":    fp.s_ema50_rising,
-                "_fp_ema200_rising":   fp.s_ema200_rising,
-                "_fp_price_above_e20": fp.s_price_above_e20,
-                "FP_SwingLabel":       fp.s_swing_label,
-                "_fp_hh_hl_intact":    fp.s_hh_hl_intact,
-                "_fp_no_breakdown":    fp.s_no_breakdown,
-                # Acceptance internals (25 pts — VWAP + Volume Profile + OBV)
-                "FP_VWAP":        round(fp.vwap, 2),
-                "FP_POC":         round(fp.poc, 2),
-                "FP_VAH":         round(fp.vah, 2),
-                "FP_VAL":         round(fp.val, 2),
-                "_fp_above_poc":            fp.a_above_poc,
-                "_fp_above_vwap":            fp.a_above_vwap,
-                "_fp_accepted_above_va":      fp.a_accepted_above_va,
-                "_fp_holding_above_zone":      fp.a_holding_above_zone,
-                "_fp_obv_trend_rising":         fp.a_obv_trend_rising,
-                "_fp_obv_leading_price":         fp.a_obv_leading_price,
-                "FP_OBV":                            round(fp.obv_value, 0),
-                # Opportunity Quality Bonus internals (10 pts, layered on
-                # the 90pt base — formerly "LL Elite Bonus")
-                "_fp_r_actionable_ll":              fp.r_actionable_ll,
-                "_fp_r_ll_defended":                  fp.r_ll_defended,
-                "_fp_r_distance_atr_ok":                fp.r_distance_atr_ok,
-                "_fp_r_distance_atr_pts":                 fp.r_distance_atr_pts,
-                "_fp_r_high_volume_confirmation":         fp.r_high_volume_confirmation,
-                "FP_LLPrice":                                  round(fp.r_ll_price, 2),
-                "FP_LLPriorLow":                                round(fp.r_prior_low_price, 2),
-                "FP_LLBarsToReclaim":                            fp.r_bars_to_reclaim,
-                "_fp_r_bars_since_reclaim":                      fp.r_bars_since_reclaim,
-                "_fp_r_vertical_extension":                      fp.r_vertical_extension,
-                "FP_LLDistanceATR":                                fp.r_distance_atr,
-                "FP_LLConfidence":                                   fp.r_confidence,
-                # Leadership internals (13 pts)
-                "FP_RS1m":        fp.rs_1m,
-                "FP_RS3m":        fp.rs_3m,
-                "FP_RS6m":        fp.rs_6m,
-                "FP_RelMomentum": fp.rel_momentum,
-                "_fp_l_rs_pts":     fp.l_rs_pts,
-                "_fp_l_mom_pts":     fp.l_mom_pts,
-                "_fp_l_sector_pts":   fp.l_sector_pts,
-                # Momentum internals (35 pts — today's trigger only)
-                "FP_StochK":         fp.stoch_k,
-                "FP_StochD":         fp.stoch_d,
-                "_fp_stoch_cross_up":            fp.stoch_cross_up,
-                "_fp_rsi_val":                     fp.rsi_val,
-                "_fp_rsi_above_50":                 fp.rsi_above_50,
-                "_fp_vwap_reaction_pts":              fp.m_vwap_reaction_pts,
-                "_fp_returned_above_vwap":             fp.m_returned_above_vwap,
-                "_fp_fresh_stoch_reignition":            fp.m_fresh_stoch_reignition,
-                "_fp_breakout_confirmed":                 fp.m_breakout_confirmed,
-                "_fp_volume_expansion":                    fp.m_volume_expansion,
-                "_fp_reaction_score":                       fp.m_reaction_score,
-                # VWAP Reclaim pattern diagnostics (now real values)
-                "_fp_vwap_touch_found":    fp.m_vwap_touch_found,
-                "_fp_touch_bar":           fp.m_touch_bar,
-                "_fp_touch_distance_atr":  fp.m_touch_distance_atr,
-                "_fp_reaction_strength":   fp.m_reaction_strength,
-                "_fp_confluence":          fp.m_confluence,
-                "_fp_pattern_age":         fp.m_pattern_age,
-                "_fp_vwap_rising":         fp.m_vwap_rising,
-                # Independent Risk Engine internals (max -20 deduction)
-                "_fp_risk_ema20_extension":   fp.risk_ema20_extension,
-                "_fp_risk_atr_extension":      fp.risk_atr_extension,
-                "_fp_risk_exhaustion_candle":   fp.risk_exhaustion_candle,
-                "_fp_risk_parabolic_move":       fp.risk_parabolic_move,
-                "_fp_risk_climactic_volume":      fp.risk_climactic_volume,
-                "FP_DistEMA20Pct": fp.dist_from_ema20_pct,
-                "FP_ATRExtension": fp.atr_extension,
-            })
-    except Exception as _fp_exc:
-        import logging as _log
-        _log.warning(
-            "[pillar_engine] compute_pillars_from_ia() failed for symbol — "
-            "FP_* columns will be absent. Error: %s", _fp_exc, exc_info=True
-        )
 
     # ── Conviction Gap diagnostic field ──────────────────────────
     # ConvictionGap = CV1_Conviction - DE_Conviction

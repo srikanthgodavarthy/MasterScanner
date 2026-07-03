@@ -418,6 +418,20 @@ def generate_signals_historical(
             "bars_since_setup_actual": r.bars_since_setup_actual,
             "bars_since_setup_band":   r.bars_since_setup_band,
             "entry_quality_score":     _eq_val,
+            # ── VWAP Reclaim trade diagnostics (migrated off the retired
+            # Five Pillars engine — see utils/stoch_convergence.py — so the
+            # Backtest page's VWAP Reclaim Analysis report also works for
+            # scanner-mode trades, not just the old five_pillars mode) ────
+            "vwap_touch":             r.stoch_vwap_touch_found,
+            "reaction_strength":      r.stoch_reaction_strength,
+            "reaction_score":         r.stoch_reaction_strength,
+            "touch_bar":              r.stoch_touch_bar,
+            "cross_bar":              r.stoch_cross_bar,
+            "confluence":             r.stoch_confluence,
+            "pattern_age":            r.stoch_pattern_age,
+            "close_position_score":   r.stoch_close_position_score,
+            "touch_distance_atr":     r.stoch_touch_distance_atr,
+            "vwap_rising":            r.stoch_vwap_rising,
             "entry_quality_band":      (
                 "Good"       if _eq_val >= 75 else
                 "Acceptable" if _eq_val >= 60 else
@@ -564,209 +578,6 @@ def generate_signals_cci_master(
         })
 
     return pd.DataFrame(signals)
-
-
-# ══════════════════════════════════════════════════════════════════
-#  FIVE PILLARS SIGNAL GENERATOR
-#  Entry: FP final_score crosses ≥ 90 (Execute class)
-#  Exit signal: FP final_score drops below 65 (falls out of Watch class)
-#  SL   : entry - 1.5× ATR14
-#  T1/T2: entry + 1.5× ATR14 / entry + 3× ATR14
-# ══════════════════════════════════════════════════════════════════
-
-def generate_signals_five_pillars(
-    df:    pd.DataFrame,
-    nifty: pd.Series,
-    cfg:   dict | None = None,
-) -> pd.DataFrame:
-    """
-    Walk-forward signal scan using Five Pillars scoring.
-    Computes FP score bar-by-bar (rolling windows) and fires entry when
-    the score crosses from Watch → Execute (≥ 90). Exits on reversion
-    below Watch threshold (< 65) within the simulation window.
-
-    cfg (optional): the ic_* "Institutional Continuation (VWAP Reclaim)"
-    settings dict -- passed straight through to pillar_engine.compute_pillars
-    so this backtest path uses the exact same VWAP Reclaim tuning as the
-    live scanner (utils.scanner_engine calls compute_pillars_from_ia with
-    the same settings dict). Without this the two engines silently drift.
-
-    Each signal record now carries full VWAP Reclaim / Reversal (LL Spring)
-    diagnostics, sourced from PillarResult's real fields (previously pulled
-    via getattr() with defaults against attribute names that no longer
-    existed on PillarResult -- every VWAP Reclaim diagnostic column was
-    silently populated with its default rather than a real value).
-    """
-    from utils.pillar_engine import compute_pillars
-    from utils.scanner_engine import atr as _atr_fn
-
-    if df.empty or len(df) < 60:
-        return pd.DataFrame()
-
-    atr_s = _atr_fn(df["high"], df["low"], df["close"], 14)
-
-    # Compute FP score + pillar result on a rolling 200-bar window.
-    fp_scores: list[float] = []
-    fp_results: list = []     # store full PillarResult per bar
-    for i in range(len(df)):
-        if i < 59:
-            fp_scores.append(float("nan"))
-            fp_results.append(None)
-            continue
-        window = df.iloc[max(0, i - 199): i + 1]
-        try:
-            r = compute_pillars(window, nifty, cfg=cfg)
-            fp_scores.append(float(r.final_score) if not r.error else float("nan"))
-            fp_results.append(r)
-        except Exception:
-            fp_scores.append(float("nan"))
-            fp_results.append(None)
-
-    fp_arr = pd.Series(fp_scores, index=df.index)
-    prev_fp = fp_arr.shift(1)
-
-    signals   = []
-    last_signal_bar = -999
-
-    for i in range(60, len(df)):
-        cur  = fp_arr.iloc[i]
-        prev = prev_fp.iloc[i]
-
-        if pd.isna(cur) or pd.isna(prev):
-            continue
-
-        # Entry: score crosses up into Execute (≥ 90) from below
-        if not (prev < 90 and cur >= 90):
-            continue
-        if i - last_signal_bar < 3:
-            continue
-
-        close_price = float(df["close"].iloc[i])
-        atr_val     = float(atr_s.iloc[i]) if not pd.isna(atr_s.iloc[i]) else close_price * 0.02
-
-        entry = round(close_price, 2)
-        sl    = round(entry - 1.5 * atr_val, 2)
-        t1    = round(entry + 1.5 * atr_val, 2)
-        t2    = round(entry + 3.0 * atr_val, 2)
-        t3    = round(entry + 5.0 * atr_val, 2)
-
-        if sl >= entry or t1 <= entry:
-            continue
-
-        # Extract VWAP Reclaim + Reversal (LL Spring) diagnostics from the
-        # PillarResult at this bar. These attribute names now genuinely
-        # exist on PillarResult (see utils/pillar_engine.py) -- previously
-        # this getattr()-with-default block referenced names that were
-        # removed in the v3 pillar refactor, so every column below was
-        # silently populated with its default instead of a real value.
-        _pr = fp_results[i]
-        _vr_vwap_touch        = bool(getattr(_pr, "m_vwap_touch_found",   False)) if _pr else False
-        _vr_reaction_strength = float(getattr(_pr, "m_reaction_strength", 0.0))   if _pr else 0.0
-        _vr_reaction_score    = float(getattr(_pr, "m_reaction_score",    0.0))   if _pr else 0.0
-        _vr_touch_bar         = int(getattr(_pr,   "m_touch_bar",         -1))    if _pr else -1
-        _vr_cross_bar         = int(getattr(_pr,   "m_cross_bar",         -1))    if _pr else -1
-        _vr_confluence        = bool(getattr(_pr,  "m_confluence",        False)) if _pr else False
-        _vr_pattern_age       = int(getattr(_pr,   "m_pattern_age",       -1))    if _pr else -1
-        _vr_close_pos         = float(getattr(_pr, "m_close_position_score", 0.0)) if _pr else 0.0
-        _vr_acceptance        = int(getattr(_pr,   "acceptance_score",    0))     if _pr else 0
-        _vr_touch_dist_atr    = float(getattr(_pr, "m_touch_distance_atr", 0.0))  if _pr else 0.0
-        _vr_returned          = bool(getattr(_pr,  "m_returned_above_vwap", False)) if _pr else False
-        _vr_stoch_cross_found = bool(getattr(_pr,  "m_stoch_cross_found",  False)) if _pr else False
-        _vr_vwap_rising       = bool(getattr(_pr,  "m_vwap_rising",       False)) if _pr else False
-
-        # Reversal pillar (LL Spring) diagnostics -- the v3 refactor
-        # replaced the old "VWAP Reclaim as reversal signal" concept with
-        # a dedicated Lower-Low spring / failed-breakdown pillar. Backtest
-        # never captured any of it before; the scanner's FP_* columns did.
-        _ll_reclaimed    = bool(getattr(_pr, "r_actionable_ll",             False)) if _pr else False
-        _ll_defended     = bool(getattr(_pr, "r_ll_defended",               False)) if _pr else False
-        _ll_dist_atr_ok  = bool(getattr(_pr, "r_distance_atr_ok",           False)) if _pr else False
-        _ll_dist_atr     = float(getattr(_pr, "r_distance_atr",             0.0))   if _pr else 0.0
-        _ll_vol_confirm  = bool(getattr(_pr, "r_high_volume_confirmation",  False)) if _pr else False
-        _ll_bars_reclaim = int(getattr(_pr,   "r_bars_to_reclaim",          -1))    if _pr else -1
-        _ll_confidence   = int(getattr(_pr,   "r_confidence",               0))     if _pr else 0
-        _ll_price        = float(getattr(_pr, "r_ll_price",                 0.0))   if _pr else 0.0
-
-        last_signal_bar = i
-        signals.append({
-            "date":            df.index[i],
-            "score":           float(cur),
-            "entry":           entry,
-            "sl":              sl,
-            "t1":              t1,
-            "t2":              t2,
-            "t3":              t3,
-            "t1_mult":         1.5,
-            "t2_mult":         3.0,
-            "t3_mult":         5.0,
-            "target_category": "Five Pillars",
-            "target_adj":      0.0,
-            "target_notes":    f"FP={int(cur)} ATR={round(atr_val,2)}",
-            "cci":             0.0,
-            "rsi":             float(getattr(_pr, "rsi_val", 0.0)) if _pr else 0.0,
-            "tier1_prime":     False,
-            "tier2_momentum":  False,
-            "elite_tier":      cur >= 95,
-            "squeeze_release": False,
-            "setup":           "FIVE_PILLARS",
-            "buy_type":        "FP",
-            "tier":            "FP Execute",
-            "structural_entry": True,
-            "rs_positive":     False,
-            "rs_val":          float(getattr(_pr, "rs_3m", 0.0)) if _pr else 0.0,
-            "rs3":             float(getattr(_pr, "rs_3m", 0.0)) if _pr else 0.0,
-            "rs_composite":    0.0,
-            "rs_top_decile":   False,
-            "fresh_base":      False,
-            "trend_age_bars":  0,
-            "trend_freshness": 0,
-            "adx_val":         0.0,
-            "trend_phase":     "EXECUTE",
-            "ema20_pct_dist":         float(getattr(_pr, "dist_from_ema20_pct", 0.0)) if _pr else 0.0,
-            "ema50_pct_dist":         0.0,
-            "pivot_high_dist":        0.0,
-            "price_move_since_setup": 0.0,
-            "bars_since_setup":       0,
-            "bars_band":              "Actionable",
-            "atr_at_setup":           round(atr_val, 2),
-            "extension_atr":          float(getattr(_pr, "atr_extension", 0.0)) if _pr else 0.0,
-            "extension_score_atr":    0,
-            "atr_band":               "Actionable",
-            "pct_band":               "Actionable",
-            "entry_quality_score":    int(cur),
-            "entry_quality_band":     "Good" if cur >= 90 else "Acceptable",
-            "entry_rejection_reason": "",
-            "leadership_score":       int(getattr(_pr, "leadership_score", 0)) if _pr else 0,
-            "conviction_score":       0,
-            # ── VWAP Reclaim diagnostics (for VWAP Reclaim Analysis report) ──
-            "vwap_touch":             _vr_vwap_touch,
-            "reaction_strength":      _vr_reaction_strength,
-            "reaction_score":         _vr_reaction_score,
-            "touch_bar":              _vr_touch_bar,
-            "cross_bar":              _vr_cross_bar,
-            "confluence":             _vr_confluence,
-            "pattern_age":            _vr_pattern_age,
-            "close_position_score":   _vr_close_pos,
-            "acceptance_score":       _vr_acceptance,
-            "overall_score":          int(cur),
-            "touch_distance_atr":     _vr_touch_dist_atr,
-            "returned_above_vwap":    _vr_returned,
-            "stoch_cross_found":      _vr_stoch_cross_found,
-            "vwap_rising":            _vr_vwap_rising,
-            # ── Reversal pillar (LL Spring) diagnostics ──────────────────
-            "ll_reclaimed":           _ll_reclaimed,
-            "ll_defended":            _ll_defended,
-            "ll_distance_atr_ok":     _ll_dist_atr_ok,
-            "ll_distance_atr":        _ll_dist_atr,
-            "ll_volume_confirmed":    _ll_vol_confirm,
-            "ll_bars_to_reclaim":     _ll_bars_reclaim,
-            "ll_confidence":          _ll_confidence,
-            "ll_price":               _ll_price,
-        })
-
-    return pd.DataFrame(signals)
-
-
 
 
 def simulate_trades(
@@ -1058,20 +869,12 @@ def run_backtest(
     rs_positive_only: bool = False,
     progress_cb            = None,
     mode:             str  = "scanner",
-    extra_pillar_cfg: dict | None = None,
 ) -> tuple:
     """
     Walk-forward backtest.
 
     mode="scanner"      — default; scoring_core.compute_bar() (full engine)
     mode="cci_master"   — CCI Master crossover signals
-    mode="five_pillars" — Five Pillars FP score crossover signals
-
-    extra_pillar_cfg (mode="five_pillars" only): overrides for the ic_*
-    "Institutional Continuation (VWAP Reclaim)" settings, layered on top
-    of whatever `settings` already carries. Used by the Parameter
-    Sensitivity sweep on the Backtest page to test one knob at a time
-    without needing a full settings dict.
     """
     if settings:
         hold_days        = settings.get("hold_days",            hold_days)
@@ -1084,13 +887,6 @@ def run_backtest(
 
     # v13: momentum failure exit and adaptive targets — read from settings
     momentum_exit_enabled = bool((settings or {}).get("momentum_exit_enabled", False))
-
-    # Five Pillars VWAP Reclaim tuning: start from whatever ic_* keys are in
-    # `settings` (so backtest matches the live scanner by default), then
-    # layer any explicit per-run override on top.
-    _fp_cfg = {k: v for k, v in (settings or {}).items() if k.startswith("ic_")}
-    if extra_pillar_cfg:
-        _fp_cfg.update(extra_pillar_cfg)
 
     workers = max(4, min(workers, 20))
 
@@ -1143,10 +939,6 @@ def run_backtest(
                 buy_score   = int(effective_settings.get("bt_cci_buy_score",    2)),
             )
             sigs = generate_signals_cci_master(df, params=_cci_params)
-            rejs = pd.DataFrame()
-
-        elif mode == "five_pillars":
-            sigs = generate_signals_five_pillars(df, nifty, cfg=_fp_cfg)
             rejs = pd.DataFrame()
 
         else:  # default: "scanner"
@@ -1819,7 +1611,7 @@ def build_vwap_reclaim_analysis(trades: pd.DataFrame) -> dict:
         return {"available": False, "reason": "no trades"}
 
     if "vwap_touch" not in trades.columns:
-        return {"available": False, "reason": "no VWAP reclaim data (non-Five Pillars mode)"}
+        return {"available": False, "reason": "no VWAP reclaim data on these trades"}
 
     def _metrics(subset: pd.DataFrame) -> dict:
         if subset.empty:

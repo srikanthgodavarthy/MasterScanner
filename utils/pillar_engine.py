@@ -85,6 +85,13 @@ from utils.swing_structure import compute_swing_labels
 from utils.obv_analyzer import (
     compute_obv, obv_trend_rising, obv_leads_price,
 )
+# ── Architecture cleanup: these two used to be private copies living only
+# in this file. They are now shared, single-owner modules also consumed by
+# utils/scoring_core.py (the main scanner engine) — see each module's
+# docstring. This file keeps importing them under their old private names
+# so the rest of this module (and its point-scoring below) is unchanged.
+from utils.scanner_engine import stochastic as _stochastic
+from utils.ll_opportunity import score_ll_opportunity as _shared_score_ll_opportunity
 
 # ── Pillar point budgets (v5 — sum to 100; Risk deducted separately) ──────
 # "Today's Volume Ratio" (volume vs its 20d average) is owned exclusively
@@ -468,166 +475,41 @@ def _score_acceptance(close: pd.Series, high: pd.Series, low: pd.Series,
 #  a newer higher low prints.
 # ══════════════════════════════════════════════════════════════════
 
-def _find_active_ll(ph_series: pd.Series, pl_series: pd.Series,
-                     close: pd.Series, low: pd.Series, volume: pd.Series,
-                     vol_avg: pd.Series | None,
-                     max_bars_to_reclaim: int) -> dict | None:
-    """
-    Locates the most recent Lower-Low pivot that is still "active" —
-    either it's the latest confirmed pivot low, or the very next pivot
-    low after it (i.e. price has since printed exactly one fresh HL
-    confirming the spring resolved). Anything older than that is
-    considered stale and the bonus does not apply.
-    """
-    try:
-        labels = compute_swing_labels(ph_series, pl_series)
-    except Exception:
-        return None
-    lows = labels[labels["pivot_type"] == "L"]
-    if len(lows) < 2:
-        return None
-
-    if lows.iloc[-1]["label"] == "LL":
-        active, prior = lows.iloc[-1], lows.iloc[-2]
-    elif len(lows) >= 3 and lows.iloc[-2]["label"] == "LL":
-        active, prior = lows.iloc[-2], lows.iloc[-3]
-    else:
-        return None
-
-    ll_bar_pos = labels.index.get_loc(active.name)
-    ll_price = float(active["pivot_price"])
-    prior_low_price = float(prior["pivot_price"])
-
-    reclaimed, reclaim_bar, bars_to_reclaim = False, -1, -1
-    window_end = min(len(close) - 1, ll_bar_pos + max_bars_to_reclaim)
-    for j in range(ll_bar_pos, window_end + 1):
-        if float(close.iloc[j]) > prior_low_price:
-            reclaimed, reclaim_bar, bars_to_reclaim = True, j, j - ll_bar_pos
-            break
-
-    volume_confirmed = False
-    if reclaimed and vol_avg is not None:
-        try:
-            volume_confirmed = float(volume.iloc[reclaim_bar]) > float(vol_avg.iloc[reclaim_bar])
-        except Exception:
-            pass
-
-    defended = True
-    try:
-        defended = bool(float(low.iloc[ll_bar_pos:].min()) >= ll_price)
-    except Exception:
-        pass
-
-    return {
-        "ll_bar_pos": ll_bar_pos, "ll_price": ll_price,
-        "prior_low_price": prior_low_price,
-        "reclaimed": reclaimed, "reclaim_bar": reclaim_bar, "bars_to_reclaim": bars_to_reclaim,
-        "volume_confirmed": volume_confirmed, "defended": defended,
-    }
-
-
 def _score_reversal(close: pd.Series, low: pd.Series, high: pd.Series,
                      open_: pd.Series | None, volume: pd.Series,
                      ph_series: pd.Series | None, pl_series: pd.Series | None,
                      osc: pd.Series | None,
                      atr_s: pd.Series | None = None,
                      vol_avg: pd.Series | None = None) -> tuple[int, dict]:
-    actionable_ll        = False
-    ll_defended            = False
-    distance_atr_ok          = False
-    distance_atr_pts           = 0
-    high_volume_confirmation     = False
-    ll_price                       = 0.0
-    prior_low_price                  = 0.0
-    bars_to_reclaim                    = -1
-    bars_since_reclaim                   = -1
-    vertical_extension                     = False
-    distance_atr                             = 0.0
-    confidence                                 = 0
+    """
+    Thin wrapper around the shared utils.ll_opportunity.score_ll_opportunity()
+    (architecture cleanup — the detection/grading logic itself now lives
+    there, single-owner, reused by utils/scoring_core.py too). This wrapper
+    only maps that shared signal onto pillar_engine's existing r_* field
+    names / PTS_REVERSAL budget so PillarResult's public shape is unchanged.
+    """
+    sig = _shared_score_ll_opportunity(
+        close=close, low=low, volume=volume,
+        ph_series=ph_series, pl_series=pl_series,
+        atr_s=atr_s, vol_avg=vol_avg,
+        max_bars_to_reclaim=LL_MAX_BARS_TO_RECLAIM,
+        max_bonus=PTS_REVERSAL,
+    )
 
-    if ph_series is not None and pl_series is not None and len(ph_series) > 0:
-        info = _find_active_ll(ph_series, pl_series, close, low, volume, vol_avg,
-                                LL_MAX_BARS_TO_RECLAIM)
-        if info is not None:
-            ll_price          = info["ll_price"]
-            prior_low_price     = info["prior_low_price"]
-            bars_to_reclaim        = info["bars_to_reclaim"]
-
-            actionable_ll = info["reclaimed"]                       # spring confirmed
-            ll_defended   = info["defended"]                        # never re-broken since
-            high_volume_confirmation = info["volume_confirmed"]
-
-            cur_atr = _safe_last(atr_s) if atr_s is not None else 0.0
-            if cur_atr > 0 and info["reclaimed"]:
-                distance_atr = (_safe_last(close) - ll_price) / cur_atr
-                distance_atr_ok = bool(0.3 <= distance_atr <= 4.0)
-                # Graduated, not flat: opportunity quality decays the further
-                # price has already moved from the actionable LL. A stock
-                # 0.4 ATR off the reload is a materially better entry than
-                # one 2.5 ATR off, even with an identical spring pattern —
-                # distance is the largest single component of this bonus
-                # precisely because it's what "opportunity cost" comes down
-                # to (see module docstring).
-                if 0.3 <= distance_atr < 1.0:
-                    distance_atr_pts = 4     # prime — right at the reload
-                elif 1.0 <= distance_atr < 2.0:
-                    distance_atr_pts = 3
-                elif 2.0 <= distance_atr < 3.0:
-                    distance_atr_pts = 2
-                elif 3.0 <= distance_atr <= 4.0:
-                    distance_atr_pts = 1     # still actionable, but stretched
-
-                # ── Pace context: HOW price covered that distance ────
-                # Two stocks 0.6 ATR off the actionable LL are not
-                # equivalent — one that took 3 bars to get there is a
-                # near-vertical spike; one that took 18 bars through an
-                # orderly consolidation is a healthier continuation.
-                # Folded into the existing distance component (not a
-                # new pillar, not a new promotion gate) so the Promotion
-                # Engine's LL Opportunity gate stays a single check.
-                reclaim_bar = info.get("reclaim_bar", -1)
-                if reclaim_bar is not None and reclaim_bar >= 0:
-                    bars_since_reclaim = (len(close) - 1) - reclaim_bar
-                    if bars_since_reclaim > 0:
-                        pace = distance_atr / bars_since_reclaim   # ATR covered per bar
-                        # Near-vertical: most of the distance covered in a
-                        # handful of bars — shave a point off the distance
-                        # score even though the raw ATR distance looks "prime".
-                        if bars_since_reclaim <= 3 and pace > 0.35:
-                            vertical_extension = True
-                            distance_atr_pts = max(0, distance_atr_pts - 1)
-                        # Orderly: same distance reached gradually over many
-                        # bars — no penalty; this is the healthier case the
-                        # raw ATR-distance number alone can't distinguish.
-
-            confidence = 30
-            if info["volume_confirmed"]: confidence += 30
-            if info["defended"]:          confidence += 20
-            if info["bars_to_reclaim"] >= 0 and info["bars_to_reclaim"] <= 3: confidence += 20
-            confidence = min(confidence, 100)
-
-    score = 0
-    if actionable_ll:              score += 2
-    if ll_defended:                  score += 2
-    score += distance_atr_pts          # 0-4, graduated by proximity to the LL, pace-adjusted
-    if high_volume_confirmation:         score += 2
-    score = min(score, PTS_REVERSAL)
-
-    return score, {
-        "r_actionable_ll": actionable_ll,
-        "r_ll_defended": ll_defended,
-        "r_distance_atr_ok": distance_atr_ok,
-        "r_distance_atr_pts": distance_atr_pts,
-        "r_high_volume_confirmation": high_volume_confirmation,
-        "r_ll_price": ll_price,
-        "r_prior_low_price": prior_low_price,
-        "r_bars_to_reclaim": bars_to_reclaim,
-        "r_bars_since_reclaim": bars_since_reclaim,
-        "r_vertical_extension": vertical_extension,
-        "r_distance_atr": round(distance_atr, 2),
-        "r_confidence": confidence,
+    return sig.bonus_pts, {
+        "r_actionable_ll": sig.actionable_ll,
+        "r_ll_defended": sig.ll_defended,
+        "r_distance_atr_ok": sig.distance_atr_ok,
+        "r_distance_atr_pts": sig.distance_atr_pts,
+        "r_high_volume_confirmation": sig.high_volume_confirmation,
+        "r_ll_price": sig.ll_price,
+        "r_prior_low_price": sig.prior_low_price,
+        "r_bars_to_reclaim": sig.bars_to_reclaim,
+        "r_bars_since_reclaim": sig.bars_since_reclaim,
+        "r_vertical_extension": sig.vertical_extension,
+        "r_distance_atr": round(sig.distance_atr, 2),
+        "r_confidence": sig.confidence,
     }
-
 
 # ══════════════════════════════════════════════════════════════════
 #  PILLAR 4 — LEADERSHIP  (13 pts) — select the strongest stock.
@@ -693,18 +575,6 @@ def _score_leadership(close: pd.Series, nifty_aligned: pd.Series) -> tuple[int, 
 #  PILLAR 5 — MOMENTUM  (35 pts) — ONLY today's trigger. No LL/HH/HL,
 #  no trend age, no EMA scoring, no OBV (OBV belongs to Acceptance).
 # ══════════════════════════════════════════════════════════════════
-
-def _stochastic(high: pd.Series, low: pd.Series, close: pd.Series,
-                 k_period: int = STOCH_K_PERIOD,
-                 d_period: int = STOCH_D_PERIOD) -> tuple[pd.Series, pd.Series]:
-    """Standard Stochastic Oscillator. %K = (C - LLn)/(HHn - LLn)*100, %D = SMA(%K, d)."""
-    hh = high.rolling(k_period).max()
-    ll = low.rolling(k_period).min()
-    rng = (hh - ll).replace(0, np.nan)
-    k = (close - ll) / rng * 100
-    d = k.rolling(d_period).mean()
-    return k, d
-
 
 def _score_momentum(
     high: pd.Series, low: pd.Series, close: pd.Series,

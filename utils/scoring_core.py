@@ -115,6 +115,29 @@ class ScoringParams:
     #                     Caller must pass a dispatch_state dict into compute_bar().
     setup_age_mode: str = "legacy"   # "legacy" | "signal_dispatch"
 
+    # ── LL Opportunity + Stochastic Convergence bonus (migrated from the
+    #    Five Pillars engine — see utils/ll_opportunity.py and
+    #    utils/stoch_convergence.py) ────────────────────────────────
+    # Layered ON TOP of norm_score, exactly like pillar_engine's own
+    # "Opportunity Quality Bonus" is layered on top of its 90pt base —
+    # NOT mixed into the backtest-tuned 265pt raw-score budget above, so
+    # existing thresholds/tiers keep meaning what they already meant.
+    # Set enable_ll_stoch_bonus=False to fully restore pre-migration
+    # scoring (e.g. to A/B against old backtest results).
+    enable_ll_stoch_bonus: bool = True
+    ll_bonus_max:           int  = 8    # 0-8 pts — defended/actionable LL spring, graded by ATR distance
+    stoch_bonus_max:        int  = 7    # 0-7 pts — fresh stoch re-ignition confluent with a VWAP reclaim
+
+    # Institutional Continuation (VWAP Reclaim) tuning — Settings page's
+    # "Institutional Continuation" panel (ic_* keys). Previously only
+    # consumed by the retired Five Pillars Momentum pillar; now wired
+    # directly into score_stochastic_convergence() so that panel keeps
+    # working for the (now single) scoring engine.
+    ic_vwap_touch_lookback: int   = 3
+    ic_vwap_touch_atr_mult: float = 0.25
+    ic_reaction_max_atr:    float = 1.5
+    ic_confluence_window:   int   = 2
+
     @classmethod
     def from_settings(cls, s: dict) -> "ScoringParams":
         """Build from the settings dict produced by pages/settings.py."""
@@ -144,6 +167,13 @@ class ScoringParams:
             nifty_regime_filter = bool(s.get("nifty_regime_filter", False)),
             nifty_regime_val    = str(s.get("nifty_regime_val",  "neutral")),
             setup_age_mode      = str(s.get("setup_age_mode",    "legacy")),
+            enable_ll_stoch_bonus = bool(s.get("enable_ll_stoch_bonus", True)),
+            ll_bonus_max          = int(s.get("ll_bonus_max",     8)),
+            stoch_bonus_max       = int(s.get("stoch_bonus_max",  7)),
+            ic_vwap_touch_lookback= int(s.get("ic_vwap_touch_lookback", 3)),
+            ic_vwap_touch_atr_mult= float(s.get("ic_vwap_touch_atr_mult", 0.25)),
+            ic_reaction_max_atr   = float(s.get("ic_reaction_max_atr", 1.5)),
+            ic_confluence_window  = int(s.get("ic_confluence_window", 2)),
         )
 
 
@@ -313,6 +343,31 @@ class BarResult:
     # no momentum-based buy_type was assigned.  Used for diagnostics and
     # to decide whether to tighten Path A's score floor.
     structural_entry:    bool  = False
+
+    # ── LL Opportunity + Stochastic Convergence (migrated from Five
+    #    Pillars — see utils/ll_opportunity.py, utils/stoch_convergence.py) ──
+    ll_actionable:      bool  = False   # defended Lower-Low spring, reclaimed
+    ll_defended:        bool  = False   # LL price never re-broken since
+    ll_distance_atr:    float = 0.0     # close vs LL price, in ATR units
+    ll_price:           float = 0.0
+    ll_bonus_pts:        int   = 0       # 0..params.ll_bonus_max
+    stoch_k:            float = 0.0
+    stoch_d:             float = 0.0
+    stoch_reignition:      bool  = False   # fresh %K/%D cross-up or cross out of oversold
+    stoch_confluence:        bool  = False   # stoch cross lines up with a VWAP touch/reclaim
+    stoch_bonus_pts:           int   = 0       # 0..params.stoch_bonus_max
+    opportunity_bonus_pts:       int   = 0       # ll_bonus_pts + stoch_bonus_pts, already applied to norm_score
+    # ── VWAP Reclaim diagnostics (migrated off the retired Five Pillars
+    # engine so the Backtest page's VWAP Reclaim Analysis report can be fed
+    # from scanner-mode trades too — see utils/stoch_convergence.py) ──────
+    stoch_vwap_touch_found:       bool  = False
+    stoch_touch_bar:                int   = -1
+    stoch_cross_bar:                  int   = -1
+    stoch_reaction_strength:            float = 0.0
+    stoch_pattern_age:                    int   = -1
+    stoch_touch_distance_atr:               float = 0.0
+    stoch_vwap_rising:                        bool  = False
+    stoch_close_position_score:                 float = 0.0
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1242,6 +1297,81 @@ def compute_bar(
     # ── NORMALISE ─────────────────────────────────────────────────
     norm_score = min(100, int(score * 100 / params.max_score))
 
+    # ── LL OPPORTUNITY + STOCHASTIC CONVERGENCE (migrated from Five
+    #    Pillars — see utils/ll_opportunity.py, utils/stoch_convergence.py) ──
+    # Layered ON TOP of norm_score (like pillar_engine's own Opportunity
+    # Quality Bonus is layered on its 90pt base), not mixed into the
+    # backtest-tuned raw-score budget above. Bar-indexed: every input
+    # Series is sliced to :i+1 so this can never see future bars — the
+    # same guarantee swing_structure.detect_ll_reversal documents.
+    ll_actionable = ll_defended = False
+    ll_distance_atr = ll_price_v = 0.0
+    ll_bonus = 0
+    stoch_k_v = stoch_d_v = 0.0
+    stoch_reignition = stoch_confluence = False
+    stoch_bonus = 0
+    stoch_vwap_touch_found_v = False
+    stoch_touch_bar_v = stoch_cross_bar_v = -1
+    stoch_reaction_strength_v = 0.0
+    stoch_pattern_age_v = -1
+    stoch_touch_distance_atr_v = 0.0
+    stoch_vwap_rising_v = False
+    stoch_close_position_score_v = 0.0
+
+    if params.enable_ll_stoch_bonus and i >= max(40, params.pvt_lb * 2):
+        try:
+            from utils.ll_opportunity import score_ll_opportunity
+            from utils.stoch_convergence import score_stochastic_convergence
+
+            _sl = slice(0, i + 1)
+            _close_i  = ia.c.iloc[_sl]
+            _low_i    = ia.l.iloc[_sl]
+            _high_i   = ia.h.iloc[_sl]
+            _vol_i    = ia.v.iloc[_sl]
+            _atr_i    = ia.atr_s.iloc[_sl]
+            _vavg_i   = ia.vol_avg.iloc[_sl]
+            _ph_i     = ia.ph_series.iloc[_sl] if ia.ph_series is not None else None
+            _pl_i     = ia.pl_series.iloc[_sl] if ia.pl_series is not None else None
+
+            _ll_sig = score_ll_opportunity(
+                close=_close_i, low=_low_i, volume=_vol_i,
+                ph_series=_ph_i, pl_series=_pl_i,
+                atr_s=_atr_i, vol_avg=_vavg_i,
+                max_bonus=params.ll_bonus_max,
+            )
+            ll_actionable   = _ll_sig.actionable_ll
+            ll_defended     = _ll_sig.ll_defended
+            ll_distance_atr = _ll_sig.distance_atr
+            ll_price_v      = _ll_sig.ll_price
+            ll_bonus        = _ll_sig.bonus_pts
+
+            _stoch_sig = score_stochastic_convergence(
+                high=_high_i, low=_low_i, close=_close_i, volume=_vol_i,
+                atr_s=_atr_i, max_bonus=params.stoch_bonus_max,
+                lookback=params.ic_vwap_touch_lookback,
+                atr_mult=params.ic_vwap_touch_atr_mult,
+                reaction_max_atr=params.ic_reaction_max_atr,
+                confluence_bars=params.ic_confluence_window,
+            )
+            stoch_k_v        = _stoch_sig.stoch_k
+            stoch_d_v         = _stoch_sig.stoch_d
+            stoch_reignition    = _stoch_sig.reignition
+            stoch_confluence       = _stoch_sig.confluence
+            stoch_bonus               = _stoch_sig.bonus_pts
+            stoch_vwap_touch_found_v  = _stoch_sig.vwap_touch_found
+            stoch_touch_bar_v         = _stoch_sig.touch_bar
+            stoch_cross_bar_v         = _stoch_sig.cross_bar
+            stoch_reaction_strength_v = _stoch_sig.reaction_strength
+            stoch_pattern_age_v       = _stoch_sig.pattern_age
+            stoch_touch_distance_atr_v= _stoch_sig.touch_distance_atr
+            stoch_vwap_rising_v       = _stoch_sig.vwap_rising
+            stoch_close_position_score_v = _stoch_sig.close_position_score
+        except Exception:
+            pass   # non-critical; bonus stays 0, norm_score falls back to pre-migration value
+
+    opportunity_bonus = ll_bonus + stoch_bonus
+    norm_score = min(100, norm_score + opportunity_bonus)
+
     # ── ADAPTIVE THRESHOLD ────────────────────────────────────────
     ts_ratio        = cur_atr / cur_atr_sma20 if cur_atr_sma20 > 0 else 1.0
     score_threshold = 65 if ts_ratio > 1.2 else (75 if ts_ratio < 0.8 else 70)
@@ -1418,6 +1548,8 @@ def compute_bar(
         "squeeze":          (params.t1_squeeze_pts if squeeze_release else (params.t1_no_squeeze_pts if not squeeze_on else 0)) if params.t1_squeeze_boost else 0,
         "cci_rising":       8 if cci_rising else 0,
         "phase_modifier":   round(score * (0.70 - 1) if trend_phase == "EXTENDED" else score * (0.90 - 1) if trend_phase == "EMERGING" else 0, 1),
+        "ll_opportunity_bonus":     ll_bonus,      # layered on norm_score, not the raw score above
+        "stoch_convergence_bonus": stoch_bonus,    # layered on norm_score, not the raw score above
     }
 
     # ── Suggestion 3: t1_path audit ──────────────────────────────
@@ -1618,6 +1750,26 @@ def compute_bar(
         cci_signal = cci_signal,
         pct_chg    = pct_chg,
         structural_entry = structural_entry,
+
+        ll_actionable          = ll_actionable,
+        ll_defended            = ll_defended,
+        ll_distance_atr        = round(ll_distance_atr, 2),
+        ll_price                = ll_price_v,
+        ll_bonus_pts             = ll_bonus,
+        stoch_vwap_touch_found    = stoch_vwap_touch_found_v,
+        stoch_touch_bar           = stoch_touch_bar_v,
+        stoch_cross_bar           = stoch_cross_bar_v,
+        stoch_reaction_strength   = stoch_reaction_strength_v,
+        stoch_pattern_age         = stoch_pattern_age_v,
+        stoch_touch_distance_atr  = stoch_touch_distance_atr_v,
+        stoch_vwap_rising         = stoch_vwap_rising_v,
+        stoch_close_position_score= stoch_close_position_score_v,
+        stoch_k                   = stoch_k_v,
+        stoch_d                    = stoch_d_v,
+        stoch_reignition             = stoch_reignition,
+        stoch_confluence               = stoch_confluence,
+        stoch_bonus_pts                  = stoch_bonus,
+        opportunity_bonus_pts              = opportunity_bonus,
         cur_cci    = cur_cci,
         cur_rsi    = cur_r,
         mom1 = round(mom1, 1),

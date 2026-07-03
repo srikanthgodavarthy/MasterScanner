@@ -70,14 +70,12 @@ def _find_stoch_cross_bar(k_s: pd.Series, d_s: pd.Series, lookback: int) -> int 
     return None
 
 
-def _stochastic(high: pd.Series, low: pd.Series, close: pd.Series,
-                k_period: int = 14, d_period: int = 3) -> tuple[pd.Series, pd.Series]:
-    hh  = high.rolling(k_period).max()
-    ll  = low.rolling(k_period).min()
-    rng = (hh - ll).replace(0, np.nan)
-    k   = (close - ll) / rng * 100
-    d   = k.rolling(d_period).mean()
-    return k, d
+# NOTE (architecture cleanup): the Stochastic Oscillator itself is no
+# longer computed here — this module only *consumes* pre-computed k_s/d_s
+# (see detect_vwap_reclaim's k_s/d_s params). The single-owner
+# implementation now lives in utils.scanner_engine.stochastic(); callers
+# (pillar_engine, scoring_core) compute it once and pass the series in,
+# so there is exactly one Stochastic implementation in the whole codebase.
 
 
 def _empty_result(pattern: str) -> dict:
