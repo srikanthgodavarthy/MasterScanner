@@ -1334,7 +1334,11 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     data_rows = ""
     for i, (_, row) in enumerate(df.iterrows()):
         stock = str(row.get("Stock", row.get("Symbol", "?")))
-        sc    = str(row.get("Recommendation", row.get("CV1_SignalClass", "WATCH")))
+        # This table's sub-factor bars are pure CV1 (conviction_score_v1.py),
+        # so the Class badge shown alongside them must also be CV1_SignalClass
+        # (post Elite-promotion) — not Recommendation, which is the separate
+        # Decision Engine's label and uses a different vocabulary entirely.
+        sc    = str(row.get("CV1_SignalClass", row.get("Recommendation", "WATCH")))
         # NOTE: this table's sub-factor bars (below) are the CV1 pillar-engine
         # breakdown (conviction_score_v1.py), so the frozen L/C/EQ totals MUST
         # read the CV1_* columns to stay consistent with those bars — reading
@@ -2079,7 +2083,11 @@ def _breakdown_row_html(label: str, pts: int, max_pts: int, color: str) -> str:
 
 
 def _detail_breakdown_panel(row: pd.Series) -> str:
-    sc  = str(row.get("Recommendation", row.get("Signal Class", "Watch")))
+    # This panel is CV1's own breakdown, so its headline badge should read
+    # CV1_SignalClass (post-promotion) — not the Decision Engine's
+    # Recommendation field, which is a different engine's label entirely
+    # and uses a different string vocabulary ("Elite Opportunity" vs "ELITE").
+    sc  = str(row.get("CV1_SignalClass", row.get("Signal Class", "WATCH")))
     # Same fix as _perstock_breakdown_table: these headline totals must be the
     # CV1 pillar totals since ls_factors/cv_factors/eq_factors below are CV1
     # sub-factors — reading "Leadership"/"Conviction"/"EntryQuality" instead
@@ -2135,6 +2143,26 @@ def _detail_breakdown_panel(row: pd.Series) -> str:
         f'<span style="font-size:10px;color:#8b949e">Conviction Score v1 — sub-score breakdown</span>'
         f'</div>'
     )
+
+    # ── Elite Promotion note ────────────────────────────────────
+    # Surfaces *why* a stock is showing ELITE when its raw CV1 leadership/
+    # conviction/entry-quality thresholds alone wouldn't have earned it —
+    # i.e. it was lifted from EXECUTE/WATCH by the Stoch Confluence + LL
+    # spring gate in utils/scanner_engine.py, not by CV1's native formula.
+    if bool(row.get("CV1_Promoted", False)):
+        _raw_cls = str(row.get("CV1_SignalClassRaw", "—"))
+        html += (
+            '<div style="background:rgba(245,197,66,0.08);border:1px solid rgba(245,197,66,0.35);'
+            'border-radius:6px;padding:8px 12px;margin-bottom:10px;">'
+            f'<span style="font-size:10px;font-weight:700;color:#f5c542">🚀 PROMOTED TO ELITE</span> '
+            f'<span style="font-size:10px;color:#8b949e">'
+            f'from {_raw_cls} — Stoch Confluence '
+            f'{"✅" if row.get("_cv1_promo_stoch_confluence") else "❌"} · '
+            f'LL Actionable {"✅" if row.get("_cv1_promo_ll_actionable") else "❌"} · '
+            f'LL Defended {"✅" if row.get("_cv1_promo_ll_defended") else "❌"}</span>'
+            '</div>'
+        )
+
     html += _section("Leadership",    ls, ls_factors, "#a371f7")
     html += _section("Conviction",    cv, cv_factors, "#3fb950")
     html += _section("Entry Quality", eq, eq_factors, "#d29922")
