@@ -1882,7 +1882,8 @@ def _lifecycle_timeline_panel(history_df=None, plan_row=None) -> str:
         ("Closed",   "🏁", "#f5c542"),
     ]
 
-    plan_row = plan_row or {}
+    if plan_row is None:
+        plan_row = {}
     status = str(plan_row.get("PlanStatus", "")).upper()
 
     fa  = plan_row.get("FirstActionable", "") or plan_row.get("first_actionable_date", "")
