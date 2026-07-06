@@ -799,6 +799,36 @@ def score_stock(
             "_cv1_eq_bars":      cv1.eq_bars_since_setup,
         })
 
+        # ── ELITE PROMOTION (Stoch Confluence + defended LL spring) ────
+        # Lift EXECUTE or WATCH straight to ELITE when both stricter
+        # structural confirmations fire together:
+        #   Stoch_Confluence — stochastic reignition that also lines up
+        #                      with a VWAP touch/reclaim (stricter than
+        #                      plain Stoch_Reignition)
+        #   LL_Actionable + LL_Defended — a confirmed Lower-Low spring
+        #                      that has never been re-broken since
+        # SKIP is never promoted — these signals accelerate an
+        # already-qualifying setup, they don't fix a structural failure.
+        _cv1_class_raw    = cv1.signal_class                 # pre-promotion, for diagnostics
+        _cv1_promo_signal = bool(r.stoch_confluence) and bool(r.ll_actionable) and bool(r.ll_defended)
+        _cv1_promoted     = _cv1_promo_signal and _cv1_class_raw in ("EXECUTE", "WATCH")
+        _cv1_class_final  = "ELITE" if _cv1_promoted else _cv1_class_raw
+
+        result["CV1_SignalClass"]             = _cv1_class_final
+        result["CV1_SignalClassRaw"]          = _cv1_class_raw
+        result["CV1_Promoted"]                = _cv1_promoted
+        result["_cv1_promo_stoch_confluence"] = bool(r.stoch_confluence)
+        result["_cv1_promo_ll_actionable"]    = bool(r.ll_actionable)
+        result["_cv1_promo_ll_defended"]      = bool(r.ll_defended)
+
+        # Promoted stocks also move into the Elite tab/bucket, which is
+        # driven by the separate Decision Engine's Recommendation field —
+        # otherwise CV1_SignalClass would say ELITE but the row would sit
+        # stranded under whichever Decision-Engine tab it started in.
+        if _cv1_promoted:
+            result["Recommendation_Raw"] = result.get("Recommendation")
+            result["Recommendation"]     = "Elite Opportunity"
+
         # ── CV1 ACTION GATE ───────────────────────────────────────
         # The original Action column (✅ BUY / 👁 WATCH / ⛔ SKIP) was
         # assigned purely from norm_score in compute_bar(), with zero
@@ -819,7 +849,7 @@ def score_stock(
         # so we can measure disagreement rate in diagnostics.
         _action_raw = result.get("Action", r.action)
         result["_action_raw"] = _action_raw          # for diagnostics
-        sc = cv1.signal_class                        # ELITE | EXECUTE | WATCH | SKIP
+        sc = _cv1_class_final                         # ELITE | EXECUTE | WATCH | SKIP (post-promotion)
 
         if sc in ("ELITE", "EXECUTE"):
             # CV1 approves — honour norm_score decision (BUY/WATCH/SKIP)
