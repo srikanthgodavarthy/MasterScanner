@@ -39,6 +39,14 @@ from utils.regime_engine   import (
 )
 from utils.supabase_client import save_scan_snapshot, load_watchlist, add_to_watchlist, _is_available
 
+# Reuse the Five Pillars page's own individual-stock breakdown renderer so the
+# Scanner page's per-stock panel is pixel-identical to pages/five_pillars.py
+# (same tiles: Structure/Acceptance/Leadership/Momentum/Risk + Opportunity
+# Quality Bonus + Promotion Engine). It reads the FP_*/_fp_* columns that
+# utils/scanner_engine.py already attaches to every scanned row, so no new
+# computation is needed here — this is purely reusing the existing display layer.
+from pages.five_pillars import _detail_breakdown as _fp_detail_breakdown
+
 try:
     from fib_tab import render_fib_tab as _render_fib_tab
     _FIB_TAB_OK = True
@@ -554,6 +562,36 @@ _CSS = """
 .locked-level .ll-label { font-size: 9px; font-weight: 700; color: var(--muted);
   text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 4px; }
 .locked-level .ll-value { font-size: 14px; font-weight: 700; }
+
+/* ── Five Pillars tile strip (borrowed from pages/five_pillars.py so the
+   Scanner page's individual-stock breakdown renders identically) ── */
+.fp-strip {
+  display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin-bottom:10px;
+}
+@media (max-width: 900px) { .fp-strip { grid-template-columns:repeat(2,1fr); } }
+.fp-tile {
+  background:var(--bg1); border:1px solid var(--border); border-radius:8px;
+  padding:8px 10px; border-top:3px solid var(--c); min-width:0;
+}
+.fp-tile-top { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px; }
+.fp-tile-name { font-size:10px; font-weight:700; color:var(--text); text-transform:uppercase; letter-spacing:0.03em; }
+.fp-tile-score { font-size:15px; font-weight:700; }
+.fp-tile-max { font-size:9px; color:var(--muted); font-weight:400; }
+.fp-tile-line { font-size:9.5px; color:var(--muted); line-height:1.5; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.fp-tile-line b { color:var(--text); font-weight:600; }
+
+.fp-stock-header {
+  background:var(--bg2); border:1px solid var(--border); border-radius:8px;
+  padding:8px 12px; margin-bottom:10px;
+  display:flex; flex-wrap:wrap; gap:14px; align-items:center;
+}
+.fp-sh-item { font-size:10.5px; color:var(--muted); white-space:nowrap; }
+.fp-sh-item b { color:var(--text); font-family:var(--mono); font-weight:700; margin-left:4px; }
+
+.fp-badge {
+  display:inline-block; padding:2px 9px; border-radius:4px;
+  font-size:10px; font-weight:700; letter-spacing:0.04em; white-space:nowrap;
+}
 </style>
 """
 
@@ -3161,8 +3199,20 @@ def render(settings: dict | None = None):
                         st.markdown(_locked_plan_panel(_row), unsafe_allow_html=True)
                         st.markdown(_lifecycle_timeline_panel(plan_row=_row), unsafe_allow_html=True)
 
-            # Decision Engine breakdown (Pillar-style tile layout)
-            if _show_detail and "DE_Leadership" in df_subset.columns:
+            # Pillar Breakdown — same panel as pages/five_pillars.py (Structure /
+            # Acceptance / Leadership / Momentum / Risk tiles + Opportunity
+            # Quality Bonus + Promotion Engine), reading the FP_*/_fp_* columns
+            # utils/scanner_engine.py already attaches to every scanned row.
+            if _show_detail and "FP_Structure" in df_subset.columns:
+                with st.expander("🔬 Pillar Breakdown — individual stock"):
+                    _sel3 = df_subset["Stock"].tolist()[:10] if "Stock" in df_subset.columns else []
+                    _picked3 = st.selectbox("Select stock", _sel3, key=f"de_breakdown_sel_{sc_key}")
+                    if _picked3:
+                        _de_row = df_subset[df_subset["Stock"] == _picked3].iloc[0]
+                        st.markdown(_fp_detail_breakdown(_de_row), unsafe_allow_html=True)
+            # Fallback for older cached scans that predate the FP_* columns —
+            # keeps the Decision Engine tile view available so nothing breaks.
+            elif _show_detail and "DE_Leadership" in df_subset.columns:
                 with st.expander("🏛️ Decision Engine Breakdown — individual stock"):
                     _sel3 = df_subset["Stock"].tolist()[:10] if "Stock" in df_subset.columns else []
                     _picked3 = st.selectbox("Select stock", _sel3, key=f"de_breakdown_sel_{sc_key}")
