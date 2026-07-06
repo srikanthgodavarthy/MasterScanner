@@ -487,14 +487,14 @@ def _primary_blocker(r, result: dict) -> str:
 
     # Extended is its own blocker — show it directly
     if category == "Extended":
-        ext = int(result.get("Extension", result.get("EntryQuality", 0)) or 0)
+        ext = int(result.get("Extension", result.get("DE_EntryQuality", 0)) or 0)
         return f"Extended ({ext}) — wait for pullback to EMA/Fib"
 
     # Pull scores — use CV1 for Leadership (matches scanner display colours at threshold 65);
     # fall back to DE values when CV1 is absent.
-    ls = float(result.get("CV1_Leadership",  result.get("Leadership",   result.get("DE_Leadership",   0))) or 0)
-    cv = float(result.get("CV1_Conviction",   result.get("Conviction",   result.get("DE_Conviction",   0))) or 0)
-    eq = float(result.get("CV1_EntryQuality", result.get("EntryQuality", result.get("DE_EntryQuality", 0))) or 0)
+    ls = float(result.get("CV1_Leadership",  result.get("DE_Leadership",   0)) or 0)
+    cv = float(result.get("CV1_Conviction",   result.get("DE_Conviction",   0)) or 0)
+    eq = float(result.get("CV1_EntryQuality", result.get("DE_EntryQuality", 0)) or 0)
     ext= float(result.get("Extension",       0) or 0)
 
     # Priority 1: Leadership gate — threshold aligned with _SCORE_THRESHOLDS["Leadership"]=65
@@ -700,9 +700,9 @@ def score_stock(
         from utils.decision_engine import compute_decision
         ds = compute_decision(r, settings or {})
         result.update({
-            "Leadership":    ds.leadership,
-            "Conviction":    ds.conviction,
-            "EntryQuality":  ds.entry_quality,
+            "DE_Leadership":    ds.leadership,
+            "DE_Conviction":    ds.conviction,
+            "DE_EntryQuality":  ds.entry_quality,
             "Extension":     ds.extension,
             "Lifecycle":     ds.lifecycle,     # objective stock state (settings-independent)
             "Recommendation":ds.recommendation,  # trader-adjusted label (respects settings)
@@ -956,7 +956,7 @@ def score_stock(
     # Negative  → DE sees more than CV1 (rare; signals a pattern-heavy bar without RS).
     try:
         cv1_cv = result.get("CV1_Conviction")
-        de_cv  = result.get("Conviction")
+        de_cv  = result.get("DE_Conviction")
         if cv1_cv is not None and de_cv is not None:
             gap = int(cv1_cv) - int(de_cv)
             result["ConvictionGap"] = gap

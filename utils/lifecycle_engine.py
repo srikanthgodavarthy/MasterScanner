@@ -115,8 +115,8 @@ def lifecycle_from_scanner_row(
     Convert a scanner result dict (one row from df_aug) into a
     LifecycleRecord ready for DB persistence.
 
-    ``row``      — dict with keys like 'Stock', 'Score', 'Leadership',
-                   'Conviction', 'Entry', 'Extension', 'Action', …
+    ``row``      — dict with keys like 'Stock', 'Score', 'DE_Leadership',
+                   'DE_Conviction', 'Entry', 'Extension', 'Action', …
     ``symbol``   — overrides row['Stock'] if provided
     ``scan_date``— date or str; defaults to today
     """
@@ -138,9 +138,9 @@ def lifecycle_from_scanner_row(
         scan_date     = scan_date,
         stage         = lc_stage,
         category      = str(row.get("Recommendation", row.get("Category", row.get("category", "")))),
-        leadership    = _safe_int(row.get("Leadership",    row.get("leadership",    0))),
-        conviction    = _safe_int(row.get("Conviction",    row.get("conviction",    0))),
-        entry_quality = _safe_int(row.get("EntryQuality",  row.get("Entry",         row.get("entry_quality", 0)))),
+        leadership    = _safe_int(row.get("DE_Leadership",    row.get("leadership",    0))),
+        conviction    = _safe_int(row.get("DE_Conviction",    row.get("conviction",    0))),
+        entry_quality = _safe_int(row.get("DE_EntryQuality",  row.get("Entry",         row.get("entry_quality", 0)))),
         extension     = _safe_int(row.get("Extension",     row.get("extension",     0))),
         trend_quality = _safe_int(row.get("TrendQuality",  row.get("trend_quality", 0))),
         score         = _safe_int(row.get("Score",         row.get("score",         0))),

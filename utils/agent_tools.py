@@ -14,7 +14,7 @@ Two families of tools:
                          outside MasterScanner's own scoring data.
 
 Column names on the raw scan_df vary across the codebase (e.g. "Stock" vs
-"Symbol", "CV1_Leadership" vs "Leadership"), so lookups go through small
+"Symbol", "CV1_Leadership" vs "DE_Leadership"), so lookups go through small
 `_first_col` / `_first_val` helpers that try several candidate names rather
 than assuming one fixed schema.
 """
@@ -128,9 +128,9 @@ def get_live_scan_snapshot(symbol: str) -> dict:
         "signal_class":     _first_val(row, ["CV1_SignalClass", "Recommendation", "Signal Class"]),
         "category":         _first_val(row, ["Category"]),
         "stage":            _first_val(row, ["Stage", "lifecycle", "CV1_Lifecycle"]),
-        "leadership":       _first_val(row, ["CV1_Leadership", "Leadership", "Leadership_DE"]),
-        "conviction":       _first_val(row, ["CV1_Conviction", "Conviction", "Conviction_DE"]),
-        "entry_quality":    _first_val(row, ["CV1_EntryQuality", "Entry Quality", "EntryQuality", "EntryQuality_DE"]),
+        "leadership":       _first_val(row, ["CV1_Leadership", "DE_Leadership"]),
+        "conviction":       _first_val(row, ["CV1_Conviction", "DE_Conviction"]),
+        "entry_quality":    _first_val(row, ["CV1_EntryQuality", "Entry Quality", "DE_EntryQuality"]),
         "extension":        _first_val(row, ["Extension", "CV1_Extension"]),
         "cmp":              _first_val(row, ["LTP", "CMP"]),
         "pct_chg":          _first_val(row, ["%Chg", "PctChg", "pct_chg"]),
@@ -157,7 +157,7 @@ def list_live_signals(signal_class: str | None = None, top_n: int = 15) -> dict:
 
     stock_col  = _first_col(df, ["Stock", "Symbol"])
     class_col  = _first_col(df, ["CV1_SignalClass", "Recommendation", "Signal Class"])
-    lead_col   = _first_col(df, ["CV1_Leadership", "Leadership"])
+    lead_col   = _first_col(df, ["CV1_Leadership", "DE_Leadership"])
     out_df = df.copy()
 
     if signal_class and class_col:
@@ -167,8 +167,8 @@ def list_live_signals(signal_class: str | None = None, top_n: int = 15) -> dict:
         out_df = out_df.sort_values(lead_col, ascending=False)
 
     cols = [c for c in [stock_col, class_col, lead_col,
-                         _first_col(df, ["CV1_Conviction", "Conviction"]),
-                         _first_col(df, ["CV1_EntryQuality", "Entry Quality"]),
+                         _first_col(df, ["CV1_Conviction", "DE_Conviction"]),
+                         _first_col(df, ["CV1_EntryQuality", "Entry Quality", "DE_EntryQuality"]),
                          _first_col(df, ["LTP", "CMP"]),
                          _first_col(df, ["%Chg"])] if c]
     records = _df_to_records(out_df[cols], limit=max(1, min(top_n, 50)))
