@@ -1297,9 +1297,17 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     for i, (_, row) in enumerate(df.iterrows()):
         stock = str(row.get("Stock", row.get("Symbol", "?")))
         sc    = str(row.get("Recommendation", row.get("CV1_SignalClass", "WATCH")))
-        ls    = int(row.get("Leadership",   row.get("Leadership",   0)))
-        cv    = int(row.get("Conviction",   row.get("Conviction",   0)))
-        eq    = int(row.get("EntryQuality", row.get("EntryQuality", 0)))
+        # NOTE: this table's sub-factor bars (below) are the CV1 pillar-engine
+        # breakdown (conviction_score_v1.py), so the frozen L/C/EQ totals MUST
+        # read the CV1_* columns to stay consistent with those bars — reading
+        # the bare "Leadership"/"Conviction"/"EntryQuality" columns instead
+        # pulls the Decision Engine's numbers (a different scoring system),
+        # which don't sum to the bars shown and silently disagree with the
+        # main results table (which displays CV1_Leadership under the
+        # "Leadership" header). See canonical_scores.py for the alias map.
+        ls    = int(row.get("CV1_Leadership",   row.get("Leadership",   0)))
+        cv    = int(row.get("CV1_Conviction",   row.get("Conviction",   0)))
+        eq    = int(row.get("CV1_EntryQuality", row.get("EntryQuality", 0)))
         sc_c, _ = _SC_STYLE.get(sc, ("#484f58", sc))
         row_bg = "#0d1117" if i % 2 == 0 else "#111820"
 
@@ -2034,9 +2042,15 @@ def _breakdown_row_html(label: str, pts: int, max_pts: int, color: str) -> str:
 
 def _detail_breakdown_panel(row: pd.Series) -> str:
     sc  = str(row.get("Recommendation", row.get("Signal Class", "Watch")))
-    ls  = int(row.get("Leadership",   0))
-    cv  = int(row.get("Conviction",   0))
-    eq  = int(row.get("EntryQuality", 0))
+    # Same fix as _perstock_breakdown_table: these headline totals must be the
+    # CV1 pillar totals since ls_factors/cv_factors/eq_factors below are CV1
+    # sub-factors — reading "Leadership"/"Conviction"/"EntryQuality" instead
+    # pulls the Decision Engine's numbers and won't sum to the rows shown.
+    # (The DE numbers are shown separately, correctly, in the divergence
+    # panel further below via DE_Leadership/DE_Conviction.)
+    ls  = int(row.get("CV1_Leadership",   row.get("Leadership",   0)))
+    cv  = int(row.get("CV1_Conviction",   row.get("Conviction",   0)))
+    eq  = int(row.get("CV1_EntryQuality", row.get("EntryQuality", 0)))
 
     ls_factors = [
         ("_cv1_ls_rs",    "RS Composite (multi-TF)",          30, "#a371f7"),
