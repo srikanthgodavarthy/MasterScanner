@@ -2154,6 +2154,162 @@ def _detail_breakdown_panel(row: pd.Series) -> str:
     return html
 
 
+def _de_is_num(v) -> bool:
+    try:
+        f = float(v)
+        return f == f and f not in (float("inf"), float("-inf"))
+    except (TypeError, ValueError):
+        return False
+
+
+def _de_breakdown_panel(row: pd.Series) -> str:
+    """
+    Decision Engine — individual stock breakdown, styled to match the
+    Five Pillars 'Pillar Breakdown' panel (pages/five_pillars.py):
+    header + price/level strip + four dimension tiles (Leadership /
+    Conviction / Entry Quality / Extension) with sub-factor checklists.
+
+    All sub-factor values are read from the DE_* / _ds_* / Extension
+    columns written by utils/scanner_engine.py's Decision Engine block —
+    no new computation happens here, this is a pure display layer.
+    """
+    from utils.decision_engine import CATEGORY_STYLE
+
+    sym      = str(row.get("Stock", "—"))
+    category = str(row.get("Recommendation", row.get("Category", "Avoid")))
+    style    = CATEGORY_STYLE.get(category, {})
+    cat_color= style.get("color", "#484f58")
+    cat_desc = style.get("description", "")
+
+    ls  = int(float(row.get("DE_Leadership",   0) or 0))
+    cv  = int(float(row.get("DE_Conviction",   0) or 0))
+    eq  = int(float(row.get("DE_EntryQuality", 0) or 0))
+    ext = int(float(row.get("Extension",       0) or 0))
+    composite = round((ls + cv + eq) / 3)
+    comp_color = _score_color(composite)
+
+    # ── Header ──────────────────────────────────────────────────
+    html = (
+        '<div style="background:#161b22;border:1px solid rgba(255,255,255,0.08);'
+        'border-radius:8px;padding:14px;">'
+        '<div style="margin-bottom:10px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;">'
+        f'<span style="font-size:14px;font-weight:700;color:#e6edf3">{sym}</span>'
+        f'{_cat_badge(category)}'
+        f'<span style="font-size:11px;color:#8b949e">{cat_desc}</span>'
+        f'<span style="margin-left:auto;font-size:20px;font-weight:700;color:{comp_color}">{composite}</span>'
+        '</div>'
+    )
+
+    # ── Price / level strip ─────────────────────────────────────
+    def _sh(label, val, fmt="{}"):
+        try:
+            v = fmt.format(val) if _de_is_num(val) else "—"
+        except (ValueError, TypeError):
+            v = "—"
+        return (
+            f'<span style="font-size:10px;color:#8b949e;margin-right:14px;white-space:nowrap">'
+            f'{label} <b style="color:#e6edf3">{v}</b></span>'
+        )
+
+    chg = row.get("%Chg")
+    chg_color = "#3fb950" if _de_is_num(chg) and float(chg) >= 0 else "#f85149"
+    chg_disp  = f"{float(chg):+.2f}%" if _de_is_num(chg) else "—"
+
+    html += (
+        '<div style="display:flex;flex-wrap:wrap;gap:4px 0;padding:8px 0;'
+        'border-top:1px solid rgba(255,255,255,0.06);border-bottom:1px solid rgba(255,255,255,0.06);margin-bottom:12px;">'
+        + _sh("LTP", row.get("LTP", row.get("Entry")), "₹{:.2f}")
+        + f'<span style="font-size:10px;color:#8b949e;margin-right:14px">Chg% '
+          f'<b style="color:{chg_color}">{chg_disp}</b></span>'
+        + _sh("RSI",        row.get("_rsi"), "{:.1f}")
+        + _sh("SL",         row.get("SL"),   "₹{:.2f}")
+        + _sh("T1",         row.get("T1"),   "₹{:.2f}")
+        + _sh("T2",         row.get("T2"),   "₹{:.2f}")
+        + _sh("EMA20 Dist", row.get("EMA20Dist"), "{:.1f}%")
+        + _sh("EMA50 Dist", row.get("EMA50Dist"), "{:.1f}%")
+        + _sh("Pivot Dist", row.get("PivotDist"), "{:.1f}%")
+        + _sh("R:R",        row.get("RR"),   "{:.2f}")
+        + _sh("Bars Since", row.get("BarsSince"), "{:.0f}")
+        + f'<span style="font-size:10px;color:#8b949e">({row.get("BarsBand","—")})</span>'
+        + '</div>'
+    )
+
+    # ── Dimension tiles ─────────────────────────────────────────
+    def _ck(flag) -> str:
+        return "✅" if bool(flag) else "❌"
+
+    def _tile(name, score, max_pts, color, lines) -> str:
+        lines_html = "".join(
+            f'<div style="font-size:10px;color:#8b949e;margin-top:4px;line-height:1.5">{l}</div>'
+            for l in lines
+        )
+        return (
+            '<div style="flex:1;min-width:190px;background:#0d1117;'
+            'border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:10px 12px;">'
+            '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px;">'
+            f'<span style="font-size:10px;font-weight:700;color:{color};letter-spacing:0.06em;'
+            f'text-transform:uppercase">{name}</span>'
+            f'<span style="font-size:18px;font-weight:700;color:{color}">{score}'
+            f'<span style="font-size:9px;color:#8b949e">/{max_pts}</span></span>'
+            f'</div>{lines_html}</div>'
+        )
+
+    ls_c, cv_c, eq_c = _score_color(ls), _score_color(cv), _score_color(eq)
+    ext_c = _score_color(ext, invert=True)
+
+    html += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">'
+    html += _tile("1 · Leadership", ls, 100, ls_c, [
+        f"Trend {_ck(row.get('_trend_up'))} · EMA align {_ck(row.get('_ema_alignment'))} · "
+        f"cloud {_ck(row.get('_above_cloud'))} — <b>{int(row.get('_ds_ls_trend', 0) or 0)}/35</b>",
+        f"RS Composite <b>{row.get('RScomp', '—')}%</b> — <b>{int(row.get('_ds_ls_rs', 0) or 0)}/30</b>",
+        f"Momentum (3M/6M) — <b>{int(row.get('_ds_ls_momentum', 0) or 0)}/15</b>",
+        f"Volume Sponsorship — <b>{int(row.get('_ds_ls_volume', 0) or 0)}/10</b>",
+        f"Trend Freshness — <b>{int(row.get('_ds_ls_freshness', 0) or 0)}/10</b>",
+    ])
+    html += _tile("2 · Conviction", cv, 100, cv_c, [
+        f"Pattern: base {_ck(row.get('FreshBase'))} · compression {_ck(row.get('_compression_break'))} · "
+        f"CCI recovery {_ck(row.get('_recent_cci_rec'))} — <b>{int(row.get('_ds_cv_pattern', 0) or 0)}/35</b>",
+        f"Fibonacci Quality (golden zone {_ck(row.get('_in_golden'))}) — "
+        f"<b>{int(row.get('_ds_cv_fib', 0) or 0)}/20</b>",
+        f"Compression (squeeze {_ck(row.get('_squeeze_on'))} / release {_ck(row.get('_squeeze_release'))}) — "
+        f"<b>{int(row.get('_ds_cv_compression', 0) or 0)}/25</b>",
+        f"RS Leadership (top decile {_ck(row.get('RS_Top10'))}) — "
+        f"<b>{int(row.get('_ds_cv_rs_lead', 0) or 0)}/20</b>",
+    ])
+    html += _tile("3 · Entry Quality", eq, 100, eq_c, [
+        f"EMA20 Distance <b>{row.get('EMA20Dist', '—')}%</b> — "
+        f"<b>{int(row.get('_ds_eq_ema20_dist', 0) or 0)}/40</b>",
+        f"EMA50 Distance <b>{row.get('EMA50Dist', '—')}%</b> — "
+        f"<b>{int(row.get('_ds_eq_ema50_dist', 0) or 0)}/25</b>",
+        f"Pivot Distance <b>{row.get('PivotDist', '—')}%</b> — "
+        f"<b>{int(row.get('_ds_eq_pivot_dist', 0) or 0)}/20</b>",
+        f"Bars Since Setup <b>{row.get('BarsSince', '—')}</b> ({row.get('BarsBand', '—')}) — "
+        f"<b>{int(row.get('_ds_eq_bars_since', 0) or 0)}/15</b>",
+    ])
+    html += _tile("4 · Extension (lower is better)", ext, 100, ext_c, [
+        f"EMA20 Distance — <b>{int(row.get('_ds_ex_ema20_dist', 0) or 0)}/32</b>",
+        f"EMA50 Distance — <b>{int(row.get('_ds_ex_ema50_dist', 0) or 0)}/15</b>",
+        f"Pivot Distance — <b>{int(row.get('_ds_ex_pivot_dist', 0) or 0)}/20</b>",
+        f"Price Move Since Setup <b>{row.get('MoveSince', '—')}%</b> — "
+        f"<b>{int(row.get('_ds_ex_move_since', 0) or 0)}/33</b>",
+    ])
+    html += '</div>'
+
+    # ── Verdict strip (Category action + one-line summary) ──────
+    action = style.get("icon", "") + " " + style.get("action", category)
+    html += (
+        f'<div style="background:#0d1117;border:1px solid rgba(255,255,255,0.08);border-radius:8px;'
+        f'padding:8px 12px;border-left:3px solid {cat_color};">'
+        f'<span style="font-size:11px;font-weight:700;color:{cat_color}">{action}</span>'
+        f'<span style="font-size:10px;color:#8b949e;margin-left:10px;">'
+        f'See the "Why this stock? — Explainability" panel below for the full gate breakdown.</span>'
+        f'</div>'
+    )
+
+    html += '</div>'
+    return html
+
+
 # ── VALIDATION ROW ────────────────────────────────────────────────
 
 def _validation_row_html(stock: str, sc: str, category: str) -> str:
@@ -3004,6 +3160,15 @@ def render(settings: dict | None = None):
                         )
                         st.markdown(_locked_plan_panel(_row), unsafe_allow_html=True)
                         st.markdown(_lifecycle_timeline_panel(plan_row=_row), unsafe_allow_html=True)
+
+            # Decision Engine breakdown (Pillar-style tile layout)
+            if _show_detail and "DE_Leadership" in df_subset.columns:
+                with st.expander("🏛️ Decision Engine Breakdown — individual stock"):
+                    _sel3 = df_subset["Stock"].tolist()[:10] if "Stock" in df_subset.columns else []
+                    _picked3 = st.selectbox("Select stock", _sel3, key=f"de_breakdown_sel_{sc_key}")
+                    if _picked3:
+                        _de_row = df_subset[df_subset["Stock"] == _picked3].iloc[0]
+                        st.markdown(_de_breakdown_panel(_de_row), unsafe_allow_html=True)
 
             # Explainability panel (Sprint 1)
             if _show_detail and "_explain_included" in df_subset.columns:
