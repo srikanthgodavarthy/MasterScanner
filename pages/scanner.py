@@ -1089,134 +1089,130 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
                       a narrow progress-bar filled to pts/max_pts %.
 
     Each column header shows the factor name + max weight; hovering reveals
-    the exact scoring bands drawn directly from conviction_score_v1.py.
+    the exact scoring bands drawn directly from decision_engine.py — the
+    engine that actually produces Leadership/Conviction/Entry Quality and
+    the Elite/Execute/Watch/Skip thresholds (Recommendation column).
     """
     if df.empty:
         return ""
 
     # ── Factor definitions ─────────────────────────────────────────
     # (df_col, short_label, max_pts, dim_color, tooltip_lines)
+    # Sourced from utils/decision_engine.py — _leadership(), _conviction(),
+    # _entry_quality(). These sub-scores are what the Recommendation column
+    # (Elite Opportunity / High Conviction / Actionable / Setup Building /
+    # Extended / Avoid) is actually gated on.
     FACTORS = [
         # ── LEADERSHIP (purple) ────────────────────────────────────
-        ("_cv1_ls_rs", "RS Composite", 30, "#a371f7",
-         "Multi-TF relative strength vs Nifty 50 (^NSEI)\n"
-         "RS > 0.15  →  +30 pts  (strong outperformance)\n"
-         "RS 0.10–0.15 →  +25 pts\n"
-         "RS 0.05–0.10 →  +20 pts\n"
-         "RS 0.03–0.05 →  +15 pts\n"
-         "RS 0.00–0.03 →  +10 pts\n"
-         "RS −0.03–0.00 → +4 pts\n"
-         "RS < −0.03   →   0 pts  (lagging the index)"),
+        ("_ds_ls_trend", "Trend Struct", 35, "#a371f7",
+         "EMA alignment + Ichimoku cloud + trend_structure flag\n"
+         "trend_up (price > EMA20 > EMA50)   → +15 pts\n"
+         "ema_alignment (EMA20 > EMA50)      → +10 pts\n"
+         "above_cloud                        →  +6 pts\n"
+         "inside_cloud (transitional)        →  +2 pts\n"
+         "trend_structure confirmed          →  +4 pts\n"
+         "Max: 35 pts"),
 
-        ("_cv1_ls_age", "Trend Age", 25, "#a371f7",
-         "Bars since trend started (EMA structure)\n"
-         "21–50 bars  →  +25 pts  ★ sweet-spot (PF 1.45, WR 51%)\n"
-         "6–20 bars   →  +8 pts   (young, acceptable)\n"
-         "51–100 bars →  +8 pts   (maturing, edge fades)\n"
-         "> 100 bars  →   0 pts   (extended, PF 0.72)\n"
-         "0–5 bars    →   0 pts   (too early)"),
+        ("_ds_ls_rs", "RS Composite", 30, "#a371f7",
+         "Multi-TF relative strength composite (weighted 1m/3m/6m/1w)\n"
+         "RS ≥ 0.12   →  +30 pts  (top-tier outperformance)\n"
+         "RS 0.08–0.12 → +26 pts\n"
+         "RS 0.05–0.08 → +22 pts\n"
+         "RS 0.03–0.05 → +18 pts\n"
+         "RS 0.01–0.03 → +13 pts\n"
+         "RS 0.00–0.01 →  +8 pts\n"
+         "RS −0.02–0.00 → +3 pts\n"
+         "RS < −0.02   →   0 pts\n"
+         "+4 pt bonus (capped 30) if rs_top_decile"),
 
-        ("_cv1_ls_adx", "ADX Strength", 20, "#a371f7",
-         "ADX(14) of the individual stock (directional strength proxy)\n"
-         "ADX ≥ 40    →  +20 pts  (strong trend, PF 1.41)\n"
-         "ADX 30–40   →  +12 pts\n"
-         "ADX 25–30   →   +5 pts  (dead zone)\n"
-         "ADX < 25    →    0 pts  (no trend)"),
+        ("_ds_ls_momentum", "Momentum", 15, "#a371f7",
+         "3-month / 6-month % price momentum (mom3 / mom6)\n"
+         "mom3 > 20% AND mom6 > 20%  →  +15 pts\n"
+         "mom3 > 12% AND mom6 > 15%  →  +12 pts\n"
+         "mom3 >  8% AND mom6 > 12%  →   +9 pts\n"
+         "mom3 >  5% AND mom6 >  5%  →   +6 pts\n"
+         "mom3 >  0% AND mom6 >  0%  →   +3 pts\n"
+         "persistent_strength floor  →   +8 pts (if higher)\n"
+         "Otherwise                  →    0 pts"),
 
-        ("_cv1_ls_ps", "Pers. Strength", 15, "#a371f7",
-         "Persistent momentum: stock must outperform on both lookbacks\n"
-         "mom3 > 8% AND mom6 > 12%  →  +15 pts\n"
-         "Either condition fails     →   0 pts\n"
-         "(3-bar and 6-bar price momentum vs own prior close)"),
+        ("_ds_ls_volume", "Vol Sponsor", 10, "#a371f7",
+         "Today's volume vs 20-bar average (vol_ratio)\n"
+         "Vol ≥ 2.5×  →  +10 pts\n"
+         "Vol 2.0–2.5× → +8 pts\n"
+         "Vol 1.5–2.0× → +6 pts\n"
+         "Vol 1.2–1.5× → +4 pts\n"
+         "Vol < 1.2×   →  0 pts\n"
+         "+2 pt bonus (capped 10) on squeeze_release"),
 
-        ("_cv1_ls_slope", "EMA20 Slope", 10, "#a371f7",
-         "5-bar velocity of EMA20 (trend acceleration)\n"
-         "Slope > 0.3  →  +10 pts  (strong upward angle)\n"
-         "Slope 0–0.3  →   +5 pts  (positive but shallow)\n"
-         "Slope ≤ 0    →    0 pts  (flat or falling)"),
+        ("_ds_ls_freshness", "Trend Freshness", 10, "#a371f7",
+         "trend_freshness (0-100 decay curve) scaled ÷10\n"
+         "Rewards newer trends over stale/extended ones\n"
+         "Fresher trend → higher score, ~1:10 of trend_freshness"),
 
         # ── CONVICTION (green) ─────────────────────────────────────
-        ("_cv1_cv_structure", "Trend Struct", 30, "#3fb950",
-         "EMA alignment + Ichimoku cloud position\n"
-         "trend_up (price > EMA20 > EMA50)  → +10 pts\n"
-         "ema_alignment (EMA20 > EMA50)     → +10 pts\n"
-         "above_cloud                       →  +7 pts\n"
-         "inside_cloud (transitional)       →  +3 pts\n"
-         "all four confirmed (full pillar)  →  +3 pts bonus\n"
-         "Max: 30 pts"),
+        ("_ds_cv_pattern", "Pattern", 35, "#3fb950",
+         "Setup shape — highest-priority slot wins (not additive)\n"
+         "fresh_base_breakout       → +20 pts  (Stage-2 / long base)\n"
+         "compression_break         → +18 pts\n"
+         "continuation_signal       → +15 pts  (trend_up, above pivot ≤5%, vol≥1.3×)\n"
+         "golden pullback (flagged) → +14 pts\n"
+         "recent_cci_recovery       →  +8 pts\n"
+         "cci_rising                →  +4 pts\n"
+         "+5 harm_bull / +4 abcd_bull bonuses (additive, capped 35)"),
 
-        ("_cv1_cv_fib", "Fib Pullback", 25, "#3fb950",
-         "Price retracement depth into Fibonacci zone\n"
-         "in_golden (50–61.8% retrace)       → +25 pts  ★ ideal\n"
-         "in_golden_relaxed (38.2–61.8%)     → +18 pts\n"
-         "near_golden (approaching zone)     →  +8 pts\n"
-         "+5 bonus if CCI also oversold in zone (confluence)\n"
-         "+3 bonus if volume < 0.8× avg during pullback\n"
-         "(controlled retracement = quality entry)"),
+        ("_ds_cv_fib", "Fib Quality", 20, "#3fb950",
+         "Fibonacci pullback depth OR continuation credit above 61.8%\n"
+         "in_golden (50–61.8% retrace)   → +20 pts  ★ ideal\n"
+         "in_golden_relaxed (38.2–61.8%) → +14 pts\n"
+         "t3_near_golden (approaching)   →  +8 pts\n"
+         "Continuation path (above pivot): +13/+10/+7/+4 by distance\n"
+         "+5 bonus if CCI oversold in golden zone (capped 20)"),
 
-        ("_cv1_cv_cci", "CCI Recovery", 25, "#3fb950",
-         "CCI(20) crossing back above oversold level (−100)\n"
-         "recent_cci_recovery (cross above OS within window) → +25 pts\n"
-         "cci_rising (building before cross, early signal)   → +12 pts\n"
-         "t3_cci_rec (CCI recovering but still < 0)          →  +6 pts\n"
-         "No recovery signal                                 →   0 pts"),
+        ("_ds_cv_compression", "Compression", 25, "#3fb950",
+         "ATR-based energy-state scale (squeeze/compression tiers)\n"
+         "squeeze_on         → 20 pts  (peak energy loading)\n"
+         "squeeze_release    → 17 pts\n"
+         "compression_break  → 15 pts\n"
+         "vol-dry golden/trend → 12–13 pts\n"
+         "trend_up floor     → 10 pts\n"
+         "+5 fresh_base / +3 vol-dry golden / +2 vol-surge bonuses (capped 25)"),
 
-        ("_cv1_cv_volume", "Vol Sponsor", 15, "#3fb950",
-         "Today's volume vs 20-bar average (institutional sponsorship)\n"
-         "Vol ≥ 2.5×  →  +15 pts  (strong sponsorship)\n"
-         "Vol 2.0–2.5× → +12 pts\n"
-         "Vol 1.5–2.0× →  +8 pts\n"
-         "Vol 1.2–1.5× →  +5 pts\n"
-         "Vol 1.0–1.2× →  +2 pts\n"
-         "Vol < 1.0×   →   0 pts  (below-avg volume, no sponsorship)"),
-
-        ("_cv1_cv_squeeze", "Squeeze", 5, "#3fb950",
-         "Bollinger Band / Keltner Channel compression release\n"
-         "squeeze_release (BB just broke outside KC) → +5 pts\n"
-         "squeeze_on (BB still inside KC)            → +3 pts\n"
-         "No squeeze                                 →  0 pts\n"
-         "Note: PF 0.69 in backtest — minimal weight (v8.1)"),
+        ("_ds_cv_rs_lead", "RS Leadership", 20, "#3fb950",
+         "RS improving ahead of price — early institutional accumulation\n"
+         "rs_top_decile   →  +20 pts\n"
+         "rs3 > 0.06      →  +16 pts\n"
+         "rs3 > 0.03      →  +11 pts\n"
+         "rs_composite > 0.02 → +7 pts\n"
+         "rs_positive     →   +3 pts\n"
+         "Otherwise       →    0 pts"),
 
         # ── ENTRY QUALITY (amber) ──────────────────────────────────
-        ("_cv1_eq_ema20", "EMA20 Dist", 30, "#d29922",
-         "% distance of price above EMA20 (entry tightness)\n"
-         "≤ 2%   →  +30 pts  ★ excellent (near EMA20 support)\n"
-         "2–4%   →  +22 pts\n"
-         "4–6%   →  +14 pts\n"
-         "6–10%  →   +6 pts  (stretched)\n"
-         "> 10%  →    0 pts  (too extended from EMA20)\n"
-         "Below EMA20 (pullback in progress) → +10 pts"),
+        ("_ds_eq_ema20_dist", "EMA20 Dist", 40, "#d29922",
+         "% distance above EMA20 — tiers differ for breakout vs pullback entries\n"
+         "Breakout entry:  0–5% → +40 · 5–8% → +29 · 8–12% → +18 · 12–18% → +8 · >18% → 0\n"
+         "Pullback entry:  0–2% → +40 · 2–4% → +29 · 4–6% → +18 · 6–10% → +8 · >10% → 0\n"
+         "Below EMA20 (either type) → +10 pts"),
 
-        ("_cv1_eq_pivot", "Pivot Dist", 20, "#d29922",
-         "% distance from last 20-bar pivot high\n"
-         "≤ −2%  (below pivot)  →  +20 pts  ★ ideal — still building\n"
-         "−2 to +0.5% (at pivot) → +16 pts  — breaking out\n"
-         "0.5–2% (just past)     → +10 pts  — acceptable\n"
-         "2–4%   (running)       →  +4 pts\n"
-         "> 4%   (chasing)       →   0 pts"),
-
-        ("_cv1_eq_move", "Price Move", 20, "#d29922",
-         "% price move since the setup trigger bar fired\n"
-         "≤ 0.5% →  +20 pts  ★ barely moved — full opportunity ahead\n"
-         "0.5–1.5% → +16 pts\n"
-         "1.5–3.0% → +10 pts  (meaningful portion consumed)\n"
-         "3.0–5.0% →  +3 pts  (at or near T1 target)\n"
-         "> 5.0%  →   0 pts  (opportunity may have passed)"),
-
-        ("_cv1_eq_ema50", "EMA50 Dist", 15, "#d29922",
-         "% distance of price above EMA50 (structural support depth)\n"
-         "≤ 5%   →  +15 pts  ★ strong support nearby\n"
-         "5–10%  →  +10 pts\n"
-         "10–15% →   +5 pts\n"
-         "15–20% →   +2 pts\n"
+        ("_ds_eq_ema50_dist", "EMA50 Dist", 25, "#d29922",
+         "% distance above EMA50 (structural support depth)\n"
+         "≤ 5%   →  +25 pts  ★ strong support nearby\n"
+         "5–10%  →  +16 pts\n"
+         "10–15% →   +8 pts\n"
+         "15–20% →   +3 pts\n"
          "> 20%  →    0 pts  (structurally extended)"),
 
-        ("_cv1_eq_bars", "Bars Setup", 15, "#d29922",
-         "Signal freshness — bars elapsed since setup trigger\n"
-         "ATR band 'Actionable' (0–3 bars)  →  +15 pts\n"
-         "ATR band 'Late'       (4–7 bars)  →   +6 pts\n"
-         "ATR band 'Extended'   (8+ bars)   →    0 pts\n"
-         "(ATR-normalised band is v9 primary metric)"),
+        ("_ds_eq_pivot_dist", "Pivot Dist", 20, "#d29922",
+         "% distance from last pivot high — tiers differ by entry type\n"
+         "Breakout entry:  ≤2% → +20 · 2–5% → +14 · 5–8% → +7 · >8% → 0\n"
+         "Pullback entry:  ≤−2% → +20 · −2–0.5% → +16 · 0.5–2% → +10 · 2–4% → +4 · >4% → 0"),
+
+        ("_ds_eq_bars_since", "Bars Setup", 15, "#d29922",
+         "Bars elapsed since the setup trigger fired\n"
+         "0–3 bars  →  +15 pts  (Actionable)\n"
+         "4–7 bars  →   +7 pts  (Late)\n"
+         "8+ bars   →    0 pts  (Extended)\n"
+         "Note: Entry Quality is also hard-capped at 35 if trend_phase=EXTENDED,\n"
+         "and total −20 if R:R < 1.5 (not shown as a column — applied after sum)"),
     ]
 
     # Filter to columns that actually exist in this df
@@ -1297,17 +1293,13 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     for i, (_, row) in enumerate(df.iterrows()):
         stock = str(row.get("Stock", row.get("Symbol", "?")))
         sc    = str(row.get("Recommendation", row.get("CV1_SignalClass", "WATCH")))
-        # NOTE: this table's sub-factor bars (below) are the CV1 pillar-engine
-        # breakdown (conviction_score_v1.py), so the frozen L/C/EQ totals MUST
-        # read the CV1_* columns to stay consistent with those bars — reading
-        # the bare "Leadership"/"Conviction"/"EntryQuality" columns instead
-        # pulls the Decision Engine's numbers (a different scoring system),
-        # which don't sum to the bars shown and silently disagree with the
-        # main results table (which displays CV1_Leadership under the
-        # "Leadership" header). See canonical_scores.py for the alias map.
-        ls    = int(row.get("CV1_Leadership",   row.get("Leadership",   0)))
-        cv    = int(row.get("CV1_Conviction",   row.get("Conviction",   0)))
-        eq    = int(row.get("CV1_EntryQuality", row.get("EntryQuality", 0)))
+        # These totals must match the DE sub-factor bars below (both sourced
+        # from decision_engine.py) since Leadership/Conviction/EntryQuality
+        # here ARE the numbers that drive the Recommendation thresholds
+        # (Elite/Execute/Watch/Skip). Do not swap to CV1_* here.
+        ls    = int(row.get("Leadership",   0))
+        cv    = int(row.get("Conviction",   0))
+        eq    = int(row.get("EntryQuality", 0))
         sc_c, _ = _SC_STYLE.get(sc, ("#484f58", sc))
         row_bg = "#0d1117" if i % 2 == 0 else "#111820"
 
@@ -2048,30 +2040,31 @@ def _detail_breakdown_panel(row: pd.Series) -> str:
     # pulls the Decision Engine's numbers and won't sum to the rows shown.
     # (The DE numbers are shown separately, correctly, in the divergence
     # panel further below via DE_Leadership/DE_Conviction.)
-    ls  = int(row.get("CV1_Leadership",   row.get("Leadership",   0)))
-    cv  = int(row.get("CV1_Conviction",   row.get("Conviction",   0)))
-    eq  = int(row.get("CV1_EntryQuality", row.get("EntryQuality", 0)))
+    # These are the Decision Engine numbers — the ones that actually drive
+    # the Recommendation thresholds (Elite/Execute/Watch/Skip). The sub-
+    # factor rows below must be sourced from decision_engine.py to match.
+    ls  = int(row.get("Leadership",   0))
+    cv  = int(row.get("Conviction",   0))
+    eq  = int(row.get("EntryQuality", 0))
 
     ls_factors = [
-        ("_cv1_ls_rs",    "RS Composite (multi-TF)",          30, "#a371f7"),
-        ("_cv1_ls_age",   "Trend Age (21–50 bar sweet-spot)",  25, "#a371f7"),
-        ("_cv1_ls_adx",   "ADX Strength (≥40 tier)",           20, "#a371f7"),
-        ("_cv1_ls_ps",    "Persistent Strength",               15, "#a371f7"),
-        ("_cv1_ls_slope", "EMA20 Slope (5-bar velocity)",      10, "#a371f7"),
+        ("_ds_ls_trend",     "Trend Structure (EMA + Cloud)",     35, "#a371f7"),
+        ("_ds_ls_rs",        "RS Composite (multi-TF)",           30, "#a371f7"),
+        ("_ds_ls_momentum",  "Momentum (mom3 / mom6)",            15, "#a371f7"),
+        ("_ds_ls_volume",    "Volume Sponsorship (vol_ratio)",    10, "#a371f7"),
+        ("_ds_ls_freshness", "Trend Freshness (decay curve)",     10, "#a371f7"),
     ]
     cv_factors = [
-        ("_cv1_cv_structure", "Trend Structure (EMA + Cloud)", 30, "#3fb950"),
-        ("_cv1_cv_fib",       "Fibonacci Pullback Zone",        25, "#3fb950"),
-        ("_cv1_cv_cci",       "CCI Recovery / OS Cross",        25, "#3fb950"),
-        ("_cv1_cv_volume",    "Volume Sponsorship",             15, "#3fb950"),
-        ("_cv1_cv_squeeze",   "Squeeze Release",                 5, "#3fb950"),
+        ("_ds_cv_pattern",     "Pattern (VCP/base/continuation)", 35, "#3fb950"),
+        ("_ds_cv_fib",         "Fibonacci Quality",                20, "#3fb950"),
+        ("_ds_cv_compression", "Compression (energy state)",       25, "#3fb950"),
+        ("_ds_cv_rs_lead",     "RS Leadership (pre-price)",        20, "#3fb950"),
     ]
     eq_factors = [
-        ("_cv1_eq_ema20", "EMA20 Distance (% above)",    30, "#d29922"),
-        ("_cv1_eq_pivot", "Pivot High Distance",          20, "#d29922"),
-        ("_cv1_eq_move",  "Price Move Since Setup",       20, "#d29922"),
-        ("_cv1_eq_ema50", "EMA50 Distance (structural)", 15, "#d29922"),
-        ("_cv1_eq_bars",  "Bars Since Setup (ATR-band)", 15, "#d29922"),
+        ("_ds_eq_ema20_dist", "EMA20 Distance (% above)",    40, "#d29922"),
+        ("_ds_eq_ema50_dist", "EMA50 Distance (structural)", 25, "#d29922"),
+        ("_ds_eq_pivot_dist", "Pivot High Distance",         20, "#d29922"),
+        ("_ds_eq_bars_since", "Bars Since Setup",            15, "#d29922"),
     ]
 
     def _section(title, score, factors, sec_color):
@@ -2094,38 +2087,42 @@ def _detail_breakdown_panel(row: pd.Series) -> str:
         f'border-radius:8px;padding:14px;">'
         f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">'
         f'{_sc_badge(sc)}'
-        f'<span style="font-size:10px;color:#8b949e">Conviction Score v1 — sub-score breakdown</span>'
+        f'<span style="font-size:10px;color:#8b949e">Decision Engine — sub-score breakdown (drives Recommendation)</span>'
         f'</div>'
     )
     html += _section("Leadership",    ls, ls_factors, "#a371f7")
     html += _section("Conviction",    cv, cv_factors, "#3fb950")
     html += _section("Entry Quality", eq, eq_factors, "#d29922")
 
-    # ── Decision Engine divergence panel ─────────────────────────
-    # Shows when CV1_SignalClass=EXECUTE but Category=Avoid.
-    # DE uses different factor weights vs CV1 — this panel exposes the gap.
-    de_ls   = int(row.get("DE_Leadership", -1))
-    de_cv   = int(row.get("DE_Conviction", -1))
-    de_stage= str(row.get("DE_Stage", ""))
-    category= str(row.get("Category", ""))
-    if de_ls >= 0:
-        # Highlight divergence: CV1 says EXECUTE/ELITE but DE says Avoid
-        cv1_sc = str(row.get("CV1_SignalClass", ""))
+    # ── CV1 divergence panel ──────────────────────────────────────
+    # Shows when CV1_SignalClass=EXECUTE but Category (DE) says Avoid/Leader.
+    # NOTE: previously this compared against "DE_Leadership"/"DE_Conviction"/
+    # "DE_Stage" columns that are never actually written anywhere in the
+    # pipeline (only "Leadership"/"Conviction"/"Lifecycle" are) — so de_ls
+    # was always -1 and this panel silently never rendered. Now that the
+    # headline Leadership/Conviction/EntryQuality above ARE the DE numbers,
+    # CV1 is the "other" system worth surfacing here instead.
+    cv1_ls  = int(row.get("CV1_Leadership", -1))
+    cv1_cv  = int(row.get("CV1_Conviction", -1))
+    cv1_sc  = str(row.get("CV1_SignalClass", ""))
+    category= str(row.get("Category", row.get("Recommendation", "")))
+    if cv1_ls >= 0:
+        # Highlight divergence: CV1 says EXECUTE/ELITE but DE Category says Avoid/Leader
         divergent = cv1_sc in ("ELITE", "EXECUTE") and category in ("Avoid", "Leader")
         div_color = "#f85149" if divergent else "#8b949e"
-        div_label = "⚠ DIVERGENCE DETECTED" if divergent else "Decision Engine"
-        # Sub-score breakdown for DE Leadership
-        de_ls_factors = [
-            ("_de_ls_trend",    "Trend Structure (trend_up + EMA align + cloud)", 35, "#58a6ff"),
-            ("_de_ls_rs",       "RS Composite (multi-TF)",                         30, "#58a6ff"),
-            ("_de_ls_momentum", "Momentum (mom3/mom6 % returns)",                  15, "#58a6ff"),
-            ("_de_ls_volume",   "Volume Sponsorship (vol_ratio)",                  10, "#58a6ff"),
-            ("_de_ls_freshness","Trend Freshness (decay curve)",                   10, "#58a6ff"),
+        div_label = "⚠ DIVERGENCE DETECTED" if divergent else "CV1 (alternate system)"
+        # Sub-score breakdown for CV1 Leadership
+        cv1_ls_factors = [
+            ("_cv1_ls_rs",    "RS Composite (multi-TF)",          30, "#58a6ff"),
+            ("_cv1_ls_age",   "Trend Age (21–50 bar sweet-spot)", 25, "#58a6ff"),
+            ("_cv1_ls_adx",   "ADX Strength (≥40 tier)",          20, "#58a6ff"),
+            ("_cv1_ls_ps",    "Persistent Strength",              15, "#58a6ff"),
+            ("_cv1_ls_slope", "EMA20 Slope (5-bar velocity)",     10, "#58a6ff"),
         ]
-        de_rows_html = ""
-        for col, lbl, max_pts, clr in de_ls_factors:
+        cv1_rows_html = ""
+        for col, lbl, max_pts, clr in cv1_ls_factors:
             pts = int(row.get(col, 0))
-            de_rows_html += _breakdown_row_html(lbl, pts, max_pts, clr)
+            cv1_rows_html += _breakdown_row_html(lbl, pts, max_pts, clr)
 
         html += (
             f'<div style="margin:10px 0;border-top:1px solid rgba(255,255,255,0.08);padding-top:10px;">'
@@ -2134,20 +2131,19 @@ def _detail_breakdown_panel(row: pd.Series) -> str:
             f'text-transform:uppercase">{div_label}</span>'
             f'</div>'
             f'<div style="display:flex;gap:16px;margin-bottom:8px;flex-wrap:wrap;">'
-            f'<span style="font-size:10px;color:#8b949e">DE Leadership: '
-            f'<b style="color:{"#f85149" if de_ls < 50 else "#58a6ff"}">{de_ls}</b>'
-            f'{"  ← below 50 → Stage=AVOID" if de_ls < 50 else ""}</span>'
-            f'<span style="font-size:10px;color:#8b949e">DE Conviction: '
-            f'<b style="color:#58a6ff">{de_cv}</b></span>'
-            f'<span style="font-size:10px;color:#8b949e">DE Stage: '
-            f'<b style="color:{"#f85149" if de_stage == "AVOID" else "#3fb950"}">{de_stage}</b></span>'
-            f'<span style="font-size:10px;color:#8b949e">Category: '
+            f'<span style="font-size:10px;color:#8b949e">CV1 Leadership: '
+            f'<b style="color:#58a6ff">{cv1_ls}</b></span>'
+            f'<span style="font-size:10px;color:#8b949e">CV1 Conviction: '
+            f'<b style="color:#58a6ff">{cv1_cv}</b></span>'
+            f'<span style="font-size:10px;color:#8b949e">CV1 Signal Class: '
+            f'<b style="color:{"#3fb950" if cv1_sc in ("ELITE","EXECUTE") else "#8b949e"}">{cv1_sc}</b></span>'
+            f'<span style="font-size:10px;color:#8b949e">DE Category: '
             f'<b style="color:{"#f85149" if category == "Avoid" else "#a78bfa" if category == "Leader" else "#3fb950"}">{category}</b></span>'
             f'</div>'
             f'<div style="font-size:9px;color:#8b949e;margin-bottom:6px;">'
-            f'DE Leadership factors (different from CV1 — explains Category vs SignalClass gap):'
+            f'CV1 Leadership factors (different weighting from DE above — explains the gap):'
             f'</div>'
-            f'{de_rows_html}'
+            f'{cv1_rows_html}'
             f'</div>'
         )
 
