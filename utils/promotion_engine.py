@@ -40,8 +40,10 @@ zero new indicators):
      and did so recently enough that it's still today's story.
 
   4. Institutional Confirmation — volume/OBV evidence of real
-     participation behind the move (r.vol_ratio, and OBV trend/leadership
-     when the raw indicator arrays are available).
+     participation RIGHT NOW: an elevated-volume bar (today) coinciding
+     with OBV making its own high on this same bar — not "volume was high
+     at some point" or "OBV has been rising for 10 bars." Both legs
+     (volume AND OBV) are required together, not either alone.
 
 Each signal contributes up to 25 points to a 0-100 Promo Score. Reward:Risk
 is tracked alongside the score (not folded into it) as a sanity gate — a
@@ -163,25 +165,31 @@ def _risk_reward(r: "BarResult") -> float:
 
 def _institutional_confirmation(r: "BarResult", ia=None) -> bool:
     """
-    True when there's real participation behind the move: strong relative
-    volume, and — when the raw price/volume arrays are available — OBV
-    that is rising and at least keeping pace with price. OBV is never
-    used as a trigger, only as supporting evidence.
+    True when there's real participation behind the move RIGHT NOW: an
+    elevated-volume bar (today, not any bar in the last N) coinciding with
+    OBV making its own high on this same bar (not "higher than 10 bars
+    ago" — that stays true long after the actual accumulation happened).
+    Both legs are required — a volume spike alone, or an old OBV trend
+    alone, isn't "institutional confirmation of the current setup."
+    OBV is never used as a trigger, only as supporting evidence.
     """
     vol_ratio = float(getattr(r, "vol_ratio", 1.0) or 1.0)
-    vol_ok = vol_ratio >= 1.5
+    vol_ok = vol_ratio >= 1.5   # today's bar vs its own average — already fresh, single-bar
 
     if ia is None:
         return vol_ok
 
     try:
-        from utils.obv_analyzer import compute_obv, obv_trend_rising, obv_leads_price
+        from utils.obv_analyzer import compute_obv, obv_new_high
         obv = compute_obv(ia.c, ia.v)
-        obv_ok = obv_trend_rising(obv, 10) and obv_leads_price(obv, ia.c, 20)
+        # obv_new_high == today's OBV IS the 10-bar high — anchored to the
+        # current bar by construction, unlike obv_trend_rising (10 bars ago
+        # baseline) which stays True long after the move is old news.
+        obv_ok = obv_new_high(obv, 10)
     except Exception:
         obv_ok = False
 
-    return vol_ok or obv_ok
+    return vol_ok and obv_ok
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -259,7 +267,7 @@ def evaluate_promotion(
     elif bool(getattr(r, "stoch_vwap_touch", False)) and bool(getattr(r, "stoch_vwap_reclaim", False)) and not _vwap_fresh:
         res.blocked.append(f"VWAP touch/reclaim found but {_vwap_bars} bars ago (>{VWAP_MAX_BARS_SINCE_TOUCH}) — too stale to count as timing")
     if res.institutional:
-        res.reasons.append("Institutional confirmation — volume/OBV support the move")
+        res.reasons.append("Institutional confirmation — elevated volume + OBV at a fresh high, today")
 
     # ── Decision ─────────────────────────────────────────────────
     if res.promo_score >= ELITE_SCORE_MIN and res.rr_ok_elite:
