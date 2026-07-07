@@ -744,6 +744,7 @@ def score_stock(
     # things they don't cover: Extension, the objective Lifecycle stage
     # (classified from CV1's scores when available), Trend Quality, R:R,
     # and the explainability panel. See utils/decision_engine.py docstring.
+    ds = None   # ensure defined even if compute_decision() below raises
     try:
         from utils.decision_engine import compute_decision
         ds = compute_decision(
@@ -830,8 +831,41 @@ def score_stock(
         from utils.promotion_engine import evaluate_promotion
 
         base_tier = classify_tier(cv1.leadership, cv1.conviction, cv1.entry_quality)
+
+        # ── STRUCTURAL GATE (opt-in — default False for A/B backtesting) ──
+        # Decision Engine computes hard structural failure conditions and
+        # an independent Lifecycle read (which factors in its own fuller
+        # Extension model — volume-climax discount, breakout-elite path —
+        # not just CV1's blunter EQ-embedded extension penalty). When
+        # enabled, honor those before Promotion Engine evaluates timing:
+        #   - hard_stop / t4_hard_stop  → structural failure, force Skip
+        #   - Lifecycle == EXTENDED     → chase risk Decision Engine caught
+        #                                 that CV1's EQ cap didn't fully
+        #                                 capture → downgrade, don't promote
+        #   - Lifecycle == AVOID        → Decision Engine's own composite
+        #                                 disagrees this is viable at all
+        # This only ever downgrades base_tier; it can never upgrade one.
+        # Flag: settings["ENABLE_STRUCTURAL_GATE"] (default False). Run the
+        # backtest with it on vs off before flipping the default — this
+        # changes which setups reach Execute/Elite, so it needs its own
+        # pass through the existing 1,732-trade validation set first.
+        _gate_reason = ""
+        _structural_gate_on = bool((settings or {}).get("ENABLE_STRUCTURAL_GATE", False))
+        if _structural_gate_on and base_tier == "Actionable":
+            if getattr(r, "t4_hard_stop", False) or getattr(r, "hard_stop", False):
+                base_tier = "Skip"
+                _gate_reason = "hard_stop"
+            elif ds is not None and ds.lifecycle == "AVOID":
+                base_tier = "Watch"
+                _gate_reason = "lifecycle=AVOID"
+            elif ds is not None and ds.lifecycle == "EXTENDED":
+                base_tier = "Watch"
+                _gate_reason = "lifecycle=EXTENDED"
+
         promo = evaluate_promotion(r, base_tier, ia=ia, settings=settings or {})
         final_tier = promo.tier if (promo.applicable and promo.promoted) else base_tier
+        result["_structural_gate_blocked"] = _gate_reason
+        result["_structural_gate_on"] = _structural_gate_on
 
         result["CV1_SignalClass"]    = cv1.signal_class   # legacy CV1-only label, kept for reference
         result["Tier"]               = base_tier           # pre-promotion CV1 tier
