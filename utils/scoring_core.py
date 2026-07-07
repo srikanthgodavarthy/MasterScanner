@@ -341,6 +341,8 @@ class BarResult:
     stoch_d:             float = 0.0
     stoch_reignition:      bool  = False   # fresh %K/%D cross-up or cross out of oversold
     stoch_confluence:        bool  = False   # stoch cross lines up with a VWAP touch/reclaim
+    stoch_vwap_touch:          bool  = False   # price touched VWAP intraday (pre-reversal)
+    stoch_vwap_reclaim:          bool  = False   # price closed back above VWAP after the touch
     stoch_bonus_pts:           int   = 0       # 0..params.stoch_bonus_max
     opportunity_bonus_pts:       int   = 0       # ll_bonus_pts + stoch_bonus_pts, already applied to norm_score
 
@@ -1303,6 +1305,7 @@ def compute_bar(
     ll_bonus = 0
     stoch_k_v = stoch_d_v = 0.0
     stoch_reignition = stoch_confluence = False
+    stoch_vwap_touch = stoch_vwap_reclaim = False
     stoch_bonus = 0
 
     _ll_min_bars    = 2 * params.pvt_lb + 1   # first bar a pivot can structurally exist
@@ -1341,6 +1344,8 @@ def compute_bar(
                 stoch_d_v        = _stoch_sig.stoch_d
                 stoch_reignition = _stoch_sig.reignition
                 stoch_confluence = _stoch_sig.confluence
+                stoch_vwap_touch    = _stoch_sig.vwap_touch_found
+                stoch_vwap_reclaim  = _stoch_sig.returned_above_vwap
                 stoch_bonus      = _stoch_sig.bonus_pts
             except Exception:
                 pass
@@ -1736,6 +1741,8 @@ def compute_bar(
         stoch_d                    = stoch_d_v,
         stoch_reignition             = stoch_reignition,
         stoch_confluence               = stoch_confluence,
+        stoch_vwap_touch                = stoch_vwap_touch,
+        stoch_vwap_reclaim                = stoch_vwap_reclaim,
         stoch_bonus_pts                  = stoch_bonus,
         opportunity_bonus_pts              = opportunity_bonus,
         cur_cci    = cur_cci,
