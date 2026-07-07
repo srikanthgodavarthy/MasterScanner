@@ -1587,10 +1587,17 @@ def _summary_cards(df: pd.DataFrame) -> str:
             return int(round(vals.mean())) if len(vals) else 0
         return 0
 
+    # [Scanner Refactor] CV1 is the single source of truth for setup quality —
+    # these headline cards used to average the legacy Decision Engine scores
+    # (DE_Leadership/DE_Conviction/DE_EntryQuality), which could paint a
+    # different quality picture than the CV1 + Promotion Engine numbers
+    # actually driving the Recommendation column below. Extension still
+    # comes from the Decision Engine since that's a distinct concern (has
+    # the move already run too far?) that CV1/Promotion don't measure.
     cards = [
-        ("Leadership",    _avg("DE_Leadership"),   False, "Market relative strength",   "Leadership"),
-        ("Conviction",    _avg("DE_Conviction"),   False, "Likelihood to hit target",   "Conviction"),
-        ("Entry Quality", _avg("DE_EntryQuality"), False, "Good entry right now?",      "Entry Quality"),
+        ("Leadership",    _avg("CV1_Leadership"),   False, "Market relative strength",   "Leadership"),
+        ("Conviction",    _avg("CV1_Conviction"),   False, "Likelihood to hit target",   "Conviction"),
+        ("Entry Quality", _avg("CV1_EntryQuality"), False, "Good entry right now?",      "Entry Quality"),
         ("Extension",     _avg("Extension"),        True,  "Move already missed",        None),
     ]
     html = '<div class="card-grid">'
@@ -2481,10 +2488,17 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
             return '<td class="col-num">—</td>'
 
     def _pb_tier(v):
-        color = {"ELITE":"#f5c542","EXECUTE":"#3fb950","WATCH":"#d29922","SKIP":"#8b949e"}.get(str(v), "#8b949e")
+        # [Scanner Refactor] Use the same TIER_STYLE lookup as the main
+        # scanner table so this tab's Recommendation badge always matches
+        # the colors/labels shown everywhere else — one Recommendation,
+        # one visual language, no competing tier scheme.
+        from utils.conviction_score_v1 import TIER_STYLE
+        style = TIER_STYLE.get(str(v), {"color": "#8b949e", "label": str(v) if v else "—"})
+        color = style["color"]
+        label = style.get("label", str(v) or "—")
         return (
             f'<td><span style="background:{color}22;border:1px solid {color}55;color:{color};'
-            f'font-size:0.68rem;padding:1px 7px;border-radius:4px;font-weight:700;">{v or "—"}</span></td>'
+            f'font-size:0.68rem;padding:1px 7px;border-radius:4px;font-weight:700;">{label}</span></td>'
         )
 
     def _pb_boosts(boosts):
@@ -2527,11 +2541,14 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
         ("LEADERSHIP", ""),          ("CONVICTION",  ""),  ("EQ",        ""),
         ("BOOSTS",     ""),          ("TIER",        ""),
     ]
-    # Gate threshold tooltips on headers
+    # Gate threshold tooltips on headers — mirror CV1's actual classify_tier()
+    # gate (utils/conviction_score_v1.py): Leadership >= 55 AND the average of
+    # all three >= 65 to reach Actionable. These are shown as reference bands
+    # tied to the real (composite) gate, same one used everywhere else.
     _HEADER_TIPS = {
-        "LEADERSHIP": 'title="Leadership ≥ 65 required (RS, Trend Age, ADX, Persistence, EMA Slope)"',
-        "CONVICTION": 'title="Conviction ≥ 20 required (Trend Structure, Fib Zone, CCI Recovery, Volume)"',
-        "EQ":         'title="Entry Quality ≥ 60 required (EMA20 dist, Pivot dist, Move since setup)"',
+        "LEADERSHIP": 'title="CV1 Leadership — gate: Leadership ≥ 55 AND avg(L,C,EQ) ≥ 65 for Actionable"',
+        "CONVICTION": 'title="CV1 Conviction — gate: avg(Leadership, Conviction, Entry Quality) ≥ 65 for Actionable"',
+        "EQ":         'title="CV1 Entry Quality — gate: avg(Leadership, Conviction, Entry Quality) ≥ 65 for Actionable"',
     }
     thead = (
         '<thead><tr>'
@@ -2551,9 +2568,15 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
         rsi    = r.get("RSI") or r.get("_rsi") or 0
         tier   = r.get("Recommendation") or r.get("Tier") or "—"
         boosts = r.get("_fib_pb_boosts") or []
-        ls     = r.get("DE_Leadership",   0)
-        cv     = r.get("DE_Conviction",   0)
-        eq     = r.get("DE_EntryQuality", 0)
+        # [Scanner Refactor] CV1 is the single source of truth for setup
+        # quality — this tab used to read the legacy Decision Engine scores
+        # (DE_Leadership/DE_Conviction/DE_EntryQuality), which could disagree
+        # with the Recommendation/Tier shown in the same row (that's computed
+        # from CV1 + the Promotion Engine). Reading CV1_* here keeps this tab
+        # consistent with the rest of the app — one scoring system everywhere.
+        ls     = r.get("CV1_Leadership",   0)
+        cv     = r.get("CV1_Conviction",   0)
+        eq     = r.get("CV1_EntryQuality", 0)
 
         # CCI state label — mirrors the main scanner
         try:
@@ -2589,9 +2612,9 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
             + _pb_num(r.get("SL"),    "{:.2f}", color="#f85149")
             + _pb_num(r.get("T1"),    "{:.2f}", color="#58a6ff")
             + _pb_num(r.get("T2"),    "{:.2f}", color="#3fb950")
-            + _pb_gate_score(ls, 65, "Leadership")
-            + _pb_gate_score(cv, 20, "Conviction")
-            + _pb_gate_score(eq, 60, "EQ")
+            + _pb_gate_score(ls, 55, "Leadership")
+            + _pb_gate_score(cv, 65, "Conviction")
+            + _pb_gate_score(eq, 65, "EQ")
             + _pb_boosts(boosts)
             + _pb_tier(tier)
             + '</tr>\n'
