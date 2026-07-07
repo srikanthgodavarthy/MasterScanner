@@ -1,46 +1,26 @@
 """
 utils/decision_engine.py
 ────────────────────────
-[Scanner Refactor] This engine no longer produces a Recommendation. CV1
-(utils/conviction_score_v1.py) is the single source of truth for setup
-QUALITY, and the Promotion Engine (utils/promotion_engine.py) is the
-single source of truth for TIMING — together they produce the one
-Recommendation shown anywhere in the app. The Decision-Category
-classifier that used to live here (Elite Opportunity / High Conviction /
-Actionable / Setup Building / Extended / Avoid) has been removed; it was
-fully superseded and nothing read its output anymore.
+Maps the existing BarResult (from scoring_core.compute_bar) into the four
+independent decision-engine scores described in the Product Design Specification.
 
-What's left here, none of it duplicated by CV1 or the Promotion Engine:
+NO new indicators are computed here.  Every input is a field already present
+on BarResult.  The engine is a pure re-mapping / re-weighting layer.
 
-  Extension     (0-100) — "Has the opportunity already passed?"
-  Lifecycle stage        — the objective, settings-independent stage
-                            (LEADER / SETUP_BUILDING / ACTIONABLE /
-                            EXTENDED / AVOID), classified from CV1's
-                            quality scores + Extension (see
-                            `_classify_stage()` / `compute_decision()`).
-  Trend Quality (0-100) — trend persistence/maturity, used as a
-                            watchlist ranking key.
-  Risk : Reward         — trade-level geometry from entry/sl/t1/t2.
-  Explainability        — plain-English "why included / why not higher /
-                            risk factors" panel, reasoned from CV1's
-                            scores and the Lifecycle stage above so it
-                            always agrees with the Recommendation shown.
+Four Engines
+────────────
+  Leadership   (0-100) — "Is this a market leader?"
+  Conviction   (0-100) — "How likely is this setup to achieve target before SL?"
+  Entry Quality(0-100) — "Should I enter NOW?"
+  Extension    (0-100) — "Has the opportunity already passed?"
 
-This module ALSO still exposes its own independent leadership/
-conviction/entry_quality factor computation (`_leadership()`,
-`_conviction()`, `_entry_quality()`). These are kept ONLY for:
-  (a) the ConvictionGap diagnostic in utils/scanner_engine.py, which
-      compares CV1 against this differently-weighted read of the same
-      bar to flag "Runner" vs "Base Builder" profiles, and
-  (b) utils/backtest_engine.py / pages/validation.py, which deliberately
-      backtest/validate this legacy factor set against CV1.
-Neither of those is a live Recommendation — both are explicitly
-comparison/diagnostic tooling. Nothing else should read these three
-scores as if they were "the" quality of a setup; CV1 is.
-
-NO new indicators are computed here.  Every input is a field already
-present on BarResult.  The engine is a pure re-mapping / re-weighting
-layer.
+Stage / Lifecycle label (settings-independent objective state)
+──────────────────────────────────────────────────────────────
+  LEADER        Leadership ≥ 70,  Extension < 40
+  SETUP_BUILDING Leadership ≥ 70,  Conviction ≥ 50,  Extension < 50
+  ACTIONABLE    Leadership ≥ 70,  Conviction ≥ 60,  Entry ≥ 60,  Extension ≤ 40
+  EXTENDED      Extension ≥ 60
+  AVOID         Leadership < 50   OR  hard structural failure
 
   v9.2 Extension changes
   ─────────────────────
@@ -51,6 +31,15 @@ layer.
   Hard cap: fresh_base_breakout stocks capped at Extension=40 (was -10 flat).
   Breakout Elite path: vol_ratio >= 2.5 + setup quality unlocks Elite at
   relaxed Extension <= 45 and slightly lower score thresholds.
+
+Decision Category (scanner display label)
+──────────────────────────────────────────
+  Elite Opportunity  Leadership ≥ 90 AND Conviction ≥ 90 AND Entry ≥ 80 AND Extension ≤ 25
+  High Conviction    Leadership ≥ 80 AND Conviction ≥ 80 AND Entry ≥ 60 AND Extension ≤ 35
+  Actionable         Leadership ≥ 70 AND Conviction ≥ 60 AND Entry ≥ 60 AND Extension ≤ 40
+  Setup Building     Leadership ≥ 70 AND Conviction ≥ 50  (not yet actionable entry)
+  Extended           Extension ≥ 60  (regardless of other scores)
+  Avoid              Everything else
 """
 
 from __future__ import annotations
@@ -68,25 +57,12 @@ if TYPE_CHECKING:
 
 @dataclass
 class DecisionScores:
-    # [Scanner Refactor] leadership/conviction/entry_quality below are this
-    # engine's OWN independent factor computation — kept only so the
-    # ConvictionGap diagnostic (utils/scanner_engine.py) can compare CV1
-    # against a second, differently-weighted read of the same bar. They no
-    # longer drive any Recommendation or Lifecycle decision; CV1 does.
-    leadership:    int = 0    # 0-100 — legacy/diagnostic only, see above
-    conviction:    int = 0    # 0-100 — legacy/diagnostic only, see above
-    entry_quality: int = 0    # 0-100 — legacy/diagnostic only, see above
+    leadership:    int = 0    # 0-100
+    conviction:    int = 0    # 0-100
+    entry_quality: int = 0    # 0-100
     extension:     int = 0    # 0-100
     lifecycle:     str = "AVOID"   # objective stock state (settings-independent)
-    # Quality scores actually used to classify `lifecycle` above — CV1's,
-    # when the caller supplies them (production path always does); falls
-    # back to this engine's own leadership/conviction/entry_quality only if
-    # CV1 wasn't available. explain_decision() reasons from these, not from
-    # the legacy fields above, so the explanation always matches the stage
-    # it's explaining.
-    q_leadership:    int = 0
-    q_conviction:    int = 0
-    q_entry_quality: int = 0
+    recommendation:str = "Avoid"   # trader-adjusted label (respects settings)
     risk_reward:   float = 0.0   # estimated R:R from trade levels
 
     # Sub-score components (for UI breakdown)
@@ -144,6 +120,12 @@ class DecisionScores:
     tq_rs:                 int   = 0   # RS persistence across timeframes
     tq_pullback:           int   = 0   # pullback/fib zone health
 
+    # ── R:R Rejection tracking ────────────────────────────────────
+    # Set when a stock would have been Actionable/High Conviction/Elite
+    # but was downgraded to Setup Building because R:R < min_rr.
+    # Format: "RR 1.4 < 2.0" (actual vs threshold) — empty string if not rejected.
+    rr_reject_reason: str = ""
+
     # ── Explainability (Sprint 1) ─────────────────────────────────
     # Plain-English reason strings — populated by explain_decision()
     why_included:   list = None   # type: list[str]
@@ -155,18 +137,17 @@ class DecisionScores:
         if self.why_not_higher is None: object.__setattr__(self, "why_not_higher", [])
         if self.risk_factors   is None: object.__setattr__(self, "risk_factors",   [])
 
-    # ── Backward-compat alias ─────────────────────────────────────────────
-    # `.stage`/`.category` used to be two different things (objective
-    # lifecycle vs. settings-adjusted recommendation). Recommendation now
-    # lives entirely in CV1 + the Promotion Engine, so both aliases point
-    # at the one objective lifecycle stage this engine still owns.
+    # ── Backward-compat aliases ──────────────────────────────────────────────
+    # All existing code (lifecycle_engine, scanner, history, pages) uses .stage
+    # and .category.  These properties keep that working while the canonical
+    # fields are lifecycle / recommendation.
     @property
     def stage(self) -> str:
         return self.lifecycle
 
     @property
     def category(self) -> str:
-        return self.lifecycle
+        return self.recommendation
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -788,6 +769,177 @@ def _classify_stage(
     return "AVOID"
 
 
+# ══════════════════════════════════════════════════════════════════
+#  DECISION CATEGORY CLASSIFIER
+# ══════════════════════════════════════════════════════════════════
+
+_CATEGORY_ORDER = [
+    "Elite Opportunity",
+    "High Conviction",
+    "Actionable",
+    "Setup Building",
+    "Leader",           # Stage=LEADER: high leadership, conviction < 50, no setup yet
+    "Extended",
+    "Avoid",
+]
+
+def _classify_category(
+    leadership: int, conviction: int, entry_quality: int, extension: int,
+    stage: str, r: "BarResult",
+) -> str:
+    """
+    Decision-oriented category label for the scanner UI.
+    Replaces old tier labels with trader-meaningful names.
+    """
+    if extension >= 60 or stage == "EXTENDED":
+        return "Extended"
+
+    if stage == "AVOID" or leadership < 50:
+        return "Avoid"
+
+    if leadership >= 90 and conviction >= 90 and entry_quality >= 80 and extension <= 25:
+        return "Elite Opportunity"
+
+    if leadership >= 80 and conviction >= 80 and entry_quality >= 60 and extension <= 35:
+        return "High Conviction"
+
+    if leadership >= 70 and conviction >= 60 and entry_quality >= 60 and extension <= 40:
+        return "Actionable"
+
+    if leadership >= 70 and conviction >= 50:
+        return "Setup Building"
+
+    # Stage=LEADER with conviction < 50: strong price leadership, no setup structure yet.
+    # Runner profile — RS/momentum present but no Fib zone or compression base formed.
+    # Distinct from Avoid (structural failure / hard stop / downtrend).
+    if stage == "LEADER":
+        return "Leader"
+
+    return "Avoid"
+#  The trader-facing settings (trading_style, entry_preference,
+#  extension_tolerance) shift the classification thresholds.
+# ══════════════════════════════════════════════════════════════════
+
+def _get_thresholds(settings: dict) -> dict:
+    """
+    Derive threshold adjustments from trader-facing settings.
+
+    trading_style:        Aggressive | Balanced | Conservative
+    extension_tolerance:  Very Strict | Strict | Normal | Loose
+    conviction_level:     Watchlist | Actionable | High Conviction | Elite
+    """
+    style = settings.get("trading_style", "Balanced")
+    ext_tol = settings.get("extension_tolerance", "Normal")
+    conv_level = settings.get("conviction_level", "Actionable")
+    entry_pref = settings.get("entry_preference", "Pullback")
+
+    # Style → leadership + conviction thresholds shift
+    style_adj = {"Aggressive": -8, "Balanced": 0, "Conservative": +8}.get(style, 0)
+
+    # Extension tolerance → extension score threshold shift
+    ext_adj = {
+        "Very Strict": -15,   # very strict = refuse anything Extension > 15
+        "Strict":      -8,
+        "Normal":       0,
+        "Loose":       +15,
+    }.get(ext_tol, 0)
+
+    # Conviction level → min conviction threshold
+    min_conv = {
+        "Watchlist":      40,
+        "Actionable":     60,
+        "High Conviction":75,
+        "Elite":          85,
+    }.get(conv_level, 60)
+
+    # Entry preference → entry quality threshold
+    entry_adj = {
+        "Early":    -10,   # Early entries = accept lower entry quality
+        "Pullback":   0,
+        "Breakout":  +5,   # Breakout = require confirmed entry
+    }.get(entry_pref, 0)
+
+    return {
+        "style_adj":   style_adj,
+        "ext_adj":     ext_adj,
+        "min_conv":    min_conv,
+        "entry_adj":   entry_adj,
+        "ext_max_actionable": 40 + ext_adj,   # upper bound for "Actionable"
+        "ext_max_hc":         35 + ext_adj,   # upper bound for "High Conviction"
+        "ext_max_elite":      25 + ext_adj,   # upper bound for "Elite Opportunity"
+    }
+
+
+def _classify_category_with_settings(
+    leadership: int, conviction: int, entry_quality: int, extension: int,
+    stage: str, r: "BarResult", thresholds: dict,
+) -> str:
+    """Settings-aware category classification."""
+    sa   = thresholds["style_adj"]
+    ea   = thresholds["entry_adj"]
+    mc   = thresholds["min_conv"]
+    emx  = thresholds["ext_max_actionable"]
+
+    # Volume climax exemption: same logic as _classify_stage — setup quality +
+    # institutional volume means extension is confirmation, not staleness.
+    _climax_exempt = (r.fresh_base_breakout or r.compression_break) and r.vol_ratio >= 2.5
+    if (extension >= 60 + thresholds["ext_adj"] or stage == "EXTENDED") and not _climax_exempt:
+        return "Extended"
+
+    if stage == "AVOID" or leadership < max(50, 50 + sa):
+        return "Avoid"
+
+    # ── Standard Elite path (pullback setups) ────────────────────
+    if (leadership >= 90 + sa and conviction >= 90
+            and entry_quality >= 80 + ea
+            and extension <= thresholds["ext_max_elite"]):
+        return "Elite Opportunity"
+
+    # ── Breakout Elite path (volume climax breakouts) ─────────────
+    # Breakout stocks structurally cannot hit Extension <= 25 (standard Elite gate)
+    # because they are above EMA/pivot by design.  A separate path qualifies them
+    # when: institutional volume confirms the move (vol_ratio >= 2.5),
+    # setup quality exists (fresh base or compression break),
+    # and all other scores are Elite-grade.
+    # Extension cap is relaxed to 45 — the volume climax discount in _extension()
+    # already brought a genuine breakout down to ~20-40; this cap is a safety net.
+    if (r.fresh_base_breakout or r.compression_break):
+        if (r.vol_ratio >= 2.5
+                and leadership >= 85 + sa
+                and conviction >= 80
+                and entry_quality >= 65 + ea
+                and extension <= 45):
+            return "Elite Opportunity"
+
+    if (leadership >= 80 + sa and conviction >= 80
+            and entry_quality >= 60 + ea
+            and extension <= thresholds["ext_max_hc"]):
+        return "High Conviction"
+
+    if (leadership >= 70 + sa and conviction >= mc
+            and entry_quality >= 60 + ea
+            and extension <= emx):
+        return "Actionable"
+
+    if leadership >= 70 + sa and conviction >= 50:
+        return "Setup Building"
+
+    # Stage=LEADER with conviction < 50: strong price leadership, no setup structure yet.
+    if stage == "LEADER":
+        return "Leader"
+
+    return "Avoid"
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MINIMUM RISK-REWARD FILTER
+# ══════════════════════════════════════════════════════════════════
+
+def _rr_ok(rr: float, settings: dict) -> bool:
+    """Check risk/reward against user's minimum preference."""
+    min_rr_map = {"1.5R": 1.5, "2R": 2.0, "3R": 3.0}
+    min_rr = min_rr_map.get(settings.get("min_risk_reward", "2R"), 2.0)
+    return rr >= min_rr
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -859,18 +1011,9 @@ def explain_decision(ds: "DecisionScores") -> dict:
     """Generate plain-English reasons for a stock's decision output.
 
     Returns a dict with three lists:
-      why_included   : positive factors present in this setup
-      why_not_higher : what is missing / limiting a higher lifecycle stage
+      why_included   : positive factors that drove inclusion / category
+      why_not_higher : what is missing / limiting a higher category
       risk_factors   : active risk conditions to be aware of
-
-    [Scanner Refactor] Reasons from CV1's quality scores (ds.q_leadership /
-    ds.q_conviction / ds.q_entry_quality) and the objective Lifecycle stage
-    (ds.lifecycle) — the same numbers that actually produced the
-    Recommendation shown on the Scanner (CV1 + Promotion Engine). The old
-    version of this function reasoned from this engine's own independent
-    leadership/conviction/entry_quality and a since-removed Decision
-    Engine category, which could tell a different story than the
-    Recommendation displayed right next to it.
 
     This is a pure formatting function over DecisionScores — no new
     computation.  Safe to call after compute_decision().
@@ -879,14 +1022,14 @@ def explain_decision(ds: "DecisionScores") -> dict:
     not_higher: list[str] = []
     risks: list[str] = []
 
-    ls    = ds.q_leadership
-    cv    = ds.q_conviction
-    eq    = ds.q_entry_quality
-    ext   = ds.extension
-    tq    = ds.trend_quality
-    stage = ds.lifecycle   # LEADER | SETUP_BUILDING | ACTIONABLE | EXTENDED | AVOID
+    ls  = ds.leadership
+    cv  = ds.conviction
+    eq  = ds.entry_quality
+    ext = ds.extension
+    tq  = ds.trend_quality
+    cat = ds.category
 
-    # ── Why included / positive drivers (CV1 quality bands) ────────
+    # ── Why included / positive drivers ──────────────────────────
     if ls >= 90:
         included.append(f"Leadership {ls}: exceptional market leader — RS and trend among top performers")
     elif ls >= 80:
@@ -894,8 +1037,6 @@ def explain_decision(ds: "DecisionScores") -> dict:
     elif ls >= 70:
         included.append(f"Leadership {ls}: qualified leader — trend and RS above minimum threshold")
 
-    # Structural detail — present on the bar regardless of which engine
-    # scores it, kept as supplementary context (not a competing score).
     if ds.ls_rs >= 26:
         included.append(f"RS composite in top decile — institutional sponsorship confirmed")
     elif ds.ls_rs >= 18:
@@ -928,13 +1069,14 @@ def explain_decision(ds: "DecisionScores") -> dict:
     elif eq >= 60:
         included.append(f"Entry Quality {eq}: acceptable entry — some distance consumed but still actionable")
 
-    # ── Why not (yet) Actionable — keyed on the objective lifecycle stage ──
-    if stage != "ACTIONABLE":
-        if ls < 70:
-            not_higher.append(f"Leadership {ls} (need ≥70 for Actionable) — RS or trend age still building")
-        if cv < 60:
-            not_higher.append(f"Conviction {cv} (need ≥60 for Actionable) — pattern or Fib zone not yet confirmed")
-        if eq < 60 and stage not in ("EXTENDED", "AVOID"):
+    # ── Why not higher category ───────────────────────────────────
+    if cat != "Elite Opportunity":
+        if ls < 90:
+            gap = 90 - ls
+            not_higher.append(f"Not Elite: Leadership {ls} (need ≥90) — {gap} pts gap, likely RS or MA alignment")
+        if cv < 90:
+            not_higher.append(f"Not Elite: Conviction {cv} (need ≥90) — pattern or Fib zone not fully confirmed")
+        if eq < 80 and cat not in ("Extended", "Avoid", "Leader"):
             move = ds.price_move_since_setup
             bss  = ds.bars_since_setup
             if move > 1.5:
@@ -952,20 +1094,20 @@ def explain_decision(ds: "DecisionScores") -> dict:
                     "stretched for a safe entry"
                 )
 
-    if stage == "LEADER":
+    if cat == "Leader":
         not_higher.append(
             f"Conviction {cv} (need ≥50 for Setup Building) — "
             "strong price leadership but no confirmed pattern (base, squeeze, or continuation vol signal) "
             "and no Fib zone yet; watch for base formation or pullback to support before entering"
         )
 
-    if stage == "SETUP_BUILDING" and cv < 60:
+    if cat == "Setup Building" and cv < 60:
         not_higher.append(
             f"Conviction {cv} (need ≥60 for Actionable) — "
             "no clear pattern or Fib zone yet; setup still forming"
         )
 
-    if tq < 50 and stage not in ("AVOID", "EXTENDED"):
+    if tq < 50 and cat not in ("Avoid", "Extended"):
         not_higher.append(
             f"Trend Quality {tq}: trend is newer or less persistent — "
             "RS or MA alignment not yet fully established"
@@ -1003,7 +1145,7 @@ def explain_decision(ds: "DecisionScores") -> dict:
     elif ds.risk_reward < 2.0:
         risks.append(f"R:R {ds.risk_reward:.1f} — marginal; target 2R or better")
 
-    if ls < 60 and stage not in ("AVOID", "LEADER"):
+    if ls < 60 and cat not in ("Avoid", "Leader"):
         risks.append(
             f"Leadership {ls} is borderline — trend or RS weakening; "
             "monitor for early exit signals"
@@ -1020,51 +1162,24 @@ def explain_decision(ds: "DecisionScores") -> dict:
 #  MAIN ENTRY POINT
 # ══════════════════════════════════════════════════════════════════
 
-def compute_decision(
-    r: "BarResult",
-    settings: dict | None = None,
-    cv1_leadership: int | None = None,
-    cv1_conviction: int | None = None,
-    cv1_entry_quality: int | None = None,
-) -> DecisionScores:
+def compute_decision(r: "BarResult", settings: dict | None = None) -> DecisionScores:
     """
-    Compute Extension, Lifecycle stage, Trend Quality, R:R, and
-    explainability from an existing BarResult.
-
-    [Scanner Refactor] This engine no longer produces a Recommendation —
-    that's entirely CV1 + the Promotion Engine's job now (see
-    utils/conviction_score_v1.py, utils/promotion_engine.py). What's left
-    here are the things CV1/Promotion don't cover: Extension (has the move
-    already run too far?), the objective Lifecycle stage, Trend Quality,
-    and the plain-English explainability panel.
+    Compute the four decision-engine scores + Stage + Category
+    entirely from an existing BarResult.
 
     Parameters
     ----------
     r        : BarResult from scoring_core.compute_bar()
     settings : Settings dict from pages/settings.py (trader-facing controls).
                If None, uses neutral defaults.
-    cv1_leadership, cv1_conviction, cv1_entry_quality :
-               CV1's quality scores for this bar. When supplied (the
-               production path always supplies them), Lifecycle staging is
-               classified from CV1 — the single source of truth for
-               quality — instead of this engine's own leadership/
-               conviction/entry_quality. Those own scores are still
-               computed and returned (see DecisionScores docstring) purely
-               as a diagnostic cross-check against CV1, never as the basis
-               for a decision.
 
     Returns
     -------
-    DecisionScores dataclass — Extension / Lifecycle / Trend Quality / R:R
-    / explainability, plus the legacy diagnostic scores.
+    DecisionScores dataclass with all four engines + stage + category.
     """
     settings = settings or {}
 
-    # ── This engine's own independent factor computation ───────────
-    # Kept only for the ConvictionGap diagnostic (utils/scanner_engine.py)
-    # and for utils/backtest_engine.py / pages/validation.py, which
-    # deliberately compare CV1 against this differently-weighted read of
-    # the same bar. Never used for Lifecycle/Recommendation below.
+    # ── Compute four engines ──────────────────────────────────────
     leadership,    ls_subs  = _leadership(r)
     conviction,    cv_subs  = _conviction(r, settings)
     entry_quality, eq_subs, rr = _entry_quality(r)
@@ -1073,13 +1188,23 @@ def compute_decision(
     # ── Trend Quality Score (Sprint 1) ────────────────────────────
     tq_score, tq_subs = _trend_quality(r)
 
-    # ── Lifecycle stage — classified from CV1's quality scores ─────
-    # (falls back to this engine's own scores only if CV1 wasn't supplied,
-    # e.g. a script calling compute_decision() directly / standalone).
-    q_ls = cv1_leadership    if cv1_leadership    is not None else leadership
-    q_cv = cv1_conviction    if cv1_conviction    is not None else conviction
-    q_eq = cv1_entry_quality if cv1_entry_quality is not None else entry_quality
-    stage = _classify_stage(q_ls, q_cv, q_eq, extension, r)
+    # ── Stage ─────────────────────────────────────────────────────
+    stage = _classify_stage(leadership, conviction, entry_quality, extension, r)
+
+    # ── Category (settings-aware) ─────────────────────────────────
+    thresholds = _get_thresholds(settings)
+    category   = _classify_category_with_settings(
+        leadership, conviction, entry_quality, extension, stage, r, thresholds
+    )
+
+    # If R:R doesn't meet minimum, downgrade from Actionable → Setup Building
+    rr_reject_reason = ""
+    if category in ("Elite Opportunity", "High Conviction", "Actionable"):
+        if not _rr_ok(rr, settings):
+            min_rr_map = {"1.5R": 1.5, "2R": 2.0, "3R": 3.0}
+            min_rr = min_rr_map.get(settings.get("min_risk_reward", "2R"), 2.0)
+            rr_reject_reason = f"RR {rr:.1f} < {min_rr:.1f}"
+            category = "Setup Building"
 
     ds = DecisionScores(
         leadership    = leadership,
@@ -1087,10 +1212,9 @@ def compute_decision(
         entry_quality = entry_quality,
         extension     = extension,
         lifecycle     = stage,
-        q_leadership    = q_ls,
-        q_conviction    = q_cv,
-        q_entry_quality = q_eq,
+        recommendation= category,
         risk_reward   = rr,
+        rr_reject_reason = rr_reject_reason,
         # Leadership subs
         ls_trend      = ls_subs["ls_trend"],
         ls_rs         = ls_subs["ls_rs"],
@@ -1150,3 +1274,54 @@ def compute_decision(
     object.__setattr__(ds, "risk_factors",   explanation["risk_factors"])
 
     return ds
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CATEGORY METADATA (for UI theming)
+# ══════════════════════════════════════════════════════════════════
+
+CATEGORY_STYLE: dict[str, dict] = {
+    "Elite Opportunity": {
+        "color": "#ffd700", "bg": "#1a1100", "border": "#92400e",
+        "icon": "🌟", "action": "EXECUTE — Elite",
+        "description": "Exceptional leader, high-probability setup, attractive entry.",
+    },
+    "High Conviction": {
+        "color": "#22c55e", "bg": "#052e16", "border": "#166534",
+        "icon": "⚡", "action": "EXECUTE — High Conviction",
+        "description": "Strong leader with a well-formed setup and entry still attractive.",
+    },
+    "Actionable": {
+        "color": "#4ade80", "bg": "#052e16", "border": "#166534",
+        "icon": "✅", "action": "EXECUTE",
+        "description": "Good setup with entry available now. Act if conviction aligns.",
+    },
+    "Setup Building": {
+        "color": "#f59e0b", "bg": "#2d1d00", "border": "#92400e",
+        "icon": "👁", "action": "WATCH — Setup Forming",
+        "description": "Strong stock. Setup forming but entry not yet attractive.",
+    },
+    "Leader": {
+        "color": "#a78bfa", "bg": "#1e1333", "border": "#5b21b6",
+        "icon": "🏃", "action": "WATCH — Await Base",
+        "description": "Strong price leader with high RS. No Fib zone or compression base yet. Watch for setup formation.",
+    },
+    "Extended": {
+        "color": "#f97316", "bg": "#2d1200", "border": "#9a3412",
+        "icon": "⚠️", "action": "DO NOT CHASE",
+        "description": "Opportunity has largely passed. Wait for pullback or next base.",
+    },
+    "Avoid": {
+        "color": "#475569", "bg": "#0f172a", "border": "#1e293b",
+        "icon": "⛔", "action": "SKIP",
+        "description": "No actionable setup. Insufficient leadership or structural failure.",
+    },
+}
+
+STAGE_LABEL: dict[str, str] = {
+    "LEADER":         "Leader",
+    "SETUP_BUILDING": "Setup Building",
+    "ACTIONABLE":     "Actionable",
+    "EXTENDED":       "Extended",
+    "AVOID":          "Avoid",
+}

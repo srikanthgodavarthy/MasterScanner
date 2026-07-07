@@ -91,7 +91,7 @@ logger = logging.getLogger(__name__)
 # Minimum recommendation/category to mint a NEW trade plan.
 # This is the ONLY point where Recommendation is allowed to touch
 # persistence — it decides whether a plan is born, never how it dies.
-_FREEZE_CATEGORIES = {"Elite", "Execute", "Actionable"}
+_FREEZE_CATEGORIES = {"Elite Opportunity", "High Conviction", "Actionable"}
 
 # A WAITING plan expires if price never reaches the entry zone within
 # N calendar days of creation. Does NOT apply once ACTIVE / T1_HIT —
@@ -554,15 +554,9 @@ def _create_plan(
         locked_recommendation = recommendation,
         locked_category        = recommendation,
         locked_rr              = float(scanner_row.get("RR", 0) or 0),
-        # [Scanner Refactor] `locked_recommendation`/`locked_category` above
-        # already come from `Recommendation` (CV1 + Promotion Engine) — lock
-        # in the CV1 scores that actually justified that Actionable call,
-        # not the legacy Decision Engine scores, so the frozen plan and its
-        # recommendation always trace back to the same engine. DE_* kept
-        # only as a fallback for rows that predate the CV1 columns.
-        locked_leadership      = int(scanner_row.get("CV1_Leadership",   scanner_row.get("DE_Leadership",   0)) or 0),
-        locked_conviction      = int(scanner_row.get("CV1_Conviction",   scanner_row.get("DE_Conviction",   0)) or 0),
-        locked_entry_quality   = int(scanner_row.get("CV1_EntryQuality", scanner_row.get("DE_EntryQuality", 0)) or 0),
+        locked_leadership      = int(scanner_row.get("DE_Leadership",   0) or 0),
+        locked_conviction      = int(scanner_row.get("DE_Conviction",   0) or 0),
+        locked_entry_quality   = int(scanner_row.get("DE_EntryQuality", 0) or 0),
         locked_extension       = int(scanner_row.get("Extension",    0) or 0),
         status                 = SetupPlanStatus.WAITING,
         status_reason           = "Plan created — awaiting entry trigger",
@@ -619,23 +613,30 @@ def enrich_scanner_row(
     #      live recommendation now qualifies. This is the one place
     #      Recommendation is allowed to act — it can only *create*,
     #      never modify or close, a plan. ─────────────────────────
-    # [Scanner Refactor 2026-07] Setup Plan creation no longer waits for
-    # _any_buy. Per the new lifecycle:
-    #     Watch → Developing → Actionable → Create Setup Plan →
-    #     Execute/Elite → Waiting for Trigger → Buy Trigger (_any_buy) →
-    #     Trade Open → Trade Closed
-    # The plan is minted the moment CV1 + Promotion Engine says Actionable
-    # (or better). The buy trigger's only job from here is to advance an
-    # existing plan's lifecycle state (WAITING → ACTIVE, in advance_lifecycle
-    # above) — it no longer gates whether the plan gets created at all.
+    # [FIX v9.1] Recommendation/Category ("Actionable", "High Conviction", ...)
+    # is derived from Leadership/Conviction/EntryQuality/Extension only — it
+    # can read "Actionable" even when the underlying buy signal never fired
+    # (Action/CV1_SignalClass == SKIP, _any_buy == False). Confirmed against
+    # a live scan where 4/4 "Actionable"-category stocks had _any_buy=False
+    # and got frozen WAITING plans with a misleading "Fresh (0d)" badge.
+    # Require an actual fired signal, not just the category label, before
+    # minting a plan.
+    has_signal = bool(scanner_row.get("_any_buy", False))
     should_create = (
         recommendation in _FREEZE_CATEGORIES
+        and has_signal
         and (plan is None or plan.is_terminal())
     )
     if not should_create:
         if recommendation not in _FREEZE_CATEGORIES:
             logger.info(
                 "[SETUP PLAN SKIPPED] symbol=%s recommendation=%s reason=recommendation_not_qualifying",
+                symbol, recommendation,
+            )
+        elif not has_signal:
+            logger.info(
+                "[SETUP PLAN SKIPPED] symbol=%s recommendation=%s reason=no_any_buy_signal "
+                "(category qualified but underlying buy condition never fired)",
                 symbol, recommendation,
             )
         elif plan is not None and plan.is_open():

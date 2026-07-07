@@ -461,61 +461,6 @@ def _classify(leadership: int, conviction: int, entry_quality: int) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  RECOMMENDATION TIER  (Scanner Refactor — Promotion Engine, 2026-07)
-# ══════════════════════════════════════════════════════════════════
-#
-# CV1 is the single source of truth for setup QUALITY. It answers
-# "is this a market leader, in a high-probability setup, at a good
-# entry price?" — nothing about TIMING.
-#
-# classify_tier() maps the three CV1 scores to the base recommendation
-# funnel:  Skip → Watch → Developing → Actionable.
-#
-# It deliberately stops at "Actionable" — CV1 never assigns Execute or
-# Elite itself. Whether an Actionable setup is *ready right now* is a
-# timing question, answered separately by utils/promotion_engine.py
-# (stochastic re-ignition, LL defense, VWAP reversal, institutional
-# confirmation, R:R). Promotion can only upgrade Actionable → Execute
-# or Actionable → Elite; it is layered on top of this function's
-# output and never runs for Watch/Developing/Skip.
-#
-# NOTE: this does not change _leadership()/_conviction()/_entry_quality()
-# or the legacy _classify()/signal_class — those scoring formulas are
-# frozen (v1) and untouched. This is a new, separate mapping used by
-# the Scanner page as the actual displayed recommendation.
-
-def classify_tier(leadership: int, conviction: int, entry_quality: int) -> str:
-    """
-    Map the three CV1 scores to the base recommendation tier.
-
-    Skip        — insufficient leadership / structural failure
-    Watch       — some strength, entry not attractive, setup not formed
-    Developing  — building setup, worth tracking, not yet actionable
-    Actionable  — high-quality setup, entry attractive — eligible for
-                  the Promotion Engine to evaluate Execute/Elite timing
-    """
-    composite = (leadership + conviction + entry_quality) / 3.0
-
-    if leadership >= 55 and composite >= 65:
-        return "Actionable"
-    if composite >= 50:
-        return "Developing"
-    if leadership >= 40 or composite >= 35:
-        return "Watch"
-    return "Skip"
-
-
-TIER_STYLE: dict[str, dict] = {
-    "Elite":      {"color": "#ffd700", "icon": "🌟", "label": "ELITE"},
-    "Execute":    {"color": "#22c55e", "icon": "🚀", "label": "EXECUTE"},
-    "Actionable": {"color": "#58a6ff", "icon": "🔷", "label": "ACTIONABLE"},
-    "Developing": {"color": "#f5a623", "icon": "⚙️", "label": "DEVELOPING"},
-    "Watch":      {"color": "#8b949e", "icon": "👁",  "label": "WATCH"},
-    "Skip":       {"color": "#484f58", "icon": "⛔",  "label": "SKIP"},
-}
-
-
-# ══════════════════════════════════════════════════════════════════
 #  MAIN ENTRY POINT
 # ══════════════════════════════════════════════════════════════════
 
