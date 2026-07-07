@@ -28,7 +28,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 from utils.scanner_engine import _strip_tz, nifty_regime, ema
-from utils.decision_engine import _entry_quality as _eq_fn, _leadership as _ls_fn, _conviction as _cv_fn, _extension as _ext_fn
+from utils.decision_engine import _extension as _ext_fn
+from utils.conviction_score_v1 import compute_conviction_v1
 from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
 from utils.adaptive_target_engine import AdaptiveTargetParams, compute_adaptive_targets, check_momentum_exit
 from utils.regime_engine  import (
@@ -260,9 +261,18 @@ def generate_signals_historical(
             continue
 
         # ══════════════════════════════════════════════════════════
-        #  ADMISSION GATE v11 — hard pre-score filters
+        #  ADMISSION GATE v12 — hard pre-score filters
         #  These are BINARY rejects; they do not reduce score.
         #  A stock that fails any gate is never added to signals.
+        #
+        #  Leadership / Conviction / Entry Quality now come from CV1
+        #  (utils/conviction_score_v1.py) — the same Quality engine the
+        #  live Scanner recommends off of. This backtest previously ran
+        #  admission through utils/decision_engine.py's legacy, differently-
+        #  weighted _leadership/_conviction/_entry_quality functions, which
+        #  meant backtest results validated a formula the Scanner no longer
+        #  uses. Risk:Reward is computed here directly from entry/sl/t1/t2
+        #  (CV1's entry_quality does not return an RR figure).
         #
         #  Gate order (cheapest checks first):
         #    1. ATR band / staleness / extension  — field lookups, free
@@ -280,14 +290,23 @@ def generate_signals_historical(
         #elif r.extension_score_atr >= 2:
         #    _rejection_reason = "HIGH_EXTENSION_SCORE"
 
-        # ── Gates 2–5: engine-scored gates (only if gate 1 passed) ─
-        # Compute all three engines once; reuse values for signal dict.
+        # ── Gates 2–5: CV1-scored gates (only if gate 1 passed) ────
+        # Compute CV1 once; reuse values for signal dict.
         # Initialise here so the rejection-log append below always has values.
         _eq_val, _rr, _ls_val, _cv_val = 0, 0.0, 0, 0
         if not _rejection_reason:
-            _eq_val, _, _rr = _eq_fn(r)
-            _ls_val, _      = _ls_fn(r)
-            _cv_val, _      = _cv_fn(r, settings)
+            _cv1    = compute_conviction_v1(r)
+            _ls_val = _cv1.leadership
+            _cv_val = _cv1.conviction
+            _eq_val = _cv1.entry_quality
+
+            _entry    = r.entry if r.entry > 0 else 0.0
+            _sl       = r.sl    if r.sl    > 0 else 0.0
+            _t1       = r.t1    if r.t1    > 0 else 0.0
+            _t2       = r.t2    if r.t2    > 0 else 0.0
+            _risk_amt = max(_entry - _sl, 0.001)
+            _reward   = _t2 - _entry if _t2 > _entry else (_t1 - _entry if _t1 > _entry else 0)
+            _rr       = round(_reward / _risk_amt, 2) if _risk_amt > 0 else 0.0
 
             # Gate 2: Leadership must be >= 65
             # A stock with Leadership < 65 has no RS edge, weak trend, or
