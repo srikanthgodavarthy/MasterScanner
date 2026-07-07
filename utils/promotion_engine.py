@@ -27,8 +27,11 @@ zero new indicators):
      Fresh %K/%D bullish cross, or a cross out of the oversold zone.
 
   2. LL Detected (Defended)     — r.ll_actionable AND r.ll_defended
+     AND r.ll_distance_atr within the actionable band (0.3-4.0 ATR).
      A Lower-Low spring / failed-breakdown reversal that has been
-     reclaimed and never re-broken since.
+     reclaimed, never re-broken since, AND is still close enough to
+     current price to matter as a TIMING signal — not one it broke away
+     from ATRs ago (that's ancient structure, not "right now" timing).
 
   3. VWAP Touch & Reverse       — r.stoch_vwap_touch AND r.stoch_vwap_reclaim
      Price touched VWAP intraday and closed back above it (a reclaim,
@@ -78,6 +81,12 @@ EXECUTE_SCORE_MIN = 50   # Moderate — 2+ of 4 signals confirming
 # when the trade itself is still worth taking, not just "confirming".
 MIN_RR_EXECUTE = 1.5
 MIN_RR_ELITE   = 2.0
+
+# LL proximity band — mirrors ll_opportunity.py's own distance_atr_ok gate.
+# A "defended" low that price is 12 ATRs away from is old structure, not a
+# live timing signal — it stopped being actionable long ago.
+LL_MIN_DISTANCE_ATR = 0.3
+LL_MAX_DISTANCE_ATR = 4.0
 
 _MIN_RR_MAP = {"1.5R": 1.5, "2R": 2.0, "2.5R": 2.5, "3R": 3.0}
 
@@ -203,7 +212,9 @@ def evaluate_promotion(
 
     # ── Timing signals ──────────────────────────────────────────
     res.stoch_up      = bool(getattr(r, "stoch_reignition", False))
-    res.ll_confirmed  = bool(getattr(r, "ll_actionable", False)) and bool(getattr(r, "ll_defended", False))
+    _ll_dist = float(getattr(r, "ll_distance_atr", 0.0) or 0.0)
+    _ll_near = LL_MIN_DISTANCE_ATR <= _ll_dist <= LL_MAX_DISTANCE_ATR
+    res.ll_confirmed  = bool(getattr(r, "ll_actionable", False)) and bool(getattr(r, "ll_defended", False)) and _ll_near
     res.vwap_reversal = bool(getattr(r, "stoch_vwap_touch", False)) and bool(getattr(r, "stoch_vwap_reclaim", False))
     res.institutional = _institutional_confirmation(r, ia)
 
@@ -223,7 +234,9 @@ def evaluate_promotion(
     if res.stoch_up:
         res.reasons.append("Stochastic re-ignition — fresh bullish %K/%D cross")
     if res.ll_confirmed:
-        res.reasons.append("Defended Lower-Low spring — reclaimed and never re-broken")
+        res.reasons.append(f"Defended Lower-Low spring — reclaimed, never re-broken, {_ll_dist:.1f} ATR away")
+    elif bool(getattr(r, "ll_actionable", False)) and bool(getattr(r, "ll_defended", False)) and not _ll_near:
+        res.blocked.append(f"LL spring is defended but {_ll_dist:.1f} ATR away — too stale to count as timing")
     if res.vwap_reversal:
         res.reasons.append("VWAP touch & reclaim — location and momentum aligned")
     if res.institutional:
