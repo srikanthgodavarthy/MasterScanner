@@ -101,6 +101,13 @@ LL_MAX_BARS_SINCE_RECLAIM = 5
 # trusting the boolean blindly.
 VWAP_MAX_BARS_SINCE_TOUCH = 3
 
+# Stoch re-ignition recency gate — mirrors LL/VWAP treatment above. The
+# detector (utils/stoch_convergence.py) now searches back up to
+# STOCH_REIGNITION_LOOKBACK bars for a qualifying cross and reports how
+# many bars ago it fired; without this gate a cross from several bars back
+# was being treated identically to one on today's bar.
+STOCH_MAX_BARS_SINCE_REIGNITION = 3
+
 _MIN_RR_MAP = {"1.5R": 1.5, "2R": 2.0, "2.5R": 2.5, "3R": 3.0}
 
 
@@ -230,7 +237,9 @@ def evaluate_promotion(
     res.applicable = True
 
     # ── Timing signals ──────────────────────────────────────────
-    res.stoch_up      = bool(getattr(r, "stoch_reignition", False))
+    _stoch_bars  = int(getattr(r, "stoch_bars_since_reignition", -1) or -1)
+    _stoch_fresh = 0 <= _stoch_bars <= STOCH_MAX_BARS_SINCE_REIGNITION
+    res.stoch_up = bool(getattr(r, "stoch_reignition", False)) and _stoch_fresh
 
     _ll_dist  = float(getattr(r, "ll_distance_atr", 0.0) or 0.0)
     _ll_bars  = int(getattr(r, "ll_bars_since_reclaim", -1) or -1)
@@ -256,7 +265,10 @@ def evaluate_promotion(
 
     # ── Reasons (for the "why promoted" explanation) ────────────
     if res.stoch_up:
-        res.reasons.append("Stochastic re-ignition — fresh bullish %K/%D cross")
+        _kind = getattr(r, "stoch_reignition_kind", "") or "cross"
+        res.reasons.append(f"Stochastic re-ignition ({_kind}) — {_stoch_bars} bar(s) ago")
+    elif bool(getattr(r, "stoch_reignition", False)) and not _stoch_fresh:
+        res.blocked.append(f"Stoch re-ignition found but {_stoch_bars} bars ago (>{STOCH_MAX_BARS_SINCE_REIGNITION}) — too stale to count as timing")
     if res.ll_confirmed:
         res.reasons.append(f"Defended Lower-Low spring — reclaimed {_ll_bars} bar(s) ago, never re-broken")
     elif bool(getattr(r, "ll_actionable", False)) and bool(getattr(r, "ll_defended", False)) and not _ll_fresh:
