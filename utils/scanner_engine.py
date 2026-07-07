@@ -683,6 +683,7 @@ def score_stock(
         "StochK":            r.stoch_k,
         "StochD":            r.stoch_d,
         "Stoch_Reignition":  r.stoch_reignition,
+        "Stoch_BarsSinceReignition": r.stoch_bars_since_reignition,
         "Stoch_Confluence":  r.stoch_confluence,
         "Stoch_BonusPts":    r.stoch_bonus_pts,
         "OpportunityBonus":  r.opportunity_bonus_pts,
@@ -694,20 +695,72 @@ def score_stock(
         "_bar_result":  r,
     }
 
-    # ── Decision Engine (4-score framework) ──────────────────────
-    # Runs AFTER all existing logic; uses only already-computed BarResult fields.
+    # ── Conviction Score v1 (backtest-validated weights) ─────────
+    # Pure re-mapping of existing BarResult fields — zero new indicators.
+    # Produces: CV1_Leadership, CV1_Conviction, CV1_EntryQuality, CV1_SignalClass
+    # and all sub-score internals for the detail-view breakdown panel.
+    # [Scanner Refactor] Runs BEFORE the Decision Engine below so its
+    # quality scores can be handed to compute_decision() for Lifecycle
+    # staging — CV1 is the single source of truth for quality everywhere,
+    # including the objective Lifecycle stage, not just the Recommendation.
+    cv1 = None
+    try:
+        from utils.conviction_score_v1 import compute_conviction_v1
+        cv1 = compute_conviction_v1(r)
+        result.update({
+            "CV1_Leadership":    cv1.leadership,
+            "CV1_Conviction":    cv1.conviction,
+            "CV1_EntryQuality":  cv1.entry_quality,
+            "CV1_Composite":     cv1.composite,
+            "CV1_SignalClass":   cv1.signal_class,
+            # Grade labels
+            "CV1_LS_Grade":      cv1.leadership_grade,
+            "CV1_CV_Grade":      cv1.conviction_grade,
+            "CV1_EQ_Grade":      cv1.entry_quality_grade,
+            # Leadership sub-scores
+            "_cv1_ls_rs":        cv1.ls_rs_composite,
+            "_cv1_ls_age":       cv1.ls_trend_age,
+            "_cv1_ls_adx":       cv1.ls_adx,
+            "_cv1_ls_ps":        cv1.ls_persistent_strength,
+            "_cv1_ls_slope":     cv1.ls_ema20_slope,
+            # Conviction sub-scores
+            "_cv1_cv_structure": cv1.cv_trend_structure,
+            "_cv1_cv_fib":       cv1.cv_fib_zone,
+            "_cv1_cv_cci":       cv1.cv_cci_recovery,
+            "_cv1_cv_volume":    cv1.cv_volume,
+            "_cv1_cv_squeeze":   cv1.cv_squeeze,
+            # Entry Quality sub-scores
+            "_cv1_eq_ema20":     cv1.eq_ema20_dist,
+            "_cv1_eq_ema50":     cv1.eq_ema50_dist,
+            "_cv1_eq_pivot":     cv1.eq_pivot_dist,
+            "_cv1_eq_move":      cv1.eq_move_since_setup,
+            "_cv1_eq_bars":      cv1.eq_bars_since_setup,
+        })
+    except Exception:
+        cv1 = None   # Decision Engine below falls back to its own scores for Lifecycle
+
+    # ── Decision Engine — Extension / Lifecycle / Trend Quality / R:R ──
+    # [Scanner Refactor] No longer produces a Recommendation — CV1 +
+    # Promotion Engine (below) own that entirely. What's left is the
+    # things they don't cover: Extension, the objective Lifecycle stage
+    # (classified from CV1's scores when available), Trend Quality, R:R,
+    # and the explainability panel. See utils/decision_engine.py docstring.
+    ds = None   # ensure defined even if compute_decision() below raises
     try:
         from utils.decision_engine import compute_decision
-        ds = compute_decision(r, settings or {})
+        ds = compute_decision(
+            r, settings or {},
+            cv1_leadership    = cv1.leadership    if cv1 else None,
+            cv1_conviction    = cv1.conviction    if cv1 else None,
+            cv1_entry_quality = cv1.entry_quality if cv1 else None,
+        )
         result.update({
-            "DE_Leadership":    ds.leadership,
-            "DE_Conviction":    ds.conviction,
-            "DE_EntryQuality":  ds.entry_quality,
+            "DE_Leadership":    ds.leadership,     # legacy/diagnostic — feeds ConvictionGap only
+            "DE_Conviction":    ds.conviction,      # legacy/diagnostic — feeds ConvictionGap only
+            "DE_EntryQuality":  ds.entry_quality,   # legacy/diagnostic — feeds ConvictionGap only
             "Extension":     ds.extension,
-            "Lifecycle":     ds.lifecycle,     # objective stock state (settings-independent)
-            "Recommendation":ds.recommendation,  # trader-adjusted label (respects settings)
+            "Lifecycle":     ds.lifecycle,     # objective stock state, classified from CV1 + Extension
             "RR":            ds.risk_reward,
-            "RR_RejectReason": ds.rr_reject_reason,
             # ── Bars-since-setup banding (key question: "Can I still enter today?")
             "BarsBand":      ds.bars_band,         # "Actionable" | "Late" | "Extended"
             "BarsSince":     ds.bars_since_setup,
@@ -758,108 +811,92 @@ def score_stock(
         import logging as _log
         _log.warning(
             "[decision_engine] compute_decision() failed for symbol — "
-            "Leadership/Conviction/Lifecycle/Recommendation/RR will be absent. "
+            "Extension/Lifecycle/TrendQuality/RR will be absent. "
             "Error: %s", _de_exc, exc_info=True
         )
 
-    # ── Conviction Score v1 (backtest-validated weights) ─────────
-    # Pure re-mapping of existing BarResult fields — zero new indicators.
-    # Produces: CV1_Leadership, CV1_Conviction, CV1_EntryQuality, CV1_SignalClass
-    # and all sub-score internals for the detail-view breakdown panel.
+    # ── RECOMMENDATION FUNNEL (CV1 quality → Promotion Engine timing) ──
+    # CV1 is the single source of truth for quality. classify_tier()
+    # maps its three scores to the base funnel:
+    #     Skip → Watch → Developing → Actionable
+    # The Promotion Engine only ever runs on an Actionable setup and
+    # can only upgrade it to Execute or Elite — it never creates a
+    # Watch/Developing/Skip recommendation and never demotes.
+    # This Recommendation is the ONLY recommendation shown anywhere in
+    # the app.
     try:
-        from utils.conviction_score_v1 import compute_conviction_v1
-        cv1 = compute_conviction_v1(r)
-        result.update({
-            "CV1_Leadership":    cv1.leadership,
-            "CV1_Conviction":    cv1.conviction,
-            "CV1_EntryQuality":  cv1.entry_quality,
-            "CV1_Composite":     cv1.composite,
-            "CV1_SignalClass":   cv1.signal_class,
-            # Grade labels
-            "CV1_LS_Grade":      cv1.leadership_grade,
-            "CV1_CV_Grade":      cv1.conviction_grade,
-            "CV1_EQ_Grade":      cv1.entry_quality_grade,
-            # Leadership sub-scores
-            "_cv1_ls_rs":        cv1.ls_rs_composite,
-            "_cv1_ls_age":       cv1.ls_trend_age,
-            "_cv1_ls_adx":       cv1.ls_adx,
-            "_cv1_ls_ps":        cv1.ls_persistent_strength,
-            "_cv1_ls_slope":     cv1.ls_ema20_slope,
-            # Conviction sub-scores
-            "_cv1_cv_structure": cv1.cv_trend_structure,
-            "_cv1_cv_fib":       cv1.cv_fib_zone,
-            "_cv1_cv_cci":       cv1.cv_cci_recovery,
-            "_cv1_cv_volume":    cv1.cv_volume,
-            "_cv1_cv_squeeze":   cv1.cv_squeeze,
-            # Entry Quality sub-scores
-            "_cv1_eq_ema20":     cv1.eq_ema20_dist,
-            "_cv1_eq_ema50":     cv1.eq_ema50_dist,
-            "_cv1_eq_pivot":     cv1.eq_pivot_dist,
-            "_cv1_eq_move":      cv1.eq_move_since_setup,
-            "_cv1_eq_bars":      cv1.eq_bars_since_setup,
-        })
+        if cv1 is None:
+            raise RuntimeError("CV1 unavailable — cannot classify Recommendation")
 
-        # ── ELITE PROMOTION (Stoch Confluence + defended LL spring) ────
-        # Lift EXECUTE or WATCH straight to ELITE when both stricter
-        # structural confirmations fire together:
-        #   Stoch_Confluence — stochastic reignition that also lines up
-        #                      with a VWAP touch/reclaim (stricter than
-        #                      plain Stoch_Reignition)
-        #   LL_Actionable + LL_Defended — a confirmed Lower-Low spring
-        #                      that has never been re-broken since
-        # SKIP is never promoted — these signals accelerate an
-        # already-qualifying setup, they don't fix a structural failure.
-        _cv1_class_raw    = cv1.signal_class                 # pre-promotion, for diagnostics
-        _cv1_promo_signal = bool(r.stoch_confluence) and bool(r.ll_actionable) and bool(r.ll_defended)
-        _cv1_promoted     = _cv1_promo_signal and _cv1_class_raw in ("EXECUTE", "WATCH")
-        _cv1_class_final  = "ELITE" if _cv1_promoted else _cv1_class_raw
+        from utils.conviction_score_v1 import classify_tier
+        from utils.promotion_engine import evaluate_promotion
 
-        result["CV1_SignalClass"]             = _cv1_class_final
-        result["CV1_SignalClassRaw"]          = _cv1_class_raw
-        result["CV1_Promoted"]                = _cv1_promoted
-        result["_cv1_promo_stoch_confluence"] = bool(r.stoch_confluence)
-        result["_cv1_promo_ll_actionable"]    = bool(r.ll_actionable)
-        result["_cv1_promo_ll_defended"]      = bool(r.ll_defended)
+        base_tier = classify_tier(cv1.leadership, cv1.conviction, cv1.entry_quality)
 
-        # Promoted stocks also move into the Elite tab/bucket, which is
-        # driven by the separate Decision Engine's Recommendation field —
-        # otherwise CV1_SignalClass would say ELITE but the row would sit
-        # stranded under whichever Decision-Engine tab it started in.
-        if _cv1_promoted:
-            result["Recommendation_Raw"] = result.get("Recommendation")
-            result["Recommendation"]     = "Elite Opportunity"
+        # ── STRUCTURAL GATE (opt-in — default False for A/B backtesting) ──
+        # Decision Engine computes hard structural failure conditions and
+        # an independent Lifecycle read (which factors in its own fuller
+        # Extension model — volume-climax discount, breakout-elite path —
+        # not just CV1's blunter EQ-embedded extension penalty). When
+        # enabled, honor those before Promotion Engine evaluates timing:
+        #   - hard_stop / t4_hard_stop  → structural failure, force Skip
+        #   - Lifecycle == EXTENDED     → chase risk Decision Engine caught
+        #                                 that CV1's EQ cap didn't fully
+        #                                 capture → downgrade, don't promote
+        #   - Lifecycle == AVOID        → Decision Engine's own composite
+        #                                 disagrees this is viable at all
+        # This only ever downgrades base_tier; it can never upgrade one.
+        # Flag: settings["ENABLE_STRUCTURAL_GATE"] (default False). Run the
+        # backtest with it on vs off before flipping the default — this
+        # changes which setups reach Execute/Elite, so it needs its own
+        # pass through the existing 1,732-trade validation set first.
+        _gate_reason = ""
+        _structural_gate_on = bool((settings or {}).get("ENABLE_STRUCTURAL_GATE", False))
+        if _structural_gate_on and base_tier == "Actionable":
+            if getattr(r, "t4_hard_stop", False) or getattr(r, "hard_stop", False):
+                base_tier = "Skip"
+                _gate_reason = "hard_stop"
+            elif ds is not None and ds.lifecycle == "AVOID":
+                base_tier = "Watch"
+                _gate_reason = "lifecycle=AVOID"
+            elif ds is not None and ds.lifecycle == "EXTENDED":
+                base_tier = "Watch"
+                _gate_reason = "lifecycle=EXTENDED"
 
-        # ── CV1 ACTION GATE ───────────────────────────────────────
+        promo = evaluate_promotion(r, base_tier, ia=ia, settings=settings or {})
+        final_tier = promo.tier if (promo.applicable and promo.promoted) else base_tier
+        result["_structural_gate_blocked"] = _gate_reason
+        result["_structural_gate_on"] = _structural_gate_on
+
+        result["CV1_SignalClass"]    = cv1.signal_class   # legacy CV1-only label, kept for reference
+        result["Tier"]               = base_tier           # pre-promotion CV1 tier
+        result["Recommendation"]     = final_tier           # Skip|Watch|Developing|Actionable|Execute|Elite
+        result["Promoted"]           = bool(promo.applicable and promo.promoted)
+        result["PromoScore"]         = promo.promo_score
+        result["PromoRR"]            = promo.risk_reward
+        result["Promo_StochUp"]      = promo.stoch_up
+        result["Promo_LLConfirmed"]  = promo.ll_confirmed
+        result["Promo_VWAPReversal"] = promo.vwap_reversal
+        result["Promo_Institutional"]= promo.institutional
+        result["_promo_reasons"]     = "|".join(promo.reasons) if promo.reasons else ""
+        result["_promo_blocked"]     = "|".join(promo.blocked) if promo.blocked else ""
+
+        # ── ACTION GATE ─────────────────────────────────────────────
         # The original Action column (✅ BUY / 👁 WATCH / ⛔ SKIP) was
         # assigned purely from norm_score in compute_bar(), with zero
-        # reference to the Conviction pipeline.  This caused BUY signals
-        # with avg Conviction ≈ 22 (audit finding: lines 523-553 of report).
-        #
-        # Fix: after CV1 is computed we reconcile Action with CV1_SignalClass.
-        # Rule: BUY is only kept when CV1 agrees (ELITE or EXECUTE).
-        #       If CV1 downgrades, we floor Action to the CV1-implied level
-        #       but never *upgrade* beyond what norm_score already decided.
-        #
-        #   CV1=ELITE   → keep/upgrade to BUY  (highest conviction)
-        #   CV1=EXECUTE → keep/upgrade to BUY  (actionable)
-        #   CV1=WATCH   → cap at WATCH          (insufficient conviction for BUY)
-        #   CV1=SKIP    → cap at SKIP           (structural failure)
-        #
-        # The original Action from norm_score is preserved as _action_raw
-        # so we can measure disagreement rate in diagnostics.
+        # reference to CV1. Reconcile Action with the final Recommendation
+        # tier so the two never disagree.
+        #   Actionable / Execute / Elite → keep/upgrade to BUY
+        #   Developing / Watch           → cap at WATCH
+        #   Skip                         → cap at SKIP
         _action_raw = result.get("Action", r.action)
         result["_action_raw"] = _action_raw          # for diagnostics
-        sc = _cv1_class_final                         # ELITE | EXECUTE | WATCH | SKIP (post-promotion)
 
-        if sc in ("ELITE", "EXECUTE"):
-            # CV1 approves — honour norm_score decision (BUY/WATCH/SKIP)
-            # but promote WATCH→BUY only if norm_score itself was BUY
+        if final_tier in ("Actionable", "Execute", "Elite"):
             gated_action = _action_raw
-        elif sc == "WATCH":
-            # Cap: BUY becomes WATCH; WATCH/SKIP stay as-is
+        elif final_tier in ("Developing", "Watch"):
             gated_action = "👁 WATCH" if _action_raw == "✅ BUY" else _action_raw
-        else:  # SKIP
-            # Full downgrade: BUY/WATCH both become SKIP
+        else:  # Skip
             gated_action = "⛔ SKIP" if _action_raw in ("✅ BUY", "👁 WATCH") else _action_raw
 
         result["Action"] = gated_action

@@ -335,12 +335,17 @@ class BarResult:
     ll_actionable:      bool  = False   # defended Lower-Low spring, reclaimed
     ll_defended:        bool  = False   # LL price never re-broken since
     ll_distance_atr:    float = 0.0     # close vs LL price, in ATR units
+    ll_bars_since_reclaim: int = -1     # bars since the reclaim happened; -1 = unknown/not reclaimed
     ll_price:           float = 0.0
     ll_bonus_pts:        int   = 0       # 0..params.ll_bonus_max
     stoch_k:            float = 0.0
     stoch_d:             float = 0.0
     stoch_reignition:      bool  = False   # fresh %K/%D cross-up or cross out of oversold
+    stoch_bars_since_reignition: int = -1  # bars since qualifying reignition; -1 = none found within lookback
     stoch_confluence:        bool  = False   # stoch cross lines up with a VWAP touch/reclaim
+    stoch_vwap_touch:          bool  = False   # price touched VWAP intraday (pre-reversal)
+    stoch_vwap_reclaim:          bool  = False   # price closed back above VWAP after the touch
+    stoch_vwap_bars_since_touch:  int   = -1     # bars since the VWAP touch; -1 = unknown/no touch found
     stoch_bonus_pts:           int   = 0       # 0..params.stoch_bonus_max
     opportunity_bonus_pts:       int   = 0       # ll_bonus_pts + stoch_bonus_pts, already applied to norm_score
 
@@ -1300,9 +1305,13 @@ def compute_bar(
     #          the (wrong, shared) gate demand 40 bars.
     ll_actionable = ll_defended = False
     ll_distance_atr = ll_price_v = 0.0
+    ll_bars_since_reclaim = -1
     ll_bonus = 0
     stoch_k_v = stoch_d_v = 0.0
     stoch_reignition = stoch_confluence = False
+    stoch_bars_since_reignition = -1
+    stoch_vwap_touch = stoch_vwap_reclaim = False
+    stoch_vwap_bars_since_touch = -1
     stoch_bonus = 0
 
     _ll_min_bars    = 2 * params.pvt_lb + 1   # first bar a pivot can structurally exist
@@ -1324,6 +1333,7 @@ def compute_bar(
                 ll_actionable   = _ll_sig.actionable_ll
                 ll_defended     = _ll_sig.ll_defended
                 ll_distance_atr = _ll_sig.distance_atr
+                ll_bars_since_reclaim = _ll_sig.bars_since_reclaim
                 ll_price_v      = _ll_sig.ll_price
                 ll_bonus        = _ll_sig.bonus_pts
             except Exception:
@@ -1340,7 +1350,12 @@ def compute_bar(
                 stoch_k_v        = _stoch_sig.stoch_k
                 stoch_d_v        = _stoch_sig.stoch_d
                 stoch_reignition = _stoch_sig.reignition
+                stoch_bars_since_reignition = _stoch_sig.bars_since_reignition
                 stoch_confluence = _stoch_sig.confluence
+                stoch_vwap_touch    = _stoch_sig.vwap_touch_found
+                stoch_vwap_reclaim  = _stoch_sig.returned_above_vwap
+                if _stoch_sig.touch_bar is not None and _stoch_sig.touch_bar >= 0:
+                    stoch_vwap_bars_since_touch = i - _stoch_sig.touch_bar   # _sl = slice(0, i+1) → last idx = i
                 stoch_bonus      = _stoch_sig.bonus_pts
             except Exception:
                 pass
@@ -1730,12 +1745,17 @@ def compute_bar(
         ll_actionable          = ll_actionable,
         ll_defended            = ll_defended,
         ll_distance_atr        = round(ll_distance_atr, 2),
+        ll_bars_since_reclaim  = ll_bars_since_reclaim,
         ll_price                = ll_price_v,
         ll_bonus_pts             = ll_bonus,
         stoch_k                   = stoch_k_v,
         stoch_d                    = stoch_d_v,
         stoch_reignition             = stoch_reignition,
+        stoch_bars_since_reignition  = stoch_bars_since_reignition,
         stoch_confluence               = stoch_confluence,
+        stoch_vwap_touch                = stoch_vwap_touch,
+        stoch_vwap_reclaim                = stoch_vwap_reclaim,
+        stoch_vwap_bars_since_touch          = stoch_vwap_bars_since_touch,
         stoch_bonus_pts                  = stoch_bonus,
         opportunity_bonus_pts              = opportunity_bonus,
         cur_cci    = cur_cci,
