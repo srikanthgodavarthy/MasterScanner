@@ -1588,8 +1588,9 @@ def _summary_cards(df: pd.DataFrame) -> str:
         return 0
 
     # [Scanner Refactor] CV1 is the single source of truth for setup quality —
-    # these headline cards used to average the legacy Decision Engine scores
-    # (DE_Leadership/DE_Conviction/DE_EntryQuality), which could paint a
+    # these headline cards used to average the legacy scoring formula
+    # (Legacy_Leadership/Legacy_Conviction/Legacy_EntryQuality, née
+    # DE_Leadership/DE_Conviction/DE_EntryQuality), which could paint a
     # different quality picture than the CV1 + Promotion Engine numbers
     # actually driving the Recommendation column below. Extension still
     # comes from the Decision Engine since that's a distinct concern (has
@@ -1655,9 +1656,9 @@ _RENAME_MAP_FULL = {
     "TrendFresh":      "Fresh%",
     "FreshBase":       "Base🔥",
     "RR":              "R:R",
-    "DE_Leadership":   "Leadership_DE",
-    "DE_Conviction":   "Conviction_DE",
-    "DE_EntryQuality": "EntryQuality_DE",
+    "Legacy_Leadership":   "Leadership_Legacy",
+    "Legacy_Conviction":   "Conviction_Legacy",
+    "Legacy_EntryQuality": "EntryQuality_Legacy",
     "LTP":             "CMP",          # last traded price from scanner → display as CMP
     # Setup persistence display columns
     "SetupAge":        "Setup Age",
@@ -2569,8 +2570,9 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
         tier   = r.get("Recommendation") or r.get("Tier") or "—"
         boosts = r.get("_fib_pb_boosts") or []
         # [Scanner Refactor] CV1 is the single source of truth for setup
-        # quality — this tab used to read the legacy Decision Engine scores
-        # (DE_Leadership/DE_Conviction/DE_EntryQuality), which could disagree
+        # quality — this tab used to read the legacy scoring formula
+        # (Legacy_Leadership/Legacy_Conviction/Legacy_EntryQuality, née
+        # DE_Leadership/DE_Conviction/DE_EntryQuality), which could disagree
         # with the Recommendation/Tier shown in the same row (that's computed
         # from CV1 + the Promotion Engine). Reading CV1_* here keeps this tab
         # consistent with the rest of the app — one scoring system everywhere.
