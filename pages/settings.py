@@ -59,6 +59,13 @@ DEFAULTS = {
     # to the Conviction pattern slot. Targets stocks stuck at pat=8 purely because no
     # other pattern condition fires despite a clean, controlled Fib pullback.
     "ENABLE_GOLDEN_PULLBACK_PATTERN": False,
+    # [A/B flag — pending backtest before default-on]
+    # Gates Promotion Engine on Decision Engine's structural read: forces
+    # Skip on hard_stop/t4_hard_stop, downgrades Actionable→Watch when
+    # Lifecycle == EXTENDED or AVOID. See utils/scanner_engine.py recommendation
+    # funnel comment block for full rationale. Off by default — run the
+    # 1,732-trade backtest with this on vs off before flipping the default.
+    "ENABLE_STRUCTURAL_GATE": False,
     # ── Institutional Continuation (VWAP Reclaim) ──────────────────
     "ic_enable_vwap_reclaim":    True,
     "ic_enable_vwap_stoch_conf": True,
@@ -463,6 +470,23 @@ def _tab_advanced() -> None:
             ),
         )
         _s("ENABLE_GOLDEN_PULLBACK_PATTERN", bool(gp_en))
+
+        sg_en = st.toggle(
+            "🧪 Structural gate — Decision Engine checkpoint (experimental)",
+            value=_g("ENABLE_STRUCTURAL_GATE"), key="tog_structural_gate",
+            help=(
+                "Before Promotion Engine evaluates timing on an Actionable setup, "
+                "checks Decision Engine's structural read: forces Skip on a hard "
+                "stop (t4_hard_stop/hard_stop), and downgrades to Watch when "
+                "Lifecycle == EXTENDED or AVOID — catching chase-risk and "
+                "structural-failure cases CV1's own EQ cap doesn't fully cover. "
+                "Only ever downgrades, never upgrades, a tier. "
+                "Off by default — run the 1,732-trade backtest with this on vs "
+                "off before enabling for live scans, since it changes which "
+                "setups reach Execute/Elite."
+            ),
+        )
+        _s("ENABLE_STRUCTURAL_GATE", bool(sg_en))
 
         ps1, ps2 = st.columns(2)
         with ps1:
