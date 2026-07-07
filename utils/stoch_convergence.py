@@ -37,7 +37,7 @@ STOCH_CONVERGENCE_MAX_BONUS = 10   # points budget (0-10 scale)
 # in an already-extended move. Only count cross-ups below this ceiling as
 # genuine location+momentum re-ignition. Crossing OUT of oversold (<20) has
 # no such ceiling — that's a different, unambiguously-fresh event by nature.
-STOCH_REIGNITION_MAX_LEVEL = 70
+STOCH_REIGNITION_MAX_LEVEL = 40
 
 # How far back to search for the most recent qualifying reignition bar, so
 # staleness can be tracked the same way LL and VWAP signals already are
