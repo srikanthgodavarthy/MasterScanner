@@ -91,7 +91,7 @@ logger = logging.getLogger(__name__)
 # Minimum recommendation/category to mint a NEW trade plan.
 # This is the ONLY point where Recommendation is allowed to touch
 # persistence — it decides whether a plan is born, never how it dies.
-_FREEZE_CATEGORIES = {"Elite Opportunity", "High Conviction", "Actionable"}
+_FREEZE_CATEGORIES = {"Elite", "Execute", "Actionable"}
 
 # A WAITING plan expires if price never reaches the entry zone within
 # N calendar days of creation. Does NOT apply once ACTIVE / T1_HIT —
@@ -613,30 +613,23 @@ def enrich_scanner_row(
     #      live recommendation now qualifies. This is the one place
     #      Recommendation is allowed to act — it can only *create*,
     #      never modify or close, a plan. ─────────────────────────
-    # [FIX v9.1] Recommendation/Category ("Actionable", "High Conviction", ...)
-    # is derived from Leadership/Conviction/EntryQuality/Extension only — it
-    # can read "Actionable" even when the underlying buy signal never fired
-    # (Action/CV1_SignalClass == SKIP, _any_buy == False). Confirmed against
-    # a live scan where 4/4 "Actionable"-category stocks had _any_buy=False
-    # and got frozen WAITING plans with a misleading "Fresh (0d)" badge.
-    # Require an actual fired signal, not just the category label, before
-    # minting a plan.
-    has_signal = bool(scanner_row.get("_any_buy", False))
+    # [Scanner Refactor 2026-07] Setup Plan creation no longer waits for
+    # _any_buy. Per the new lifecycle:
+    #     Watch → Developing → Actionable → Create Setup Plan →
+    #     Execute/Elite → Waiting for Trigger → Buy Trigger (_any_buy) →
+    #     Trade Open → Trade Closed
+    # The plan is minted the moment CV1 + Promotion Engine says Actionable
+    # (or better). The buy trigger's only job from here is to advance an
+    # existing plan's lifecycle state (WAITING → ACTIVE, in advance_lifecycle
+    # above) — it no longer gates whether the plan gets created at all.
     should_create = (
         recommendation in _FREEZE_CATEGORIES
-        and has_signal
         and (plan is None or plan.is_terminal())
     )
     if not should_create:
         if recommendation not in _FREEZE_CATEGORIES:
             logger.info(
                 "[SETUP PLAN SKIPPED] symbol=%s recommendation=%s reason=recommendation_not_qualifying",
-                symbol, recommendation,
-            )
-        elif not has_signal:
-            logger.info(
-                "[SETUP PLAN SKIPPED] symbol=%s recommendation=%s reason=no_any_buy_signal "
-                "(category qualified but underlying buy condition never fired)",
                 symbol, recommendation,
             )
         elif plan is not None and plan.is_open():
