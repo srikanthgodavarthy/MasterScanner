@@ -45,7 +45,7 @@ from utils.supabase_client import save_scan_snapshot, load_watchlist, add_to_wat
 # Quality Bonus + Promotion Engine). It reads the FP_*/_fp_* columns that
 # utils/scanner_engine.py already attaches to every scanned row, so no new
 # computation is needed here — this is purely reusing the existing display layer.
-from pages.five_pillars import _detail_breakdown as _fp_detail_breakdown
+
 
 try:
     from fib_tab import render_fib_tab as _render_fib_tab
@@ -60,12 +60,14 @@ REGIME_COLORS = {
     "VOLATILE": ("#f85149", "#0d1117", "#2d0a0a"),
 }
 
-_SC_ORDER = ["ELITE", "EXECUTE", "WATCH", "SKIP"]
+_SC_ORDER = ["ELITE", "EXECUTE", "ACTIONABLE", "DEVELOPING", "WATCH", "SKIP"]
 _SC_STYLE = {
-    "ELITE":   ("#f5c542", "ELITE"),
-    "EXECUTE": ("#3fb950", "EXECUTE"),
-    "WATCH":   ("#d29922", "WATCH"),
-    "SKIP":    ("#484f58", "SKIP"),
+    "ELITE":      ("#f5c542", "ELITE"),
+    "EXECUTE":    ("#3fb950", "EXECUTE"),
+    "ACTIONABLE": ("#58a6ff", "ACTIONABLE"),
+    "DEVELOPING": ("#d29922", "DEVELOPING"),
+    "WATCH":      ("#8b949e", "WATCH"),
+    "SKIP":       ("#484f58", "SKIP"),
 }
 
 _CAT_ORDER = [
@@ -1334,22 +1336,15 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     data_rows = ""
     for i, (_, row) in enumerate(df.iterrows()):
         stock = str(row.get("Stock", row.get("Symbol", "?")))
-        # This table's sub-factor bars are pure CV1 (conviction_score_v1.py),
-        # so the Class badge shown alongside them must also be CV1_SignalClass
-        # (post Elite-promotion) — not Recommendation, which is the separate
-        # Decision Engine's label and uses a different vocabulary entirely.
-        sc    = str(row.get("CV1_SignalClass", row.get("Recommendation", "WATCH")))
-        # NOTE: this table's sub-factor bars (below) are the CV1 pillar-engine
-        # breakdown (conviction_score_v1.py), so the frozen L/C/EQ totals MUST
-        # read the CV1_* columns to stay consistent with those bars — reading
-        # the DE_* columns instead pulls the Decision Engine's numbers (a
-        # different scoring system), which don't sum to the bars shown and
-        # silently disagree with the main results table (which displays
-        # CV1_Leadership under the "Leadership" header).
-        ls    = int(row.get("CV1_Leadership",   row.get("DE_Leadership",   0)))
-        cv    = int(row.get("CV1_Conviction",   row.get("DE_Conviction",   0)))
-        eq    = int(row.get("CV1_EntryQuality", row.get("DE_EntryQuality", 0)))
-        sc_c, _ = _SC_STYLE.get(sc, ("#484f58", sc))
+        # This table's sub-factor bars are pure CV1 (conviction_score_v1.py).
+        # The Class badge shown alongside them uses the final Recommendation
+        # (CV1 tier + Promotion Engine) — the one and only recommendation
+        # shown anywhere on the Scanner page.
+        sc    = str(row.get("Recommendation", row.get("CV1_SignalClass", "Watch")))
+        ls    = int(row.get("CV1_Leadership",   0))
+        cv    = int(row.get("CV1_Conviction",   0))
+        eq    = int(row.get("CV1_EntryQuality", 0))
+        sc_c, _ = _SC_STYLE.get(sc.upper(), ("#484f58", sc))
         row_bg = "#0d1117" if i % 2 == 0 else "#111820"
 
         data_rows += f'<tr style="background:{row_bg}">'
@@ -1432,6 +1427,76 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
   </div>
 </div>
 """
+
+
+def _promotion_signals_table(df: pd.DataFrame) -> str:
+    """
+    Lightweight Promotion Engine signal strip — one row per stock, shown
+    directly alongside the scanner results (not a separate scoring page).
+
+    Only meaningful for Actionable/Execute/Elite rows — the Promotion
+    Engine never runs on Watch/Developing/Skip, so those rows are skipped.
+    """
+    if df.empty or "PromoScore" not in df.columns:
+        return ""
+
+    _elig = df[df.get("Recommendation", "").isin(["Actionable", "Execute", "Elite"])]
+    if _elig.empty:
+        return ""
+
+    def _badge(ok: bool, label: str) -> str:
+        color = "#3fb950" if ok else "#484f58"
+        icon  = "✅" if ok else "▫️"
+        return (
+            f'<span style="display:inline-flex;align-items:center;gap:4px;'
+            f'font-size:10px;color:{color};margin-right:12px;">{icon} {label}</span>'
+        )
+
+    rows_html = ""
+    for _, row in _elig.iterrows():
+        stock   = str(row.get("Stock", ""))
+        rec     = str(row.get("Recommendation", ""))
+        score   = int(row.get("PromoScore", 0) or 0)
+        rr      = float(row.get("PromoRR", 0) or 0)
+        promoted= bool(row.get("Promoted", False))
+        rec_color = {"Elite": "#ffd700", "Execute": "#22c55e"}.get(rec, "#58a6ff")
+
+        score_color = "#3fb950" if score >= 75 else ("#d29922" if score >= 50 else "#8b949e")
+
+        badges = (
+            _badge(bool(row.get("Promo_StochUp", False)),       "Stoch Up") +
+            _badge(bool(row.get("Promo_LLConfirmed", False)),   "LL Confirmed") +
+            _badge(bool(row.get("Promo_VWAPReversal", False)),  "VWAP Reversal") +
+            _badge(bool(row.get("Promo_Institutional", False)), "Institutional")
+        )
+
+        reasons = str(row.get("_promo_reasons", "") or "")
+        blocked = str(row.get("_promo_blocked", "") or "")
+        note = reasons.replace("|", " · ") if promoted else blocked.replace("|", " · ")
+
+        rows_html += (
+            '<div style="display:flex;align-items:center;gap:10px;padding:7px 4px;'
+            'border-bottom:1px solid rgba(255,255,255,0.06);flex-wrap:wrap;">'
+            f'<span style="font-size:11px;font-weight:700;color:#e6edf3;width:90px;">{stock}</span>'
+            f'<span style="font-size:9px;font-weight:700;color:{rec_color};'
+            f'text-transform:uppercase;width:70px;">{rec}</span>'
+            f'<span style="font-size:10px;color:{score_color};font-weight:700;width:70px;">'
+            f'Promo {score}/100</span>'
+            f'<span style="font-size:10px;color:#8b949e;width:60px;">R:R {rr:.1f}</span>'
+            f'{badges}'
+            f'<span style="font-size:9px;color:#8b949e;flex:1;min-width:160px;">{note}</span>'
+            '</div>'
+        )
+
+    return (
+        '<div style="background:#161b22;border:1px solid rgba(255,255,255,0.08);'
+        'border-radius:8px;padding:10px 12px;">'
+        '<div style="font-size:9px;font-weight:700;color:#8b949e;letter-spacing:0.08em;'
+        'text-transform:uppercase;margin-bottom:6px;">'
+        '🚀 Promotion Engine — timing signals (Actionable setups only)</div>'
+        f'{rows_html}'
+        '</div>'
+    )
 
 
 def _market_status_row(summary: dict, scan_time: str,
@@ -1591,6 +1656,12 @@ _RENAME_MAP_FULL = {
     "SetupAge":        "Setup Age",
     "TradePlanStatus": "Plan Status",
     "EntryDriftPct":   "Drift%",
+    # Promotion Engine — inline scanner indicators
+    "Promo_StochUp":       "Stoch↑",
+    "Promo_LLConfirmed":   "LL✓",
+    "Promo_VWAPReversal":  "VWAP↺",
+    "Promo_Institutional": "Inst✓",
+    "PromoScore":          "Promo Score",
 }
 
 _RENAME_PRIMARY = {
@@ -1612,11 +1683,12 @@ _DETAIL_EXTRA = [
     "Conv Gap", "Conv Profile",
 ]
 
-# Primary column order for HTML table (v10: persistence fields added)
+# Primary column order for HTML table (Scanner Refactor: CV1 + Promotion Engine)
 _PRIMARY_ORDERED = [
-    "Stock", "Setup Age", "Plan Status", "Signal Class", "Category", "Primary Blocker",
-    "Leadership", "Conviction",
-    "Entry Quality", "Extension", "CMP", "%Chg", "Entry", "SL", "T1", "R:R", "Drift%", "Size%",
+    "Stock", "Setup Age", "Plan Status", "Recommendation", "Primary Blocker",
+    "Leadership", "Conviction", "Entry Quality",
+    "Stoch↑", "LL✓", "VWAP↺", "Inst✓", "Promo Score",
+    "Extension", "CMP", "%Chg", "Entry", "SL", "T1", "R:R", "Drift%", "Size%",
 ]
 
 
@@ -1705,6 +1777,24 @@ def _rr_cell(val) -> str:
     return f'<td class="col-num" style="color:{color};{weight}">{v:.1f}</td>'
 
 
+def _promo_signal_cell(val) -> str:
+    """Compact ✓/· indicator for a single Promotion Engine timing signal."""
+    ok = bool(val) if not isinstance(val, str) else val.strip().lower() in ("true", "1", "yes")
+    if ok:
+        return '<td class="col-num" style="color:#3fb950;font-weight:700">✓</td>'
+    return '<td class="col-num" style="color:#484f58">·</td>'
+
+
+def _promo_score_cell(val) -> str:
+    """0-100 Promotion Score — green ≥75 (Elite band), amber ≥50 (Execute band), grey below."""
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return '<td class="col-num" style="color:#484f58">—</td>'
+    color = "#3fb950" if v >= 75 else ("#d29922" if v >= 50 else "#8b949e")
+    return f'<td class="col-num" style="color:{color};font-weight:600">{int(v)}</td>'
+
+
 def _size_cell(val) -> str:
     try:
         v = int(float(val))
@@ -1750,9 +1840,9 @@ def _cmp_cell(val) -> str:
     )
 
 
-def _sc_table_badge(signal_class: str) -> str:
+def _sc_table_badge(signal_class: str, tooltip_key: str = "Signal Class") -> str:
     color, label = _SC_STYLE.get(str(signal_class).strip(), ("#484f58", str(signal_class)))
-    title, body  = _COL_TOOLTIPS.get("Signal Class", ("Signal Class", ""))
+    title, body  = _COL_TOOLTIPS.get(tooltip_key, (tooltip_key, ""))
     return (
         f'<td><span class="tbl-badge" {_tip_attrs(title, body)} '
         f'style="color:{color};background:{color}1a;border:1px solid {color}50">'
@@ -2000,6 +2090,14 @@ def _render_html_table(df: pd.DataFrame) -> str:
                 )
             elif c == "Signal Class":
                 cells += _sc_table_badge(str(val) if val is not None else "")
+            elif c == "Recommendation":
+                cells += _sc_table_badge(str(val).upper() if val is not None else "", tooltip_key="Recommendation")
+            elif c in ("Stoch↑", "LL✓", "VWAP↺", "Inst✓"):
+                rec = str(row.get("Recommendation", "")).strip().lower()
+                cells += _promo_signal_cell(val) if rec in ("actionable", "execute", "elite") else '<td class="col-num" style="color:#30363d">—</td>'
+            elif c == "Promo Score":
+                rec = str(row.get("Recommendation", "")).strip().lower()
+                cells += _promo_score_cell(val) if rec in ("actionable", "execute", "elite") else '<td class="col-num" style="color:#30363d">—</td>'
             elif c == "Setup Age":
                 cells += f'<td>{_freshness_badge(val)}</td>'
             elif c == "Plan Status":
@@ -2071,310 +2169,11 @@ def _render_html_table(df: pd.DataFrame) -> str:
 
 # ── DETAIL BREAKDOWN PANEL ────────────────────────────────────────
 
-def _breakdown_row_html(label: str, pts: int, max_pts: int, color: str) -> str:
-    pct = int(pts / max_pts * 100) if max_pts > 0 else 0
-    return (
-        f'<div class="breakdown-row">'
-        f'<div class="breakdown-label">{label}</div>'
-        f'<div class="breakdown-bar"><div class="breakdown-fill" style="width:{pct}%;background:{color}"></div></div>'
-        f'<div class="breakdown-val" style="color:{color}">{pts}/{max_pts}</div>'
-        f'</div>'
-    )
 
+# ── (Score/Decision-Engine breakdown panels removed — Scanner Refactor.
+#    CV1 sub-factor detail lives in _perstock_breakdown_table(), always
+#    visible; Promotion Engine reasons live in _promotion_signals_table().)
 
-def _detail_breakdown_panel(row: pd.Series) -> str:
-    # This panel is CV1's own breakdown, so its headline badge should read
-    # CV1_SignalClass (post-promotion) — not the Decision Engine's
-    # Recommendation field, which is a different engine's label entirely
-    # and uses a different string vocabulary ("Elite Opportunity" vs "ELITE").
-    sc  = str(row.get("CV1_SignalClass", row.get("Signal Class", "WATCH")))
-    # Same fix as _perstock_breakdown_table: these headline totals must be the
-    # CV1 pillar totals since ls_factors/cv_factors/eq_factors below are CV1
-    # sub-factors — reading "Leadership"/"Conviction"/"EntryQuality" instead
-    # pulls the Decision Engine's numbers and won't sum to the rows shown.
-    # (The DE numbers are shown separately, correctly, in the divergence
-    # panel further below via DE_Leadership/DE_Conviction.)
-    ls  = int(row.get("CV1_Leadership",   row.get("Leadership",   0)))
-    cv  = int(row.get("CV1_Conviction",   row.get("Conviction",   0)))
-    eq  = int(row.get("CV1_EntryQuality", row.get("EntryQuality", 0)))
-
-    ls_factors = [
-        ("_cv1_ls_rs",    "RS Composite (multi-TF)",          30, "#a371f7"),
-        ("_cv1_ls_age",   "Trend Age (21–50 bar sweet-spot)",  25, "#a371f7"),
-        ("_cv1_ls_adx",   "ADX Strength (≥40 tier)",           20, "#a371f7"),
-        ("_cv1_ls_ps",    "Persistent Strength",               15, "#a371f7"),
-        ("_cv1_ls_slope", "EMA20 Slope (5-bar velocity)",      10, "#a371f7"),
-    ]
-    cv_factors = [
-        ("_cv1_cv_structure", "Trend Structure (EMA + Cloud)", 30, "#3fb950"),
-        ("_cv1_cv_fib",       "Fibonacci Pullback Zone",        25, "#3fb950"),
-        ("_cv1_cv_cci",       "CCI Recovery / OS Cross",        25, "#3fb950"),
-        ("_cv1_cv_volume",    "Volume Sponsorship",             15, "#3fb950"),
-        ("_cv1_cv_squeeze",   "Squeeze Release",                 5, "#3fb950"),
-    ]
-    eq_factors = [
-        ("_cv1_eq_ema20", "EMA20 Distance (% above)",    30, "#d29922"),
-        ("_cv1_eq_pivot", "Pivot High Distance",          20, "#d29922"),
-        ("_cv1_eq_move",  "Price Move Since Setup",       20, "#d29922"),
-        ("_cv1_eq_ema50", "EMA50 Distance (structural)", 15, "#d29922"),
-        ("_cv1_eq_bars",  "Bars Since Setup (ATR-band)", 15, "#d29922"),
-    ]
-
-    def _section(title, score, factors, sec_color):
-        rows_html = ""
-        for col, lbl, max_pts, clr in factors:
-            pts = int(row.get(col, 0))
-            rows_html += _breakdown_row_html(lbl, pts, max_pts, clr)
-        return (
-            f'<div style="margin:10px 0;">'
-            f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;">'
-            f'<span style="font-size:9px;font-weight:700;color:{sec_color};letter-spacing:0.1em;'
-            f'text-transform:uppercase">{title}</span>'
-            f'<span style="font-size:20px;font-weight:700;color:{sec_color};'
-            f'font-family:\'JetBrains Mono\',monospace">{score}</span>'
-            f'</div>{rows_html}</div>'
-        )
-
-    html = (
-        f'<div style="background:#161b22;border:1px solid rgba(255,255,255,0.08);'
-        f'border-radius:8px;padding:14px;">'
-        f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">'
-        f'{_sc_badge(sc)}'
-        f'<span style="font-size:10px;color:#8b949e">Conviction Score v1 — sub-score breakdown</span>'
-        f'</div>'
-    )
-
-    # ── Elite Promotion note ────────────────────────────────────
-    # Surfaces *why* a stock is showing ELITE when its raw CV1 leadership/
-    # conviction/entry-quality thresholds alone wouldn't have earned it —
-    # i.e. it was lifted from EXECUTE/WATCH by the Stoch Confluence + LL
-    # spring gate in utils/scanner_engine.py, not by CV1's native formula.
-    if bool(row.get("CV1_Promoted", False)):
-        _raw_cls = str(row.get("CV1_SignalClassRaw", "—"))
-        html += (
-            '<div style="background:rgba(245,197,66,0.08);border:1px solid rgba(245,197,66,0.35);'
-            'border-radius:6px;padding:8px 12px;margin-bottom:10px;">'
-            f'<span style="font-size:10px;font-weight:700;color:#f5c542">🚀 PROMOTED TO ELITE</span> '
-            f'<span style="font-size:10px;color:#8b949e">'
-            f'from {_raw_cls} — Stoch Confluence '
-            f'{"✅" if row.get("_cv1_promo_stoch_confluence") else "❌"} · '
-            f'LL Actionable {"✅" if row.get("_cv1_promo_ll_actionable") else "❌"} · '
-            f'LL Defended {"✅" if row.get("_cv1_promo_ll_defended") else "❌"}</span>'
-            '</div>'
-        )
-
-    html += _section("Leadership",    ls, ls_factors, "#a371f7")
-    html += _section("Conviction",    cv, cv_factors, "#3fb950")
-    html += _section("Entry Quality", eq, eq_factors, "#d29922")
-
-    # ── Decision Engine divergence panel ─────────────────────────
-    # Shows when CV1_SignalClass=EXECUTE but Category=Avoid.
-    # DE uses different factor weights vs CV1 — this panel exposes the gap.
-    de_ls   = int(row.get("DE_Leadership", -1))
-    de_cv   = int(row.get("DE_Conviction", -1))
-    de_stage= str(row.get("DE_Stage", ""))
-    category= str(row.get("Category", ""))
-    if de_ls >= 0:
-        # Highlight divergence: CV1 says EXECUTE/ELITE but DE says Avoid
-        cv1_sc = str(row.get("CV1_SignalClass", ""))
-        divergent = cv1_sc in ("ELITE", "EXECUTE") and category in ("Avoid", "Leader")
-        div_color = "#f85149" if divergent else "#8b949e"
-        div_label = "⚠ DIVERGENCE DETECTED" if divergent else "Decision Engine"
-        # Sub-score breakdown for DE Leadership
-        de_ls_factors = [
-            ("_de_ls_trend",    "Trend Structure (trend_up + EMA align + cloud)", 35, "#58a6ff"),
-            ("_de_ls_rs",       "RS Composite (multi-TF)",                         30, "#58a6ff"),
-            ("_de_ls_momentum", "Momentum (mom3/mom6 % returns)",                  15, "#58a6ff"),
-            ("_de_ls_volume",   "Volume Sponsorship (vol_ratio)",                  10, "#58a6ff"),
-            ("_de_ls_freshness","Trend Freshness (decay curve)",                   10, "#58a6ff"),
-        ]
-        de_rows_html = ""
-        for col, lbl, max_pts, clr in de_ls_factors:
-            pts = int(row.get(col, 0))
-            de_rows_html += _breakdown_row_html(lbl, pts, max_pts, clr)
-
-        html += (
-            f'<div style="margin:10px 0;border-top:1px solid rgba(255,255,255,0.08);padding-top:10px;">'
-            f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
-            f'<span style="font-size:9px;font-weight:700;color:{div_color};letter-spacing:0.1em;'
-            f'text-transform:uppercase">{div_label}</span>'
-            f'</div>'
-            f'<div style="display:flex;gap:16px;margin-bottom:8px;flex-wrap:wrap;">'
-            f'<span style="font-size:10px;color:#8b949e">DE Leadership: '
-            f'<b style="color:{"#f85149" if de_ls < 50 else "#58a6ff"}">{de_ls}</b>'
-            f'{"  ← below 50 → Stage=AVOID" if de_ls < 50 else ""}</span>'
-            f'<span style="font-size:10px;color:#8b949e">DE Conviction: '
-            f'<b style="color:#58a6ff">{de_cv}</b></span>'
-            f'<span style="font-size:10px;color:#8b949e">DE Stage: '
-            f'<b style="color:{"#f85149" if de_stage == "AVOID" else "#3fb950"}">{de_stage}</b></span>'
-            f'<span style="font-size:10px;color:#8b949e">Category: '
-            f'<b style="color:{"#f85149" if category == "Avoid" else "#a78bfa" if category == "Leader" else "#3fb950"}">{category}</b></span>'
-            f'</div>'
-            f'<div style="font-size:9px;color:#8b949e;margin-bottom:6px;">'
-            f'DE Leadership factors (different from CV1 — explains Category vs SignalClass gap):'
-            f'</div>'
-            f'{de_rows_html}'
-            f'</div>'
-        )
-
-    html += '</div>'
-    return html
-
-
-def _de_is_num(v) -> bool:
-    try:
-        f = float(v)
-        return f == f and f not in (float("inf"), float("-inf"))
-    except (TypeError, ValueError):
-        return False
-
-
-def _de_breakdown_panel(row: pd.Series) -> str:
-    """
-    Decision Engine — individual stock breakdown, styled to match the
-    Five Pillars 'Pillar Breakdown' panel (pages/five_pillars.py):
-    header + price/level strip + four dimension tiles (Leadership /
-    Conviction / Entry Quality / Extension) with sub-factor checklists.
-
-    All sub-factor values are read from the DE_* / _ds_* / Extension
-    columns written by utils/scanner_engine.py's Decision Engine block —
-    no new computation happens here, this is a pure display layer.
-    """
-    from utils.decision_engine import CATEGORY_STYLE
-
-    sym      = str(row.get("Stock", "—"))
-    category = str(row.get("Recommendation", row.get("Category", "Avoid")))
-    style    = CATEGORY_STYLE.get(category, {})
-    cat_color= style.get("color", "#484f58")
-    cat_desc = style.get("description", "")
-
-    ls  = int(float(row.get("DE_Leadership",   0) or 0))
-    cv  = int(float(row.get("DE_Conviction",   0) or 0))
-    eq  = int(float(row.get("DE_EntryQuality", 0) or 0))
-    ext = int(float(row.get("Extension",       0) or 0))
-    composite = round((ls + cv + eq) / 3)
-    comp_color = _score_color(composite)
-
-    # ── Header ──────────────────────────────────────────────────
-    html = (
-        '<div style="background:#161b22;border:1px solid rgba(255,255,255,0.08);'
-        'border-radius:8px;padding:14px;">'
-        '<div style="margin-bottom:10px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;">'
-        f'<span style="font-size:14px;font-weight:700;color:#e6edf3">{sym}</span>'
-        f'{_cat_badge(category)}'
-        f'<span style="font-size:11px;color:#8b949e">{cat_desc}</span>'
-        f'<span style="margin-left:auto;font-size:20px;font-weight:700;color:{comp_color}">{composite}</span>'
-        '</div>'
-    )
-
-    # ── Price / level strip ─────────────────────────────────────
-    def _sh(label, val, fmt="{}"):
-        try:
-            v = fmt.format(val) if _de_is_num(val) else "—"
-        except (ValueError, TypeError):
-            v = "—"
-        return (
-            f'<span style="font-size:10px;color:#8b949e;margin-right:14px;white-space:nowrap">'
-            f'{label} <b style="color:#e6edf3">{v}</b></span>'
-        )
-
-    chg = row.get("%Chg")
-    chg_color = "#3fb950" if _de_is_num(chg) and float(chg) >= 0 else "#f85149"
-    chg_disp  = f"{float(chg):+.2f}%" if _de_is_num(chg) else "—"
-
-    html += (
-        '<div style="display:flex;flex-wrap:wrap;gap:4px 0;padding:8px 0;'
-        'border-top:1px solid rgba(255,255,255,0.06);border-bottom:1px solid rgba(255,255,255,0.06);margin-bottom:12px;">'
-        + _sh("LTP", row.get("LTP", row.get("Entry")), "₹{:.2f}")
-        + f'<span style="font-size:10px;color:#8b949e;margin-right:14px">Chg% '
-          f'<b style="color:{chg_color}">{chg_disp}</b></span>'
-        + _sh("RSI",        row.get("_rsi"), "{:.1f}")
-        + _sh("SL",         row.get("SL"),   "₹{:.2f}")
-        + _sh("T1",         row.get("T1"),   "₹{:.2f}")
-        + _sh("T2",         row.get("T2"),   "₹{:.2f}")
-        + _sh("EMA20 Dist", row.get("EMA20Dist"), "{:.1f}%")
-        + _sh("EMA50 Dist", row.get("EMA50Dist"), "{:.1f}%")
-        + _sh("Pivot Dist", row.get("PivotDist"), "{:.1f}%")
-        + _sh("R:R",        row.get("RR"),   "{:.2f}")
-        + _sh("Bars Since", row.get("BarsSince"), "{:.0f}")
-        + f'<span style="font-size:10px;color:#8b949e">({row.get("BarsBand","—")})</span>'
-        + '</div>'
-    )
-
-    # ── Dimension tiles ─────────────────────────────────────────
-    def _ck(flag) -> str:
-        return "✅" if bool(flag) else "❌"
-
-    def _tile(name, score, max_pts, color, lines) -> str:
-        lines_html = "".join(
-            f'<div style="font-size:10px;color:#8b949e;margin-top:4px;line-height:1.5">{l}</div>'
-            for l in lines
-        )
-        return (
-            '<div style="flex:1;min-width:190px;background:#0d1117;'
-            'border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:10px 12px;">'
-            '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px;">'
-            f'<span style="font-size:10px;font-weight:700;color:{color};letter-spacing:0.06em;'
-            f'text-transform:uppercase">{name}</span>'
-            f'<span style="font-size:18px;font-weight:700;color:{color}">{score}'
-            f'<span style="font-size:9px;color:#8b949e">/{max_pts}</span></span>'
-            f'</div>{lines_html}</div>'
-        )
-
-    ls_c, cv_c, eq_c = _score_color(ls), _score_color(cv), _score_color(eq)
-    ext_c = _score_color(ext, invert=True)
-
-    html += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">'
-    html += _tile("1 · Leadership", ls, 100, ls_c, [
-        f"Trend {_ck(row.get('_trend_up'))} · EMA align {_ck(row.get('_ema_alignment'))} · "
-        f"cloud {_ck(row.get('_above_cloud'))} — <b>{int(row.get('_ds_ls_trend', 0) or 0)}/35</b>",
-        f"RS Composite <b>{row.get('RScomp', '—')}%</b> — <b>{int(row.get('_ds_ls_rs', 0) or 0)}/30</b>",
-        f"Momentum (3M/6M) — <b>{int(row.get('_ds_ls_momentum', 0) or 0)}/15</b>",
-        f"Volume Sponsorship — <b>{int(row.get('_ds_ls_volume', 0) or 0)}/10</b>",
-        f"Trend Freshness — <b>{int(row.get('_ds_ls_freshness', 0) or 0)}/10</b>",
-    ])
-    html += _tile("2 · Conviction", cv, 100, cv_c, [
-        f"Pattern: base {_ck(row.get('FreshBase'))} · compression {_ck(row.get('_compression_break'))} · "
-        f"CCI recovery {_ck(row.get('_recent_cci_rec'))} — <b>{int(row.get('_ds_cv_pattern', 0) or 0)}/35</b>",
-        f"Fibonacci Quality (golden zone {_ck(row.get('_in_golden'))}) — "
-        f"<b>{int(row.get('_ds_cv_fib', 0) or 0)}/20</b>",
-        f"Compression (squeeze {_ck(row.get('_squeeze_on'))} / release {_ck(row.get('_squeeze_release'))}) — "
-        f"<b>{int(row.get('_ds_cv_compression', 0) or 0)}/25</b>",
-        f"RS Leadership (top decile {_ck(row.get('RS_Top10'))}) — "
-        f"<b>{int(row.get('_ds_cv_rs_lead', 0) or 0)}/20</b>",
-    ])
-    html += _tile("3 · Entry Quality", eq, 100, eq_c, [
-        f"EMA20 Distance <b>{row.get('EMA20Dist', '—')}%</b> — "
-        f"<b>{int(row.get('_ds_eq_ema20_dist', 0) or 0)}/40</b>",
-        f"EMA50 Distance <b>{row.get('EMA50Dist', '—')}%</b> — "
-        f"<b>{int(row.get('_ds_eq_ema50_dist', 0) or 0)}/25</b>",
-        f"Pivot Distance <b>{row.get('PivotDist', '—')}%</b> — "
-        f"<b>{int(row.get('_ds_eq_pivot_dist', 0) or 0)}/20</b>",
-        f"Bars Since Setup <b>{row.get('BarsSince', '—')}</b> ({row.get('BarsBand', '—')}) — "
-        f"<b>{int(row.get('_ds_eq_bars_since', 0) or 0)}/15</b>",
-    ])
-    html += _tile("4 · Extension (lower is better)", ext, 100, ext_c, [
-        f"EMA20 Distance — <b>{int(row.get('_ds_ex_ema20_dist', 0) or 0)}/32</b>",
-        f"EMA50 Distance — <b>{int(row.get('_ds_ex_ema50_dist', 0) or 0)}/15</b>",
-        f"Pivot Distance — <b>{int(row.get('_ds_ex_pivot_dist', 0) or 0)}/20</b>",
-        f"Price Move Since Setup <b>{row.get('MoveSince', '—')}%</b> — "
-        f"<b>{int(row.get('_ds_ex_move_since', 0) or 0)}/33</b>",
-    ])
-    html += '</div>'
-
-    # ── Verdict strip (Category action + one-line summary) ──────
-    action = style.get("icon", "") + " " + style.get("action", category)
-    html += (
-        f'<div style="background:#0d1117;border:1px solid rgba(255,255,255,0.08);border-radius:8px;'
-        f'padding:8px 12px;border-left:3px solid {cat_color};">'
-        f'<span style="font-size:11px;font-weight:700;color:{cat_color}">{action}</span>'
-        f'<span style="font-size:10px;color:#8b949e;margin-left:10px;">'
-        f'See the "Why this stock? — Explainability" panel below for the full gate breakdown.</span>'
-        f'</div>'
-    )
-
-    html += '</div>'
-    return html
 
 
 # ── VALIDATION ROW ────────────────────────────────────────────────
@@ -2471,7 +2270,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
 
     open_plans = preloaded_plans if preloaded_plans is not None else load_open_setup_plans()
     if not open_plans:
-        st.info("No open trade plans right now. A plan is minted automatically the first time a stock reaches Elite / High Conviction / Actionable.")
+        st.info("No open trade plans right now. A plan is minted automatically the first time a stock reaches Actionable, Execute, or Elite.")
         return
 
     # Look up today's live price + current recommendation for symbols
@@ -3015,7 +2814,7 @@ def render(settings: dict | None = None):
             key="sort_persistence",
         )
 
-    # ── Split by Signal Class ────────────────────────────────────
+    # ── Split by Recommendation (CV1 tier + Promotion Engine) ──────
     has_cv1 = "Recommendation" in df_aug.columns
 
     def _sc_df(sc):
@@ -3025,20 +2824,25 @@ def render(settings: dict | None = None):
         sort_key = st.session_state.get("sort_persistence", "Leadership ↓")
         if sort_key == "Freshest First 🟢" and "DaysActive" in _base.columns:
             _base = _base.sort_values("DaysActive", ascending=True)
-        else:
-            _base = _base.sort_values("DE_Leadership", ascending=False)
+        elif "CV1_Leadership" in _base.columns:
+            _base = _base.sort_values("CV1_Leadership", ascending=False)
         return _base
 
-    elite_df   = _sc_df("Elite Opportunity")
-    execute_df = _sc_df("Actionable")
-    watch_df   = _sc_df("Setup Building")
+    elite_df      = _sc_df("Elite")
+    execute_df    = _sc_df("Execute")
+    actionable_df = _sc_df("Actionable")
+    developing_df = _sc_df("Developing")
+    watch_df      = _sc_df("Watch")
 
     if not has_cv1:
-        _rec_col   = "Recommendation" if "Recommendation" in df_aug.columns else "Category"
-        has_cat    = _rec_col in df_aug.columns
-        elite_df   = df_aug[df_aug[_rec_col] == "Elite Opportunity"].copy() if has_cat else pd.DataFrame()
-        execute_df = df_aug[df_aug[_rec_col].isin(["High Conviction", "Actionable"])].copy() if has_cat else pd.DataFrame()
-        watch_df   = df_aug[df_aug[_rec_col].isin(["Setup Building", "Leader"])].copy() if has_cat else pd.DataFrame()
+        # Legacy fallback for cached scans predating this refactor.
+        _rec_col   = "Category" if "Category" in df_aug.columns else None
+        has_cat    = _rec_col is not None
+        elite_df      = df_aug[df_aug[_rec_col] == "Elite Opportunity"].copy() if has_cat else pd.DataFrame()
+        execute_df    = pd.DataFrame()
+        actionable_df = df_aug[df_aug[_rec_col].isin(["High Conviction", "Actionable"])].copy() if has_cat else pd.DataFrame()
+        developing_df = df_aug[df_aug[_rec_col] == "Setup Building"].copy() if has_cat else pd.DataFrame()
+        watch_df      = df_aug[df_aug[_rec_col] == "Leader"].copy() if has_cat else pd.DataFrame()
 
     # ── SETUP_FIB_PULLBACK detection ─────────────────────────────────────────────
     # Rules: trend_up AND in_golden AND cci <= -100
@@ -3097,16 +2901,18 @@ def render(settings: dict | None = None):
 
     tab_labels = [
         f"🌟 Elite ({len(elite_df)})",
-        f"⚡ Execute ({len(execute_df)})",
+        f"🚀 Execute ({len(execute_df)})",
+        f"🔷 Actionable ({len(actionable_df)})",
+        f"⚙️ Developing ({len(developing_df)})",
         f"👁 Watch ({len(watch_df)})",
         f"📐 Fib Pullback ({len(fib_pb_records)})",
         f"📋 Active Plans ({len(_open_plans_preview)})",
     ]
-    df_sets  = [elite_df, execute_df, watch_df, fib_pb_df, pd.DataFrame()]
-    set_keys = ["ELITE", "EXECUTE", "WATCH", "FIB_PULLBACK", "ACTIVE_PLANS"]
+    df_sets  = [elite_df, execute_df, actionable_df, developing_df, watch_df, fib_pb_df, pd.DataFrame()]
+    set_keys = ["ELITE", "EXECUTE", "ACTIONABLE", "DEVELOPING", "WATCH", "FIB_PULLBACK", "ACTIVE_PLANS"]
 
     if show_skip:
-        skip_df = _sc_df("Avoid") if has_cv1 else pd.DataFrame()
+        skip_df = _sc_df("Skip") if has_cv1 else pd.DataFrame()
         tab_labels.append(f"⛔ Skip ({len(skip_df)})")
         df_sets.append(skip_df)
         set_keys.append("SKIP")
@@ -3176,16 +2982,23 @@ def render(settings: dict | None = None):
                 with st.expander("🔬 Stock Breakdown Summary", expanded=False):
                     st.markdown(_pills_html, unsafe_allow_html=True)
 
-            # Per-stock breakdown
-            if _show_detail and has_cv1:
-                with st.expander("📊 Score Breakdown — individual stock"):
+            # ── Promotion signals — always visible, lightweight badges ──
+            # This is the ONLY place promotion timing is explained; there is
+            # no separate "Score Breakdown" or "Pillar Breakdown" page.
+            _promo_html = _promotion_signals_table(df_subset)
+            if _promo_html:
+                with st.expander("🚀 Promotion Signals", expanded=False):
+                    st.markdown(_promo_html, unsafe_allow_html=True)
+
+            # Setup Persistence detail (kept — this is trade-lifecycle state,
+            # not a competing scoring system)
+            if _show_detail and "SetupID" in df_subset.columns:
+                with st.expander("🗂️ Setup Persistence — individual stock"):
                     _sel = df_subset["Stock"].tolist()[:10] if "Stock" in df_subset.columns else []
                     _picked = st.selectbox("Select stock", _sel, key=f"breakdown_sel_{sc_key}")
                     if _picked:
                         _row = df_subset[df_subset["Stock"] == _picked].iloc[0]
-                        st.markdown(_detail_breakdown_panel(_row), unsafe_allow_html=True)
 
-                        # ── Setup Persistence section ──────────────────
                         _setup_id   = str(_row.get("SetupID", ""))
                         _plan_status= str(_row.get("PlanStatus", ""))
                         _setup_age  = str(_row.get("SetupAge",  _row.get("Setup Age", "")))
@@ -3228,27 +3041,6 @@ def render(settings: dict | None = None):
                         st.markdown(_locked_plan_panel(_row), unsafe_allow_html=True)
                         st.markdown(_lifecycle_timeline_panel(plan_row=_row), unsafe_allow_html=True)
 
-            # Pillar Breakdown — same panel as pages/five_pillars.py (Structure /
-            # Acceptance / Leadership / Momentum / Risk tiles + Opportunity
-            # Quality Bonus + Promotion Engine), reading the FP_*/_fp_* columns
-            # utils/scanner_engine.py already attaches to every scanned row.
-            if _show_detail and "FP_Structure" in df_subset.columns:
-                with st.expander("🔬 Pillar Breakdown — individual stock"):
-                    _sel3 = df_subset["Stock"].tolist()[:10] if "Stock" in df_subset.columns else []
-                    _picked3 = st.selectbox("Select stock", _sel3, key=f"de_breakdown_sel_{sc_key}")
-                    if _picked3:
-                        _de_row = df_subset[df_subset["Stock"] == _picked3].iloc[0]
-                        st.markdown(_fp_detail_breakdown(_de_row), unsafe_allow_html=True)
-            # Fallback for older cached scans that predate the FP_* columns —
-            # keeps the Decision Engine tile view available so nothing breaks.
-            elif _show_detail and "DE_Leadership" in df_subset.columns:
-                with st.expander("🏛️ Decision Engine Breakdown — individual stock"):
-                    _sel3 = df_subset["Stock"].tolist()[:10] if "Stock" in df_subset.columns else []
-                    _picked3 = st.selectbox("Select stock", _sel3, key=f"de_breakdown_sel_{sc_key}")
-                    if _picked3:
-                        _de_row = df_subset[df_subset["Stock"] == _picked3].iloc[0]
-                        st.markdown(_de_breakdown_panel(_de_row), unsafe_allow_html=True)
-
             # Explainability panel (Sprint 1)
             if _show_detail and "_explain_included" in df_subset.columns:
                 with st.expander("💡 Why this stock? — Explainability"):
@@ -3277,40 +3069,27 @@ def render(settings: dict | None = None):
                             unsafe_allow_html=True,
                         )
 
-                        # ── Elite Gap (Fix 5) ─────────────────────────────
-                        # Show gap to Elite Opportunity for non-elite stocks only.
-                        # When category IS Elite Opportunity, gap = 0 — suppress entirely.
-                        _rec_col2 = "Recommendation" if "Recommendation" in _erow else "Category"
-                        _cat = str(_erow.get(_rec_col2, ""))
-                        if _cat != "Elite Opportunity":
-                            try:
-                                _ls  = int(float(_erow.get("DE_Leadership",   0) or 0))
-                                _cv  = int(float(_erow.get("DE_Conviction",   0) or 0))
-                                _eq  = int(float(_erow.get("DE_EntryQuality", 0) or 0))
-                                _ext = int(float(_erow.get("Extension", 0) or 0))
-                                ls_gap  = max(0, 90 - _ls)
-                                cv_gap  = max(0, 90 - _cv)
-                                eq_gap  = max(0, 80 - _eq)
-                                ext_gap = max(0, _ext - 25)  # extension must come DOWN
-                                total_gap = ls_gap + cv_gap + eq_gap + ext_gap
-                                if total_gap > 0:
-                                    gap_parts = []
-                                    if ls_gap  > 0: gap_parts.append(f"Leadership +{ls_gap}")
-                                    if cv_gap  > 0: gap_parts.append(f"Conviction +{cv_gap}")
-                                    if eq_gap  > 0: gap_parts.append(f"Entry +{eq_gap}")
-                                    if ext_gap > 0: gap_parts.append(f"Extension −{ext_gap}")
-                                    gap_str = "  ·  ".join(gap_parts)
-                                    st.markdown(
-                                        f"<div style='background:rgba(245,197,66,0.06);border:1px solid rgba(245,197,66,0.2);"
-                                        f"border-radius:6px;padding:8px 12px;margin-bottom:8px;font-size:11px;'"
-                                        f" title='Gap required to reach Elite Opportunity thresholds: "
-                                        f"Leadership≥90, Conviction≥90, Entry≥80, Extension≤25'>"
-                                        f"<span style='color:#f5c542;font-weight:700;'>🌟 Elite Gap</span>"
-                                        f"<span style='color:#8b949e;margin-left:8px;'>{gap_str}</span></div>",
-                                        unsafe_allow_html=True,
-                                    )
-                            except (TypeError, ValueError):
-                                pass
+                        # ── Gap to promotion ────────────────────────────
+                        # For an Actionable setup, show what's missing to
+                        # reach Execute/Elite — sourced from the Promotion
+                        # Engine, not a second scoring calculation.
+                        _rec = str(_erow.get("Recommendation", ""))
+                        if _rec == "Actionable":
+                            _blocked = [s for s in str(_erow.get("_promo_blocked", "")).split("|") if s]
+                            _score   = int(_erow.get("PromoScore", 0) or 0)
+                            _rr      = float(_erow.get("PromoRR", 0) or 0)
+                            _gap_note = "  ·  ".join(_blocked) if _blocked else f"Promo Score {_score}/100, R:R {_rr:.1f}"
+                            st.markdown(
+                                "<div style='background:rgba(245,197,66,0.06);border:1px solid rgba(245,197,66,0.2);"
+                                "border-radius:6px;padding:8px 12px;margin-bottom:8px;font-size:11px;'"
+                                " title='Promotion Engine gate: Promo Score ≥75 + R:R ≥2.0 → Elite; "
+                                "Promo Score ≥50 + R:R ≥1.5 → Execute'>"
+                                "<span style='color:#f5c542;font-weight:700;'>🚀 Gap to Promotion</span>"
+                                f"<span style='color:#8b949e;margin-left:8px;'>{_gap_note}</span></div>",
+                                unsafe_allow_html=True,
+                            )
+                        elif _rec in ("Execute", "Elite"):
+                            st.success(f"This stock IS {_rec} — Promotion Engine has confirmed timing.")
 
                         if _included:
                             st.markdown("**✅ Why included:**")
@@ -3324,10 +3103,8 @@ def render(settings: dict | None = None):
                             st.markdown("**⚠️ Risk factors:**")
                             for item in _risks:
                                 st.markdown(f"- {item}")
-                        if not _included and not _not_higher and not _risks and _cat != "Elite Opportunity":
+                        if not _included and not _not_higher and not _risks and _rec not in ("Execute", "Elite"):
                             st.info("No explainability data for this stock.")
-                        elif _cat == "Elite Opportunity":
-                            st.success("This stock IS Elite Opportunity — all gates met.")
 
             # Watchlist
             if supabase_ok and sc_key not in ("SKIP",):
