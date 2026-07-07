@@ -95,7 +95,7 @@ MIN_RR_ELITE   = 2.0
 LL_MAX_BARS_SINCE_RECLAIM = 3
 
 # VWAP touch recency gate — mirrors the detector's own lookback window
-# (default 2 bars in utils/stoch_convergence.py), so this is a sanity
+# (default 3 bars in utils/stoch_convergence.py), so this is a sanity
 # check, not a new restriction: a touch the detector reports at all is
 # already ≤ lookback bars old, but we verify it explicitly rather than
 # trusting the boolean blindly.
@@ -106,7 +106,15 @@ VWAP_MAX_BARS_SINCE_TOUCH = 2
 # STOCH_REIGNITION_LOOKBACK bars for a qualifying cross and reports how
 # many bars ago it fired; without this gate a cross from several bars back
 # was being treated identically to one on today's bar.
-STOCH_MAX_BARS_SINCE_REIGNITION = 2
+STOCH_MAX_BARS_SINCE_REIGNITION = 3
+
+# Current-momentum-position gate — independent of both the cross-quality
+# check (was the cross itself clean, evaluated at the crossover bar) and
+# the freshness check (how many bars ago did it fire). This one looks at
+# where %K sits RIGHT NOW: even a clean, recent cross can have already
+# run hard in the bars since it fired, in which case promoting it here
+# is chasing, not catching a fresh reversal.
+PROMOTION_STOCH_MAX_LEVEL = 40
 
 _MIN_RR_MAP = {"1.5R": 1.5, "2R": 2.0, "2.5R": 2.5, "3R": 3.0}
 
@@ -237,9 +245,22 @@ def evaluate_promotion(
     res.applicable = True
 
     # ── Timing signals ──────────────────────────────────────────
-    _stoch_bars  = int(getattr(r, "stoch_bars_since_reignition", -1) or -1)
-    _stoch_fresh = 0 <= _stoch_bars <= STOCH_MAX_BARS_SINCE_REIGNITION
-    res.stoch_up = bool(getattr(r, "stoch_reignition", False)) and _stoch_fresh
+    # Three independent stochastic checks — each answers a different
+    # question and none substitutes for another:
+    #   A. Cross Quality  — was the crossover itself clean? (already
+    #      enforced upstream in stoch_convergence.py via reignition_max_level
+    #      at the crossover bar)
+    #   B. Freshness      — did it fire recently? (bars-since-reignition)
+    #   C. Current Momentum Position — has %K already run away from the
+    #      reversal since the cross fired? Evaluated on TODAY's %K, not
+    #      the crossover bar's %K, so it catches moves that accelerated
+    #      after a clean, recent cross.
+    _stoch_bars    = int(getattr(r, "stoch_bars_since_reignition", -1) or -1)
+    _stoch_fresh   = 0 <= _stoch_bars <= STOCH_MAX_BARS_SINCE_REIGNITION
+    _stoch_k_now   = float(getattr(r, "stoch_k", 0.0) or 0.0)
+    _stoch_not_extended = _stoch_k_now <= PROMOTION_STOCH_MAX_LEVEL
+    _stoch_crossed = bool(getattr(r, "stoch_reignition", False))
+    res.stoch_up = _stoch_crossed and _stoch_fresh and _stoch_not_extended
 
     _ll_dist  = float(getattr(r, "ll_distance_atr", 0.0) or 0.0)
     _ll_bars  = int(getattr(r, "ll_bars_since_reclaim", -1) or -1)
