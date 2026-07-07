@@ -755,9 +755,9 @@ def score_stock(
             cv1_entry_quality = cv1.entry_quality if cv1 else None,
         )
         result.update({
-            "DE_Leadership":    ds.leadership,     # legacy/diagnostic — feeds ConvictionGap only
-            "DE_Conviction":    ds.conviction,      # legacy/diagnostic — feeds ConvictionGap only
-            "DE_EntryQuality":  ds.entry_quality,   # legacy/diagnostic — feeds ConvictionGap only
+            "DE_Leadership":    ds.legacy_leadership,     # diagnostic only — feeds ConvictionGap; key name kept
+            "DE_Conviction":    ds.legacy_conviction,      # for compatibility with lifecycle_engine.py,
+            "DE_EntryQuality":  ds.legacy_entry_quality,   # setup_persistence.py, agent_tools.py, pages/scanner.py
             "Extension":     ds.extension,
             "Lifecycle":     ds.lifecycle,     # objective stock state, classified from CV1 + Extension
             "RR":            ds.risk_reward,

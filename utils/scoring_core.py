@@ -293,7 +293,8 @@ class BarResult:
 
     # ── Entry Quality / Extension: real measurements ──────────────
     # These are computed in compute_bar() using actual price vs indicator levels.
-    # Passed to decision_engine._entry_quality() and ._extension() for accurate scoring.
+    # Passed to conviction_score_v1's entry_quality calc, decision_engine._extension(),
+    # and legacy_scoring_diagnostic.legacy_entry_quality() (diagnostic only) for scoring.
     ema20_pct_dist:     float = 0.0      # % price is above EMA20 (positive = above)
     ema50_pct_dist:     float = 0.0      # % price is above EMA50
     pivot_high_dist:    float = 0.0      # % price is above last pivot high (>0 = extended past pivot)
