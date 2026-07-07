@@ -722,6 +722,8 @@ def compute_decision(
     cv1_leadership: int | None = None,
     cv1_conviction: int | None = None,
     cv1_entry_quality: int | None = None,
+    *,
+    mode: str = "production",
 ) -> DecisionScores:
     """
     Compute Extension, Lifecycle stage, Trend Quality, R:R, and
@@ -740,14 +742,27 @@ def compute_decision(
     settings : Settings dict from pages/settings.py (trader-facing controls).
                If None, uses neutral defaults.
     cv1_leadership, cv1_conviction, cv1_entry_quality :
-               CV1's quality scores for this bar. When supplied (the
-               production path always supplies them), Lifecycle staging is
-               classified from CV1 — the single source of truth for
-               quality — instead of this engine's own leadership/
-               conviction/entry_quality. Those own scores are still
-               computed and returned (see DecisionScores docstring) purely
-               as a diagnostic cross-check against CV1, never as the basis
-               for a decision.
+               CV1's quality scores for this bar. Required when mode=
+               "production" (the default) — Lifecycle staging is always
+               classified from CV1, the single source of truth for
+               quality. This engine's own legacy leadership/conviction/
+               entry_quality (utils/legacy_scoring_diagnostic.py) are
+               still computed and returned on every call (see
+               DecisionScores docstring) purely as a diagnostic
+               cross-check against CV1 — never as the basis for a
+               decision.
+    mode     : "production" (default) — Lifecycle is classified from the
+               cv1_* arguments above, which are REQUIRED in this mode
+               (raises ValueError if any are None). This is the only mode
+               utils/scanner_engine.py's live scoring path may use.
+               "diagnostic_standalone" — for ad-hoc scripts / notebooks
+               that want a Lifecycle read with no CV1 available. Lifecycle
+               is explicitly classified from this engine's OWN legacy
+               scores instead. cv1_* arguments must be None in this mode
+               (raises ValueError if any are supplied — mixing the two
+               silently was the previous implicit-fallback behaviour this
+               replaces). Never used by the live Scanner, backtest, or
+               Setup Plan paths.
 
     Returns
     -------
@@ -756,12 +771,34 @@ def compute_decision(
     """
     settings = settings or {}
 
+    if mode == "production":
+        if cv1_leadership is None or cv1_conviction is None or cv1_entry_quality is None:
+            raise ValueError(
+                "compute_decision(mode='production') requires cv1_leadership, "
+                "cv1_conviction, and cv1_entry_quality to all be supplied — "
+                "CV1 is the single source of truth for quality and Lifecycle "
+                "must never silently fall back to the legacy scores. If you "
+                "intentionally want a CV1-free diagnostic read, call with "
+                "mode='diagnostic_standalone' and omit the cv1_* arguments."
+            )
+    elif mode == "diagnostic_standalone":
+        if cv1_leadership is not None or cv1_conviction is not None or cv1_entry_quality is not None:
+            raise ValueError(
+                "compute_decision(mode='diagnostic_standalone') classifies Lifecycle "
+                "from this engine's own legacy scores and must not receive cv1_* "
+                "arguments — pass mode='production' instead if CV1 scores are "
+                "available."
+            )
+    else:
+        raise ValueError(f"compute_decision(): unknown mode {mode!r} — expected "
+                          "'production' or 'diagnostic_standalone'")
+
     # ── Legacy factor computation (relocated to legacy_scoring_diagnostic.py) ──
     # Kept only for the ConvictionGap diagnostic (utils/scanner_engine.py)
     # and for pages/validation.py, which deliberately compares CV1 against
     # this differently-weighted read of the same bar. Never used for
-    # Lifecycle/Recommendation below. utils/backtest_engine.py no longer
-    # touches these at all.
+    # Lifecycle/Recommendation below in production mode. utils/backtest_engine.py
+    # no longer touches these at all.
     legacy_leadership,    ls_subs  = _legacy_leadership_fn(r)
     legacy_conviction,    cv_subs  = _legacy_conviction_fn(r, settings)
     legacy_entry_quality, eq_subs, rr = _legacy_entry_quality_fn(r)
@@ -770,12 +807,13 @@ def compute_decision(
     # ── Trend Quality Score (Sprint 1) ────────────────────────────
     tq_score, tq_subs = _trend_quality(r)
 
-    # ── Lifecycle stage — classified from CV1's quality scores ─────
-    # (falls back to this engine's own legacy scores only if CV1 wasn't
-    # supplied, e.g. a script calling compute_decision() directly / standalone).
-    q_ls = cv1_leadership    if cv1_leadership    is not None else legacy_leadership
-    q_cv = cv1_conviction    if cv1_conviction    is not None else legacy_conviction
-    q_eq = cv1_entry_quality if cv1_entry_quality is not None else legacy_entry_quality
+    # ── Lifecycle stage — classification source is now explicit, not a
+    # silent fallback. "production" always uses CV1 (validated above);
+    # "diagnostic_standalone" always uses this engine's own legacy scores.
+    if mode == "production":
+        q_ls, q_cv, q_eq = cv1_leadership, cv1_conviction, cv1_entry_quality
+    else:  # diagnostic_standalone
+        q_ls, q_cv, q_eq = legacy_leadership, legacy_conviction, legacy_entry_quality
     stage = _classify_stage(q_ls, q_cv, q_eq, extension, r)
 
     ds = DecisionScores(

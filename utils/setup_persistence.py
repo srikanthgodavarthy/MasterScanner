@@ -560,9 +560,9 @@ def _create_plan(
         # not the legacy Decision Engine scores, so the frozen plan and its
         # recommendation always trace back to the same engine. DE_* kept
         # only as a fallback for rows that predate the CV1 columns.
-        locked_leadership      = int(scanner_row.get("CV1_Leadership",   scanner_row.get("DE_Leadership",   0)) or 0),
-        locked_conviction      = int(scanner_row.get("CV1_Conviction",   scanner_row.get("DE_Conviction",   0)) or 0),
-        locked_entry_quality   = int(scanner_row.get("CV1_EntryQuality", scanner_row.get("DE_EntryQuality", 0)) or 0),
+        locked_leadership      = int(scanner_row.get("CV1_Leadership",   scanner_row.get("Legacy_Leadership",   scanner_row.get("DE_Leadership",   0))) or 0),
+        locked_conviction      = int(scanner_row.get("CV1_Conviction",   scanner_row.get("Legacy_Conviction",   scanner_row.get("DE_Conviction",   0))) or 0),
+        locked_entry_quality   = int(scanner_row.get("CV1_EntryQuality", scanner_row.get("Legacy_EntryQuality", scanner_row.get("DE_EntryQuality", 0))) or 0),
         locked_extension       = int(scanner_row.get("Extension",    0) or 0),
         status                 = SetupPlanStatus.WAITING,
         status_reason           = "Plan created — awaiting entry trigger",

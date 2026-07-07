@@ -115,8 +115,8 @@ def lifecycle_from_scanner_row(
     Convert a scanner result dict (one row from df_aug) into a
     LifecycleRecord ready for DB persistence.
 
-    ``row``      — dict with keys like 'Stock', 'Score', 'DE_Leadership',
-                   'DE_Conviction', 'Entry', 'Extension', 'Action', …
+    ``row``      — dict with keys like 'Stock', 'Score', 'Legacy_Leadership',
+                   'Legacy_Conviction', 'Entry', 'Extension', 'Action', …
     ``symbol``   — overrides row['Stock'] if provided
     ``scan_date``— date or str; defaults to today
     """
@@ -144,9 +144,9 @@ def lifecycle_from_scanner_row(
         # would persist a CV1-based category next to Decision-Engine-based
         # sub-scores that don't actually explain it. DE_* kept only as a
         # fallback for any row that predates the CV1 columns.
-        leadership    = _safe_int(row.get("CV1_Leadership",    row.get("DE_Leadership",   row.get("leadership",    0)))),
-        conviction    = _safe_int(row.get("CV1_Conviction",    row.get("DE_Conviction",   row.get("conviction",    0)))),
-        entry_quality = _safe_int(row.get("CV1_EntryQuality",  row.get("DE_EntryQuality", row.get("Entry", row.get("entry_quality", 0))))),
+        leadership    = _safe_int(row.get("CV1_Leadership",    row.get("Legacy_Leadership",   row.get("DE_Leadership",   row.get("leadership",    0))))),
+        conviction    = _safe_int(row.get("CV1_Conviction",    row.get("Legacy_Conviction",   row.get("DE_Conviction",   row.get("conviction",    0))))),
+        entry_quality = _safe_int(row.get("CV1_EntryQuality",  row.get("Legacy_EntryQuality", row.get("DE_EntryQuality", row.get("Entry", row.get("entry_quality", 0)))))),
         extension     = _safe_int(row.get("Extension",     row.get("extension",     0))),
         trend_quality = _safe_int(row.get("TrendQuality",  row.get("trend_quality", 0))),
         score         = _safe_int(row.get("Score",         row.get("score",         0))),

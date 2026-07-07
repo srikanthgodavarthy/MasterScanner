@@ -487,14 +487,15 @@ def _primary_blocker(r, result: dict) -> str:
 
     # Extended is its own blocker — show it directly
     if category == "Extended":
-        ext = int(result.get("Extension", result.get("DE_EntryQuality", 0)) or 0)
+        ext = int(result.get("Extension", result.get("Legacy_EntryQuality", result.get("DE_EntryQuality", 0))) or 0)
         return f"Extended ({ext}) — wait for pullback to EMA/Fib"
 
     # Pull scores — use CV1 for Leadership (matches scanner display colours at threshold 65);
-    # fall back to DE values when CV1 is absent.
-    ls = float(result.get("CV1_Leadership",  result.get("DE_Leadership",   0)) or 0)
-    cv = float(result.get("CV1_Conviction",   result.get("DE_Conviction",   0)) or 0)
-    eq = float(result.get("CV1_EntryQuality", result.get("DE_EntryQuality", 0)) or 0)
+    # fall back to Legacy_* (diagnostic-only, no longer DE production logic) when CV1 is absent,
+    # then to the old "DE_*" key name for rows/cache written before the rename.
+    ls = float(result.get("CV1_Leadership",  result.get("Legacy_Leadership",   result.get("DE_Leadership",   0))) or 0)
+    cv = float(result.get("CV1_Conviction",   result.get("Legacy_Conviction",   result.get("DE_Conviction",   0))) or 0)
+    eq = float(result.get("CV1_EntryQuality", result.get("Legacy_EntryQuality", result.get("DE_EntryQuality", 0))) or 0)
     ext= float(result.get("Extension",       0) or 0)
 
     # Priority 1: Leadership gate — threshold aligned with _SCORE_THRESHOLDS["Leadership"]=65
@@ -737,7 +738,8 @@ def score_stock(
             "_cv1_eq_bars":      cv1.eq_bars_since_setup,
         })
     except Exception:
-        cv1 = None   # Decision Engine below falls back to its own scores for Lifecycle
+        cv1 = None   # Decision Engine call below is skipped entirely for this symbol —
+                     # see compute_decision(mode="production") requirement below
 
     # ── Decision Engine — Extension / Lifecycle / Trend Quality / R:R ──
     # [Scanner Refactor] No longer produces a Recommendation — CV1 +
@@ -748,16 +750,25 @@ def score_stock(
     ds = None   # ensure defined even if compute_decision() below raises
     try:
         from utils.decision_engine import compute_decision
+        if cv1 is None:
+            # CV1 failed above — there is no legitimate production Lifecycle
+            # read without it (compute_decision(mode="production") requires
+            # CV1's scores and will not silently substitute the legacy
+            # ones). Leave ds=None; downstream treats this the same as any
+            # other Decision Engine failure — logged, Extension/Lifecycle/
+            # TrendQuality/RR absent for this symbol.
+            raise RuntimeError("CV1 unavailable — skipping compute_decision(mode='production')")
         ds = compute_decision(
             r, settings or {},
-            cv1_leadership    = cv1.leadership    if cv1 else None,
-            cv1_conviction    = cv1.conviction    if cv1 else None,
-            cv1_entry_quality = cv1.entry_quality if cv1 else None,
+            cv1_leadership    = cv1.leadership,
+            cv1_conviction    = cv1.conviction,
+            cv1_entry_quality = cv1.entry_quality,
+            mode="production",
         )
         result.update({
-            "DE_Leadership":    ds.legacy_leadership,     # diagnostic only — feeds ConvictionGap; key name kept
-            "DE_Conviction":    ds.legacy_conviction,      # for compatibility with lifecycle_engine.py,
-            "DE_EntryQuality":  ds.legacy_entry_quality,   # setup_persistence.py, agent_tools.py, pages/scanner.py
+            "Legacy_Leadership":    ds.legacy_leadership,     # diagnostic only — feeds ConvictionGap
+            "Legacy_Conviction":    ds.legacy_conviction,      # no longer represents DE production logic —
+            "Legacy_EntryQuality":  ds.legacy_entry_quality,   # consumers read this key, falling back to old "DE_*"
             "Extension":     ds.extension,
             "Lifecycle":     ds.lifecycle,     # objective stock state, classified from CV1 + Extension
             "RR":            ds.risk_reward,
@@ -1015,15 +1026,15 @@ def score_stock(
         )
 
     # ── Conviction Gap diagnostic field ──────────────────────────
-    # ConvictionGap = CV1_Conviction - DE_Conviction
-    # Positive  → CV1 sees more structural quality than DE (common in momentum runners
-    #             with RS/CCI strength but no Fib zone or compression setup).
+    # ConvictionGap = CV1_Conviction - Legacy_Conviction
+    # Positive  → CV1 sees more structural quality than the legacy formula (common in
+    #             momentum runners with RS/CCI strength but no Fib zone or compression setup).
     #             These stocks now receive Category='Leader' instead of 'Avoid'.
-    # Near zero → both engines agree; Category and CV1_SignalClass should align.
-    # Negative  → DE sees more than CV1 (rare; signals a pattern-heavy bar without RS).
+    # Near zero → both formulas agree; Category and CV1_SignalClass should align.
+    # Negative  → legacy formula sees more than CV1 (rare; signals a pattern-heavy bar without RS).
     try:
         cv1_cv = result.get("CV1_Conviction")
-        de_cv  = result.get("DE_Conviction")
+        de_cv  = result.get("Legacy_Conviction", result.get("DE_Conviction"))
         if cv1_cv is not None and de_cv is not None:
             gap = int(cv1_cv) - int(de_cv)
             result["ConvictionGap"] = gap
