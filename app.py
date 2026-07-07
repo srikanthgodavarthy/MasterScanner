@@ -143,36 +143,60 @@ settings = {
     "bt_default_engine":         ss.get("bt_default_engine",         "scanner"),
 }
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
-    "📡 Live Scanner", "📍 Pre-Breakout Scanner", "📈 Backtest Engine", "🔄 Lifecycle", "📊 History", "⚙️ Settings", "🔬 CV/EQ Validation", "🧬 Diagnostic", "🤖 Agent", "📐 CCI Master"
-])
-
-with tab1:
+def _page_scanner():
     render_scanner(settings)
 
-with tab2:
+def _page_pre_breakout():
     render_five_pillars(settings)
 
-with tab3:
+def _page_backtest():
     render_backtest(settings)
 
-with tab4:
+def _page_lifecycle():
     render_lifecycle()
 
-with tab5:
+def _page_history():
     render_history()
 
-with tab6:
+def _page_settings():
     render_settings()
 
-with tab7:
+def _page_validation():
     render_validation(settings)
 
-with tab8:
+def _page_diagnostic():
     render_diagnostic(settings)
 
-with tab9:
+def _page_agent():
     render_agent(settings)
 
-with tab10:
+def _page_cci_master():
     render_cci_master(settings)
+
+# ── Navigation ──────────────────────────────────────────────────
+# [Scanner Refactor 2026-07] Previously this was a single st.tabs() shell,
+# which — regardless of which tab was visually active — re-executed EVERY
+# tab's render_*() function on every rerun (any widget interaction, anywhere
+# in the app, reruns the whole script). That meant Backtest interactions
+# were silently re-running the full Scanner scan/render in the background
+# on every click, which got heavy enough after the Promotion Engine
+# additions to cause a visible flash/jump back to the Scanner tab.
+#
+# st.navigation + st.Page only ever executes the ONE page function the
+# user actually has selected — the other nine pages simply don't run.
+pg = st.navigation(
+    [
+        st.Page(_page_scanner,      title="Live Scanner",         icon="📡", default=True),
+        st.Page(_page_pre_breakout, title="Pre-Breakout Scanner", icon="📍"),
+        st.Page(_page_backtest,     title="Backtest Engine",      icon="📈"),
+        st.Page(_page_lifecycle,    title="Lifecycle",            icon="🔄"),
+        st.Page(_page_history,      title="History",              icon="📊"),
+        st.Page(_page_settings,     title="Settings",             icon="⚙️"),
+        st.Page(_page_validation,   title="CV/EQ Validation",     icon="🔬"),
+        st.Page(_page_diagnostic,   title="Diagnostic",           icon="🧬"),
+        st.Page(_page_agent,        title="Agent",                icon="🤖"),
+        st.Page(_page_cci_master,   title="CCI Master",           icon="📐"),
+    ],
+    position="top",   # matches the original inline-controls look (sidebar stays collapsed)
+)
+pg.run()
