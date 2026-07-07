@@ -683,6 +683,7 @@ def score_stock(
         "StochK":            r.stoch_k,
         "StochD":            r.stoch_d,
         "Stoch_Reignition":  r.stoch_reignition,
+        "Stoch_BarsSinceReignition": r.stoch_bars_since_reignition,
         "Stoch_Confluence":  r.stoch_confluence,
         "Stoch_BonusPts":    r.stoch_bonus_pts,
         "OpportunityBonus":  r.opportunity_bonus_pts,
