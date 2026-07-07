@@ -57,27 +57,22 @@ def _symbols_from_source(source: str, settings: dict | None) -> tuple[list[str],
     if source == "🌟 Elite (Scanner)":
         if scan_df.empty:
             st.warning("⚠️ No scanner data — run the Live Scanner first, then return here.", icon="⚠️")
-            return default_syms, "Elite"
-        # [Scanner Refactor 2026-07] Recommendation vocabulary is now
-        # Skip/Watch/Developing/Actionable/Execute/Elite (CV1 tier +
-        # Promotion Engine) — "Elite Opportunity" was the old Decision
-        # Engine label and no longer appears anywhere, which silently
-        # emptied this filter and fell back to default_syms every time.
+            return default_syms, "Elite Opportunity"
         rec_col = "Recommendation" if "Recommendation" in scan_df.columns else "Category"
-        sub = scan_df[scan_df.get(rec_col, pd.Series(dtype=str)) == "Elite"]
+        sub = scan_df[scan_df.get(rec_col, pd.Series(dtype=str)) == "Elite Opportunity"]
         sc = _sym_col(sub)
         syms = sorted(sub[sc].dropna().unique().tolist()) if sc else default_syms
-        return (syms or default_syms), "Elite"
+        return (syms or default_syms), "Elite Opportunity"
 
     if source == "⚡ Execute (Scanner)":
         if scan_df.empty:
             st.warning("⚠️ No scanner data — run the Live Scanner first, then return here.", icon="⚠️")
-            return default_syms, "Execute"
+            return default_syms, "Actionable"
         rec_col = "Recommendation" if "Recommendation" in scan_df.columns else "Category"
-        sub = scan_df[scan_df.get(rec_col, pd.Series(dtype=str)).isin(["Execute", "Elite"])]
+        sub = scan_df[scan_df.get(rec_col, pd.Series(dtype=str)).isin(["High Conviction", "Actionable"])]
         sc = _sym_col(sub)
         syms = sorted(sub[sc].dropna().unique().tolist()) if sc else default_syms
-        return (syms or default_syms), "Execute"
+        return (syms or default_syms), "Actionable"
 
     if source == "📐 Fib Pullback (Scanner)":
         if scan_df.empty:
