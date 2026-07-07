@@ -92,21 +92,21 @@ MIN_RR_ELITE   = 2.0
 # not as the gate, since a stock can cover several ATR in one volatile bar
 # and still be perfectly fresh, or drift 1 ATR over 20 quiet bars and be
 # stale — bars is the correct freshness clock, not price distance.
-LL_MAX_BARS_SINCE_RECLAIM = 5
+LL_MAX_BARS_SINCE_RECLAIM = 3
 
 # VWAP touch recency gate — mirrors the detector's own lookback window
-# (default 3 bars in utils/stoch_convergence.py), so this is a sanity
+# (default 2 bars in utils/stoch_convergence.py), so this is a sanity
 # check, not a new restriction: a touch the detector reports at all is
 # already ≤ lookback bars old, but we verify it explicitly rather than
 # trusting the boolean blindly.
-VWAP_MAX_BARS_SINCE_TOUCH = 3
+VWAP_MAX_BARS_SINCE_TOUCH = 2
 
 # Stoch re-ignition recency gate — mirrors LL/VWAP treatment above. The
 # detector (utils/stoch_convergence.py) now searches back up to
 # STOCH_REIGNITION_LOOKBACK bars for a qualifying cross and reports how
 # many bars ago it fired; without this gate a cross from several bars back
 # was being treated identically to one on today's bar.
-STOCH_MAX_BARS_SINCE_REIGNITION = 3
+STOCH_MAX_BARS_SINCE_REIGNITION = 2
 
 _MIN_RR_MAP = {"1.5R": 1.5, "2R": 2.0, "2.5R": 2.5, "3R": 3.0}
 
