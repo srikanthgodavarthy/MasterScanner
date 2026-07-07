@@ -694,20 +694,71 @@ def score_stock(
         "_bar_result":  r,
     }
 
-    # ── Decision Engine (4-score framework) ──────────────────────
-    # Runs AFTER all existing logic; uses only already-computed BarResult fields.
+    # ── Conviction Score v1 (backtest-validated weights) ─────────
+    # Pure re-mapping of existing BarResult fields — zero new indicators.
+    # Produces: CV1_Leadership, CV1_Conviction, CV1_EntryQuality, CV1_SignalClass
+    # and all sub-score internals for the detail-view breakdown panel.
+    # [Scanner Refactor] Runs BEFORE the Decision Engine below so its
+    # quality scores can be handed to compute_decision() for Lifecycle
+    # staging — CV1 is the single source of truth for quality everywhere,
+    # including the objective Lifecycle stage, not just the Recommendation.
+    cv1 = None
+    try:
+        from utils.conviction_score_v1 import compute_conviction_v1
+        cv1 = compute_conviction_v1(r)
+        result.update({
+            "CV1_Leadership":    cv1.leadership,
+            "CV1_Conviction":    cv1.conviction,
+            "CV1_EntryQuality":  cv1.entry_quality,
+            "CV1_Composite":     cv1.composite,
+            "CV1_SignalClass":   cv1.signal_class,
+            # Grade labels
+            "CV1_LS_Grade":      cv1.leadership_grade,
+            "CV1_CV_Grade":      cv1.conviction_grade,
+            "CV1_EQ_Grade":      cv1.entry_quality_grade,
+            # Leadership sub-scores
+            "_cv1_ls_rs":        cv1.ls_rs_composite,
+            "_cv1_ls_age":       cv1.ls_trend_age,
+            "_cv1_ls_adx":       cv1.ls_adx,
+            "_cv1_ls_ps":        cv1.ls_persistent_strength,
+            "_cv1_ls_slope":     cv1.ls_ema20_slope,
+            # Conviction sub-scores
+            "_cv1_cv_structure": cv1.cv_trend_structure,
+            "_cv1_cv_fib":       cv1.cv_fib_zone,
+            "_cv1_cv_cci":       cv1.cv_cci_recovery,
+            "_cv1_cv_volume":    cv1.cv_volume,
+            "_cv1_cv_squeeze":   cv1.cv_squeeze,
+            # Entry Quality sub-scores
+            "_cv1_eq_ema20":     cv1.eq_ema20_dist,
+            "_cv1_eq_ema50":     cv1.eq_ema50_dist,
+            "_cv1_eq_pivot":     cv1.eq_pivot_dist,
+            "_cv1_eq_move":      cv1.eq_move_since_setup,
+            "_cv1_eq_bars":      cv1.eq_bars_since_setup,
+        })
+    except Exception:
+        cv1 = None   # Decision Engine below falls back to its own scores for Lifecycle
+
+    # ── Decision Engine — Extension / Lifecycle / Trend Quality / R:R ──
+    # [Scanner Refactor] No longer produces a Recommendation — CV1 +
+    # Promotion Engine (below) own that entirely. What's left is the
+    # things they don't cover: Extension, the objective Lifecycle stage
+    # (classified from CV1's scores when available), Trend Quality, R:R,
+    # and the explainability panel. See utils/decision_engine.py docstring.
     try:
         from utils.decision_engine import compute_decision
-        ds = compute_decision(r, settings or {})
+        ds = compute_decision(
+            r, settings or {},
+            cv1_leadership    = cv1.leadership    if cv1 else None,
+            cv1_conviction    = cv1.conviction    if cv1 else None,
+            cv1_entry_quality = cv1.entry_quality if cv1 else None,
+        )
         result.update({
-            "DE_Leadership":    ds.leadership,
-            "DE_Conviction":    ds.conviction,
-            "DE_EntryQuality":  ds.entry_quality,
+            "DE_Leadership":    ds.leadership,     # legacy/diagnostic — feeds ConvictionGap only
+            "DE_Conviction":    ds.conviction,      # legacy/diagnostic — feeds ConvictionGap only
+            "DE_EntryQuality":  ds.entry_quality,   # legacy/diagnostic — feeds ConvictionGap only
             "Extension":     ds.extension,
-            "Lifecycle":     ds.lifecycle,     # objective stock state (settings-independent)
-            "Recommendation":ds.recommendation,  # trader-adjusted label (respects settings)
+            "Lifecycle":     ds.lifecycle,     # objective stock state, classified from CV1 + Extension
             "RR":            ds.risk_reward,
-            "RR_RejectReason": ds.rr_reject_reason,
             # ── Bars-since-setup banding (key question: "Can I still enter today?")
             "BarsBand":      ds.bars_band,         # "Actionable" | "Late" | "Extended"
             "BarsSince":     ds.bars_since_setup,
@@ -758,57 +809,23 @@ def score_stock(
         import logging as _log
         _log.warning(
             "[decision_engine] compute_decision() failed for symbol — "
-            "Leadership/Conviction/Lifecycle/Recommendation/RR will be absent. "
+            "Extension/Lifecycle/TrendQuality/RR will be absent. "
             "Error: %s", _de_exc, exc_info=True
         )
 
-    # ── Conviction Score v1 (backtest-validated weights) ─────────
-    # Pure re-mapping of existing BarResult fields — zero new indicators.
-    # Produces: CV1_Leadership, CV1_Conviction, CV1_EntryQuality, CV1_SignalClass
-    # and all sub-score internals for the detail-view breakdown panel.
+    # ── RECOMMENDATION FUNNEL (CV1 quality → Promotion Engine timing) ──
+    # CV1 is the single source of truth for quality. classify_tier()
+    # maps its three scores to the base funnel:
+    #     Skip → Watch → Developing → Actionable
+    # The Promotion Engine only ever runs on an Actionable setup and
+    # can only upgrade it to Execute or Elite — it never creates a
+    # Watch/Developing/Skip recommendation and never demotes.
+    # This Recommendation is the ONLY recommendation shown anywhere in
+    # the app.
     try:
-        from utils.conviction_score_v1 import compute_conviction_v1
-        cv1 = compute_conviction_v1(r)
-        result.update({
-            "CV1_Leadership":    cv1.leadership,
-            "CV1_Conviction":    cv1.conviction,
-            "CV1_EntryQuality":  cv1.entry_quality,
-            "CV1_Composite":     cv1.composite,
-            "CV1_SignalClass":   cv1.signal_class,
-            # Grade labels
-            "CV1_LS_Grade":      cv1.leadership_grade,
-            "CV1_CV_Grade":      cv1.conviction_grade,
-            "CV1_EQ_Grade":      cv1.entry_quality_grade,
-            # Leadership sub-scores
-            "_cv1_ls_rs":        cv1.ls_rs_composite,
-            "_cv1_ls_age":       cv1.ls_trend_age,
-            "_cv1_ls_adx":       cv1.ls_adx,
-            "_cv1_ls_ps":        cv1.ls_persistent_strength,
-            "_cv1_ls_slope":     cv1.ls_ema20_slope,
-            # Conviction sub-scores
-            "_cv1_cv_structure": cv1.cv_trend_structure,
-            "_cv1_cv_fib":       cv1.cv_fib_zone,
-            "_cv1_cv_cci":       cv1.cv_cci_recovery,
-            "_cv1_cv_volume":    cv1.cv_volume,
-            "_cv1_cv_squeeze":   cv1.cv_squeeze,
-            # Entry Quality sub-scores
-            "_cv1_eq_ema20":     cv1.eq_ema20_dist,
-            "_cv1_eq_ema50":     cv1.eq_ema50_dist,
-            "_cv1_eq_pivot":     cv1.eq_pivot_dist,
-            "_cv1_eq_move":      cv1.eq_move_since_setup,
-            "_cv1_eq_bars":      cv1.eq_bars_since_setup,
-        })
+        if cv1 is None:
+            raise RuntimeError("CV1 unavailable — cannot classify Recommendation")
 
-        # ── RECOMMENDATION FUNNEL (CV1 quality → Promotion Engine timing) ──
-        # CV1 is the single source of truth for quality. classify_tier()
-        # maps its three scores to the base funnel:
-        #     Skip → Watch → Developing → Actionable
-        # The Promotion Engine only ever runs on an Actionable setup and
-        # can only upgrade it to Execute or Elite — it never creates a
-        # Watch/Developing/Skip recommendation and never demotes.
-        # This Recommendation is the ONLY recommendation shown on the
-        # Scanner page; the Decision Engine's own category (set earlier
-        # in `result["Recommendation"]`) is superseded here.
         from utils.conviction_score_v1 import classify_tier
         from utils.promotion_engine import evaluate_promotion
 
