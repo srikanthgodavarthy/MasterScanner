@@ -119,7 +119,9 @@ def score_stochastic_convergence(
     %K/%D cross-up only qualifies while %K is below `reignition_max_level` —
     a crossover deep in overbought territory is a continuation/rollover risk,
     not a fresh location+momentum re-ignition. Crossing out of oversold has
-    no such ceiling since it's unambiguously fresh by construction.
+    no such ceiling since it's unambiguously fresh by construction. Either
+    kind is discarded entirely if today's bar no longer holds %K >= %D —
+    a cross that has since reversed is invalidated, not merely aged.
     """
     sig = StochConvergenceSignal()
 
@@ -131,20 +133,30 @@ def score_stochastic_convergence(
     sig.stoch_k = round(cur_k, 1)
     sig.stoch_d = round(cur_d, 1)
 
+    # A cross found further back in the lookback window is only a live
+    # signal if today's bar still holds the relationship it created — if
+    # %K has already fallen back below %D since the cross, the cross has
+    # been invalidated by today, not merely "aged." This is stricter than
+    # staleness: an aged-but-still-holding cross is discounted by the bars
+    # gate downstream; an already-reversed cross is excluded here entirely,
+    # regardless of how recent it was.
+    _still_holding = cur_k >= cur_d
+
     max_back = min(reignition_lookback, n - 2) if n >= 2 else -1
-    for back in range(0, max(max_back, -1) + 1):
-        i = n - 1 - back
-        k_i, d_i = _safe_at(k_s, i), _safe_at(d_s, i)
-        k_prev, d_prev = _safe_at(k_s, i - 1, k_i), _safe_at(d_s, i - 1, d_i)
+    if _still_holding:
+        for back in range(0, max(max_back, -1) + 1):
+            i = n - 1 - back
+            k_i, d_i = _safe_at(k_s, i), _safe_at(d_s, i)
+            k_prev, d_prev = _safe_at(k_s, i - 1, k_i), _safe_at(d_s, i - 1, d_i)
 
-        cross_up_i = bool(k_prev <= d_prev and k_i > d_i and k_i < reignition_max_level)
-        from_os_i  = bool(k_prev <= 20 and k_i > 20)
+            cross_up_i = bool(k_prev <= d_prev and k_i > d_i and k_i < reignition_max_level)
+            from_os_i  = bool(k_prev <= 20 and k_i > 20)
 
-        if cross_up_i or from_os_i:
-            sig.reignition             = True
-            sig.reignition_kind        = "cross_up" if cross_up_i else "from_oversold"
-            sig.bars_since_reignition  = back
-            break
+            if cross_up_i or from_os_i:
+                sig.reignition             = True
+                sig.reignition_kind        = "cross_up" if cross_up_i else "from_oversold"
+                sig.bars_since_reignition  = back
+                break
 
     vwap_typical = (high + low + close) / 3.0
     vwap_series  = (vwap_typical * volume).cumsum() / volume.cumsum().replace(0, np.nan)
