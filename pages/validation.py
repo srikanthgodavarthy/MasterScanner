@@ -49,10 +49,10 @@ from utils.scanner_engine import NIFTY500_SYMBOLS, _strip_tz, nifty_regime
 from utils.backtest_engine import (
     _fetch_bt_batch, _fetch_bt_nifty, simulate_trades, fetch_all_bt_data
 )
-from utils.decision_engine import (
-    _entry_quality as _eq_fn,
-    _leadership    as _ls_fn,
-    _conviction    as _cv_fn,
+from utils.legacy_scoring_diagnostic import (
+    legacy_entry_quality as _eq_fn,
+    legacy_leadership    as _ls_fn,
+    legacy_conviction    as _cv_fn,
 )
 from utils.scoring_core import ScoringParams, build_indicators, compute_bar
 
