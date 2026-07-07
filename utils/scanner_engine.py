@@ -799,67 +799,52 @@ def score_stock(
             "_cv1_eq_bars":      cv1.eq_bars_since_setup,
         })
 
-        # ── ELITE PROMOTION (Stoch Confluence + defended LL spring) ────
-        # Lift EXECUTE or WATCH straight to ELITE when both stricter
-        # structural confirmations fire together:
-        #   Stoch_Confluence — stochastic reignition that also lines up
-        #                      with a VWAP touch/reclaim (stricter than
-        #                      plain Stoch_Reignition)
-        #   LL_Actionable + LL_Defended — a confirmed Lower-Low spring
-        #                      that has never been re-broken since
-        # SKIP is never promoted — these signals accelerate an
-        # already-qualifying setup, they don't fix a structural failure.
-        _cv1_class_raw    = cv1.signal_class                 # pre-promotion, for diagnostics
-        _cv1_promo_signal = bool(r.stoch_confluence) and bool(r.ll_actionable) and bool(r.ll_defended)
-        _cv1_promoted     = _cv1_promo_signal and _cv1_class_raw in ("EXECUTE", "WATCH")
-        _cv1_class_final  = "ELITE" if _cv1_promoted else _cv1_class_raw
+        # ── RECOMMENDATION FUNNEL (CV1 quality → Promotion Engine timing) ──
+        # CV1 is the single source of truth for quality. classify_tier()
+        # maps its three scores to the base funnel:
+        #     Skip → Watch → Developing → Actionable
+        # The Promotion Engine only ever runs on an Actionable setup and
+        # can only upgrade it to Execute or Elite — it never creates a
+        # Watch/Developing/Skip recommendation and never demotes.
+        # This Recommendation is the ONLY recommendation shown on the
+        # Scanner page; the Decision Engine's own category (set earlier
+        # in `result["Recommendation"]`) is superseded here.
+        from utils.conviction_score_v1 import classify_tier
+        from utils.promotion_engine import evaluate_promotion
 
-        result["CV1_SignalClass"]             = _cv1_class_final
-        result["CV1_SignalClassRaw"]          = _cv1_class_raw
-        result["CV1_Promoted"]                = _cv1_promoted
-        result["_cv1_promo_stoch_confluence"] = bool(r.stoch_confluence)
-        result["_cv1_promo_ll_actionable"]    = bool(r.ll_actionable)
-        result["_cv1_promo_ll_defended"]      = bool(r.ll_defended)
+        base_tier = classify_tier(cv1.leadership, cv1.conviction, cv1.entry_quality)
+        promo = evaluate_promotion(r, base_tier, ia=ia, settings=settings or {})
+        final_tier = promo.tier if (promo.applicable and promo.promoted) else base_tier
 
-        # Promoted stocks also move into the Elite tab/bucket, which is
-        # driven by the separate Decision Engine's Recommendation field —
-        # otherwise CV1_SignalClass would say ELITE but the row would sit
-        # stranded under whichever Decision-Engine tab it started in.
-        if _cv1_promoted:
-            result["Recommendation_Raw"] = result.get("Recommendation")
-            result["Recommendation"]     = "Elite Opportunity"
+        result["CV1_SignalClass"]    = cv1.signal_class   # legacy CV1-only label, kept for reference
+        result["Tier"]               = base_tier           # pre-promotion CV1 tier
+        result["Recommendation"]     = final_tier           # Skip|Watch|Developing|Actionable|Execute|Elite
+        result["Promoted"]           = bool(promo.applicable and promo.promoted)
+        result["PromoScore"]         = promo.promo_score
+        result["PromoRR"]            = promo.risk_reward
+        result["Promo_StochUp"]      = promo.stoch_up
+        result["Promo_LLConfirmed"]  = promo.ll_confirmed
+        result["Promo_VWAPReversal"] = promo.vwap_reversal
+        result["Promo_Institutional"]= promo.institutional
+        result["_promo_reasons"]     = "|".join(promo.reasons) if promo.reasons else ""
+        result["_promo_blocked"]     = "|".join(promo.blocked) if promo.blocked else ""
 
-        # ── CV1 ACTION GATE ───────────────────────────────────────
+        # ── ACTION GATE ─────────────────────────────────────────────
         # The original Action column (✅ BUY / 👁 WATCH / ⛔ SKIP) was
         # assigned purely from norm_score in compute_bar(), with zero
-        # reference to the Conviction pipeline.  This caused BUY signals
-        # with avg Conviction ≈ 22 (audit finding: lines 523-553 of report).
-        #
-        # Fix: after CV1 is computed we reconcile Action with CV1_SignalClass.
-        # Rule: BUY is only kept when CV1 agrees (ELITE or EXECUTE).
-        #       If CV1 downgrades, we floor Action to the CV1-implied level
-        #       but never *upgrade* beyond what norm_score already decided.
-        #
-        #   CV1=ELITE   → keep/upgrade to BUY  (highest conviction)
-        #   CV1=EXECUTE → keep/upgrade to BUY  (actionable)
-        #   CV1=WATCH   → cap at WATCH          (insufficient conviction for BUY)
-        #   CV1=SKIP    → cap at SKIP           (structural failure)
-        #
-        # The original Action from norm_score is preserved as _action_raw
-        # so we can measure disagreement rate in diagnostics.
+        # reference to CV1. Reconcile Action with the final Recommendation
+        # tier so the two never disagree.
+        #   Actionable / Execute / Elite → keep/upgrade to BUY
+        #   Developing / Watch           → cap at WATCH
+        #   Skip                         → cap at SKIP
         _action_raw = result.get("Action", r.action)
         result["_action_raw"] = _action_raw          # for diagnostics
-        sc = _cv1_class_final                         # ELITE | EXECUTE | WATCH | SKIP (post-promotion)
 
-        if sc in ("ELITE", "EXECUTE"):
-            # CV1 approves — honour norm_score decision (BUY/WATCH/SKIP)
-            # but promote WATCH→BUY only if norm_score itself was BUY
+        if final_tier in ("Actionable", "Execute", "Elite"):
             gated_action = _action_raw
-        elif sc == "WATCH":
-            # Cap: BUY becomes WATCH; WATCH/SKIP stay as-is
+        elif final_tier in ("Developing", "Watch"):
             gated_action = "👁 WATCH" if _action_raw == "✅ BUY" else _action_raw
-        else:  # SKIP
-            # Full downgrade: BUY/WATCH both become SKIP
+        else:  # Skip
             gated_action = "⛔ SKIP" if _action_raw in ("✅ BUY", "👁 WATCH") else _action_raw
 
         result["Action"] = gated_action
