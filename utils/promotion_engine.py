@@ -27,15 +27,17 @@ zero new indicators):
      Fresh %K/%D bullish cross, or a cross out of the oversold zone.
 
   2. LL Detected (Defended)     — r.ll_actionable AND r.ll_defended
-     AND r.ll_distance_atr within the actionable band (0.3-4.0 ATR).
+     AND r.ll_bars_since_reclaim within the fresh window (≤5 bars).
      A Lower-Low spring / failed-breakdown reversal that has been
-     reclaimed, never re-broken since, AND is still close enough to
-     current price to matter as a TIMING signal — not one it broke away
-     from ATRs ago (that's ancient structure, not "right now" timing).
+     reclaimed, never re-broken since, AND reclaimed RECENTLY — not one
+     it broke away from many bars ago (that's ancient structure, not
+     "right now" timing).
 
   3. VWAP Touch & Reverse       — r.stoch_vwap_touch AND r.stoch_vwap_reclaim
-     Price touched VWAP intraday and closed back above it (a reclaim,
-     not just a touch).
+     AND r.stoch_vwap_bars_since_touch within the fresh window (≤3 bars,
+     matching the detector's own lookback window). Price touched VWAP
+     intraday and closed back above it (a reclaim, not just a touch) —
+     and did so recently enough that it's still today's story.
 
   4. Institutional Confirmation — volume/OBV evidence of real
      participation behind the move (r.vol_ratio, and OBV trend/leadership
@@ -82,11 +84,20 @@ EXECUTE_SCORE_MIN = 50   # Moderate — 2+ of 4 signals confirming
 MIN_RR_EXECUTE = 1.5
 MIN_RR_ELITE   = 2.0
 
-# LL proximity band — mirrors ll_opportunity.py's own distance_atr_ok gate.
-# A "defended" low that price is 12 ATRs away from is old structure, not a
-# live timing signal — it stopped being actionable long ago.
-LL_MIN_DISTANCE_ATR = 0.3
-LL_MAX_DISTANCE_ATR = 4.0
+# LL recency gate — a "defended" low is only a TIMING signal if it was
+# reclaimed recently. Bars-since-reclaim is the direct measure of that;
+# ATR distance is kept only as a display/diagnostic metric (pace context),
+# not as the gate, since a stock can cover several ATR in one volatile bar
+# and still be perfectly fresh, or drift 1 ATR over 20 quiet bars and be
+# stale — bars is the correct freshness clock, not price distance.
+LL_MAX_BARS_SINCE_RECLAIM = 5
+
+# VWAP touch recency gate — mirrors the detector's own lookback window
+# (default 3 bars in utils/stoch_convergence.py), so this is a sanity
+# check, not a new restriction: a touch the detector reports at all is
+# already ≤ lookback bars old, but we verify it explicitly rather than
+# trusting the boolean blindly.
+VWAP_MAX_BARS_SINCE_TOUCH = 3
 
 _MIN_RR_MAP = {"1.5R": 1.5, "2R": 2.0, "2.5R": 2.5, "3R": 3.0}
 
@@ -212,10 +223,15 @@ def evaluate_promotion(
 
     # ── Timing signals ──────────────────────────────────────────
     res.stoch_up      = bool(getattr(r, "stoch_reignition", False))
-    _ll_dist = float(getattr(r, "ll_distance_atr", 0.0) or 0.0)
-    _ll_near = LL_MIN_DISTANCE_ATR <= _ll_dist <= LL_MAX_DISTANCE_ATR
-    res.ll_confirmed  = bool(getattr(r, "ll_actionable", False)) and bool(getattr(r, "ll_defended", False)) and _ll_near
-    res.vwap_reversal = bool(getattr(r, "stoch_vwap_touch", False)) and bool(getattr(r, "stoch_vwap_reclaim", False))
+
+    _ll_dist  = float(getattr(r, "ll_distance_atr", 0.0) or 0.0)
+    _ll_bars  = int(getattr(r, "ll_bars_since_reclaim", -1) or -1)
+    _ll_fresh = 0 <= _ll_bars <= LL_MAX_BARS_SINCE_RECLAIM
+    res.ll_confirmed  = bool(getattr(r, "ll_actionable", False)) and bool(getattr(r, "ll_defended", False)) and _ll_fresh
+
+    _vwap_bars  = int(getattr(r, "stoch_vwap_bars_since_touch", -1) or -1)
+    _vwap_fresh = 0 <= _vwap_bars <= VWAP_MAX_BARS_SINCE_TOUCH
+    res.vwap_reversal = bool(getattr(r, "stoch_vwap_touch", False)) and bool(getattr(r, "stoch_vwap_reclaim", False)) and _vwap_fresh
     res.institutional = _institutional_confirmation(r, ia)
 
     res.promo_score = sum(
@@ -234,11 +250,14 @@ def evaluate_promotion(
     if res.stoch_up:
         res.reasons.append("Stochastic re-ignition — fresh bullish %K/%D cross")
     if res.ll_confirmed:
-        res.reasons.append(f"Defended Lower-Low spring — reclaimed, never re-broken, {_ll_dist:.1f} ATR away")
-    elif bool(getattr(r, "ll_actionable", False)) and bool(getattr(r, "ll_defended", False)) and not _ll_near:
-        res.blocked.append(f"LL spring is defended but {_ll_dist:.1f} ATR away — too stale to count as timing")
+        res.reasons.append(f"Defended Lower-Low spring — reclaimed {_ll_bars} bar(s) ago, never re-broken")
+    elif bool(getattr(r, "ll_actionable", False)) and bool(getattr(r, "ll_defended", False)) and not _ll_fresh:
+        _age = f"{_ll_bars} bars ago" if _ll_bars >= 0 else "an unknown number of bars ago"
+        res.blocked.append(f"LL spring is defended but reclaimed {_age} (>{LL_MAX_BARS_SINCE_RECLAIM}) — too stale to count as timing")
     if res.vwap_reversal:
-        res.reasons.append("VWAP touch & reclaim — location and momentum aligned")
+        res.reasons.append(f"VWAP touch & reclaim — touched {_vwap_bars} bar(s) ago, location and momentum aligned")
+    elif bool(getattr(r, "stoch_vwap_touch", False)) and bool(getattr(r, "stoch_vwap_reclaim", False)) and not _vwap_fresh:
+        res.blocked.append(f"VWAP touch/reclaim found but {_vwap_bars} bars ago (>{VWAP_MAX_BARS_SINCE_TOUCH}) — too stale to count as timing")
     if res.institutional:
         res.reasons.append("Institutional confirmation — volume/OBV support the move")
 
