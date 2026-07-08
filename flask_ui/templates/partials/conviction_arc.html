@@ -1,0 +1,28 @@
+{# Conviction arc macro — renders an SVG ring from a 0-100 score.
+   Usage: {% from "partials/conviction_arc.html" import conviction_arc %}
+          {{ conviction_arc(score, size=56, ticker="TCS") }}
+   The numeric label is always rendered (non-color fallback, §12
+   accessibility requirement) alongside the color-coded arc. #}
+{% macro conviction_arc(score, size=48, ticker='') %}
+{% set radius = (size / 2) - 4 %}
+{% set circumference = 2 * 3.14159265 * radius %}
+{% set offset = circumference * (1 - (score / 100)) %}
+{% set color = 'var(--tw-color-elite, #F5B700)' if score >= 85 else ('var(--tw-color-actionable, #22C55E)' if score >= 70 else ('var(--tw-color-watch, #38BDF8)' if score >= 55 else 'var(--tw-color-monitor, #64748B)')) %}
+<svg viewBox="0 0 {{ size }} {{ size }}" width="{{ size }}" height="{{ size }}"
+     class="conviction-arc" data-ticker="{{ ticker }}" role="img"
+     aria-label="Conviction score {{ score }} of 100">
+  <circle cx="{{ size/2 }}" cy="{{ size/2 }}" r="{{ radius }}"
+          fill="none" stroke="#232B3A" stroke-width="4" />
+  <circle cx="{{ size/2 }}" cy="{{ size/2 }}" r="{{ radius }}"
+          fill="none" stroke="{{ color }}" stroke-width="4"
+          stroke-linecap="round"
+          stroke-dasharray="{{ circumference }}"
+          stroke-dashoffset="{{ offset }}"
+          transform="rotate(-90 {{ size/2 }} {{ size/2 }})"
+          class="conviction-arc-fill" />
+  <text x="50%" y="50%" text-anchor="middle" dominant-baseline="central"
+        class="fill-text-0" style="font-size:{{ size/3.4 }}px; font-family: ui-monospace, monospace;">
+    {{ score }}
+  </text>
+</svg>
+{% endmacro %}

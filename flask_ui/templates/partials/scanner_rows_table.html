@@ -1,0 +1,20 @@
+<table class="w-full text-left text-sm" id="scanner-table">
+  <thead class="text-text-1 border-b border-border-0">
+    <tr>
+      <th class="py-2 px-3 font-medium">Ticker</th>
+      <th class="py-2 px-3 font-medium">Price</th>
+      <th class="py-2 px-3 font-medium">%Chg</th>
+      <th class="py-2 px-3 font-medium">Category</th>
+      <th class="py-2 px-3 font-medium">Setup</th>
+      <th class="py-2 px-3 font-medium">Conviction</th>
+      <th class="py-2 px-3 font-medium">R:R</th>
+    </tr>
+  </thead>
+  <tbody id="scanner-table-body">
+    {% for row in rows %}
+      {% include "partials/scanner_row.html" %}
+    {% else %}
+      <tr><td colspan="7" class="py-8 text-center text-text-1">No symbols match this filter.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>

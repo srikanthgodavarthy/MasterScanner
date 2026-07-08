@@ -1,0 +1,7 @@
+<div id="opportunities" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+  {% for row in opportunities %}
+    {% include "partials/opportunity_card.html" %}
+  {% else %}
+    <div class="col-span-full text-text-1 text-sm py-8 text-center">No Elite Opportunities right now.</div>
+  {% endfor %}
+</div>

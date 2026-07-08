@@ -1,0 +1,34 @@
+{% set closes = series.close %}
+{% set w = 640 %}
+{% set h = 220 %}
+{% set pad = 12 %}
+{% if closes %}
+  {% set lo = closes|min %}
+  {% set hi = closes|max %}
+  {% set span = (hi - lo) if hi != lo else 1 %}
+  {% set n = closes|length %}
+  {% set step = ((w - 2*pad) / (n - 1)) if n > 1 else 0 %}
+  {% set points = [] %}
+  {% for c in closes %}
+    {% set x = pad + loop.index0 * step %}
+    {% set y = pad + (h - 2*pad) * (1 - ((c - lo) / span)) %}
+    {% if points.append(x ~ ',' ~ y) %}{% endif %}
+  {% endfor %}
+  <svg viewBox="0 0 {{ w }} {{ h }}" class="w-full h-56" preserveAspectRatio="none">
+    <polyline points="{{ points|join(' ') }}" fill="none" stroke="#3B82F6" stroke-width="2" />
+    <polyline points="{{ pad }},{{ h-pad }} {{ points|join(' ') }} {{ w-pad }},{{ h-pad }}"
+              fill="url(#chartGradient)" stroke="none" opacity="0.15" />
+    <defs>
+      <linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#3B82F6" />
+        <stop offset="100%" stop-color="#3B82F6" stop-opacity="0" />
+      </linearGradient>
+    </defs>
+  </svg>
+  <div class="flex justify-between text-xs text-text-1 mt-1 font-mono">
+    <span>{{ series.dates[0] }}</span>
+    <span>{{ series.dates[-1] }}</span>
+  </div>
+{% else %}
+  <div class="h-56 flex items-center justify-center text-text-1 text-sm">No price data available</div>
+{% endif %}

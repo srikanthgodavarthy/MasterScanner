@@ -1,0 +1,8 @@
+{# Response to POST /trades/<id>/exit. The outer swap target (the active
+   row, hx-swap="outerHTML") is replaced with nothing -- removing it from
+   the Active table. The row below carries hx-swap-oob so htmx prepends
+   the same trade, now closed, into the Recently Closed table in the
+   same response -- only the two affected rows repaint (resolves the
+   §11 open question in favor of an OOB move over a full-table
+   re-render). #}
+{% include "partials/trade_row.html" with context %}

@@ -1,0 +1,23 @@
+{% from "partials/conviction_arc.html" import conviction_arc %}
+<a href="{{ url_for('stock_detail.stock_detail', ticker=row.ticker) }}"
+   class="block rounded-xl border border-border-0 bg-bg-2 p-4 hover:border-interactive transition-colors focus:outline-none focus:ring-2 focus:ring-interactive">
+  <div class="flex items-start justify-between">
+    <div>
+      <div class="font-mono font-semibold text-text-0">{{ row.ticker }}</div>
+      <div class="text-xs text-text-1 mt-0.5">{{ row.category }}</div>
+    </div>
+    {{ conviction_arc(row.conviction_composite, size=44, ticker=row.ticker) }}
+  </div>
+  <div class="mt-3 flex items-baseline justify-between">
+    <span class="font-mono text-lg text-text-0">₹{{ "%.2f"|format(row.price) }}</span>
+    <span class="text-sm font-mono {{ 'text-actionable' if row.pct_chg >= 0 else 'text-danger' }}">
+      {{ "%+.2f"|format(row.pct_chg) }}%
+    </span>
+  </div>
+  <div class="mt-2 flex items-center gap-2 text-xs text-text-1">
+    <span class="uppercase tracking-wide">{{ row.setup }}</span>
+    {% if row.is_amber %}
+      <span class="px-1.5 py-0.5 rounded bg-elite/20 text-elite">Rank #1</span>
+    {% endif %}
+  </div>
+</a>

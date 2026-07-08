@@ -1,0 +1,26 @@
+{% from "partials/conviction_arc.html" import conviction_arc %}
+<tr id="row-{{ row.ticker }}"
+    class="border-b border-border-0 hover:bg-bg-2 cursor-pointer focus-within:ring-2 focus-within:ring-interactive"
+    tabindex="0"
+    hx-get="{{ url_for('dashboard.analysis_drawer', ticker=row.ticker) }}"
+    hx-target="#drawer"
+    hx-swap="innerHTML"
+    hx-on::after-request="document.getElementById('drawer-backdrop').classList.remove('hidden'); document.getElementById('drawer').classList.remove('translate-x-full');">
+  <td class="py-2 px-3 font-mono font-medium text-text-0">{{ row.ticker }}</td>
+  <td class="py-2 px-3 font-mono price-cell" data-ticker="{{ row.ticker }}">₹{{ "%.2f"|format(row.price) }}</td>
+  <td class="py-2 px-3 font-mono {{ 'text-actionable' if row.pct_chg >= 0 else 'text-danger' }}">
+    {{ "%+.2f"|format(row.pct_chg) }}%
+  </td>
+  <td class="py-2 px-3">
+    <span class="text-xs px-2 py-0.5 rounded-full border border-border-0
+      {{ 'text-elite border-elite/40' if row.category == 'Elite Opportunity'
+         else 'text-actionable border-actionable/40' if row.category == 'Actionable'
+         else 'text-watch border-watch/40' if row.category == 'Watch'
+         else 'text-monitor border-monitor/40' }}">
+      {{ row.category }}
+    </span>
+  </td>
+  <td class="py-2 px-3 text-text-1 text-sm uppercase">{{ row.setup }}</td>
+  <td class="py-2 px-3">{{ conviction_arc(row.conviction_composite, size=36, ticker=row.ticker) }}</td>
+  <td class="py-2 px-3 font-mono text-sm text-text-1">{{ row.rr }}R</td>
+</tr>

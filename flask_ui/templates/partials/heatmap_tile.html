@@ -1,0 +1,18 @@
+{% set intensity = 'bg-elite/30 border-elite/50' if tile.avg_score >= 80
+                   else 'bg-actionable/25 border-actionable/40' if tile.avg_score >= 65
+                   else 'bg-watch/20 border-watch/30' if tile.avg_score >= 50
+                   else 'bg-monitor/15 border-monitor/30' %}
+<a href="{{ url_for('stock_detail.stock_detail', ticker=tile.top_ticker) }}"
+   class="rounded-lg border p-4 flex flex-col justify-between h-28 hover:brightness-110 transition
+          focus:outline-none focus:ring-2 focus:ring-interactive {{ intensity }}">
+  <div class="text-sm font-medium text-text-0">{{ tile.sector }}</div>
+  <div>
+    <div class="font-mono text-xl">{{ tile.avg_score }}</div>
+    <div class="text-xs text-text-1 flex justify-between">
+      <span>{{ tile.count }} stocks</span>
+      <span class="{{ 'text-actionable' if tile.avg_pct_chg >= 0 else 'text-danger' }}">
+        {{ "%+.2f"|format(tile.avg_pct_chg) }}%
+      </span>
+    </div>
+  </div>
+</a>

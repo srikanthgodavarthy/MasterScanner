@@ -1,1 +1,57 @@
+{% from "partials/conviction_arc.html" import conviction_arc %}
+<div class="p-5 h-full overflow-y-auto">
+  <div class="flex items-start justify-between mb-4">
+    <div>
+      <div class="font-mono text-xl font-semibold">{{ ticker }}</div>
+      <div class="text-xs text-text-1">{{ breakdown.category }} · {{ breakdown.signal_class }}</div>
+    </div>
+    <button class="text-text-1 hover:text-text-0 focus:outline-none focus:ring-2 focus:ring-interactive rounded"
+      onclick="document.getElementById('drawer-backdrop').classList.add('hidden'); document.getElementById('drawer').classList.add('translate-x-full');">
+      ✕
+    </button>
+  </div>
 
+  <div class="flex justify-center mb-6">
+    {{ conviction_arc(breakdown.composite, size=96, ticker=ticker) }}
+  </div>
+
+  <h3 class="text-sm font-medium text-text-1 mb-2">Pillar breakdown</h3>
+  <div class="space-y-2 mb-6">
+    {% for p in breakdown.pillars %}
+    <div>
+      <div class="flex justify-between text-xs mb-1">
+        <span class="text-text-1">{{ p.label }}</span>
+        <span class="font-mono">{{ p.value }}</span>
+      </div>
+      <div class="h-1.5 rounded-full bg-bg-2 overflow-hidden">
+        <div class="h-full bg-interactive" style="width:{{ p.value }}%"></div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <h3 class="text-sm font-medium text-text-1 mb-2">Lifecycle timeline</h3>
+  <ol class="border-l border-border-0 ml-1 mb-6">
+    {% for step in timeline %}
+    <li class="ml-4 mb-3 relative">
+      <span class="absolute -left-[21px] top-1 w-2 h-2 rounded-full bg-interactive"></span>
+      <div class="text-sm text-text-0">{{ step.stage }}</div>
+      <div class="text-xs text-text-1">{{ step.days_ago }} days ago</div>
+    </li>
+    {% endfor %}
+  </ol>
+
+  {% if blockers %}
+  <h3 class="text-sm font-medium text-text-1 mb-2">Blockers</h3>
+  <ul class="space-y-1 mb-6">
+    {% for b in blockers %}
+    <li class="text-sm text-danger flex gap-2"><span>⚠</span><span>{{ b }}</span></li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+
+  <a href="{{ url_for('stock_detail.stock_detail', ticker=ticker) }}"
+     class="block text-center w-full py-2 rounded-lg bg-interactive text-white font-medium hover:opacity-90 focus:outline-none focus:ring-2 focus:ring-interactive">
+    Full stock detail →
+  </a>
+</div>
