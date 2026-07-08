@@ -618,3 +618,319 @@ FACTOR_WEIGHTS: dict[str, dict] = {
     "Conviction":    {"trend_structure": 30, "fib_zone": 25, "cci_recovery": 25, "volume": 15, "squeeze": 5},
     "Entry Quality": {"ema20_dist": 30, "pivot_dist": 20, "move_since": 20, "ema50_dist": 15, "bars_since": 15},
 }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CONVICTION SCORE v2 — Swift-trade composite (2026-07)
+# ══════════════════════════════════════════════════════════════════
+#
+# v1's composite (L=25% / C=25% / EQ=50%) is frozen above for
+# back-comparison. v2 does NOT touch _leadership(), _conviction(),
+# or _entry_quality() — the sub-factor scoring is untouched. It only
+# changes how the three pillar scores are blended for a swift-trade
+# profile (short holding period, fast trigger-to-target).
+#
+# Rationale (see decision_engine._extension()):
+#   decision_engine._extension() already scores ema20_pct_dist (32),
+#   ema50_pct_dist (15), pivot_high_dist (20) and price_move_since_setup
+#   (33) as a HARD GATE (extension <= 25/35/40 required for the higher
+#   backtest_engine.py tiers) — near-identical to entry_quality's
+#   ema20_dist (30) / ema50_dist (15) / pivot_dist (20) / move_since (20).
+#   3 of EQ's 4 factors are already policed downstream by the Extension
+#   gate; EQ's unique contribution inside the composite is mainly
+#   eq_bars_since_setup (15 pts — deliberately excluded from Extension
+#   per that function's own docstring, so NOT redundant).
+#
+#   Conviction (trend_structure, fib_zone, cci_recovery, volume,
+#   squeeze) has no downstream duplicate anywhere in the funnel, and
+#   its factors (squeeze_release, recent_cci_recovery) are most
+#   directly tied to "will this move fast" — what a swift/short-hold
+#   trade needs most.
+#
+#   New composite: Leadership 15% / Conviction 60% / Entry Quality 25%
+#
+# NOTE: these weights are an architectural judgment call, not yet
+# re-validated against a holding-period-filtered backtest. Before
+# trusting this in production, re-run backtest_engine.py's factor
+# attribution filtered to short-hold trades only, and compare
+# expectancy/PF against v1 and v2 composites side by side.
+# ══════════════════════════════════════════════════════════════════
+
+W_V2_LEADERSHIP    = 0.15
+W_V2_CONVICTION    = 0.60
+W_V2_ENTRY_QUALITY = 0.25
+
+
+@dataclass
+class ConvictionV2(ConvictionV1):
+    """Same shape as ConvictionV1 — composite uses the swift-trade weights."""
+    pass
+
+
+def _classify_v2(leadership: int, conviction: int, entry_quality: int) -> str:
+    """
+    v2 analogue of _classify() / signal_class.
+
+    v1's _classify() is frozen (per its own docstring, kept only as
+    "CV1_SignalClass — legacy CV1-only label, kept for reference" in
+    scanner_engine.py) and uses individual floors ONLY — no composite
+    check. compute_conviction_v1() and compute_conviction_v2() both
+    called that same unweighted function, which meant the swift-trade
+    reweighting had zero effect on ELITE/EXECUTE/WATCH/SKIP — only on
+    classify_tier's Actionable funnel. This function closes that gap
+    for v2 specifically, without touching the v1 original.
+
+    Individual floors are lowered/raised roughly in proportion to the
+    v2 pillar weights (L 15% / C 60% / EQ 25%), and a composite floor
+    is added on top — same "composite alone is compensatory, floors
+    are non-negotiable" reasoning as classify_tier_v2.
+
+    PLACEHOLDER THRESHOLDS — same caveat as classify_tier_v2: not yet
+    re-fit against v2's real score distribution.
+    """
+    composite = (leadership * W_V2_LEADERSHIP) + (conviction * W_V2_CONVICTION) + (entry_quality * W_V2_ENTRY_QUALITY)
+
+    if leadership >= 60 and conviction >= 80 and entry_quality >= 65 and composite >= 75:
+        return "ELITE"
+    if leadership >= 45 and conviction >= 65 and entry_quality >= 55 and composite >= 62:
+        return "EXECUTE"
+    if leadership >= 35 or composite >= 40:
+        return "WATCH"
+    return "SKIP"
+
+
+def classify_tier_v2(leadership: int, conviction: int, entry_quality: int) -> str:
+    """
+    v2 analogue of classify_tier() — same funnel shape (Skip → Watch →
+    Developing → Actionable), rescaled for a Conviction-dominant composite.
+
+    PLACEHOLDER THRESHOLDS: scaled proportionally from v1's cutoffs, not
+    re-fit against v2's actual score distribution. Re-validate against a
+    real backtest run before relying on these for live gating — see
+    module note above.
+    """
+    composite = (leadership * W_V2_LEADERSHIP) + (conviction * W_V2_CONVICTION) + (entry_quality * W_V2_ENTRY_QUALITY)
+
+    # Conviction floor added: since conviction now carries 60% of the
+    # composite, a high composite driven almost entirely by conviction
+    # (with weak leadership/entry) should not slip into Actionable —
+    # v1 used a leadership floor for the equivalent guard; v2 needs both.
+    if leadership >= 45 and conviction >= 65 and composite >= 65:
+        return "Actionable"
+    if composite >= 50:
+        return "Developing"
+    if leadership >= 35 or composite >= 35:
+        return "Watch"
+    return "Skip"
+
+
+def compute_conviction_v2(r: "BarResult") -> ConvictionV2:
+    """
+    Compute Conviction Score v2 (swift-trade composite) from an existing
+    BarResult. Reuses v1's unchanged _leadership()/_conviction()/
+    _entry_quality() sub-scoring — only the composite blend differs.
+
+    Inputs : scoring_core.BarResult (output of compute_bar())
+    Outputs: ConvictionV2 dataclass — same fields as ConvictionV1, with
+             composite computed from the 15/60/25 swift-trade weights.
+    """
+    leadership,    ls_subs = _leadership(r)
+    conviction,    cv_subs = _conviction(r)
+    entry_quality, eq_subs = _entry_quality(r)
+
+    composite = int(round(
+        (leadership * W_V2_LEADERSHIP)
+        + (conviction * W_V2_CONVICTION)
+        + (entry_quality * W_V2_ENTRY_QUALITY)
+    ))
+    signal = _classify_v2(leadership, conviction, entry_quality)
+
+    return ConvictionV2(
+        leadership    = leadership,
+        conviction    = conviction,
+        entry_quality = entry_quality,
+        composite     = composite,
+        signal_class  = signal,
+        # Leadership subs
+        ls_rs_composite        = ls_subs["ls_rs_composite"],
+        ls_trend_age           = ls_subs["ls_trend_age"],
+        ls_adx                 = ls_subs["ls_adx"],
+        ls_persistent_strength = ls_subs["ls_persistent_strength"],
+        ls_ema20_slope         = ls_subs["ls_ema20_slope"],
+        # Conviction subs
+        cv_trend_structure = cv_subs["cv_trend_structure"],
+        cv_fib_zone        = cv_subs["cv_fib_zone"],
+        cv_cci_recovery    = cv_subs["cv_cci_recovery"],
+        cv_volume           = cv_subs["cv_volume"],
+        cv_squeeze          = cv_subs["cv_squeeze"],
+        # Entry Quality subs
+        eq_ema20_dist       = eq_subs["eq_ema20_dist"],
+        eq_ema50_dist       = eq_subs["eq_ema50_dist"],
+        eq_pivot_dist       = eq_subs["eq_pivot_dist"],
+        eq_move_since_setup = eq_subs["eq_move_since_setup"],
+        eq_bars_since_setup = eq_subs["eq_bars_since_setup"],
+        # Grade labels
+        leadership_grade    = _grade(leadership),
+        conviction_grade    = _grade(conviction),
+        entry_quality_grade = _grade(entry_quality),
+        # Raw measurements (pass-through for display)
+        rs_composite           = r.rs_composite,
+        trend_age_bars         = r.trend_age_bars,
+        adx_val                = r.adx_val,
+        ema20_slope            = r.ema20_slope,
+        ema20_pct_dist          = r.ema20_pct_dist,
+        ema50_pct_dist          = r.ema50_pct_dist,
+        pivot_high_dist         = r.pivot_high_dist,
+        price_move_since_setup  = r.price_move_since_setup,
+        bars_since_setup        = r.bars_since_setup,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CLASSIFY TIER v3 — 20/50/30 composite, floors relaxed (2026-07)
+# ══════════════════════════════════════════════════════════════════
+#
+# Same funnel shape as classify_tier() (v1, frozen, 25/25/50) and
+# classify_tier_v2() (15/60/25) — this is a third weighting point,
+# not a replacement for either. v1 and v2 are both untouched.
+#
+# New composite: Leadership 20% / Conviction 50% / Entry Quality 30%
+#
+# Per the "reduce individual scores to qualify the percentages"
+# direction: v1's floors (leadership >= 55 for Actionable, >= 40 for
+# Watch) were sized for a composite where Leadership carried 25% of
+# the blend. Here Leadership only carries 20%, so holding it to v1's
+# floor would make the floor the binding constraint almost every
+# time — the composite/weighting would rarely get to do its job.
+# Floors are lowered so the weighted composite is what actually
+# decides most borderline cases; Leadership and Conviction (the two
+# highest-weighted pillars) keep floors so a strong percentage score
+# built almost entirely off Entry Quality still can't compensate its
+# way to Actionable — same "floors are non-negotiable, composite is
+# not the whole story" reasoning as v1 and v2.
+#
+# PLACEHOLDER THRESHOLDS — not yet re-validated against a real score
+# distribution. Re-run backtest_engine.py's factor attribution before
+# trusting this for live gating, same caveat as v2.
+# ══════════════════════════════════════════════════════════════════
+
+W_V3_LEADERSHIP    = 0.20
+W_V3_CONVICTION    = 0.50
+W_V3_ENTRY_QUALITY = 0.30
+
+
+def classify_tier_v3(leadership: int, conviction: int, entry_quality: int) -> str:
+    """
+    v3 analogue of classify_tier() — 20/50/30 composite, floors
+    relaxed relative to v1 so the weighted percentage carries more of
+    the qualification decision.
+
+    PLACEHOLDER THRESHOLDS — see module note above.
+    """
+    composite = (leadership * W_V3_LEADERSHIP) + (conviction * W_V3_CONVICTION) + (entry_quality * W_V3_ENTRY_QUALITY)
+
+    # Leadership floor: 55 -> 40 (v1 was sized for 25% weight; at 20%
+    # the old floor would dominate the decision almost every time).
+    # Conviction floor: new, 55 — the highest-weighted pillar (50%)
+    # still needs its own non-negotiable minimum, same reasoning v2
+    # applied at its 60% weight.
+    if leadership >= 40 and conviction >= 55 and composite >= 65:
+        return "Actionable"
+    if composite >= 50:
+        return "Developing"
+    # Watch floor: 40 -> 30, same proportional relaxation as Actionable.
+    if leadership >= 30 or composite >= 35:
+        return "Watch"
+    return "Skip"
+
+
+@dataclass
+class ConvictionV3(ConvictionV1):
+    """Same shape as ConvictionV1 — composite uses the 20/50/30 weights."""
+    pass
+
+
+def _classify_v3(leadership: int, conviction: int, entry_quality: int) -> str:
+    """
+    v3 analogue of _classify() / signal_class — 20/50/30 composite,
+    floors relaxed the same way classify_tier_v3 relaxed its floors.
+
+    Same reasoning as _classify_v2: v1's _classify() is frozen/legacy
+    and unweighted, so it wouldn't reflect the 20/50/30 blend at all
+    if reused here. This closes that gap for v3, independent of v2.
+
+    PLACEHOLDER THRESHOLDS — not yet re-fit against v3's real score
+    distribution.
+    """
+    composite = (leadership * W_V3_LEADERSHIP) + (conviction * W_V3_CONVICTION) + (entry_quality * W_V3_ENTRY_QUALITY)
+
+    if leadership >= 55 and conviction >= 75 and entry_quality >= 70 and composite >= 72:
+        return "ELITE"
+    if leadership >= 40 and conviction >= 55 and entry_quality >= 55 and composite >= 60:
+        return "EXECUTE"
+    if leadership >= 30 or composite >= 40:
+        return "WATCH"
+    return "SKIP"
+
+
+def compute_conviction_v3(r: "BarResult") -> ConvictionV3:
+    """
+    Compute Conviction Score v3 (20/50/30 composite) from an existing
+    BarResult. Reuses v1's unchanged _leadership()/_conviction()/
+    _entry_quality() sub-scoring — only the composite blend and the
+    tier/signal thresholds differ (classify_tier_v3 / _classify_v3).
+
+    Inputs : scoring_core.BarResult (output of compute_bar())
+    Outputs: ConvictionV3 dataclass — same fields as ConvictionV1, with
+             composite computed from the 20/50/30 weights.
+    """
+    leadership,    ls_subs = _leadership(r)
+    conviction,    cv_subs = _conviction(r)
+    entry_quality, eq_subs = _entry_quality(r)
+
+    composite = int(round(
+        (leadership * W_V3_LEADERSHIP)
+        + (conviction * W_V3_CONVICTION)
+        + (entry_quality * W_V3_ENTRY_QUALITY)
+    ))
+    signal = _classify_v3(leadership, conviction, entry_quality)
+
+    return ConvictionV3(
+        leadership    = leadership,
+        conviction    = conviction,
+        entry_quality = entry_quality,
+        composite     = composite,
+        signal_class  = signal,
+        # Leadership subs
+        ls_rs_composite        = ls_subs["ls_rs_composite"],
+        ls_trend_age           = ls_subs["ls_trend_age"],
+        ls_adx                 = ls_subs["ls_adx"],
+        ls_persistent_strength = ls_subs["ls_persistent_strength"],
+        ls_ema20_slope         = ls_subs["ls_ema20_slope"],
+        # Conviction subs
+        cv_trend_structure = cv_subs["cv_trend_structure"],
+        cv_fib_zone        = cv_subs["cv_fib_zone"],
+        cv_cci_recovery    = cv_subs["cv_cci_recovery"],
+        cv_volume           = cv_subs["cv_volume"],
+        cv_squeeze          = cv_subs["cv_squeeze"],
+        # Entry Quality subs
+        eq_ema20_dist       = eq_subs["eq_ema20_dist"],
+        eq_ema50_dist       = eq_subs["eq_ema50_dist"],
+        eq_pivot_dist       = eq_subs["eq_pivot_dist"],
+        eq_move_since_setup = eq_subs["eq_move_since_setup"],
+        eq_bars_since_setup = eq_subs["eq_bars_since_setup"],
+        # Grade labels
+        leadership_grade    = _grade(leadership),
+        conviction_grade    = _grade(conviction),
+        entry_quality_grade = _grade(entry_quality),
+        # Raw measurements (pass-through for display)
+        rs_composite           = r.rs_composite,
+        trend_age_bars         = r.trend_age_bars,
+        adx_val                = r.adx_val,
+        ema20_slope            = r.ema20_slope,
+        ema20_pct_dist          = r.ema20_pct_dist,
+        ema50_pct_dist          = r.ema50_pct_dist,
+        pivot_high_dist         = r.pivot_high_dist,
+        price_move_since_setup  = r.price_move_since_setup,
+        bars_since_setup        = r.bars_since_setup,
+    )
