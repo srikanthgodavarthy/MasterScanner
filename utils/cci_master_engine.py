@@ -109,6 +109,17 @@ class CCIMasterParams:
     blend_into_score: bool = False
     stoch_entry_bonus: int = 2
     stoch_trim_penalty: int = 1
+
+    # gate_require_stoch_entry=True: hard gate, not a bonus. A row can only
+    # keep a BUY/STRONG BUY rating if stoch_entry_signal is True on that bar
+    # (i.e. a short-CCI regime trip AND a matching Stochastic timing
+    # crossover both fired). Otherwise it is downgraded to WATCH regardless
+    # of how high the underlying Pine state/signal score is — e.g. a stock
+    # sitting in OB state alone (no fresh Stochastic entry) will NOT reach
+    # Buy under gating, even though that alone is enough in Classic Pine or
+    # blend_into_score mode. This is stricter than blend_into_score and the
+    # two are mutually exclusive in the UI (gate wins if both are set).
+    gate_require_stoch_entry: bool = False
     stoch_params: "StochConfluenceParams | None" = None
 
 
@@ -387,6 +398,19 @@ def compute_cci_master(df: pd.DataFrame, params: CCIMasterParams) -> pd.DataFram
     )
     out["cci_rating"] = rating
 
+    # ── Optional hard Stochastic gate ───────────────────────────────
+    # Applied AFTER rating so it can override Buy/Strong Buy earned purely
+    # from Pine state/signal (or from blend_into_score's bonus). A row
+    # keeps its rating only if stoch_entry_signal is True on that bar.
+    if params.gate_require_stoch_entry and stoch_entry_signal is not None:
+        would_qualify = np.isin(rating, [RATING_STRONG_BUY, RATING_BUY])
+        gated_out = would_qualify & ~stoch_entry_signal.values
+        out["gate_blocked"] = gated_out
+        rating = np.where(gated_out, RATING_WATCH, rating)
+        out["cci_rating"] = rating
+    else:
+        out["gate_blocked"] = False
+
     return out
 
 
@@ -429,6 +453,7 @@ def _score_one_symbol(symbol: str, df: pd.DataFrame, params: CCIMasterParams) ->
         bool(stoch_entry and str(last["cci_rating"]) in (RATING_STRONG_BUY, RATING_BUY))
         if stoch_entry is not None else None
     )
+    gate_blocked = bool(last["gate_blocked"]) if "gate_blocked" in computed.columns else False
 
     return {
         "Stock":        symbol,
@@ -445,6 +470,7 @@ def _score_one_symbol(symbol: str, df: pd.DataFrame, params: CCIMasterParams) ->
         "Stoch_Entry":  stoch_entry,
         "Stoch_Trim":   stoch_trim,
         "Confluence":   confluence,
+        "Gate_Blocked": gate_blocked,
         # ── Trade plan fields ──────────────────────────────────────
         "SL":           levels["sl"],
         "T1":           levels["t1"],
@@ -517,6 +543,7 @@ def get_symbol_cci_history(symbol: str, period: str = "6mo",
                             buy_score: int = DEFAULT_BUY_SCORE,
                             enable_stoch_confluence: bool = ENABLE_STOCHASTIC_CONFLUENCE,
                             blend_into_score: bool = False,
+                            gate_require_stoch_entry: bool = False,
                             stoch_cci_length: int = 12,
                             stoch_cci_moderate: float = 150.0,
                             stoch_cci_extreme: float = 200.0) -> pd.DataFrame:
@@ -530,6 +557,7 @@ def get_symbol_cci_history(symbol: str, period: str = "6mo",
         strong_score=strong_score, buy_score=buy_score,
         enable_stoch_confluence=enable_stoch_confluence,
         blend_into_score=blend_into_score,
+        gate_require_stoch_entry=gate_require_stoch_entry,
         stoch_params=StochConfluenceParams(
             cci_length=stoch_cci_length,
             cci_moderate=stoch_cci_moderate,
