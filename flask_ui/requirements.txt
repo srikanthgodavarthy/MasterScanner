@@ -1,0 +1,11 @@
+flask
+jinja2
+flask-caching
+gunicorn
+python-dotenv
+pandas
+numpy
+yfinance
+streamlit   # required only because utils/scanner_engine.py still uses
+            # @st.cache_data decorators directly (see README "Streamlit
+            # coupling" note) — not because Flask needs it
