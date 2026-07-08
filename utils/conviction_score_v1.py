@@ -494,7 +494,9 @@ def classify_tier(leadership: int, conviction: int, entry_quality: int) -> str:
     Actionable  — high-quality setup, entry attractive — eligible for
                   the Promotion Engine to evaluate Execute/Elite timing
     """
-    composite = (leadership + conviction + entry_quality) / 3.0
+    # [Weight change] Composite reweighted: Leadership 25% / Conviction 25%
+    # / Entry Quality 50% (previously an equal 33.3/33.3/33.3 split).
+    composite = (leadership * 0.25) + (conviction * 0.25) + (entry_quality * 0.50)
 
     if leadership >= 55 and composite >= 65:
         return "Actionable"
@@ -533,7 +535,9 @@ def compute_conviction_v1(r: "BarResult") -> ConvictionV1:
     conviction,    cv_subs = _conviction(r)
     entry_quality, eq_subs = _entry_quality(r)
 
-    composite = int(round((leadership + conviction + entry_quality) / 3))
+    # [Weight change] Composite reweighted: Leadership 25% / Conviction 25%
+    # / Entry Quality 50% (previously an equal 33.3/33.3/33.3 split).
+    composite = int(round((leadership * 0.25) + (conviction * 0.25) + (entry_quality * 0.50)))
     signal    = _classify(leadership, conviction, entry_quality)
 
     return ConvictionV1(
