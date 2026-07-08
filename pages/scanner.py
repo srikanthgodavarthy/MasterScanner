@@ -2824,7 +2824,7 @@ def render(settings: dict | None = None):
         st.markdown(_scoring_explainer_html(), unsafe_allow_html=True)
 
     # ── Toggles ──────────────────────────────────────────────────
-    tgl1, tgl2, tgl3 = st.columns([2, 2, 2])
+    tgl1, tgl2 = st.columns([2, 2])
     with tgl1:
         val_mode = st.checkbox(
             "🔬 Validation mode — Signal Class vs legacy tier side-by-side",
@@ -2832,12 +2832,6 @@ def render(settings: dict | None = None):
         )
     with tgl2:
         show_skip = st.checkbox("Show SKIP candidates", value=False, key="chk_show_skip")
-    with tgl3:
-        st.selectbox(
-            "Sort by",
-            ["Leadership ↓", "Freshest First 🟢"],
-            key="sort_persistence",
-        )
 
     # ── Split by Recommendation (CV1 tier + Promotion Engine) ──────
     has_cv1 = "Recommendation" in df_aug.columns
@@ -2846,9 +2840,9 @@ def render(settings: dict | None = None):
         if not has_cv1:
             return pd.DataFrame()
         _base = df_aug[df_aug["Recommendation"] == sc].copy()
-        sort_key = st.session_state.get("sort_persistence", "Leadership ↓")
-        if sort_key == "Freshest First 🟢" and "DaysActive" in _base.columns:
-            _base = _base.sort_values("DaysActive", ascending=True)
+        # Default sort: Score (CV1_Composite) high → low.
+        if "CV1_Composite" in _base.columns:
+            _base = _base.sort_values("CV1_Composite", ascending=False)
         elif "CV1_Leadership" in _base.columns:
             _base = _base.sort_values("CV1_Leadership", ascending=False)
         return _base
