@@ -490,17 +490,26 @@ def _primary_blocker(r, result: dict) -> str:
         ext = int(result.get("Extension", result.get("Legacy_EntryQuality", result.get("DE_EntryQuality", 0))) or 0)
         return f"Extended ({ext}) — wait for pullback to EMA/Fib"
 
-    # Pull scores — use CV1 for Leadership (matches scanner display colours at threshold 65);
-    # fall back to Legacy_* (diagnostic-only, no longer DE production logic) when CV1 is absent,
-    # then to the old "DE_*" key name for rows/cache written before the rename.
-    ls = float(result.get("CV1_Leadership",  result.get("Legacy_Leadership",   result.get("DE_Leadership",   0))) or 0)
-    cv = float(result.get("CV1_Conviction",   result.get("Legacy_Conviction",   result.get("DE_Conviction",   0))) or 0)
-    eq = float(result.get("CV1_EntryQuality", result.get("Legacy_EntryQuality", result.get("DE_EntryQuality", 0))) or 0)
-    ext= float(result.get("Extension",       0) or 0)
+    # Pull scores — use CV1 (v3: 20/50/30 composite, live since 2026-07) for
+    # Leadership; fall back to Legacy_* (diagnostic-only, no longer DE
+    # production logic) when CV1 is absent, then to the old "DE_*" key name
+    # for rows/cache written before the rename.
+    ls  = float(result.get("CV1_Leadership",  result.get("Legacy_Leadership",   result.get("DE_Leadership",   0))) or 0)
+    cv  = float(result.get("CV1_Conviction",   result.get("Legacy_Conviction",   result.get("DE_Conviction",   0))) or 0)
+    eq  = float(result.get("CV1_EntryQuality", result.get("Legacy_EntryQuality", result.get("DE_EntryQuality", 0))) or 0)
+    ext = float(result.get("Extension",       0) or 0)
+    # v3 composite (20/50/30) — prefer the value CV3 already computed;
+    # recompute only as a fallback for rows/cache predating CV1_Composite.
+    composite = float(result.get("CV1_Composite", 0) or 0)
+    if not composite:
+        composite = (ls * 0.20) + (cv * 0.50) + (eq * 0.30)
 
-    # Priority 1: Leadership gate — threshold aligned with _SCORE_THRESHOLDS["Leadership"]=65
-    # and _bucket() in scanner.py so blocker text and score colours are consistent.
-    if ls < 65:
+    # Priority 1: Leadership gate — aligned with classify_tier_v3()'s
+    # Actionable floor (leadership >= 40), NOT v1's 65/55 floors. v3 has
+    # been the live gate since 2026-07; this blocker message must match
+    # whatever tier logic actually decided the Category, or the "why not
+    # Actionable" text lies about the real reason.
+    if ls < 40:
         ls_rs   = int(result.get("_ds_ls_rs",   result.get("_de_ls_rs",   0)) or 0)
         ls_trend= int(result.get("_ds_ls_trend", result.get("_de_ls_trend",0)) or 0)
         detail = "trend below EMA" if ls_trend < 20 else "RS below market"
@@ -510,8 +519,10 @@ def _primary_blocker(r, result: dict) -> str:
     if ext >= 60:
         return f"Extended ({int(ext)}) — wait for pullback"
 
-    # Priority 3: Conviction (setup quality — Fib zone / CCI / squeeze)
-    if cv < 50:
+    # Priority 3: Conviction gate — v3's Actionable floor is conviction >= 55
+    # (v1 used 50; v3 leans harder on Conviction since it carries 50% of
+    # the composite weight).
+    if cv < 55:
         # Prefer CV1's cv_fib_zone which accounts for both pullback AND
         # continuation paths (stock above Fib 61.8% / above pivot high).
         # Fall back to DE cv_fib (now also updated with continuation path).
@@ -525,8 +536,13 @@ def _primary_blocker(r, result: dict) -> str:
             sub = f"DE score {int(cv)}"
         return f"Low Conviction ({int(cv)}) — {sub}"
 
-    # Priority 4: Entry Quality (too extended from entry levels)
-    if eq < 60:
+    # Priority 4: v3 has no standalone Entry Quality floor — EQ only
+    # enters the decision via its 30% composite weight. So once Leadership
+    # and Conviction clear their floors, the remaining blocker (if any) is
+    # the composite itself falling short of v3's Actionable bar (>= 65),
+    # which in practice is almost always an Entry Quality drag since LS/CV
+    # already passed their own floors above.
+    if composite < 65:
         eq_ema = int(result.get("_ds_eq_ema20_dist", result.get("_cv1_eq_ema20", 0)) or 0)
         eq_piv = int(result.get("_ds_eq_pivot_dist", result.get("_cv1_eq_piv",  0)) or 0)
         if eq_ema < 10:
@@ -534,8 +550,8 @@ def _primary_blocker(r, result: dict) -> str:
         elif eq_piv < 8:
             sub = "too far above pivot"
         else:
-            sub = f"DE score {int(eq)}"
-        return f"Low Entry Quality ({int(eq)}) — {sub}"
+            sub = f"EQ score {int(eq)}"
+        return f"Composite {int(composite)} (need 65) — Low Entry Quality ({int(eq)}) — {sub}"
 
     # Priority 5: CCI momentum not confirmed
     try:
@@ -545,10 +561,12 @@ def _primary_blocker(r, result: dict) -> str:
     except (TypeError, ValueError):
         pass
 
-    # Leader / Setup Building with everything borderline
+    # Leader / Setup Building with everything borderline — all v3 floors
+    # (LS>=40, CV>=55, composite>=65) already passed above, so this is a
+    # genuine "everything is borderline-adequate" state, not a specific gate.
     if category == "Leader":
-        return f"Leader — DE conviction {int(cv)} (need 50) · await base"
-    return f"Setup Building — DE conviction {int(cv)} (need 60) or DE entry {int(eq)} (need 60)"
+        return f"Leader — DE conviction {int(cv)} (need 55) · await base"
+    return f"Setup Building — composite {int(composite)} (need 65)"
 
 
 def score_stock(
