@@ -169,7 +169,10 @@ def _price_cell(val, color="#e6edf3") -> str:
     return f'<td style="color:{color};font-weight:600">{float(val):.2f}</td>'
 
 
-def _confluence_cell(val) -> str:
+def _confluence_cell(val, gate_blocked=False) -> str:
+    if gate_blocked:
+        return ('<td><span class="cci-badge" style="background:rgba(0,0,0,0.3);'
+                'border:1px solid #ef535055;color:#ef5350">⛔ GATED</span></td>')
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return '<td style="color:#484f58">—</td>'
     if bool(val):
@@ -287,9 +290,10 @@ def _build_table_html(df: pd.DataFrame) -> str:
 
     has_levels = "SL" in df.columns
     has_confluence = "Confluence" in df.columns and df["Confluence"].notna().any()
+    has_gate = "Gate_Blocked" in df.columns and df["Gate_Blocked"].any()
 
     headers = ["Stock", "Close", "Chg%", "CCI", "State", "Signal", "Score", "Rating"]
-    if has_confluence:
+    if has_confluence or has_gate:
         headers += ["Stoch Confluence"]
     if has_levels:
         headers += ["SL", "T1", "T2", "RR"]
@@ -305,8 +309,8 @@ def _build_table_html(df: pd.DataFrame) -> str:
         cells += _signal_cell(str(row.get("Signal", "-")))
         cells += _score_cell(row.get("Score"))
         cells += _rating_cell(str(row.get("Rating", "-")), bool(row.get("FreshRating", False)))
-        if has_confluence:
-            cells += _confluence_cell(row.get("Confluence"))
+        if has_confluence or has_gate:
+            cells += _confluence_cell(row.get("Confluence"), gate_blocked=bool(row.get("Gate_Blocked", False)))
         if has_levels:
             cells += _price_cell(row.get("SL"), "#ef5350")
             cells += _price_cell(row.get("T1"), "#26c6da")
@@ -358,15 +362,20 @@ def render(settings: dict | None = None):
     with sc1:
         mode = st.radio(
             "CCI Mode",
-            ["Classic Pine", "+ Stoch Confluence (info)", "+ Stoch Confluence (blended into score)"],
+            ["Classic Pine", "+ Stoch Confluence (info)",
+             "+ Stoch Confluence (blended into score)",
+             "+ Stoch Gate (required for Buy/Strong Buy)"],
             index=0, key="ccim_mode",
             help="Classic Pine = unchanged 1:1 indicator port. Info = stochastic "
                  "columns shown alongside, score untouched. Blended = a confirmed "
                  "regime-trip + Stochastic entry crossover adjusts cci_score before "
-                 "rating thresholds are applied.",
+                 "rating thresholds are applied. Gate = HARD requirement — a stock "
+                 "cannot show Buy/Strong Buy without a live Stochastic entry "
+                 "crossover, no matter how strong its CCI state/signal score is.",
         )
     enable_confluence = mode != "Classic Pine"
     blend_into_score = mode == "+ Stoch Confluence (blended into score)"
+    gate_mode = mode == "+ Stoch Gate (required for Buy/Strong Buy)"
     with sc2:
         if enable_confluence:
             stoch_len = st.number_input("Regime CCI Len", min_value=5, max_value=30,
@@ -381,11 +390,16 @@ def render(settings: dict | None = None):
             stoch_len, stoch_moderate, stoch_extreme = 12, 150.0, 200.0
     with sc3:
         if enable_confluence:
+            mode_desc = (
+                "score is adjusted" if blend_into_score else
+                "Buy/Strong Buy is BLOCKED without it — downgraded to Watch" if gate_mode else
+                "informational only, rating unaffected"
+            )
             st.markdown(
                 "<div style='padding-top:0.3rem;color:#8b949e;font-size:0.75rem;'>"
                 "Regime = |CCI(short)| trip past Moderate/Extreme threshold, ≤8 bars stale. "
                 "Entry = Stochastic %K/%D bullish crossover confirming the regime "
-                f"({'score is adjusted' if blend_into_score else 'informational only, rating unaffected'})."
+                f"({mode_desc})."
                 "</div>",
                 unsafe_allow_html=True,
             )
@@ -404,6 +418,7 @@ def render(settings: dict | None = None):
             strong_score=int(strong_score), buy_score=int(buy_score),
             enable_stoch_confluence=bool(enable_confluence),
             blend_into_score=bool(blend_into_score),
+            gate_require_stoch_entry=bool(gate_mode),
             stoch_params=StochConfluenceParams(
                 cci_length=int(stoch_len),
                 cci_moderate=float(stoch_moderate),
@@ -503,6 +518,7 @@ def render(settings: dict | None = None):
                         buy_score=int(buy_score) if run_btn or "ccim_buy" in st.session_state else DEFAULT_BUY_SCORE,
                         enable_stoch_confluence=bool(enable_confluence),
                         blend_into_score=bool(blend_into_score),
+                        gate_require_stoch_entry=bool(gate_mode),
                         stoch_cci_length=int(stoch_len),
                         stoch_cci_moderate=float(stoch_moderate),
                         stoch_cci_extreme=float(stoch_extreme),
