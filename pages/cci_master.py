@@ -27,7 +27,9 @@ from utils.cci_master_engine import (
     RATING_COLORS, STATE_COLORS, SIGNAL_COLORS,
     DEFAULT_CCI_LENGTH, DEFAULT_OB_LEVEL, DEFAULT_OS_LEVEL,
     DEFAULT_STRONG_SCORE, DEFAULT_BUY_SCORE,
+    ENABLE_STOCHASTIC_CONFLUENCE,
 )
+from utils.cci_stochastic_signal import SignalParams as StochConfluenceParams
 from utils.scanner_engine import NIFTY500_SYMBOLS
 
 _RATING_ORDER = [RATING_STRONG_BUY, RATING_BUY, RATING_WATCH, RATING_AVOID]
@@ -167,6 +169,15 @@ def _price_cell(val, color="#e6edf3") -> str:
     return f'<td style="color:{color};font-weight:600">{float(val):.2f}</td>'
 
 
+def _confluence_cell(val) -> str:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return '<td style="color:#484f58">—</td>'
+    if bool(val):
+        return ('<td><span class="cci-badge" style="background:rgba(0,0,0,0.3);'
+                'border:1px solid #00e67655;color:#00e676">⚡ CONFLUENCE</span></td>')
+    return '<td style="color:#484f58">—</td>'
+
+
 def _rr_cell(val) -> str:
     if not _is_valid_num(val):
         return '<td>—</td>'
@@ -275,8 +286,11 @@ def _build_table_html(df: pd.DataFrame) -> str:
         return '<div class="cci-empty"><div class="icn">📡</div>No candidates in this bucket.</div>'
 
     has_levels = "SL" in df.columns
+    has_confluence = "Confluence" in df.columns and df["Confluence"].notna().any()
 
     headers = ["Stock", "Close", "Chg%", "CCI", "State", "Signal", "Score", "Rating"]
+    if has_confluence:
+        headers += ["Stoch Confluence"]
     if has_levels:
         headers += ["SL", "T1", "T2", "RR"]
     header_html = "".join(f"<th>{h}</th>" for h in headers)
@@ -291,6 +305,8 @@ def _build_table_html(df: pd.DataFrame) -> str:
         cells += _signal_cell(str(row.get("Signal", "-")))
         cells += _score_cell(row.get("Score"))
         cells += _rating_cell(str(row.get("Rating", "-")), bool(row.get("FreshRating", False)))
+        if has_confluence:
+            cells += _confluence_cell(row.get("Confluence"))
         if has_levels:
             cells += _price_cell(row.get("SL"), "#ef5350")
             cells += _price_cell(row.get("T1"), "#26c6da")
@@ -333,6 +349,47 @@ def render(settings: dict | None = None):
         st.markdown("<div style='padding-top:1.7rem'></div>", unsafe_allow_html=True)
         run_btn = st.button("▶  Run CCI Scan", use_container_width=True, key="ccim_run")
 
+    # ── Stochastic Confluence overlay (opt-in) ─────────────────────
+    # Pine state/signal are always computed unchanged above; this section
+    # controls whether the tiered short-CCI regime + Stochastic timing
+    # trigger from cci_stochastic_signal.py is (a) shown as informational
+    # columns only, or (b) actually blended into cci_score/rating.
+    sc1, sc2, sc3 = st.columns([1.3, 1, 2])
+    with sc1:
+        mode = st.radio(
+            "CCI Mode",
+            ["Classic Pine", "+ Stoch Confluence (info)", "+ Stoch Confluence (blended into score)"],
+            index=0, key="ccim_mode",
+            help="Classic Pine = unchanged 1:1 indicator port. Info = stochastic "
+                 "columns shown alongside, score untouched. Blended = a confirmed "
+                 "regime-trip + Stochastic entry crossover adjusts cci_score before "
+                 "rating thresholds are applied.",
+        )
+    enable_confluence = mode != "Classic Pine"
+    blend_into_score = mode == "+ Stoch Confluence (blended into score)"
+    with sc2:
+        if enable_confluence:
+            stoch_len = st.number_input("Regime CCI Len", min_value=5, max_value=30,
+                                         value=12, key="ccim_stoch_len",
+                                         help="Short length (9-14 typical) for the regime filter — "
+                                              "independent of the Classic Pine CCI Length above.")
+            stoch_moderate = st.number_input("Moderate |CCI|", min_value=100, max_value=300,
+                                              value=150, key="ccim_stoch_moderate")
+            stoch_extreme = st.number_input("Extreme |CCI|", min_value=100, max_value=400,
+                                             value=200, key="ccim_stoch_extreme")
+        else:
+            stoch_len, stoch_moderate, stoch_extreme = 12, 150.0, 200.0
+    with sc3:
+        if enable_confluence:
+            st.markdown(
+                "<div style='padding-top:0.3rem;color:#8b949e;font-size:0.75rem;'>"
+                "Regime = |CCI(short)| trip past Moderate/Extreme threshold, ≤8 bars stale. "
+                "Entry = Stochastic %K/%D bullish crossover confirming the regime "
+                f"({'score is adjusted' if blend_into_score else 'informational only, rating unaffected'})."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
     universe = settings.get("symbols", NIFTY500_SYMBOLS)
     st.markdown(
         f"<div style='padding:0.3rem 0 0.8rem;color:#8b949e;font-size:0.78rem;'>"
@@ -345,6 +402,13 @@ def render(settings: dict | None = None):
         params = CCIMasterParams(
             cci_length=int(cci_length), ob_level=int(ob_level), os_level=int(os_level),
             strong_score=int(strong_score), buy_score=int(buy_score),
+            enable_stoch_confluence=bool(enable_confluence),
+            blend_into_score=bool(blend_into_score),
+            stoch_params=StochConfluenceParams(
+                cci_length=int(stoch_len),
+                cci_moderate=float(stoch_moderate),
+                cci_extreme=float(stoch_extreme),
+            ) if enable_confluence else None,
         )
         prog = st.progress(0, text="Fetching data…")
 
@@ -437,21 +501,36 @@ def render(settings: dict | None = None):
                         os_level=int(os_level) if run_btn or "ccim_os" in st.session_state else DEFAULT_OS_LEVEL,
                         strong_score=int(strong_score) if run_btn or "ccim_strong" in st.session_state else DEFAULT_STRONG_SCORE,
                         buy_score=int(buy_score) if run_btn or "ccim_buy" in st.session_state else DEFAULT_BUY_SCORE,
+                        enable_stoch_confluence=bool(enable_confluence),
+                        blend_into_score=bool(blend_into_score),
+                        stoch_cci_length=int(stoch_len),
+                        stoch_cci_moderate=float(stoch_moderate),
+                        stoch_cci_extreme=float(stoch_extreme),
                     )
                     if hist.empty:
                         st.warning("No data available for this symbol.")
                     else:
                         last = hist.iloc[-1]
+                        stoch_bits = ""
+                        if enable_confluence and "stoch_k" in hist.columns and not pd.isna(last.get("stoch_k")):
+                            stoch_bits = (
+                                f" &nbsp;·&nbsp; Stoch %K <b style='color:#e6edf3'>{last['stoch_k']:.1f}</b>"
+                                f" %D <b style='color:#e6edf3'>{last['stoch_d']:.1f}</b>"
+                                f" &nbsp;·&nbsp; Entry <b style='color:{'#00e676' if last.get('stoch_entry_signal') else '#484f58'}'>"
+                                f"{'YES' if last.get('stoch_entry_signal') else 'no'}</b>"
+                            )
                         st.markdown(
                             f"<div style='font-size:11px;color:#8b949e;margin-bottom:4px;'>Last 10 bars — "
                             f"CCI <b style='color:#e6edf3'>{last['cci']:.1f}</b> &nbsp;·&nbsp; "
                             f"State <b style='color:#e6edf3'>{last['cci_state']}</b> &nbsp;·&nbsp; "
-                            f"Signal <b style='color:#e6edf3'>{last['cci_signal']}</b></div>",
+                            f"Signal <b style='color:#e6edf3'>{last['cci_signal']}</b>{stoch_bits}</div>",
                             unsafe_allow_html=True,
                         )
+                        detail_cols = ["close", "cci", "cci_state", "cci_signal", "cci_score", "cci_rating"]
+                        if enable_confluence and "stoch_entry_signal" in hist.columns:
+                            detail_cols += ["stoch_k", "stoch_d", "stoch_entry_signal", "stoch_trim_signal"]
                         st.dataframe(
-                            hist[["close", "cci", "cci_state", "cci_signal", "cci_score", "cci_rating"]]
-                            .tail(10).iloc[::-1],
+                            hist[detail_cols].tail(10).iloc[::-1],
                             use_container_width=True,
                         )
                         st.line_chart(hist["cci"].tail(120))

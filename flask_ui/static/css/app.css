@@ -1,0 +1,18 @@
+/* app.css — small hand-written additions Tailwind's utility classes
+   can't express (keyframes, drawer transform state). Everything else
+   should stay in Tailwind utility classes per §7. */
+
+@keyframes tick-flash {
+  0%   { background-color: rgba(59, 130, 246, 0.25); }
+  100% { background-color: transparent; }
+}
+.tick-flash {
+  animation: tick-flash 600ms ease-out;
+}
+
+#drawer.translate-x-full {
+  transform: translateX(100%);
+}
+#drawer:not(.translate-x-full) {
+  transform: translateX(0);
+}

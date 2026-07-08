@@ -37,10 +37,6 @@ import pandas as pd
 import streamlit as st
 
 from utils.scanner_engine import fetch_batch_ohlcv, NIFTY500_SYMBOLS, atr as _atr_fn
-from utils.cci_stochastic_signal import (
-    SignalParams as StochConfluenceParams,
-    generate_signals as _generate_stoch_confluence_signals,
-)
 
 # ── Defaults — match Pine indicator inputs exactly ────────────────────────
 DEFAULT_CCI_LENGTH   = 14
@@ -48,14 +44,6 @@ DEFAULT_OB_LEVEL      = 100
 DEFAULT_OS_LEVEL      = -100
 DEFAULT_STRONG_SCORE  = 4
 DEFAULT_BUY_SCORE     = 2
-
-# ── Stochastic Confluence overlay (feature-flagged, additive only) ────────
-# Does NOT alter the Pine 1:1 state/signal/score/rating pipeline below.
-# Runs cci_stochastic_signal.py's independent CCI-regime + Stochastic-
-# crossover engine on the SAME OHLCV frame and attaches its verdict as
-# extra columns. Off by default so existing CCI Master numbers stay
-# byte-for-byte identical to the Pine indicator until explicitly enabled.
-ENABLE_STOCHASTIC_CONFLUENCE = False
 
 RATING_STRONG_BUY = "STRONG BUY"
 RATING_BUY        = "BUY"
@@ -89,27 +77,6 @@ class CCIMasterParams:
     os_level:    int = DEFAULT_OS_LEVEL
     strong_score: int = DEFAULT_STRONG_SCORE
     buy_score:    int = DEFAULT_BUY_SCORE
-
-    # ── Stochastic Confluence overlay ──────────────────────────────────
-    # enable_stoch_confluence=True runs cci_stochastic_signal.py's
-    # short-length/wide-threshold CCI regime filter + Stochastic timing
-    # trigger on the same OHLCV frame and attaches Stoch_Entry/Stoch_Trim.
-    #
-    # blend_into_score=False (default): those columns are informational
-    # only — Pine state/signal/score/rating are byte-for-byte unchanged
-    # (this is the "Classic Pine" mode).
-    #
-    # blend_into_score=True: a confirmed regime-trip + Stochastic entry
-    # crossover adds +stoch_entry_bonus to cci_score before the rating
-    # thresholds are applied; a trim signal subtracts stoch_trim_penalty.
-    # This is the "improved" mode — CCI's own state/signal are untouched,
-    # but the final score/rating now reflects the tiered regime + timing
-    # confirmation instead of the crossover-only Pine logic alone.
-    enable_stoch_confluence: bool = ENABLE_STOCHASTIC_CONFLUENCE
-    blend_into_score: bool = False
-    stoch_entry_bonus: int = 2
-    stoch_trim_penalty: int = 1
-    stoch_params: "StochConfluenceParams | None" = None
 
 
 def _cci_hlc3(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
@@ -335,30 +302,6 @@ def compute_cci_master(df: pd.DataFrame, params: CCIMasterParams) -> pd.DataFram
     signal = np.where(sig_buy, "BUY", np.where(sig_exit, "EXIT", "-"))
     out["cci_signal"] = signal
 
-    # ── Optional Stochastic Confluence overlay ─────────────────────────
-    # Computed BEFORE scoring so blend_into_score can adjust cci_score.
-    # cci_state / cci_signal above are always the untouched Pine values.
-    stoch_entry_signal = None
-    stoch_trim_signal  = None
-    if getattr(params, "enable_stoch_confluence", False):
-        try:
-            sparams = params.stoch_params or StochConfluenceParams()
-            stoch = _generate_stoch_confluence_signals(
-                out[["high", "low", "close"]], sparams
-            )
-            out["stoch_k"] = stoch["k"]
-            out["stoch_d"] = stoch["d"]
-            out["stoch_regime"] = stoch["cci_regime"]
-            out["stoch_entry_signal"] = stoch["entry_signal"]
-            out["stoch_trim_signal"] = stoch["trim_signal"]
-            out["stoch_stop_level"] = stoch["stop_level"]
-            out["stoch_notes"] = stoch["notes"]
-            stoch_entry_signal = stoch["entry_signal"]
-            stoch_trim_signal = stoch["trim_signal"]
-        except Exception:
-            out["stoch_entry_signal"] = False
-            out["stoch_trim_signal"] = False
-
     # ── score ──────────────────────────────────────────────────────
     state_score = np.where(
         state == "OB", 2,
@@ -366,15 +309,6 @@ def compute_cci_master(df: pd.DataFrame, params: CCIMasterParams) -> pd.DataFram
     )
     sig_score = np.where(signal == "BUY", 2, np.where(signal == "EXIT", -2, 0))
     total_score = state_score + sig_score
-
-    if params.blend_into_score and stoch_entry_signal is not None:
-        confluence_bonus = (
-            np.where(stoch_entry_signal.values, params.stoch_entry_bonus, 0)
-            - np.where(stoch_trim_signal.values, params.stoch_trim_penalty, 0)
-        )
-        total_score = total_score + confluence_bonus
-        out["confluence_bonus"] = confluence_bonus
-
     out["cci_score"] = total_score
 
     # ── rating ─────────────────────────────────────────────────────
@@ -421,15 +355,6 @@ def _score_one_symbol(symbol: str, df: pd.DataFrame, params: CCIMasterParams) ->
         os_level=float(params.os_level),
     )
 
-    # ── Stochastic Confluence verdict (only populated when the params
-    # opted in — see CCIMasterParams.enable_stoch_confluence) ──────────
-    stoch_entry = bool(last["stoch_entry_signal"]) if "stoch_entry_signal" in computed.columns else None
-    stoch_trim  = bool(last["stoch_trim_signal"]) if "stoch_trim_signal" in computed.columns else None
-    confluence  = (
-        bool(stoch_entry and str(last["cci_rating"]) in (RATING_STRONG_BUY, RATING_BUY))
-        if stoch_entry is not None else None
-    )
-
     return {
         "Stock":        symbol,
         "Close":        round(close, 2),
@@ -441,10 +366,6 @@ def _score_one_symbol(symbol: str, df: pd.DataFrame, params: CCIMasterParams) ->
         "Rating":       str(last["cci_rating"]),
         "FreshRating":  bool(prev_rating is not None and prev_rating != last["cci_rating"]),
         "Date":         computed.index[-1],
-        # ── Stochastic Confluence (None when overlay disabled) ─────────
-        "Stoch_Entry":  stoch_entry,
-        "Stoch_Trim":   stoch_trim,
-        "Confluence":   confluence,
         # ── Trade plan fields ──────────────────────────────────────
         "SL":           levels["sl"],
         "T1":           levels["t1"],
@@ -514,12 +435,7 @@ def get_symbol_cci_history(symbol: str, period: str = "6mo",
                             ob_level: int = DEFAULT_OB_LEVEL,
                             os_level: int = DEFAULT_OS_LEVEL,
                             strong_score: int = DEFAULT_STRONG_SCORE,
-                            buy_score: int = DEFAULT_BUY_SCORE,
-                            enable_stoch_confluence: bool = ENABLE_STOCHASTIC_CONFLUENCE,
-                            blend_into_score: bool = False,
-                            stoch_cci_length: int = 12,
-                            stoch_cci_moderate: float = 150.0,
-                            stoch_cci_extreme: float = 200.0) -> pd.DataFrame:
+                            buy_score: int = DEFAULT_BUY_SCORE) -> pd.DataFrame:
     """Cached single-symbol fetch + compute, used for the detail chart/expander."""
     from utils.scanner_engine import fetch_ohlcv
     df = fetch_ohlcv(symbol, period=period, interval="1d")
@@ -528,13 +444,6 @@ def get_symbol_cci_history(symbol: str, period: str = "6mo",
     params = CCIMasterParams(
         cci_length=cci_length, ob_level=ob_level, os_level=os_level,
         strong_score=strong_score, buy_score=buy_score,
-        enable_stoch_confluence=enable_stoch_confluence,
-        blend_into_score=blend_into_score,
-        stoch_params=StochConfluenceParams(
-            cci_length=stoch_cci_length,
-            cci_moderate=stoch_cci_moderate,
-            cci_extreme=stoch_cci_extreme,
-        ) if enable_stoch_confluence else None,
     )
     computed = compute_cci_master(df, params)
     return computed if computed is not None else pd.DataFrame()
