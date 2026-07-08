@@ -29,7 +29,7 @@ import threading
 
 from utils.scanner_engine import _strip_tz, nifty_regime, ema
 from utils.decision_engine import _extension as _ext_fn
-from utils.conviction_score_v1 import compute_conviction_v1
+from utils.conviction_score_v1 import compute_conviction_v3
 from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
 from utils.adaptive_target_engine import AdaptiveTargetParams, compute_adaptive_targets, check_momentum_exit
 from utils.regime_engine  import (
@@ -274,6 +274,18 @@ def generate_signals_historical(
         #  uses. Risk:Reward is computed here directly from entry/sl/t1/t2
         #  (CV1's entry_quality does not return an RR figure).
         #
+        #  NOTE (2026-07): these 65/20/60 floors are hardcoded here and are
+        #  NOT derived from classify_tier_v3() — the live Scanner's actual
+        #  Recommendation funnel. compute_conviction_v3() is called below
+        #  only for its raw leadership/conviction/entry_quality values
+        #  (identical across v1/v2/v3 — sub-scoring is unweighted), not its
+        #  composite or tier. This gate and the live Recommendation funnel
+        #  can and do diverge — a stock can pass this gate and still be
+        #  Watch/Developing under classify_tier_v3, or vice versa. If
+        #  backtest population needs to exactly mirror what the Scanner
+        #  recommends, this gate should call classify_tier_v3() directly
+        #  instead of re-deriving its own floors.
+        #
         #  Gate order (cheapest checks first):
         #    1. ATR band / staleness / extension  — field lookups, free
         #    2. Leadership / Conviction            — requires engine call
@@ -295,7 +307,7 @@ def generate_signals_historical(
         # Initialise here so the rejection-log append below always has values.
         _eq_val, _rr, _ls_val, _cv_val = 0, 0.0, 0, 0
         if not _rejection_reason:
-            _cv1    = compute_conviction_v1(r)
+            _cv1    = compute_conviction_v3(r)
             _ls_val = _cv1.leadership
             _cv_val = _cv1.conviction
             _eq_val = _cv1.entry_quality
