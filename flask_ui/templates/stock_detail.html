@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% from "partials/conviction_arc.html" import conviction_arc %}
+{% block title %}{{ row.ticker }} · MasterScanner{% endblock %}
+{% block content %}
+<div class="flex items-start justify-between mb-6">
+  <div>
+    <h1 class="text-2xl font-mono font-semibold">{{ row.ticker }}</h1>
+    <div class="text-text-1 text-sm">{{ row.category }} · {{ row.setup|upper }}</div>
+  </div>
+  {{ conviction_arc(row.conviction_composite, size=72, ticker=row.ticker) }}
+</div>
+
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+  <div class="lg:col-span-2 rounded-xl border border-border-0 bg-bg-1 p-4">
+    <div class="flex items-center gap-1 mb-3">
+      {% for tf in ['1D','1M','3M','1Y','5Y'] %}
+      <button
+        class="px-2.5 py-1 rounded text-xs border border-border-0 text-text-1 hover:text-text-0
+               focus:outline-none focus:ring-2 focus:ring-interactive
+               {{ 'bg-bg-2 text-text-0' if tf == timeframe else '' }}"
+        hx-get="{{ url_for('stock_detail.chart_partial', ticker=row.ticker) }}?tf={{ tf }}"
+        hx-target="#chart-svg-wrap"
+        hx-swap="innerHTML">
+        {{ tf }}
+      </button>
+      {% endfor %}
+    </div>
+    <div id="chart-svg-wrap">
+      {% include "partials/chart_svg.html" %}
+    </div>
+  </div>
+
+  <div class="rounded-xl border border-border-0 bg-bg-1 p-4">
+    <h2 class="text-sm font-medium text-text-1 mb-3 uppercase tracking-wide">Trade levels</h2>
+    <dl class="space-y-2 font-mono text-sm">
+      <div class="flex justify-between"><dt class="text-text-1">Entry</dt><dd>₹{{ "%.2f"|format(row.entry) }}</dd></div>
+      <div class="flex justify-between"><dt class="text-text-1">Stop Loss</dt><dd class="text-danger">₹{{ "%.2f"|format(row.sl) }}</dd></div>
+      <div class="flex justify-between"><dt class="text-text-1">T1</dt><dd class="text-actionable">₹{{ "%.2f"|format(row.t1) }}</dd></div>
+      <div class="flex justify-between"><dt class="text-text-1">T2</dt><dd class="text-actionable">₹{{ "%.2f"|format(row.t2) }}</dd></div>
+      <div class="flex justify-between"><dt class="text-text-1">T3</dt><dd class="text-actionable">₹{{ "%.2f"|format(row.t3) }}</dd></div>
+      <div class="flex justify-between border-t border-border-0 pt-2"><dt class="text-text-1">R:R</dt><dd>{{ row.rr }}R</dd></div>
+    </dl>
+
+    <h2 class="text-sm font-medium text-text-1 mt-6 mb-3 uppercase tracking-wide">Pillars</h2>
+    {% for p in breakdown.pillars %}
+    <div class="mb-2">
+      <div class="flex justify-between text-xs mb-1">
+        <span class="text-text-1">{{ p.label }}</span><span class="font-mono">{{ p.value }}</span>
+      </div>
+      <div class="h-1.5 rounded-full bg-bg-2 overflow-hidden">
+        <div class="h-full bg-interactive" style="width:{{ p.value }}%"></div>
+      </div>
+    </div>
+    {% endfor %}
+
+    {% if blockers %}
+    <h2 class="text-sm font-medium text-text-1 mt-6 mb-2 uppercase tracking-wide">Blockers</h2>
+    <ul class="space-y-1">
+      {% for b in blockers %}
+      <li class="text-sm text-danger flex gap-2"><span>⚠</span><span>{{ b }}</span></li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% from "partials/conviction_arc.html" import conviction_arc %}
+{% block title %}MasterScanner Mobile{% endblock %}
+{% block content %}
+<div class="pb-20">
+  <div class="flex gap-2 overflow-x-auto mb-4 -mx-1 px-1">
+    {% for chip, label in [('all','All'), ('breakout','Breakout'), ('pullback','Pullback'), ('reversal','Reversal'), ('continuation','Continuation')] %}
+    <a href="{{ url_for('mobile.mobile_home', setup=chip) }}"
+       class="shrink-0 px-3 py-1.5 rounded-full text-xs border
+              {{ 'bg-interactive border-interactive text-white' if active_setup == chip else 'border-border-0 text-text-1' }}">
+      {{ label }}
+    </a>
+    {% endfor %}
+  </div>
+
+  <div class="space-y-2">
+    {% for row in rows %}
+    <a href="{{ url_for('stock_detail.stock_detail', ticker=row.ticker) }}"
+       class="flex items-center justify-between rounded-lg border border-border-0 bg-bg-1 p-3">
+      <div>
+        <div class="font-mono font-medium">{{ row.ticker }}</div>
+        <div class="text-xs text-text-1">{{ row.category }}</div>
+      </div>
+      <div class="flex items-center gap-3">
+        <div class="text-right">
+          <div class="font-mono text-sm">₹{{ "%.2f"|format(row.price) }}</div>
+          <div class="text-xs {{ 'text-actionable' if row.pct_chg >= 0 else 'text-danger' }}">
+            {{ "%+.2f"|format(row.pct_chg) }}%
+          </div>
+        </div>
+        {{ conviction_arc(row.conviction_composite, size=36, ticker=row.ticker) }}
+      </div>
+    </a>
+    {% endfor %}
+  </div>
+</div>
+
+<!-- Bottom nav only exists on mobile — structurally different section, §8.5 -->
+<nav class="fixed bottom-0 inset-x-0 bg-bg-1 border-t border-border-0 flex justify-around py-2">
+  <a href="{{ url_for('mobile.mobile_home') }}" class="text-xs text-text-0 flex flex-col items-center gap-0.5">
+    <span>📈</span>Scanner
+  </a>
+  <a href="{{ url_for('heatmap.sectors') }}" class="text-xs text-text-1 flex flex-col items-center gap-0.5">
+    <span>🗺️</span>Sectors
+  </a>
+  <a href="{{ url_for('lifecycle.trades') }}" class="text-xs text-text-1 flex flex-col items-center gap-0.5">
+    <span>💼</span>Trades
+  </a>
+</nav>
+{% endblock %}

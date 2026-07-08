@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Trade Lifecycle · MasterScanner{% endblock %}
+{% block content %}
+<h1 class="text-xl font-semibold mb-1">Trade Lifecycle</h1>
+<p class="text-text-1 text-sm mb-6">Journal-only tracking — exits here do not call a broker (see open question #4)</p>
+
+<section class="mb-8">
+  <h2 class="text-sm font-medium text-text-1 mb-3 uppercase tracking-wide">Active</h2>
+  <div class="rounded-xl border border-border-0 bg-bg-1 overflow-x-auto">
+    <table class="w-full text-left text-sm">
+      <thead class="text-text-1 border-b border-border-0">
+        <tr>
+          <th class="py-2 px-3 font-medium">Symbol</th>
+          <th class="py-2 px-3 font-medium">Status</th>
+          <th class="py-2 px-3 font-medium">Entry</th>
+          <th class="py-2 px-3 font-medium">Current</th>
+          <th class="py-2 px-3 font-medium">SL</th>
+          <th class="py-2 px-3 font-medium">T1</th>
+          <th class="py-2 px-3 font-medium">P&amp;L</th>
+          <th class="py-2 px-3 font-medium">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="active-trades-table">
+        {% for trade in active_trades %}
+          {% include "partials/trade_row.html" %}
+        {% else %}
+          <tr><td colspan="8" class="py-8 text-center text-text-1">No active trades.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2 class="text-sm font-medium text-text-1 mb-3 uppercase tracking-wide">Recently Closed</h2>
+  <div class="rounded-xl border border-border-0 bg-bg-1 overflow-x-auto">
+    <table class="w-full text-left text-sm">
+      <thead class="text-text-1 border-b border-border-0">
+        <tr>
+          <th class="py-2 px-3 font-medium">Symbol</th>
+          <th class="py-2 px-3 font-medium">Closed</th>
+          <th class="py-2 px-3 font-medium">Reason</th>
+          <th class="py-2 px-3 font-medium">P&amp;L</th>
+        </tr>
+      </thead>
+      <tbody id="closed-trades-table">
+        {% for trade in closed_trades %}
+          {% include "partials/trade_row.html" %}
+        {% else %}
+          <tr><td colspan="4" class="py-8 text-center text-text-1">Nothing closed yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

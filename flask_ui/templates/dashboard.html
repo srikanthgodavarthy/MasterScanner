@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · MasterScanner{% endblock %}
+{% block content %}
+<h1 class="text-xl font-semibold mb-1">Scanner Dashboard</h1>
+<p class="text-text-1 text-sm mb-6">Nifty 500 · live conviction-ranked opportunities</p>
+
+<section class="mb-8">
+  <h2 class="text-sm font-medium text-text-1 mb-3 uppercase tracking-wide">Elite Opportunities</h2>
+  {% include "partials/opportunities.html" %}
+</section>
+
+<section>
+  <div class="flex items-center gap-2 mb-3 flex-wrap">
+    {% for chip, label in [('all','All Setups'), ('breakout','Breakout'), ('pullback','Pullback'), ('reversal','Reversal'), ('continuation','Continuation')] %}
+    <button
+      class="px-3 py-1.5 rounded-full text-xs border transition-colors focus:outline-none focus:ring-2 focus:ring-interactive
+        {{ 'bg-interactive border-interactive text-white' if active_setup == chip else 'border-border-0 text-text-1 hover:text-text-0' }}"
+      hx-get="{{ url_for('dashboard.scanner_rows_partial') }}?setup={{ chip }}"
+      hx-target="#scanner-table-wrap"
+      hx-swap="innerHTML"
+      hx-push-url="true">
+      {{ label }}
+    </button>
+    {% endfor %}
+  </div>
+
+  <div id="scanner-table-wrap" class="rounded-xl border border-border-0 bg-bg-1 overflow-x-auto">
+    {% include "partials/scanner_rows_table.html" %}
+  </div>
+</section>
+
+{% endblock %}
+{% block scripts %}
+<script>document.addEventListener('DOMContentLoaded', () => initLiveTicks('{{ url_for("stream.stream_prices") }}'));</script>
+{% endblock %}
