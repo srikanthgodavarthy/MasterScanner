@@ -1693,17 +1693,34 @@ _DETAIL_EXTRA = [
 
 # Primary column order for HTML table (Scanner Refactor: CV1 + Promotion Engine)
 _PRIMARY_ORDERED = [
-    "Stock", "Setup Age", "Plan Status", "Recommendation", "Primary Blocker",
+    "Stock", "%Chg", "Setup Age", "Plan Status", "Recommendation", "Primary Blocker",
     "Leadership", "Conviction", "Entry Quality",
     "Stoch↑", "LL✓", "VWAP↺", "Inst✓", "Promo Score",
-    "Extension", "CMP", "%Chg", "Entry", "SL", "T1", "R:R", "Drift%", "Size%",
+    "Extension", "CMP", "Entry", "SL", "T1", "R:R", "Drift%", "Size%",
 ]
 
+# Tabs where "Primary Blocker" is meaningless — it explains why a stock is
+# NOT (yet) Actionable, so it has nothing to say once a stock already is
+# Elite / Execute / Actionable.
+_NO_BLOCKER_TABS = {"ELITE", "EXECUTE", "ACTIONABLE"}
 
-def _build_display_df(df: pd.DataFrame, detail: bool = False) -> pd.DataFrame:
+# Tabs where Promotion Engine's timing columns are meaningless — Promotion
+# Engine only ever evaluates Actionable/Execute/Elite rows (see
+# _promotion_signals_table docstring above); Developing/Watch/Skip never
+# reach it, so these columns are always empty there.
+_NO_PROMO_TABS = {"DEVELOPING", "WATCH", "SKIP"}
+_PROMO_COLS    = ["Stoch↑", "LL✓", "VWAP↺", "Inst✓", "Promo Score"]
+
+
+def _build_display_df(df: pd.DataFrame, detail: bool = False, sc_key: str | None = None) -> pd.DataFrame:
     out = df.rename(columns=_RENAME_MAP_FULL).copy()
     out = out.rename(columns=_RENAME_PRIMARY)
-    primary_cols = [c for c in _PRIMARY_ORDERED if c in out.columns]
+    ordered = _PRIMARY_ORDERED
+    if sc_key in _NO_BLOCKER_TABS:
+        ordered = [c for c in ordered if c != "Primary Blocker"]
+    if sc_key in _NO_PROMO_TABS:
+        ordered = [c for c in ordered if c not in _PROMO_COLS]
+    primary_cols = [c for c in ordered if c in out.columns]
     if detail:
         extra = [c for c in _DETAIL_EXTRA if c in out.columns]
         want_final = primary_cols + [c for c in extra if c not in primary_cols]
@@ -2990,7 +3007,7 @@ def render(settings: dict | None = None):
                         )
 
             # ── Rich HTML table ──────────────────────────────────
-            disp = _build_display_df(df_subset, detail=_show_detail)
+            disp = _build_display_df(df_subset, detail=_show_detail, sc_key=sc_key)
             if "regime_tier" in disp.columns:
                 disp = disp.drop(columns=["regime_tier"])
             st.markdown(_render_html_table(disp), unsafe_allow_html=True)
