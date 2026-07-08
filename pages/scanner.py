@@ -791,25 +791,31 @@ def _scoring_explainer_html() -> str:
     """
     Static HTML panel: 'Scoring & Thresholds'.
 
-    [REBUILT] Was 'How CV1 Scores & Signal Classes are calculated' — documented
-    only the Decision Engine (Leadership/Conviction/Entry Quality/Extension).
-    There are actually TWO independent scoring systems in this codebase, and
-    this panel now documents both, plus the bonus layer that sits between them:
+    [REBUILT 2026-07] Previous version documented Score/Action/Tier
+    (scoring_core.py) and the old Decision Engine categories (Elite
+    Opportunity / High Conviction / Setup Building / ...) as if they
+    still drove the Recommendation column. They don't — as of the
+    CV1 + Promotion Engine refactor, neither of those threshold sets
+    is what actually classifies a stock. This panel now documents the
+    real live pipeline, in the order a stock actually passes through it:
 
-      A) Raw Score / Action / Tier  (utils/scoring_core.py compute_bar())
-         — the original, backtest-tuned engine. Feeds the "Score", "Action",
-         "Tier", "Buy Type" columns.
-      B) Opportunity Bonus  (utils/ll_opportunity.py + utils/stoch_convergence.py)
-         — LL Spring + VWAP Reclaim, layered on top of (A)'s norm_score,
-         up to +15 pts combined.
-      C) Decision Engine  (utils/decision_engine.py compute_decision())
-         — a second, independent 4-score framework. Feeds "Leadership",
-         "Conviction", "Entry Quality", "Extension", and the "Recommendation"
-         / Category (Elite Opportunity / High Conviction / ... / Avoid).
+      1) CV1 sub-factor scores   (utils/conviction_score_v1.py — Leadership,
+         Conviction, Entry Quality; unchanged formulas since v1, still the
+         single source of truth for setup QUALITY)
+      2) Composite blend + base tier (classify_tier_v3 — LIVE since 2026-07,
+         replaces v1's classify_tier; flagged in source as placeholder
+         thresholds, not yet re-validated against a real score distribution)
+      3) Promotion Engine  (utils/promotion_engine.py — TIMING only; can
+         only upgrade an Actionable setup to Execute/Elite, never creates
+         Watch/Developing and never demotes)
+      4) Structural Gate  (optional, OFF by default — Decision Engine can
+         downgrade Actionable→Skip/Watch on hard-stop or Extended/Avoid
+         lifecycle reads, but only when explicitly enabled)
 
-    A stock's Score/Action/Tier (A+B) and its Recommendation/Category (C)
-    come from two different pipelines and can disagree — that's expected,
-    not a bug: (A) is a single blended score, (C) is a 4-dimension shape.
+    Score / Action / Tier (scoring_core.py) and Extension / Lifecycle /
+    Trend Quality (decision_engine.py) still run and still feed their own
+    columns — they just don't produce the Recommendation anymore. They're
+    covered briefly at the end for that reason.
     """
 
     def _section_head(title, color, subtitle=""):
@@ -834,286 +840,161 @@ def _scoring_explainer_html() -> str:
         return f'<table style="border-collapse:collapse;width:100%;margin-bottom:10px">' \
                f'<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>'
 
-    def _note(text):
-        return f'<p style="font-size:10.5px;color:#8b949e;margin:4px 0 12px;">{text}</p>'
+    def _note(text, warn=False):
+        color = "#f5c542" if warn else "#8b949e"
+        return f'<p style="font-size:10.5px;color:{color};margin:4px 0 12px;">{text}</p>'
 
     # ══════════════════════════════════════════════════════════════
-    # SECTION A — Raw Score / Action / Tier
+    # SECTION 1 — CV1 Sub-Factor Scores
     # ══════════════════════════════════════════════════════════════
-    sec_a = _section_head(
-        "A · Raw Score, Action &amp; Tier", "#58a6ff",
-        "utils/scoring_core.py compute_bar() — backtest-tuned, feeds Score / Action / Tier / Buy Type columns",
+    sec1 = _section_head(
+        "1 · CV1 Sub-Factor Scores — Leadership, Conviction, Entry Quality", "#58a6ff",
+        "utils/conviction_score_v1.py _leadership() / _conviction() / _entry_quality() — unchanged since v1, backtest-tuned (v8.1). Each is 0-100.",
     )
-    sec_a += _note(
-        "Raw points sum against a 265-pt budget, then normalized: "
-        "<b>norm_score = min(100, raw_score &times; 100 / 265)</b>. "
-        "Weights below were tuned empirically against backtest profit-factor data (v8.1), not fixed a priori."
-    )
-    sec_a += _mini_table([
-        ("trend_up",          "+25 / 0",              "EMA alignment trending up"),
-        ("EMA20 vs EMA50",    "+30 / +20 / 0",         "EMA20&gt;EMA50 (full) / within 0.5% (partial) / below"),
-        ("RSI",               "+25/20/15/5/0",         "&gt;60 / &gt;55 / &gt;50 / &gt;45 / else"),
-        ("Volume",            "+30/20/10/0",           "vol &ge;2.0&times; avg / &ge;1.5&times; / &ge;1.2&times; / below"),
-        ("RS Composite",      "+30/25/20/5/-10/0",     "&gt;15% / &gt;10% / &gt;5% / &gt;0% / &lt;-3% / else"),
-        ("Trend Age",         "-5/+5/+20/0/-10",       "0-5 bars / 6-20 / <b>21-50 (sweet spot)</b> / 51-100 / &gt;100"),
-        ("ADX(14)",           "+20/12/5/0",            "&ge;40 / &gt;30 / &gt;25 / else"),
-        ("EMA20 Slope",       "+10/5/0",               "&gt;0.3 / &gt;0 / else"),
-        ("CCI State",         "+20/8/-15/0",           "&lt; CCI oversold / &lt;0 / extended / else"),
-        ("Fresh Base Breakout","+15 / 0",              "Stage-2 / long-base breakout detected"),
-        ("In Golden Zone",    "+15 / 0",                "50-61.8% Fib pullback zone"),
-        ("Fib Extension Penalty","-20/-30/0",           "near 127% ext / near 161% ext / else"),
-        ("Momentum (3M &amp; 6M)","+20/10/5/0",         "both &gt;20% / both &gt;10% / both &gt;5% / else"),
-        ("Harmonic / ABCD",   "+10 / +8",               "pattern confirmed (additive)"),
-        ("Below Cloud",       "-15 / 0",                "price below Ichimoku cloud"),
-        ("Squeeze",           "settings-tunable",       "BB/KC squeeze release or no-squeeze bonus"),
-        ("CCI Rising",        "+8 / 0",                 "CCI building below -50, positive slope"),
-        ("Phase Modifier",    "&times;0.70 / &times;0.90","EXTENDED phase / EMERGING phase (multiplies raw score)"),
-    ])
-    sec_a += _note(
-        "<b>Adaptive Score Threshold</b> (used by Buy Type / Tier-1 Path B gates): "
-        "<b>65</b> if ATR/ATR-SMA20 &gt; 1.2 (volatile regime) &middot; "
-        "<b>75</b> if &lt; 0.8 (quiet regime) &middot; <b>70</b> otherwise."
-    )
-
-    # ══════════════════════════════════════════════════════════════
-    # SECTION B — Opportunity Bonus
-    # ══════════════════════════════════════════════════════════════
-    sec_b = _section_head(
-        "B · Opportunity Bonus (+15 max, layered on Section A)", "#f5c542",
-        "utils/ll_opportunity.py + utils/stoch_convergence.py — migrated off the retired Five Pillars engine",
-    )
-    sec_b += _note(
-        "<b>opportunity_bonus = ll_bonus (0-10) + stoch_bonus (0-10)</b>, capped so "
-        "<b>norm_score = min(100, norm_score + opportunity_bonus)</b>. Each half has its own "
-        "independent warm-up gate — LL needs bar index &ge; 2&times;pivot_lookback+1 (first bar a "
-        "pivot can structurally exist); Stoch Convergence needs bar index &ge; 20 (%K/%D warm-up), "
-        "regardless of pivot_lookback. Toggle: Settings &rarr; "
-        "\"enable_ll_stoch_bonus\" (default ON)."
-    )
-    sec_b += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">'
-    sec_b += (
-        '<div><div style="font-size:10px;font-weight:700;color:#f5c542;text-transform:uppercase;'
-        'letter-spacing:0.05em;margin-bottom:5px">LL Spring (0-10)</div>'
+    sec1 += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px">'
+    sec1 += (
+        '<div><div style="font-size:10px;font-weight:700;color:#a371f7;text-transform:uppercase;'
+        'letter-spacing:0.05em;margin-bottom:5px">Leadership — "is this a market leader right now?"</div>'
         + _mini_table([
-            ("Actionable LL confirmed",      "+2", "close reclaimed prior low within 10 bars of the LL print"),
-            ("LL defended",                  "+2", "LL price never re-broken since"),
-            ("Distance from LL (graduated)", "+0-4", "0.3-1.0 ATR&rarr;4 &middot; 1.0-2.0&rarr;3 &middot; 2.0-3.0&rarr;2 &middot; 3.0-4.0&rarr;1"),
-            ("Institutional volume",         "+2", "reclaim-bar volume &gt; 20d average"),
-            ("Pace penalty",                 "-1", "reclaimed in &le;3 bars at &gt;0.35 ATR/bar (near-vertical)"),
-        ], cols=("Check", "Pts", "Condition"))
+            ("RS Composite",         "0-30", "&gt;15%&rarr;30 &middot; &gt;10%&rarr;25 &middot; &gt;5%&rarr;20 &middot; &gt;3%&rarr;15 &middot; &gt;0%&rarr;10 &middot; &gt;-3%&rarr;4 &middot; else 0"),
+            ("Trend Age",            "0-25", "21-50 bars&rarr;25 (sweet spot) &middot; 6-20 or 51-100&rarr;8 &middot; else 0"),
+            ("ADX(14)",              "0-20", "&ge;40&rarr;20 &middot; &gt;30&rarr;12 &middot; &gt;25&rarr;5 &middot; else 0"),
+            ("Persistent Strength",  "0/15", "mom3&gt;8% AND mom6&gt;12% (boolean gate)"),
+            ("EMA20 Slope",          "0-10", "&gt;0.3&rarr;10 &middot; &gt;0&rarr;5 &middot; else 0"),
+        ], cols=("Factor", "Pts", "Bands"))
         + '</div>'
     )
-    sec_b += (
-        '<div><div style="font-size:10px;font-weight:700;color:#f5c542;text-transform:uppercase;'
-        'letter-spacing:0.05em;margin-bottom:5px">VWAP Reclaim / Stoch Convergence (0-10)</div>'
+    sec1 += (
+        '<div><div style="font-size:10px;font-weight:700;color:#3fb950;text-transform:uppercase;'
+        'letter-spacing:0.05em;margin-bottom:5px">Conviction — "will this reach target before stop?"</div>'
         + _mini_table([
-            ("Fresh %K/%D re-ignition", "+4", "cross-up, or %K crosses back above 20 from oversold"),
-            ("Returned above VWAP",     "+3", "price reclaimed session-anchored VWAP"),
-            ("Confluence",              "+3", "VWAP touch &amp; stoch cross within confluence_bars (default 2) of each other"),
-        ], cols=("Check", "Pts", "Condition"))
-        + '<div style="font-size:9.5px;color:#8b949e;margin-top:2px">Tunable in Settings &rarr; '
-          'Institutional Continuation: touch lookback (3 bars), ATR touch tolerance (0.25&times;ATR), '
-          'reaction cap (1.5&times;ATR), confluence window (2 bars).</div>'
+            ("Trend Structure",  "0-30", "trend_up +10, EMA alignment +10, above/inside cloud +7/+3, full pillar +3"),
+            ("Fib Zone",         "0-25", "golden 50-61.8%&rarr;25 &middot; relaxed 38.2-61.8%&rarr;18 &middot; continuation path&rarr;up to 17"),
+            ("CCI Recovery",     "0-25", "cross above oversold&rarr;25 &middot; CCI rising&rarr;12 &middot; recovering&rarr;6"),
+            ("Volume Sponsorship","0-15", "vol_ratio &ge;2.5&rarr;15 &middot; &ge;2.0&rarr;12 &middot; &ge;1.5&rarr;8 &middot; &ge;1.2&rarr;5 &middot; &ge;1.0&rarr;2"),
+            ("Squeeze Release",  "0-5",  "just fired&rarr;5 &middot; still building&rarr;3"),
+        ], cols=("Factor", "Pts", "Bands"))
         + '</div>'
     )
-    sec_b += '</div>'
-
-    # ══════════════════════════════════════════════════════════════
-    # SECTION C — Tier Gates
-    # ══════════════════════════════════════════════════════════════
-    sec_c = _section_head(
-        "C · Tier Gates (Tier-1 Prime / Tier-2 Momentum / Elite)", "#3fb950",
-        "Structural gates on top of Score+Bonus — determine Action (BUY/WATCH/SKIP) and Tier label",
-    )
-    sec_c += (
-        '<div style="font-size:11px;color:#e6edf3;margin-bottom:6px"><b>Tier-1 Prime</b> — any ONE path, '
-        'plus <b>RS Composite &ge; 5%</b>, <b>strength gate</b> (ADX&ge;20 OR EMA20 slope&gt;0), and Nifty regime allows:</div>'
-    )
-    sec_c += _mini_table([
-        ("Path A — Pullback",    "trend_up + Fib golden zone (relaxed) + recent CCI recovery + persistent strength + trend structure"),
-        ("Path B — Momentum",    "is_norm_buy (score &ge; adaptive threshold) AND score &ge; 75 (or 70 if trend phase EMERGING)"),
-        ("Path C — Fresh Base",  "fresh_base_breakout + trend_up + (persistent strength OR RS &ge; 5%) — relaxed strength gate"),
-    ], cols=("Path", "Condition"))
-    sec_c += _mini_table([
-        ("Tier-2 Momentum",  "—", "compression_break AND cci_momentum_break AND volume &gt; 1.2&times; avg AND trend phase &ne; EXTENDED (hard block)"),
-        ("Elite Tier",       "—", "Tier-1 Prime AND score &ge; 85 AND RS top-decile AND vol_ratio &ge; 1.5"),
-    ], cols=("Gate", "—", "Condition"))
-    sec_c += _note(
-        "<b>Buy Type</b> (any_buy) fires when any of: Fib pullback+score&ge;threshold, Fib+CCI cross+score&ge;55, "
-        "ABCD, Harmonic, Norm/momentum+score&ge;threshold, or CCI cross+score&ge;55 — AND price clears the cloud gate "
-        "(above cloud, or inside cloud with score&ge;65)."
-    )
-
-    # ══════════════════════════════════════════════════════════════
-    # SECTION D — Decision Engine
-    # ══════════════════════════════════════════════════════════════
-    dim_rows = [
-        ("Leadership", "#a371f7", [
-            ("Trend Quality (EMA align + cloud + trend_up)", 35),
-            ("Relative Strength (multi-TF composite)",       30),
-            ("Momentum (3M + 6M return tiers)",               15),
-            ("Volume Sponsorship (+2 on squeeze release)",    10),
-            ("Trend Freshness (decays with age)",             10),
-        ]),
-        ("Conviction", "#3fb950", [
-            ("Pattern Recognition (base/compression/continuation)", 35),
-            ("Compression (continuous ATR-based energy scale)",     25),
-            ("Fibonacci Quality (pullback zone OR continuation)",   20),
-            ("RS Leadership (RS improving ahead of price)",         20),
-        ]),
-        ("Entry Quality", "#d29922", [
-            ("EMA20 Distance (breakout/pullback-aware bands)", 40),
-            ("EMA50 Distance (structural)",                    25),
-            ("Pivot High Distance",                            20),
-            ("Bars Since Setup (0-3 Actionable, 8+ Extended)", 15),
-        ]),
-        ("Extension", "#f97316", [
-            ("Price Move Since Setup (trigger to now)",        33),
-            ("EMA20 Distance (volume-climax discounted)",     32),
-            ("Pivot High Distance (volume-climax discounted)", 20),
-            ("EMA50 Distance",                                15),
-        ]),
-    ]
-
-    def _dim_block(dim, color, factors):
-        rows = ""
-        for label, pts in factors:
-            rows += (
-                f'<tr>'
-                f'<td style="padding:3px 10px 3px 0;font-size:11px;color:#e6edf3;">{label}</td>'
-                f'<td style="padding:3px 0;font-size:11px;font-weight:700;color:{color};'
-                f'text-align:right;font-family:var(--mono);white-space:nowrap">+{pts}</td>'
-                f'</tr>'
-            )
-        return (
-            f'<div style="margin-bottom:14px;">'
-            f'<div style="font-size:10px;font-weight:700;color:{color};letter-spacing:0.08em;'
-            f'text-transform:uppercase;margin-bottom:5px;">{dim} <span style="font-size:9px;'
-            f'font-weight:400;color:#8b949e">(0-100{" - lower is better" if dim == "Extension" else ""})</span></div>'
-            f'<table style="border-collapse:collapse;width:100%">{rows}</table>'
-            f'</div>'
-        )
-
-    sec_d = _section_head(
-        "D · Decision Engine", "#d29922",
-        "utils/decision_engine.py compute_decision() — independent 4-score framework, feeds Leadership / Conviction / Entry Quality / Extension / Recommendation columns",
-    )
-    sec_d += f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:16px;margin-bottom:8px;">' \
-              f'{"".join(_dim_block(d, c, f) for d, c, f in dim_rows)}</div>'
-
-    # Internal parameter detail — EMA20 Distance bands (EQ + Extension), RS Composite tiers
-    sec_d += '<div style="font-size:10px;font-weight:700;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em;margin:10px 0 6px">Internal Parameters — key bands</div>'
-    sec_d += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">'
-    sec_d += (
-        '<div><div style="font-size:10px;font-weight:700;color:#d29922;margin-bottom:4px">Entry Quality — EMA20 Distance (breakout entries)</div>'
+    sec1 += (
+        '<div><div style="font-size:10px;font-weight:700;color:#d29922;text-transform:uppercase;'
+        'letter-spacing:0.05em;margin-bottom:5px">Entry Quality — "enter now, or wait?"</div>'
         + _mini_table([
-            ("&le;0%",    "+10", "below EMA20 — unusual for breakout"),
-            ("0-5%",      "+40", "excellent — close to EMA20"),
-            ("5-8%",      "+29", "normal post-breakout extension"),
-            ("8-12%",     "+18", "stretched but tradeable"),
-            ("12-18%",    "+8",  "extended"),
-            ("&gt;18%",   "+0",  "parabolic — avoid"),
-        ], cols=("EMA20 dist", "Pts", "Read"))
+            ("EMA20 Distance",       "0-30", "&le;2%&rarr;30 &middot; &le;4%&rarr;22 &middot; &le;6%&rarr;14 &middot; &le;10%&rarr;6 &middot; else 0"),
+            ("Pivot High Distance",  "0-20", "&le;-2%&rarr;20 (building under) &middot; &le;0.5%&rarr;16 &middot; &le;2%&rarr;10 &middot; else fades to 0"),
+            ("Move Since Setup",     "0-20", "&le;0.5%&rarr;20 &middot; &le;1.5%&rarr;16 &middot; &le;3%&rarr;10 &middot; &le;5%&rarr;3 &middot; else 0"),
+            ("EMA50 Distance",       "0-15", "&le;5%&rarr;15 &middot; &le;10%&rarr;10 &middot; &le;15%&rarr;5 &middot; &le;20%&rarr;2 &middot; else 0"),
+            ("Bars Since Setup",     "0-15", "ATR band Actionable&rarr;15 &middot; Late&rarr;6 &middot; Extended&rarr;0"),
+        ], cols=("Factor", "Pts", "Bands"))
+        + '<div style="font-size:9.5px;color:#8b949e;margin-top:2px">Hard cap: total capped at 35 when trend_phase == EXTENDED, regardless of the sum above.</div>'
         + '</div>'
     )
-    sec_d += (
-        '<div><div style="font-size:10px;font-weight:700;color:#a371f7;margin-bottom:4px">Leadership — Relative Strength (composite)</div>'
-        + _mini_table([
-            ("&ge;12%",      "+30 (+4 top-decile)", "elite RS"),
-            ("8-12%",        "+26", "strong"),
-            ("5-8%",         "+22", "good"),
-            ("3-5%",         "+18", "positive"),
-            ("1-3%",         "+13", "modest"),
-            ("0-1%",         "+8",  "flat"),
-            ("-2-0%",        "+3",  "weak"),
-            ("&lt;-2%",      "+0",  "negative RS"),
-        ], cols=("RS composite", "Pts", "Read"))
-        + '</div>'
-    )
-    sec_d += '</div>'
+    sec1 += '</div>'
 
-    # ── Category thresholds ─────────────────────────────────────────
-    grades = [
-        ("#f5c542", "Elite Opportunity — pullback path",
-         "Leadership &ge; 90 &middot; Conviction &ge; 90 &middot; Entry Quality &ge; 80 &middot; Extension &le; 25"),
-        ("#f5c542", "Elite Opportunity — breakout path",
-         "Fresh base/compression break + Vol &ge; 2.5&times; &middot; Leadership &ge; 85 &middot; Conviction &ge; 80 &middot; EQ &ge; 65 &middot; Extension &le; 45"),
-        ("#3fb950", "High Conviction",
-         "Leadership &ge; 80 &middot; Conviction &ge; 80 &middot; Entry Quality &ge; 60 &middot; Extension &le; 35"),
-        ("#4ade80", "Actionable",
-         "Leadership &ge; 70 &middot; Conviction &ge; 60 &middot; Entry Quality &ge; 60 &middot; Extension &le; 40"),
-        ("#d29922", "Setup Building",
-         "Leadership &ge; 70 &middot; Conviction &ge; 50 — not all Actionable gates met"),
-        ("#a78bfa", "Leader",
-         "Leadership &ge; 70 &middot; Conviction &lt; 50 — RS/momentum present, no setup structure yet"),
-        ("#f97316", "Extended",
-         "Extension &ge; 60 — unless volume-climax exempt (fresh base/compression + Vol &ge; 2.5&times;)"),
-        ("#f85149", "Avoid",
-         "Leadership &lt; 50, or hard stop / no trend / downtrend"),
-    ]
-    grade_html = "".join(
-        f'<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px;">'
-        f'<span style="width:9px;height:9px;border-radius:50%;background:{c};'
-        f'flex-shrink:0;margin-top:2px;display:inline-block"></span>'
-        f'<span style="font-size:11px;color:#e6edf3;font-family:var(--mono)">{label}</span>'
-        f'<span style="font-size:10px;color:#8b949e">&mdash; {desc}</span>'
-        f'</div>'
-        for c, label, desc in grades
+    # ══════════════════════════════════════════════════════════════
+    # SECTION 2 — Composite Blend & Base Tier
+    # ══════════════════════════════════════════════════════════════
+    sec2 = _section_head(
+        "2 · Composite Blend &amp; Base Tier — classify_tier_v3()", "#f5c542",
+        "utils/conviction_score_v1.py classify_tier_v3() — LIVE since 2026-07 (replaces v1's 25/25/50 classify_tier)",
     )
-    sec_d += (
-        f'<div style="border-top:1px solid rgba(255,255,255,0.08);padding-top:14px;margin:14px 0;">'
-        f'<div style="font-size:10px;font-weight:700;color:#8b949e;letter-spacing:0.08em;'
-        f'text-transform:uppercase;margin-bottom:8px;">Category Thresholds '
-        f'<span style="font-size:9px;font-weight:400">(Balanced style, default settings — shift with Trading Style / Extension Tolerance / Conviction Level)</span></div>'
-        f'{grade_html}</div>'
+    sec2 += _mini_table([
+        ("Leadership",    "20%", "floor: &ge; 40 required for Actionable"),
+        ("Conviction",    "50%", "floor: &ge; 55 required for Actionable — highest-weighted pillar keeps its own minimum"),
+        ("Entry Quality", "30%", "no independent floor — carried entirely by the weighted composite"),
+    ], cols=("Pillar", "Weight", "Notes"))
+    sec2 += _mini_table([
+        ("Actionable", "Leadership &ge;40 AND Conviction &ge;55 AND composite &ge;65"),
+        ("Developing",  "composite &ge;50 (floors not required)"),
+        ("Watch",       "Leadership &ge;30 OR composite &ge;35"),
+        ("Skip",        "everything else"),
+    ], cols=("Base Tier", "Condition"))
+    sec2 += _note(
+        "&#9888; These thresholds are marked <b>PLACEHOLDER</b> directly in source — proportionally "
+        "scaled down from v1's 25/25/50 floors to fit the new 20/50/30 weighting, not re-fit against "
+        "a real v3 score distribution. The code comment is explicit: re-run backtest_engine.py's factor "
+        "attribution before trusting this for live gating. Worth knowing before leaning hard on the "
+        "Actionable cut-off for sizing or conviction — it hasn't been through the same v8.1-style "
+        "validation the sub-factor point tables above have.",
+        warn=True,
+    )
+    sec2 += _note(
+        "v1 (compute_conviction_v1 / classify_tier, 25/25/50, empirically validated) and v2 (60% "
+        "Conviction weight) both remain importable for back-comparison — neither feeds the live "
+        "Recommendation. Only v3 is wired into utils/scanner_engine.py."
     )
 
-    sc_rows_data = [
-        ("ELITE",   "#f5c542", "Elite Opportunity",
-         "Highest conviction &middot; either Elite path above &middot; R:R must clear your Min Risk:Reward setting"),
-        ("EXECUTE", "#3fb950", "High Conviction + Actionable",
-         "Actionable setup, tradeable now &middot; R:R must clear your Min Risk:Reward setting"),
-        ("WATCH",   "#d29922", "Setup Building + Leader",
-         "Gates partially met — monitor for upgrade, or RS leader awaiting a base"),
-        ("SKIP",    "#484f58", "Extended + Avoid",
-         "Chase risk too high, or structural gates failed — no actionable setup"),
-    ]
-    sc_rows_html = "".join(
-        f'<tr style="border-bottom:1px solid rgba(255,255,255,0.06)">'
-        f'<td style="padding:6px 12px 6px 0">'
-        f'<span style="background:{c}18;border:1px solid {c}44;color:{c};'
-        f'font-size:10px;font-weight:700;border-radius:4px;padding:2px 8px;'
-        f'font-family:var(--mono)">{sc}</span></td>'
-        f'<td style="padding:6px 12px 6px 0;font-size:11px;color:#e6edf3;white-space:nowrap">{name}</td>'
-        f'<td style="padding:6px 0;font-size:10px;color:#8b949e">{conds}</td>'
-        f'</tr>'
-        for sc, c, name, conds in sc_rows_data
+    # ══════════════════════════════════════════════════════════════
+    # SECTION 3 — Promotion Engine (timing)
+    # ══════════════════════════════════════════════════════════════
+    sec3 = _section_head(
+        "3 · Promotion Engine — Timing Layer (Actionable &rarr; Execute / Elite)", "#3fb950",
+        "utils/promotion_engine.py evaluate_promotion() — runs ONLY on Actionable setups; can upgrade, never demote or create Watch/Developing",
     )
-    sec_d += (
-        f'<div style="border-top:1px solid rgba(255,255,255,0.08);padding-top:14px;">'
-        f'<div style="font-size:10px;font-weight:700;color:#8b949e;letter-spacing:0.08em;'
-        f'text-transform:uppercase;margin-bottom:8px;">Signal Class — Priority (ELITE &gt; EXECUTE &gt; WATCH &gt; SKIP)</div>'
-        f'<table style="border-collapse:collapse;width:100%">{sc_rows_html}</table></div>'
+    sec3 += _mini_table([
+        ("Stochastic Re-ignition", "25", "fresh %K/%D cross AND fired &le;3 bars ago AND %K now &le;40 (not already run away)"),
+        ("LL Defended Spring",     "25", "ll_actionable AND ll_defended AND reclaimed &le;3 bars ago"),
+        ("VWAP Touch &amp; Reclaim","25", "touched &amp; reclaimed session VWAP AND &le;2 bars since touch"),
+        ("Institutional Confirmation","25", "vol_ratio &ge;1.5 AND OBV makes a fresh 10-bar high, same bar"),
+    ], cols=("Signal", "Pts", "Condition"))
+    sec3 += _mini_table([
+        ("Elite",   "Promo Score &ge;75 (3+ signals) AND R:R &ge;2.0"),
+        ("Execute", "Promo Score &ge;50 (2+ signals) AND R:R &ge;1.5"),
+        ("Actionable (no promotion)", "Promo Score &lt;50, or R:R gate not cleared — stays at the CV1 base tier"),
+    ], cols=("Outcome", "Condition"))
+    sec3 += _note(
+        "R:R is a sanity gate, not part of the Promo Score itself — a setup with all 4 timing signals "
+        "firing still won't promote past Actionable if the trade's own Reward:Risk doesn't clear the "
+        "bar. min_risk_reward in Settings can only raise the Execute bar above 1.5, never lower it."
     )
+
+    # ══════════════════════════════════════════════════════════════
+    # SECTION 4 — Structural Gate
+    # ══════════════════════════════════════════════════════════════
+    sec4 = _section_head(
+        "4 · Structural Gate — optional, OFF by default", "#a371f7",
+        "settings['ENABLE_STRUCTURAL_GATE'] — Decision Engine can downgrade (never upgrade) an Actionable base tier before Promotion Engine sees it",
+    )
+    sec4 += _mini_table([
+        ("hard_stop / t4_hard_stop", "&rarr; Skip",  "structural failure Decision Engine caught that CV1 didn't"),
+        ("Lifecycle == AVOID",       "&rarr; Watch", "Decision Engine's fuller Extension model disagrees this is viable"),
+        ("Lifecycle == EXTENDED",    "&rarr; Watch", "chase risk — CV1's blunter EQ-embedded extension cap didn't fully catch it"),
+    ], cols=("Trigger", "Effect", "Why"))
+    sec4 += _note(
+        "Not yet validated against the 1,732-trade backtest set with the gate on vs off — that's why "
+        "it defaults False. If it's on in your Settings, base tiers here can differ from what "
+        "classify_tier_v3() alone would produce."
+    )
+
+    # ══════════════════════════════════════════════════════════════
+    # SECTION 5 — Everything else still running (not part of Recommendation)
+    # ══════════════════════════════════════════════════════════════
+    sec5 = _section_head(
+        "5 · Also running, but NOT part of Recommendation", "#8b949e",
+    )
+    sec5 += _mini_table([
+        ("Score / Action / Tier",  "utils/scoring_core.py compute_bar()", "265-pt raw budget, own norm_score. Action is gated to agree with Recommendation after the fact (see Action Gate), Score/Tier are not."),
+        ("Extension / Lifecycle / Trend Quality / R:R", "utils/decision_engine.py compute_decision(mode=\"production\")", "Takes CV1's L/C/EQ as inputs but computes its own fuller Extension + objective Lifecycle stage — feeds the Extension column and the per-stock explainability panel."),
+        ("Legacy_Leadership / _Conviction / _EntryQuality", "utils/legacy_scoring_diagnostic.py", "Old Decision Engine's own L/C/EQ, kept only as a diagnostic (ConvictionGap). Renamed from DE_* — reads fall back to DE_* for previously persisted rows. Never feeds Recommendation."),
+        ("Five Pillars (FP_*)",    "utils/pillar_engine.py", "Independent, display-only ranking model on the Five Pillars page. Does not influence Score, Action, CV1, or Recommendation."),
+    ], cols=("Column(s)", "Source", "Role"))
 
     return f"""
 <div style="font-family:'JetBrains Mono','Fira Code',monospace;">
   <p style="font-size:11px;color:#8b949e;margin:0 0 8px;">
-    Two independent scoring systems run for every stock — <b style="color:#58a6ff">A/B/C</b> below
-    (Score / Action / Tier + the Opportunity Bonus layered on it) and
-    <b style="color:#d29922">D</b> (the Decision Engine's Leadership/Conviction/Entry Quality/Extension
-    &rarr; Recommendation). They can disagree on the same stock — that is expected, not a bug.
+    <b style="color:#e6edf3">Recommendation</b> (Skip &rarr; Watch &rarr; Developing &rarr; Actionable &rarr;
+    Execute &rarr; Elite) is the <b>only</b> recommendation shown anywhere in the app, and it comes from
+    exactly one pipeline: <b style="color:#58a6ff">CV1 sub-scores</b> &rarr;
+    <b style="color:#f5c542">v3 composite/base tier</b> &rarr;
+    <b style="color:#3fb950">Promotion Engine timing</b> &rarr;
+    <b style="color:#a371f7">optional structural downgrade</b>. Everything in Section 5 still runs and
+    still feeds its own columns, but none of it can change the Recommendation.
   </p>
-  {sec_a}
-  {sec_b}
-  {sec_c}
-  {sec_d}
-  <p style="font-size:10px;color:#8b949e;margin:14px 0 0;font-style:italic;">
-    A category that fails the Min Risk:Reward gate (Elite/High Conviction/Actionable
-    only) is downgraded to Setup Building — see "Primary Blocker" in the results
-    table. Use the per-stock breakdown (inside each tab) to see exactly which
-    sub-factors fired.
-  </p>
+  {sec1}
+  {sec2}
+  {sec3}
+  {sec4}
+  {sec5}
 </div>
 """
 
@@ -1540,40 +1421,30 @@ def _market_status_row(summary: dict, scan_time: str,
     adx_is_real  = summary.get("adx_is_real", False)
     adx_note     = "" if adx_is_real else " (proxy)"
 
-    def _gate(ok: bool, label: str, tip: str = "") -> str:
+    def _gate_chip(ok: bool, chip_label: str, value: str, tip: str) -> str:
+        # [Restructure 2026-07] Merges the old duplicate rows — a plain
+        # value chip ("VIX 14.7") plus a separate pass/fail checklist row
+        # ("✅ VIX ≤22 (14.7)") repeating the same number — into one chip
+        # that carries both the value and the gate verdict.
         icon  = "✅" if ok else "❌"
         color = "#3fb950" if ok else "#f85149"
-        tip_attr = f' title="{tip}"' if tip else ""
         return (
-            f'<span{tip_attr} style="font-size:11px;color:{color};'
-            f'white-space:nowrap;cursor:default">{icon} {label}</span>'
+            f'<span class="msr-chip" title="{tip}" style="color:{color}">'
+            f'{icon} <span class="chip-label">{chip_label}</span>{value}</span>'
         )
-
-    checklist_html = (
-        f'<div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:4px;">'
-        + _gate(vix_ok,    f"VIX ≤22 ({vix_val})",
-                "India VIX ≤ 22 required — higher VIX closes the Execute gate")
-        + _gate(ema50_up,  "Nifty > EMA50",
-                "Nifty above 50-day EMA — short-term trend intact")
-        + _gate(ema200_up, "Nifty > EMA200",
-                "Nifty above 200-day EMA — long-term uptrend confirmed")
-        + _gate(adx_ok,    f"ADX ≥25 ({adx_val}{adx_note})",
-                f"Nifty ADX(14) ≥ 25 — market trending with direction{adx_note}")
-        + "</div>"
-    )
 
     return f"""
 <div class="msr">
   <span class="regime-pill-solid" style="background:{color};color:#0d1117">{regime_label}</span>
   <span class="msr-chip"><span class="chip-label">Nifty</span>{nifty_str}</span>
   <span class="msr-chip">{pct_html}</span>
-  <span class="msr-chip" style="color:{ema50_col}">{ema50_txt}</span>
-  <span class="msr-chip"><span class="chip-label">VIX</span>{vix_val}</span>
-  <span class="msr-chip" title="Nifty ADX(14) — directional strength of the index"><span class="chip-label">Nifty ADX</span>{adx_val}</span>
+  {_gate_chip(ema50_up,  "EMA50",     "", "Nifty above 50-day EMA — short-term trend intact")}
+  {_gate_chip(ema200_up, "EMA200",    "", "Nifty above 200-day EMA — long-term uptrend confirmed")}
+  {_gate_chip(vix_ok,    "VIX ≤22 ", vix_val, "India VIX ≤ 22 required — higher VIX closes the Execute gate")}
+  {_gate_chip(adx_ok,    "ADX ≥25 ", f"{adx_val}{adx_note}", f"Nifty ADX(14) ≥ 25 — market trending with direction{adx_note}")}
   <span class="msr-spacer"></span>
   {scan_chip}
 </div>
-{checklist_html}
 <p class="market-note">{mkt_text}</p>
 """
 
@@ -2800,7 +2671,11 @@ def render(settings: dict | None = None):
                         save_lifecycle_transitions(_transitions)
             except Exception:
                 pass  # non-critical
-            st.success("✅ Saved to Supabase.")
+            # [Restructure 2026-07] Was a persistent full-width st.success()
+            # banner that stayed on screen (and pushed everything below it
+            # down) until the next scan. A toast confirms the same thing
+            # without permanently occupying a row.
+            st.toast("Saved to Supabase.", icon="✅")
 
     # ── Display ────────────────────────────────────────────────
     df_aug        = st.session_state.get("scan_df",       pd.DataFrame())
