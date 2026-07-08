@@ -696,7 +696,17 @@ def score_stock(
         "_bar_result":  r,
     }
 
-    # ── Conviction Score v1 (backtest-validated weights) ─────────
+    # ── Conviction Score v3 — LIVE (2026-07, replaces v1) ─────────
+    # v3 composite: Leadership 20% / Conviction 50% / Entry Quality 30%,
+    # with tier/signal floors relaxed relative to v1 (25/25/50) so the
+    # weighted composite carries more of the qualification decision —
+    # see utils/conviction_score_v1.py classify_tier_v3()/_classify_v3()
+    # for the full rationale. Sub-factor scoring itself (_leadership(),
+    # _conviction(), _entry_quality()) is UNCHANGED from v1 — only the
+    # composite blend and tier/signal thresholds differ.
+    # v1 (compute_conviction_v1/classify_tier, 25/25/50) remains frozen
+    # and importable directly for back-comparison; it's simply no
+    # longer what feeds the live Recommendation as of this change.
     # Pure re-mapping of existing BarResult fields — zero new indicators.
     # Produces: CV1_Leadership, CV1_Conviction, CV1_EntryQuality, CV1_SignalClass
     # and all sub-score internals for the detail-view breakdown panel.
@@ -706,8 +716,8 @@ def score_stock(
     # including the objective Lifecycle stage, not just the Recommendation.
     cv1 = None
     try:
-        from utils.conviction_score_v1 import compute_conviction_v1
-        cv1 = compute_conviction_v1(r)
+        from utils.conviction_score_v1 import compute_conviction_v3
+        cv1 = compute_conviction_v3(r)
         result.update({
             "CV1_Leadership":    cv1.leadership,
             "CV1_Conviction":    cv1.conviction,
@@ -827,8 +837,9 @@ def score_stock(
         )
 
     # ── RECOMMENDATION FUNNEL (CV1 quality → Promotion Engine timing) ──
-    # CV1 is the single source of truth for quality. classify_tier()
-    # maps its three scores to the base funnel:
+    # CV1 is the single source of truth for quality. classify_tier_v3()
+    # (20/50/30 composite, relaxed floors — LIVE as of 2026-07, replaces
+    # v1's classify_tier) maps its three scores to the base funnel:
     #     Skip → Watch → Developing → Actionable
     # The Promotion Engine only ever runs on an Actionable setup and
     # can only upgrade it to Execute or Elite — it never creates a
@@ -839,10 +850,10 @@ def score_stock(
         if cv1 is None:
             raise RuntimeError("CV1 unavailable — cannot classify Recommendation")
 
-        from utils.conviction_score_v1 import classify_tier
+        from utils.conviction_score_v1 import classify_tier_v3
         from utils.promotion_engine import evaluate_promotion
 
-        base_tier = classify_tier(cv1.leadership, cv1.conviction, cv1.entry_quality)
+        base_tier = classify_tier_v3(cv1.leadership, cv1.conviction, cv1.entry_quality)
 
         # ── STRUCTURAL GATE (opt-in — default False for A/B backtesting) ──
         # Decision Engine computes hard structural failure conditions and
@@ -879,7 +890,7 @@ def score_stock(
         result["_structural_gate_blocked"] = _gate_reason
         result["_structural_gate_on"] = _structural_gate_on
 
-        result["CV1_SignalClass"]    = cv1.signal_class   # legacy CV1-only label, kept for reference
+        result["CV1_SignalClass"]    = cv1.signal_class   # v3-weighted (_classify_v3) as of 2026-07 — no longer v1's frozen label
         result["Tier"]               = base_tier           # pre-promotion CV1 tier
         result["Recommendation"]     = final_tier           # Skip|Watch|Developing|Actionable|Execute|Elite
         result["Promoted"]           = bool(promo.applicable and promo.promoted)
