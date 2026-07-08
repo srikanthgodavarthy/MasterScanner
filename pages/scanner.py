@@ -2403,12 +2403,19 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
             )
         return f'<td style="white-space:nowrap">{badges}</td>'
 
-    def _pb_gate_score(v, threshold, label):
-        """Score cell that turns red when below the admission gate threshold."""
+    def _pb_gate_score(v, threshold, label, compare_v=None):
+        """Score cell that turns red when below the admission gate threshold.
+
+        `compare_v` lets the cell display one number (e.g. raw EQ) while
+        gating on a different one (e.g. composite) — needed for v3 where
+        EQ has no standalone floor and only matters via its 30% composite
+        weight (see utils/conviction_score_v1.py classify_tier_v3()).
+        """
         try:
             fv    = float(v)
-            fail  = fv < threshold
-            color = "#f85149" if fail else "#3fb950" if fv >= threshold * 1.2 else "#d29922"
+            gate_v = float(compare_v) if compare_v is not None else fv
+            fail  = gate_v < threshold
+            color = "#f85149" if fail else "#3fb950" if gate_v >= threshold * 1.2 else "#d29922"
             pct   = min(int(fv), 100)
             tip   = f'title="Gate: ≥{threshold} — {"FAILING" if fail else "OK"}"'
             icon  = "✖" if fail else ""
@@ -2430,14 +2437,15 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
         ("LEADERSHIP", ""),          ("CONVICTION",  ""),  ("EQ",        ""),
         ("BOOSTS",     ""),          ("TIER",        ""),
     ]
-    # Gate threshold tooltips on headers — mirror CV1's actual classify_tier()
-    # gate (utils/conviction_score_v1.py): Leadership >= 55 AND the average of
-    # all three >= 65 to reach Actionable. These are shown as reference bands
-    # tied to the real (composite) gate, same one used everywhere else.
+    # Gate threshold tooltips on headers — mirror CV1 v3's actual
+    # classify_tier_v3() gate (utils/conviction_score_v1.py, LIVE since
+    # 2026-07): Leadership >= 40 AND Conviction >= 55 AND the 20/50/30
+    # WEIGHTED composite >= 65 to reach Actionable. (Not a simple average —
+    # that was v1's stale description and never matched v3's blend.)
     _HEADER_TIPS = {
-        "LEADERSHIP": 'title="CV1 Leadership — gate: Leadership ≥ 55 AND avg(L,C,EQ) ≥ 65 for Actionable"',
-        "CONVICTION": 'title="CV1 Conviction — gate: avg(Leadership, Conviction, Entry Quality) ≥ 65 for Actionable"',
-        "EQ":         'title="CV1 Entry Quality — gate: avg(Leadership, Conviction, Entry Quality) ≥ 65 for Actionable"',
+        "LEADERSHIP": 'title="CV1 Leadership — gate: Leadership ≥ 40 (v3 floor)"',
+        "CONVICTION": 'title="CV1 Conviction — gate: Conviction ≥ 55 (v3 floor, 50% composite weight)"',
+        "EQ":         'title="CV1 Entry Quality — no standalone floor in v3; gates via 20/50/30 weighted composite ≥ 65"',
     }
     thead = (
         '<thead><tr>'
@@ -2467,6 +2475,9 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
         ls     = r.get("CV1_Leadership",   0)
         cv     = r.get("CV1_Conviction",   0)
         eq     = r.get("CV1_EntryQuality", 0)
+        composite = r.get("CV1_Composite", 0) or (
+            (float(ls or 0) * 0.20) + (float(cv or 0) * 0.50) + (float(eq or 0) * 0.30)
+        )
 
         # CCI state label — mirrors the main scanner
         try:
@@ -2502,9 +2513,9 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
             + _pb_num(r.get("SL"),    "{:.2f}", color="#f85149")
             + _pb_num(r.get("T1"),    "{:.2f}", color="#58a6ff")
             + _pb_num(r.get("T2"),    "{:.2f}", color="#3fb950")
-            + _pb_gate_score(ls, 55, "Leadership")
-            + _pb_gate_score(cv, 65, "Conviction")
-            + _pb_gate_score(eq, 65, "EQ")
+            + _pb_gate_score(ls, 40, "Leadership")
+            + _pb_gate_score(cv, 55, "Conviction")
+            + _pb_gate_score(eq, 65, "EQ", compare_v=composite)
             + _pb_boosts(boosts)
             + _pb_tier(tier)
             + '</tr>\n'
