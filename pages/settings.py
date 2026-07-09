@@ -82,6 +82,34 @@ DEFAULTS = {
     # ── Backtest engine default (Backtest page reads this to pick its
     # initial Signal Source; still overridable per-run on that page) ──
     "bt_default_engine":         "scanner",
+    # ── CV1 v3 tier / signal thresholds (see utils/conviction_score_v1.py
+    # V3_THRESHOLD_DEFAULTS — PLACEHOLDER THRESHOLDS, not yet re-validated
+    # against a real v3 score distribution; exposed here so they can be
+    # tuned without a code change while that validation is pending) ──
+    "v3_watch_leadership_min":      30,
+    "v3_watch_composite_min":       35,
+    "v3_developing_composite_min":  50,
+    "v3_actionable_leadership_min": 40,
+    "v3_actionable_conviction_min": 55,
+    "v3_actionable_composite_min":  65,
+    "v3_execute_leadership_min":    40,
+    "v3_execute_conviction_min":    55,
+    "v3_execute_entry_quality_min": 55,
+    "v3_execute_composite_min":     60,
+    "v3_elite_leadership_min":      55,
+    "v3_elite_conviction_min":      75,
+    "v3_elite_entry_quality_min":   70,
+    "v3_elite_composite_min":       72,
+    # ── Promotion Engine (utils/promotion_engine.py) — Promo Score and
+    # R:R thresholds are all plain overrides, freely adjustable either
+    # direction (see evaluate_promotion docstring) ──
+    "promo_execute_score_min": 50,
+    "promo_elite_score_min":   75,
+    "promo_min_rr_elite":      2.0,
+    # ── Backtest admission (utils/backtest_engine.py Gate 3) — separate
+    # from Promotion Engine's R:R gates; a backtest population choice,
+    # freely adjustable either direction ──
+    "backtest_min_rr": 2.0,
 }
 
 _TRADING_STYLE_DEFAULTS = {
@@ -580,6 +608,118 @@ def _tab_advanced() -> None:
                 key="sl_min_score", label_visibility="collapsed")
             _s("min_score", int(min_score))
 
+        _label("Backtest R:R admission floor")
+        bt_min_rr = st.slider("Backtest min R:R", 1.0, 4.0, float(_g("backtest_min_rr")),
+            step=0.1, key="sl_backtest_min_rr", label_visibility="collapsed",
+            help="Independent of Promotion Engine's R:R gates below — this is the "
+                 "backtest's own population filter (utils/backtest_engine.py Gate 3).")
+        _s("backtest_min_rr", float(bt_min_rr))
+
+    # ── CV1 v3 tier / signal thresholds & Promotion Engine ───────
+    with st.expander("CV1 v3 — Tier & Promotion thresholds", expanded=False):
+        st.markdown(
+            "<small style='color:#8b949e'>These are PLACEHOLDER THRESHOLDS "
+            "(utils/conviction_score_v1.py) — proportionally scaled, not yet "
+            "re-validated against a real v3 score distribution. Adjust here "
+            "without a code change; re-run the backtest to see the effect.</small>",
+            unsafe_allow_html=True,
+        )
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**Actionable** (base funnel floor)")
+            _label("Leadership ≥")
+            v = st.slider("Actionable Leadership", 0, 100, int(_g("v3_actionable_leadership_min")),
+                step=5, key="sl_v3_act_ls", label_visibility="collapsed")
+            _s("v3_actionable_leadership_min", int(v))
+            _label("Conviction ≥")
+            v = st.slider("Actionable Conviction", 0, 100, int(_g("v3_actionable_conviction_min")),
+                step=5, key="sl_v3_act_cv", label_visibility="collapsed")
+            _s("v3_actionable_conviction_min", int(v))
+            _label("Composite ≥")
+            v = st.slider("Actionable Composite", 0, 100, int(_g("v3_actionable_composite_min")),
+                step=5, key="sl_v3_act_comp", label_visibility="collapsed")
+            _s("v3_actionable_composite_min", int(v))
+
+        with c2:
+            st.markdown("**Execute** (natural score)")
+            _label("Leadership ≥")
+            v = st.slider("Execute Leadership", 0, 100, int(_g("v3_execute_leadership_min")),
+                step=5, key="sl_v3_exec_ls", label_visibility="collapsed")
+            _s("v3_execute_leadership_min", int(v))
+            _label("Conviction ≥")
+            v = st.slider("Execute Conviction", 0, 100, int(_g("v3_execute_conviction_min")),
+                step=5, key="sl_v3_exec_cv", label_visibility="collapsed")
+            _s("v3_execute_conviction_min", int(v))
+            _label("Entry Quality ≥")
+            v = st.slider("Execute Entry Quality", 0, 100, int(_g("v3_execute_entry_quality_min")),
+                step=5, key="sl_v3_exec_eq", label_visibility="collapsed")
+            _s("v3_execute_entry_quality_min", int(v))
+            _label("Composite ≥")
+            v = st.slider("Execute Composite", 0, 100, int(_g("v3_execute_composite_min")),
+                step=5, key="sl_v3_exec_comp", label_visibility="collapsed")
+            _s("v3_execute_composite_min", int(v))
+
+        with c3:
+            st.markdown("**Elite** (natural score)")
+            _label("Leadership ≥")
+            v = st.slider("Elite Leadership", 0, 100, int(_g("v3_elite_leadership_min")),
+                step=5, key="sl_v3_elite_ls", label_visibility="collapsed")
+            _s("v3_elite_leadership_min", int(v))
+            _label("Conviction ≥")
+            v = st.slider("Elite Conviction", 0, 100, int(_g("v3_elite_conviction_min")),
+                step=5, key="sl_v3_elite_cv", label_visibility="collapsed")
+            _s("v3_elite_conviction_min", int(v))
+            _label("Entry Quality ≥")
+            v = st.slider("Elite Entry Quality", 0, 100, int(_g("v3_elite_entry_quality_min")),
+                step=5, key="sl_v3_elite_eq", label_visibility="collapsed")
+            _s("v3_elite_entry_quality_min", int(v))
+            _label("Composite ≥")
+            v = st.slider("Elite Composite", 0, 100, int(_g("v3_elite_composite_min")),
+                step=5, key="sl_v3_elite_comp", label_visibility="collapsed")
+            _s("v3_elite_composite_min", int(v))
+
+        _divider()
+        st.markdown("**Watch / Developing floors** (base funnel)")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            _label("Watch: Leadership ≥")
+            v = st.slider("Watch Leadership", 0, 100, int(_g("v3_watch_leadership_min")),
+                step=5, key="sl_v3_watch_ls", label_visibility="collapsed")
+            _s("v3_watch_leadership_min", int(v))
+        with c2:
+            _label("Watch: Composite ≥")
+            v = st.slider("Watch Composite", 0, 100, int(_g("v3_watch_composite_min")),
+                step=5, key="sl_v3_watch_comp", label_visibility="collapsed")
+            _s("v3_watch_composite_min", int(v))
+        with c3:
+            _label("Developing: Composite ≥")
+            v = st.slider("Developing Composite", 0, 100, int(_g("v3_developing_composite_min")),
+                step=5, key="sl_v3_dev_comp", label_visibility="collapsed")
+            _s("v3_developing_composite_min", int(v))
+
+        _divider()
+        st.markdown(
+            "**Promotion Engine** (utils/promotion_engine.py) — Promo Score "
+            "and R:R thresholds are all plain overrides now, freely "
+            "adjustable in either direction."
+        )
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            _label("Execute Promo Score ≥")
+            v = st.slider("Promo Execute", 0, 100, int(_g("promo_execute_score_min")),
+                step=5, key="sl_promo_exec", label_visibility="collapsed")
+            _s("promo_execute_score_min", int(v))
+        with c2:
+            _label("Elite Promo Score ≥")
+            v = st.slider("Promo Elite", 0, 100, int(_g("promo_elite_score_min")),
+                step=5, key="sl_promo_elite", label_visibility="collapsed")
+            _s("promo_elite_score_min", int(v))
+        with c3:
+            _label("Elite R:R ≥")
+            v = st.slider("Promo Elite RR", 1.0, 5.0, float(_g("promo_min_rr_elite")),
+                step=0.1, key="sl_promo_elite_rr", label_visibility="collapsed")
+            _s("promo_min_rr_elite", float(v))
+
     # ── Institutional Continuation (VWAP Reclaim) ────────────────
     with st.expander("Institutional Continuation", expanded=False):
         st.markdown(
@@ -870,4 +1010,25 @@ def render() -> dict:
         "ic_momentum_weight":        ss.get("ic_momentum_weight",        DEFAULTS["ic_momentum_weight"]),
         "ic_confluence_weight":      ss.get("ic_confluence_weight",      DEFAULTS["ic_confluence_weight"]),
         "bt_default_engine":         ss.get("bt_default_engine",         DEFAULTS["bt_default_engine"]),
+        # ── CV1 v3 tier / signal thresholds ──────────────────────
+        "v3_watch_leadership_min":      ss.get("v3_watch_leadership_min",      DEFAULTS["v3_watch_leadership_min"]),
+        "v3_watch_composite_min":       ss.get("v3_watch_composite_min",       DEFAULTS["v3_watch_composite_min"]),
+        "v3_developing_composite_min":  ss.get("v3_developing_composite_min",  DEFAULTS["v3_developing_composite_min"]),
+        "v3_actionable_leadership_min": ss.get("v3_actionable_leadership_min", DEFAULTS["v3_actionable_leadership_min"]),
+        "v3_actionable_conviction_min": ss.get("v3_actionable_conviction_min", DEFAULTS["v3_actionable_conviction_min"]),
+        "v3_actionable_composite_min":  ss.get("v3_actionable_composite_min",  DEFAULTS["v3_actionable_composite_min"]),
+        "v3_execute_leadership_min":    ss.get("v3_execute_leadership_min",    DEFAULTS["v3_execute_leadership_min"]),
+        "v3_execute_conviction_min":    ss.get("v3_execute_conviction_min",    DEFAULTS["v3_execute_conviction_min"]),
+        "v3_execute_entry_quality_min": ss.get("v3_execute_entry_quality_min", DEFAULTS["v3_execute_entry_quality_min"]),
+        "v3_execute_composite_min":     ss.get("v3_execute_composite_min",     DEFAULTS["v3_execute_composite_min"]),
+        "v3_elite_leadership_min":      ss.get("v3_elite_leadership_min",      DEFAULTS["v3_elite_leadership_min"]),
+        "v3_elite_conviction_min":      ss.get("v3_elite_conviction_min",      DEFAULTS["v3_elite_conviction_min"]),
+        "v3_elite_entry_quality_min":   ss.get("v3_elite_entry_quality_min",   DEFAULTS["v3_elite_entry_quality_min"]),
+        "v3_elite_composite_min":       ss.get("v3_elite_composite_min",       DEFAULTS["v3_elite_composite_min"]),
+        # ── Promotion Engine ──────────────────────────────────────
+        "promo_execute_score_min": ss.get("promo_execute_score_min", DEFAULTS["promo_execute_score_min"]),
+        "promo_elite_score_min":   ss.get("promo_elite_score_min",   DEFAULTS["promo_elite_score_min"]),
+        "promo_min_rr_elite":      ss.get("promo_min_rr_elite",      DEFAULTS["promo_min_rr_elite"]),
+        # ── Backtest admission (independent of Promotion Engine) ──
+        "backtest_min_rr": ss.get("backtest_min_rr", DEFAULTS["backtest_min_rr"]),
     }
