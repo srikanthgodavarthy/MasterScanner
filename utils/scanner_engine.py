@@ -11,6 +11,9 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import streamlit as st
+import requests
+import io
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings("ignore")
@@ -177,10 +180,10 @@ def detect_abcd(pivots_price, pivots_is_high, close_val, open_val, prev_high):
 
 
 # ══════════════════════════════════════════════════════════════════
-#  NIFTY 500 SYMBOLS
+#  NIFTY 500 SYMBOLS — hardcoded fallback (used if NSE CSV fetch fails)
 # ══════════════════════════════════════════════════════════════════
 
-NIFTY500_SYMBOLS = [
+_NIFTY500_FALLBACK = [
     "360ONE","3MINDIA","ABB","ACC","AIAENG","APLAPOLLO","AUBANK","AARTIIND",
     "AAVAS","ABBOTINDIA","ACE","ADANIENSOL","ADANIENT","ADANIGREEN","ADANIPORTS","ADANIPOWER",
     "ATGL","AWL","ABCAPITAL","ABFRL","AEGISLOG","AETHER","AFFLE","AJANTPHARM",
@@ -208,7 +211,7 @@ NIFTY500_SYMBOLS = [
     "GPPL","GSFC","GSPL","HEG","HBLENGINE","HCLTECH","HDFCAMC","HDFCBANK",
     "HDFCLIFE","HFCL","HAPPSTMNDS","HAPPYFORGE","HAVELLS","HEROMOTOCO","HSCL","HINDALCO",
     "HAL","HINDCOPPER","HINDPETRO","HINDUNILVR","HINDZINC","POWERINDIA","HOMEFIRST","HONASA",
-    "HONAUT","HUDCO","ICICIBANK","ICICIGI","ICICIPRULI","ISEC","IDBI","IDFCFIRSTB",
+    "HONAUT","HUDCO","ICICIBANK","ICICIGI","ICICIPRULI","IDBI","IDFCFIRSTB",
     "IFCI","IIFL","IRB","IRCON","ITC","ITI","INDIACEM","INDIAMART",
     "INDIANB","IEX","INDHOTEL","IOC","IOB","IRCTC","IRFC","INDIGOPNTS",
     "IGL","INDUSTOWER","INDUSINDBK","NAUKRI","INFY","INOXWIND","INTELLECT","INDIGO",
@@ -240,9 +243,92 @@ NIFTY500_SYMBOLS = [
     "TRENT","TRIDENT","TIINDIA","UPL","UTIAMC","ULTRACEMCO","UNIONBANK","UBL",
     "VOLTAS","WELCORP","WELSPUNLIV","WIPRO","YESBANK","ZYDUSLIFE","ZYDUSWELL","ECLERX",
     "TMCV","TMPV","EMCURE","GODIGIT","GRAVITA","IREDA","JKTYRE","JPPOWER","NTPCGREEN",
-    "JSWCEMENT","AKZOINDIA","KIRLOSENG","LTFOODS","NEULANDLAB","NEWGEN","PFIZER","SCI",
+    "JSWCEMENT","KIRLOSENG","LTFOODS","NEULANDLAB","NEWGEN","PFIZER","SCI",
     "FORCEMOT","TEGA","TITAGARH","HDBFS","ICICIAMC","PIRAMALFIN","PWL",
 ]
+
+_NSE_CSV_URL   = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
+_NSE_HOME_URL  = "https://www.nseindia.com"
+_NSE_HEADERS   = {
+    # NSE's edge blocks requests without a browser-like UA + referer, and
+    # requires cookies from a prior hit to the site root before the CSV
+    # endpoint will respond — a bare GET to the CSV URL alone 403s.
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/csv,application/csv,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/market-data/live-equity-market",
+}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_nifty500_constituents() -> list[str]:
+    """
+    Download the official Nifty 500 constituent list from NSE Indices and
+    cache it for 24h, so the scanner's universe stays in sync with index
+    reconstitutions instead of drifting from a hardcoded snapshot.
+
+    NSE's edge rejects bare requests to the CSV endpoint (403) unless the
+    session first hits the site root to pick up cookies, and expects a
+    browser-like User-Agent/Referer. On any failure — network error, non-200
+    status, unexpected schema, or a suspiciously short list — this falls
+    back to the last-known-good hardcoded snapshot (_NIFTY500_FALLBACK)
+    rather than let the scanner run with an empty or partial universe.
+
+    Returns
+    -------
+    list[str] — NSE trading symbols (no ".NS" suffix), e.g. "RELIANCE".
+    """
+    try:
+        session = requests.Session()
+        session.headers.update(_NSE_HEADERS)
+
+        # Prime cookies — NSE's CSV endpoint 403s without a prior hit to
+        # the site root in the same session.
+        session.get(_NSE_HOME_URL, timeout=10)
+
+        resp = session.get(_NSE_CSV_URL, timeout=10)
+        resp.raise_for_status()
+
+        df = pd.read_csv(io.StringIO(resp.text))
+
+        # Column name has been "Symbol" historically; guard against NSE
+        # tweaking casing/whitespace without warning.
+        sym_col = next(
+            (c for c in df.columns if c.strip().lower() == "symbol"), None
+        )
+        if sym_col is None:
+            raise ValueError(f"no 'Symbol' column in NSE CSV; got {list(df.columns)}")
+
+        symbols = (
+            df[sym_col]
+            .astype(str)
+            .str.strip()
+            .replace("", pd.NA)
+            .dropna()
+            .unique()
+            .tolist()
+        )
+
+        # Sanity floor — a real Nifty 500 file should be close to 500 rows;
+        # anything wildly short signals a malformed/partial download.
+        if len(symbols) < 450:
+            raise ValueError(f"NSE CSV returned only {len(symbols)} symbols, expected ~500")
+
+        return symbols
+
+    except Exception as e:
+        logging.warning(f"fetch_nifty500_constituents: NSE fetch failed ({e}); using hardcoded fallback")
+        return list(_NIFTY500_FALLBACK)
+
+
+# Resolved once at import time (st.cache_data works outside an active
+# Streamlit script run too — it just populates the cache). Every existing
+# `from utils.scanner_engine import NIFTY500_SYMBOLS` callsite keeps working
+# unchanged; they now get the NSE-sourced list when available.
+NIFTY500_SYMBOLS = fetch_nifty500_constituents()
 
 
 # ══════════════════════════════════════════════════════════════════
