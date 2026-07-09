@@ -107,6 +107,13 @@ def _get_live_scan_metrics() -> pd.DataFrame:
     return st.session_state["portfolio_exit_cfg"]
 
 
+def _get_config() -> ExitScoreConfig:
+    """Config lives in session_state so edits persist across reruns on this page."""
+    if "portfolio_exit_cfg" not in st.session_state:
+        st.session_state["portfolio_exit_cfg"] = ExitScoreConfig()
+    return st.session_state["portfolio_exit_cfg"]
+
+
 def _config_editor(cfg: ExitScoreConfig):
     with st.expander("⚙️ Exit Score weights & thresholds (configurable)", expanded=False):
         c1, c2, c3, c4 = st.columns(4)
