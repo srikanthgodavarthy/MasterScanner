@@ -830,6 +830,18 @@ def simulate_trades(
     trades        = []
     blocked_until = pd.Timestamp.min   # tracks exit_date of last trade
 
+    # ── Perf: avoid rescanning df_full for every signal ──────────────────
+    # df_full's index must be sorted+unique for searchsorted to give correct
+    # positions. This holds for the OHLCV frames as loaded today, but assert
+    # defensively rather than trust callers silently.
+    if not df_full.index.is_monotonic_increasing:
+        raise ValueError("simulate_trades: df_full.index must be sorted ascending")
+    if df_full.index.has_duplicates:
+        raise ValueError("simulate_trades: df_full.index has duplicate timestamps")
+
+    idx = df_full.index
+    n   = len(idx)
+
     for _, sig in signals.iterrows():
         entry_signal_date = sig["date"]
 
@@ -837,9 +849,14 @@ def simulate_trades(
         if entry_signal_date < blocked_until:
             continue
 
-        future = df_full[df_full.index > entry_signal_date]
-        if len(future) < 2:
+        # searchsorted("right") gives the first position strictly after
+        # entry_signal_date, equivalent to the old `index > entry_signal_date`
+        # boolean mask but without scanning/copying the whole frame.
+        start_pos = idx.searchsorted(entry_signal_date, side="right")
+        if n - start_pos < 2:
             continue
+
+        future = df_full.iloc[start_pos:]
 
         entry_bar   = future.index[0]
         entry_price = float(future["open"].iloc[0])
@@ -908,14 +925,26 @@ def simulate_trades(
         else:
             window = future.iloc[: hold_days + 1]
 
-        for dt, row in window.iterrows():
-            bar_low  = float(row["low"])
-            bar_high = float(row["high"])
-            bar_open = float(row["open"])
+        # numpy views over the window — avoids a per-row Series + float()
+        # conversion for every bar (window is typically ~20 rows, but this
+        # runs once per signal, so it adds up fast at scale).
+        w_low   = window["low"].to_numpy()
+        w_high  = window["high"].to_numpy()
+        w_open  = window["open"].to_numpy()
+        w_close = window["close"].to_numpy()
+        w_index = window.index
+
+        _exit_ts_cmp = pd.Timestamp(_cci_exit_date) if (_is_cci_mode and _cci_exit_date is not None) else None
+
+        for i in range(len(window)):
+            dt       = w_index[i]
+            bar_low  = w_low[i]
+            bar_high = w_high[i]
+            bar_open = w_open[i]
 
             # CCI Master native EXIT signal: hard exit at close of this bar
-            if _is_cci_mode and _cci_exit_date is not None and dt >= pd.Timestamp(_cci_exit_date):
-                exit_price  = float(row["close"])
+            if _exit_ts_cmp is not None and dt >= _exit_ts_cmp:
+                exit_price  = float(w_close[i])
                 exit_date   = dt
                 exit_reason = "CCI_EXIT"
                 break
