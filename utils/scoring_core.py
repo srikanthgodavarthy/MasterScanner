@@ -634,7 +634,7 @@ def _get_pivots(ia: IndicatorArrays, i: int, pvt_lb: int):
 
     # P5: Numba ABCD
     cur_c  = ia._c_arr[i]   if ia._c_arr  is not None else float(ia.c.iloc[i])
-    cur_o  = float(ia.o.iloc[i])
+    cur_o  = ia._o_arr[i]   if ia._o_arr  is not None else float(ia.o.iloc[i])
     prev_h = ia._h_arr[i-1] if (ia._h_arr is not None and i >= 1) else cur_c
     abcd_bull, abcd_bear = detect_abcd_nb(
         pv_prices_arr[:4], pv_is_high_arr[:4],
@@ -1164,16 +1164,24 @@ def compute_bar(
     #   3. Volume above average (institutional participation)
     #   4. Base lasted >= 4 bars where ATR was compressed
 
+    # PERF-7: missed by the PERF-6 audit — a second per-bar scan further
+    # down compute_bar(), invisible to a flat-.iloc[i] grep because it's a
+    # slice+.max() plus a nested loop. ha/asmaca/atrl are the same numpy
+    # shadows already loaded above in this function.
     _lb_base  = min(params.pvt_lb * 2, i)           # lookback for base scan
-    _base_hi  = float(ia.h.iloc[max(0, i - _lb_base):i].max()) if i > 0 else cur_c
-    _atr_base = float(ia.atr_sma_comp.iloc[i]) if not np.isnan(float(ia.atr_sma_comp.iloc[i])) else cur_atr
+    if ha is not None and i > 0:
+        _base_hi = float(ha[max(0, i - _lb_base):i].max())
+    else:
+        _base_hi = float(ia.h.iloc[max(0, i - _lb_base):i].max()) if i > 0 else cur_c
+    _atr_base_raw = asmaca[i] if asmaca is not None else float(ia.atr_sma_comp.iloc[i])
+    _atr_base = _atr_base_raw if not np.isnan(_atr_base_raw) else cur_atr
 
     # Count compressed bars in lookback window
     _compressed_bars = 0
     _comp_ratio = params.t2_atr_ratio
     for _bk in range(1, min(_lb_base, 20)):
-        _atr_k     = atrl[i - _bk] if atrl is not None else float(ia.atr_s.iloc[i - _bk])
-        _atr_sma_k = float(ia.atr_sma_comp.iloc[i - _bk])
+        _atr_k     = atrl[i - _bk]   if atrl   is not None else float(ia.atr_s.iloc[i - _bk])
+        _atr_sma_k = asmaca[i - _bk] if asmaca is not None else float(ia.atr_sma_comp.iloc[i - _bk])
         if not np.isnan(_atr_sma_k) and _atr_sma_k > 0 and _atr_k < _atr_sma_k * _comp_ratio:
             _compressed_bars += 1
 
