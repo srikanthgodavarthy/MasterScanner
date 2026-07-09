@@ -923,6 +923,23 @@ def _scoring_explainer_html() -> str:
         "Conviction weight) both remain importable for back-comparison — neither feeds the live "
         "Recommendation. Only v3 is wired into utils/scanner_engine.py."
     )
+    sec2 += _note(
+        "An Actionable (or even Developing — see below) setup qualifies for Execute/Elite on its OWN "
+        "natural V3 score first (CV1_SignalClass, from _classify_v3 off this same composite) — that's "
+        "the qualifying condition. The Promotion Engine below is additive timing on top of that, not "
+        "a gate: see Section 3."
+    )
+    sec2 += _note(
+        "&#9888; Natural EXECUTE's composite floor (&ge;60, in _classify_v3) sits BELOW this table's "
+        "Actionable floor (&ge;65) even though both share the same Leadership&ge;40/Conviction&ge;55 "
+        "floors — so a setup with composite in [60,65) can legitimately be natural EXECUTE while "
+        "landing on <b>Developing</b> here. That's not a bug to patch out of this table: the "
+        "Recommendation funnel (Section 3) takes the higher of the two, so Developing-here-but-"
+        "natural-EXECUTE setups still surface correctly as Execute. This table alone will just look "
+        "one rung behind the actual Recommendation in that narrow band — check CV1_SignalClass, not "
+        "just this Base Tier, if a row looks off.",
+        warn=True,
+    )
 
     # ══════════════════════════════════════════════════════════════
     # SECTION 3 — Promotion Engine (timing)
@@ -945,7 +962,18 @@ def _scoring_explainer_html() -> str:
     sec3 += _note(
         "R:R is a sanity gate, not part of the Promo Score itself — a setup with all 4 timing signals "
         "firing still won't promote past Actionable if the trade's own Reward:Risk doesn't clear the "
-        "bar. min_risk_reward in Settings can only raise the Execute bar above 1.5, never lower it."
+        "bar. min_risk_reward in Settings can only raise the Execute bar above 1.5, never lower it — "
+        "fixed 2026-07: the effective floor is now max(setting, 1.5), so raising it in Settings "
+        "actually tightens the gate instead of being silently ignored."
+    )
+    sec3 += _note(
+        "This layer never GATES Execute/Elite for a setup that already qualifies on its natural V3 "
+        "score (Section 2) — it can only carry a setup one rung further on top of wherever base_tier "
+        "and natural score already landed it (e.g. natural Execute + strong timing &rarr; Elite). "
+        "Extension risk is already priced into Entry Quality's EXTENDED-phase cap, so it isn't "
+        "re-applied here as a second gate. Promo Score itself is still computed only against "
+        "Actionable setups (unchanged) — it's the Recommendation funnel, not this engine, that lets "
+        "natural EXECUTE/ELITE win from a Developing base_tier too."
     )
 
     # ══════════════════════════════════════════════════════════════
