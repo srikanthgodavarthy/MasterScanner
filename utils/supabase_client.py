@@ -823,15 +823,21 @@ def load_watchlist_enriched(lc_df: pd.DataFrame | None = None) -> pd.DataFrame:
 # from setup_plans (WAITING/pre-trigger trade plans) and watchlist
 # (pre-decision). status: OPEN | CLOSED.
 
-def add_to_portfolio(position: dict) -> bool:
+def add_to_portfolio(position: dict) -> tuple[bool, str]:
     """
     Insert a new held position ("Bought" action). Expected keys:
     symbol, entry_price, entry_date (YYYY-MM-DD), qty, locked_leadership,
     locked_conviction, entry_rs_rank, source_category, notes.
+
+    Returns (success, message). message is empty on success and holds a
+    human-readable reason on failure ("no credentials" vs. the actual
+    Supabase/Postgres error) so callers don't have to guess.
     """
     client = get_client()
     if client is None:
-        return False
+        msg = "Supabase not configured (SUPABASE_URL / SUPABASE_KEY missing from secrets)."
+        logger.warning("add_to_portfolio: %s", msg)
+        return False, msg
 
     def _safe(v):
         if v is None:
@@ -849,16 +855,19 @@ def add_to_portfolio(position: dict) -> bool:
             "locked_leadership":   _safe(position.get("locked_leadership", 0.0)),
             "locked_conviction":   _safe(position.get("locked_conviction", 0.0)),
             "entry_rs_rank":       _safe(position.get("entry_rs_rank")),
+            "initial_stop":        _safe(position.get("initial_stop")),
             "source_category":     position.get("source_category", ""),
             "notes":               position.get("notes", ""),
             "status":              "OPEN",
             "created_at":          datetime.now(timezone.utc).isoformat(),
         }
         resp = client.table("portfolio_positions").insert(row).execute()
-        return bool(resp.data)
+        if not resp.data:
+            return False, "Insert returned no data — check Supabase RLS policies on portfolio_positions."
+        return True, ""
     except Exception as exc:
         logger.error("add_to_portfolio failed: %s", exc)
-        return False
+        return False, str(exc)
 
 
 def load_portfolio(status: str = "OPEN") -> pd.DataFrame:
@@ -1112,6 +1121,7 @@ CREATE TABLE IF NOT EXISTS portfolio_positions (
     locked_leadership   numeric(6,2)  NOT NULL DEFAULT 0,
     locked_conviction   numeric(6,2)  NOT NULL DEFAULT 0,
     entry_rs_rank       numeric(6,2),
+    initial_stop        numeric(12,2),
     source_category     text          NOT NULL DEFAULT '',   -- scanner category at buy time
     notes               text          NOT NULL DEFAULT '',
 
@@ -1124,4 +1134,8 @@ CREATE TABLE IF NOT EXISTS portfolio_positions (
 );
 CREATE INDEX IF NOT EXISTS idx_portfolio_positions_symbol ON portfolio_positions(symbol);
 CREATE INDEX IF NOT EXISTS idx_portfolio_positions_status ON portfolio_positions(status);
+
+-- Idempotent migration for installs that created portfolio_positions before
+-- initial_stop existed (safe to re-run).
+ALTER TABLE portfolio_positions ADD COLUMN IF NOT EXISTS initial_stop numeric(12,2);
 """
