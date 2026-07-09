@@ -407,6 +407,15 @@ class IndicatorArrays:
     _vavg_arr: np.ndarray = None
     _adx_arr:  np.ndarray = None
     _nifty_arr: np.ndarray = None
+    # PERF-6: numpy shadows for series that were still hitting .iloc[i]
+    # in compute_bar() every bar (P3 was only partially applied).
+    _o_arr:        np.ndarray = None
+    _rsi_arr:      np.ndarray = None
+    _atr_sma20_arr: np.ndarray = None
+    _atr_sma_comp_arr: np.ndarray = None
+    _cloud_top_arr:    np.ndarray = None
+    _cloud_bottom_arr: np.ndarray = None
+    _squeeze_arr:      np.ndarray = None
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -544,6 +553,16 @@ def build_indicators(
     _adx_arr  = adx_s.values.astype(np.float64)
     _nifty_arr = nifty_aligned.values.astype(np.float64)
 
+    # PERF-6: the remaining series compute_bar() reads by index every bar.
+    # squeeze_series is bool; keep it bool (not float) to skip a cast.
+    _o_arr            = o.values.astype(np.float64)
+    _rsi_arr          = rsi_s.values.astype(np.float64)
+    _atr_sma20_arr    = atr_sma20.values.astype(np.float64)
+    _atr_sma_comp_arr = atr_sma_comp.values.astype(np.float64)
+    _cloud_top_arr    = cloud_top.values.astype(np.float64)
+    _cloud_bottom_arr = cloud_bottom.values.astype(np.float64)
+    _squeeze_arr      = squeeze_series.values.astype(bool)
+
     return IndicatorArrays(
         c=c, h=h, l=l, o=o, v=v,
         e20=e20, e50=e50, e200=e200,
@@ -559,6 +578,9 @@ def build_indicators(
         _e20_arr=_e20_arr, _e50_arr=_e50_arr, _e200_arr=_e200_arr,
         _atr_arr=_atr_arr, _vol_arr=_vol_arr, _vavg_arr=_vavg_arr,
         _adx_arr=_adx_arr, _nifty_arr=_nifty_arr,
+        _o_arr=_o_arr, _rsi_arr=_rsi_arr, _atr_sma20_arr=_atr_sma20_arr,
+        _atr_sma_comp_arr=_atr_sma_comp_arr, _cloud_top_arr=_cloud_top_arr,
+        _cloud_bottom_arr=_cloud_bottom_arr, _squeeze_arr=_squeeze_arr,
     )
 
 
@@ -671,21 +693,26 @@ def compute_bar(
     e20a = ia._e20_arr; e50a= ia._e50_arr; e200a=ia._e200_arr
     atrl = ia._atr_arr; ccil= ia._cci_arr; vola = ia._vol_arr
     vavga= ia._vavg_arr; adxa= ia._adx_arr
+    # PERF-6: previously-uncovered arrays (were falling back to .iloc)
+    oa      = ia._o_arr;        rsia    = ia._rsi_arr
+    asma20a = ia._atr_sma20_arr; asmaca = ia._atr_sma_comp_arr
+    ctopa   = ia._cloud_top_arr; cbota  = ia._cloud_bottom_arr
+    sqza    = ia._squeeze_arr
 
     cur_c    = ca[i]    if ca   is not None else float(c.iloc[i])
-    cur_o    = float(ia.o.iloc[i])
+    cur_o    = oa[i]    if oa   is not None else float(ia.o.iloc[i])
     cur_e20  = e20a[i]  if e20a is not None else float(ia.e20.iloc[i])
     cur_e50  = e50a[i]  if e50a is not None else float(ia.e50.iloc[i])
     cur_e200 = e200a[i] if e200a is not None else float(ia.e200.iloc[i])
-    cur_r    = float(ia.rsi_s.iloc[i])
+    cur_r    = rsia[i]  if rsia  is not None else float(ia.rsi_s.iloc[i])
     cur_v    = vola[i]  if vola  is not None else float(v.iloc[i])
     cur_atr  = atrl[i]  if atrl  is not None else float(ia.atr_s.iloc[i])
     cur_cci  = ccil[i]  if ccil  is not None else float(ia.cci_s.iloc[i])
     cur_vavg = vavga[i] if vavga is not None else float(ia.vol_avg.iloc[i])
-    _atr_sma20_v = float(ia.atr_sma20.iloc[i])
+    _atr_sma20_v = asma20a[i] if asma20a is not None else float(ia.atr_sma20.iloc[i])
     cur_atr_sma20 = _atr_sma20_v if not np.isnan(_atr_sma20_v) else cur_atr
-    cur_ct   = float(ia.cloud_top.iloc[i])
-    cur_cb   = float(ia.cloud_bottom.iloc[i])
+    cur_ct   = ctopa[i] if ctopa is not None else float(ia.cloud_top.iloc[i])
+    cur_cb   = cbota[i] if cbota is not None else float(ia.cloud_bottom.iloc[i])
 
     # ADX (may be NaN early)
     _adx_raw = adxa[i] if adxa is not None else float(ia.adx_s.iloc[i])
@@ -703,7 +730,7 @@ def compute_bar(
 
     # ── EMA20 SLOPE (5-bar, normalised) ───────────────────────────
     if i >= 5:
-        e20_5ago    = float(ia.e20.iloc[i - 5])
+        e20_5ago    = e20a[i - 5] if e20a is not None else float(ia.e20.iloc[i - 5])
         ema20_slope = (cur_e20 - e20_5ago) / e20_5ago * 100 if e20_5ago > 0 else 0.0
     else:
         ema20_slope = 0.0
@@ -831,11 +858,11 @@ def compute_bar(
     # ── COMPRESSION BREAKOUT (Tier 2) ─────────────────────────────
     comp  = params.t2_comp_bars
     ratio = params.t2_atr_ratio
-    if i >= 1 and not np.isnan(float(ia.atr_sma_comp.iloc[i - 1])) \
-              and float(ia.atr_sma_comp.iloc[i - 1]) > 0:
-        prev_atr_compressed = (
-            float(ia.atr_s.iloc[i - 1]) < float(ia.atr_sma_comp.iloc[i - 1]) * ratio
-        )
+    _asmac_prev = (asmaca[i - 1] if asmaca is not None
+                   else float(ia.atr_sma_comp.iloc[i - 1])) if i >= 1 else np.nan
+    _atr_prev = atrl[i - 1] if (atrl is not None and i >= 1) else (float(ia.atr_s.iloc[i - 1]) if i >= 1 else 0.0)
+    if i >= 1 and not np.isnan(_asmac_prev) and _asmac_prev > 0:
+        prev_atr_compressed = _atr_prev < _asmac_prev * ratio
     else:
         prev_atr_compressed = False
 
@@ -844,14 +871,16 @@ def compute_bar(
     compression_break = prev_atr_compressed and cur_c > compression_high
 
     # ── SQUEEZE ────────────────────────────────────────────────────
-    squeeze_on      = bool(ia.squeeze_series.iloc[i])
-    prev_squeeze_on = bool(ia.squeeze_series.iloc[i - 1]) if i >= 1 else squeeze_on
+    squeeze_on      = bool(sqza[i]) if sqza is not None else bool(ia.squeeze_series.iloc[i])
+    prev_squeeze_on = (bool(sqza[i - 1]) if sqza is not None else bool(ia.squeeze_series.iloc[i - 1])) if i >= 1 else squeeze_on
     squeeze_release = prev_squeeze_on and not squeeze_on
 
     # ── MOMENTUM ──────────────────────────────────────────────────
-    mom1 = (cur_c / float(c.iloc[i - 21])  - 1) * 100 if i >= 21  else 0.0
-    mom3 = (cur_c / float(c.iloc[i - 63])  - 1) * 100 if i >= 63  else 0.0
-    mom6 = (cur_c / float(c.iloc[i - 126]) - 1) * 100 if i >= 126 else 0.0
+    # PERF-6/BUG: ca (numpy close array) was already loaded above but these
+    # three lookbacks were still using c.iloc[i-N], the slow pandas path.
+    mom1 = (cur_c / ca[i - 21]  - 1) * 100 if (i >= 21  and ca is not None) else ((cur_c / float(c.iloc[i - 21])  - 1) * 100 if i >= 21  else 0.0)
+    mom3 = (cur_c / ca[i - 63]  - 1) * 100 if (i >= 63  and ca is not None) else ((cur_c / float(c.iloc[i - 63])  - 1) * 100 if i >= 63  else 0.0)
+    mom6 = (cur_c / ca[i - 126] - 1) * 100 if (i >= 126 and ca is not None) else ((cur_c / float(c.iloc[i - 126]) - 1) * 100 if i >= 126 else 0.0)
 
     # Persistent strength (v2 Tier 1 gate)
     persistent_strength = mom3 > params.t1_mom3 and mom6 > params.t1_mom6
