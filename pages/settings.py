@@ -624,84 +624,37 @@ def _tab_advanced() -> None:
             "without a code change; re-run the backtest to see the effect.</small>",
             unsafe_allow_html=True,
         )
+
+        # ── Simple view: the composite bar per tier is what actually
+        # separates most setups day-to-day. Leadership/Conviction/Entry
+        # Quality sub-floors and the Watch/Developing floors rarely need
+        # touching, so they're tucked behind the toggle below instead of
+        # always taking up screen space.
         c1, c2, c3 = st.columns(3)
         with c1:
             st.markdown("**Actionable** (base funnel floor)")
-            _label("Leadership ≥")
-            v = st.slider("Actionable Leadership", 0, 100, int(_g("v3_actionable_leadership_min")),
-                step=5, key="sl_v3_act_ls", label_visibility="collapsed")
-            _s("v3_actionable_leadership_min", int(v))
-            _label("Conviction ≥")
-            v = st.slider("Actionable Conviction", 0, 100, int(_g("v3_actionable_conviction_min")),
-                step=5, key="sl_v3_act_cv", label_visibility="collapsed")
-            _s("v3_actionable_conviction_min", int(v))
             _label("Composite ≥")
             v = st.slider("Actionable Composite", 0, 100, int(_g("v3_actionable_composite_min")),
                 step=5, key="sl_v3_act_comp", label_visibility="collapsed")
             _s("v3_actionable_composite_min", int(v))
-
         with c2:
             st.markdown("**Execute** (natural score)")
-            _label("Leadership ≥")
-            v = st.slider("Execute Leadership", 0, 100, int(_g("v3_execute_leadership_min")),
-                step=5, key="sl_v3_exec_ls", label_visibility="collapsed")
-            _s("v3_execute_leadership_min", int(v))
-            _label("Conviction ≥")
-            v = st.slider("Execute Conviction", 0, 100, int(_g("v3_execute_conviction_min")),
-                step=5, key="sl_v3_exec_cv", label_visibility="collapsed")
-            _s("v3_execute_conviction_min", int(v))
-            _label("Entry Quality ≥")
-            v = st.slider("Execute Entry Quality", 0, 100, int(_g("v3_execute_entry_quality_min")),
-                step=5, key="sl_v3_exec_eq", label_visibility="collapsed")
-            _s("v3_execute_entry_quality_min", int(v))
             _label("Composite ≥")
             v = st.slider("Execute Composite", 0, 100, int(_g("v3_execute_composite_min")),
                 step=5, key="sl_v3_exec_comp", label_visibility="collapsed")
             _s("v3_execute_composite_min", int(v))
-
         with c3:
             st.markdown("**Elite** (natural score)")
-            _label("Leadership ≥")
-            v = st.slider("Elite Leadership", 0, 100, int(_g("v3_elite_leadership_min")),
-                step=5, key="sl_v3_elite_ls", label_visibility="collapsed")
-            _s("v3_elite_leadership_min", int(v))
-            _label("Conviction ≥")
-            v = st.slider("Elite Conviction", 0, 100, int(_g("v3_elite_conviction_min")),
-                step=5, key="sl_v3_elite_cv", label_visibility="collapsed")
-            _s("v3_elite_conviction_min", int(v))
-            _label("Entry Quality ≥")
-            v = st.slider("Elite Entry Quality", 0, 100, int(_g("v3_elite_entry_quality_min")),
-                step=5, key="sl_v3_elite_eq", label_visibility="collapsed")
-            _s("v3_elite_entry_quality_min", int(v))
             _label("Composite ≥")
             v = st.slider("Elite Composite", 0, 100, int(_g("v3_elite_composite_min")),
                 step=5, key="sl_v3_elite_comp", label_visibility="collapsed")
             _s("v3_elite_composite_min", int(v))
 
         _divider()
-        st.markdown("**Watch / Developing floors** (base funnel)")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            _label("Watch: Leadership ≥")
-            v = st.slider("Watch Leadership", 0, 100, int(_g("v3_watch_leadership_min")),
-                step=5, key="sl_v3_watch_ls", label_visibility="collapsed")
-            _s("v3_watch_leadership_min", int(v))
-        with c2:
-            _label("Watch: Composite ≥")
-            v = st.slider("Watch Composite", 0, 100, int(_g("v3_watch_composite_min")),
-                step=5, key="sl_v3_watch_comp", label_visibility="collapsed")
-            _s("v3_watch_composite_min", int(v))
-        with c3:
-            _label("Developing: Composite ≥")
-            v = st.slider("Developing Composite", 0, 100, int(_g("v3_developing_composite_min")),
-                step=5, key="sl_v3_dev_comp", label_visibility="collapsed")
-            _s("v3_developing_composite_min", int(v))
-
-        _divider()
         st.markdown(
             "**Promotion Engine** (utils/promotion_engine.py) — Promo Score "
-            "and R:R thresholds are all plain overrides now, freely "
-            "adjustable in either direction."
+            "and R:R thresholds are all plain overrides, freely adjustable "
+            "in either direction."
         )
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -719,6 +672,76 @@ def _tab_advanced() -> None:
             v = st.slider("Promo Elite RR", 1.0, 5.0, float(_g("promo_min_rr_elite")),
                 step=0.1, key="sl_promo_elite_rr", label_visibility="collapsed")
             _s("promo_min_rr_elite", float(v))
+
+        # ── Advanced view: individual Leadership/Conviction/Entry Quality
+        # floors per tier, plus the Watch/Developing base-funnel floors.
+        # Off by default — composite alone is usually enough.
+        _divider()
+        show_advanced = st.toggle(
+            "Show individual factor floors (Leadership / Conviction / Entry Quality, Watch / Developing)",
+            value=st.session_state.get("v3_show_advanced_thresholds", False),
+            key="v3_show_advanced_thresholds",
+        )
+        if show_advanced:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.markdown("**Actionable**")
+                _label("Leadership ≥")
+                v = st.slider("Actionable Leadership", 0, 100, int(_g("v3_actionable_leadership_min")),
+                    step=5, key="sl_v3_act_ls", label_visibility="collapsed")
+                _s("v3_actionable_leadership_min", int(v))
+                _label("Conviction ≥")
+                v = st.slider("Actionable Conviction", 0, 100, int(_g("v3_actionable_conviction_min")),
+                    step=5, key="sl_v3_act_cv", label_visibility="collapsed")
+                _s("v3_actionable_conviction_min", int(v))
+
+            with c2:
+                st.markdown("**Execute**")
+                _label("Leadership ≥")
+                v = st.slider("Execute Leadership", 0, 100, int(_g("v3_execute_leadership_min")),
+                    step=5, key="sl_v3_exec_ls", label_visibility="collapsed")
+                _s("v3_execute_leadership_min", int(v))
+                _label("Conviction ≥")
+                v = st.slider("Execute Conviction", 0, 100, int(_g("v3_execute_conviction_min")),
+                    step=5, key="sl_v3_exec_cv", label_visibility="collapsed")
+                _s("v3_execute_conviction_min", int(v))
+                _label("Entry Quality ≥")
+                v = st.slider("Execute Entry Quality", 0, 100, int(_g("v3_execute_entry_quality_min")),
+                    step=5, key="sl_v3_exec_eq", label_visibility="collapsed")
+                _s("v3_execute_entry_quality_min", int(v))
+
+            with c3:
+                st.markdown("**Elite**")
+                _label("Leadership ≥")
+                v = st.slider("Elite Leadership", 0, 100, int(_g("v3_elite_leadership_min")),
+                    step=5, key="sl_v3_elite_ls", label_visibility="collapsed")
+                _s("v3_elite_leadership_min", int(v))
+                _label("Conviction ≥")
+                v = st.slider("Elite Conviction", 0, 100, int(_g("v3_elite_conviction_min")),
+                    step=5, key="sl_v3_elite_cv", label_visibility="collapsed")
+                _s("v3_elite_conviction_min", int(v))
+                _label("Entry Quality ≥")
+                v = st.slider("Elite Entry Quality", 0, 100, int(_g("v3_elite_entry_quality_min")),
+                    step=5, key="sl_v3_elite_eq", label_visibility="collapsed")
+                _s("v3_elite_entry_quality_min", int(v))
+
+            st.markdown("**Watch / Developing floors** (base funnel)")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                _label("Watch: Leadership ≥")
+                v = st.slider("Watch Leadership", 0, 100, int(_g("v3_watch_leadership_min")),
+                    step=5, key="sl_v3_watch_ls", label_visibility="collapsed")
+                _s("v3_watch_leadership_min", int(v))
+            with c2:
+                _label("Watch: Composite ≥")
+                v = st.slider("Watch Composite", 0, 100, int(_g("v3_watch_composite_min")),
+                    step=5, key="sl_v3_watch_comp", label_visibility="collapsed")
+                _s("v3_watch_composite_min", int(v))
+            with c3:
+                _label("Developing: Composite ≥")
+                v = st.slider("Developing Composite", 0, 100, int(_g("v3_developing_composite_min")),
+                    step=5, key="sl_v3_dev_comp", label_visibility="collapsed")
+                _s("v3_developing_composite_min", int(v))
 
     # ── Institutional Continuation (VWAP Reclaim) ────────────────
     with st.expander("Institutional Continuation", expanded=False):
