@@ -89,6 +89,7 @@ from pages.history       import render as render_history
 from pages.agent          import render as render_agent
 from pages.five_pillars  import render as render_five_pillars
 from pages.cci_master    import render as render_cci_master
+from pages.portfolio     import render as render_portfolio
 from utils.scanner_engine import NIFTY500_SYMBOLS
 
 ss = st.session_state
@@ -173,6 +174,9 @@ def _page_agent():
 def _page_cci_master():
     render_cci_master(settings)
 
+def _page_portfolio():
+    render_portfolio()
+
 # ── Navigation ──────────────────────────────────────────────────
 # [Scanner Refactor 2026-07] Previously this was a single st.tabs() shell,
 # which — regardless of which tab was visually active — re-executed EVERY
@@ -196,6 +200,7 @@ pg = st.navigation(
         st.Page(_page_diagnostic,   title="Diagnostic",           icon="🧬"),
         st.Page(_page_agent,        title="Agent",                icon="🤖"),
         st.Page(_page_cci_master,   title="CCI Master",           icon="📐"),
+        st.Page(_page_portfolio,    title="Portfolio",            icon="📁"),
     ],
     position="top",   # matches the original inline-controls look (sidebar stays collapsed)
 )
