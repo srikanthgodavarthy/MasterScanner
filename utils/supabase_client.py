@@ -818,6 +818,108 @@ def load_watchlist_enriched(lc_df: pd.DataFrame | None = None) -> pd.DataFrame:
     return merged
 
 
+# ─── PORTFOLIO POSITIONS ──────────────────────────────────────────────────────
+# Bought → Portfolio hand-off. A row here is a real, held position — separate
+# from setup_plans (WAITING/pre-trigger trade plans) and watchlist
+# (pre-decision). status: OPEN | CLOSED.
+
+def add_to_portfolio(position: dict) -> bool:
+    """
+    Insert a new held position ("Bought" action). Expected keys:
+    symbol, entry_price, entry_date (YYYY-MM-DD), qty, locked_leadership,
+    locked_conviction, entry_rs_rank, source_category, notes.
+    """
+    client = get_client()
+    if client is None:
+        return False
+
+    def _safe(v):
+        if v is None:
+            return None
+        if hasattr(v, "item"):   # numpy scalar -> python scalar
+            return v.item()
+        return v
+
+    try:
+        row = {
+            "symbol":              str(position.get("symbol", "")).upper().strip(),
+            "entry_price":         _safe(position.get("entry_price", 0.0)),
+            "entry_date":          position.get("entry_date"),
+            "qty":                 _safe(position.get("qty", 0)),
+            "locked_leadership":   _safe(position.get("locked_leadership", 0.0)),
+            "locked_conviction":   _safe(position.get("locked_conviction", 0.0)),
+            "entry_rs_rank":       _safe(position.get("entry_rs_rank")),
+            "source_category":     position.get("source_category", ""),
+            "notes":               position.get("notes", ""),
+            "status":              "OPEN",
+            "created_at":          datetime.now(timezone.utc).isoformat(),
+        }
+        resp = client.table("portfolio_positions").insert(row).execute()
+        return bool(resp.data)
+    except Exception as exc:
+        logger.error("add_to_portfolio failed: %s", exc)
+        return False
+
+
+def load_portfolio(status: str = "OPEN") -> pd.DataFrame:
+    """Load portfolio positions, default OPEN (i.e. currently held)."""
+    client = get_client()
+    if client is None:
+        return pd.DataFrame()
+
+    try:
+        q = client.table("portfolio_positions").select("*")
+        if status:
+            q = q.eq("status", status)
+        resp = q.order("created_at", desc=True).execute()
+        return pd.DataFrame(resp.data or [])
+    except Exception as exc:
+        logger.error("load_portfolio failed: %s", exc)
+        return pd.DataFrame()
+
+
+def update_portfolio_position(position_id, updates: dict) -> bool:
+    """Patch fields on an existing position (e.g. after a Reduce)."""
+    client = get_client()
+    if client is None:
+        return False
+
+    try:
+        resp = (
+            client.table("portfolio_positions")
+            .update(updates)
+            .eq("id", position_id)
+            .execute()
+        )
+        return bool(resp.data)
+    except Exception as exc:
+        logger.error("update_portfolio_position failed: %s", exc)
+        return False
+
+
+def close_portfolio_position(position_id, reason: str = "Manual exit") -> bool:
+    """Mark a position CLOSED (full Exit)."""
+    return update_portfolio_position(position_id, {
+        "status":       "CLOSED",
+        "closed_at":    datetime.now(timezone.utc).isoformat(),
+        "close_reason": reason,
+    })
+
+
+def reduce_portfolio_position(position_id, new_qty: float, reason: str = "Partial exit") -> bool:
+    """Trim quantity on a Reduce action; stays OPEN unless new_qty <= 0."""
+    updates = {
+        "qty":              new_qty,
+        "last_reduced_at":  datetime.now(timezone.utc).isoformat(),
+        "reduce_reason":    reason,
+    }
+    if new_qty <= 0:
+        updates["status"] = "CLOSED"
+        updates["closed_at"] = datetime.now(timezone.utc).isoformat()
+        updates["close_reason"] = reason
+    return update_portfolio_position(position_id, updates)
+
+
 # ─── SCHEMA SQL ───────────────────────────────────────────────────────────────
 
 SCHEMA_SQL = """
@@ -991,4 +1093,35 @@ UPDATE setup_plans SET status_reason = invalidation_reason
 UPDATE setup_plans SET status = 'CLOSED' WHERE status = 'INVALIDATED';
 UPDATE setup_plans SET closed_at = invalidated_date::timestamptz
   WHERE closed_at IS NULL AND invalidated_date IS NOT NULL;
+"""
+
+# Append portfolio_positions SQL to the canonical SCHEMA_SQL for easy copy-paste
+SCHEMA_SQL += """
+-- 8. Portfolio Positions — Bought → Portfolio hand-off. Real, held positions
+--    evaluated on an ongoing basis by utils/portfolio_engine.py's Exit Score
+--    model (pages/portfolio.py). status: OPEN | CLOSED.
+CREATE TABLE IF NOT EXISTS portfolio_positions (
+    id                  bigserial     PRIMARY KEY,
+    symbol              text          NOT NULL,
+    entry_price         numeric(12,2) NOT NULL DEFAULT 0,
+    entry_date          date          NOT NULL,
+    qty                 numeric(14,4) NOT NULL DEFAULT 0,
+
+    -- Locked-at-entry thesis, used by the exit engine to detect decay
+    -- relative to the moment this position was bought (never overwritten).
+    locked_leadership   numeric(6,2)  NOT NULL DEFAULT 0,
+    locked_conviction   numeric(6,2)  NOT NULL DEFAULT 0,
+    entry_rs_rank       numeric(6,2),
+    source_category     text          NOT NULL DEFAULT '',   -- scanner category at buy time
+    notes               text          NOT NULL DEFAULT '',
+
+    status              text          NOT NULL DEFAULT 'OPEN',  -- OPEN | CLOSED
+    created_at          timestamptz   NOT NULL DEFAULT now(),
+    closed_at           timestamptz,
+    close_reason        text,
+    last_reduced_at     timestamptz,
+    reduce_reason       text
+);
+CREATE INDEX IF NOT EXISTS idx_portfolio_positions_symbol ON portfolio_positions(symbol);
+CREATE INDEX IF NOT EXISTS idx_portfolio_positions_status ON portfolio_positions(status);
 """
