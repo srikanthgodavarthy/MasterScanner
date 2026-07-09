@@ -96,8 +96,13 @@ class ExitScoreConfig:
 
     # Trend structure
     ema_period:              int   = 20
+    ema_slow_period:         int   = 50
     swing_lookback:          int   = 5      # bars either side for pivot detection
     structure_lookback_bars: int   = 60
+
+    # Thesis / leadership-health thresholds
+    leadership_strong_min:  float = 70.0
+    conviction_strong_min:  float = 65.0
 
     # Momentum
     rsi_period:        int = 14
@@ -147,15 +152,80 @@ class ExitScoreResult:
     action:              str            # HOLD | REDUCE | EXIT
     structure_break:     bool
     top_reasons:         list           # list[str], top 3
-    factor_scores:        dict           # factor_name -> 0-100
+    factor_scores:        dict           # factor_name -> 0-100 (raw exit-risk, higher = more reason to exit)
     factor_weighted:       dict           # factor_name -> weighted contribution
     factor_notes:          dict           # factor_name -> human-readable explanation
     price:                float = 0.0
     unrealized_pct:        float = 0.0
 
+    # ── New: trade-management context (days held / R-multiple / trend badge) ──
+    days_held:             int   = 0
+    r_multiple:             Optional[float] = None   # None if no initial stop supplied
+    trend_health:            str   = "UNKNOWN"          # STRONG | WEAKENING | BROKEN | UNKNOWN
+    trend_health_detail:      str   = ""
+    ema_fast_rising:          Optional[bool] = None
+    ema_slow_rising:          Optional[bool] = None
+    swing_label:              str   = ""                 # HIGHER_LOW | LOWER_LOW | INSUFFICIENT
+
+    # ── New: "why am I still holding this" investment-thesis checklist ──
+    thesis_intact:           bool  = True
+    thesis_checks:            list  = field(default_factory=list)   # list[(label, ok:bool, detail:str)]
+
+    # ── New: display-friendly HEALTH-oriented factor scores (0-100, higher = better,
+    #  except protection_urgency / time_decay which stay risk-oriented — see
+    #  display_factor_directions below). Built by _build_display_factors().
+    display_factors:          dict  = field(default_factory=dict)
+
     def to_dict(self) -> dict:
         d = asdict(self)
         return d
+
+
+# Which display factors are "higher = healthier" vs "higher = more urgent".
+# Used purely by the UI to decide bar color; not used in scoring itself.
+DISPLAY_FACTOR_DIRECTION = {
+    "Trend Health":       "health",
+    "Leadership":         "health",
+    "Conviction":         "health",
+    "Momentum":           "health",
+    "Profit Protection":  "urgency",
+    "Time Decay":         "urgency",
+}
+
+
+def _build_display_factors(factor_scores: dict, current_leadership: Optional[float],
+                            current_conviction: Optional[float]) -> dict:
+    """
+    Maps the internal risk-oriented factor_scores (higher = more reason to
+    exit) onto the human-facing labels/semantics requested for the UI:
+    Trend Health / Leadership / Conviction / Momentum are shown as HEALTH
+    (higher = better); Profit Protection / Time Decay stay as urgency
+    (higher = more attention needed) since that reads naturally as-is.
+    Leadership/Conviction show the actual current score when available
+    (matches what the scanner displays elsewhere) rather than a derived
+    decay percentage, falling back to the decay-inverted score otherwise.
+    """
+    trend_health_score = round(100 - factor_scores.get("trend_structure", 0), 1)
+    leadership_score = (
+        round(current_leadership, 1) if current_leadership is not None
+        else round(100 - factor_scores.get("leadership_decay", 0), 1)
+    )
+    conviction_score = (
+        round(current_conviction, 1) if current_conviction is not None
+        else round(100 - factor_scores.get("conviction_decay", 0), 1)
+    )
+    momentum_health = round(100 - factor_scores.get("momentum_exhaustion", 0), 1)
+    profit_protection = round(factor_scores.get("profit_protection", 0), 1)
+    time_decay = round(factor_scores.get("time_decay", 0), 1)
+
+    return {
+        "Trend Health":      max(0.0, min(100.0, trend_health_score)),
+        "Leadership":        max(0.0, min(100.0, leadership_score)),
+        "Conviction":        max(0.0, min(100.0, conviction_score)),
+        "Momentum":          max(0.0, min(100.0, momentum_health)),
+        "Profit Protection": max(0.0, min(100.0, profit_protection)),
+        "Time Decay":        max(0.0, min(100.0, time_decay)),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -405,6 +475,103 @@ def _factor_time_decay(df: pd.DataFrame, cfg: ExitScoreConfig) -> tuple[float, s
 #  MAIN ENTRY POINT
 # ══════════════════════════════════════════════════════════════════
 
+def _trend_health_badge(df: pd.DataFrame, cfg: ExitScoreConfig, structure_break: bool,
+                         swing_label: str) -> tuple[str, str, bool, bool]:
+    """
+    Returns (label, detail, ema_fast_rising, ema_slow_rising).
+    label: STRONG (🟢) | WEAKENING (🟠) | BROKEN (🔴)
+    STRONG   = HH/HL intact, EMA20 rising, EMA50 rising, price above both.
+    WEAKENING = one of the above has slipped but no confirmed structure break.
+    BROKEN    = confirmed structure break (lower low + below EMA20).
+    """
+    close = df["close"]
+    ema20 = _ema(close, cfg.ema_period)
+    ema50 = _ema(close, cfg.ema_slow_period)
+    price = close.iloc[-1]
+
+    ema20_rising = bool(ema20.iloc[-1] > ema20.iloc[-5]) if len(ema20) > 5 else None
+    ema50_rising = bool(ema50.iloc[-1] > ema50.iloc[-5]) if len(ema50) > 5 else None
+    above20 = price > ema20.iloc[-1]
+    above50 = price > ema50.iloc[-1]
+
+    if structure_break:
+        label = "BROKEN"
+    elif swing_label == "HIGHER_LOW" and ema20_rising and ema50_rising and above20 and above50:
+        label = "STRONG"
+    else:
+        label = "WEAKENING"
+
+    parts = [
+        f"HH/HL {'intact' if swing_label == 'HIGHER_LOW' else swing_label.replace('_', ' ').title()}",
+        f"EMA20 {'↑' if ema20_rising else '↓'}",
+        f"EMA50 {'↑' if ema50_rising else '↓'}",
+        f"price {'above' if above20 else 'below'} EMA20",
+    ]
+    return label, ", ".join(parts), ema20_rising, ema50_rising
+
+
+def _build_thesis(
+    trend_health: str,
+    structure_break: bool,
+    current_leadership: Optional[float],
+    current_conviction: Optional[float],
+    locked_leadership: float,
+    locked_conviction: float,
+    current_rs_rank: Optional[float],
+    entry_rs_rank: Optional[float],
+    momentum_score: float,
+    cfg: ExitScoreConfig,
+) -> tuple[bool, list]:
+    """
+    Builds the "why am I still holding this" checklist. Each check is
+    (label, ok:bool, detail:str). thesis_intact = True only if every
+    checked item (that has data) passes; missing-data items are informational
+    and don't count against the thesis.
+    """
+    checks = []
+
+    # Market leader / Leadership
+    if current_leadership is not None:
+        ok = current_leadership >= cfg.leadership_strong_min
+        if locked_leadership > 0 and current_leadership < locked_leadership - 15:
+            ok = False
+            detail = f"Leadership dropped {locked_leadership:.0f} → {current_leadership:.0f}"
+        else:
+            detail = f"Leadership {current_leadership:.0f}"
+        checks.append(("Market leader", ok, detail))
+
+    # Conviction
+    if current_conviction is not None:
+        ok = current_conviction >= cfg.conviction_strong_min
+        if locked_conviction > 0 and current_conviction < locked_conviction - 15:
+            ok = False
+            detail = f"Conviction dropped {locked_conviction:.0f} → {current_conviction:.0f}"
+        else:
+            detail = f"Conviction {current_conviction:.0f}"
+        checks.append(("Conviction", ok, detail))
+
+    # Sector / relative strength
+    if current_rs_rank is not None:
+        ok = current_rs_rank >= 50
+        if entry_rs_rank is not None and current_rs_rank < entry_rs_rank - 15:
+            ok = False
+        detail = f"RS rank {current_rs_rank:.0f}" + (f" (was {entry_rs_rank:.0f} at entry)" if entry_rs_rank is not None else "")
+        checks.append(("Sector / RS outperforming", ok, detail))
+
+    # Trend intact
+    checks.append(("Trend intact", trend_health == "STRONG" and not structure_break,
+                    f"Trend health: {trend_health}"))
+
+    # Momentum
+    checks.append(("Momentum constructive", momentum_score < 40,
+                    f"Momentum exhaustion score {momentum_score:.0f}/100"))
+
+    scored = [c for c in checks if True]  # all checks currently contribute
+    thesis_intact = all(ok for _, ok, _ in scored) if scored else True
+    return thesis_intact, checks
+
+
+
 def compute_exit_score(
     symbol: str,
     df: pd.DataFrame,
@@ -415,6 +582,8 @@ def compute_exit_score(
     current_leadership: Optional[float] = None,
     current_conviction: Optional[float] = None,
     current_rs_rank: Optional[float] = None,
+    entry_date: Optional[str] = None,      # 'YYYY-MM-DD' — for Days Held
+    initial_stop: Optional[float] = None,  # for R-Multiple; falls back to ATR-based risk if omitted
     cfg: ExitScoreConfig = DEFAULT_CONFIG,
 ) -> ExitScoreResult:
     """
@@ -489,6 +658,52 @@ def compute_exit_score(
     price = float(df["close"].iloc[-1])
     unrealized_pct = (price - entry_price) / entry_price * 100 if entry_price else 0.0
 
+    # ── Days held ──
+    days_held = 0
+    if entry_date:
+        try:
+            ed = pd.to_datetime(entry_date)
+            last_dt = df.index[-1]
+            days_held = max(0, (pd.Timestamp(last_dt).tz_localize(None) - ed.tz_localize(None)).days)
+        except Exception:
+            days_held = 0
+
+    # ── R-Multiple ── initial risk = entry - initial_stop if supplied,
+    # otherwise fall back to an ATR-based estimate of the risk taken at entry.
+    r_multiple = None
+    if entry_price:
+        risk_per_share = None
+        if initial_stop and initial_stop > 0 and initial_stop < entry_price:
+            risk_per_share = entry_price - initial_stop
+        else:
+            atr_est = _atr(df, cfg.atr_period).iloc[-1]
+            if atr_est and atr_est > 0:
+                risk_per_share = cfg.atr_trail_mult * atr_est
+        if risk_per_share and risk_per_share > 0:
+            r_multiple = round((price - entry_price) / risk_per_share, 2)
+
+    # ── Trend health badge ──
+    swing_label, _ = _classify_swing_sequence(df.tail(cfg.structure_lookback_bars), cfg.swing_lookback)
+    trend_health, trend_detail, ema20_rising, ema50_rising = _trend_health_badge(
+        df, cfg, hard_break, swing_label
+    )
+
+    # ── Investment thesis checklist ──
+    thesis_intact, thesis_checks = _build_thesis(
+        trend_health=trend_health,
+        structure_break=hard_break,
+        current_leadership=current_leadership,
+        current_conviction=current_conviction,
+        locked_leadership=locked_leadership,
+        locked_conviction=locked_conviction,
+        current_rs_rank=current_rs_rank,
+        entry_rs_rank=entry_rs_rank,
+        momentum_score=mom_score,
+        cfg=cfg,
+    )
+
+    display_factors = _build_display_factors(factor_scores, current_leadership, current_conviction)
+
     return ExitScoreResult(
         symbol=symbol,
         exit_score=round(exit_score, 1),
@@ -500,6 +715,16 @@ def compute_exit_score(
         factor_notes=factor_notes,
         price=round(price, 2),
         unrealized_pct=round(unrealized_pct, 2),
+        days_held=days_held,
+        r_multiple=r_multiple,
+        trend_health=trend_health,
+        trend_health_detail=trend_detail,
+        ema_fast_rising=ema20_rising,
+        ema_slow_rising=ema50_rising,
+        swing_label=swing_label,
+        thesis_intact=thesis_intact,
+        thesis_checks=thesis_checks,
+        display_factors=display_factors,
     )
 
 
