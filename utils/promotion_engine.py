@@ -281,7 +281,9 @@ def evaluate_promotion(
     # ── Reward : Risk sanity gate ───────────────────────────────
     res.risk_reward = _risk_reward(r)
     min_rr_execute = _MIN_RR_MAP.get(settings.get("min_risk_reward"), MIN_RR_EXECUTE)
-    res.rr_ok_execute = res.risk_reward >= min(min_rr_execute, MIN_RR_EXECUTE) or res.risk_reward >= MIN_RR_EXECUTE
+    # min_rr_execute can only RAISE the bar above the 1.5 default, never
+    # lower it, so the effective floor is whichever is higher.
+    res.rr_ok_execute = res.risk_reward >= max(min_rr_execute, MIN_RR_EXECUTE)
     res.rr_ok_elite   = res.risk_reward >= MIN_RR_ELITE
 
     # ── Reasons (for the "why promoted" explanation) ────────────

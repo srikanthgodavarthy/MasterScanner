@@ -854,14 +854,17 @@ def score_stock(
             "Error: %s", _de_exc, exc_info=True
         )
 
-    # ── RECOMMENDATION FUNNEL (CV1 quality → Promotion Engine timing) ──
+    # ── RECOMMENDATION FUNNEL (CV1 quality → Execute/Elite) ──
     # CV1 is the single source of truth for quality. classify_tier_v3()
     # (20/50/30 composite, relaxed floors — LIVE as of 2026-07, replaces
     # v1's classify_tier) maps its three scores to the base funnel:
     #     Skip → Watch → Developing → Actionable
-    # The Promotion Engine only ever runs on an Actionable setup and
-    # can only upgrade it to Execute or Elite — it never creates a
-    # Watch/Developing/Skip recommendation and never demotes.
+    # An Actionable setup reaches Execute/Elite by its OWN natural V3
+    # score first (cv1.signal_class / _classify_v3, off the same
+    # composite) — that is the qualifying condition, not the Promotion
+    # Engine. Promo Score/timing is additive only: it can carry an
+    # Actionable setup one rung further (never required, never a gate,
+    # never a demotion, never creates Watch/Developing/Skip on its own).
     # This Recommendation is the ONLY recommendation shown anywhere in
     # the app.
     try:
@@ -904,14 +907,53 @@ def score_stock(
                 _gate_reason = "lifecycle=EXTENDED"
 
         promo = evaluate_promotion(r, base_tier, ia=ia, settings=settings or {})
-        final_tier = promo.tier if (promo.applicable and promo.promoted) else base_tier
+
+        # ── NATURAL V3 SCORE → EXECUTE/ELITE (not gated by Promo Score) ──
+        # cv1.signal_class (_classify_v3) independently qualifies EXECUTE/
+        # ELITE straight off the 20/50/30 composite + its own floors — it
+        # was being computed into CV1_SignalClass but never consulted here,
+        # so a naturally-qualifying setup sat capped at Actionable (or even
+        # Developing — see below) unless Promotion Engine's *timing*
+        # signals also happened to fire. Promo Score was never meant to be
+        # a gate on this path — Entry Quality already hard-caps at 35 under
+        # EXTENDED trend_phase, so extension risk is already priced into
+        # the natural score. Promo Score/timing can still carry a setup one
+        # rung further (e.g. a naturally-Execute setup that also times
+        # perfectly → Elite); it just can't be required to reach
+        # Execute/Elite in the first place.
+        #
+        # Natural EXECUTE's composite floor (>=60) sits BELOW base funnel's
+        # Actionable floor (>=65) even though both share the same
+        # leadership>=40/conviction>=55 floors — so a setup can legitimately
+        # earn natural EXECUTE/ELITE while base_tier is still "Developing".
+        # The natural score always wins regardless of which rung base_tier
+        # landed on; Promo Score is additive on top and is only ever
+        # non-zero when base_tier == "Actionable" (evaluate_promotion's own
+        # internal gate — untouched here).
+        _LADDER = ["Skip", "Watch", "Developing", "Actionable", "Execute", "Elite"]
+        _RANK = {name: i for i, name in enumerate(_LADDER)}
+        base_rank = _RANK.get(base_tier, 0)
+        natural_rank = {"ELITE": 5, "EXECUTE": 4}.get(cv1.signal_class, 0)
+        promo_rank = _RANK.get(promo.tier, 0) if (promo.applicable and promo.promoted) else 0
+
+        final_rank = max(base_rank, natural_rank, promo_rank)
+        final_tier = _LADDER[final_rank]
+
         result["_structural_gate_blocked"] = _gate_reason
         result["_structural_gate_on"] = _structural_gate_on
 
         result["CV1_SignalClass"]    = cv1.signal_class   # v3-weighted (_classify_v3) as of 2026-07 — no longer v1's frozen label
         result["Tier"]               = base_tier           # pre-promotion CV1 tier
         result["Recommendation"]     = final_tier           # Skip|Watch|Developing|Actionable|Execute|Elite
-        result["Promoted"]           = bool(promo.applicable and promo.promoted)
+        # "Promoted" means Promo Score/timing is the reason final_tier is
+        # above where base_tier + natural score would have landed on their
+        # own (promo_rank strictly ahead of both) — not just "timing
+        # signals happened to fire on a setup that would've gotten here
+        # anyway via base_tier or natural score".
+        result["Promoted"]           = bool(
+            promo.applicable and promo.promoted
+            and promo_rank > max(base_rank, natural_rank)
+        )
         result["PromoScore"]         = promo.promo_score
         result["PromoRR"]            = promo.risk_reward
         result["Promo_StochUp"]      = promo.stoch_up
