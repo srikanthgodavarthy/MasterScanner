@@ -810,8 +810,20 @@ def simulate_trades(
     df_full:   pd.DataFrame,
     signals:   pd.DataFrame,
     hold_days: int  = 20,
-    momentum_exit_enabled: bool = False,
+    momentum_exit_enabled: bool = False,   # kept for call-site compatibility;
+                                            # unused now that trades close in
+                                            # full at T1 (see docstring).
 ) -> pd.DataFrame:
+    """
+    Single-target exit model: each trade closes in full the moment T1 is
+    touched ("T1 HIT"), or is stopped out at SL ("SL HIT"), or times out
+    after `hold_days` bars ("TIMEOUT"). T1 itself is the adaptive,
+    entry-criteria-driven level computed upstream (tier, trend age,
+    EMA distance, extension, conviction/leadership — see
+    utils/adaptive_target_engine.py). T2/T3 are still computed and kept on
+    the trade row for reference only; they no longer drive any exit
+    decision, and there is no breakeven-trail-and-hold-for-T2 step.
+    """
     if signals.empty or df_full.empty:
         return pd.DataFrame()
 
@@ -873,23 +885,20 @@ def simulate_trades(
             blocked_until = entry_bar
             continue
 
-        # Gap-up beyond T2: skip — chasing, no margin of safety
-        if entry_price >= sig_t2:
+        # Gap-up beyond T1: skip — chasing, no margin of safety left to the
+        # only target we now trade for.
+        if entry_price >= t1:
             continue
 
         exit_price  = float(future["close"].iloc[min(hold_days, len(future) - 1)])
         exit_date   = future.index[min(hold_days, len(future) - 1)]
         exit_reason = "TIMEOUT"
 
-        # T3 uses adaptive multiple (t3_mult stored on signal)
+        # T2/T3 are no longer used as exit targets — the trade is closed in
+        # full the moment T1 is hit. t2/t3 are still computed and recorded
+        # on the trade row purely for reference/analysis (e.g. "how much
+        # further could this have run"), never for the exit decision.
         t3 = round(entry_price + rk * _t3m, 2)
-
-        # Trail state: once T1 is hit, SL moves to breakeven (entry_price).
-        # This converts "T1 then drift to TIMEOUT near 0%" into a small-profit
-        # SL exit, reducing TIMEOUT count and lifting TIMEOUT avg return.
-        active_sl    = sl
-        t1_triggered = False
-        _mf_confirm  = False   # v13: 2-bar momentum-fail confirmation arm
 
         # CCI Master: cap window at native EXIT signal if it arrives before hold_days
         if _is_cci_mode and _cci_exit_date is not None:
@@ -911,84 +920,29 @@ def simulate_trades(
                 exit_reason = "CCI_EXIT"
                 break
 
-            sl_hit = bar_low  <= active_sl
+            sl_hit = bar_low  <= sl
             t1_hit = bar_high >= t1
-            t2_hit = bar_high >= t2
-            t3_hit = bar_high >= t3
 
-            if sl_hit and t3_hit:
-                dist_sl = abs(bar_open - active_sl)
-                dist_t3 = abs(bar_open - t3)
-                if dist_t3 <= dist_sl:
-                    exit_price, exit_reason = t3, "T3 HIT"
-                else:
-                    exit_price, exit_reason = active_sl, "SL HIT"
-                exit_date = dt
-                break
-            elif sl_hit and t2_hit:
-                # BUG-3: both hit same bar — resolve by distance from open
-                dist_sl = abs(bar_open - active_sl)
-                dist_t2 = abs(bar_open - t2)
-                if dist_t2 <= dist_sl:
-                    exit_price, exit_reason = t2, "T2 HIT"
-                else:
-                    exit_price, exit_reason = active_sl, "SL HIT"
-                exit_date = dt
-                break
-            elif sl_hit and t1_hit:
-                dist_sl = abs(bar_open - active_sl)
+            if sl_hit and t1_hit:
+                # BUG-3: both levels touched intrabar — resolve by distance
+                # from the open (whichever level price was closer to is
+                # assumed to have been reached first).
+                dist_sl = abs(bar_open - sl)
                 dist_t1 = abs(bar_open - t1)
                 if dist_t1 <= dist_sl:
-                    # T1 hit first — trail SL to breakeven, keep running
-                    t1_triggered = True
-                    active_sl    = entry_price
+                    exit_price, exit_reason = t1, "T1 HIT"
                 else:
-                    exit_price, exit_reason = active_sl, "SL HIT"
-                    exit_date = dt
-                    break
-            elif sl_hit:
-                exit_price, exit_reason = active_sl, "SL HIT"
+                    exit_price, exit_reason = sl, "SL HIT"
                 exit_date = dt
-                if t1_triggered:
-                    exit_reason = "SL TRAIL"   # distinguish breakeven exits
                 break
-            elif t3_hit:
-                exit_price, exit_date, exit_reason = t3, dt, "T3 HIT"
+            elif sl_hit:
+                exit_price, exit_reason = sl, "SL HIT"
+                exit_date = dt
                 break
-            elif t2_hit:
-                exit_price, exit_date, exit_reason = t2, dt, "T2 HIT"
+            elif t1_hit:
+                exit_price, exit_reason = t1, "T1 HIT"
+                exit_date = dt
                 break
-            elif t1_hit and not t1_triggered:
-                # T1 reached — trail SL to breakeven, continue to T2/T3
-                t1_triggered = True
-                active_sl    = entry_price
-
-            # ── Momentum failure exit (v13) — 2-bar confirmation ─
-            # Only fires after T1 (SL already at breakeven → cannot lose).
-            # Requires all three conditions on BOTH this bar and the previous
-            # bar to avoid noise exits on a single bad candle.
-            if momentum_exit_enabled and t1_triggered and exit_reason == "TIMEOUT":
-                _c   = float(row["close"])
-                _ema = float(row.get("ema20",        entry_price))
-                _ml  = float(row.get("macd_line",    0.0))
-                _ms  = float(row.get("macd_signal",  0.0))
-                _cci = float(row.get("cci",          0.0))
-                _fired, _ = check_momentum_exit(
-                    close=_c, ema20=_ema,
-                    macd_line=_ml, macd_signal=_ms,
-                    cci=_cci,
-                    t1_triggered=True, entry_price=entry_price,
-                )
-                if _fired:
-                    if _mf_confirm:   # second consecutive bar → exit
-                        exit_price  = max(_c, entry_price)   # floor at BE
-                        exit_date   = dt
-                        exit_reason = "MOMENTUM_FAIL"
-                        break
-                    else:
-                        _mf_confirm = True   # first bar — arm the flag
-                else:
-                    _mf_confirm = False   # reset if conditions clear
 
         pnl_pct = round((exit_price - entry_price) / entry_price * 100, 2)
 
