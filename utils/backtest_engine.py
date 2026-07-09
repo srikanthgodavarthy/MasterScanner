@@ -963,8 +963,14 @@ def simulate_trades(
             "t1":              round(t1, 2),
             "t2":              round(t2, 2),
             "setup":           sig.get("setup", "-"),
+            "setup_type":      sig.get("setup", "-"),   # alias of "setup", added on request
             "buy_type":        sig.get("buy_type", "-"),
             "tier":            sig.get("tier", "-"),
+            # ── Quality scores (were computed upstream but dropped before
+            # export — now carried through onto the trade row) ──────────
+            "leadership_score":    int(sig.get("leadership_score",    0)),
+            "conviction_score":    int(sig.get("conviction_score",    0)),
+            "entry_quality_score": int(sig.get("entry_quality_score", 0)),
             "structural_entry": bool(sig.get("structural_entry", False)),
             "tier1_prime":     bool(sig.get("tier1_prime",    False)),
             "tier2_momentum":  bool(sig.get("tier2_momentum", False)),
@@ -1000,8 +1006,13 @@ def simulate_trades(
             "target_category": str(sig.get("target_category",  "Actionable")),
             "target_adj":      float(sig.get("target_adj",      0.0)),
             "target_notes":    str(sig.get("target_notes",      "")),
-            # Actual RR at entry (from real open, not signal close)
+            # Actual RR at entry (from real open, not signal close) — this is
+            # the PLANNED reward:risk of the T1 target, fixed at entry time.
             "rr_actual":       round((t1 - entry_price) / rk, 2) if rk > 0 else 0.0,
+            # Realized R-multiple — the ACTUAL outcome of the trade, in units
+            # of initial risk (pnl_abs ÷ rk). +t1_mult on a T1 HIT, -1.0 on an
+            # SL HIT, whatever fraction of R was banked/lost on a TIMEOUT.
+            "r_multiple":      round((exit_price - entry_price) / rk, 2) if rk > 0 else 0.0,
             # ── VWAP Reclaim trade diagnostics (from signal, preserved on trade) ──
             "vwap_touch":             bool(sig.get("vwap_touch",           False)),
             "reaction_strength":      float(sig.get("reaction_strength",   0.0)),
