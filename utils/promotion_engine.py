@@ -229,7 +229,11 @@ def evaluate_promotion(
                Promotion only ever runs when tier == "Actionable".
     ia       : optional IndicatorArrays — enables the OBV leg of the
                Institutional Confirmation signal. Safe to omit.
-    settings : optional settings dict — reads "min_risk_reward" if present.
+    settings : optional settings dict — reads "min_risk_reward" (Execute
+               R:R, default 1.5), "promo_min_rr_elite" (Elite R:R, default
+               2.0), "promo_execute_score_min" (default 50) and
+               "promo_elite_score_min" (default 75) if present. All four
+               are plain overrides, freely adjustable in either direction.
 
     Returns
     -------
@@ -279,12 +283,14 @@ def evaluate_promotion(
     )
 
     # ── Reward : Risk sanity gate ───────────────────────────────
+    # All thresholds in this module (Promo Score and R:R alike) are now
+    # treated the same way: a plain override via `settings`, adjustable
+    # in either direction, falling back to the module default when absent.
     res.risk_reward = _risk_reward(r)
     min_rr_execute = _MIN_RR_MAP.get(settings.get("min_risk_reward"), MIN_RR_EXECUTE)
-    # min_rr_execute can only RAISE the bar above the 1.5 default, never
-    # lower it, so the effective floor is whichever is higher.
-    res.rr_ok_execute = res.risk_reward >= max(min_rr_execute, MIN_RR_EXECUTE)
-    res.rr_ok_elite   = res.risk_reward >= MIN_RR_ELITE
+    res.rr_ok_execute = res.risk_reward >= min_rr_execute
+    min_rr_elite = settings.get("promo_min_rr_elite", MIN_RR_ELITE)
+    res.rr_ok_elite = res.risk_reward >= min_rr_elite
 
     # ── Reasons (for the "why promoted" explanation) ────────────
     if res.stoch_up:
@@ -305,15 +311,20 @@ def evaluate_promotion(
         res.reasons.append("Institutional confirmation — elevated volume + OBV at a fresh high, today")
 
     # ── Decision ─────────────────────────────────────────────────
-    if res.promo_score >= ELITE_SCORE_MIN and res.rr_ok_elite:
+    # promo_execute_score_min / promo_elite_score_min are freely settable
+    # in either direction — same treatment as the R:R gates above now, and
+    # the same as the app's existing min_score/execute_threshold sliders.
+    elite_score_min   = settings.get("promo_elite_score_min",   ELITE_SCORE_MIN)
+    execute_score_min = settings.get("promo_execute_score_min", EXECUTE_SCORE_MIN)
+    if res.promo_score >= elite_score_min and res.rr_ok_elite:
         res.promoted, res.tier = True, "Elite"
-    elif res.promo_score >= EXECUTE_SCORE_MIN and res.rr_ok_execute:
+    elif res.promo_score >= execute_score_min and res.rr_ok_execute:
         res.promoted, res.tier = True, "Execute"
     else:
         res.tier = "Actionable"
-        if res.promo_score >= EXECUTE_SCORE_MIN and not res.rr_ok_execute:
+        if res.promo_score >= execute_score_min and not res.rr_ok_execute:
             res.blocked.append(f"R:R {res.risk_reward:.1f} below minimum — promotion withheld")
-        elif res.promo_score < EXECUTE_SCORE_MIN:
+        elif res.promo_score < execute_score_min:
             res.blocked.append(f"Promo Score {res.promo_score}/100 — needs more timing confirmation")
 
     return res

@@ -735,7 +735,7 @@ def score_stock(
     cv1 = None
     try:
         from utils.conviction_score_v1 import compute_conviction_v3
-        cv1 = compute_conviction_v3(r)
+        cv1 = compute_conviction_v3(r, settings=settings)
         result.update({
             "CV1_Leadership":    cv1.leadership,
             "CV1_Conviction":    cv1.conviction,
@@ -874,7 +874,7 @@ def score_stock(
         from utils.conviction_score_v1 import classify_tier_v3
         from utils.promotion_engine import evaluate_promotion
 
-        base_tier = classify_tier_v3(cv1.leadership, cv1.conviction, cv1.entry_quality)
+        base_tier = classify_tier_v3(cv1.leadership, cv1.conviction, cv1.entry_quality, thresholds=settings)
 
         # ── STRUCTURAL GATE (opt-in — default False for A/B backtesting) ──
         # Decision Engine computes hard structural failure conditions and

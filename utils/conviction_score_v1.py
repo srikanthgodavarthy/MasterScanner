@@ -56,7 +56,7 @@ produce v2, v3, … so historical runs remain reproducible.
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from utils.scoring_core import BarResult
@@ -818,15 +818,43 @@ W_V3_LEADERSHIP    = 0.20
 W_V3_CONVICTION    = 0.50
 W_V3_ENTRY_QUALITY = 0.30
 
+# Every floor below is overridable — pass a `thresholds` dict (or the app's
+# whole `settings` dict; unrelated keys are ignored) to classify_tier_v3()/
+# _classify_v3(), or set the matching v3_* keys in Settings. Anything
+# omitted falls back to these defaults. Keys match Settings' names 1:1 so
+# pages/settings.py's settings dict can be passed straight through.
+V3_THRESHOLD_DEFAULTS = {
+    "v3_watch_leadership_min":      30,
+    "v3_watch_composite_min":       35,
+    "v3_developing_composite_min":  50,
+    "v3_actionable_leadership_min": 40,
+    "v3_actionable_conviction_min": 55,
+    "v3_actionable_composite_min":  65,
+    "v3_execute_leadership_min":    40,
+    "v3_execute_conviction_min":    55,
+    "v3_execute_entry_quality_min": 55,
+    "v3_execute_composite_min":     60,
+    "v3_elite_leadership_min":      55,
+    "v3_elite_conviction_min":      75,
+    "v3_elite_entry_quality_min":   70,
+    "v3_elite_composite_min":       72,
+}
 
-def classify_tier_v3(leadership: int, conviction: int, entry_quality: int) -> str:
+
+def classify_tier_v3(leadership: int, conviction: int, entry_quality: int,
+                      thresholds: Optional[dict] = None) -> str:
     """
     v3 analogue of classify_tier() — 20/50/30 composite, floors
     relaxed relative to v1 so the weighted percentage carries more of
     the qualification decision.
 
-    PLACEHOLDER THRESHOLDS — see module note above.
+    thresholds : optional overrides (or the app's full `settings` dict) —
+                 keys match V3_THRESHOLD_DEFAULTS above; anything omitted
+                 uses the module default. These are PLACEHOLDER THRESHOLDS
+                 (see module note above) — Settings lets you tune them
+                 without a code change while they're still unvalidated.
     """
+    t = {**V3_THRESHOLD_DEFAULTS, **(thresholds or {})}
     composite = (leadership * W_V3_LEADERSHIP) + (conviction * W_V3_CONVICTION) + (entry_quality * W_V3_ENTRY_QUALITY)
 
     # Leadership floor: 55 -> 40 (v1 was sized for 25% weight; at 20%
@@ -834,12 +862,14 @@ def classify_tier_v3(leadership: int, conviction: int, entry_quality: int) -> st
     # Conviction floor: new, 55 — the highest-weighted pillar (50%)
     # still needs its own non-negotiable minimum, same reasoning v2
     # applied at its 60% weight.
-    if leadership >= 40 and conviction >= 55 and composite >= 65:
+    if (leadership >= t["v3_actionable_leadership_min"]
+            and conviction >= t["v3_actionable_conviction_min"]
+            and composite  >= t["v3_actionable_composite_min"]):
         return "Actionable"
-    if composite >= 50:
+    if composite >= t["v3_developing_composite_min"]:
         return "Developing"
     # Watch floor: 40 -> 30, same proportional relaxation as Actionable.
-    if leadership >= 30 or composite >= 35:
+    if leadership >= t["v3_watch_leadership_min"] or composite >= t["v3_watch_composite_min"]:
         return "Watch"
     return "Skip"
 
@@ -850,7 +880,8 @@ class ConvictionV3(ConvictionV1):
     pass
 
 
-def _classify_v3(leadership: int, conviction: int, entry_quality: int) -> str:
+def _classify_v3(leadership: int, conviction: int, entry_quality: int,
+                  thresholds: Optional[dict] = None) -> str:
     """
     v3 analogue of _classify() / signal_class — 20/50/30 composite,
     floors relaxed the same way classify_tier_v3 relaxed its floors.
@@ -859,21 +890,25 @@ def _classify_v3(leadership: int, conviction: int, entry_quality: int) -> str:
     and unweighted, so it wouldn't reflect the 20/50/30 blend at all
     if reused here. This closes that gap for v3, independent of v2.
 
+    thresholds : see classify_tier_v3() above — same dict, same keys.
     PLACEHOLDER THRESHOLDS — not yet re-fit against v3's real score
     distribution.
     """
+    t = {**V3_THRESHOLD_DEFAULTS, **(thresholds or {})}
     composite = (leadership * W_V3_LEADERSHIP) + (conviction * W_V3_CONVICTION) + (entry_quality * W_V3_ENTRY_QUALITY)
 
-    if leadership >= 55 and conviction >= 75 and entry_quality >= 70 and composite >= 72:
+    if (leadership >= t["v3_elite_leadership_min"] and conviction >= t["v3_elite_conviction_min"]
+            and entry_quality >= t["v3_elite_entry_quality_min"] and composite >= t["v3_elite_composite_min"]):
         return "ELITE"
-    if leadership >= 40 and conviction >= 55 and entry_quality >= 55 and composite >= 60:
+    if (leadership >= t["v3_execute_leadership_min"] and conviction >= t["v3_execute_conviction_min"]
+            and entry_quality >= t["v3_execute_entry_quality_min"] and composite >= t["v3_execute_composite_min"]):
         return "EXECUTE"
-    if leadership >= 30 or composite >= 40:
+    if leadership >= t["v3_watch_leadership_min"] or composite >= t["v3_watch_composite_min"]:
         return "WATCH"
     return "SKIP"
 
 
-def compute_conviction_v3(r: "BarResult") -> ConvictionV3:
+def compute_conviction_v3(r: "BarResult", settings: Optional[dict] = None) -> ConvictionV3:
     """
     Compute Conviction Score v3 (20/50/30 composite) from an existing
     BarResult. Reuses v1's unchanged _leadership()/_conviction()/
@@ -881,6 +916,9 @@ def compute_conviction_v3(r: "BarResult") -> ConvictionV3:
     tier/signal thresholds differ (classify_tier_v3 / _classify_v3).
 
     Inputs : scoring_core.BarResult (output of compute_bar())
+             settings — optional; forwarded to _classify_v3() as
+             threshold overrides (see V3_THRESHOLD_DEFAULTS). Unrelated
+             keys in a full app `settings` dict are ignored.
     Outputs: ConvictionV3 dataclass — same fields as ConvictionV1, with
              composite computed from the 20/50/30 weights.
     """
@@ -893,7 +931,7 @@ def compute_conviction_v3(r: "BarResult") -> ConvictionV3:
         + (conviction * W_V3_CONVICTION)
         + (entry_quality * W_V3_ENTRY_QUALITY)
     ))
-    signal = _classify_v3(leadership, conviction, entry_quality)
+    signal = _classify_v3(leadership, conviction, entry_quality, thresholds=settings)
 
     return ConvictionV3(
         leadership    = leadership,

@@ -312,7 +312,7 @@ def generate_signals_historical(
         # Initialise here so the rejection-log append below always has values.
         _eq_val, _rr, _ls_val, _cv_val = 0, 0.0, 0, 0
         if not _rejection_reason:
-            _cv1    = compute_conviction_v3(r)
+            _cv1    = compute_conviction_v3(r, settings=settings)
             _ls_val = _cv1.leadership
             _cv_val = _cv1.conviction
             _eq_val = _cv1.entry_quality
@@ -328,14 +328,20 @@ def generate_signals_historical(
             # Gate 2: admission — same verdict the live Scanner would show.
             # base_tier=="Actionable" is the base funnel's own floor; the
             # natural-score OR covers the Developing-but-natural-EXECUTE/
-            # ELITE band that base_tier alone would miss.
-            _base_tier   = classify_tier_v3(_ls_val, _cv_val, _eq_val)
-            _natural_cls = _classify_v3(_ls_val, _cv_val, _eq_val)
+            # ELITE band that base_tier alone would miss. Thresholds come
+            # from the same v3_* settings keys the live Scanner uses, so a
+            # backtest run against custom thresholds validates exactly
+            # what that configuration would have recommended.
+            _base_tier   = classify_tier_v3(_ls_val, _cv_val, _eq_val, thresholds=settings)
+            _natural_cls = _classify_v3(_ls_val, _cv_val, _eq_val, thresholds=settings)
             if _base_tier != "Actionable" and _natural_cls not in ("EXECUTE", "ELITE"):
                 _rejection_reason = f"BELOW_ACTIONABLE (base={_base_tier}, natural={_natural_cls})"
             # Gate 3: Risk/Reward — independent backtest-specific quality
             # bar; classify_tier_v3/_classify_v3 have no R:R component.
-            elif _rr < 2.0:
+            # "backtest_min_rr" in settings overrides the 2.0 default in
+            # either direction (this is a backtest population choice, not
+            # a live trade-safety floor like Promotion Engine's R:R gates).
+            elif _rr < (settings or {}).get("backtest_min_rr", 2.0):
                 _rejection_reason = "POOR_RR"
 
         if _rejection_reason:
