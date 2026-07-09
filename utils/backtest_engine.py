@@ -29,7 +29,7 @@ import threading
 
 from utils.scanner_engine import _strip_tz, nifty_regime, ema
 from utils.decision_engine import _extension as _ext_fn
-from utils.conviction_score_v1 import compute_conviction_v3
+from utils.conviction_score_v1 import compute_conviction_v3, classify_tier_v3, _classify_v3
 from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
 from utils.adaptive_target_engine import AdaptiveTargetParams, compute_adaptive_targets, check_momentum_exit
 from utils.regime_engine  import (
@@ -131,8 +131,8 @@ def _target_category_for_backtest(leadership: int, conviction: int,
                                    entry_quality: int, extension: int) -> str:
     """
     Target-tier label for compute_adaptive_targets(), scoped to trades that
-    have ALREADY cleared the ADMISSION GATE above (Leadership >= 65,
-    Conviction >= 20, RR >= 2.0, Entry Quality >= 60).
+    have ALREADY cleared the ADMISSION GATE above (classify_tier_v3()=="
+    Actionable" OR _classify_v3() in EXECUTE/ELITE, AND RR >= 2.0).
 
     decision_engine._classify_category() is NOT used here on purpose: its
     lowest non-"Avoid" bucket requires Leadership >= 70 and Conviction >= 50
@@ -261,7 +261,7 @@ def generate_signals_historical(
             continue
 
         # ══════════════════════════════════════════════════════════
-        #  ADMISSION GATE v12 — hard pre-score filters
+        #  ADMISSION GATE v13 — hard pre-score filters
         #  These are BINARY rejects; they do not reduce score.
         #  A stock that fails any gate is never added to signals.
         #
@@ -274,22 +274,27 @@ def generate_signals_historical(
         #  uses. Risk:Reward is computed here directly from entry/sl/t1/t2
         #  (CV1's entry_quality does not return an RR figure).
         #
-        #  NOTE (2026-07): these 65/20/60 floors are hardcoded here and are
-        #  NOT derived from classify_tier_v3() — the live Scanner's actual
-        #  Recommendation funnel. compute_conviction_v3() is called below
-        #  only for its raw leadership/conviction/entry_quality values
-        #  (identical across v1/v2/v3 — sub-scoring is unweighted), not its
-        #  composite or tier. This gate and the live Recommendation funnel
-        #  can and do diverge — a stock can pass this gate and still be
-        #  Watch/Developing under classify_tier_v3, or vice versa. If
-        #  backtest population needs to exactly mirror what the Scanner
-        #  recommends, this gate should call classify_tier_v3() directly
-        #  instead of re-deriving its own floors.
+        #  FIXED (2026-07): admission now calls classify_tier_v3() /
+        #  _classify_v3() directly — the same functions the live Scanner's
+        #  Recommendation funnel uses (utils/scanner_engine.py) — instead
+        #  of independently re-derived Leadership/Conviction/EntryQuality
+        #  floors. The old hardcoded floors here (Leadership>=65,
+        #  Conviction>=20, EntryQuality>=60) didn't match classify_tier_v3's
+        #  actual floors (Leadership>=40, Conviction>=55, composite>=65) in
+        #  either direction — Leadership was stricter, Conviction far more
+        #  lenient — so this gate silently validated a different population
+        #  than the Scanner actually recommends. _classify_v3's natural
+        #  EXECUTE/ELITE is OR'd in too, since that can independently fire
+        #  from a Developing base_tier (composite 60-64 band — see
+        #  scanner_engine.py's Recommendation funnel for why).
         #
         #  Gate order (cheapest checks first):
         #    1. ATR band / staleness / extension  — field lookups, free
-        #    2. Leadership / Conviction            — requires engine call
-        #    3. Entry Quality / RR                 — requires engine call
+        #    2. CV1 tier admission                 — requires engine call
+        #    3. Risk:Reward                        — backtest-specific bar,
+        #                                             independent of CV1
+        #                                             (classify_tier_v3 has
+        #                                             no R:R component)
         #  Engine calls are skipped entirely if an early gate already fires.
         # ══════════════════════════════════════════════════════════
         _rejection_reason: str = ""
@@ -302,7 +307,7 @@ def generate_signals_historical(
         #elif r.extension_score_atr >= 2:
         #    _rejection_reason = "HIGH_EXTENSION_SCORE"
 
-        # ── Gates 2–5: CV1-scored gates (only if gate 1 passed) ────
+        # ── Gates 2–3: CV1-scored gates (only if gate 1 passed) ────
         # Compute CV1 once; reuse values for signal dict.
         # Initialise here so the rejection-log append below always has values.
         _eq_val, _rr, _ls_val, _cv_val = 0, 0.0, 0, 0
@@ -320,24 +325,18 @@ def generate_signals_historical(
             _reward   = _t2 - _entry if _t2 > _entry else (_t1 - _entry if _t1 > _entry else 0)
             _rr       = round(_reward / _risk_amt, 2) if _risk_amt > 0 else 0.0
 
-            # Gate 2: Leadership must be >= 65
-            # A stock with Leadership < 65 has no RS edge, weak trend, or
-            # poor volume profile.  Admitting it produces noise trades.
-            if _ls_val < 65:
-                _rejection_reason = "WEAK_LEADERSHIP"
-            # Gate 3: Conviction must be >= 20
-            # Floor of 20 filters only stocks with zero RS contribution
-            # (rs_positive=False, rs_top_decile=False, no composite edge).
-            # Conviction is logged on every admitted signal for factor
-            # attribution analysis — the diagnostic measures its lift.
-            elif _cv_val < 20:
-                _rejection_reason = "WEAK_CONVICTION"
-            # Gate 4: Risk/Reward
+            # Gate 2: admission — same verdict the live Scanner would show.
+            # base_tier=="Actionable" is the base funnel's own floor; the
+            # natural-score OR covers the Developing-but-natural-EXECUTE/
+            # ELITE band that base_tier alone would miss.
+            _base_tier   = classify_tier_v3(_ls_val, _cv_val, _eq_val)
+            _natural_cls = _classify_v3(_ls_val, _cv_val, _eq_val)
+            if _base_tier != "Actionable" and _natural_cls not in ("EXECUTE", "ELITE"):
+                _rejection_reason = f"BELOW_ACTIONABLE (base={_base_tier}, natural={_natural_cls})"
+            # Gate 3: Risk/Reward — independent backtest-specific quality
+            # bar; classify_tier_v3/_classify_v3 have no R:R component.
             elif _rr < 2.0:
                 _rejection_reason = "POOR_RR"
-            # Gate 5: Entry Quality
-            elif _eq_val < 60:
-                _rejection_reason = "LOW_ENTRY_QUALITY"
 
         if _rejection_reason:
             rejections.append({
