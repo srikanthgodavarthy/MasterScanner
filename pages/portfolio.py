@@ -145,6 +145,30 @@ def _inject_css():
     .pcc-stat-label { font-size:0.65rem; color:#64748b; text-transform:uppercase; letter-spacing:0.06em; }
     .pcc-stat-value { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1.35rem; margin-top:0.15rem; }
     .pcc-stat-sub { font-size:0.72rem; font-weight:600; margin-top:0.1rem; }
+
+    .pcc-row-2col { display:flex; gap:0.9rem; align-items:flex-start; margin-bottom:0.5rem; }
+    .pcc-row-2col > div { min-width:0; }
+
+    .pcc-stockcard { background:#0d1420; border:1px solid #1e293b; border-radius:12px;
+        padding:0.85rem 0.9rem; margin-bottom:0.7rem; }
+    .pcc-stockcard-top { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:0.5rem; }
+    .pcc-stockcard-price { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1.1rem; margin-top:0.2rem; }
+    .pcc-stockcard-pnl { font-size:0.72rem; font-weight:600; }
+    .pcc-stockcard-mini { display:flex; gap:0; border:1px solid #1a2436; border-radius:8px; margin:0.5rem 0; }
+    .pcc-stockcard-mini > div { flex:1; text-align:center; padding:0.3rem 0.1rem; }
+    .pcc-stockcard-mini > div + div { border-left:1px solid #1a2436; }
+    .pcc-stockcard-mini-label { font-size:0.55rem; color:#64748b; text-transform:uppercase; }
+    .pcc-stockcard-mini-value { font-weight:700; font-size:0.8rem; }
+
+    .pcc-journey { margin-top:0.65rem; }
+    .pcc-journey-track { position:relative; height:5px; border-radius:3px; margin:1.3rem 0 0.35rem;
+        background:linear-gradient(90deg,#ff4d6d 0%,#f59e0b 45%,#00ff88 100%); opacity:0.4; }
+    .pcc-journey-tick { position:absolute; top:-3px; width:2px; height:11px; background:#475569; transform:translateX(-1px); }
+    .pcc-journey-tick-label { position:absolute; top:-1.15rem; font-size:0.55rem; color:#64748b; white-space:nowrap; transform:translateX(-50%); }
+    .pcc-journey-marker { position:absolute; top:-4px; width:12px; height:12px; border-radius:50%;
+        border:2px solid #0d1420; transform:translateX(-6px); box-shadow:0 0 6px rgba(0,0,0,0.6); }
+    .pcc-journey-endlabels { display:flex; justify-content:space-between; font-size:0.6rem; color:#54607a; margin-top:0.1rem; }
+    .pcc-journey-dist { font-size:0.72rem; font-weight:700; text-align:center; margin-top:0.4rem; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -442,6 +466,8 @@ def _compute_row(pos: dict, cfg: ExitScoreConfig, live_metrics: pd.DataFrame) ->
     lm_score = _lm_get(lm_row, "score")
     lm_category = lm_row.get("category") if lm_row is not None and pd.notna(lm_row.get("category")) else None
 
+    stop_price = (entry_price - risk_per_share) if risk_per_share else None
+
     return dict(
         pos=pos, result=result, symbol=symbol, qty=qty, entry_price=entry_price,
         price=result.price, market_val=result.price * qty, pnl_val=(result.price - entry_price) * qty,
@@ -450,6 +476,7 @@ def _compute_row(pos: dict, cfg: ExitScoreConfig, live_metrics: pd.DataFrame) ->
         status=status, ls=ls, cv=cv, eq=eq, rs=rs, ts=ts,
         risk_pct=risk_pct, rr=rr, t1_hit=t1_hit, trail_active=trail_active,
         targets=targets, category=lm_category or category, lm_score=lm_score,
+        stop_price=stop_price,
     )
 
 
@@ -648,6 +675,91 @@ def _lifecycle_progress_html(stage_raw: str) -> str:
       <div style="display:flex;position:relative;">{''.join(dots)}</div>
     </div>
     """
+
+
+def _journey_bar_html(sl, entry, current, t1) -> str:
+    """SL ---- Entry ---- Current ---- T1 number line, showing how far price
+    is from stopping out vs. hitting the first target."""
+    if not sl or not entry or not current or not t1 or t1 == sl:
+        return ('<div class="pcc-journey"><div class="pcc-journey-dist" style="color:#3a4658;">'
+                'Journey unavailable — no stop/target on this position</div></div>')
+
+    lo, hi = min(sl, t1), max(sl, t1)
+    span = hi - lo if hi != lo else 1
+    pct = lambda v: max(0.0, min(100.0, (v - lo) / span * 100))
+    sl_pct, entry_pct, t1_pct, cur_pct = pct(sl), pct(entry), pct(t1), pct(current)
+
+    if current <= sl:
+        dist_txt, dist_color = "At/through Stop Loss", "#ff4d6d"
+    elif current >= t1:
+        dist_txt, dist_color = "Target hit", "#00ff88"
+    else:
+        to_sl = abs((current - sl) / current * 100)
+        to_t1 = abs((t1 - current) / current * 100)
+        if to_sl <= to_t1:
+            dist_txt, dist_color = f"{to_sl:.1f}% from Stop Loss", "#f59e0b" if to_sl < 3 else "#94a3b8"
+        else:
+            dist_txt, dist_color = f"{to_t1:.1f}% to Target", "#60a5fa"
+
+    marker_color = "#00ff88" if current >= entry else ("#f59e0b" if current > sl else "#ff4d6d")
+
+    ticks = "".join(f"""
+        <div class="pcc-journey-tick" style="left:{p:.1f}%;"></div>
+        <div class="pcc-journey-tick-label" style="left:{p:.1f}%;">{lbl}</div>
+        """ for p, lbl in ((sl_pct, "SL"), (entry_pct, "Entry"), (t1_pct, "T1")))
+
+    return f"""
+    <div class="pcc-journey">
+      <div class="pcc-journey-track">
+        {ticks}
+        <div class="pcc-journey-marker" style="left:{cur_pct:.1f}%;background:{marker_color};"></div>
+      </div>
+      <div class="pcc-journey-endlabels"><span>₹{sl:.2f}</span><span>₹{current:.2f}</span><span>₹{t1:.2f}</span></div>
+      <div class="pcc-journey-dist" style="color:{dist_color};">{dist_txt}</div>
+    </div>
+    """
+
+
+def _render_stock_cards(rows: list[dict], cfg: ExitScoreConfig):
+    """Grid of compact stock cards, 5 per row, sorted by action urgency —
+    each with a mini score strip and an SL→Entry→Current→T1 journey bar;
+    full detail (thesis checks, Reduce/Exit/Notes) lives in the expander
+    underneath each card."""
+    order = {"EXIT": 0, "REDUCE": 1, "STRONG ADD": 2, "ADD": 3, "HOLD": 4}
+    sorted_rows = sorted(rows, key=lambda r: order.get(r["display_action"], 9))
+
+    n_per_row = 5
+    for i in range(0, len(sorted_rows), n_per_row):
+        chunk = sorted_rows[i:i + n_per_row]
+        cols = st.columns(n_per_row)
+        for col, r in zip(cols, chunk):
+            with col:
+                pnl_color = "#00ff88" if r["pnl_val"] >= 0 else "#ff4d6d"
+                mini_items = "".join(f"""
+                    <div><div class="pcc-stockcard-mini-label">{lbl}</div>
+                    <div class="pcc-stockcard-mini-value" style="color:{_score_color(val) if val is not None else '#3a4658'};">
+                    {f"{val:.0f}" if val is not None else "—"}</div></div>
+                    """ for lbl, val in (("LS", r["ls"]), ("CV", r["cv"]), ("EQ", r["eq"]), ("RS", r["rs"]), ("TS", r["ts"])))
+                t1_price = r["targets"].t1 if r["targets"] else None
+                journey = _journey_bar_html(r["stop_price"], r["entry_price"], r["price"], t1_price)
+                _md(f"""
+                <div class="pcc-stockcard">
+                  <div class="pcc-stockcard-top">
+                    <div>
+                      <span class="pcc-sym">{r['symbol']}</span><br/>
+                      {_stage_badge(r['stage_label'], r['stage_color'])}
+                    </div>
+                    {_action_badge(r['display_action'])}
+                  </div>
+                  <div class="pcc-stockcard-price">₹{r['price']:.2f}</div>
+                  <div class="pcc-stockcard-pnl" style="color:{pnl_color};">
+                    {'+' if r['pnl_val']>=0 else ''}₹{r['pnl_val']:,.0f} ({r['result'].unrealized_pct:+.2f}%)</div>
+                  <div class="pcc-stockcard-mini">{mini_items}</div>
+                  {journey}
+                </div>
+                """)
+                with st.expander("Details & Actions"):
+                    _render_detail_card(r, cfg)
 
 
 def _render_detail_card(r: dict, cfg: ExitScoreConfig):
@@ -855,17 +967,17 @@ def render():
 
         if rows:
             _render_summary_cards(rows)
-            st.markdown("### 📊 Current Portfolio")
-            _render_positions_table(rows)
 
-            st.markdown("### 🔍 Opportunity Cost Analyzer")
-            _render_opportunity_cost(rows, live_metrics)
+            col_pf, col_oc = st.columns([1.7, 1])
+            with col_pf:
+                st.markdown("### 📊 Current Portfolio")
+                _render_positions_table(rows)
+            with col_oc:
+                st.markdown("### 🔍 Opportunity Cost")
+                _render_opportunity_cost(rows, live_metrics)
 
-            st.markdown("### 🗂️ Position Details")
-            for r in rows:
-                with st.expander(f"{r['symbol']} — {_fmt_inr(r['price'])}  ·  {r['display_action']}",
-                                  expanded=(r["display_action"] in ("EXIT", "REDUCE"))):
-                    _render_detail_card(r, cfg)
+            st.markdown("### 🗂️ Position Cards")
+            _render_stock_cards(rows, cfg)
 
             if live_metrics is None or live_metrics.empty:
                 st.caption(
