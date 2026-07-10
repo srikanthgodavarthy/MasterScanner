@@ -134,17 +134,25 @@ def _inject_css():
     .pcc-section-label { font-size:0.68rem; font-weight:700; color:#64748b; text-transform:uppercase;
         letter-spacing:0.08em; margin:0.9rem 0 0.45rem; }
     .pcc-mini-box { background:#0d1420; border:1px solid #1e293b; border-radius:10px;
-        padding:0.7rem 0.9rem; display:flex; gap:0; }
-    .pcc-mini-item { flex:1; text-align:center; padding:0 0.3rem; }
+        padding:0.6rem 0.4rem; display:flex; gap:0; width:100%; box-sizing:border-box; }
+    .pcc-mini-item { flex:1; min-width:0; text-align:center; padding:0 0.2rem; box-sizing:border-box; }
     .pcc-mini-item + .pcc-mini-item { border-left:1px solid #1a2436; }
-    .pcc-mini-label { font-size:0.62rem; color:#64748b; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:0.25rem; }
-    .pcc-mini-value { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1.05rem; }
+    .pcc-mini-label { font-size:0.58rem; color:#64748b; text-transform:uppercase; letter-spacing:0.03em;
+        white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .pcc-mini-value { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:0.85rem; }
 
-    .pcc-stat-strip { display:grid; grid-template-columns:repeat(4,1fr); gap:0.7rem; margin:0.4rem 0 0.8rem; }
-    .pcc-stat-box { background:#0d1420; border:1px solid #1e293b; border-radius:10px; padding:0.75rem 0.9rem; }
-    .pcc-stat-label { font-size:0.65rem; color:#64748b; text-transform:uppercase; letter-spacing:0.06em; }
-    .pcc-stat-value { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1.35rem; margin-top:0.15rem; }
-    .pcc-stat-sub { font-size:0.72rem; font-weight:600; margin-top:0.1rem; }
+    .pcc-stat-strip { display:grid; grid-template-columns:repeat(3,1fr); gap:0.5rem; margin:0.4rem 0 0.8rem; width:100%; box-sizing:border-box; }
+    .pcc-stat-box { background:#0d1420; border:1px solid #1e293b; border-radius:10px; padding:0.6rem 0.5rem;
+        min-width:0; box-sizing:border-box; overflow:hidden; }
+    .pcc-stat-label { font-size:0.6rem; color:#64748b; text-transform:uppercase; letter-spacing:0.03em; white-space:nowrap; }
+    .pcc-stat-value { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1.05rem; margin-top:0.1rem;
+        white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .pcc-stat-sub { font-size:0.68rem; font-weight:600; margin-top:0.1rem; }
+
+    .pcc-factor-row { margin:0.35rem 0; }
+    .pcc-factor-toprow { display:flex; justify-content:space-between; font-size:0.72rem; color:#94a3b8; margin-bottom:2px; }
+    .pcc-factor-track { height:5px; background:#1a2436; border-radius:3px; overflow:hidden; }
+    .pcc-factor-fill { height:100%; border-radius:3px; }
 
     .pcc-row-2col { display:flex; gap:0.9rem; align-items:flex-start; margin-bottom:0.5rem; }
     .pcc-row-2col > div { min-width:0; }
@@ -780,41 +788,55 @@ def _render_stock_cards(rows: list[dict], cfg: ExitScoreConfig):
                     _render_detail_card(r, cfg)
 
 
+def _factor_bar_html(label: str, value: float, direction: str) -> str:
+    """Clean CSS progress bar for one factor — replaces the old unicode
+    block-character bar, which renders illegibly at narrow card widths."""
+    pct = max(0.0, min(100.0, value))
+    if direction == "health":
+        color = "#00ff88" if value >= 60 else "#f59e0b" if value >= 35 else "#ff4d6d"
+    else:  # urgency: higher = more reason for concern
+        color = "#ff4d6d" if value >= 60 else "#f59e0b" if value >= 35 else "#00ff88"
+    return f"""
+    <div class="pcc-factor-row">
+      <div class="pcc-factor-toprow"><span>{label}</span><span style="color:{color};font-weight:700;">{value:.0f}</span></div>
+      <div class="pcc-factor-track"><div class="pcc-factor-fill" style="width:{pct:.0f}%;background:{color};"></div></div>
+    </div>
+    """
+
+
 def _render_detail_card(r: dict, cfg: ExitScoreConfig):
     result = r["result"]
     pos = r["pos"]
     symbol = r["symbol"]
     pnl_color = "#00ff88" if r["pnl_val"] >= 0 else "#ff4d6d"
 
-    header = f"""
-    <div style="background:#0d1420;border:1px solid #1e293b;border-radius:12px;padding:1rem 1.2rem;margin-top:0.6rem;">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;">
-        <div>
-          <span class="pcc-sym" style="font-size:1.1rem;">{symbol}</span>
-          {_stage_badge(r['stage_label'], r['stage_color'])}
-          <div style="margin-top:0.3rem;font-size:1.4rem;font-weight:700;">₹{r['price']:.2f}
-            <span style="font-size:0.85rem;color:{pnl_color};">
-              {'+' if r['pnl_val']>=0 else ''}₹{r['pnl_val']:,.0f} ({result.unrealized_pct:+.2f}%)</span>
+    with st.container(border=True):
+        # ── Header ──
+        _md(f"""
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+          <div>
+            <span class="pcc-sym" style="font-size:1.1rem;">{symbol}</span>
+            {_stage_badge(r['stage_label'], r['stage_color'])}
+            <div style="margin-top:0.3rem;font-size:1.4rem;font-weight:700;">₹{r['price']:.2f}
+              <span style="font-size:0.85rem;color:{pnl_color};">
+                {'+' if r['pnl_val']>=0 else ''}₹{r['pnl_val']:,.0f} ({result.unrealized_pct:+.2f}%)</span>
+            </div>
+          </div>
+          <div style="text-align:right;font-size:0.75rem;color:#64748b;">
+            Days Held<br><span style="color:#e2e8f0;font-weight:700;font-size:1rem;">{result.days_held}</span>
+            &nbsp;&nbsp; Qty<br><span style="color:#e2e8f0;font-weight:700;font-size:1rem;">{r['qty']:g}</span>
           </div>
         </div>
-        <div style="text-align:right;font-size:0.75rem;color:#64748b;">
-          Days Held<br><span style="color:#e2e8f0;font-weight:700;font-size:1rem;">{result.days_held}</span>
-          &nbsp;&nbsp; Qty<br><span style="color:#e2e8f0;font-weight:700;font-size:1rem;">{r['qty']:g}</span>
-        </div>
-      </div>
-      <div style="font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;margin-top:0.8rem;">Lifecycle Progress</div>
-      {_lifecycle_progress_html(pos.get('_stage_raw'))}
-    </div>
-    """
-    _md(header)
+        <div style="font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;margin-top:0.8rem;">Lifecycle Progress</div>
+        {_lifecycle_progress_html(pos.get('_stage_raw'))}
+        """)
 
-    col_l, col_r = st.columns([1.15, 1])
-
-    with col_l:
+        # ── Key Scores (LS / CV / EQ / RS / TS / Momentum) ──
         _md('<div class="pcc-section-label">Key Scores</div>')
+        momentum_val = result.display_factors.get("Momentum")
         items = []
-        for label, val in zip(("LS", "CV", "EQ", "RS", "TS"),
-                               (r["ls"], r["cv"], r["eq"], r["rs"], r["ts"])):
+        for label, val in zip(("LS", "CV", "EQ", "RS", "TS", "Mom"),
+                               (r["ls"], r["cv"], r["eq"], r["rs"], r["ts"], momentum_val)):
             val_txt = f"{val:.0f}" if val is not None else "—"
             val_color = _score_color(val) if val is not None else "#3a4658"
             items.append(f"""
@@ -825,6 +847,26 @@ def _render_detail_card(r: dict, cfg: ExitScoreConfig):
             """)
         _md(f'<div class="pcc-mini-box">{"".join(items)}</div>')
 
+        # ── Exit Score / Risk % / R:R + trend badge ──
+        es_sub, es_color = _exit_score_sub(result.exit_score)
+        rk_sub, rk_color = _risk_sub(r["risk_pct"])
+        rr_sub, rr_color = _rr_sub(r["rr"])
+        _md(f"""
+        <div class="pcc-stat-strip">
+          <div class="pcc-stat-box"><div class="pcc-stat-label">Exit Score</div>
+            <div class="pcc-stat-value">{result.exit_score:.0f}<span style="font-size:0.75rem;color:#64748b;">/100</span></div>
+            <div class="pcc-stat-sub" style="color:{es_color};">{es_sub}</div></div>
+          <div class="pcc-stat-box"><div class="pcc-stat-label">Risk %</div>
+            <div class="pcc-stat-value">{f"{r['risk_pct']:.1f}%" if r['risk_pct'] is not None else "—"}</div>
+            <div class="pcc-stat-sub" style="color:{rk_color};">{rk_sub}</div></div>
+          <div class="pcc-stat-box"><div class="pcc-stat-label">R:R</div>
+            <div class="pcc-stat-value">{f"{r['rr']:.2f}" if r['rr'] is not None else "—"}</div>
+            <div class="pcc-stat-sub" style="color:{rr_color};">{rr_sub}</div></div>
+        </div>
+        """)
+        st.markdown(_trend_badge_html(result.trend_health, result.trend_health_detail), unsafe_allow_html=True)
+
+        # ── Targets ──
         if r["targets"]:
             t = r["targets"]
             trail_color = "#00ff88" if r["trail_active"] else "#64748b"
@@ -843,46 +885,23 @@ def _render_detail_card(r: dict, cfg: ExitScoreConfig):
             </div>
             """)
 
+        # ── Factor Breakdown (real CSS bars, not unicode blocks) ──
         _md('<div class="pcc-section-label">Factor Breakdown</div>')
-        for label, value in result.display_factors.items():
-            direction = DISPLAY_FACTOR_DIRECTION.get(label, "health")
-            st.markdown(_bar(label, value, direction), unsafe_allow_html=True)
-
-        _md('<div class="pcc-section-label">Top Reasons</div>')
-        for reason in result.top_reasons:
-            st.markdown(f"- {reason}")
+        factor_html = "".join(
+            _factor_bar_html(label, value, DISPLAY_FACTOR_DIRECTION.get(label, "health"))
+            for label, value in result.display_factors.items()
+        )
+        _md(factor_html)
         if result.structure_break:
             st.error("⚠️ Trend structure break confirmed — escalates straight to EXIT regardless of composite score.")
 
-    with col_r:
-        es_sub, es_color = _exit_score_sub(result.exit_score)
-        rm_sub, rm_color = _rmult_sub(result.r_multiple)
-        rk_sub, rk_color = _risk_sub(r["risk_pct"])
-        rr_sub, rr_color = _rr_sub(r["rr"])
-        _md(f"""
-        <div class="pcc-stat-strip">
-          <div class="pcc-stat-box"><div class="pcc-stat-label">Exit Score</div>
-            <div class="pcc-stat-value">{result.exit_score:.0f}<span style="font-size:0.85rem;color:#64748b;">/100</span></div>
-            <div class="pcc-stat-sub" style="color:{es_color};">{es_sub}</div></div>
-          <div class="pcc-stat-box"><div class="pcc-stat-label">R-Multiple</div>
-            <div class="pcc-stat-value">{f"{result.r_multiple:+.1f}R" if result.r_multiple is not None else "—"}</div>
-            <div class="pcc-stat-sub" style="color:{rm_color};">{rm_sub}</div></div>
-          <div class="pcc-stat-box"><div class="pcc-stat-label">Risk %</div>
-            <div class="pcc-stat-value">{f"{r['risk_pct']:.1f}%" if r['risk_pct'] is not None else "—"}</div>
-            <div class="pcc-stat-sub" style="color:{rk_color};">{rk_sub}</div></div>
-          <div class="pcc-stat-box"><div class="pcc-stat-label">R:R</div>
-            <div class="pcc-stat-value">{f"{r['rr']:.2f}" if r['rr'] is not None else "—"}</div>
-            <div class="pcc-stat-sub" style="color:{rr_color};">{rr_sub}</div></div>
-        </div>
-        """)
-        st.markdown(_trend_badge_html(result.trend_health, result.trend_health_detail), unsafe_allow_html=True)
-
+        # ── Why am I holding this? ──
         if result.thesis_intact:
             banner_bg, banner_color, banner_icon = "#00ff8814", "#00ff88", "✅"
-            banner_text = "Investment thesis intact — no reason to exit on the checks below."
+            banner_text = "Thesis intact — no reason to exit on the checks below."
         else:
             banner_bg, banner_color, banner_icon = "#ff4d6d14", "#ff4d6d", "⚠️"
-            banner_text = f"Investment thesis broken — recommendation: {result.action}"
+            banner_text = f"Thesis broken — recommendation: {result.action}"
 
         check_rows = []
         checks = list(result.thesis_checks)
@@ -891,50 +910,49 @@ def _render_detail_card(r: dict, cfg: ExitScoreConfig):
             color = "#00ff88" if ok else "#ff4d6d"
             border = "border-bottom:1px solid #161d2e;" if i < len(checks) - 1 else ""
             check_rows.append(f"""
-            <div style="display:flex;align-items:baseline;gap:0.55rem;padding:0.4rem 0;{border}">
+            <div style="display:flex;align-items:baseline;gap:0.55rem;padding:0.35rem 0;{border}">
               <span style="color:{color};font-weight:700;width:12px;flex-shrink:0;">{icon}</span>
-              <span style="color:#e2e8f0;font-size:0.83rem;">{label}</span>
-              <span style="color:#54607a;font-size:0.74rem;">— {detail}</span>
+              <span style="color:#e2e8f0;font-size:0.8rem;">{label}</span>
+              <span style="color:#54607a;font-size:0.7rem;">— {detail}</span>
             </div>
             """)
 
+        _md('<div class="pcc-section-label">Why Am I Holding This?</div>')
         _md(f"""
-        <div style="background:#0d1420;border:1px solid #1e293b;border-radius:10px;padding:0.9rem 1.1rem;margin:0.4rem 0 0.9rem;">
-          <div style="font-size:0.7rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.07em;margin-bottom:0.7rem;">
-            Why am I still holding this?</div>
-          <div style="display:flex;align-items:center;gap:0.55rem;padding:0.55rem 0.8rem;border-radius:8px;
-               background:{banner_bg};border:1px solid {banner_color}33;margin-bottom:0.5rem;">
-            <span>{banner_icon}</span>
-            <span style="color:{banner_color};font-weight:600;font-size:0.83rem;">{banner_text}</span>
-          </div>
-          {''.join(check_rows)}
+        <div style="display:flex;align-items:center;gap:0.55rem;padding:0.55rem 0.8rem;border-radius:8px;
+             background:{banner_bg};border:1px solid {banner_color}33;margin-bottom:0.3rem;">
+          <span>{banner_icon}</span>
+          <span style="color:{banner_color};font-weight:600;font-size:0.83rem;">{banner_text}</span>
         </div>
+        {''.join(check_rows)}
         """)
 
-    _md(f'<div class="pcc-section-label" style="margin-top:1.1rem;">Action Engine &nbsp;{_action_badge(r["display_action"])}</div>')
-    act_c1, act_c2, act_c3 = st.columns(3)
-    with act_c1:
-        reduce_pct = st.slider(f"Reduce % — {symbol}", 10, 90, 50, 10, key=f"reduce_{pos.get('id')}")
-        if st.button(f"Reduce {reduce_pct}%", key=f"btn_reduce_{pos.get('id')}"):
-            new_qty = round(r["qty"] * (1 - reduce_pct / 100), 4)
-            if reduce_portfolio_position(pos.get("id"), new_qty, reason=f"Reduce {reduce_pct}% — exit score {result.exit_score:.0f}"):
-                st.success(f"Reduced {symbol} to qty {new_qty:g}.")
-                st.rerun()
-            else:
-                st.error("Reduce failed.")
-    with act_c2:
-        if st.button(f"🚪 Exit {symbol}", key=f"btn_exit_{pos.get('id')}"):
-            if close_portfolio_position(pos.get("id"), reason=f"Manual exit — exit score {result.exit_score:.0f}"):
-                st.success(f"{symbol} closed.")
-                st.rerun()
-            else:
-                st.error("Exit failed.")
-    with act_c3:
-        new_notes = st.text_input("Update notes", pos.get("notes", ""), key=f"notes_{pos.get('id')}")
-        if st.button("💾 Save notes", key=f"btn_notes_{pos.get('id')}"):
-            if update_portfolio_position(pos.get("id"), {"notes": new_notes}):
-                st.success("Notes saved.")
-                st.rerun()
+        # ── Action Engine ──
+        _md(f'<div class="pcc-section-label" style="margin-top:1.1rem;">Action Engine &nbsp;{_action_badge(r["display_action"])}</div>')
+        act_c1, act_c2, act_c3 = st.columns(3)
+        with act_c1:
+            reduce_pct = st.slider(f"Reduce % — {symbol}", 10, 90, 50, 10, key=f"reduce_{pos.get('id')}")
+            if st.button(f"Reduce {reduce_pct}%", key=f"btn_reduce_{pos.get('id')}"):
+                new_qty = round(r["qty"] * (1 - reduce_pct / 100), 4)
+                if reduce_portfolio_position(pos.get("id"), new_qty, reason=f"Reduce {reduce_pct}% — exit score {result.exit_score:.0f}"):
+                    st.success(f"Reduced {symbol} to qty {new_qty:g}.")
+                    st.rerun()
+                else:
+                    st.error("Reduce failed.")
+        with act_c2:
+            if st.button(f"🚪 Exit {symbol}", key=f"btn_exit_{pos.get('id')}"):
+                if close_portfolio_position(pos.get("id"), reason=f"Manual exit — exit score {result.exit_score:.0f}"):
+                    st.success(f"{symbol} closed.")
+                    st.rerun()
+                else:
+                    st.error("Exit failed.")
+        with act_c3:
+            new_notes = st.text_input("Update notes", pos.get("notes", ""), key=f"notes_{pos.get('id')}")
+            if st.button("💾 Save notes", key=f"btn_notes_{pos.get('id')}"):
+                if update_portfolio_position(pos.get("id"), {"notes": new_notes}):
+                    st.success("Notes saved.")
+                    st.rerun()
+
 
 
 # ══════════════════════════════════════════════════════════════════
