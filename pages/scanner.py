@@ -904,18 +904,21 @@ def _scoring_explainer_html() -> str:
         ("Entry Quality", "30%", "no independent floor — carried entirely by the weighted composite"),
     ], cols=("Pillar", "Weight", "Notes"))
     sec2 += _mini_table([
-        ("Actionable", "Leadership &ge;40 AND Conviction &ge;55 AND composite &ge;65"),
-        ("Developing",  "composite &ge;50 (floors not required)"),
-        ("Watch",       "Leadership &ge;30 OR composite &ge;35"),
+        ("Elite",      "Leadership &ge;70 AND Conviction &ge;70 AND Entry Quality &ge;60 AND composite &ge;67"),
+        ("Execute / Actionable", "Leadership &ge;60 AND Conviction &ge;70 AND Entry Quality &ge;50 AND composite &ge;60"),
+        ("Developing",  "composite &ge;55 (floors not required)"),
+        ("Watch",       "Leadership &ge;50 AND Conviction &ge;50 AND Entry Quality &ge;50 (strict, no composite fallback)"),
         ("Skip",        "everything else"),
     ], cols=("Base Tier", "Condition"))
     sec2 += _note(
-        "&#9888; These thresholds are marked <b>PLACEHOLDER</b> directly in source — proportionally "
-        "scaled down from v1's 25/25/50 floors to fit the new 20/50/30 weighting, not re-fit against "
-        "a real v3 score distribution. The code comment is explicit: re-run backtest_engine.py's factor "
-        "attribution before trusting this for live gating. Worth knowing before leaning hard on the "
-        "Actionable cut-off for sizing or conviction — it hasn't been through the same v8.1-style "
-        "validation the sub-factor point tables above have.",
+        "&#9888; Backtest-derived thresholds (2026-07), composite is now an equal-weight "
+        "average (Leadership + Conviction + Entry Quality) / 3, replacing the earlier "
+        "20/50/30 weighted blend. Watch is a strict AND across all three pillars, per the "
+        "decile backtest — a high composite built off one strong pillar no longer qualifies "
+        "on its own (this replaced an earlier OR-gate design). Developing's composite floor (55) "
+        "is a midpoint placeholder between Watch (50) and Actionable/Execute (60) — not yet "
+        "backtest-fit on its own. Re-run backtest_engine.py's factor attribution before trusting "
+        "Developing's cut-off for sizing or conviction.",
         warn=True,
     )
     sec2 += _note(
@@ -2466,14 +2469,13 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
         ("BOOSTS",     ""),          ("TIER",        ""),
     ]
     # Gate threshold tooltips on headers — mirror CV1 v3's actual
-    # classify_tier_v3() gate (utils/conviction_score_v1.py, LIVE since
-    # 2026-07): Leadership >= 40 AND Conviction >= 55 AND the 20/50/30
-    # WEIGHTED composite >= 65 to reach Actionable. (Not a simple average —
-    # that was v1's stale description and never matched v3's blend.)
+    # classify_tier_v3() gate (utils/conviction_score_v1.py, backtest-fit
+    # 2026-07): Leadership >= 60 AND Conviction >= 70 AND the equal-weight
+    # (1/3 each) composite >= 60 to reach Actionable.
     _HEADER_TIPS = {
-        "LEADERSHIP": 'title="CV1 Leadership — gate: Leadership ≥ 40 (v3 floor)"',
-        "CONVICTION": 'title="CV1 Conviction — gate: Conviction ≥ 55 (v3 floor, 50% composite weight)"',
-        "EQ":         'title="CV1 Entry Quality — no standalone floor in v3; gates via 20/50/30 weighted composite ≥ 65"',
+        "LEADERSHIP": 'title="CV1 Leadership — gate: Leadership ≥ 60 (v3 floor)"',
+        "CONVICTION": 'title="CV1 Conviction — gate: Conviction ≥ 70 (v3 floor)"',
+        "EQ":         'title="CV1 Entry Quality — no standalone floor in v3; gates via equal-weight composite ≥ 60"',
     }
     thead = (
         '<thead><tr>'
@@ -2504,7 +2506,7 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
         cv     = r.get("CV1_Conviction",   0)
         eq     = r.get("CV1_EntryQuality", 0)
         composite = r.get("CV1_Composite", 0) or (
-            (float(ls or 0) * 0.20) + (float(cv or 0) * 0.50) + (float(eq or 0) * 0.30)
+            (float(ls or 0) + float(cv or 0) + float(eq or 0)) / 3
         )
 
         # CCI state label — mirrors the main scanner
