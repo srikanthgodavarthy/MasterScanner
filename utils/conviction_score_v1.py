@@ -787,7 +787,7 @@ def compute_conviction_v2(r: "BarResult") -> ConvictionV2:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  CLASSIFY TIER v3 — 20/50/30 composite, floors relaxed (2026-07)
+#  CLASSIFY TIER v3 — equal-weight composite, decile-backtest calibrated (2026-07)
 # ══════════════════════════════════════════════════════════════════
 #
 # Same funnel shape as classify_tier() (v1, frozen, 25/25/50) and
@@ -809,14 +809,15 @@ def compute_conviction_v2(r: "BarResult") -> ConvictionV2:
 # way to Actionable — same "floors are non-negotiable, composite is
 # not the whole story" reasoning as v1 and v2.
 #
-# PLACEHOLDER THRESHOLDS — not yet re-validated against a real score
-# distribution. Re-run backtest_engine.py's factor attribution before
-# trusting this for live gating, same caveat as v2.
+# DECILE-BACKTEST CALIBRATED (2026-07) — Watch/Execute/Elite floors below
+# are empirically derived from decile backtest results, not hand-tuned.
+# The Developing composite floor is the one exception still pending its
+# own backtest fit (see TODO on that key below).
 # ══════════════════════════════════════════════════════════════════
 
-W_V3_LEADERSHIP    = 0.20
-W_V3_CONVICTION    = 0.50
-W_V3_ENTRY_QUALITY = 0.30
+W_V3_LEADERSHIP    = 1/3
+W_V3_CONVICTION    = 1/3
+W_V3_ENTRY_QUALITY = 1/3
 
 # Every floor below is overridable — pass a `thresholds` dict (or the app's
 # whole `settings` dict; unrelated keys are ignored) to classify_tier_v3()/
@@ -824,78 +825,88 @@ W_V3_ENTRY_QUALITY = 0.30
 # omitted falls back to these defaults. Keys match Settings' names 1:1 so
 # pages/settings.py's settings dict can be passed straight through.
 V3_THRESHOLD_DEFAULTS = {
-    "v3_watch_leadership_min":      30,
-    "v3_watch_composite_min":       35,
-    "v3_developing_composite_min":  50,
-    "v3_actionable_leadership_min": 40,
-    "v3_actionable_conviction_min": 55,
-    "v3_actionable_composite_min":  65,
-    "v3_execute_leadership_min":    40,
-    "v3_execute_conviction_min":    55,
-    "v3_execute_entry_quality_min": 55,
+    # Backtest-derived (2026-07), equal-weight (1/3/1/3/1/3) composite.
+    # Base funnel (classify_tier_v3: Watch/Developing/Actionable) is kept
+    # in sync with the natural signal class (_classify_v3: Watch/Execute/
+    # Elite) — Actionable == Execute's floors, Developing is the midpoint
+    # between Watch (50) and Actionable/Execute (60) pending its own
+    # backtest fit.
+    "v3_watch_leadership_min":      50,
+    "v3_watch_conviction_min":      50,
+    "v3_watch_entry_quality_min":   50,
+    "v3_watch_composite_min":       50,
+    "v3_developing_composite_min":  55,   # TODO: not yet backtest-fit — midpoint placeholder
+    "v3_actionable_leadership_min": 60,
+    "v3_actionable_conviction_min": 70,
+    "v3_actionable_composite_min":  60,
+    "v3_execute_leadership_min":    60,
+    "v3_execute_conviction_min":    70,
+    "v3_execute_entry_quality_min": 50,
     "v3_execute_composite_min":     60,
-    "v3_elite_leadership_min":      55,
-    "v3_elite_conviction_min":      75,
-    "v3_elite_entry_quality_min":   70,
-    "v3_elite_composite_min":       72,
+    "v3_elite_leadership_min":      70,
+    "v3_elite_conviction_min":      70,
+    "v3_elite_entry_quality_min":   60,
+    "v3_elite_composite_min":       66,  # raw (70+70+60)/3 = 66.67; 67 only holds post-rounding
 }
 
 
 def classify_tier_v3(leadership: int, conviction: int, entry_quality: int,
                       thresholds: Optional[dict] = None) -> str:
     """
-    v3 analogue of classify_tier() — 20/50/30 composite, floors
-    relaxed relative to v1 so the weighted percentage carries more of
-    the qualification decision.
+    v3 analogue of classify_tier() — equal-weight (1/3 each) composite,
+    floors relaxed relative to v1 so the weighted percentage carries more
+    of the qualification decision.
 
     thresholds : optional overrides (or the app's full `settings` dict) —
                  keys match V3_THRESHOLD_DEFAULTS above; anything omitted
-                 uses the module default. These are PLACEHOLDER THRESHOLDS
-                 (see module note above) — Settings lets you tune them
-                 without a code change while they're still unvalidated.
+                 uses the module default. Defaults are decile-backtest
+                 calibrated (2026-07) — see module note above. Settings
+                 lets you tune them without a code change if a future
+                 recalibration warrants it.
     """
     t = {**V3_THRESHOLD_DEFAULTS, **(thresholds or {})}
-    composite = (leadership * W_V3_LEADERSHIP) + (conviction * W_V3_CONVICTION) + (entry_quality * W_V3_ENTRY_QUALITY)
+    composite = (leadership + conviction + entry_quality) / 3  # equal-weight; sum-then-divide avoids float rounding (60*1/3+70*1/3+50*1/3 != 60.0)
 
-    # Leadership floor: 55 -> 40 (v1 was sized for 25% weight; at 20%
-    # the old floor would dominate the decision almost every time).
-    # Conviction floor: new, 55 — the highest-weighted pillar (50%)
-    # still needs its own non-negotiable minimum, same reasoning v2
-    # applied at its 60% weight.
+    # Actionable requires its own Leadership and Conviction floors on top
+    # of the composite bar — a strong percentage built almost entirely
+    # off Entry Quality still can't compensate its way to Actionable.
     if (leadership >= t["v3_actionable_leadership_min"]
             and conviction >= t["v3_actionable_conviction_min"]
             and composite  >= t["v3_actionable_composite_min"]):
         return "Actionable"
     if composite >= t["v3_developing_composite_min"]:
         return "Developing"
-    # Watch floor: 40 -> 30, same proportional relaxation as Actionable.
-    if leadership >= t["v3_watch_leadership_min"] or composite >= t["v3_watch_composite_min"]:
+    # Watch — strict AND per decile backtest: all three pillars must
+    # independently clear their floor (composite alone can't compensate).
+    if (leadership    >= t["v3_watch_leadership_min"]
+            and conviction    >= t["v3_watch_conviction_min"]
+            and entry_quality >= t["v3_watch_entry_quality_min"]):
         return "Watch"
     return "Skip"
 
 
 @dataclass
 class ConvictionV3(ConvictionV1):
-    """Same shape as ConvictionV1 — composite uses the 20/50/30 weights."""
+    """Same shape as ConvictionV1 — composite is an equal-weight (1/3 each) average."""
     pass
 
 
 def _classify_v3(leadership: int, conviction: int, entry_quality: int,
                   thresholds: Optional[dict] = None) -> str:
     """
-    v3 analogue of _classify() / signal_class — 20/50/30 composite,
-    floors relaxed the same way classify_tier_v3 relaxed its floors.
+    v3 analogue of _classify() / signal_class — equal-weight (1/3 each)
+    composite, floors relaxed the same way classify_tier_v3 relaxed its
+    floors.
 
     Same reasoning as _classify_v2: v1's _classify() is frozen/legacy
-    and unweighted, so it wouldn't reflect the 20/50/30 blend at all
-    if reused here. This closes that gap for v3, independent of v2.
+    and unweighted, so it wouldn't reflect v3's blend at all if reused
+    here. This closes that gap for v3, independent of v2.
 
     thresholds : see classify_tier_v3() above — same dict, same keys.
-    PLACEHOLDER THRESHOLDS — not yet re-fit against v3's real score
-    distribution.
+    Decile-backtest calibrated (2026-07) — see module note above.
     """
     t = {**V3_THRESHOLD_DEFAULTS, **(thresholds or {})}
-    composite = (leadership * W_V3_LEADERSHIP) + (conviction * W_V3_CONVICTION) + (entry_quality * W_V3_ENTRY_QUALITY)
+    composite = (leadership + conviction + entry_quality) / 3  # equal-weight; sum-then-divide avoids float rounding (60*1/3+70*1/3+50*1/3 != 60.0)
 
     if (leadership >= t["v3_elite_leadership_min"] and conviction >= t["v3_elite_conviction_min"]
             and entry_quality >= t["v3_elite_entry_quality_min"] and composite >= t["v3_elite_composite_min"]):
@@ -903,15 +914,19 @@ def _classify_v3(leadership: int, conviction: int, entry_quality: int,
     if (leadership >= t["v3_execute_leadership_min"] and conviction >= t["v3_execute_conviction_min"]
             and entry_quality >= t["v3_execute_entry_quality_min"] and composite >= t["v3_execute_composite_min"]):
         return "EXECUTE"
-    if leadership >= t["v3_watch_leadership_min"] or composite >= t["v3_watch_composite_min"]:
+    # Watch — strict AND per decile backtest: all three pillars must
+    # independently clear their floor (composite alone can't compensate).
+    if (leadership    >= t["v3_watch_leadership_min"]
+            and conviction    >= t["v3_watch_conviction_min"]
+            and entry_quality >= t["v3_watch_entry_quality_min"]):
         return "WATCH"
     return "SKIP"
 
 
 def compute_conviction_v3(r: "BarResult", settings: Optional[dict] = None) -> ConvictionV3:
     """
-    Compute Conviction Score v3 (20/50/30 composite) from an existing
-    BarResult. Reuses v1's unchanged _leadership()/_conviction()/
+    Compute Conviction Score v3 (equal-weight 1/3 each composite) from an
+    existing BarResult. Reuses v1's unchanged _leadership()/_conviction()/
     _entry_quality() sub-scoring — only the composite blend and the
     tier/signal thresholds differ (classify_tier_v3 / _classify_v3).
 
@@ -920,17 +935,13 @@ def compute_conviction_v3(r: "BarResult", settings: Optional[dict] = None) -> Co
              threshold overrides (see V3_THRESHOLD_DEFAULTS). Unrelated
              keys in a full app `settings` dict are ignored.
     Outputs: ConvictionV3 dataclass — same fields as ConvictionV1, with
-             composite computed from the 20/50/30 weights.
+             composite computed as an equal-weight (1/3 each) average.
     """
     leadership,    ls_subs = _leadership(r)
     conviction,    cv_subs = _conviction(r)
     entry_quality, eq_subs = _entry_quality(r)
 
-    composite = int(round(
-        (leadership * W_V3_LEADERSHIP)
-        + (conviction * W_V3_CONVICTION)
-        + (entry_quality * W_V3_ENTRY_QUALITY)
-    ))
+    composite = int(round((leadership + conviction + entry_quality) / 3))
     signal = _classify_v3(leadership, conviction, entry_quality, thresholds=settings)
 
     return ConvictionV3(
