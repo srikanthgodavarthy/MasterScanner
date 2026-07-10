@@ -461,6 +461,7 @@ def _compute_row(pos: dict, cfg: ExitScoreConfig, live_metrics: pd.DataFrame) ->
     # ── Today's P&L (prior close vs LTP) ──
     prev_close = float(df["close"].iloc[-2]) if len(df) >= 2 else result.price
     today_pnl = (result.price - prev_close) * qty
+    today_pct = ((result.price - prev_close) / prev_close * 100) if prev_close else 0.0
 
     # ── Scores: LS / CV / EQ / RS / TS ──
     ls = current_leadership if current_leadership is not None else pos.get("locked_leadership")
@@ -490,7 +491,7 @@ def _compute_row(pos: dict, cfg: ExitScoreConfig, live_metrics: pd.DataFrame) ->
     return dict(
         pos=pos, result=result, symbol=symbol, qty=qty, entry_price=entry_price,
         price=result.price, market_val=result.price * qty, pnl_val=(result.price - entry_price) * qty,
-        today_pnl=today_pnl, display_action=display_action,
+        today_pnl=today_pnl, today_pct=today_pct, display_action=display_action,
         stage_label=stage_meta.get("label", "—"), stage_color=stage_meta.get("color", "#64748b"),
         status=status, ls=ls, cv=cv, eq=eq, rs=rs, ts=ts,
         risk_pct=risk_pct, rr=rr, t1_hit=t1_hit, trail_active=trail_active,
@@ -776,18 +777,24 @@ def _render_stock_cards(rows: list[dict], cfg: ExitScoreConfig):
                     ))
                 t1_price = r["targets"].t1 if r["targets"] else None
                 journey = _journey_bar_html(r["stop_price"], r["entry_price"], r["price"], t1_price)
+                day_color = "#00ff88" if r["today_pct"] >= 0 else "#ff4d6d"
                 _md(f"""
                 <div class="pcc-stockcard" style="border-left-color:{accent}; background:linear-gradient(160deg,{accent}22 0%,#151d30 65%);">
                   <div class="pcc-stockcard-top">
                     <div>
                       <span class="pcc-sym">{r['symbol']}</span><br/>
-                      {_stage_badge(r['stage_label'], r['stage_color'])}
+                      <span style="font-size:0.75rem;font-weight:600;color:{day_color};">
+                        {'+' if r['today_pct']>=0 else ''}{r['today_pct']:.2f}% today</span>
                     </div>
-                    {_action_badge(r['display_action'])}
+                    <div style="text-align:right;">
+                      <span style="font-size:0.85rem;font-weight:700;color:{pnl_color};">
+                        {'+' if r['result'].unrealized_pct>=0 else ''}{r['result'].unrealized_pct:.2f}%</span><br/>
+                      {_action_badge(r['display_action'])}
+                    </div>
                   </div>
                   <div class="pcc-stockcard-price">₹{r['price']:.2f}</div>
                   <div class="pcc-stockcard-pnl" style="color:{pnl_color};">
-                    {'+' if r['pnl_val']>=0 else ''}₹{r['pnl_val']:,.0f} ({r['result'].unrealized_pct:+.2f}%)</div>
+                    {'+' if r['pnl_val']>=0 else ''}₹{r['pnl_val']:,.0f}</div>
                   <div class="pcc-stockcard-mini">{mini_items}</div>
                   <div class="pcc-stockcard-mini">{stat_items}</div>
                   {journey}
@@ -1003,7 +1010,6 @@ def render():
         for pos in positions:
             row = _compute_row(pos, cfg, live_metrics)
             if row is None:
-                st.warning(f"{pos.get('symbol')}: no price data available — skipping scoring.")
                 continue
             # stash raw stage for the lifecycle-progress widget
             lm_row = _lm_lookup(live_metrics, row["symbol"])
