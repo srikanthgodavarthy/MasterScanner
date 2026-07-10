@@ -149,16 +149,19 @@ def _inject_css():
     .pcc-row-2col { display:flex; gap:0.9rem; align-items:flex-start; margin-bottom:0.5rem; }
     .pcc-row-2col > div { min-width:0; }
 
-    .pcc-stockcard { background:#0d1420; border:1px solid #1e293b; border-radius:12px;
-        padding:0.85rem 0.9rem; margin-bottom:0.7rem; }
+    .pcc-stockcard { background:linear-gradient(160deg,#1b2438 0%,#151d30 100%); border:1px solid #2a3652;
+        border-left:3px solid #3b4766; border-radius:12px; padding:0.85rem 0.9rem; margin-bottom:0.7rem; }
     .pcc-stockcard-top { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:0.5rem; }
     .pcc-stockcard-price { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1.1rem; margin-top:0.2rem; }
     .pcc-stockcard-pnl { font-size:0.72rem; font-weight:600; }
-    .pcc-stockcard-mini { display:flex; gap:0; border:1px solid #1a2436; border-radius:8px; margin:0.5rem 0; }
+    .pcc-stockcard-mini { display:flex; gap:0; border:1px solid #2a3652; border-radius:8px; margin:0.5rem 0; background:#0d1420cc; }
     .pcc-stockcard-mini > div { flex:1; text-align:center; padding:0.3rem 0.1rem; }
-    .pcc-stockcard-mini > div + div { border-left:1px solid #1a2436; }
-    .pcc-stockcard-mini-label { font-size:0.55rem; color:#64748b; text-transform:uppercase; }
+    .pcc-stockcard-mini > div + div { border-left:1px solid #2a3652; }
+    .pcc-stockcard-mini-label { font-size:0.55rem; color:#8291ab; text-transform:uppercase; }
     .pcc-stockcard-mini-value { font-weight:700; font-size:0.8rem; }
+
+    .pcc-oc-wrap table.pcc-table th, .pcc-oc-wrap table.pcc-table td { padding:0.4rem 0.5rem; font-size:0.71rem; }
+    .pcc-oc-wrap table.pcc-table td:nth-child(3) { white-space:normal; max-width:140px; }
 
     .pcc-journey { margin-top:0.65rem; }
     .pcc-journey-track { position:relative; height:5px; border-radius:3px; margin:1.3rem 0 0.35rem;
@@ -632,15 +635,16 @@ def _render_opportunity_cost(rows: list[dict], live_metrics: pd.DataFrame):
         </tr>
         """)
     html = f"""
+    <div class="pcc-oc-wrap">
     <div class="pcc-table-wrap">
       <table class="pcc-table">
-        <thead><tr><th>Symbol</th><th>Would I buy today?</th><th>Better Alternatives</th><th>Action</th></tr></thead>
+        <thead><tr><th>Symbol</th><th>Buy today?</th><th>Alternatives</th><th>Action</th></tr></thead>
         <tbody>{''.join(trs)}</tbody>
       </table>
     </div>
-    <div style="color:#3a4658;font-size:0.7rem;margin:-0.8rem 0 1.2rem 0.2rem;">
-      "Better Alternatives" are the top-scoring symbols from your latest saved scan that you don't currently hold,
-      preferring the same Decision-Engine category where available.
+    </div>
+    <div style="color:#3a4658;font-size:0.68rem;margin:-0.8rem 0 1.2rem 0.2rem;">
+      Top-scoring symbols you don't hold, from your latest saved scan.
     </div>
     """
     _md(html)
@@ -735,15 +739,28 @@ def _render_stock_cards(rows: list[dict], cfg: ExitScoreConfig):
         for col, r in zip(cols, chunk):
             with col:
                 pnl_color = "#00ff88" if r["pnl_val"] >= 0 else "#ff4d6d"
+                accent = _ACTION_COLOR.get(r["display_action"], "#3b4766")
                 mini_items = "".join(f"""
                     <div><div class="pcc-stockcard-mini-label">{lbl}</div>
                     <div class="pcc-stockcard-mini-value" style="color:{_score_color(val) if val is not None else '#3a4658'};">
                     {f"{val:.0f}" if val is not None else "—"}</div></div>
                     """ for lbl, val in (("LS", r["ls"]), ("CV", r["cv"]), ("EQ", r["eq"]), ("RS", r["rs"]), ("TS", r["ts"])))
+                es_sub, es_color = _exit_score_sub(r["result"].exit_score)
+                stat_items = "".join(f"""
+                    <div><div class="pcc-stockcard-mini-label">{lbl}</div>
+                    <div class="pcc-stockcard-mini-value" style="color:{val_color};">{val_txt}</div></div>
+                    """ for lbl, val_txt, val_color in (
+                        ("Entry", f"₹{r['entry_price']:.2f}", "#cbd5e1"),
+                        ("Qty", f"{r['qty']:g}", "#cbd5e1"),
+                        ("Days", f"{r['result'].days_held}", "#cbd5e1"),
+                        ("Risk%", f"{r['risk_pct']:.1f}%" if r['risk_pct'] is not None else "—", "#cbd5e1"),
+                        ("R:R", f"{r['rr']:.2f}" if r['rr'] is not None else "—", "#cbd5e1"),
+                        ("Exit", f"{r['result'].exit_score:.0f}", es_color),
+                    ))
                 t1_price = r["targets"].t1 if r["targets"] else None
                 journey = _journey_bar_html(r["stop_price"], r["entry_price"], r["price"], t1_price)
                 _md(f"""
-                <div class="pcc-stockcard">
+                <div class="pcc-stockcard" style="border-left-color:{accent};">
                   <div class="pcc-stockcard-top">
                     <div>
                       <span class="pcc-sym">{r['symbol']}</span><br/>
@@ -755,6 +772,7 @@ def _render_stock_cards(rows: list[dict], cfg: ExitScoreConfig):
                   <div class="pcc-stockcard-pnl" style="color:{pnl_color};">
                     {'+' if r['pnl_val']>=0 else ''}₹{r['pnl_val']:,.0f} ({r['result'].unrealized_pct:+.2f}%)</div>
                   <div class="pcc-stockcard-mini">{mini_items}</div>
+                  <div class="pcc-stockcard-mini">{stat_items}</div>
                   {journey}
                 </div>
                 """)
@@ -968,7 +986,7 @@ def render():
         if rows:
             _render_summary_cards(rows)
 
-            col_pf, col_oc = st.columns([1.7, 1])
+            col_pf, col_oc = st.columns([2.6, 1])
             with col_pf:
                 st.markdown("### 📊 Current Portfolio")
                 _render_positions_table(rows)
