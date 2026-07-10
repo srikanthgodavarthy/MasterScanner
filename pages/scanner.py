@@ -2769,10 +2769,22 @@ def render(settings: dict | None = None):
     # ── Split by Recommendation (CV1 tier + Promotion Engine) ──────
     has_cv1 = "Recommendation" in df_aug.columns
 
+    # Tiers that never mint a Setup Plan on their own (_FREEZE_CATEGORIES
+    # = Elite/Execute/Actionable is the only trigger for plan creation,
+    # in setup_persistence.py). A Watch/Developing/Skip row showing an
+    # open plan can only mean it qualified for Actionable+ before, a plan
+    # was minted, and its score has since decayed — the plan is still
+    # legitimately open (tracked by price, not by current tier) but
+    # belongs in Active Plans, not here.
+    _PRE_ACTIONABLE_TIERS = {"Developing", "Watch", "Skip"}
+
     def _sc_df(sc):
         if not has_cv1:
             return pd.DataFrame()
         _base = df_aug[df_aug["Recommendation"] == sc].copy()
+        if sc in _PRE_ACTIONABLE_TIERS and "PlanStatus" in _base.columns:
+            _open_states = {"WAITING", "ACTIVE", "T1_HIT"}
+            _base = _base[~_base["PlanStatus"].astype(str).str.upper().isin(_open_states)]
         # Default sort: Score (CV1_Composite) high → low.
         if "CV1_Composite" in _base.columns:
             _base = _base.sort_values("CV1_Composite", ascending=False)
@@ -2855,13 +2867,12 @@ def render(settings: dict | None = None):
         f"🌟 Elite ({len(elite_df)})",
         f"🚀 Execute ({len(execute_df)})",
         f"🔷 Actionable ({len(actionable_df)})",
-        f"⚙️ Developing ({len(developing_df)})",
-        f"👁 Watch ({len(watch_df)})",
+        f"🧭 Developing/Watch ({len(developing_df) + len(watch_df)})",
         f"📐 Fib Pullback ({len(fib_pb_records)})",
         f"📋 Active Plans ({len(_open_plans_preview)})",
     ]
-    df_sets  = [elite_df, execute_df, actionable_df, developing_df, watch_df, fib_pb_df, pd.DataFrame()]
-    set_keys = ["ELITE", "EXECUTE", "ACTIONABLE", "DEVELOPING", "WATCH", "FIB_PULLBACK", "ACTIVE_PLANS"]
+    df_sets  = [elite_df, execute_df, actionable_df, pd.DataFrame(), fib_pb_df, pd.DataFrame()]
+    set_keys = ["ELITE", "EXECUTE", "ACTIONABLE", "DEV_WATCH", "FIB_PULLBACK", "ACTIVE_PLANS"]
 
     if show_skip:
         skip_df = _sc_df("Skip") if has_cv1 else pd.DataFrame()
@@ -2883,6 +2894,20 @@ def render(settings: dict | None = None):
             if sc_key == "ACTIVE_PLANS":
                 _render_active_plans_tab(df_aug, preloaded_plans=_open_plans_preview)
                 continue
+
+            # ── DEV_WATCH: merged tab, sub-filtered between the two
+            #    pre-Actionable tiers. Developing is the stronger of the
+            #    two (closer to qualifying), so it's the default view.
+            if sc_key == "DEV_WATCH":
+                _sub = st.radio(
+                    "Sub-filter",
+                    options=[f"⚙️ Developing ({len(developing_df)})", f"👁 Watch ({len(watch_df)})"],
+                    index=0, horizontal=True, key="dev_watch_subfilter", label_visibility="collapsed",
+                )
+                if _sub.startswith("⚙️"):
+                    df_subset, sc_key = developing_df, "DEVELOPING"
+                else:
+                    df_subset, sc_key = watch_df, "WATCH"
 
             sc_color, sc_label = _SC_STYLE.get(sc_key, ("#484f58", sc_key))
 
