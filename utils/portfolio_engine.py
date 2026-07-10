@@ -729,14 +729,23 @@ def compute_exit_score(
 
 
 def suggest_add(current_category: Optional[str], unrealized_pct: float,
-                 exit_result: ExitScoreResult) -> bool:
+                 exit_result: ExitScoreResult,
+                 lm_score: Optional[float] = None,
+                 t1_hit: bool = False) -> bool:
     """
     ADD is deliberately NOT part of the exit-score composite (see module
     docstring). A position is flagged as an ADD candidate only when ALL of:
       - it is currently profitable,
       - the exit engine sees no structural break and a low exit score,
       - the scanner still classifies it as a fresh, strong entry today
-        (Elite Opportunity / High Conviction / Actionable).
+        (Elite Opportunity / High Conviction / Actionable),
+      - it hasn't already run past its own first adaptive target (T1) —
+        once T1 is hit the position is extended relative to its own plan
+        and shouldn't be flagged as a fresh add regardless of category/exit
+        score,
+      - and, when a live scan score is available, the scanner still rates
+        it as a live opportunity today (score >= 60) rather than a stale
+        snapshot that's since moved past its window.
     """
     strong_categories = {"Elite Opportunity", "High Conviction", "Actionable"}
     return (
@@ -744,4 +753,6 @@ def suggest_add(current_category: Optional[str], unrealized_pct: float,
         and not exit_result.structure_break
         and exit_result.exit_score < 35
         and (current_category in strong_categories)
+        and not t1_hit
+        and (lm_score is None or lm_score >= 60)
     )
