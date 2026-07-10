@@ -85,6 +85,20 @@ _TREND_BADGE = {
 }
 
 
+def _md(html: str):
+    """Render a multi-line HTML block via st.markdown safely.
+
+    CommonMark treats 4+ leading spaces as a code block, and a blank line
+    inside a raw-HTML block ends "HTML mode" early — both turn into literal
+    '<tr>...' text showing up on screen instead of a rendered table. Multi-
+    line, indented f-strings (like the table/card blocks below) trip both
+    rules, so every line is stripped and blank lines are dropped before
+    handing the string to st.markdown.
+    """
+    compact = "\n".join(line.strip() for line in html.strip().split("\n") if line.strip())
+    st.markdown(compact, unsafe_allow_html=True)
+
+
 def _inject_css():
     st.markdown("""
     <style>
@@ -432,7 +446,7 @@ def _render_summary_cards(rows: list[dict]):
       </div>
     </div>
     """
-    st.markdown(html, unsafe_allow_html=True)
+    _md(html)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -507,7 +521,7 @@ def _render_positions_table(rows: list[dict]):
       &nbsp;·&nbsp; missing scores (—) mean no saved scan snapshot for that symbol yet — save one from the Lifecycle page.
     </div>
     """
-    st.markdown(html, unsafe_allow_html=True)
+    _md(html)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -558,7 +572,7 @@ def _render_opportunity_cost(rows: list[dict], live_metrics: pd.DataFrame):
       preferring the same Decision-Engine category where available.
     </div>
     """
-    st.markdown(html, unsafe_allow_html=True)
+    _md(html)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -618,7 +632,7 @@ def _render_detail_card(r: dict, cfg: ExitScoreConfig):
       {_lifecycle_progress_html(pos.get('_stage_raw'))}
     </div>
     """
-    st.markdown(header, unsafe_allow_html=True)
+    _md(header)
 
     col_l, col_r = st.columns([1.15, 1])
 
@@ -718,7 +732,7 @@ def render():
     is_market_hours = now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) <= (15, 30)
     market_txt = "Market Open" if is_market_hours else "Market Closed"
 
-    st.markdown(f"""
+    _md(f"""
     <div class="pcc-header">
       <div>
         <p class="pcc-title">📁 Portfolio Command Center</p>
@@ -727,7 +741,7 @@ def render():
       </div>
       <div class="pcc-live"><span class="pcc-dot"></span>Live · {market_txt}</div>
     </div>
-    """, unsafe_allow_html=True)
+    """)
 
     if not _is_available():
         st.warning("Supabase is not configured — Portfolio Manager needs persistence to track positions. "
