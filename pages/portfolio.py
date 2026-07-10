@@ -680,20 +680,39 @@ def _render_detail_card(r: dict, cfg: ExitScoreConfig):
         m4.metric("R:R", f"{r['rr']:.2f}" if r['rr'] is not None else "—")
         st.markdown(_trend_badge_html(result.trend_health, result.trend_health_detail), unsafe_allow_html=True)
 
-        st.markdown("**Why am I still holding this?**")
         if result.thesis_intact:
-            st.success("✅ Investment thesis intact — no reason to exit on the checks below.")
+            banner_bg, banner_color, banner_icon = "#00ff8814", "#00ff88", "✅"
+            banner_text = "Investment thesis intact — no reason to exit on the checks below."
         else:
-            st.error(f"⚠️ Investment thesis broken — recommendation: **{result.action}**")
-        for label, ok, detail in result.thesis_checks:
+            banner_bg, banner_color, banner_icon = "#ff4d6d14", "#ff4d6d", "⚠️"
+            banner_text = f"Investment thesis broken — recommendation: {result.action}"
+
+        check_rows = []
+        checks = list(result.thesis_checks)
+        for i, (label, ok, detail) in enumerate(checks):
             icon = "✓" if ok else "✗"
             color = "#00ff88" if ok else "#ff4d6d"
-            st.markdown(
-                f"<span style='color:{color};font-weight:700'>{icon}</span> "
-                f"<span style='color:#e2e8f0'>{label}</span> "
-                f"<span style='color:#64748b;font-size:0.8rem'>— {detail}</span>",
-                unsafe_allow_html=True,
-            )
+            border = "border-bottom:1px solid #161d2e;" if i < len(checks) - 1 else ""
+            check_rows.append(f"""
+            <div style="display:flex;align-items:baseline;gap:0.55rem;padding:0.4rem 0;{border}">
+              <span style="color:{color};font-weight:700;width:12px;flex-shrink:0;">{icon}</span>
+              <span style="color:#e2e8f0;font-size:0.83rem;">{label}</span>
+              <span style="color:#54607a;font-size:0.74rem;">— {detail}</span>
+            </div>
+            """)
+
+        _md(f"""
+        <div style="background:#0d1420;border:1px solid #1e293b;border-radius:10px;padding:0.9rem 1.1rem;margin:0.4rem 0 0.9rem;">
+          <div style="font-size:0.7rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.07em;margin-bottom:0.7rem;">
+            Why am I still holding this?</div>
+          <div style="display:flex;align-items:center;gap:0.55rem;padding:0.55rem 0.8rem;border-radius:8px;
+               background:{banner_bg};border:1px solid {banner_color}33;margin-bottom:0.5rem;">
+            <span>{banner_icon}</span>
+            <span style="color:{banner_color};font-weight:600;font-size:0.83rem;">{banner_text}</span>
+          </div>
+          {''.join(check_rows)}
+        </div>
+        """)
 
     st.markdown(f"**Action Engine** &nbsp;{_action_badge(r['display_action'])}", unsafe_allow_html=True)
     act_c1, act_c2, act_c3 = st.columns(3)
