@@ -576,26 +576,32 @@ def _primary_blocker(r, result: dict) -> str:
         ext = int(result.get("Extension", result.get("Legacy_EntryQuality", result.get("DE_EntryQuality", 0))) or 0)
         return f"Extended ({ext}) — wait for pullback to EMA/Fib"
 
-    # Pull scores — use CV1 (v3: 20/50/30 composite, live since 2026-07) for
-    # Leadership; fall back to Legacy_* (diagnostic-only, no longer DE
-    # production logic) when CV1 is absent, then to the old "DE_*" key name
-    # for rows/cache written before the rename.
+    # Pull scores — use CV1 (v3: equal-weight 1/3/1/3/1/3 composite, live
+    # since 2026-07) for Leadership; fall back to Legacy_* (diagnostic-only,
+    # no longer DE production logic) when CV1 is absent, then to the old
+    # "DE_*" key name for rows/cache written before the rename.
     ls  = float(result.get("CV1_Leadership",  result.get("Legacy_Leadership",   result.get("DE_Leadership",   0))) or 0)
     cv  = float(result.get("CV1_Conviction",   result.get("Legacy_Conviction",   result.get("DE_Conviction",   0))) or 0)
     eq  = float(result.get("CV1_EntryQuality", result.get("Legacy_EntryQuality", result.get("DE_EntryQuality", 0))) or 0)
     ext = float(result.get("Extension",       0) or 0)
-    # v3 composite (20/50/30) — prefer the value CV3 already computed;
-    # recompute only as a fallback for rows/cache predating CV1_Composite.
+    # v3 composite (equal-weight 1/3 each) — prefer the value CV3 already
+    # computed; recompute only as a fallback for rows/cache predating
+    # CV1_Composite.
     composite = float(result.get("CV1_Composite", 0) or 0)
     if not composite:
-        composite = (ls * 0.20) + (cv * 0.50) + (eq * 0.30)
+        composite = (ls + cv + eq) / 3
+
+    from utils.conviction_score_v1 import V3_THRESHOLD_DEFAULTS as _T
+    _ls_floor   = _T["v3_actionable_leadership_min"]
+    _cv_floor   = _T["v3_actionable_conviction_min"]
+    _comp_floor = _T["v3_actionable_composite_min"]
 
     # Priority 1: Leadership gate — aligned with classify_tier_v3()'s
-    # Actionable floor (leadership >= 40), NOT v1's 65/55 floors. v3 has
-    # been the live gate since 2026-07; this blocker message must match
-    # whatever tier logic actually decided the Category, or the "why not
-    # Actionable" text lies about the real reason.
-    if ls < 40:
+    # Actionable floor. v3 has been the live gate since 2026-07; this
+    # blocker message must match whatever tier logic actually decided
+    # the Category, or the "why not Actionable" text lies about the
+    # real reason.
+    if ls < _ls_floor:
         ls_rs   = int(result.get("_ds_ls_rs",   result.get("_de_ls_rs",   0)) or 0)
         ls_trend= int(result.get("_ds_ls_trend", result.get("_de_ls_trend",0)) or 0)
         detail = "trend below EMA" if ls_trend < 20 else "RS below market"
@@ -605,10 +611,9 @@ def _primary_blocker(r, result: dict) -> str:
     if ext >= 60:
         return f"Extended ({int(ext)}) — wait for pullback"
 
-    # Priority 3: Conviction gate — v3's Actionable floor is conviction >= 55
-    # (v1 used 50; v3 leans harder on Conviction since it carries 50% of
-    # the composite weight).
-    if cv < 55:
+    # Priority 3: Conviction gate — v3's Actionable floor (equal-weight
+    # composite, backtest-fit 2026-07).
+    if cv < _cv_floor:
         # Prefer CV1's cv_fib_zone which accounts for both pullback AND
         # continuation paths (stock above Fib 61.8% / above pivot high).
         # Fall back to DE cv_fib (now also updated with continuation path).
@@ -623,12 +628,12 @@ def _primary_blocker(r, result: dict) -> str:
         return f"Low Conviction ({int(cv)}) — {sub}"
 
     # Priority 4: v3 has no standalone Entry Quality floor — EQ only
-    # enters the decision via its 30% composite weight. So once Leadership
-    # and Conviction clear their floors, the remaining blocker (if any) is
-    # the composite itself falling short of v3's Actionable bar (>= 65),
-    # which in practice is almost always an Entry Quality drag since LS/CV
-    # already passed their own floors above.
-    if composite < 65:
+    # enters the decision via its equal-weight (1/3) composite share. So
+    # once Leadership and Conviction clear their floors, the remaining
+    # blocker (if any) is the composite itself falling short of v3's
+    # Actionable bar, which in practice is almost always an Entry Quality
+    # drag since LS/CV already passed their own floors above.
+    if composite < _comp_floor:
         eq_ema = int(result.get("_ds_eq_ema20_dist", result.get("_cv1_eq_ema20", 0)) or 0)
         eq_piv = int(result.get("_ds_eq_pivot_dist", result.get("_cv1_eq_piv",  0)) or 0)
         if eq_ema < 10:
@@ -637,7 +642,7 @@ def _primary_blocker(r, result: dict) -> str:
             sub = "too far above pivot"
         else:
             sub = f"EQ score {int(eq)}"
-        return f"Composite {int(composite)} (need 65) — Low Entry Quality ({int(eq)}) — {sub}"
+        return f"Composite {int(composite)} (need {_comp_floor}) — Low Entry Quality ({int(eq)}) — {sub}"
 
     # Priority 5: CCI momentum not confirmed
     try:
@@ -648,11 +653,11 @@ def _primary_blocker(r, result: dict) -> str:
         pass
 
     # Leader / Setup Building with everything borderline — all v3 floors
-    # (LS>=40, CV>=55, composite>=65) already passed above, so this is a
-    # genuine "everything is borderline-adequate" state, not a specific gate.
+    # (LS/CV/composite Actionable floors) already passed above, so this is
+    # a genuine "everything is borderline-adequate" state, not a specific gate.
     if category == "Leader":
-        return f"Leader — DE conviction {int(cv)} (need 55) · await base"
-    return f"Setup Building — composite {int(composite)} (need 65)"
+        return f"Leader — DE conviction {int(cv)} (need {_cv_floor}) · await base"
+    return f"Setup Building — composite {int(composite)} (need {_comp_floor})"
 
 
 def score_stock(
@@ -942,7 +947,8 @@ def score_stock(
 
     # ── RECOMMENDATION FUNNEL (CV1 quality → Execute/Elite) ──
     # CV1 is the single source of truth for quality. classify_tier_v3()
-    # (20/50/30 composite, relaxed floors — LIVE as of 2026-07, replaces
+    # (equal-weight 1/3 each composite, decile-backtest calibrated 2026-07,
+    # replaces
     # v1's classify_tier) maps its three scores to the base funnel:
     #     Skip → Watch → Developing → Actionable
     # An Actionable setup reaches Execute/Elite by its OWN natural V3
@@ -996,7 +1002,7 @@ def score_stock(
 
         # ── NATURAL V3 SCORE → EXECUTE/ELITE (not gated by Promo Score) ──
         # cv1.signal_class (_classify_v3) independently qualifies EXECUTE/
-        # ELITE straight off the 20/50/30 composite + its own floors — it
+        # ELITE straight off the equal-weight composite + its own floors — it
         # was being computed into CV1_SignalClass but never consulted here,
         # so a naturally-qualifying setup sat capped at Actionable (or even
         # Developing — see below) unless Promotion Engine's *timing*
