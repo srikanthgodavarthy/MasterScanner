@@ -2865,14 +2865,13 @@ def render(settings: dict | None = None):
 
     tab_labels = [
         f"🌟 Elite ({len(elite_df)})",
-        f"🚀 Execute ({len(execute_df)})",
-        f"🔷 Actionable ({len(actionable_df)})",
+        f"🚀 Execute/Actionable ({len(execute_df) + len(actionable_df)})",
         f"🧭 Developing/Watch ({len(developing_df) + len(watch_df)})",
         f"📐 Fib Pullback ({len(fib_pb_records)})",
         f"📋 Active Plans ({len(_open_plans_preview)})",
     ]
-    df_sets  = [elite_df, execute_df, actionable_df, pd.DataFrame(), fib_pb_df, pd.DataFrame()]
-    set_keys = ["ELITE", "EXECUTE", "ACTIONABLE", "DEV_WATCH", "FIB_PULLBACK", "ACTIVE_PLANS"]
+    df_sets  = [elite_df, pd.DataFrame(), pd.DataFrame(), fib_pb_df, pd.DataFrame()]
+    set_keys = ["ELITE", "EXEC_ACTIONABLE", "DEV_WATCH", "FIB_PULLBACK", "ACTIVE_PLANS"]
 
     if show_skip:
         skip_df = _sc_df("Skip") if has_cv1 else pd.DataFrame()
@@ -2894,6 +2893,21 @@ def render(settings: dict | None = None):
             if sc_key == "ACTIVE_PLANS":
                 _render_active_plans_tab(df_aug, preloaded_plans=_open_plans_preview)
                 continue
+
+            # ── EXEC_ACTIONABLE: merged tab, sub-filtered between Execute
+            #    (timing-confirmed, higher urgency) and Actionable (quality
+            #    qualified, plan created, awaiting trigger). Execute is the
+            #    more time-sensitive of the two, so it's the default view.
+            if sc_key == "EXEC_ACTIONABLE":
+                _sub2 = st.radio(
+                    "Sub-filter",
+                    options=[f"🚀 Execute ({len(execute_df)})", f"🔷 Actionable ({len(actionable_df)})"],
+                    index=0, horizontal=True, key="exec_actionable_subfilter", label_visibility="collapsed",
+                )
+                if _sub2.startswith("🚀"):
+                    df_subset, sc_key = execute_df, "EXECUTE"
+                else:
+                    df_subset, sc_key = actionable_df, "ACTIONABLE"
 
             # ── DEV_WATCH: merged tab, sub-filtered between the two
             #    pre-Actionable tiers. Developing is the stronger of the
