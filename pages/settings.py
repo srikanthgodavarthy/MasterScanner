@@ -83,23 +83,27 @@ DEFAULTS = {
     # initial Signal Source; still overridable per-run on that page) ──
     "bt_default_engine":         "scanner",
     # ── CV1 v3 tier / signal thresholds (see utils/conviction_score_v1.py
-    # V3_THRESHOLD_DEFAULTS — PLACEHOLDER THRESHOLDS, not yet re-validated
-    # against a real v3 score distribution; exposed here so they can be
-    # tuned without a code change while that validation is pending) ──
-    "v3_watch_leadership_min":      30,
-    "v3_watch_composite_min":       35,
-    "v3_developing_composite_min":  50,
-    "v3_actionable_leadership_min": 40,
-    "v3_actionable_conviction_min": 55,
-    "v3_actionable_composite_min":  65,
-    "v3_execute_leadership_min":    40,
-    "v3_execute_conviction_min":    55,
-    "v3_execute_entry_quality_min": 55,
+    # V3_THRESHOLD_DEFAULTS — decile-backtest calibrated, 2026-07. This
+    # dict is the UI-side mirror of that module's defaults; keep them in
+    # sync manually whenever conviction_score_v1.py's defaults change,
+    # since this dict's values win whenever a key is present (which is
+    # always, for keys not yet touched by the user — see _g()/_s() below).
+    "v3_watch_leadership_min":      50,
+    "v3_watch_conviction_min":      50,
+    "v3_watch_entry_quality_min":   50,
+    "v3_watch_composite_min":       50,
+    "v3_developing_composite_min":  55,
+    "v3_actionable_leadership_min": 60,
+    "v3_actionable_conviction_min": 70,
+    "v3_actionable_composite_min":  60,
+    "v3_execute_leadership_min":    60,
+    "v3_execute_conviction_min":    70,
+    "v3_execute_entry_quality_min": 50,
     "v3_execute_composite_min":     60,
-    "v3_elite_leadership_min":      55,
-    "v3_elite_conviction_min":      75,
-    "v3_elite_entry_quality_min":   70,
-    "v3_elite_composite_min":       72,
+    "v3_elite_leadership_min":      70,
+    "v3_elite_conviction_min":      70,
+    "v3_elite_entry_quality_min":   60,
+    "v3_elite_composite_min":       66,
     # ── Promotion Engine (utils/promotion_engine.py) — Promo Score and
     # R:R thresholds are all plain overrides, freely adjustable either
     # direction (see evaluate_promotion docstring) ──
@@ -725,19 +729,24 @@ def _tab_advanced() -> None:
                     step=5, key="sl_v3_elite_eq", label_visibility="collapsed")
                 _s("v3_elite_entry_quality_min", int(v))
 
-            st.markdown("**Watch / Developing floors** (base funnel)")
-            c1, c2, c3 = st.columns(3)
+            st.markdown("**Watch floors** (base funnel — strict AND across all three, per decile backtest)")
+            c1, c2, c3, c4 = st.columns(4)
             with c1:
                 _label("Watch: Leadership ≥")
                 v = st.slider("Watch Leadership", 0, 100, int(_g("v3_watch_leadership_min")),
                     step=5, key="sl_v3_watch_ls", label_visibility="collapsed")
                 _s("v3_watch_leadership_min", int(v))
             with c2:
-                _label("Watch: Composite ≥")
-                v = st.slider("Watch Composite", 0, 100, int(_g("v3_watch_composite_min")),
-                    step=5, key="sl_v3_watch_comp", label_visibility="collapsed")
-                _s("v3_watch_composite_min", int(v))
+                _label("Watch: Conviction ≥")
+                v = st.slider("Watch Conviction", 0, 100, int(_g("v3_watch_conviction_min")),
+                    step=5, key="sl_v3_watch_cv", label_visibility="collapsed")
+                _s("v3_watch_conviction_min", int(v))
             with c3:
+                _label("Watch: Entry Quality ≥")
+                v = st.slider("Watch Entry Quality", 0, 100, int(_g("v3_watch_entry_quality_min")),
+                    step=5, key="sl_v3_watch_eq", label_visibility="collapsed")
+                _s("v3_watch_entry_quality_min", int(v))
+            with c4:
                 _label("Developing: Composite ≥")
                 v = st.slider("Developing Composite", 0, 100, int(_g("v3_developing_composite_min")),
                     step=5, key="sl_v3_dev_comp", label_visibility="collapsed")
@@ -1035,6 +1044,8 @@ def render() -> dict:
         "bt_default_engine":         ss.get("bt_default_engine",         DEFAULTS["bt_default_engine"]),
         # ── CV1 v3 tier / signal thresholds ──────────────────────
         "v3_watch_leadership_min":      ss.get("v3_watch_leadership_min",      DEFAULTS["v3_watch_leadership_min"]),
+        "v3_watch_conviction_min":      ss.get("v3_watch_conviction_min",      DEFAULTS["v3_watch_conviction_min"]),
+        "v3_watch_entry_quality_min":   ss.get("v3_watch_entry_quality_min",   DEFAULTS["v3_watch_entry_quality_min"]),
         "v3_watch_composite_min":       ss.get("v3_watch_composite_min",       DEFAULTS["v3_watch_composite_min"]),
         "v3_developing_composite_min":  ss.get("v3_developing_composite_min",  DEFAULTS["v3_developing_composite_min"]),
         "v3_actionable_leadership_min": ss.get("v3_actionable_leadership_min", DEFAULTS["v3_actionable_leadership_min"]),
