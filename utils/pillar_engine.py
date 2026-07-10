@@ -480,13 +480,18 @@ def _score_reversal(close: pd.Series, low: pd.Series, high: pd.Series,
                      ph_series: pd.Series | None, pl_series: pd.Series | None,
                      osc: pd.Series | None,
                      atr_s: pd.Series | None = None,
-                     vol_avg: pd.Series | None = None) -> tuple[int, dict]:
+                     vol_avg: pd.Series | None = None,
+                     precomputed_labels: pd.DataFrame | None = None) -> tuple[int, dict]:
     """
     Thin wrapper around the shared utils.ll_opportunity.score_ll_opportunity()
     (architecture cleanup — the detection/grading logic itself now lives
     there, single-owner, reused by utils/scoring_core.py too). This wrapper
     only maps that shared signal onto pillar_engine's existing r_* field
     names / PTS_REVERSAL budget so PillarResult's public shape is unchanged.
+
+    precomputed_labels: see ll_opportunity.find_active_ll — pass-through
+    for callers (the Five Pillars backtest) that already computed swing
+    labels once per symbol instead of letting this recompute them per bar.
     """
     sig = _shared_score_ll_opportunity(
         close=close, low=low, volume=volume,
@@ -494,6 +499,7 @@ def _score_reversal(close: pd.Series, low: pd.Series, high: pd.Series,
         atr_s=atr_s, vol_avg=vol_avg,
         max_bars_to_reclaim=LL_MAX_BARS_TO_RECLAIM,
         max_bonus=PTS_REVERSAL,
+        precomputed_labels=precomputed_labels,
     )
 
     return sig.bonus_pts, {
@@ -1038,7 +1044,8 @@ def compute_pillars_from_ia(df: pd.DataFrame, ia, cfg: dict | None = None) -> Pi
         s_score, s_sub = _score_structure(close, ia.e20, ia.e50, ia.e200, ph_series, pl_series)
         a_score, a_sub = _score_acceptance(close, high, low, volume)
         r_score, r_sub = _score_reversal(close, low, high, open_, volume,
-                                          ph_series, pl_series, osc, ia.atr_s, vol_avg)
+                                          ph_series, pl_series, osc, ia.atr_s, vol_avg,
+                                          precomputed_labels=getattr(ia, "swing_labels", None))
         l_score, l_sub = _score_leadership(close, ia.nifty_aligned)
         m_score, m_sub = _score_momentum(high, low, close, ia.rsi_s, volume, ia.atr_s, vol_avg,
                                           e20=ia.e20, e50=ia.e50, cfg=cfg)

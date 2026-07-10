@@ -81,7 +81,8 @@ class LLOpportunitySignal:
 def find_active_ll(ph_series: pd.Series, pl_series: pd.Series,
                     close: pd.Series, low: pd.Series, volume: pd.Series,
                     vol_avg: pd.Series | None,
-                    max_bars_to_reclaim: int = LL_MAX_BARS_TO_RECLAIM) -> dict | None:
+                    max_bars_to_reclaim: int = LL_MAX_BARS_TO_RECLAIM,
+                    precomputed_labels: pd.DataFrame | None = None) -> dict | None:
     """
     Locates the most recent Lower-Low pivot that is still "active" — either
     it's the latest confirmed pivot low, or the very next pivot low after it
@@ -91,9 +92,18 @@ def find_active_ll(ph_series: pd.Series, pl_series: pd.Series,
 
     Scored from the CONFIRMATION point, not the theoretical turning point —
     institutions buy after the low is confirmed, not at the exact print.
+
+    precomputed_labels (optional): the output of compute_swing_labels(),
+    already computed and correctly truncated by the caller (no bars beyond
+    what should be "known" at this point). Callers that walk many bars over
+    the same symbol's history (e.g. a backtest) should compute this once
+    per symbol and slice it per bar instead of paying compute_swing_labels'
+    full O(n) walk on every single call — that recomputation is what made
+    the Five Pillars backtest path O(bars²) per symbol. Live single-bar
+    callers (the Scanner) can omit this and keep the old behaviour.
     """
     try:
-        labels = compute_swing_labels(ph_series, pl_series)
+        labels = precomputed_labels if precomputed_labels is not None else compute_swing_labels(ph_series, pl_series)
     except Exception:
         return None
     lows = labels[labels["pivot_type"] == "L"]
@@ -146,6 +156,7 @@ def score_ll_opportunity(
     vol_avg: pd.Series | None = None,
     max_bars_to_reclaim: int = LL_MAX_BARS_TO_RECLAIM,
     max_bonus: int = LL_DEFAULT_MAX_BONUS,
+    precomputed_labels: pd.DataFrame | None = None,
 ) -> LLOpportunitySignal:
     """
     Grade the quality of the current "LL spring" opportunity, on a
@@ -167,7 +178,8 @@ def score_ll_opportunity(
     if ph_series is None or pl_series is None or len(ph_series) == 0:
         return sig
 
-    info = find_active_ll(ph_series, pl_series, close, low, volume, vol_avg, max_bars_to_reclaim)
+    info = find_active_ll(ph_series, pl_series, close, low, volume, vol_avg, max_bars_to_reclaim,
+                           precomputed_labels=precomputed_labels)
     if info is None:
         return sig
 

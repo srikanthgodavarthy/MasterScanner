@@ -632,14 +632,71 @@ def generate_signals_five_pillars(
     via getattr() with defaults against attribute names that no longer
     existed on PillarResult -- every VWAP Reclaim diagnostic column was
     silently populated with its default rather than a real value).
+
+    PERF FIX (2026-07): this used to call pillar_engine.compute_pillars()
+    fresh on a re-sliced 200-bar window for EVERY bar, which recomputes
+    EMA20/50/200, RSI14, ATR14, the pivot series, and the volume average
+    from scratch ~len(df) times per symbol -- O(n * window) pandas work
+    per symbol. That's the actual cause of multi-symbol backtests
+    stalling after the Five Pillars / Promotion Engine work landed (the
+    "scanner" mode never had this problem because build_indicators()
+    already computes everything once via IndicatorArrays). Indicators
+    are now built ONCE per symbol here too, and each bar just slices
+    into the precomputed series -- O(1) amortized per bar instead of
+    O(window).
+
+    The one indicator that genuinely depends on window position is the
+    pivot series: build_pivot_series() uses a *centered* rolling window
+    (looks `lb` bars forward), so a pivot at bar j is only confirmable
+    once bar j+lb exists. The old per-bar-window version naturally left
+    the most recent `lb` bars of every window unconfirmed (NaN) for
+    exactly this reason -- if we don't replicate that when slicing a
+    globally-precomputed pivot series, "future" pivot confirmations leak
+    into bar i's score (look-ahead bias). So the last `lb` bars of every
+    slice are explicitly blanked out below, same as the old behaviour.
     """
-    from utils.pillar_engine import compute_pillars
-    from utils.scanner_engine import atr as _atr_fn
+    from utils.pillar_engine import compute_pillars_from_ia
+    from utils.scanner_engine import ema, rsi, atr, _strip_tz
+    from utils.pivot_engine import build_pivot_series
+    from utils.swing_structure import compute_swing_labels
 
     if df.empty or len(df) < 60:
         return pd.DataFrame()
 
-    atr_s = _atr_fn(df["high"], df["low"], df["close"], 14)
+    close, high, low, volume = df["close"], df["high"], df["low"], df["volume"]
+    open_ = df["open"] if "open" in df.columns else close
+
+    _PIVOT_LB = 20   # matches pillar_engine.compute_pillars()'s build_pivot_series(lb=20)
+
+    # ── Build every indicator ONCE for the full symbol history ─────────
+    e20   = ema(close, 20)
+    e50   = ema(close, 50)
+    e200  = ema(close, 200)
+    rsi_s = rsi(close, 14)
+    atr_s = atr(high, low, close, 14)
+    ph_full, pl_full = build_pivot_series(high, low, lb=_PIVOT_LB)
+    vol_avg = volume.rolling(20, min_periods=1).mean()
+
+    # compute_swing_labels() is a single chronological O(n) walk over the
+    # full pivot series -- it does NOT need to be re-walked from scratch
+    # per bar. find_active_ll() (called deep inside the Reversal/LL pillar,
+    # which directly feeds the Promotion Engine's "ll_opportunity" gate)
+    # used to do exactly that: recompute the full label history on every
+    # bar's re-sliced window, which is the second O(bars²) hotspot in this
+    # path (profiled at ~22% of total time, on top of the indicator-
+    # recompute fix above). Walking it once here and truncating per bar
+    # below (via precomputed_labels) is exactly equivalent -- the walk is
+    # causal, so a label at position j only ever depends on pivots at or
+    # before j, never on anything later.
+    swing_labels_full = compute_swing_labels(ph_full, pl_full)
+
+    c_idx = _strip_tz(close.index)
+    nf = nifty.copy()
+    nf.index = _strip_tz(nf.index)
+    nifty_aligned = nf.reindex(c_idx, method="ffill")
+
+    class _IA:
+        pass
 
     # Compute FP score + pillar result on a rolling 200-bar window.
     fp_scores: list[float] = []
@@ -649,9 +706,38 @@ def generate_signals_five_pillars(
             fp_scores.append(float("nan"))
             fp_results.append(None)
             continue
-        window = df.iloc[max(0, i - 199): i + 1]
+
+        lo = max(0, i - 199)
+
+        # Blank out the last _PIVOT_LB bars of the pivot slice so a pivot
+        # can't be "confirmed" before it would have been in the original
+        # windowed computation (see PERF FIX note above).
+        _ph_slice = ph_full.iloc[lo:i + 1].copy()
+        _pl_slice = pl_full.iloc[lo:i + 1].copy()
+        _mask_n = min(_PIVOT_LB, len(_ph_slice))
+        if _mask_n > 0:
+            _ph_slice.iloc[-_mask_n:] = float("nan")
+            _pl_slice.iloc[-_mask_n:] = float("nan")
+
+        # Same confirmation cutoff as the pivot masking above, applied to
+        # the label walk: truncate (not mask-to-NaN) so find_active_ll
+        # never sees a pivot/label beyond what bar i would actually know.
+        _labels_slice = swing_labels_full.iloc[lo: i + 1 - _mask_n]
+
+        ia = _IA()
+        ia.c, ia.h, ia.l, ia.v, ia.o = (
+            close.iloc[lo:i + 1], high.iloc[lo:i + 1], low.iloc[lo:i + 1],
+            volume.iloc[lo:i + 1], open_.iloc[lo:i + 1],
+        )
+        ia.e20, ia.e50, ia.e200 = e20.iloc[lo:i + 1], e50.iloc[lo:i + 1], e200.iloc[lo:i + 1]
+        ia.rsi_s, ia.atr_s = rsi_s.iloc[lo:i + 1], atr_s.iloc[lo:i + 1]
+        ia.nifty_aligned = nifty_aligned.iloc[lo:i + 1]
+        ia.ph_series, ia.pl_series = _ph_slice, _pl_slice
+        ia.vol_avg = vol_avg.iloc[lo:i + 1]
+        ia.swing_labels = _labels_slice
+
         try:
-            r = compute_pillars(window, nifty, cfg=cfg)
+            r = compute_pillars_from_ia(df.iloc[lo:i + 1], ia, cfg=cfg)
             fp_scores.append(float(r.final_score) if not r.error else float("nan"))
             fp_results.append(r)
         except Exception:
