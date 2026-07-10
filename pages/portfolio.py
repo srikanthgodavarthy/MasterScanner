@@ -130,6 +130,21 @@ def _inject_css():
     .pcc-sym { font-weight:700; color:#f1f5f9; }
     .pcc-sub { color:#64748b; font-size:0.7rem; }
     .pcc-score { font-weight:700; }
+
+    .pcc-section-label { font-size:0.68rem; font-weight:700; color:#64748b; text-transform:uppercase;
+        letter-spacing:0.08em; margin:0.9rem 0 0.45rem; }
+    .pcc-mini-box { background:#0d1420; border:1px solid #1e293b; border-radius:10px;
+        padding:0.7rem 0.9rem; display:flex; gap:0; }
+    .pcc-mini-item { flex:1; text-align:center; padding:0 0.3rem; }
+    .pcc-mini-item + .pcc-mini-item { border-left:1px solid #1a2436; }
+    .pcc-mini-label { font-size:0.62rem; color:#64748b; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:0.25rem; }
+    .pcc-mini-value { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1.05rem; }
+
+    .pcc-stat-strip { display:grid; grid-template-columns:repeat(4,1fr); gap:0.7rem; margin:0.4rem 0 0.8rem; }
+    .pcc-stat-box { background:#0d1420; border:1px solid #1e293b; border-radius:10px; padding:0.75rem 0.9rem; }
+    .pcc-stat-label { font-size:0.65rem; color:#64748b; text-transform:uppercase; letter-spacing:0.06em; }
+    .pcc-stat-value { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1.35rem; margin-top:0.15rem; }
+    .pcc-stat-sub { font-size:0.72rem; font-weight:600; margin-top:0.1rem; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -166,6 +181,35 @@ def _score_cell(v):
     if v is None:
         return "<span style='color:#3a4658;'>—</span>"
     return f"<span class='pcc-score' style='color:{_score_color(v)};'>{v:.0f}</span>"
+
+
+def _exit_score_sub(v: float) -> tuple[str, str]:
+    if v is None: return "—", "#3a4658"
+    if v < 30: return "Low", "#00ff88"
+    if v < 60: return "Moderate", "#f59e0b"
+    return "High", "#ff4d6d"
+
+
+def _rmult_sub(v):
+    if v is None: return "—", "#3a4658"
+    if v > 0.05: return "Profit", "#00ff88"
+    if v < -0.05: return "Loss", "#ff4d6d"
+    return "Breakeven", "#8b98ac"
+
+
+def _risk_sub(v):
+    if v is None: return "—", "#3a4658"
+    if v < 5: return "Tight", "#00ff88"
+    if v < 10: return "Moderate", "#f59e0b"
+    return "Wide", "#ff4d6d"
+
+
+def _rr_sub(v):
+    if v is None: return "—", "#3a4658"
+    if v < 1: return "Poor", "#ff4d6d"
+    if v < 2: return "Fair", "#f59e0b"
+    if v < 3: return "Good", "#60a5fa"
+    return "Great", "#00ff88"
 
 
 def _trend_badge_html(trend_health: str, detail: str) -> str:
@@ -637,47 +681,70 @@ def _render_detail_card(r: dict, cfg: ExitScoreConfig):
     col_l, col_r = st.columns([1.15, 1])
 
     with col_l:
-        st.markdown("**Key Scores**")
-        sc1, sc2, sc3, sc4, sc5 = st.columns(5)
-        for col, label, val in zip((sc1, sc2, sc3, sc4, sc5),
-                                    ("LS", "CV", "EQ", "RS", "TS"),
-                                    (r["ls"], r["cv"], r["eq"], r["rs"], r["ts"])):
+        _md('<div class="pcc-section-label">Key Scores</div>')
+        items = []
+        for label, val in zip(("LS", "CV", "EQ", "RS", "TS"),
+                               (r["ls"], r["cv"], r["eq"], r["rs"], r["ts"])):
             val_txt = f"{val:.0f}" if val is not None else "—"
             val_color = _score_color(val) if val is not None else "#3a4658"
-            col.markdown(
-                f"<div style='text-align:center;'><div style='font-size:0.62rem;color:#64748b;'>{label}</div>"
-                f"<div style='font-weight:700;font-size:1.05rem;color:{val_color};'>{val_txt}</div></div>",
-                unsafe_allow_html=True,
-            )
+            items.append(f"""
+            <div class="pcc-mini-item">
+              <div class="pcc-mini-label">{label}</div>
+              <div class="pcc-mini-value" style="color:{val_color};">{val_txt}</div>
+            </div>
+            """)
+        _md(f'<div class="pcc-mini-box">{"".join(items)}</div>')
 
         if r["targets"]:
             t = r["targets"]
-            st.markdown("**Targets**")
-            tg1, tg2, tg3, tg4 = st.columns(4)
-            tg1.markdown(f"<div style='font-size:0.65rem;color:#64748b;'>T1 ({t.t1_mult:.2g}R)</div><div style='color:#00ff88;font-weight:700;'>₹{t.t1:.2f}</div>", unsafe_allow_html=True)
-            tg2.markdown(f"<div style='font-size:0.65rem;color:#64748b;'>T2 ({t.t2_mult:.2g}R)</div><div style='color:#00ff88;font-weight:700;'>₹{t.t2:.2f}</div>", unsafe_allow_html=True)
-            tg3.markdown(f"<div style='font-size:0.65rem;color:#64748b;'>T3 ({t.t3_mult:.2g}R)</div><div style='color:#00ff88;font-weight:700;'>₹{t.t3:.2f}</div>", unsafe_allow_html=True)
             trail_color = "#00ff88" if r["trail_active"] else "#64748b"
             trail_txt = "Yes" if r["trail_active"] else "No"
-            tg4.markdown(f"<div style='font-size:0.65rem;color:#64748b;'>Trail Active</div><div style='color:{trail_color};font-weight:700;'>{trail_txt}</div>", unsafe_allow_html=True)
+            _md('<div class="pcc-section-label">Targets</div>')
+            _md(f"""
+            <div class="pcc-mini-box">
+              <div class="pcc-mini-item"><div class="pcc-mini-label">T1 ({t.t1_mult:.2g}R)</div>
+                <div class="pcc-mini-value" style="color:#00ff88;">₹{t.t1:.2f}</div></div>
+              <div class="pcc-mini-item"><div class="pcc-mini-label">T2 ({t.t2_mult:.2g}R)</div>
+                <div class="pcc-mini-value" style="color:#00ff88;">₹{t.t2:.2f}</div></div>
+              <div class="pcc-mini-item"><div class="pcc-mini-label">T3 ({t.t3_mult:.2g}R)</div>
+                <div class="pcc-mini-value" style="color:#00ff88;">₹{t.t3:.2f}</div></div>
+              <div class="pcc-mini-item"><div class="pcc-mini-label">Trail Active</div>
+                <div class="pcc-mini-value" style="color:{trail_color};">{trail_txt}</div></div>
+            </div>
+            """)
 
-        st.markdown("**Factor breakdown**")
+        _md('<div class="pcc-section-label">Factor Breakdown</div>')
         for label, value in result.display_factors.items():
             direction = DISPLAY_FACTOR_DIRECTION.get(label, "health")
             st.markdown(_bar(label, value, direction), unsafe_allow_html=True)
 
-        st.markdown("**Top reasons**")
+        _md('<div class="pcc-section-label">Top Reasons</div>')
         for reason in result.top_reasons:
             st.markdown(f"- {reason}")
         if result.structure_break:
             st.error("⚠️ Trend structure break confirmed — escalates straight to EXIT regardless of composite score.")
 
     with col_r:
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Exit Score", f"{result.exit_score:.0f}/100")
-        m2.metric("R-Multiple", f"{result.r_multiple:+.1f}R" if result.r_multiple is not None else "—")
-        m3.metric("Risk %", f"{r['risk_pct']:.1f}%" if r['risk_pct'] is not None else "—")
-        m4.metric("R:R", f"{r['rr']:.2f}" if r['rr'] is not None else "—")
+        es_sub, es_color = _exit_score_sub(result.exit_score)
+        rm_sub, rm_color = _rmult_sub(result.r_multiple)
+        rk_sub, rk_color = _risk_sub(r["risk_pct"])
+        rr_sub, rr_color = _rr_sub(r["rr"])
+        _md(f"""
+        <div class="pcc-stat-strip">
+          <div class="pcc-stat-box"><div class="pcc-stat-label">Exit Score</div>
+            <div class="pcc-stat-value">{result.exit_score:.0f}<span style="font-size:0.85rem;color:#64748b;">/100</span></div>
+            <div class="pcc-stat-sub" style="color:{es_color};">{es_sub}</div></div>
+          <div class="pcc-stat-box"><div class="pcc-stat-label">R-Multiple</div>
+            <div class="pcc-stat-value">{f"{result.r_multiple:+.1f}R" if result.r_multiple is not None else "—"}</div>
+            <div class="pcc-stat-sub" style="color:{rm_color};">{rm_sub}</div></div>
+          <div class="pcc-stat-box"><div class="pcc-stat-label">Risk %</div>
+            <div class="pcc-stat-value">{f"{r['risk_pct']:.1f}%" if r['risk_pct'] is not None else "—"}</div>
+            <div class="pcc-stat-sub" style="color:{rk_color};">{rk_sub}</div></div>
+          <div class="pcc-stat-box"><div class="pcc-stat-label">R:R</div>
+            <div class="pcc-stat-value">{f"{r['rr']:.2f}" if r['rr'] is not None else "—"}</div>
+            <div class="pcc-stat-sub" style="color:{rr_color};">{rr_sub}</div></div>
+        </div>
+        """)
         st.markdown(_trend_badge_html(result.trend_health, result.trend_health_detail), unsafe_allow_html=True)
 
         if result.thesis_intact:
@@ -714,7 +781,7 @@ def _render_detail_card(r: dict, cfg: ExitScoreConfig):
         </div>
         """)
 
-    st.markdown(f"**Action Engine** &nbsp;{_action_badge(r['display_action'])}", unsafe_allow_html=True)
+    _md(f'<div class="pcc-section-label" style="margin-top:1.1rem;">Action Engine &nbsp;{_action_badge(r["display_action"])}</div>')
     act_c1, act_c2, act_c3 = st.columns(3)
     with act_c1:
         reduce_pct = st.slider(f"Reduce % — {symbol}", 10, 90, 50, 10, key=f"reduce_{pos.get('id')}")
