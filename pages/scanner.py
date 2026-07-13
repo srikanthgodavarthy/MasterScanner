@@ -2894,42 +2894,38 @@ def render(settings: dict | None = None):
                 _render_active_plans_tab(df_aug, preloaded_plans=_open_plans_preview)
                 continue
 
-            # ── EXEC_ACTIONABLE: merged tab, sub-filtered between Execute
-            #    (timing-confirmed, higher urgency) and Actionable (quality
-            #    qualified, plan created, awaiting trigger). Execute is the
-            #    more time-sensitive of the two, so it's the default view.
-            if sc_key == "EXEC_ACTIONABLE":
-                _sub2 = st.radio(
-                    "Sub-filter",
-                    options=[f"🚀 Execute ({len(execute_df)})", f"🔷 Actionable ({len(actionable_df)})"],
-                    index=0, horizontal=True, key="exec_actionable_subfilter", label_visibility="collapsed",
-                )
-                if _sub2.startswith("🚀"):
-                    df_subset, sc_key = execute_df, "EXECUTE"
-                else:
-                    df_subset, sc_key = actionable_df, "ACTIONABLE"
+            # ── EXEC_ACTIONABLE: merged tab — Execute (timing-confirmed,
+            #    higher urgency) and Actionable (quality-qualified, plan
+            #    created, awaiting trigger) are shown together in one table,
+            #    Execute rows first. Each row already carries its own
+            #    Recommendation badge (EXECUTE/ACTIONABLE), so no sub-filter
+            #    is needed to tell them apart.
+            _merged_exec_actionable = False
+            _merged_dev_watch = False
 
-            # ── DEV_WATCH: merged tab, sub-filtered between the two
-            #    pre-Actionable tiers. Developing is the stronger of the
-            #    two (closer to qualifying), so it's the default view.
+            if sc_key == "EXEC_ACTIONABLE":
+                df_subset = pd.concat([execute_df, actionable_df], ignore_index=True) if not (execute_df.empty and actionable_df.empty) else pd.DataFrame()
+                sc_key = "EXECUTE"   # column-set + accent color for the merged view
+                _merged_exec_actionable = True
+
+            # ── DEV_WATCH: merged tab — Developing (closer to qualifying)
+            #    and Watch shown together in one table, Developing first.
             if sc_key == "DEV_WATCH":
-                _sub = st.radio(
-                    "Sub-filter",
-                    options=[f"⚙️ Developing ({len(developing_df)})", f"👁 Watch ({len(watch_df)})"],
-                    index=0, horizontal=True, key="dev_watch_subfilter", label_visibility="collapsed",
-                )
-                if _sub.startswith("⚙️"):
-                    df_subset, sc_key = developing_df, "DEVELOPING"
-                else:
-                    df_subset, sc_key = watch_df, "WATCH"
+                df_subset = pd.concat([developing_df, watch_df], ignore_index=True) if not (developing_df.empty and watch_df.empty) else pd.DataFrame()
+                sc_key = "DEVELOPING"   # column-set + accent color for the merged view
+                _merged_dev_watch = True
 
             sc_color, sc_label = _SC_STYLE.get(sc_key, ("#484f58", sc_key))
+            if sc_key == "EXECUTE" and _merged_exec_actionable:
+                sc_label = "EXECUTE / ACTIONABLE"
+            elif sc_key == "DEVELOPING" and _merged_dev_watch:
+                sc_label = "DEVELOPING / WATCH"
 
             if df_subset.empty:
                 if sc_key == "ELITE" and summary.get("regime") != "TREND":
                     st.info(f"Execute gate restricted — market regime is {summary.get('regime', '?')}.")
                 else:
-                    st.info(f"No {sc_key} candidates in this scan.")
+                    st.info(f"No {sc_label} candidates in this scan.")
                 continue
 
             # Section label
