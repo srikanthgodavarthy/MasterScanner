@@ -247,17 +247,23 @@ def save_watchlist(symbols: list[str]) -> bool:
 
 # ─── BACKTEST RESULTS ─────────────────────────────────────────────────────────
 
-def save_backtest_results(trades_df: pd.DataFrame, run_label: str = "") -> bool:
+def save_backtest_results(trades_df: pd.DataFrame, run_label: str = "",
+                           run_ts: str | None = None) -> bool:
     """
-    Persist the full backtest trade log.
+    Persist the full (or partial) backtest trade log.
     trades_df must have columns: symbol, entry_date, exit_date,
     entry_price, exit_price, sl, t1, t2, pnl_r, result
+
+    run_ts: pass a shared timestamp (str, UTC isoformat) when calling this
+    repeatedly for incremental/checkpoint saves of the SAME run, so all
+    rows group under one run_at value instead of each call minting its own.
+    If omitted, a fresh timestamp is generated (single-shot save).
     """
     client = get_client()
     if client is None or trades_df.empty:
         return False
 
-    run_ts = datetime.now(timezone.utc).isoformat()
+    run_ts = run_ts or datetime.now(timezone.utc).isoformat()
 
     def _safe(val):
         if pd.isna(val):
