@@ -7,8 +7,8 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 st.set_page_config(
-    page_title="MasterScanner — Nifty 500",
-    page_icon="📊",
+    page_title="Trinity — Nifty 500",
+    page_icon="🔱",
     layout="wide",
     initial_sidebar_state="collapsed",  # sidebar hidden — all controls are inline
 )
@@ -74,7 +74,7 @@ footer { display:none !important; }
 
 st.markdown("""
 <div class="scanner-header">
-    <p class="scanner-title">⚡ MasterScanner</p>
+    <p class="scanner-title">🔱 Trinity</p>
     <p class="scanner-subtitle"><span class="status-dot"></span>Nifty 500 · Regime Engine v2 · Leadership · Conviction · Entry Quality</p>
 </div>
 """, unsafe_allow_html=True)

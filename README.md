@@ -1,4 +1,4 @@
-# ⚡ NSE Master Scanner Pro
+# 🔱 Trinity — NSE Nifty 500 Scanner
 
 A production-grade Streamlit app that ports the **MASTER SCANNER PRO + CCI** Pine Script indicator to Python — scanning Nifty 500 stocks continuously with live scoring, CCI analysis, trade levels, and a walk-forward backtester. Results are persisted to Supabase.
 
