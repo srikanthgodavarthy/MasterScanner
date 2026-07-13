@@ -5,11 +5,11 @@ from flask import Flask
 from flask_caching import Cache
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)  # parent dir, e.g. MasterScanner/ if this lives in MasterScanner/flask_ui/
+_REPO_ROOT = os.path.dirname(_HERE)  # parent dir, e.g. Trinity/ if this lives in Trinity/flask_ui/
 
 sys.path.insert(0, _HERE)
 
-# Prefer the real, live `utils/` package from the parent MasterScanner repo
+# Prefer the real, live `utils/` package from the parent Trinity repo
 # (when flask_ui/ is dropped in as a sibling of it). Fall back to the
 # bundled legacy_utils/ snapshot copy if utils/ isn't found alongside —
 # e.g. when running flask_ui/ standalone, unzipped on its own.

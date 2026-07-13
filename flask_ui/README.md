@@ -1,7 +1,7 @@
-# MasterScanner — Flask + HTMX + Tailwind (migration implementation)
+# Trinity — Flask + HTMX + Tailwind (migration implementation)
 
 This implements `migration-requirements-flask-htmx-tailwind.md` against the
-actual `MasterScanner-main` repo. It's a runnable Flask app with all 5
+actual `Trinity-main` repo. It's a runnable Flask app with all 5
 screens, HTMX partial-swap wiring, an SSE live-tick stream, and a service
 layer that wraps (not rewrites) the existing pandas scan/scoring engine.
 
@@ -102,7 +102,7 @@ Two ways to handle this, not done here since it touches a shared file:
 ## Deploying: sibling-to-repo vs. standalone
 
 `app.py` auto-detects its environment:
-- If `flask_ui/` sits as a **subfolder inside your MasterScanner repo**
+- If `flask_ui/` sits as a **subfolder inside your Trinity repo**
   (next to the real `utils/`), it imports the real, live `utils/` package —
   no code duplication, always current.
 - If run **standalone** (unzipped on its own), it falls back to the
@@ -110,7 +110,7 @@ Two ways to handle this, not done here since it touches a shared file:
 
 Recommended repo layout:
 ```
-MasterScanner/
+Trinity/
 ├── utils/              # existing, untouched
 ├── pages/               # existing Streamlit pages, untouched
 ├── app.py                # existing Streamlit entrypoint, untouched
