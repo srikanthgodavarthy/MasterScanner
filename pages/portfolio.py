@@ -196,14 +196,14 @@ def _inject_css():
     .pcc-lc-sub { font-size:0.63rem; color:#64748b; margin-top:1px; }
     .pcc-alert { font-size:1rem; }
 
-    /* ── Positions table v2 (row-card style) ── */
-    .pcc-ptable { width:100%; border-collapse:separate; border-spacing:0 6px; font-family:'JetBrains Mono',monospace; }
+    /* ── Positions table v2 (continuous surface, thin row dividers) ── */
+    .pcc-ptable { width:100%; border-collapse:collapse; font-family:'JetBrains Mono',monospace; }
     .pcc-ptable thead th { color:#54607a; text-transform:uppercase; font-size:0.62rem; letter-spacing:0.06em;
-        text-align:left; padding:0 0.7rem 0.35rem; font-weight:600; }
+        text-align:left; padding:0.55rem 0.7rem; font-weight:600; background:#0d1420; border-bottom:1px solid #1e293b; }
     .pcc-ptable tbody tr { background:#111827; }
-    .pcc-ptable tbody td { padding:0.55rem 0.7rem; border-top:1px solid #1e293b; border-bottom:1px solid #1e293b; white-space:nowrap; }
-    .pcc-ptable tbody td:first-child { border-left:1px solid #1e293b; border-top-left-radius:8px; border-bottom-left-radius:8px; }
-    .pcc-ptable tbody td:last-child { border-right:1px solid #1e293b; border-top-right-radius:8px; border-bottom-right-radius:8px; }
+    .pcc-ptable tbody tr:hover { background:#161f36; }
+    .pcc-ptable tbody tr:not(:last-child) td { border-bottom:1px solid #1e293b; }
+    .pcc-ptable tbody td { padding:0.55rem 0.7rem; white-space:nowrap; }
 
     /* ── Opportunity Cost swap panel ── */
     .pcc-swap-card { background:#111827; border:1px solid #1e293b; border-radius:10px; padding:0.6rem 0.75rem; margin-bottom:0.5rem; }
@@ -808,13 +808,16 @@ def _better_alternatives(row: dict, live_metrics: pd.DataFrame, held_symbols: se
     return list(pool["symbol"].astype(str))
 
 
-def _best_swap(row: dict, live_metrics: pd.DataFrame, held_symbols: set) -> dict | None:
-    """Best single not-held symbol to swap into for a weak/expensive-to-hold
-    position, plus a swap score (scan-score delta) and the factor tags that
-    drove the delta (top improvements only)."""
+def _best_swap(row: dict, live_metrics: pd.DataFrame, held_symbols: set, excluded_symbols: set) -> dict | None:
+    """Best not-held, not-already-recommended symbol to swap into for a
+    weak/expensive-to-hold position, plus a swap score (scan-score delta)
+    and the factor tags that drove the delta (top improvements only).
+    excluded_symbols accumulates across calls so each weak holding gets a
+    distinct suggestion instead of every row pointing at the same top pick."""
     if live_metrics is None or live_metrics.empty or "score" not in live_metrics.columns:
         return None
-    pool = live_metrics[~live_metrics["symbol"].astype(str).str.upper().isin(held_symbols)]
+    exclude = held_symbols | excluded_symbols
+    pool = live_metrics[~live_metrics["symbol"].astype(str).str.upper().isin(exclude)]
     if pool.empty:
         return None
     pool = pool.sort_values("score", ascending=False)
@@ -846,11 +849,24 @@ def _render_opportunity_cost(rows: list[dict], live_metrics: pd.DataFrame):
             or r["result"].trend_health in ("WEAKENING", "BROKEN")
             or (r["lm_score"] is not None and r["lm_score"] < 55)]
 
+    # Give the weakest / most urgent holdings first pick of the best
+    # replacement candidates — EXIT before REDUCE before a merely-weak score,
+    # then lowest scan score first among ties. Each accepted swap consumes
+    # its target symbol so no candidate is recommended twice.
+    urgency_rank = {"EXIT": 0, "REDUCE": 1}
+    weak_ordered = sorted(
+        weak,
+        key=lambda r: (urgency_rank.get(r["display_action"], 2),
+                        r["lm_score"] if r["lm_score"] is not None else 999)
+    )
+
     swaps = []
-    for r in weak:
-        best = _best_swap(r, live_metrics, held)
+    recommended_symbols: set = set()
+    for r in weak_ordered:
+        best = _best_swap(r, live_metrics, held, recommended_symbols)
         if best:
             swaps.append((r, best))
+            recommended_symbols.add(best["symbol"].upper())
     swaps.sort(key=lambda x: x[1]["swap_score"], reverse=True)
 
     if not swaps:
