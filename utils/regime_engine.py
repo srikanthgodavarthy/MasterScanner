@@ -1,7 +1,7 @@
 """
 utils/regime_engine.py
 ──────────────────────
-Regime-conditional scoring engine for MasterScanner.
+Regime-conditional scoring engine for Trinity.
 
 Architecture:
     Market Regime (VIX + ADX + Nifty EMA slopes)

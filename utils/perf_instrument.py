@@ -1,5 +1,5 @@
 """
-perf_instrument.py — drop-in timing harness for MasterScanner backtest.
+perf_instrument.py — drop-in timing harness for Trinity backtest.
 
 Usage:
     from perf_instrument import instrument_all, report
