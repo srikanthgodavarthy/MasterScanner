@@ -24,7 +24,7 @@ import numpy as np
 from datetime import datetime, timezone, timedelta
 import yfinance as yf
 import streamlit as st
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import threading
 
 from utils.scanner_engine import _strip_tz, nifty_regime, ema
@@ -1160,6 +1160,72 @@ def simulate_trades(
 #  RUNNER
 # ══════════════════════════════════════════════════════════════════
 
+def _score_symbol_worker(
+    sym:                    str,
+    df:                     pd.DataFrame,
+    nifty:                  pd.Series,
+    mode:                   str,
+    effective_settings:     dict,
+    cci_len:                int,
+    cci_ob:                 int,
+    cci_os:                 int,
+    min_score:              int,
+    tier_filter:            str,
+    buy_type_filter:        list | None,
+    rs_positive_only:       bool,
+    regime_ctx:             "RegimeContext | None",
+    hold_days:              int,
+    momentum_exit_enabled:  bool,
+    fp_cfg:                 dict,
+) -> tuple:
+    """
+    Score + simulate ONE symbol. Module-level (not a closure) and only takes
+    plain-picklable arguments (str/DataFrame/Series/dict/dataclass-of-
+    primitives) so it can run under ProcessPoolExecutor — CPU-bound scoring
+    across ~500 symbols x ~750 bars does not benefit from ThreadPoolExecutor
+    in CPython (the GIL serializes it; only I/O-bound work parallelizes with
+    threads). Real multiprocessing is what actually cuts wall-clock time.
+    """
+    # ── Route to the correct signal generator based on mode ───────────
+    if mode == "cci_master":
+        from utils.cci_master_engine import CCIMasterParams
+        _cci_params = CCIMasterParams(
+            cci_length  = int(effective_settings.get("bt_cci_len", 14)),
+            ob_level    = int(effective_settings.get("bt_cci_ob",  100)),
+            os_level    = int(effective_settings.get("bt_cci_os",  -100)),
+            strong_score= int(effective_settings.get("bt_cci_strong_score", 4)),
+            buy_score   = int(effective_settings.get("bt_cci_buy_score",    2)),
+        )
+        sigs = generate_signals_cci_master(df, params=_cci_params)
+        rejs = pd.DataFrame()
+
+    elif mode == "five_pillars":
+        sigs = generate_signals_five_pillars(df, nifty, cfg=fp_cfg)
+        rejs = pd.DataFrame()
+
+    else:  # default: "scanner"
+        sigs, rejs = generate_signals_historical(
+            df, nifty,
+            settings         = effective_settings,
+            cci_len          = cci_len,
+            cci_ob           = cci_ob,
+            cci_os           = cci_os,
+            min_score        = min_score,
+            tier_filter      = tier_filter,
+            buy_type_filter  = buy_type_filter,
+            rs_positive_only = rs_positive_only,
+            regime_ctx       = regime_ctx,
+        )
+
+    trades = simulate_trades(sym, df, sigs, hold_days=hold_days,
+                             momentum_exit_enabled=momentum_exit_enabled)
+    if not rejs.empty:
+        rejs.insert(0, "symbol", sym)
+    if not trades.empty:
+        trades["rejection_log"] = None
+    return sym, trades, rejs
+
+
 def run_backtest(
     symbols:          list,
     settings:         dict | None = None,
@@ -1175,6 +1241,9 @@ def run_backtest(
     progress_cb            = None,
     mode:             str  = "scanner",
     extra_pillar_cfg: dict | None = None,
+    checkpoint_cb          = None,
+    checkpoint_every: int  = 25,
+    use_processes:    bool = True,
 ) -> tuple:
     """
     Walk-forward backtest.
@@ -1188,6 +1257,21 @@ def run_backtest(
     of whatever `settings` already carries. Used by the Parameter
     Sensitivity sweep on the Backtest page to test one knob at a time
     without needing a full settings dict.
+
+    checkpoint_cb(trades_df_so_far, rejections_df_so_far, completed, total):
+    optional callback fired every `checkpoint_every` completed symbols (and
+    once at the end) with the trades/rejections accumulated SO FAR. Callers
+    (e.g. the Streamlit page) should use this to persist partial state
+    (session_state + Supabase) as the run progresses, so a mid-run kill
+    (host timeout, browser disconnect) doesn't lose the whole run — only
+    whatever completed since the last checkpoint.
+
+    use_processes: score+simulate is pure CPU work (no network I/O). CPython
+    threads don't parallelize CPU-bound code (GIL), so ThreadPoolExecutor
+    here previously ran close to single-threaded despite N "workers". Default
+    True uses ProcessPoolExecutor for real multi-core parallelism. Set False
+    to fall back to threads (e.g. constrained/sandboxed hosts where spawning
+    processes isn't available).
     """
     if settings:
         hold_days        = settings.get("hold_days",            hold_days)
@@ -1245,52 +1329,49 @@ def run_backtest(
     all_trades    = []
     t_lock        = threading.Lock()
 
-    def _process(sym):
-        df = all_data[sym]
-
-        # ── Route to the correct signal generator based on mode ───────────
-        if mode == "cci_master":
-            from utils.cci_master_engine import CCIMasterParams
-            _cci_params = CCIMasterParams(
-                cci_length  = int(effective_settings.get("bt_cci_len", 14)),
-                ob_level    = int(effective_settings.get("bt_cci_ob",  100)),
-                os_level    = int(effective_settings.get("bt_cci_os",  -100)),
-                strong_score= int(effective_settings.get("bt_cci_strong_score", 4)),
-                buy_score   = int(effective_settings.get("bt_cci_buy_score",    2)),
-            )
-            sigs = generate_signals_cci_master(df, params=_cci_params)
-            rejs = pd.DataFrame()
-
-        elif mode == "five_pillars":
-            sigs = generate_signals_five_pillars(df, nifty, cfg=_fp_cfg)
-            rejs = pd.DataFrame()
-
-        else:  # default: "scanner"
-            sigs, rejs = generate_signals_historical(
-                df, nifty,
-                settings         = effective_settings,
-                cci_len          = cci_len,
-                cci_ob           = cci_ob,
-                cci_os           = cci_os,
-                min_score        = min_score,
-                tier_filter      = tier_filter,
-                buy_type_filter  = buy_type_filter,
-                rs_positive_only = rs_positive_only,
-                regime_ctx       = _regime_ctx,
-            )
-
-        trades = simulate_trades(sym, df, sigs, hold_days=hold_days,
-                                 momentum_exit_enabled=momentum_exit_enabled)
-        if not rejs.empty:
-            rejs.insert(0, "symbol", sym)
-        if not trades.empty:
-            trades["rejection_log"] = None
-        return trades, rejs
-
     all_rejections = []
+    _since_checkpoint = 0
+    _new_since_checkpoint = []   # trade-frames completed since last checkpoint (delta)
 
-    with ThreadPoolExecutor(max_workers=workers) as exe:
-        futures = {exe.submit(_process, s): s for s in valid_symbols}
+    def _fire_checkpoint(n, force=False):
+        """Report whatever has accumulated so far. checkpoint_cb receives
+        BOTH the full running trades_df (for UI/session_state display) and
+        delta_df (only rows completed since the previous checkpoint — use
+        this for appending to Supabase so repeated checkpoints don't
+        re-insert the same trades)."""
+        nonlocal _since_checkpoint, _new_since_checkpoint
+        if checkpoint_cb is None:
+            return
+        if not force and _since_checkpoint < checkpoint_every:
+            return
+        _since_checkpoint = 0
+        _t = pd.concat(all_trades,     ignore_index=True) if all_trades     else pd.DataFrame()
+        _r = pd.concat(all_rejections, ignore_index=True) if all_rejections else pd.DataFrame()
+        _delta = pd.concat(_new_since_checkpoint, ignore_index=True) if _new_since_checkpoint else pd.DataFrame()
+        _new_since_checkpoint = []
+        try:
+            checkpoint_cb(_t, _r, _delta, n, total)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning("checkpoint_cb failed at %d/%d", n, total, exc_info=True)
+
+    # CPU-bound scoring: ProcessPoolExecutor gives real multi-core parallelism.
+    # ThreadPoolExecutor would just serialize on the GIL for this workload —
+    # kept as an opt-out (use_processes=False) for hosts that can't spawn
+    # subprocesses.
+    Executor = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
+
+    with Executor(max_workers=workers) as exe:
+        futures = {
+            exe.submit(
+                _score_symbol_worker,
+                s, all_data[s], nifty, mode, effective_settings,
+                cci_len, cci_ob, cci_os, min_score, tier_filter,
+                buy_type_filter, rs_positive_only, _regime_ctx,
+                hold_days, momentum_exit_enabled, _fp_cfg,
+            ): s
+            for s in valid_symbols
+        }
         for fut in as_completed(futures):
             sym = futures[fut]
             with c_lock:
@@ -1301,16 +1382,22 @@ def run_backtest(
                 pct = 0.15 + 0.85 * (n / total)
                 progress_cb(min(pct, 1.0), sym)
             try:
-                result, rejs = fut.result()
+                _sym, result, rejs = fut.result()
                 if result is not None and not result.empty:
                     with t_lock:
                         all_trades.append(result)
+                        _new_since_checkpoint.append(result)
                 if rejs is not None and not rejs.empty:
                     with t_lock:
                         all_rejections.append(rejs)
             except Exception as _exc:
                 import logging
                 logging.getLogger(__name__).warning("backtest inner loop failed for %s: %s", sym, _exc)
+
+            _since_checkpoint += 1
+            _fire_checkpoint(n)
+
+    _fire_checkpoint(total, force=True)  # final checkpoint == full result
 
     trades_df     = pd.concat(all_trades,     ignore_index=True) if all_trades     else pd.DataFrame()
     rejections_df = pd.concat(all_rejections, ignore_index=True) if all_rejections else pd.DataFrame()
