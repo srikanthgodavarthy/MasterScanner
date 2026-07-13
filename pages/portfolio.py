@@ -67,6 +67,7 @@ _ACTION_COLOR = {
     "ADD":        "#3b82f6",
     "HOLD":       "#8b98ac",
     "REDUCE":     "#f59e0b",
+    "ROTATE":     "#a78bfa",
     "EXIT":       "#ff4d6d",
 }
 
@@ -264,6 +265,20 @@ def _action_badge(action: str) -> str:
     return f'<span class="pcc-badge" style="background:{color}22;color:{color};border-color:{color}66;">{action}</span>'
 
 
+def _action_badge_for_row(r: dict) -> str:
+    """Same badge, but when display_action is ROTATE it appends the target
+    symbol directly on the badge (non-clickable — this is a strong directional
+    signal, not a one-click trade action) so the recommendation is visible
+    without opening any panel or expander."""
+    action = r["display_action"]
+    color = _ACTION_COLOR.get(action, "#94a3b8")
+    if action == "ROTATE" and r.get("rotate_target"):
+        label = f"ROTATE → {r['rotate_target']}"
+    else:
+        label = action
+    return f'<span class="pcc-badge" style="background:{color}22;color:{color};border-color:{color}66;white-space:nowrap;">{label}</span>'
+
+
 def _status_badge(status: str) -> str:
     color = _STATUS_COLOR.get(status, "#8b98ac")
     arrow = " ↓" if status in ("Weakening", "Broken") else ""
@@ -346,6 +361,7 @@ _TIER_META = {
     "ADD":        ("EXECUTE", "#00ff88"),
     "HOLD":       ("HOLD",    "#60a5fa"),
     "REDUCE":     ("REDUCE",  "#f59e0b"),
+    "ROTATE":     ("ROTATE",  "#a78bfa"),
     "EXIT":       ("EXIT",    "#ff4d6d"),
 }
 
@@ -728,7 +744,7 @@ def _render_summary_cards(rows: list[dict]):
 # ══════════════════════════════════════════════════════════════════
 
 def _render_positions_table(rows: list[dict]):
-    order = {"EXIT": 0, "REDUCE": 1, "STRONG ADD": 2, "ADD": 3, "HOLD": 4}
+    order = {"EXIT": 0, "ROTATE": 1, "REDUCE": 2, "STRONG ADD": 3, "ADD": 4, "HOLD": 5}
     sorted_rows = sorted(rows, key=lambda r: order.get(r["display_action"], 9))
 
     thead = """
@@ -755,7 +771,7 @@ def _render_positions_table(rows: list[dict]):
             <div class="pcc-lc-top" style="color:{tier_color};">{tier_label}</div>
             <div class="pcc-lc-sub">{r['stage_label']}</div>
           </td>
-          <td>{_action_badge(r['display_action'])}</td>
+          <td>{_action_badge_for_row(r)}</td>
           <td style="color:{pnl_color};font-weight:700;">{r['result'].unrealized_pct:+.2f}%</td>
           <td style="color:{pnl_color};font-weight:700;">{'+' if r['pnl_val']>=0 else ''}₹{r['pnl_val']:,.0f}</td>
           <td>{f"{r['risk_pct']:.1f}%" if r['risk_pct'] is not None else "—"}</td>
@@ -796,18 +812,6 @@ _SWAP_FACTOR_LABELS = [
 ]
 
 
-def _better_alternatives(row: dict, live_metrics: pd.DataFrame, held_symbols: set, n: int = 2) -> list[str]:
-    if live_metrics is None or live_metrics.empty or "score" not in live_metrics.columns:
-        return []
-    pool = live_metrics[~live_metrics["symbol"].astype(str).str.upper().isin(held_symbols)]
-    if row.get("category") and "category" in pool.columns:
-        same_cat = pool[pool["category"] == row["category"]]
-        if len(same_cat) >= n:
-            pool = same_cat
-    pool = pool.sort_values("score", ascending=False).head(n)
-    return list(pool["symbol"].astype(str))
-
-
 def _best_swap(row: dict, live_metrics: pd.DataFrame, held_symbols: set, excluded_symbols: set) -> dict | None:
     """Best not-held, not-already-recommended symbol to swap into for a
     weak/expensive-to-hold position, plus a swap score (scan-score delta)
@@ -843,16 +847,23 @@ def _best_swap(row: dict, live_metrics: pd.DataFrame, held_symbols: set, exclude
     return {"symbol": str(alt["symbol"]), "swap_score": swap_score, "tags": tag_labels}
 
 
-def _render_opportunity_cost(rows: list[dict], live_metrics: pd.DataFrame):
+def _apply_rotation(rows: list[dict], live_metrics: pd.DataFrame, min_swap_score: float = 15.0) -> None:
+    """
+    Folds swap logic directly into the action taxonomy instead of leaving it
+    as a side panel: a REDUCE/EXIT-eligible position whose replacement
+    candidate scores meaningfully higher (>= min_swap_score) becomes ROTATE
+    on the row itself — display_action, rotate_target, rotate_score,
+    rotate_tags are set in place. Weak positions with no strong replacement
+    keep their original REDUCE/EXIT action; nothing here ever touches HOLD/
+    ADD/STRONG ADD rows. Not a clickable trade action — it's a strong
+    directional signal shown right on the position, no separate panel needed.
+    """
     held = {r["symbol"] for r in rows}
-    weak = [r for r in rows if r["display_action"] in ("REDUCE", "EXIT")
-            or r["result"].trend_health in ("WEAKENING", "BROKEN")
-            or (r["lm_score"] is not None and r["lm_score"] < 55)]
+    weak = [r for r in rows if r["display_action"] in ("REDUCE", "EXIT")]
 
-    # Give the weakest / most urgent holdings first pick of the best
-    # replacement candidates — EXIT before REDUCE before a merely-weak score,
-    # then lowest scan score first among ties. Each accepted swap consumes
-    # its target symbol so no candidate is recommended twice.
+    # Weakest/most urgent gets first pick of the best replacement so the
+    # strongest candidates go where they matter most; each accepted swap
+    # consumes its target symbol so no candidate is recommended twice.
     urgency_rank = {"EXIT": 0, "REDUCE": 1}
     weak_ordered = sorted(
         weak,
@@ -860,71 +871,50 @@ def _render_opportunity_cost(rows: list[dict], live_metrics: pd.DataFrame):
                         r["lm_score"] if r["lm_score"] is not None else 999)
     )
 
-    swaps = []
     recommended_symbols: set = set()
     for r in weak_ordered:
         best = _best_swap(r, live_metrics, held, recommended_symbols)
-        if best:
-            swaps.append((r, best))
+        if best and best["swap_score"] >= min_swap_score:
+            r["display_action"] = "ROTATE"
+            r["rotate_target"] = best["symbol"]
+            r["rotate_score"] = best["swap_score"]
+            r["rotate_tags"] = best["tags"]
             recommended_symbols.add(best["symbol"].upper())
-    swaps.sort(key=lambda x: x[1]["swap_score"], reverse=True)
 
-    if not swaps:
-        st.caption("No clear swap candidates right now — your weaker positions don't score below any "
-                    "un-held symbol from your latest saved scan by enough to flag a swap.")
-    else:
-        cards = []
-        for r, best in swaps[:6]:
-            tags_html = "".join(f'<span class="pcc-swap-tag">{t}</span>' for t in best["tags"])
-            cards.append(f"""
-            <div class="pcc-swap-card">
-              <div class="pcc-swap-toprow">
-                <div class="pcc-swap-syms">
-                  <span>{r['symbol']}</span><span class="pcc-swap-arrow">→</span>
-                  <span class="pcc-swap-target">{best['symbol']}</span>
-                </div>
-                <div class="pcc-swap-score" style="color:#00ff88;">+{best['swap_score']}</div>
-              </div>
-              <div class="pcc-swap-tags">{tags_html}</div>
+
+def _render_rotation_rationale(rows: list[dict]):
+    """Compact 'why' explainer for every ROTATE-flagged row — replaces the
+    old standalone Opportunity Cost panel. Lives directly under the
+    positions table so the reasoning is one scroll away from the badge,
+    not off in a separate section."""
+    rotated = [r for r in rows if r["display_action"] == "ROTATE" and r.get("rotate_target")]
+    if not rotated:
+        return
+    rotated.sort(key=lambda r: r.get("rotate_score", 0), reverse=True)
+
+    cards = []
+    for r in rotated:
+        tags_html = "".join(f'<span class="pcc-swap-tag">{t}</span>' for t in r.get("rotate_tags", []))
+        cards.append(f"""
+        <div class="pcc-swap-card">
+          <div class="pcc-swap-toprow">
+            <div class="pcc-swap-syms">
+              <span>{r['symbol']}</span><span class="pcc-swap-arrow">→</span>
+              <span class="pcc-swap-target">{r['rotate_target']}</span>
             </div>
-            """)
+            <div class="pcc-swap-score" style="color:#00ff88;">+{r['rotate_score']:.0f}</div>
+          </div>
+          <div class="pcc-swap-tags">{tags_html}</div>
+        </div>
+        """)
+    with st.expander(f"🔄 Why these {len(rotated)} rotation{'s' if len(rotated) != 1 else ''} were flagged", expanded=False):
         _md(f'<div class="pcc-oc-wrap">{"".join(cards)}</div>')
-        st.caption("Swap Score = scan-score gap between your position and the best-scoring symbol you don't hold.")
-
-    with st.expander("View All Opportunities"):
-        trs = []
-        for r in rows:
-            would_buy = (
-                r["display_action"] in ("HOLD", "ADD", "STRONG ADD")
-                and not r["result"].structure_break
-                and not r.get("t1_hit")
-                and (r["lm_score"] is None or r["lm_score"] >= 60)
-            )
-            alts = [] if would_buy else _better_alternatives(r, live_metrics, held)
-            alt_txt = ", ".join(alts) if alts else "-"
-            buy_color = "#00ff88" if would_buy else "#ff4d6d"
-            trs.append(f"""
-            <tr>
-              <td><span class="pcc-sym">{r['symbol']}</span></td>
-              <td style="color:{buy_color};font-weight:700;">{'Yes' if would_buy else 'No'}</td>
-              <td style="color:#94a3b8;">{alt_txt}</td>
-              <td>{_action_badge(r['display_action'])}</td>
-            </tr>
-            """)
-        html = f"""
-        <div class="pcc-oc-wrap">
-        <div class="pcc-table-wrap">
-          <table class="pcc-table">
-            <thead><tr><th>Symbol</th><th>Buy today?</th><th>Alternatives</th><th>Action</th></tr></thead>
-            <tbody>{''.join(trs)}</tbody>
-          </table>
-        </div>
-        </div>
-        <div style="color:#3a4658;font-size:0.68rem;margin:0.4rem 0 0 0.2rem;">
-          Top-scoring symbols you don't hold, from your latest saved scan.
-        </div>
-        """
-        _md(html)
+        st.caption(
+            "ROTATE = your position is already REDUCE/EXIT-eligible on its own merits, AND a symbol you "
+            "don't hold scores at least +15 higher on the latest saved scan. The tags are the specific "
+            "factors driving that gap. Score = scan-score delta between your position and the target — "
+            "not a live quote, and not an order; verify before acting."
+        )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1006,7 +996,7 @@ def _render_stock_cards(rows: list[dict], cfg: ExitScoreConfig, total_value: flo
     each with a mini score strip and an SL→Entry→Current→T1 journey bar;
     full detail (thesis checks, Reduce/Exit/Notes) lives in the expander
     underneath each card."""
-    order = {"EXIT": 0, "REDUCE": 1, "STRONG ADD": 2, "ADD": 3, "HOLD": 4}
+    order = {"EXIT": 0, "ROTATE": 1, "REDUCE": 2, "STRONG ADD": 3, "ADD": 4, "HOLD": 5}
     sorted_rows = sorted(rows, key=lambda r: order.get(r["display_action"], 9))
 
     n_per_row = 5
@@ -1048,7 +1038,7 @@ def _render_stock_cards(rows: list[dict], cfg: ExitScoreConfig, total_value: flo
                     <div style="text-align:right;">
                       <span style="font-size:0.85rem;font-weight:700;color:{pnl_color};">
                         {'+' if r['result'].unrealized_pct>=0 else ''}{r['result'].unrealized_pct:.2f}%</span><br/>
-                      {_action_badge(r['display_action'])}
+                      {_action_badge_for_row(r)}
                     </div>
                   </div>
                   <div class="pcc-stockcard-price">₹{r['price']:.2f}</div>
@@ -1096,6 +1086,21 @@ def _render_detail_card(r: dict, cfg: ExitScoreConfig, total_value: float = 0.0)
           <div class="pcc-dc-tier" style="background:{tier_color}22;color:{tier_color};border:1px solid {tier_color}66;">{tier_label}</div>
         </div>
         """)
+
+        if r["display_action"] == "ROTATE" and r.get("rotate_target"):
+            rotate_tags_html = "".join(f'<span class="pcc-swap-tag">{t}</span>' for t in r.get("rotate_tags", []))
+            _md(f"""
+            <div class="pcc-swap-card" style="margin-bottom:0.7rem;">
+              <div class="pcc-swap-toprow">
+                <div class="pcc-swap-syms">
+                  <span>Rotate into</span><span class="pcc-swap-arrow">→</span>
+                  <span class="pcc-swap-target">{r['rotate_target']}</span>
+                </div>
+                <div class="pcc-swap-score" style="color:#00ff88;">+{r['rotate_score']:.0f}</div>
+              </div>
+              <div class="pcc-swap-tags">{rotate_tags_html}</div>
+            </div>
+            """)
 
         # ── Current Price / P&L / Qty / Avg Price ──
         _md(f"""
@@ -1296,7 +1301,7 @@ def render():
       <div>
         <p class="pcc-title">📁 Portfolio Command Center</p>
         <p style="color:#64748b;font-size:0.75rem;margin:0.15rem 0 0;">
-          Scanner → Candidate → Bought → Portfolio → Decision Engine (Add / Hold / Reduce / Exit)</p>
+          Scanner → Candidate → Bought → Portfolio → Decision Engine (Add / Hold / Reduce / Exit / Rotate)</p>
       </div>
       <div class="pcc-live"><span class="pcc-dot"></span>Live · {market_txt}</div>
     </div>
@@ -1326,15 +1331,12 @@ def render():
             rows.append(row)
 
         if rows:
+            _apply_rotation(rows, live_metrics)
             _render_summary_cards(rows)
 
-            col_pf, col_oc = st.columns([2.6, 1])
-            with col_pf:
-                st.markdown("### 📊 Current Portfolio")
-                _render_positions_table(rows)
-            with col_oc:
-                st.markdown("### 🔍 Opportunity Cost")
-                _render_opportunity_cost(rows, live_metrics)
+            st.markdown("### 📊 Current Portfolio")
+            _render_positions_table(rows)
+            _render_rotation_rationale(rows)
 
             st.markdown("### 🗂️ Position Cards")
             total_value = sum(x["market_val"] for x in rows)
