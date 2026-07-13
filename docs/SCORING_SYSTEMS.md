@@ -1,6 +1,6 @@
 # Scoring Systems
 
-MasterScanner runs three independent scoring systems. They are **not** meant
+Trinity runs three independent scoring systems. They are **not** meant
 to be merged — each earns its keep for a different job — but they've
 historically collided on column names (`"Leadership"`, `"Conviction"`,
 `"EntryQuality"`), which caused display bugs where one system's numbers were
