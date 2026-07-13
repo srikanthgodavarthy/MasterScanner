@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 import plotly.graph_objects as go
 
 from utils.scanner_engine import NIFTY500_SYMBOLS
@@ -358,21 +358,64 @@ def render(settings=None):
         bt_settings["bt_cci_ob"]             = int(bt_cci_ob)
         bt_settings["bt_cci_os"]             = int(bt_cci_os)
 
-        trades_df, rejections_df = run_backtest(
-            bt_universe,
-            settings         = bt_settings,
-            cci_len          = int(bt_cci_len),
-            cci_ob           = int(bt_cci_ob),
-            cci_os           = int(bt_cci_os),
-            min_score        = bt_min_score,
-            hold_days        = bt_hold_days,
-            workers          = settings.get("workers", 10) if settings else 10,
-            tier_filter      = bt_tier_filter,
-            buy_type_filter  = buy_type_filter,
-            rs_positive_only = bt_rs_positive_only,
-            progress_cb      = _bt_progress,
-            mode             = _bt_mode,
-        )
+        # Shared run timestamp so every incremental checkpoint save groups
+        # under the same backtest_results.run_at value in Supabase.
+        _bt_run_ts = datetime.now(timezone.utc).isoformat()
+        st.session_state["bt_run_in_progress"] = True
+
+        def _bt_checkpoint(trades_so_far, rejections_so_far, delta_trades, n, total):
+            # Fires periodically DURING the run (not just at the end), so a
+            # host/browser timeout that kills the run mid-way still leaves
+            # partial results in session_state and, if enabled, in Supabase —
+            # instead of the whole run vanishing with nothing persisted.
+            st.session_state["bt_trades"]     = trades_so_far
+            st.session_state["bt_rejections"] = rejections_so_far
+            st.session_state["bt_partial"]    = (n < total)
+            st.session_state["bt_progress_n"] = (n, total)
+            if trades_so_far is not None and not trades_so_far.empty:
+                st.session_state["bt_stats"] = compute_stats(trades_so_far)
+            if bt_save_db and delta_trades is not None and not delta_trades.empty:
+                save_backtest_results(delta_trades, run_ts=_bt_run_ts)
+
+        try:
+            trades_df, rejections_df = run_backtest(
+                bt_universe,
+                settings         = bt_settings,
+                cci_len          = int(bt_cci_len),
+                cci_ob           = int(bt_cci_ob),
+                cci_os           = int(bt_cci_os),
+                min_score        = bt_min_score,
+                hold_days        = bt_hold_days,
+                workers          = settings.get("workers", 10) if settings else 10,
+                tier_filter      = bt_tier_filter,
+                buy_type_filter  = buy_type_filter,
+                rs_positive_only = bt_rs_positive_only,
+                progress_cb      = _bt_progress,
+                mode             = _bt_mode,
+                checkpoint_cb    = _bt_checkpoint,
+                checkpoint_every = 25,
+            )
+        except Exception as _bt_exc:
+            # Previously an exception (or host kill) here left the run
+            # looking "abandoned" — nothing saved, no message. Now: whatever
+            # was checkpointed is already in session_state/Supabase, and the
+            # user gets a visible error instead of silence.
+            prog.empty()
+            sym_status.empty()
+            _partial = st.session_state.get("bt_trades", pd.DataFrame())
+            _n, _tot = st.session_state.get("bt_progress_n", (0, len(bt_universe)))
+            st.error(
+                f"⚠️ Backtest failed after completing {_n}/{_tot} symbols: {_bt_exc}. "
+                f"Partial results ({len(_partial)} trades) have been kept below"
+                + (" and saved to Supabase." if bt_save_db else ".")
+            )
+            st.session_state["bt_run_in_progress"] = False
+            if _partial.empty:
+                return
+            trades_df, rejections_df = _partial, st.session_state.get("bt_rejections", pd.DataFrame())
+        else:
+            st.session_state["bt_run_in_progress"] = False
+
         prog.empty()
         sym_status.empty()
 
@@ -402,9 +445,17 @@ def render(settings=None):
         st.session_state["bt_trades"]      = trades_df
         st.session_state["bt_rejections"]  = rejections_df
         st.session_state["bt_stats"]       = compute_stats(trades_df)
+        st.session_state["bt_partial"]     = False
 
         if bt_save_db:
-            save_backtest_results(trades_df)
+            # Checkpoints already streamed earlier batches to Supabase under
+            # _bt_run_ts as the run progressed; the final checkpoint_cb call
+            # (fired with force=True inside run_backtest) covers the last
+            # delta, so there's nothing left to save here — this branch only
+            # runs if checkpointing never fired (e.g. tiny universe finishing
+            # before the first checkpoint_every boundary).
+            if len(trades_df) > 0 and st.session_state.get("bt_progress_n", (0, 0))[0] == 0:
+                save_backtest_results(trades_df, run_ts=_bt_run_ts)
             st.success("✅ Results saved to Supabase.")
 
     # ── Load saved if no in-memory results ────────────────────────────────────
