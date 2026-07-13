@@ -17,7 +17,7 @@ from numba import njit
 
 _TOL = 0.03   # harmonic ratio tolerance (global constant, readable by Python)
 
-@njit
+@njit(nogil=True)
 def _check_harmonic_nb(xP, aP, bP, cP, dP,
                        abR, bcLo, bcHi, cdR, xdR, tol):
     leg_xa = abs(aP - xP)
@@ -39,7 +39,7 @@ def _check_harmonic_nb(xP, aP, bP, cP, dP,
     )
 
 
-@njit
+@njit(nogil=True)
 def detect_harmonic_nb(prices, is_high):
     """
     Numba JIT harmonic detector.
@@ -85,7 +85,7 @@ def detect_harmonic_nb(prices, is_high):
     return bull, bear
 
 
-@njit
+@njit(nogil=True)
 def detect_abcd_nb(prices, is_high, close_val, open_val, prev_high):
     """
     Numba JIT ABCD detector.
