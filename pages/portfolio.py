@@ -7,7 +7,8 @@ Portfolio Command Center — the bottom of the pipeline:
                                                     ├── Add
                                                     ├── Hold
                                                     ├── Reduce
-                                                    └── Exit
+                                                    ├── Exit
+                                                    └── Rotate
 
 Standalone page (separate from the scanner) with its own "Bought" entry
 form — you decide what you bought and when; nothing here auto-promotes a
@@ -16,16 +17,24 @@ scanner row into a position. Once bought, a position lives in Supabase
 utils/portfolio_engine.compute_exit_score(), which returns HOLD / REDUCE /
 EXIT plus a factor-by-factor breakdown. ADD is surfaced separately (see
 suggest_add) since it is an entry-side judgement, not part of the exit model.
+A REDUCE/EXIT position with a meaningfully better-scoring replacement in the
+latest saved scan is promoted to ROTATE directly in the table (see
+_apply_rotation / _render_rotation_rationale).
 
-Layout: a Command-Center summary strip, a dense positions table (Lifecycle
-stage, Status, Scores, Risk/Reward, Action), an Opportunity Cost Analyzer
-that checks each holding against the best-scoring symbols you're NOT
-holding, and a per-symbol detail card (lifecycle progress, targets, thesis
-checklist, and the Reduce/Exit/Notes controls) you open on demand.
+Gated behind a password (PORTFOLIO_PASSWORD in st.secrets — see
+_require_unlock) since this page shows real position sizes and P&L; the
+rest of the app (scanner, backtest, etc.) stays open.
+
+Layout: a password gate, a Command-Center summary strip, a dense positions
+table (Lifecycle stage, Status, Scores, Risk/Reward, Action), a rotation
+rationale explainer, and a per-symbol detail card (lifecycle progress,
+targets, thesis checklist, and the Reduce/Exit/Notes controls) you open on
+demand.
 """
 
 from __future__ import annotations
 
+import hmac
 import streamlit as st
 import pandas as pd
 from datetime import datetime
@@ -1289,7 +1298,75 @@ def _render_detail_card(r: dict, cfg: ExitScoreConfig, total_value: float = 0.0)
 #  RENDER
 # ══════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════
+#  ACCESS CONTROL
+# ══════════════════════════════════════════════════════════════════
+
+def _require_unlock() -> bool:
+    """
+    Simple password gate for this page only — the rest of the app (scanner,
+    backtest, lifecycle, etc.) stays open. Password comes from st.secrets
+    (PORTFOLIO_PASSWORD), same convention as SUPABASE_URL / SUPABASE_KEY
+    elsewhere in this app. Unlock state lives in st.session_state so it
+    persists across reruns for the rest of this browser session, but resets
+    if the tab is closed / a fresh session starts.
+
+    Returns True if the page should render, False if it should stop after
+    showing the lock screen.
+    """
+    if st.session_state.get("portfolio_unlocked"):
+        return True
+
+    expected = st.secrets.get("PORTFOLIO_PASSWORD")
+    _md("""
+    <div style="max-width:420px;margin:3rem auto;text-align:center;">
+      <div style="font-size:2.2rem;">🔒</div>
+      <p style="font-family:'Syne',sans-serif;font-size:1.3rem;font-weight:800;margin:0.4rem 0 0.2rem;">
+        Portfolio is locked</p>
+      <p style="color:#64748b;font-size:0.8rem;margin-bottom:1.2rem;">
+        Enter the password to view positions, P&amp;L, and Decision Engine actions.</p>
+    </div>
+    """)
+
+    if not expected:
+        st.error(
+            "PORTFOLIO_PASSWORD is not set in secrets — the Portfolio page can't be unlocked until it is. "
+            "Add `PORTFOLIO_PASSWORD = \"your-password\"` to .streamlit/secrets.toml (locally) or your "
+            "app's Secrets (Streamlit Cloud), then reload."
+        )
+        return False
+
+    with st.form("portfolio_unlock_form"):
+        col1, col2, col3 = st.columns([1, 1.4, 1])
+        with col2:
+            pw = st.text_input("Password", type="password", label_visibility="collapsed",
+                                placeholder="Password")
+            submitted = st.form_submit_button("Unlock", use_container_width=True)
+    if submitted:
+        if hmac.compare_digest(pw, str(expected)):
+            st.session_state["portfolio_unlocked"] = True
+            st.rerun()
+        else:
+            col1, col2, col3 = st.columns([1, 1.4, 1])
+            with col2:
+                st.error("Incorrect password.")
+    return False
+
+
+def _render_lock_control():
+    """Small manual re-lock control shown once unlocked."""
+    col1, col2 = st.columns([9, 1])
+    with col2:
+        if st.button("🔒 Lock", use_container_width=True):
+            st.session_state["portfolio_unlocked"] = False
+            st.rerun()
+
+
 def render():
+    if not _require_unlock():
+        return
+
+    _render_lock_control()
     _inject_css()
 
     now = _now_ist()
