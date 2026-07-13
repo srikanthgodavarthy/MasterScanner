@@ -180,6 +180,77 @@ def _inject_css():
         border:2px solid #0d1420; transform:translateX(-6px); box-shadow:0 0 6px rgba(0,0,0,0.6); }
     .pcc-journey-endlabels { display:flex; justify-content:space-between; font-size:0.6rem; color:#54607a; margin-top:0.1rem; }
     .pcc-journey-dist { font-size:0.72rem; font-weight:700; text-align:center; margin-top:0.4rem; }
+
+    /* ── Health ring / score chips (positions table v2) ── */
+    .pcc-ring { position:relative; width:34px; height:34px; border-radius:50%; display:inline-flex;
+        align-items:center; justify-content:center; flex-shrink:0; }
+    .pcc-ring::before { content:''; position:absolute; inset:0; border-radius:50%;
+        background:conic-gradient(var(--ring-color) calc(var(--ring-pct) * 1%), #1a2436 0); }
+    .pcc-ring::after { content:''; position:absolute; inset:3px; border-radius:50%; background:#0d1420; }
+    .pcc-ring-val { position:relative; z-index:1; font-size:0.68rem; font-weight:700; font-family:'JetBrains Mono',monospace; }
+    .pcc-chip { display:inline-flex; flex-direction:column; align-items:center; width:30px; }
+    .pcc-chip-ring { width:24px; height:24px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+        font-size:0.58rem; font-weight:700; font-family:'JetBrains Mono',monospace; }
+    .pcc-chip-lbl { font-size:0.5rem; color:#54607a; margin-top:2px; text-transform:uppercase; }
+    .pcc-lc-top { font-weight:700; font-size:0.76rem; }
+    .pcc-lc-sub { font-size:0.63rem; color:#64748b; margin-top:1px; }
+    .pcc-alert { font-size:1rem; }
+
+    /* ── Positions table v2 (row-card style) ── */
+    .pcc-ptable { width:100%; border-collapse:separate; border-spacing:0 6px; font-family:'JetBrains Mono',monospace; }
+    .pcc-ptable thead th { color:#54607a; text-transform:uppercase; font-size:0.62rem; letter-spacing:0.06em;
+        text-align:left; padding:0 0.7rem 0.35rem; font-weight:600; }
+    .pcc-ptable tbody tr { background:#111827; }
+    .pcc-ptable tbody td { padding:0.55rem 0.7rem; border-top:1px solid #1e293b; border-bottom:1px solid #1e293b; white-space:nowrap; }
+    .pcc-ptable tbody td:first-child { border-left:1px solid #1e293b; border-top-left-radius:8px; border-bottom-left-radius:8px; }
+    .pcc-ptable tbody td:last-child { border-right:1px solid #1e293b; border-top-right-radius:8px; border-bottom-right-radius:8px; }
+
+    /* ── Opportunity Cost swap panel ── */
+    .pcc-swap-card { background:#111827; border:1px solid #1e293b; border-radius:10px; padding:0.6rem 0.75rem; margin-bottom:0.5rem; }
+    .pcc-swap-toprow { display:flex; justify-content:space-between; align-items:center; }
+    .pcc-swap-syms { font-weight:700; font-size:0.85rem; }
+    .pcc-swap-arrow { color:#54607a; margin:0 0.3rem; }
+    .pcc-swap-target { color:#00ff88; }
+    .pcc-swap-score { font-weight:700; font-size:0.9rem; }
+    .pcc-swap-tags { margin-top:0.35rem; display:flex; flex-wrap:wrap; gap:0.3rem; }
+    .pcc-swap-tag { font-size:0.6rem; color:#94a3b8; background:#0d1420; border:1px solid #1e293b;
+        border-radius:5px; padding:1px 6px; }
+
+    /* ── Execute-style detail card header ── */
+    .pcc-dc-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:0.7rem; }
+    .pcc-dc-title { display:flex; align-items:center; gap:0.4rem; font-size:1.05rem; font-weight:800; font-family:'Syne',sans-serif; }
+    .pcc-dc-exch { font-size:0.62rem; color:#64748b; background:#0d1420; border:1px solid #1e293b; border-radius:5px; padding:1px 6px; }
+    .pcc-dc-tier { padding:3px 12px; border-radius:6px; font-size:0.72rem; font-weight:800; letter-spacing:0.03em; }
+    .pcc-dc-toprow { display:grid; grid-template-columns:repeat(4,1fr); gap:0.6rem; margin-bottom:0.7rem; }
+    .pcc-dc-topitem { background:#0d1420; border:1px solid #1e293b; border-radius:8px; padding:0.5rem 0.6rem; min-width:0; }
+    .pcc-dc-topitem-lbl { font-size:0.6rem; color:#64748b; text-transform:uppercase; letter-spacing:0.03em; }
+    .pcc-dc-topitem-val { font-weight:700; font-size:0.92rem; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+    .pcc-breakdown-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:0.55rem; }
+    .pcc-breakdown-tile { background:#0d1420; border:1px solid #1e293b; border-radius:8px; padding:0.55rem 0.5rem; text-align:center; }
+    .pcc-breakdown-icon { font-size:0.9rem; }
+    .pcc-breakdown-val { font-weight:700; font-size:1.05rem; margin-top:0.1rem; }
+    .pcc-breakdown-lbl { font-size:0.58rem; color:#64748b; margin-top:0.1rem; text-transform:uppercase; letter-spacing:0.02em; }
+
+    .pcc-km-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:0.55rem; }
+    .pcc-km-tile { background:#0d1420; border:1px solid #1e293b; border-radius:8px; padding:0.5rem 0.6rem; min-width:0; }
+    .pcc-km-lbl { font-size:0.58rem; color:#64748b; text-transform:uppercase; letter-spacing:0.02em; }
+    .pcc-km-val { font-weight:700; font-size:0.85rem; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+    .pcc-target-box { background:#0d1420; border:1px solid #1e293b; border-radius:8px; padding:0.6rem 0.7rem; }
+    .pcc-target-row { display:flex; justify-content:space-between; align-items:center; padding:0.28rem 0;
+        border-bottom:1px solid #161d2e; font-size:0.78rem; }
+    .pcc-target-row:last-child { border-bottom:none; }
+    .pcc-target-lbl { color:#94a3b8; }
+    .pcc-target-val { font-weight:700; }
+
+    .pcc-exit-box { background:#0d1420; border:1px solid #1e293b; border-radius:8px; padding:0.7rem 0.7rem; text-align:center; }
+    .pcc-exit-score { font-size:1.5rem; font-weight:800; }
+    .pcc-exit-sub { font-size:0.7rem; margin-top:2px; font-weight:600; }
+
+    .pcc-why-title { font-size:0.85rem; font-weight:700; margin:0.9rem 0 0.4rem; }
+    .pcc-why-row { display:flex; align-items:flex-start; gap:0.5rem; padding:0.22rem 0; font-size:0.78rem; }
+    .pcc-why-check { color:#00ff88; font-weight:800; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -267,6 +338,100 @@ def _bar(label: str, value: float, direction: str) -> str:
             f"<span style='color:#94a3b8;min-width:120px;'>{label}</span>"
             f"<span style='color:{color};letter-spacing:-1px;'>{blocks}</span>"
             f"<span style='color:{color};font-weight:700;min-width:32px;text-align:right;'>{value:.0f}</span></div>")
+
+
+_TIER_META = {
+    # display_action bucket -> (tier label used on badges/cards, color)
+    "STRONG ADD": ("EXECUTE", "#00ff88"),
+    "ADD":        ("EXECUTE", "#00ff88"),
+    "HOLD":       ("HOLD",    "#60a5fa"),
+    "REDUCE":     ("REDUCE",  "#f59e0b"),
+    "EXIT":       ("EXIT",    "#ff4d6d"),
+}
+
+
+def _tier_for(display_action: str) -> tuple[str, str]:
+    return _TIER_META.get(display_action, ("HOLD", "#8b98ac"))
+
+
+def _ring_html(value, size: int = 34, decimals: int = 0) -> str:
+    """Circular conic-gradient score ring, e.g. the Health column."""
+    if value is None:
+        return f'<div class="pcc-ring" style="width:{size}px;height:{size}px;--ring-pct:0;--ring-color:#2a3244;"><span class="pcc-ring-val" style="color:#3a4658;">—</span></div>'
+    v = max(0.0, min(100.0, float(value)))
+    color = _score_color(v)
+    txt = f"{v:.{decimals}f}"
+    return (f'<div class="pcc-ring" style="width:{size}px;height:{size}px;--ring-pct:{v:.0f};--ring-color:{color};">'
+            f'<span class="pcc-ring-val" style="color:{color};">{txt}</span></div>')
+
+
+def _chip_html(label: str, value) -> str:
+    """Small labelled score circle used in the Score Snapshot column."""
+    color = _score_color(value)
+    txt = f"{value:.0f}" if value is not None else "—"
+    return (f'<div class="pcc-chip"><div class="pcc-chip-ring" style="border:2px solid {color}66;color:{color};">{txt}</div>'
+            f'<div class="pcc-chip-lbl">{label}</div></div>')
+
+
+def _health_score(r: dict) -> float:
+    """Composite 0-100 'position health' — blends the exit engine's risk
+    read (inverted, 45%) with the average of the available quality scores
+    (LS/CV/EQ/RS/TS, 55%). Not a persisted metric — computed for display
+    only so the table has a single at-a-glance number per row."""
+    exit_score = r["result"].exit_score if r.get("result") is not None else None
+    quality_vals = [v for v in (r.get("ls"), r.get("cv"), r.get("eq"), r.get("rs"), r.get("ts")) if v is not None]
+    quality_avg = sum(quality_vals) / len(quality_vals) if quality_vals else None
+    parts, weights = [], []
+    if exit_score is not None:
+        parts.append(100 - exit_score); weights.append(0.45)
+    if quality_avg is not None:
+        parts.append(quality_avg); weights.append(0.55)
+    if not parts:
+        return None
+    wsum = sum(weights)
+    return round(sum(p * w for p, w in zip(parts, weights)) / wsum, 0)
+
+
+def _alert_html(r: dict) -> str:
+    """✅ thesis intact & trend strong · ⚠️ weakening trend/elevated risk · 🔴 structure break / broken trend."""
+    result = r["result"]
+    if result.structure_break or result.trend_health == "BROKEN":
+        return '<span class="pcc-alert" title="Trend structure broken">🔴</span>'
+    if result.trend_health == "WEAKENING" or not result.thesis_intact or (r.get("risk_pct") or 0) >= 10:
+        return '<span class="pcc-alert" title="Weakening — thesis or risk flag">⚠️</span>'
+    return '<span class="pcc-alert" title="Thesis intact">✅</span>'
+
+
+def _derive_live_extras(df: pd.DataFrame) -> dict:
+    """Lightweight metrics computed directly off the already-fetched OHLCV
+    frame — volume-vs-average, an anchored VWAP position read, and an OBV-
+    trend based Accumulating/Distributing (\"smart money\") + Acceptance
+    proxy. These are pragmatic proxies (not the full Five-Pillars pillar
+    engine) so the detail card can show them without an extra fetch."""
+    out = {"vol_ratio": None, "vwap_pos": None, "obv_state": None, "acceptance_proxy": None}
+    if df is None or df.empty or len(df) < 25:
+        return out
+    tail = df.tail(21)
+    avg_vol = tail["volume"].iloc[:-1].mean()
+    if avg_vol:
+        out["vol_ratio"] = float(tail["volume"].iloc[-1] / avg_vol)
+
+    vwap_win = df.tail(20)
+    typical = (vwap_win["high"] + vwap_win["low"] + vwap_win["close"]) / 3
+    vol_sum = vwap_win["volume"].sum()
+    if vol_sum:
+        vwap = float((typical * vwap_win["volume"]).sum() / vol_sum)
+        out["vwap_pos"] = "Above VWAP" if df["close"].iloc[-1] >= vwap else "Below VWAP"
+
+    direction = df["close"].diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+    obv = (direction * df["volume"]).cumsum()
+    obv_recent = obv.tail(20)
+    if len(obv_recent) >= 2:
+        slope = obv_recent.iloc[-1] - obv_recent.iloc[0]
+        up_days = int((direction.tail(20) > 0).sum())
+        out["acceptance_proxy"] = max(0.0, min(100.0, up_days / 20 * 100))
+        out["obv_state"] = "Accumulating" if slope > 0 else ("Distributing" if slope < 0 else "Neutral")
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -488,6 +653,20 @@ def _compute_row(pos: dict, cfg: ExitScoreConfig, live_metrics: pd.DataFrame) ->
 
     stop_price = (entry_price - risk_per_share) if risk_per_share else None
 
+    # ── Extra key-metric fields sourced from the saved lifecycle snapshot
+    #    (cci / extension / setup age) plus lightweight live proxies
+    #    (ATR%, volume ratio, VWAP position, OBV-based accumulation read) ──
+    cci_val = _lm_get(lm_row, "cci")
+    cci_state = lm_row.get("cci_state") if lm_row is not None and pd.notna(lm_row.get("cci_state")) else None
+    extension = _lm_get(lm_row, "extension")
+    bars_since = _lm_get(lm_row, "bars_since")
+
+    atr_series = _atr(df, cfg.atr_period)
+    atr_val = float(atr_series.iloc[-1]) if not atr_series.empty else None
+    atr_pct = (atr_val / result.price * 100) if (atr_val and result.price) else None
+
+    live_extras = _derive_live_extras(df)
+
     return dict(
         pos=pos, result=result, symbol=symbol, qty=qty, entry_price=entry_price,
         price=result.price, market_val=result.price * qty, pnl_val=(result.price - entry_price) * qty,
@@ -497,6 +676,10 @@ def _compute_row(pos: dict, cfg: ExitScoreConfig, live_metrics: pd.DataFrame) ->
         risk_pct=risk_pct, rr=rr, t1_hit=t1_hit, trail_active=trail_active,
         targets=targets, category=lm_category or category, lm_score=lm_score,
         stop_price=stop_price,
+        cci_val=cci_val, cci_state=cci_state, extension=extension, bars_since=bars_since,
+        atr_val=atr_val, atr_pct=atr_pct,
+        vol_ratio=live_extras["vol_ratio"], vwap_pos=live_extras["vwap_pos"],
+        obv_state=live_extras["obv_state"], acceptance_proxy=live_extras["acceptance_proxy"],
     )
 
 
@@ -545,71 +728,55 @@ def _render_summary_cards(rows: list[dict]):
 # ══════════════════════════════════════════════════════════════════
 
 def _render_positions_table(rows: list[dict]):
+    order = {"EXIT": 0, "REDUCE": 1, "STRONG ADD": 2, "ADD": 3, "HOLD": 4}
+    sorted_rows = sorted(rows, key=lambda r: order.get(r["display_action"], 9))
+
     thead = """
     <tr>
-      <th>Symbol</th><th>Lifecycle</th><th>Status</th><th>Qty</th>
-      <th>Avg Price</th><th>LTP</th><th>P&amp;L %</th><th>P&amp;L (₹)</th>
-      <th colspan="5" style="text-align:center;">Score (LS · CV · EQ · RS · TS)</th>
-      <th>Risk %</th><th>R:R</th><th>T1 Hit</th><th>Days Held</th><th>Action</th>
+      <th>Symbol</th><th>Health</th><th>Lifecycle</th><th>Action</th>
+      <th>P&amp;L %</th><th>P&amp;L ₹</th><th>Risk</th><th>R:R</th><th>Days</th>
+      <th style="text-align:center;">Score Snapshot</th><th style="text-align:center;">Alerts</th>
     </tr>
     """
     trs = []
-    for r in rows:
+    for r in sorted_rows:
         pnl_color = "#00ff88" if r["pnl_val"] >= 0 else "#ff4d6d"
-        t1_icon = "✅" if r["t1_hit"] else "⭕"
+        tier_label, tier_color = _tier_for(r["display_action"])
+        chips = "".join(_chip_html(lbl, val) for lbl, val in
+                         (("LS", r["ls"]), ("CV", r["cv"]), ("EQ", r["eq"]), ("RS", r["rs"]), ("TS", r["ts"])))
         trs.append(f"""
         <tr>
-          <td><span class="pcc-sym">{r['symbol']}</span></td>
-          <td>{_stage_badge(r['stage_label'], r['stage_color'])}</td>
-          <td>{_status_badge(r['status'])}</td>
-          <td>{r['qty']:g}</td>
-          <td>₹{r['entry_price']:.2f}</td>
-          <td>₹{r['price']:.2f}</td>
+          <td>
+            <span class="pcc-sym">{r['symbol']}</span><br/>
+            <span class="pcc-sub">NSE</span>
+          </td>
+          <td>{_ring_html(_health_score(r))}</td>
+          <td>
+            <div class="pcc-lc-top" style="color:{tier_color};">{tier_label}</div>
+            <div class="pcc-lc-sub">{r['stage_label']}</div>
+          </td>
+          <td>{_action_badge(r['display_action'])}</td>
           <td style="color:{pnl_color};font-weight:700;">{r['result'].unrealized_pct:+.2f}%</td>
-          <td style="color:{pnl_color};font-weight:700;">{'+' if r['pnl_val']>=0 else ''}{r['pnl_val']:,.0f}</td>
-          <td>{_score_cell(r['ls'])}</td>
-          <td>{_score_cell(r['cv'])}</td>
-          <td>{_score_cell(r['eq'])}</td>
-          <td>{_score_cell(r['rs'])}</td>
-          <td>{_score_cell(r['ts'])}</td>
+          <td style="color:{pnl_color};font-weight:700;">{'+' if r['pnl_val']>=0 else ''}₹{r['pnl_val']:,.0f}</td>
           <td>{f"{r['risk_pct']:.1f}%" if r['risk_pct'] is not None else "—"}</td>
           <td>{f"{r['rr']:.2f}" if r['rr'] is not None else "—"}</td>
-          <td style="text-align:center;">{t1_icon}</td>
           <td>{r['result'].days_held}</td>
-          <td>{_action_badge(r['display_action'])}</td>
+          <td><div style="display:flex;gap:0.3rem;justify-content:center;">{chips}</div></td>
+          <td style="text-align:center;">{_alert_html(r)}</td>
         </tr>
         """)
 
-    invested = sum(x["entry_price"] * x["qty"] for x in rows)
-    current = sum(x["market_val"] for x in rows)
-    open_pnl = current - invested
-    open_pct = (open_pnl / invested * 100) if invested else 0.0
-    avg_ls = sum(x["ls"] or 0 for x in rows) / len(rows)
-    avg_cv = sum(x["cv"] or 0 for x in rows) / len(rows)
-    avg_eq = sum(x["eq"] or 0 for x in rows) / len(rows)
-    avg_rs = sum(x["rs"] or 0 for x in rows) / len(rows)
-    avg_ts = sum(x["ts"] or 0 for x in rows) / len(rows)
-    pnl_color = "#00ff88" if open_pnl >= 0 else "#ff4d6d"
-    tfoot = f"""
-    <tr style="background:#0d1420;font-weight:700;">
-      <td colspan="6">Total / Average</td>
-      <td style="color:{pnl_color};">{open_pct:+.1f}%</td>
-      <td style="color:{pnl_color};">{'+' if open_pnl>=0 else ''}{open_pnl:,.0f}</td>
-      <td>{avg_ls:.0f}</td><td>{avg_cv:.0f}</td><td>{avg_eq:.0f}</td><td>{avg_rs:.0f}</td><td>{avg_ts:.0f}</td>
-      <td colspan="4"></td>
-    </tr>
-    """
-
     html = f"""
     <div class="pcc-table-wrap">
-      <table class="pcc-table">
+      <table class="pcc-ptable">
         <thead>{thead}</thead>
-        <tbody>{''.join(trs)}{tfoot}</tbody>
+        <tbody>{''.join(trs)}</tbody>
       </table>
     </div>
-    <div style="color:#3a4658;font-size:0.7rem;margin:-0.8rem 0 1.2rem 0.2rem;">
-      * Scores: LS = Leadership, CV = Conviction, EQ = Entry Quality, RS = Relative Strength, TS = Trend Score
-      &nbsp;·&nbsp; missing scores (—) mean no saved scan snapshot for that symbol yet — save one from the Lifecycle page.
+    <div style="color:#3a4658;font-size:0.68rem;margin:0.2rem 0 1.2rem 0.2rem;">
+      Health = blended read of exit risk + LS/CV/EQ/RS/TS quality scores (display-only, not persisted).
+      Score Snapshot: LS = Leadership, CV = Conviction, EQ = Entry Quality, RS = Relative Strength, TS = Trend Score.
+      Missing scores (—) mean no saved scan snapshot yet — save one from the Lifecycle page.
     </div>
     """
     _md(html)
@@ -618,6 +785,16 @@ def _render_positions_table(rows: list[dict]):
 # ══════════════════════════════════════════════════════════════════
 #  OPPORTUNITY COST ANALYZER
 # ══════════════════════════════════════════════════════════════════
+
+_SWAP_FACTOR_LABELS = [
+    # (row-factor key, live_metrics column, friendly tag, min delta to tag)
+    ("ls", "leadership",    "Leadership",    6),
+    ("cv", "conviction",    "Conviction",    6),
+    ("rs", "rs_composite",  "RS",            6),
+    ("eq", "entry_quality", "Entry Quality", 6),
+    ("ts", "trend_quality", "Trend",         6),
+]
+
 
 def _better_alternatives(row: dict, live_metrics: pd.DataFrame, held_symbols: set, n: int = 2) -> list[str]:
     if live_metrics is None or live_metrics.empty or "score" not in live_metrics.columns:
@@ -631,41 +808,107 @@ def _better_alternatives(row: dict, live_metrics: pd.DataFrame, held_symbols: se
     return list(pool["symbol"].astype(str))
 
 
+def _best_swap(row: dict, live_metrics: pd.DataFrame, held_symbols: set) -> dict | None:
+    """Best single not-held symbol to swap into for a weak/expensive-to-hold
+    position, plus a swap score (scan-score delta) and the factor tags that
+    drove the delta (top improvements only)."""
+    if live_metrics is None or live_metrics.empty or "score" not in live_metrics.columns:
+        return None
+    pool = live_metrics[~live_metrics["symbol"].astype(str).str.upper().isin(held_symbols)]
+    if pool.empty:
+        return None
+    pool = pool.sort_values("score", ascending=False)
+    alt = pool.iloc[0]
+    cur_score = row.get("lm_score")
+    alt_score = float(alt.get("score")) if pd.notna(alt.get("score")) else None
+    if cur_score is None or alt_score is None:
+        return None
+    swap_score = round(alt_score - cur_score)
+    if swap_score <= 0:
+        return None
+    tags = []
+    for row_key, lm_col, label, min_delta in _SWAP_FACTOR_LABELS:
+        cur_val = row.get(row_key)
+        alt_val = alt.get(lm_col) if lm_col in alt else None
+        if cur_val is None or alt_val is None or pd.isna(alt_val):
+            continue
+        delta = float(alt_val) - float(cur_val)
+        if delta >= min_delta:
+            tags.append((delta, label))
+    tags.sort(reverse=True)
+    tag_labels = [t[1] for t in tags[:3]] or ["Overall Score"]
+    return {"symbol": str(alt["symbol"]), "swap_score": swap_score, "tags": tag_labels}
+
+
 def _render_opportunity_cost(rows: list[dict], live_metrics: pd.DataFrame):
     held = {r["symbol"] for r in rows}
-    trs = []
-    for r in rows:
-        would_buy = (
-            r["display_action"] in ("HOLD", "ADD", "STRONG ADD")
-            and not r["result"].structure_break
-            and not r.get("t1_hit")
-            and (r["lm_score"] is None or r["lm_score"] >= 60)
-        )
-        alts = [] if would_buy else _better_alternatives(r, live_metrics, held)
-        alt_txt = ", ".join(alts) if alts else "-"
-        buy_color = "#00ff88" if would_buy else "#ff4d6d"
-        trs.append(f"""
-        <tr>
-          <td><span class="pcc-sym">{r['symbol']}</span></td>
-          <td style="color:{buy_color};font-weight:700;">{'Yes' if would_buy else 'No'}</td>
-          <td style="color:#94a3b8;">{alt_txt}</td>
-          <td>{_action_badge(r['display_action'])}</td>
-        </tr>
-        """)
-    html = f"""
-    <div class="pcc-oc-wrap">
-    <div class="pcc-table-wrap">
-      <table class="pcc-table">
-        <thead><tr><th>Symbol</th><th>Buy today?</th><th>Alternatives</th><th>Action</th></tr></thead>
-        <tbody>{''.join(trs)}</tbody>
-      </table>
-    </div>
-    </div>
-    <div style="color:#3a4658;font-size:0.68rem;margin:-0.8rem 0 1.2rem 0.2rem;">
-      Top-scoring symbols you don't hold, from your latest saved scan.
-    </div>
-    """
-    _md(html)
+    weak = [r for r in rows if r["display_action"] in ("REDUCE", "EXIT")
+            or r["result"].trend_health in ("WEAKENING", "BROKEN")
+            or (r["lm_score"] is not None and r["lm_score"] < 55)]
+
+    swaps = []
+    for r in weak:
+        best = _best_swap(r, live_metrics, held)
+        if best:
+            swaps.append((r, best))
+    swaps.sort(key=lambda x: x[1]["swap_score"], reverse=True)
+
+    if not swaps:
+        st.caption("No clear swap candidates right now — your weaker positions don't score below any "
+                    "un-held symbol from your latest saved scan by enough to flag a swap.")
+    else:
+        cards = []
+        for r, best in swaps[:6]:
+            tags_html = "".join(f'<span class="pcc-swap-tag">{t}</span>' for t in best["tags"])
+            cards.append(f"""
+            <div class="pcc-swap-card">
+              <div class="pcc-swap-toprow">
+                <div class="pcc-swap-syms">
+                  <span>{r['symbol']}</span><span class="pcc-swap-arrow">→</span>
+                  <span class="pcc-swap-target">{best['symbol']}</span>
+                </div>
+                <div class="pcc-swap-score" style="color:#00ff88;">+{best['swap_score']}</div>
+              </div>
+              <div class="pcc-swap-tags">{tags_html}</div>
+            </div>
+            """)
+        _md(f'<div class="pcc-oc-wrap">{"".join(cards)}</div>')
+        st.caption("Swap Score = scan-score gap between your position and the best-scoring symbol you don't hold.")
+
+    with st.expander("View All Opportunities"):
+        trs = []
+        for r in rows:
+            would_buy = (
+                r["display_action"] in ("HOLD", "ADD", "STRONG ADD")
+                and not r["result"].structure_break
+                and not r.get("t1_hit")
+                and (r["lm_score"] is None or r["lm_score"] >= 60)
+            )
+            alts = [] if would_buy else _better_alternatives(r, live_metrics, held)
+            alt_txt = ", ".join(alts) if alts else "-"
+            buy_color = "#00ff88" if would_buy else "#ff4d6d"
+            trs.append(f"""
+            <tr>
+              <td><span class="pcc-sym">{r['symbol']}</span></td>
+              <td style="color:{buy_color};font-weight:700;">{'Yes' if would_buy else 'No'}</td>
+              <td style="color:#94a3b8;">{alt_txt}</td>
+              <td>{_action_badge(r['display_action'])}</td>
+            </tr>
+            """)
+        html = f"""
+        <div class="pcc-oc-wrap">
+        <div class="pcc-table-wrap">
+          <table class="pcc-table">
+            <thead><tr><th>Symbol</th><th>Buy today?</th><th>Alternatives</th><th>Action</th></tr></thead>
+            <tbody>{''.join(trs)}</tbody>
+          </table>
+        </div>
+        </div>
+        <div style="color:#3a4658;font-size:0.68rem;margin:0.4rem 0 0 0.2rem;">
+          Top-scoring symbols you don't hold, from your latest saved scan.
+        </div>
+        """
+        _md(html)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -742,7 +985,7 @@ def _journey_bar_html(sl, entry, current, t1) -> str:
     """
 
 
-def _render_stock_cards(rows: list[dict], cfg: ExitScoreConfig):
+def _render_stock_cards(rows: list[dict], cfg: ExitScoreConfig, total_value: float = 0.0):
     """Grid of compact stock cards, 5 per row, sorted by action urgency —
     each with a mini score strip and an SL→Entry→Current→T1 journey bar;
     full detail (thesis checks, Reduce/Exit/Notes) lives in the expander
@@ -801,7 +1044,7 @@ def _render_stock_cards(rows: list[dict], cfg: ExitScoreConfig):
                 </div>
                 """)
                 with st.expander("Details & Actions"):
-                    _render_detail_card(r, cfg)
+                    _render_detail_card(r, cfg, total_value)
 
 
 def _factor_bar_html(label: str, value: float, direction: str) -> str:
@@ -820,86 +1063,136 @@ def _factor_bar_html(label: str, value: float, direction: str) -> str:
     """
 
 
-def _render_detail_card(r: dict, cfg: ExitScoreConfig):
+def _render_detail_card(r: dict, cfg: ExitScoreConfig, total_value: float = 0.0):
     result = r["result"]
     pos = r["pos"]
     symbol = r["symbol"]
     pnl_color = "#00ff88" if r["pnl_val"] >= 0 else "#ff4d6d"
+    tier_label, tier_color = _tier_for(r["display_action"])
+    weight_pct = (r["market_val"] / total_value * 100) if total_value else None
 
     with st.container(border=True):
-        # ── Header ──
+        # ── Header: star (STRONG ADD only) · symbol · exchange · tier badge ──
+        star = "⭐ " if r["display_action"] == "STRONG ADD" else ""
         _md(f"""
-        <div style="display:flex;justify-content:space-between;align-items:flex-start;">
-          <div>
-            <span class="pcc-sym" style="font-size:1.1rem;">{symbol}</span>
-            {_stage_badge(r['stage_label'], r['stage_color'])}
-            <div style="margin-top:0.3rem;font-size:1.4rem;font-weight:700;">₹{r['price']:.2f}
-              <span style="font-size:0.85rem;color:{pnl_color};">
-                {'+' if r['pnl_val']>=0 else ''}₹{r['pnl_val']:,.0f} ({result.unrealized_pct:+.2f}%)</span>
-            </div>
-          </div>
-          <div style="text-align:right;font-size:0.75rem;color:#64748b;">
-            Days Held<br><span style="color:#e2e8f0;font-weight:700;font-size:1rem;">{result.days_held}</span>
-            &nbsp;&nbsp; Qty<br><span style="color:#e2e8f0;font-weight:700;font-size:1rem;">{r['qty']:g}</span>
-          </div>
+        <div class="pcc-dc-header">
+          <div class="pcc-dc-title">{star}{symbol} <span class="pcc-dc-exch">NSE</span></div>
+          <div class="pcc-dc-tier" style="background:{tier_color}22;color:{tier_color};border:1px solid {tier_color}66;">{tier_label}</div>
         </div>
-        <div style="font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;margin-top:0.8rem;">Lifecycle Progress</div>
-        {_lifecycle_progress_html(pos.get('_stage_raw'))}
         """)
 
-        # ── Key Scores (LS / CV / EQ / RS / TS / Momentum) ──
-        _md('<div class="pcc-section-label">Key Scores</div>')
-        momentum_val = result.display_factors.get("Momentum")
-        items = []
-        for label, val in zip(("LS", "CV", "EQ", "RS", "TS", "Mom"),
-                               (r["ls"], r["cv"], r["eq"], r["rs"], r["ts"], momentum_val)):
-            val_txt = f"{val:.0f}" if val is not None else "—"
-            val_color = _score_color(val) if val is not None else "#3a4658"
-            items.append(f"""
-            <div class="pcc-mini-item">
-              <div class="pcc-mini-label">{label}</div>
-              <div class="pcc-mini-value" style="color:{val_color};">{val_txt}</div>
-            </div>
-            """)
-        _md(f'<div class="pcc-mini-box">{"".join(items)}</div>')
+        # ── Current Price / P&L / Qty / Avg Price ──
+        _md(f"""
+        <div class="pcc-dc-toprow">
+          <div class="pcc-dc-topitem"><div class="pcc-dc-topitem-lbl">Current Price</div>
+            <div class="pcc-dc-topitem-val">₹{r['price']:.2f}</div></div>
+          <div class="pcc-dc-topitem"><div class="pcc-dc-topitem-lbl">P&amp;L (Unrealized)</div>
+            <div class="pcc-dc-topitem-val" style="color:{pnl_color};">{result.unrealized_pct:+.2f}% (+₹{r['pnl_val']:,.0f})</div></div>
+          <div class="pcc-dc-topitem"><div class="pcc-dc-topitem-lbl">Qty</div>
+            <div class="pcc-dc-topitem-val">{r['qty']:g}</div></div>
+          <div class="pcc-dc-topitem"><div class="pcc-dc-topitem-lbl">Avg Price</div>
+            <div class="pcc-dc-topitem-val">₹{r['entry_price']:.2f}</div></div>
+        </div>
+        """)
 
-        # ── Exit Score / Risk % / R:R + trend badge ──
-        es_sub, es_color = _exit_score_sub(result.exit_score)
+        # ── Portfolio Weight / Risk / R:R / Days Held ──
         rk_sub, rk_color = _risk_sub(r["risk_pct"])
         rr_sub, rr_color = _rr_sub(r["rr"])
         _md(f"""
-        <div class="pcc-stat-strip">
-          <div class="pcc-stat-box"><div class="pcc-stat-label">Exit Score</div>
-            <div class="pcc-stat-value">{result.exit_score:.0f}<span style="font-size:0.75rem;color:#64748b;">/100</span></div>
-            <div class="pcc-stat-sub" style="color:{es_color};">{es_sub}</div></div>
-          <div class="pcc-stat-box"><div class="pcc-stat-label">Risk %</div>
-            <div class="pcc-stat-value">{f"{r['risk_pct']:.1f}%" if r['risk_pct'] is not None else "—"}</div>
-            <div class="pcc-stat-sub" style="color:{rk_color};">{rk_sub}</div></div>
-          <div class="pcc-stat-box"><div class="pcc-stat-label">R:R</div>
-            <div class="pcc-stat-value">{f"{r['rr']:.2f}" if r['rr'] is not None else "—"}</div>
-            <div class="pcc-stat-sub" style="color:{rr_color};">{rr_sub}</div></div>
+        <div class="pcc-dc-toprow">
+          <div class="pcc-dc-topitem"><div class="pcc-dc-topitem-lbl">Portfolio Weight</div>
+            <div class="pcc-dc-topitem-val">{f"{weight_pct:.1f}%" if weight_pct is not None else "—"}</div></div>
+          <div class="pcc-dc-topitem"><div class="pcc-dc-topitem-lbl">Risk</div>
+            <div class="pcc-dc-topitem-val" style="color:{rk_color};">{f"{r['risk_pct']:.1f}%" if r['risk_pct'] is not None else "—"}</div></div>
+          <div class="pcc-dc-topitem"><div class="pcc-dc-topitem-lbl">R:R</div>
+            <div class="pcc-dc-topitem-val" style="color:{rr_color};">{f"{r['rr']:.1f}" if r['rr'] is not None else "—"}</div></div>
+          <div class="pcc-dc-topitem"><div class="pcc-dc-topitem-lbl">Days Held</div>
+            <div class="pcc-dc-topitem-val">{result.days_held}</div></div>
         </div>
         """)
-        st.markdown(_trend_badge_html(result.trend_health, result.trend_health_detail), unsafe_allow_html=True)
 
-        # ── Targets ──
-        if r["targets"]:
-            t = r["targets"]
-            trail_color = "#00ff88" if r["trail_active"] else "#64748b"
-            trail_txt = "Yes" if r["trail_active"] else "No"
-            _md('<div class="pcc-section-label">Targets</div>')
+        # ── Score Breakdown (Leadership / Conviction / Entry Quality / Acceptance /
+        #    Relative Strength / Momentum / Structure / Trend Score) ──
+        _md('<div class="pcc-section-label">Score Breakdown</div>')
+        momentum_val = result.display_factors.get("Momentum")
+        structure_val = result.display_factors.get("Trend Health")
+        breakdown = [
+            ("🌱", "Leadership", r["ls"]),
+            ("🎯", "Conviction", r["cv"]),
+            ("✅", "Entry Quality", r["eq"]),
+            ("👥", "Acceptance", r.get("acceptance_proxy")),
+            ("📈", "Relative Strength", r["rs"]),
+            ("〰️", "Momentum", momentum_val),
+            ("🏛️", "Structure", structure_val),
+            ("📊", "Trend Score", r["ts"]),
+        ]
+        tiles = "".join(f"""
+            <div class="pcc-breakdown-tile">
+              <div class="pcc-breakdown-icon">{icon}</div>
+              <div class="pcc-breakdown-val" style="color:{_score_color(val)};">{f"{val:.0f}" if val is not None else "—"}</div>
+              <div class="pcc-breakdown-lbl">{lbl}</div>
+            </div>
+        """ for icon, lbl, val in breakdown)
+        _md(f'<div class="pcc-breakdown-grid">{tiles}</div>')
+
+        # ── Key Metrics ──
+        _md('<div class="pcc-section-label">Key Metrics</div>')
+        ext = r.get("extension")
+        ext_tag = "Low" if (ext is not None and ext < 40) else ("High" if (ext is not None and ext >= 70) else "Moderate")
+        rs_tag = "Outperforming" if (r["rs"] or 0) >= 60 else ("Underperforming" if (r["rs"] or 0) < 40 else "Neutral")
+        km = [
+            ("Trend Phase", r["stage_label"]),
+            ("Extension Score", f"{ext:.0f} ({ext_tag})" if ext is not None else "—"),
+            ("Setup Age", f"{r['bars_since']:.0f} bars" if r.get("bars_since") is not None else "—"),
+            ("ATR (14)", f"₹{r['atr_val']:.2f} ({r['atr_pct']:.1f}%)" if r.get("atr_val") else "—"),
+            ("VWAP/POC", r.get("vwap_pos") or "—"),
+            ("RS vs Nifty", rs_tag if r["rs"] is not None else "—"),
+            ("CCI (20)", f"{r['cci_val']:+.1f} ({r.get('cci_state') or '—'})" if r.get("cci_val") is not None else "—"),
+            ("Volume vs Avg", f"{r['vol_ratio']:.2f}x" if r.get("vol_ratio") else "—"),
+            ("Smart Money", r.get("obv_state") or "—"),
+        ]
+        km_tiles = "".join(f"""
+            <div class="pcc-km-tile"><div class="pcc-km-lbl">{lbl}</div><div class="pcc-km-val">{val}</div></div>
+        """ for lbl, val in km)
+        _md(f'<div class="pcc-km-grid">{km_tiles}</div>')
+
+        # ── Targets (Adaptive) + Exit Score, side by side ──
+        col_t, col_e = st.columns([1.6, 1])
+        with col_t:
+            _md('<div class="pcc-section-label">Targets (Adaptive)</div>')
+            if r["targets"]:
+                t = r["targets"]
+                trail_txt = "Active (ATR)" if r["trail_active"] else "Not yet"
+                trail_color = "#00ff88" if r["trail_active"] else "#64748b"
+                _md(f"""
+                <div class="pcc-target-box">
+                  <div class="pcc-target-row"><span class="pcc-target-lbl">T1 ({t.t1_mult:.2g}R)</span><span class="pcc-target-val" style="color:#00ff88;">₹{t.t1:.2f}</span></div>
+                  <div class="pcc-target-row"><span class="pcc-target-lbl">T2 ({t.t2_mult:.2g}R)</span><span class="pcc-target-val" style="color:#00ff88;">₹{t.t2:.2f}</span></div>
+                  <div class="pcc-target-row"><span class="pcc-target-lbl">T3 ({t.t3_mult:.2g}R)</span><span class="pcc-target-val" style="color:#00ff88;">₹{t.t3:.2f}</span></div>
+                  <div class="pcc-target-row"><span class="pcc-target-lbl">Trailing</span><span class="pcc-target-val" style="color:{trail_color};">{trail_txt}</span></div>
+                  <div class="pcc-target-row"><span class="pcc-target-lbl">Stop Loss</span><span class="pcc-target-val" style="color:#ff4d6d;">{f"₹{r['stop_price']:.2f}" if r['stop_price'] else "—"}</span></div>
+                </div>
+                """)
+            else:
+                _md('<div class="pcc-target-box" style="color:#54607a;font-size:0.78rem;">No stop set — add an initial stop to unlock adaptive targets.</div>')
+        with col_e:
+            _md('<div class="pcc-section-label">Exit Score</div>')
+            es_sub, es_color = _exit_score_sub(result.exit_score)
             _md(f"""
-            <div class="pcc-mini-box">
-              <div class="pcc-mini-item"><div class="pcc-mini-label">T1 ({t.t1_mult:.2g}R)</div>
-                <div class="pcc-mini-value" style="color:#00ff88;">₹{t.t1:.2f}</div></div>
-              <div class="pcc-mini-item"><div class="pcc-mini-label">T2 ({t.t2_mult:.2g}R)</div>
-                <div class="pcc-mini-value" style="color:#00ff88;">₹{t.t2:.2f}</div></div>
-              <div class="pcc-mini-item"><div class="pcc-mini-label">T3 ({t.t3_mult:.2g}R)</div>
-                <div class="pcc-mini-value" style="color:#00ff88;">₹{t.t3:.2f}</div></div>
-              <div class="pcc-mini-item"><div class="pcc-mini-label">Trail Active</div>
-                <div class="pcc-mini-value" style="color:{trail_color};">{trail_txt}</div></div>
+            <div class="pcc-exit-box">
+              <div class="pcc-exit-score" style="color:{es_color};">{result.exit_score:.0f}<span style="font-size:0.9rem;color:#64748b;">/100</span></div>
+              <div class="pcc-exit-sub" style="color:{es_color};">🛡️ {es_sub} Risk</div>
             </div>
             """)
+
+        # ── Lifecycle progress (kept as a bonus visual, not in the reference) ──
+        _md(f"""
+        <div class="pcc-section-label" style="margin-top:1rem;">Lifecycle Progress</div>
+        {_lifecycle_progress_html(pos.get('_stage_raw'))}
+        """)
+
+        # ── Exit Score / Risk % / R:R + trend badge ──
+        st.markdown(_trend_badge_html(result.trend_health, result.trend_health_detail), unsafe_allow_html=True)
 
         # ── Factor Breakdown (real CSS bars, not unicode blocks) ──
         _md('<div class="pcc-section-label">Factor Breakdown</div>')
@@ -933,7 +1226,7 @@ def _render_detail_card(r: dict, cfg: ExitScoreConfig):
             </div>
             """)
 
-        _md('<div class="pcc-section-label">Why Am I Holding This?</div>')
+        _md(f'<div class="pcc-why-title">Why is this a {tier_label}?</div>')
         _md(f"""
         <div style="display:flex;align-items:center;gap:0.55rem;padding:0.55rem 0.8rem;border-radius:8px;
              background:{banner_bg};border:1px solid {banner_color}33;margin-bottom:0.3rem;">
@@ -1028,7 +1321,8 @@ def render():
                 _render_opportunity_cost(rows, live_metrics)
 
             st.markdown("### 🗂️ Position Cards")
-            _render_stock_cards(rows, cfg)
+            total_value = sum(x["market_val"] for x in rows)
+            _render_stock_cards(rows, cfg, total_value)
 
             if live_metrics is None or live_metrics.empty:
                 st.caption(
