@@ -1,7 +1,7 @@
 """
 utils/adaptive_target_engine.py
 ────────────────────────────────
-MasterScanner — Adaptive Target Engine  (v1.0)
+Trinity — Adaptive Target Engine  (v1.0)
 
 OBJECTIVE
 ---------

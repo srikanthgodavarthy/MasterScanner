@@ -1,7 +1,7 @@
 """
 utils/scanner_engine.py
 ────────────────────────
-NSE Master Scanner — data fetch, indicator primitives, and live scanner.
+Trinity — data fetch, indicator primitives, and live scanner.
 
 All scoring logic lives in utils/scoring_core.py (compute_bar / BarResult).
 score_stock() here is now a thin wrapper: build_indicators → compute_bar(i=-1).

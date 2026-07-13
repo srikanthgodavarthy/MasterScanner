@@ -1,5 +1,5 @@
 """
-OpenAI client helper for the MasterScanner Agent tab.
+OpenAI client helper for the Trinity Agent tab.
 
 Mirrors utils/supabase_client.py's pattern: pull credentials from st.secrets
 (works identically locally via .streamlit/secrets.toml and on Streamlit

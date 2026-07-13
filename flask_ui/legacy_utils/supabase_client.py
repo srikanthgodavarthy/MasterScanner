@@ -1,5 +1,5 @@
 """
-Supabase read/write helpers for NSE Master Scanner Pro.
+Supabase read/write helpers for Trinity (NSE Nifty 500 scanner).
 
 Tables
 ------

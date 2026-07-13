@@ -1,5 +1,5 @@
 """
-utils/agent_tools.py — Tool definitions + dispatcher for the MasterScanner Agent tab.
+utils/agent_tools.py — Tool definitions + dispatcher for the Trinity Agent tab.
 
 The agent (pages/agent.py) is an OpenAI function-calling chat loop. Every tool
 here is read-only and defensive: it never raises out to the caller, it always
@@ -11,7 +11,7 @@ Two families of tools:
                          and from Supabase (lifecycle, watchlist, backtest,
                          setup plans) via utils/supabase_client.py.
   2. Market-data tools — read from yfinance for fundamentals/news that live
-                         outside MasterScanner's own scoring data.
+                         outside Trinity's own scoring data.
 
 Column names on the raw scan_df vary across the codebase (e.g. "Stock" vs
 "Symbol", "CV1_Leadership" vs "Legacy_Leadership" vs the older "DE_Leadership"),
@@ -97,7 +97,7 @@ def _get_scan_df() -> Optional[pd.DataFrame]:
 def _not_in_universe_note(symbol: str) -> Optional[str]:
     if symbol not in NIFTY500_SET:
         return (f"Note: {symbol} is not in the tracked Nifty 500 universe — "
-                f"MasterScanner's own scores/lifecycle won't have it.")
+                f"Trinity's own scores/lifecycle won't have it.")
     return None
 
 
@@ -341,7 +341,7 @@ def get_price_performance(symbol: str, period: str = "6mo") -> dict:
 TOOLS = [
     {"type": "function", "function": {
         "name": "get_live_scan_snapshot",
-        "description": "Get this session's live MasterScanner scan row for one NSE symbol: "
+        "description": "Get this session's live Trinity scan row for one NSE symbol: "
                         "signal class, Leadership/Conviction/Entry Quality/Extension scores, "
                         "CMP, entry/SL/target levels, R:R. Only works if a scan has been run "
                         "in the current browser session (Live Scanner tab).",

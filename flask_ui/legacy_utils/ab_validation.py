@@ -29,7 +29,7 @@ from utils.supabase_client import get_nifty500_symbols
 # ══════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="A/B Validation · MasterScanner",
+    page_title="A/B Validation · Trinity",
     page_icon="🔬",
     layout="wide",
 )
