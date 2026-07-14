@@ -884,6 +884,184 @@ _CSS = """
 }
 .ti-thresh-icon { font-size: 18px; color: var(--muted); }
 .ti-thresh-label { font-size: 11px; font-weight: 600; color: var(--text); }
+
+/* ══════════════════════════════════════════════════════════════
+   MARKET OVERVIEW  (replaces old Market Intelligence + status row, 2026-07)
+   ══════════════════════════════════════════════════════════════ */
+
+.mo-panel {
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px 16px;
+  margin-bottom: 14px;
+}
+.mo-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.mo-title .mo-scan-chip {
+  margin-left: auto;
+  font-size: 10.5px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--muted);
+}
+.mo-title .mo-scan-chip b { color: var(--text); }
+
+.mo-top-grid {
+  display: grid;
+  grid-template-columns: 1.05fr 1.6fr;
+  gap: 18px;
+  align-items: stretch;
+}
+@media (max-width: 900px) { .mo-top-grid { grid-template-columns: 1fr; } }
+
+/* ── Left: Nifty price card ── */
+.mo-nifty-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+}
+.mo-nifty-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.mo-nifty-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.mo-nifty-price {
+  font-size: 34px;
+  font-weight: 700;
+  font-family: var(--mono);
+  color: var(--text);
+  line-height: 1.1;
+}
+.mo-nifty-chg { margin-top: 6px; font-family: var(--mono); }
+.mo-spark { width: 100%; max-width: 200px; height: 64px; flex-shrink: 0; }
+.mo-ohlc-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.mo-ohlc-item { text-align: left; }
+.mo-ohlc-label {
+  font-size: 9px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 3px;
+}
+.mo-ohlc-val {
+  font-size: 12.5px;
+  font-weight: 700;
+  font-family: var(--mono);
+}
+
+/* ── Right: stat grid ── */
+.mo-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px 22px;
+}
+@media (max-width: 700px) { .mo-stats-grid { grid-template-columns: repeat(2, 1fr); } }
+.mo-stat-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 6px;
+  cursor: default;
+}
+.mo-info { opacity: 0.6; font-size: 9px; }
+.mo-stat-value {
+  font-size: 22px;
+  font-weight: 700;
+  font-family: var(--mono);
+  color: var(--text);
+  line-height: 1.1;
+}
+.mo-stat-value .a { color: var(--green); }
+.mo-stat-value .d { color: var(--red); }
+.mo-stat-sub { font-size: 9.5px; margin-top: 4px; font-family: var(--mono); }
+.mo-stat-sub .a { color: var(--green); }
+.mo-stat-sub .d { color: var(--red); }
+.mo-bar-track {
+  height: 5px;
+  background: var(--bg3);
+  border-radius: 3px;
+  margin-top: 8px;
+  overflow: hidden;
+}
+.mo-bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+.mo-bar-track.mo-bar-split { margin-top: 4px; }
+
+/* ── Bottom: gate cards row ── */
+.mo-gates-row {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 10px;
+  margin-top: 16px;
+}
+@media (max-width: 900px) { .mo-gates-row { grid-template-columns: repeat(2, 1fr); } }
+.mo-gate-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.mo-gate-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.mo-gate-icon { font-size: 13px; }
+.mo-gate-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  flex: 1;
+}
+.mo-gate-value {
+  font-size: 17px;
+  font-weight: 700;
+  font-family: var(--mono);
+}
+.mo-gate-qual {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted);
+  margin-left: 5px;
+}
+.mo-note {
+  font-size: 11px;
+  color: var(--muted);
+  font-style: italic;
+  margin: 10px 0 0;
+}
 </style>
 """
 
@@ -1073,251 +1251,6 @@ def _tv_link(symbol: str) -> str:
         f'<a class="tv-link" href="{url}" target="_blank" '
         f'title="Open {symbol} on TradingView">{symbol}</a>'
     )
-
-
-# ── MARKET STATUS ROW ──────────────────────────────────────────────
-
-def _scoring_explainer_html() -> str:
-    """
-    Static HTML panel: 'Scoring & Thresholds'.
-
-    [REBUILT 2026-07] Previous version documented Score/Action/Tier
-    (scoring_core.py) and the old Decision Engine categories (Elite
-    Opportunity / High Conviction / Setup Building / ...) as if they
-    still drove the Recommendation column. They don't — as of the
-    CV1 + Promotion Engine refactor, neither of those threshold sets
-    is what actually classifies a stock. This panel now documents the
-    real live pipeline, in the order a stock actually passes through it:
-
-      1) CV1 sub-factor scores   (utils/conviction_score_v1.py — Leadership,
-         Conviction, Entry Quality; unchanged formulas since v1, still the
-         single source of truth for setup QUALITY)
-      2) Composite blend + base tier (classify_tier_v3 — LIVE since 2026-07,
-         replaces v1's classify_tier; flagged in source as placeholder
-         thresholds, not yet re-validated against a real score distribution)
-      3) Promotion Engine  (utils/promotion_engine.py — TIMING only; can
-         only upgrade an Actionable setup to Execute/Elite, never creates
-         Watch/Developing and never demotes)
-      4) Structural Gate  (optional, OFF by default — Decision Engine can
-         downgrade Actionable→Skip/Watch on hard-stop or Extended/Avoid
-         lifecycle reads, but only when explicitly enabled)
-
-    Score / Action / Tier (scoring_core.py) and Extension / Lifecycle /
-    Trend Quality (decision_engine.py) still run and still feed their own
-    columns — they just don't produce the Recommendation anymore. They're
-    covered briefly at the end for that reason.
-    """
-
-    def _section_head(title, color, subtitle=""):
-        sub = f'<div style="font-size:10.5px;color:#8b949e;margin-top:2px">{subtitle}</div>' if subtitle else ""
-        return (
-            f'<div style="margin:22px 0 10px;padding-top:16px;border-top:2px solid {color}33;">'
-            f'<div style="font-size:13px;font-weight:700;color:{color};letter-spacing:0.04em;">{title}</div>'
-            f'{sub}</div>'
-        )
-
-    def _mini_table(rows, cols=("Component", "Points", "Condition")):
-        head = "".join(f'<th style="text-align:left;padding:4px 10px 4px 0;font-size:9.5px;color:#8b949e;'
-                        f'text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid rgba(255,255,255,0.08)">{c}</th>' for c in cols)
-        body = ""
-        for r in rows:
-            tds = "".join(
-                f'<td style="padding:4px 10px 4px 0;font-size:11px;color:{"var(--text)" if i != 1 else "#4ade80"};'
-                f'font-family:var(--mono);white-space:nowrap;vertical-align:top">{v}</td>'
-                for i, v in enumerate(r)
-            )
-            body += f'<tr>{tds}</tr>'
-        return f'<table style="border-collapse:collapse;width:100%;margin-bottom:10px">' \
-               f'<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>'
-
-    def _note(text, warn=False):
-        color = "#f5c542" if warn else "#8b949e"
-        return f'<p style="font-size:10.5px;color:{color};margin:4px 0 12px;">{text}</p>'
-
-    # ══════════════════════════════════════════════════════════════
-    # SECTION 1 — CV1 Sub-Factor Scores
-    # ══════════════════════════════════════════════════════════════
-    sec1 = _section_head(
-        "1 · CV1 Sub-Factor Scores — Leadership, Conviction, Entry Quality", "#58a6ff",
-        "utils/conviction_score_v1.py _leadership() / _conviction() / _entry_quality() — unchanged since v1, backtest-tuned (v8.1). Each is 0-100.",
-    )
-    sec1 += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px">'
-    sec1 += (
-        '<div><div style="font-size:10px;font-weight:700;color:#a371f7;text-transform:uppercase;'
-        'letter-spacing:0.05em;margin-bottom:5px">Leadership — "is this a market leader right now?"</div>'
-        + _mini_table([
-            ("RS Composite",         "0-30", "&gt;15%&rarr;30 &middot; &gt;10%&rarr;25 &middot; &gt;5%&rarr;20 &middot; &gt;3%&rarr;15 &middot; &gt;0%&rarr;10 &middot; &gt;-3%&rarr;4 &middot; else 0"),
-            ("Trend Age",            "0-25", "21-50 bars&rarr;25 (sweet spot) &middot; 6-20 or 51-100&rarr;8 &middot; else 0"),
-            ("ADX(14)",              "0-20", "&ge;40&rarr;20 &middot; &gt;30&rarr;12 &middot; &gt;25&rarr;5 &middot; else 0"),
-            ("Persistent Strength",  "0/15", "mom3&gt;8% AND mom6&gt;12% (boolean gate)"),
-            ("EMA20 Slope",          "0-10", "&gt;0.3&rarr;10 &middot; &gt;0&rarr;5 &middot; else 0"),
-        ], cols=("Factor", "Pts", "Bands"))
-        + '</div>'
-    )
-    sec1 += (
-        '<div><div style="font-size:10px;font-weight:700;color:#3fb950;text-transform:uppercase;'
-        'letter-spacing:0.05em;margin-bottom:5px">Conviction — "will this reach target before stop?"</div>'
-        + _mini_table([
-            ("Trend Structure",  "0-30", "trend_up +10, EMA alignment +10, above/inside cloud +7/+3, full pillar +3"),
-            ("Fib Zone",         "0-25", "golden 50-61.8%&rarr;25 &middot; relaxed 38.2-61.8%&rarr;18 &middot; continuation path&rarr;up to 17"),
-            ("CCI Recovery",     "0-25", "cross above oversold&rarr;25 &middot; CCI rising&rarr;12 &middot; recovering&rarr;6"),
-            ("Volume Sponsorship","0-15", "vol_ratio &ge;2.5&rarr;15 &middot; &ge;2.0&rarr;12 &middot; &ge;1.5&rarr;8 &middot; &ge;1.2&rarr;5 &middot; &ge;1.0&rarr;2"),
-            ("Squeeze Release",  "0-5",  "just fired&rarr;5 &middot; still building&rarr;3"),
-        ], cols=("Factor", "Pts", "Bands"))
-        + '</div>'
-    )
-    sec1 += (
-        '<div><div style="font-size:10px;font-weight:700;color:#d29922;text-transform:uppercase;'
-        'letter-spacing:0.05em;margin-bottom:5px">Entry Quality — "enter now, or wait?"</div>'
-        + _mini_table([
-            ("EMA20 Distance",       "0-30", "&le;2%&rarr;30 &middot; &le;4%&rarr;22 &middot; &le;6%&rarr;14 &middot; &le;10%&rarr;6 &middot; else 0"),
-            ("Pivot High Distance",  "0-20", "&le;-2%&rarr;20 (building under) &middot; &le;0.5%&rarr;16 &middot; &le;2%&rarr;10 &middot; else fades to 0"),
-            ("Move Since Setup",     "0-20", "&le;0.5%&rarr;20 &middot; &le;1.5%&rarr;16 &middot; &le;3%&rarr;10 &middot; &le;5%&rarr;3 &middot; else 0"),
-            ("EMA50 Distance",       "0-15", "&le;5%&rarr;15 &middot; &le;10%&rarr;10 &middot; &le;15%&rarr;5 &middot; &le;20%&rarr;2 &middot; else 0"),
-            ("Bars Since Setup",     "0-15", "ATR band Actionable&rarr;15 &middot; Late&rarr;6 &middot; Extended&rarr;0"),
-        ], cols=("Factor", "Pts", "Bands"))
-        + '<div style="font-size:9.5px;color:#8b949e;margin-top:2px">Hard cap: total capped at 35 when trend_phase == EXTENDED, regardless of the sum above.</div>'
-        + '</div>'
-    )
-    sec1 += '</div>'
-
-    # ══════════════════════════════════════════════════════════════
-    # SECTION 2 — Composite Blend & Base Tier
-    # ══════════════════════════════════════════════════════════════
-    sec2 = _section_head(
-        "2 · Composite Blend &amp; Base Tier — classify_tier_v3()", "#f5c542",
-        "utils/conviction_score_v1.py classify_tier_v3() — LIVE since 2026-07 (replaces v1's 25/25/50 classify_tier)",
-    )
-    sec2 += _mini_table([
-        ("Leadership",    "20%", "floor: &ge; 40 required for Actionable"),
-        ("Conviction",    "50%", "floor: &ge; 55 required for Actionable — highest-weighted pillar keeps its own minimum"),
-        ("Entry Quality", "30%", "no independent floor — carried entirely by the weighted composite"),
-    ], cols=("Pillar", "Weight", "Notes"))
-    sec2 += _mini_table([
-        ("Elite",      "Leadership &ge;70 AND Conviction &ge;70 AND Entry Quality &ge;60 AND composite &ge;67"),
-        ("Execute / Actionable", "Leadership &ge;60 AND Conviction &ge;70 AND Entry Quality &ge;50 AND composite &ge;60"),
-        ("Developing",  "composite &ge;55 (floors not required)"),
-        ("Watch",       "Leadership &ge;50 AND Conviction &ge;50 AND Entry Quality &ge;50 (strict, no composite fallback)"),
-        ("Skip",        "everything else"),
-    ], cols=("Base Tier", "Condition"))
-    sec2 += _note(
-        "&#9888; Backtest-derived thresholds (2026-07), composite is now an equal-weight "
-        "average (Leadership + Conviction + Entry Quality) / 3, replacing the earlier "
-        "20/50/30 weighted blend. Watch is a strict AND across all three pillars, per the "
-        "decile backtest — a high composite built off one strong pillar no longer qualifies "
-        "on its own (this replaced an earlier OR-gate design). Developing's composite floor (55) "
-        "is a midpoint placeholder between Watch (50) and Actionable/Execute (60) — not yet "
-        "backtest-fit on its own. Re-run backtest_engine.py's factor attribution before trusting "
-        "Developing's cut-off for sizing or conviction.",
-        warn=True,
-    )
-    sec2 += _note(
-        "v1 (compute_conviction_v1 / classify_tier, 25/25/50, empirically validated) and v2 (60% "
-        "Conviction weight) both remain importable for back-comparison — neither feeds the live "
-        "Recommendation. Only v3 is wired into utils/scanner_engine.py."
-    )
-    sec2 += _note(
-        "An Actionable (or even Developing — see below) setup qualifies for Execute/Elite on its OWN "
-        "natural V3 score first (CV1_SignalClass, from _classify_v3 off this same composite) — that's "
-        "the qualifying condition. The Promotion Engine below is additive timing on top of that, not "
-        "a gate: see Section 3."
-    )
-    sec2 += _note(
-        "&#9888; Natural EXECUTE's composite floor (&ge;60, in _classify_v3) sits BELOW this table's "
-        "Actionable floor (&ge;65) even though both share the same Leadership&ge;40/Conviction&ge;55 "
-        "floors — so a setup with composite in [60,65) can legitimately be natural EXECUTE while "
-        "landing on <b>Developing</b> here. That's not a bug to patch out of this table: the "
-        "Recommendation funnel (Section 3) takes the higher of the two, so Developing-here-but-"
-        "natural-EXECUTE setups still surface correctly as Execute. This table alone will just look "
-        "one rung behind the actual Recommendation in that narrow band — check CV1_SignalClass, not "
-        "just this Base Tier, if a row looks off.",
-        warn=True,
-    )
-
-    # ══════════════════════════════════════════════════════════════
-    # SECTION 3 — Promotion Engine (timing)
-    # ══════════════════════════════════════════════════════════════
-    sec3 = _section_head(
-        "3 · Promotion Engine — Timing Layer (Actionable &rarr; Execute / Elite)", "#3fb950",
-        "utils/promotion_engine.py evaluate_promotion() — runs ONLY on Actionable setups; can upgrade, never demote or create Watch/Developing",
-    )
-    sec3 += _mini_table([
-        ("Stochastic Re-ignition", "25", "fresh %K/%D cross AND fired &le;3 bars ago AND %K now &le;40 (not already run away)"),
-        ("LL Defended Spring",     "25", "ll_actionable AND ll_defended AND reclaimed &le;3 bars ago"),
-        ("VWAP Touch &amp; Reclaim","25", "touched &amp; reclaimed session VWAP AND &le;2 bars since touch"),
-        ("Institutional Confirmation","25", "vol_ratio &ge;1.5 AND OBV makes a fresh 10-bar high, same bar"),
-    ], cols=("Signal", "Pts", "Condition"))
-    sec3 += _mini_table([
-        ("Elite",   "Promo Score &ge;75 (3+ signals) AND R:R &ge;2.0"),
-        ("Execute", "Promo Score &ge;50 (2+ signals) AND R:R &ge;1.5"),
-        ("Actionable (no promotion)", "Promo Score &lt;50, or R:R gate not cleared — stays at the CV1 base tier"),
-    ], cols=("Outcome", "Condition"))
-    sec3 += _note(
-        "R:R is a sanity gate, not part of the Promo Score itself — a setup with all 4 timing signals "
-        "firing still won't promote past Actionable if the trade's own Reward:Risk doesn't clear the "
-        "bar. min_risk_reward in Settings can only raise the Execute bar above 1.5, never lower it — "
-        "fixed 2026-07: the effective floor is now max(setting, 1.5), so raising it in Settings "
-        "actually tightens the gate instead of being silently ignored."
-    )
-    sec3 += _note(
-        "This layer never GATES Execute/Elite for a setup that already qualifies on its natural V3 "
-        "score (Section 2) — it can only carry a setup one rung further on top of wherever base_tier "
-        "and natural score already landed it (e.g. natural Execute + strong timing &rarr; Elite). "
-        "Extension risk is already priced into Entry Quality's EXTENDED-phase cap, so it isn't "
-        "re-applied here as a second gate. Promo Score itself is still computed only against "
-        "Actionable setups (unchanged) — it's the Recommendation funnel, not this engine, that lets "
-        "natural EXECUTE/ELITE win from a Developing base_tier too."
-    )
-
-    # ══════════════════════════════════════════════════════════════
-    # SECTION 4 — Structural Gate
-    # ══════════════════════════════════════════════════════════════
-    sec4 = _section_head(
-        "4 · Structural Gate — optional, OFF by default", "#a371f7",
-        "settings['ENABLE_STRUCTURAL_GATE'] — Decision Engine can downgrade (never upgrade) an Actionable base tier before Promotion Engine sees it",
-    )
-    sec4 += _mini_table([
-        ("hard_stop / t4_hard_stop", "&rarr; Skip",  "structural failure Decision Engine caught that CV1 didn't"),
-        ("Lifecycle == AVOID",       "&rarr; Watch", "Decision Engine's fuller Extension model disagrees this is viable"),
-        ("Lifecycle == EXTENDED",    "&rarr; Watch", "chase risk — CV1's blunter EQ-embedded extension cap didn't fully catch it"),
-    ], cols=("Trigger", "Effect", "Why"))
-    sec4 += _note(
-        "Not yet validated against the 1,732-trade backtest set with the gate on vs off — that's why "
-        "it defaults False. If it's on in your Settings, base tiers here can differ from what "
-        "classify_tier_v3() alone would produce."
-    )
-
-    # ══════════════════════════════════════════════════════════════
-    # SECTION 5 — Everything else still running (not part of Recommendation)
-    # ══════════════════════════════════════════════════════════════
-    sec5 = _section_head(
-        "5 · Also running, but NOT part of Recommendation", "#8b949e",
-    )
-    sec5 += _mini_table([
-        ("Score / Action / Tier",  "utils/scoring_core.py compute_bar()", "265-pt raw budget, own norm_score. Action is gated to agree with Recommendation after the fact (see Action Gate), Score/Tier are not."),
-        ("Extension / Lifecycle / Trend Quality / R:R", "utils/decision_engine.py compute_decision(mode=\"production\")", "Takes CV1's L/C/EQ as inputs but computes its own fuller Extension + objective Lifecycle stage — feeds the Extension column and the per-stock explainability panel."),
-        ("Legacy_Leadership / _Conviction / _EntryQuality", "utils/legacy_scoring_diagnostic.py", "Old Decision Engine's own L/C/EQ, kept only as a diagnostic (ConvictionGap). Renamed from DE_* — reads fall back to DE_* for previously persisted rows. Never feeds Recommendation."),
-        ("Five Pillars (FP_*)",    "utils/pillar_engine.py", "Independent, display-only ranking model on the Five Pillars page. Does not influence Score, Action, CV1, or Recommendation."),
-    ], cols=("Column(s)", "Source", "Role"))
-
-    return f"""
-<div style="font-family:'JetBrains Mono','Fira Code',monospace;">
-  <p style="font-size:11px;color:#8b949e;margin:0 0 8px;">
-    <b style="color:var(--text)">Recommendation</b> (Skip &rarr; Watch &rarr; Developing &rarr; Actionable &rarr;
-    Execute &rarr; Elite) is the <b>only</b> recommendation shown anywhere in the app, and it comes from
-    exactly one pipeline: <b style="color:#58a6ff">CV1 sub-scores</b> &rarr;
-    <b style="color:#f5c542">v3 composite/base tier</b> &rarr;
-    <b style="color:#3fb950">Promotion Engine timing</b> &rarr;
-    <b style="color:#a371f7">optional structural downgrade</b>. Everything in Section 5 still runs and
-    still feeds its own columns, but none of it can change the Recommendation.
-  </p>
-  {sec1}
-  {sec2}
-  {sec3}
-  {sec4}
-  {sec5}
-</div>
-"""
 
 
 def _perstock_breakdown_table(df: pd.DataFrame) -> str:
@@ -1701,75 +1634,6 @@ def _promotion_signals_table(df: pd.DataFrame) -> str:
     )
 
 
-def _market_status_row(summary: dict, scan_time: str,
-                        nifty_price: float = 0, nifty_chg_pct: float | None = None) -> str:
-    r = summary.get("regime", "RANGE")
-    color, _, _ = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
-    regime_label = {"TREND": "TREND", "RANGE": "RANGE", "VOLATILE": "VOLATILE"}.get(r, r)
-
-    ema50_up  = summary.get("nifty_ema50", False)
-    ema50_txt = "▲ EMA50" if ema50_up else "▼ EMA50"
-    ema50_col = "#3fb950" if ema50_up else "#f85149"
-
-    vix_val   = "{:.1f}".format(summary.get("vix", 0))
-    adx_val   = "{:.0f}".format(summary.get("adx", 0))
-    nifty_str = "{:,.0f}".format(nifty_price) if nifty_price else "—"
-
-    if nifty_chg_pct is not None:
-        pct_sign  = "+" if nifty_chg_pct >= 0 else ""
-        pct_color = "#3fb950" if nifty_chg_pct >= 0 else "#f85149"
-        arrow     = "▲" if nifty_chg_pct >= 0 else "▼"
-        pct_html  = (f'<span style="color:{pct_color};font-weight:700">'
-                     f'{arrow} {pct_sign}{nifty_chg_pct:.2f}%</span>')
-    else:
-        pct_html = '<span style="color:var(--muted)">%Chg</span>'
-
-    scan_chip = (
-        f'<span class="last-scan-chip">Last scan: <b>{scan_time} IST</b></span>'
-        if scan_time else ""
-    )
-
-    mkt_text = {
-        "TREND":    "Trending market · Full position sizing active.",
-        "RANGE":    "Range-bound market · Gate restricted · Half position sizing.",
-        "VOLATILE": "Volatile market · Execute gate closed · No new positions.",
-    }.get(r, "")
-
-    # ── Regime checklist (4 gate conditions) ─────────────────────
-    ema200_up    = summary.get("nifty_ema200",  False)
-    vix_ok       = float(summary.get("vix", 99)) <= 22.0
-    adx_ok       = float(summary.get("adx", 0))  >= 25.0
-    adx_is_real  = summary.get("adx_is_real", False)
-    adx_note     = "" if adx_is_real else " (proxy)"
-
-    def _gate_chip(ok: bool, chip_label: str, value: str, tip: str) -> str:
-        # [Restructure 2026-07] Merges the old duplicate rows — a plain
-        # value chip ("VIX 14.7") plus a separate pass/fail checklist row
-        # ("✅ VIX ≤22 (14.7)") repeating the same number — into one chip
-        # that carries both the value and the gate verdict.
-        icon  = "✅" if ok else "❌"
-        color = "#3fb950" if ok else "#f85149"
-        return (
-            f'<span class="msr-chip" title="{tip}" style="color:{color}">'
-            f'{icon} <span class="chip-label">{chip_label}</span>{value}</span>'
-        )
-
-    return f"""
-<div class="msr">
-  <span class="regime-pill-solid" style="background:{color};color:#0d1117">{regime_label}</span>
-  <span class="msr-chip"><span class="chip-label">Nifty</span>{nifty_str}</span>
-  <span class="msr-chip">{pct_html}</span>
-  {_gate_chip(ema50_up,  "EMA50",     "", "Nifty above 50-day EMA — short-term trend intact")}
-  {_gate_chip(ema200_up, "EMA200",    "", "Nifty above 200-day EMA — long-term uptrend confirmed")}
-  {_gate_chip(vix_ok,    "VIX ≤22 ", vix_val, "India VIX ≤ 22 required — higher VIX closes the Execute gate")}
-  {_gate_chip(adx_ok,    "ADX ≥25 ", f"{adx_val}{adx_note}", f"Nifty ADX(14) ≥ 25 — market trending with direction{adx_note}")}
-  <span class="msr-spacer"></span>
-  {scan_chip}
-</div>
-<p class="market-note">{mkt_text}</p>
-"""
-
-
 # ── SUMMARY CARDS ─────────────────────────────────────────────────
 
 def _summary_cards(df: pd.DataFrame) -> str:
@@ -1868,40 +1732,204 @@ def _compute_breadth_stats(df: pd.DataFrame) -> dict:
     return out
 
 
-# ── MARKET INTELLIGENCE PANEL ───────────────────────────────────────
+# ── MARKET OVERVIEW PANEL ───────────────────────────────────────────
 
-def _market_intelligence_panel(summary: dict, breadth: dict) -> str:
-    r = summary.get("regime", "RANGE")
-    trend_label = _trend_strength_label(
-        float(summary.get("adx", 0)), summary.get("adx_is_real", False)
+def _nifty_spark_svg(values: list[float], color: str, width: int = 200, height: int = 64) -> str:
+    """Line + soft gradient-fill sparkline for the Market Overview Nifty
+    card. Falls back to a flat dashed line when there's no usable series
+    (e.g. both live and daily Nifty fetches failed) -- honest about the
+    missing data rather than faking a shape."""
+    if not values or len(values) < 2:
+        y = height / 2
+        return (f'<svg class="mo-spark" viewBox="0 0 {width} {height}" preserveAspectRatio="none">'
+                f'<line x1="2" y1="{y}" x2="{width-2}" y2="{y}" stroke="{color}" '
+                f'stroke-width="1.5" stroke-dasharray="4 4" opacity="0.4"/></svg>')
+
+    lo, hi = min(values), max(values)
+    span = (hi - lo) or 1.0
+    step = (width - 4) / (len(values) - 1)
+    pts = []
+    for i, v in enumerate(values):
+        x = 2 + i * step
+        y = height - 6 - ((v - lo) / span) * (height - 12)
+        pts.append((x, y))
+    line_pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+    area_pts = f"2,{height-2} " + line_pts + f" {width-2},{height-2}"
+
+    return (
+        f'<svg class="mo-spark" viewBox="0 0 {width} {height}" preserveAspectRatio="none">'
+        f'<defs><linearGradient id="moNiftyGrad" x1="0" y1="0" x2="0" y2="1">'
+        f'<stop offset="0%" stop-color="{color}" stop-opacity="0.35"/>'
+        f'<stop offset="100%" stop-color="{color}" stop-opacity="0"/></linearGradient></defs>'
+        f'<polygon points="{area_pts}" fill="url(#moNiftyGrad)"/>'
+        f'<polyline points="{line_pts}" fill="none" stroke="{color}" stroke-width="2" '
+        f'stroke-linecap="round" stroke-linejoin="round"/>'
+        f'</svg>'
     )
 
-    adv, dec = breadth["advancing"], breadth["declining"]
-    hi, lo   = breadth["n_52w_high"], breadth["n_52w_low"]
-    e20, e200 = breadth["pct_above_ema20"], breadth["pct_above_ema200"]
 
-    def _stat(label, value_html, sub_html=""):
-        return (f'<div><div class="ti-mi-label">{label}</div>'
-                f'<div class="ti-mi-value">{value_html}</div>'
-                f'{sub_html}</div>')
+def _vix_band(vix: float) -> tuple[str, str]:
+    """(label, color) band for India VIX -- thresholds line up with the
+    existing ≤22 Execute-gate cutoff (MODERATE tops out right at the gate)."""
+    if vix <= 15:
+        return "LOW", "#3fb950"
+    if vix <= 22:
+        return "MODERATE", "#d29922"
+    return "HIGH", "#f85149"
 
+
+def _market_overview_panel(summary: dict, breadth: dict,
+                            nifty_snapshot: dict | None, scan_time: str) -> str:
+    """
+    Full-width 'Market Overview' card — live Nifty price/sparkline/OHLC on
+    the left, breadth + trend + EMA stats on the right, and a row of
+    Regime/EMA50/EMA200/VIX/ADX gate cards underneath. Replaces the old
+    _market_intelligence_panel + _market_status_row pair (2026-07 redesign).
+    """
+    nifty_snapshot = nifty_snapshot or {}
+    r = summary.get("regime", "RANGE")
     regime_color, _, _ = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
 
+    adx         = float(summary.get("adx", 0))
+    adx_is_real = summary.get("adx_is_real", False)
+    vix         = float(summary.get("vix", 0))
+    ema50_up    = summary.get("nifty_ema50", False)
+    ema200_up   = summary.get("nifty_ema200", False)
+    ema50_val   = summary.get("nifty_ema50_val", 0.0)
+    ema200_val  = summary.get("nifty_ema200_val", 0.0)
+
+    trend_label          = _trend_strength_label(adx, adx_is_real)
+    vix_label, vix_color = _vix_band(vix)
+    trend_color = {"WEAK": "#f85149", "MODERATE": "#d29922", "STRONG": "#3fb950"}[trend_label]
+    trend_pct   = {"WEAK": 33, "MODERATE": 66, "STRONG": 100}[trend_label]
+
+    # ── Nifty price card ─────────────────────────────────────────
+    price      = nifty_snapshot.get("price", 0.0)
+    pct_chg    = nifty_snapshot.get("pct_chg")
+    open_px    = nifty_snapshot.get("open", 0.0)
+    high_px    = nifty_snapshot.get("high", 0.0)
+    low_px     = nifty_snapshot.get("low", 0.0)
+    prev_close = nifty_snapshot.get("prev_close")
+    spark_vals = nifty_snapshot.get("spark", [])
+
+    if pct_chg is not None:
+        up          = pct_chg >= 0
+        chg_color   = "#3fb950" if up else "#f85149"
+        arrow       = "▲" if up else "▼"
+        pt_chg      = (price - prev_close) if prev_close else 0.0
+        chg_html    = (
+            f'<span style="color:{chg_color};font-weight:700;font-size:14px">'
+            f'{arrow} {"+" if up else ""}{pct_chg:.2f}%</span>'
+            f'<span style="color:var(--muted);font-weight:600;font-size:12px;margin-left:6px">'
+            f'({"+" if pt_chg >= 0 else ""}{pt_chg:,.1f})</span>'
+        )
+        spark_color = chg_color
+    else:
+        chg_html    = '<span style="color:var(--muted);font-size:12px">—</span>'
+        spark_color = "#8b949e"
+
+    price_str = f"{price:,.0f}" if price else "—"
+    spark_svg = _nifty_spark_svg(spark_vals, spark_color)
+
+    def _ohlc_item(label, val, color="var(--text)"):
+        txt = f"{val:,.0f}" if val else "—"
+        return (f'<div class="mo-ohlc-item"><div class="mo-ohlc-label">{label}</div>'
+                f'<div class="mo-ohlc-val" style="color:{color}">{txt}</div></div>')
+
+    ohlc_html = (
+        _ohlc_item("Open", open_px) +
+        _ohlc_item("High", high_px, "#3fb950") +
+        _ohlc_item("Low", low_px, "#f85149") +
+        _ohlc_item("Prev. Close", prev_close or 0)
+    )
+
+    # ── Right-hand stat grid ──────────────────────────────────────
+    adv, dec  = breadth.get("advancing", 0), breadth.get("declining", 0)
+    hi, lo    = breadth.get("n_52w_high", 0), breadth.get("n_52w_low", 0)
+    e20, e200 = breadth.get("pct_above_ema20", 0), breadth.get("pct_above_ema200", 0)
+    adv_pct   = int(round(100 * adv / max(1, adv + dec)))
+
+    def _stat_block(label, tip, value_html, extra_html=""):
+        return (
+            f'<div class="mo-stat">'
+            f'<div class="mo-stat-label" title="{tip}">{label} <span class="mo-info">ⓘ</span></div>'
+            f'<div class="mo-stat-value">{value_html}</div>'
+            f'{extra_html}'
+            f'</div>'
+        )
+
+    trend_bar = (f'<div class="mo-bar-track"><div class="mo-bar-fill" '
+                 f'style="width:{trend_pct}%;background:{trend_color}"></div></div>')
+    breadth_extra = (
+        '<div class="mo-stat-sub"><span class="a">Advancing</span>&nbsp;&nbsp;'
+        '<span class="d">Declining</span></div>'
+        f'<div class="mo-bar-track mo-bar-split"><div class="mo-bar-fill" '
+        f'style="width:{adv_pct}%;background:#3fb950"></div></div>'
+    )
+
+    stats_html = (
+        _stat_block("Trend Strength", "Based on Nifty ADX(14)",
+                    f'<span style="color:{trend_color}">{trend_label}</span>', trend_bar) +
+        _stat_block("Market Breadth", "Stocks advancing vs declining in this scan",
+                    f'<span class="a">{adv}</span> / <span class="d">{dec}</span>', breadth_extra) +
+        _stat_block("52W High", "Stocks within range of their 52-week high", f'<span class="a">{hi}</span>') +
+        _stat_block("52W Low", "Stocks within range of their 52-week low", f'<span class="d">{lo}</span>') +
+        _stat_block("Above EMA20", "Share of scanned universe trading above EMA20", f'{e20}%') +
+        _stat_block("Above EMA200", "Share of scanned universe trading above EMA200", f'{e200}%')
+    )
+
+    # ── Gate cards row ─────────────────────────────────────────────
+    adx_note = "" if adx_is_real else " · proxy"
+
+    def _gate_card(icon, label, value_html, ok, qualifier="", border_color=None):
+        border = border_color if border_color else ("#3fb950" if ok else "#f85149")
+        check  = f'<span style="color:{border}">{"✓" if ok else "✕"}</span>'
+        qual   = f'<span class="mo-gate-qual">({qualifier})</span>' if qualifier else ""
+        return (
+            f'<div class="mo-gate-card" style="border-color:{border}66">'
+            f'<div class="mo-gate-top"><span class="mo-gate-icon">{icon}</span>'
+            f'<span class="mo-gate-label">{label}</span>{check}</div>'
+            f'<div class="mo-gate-value" style="color:{border}">{value_html}{qual}</div>'
+            f'</div>'
+        )
+
+    ema50_str  = f"{ema50_val:,.0f}"  if ema50_val  else "—"
+    ema200_str = f"{ema200_val:,.0f}" if ema200_val else "—"
+
+    gates_html = (
+        _gate_card("🎯", "NIFTY REGIME", r, True, border_color=regime_color) +
+        _gate_card("📈", "EMA50",  ema50_str,  ema50_up) +
+        _gate_card("📉", "EMA200", ema200_str, ema200_up) +
+        _gate_card("💓", "VIX",    f"{vix:.1f}", vix <= 22.0, qualifier=vix_label, border_color=vix_color if vix <= 22.0 else None) +
+        _gate_card("🛡️", "ADX",   f"{adx:.0f}{adx_note}", adx >= 25.0, qualifier=trend_label, border_color=trend_color if adx_is_real else None)
+    )
+
+    mkt_note = {
+        "TREND":    "Trending market · Full position sizing active.",
+        "RANGE":    "Range-bound market · Gate restricted · Half position sizing.",
+        "VOLATILE": "Volatile market · Execute gate closed · No new positions.",
+    }.get(r, "")
+    scan_chip = f'<span class="mo-scan-chip">Last scan: <b>{scan_time} IST</b></span>' if scan_time else ""
+
     return f"""
-<div class="ti-panel">
-  <div class="ti-panel-title">ⓘ MARKET INTELLIGENCE</div>
-  <div class="ti-mi-grid">
-    {_stat("Regime", f'<span style="color:{regime_color}">{r}</span>')}
-    {_stat("Trend Strength", trend_label)}
-    {_stat("Market Breadth",
-           f'<span class="a">{adv}</span> / <span class="d">{dec}</span>',
-           '<div class="ti-mi-sub"><span class="a">Advancing</span> &nbsp;'
-           '<span class="d">Declining</span></div>')}
-    {_stat("52W High", f'<span class="a">{hi}</span>')}
-    {_stat("52W Low", f'<span class="d">{lo}</span>')}
-    {_stat("Above EMA20", f'{e20}%')}
-    {_stat("Above EMA200", f'{e200}%')}
+<div class="mo-panel">
+  <div class="mo-title">MARKET OVERVIEW ⓘ {scan_chip}</div>
+  <div class="mo-top-grid">
+    <div class="mo-nifty-card">
+      <div class="mo-nifty-label">NIFTY 50</div>
+      <div class="mo-nifty-row">
+        <div>
+          <div class="mo-nifty-price">{price_str}</div>
+          <div class="mo-nifty-chg">{chg_html}</div>
+        </div>
+        {spark_svg}
+      </div>
+      <div class="mo-ohlc-row">{ohlc_html}</div>
+    </div>
+    <div class="mo-stats-grid">{stats_html}</div>
   </div>
+  <div class="mo-gates-row">{gates_html}</div>
+  <p class="mo-note">{mkt_note}</p>
 </div>
 """
 
@@ -3307,19 +3335,23 @@ def render(settings: dict | None = None):
         st.session_state["scan_time"]     = _now_ist().strftime("%H:%M:%S")
         st.session_state["scan_settings"] = effective
 
-        # Nifty price + today's live %Chg (intraday)
+        # Nifty snapshot for the Market Overview card: price, %chg, OHLC, spark
         try:
-            from utils.scanner_engine import fetch_nifty_live
-            _nifty_price, _nifty_chg = fetch_nifty_live()
-            if _nifty_price:
-                st.session_state["nifty_price"]   = _nifty_price
-                st.session_state["nifty_chg_pct"] = _nifty_chg
+            from utils.scanner_engine import fetch_nifty_intraday_snapshot
+            _snap = fetch_nifty_intraday_snapshot()
+            if _snap.get("price"):
+                st.session_state["nifty_snapshot"] = _snap
             elif nifty_series is not None and len(nifty_series) >= 2:
-                # Fallback to daily series already fetched
+                # Fallback to the daily series already fetched for regime calc
                 last = float(nifty_series.iloc[-1])
                 prev = float(nifty_series.iloc[-2])
-                st.session_state["nifty_price"]   = last
-                st.session_state["nifty_chg_pct"] = round((last - prev) / prev * 100, 2)
+                st.session_state["nifty_snapshot"] = {
+                    "price": last,
+                    "pct_chg": round((last - prev) / prev * 100, 2),
+                    "open": 0.0, "high": 0.0, "low": 0.0,
+                    "prev_close": prev,
+                    "spark": nifty_series.tail(15).tolist(),
+                }
         except Exception:
             pass
 
@@ -3367,11 +3399,10 @@ def render(settings: dict | None = None):
             st.toast("Saved to Supabase.", icon="✅")
 
     # ── Display ────────────────────────────────────────────────
-    df_aug        = st.session_state.get("scan_df",       pd.DataFrame())
-    summary       = st.session_state.get("scan_summary",  {})
-    scan_time     = st.session_state.get("scan_time",     "")
-    nifty_price   = st.session_state.get("nifty_price",   0)
-    nifty_chg_pct = st.session_state.get("nifty_chg_pct", None)
+    df_aug         = st.session_state.get("scan_df",       pd.DataFrame())
+    summary        = st.session_state.get("scan_summary",  {})
+    scan_time      = st.session_state.get("scan_time",     "")
+    nifty_snapshot = st.session_state.get("nifty_snapshot", {})
 
     if df_aug.empty:
         st.markdown("""
@@ -3382,31 +3413,20 @@ def render(settings: dict | None = None):
         </div>""", unsafe_allow_html=True)
         return
 
-    # ── Row 1: Market Intelligence + Score Cards + Thresholds ────
+    # ── Market Overview ───────────────────────────────────────────
     breadth       = _compute_breadth_stats(df_aug)
     active_df = (
         df_aug[df_aug["Recommendation"] != "Avoid"]
         if "Recommendation" in df_aug.columns else df_aug
     )
 
-    row1_a, row1_b, row1_c = st.columns([2.1, 3.1, 1.1])
-    with row1_a:
-        st.markdown(_market_intelligence_panel(summary, breadth), unsafe_allow_html=True)
-    with row1_b:
-        if not active_df.empty:
-            st.markdown(_summary_cards(active_df), unsafe_allow_html=True)
-    with row1_c:
-        _thresh_expanded = st.session_state.get("_show_thresholds", False)
-        if st.button("⚙️ Scores & Thresholds", key="btn_scores_thresholds",
-                     use_container_width=True, help="View / edit scoring thresholds"):
-            st.session_state["_show_thresholds"] = not _thresh_expanded
-
-    # Last-scan chip + regime checklist (kept from the old status row —
-    # still useful context, just no longer the whole top strip)
     st.markdown(
-        _market_status_row(summary, scan_time, nifty_price, nifty_chg_pct),
+        _market_overview_panel(summary, breadth, nifty_snapshot, scan_time),
         unsafe_allow_html=True,
     )
+
+    if not active_df.empty:
+        st.markdown(_summary_cards(active_df), unsafe_allow_html=True)
 
     # ── Signal class counts ───────────────────────────────────────
     if "Recommendation" in df_aug.columns:
@@ -3427,10 +3447,6 @@ def render(settings: dict | None = None):
         # Passing None lets the panel's documented single-scan fallback
         # (AvgChg as momentum, NetInflowCr as inflow) take over instead.
         st.markdown(_leadership_rotation_panel(sector_stats, None), unsafe_allow_html=True)
-
-    # ── Scoring Explainer ─────────────────────────────────────────
-    with st.expander("📊 Scoring & Thresholds", expanded=st.session_state.get("_show_thresholds", False)):
-        st.markdown(_scoring_explainer_html(), unsafe_allow_html=True)
 
     # ── Toggles ──────────────────────────────────────────────────
     tgl1, tgl2 = st.columns([2, 2])
