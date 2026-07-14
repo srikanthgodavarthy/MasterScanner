@@ -311,6 +311,7 @@ def generate_signals_historical(
         # Compute CV1 once; reuse values for signal dict.
         # Initialise here so the rejection-log append below always has values.
         _eq_val, _rr, _ls_val, _cv_val = 0, 0.0, 0, 0
+        _cv1 = None
         if not _rejection_reason:
             _cv1    = compute_conviction_v3(r, settings=settings)
             _ls_val = _cv1.leadership
@@ -344,6 +345,21 @@ def generate_signals_historical(
             elif _rr < (settings or {}).get("backtest_min_rr", 2.0):
                 _rejection_reason = "POOR_RR"
 
+        # ── Shadow diagnostic: Entry-Quality component audit ─────────
+        # Default OFF — zero production behavior change. When explicitly
+        # enabled via settings["shadow_no_admission_gate"], gate 2/3
+        # rejections are logged but NOT enforced, so the resulting trade
+        # population spans the full EQ range instead of only the top
+        # decile the live gate normally admits. This exists purely to
+        # break the restricted-range problem that flattened the EQ
+        # component correlations in the 165-trade audit (2026-07-14) —
+        # it must never be on for a real/live-facing backtest run.
+        # Safe because gate 1 (above) is fully disabled/commented, so
+        # _cv1 is always computed by the time we reach this point —
+        # there is no code path where a rejection fires before CV1 runs.
+        _shadow_no_gate = bool((settings or {}).get("shadow_no_admission_gate", False))
+        _passed_gate    = not bool(_rejection_reason)
+
         if _rejection_reason:
             rejections.append({
                 "date":                   df.index[i],
@@ -358,7 +374,15 @@ def generate_signals_historical(
                 "leadership_score":       _ls_val,
                 "conviction_score":       _cv_val,
             })
-            continue   # hard reject — do not create a trade signal
+            if not _shadow_no_gate:
+                continue   # hard reject — do not create a trade signal
+            # shadow mode: fall through and still score/simulate this
+            # setup so its outcome joins the diagnostic dataset, tagged
+            # passed_gate=False below. Defensive: if a future gate 1 fired
+            # before CV1 was computed above, compute it now rather than
+            # let signals.append() below hit an undefined _cv1.
+            if _cv1 is None:
+                _cv1 = compute_conviction_v3(r, settings=settings)
 
         last_signal_bar = i
 
@@ -398,6 +422,14 @@ def generate_signals_historical(
             "sl":              r.sl,
             "t1":              _sig_t1,
             "t2":              _sig_t2,
+            # ── Shadow diagnostic: EQ component audit (additive only) ──
+            "passed_gate":         _passed_gate,
+            "gate_rejection_reason": _rejection_reason,
+            "eq_ema20_dist":       _cv1.eq_ema20_dist,
+            "eq_ema50_dist":       _cv1.eq_ema50_dist,
+            "eq_pivot_dist":       _cv1.eq_pivot_dist,
+            "eq_move_since_setup": _cv1.eq_move_since_setup,
+            "eq_bars_since_setup": _cv1.eq_bars_since_setup,
             "t3":              _sig_t3,
             "t1_mult":         _t1m,
             "t2_mult":         _t2m,
@@ -1086,6 +1118,14 @@ def simulate_trades(
             "leadership_score":    int(sig.get("leadership_score",    0)),
             "conviction_score":    int(sig.get("conviction_score",    0)),
             "entry_quality_score": int(sig.get("entry_quality_score", 0)),
+            # ── Shadow diagnostic: EQ component audit (additive only) ──
+            "passed_gate":           bool(sig.get("passed_gate", True)),
+            "gate_rejection_reason": str(sig.get("gate_rejection_reason", "")),
+            "eq_ema20_dist":         int(sig.get("eq_ema20_dist",       0)),
+            "eq_ema50_dist":         int(sig.get("eq_ema50_dist",       0)),
+            "eq_pivot_dist":         int(sig.get("eq_pivot_dist",       0)),
+            "eq_move_since_setup":   int(sig.get("eq_move_since_setup", 0)),
+            "eq_bars_since_setup":   int(sig.get("eq_bars_since_setup", 0)),
             "structural_entry": bool(sig.get("structural_entry", False)),
             "tier1_prime":     bool(sig.get("tier1_prime",    False)),
             "tier2_momentum":  bool(sig.get("tier2_momentum", False)),
