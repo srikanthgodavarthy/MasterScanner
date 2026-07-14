@@ -3418,9 +3418,15 @@ def render(settings: dict | None = None):
     with row2_a:
         st.markdown(_top_gainers_panel(df_aug), unsafe_allow_html=True)
     with row2_b:
-        st.markdown(_sector_heatmap_panel(sector_stats), unsafe_allow_html=True)
+        st.markdown(_sector_opportunity_board_panel(sector_stats), unsafe_allow_html=True)
     with row2_c:
-        st.markdown(_leadership_rotation_panel(sector_stats, breadth), unsafe_allow_html=True)
+        # No real day-over-day rotation_metrics feed exists yet (see
+        # _leadership_rotation_panel docstring) -- `breadth` is a dict from
+        # _compute_breadth_stats, not the Sector/Momentum/NetInflow5D
+        # DataFrame this panel expects, so it must not be passed here.
+        # Passing None lets the panel's documented single-scan fallback
+        # (AvgChg as momentum, NetInflowCr as inflow) take over instead.
+        st.markdown(_leadership_rotation_panel(sector_stats, None), unsafe_allow_html=True)
 
     # ── Scoring Explainer ─────────────────────────────────────────
     with st.expander("📊 Scoring & Thresholds", expanded=st.session_state.get("_show_thresholds", False)):
