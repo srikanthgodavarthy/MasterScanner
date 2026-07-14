@@ -32,6 +32,7 @@ from utils.decision_engine import _extension as _ext_fn
 from utils.conviction_score_v1 import compute_conviction_v3, classify_tier_v3, _classify_v3
 from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
 from utils.adaptive_target_engine import AdaptiveTargetParams, compute_adaptive_targets, check_momentum_exit
+from utils.structural_levels import structural_ceiling
 from utils.regime_engine  import (
     build_regime_context, RegimeContext,
     bar_result_to_row, compute_composite, _classify_tier,
@@ -415,6 +416,24 @@ def generate_signals_historical(
             _t1m, _t2m, _t3m          = 1.5, 3.0, 5.0
             _tgt_cat, _tgt_adj, _tgt_notes = "Actionable", 0.0, ""
 
+        # ── Dimension 2: structural ceiling (diagnostic, not yet enforced) ──
+        # Logged alongside the tier-based T1/T2/T3 above so it can be joined
+        # against mfe_ceiling_table()'s empirical dimension-1 percentiles once
+        # the bigger-sample run is in. NOT used to cap _sig_t1/t2/t3 yet —
+        # dimension 1's calibrated per-quality-tier values aren't finalized
+        # (see mfe_ceiling_table() thin_sample flags), and capping against an
+        # uncalibrated dimension 1 would just substitute one guess for another.
+        # Once dimension 1 is calibrated, T1 becomes
+        # min(quality-modulated pause_r target, structural_ceiling_r).
+        _sc = structural_ceiling(
+            ph_causal = ia.ph_causal,
+            pl_causal = ia.pl_causal,
+            i         = i,
+            price     = r.entry,
+            atr_val   = r.atr_at_setup,
+            risk      = max(r.entry - r.sl, 0.01),
+        )
+
         signals.append({
             "date":            df.index[i],
             "score":           r.norm_score,
@@ -437,6 +456,10 @@ def generate_signals_historical(
             "target_category": _tgt_cat,
             "target_adj":      _tgt_adj,
             "target_notes":    _tgt_notes,
+            # Dimension 2 diagnostics — see note above compute() call.
+            "structural_ceiling":        _sc.ceiling,
+            "structural_ceiling_r":      _sc.ceiling_r,
+            "structural_ceiling_source": _sc.ceiling_source,
             "cci":             round(r.cur_cci),
             "rsi":             round(r.cur_rsi, 1),
             "tier1_prime":     r.tier1_prime,
