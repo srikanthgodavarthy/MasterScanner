@@ -778,38 +778,84 @@ _CSS = """
 }
 .ti-gainers-link a { color: var(--blue); text-decoration: none; font-weight: 600; }
 
-/* Sector Heatmap */
-.ti-heatmap-grid {
+/* Sector Opportunity Board */
+.ti-sob-wrap { display: grid; grid-template-columns: 1fr 130px; gap: 14px; }
+.ti-sob-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 8px;
 }
-.ti-heat-tile {
-  border-radius: 7px;
-  padding: 10px 11px;
-  min-height: 66px;
+.ti-sob-card {
+  border-radius: 8px;
+  padding: 10px 11px 8px;
+  min-height: 86px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
 }
-.ti-heat-name  { font-size: 11px; font-weight: 700; color: #fff; margin-bottom: 4px; }
-.ti-heat-chg   { font-size: 15px; font-weight: 700; color: #fff; line-height: 1.1; }
-.ti-heat-count { font-size: 9.5px; color: rgba(255,255,255,0.75); margin-top: 3px; }
-.ti-heatmap-hint {
+.ti-sob-top { display: flex; align-items: center; justify-content: space-between; }
+.ti-sob-name { font-size: 10.5px; font-weight: 700; color: rgba(255,255,255,0.92); }
+.ti-sob-trend { font-size: 12px; font-weight: 700; }
+.ti-sob-trend.up      { color: #4ade80; }
+.ti-sob-trend.down    { color: #fca5a5; }
+.ti-sob-trend.neutral { color: #fbbf24; }
+.ti-sob-score { font-size: 24px; font-weight: 700; font-family: var(--mono); color: #fff; line-height: 1.05; margin: 2px 0; }
+.ti-sob-meta  { font-size: 9.5px; font-weight: 600; color: rgba(255,255,255,0.75); font-family: var(--mono); letter-spacing: 0.02em; }
+.ti-sob-spark { display: block; margin-top: 3px; }
+.ti-sob-hint {
+  grid-column: 1 / -1;
   text-align: center; font-size: 10.5px; color: var(--blue);
   margin-top: 10px; cursor: default;
 }
-
-/* Leadership Rotation */
-.ti-rotation-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 14px; }
-.ti-rotation-head { font-size: 10px; font-weight: 700; letter-spacing: 0.05em; margin-bottom: 8px; }
-.ti-rotation-head.up   { color: var(--green); }
-.ti-rotation-head.down { color: var(--red); }
-.ti-rotation-item {
-  font-size: 11.5px; color: var(--text); padding: 3px 0;
-  display: flex; align-items: center; gap: 6px;
+.ti-sob-legend {
+  background: var(--bg1); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 11px; font-size: 9.5px; color: var(--muted);
 }
-.ti-rotation-item .arrow-up   { color: var(--green); font-weight: 700; }
-.ti-rotation-item .arrow-down { color: var(--red); font-weight: 700; }
+.ti-sob-legend-title { font-size: 9px; font-weight: 700; letter-spacing: 0.05em; color: var(--text); margin-bottom: 2px; }
+.ti-sob-legend-range { font-size: 8.5px; color: var(--muted); margin-bottom: 8px; }
+.ti-sob-legend-key { display: flex; gap: 6px; margin: 2px 0; }
+.ti-sob-legend-key b { color: var(--text); }
 
-/* Market Breadth mini-stats (nested inside Leadership Rotation panel) */
+/* Leadership Rotation — Sector Momentum list */
+.ti-lead-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.ti-mom-title {
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
+  color: var(--muted); margin-bottom: 8px;
+}
+.ti-mom-row {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 11.5px; color: var(--text); padding: 4px 0;
+}
+.ti-mom-name { display: flex; align-items: center; gap: 6px; }
+.ti-mom-name .arrow-up   { color: var(--green); font-weight: 700; }
+.ti-mom-name .arrow-down { color: var(--red); font-weight: 700; }
+.ti-mom-val { font-family: var(--mono); font-weight: 700; font-size: 11.5px; }
+.ti-mom-val.up   { color: var(--green); }
+.ti-mom-val.down { color: var(--red); }
+.ti-mom-note { font-size: 9px; color: var(--muted); margin-top: 6px; font-style: italic; }
+
+/* Leadership Rotation — Net Inflow donut + Top 3 lists */
+.ti-inflow-ring-wrap { position: relative; width: 108px; height: 108px; margin: 0 auto 10px; }
+.ti-inflow-center {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; text-align: center;
+}
+.ti-inflow-value { font-size: 14px; font-weight: 700; font-family: var(--mono); color: var(--text); line-height: 1.1; }
+.ti-inflow-label { font-size: 8px; color: var(--muted); margin-top: 2px; text-transform: uppercase; letter-spacing: 0.04em; }
+.ti-inflow-list-title {
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.03em; margin: 8px 0 4px;
+}
+.ti-inflow-list-title.up   { color: var(--green); }
+.ti-inflow-list-title.down { color: var(--red); }
+.ti-inflow-list-row {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 10.5px; color: var(--text); padding: 2px 0;
+}
+.ti-inflow-list-val { font-family: var(--mono); font-weight: 700; }
+.ti-inflow-list-val.up   { color: var(--green); }
+.ti-inflow-list-val.down { color: var(--red); }
+
+/* Market Breadth mini-stats (still used by MARKET INTELLIGENCE panel) */
 .ti-breadth-title {
   font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
   color: var(--muted); margin: 4px 0 8px; padding-top: 10px; border-top: 1px solid var(--border);
@@ -1903,100 +1949,218 @@ def _top_gainers_panel(df: pd.DataFrame, top_n: int = 10) -> str:
 """
 
 
-# ── SECTOR HEATMAP PANEL ─────────────────────────────────────────────
+# ── SECTOR OPPORTUNITY BOARD PANEL ────────────────────────────────────
 
-def _heat_color(chg: float) -> str:
-    """Green/red tile background, intensity scaled by |%chg| — mirrors the
-    saturation banding used in the reference design (stronger moves ->
-    deeper color) rather than a flat two-tone scheme."""
-    if chg >= 2.0:   return "#1f7a3d"
-    if chg >= 0.7:   return "#2d8f4e"
-    if chg >= 0.0:   return "#1e5631"
-    if chg >= -0.7:  return "#7a1f1f"
-    if chg >= -2.0:  return "#8f2d2d"
+def _opp_color(score: float) -> str:
+    """Background color for a sector card, banded by OppScore (0-100) --
+    deep green at the top, deep red at the bottom, matching the reference
+    design's saturation banding."""
+    if score >= 80: return "#1f7a3d"
+    if score >= 60: return "#2d8f4e"
+    if score >= 45: return "#8a6d1f"
+    if score >= 30: return "#8f2d2d"
     return "#a11d1d"
 
 
-def _sector_heatmap_panel(sector_stats: pd.DataFrame, max_tiles: int = 12) -> str:
+_TREND_ARROW = {"up": "↑", "down": "↓", "neutral": "→"}
+
+
+def _sparkline_svg(values: list[float], color: str = "rgba(255,255,255,0.85)",
+                    width: int = 54, height: int = 15) -> str:
+    """Small inline trend line from real recent daily values (cumulative
+    sum of AvgChg, so a run of positive days reads as a rising line).
+    Falls back to a flat dash when there isn't enough history yet --
+    honest about the cold-start rather than faking a trend."""
+    if not values or len(values) < 2:
+        y = height / 2
+        return (f'<svg class="ti-sob-spark" width="{width}" height="{height}" viewBox="0 0 {width} {height}">'
+                f'<line x1="2" y1="{y}" x2="{width-2}" y2="{y}" stroke="{color}" stroke-width="1.4" opacity="0.45"/></svg>')
+    lo, hi = min(values), max(values)
+    span = (hi - lo) or 1.0
+    step = (width - 4) / (len(values) - 1)
+    pts = []
+    for i, v in enumerate(values):
+        x = 2 + i * step
+        y = height - 2 - ((v - lo) / span) * (height - 4)
+        pts.append(f"{x:.1f},{y:.1f}")
+    return (f'<svg class="ti-sob-spark" width="{width}" height="{height}" viewBox="0 0 {width} {height}">'
+            f'<polyline points="{" ".join(pts)}" fill="none" stroke="{color}" '
+            f'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>')
+
+
+def _sector_opportunity_board_panel(sector_stats: pd.DataFrame,
+                                     history: pd.DataFrame | None = None,
+                                     max_tiles: int = 12) -> str:
     if sector_stats is None or sector_stats.empty:
-        return '<div class="ti-panel"><div class="ti-panel-title">🔊 SECTOR HEATMAP</div>' \
+        return '<div class="ti-panel"><div class="ti-panel-title">🧭 SECTOR OPPORTUNITY BOARD</div>' \
                '<div style="color:var(--muted);font-size:11px">No sector data</div></div>'
 
-    tiles = sector_stats.head(max_tiles)
+    # Real recent daily AvgChg per sector (cumulative, for the sparkline) --
+    # only present once sector_snapshots has accumulated a few days.
+    spark_by_sector: dict[str, list[float]] = {}
+    if history is not None and not history.empty and "sector" in history.columns:
+        for sector, grp in history.groupby("sector"):
+            vals = pd.to_numeric(grp.sort_values("scan_date")["avg_chg"], errors="coerce").fillna(0.0).tail(8).tolist()
+            spark_by_sector[sector] = list(pd.Series(vals).cumsum())
+
+    tiles = sector_stats.sort_values("OppScore", ascending=False).head(max_tiles)
     cells = []
     for _, row in tiles.iterrows():
-        chg   = float(row["AvgChg"])
-        sign  = "+" if chg >= 0 else ""
-        color = _heat_color(chg)
-        n_lead = int(row["Leaders"])
+        sector = str(row["Sector"])
+        score  = float(row.get("OppScore", 0) or 0)
+        trend  = str(row.get("Trend", "neutral"))
+        color  = _opp_color(score)
+        arrow  = _TREND_ARROW.get(trend, "→")
+        e_ct, x_ct, w_ct = int(row.get("EliteCount", 0)), int(row.get("ExecuteCount", 0)), int(row.get("WatchCount", 0))
+        spark  = _sparkline_svg(spark_by_sector.get(sector, []))
         cells.append(
-            f'<div class="ti-heat-tile" style="background:{color}">'
-            f'<div class="ti-heat-name">{row["Sector"]}</div>'
-            f'<div class="ti-heat-chg">{sign}{chg:.2f}%</div>'
-            f'<div class="ti-heat-count">{n_lead} Leader{"s" if n_lead != 1 else ""}</div>'
+            f'<div class="ti-sob-card" style="background:{color}">'
+            f'<div class="ti-sob-top"><span class="ti-sob-name">{sector}</span>'
+            f'<span class="ti-sob-trend {trend}">{arrow}</span></div>'
+            f'<div class="ti-sob-score">{score:.0f}</div>'
+            f'<div class="ti-sob-meta">E {e_ct} &middot; X {x_ct} &middot; W {w_ct}</div>'
+            f'{spark}'
             f'</div>'
         )
 
+    legend = """
+<div class="ti-sob-legend">
+  <div class="ti-sob-legend-title">Leadership Score</div>
+  <div class="ti-sob-legend-range">(0 &ndash; 100)</div>
+  <div class="ti-sob-legend-title">Entry Quality Score</div>
+  <div class="ti-sob-legend-range">(0 &ndash; 100)</div>
+  <div class="ti-sob-legend-title" style="margin-top:6px">Trend</div>
+  <div class="ti-sob-legend-key">↑ <span>Improving</span></div>
+  <div class="ti-sob-legend-key">→ <span>Neutral</span></div>
+  <div class="ti-sob-legend-key">↓ <span>Weakening</span></div>
+  <div class="ti-sob-legend-title" style="margin-top:6px"><b>E</b>: Elite &middot; <b>X</b>: Execute &middot; <b>W</b>: Watch</div>
+</div>
+"""
+
     return f"""
 <div class="ti-panel">
-  <div class="ti-panel-title">🔊 SECTOR HEATMAP</div>
-  <div class="ti-heatmap-grid">{"".join(cells)}</div>
-  <div class="ti-heatmap-hint">Sector performance across today's scanned universe</div>
+  <div class="ti-panel-title">🧭 SECTOR OPPORTUNITY BOARD</div>
+  <div class="ti-sob-wrap">
+    <div class="ti-sob-grid">{"".join(cells)}</div>
+    {legend}
+  </div>
+  <div class="ti-sob-hint">Click a sector to filter scanner &rarr;</div>
 </div>
 """
 
 
-# ── LEADERSHIP ROTATION + MARKET BREADTH PANEL ───────────────────────
+# ── LEADERSHIP ROTATION PANEL (Sector Momentum + Net Inflow) ──────────
 
-def _leadership_rotation_panel(sector_stats: pd.DataFrame, breadth: dict, n: int = 5) -> str:
+def _donut_ring_svg(fraction: float, color: str, size: int = 108, stroke: int = 10) -> str:
+    fraction = max(0.0, min(1.0, fraction))
+    r = (size - stroke) / 2
+    circumference = 2 * 3.14159265 * r
+    dash = fraction * circumference
+    return (
+        f'<svg width="{size}" height="{size}" viewBox="0 0 {size} {size}">'
+        f'<circle cx="{size/2}" cy="{size/2}" r="{r}" fill="none" '
+        f'stroke="rgba(255,255,255,0.08)" stroke-width="{stroke}"/>'
+        f'<circle cx="{size/2}" cy="{size/2}" r="{r}" fill="none" stroke="{color}" '
+        f'stroke-width="{stroke}" stroke-dasharray="{dash:.2f} {circumference:.2f}" '
+        f'stroke-linecap="round" transform="rotate(-90 {size/2} {size/2})"/>'
+        f'</svg>'
+    )
+
+
+def _leadership_rotation_panel(sector_stats: pd.DataFrame,
+                                rotation_metrics: pd.DataFrame | None = None,
+                                limit: int = 10) -> str:
     if sector_stats is None or sector_stats.empty:
-        stronger, weaker = [], []
+        return '<div class="ti-panel"><div class="ti-panel-title">⇅ LEADERSHIP ROTATION</div>' \
+               '<div style="color:var(--muted);font-size:11px">No sector data</div></div>'
+
+    has_history = rotation_metrics is not None and not rotation_metrics.empty
+
+    # ── Sector Momentum (vs 20D ago) — falls back to today's AvgChg,
+    #    clearly noted, until sector_snapshots has real multi-day history. ──
+    if has_history:
+        mom = sector_stats[["Sector"]].merge(rotation_metrics, on="Sector", how="left")
+        mom["Momentum"]     = mom["Momentum"].fillna(0.0)
+        mom["MomentumDays"] = mom["MomentumDays"].fillna(0).astype(int)
     else:
-        ranked   = sector_stats.sort_values("AvgChg", ascending=False)
-        stronger = ranked.head(n)["Sector"].tolist()
-        weaker   = ranked.tail(n)["Sector"].tolist()[::-1]
+        mom = sector_stats[["Sector", "AvgChg"]].rename(columns={"AvgChg": "Momentum"})
+        mom["MomentumDays"] = 1
 
-    def _list_html(items, arrow_cls, arrow_char):
-        if not items:
-            return '<div style="color:var(--muted);font-size:11px">—</div>'
-        return "".join(
-            f'<div class="ti-rotation-item"><span class="{arrow_cls}">{arrow_char}</span>{s}</div>'
-            for s in items
+    mom = mom.sort_values("Momentum", ascending=False).head(limit)
+    max_days = int(mom["MomentumDays"].max()) if not mom.empty else 0
+
+    mom_rows = "".join(
+        f'<div class="ti-mom-row"><span class="ti-mom-name">'
+        f'<span class="{"arrow-up" if m >= 0 else "arrow-down"}">{"↑" if m >= 0 else "↓"}</span>{s}</span>'
+        f'<span class="ti-mom-val {"up" if m >= 0 else "down"}">{"+" if m >= 0 else ""}{m:.1f}</span></div>'
+        for s, m in zip(mom["Sector"], mom["Momentum"])
+    ) or '<div style="color:var(--muted);font-size:11px">—</div>'
+
+    mom_note = (
+        f'<div class="ti-mom-note">Based on {max_days} trading day{"s" if max_days != 1 else ""} of history '
+        f'collected so far &mdash; full 20-day window builds up over time.</div>'
+        if max_days < 20 else ""
+    )
+
+    # ── Net Inflow (5D) ─────────────────────────────────────────────
+    if has_history and "NetInflow5D" in rotation_metrics.columns:
+        inflow = sector_stats[["Sector"]].merge(
+            rotation_metrics[["Sector", "NetInflow5D", "InflowDays"]], on="Sector", how="left"
         )
+        inflow["NetInflow5D"] = inflow["NetInflow5D"].fillna(0.0)
+        inflow["InflowDays"]  = inflow["InflowDays"].fillna(0).astype(int)
+        inflow_days = int(inflow["InflowDays"].max()) if not inflow.empty else 0
+    else:
+        inflow = sector_stats[["Sector", "NetInflowCr"]].rename(columns={"NetInflowCr": "NetInflow5D"})
+        inflow_days = 1
 
-    adv, dec = breadth["advancing"], breadth["declining"]
+    total_inflow = float(inflow["NetInflow5D"].sum())
+    pos_sum = float(inflow.loc[inflow["NetInflow5D"] > 0, "NetInflow5D"].sum())
+    abs_sum = float(inflow["NetInflow5D"].abs().sum())
+    fraction = (pos_sum / abs_sum) if abs_sum > 0 else 0.5
+    ring_color = "var(--green)" if total_inflow >= 0 else "var(--red)"
+    ring_svg = _donut_ring_svg(fraction, "#3fb950" if total_inflow >= 0 else "#f85149")
+
+    top_in  = inflow.sort_values("NetInflow5D", ascending=False).head(3)
+    top_out = inflow.sort_values("NetInflow5D", ascending=True).head(3)
+
+    def _flow_rows(df_):
+        rows = ""
+        for i, (_, r) in enumerate(df_.iterrows(), 1):
+            v = float(r["NetInflow5D"])
+            rows += (f'<div class="ti-inflow-list-row"><span>{i}&nbsp; {r["Sector"]}</span>'
+                      f'<span class="ti-inflow-list-val {"up" if v >= 0 else "down"}">'
+                      f'{"+" if v >= 0 else ""}{v:,.0f} Cr</span></div>')
+        return rows or '<div style="color:var(--muted);font-size:10.5px">—</div>'
+
+    inflow_note = (
+        f'<div class="ti-mom-note">{inflow_days}d of {"5" if inflow_days >= 5 else "5"}-day window collected.</div>'
+        if inflow_days < 5 else ""
+    )
 
     return f"""
 <div class="ti-panel">
   <div class="ti-panel-title">⇅ LEADERSHIP ROTATION</div>
-  <div class="ti-rotation-cols">
+  <div class="ti-lead-cols">
     <div>
-      <div class="ti-rotation-head up">STRONGER SECTORS</div>
-      {_list_html(stronger, "arrow-up", "↑")}
+      <div class="ti-mom-title">Sector Momentum (vs 20D ago)</div>
+      {mom_rows}
+      {mom_note}
     </div>
     <div>
-      <div class="ti-rotation-head down">WEAKER SECTORS</div>
-      {_list_html(weaker, "arrow-down", "↓")}
-    </div>
-  </div>
-
-  <div class="ti-breadth-title">ⓘ MARKET BREADTH</div>
-  <div class="ti-breadth-grid">
-    <div class="ti-breadth-stat">
-      <div class="ti-breadth-num up">↑ {adv}</div>
-      <div class="ti-breadth-lbl">Advancing</div>
-    </div>
-    <div class="ti-breadth-stat">
-      <div class="ti-breadth-num down">↓ {dec}</div>
-      <div class="ti-breadth-lbl">Declining</div>
-    </div>
-    <div class="ti-breadth-stat">
-      <div class="ti-breadth-num">{breadth["pct_above_ema20"]}%</div>
-      <div class="ti-breadth-lbl">Above EMA20</div>
-    </div>
-    <div class="ti-breadth-stat">
-      <div class="ti-breadth-num">{breadth["pct_above_ema200"]}%</div>
-      <div class="ti-breadth-lbl">Above EMA200</div>
+      <div class="ti-mom-title">Net Inflow (5D)</div>
+      <div class="ti-inflow-ring-wrap">
+        {ring_svg}
+        <div class="ti-inflow-center">
+          <div class="ti-inflow-value" style="color:{ring_color}">{"+" if total_inflow >= 0 else ""}{total_inflow:,.0f} Cr</div>
+          <div class="ti-inflow-label">Net Inflow</div>
+        </div>
+      </div>
+      <div class="ti-inflow-list-title up">Top 3 Inflow Sectors</div>
+      {_flow_rows(top_in)}
+      <div class="ti-inflow-list-title down">Top 3 Outflow Sectors</div>
+      {_flow_rows(top_out)}
+      {inflow_note}
     </div>
   </div>
 </div>
