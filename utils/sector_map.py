@@ -215,18 +215,40 @@ def build_sector_stats(df: pd.DataFrame,
                         rec_col: str = "Recommendation") -> pd.DataFrame:
     """
     Aggregate a scan result df into one row per sector:
-        Sector | AvgChg | Leaders | StockCount | Advancing | Declining
+        Sector | AvgChg | Leaders | StockCount | Advancing | Declining |
+        OppScore | Trend | EliteCount | ExecuteCount | WatchCount | NetInflowCr
 
-    - AvgChg     : mean %Chg of stocks in that sector (drives heatmap color)
-    - Leaders    : count of stocks in Elite/Execute/Actionable-tier recommendation
-                   (proxy for "leaders" -- no separate sector-index feed exists,
-                   see module docstring / pillar_engine.py's sector-leadership note)
+    - AvgChg      : mean %Chg of stocks in that sector (drives heatmap color)
+    - Leaders     : count of stocks in Elite/Execute/Actionable-tier recommendation
+                    (proxy for "leaders" -- no separate sector-index feed exists,
+                    see module docstring / pillar_engine.py's sector-leadership note)
     - Advancing / Declining : simple breadth within the sector
+    - OppScore    : 0-100 opportunity score for pages/scanner.py's Sector
+                    Opportunity Board. Blend of (a) the sector's mean
+                    CV1_Composite (setup quality, if present in df) and
+                    (b) the proportion of stocks that are Elite/Execute/
+                    Actionable. Falls back to an AvgChg-derived score if
+                    CV1_Composite isn't in df (e.g. cached pre-CV1 scans).
+    - Trend       : "up" / "down" / "neutral", from AvgChg vs a small
+                    deadband -- same convention as elsewhere in the app.
+    - EliteCount / ExecuteCount / WatchCount : per-tier counts, for the
+                    Sector Opportunity Board's "E · X · W" tile line.
+    - NetInflowCr : PROXY, not real traded value. There's no real
+                    price*volume feed wired into the scanner (see
+                    scanner_engine._vol_ratio, which is volume vs its own
+                    20-bar average, not absolute traded value), so this is
+                    a directional proxy only: sum of (vol_ratio - 1) *
+                    %Chg per stock, scaled to look like Cr for the
+                    Leadership Rotation donut. Treat as a rough "which way
+                    is volume-weighted money leaning" signal, not a real
+                    inflow/outflow figure.
 
     Returns empty DataFrame if required columns are missing.
     """
     empty = pd.DataFrame(columns=["Sector", "AvgChg", "Leaders", "StockCount",
-                                   "Advancing", "Declining"])
+                                   "Advancing", "Declining", "OppScore", "Trend",
+                                   "EliteCount", "ExecuteCount", "WatchCount",
+                                   "NetInflowCr"])
     if df is None or df.empty or symbol_col not in df.columns:
         return empty
 
@@ -239,18 +261,68 @@ def build_sector_stats(df: pd.DataFrame,
         work["_chg"] = pd.NA
 
     leader_tiers = {"Elite", "Execute", "Actionable"}
-    work["_is_leader"] = work[rec_col].isin(leader_tiers) if rec_col in work.columns else False
+    has_rec = rec_col in work.columns
+    work["_is_leader"] = work[rec_col].isin(leader_tiers) if has_rec else False
+
+    has_composite = "CV1_Composite" in work.columns
+    if has_composite:
+        work["_composite"] = pd.to_numeric(work["CV1_Composite"], errors="coerce")
+
+    has_vol_ratio = "_vol_ratio" in work.columns
+    if has_vol_ratio:
+        work["_vr"] = pd.to_numeric(work["_vol_ratio"], errors="coerce")
 
     rows = []
     for sector, grp in work.groupby("_sector"):
+        n = len(grp)
         has_chg = grp["_chg"].notna().any()
+        avg_chg = round(float(grp["_chg"].mean()), 2) if has_chg else 0.0
+
+        elite_ct   = int((grp[rec_col] == "Elite").sum())   if has_rec else 0
+        execute_ct = int((grp[rec_col] == "Execute").sum()) if has_rec else 0
+        watch_ct   = int((grp[rec_col] == "Watch").sum())   if has_rec else 0
+
+        if has_composite and grp["_composite"].notna().any():
+            avg_composite = float(grp["_composite"].mean())
+        else:
+            avg_composite = None
+
+        leader_frac = (int(grp["_is_leader"].sum()) / n) if n else 0.0
+        if avg_composite is not None:
+            # 70% setup-quality composite, 30% breadth of qualifying setups
+            opp_score = 0.7 * avg_composite + 0.3 * (leader_frac * 100)
+        else:
+            # No CV1 data (older cached scan) -- fall back to a coarse
+            # score derived from AvgChg + leader breadth only.
+            chg_component = max(0.0, min(100.0, 50.0 + avg_chg * 5))
+            opp_score = 0.5 * chg_component + 0.5 * (leader_frac * 100)
+        opp_score = round(max(0.0, min(100.0, opp_score)), 1)
+
+        if avg_chg > 0.5:
+            trend = "up"
+        elif avg_chg < -0.5:
+            trend = "down"
+        else:
+            trend = "neutral"
+
+        if has_vol_ratio and has_chg:
+            net_inflow = float(((grp["_vr"].fillna(1.0) - 1.0) * grp["_chg"].fillna(0.0)).sum()) * 10.0
+        else:
+            net_inflow = 0.0
+
         rows.append({
-            "Sector":     sector,
-            "AvgChg":     round(float(grp["_chg"].mean()), 2) if has_chg else 0.0,
-            "Leaders":    int(grp["_is_leader"].sum()),
-            "StockCount": int(len(grp)),
-            "Advancing":  int((grp["_chg"] > 0).sum()) if has_chg else 0,
-            "Declining":  int((grp["_chg"] < 0).sum()) if has_chg else 0,
+            "Sector":       sector,
+            "AvgChg":       avg_chg,
+            "Leaders":      int(grp["_is_leader"].sum()),
+            "StockCount":   n,
+            "Advancing":    int((grp["_chg"] > 0).sum()) if has_chg else 0,
+            "Declining":    int((grp["_chg"] < 0).sum()) if has_chg else 0,
+            "OppScore":     opp_score,
+            "Trend":        trend,
+            "EliteCount":   elite_ct,
+            "ExecuteCount": execute_ct,
+            "WatchCount":   watch_ct,
+            "NetInflowCr":  round(net_inflow, 1),
         })
 
     out = pd.DataFrame(rows)
