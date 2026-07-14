@@ -394,6 +394,12 @@ class IndicatorArrays:
     # P1: Precomputed pivot series (full-length, NaN where not a pivot)
     ph_series: pd.Series = None   # pivot highs
     pl_series: pd.Series = None   # pivot lows
+    # Dimension 2 (structural ceiling): causal-confirmed pivots — safe to
+    # index at any as-of bar i inside a walk-forward loop. See
+    # utils.structural_levels.causal_pivot_series() for why this differs
+    # from ph_series/pl_series above.
+    ph_causal: pd.Series = None
+    pl_causal: pd.Series = None
     # Raw numpy arrays for P3 (fast scalar access)
     _c_arr:   np.ndarray = None
     _h_arr:   np.ndarray = None
@@ -539,6 +545,17 @@ def build_indicators(
     from utils.pivot_engine import build_pivot_series
     ph_series, pl_series = build_pivot_series(h, l, params.pvt_lb)
 
+    # ── Dimension 2 (structural ceiling): causal pivot series ────────
+    # NOT the same as ph_series/pl_series above. Those use a centered
+    # rolling window (lookahead-safe only for live scanning, where
+    # "today" is always the last bar). structural_levels.causal_pivot_series
+    # re-indexes each pivot's confirmation lb bars forward so that, at
+    # any as-of bar i inside this walk-forward loop, ph_causal[j]/pl_causal[j]
+    # for j <= i was genuinely confirmable using only bars <= i. Computed
+    # once per symbol here; indexed per-bar in generate_signals_historical().
+    from utils.structural_levels import causal_pivot_series
+    ph_causal, pl_causal = causal_pivot_series(h, l, params.pvt_lb)
+
     # ── P3: Cache numpy arrays for fast scalar access ─────────────
     _c_arr    = c.values.astype(np.float64)
     _h_arr    = h.values.astype(np.float64)
@@ -574,6 +591,7 @@ def build_indicators(
         cloud_top=cloud_top, cloud_bottom=cloud_bottom,
         nifty_aligned=nifty_aligned,
         ph_series=ph_series, pl_series=pl_series,
+        ph_causal=ph_causal, pl_causal=pl_causal,
         _c_arr=_c_arr, _h_arr=_h_arr, _l_arr=_l_arr, _cci_arr=_cci_arr,
         _e20_arr=_e20_arr, _e50_arr=_e50_arr, _e200_arr=_e200_arr,
         _atr_arr=_atr_arr, _vol_arr=_vol_arr, _vavg_arr=_vavg_arr,
