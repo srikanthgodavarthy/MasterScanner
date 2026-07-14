@@ -344,6 +344,27 @@ _CSS = """
 .sc-count-label { color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: 0.05em; }
 .sc-count-num   { font-weight: 700; }
 
+/* ── Result tab strip (Actionable / Developing / Fib Pullback / Active Setups) ── */
+.stTabs [data-baseweb="tab-list"] {
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+}
+.stTabs [data-baseweb="tab"] {
+  height: 38px;
+  padding: 0 4px;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--muted);
+  background: transparent;
+}
+.stTabs [aria-selected="true"] {
+  color: var(--blue) !important;
+  border-bottom: 2px solid var(--blue) !important;
+}
+.stTabs [data-baseweb="tab-highlight"] { background: transparent; }
+.stTabs [data-baseweb="tab-border"] { display: none; }
+
 /* ── Section label ── */
 .section-label {
   padding: 3px 10px;
@@ -3251,14 +3272,13 @@ def render(settings: dict | None = None):
         _open_plans_preview = {}
 
     tab_labels = [
-        f"🌟 Elite ({len(elite_df)})",
-        f"🚀 Execute/Actionable ({len(execute_df) + len(actionable_df)})",
-        f"🧭 Developing/Watch ({len(developing_df) + len(watch_df)})",
+        f"✅ Actionable ({len(elite_df) + len(execute_df) + len(actionable_df)})",
+        f"🧭 Developing ({len(developing_df) + len(watch_df)})",
         f"📐 Fib Pullback ({len(fib_pb_records)})",
-        f"📋 Active Plans ({len(_open_plans_preview)})",
+        f"📋 Active Setups ({len(_open_plans_preview)})",
     ]
-    df_sets  = [elite_df, pd.DataFrame(), pd.DataFrame(), fib_pb_df, pd.DataFrame()]
-    set_keys = ["ELITE", "EXEC_ACTIONABLE", "DEV_WATCH", "FIB_PULLBACK", "ACTIVE_PLANS"]
+    df_sets  = [pd.DataFrame(), pd.DataFrame(), fib_pb_df, pd.DataFrame()]
+    set_keys = ["ELITE_EXEC_ACTIONABLE", "DEV_WATCH", "FIB_PULLBACK", "ACTIVE_PLANS"]
 
     if show_skip:
         skip_df = _sc_df("Skip") if has_cv1 else pd.DataFrame()
@@ -3281,19 +3301,21 @@ def render(settings: dict | None = None):
                 _render_active_plans_tab(df_aug, preloaded_plans=_open_plans_preview)
                 continue
 
-            # ── EXEC_ACTIONABLE: merged tab — Execute (timing-confirmed,
-            #    higher urgency) and Actionable (quality-qualified, plan
-            #    created, awaiting trigger) are shown together in one table,
-            #    Execute rows first. Each row already carries its own
-            #    Recommendation badge (EXECUTE/ACTIONABLE), so no sub-filter
-            #    is needed to tell them apart.
-            _merged_exec_actionable = False
+            # ── ELITE_EXEC_ACTIONABLE: merged tab — Elite (highest
+            #    conviction), Execute (timing-confirmed, higher urgency)
+            #    and Actionable (quality-qualified, plan created, awaiting
+            #    trigger) are all shown together in one "Actionable" table,
+            #    highest tier first. Each row already carries its own
+            #    Recommendation badge (ELITE/EXECUTE/ACTIONABLE), so no
+            #    sub-filter is needed to tell them apart.
+            _merged_actionable = False
             _merged_dev_watch = False
 
-            if sc_key == "EXEC_ACTIONABLE":
-                df_subset = pd.concat([execute_df, actionable_df], ignore_index=True) if not (execute_df.empty and actionable_df.empty) else pd.DataFrame()
-                sc_key = "EXECUTE"   # column-set + accent color for the merged view
-                _merged_exec_actionable = True
+            if sc_key == "ELITE_EXEC_ACTIONABLE":
+                _parts = [d for d in (elite_df, execute_df, actionable_df) if not d.empty]
+                df_subset = pd.concat(_parts, ignore_index=True) if _parts else pd.DataFrame()
+                sc_key = "ACTIONABLE"   # column-set + accent color for the merged view
+                _merged_actionable = True
 
             # ── DEV_WATCH: merged tab — Developing (closer to qualifying)
             #    and Watch shown together in one table, Developing first.
@@ -3303,13 +3325,13 @@ def render(settings: dict | None = None):
                 _merged_dev_watch = True
 
             sc_color, sc_label = _SC_STYLE.get(sc_key, ("#484f58", sc_key))
-            if sc_key == "EXECUTE" and _merged_exec_actionable:
-                sc_label = "EXECUTE / ACTIONABLE"
+            if sc_key == "ACTIONABLE" and _merged_actionable:
+                sc_label = "ACTIONABLE (ELITE / EXECUTE / ACTIONABLE)"
             elif sc_key == "DEVELOPING" and _merged_dev_watch:
-                sc_label = "DEVELOPING / WATCH"
+                sc_label = "DEVELOPING (DEVELOPING / WATCH)"
 
             if df_subset.empty:
-                if sc_key == "ELITE" and summary.get("regime") != "TREND":
+                if sc_key == "ACTIONABLE" and _merged_actionable and summary.get("regime") != "TREND":
                     st.info(f"Execute gate restricted — market regime is {summary.get('regime', '?')}.")
                 else:
                     st.info(f"No {sc_label} candidates in this scan.")
