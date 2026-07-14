@@ -72,7 +72,7 @@ _SC_STYLE = {
 }
 
 _CAT_ORDER = [
-    "Elite Opportunity", "High Conviction", "Actionable",
+    "Elite Opportunity", "High Conviction",
     "Setup Building", "Leader", "Extended", "Avoid",
 ]
 _CAT_STYLE = {
@@ -3446,14 +3446,12 @@ def render(settings: dict | None = None):
         st.markdown(_leadership_rotation_panel(sector_stats, None), unsafe_allow_html=True)
 
     # ── Toggles ──────────────────────────────────────────────────
-    tgl1, tgl2 = st.columns([2, 2])
-    with tgl1:
-        val_mode = st.checkbox(
-            "🔬 Validation mode — Signal Class vs legacy tier side-by-side",
-            value=False, key="chk_validation_mode",
-        )
-    with tgl2:
-        show_skip = st.checkbox("Show SKIP candidates", value=False, key="chk_show_skip")
+    # Widgets now render inline next to the ACTIONABLE section label
+    # (below, inside the tab loop). Read the persisted values here so
+    # the SKIP-tab/validation-strip logic that runs before the tabs
+    # exist still sees the current toggle state.
+    val_mode  = st.session_state.get("chk_validation_mode", False)
+    show_skip = st.session_state.get("chk_show_skip", False)
 
     # ── Split by Recommendation (CV1 tier + Promotion Engine) ──────
     has_cv1 = "Recommendation" in df_aug.columns
@@ -3615,18 +3613,45 @@ def render(settings: dict | None = None):
                 sc_label = "DEVELOPING (DEVELOPING / WATCH)"
 
             if df_subset.empty:
-                if sc_key == "ACTIONABLE" and _merged_actionable and summary.get("regime") != "TREND":
-                    st.info(f"Execute gate restricted — market regime is {summary.get('regime', '?')}.")
+                if sc_key == "ACTIONABLE" and _merged_actionable:
+                    _etgl1, _etgl2 = st.columns([2, 1.4])
+                    with _etgl1:
+                        val_mode = st.checkbox(
+                            "🔬 Validation mode — Signal Class vs legacy tier side-by-side",
+                            value=val_mode, key="chk_validation_mode",
+                        )
+                    with _etgl2:
+                        show_skip = st.checkbox("Show SKIP candidates", value=show_skip, key="chk_show_skip")
+                    if summary.get("regime") != "TREND":
+                        st.info(f"Execute gate restricted — market regime is {summary.get('regime', '?')}.")
+                    else:
+                        st.info(f"No {sc_label} candidates in this scan.")
                 else:
                     st.info(f"No {sc_label} candidates in this scan.")
                 continue
 
             # Section label
-            st.markdown(
-                f'<div class="section-label" style="border-left-color:{sc_color};color:{sc_color};">'
-                f'{sc_label}</div>',
-                unsafe_allow_html=True,
-            )
+            if sc_key == "ACTIONABLE" and _merged_actionable:
+                lbl_col, tgl1, tgl2 = st.columns([2.4, 2, 1.4])
+                with lbl_col:
+                    st.markdown(
+                        f'<div class="section-label" style="border-left-color:{sc_color};color:{sc_color};">'
+                        f'{sc_label}</div>',
+                        unsafe_allow_html=True,
+                    )
+                with tgl1:
+                    val_mode = st.checkbox(
+                        "🔬 Validation mode — Signal Class vs legacy tier side-by-side",
+                        value=val_mode, key="chk_validation_mode",
+                    )
+                with tgl2:
+                    show_skip = st.checkbox("Show SKIP candidates", value=show_skip, key="chk_show_skip")
+            else:
+                st.markdown(
+                    f'<div class="section-label" style="border-left-color:{sc_color};color:{sc_color};">'
+                    f'{sc_label}</div>',
+                    unsafe_allow_html=True,
+                )
 
             _show_detail = st.toggle("Detail view", value=False, key=f"detail_{sc_key}")
 
