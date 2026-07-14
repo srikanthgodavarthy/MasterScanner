@@ -238,6 +238,8 @@ class RegimeContext:
     execute_threshold:  float = 70.0   # FIX 5: raised from 60 → 70
     force_execute:      bool  = False  # bypass TREND-only gate (user setting)
     adx_is_real:        bool  = False  # True = Wilder ADX; False = EMA-slope proxy
+    nifty_ema50_val:    float = 0.0    # Nifty EMA50 price level (for Market Overview gate cards)
+    nifty_ema200_val:   float = 0.0    # Nifty EMA200 price level (for Market Overview gate cards)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -469,9 +471,10 @@ def classify_regime(
     nifty: pd.Series,
     vix:   Optional[float] = None,
     adx:   Optional[float] = None,
-) -> tuple[str, float, float, bool, bool]:
+) -> tuple[str, float, float, bool, bool, float, float]:
     """
-    Returns (regime, vix_used, adx_used, nifty_above_ema50, nifty_above_ema200).
+    Returns (regime, vix_used, adx_used, nifty_above_ema50, nifty_above_ema200,
+              nifty_ema50_val, nifty_ema200_val).
 
     Priority:
       VIX > 22              → VOLATILE
@@ -488,16 +491,22 @@ def classify_regime(
 
     vix_val = float(vix) if vix is not None else 16.0
 
-    if vix_val > 22.0:
-        return "VOLATILE", vix_val, adx or 20.0, False, False
-
+    # Compute EMA50/EMA200 levels up front (independent of VIX regime branch)
+    # so the Market Overview panel always has real numbers to show, even
+    # when the regime resolves to VOLATILE via the early VIX return below.
     nifty_a50 = nifty_a200 = False
+    ema50_val = ema200_val = 0.0
     if not nifty.empty and len(nifty) >= 200:
         e50  = _ema(nifty, 50)
         e200 = _ema(nifty, 200)
         cur  = float(nifty.iloc[-1])
-        nifty_a50  = cur > float(e50.iloc[-1])
-        nifty_a200 = cur > float(e200.iloc[-1])
+        ema50_val  = float(e50.iloc[-1])
+        ema200_val = float(e200.iloc[-1])
+        nifty_a50  = cur > ema50_val
+        nifty_a200 = cur > ema200_val
+
+    if vix_val > 22.0:
+        return "VOLATILE", vix_val, adx or 20.0, False, False, ema50_val, ema200_val
 
     # FIX 3: use EMA slope proxy, not abs(price diff)/price
     adx_val = float(adx) if adx is not None else _ema_slope_adx_proxy(nifty)
@@ -505,9 +514,9 @@ def classify_regime(
     # FIX: VIX dead zone closed — TREND allowed up to 22.0 (not just ≤20.0).
     # FIX: nifty_a200 added — TREND only in confirmed bull structure (above both EMAs).
     if vix_val <= 22.0 and adx_val > 25.0 and nifty_a50 and nifty_a200:
-        return "TREND", vix_val, adx_val, nifty_a50, nifty_a200
+        return "TREND", vix_val, adx_val, nifty_a50, nifty_a200, ema50_val, ema200_val
 
-    return "RANGE", vix_val, adx_val, nifty_a50, nifty_a200
+    return "RANGE", vix_val, adx_val, nifty_a50, nifty_a200, ema50_val, ema200_val
 
 
 def fetch_india_vix() -> float:
@@ -554,7 +563,7 @@ def build_regime_context(
         adx = compute_nifty_adx()   # returns None on failure -> proxy used
 
     _adx_real = adx is not None   # True if compute_nifty_adx() returned a real Wilder ADX
-    regime, vix_used, adx_used, a50, a200 = classify_regime(nifty, vix, adx)
+    regime, vix_used, adx_used, a50, a200, ema50_val, ema200_val = classify_regime(nifty, vix, adx)
     nifty_mom3, nifty_mom6 = _nifty_momentum(nifty)
 
     return RegimeContext(
@@ -569,6 +578,8 @@ def build_regime_context(
         execute_threshold  = execute_threshold,
         force_execute      = force_execute,
         adx_is_real        = _adx_real,
+        nifty_ema50_val    = ema50_val,
+        nifty_ema200_val   = ema200_val,
     )
 
 
@@ -665,6 +676,8 @@ def regime_summary(df_aug: pd.DataFrame, ctx: RegimeContext) -> dict:
         "adx":             round(ctx.adx_proxy, 1),
         "nifty_ema50":     ctx.nifty_above_ema50,
         "nifty_ema200":    ctx.nifty_above_ema200,
+        "nifty_ema50_val": ctx.nifty_ema50_val,
+        "nifty_ema200_val":ctx.nifty_ema200_val,
         "nifty_mom3":      ctx.nifty_mom3,
         "nifty_mom6":      ctx.nifty_mom6,
         "n_elite":         n_elite,
