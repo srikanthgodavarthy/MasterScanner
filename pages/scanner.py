@@ -379,8 +379,11 @@ _CSS = """
 .stTabs [data-baseweb="tab-border"] { display: none; }
 
 /* Actionable / Developing / Fib Pullback tab-panels: plain dark theme,
-   same as the rest of the app (no re-scoping needed here). */
+   same as the rest of the app. Background set explicitly (not just
+   inherited) so these three tabs are guaranteed dark. */
 .stTabs [data-baseweb="tab-panel"] {
+  background: var(--bg0);
+  color: var(--text);
   padding: 14px 16px 18px;
   border-radius: 0 0 10px 10px;
   border: 1px solid var(--border);
@@ -449,13 +452,16 @@ _CSS = """
   border-left-style: solid;
 }
 
-/* ── Rich HTML results table (light zone, matches reference image) ── */
+/* ── Rich HTML results table — theme-aware: dark by default (Actionable /
+   Developing / Fib Pullback tabs), automatically flips to the light "data
+   zone" only inside the Active Setups tab-panel, which re-scopes --bg*/
+   --text/--muted/--border to their --tbl-* light equivalents above. ── */
 .rt-wrap {
   width: 100%;
   overflow-x: auto;
   border-radius: 8px;
-  border: 1px solid var(--tbl-border);
-  background: var(--tbl-bg1);
+  border: 1px solid var(--border);
+  background: var(--bg1);
   margin-bottom: 10px;
   max-height: 520px;
   overflow-y: auto;
@@ -472,8 +478,8 @@ _CSS = """
   z-index: 2;
 }
 .rt thead th {
-  background: var(--tbl-bg2);
-  color: var(--tbl-muted);
+  background: var(--bg2);
+  color: var(--muted);
   font-size: 0.68rem;
   font-weight: 700;
   text-transform: uppercase;
@@ -481,23 +487,23 @@ _CSS = """
   padding: 8px 10px;
   text-align: center;
   white-space: nowrap;
-  border-bottom: 1px solid var(--tbl-border);
+  border-bottom: 1px solid var(--border);
 }
 .rt thead th.col-stock { text-align: left; padding-left: 12px; }
 .rt tbody tr {
-  border-bottom: 1px solid rgba(15,23,42,0.05);
+  border-bottom: 1px solid var(--border);
   transition: background 0.12s;
 }
-.rt tbody tr:nth-child(even) { background: rgba(15,23,42,0.015); }
-.rt tbody tr:hover { background: rgba(9,105,218,0.06) !important; }
+.rt tbody tr:nth-child(even) { background: rgba(148,163,184,0.05); }
+.rt tbody tr:hover { background: rgba(9,105,218,0.10) !important; }
 .rt td {
   padding: 7px 10px;
   text-align: center;
-  color: var(--tbl-text);
+  color: var(--text);
   white-space: nowrap;
 }
 .rt td.col-rank {
-  color: var(--tbl-muted);
+  color: var(--muted);
   font-size: 0.68rem;
   width: 28px;
   text-align: right;
@@ -507,13 +513,13 @@ _CSS = """
   text-align: left;
   padding-left: 12px;
   font-weight: 700;
-  color: var(--tbl-text);
+  color: var(--text);
   font-size: 0.78rem;
   min-width: 110px;
 }
 /* TradingView link — matches bold stock text, no underline by default */
 .tv-link {
-  color: var(--tbl-text);
+  color: var(--text);
   text-decoration: none;
   font-weight: 700;
   transition: color 0.15s;
@@ -529,20 +535,20 @@ _CSS = """
 /* score cell: number + mini bar */
 .score-cell { display: flex; flex-direction: column; align-items: center; gap: 3px; }
 .score-num  { font-weight: 600; font-size: 0.76rem; }
-.score-bar  { width: 36px; height: 3px; background: var(--tbl-bg3); border-radius: 2px; overflow: hidden; }
+.score-bar  { width: 36px; height: 3px; background: var(--bg3); border-radius: 2px; overflow: hidden; }
 .score-fill { height: 100%; border-radius: 2px; }
 /* size% bar chip */
 .size-chip {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  background: var(--tbl-bg2);
+  background: var(--bg2);
   border-radius: 4px;
   padding: 2px 7px;
   font-size: 0.72rem;
-  color: var(--tbl-text);
+  color: var(--text);
 }
-.size-bar  { width: 28px; height: 3px; background: var(--tbl-bg3); border-radius: 2px; overflow: hidden; }
+.size-bar  { width: 28px; height: 3px; background: var(--bg3); border-radius: 2px; overflow: hidden; }
 .size-fill { height: 100%; border-radius: 2px; background: var(--blue); }
 /* signal class badge inside table */
 .tbl-badge {
@@ -1069,7 +1075,7 @@ def _scoring_explainer_html() -> str:
         body = ""
         for r in rows:
             tds = "".join(
-                f'<td style="padding:4px 10px 4px 0;font-size:11px;color:{"#0f172a" if i != 1 else "#4ade80"};'
+                f'<td style="padding:4px 10px 4px 0;font-size:11px;color:{"var(--text)" if i != 1 else "#4ade80"};'
                 f'font-family:var(--mono);white-space:nowrap;vertical-align:top">{v}</td>'
                 for i, v in enumerate(r)
             )
@@ -1250,7 +1256,7 @@ def _scoring_explainer_html() -> str:
     return f"""
 <div style="font-family:'JetBrains Mono','Fira Code',monospace;">
   <p style="font-size:11px;color:#8b949e;margin:0 0 8px;">
-    <b style="color:#0f172a">Recommendation</b> (Skip &rarr; Watch &rarr; Developing &rarr; Actionable &rarr;
+    <b style="color:var(--text)">Recommendation</b> (Skip &rarr; Watch &rarr; Developing &rarr; Actionable &rarr;
     Execute &rarr; Elite) is the <b>only</b> recommendation shown anywhere in the app, and it comes from
     exactly one pipeline: <b style="color:#58a6ff">CV1 sub-scores</b> &rarr;
     <b style="color:#f5c542">v3 composite/base tier</b> &rarr;
@@ -1502,7 +1508,7 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
         data_rows += (
             f'<td style="position:sticky;left:0;background:{row_bg};'
             f'padding:6px 10px 6px 12px;font-size:11px;font-weight:700;'
-            f'color:#0f172a;white-space:nowrap;z-index:2;'
+            f'color:var(--text);white-space:nowrap;z-index:2;'
             f'border-right:1px solid rgba(15,23,42,0.10);">{stock}</td>'
         )
 
@@ -1626,7 +1632,7 @@ def _promotion_signals_table(df: pd.DataFrame) -> str:
         rows_html += (
             '<div style="display:flex;align-items:center;gap:10px;padding:7px 4px;'
             'border-bottom:1px solid rgba(255,255,255,0.06);flex-wrap:wrap;">'
-            f'<span style="font-size:11px;font-weight:700;color:#0f172a;width:90px;">{stock}</span>'
+            f'<span style="font-size:11px;font-weight:700;color:var(--text);width:90px;">{stock}</span>'
             f'<span style="font-size:9px;font-weight:700;color:{rec_color};'
             f'text-transform:uppercase;width:70px;">{rec}</span>'
             f'<span style="font-size:10px;color:{score_color};font-weight:700;width:70px;">'
@@ -2496,10 +2502,10 @@ def _render_html_table(df: pd.DataFrame) -> str:
                 cells += _sc_table_badge(str(val).upper() if val is not None else "", tooltip_key="Recommendation")
             elif c in ("Stoch↑", "LL✓", "VWAP↺", "Inst✓"):
                 rec = str(row.get("Recommendation", "")).strip().lower()
-                cells += _promo_signal_cell(val) if rec in ("actionable", "execute", "elite") else '<td class="col-num" style="color:#30363d">—</td>'
+                cells += _promo_signal_cell(val) if rec in ("actionable", "execute", "elite") else '<td class="col-num" style="color:var(--muted)">—</td>'
             elif c == "Promo Score":
                 rec = str(row.get("Recommendation", "")).strip().lower()
-                cells += _promo_score_cell(val) if rec in ("actionable", "execute", "elite") else '<td class="col-num" style="color:#30363d">—</td>'
+                cells += _promo_score_cell(val) if rec in ("actionable", "execute", "elite") else '<td class="col-num" style="color:var(--muted)">—</td>'
             elif c == "Setup Age":
                 cells += f'<td>{_freshness_badge(val)}</td>'
             elif c == "Plan Status":
@@ -2583,7 +2589,7 @@ def _render_html_table(df: pd.DataFrame) -> str:
 def _validation_row_html(stock: str, sc: str, category: str) -> str:
     return (
         f'<div class="val-strip">'
-        f'<div style="font-size:11px;font-weight:700;color:#0f172a;width:80px;'
+        f'<div style="font-size:11px;font-weight:700;color:var(--text);width:80px;'
         f'font-family:\'JetBrains Mono\',monospace">{stock}</div>'
         f'<div class="val-label">CV1</div>'
         f'{_sc_badge(sc)}'
@@ -3073,9 +3079,9 @@ def render(settings: dict | None = None):
     with ctrl3:
         st.markdown(
             f"<div style='padding:0.55rem 0;color:#8b949e;font-size:0.78rem;'>"
-            f"Universe: <b style='color:#0f172a'>{len(settings.get('symbols', NIFTY500_SYMBOLS))}</b> symbols"
-            f" &nbsp;·&nbsp; Execute threshold: <b style='color:#0f172a'>{settings.get('execute_threshold', 70)}</b>"
-            f" &nbsp;·&nbsp; Workers: <b style='color:#0f172a'>{settings.get('workers', 10)}</b></div>",
+            f"Universe: <b style='color:var(--text)'>{len(settings.get('symbols', NIFTY500_SYMBOLS))}</b> symbols"
+            f" &nbsp;·&nbsp; Execute threshold: <b style='color:var(--text)'>{settings.get('execute_threshold', 70)}</b>"
+            f" &nbsp;·&nbsp; Workers: <b style='color:var(--text)'>{settings.get('workers', 10)}</b></div>",
             unsafe_allow_html=True)
     with ctrl4:
         if st.button("🗑️", key="sb_clear_cache", help="Clear data cache"):
@@ -3204,7 +3210,7 @@ def render(settings: dict | None = None):
         st.markdown("""
         <div style="text-align:center;padding:4rem 2rem;color:#8b949e;">
             <div style="font-size:3rem">📡</div>
-            <div style="font-size:1.1rem;margin-top:0.5rem;color:#0f172a;">No scan data</div>
+            <div style="font-size:1.1rem;margin-top:0.5rem;color:var(--text);">No scan data</div>
             <div style="font-size:0.8rem;margin-top:0.3rem;">Configure settings and click <b>Run Scan</b></div>
         </div>""", unsafe_allow_html=True)
         return
