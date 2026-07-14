@@ -19,11 +19,11 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;600;800&display=swap');
 
 html, body, [data-testid="stAppViewContainer"] {
-    background-color: #0a0e1a !important;
+    background-color: #f5f7fa !important;
     font-family: 'JetBrains Mono', monospace;
-    color: #e2e8f0;
+    color: #0f172a;
 }
-h1,h2,h3 { font-family: 'Syne', sans-serif !important; }
+h1,h2,h3 { font-family: 'Syne', sans-serif !important; color:#0f172a; }
 .stButton > button {
     background: linear-gradient(135deg, #3b82f6, #1d4ed8) !important;
     color: white !important; border: none !important;
@@ -34,38 +34,63 @@ h1,h2,h3 { font-family: 'Syne', sans-serif !important; }
 }
 .stButton > button:hover {
     transform: translateY(-1px) !important;
-    box-shadow: 0 4px 15px rgba(59,130,246,0.4) !important;
+    box-shadow: 0 4px 15px rgba(59,130,246,0.3) !important;
 }
 .metric-card {
-    background: #1a2235; border: 1px solid #1e293b;
+    background: #ffffff; border: 1px solid #e2e8f0;
     border-radius: 10px; padding: 1rem 1.5rem; text-align: center;
+    box-shadow: 0 1px 2px rgba(15,23,42,0.04);
 }
-.metric-value { font-size:1.8rem; font-weight:700; font-family:'JetBrains Mono',monospace; }
+.metric-value { font-size:1.8rem; font-weight:700; font-family:'JetBrains Mono',monospace; color:#0f172a; }
 .metric-label { font-size:0.7rem; color:#64748b; text-transform:uppercase; letter-spacing:0.1em; margin-top:0.2rem; }
 .scanner-header {
-    background: linear-gradient(135deg,#0f172a 0%,#1e293b 100%);
-    border: 1px solid #1e3a5f; border-radius: 12px;
-    padding: 1.5rem 2rem; margin-bottom: 1.5rem;
+    background: #ffffff;
+    border: 1px solid #e2e8f0; border-radius: 12px;
+    padding: 1.25rem 2rem; margin-bottom: 1.5rem;
     position: relative; overflow: hidden;
+    box-shadow: 0 1px 3px rgba(15,23,42,0.05);
 }
 .scanner-header::before {
     content:''; position:absolute; top:0; left:0; right:0; height:2px;
-    background: linear-gradient(90deg,#3b82f6,#00ff88,#3b82f6);
+    background: linear-gradient(90deg,#3b82f6,#22c55e,#3b82f6);
 }
 .scanner-title {
-    font-family:'Syne',sans-serif; font-size:1.8rem; font-weight:800;
-    background:linear-gradient(135deg,#60a5fa,#00ff88);
-    -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin:0;
+    font-family:'Syne',sans-serif; font-size:1.6rem; font-weight:800;
+    color:#0f172a; margin:0; display:flex; align-items:center; gap:8px;
 }
-.scanner-subtitle { color:#64748b; font-size:0.75rem; letter-spacing:0.15em; text-transform:uppercase; margin-top:0.3rem; }
+.scanner-subtitle { color:#64748b; font-size:0.75rem; letter-spacing:0.1em; text-transform:uppercase; margin-top:0.3rem; }
 .status-dot {
     display:inline-block; width:8px; height:8px; border-radius:50%;
-    background:#00ff88; box-shadow:0 0 8px #00ff88;
+    background:#22c55e; box-shadow:0 0 6px rgba(34,197,94,0.6);
     animation:pulse 2s infinite; margin-right:6px;
 }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
-div[data-testid="stDataFrame"] { border:1px solid #1e293b !important; border-radius:8px !important; }
-[data-testid="metric-container"] { background:#1a2235; border:1px solid #1e293b; border-radius:8px; padding:0.75rem; }
+div[data-testid="stDataFrame"] { border:1px solid #e2e8f0 !important; border-radius:8px !important; }
+[data-testid="metric-container"] { background:#ffffff; border:1px solid #e2e8f0; border-radius:8px; padding:0.75rem; }
+
+/* ── Top navigation bar (st.navigation position="top") ── */
+header[data-testid="stHeader"] {
+    background: #ffffff !important;
+    border-bottom: 1px solid #e2e8f0 !important;
+}
+div[data-testid="stAppViewContainer"] > section { background: #f5f7fa !important; }
+[data-testid="stNavigation"], nav[data-testid="stNavigation"] {
+    background: #ffffff !important;
+    border-bottom: 1px solid #e2e8f0 !important;
+}
+[data-testid="stNavigation"] a, [data-testid*="NavLink"] {
+    color: #64748b !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.82rem !important;
+    font-weight: 600 !important;
+}
+[data-testid="stNavigation"] a[aria-selected="true"],
+[data-testid*="NavLink"][aria-selected="true"] {
+    color: #3b82f6 !important;
+    border-bottom: 2px solid #3b82f6 !important;
+}
+
+.stTabs [data-baseweb="tab-list"] { border-bottom: 1px solid #e2e8f0 !important; }
 .stTabs [data-baseweb="tab"] { font-family:'JetBrains Mono',monospace !important; font-size:0.8rem !important; color:#64748b !important; }
 .stTabs [aria-selected="true"] { color:#3b82f6 !important; border-bottom-color:#3b82f6 !important; }
 footer { display:none !important; }
