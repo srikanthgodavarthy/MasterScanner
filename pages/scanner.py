@@ -357,8 +357,8 @@ _CSS = """
 /* ── Result tab strip (Actionable / Developing / Fib Pullback / Active Setups) ── */
 .stTabs [data-baseweb="tab-list"] {
   gap: 4px;
-  background: var(--tbl-bg1);
-  border-bottom: 1px solid var(--tbl-border);
+  background: var(--bg1);
+  border-bottom: 1px solid var(--border);
   padding: 4px 4px 0;
   border-radius: 8px 8px 0 0;
 }
@@ -368,7 +368,7 @@ _CSS = """
   font-family: var(--mono);
   font-size: 0.82rem;
   font-weight: 600;
-  color: var(--tbl-muted);
+  color: var(--muted);
   background: transparent;
 }
 .stTabs [aria-selected="true"] {
@@ -378,16 +378,22 @@ _CSS = """
 .stTabs [data-baseweb="tab-highlight"] { background: transparent; }
 .stTabs [data-baseweb="tab-border"] { display: none; }
 
-/* ── Light "data zone": everything rendered inside a results tab
-   (table, Detail view toggle, expanders, download button, watchlist
-   controls) sits on a white panel with dark text, matching the
-   reference image — while the dashboard panels above stay dark. ── */
+/* Actionable / Developing / Fib Pullback tab-panels: plain dark theme,
+   same as the rest of the app (no re-scoping needed here). */
 .stTabs [data-baseweb="tab-panel"] {
-  background: var(--tbl-bg0);
   padding: 14px 16px 18px;
   border-radius: 0 0 10px 10px;
-  border: 1px solid var(--tbl-border);
+  border: 1px solid var(--border);
   border-top: none;
+}
+
+/* Active Setups is the 4th tab-panel — keeps the white "data zone"
+   treatment (table, Detail view toggle, expanders, download button,
+   watchlist controls) while the other three tabs and the dashboard
+   above stay dark. */
+.stTabs [data-baseweb="tab-panel"]:nth-of-type(4) {
+  background: var(--tbl-bg0);
+  border-color: var(--tbl-border);
   /* Re-scope the shared theme vars to their light equivalents here —
      every nested component (badges, expanders, lifecycle panels,
      breakdown tables) that reads var(--bg1)/var(--text)/etc. picks up
@@ -400,35 +406,35 @@ _CSS = """
   --text: var(--tbl-text);
   --muted: var(--tbl-muted);
 }
-.stTabs [data-baseweb="tab-panel"],
-.stTabs [data-baseweb="tab-panel"] p,
-.stTabs [data-baseweb="tab-panel"] span,
-.stTabs [data-baseweb="tab-panel"] label,
-.stTabs [data-baseweb="tab-panel"] div {
+.stTabs [data-baseweb="tab-panel"]:nth-of-type(4),
+.stTabs [data-baseweb="tab-panel"]:nth-of-type(4) p,
+.stTabs [data-baseweb="tab-panel"]:nth-of-type(4) span,
+.stTabs [data-baseweb="tab-panel"]:nth-of-type(4) label,
+.stTabs [data-baseweb="tab-panel"]:nth-of-type(4) div {
   color: var(--tbl-text);
 }
-.stTabs [data-baseweb="tab-panel"] [data-testid="stExpander"] {
+.stTabs [data-baseweb="tab-panel"]:nth-of-type(4) [data-testid="stExpander"] {
   background: var(--tbl-bg2) !important;
   border: 1px solid var(--tbl-border) !important;
   border-radius: 8px !important;
 }
-.stTabs [data-baseweb="tab-panel"] [data-testid="stExpander"] summary {
+.stTabs [data-baseweb="tab-panel"]:nth-of-type(4) [data-testid="stExpander"] summary {
   color: var(--tbl-text) !important;
 }
-.stTabs [data-baseweb="tab-panel"] [data-baseweb="select"] > div,
-.stTabs [data-baseweb="tab-panel"] input,
-.stTabs [data-baseweb="tab-panel"] textarea {
+.stTabs [data-baseweb="tab-panel"]:nth-of-type(4) [data-baseweb="select"] > div,
+.stTabs [data-baseweb="tab-panel"]:nth-of-type(4) input,
+.stTabs [data-baseweb="tab-panel"]:nth-of-type(4) textarea {
   background: var(--tbl-bg1) !important;
   color: var(--tbl-text) !important;
   border-color: var(--tbl-border) !important;
 }
-.stTabs [data-baseweb="tab-panel"] [data-testid="stDownloadButton"] button,
-.stTabs [data-baseweb="tab-panel"] [data-testid="stButton"] button {
+.stTabs [data-baseweb="tab-panel"]:nth-of-type(4) [data-testid="stDownloadButton"] button,
+.stTabs [data-baseweb="tab-panel"]:nth-of-type(4) [data-testid="stButton"] button {
   background: var(--tbl-bg2) !important;
   color: var(--tbl-text) !important;
   border: 1px solid var(--tbl-border) !important;
 }
-.stTabs [data-baseweb="tab-panel"] [data-testid="stMarkdownContainer"] code {
+.stTabs [data-baseweb="tab-panel"]:nth-of-type(4) [data-testid="stMarkdownContainer"] code {
   background: var(--tbl-bg2) !important;
   color: var(--blue) !important;
 }
