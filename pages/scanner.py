@@ -760,8 +760,9 @@ _CSS = """
 .ti-gainers-rank { color: var(--muted); font-size: 10.5px; width: 14px; flex-shrink: 0; }
 .ti-gainers-sym  { color: var(--text); font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ti-gainers-price {
-  color: var(--muted); font-family: var(--mono); font-weight: 400;
-  font-size: 10.5px; margin-left: 6px;
+  color: var(--muted); font-family: var(--mono); font-weight: 600;
+  font-size: 10.5px; width: 66px; flex-shrink: 0; text-align: right;
+  white-space: nowrap;
 }
 .ti-gainers-chg  {
   color: var(--green); font-family: var(--mono); font-weight: 700; font-size: 11.5px;
@@ -1881,12 +1882,13 @@ def _top_gainers_panel(df: pd.DataFrame, top_n: int = 10) -> str:
             price = float(row.get("CMP", 0) or row.get("LTP", 0) or row.get("Entry", 0) or 0)
         except (TypeError, ValueError):
             price = 0.0
-        price_html = f'<span class="ti-gainers-price">₹{price:,.2f}</span>' if price > 0 else ""
+        price_html = f'<span class="ti-gainers-price">₹{price:,.2f}</span>' if price > 0 else '<span class="ti-gainers-price"></span>'
         sym_html = _tv_link(str(sym)) if sym != "—" else sym
         rows.append(
             f'<div class="ti-gainers-row">'
             f'<span class="ti-gainers-rank">{i}</span>'
-            f'<span class="ti-gainers-sym">{sym_html}{price_html}</span>'
+            f'<span class="ti-gainers-sym">{sym_html}</span>'
+            f'{price_html}'
             f'<span class="ti-gainers-chg">+{chg:.2f}%</span>'
             f'<span class="ti-gainers-badge" style="background:{color}22;color:{color};border:1px solid {color}55">'
             f'{badge_label}</span>'
