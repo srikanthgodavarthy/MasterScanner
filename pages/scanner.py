@@ -747,10 +747,18 @@ _CSS = """
 .ti-gainers-row:last-child { border-bottom: none; }
 .ti-gainers-rank { color: var(--muted); font-size: 10.5px; width: 14px; flex-shrink: 0; }
 .ti-gainers-sym  { color: var(--text); font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ti-gainers-chg  { color: var(--green); font-family: var(--mono); font-weight: 700; font-size: 11.5px; white-space: nowrap; }
+.ti-gainers-price {
+  color: var(--muted); font-family: var(--mono); font-weight: 400;
+  font-size: 10.5px; margin-left: 6px;
+}
+.ti-gainers-chg  {
+  color: var(--green); font-family: var(--mono); font-weight: 700; font-size: 11.5px;
+  white-space: nowrap; width: 64px; flex-shrink: 0; text-align: right;
+}
 .ti-gainers-badge {
   font-size: 9px; font-weight: 700; padding: 1px 7px; border-radius: 3px;
   white-space: nowrap; letter-spacing: 0.03em;
+  width: 84px; flex-shrink: 0; text-align: center; box-sizing: border-box;
 }
 .ti-gainers-link {
   text-align: center; margin-top: 10px; font-size: 11px;
@@ -1857,10 +1865,15 @@ def _top_gainers_panel(df: pd.DataFrame, top_n: int = 10) -> str:
         rec = str(row.get("Recommendation", "")).strip()
         color, label = _SC_STYLE.get(rec.upper(), ("#484f58", "Not Qualified"))
         badge_label = label if rec else "Not Qualified"
+        try:
+            price = float(row.get("CMP", 0) or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        price_html = f'<span class="ti-gainers-price">₹{price:,.2f}</span>' if price > 0 else ""
         rows.append(
             f'<div class="ti-gainers-row">'
             f'<span class="ti-gainers-rank">{i}</span>'
-            f'<span class="ti-gainers-sym">{sym}</span>'
+            f'<span class="ti-gainers-sym">{sym}{price_html}</span>'
             f'<span class="ti-gainers-chg">+{chg:.2f}%</span>'
             f'<span class="ti-gainers-badge" style="background:{color}22;color:{color};border:1px solid {color}55">'
             f'{badge_label}</span>'
