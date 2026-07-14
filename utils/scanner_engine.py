@@ -642,7 +642,10 @@ def _primary_blocker(r, result: dict) -> str:
             sub = "too far above pivot"
         else:
             sub = f"EQ score {int(eq)}"
-        return f"Composite {int(composite)} (need {_comp_floor}) — Low Entry Quality ({int(eq)}) — {sub}"
+        # composite is now unrounded (see conviction_score_v1.py) — show one
+        # decimal so this can't read as self-contradictory (e.g. "Composite
+        # 60 (need 60)" while still being the rejection reason).
+        return f"Composite {composite:.1f} (need {_comp_floor}) — Low Entry Quality ({int(eq)}) — {sub}"
 
     # Priority 5: CCI momentum not confirmed
     try:

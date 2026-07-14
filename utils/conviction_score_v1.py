@@ -76,7 +76,15 @@ class ConvictionV1:
     entry_quality: int = 0    # 0-100  "Should I enter NOW?"
 
     # Composite (simple average of all three)
-    composite:     int = 0    # 0-100
+    composite:     float = 0.0  # 0-100, UNROUNDED — must stay bit-for-bit
+                                 # identical to the composite classify_tier_v3()/
+                                 # _classify_v3() compute internally from the same
+                                 # three inputs, or the displayed CV1_Composite can
+                                 # disagree with the tier the gate actually assigned
+                                 # (rounding could show e.g. 60 while the gate saw
+                                 # 59.667 and rejected it as not-Actionable — found
+                                 # in the 2026-07-14 EQ audit). Round only at the
+                                 # point of display, never before comparison.
 
     # Leadership sub-scores (weights: rs=30, age=25, adx=20, ps=15, slope=10)
     ls_rs_composite:       int = 0   # 0-30
@@ -941,7 +949,14 @@ def compute_conviction_v3(r: "BarResult", settings: Optional[dict] = None) -> Co
     conviction,    cv_subs = _conviction(r)
     entry_quality, eq_subs = _entry_quality(r)
 
-    composite = int(round((leadership + conviction + entry_quality) / 3))
+    # UNROUNDED — must exactly match the composite classify_tier_v3()/
+    # _classify_v3() compute internally (same formula, same inputs) below.
+    # Previously this rounded to an int here while those two functions
+    # compared the raw float, so the displayed CV1_Composite could say a
+    # setup cleared a threshold (e.g. showed 60) when the actual gate saw
+    # the unrounded value (59.667) and rejected it — or vice versa. Round
+    # only when formatting for display.
+    composite = (leadership + conviction + entry_quality) / 3
     signal = _classify_v3(leadership, conviction, entry_quality, thresholds=settings)
 
     return ConvictionV3(
