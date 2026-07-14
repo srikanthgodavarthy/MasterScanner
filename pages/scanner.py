@@ -38,6 +38,7 @@ from utils.regime_engine   import (
     REGIME_WEIGHTS,
 )
 from utils.supabase_client import save_scan_snapshot, load_watchlist, add_to_watchlist, _is_available
+from utils.sector_map      import build_sector_stats
 
 # Reuse the Five Pillars page's own individual-stock breakdown renderer so the
 # Scanner page's per-stock panel is pixel-identical to pages/five_pillars.py
@@ -594,6 +595,137 @@ _CSS = """
   display:inline-block; padding:2px 9px; border-radius:4px;
   font-size:10px; font-weight:700; letter-spacing:0.04em; white-space:nowrap;
 }
+
+/* ══════════════════════════════════════════════════════════════
+   MARKET INTELLIGENCE / TOP GAINERS / SECTOR HEATMAP / ROTATION
+   (Live Scanner redesign, 2026-07)
+   ══════════════════════════════════════════════════════════════ */
+
+.ti-panel {
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  height: 100%;
+}
+.ti-panel-title {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Market Intelligence stat grid */
+.ti-mi-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px 18px;
+}
+.ti-mi-label {
+  font-size: 9.5px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+.ti-mi-value {
+  font-size: 17px;
+  font-weight: 700;
+  font-family: var(--mono);
+  color: var(--text);
+  line-height: 1.15;
+}
+.ti-mi-sub { font-size: 9.5px; margin-top: 2px; font-family: var(--mono); }
+.ti-mi-sub .a { color: var(--green); }
+.ti-mi-sub .d { color: var(--red); }
+
+/* Top Gainers */
+.ti-gainers-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.ti-gainers-row:last-child { border-bottom: none; }
+.ti-gainers-rank { color: var(--muted); font-size: 10.5px; width: 14px; flex-shrink: 0; }
+.ti-gainers-sym  { color: var(--text); font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ti-gainers-chg  { color: var(--green); font-family: var(--mono); font-weight: 700; font-size: 11.5px; white-space: nowrap; }
+.ti-gainers-badge {
+  font-size: 9px; font-weight: 700; padding: 1px 7px; border-radius: 3px;
+  white-space: nowrap; letter-spacing: 0.03em;
+}
+.ti-gainers-link {
+  text-align: center; margin-top: 10px; font-size: 11px;
+}
+.ti-gainers-link a { color: var(--blue); text-decoration: none; font-weight: 600; }
+
+/* Sector Heatmap */
+.ti-heatmap-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+.ti-heat-tile {
+  border-radius: 7px;
+  padding: 10px 11px;
+  min-height: 66px;
+}
+.ti-heat-name  { font-size: 11px; font-weight: 700; color: #fff; margin-bottom: 4px; }
+.ti-heat-chg   { font-size: 15px; font-weight: 700; color: #fff; line-height: 1.1; }
+.ti-heat-count { font-size: 9.5px; color: rgba(255,255,255,0.75); margin-top: 3px; }
+.ti-heatmap-hint {
+  text-align: center; font-size: 10.5px; color: var(--blue);
+  margin-top: 10px; cursor: default;
+}
+
+/* Leadership Rotation */
+.ti-rotation-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 14px; }
+.ti-rotation-head { font-size: 10px; font-weight: 700; letter-spacing: 0.05em; margin-bottom: 8px; }
+.ti-rotation-head.up   { color: var(--green); }
+.ti-rotation-head.down { color: var(--red); }
+.ti-rotation-item {
+  font-size: 11.5px; color: var(--text); padding: 3px 0;
+  display: flex; align-items: center; gap: 6px;
+}
+.ti-rotation-item .arrow-up   { color: var(--green); font-weight: 700; }
+.ti-rotation-item .arrow-down { color: var(--red); font-weight: 700; }
+
+/* Market Breadth mini-stats (nested inside Leadership Rotation panel) */
+.ti-breadth-title {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); margin: 4px 0 8px; padding-top: 10px; border-top: 1px solid var(--border);
+}
+.ti-breadth-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+.ti-breadth-stat { text-align: left; }
+.ti-breadth-num { font-size: 16px; font-weight: 700; font-family: var(--mono); line-height: 1.1; }
+.ti-breadth-num.up   { color: var(--green); }
+.ti-breadth-num.down { color: var(--red); }
+.ti-breadth-lbl { font-size: 9px; color: var(--muted); margin-top: 2px; white-space: nowrap; }
+
+/* Scores & Thresholds button card */
+.ti-thresh-card {
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 14px;
+  height: 100%;
+  display: flex; flex-direction: column; justify-content: center; align-items: center;
+  text-align: center;
+  gap: 8px;
+}
+.ti-thresh-icon { font-size: 18px; color: var(--muted); }
+.ti-thresh-label { font-size: 11px; font-weight: 600; color: var(--text); }
 </style>
 """
 
@@ -1517,6 +1649,239 @@ def _summary_cards(df: pd.DataFrame) -> str:
         )
     html += '</div>'
     return html
+
+
+# ── BREADTH STATS (used by Market Intelligence + Leadership Rotation) ──
+
+def _trend_strength_label(adx: float, adx_is_real: bool) -> str:
+    """ADX-based trend-strength label — reuses the same >=25 threshold
+    already gating the Execute regime check, so this can't disagree with
+    the EMA/ADX gate chips shown elsewhere on the page."""
+    if not adx_is_real:
+        return "MODERATE"  # proxy ADX — avoid overclaiming STRONG/WEAK on a proxy
+    if adx >= 30:
+        return "STRONG"
+    if adx >= 20:
+        return "MODERATE"
+    return "WEAK"
+
+
+def _compute_breadth_stats(df: pd.DataFrame) -> dict:
+    """
+    Advancing/declining + %-above-EMA20/50/200 + 52W-high/low counts,
+    computed directly off the raw scan df (pre-display-rename columns).
+
+    EMA20/EMA200 above-flags reuse _fp_price_above_e20 / _fp_no_breakdown
+    (Five Pillars structure pillar — price > EMA20 / price > EMA200,
+    already computed per-stock, see pillar_engine._score_structure).
+    EMA50 uses EMA50Dist > 0 (no boolean flag exists upstream for EMA50
+    specifically). 52W hi/lo use the _near_52w_high/_near_52w_low flags
+    added in scanner_engine.score_stock.
+    """
+    out = {
+        "advancing": 0, "declining": 0, "total": 0,
+        "pct_above_ema20": 0, "pct_above_ema50": 0, "pct_above_ema200": 0,
+        "n_52w_high": 0, "n_52w_low": 0,
+    }
+    if df is None or df.empty:
+        return out
+
+    n = len(df)
+    out["total"] = n
+
+    if "%Chg" in df.columns:
+        chg = pd.to_numeric(df["%Chg"], errors="coerce")
+        out["advancing"] = int((chg > 0).sum())
+        out["declining"] = int((chg < 0).sum())
+
+    if "_fp_price_above_e20" in df.columns:
+        out["pct_above_ema20"] = int(round(100 * df["_fp_price_above_e20"].fillna(False).mean())) if n else 0
+    if "EMA50Dist" in df.columns:
+        ema50 = pd.to_numeric(df["EMA50Dist"], errors="coerce")
+        out["pct_above_ema50"] = int(round(100 * (ema50 > 0).mean())) if n else 0
+    if "_fp_no_breakdown" in df.columns:
+        out["pct_above_ema200"] = int(round(100 * df["_fp_no_breakdown"].fillna(False).mean())) if n else 0
+
+    if "_near_52w_high" in df.columns:
+        out["n_52w_high"] = int(df["_near_52w_high"].fillna(False).sum())
+    if "_near_52w_low" in df.columns:
+        out["n_52w_low"] = int(df["_near_52w_low"].fillna(False).sum())
+
+    return out
+
+
+# ── MARKET INTELLIGENCE PANEL ───────────────────────────────────────
+
+def _market_intelligence_panel(summary: dict, breadth: dict) -> str:
+    r = summary.get("regime", "RANGE")
+    trend_label = _trend_strength_label(
+        float(summary.get("adx", 0)), summary.get("adx_is_real", False)
+    )
+
+    adv, dec = breadth["advancing"], breadth["declining"]
+    hi, lo   = breadth["n_52w_high"], breadth["n_52w_low"]
+    e20, e200 = breadth["pct_above_ema20"], breadth["pct_above_ema200"]
+
+    def _stat(label, value_html, sub_html=""):
+        return (f'<div><div class="ti-mi-label">{label}</div>'
+                f'<div class="ti-mi-value">{value_html}</div>'
+                f'{sub_html}</div>')
+
+    regime_color, _, _ = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
+
+    return f"""
+<div class="ti-panel">
+  <div class="ti-panel-title">ⓘ MARKET INTELLIGENCE</div>
+  <div class="ti-mi-grid">
+    {_stat("Regime", f'<span style="color:{regime_color}">{r}</span>')}
+    {_stat("Trend Strength", trend_label)}
+    {_stat("Market Breadth",
+           f'<span class="a">{adv}</span> / <span class="d">{dec}</span>',
+           '<div class="ti-mi-sub"><span class="a">Advancing</span> &nbsp;'
+           '<span class="d">Declining</span></div>')}
+    {_stat("52W High", f'<span class="a">{hi}</span>')}
+    {_stat("52W Low", f'<span class="d">{lo}</span>')}
+    {_stat("Above EMA20", f'{e20}%')}
+    {_stat("Above EMA200", f'{e200}%')}
+  </div>
+</div>
+"""
+
+
+# ── TOP GAINERS TODAY PANEL ──────────────────────────────────────────
+
+def _top_gainers_panel(df: pd.DataFrame, top_n: int = 10) -> str:
+    if df is None or df.empty or "%Chg" not in df.columns:
+        return '<div class="ti-panel"><div class="ti-panel-title">🔥 TOP GAINERS TODAY</div>' \
+               '<div style="color:var(--muted);font-size:11px">No data</div></div>'
+
+    work = df.copy()
+    work["_chg"] = pd.to_numeric(work["%Chg"], errors="coerce")
+    top = work.sort_values("_chg", ascending=False).head(top_n)
+
+    rows = []
+    for i, (_, row) in enumerate(top.iterrows(), start=1):
+        sym = row.get("Stock", "—")
+        chg = row.get("_chg", 0) or 0
+        rec = str(row.get("Recommendation", "")).strip()
+        color, label = _SC_STYLE.get(rec.upper(), ("#484f58", "Not Qualified"))
+        badge_label = label if rec else "Not Qualified"
+        rows.append(
+            f'<div class="ti-gainers-row">'
+            f'<span class="ti-gainers-rank">{i}</span>'
+            f'<span class="ti-gainers-sym">{sym}</span>'
+            f'<span class="ti-gainers-chg">+{chg:.2f}%</span>'
+            f'<span class="ti-gainers-badge" style="background:{color}22;color:{color};border:1px solid {color}55">'
+            f'{badge_label}</span>'
+            f'</div>'
+        )
+
+    return f"""
+<div class="ti-panel">
+  <div class="ti-panel-title">🔥 TOP GAINERS TODAY</div>
+  {"".join(rows)}
+</div>
+"""
+
+
+# ── SECTOR HEATMAP PANEL ─────────────────────────────────────────────
+
+def _heat_color(chg: float) -> str:
+    """Green/red tile background, intensity scaled by |%chg| — mirrors the
+    saturation banding used in the reference design (stronger moves ->
+    deeper color) rather than a flat two-tone scheme."""
+    if chg >= 2.0:   return "#1f7a3d"
+    if chg >= 0.7:   return "#2d8f4e"
+    if chg >= 0.0:   return "#1e5631"
+    if chg >= -0.7:  return "#7a1f1f"
+    if chg >= -2.0:  return "#8f2d2d"
+    return "#a11d1d"
+
+
+def _sector_heatmap_panel(sector_stats: pd.DataFrame, max_tiles: int = 12) -> str:
+    if sector_stats is None or sector_stats.empty:
+        return '<div class="ti-panel"><div class="ti-panel-title">🔊 SECTOR HEATMAP</div>' \
+               '<div style="color:var(--muted);font-size:11px">No sector data</div></div>'
+
+    tiles = sector_stats.head(max_tiles)
+    cells = []
+    for _, row in tiles.iterrows():
+        chg   = float(row["AvgChg"])
+        sign  = "+" if chg >= 0 else ""
+        color = _heat_color(chg)
+        n_lead = int(row["Leaders"])
+        cells.append(
+            f'<div class="ti-heat-tile" style="background:{color}">'
+            f'<div class="ti-heat-name">{row["Sector"]}</div>'
+            f'<div class="ti-heat-chg">{sign}{chg:.2f}%</div>'
+            f'<div class="ti-heat-count">{n_lead} Leader{"s" if n_lead != 1 else ""}</div>'
+            f'</div>'
+        )
+
+    return f"""
+<div class="ti-panel">
+  <div class="ti-panel-title">🔊 SECTOR HEATMAP</div>
+  <div class="ti-heatmap-grid">{"".join(cells)}</div>
+  <div class="ti-heatmap-hint">Sector performance across today's scanned universe</div>
+</div>
+"""
+
+
+# ── LEADERSHIP ROTATION + MARKET BREADTH PANEL ───────────────────────
+
+def _leadership_rotation_panel(sector_stats: pd.DataFrame, breadth: dict, n: int = 5) -> str:
+    if sector_stats is None or sector_stats.empty:
+        stronger, weaker = [], []
+    else:
+        ranked   = sector_stats.sort_values("AvgChg", ascending=False)
+        stronger = ranked.head(n)["Sector"].tolist()
+        weaker   = ranked.tail(n)["Sector"].tolist()[::-1]
+
+    def _list_html(items, arrow_cls, arrow_char):
+        if not items:
+            return '<div style="color:var(--muted);font-size:11px">—</div>'
+        return "".join(
+            f'<div class="ti-rotation-item"><span class="{arrow_cls}">{arrow_char}</span>{s}</div>'
+            for s in items
+        )
+
+    adv, dec = breadth["advancing"], breadth["declining"]
+
+    return f"""
+<div class="ti-panel">
+  <div class="ti-panel-title">⇅ LEADERSHIP ROTATION</div>
+  <div class="ti-rotation-cols">
+    <div>
+      <div class="ti-rotation-head up">STRONGER SECTORS</div>
+      {_list_html(stronger, "arrow-up", "↑")}
+    </div>
+    <div>
+      <div class="ti-rotation-head down">WEAKER SECTORS</div>
+      {_list_html(weaker, "arrow-down", "↓")}
+    </div>
+  </div>
+
+  <div class="ti-breadth-title">ⓘ MARKET BREADTH</div>
+  <div class="ti-breadth-grid">
+    <div class="ti-breadth-stat">
+      <div class="ti-breadth-num up">↑ {adv}</div>
+      <div class="ti-breadth-lbl">Advancing</div>
+    </div>
+    <div class="ti-breadth-stat">
+      <div class="ti-breadth-num down">↓ {dec}</div>
+      <div class="ti-breadth-lbl">Declining</div>
+    </div>
+    <div class="ti-breadth-stat">
+      <div class="ti-breadth-num">{breadth["pct_above_ema20"]}%</div>
+      <div class="ti-breadth-lbl">Above EMA20</div>
+    </div>
+    <div class="ti-breadth-stat">
+      <div class="ti-breadth-num">{breadth["pct_above_ema200"]}%</div>
+      <div class="ti-breadth-lbl">Above EMA200</div>
+    </div>
+  </div>
+</div>
+"""
 
 
 # ── SIGNAL CLASS COUNTS ────────────────────────────────────────────
@@ -2734,26 +3099,48 @@ def render(settings: dict | None = None):
         </div>""", unsafe_allow_html=True)
         return
 
-    # ── Market Status Row ────────────────────────────────────────
+    # ── Row 1: Market Intelligence + Score Cards + Thresholds ────
+    breadth       = _compute_breadth_stats(df_aug)
+    active_df = (
+        df_aug[df_aug["Recommendation"] != "Avoid"]
+        if "Recommendation" in df_aug.columns else df_aug
+    )
+
+    row1_a, row1_b, row1_c = st.columns([2.1, 3.1, 1.1])
+    with row1_a:
+        st.markdown(_market_intelligence_panel(summary, breadth), unsafe_allow_html=True)
+    with row1_b:
+        if not active_df.empty:
+            st.markdown(_summary_cards(active_df), unsafe_allow_html=True)
+    with row1_c:
+        _thresh_expanded = st.session_state.get("_show_thresholds", False)
+        if st.button("⚙️ Scores & Thresholds", key="btn_scores_thresholds",
+                     use_container_width=True, help="View / edit scoring thresholds"):
+            st.session_state["_show_thresholds"] = not _thresh_expanded
+
+    # Last-scan chip + regime checklist (kept from the old status row —
+    # still useful context, just no longer the whole top strip)
     st.markdown(
         _market_status_row(summary, scan_time, nifty_price, nifty_chg_pct),
         unsafe_allow_html=True,
     )
 
-    # ── Score cards ──────────────────────────────────────────────
-    active_df = (
-        df_aug[df_aug["Recommendation"] != "Avoid"]
-        if "Recommendation" in df_aug.columns else df_aug
-    )
-    if not active_df.empty:
-        st.markdown(_summary_cards(active_df), unsafe_allow_html=True)
-
     # ── Signal class counts ───────────────────────────────────────
     if "Recommendation" in df_aug.columns:
         st.markdown(_sc_counts_html(df_aug), unsafe_allow_html=True)
 
+    # ── Row 2: Top Gainers | Sector Heatmap | Leadership Rotation ─
+    sector_stats = build_sector_stats(df_aug)
+    row2_a, row2_b, row2_c = st.columns([1.3, 1.8, 1.5])
+    with row2_a:
+        st.markdown(_top_gainers_panel(df_aug), unsafe_allow_html=True)
+    with row2_b:
+        st.markdown(_sector_heatmap_panel(sector_stats), unsafe_allow_html=True)
+    with row2_c:
+        st.markdown(_leadership_rotation_panel(sector_stats, breadth), unsafe_allow_html=True)
+
     # ── Scoring Explainer ─────────────────────────────────────────
-    with st.expander("📊 Scoring & Thresholds", expanded=False):
+    with st.expander("📊 Scoring & Thresholds", expanded=st.session_state.get("_show_thresholds", False)):
         st.markdown(_scoring_explainer_html(), unsafe_allow_html=True)
 
     # ── Toggles ──────────────────────────────────────────────────
