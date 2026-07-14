@@ -699,7 +699,29 @@ def score_stock(
     if r is None:
         return {}
 
+    # ── 52-week high/low breadth flags ────────────────────────────
+    # [Market Breadth panel, 2026-07] "Near 52W high/low" is a classic
+    # breadth stat but nothing upstream computed it — CV1/DE/Five Pillars
+    # all work off EMA distance, not the rolling 1y extreme. df already
+    # carries >=210 daily bars (guarded above), so derive it here directly
+    # off close, using a 2% tolerance band since exact new highs/lows are
+    # rare on any given day and the panel wants "near the extreme", not a
+    # literal all-time-max tick.
+    try:
+        _close_col   = "close" if "close" in df.columns else "Close"
+        _closes_1y   = df[_close_col].tail(252)
+        _cur_close   = float(_closes_1y.iloc[-1])
+        _hi_52w      = float(_closes_1y.max())
+        _lo_52w      = float(_closes_1y.min())
+        _near_52w_hi = _hi_52w > 0 and _cur_close >= _hi_52w * 0.98
+        _near_52w_lo = _lo_52w > 0 and _cur_close <= _lo_52w * 1.02
+    except Exception:
+        _near_52w_hi = False
+        _near_52w_lo = False
+
     result = {
+        "_near_52w_high": _near_52w_hi,
+        "_near_52w_low":  _near_52w_lo,
         # ── display columns ──────────────────────────────────────
         "Stock":        None,
         "Tier":         r.tier,
