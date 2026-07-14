@@ -3425,9 +3425,6 @@ def render(settings: dict | None = None):
         unsafe_allow_html=True,
     )
 
-    if not active_df.empty:
-        st.markdown(_summary_cards(active_df), unsafe_allow_html=True)
-
     # ── Signal class counts ───────────────────────────────────────
     if "Recommendation" in df_aug.columns:
         st.markdown(_sc_counts_html(df_aug), unsafe_allow_html=True)
@@ -3569,6 +3566,9 @@ def render(settings: dict | None = None):
         tab_labels.append(f"⛔ Skip ({len(skip_df)})")
         df_sets.append(skip_df)
         set_keys.append("SKIP")
+
+    if not active_df.empty:
+        st.markdown(_summary_cards(active_df), unsafe_allow_html=True)
 
     tabs = st.tabs(tab_labels)
 
