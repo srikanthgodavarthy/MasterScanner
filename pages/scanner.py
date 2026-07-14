@@ -196,20 +196,30 @@ _CSS = """
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
 
 :root {
-  --bg0: #f5f7fa;
-  --bg1: #ffffff;
-  --bg2: #f1f4f8;
-  --bg3: #e5e9f0;
-  --border: rgba(15,23,42,0.09);
-  --gold:   #b8860b;
-  --green:  #1a7f37;
-  --amber:  #9a6700;
-  --red:    #cf222e;
-  --purple: #8250df;
-  --blue:   #0969da;
-  --muted:  #64748b;
-  --text:   #0f172a;
+  --bg0: #0d1117;
+  --bg1: #161b22;
+  --bg2: #1c2333;
+  --bg3: #21262d;
+  --border: rgba(255,255,255,0.08);
+  --gold:   #f5c542;
+  --green:  #3fb950;
+  --amber:  #d29922;
+  --red:    #f85149;
+  --purple: #a371f7;
+  --blue:   #58a6ff;
+  --muted:  #8b949e;
+  --text:   #e6edf3;
   --mono: 'JetBrains Mono', 'Fira Code', monospace;
+  /* Light "data table" zone — Actionable/Developing/Fib/Active Setups tabs
+     and the rich results table render on a white surface, matching the
+     reference image, while the dashboard panels above stay dark. */
+  --tbl-bg0:   #ffffff;
+  --tbl-bg1:   #ffffff;
+  --tbl-bg2:   #f1f4f8;
+  --tbl-bg3:   #e5e9f0;
+  --tbl-border:rgba(15,23,42,0.09);
+  --tbl-text:  #0f172a;
+  --tbl-muted: #64748b;
 }
 
 /* ── Market Status Row ── */
@@ -347,7 +357,10 @@ _CSS = """
 /* ── Result tab strip (Actionable / Developing / Fib Pullback / Active Setups) ── */
 .stTabs [data-baseweb="tab-list"] {
   gap: 4px;
-  border-bottom: 1px solid var(--border);
+  background: var(--tbl-bg1);
+  border-bottom: 1px solid var(--tbl-border);
+  padding: 4px 4px 0;
+  border-radius: 8px 8px 0 0;
 }
 .stTabs [data-baseweb="tab"] {
   height: 38px;
@@ -355,7 +368,7 @@ _CSS = """
   font-family: var(--mono);
   font-size: 0.82rem;
   font-weight: 600;
-  color: var(--muted);
+  color: var(--tbl-muted);
   background: transparent;
 }
 .stTabs [aria-selected="true"] {
@@ -364,6 +377,61 @@ _CSS = """
 }
 .stTabs [data-baseweb="tab-highlight"] { background: transparent; }
 .stTabs [data-baseweb="tab-border"] { display: none; }
+
+/* ── Light "data zone": everything rendered inside a results tab
+   (table, Detail view toggle, expanders, download button, watchlist
+   controls) sits on a white panel with dark text, matching the
+   reference image — while the dashboard panels above stay dark. ── */
+.stTabs [data-baseweb="tab-panel"] {
+  background: var(--tbl-bg0);
+  padding: 14px 16px 18px;
+  border-radius: 0 0 10px 10px;
+  border: 1px solid var(--tbl-border);
+  border-top: none;
+  /* Re-scope the shared theme vars to their light equivalents here —
+     every nested component (badges, expanders, lifecycle panels,
+     breakdown tables) that reads var(--bg1)/var(--text)/etc. picks up
+     the light values automatically, without per-class overrides. */
+  --bg0: var(--tbl-bg0);
+  --bg1: var(--tbl-bg1);
+  --bg2: var(--tbl-bg2);
+  --bg3: var(--tbl-bg3);
+  --border: var(--tbl-border);
+  --text: var(--tbl-text);
+  --muted: var(--tbl-muted);
+}
+.stTabs [data-baseweb="tab-panel"],
+.stTabs [data-baseweb="tab-panel"] p,
+.stTabs [data-baseweb="tab-panel"] span,
+.stTabs [data-baseweb="tab-panel"] label,
+.stTabs [data-baseweb="tab-panel"] div {
+  color: var(--tbl-text);
+}
+.stTabs [data-baseweb="tab-panel"] [data-testid="stExpander"] {
+  background: var(--tbl-bg2) !important;
+  border: 1px solid var(--tbl-border) !important;
+  border-radius: 8px !important;
+}
+.stTabs [data-baseweb="tab-panel"] [data-testid="stExpander"] summary {
+  color: var(--tbl-text) !important;
+}
+.stTabs [data-baseweb="tab-panel"] [data-baseweb="select"] > div,
+.stTabs [data-baseweb="tab-panel"] input,
+.stTabs [data-baseweb="tab-panel"] textarea {
+  background: var(--tbl-bg1) !important;
+  color: var(--tbl-text) !important;
+  border-color: var(--tbl-border) !important;
+}
+.stTabs [data-baseweb="tab-panel"] [data-testid="stDownloadButton"] button,
+.stTabs [data-baseweb="tab-panel"] [data-testid="stButton"] button {
+  background: var(--tbl-bg2) !important;
+  color: var(--tbl-text) !important;
+  border: 1px solid var(--tbl-border) !important;
+}
+.stTabs [data-baseweb="tab-panel"] [data-testid="stMarkdownContainer"] code {
+  background: var(--tbl-bg2) !important;
+  color: var(--blue) !important;
+}
 
 /* ── Section label ── */
 .section-label {
@@ -375,12 +443,13 @@ _CSS = """
   border-left-style: solid;
 }
 
-/* ── Rich HTML results table ── */
+/* ── Rich HTML results table (light zone, matches reference image) ── */
 .rt-wrap {
   width: 100%;
   overflow-x: auto;
   border-radius: 8px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--tbl-border);
+  background: var(--tbl-bg1);
   margin-bottom: 10px;
   max-height: 520px;
   overflow-y: auto;
@@ -397,8 +466,8 @@ _CSS = """
   z-index: 2;
 }
 .rt thead th {
-  background: var(--bg2);
-  color: var(--muted);
+  background: var(--tbl-bg2);
+  color: var(--tbl-muted);
   font-size: 0.68rem;
   font-weight: 700;
   text-transform: uppercase;
@@ -406,7 +475,7 @@ _CSS = """
   padding: 8px 10px;
   text-align: center;
   white-space: nowrap;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--tbl-border);
 }
 .rt thead th.col-stock { text-align: left; padding-left: 12px; }
 .rt tbody tr {
@@ -414,15 +483,15 @@ _CSS = """
   transition: background 0.12s;
 }
 .rt tbody tr:nth-child(even) { background: rgba(15,23,42,0.015); }
-.rt tbody tr:hover { background: rgba(88,166,255,0.07) !important; }
+.rt tbody tr:hover { background: rgba(9,105,218,0.06) !important; }
 .rt td {
   padding: 7px 10px;
   text-align: center;
-  color: var(--text);
+  color: var(--tbl-text);
   white-space: nowrap;
 }
 .rt td.col-rank {
-  color: var(--muted);
+  color: var(--tbl-muted);
   font-size: 0.68rem;
   width: 28px;
   text-align: right;
@@ -432,13 +501,13 @@ _CSS = """
   text-align: left;
   padding-left: 12px;
   font-weight: 700;
-  color: var(--text);
+  color: var(--tbl-text);
   font-size: 0.78rem;
   min-width: 110px;
 }
 /* TradingView link — matches bold stock text, no underline by default */
 .tv-link {
-  color: var(--text);
+  color: var(--tbl-text);
   text-decoration: none;
   font-weight: 700;
   transition: color 0.15s;
@@ -454,19 +523,20 @@ _CSS = """
 /* score cell: number + mini bar */
 .score-cell { display: flex; flex-direction: column; align-items: center; gap: 3px; }
 .score-num  { font-weight: 600; font-size: 0.76rem; }
-.score-bar  { width: 36px; height: 3px; background: var(--bg3); border-radius: 2px; overflow: hidden; }
+.score-bar  { width: 36px; height: 3px; background: var(--tbl-bg3); border-radius: 2px; overflow: hidden; }
 .score-fill { height: 100%; border-radius: 2px; }
 /* size% bar chip */
 .size-chip {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  background: var(--bg2);
+  background: var(--tbl-bg2);
   border-radius: 4px;
   padding: 2px 7px;
   font-size: 0.72rem;
+  color: var(--tbl-text);
 }
-.size-bar  { width: 28px; height: 3px; background: var(--bg3); border-radius: 2px; overflow: hidden; }
+.size-bar  { width: 28px; height: 3px; background: var(--tbl-bg3); border-radius: 2px; overflow: hidden; }
 .size-fill { height: 100%; border-radius: 2px; background: var(--blue); }
 /* signal class badge inside table */
 .tbl-badge {
