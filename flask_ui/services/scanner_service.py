@@ -143,7 +143,7 @@ def _live_universe_rows() -> list[ScannerRow]:
             leadership=int(r.get("CV1_Leadership", 0) or 0),
             conviction=int(r.get("CV1_Conviction", 0) or 0),
             entry_quality=int(r.get("CV1_EntryQuality", 0) or 0),
-            conviction_composite=int(r.get("CV1_Composite", 0) or 0),
+            conviction_composite=int(round(float(r.get("CV1_Composite", 0) or 0))),
             signal_class=str(r.get("CV1_SignalClass", "") or ""),
             entry=float(r.get("Entry", 0) or 0),
             sl=float(r.get("SL", 0) or 0),
