@@ -196,19 +196,19 @@ _CSS = """
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
 
 :root {
-  --bg0: #0d1117;
-  --bg1: #161b22;
-  --bg2: #1c2333;
-  --bg3: #21262d;
-  --border: rgba(255,255,255,0.08);
-  --gold:   #f5c542;
-  --green:  #3fb950;
-  --amber:  #d29922;
-  --red:    #f85149;
-  --purple: #a371f7;
-  --blue:   #58a6ff;
-  --muted:  #8b949e;
-  --text:   #e6edf3;
+  --bg0: #f5f7fa;
+  --bg1: #ffffff;
+  --bg2: #f1f4f8;
+  --bg3: #e5e9f0;
+  --border: rgba(15,23,42,0.09);
+  --gold:   #b8860b;
+  --green:  #1a7f37;
+  --amber:  #9a6700;
+  --red:    #cf222e;
+  --purple: #8250df;
+  --blue:   #0969da;
+  --muted:  #64748b;
+  --text:   #0f172a;
   --mono: 'JetBrains Mono', 'Fira Code', monospace;
 }
 
@@ -397,7 +397,7 @@ _CSS = """
   z-index: 2;
 }
 .rt thead th {
-  background: #1c2333;
+  background: var(--bg2);
   color: var(--muted);
   font-size: 0.68rem;
   font-weight: 700;
@@ -410,10 +410,10 @@ _CSS = """
 }
 .rt thead th.col-stock { text-align: left; padding-left: 12px; }
 .rt tbody tr {
-  border-bottom: 1px solid rgba(255,255,255,0.04);
+  border-bottom: 1px solid rgba(15,23,42,0.05);
   transition: background 0.12s;
 }
-.rt tbody tr:nth-child(even) { background: rgba(255,255,255,0.02); }
+.rt tbody tr:nth-child(even) { background: rgba(15,23,42,0.015); }
 .rt tbody tr:hover { background: rgba(88,166,255,0.07) !important; }
 .rt td {
   padding: 7px 10px;
@@ -485,7 +485,7 @@ _CSS = """
    No position:absolute inside overflow:hidden — tooltips are never clipped. */
 [data-tip-title] { cursor: default; }
 .tip-underline {
-  border-bottom: 1px dashed rgba(255,255,255,0.35);
+  border-bottom: 1px dashed rgba(15,23,42,0.35);
   cursor: default;
 }
 /* #ms-tip styles are injected into window.parent.document by _TOOLTIP_JS */
@@ -541,7 +541,7 @@ _CSS = """
   letter-spacing:0.06em; text-transform:uppercase; border-bottom:1px solid var(--border);
 }
 .ap-table td { padding:6px 8px; border-bottom:1px solid var(--border); }
-.ap-table tr:hover { background: rgba(255,255,255,0.02); }
+.ap-table tr:hover { background: rgba(15,23,42,0.02); }
 
 /* ── Setup Lifecycle Timeline Panel ── */
 .lifecycle-panel {
@@ -985,7 +985,7 @@ def _scoring_explainer_html() -> str:
         body = ""
         for r in rows:
             tds = "".join(
-                f'<td style="padding:4px 10px 4px 0;font-size:11px;color:{"#e6edf3" if i != 1 else "#4ade80"};'
+                f'<td style="padding:4px 10px 4px 0;font-size:11px;color:{"#0f172a" if i != 1 else "#4ade80"};'
                 f'font-family:var(--mono);white-space:nowrap;vertical-align:top">{v}</td>'
                 for i, v in enumerate(r)
             )
@@ -1166,7 +1166,7 @@ def _scoring_explainer_html() -> str:
     return f"""
 <div style="font-family:'JetBrains Mono','Fira Code',monospace;">
   <p style="font-size:11px;color:#8b949e;margin:0 0 8px;">
-    <b style="color:#e6edf3">Recommendation</b> (Skip &rarr; Watch &rarr; Developing &rarr; Actionable &rarr;
+    <b style="color:#0f172a">Recommendation</b> (Skip &rarr; Watch &rarr; Developing &rarr; Actionable &rarr;
     Execute &rarr; Elite) is the <b>only</b> recommendation shown anywhere in the app, and it comes from
     exactly one pipeline: <b style="color:#58a6ff">CV1 sub-scores</b> &rarr;
     <b style="color:#f5c542">v3 composite/base tier</b> &rarr;
@@ -1341,8 +1341,8 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     group_header = '<tr>'
     # frozen cols: Stock + Signal + L + C + EQ = 5
     group_header += (
-        '<th colspan="5" style="background:#0d1117;position:sticky;left:0;z-index:3;'
-        'border-bottom:1px solid rgba(255,255,255,0.08);"></th>'
+        '<th colspan="5" style="background:#ffffff;position:sticky;left:0;z-index:3;'
+        'border-bottom:1px solid rgba(15,23,42,0.08);"></th>'
     )
     for dim_name, dim_col, span in dim_spans:
         if span == 0:
@@ -1351,7 +1351,7 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
             f'<th colspan="{span}" style="text-align:center;font-size:9px;font-weight:700;'
             f'color:{dim_col};letter-spacing:0.1em;text-transform:uppercase;'
             f'border-bottom:2px solid {dim_col}44;padding:5px 4px 4px;'
-            f'background:#0d1117;">{dim_name}</th>'
+            f'background:#ffffff;">{dim_name}</th>'
         )
     group_header += '</tr>'
 
@@ -1359,29 +1359,29 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     factor_header = '<tr>'
     # Frozen: Stock
     factor_header += (
-        '<th style="position:sticky;left:0;z-index:3;background:#161b22;'
+        '<th style="position:sticky;left:0;z-index:3;background:#f1f4f8;'
         'min-width:90px;padding:6px 10px 6px 12px;text-align:left;'
-        'font-size:10px;font-weight:600;color:#8b949e;white-space:nowrap;'
-        'border-right:1px solid rgba(255,255,255,0.10);">Stock</th>'
+        'font-size:10px;font-weight:600;color:#64748b;white-space:nowrap;'
+        'border-right:1px solid rgba(15,23,42,0.10);">Stock</th>'
     )
     # Frozen: Signal badge
     factor_header += (
-        '<th style="position:sticky;left:90px;z-index:3;background:#161b22;'
+        '<th style="position:sticky;left:90px;z-index:3;background:#f1f4f8;'
         'min-width:62px;padding:6px 8px;text-align:center;'
-        'font-size:10px;font-weight:600;color:#8b949e;white-space:nowrap;'
-        'border-right:1px solid rgba(255,255,255,0.08);">Class</th>'
+        'font-size:10px;font-weight:600;color:#64748b;white-space:nowrap;'
+        'border-right:1px solid rgba(15,23,42,0.08);">Class</th>'
     )
     # Frozen: L / C / EQ
     for lbl, clr in (("L", "#a371f7"), ("C", "#3fb950"), ("EQ", "#d29922")):
         factor_header += (
-            f'<th style="position:sticky;z-index:3;background:#161b22;'
+            f'<th style="position:sticky;z-index:3;background:#f1f4f8;'
             f'min-width:32px;padding:6px 6px;text-align:center;'
             f'font-size:10px;font-weight:700;color:{clr};">{lbl}</th>'
         )
     # Frozen divider
     factor_header += (
-        '<th style="position:sticky;z-index:3;background:#161b22;width:1px;'
-        'padding:0;border-right:2px solid rgba(255,255,255,0.14);"></th>'
+        '<th style="position:sticky;z-index:3;background:#f1f4f8;width:1px;'
+        'padding:0;border-right:2px solid rgba(15,23,42,0.14);"></th>'
     )
 
     # One column per sub-factor with tooltip
@@ -1392,7 +1392,7 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
             f'text-align:center;font-size:9px;font-weight:600;color:{clr};'
             f'white-space:nowrap;cursor:help;border-bottom:2px solid {clr}33;">'
             f'{lbl}<br>'
-            f'<span style="font-size:8px;font-weight:400;color:#8b949e">(+{mx})</span>'
+            f'<span style="font-size:8px;font-weight:400;color:#64748b">(+{mx})</span>'
             f'</th>'
         )
     factor_header += '</tr>'
@@ -1409,8 +1409,8 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
         ls    = int(row.get("CV1_Leadership",   0))
         cv    = int(row.get("CV1_Conviction",   0))
         eq    = int(row.get("CV1_EntryQuality", 0))
-        sc_c, _ = _SC_STYLE.get(sc.upper(), ("#484f58", sc))
-        row_bg = "#0d1117" if i % 2 == 0 else "#111820"
+        sc_c, _ = _SC_STYLE.get(sc.upper(), ("#94a3b8", sc))
+        row_bg = "#ffffff" if i % 2 == 0 else "#f8fafc"
 
         data_rows += f'<tr style="background:{row_bg}">'
 
@@ -1418,15 +1418,15 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
         data_rows += (
             f'<td style="position:sticky;left:0;background:{row_bg};'
             f'padding:6px 10px 6px 12px;font-size:11px;font-weight:700;'
-            f'color:#e6edf3;white-space:nowrap;z-index:2;'
-            f'border-right:1px solid rgba(255,255,255,0.10);">{stock}</td>'
+            f'color:#0f172a;white-space:nowrap;z-index:2;'
+            f'border-right:1px solid rgba(15,23,42,0.10);">{stock}</td>'
         )
 
         # Frozen: Signal badge
         data_rows += (
             f'<td style="position:sticky;left:90px;background:{row_bg};'
             f'padding:5px 8px;text-align:center;z-index:2;'
-            f'border-right:1px solid rgba(255,255,255,0.08);">'
+            f'border-right:1px solid rgba(15,23,42,0.08);">'
             f'<span style="background:{sc_c}18;border:1px solid {sc_c}44;color:{sc_c};'
             f'font-size:9px;font-weight:700;border-radius:3px;padding:1px 5px;">{sc}</span>'
             f'</td>'
@@ -1444,7 +1444,7 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
         # Frozen divider
         data_rows += (
             f'<td style="position:sticky;background:{row_bg};z-index:2;'
-            f'width:1px;padding:0;border-right:2px solid rgba(255,255,255,0.14);"></td>'
+            f'width:1px;padding:0;border-right:2px solid rgba(15,23,42,0.14);"></td>'
         )
 
         # Sub-factor cells
@@ -1452,15 +1452,15 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
             pts = int(row.get(col, 0))
             pct = int(pts / mx * 100) if mx > 0 else 0
             # Colour the bar: full = bright, partial = mid, zero = dark
-            bar_clr = clr if pct >= 60 else (clr + "99" if pct > 0 else "rgba(255,255,255,0.06)")
+            bar_clr = clr if pct >= 60 else (clr + "99" if pct > 0 else "rgba(15,23,42,0.06)")
             data_rows += (
                 f'<td style="padding:5px 6px;text-align:center;min-width:72px;">'
                 # pts label
                 f'<div style="font-size:10px;font-weight:{"700" if pts > 0 else "400"};'
-                f'color:{"" + clr if pts > 0 else "#484f58"};margin-bottom:3px;">'
+                f'color:{"" + clr if pts > 0 else "#94a3b8"};margin-bottom:3px;">'
                 f'{"+" if pts > 0 else ""}{pts}</div>'
                 # progress bar
-                f'<div style="height:4px;background:rgba(255,255,255,0.06);'
+                f'<div style="height:4px;background:rgba(15,23,42,0.06);'
                 f'border-radius:2px;overflow:hidden;">'
                 f'<div style="height:100%;width:{pct}%;background:{bar_clr};'
                 f'border-radius:2px;transition:width 0.3s;"></div>'
@@ -1475,13 +1475,13 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
 
     return f"""
 <div style="font-family:'JetBrains Mono','Fira Code',monospace;margin-top:10px;">
-  <div style="font-size:9px;font-weight:700;color:#8b949e;letter-spacing:0.1em;
+  <div style="font-size:9px;font-weight:700;color:#64748b;letter-spacing:0.1em;
   text-transform:uppercase;margin-bottom:6px;">
   📊 Per-stock sub-factor breakdown — hover column headers for scoring conditions
   </div>
-  <div style="overflow-x:auto;border:1px solid rgba(255,255,255,0.08);border-radius:8px;">
-    <table style="border-collapse:collapse;width:100%;background:#0d1117;">
-      <thead style="background:#161b22;">
+  <div style="overflow-x:auto;border:1px solid rgba(15,23,42,0.08);border-radius:8px;">
+    <table style="border-collapse:collapse;width:100%;background:#ffffff;">
+      <thead style="background:#f1f4f8;">
         {group_header}
         {factor_header}
       </thead>
@@ -1542,7 +1542,7 @@ def _promotion_signals_table(df: pd.DataFrame) -> str:
         rows_html += (
             '<div style="display:flex;align-items:center;gap:10px;padding:7px 4px;'
             'border-bottom:1px solid rgba(255,255,255,0.06);flex-wrap:wrap;">'
-            f'<span style="font-size:11px;font-weight:700;color:#e6edf3;width:90px;">{stock}</span>'
+            f'<span style="font-size:11px;font-weight:700;color:#0f172a;width:90px;">{stock}</span>'
             f'<span style="font-size:9px;font-weight:700;color:{rec_color};'
             f'text-transform:uppercase;width:70px;">{rec}</span>'
             f'<span style="font-size:10px;color:{score_color};font-weight:700;width:70px;">'
@@ -1554,7 +1554,7 @@ def _promotion_signals_table(df: pd.DataFrame) -> str:
         )
 
     return (
-        '<div style="background:#161b22;border:1px solid rgba(255,255,255,0.08);'
+        '<div style="background:#ffffff;border:1px solid rgba(15,23,42,0.08);'
         'border-radius:8px;padding:10px 12px;">'
         '<div style="font-size:9px;font-weight:700;color:#8b949e;letter-spacing:0.08em;'
         'text-transform:uppercase;margin-bottom:6px;">'
@@ -2494,7 +2494,7 @@ def _render_html_table(df: pd.DataFrame) -> str:
 def _validation_row_html(stock: str, sc: str, category: str) -> str:
     return (
         f'<div class="val-strip">'
-        f'<div style="font-size:11px;font-weight:700;color:#e6edf3;width:80px;'
+        f'<div style="font-size:11px;font-weight:700;color:#0f172a;width:80px;'
         f'font-family:\'JetBrains Mono\',monospace">{stock}</div>'
         f'<div class="val-label">CV1</div>'
         f'{_sc_badge(sc)}'
@@ -2984,9 +2984,9 @@ def render(settings: dict | None = None):
     with ctrl3:
         st.markdown(
             f"<div style='padding:0.55rem 0;color:#8b949e;font-size:0.78rem;'>"
-            f"Universe: <b style='color:#e6edf3'>{len(settings.get('symbols', NIFTY500_SYMBOLS))}</b> symbols"
-            f" &nbsp;·&nbsp; Execute threshold: <b style='color:#e6edf3'>{settings.get('execute_threshold', 70)}</b>"
-            f" &nbsp;·&nbsp; Workers: <b style='color:#e6edf3'>{settings.get('workers', 10)}</b></div>",
+            f"Universe: <b style='color:#0f172a'>{len(settings.get('symbols', NIFTY500_SYMBOLS))}</b> symbols"
+            f" &nbsp;·&nbsp; Execute threshold: <b style='color:#0f172a'>{settings.get('execute_threshold', 70)}</b>"
+            f" &nbsp;·&nbsp; Workers: <b style='color:#0f172a'>{settings.get('workers', 10)}</b></div>",
             unsafe_allow_html=True)
     with ctrl4:
         if st.button("🗑️", key="sb_clear_cache", help="Clear data cache"):
@@ -3115,7 +3115,7 @@ def render(settings: dict | None = None):
         st.markdown("""
         <div style="text-align:center;padding:4rem 2rem;color:#8b949e;">
             <div style="font-size:3rem">📡</div>
-            <div style="font-size:1.1rem;margin-top:0.5rem;color:#e6edf3;">No scan data</div>
+            <div style="font-size:1.1rem;margin-top:0.5rem;color:#0f172a;">No scan data</div>
             <div style="font-size:0.8rem;margin-top:0.3rem;">Configure settings and click <b>Run Scan</b></div>
         </div>""", unsafe_allow_html=True)
         return
@@ -3450,7 +3450,7 @@ def render(settings: dict | None = None):
                         tq          = int(_erow.get("TrendQuality", 0))
 
                         st.markdown(
-                            f"<div style='background:#161b22;border:1px solid rgba(255,255,255,0.08);"
+                            f"<div style='background:#ffffff;border:1px solid rgba(15,23,42,0.08);"
                             f"border-radius:8px;padding:14px;font-size:12px;'>",
                             unsafe_allow_html=True,
                         )
