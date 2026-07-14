@@ -246,6 +246,14 @@ def render(settings=None):
                 "Momentum failure exit", value=False, key="bt_momentum_exit",
                 help="Exit post-T1 trades when Close < EMA20 + MACD crossed down + CCI < -100 for 2 consecutive bars. Floors at breakeven — cannot produce a loser."
             )
+            st.markdown("---")
+            bt_shadow_no_gate = st.checkbox(
+                "⚠️ Shadow: disable admission gate (diagnostic only)",
+                value=False, key="bt_shadow_no_gate",
+                help="Simulates every setup regardless of tier/R:R gate, tagging each trade passed_gate=True/False plus its 5 Entry-Quality sub-scores (eq_ema20_dist, eq_pivot_dist, eq_move_since_setup, eq_ema50_dist, eq_bars_since_setup). Produces a wider-range dataset for component-level correlation/PF/expectancy analysis. Do NOT use this run's stats as a live-strategy result — it includes setups the real Scanner would reject."
+            )
+            if bt_shadow_no_gate:
+                st.caption("🔬 Shadow mode ON — this run's trade population is NOT what the live Scanner would recommend. Use only for the Entry Quality component audit.")
 
         with _bc2:
             bt_min_score = st.slider("Min Score for Entry", 50, 100, 70, step=5, key="bt_min_score")
@@ -357,6 +365,10 @@ def render(settings=None):
         bt_settings["bt_cci_len"]            = int(bt_cci_len)
         bt_settings["bt_cci_ob"]             = int(bt_cci_ob)
         bt_settings["bt_cci_os"]             = int(bt_cci_os)
+        # Shadow diagnostic — default False; only True when the checkbox
+        # above is explicitly ticked. See backtest_engine.py's admission
+        # gate section for what this does.
+        bt_settings["shadow_no_admission_gate"] = bool(bt_shadow_no_gate)
 
         # Shared run timestamp so every incremental checkpoint save groups
         # under the same backtest_results.run_at value in Supabase.
