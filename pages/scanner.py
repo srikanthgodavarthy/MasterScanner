@@ -1878,14 +1878,15 @@ def _top_gainers_panel(df: pd.DataFrame, top_n: int = 10) -> str:
         color, label = _SC_STYLE.get(rec.upper(), ("#484f58", "Not Qualified"))
         badge_label = label if rec else "Not Qualified"
         try:
-            price = float(row.get("CMP", 0) or 0)
+            price = float(row.get("CMP", 0) or row.get("LTP", 0) or row.get("Entry", 0) or 0)
         except (TypeError, ValueError):
             price = 0.0
         price_html = f'<span class="ti-gainers-price">₹{price:,.2f}</span>' if price > 0 else ""
+        sym_html = _tv_link(str(sym)) if sym != "—" else sym
         rows.append(
             f'<div class="ti-gainers-row">'
             f'<span class="ti-gainers-rank">{i}</span>'
-            f'<span class="ti-gainers-sym">{sym}{price_html}</span>'
+            f'<span class="ti-gainers-sym">{sym_html}{price_html}</span>'
             f'<span class="ti-gainers-chg">+{chg:.2f}%</span>'
             f'<span class="ti-gainers-badge" style="background:{color}22;color:{color};border:1px solid {color}55">'
             f'{badge_label}</span>'
