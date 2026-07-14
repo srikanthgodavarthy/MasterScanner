@@ -484,6 +484,77 @@ def fetch_nifty_ohlcv(period: str = "1y") -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def fetch_nifty_intraday_snapshot() -> dict:
+    """
+    Return today's Nifty 50 (^NSEI) snapshot for the Market Overview panel's
+    price card: live price, day %chg, today's Open/High/Low, previous close,
+    and an intraday price path for the sparkline.
+
+    {
+      "price": float, "pct_chg": float | None, "open": float, "high": float,
+      "low": float, "prev_close": float | None, "spark": list[float]
+    }
+
+    Same IST-aware "today" logic as fetch_nifty_live(). If the market hasn't
+    opened yet today (or intraday data can't be fetched at all), falls back
+    to the last completed daily bar for Open/High/Low/Close and the most
+    recent ~15 daily closes for the sparkline -- honest about showing
+    yesterday's shape rather than a blank card, same convention already
+    used for the sector sparkline fallback in pages/scanner.py.
+    """
+    import pytz
+    _IST = pytz.timezone("Asia/Kolkata")
+
+    def _today_ist() -> pd.Timestamp:
+        return pd.Timestamp.now(tz=_IST).normalize().tz_localize(None)
+
+    out = {"price": 0.0, "pct_chg": None, "open": 0.0, "high": 0.0,
+           "low": 0.0, "prev_close": None, "spark": []}
+
+    try:
+        df = yf.Ticker("^NSEI").history(period="2d", interval="1m", auto_adjust=True)
+        if not df.empty:
+            df.index = _strip_tz(pd.to_datetime(df.index))
+            today = _today_ist()
+            today_bars = df[df.index.normalize() == today]
+            if not today_bars.empty:
+                prev_bars  = df[df.index.normalize() < today]
+                prev_close = float(prev_bars["Close"].iloc[-1]) if not prev_bars.empty else None
+                price      = float(today_bars["Close"].iloc[-1])
+                out.update({
+                    "price":      price,
+                    "pct_chg":    round((price - prev_close) / prev_close * 100, 2) if prev_close else None,
+                    "open":       float(today_bars["Open"].iloc[0]),
+                    "high":       float(today_bars["High"].max()),
+                    "low":        float(today_bars["Low"].min()),
+                    "prev_close": prev_close,
+                    # Evenly-ish sampled closes across the session for the spark line
+                    "spark":      today_bars["Close"].tolist()[::max(1, len(today_bars)//60)],
+                })
+                return out
+    except Exception:
+        pass
+
+    # Market not yet open / intraday fetch failed — fall back to daily bars
+    try:
+        daily = yf.Ticker("^NSEI").history(period="1mo", auto_adjust=True)
+        if len(daily) >= 2:
+            last, prev = daily.iloc[-1], daily.iloc[-2]
+            last_close, prev_close = float(last["Close"]), float(prev["Close"])
+            out.update({
+                "price":      last_close,
+                "pct_chg":    round((last_close - prev_close) / prev_close * 100, 2) if prev_close else None,
+                "open":       float(last["Open"]),
+                "high":       float(last["High"]),
+                "low":        float(last["Low"]),
+                "prev_close": prev_close,
+                "spark":      daily["Close"].tail(15).tolist(),
+            })
+    except Exception:
+        pass
+    return out
+
+
 def fetch_nifty_live() -> tuple[float, float | None]:
     """
     Return (current_price, day_pct_change) for Nifty 50 (^NSEI).
