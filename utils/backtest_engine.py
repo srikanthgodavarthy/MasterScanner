@@ -1093,6 +1093,41 @@ def simulate_trades(
 
         pnl_pct = round((exit_price - entry_price) / entry_price * 100, 2)
 
+        # ── True MFE / MAE (v14) ──────────────────────────────────
+        # Model-independent of the T1/SL exit above: this is the actual
+        # best/worst excursion price reached anywhere in the same
+        # `window` (entry → min(hold_days, natural exit-cap)), regardless
+        # of whether the single-target model would have already closed
+        # the position. This is the raw material for an empirical MFE
+        # ceiling (dimension 1 of the target-engine redesign) — it must
+        # NOT be contaminated by T1/SL/target logic, or it just re-derives
+        # the same heuristic it's meant to replace.
+        run_high    = float(np.max(w_high)) if len(w_high) else entry_price
+        run_low     = float(np.min(w_low))  if len(w_low) else entry_price
+        bars_to_mfe = int(np.argmax(w_high)) if len(w_high) else 0
+        mfe_r       = round((run_high - entry_price) / rk, 3) if rk > 0 else 0.0
+        mfe_pct     = round((run_high - entry_price) / entry_price * 100, 2)
+        mae_r       = round((entry_price - run_low) / rk, 3) if rk > 0 else 0.0
+        mae_pct     = round((entry_price - run_low) / entry_price * 100, 2)
+
+        # "First meaningful pause" — the run-up actually captured *before*
+        # the first pullback of >=1 ATR (or >=50% giveback of the run-up
+        # so far) from the running high, using bars up to bars_to_mfe.
+        # This targets the reframed question directly: not "how far can
+        # an Elite stock go" but "how far does price usually run before it
+        # first pauses". Falls back to the full-window MFE when no pause
+        # is detected inside the window (i.e. price ran clean to its high).
+        _atr0 = float(sig.get("atr_at_setup", 0.0)) or (rk * 0.5)   # crude ATR proxy if missing
+        pause_r = mfe_r
+        if bars_to_mfe > 0 and _atr0 > 0:
+            running_peak = entry_price
+            for j in range(bars_to_mfe + 1):
+                running_peak = max(running_peak, w_high[j])
+                giveback = running_peak - w_low[j]
+                if giveback >= _atr0 and running_peak > entry_price:
+                    pause_r = round((running_peak - entry_price) / rk, 3) if rk > 0 else 0.0
+                    break
+
         trades.append({
             "symbol":          symbol,
             "entry_date":      entry_bar.date(),
@@ -1168,6 +1203,14 @@ def simulate_trades(
             # of initial risk (pnl_abs ÷ rk). +t1_mult on a T1 HIT, -1.0 on an
             # SL HIT, whatever fraction of R was banked/lost on a TIMEOUT.
             "r_multiple":      round((exit_price - entry_price) / rk, 2) if rk > 0 else 0.0,
+            # ── True MFE/MAE (v14) — model-independent excursion data,
+            # the raw input for the empirical MFE ceiling table below.
+            "mfe_r":           mfe_r,
+            "mfe_pct":         mfe_pct,
+            "mae_r":           mae_r,
+            "mae_pct":         mae_pct,
+            "bars_to_mfe":     bars_to_mfe,
+            "pause_r":         pause_r,   # run-up captured before first >=1ATR giveback
             # ── VWAP Reclaim trade diagnostics (from signal, preserved on trade) ──
             "vwap_touch":             bool(sig.get("vwap_touch",           False)),
             "reaction_strength":      float(sig.get("reaction_strength",   0.0)),
@@ -1899,6 +1942,76 @@ def _excursion_summary(trades: pd.DataFrame) -> dict:
     }
 
 
+def mfe_ceiling_table(trades: pd.DataFrame, min_bucket_n: int = 15) -> dict:
+    """
+    v14: Empirical MFE ceiling table — dimension 1 of the target-engine
+    redesign (see adaptive_target_engine.py redesign notes).
+
+    Unlike _excursion_summary() above (which *infers* MFE from which
+    target was hit — circular, since it's built from the very heuristic
+    tiers it's meant to replace), this reads the true bar-level `mfe_r`
+    / `pause_r` columns written by simulate_trades(): the actual best
+    price reached in the hold window, independent of T1/SL/target logic.
+
+    Buckets by (target_category, atr_band) — both already attached to
+    every trade row, so no extra joins are needed. For each bucket:
+      - mfe_r_p50/p75/p90   : full-window run-up percentiles (the true
+                               ceiling — "how far could this have gone")
+      - pause_r_p50/p75/p90 : run-up captured before the first >=1 ATR
+                               giveback (the "before its next meaningful
+                               pause" distance — usually the more useful
+                               number for setting T1/T2)
+      - n                   : sample size (buckets under min_bucket_n
+                               are flagged, not dropped, so thin data is
+                               visible rather than silently trusted)
+
+    Falls back to an empty dict if the trades frame predates the v14
+    mfe_r/pause_r columns (e.g. a cached backtest run) — call sites
+    should check for this and fall back to _excursion_summary().
+    """
+    if trades.empty or "mfe_r" not in trades.columns or "pause_r" not in trades.columns:
+        return {}
+
+    df = trades.copy()
+    cat_col = "target_category" if "target_category" in df.columns else None
+    band_col = "atr_band" if "atr_band" in df.columns else None
+    if cat_col is None:
+        return {}
+
+    group_cols = [c for c in (cat_col, band_col) if c is not None]
+    rows = []
+    for keys, grp in df.groupby(group_cols):
+        keys = keys if isinstance(keys, tuple) else (keys,)
+        n = len(grp)
+        row = dict(zip(group_cols, keys))
+        row.update({
+            "n":             n,
+            "thin_sample":   n < min_bucket_n,
+            "mfe_r_p50":     round(float(np.percentile(grp["mfe_r"], 50)), 2),
+            "mfe_r_p75":     round(float(np.percentile(grp["mfe_r"], 75)), 2),
+            "mfe_r_p90":     round(float(np.percentile(grp["mfe_r"], 90)), 2),
+            "pause_r_p50":   round(float(np.percentile(grp["pause_r"], 50)), 2),
+            "pause_r_p75":   round(float(np.percentile(grp["pause_r"], 75)), 2),
+            "pause_r_p90":   round(float(np.percentile(grp["pause_r"], 90)), 2),
+            "mae_r_p50":     round(float(np.percentile(grp["mae_r"], 50)), 2) if "mae_r" in grp.columns else None,
+        })
+        rows.append(row)
+
+    return {
+        "buckets":    rows,
+        "group_cols": group_cols,
+        "overall": {
+            "n":           len(df),
+            "mfe_r_p50":   round(float(np.percentile(df["mfe_r"], 50)), 2),
+            "mfe_r_p75":   round(float(np.percentile(df["mfe_r"], 75)), 2),
+            "mfe_r_p90":   round(float(np.percentile(df["mfe_r"], 90)), 2),
+            "pause_r_p50": round(float(np.percentile(df["pause_r"], 50)), 2),
+            "pause_r_p75": round(float(np.percentile(df["pause_r"], 75)), 2),
+            "pause_r_p90": round(float(np.percentile(df["pause_r"], 90)), 2),
+        },
+    }
+
+
 def compute_stats(trades: pd.DataFrame) -> dict:
     if trades.empty:
         return {}
@@ -2038,6 +2151,9 @@ def compute_stats(trades: pd.DataFrame) -> dict:
         # v12/v13: adaptive target category breakdown + excursion stats
         "target_category_stats":   _target_category_breakdown(trades),
         "excursion_stats":         _excursion_summary(trades),
+        # v14: true-MFE empirical ceiling table (dimension 1 of the
+        # target-engine redesign) — empty dict on cached pre-v14 runs.
+        "mfe_ceiling_table":       mfe_ceiling_table(trades),
     }
 
 
