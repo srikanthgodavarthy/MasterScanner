@@ -40,10 +40,15 @@ be. This is a deliberate correctness/cost tradeoff, not an oversight —
 if you see stale-looking adjusted prices, check whether this interval
 needs to be shorter for your holding universe.
 
-Supabase Storage setup (ONE-TIME, do this in the Supabase dashboard):
-  Storage -> New bucket -> name it exactly "history-cache" -> private is
-  fine (we use the existing service client from utils.supabase_client).
-  No SQL needed — this is Storage, not a table.
+Supabase Storage setup:
+  None needed — get_history() auto-creates the "history-cache" bucket on
+  first use if it doesn't exist yet (see _ensure_bucket()). This requires
+  SUPABASE_KEY in st.secrets to be the service_role key, not the anon key,
+  since bucket creation is an admin-level Storage operation. If it's the
+  anon key, auto-create will fail with a permissions error (logged, not
+  raised) and the cache falls back to local-only for that process — create
+  the bucket manually in the dashboard in that case (Storage -> New bucket
+  -> name it exactly "history-cache").
 """
 
 from __future__ import annotations
@@ -122,12 +127,60 @@ def _meta_save(symbol: str, meta: dict) -> None:
 
 # ─── SUPABASE STORAGE TIER (best-effort — never blocks or raises) ──────────
 
+_bucket_status: Optional[bool] = None   # None=not checked yet, True=ready, False=gave up this process
+
+
+def _ensure_bucket(client) -> bool:
+    """
+    Checks the history-cache bucket exists; creates it if not. Runs at most
+    once per process — a permission failure won't be retried on every
+    symbol's upload, it just falls back to local-only for the rest of the run.
+    """
+    global _bucket_status
+    if _bucket_status is not None:
+        return _bucket_status
+
+    try:
+        client.storage.get_bucket(HISTORY_BUCKET)
+        _bucket_status = True
+        return True
+    except Exception:
+        pass  # doesn't exist (or transient) — try creating it next
+
+    try:
+        client.storage.create_bucket(HISTORY_BUCKET, options={"public": False})
+        logger.info("history_store: auto-created Supabase Storage bucket '%s'", HISTORY_BUCKET)
+        _bucket_status = True
+        return True
+    except Exception as exc:
+        msg = str(exc)
+        if "already exists" in msg.lower() or "duplicate" in msg.lower():
+            _bucket_status = True
+            return True
+        # Most likely cause: SUPABASE_KEY in st.secrets is the anon key.
+        # Creating a bucket is an admin-level Storage operation and needs
+        # the service_role key — the anon key will 403 here even though it
+        # works fine for the table reads/writes elsewhere in this app.
+        logger.warning(
+            "history_store: could not auto-create Supabase Storage bucket '%s' (%s). "
+            "If this looks like a permissions error, SUPABASE_KEY in st.secrets is "
+            "probably the anon key — bucket creation needs the service_role key. "
+            "Falling back to local-only cache for this process; create the bucket "
+            "manually in the Supabase dashboard to restore durability.",
+            HISTORY_BUCKET, exc,
+        )
+        _bucket_status = False
+        return False
+
+
 def _supabase_storage():
     """Returns the storage bucket handle, or None if unavailable for any reason."""
     try:
         from utils.supabase_client import get_client
         client = get_client()
         if client is None:
+            return None
+        if not _ensure_bucket(client):
             return None
         return client.storage.from_(HISTORY_BUCKET)
     except Exception as exc:
@@ -188,10 +241,10 @@ def _raw_fetch(symbols: list, start: date, end: date) -> dict:
         )
         if raw.empty:
             continue
-        single = len(tickers) == 1
+        is_multi = isinstance(raw.columns, pd.MultiIndex)
         for sym, ticker in zip(chunk, tickers):
             try:
-                df = raw if single else raw[ticker]
+                df = raw[ticker] if is_multi else raw
                 df = df.dropna(how="all")
                 if df.empty:
                     continue
