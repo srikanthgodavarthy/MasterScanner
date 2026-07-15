@@ -149,6 +149,15 @@ with st.expander("🔌 Upstox Pilot Check (token sanity test)", expanded=False):
                 "as UPSTOX_ACCESS_TOKEN = \"...\" or to a local .env file, then rerun."
             )
         else:
+            # Masked debug info — never prints the real token, just enough
+            # to catch a truncated/corrupted paste. A genuine Upstox JWT
+            # access token is typically 300+ chars.
+            st.caption(f"Loaded token: {len(token)} chars, ends in ...{token[-6:]}")
+            if len(token) < 200:
+                st.warning(
+                    "This looks shorter than a normal Upstox access token — "
+                    "it may have gotten truncated when pasted into secrets.toml/.env."
+                )
             headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
 
             # Step 1 — confirm the token itself is valid
