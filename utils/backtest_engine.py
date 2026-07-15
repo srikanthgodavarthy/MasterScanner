@@ -27,7 +27,7 @@ import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import threading
 
-from utils.scanner_engine import _strip_tz, nifty_regime, ema
+from utils.scanner_engine import _strip_tz, nifty_regime, ema, yf_download_with_retry
 from utils.decision_engine import _extension as _ext_fn
 from utils.conviction_score_v1 import compute_conviction_v3, classify_tier_v3, _classify_v3
 from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
@@ -59,18 +59,17 @@ def _fetch_bt_batch(symbols: tuple, years: int = 3) -> dict:
     start = end - timedelta(days=years * 365 + 10)
 
     tickers = [f"{s}.NS" for s in symbols]
-    try:
-        raw = yf.download(
-            tickers,
-            start       = start.strftime("%Y-%m-%d"),
-            end         = end.strftime("%Y-%m-%d"),
-            interval    = "1d",
-            auto_adjust = True,
-            group_by    = "ticker",
-            threads     = True,
-            progress    = False,
-        )
-    except Exception:
+    raw = yf_download_with_retry(
+        tickers,
+        start       = start.strftime("%Y-%m-%d"),
+        end         = end.strftime("%Y-%m-%d"),
+        interval    = "1d",
+        auto_adjust = True,
+        group_by    = "ticker",
+        threads     = True,
+        progress    = False,
+    )
+    if raw.empty:
         return {}
 
     result = {}
@@ -107,20 +106,33 @@ def _fetch_bt_nifty(years: int = 3) -> pd.Series:
         return pd.Series(dtype=float)
 
 
-def fetch_all_bt_data(symbols: list, years: int = 3) -> dict:
+def fetch_all_bt_data(symbols: list, years: int = 3, progress_cb=None) -> dict:
     """
     Pre-fetch all backtest data in batches.
     Called ONCE before spawning worker threads — workers do dict lookups only.
+
+    progress_cb(batch_i, n_batches, symbols_so_far): optional, fired after each
+    batch completes. 2026-07-15: previously nothing fired between the single
+    "Fetching historical data…" call in run_backtest() and this function
+    returning — so a slow/retrying batch (see yf_download_with_retry) looked
+    identical to a fully-hung app. Now each batch reports in, so a run that's
+    just slow (vs. actually stuck) is visibly making progress.
     """
     # Deduplicate while preserving order
     seen   = set()
     unique = [s for s in symbols if not (s in seen or seen.add(s))]
 
+    n_batches = max(1, (len(unique) + _BT_BATCH_SIZE - 1) // _BT_BATCH_SIZE)
     all_data: dict = {}
-    for start in range(0, len(unique), _BT_BATCH_SIZE):
+    for batch_i, start in enumerate(range(0, len(unique), _BT_BATCH_SIZE)):
         chunk = tuple(unique[start: start + _BT_BATCH_SIZE])
         batch = _fetch_bt_batch(chunk, years=years)
         all_data.update(batch)
+        if progress_cb:
+            try:
+                progress_cb(batch_i + 1, n_batches, len(all_data))
+            except Exception:
+                pass
     return all_data
 
 
@@ -1413,7 +1425,13 @@ def run_backtest(
     if progress_cb:
         progress_cb(0.0, "Fetching historical data…")
 
-    all_data = fetch_all_bt_data(symbols, years=3)
+    def _fetch_progress(batch_i, n_batches, n_fetched):
+        if progress_cb:
+            # Fetch phase occupies 0%–15% of the overall bar.
+            pct = 0.15 * (batch_i / n_batches)
+            progress_cb(pct, f"Fetching data — batch {batch_i}/{n_batches} ({n_fetched} symbols so far)")
+
+    all_data = fetch_all_bt_data(symbols, years=3, progress_cb=_fetch_progress)
 
     nifty = _fetch_bt_nifty(years=3)                  # cached 1h
     regime_val         = nifty_regime(nifty)
