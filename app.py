@@ -1,10 +1,17 @@
 import streamlit as st
 import sys
 import os
+import gzip
+import io
+import requests
+import pandas as pd
+from dotenv import load_dotenv
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+
+load_dotenv()  # picks up UPSTOX_ACCESS_TOKEN from a local .env if present
 
 st.set_page_config(
     page_title="Trinity — Nifty 500",
@@ -78,6 +85,102 @@ st.markdown("""
     <p class="scanner-subtitle"><span class="status-dot"></span>Nifty 500 · Regime Engine v2 · Leadership · Conviction · Entry Quality</p>
 </div>
 """, unsafe_allow_html=True)
+
+# ── Upstox Pilot Check ────────────────────────────────────────────
+# Small standalone sanity check: confirms the Upstox access token works
+# and fetches a live LTP quote for a stock. Not wired into the scanner —
+# just a manual "is my token good" button. Change STOCK NAME in the
+# text box below to test a different stock; no other edits needed.
+
+def _get_upstox_token() -> str | None:
+    """Looks in st.secrets first (Streamlit Cloud), then falls back to
+    an environment variable / local .env (UPSTOX_ACCESS_TOKEN)."""
+    try:
+        token = st.secrets.get("UPSTOX_ACCESS_TOKEN")
+        if token:
+            return token
+    except Exception:
+        pass
+    return os.environ.get("UPSTOX_ACCESS_TOKEN")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _load_nse_instrument_master() -> pd.DataFrame:
+    """Downloads Upstox's NSE instrument master (refreshed daily by
+    Upstox) and returns it as a DataFrame so plain stock names like
+    'RELIANCE' can be resolved to the instrument_key Upstox's API
+    actually requires (e.g. NSE_EQ|INE002A01018)."""
+    url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz"
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    with gzip.open(io.BytesIO(resp.content)) as f:
+        df = pd.read_csv(f)
+    df.columns = [c.strip().lower() for c in df.columns]
+    return df
+
+
+def _resolve_instrument_key(trading_symbol: str) -> str | None:
+    df = _load_nse_instrument_master()
+    symbol_col = next((c for c in ("tradingsymbol", "trading_symbol", "symbol") if c in df.columns), None)
+    type_col   = next((c for c in ("instrument_type", "instrumenttype") if c in df.columns), None)
+    if symbol_col is None:
+        return None
+    matches = df[df[symbol_col].astype(str).str.upper() == trading_symbol.strip().upper()]
+    if type_col in df.columns:
+        eq_matches = matches[matches[type_col].astype(str).str.upper() == "EQ"]
+        if not eq_matches.empty:
+            matches = eq_matches
+    if matches.empty:
+        return None
+    return matches.iloc[0]["instrument_key"]
+
+
+with st.expander("🔌 Upstox Pilot Check (token sanity test)", expanded=False):
+    stock_name = st.text_input(
+        "Stock name (NSE trading symbol)",
+        value="RELIANCE",
+        help="e.g. RELIANCE, TCS, INFY, HDFCBANK — change this to test a different stock.",
+    )
+    if st.button("Test Upstox Connection"):
+        token = _get_upstox_token()
+        if not token:
+            st.error(
+                "No UPSTOX_ACCESS_TOKEN found. Add it to .streamlit/secrets.toml "
+                "as UPSTOX_ACCESS_TOKEN = \"...\" or to a local .env file, then rerun."
+            )
+        else:
+            headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+
+            # Step 1 — confirm the token itself is valid
+            profile_resp = requests.get("https://api.upstox.com/v2/user/profile", headers=headers, timeout=10)
+            if profile_resp.status_code != 200:
+                st.error(f"Token check failed ({profile_resp.status_code}): {profile_resp.text}")
+            else:
+                profile = profile_resp.json().get("data", {})
+                st.success(f"Token valid — logged in as {profile.get('user_name', 'unknown')} ({profile.get('broker', 'UPSTOX')})")
+
+                # Step 2 — resolve the stock name to an instrument_key, then fetch LTP
+                with st.spinner(f"Resolving {stock_name} and fetching LTP..."):
+                    instrument_key = _resolve_instrument_key(stock_name)
+                if not instrument_key:
+                    st.warning(f"Could not find '{stock_name}' in the NSE instrument master. Check the spelling.")
+                else:
+                    ltp_resp = requests.get(
+                        "https://api.upstox.com/v3/market-quote/ltp",
+                        headers=headers,
+                        params={"instrument_key": instrument_key},
+                        timeout=10,
+                    )
+                    if ltp_resp.status_code != 200:
+                        st.error(f"LTP fetch failed ({ltp_resp.status_code}): {ltp_resp.text}")
+                    else:
+                        data = ltp_resp.json().get("data", {})
+                        if data:
+                            quote = next(iter(data.values()))
+                            st.metric(f"{stock_name} LTP", f"₹{quote.get('last_price')}")
+                            st.caption(f"instrument_key: {instrument_key}")
+                        else:
+                            st.warning("Empty response — market may be closed or instrument_key is stale.")
 
 from pages.scanner       import render as render_scanner
 from pages.backtest      import render as render_backtest
