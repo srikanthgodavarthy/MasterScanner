@@ -1364,7 +1364,7 @@ def run_backtest(
     extra_pillar_cfg: dict | None = None,
     checkpoint_cb          = None,
     checkpoint_every: int  = 25,
-    use_processes:    bool = True,
+    use_processes:    bool = False,
 ) -> tuple:
     """
     Walk-forward backtest.
@@ -1389,24 +1389,32 @@ def run_backtest(
 
     use_processes: score+simulate is pure CPU work (no network I/O). CPython
     threads don't parallelize CPU-bound code (GIL), so ThreadPoolExecutor
-    runs close to single-threaded despite N "workers". Default True uses
-    ProcessPoolExecutor for real multi-core parallelism — restored
-    2026-07-15 back to the pre-incident baseline after confirming the
-    original backtest slowness was actually two separate issues: (1) an
-    unbounded, retry-less yf.download() hang during fetch [fixed
-    separately via yf_download_with_retry + the yfinance==0.2.66 pin],
-    and (2) this flag having been flipped to False the same day, which
-    made Phase 2 scoring run effectively single-threaded.
+    runs close to single-threaded despite N "workers" — that's the
+    ThreadPoolExecutor tradeoff and it's a known, accepted cost.
 
-    Known risk this reintroduces: ProcessPoolExecutor's per-worker cost
-    (one full Python interpreter + full pandas/numpy/utils import PER
-    WORKER, paid up front regardless of symbol count) previously OOM-killed
-    this app on a memory-capped host (Streamlit Community Cloud), with a
-    silent death and no Python-level traceback — same failure on a
-    15-symbol run as a 500-symbol run, since it's driven by worker COUNT
-    not data volume. If that resurfaces, the cheapest first lever is
-    lowering `workers` well below 10 (e.g. 3-4) before considering
-    reverting this flag again.
+    Default is now False (changed back 2026-07-15 PM). Earlier the same
+    day this was flipped to True (ProcessPoolExecutor) to fix a different
+    problem — Phase 2 scoring running effectively single-threaded — but
+    that reintroduced a worse failure: ProcessPoolExecutor defaults to
+    `fork` on Linux, and forking a process that already has multiple
+    threads running (which every Streamlit app does — tornado/session/
+    cache threads) can deadlock a child worker on a lock it inherited
+    mid-acquisition. Unlike an OOM kill, this doesn't raise
+    BrokenProcessPool — the worker just never returns, and as_completed()
+    waits on it forever. Confirmed in practice: a 500-symbol run stalled
+    at ~32% (mid-scoring) after 20+ minutes with no error, matching this
+    failure mode exactly, not the OOM one.
+
+    It also wasn't buying anything: Streamlit Community Cloud provisions
+    a single shared vCPU, so multiple processes have no real cores to
+    parallelize across — only fork overhead and this deadlock risk, for
+    zero wall-clock benefit. If this app ever moves to a host with
+    multiple dedicated cores, ProcessPoolExecutor could be revisited, but
+    it MUST use `mp_context=multiprocessing.get_context("spawn")`
+    (not the fork default) to avoid this exact deadlock — spawn starts a
+    fresh interpreter per worker instead of forking the live threaded
+    process. Do not just flip this back to True without also setting
+    that context.
     """
     if settings:
         hold_days        = settings.get("hold_days",            hold_days)
@@ -1507,10 +1515,11 @@ def run_backtest(
             import logging
             logging.getLogger(__name__).warning("checkpoint_cb failed at %d/%d", n, total, exc_info=True)
 
-    # Defaults to ProcessPoolExecutor (see use_processes docstring above) —
-    # real multi-core parallelism for this CPU-bound work. ThreadPoolExecutor
-    # remains available (use_processes=False) as a GIL-serialized fallback
-    # for hosts where spawning processes isn't safe/available.
+    # Defaults to ThreadPoolExecutor (see use_processes docstring above) —
+    # GIL-serialized for this CPU-bound work, but safe on Streamlit's
+    # multi-threaded runtime. ProcessPoolExecutor remains available
+    # (use_processes=True) for hosts with real dedicated multi-core CPUs,
+    # but requires mp_context="spawn" there to avoid the fork deadlock.
     Executor = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
     _log.info("run_backtest: executor=%s workers=%d symbols=%d",
               Executor.__name__, workers, len(valid_symbols))
