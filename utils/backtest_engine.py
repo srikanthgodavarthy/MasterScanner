@@ -1361,7 +1361,7 @@ def run_backtest(
     extra_pillar_cfg: dict | None = None,
     checkpoint_cb          = None,
     checkpoint_every: int  = 25,
-    use_processes:    bool = False,
+    use_processes:    bool = True,
 ) -> tuple:
     """
     Walk-forward backtest.
@@ -1386,18 +1386,24 @@ def run_backtest(
 
     use_processes: score+simulate is pure CPU work (no network I/O). CPython
     threads don't parallelize CPU-bound code (GIL), so ThreadPoolExecutor
-    here runs close to single-threaded despite N "workers" — true, but
-    ProcessPoolExecutor's fix for that costs one full Python interpreter
-    + full import of pandas/numpy/every utils module PER WORKER PROCESS,
-    paid up front regardless of how many symbols are actually being
-    scored. On a memory-capped host (Streamlit Community Cloud) that
-    overhead alone — before a single bar is scored — was enough to OOM-kill
-    the app with no Python-level traceback (silent death at a random
-    progress %, same failure on a 15-symbol run as a 500-symbol run,
-    since it's driven by worker COUNT not by data volume). Reverted to
-    False (2026-07-15) after that exact failure. Only flip this back to
-    True on a host with real headroom to spare, and consider dropping
-    default `workers` well below 10 first if you do.
+    runs close to single-threaded despite N "workers". Default True uses
+    ProcessPoolExecutor for real multi-core parallelism — restored
+    2026-07-15 back to the pre-incident baseline after confirming the
+    original backtest slowness was actually two separate issues: (1) an
+    unbounded, retry-less yf.download() hang during fetch [fixed
+    separately via yf_download_with_retry + the yfinance==0.2.66 pin],
+    and (2) this flag having been flipped to False the same day, which
+    made Phase 2 scoring run effectively single-threaded.
+
+    Known risk this reintroduces: ProcessPoolExecutor's per-worker cost
+    (one full Python interpreter + full pandas/numpy/utils import PER
+    WORKER, paid up front regardless of symbol count) previously OOM-killed
+    this app on a memory-capped host (Streamlit Community Cloud), with a
+    silent death and no Python-level traceback — same failure on a
+    15-symbol run as a 500-symbol run, since it's driven by worker COUNT
+    not data volume. If that resurfaces, the cheapest first lever is
+    lowering `workers` well below 10 (e.g. 3-4) before considering
+    reverting this flag again.
     """
     if settings:
         hold_days        = settings.get("hold_days",            hold_days)
