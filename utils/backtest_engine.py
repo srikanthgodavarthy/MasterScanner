@@ -1349,7 +1349,7 @@ def run_backtest(
     extra_pillar_cfg: dict | None = None,
     checkpoint_cb          = None,
     checkpoint_every: int  = 25,
-    use_processes:    bool = True,
+    use_processes:    bool = False,
 ) -> tuple:
     """
     Walk-forward backtest.
@@ -1374,10 +1374,18 @@ def run_backtest(
 
     use_processes: score+simulate is pure CPU work (no network I/O). CPython
     threads don't parallelize CPU-bound code (GIL), so ThreadPoolExecutor
-    here previously ran close to single-threaded despite N "workers". Default
-    True uses ProcessPoolExecutor for real multi-core parallelism. Set False
-    to fall back to threads (e.g. constrained/sandboxed hosts where spawning
-    processes isn't available).
+    here runs close to single-threaded despite N "workers" — true, but
+    ProcessPoolExecutor's fix for that costs one full Python interpreter
+    + full import of pandas/numpy/every utils module PER WORKER PROCESS,
+    paid up front regardless of how many symbols are actually being
+    scored. On a memory-capped host (Streamlit Community Cloud) that
+    overhead alone — before a single bar is scored — was enough to OOM-kill
+    the app with no Python-level traceback (silent death at a random
+    progress %, same failure on a 15-symbol run as a 500-symbol run,
+    since it's driven by worker COUNT not by data volume). Reverted to
+    False (2026-07-15) after that exact failure. Only flip this back to
+    True on a host with real headroom to spare, and consider dropping
+    default `workers` well below 10 first if you do.
     """
     if settings:
         hold_days        = settings.get("hold_days",            hold_days)
@@ -1461,10 +1469,10 @@ def run_backtest(
             import logging
             logging.getLogger(__name__).warning("checkpoint_cb failed at %d/%d", n, total, exc_info=True)
 
-    # CPU-bound scoring: ProcessPoolExecutor gives real multi-core parallelism.
-    # ThreadPoolExecutor would just serialize on the GIL for this workload —
-    # kept as an opt-out (use_processes=False) for hosts that can't spawn
-    # subprocesses.
+    # Defaults to ThreadPoolExecutor (see use_processes docstring above) —
+    # GIL-serialized for this CPU-bound work, but stable on a memory-capped
+    # host. ProcessPoolExecutor remains available as an explicit opt-in
+    # (use_processes=True) on hosts with real memory headroom.
     Executor = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
 
     with Executor(max_workers=workers) as exe:
