@@ -1,5 +1,9 @@
 streamlit>=1.35.0
-yfinance>=0.2.40
+yfinance==0.2.66  # PINNED 2026-07-15: was >=0.2.40 (floating), which silently
+                  # resolved to 1.5.1 on the last reinstall and coincided with
+                  # backtest fetches hanging/never completing. 0.2.66 is the
+                  # last 0.2.x release before the 1.0 jump. Re-test before
+                  # bumping past this — see utils/backtest_engine.py PERF notes.
 pandas==2.2.3
 numpy==1.26.4
 plotly>=5.22.0
