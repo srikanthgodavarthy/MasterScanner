@@ -15,11 +15,22 @@ import requests
 import io
 import logging
 import time
+import random
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings("ignore")
 
 _log = logging.getLogger(__name__)
+
+try:
+    # Present in recent yfinance releases; lets us give rate-limit errors
+    # their own (much longer) backoff instead of treating them the same
+    # as a generic network blip. Not all versions expose this, so we fall
+    # back to string-matching the exception message if the import fails.
+    from yfinance.exceptions import YFRateLimitError as _YFRateLimitError
+except Exception:
+    _YFRateLimitError = None
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -32,33 +43,137 @@ _log = logging.getLogger(__name__)
 # always honored — see ranaroussi/yfinance and lexiforest/curl_cffi
 # issue trackers). This wrapper bounds each attempt and gives up loudly
 # after a few tries instead of hanging silently.
+#
+# 2026-07-15 (later same day) — COLD-CACHE HARDENING:
+# The above was enough for the normal "small tail fetch per symbol"
+# workload, but a cold cache (fresh redeploy, or history-cache Storage
+# bucket not yet populated) sends ALL symbols through need_full at once
+# — 10 batches of 50 tickers, each internally multi-threaded by
+# yf.download(threads=True). That load pattern surfaced two failure
+# modes that never showed up under the normal light workload:
+#
+#   1. YFRateLimitError — Yahoo throttles bursts of concurrent batch
+#      calls. Treating this the same as a generic exception (5s/10s/15s
+#      backoff) isn't enough; rate limits need a longer, escalating
+#      cooldown or the very next attempt just gets limited again.
+#   2. sqlite3.OperationalError("database is locked") — yfinance keeps a
+#      local SQLite cache (tz/cookie data) that multiple threads across
+#      concurrent batches can hit at once. This is transient (the lock
+#      clears in milliseconds) but needs its own short retry rather than
+#      the full linear backoff, and benefits from serializing calls
+#      rather than letting every batch fire at the same instant.
+#
+# Two changes address this without touching any caller's contract
+# (still fail-soft, still returns an empty DataFrame, never raises):
+#   - A process-wide minimum spacing between successive yf.download()
+#     *attempts* (not just retries), enforced via a lock + shared
+#     timestamp, so a cold-cache run's 10+ batches don't all slam Yahoo
+#     back-to-back.
+#   - Error-type-aware backoff: rate limits get a longer exponential
+#     cooldown; "database is locked" gets a short jittered retry and
+#     forces threads=False on its next attempt (avoids re-triggering the
+#     same concurrent-write race); anything else keeps the original
+#     linear backoff.
 
-_YF_TIMEOUT     = 30   # seconds per attempt
-_YF_MAX_RETRIES = 3
-_YF_BACKOFF_S   = 5    # base backoff between retries (linear: 5s, 10s, 15s...)
+_YF_TIMEOUT       = 30    # seconds per attempt
+_YF_MAX_RETRIES   = 3
+_YF_BACKOFF_S     = 5     # base linear backoff for generic errors (5s, 10s, 15s...)
+
+_YF_MIN_SPACING_S = 2.0   # minimum gap enforced between successive yf.download calls,
+                          # process-wide — smooths out bursty cold-cache batch loops
+_YF_LOCK_RETRY_S  = 0.5   # base backoff for "database is locked" (short + jittered)
+_YF_LOCK_MAX_TRY  = 5     # locked-db is transient; worth a few extra quick attempts
+_YF_RATELIMIT_BASE_S = 20  # base cooldown for rate-limit errors (exponential: 20s, 40s, 80s...)
+
+_yf_call_lock  = threading.Lock()   # serializes spacing + protects _yf_last_call_ts
+_yf_last_call_ts = 0.0
+
+
+def _is_locked_db_error(exc: Exception) -> bool:
+    return "database is locked" in str(exc).lower()
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    if _YFRateLimitError is not None and isinstance(exc, _YFRateLimitError):
+        return True
+    msg = str(exc).lower()
+    return "rate limit" in msg or "too many requests" in msg
+
+
+def _wait_for_spacing():
+    """Blocks the caller (if needed) so consecutive yf.download() attempts
+    across the whole process are never closer together than
+    _YF_MIN_SPACING_S. Cheap no-op once the process has been idle a bit."""
+    global _yf_last_call_ts
+    with _yf_call_lock:
+        now = time.monotonic()
+        wait = _YF_MIN_SPACING_S - (now - _yf_last_call_ts)
+        if wait > 0:
+            time.sleep(wait)
+        _yf_last_call_ts = time.monotonic()
 
 
 def yf_download_with_retry(tickers, **kwargs):
     """
-    Thin wrapper around yf.download() that adds a bounded timeout and a
-    small linear-backoff retry loop. Returns an empty DataFrame (never
-    raises) if all attempts fail, matching the existing fail-soft
-    behaviour of fetch_batch_ohlcv / _fetch_bt_batch.
+    Thin wrapper around yf.download() that adds:
+      - a bounded per-attempt timeout,
+      - process-wide minimum spacing between calls (avoids bursty
+        cold-cache runs hammering Yahoo all at once),
+      - error-aware backoff: rate limits get a long exponential cooldown,
+        "database is locked" gets a short jittered retry (with
+        threads=False forced on the retry to stop the concurrent-write
+        race that caused it), everything else keeps the original linear
+        backoff.
+
+    Returns an empty DataFrame (never raises) if all attempts fail,
+    matching the existing fail-soft behaviour of fetch_batch_ohlcv /
+    _fetch_bt_batch / history_store._raw_fetch.
     """
     kwargs.setdefault("timeout", _YF_TIMEOUT)
     last_exc = None
-    for attempt in range(1, _YF_MAX_RETRIES + 1):
+    lock_retry_count = 0
+    attempt = 1
+    max_total_attempts = _YF_MAX_RETRIES + _YF_LOCK_MAX_TRY  # locked-db retries are extra, not counted against the normal budget
+
+    while attempt <= max_total_attempts:
+        _wait_for_spacing()
         try:
             return yf.download(tickers, **kwargs)
         except Exception as exc:
             last_exc = exc
-            _log.warning(
-                "yf.download attempt %d/%d failed (%s): %s",
-                attempt, _YF_MAX_RETRIES, type(exc).__name__, exc,
-            )
+
+            if _is_locked_db_error(exc) and lock_retry_count < _YF_LOCK_MAX_TRY:
+                lock_retry_count += 1
+                # Force single-threaded on retry — concurrent threads writing
+                # to yfinance's local SQLite cache is the actual cause here.
+                kwargs["threads"] = False
+                backoff = _YF_LOCK_RETRY_S * lock_retry_count + random.uniform(0, 0.5)
+                _log.warning(
+                    "yf.download hit a locked local cache (attempt %d/%d, retrying "
+                    "single-threaded in %.1fs): %s",
+                    lock_retry_count, _YF_LOCK_MAX_TRY, backoff, exc,
+                )
+                time.sleep(backoff)
+                continue   # doesn't consume a normal `attempt` slot
+
+            if _is_rate_limit_error(exc):
+                backoff = _YF_RATELIMIT_BASE_S * (2 ** (attempt - 1))
+                _log.warning(
+                    "yf.download rate-limited (attempt %d/%d, cooling down %ds): %s",
+                    attempt, _YF_MAX_RETRIES, backoff, exc,
+                )
+            else:
+                backoff = _YF_BACKOFF_S * attempt
+                _log.warning(
+                    "yf.download attempt %d/%d failed (%s): %s",
+                    attempt, _YF_MAX_RETRIES, type(exc).__name__, exc,
+                )
+
             if attempt < _YF_MAX_RETRIES:
-                time.sleep(_YF_BACKOFF_S * attempt)
-    _log.error("yf.download giving up after %d attempts: %s", _YF_MAX_RETRIES, last_exc)
+                time.sleep(backoff)
+            attempt += 1
+
+    _log.error("yf.download giving up after %d attempts: %s", attempt - 1, last_exc)
     return pd.DataFrame()
 
 
