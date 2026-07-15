@@ -26,6 +26,9 @@ import yfinance as yf
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import threading
+import logging
+
+_log = logging.getLogger(__name__)
 
 from utils.scanner_engine import _strip_tz, nifty_regime, ema, yf_download_with_retry
 from utils.decision_engine import _extension as _ext_fn
@@ -1424,7 +1427,18 @@ def run_backtest(
     if extra_pillar_cfg:
         _fp_cfg.update(extra_pillar_cfg)
 
-    workers = max(4, min(workers, 20))
+    # `workers` is shared with the scanner's I/O-bound ThreadPoolExecutor,
+    # where 10 threads is cheap and reasonable. It is NOT a safe value for
+    # ProcessPoolExecutor: each process pays a full interpreter start +
+    # pandas/numpy/every utils module import, independent of how much work
+    # it actually does. 2026-07-15: this exact mismatch (10 processes on a
+    # memory-capped host) OOM-killed the app silently mid-run. Cap process
+    # workers much lower regardless of what the shared UI setting says;
+    # thread workers keep the original wider range.
+    if use_processes:
+        workers = max(2, min(workers, 4))
+    else:
+        workers = max(4, min(workers, 20))
 
     # ── Phase 1: Batch-fetch all data (main thread, no concurrency) ──
     # All HTTP happens here. Workers below do zero network I/O.
@@ -1493,11 +1507,15 @@ def run_backtest(
             import logging
             logging.getLogger(__name__).warning("checkpoint_cb failed at %d/%d", n, total, exc_info=True)
 
-    # Defaults to ThreadPoolExecutor (see use_processes docstring above) —
-    # GIL-serialized for this CPU-bound work, but stable on a memory-capped
-    # host. ProcessPoolExecutor remains available as an explicit opt-in
-    # (use_processes=True) on hosts with real memory headroom.
+    # Defaults to ProcessPoolExecutor (see use_processes docstring above) —
+    # real multi-core parallelism for this CPU-bound work. ThreadPoolExecutor
+    # remains available (use_processes=False) as a GIL-serialized fallback
+    # for hosts where spawning processes isn't safe/available.
     Executor = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
+    _log.info("run_backtest: executor=%s workers=%d symbols=%d",
+              Executor.__name__, workers, len(valid_symbols))
+
+    from concurrent.futures.process import BrokenProcessPool
 
     with Executor(max_workers=workers) as exe:
         futures = {
@@ -1528,9 +1546,26 @@ def run_backtest(
                 if rejs is not None and not rejs.empty:
                     with t_lock:
                         all_rejections.append(rejs)
+            except BrokenProcessPool:
+                # A worker process died (most likely OOM-killed by the host).
+                # Surface this loudly and stop instead of letting the run
+                # sit there looking frozen — every other pending future will
+                # raise the same error, so bail out now rather than log it
+                # N times on the way to an identical failure.
+                _log.error(
+                    "run_backtest: worker process pool crashed (likely OOM) "
+                    "after %d/%d symbols scored with workers=%d. Try lowering "
+                    "`workers` further or set use_processes=False.",
+                    n, total, workers,
+                )
+                if progress_cb:
+                    progress_cb(min(pct, 1.0),
+                                f"ERROR: worker process crashed (likely out of "
+                                f"memory) after {n}/{total} symbols — "
+                                f"try fewer workers or use_processes=False")
+                raise
             except Exception as _exc:
-                import logging
-                logging.getLogger(__name__).warning("backtest inner loop failed for %s: %s", sym, _exc)
+                _log.warning("backtest inner loop failed for %s: %s", sym, _exc)
 
             _since_checkpoint += 1
             _fire_checkpoint(n)
