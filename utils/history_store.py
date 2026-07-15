@@ -381,9 +381,29 @@ def get_history(
             if meta:
                 _meta_save(sym, meta)   # repopulate local cache
         last_full = meta.get("last_full_refresh")
+        # 2026-07-15 BUG: staleness was purely time-based (last_full_refresh
+        # within _FULL_REFRESH_DAYS), with no check that the cached RANGE
+        # actually covers the `years` being requested NOW. The scanner calls
+        # this with years=1, the backtest with years=3, sharing the same
+        # per-symbol cache. If the scanner populated/refreshed a symbol
+        # recently, the backtest's request for 3 years saw it as "fresh"
+        # and only tail-fetched — permanently capping that symbol at ~1
+        # year of history regardless of what the backtest asked for. This
+        # produced backtests where qualifying trades only ever appeared in
+        # roughly the last year, no matter how low the score threshold was
+        # dropped, because there was no older data to score in the first
+        # place. Fix: treat the cache as stale if its earliest cached bar
+        # doesn't reach back to (approximately) full_start, independent of
+        # how recently it was refreshed.
+        range_insufficient = (
+            df is not None
+            and not df.empty
+            and df.index.min().date() > full_start + timedelta(days=15)
+        )
         stale = (
             df is None
             or not last_full
+            or range_insufficient
             or (today - datetime.strptime(last_full, "%Y-%m-%d").date()).days >= _FULL_REFRESH_DAYS
         )
 
