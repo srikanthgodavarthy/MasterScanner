@@ -472,7 +472,7 @@ def render(settings=None):
 
     col_run, col_note = st.columns([1.2, 5])
     with col_run:
-        run_btn = st.button("▶ Run Validation", use_container_width=True, key="btn_run_val")
+        run_btn = st.button("▶ Run Validation", width='stretch', key="btn_run_val")
     with col_note:
         st.markdown(
             "<span style='color:#64748b;font-size:0.82rem;'>"
@@ -630,7 +630,7 @@ def _render_results(all_trades: pd.DataFrame):
 
     st.dataframe(
         scen_df.style.apply(_style_scenario, axis=1),
-        use_container_width=True, hide_index=True,
+        width='stretch', hide_index=True,
     )
 
     # Interpretation badge
@@ -711,7 +711,7 @@ def _render_results(all_trades: pd.DataFrame):
 
             st.dataframe(
                 cv_display.style.apply(_style_cv, axis=1),
-                use_container_width=True, hide_index=True,
+                width='stretch', hide_index=True,
             )
 
             if monotone_wr and monotone_exp:
@@ -780,7 +780,7 @@ def _render_results(all_trades: pd.DataFrame):
 
             st.dataframe(
                 eq_display.style.apply(_style_eq, axis=1),
-                use_container_width=True, hide_index=True,
+                width='stretch', hide_index=True,
             )
 
             if mono_wr_eq and mono_exp_eq:
@@ -832,7 +832,7 @@ def _render_results(all_trades: pd.DataFrame):
         heat_df = pd.DataFrame(heat_data).T
         heat_df.index.name = "CV \\ EQ"
 
-        st.dataframe(heat_df, use_container_width=True)
+        st.dataframe(heat_df, width='stretch')
 
     st.markdown("---")
 
@@ -845,7 +845,7 @@ def _render_results(all_trades: pd.DataFrame):
         ] if c in all_trades.columns]
         st.dataframe(
             all_trades[display_trade_cols].sort_values("entry_date", ascending=False),
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
         )
 
     # ── Conclusion ─────────────────────────────────────────────────────────────

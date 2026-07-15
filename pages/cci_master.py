@@ -351,7 +351,7 @@ def render(settings: dict | None = None):
         buy_score = st.number_input("Buy Min Score", min_value=1, value=DEFAULT_BUY_SCORE, key="ccim_buy")
     with p6:
         st.markdown("<div style='padding-top:1.7rem'></div>", unsafe_allow_html=True)
-        run_btn = st.button("▶  Run CCI Scan", use_container_width=True, key="ccim_run")
+        run_btn = st.button("▶  Run CCI Scan", width='stretch', key="ccim_run")
 
     # ── Stochastic Confluence overlay (opt-in) ─────────────────────
     # Pine state/signal are always computed unchanged above; this section
@@ -547,6 +547,6 @@ def render(settings: dict | None = None):
                             detail_cols += ["stoch_k", "stoch_d", "stoch_entry_signal", "stoch_trim_signal"]
                         st.dataframe(
                             hist[detail_cols].tail(10).iloc[::-1],
-                            use_container_width=True,
+                            width='stretch',
                         )
                         st.line_chart(hist["cci"].tail(120))

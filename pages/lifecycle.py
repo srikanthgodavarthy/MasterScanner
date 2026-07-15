@@ -1133,7 +1133,7 @@ def render():
             else:
                 styled = _show_df.style
 
-            st.dataframe(styled, use_container_width=True, hide_index=True)
+            st.dataframe(styled, width='stretch', hide_index=True)
 
             # ── Export ────────────────────────────────────────────────
             _csv = _show_df.to_csv(index=False).encode()

@@ -325,7 +325,7 @@ def render():
                 [c for c in ["score", "leadership", "conviction", "entry_quality", "trend_quality"]
                  if c in hist_df.columns]
             ].copy()
-            st.line_chart(chart_df, height=220, use_container_width=True)
+            st.line_chart(chart_df, height=220, width='stretch')
     
             # ── Stage change events ───────────────────────────────────
             st.markdown("#### Stage History")
@@ -380,7 +380,7 @@ def render():
                         "stage_label": "Stage", "days_in_stage": "Days",
                         "entry_date": "From", "exit_date": "To",
                     }),
-                    hide_index=True, use_container_width=True,
+                    hide_index=True, width='stretch',
                 )
     
             # ── Backtest trades for this symbol ───────────────────────
@@ -413,7 +413,7 @@ def render():
                     "action", "cci", "cci_state", "rs_composite", "adx",
                     "bars_band", "bars_since", "move_since",
                 ] if c in hist_df.columns]
-                st.dataframe(hist_df[show_cols], hide_index=True, use_container_width=True)
+                st.dataframe(hist_df[show_cols], hide_index=True, width='stretch')
                 csv = hist_df[show_cols].to_csv(index=False).encode()
                 st.download_button(
                     f"⬇️ Download {sym_input} journey CSV",
@@ -517,7 +517,7 @@ def render():
                         return styles
 
                     styled = matrix.style.apply(_green_gradient, axis=0).format("{:.0f}")
-                    st.dataframe(styled, use_container_width=True)
+                    st.dataframe(styled, width='stretch')
                     st.caption("Rows = from-stage · Columns = to-stage")
     
             # ── Average time per stage ─────────────────────────────────
@@ -541,7 +541,7 @@ def render():
                     )
                     avg_dur.index = avg_dur.index.map(lambda s: _SL.get(s, s))
                     avg_dur.index.name = "Stage"
-                    st.dataframe(avg_dur, use_container_width=True)
+                    st.dataframe(avg_dur, width='stretch')
     
             # ── Breakout success rate ──────────────────────────────────
             st.markdown("#### Breakout Success Rate")
@@ -575,7 +575,7 @@ def render():
                         .reset_index()
                     )
                     _stage_wr.columns = [stage_col.replace("_", " ").title()] + list(_stage_wr.columns[1:])
-                    st.dataframe(_stage_wr, hide_index=True, use_container_width=True)
+                    st.dataframe(_stage_wr, hide_index=True, width='stretch')
             else:
                 st.info("Run a backtest and save results to see success rate analytics.", icon="ℹ️")
     
@@ -596,7 +596,7 @@ def render():
                     )
                     top_active["Stage"] = top_active["stage"].map(lambda s: _SL.get(s, s) if pd.notna(s) else "—")
                     top_active = top_active.drop(columns=["stage"])
-                st.dataframe(top_active, hide_index=True, use_container_width=True)
+                st.dataframe(top_active, hide_index=True, width='stretch')
     
             # ── Export ─────────────────────────────────────────────────
             csv_tr = tr_filtered.to_csv(index=False).encode()
@@ -791,7 +791,7 @@ def render():
                             if "result" in sym_trades.columns:
                                 exit_counts = sym_trades["result"].value_counts().reset_index()
                                 exit_counts.columns = ["Exit Reason", "Count"]
-                                st.dataframe(exit_counts, hide_index=True, use_container_width=True)
+                                st.dataframe(exit_counts, hide_index=True, width='stretch')
     
                             # Full trade table
                             detail_cols = [c for c in [
@@ -800,7 +800,7 @@ def render():
                             ] if c in sym_trades.columns]
                             st.dataframe(
                                 sym_trades[detail_cols].sort_values("entry_date", ascending=False),
-                                hide_index=True, use_container_width=True,
+                                hide_index=True, width='stretch',
                             )
     
                     # ── Export ────────────────────────────────────────
@@ -832,4 +832,4 @@ def render():
                             .reset_index()
                         )
                         _sd[_stage_col] = _sd[_stage_col].map(lambda s: _SL.get(s, s))
-                        st.dataframe(_sd, hide_index=True, use_container_width=True)
+                        st.dataframe(_sd, hide_index=True, width='stretch')

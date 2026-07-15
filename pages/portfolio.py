@@ -523,7 +523,7 @@ def _bought_form():
         )
         notes = st.text_area("Notes", "")
 
-        submitted = st.form_submit_button("➕ Add to Portfolio", use_container_width=True)
+        submitted = st.form_submit_button("➕ Add to Portfolio", width='stretch')
         if submitted:
             if not symbol or entry_price <= 0 or qty <= 0:
                 st.error("Symbol, entry price, and qty are required.")
@@ -1341,7 +1341,7 @@ def _require_unlock() -> bool:
         with col2:
             pw = st.text_input("Password", type="password", label_visibility="collapsed",
                                 placeholder="Password")
-            submitted = st.form_submit_button("Unlock", use_container_width=True)
+            submitted = st.form_submit_button("Unlock", width='stretch')
     if submitted:
         if hmac.compare_digest(pw, str(expected)):
             st.session_state["portfolio_unlocked"] = True
@@ -1357,7 +1357,7 @@ def _render_lock_control():
     """Small manual re-lock control shown once unlocked."""
     col1, col2 = st.columns([9, 1])
     with col2:
-        if st.button("🔒 Lock", use_container_width=True):
+        if st.button("🔒 Lock", width='stretch'):
             st.session_state["portfolio_unlocked"] = False
             st.rerun()
 

@@ -920,7 +920,7 @@ def _tab_system() -> None:
         if wl:
             wl_df = pd.DataFrame(wl)[["symbol", "notes"]].rename(
                 columns={"symbol": "Symbol", "notes": "Notes"})
-            st.dataframe(wl_df, use_container_width=True, hide_index=True, height=140)
+            st.dataframe(wl_df, width='stretch', hide_index=True, height=140)
 
         bulk_raw = st.text_area("Symbols (one per line)",
             value="\n".join(w["symbol"] for w in wl),
@@ -961,7 +961,7 @@ def _tab_system() -> None:
                         st.dataframe(
                             grp[["symbol", "score", "action", "cci", "entry", "sl", "t1"]]
                             .rename(columns=str.title).reset_index(drop=True),
-                            use_container_width=True,
+                            width='stretch',
                         )
             else:
                 st.info("No scan history found.")

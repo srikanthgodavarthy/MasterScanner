@@ -136,7 +136,7 @@ def render(settings: dict | None = None) -> None:
     with top_c1:
         st.caption(f"Model: `{model}` · Data: live scan (this session) + Supabase + yfinance")
     with top_c2:
-        if st.button("🗑️ Clear", use_container_width=True):
+        if st.button("🗑️ Clear", width='stretch'):
             st.session_state["agent_messages"] = [{"role": "system", "content": SYSTEM_PROMPT}]
             st.rerun()
 

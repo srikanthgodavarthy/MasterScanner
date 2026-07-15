@@ -3268,7 +3268,7 @@ def render(settings: dict | None = None):
     # ── Controls row ────────────────────────────────────────────
     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.2, 1, 4, 1])
     with ctrl1:
-        run_btn = st.button("▶  Run Scan", use_container_width=True, key="btn_run_scan")
+        run_btn = st.button("▶  Run Scan", width='stretch', key="btn_run_scan")
     with ctrl2:
         save_db = st.checkbox("💾 Save to DB", value=True, key="chk_save_db")
     with ctrl3:

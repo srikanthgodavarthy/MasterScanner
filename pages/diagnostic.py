@@ -310,7 +310,7 @@ def render_summary(df: pd.DataFrame, n_syms: int, total_sigs: int):
         er = df["exit_reason"].value_counts().reset_index()
         er.columns = ["Exit Reason", "Count"]
         er["% of trades"] = (er["Count"] / len(df) * 100).round(1)
-        st.dataframe(_style(er), use_container_width=False, hide_index=True)
+        st.dataframe(_style(er), width='content', hide_index=True)
 
     # Missing columns warning
     want = ["conviction_score","leadership_score","entry_quality_score"]
@@ -357,7 +357,7 @@ def render_buy_type_census(df: pd.DataFrame):
     tbl = pd.DataFrame(rows)
     st.dataframe(
         _style(tbl, ["avg_ret_%"]).format({"pct_%":"{}%","win_%":"{}%","avg_ret_%":"{}%"}, na_rep="—"),
-        use_container_width=True, hide_index=True,
+        width='stretch', hide_index=True,
     )
 
 
@@ -389,7 +389,7 @@ def render_conviction_buckets(df: pd.DataFrame):
         tbl = pd.DataFrame(rows)
         st.dataframe(
             _style(tbl, ["avg_ret_%","med_ret_%","expectancy"]),
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
         )
 
 
@@ -421,7 +421,7 @@ def render_entry_quality_buckets(df: pd.DataFrame):
         tbl = pd.DataFrame(rows)
         st.dataframe(
             _style(tbl, ["avg_ret_%","med_ret_%","expectancy"]),
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
         )
 
 
@@ -457,13 +457,13 @@ def render_atr_band(df: pd.DataFrame):
         tbl = pd.DataFrame(rows)
         st.dataframe(
             _style(tbl, ["avg_ret_%","med_ret_%","expectancy"]),
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
         )
 
     if "buy_type" in df.columns:
         with st.expander("ATR-band × buy_type cross-tab"):
             ct = pd.crosstab(df[col], df["buy_type"])
-            st.dataframe(_style(ct), use_container_width=True)
+            st.dataframe(_style(ct), width='stretch')
 
 
 def render_setup_age(df: pd.DataFrame):
@@ -502,7 +502,7 @@ def render_setup_age(df: pd.DataFrame):
         tbl = pd.DataFrame(rows)
         st.dataframe(
             _style(tbl, ["avg_ret_%","med_ret_%","expectancy"]),
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
         )
 
     if "buy_type" in df.columns:
@@ -513,7 +513,7 @@ def render_setup_age(df: pd.DataFrame):
                 include_lowest=True,
             )
             ct = pd.crosstab(valid["_age_band"], valid["buy_type"])
-            st.dataframe(_style(ct), use_container_width=True)
+            st.dataframe(_style(ct), width='stretch')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -550,7 +550,7 @@ def render(settings=None):
     # ── Run button ────────────────────────────────────────────────────────────
     col_run, col_info = st.columns([1.2, 5])
     with col_run:
-        run_diag = st.button("▶ Run Diagnostic", use_container_width=True, key="btn_run_diag")
+        run_diag = st.button("▶ Run Diagnostic", width='stretch', key="btn_run_diag")
     with col_info:
         st.markdown(
             f"<div style='padding:0.55rem 0;color:#64748b;font-size:0.78rem;'>"

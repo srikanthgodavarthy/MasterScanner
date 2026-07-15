@@ -283,7 +283,7 @@ def render(settings=None):
     # ── Run row ───────────────────────────────────────────────────────────────
     col_run, col_info = st.columns([1.2, 5])
     with col_run:
-        run_bt = st.button("▶ Run Backtest", use_container_width=True, key="btn_run_bt")
+        run_bt = st.button("▶ Run Backtest", width='stretch', key="btn_run_bt")
     with col_info:
         _tier_label = {
             "All":               "<b style='color:#94a3b8'>All Signals</b>",
@@ -451,7 +451,7 @@ def render(settings=None):
             if not rejections_df.empty:
                 st.info(f"ℹ️ {len(rejections_df)} signals were rejected by the admission gate. Expand below to inspect.")
                 with st.expander("🚫 Admission Gate Rejections"):
-                    st.dataframe(rejections_df, use_container_width=True)
+                    st.dataframe(rejections_df, width='stretch')
             return
 
         st.session_state["bt_trades"]      = trades_df
@@ -624,7 +624,7 @@ def render(settings=None):
                     ("background-color", "#0f1e3d"), ("color", "#93c5fd"),
                     ("font-size", "0.72rem"), ("text-transform", "uppercase"),
                 ]}]),
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
             )
 
@@ -690,7 +690,7 @@ def render(settings=None):
                         ("font-size", "0.72rem"), ("text-transform", "uppercase"),
                     ]}])
                 )
-                st.dataframe(styled_path, use_container_width=True, hide_index=True)
+                st.dataframe(styled_path, width='stretch', hide_index=True)
                 st.caption("💡 Compare paths to identify which Tier-1 entry style drives your win rate. "
                            "Path A with low win rate suggests the CCI recovery window is too wide. "
                            "Path C with low win rate suggests fresh-base breakouts are firing too early.")
@@ -716,7 +716,7 @@ def render(settings=None):
             xaxis=dict(showgrid=False, color="#334155"),
             yaxis=dict(showgrid=True, gridcolor="#1e293b", color="#334155"),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     with ch2:
         st.markdown("##### 🎯 Exit Breakdown")
@@ -731,7 +731,7 @@ def render(settings=None):
                 textfont=dict(family="JetBrains Mono", size=11),
             ))
             fig2.update_layout(**PLOT_BG, showlegend=False)
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width='stretch')
 
     st.markdown("##### 📊 PnL Distribution")
     fig3 = go.Figure(go.Histogram(
@@ -745,7 +745,7 @@ def render(settings=None):
         xaxis=dict(title="PnL %", showgrid=False, color="#334155"),
         yaxis=dict(title="Trades", showgrid=True, gridcolor="#1e293b", color="#334155"),
     )
-    st.plotly_chart(fig3, use_container_width=True)
+    st.plotly_chart(fig3, width='stretch')
 
     # ── Tier overlay: Elite / T1 Prime / Rest — Cumulative PnL ─────────────
     elite_count = s.get("elite_trades", 0)
@@ -790,7 +790,7 @@ def render(settings=None):
             legend=dict(orientation="h", yanchor="bottom", y=1.02,
                         xanchor="right", x=1, font=dict(size=11)),
         )
-        st.plotly_chart(fig4, use_container_width=True)
+        st.plotly_chart(fig4, width='stretch')
 
     # ── Score-bin validation chart ───────────────────────────────────────
     sb = s.get("score_bin_stats", {})
@@ -842,7 +842,7 @@ def render(settings=None):
             legend=dict(orientation="h", y=1.12, font=dict(size=11)),
             bargap=0.25,
         )
-        st.plotly_chart(fig5, use_container_width=True)
+        st.plotly_chart(fig5, width='stretch')
 
         # Expectancy table per bin
         exp_rows = [{"Bucket": b, "Trades": sb[b]["trades"],
@@ -861,7 +861,7 @@ def render(settings=None):
                 ("background-color", "#0f172a"), ("color", "#93c5fd"),
                 ("font-size", "0.72rem"), ("text-transform", "uppercase"),
             ]}]),
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
         )
 
         # Monotonicity check on the three core action bins only
@@ -949,7 +949,7 @@ def render(settings=None):
                 legend=dict(orientation="h", y=1.12, font=dict(size=11)),
                 bargap=0.25,
             )
-            st.plotly_chart(fig_age, use_container_width=True)
+            st.plotly_chart(fig_age, width='stretch')
 
         # Freshness detail table
         age_rows = []
@@ -973,7 +973,7 @@ def render(settings=None):
                     ("background-color", "#0f172a"), ("color", "#93c5fd"),
                     ("font-size", "0.72rem"), ("text-transform", "uppercase"),
                 ]}]),
-                use_container_width=True, hide_index=True,
+                width='stretch', hide_index=True,
             )
 
         # Insight: which band has highest expectancy?
@@ -1043,7 +1043,7 @@ def render(settings=None):
                 ("font-size", "0.72rem"), ("text-transform", "uppercase"),
             ]}])
         )
-        st.dataframe(styled_pat, use_container_width=True, hide_index=True)
+        st.dataframe(styled_pat, width='stretch', hide_index=True)
 
         # Visual: lift bars for Harm + ABCD
         pattern_targets = {k: v for k, v in pattern_stats.items()
@@ -1069,7 +1069,7 @@ def render(settings=None):
                 legend=dict(orientation="h", y=1.1, font=dict(size=11)),
                 bargap=0.3,
             )
-            st.plotly_chart(fig_pat, use_container_width=True)
+            st.plotly_chart(fig_pat, width='stretch')
 
             # Auto-insight
             for bt, d in pattern_targets.items():
@@ -1182,7 +1182,7 @@ def render(settings=None):
         ]}])
         .format({"Win_Rate":"{}%","Avg_PnL":"{}%","Total_PnL":"{}%","Best":"{}%","Worst":"{}%"})
     )
-    st.dataframe(styled_sym, use_container_width=True, height=400)
+    st.dataframe(styled_sym, width='stretch', height=400)
 
     # ── Trade log ─────────────────────────────────────────────────────────────
     with st.expander("📜 Full Trade Log", expanded=False):
@@ -1214,7 +1214,7 @@ def render(settings=None):
                                "font-size":"0.74rem","color":"#e2e8f0"})
             .format({"pnl_pct":"{}%"})
         )
-        st.dataframe(styled_log, use_container_width=True, height=400)
+        st.dataframe(styled_log, width='stretch', height=400)
 
         csv_bt = trades_df.to_csv(index=False)
         st.download_button(
@@ -1263,7 +1263,7 @@ def render(settings=None):
                     })
                 if rows:
                     import pandas as _pd
-                    st.dataframe(_pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                    st.dataframe(_pd.DataFrame(rows), width='stretch', hide_index=True)
 
             _vra_table(vra.get("by_reaction_strength", {}),    "By Reaction Strength (0–100)")
             _vra_table(vra.get("by_pattern_age", {}),          "By Pattern Age (bars)")
@@ -1354,7 +1354,7 @@ for each combination and outputs a ranked sensitivity table.
             if results:
                 df_opt = _pd.DataFrame(results).sort_values("PF", ascending=False)
                 st.markdown("**Sensitivity Table — ranked by Profit Factor**")
-                st.dataframe(df_opt, use_container_width=True, hide_index=True)
+                st.dataframe(df_opt, width='stretch', hide_index=True)
                 st.download_button(
                     "⬇️ Download Sensitivity CSV",
                     data=df_opt.to_csv(index=False),
