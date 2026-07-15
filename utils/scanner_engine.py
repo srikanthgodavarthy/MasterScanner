@@ -14,9 +14,52 @@ import streamlit as st
 import requests
 import io
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings("ignore")
+
+_log = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  YFINANCE RETRY WRAPPER
+# ══════════════════════════════════════════════════════════════════
+# 2026-07-15: batch fetches (scanner + backtest) had no timeout and no
+# retry, so a single stalled/rate-limited yf.download() call could hang
+# the whole run indefinitely with zero visible progress (yfinance's
+# underlying curl_cffi session has a known bug where `timeout` is not
+# always honored — see ranaroussi/yfinance and lexiforest/curl_cffi
+# issue trackers). This wrapper bounds each attempt and gives up loudly
+# after a few tries instead of hanging silently.
+
+_YF_TIMEOUT     = 30   # seconds per attempt
+_YF_MAX_RETRIES = 3
+_YF_BACKOFF_S   = 5    # base backoff between retries (linear: 5s, 10s, 15s...)
+
+
+def yf_download_with_retry(tickers, **kwargs):
+    """
+    Thin wrapper around yf.download() that adds a bounded timeout and a
+    small linear-backoff retry loop. Returns an empty DataFrame (never
+    raises) if all attempts fail, matching the existing fail-soft
+    behaviour of fetch_batch_ohlcv / _fetch_bt_batch.
+    """
+    kwargs.setdefault("timeout", _YF_TIMEOUT)
+    last_exc = None
+    for attempt in range(1, _YF_MAX_RETRIES + 1):
+        try:
+            return yf.download(tickers, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            _log.warning(
+                "yf.download attempt %d/%d failed (%s): %s",
+                attempt, _YF_MAX_RETRIES, type(exc).__name__, exc,
+            )
+            if attempt < _YF_MAX_RETRIES:
+                time.sleep(_YF_BACKOFF_S * attempt)
+    _log.error("yf.download giving up after %d attempts: %s", _YF_MAX_RETRIES, last_exc)
+    return pd.DataFrame()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -357,11 +400,10 @@ def _fetch_live_prices(symbols: tuple) -> dict:
     if not symbols:
         return {}
     tickers = [f"{s}.NS" for s in symbols]
-    try:
-        raw = yf.download(tickers, period="5d", interval="1d",
-                          auto_adjust=True, group_by="ticker",
-                          threads=True, progress=False)
-    except Exception:
+    raw = yf_download_with_retry(tickers, period="5d", interval="1d",
+                                 auto_adjust=True, group_by="ticker",
+                                 threads=True, progress=False)
+    if raw.empty:
         return {}
 
     result = {}
@@ -431,10 +473,9 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") 
     if not symbols:
         return {}
     tickers = [f"{s}.NS" for s in symbols]
-    try:
-        raw = yf.download(tickers, period=period, interval=interval,
-                          auto_adjust=True, group_by="ticker", threads=True, progress=False)
-    except Exception:
+    raw = yf_download_with_retry(tickers, period=period, interval=interval,
+                                 auto_adjust=True, group_by="ticker", threads=True, progress=False)
+    if raw.empty:
         return {}
     result = {}
     single = len(tickers) == 1
