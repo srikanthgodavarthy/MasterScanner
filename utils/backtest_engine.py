@@ -1371,7 +1371,7 @@ def run_backtest(
     extra_pillar_cfg: dict | None = None,
     checkpoint_cb          = None,
     checkpoint_every: int  = 25,
-    use_processes:    bool = False,
+    use_processes:    bool = True,
 ) -> tuple:
     """
     Walk-forward backtest.
