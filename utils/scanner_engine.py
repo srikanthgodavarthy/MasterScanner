@@ -468,29 +468,24 @@ def _patch_live_prices(data: dict, live: dict) -> dict:
         patched[sym] = df_copy
     return patched
 
+# period strings this app actually passes in, mapped to years for the cache.
+# Extend if a caller starts using a period not listed here.
+_PERIOD_TO_YEARS = {"3mo": 0.25, "6mo": 0.5, "1y": 1.0, "2y": 2.0, "5y": 5.0}
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") -> dict:
+    """
+    2026-07-15: now routed through utils.history_store — local Parquet +
+    Supabase Storage cache with live-tail fetching, instead of a fresh
+    yf.download() over the full `period` on every call. `interval` is
+    assumed daily; history_store doesn't support intraday caching.
+    """
     if not symbols:
         return {}
-    tickers = [f"{s}.NS" for s in symbols]
-    raw = yf_download_with_retry(tickers, period=period, interval=interval,
-                                 auto_adjust=True, group_by="ticker", threads=True, progress=False)
-    if raw.empty:
-        return {}
-    result = {}
-    single = len(tickers) == 1
-    for sym, ticker in zip(symbols, tickers):
-        try:
-            df = raw if single else raw[ticker]
-            df = df.dropna(how="all")
-            if df.empty or len(df) < 60:
-                continue
-            df.index   = _strip_tz(pd.to_datetime(df.index))
-            df.columns = [c.lower() for c in df.columns]
-            result[sym] = df[["open", "high", "low", "close", "volume"]]
-        except Exception:
-            continue
-    return result
+    from utils.history_store import get_history
+    years = _PERIOD_TO_YEARS.get(period, 1.0)
+    return get_history(list(symbols), years=years, min_bars=60)
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_nifty(period: str = "1y") -> pd.Series:
