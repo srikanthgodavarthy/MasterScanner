@@ -57,6 +57,7 @@ import io
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeoutError
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
@@ -66,6 +67,33 @@ import pandas as pd
 from utils.scanner_engine import _strip_tz, yf_download_with_retry
 
 logger = logging.getLogger(__name__)
+
+# ─── SUPABASE CALL TIMEOUT ──────────────────────────────────────────────────
+# utils/supabase_client.get_client() creates the Supabase client with no
+# timeout configured anywhere (create_client(url, key), no ClientOptions).
+# yf_download_with_retry() got an explicit 30s-timeout + retry wrapper after
+# a prior incident where an unbounded Yahoo call hung a run indefinitely with
+# no exception (see scanner_engine.py). Supabase Storage calls had no such
+# protection, and get_history() below makes several of them SEQUENTIALLY on
+# the main thread, per symbol, before Phase 1's progress callback ever fires
+# — so a single stuck connection here is invisible on the progress bar until
+# it's way too late, and looks exactly like "stuck at N%" with 1 worker.
+# This wraps each Storage call in its own thread with a hard deadline; a call
+# that blows the deadline is abandoned (fail-soft, like yfinance) rather than
+# left to hang the whole run.
+_SB_TIMEOUT = 15   # seconds per Supabase Storage call
+_sb_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sb-storage")
+
+
+def _with_timeout(fn, *args, timeout: float = _SB_TIMEOUT, **kwargs):
+    """Run fn(*args, **kwargs) with a hard wall-clock deadline. Raises
+    TimeoutError (uncaught here — callers already wrap Storage calls in
+    their own try/except) if the deadline is exceeded."""
+    fut = _sb_executor.submit(fn, *args, **kwargs)
+    try:
+        return fut.result(timeout=timeout)
+    except _FutureTimeoutError:
+        raise TimeoutError(f"Supabase Storage call exceeded {timeout}s")
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────────
 
@@ -141,14 +169,14 @@ def _ensure_bucket(client) -> bool:
         return _bucket_status
 
     try:
-        client.storage.get_bucket(HISTORY_BUCKET)
+        _with_timeout(client.storage.get_bucket, HISTORY_BUCKET)
         _bucket_status = True
         return True
     except Exception:
-        pass  # doesn't exist (or transient) — try creating it next
+        pass  # doesn't exist (or transient, including a timeout) — try creating it next
 
     try:
-        client.storage.create_bucket(HISTORY_BUCKET, options={"public": False})
+        _with_timeout(client.storage.create_bucket, HISTORY_BUCKET, options={"public": False})
         logger.info("history_store: auto-created Supabase Storage bucket '%s'", HISTORY_BUCKET)
         _bucket_status = True
         return True
@@ -193,8 +221,11 @@ def _supabase_load(symbol: str) -> Optional[pd.DataFrame]:
     if bucket is None:
         return None
     try:
-        raw = bucket.download(f"{symbol}.parquet")
+        raw = _with_timeout(bucket.download, f"{symbol}.parquet")
         return pd.read_parquet(io.BytesIO(raw))
+    except TimeoutError as exc:
+        logger.warning("history_store: Supabase download timed out for %s: %s", symbol, exc)
+        return None
     except Exception:
         # Expected/common case: object doesn't exist yet for this symbol.
         return None
@@ -207,14 +238,15 @@ def _supabase_save(symbol: str, df: pd.DataFrame) -> None:
     try:
         buf = io.BytesIO()
         df.to_parquet(buf)
-        bucket.upload(
+        _with_timeout(
+            bucket.upload,
             f"{symbol}.parquet",
             buf.getvalue(),
             {"content-type": "application/octet-stream", "upsert": "true"},
         )
     except Exception as exc:
         # Durability is a nice-to-have, not a hard dependency — never let
-        # a Storage hiccup take down the actual data path.
+        # a Storage hiccup (including a timeout) take down the actual data path.
         logger.warning("history_store: Supabase Storage upload failed for %s: %s", symbol, exc)
 
 
@@ -238,8 +270,11 @@ def _supabase_meta_load(symbol: str) -> dict:
     if bucket is None:
         return {}
     try:
-        raw = bucket.download(f"{symbol}.meta.json")
+        raw = _with_timeout(bucket.download, f"{symbol}.meta.json")
         return json.loads(raw)
+    except TimeoutError as exc:
+        logger.warning("history_store: Supabase meta download timed out for %s: %s", symbol, exc)
+        return {}
     except Exception:
         return {}
 
@@ -249,7 +284,8 @@ def _supabase_meta_save(symbol: str, meta: dict) -> None:
     if bucket is None:
         return
     try:
-        bucket.upload(
+        _with_timeout(
+            bucket.upload,
             f"{symbol}.meta.json",
             json.dumps(meta).encode("utf-8"),
             {"content-type": "application/json", "upsert": "true"},
