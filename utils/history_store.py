@@ -218,6 +218,46 @@ def _supabase_save(symbol: str, df: pd.DataFrame) -> None:
         logger.warning("history_store: Supabase Storage upload failed for %s: %s", symbol, exc)
 
 
+def _supabase_meta_load(symbol: str) -> dict:
+    """
+    Companion to _supabase_load(): the ".meta.json" sidecar (currently just
+    last_full_refresh) uploaded next to "<symbol>.parquet". Needed because
+    local meta lives on Streamlit Community Cloud's EPHEMERAL disk (see
+    module docstring) — if only the local meta is consulted, a disk reset
+    makes every symbol look stale even when Supabase has fresh data, which
+    forces a full re-fetch of the ENTIRE universe on every wake/redeploy.
+    That full re-fetch routinely exceeds the host's request timeout or gets
+    rate-limited by Yahoo partway through, and yf_download_with_retry fails
+    soft (returns an empty frame) rather than raising — so symbols that
+    didn't finish simply never make it into the result dict. The backtest
+    then runs to completion over whatever partial subset succeeded, with no
+    exception anywhere: exactly the "finishes but with wrong/empty results"
+    failure mode. Falling back to Supabase-stored meta here fixes it.
+    """
+    bucket = _supabase_storage()
+    if bucket is None:
+        return {}
+    try:
+        raw = bucket.download(f"{symbol}.meta.json")
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _supabase_meta_save(symbol: str, meta: dict) -> None:
+    bucket = _supabase_storage()
+    if bucket is None:
+        return
+    try:
+        bucket.upload(
+            f"{symbol}.meta.json",
+            json.dumps(meta).encode("utf-8"),
+            {"content-type": "application/json", "upsert": "true"},
+        )
+    except Exception as exc:
+        logger.warning("history_store: Supabase meta upload failed for %s: %s", symbol, exc)
+
+
 # ─── RAW NETWORK FETCH (date-range based; replaces period/years fetch) ─────
 
 def _raw_fetch(symbols: list, start: date, end: date) -> dict:
@@ -287,12 +327,23 @@ def get_history(
 
     for sym in unique:
         df = _local_load(sym)
+        recovered_from_supabase = False
         if df is None:
             df = _supabase_load(sym)
             if df is not None:
                 _local_save(sym, df)
+                recovered_from_supabase = True
 
         meta = _meta_load(sym)
+        if not meta and recovered_from_supabase:
+            # Local meta is gone (ephemeral disk was reset) but the data
+            # itself just came back from Supabase — check Supabase's meta
+            # sidecar before concluding "stale". Without this, every symbol
+            # looks stale after any redeploy/sleep-wake, forcing a full
+            # re-fetch of the whole universe (see _supabase_meta_load()).
+            meta = _supabase_meta_load(sym)
+            if meta:
+                _meta_save(sym, meta)   # repopulate local cache
         last_full = meta.get("last_full_refresh")
         stale = (
             df is None
@@ -320,9 +371,11 @@ def get_history(
         chunk = need_full[i: i + _RAW_BATCH_SIZE]
         fetched = _raw_fetch(chunk, full_start, today)
         for sym, df in fetched.items():
+            _meta = {"last_full_refresh": today.strftime("%Y-%m-%d")}
             _local_save(sym, df)
-            _meta_save(sym, {"last_full_refresh": today.strftime("%Y-%m-%d")})
+            _meta_save(sym, _meta)
             _supabase_save(sym, df)
+            _supabase_meta_save(sym, _meta)
             result[sym] = df
         done_batches += 1
         if progress_cb:
