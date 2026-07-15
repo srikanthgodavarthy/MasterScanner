@@ -111,32 +111,31 @@ def _fetch_bt_nifty(years: int = 3) -> pd.Series:
 
 def fetch_all_bt_data(symbols: list, years: int = 3, progress_cb=None) -> dict:
     """
-    Pre-fetch all backtest data in batches.
-    Called ONCE before spawning worker threads — workers do dict lookups only.
+    Pre-fetch all backtest data. Called ONCE before spawning workers —
+    workers do dict lookups only.
 
-    progress_cb(batch_i, n_batches, symbols_so_far): optional, fired after each
-    batch completes. 2026-07-15: previously nothing fired between the single
-    "Fetching historical data…" call in run_backtest() and this function
-    returning — so a slow/retrying batch (see yf_download_with_retry) looked
-    identical to a fully-hung app. Now each batch reports in, so a run that's
-    just slow (vs. actually stuck) is visibly making progress.
+    2026-07-16: now routed through utils.history_store (local Parquet +
+    Supabase Storage cache, live-tail fetching). Previously this refetched
+    the FULL `years` lookback for every symbol on every single backtest —
+    the dominant cost for a 500-symbol run. Now only new/uncached/due-for-
+    refresh symbols hit the network; everything else is a cache read plus
+    a small tail merge. _fetch_bt_batch/_BT_BATCH_SIZE are kept below for
+    any other direct callers, but are no longer used on this path.
+
+    progress_cb(batch_i, n_batches, symbols_so_far): optional, fired after
+    each network batch (2026-07-15 fix — makes a slow-but-alive run
+    visibly distinguishable from a genuinely stuck one).
     """
-    # Deduplicate while preserving order
     seen   = set()
     unique = [s for s in symbols if not (s in seen or seen.add(s))]
 
-    n_batches = max(1, (len(unique) + _BT_BATCH_SIZE - 1) // _BT_BATCH_SIZE)
-    all_data: dict = {}
-    for batch_i, start in enumerate(range(0, len(unique), _BT_BATCH_SIZE)):
-        chunk = tuple(unique[start: start + _BT_BATCH_SIZE])
-        batch = _fetch_bt_batch(chunk, years=years)
-        all_data.update(batch)
+    from utils.history_store import get_history
+
+    def _cb(done, total):
         if progress_cb:
-            try:
-                progress_cb(batch_i + 1, n_batches, len(all_data))
-            except Exception:
-                pass
-    return all_data
+            progress_cb(done, total, done)  # symbols_so_far not tracked mid-batch here
+
+    return get_history(unique, years=float(years), min_bars=210, progress_cb=_cb)
 
 
 # ══════════════════════════════════════════════════════════════════
