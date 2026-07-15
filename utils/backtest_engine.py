@@ -24,19 +24,14 @@ import numpy as np
 from datetime import datetime, timezone, timedelta
 import yfinance as yf
 import streamlit as st
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
-import time
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import threading
-import logging
 
-_log = logging.getLogger(__name__)
-
-from utils.scanner_engine import _strip_tz, nifty_regime, ema, yf_download_with_retry
+from utils.scanner_engine import _strip_tz, nifty_regime, ema
 from utils.decision_engine import _extension as _ext_fn
 from utils.conviction_score_v1 import compute_conviction_v3, classify_tier_v3, _classify_v3
 from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
 from utils.adaptive_target_engine import AdaptiveTargetParams, compute_adaptive_targets, check_momentum_exit
-from utils.structural_levels import structural_ceiling
 from utils.regime_engine  import (
     build_regime_context, RegimeContext,
     bar_result_to_row, compute_composite, _classify_tier,
@@ -63,17 +58,18 @@ def _fetch_bt_batch(symbols: tuple, years: int = 3) -> dict:
     start = end - timedelta(days=years * 365 + 10)
 
     tickers = [f"{s}.NS" for s in symbols]
-    raw = yf_download_with_retry(
-        tickers,
-        start       = start.strftime("%Y-%m-%d"),
-        end         = end.strftime("%Y-%m-%d"),
-        interval    = "1d",
-        auto_adjust = True,
-        group_by    = "ticker",
-        threads     = True,
-        progress    = False,
-    )
-    if raw.empty:
+    try:
+        raw = yf.download(
+            tickers,
+            start       = start.strftime("%Y-%m-%d"),
+            end         = end.strftime("%Y-%m-%d"),
+            interval    = "1d",
+            auto_adjust = True,
+            group_by    = "ticker",
+            threads     = True,
+            progress    = False,
+        )
+    except Exception:
         return {}
 
     result = {}
@@ -110,33 +106,21 @@ def _fetch_bt_nifty(years: int = 3) -> pd.Series:
         return pd.Series(dtype=float)
 
 
-def fetch_all_bt_data(symbols: list, years: int = 3, progress_cb=None) -> dict:
+def fetch_all_bt_data(symbols: list, years: int = 3) -> dict:
     """
-    Pre-fetch all backtest data. Called ONCE before spawning workers —
-    workers do dict lookups only.
-
-    2026-07-16: now routed through utils.history_store (local Parquet +
-    Supabase Storage cache, live-tail fetching). Previously this refetched
-    the FULL `years` lookback for every symbol on every single backtest —
-    the dominant cost for a 500-symbol run. Now only new/uncached/due-for-
-    refresh symbols hit the network; everything else is a cache read plus
-    a small tail merge. _fetch_bt_batch/_BT_BATCH_SIZE are kept below for
-    any other direct callers, but are no longer used on this path.
-
-    progress_cb(batch_i, n_batches, symbols_so_far): optional, fired after
-    each network batch (2026-07-15 fix — makes a slow-but-alive run
-    visibly distinguishable from a genuinely stuck one).
+    Pre-fetch all backtest data in batches.
+    Called ONCE before spawning worker threads — workers do dict lookups only.
     """
+    # Deduplicate while preserving order
     seen   = set()
     unique = [s for s in symbols if not (s in seen or seen.add(s))]
 
-    from utils.history_store import get_history
-
-    def _cb(done, total):
-        if progress_cb:
-            progress_cb(done, total, done)  # symbols_so_far not tracked mid-batch here
-
-    return get_history(unique, years=float(years), min_bars=210, progress_cb=_cb)
+    all_data: dict = {}
+    for start in range(0, len(unique), _BT_BATCH_SIZE):
+        chunk = tuple(unique[start: start + _BT_BATCH_SIZE])
+        batch = _fetch_bt_batch(chunk, years=years)
+        all_data.update(batch)
+    return all_data
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -431,24 +415,6 @@ def generate_signals_historical(
             _t1m, _t2m, _t3m          = 1.5, 3.0, 5.0
             _tgt_cat, _tgt_adj, _tgt_notes = "Actionable", 0.0, ""
 
-        # ── Dimension 2: structural ceiling (diagnostic, not yet enforced) ──
-        # Logged alongside the tier-based T1/T2/T3 above so it can be joined
-        # against mfe_ceiling_table()'s empirical dimension-1 percentiles once
-        # the bigger-sample run is in. NOT used to cap _sig_t1/t2/t3 yet —
-        # dimension 1's calibrated per-quality-tier values aren't finalized
-        # (see mfe_ceiling_table() thin_sample flags), and capping against an
-        # uncalibrated dimension 1 would just substitute one guess for another.
-        # Once dimension 1 is calibrated, T1 becomes
-        # min(quality-modulated pause_r target, structural_ceiling_r).
-        _sc = structural_ceiling(
-            ph_causal = ia.ph_causal,
-            pl_causal = ia.pl_causal,
-            i         = i,
-            price     = r.entry,
-            atr_val   = r.atr_at_setup,
-            risk      = max(r.entry - r.sl, 0.01),
-        )
-
         signals.append({
             "date":            df.index[i],
             "score":           r.norm_score,
@@ -471,10 +437,6 @@ def generate_signals_historical(
             "target_category": _tgt_cat,
             "target_adj":      _tgt_adj,
             "target_notes":    _tgt_notes,
-            # Dimension 2 diagnostics — see note above compute() call.
-            "structural_ceiling":        _sc.ceiling,
-            "structural_ceiling_r":      _sc.ceiling_r,
-            "structural_ceiling_source": _sc.ceiling_source,
             "cci":             round(r.cur_cci),
             "rsi":             round(r.cur_rsi, 1),
             "tier1_prime":     r.tier1_prime,
@@ -1131,41 +1093,6 @@ def simulate_trades(
 
         pnl_pct = round((exit_price - entry_price) / entry_price * 100, 2)
 
-        # ── True MFE / MAE (v14) ──────────────────────────────────
-        # Model-independent of the T1/SL exit above: this is the actual
-        # best/worst excursion price reached anywhere in the same
-        # `window` (entry → min(hold_days, natural exit-cap)), regardless
-        # of whether the single-target model would have already closed
-        # the position. This is the raw material for an empirical MFE
-        # ceiling (dimension 1 of the target-engine redesign) — it must
-        # NOT be contaminated by T1/SL/target logic, or it just re-derives
-        # the same heuristic it's meant to replace.
-        run_high    = float(np.max(w_high)) if len(w_high) else entry_price
-        run_low     = float(np.min(w_low))  if len(w_low) else entry_price
-        bars_to_mfe = int(np.argmax(w_high)) if len(w_high) else 0
-        mfe_r       = round((run_high - entry_price) / rk, 3) if rk > 0 else 0.0
-        mfe_pct     = round((run_high - entry_price) / entry_price * 100, 2)
-        mae_r       = round((entry_price - run_low) / rk, 3) if rk > 0 else 0.0
-        mae_pct     = round((entry_price - run_low) / entry_price * 100, 2)
-
-        # "First meaningful pause" — the run-up actually captured *before*
-        # the first pullback of >=1 ATR (or >=50% giveback of the run-up
-        # so far) from the running high, using bars up to bars_to_mfe.
-        # This targets the reframed question directly: not "how far can
-        # an Elite stock go" but "how far does price usually run before it
-        # first pauses". Falls back to the full-window MFE when no pause
-        # is detected inside the window (i.e. price ran clean to its high).
-        _atr0 = float(sig.get("atr_at_setup", 0.0)) or (rk * 0.5)   # crude ATR proxy if missing
-        pause_r = mfe_r
-        if bars_to_mfe > 0 and _atr0 > 0:
-            running_peak = entry_price
-            for j in range(bars_to_mfe + 1):
-                running_peak = max(running_peak, w_high[j])
-                giveback = running_peak - w_low[j]
-                if giveback >= _atr0 and running_peak > entry_price:
-                    pause_r = round((running_peak - entry_price) / rk, 3) if rk > 0 else 0.0
-                    break
-
         trades.append({
             "symbol":          symbol,
             "entry_date":      entry_bar.date(),
@@ -1234,13 +1161,6 @@ def simulate_trades(
             "target_category": str(sig.get("target_category",  "Actionable")),
             "target_adj":      float(sig.get("target_adj",      0.0)),
             "target_notes":    str(sig.get("target_notes",      "")),
-            # Dimension 2 diagnostic — carried through from the signal row.
-            # NaN/"none" for CCI Master and Five Pillars signals, since
-            # structural_ceiling() is currently only computed in
-            # generate_signals_historical() (the main scanner path).
-            "structural_ceiling":        sig.get("structural_ceiling",        None),
-            "structural_ceiling_r":      sig.get("structural_ceiling_r",      None),
-            "structural_ceiling_source": sig.get("structural_ceiling_source", "n/a"),
             # Actual RR at entry (from real open, not signal close) — this is
             # the PLANNED reward:risk of the T1 target, fixed at entry time.
             "rr_actual":       round((t1 - entry_price) / rk, 2) if rk > 0 else 0.0,
@@ -1248,14 +1168,6 @@ def simulate_trades(
             # of initial risk (pnl_abs ÷ rk). +t1_mult on a T1 HIT, -1.0 on an
             # SL HIT, whatever fraction of R was banked/lost on a TIMEOUT.
             "r_multiple":      round((exit_price - entry_price) / rk, 2) if rk > 0 else 0.0,
-            # ── True MFE/MAE (v14) — model-independent excursion data,
-            # the raw input for the empirical MFE ceiling table below.
-            "mfe_r":           mfe_r,
-            "mfe_pct":         mfe_pct,
-            "mae_r":           mae_r,
-            "mae_pct":         mae_pct,
-            "bars_to_mfe":     bars_to_mfe,
-            "pause_r":         pause_r,   # run-up captured before first >=1ATR giveback
             # ── VWAP Reclaim trade diagnostics (from signal, preserved on trade) ──
             "vwap_touch":             bool(sig.get("vwap_touch",           False)),
             "reaction_strength":      float(sig.get("reaction_strength",   0.0)),
@@ -1396,32 +1308,10 @@ def run_backtest(
 
     use_processes: score+simulate is pure CPU work (no network I/O). CPython
     threads don't parallelize CPU-bound code (GIL), so ThreadPoolExecutor
-    runs close to single-threaded despite N "workers" — that's the
-    ThreadPoolExecutor tradeoff and it's a known, accepted cost.
-
-    Default is now False (changed back 2026-07-15 PM). Earlier the same
-    day this was flipped to True (ProcessPoolExecutor) to fix a different
-    problem — Phase 2 scoring running effectively single-threaded — but
-    that reintroduced a worse failure: ProcessPoolExecutor defaults to
-    `fork` on Linux, and forking a process that already has multiple
-    threads running (which every Streamlit app does — tornado/session/
-    cache threads) can deadlock a child worker on a lock it inherited
-    mid-acquisition. Unlike an OOM kill, this doesn't raise
-    BrokenProcessPool — the worker just never returns, and as_completed()
-    waits on it forever. Confirmed in practice: a 500-symbol run stalled
-    at ~32% (mid-scoring) after 20+ minutes with no error, matching this
-    failure mode exactly, not the OOM one.
-
-    It also wasn't buying anything: Streamlit Community Cloud provisions
-    a single shared vCPU, so multiple processes have no real cores to
-    parallelize across — only fork overhead and this deadlock risk, for
-    zero wall-clock benefit. If this app ever moves to a host with
-    multiple dedicated cores, ProcessPoolExecutor could be revisited, but
-    it MUST use `mp_context=multiprocessing.get_context("spawn")`
-    (not the fork default) to avoid this exact deadlock — spawn starts a
-    fresh interpreter per worker instead of forking the live threaded
-    process. Do not just flip this back to True without also setting
-    that context.
+    here previously ran close to single-threaded despite N "workers". Default
+    True uses ProcessPoolExecutor for real multi-core parallelism. Set False
+    to fall back to threads (e.g. constrained/sandboxed hosts where spawning
+    processes isn't available).
     """
     if settings:
         hold_days        = settings.get("hold_days",            hold_days)
@@ -1442,31 +1332,14 @@ def run_backtest(
     if extra_pillar_cfg:
         _fp_cfg.update(extra_pillar_cfg)
 
-    # `workers` is shared with the scanner's I/O-bound ThreadPoolExecutor,
-    # where 10 threads is cheap and reasonable. It is NOT a safe value for
-    # ProcessPoolExecutor: each process pays a full interpreter start +
-    # pandas/numpy/every utils module import, independent of how much work
-    # it actually does. 2026-07-15: this exact mismatch (10 processes on a
-    # memory-capped host) OOM-killed the app silently mid-run. Cap process
-    # workers much lower regardless of what the shared UI setting says;
-    # thread workers keep the original wider range.
-    if use_processes:
-        workers = max(2, min(workers, 4))
-    else:
-        workers = max(4, min(workers, 20))
+    workers = max(4, min(workers, 20))
 
     # ── Phase 1: Batch-fetch all data (main thread, no concurrency) ──
     # All HTTP happens here. Workers below do zero network I/O.
     if progress_cb:
         progress_cb(0.0, "Fetching historical data…")
 
-    def _fetch_progress(batch_i, n_batches, n_fetched):
-        if progress_cb:
-            # Fetch phase occupies 0%–15% of the overall bar.
-            pct = 0.15 * (batch_i / n_batches)
-            progress_cb(pct, f"Fetching data — batch {batch_i}/{n_batches} ({n_fetched} symbols so far)")
-
-    all_data = fetch_all_bt_data(symbols, years=3, progress_cb=_fetch_progress)
+    all_data = fetch_all_bt_data(symbols, years=3)
 
     nifty = _fetch_bt_nifty(years=3)                  # cached 1h
     regime_val         = nifty_regime(nifty)
@@ -1522,16 +1395,11 @@ def run_backtest(
             import logging
             logging.getLogger(__name__).warning("checkpoint_cb failed at %d/%d", n, total, exc_info=True)
 
-    # Defaults to ThreadPoolExecutor (see use_processes docstring above) —
-    # GIL-serialized for this CPU-bound work, but safe on Streamlit's
-    # multi-threaded runtime. ProcessPoolExecutor remains available
-    # (use_processes=True) for hosts with real dedicated multi-core CPUs,
-    # but requires mp_context="spawn" there to avoid the fork deadlock.
+    # CPU-bound scoring: ProcessPoolExecutor gives real multi-core parallelism.
+    # ThreadPoolExecutor would just serialize on the GIL for this workload —
+    # kept as an opt-out (use_processes=False) for hosts that can't spawn
+    # subprocesses.
     Executor = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
-    _log.info("run_backtest: executor=%s workers=%d symbols=%d",
-              Executor.__name__, workers, len(valid_symbols))
-
-    from concurrent.futures.process import BrokenProcessPool
 
     with Executor(max_workers=workers) as exe:
         futures = {
@@ -1544,77 +1412,30 @@ def run_backtest(
             ): s
             for s in valid_symbols
         }
-        # Manual wait()-loop instead of as_completed() so a stalled run is
-        # diagnosable: if nothing finishes within STALL_LOG_INTERVAL seconds,
-        # log exactly which symbols are still outstanding. With
-        # ThreadPoolExecutor specifically, one pathological symbol (unusual
-        # real-data edge case) can starve the whole pool via the GIL rather
-        # than just its own worker — this turns that from a silent freeze
-        # into a named suspect. See 2026-07 hang investigation.
-        STALL_LOG_INTERVAL = 60  # seconds
-        pending = set(futures)
-        pct = 0.15
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            with c_lock:
+                completed[0] += 1
+                n = completed[0]
+            # Progress: 15%–100% over scoring phase
+            if progress_cb:
+                pct = 0.15 + 0.85 * (n / total)
+                progress_cb(min(pct, 1.0), sym)
+            try:
+                _sym, result, rejs = fut.result()
+                if result is not None and not result.empty:
+                    with t_lock:
+                        all_trades.append(result)
+                        _new_since_checkpoint.append(result)
+                if rejs is not None and not rejs.empty:
+                    with t_lock:
+                        all_rejections.append(rejs)
+            except Exception as _exc:
+                import logging
+                logging.getLogger(__name__).warning("backtest inner loop failed for %s: %s", sym, _exc)
 
-        while pending:
-            done, pending = wait(pending, timeout=STALL_LOG_INTERVAL,
-                                  return_when=FIRST_COMPLETED)
-
-            if not done:
-                stuck_syms = sorted(futures[f] for f in pending)
-                _log.warning(
-                    "run_backtest: no completions in %ds — %d/%d symbols "
-                    "still pending (possible GIL-starving symbol if "
-                    "use_processes=False): %s",
-                    STALL_LOG_INTERVAL, len(stuck_syms), total,
-                    ", ".join(stuck_syms[:20]) + ("…" if len(stuck_syms) > 20 else ""),
-                )
-                if progress_cb:
-                    progress_cb(min(pct, 1.0),
-                                f"Still working — no symbol has finished in "
-                                f"{STALL_LOG_INTERVAL}s (see logs for pending list)")
-                continue
-
-            for fut in done:
-                sym = futures[fut]
-                with c_lock:
-                    completed[0] += 1
-                    n = completed[0]
-                # Progress: 15%–100% over scoring phase
-                if progress_cb:
-                    pct = 0.15 + 0.85 * (n / total)
-                    progress_cb(min(pct, 1.0), sym)
-                try:
-                    _sym, result, rejs = fut.result()
-                    if result is not None and not result.empty:
-                        with t_lock:
-                            all_trades.append(result)
-                            _new_since_checkpoint.append(result)
-                    if rejs is not None and not rejs.empty:
-                        with t_lock:
-                            all_rejections.append(rejs)
-                except BrokenProcessPool:
-                    # A worker process died (most likely OOM-killed by the host).
-                    # Surface this loudly and stop instead of letting the run
-                    # sit there looking frozen — every other pending future will
-                    # raise the same error, so bail out now rather than log it
-                    # N times on the way to an identical failure.
-                    _log.error(
-                        "run_backtest: worker process pool crashed (likely OOM) "
-                        "after %d/%d symbols scored with workers=%d. Try lowering "
-                        "`workers` further or set use_processes=False.",
-                        n, total, workers,
-                    )
-                    if progress_cb:
-                        progress_cb(min(pct, 1.0),
-                                    f"ERROR: worker process crashed (likely out of "
-                                    f"memory) after {n}/{total} symbols — "
-                                    f"try fewer workers or use_processes=False")
-                    raise
-                except Exception as _exc:
-                    _log.warning("backtest inner loop failed for %s: %s", sym, _exc)
-
-                _since_checkpoint += 1
-                _fire_checkpoint(n)
+            _since_checkpoint += 1
+            _fire_checkpoint(n)
 
     _fire_checkpoint(total, force=True)  # final checkpoint == full result
 
@@ -2078,76 +1899,6 @@ def _excursion_summary(trades: pd.DataFrame) -> dict:
     }
 
 
-def mfe_ceiling_table(trades: pd.DataFrame, min_bucket_n: int = 15) -> dict:
-    """
-    v14: Empirical MFE ceiling table — dimension 1 of the target-engine
-    redesign (see adaptive_target_engine.py redesign notes).
-
-    Unlike _excursion_summary() above (which *infers* MFE from which
-    target was hit — circular, since it's built from the very heuristic
-    tiers it's meant to replace), this reads the true bar-level `mfe_r`
-    / `pause_r` columns written by simulate_trades(): the actual best
-    price reached in the hold window, independent of T1/SL/target logic.
-
-    Buckets by (target_category, atr_band) — both already attached to
-    every trade row, so no extra joins are needed. For each bucket:
-      - mfe_r_p50/p75/p90   : full-window run-up percentiles (the true
-                               ceiling — "how far could this have gone")
-      - pause_r_p50/p75/p90 : run-up captured before the first >=1 ATR
-                               giveback (the "before its next meaningful
-                               pause" distance — usually the more useful
-                               number for setting T1/T2)
-      - n                   : sample size (buckets under min_bucket_n
-                               are flagged, not dropped, so thin data is
-                               visible rather than silently trusted)
-
-    Falls back to an empty dict if the trades frame predates the v14
-    mfe_r/pause_r columns (e.g. a cached backtest run) — call sites
-    should check for this and fall back to _excursion_summary().
-    """
-    if trades.empty or "mfe_r" not in trades.columns or "pause_r" not in trades.columns:
-        return {}
-
-    df = trades.copy()
-    cat_col = "target_category" if "target_category" in df.columns else None
-    band_col = "atr_band" if "atr_band" in df.columns else None
-    if cat_col is None:
-        return {}
-
-    group_cols = [c for c in (cat_col, band_col) if c is not None]
-    rows = []
-    for keys, grp in df.groupby(group_cols):
-        keys = keys if isinstance(keys, tuple) else (keys,)
-        n = len(grp)
-        row = dict(zip(group_cols, keys))
-        row.update({
-            "n":             n,
-            "thin_sample":   n < min_bucket_n,
-            "mfe_r_p50":     round(float(np.percentile(grp["mfe_r"], 50)), 2),
-            "mfe_r_p75":     round(float(np.percentile(grp["mfe_r"], 75)), 2),
-            "mfe_r_p90":     round(float(np.percentile(grp["mfe_r"], 90)), 2),
-            "pause_r_p50":   round(float(np.percentile(grp["pause_r"], 50)), 2),
-            "pause_r_p75":   round(float(np.percentile(grp["pause_r"], 75)), 2),
-            "pause_r_p90":   round(float(np.percentile(grp["pause_r"], 90)), 2),
-            "mae_r_p50":     round(float(np.percentile(grp["mae_r"], 50)), 2) if "mae_r" in grp.columns else None,
-        })
-        rows.append(row)
-
-    return {
-        "buckets":    rows,
-        "group_cols": group_cols,
-        "overall": {
-            "n":           len(df),
-            "mfe_r_p50":   round(float(np.percentile(df["mfe_r"], 50)), 2),
-            "mfe_r_p75":   round(float(np.percentile(df["mfe_r"], 75)), 2),
-            "mfe_r_p90":   round(float(np.percentile(df["mfe_r"], 90)), 2),
-            "pause_r_p50": round(float(np.percentile(df["pause_r"], 50)), 2),
-            "pause_r_p75": round(float(np.percentile(df["pause_r"], 75)), 2),
-            "pause_r_p90": round(float(np.percentile(df["pause_r"], 90)), 2),
-        },
-    }
-
-
 def compute_stats(trades: pd.DataFrame) -> dict:
     if trades.empty:
         return {}
@@ -2287,9 +2038,6 @@ def compute_stats(trades: pd.DataFrame) -> dict:
         # v12/v13: adaptive target category breakdown + excursion stats
         "target_category_stats":   _target_category_breakdown(trades),
         "excursion_stats":         _excursion_summary(trades),
-        # v14: true-MFE empirical ceiling table (dimension 1 of the
-        # target-engine redesign) — empty dict on cached pre-v14 runs.
-        "mfe_ceiling_table":       mfe_ceiling_table(trades),
     }
 
 
