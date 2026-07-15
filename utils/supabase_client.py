@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, date, timezone
 from typing import Optional
 
 import pandas as pd
@@ -268,7 +268,12 @@ def save_backtest_results(trades_df: pd.DataFrame, run_label: str = "",
     def _safe(val):
         if pd.isna(val):
             return None
-        if isinstance(val, (pd.Timestamp, datetime)):
+        # order matters: datetime is a subclass of date, so this catches
+        # both pd.Timestamp/datetime.datetime AND plain datetime.date
+        # (e.g. entry_bar.date()/exit_date.date() in backtest_engine.py's
+        # simulate_trades() — those aren't Timestamp/datetime instances,
+        # and json.dumps() can't serialize a bare date on its own).
+        if isinstance(val, (pd.Timestamp, datetime, date)):
             return val.isoformat()
         return val
 
