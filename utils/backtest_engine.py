@@ -1233,13 +1233,6 @@ def simulate_trades(
             "target_category": str(sig.get("target_category",  "Actionable")),
             "target_adj":      float(sig.get("target_adj",      0.0)),
             "target_notes":    str(sig.get("target_notes",      "")),
-            # Dimension 2 diagnostic — carried through from the signal row.
-            # NaN/"none" for CCI Master and Five Pillars signals, since
-            # structural_ceiling() is currently only computed in
-            # generate_signals_historical() (the main scanner path).
-            "structural_ceiling":        sig.get("structural_ceiling",        None),
-            "structural_ceiling_r":      sig.get("structural_ceiling_r",      None),
-            "structural_ceiling_source": sig.get("structural_ceiling_source", "n/a"),
             # Actual RR at entry (from real open, not signal close) — this is
             # the PLANNED reward:risk of the T1 target, fixed at entry time.
             "rr_actual":       round((t1 - entry_price) / rk, 2) if rk > 0 else 0.0,
