@@ -24,7 +24,8 @@ import numpy as np
 from datetime import datetime, timezone, timedelta
 import yfinance as yf
 import streamlit as st
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
+import time
 import threading
 import logging
 
@@ -1233,6 +1234,13 @@ def simulate_trades(
             "target_category": str(sig.get("target_category",  "Actionable")),
             "target_adj":      float(sig.get("target_adj",      0.0)),
             "target_notes":    str(sig.get("target_notes",      "")),
+            # Dimension 2 diagnostic — carried through from the signal row.
+            # NaN/"none" for CCI Master and Five Pillars signals, since
+            # structural_ceiling() is currently only computed in
+            # generate_signals_historical() (the main scanner path).
+            "structural_ceiling":        sig.get("structural_ceiling",        None),
+            "structural_ceiling_r":      sig.get("structural_ceiling_r",      None),
+            "structural_ceiling_source": sig.get("structural_ceiling_source", "n/a"),
             # Actual RR at entry (from real open, not signal close) — this is
             # the PLANNED reward:risk of the T1 target, fixed at entry time.
             "rr_actual":       round((t1 - entry_price) / rk, 2) if rk > 0 else 0.0,
@@ -1536,47 +1544,77 @@ def run_backtest(
             ): s
             for s in valid_symbols
         }
-        for fut in as_completed(futures):
-            sym = futures[fut]
-            with c_lock:
-                completed[0] += 1
-                n = completed[0]
-            # Progress: 15%–100% over scoring phase
-            if progress_cb:
-                pct = 0.15 + 0.85 * (n / total)
-                progress_cb(min(pct, 1.0), sym)
-            try:
-                _sym, result, rejs = fut.result()
-                if result is not None and not result.empty:
-                    with t_lock:
-                        all_trades.append(result)
-                        _new_since_checkpoint.append(result)
-                if rejs is not None and not rejs.empty:
-                    with t_lock:
-                        all_rejections.append(rejs)
-            except BrokenProcessPool:
-                # A worker process died (most likely OOM-killed by the host).
-                # Surface this loudly and stop instead of letting the run
-                # sit there looking frozen — every other pending future will
-                # raise the same error, so bail out now rather than log it
-                # N times on the way to an identical failure.
-                _log.error(
-                    "run_backtest: worker process pool crashed (likely OOM) "
-                    "after %d/%d symbols scored with workers=%d. Try lowering "
-                    "`workers` further or set use_processes=False.",
-                    n, total, workers,
+        # Manual wait()-loop instead of as_completed() so a stalled run is
+        # diagnosable: if nothing finishes within STALL_LOG_INTERVAL seconds,
+        # log exactly which symbols are still outstanding. With
+        # ThreadPoolExecutor specifically, one pathological symbol (unusual
+        # real-data edge case) can starve the whole pool via the GIL rather
+        # than just its own worker — this turns that from a silent freeze
+        # into a named suspect. See 2026-07 hang investigation.
+        STALL_LOG_INTERVAL = 60  # seconds
+        pending = set(futures)
+        pct = 0.15
+
+        while pending:
+            done, pending = wait(pending, timeout=STALL_LOG_INTERVAL,
+                                  return_when=FIRST_COMPLETED)
+
+            if not done:
+                stuck_syms = sorted(futures[f] for f in pending)
+                _log.warning(
+                    "run_backtest: no completions in %ds — %d/%d symbols "
+                    "still pending (possible GIL-starving symbol if "
+                    "use_processes=False): %s",
+                    STALL_LOG_INTERVAL, len(stuck_syms), total,
+                    ", ".join(stuck_syms[:20]) + ("…" if len(stuck_syms) > 20 else ""),
                 )
                 if progress_cb:
                     progress_cb(min(pct, 1.0),
-                                f"ERROR: worker process crashed (likely out of "
-                                f"memory) after {n}/{total} symbols — "
-                                f"try fewer workers or use_processes=False")
-                raise
-            except Exception as _exc:
-                _log.warning("backtest inner loop failed for %s: %s", sym, _exc)
+                                f"Still working — no symbol has finished in "
+                                f"{STALL_LOG_INTERVAL}s (see logs for pending list)")
+                continue
 
-            _since_checkpoint += 1
-            _fire_checkpoint(n)
+            for fut in done:
+                sym = futures[fut]
+                with c_lock:
+                    completed[0] += 1
+                    n = completed[0]
+                # Progress: 15%–100% over scoring phase
+                if progress_cb:
+                    pct = 0.15 + 0.85 * (n / total)
+                    progress_cb(min(pct, 1.0), sym)
+                try:
+                    _sym, result, rejs = fut.result()
+                    if result is not None and not result.empty:
+                        with t_lock:
+                            all_trades.append(result)
+                            _new_since_checkpoint.append(result)
+                    if rejs is not None and not rejs.empty:
+                        with t_lock:
+                            all_rejections.append(rejs)
+                except BrokenProcessPool:
+                    # A worker process died (most likely OOM-killed by the host).
+                    # Surface this loudly and stop instead of letting the run
+                    # sit there looking frozen — every other pending future will
+                    # raise the same error, so bail out now rather than log it
+                    # N times on the way to an identical failure.
+                    _log.error(
+                        "run_backtest: worker process pool crashed (likely OOM) "
+                        "after %d/%d symbols scored with workers=%d. Try lowering "
+                        "`workers` further or set use_processes=False.",
+                        n, total, workers,
+                    )
+                    if progress_cb:
+                        progress_cb(min(pct, 1.0),
+                                    f"ERROR: worker process crashed (likely out of "
+                                    f"memory) after {n}/{total} symbols — "
+                                    f"try fewer workers or use_processes=False")
+                    raise
+                except Exception as _exc:
+                    _log.warning("backtest inner loop failed for %s: %s", sym, _exc)
+
+                _since_checkpoint += 1
+                _fire_checkpoint(n)
 
     _fire_checkpoint(total, force=True)  # final checkpoint == full result
 
