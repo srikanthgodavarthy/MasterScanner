@@ -917,139 +917,8 @@ _CSS = """
 }
 .mo-title .mo-scan-chip b { color: var(--text); }
 
-.mo-top-grid {
-  display: grid;
-  grid-template-columns: 1.05fr 1.6fr;
-  gap: 18px;
-  align-items: stretch;
-}
-@media (max-width: 900px) { .mo-top-grid { grid-template-columns: 1fr; } }
-
-/* ── Left: Nifty price card ── */
-.mo-nifty-card {
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 16px 18px;
-  display: flex;
-  flex-direction: column;
-}
-.mo-nifty-label {
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.05em;
-  color: var(--muted);
-  margin-bottom: 6px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-/* ── Sensex chip, shown next to the NIFTY 50 label ── */
-.mo-sensex-chip {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
-  font-family: var(--mono);
-  font-weight: 700;
-  letter-spacing: normal;
-  text-transform: none;
-  background: var(--bg1, rgba(255,255,255,0.04));
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 2px 8px;
-  font-size: 10.5px;
-}
-.mo-sensex-chip .mo-sensex-name { color: var(--muted); font-weight: 700; }
-.mo-sensex-chip .mo-sensex-ltp  { color: var(--text); }
-/* ── OI resistance block (nearest expiry, CE/PE) ── */
-.mo-oi-row {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 6px;
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border);
-}
-.mo-oi-item { text-align: left; }
-.mo-oi-label {
-  font-size: 9px;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  margin-bottom: 3px;
-}
-.mo-oi-val {
-  font-size: 12.5px;
-  font-weight: 700;
-  font-family: var(--mono);
-}
-.mo-oi-sub { font-size: 9.5px; color: var(--muted); font-weight: 500; margin-left: 4px; }
-.mo-nifty-row {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 10px;
-}
-.mo-nifty-price {
-  font-size: 34px;
-  font-weight: 700;
-  font-family: var(--mono);
-  color: var(--text);
-  line-height: 1.1;
-}
-.mo-nifty-chg { margin-top: 6px; font-family: var(--mono); }
-.mo-spark { width: 100%; max-width: 200px; height: 64px; flex-shrink: 0; }
-.mo-ohlc-row {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 6px;
-  margin-top: 14px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
-}
-.mo-ohlc-item { text-align: left; }
-.mo-ohlc-label {
-  font-size: 9px;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  margin-bottom: 3px;
-}
-.mo-ohlc-val {
-  font-size: 12.5px;
-  font-weight: 700;
-  font-family: var(--mono);
-}
-
-/* ── Right: stat grid ── */
-.mo-stats-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 14px 22px;
-}
-@media (max-width: 700px) { .mo-stats-grid { grid-template-columns: repeat(2, 1fr); } }
-.mo-stat-label {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  color: var(--muted);
-  margin-bottom: 6px;
-  cursor: default;
-}
 .mo-info { opacity: 0.6; font-size: 9px; }
-.mo-stat-value {
-  font-size: 22px;
-  font-weight: 700;
-  font-family: var(--mono);
-  color: var(--text);
-  line-height: 1.1;
-}
-.mo-stat-value .a { color: var(--green); }
-.mo-stat-value .d { color: var(--red); }
-.mo-stat-sub { font-size: 9.5px; margin-top: 4px; font-family: var(--mono); }
-.mo-stat-sub .a { color: var(--green); }
-.mo-stat-sub .d { color: var(--red); }
+.mo-spark { width: 100%; max-width: 200px; height: 64px; flex-shrink: 0; }
 .mo-bar-track {
   height: 5px;
   background: var(--bg3);
@@ -1059,52 +928,197 @@ _CSS = """
 }
 .mo-bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
 .mo-bar-track.mo-bar-split { margin-top: 4px; }
-
-/* ── Bottom: gate cards row ── */
-.mo-gates-row {
-  display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  gap: 10px;
-  margin-top: 16px;
+.mo-bar-legend {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--muted);
+  margin-top: 6px;
 }
-@media (max-width: 900px) { .mo-gates-row { grid-template-columns: repeat(2, 1fr); } }
-.mo-gate-card {
+.mo-bar-legend .a { color: var(--green); }
+.mo-bar-legend .d { color: var(--red); }
+
+/* ── Health row: Regime / Trend / Breadth / 52W Hi-Lo / EMA / Gate ── */
+.mo-health-row {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr 1fr 0.85fr 0.85fr 0.85fr;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+@media (max-width: 1100px) { .mo-health-row { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 700px)  { .mo-health-row { grid-template-columns: repeat(2, 1fr); } }
+.mo-health-card {
   background: var(--bg2);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px 12px;
+  border-radius: 10px;
+  padding: 12px 14px;
 }
-.mo-gate-top {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 6px;
-}
-.mo-gate-icon { font-size: 13px; }
-.mo-gate-label {
+.mo-health-label {
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.04em;
+  text-transform: uppercase;
   color: var(--muted);
-  flex: 1;
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: default;
 }
-.mo-gate-value {
-  font-size: 17px;
+.mo-health-value {
+  font-size: 18px;
   font-weight: 700;
   font-family: var(--mono);
+  color: var(--text);
+  line-height: 1.1;
 }
-.mo-gate-qual {
-  font-size: 10px;
+.mo-health-value .a { color: var(--green); }
+.mo-health-value .d { color: var(--red); }
+
+/* ── Regime card ── */
+.mo-regime-card { display: flex; gap: 10px; align-items: flex-start; }
+.mo-regime-icon { font-size: 20px; line-height: 1; }
+.mo-regime-body { flex: 1; min-width: 0; }
+.mo-regime-tag {
+  font-size: 20px;
+  font-weight: 800;
+  font-family: var(--mono);
+  margin: 2px 0 5px;
+}
+.mo-regime-note { font-size: 10.5px; color: var(--muted); line-height: 1.4; }
+
+/* ── Mini-pair cards (52W Hi/Lo, EMA breadth, VIX/ADX gate) ── */
+.mo-mini-pair { display: flex; justify-content: space-between; gap: 10px; }
+.mo-mini-item { flex: 1; min-width: 0; }
+.mo-mini-label {
+  font-size: 9px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-bottom: 4px;
+}
+.mo-mini-val {
+  font-size: 15px;
+  font-weight: 700;
+  font-family: var(--mono);
+  color: var(--text);
+}
+.mo-mini-val.a { color: var(--green); }
+.mo-mini-val.d { color: var(--red); }
+.mo-gate-mini-top { display: flex; align-items: center; gap: 4px; margin-bottom: 3px; }
+.mo-gate-mini-icon { font-size: 11px; }
+.mo-gate-mini-check { margin-left: auto; font-weight: 700; font-size: 11px; }
+.mo-gate-mini-qual { font-size: 9px; color: var(--muted); font-weight: 600; margin-left: 5px; }
+
+/* ── Index cards row (NIFTY 50 / SENSEX / BANK NIFTY) ── */
+.mo-index-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 14px;
+}
+@media (max-width: 900px) { .mo-index-grid { grid-template-columns: 1fr; } }
+.mo-index-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+.mo-index-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mo-index-badge {
+  font-size: 9.5px;
   font-weight: 600;
   color: var(--muted);
-  margin-left: 5px;
+  background: rgba(255,255,255,0.05);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 6px;
 }
-.mo-note {
-  font-size: 11px;
+
+/* ── EMA20/50/200 badge row ── */
+.mo-index-ema-row { display: flex; gap: 6px; margin-bottom: 10px; }
+.mo-index-ema-item {
+  flex: 1;
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 7px;
+  text-align: center;
+}
+.mo-index-ema-label {
+  font-size: 8.5px;
+  font-weight: 700;
   color: var(--muted);
-  font-style: italic;
-  margin: 10px 0 0;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-bottom: 2px;
 }
+.mo-index-ema-val { font-size: 11.5px; font-weight: 700; font-family: var(--mono); }
+.mo-index-ema-check { font-size: 10px; }
+
+.mo-index-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.mo-index-price {
+  font-size: 28px;
+  font-weight: 700;
+  font-family: var(--mono);
+  color: var(--text);
+  line-height: 1.1;
+}
+.mo-index-chg { margin-top: 6px; font-family: var(--mono); font-size: 12.5px; }
+
+.mo-index-ohlc-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.mo-index-ohlc-item { text-align: left; }
+.mo-index-ohlc-label {
+  font-size: 9px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 3px;
+}
+.mo-index-ohlc-val { font-size: 12px; font-weight: 700; font-family: var(--mono); }
+
+.mo-index-oi-row {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.mo-index-oi-item { text-align: left; }
+.mo-index-oi-label {
+  font-size: 9px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 3px;
+}
+.mo-index-oi-val { font-size: 12.5px; font-weight: 700; font-family: var(--mono); }
+.mo-index-oi-meta { font-size: 9px; color: var(--muted); margin-top: 2px; }
+
+.mo-index-expiry { font-size: 9.5px; color: var(--muted); margin-top: 8px; }
 </style>
 """
 
@@ -1825,23 +1839,29 @@ def _vix_band(vix: float) -> tuple[str, str]:
 
 
 def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
-                      grad_id: str, badge: str = "") -> str:
+                      grad_id: str, badge: str = "", ema: dict | None = None) -> str:
     """
-    Render one equal-width Market Overview index card: live price, %chg,
-    intraday sparkline, OHLC row, and nearest-expiry CE/PE OI resistance
-    (strike, OI, premium). Used identically for NIFTY 50, SENSEX, and
-    BANK NIFTY so all three stay visually symmetric.
+    Render one equal-width Market Overview index card: EMA20/50/200 badge
+    row, live price, %chg, intraday sparkline, OHLC row, and nearest-expiry
+    CE/PE OI resistance (strike, OI, premium). Used identically for
+    NIFTY 50, SENSEX, and BANK NIFTY so all three stay visually symmetric.
 
     snapshot: {"price", "pct_chg", "open", "high", "low", "prev_close",
                "spark", "source"} — utils.scanner_engine index snapshot fns.
     oi: {"expiry", "ce_strike", "ce_oi", "ce_premium",
          "pe_strike", "pe_oi", "pe_premium"} — utils.upstox_client.
          fetch_oi_resistance(). None/empty renders "—" throughout.
+    ema: {"ema20"/"above_ema20", "ema50"/"above_ema50",
+          "ema200"/"above_ema200"} — utils.scanner_engine.compute_ema_levels()
+          / fetch_sensex_ema_levels(). A span is simply skipped in the badge
+          row if it's missing (not enough history yet). None/empty hides
+          the whole row.
     grad_id: unique sparkline gradient id (see _nifty_spark_svg).
     badge: optional small right-aligned tag, e.g. "(delayed)".
     """
     snapshot = snapshot or {}
     oi       = oi or {}
+    ema      = ema or {}
 
     price      = snapshot.get("price", 0.0)
     pct_chg    = snapshot.get("pct_chg")
@@ -1902,8 +1922,28 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
     expiry_html = f"Nearest expiry: {expiry}" if expiry else "Nearest expiry: —"
     badge_html  = f'<span class="mo-index-badge">{badge}</span>' if badge else ""
 
+    ema_specs = (("EMA20", "ema20", "above_ema20"),
+                 ("EMA50", "ema50", "above_ema50"),
+                 ("EMA200", "ema200", "above_ema200"))
+    ema_items = []
+    for ema_lbl, val_key, ok_key in ema_specs:
+        if val_key not in ema:
+            continue
+        ema_ok    = bool(ema.get(ok_key))
+        ema_color = "#3fb950" if ema_ok else "#f85149"
+        ema_mark  = "✓" if ema_ok else "✕"
+        ema_items.append(
+            f'<div class="mo-index-ema-item" style="border-color:{ema_color}55">'
+            f'<div class="mo-index-ema-label">{ema_lbl}</div>'
+            f'<div class="mo-index-ema-val" style="color:{ema_color}">'
+            f'{ema[val_key]:,.0f} <span class="mo-index-ema-check">{ema_mark}</span></div>'
+            f'</div>'
+        )
+    ema_row_html = f'<div class="mo-index-ema-row">{"".join(ema_items)}</div>' if ema_items else ""
+
     return f"""
 <div class="mo-index-card">
+  {ema_row_html}
   <div class="mo-index-label"><span>{label}</span>{badge_html}</div>
   <div class="mo-index-row">
     <div>
@@ -1929,8 +1969,9 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
     layout (2026-07 redesign) with an institutional-terminal-style,
     information-dense strip that doesn't grow the page height.
 
-    index_cards: list of {"label", "snapshot", "oi", "badge"} dicts, one
-    per index, rendered via _index_card_html() in the given order.
+    index_cards: list of {"label", "snapshot", "oi", "badge", "ema"} dicts,
+    one per index, rendered via _index_card_html() in the given order.
+    "ema" is the compute_ema_levels()/fetch_sensex_ema_levels() output.
     """
     r = summary.get("regime", "RANGE")
     regime_color, _, _ = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
@@ -2041,7 +2082,7 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
     cards_html = "".join(
         _index_card_html(
             c.get("label", ""), c.get("snapshot"), c.get("oi"),
-            grad_id=f"moSpark{i}", badge=c.get("badge", ""),
+            grad_id=f"moSpark{i}", badge=c.get("badge", ""), ema=c.get("ema"),
         )
         for i, c in enumerate(index_cards)
     )
@@ -3506,6 +3547,22 @@ def render(settings: dict | None = None):
                 _sx = {}
         st.session_state["sensex_snapshot"] = _sx or {}
 
+        # EMA20/EMA50/EMA200 for the Market Overview index-card badge row.
+        # Nifty reuses the nifty_series already fetched above for regime
+        # calc; Sensex isn't part of that series so it gets its own fetch.
+        try:
+            from utils.scanner_engine import compute_ema_levels
+            st.session_state["nifty_ema_levels"] = (
+                compute_ema_levels(nifty_series) if nifty_series is not None else {}
+            )
+        except Exception:
+            st.session_state["nifty_ema_levels"] = {}
+        try:
+            from utils.scanner_engine import fetch_sensex_ema_levels
+            st.session_state["sensex_ema_levels"] = fetch_sensex_ema_levels()
+        except Exception:
+            st.session_state["sensex_ema_levels"] = {}
+
         # Nearest-expiry CE/PE OI resistance (Upstox option chain) — best-effort;
         # silently absent (renders "—") if the Upstox token isn't configured.
         try:
@@ -3561,9 +3618,11 @@ def render(settings: dict | None = None):
     df_aug          = st.session_state.get("scan_df",       pd.DataFrame())
     summary         = st.session_state.get("scan_summary",  {})
     scan_time       = st.session_state.get("scan_time",     "")
-    nifty_snapshot  = st.session_state.get("nifty_snapshot", {})
-    sensex_snapshot = st.session_state.get("sensex_snapshot", {})
-    oi_resistance   = st.session_state.get("oi_resistance", {})
+    nifty_snapshot    = st.session_state.get("nifty_snapshot", {})
+    sensex_snapshot   = st.session_state.get("sensex_snapshot", {})
+    oi_resistance     = st.session_state.get("oi_resistance", {})
+    nifty_ema_levels  = st.session_state.get("nifty_ema_levels", {})
+    sensex_ema_levels = st.session_state.get("sensex_ema_levels", {})
 
     if df_aug.empty:
         st.markdown("""
@@ -3582,8 +3641,8 @@ def render(settings: dict | None = None):
     )
 
     index_cards = [
-        {"label": "NIFTY 50", "snapshot": nifty_snapshot, "oi": oi_resistance, "badge": ""},
-        {"label": "SENSEX",   "snapshot": sensex_snapshot, "oi": {},            "badge": ""},
+        {"label": "NIFTY 50", "snapshot": nifty_snapshot,  "oi": oi_resistance, "badge": "", "ema": nifty_ema_levels},
+        {"label": "SENSEX",   "snapshot": sensex_snapshot, "oi": {},            "badge": "", "ema": sensex_ema_levels},
     ]
     st.markdown(
         _market_overview_panel(summary, breadth, scan_time, index_cards),
