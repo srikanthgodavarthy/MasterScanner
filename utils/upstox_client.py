@@ -248,6 +248,57 @@ def fetch_ohlcv_upstox(symbol: str, period: str = "1y", interval: str = "1d") ->
     return df
 
 
+def fetch_ohlcv_range_upstox(symbol: str, start: date, end: date) -> pd.DataFrame:
+    """
+    Date-range counterpart to fetch_ohlcv_upstox(), for callers (history_store)
+    that manage their own caching and need an explicit [start, end] window
+    rather than a period string. No st.cache_data here on purpose —
+    history_store already caches at the parquet/Supabase layer; caching
+    again here would just add a second, harder-to-invalidate cache in front
+    of it.
+    """
+    instrument_key = resolve_instrument_key(symbol)
+    if instrument_key is None:
+        return pd.DataFrame()
+    return _fetch_candles(instrument_key, start, end, unit="days", interval="1")
+
+
+def fetch_batch_ohlcv_range_upstox(symbols: list, start: date, end: date,
+                                    progress_cb=None) -> dict:
+    """
+    Date-range counterpart to fetch_batch_ohlcv_upstox() — same concurrent
+    per-symbol throttled fetch (no multi-symbol historical-candle call
+    exists), but takes an explicit window instead of a period string.
+    Returns {symbol: df} for symbols with any data in range, matching
+    history_store._raw_fetch()'s contract.
+    """
+    if not symbols:
+        return {}
+    if is_token_expired():
+        logger.warning("Upstox token likely expired (past 3:30 AM IST) — skipping range fetch")
+        return {}
+
+    result: dict = {}
+    done = 0
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(fetch_ohlcv_range_upstox, sym, start, end): sym
+            for sym in symbols
+        }
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                df = fut.result()
+                if not df.empty:
+                    result[sym] = df
+            except Exception as exc:
+                logger.warning("Upstox range fetch failed for %s: %s", sym, exc)
+            done += 1
+            if progress_cb:
+                progress_cb(done, len(symbols))
+    return result
+
+
 def fetch_batch_ohlcv_upstox(symbols: list, period: str = "1y", interval: str = "1d",
                               progress_cb=None) -> dict:
     """
