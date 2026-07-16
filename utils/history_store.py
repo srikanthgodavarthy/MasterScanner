@@ -1,474 +1,384 @@
 """
-history_store.py — cached OHLCV history with live-tail fetching.
+upstox_client.py — shared Upstox auth, instrument resolution, and OHLCV fetch.
 
-PROBLEM THIS SOLVES (2026-07-15)
---------------------------------
-scanner_engine.fetch_batch_ohlcv() and backtest_engine.fetch_all_bt_data()
-both re-download the FULL lookback window (1y for the scanner, 3y for
-backtests) from Yahoo on every single run, for every symbol, every time.
-For a 500-symbol backtest that's 500 x 3 years of daily bars pulled fresh
-every run — most of that data never changes.
+WHY THIS EXISTS
+----------------
+app.py's "Upstox Pilot Check" expander proves the access token works and can
+resolve a symbol -> instrument_key -> LTP. It's a standalone sanity check —
+nothing else in the app calls it. scanner_engine.fetch_ohlcv() / fetch_batch_ohlcv()
+and history_store.get_history() are still 100% yfinance.
 
-ARCHITECTURE
-------------
-Two-tier cache, keyed by symbol:
-  1. LOCAL   — Parquet file per symbol in CACHE_DIR. Fast, but Streamlit
-               Community Cloud's disk is EPHEMERAL: it resets on redeploy
-               and on wake-from-sleep after inactivity. Local-only would
-               mean "fast within a session, full refetch after every
-               restart" — better than nothing, not the actual goal.
-  2. SUPABASE STORAGE — same Parquet bytes, uploaded to a bucket. Survives
-               restarts. On a local cache miss, we check here before
-               falling back to a real network fetch.
+This module is the actual data-fetch path: fetch_ohlcv_upstox() returns the
+SAME shape as scanner_engine.fetch_ohlcv() — a DataFrame indexed by date with
+lowercase [open, high, low, close, volume] columns — so it can be dropped in
+anywhere fetch_ohlcv() is currently called, or passed into history_store as
+an alternate source, without touching any downstream indicator/scoring code.
 
-On every call we do the least work possible per symbol:
-  - No cache anywhere            -> full fetch (years lookback)
-  - Cache exists, due for refresh -> full fetch (see REFRESH NOTE below)
-  - Cache exists, fresh           -> fetch ONLY bars from (last_cached_date
-                                     + 1) to today ("live tail"), then
-                                     merge + dedupe against the cached data
+WHAT THIS DOES NOT SOLVE YET
+------------------------------
+Token lifecycle. An Upstox access_token expires at 3:30 AM every day
+regardless of when it was issued. This module reads whatever token is
+currently in st.secrets/.env at call time — it does not refresh it. Until
+there's a scheduled re-auth step, this is a "refresh the token every
+morning" data source, not an unattended-cron-safe one. is_token_expired()
+below at least lets callers *detect* that case instead of silently getting
+empty DataFrames back.
 
-REFRESH NOTE — why tail-only isn't enough forever
---------------------------------------------------
-Every fetch in this codebase uses yf.download(auto_adjust=True), which
-retroactively re-adjusts HISTORICAL closes when a stock has a split or
-dividend. A pure tail-only cache never re-pulls old bars, so it would
-silently drift stale the moment any cached symbol has a corporate action.
-To self-correct, each symbol is fully refetched (not just tailed) every
-_FULL_REFRESH_DAYS regardless of how fresh the tail merge would otherwise
-be. This is a deliberate correctness/cost tradeoff, not an oversight —
-if you see stale-looking adjusted prices, check whether this interval
-needs to be shorter for your holding universe.
-
-Supabase Storage setup:
-  None needed — get_history() auto-creates the "history-cache" bucket on
-  first use if it doesn't exist yet (see _ensure_bucket()). This requires
-  SUPABASE_KEY in st.secrets to be the service_role key, not the anon key,
-  since bucket creation is an admin-level Storage operation. If it's the
-  anon key, auto-create will fail with a permissions error (logged, not
-  raised) and the cache falls back to local-only for that process — create
-  the bucket manually in the dashboard in that case (Storage -> New bucket
-  -> name it exactly "history-cache").
+RATE LIMITS
+-----------
+Unlike yf.download(), Upstox's historical-candle endpoint is one instrument
+per request — there is no multi-symbol batch call. fetch_batch_ohlcv_upstox()
+throttles + retries per symbol; tune _MAX_WORKERS / _MIN_SPACING_S if you hit
+429s at your Upstox plan's rate limit.
 """
 
 from __future__ import annotations
 
+import gzip
 import io
-import json
 import logging
+import random
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
-from pathlib import Path
-from typing import Callable, Optional
 
 import pandas as pd
-
-from utils.scanner_engine import _strip_tz, yf_download_with_retry
+import requests
+import streamlit as st
 
 logger = logging.getLogger(__name__)
 
-# ─── SUPABASE CALL TIMEOUT ──────────────────────────────────────────────────
-# utils/supabase_client.get_client() creates the Supabase client with no
-# timeout configured anywhere (create_client(url, key), no ClientOptions).
-# yf_download_with_retry() got an explicit 30s-timeout + retry wrapper after
-# a prior incident where an unbounded Yahoo call hung a run indefinitely with
-# no exception (see scanner_engine.py). Supabase Storage calls had no such
-# protection, and get_history() below makes several of them SEQUENTIALLY on
-# the main thread, per symbol, before Phase 1's progress callback ever fires
-# — so a single stuck connection here is invisible on the progress bar until
-# it's way too late, and looks exactly like "stuck at N%" with 1 worker.
-# This wraps each Storage call in its own thread with a hard deadline; a call
-# that blows the deadline is abandoned (fail-soft, like yfinance) rather than
-# left to hang the whole run.
-_SB_TIMEOUT = 15   # seconds per Supabase Storage call
-_sb_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sb-storage")
+BASE_URL = "https://api.upstox.com"
+_INSTRUMENT_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz"
+
+# period strings this app passes around, mapped to a lookback in days.
+# Extend if a caller starts using a period not listed here (mirrors
+# scanner_engine._PERIOD_TO_YEARS).
+_PERIOD_TO_DAYS = {"3mo": 95, "6mo": 190, "1y": 375, "2y": 740, "5y": 1850}
+
+# ── throttling ───────────────────────────────────────────────────────────
+_MAX_WORKERS      = 6      # concurrent historical-candle requests
+_MIN_SPACING_S     = 0.12   # floor between request *starts*, process-wide
+_MAX_RETRIES       = 3
+_RETRY_BASE_S      = 1.5
+
+_spacing_lock = threading.Lock()
+_last_call_ts = [0.0]
 
 
-def _with_timeout(fn, *args, timeout: float = _SB_TIMEOUT, **kwargs):
-    """Run fn(*args, **kwargs) with a hard wall-clock deadline. Raises
-    TimeoutError (uncaught here — callers already wrap Storage calls in
-    their own try/except) if the deadline is exceeded."""
-    fut = _sb_executor.submit(fn, *args, **kwargs)
+def _wait_for_spacing() -> None:
+    with _spacing_lock:
+        elapsed = time.monotonic() - _last_call_ts[0]
+        if elapsed < _MIN_SPACING_S:
+            time.sleep(_MIN_SPACING_S - elapsed)
+        _last_call_ts[0] = time.monotonic()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  AUTH
+# ══════════════════════════════════════════════════════════════════
+
+def get_upstox_token() -> str | None:
+    """Looks in st.secrets first (Streamlit Cloud), then falls back to
+    an environment variable / local .env (UPSTOX_ACCESS_TOKEN)."""
     try:
-        return fut.result(timeout=timeout)
-    except _FutureTimeoutError:
-        raise TimeoutError(f"Supabase Storage call exceeded {timeout}s")
-
-# ─── CONFIG ─────────────────────────────────────────────────────────────────
-
-CACHE_DIR = Path(".ms_history_cache")
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-HISTORY_BUCKET = "history-cache"
-_FULL_REFRESH_DAYS = 7      # see REFRESH NOTE above
-_RAW_BATCH_SIZE    = 50     # symbols per yf.download() call — matches the
-                            # existing _BT_BATCH_SIZE convention
-
-_REQUIRED_COLS = ["open", "high", "low", "close", "volume"]
-
-
-# ─── LOCAL TIER ─────────────────────────────────────────────────────────────
-
-def _local_parquet_path(symbol: str) -> Path:
-    return CACHE_DIR / f"{symbol}.parquet"
-
-
-def _local_meta_path(symbol: str) -> Path:
-    return CACHE_DIR / f"{symbol}.meta.json"
-
-
-def _local_load(symbol: str) -> Optional[pd.DataFrame]:
-    p = _local_parquet_path(symbol)
-    if not p.exists():
-        return None
-    try:
-        return pd.read_parquet(p)
-    except Exception as exc:
-        logger.warning("history_store: local parquet read failed for %s: %s", symbol, exc)
-        return None
-
-
-def _local_save(symbol: str, df: pd.DataFrame) -> None:
-    try:
-        df.to_parquet(_local_parquet_path(symbol))
-    except Exception as exc:
-        logger.warning("history_store: local parquet write failed for %s: %s", symbol, exc)
-
-
-def _meta_load(symbol: str) -> dict:
-    p = _local_meta_path(symbol)
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text())
+        token = st.secrets.get("UPSTOX_ACCESS_TOKEN")
+        if token:
+            return token
     except Exception:
-        return {}
+        pass
+    import os
+    return os.environ.get("UPSTOX_ACCESS_TOKEN")
 
 
-def _meta_save(symbol: str, meta: dict) -> None:
-    try:
-        _local_meta_path(symbol).write_text(json.dumps(meta))
-    except Exception as exc:
-        logger.warning("history_store: meta write failed for %s: %s", symbol, exc)
+def is_token_expired() -> bool:
+    """Upstox access tokens expire 3:30 AM IST the day after they're
+    checked out — regardless of generation time. There's no expiry claim
+    to introspect locally without decoding the JWT payload, so this is a
+    same-day floor: if it's already past 3:30 AM IST *today* and the
+    token was (as far as we know) obtained before that, treat it as
+    expired. In practice: call this right before a batch fetch and, if
+    True, surface a "re-auth on Upstox" prompt instead of burning retries
+    against a dead token."""
+    now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    cutoff = now_ist.replace(hour=3, minute=30, second=0, microsecond=0)
+    # Best-effort only: this doesn't know when the token was issued, so it
+    # can't tell "expired at 3:30 today" apart from "generated at 4am
+    # today, still good for 23+ hours." Treat as advisory, not gospel —
+    # a 401 from the API is still the authoritative signal.
+    return now_ist > cutoff and now_ist.hour >= 4
 
 
-# ─── SUPABASE STORAGE TIER (best-effort — never blocks or raises) ──────────
-
-_bucket_status: Optional[bool] = None   # None=not checked yet, True=ready, False=gave up this process
-
-
-def _ensure_bucket(client) -> bool:
-    """
-    Checks the history-cache bucket exists; creates it if not. Runs at most
-    once per process — a permission failure won't be retried on every
-    symbol's upload, it just falls back to local-only for the rest of the run.
-    """
-    global _bucket_status
-    if _bucket_status is not None:
-        return _bucket_status
-
-    try:
-        _with_timeout(client.storage.get_bucket, HISTORY_BUCKET)
-        _bucket_status = True
-        return True
-    except Exception:
-        pass  # doesn't exist (or transient, including a timeout) — try creating it next
-
-    try:
-        _with_timeout(client.storage.create_bucket, HISTORY_BUCKET, options={"public": False})
-        logger.info("history_store: auto-created Supabase Storage bucket '%s'", HISTORY_BUCKET)
-        _bucket_status = True
-        return True
-    except Exception as exc:
-        msg = str(exc)
-        if "already exists" in msg.lower() or "duplicate" in msg.lower():
-            _bucket_status = True
-            return True
-        # Most likely cause: SUPABASE_KEY in st.secrets is the anon key.
-        # Creating a bucket is an admin-level Storage operation and needs
-        # the service_role key — the anon key will 403 here even though it
-        # works fine for the table reads/writes elsewhere in this app.
-        logger.warning(
-            "history_store: could not auto-create Supabase Storage bucket '%s' (%s). "
-            "If this looks like a permissions error, SUPABASE_KEY in st.secrets is "
-            "probably the anon key — bucket creation needs the service_role key. "
-            "Falling back to local-only cache for this process; create the bucket "
-            "manually in the Supabase dashboard to restore durability.",
-            HISTORY_BUCKET, exc,
-        )
-        _bucket_status = False
-        return False
-
-
-def _supabase_storage():
-    """Returns the storage bucket handle, or None if unavailable for any reason."""
-    try:
-        from utils.supabase_client import get_client
-        client = get_client()
-        if client is None:
-            return None
-        if not _ensure_bucket(client):
-            return None
-        return client.storage.from_(HISTORY_BUCKET)
-    except Exception as exc:
-        logger.warning("history_store: Supabase Storage unavailable: %s", exc)
+def _auth_headers() -> dict | None:
+    token = get_upstox_token()
+    if not token:
         return None
+    return {"Accept": "application/json", "Authorization": f"Bearer {token}"}
 
 
-def _supabase_load(symbol: str) -> Optional[pd.DataFrame]:
-    bucket = _supabase_storage()
-    if bucket is None:
-        return None
-    try:
-        raw = _with_timeout(bucket.download, f"{symbol}.parquet")
-        return pd.read_parquet(io.BytesIO(raw))
-    except TimeoutError as exc:
-        logger.warning("history_store: Supabase download timed out for %s: %s", symbol, exc)
-        return None
-    except Exception:
-        # Expected/common case: object doesn't exist yet for this symbol.
-        return None
+# ══════════════════════════════════════════════════════════════════
+#  INSTRUMENT RESOLUTION
+# ══════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_nse_instrument_master() -> pd.DataFrame:
+    """Downloads Upstox's NSE instrument master (refreshed daily by
+    Upstox) so plain stock names like 'RELIANCE' can be resolved to the
+    instrument_key Upstox's API actually requires
+    (e.g. NSE_EQ|INE002A01018)."""
+    resp = requests.get(_INSTRUMENT_MASTER_URL, timeout=15)
+    resp.raise_for_status()
+    with gzip.open(io.BytesIO(resp.content)) as f:
+        df = pd.read_csv(f)
+    df.columns = [c.strip().lower() for c in df.columns]
+    return df
 
 
-def _supabase_save(symbol: str, df: pd.DataFrame) -> None:
-    bucket = _supabase_storage()
-    if bucket is None:
-        return
-    try:
-        buf = io.BytesIO()
-        df.to_parquet(buf)
-        _with_timeout(
-            bucket.upload,
-            f"{symbol}.parquet",
-            buf.getvalue(),
-            {"content-type": "application/octet-stream", "upsert": "true"},
-        )
-    except Exception as exc:
-        # Durability is a nice-to-have, not a hard dependency — never let
-        # a Storage hiccup (including a timeout) take down the actual data path.
-        logger.warning("history_store: Supabase Storage upload failed for %s: %s", symbol, exc)
-
-
-def _supabase_meta_load(symbol: str) -> dict:
-    """
-    Companion to _supabase_load(): the ".meta.json" sidecar (currently just
-    last_full_refresh) uploaded next to "<symbol>.parquet". Needed because
-    local meta lives on Streamlit Community Cloud's EPHEMERAL disk (see
-    module docstring) — if only the local meta is consulted, a disk reset
-    makes every symbol look stale even when Supabase has fresh data, which
-    forces a full re-fetch of the ENTIRE universe on every wake/redeploy.
-    That full re-fetch routinely exceeds the host's request timeout or gets
-    rate-limited by Yahoo partway through, and yf_download_with_retry fails
-    soft (returns an empty frame) rather than raising — so symbols that
-    didn't finish simply never make it into the result dict. The backtest
-    then runs to completion over whatever partial subset succeeded, with no
-    exception anywhere: exactly the "finishes but with wrong/empty results"
-    failure mode. Falling back to Supabase-stored meta here fixes it.
-    """
-    bucket = _supabase_storage()
-    if bucket is None:
+@st.cache_data(ttl=86400, show_spinner=False)
+def _symbol_to_instrument_key_map() -> dict:
+    """Builds the full symbol -> instrument_key lookup once per day
+    instead of re-filtering the instrument master on every call —
+    resolve_instrument_key() gets called once per symbol per scan, and
+    a 500-row .str.upper() == filter x 500 symbols adds up."""
+    df = load_nse_instrument_master()
+    symbol_col = next((c for c in ("tradingsymbol", "trading_symbol", "symbol") if c in df.columns), None)
+    type_col   = next((c for c in ("instrument_type", "instrumenttype") if c in df.columns), None)
+    if symbol_col is None:
         return {}
-    try:
-        raw = _with_timeout(bucket.download, f"{symbol}.meta.json")
-        return json.loads(raw)
-    except TimeoutError as exc:
-        logger.warning("history_store: Supabase meta download timed out for %s: %s", symbol, exc)
-        return {}
-    except Exception:
-        return {}
+    if type_col in df.columns:
+        eq = df[df[type_col].astype(str).str.upper() == "EQ"]
+        # keep non-EQ rows too, but EQ wins ties via the update order below
+        base = df
+    else:
+        eq = df
+        base = df
+    mapping = {}
+    for _, row in base.iterrows():
+        sym = str(row[symbol_col]).strip().upper()
+        mapping.setdefault(sym, row["instrument_key"])
+    for _, row in eq.iterrows():
+        sym = str(row[symbol_col]).strip().upper()
+        mapping[sym] = row["instrument_key"]   # EQ overrides any prior non-EQ match
+    return mapping
 
 
-def _supabase_meta_save(symbol: str, meta: dict) -> None:
-    bucket = _supabase_storage()
-    if bucket is None:
-        return
-    try:
-        _with_timeout(
-            bucket.upload,
-            f"{symbol}.meta.json",
-            json.dumps(meta).encode("utf-8"),
-            {"content-type": "application/json", "upsert": "true"},
-        )
-    except Exception as exc:
-        logger.warning("history_store: Supabase meta upload failed for %s: %s", symbol, exc)
+def resolve_instrument_key(trading_symbol: str) -> str | None:
+    return _symbol_to_instrument_key_map().get(trading_symbol.strip().upper())
 
 
-# ─── RAW NETWORK FETCH (date-range based; replaces period/years fetch) ─────
+# ══════════════════════════════════════════════════════════════════
+#  HISTORICAL CANDLES
+# ══════════════════════════════════════════════════════════════════
 
-def _raw_fetch(symbols: list, start: date, end: date) -> dict:
+def _fetch_candles(instrument_key: str, from_date: date, to_date: date,
+                    unit: str = "days", interval: str = "1") -> pd.DataFrame:
     """
-    One-shot batch fetch over an explicit date range. Batches internally at
-    _RAW_BATCH_SIZE. Returns {symbol: df} for symbols with any data in range.
+    One instrument, one request, via the v3 historical-candle endpoint:
+      GET /v3/historical-candle/{instrument_key}/{unit}/{interval}/{to_date}/{from_date}
+    unit in {"minutes","hours","days","weeks","months"}. days/weeks/months
+    are available back to Jan 2000 — no lookback ceiling issue for the 1y/3y
+    windows this app uses. Fail-soft: returns an empty DataFrame rather than
+    raising, matching fetch_ohlcv()'s existing contract.
     """
-    result: dict = {}
-    for i in range(0, len(symbols), _RAW_BATCH_SIZE):
-        chunk = symbols[i: i + _RAW_BATCH_SIZE]
-        tickers = [f"{s}.NS" for s in chunk]
-        raw = yf_download_with_retry(
-            tickers,
-            start=start.strftime("%Y-%m-%d"),
-            end=(end + timedelta(days=1)).strftime("%Y-%m-%d"),
-            interval="1d",
-            auto_adjust=True,
-            group_by="ticker",
-            threads=True,
-            progress=False,
-        )
-        if raw.empty:
-            continue
-        is_multi = isinstance(raw.columns, pd.MultiIndex)
-        for sym, ticker in zip(chunk, tickers):
-            try:
-                df = raw[ticker] if is_multi else raw
-                df = df.dropna(how="all")
-                if df.empty:
-                    continue
-                df.index = _strip_tz(pd.to_datetime(df.index))
-                df.columns = [c.lower() for c in df.columns]
-                result[sym] = df[_REQUIRED_COLS]
-            except Exception:
+    headers = _auth_headers()
+    if headers is None:
+        return pd.DataFrame()
+
+    url = f"{BASE_URL}/v3/historical-candle/{instrument_key}/{unit}/{interval}/{to_date.isoformat()}/{from_date.isoformat()}"
+
+    last_exc = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        _wait_for_spacing()
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 429:
+                backoff = _RETRY_BASE_S * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                logger.warning("Upstox rate-limited on %s, retrying in %.1fs", instrument_key, backoff)
+                time.sleep(backoff)
                 continue
-    return result
+            if resp.status_code == 401:
+                logger.warning("Upstox 401 on %s — token expired or invalid", instrument_key)
+                return pd.DataFrame()
+            resp.raise_for_status()
+            candles = resp.json().get("data", {}).get("candles", [])
+            if not candles:
+                return pd.DataFrame()
+            df = pd.DataFrame(
+                candles,
+                columns=["timestamp", "open", "high", "low", "close", "volume", "open_interest"],
+            )
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            df = df.set_index("timestamp").sort_index()
+            df.index = df.index.tz_convert("Asia/Kolkata").tz_localize(None).normalize()
+            df.index.name = None
+            return df[["open", "high", "low", "close", "volume"]]
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(_RETRY_BASE_S * attempt)
+
+    logger.warning("Upstox historical-candle failed for %s after %d attempts: %s",
+                    instrument_key, _MAX_RETRIES, last_exc)
+    return pd.DataFrame()
 
 
-# ─── PUBLIC ENTRY POINT ─────────────────────────────────────────────────────
-
-def get_history(
-    symbols: list,
-    years: float = 1.0,
-    min_bars: int = 0,
-    progress_cb: Optional[Callable[[int, int], None]] = None,
-) -> dict:
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_ohlcv_upstox(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
     """
-    Returns {symbol: DataFrame} using the local+Supabase cache, doing only
-    the minimum network fetch needed per symbol (nothing / tail / full).
-
-    years:    lookback window for symbols needing a full fetch (first time
-              seen, or due for periodic refresh).
-    min_bars: symbols whose final merged history has fewer rows than this
-              are dropped from the result (mirrors the old "not enough
-              history" skip behaviour in fetch_batch_ohlcv / _fetch_bt_batch).
-    progress_cb(done, total): fired after each network batch (full or tail).
+    Drop-in counterpart to scanner_engine.fetch_ohlcv(symbol, period, interval)
+    — same signature shape, same return contract (empty DataFrame if fewer
+    than 60 bars or on any failure), same [open,high,low,close,volume]
+    lowercase columns indexed by naive date. Only daily ("1d") is wired up;
+    extend the unit/interval mapping below if intraday scanning is needed.
     """
-    seen = set()
-    unique = [s for s in symbols if not (s in seen or seen.add(s))]
+    if interval != "1d":
+        raise NotImplementedError("fetch_ohlcv_upstox currently only supports interval='1d'")
 
-    today = date.today()
-    full_start = today - timedelta(days=int(years * 365) + 10)
+    instrument_key = resolve_instrument_key(symbol)
+    if instrument_key is None:
+        return pd.DataFrame()
+
+    days_back = _PERIOD_TO_DAYS.get(period, 375)
+    to_date = date.today()
+    from_date = to_date - timedelta(days=days_back)
+
+    df = _fetch_candles(instrument_key, from_date, to_date, unit="days", interval="1")
+    if df.empty or len(df) < 60:
+        return pd.DataFrame()
+    return df
+
+
+def fetch_ohlcv_range_upstox(symbol: str, start: date, end: date) -> pd.DataFrame:
+    """
+    Date-range counterpart to fetch_ohlcv_upstox(), for callers (history_store)
+    that manage their own caching and need an explicit [start, end] window
+    rather than a period string. No st.cache_data here on purpose —
+    history_store already caches at the parquet/Supabase layer; caching
+    again here would just add a second, harder-to-invalidate cache in front
+    of it.
+    """
+    instrument_key = resolve_instrument_key(symbol)
+    if instrument_key is None:
+        return pd.DataFrame()
+    return _fetch_candles(instrument_key, start, end, unit="days", interval="1")
+
+
+def fetch_batch_ohlcv_range_upstox(symbols: list, start: date, end: date,
+                                    progress_cb=None) -> dict:
+    """
+    Date-range counterpart to fetch_batch_ohlcv_upstox() — same concurrent
+    per-symbol throttled fetch (no multi-symbol historical-candle call
+    exists), but takes an explicit window instead of a period string.
+    Returns {symbol: df} for symbols with any data in range, matching
+    history_store._raw_fetch()'s contract.
+    """
+    if not symbols:
+        return {}
+    if is_token_expired():
+        logger.warning("Upstox token likely expired (past 3:30 AM IST) — skipping range fetch")
+        return {}
 
     result: dict = {}
-    need_full: list = []
-    need_tail: dict = {}   # symbol -> tail_start date
-
-    for sym in unique:
-        df = _local_load(sym)
-        recovered_from_supabase = False
-        if df is None:
-            df = _supabase_load(sym)
-            if df is not None:
-                _local_save(sym, df)
-                recovered_from_supabase = True
-
-        meta = _meta_load(sym)
-        if not meta and recovered_from_supabase:
-            # Local meta is gone (ephemeral disk was reset) but the data
-            # itself just came back from Supabase — check Supabase's meta
-            # sidecar before concluding "stale". Without this, every symbol
-            # looks stale after any redeploy/sleep-wake, forcing a full
-            # re-fetch of the whole universe (see _supabase_meta_load()).
-            meta = _supabase_meta_load(sym)
-            if meta:
-                _meta_save(sym, meta)   # repopulate local cache
-        last_full = meta.get("last_full_refresh")
-        # 2026-07-15 BUG: staleness was purely time-based (last_full_refresh
-        # within _FULL_REFRESH_DAYS), with no check that the cached RANGE
-        # actually covers the `years` being requested NOW. The scanner calls
-        # this with years=1, the backtest with years=3, sharing the same
-        # per-symbol cache. If the scanner populated/refreshed a symbol
-        # recently, the backtest's request for 3 years saw it as "fresh"
-        # and only tail-fetched — permanently capping that symbol at ~1
-        # year of history regardless of what the backtest asked for. This
-        # produced backtests where qualifying trades only ever appeared in
-        # roughly the last year, no matter how low the score threshold was
-        # dropped, because there was no older data to score in the first
-        # place. Fix: treat the cache as stale if its earliest cached bar
-        # doesn't reach back to (approximately) full_start, independent of
-        # how recently it was refreshed.
-        range_insufficient = (
-            df is not None
-            and not df.empty
-            and df.index.min().date() > full_start + timedelta(days=15)
-        )
-        stale = (
-            df is None
-            or not last_full
-            or range_insufficient
-            or (today - datetime.strptime(last_full, "%Y-%m-%d").date()).days >= _FULL_REFRESH_DAYS
-        )
-
-        if stale:
-            need_full.append(sym)
-        else:
-            result[sym] = df
-            last_date = df.index.max().date()
-            tail_start = last_date + timedelta(days=1)
-            if tail_start <= today:
-                need_tail[sym] = tail_start
-
-    total_batches = (
-        (len(need_full) + _RAW_BATCH_SIZE - 1) // _RAW_BATCH_SIZE
-        + (len(need_tail) + _RAW_BATCH_SIZE - 1) // _RAW_BATCH_SIZE
-    )
-    done_batches = 0
-
-    # --- full fetches ---
-    for i in range(0, len(need_full), _RAW_BATCH_SIZE):
-        chunk = need_full[i: i + _RAW_BATCH_SIZE]
-        fetched = _raw_fetch(chunk, full_start, today)
-        for sym, df in fetched.items():
-            _meta = {"last_full_refresh": today.strftime("%Y-%m-%d")}
-            _local_save(sym, df)
-            _meta_save(sym, _meta)
-            _supabase_save(sym, df)
-            _supabase_meta_save(sym, _meta)
-            result[sym] = df
-        done_batches += 1
-        if progress_cb:
+    done = 0
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(fetch_ohlcv_range_upstox, sym, start, end): sym
+            for sym in symbols
+        }
+        for fut in as_completed(futures):
+            sym = futures[fut]
             try:
-                progress_cb(done_batches, max(total_batches, 1))
-            except Exception:
-                pass
-
-    # --- tail-only fetches (fetch once from the earliest needed tail_start,
-    #     then trim per symbol to only append rows after ITS OWN last_date) ---
-    if need_tail:
-        tail_symbols = list(need_tail.keys())
-        earliest_tail_start = min(need_tail.values())
-        for i in range(0, len(tail_symbols), _RAW_BATCH_SIZE):
-            chunk = tail_symbols[i: i + _RAW_BATCH_SIZE]
-            fetched = _raw_fetch(chunk, earliest_tail_start, today)
-            for sym in chunk:
-                new_rows = fetched.get(sym)
-                base_df = result.get(sym)
-                if new_rows is not None and not new_rows.empty and base_df is not None:
-                    merged = pd.concat([base_df, new_rows])
-                    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
-                elif base_df is not None:
-                    merged = base_df
-                else:
-                    continue
-                _local_save(sym, merged)
-                _supabase_save(sym, merged)
-                result[sym] = merged
-            done_batches += 1
+                df = fut.result()
+                if not df.empty:
+                    result[sym] = df
+            except Exception as exc:
+                logger.warning("Upstox range fetch failed for %s: %s", sym, exc)
+            done += 1
             if progress_cb:
-                try:
-                    progress_cb(done_batches, max(total_batches, 1))
-                except Exception:
-                    pass
-
-    if min_bars:
-        result = {sym: df for sym, df in result.items() if len(df) >= min_bars}
-
+                progress_cb(done, len(symbols))
     return result
+
+
+def fetch_batch_ohlcv_upstox(symbols: list, period: str = "1y", interval: str = "1d",
+                              progress_cb=None) -> dict:
+    """
+    Concurrent per-symbol fetch (there's no multi-symbol historical-candle
+    call). Mirrors fetch_batch_ohlcv()'s dict-of-DataFrames return shape so
+    it can substitute for it, or be handed to history_store as the
+    underlying source for _raw_fetch.
+    """
+    if not symbols:
+        return {}
+    if is_token_expired():
+        logger.warning("Upstox token likely expired (past 3:30 AM IST) — skipping fetch")
+        return {}
+
+    result: dict = {}
+    done = 0
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(fetch_ohlcv_upstox, sym, period, interval): sym
+            for sym in symbols
+        }
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                df = fut.result()
+                if not df.empty:
+                    result[sym] = df
+            except Exception as exc:
+                logger.warning("Upstox fetch failed for %s: %s", sym, exc)
+            done += 1
+            if progress_cb:
+                progress_cb(done, len(symbols))
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
+#  QUOTES (today's live/partial bar — historical-candle only has
+#  completed days)
+# ══════════════════════════════════════════════════════════════════
+
+def fetch_ltp(symbol: str) -> float | None:
+    headers = _auth_headers()
+    instrument_key = resolve_instrument_key(symbol)
+    if headers is None or instrument_key is None:
+        return None
+    resp = requests.get(f"{BASE_URL}/v3/market-quote/ltp", headers=headers,
+                         params={"instrument_key": instrument_key}, timeout=10)
+    if resp.status_code != 200:
+        return None
+    data = resp.json().get("data", {})
+    if not data:
+        return None
+    return next(iter(data.values())).get("last_price")
+
+
+def fetch_today_ohlc(symbol: str) -> dict | None:
+    """Today's (possibly partial) OHLC via the full quotes endpoint —
+    use this to patch the last row the same way scanner_engine's
+    _patch_live_prices() does for the yfinance path. LTP alone only
+    gives close, not the day's open/high/low."""
+    headers = _auth_headers()
+    instrument_key = resolve_instrument_key(symbol)
+    if headers is None or instrument_key is None:
+        return None
+    resp = requests.get(f"{BASE_URL}/v2/market-quote/quotes", headers=headers,
+                         params={"instrument_key": instrument_key}, timeout=10)
+    if resp.status_code != 200:
+        return None
+    data = resp.json().get("data", {})
+    if not data:
+        return None
+    quote = next(iter(data.values()))
+    ohlc = quote.get("ohlc", {})
+    if not ohlc:
+        return None
+    return {
+        "date":   date.today(),
+        "open":   ohlc.get("open"),
+        "high":   ohlc.get("high"),
+        "low":    ohlc.get("low"),
+        "close":  quote.get("last_price", ohlc.get("close")),
+        "volume": quote.get("volume"),
+    }
