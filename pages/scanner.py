@@ -1889,6 +1889,7 @@ def _market_overview_panel(summary: dict, breadth: dict,
     # ── Sensex chip (next to the NIFTY 50 label) ─────────────────
     sx_price   = sensex_snapshot.get("price", 0.0)
     sx_pct_chg = sensex_snapshot.get("pct_chg")
+    sx_source  = sensex_snapshot.get("source", "upstox")
     if sx_price:
         sx_price_str = f"{sx_price:,.0f}"
         if sx_pct_chg is not None:
@@ -1899,11 +1900,15 @@ def _market_overview_panel(summary: dict, breadth: dict,
                            f'{"+" if sx_up else ""}{sx_pct_chg:.2f}%</span>')
         else:
             sx_pct_str = '<span style="color:var(--muted)">—</span>'
+        sx_delayed_str = (
+            ' <span class="mo-oi-sub" title="Upstox token missing/expired — showing yfinance\'s delayed feed instead">(delayed)</span>'
+            if sx_source == "yfinance" else ""
+        )
         sensex_chip_html = (
             '<span class="mo-sensex-chip">'
             '<span class="mo-sensex-name">SENSEX</span>'
             f'<span class="mo-sensex-ltp">{sx_price_str}</span>'
-            f'{sx_pct_str}'
+            f'{sx_pct_str}{sx_delayed_str}'
             '</span>'
         )
     else:
@@ -3464,12 +3469,25 @@ def render(settings: dict | None = None):
         except Exception:
             pass
 
-        # Sensex snapshot for the chip shown next to NIFTY 50 in the same card
+        # Sensex snapshot for the chip shown next to NIFTY 50 in the same card.
+        # Upstox first — it's a live quote, unlike yfinance's ~15-min-delayed
+        # index feed. Falls back to yfinance only if the Upstox token is
+        # missing/expired or the request itself fails.
         try:
-            from utils.scanner_engine import fetch_sensex_intraday_snapshot
-            st.session_state["sensex_snapshot"] = fetch_sensex_intraday_snapshot()
+            from utils.upstox_client import fetch_index_quote
+            _sx = fetch_index_quote("SENSEX")
+            if _sx is not None:
+                _sx["source"] = "upstox"
         except Exception:
-            st.session_state["sensex_snapshot"] = {}
+            _sx = None
+        if _sx is None:
+            try:
+                from utils.scanner_engine import fetch_sensex_intraday_snapshot
+                _sx = fetch_sensex_intraday_snapshot()
+                _sx["source"] = "yfinance"
+            except Exception:
+                _sx = {}
+        st.session_state["sensex_snapshot"] = _sx or {}
 
         # Nearest-expiry CE/PE OI resistance (Upstox option chain) — best-effort;
         # silently absent (renders "—") if the Upstox token isn't configured.
