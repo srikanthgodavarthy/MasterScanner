@@ -60,8 +60,25 @@ _INSTRUMENT_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exc
 _PERIOD_TO_DAYS = {"3mo": 95, "6mo": 190, "1y": 375, "2y": 740, "5y": 1850}
 
 # ── throttling ───────────────────────────────────────────────────────────
-_MAX_WORKERS      = 6      # concurrent historical-candle requests
-_MIN_SPACING_S     = 0.12   # floor between request *starts*, process-wide
+# Upstox's standard (non-order) APIs — which covers historical-candle and
+# market-quote, both used here — are documented at 25 req/s, 250/min per
+# user/API (https://upstox.com/developer/api-documentation/rate-limiting/;
+# corroborated by Upstox community threads reporting the same 25/s,
+# 250/min figures for non-websocket usage). We stay well under that
+# ceiling rather than right up against it, since:
+#   (a) app.py's "Upstox Pilot Check" and pages/data_source_check.py can
+#       run concurrently with a scanner batch and share the same 25/s
+#       per-user budget — not per-process — so headroom matters more
+#       than squeezing out max throughput;
+#   (b) 429 backoff cost (_RETRY_BASE_S * 2^attempt) is much more
+#       expensive than the marginal time saved by racing closer to 25/s.
+# 12 workers at a 50ms floor between request *starts* caps sustained
+# throughput at 20/s — 80% of the documented limit — while previously
+# 6 workers / 120ms floor capped it at just over 8/s, far below what the
+# account is actually allowed. If you're on a plan with different limits,
+# adjust these two numbers; nothing else needs to change.
+_MAX_WORKERS      = 12     # concurrent historical-candle / quote requests
+_MIN_SPACING_S     = 0.05   # floor between request *starts*, process-wide (~20 req/s)
 _MAX_RETRIES       = 3
 _RETRY_BASE_S      = 1.5
 

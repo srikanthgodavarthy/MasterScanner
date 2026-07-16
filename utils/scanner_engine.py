@@ -561,8 +561,24 @@ def _fetch_live_prices_upstox(symbols: tuple) -> dict:
     return fetch_batch_today_ohlc_upstox(list(symbols))
 
 
+# Upstox has no multi-symbol quotes call, so patching today's live bar
+# costs one extra throttled request per symbol on top of the historical
+# fetch — doubling the request count for a full-universe scan. Past this
+# many stale symbols, skip the Upstox live patch and rely on the last
+# cached daily bar instead; yfinance's live patch has no such cap since
+# a batch yf.download() covers any number of symbols in one call.
+_UPSTOX_LIVE_PATCH_MAX_SYMBOLS = 60
+
+
 def _fetch_live_prices_for_source(symbols: tuple, source: str) -> dict:
     if source == "upstox":
+        if len(symbols) > _UPSTOX_LIVE_PATCH_MAX_SYMBOLS:
+            _log.info(
+                "Skipping Upstox live-price patch for %d symbols (cap is %d) — "
+                "falling back to last cached daily bar for this run.",
+                len(symbols), _UPSTOX_LIVE_PATCH_MAX_SYMBOLS,
+            )
+            return {}
         return _fetch_live_prices_upstox(symbols)
     return _fetch_live_prices(symbols)
 
@@ -1558,14 +1574,34 @@ def run_scanner(
 
     total     = len(symbols)
     n_batches = max(1, (total + _BATCH_SIZE - 1) // _BATCH_SIZE)
+    _t0       = time.monotonic()
+
+    def _report(pct: float, stage: str) -> None:
+        """Calls progress_cb(pct, text). Falls back to progress_cb(pct) for
+        callers that haven't been updated to accept the text argument, so
+        this isn't a breaking change for other run_scanner() callers."""
+        if not progress_cb:
+            return
+        elapsed = time.monotonic() - _t0
+        eta_s   = (elapsed / pct - elapsed) if pct > 0.02 else None
+        eta_txt = f", ETA ~{eta_s:.0f}s" if eta_s is not None else ""
+        throttle_note = (
+            " — Upstox throttles to ~1 symbol/worker every 50ms, this is "
+            "expected, not stuck" if effective_source == "upstox" else ""
+        )
+        text = f"{stage} — elapsed {elapsed:.0f}s{eta_txt}{throttle_note}"
+        try:
+            progress_cb(pct, text)
+        except TypeError:
+            progress_cb(pct)
 
     all_data: dict = {}
     for batch_i, start in enumerate(range(0, total, _BATCH_SIZE)):
         chunk      = tuple(symbols[start: start + _BATCH_SIZE])
         batch_data = fetch_batch_ohlcv(chunk, period="1y", interval="1d", source=effective_source)
         all_data.update(batch_data)
-        if progress_cb:
-            progress_cb(0.5 * (batch_i + 1) / n_batches)
+        pct = 0.5 * (batch_i + 1) / n_batches
+        _report(pct, f"Fetching history ({effective_source}) — batch {batch_i + 1}/{n_batches}")
 
     # ── Patch live prices (today's intraday bar) ──────────────────
     # FIX: only call the live-price fetch when today's bar is missing from
@@ -1581,6 +1617,14 @@ def run_scanner(
             if sym in all_data and all_data[sym].index[-1].normalize() < _today
         )
         if stale_syms:
+            if (effective_source == "upstox"
+                    and len(stale_syms) > _UPSTOX_LIVE_PATCH_MAX_SYMBOLS
+                    and source_warn_cb):
+                source_warn_cb(
+                    f"Skipped Upstox live-price patch for {len(stale_syms)} symbols "
+                    f"(cap is {_UPSTOX_LIVE_PATCH_MAX_SYMBOLS}) — using last cached "
+                    f"daily bar instead. Use a smaller watchlist to get live patching."
+                )
             live_prices = _fetch_live_prices_for_source(stale_syms, effective_source)
             all_data    = _patch_live_prices(all_data, live_prices)
     except Exception:
@@ -1611,8 +1655,7 @@ def run_scanner(
         futures = {exe.submit(process, s): s for s in symbols}
         for fut in as_completed(futures):
             done += 1
-            if progress_cb:
-                progress_cb(0.5 + 0.5 * done / total)
+            _report(0.5 + 0.5 * done / total, f"Scoring — {done}/{total} stocks")
             row = fut.result()
             if row:
                 results.append(row)

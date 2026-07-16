@@ -3293,8 +3293,8 @@ def render(settings: dict | None = None):
         symbols   = effective.get("symbols", NIFTY500_SYMBOLS)
         prog      = st.progress(0, text="Fetching data…")
 
-        def _cb(pct):
-            prog.progress(min(pct, 1.0), text=f"Scanning… {int(pct*100)}%")
+        def _cb(pct, text=None):
+            prog.progress(min(pct, 1.0), text=text or f"Scanning… {int(pct*100)}%")
 
         _source_warnings = []
         with st.spinner("Running scanner…"):

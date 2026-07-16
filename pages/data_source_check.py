@@ -41,6 +41,7 @@ any other get_history() caller would.
 from __future__ import annotations
 
 import sys, os
+import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
@@ -145,6 +146,58 @@ def render(settings=None):
             "token and rerun.",
             icon="⚠️",
         )
+
+    # ── Cache warming ───────────────────────────────────────────────────
+    # The comparison below only caches years=0.25 for whatever symbols you
+    # select — the Scanner requests years=1.0 for the full universe.
+    # history_store.get_history() treats a shorter cached range as stale
+    # (see the range_insufficient check), so a comparison run alone does
+    # NOT warm the cache the Scanner will actually use — every symbol
+    # still gets a full 1y re-fetch on your first Upstox scan. Run this
+    # once beforehand so that fetch is already done by the time you hit
+    # "Run Scan".
+    with st.expander("🔥 Warm Upstox cache for the Scanner (full universe, 1y)"):
+        from utils.upstox_client import _MAX_WORKERS, _MIN_SPACING_S
+        st.caption(
+            f"Fetches 1 year of daily bars for all {len(NIFTY500_SYMBOLS)} "
+            f"Nifty 500 symbols via history_store (same years=1.0 the "
+            f"Scanner uses), so the next Upstox scan is tail-only instead "
+            f"of a full re-fetch. At ~{1/_MIN_SPACING_S:.0f} req/s across "
+            f"{_MAX_WORKERS} workers, a full cold-cache run over "
+            f"{len(NIFTY500_SYMBOLS)} symbols takes roughly "
+            f"{len(NIFTY500_SYMBOLS) * _MIN_SPACING_S / 60:.1f}–"
+            f"{len(NIFTY500_SYMBOLS) * _MIN_SPACING_S * 2 / 60:.1f} min. "
+            f"Safe to re-run any time — already-warm symbols come back "
+            f"as fast tail fetches."
+        )
+        if st.button("▶ Warm cache", key="btn_warm_upstox_cache"):
+            warm_prog = st.progress(0, text="Starting…")
+            _t0 = time.monotonic()
+
+            def _warm_cb(done, total):
+                pct = done / max(total, 1)
+                elapsed = time.monotonic() - _t0
+                eta = (elapsed / pct - elapsed) if pct > 0 else 0
+                warm_prog.progress(
+                    min(pct, 1.0),
+                    text=f"Upstox batch {done}/{total} — elapsed {elapsed:.0f}s, ETA ~{eta:.0f}s",
+                )
+
+            warmed = get_history(
+                list(NIFTY500_SYMBOLS), years=1.0, min_bars=0,
+                progress_cb=_warm_cb, source="upstox",
+            )
+            warm_prog.progress(1.0, text=f"Done in {time.monotonic() - _t0:.0f}s.")
+            got = sum(1 for df in warmed.values() if df is not None and not df.empty)
+            st.success(f"Cached {got}/{len(NIFTY500_SYMBOLS)} symbols with 1y of Upstox history.")
+            if got < len(NIFTY500_SYMBOLS):
+                st.caption(
+                    f"{len(NIFTY500_SYMBOLS) - got} symbol(s) came back empty — "
+                    f"usually a symbol that doesn't resolve in the Upstox "
+                    f"instrument master, not a token problem."
+                )
+
+    st.markdown("---")
 
     with st.expander("⚙️ Symbols", expanded=True):
         symbols = st.multiselect(
