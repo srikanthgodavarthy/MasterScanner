@@ -545,44 +545,6 @@ def _fetch_live_prices(symbols: tuple) -> dict:
     return result
 
 
-@st.cache_data(ttl=30, show_spinner=False)   # 30s TTL — live price patch
-def _fetch_live_prices_upstox(symbols: tuple) -> dict:
-    """
-    Upstox counterpart to _fetch_live_prices() — same return shape
-    ({sym: {date, open, high, low, close, volume}}), so
-    _patch_live_prices() doesn't need to know which source it came from.
-    Delegates to utils.upstox_client.fetch_batch_today_ohlc_upstox(),
-    which handles the per-symbol quotes call + throttling (there's no
-    multi-symbol quotes endpoint, same constraint as historical candles).
-    """
-    if not symbols:
-        return {}
-    from utils.upstox_client import fetch_batch_today_ohlc_upstox
-    return fetch_batch_today_ohlc_upstox(list(symbols))
-
-
-# Upstox has no multi-symbol quotes call, so patching today's live bar
-# costs one extra throttled request per symbol on top of the historical
-# fetch — doubling the request count for a full-universe scan. Past this
-# many stale symbols, skip the Upstox live patch and rely on the last
-# cached daily bar instead; yfinance's live patch has no such cap since
-# a batch yf.download() covers any number of symbols in one call.
-_UPSTOX_LIVE_PATCH_MAX_SYMBOLS = 60
-
-
-def _fetch_live_prices_for_source(symbols: tuple, source: str) -> dict:
-    if source == "upstox":
-        if len(symbols) > _UPSTOX_LIVE_PATCH_MAX_SYMBOLS:
-            _log.info(
-                "Skipping Upstox live-price patch for %d symbols (cap is %d) — "
-                "falling back to last cached daily bar for this run.",
-                len(symbols), _UPSTOX_LIVE_PATCH_MAX_SYMBOLS,
-            )
-            return {}
-        return _fetch_live_prices_upstox(symbols)
-    return _fetch_live_prices(symbols)
-
-
 def _patch_live_prices(data: dict, live: dict) -> dict:
     """
     Overwrite the last row of each symbol's OHLCV DataFrame with the live bar.
@@ -627,23 +589,40 @@ _PERIOD_TO_YEARS = {"3mo": 0.25, "6mo": 0.5, "1y": 1.0, "2y": 2.0, "5y": 5.0}
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d",
-                       source: str = "yfinance") -> dict:
+def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") -> dict:
     """
-    2026-07-15: now routed through utils.history_store — local Parquet +
-    Supabase Storage cache with live-tail fetching, instead of a fresh
-    yf.download() over the full `period` on every call. `interval` is
-    assumed daily; history_store doesn't support intraday caching.
-
-    2026-07-16: added `source` passthrough ("yfinance" | "upstox") so
-    callers can route through Upstox instead of the yfinance default —
-    see utils.history_store.get_history's SOURCE-AWARE CACHING note.
+    2026-07-16: reverted off utils.history_store. The Supabase Storage tier
+    started timing out on every symbol (15s cap hit consistently, not just
+    occasionally), so the "cache" was strictly slower than a plain fetch —
+    every call paid the full local+Supabase round trip AND still fell
+    through to network. Back to a direct yf_download_with_retry() call per
+    batch (retry/backoff kept — that part was a real fix, not part of the
+    caching layer). history_store.py itself is untouched in case Supabase
+    Storage gets sorted out and this is worth revisiting later.
     """
     if not symbols:
         return {}
-    from utils.history_store import get_history
-    years = _PERIOD_TO_YEARS.get(period, 1.0)
-    return get_history(list(symbols), years=years, min_bars=60, source=source)
+    tickers = [f"{s}.NS" for s in symbols]
+    raw = yf_download_with_retry(
+        tickers, period=period, interval=interval,
+        auto_adjust=True, group_by="ticker", threads=True, progress=False,
+    )
+    if raw.empty:
+        return {}
+    result = {}
+    single = len(tickers) == 1
+    for sym, ticker in zip(symbols, tickers):
+        try:
+            df = raw if single else raw[ticker]
+            df = df.dropna(how="all")
+            if df.empty or len(df) < 60:
+                continue
+            df.index   = _strip_tz(pd.to_datetime(df.index))
+            df.columns = [c.lower() for c in df.columns]
+            result[sym] = df[["open", "high", "low", "close", "volume"]]
+        except Exception:
+            continue
+    return result
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_nifty(period: str = "1y") -> pd.Series:
@@ -1541,74 +1520,27 @@ def run_scanner(
     cci_os:      int  = -100,
     max_workers: int  = 10,
     progress_cb       = None,
-    source:      str  = "yfinance",
-    source_warn_cb    = None,
 ) -> pd.DataFrame:
     """
     Two-phase scanner.
     Nifty regime is computed once here from live data, then injected into
     the settings dict so every score_stock() call uses the same value
     without redundant per-stock computation.
-
-    source: "yfinance" (default) or "upstox". If "upstox" is requested but
-    there's no token or it looks expired, this silently falls back to
-    "yfinance" for the run rather than returning an empty scan (see
-    utils.upstox_client.is_token_expired's fix note — previously that
-    check was wrong ~around the clock, which is a separate bug; this
-    fallback exists regardless, since a dead/missing token is a real
-    possibility any day). source_warn_cb(msg), if given, is called with a
-    human-readable reason when the fallback happens, so the caller can
-    surface it in the UI instead of it failing silently.
     """
-    effective_source = source
-    if source == "upstox":
-        from utils.upstox_client import get_upstox_token, is_token_expired
-        if not get_upstox_token():
-            effective_source = "yfinance"
-            if source_warn_cb:
-                source_warn_cb("No Upstox token found — falling back to Yahoo Finance for this run.")
-        elif is_token_expired():
-            effective_source = "yfinance"
-            if source_warn_cb:
-                source_warn_cb("Upstox token looks expired — falling back to Yahoo Finance for this run.")
-
     total     = len(symbols)
     n_batches = max(1, (total + _BATCH_SIZE - 1) // _BATCH_SIZE)
-    _t0       = time.monotonic()
-
-    def _report(pct: float, stage: str) -> None:
-        """Calls progress_cb(pct, text). Falls back to progress_cb(pct) for
-        callers that haven't been updated to accept the text argument, so
-        this isn't a breaking change for other run_scanner() callers."""
-        if not progress_cb:
-            return
-        elapsed = time.monotonic() - _t0
-        eta_s   = (elapsed / pct - elapsed) if pct > 0.02 else None
-        eta_txt = f", ETA ~{eta_s:.0f}s" if eta_s is not None else ""
-        throttle_note = (
-            " — Upstox throttles to ~1 symbol/worker every 50ms, this is "
-            "expected, not stuck" if effective_source == "upstox" else ""
-        )
-        text = f"{stage} — elapsed {elapsed:.0f}s{eta_txt}{throttle_note}"
-        try:
-            progress_cb(pct, text)
-        except TypeError:
-            progress_cb(pct)
 
     all_data: dict = {}
     for batch_i, start in enumerate(range(0, total, _BATCH_SIZE)):
         chunk      = tuple(symbols[start: start + _BATCH_SIZE])
-        batch_data = fetch_batch_ohlcv(chunk, period="1y", interval="1d", source=effective_source)
+        batch_data = fetch_batch_ohlcv(chunk, period="1y", interval="1d")
         all_data.update(batch_data)
-        pct = 0.5 * (batch_i + 1) / n_batches
-        _report(pct, f"Fetching history ({effective_source}) — batch {batch_i + 1}/{n_batches}")
+        if progress_cb:
+            progress_cb(0.5 * (batch_i + 1) / n_batches)
 
     # ── Patch live prices (today's intraday bar) ──────────────────
-    # FIX: only call the live-price fetch when today's bar is missing from
-    # the batch download (avoids a duplicate 500-symbol fetch on most runs).
-    # Uses effective_source so an Upstox scan gets its live patch from
-    # Upstox quotes too, instead of silently falling back to yfinance here
-    # after correctly routing the historical fetch through Upstox above.
+    # FIX: only call _fetch_live_prices when today's bar is missing from the
+    # batch download (avoids a duplicate 500-symbol yf.download on most runs).
     try:
         from datetime import date as _date
         _today = pd.Timestamp(_date.today())
@@ -1617,15 +1549,7 @@ def run_scanner(
             if sym in all_data and all_data[sym].index[-1].normalize() < _today
         )
         if stale_syms:
-            if (effective_source == "upstox"
-                    and len(stale_syms) > _UPSTOX_LIVE_PATCH_MAX_SYMBOLS
-                    and source_warn_cb):
-                source_warn_cb(
-                    f"Skipped Upstox live-price patch for {len(stale_syms)} symbols "
-                    f"(cap is {_UPSTOX_LIVE_PATCH_MAX_SYMBOLS}) — using last cached "
-                    f"daily bar instead. Use a smaller watchlist to get live patching."
-                )
-            live_prices = _fetch_live_prices_for_source(stale_syms, effective_source)
+            live_prices = _fetch_live_prices(stale_syms)
             all_data    = _patch_live_prices(all_data, live_prices)
     except Exception:
         pass   # non-fatal — fall back to cached OHLCV
@@ -1655,7 +1579,8 @@ def run_scanner(
         futures = {exe.submit(process, s): s for s in symbols}
         for fut in as_completed(futures):
             done += 1
-            _report(0.5 + 0.5 * done / total, f"Scoring — {done}/{total} stocks")
+            if progress_cb:
+                progress_cb(0.5 + 0.5 * done / total)
             row = fut.result()
             if row:
                 results.append(row)
