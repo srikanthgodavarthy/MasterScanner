@@ -555,8 +555,8 @@ _INDEX_INSTRUMENT_KEYS = {
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_index_quote(index: str = "SENSEX") -> dict | None:
     """
-    Real-time LTP + day % change for an index ("NIFTY" or "SENSEX") via
-    Upstox's full market-quote endpoint (GET /v2/market-quote/quotes) —
+    Real-time LTP + day % change + OHLC for an index ("NIFTY" or "SENSEX")
+    via Upstox's full market-quote endpoint (GET /v2/market-quote/quotes) —
     unlike yfinance's ~15-min-delayed index feed, this is live (subject to
     your Upstox plan's data entitlement).
 
@@ -564,11 +564,19 @@ def fetch_index_quote(index: str = "SENSEX") -> dict | None:
     the change from `ohlc.close` — for indices, `ohlc.close` is not
     reliably the previous day's close, but `last_price - net_change` is
     guaranteed to be (this mirrors how the NHPC example in Upstox's own
-    docs computes it).
+    docs computes it). `open`/`high`/`low` ARE reliable straight off
+    `ohlc` though — only `close` has that caveat.
 
-    Returns {"price": float, "pct_chg": float | None}, or None if the
-    token is missing/expired or the request fails — callers should fall
-    back to another source (e.g. yfinance) rather than show nothing.
+    2026-07-16: previously returned only {"price", "pct_chg"} — the OHLC
+    row on the index card always showed "—" for Open/High/Low/Prev. Close
+    as a result, even though the same API response already carries them
+    in the `ohlc` block. No second call needed, just reading more of what
+    was already there.
+
+    Returns {"price", "pct_chg", "open", "high", "low", "prev_close"}, or
+    None if the token is missing/expired or the request fails — callers
+    should fall back to another source (e.g. yfinance) rather than show
+    nothing.
     """
     headers = _auth_headers()
     instrument_key = _INDEX_INSTRUMENT_KEYS.get(index.upper())
@@ -596,7 +604,15 @@ def fetch_index_quote(index: str = "SENSEX") -> dict | None:
             return None
         prev_close = (last_price - net_change) if net_change is not None else None
         pct_chg    = round(net_change / prev_close * 100, 2) if prev_close else None
-        return {"price": float(last_price), "pct_chg": pct_chg}
+        ohlc       = quote.get("ohlc") or {}
+        return {
+            "price":      float(last_price),
+            "pct_chg":    pct_chg,
+            "open":       ohlc.get("open"),
+            "high":       ohlc.get("high"),
+            "low":        ohlc.get("low"),
+            "prev_close": prev_close,
+        }
     except Exception:
         logger.warning("Upstox index-quote fetch failed for %s", index, exc_info=True)
         return None
