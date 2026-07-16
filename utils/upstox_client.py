@@ -536,6 +536,115 @@ def _fetch_quotes_batch(instrument_keys: list[str]) -> dict:
     return {}
 
 
+# ══════════════════════════════════════════════════════════════════
+#  OPTION CHAIN — OI RESISTANCE (nearest expiry, CE/PE)
+# ══════════════════════════════════════════════════════════════════
+# Highest-OI strike on the Call side is the level price has struggled to
+# close above (an "OI resistance"); highest-OI strike on the Put side is
+# the level it's struggled to close below (an "OI support", though traders
+# often still say "PE resistance" loosely). We surface both, labelled by
+# leg, and let the Market Overview panel decide how to phrase it.
+
+_INDEX_INSTRUMENT_KEYS = {
+    "NIFTY":  "NSE_INDEX|Nifty 50",
+    "SENSEX": "BSE_INDEX|SENSEX",
+}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_nearest_expiry(index: str = "NIFTY") -> str | None:
+    """
+    Return the nearest upcoming options expiry ("YYYY-MM-DD") for `index`
+    ("NIFTY" or "SENSEX"), via Upstox's option-contracts endpoint:
+      GET /v2/option/contract?instrument_key=...
+    Returns None if the token is missing/expired or the request fails.
+    """
+    headers = _auth_headers()
+    instrument_key = _INDEX_INSTRUMENT_KEYS.get(index.upper())
+    if headers is None or instrument_key is None:
+        return None
+
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/v2/option/contract",
+            headers=headers,
+            params={"instrument_key": instrument_key},
+            timeout=10,
+        )
+        if resp.status_code == 401:
+            logger.warning("Upstox 401 on option-contract for %s — token expired or invalid", index)
+            return None
+        resp.raise_for_status()
+        contracts = resp.json().get("data", [])
+        expiries = sorted({c["expiry"] for c in contracts if c.get("expiry")})
+        if not expiries:
+            return None
+        today_str = date.today().isoformat()
+        upcoming = [e for e in expiries if e >= today_str]
+        return upcoming[0] if upcoming else expiries[-1]
+    except Exception:
+        logger.warning("Upstox option-contract fetch failed for %s", index, exc_info=True)
+        return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
+    """
+    Return the nearest-expiry Call/Put OI resistance levels for `index`
+    ("NIFTY" or "SENSEX") via Upstox's option-chain endpoint:
+      GET /v2/option/chain?instrument_key=...&expiry_date=...
+
+    {
+      "expiry":    "2026-07-24",
+      "ce_strike": 25400.0, "ce_oi": 8123450,   # highest-OI Call strike
+      "pe_strike": 24800.0, "pe_oi": 7543210,   # highest-OI Put strike
+    }
+
+    Returns None on any failure (missing/expired token, empty chain, etc.)
+    — callers should render a "—" placeholder rather than crash the panel.
+    """
+    headers = _auth_headers()
+    instrument_key = _INDEX_INSTRUMENT_KEYS.get(index.upper())
+    if headers is None or instrument_key is None or is_token_expired():
+        return None
+
+    expiry = fetch_nearest_expiry(index)
+    if not expiry:
+        return None
+
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/v2/option/chain",
+            headers=headers,
+            params={"instrument_key": instrument_key, "expiry_date": expiry},
+            timeout=15,
+        )
+        if resp.status_code == 401:
+            logger.warning("Upstox 401 on option-chain for %s — token expired or invalid", index)
+            return None
+        resp.raise_for_status()
+        chain = resp.json().get("data", [])
+        if not chain:
+            return None
+
+        def _oi(row: dict, leg: str) -> float:
+            return ((row.get(leg) or {}).get("market_data") or {}).get("oi", 0) or 0
+
+        best_ce = max(chain, key=lambda r: _oi(r, "call_options"))
+        best_pe = max(chain, key=lambda r: _oi(r, "put_options"))
+
+        return {
+            "expiry":    expiry,
+            "ce_strike": best_ce.get("strike_price"),
+            "ce_oi":     _oi(best_ce, "call_options"),
+            "pe_strike": best_pe.get("strike_price"),
+            "pe_oi":     _oi(best_pe, "put_options"),
+        }
+    except Exception:
+        logger.warning("Upstox option-chain fetch failed for %s", index, exc_info=True)
+        return None
+
+
 def fetch_batch_today_ohlc_upstox(symbols: list) -> dict:
     """
     Today's (possibly partial) OHLC for many symbols via Upstox's batched
