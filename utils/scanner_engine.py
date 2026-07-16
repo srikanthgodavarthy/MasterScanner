@@ -669,6 +669,55 @@ def fetch_nifty_ohlcv(period: str = "1y") -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def compute_ema_levels(series: pd.Series) -> dict:
+    """
+    Given a daily close-price series (chronological, most-recent last),
+    compute EMA20/EMA50/EMA200 and whether the latest close trades above
+    each — feeds the small EMA badge row on each Market Overview index
+    card (mo-index-ema-row).
+
+    {"ema20": float, "above_ema20": bool,
+     "ema50": float, "above_ema50": bool,
+     "ema200": float, "above_ema200": bool}
+
+    A span is simply omitted (not backfilled with a misleading value) if
+    there isn't enough history for it yet — e.g. a freshly-listed index
+    or a short lookback would omit "ema200" but still show ema20/ema50.
+    Returns {} if the series is empty/too short for even EMA20.
+    """
+    if series is None or len(series) < 5:
+        return {}
+    s = series.dropna()
+    if s.empty:
+        return {}
+    last_price = float(s.iloc[-1])
+    out: dict = {}
+    for span, key in ((20, "ema20"), (50, "ema50"), (200, "ema200")):
+        if len(s) >= span:
+            ema_val = float(s.ewm(span=span, adjust=False).mean().iloc[-1])
+            out[key] = ema_val
+            out[f"above_{key}"] = last_price >= ema_val
+    return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_sensex_ema_levels() -> dict:
+    """
+    EMA20/EMA50/EMA200 for BSE Sensex (^BSESN), via compute_ema_levels().
+    Sensex isn't part of the regime-calc series like Nifty is (that one's
+    reused straight from fetch_nifty()), so this does its own 1y daily
+    fetch. Cached for 5 minutes since these only move with each new daily
+    close, not intraday. Returns {} on fetch failure.
+    """
+    try:
+        daily = yf.Ticker("^BSESN").history(period="1y", interval="1d", auto_adjust=True)
+        if daily.empty:
+            return {}
+        return compute_ema_levels(daily["Close"])
+    except Exception:
+        return {}
+
+
 def fetch_nifty_intraday_snapshot() -> dict:
     """
     Return today's Nifty 50 (^NSEI) snapshot for the Market Overview panel's
