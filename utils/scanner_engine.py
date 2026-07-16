@@ -1644,6 +1644,29 @@ def score_stock(
 
 _BATCH_SIZE = 150
 
+
+def _missing_today_bar(data: dict, symbols) -> tuple:
+    """
+    Single authoritative definition of "does this symbol's cached history
+    already include a bar dated today". This used to be inlined inside
+    run_scanner() as a one-off list comprehension; pulled out so that
+    history_store.update_live_cache() (which needs to know exactly which
+    symbols were live-patched, to scope its background parquet flush) can
+    reuse the identical check rather than a second, potentially-diverging
+    copy of it. This is a distinct question from
+    history_store.get_history()'s own staleness check (does the cached
+    EOD history need a NETWORK re-fetch, e.g. due to age or a corporate
+    action) — that one is owned entirely by history_store.py and is
+    untouched by this function.
+    """
+    from datetime import date as _date
+    today = pd.Timestamp(_date.today())
+    return tuple(
+        sym for sym in symbols
+        if sym in data and data[sym].index[-1].normalize() < today
+    )
+
+
 def run_scanner(
     symbols:     list,
     settings:    dict | None = None,
@@ -1687,16 +1710,28 @@ def run_scanner(
     n_batches = max(1, (total + _BATCH_SIZE - 1) // _BATCH_SIZE)
     fetch_source = "upstox" if use_upstox else "yfinance"
 
+    # 2026-07-16: fetch_batch_ohlcv() (st.cache_data(ttl=60) over
+    # get_history()) replaced with history_store.get_live_history_cached()
+    # here — a RAM-resident cache that only calls get_history() (i.e. only
+    # touches disk) once per process per calendar day in the common case,
+    # instead of on every ~60s TTL miss for the whole universe. See
+    # history_store.py's "LIVE (RAM) CACHE FOR THE SCANNER" section.
+    # get_history() itself, and every other caller of it (backtest_engine,
+    # cci_master_engine, fetch_batch_ohlcv), is unaffected.
+    from utils.history_store import get_live_history_cached, update_live_cache
+
     all_data: dict = {}
+    fallback_syms: set = set()   # symbols served via yfinance fallback during an upstox scan
     for batch_i, start in enumerate(range(0, total, _BATCH_SIZE)):
         chunk      = tuple(symbols[start: start + _BATCH_SIZE])
-        batch_data = fetch_batch_ohlcv(chunk, period="1y", interval="1d", source=fetch_source)
+        batch_data = get_live_history_cached(list(chunk), years=1.0, min_bars=60, source=fetch_source)
         if use_upstox:
             missing = [s for s in chunk if s not in batch_data]
             if missing:
-                fallback = fetch_batch_ohlcv(tuple(missing), period="1y", interval="1d", source="yfinance")
+                fallback = get_live_history_cached(list(missing), years=1.0, min_bars=60, source="yfinance")
                 if fallback:
                     _warn(f"Upstox had no data for {len(fallback)} symbol(s) this batch — used Yahoo Finance instead.")
+                    fallback_syms.update(fallback.keys())
                 batch_data.update(fallback)
         all_data.update(batch_data)
         if progress_cb:
@@ -1706,12 +1741,7 @@ def run_scanner(
     # FIX: only call _fetch_live_prices when today's bar is missing from the
     # batch download (avoids a duplicate 500-symbol yf.download on most runs).
     try:
-        from datetime import date as _date
-        _today = pd.Timestamp(_date.today())
-        stale_syms = tuple(
-            sym for sym in symbols
-            if sym in all_data and all_data[sym].index[-1].normalize() < _today
-        )
+        stale_syms = _missing_today_bar(all_data, symbols)
         if stale_syms:
             if use_upstox:
                 from utils.upstox_client import fetch_batch_today_ohlc_upstox
@@ -1722,6 +1752,21 @@ def run_scanner(
             else:
                 live_prices = _fetch_live_prices(stale_syms)
             all_data    = _patch_live_prices(all_data, live_prices)
+
+            # Persist the live-patched bars back into the RAM cache so a
+            # later scan THIS SESSION doesn't need to re-patch symbols that
+            # already have today's bar, and schedule a background parquet
+            # flush for just the changed symbols. Split by actual source —
+            # symbols served via the yfinance fallback above must land in
+            # the yfinance RAM/disk bucket, never the upstox one (mixing
+            # adjusted/unadjusted closes would corrupt the tail-merge; see
+            # history_store.py's module docstring).
+            primary_syms = tuple(s for s in stale_syms if s not in fallback_syms)
+            fb_syms      = tuple(s for s in stale_syms if s in fallback_syms)
+            if primary_syms:
+                update_live_cache(fetch_source, all_data, primary_syms)
+            if fb_syms:
+                update_live_cache("yfinance", all_data, fb_syms)
     except Exception:
         pass   # non-fatal — fall back to cached OHLCV
 
