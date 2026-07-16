@@ -27,6 +27,7 @@ from utils.scanner_engine import NIFTY500_SYMBOLS
 DEFAULTS = {
     "universe_mode":     "Nifty 500 (default)",
     "custom_symbols":    [],
+    "data_source":       "yfinance",
     "workers":           15,
     "hold_days":         20,
     "auto_refresh":      False,
@@ -838,6 +839,49 @@ def _tab_advanced() -> None:
 def _tab_system() -> None:
     supabase_ok = _is_available()
 
+    # ── Data Source ──────────────────────────────────────────────
+    # Which OHLCV provider the Scanner/Backtest history fetch (see
+    # utils/history_store.get_history) uses. "upstox" requires
+    # UPSTOX_ACCESS_TOKEN in secrets/.env — see utils/upstox_client.py.
+    # Each source has its own on-disk + Supabase cache namespace, so
+    # switching sources here does not invalidate anything already
+    # cached under the other source.
+    _label("Data Source")
+    _SOURCE_OPTIONS = {
+        "yfinance": "📈 Yahoo Finance (adjusted close, default)",
+        "upstox":   "🟠 Upstox (unadjusted close, needs daily token)",
+    }
+    _cur_source = _g("data_source", "yfinance")
+    _source_choice = st.selectbox(
+        "Data Source",
+        options=list(_SOURCE_OPTIONS.keys()),
+        format_func=lambda k: _SOURCE_OPTIONS[k],
+        index=list(_SOURCE_OPTIONS.keys()).index(_cur_source) if _cur_source in _SOURCE_OPTIONS else 0,
+        key="w_data_source",
+        label_visibility="collapsed",
+    )
+    _s("data_source", _source_choice)
+    if _source_choice == "upstox":
+        from utils.upstox_client import get_upstox_token, is_token_expired
+        if not get_upstox_token():
+            st.error(
+                "No UPSTOX_ACCESS_TOKEN found in secrets/.env. The Scanner "
+                "will fall back to Yahoo Finance for this run."
+            )
+        elif is_token_expired():
+            st.warning(
+                "Upstox token looks expired (past its 3:30 AM IST cutoff). "
+                "Re-auth on the Data Source Check page, or the Scanner will "
+                "fall back to Yahoo Finance for this run."
+            )
+        else:
+            st.caption("Upstox token OK.")
+    st.caption(
+        "Which provider Scanner/Backtest pull daily candles from. Upstox "
+        "gives unadjusted closes and needs a fresh token every day — see "
+        "the Data Source Check page to verify before switching."
+    )
+
     # ── Default Backtest Engine ───────────────────────────────────
     # Persists which signal source the Backtest page opens with. The
     # Backtest page's own selector still allows a per-run override —
@@ -1002,6 +1046,7 @@ def render() -> dict:
         "min_risk_reward":     ss.get("min_risk_reward",     _TRADING_STYLE_DEFAULTS["min_risk_reward"]),
         "conviction_level":    ss.get("conviction_level",    _TRADING_STYLE_DEFAULTS["conviction_level"]),
         "symbols":             ss.get("symbols",             NIFTY500_SYMBOLS),
+        "data_source":         ss.get("data_source",         DEFAULTS["data_source"]),
         "cci_len":             ss.get("cci_len",             DEFAULTS["cci_len"]),
         "cci_ob":              ss.get("cci_ob",              DEFAULTS["cci_ob"]),
         "cci_os":              ss.get("cci_os",              DEFAULTS["cci_os"]),
