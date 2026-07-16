@@ -124,6 +124,7 @@ CACHE_DIR = Path(".ms_history_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 HISTORY_BUCKET = "history-cache"
+_SUPABASE_ENABLED  = False  # see _supabase_storage() docstring — timing out consistently
 _FULL_REFRESH_DAYS = 7      # see REFRESH NOTE above
 _RAW_BATCH_SIZE    = 50     # symbols per yf.download() call — matches the
                             # existing _BT_BATCH_SIZE convention
@@ -235,7 +236,20 @@ def _ensure_bucket(client) -> bool:
 
 
 def _supabase_storage():
-    """Returns the storage bucket handle, or None if unavailable for any reason."""
+    """
+    Returns the storage bucket handle, or None if unavailable for any reason.
+
+    2026-07-16: DISABLED. Every Storage call was hitting the 15s timeout
+    consistently (not just occasionally) for this project, making the
+    "cache" strictly slower than a plain network fetch — the round trip to
+    Supabase timed out AND a fetch still had to happen. Short-circuiting
+    here keeps the local parquet tier (same-session caching, no network)
+    fully working while removing Supabase from the path entirely — no
+    calls, no timeouts, no log spam. Flip _SUPABASE_ENABLED back on if the
+    project's connectivity gets sorted out.
+    """
+    if not _SUPABASE_ENABLED:
+        return None
     try:
         from utils.supabase_client import get_client
         client = get_client()
