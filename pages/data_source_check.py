@@ -277,58 +277,68 @@ def render(settings=None):
         )
 
     run = st.button("▶ Run Comparison", key="btn_run_dsc")
-    if not run:
-        st.info("Select symbols above and click **▶ Run Comparison**.")
-        return
-    if not symbols:
+    if run and not symbols:
         st.error("Select at least one symbol.")
-        return
+    elif run:
+        prog = st.progress(0, text="Starting…")
 
-    prog = st.progress(0, text="Starting…")
+        def _yf_prog(done, total):
+            prog.progress(min(0.05 + 0.45 * (done / max(total, 1)), 0.5),
+                           text=f"yfinance via history_store… batch {done}/{total}")
 
-    def _yf_prog(done, total):
-        prog.progress(min(0.05 + 0.45 * (done / max(total, 1)), 0.5),
-                       text=f"yfinance via history_store… batch {done}/{total}")
+        def _ux_prog(done, total):
+            prog.progress(min(0.5 + 0.45 * (done / max(total, 1)), 0.95),
+                           text=f"upstox via history_store… batch {done}/{total}")
 
-    def _ux_prog(done, total):
-        prog.progress(min(0.5 + 0.45 * (done / max(total, 1)), 0.95),
-                       text=f"upstox via history_store… batch {done}/{total}")
+        yf_data = get_history(symbols, years=0.25, min_bars=0, progress_cb=_yf_prog, source="yfinance")
+        ux_data = get_history(symbols, years=0.25, min_bars=0, progress_cb=_ux_prog, source="upstox")
+        prog.progress(1.0, text="Comparing…")
 
-    yf_data = get_history(symbols, years=0.25, min_bars=0, progress_cb=_yf_prog, source="yfinance")
-    ux_data = get_history(symbols, years=0.25, min_bars=0, progress_cb=_ux_prog, source="upstox")
-    prog.progress(1.0, text="Comparing…")
+        # NOTE: stored in session_state rather than just used inline — this
+        # section used to `return` here when the button wasn't the thing
+        # that triggered the rerun, which killed the Live/Partial-Bar
+        # section below on every rerun EXCEPT the one where this exact
+        # button was clicked (e.g. clicking "Run Live-Patch Comparison"
+        # reran the whole page with `run=False` here and bailed out before
+        # ever reaching the live section). Session state lets both
+        # sections persist independently across reruns.
+        st.session_state["dsc_results"] = [
+            _compare_one(sym, yf_data.get(sym), ux_data.get(sym)) for sym in symbols
+        ]
+        prog.empty()
 
-    results = [_compare_one(sym, yf_data.get(sym), ux_data.get(sym)) for sym in symbols]
-    prog.empty()
-
-    summary_df = pd.DataFrame([
-        {k: v for k, v in r.items() if not k.startswith("_")} for r in results
-    ])
-    st.dataframe(summary_df, width="stretch", hide_index=True)
-
-    # ── Drill into anything flagged ──────────────────────────────────────
-    flagged_syms = [r for r in results if r.get("flagged_dates")]
-    if flagged_syms:
-        st.markdown("---")
-        st.markdown("#### ⚠ Flagged symbols — detail")
-        for r in flagged_syms:
-            sym = r["symbol"]
-            with st.expander(f"{sym} — {r['flagged_dates']} date(s) over {CLOSE_TOL_PCT}%"):
-                yf_c, ux_c, flagged = r["_yf_c"], r["_ux_c"], r["_flagged"]
-                detail = pd.DataFrame({
-                    "yfinance_close": yf_c.loc[flagged.index],
-                    "upstox_close":   ux_c.loc[flagged.index],
-                    "diff_%":         flagged,
-                }).round(2)
-                st.dataframe(detail, width="stretch")
-
-                drift_note = _ratio_drift_note(sym, yf_c, ux_c)
-                if drift_note:
-                    st.warning(drift_note, icon="⚠️")
-                else:
-                    st.caption("Divergence looks like day-to-day feed noise, not a systematic adjustment.")
+    results = st.session_state.get("dsc_results")
+    if results is None:
+        st.info("Select symbols above and click **▶ Run Comparison**.")
     else:
-        st.success("✅ No symbols exceeded the close-price divergence tolerance.")
+        summary_df = pd.DataFrame([
+            {k: v for k, v in r.items() if not k.startswith("_")} for r in results
+        ])
+        st.dataframe(summary_df, width="stretch", hide_index=True)
+
+        # ── Drill into anything flagged ──────────────────────────────────
+        flagged_syms = [r for r in results if r.get("flagged_dates")]
+        if flagged_syms:
+            st.markdown("---")
+            st.markdown("#### ⚠ Flagged symbols — detail")
+            for r in flagged_syms:
+                sym = r["symbol"]
+                with st.expander(f"{sym} — {r['flagged_dates']} date(s) over {CLOSE_TOL_PCT}%"):
+                    yf_c, ux_c, flagged = r["_yf_c"], r["_ux_c"], r["_flagged"]
+                    detail = pd.DataFrame({
+                        "yfinance_close": yf_c.loc[flagged.index],
+                        "upstox_close":   ux_c.loc[flagged.index],
+                        "diff_%":         flagged,
+                    }).round(2)
+                    st.dataframe(detail, width="stretch")
+
+                    drift_note = _ratio_drift_note(sym, yf_c, ux_c)
+                    if drift_note:
+                        st.warning(drift_note, icon="⚠️")
+                    else:
+                        st.caption("Divergence looks like day-to-day feed noise, not a systematic adjustment.")
+        else:
+            st.success("✅ No symbols exceeded the close-price divergence tolerance.")
 
     st.markdown("---")
     st.markdown("### 🔴 Live/Partial-Bar Check — Upstox vs yfinance")
@@ -346,46 +356,50 @@ def render(settings=None):
         unsafe_allow_html=True,
     )
     run_live = st.button("▶ Run Live-Patch Comparison", key="btn_run_live_dsc")
-    if run_live:
-        if not symbols:
-            st.error("Select at least one symbol above.")
-        else:
-            with st.spinner(f"Fetching live/partial bar for {len(symbols)} symbol(s) from both sources…"):
-                yf_live = _fetch_live_prices(tuple(symbols))
-                ux_live = fetch_batch_today_ohlc_upstox(list(symbols)) if not is_token_expired() else {}
+    if run_live and not symbols:
+        st.error("Select at least one symbol above.")
+    elif run_live:
+        with st.spinner(f"Fetching live/partial bar for {len(symbols)} symbol(s) from both sources…"):
+            yf_live = _fetch_live_prices(tuple(symbols))
+            ux_live = fetch_batch_today_ohlc_upstox(list(symbols)) if not is_token_expired() else {}
 
-            live_results = [
-                _compare_live_one(sym, yf_live.get(sym), ux_live.get(sym))
-                for sym in symbols
-            ]
-            live_df = pd.DataFrame(live_results)
-            st.dataframe(live_df, width="stretch", hide_index=True)
+        st.session_state["dsc_live_results"] = [
+            _compare_live_one(sym, yf_live.get(sym), ux_live.get(sym))
+            for sym in symbols
+        ]
 
-            n_diverged = sum(1 for r in live_results if r["status"].startswith("⚠"))
-            n_both_empty = sum(1 for r in live_results if r["status"] == "both empty")
-            if n_diverged:
-                st.warning(
-                    f"⚠ {n_diverged}/{len(symbols)} symbol(s) show a live-bar "
-                    f"divergence or date mismatch — this is the untested path "
-                    f"that could explain %CHG / score differences between scans "
-                    f"run on the same day with different active data sources.",
-                    icon="⚠️",
-                )
-            else:
-                st.success(f"✅ Live bars agree within {LIVE_CLOSE_TOL_PCT}% for all {len(symbols)} symbol(s) right now.")
-            if n_both_empty:
-                st.caption(
-                    f"{n_both_empty} symbol(s) came back empty from both sources — "
-                    f"outside market hours, or both fetches failed."
-                )
+    live_results = st.session_state.get("dsc_live_results")
+    if live_results is None:
+        st.info("Select symbols above and click **▶ Run Live-Patch Comparison**.")
+    else:
+        live_df = pd.DataFrame(live_results)
+        st.dataframe(live_df, width="stretch", hide_index=True)
 
-            st.caption(
-                "Note: in a real scan, the live patch is only invoked when "
-                "`_build_ohlcv` sees the *historical* fetch's last bar dated "
-                "before today (`stale_syms` in scanner_engine.py). If Upstox's "
-                "historical fetch already returned a bar timestamped today "
-                "(unusual given ux_bars typically trails yf_bars — see the "
-                "comparison above), that symbol would skip the live patch "
-                "entirely and keep whatever close came from the historical "
-                "batch call, independent of what this section shows."
+        n_diverged = sum(1 for r in live_results if r["status"].startswith("⚠"))
+        n_both_empty = sum(1 for r in live_results if r["status"] == "both empty")
+        if n_diverged:
+            st.warning(
+                f"⚠ {n_diverged}/{len(live_results)} symbol(s) show a live-bar "
+                f"divergence or date mismatch — this is the untested path "
+                f"that could explain %CHG / score differences between scans "
+                f"run on the same day with different active data sources.",
+                icon="⚠️",
             )
+        else:
+            st.success(f"✅ Live bars agree within {LIVE_CLOSE_TOL_PCT}% for all {len(live_results)} symbol(s) right now.")
+        if n_both_empty:
+            st.caption(
+                f"{n_both_empty} symbol(s) came back empty from both sources — "
+                f"outside market hours, or both fetches failed."
+            )
+
+        st.caption(
+            "Note: in a real scan, the live patch is only invoked when "
+            "`_build_ohlcv` sees the *historical* fetch's last bar dated "
+            "before today (`stale_syms` in scanner_engine.py). If Upstox's "
+            "historical fetch already returned a bar timestamped today "
+            "(unusual given ux_bars typically trails yf_bars — see the "
+            "comparison above), that symbol would skip the live patch "
+            "entirely and keep whatever close came from the historical "
+            "batch call, independent of what this section shows."
+        )
