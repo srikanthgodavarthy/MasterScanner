@@ -940,7 +940,50 @@ _CSS = """
   letter-spacing: 0.05em;
   color: var(--muted);
   margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
+/* ── Sensex chip, shown next to the NIFTY 50 label ── */
+.mo-sensex-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-family: var(--mono);
+  font-weight: 700;
+  letter-spacing: normal;
+  text-transform: none;
+  background: var(--bg1, rgba(255,255,255,0.04));
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 10.5px;
+}
+.mo-sensex-chip .mo-sensex-name { color: var(--muted); font-weight: 700; }
+.mo-sensex-chip .mo-sensex-ltp  { color: var(--text); }
+/* ── OI resistance block (nearest expiry, CE/PE) ── */
+.mo-oi-row {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.mo-oi-item { text-align: left; }
+.mo-oi-label {
+  font-size: 9px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 3px;
+}
+.mo-oi-val {
+  font-size: 12.5px;
+  font-weight: 700;
+  font-family: var(--mono);
+}
+.mo-oi-sub { font-size: 9.5px; color: var(--muted); font-weight: 500; margin-left: 4px; }
 .mo-nifty-row {
   display: flex;
   align-items: flex-start;
@@ -1779,14 +1822,26 @@ def _vix_band(vix: float) -> tuple[str, str]:
 
 
 def _market_overview_panel(summary: dict, breadth: dict,
-                            nifty_snapshot: dict | None, scan_time: str) -> str:
+                            nifty_snapshot: dict | None, scan_time: str,
+                            sensex_snapshot: dict | None = None,
+                            oi_resistance: dict | None = None) -> str:
     """
     Full-width 'Market Overview' card — live Nifty price/sparkline/OHLC on
     the left, breadth + trend + EMA stats on the right, and a row of
     Regime/EMA50/EMA200/VIX/ADX gate cards underneath. Replaces the old
     _market_intelligence_panel + _market_status_row pair (2026-07 redesign).
+
+    sensex_snapshot: {"price": float, "pct_chg": float | None} — rendered as
+    a compact chip next to the NIFTY 50 label (utils.scanner_engine.
+    fetch_sensex_intraday_snapshot()).
+
+    oi_resistance: {"expiry", "ce_strike", "ce_oi", "pe_strike", "pe_oi"} —
+    nearest-expiry Call/Put OI resistance, rendered under the OHLC row
+    (utils.upstox_client.fetch_oi_resistance()). None/empty renders "—".
     """
-    nifty_snapshot = nifty_snapshot or {}
+    nifty_snapshot  = nifty_snapshot or {}
+    sensex_snapshot = sensex_snapshot or {}
+    oi_resistance   = oi_resistance or {}
     r = summary.get("regime", "RANGE")
     regime_color, _, _ = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
 
@@ -1830,6 +1885,50 @@ def _market_overview_panel(summary: dict, breadth: dict,
 
     price_str = f"{price:,.0f}" if price else "—"
     spark_svg = _nifty_spark_svg(spark_vals, spark_color)
+
+    # ── Sensex chip (next to the NIFTY 50 label) ─────────────────
+    sx_price   = sensex_snapshot.get("price", 0.0)
+    sx_pct_chg = sensex_snapshot.get("pct_chg")
+    if sx_price:
+        sx_price_str = f"{sx_price:,.0f}"
+        if sx_pct_chg is not None:
+            sx_up      = sx_pct_chg >= 0
+            sx_color   = "#3fb950" if sx_up else "#f85149"
+            sx_arrow   = "▲" if sx_up else "▼"
+            sx_pct_str = (f'<span style="color:{sx_color}">{sx_arrow} '
+                           f'{"+" if sx_up else ""}{sx_pct_chg:.2f}%</span>')
+        else:
+            sx_pct_str = '<span style="color:var(--muted)">—</span>'
+        sensex_chip_html = (
+            '<span class="mo-sensex-chip">'
+            '<span class="mo-sensex-name">SENSEX</span>'
+            f'<span class="mo-sensex-ltp">{sx_price_str}</span>'
+            f'{sx_pct_str}'
+            '</span>'
+        )
+    else:
+        sensex_chip_html = ""
+
+    # ── OI resistance (nearest expiry, CE/PE) ─────────────────────
+    ce_strike, ce_oi = oi_resistance.get("ce_strike"), oi_resistance.get("ce_oi")
+    pe_strike, pe_oi = oi_resistance.get("pe_strike"), oi_resistance.get("pe_oi")
+    oi_expiry = oi_resistance.get("expiry", "")
+
+    def _oi_item(label, strike, oi, color):
+        if strike is None:
+            val_html = '<span style="color:var(--muted)">—</span>'
+        else:
+            oi_str   = f"{oi:,.0f}" if oi else "0"
+            val_html = (f'<span style="color:{color}">{strike:,.0f}</span>'
+                        f'<span class="mo-oi-sub">OI {oi_str}</span>')
+        return (f'<div class="mo-oi-item"><div class="mo-oi-label">{label}</div>'
+                f'<div class="mo-oi-val">{val_html}</div></div>')
+
+    oi_html = (
+        _oi_item("CE OI Resistance", ce_strike, ce_oi, "#f85149") +
+        _oi_item("PE OI Resistance", pe_strike, pe_oi, "#3fb950")
+    )
+    oi_expiry_html = f"Nearest expiry: {oi_expiry}" if oi_expiry else "Nearest expiry: —"
 
     def _ohlc_item(label, val, color="var(--text)"):
         txt = f"{val:,.0f}" if val else "—"
@@ -1916,7 +2015,7 @@ def _market_overview_panel(summary: dict, breadth: dict,
   <div class="mo-title">MARKET OVERVIEW ⓘ {scan_chip}</div>
   <div class="mo-top-grid">
     <div class="mo-nifty-card">
-      <div class="mo-nifty-label">NIFTY 50</div>
+      <div class="mo-nifty-label">NIFTY 50{sensex_chip_html}</div>
       <div class="mo-nifty-row">
         <div>
           <div class="mo-nifty-price">{price_str}</div>
@@ -1925,6 +2024,8 @@ def _market_overview_panel(summary: dict, breadth: dict,
         {spark_svg}
       </div>
       <div class="mo-ohlc-row">{ohlc_html}</div>
+      <div class="mo-oi-row">{oi_html}</div>
+      <div class="mo-oi-sub" style="display:block;margin-top:4px;">{oi_expiry_html}</div>
     </div>
     <div class="mo-stats-grid">{stats_html}</div>
   </div>
@@ -3363,6 +3464,21 @@ def render(settings: dict | None = None):
         except Exception:
             pass
 
+        # Sensex snapshot for the chip shown next to NIFTY 50 in the same card
+        try:
+            from utils.scanner_engine import fetch_sensex_intraday_snapshot
+            st.session_state["sensex_snapshot"] = fetch_sensex_intraday_snapshot()
+        except Exception:
+            st.session_state["sensex_snapshot"] = {}
+
+        # Nearest-expiry CE/PE OI resistance (Upstox option chain) — best-effort;
+        # silently absent (renders "—") if the Upstox token isn't configured.
+        try:
+            from utils.upstox_client import fetch_oi_resistance
+            st.session_state["oi_resistance"] = fetch_oi_resistance("NIFTY")
+        except Exception:
+            st.session_state["oi_resistance"] = {}
+
         if supabase_ok and save_db:
             save_scan_snapshot(df_aug)
             # ── Sprint 2 / 3: persist lifecycle snapshot + transitions ──
@@ -3407,10 +3523,12 @@ def render(settings: dict | None = None):
             st.toast("Saved to Supabase.", icon="✅")
 
     # ── Display ────────────────────────────────────────────────
-    df_aug         = st.session_state.get("scan_df",       pd.DataFrame())
-    summary        = st.session_state.get("scan_summary",  {})
-    scan_time      = st.session_state.get("scan_time",     "")
-    nifty_snapshot = st.session_state.get("nifty_snapshot", {})
+    df_aug          = st.session_state.get("scan_df",       pd.DataFrame())
+    summary         = st.session_state.get("scan_summary",  {})
+    scan_time       = st.session_state.get("scan_time",     "")
+    nifty_snapshot  = st.session_state.get("nifty_snapshot", {})
+    sensex_snapshot = st.session_state.get("sensex_snapshot", {})
+    oi_resistance   = st.session_state.get("oi_resistance", {})
 
     if df_aug.empty:
         st.markdown("""
@@ -3429,7 +3547,8 @@ def render(settings: dict | None = None):
     )
 
     st.markdown(
-        _market_overview_panel(summary, breadth, nifty_snapshot, scan_time),
+        _market_overview_panel(summary, breadth, nifty_snapshot, scan_time,
+                                sensex_snapshot, oi_resistance),
         unsafe_allow_html=True,
     )
 
