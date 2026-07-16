@@ -208,6 +208,7 @@ from utils.scanner_engine import NIFTY500_SYMBOLS
 ss = st.session_state
 settings = {
     "symbols":              ss.get("symbols",              NIFTY500_SYMBOLS),
+    "data_source":          ss.get("data_source",           "yfinance"),
     "cci_len":              ss.get("cci_len",              20),
     "cci_ob":               ss.get("cci_ob",               100),
     "cci_os":               ss.get("cci_os",              -100),
