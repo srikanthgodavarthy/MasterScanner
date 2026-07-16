@@ -110,15 +110,20 @@ def _fetch_bt_nifty(years: int = 3) -> pd.Series:
         return pd.Series(dtype=float)
 
 
-def fetch_all_bt_data(symbols: list, years: int = 3, progress_cb=None) -> dict:
+def fetch_all_bt_data(symbols: list, years: int = 3, progress_cb=None,
+                       source: str = "yfinance") -> dict:
     """
     Pre-fetch all backtest data. Called ONCE before spawning workers —
     workers do dict lookups only.
 
-    2026-07-16: reverted off utils.history_store — Supabase Storage started
-    timing out (15s cap) on every symbol rather than occasionally, making
-    the cache path slower than just fetching. Back to direct batched
-    _fetch_bt_batch() calls (st.cache_data still gives same-session reuse).
+    2026-07-16: back on utils.history_store, now with Supabase disabled
+    (see history_store._supabase_storage()) instead of removed outright —
+    the Supabase round trip was the actual bottleneck, not the local
+    parquet caching. Without any cache a 500-symbol/3-year backtest
+    re-downloads everything from scratch on every run; the local tier
+    gets same-session reuse back (tail-fetch only) with zero Supabase
+    involvement. _fetch_bt_batch/_BT_BATCH_SIZE are kept below for any
+    direct callers that want the old uncached behaviour.
 
     progress_cb(batch_i, n_batches, symbols_so_far): optional, fired after
     each network batch.
@@ -126,15 +131,13 @@ def fetch_all_bt_data(symbols: list, years: int = 3, progress_cb=None) -> dict:
     seen   = set()
     unique = [s for s in symbols if not (s in seen or seen.add(s))]
 
-    result: dict = {}
-    total_batches = max(1, (len(unique) + _BT_BATCH_SIZE - 1) // _BT_BATCH_SIZE)
-    for batch_i, start in enumerate(range(0, len(unique), _BT_BATCH_SIZE)):
-        chunk = tuple(unique[start: start + _BT_BATCH_SIZE])
-        result.update(_fetch_bt_batch(chunk, years=years))
-        if progress_cb:
-            progress_cb(batch_i + 1, total_batches, len(result))
+    from utils.history_store import get_history
 
-    return result
+    def _cb(done, total):
+        if progress_cb:
+            progress_cb(done, total, done)  # symbols_so_far not tracked mid-batch here
+
+    return get_history(unique, years=float(years), min_bars=210, progress_cb=_cb, source=source)
 
 
 # ══════════════════════════════════════════════════════════════════
