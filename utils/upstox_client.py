@@ -30,11 +30,6 @@ Unlike yf.download(), Upstox's historical-candle endpoint is one instrument
 per request — there is no multi-symbol batch call. fetch_batch_ohlcv_upstox()
 throttles + retries per symbol; tune _MAX_WORKERS / _MIN_SPACING_S if you hit
 429s at your Upstox plan's rate limit.
-
-The market-quote endpoints (LTP/OHLC/full quotes) are different: Upstox
-supports up to 500 instrument_keys per request as a comma-separated list.
-fetch_batch_today_ohlc_upstox() uses that batched form (2026-07-16), not
-the throttled per-symbol pattern — see _fetch_quotes_batch() below.
 """
 
 from __future__ import annotations
@@ -472,274 +467,17 @@ def fetch_today_ohlc(symbol: str) -> dict | None:
     return None
 
 
-_QUOTE_BATCH_SIZE = 500  # Upstox's documented max instrument_keys per /v2/market-quote/quotes call
-
-
-def _fetch_quotes_batch(instrument_keys: list[str]) -> dict:
-    """
-    One HTTP call for up to _QUOTE_BATCH_SIZE instrument_keys via the full
-    quotes endpoint — a comma-separated instrument_key list, NOT one
-    request per instrument. Confirmed against Upstox's docs: /v2/market-
-    quote/quotes (like /ltp and /ohlc) accepts up to 500 instrument_keys
-    per call (https://upstox.com/developer/api-documentation/
-    get-full-market-quote/). This does NOT apply to the historical-candle
-    endpoint, which genuinely is one-instrument-per-request — see
-    _fetch_candles() above.
-
-    Returns {instrument_key: quote_dict} for whatever came back; fail-soft
-    (empty dict) on any error, matching the rest of this module's contract.
-    """
-    headers = _auth_headers()
-    if headers is None or not instrument_keys:
-        return {}
-
-    last_exc = None
-    for attempt in range(1, _MAX_RETRIES + 1):
-        _wait_for_spacing()
-        try:
-            resp = requests.get(
-                f"{BASE_URL}/v2/market-quote/quotes",
-                headers=headers,
-                params={"instrument_key": ",".join(instrument_keys)},
-                timeout=15,
-            )
-            if resp.status_code == 429:
-                backoff = _RETRY_BASE_S * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
-                logger.warning(
-                    "Upstox rate-limited on batch quote (%d instruments), retrying in %.1fs",
-                    len(instrument_keys), backoff,
-                )
-                time.sleep(backoff)
-                continue
-            if resp.status_code == 401:
-                logger.warning("Upstox 401 on batch quote — token expired or invalid")
-                return {}
-            resp.raise_for_status()
-            data = resp.json().get("data", {})
-            # Re-key by instrument_token (e.g. "NSE_EQ|INE848E01016") rather
-            # than the response dict's own keys (observed as "EXCHANGE:
-            # SYMBOL", e.g. "NSE_EQ:NHPC") — instrument_token is already in
-            # every quote payload and matches resolve_instrument_key()'s
-            # output format exactly, so mapping back to our symbol list is
-            # unambiguous regardless of how Upstox formats the outer keys.
-            return {
-                q["instrument_token"]: q
-                for q in data.values()
-                if isinstance(q, dict) and q.get("instrument_token")
-            }
-        except Exception as exc:
-            last_exc = exc
-            time.sleep(_RETRY_BASE_S * attempt)
-
-    logger.warning("Upstox batch quote failed for %d instruments after %d attempts: %s",
-                    len(instrument_keys), _MAX_RETRIES, last_exc)
-    return {}
-
-
-# ══════════════════════════════════════════════════════════════════
-#  OPTION CHAIN — OI RESISTANCE (nearest expiry, CE/PE)
-# ══════════════════════════════════════════════════════════════════
-# Highest-OI strike on the Call side is the level price has struggled to
-# close above (an "OI resistance"); highest-OI strike on the Put side is
-# the level it's struggled to close below (an "OI support", though traders
-# often still say "PE resistance" loosely). We surface both, labelled by
-# leg, and let the Market Overview panel decide how to phrase it.
-
-_INDEX_INSTRUMENT_KEYS = {
-    "NIFTY":     "NSE_INDEX|Nifty 50",
-    "SENSEX":    "BSE_INDEX|SENSEX",
-    "BANKNIFTY": "NSE_INDEX|Nifty Bank",
-}
-
-
-@st.cache_data(ttl=15, show_spinner=False)
-def fetch_index_quote(index: str = "SENSEX") -> dict | None:
-    """
-    Real-time LTP + day % change + OHLC for an index ("NIFTY" or "SENSEX")
-    via Upstox's full market-quote endpoint (GET /v2/market-quote/quotes) —
-    unlike yfinance's ~15-min-delayed index feed, this is live (subject to
-    your Upstox plan's data entitlement).
-
-    Uses the response's `net_change` field directly rather than deriving
-    the change from `ohlc.close` — for indices, `ohlc.close` is not
-    reliably the previous day's close, but `last_price - net_change` is
-    guaranteed to be (this mirrors how the NHPC example in Upstox's own
-    docs computes it). `open`/`high`/`low` ARE reliable straight off
-    `ohlc` though — only `close` has that caveat.
-
-    2026-07-16: previously returned only {"price", "pct_chg"} — the OHLC
-    row on the index card always showed "—" for Open/High/Low/Prev. Close
-    as a result, even though the same API response already carries them
-    in the `ohlc` block. No second call needed, just reading more of what
-    was already there.
-
-    Returns {"price", "pct_chg", "open", "high", "low", "prev_close"}, or
-    None if the token is missing/expired or the request fails — callers
-    should fall back to another source (e.g. yfinance) rather than show
-    nothing.
-    """
-    headers = _auth_headers()
-    instrument_key = _INDEX_INSTRUMENT_KEYS.get(index.upper())
-    if headers is None or instrument_key is None or is_token_expired():
-        return None
-
-    try:
-        resp = requests.get(
-            f"{BASE_URL}/v2/market-quote/quotes",
-            headers=headers,
-            params={"instrument_key": instrument_key},
-            timeout=10,
-        )
-        if resp.status_code == 401:
-            logger.warning("Upstox 401 on index quote for %s — token expired or invalid", index)
-            return None
-        resp.raise_for_status()
-        data = resp.json().get("data", {})
-        if not data:
-            return None
-        quote      = next(iter(data.values()))
-        last_price = quote.get("last_price")
-        net_change = quote.get("net_change")
-        if last_price is None:
-            return None
-        prev_close = (last_price - net_change) if net_change is not None else None
-        pct_chg    = round(net_change / prev_close * 100, 2) if prev_close else None
-        ohlc       = quote.get("ohlc") or {}
-        return {
-            "price":      float(last_price),
-            "pct_chg":    pct_chg,
-            "open":       ohlc.get("open"),
-            "high":       ohlc.get("high"),
-            "low":        ohlc.get("low"),
-            "prev_close": prev_close,
-        }
-    except Exception:
-        logger.warning("Upstox index-quote fetch failed for %s", index, exc_info=True)
-        return None
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_nearest_expiry(index: str = "NIFTY") -> str | None:
-    """
-    Return the nearest upcoming options expiry ("YYYY-MM-DD") for `index`
-    ("NIFTY" or "SENSEX"), via Upstox's option-contracts endpoint:
-      GET /v2/option/contract?instrument_key=...
-    Returns None if the token is missing/expired or the request fails.
-    """
-    headers = _auth_headers()
-    instrument_key = _INDEX_INSTRUMENT_KEYS.get(index.upper())
-    if headers is None or instrument_key is None:
-        return None
-
-    try:
-        resp = requests.get(
-            f"{BASE_URL}/v2/option/contract",
-            headers=headers,
-            params={"instrument_key": instrument_key},
-            timeout=10,
-        )
-        if resp.status_code == 401:
-            logger.warning("Upstox 401 on option-contract for %s — token expired or invalid", index)
-            return None
-        resp.raise_for_status()
-        contracts = resp.json().get("data", [])
-        expiries = sorted({c["expiry"] for c in contracts if c.get("expiry")})
-        if not expiries:
-            return None
-        today_str = date.today().isoformat()
-        upcoming = [e for e in expiries if e >= today_str]
-        return upcoming[0] if upcoming else expiries[-1]
-    except Exception:
-        logger.warning("Upstox option-contract fetch failed for %s", index, exc_info=True)
-        return None
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
-    """
-    Return the nearest-expiry Call/Put OI resistance levels for `index`
-    ("NIFTY", "SENSEX", or "BANKNIFTY") via Upstox's option-chain endpoint:
-      GET /v2/option/chain?instrument_key=...&expiry_date=...
-
-    {
-      "expiry":     "2026-07-24",
-      "ce_strike": 25400.0, "ce_oi": 8123450, "ce_premium": 42.15,  # highest-OI Call strike
-      "pe_strike": 24800.0, "pe_oi": 7543210, "pe_premium": 38.60,  # highest-OI Put strike
-    }
-
-    Returns None on any failure (missing/expired token, empty chain, etc.)
-    — callers should render a "—" placeholder rather than crash the panel.
-    """
-    headers = _auth_headers()
-    instrument_key = _INDEX_INSTRUMENT_KEYS.get(index.upper())
-    if headers is None or instrument_key is None or is_token_expired():
-        return None
-
-    expiry = fetch_nearest_expiry(index)
-    if not expiry:
-        return None
-
-    try:
-        resp = requests.get(
-            f"{BASE_URL}/v2/option/chain",
-            headers=headers,
-            params={"instrument_key": instrument_key, "expiry_date": expiry},
-            timeout=15,
-        )
-        if resp.status_code == 401:
-            logger.warning("Upstox 401 on option-chain for %s — token expired or invalid", index)
-            return None
-        resp.raise_for_status()
-        chain = resp.json().get("data", [])
-        if not chain:
-            return None
-
-        def _oi(row: dict, leg: str) -> float:
-            return ((row.get(leg) or {}).get("market_data") or {}).get("oi", 0) or 0
-
-        def _premium(row: dict, leg: str) -> float:
-            return ((row.get(leg) or {}).get("market_data") or {}).get("ltp", 0) or 0
-
-        best_ce = max(chain, key=lambda r: _oi(r, "call_options"))
-        best_pe = max(chain, key=lambda r: _oi(r, "put_options"))
-
-        return {
-            "expiry":     expiry,
-            "ce_strike":  best_ce.get("strike_price"),
-            "ce_oi":      _oi(best_ce, "call_options"),
-            "ce_premium": _premium(best_ce, "call_options"),
-            "pe_strike":  best_pe.get("strike_price"),
-            "pe_oi":      _oi(best_pe, "put_options"),
-            "pe_premium": _premium(best_pe, "put_options"),
-        }
-    except Exception:
-        logger.warning("Upstox option-chain fetch failed for %s", index, exc_info=True)
-        return None
-
-
 def fetch_batch_today_ohlc_upstox(symbols: list) -> dict:
     """
-    Today's (possibly partial) OHLC for many symbols via Upstox's batched
-    quotes endpoint — up to _QUOTE_BATCH_SIZE instrument_keys per HTTP call
-    instead of one request per symbol.
-
-    2026-07-16: rewritten. This used to fan out one request per symbol
-    through a throttled ThreadPoolExecutor, mirroring the historical-
-    candle endpoint's genuine one-instrument-per-request limit — but the
-    quotes/LTP/OHLC endpoints don't share that limit. For a ~500-symbol
-    universe that's the difference between ~500 throttled requests (at the
-    ~20/s process-wide ceiling, 25s+ in spacing alone, more under any 429
-    backoff) and 1 request total. This was the main cost of an "Upstox
-    scan" running much slower than a yfinance one — see also
-    fetch_batch_ohlcv_upstox() / fetch_batch_ohlcv_range_upstox() above,
-    which still fan out one-per-symbol because the historical-candle
-    endpoint genuinely has no batch equivalent; only the live-quote patch
-    step benefits from this change.
-
-    Returns {symbol: {date, open, high, low, close, volume}}, matching the
-    shape scanner_engine._patch_live_prices() expects — same contract as
-    before, only the transport changed. Callers (scanner_engine.py)
-    require no changes.
+    Concurrent per-symbol fetch of today's (possibly partial) OHLC —
+    the Upstox counterpart to scanner_engine._fetch_live_prices(). There's
+    no multi-symbol quotes call any more than there is for historical
+    candles, so this reuses the same throttled ThreadPoolExecutor pattern
+    as fetch_batch_ohlcv_upstox(). Returns {symbol: {date, open, high,
+    low, close, volume}}, matching the shape scanner_engine's
+    _patch_live_prices() expects — so callers can pick this or the
+    yfinance live-price fetch based on the active data source without
+    touching the patch logic itself.
     """
     if not symbols:
         return {}
@@ -747,41 +485,127 @@ def fetch_batch_today_ohlc_upstox(symbols: list) -> dict:
         logger.warning("Upstox token likely expired — skipping live-price patch")
         return {}
 
-    # symbol -> instrument_key, dropping anything that doesn't resolve
-    sym_to_ikey = {}
-    for sym in symbols:
-        ikey = resolve_instrument_key(sym)
-        if ikey:
-            sym_to_ikey[sym] = ikey
-    if not sym_to_ikey:
-        return {}
-    ikey_to_sym = {ikey: sym for sym, ikey in sym_to_ikey.items()}
-
-    today = date.today()
     result: dict = {}
-    all_ikeys = list(sym_to_ikey.values())
-    chunks = [all_ikeys[i:i + _QUOTE_BATCH_SIZE] for i in range(0, len(all_ikeys), _QUOTE_BATCH_SIZE)]
-
-    # A ~500-symbol universe is 1 chunk (2 for the full Nifty 500 once you
-    # account for a few unresolved symbols pushing just past 500) — no
-    # need for a thread pool when it's 1-2 calls total; sequential keeps
-    # the retry/backoff logic in _fetch_quotes_batch() simple.
-    for chunk in chunks:
-        quotes = _fetch_quotes_batch(chunk)
-        for ikey, quote in quotes.items():
-            sym = ikey_to_sym.get(ikey)
-            if sym is None:
-                continue
-            ohlc = quote.get("ohlc") or {}
-            close = quote.get("last_price", ohlc.get("close"))
-            if not ohlc or close is None:
-                continue
-            result[sym] = {
-                "date":   today,
-                "open":   ohlc.get("open"),
-                "high":   ohlc.get("high"),
-                "low":    ohlc.get("low"),
-                "close":  close,
-                "volume": quote.get("volume"),
-            }
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {pool.submit(fetch_today_ohlc, sym): sym for sym in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                quote = fut.result()
+                if quote and quote.get("close") is not None:
+                    result[sym] = quote
+            except Exception as exc:
+                logger.warning("Upstox live-quote fetch failed for %s: %s", sym, exc)
     return result
+
+
+# ── Option chain / nearest-expiry snapshot ─────────────────────────────────
+# Underlying instrument keys per Upstox's instrument master
+# (https://upstox.com/developer/api-documentation/instruments/). Indices use
+# segment NSE_INDEX / BSE_INDEX + instrument_type INDEX.
+INDEX_INSTRUMENT_KEYS = {
+    "NIFTY":  "NSE_INDEX|Nifty 50",
+    "SENSEX": "BSE_INDEX|SENSEX",
+}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_nearest_expiry(underlying_key: str) -> str | None:
+    """
+    Nearest (soonest, still-upcoming) expiry date for an index's option
+    chain, via GET /v2/option/contract — this returns every contract
+    (all strikes x both CE/PE x every expiry) for the underlying, so we
+    just take the min of the future 'expiry' field across all of them.
+    Cached 5 min: the expiry list itself only changes weekly/monthly, no
+    reason to hit this on every card render.
+    """
+    headers = _auth_headers()
+    if headers is None:
+        return None
+    try:
+        _wait_for_spacing()
+        resp = requests.get(f"{BASE_URL}/v2/option/contract", headers=headers,
+                             params={"instrument_key": underlying_key}, timeout=10)
+        resp.raise_for_status()
+        contracts = resp.json().get("data", [])
+        today = date.today().isoformat()
+        expiries = sorted({c["expiry"] for c in contracts if c.get("expiry", "") >= today})
+        return expiries[0] if expiries else None
+    except Exception as exc:
+        logger.warning("Upstox option/contract fetch failed for %s: %s", underlying_key, exc)
+        return None
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_option_chain(underlying_key: str, expiry_date: str) -> list[dict]:
+    """
+    Raw GET /v2/option/chain response's `data` list — one dict per strike,
+    each with strike_price, underlying_spot_price, call_options.market_data
+    (ltp, oi, ...), put_options.market_data. Cached 30s so the two cards
+    (Nifty, Sensex) rendered on the same page don't double-fetch on rerun.
+    """
+    headers = _auth_headers()
+    if headers is None:
+        return []
+    try:
+        _wait_for_spacing()
+        resp = requests.get(f"{BASE_URL}/v2/option/chain", headers=headers,
+                             params={"instrument_key": underlying_key, "expiry_date": expiry_date},
+                             timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("data", [])
+    except Exception as exc:
+        logger.warning("Upstox option/chain fetch failed for %s @ %s: %s",
+                        underlying_key, expiry_date, exc)
+        return []
+
+
+def get_expiry_card_data(underlying_key: str) -> dict | None:
+    """
+    Everything the "Nearest Expiry" card needs for one index, in one call:
+    nearest expiry date, days-to-expiry, spot price, and the ATM CE/PE
+    strikes with premium (ltp) + OI. ATM here means: CE = highest strike
+    at-or-below spot, PE = lowest strike at-or-above spot — mirrors the
+    two-strikes-apart layout in the reference mockup (e.g. spot ~24,250
+    -> CE 24200 / PE 24300 on a 100-pt Sensex-style strike step; Nifty's
+    50-pt step would show CE/PE 50 apart instead).
+
+    Returns None if the token's dead, the underlying has no chain, or spot
+    price is unavailable — callers should treat that as "show a
+    placeholder card", not raise.
+    """
+    if is_token_expired():
+        return None
+    expiry = get_nearest_expiry(underlying_key)
+    if not expiry:
+        return None
+    chain = get_option_chain(underlying_key, expiry)
+    if not chain:
+        return None
+
+    spot = chain[0].get("underlying_spot_price")
+    if not spot:
+        return None
+
+    ce_candidates = [row for row in chain if row.get("strike_price", 0) <= spot]
+    pe_candidates = [row for row in chain if row.get("strike_price", 0) >= spot]
+    ce_row = max(ce_candidates, key=lambda r: r["strike_price"]) if ce_candidates else min(
+        chain, key=lambda r: abs(r["strike_price"] - spot))
+    pe_row = min(pe_candidates, key=lambda r: r["strike_price"]) if pe_candidates else ce_row
+
+    ce_md = (ce_row.get("call_options") or {}).get("market_data", {})
+    pe_md = (pe_row.get("put_options") or {}).get("market_data", {})
+
+    days_to_expiry = (datetime.strptime(expiry, "%Y-%m-%d").date() - date.today()).days
+
+    return {
+        "expiry":          expiry,
+        "days_to_expiry":  max(days_to_expiry, 0),
+        "spot":            spot,
+        "ce_strike":       ce_row.get("strike_price"),
+        "ce_premium":      ce_md.get("ltp"),
+        "ce_oi":           ce_md.get("oi"),
+        "pe_strike":       pe_row.get("strike_price"),
+        "pe_premium":      pe_md.get("ltp"),
+        "pe_oi":           pe_md.get("oi"),
+    }
