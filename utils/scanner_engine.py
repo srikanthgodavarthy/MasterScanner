@@ -1520,20 +1520,54 @@ def run_scanner(
     cci_os:      int  = -100,
     max_workers: int  = 10,
     progress_cb       = None,
+    source:      str  = "yfinance",
+    source_warn_cb    = None,
 ) -> pd.DataFrame:
     """
     Two-phase scanner.
     Nifty regime is computed once here from live data, then injected into
     the settings dict so every score_stock() call uses the same value
     without redundant per-stock computation.
+
+    source: "yfinance" (default) or "upstox". Upstox has no multi-symbol
+    historical-candle endpoint, so utils.upstox_client fetches per-symbol
+    concurrently; if it comes back empty for any symbol in a batch (token
+    expired, rate-limited, unresolved instrument_key, etc.) those specific
+    symbols are filled in from yfinance rather than dropped, and
+    source_warn_cb(str) — if given — is called so the caller can surface
+    what happened without failing the whole scan.
     """
+    def _warn(msg: str) -> None:
+        if source_warn_cb:
+            try:
+                source_warn_cb(msg)
+            except Exception:
+                pass
+
+    use_upstox = source == "upstox"
+    if use_upstox:
+        from utils.upstox_client import is_token_expired
+        if is_token_expired():
+            _warn("Upstox token appears expired (tokens expire 3:30 AM IST daily) — using Yahoo Finance for this scan instead.")
+            use_upstox = False
+
     total     = len(symbols)
     n_batches = max(1, (total + _BATCH_SIZE - 1) // _BATCH_SIZE)
 
     all_data: dict = {}
     for batch_i, start in enumerate(range(0, total, _BATCH_SIZE)):
-        chunk      = tuple(symbols[start: start + _BATCH_SIZE])
-        batch_data = fetch_batch_ohlcv(chunk, period="1y", interval="1d")
+        chunk = tuple(symbols[start: start + _BATCH_SIZE])
+        if use_upstox:
+            from utils.upstox_client import fetch_batch_ohlcv_upstox
+            batch_data = fetch_batch_ohlcv_upstox(list(chunk), period="1y", interval="1d")
+            missing = [s for s in chunk if s not in batch_data]
+            if missing:
+                fallback = fetch_batch_ohlcv(tuple(missing), period="1y", interval="1d")
+                if fallback:
+                    _warn(f"Upstox had no data for {len(fallback)} symbol(s) this batch — used Yahoo Finance instead.")
+                batch_data.update(fallback)
+        else:
+            batch_data = fetch_batch_ohlcv(chunk, period="1y", interval="1d")
         all_data.update(batch_data)
         if progress_cb:
             progress_cb(0.5 * (batch_i + 1) / n_batches)
@@ -1549,7 +1583,14 @@ def run_scanner(
             if sym in all_data and all_data[sym].index[-1].normalize() < _today
         )
         if stale_syms:
-            live_prices = _fetch_live_prices(stale_syms)
+            if use_upstox:
+                from utils.upstox_client import fetch_batch_today_ohlc_upstox
+                live_prices = fetch_batch_today_ohlc_upstox(list(stale_syms))
+                missing_live = [s for s in stale_syms if s not in live_prices]
+                if missing_live:
+                    live_prices.update(_fetch_live_prices(tuple(missing_live)))
+            else:
+                live_prices = _fetch_live_prices(stale_syms)
             all_data    = _patch_live_prices(all_data, live_prices)
     except Exception:
         pass   # non-fatal — fall back to cached OHLCV
