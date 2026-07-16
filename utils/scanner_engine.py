@@ -740,6 +740,62 @@ def fetch_nifty_intraday_snapshot() -> dict:
     return out
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_sensex_intraday_snapshot() -> dict:
+    """
+    Return today's BSE Sensex (^BSESN) snapshot for the Market Overview
+    panel's Sensex chip: live price and day %chg (mirrors
+    fetch_nifty_intraday_snapshot's shape, minus the OHLC/spark fields the
+    chip doesn't need).
+
+    {"price": float, "pct_chg": float | None}
+
+    Same IST-aware "today" logic as fetch_nifty_intraday_snapshot(). Falls
+    back to the last two completed daily bars if the market hasn't opened
+    yet today or the intraday fetch fails — honest about showing
+    yesterday's change rather than a blank chip.
+    """
+    import pytz
+    _IST = pytz.timezone("Asia/Kolkata")
+
+    def _today_ist() -> pd.Timestamp:
+        return pd.Timestamp.now(tz=_IST).normalize().tz_localize(None)
+
+    out = {"price": 0.0, "pct_chg": None}
+
+    try:
+        df = yf.Ticker("^BSESN").history(period="2d", interval="1m", auto_adjust=True)
+        if not df.empty:
+            df.index = _strip_tz(pd.to_datetime(df.index))
+            today = _today_ist()
+            today_bars = df[df.index.normalize() == today]
+            if not today_bars.empty:
+                prev_bars  = df[df.index.normalize() < today]
+                prev_close = float(prev_bars["Close"].iloc[-1]) if not prev_bars.empty else None
+                price      = float(today_bars["Close"].iloc[-1])
+                out.update({
+                    "price":   price,
+                    "pct_chg": round((price - prev_close) / prev_close * 100, 2) if prev_close else None,
+                })
+                return out
+    except Exception:
+        pass
+
+    # Market not yet open / intraday fetch failed — fall back to daily bars
+    try:
+        daily = yf.Ticker("^BSESN").history(period="1mo", auto_adjust=True)
+        if len(daily) >= 2:
+            last_close = float(daily["Close"].iloc[-1])
+            prev_close = float(daily["Close"].iloc[-2])
+            out.update({
+                "price":   last_close,
+                "pct_chg": round((last_close - prev_close) / prev_close * 100, 2) if prev_close else None,
+            })
+    except Exception:
+        pass
+    return out
+
+
 def fetch_nifty_live() -> tuple[float, float | None]:
     """
     Return (current_price, day_pct_change) for Nifty 50 (^NSEI).
