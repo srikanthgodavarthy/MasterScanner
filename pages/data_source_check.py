@@ -15,16 +15,27 @@ already has the token (same as the Upstox Pilot Check in app.py).
 WHAT IT CHECKS
 --------------
 For each selected symbol: pulls ~3 months of daily bars from both
-scanner_engine.fetch_ohlcv() (yfinance) and utils.upstox_client's
-fetch_ohlcv_upstox(), aligns on overlapping dates, and reports missing
-dates, close-price divergence beyond CLOSE_TOL_PCT, and whether any
-divergence is a SYSTEMATIC ratio shift (the signature of one source
-adjusting historical closes for a split/bonus/dividend and the other
-not) versus ordinary day-to-day feed noise. See scripts/compare_yf_upstox.py
-for the fuller rationale on why that distinction matters for
-history_store.py's refresh design.
+sources via history_store.get_history(source="yfinance") and
+get_history(source="upstox") — NOT the raw fetch_ohlcv/fetch_ohlcv_upstox
+calls anymore (2026-07-16 change, see below) — aligns on overlapping
+dates, and reports missing dates, close-price divergence beyond
+CLOSE_TOL_PCT, and whether any divergence is a SYSTEMATIC ratio shift
+(the signature of one source adjusting historical closes for a
+split/bonus/dividend and the other not) versus ordinary day-to-day feed
+noise. See scripts/compare_yf_upstox.py for the fuller rationale.
 
-Read-only. Doesn't touch history_store.py or any cached data.
+2026-07-16: switched from calling fetch_ohlcv()/fetch_ohlcv_upstox()
+directly to going through history_store.get_history(source=...) instead.
+This page is now the first thing exercising the source-aware cache
+(local parquet + Supabase, namespaced per source) before it touches the
+live Scanner or Backtest paths — run it twice in a row and the second
+run's Upstox side should be a fast tail-only fetch instead of a full
+refetch, which is a real check that the caching is doing what it's
+supposed to, not just a comparison of raw numbers.
+
+NOT read-only anymore: this page now populates the on-disk (and
+Supabase, if configured) cache under the "upstox" namespace, same as
+any other get_history() caller would.
 """
 
 from __future__ import annotations
@@ -35,8 +46,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pandas as pd
 import streamlit as st
 
-from utils.scanner_engine import NIFTY500_SYMBOLS, fetch_ohlcv
-from utils.upstox_client import fetch_ohlcv_upstox, get_upstox_token, is_token_expired
+from utils.scanner_engine import NIFTY500_SYMBOLS
+from utils.history_store import get_history
+from utils.upstox_client import get_upstox_token, is_token_expired
 
 CLOSE_TOL_PCT  = 0.5   # flag close-price divergence beyond this %
 RATIO_STD_TOL  = 0.01  # ratios tighter than this look "systematic," not noisy
@@ -65,9 +77,9 @@ def _ratio_drift_note(symbol: str, yf_c: pd.Series, ux_c: pd.Series) -> str | No
     return None
 
 
-def _compare_one(symbol: str) -> dict:
-    yf_df = fetch_ohlcv(symbol, period="3mo", interval="1d")
-    ux_df = fetch_ohlcv_upstox(symbol, period="3mo", interval="1d")
+def _compare_one(symbol: str, yf_df: pd.DataFrame | None, ux_df: pd.DataFrame | None) -> dict:
+    yf_df = yf_df if yf_df is not None else pd.DataFrame()
+    ux_df = ux_df if ux_df is not None else pd.DataFrame()
 
     row = {
         "symbol": symbol,
@@ -112,10 +124,13 @@ def render(settings=None):
     st.markdown("### 🔍 Data Source Check — Upstox vs yfinance")
     st.markdown(
         "<span style='color:#64748b;font-size:0.82rem;'>"
-        "Read-only. Compares 3 months of daily bars from both sources per "
-        "symbol and flags close-price divergence, missing dates, and "
-        "systematic split/bonus adjustment mismatches. Doesn't touch "
-        "history_store.py or any cache.</span>",
+        "Compares 3 months of daily bars from both sources per symbol via "
+        "history_store.get_history() — flags close-price divergence, missing "
+        "dates, and systematic split/bonus/dividend adjustment mismatches. "
+        "This populates the real source-aware cache (local + Supabase, "
+        "namespaced per source) — rerun after the first pass and the Upstox "
+        "side should come back as a fast tail-only fetch instead of a full "
+        "refetch.</span>",
         unsafe_allow_html=True,
     )
     st.markdown("")
@@ -148,16 +163,20 @@ def render(settings=None):
         return
 
     prog = st.progress(0, text="Starting…")
-    results = []
-    for i, sym in enumerate(symbols, 1):
-        prog.progress(i / len(symbols), text=f"Comparing {sym}… ({i}/{len(symbols)})")
-        try:
-            results.append(_compare_one(sym))
-        except Exception as exc:
-            results.append({"symbol": sym, "status": f"ERROR: {exc}",
-                             "yf_bars": None, "ux_bars": None, "common_dates": None,
-                             "max_close_diff_%": None, "mean_close_diff_%": None,
-                             "flagged_dates": None})
+
+    def _yf_prog(done, total):
+        prog.progress(min(0.05 + 0.45 * (done / max(total, 1)), 0.5),
+                       text=f"yfinance via history_store… batch {done}/{total}")
+
+    def _ux_prog(done, total):
+        prog.progress(min(0.5 + 0.45 * (done / max(total, 1)), 0.95),
+                       text=f"upstox via history_store… batch {done}/{total}")
+
+    yf_data = get_history(symbols, years=0.25, min_bars=0, progress_cb=_yf_prog, source="yfinance")
+    ux_data = get_history(symbols, years=0.25, min_bars=0, progress_cb=_ux_prog, source="upstox")
+    prog.progress(1.0, text="Comparing…")
+
+    results = [_compare_one(sym, yf_data.get(sym), ux_data.get(sym)) for sym in symbols]
     prog.empty()
 
     summary_df = pd.DataFrame([
