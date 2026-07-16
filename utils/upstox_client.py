@@ -36,12 +36,14 @@ from __future__ import annotations
 
 import gzip
 import io
+import json
 import logging
 import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -92,22 +94,67 @@ def get_upstox_token() -> str | None:
     return os.environ.get("UPSTOX_ACCESS_TOKEN")
 
 
-def is_token_expired() -> bool:
-    """Upstox access tokens expire 3:30 AM IST the day after they're
-    checked out — regardless of generation time. There's no expiry claim
-    to introspect locally without decoding the JWT payload, so this is a
-    same-day floor: if it's already past 3:30 AM IST *today* and the
-    token was (as far as we know) obtained before that, treat it as
-    expired. In practice: call this right before a batch fetch and, if
-    True, surface a "re-auth on Upstox" prompt instead of burning retries
-    against a dead token."""
+_TOKEN_META_PATH = Path(".ms_history_cache") / "upstox_token.meta.json"
+
+
+def _load_token_first_seen(token: str) -> datetime:
+    """Returns the timestamp this exact token value was first observed,
+    persisting it on first sight. This is the only way to approximate
+    "when was this token issued" without decoding the JWT — Upstox
+    access tokens are opaque bearer strings with no local introspection.
+    If the token string changes (user pasted a fresh one), the first-seen
+    clock resets, which is exactly what we want."""
     now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    cutoff = now_ist.replace(hour=3, minute=30, second=0, microsecond=0)
-    # Best-effort only: this doesn't know when the token was issued, so it
-    # can't tell "expired at 3:30 today" apart from "generated at 4am
-    # today, still good for 23+ hours." Treat as advisory, not gospel —
-    # a 401 from the API is still the authoritative signal.
-    return now_ist > cutoff and now_ist.hour >= 4
+    try:
+        _TOKEN_META_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if _TOKEN_META_PATH.exists():
+            meta = json.loads(_TOKEN_META_PATH.read_text())
+            if meta.get("token") == token and meta.get("first_seen"):
+                return datetime.fromisoformat(meta["first_seen"])
+        # New/unknown token — record now as its first-seen time.
+        _TOKEN_META_PATH.write_text(json.dumps({
+            "token": token,
+            "first_seen": now_ist.isoformat(),
+        }))
+    except Exception:
+        logger.debug("Could not persist Upstox token metadata", exc_info=True)
+    return now_ist
+
+
+def is_token_expired() -> bool:
+    """Upstox access tokens expire 3:30 AM IST the day *after* they're
+    checked out — regardless of generation time. There's no expiry claim
+    to introspect locally without decoding the JWT payload, so we
+    approximate issuance time as "the first time this app process saw
+    this exact token string" (persisted in _TOKEN_META_PATH) and compare
+    against the next 3:30 AM IST boundary after that.
+
+    NOTE: the previous implementation computed `now > cutoff and
+    now.hour >= 4`, where `cutoff` was always *today's* 3:30 AM. Since
+    `now > today's 3:30 AM` is true for essentially the entire day
+    (00:00-03:29 excepted), that condition was true almost around the
+    clock — meaning a token refreshed at 9 AM was immediately treated as
+    "expired" for the rest of the day, and every Upstox batch fetch
+    call (fetch_batch_ohlcv_upstox / fetch_batch_ohlcv_range_upstox)
+    short-circuited to an empty dict. That's the root cause of "upstox
+    empty" showing up for every symbol regardless of token validity.
+    """
+    token = get_upstox_token()
+    if not token:
+        return True
+
+    now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    first_seen = _load_token_first_seen(token)
+
+    # Next 3:30 AM IST strictly after first_seen.
+    expiry = first_seen.replace(hour=3, minute=30, second=0, microsecond=0)
+    if expiry <= first_seen:
+        expiry += timedelta(days=1)
+
+    # Best-effort only: a 401 from the API is still the authoritative
+    # signal — this is advisory, meant to avoid burning retries against
+    # a token we're fairly confident is dead.
+    return now_ist >= expiry
 
 
 def _auth_headers() -> dict | None:
