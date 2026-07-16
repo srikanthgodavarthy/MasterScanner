@@ -3565,11 +3565,18 @@ def render(settings: dict | None = None):
 
         # Nearest-expiry CE/PE OI resistance (Upstox option chain) — best-effort;
         # silently absent (renders "—") if the Upstox token isn't configured.
+        # Sensex options are on BSE; fetch_oi_resistance("SENSEX") already
+        # resolves to the BSE_INDEX|SENSEX instrument key in upstox_client.
         try:
             from utils.upstox_client import fetch_oi_resistance
-            st.session_state["oi_resistance"] = fetch_oi_resistance("NIFTY")
+            st.session_state["oi_resistance"] = fetch_oi_resistance("NIFTY") or {}
         except Exception:
             st.session_state["oi_resistance"] = {}
+        try:
+            from utils.upstox_client import fetch_oi_resistance
+            st.session_state["sensex_oi_resistance"] = fetch_oi_resistance("SENSEX") or {}
+        except Exception:
+            st.session_state["sensex_oi_resistance"] = {}
 
         if supabase_ok and save_db:
             save_scan_snapshot(df_aug)
@@ -3618,11 +3625,12 @@ def render(settings: dict | None = None):
     df_aug          = st.session_state.get("scan_df",       pd.DataFrame())
     summary         = st.session_state.get("scan_summary",  {})
     scan_time       = st.session_state.get("scan_time",     "")
-    nifty_snapshot    = st.session_state.get("nifty_snapshot", {})
-    sensex_snapshot   = st.session_state.get("sensex_snapshot", {})
-    oi_resistance     = st.session_state.get("oi_resistance", {})
-    nifty_ema_levels  = st.session_state.get("nifty_ema_levels", {})
-    sensex_ema_levels = st.session_state.get("sensex_ema_levels", {})
+    nifty_snapshot        = st.session_state.get("nifty_snapshot", {})
+    sensex_snapshot       = st.session_state.get("sensex_snapshot", {})
+    oi_resistance         = st.session_state.get("oi_resistance", {})
+    sensex_oi_resistance  = st.session_state.get("sensex_oi_resistance", {})
+    nifty_ema_levels      = st.session_state.get("nifty_ema_levels", {})
+    sensex_ema_levels     = st.session_state.get("sensex_ema_levels", {})
 
     if df_aug.empty:
         st.markdown("""
@@ -3641,8 +3649,8 @@ def render(settings: dict | None = None):
     )
 
     index_cards = [
-        {"label": "NIFTY 50", "snapshot": nifty_snapshot,  "oi": oi_resistance, "badge": "", "ema": nifty_ema_levels},
-        {"label": "SENSEX",   "snapshot": sensex_snapshot, "oi": {},            "badge": "", "ema": sensex_ema_levels},
+        {"label": "NIFTY 50", "snapshot": nifty_snapshot,  "oi": oi_resistance,        "badge": "", "ema": nifty_ema_levels},
+        {"label": "SENSEX",   "snapshot": sensex_snapshot, "oi": sensex_oi_resistance, "badge": "", "ema": sensex_ema_levels},
     ]
     st.markdown(
         _market_overview_panel(summary, breadth, scan_time, index_cards),
