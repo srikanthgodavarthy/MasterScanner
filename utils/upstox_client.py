@@ -30,6 +30,11 @@ Unlike yf.download(), Upstox's historical-candle endpoint is one instrument
 per request — there is no multi-symbol batch call. fetch_batch_ohlcv_upstox()
 throttles + retries per symbol; tune _MAX_WORKERS / _MIN_SPACING_S if you hit
 429s at your Upstox plan's rate limit.
+
+The market-quote endpoints (LTP/OHLC/full quotes) are different: Upstox
+supports up to 500 instrument_keys per request as a comma-separated list.
+fetch_batch_today_ohlc_upstox() uses that batched form (2026-07-16), not
+the throttled per-symbol pattern — see _fetch_quotes_batch() below.
 """
 
 from __future__ import annotations
@@ -467,17 +472,93 @@ def fetch_today_ohlc(symbol: str) -> dict | None:
     return None
 
 
+_QUOTE_BATCH_SIZE = 500  # Upstox's documented max instrument_keys per /v2/market-quote/quotes call
+
+
+def _fetch_quotes_batch(instrument_keys: list[str]) -> dict:
+    """
+    One HTTP call for up to _QUOTE_BATCH_SIZE instrument_keys via the full
+    quotes endpoint — a comma-separated instrument_key list, NOT one
+    request per instrument. Confirmed against Upstox's docs: /v2/market-
+    quote/quotes (like /ltp and /ohlc) accepts up to 500 instrument_keys
+    per call (https://upstox.com/developer/api-documentation/
+    get-full-market-quote/). This does NOT apply to the historical-candle
+    endpoint, which genuinely is one-instrument-per-request — see
+    _fetch_candles() above.
+
+    Returns {instrument_key: quote_dict} for whatever came back; fail-soft
+    (empty dict) on any error, matching the rest of this module's contract.
+    """
+    headers = _auth_headers()
+    if headers is None or not instrument_keys:
+        return {}
+
+    last_exc = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        _wait_for_spacing()
+        try:
+            resp = requests.get(
+                f"{BASE_URL}/v2/market-quote/quotes",
+                headers=headers,
+                params={"instrument_key": ",".join(instrument_keys)},
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                backoff = _RETRY_BASE_S * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                logger.warning(
+                    "Upstox rate-limited on batch quote (%d instruments), retrying in %.1fs",
+                    len(instrument_keys), backoff,
+                )
+                time.sleep(backoff)
+                continue
+            if resp.status_code == 401:
+                logger.warning("Upstox 401 on batch quote — token expired or invalid")
+                return {}
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+            # Re-key by instrument_token (e.g. "NSE_EQ|INE848E01016") rather
+            # than the response dict's own keys (observed as "EXCHANGE:
+            # SYMBOL", e.g. "NSE_EQ:NHPC") — instrument_token is already in
+            # every quote payload and matches resolve_instrument_key()'s
+            # output format exactly, so mapping back to our symbol list is
+            # unambiguous regardless of how Upstox formats the outer keys.
+            return {
+                q["instrument_token"]: q
+                for q in data.values()
+                if isinstance(q, dict) and q.get("instrument_token")
+            }
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(_RETRY_BASE_S * attempt)
+
+    logger.warning("Upstox batch quote failed for %d instruments after %d attempts: %s",
+                    len(instrument_keys), _MAX_RETRIES, last_exc)
+    return {}
+
+
 def fetch_batch_today_ohlc_upstox(symbols: list) -> dict:
     """
-    Concurrent per-symbol fetch of today's (possibly partial) OHLC —
-    the Upstox counterpart to scanner_engine._fetch_live_prices(). There's
-    no multi-symbol quotes call any more than there is for historical
-    candles, so this reuses the same throttled ThreadPoolExecutor pattern
-    as fetch_batch_ohlcv_upstox(). Returns {symbol: {date, open, high,
-    low, close, volume}}, matching the shape scanner_engine's
-    _patch_live_prices() expects — so callers can pick this or the
-    yfinance live-price fetch based on the active data source without
-    touching the patch logic itself.
+    Today's (possibly partial) OHLC for many symbols via Upstox's batched
+    quotes endpoint — up to _QUOTE_BATCH_SIZE instrument_keys per HTTP call
+    instead of one request per symbol.
+
+    2026-07-16: rewritten. This used to fan out one request per symbol
+    through a throttled ThreadPoolExecutor, mirroring the historical-
+    candle endpoint's genuine one-instrument-per-request limit — but the
+    quotes/LTP/OHLC endpoints don't share that limit. For a ~500-symbol
+    universe that's the difference between ~500 throttled requests (at the
+    ~20/s process-wide ceiling, 25s+ in spacing alone, more under any 429
+    backoff) and 1 request total. This was the main cost of an "Upstox
+    scan" running much slower than a yfinance one — see also
+    fetch_batch_ohlcv_upstox() / fetch_batch_ohlcv_range_upstox() above,
+    which still fan out one-per-symbol because the historical-candle
+    endpoint genuinely has no batch equivalent; only the live-quote patch
+    step benefits from this change.
+
+    Returns {symbol: {date, open, high, low, close, volume}}, matching the
+    shape scanner_engine._patch_live_prices() expects — same contract as
+    before, only the transport changed. Callers (scanner_engine.py)
+    require no changes.
     """
     if not symbols:
         return {}
@@ -485,15 +566,41 @@ def fetch_batch_today_ohlc_upstox(symbols: list) -> dict:
         logger.warning("Upstox token likely expired — skipping live-price patch")
         return {}
 
+    # symbol -> instrument_key, dropping anything that doesn't resolve
+    sym_to_ikey = {}
+    for sym in symbols:
+        ikey = resolve_instrument_key(sym)
+        if ikey:
+            sym_to_ikey[sym] = ikey
+    if not sym_to_ikey:
+        return {}
+    ikey_to_sym = {ikey: sym for sym, ikey in sym_to_ikey.items()}
+
+    today = date.today()
     result: dict = {}
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-        futures = {pool.submit(fetch_today_ohlc, sym): sym for sym in symbols}
-        for fut in as_completed(futures):
-            sym = futures[fut]
-            try:
-                quote = fut.result()
-                if quote and quote.get("close") is not None:
-                    result[sym] = quote
-            except Exception as exc:
-                logger.warning("Upstox live-quote fetch failed for %s: %s", sym, exc)
+    all_ikeys = list(sym_to_ikey.values())
+    chunks = [all_ikeys[i:i + _QUOTE_BATCH_SIZE] for i in range(0, len(all_ikeys), _QUOTE_BATCH_SIZE)]
+
+    # A ~500-symbol universe is 1 chunk (2 for the full Nifty 500 once you
+    # account for a few unresolved symbols pushing just past 500) — no
+    # need for a thread pool when it's 1-2 calls total; sequential keeps
+    # the retry/backoff logic in _fetch_quotes_batch() simple.
+    for chunk in chunks:
+        quotes = _fetch_quotes_batch(chunk)
+        for ikey, quote in quotes.items():
+            sym = ikey_to_sym.get(ikey)
+            if sym is None:
+                continue
+            ohlc = quote.get("ohlc") or {}
+            close = quote.get("last_price", ohlc.get("close"))
+            if not ohlc or close is None:
+                continue
+            result[sym] = {
+                "date":   today,
+                "open":   ohlc.get("open"),
+                "high":   ohlc.get("high"),
+                "low":    ohlc.get("low"),
+                "close":  close,
+                "volume": quote.get("volume"),
+            }
     return result
