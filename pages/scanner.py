@@ -917,96 +917,8 @@ _CSS = """
 }
 .mo-title .mo-scan-chip b { color: var(--text); }
 
-.mo-top-grid {
-  display: grid;
-  grid-template-columns: 1.05fr 1.6fr;
-  gap: 18px;
-  align-items: stretch;
-}
-@media (max-width: 900px) { .mo-top-grid { grid-template-columns: 1fr; } }
-
-/* ── Left: Nifty price card ── */
-.mo-nifty-card {
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 16px 18px;
-  display: flex;
-  flex-direction: column;
-}
-.mo-nifty-label {
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.05em;
-  color: var(--muted);
-  margin-bottom: 6px;
-}
-.mo-nifty-row {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 10px;
-}
-.mo-nifty-price {
-  font-size: 34px;
-  font-weight: 700;
-  font-family: var(--mono);
-  color: var(--text);
-  line-height: 1.1;
-}
-.mo-nifty-chg { margin-top: 6px; font-family: var(--mono); }
-.mo-spark { width: 100%; max-width: 200px; height: 64px; flex-shrink: 0; }
-.mo-ohlc-row {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 6px;
-  margin-top: 14px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
-}
-.mo-ohlc-item { text-align: left; }
-.mo-ohlc-label {
-  font-size: 9px;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  margin-bottom: 3px;
-}
-.mo-ohlc-val {
-  font-size: 12.5px;
-  font-weight: 700;
-  font-family: var(--mono);
-}
-
-/* ── Right: stat grid ── */
-.mo-stats-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 14px 22px;
-}
-@media (max-width: 700px) { .mo-stats-grid { grid-template-columns: repeat(2, 1fr); } }
-.mo-stat-label {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  color: var(--muted);
-  margin-bottom: 6px;
-  cursor: default;
-}
 .mo-info { opacity: 0.6; font-size: 9px; }
-.mo-stat-value {
-  font-size: 22px;
-  font-weight: 700;
-  font-family: var(--mono);
-  color: var(--text);
-  line-height: 1.1;
-}
-.mo-stat-value .a { color: var(--green); }
-.mo-stat-value .d { color: var(--red); }
-.mo-stat-sub { font-size: 9.5px; margin-top: 4px; font-family: var(--mono); }
-.mo-stat-sub .a { color: var(--green); }
-.mo-stat-sub .d { color: var(--red); }
+.mo-spark { width: 100%; max-width: 200px; height: 64px; flex-shrink: 0; }
 .mo-bar-track {
   height: 5px;
   background: var(--bg3);
@@ -1016,119 +928,197 @@ _CSS = """
 }
 .mo-bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
 .mo-bar-track.mo-bar-split { margin-top: 4px; }
-
-/* ── Bottom: gate cards row ── */
-.mo-gates-row {
-  display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  gap: 10px;
-  margin-top: 16px;
+.mo-bar-legend {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--muted);
+  margin-top: 6px;
 }
-@media (max-width: 900px) { .mo-gates-row { grid-template-columns: repeat(2, 1fr); } }
-.mo-gate-card {
+.mo-bar-legend .a { color: var(--green); }
+.mo-bar-legend .d { color: var(--red); }
+
+/* ── Health row: Regime / Trend / Breadth / 52W Hi-Lo / EMA / Gate ── */
+.mo-health-row {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr 1fr 0.85fr 0.85fr 0.85fr;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+@media (max-width: 1100px) { .mo-health-row { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 700px)  { .mo-health-row { grid-template-columns: repeat(2, 1fr); } }
+.mo-health-card {
   background: var(--bg2);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px 12px;
+  border-radius: 10px;
+  padding: 12px 14px;
 }
-.mo-gate-top {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 6px;
-}
-.mo-gate-icon { font-size: 13px; }
-.mo-gate-label {
+.mo-health-label {
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.04em;
+  text-transform: uppercase;
   color: var(--muted);
-  flex: 1;
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: default;
 }
-.mo-gate-value {
-  font-size: 17px;
+.mo-health-value {
+  font-size: 18px;
   font-weight: 700;
   font-family: var(--mono);
+  color: var(--text);
+  line-height: 1.1;
 }
-.mo-gate-qual {
-  font-size: 10px;
+.mo-health-value .a { color: var(--green); }
+.mo-health-value .d { color: var(--red); }
+
+/* ── Regime card ── */
+.mo-regime-card { display: flex; gap: 10px; align-items: flex-start; }
+.mo-regime-icon { font-size: 20px; line-height: 1; }
+.mo-regime-body { flex: 1; min-width: 0; }
+.mo-regime-tag {
+  font-size: 20px;
+  font-weight: 800;
+  font-family: var(--mono);
+  margin: 2px 0 5px;
+}
+.mo-regime-note { font-size: 10.5px; color: var(--muted); line-height: 1.4; }
+
+/* ── Mini-pair cards (52W Hi/Lo, EMA breadth, VIX/ADX gate) ── */
+.mo-mini-pair { display: flex; justify-content: space-between; gap: 10px; }
+.mo-mini-item { flex: 1; min-width: 0; }
+.mo-mini-label {
+  font-size: 9px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-bottom: 4px;
+}
+.mo-mini-val {
+  font-size: 15px;
+  font-weight: 700;
+  font-family: var(--mono);
+  color: var(--text);
+}
+.mo-mini-val.a { color: var(--green); }
+.mo-mini-val.d { color: var(--red); }
+.mo-gate-mini-top { display: flex; align-items: center; gap: 4px; margin-bottom: 3px; }
+.mo-gate-mini-icon { font-size: 11px; }
+.mo-gate-mini-check { margin-left: auto; font-weight: 700; font-size: 11px; }
+.mo-gate-mini-qual { font-size: 9px; color: var(--muted); font-weight: 600; margin-left: 5px; }
+
+/* ── Index cards row (NIFTY 50 / SENSEX / BANK NIFTY) ── */
+.mo-index-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 14px;
+}
+@media (max-width: 900px) { .mo-index-grid { grid-template-columns: 1fr; } }
+.mo-index-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+.mo-index-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mo-index-badge {
+  font-size: 9.5px;
   font-weight: 600;
   color: var(--muted);
-  margin-left: 5px;
-}
-.mo-note {
-  font-size: 11px;
-  color: var(--muted);
-  font-style: italic;
-  margin: 10px 0 0;
+  background: rgba(255,255,255,0.05);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 6px;
 }
 
-/* ── Nearest Expiry CE/PE cards ─────────────────────────────── */
-.expiry-card {
-    background: #0b1220;
-    border: 1px solid #1f2937;
-    border-radius: 10px;
-    overflow: hidden;
-    font-family: 'Segoe UI', system-ui, sans-serif;
-    margin-bottom: 0.9rem;
+/* ── EMA20/50/200 badge row ── */
+.mo-index-ema-row { display: flex; gap: 6px; margin-bottom: 10px; }
+.mo-index-ema-item {
+  flex: 1;
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 7px;
+  text-align: center;
 }
-.expiry-card .hdr {
-    text-align: center;
-    padding: 0.5rem 0 0.6rem 0;
-    border-bottom: 1px solid #1f2937;
+.mo-index-ema-label {
+  font-size: 8.5px;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-bottom: 2px;
 }
-.expiry-card .hdr .title {
-    color: #e5e7eb;
-    font-weight: 700;
-    font-size: 0.95rem;
-    letter-spacing: 0.02em;
+.mo-index-ema-val { font-size: 11.5px; font-weight: 700; font-family: var(--mono); }
+.mo-index-ema-check { font-size: 10px; }
+
+.mo-index-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
 }
-.expiry-card .hdr .date {
-    color: #f9fafb;
-    font-size: 1.0rem;
-    font-weight: 600;
-    margin-top: 0.12rem;
+.mo-index-price {
+  font-size: 28px;
+  font-weight: 700;
+  font-family: var(--mono);
+  color: var(--text);
+  line-height: 1.1;
 }
-.expiry-card .hdr .days {
-    color: #9ca3af;
-    font-size: 0.8rem;
-    margin-top: 0.08rem;
+.mo-index-chg { margin-top: 6px; font-family: var(--mono); font-size: 12.5px; }
+
+.mo-index-ohlc-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
 }
-.expiry-card .split {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
+.mo-index-ohlc-item { text-align: left; }
+.mo-index-ohlc-label {
+  font-size: 9px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 3px;
 }
-.expiry-card .side {
-    text-align: center;
-    padding: 0.55rem 0.4rem 0.7rem 0.4rem;
+.mo-index-ohlc-val { font-size: 12px; font-weight: 700; font-family: var(--mono); }
+
+.mo-index-oi-row {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
 }
-.expiry-card .side.ce { border-right: 1px solid #1f2937; }
-.expiry-card .side .label {
-    color: #e5e7eb;
-    font-size: 1.2rem;
-    font-weight: 700;
-    letter-spacing: 0.05em;
-    margin-bottom: 0.3rem;
+.mo-index-oi-item { text-align: left; }
+.mo-index-oi-label {
+  font-size: 9px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 3px;
 }
-.expiry-card .side .strike-premium {
-    font-size: 0.92rem;
-    font-weight: 700;
-    margin-bottom: 0.25rem;
-}
-.expiry-card .side.ce .strike-premium .strike { color: #22c55e; }
-.expiry-card .side.pe .strike-premium .strike { color: #ef4444; }
-.expiry-card .side .strike-premium .premium { color: #e5e7eb; font-weight: 400; }
-.expiry-card .side .oi {
-    color: #9ca3af;
-    font-size: 0.78rem;
-}
-.expiry-card .spot {
-    text-align: center;
-    color: #6b7280;
-    font-size: 0.72rem;
-    padding: 0.3rem 0 0.45rem 0;
-    border-top: 1px solid #1f2937;
-}
+.mo-index-oi-val { font-size: 12.5px; font-weight: 700; font-family: var(--mono); }
+.mo-index-oi-meta { font-size: 9px; color: var(--muted); margin-top: 2px; }
+
+.mo-index-expiry { font-size: 9.5px; color: var(--muted); margin-top: 8px; }
 </style>
 """
 
@@ -1801,11 +1791,14 @@ def _compute_breadth_stats(df: pd.DataFrame) -> dict:
 
 # ── MARKET OVERVIEW PANEL ───────────────────────────────────────────
 
-def _nifty_spark_svg(values: list[float], color: str, width: int = 200, height: int = 64) -> str:
-    """Line + soft gradient-fill sparkline for the Market Overview Nifty
+def _nifty_spark_svg(values: list[float], color: str, width: int = 200, height: int = 64,
+                      grad_id: str = "moNiftyGrad") -> str:
+    """Line + soft gradient-fill sparkline for a Market Overview index
     card. Falls back to a flat dashed line when there's no usable series
-    (e.g. both live and daily Nifty fetches failed) -- honest about the
-    missing data rather than faking a shape."""
+    (e.g. both live and daily fetches failed) -- honest about the missing
+    data rather than faking a shape. grad_id must be unique per card when
+    several sparklines render on the same page (duplicate SVG element IDs
+    are invalid HTML and some browsers only honor the first)."""
     if not values or len(values) < 2:
         y = height / 2
         return (f'<svg class="mo-spark" viewBox="0 0 {width} {height}" preserveAspectRatio="none">'
@@ -1825,10 +1818,10 @@ def _nifty_spark_svg(values: list[float], color: str, width: int = 200, height: 
 
     return (
         f'<svg class="mo-spark" viewBox="0 0 {width} {height}" preserveAspectRatio="none">'
-        f'<defs><linearGradient id="moNiftyGrad" x1="0" y1="0" x2="0" y2="1">'
+        f'<defs><linearGradient id="{grad_id}" x1="0" y1="0" x2="0" y2="1">'
         f'<stop offset="0%" stop-color="{color}" stop-opacity="0.35"/>'
         f'<stop offset="100%" stop-color="{color}" stop-opacity="0"/></linearGradient></defs>'
-        f'<polygon points="{area_pts}" fill="url(#moNiftyGrad)"/>'
+        f'<polygon points="{area_pts}" fill="url(#{grad_id})"/>'
         f'<polyline points="{line_pts}" fill="none" stroke="{color}" stroke-width="2" '
         f'stroke-linecap="round" stroke-linejoin="round"/>'
         f'</svg>'
@@ -1845,63 +1838,62 @@ def _vix_band(vix: float) -> tuple[str, str]:
     return "HIGH", "#f85149"
 
 
-def _market_overview_panel(summary: dict, breadth: dict,
-                            nifty_snapshot: dict | None, scan_time: str) -> str:
+def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
+                      grad_id: str, badge: str = "", ema: dict | None = None) -> str:
     """
-    Full-width 'Market Overview' card — live Nifty price/sparkline/OHLC on
-    the left, breadth + trend + EMA stats on the right, and a row of
-    Regime/EMA50/EMA200/VIX/ADX gate cards underneath. Replaces the old
-    _market_intelligence_panel + _market_status_row pair (2026-07 redesign).
+    Render one equal-width Market Overview index card: EMA20/50/200 badge
+    row, live price, %chg, intraday sparkline, OHLC row, and nearest-expiry
+    CE/PE OI resistance (strike, OI, premium). Used identically for
+    NIFTY 50, SENSEX, and BANK NIFTY so all three stay visually symmetric.
+
+    snapshot: {"price", "pct_chg", "open", "high", "low", "prev_close",
+               "spark", "source"} — utils.scanner_engine index snapshot fns.
+    oi: {"expiry", "ce_strike", "ce_oi", "ce_premium",
+         "pe_strike", "pe_oi", "pe_premium"} — utils.upstox_client.
+         fetch_oi_resistance(). None/empty renders "—" throughout.
+    ema: {"ema20"/"above_ema20", "ema50"/"above_ema50",
+          "ema200"/"above_ema200"} — utils.scanner_engine.compute_ema_levels()
+          / fetch_sensex_ema_levels(). A span is simply skipped in the badge
+          row if it's missing (not enough history yet). None/empty hides
+          the whole row.
+    grad_id: unique sparkline gradient id (see _nifty_spark_svg).
+    badge: optional small right-aligned tag, e.g. "(delayed)".
     """
-    nifty_snapshot = nifty_snapshot or {}
-    r = summary.get("regime", "RANGE")
-    regime_color, _, _ = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
+    snapshot = snapshot or {}
+    oi       = oi or {}
+    ema      = ema or {}
 
-    adx         = float(summary.get("adx", 0))
-    adx_is_real = summary.get("adx_is_real", False)
-    vix         = float(summary.get("vix", 0))
-    ema50_up    = summary.get("nifty_ema50", False)
-    ema200_up   = summary.get("nifty_ema200", False)
-    ema50_val   = summary.get("nifty_ema50_val", 0.0)
-    ema200_val  = summary.get("nifty_ema200_val", 0.0)
-
-    trend_label          = _trend_strength_label(adx, adx_is_real)
-    vix_label, vix_color = _vix_band(vix)
-    trend_color = {"WEAK": "#f85149", "MODERATE": "#d29922", "STRONG": "#3fb950"}[trend_label]
-    trend_pct   = {"WEAK": 33, "MODERATE": 66, "STRONG": 100}[trend_label]
-
-    # ── Nifty price card ─────────────────────────────────────────
-    price      = nifty_snapshot.get("price", 0.0)
-    pct_chg    = nifty_snapshot.get("pct_chg")
-    open_px    = nifty_snapshot.get("open", 0.0)
-    high_px    = nifty_snapshot.get("high", 0.0)
-    low_px     = nifty_snapshot.get("low", 0.0)
-    prev_close = nifty_snapshot.get("prev_close")
-    spark_vals = nifty_snapshot.get("spark", [])
+    price      = snapshot.get("price", 0.0)
+    pct_chg    = snapshot.get("pct_chg")
+    open_px    = snapshot.get("open", 0.0)
+    high_px    = snapshot.get("high", 0.0)
+    low_px     = snapshot.get("low", 0.0)
+    prev_close = snapshot.get("prev_close")
+    spark_vals = snapshot.get("spark", [])
 
     if pct_chg is not None:
-        up          = pct_chg >= 0
-        chg_color   = "#3fb950" if up else "#f85149"
-        arrow       = "▲" if up else "▼"
-        pt_chg      = (price - prev_close) if prev_close else 0.0
-        chg_html    = (
-            f'<span style="color:{chg_color};font-weight:700;font-size:14px">'
+        up        = pct_chg >= 0
+        chg_color = "#3fb950" if up else "#f85149"
+        arrow     = "▲" if up else "▼"
+        pt_chg    = (price - prev_close) if prev_close else 0.0
+        chg_html  = (
+            f'<span style="color:{chg_color};font-weight:700;">'
             f'{arrow} {"+" if up else ""}{pct_chg:.2f}%</span>'
-            f'<span style="color:var(--muted);font-weight:600;font-size:12px;margin-left:6px">'
+            f'<span style="color:var(--muted);font-weight:600;margin-left:6px;">'
             f'({"+" if pt_chg >= 0 else ""}{pt_chg:,.1f})</span>'
         )
         spark_color = chg_color
     else:
-        chg_html    = '<span style="color:var(--muted);font-size:12px">—</span>'
+        chg_html    = '<span style="color:var(--muted)">—</span>'
         spark_color = "#8b949e"
 
     price_str = f"{price:,.0f}" if price else "—"
-    spark_svg = _nifty_spark_svg(spark_vals, spark_color)
+    spark_svg = _nifty_spark_svg(spark_vals, spark_color, width=130, height=46, grad_id=grad_id)
 
-    def _ohlc_item(label, val, color="var(--text)"):
+    def _ohlc_item(lbl, val, color="var(--text)"):
         txt = f"{val:,.0f}" if val else "—"
-        return (f'<div class="mo-ohlc-item"><div class="mo-ohlc-label">{label}</div>'
-                f'<div class="mo-ohlc-val" style="color:{color}">{txt}</div></div>')
+        return (f'<div class="mo-index-ohlc-item"><div class="mo-index-ohlc-label">{lbl}</div>'
+                f'<div class="mo-index-ohlc-val" style="color:{color}">{txt}</div></div>')
 
     ohlc_html = (
         _ohlc_item("Open", open_px) +
@@ -1910,93 +1902,198 @@ def _market_overview_panel(summary: dict, breadth: dict,
         _ohlc_item("Prev. Close", prev_close or 0)
     )
 
-    # ── Right-hand stat grid ──────────────────────────────────────
-    adv, dec  = breadth.get("advancing", 0), breadth.get("declining", 0)
-    hi, lo    = breadth.get("n_52w_high", 0), breadth.get("n_52w_low", 0)
-    e20, e200 = breadth.get("pct_above_ema20", 0), breadth.get("pct_above_ema200", 0)
-    adv_pct   = int(round(100 * adv / max(1, adv + dec)))
+    def _oi_item(lbl, strike, oi_val, premium, color):
+        if strike is None:
+            val_html  = '<span style="color:var(--muted)">—</span>'
+            meta_html = ""
+        else:
+            oi_str    = f"{oi_val:,.0f}" if oi_val else "0"
+            prem_str  = f"₹{premium:,.2f}" if premium else "—"
+            val_html  = f'<span style="color:{color}">{strike:,.0f}</span>'
+            meta_html = f'<div class="mo-index-oi-meta">OI {oi_str} · Premium: {prem_str}</div>'
+        return (f'<div class="mo-index-oi-item"><div class="mo-index-oi-label">{lbl}</div>'
+                f'<div class="mo-index-oi-val">{val_html}</div>{meta_html}</div>')
 
-    def _stat_block(label, tip, value_html, extra_html=""):
-        return (
-            f'<div class="mo-stat">'
-            f'<div class="mo-stat-label" title="{tip}">{label} <span class="mo-info">ⓘ</span></div>'
-            f'<div class="mo-stat-value">{value_html}</div>'
-            f'{extra_html}'
+    oi_html = (
+        _oi_item("CE OI Resistance", oi.get("ce_strike"), oi.get("ce_oi"), oi.get("ce_premium"), "#f85149") +
+        _oi_item("PE OI Resistance", oi.get("pe_strike"), oi.get("pe_oi"), oi.get("pe_premium"), "#3fb950")
+    )
+    expiry      = oi.get("expiry", "")
+    expiry_html = f"Nearest expiry: {expiry}" if expiry else "Nearest expiry: —"
+    badge_html  = f'<span class="mo-index-badge">{badge}</span>' if badge else ""
+
+    ema_specs = (("EMA20", "ema20", "above_ema20"),
+                 ("EMA50", "ema50", "above_ema50"),
+                 ("EMA200", "ema200", "above_ema200"))
+    ema_items = []
+    for ema_lbl, val_key, ok_key in ema_specs:
+        if val_key not in ema:
+            continue
+        ema_ok    = bool(ema.get(ok_key))
+        ema_color = "#3fb950" if ema_ok else "#f85149"
+        ema_mark  = "✓" if ema_ok else "✕"
+        ema_items.append(
+            f'<div class="mo-index-ema-item" style="border-color:{ema_color}55">'
+            f'<div class="mo-index-ema-label">{ema_lbl}</div>'
+            f'<div class="mo-index-ema-val" style="color:{ema_color}">'
+            f'{ema[val_key]:,.0f} <span class="mo-index-ema-check">{ema_mark}</span></div>'
             f'</div>'
         )
+    ema_row_html = f'<div class="mo-index-ema-row">{"".join(ema_items)}</div>' if ema_items else ""
 
-    trend_bar = (f'<div class="mo-bar-track"><div class="mo-bar-fill" '
-                 f'style="width:{trend_pct}%;background:{trend_color}"></div></div>')
-    breadth_extra = (
-        '<div class="mo-stat-sub"><span class="a">Advancing</span>&nbsp;&nbsp;'
-        '<span class="d">Declining</span></div>'
-        f'<div class="mo-bar-track mo-bar-split"><div class="mo-bar-fill" '
-        f'style="width:{adv_pct}%;background:#3fb950"></div></div>'
-    )
+    return f"""
+<div class="mo-index-card">
+  {ema_row_html}
+  <div class="mo-index-label"><span>{label}</span>{badge_html}</div>
+  <div class="mo-index-row">
+    <div>
+      <div class="mo-index-price">{price_str}</div>
+      <div class="mo-index-chg">{chg_html}</div>
+    </div>
+    {spark_svg}
+  </div>
+  <div class="mo-index-ohlc-row">{ohlc_html}</div>
+  <div class="mo-index-oi-row">{oi_html}</div>
+  <div class="mo-index-expiry">{expiry_html}</div>
+</div>
+"""
 
-    stats_html = (
-        _stat_block("Trend Strength", "Based on Nifty ADX(14)",
-                    f'<span style="color:{trend_color}">{trend_label}</span>', trend_bar) +
-        _stat_block("Market Breadth", "Stocks advancing vs declining in this scan",
-                    f'<span class="a">{adv}</span> / <span class="d">{dec}</span>', breadth_extra) +
-        _stat_block("52W High", "Stocks within range of their 52-week high", f'<span class="a">{hi}</span>') +
-        _stat_block("52W Low", "Stocks within range of their 52-week low", f'<span class="d">{lo}</span>') +
-        _stat_block("Above EMA20", "Share of scanned universe trading above EMA20", f'{e20}%') +
-        _stat_block("Above EMA200", "Share of scanned universe trading above EMA200", f'{e200}%')
-    )
 
-    # ── Gate cards row ─────────────────────────────────────────────
-    adx_note = "" if adx_is_real else " · proxy"
+def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
+                            index_cards: list[dict]) -> str:
+    """
+    Full-width 'Market Overview' card — a compact market-health strip
+    (Regime / Trend Strength / Market Breadth / 52W Hi-Lo / EMA20-EMA200 /
+    VIX-ADX) on top, and three equal-width index cards (NIFTY 50, SENSEX,
+    BANK NIFTY) underneath. Replaces the single-Nifty-card + stats-grid
+    layout (2026-07 redesign) with an institutional-terminal-style,
+    information-dense strip that doesn't grow the page height.
 
-    def _gate_card(icon, label, value_html, ok, qualifier="", border_color=None):
-        border = border_color if border_color else ("#3fb950" if ok else "#f85149")
-        check  = f'<span style="color:{border}">{"✓" if ok else "✕"}</span>'
-        qual   = f'<span class="mo-gate-qual">({qualifier})</span>' if qualifier else ""
-        return (
-            f'<div class="mo-gate-card" style="border-color:{border}66">'
-            f'<div class="mo-gate-top"><span class="mo-gate-icon">{icon}</span>'
-            f'<span class="mo-gate-label">{label}</span>{check}</div>'
-            f'<div class="mo-gate-value" style="color:{border}">{value_html}{qual}</div>'
-            f'</div>'
-        )
+    index_cards: list of {"label", "snapshot", "oi", "badge", "ema"} dicts,
+    one per index, rendered via _index_card_html() in the given order.
+    "ema" is the compute_ema_levels()/fetch_sensex_ema_levels() output.
+    """
+    r = summary.get("regime", "RANGE")
+    regime_color, _, _ = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
 
-    ema50_str  = f"{ema50_val:,.0f}"  if ema50_val  else "—"
-    ema200_str = f"{ema200_val:,.0f}" if ema200_val else "—"
+    adx         = float(summary.get("adx", 0))
+    adx_is_real = summary.get("adx_is_real", False)
+    vix         = float(summary.get("vix", 0))
+    ema50_up    = summary.get("nifty_ema50", False)
+    ema200_up   = summary.get("nifty_ema200", False)
 
-    gates_html = (
-        _gate_card("🎯", "NIFTY REGIME", r, True, border_color=regime_color) +
-        _gate_card("📈", "EMA50",  ema50_str,  ema50_up) +
-        _gate_card("📉", "EMA200", ema200_str, ema200_up) +
-        _gate_card("💓", "VIX",    f"{vix:.1f}", vix <= 22.0, qualifier=vix_label, border_color=vix_color if vix <= 22.0 else None) +
-        _gate_card("🛡️", "ADX",   f"{adx:.0f}{adx_note}", adx >= 25.0, qualifier=trend_label, border_color=trend_color if adx_is_real else None)
-    )
+    trend_label          = _trend_strength_label(adx, adx_is_real)
+    vix_label, vix_color = _vix_band(vix)
+    trend_color = {"WEAK": "#f85149", "MODERATE": "#d29922", "STRONG": "#3fb950"}[trend_label]
+    trend_pct   = {"WEAK": 33, "MODERATE": 66, "STRONG": 100}[trend_label]
 
+    # ── Regime card ────────────────────────────────────────────────
     mkt_note = {
         "TREND":    "Trending market · Full position sizing active.",
         "RANGE":    "Range-bound market · Gate restricted · Half position sizing.",
         "VOLATILE": "Volatile market · Execute gate closed · No new positions.",
     }.get(r, "")
+    regime_card = f"""
+<div class="mo-health-card mo-regime-card">
+  <span class="mo-regime-icon">🎯</span>
+  <div class="mo-regime-body">
+    <div class="mo-health-label">NIFTY REGIME <span style="color:{regime_color};margin-left:auto">✓</span></div>
+    <div class="mo-regime-tag" style="color:{regime_color}">{r}</div>
+    <div class="mo-regime-note">{mkt_note}</div>
+  </div>
+</div>"""
+
+    # ── Trend Strength card ────────────────────────────────────────
+    trend_card = f"""
+<div class="mo-health-card">
+  <div class="mo-health-label" title="Based on Nifty ADX(14)">Trend Strength <span class="mo-info">ⓘ</span></div>
+  <div class="mo-health-value" style="color:{trend_color}">{trend_label}</div>
+  <div class="mo-bar-track"><div class="mo-bar-fill" style="width:{trend_pct}%;background:{trend_color}"></div></div>
+</div>"""
+
+    # ── Market Breadth card ────────────────────────────────────────
+    adv, dec = breadth.get("advancing", 0), breadth.get("declining", 0)
+    adv_pct  = int(round(100 * adv / max(1, adv + dec)))
+    breadth_card = f"""
+<div class="mo-health-card">
+  <div class="mo-health-label" title="Stocks advancing vs declining in this scan">Market Breadth <span class="mo-info">ⓘ</span></div>
+  <div class="mo-health-value"><span class="a">{adv}</span> / <span class="d">{dec}</span></div>
+  <div class="mo-bar-legend"><span class="a">Advancing</span><span class="d">Declining</span></div>
+  <div class="mo-bar-track mo-bar-split"><div class="mo-bar-fill" style="width:{adv_pct}%;background:#3fb950"></div></div>
+</div>"""
+
+    # ── 52W High/Low card ──────────────────────────────────────────
+    hi, lo = breadth.get("n_52w_high", 0), breadth.get("n_52w_low", 0)
+    hilo_card = f"""
+<div class="mo-health-card">
+  <div class="mo-mini-pair">
+    <div class="mo-mini-item">
+      <div class="mo-mini-label" title="Stocks within range of their 52-week high">52W High</div>
+      <div class="mo-mini-val a">{hi}</div>
+    </div>
+    <div class="mo-mini-item">
+      <div class="mo-mini-label" title="Stocks within range of their 52-week low">52W Low</div>
+      <div class="mo-mini-val d">{lo}</div>
+    </div>
+  </div>
+</div>"""
+
+    # ── EMA20/EMA200 breadth card ──────────────────────────────────
+    e20, e200 = breadth.get("pct_above_ema20", 0), breadth.get("pct_above_ema200", 0)
+    ema_card = f"""
+<div class="mo-health-card">
+  <div class="mo-mini-pair">
+    <div class="mo-mini-item">
+      <div class="mo-mini-label" title="Share of scanned universe trading above EMA20">Above EMA20</div>
+      <div class="mo-mini-val" style="color:{'#3fb950' if ema50_up else 'var(--text)'}">{e20}%</div>
+    </div>
+    <div class="mo-mini-item">
+      <div class="mo-mini-label" title="Share of scanned universe trading above EMA200">Above EMA200</div>
+      <div class="mo-mini-val" style="color:{'#3fb950' if ema200_up else 'var(--text)'}">{e200}%</div>
+    </div>
+  </div>
+</div>"""
+
+    # ── VIX/ADX gate card ───────────────────────────────────────────
+    adx_note   = "" if adx_is_real else "·proxy"
+    vix_ok     = vix <= 22.0
+    adx_ok     = adx >= 25.0
+    vix_gate_c = vix_color if vix_ok else "#f85149"
+    adx_gate_c = trend_color if adx_is_real else "#8b949e"
+    gate_card = f"""
+<div class="mo-health-card">
+  <div class="mo-mini-pair">
+    <div class="mo-mini-item">
+      <div class="mo-gate-mini-top"><span class="mo-gate-mini-icon">💓</span><span class="mo-mini-label">VIX</span>
+        <span class="mo-gate-mini-check" style="color:{vix_gate_c}">{"✓" if vix_ok else "✕"}</span></div>
+      <div class="mo-mini-val" style="color:{vix_gate_c}">{vix:.1f}<span class="mo-gate-mini-qual">{vix_label}</span></div>
+    </div>
+    <div class="mo-mini-item">
+      <div class="mo-gate-mini-top"><span class="mo-gate-mini-icon">🛡️</span><span class="mo-mini-label">ADX</span>
+        <span class="mo-gate-mini-check" style="color:{adx_gate_c}">{"✓" if adx_ok else "✕"}</span></div>
+      <div class="mo-mini-val" style="color:{adx_gate_c}">{adx:.0f}{adx_note}<span class="mo-gate-mini-qual">{trend_label}</span></div>
+    </div>
+  </div>
+</div>"""
+
+    health_html = regime_card + trend_card + breadth_card + hilo_card + ema_card + gate_card
+
+    # ── Index cards row ─────────────────────────────────────────────
+    cards_html = "".join(
+        _index_card_html(
+            c.get("label", ""), c.get("snapshot"), c.get("oi"),
+            grad_id=f"moSpark{i}", badge=c.get("badge", ""), ema=c.get("ema"),
+        )
+        for i, c in enumerate(index_cards)
+    )
+
     scan_chip = f'<span class="mo-scan-chip">Last scan: <b>{scan_time} IST</b></span>' if scan_time else ""
 
     return f"""
 <div class="mo-panel">
   <div class="mo-title">MARKET OVERVIEW ⓘ {scan_chip}</div>
-  <div class="mo-top-grid">
-    <div class="mo-nifty-card">
-      <div class="mo-nifty-label">NIFTY 50</div>
-      <div class="mo-nifty-row">
-        <div>
-          <div class="mo-nifty-price">{price_str}</div>
-          <div class="mo-nifty-chg">{chg_html}</div>
-        </div>
-        {spark_svg}
-      </div>
-      <div class="mo-ohlc-row">{ohlc_html}</div>
-    </div>
-    <div class="mo-stats-grid">{stats_html}</div>
-  </div>
-  <div class="mo-gates-row">{gates_html}</div>
-  <p class="mo-note">{mkt_note}</p>
+  <div class="mo-health-row">{health_html}</div>
+  <div class="mo-index-grid">{cards_html}</div>
 </div>
 """
 
@@ -3325,72 +3422,132 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
             )
 
 
-# ── MAIN RENDER ───────────────────────────────────────────────────
+# ── MARKET INTELLIGENCE — continuous, decoupled from Run Scan ──────────
+# 2026-07-16: previously all of this (Nifty/Sensex live quotes, EMA levels,
+# nearest-expiry OI resistance) only fetched once per manual "Run Scan"
+# click, inside the same block that kicks off the full 500-symbol
+# historical fetch + scoring pass. Those are two different things running
+# on two different natural cadences: a live quote should be seconds-fresh,
+# a 500-symbol historical rescan is a deliberate, manual action. Coupling
+# them meant the market intel strip was only ever as fresh as the last
+# time someone clicked Run Scan — stale for however long between scans.
+#
+# st.fragment(run_every=...) reruns ONLY this function on its own timer,
+# independent of the rest of the page and of any button click. It always
+# uses Upstox first (live quotes) with yfinance fallback only if the
+# token's missing/expired or the request fails — see fetch_index_quote()/
+# fetch_oi_resistance() in utils/upstox_client.py. The Run Scan button's
+# `source` selector (yfinance/upstox) is unrelated to this — that toggle
+# controls the historical OHLCV fetch for scoring, not the live strip.
+_MARKET_INTEL_REFRESH_SECS = 20  # matches fetch_index_quote's own ttl=15
+                                   # cache reasonably closely without
+                                   # hammering Upstox on every tick
 
-def _fmt_expiry(n, decimals=1):
-    if n is None:
-        return "—"
-    return f"{n:,.{decimals}f}"
 
+@st.fragment(run_every=_MARKET_INTEL_REFRESH_SECS)
+def _market_intelligence_fragment():
+    """
+    Fetches live Nifty/Sensex quotes, EMA20/50/200 levels, and nearest-
+    expiry OI resistance, then renders the full Market Overview panel.
+    Runs on its own _MARKET_INTEL_REFRESH_SECS timer via st.fragment,
+    whether or not a scan has ever been triggered. The regime/trend/
+    breadth portion of the panel still reflects the most recent scan
+    (session_state["scan_summary"]/["scan_df"]) since those are properties
+    of the scored universe, not something a live quote feed can supply on
+    its own — only the index-card portion (price, OHLC, OI, EMA) is truly
+    live here.
+    """
+    # ── Nifty snapshot ──────────────────────────────────────────────
+    try:
+        from utils.scanner_engine import fetch_nifty_intraday_snapshot, fetch_nifty, compute_ema_levels
+        _nifty_series = fetch_nifty("1y")
+        _snap = fetch_nifty_intraday_snapshot()
+        if _snap.get("price"):
+            st.session_state["nifty_snapshot"] = _snap
+        elif _nifty_series is not None and len(_nifty_series) >= 2:
+            last = float(_nifty_series.iloc[-1])
+            prev = float(_nifty_series.iloc[-2])
+            st.session_state["nifty_snapshot"] = {
+                "price": last,
+                "pct_chg": round((last - prev) / prev * 100, 2),
+                "open": 0.0, "high": 0.0, "low": 0.0,
+                "prev_close": prev,
+                "spark": _nifty_series.tail(15).tolist(),
+            }
+        st.session_state["nifty_ema_levels"] = (
+            compute_ema_levels(_nifty_series) if _nifty_series is not None else {}
+        )
+    except Exception:
+        st.session_state.setdefault("nifty_snapshot", {})
+        st.session_state.setdefault("nifty_ema_levels", {})
 
-def _render_expiry_card(index_label: str, underlying_key: str) -> None:
-    """Nearest-expiry ATM CE/PE snapshot card (strike, premium, OI) —
-    live Upstox option-chain data, not part of the OHLCV cache pipeline.
-    See utils.upstox_client.get_expiry_card_data for the fetch/ATM logic."""
-    from utils.upstox_client import get_expiry_card_data
-    data = get_expiry_card_data(underlying_key)
+    # ── Sensex snapshot — Upstox first (live price/OHLC), yfinance
+    #    backfill for spark only (Upstox's quote endpoint is a single
+    #    point-in-time snapshot with no historical series in it at all —
+    #    there's nothing to draw a sparkline from until we add one).
+    try:
+        from utils.upstox_client import fetch_index_quote
+        _sx = fetch_index_quote("SENSEX")
+        if _sx is not None:
+            _sx["source"] = "upstox"
+    except Exception:
+        _sx = None
+    if _sx is None:
+        try:
+            from utils.scanner_engine import fetch_sensex_intraday_snapshot
+            _sx = fetch_sensex_intraday_snapshot()
+            _sx["source"] = "yfinance"
+        except Exception:
+            _sx = {}
+    elif not _sx.get("spark"):
+        # Upstox gave us live price/OHLC — just missing the spark. Pull
+        # yfinance's intraday snapshot (cheap, @st.cache_data ttl=30) for
+        # its "spark" list only; leave everything else Upstox-sourced.
+        try:
+            from utils.scanner_engine import fetch_sensex_intraday_snapshot
+            _yf_spark = fetch_sensex_intraday_snapshot().get("spark") or []
+            if _yf_spark:
+                _sx["spark"] = _yf_spark
+        except Exception:
+            pass
+    st.session_state["sensex_snapshot"] = _sx or {}
 
-    if data is None:
-        st.markdown(f"""
-        <div class="expiry-card">
-            <div class="hdr">
-                <div class="title">{index_label} — Nearest Expiry</div>
-                <div class="date">—</div>
-                <div class="days">No data</div>
-            </div>
-            <div class="split">
-                <div class="side ce"><div class="label">CE</div>
-                    <div class="strike-premium"><span class="strike">—</span></div>
-                    <div class="oi">OI — —</div></div>
-                <div class="side pe"><div class="label">PE</div>
-                    <div class="strike-premium"><span class="strike">—</span></div>
-                    <div class="oi">OI — —</div></div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        return
+    try:
+        from utils.scanner_engine import fetch_sensex_ema_levels
+        st.session_state["sensex_ema_levels"] = fetch_sensex_ema_levels()
+    except Exception:
+        st.session_state["sensex_ema_levels"] = {}
 
-    days_label = "Today" if data["days_to_expiry"] == 0 else (
-        "1 day" if data["days_to_expiry"] == 1 else f"{data['days_to_expiry']} days"
+    # ── Nearest-expiry OI resistance (Upstox option chain) ──────────
+    try:
+        from utils.upstox_client import fetch_oi_resistance
+        st.session_state["oi_resistance"] = fetch_oi_resistance("NIFTY") or {}
+    except Exception:
+        st.session_state["oi_resistance"] = {}
+    try:
+        from utils.upstox_client import fetch_oi_resistance
+        st.session_state["sensex_oi_resistance"] = fetch_oi_resistance("SENSEX") or {}
+    except Exception:
+        st.session_state["sensex_oi_resistance"] = {}
+
+    # ── Render ────────────────────────────────────────────────────
+    summary   = st.session_state.get("scan_summary", {})
+    scan_time = st.session_state.get("scan_time", "")
+    breadth   = _compute_breadth_stats(st.session_state.get("scan_df", pd.DataFrame()))
+    index_cards = [
+        {"label": "NIFTY 50", "snapshot": st.session_state.get("nifty_snapshot", {}),
+         "oi": st.session_state.get("oi_resistance", {}), "badge": "",
+         "ema": st.session_state.get("nifty_ema_levels", {})},
+        {"label": "SENSEX",   "snapshot": st.session_state.get("sensex_snapshot", {}),
+         "oi": st.session_state.get("sensex_oi_resistance", {}), "badge": "",
+         "ema": st.session_state.get("sensex_ema_levels", {})},
+    ]
+    st.markdown(
+        _market_overview_panel(summary, breadth, scan_time, index_cards),
+        unsafe_allow_html=True,
     )
-    st.markdown(f"""
-    <div class="expiry-card">
-        <div class="hdr">
-            <div class="title">{index_label} — Nearest Expiry</div>
-            <div class="date">{data['expiry']}</div>
-            <div class="days">{days_label}</div>
-        </div>
-        <div class="split">
-            <div class="side ce">
-                <div class="label">CE</div>
-                <div class="strike-premium">
-                    <span class="strike">{_fmt_expiry(data['ce_strike'], 0)}</span>
-                    <span class="premium"> – Premium {_fmt_expiry(data['ce_premium'])}</span>
-                </div>
-                <div class="oi">OI - {_fmt_expiry(data['ce_oi'], 0)}</div>
-            </div>
-            <div class="side pe">
-                <div class="label">PE</div>
-                <div class="strike-premium">
-                    <span class="strike">{_fmt_expiry(data['pe_strike'], 0)}</span>
-                    <span class="premium"> – Premium {_fmt_expiry(data['pe_premium'])}</span>
-                </div>
-                <div class="oi">OI - {_fmt_expiry(data['pe_oi'], 0)}</div>
-            </div>
-        </div>
-        <div class="spot">Spot: {_fmt_expiry(data['spot'])}</div>
-    </div>
-    """, unsafe_allow_html=True)
+
+
 
 
 def render(settings: dict | None = None):
@@ -3476,25 +3633,14 @@ def render(settings: dict | None = None):
         st.session_state["scan_time"]     = _now_ist().strftime("%H:%M:%S")
         st.session_state["scan_settings"] = effective
 
-        # Nifty snapshot for the Market Overview card: price, %chg, OHLC, spark
-        try:
-            from utils.scanner_engine import fetch_nifty_intraday_snapshot
-            _snap = fetch_nifty_intraday_snapshot()
-            if _snap.get("price"):
-                st.session_state["nifty_snapshot"] = _snap
-            elif nifty_series is not None and len(nifty_series) >= 2:
-                # Fallback to the daily series already fetched for regime calc
-                last = float(nifty_series.iloc[-1])
-                prev = float(nifty_series.iloc[-2])
-                st.session_state["nifty_snapshot"] = {
-                    "price": last,
-                    "pct_chg": round((last - prev) / prev * 100, 2),
-                    "open": 0.0, "high": 0.0, "low": 0.0,
-                    "prev_close": prev,
-                    "spark": nifty_series.tail(15).tolist(),
-                }
-        except Exception:
-            pass
+        # 2026-07-16: Nifty/Sensex live quotes, EMA levels, and OI
+        # resistance used to be fetched here on every scan click — moved
+        # to _market_intelligence_fragment() (see above _market_overview_panel),
+        # which now refreshes continuously on its own timer via
+        # st.fragment(run_every=...), independent of Run Scan entirely.
+        # scan_summary/scan_df above are all this button needs to update;
+        # the fragment picks them up on its next tick (or immediately,
+        # since this button click triggers a full-script rerun anyway).
 
         if supabase_ok and save_db:
             save_scan_snapshot(df_aug)
@@ -3540,10 +3686,14 @@ def render(settings: dict | None = None):
             st.toast("Saved to Supabase.", icon="✅")
 
     # ── Display ────────────────────────────────────────────────
-    df_aug         = st.session_state.get("scan_df",       pd.DataFrame())
-    summary        = st.session_state.get("scan_summary",  {})
-    scan_time      = st.session_state.get("scan_time",     "")
-    nifty_snapshot = st.session_state.get("nifty_snapshot", {})
+    df_aug          = st.session_state.get("scan_df",       pd.DataFrame())
+    summary         = st.session_state.get("scan_summary",  {})
+    scan_time       = st.session_state.get("scan_time",     "")
+
+    # ── Market Overview — continuous, live via Upstox, independent of
+    #    whether a scan has ever been run (see _market_intelligence_fragment
+    #    above _market_overview_panel for the fetch + render logic).
+    _market_intelligence_fragment()
 
     if df_aug.empty:
         st.markdown("""
@@ -3554,31 +3704,10 @@ def render(settings: dict | None = None):
         </div>""", unsafe_allow_html=True)
         return
 
-    # ── Market Overview ───────────────────────────────────────────
-    breadth       = _compute_breadth_stats(df_aug)
     active_df = (
         df_aug[df_aug["Recommendation"] != "Avoid"]
         if "Recommendation" in df_aug.columns else df_aug
     )
-
-    st.markdown(
-        _market_overview_panel(summary, breadth, nifty_snapshot, scan_time),
-        unsafe_allow_html=True,
-    )
-
-    # ── Nearest Expiry — Nifty & Sensex CE/PE snapshot ─────────────
-    # Live Upstox option-chain data (utils.upstox_client.get_expiry_card_data),
-    # not part of the OHLCV scan pipeline — renders regardless of scan
-    # results as long as the Upstox token is valid. Skipped entirely (no
-    # empty placeholder cards) if there's no Upstox token configured, since
-    # this data has no yfinance equivalent to fall back to.
-    from utils.upstox_client import get_upstox_token, INDEX_INSTRUMENT_KEYS
-    if get_upstox_token():
-        exp_col1, exp_col2 = st.columns(2)
-        with exp_col1:
-            _render_expiry_card("NIFTY", INDEX_INSTRUMENT_KEYS["NIFTY"])
-        with exp_col2:
-            _render_expiry_card("SENSEX", INDEX_INSTRUMENT_KEYS["SENSEX"])
 
     # ── Signal class counts ───────────────────────────────────────
     if "Recommendation" in df_aug.columns:
