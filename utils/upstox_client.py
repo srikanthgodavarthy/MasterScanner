@@ -546,8 +546,9 @@ def _fetch_quotes_batch(instrument_keys: list[str]) -> dict:
 # leg, and let the Market Overview panel decide how to phrase it.
 
 _INDEX_INSTRUMENT_KEYS = {
-    "NIFTY":  "NSE_INDEX|Nifty 50",
-    "SENSEX": "BSE_INDEX|SENSEX",
+    "NIFTY":     "NSE_INDEX|Nifty 50",
+    "SENSEX":    "BSE_INDEX|SENSEX",
+    "BANKNIFTY": "NSE_INDEX|Nifty Bank",
 }
 
 
@@ -641,13 +642,13 @@ def fetch_nearest_expiry(index: str = "NIFTY") -> str | None:
 def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
     """
     Return the nearest-expiry Call/Put OI resistance levels for `index`
-    ("NIFTY" or "SENSEX") via Upstox's option-chain endpoint:
+    ("NIFTY", "SENSEX", or "BANKNIFTY") via Upstox's option-chain endpoint:
       GET /v2/option/chain?instrument_key=...&expiry_date=...
 
     {
-      "expiry":    "2026-07-24",
-      "ce_strike": 25400.0, "ce_oi": 8123450,   # highest-OI Call strike
-      "pe_strike": 24800.0, "pe_oi": 7543210,   # highest-OI Put strike
+      "expiry":     "2026-07-24",
+      "ce_strike": 25400.0, "ce_oi": 8123450, "ce_premium": 42.15,  # highest-OI Call strike
+      "pe_strike": 24800.0, "pe_oi": 7543210, "pe_premium": 38.60,  # highest-OI Put strike
     }
 
     Returns None on any failure (missing/expired token, empty chain, etc.)
@@ -680,15 +681,20 @@ def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
         def _oi(row: dict, leg: str) -> float:
             return ((row.get(leg) or {}).get("market_data") or {}).get("oi", 0) or 0
 
+        def _premium(row: dict, leg: str) -> float:
+            return ((row.get(leg) or {}).get("market_data") or {}).get("ltp", 0) or 0
+
         best_ce = max(chain, key=lambda r: _oi(r, "call_options"))
         best_pe = max(chain, key=lambda r: _oi(r, "put_options"))
 
         return {
-            "expiry":    expiry,
-            "ce_strike": best_ce.get("strike_price"),
-            "ce_oi":     _oi(best_ce, "call_options"),
-            "pe_strike": best_pe.get("strike_price"),
-            "pe_oi":     _oi(best_pe, "put_options"),
+            "expiry":     expiry,
+            "ce_strike":  best_ce.get("strike_price"),
+            "ce_oi":      _oi(best_ce, "call_options"),
+            "ce_premium": _premium(best_ce, "call_options"),
+            "pe_strike":  best_pe.get("strike_price"),
+            "pe_oi":      _oi(best_pe, "put_options"),
+            "pe_premium": _premium(best_pe, "put_options"),
         }
     except Exception:
         logger.warning("Upstox option-chain fetch failed for %s", index, exc_info=True)
