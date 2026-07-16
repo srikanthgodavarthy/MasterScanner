@@ -3272,11 +3272,14 @@ def render(settings: dict | None = None):
     with ctrl2:
         save_db = st.checkbox("💾 Save to DB", value=True, key="chk_save_db")
     with ctrl3:
+        _src = settings.get('data_source', 'yfinance')
+        _src_label = "🟠 Upstox" if _src == "upstox" else "📈 Yahoo Finance"
         st.markdown(
             f"<div style='padding:0.55rem 0;color:#8b949e;font-size:0.78rem;'>"
             f"Universe: <b style='color:var(--text)'>{len(settings.get('symbols', NIFTY500_SYMBOLS))}</b> symbols"
             f" &nbsp;·&nbsp; Execute threshold: <b style='color:var(--text)'>{settings.get('execute_threshold', 70)}</b>"
-            f" &nbsp;·&nbsp; Workers: <b style='color:var(--text)'>{settings.get('workers', 10)}</b></div>",
+            f" &nbsp;·&nbsp; Workers: <b style='color:var(--text)'>{settings.get('workers', 10)}</b>"
+            f" &nbsp;·&nbsp; Source: <b style='color:var(--text)'>{_src_label}</b></div>",
             unsafe_allow_html=True)
     with ctrl4:
         if st.button("🗑️", key="sb_clear_cache", help="Clear data cache"):
@@ -3293,17 +3296,22 @@ def render(settings: dict | None = None):
         def _cb(pct):
             prog.progress(min(pct, 1.0), text=f"Scanning… {int(pct*100)}%")
 
+        _source_warnings = []
         with st.spinner("Running scanner…"):
             df_raw = run_scanner(
                 symbols,
-                settings    = effective,
-                cci_len     = effective.get("cci_len",  20),
-                cci_ob      = effective.get("cci_ob",  100),
-                cci_os      = effective.get("cci_os", -100),
-                max_workers = effective.get("workers",  10),
-                progress_cb = _cb,
+                settings       = effective,
+                cci_len        = effective.get("cci_len",  20),
+                cci_ob         = effective.get("cci_ob",  100),
+                cci_os         = effective.get("cci_os", -100),
+                max_workers    = effective.get("workers",  10),
+                progress_cb    = _cb,
+                source         = effective.get("data_source", "yfinance"),
+                source_warn_cb = _source_warnings.append,
             )
         prog.empty()
+        for _msg in _source_warnings:
+            st.warning(_msg)
 
         if df_raw.empty:
             st.warning("No results returned. Check data connection or try fewer symbols.")
