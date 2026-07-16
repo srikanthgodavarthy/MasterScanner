@@ -729,6 +729,17 @@ def fetch_nifty_intraday_snapshot() -> dict:
       "low": float, "prev_close": float | None, "spark": list[float]
     }
 
+    2026-07-16: price/pct_chg/open/high/low/prev_close now come from
+    Upstox's live index quote (upstox_client.fetch_index_quote("NIFTY"))
+    by default when it's available — real-time, vs. yfinance's ~15-min-
+    delayed index feed. yfinance is still used for the sparkline (Upstox's
+    historical-candle endpoint, as wired up in this app, only returns
+    daily-resolution bars — see _fetch_candles()'s date-only index — so it
+    can't produce an intraday path) and remains the full fallback (numbers
+    + spark) whenever the Upstox quote comes back None (token expired, not
+    entitled, request failed, etc.). fetch_index_quote() is itself
+    fail-soft, so this never raises even if Upstox is fully unreachable.
+
     Same IST-aware "today" logic as fetch_nifty_live(). If the market hasn't
     opened yet today (or intraday data can't be fetched at all), falls back
     to the last completed daily bar for Open/High/Low/Close and the most
@@ -737,6 +748,7 @@ def fetch_nifty_intraday_snapshot() -> dict:
     used for the sector sparkline fallback in pages/scanner.py.
     """
     import pytz
+    from utils.upstox_client import fetch_index_quote
     _IST = pytz.timezone("Asia/Kolkata")
 
     def _today_ist() -> pd.Timestamp:
@@ -745,6 +757,9 @@ def fetch_nifty_intraday_snapshot() -> dict:
     out = {"price": 0.0, "pct_chg": None, "open": 0.0, "high": 0.0,
            "low": 0.0, "prev_close": None, "spark": []}
 
+    ux = fetch_index_quote("NIFTY")   # live numbers, or None — spark always comes from yfinance below
+
+    got_spark = False
     try:
         df = yf.Ticker("^NSEI").history(period="2d", interval="1m", auto_adjust=True)
         if not df.empty:
@@ -765,27 +780,34 @@ def fetch_nifty_intraday_snapshot() -> dict:
                     # Evenly-ish sampled closes across the session for the spark line
                     "spark":      today_bars["Close"].tolist()[::max(1, len(today_bars)//60)],
                 })
-                return out
+                got_spark = True
     except Exception:
         pass
 
     # Market not yet open / intraday fetch failed — fall back to daily bars
-    try:
-        daily = yf.Ticker("^NSEI").history(period="1mo", auto_adjust=True)
-        if len(daily) >= 2:
-            last, prev = daily.iloc[-1], daily.iloc[-2]
-            last_close, prev_close = float(last["Close"]), float(prev["Close"])
-            out.update({
-                "price":      last_close,
-                "pct_chg":    round((last_close - prev_close) / prev_close * 100, 2) if prev_close else None,
-                "open":       float(last["Open"]),
-                "high":       float(last["High"]),
-                "low":        float(last["Low"]),
-                "prev_close": prev_close,
-                "spark":      daily["Close"].tail(15).tolist(),
-            })
-    except Exception:
-        pass
+    if not got_spark:
+        try:
+            daily = yf.Ticker("^NSEI").history(period="1mo", auto_adjust=True)
+            if len(daily) >= 2:
+                last, prev = daily.iloc[-1], daily.iloc[-2]
+                last_close, prev_close = float(last["Close"]), float(prev["Close"])
+                out.update({
+                    "price":      last_close,
+                    "pct_chg":    round((last_close - prev_close) / prev_close * 100, 2) if prev_close else None,
+                    "open":       float(last["Open"]),
+                    "high":       float(last["High"]),
+                    "low":        float(last["Low"]),
+                    "prev_close": prev_close,
+                    "spark":      daily["Close"].tail(15).tolist(),
+                })
+        except Exception:
+            pass
+
+    if ux:
+        # Upstox numbers win whenever present — spark (yfinance-only) is
+        # untouched since ux never carries a "spark" key.
+        out.update({k: v for k, v in ux.items() if v is not None})
+
     return out
 
 
@@ -795,7 +817,10 @@ def fetch_sensex_intraday_snapshot() -> dict:
     Return today's BSE Sensex (^BSESN) snapshot for the Market Overview
     panel's SENSEX index card: live price, day %chg, today's Open/High/Low,
     previous close, and an intraday price path for the sparkline. Mirrors
-    fetch_nifty_intraday_snapshot()'s shape exactly.
+    fetch_nifty_intraday_snapshot()'s shape exactly, including its
+    2026-07-16 Upstox-numbers-by-default behaviour (see that function's
+    docstring — same fetch_index_quote("SENSEX") overlay, yfinance still
+    owns the sparkline and is the full fallback if Upstox is unavailable).
 
     {
       "price": float, "pct_chg": float | None, "open": float, "high": float,
@@ -809,6 +834,7 @@ def fetch_sensex_intraday_snapshot() -> dict:
     yesterday's shape rather than a blank card.
     """
     import pytz
+    from utils.upstox_client import fetch_index_quote
     _IST = pytz.timezone("Asia/Kolkata")
 
     def _today_ist() -> pd.Timestamp:
@@ -817,6 +843,9 @@ def fetch_sensex_intraday_snapshot() -> dict:
     out = {"price": 0.0, "pct_chg": None, "open": 0.0, "high": 0.0,
            "low": 0.0, "prev_close": None, "spark": []}
 
+    ux = fetch_index_quote("SENSEX")   # live numbers, or None — spark always comes from yfinance below
+
+    got_spark = False
     try:
         df = yf.Ticker("^BSESN").history(period="2d", interval="1m", auto_adjust=True)
         if not df.empty:
@@ -836,27 +865,32 @@ def fetch_sensex_intraday_snapshot() -> dict:
                     "prev_close": prev_close,
                     "spark":      today_bars["Close"].tolist()[::max(1, len(today_bars)//60)],
                 })
-                return out
+                got_spark = True
     except Exception:
         pass
 
     # Market not yet open / intraday fetch failed — fall back to daily bars
-    try:
-        daily = yf.Ticker("^BSESN").history(period="1mo", auto_adjust=True)
-        if len(daily) >= 2:
-            last, prev = daily.iloc[-1], daily.iloc[-2]
-            last_close, prev_close = float(last["Close"]), float(prev["Close"])
-            out.update({
-                "price":      last_close,
-                "pct_chg":    round((last_close - prev_close) / prev_close * 100, 2) if prev_close else None,
-                "open":       float(last["Open"]),
-                "high":       float(last["High"]),
-                "low":        float(last["Low"]),
-                "prev_close": prev_close,
-                "spark":      daily["Close"].tail(15).tolist(),
-            })
-    except Exception:
-        pass
+    if not got_spark:
+        try:
+            daily = yf.Ticker("^BSESN").history(period="1mo", auto_adjust=True)
+            if len(daily) >= 2:
+                last, prev = daily.iloc[-1], daily.iloc[-2]
+                last_close, prev_close = float(last["Close"]), float(prev["Close"])
+                out.update({
+                    "price":      last_close,
+                    "pct_chg":    round((last_close - prev_close) / prev_close * 100, 2) if prev_close else None,
+                    "open":       float(last["Open"]),
+                    "high":       float(last["High"]),
+                    "low":        float(last["Low"]),
+                    "prev_close": prev_close,
+                    "spark":      daily["Close"].tail(15).tolist(),
+                })
+        except Exception:
+            pass
+
+    if ux:
+        out.update({k: v for k, v in ux.items() if v is not None})
+
     return out
 
 
