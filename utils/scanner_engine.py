@@ -589,40 +589,24 @@ _PERIOD_TO_YEARS = {"3mo": 0.25, "6mo": 0.5, "1y": 1.0, "2y": 2.0, "5y": 5.0}
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d") -> dict:
+def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d",
+                       source: str = "yfinance") -> dict:
     """
-    2026-07-16: reverted off utils.history_store. The Supabase Storage tier
-    started timing out on every symbol (15s cap hit consistently, not just
-    occasionally), so the "cache" was strictly slower than a plain fetch —
-    every call paid the full local+Supabase round trip AND still fell
-    through to network. Back to a direct yf_download_with_retry() call per
-    batch (retry/backoff kept — that part was a real fix, not part of the
-    caching layer). history_store.py itself is untouched in case Supabase
-    Storage gets sorted out and this is worth revisiting later.
+    2026-07-16: back on utils.history_store, now with Supabase disabled
+    (see history_store._supabase_storage()) rather than removed outright.
+    Without ANY cache, a full run re-downloads the whole `period` window
+    for every symbol on every click — that's what was actually making
+    things feel slow, not the network fetch itself. The local parquet tier
+    (same-session only, no Supabase round trip) gets that back: repeat
+    scans in one session only pay for a live-tail fetch, not a full
+    re-download. `interval` is assumed daily; history_store doesn't
+    support intraday caching.
     """
     if not symbols:
         return {}
-    tickers = [f"{s}.NS" for s in symbols]
-    raw = yf_download_with_retry(
-        tickers, period=period, interval=interval,
-        auto_adjust=True, group_by="ticker", threads=True, progress=False,
-    )
-    if raw.empty:
-        return {}
-    result = {}
-    single = len(tickers) == 1
-    for sym, ticker in zip(symbols, tickers):
-        try:
-            df = raw if single else raw[ticker]
-            df = df.dropna(how="all")
-            if df.empty or len(df) < 60:
-                continue
-            df.index   = _strip_tz(pd.to_datetime(df.index))
-            df.columns = [c.lower() for c in df.columns]
-            result[sym] = df[["open", "high", "low", "close", "volume"]]
-        except Exception:
-            continue
-    return result
+    from utils.history_store import get_history
+    years = _PERIOD_TO_YEARS.get(period, 1.0)
+    return get_history(list(symbols), years=years, min_bars=60, source=source)
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_nifty(period: str = "1y") -> pd.Series:
@@ -1553,21 +1537,19 @@ def run_scanner(
 
     total     = len(symbols)
     n_batches = max(1, (total + _BATCH_SIZE - 1) // _BATCH_SIZE)
+    fetch_source = "upstox" if use_upstox else "yfinance"
 
     all_data: dict = {}
     for batch_i, start in enumerate(range(0, total, _BATCH_SIZE)):
-        chunk = tuple(symbols[start: start + _BATCH_SIZE])
+        chunk      = tuple(symbols[start: start + _BATCH_SIZE])
+        batch_data = fetch_batch_ohlcv(chunk, period="1y", interval="1d", source=fetch_source)
         if use_upstox:
-            from utils.upstox_client import fetch_batch_ohlcv_upstox
-            batch_data = fetch_batch_ohlcv_upstox(list(chunk), period="1y", interval="1d")
             missing = [s for s in chunk if s not in batch_data]
             if missing:
-                fallback = fetch_batch_ohlcv(tuple(missing), period="1y", interval="1d")
+                fallback = fetch_batch_ohlcv(tuple(missing), period="1y", interval="1d", source="yfinance")
                 if fallback:
                     _warn(f"Upstox had no data for {len(fallback)} symbol(s) this batch — used Yahoo Finance instead.")
                 batch_data.update(fallback)
-        else:
-            batch_data = fetch_batch_ohlcv(chunk, period="1y", interval="1d")
         all_data.update(batch_data)
         if progress_cb:
             progress_cb(0.5 * (batch_i + 1) / n_batches)
