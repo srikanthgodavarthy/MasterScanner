@@ -1777,11 +1777,14 @@ def _compute_breadth_stats(df: pd.DataFrame) -> dict:
 
 # ── MARKET OVERVIEW PANEL ───────────────────────────────────────────
 
-def _nifty_spark_svg(values: list[float], color: str, width: int = 200, height: int = 64) -> str:
-    """Line + soft gradient-fill sparkline for the Market Overview Nifty
+def _nifty_spark_svg(values: list[float], color: str, width: int = 200, height: int = 64,
+                      grad_id: str = "moNiftyGrad") -> str:
+    """Line + soft gradient-fill sparkline for a Market Overview index
     card. Falls back to a flat dashed line when there's no usable series
-    (e.g. both live and daily Nifty fetches failed) -- honest about the
-    missing data rather than faking a shape."""
+    (e.g. both live and daily fetches failed) -- honest about the missing
+    data rather than faking a shape. grad_id must be unique per card when
+    several sparklines render on the same page (duplicate SVG element IDs
+    are invalid HTML and some browsers only honor the first)."""
     if not values or len(values) < 2:
         y = height / 2
         return (f'<svg class="mo-spark" viewBox="0 0 {width} {height}" preserveAspectRatio="none">'
@@ -1801,10 +1804,10 @@ def _nifty_spark_svg(values: list[float], color: str, width: int = 200, height: 
 
     return (
         f'<svg class="mo-spark" viewBox="0 0 {width} {height}" preserveAspectRatio="none">'
-        f'<defs><linearGradient id="moNiftyGrad" x1="0" y1="0" x2="0" y2="1">'
+        f'<defs><linearGradient id="{grad_id}" x1="0" y1="0" x2="0" y2="1">'
         f'<stop offset="0%" stop-color="{color}" stop-opacity="0.35"/>'
         f'<stop offset="100%" stop-color="{color}" stop-opacity="0"/></linearGradient></defs>'
-        f'<polygon points="{area_pts}" fill="url(#moNiftyGrad)"/>'
+        f'<polygon points="{area_pts}" fill="url(#{grad_id})"/>'
         f'<polyline points="{line_pts}" fill="none" stroke="{color}" stroke-width="2" '
         f'stroke-linecap="round" stroke-linejoin="round"/>'
         f'</svg>'
@@ -1821,124 +1824,56 @@ def _vix_band(vix: float) -> tuple[str, str]:
     return "HIGH", "#f85149"
 
 
-def _market_overview_panel(summary: dict, breadth: dict,
-                            nifty_snapshot: dict | None, scan_time: str,
-                            sensex_snapshot: dict | None = None,
-                            oi_resistance: dict | None = None) -> str:
+def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
+                      grad_id: str, badge: str = "") -> str:
     """
-    Full-width 'Market Overview' card — live Nifty price/sparkline/OHLC on
-    the left, breadth + trend + EMA stats on the right, and a row of
-    Regime/EMA50/EMA200/VIX/ADX gate cards underneath. Replaces the old
-    _market_intelligence_panel + _market_status_row pair (2026-07 redesign).
+    Render one equal-width Market Overview index card: live price, %chg,
+    intraday sparkline, OHLC row, and nearest-expiry CE/PE OI resistance
+    (strike, OI, premium). Used identically for NIFTY 50, SENSEX, and
+    BANK NIFTY so all three stay visually symmetric.
 
-    sensex_snapshot: {"price": float, "pct_chg": float | None} — rendered as
-    a compact chip next to the NIFTY 50 label (utils.scanner_engine.
-    fetch_sensex_intraday_snapshot()).
-
-    oi_resistance: {"expiry", "ce_strike", "ce_oi", "pe_strike", "pe_oi"} —
-    nearest-expiry Call/Put OI resistance, rendered under the OHLC row
-    (utils.upstox_client.fetch_oi_resistance()). None/empty renders "—".
+    snapshot: {"price", "pct_chg", "open", "high", "low", "prev_close",
+               "spark", "source"} — utils.scanner_engine index snapshot fns.
+    oi: {"expiry", "ce_strike", "ce_oi", "ce_premium",
+         "pe_strike", "pe_oi", "pe_premium"} — utils.upstox_client.
+         fetch_oi_resistance(). None/empty renders "—" throughout.
+    grad_id: unique sparkline gradient id (see _nifty_spark_svg).
+    badge: optional small right-aligned tag, e.g. "(delayed)".
     """
-    nifty_snapshot  = nifty_snapshot or {}
-    sensex_snapshot = sensex_snapshot or {}
-    oi_resistance   = oi_resistance or {}
-    r = summary.get("regime", "RANGE")
-    regime_color, _, _ = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
+    snapshot = snapshot or {}
+    oi       = oi or {}
 
-    adx         = float(summary.get("adx", 0))
-    adx_is_real = summary.get("adx_is_real", False)
-    vix         = float(summary.get("vix", 0))
-    ema50_up    = summary.get("nifty_ema50", False)
-    ema200_up   = summary.get("nifty_ema200", False)
-    ema50_val   = summary.get("nifty_ema50_val", 0.0)
-    ema200_val  = summary.get("nifty_ema200_val", 0.0)
-
-    trend_label          = _trend_strength_label(adx, adx_is_real)
-    vix_label, vix_color = _vix_band(vix)
-    trend_color = {"WEAK": "#f85149", "MODERATE": "#d29922", "STRONG": "#3fb950"}[trend_label]
-    trend_pct   = {"WEAK": 33, "MODERATE": 66, "STRONG": 100}[trend_label]
-
-    # ── Nifty price card ─────────────────────────────────────────
-    price      = nifty_snapshot.get("price", 0.0)
-    pct_chg    = nifty_snapshot.get("pct_chg")
-    open_px    = nifty_snapshot.get("open", 0.0)
-    high_px    = nifty_snapshot.get("high", 0.0)
-    low_px     = nifty_snapshot.get("low", 0.0)
-    prev_close = nifty_snapshot.get("prev_close")
-    spark_vals = nifty_snapshot.get("spark", [])
+    price      = snapshot.get("price", 0.0)
+    pct_chg    = snapshot.get("pct_chg")
+    open_px    = snapshot.get("open", 0.0)
+    high_px    = snapshot.get("high", 0.0)
+    low_px     = snapshot.get("low", 0.0)
+    prev_close = snapshot.get("prev_close")
+    spark_vals = snapshot.get("spark", [])
 
     if pct_chg is not None:
-        up          = pct_chg >= 0
-        chg_color   = "#3fb950" if up else "#f85149"
-        arrow       = "▲" if up else "▼"
-        pt_chg      = (price - prev_close) if prev_close else 0.0
-        chg_html    = (
-            f'<span style="color:{chg_color};font-weight:700;font-size:14px">'
+        up        = pct_chg >= 0
+        chg_color = "#3fb950" if up else "#f85149"
+        arrow     = "▲" if up else "▼"
+        pt_chg    = (price - prev_close) if prev_close else 0.0
+        chg_html  = (
+            f'<span style="color:{chg_color};font-weight:700;">'
             f'{arrow} {"+" if up else ""}{pct_chg:.2f}%</span>'
-            f'<span style="color:var(--muted);font-weight:600;font-size:12px;margin-left:6px">'
+            f'<span style="color:var(--muted);font-weight:600;margin-left:6px;">'
             f'({"+" if pt_chg >= 0 else ""}{pt_chg:,.1f})</span>'
         )
         spark_color = chg_color
     else:
-        chg_html    = '<span style="color:var(--muted);font-size:12px">—</span>'
+        chg_html    = '<span style="color:var(--muted)">—</span>'
         spark_color = "#8b949e"
 
     price_str = f"{price:,.0f}" if price else "—"
-    spark_svg = _nifty_spark_svg(spark_vals, spark_color)
+    spark_svg = _nifty_spark_svg(spark_vals, spark_color, width=130, height=46, grad_id=grad_id)
 
-    # ── Sensex chip (next to the NIFTY 50 label) ─────────────────
-    sx_price   = sensex_snapshot.get("price", 0.0)
-    sx_pct_chg = sensex_snapshot.get("pct_chg")
-    sx_source  = sensex_snapshot.get("source", "upstox")
-    if sx_price:
-        sx_price_str = f"{sx_price:,.0f}"
-        if sx_pct_chg is not None:
-            sx_up      = sx_pct_chg >= 0
-            sx_color   = "#3fb950" if sx_up else "#f85149"
-            sx_arrow   = "▲" if sx_up else "▼"
-            sx_pct_str = (f'<span style="color:{sx_color}">{sx_arrow} '
-                           f'{"+" if sx_up else ""}{sx_pct_chg:.2f}%</span>')
-        else:
-            sx_pct_str = '<span style="color:var(--muted)">—</span>'
-        sx_delayed_str = (
-            ' <span class="mo-oi-sub" title="Upstox token missing/expired — showing yfinance\'s delayed feed instead">(delayed)</span>'
-            if sx_source == "yfinance" else ""
-        )
-        sensex_chip_html = (
-            '<span class="mo-sensex-chip">'
-            '<span class="mo-sensex-name">SENSEX</span>'
-            f'<span class="mo-sensex-ltp">{sx_price_str}</span>'
-            f'{sx_pct_str}{sx_delayed_str}'
-            '</span>'
-        )
-    else:
-        sensex_chip_html = ""
-
-    # ── OI resistance (nearest expiry, CE/PE) ─────────────────────
-    ce_strike, ce_oi = oi_resistance.get("ce_strike"), oi_resistance.get("ce_oi")
-    pe_strike, pe_oi = oi_resistance.get("pe_strike"), oi_resistance.get("pe_oi")
-    oi_expiry = oi_resistance.get("expiry", "")
-
-    def _oi_item(label, strike, oi, color):
-        if strike is None:
-            val_html = '<span style="color:var(--muted)">—</span>'
-        else:
-            oi_str   = f"{oi:,.0f}" if oi else "0"
-            val_html = (f'<span style="color:{color}">{strike:,.0f}</span>'
-                        f'<span class="mo-oi-sub">OI {oi_str}</span>')
-        return (f'<div class="mo-oi-item"><div class="mo-oi-label">{label}</div>'
-                f'<div class="mo-oi-val">{val_html}</div></div>')
-
-    oi_html = (
-        _oi_item("CE OI Resistance", ce_strike, ce_oi, "#f85149") +
-        _oi_item("PE OI Resistance", pe_strike, pe_oi, "#3fb950")
-    )
-    oi_expiry_html = f"Nearest expiry: {oi_expiry}" if oi_expiry else "Nearest expiry: —"
-
-    def _ohlc_item(label, val, color="var(--text)"):
+    def _ohlc_item(lbl, val, color="var(--text)"):
         txt = f"{val:,.0f}" if val else "—"
-        return (f'<div class="mo-ohlc-item"><div class="mo-ohlc-label">{label}</div>'
-                f'<div class="mo-ohlc-val" style="color:{color}">{txt}</div></div>')
+        return (f'<div class="mo-index-ohlc-item"><div class="mo-index-ohlc-label">{lbl}</div>'
+                f'<div class="mo-index-ohlc-val" style="color:{color}">{txt}</div></div>')
 
     ohlc_html = (
         _ohlc_item("Open", open_px) +
@@ -1947,95 +1882,177 @@ def _market_overview_panel(summary: dict, breadth: dict,
         _ohlc_item("Prev. Close", prev_close or 0)
     )
 
-    # ── Right-hand stat grid ──────────────────────────────────────
-    adv, dec  = breadth.get("advancing", 0), breadth.get("declining", 0)
-    hi, lo    = breadth.get("n_52w_high", 0), breadth.get("n_52w_low", 0)
-    e20, e200 = breadth.get("pct_above_ema20", 0), breadth.get("pct_above_ema200", 0)
-    adv_pct   = int(round(100 * adv / max(1, adv + dec)))
+    def _oi_item(lbl, strike, oi_val, premium, color):
+        if strike is None:
+            val_html  = '<span style="color:var(--muted)">—</span>'
+            meta_html = ""
+        else:
+            oi_str    = f"{oi_val:,.0f}" if oi_val else "0"
+            prem_str  = f"₹{premium:,.2f}" if premium else "—"
+            val_html  = f'<span style="color:{color}">{strike:,.0f}</span>'
+            meta_html = f'<div class="mo-index-oi-meta">OI {oi_str} · Premium: {prem_str}</div>'
+        return (f'<div class="mo-index-oi-item"><div class="mo-index-oi-label">{lbl}</div>'
+                f'<div class="mo-index-oi-val">{val_html}</div>{meta_html}</div>')
 
-    def _stat_block(label, tip, value_html, extra_html=""):
-        return (
-            f'<div class="mo-stat">'
-            f'<div class="mo-stat-label" title="{tip}">{label} <span class="mo-info">ⓘ</span></div>'
-            f'<div class="mo-stat-value">{value_html}</div>'
-            f'{extra_html}'
-            f'</div>'
-        )
-
-    trend_bar = (f'<div class="mo-bar-track"><div class="mo-bar-fill" '
-                 f'style="width:{trend_pct}%;background:{trend_color}"></div></div>')
-    breadth_extra = (
-        '<div class="mo-stat-sub"><span class="a">Advancing</span>&nbsp;&nbsp;'
-        '<span class="d">Declining</span></div>'
-        f'<div class="mo-bar-track mo-bar-split"><div class="mo-bar-fill" '
-        f'style="width:{adv_pct}%;background:#3fb950"></div></div>'
+    oi_html = (
+        _oi_item("CE OI Resistance", oi.get("ce_strike"), oi.get("ce_oi"), oi.get("ce_premium"), "#f85149") +
+        _oi_item("PE OI Resistance", oi.get("pe_strike"), oi.get("pe_oi"), oi.get("pe_premium"), "#3fb950")
     )
+    expiry      = oi.get("expiry", "")
+    expiry_html = f"Nearest expiry: {expiry}" if expiry else "Nearest expiry: —"
+    badge_html  = f'<span class="mo-index-badge">{badge}</span>' if badge else ""
 
-    stats_html = (
-        _stat_block("Trend Strength", "Based on Nifty ADX(14)",
-                    f'<span style="color:{trend_color}">{trend_label}</span>', trend_bar) +
-        _stat_block("Market Breadth", "Stocks advancing vs declining in this scan",
-                    f'<span class="a">{adv}</span> / <span class="d">{dec}</span>', breadth_extra) +
-        _stat_block("52W High", "Stocks within range of their 52-week high", f'<span class="a">{hi}</span>') +
-        _stat_block("52W Low", "Stocks within range of their 52-week low", f'<span class="d">{lo}</span>') +
-        _stat_block("Above EMA20", "Share of scanned universe trading above EMA20", f'{e20}%') +
-        _stat_block("Above EMA200", "Share of scanned universe trading above EMA200", f'{e200}%')
-    )
+    return f"""
+<div class="mo-index-card">
+  <div class="mo-index-label"><span>{label}</span>{badge_html}</div>
+  <div class="mo-index-row">
+    <div>
+      <div class="mo-index-price">{price_str}</div>
+      <div class="mo-index-chg">{chg_html}</div>
+    </div>
+    {spark_svg}
+  </div>
+  <div class="mo-index-ohlc-row">{ohlc_html}</div>
+  <div class="mo-index-oi-row">{oi_html}</div>
+  <div class="mo-index-expiry">{expiry_html}</div>
+</div>
+"""
 
-    # ── Gate cards row ─────────────────────────────────────────────
-    adx_note = "" if adx_is_real else " · proxy"
 
-    def _gate_card(icon, label, value_html, ok, qualifier="", border_color=None):
-        border = border_color if border_color else ("#3fb950" if ok else "#f85149")
-        check  = f'<span style="color:{border}">{"✓" if ok else "✕"}</span>'
-        qual   = f'<span class="mo-gate-qual">({qualifier})</span>' if qualifier else ""
-        return (
-            f'<div class="mo-gate-card" style="border-color:{border}66">'
-            f'<div class="mo-gate-top"><span class="mo-gate-icon">{icon}</span>'
-            f'<span class="mo-gate-label">{label}</span>{check}</div>'
-            f'<div class="mo-gate-value" style="color:{border}">{value_html}{qual}</div>'
-            f'</div>'
-        )
+def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
+                            index_cards: list[dict]) -> str:
+    """
+    Full-width 'Market Overview' card — a compact market-health strip
+    (Regime / Trend Strength / Market Breadth / 52W Hi-Lo / EMA20-EMA200 /
+    VIX-ADX) on top, and three equal-width index cards (NIFTY 50, SENSEX,
+    BANK NIFTY) underneath. Replaces the single-Nifty-card + stats-grid
+    layout (2026-07 redesign) with an institutional-terminal-style,
+    information-dense strip that doesn't grow the page height.
 
-    ema50_str  = f"{ema50_val:,.0f}"  if ema50_val  else "—"
-    ema200_str = f"{ema200_val:,.0f}" if ema200_val else "—"
+    index_cards: list of {"label", "snapshot", "oi", "badge"} dicts, one
+    per index, rendered via _index_card_html() in the given order.
+    """
+    r = summary.get("regime", "RANGE")
+    regime_color, _, _ = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
 
-    gates_html = (
-        _gate_card("🎯", "NIFTY REGIME", r, True, border_color=regime_color) +
-        _gate_card("📈", "EMA50",  ema50_str,  ema50_up) +
-        _gate_card("📉", "EMA200", ema200_str, ema200_up) +
-        _gate_card("💓", "VIX",    f"{vix:.1f}", vix <= 22.0, qualifier=vix_label, border_color=vix_color if vix <= 22.0 else None) +
-        _gate_card("🛡️", "ADX",   f"{adx:.0f}{adx_note}", adx >= 25.0, qualifier=trend_label, border_color=trend_color if adx_is_real else None)
-    )
+    adx         = float(summary.get("adx", 0))
+    adx_is_real = summary.get("adx_is_real", False)
+    vix         = float(summary.get("vix", 0))
+    ema50_up    = summary.get("nifty_ema50", False)
+    ema200_up   = summary.get("nifty_ema200", False)
 
+    trend_label          = _trend_strength_label(adx, adx_is_real)
+    vix_label, vix_color = _vix_band(vix)
+    trend_color = {"WEAK": "#f85149", "MODERATE": "#d29922", "STRONG": "#3fb950"}[trend_label]
+    trend_pct   = {"WEAK": 33, "MODERATE": 66, "STRONG": 100}[trend_label]
+
+    # ── Regime card ────────────────────────────────────────────────
     mkt_note = {
         "TREND":    "Trending market · Full position sizing active.",
         "RANGE":    "Range-bound market · Gate restricted · Half position sizing.",
         "VOLATILE": "Volatile market · Execute gate closed · No new positions.",
     }.get(r, "")
+    regime_card = f"""
+<div class="mo-health-card mo-regime-card">
+  <span class="mo-regime-icon">🎯</span>
+  <div class="mo-regime-body">
+    <div class="mo-health-label">NIFTY REGIME <span style="color:{regime_color};margin-left:auto">✓</span></div>
+    <div class="mo-regime-tag" style="color:{regime_color}">{r}</div>
+    <div class="mo-regime-note">{mkt_note}</div>
+  </div>
+</div>"""
+
+    # ── Trend Strength card ────────────────────────────────────────
+    trend_card = f"""
+<div class="mo-health-card">
+  <div class="mo-health-label" title="Based on Nifty ADX(14)">Trend Strength <span class="mo-info">ⓘ</span></div>
+  <div class="mo-health-value" style="color:{trend_color}">{trend_label}</div>
+  <div class="mo-bar-track"><div class="mo-bar-fill" style="width:{trend_pct}%;background:{trend_color}"></div></div>
+</div>"""
+
+    # ── Market Breadth card ────────────────────────────────────────
+    adv, dec = breadth.get("advancing", 0), breadth.get("declining", 0)
+    adv_pct  = int(round(100 * adv / max(1, adv + dec)))
+    breadth_card = f"""
+<div class="mo-health-card">
+  <div class="mo-health-label" title="Stocks advancing vs declining in this scan">Market Breadth <span class="mo-info">ⓘ</span></div>
+  <div class="mo-health-value"><span class="a">{adv}</span> / <span class="d">{dec}</span></div>
+  <div class="mo-bar-legend"><span class="a">Advancing</span><span class="d">Declining</span></div>
+  <div class="mo-bar-track mo-bar-split"><div class="mo-bar-fill" style="width:{adv_pct}%;background:#3fb950"></div></div>
+</div>"""
+
+    # ── 52W High/Low card ──────────────────────────────────────────
+    hi, lo = breadth.get("n_52w_high", 0), breadth.get("n_52w_low", 0)
+    hilo_card = f"""
+<div class="mo-health-card">
+  <div class="mo-mini-pair">
+    <div class="mo-mini-item">
+      <div class="mo-mini-label" title="Stocks within range of their 52-week high">52W High</div>
+      <div class="mo-mini-val a">{hi}</div>
+    </div>
+    <div class="mo-mini-item">
+      <div class="mo-mini-label" title="Stocks within range of their 52-week low">52W Low</div>
+      <div class="mo-mini-val d">{lo}</div>
+    </div>
+  </div>
+</div>"""
+
+    # ── EMA20/EMA200 breadth card ──────────────────────────────────
+    e20, e200 = breadth.get("pct_above_ema20", 0), breadth.get("pct_above_ema200", 0)
+    ema_card = f"""
+<div class="mo-health-card">
+  <div class="mo-mini-pair">
+    <div class="mo-mini-item">
+      <div class="mo-mini-label" title="Share of scanned universe trading above EMA20">Above EMA20</div>
+      <div class="mo-mini-val" style="color:{'#3fb950' if ema50_up else 'var(--text)'}">{e20}%</div>
+    </div>
+    <div class="mo-mini-item">
+      <div class="mo-mini-label" title="Share of scanned universe trading above EMA200">Above EMA200</div>
+      <div class="mo-mini-val" style="color:{'#3fb950' if ema200_up else 'var(--text)'}">{e200}%</div>
+    </div>
+  </div>
+</div>"""
+
+    # ── VIX/ADX gate card ───────────────────────────────────────────
+    adx_note   = "" if adx_is_real else "·proxy"
+    vix_ok     = vix <= 22.0
+    adx_ok     = adx >= 25.0
+    vix_gate_c = vix_color if vix_ok else "#f85149"
+    adx_gate_c = trend_color if adx_is_real else "#8b949e"
+    gate_card = f"""
+<div class="mo-health-card">
+  <div class="mo-mini-pair">
+    <div class="mo-mini-item">
+      <div class="mo-gate-mini-top"><span class="mo-gate-mini-icon">💓</span><span class="mo-mini-label">VIX</span>
+        <span class="mo-gate-mini-check" style="color:{vix_gate_c}">{"✓" if vix_ok else "✕"}</span></div>
+      <div class="mo-mini-val" style="color:{vix_gate_c}">{vix:.1f}<span class="mo-gate-mini-qual">{vix_label}</span></div>
+    </div>
+    <div class="mo-mini-item">
+      <div class="mo-gate-mini-top"><span class="mo-gate-mini-icon">🛡️</span><span class="mo-mini-label">ADX</span>
+        <span class="mo-gate-mini-check" style="color:{adx_gate_c}">{"✓" if adx_ok else "✕"}</span></div>
+      <div class="mo-mini-val" style="color:{adx_gate_c}">{adx:.0f}{adx_note}<span class="mo-gate-mini-qual">{trend_label}</span></div>
+    </div>
+  </div>
+</div>"""
+
+    health_html = regime_card + trend_card + breadth_card + hilo_card + ema_card + gate_card
+
+    # ── Index cards row ─────────────────────────────────────────────
+    cards_html = "".join(
+        _index_card_html(
+            c.get("label", ""), c.get("snapshot"), c.get("oi"),
+            grad_id=f"moSpark{i}", badge=c.get("badge", ""),
+        )
+        for i, c in enumerate(index_cards)
+    )
+
     scan_chip = f'<span class="mo-scan-chip">Last scan: <b>{scan_time} IST</b></span>' if scan_time else ""
 
     return f"""
 <div class="mo-panel">
   <div class="mo-title">MARKET OVERVIEW ⓘ {scan_chip}</div>
-  <div class="mo-top-grid">
-    <div class="mo-nifty-card">
-      <div class="mo-nifty-label">NIFTY 50{sensex_chip_html}</div>
-      <div class="mo-nifty-row">
-        <div>
-          <div class="mo-nifty-price">{price_str}</div>
-          <div class="mo-nifty-chg">{chg_html}</div>
-        </div>
-        {spark_svg}
-      </div>
-      <div class="mo-ohlc-row">{ohlc_html}</div>
-      <div class="mo-oi-row">{oi_html}</div>
-      <div class="mo-oi-sub" style="display:block;margin-top:4px;">{oi_expiry_html}</div>
-    </div>
-    <div class="mo-stats-grid">{stats_html}</div>
-  </div>
-  <div class="mo-gates-row">{gates_html}</div>
-  <p class="mo-note">{mkt_note}</p>
+  <div class="mo-health-row">{health_html}</div>
+  <div class="mo-index-grid">{cards_html}</div>
 </div>
 """
 
