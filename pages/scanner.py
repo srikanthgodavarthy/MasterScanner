@@ -3422,7 +3422,119 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
             )
 
 
-# ── MAIN RENDER ───────────────────────────────────────────────────
+# ── MARKET INTELLIGENCE — continuous, decoupled from Run Scan ──────────
+# 2026-07-16: previously all of this (Nifty/Sensex live quotes, EMA levels,
+# nearest-expiry OI resistance) only fetched once per manual "Run Scan"
+# click, inside the same block that kicks off the full 500-symbol
+# historical fetch + scoring pass. Those are two different things running
+# on two different natural cadences: a live quote should be seconds-fresh,
+# a 500-symbol historical rescan is a deliberate, manual action. Coupling
+# them meant the market intel strip was only ever as fresh as the last
+# time someone clicked Run Scan — stale for however long between scans.
+#
+# st.fragment(run_every=...) reruns ONLY this function on its own timer,
+# independent of the rest of the page and of any button click. It always
+# uses Upstox first (live quotes) with yfinance fallback only if the
+# token's missing/expired or the request fails — see fetch_index_quote()/
+# fetch_oi_resistance() in utils/upstox_client.py. The Run Scan button's
+# `source` selector (yfinance/upstox) is unrelated to this — that toggle
+# controls the historical OHLCV fetch for scoring, not the live strip.
+_MARKET_INTEL_REFRESH_SECS = 20  # matches fetch_index_quote's own ttl=15
+                                   # cache reasonably closely without
+                                   # hammering Upstox on every tick
+
+
+@st.fragment(run_every=_MARKET_INTEL_REFRESH_SECS)
+def _market_intelligence_fragment():
+    """
+    Fetches live Nifty/Sensex quotes, EMA20/50/200 levels, and nearest-
+    expiry OI resistance, then renders the full Market Overview panel.
+    Runs on its own _MARKET_INTEL_REFRESH_SECS timer via st.fragment,
+    whether or not a scan has ever been triggered. The regime/trend/
+    breadth portion of the panel still reflects the most recent scan
+    (session_state["scan_summary"]/["scan_df"]) since those are properties
+    of the scored universe, not something a live quote feed can supply on
+    its own — only the index-card portion (price, OHLC, OI, EMA) is truly
+    live here.
+    """
+    # ── Nifty snapshot ──────────────────────────────────────────────
+    try:
+        from utils.scanner_engine import fetch_nifty_intraday_snapshot, fetch_nifty, compute_ema_levels
+        _nifty_series = fetch_nifty("1y")
+        _snap = fetch_nifty_intraday_snapshot()
+        if _snap.get("price"):
+            st.session_state["nifty_snapshot"] = _snap
+        elif _nifty_series is not None and len(_nifty_series) >= 2:
+            last = float(_nifty_series.iloc[-1])
+            prev = float(_nifty_series.iloc[-2])
+            st.session_state["nifty_snapshot"] = {
+                "price": last,
+                "pct_chg": round((last - prev) / prev * 100, 2),
+                "open": 0.0, "high": 0.0, "low": 0.0,
+                "prev_close": prev,
+                "spark": _nifty_series.tail(15).tolist(),
+            }
+        st.session_state["nifty_ema_levels"] = (
+            compute_ema_levels(_nifty_series) if _nifty_series is not None else {}
+        )
+    except Exception:
+        st.session_state.setdefault("nifty_snapshot", {})
+        st.session_state.setdefault("nifty_ema_levels", {})
+
+    # ── Sensex snapshot — Upstox first (live), yfinance fallback ────
+    try:
+        from utils.upstox_client import fetch_index_quote
+        _sx = fetch_index_quote("SENSEX")
+        if _sx is not None:
+            _sx["source"] = "upstox"
+    except Exception:
+        _sx = None
+    if _sx is None:
+        try:
+            from utils.scanner_engine import fetch_sensex_intraday_snapshot
+            _sx = fetch_sensex_intraday_snapshot()
+            _sx["source"] = "yfinance"
+        except Exception:
+            _sx = {}
+    st.session_state["sensex_snapshot"] = _sx or {}
+
+    try:
+        from utils.scanner_engine import fetch_sensex_ema_levels
+        st.session_state["sensex_ema_levels"] = fetch_sensex_ema_levels()
+    except Exception:
+        st.session_state["sensex_ema_levels"] = {}
+
+    # ── Nearest-expiry OI resistance (Upstox option chain) ──────────
+    try:
+        from utils.upstox_client import fetch_oi_resistance
+        st.session_state["oi_resistance"] = fetch_oi_resistance("NIFTY") or {}
+    except Exception:
+        st.session_state["oi_resistance"] = {}
+    try:
+        from utils.upstox_client import fetch_oi_resistance
+        st.session_state["sensex_oi_resistance"] = fetch_oi_resistance("SENSEX") or {}
+    except Exception:
+        st.session_state["sensex_oi_resistance"] = {}
+
+    # ── Render ────────────────────────────────────────────────────
+    summary   = st.session_state.get("scan_summary", {})
+    scan_time = st.session_state.get("scan_time", "")
+    breadth   = _compute_breadth_stats(st.session_state.get("scan_df", pd.DataFrame()))
+    index_cards = [
+        {"label": "NIFTY 50", "snapshot": st.session_state.get("nifty_snapshot", {}),
+         "oi": st.session_state.get("oi_resistance", {}), "badge": "",
+         "ema": st.session_state.get("nifty_ema_levels", {})},
+        {"label": "SENSEX",   "snapshot": st.session_state.get("sensex_snapshot", {}),
+         "oi": st.session_state.get("sensex_oi_resistance", {}), "badge": "",
+         "ema": st.session_state.get("sensex_ema_levels", {})},
+    ]
+    st.markdown(
+        _market_overview_panel(summary, breadth, scan_time, index_cards),
+        unsafe_allow_html=True,
+    )
+
+
+
 
 def render(settings: dict | None = None):
     st.markdown(_CSS, unsafe_allow_html=True)
@@ -3507,76 +3619,14 @@ def render(settings: dict | None = None):
         st.session_state["scan_time"]     = _now_ist().strftime("%H:%M:%S")
         st.session_state["scan_settings"] = effective
 
-        # Nifty snapshot for the Market Overview card: price, %chg, OHLC, spark
-        try:
-            from utils.scanner_engine import fetch_nifty_intraday_snapshot
-            _snap = fetch_nifty_intraday_snapshot()
-            if _snap.get("price"):
-                st.session_state["nifty_snapshot"] = _snap
-            elif nifty_series is not None and len(nifty_series) >= 2:
-                # Fallback to the daily series already fetched for regime calc
-                last = float(nifty_series.iloc[-1])
-                prev = float(nifty_series.iloc[-2])
-                st.session_state["nifty_snapshot"] = {
-                    "price": last,
-                    "pct_chg": round((last - prev) / prev * 100, 2),
-                    "open": 0.0, "high": 0.0, "low": 0.0,
-                    "prev_close": prev,
-                    "spark": nifty_series.tail(15).tolist(),
-                }
-        except Exception:
-            pass
-
-        # Sensex snapshot for the chip shown next to NIFTY 50 in the same card.
-        # Upstox first — it's a live quote, unlike yfinance's ~15-min-delayed
-        # index feed. Falls back to yfinance only if the Upstox token is
-        # missing/expired or the request itself fails.
-        try:
-            from utils.upstox_client import fetch_index_quote
-            _sx = fetch_index_quote("SENSEX")
-            if _sx is not None:
-                _sx["source"] = "upstox"
-        except Exception:
-            _sx = None
-        if _sx is None:
-            try:
-                from utils.scanner_engine import fetch_sensex_intraday_snapshot
-                _sx = fetch_sensex_intraday_snapshot()
-                _sx["source"] = "yfinance"
-            except Exception:
-                _sx = {}
-        st.session_state["sensex_snapshot"] = _sx or {}
-
-        # EMA20/EMA50/EMA200 for the Market Overview index-card badge row.
-        # Nifty reuses the nifty_series already fetched above for regime
-        # calc; Sensex isn't part of that series so it gets its own fetch.
-        try:
-            from utils.scanner_engine import compute_ema_levels
-            st.session_state["nifty_ema_levels"] = (
-                compute_ema_levels(nifty_series) if nifty_series is not None else {}
-            )
-        except Exception:
-            st.session_state["nifty_ema_levels"] = {}
-        try:
-            from utils.scanner_engine import fetch_sensex_ema_levels
-            st.session_state["sensex_ema_levels"] = fetch_sensex_ema_levels()
-        except Exception:
-            st.session_state["sensex_ema_levels"] = {}
-
-        # Nearest-expiry CE/PE OI resistance (Upstox option chain) — best-effort;
-        # silently absent (renders "—") if the Upstox token isn't configured.
-        # Sensex options are on BSE; fetch_oi_resistance("SENSEX") already
-        # resolves to the BSE_INDEX|SENSEX instrument key in upstox_client.
-        try:
-            from utils.upstox_client import fetch_oi_resistance
-            st.session_state["oi_resistance"] = fetch_oi_resistance("NIFTY") or {}
-        except Exception:
-            st.session_state["oi_resistance"] = {}
-        try:
-            from utils.upstox_client import fetch_oi_resistance
-            st.session_state["sensex_oi_resistance"] = fetch_oi_resistance("SENSEX") or {}
-        except Exception:
-            st.session_state["sensex_oi_resistance"] = {}
+        # 2026-07-16: Nifty/Sensex live quotes, EMA levels, and OI
+        # resistance used to be fetched here on every scan click — moved
+        # to _market_intelligence_fragment() (see above _market_overview_panel),
+        # which now refreshes continuously on its own timer via
+        # st.fragment(run_every=...), independent of Run Scan entirely.
+        # scan_summary/scan_df above are all this button needs to update;
+        # the fragment picks them up on its next tick (or immediately,
+        # since this button click triggers a full-script rerun anyway).
 
         if supabase_ok and save_db:
             save_scan_snapshot(df_aug)
@@ -3625,12 +3675,11 @@ def render(settings: dict | None = None):
     df_aug          = st.session_state.get("scan_df",       pd.DataFrame())
     summary         = st.session_state.get("scan_summary",  {})
     scan_time       = st.session_state.get("scan_time",     "")
-    nifty_snapshot        = st.session_state.get("nifty_snapshot", {})
-    sensex_snapshot       = st.session_state.get("sensex_snapshot", {})
-    oi_resistance         = st.session_state.get("oi_resistance", {})
-    sensex_oi_resistance  = st.session_state.get("sensex_oi_resistance", {})
-    nifty_ema_levels      = st.session_state.get("nifty_ema_levels", {})
-    sensex_ema_levels     = st.session_state.get("sensex_ema_levels", {})
+
+    # ── Market Overview — continuous, live via Upstox, independent of
+    #    whether a scan has ever been run (see _market_intelligence_fragment
+    #    above _market_overview_panel for the fetch + render logic).
+    _market_intelligence_fragment()
 
     if df_aug.empty:
         st.markdown("""
@@ -3641,20 +3690,9 @@ def render(settings: dict | None = None):
         </div>""", unsafe_allow_html=True)
         return
 
-    # ── Market Overview ───────────────────────────────────────────
-    breadth       = _compute_breadth_stats(df_aug)
     active_df = (
         df_aug[df_aug["Recommendation"] != "Avoid"]
         if "Recommendation" in df_aug.columns else df_aug
-    )
-
-    index_cards = [
-        {"label": "NIFTY 50", "snapshot": nifty_snapshot,  "oi": oi_resistance,        "badge": "", "ema": nifty_ema_levels},
-        {"label": "SENSEX",   "snapshot": sensex_snapshot, "oi": sensex_oi_resistance, "badge": "", "ema": sensex_ema_levels},
-    ]
-    st.markdown(
-        _market_overview_panel(summary, breadth, scan_time, index_cards),
-        unsafe_allow_html=True,
     )
 
     # ── Signal class counts ───────────────────────────────────────
