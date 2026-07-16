@@ -47,9 +47,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pandas as pd
 import streamlit as st
 
-from utils.scanner_engine import NIFTY500_SYMBOLS
+from utils.scanner_engine import NIFTY500_SYMBOLS, _fetch_live_prices
 from utils.history_store import get_history
-from utils.upstox_client import get_upstox_token, is_token_expired
+from utils.upstox_client import get_upstox_token, is_token_expired, fetch_batch_today_ohlc_upstox
 
 CLOSE_TOL_PCT  = 0.5   # flag close-price divergence beyond this %
 RATIO_STD_TOL  = 0.01  # ratios tighter than this look "systematic," not noisy
@@ -118,6 +118,75 @@ def _compare_one(symbol: str, yf_df: pd.DataFrame | None, ux_df: pd.DataFrame | 
     row["_yf_c"] = yf_c
     row["_ux_c"] = ux_c
     row["_flagged"] = flagged
+    return row
+
+
+LIVE_CLOSE_TOL_PCT = 0.5   # flag today's-bar close divergence beyond this %
+
+
+def _compare_live_one(symbol: str, yf_lv: dict | None, ux_lv: dict | None) -> dict:
+    """
+    Compares today's (possibly partial) bar from the two untested code
+    paths: scanner_engine._fetch_live_prices() [yfinance, period='5d'
+    last row] vs upstox_client.fetch_batch_today_ohlc_upstox() [Upstox
+    /v2/market-quote/quotes snapshot]. Unlike _compare_one() above, this
+    is never a completed-candle comparison — it's whatever each source
+    considers "now" at the moment this runs, so a nonzero diff here does
+    NOT necessarily mean either source is wrong; it can just mean the two
+    were sampled at slightly different points in a moving intraday price.
+    A LARGE or repeated diff is the signal worth chasing.
+    """
+    row = {
+        "symbol": symbol,
+        "yf_date": None, "yf_close": None,
+        "ux_date": None, "ux_close": None,
+        "close_diff_%": None,
+        "yf_o": None, "yf_h": None, "yf_l": None, "yf_vol": None,
+        "ux_o": None, "ux_h": None, "ux_l": None, "ux_vol": None,
+        "status": "",
+    }
+
+    if not yf_lv and not ux_lv:
+        row["status"] = "both empty"
+        return row
+    if not yf_lv:
+        row["status"] = "yfinance empty (fetch failed / not stale per _fetch_live_prices)"
+        row["ux_date"], row["ux_close"] = ux_lv["date"], round(ux_lv["close"], 2)
+        row["ux_o"], row["ux_h"], row["ux_l"], row["ux_vol"] = (
+            round(ux_lv["open"], 2), round(ux_lv["high"], 2),
+            round(ux_lv["low"], 2), ux_lv["volume"],
+        )
+        return row
+    if not ux_lv:
+        row["status"] = "upstox empty (token expired / symbol not resolved / no data)"
+        row["yf_date"], row["yf_close"] = yf_lv["date"], round(yf_lv["close"], 2)
+        row["yf_o"], row["yf_h"], row["yf_l"], row["yf_vol"] = (
+            round(yf_lv["open"], 2), round(yf_lv["high"], 2),
+            round(yf_lv["low"], 2), yf_lv["volume"],
+        )
+        return row
+
+    yf_c, ux_c = yf_lv["close"], ux_lv["close"]
+    pct_diff = abs(ux_c - yf_c) / yf_c * 100 if yf_c else None
+
+    row["yf_date"], row["yf_close"] = yf_lv["date"], round(yf_c, 2)
+    row["ux_date"], row["ux_close"] = ux_lv["date"], round(ux_c, 2)
+    row["yf_o"], row["yf_h"], row["yf_l"], row["yf_vol"] = (
+        round(yf_lv["open"], 2), round(yf_lv["high"], 2),
+        round(yf_lv["low"], 2), yf_lv["volume"],
+    )
+    row["ux_o"], row["ux_h"], row["ux_l"], row["ux_vol"] = (
+        round(ux_lv["open"], 2), round(ux_lv["high"], 2),
+        round(ux_lv["low"], 2), ux_lv["volume"],
+    )
+    row["close_diff_%"] = round(pct_diff, 3) if pct_diff is not None else None
+
+    if pd.Timestamp(yf_lv["date"]).normalize() != pd.Timestamp(ux_lv["date"]).normalize():
+        row["status"] = "⚠ date mismatch (one source hasn't rolled to today yet)"
+    elif pct_diff is not None and pct_diff > LIVE_CLOSE_TOL_PCT:
+        row["status"] = f"⚠ {pct_diff:.2f}% close diff"
+    else:
+        row["status"] = "✓ close"
     return row
 
 
@@ -260,3 +329,63 @@ def render(settings=None):
                     st.caption("Divergence looks like day-to-day feed noise, not a systematic adjustment.")
     else:
         st.success("✅ No symbols exceeded the close-price divergence tolerance.")
+
+    st.markdown("---")
+    st.markdown("### 🔴 Live/Partial-Bar Check — Upstox vs yfinance")
+    st.markdown(
+        "<span style='color:#64748b;font-size:0.82rem;'>"
+        "Everything above only compares <b>completed</b> historical candles via "
+        "history_store — it never touches today's bar. This section calls the "
+        "two live-patch code paths directly: <code>scanner_engine._fetch_live_prices()</code> "
+        "(yfinance, last row of a period='5d' pull) and "
+        "<code>upstox_client.fetch_batch_today_ohlc_upstox()</code> (Upstox's "
+        "/v2/market-quote/quotes snapshot) — the same two functions a live "
+        "scan's <code>_patch_live_prices()</code> step picks between. Run this "
+        "during market hours to see where today's numbers actually diverge."
+        "</span>",
+        unsafe_allow_html=True,
+    )
+    run_live = st.button("▶ Run Live-Patch Comparison", key="btn_run_live_dsc")
+    if run_live:
+        if not symbols:
+            st.error("Select at least one symbol above.")
+        else:
+            with st.spinner(f"Fetching live/partial bar for {len(symbols)} symbol(s) from both sources…"):
+                yf_live = _fetch_live_prices(tuple(symbols))
+                ux_live = fetch_batch_today_ohlc_upstox(list(symbols)) if not is_token_expired() else {}
+
+            live_results = [
+                _compare_live_one(sym, yf_live.get(sym), ux_live.get(sym))
+                for sym in symbols
+            ]
+            live_df = pd.DataFrame(live_results)
+            st.dataframe(live_df, width="stretch", hide_index=True)
+
+            n_diverged = sum(1 for r in live_results if r["status"].startswith("⚠"))
+            n_both_empty = sum(1 for r in live_results if r["status"] == "both empty")
+            if n_diverged:
+                st.warning(
+                    f"⚠ {n_diverged}/{len(symbols)} symbol(s) show a live-bar "
+                    f"divergence or date mismatch — this is the untested path "
+                    f"that could explain %CHG / score differences between scans "
+                    f"run on the same day with different active data sources.",
+                    icon="⚠️",
+                )
+            else:
+                st.success(f"✅ Live bars agree within {LIVE_CLOSE_TOL_PCT}% for all {len(symbols)} symbol(s) right now.")
+            if n_both_empty:
+                st.caption(
+                    f"{n_both_empty} symbol(s) came back empty from both sources — "
+                    f"outside market hours, or both fetches failed."
+                )
+
+            st.caption(
+                "Note: in a real scan, the live patch is only invoked when "
+                "`_build_ohlcv` sees the *historical* fetch's last bar dated "
+                "before today (`stale_syms` in scanner_engine.py). If Upstox's "
+                "historical fetch already returned a bar timestamped today "
+                "(unusual given ux_bars typically trails yf_bars — see the "
+                "comparison above), that symbol would skip the live patch "
+                "entirely and keep whatever close came from the historical "
+                "batch call, independent of what this section shows."
+            )
