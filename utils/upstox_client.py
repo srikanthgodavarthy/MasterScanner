@@ -410,22 +410,73 @@ def fetch_today_ohlc(symbol: str) -> dict | None:
     instrument_key = resolve_instrument_key(symbol)
     if headers is None or instrument_key is None:
         return None
-    resp = requests.get(f"{BASE_URL}/v2/market-quote/quotes", headers=headers,
-                         params={"instrument_key": instrument_key}, timeout=10)
-    if resp.status_code != 200:
-        return None
-    data = resp.json().get("data", {})
-    if not data:
-        return None
-    quote = next(iter(data.values()))
-    ohlc = quote.get("ohlc", {})
-    if not ohlc:
-        return None
-    return {
-        "date":   date.today(),
-        "open":   ohlc.get("open"),
-        "high":   ohlc.get("high"),
-        "low":    ohlc.get("low"),
-        "close":  quote.get("last_price", ohlc.get("close")),
-        "volume": quote.get("volume"),
-    }
+
+    last_exc = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        _wait_for_spacing()
+        try:
+            resp = requests.get(f"{BASE_URL}/v2/market-quote/quotes", headers=headers,
+                                 params={"instrument_key": instrument_key}, timeout=10)
+            if resp.status_code == 429:
+                backoff = _RETRY_BASE_S * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                logger.warning("Upstox rate-limited on quote for %s, retrying in %.1fs", symbol, backoff)
+                time.sleep(backoff)
+                continue
+            if resp.status_code == 401:
+                logger.warning("Upstox 401 on quote for %s — token expired or invalid", symbol)
+                return None
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+            if not data:
+                return None
+            quote = next(iter(data.values()))
+            ohlc = quote.get("ohlc", {})
+            if not ohlc:
+                return None
+            return {
+                "date":   date.today(),
+                "open":   ohlc.get("open"),
+                "high":   ohlc.get("high"),
+                "low":    ohlc.get("low"),
+                "close":  quote.get("last_price", ohlc.get("close")),
+                "volume": quote.get("volume"),
+            }
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(_RETRY_BASE_S * attempt)
+
+    logger.warning("Upstox quote fetch failed for %s after %d attempts: %s",
+                    symbol, _MAX_RETRIES, last_exc)
+    return None
+
+
+def fetch_batch_today_ohlc_upstox(symbols: list) -> dict:
+    """
+    Concurrent per-symbol fetch of today's (possibly partial) OHLC —
+    the Upstox counterpart to scanner_engine._fetch_live_prices(). There's
+    no multi-symbol quotes call any more than there is for historical
+    candles, so this reuses the same throttled ThreadPoolExecutor pattern
+    as fetch_batch_ohlcv_upstox(). Returns {symbol: {date, open, high,
+    low, close, volume}}, matching the shape scanner_engine's
+    _patch_live_prices() expects — so callers can pick this or the
+    yfinance live-price fetch based on the active data source without
+    touching the patch logic itself.
+    """
+    if not symbols:
+        return {}
+    if is_token_expired():
+        logger.warning("Upstox token likely expired — skipping live-price patch")
+        return {}
+
+    result: dict = {}
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {pool.submit(fetch_today_ohlc, sym): sym for sym in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                quote = fut.result()
+                if quote and quote.get("close") is not None:
+                    result[sym] = quote
+            except Exception as exc:
+                logger.warning("Upstox live-quote fetch failed for %s: %s", sym, exc)
+    return result
