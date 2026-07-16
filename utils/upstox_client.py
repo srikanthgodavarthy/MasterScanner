@@ -551,6 +551,56 @@ _INDEX_INSTRUMENT_KEYS = {
 }
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_index_quote(index: str = "SENSEX") -> dict | None:
+    """
+    Real-time LTP + day % change for an index ("NIFTY" or "SENSEX") via
+    Upstox's full market-quote endpoint (GET /v2/market-quote/quotes) —
+    unlike yfinance's ~15-min-delayed index feed, this is live (subject to
+    your Upstox plan's data entitlement).
+
+    Uses the response's `net_change` field directly rather than deriving
+    the change from `ohlc.close` — for indices, `ohlc.close` is not
+    reliably the previous day's close, but `last_price - net_change` is
+    guaranteed to be (this mirrors how the NHPC example in Upstox's own
+    docs computes it).
+
+    Returns {"price": float, "pct_chg": float | None}, or None if the
+    token is missing/expired or the request fails — callers should fall
+    back to another source (e.g. yfinance) rather than show nothing.
+    """
+    headers = _auth_headers()
+    instrument_key = _INDEX_INSTRUMENT_KEYS.get(index.upper())
+    if headers is None or instrument_key is None or is_token_expired():
+        return None
+
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/v2/market-quote/quotes",
+            headers=headers,
+            params={"instrument_key": instrument_key},
+            timeout=10,
+        )
+        if resp.status_code == 401:
+            logger.warning("Upstox 401 on index quote for %s — token expired or invalid", index)
+            return None
+        resp.raise_for_status()
+        data = resp.json().get("data", {})
+        if not data:
+            return None
+        quote      = next(iter(data.values()))
+        last_price = quote.get("last_price")
+        net_change = quote.get("net_change")
+        if last_price is None:
+            return None
+        prev_close = (last_price - net_change) if net_change is not None else None
+        pct_chg    = round(net_change / prev_close * 100, 2) if prev_close else None
+        return {"price": float(last_price), "pct_chg": pct_chg}
+    except Exception:
+        logger.warning("Upstox index-quote fetch failed for %s", index, exc_info=True)
+        return None
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_nearest_expiry(index: str = "NIFTY") -> str | None:
     """
