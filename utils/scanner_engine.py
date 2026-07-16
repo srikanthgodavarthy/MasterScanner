@@ -138,7 +138,7 @@ def yf_download_with_retry(tickers, **kwargs):
     while attempt <= max_total_attempts:
         _wait_for_spacing()
         try:
-            return yf.download(tickers, **kwargs)
+            result = yf.download(tickers, **kwargs)
         except Exception as exc:
             last_exc = exc
 
@@ -172,6 +172,34 @@ def yf_download_with_retry(tickers, **kwargs):
             if attempt < _YF_MAX_RETRIES:
                 time.sleep(backoff)
             attempt += 1
+            continue
+
+        # No exception raised — but Yahoo's soft rate-limit/block on cloud
+        # IPs frequently comes back as an ordinary 200 response with zero
+        # rows rather than a raised error, especially during market hours
+        # under load. That failure mode used to be accepted as "no data"
+        # on attempt 1 with no backoff at all, since `return` exited the
+        # loop unconditionally on any non-exception result. Confirmed live
+        # via the Data Source Check page: a liquid, actively-traded symbol
+        # returned 0 bars from yf.download with nothing logged as an error.
+        # Treat an empty result the same as a rate-limit error — same
+        # exponential cooldown — before accepting it as genuinely empty.
+        if result is None or result.empty:
+            backoff = _YF_RATELIMIT_BASE_S * (2 ** (attempt - 1))
+            last_exc = last_exc or RuntimeError(
+                "yf.download returned empty with no exception (possible soft rate-limit/block)"
+            )
+            _log.warning(
+                "yf.download returned empty with no exception (attempt %d/%d) — "
+                "treating as a possible soft rate-limit/block, cooling down %ds",
+                attempt, _YF_MAX_RETRIES, backoff,
+            )
+            if attempt < _YF_MAX_RETRIES:
+                time.sleep(backoff)
+            attempt += 1
+            continue
+
+        return result
 
     _log.error("yf.download giving up after %d attempts: %s", attempt - 1, last_exc)
     return pd.DataFrame()
