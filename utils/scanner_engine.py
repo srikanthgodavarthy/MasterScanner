@@ -793,16 +793,20 @@ def fetch_nifty_intraday_snapshot() -> dict:
 def fetch_sensex_intraday_snapshot() -> dict:
     """
     Return today's BSE Sensex (^BSESN) snapshot for the Market Overview
-    panel's Sensex chip: live price and day %chg (mirrors
-    fetch_nifty_intraday_snapshot's shape, minus the OHLC/spark fields the
-    chip doesn't need).
+    panel's SENSEX index card: live price, day %chg, today's Open/High/Low,
+    previous close, and an intraday price path for the sparkline. Mirrors
+    fetch_nifty_intraday_snapshot()'s shape exactly.
 
-    {"price": float, "pct_chg": float | None}
+    {
+      "price": float, "pct_chg": float | None, "open": float, "high": float,
+      "low": float, "prev_close": float | None, "spark": list[float]
+    }
 
     Same IST-aware "today" logic as fetch_nifty_intraday_snapshot(). Falls
-    back to the last two completed daily bars if the market hasn't opened
-    yet today or the intraday fetch fails — honest about showing
-    yesterday's change rather than a blank chip.
+    back to the last completed daily bar for Open/High/Low/Close and the
+    most recent ~15 daily closes for the sparkline if the market hasn't
+    opened yet today or the intraday fetch fails — honest about showing
+    yesterday's shape rather than a blank card.
     """
     import pytz
     _IST = pytz.timezone("Asia/Kolkata")
@@ -810,7 +814,8 @@ def fetch_sensex_intraday_snapshot() -> dict:
     def _today_ist() -> pd.Timestamp:
         return pd.Timestamp.now(tz=_IST).normalize().tz_localize(None)
 
-    out = {"price": 0.0, "pct_chg": None}
+    out = {"price": 0.0, "pct_chg": None, "open": 0.0, "high": 0.0,
+           "low": 0.0, "prev_close": None, "spark": []}
 
     try:
         df = yf.Ticker("^BSESN").history(period="2d", interval="1m", auto_adjust=True)
@@ -823,8 +828,13 @@ def fetch_sensex_intraday_snapshot() -> dict:
                 prev_close = float(prev_bars["Close"].iloc[-1]) if not prev_bars.empty else None
                 price      = float(today_bars["Close"].iloc[-1])
                 out.update({
-                    "price":   price,
-                    "pct_chg": round((price - prev_close) / prev_close * 100, 2) if prev_close else None,
+                    "price":      price,
+                    "pct_chg":    round((price - prev_close) / prev_close * 100, 2) if prev_close else None,
+                    "open":       float(today_bars["Open"].iloc[0]),
+                    "high":       float(today_bars["High"].max()),
+                    "low":        float(today_bars["Low"].min()),
+                    "prev_close": prev_close,
+                    "spark":      today_bars["Close"].tolist()[::max(1, len(today_bars)//60)],
                 })
                 return out
     except Exception:
@@ -834,11 +844,16 @@ def fetch_sensex_intraday_snapshot() -> dict:
     try:
         daily = yf.Ticker("^BSESN").history(period="1mo", auto_adjust=True)
         if len(daily) >= 2:
-            last_close = float(daily["Close"].iloc[-1])
-            prev_close = float(daily["Close"].iloc[-2])
+            last, prev = daily.iloc[-1], daily.iloc[-2]
+            last_close, prev_close = float(last["Close"]), float(prev["Close"])
             out.update({
-                "price":   last_close,
-                "pct_chg": round((last_close - prev_close) / prev_close * 100, 2) if prev_close else None,
+                "price":      last_close,
+                "pct_chg":    round((last_close - prev_close) / prev_close * 100, 2) if prev_close else None,
+                "open":       float(last["Open"]),
+                "high":       float(last["High"]),
+                "low":        float(last["Low"]),
+                "prev_close": prev_close,
+                "spark":      daily["Close"].tail(15).tolist(),
             })
     except Exception:
         pass
