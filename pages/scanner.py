@@ -3481,7 +3481,10 @@ def _market_intelligence_fragment():
         st.session_state.setdefault("nifty_snapshot", {})
         st.session_state.setdefault("nifty_ema_levels", {})
 
-    # ── Sensex snapshot — Upstox first (live), yfinance fallback ────
+    # ── Sensex snapshot — Upstox first (live price/OHLC), yfinance
+    #    backfill for spark only (Upstox's quote endpoint is a single
+    #    point-in-time snapshot with no historical series in it at all —
+    #    there's nothing to draw a sparkline from until we add one).
     try:
         from utils.upstox_client import fetch_index_quote
         _sx = fetch_index_quote("SENSEX")
@@ -3496,6 +3499,17 @@ def _market_intelligence_fragment():
             _sx["source"] = "yfinance"
         except Exception:
             _sx = {}
+    elif not _sx.get("spark"):
+        # Upstox gave us live price/OHLC — just missing the spark. Pull
+        # yfinance's intraday snapshot (cheap, @st.cache_data ttl=30) for
+        # its "spark" list only; leave everything else Upstox-sourced.
+        try:
+            from utils.scanner_engine import fetch_sensex_intraday_snapshot
+            _yf_spark = fetch_sensex_intraday_snapshot().get("spark") or []
+            if _yf_spark:
+                _sx["spark"] = _yf_spark
+        except Exception:
+            pass
     st.session_state["sensex_snapshot"] = _sx or {}
 
     try:
