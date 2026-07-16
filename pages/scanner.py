@@ -3581,9 +3581,12 @@ def render(settings: dict | None = None):
         if "Recommendation" in df_aug.columns else df_aug
     )
 
+    index_cards = [
+        {"label": "NIFTY 50", "snapshot": nifty_snapshot, "oi": oi_resistance, "badge": ""},
+        {"label": "SENSEX",   "snapshot": sensex_snapshot, "oi": {},            "badge": ""},
+    ]
     st.markdown(
-        _market_overview_panel(summary, breadth, nifty_snapshot, scan_time,
-                                sensex_snapshot, oi_resistance),
+        _market_overview_panel(summary, breadth, scan_time, index_cards),
         unsafe_allow_html=True,
     )
 
