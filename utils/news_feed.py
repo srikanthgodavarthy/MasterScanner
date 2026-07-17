@@ -20,8 +20,8 @@ URL); `feedparser` (new dependency, see requirements.txt) parses it.
 
 from __future__ import annotations
 
+import calendar
 import logging
-import time
 from datetime import datetime, timezone
 
 import feedparser
@@ -84,8 +84,16 @@ def _fetch_one_feed(source: str, url: str) -> list[dict]:
         for attr in ("published_parsed", "updated_parsed"):
             struct = getattr(entry, attr, None)
             if struct:
+                # 2026-07-18 FIX: feedparser's *_parsed struct is always
+                # already normalized to UTC. time.mktime() assumes its
+                # input is LOCAL time and converts accordingly, so using
+                # it here silently shifted every published timestamp by
+                # the host machine's UTC offset (e.g. -5:30 on an
+                # IST-zoned host). calendar.timegm() is the correct
+                # inverse of a UTC struct -> epoch, with no host-timezone
+                # dependency.
                 published_dt = datetime.fromtimestamp(
-                    time.mktime(struct), tz=timezone.utc
+                    calendar.timegm(struct), tz=timezone.utc
                 )
                 break
 
