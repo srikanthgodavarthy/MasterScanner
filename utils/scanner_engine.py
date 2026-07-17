@@ -669,6 +669,26 @@ def fetch_nifty_ohlcv(period: str = "1y") -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def fetch_sensex_ohlcv(period: str = "1y") -> pd.DataFrame:
+    """
+    Fetch full OHLCV for BSE Sensex (^BSESN) — the Sensex counterpart to
+    fetch_nifty_ohlcv(). Added for utils.dore_engine.build_dore_input_for_index(),
+    which needs full OHLCV (not just the close-only series compute_ema_levels()
+    accepts) to run the same build_indicators()/compute_bar() pipeline used
+    for every scanned stock, applied here to the index itself.
+    Returns an empty DataFrame on failure.
+    """
+    try:
+        df = yf.Ticker("^BSESN").history(period=period, auto_adjust=True)
+        if not df.empty:
+            df.index   = _strip_tz(pd.to_datetime(df.index))
+            df.columns = [c.lower() for c in df.columns]
+            return df[["open", "high", "low", "close", "volume"]]
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
 def compute_ema_levels(series: pd.Series) -> dict:
     """
     Given a daily close-price series (chronological, most-recent last),
