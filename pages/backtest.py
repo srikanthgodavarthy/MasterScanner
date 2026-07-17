@@ -406,7 +406,6 @@ def render(settings=None):
                 mode             = _bt_mode,
                 checkpoint_cb    = _bt_checkpoint,
                 checkpoint_every = 25,
-                source           = settings.get("data_source", "yfinance") if settings else "yfinance",
             )
         except Exception as _bt_exc:
             # Previously an exception (or host kill) here left the run

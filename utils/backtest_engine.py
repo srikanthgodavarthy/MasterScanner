@@ -93,27 +93,8 @@ def _fetch_bt_batch(symbols: tuple, years: int = 3) -> dict:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_bt_nifty(years: int = 3, source: str = "yfinance") -> pd.Series:
-    """
-    Fetch Nifty 50 for the backtest window. Cached 1h — backtest data is
-    historical.
-
-    2026-07-17: added `source`, mirroring scanner_engine.fetch_nifty() —
-    Relative Strength/regime must use the same provider as the stock data
-    being backtested. Defaults to "yfinance" so existing callers are
-    unaffected; run_backtest() passes through whatever the Scanner Data
-    Source setting resolved to for this run.
-    """
-    if source == "upstox":
-        try:
-            from utils.upstox_client import fetch_index_ohlcv_upstox
-            _period = "5y" if years >= 5 else ("2y" if years >= 2 else "1y")
-            df = fetch_index_ohlcv_upstox("NIFTY", _period)
-            if not df.empty:
-                return df["close"].rename("nifty")
-        except Exception:
-            pass
-        # fall through to yfinance below
+def _fetch_bt_nifty(years: int = 3) -> pd.Series:
+    """Fetch Nifty 50 (^NSEI) for backtest window. Cached 1h — backtest data is historical."""
     try:
         end   = datetime.now(timezone.utc) + timedelta(days=1)
         start = end - timedelta(days=years * 365 + 10)
@@ -1392,7 +1373,6 @@ def run_backtest(
     checkpoint_cb          = None,
     checkpoint_every: int  = 25,
     use_processes:    bool = True,
-    source:           str  = "yfinance",
 ) -> tuple:
     """
     Walk-forward backtest.
@@ -1400,14 +1380,6 @@ def run_backtest(
     mode="scanner"      — default; scoring_core.compute_bar() (full engine)
     mode="cci_master"   — CCI Master crossover signals
     mode="five_pillars" — Five Pillars FP score crossover signals
-
-    source: "yfinance" (default) or "upstox" — which provider fetch_all_bt_data()
-    and the Nifty benchmark (_fetch_bt_nifty()) pull from. 2026-07-17: added
-    so Backtesting respects the Scanner Data Source setting the same way
-    the live scanner does — the benchmark and stock data must come from the
-    same provider (see scanner_engine.fetch_nifty()'s docstring). Defaults
-    to "yfinance" so existing callers (e.g. the Five Pillars parameter
-    sensitivity sweep) are unaffected unless they explicitly opt in.
 
     extra_pillar_cfg (mode="five_pillars" only): overrides for the ic_*
     "Institutional Continuation (VWAP Reclaim)" settings, layered on top
@@ -1495,9 +1467,9 @@ def run_backtest(
             pct = 0.15 * (batch_i / n_batches)
             progress_cb(pct, f"Fetching data — batch {batch_i}/{n_batches} ({n_fetched} symbols so far)")
 
-    all_data = fetch_all_bt_data(symbols, years=3, progress_cb=_fetch_progress, source=source)
+    all_data = fetch_all_bt_data(symbols, years=3, progress_cb=_fetch_progress)
 
-    nifty = _fetch_bt_nifty(years=3, source=source)    # cached 1h
+    nifty = _fetch_bt_nifty(years=3)                  # cached 1h
     regime_val         = nifty_regime(nifty)
     effective_settings = dict(settings) if settings else {}
     effective_settings["nifty_regime_val"] = regime_val
@@ -1510,7 +1482,7 @@ def run_backtest(
     _regime_ctx: "RegimeContext | None" = None
     if _apply_regime:
         try:
-            _regime_ctx = build_regime_context(nifty, source=source)
+            _regime_ctx = build_regime_context(nifty)
         except Exception:
             _regime_ctx = None   # graceful fallback: no regime filter
 

@@ -390,28 +390,19 @@ def _classify_tier(row: dict, regime: str, composite: float, threshold: float,
 #    - Combines into 0–60 ADX-equivalent scale
 # ══════════════════════════════════════════════════════════════════
 
-def compute_nifty_adx(period: int = 14, source: str = "yfinance") -> Optional[float]:
+def compute_nifty_adx(period: int = 14) -> Optional[float]:
     """
     Compute a real Wilder-smoothed ADX(14) on the broad NSE market.
     Uses Nifty 50 (^NSEI) OHLCV input via fetch_nifty_ohlcv().
     ADX here is a regime-strength measure based purely on Nifty 50,
     not the display price shown in the Market Status Bar.
-
-    2026-07-16: added `source`, threaded through from build_regime_context()
-    so the "Trend Phase"/regime classification uses the same OHLCV
-    provider as the rest of the scan when the Scanner Data Source setting
-    is "upstox" — see scanner_engine.fetch_nifty()'s docstring for why
-    benchmark/stock provider consistency matters. Defaults to "yfinance"
-    so existing callers (backtest_engine, Market Intelligence) are
-    unaffected unless they explicitly opt in.
-
     Returns None if the fetch fails or the series is too short, which lets
     build_regime_context() fall back to the EMA-slope proxy.
     """
     try:
         from utils.scanner_engine import fetch_nifty_ohlcv
         from utils.scoring_core import _adx as _wilder_adx
-        df = fetch_nifty_ohlcv("1y", source=source)
+        df = fetch_nifty_ohlcv("1y")
         if df.empty or len(df) < period * 3:
             return None
         adx_series = _wilder_adx(df["high"], df["low"], df["close"], period)
@@ -551,7 +542,6 @@ def build_regime_context(
     execute_threshold: float = 70.0,
     auto_fetch_vix:    bool  = True,
     force_execute:     bool  = False,   # bypass TREND-only Execute gate
-    source:            str   = "yfinance",
 ) -> RegimeContext:
     """
     Build RegimeContext used for the entire scan run.
@@ -563,11 +553,6 @@ def build_regime_context(
     adx               : Nifty ADX. EMA slope proxy used if None.
     execute_threshold : Composite score cutoff for EXECUTE. Default 70.
     force_execute     : If True, Execute gate opens even in RANGE/VOLATILE regimes.
-    source            : Provider used for the auto-computed ADX fetch (see
-                         compute_nifty_adx()) when `adx` isn't supplied —
-                         pass whatever provider `nifty` itself came from so
-                         the regime classification stays internally
-                         consistent. Defaults to "yfinance".
     """
     if vix is None and auto_fetch_vix:
         vix = fetch_india_vix()
@@ -575,7 +560,7 @@ def build_regime_context(
     # Auto-compute real Wilder ADX(14) on Nifty OHLCV when no value supplied.
     # Falls back to EMA-slope proxy inside classify_regime() if fetch fails.
     if adx is None:
-        adx = compute_nifty_adx(source=source)   # returns None on failure -> proxy used
+        adx = compute_nifty_adx()   # returns None on failure -> proxy used
 
     _adx_real = adx is not None   # True if compute_nifty_adx() returned a real Wilder ADX
     regime, vix_used, adx_used, a50, a200, ema50_val, ema200_val = classify_regime(nifty, vix, adx)
