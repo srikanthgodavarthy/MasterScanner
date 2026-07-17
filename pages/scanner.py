@@ -3734,13 +3734,26 @@ def _market_intelligence_fragment():
     #    exists for option-chain data (yfinance doesn't carry NSE/BSE
     #    option chains), so this comes back {} rather than a wrong-source
     #    substitute if the Upstox token is missing/expired.
+    #
+    # 2026-07-18: also runs each index's fresh total_ce_oi/total_pe_oi
+    # through utils.oi_snapshot_store.record_and_diff() right here, so
+    # the resulting (ce_oi_change, pe_oi_change) is ready for the DORE
+    # block below — see that module's docstring for why this needs to
+    # happen once, right after the fetch, rather than inside DORE itself.
+    from utils.oi_snapshot_store import record_and_diff
+    _oi_changes: dict = {}   # {"NIFTY": (ce_chg, pe_chg), "SENSEX": ..., "BANKNIFTY": ...}
     for _idx, _key in (("NIFTY", "oi_resistance"), ("SENSEX", "sensex_oi_resistance"),
                         ("BANKNIFTY", "banknifty_oi_resistance")):
         try:
             from utils.upstox_client import fetch_oi_resistance
-            st.session_state[_key] = fetch_oi_resistance(_idx) or {}
+            _oi = fetch_oi_resistance(_idx) or {}
+            st.session_state[_key] = _oi
+            _oi_changes[_idx] = record_and_diff(
+                _idx, _oi.get("total_ce_oi", 0.0), _oi.get("total_pe_oi", 0.0)
+            )
         except Exception:
             st.session_state[_key] = {}
+            _oi_changes[_idx] = (0.0, 0.0)
 
     # ── DORE (Dynamic Options Recommendation Engine) ────────────────
     # NIFTY/SENSEX/BANKNIFTY aren't part of the scanned Nifty-500
@@ -3762,30 +3775,36 @@ def _market_intelligence_fragment():
         _dore_cfg = DORESettings.from_dict(st.session_state.get("dore_settings", {}))
 
         _nifty_ohlcv = fetch_nifty_ohlcv("1y", source="upstox")
+        _nifty_ce_chg, _nifty_pe_chg = _oi_changes.get("NIFTY", (0.0, 0.0))
         _nifty_dore_input = build_dore_input_for_index(
             "NIFTY", _nifty_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
             st.session_state.get("oi_resistance", {}),
             position=st.session_state.get("nifty_option_position"),
+            ce_oi_change=_nifty_ce_chg, pe_oi_change=_nifty_pe_chg,
         )
         st.session_state["nifty_dore"] = (
             compute_dore(_nifty_dore_input, _dore_cfg).as_dict() if _nifty_dore_input else None
         )
 
         _sensex_ohlcv = fetch_sensex_ohlcv("1y")
+        _sensex_ce_chg, _sensex_pe_chg = _oi_changes.get("SENSEX", (0.0, 0.0))
         _sensex_dore_input = build_dore_input_for_index(
             "SENSEX", _sensex_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
             st.session_state.get("sensex_oi_resistance", {}),
             position=st.session_state.get("sensex_option_position"),
+            ce_oi_change=_sensex_ce_chg, pe_oi_change=_sensex_pe_chg,
         )
         st.session_state["sensex_dore"] = (
             compute_dore(_sensex_dore_input, _dore_cfg).as_dict() if _sensex_dore_input else None
         )
 
         _banknifty_ohlcv = fetch_banknifty_ohlcv("1y")
+        _banknifty_ce_chg, _banknifty_pe_chg = _oi_changes.get("BANKNIFTY", (0.0, 0.0))
         _banknifty_dore_input = build_dore_input_for_index(
             "BANKNIFTY", _banknifty_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
             st.session_state.get("banknifty_oi_resistance", {}),
             position=st.session_state.get("banknifty_option_position"),
+            ce_oi_change=_banknifty_ce_chg, pe_oi_change=_banknifty_pe_chg,
         )
         st.session_state["banknifty_dore"] = (
             compute_dore(_banknifty_dore_input, _dore_cfg).as_dict() if _banknifty_dore_input else None
