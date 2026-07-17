@@ -1170,6 +1170,45 @@ _CSS = """
   color: #d29922;
   margin-top: 2px;
 }
+
+/* ── News Pulse block ── */
+.np-summary-row {
+  display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap;
+}
+.np-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 10px; border-radius: 12px;
+  font-size: 11px; font-weight: 700; font-family: var(--mono);
+}
+.np-chip-pos { background: rgba(63,185,80,0.15);  border: 1px solid rgba(63,185,80,0.4);  color: var(--green); }
+.np-chip-neg { background: rgba(248,81,73,0.12);  border: 1px solid rgba(248,81,73,0.35); color: var(--red); }
+.np-chip-neu { background: rgba(139,148,158,0.1); border: 1px solid rgba(139,148,158,0.3); color: var(--muted); }
+
+.np-item {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 8px 0; border-bottom: 1px solid var(--border);
+}
+.np-item:last-child { border-bottom: none; }
+.np-dot { flex-shrink: 0; margin-top: 5px; width: 8px; height: 8px; border-radius: 50%; }
+.np-dot-pos { background: var(--green); }
+.np-dot-neg { background: var(--red); }
+.np-dot-neu { background: var(--muted); }
+.np-body { flex: 1; min-width: 0; }
+.np-title { font-size: 12.5px; font-weight: 600; color: var(--text); text-decoration: none; }
+.np-title:hover { text-decoration: underline; }
+.np-meta { font-size: 10px; color: var(--muted); margin-top: 2px; }
+.np-note { font-size: 10.5px; color: var(--muted); margin-top: 2px; font-style: italic; }
+.np-symbol-chip {
+  display: inline-block; padding: 1px 6px; border-radius: 4px;
+  background: rgba(88,166,255,0.12); border: 1px solid rgba(88,166,255,0.35);
+  color: #58a6ff; font-size: 9.5px; font-weight: 700; font-family: var(--mono);
+  margin-right: 4px;
+}
+.np-scan-flag {
+  display: inline-block; padding: 1px 6px; border-radius: 4px;
+  background: rgba(245,197,66,0.15); border: 1px solid rgba(245,197,66,0.4);
+  color: #f5c542; font-size: 9.5px; font-weight: 700; margin-left: 4px;
+}
 </style>
 """
 
@@ -3669,6 +3708,101 @@ def _market_intelligence_fragment():
     )
 
 
+# ── NEWS PULSE — ET + Moneycontrol headlines, free-LLM sentiment tag ──
+# 2026-07-17: uses the Agent's existing OpenAI-SDK-style client pattern but
+# points at Groq (free tier) instead — see utils/groq_client.py for why.
+# Feed fetch (utils/news_feed.py) and sentiment tagging (utils/news_sentiment.py)
+# are both @st.cache_data-backed (15min / 30min respectively), so this is
+# cheap to call on every render() — no fragment/timer needed the way the
+# live index-quote strip above needs one.
+_SENTIMENT_DOT_CLASS = {
+    "Positive": "np-dot-pos", "Negative": "np-dot-neg",
+    "Neutral": "np-dot-neu", "Unclassified": "np-dot-neu",
+}
+
+
+def _news_ago(published) -> str:
+    if published is None:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        delta = datetime.now(timezone.utc) - published
+        mins = int(delta.total_seconds() // 60)
+        if mins < 60:
+            return f"{mins}m ago"
+        hrs = mins // 60
+        if hrs < 24:
+            return f"{hrs}h ago"
+        return f"{hrs // 24}d ago"
+    except Exception:
+        return ""
+
+
+def _news_pulse_block():
+    """Renders the 📰 Market News Pulse expander on the Scanner page."""
+    try:
+        from utils.news_feed import fetch_all_news
+        from utils.news_sentiment import tag_news
+        from utils.groq_client import _is_available as _groq_available
+    except Exception as exc:
+        # feedparser not yet installed (requirements.txt just changed) or
+        # similar — fail soft, the rest of the scanner page must not break.
+        with st.expander("📰 Market News Pulse", expanded=False):
+            st.caption(f"News module unavailable: {exc}")
+        return
+
+    with st.expander("📰 Market News Pulse — ET + Moneycontrol", expanded=False):
+        if not _groq_available():
+            st.caption(
+                "ℹ️ Add `GROQ_API_KEY` in secrets to enable bullish/bearish "
+                "tagging (free at console.groq.com) — showing raw headlines only."
+            )
+
+        with st.spinner("Fetching news…"):
+            raw_items = fetch_all_news()
+            items = tag_news(raw_items)
+
+        if not items:
+            st.caption("No headlines available right now — feeds may be temporarily unreachable.")
+            return
+
+        # symbols currently in the loaded scan, for the "in your scan" flag
+        scan_df = st.session_state.get("scan_df", pd.DataFrame())
+        scan_symbols = set(scan_df["Stock"].astype(str)) if "Stock" in scan_df.columns else set()
+
+        pos = sum(1 for i in items if i["sentiment"] == "Positive")
+        neg = sum(1 for i in items if i["sentiment"] == "Negative")
+        neu = sum(1 for i in items if i["sentiment"] in ("Neutral", "Unclassified"))
+
+        summary_html = f"""
+<div class="np-summary-row">
+  <span class="np-chip np-chip-pos">▲ {pos} Positive</span>
+  <span class="np-chip np-chip-neg">▼ {neg} Negative</span>
+  <span class="np-chip np-chip-neu">● {neu} Neutral</span>
+</div>
+"""
+        rows_html = []
+        for item in items[:30]:
+            dot_class = _SENTIMENT_DOT_CLASS.get(item["sentiment"], "np-dot-neu")
+            symbol_chips = "".join(
+                f'<span class="np-symbol-chip">{sym}</span>'
+                + ('<span class="np-scan-flag">IN SCAN</span>' if sym in scan_symbols else '')
+                for sym in item.get("symbols", [])
+            )
+            note = item.get("impact_note", "")
+            note_html = f'<div class="np-note">{note}</div>' if note else ""
+            ago = _news_ago(item.get("published"))
+            rows_html.append(f"""
+<div class="np-item">
+  <span class="np-dot {dot_class}"></span>
+  <div class="np-body">
+    <a class="np-title" href="{item['link']}" target="_blank">{item['title']}</a>
+    <div class="np-meta">{item['source']} · {ago} {symbol_chips}</div>
+    {note_html}
+  </div>
+</div>""")
+
+        st.markdown(summary_html + "".join(rows_html), unsafe_allow_html=True)
 
 
 def render(settings: dict | None = None):
@@ -3815,6 +3949,11 @@ def render(settings: dict | None = None):
     #    whether a scan has ever been run (see _market_intelligence_fragment
     #    above _market_overview_panel for the fetch + render logic).
     _market_intelligence_fragment()
+
+    # ── News Pulse — independent of scan state too, same reasoning as
+    #    the market intel strip above: news relevance doesn't wait for
+    #    someone to click Run Scan.
+    _news_pulse_block()
 
     if df_aug.empty:
         st.markdown("""
