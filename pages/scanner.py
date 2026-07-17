@@ -1222,6 +1222,13 @@ _CSS = """
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block;
 }
 .ni-headline:hover { text-decoration: underline; }
+.ni-symbols { margin-top: 3px; }
+.ni-symbol-chip {
+  display: inline-block; padding: 1px 6px; border-radius: 4px;
+  background: rgba(88,166,255,0.12); border: 1px solid rgba(88,166,255,0.35);
+  color: var(--blue); font-size: 9.5px; font-weight: 700; font-family: var(--mono);
+  margin-right: 4px;
+}
 .ni-sector { font-size: 11px; color: var(--muted); }
 .ni-source { font-size: 10px; color: var(--muted); text-align: right; }
 
@@ -3803,13 +3810,29 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
             if rec else '<span class="ni-rec-dash">—</span>'
         )
 
-        sector_label = item.get("sector") or (symbols[0] if symbols else "Market")
+        # 2026-07-17 fix: this used to fall back to symbols[0] only when
+        # item["sector"] was falsy — but tag_news() always sets a sector
+        # (get_sector() defaults to "Diversified", never None/empty) the
+        # instant there's at least one matched symbol, so that fallback
+        # never actually fired and the stock name never appeared anywhere
+        # in the row. Sector and matched-symbol are now shown separately:
+        # SECTOR column stays genuinely sector-level; matched tickers get
+        # their own chip row under the headline (blank if nothing matched
+        # — a market-wide story with no single stock behind it).
+        sector_label = item.get("sector") or "Market"
+        symbol_chips_html = (
+            "".join(f'<span class="ni-symbol-chip">{s}</span>' for s in symbols[:4])
+            if symbols else ""
+        )
         time_label = item["published"].strftime("%I:%M %p") if item.get("published") else "—"
 
         rows.append(f"""
 <div class="ni-grid ni-row" title="{item.get('impact_note', '')}">
   <div class="ni-time">{time_label}</div>
-  <a class="ni-headline" href="{item['link']}" target="_blank" title="{item['title']}">{item['title']}</a>
+  <div>
+    <a class="ni-headline" href="{item['link']}" target="_blank" title="{item['title']}">{item['title']}</a>
+    {f'<div class="ni-symbols">{symbol_chips_html}</div>' if symbol_chips_html else ''}
+  </div>
   <div class="ni-sector">{sector_label}</div>
   <div><span class="ni-pill {impact_class}">{impact_label}</span></div>
   <div>{rec_html}</div>
