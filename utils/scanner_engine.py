@@ -637,8 +637,35 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d",
     return get_history(list(symbols), years=years, min_bars=60, source=source)
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_nifty(period: str = "1y") -> pd.Series:
-    """Fetch Nifty 50 (^NSEI) close series for regime classification."""
+def fetch_nifty(period: str = "1y", source: str = "yfinance") -> pd.Series:
+    """
+    Fetch Nifty 50 close series for regime classification and as the
+    Relative Strength benchmark.
+
+    2026-07-16: added `source`. RS/regime is only a meaningful comparison
+    when the benchmark and the stock data come from the SAME provider
+    (adjusted-vs-raw closes move both series differently — see
+    history_store.py's module docstring on why yfinance/Upstox are never
+    mixed for a single symbol's cache; the same reasoning applies to
+    comparing a stock series against a benchmark series). run_scanner()
+    passes source=fetch_source (whatever the Scanner Data Source setting
+    resolved to) here for exactly that reason. Defaults to "yfinance" so
+    every other existing caller (Market Overview panel, anything not
+    explicitly passing source) is unaffected.
+
+    source="upstox" fetches via upstox_client.fetch_index_ohlcv_upstox("NIFTY"),
+    falling back to yfinance (same fail-soft convention used throughout
+    this app) if that comes back empty.
+    """
+    if source == "upstox":
+        try:
+            from utils.upstox_client import fetch_index_ohlcv_upstox
+            df = fetch_index_ohlcv_upstox("NIFTY", period)
+            if not df.empty:
+                return df["close"].rename("nifty")
+        except Exception:
+            pass
+        # fall through to yfinance below
     try:
         df = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
         if not df.empty:
@@ -651,13 +678,25 @@ def fetch_nifty(period: str = "1y") -> pd.Series:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_nifty_ohlcv(period: str = "1y") -> pd.DataFrame:
+def fetch_nifty_ohlcv(period: str = "1y", source: str = "yfinance") -> pd.DataFrame:
     """
     Fetch full OHLCV for Nifty 50 (^NSEI).
     Used by regime_engine to compute a real Wilder ADX on the index
-    instead of the EMA-slope proxy.
+    instead of the EMA-slope proxy, and by Market Intelligence's DORE
+    integration (which passes source="upstox" explicitly — see
+    fetch_nifty()'s docstring for why source consistency matters and
+    who passes what).
     Returns an empty DataFrame on failure.
     """
+    if source == "upstox":
+        try:
+            from utils.upstox_client import fetch_index_ohlcv_upstox
+            df = fetch_index_ohlcv_upstox("NIFTY", period)
+            if not df.empty:
+                return df
+        except Exception:
+            pass
+        # fall through to yfinance below
     try:
         df = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
         if not df.empty:
@@ -669,17 +708,54 @@ def fetch_nifty_ohlcv(period: str = "1y") -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def fetch_sensex_ohlcv(period: str = "1y") -> pd.DataFrame:
+def fetch_sensex_ohlcv(period: str = "1y", source: str = "upstox") -> pd.DataFrame:
     """
-    Fetch full OHLCV for BSE Sensex (^BSESN) — the Sensex counterpart to
-    fetch_nifty_ohlcv(). Added for utils.dore_engine.build_dore_input_for_index(),
-    which needs full OHLCV (not just the close-only series compute_ema_levels()
-    accepts) to run the same build_indicators()/compute_bar() pipeline used
-    for every scanned stock, applied here to the index itself.
+    Fetch full OHLCV for BSE Sensex — the Sensex counterpart to
+    fetch_nifty_ohlcv(). Used exclusively by Market Intelligence (DORE for
+    the Sensex card) — Sensex is never a scanner benchmark, so this
+    defaults to source="upstox" per the Market Intelligence pipeline's
+    "always Upstox" rule, falling back to yfinance (^BSESN) only if the
+    Upstox fetch fails.
     Returns an empty DataFrame on failure.
     """
+    if source == "upstox":
+        try:
+            from utils.upstox_client import fetch_index_ohlcv_upstox
+            df = fetch_index_ohlcv_upstox("SENSEX", period)
+            if not df.empty:
+                return df
+        except Exception:
+            pass
     try:
         df = yf.Ticker("^BSESN").history(period=period, auto_adjust=True)
+        if not df.empty:
+            df.index   = _strip_tz(pd.to_datetime(df.index))
+            df.columns = [c.lower() for c in df.columns]
+            return df[["open", "high", "low", "close", "volume"]]
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def fetch_banknifty_ohlcv(period: str = "1y", source: str = "upstox") -> pd.DataFrame:
+    """
+    Fetch full OHLCV for Nifty Bank (^NSEBANK) — the Bank Nifty counterpart
+    to fetch_nifty_ohlcv()/fetch_sensex_ohlcv(). Used exclusively by Market
+    Intelligence (DORE for the new Bank Nifty card). Defaults to
+    source="upstox" per the Market Intelligence pipeline's "always Upstox"
+    rule, falling back to yfinance (^NSEBANK) only if the Upstox fetch fails.
+    Returns an empty DataFrame on failure.
+    """
+    if source == "upstox":
+        try:
+            from utils.upstox_client import fetch_index_ohlcv_upstox
+            df = fetch_index_ohlcv_upstox("BANKNIFTY", period)
+            if not df.empty:
+                return df
+        except Exception:
+            pass
+    try:
+        df = yf.Ticker("^NSEBANK").history(period=period, auto_adjust=True)
         if not df.empty:
             df.index   = _strip_tz(pd.to_datetime(df.index))
             df.columns = [c.lower() for c in df.columns]
@@ -723,17 +799,37 @@ def compute_ema_levels(series: pd.Series) -> dict:
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_sensex_ema_levels() -> dict:
     """
-    EMA20/EMA50/EMA200 for BSE Sensex (^BSESN), via compute_ema_levels().
+    EMA20/EMA50/EMA200 for BSE Sensex, via compute_ema_levels().
     Sensex isn't part of the regime-calc series like Nifty is (that one's
     reused straight from fetch_nifty()), so this does its own 1y daily
-    fetch. Cached for 5 minutes since these only move with each new daily
-    close, not intraday. Returns {} on fetch failure.
+    fetch — reusing fetch_sensex_ohlcv() (Upstox by default, per Market
+    Intelligence's "always Upstox" rule, yfinance fallback on failure)
+    rather than a separate hardcoded yfinance call. Cached for 5 minutes
+    since these only move with each new daily close, not intraday.
+    Returns {} on fetch failure.
     """
     try:
-        daily = yf.Ticker("^BSESN").history(period="1y", interval="1d", auto_adjust=True)
+        daily = fetch_sensex_ohlcv("1y")
         if daily.empty:
             return {}
-        return compute_ema_levels(daily["Close"])
+        return compute_ema_levels(daily["close"])
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_banknifty_ema_levels() -> dict:
+    """
+    EMA20/EMA50/EMA200 for Nifty Bank, via compute_ema_levels(). Bank Nifty
+    counterpart to fetch_sensex_ema_levels() — same Upstox-by-default,
+    yfinance-fallback sourcing via fetch_banknifty_ohlcv().
+    Returns {} on fetch failure.
+    """
+    try:
+        daily = fetch_banknifty_ohlcv("1y")
+        if daily.empty:
+            return {}
+        return compute_ema_levels(daily["close"])
     except Exception:
         return {}
 
@@ -893,6 +989,81 @@ def fetch_sensex_intraday_snapshot() -> dict:
     if not got_spark:
         try:
             daily = yf.Ticker("^BSESN").history(period="1mo", auto_adjust=True)
+            if len(daily) >= 2:
+                last, prev = daily.iloc[-1], daily.iloc[-2]
+                last_close, prev_close = float(last["Close"]), float(prev["Close"])
+                out.update({
+                    "price":      last_close,
+                    "pct_chg":    round((last_close - prev_close) / prev_close * 100, 2) if prev_close else None,
+                    "open":       float(last["Open"]),
+                    "high":       float(last["High"]),
+                    "low":        float(last["Low"]),
+                    "prev_close": prev_close,
+                    "spark":      daily["Close"].tail(15).tolist(),
+                })
+        except Exception:
+            pass
+
+    if ux:
+        out.update({k: v for k, v in ux.items() if v is not None})
+
+    return out
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_banknifty_intraday_snapshot() -> dict:
+    """
+    Return today's Nifty Bank (^NSEBANK) snapshot for the Market Overview
+    panel's BANK NIFTY index card. Mirrors fetch_sensex_intraday_snapshot()
+    exactly — Upstox's live index quote (fetch_index_quote("BANKNIFTY"))
+    supplies price/pct_chg/OHLC by default, yfinance supplies the
+    sparkline and is the full fallback if Upstox is unavailable.
+
+    {
+      "price": float, "pct_chg": float | None, "open": float, "high": float,
+      "low": float, "prev_close": float | None, "spark": list[float]
+    }
+    """
+    import pytz
+    from utils.upstox_client import fetch_index_quote
+    _IST = pytz.timezone("Asia/Kolkata")
+
+    def _today_ist() -> pd.Timestamp:
+        return pd.Timestamp.now(tz=_IST).normalize().tz_localize(None)
+
+    out = {"price": 0.0, "pct_chg": None, "open": 0.0, "high": 0.0,
+           "low": 0.0, "prev_close": None, "spark": []}
+
+    ux = fetch_index_quote("BANKNIFTY")   # live numbers, or None — spark always comes from yfinance below
+
+    got_spark = False
+    try:
+        df = yf.Ticker("^NSEBANK").history(period="2d", interval="1m", auto_adjust=True)
+        if not df.empty:
+            df.index = _strip_tz(pd.to_datetime(df.index))
+            today = _today_ist()
+            today_bars = df[df.index.normalize() == today]
+            if not today_bars.empty:
+                prev_bars  = df[df.index.normalize() < today]
+                prev_close = float(prev_bars["Close"].iloc[-1]) if not prev_bars.empty else None
+                price      = float(today_bars["Close"].iloc[-1])
+                out.update({
+                    "price":      price,
+                    "pct_chg":    round((price - prev_close) / prev_close * 100, 2) if prev_close else None,
+                    "open":       float(today_bars["Open"].iloc[0]),
+                    "high":       float(today_bars["High"].max()),
+                    "low":        float(today_bars["Low"].min()),
+                    "prev_close": prev_close,
+                    "spark":      today_bars["Close"].tolist()[::max(1, len(today_bars)//60)],
+                })
+                got_spark = True
+    except Exception:
+        pass
+
+    # Market not yet open / intraday fetch failed — fall back to daily bars
+    if not got_spark:
+        try:
+            daily = yf.Ticker("^NSEBANK").history(period="1mo", auto_adjust=True)
             if len(daily) >= 2:
                 last, prev = daily.iloc[-1], daily.iloc[-2]
                 last_close, prev_close = float(last["Close"]), float(prev["Close"])
@@ -1824,7 +1995,7 @@ def run_scanner(
     except Exception:
         pass   # non-fatal — fall back to cached OHLCV
 
-    nifty_series = fetch_nifty("1y")
+    nifty_series = fetch_nifty("1y", source=fetch_source)
     regime_val   = nifty_regime(nifty_series)   # bull / bear / neutral — computed once
 
     # Inject regime into settings so ScoringParams picks it up
