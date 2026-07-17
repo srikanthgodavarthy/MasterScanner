@@ -696,6 +696,10 @@ def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
       "ce_strike": 25400.0, "ce_oi": 8123450, "ce_premium": 42.15,  # highest-OI Call strike
       "pe_strike": 24800.0, "pe_oi": 7543210, "pe_premium": 38.60,  # highest-OI Put strike
       "pcr": 1.08,   # total Put OI / total Call OI across the whole chain
+      "total_ce_oi": 142883210, "total_pe_oi": 154313500,  # 2026-07-18: added for
+                     # utils.oi_snapshot_store's OI-change tracker (DORE Stage 2's
+                     # writing/unwinding signal needs a real total to diff against
+                     # snapshot-over-snapshot — see that module's docstring).
     }
 
     Returns None on any failure (missing/expired token, empty chain, etc.)
@@ -750,6 +754,13 @@ def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
             # standard definition) — NOT ce_oi/pe_oi at the two individual
             # max-OI strikes, which would be a different, narrower ratio.
             "pcr":        round(total_pe_oi / total_ce_oi, 3) if total_ce_oi else None,
+            # 2026-07-18: chain-wide totals, surfaced for
+            # utils.oi_snapshot_store.record_and_diff() (DORE Stage 2's
+            # writing/unwinding signal — see that module's docstring for why
+            # this needs to be the whole-chain total, not just the two
+            # highest-OI strikes above, which OI Resistance/Support use).
+            "total_ce_oi": total_ce_oi,
+            "total_pe_oi": total_pe_oi,
         }
     except Exception:
         logger.warning("Upstox option-chain fetch failed for %s", index, exc_info=True)

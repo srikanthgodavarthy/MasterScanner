@@ -720,6 +720,9 @@ def build_dore_input_for_index(
     oi_resistance: Optional[dict],     # utils.upstox_client.fetch_oi_resistance() output
     breadth: Optional[float] = None,
     position: Optional[dict] = None,
+    ce_oi_change: float = 0.0,         # 2026-07-18: from utils.oi_snapshot_store.record_and_diff() —
+    pe_oi_change: float = 0.0,         # see that module's docstring. Caller computes the diff (this
+                                        # function stays a pure builder, no cache access of its own).
 ) -> Optional[DOREInput]:
     """Index-level counterpart to build_dore_input_from_scanner(). Nifty and
     Sensex aren't part of the Nifty-500 scan universe, so there's no
@@ -778,10 +781,12 @@ def build_dore_input_for_index(
         bar_result=bar_result,
         cv1_scores=cv1,
         oi_resistance=oi_resistance,
+        atm_chain_row={"ce_oi_change": ce_oi_change, "pe_oi_change": pe_oi_change},
         breadth=breadth,
         position=position,
         atr_override=cur_atr,
     )
+
 
 
 def build_dore_input_from_scanner(
@@ -865,7 +870,7 @@ def build_dore_input_from_scanner(
         pe_oi_change=atm_chain_row.get("pe_oi_change", 0.0),
         ce_bid_ask_spread_pct=atm_chain_row.get("ce_spread_pct"),
         pe_bid_ask_spread_pct=atm_chain_row.get("pe_spread_pct"),
-        pcr=atm_chain_row.get("pcr", 1.0),
+        pcr=atm_chain_row.get("pcr", oi_resistance.get("pcr", 1.0)),
         highest_ce_oi_strike=oi_resistance.get("ce_strike", 0.0),
         highest_pe_oi_strike=oi_resistance.get("pe_strike", 0.0),
         nearest_expiry=oi_resistance.get("expiry", ""),
