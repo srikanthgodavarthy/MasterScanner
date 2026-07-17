@@ -17,6 +17,9 @@ Changes vs v8:
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import logging
+logger = logging.getLogger(__name__)
+
 import streamlit as st
 import pandas as pd
 from datetime import datetime
@@ -69,6 +72,22 @@ _SC_STYLE = {
     "DEVELOPING": ("#d29922", "DEVELOPING"),
     "WATCH":      ("#8b949e", "WATCH"),
     "SKIP":       ("#484f58", "SKIP"),
+}
+
+# DORE (Dynamic Options Recommendation Engine) badge palette — one color
+# family per action type: green=enter now, blue=wait-for-confirmation,
+# amber=hold, red=book profits / step aside, gray=wait/no-trade.
+_DORE_BADGE_STYLE = {
+    "BUY_CE_NOW":       ("#3fb950", "🟢 BUY CE NOW"),
+    "BUY_PE_NOW":       ("#3fb950", "🟢 BUY PE NOW"),
+    "BUY_CE_BREAKOUT":  ("#58a6ff", "🔵 BUY CE ON BREAKOUT"),
+    "BUY_PE_BREAKDOWN": ("#58a6ff", "🔵 BUY PE ON BREAKDOWN"),
+    "HOLD_CE":          ("#d29922", "🟡 HOLD CE"),
+    "HOLD_PE":          ("#d29922", "🟡 HOLD PE"),
+    "BOOK_CE_PROFITS":  ("#f85149", "🔴 BOOK CE PROFITS"),
+    "BOOK_PE_PROFITS":  ("#f85149", "🔴 BOOK PE PROFITS"),
+    "WAIT":             ("#8b949e", "⚪ WAIT"),
+    "NO_TRADE":         ("#484f58", "⚫ NO TRADE"),
 }
 
 _CAT_ORDER = [
@@ -1119,6 +1138,38 @@ _CSS = """
 .mo-index-oi-meta { font-size: 9px; color: var(--muted); margin-top: 2px; }
 
 .mo-index-expiry { font-size: 9.5px; color: var(--muted); margin-top: 8px; }
+
+.mo-index-dore-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  cursor: help;
+}
+.mo-index-dore-badge {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 3px 8px;
+  border-radius: 5px;
+  border: 1px solid;
+  font-family: var(--mono);
+}
+.mo-index-dore-conf { font-size: 11px; font-weight: 700; font-family: var(--mono); }
+.mo-index-dore-reason {
+  font-size: 9.5px;
+  color: var(--muted);
+  margin-top: 4px;
+  line-height: 1.35;
+}
+.mo-index-dore-warn {
+  font-size: 9px;
+  color: #d29922;
+  margin-top: 2px;
+}
 </style>
 """
 
@@ -1839,7 +1890,8 @@ def _vix_band(vix: float) -> tuple[str, str]:
 
 
 def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
-                      grad_id: str, badge: str = "", ema: dict | None = None) -> str:
+                      grad_id: str, badge: str = "", ema: dict | None = None,
+                      dore: dict | None = None) -> str:
     """
     Render one equal-width Market Overview index card: EMA20/50/200 badge
     row, live price, %chg, intraday sparkline, OHLC row, and nearest-expiry
@@ -1856,6 +1908,10 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
           / fetch_sensex_ema_levels(). A span is simply skipped in the badge
           row if it's missing (not enough history yet). None/empty hides
           the whole row.
+    dore: utils.dore_engine.DOREResult.as_dict() — {"recommendation",
+          "confidence", "reasons", "warnings", ...}. None/empty hides the
+          whole DORE row (e.g. while an index BarResult couldn't be built
+          yet, or DORE hasn't been wired up in this deployment).
     grad_id: unique sparkline gradient id (see _nifty_spark_svg).
     badge: optional small right-aligned tag, e.g. "(delayed)".
     """
@@ -1941,6 +1997,26 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
         )
     ema_row_html = f'<div class="mo-index-ema-row">{"".join(ema_items)}</div>' if ema_items else ""
 
+    dore_html = ""
+    if dore:
+        rec        = dore.get("recommendation", "WAIT")
+        conf       = dore.get("confidence", 0)
+        color, lbl = _DORE_BADGE_STYLE.get(rec, ("#8b949e", rec))
+        reasons    = dore.get("reasons") or []
+        warnings   = dore.get("warnings") or []
+        top_reason = reasons[-1] if reasons else ""   # Stage 5's own reason is appended last
+        tooltip    = " · ".join(reasons)[:500].replace('"', "'")
+        warn_html  = (
+            f'<div class="mo-index-dore-warn">⚠ {warnings[0]}</div>' if warnings else ""
+        )
+        dore_html = f"""
+  <div class="mo-index-dore-row" title="{tooltip}">
+    <span class="mo-index-dore-badge" style="color:{color};border-color:{color}55;background:{color}14">{lbl}</span>
+    <span class="mo-index-dore-conf" style="color:{color}">{conf:.0f}%</span>
+  </div>
+  <div class="mo-index-dore-reason">{top_reason}</div>
+  {warn_html}"""
+
     return f"""
 <div class="mo-index-card">
   {ema_row_html}
@@ -1955,6 +2031,7 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
   <div class="mo-index-ohlc-row">{ohlc_html}</div>
   <div class="mo-index-oi-row">{oi_html}</div>
   <div class="mo-index-expiry">{expiry_html}</div>
+  {dore_html}
 </div>
 """
 
@@ -1969,9 +2046,11 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
     layout (2026-07 redesign) with an institutional-terminal-style,
     information-dense strip that doesn't grow the page height.
 
-    index_cards: list of {"label", "snapshot", "oi", "badge", "ema"} dicts,
-    one per index, rendered via _index_card_html() in the given order.
-    "ema" is the compute_ema_levels()/fetch_sensex_ema_levels() output.
+    index_cards: list of {"label", "snapshot", "oi", "badge", "ema", "dore"}
+    dicts, one per index, rendered via _index_card_html() in the given
+    order. "ema" is the compute_ema_levels()/fetch_sensex_ema_levels()
+    output. "dore" is utils.dore_engine.DOREResult.as_dict() (optional —
+    omit or leave None/{} to render the card without the DORE row).
     """
     r = summary.get("regime", "RANGE")
     regime_color, _, _ = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
@@ -2083,6 +2162,7 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
         _index_card_html(
             c.get("label", ""), c.get("snapshot"), c.get("oi"),
             grad_id=f"moSpark{i}", badge=c.get("badge", ""), ema=c.get("ema"),
+            dore=c.get("dore"),
         )
         for i, c in enumerate(index_cards)
     )
@@ -3530,6 +3610,45 @@ def _market_intelligence_fragment():
     except Exception:
         st.session_state["sensex_oi_resistance"] = {}
 
+    # ── DORE (Dynamic Options Recommendation Engine) ────────────────
+    # NIFTY/SENSEX aren't part of the scanned Nifty-500 universe, so
+    # there's no BarResult/CV1 sitting in memory for them the way there
+    # is for a scanned stock — build one on demand from each index's own
+    # OHLCV history via the same scoring_core pipeline every stock goes
+    # through. Fails soft to None (card renders without the DORE row)
+    # on any error — a DORE hiccup should never take down the rest of
+    # this already-live fragment.
+    try:
+        from utils.dore_engine import build_dore_input_for_index, compute_dore
+        from utils.dore_settings import DORESettings
+        from utils.scanner_engine import fetch_nifty_ohlcv, fetch_sensex_ohlcv
+
+        _dore_cfg = DORESettings.from_dict(st.session_state.get("dore_settings", {}))
+
+        _nifty_ohlcv = fetch_nifty_ohlcv("1y")
+        _nifty_dore_input = build_dore_input_for_index(
+            "NIFTY", _nifty_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
+            st.session_state.get("oi_resistance", {}),
+            position=st.session_state.get("nifty_option_position"),
+        )
+        st.session_state["nifty_dore"] = (
+            compute_dore(_nifty_dore_input, _dore_cfg).as_dict() if _nifty_dore_input else None
+        )
+
+        _sensex_ohlcv = fetch_sensex_ohlcv("1y")
+        _sensex_dore_input = build_dore_input_for_index(
+            "SENSEX", _sensex_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
+            st.session_state.get("sensex_oi_resistance", {}),
+            position=st.session_state.get("sensex_option_position"),
+        )
+        st.session_state["sensex_dore"] = (
+            compute_dore(_sensex_dore_input, _dore_cfg).as_dict() if _sensex_dore_input else None
+        )
+    except Exception:
+        logger.exception("DORE computation failed in _market_intelligence_fragment")
+        st.session_state.setdefault("nifty_dore", None)
+        st.session_state.setdefault("sensex_dore", None)
+
     # ── Render ────────────────────────────────────────────────────
     summary   = st.session_state.get("scan_summary", {})
     scan_time = st.session_state.get("scan_time", "")
@@ -3537,10 +3656,12 @@ def _market_intelligence_fragment():
     index_cards = [
         {"label": "NIFTY 50", "snapshot": st.session_state.get("nifty_snapshot", {}),
          "oi": st.session_state.get("oi_resistance", {}), "badge": "",
-         "ema": st.session_state.get("nifty_ema_levels", {})},
+         "ema": st.session_state.get("nifty_ema_levels", {}),
+         "dore": st.session_state.get("nifty_dore")},
         {"label": "SENSEX",   "snapshot": st.session_state.get("sensex_snapshot", {}),
          "oi": st.session_state.get("sensex_oi_resistance", {}), "badge": "",
-         "ema": st.session_state.get("sensex_ema_levels", {})},
+         "ema": st.session_state.get("sensex_ema_levels", {}),
+         "dore": st.session_state.get("sensex_dore")},
     ]
     st.markdown(
         _market_overview_panel(summary, breadth, scan_time, index_cards),
