@@ -47,9 +47,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pandas as pd
 import streamlit as st
 
-from utils.scanner_engine import NIFTY500_SYMBOLS, _fetch_live_prices
+from utils.scanner_engine import NIFTY500_SYMBOLS, _fetch_live_prices, score_stock, fetch_nifty
 from utils.history_store import get_history
 from utils.upstox_client import get_upstox_token, is_token_expired, fetch_batch_today_ohlc_upstox
+from utils.scoring_core import ScoringParams, build_indicators
 
 CLOSE_TOL_PCT  = 0.5   # flag close-price divergence beyond this %
 RATIO_STD_TOL  = 0.01  # ratios tighter than this look "systematic," not noisy
@@ -188,6 +189,136 @@ def _compare_live_one(symbol: str, yf_lv: dict | None, ux_lv: dict | None) -> di
     else:
         row["status"] = "✓ close"
     return row
+
+
+# ══════════════════════════════════════════════════════════════════
+#  FULL INDICATOR / SCORE COMPARISON — yfinance vs upstox
+# ══════════════════════════════════════════════════════════════════
+# Everything above only compares raw CLOSE. That's not enough: two
+# sources can agree on close to the last paisa and still disagree on
+# every derived signal the app actually trades off of, because
+# indicators are path-dependent (EMA/RSI/ATR/CCI all depend on the
+# FULL bar sequence feeding them, not just the latest close) and the
+# composite scores (Leadership/Conviction/Entry Quality/Extension/
+# Recommendation) are themselves built on top of those indicators.
+# A source with a missing bar, a shifted split-adjustment, or a
+# slightly different high/low on one day can silently produce a
+# different Recommendation for the same stock on the same day even
+# when both closes matched exactly.
+#
+# This section runs the SAME code path the live scanner uses
+# (build_indicators + score_stock, i.e. utils.scoring_core /
+# utils.scanner_engine — never a reimplementation) once per source,
+# on that source's own OHLCV, and diffs the results field by field.
+#
+# NOTE: score_stock() requires >=210 bars, so this section fetches
+# years=1.0 (matching what run_scanner() actually requests), not the
+# years=0.25 used by the close-only check above.
+
+EMA_ATR_TOL_PCT = 1.0     # EMA20/50/200, ATR — % divergence flagged
+CCI_TOL_PTS     = 15.0    # CCI — absolute-point divergence flagged
+RSI_TOL_PTS     = 5.0     # RSI (0-100 scale) — absolute-point divergence flagged
+VOLRATIO_TOL    = 0.15    # Volume Ratio — absolute divergence flagged
+SCORE_TOL_PTS   = 10.0    # Extension / Leadership / Conviction / Entry Quality (0-100)
+
+_MIN_BARS_FOR_SCORE = 210   # mirrors score_stock()'s own gate
+
+
+def _pct_row(label, yf_v, ux_v, tol_pct):
+    if yf_v is None or ux_v is None:
+        return {"metric": label, "yfinance": yf_v, "upstox": ux_v, "diff": None, "flag": "n/a"}
+    diff_pct = abs(ux_v - yf_v) / abs(yf_v) * 100 if yf_v else (0.0 if ux_v == 0 else None)
+    flag = "⚠" if (diff_pct is not None and diff_pct > tol_pct) else "✓"
+    return {
+        "metric": label,
+        "yfinance": round(yf_v, 3),
+        "upstox": round(ux_v, 3),
+        "diff": round(diff_pct, 2) if diff_pct is not None else None,
+        "flag": flag,
+    }
+
+
+def _pts_row(label, yf_v, ux_v, tol_pts):
+    if yf_v is None or ux_v is None:
+        return {"metric": label, "yfinance": yf_v, "upstox": ux_v, "diff": None, "flag": "n/a"}
+    diff = abs(ux_v - yf_v)
+    flag = "⚠" if diff > tol_pts else "✓"
+    return {
+        "metric": label,
+        "yfinance": round(yf_v, 2),
+        "upstox": round(ux_v, 2),
+        "diff": round(diff, 2),
+        "flag": flag,
+    }
+
+
+def _match_row(label, yf_v, ux_v):
+    if yf_v is None or ux_v is None:
+        return {"metric": label, "yfinance": yf_v, "upstox": ux_v, "diff": None, "flag": "n/a"}
+    flag = "✓" if yf_v == ux_v else "⚠"
+    return {"metric": label, "yfinance": yf_v, "upstox": ux_v, "diff": None, "flag": flag}
+
+
+def _compare_scored_one(
+    symbol: str,
+    yf_df: pd.DataFrame | None,
+    ux_df: pd.DataFrame | None,
+    nifty: pd.Series,
+    settings: dict | None,
+) -> dict:
+    """
+    Runs build_indicators()+score_stock() independently on each source's
+    OHLCV for `symbol` and returns {"symbol", "rows": [...], "status"}
+    where each row is one metric from the required comparison set:
+    EMA20, EMA50, EMA200, ATR, CCI, RSI, Volume Ratio, Trend Phase,
+    Golden Zone, Compression, Extension, Leadership, Conviction,
+    Entry Quality, Recommendation.
+    """
+    yf_df = yf_df if yf_df is not None else pd.DataFrame()
+    ux_df = ux_df if ux_df is not None else pd.DataFrame()
+
+    if len(yf_df) < _MIN_BARS_FOR_SCORE:
+        return {"symbol": symbol, "rows": [], "status": f"yfinance: only {len(yf_df)} bars (<{_MIN_BARS_FOR_SCORE} needed)"}
+    if len(ux_df) < _MIN_BARS_FOR_SCORE:
+        return {"symbol": symbol, "rows": [], "status": f"upstox: only {len(ux_df)} bars (<{_MIN_BARS_FOR_SCORE} needed)"}
+
+    try:
+        params = ScoringParams.from_settings(settings) if settings else ScoringParams()
+
+        # Raw indicator series — independent of score_stock's composite logic.
+        ia_yf = build_indicators(yf_df, nifty, params)
+        ia_ux = build_indicators(ux_df, nifty, params)
+
+        # Composite scores — the exact function run_scanner() calls per symbol.
+        r_yf = score_stock(yf_df, nifty, settings=settings)
+        r_ux = score_stock(ux_df, nifty, settings=settings)
+    except Exception as exc:
+        return {"symbol": symbol, "rows": [], "status": f"error: {exc}"}
+
+    if not r_yf or not r_ux:
+        return {"symbol": symbol, "rows": [], "status": "score_stock() returned empty for one/both sources"}
+
+    rows = [
+        _pct_row("EMA20",        float(ia_yf.e20.iloc[-1]),  float(ia_ux.e20.iloc[-1]),  EMA_ATR_TOL_PCT),
+        _pct_row("EMA50",        float(ia_yf.e50.iloc[-1]),  float(ia_ux.e50.iloc[-1]),  EMA_ATR_TOL_PCT),
+        _pct_row("EMA200",       float(ia_yf.e200.iloc[-1]), float(ia_ux.e200.iloc[-1]), EMA_ATR_TOL_PCT),
+        _pct_row("ATR",          float(ia_yf.atr_s.iloc[-1]),float(ia_ux.atr_s.iloc[-1]),EMA_ATR_TOL_PCT),
+        _pts_row("CCI",          r_yf.get("CCI"),            r_ux.get("CCI"),            CCI_TOL_PTS),
+        _pts_row("RSI",          r_yf.get("_rsi"),           r_ux.get("_rsi"),           RSI_TOL_PTS),
+        _pts_row("Volume Ratio", r_yf.get("_vol_ratio"),     r_ux.get("_vol_ratio"),     VOLRATIO_TOL),
+        _match_row("Trend Phase",  r_yf.get("TrendPhase"),      r_ux.get("TrendPhase")),
+        _match_row("Golden Zone",  r_yf.get("_in_golden"),      r_ux.get("_in_golden")),
+        _match_row("Compression",  r_yf.get("_squeeze_on"),     r_ux.get("_squeeze_on")),
+        _pts_row("Extension",    r_yf.get("Extension"),      r_ux.get("Extension"),      SCORE_TOL_PTS),
+        _pts_row("Leadership",   r_yf.get("CV1_Leadership"), r_ux.get("CV1_Leadership"), SCORE_TOL_PTS),
+        _pts_row("Conviction",   r_yf.get("CV1_Conviction"), r_ux.get("CV1_Conviction"), SCORE_TOL_PTS),
+        _pts_row("Entry Quality",r_yf.get("CV1_EntryQuality"),r_ux.get("CV1_EntryQuality"),SCORE_TOL_PTS),
+        _match_row("Recommendation", r_yf.get("Recommendation"), r_ux.get("Recommendation")),
+    ]
+
+    n_flagged = sum(1 for row in rows if row["flag"] == "⚠")
+    status = "✓ clean" if n_flagged == 0 else f"⚠ {n_flagged}/{len(rows)} metric(s) diverged"
+    return {"symbol": symbol, "rows": rows, "status": status}
 
 
 def render(settings=None):
@@ -403,3 +534,73 @@ def render(settings=None):
             "entirely and keep whatever close came from the historical "
             "batch call, independent of what this section shows."
         )
+
+    st.markdown("---")
+    st.markdown("### 🧮 Full Indicator & Score Comparison — beyond CLOSE")
+    st.markdown(
+        "<span style='color:#64748b;font-size:0.82rem;'>"
+        "Close price can match perfectly while every derived signal still "
+        "diverges — indicators are path-dependent, and the composite scores "
+        "sit on top of them. This runs the exact scanner code path "
+        "(<code>build_indicators</code> + <code>score_stock</code>) once per "
+        "source and diffs: <b>EMA20, EMA50, EMA200, ATR, CCI, RSI, Volume "
+        "Ratio, Trend Phase, Golden Zone, Compression, Extension, "
+        "Leadership, Conviction, Entry Quality, Recommendation</b>. "
+        "Requires a full 1y fetch per source (score_stock needs "
+        f"≥{_MIN_BARS_FOR_SCORE} bars), so this is slower than the close-only "
+        "check above."
+        "</span>",
+        unsafe_allow_html=True,
+    )
+    run_scored = st.button("▶ Run Full Comparison", key="btn_run_scored_dsc")
+    if run_scored and not symbols:
+        st.error("Select at least one symbol above.")
+    elif run_scored:
+        prog2 = st.progress(0, text="Starting…")
+
+        def _yf_prog2(done, total):
+            prog2.progress(min(0.05 + 0.4 * (done / max(total, 1)), 0.45),
+                            text=f"yfinance 1y history… batch {done}/{total}")
+
+        def _ux_prog2(done, total):
+            prog2.progress(min(0.45 + 0.4 * (done / max(total, 1)), 0.85),
+                            text=f"upstox 1y history… batch {done}/{total}")
+
+        yf_full = get_history(symbols, years=1.0, min_bars=0, progress_cb=_yf_prog2, source="yfinance")
+        ux_full = get_history(symbols, years=1.0, min_bars=0, progress_cb=_ux_prog2, source="upstox")
+        nifty_series = fetch_nifty("1y")
+
+        prog2.progress(0.9, text="Scoring both sources…")
+        st.session_state["dsc_scored_results"] = [
+            _compare_scored_one(sym, yf_full.get(sym), ux_full.get(sym), nifty_series, settings)
+            for sym in symbols
+        ]
+        prog2.progress(1.0, text="Done.")
+        prog2.empty()
+
+    scored_results = st.session_state.get("dsc_scored_results")
+    if scored_results is None:
+        st.info("Select symbols above and click **▶ Run Full Comparison**.")
+    else:
+        overview_df = pd.DataFrame([
+            {"symbol": r["symbol"], "status": r["status"]} for r in scored_results
+        ])
+        st.dataframe(overview_df, width="stretch", hide_index=True)
+
+        n_clean = sum(1 for r in scored_results if r["status"] == "✓ clean")
+        n_bad   = sum(1 for r in scored_results if r["status"].startswith("⚠"))
+        n_skip  = len(scored_results) - n_clean - n_bad
+        if n_bad:
+            st.warning(f"⚠ {n_bad} symbol(s) show a diverging indicator or score between sources.", icon="⚠️")
+        elif n_clean:
+            st.success(f"✅ All {n_clean} scored symbol(s) agree across every metric within tolerance.")
+        if n_skip:
+            st.caption(f"{n_skip} symbol(s) skipped (insufficient history or an error — see status above).")
+
+        st.markdown("#### Per-symbol detail")
+        for r in scored_results:
+            if not r["rows"]:
+                continue
+            with st.expander(f"{r['symbol']} — {r['status']}"):
+                detail_df = pd.DataFrame(r["rows"])
+                st.dataframe(detail_df, width="stretch", hide_index=True)
