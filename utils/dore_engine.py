@@ -211,9 +211,17 @@ def stage1_market_bias(inp: DOREInput, cfg: DORESettings) -> tuple[float, str, l
     if inp.ema_stack_up is not None or inp.ema_stack_down is not None:
         ema_bull = bool(inp.ema_stack_up)
         ema_bear = bool(inp.ema_stack_down)
-    else:
+    elif inp.ema200 > 0:
+        # Only trust the raw-float comparison when a real EMA200 was
+        # actually supplied. build_dore_input_from_scanner() always sets
+        # ema200=0.0 (BarResult carries no raw EMA200 float), which would
+        # make ema_bull spuriously true (price>ema20>ema50>0) and ema_bear
+        # permanently false — silently bullish-biased with no warning.
         ema_bull = inp.price > inp.ema20 > inp.ema50 > inp.ema200
         ema_bear = inp.price < inp.ema20 < inp.ema50 < inp.ema200
+    else:
+        ema_bull = ema_bear = False
+        reasons.append("EMA stack unknown — no boolean flags and no real EMA200 float supplied")
     if ema_bull:
         ema_align_score = 100.0
         reasons.append("EMA stack aligned bullish (Price>EMA20>EMA50>EMA200)")
@@ -236,12 +244,12 @@ def stage1_market_bias(inp: DOREInput, cfg: DORESettings) -> tuple[float, str, l
         trend_phase_score = 100.0 - trend_phase_score
     reasons.append(f"Trend Phase={inp.trend_phase}")
 
+    # ADX measures trend STRENGTH, not direction, so it is intentionally
+    # never flipped by direction_sign (unlike trend_phase_score above).
     adx_score = _pct_score(inp.adx, 10.0, max(cfg.bias_adx_trend_min * 2, 30.0))
-    if direction_sign < 0:
-        adx_score = 100.0 - (100.0 - adx_score)  # ADX = strength, not direction
     reasons.append(f"ADX={inp.adx:.1f}")
 
-    rsi_score = _pct_score(inp.rsi, 30.0, 70.0)  # naturally bull-high/bear-low
+    rsi_score = _pct_score(inp.rsi, cfg.bias_rsi_bear_max, cfg.bias_rsi_bull_min)  # naturally bull-high/bear-low
     reasons.append(f"RSI={inp.rsi:.1f}")
 
     vol_score = _pct_score(inp.vol_ratio, 0.5, max(cfg.bias_vol_ratio_min * 2, 1.5))
@@ -419,10 +427,15 @@ def stage3_premium_evaluation(inp: DOREInput, cfg: DORESettings, direction: Opti
 #  STAGE 4 — OI CORRIDOR
 # ══════════════════════════════════════════════════════════════════
 
-def stage4_oi_corridor(inp: DOREInput, cfg: DORESettings) -> tuple[float, float, float, float, list[str]]:
+def stage4_oi_corridor(inp: DOREInput, cfg: DORESettings) -> tuple[float, float, float, float, float, list[str]]:
     """Room between current price and the nearest CE wall (resistance)
-    / PE wall (support), normalised by ATR. Returns
-    (corridor_score, expected_move, nearest_resistance, nearest_support, reasons).
+    / PE wall (support), normalised by ATR.
+
+    Returns (upside_score, downside_score, expected_move, nearest_resistance,
+    nearest_support, reasons) — the two sub-scores are returned separately
+    (not pre-blended) because which one actually matters depends on the
+    trade direction, which isn't known yet at this stage. See
+    `_corridor_score()` for how they're combined once direction is known.
     """
     reasons: list[str] = []
     atr_ref = max(inp.atr, 1e-6)
@@ -439,16 +452,31 @@ def stage4_oi_corridor(inp: DOREInput, cfg: DORESettings) -> tuple[float, float,
     reasons.append(f"Upside room={upside_room_atr:.2f} ATR to CE wall @{resistance:.0f}")
     reasons.append(f"Downside room={downside_room_atr:.2f} ATR to PE wall @{support:.0f}")
 
-    corridor_score = _weighted([
+    expected_move = round(atr_ref * 1.0, 2)  # 1-ATR expected move, simple & explainable
+
+    logger.info("[DORE:%s] Stage4 Corridor upside=%.1f downside=%.1f expected_move=%.2f",
+                inp.symbol, upside_score, downside_score, expected_move)
+    logger.debug("[DORE:%s] Stage4 reasons=%s", inp.symbol, reasons)
+    return upside_score, downside_score, expected_move, resistance, support, reasons
+
+
+def _corridor_score(cfg: DORESettings, direction: Optional[str],
+                     upside_score: float, downside_score: float) -> float:
+    """Blend Stage 4's upside/downside sub-scores for a specific trade
+    direction. A CE trade only cares about room to the CE wall (upside);
+    a PE trade only cares about room to the PE wall (downside). With no
+    direction yet decided (e.g. an early NEUTRAL/OI-conflict WAIT), fall
+    back to the old symmetric blend for reporting purposes only — no
+    decision is gated on it in that case.
+    """
+    if direction == "CE":
+        return upside_score
+    if direction == "PE":
+        return downside_score
+    return _weighted([
         (upside_score,   cfg.w_corridor_upside_room),
         (downside_score, cfg.w_corridor_downside_room),
     ])
-
-    expected_move = round(atr_ref * 1.0, 2)  # 1-ATR expected move, simple & explainable
-
-    logger.info("[DORE:%s] Stage4 Corridor score=%.1f expected_move=%.2f", inp.symbol, corridor_score, expected_move)
-    logger.debug("[DORE:%s] Stage4 reasons=%s", inp.symbol, reasons)
-    return corridor_score, expected_move, resistance, support, reasons
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -461,12 +489,17 @@ def stage5_decision(
     bias_score: float,
     bias_label: str,
     oi_score: float,
-    corridor_score: float,
+    upside_score: float,
+    downside_score: float,
     resistance: float,
     support: float,
-) -> tuple[str, Optional[str], Optional[float], float, list[str], list[str]]:
+) -> tuple[str, Optional[str], Optional[float], float, float, list[str], list[str]]:
     """Deterministic decision tree. Returns
-    (recommendation, direction, suggested_strike, premium_score, reasons, warnings).
+    (recommendation, direction, suggested_strike, premium_score, corridor_score, reasons, warnings).
+
+    `corridor_score` returned here is direction-aware (see `_corridor_score()`):
+    a CE trade is gated only on room to the CE wall, a PE trade only on room
+    to the PE wall, rather than a direction-blind average of both.
 
     Decision tree (evaluated top to bottom, first match wins):
 
@@ -494,6 +527,7 @@ def stage5_decision(
     # ── Branch 1: managing an existing position ─────────────────
     if inp.in_position and inp.position_side in ("CE", "PE"):
         direction = inp.position_side
+        corridor_score = _corridor_score(cfg, direction, upside_score, downside_score)
         premium_score, p_reasons = stage3_premium_evaluation(inp, cfg, direction)
         reasons += p_reasons
 
@@ -518,24 +552,27 @@ def stage5_decision(
                 reasons.append("OI structure has reversed against the open position")
             strike = inp.atm_strike
             logger.info("[DORE:%s] Stage5 decision=%s (managing position)", inp.symbol, rec)
-            return rec, direction, strike, premium_score, reasons, warnings
+            return rec, direction, strike, premium_score, corridor_score, reasons, warnings
 
         rec = HOLD_CE if direction == "CE" else HOLD_PE
         reasons.append("Position intact: no wall proximity, exhaustion, or OI reversal trigger")
         strike = inp.atm_strike
         logger.info("[DORE:%s] Stage5 decision=%s (managing position)", inp.symbol, rec)
-        return rec, direction, strike, premium_score, reasons, warnings
+        return rec, direction, strike, premium_score, corridor_score, reasons, warnings
 
     # ── Branch 2: no position, deciding whether to enter ────────
     if bias_label == "NEUTRAL":
         reasons.append("Market Bias NEUTRAL — no directional edge")
-        return WAIT, None, None, premium_score, reasons, warnings
+        corridor_score = _corridor_score(cfg, None, upside_score, downside_score)
+        return WAIT, None, None, premium_score, corridor_score, reasons, warnings
 
     if oi_score <= cfg.oi_conflict_score_max:
         reasons.append(f"OI Structure Score={oi_score:.0f} conflicts with {bias_label} bias")
-        return WAIT, None, None, premium_score, reasons, warnings
+        corridor_score = _corridor_score(cfg, None, upside_score, downside_score)
+        return WAIT, None, None, premium_score, corridor_score, reasons, warnings
 
     direction = "CE" if bias_label == "BULLISH" else "PE"
+    corridor_score = _corridor_score(cfg, direction, upside_score, downside_score)
     premium_score, p_reasons = stage3_premium_evaluation(inp, cfg, direction)
     reasons += p_reasons
 
@@ -563,7 +600,7 @@ def stage5_decision(
 
     if trend_extended or premium_expensive or corridor_tight:
         reasons.append("One or more entry gates failed — waiting for better structure")
-        return WAIT, direction, None, premium_score, reasons, warnings
+        return WAIT, direction, None, premium_score, corridor_score, reasons, warnings
 
     oi_confirms = oi_score >= cfg.oi_confirm_score_min
     quality_ok = (
@@ -587,12 +624,12 @@ def stage5_decision(
             reasons.append(f"Key OI level not yet broken (@{level:.0f}) — wait for confirmation")
         strike = inp.atm_strike
         logger.info("[DORE:%s] Stage5 decision=%s", inp.symbol, rec)
-        return rec, direction, strike, premium_score, reasons, warnings
+        return rec, direction, strike, premium_score, corridor_score, reasons, warnings
 
     reasons.append("Setup incomplete: " + ("OI unconfirmed. " if not oi_confirms else "")
                     + ("Quality scores below threshold." if not quality_ok else ""))
     logger.info("[DORE:%s] Stage5 decision=%s", inp.symbol, NO_TRADE)
-    return NO_TRADE, direction, None, premium_score, reasons, warnings
+    return NO_TRADE, direction, None, premium_score, corridor_score, reasons, warnings
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -635,10 +672,10 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
 
     bias_score, bias_label, bias_reasons = stage1_market_bias(inp, cfg)
     oi_score, oi_reasons = stage2_oi_structure(inp, cfg, bias_label)
-    corridor_score, expected_move, resistance, support, corridor_reasons = stage4_oi_corridor(inp, cfg)
+    upside_score, downside_score, expected_move, resistance, support, corridor_reasons = stage4_oi_corridor(inp, cfg)
 
-    recommendation, direction, strike, premium_score, dec_reasons, warnings = stage5_decision(
-        inp, cfg, bias_score, bias_label, oi_score, corridor_score, resistance, support,
+    recommendation, direction, strike, premium_score, corridor_score, dec_reasons, warnings = stage5_decision(
+        inp, cfg, bias_score, bias_label, oi_score, upside_score, downside_score, resistance, support,
     )
 
     confidence = stage6_confidence(cfg, bias_score, oi_score, premium_score, corridor_score, inp.market_breadth)
