@@ -1204,7 +1204,7 @@ _CSS = """
 
 .ni-grid {
   display: grid;
-  grid-template-columns: 62px 1fr 108px 54px 118px 118px;
+  grid-template-columns: 62px 1fr 104px 92px 54px 112px 100px;
   column-gap: 14px;
   align-items: center;
 }
@@ -1223,13 +1223,14 @@ _CSS = """
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block;
 }
 .ni-headline:hover { text-decoration: underline; }
-.ni-symbols { margin-top: 3px; }
+.ni-stocks { display: flex; flex-wrap: wrap; gap: 4px; }
 .ni-symbol-chip {
   display: inline-block; padding: 1px 6px; border-radius: 4px;
   background: rgba(88,166,255,0.12); border: 1px solid rgba(88,166,255,0.35);
   color: var(--blue); font-size: 9.5px; font-weight: 700; font-family: var(--mono);
-  margin-right: 4px;
+  text-decoration: none;
 }
+.ni-symbol-chip:hover { background: rgba(88,166,255,0.22); text-decoration: none; }
 .ni-sector { font-size: 11px; color: var(--muted); }
 .ni-source { font-size: 10px; color: var(--muted); text-align: right; }
 
@@ -1422,13 +1423,13 @@ def _th_tooltip(label: str, col_key: str) -> str:
     return f'<th>{label}</th>'
 
 
-def _tv_link(symbol: str) -> str:
+def _tv_link(symbol: str, css_class: str = "tv-link") -> str:
     """Return an anchor that opens TradingView NSE chart in a new tab."""
     # TradingView NSE symbol format: NSE:SYMBOLNAME
     tv_sym = f"NSE:{symbol.upper().replace('.NS', '').replace('-EQ', '')}"
     url = f"https://www.tradingview.com/chart/?symbol={tv_sym}"
     return (
-        f'<a class="tv-link" href="{url}" target="_blank" '
+        f'<a class="{css_class}" href="{url}" target="_blank" '
         f'title="Open {symbol} on TradingView">{symbol}</a>'
     )
 
@@ -3894,24 +3895,34 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
         # (get_sector() defaults to "Diversified", never None/empty) the
         # instant there's at least one matched symbol, so that fallback
         # never actually fired and the stock name never appeared anywhere
-        # in the row. Sector and matched-symbol are now shown separately:
+        # in the row. Sector and matched-symbol are shown separately:
         # SECTOR column stays genuinely sector-level; matched tickers get
-        # their own chip row under the headline (blank if nothing matched
-        # — a market-wide story with no single stock behind it).
+        # their own STOCK(S) column (2026-07-18: promoted from a chip row
+        # under the headline to its own column, each ticker now a
+        # TradingView chart link via _tv_link() — same helper/link format
+        # the scan table itself uses — blank if nothing matched, i.e. a
+        # market-wide story with no single stock behind it).
         sector_label = item.get("sector") or "Market"
-        symbol_chips_html = (
-            "".join(f'<span class="ni-symbol-chip">{s}</span>' for s in symbols[:4])
-            if symbols else ""
+        stock_chips_html = (
+            "".join(_tv_link(s, css_class="ni-symbol-chip") for s in symbols[:4])
+            if symbols else '<span class="ni-rec-dash">—</span>'
         )
-        time_label = item["published"].strftime("%I:%M %p") if item.get("published") else "—"
+        # 2026-07-18 FIX: item["published"] is UTC (see news_feed.py) —
+        # convert to IST before formatting, same as every other displayed
+        # time in this app (_now_ist()), instead of printing the raw UTC
+        # clock reading unlabeled (was showing 5h30m behind actual IST).
+        time_label = (
+            item["published"].astimezone(_IST).strftime("%I:%M %p")
+            if item.get("published") else "—"
+        )
 
         rows.append(f"""
 <div class="ni-grid ni-row" title="{item.get('impact_note', '')}">
   <div class="ni-time">{time_label}</div>
   <div>
     <a class="ni-headline" href="{item['link']}" target="_blank" title="{item['title']}">{item['title']}</a>
-    {f'<div class="ni-symbols">{symbol_chips_html}</div>' if symbol_chips_html else ''}
   </div>
+  <div class="ni-stocks">{stock_chips_html}</div>
   <div class="ni-sector">{sector_label}</div>
   <div><span class="ni-pill {impact_class}">{impact_label}</span></div>
   <div>{rec_html}</div>
@@ -3957,7 +3968,7 @@ def _news_impact_panel():
 
     header_html = """
 <div class="ni-grid ni-head">
-  <div>TIME</div><div>HEADLINE</div><div>SECTOR</div><div>IMPACT</div><div>RECOMMENDATION</div><div></div>
+  <div>TIME</div><div>HEADLINE</div><div>STOCK(S)</div><div>SECTOR</div><div>IMPACT</div><div>RECOMMENDATION</div><div></div>
 </div>"""
 
     panel_html = f"""
