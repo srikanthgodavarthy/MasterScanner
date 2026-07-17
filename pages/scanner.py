@@ -1171,44 +1171,69 @@ _CSS = """
   margin-top: 2px;
 }
 
-/* ── News Pulse block ── */
-.np-summary-row {
-  display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap;
+/* ── News Impact panel (table card, matches mockup) ── */
+.ni-panel {
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px 16px;
+  margin-bottom: 14px;
 }
-.np-chip {
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 3px 10px; border-radius: 12px;
-  font-size: 11px; font-weight: 700; font-family: var(--mono);
+.ni-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 14px;
 }
-.np-chip-pos { background: rgba(63,185,80,0.15);  border: 1px solid rgba(63,185,80,0.4);  color: var(--green); }
-.np-chip-neg { background: rgba(248,81,73,0.12);  border: 1px solid rgba(248,81,73,0.35); color: var(--red); }
-.np-chip-neu { background: rgba(139,148,158,0.1); border: 1px solid rgba(139,148,158,0.3); color: var(--muted); }
+.ni-title .ni-viewall {
+  margin-left: auto;
+  font-size: 10.5px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--blue);
+  text-decoration: none;
+}
+.ni-title .ni-viewall:hover { text-decoration: underline; }
 
-.np-item {
-  display: flex; gap: 10px; align-items: flex-start;
-  padding: 8px 0; border-bottom: 1px solid var(--border);
+.ni-grid {
+  display: grid;
+  grid-template-columns: 62px 1fr 108px 54px 118px 118px;
+  column-gap: 14px;
+  align-items: center;
 }
-.np-item:last-child { border-bottom: none; }
-.np-dot { flex-shrink: 0; margin-top: 5px; width: 8px; height: 8px; border-radius: 50%; }
-.np-dot-pos { background: var(--green); }
-.np-dot-neg { background: var(--red); }
-.np-dot-neu { background: var(--muted); }
-.np-body { flex: 1; min-width: 0; }
-.np-title { font-size: 12.5px; font-weight: 600; color: var(--text); text-decoration: none; }
-.np-title:hover { text-decoration: underline; }
-.np-meta { font-size: 10px; color: var(--muted); margin-top: 2px; }
-.np-note { font-size: 10.5px; color: var(--muted); margin-top: 2px; font-style: italic; }
-.np-symbol-chip {
-  display: inline-block; padding: 1px 6px; border-radius: 4px;
-  background: rgba(88,166,255,0.12); border: 1px solid rgba(88,166,255,0.35);
-  color: #58a6ff; font-size: 9.5px; font-weight: 700; font-family: var(--mono);
-  margin-right: 4px;
+.ni-head {
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--muted);
+  padding-bottom: 8px; border-bottom: 1px solid var(--border);
 }
-.np-scan-flag {
-  display: inline-block; padding: 1px 6px; border-radius: 4px;
-  background: rgba(245,197,66,0.15); border: 1px solid rgba(245,197,66,0.4);
-  color: #f5c542; font-size: 9.5px; font-weight: 700; margin-left: 4px;
+.ni-row {
+  padding: 9px 0; border-bottom: 1px solid var(--border);
 }
+.ni-row:last-child { border-bottom: none; }
+.ni-time { font-size: 11px; font-family: var(--mono); color: var(--muted); }
+.ni-headline {
+  font-size: 12.5px; font-weight: 600; color: var(--text); text-decoration: none;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block;
+}
+.ni-headline:hover { text-decoration: underline; }
+.ni-sector { font-size: 11px; color: var(--muted); }
+.ni-source { font-size: 10px; color: var(--muted); text-align: right; }
+
+.ni-pill {
+  display: inline-block; padding: 2px 9px; border-radius: 10px;
+  font-size: 10px; font-weight: 700; font-family: var(--mono);
+  white-space: nowrap;
+}
+.ni-impact-pos { background: rgba(63,185,80,0.15);  border: 1px solid rgba(63,185,80,0.4);  color: var(--green); }
+.ni-impact-neg { background: rgba(248,81,73,0.12);  border: 1px solid rgba(248,81,73,0.35); color: var(--red); }
+.ni-impact-neu { background: rgba(139,148,158,0.1); border: 1px solid rgba(139,148,158,0.3); color: var(--muted); }
+.ni-rec-dash { color: var(--muted); font-size: 11px; font-family: var(--mono); }
 </style>
 """
 
@@ -3708,17 +3733,41 @@ def _market_intelligence_fragment():
     )
 
 
-# ── NEWS PULSE — ET + Moneycontrol headlines, free-LLM sentiment tag ──
+# ── NEWS IMPACT — ET + Moneycontrol headlines, free-LLM sentiment tag ──
 # 2026-07-17: uses the Agent's existing OpenAI-SDK-style client pattern but
 # points at Groq (free tier) instead — see utils/groq_client.py for why.
 # Feed fetch (utils/news_feed.py) and sentiment tagging (utils/news_sentiment.py)
 # are both @st.cache_data-backed (15min / 30min respectively), so this is
 # cheap to call on every render() — no fragment/timer needed the way the
 # live index-quote strip above needs one.
-_SENTIMENT_DOT_CLASS = {
-    "Positive": "np-dot-pos", "Negative": "np-dot-neg",
-    "Neutral": "np-dot-neu", "Unclassified": "np-dot-neu",
-}
+#
+# Recommendation column: deliberately reuses the SAME vocabulary/colors as
+# the live scan's own Recommendation field (_SC_STYLE — Elite/Execute/
+# Actionable/Developing/Watch/Skip) rather than inventing a parallel
+# "Accumulate/Book Partial" taxonomy. That's a direct consequence of how
+# this codebase is built: Recommendation is decision-engine output, an
+# explicit business rule over scored evidence — not something a headline's
+# sentiment should independently assert. A news item only gets a
+# Recommendation pill if one of its matched symbols is in the current scan;
+# otherwise it shows "—" rather than guessing. If you'd rather have Groq
+# suggest an action straight from the headline, or derive one from
+# sentiment + portfolio holdings instead, that's a one-function swap in
+# _resolve_scan_recommendation() below — nothing else depends on how this
+# is computed.
+def _resolve_scan_recommendation(symbols: list[str], scan_df: pd.DataFrame) -> tuple[str, str] | None:
+    """Returns (label, hex_color) from the current scan's own Recommendation
+    column for the first matched symbol found in it, or None if no matched
+    symbol is in the current scan (no scan run yet, or none of the
+    headline's symbols happen to be in this universe/run)."""
+    if scan_df is None or scan_df.empty or "Recommendation" not in scan_df.columns:
+        return None
+    for sym in symbols:
+        hit = scan_df.loc[scan_df["Stock"].astype(str) == sym, "Recommendation"]
+        if not hit.empty:
+            label = str(hit.iloc[0])
+            color, _ = _SC_STYLE.get(label.upper(), ("#8b949e", label))
+            return label.upper(), color
+    return None
 
 
 def _news_ago(published) -> str:
@@ -3738,8 +3787,40 @@ def _news_ago(published) -> str:
         return ""
 
 
-def _news_pulse_block():
-    """Renders the 📰 Market News Pulse expander on the Scanner page."""
+def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
+    rows = []
+    for item in items:
+        symbols = item.get("symbols", [])
+        sentiment = item["sentiment"]
+        impact_class = {
+            "Positive": "ni-impact-pos", "Negative": "ni-impact-neg",
+        }.get(sentiment, "ni-impact-neu")
+        impact_label = {"Positive": "+ve", "Negative": "-ve"}.get(sentiment, "n/a")
+
+        rec = _resolve_scan_recommendation(symbols, scan_df)
+        rec_html = (
+            f'<span class="ni-pill" style="background:{rec[1]}22;border:1px solid {rec[1]}66;color:{rec[1]}">{rec[0]}</span>'
+            if rec else '<span class="ni-rec-dash">—</span>'
+        )
+
+        sector_label = item.get("sector") or (symbols[0] if symbols else "Market")
+        time_label = item["published"].strftime("%I:%M %p") if item.get("published") else "—"
+
+        rows.append(f"""
+<div class="ni-grid ni-row" title="{item.get('impact_note', '')}">
+  <div class="ni-time">{time_label}</div>
+  <a class="ni-headline" href="{item['link']}" target="_blank" title="{item['title']}">{item['title']}</a>
+  <div class="ni-sector">{sector_label}</div>
+  <div><span class="ni-pill {impact_class}">{impact_label}</span></div>
+  <div>{rec_html}</div>
+  <div class="ni-source">{item['source']}</div>
+</div>""")
+    return "".join(rows)
+
+
+def _news_impact_panel():
+    """Renders the 📰 News Impact (Latest) table card on the Scanner page,
+    right under the live Market Overview strip — matches the mockup layout."""
     try:
         from utils.news_feed import fetch_all_news
         from utils.news_sentiment import tag_news
@@ -3747,62 +3828,51 @@ def _news_pulse_block():
     except Exception as exc:
         # feedparser not yet installed (requirements.txt just changed) or
         # similar — fail soft, the rest of the scanner page must not break.
-        with st.expander("📰 Market News Pulse", expanded=False):
-            st.caption(f"News module unavailable: {exc}")
+        st.caption(f"News Impact panel unavailable: {exc}")
         return
 
-    with st.expander("📰 Market News Pulse — ET + Moneycontrol", expanded=False):
-        if not _groq_available():
-            st.caption(
-                "ℹ️ Add `GROQ_API_KEY` in secrets to enable bullish/bearish "
-                "tagging (free at console.groq.com) — showing raw headlines only."
+    with st.spinner("Fetching news…"):
+        raw_items = fetch_all_news()
+        items = tag_news(raw_items)
+
+    if not items:
+        st.markdown(
+            '<div class="ni-panel"><div class="ni-title">📰 NEWS IMPACT (LATEST)</div>'
+            '<div style="color:var(--muted);font-size:12px;">No headlines available right now — '
+            'feeds may be temporarily unreachable.</div></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    if not _groq_available():
+        st.caption(
+            "ℹ️ Add `GROQ_API_KEY` in secrets to enable bullish/bearish "
+            "tagging (free at console.groq.com) — showing raw headlines only."
+        )
+
+    scan_df = st.session_state.get("scan_df", pd.DataFrame())
+    _VISIBLE = 8
+
+    header_html = """
+<div class="ni-grid ni-head">
+  <div>TIME</div><div>HEADLINE</div><div>SECTOR</div><div>IMPACT</div><div>RECOMMENDATION</div><div></div>
+</div>"""
+
+    panel_html = f"""
+<div class="ni-panel">
+  <div class="ni-title">📰 NEWS IMPACT (LATEST) <span class="ni-viewall">View all news →</span></div>
+  {header_html}
+  {_news_impact_rows_html(items[:_VISIBLE], scan_df)}
+</div>"""
+    st.markdown(panel_html, unsafe_allow_html=True)
+
+    if len(items) > _VISIBLE:
+        with st.expander(f"Show {len(items) - _VISIBLE} more headlines"):
+            st.markdown(
+                f'<div class="ni-panel">{header_html}'
+                f'{_news_impact_rows_html(items[_VISIBLE:30], scan_df)}</div>',
+                unsafe_allow_html=True,
             )
-
-        with st.spinner("Fetching news…"):
-            raw_items = fetch_all_news()
-            items = tag_news(raw_items)
-
-        if not items:
-            st.caption("No headlines available right now — feeds may be temporarily unreachable.")
-            return
-
-        # symbols currently in the loaded scan, for the "in your scan" flag
-        scan_df = st.session_state.get("scan_df", pd.DataFrame())
-        scan_symbols = set(scan_df["Stock"].astype(str)) if "Stock" in scan_df.columns else set()
-
-        pos = sum(1 for i in items if i["sentiment"] == "Positive")
-        neg = sum(1 for i in items if i["sentiment"] == "Negative")
-        neu = sum(1 for i in items if i["sentiment"] in ("Neutral", "Unclassified"))
-
-        summary_html = f"""
-<div class="np-summary-row">
-  <span class="np-chip np-chip-pos">▲ {pos} Positive</span>
-  <span class="np-chip np-chip-neg">▼ {neg} Negative</span>
-  <span class="np-chip np-chip-neu">● {neu} Neutral</span>
-</div>
-"""
-        rows_html = []
-        for item in items[:30]:
-            dot_class = _SENTIMENT_DOT_CLASS.get(item["sentiment"], "np-dot-neu")
-            symbol_chips = "".join(
-                f'<span class="np-symbol-chip">{sym}</span>'
-                + ('<span class="np-scan-flag">IN SCAN</span>' if sym in scan_symbols else '')
-                for sym in item.get("symbols", [])
-            )
-            note = item.get("impact_note", "")
-            note_html = f'<div class="np-note">{note}</div>' if note else ""
-            ago = _news_ago(item.get("published"))
-            rows_html.append(f"""
-<div class="np-item">
-  <span class="np-dot {dot_class}"></span>
-  <div class="np-body">
-    <a class="np-title" href="{item['link']}" target="_blank">{item['title']}</a>
-    <div class="np-meta">{item['source']} · {ago} {symbol_chips}</div>
-    {note_html}
-  </div>
-</div>""")
-
-        st.markdown(summary_html + "".join(rows_html), unsafe_allow_html=True)
 
 
 def render(settings: dict | None = None):
@@ -3950,10 +4020,11 @@ def render(settings: dict | None = None):
     #    above _market_overview_panel for the fetch + render logic).
     _market_intelligence_fragment()
 
-    # ── News Pulse — independent of scan state too, same reasoning as
+    # ── News Impact — independent of scan state too, same reasoning as
     #    the market intel strip above: news relevance doesn't wait for
-    #    someone to click Run Scan.
-    _news_pulse_block()
+    #    someone to click Run Scan. Recommendation column only populates
+    #    once a scan has been run (see _resolve_scan_recommendation).
+    _news_impact_panel()
 
     if df_aug.empty:
         st.markdown("""
