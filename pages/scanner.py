@@ -17,6 +17,9 @@ Changes vs v8:
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import logging
+logger = logging.getLogger(__name__)
+
 import streamlit as st
 import pandas as pd
 from datetime import datetime
@@ -69,6 +72,22 @@ _SC_STYLE = {
     "DEVELOPING": ("#d29922", "DEVELOPING"),
     "WATCH":      ("#8b949e", "WATCH"),
     "SKIP":       ("#484f58", "SKIP"),
+}
+
+# DORE (Dynamic Options Recommendation Engine) badge palette — one color
+# family per action type: green=enter now, blue=wait-for-confirmation,
+# amber=hold, red=book profits / step aside, gray=wait/no-trade.
+_DORE_BADGE_STYLE = {
+    "BUY_CE_NOW":       ("#3fb950", "🟢 BUY CE NOW"),
+    "BUY_PE_NOW":       ("#3fb950", "🟢 BUY PE NOW"),
+    "BUY_CE_BREAKOUT":  ("#58a6ff", "🔵 BUY CE ON BREAKOUT"),
+    "BUY_PE_BREAKDOWN": ("#58a6ff", "🔵 BUY PE ON BREAKDOWN"),
+    "HOLD_CE":          ("#d29922", "🟡 HOLD CE"),
+    "HOLD_PE":          ("#d29922", "🟡 HOLD PE"),
+    "BOOK_CE_PROFITS":  ("#f85149", "🔴 BOOK CE PROFITS"),
+    "BOOK_PE_PROFITS":  ("#f85149", "🔴 BOOK PE PROFITS"),
+    "WAIT":             ("#8b949e", "⚪ WAIT"),
+    "NO_TRADE":         ("#484f58", "⚫ NO TRADE"),
 }
 
 _CAT_ORDER = [
@@ -1014,9 +1033,10 @@ _CSS = """
 /* ── Index cards row (NIFTY 50 / SENSEX / BANK NIFTY) ── */
 .mo-index-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: 14px;
 }
+@media (max-width: 1200px) { .mo-index-grid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 900px) { .mo-index-grid { grid-template-columns: 1fr; } }
 .mo-index-card {
   background: var(--bg2);
@@ -1119,6 +1139,109 @@ _CSS = """
 .mo-index-oi-meta { font-size: 9px; color: var(--muted); margin-top: 2px; }
 
 .mo-index-expiry { font-size: 9.5px; color: var(--muted); margin-top: 8px; }
+
+.mo-index-dore-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  cursor: help;
+}
+.mo-index-dore-badge {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 3px 8px;
+  border-radius: 5px;
+  border: 1px solid;
+  font-family: var(--mono);
+}
+.mo-index-dore-conf { font-size: 11px; font-weight: 700; font-family: var(--mono); }
+.mo-index-dore-reason {
+  font-size: 9.5px;
+  color: var(--muted);
+  margin-top: 4px;
+  line-height: 1.35;
+}
+.mo-index-dore-warn {
+  font-size: 9px;
+  color: #d29922;
+  margin-top: 2px;
+}
+
+/* ── News Impact panel (table card, matches mockup) ── */
+.ni-panel {
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px 16px;
+  margin-bottom: 14px;
+}
+.ni-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.ni-title .ni-viewall {
+  margin-left: auto;
+  font-size: 10.5px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--blue);
+  text-decoration: none;
+}
+.ni-title .ni-viewall:hover { text-decoration: underline; }
+
+.ni-grid {
+  display: grid;
+  grid-template-columns: 62px 1fr 108px 54px 118px 118px;
+  column-gap: 14px;
+  align-items: center;
+}
+.ni-head {
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--muted);
+  padding-bottom: 8px; border-bottom: 1px solid var(--border);
+}
+.ni-row {
+  padding: 9px 0; border-bottom: 1px solid var(--border);
+}
+.ni-row:last-child { border-bottom: none; }
+.ni-time { font-size: 11px; font-family: var(--mono); color: var(--muted); }
+.ni-headline {
+  font-size: 12.5px; font-weight: 600; color: var(--text); text-decoration: none;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block;
+}
+.ni-headline:hover { text-decoration: underline; }
+.ni-symbols { margin-top: 3px; }
+.ni-symbol-chip {
+  display: inline-block; padding: 1px 6px; border-radius: 4px;
+  background: rgba(88,166,255,0.12); border: 1px solid rgba(88,166,255,0.35);
+  color: var(--blue); font-size: 9.5px; font-weight: 700; font-family: var(--mono);
+  margin-right: 4px;
+}
+.ni-sector { font-size: 11px; color: var(--muted); }
+.ni-source { font-size: 10px; color: var(--muted); text-align: right; }
+
+.ni-pill {
+  display: inline-block; padding: 2px 9px; border-radius: 10px;
+  font-size: 10px; font-weight: 700; font-family: var(--mono);
+  white-space: nowrap;
+}
+.ni-impact-pos { background: rgba(63,185,80,0.15);  border: 1px solid rgba(63,185,80,0.4);  color: var(--green); }
+.ni-impact-neg { background: rgba(248,81,73,0.12);  border: 1px solid rgba(248,81,73,0.35); color: var(--red); }
+.ni-impact-neu { background: rgba(139,148,158,0.1); border: 1px solid rgba(139,148,158,0.3); color: var(--muted); }
+.ni-rec-dash { color: var(--muted); font-size: 11px; font-family: var(--mono); }
 </style>
 """
 
@@ -1839,7 +1962,8 @@ def _vix_band(vix: float) -> tuple[str, str]:
 
 
 def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
-                      grad_id: str, badge: str = "", ema: dict | None = None) -> str:
+                      grad_id: str, badge: str = "", ema: dict | None = None,
+                      dore: dict | None = None) -> str:
     """
     Render one equal-width Market Overview index card: EMA20/50/200 badge
     row, live price, %chg, intraday sparkline, OHLC row, and nearest-expiry
@@ -1856,6 +1980,10 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
           / fetch_sensex_ema_levels(). A span is simply skipped in the badge
           row if it's missing (not enough history yet). None/empty hides
           the whole row.
+    dore: utils.dore_engine.DOREResult.as_dict() — {"recommendation",
+          "confidence", "reasons", "warnings", ...}. None/empty hides the
+          whole DORE row (e.g. while an index BarResult couldn't be built
+          yet, or DORE hasn't been wired up in this deployment).
     grad_id: unique sparkline gradient id (see _nifty_spark_svg).
     badge: optional small right-aligned tag, e.g. "(delayed)".
     """
@@ -1916,10 +2044,15 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
 
     oi_html = (
         _oi_item("CE OI Resistance", oi.get("ce_strike"), oi.get("ce_oi"), oi.get("ce_premium"), "#f85149") +
-        _oi_item("PE OI Resistance", oi.get("pe_strike"), oi.get("pe_oi"), oi.get("pe_premium"), "#3fb950")
+        _oi_item("PE OI Support",    oi.get("pe_strike"), oi.get("pe_oi"), oi.get("pe_premium"), "#3fb950")
     )
-    expiry      = oi.get("expiry", "")
-    expiry_html = f"Nearest expiry: {expiry}" if expiry else "Nearest expiry: —"
+    expiry = oi.get("expiry", "")
+    pcr    = oi.get("pcr")
+    pcr_html = (
+        f' · PCR: <span style="color:{"#3fb950" if pcr >= 1 else "#f85149"};font-weight:700">{pcr:.2f}</span>'
+        if pcr is not None else ""
+    )
+    expiry_html = f"Nearest expiry: {expiry}{pcr_html}" if expiry else f"Nearest expiry: —{pcr_html}"
     badge_html  = f'<span class="mo-index-badge">{badge}</span>' if badge else ""
 
     ema_specs = (("EMA20", "ema20", "above_ema20"),
@@ -1941,10 +2074,44 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
         )
     ema_row_html = f'<div class="mo-index-ema-row">{"".join(ema_items)}</div>' if ema_items else ""
 
+    # Market Bias — reuses DORE's own Stage 1 output (stage1_market_bias(),
+    # already computed for the DORE recommendation below) rather than a
+    # second, separately-computed bias figure. BULLISH/BEARISH/NEUTRAL +
+    # the underlying 0-100 score.
+    bias_html = ""
+    if dore and dore.get("market_bias_label"):
+        _bias_lbl = dore["market_bias_label"]
+        _bias_val = dore.get("market_bias", 50.0)
+        _bias_color = {"BULLISH": "#3fb950", "BEARISH": "#f85149"}.get(_bias_lbl, "#8b949e")
+        bias_html = (
+            f'<span class="mo-index-badge" style="color:{_bias_color};border-color:{_bias_color}55;'
+            f'background:{_bias_color}14;margin-left:6px;">{_bias_lbl} {_bias_val:.0f}</span>'
+        )
+
+    dore_html = ""
+    if dore:
+        rec        = dore.get("recommendation", "WAIT")
+        conf       = dore.get("confidence", 0)
+        color, lbl = _DORE_BADGE_STYLE.get(rec, ("#8b949e", rec))
+        reasons    = dore.get("reasons") or []
+        warnings   = dore.get("warnings") or []
+        top_reason = reasons[-1] if reasons else ""   # Stage 5's own reason is appended last
+        tooltip    = " · ".join(reasons)[:500].replace('"', "'")
+        warn_html  = (
+            f'<div class="mo-index-dore-warn">⚠ {warnings[0]}</div>' if warnings else ""
+        )
+        dore_html = f"""
+  <div class="mo-index-dore-row" title="{tooltip}">
+    <span class="mo-index-dore-badge" style="color:{color};border-color:{color}55;background:{color}14">{lbl}</span>
+    <span class="mo-index-dore-conf" style="color:{color}">{conf:.0f}%</span>
+  </div>
+  <div class="mo-index-dore-reason">{top_reason}</div>
+  {warn_html}"""
+
     return f"""
 <div class="mo-index-card">
   {ema_row_html}
-  <div class="mo-index-label"><span>{label}</span>{badge_html}</div>
+  <div class="mo-index-label"><span>{label}</span>{badge_html}{bias_html}</div>
   <div class="mo-index-row">
     <div>
       <div class="mo-index-price">{price_str}</div>
@@ -1955,6 +2122,7 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
   <div class="mo-index-ohlc-row">{ohlc_html}</div>
   <div class="mo-index-oi-row">{oi_html}</div>
   <div class="mo-index-expiry">{expiry_html}</div>
+  {dore_html}
 </div>
 """
 
@@ -1969,9 +2137,11 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
     layout (2026-07 redesign) with an institutional-terminal-style,
     information-dense strip that doesn't grow the page height.
 
-    index_cards: list of {"label", "snapshot", "oi", "badge", "ema"} dicts,
-    one per index, rendered via _index_card_html() in the given order.
-    "ema" is the compute_ema_levels()/fetch_sensex_ema_levels() output.
+    index_cards: list of {"label", "snapshot", "oi", "badge", "ema", "dore"}
+    dicts, one per index, rendered via _index_card_html() in the given
+    order. "ema" is the compute_ema_levels()/fetch_sensex_ema_levels()
+    output. "dore" is utils.dore_engine.DOREResult.as_dict() (optional —
+    omit or leave None/{} to render the card without the DORE row).
     """
     r = summary.get("regime", "RANGE")
     regime_color, _, _ = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
@@ -2083,6 +2253,7 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
         _index_card_html(
             c.get("label", ""), c.get("snapshot"), c.get("oi"),
             grad_id=f"moSpark{i}", badge=c.get("badge", ""), ema=c.get("ema"),
+            dore=c.get("dore"),
         )
         for i, c in enumerate(index_cards)
     )
@@ -3458,9 +3629,16 @@ def _market_intelligence_fragment():
     live here.
     """
     # ── Nifty snapshot ──────────────────────────────────────────────
+    # 2026-07-16: EMA levels now sourced via fetch_nifty(source="upstox")
+    # — this is the Market Intelligence card's EMA badge row, not the
+    # scanner's RS/regime benchmark (that stays wired to the Scanner Data
+    # Source setting via run_scanner()/build_regime_context(), separately,
+    # in the "Run scan" block above). Two different call sites of the same
+    # shared fetch_nifty() intentionally passing different `source` — see
+    # its docstring.
     try:
         from utils.scanner_engine import fetch_nifty_intraday_snapshot, fetch_nifty, compute_ema_levels
-        _nifty_series = fetch_nifty("1y")
+        _nifty_series = fetch_nifty("1y", source="upstox")
         _snap = fetch_nifty_intraday_snapshot()
         if _snap.get("price"):
             st.session_state["nifty_snapshot"] = _snap
@@ -3518,17 +3696,104 @@ def _market_intelligence_fragment():
     except Exception:
         st.session_state["sensex_ema_levels"] = {}
 
-    # ── Nearest-expiry OI resistance (Upstox option chain) ──────────
+    # ── Bank Nifty snapshot — same Upstox-first / yfinance-spark-backfill
+    #    pattern as Sensex above.
     try:
-        from utils.upstox_client import fetch_oi_resistance
-        st.session_state["oi_resistance"] = fetch_oi_resistance("NIFTY") or {}
+        from utils.upstox_client import fetch_index_quote
+        _bn = fetch_index_quote("BANKNIFTY")
+        if _bn is not None:
+            _bn["source"] = "upstox"
     except Exception:
-        st.session_state["oi_resistance"] = {}
+        _bn = None
+    if _bn is None:
+        try:
+            from utils.scanner_engine import fetch_banknifty_intraday_snapshot
+            _bn = fetch_banknifty_intraday_snapshot()
+            _bn["source"] = "yfinance"
+        except Exception:
+            _bn = {}
+    elif not _bn.get("spark"):
+        try:
+            from utils.scanner_engine import fetch_banknifty_intraday_snapshot
+            _yf_spark = fetch_banknifty_intraday_snapshot().get("spark") or []
+            if _yf_spark:
+                _bn["spark"] = _yf_spark
+        except Exception:
+            pass
+    st.session_state["banknifty_snapshot"] = _bn or {}
+
     try:
-        from utils.upstox_client import fetch_oi_resistance
-        st.session_state["sensex_oi_resistance"] = fetch_oi_resistance("SENSEX") or {}
+        from utils.scanner_engine import fetch_banknifty_ema_levels
+        st.session_state["banknifty_ema_levels"] = fetch_banknifty_ema_levels()
     except Exception:
-        st.session_state["sensex_oi_resistance"] = {}
+        st.session_state["banknifty_ema_levels"] = {}
+
+    # ── Nearest-expiry OI resistance/support + PCR (Upstox option chain)
+    #    — Nifty, Sensex, Bank Nifty. Always Upstox; no yfinance fallback
+    #    exists for option-chain data (yfinance doesn't carry NSE/BSE
+    #    option chains), so this comes back {} rather than a wrong-source
+    #    substitute if the Upstox token is missing/expired.
+    for _idx, _key in (("NIFTY", "oi_resistance"), ("SENSEX", "sensex_oi_resistance"),
+                        ("BANKNIFTY", "banknifty_oi_resistance")):
+        try:
+            from utils.upstox_client import fetch_oi_resistance
+            st.session_state[_key] = fetch_oi_resistance(_idx) or {}
+        except Exception:
+            st.session_state[_key] = {}
+
+    # ── DORE (Dynamic Options Recommendation Engine) ────────────────
+    # NIFTY/SENSEX/BANKNIFTY aren't part of the scanned Nifty-500
+    # universe, so there's no BarResult/CV1 sitting in memory for them
+    # the way there is for a scanned stock — build one on demand from
+    # each index's own OHLCV history via the same scoring_core pipeline
+    # every stock goes through. 2026-07-16: this OHLCV base — a DORE
+    # input — is now fetched with source="upstox" (Market Intelligence's
+    # "always Upstox" rule; each fetch still fails soft to yfinance
+    # internally if Upstox is unreachable — see fetch_nifty_ohlcv() /
+    # fetch_sensex_ohlcv() / fetch_banknifty_ohlcv()). Fails soft to None
+    # (card renders without the DORE row) on any error — a DORE hiccup
+    # should never take down the rest of this already-live fragment.
+    try:
+        from utils.dore_engine import build_dore_input_for_index, compute_dore
+        from utils.dore_settings import DORESettings
+        from utils.scanner_engine import fetch_nifty_ohlcv, fetch_sensex_ohlcv, fetch_banknifty_ohlcv
+
+        _dore_cfg = DORESettings.from_dict(st.session_state.get("dore_settings", {}))
+
+        _nifty_ohlcv = fetch_nifty_ohlcv("1y", source="upstox")
+        _nifty_dore_input = build_dore_input_for_index(
+            "NIFTY", _nifty_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
+            st.session_state.get("oi_resistance", {}),
+            position=st.session_state.get("nifty_option_position"),
+        )
+        st.session_state["nifty_dore"] = (
+            compute_dore(_nifty_dore_input, _dore_cfg).as_dict() if _nifty_dore_input else None
+        )
+
+        _sensex_ohlcv = fetch_sensex_ohlcv("1y")
+        _sensex_dore_input = build_dore_input_for_index(
+            "SENSEX", _sensex_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
+            st.session_state.get("sensex_oi_resistance", {}),
+            position=st.session_state.get("sensex_option_position"),
+        )
+        st.session_state["sensex_dore"] = (
+            compute_dore(_sensex_dore_input, _dore_cfg).as_dict() if _sensex_dore_input else None
+        )
+
+        _banknifty_ohlcv = fetch_banknifty_ohlcv("1y")
+        _banknifty_dore_input = build_dore_input_for_index(
+            "BANKNIFTY", _banknifty_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
+            st.session_state.get("banknifty_oi_resistance", {}),
+            position=st.session_state.get("banknifty_option_position"),
+        )
+        st.session_state["banknifty_dore"] = (
+            compute_dore(_banknifty_dore_input, _dore_cfg).as_dict() if _banknifty_dore_input else None
+        )
+    except Exception:
+        logger.exception("DORE computation failed in _market_intelligence_fragment")
+        st.session_state.setdefault("nifty_dore", None)
+        st.session_state.setdefault("sensex_dore", None)
+        st.session_state.setdefault("banknifty_dore", None)
 
     # ── Render ────────────────────────────────────────────────────
     summary   = st.session_state.get("scan_summary", {})
@@ -3537,10 +3802,16 @@ def _market_intelligence_fragment():
     index_cards = [
         {"label": "NIFTY 50", "snapshot": st.session_state.get("nifty_snapshot", {}),
          "oi": st.session_state.get("oi_resistance", {}), "badge": "",
-         "ema": st.session_state.get("nifty_ema_levels", {})},
+         "ema": st.session_state.get("nifty_ema_levels", {}),
+         "dore": st.session_state.get("nifty_dore")},
         {"label": "SENSEX",   "snapshot": st.session_state.get("sensex_snapshot", {}),
          "oi": st.session_state.get("sensex_oi_resistance", {}), "badge": "",
-         "ema": st.session_state.get("sensex_ema_levels", {})},
+         "ema": st.session_state.get("sensex_ema_levels", {}),
+         "dore": st.session_state.get("sensex_dore")},
+        {"label": "BANK NIFTY", "snapshot": st.session_state.get("banknifty_snapshot", {}),
+         "oi": st.session_state.get("banknifty_oi_resistance", {}), "badge": "",
+         "ema": st.session_state.get("banknifty_ema_levels", {}),
+         "dore": st.session_state.get("banknifty_dore")},
     ]
     st.markdown(
         _market_overview_panel(summary, breadth, scan_time, index_cards),
@@ -3548,6 +3819,162 @@ def _market_intelligence_fragment():
     )
 
 
+# ── NEWS IMPACT — ET + Moneycontrol headlines, free-LLM sentiment tag ──
+# 2026-07-17: uses the Agent's existing OpenAI-SDK-style client pattern but
+# points at Groq (free tier) instead — see utils/groq_client.py for why.
+# Feed fetch (utils/news_feed.py) and sentiment tagging (utils/news_sentiment.py)
+# are both @st.cache_data-backed (15min / 30min respectively), so this is
+# cheap to call on every render() — no fragment/timer needed the way the
+# live index-quote strip above needs one.
+#
+# Recommendation column: deliberately reuses the SAME vocabulary/colors as
+# the live scan's own Recommendation field (_SC_STYLE — Elite/Execute/
+# Actionable/Developing/Watch/Skip) rather than inventing a parallel
+# "Accumulate/Book Partial" taxonomy. That's a direct consequence of how
+# this codebase is built: Recommendation is decision-engine output, an
+# explicit business rule over scored evidence — not something a headline's
+# sentiment should independently assert. A news item only gets a
+# Recommendation pill if one of its matched symbols is in the current scan;
+# otherwise it shows "—" rather than guessing. If you'd rather have Groq
+# suggest an action straight from the headline, or derive one from
+# sentiment + portfolio holdings instead, that's a one-function swap in
+# _resolve_scan_recommendation() below — nothing else depends on how this
+# is computed.
+def _resolve_scan_recommendation(symbols: list[str], scan_df: pd.DataFrame) -> tuple[str, str] | None:
+    """Returns (label, hex_color) from the current scan's own Recommendation
+    column for the first matched symbol found in it, or None if no matched
+    symbol is in the current scan (no scan run yet, or none of the
+    headline's symbols happen to be in this universe/run)."""
+    if scan_df is None or scan_df.empty or "Recommendation" not in scan_df.columns:
+        return None
+    for sym in symbols:
+        hit = scan_df.loc[scan_df["Stock"].astype(str) == sym, "Recommendation"]
+        if not hit.empty:
+            label = str(hit.iloc[0])
+            color, _ = _SC_STYLE.get(label.upper(), ("#8b949e", label))
+            return label.upper(), color
+    return None
+
+
+def _news_ago(published) -> str:
+    if published is None:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        delta = datetime.now(timezone.utc) - published
+        mins = int(delta.total_seconds() // 60)
+        if mins < 60:
+            return f"{mins}m ago"
+        hrs = mins // 60
+        if hrs < 24:
+            return f"{hrs}h ago"
+        return f"{hrs // 24}d ago"
+    except Exception:
+        return ""
+
+
+def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
+    rows = []
+    for item in items:
+        symbols = item.get("symbols", [])
+        sentiment = item["sentiment"]
+        impact_class = {
+            "Positive": "ni-impact-pos", "Negative": "ni-impact-neg",
+        }.get(sentiment, "ni-impact-neu")
+        impact_label = {"Positive": "+ve", "Negative": "-ve"}.get(sentiment, "n/a")
+
+        rec = _resolve_scan_recommendation(symbols, scan_df)
+        rec_html = (
+            f'<span class="ni-pill" style="background:{rec[1]}22;border:1px solid {rec[1]}66;color:{rec[1]}">{rec[0]}</span>'
+            if rec else '<span class="ni-rec-dash">—</span>'
+        )
+
+        # 2026-07-17 fix: this used to fall back to symbols[0] only when
+        # item["sector"] was falsy — but tag_news() always sets a sector
+        # (get_sector() defaults to "Diversified", never None/empty) the
+        # instant there's at least one matched symbol, so that fallback
+        # never actually fired and the stock name never appeared anywhere
+        # in the row. Sector and matched-symbol are now shown separately:
+        # SECTOR column stays genuinely sector-level; matched tickers get
+        # their own chip row under the headline (blank if nothing matched
+        # — a market-wide story with no single stock behind it).
+        sector_label = item.get("sector") or "Market"
+        symbol_chips_html = (
+            "".join(f'<span class="ni-symbol-chip">{s}</span>' for s in symbols[:4])
+            if symbols else ""
+        )
+        time_label = item["published"].strftime("%I:%M %p") if item.get("published") else "—"
+
+        rows.append(f"""
+<div class="ni-grid ni-row" title="{item.get('impact_note', '')}">
+  <div class="ni-time">{time_label}</div>
+  <div>
+    <a class="ni-headline" href="{item['link']}" target="_blank" title="{item['title']}">{item['title']}</a>
+    {f'<div class="ni-symbols">{symbol_chips_html}</div>' if symbol_chips_html else ''}
+  </div>
+  <div class="ni-sector">{sector_label}</div>
+  <div><span class="ni-pill {impact_class}">{impact_label}</span></div>
+  <div>{rec_html}</div>
+  <div class="ni-source">{item['source']}</div>
+</div>""")
+    return "".join(rows)
+
+
+def _news_impact_panel():
+    """Renders the 📰 News Impact (Latest) table card on the Scanner page,
+    right under the live Market Overview strip — matches the mockup layout."""
+    try:
+        from utils.news_feed import fetch_all_news
+        from utils.news_sentiment import tag_news
+        from utils.groq_client import _is_available as _groq_available
+    except Exception as exc:
+        # feedparser not yet installed (requirements.txt just changed) or
+        # similar — fail soft, the rest of the scanner page must not break.
+        st.caption(f"News Impact panel unavailable: {exc}")
+        return
+
+    with st.spinner("Fetching news…"):
+        raw_items = fetch_all_news()
+        items = tag_news(raw_items)
+
+    if not items:
+        st.markdown(
+            '<div class="ni-panel"><div class="ni-title">📰 NEWS IMPACT (LATEST)</div>'
+            '<div style="color:var(--muted);font-size:12px;">No headlines available right now — '
+            'feeds may be temporarily unreachable.</div></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    if not _groq_available():
+        st.caption(
+            "ℹ️ Add `GROQ_API_KEY` in secrets to enable bullish/bearish "
+            "tagging (free at console.groq.com) — showing raw headlines only."
+        )
+
+    scan_df = st.session_state.get("scan_df", pd.DataFrame())
+    _VISIBLE = 8
+
+    header_html = """
+<div class="ni-grid ni-head">
+  <div>TIME</div><div>HEADLINE</div><div>SECTOR</div><div>IMPACT</div><div>RECOMMENDATION</div><div></div>
+</div>"""
+
+    panel_html = f"""
+<div class="ni-panel">
+  <div class="ni-title">📰 NEWS IMPACT (LATEST) <span class="ni-viewall">View all news →</span></div>
+  {header_html}
+  {_news_impact_rows_html(items[:_VISIBLE], scan_df)}
+</div>"""
+    st.markdown(panel_html, unsafe_allow_html=True)
+
+    if len(items) > _VISIBLE:
+        with st.expander(f"Show {len(items) - _VISIBLE} more headlines"):
+            st.markdown(
+                f'<div class="ni-panel">{header_html}'
+                f'{_news_impact_rows_html(items[_VISIBLE:30], scan_df)}</div>',
+                unsafe_allow_html=True,
+            )
 
 
 def render(settings: dict | None = None):
@@ -3608,11 +4035,13 @@ def render(settings: dict | None = None):
             return
 
         with st.spinner("Classifying regime & computing composite scores…"):
-            nifty_series = fetch_nifty("1y")
+            _scan_source = effective.get("data_source", "yfinance")
+            nifty_series = fetch_nifty("1y", source=_scan_source)
             regime_ctx   = build_regime_context(
                 nifty             = nifty_series,
                 execute_threshold = effective.get("execute_threshold", 70),
                 auto_fetch_vix    = True,
+                source            = _scan_source,
             )
             df_aug = apply_regime_layer(df_raw, regime_ctx)
 
@@ -3694,6 +4123,12 @@ def render(settings: dict | None = None):
     #    whether a scan has ever been run (see _market_intelligence_fragment
     #    above _market_overview_panel for the fetch + render logic).
     _market_intelligence_fragment()
+
+    # ── News Impact — independent of scan state too, same reasoning as
+    #    the market intel strip above: news relevance doesn't wait for
+    #    someone to click Run Scan. Recommendation column only populates
+    #    once a scan has been run (see _resolve_scan_recommendation).
+    _news_impact_panel()
 
     if df_aug.empty:
         st.markdown("""

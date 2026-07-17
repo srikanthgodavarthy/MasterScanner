@@ -14,3 +14,4 @@ numba==0.59.1
 scipy
 openai>=1.40.0
 pyarrow>=15.0.0  # ADDED 2026-07-16: parquet read/write for utils/history_store.py
+feedparser>=6.0.0  # ADDED 2026-07-17: RSS ingestion for utils/news_feed.py (ET / Moneycontrol)

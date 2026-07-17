@@ -839,21 +839,32 @@ def _tab_advanced() -> None:
 def _tab_system() -> None:
     supabase_ok = _is_available()
 
-    # ── Data Source ──────────────────────────────────────────────
+    # ── Scanner Data Source ─────────────────────────────────────────
     # Which OHLCV provider the Scanner/Backtest history fetch (see
     # utils/history_store.get_history) uses. "upstox" requires
     # UPSTOX_ACCESS_TOKEN in secrets/.env — see utils/upstox_client.py.
     # Each source has its own on-disk + Supabase cache namespace, so
     # switching sources here does not invalidate anything already
     # cached under the other source.
-    _label("Data Source")
+    #
+    # 2026-07-17: renamed from "Data Source" to "Scanner Data Source" and
+    # scoped explicitly to the Scanner Engine pipeline — this setting
+    # affects OHLCV/EMA/RSI/ATR/ADX/CCI/Relative Strength/Leadership/
+    # Conviction/Entry Quality/Overall Score/Trend Phase/Fib/Categories/
+    # Backtesting/Alerts/Setup Lifecycle, and nothing else. Market
+    # Intelligence (Nifty/Bank Nifty/Sensex live price, option chain, OI,
+    # PCR, premiums, Market Bias, DORE inputs) always uses Upstox and does
+    # not read this setting at all — see utils/scanner_engine.py's
+    # fetch_nifty()/fetch_sensex_ohlcv()/fetch_banknifty_ohlcv() docstrings
+    # for exactly which call sites use which source and why.
+    _label("Scanner Data Source")
     _SOURCE_OPTIONS = {
-        "yfinance": "📈 Yahoo Finance (adjusted close, default)",
-        "upstox":   "🟠 Upstox (unadjusted close, needs daily token)",
+        "yfinance": "📈 Yahoo Finance (Default / Recommended)",
+        "upstox":   "🟠 Upstox (Experimental)",
     }
     _cur_source = _g("data_source", "yfinance")
     _source_choice = st.selectbox(
-        "Data Source",
+        "Scanner Data Source",
         options=list(_SOURCE_OPTIONS.keys()),
         format_func=lambda k: _SOURCE_OPTIONS[k],
         index=list(_SOURCE_OPTIONS.keys()).index(_cur_source) if _cur_source in _SOURCE_OPTIONS else 0,
@@ -877,9 +888,15 @@ def _tab_system() -> None:
         else:
             st.caption("Upstox token OK.")
     st.caption(
-        "Which provider Scanner/Backtest pull daily candles from. Upstox "
-        "gives unadjusted closes and needs a fresh token every day — see "
-        "the Data Source Check page to verify before switching."
+        "Which provider the Scanner Engine (OHLCV, indicators, scoring, "
+        "categories, backtesting) pulls daily candles from. Upstox gives "
+        "unadjusted closes and needs a fresh token every day — see the "
+        "Data Source Check page to verify before switching."
+    )
+    st.info(
+        "🟠 Market Intelligence (Nifty, Bank Nifty, Sensex, OI and "
+        "Premiums) always uses Upstox and is independent of this setting.",
+        icon="ℹ️",
     )
 
     # ── Default Backtest Engine ───────────────────────────────────

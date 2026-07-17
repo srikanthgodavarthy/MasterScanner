@@ -317,6 +317,36 @@ def fetch_ohlcv_upstox(symbol: str, period: str = "1y", interval: str = "1d") ->
     return df
 
 
+def fetch_index_ohlcv_upstox(index: str, period: str = "1y") -> pd.DataFrame:
+    """
+    Index counterpart to fetch_ohlcv_upstox() — historical daily OHLCV for
+    "NIFTY", "BANKNIFTY", or "SENSEX" via Upstox, keyed off
+    _INDEX_INSTRUMENT_KEYS instead of resolve_instrument_key() (which only
+    covers NSE-listed equities, not indices). Used by Market Intelligence
+    (DORE's own indicator computation on the index) and, when the Scanner
+    Data Source setting is "upstox", by the scanner's Nifty benchmark
+    fetch (utils.scanner_engine.fetch_nifty/fetch_nifty_ohlcv) so the
+    Relative Strength / regime benchmark comes from the same provider as
+    the stock data it's being compared against.
+
+    Same return contract as fetch_ohlcv_upstox(): empty DataFrame if fewer
+    than 60 bars or on any failure — callers should fall back to another
+    source rather than treat this as fatal.
+    """
+    instrument_key = _INDEX_INSTRUMENT_KEYS.get(index.upper())
+    if instrument_key is None:
+        return pd.DataFrame()
+
+    days_back = _PERIOD_TO_DAYS.get(period, 375)
+    to_date   = date.today()
+    from_date = to_date - timedelta(days=days_back)
+
+    df = _fetch_candles(instrument_key, from_date, to_date, unit="days", interval="1")
+    if df.empty or len(df) < 60:
+        return pd.DataFrame()
+    return df
+
+
 def fetch_ohlcv_range_upstox(symbol: str, start: date, end: date) -> pd.DataFrame:
     """
     Date-range counterpart to fetch_ohlcv_upstox(), for callers (history_store)
@@ -665,6 +695,7 @@ def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
       "expiry":     "2026-07-24",
       "ce_strike": 25400.0, "ce_oi": 8123450, "ce_premium": 42.15,  # highest-OI Call strike
       "pe_strike": 24800.0, "pe_oi": 7543210, "pe_premium": 38.60,  # highest-OI Put strike
+      "pcr": 1.08,   # total Put OI / total Call OI across the whole chain
     }
 
     Returns None on any failure (missing/expired token, empty chain, etc.)
@@ -702,15 +733,23 @@ def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
 
         best_ce = max(chain, key=lambda r: _oi(r, "call_options"))
         best_pe = max(chain, key=lambda r: _oi(r, "put_options"))
+        ce_oi   = _oi(best_ce, "call_options")
+        pe_oi   = _oi(best_pe, "put_options")
+        total_ce_oi = sum(_oi(r, "call_options") for r in chain)
+        total_pe_oi = sum(_oi(r, "put_options") for r in chain)
 
         return {
             "expiry":     expiry,
-            "ce_strike":  best_ce.get("strike_price"),
-            "ce_oi":      _oi(best_ce, "call_options"),
+            "ce_strike":  best_ce.get("strike_price"),   # highest-OI Call strike -> OI Resistance
+            "ce_oi":      ce_oi,
             "ce_premium": _premium(best_ce, "call_options"),
-            "pe_strike":  best_pe.get("strike_price"),
-            "pe_oi":      _oi(best_pe, "put_options"),
+            "pe_strike":  best_pe.get("strike_price"),   # highest-OI Put strike -> OI Support
+            "pe_oi":      pe_oi,
             "pe_premium": _premium(best_pe, "put_options"),
+            # PCR = total Put OI / total Call OI across the whole chain (the
+            # standard definition) — NOT ce_oi/pe_oi at the two individual
+            # max-OI strikes, which would be a different, narrower ratio.
+            "pcr":        round(total_pe_oi / total_ce_oi, 3) if total_ce_oi else None,
         }
     except Exception:
         logger.warning("Upstox option-chain fetch failed for %s", index, exc_info=True)
