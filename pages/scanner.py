@@ -4035,13 +4035,27 @@ def render(settings: dict | None = None):
             return
 
         with st.spinner("Classifying regime & computing composite scores…"):
-            _scan_source = effective.get("data_source", "yfinance")
-            nifty_series = fetch_nifty("1y", source=_scan_source)
+            # 2026-07-17 FIX: regime benchmark is deliberately NOT threaded
+            # through the Scanner Data Source setting. Nifty regime
+            # (TREND/RANGE/VOLATILE) is a strict AND-gate on ADX>25 +
+            # above-EMA50 + above-EMA200 + VIX<=22 (see regime_engine.
+            # classify_regime()), so it's boundary-sensitive: swapping the
+            # Nifty benchmark's provider between Yahoo and Upstox can flip
+            # a borderline TREND into RANGE (or vice versa) on its own,
+            # independent of how any individual stock actually scores —
+            # and once regime != TREND, apply_regime_layer() zeroes out
+            # execute_flag for every row (Actionable goes to 0) regardless
+            # of what the per-stock CV1/scoring says. Pinning the regime
+            # benchmark to Yahoo Finance, always, keeps regime
+            # classification stable across a Scanner Data Source switch.
+            # Per-stock OHLCV / RS / scoring still correctly follows
+            # effective["data_source"] via run_scanner() above — this only
+            # affects the Nifty benchmark series used for the regime call.
+            nifty_series = fetch_nifty("1y")
             regime_ctx   = build_regime_context(
                 nifty             = nifty_series,
                 execute_threshold = effective.get("execute_threshold", 70),
                 auto_fetch_vix    = True,
-                source            = _scan_source,
             )
             df_aug = apply_regime_layer(df_raw, regime_ctx)
 
