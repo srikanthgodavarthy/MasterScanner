@@ -192,34 +192,54 @@ def _compare_live_one(symbol: str, yf_lv: dict | None, ux_lv: dict | None) -> di
 
 
 # ══════════════════════════════════════════════════════════════════
-#  FULL INDICATOR / SCORE COMPARISON — yfinance vs upstox
+#  STAGED PIPELINE COMPARISON — yfinance vs upstox
 # ══════════════════════════════════════════════════════════════════
-# Everything above only compares raw CLOSE. That's not enough: two
-# sources can agree on close to the last paisa and still disagree on
-# every derived signal the app actually trades off of, because
-# indicators are path-dependent (EMA/RSI/ATR/CCI all depend on the
-# FULL bar sequence feeding them, not just the latest close) and the
-# composite scores (Leadership/Conviction/Entry Quality/Extension/
-# Recommendation) are themselves built on top of those indicators.
-# A source with a missing bar, a shifted split-adjustment, or a
-# slightly different high/low on one day can silently produce a
-# different Recommendation for the same stock on the same day even
-# when both closes matched exactly.
+# Everything above only compares raw CLOSE. That's not enough, and a
+# flat "7 metrics differ" count doesn't tell you WHERE in the pipeline
+# the two sources actually parted ways — a downstream Score/Category
+# mismatch is often just fallout from an upstream OHLC or indicator
+# mismatch, not an independent bug.
 #
-# This section runs the SAME code path the live scanner uses
-# (build_indicators + score_stock, i.e. utils.scoring_core /
-# utils.scanner_engine — never a reimplementation) once per source,
-# on that source's own OHLCV, and diffs the results field by field.
+# This section validates the pipeline as 5 independent stages, in the
+# order data actually flows through the app, and reports match/no-match
+# per stage plus the FIRST stage where divergence begins:
 #
-# NOTE: score_stock() requires >=210 bars, so this section fetches
-# years=1.0 (matching what run_scanner() actually requests), not the
-# years=0.25 used by the close-only check above.
+#   Stage 1  OHLC        — raw candles (last 200): alignment, gaps,
+#                           dupes, tz, adjusted-vs-unadjusted, values
+#   Stage 2  Indicators   — EMA20/50/200, ATR, RSI, CCI, ADX, Vol Ratio
+#                           (should be ~identical if Stage 1 matches)
+#   Stage 3  Features     — Above EMA, EMA Alignment, Trend Phase,
+#                           Golden Zone, Compression, Breakout,
+#                           Volume Expansion, Relative Strength
+#                           (small numeric diffs can flip these booleans)
+#   Stage 4  Scores       — Leadership, Conviction, Entry Quality,
+#                           Overall Score
+#   Stage 5  Category     — Elite / Execute / Actionable / Watch / ...
+#                           (Recommendation)
+#
+# Every stage is still computed and shown even if an earlier stage
+# failed — a later stage passing despite an earlier failure is itself
+# useful information (small OHLC noise that didn't propagate) — but
+# the FIRST failing stage is surfaced up front as the actionable
+# root-cause signal, per "if Stage 1 differs, stop there."
+#
+# Uses the exact scanner code path (build_indicators + score_stock,
+# utils.scoring_core / utils.scanner_engine — never a reimplementation)
+# on each source's own OHLCV. Requires a full 1y fetch per source since
+# score_stock() needs >=210 bars.
 
+STAGE_NAMES = ["OHLC", "Indicators", "Features", "Scores", "Category"]
+
+OHLC_TOL_PCT    = 0.5     # Open/High/Low/Close — % divergence flagged
 EMA_ATR_TOL_PCT = 1.0     # EMA20/50/200, ATR — % divergence flagged
+ADX_TOL_PTS     = 5.0     # ADX (0-100 scale) — absolute-point divergence flagged
 CCI_TOL_PTS     = 15.0    # CCI — absolute-point divergence flagged
 RSI_TOL_PTS     = 5.0     # RSI (0-100 scale) — absolute-point divergence flagged
 VOLRATIO_TOL    = 0.15    # Volume Ratio — absolute divergence flagged
-SCORE_TOL_PTS   = 10.0    # Extension / Leadership / Conviction / Entry Quality (0-100)
+SCORE_TOL_PTS   = 10.0    # Leadership / Conviction / Entry Quality / Score (0-100)
+OHLC_LOOKBACK   = 200     # last N candles per Stage 1 spec
+RATIO_STD_TOL_S1  = 0.01  # same adjusted-vs-unadjusted detector as Stage-0 close check
+RATIO_MEAN_TOL_S1 = 0.02
 
 _MIN_BARS_FOR_SCORE = 210   # mirrors score_stock()'s own gate
 
@@ -259,6 +279,152 @@ def _match_row(label, yf_v, ux_v):
     return {"metric": label, "yfinance": yf_v, "upstox": ux_v, "diff": None, "flag": flag}
 
 
+def _stage_passed(rows: list[dict]) -> bool | None:
+    """True/False, or None if every row was n/a (nothing usable to judge)."""
+    flags = [r["flag"] for r in rows]
+    if not flags or all(f == "n/a" for f in flags):
+        return None
+    return all(f != "⚠" for f in flags)
+
+
+def _stage1_ohlc(symbol: str, yf_df: pd.DataFrame, ux_df: pd.DataFrame) -> dict:
+    """
+    Raw candle validation over the last OHLC_LOOKBACK bars: alignment,
+    missing candles, duplicate candles, timezone, adjusted-vs-unadjusted
+    drift, and O/H/L/C value divergence.
+    """
+    notes = []
+    rows = []
+
+    if yf_df.empty or ux_df.empty:
+        notes.append("one or both sources returned no data")
+        return {"rows": [], "notes": notes, "passed": False}
+
+    # ── duplicates (within each source, before trimming) ──────────
+    yf_dupes = int(yf_df.index.duplicated().sum())
+    ux_dupes = int(ux_df.index.duplicated().sum())
+    if yf_dupes or ux_dupes:
+        notes.append(f"duplicate candles — yfinance:{yf_dupes} upstox:{ux_dupes}")
+
+    # ── timezone ────────────────────────────────────────────────
+    yf_tz = getattr(yf_df.index, "tz", None)
+    ux_tz = getattr(ux_df.index, "tz", None)
+    tz_match = yf_tz == ux_tz
+    if not tz_match:
+        notes.append(f"timezone mismatch — yfinance:{yf_tz} upstox:{ux_tz}")
+
+    yf_tail = yf_df.tail(OHLC_LOOKBACK)
+    ux_tail = ux_df.tail(OHLC_LOOKBACK)
+
+    # ── only-closed-candles heads-up (informational, not a hard fail —
+    #    can't be certain from historical data alone whether the source
+    #    itself already excludes today's incomplete session) ─────────
+    today = pd.Timestamp.now().normalize()
+    if not yf_tail.empty and yf_tail.index[-1].normalize() == today:
+        notes.append("yfinance: last candle is dated today — verify it's not a live/partial bar")
+    if not ux_tail.empty and ux_tail.index[-1].normalize() == today:
+        notes.append("upstox: last candle is dated today — verify it's not a live/partial bar")
+
+    # ── alignment / missing candles ─────────────────────────────
+    common   = yf_tail.index.intersection(ux_tail.index)
+    only_yf  = yf_tail.index.difference(ux_tail.index)
+    only_ux  = ux_tail.index.difference(yf_tail.index)
+    aligned  = len(only_yf) == 0 and len(only_ux) == 0
+    if only_yf.size:
+        notes.append(f"{len(only_yf)} candle(s) in yfinance missing from upstox (e.g. {only_yf[0].date()})")
+    if only_ux.size:
+        notes.append(f"{len(only_ux)} candle(s) in upstox missing from yfinance (e.g. {only_ux[0].date()})")
+
+    rows.append({"metric": "Timestamps aligned", "yfinance": len(yf_tail), "upstox": len(ux_tail),
+                 "diff": f"{len(common)} common", "flag": "✓" if aligned else "⚠"})
+    rows.append({"metric": "Duplicate candles", "yfinance": yf_dupes, "upstox": ux_dupes,
+                 "diff": None, "flag": "✓" if not (yf_dupes or ux_dupes) else "⚠"})
+    rows.append({"metric": "Timezone", "yfinance": str(yf_tz), "upstox": str(ux_tz),
+                 "diff": None, "flag": "✓" if tz_match else "⚠"})
+
+    if len(common) == 0:
+        notes.append("no overlapping dates in the last 200 candles — cannot compare O/H/L/C")
+        return {"rows": rows, "notes": notes, "passed": False}
+
+    # ── O/H/L/C value comparison over common dates ─────────────
+    for col, label in (("open", "Open"), ("high", "High"), ("low", "Low"), ("close", "Close")):
+        yf_s = yf_tail.loc[common, col]
+        ux_s = ux_tail.loc[common, col]
+        pct_diff = ((ux_s - yf_s).abs() / yf_s.replace(0, pd.NA) * 100).dropna()
+        max_diff = float(pct_diff.max()) if not pct_diff.empty else None
+        flag = "⚠" if (max_diff is not None and max_diff > OHLC_TOL_PCT) else "✓"
+        rows.append({"metric": label, "yfinance": round(float(yf_s.iloc[-1]), 2),
+                     "upstox": round(float(ux_s.iloc[-1]), 2),
+                     "diff": round(max_diff, 3) if max_diff is not None else None, "flag": flag})
+
+    # ── adjusted (yfinance) vs unadjusted (upstox) drift ────────
+    yf_c, ux_c = yf_tail.loc[common, "close"], ux_tail.loc[common, "close"]
+    ratio = ux_c / yf_c.replace(0, pd.NA)
+    ratio = ratio.dropna()
+    adj_flag = "✓"
+    if not ratio.empty:
+        r_std, r_mean = float(ratio.std()), float(ratio.mean())
+        if r_std <= RATIO_STD_TOL_S1 and abs(r_mean - 1.0) > RATIO_MEAN_TOL_S1:
+            adj_flag = "⚠"
+            notes.append(
+                f"systematic close ratio ≈{r_mean:.4f} (std={r_std:.4f}) — looks like Yahoo-adjusted "
+                f"vs Upstox-unadjusted for a split/bonus/dividend, not feed noise"
+            )
+    rows.append({"metric": "Adjusted vs unadjusted", "yfinance": "auto_adjust=True", "upstox": "raw",
+                 "diff": None, "flag": adj_flag})
+
+    passed = aligned and not (yf_dupes or ux_dupes) and tz_match and all(
+        r["flag"] != "⚠" for r in rows if r["metric"] in ("Open", "High", "Low", "Close", "Adjusted vs unadjusted")
+    )
+    return {"rows": rows, "notes": notes, "passed": passed}
+
+
+def _stage2_indicators(ia_yf, ia_ux) -> dict:
+    rows = [
+        _pct_row("EMA20",  float(ia_yf.e20.iloc[-1]),  float(ia_ux.e20.iloc[-1]),  EMA_ATR_TOL_PCT),
+        _pct_row("EMA50",  float(ia_yf.e50.iloc[-1]),  float(ia_ux.e50.iloc[-1]),  EMA_ATR_TOL_PCT),
+        _pct_row("EMA200", float(ia_yf.e200.iloc[-1]), float(ia_ux.e200.iloc[-1]), EMA_ATR_TOL_PCT),
+        _pct_row("ATR",    float(ia_yf.atr_s.iloc[-1]),float(ia_ux.atr_s.iloc[-1]),EMA_ATR_TOL_PCT),
+        _pts_row("RSI",    float(ia_yf.rsi_s.iloc[-1]),float(ia_ux.rsi_s.iloc[-1]),RSI_TOL_PTS),
+        _pts_row("CCI",    float(ia_yf.cci_s.iloc[-1]),float(ia_ux.cci_s.iloc[-1]),CCI_TOL_PTS),
+        _pts_row("ADX",    float(ia_yf.adx_s.iloc[-1]),float(ia_ux.adx_s.iloc[-1]),ADX_TOL_PTS),
+        _pct_row("Volume Ratio",
+                 float(ia_yf.v.iloc[-1] / ia_yf.vol_avg.iloc[-1]) if ia_yf.vol_avg.iloc[-1] else None,
+                 float(ia_ux.v.iloc[-1] / ia_ux.vol_avg.iloc[-1]) if ia_ux.vol_avg.iloc[-1] else None,
+                 VOLRATIO_TOL * 100),
+    ]
+    return {"rows": rows, "passed": _stage_passed(rows)}
+
+
+def _stage3_features(r_yf: dict, r_ux: dict) -> dict:
+    rows = [
+        _match_row("Above EMA20",       r_yf.get("_fp_price_above_e20"), r_ux.get("_fp_price_above_e20")),
+        _match_row("EMA Alignment",     r_yf.get("_fp_ema_stack"),       r_ux.get("_fp_ema_stack")),
+        _match_row("Trend Phase",       r_yf.get("TrendPhase"),          r_ux.get("TrendPhase")),
+        _match_row("Golden Zone",       r_yf.get("_in_golden"),          r_ux.get("_in_golden")),
+        _match_row("Compression",       r_yf.get("_squeeze_on"),         r_ux.get("_squeeze_on")),
+        _match_row("Breakout",          r_yf.get("_fp_breakout_confirmed"), r_ux.get("_fp_breakout_confirmed")),
+        _match_row("Volume Expansion",  r_yf.get("_fp_volume_expansion"),r_ux.get("_fp_volume_expansion")),
+        _match_row("Relative Strength (top decile)", r_yf.get("RS_Top10"), r_ux.get("RS_Top10")),
+    ]
+    return {"rows": rows, "passed": _stage_passed(rows)}
+
+
+def _stage4_scores(r_yf: dict, r_ux: dict) -> dict:
+    rows = [
+        _pts_row("Leadership",    r_yf.get("CV1_Leadership"),   r_ux.get("CV1_Leadership"),   SCORE_TOL_PTS),
+        _pts_row("Conviction",    r_yf.get("CV1_Conviction"),   r_ux.get("CV1_Conviction"),   SCORE_TOL_PTS),
+        _pts_row("Entry Quality", r_yf.get("CV1_EntryQuality"), r_ux.get("CV1_EntryQuality"), SCORE_TOL_PTS),
+        _pts_row("Overall Score", r_yf.get("Score"),            r_ux.get("Score"),            SCORE_TOL_PTS),
+    ]
+    return {"rows": rows, "passed": _stage_passed(rows)}
+
+
+def _stage5_category(r_yf: dict, r_ux: dict) -> dict:
+    rows = [_match_row("Category / Recommendation", r_yf.get("Recommendation"), r_ux.get("Recommendation"))]
+    return {"rows": rows, "passed": _stage_passed(rows)}
+
+
 def _compare_scored_one(
     symbol: str,
     yf_df: pd.DataFrame | None,
@@ -267,58 +433,62 @@ def _compare_scored_one(
     settings: dict | None,
 ) -> dict:
     """
-    Runs build_indicators()+score_stock() independently on each source's
-    OHLCV for `symbol` and returns {"symbol", "rows": [...], "status"}
-    where each row is one metric from the required comparison set:
-    EMA20, EMA50, EMA200, ATR, CCI, RSI, Volume Ratio, Trend Phase,
-    Golden Zone, Compression, Extension, Leadership, Conviction,
-    Entry Quality, Recommendation.
+    Validates the pipeline as 5 independent stages (OHLC -> Indicators ->
+    Features -> Scores -> Category) for `symbol` and returns:
+      {"symbol", "stages": {name: {"rows": [...], "passed": bool|None, "notes"?: [...]}},
+       "first_diverging_stage": str | None, "status": str}
+    Every stage is computed and shown regardless of earlier failures —
+    the first FAILING stage is what's actionable, not a reason to hide
+    the rest.
     """
     yf_df = yf_df if yf_df is not None else pd.DataFrame()
     ux_df = ux_df if ux_df is not None else pd.DataFrame()
 
-    if len(yf_df) < _MIN_BARS_FOR_SCORE:
-        return {"symbol": symbol, "rows": [], "status": f"yfinance: only {len(yf_df)} bars (<{_MIN_BARS_FOR_SCORE} needed)"}
-    if len(ux_df) < _MIN_BARS_FOR_SCORE:
-        return {"symbol": symbol, "rows": [], "status": f"upstox: only {len(ux_df)} bars (<{_MIN_BARS_FOR_SCORE} needed)"}
+    stages: dict = {}
+    stages["OHLC"] = _stage1_ohlc(symbol, yf_df, ux_df)
+
+    if len(yf_df) < _MIN_BARS_FOR_SCORE or len(ux_df) < _MIN_BARS_FOR_SCORE:
+        short = "yfinance" if len(yf_df) < _MIN_BARS_FOR_SCORE else "upstox"
+        n = len(yf_df) if short == "yfinance" else len(ux_df)
+        for name in STAGE_NAMES[1:]:
+            stages[name] = {"rows": [], "passed": None,
+                             "notes": [f"skipped — {short} only has {n} bars (<{_MIN_BARS_FOR_SCORE} needed)"]}
+        return _finalize_staged_result(symbol, stages)
 
     try:
         params = ScoringParams.from_settings(settings) if settings else ScoringParams()
-
-        # Raw indicator series — independent of score_stock's composite logic.
         ia_yf = build_indicators(yf_df, nifty, params)
         ia_ux = build_indicators(ux_df, nifty, params)
-
-        # Composite scores — the exact function run_scanner() calls per symbol.
         r_yf = score_stock(yf_df, nifty, settings=settings)
         r_ux = score_stock(ux_df, nifty, settings=settings)
     except Exception as exc:
-        return {"symbol": symbol, "rows": [], "status": f"error: {exc}"}
+        for name in STAGE_NAMES[1:]:
+            stages[name] = {"rows": [], "passed": None, "notes": [f"error: {exc}"]}
+        return _finalize_staged_result(symbol, stages)
+
+    stages["Indicators"] = _stage2_indicators(ia_yf, ia_ux)
 
     if not r_yf or not r_ux:
-        return {"symbol": symbol, "rows": [], "status": "score_stock() returned empty for one/both sources"}
+        for name in STAGE_NAMES[2:]:
+            stages[name] = {"rows": [], "passed": None, "notes": ["score_stock() returned empty for one/both sources"]}
+        return _finalize_staged_result(symbol, stages)
 
-    rows = [
-        _pct_row("EMA20",        float(ia_yf.e20.iloc[-1]),  float(ia_ux.e20.iloc[-1]),  EMA_ATR_TOL_PCT),
-        _pct_row("EMA50",        float(ia_yf.e50.iloc[-1]),  float(ia_ux.e50.iloc[-1]),  EMA_ATR_TOL_PCT),
-        _pct_row("EMA200",       float(ia_yf.e200.iloc[-1]), float(ia_ux.e200.iloc[-1]), EMA_ATR_TOL_PCT),
-        _pct_row("ATR",          float(ia_yf.atr_s.iloc[-1]),float(ia_ux.atr_s.iloc[-1]),EMA_ATR_TOL_PCT),
-        _pts_row("CCI",          r_yf.get("CCI"),            r_ux.get("CCI"),            CCI_TOL_PTS),
-        _pts_row("RSI",          r_yf.get("_rsi"),           r_ux.get("_rsi"),           RSI_TOL_PTS),
-        _pts_row("Volume Ratio", r_yf.get("_vol_ratio"),     r_ux.get("_vol_ratio"),     VOLRATIO_TOL),
-        _match_row("Trend Phase",  r_yf.get("TrendPhase"),      r_ux.get("TrendPhase")),
-        _match_row("Golden Zone",  r_yf.get("_in_golden"),      r_ux.get("_in_golden")),
-        _match_row("Compression",  r_yf.get("_squeeze_on"),     r_ux.get("_squeeze_on")),
-        _pts_row("Extension",    r_yf.get("Extension"),      r_ux.get("Extension"),      SCORE_TOL_PTS),
-        _pts_row("Leadership",   r_yf.get("CV1_Leadership"), r_ux.get("CV1_Leadership"), SCORE_TOL_PTS),
-        _pts_row("Conviction",   r_yf.get("CV1_Conviction"), r_ux.get("CV1_Conviction"), SCORE_TOL_PTS),
-        _pts_row("Entry Quality",r_yf.get("CV1_EntryQuality"),r_ux.get("CV1_EntryQuality"),SCORE_TOL_PTS),
-        _match_row("Recommendation", r_yf.get("Recommendation"), r_ux.get("Recommendation")),
-    ]
+    stages["Features"] = _stage3_features(r_yf, r_ux)
+    stages["Scores"]   = _stage4_scores(r_yf, r_ux)
+    stages["Category"] = _stage5_category(r_yf, r_ux)
 
-    n_flagged = sum(1 for row in rows if row["flag"] == "⚠")
-    status = "✓ clean" if n_flagged == 0 else f"⚠ {n_flagged}/{len(rows)} metric(s) diverged"
-    return {"symbol": symbol, "rows": rows, "status": status}
+    return _finalize_staged_result(symbol, stages)
+
+
+def _finalize_staged_result(symbol: str, stages: dict) -> dict:
+    first_fail = next((name for name in STAGE_NAMES if stages.get(name, {}).get("passed") is False), None)
+    if first_fail:
+        status = f"⚠ diverges at {first_fail}"
+    elif any(stages.get(name, {}).get("passed") for name in STAGE_NAMES):
+        status = "✓ clean"
+    else:
+        status = "n/a — insufficient data"
+    return {"symbol": symbol, "stages": stages, "first_diverging_stage": first_fail, "status": status}
 
 
 def render(settings=None):
@@ -536,23 +706,37 @@ def render(settings=None):
         )
 
     st.markdown("---")
-    st.markdown("### 🧮 Full Indicator & Score Comparison — beyond CLOSE")
+    st.markdown("### 🧮 Pipeline Stage Comparison — beyond CLOSE")
     st.markdown(
         "<span style='color:#64748b;font-size:0.82rem;'>"
-        "Close price can match perfectly while every derived signal still "
-        "diverges — indicators are path-dependent, and the composite scores "
-        "sit on top of them. This runs the exact scanner code path "
-        "(<code>build_indicators</code> + <code>score_stock</code>) once per "
-        "source and diffs: <b>EMA20, EMA50, EMA200, ATR, CCI, RSI, Volume "
-        "Ratio, Trend Phase, Golden Zone, Compression, Extension, "
-        "Leadership, Conviction, Entry Quality, Recommendation</b>. "
+        "Validates the pipeline as 5 independent stages, in the order data "
+        "actually flows through the app, and reports the FIRST stage where "
+        "the two sources diverge — a Score/Category mismatch is often just "
+        "fallout from an upstream OHLC or indicator mismatch, not a separate "
+        "bug. Runs the exact scanner code path "
+        "(<code>build_indicators</code> + <code>score_stock</code>), never a "
+        "reimplementation.<br>"
+        "<b>Stage 1 OHLC</b> (last 200 candles): alignment, gaps, "
+        "duplicates, timezone, adjusted-vs-unadjusted, O/H/L/C values.<br>"
+        "<b>Stage 2 Indicators</b>: EMA20/50/200, ATR, RSI, CCI, ADX, "
+        "Volume Ratio.<br>"
+        "<b>Stage 3 Features</b>: Above EMA20, EMA Alignment, Trend Phase, "
+        "Golden Zone, Compression, Breakout, Volume Expansion, Relative "
+        "Strength.<br>"
+        "<b>Stage 4 Scores</b>: Leadership, Conviction, Entry Quality, "
+        "Overall Score.<br>"
+        "<b>Stage 5 Category</b>: Recommendation (Elite/Execute/Actionable/"
+        "Watch/…).<br>"
+        "Every stage is still computed and shown even after an earlier "
+        "stage fails — that's useful information too — but the first "
+        "failing stage is the root cause to chase.<br>"
         "Requires a full 1y fetch per source (score_stock needs "
         f"≥{_MIN_BARS_FOR_SCORE} bars), so this is slower than the close-only "
         "check above."
         "</span>",
         unsafe_allow_html=True,
     )
-    run_scored = st.button("▶ Run Full Comparison", key="btn_run_scored_dsc")
+    run_scored = st.button("▶ Run Pipeline Comparison", key="btn_run_scored_dsc")
     if run_scored and not symbols:
         st.error("Select at least one symbol above.")
     elif run_scored:
@@ -570,7 +754,7 @@ def render(settings=None):
         ux_full = get_history(symbols, years=1.0, min_bars=0, progress_cb=_ux_prog2, source="upstox")
         nifty_series = fetch_nifty("1y")
 
-        prog2.progress(0.9, text="Scoring both sources…")
+        prog2.progress(0.9, text="Validating pipeline stages for both sources…")
         st.session_state["dsc_scored_results"] = [
             _compare_scored_one(sym, yf_full.get(sym), ux_full.get(sym), nifty_series, settings)
             for sym in symbols
@@ -580,10 +764,18 @@ def render(settings=None):
 
     scored_results = st.session_state.get("dsc_scored_results")
     if scored_results is None:
-        st.info("Select symbols above and click **▶ Run Full Comparison**.")
+        st.info("Select symbols above and click **▶ Run Pipeline Comparison**.")
     else:
+        def _stage_icon(passed):
+            return {"True": "✅", "False": "❌"}.get(str(passed), "—")
+
         overview_df = pd.DataFrame([
-            {"symbol": r["symbol"], "status": r["status"]} for r in scored_results
+            {
+                "symbol": r["symbol"],
+                **{name: _stage_icon(r["stages"].get(name, {}).get("passed")) for name in STAGE_NAMES},
+                "first_diverging_stage": r["first_diverging_stage"] or "—",
+            }
+            for r in scored_results
         ])
         st.dataframe(overview_df, width="stretch", hide_index=True)
 
@@ -591,16 +783,37 @@ def render(settings=None):
         n_bad   = sum(1 for r in scored_results if r["status"].startswith("⚠"))
         n_skip  = len(scored_results) - n_clean - n_bad
         if n_bad:
-            st.warning(f"⚠ {n_bad} symbol(s) show a diverging indicator or score between sources.", icon="⚠️")
+            by_stage = pd.Series(
+                [r["first_diverging_stage"] for r in scored_results if r["first_diverging_stage"]]
+            ).value_counts()
+            st.warning(
+                f"⚠ {n_bad}/{len(scored_results)} symbol(s) diverge somewhere in the pipeline. "
+                f"First-failure breakdown: "
+                + ", ".join(f"{stage} × {cnt}" for stage, cnt in by_stage.items()),
+                icon="⚠️",
+            )
         elif n_clean:
-            st.success(f"✅ All {n_clean} scored symbol(s) agree across every metric within tolerance.")
+            st.success(f"✅ All {n_clean} symbol(s) pass every stage within tolerance.")
         if n_skip:
-            st.caption(f"{n_skip} symbol(s) skipped (insufficient history or an error — see status above).")
+            st.caption(f"{n_skip} symbol(s) skipped (insufficient history or an error).")
 
-        st.markdown("#### Per-symbol detail")
+        st.markdown("#### Per-symbol stage detail")
         for r in scored_results:
-            if not r["rows"]:
-                continue
             with st.expander(f"{r['symbol']} — {r['status']}"):
-                detail_df = pd.DataFrame(r["rows"])
-                st.dataframe(detail_df, width="stretch", hide_index=True)
+                stage_summary_df = pd.DataFrame([
+                    {"Stage": name, "Match": _stage_icon(r["stages"].get(name, {}).get("passed"))}
+                    for name in STAGE_NAMES
+                ])
+                st.dataframe(stage_summary_df, width="stretch", hide_index=True)
+
+                for name in STAGE_NAMES:
+                    stage = r["stages"].get(name, {})
+                    rows  = stage.get("rows", [])
+                    notes = stage.get("notes", [])
+                    if not rows and not notes:
+                        continue
+                    st.markdown(f"**{name}**")
+                    if rows:
+                        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+                    for note in notes:
+                        st.caption(f"• {note}")
