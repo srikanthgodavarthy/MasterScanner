@@ -1033,9 +1033,10 @@ _CSS = """
 /* ── Index cards row (NIFTY 50 / SENSEX / BANK NIFTY) ── */
 .mo-index-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: 14px;
 }
+@media (max-width: 1200px) { .mo-index-grid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 900px) { .mo-index-grid { grid-template-columns: 1fr; } }
 .mo-index-card {
   background: var(--bg2);
@@ -2043,10 +2044,15 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
 
     oi_html = (
         _oi_item("CE OI Resistance", oi.get("ce_strike"), oi.get("ce_oi"), oi.get("ce_premium"), "#f85149") +
-        _oi_item("PE OI Resistance", oi.get("pe_strike"), oi.get("pe_oi"), oi.get("pe_premium"), "#3fb950")
+        _oi_item("PE OI Support",    oi.get("pe_strike"), oi.get("pe_oi"), oi.get("pe_premium"), "#3fb950")
     )
-    expiry      = oi.get("expiry", "")
-    expiry_html = f"Nearest expiry: {expiry}" if expiry else "Nearest expiry: —"
+    expiry = oi.get("expiry", "")
+    pcr    = oi.get("pcr")
+    pcr_html = (
+        f' · PCR: <span style="color:{"#3fb950" if pcr >= 1 else "#f85149"};font-weight:700">{pcr:.2f}</span>'
+        if pcr is not None else ""
+    )
+    expiry_html = f"Nearest expiry: {expiry}{pcr_html}" if expiry else f"Nearest expiry: —{pcr_html}"
     badge_html  = f'<span class="mo-index-badge">{badge}</span>' if badge else ""
 
     ema_specs = (("EMA20", "ema20", "above_ema20"),
@@ -2067,6 +2073,20 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
             f'</div>'
         )
     ema_row_html = f'<div class="mo-index-ema-row">{"".join(ema_items)}</div>' if ema_items else ""
+
+    # Market Bias — reuses DORE's own Stage 1 output (stage1_market_bias(),
+    # already computed for the DORE recommendation below) rather than a
+    # second, separately-computed bias figure. BULLISH/BEARISH/NEUTRAL +
+    # the underlying 0-100 score.
+    bias_html = ""
+    if dore and dore.get("market_bias_label"):
+        _bias_lbl = dore["market_bias_label"]
+        _bias_val = dore.get("market_bias", 50.0)
+        _bias_color = {"BULLISH": "#3fb950", "BEARISH": "#f85149"}.get(_bias_lbl, "#8b949e")
+        bias_html = (
+            f'<span class="mo-index-badge" style="color:{_bias_color};border-color:{_bias_color}55;'
+            f'background:{_bias_color}14;margin-left:6px;">{_bias_lbl} {_bias_val:.0f}</span>'
+        )
 
     dore_html = ""
     if dore:
@@ -2091,7 +2111,7 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
     return f"""
 <div class="mo-index-card">
   {ema_row_html}
-  <div class="mo-index-label"><span>{label}</span>{badge_html}</div>
+  <div class="mo-index-label"><span>{label}</span>{badge_html}{bias_html}</div>
   <div class="mo-index-row">
     <div>
       <div class="mo-index-price">{price_str}</div>
@@ -3609,9 +3629,16 @@ def _market_intelligence_fragment():
     live here.
     """
     # ── Nifty snapshot ──────────────────────────────────────────────
+    # 2026-07-16: EMA levels now sourced via fetch_nifty(source="upstox")
+    # — this is the Market Intelligence card's EMA badge row, not the
+    # scanner's RS/regime benchmark (that stays wired to the Scanner Data
+    # Source setting via run_scanner()/build_regime_context(), separately,
+    # in the "Run scan" block above). Two different call sites of the same
+    # shared fetch_nifty() intentionally passing different `source` — see
+    # its docstring.
     try:
         from utils.scanner_engine import fetch_nifty_intraday_snapshot, fetch_nifty, compute_ema_levels
-        _nifty_series = fetch_nifty("1y")
+        _nifty_series = fetch_nifty("1y", source="upstox")
         _snap = fetch_nifty_intraday_snapshot()
         if _snap.get("price"):
             st.session_state["nifty_snapshot"] = _snap
@@ -3669,34 +3696,71 @@ def _market_intelligence_fragment():
     except Exception:
         st.session_state["sensex_ema_levels"] = {}
 
-    # ── Nearest-expiry OI resistance (Upstox option chain) ──────────
+    # ── Bank Nifty snapshot — same Upstox-first / yfinance-spark-backfill
+    #    pattern as Sensex above.
     try:
-        from utils.upstox_client import fetch_oi_resistance
-        st.session_state["oi_resistance"] = fetch_oi_resistance("NIFTY") or {}
+        from utils.upstox_client import fetch_index_quote
+        _bn = fetch_index_quote("BANKNIFTY")
+        if _bn is not None:
+            _bn["source"] = "upstox"
     except Exception:
-        st.session_state["oi_resistance"] = {}
+        _bn = None
+    if _bn is None:
+        try:
+            from utils.scanner_engine import fetch_banknifty_intraday_snapshot
+            _bn = fetch_banknifty_intraday_snapshot()
+            _bn["source"] = "yfinance"
+        except Exception:
+            _bn = {}
+    elif not _bn.get("spark"):
+        try:
+            from utils.scanner_engine import fetch_banknifty_intraday_snapshot
+            _yf_spark = fetch_banknifty_intraday_snapshot().get("spark") or []
+            if _yf_spark:
+                _bn["spark"] = _yf_spark
+        except Exception:
+            pass
+    st.session_state["banknifty_snapshot"] = _bn or {}
+
     try:
-        from utils.upstox_client import fetch_oi_resistance
-        st.session_state["sensex_oi_resistance"] = fetch_oi_resistance("SENSEX") or {}
+        from utils.scanner_engine import fetch_banknifty_ema_levels
+        st.session_state["banknifty_ema_levels"] = fetch_banknifty_ema_levels()
     except Exception:
-        st.session_state["sensex_oi_resistance"] = {}
+        st.session_state["banknifty_ema_levels"] = {}
+
+    # ── Nearest-expiry OI resistance/support + PCR (Upstox option chain)
+    #    — Nifty, Sensex, Bank Nifty. Always Upstox; no yfinance fallback
+    #    exists for option-chain data (yfinance doesn't carry NSE/BSE
+    #    option chains), so this comes back {} rather than a wrong-source
+    #    substitute if the Upstox token is missing/expired.
+    for _idx, _key in (("NIFTY", "oi_resistance"), ("SENSEX", "sensex_oi_resistance"),
+                        ("BANKNIFTY", "banknifty_oi_resistance")):
+        try:
+            from utils.upstox_client import fetch_oi_resistance
+            st.session_state[_key] = fetch_oi_resistance(_idx) or {}
+        except Exception:
+            st.session_state[_key] = {}
 
     # ── DORE (Dynamic Options Recommendation Engine) ────────────────
-    # NIFTY/SENSEX aren't part of the scanned Nifty-500 universe, so
-    # there's no BarResult/CV1 sitting in memory for them the way there
-    # is for a scanned stock — build one on demand from each index's own
-    # OHLCV history via the same scoring_core pipeline every stock goes
-    # through. Fails soft to None (card renders without the DORE row)
-    # on any error — a DORE hiccup should never take down the rest of
-    # this already-live fragment.
+    # NIFTY/SENSEX/BANKNIFTY aren't part of the scanned Nifty-500
+    # universe, so there's no BarResult/CV1 sitting in memory for them
+    # the way there is for a scanned stock — build one on demand from
+    # each index's own OHLCV history via the same scoring_core pipeline
+    # every stock goes through. 2026-07-16: this OHLCV base — a DORE
+    # input — is now fetched with source="upstox" (Market Intelligence's
+    # "always Upstox" rule; each fetch still fails soft to yfinance
+    # internally if Upstox is unreachable — see fetch_nifty_ohlcv() /
+    # fetch_sensex_ohlcv() / fetch_banknifty_ohlcv()). Fails soft to None
+    # (card renders without the DORE row) on any error — a DORE hiccup
+    # should never take down the rest of this already-live fragment.
     try:
         from utils.dore_engine import build_dore_input_for_index, compute_dore
         from utils.dore_settings import DORESettings
-        from utils.scanner_engine import fetch_nifty_ohlcv, fetch_sensex_ohlcv
+        from utils.scanner_engine import fetch_nifty_ohlcv, fetch_sensex_ohlcv, fetch_banknifty_ohlcv
 
         _dore_cfg = DORESettings.from_dict(st.session_state.get("dore_settings", {}))
 
-        _nifty_ohlcv = fetch_nifty_ohlcv("1y")
+        _nifty_ohlcv = fetch_nifty_ohlcv("1y", source="upstox")
         _nifty_dore_input = build_dore_input_for_index(
             "NIFTY", _nifty_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
             st.session_state.get("oi_resistance", {}),
@@ -3715,10 +3779,21 @@ def _market_intelligence_fragment():
         st.session_state["sensex_dore"] = (
             compute_dore(_sensex_dore_input, _dore_cfg).as_dict() if _sensex_dore_input else None
         )
+
+        _banknifty_ohlcv = fetch_banknifty_ohlcv("1y")
+        _banknifty_dore_input = build_dore_input_for_index(
+            "BANKNIFTY", _banknifty_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
+            st.session_state.get("banknifty_oi_resistance", {}),
+            position=st.session_state.get("banknifty_option_position"),
+        )
+        st.session_state["banknifty_dore"] = (
+            compute_dore(_banknifty_dore_input, _dore_cfg).as_dict() if _banknifty_dore_input else None
+        )
     except Exception:
         logger.exception("DORE computation failed in _market_intelligence_fragment")
         st.session_state.setdefault("nifty_dore", None)
         st.session_state.setdefault("sensex_dore", None)
+        st.session_state.setdefault("banknifty_dore", None)
 
     # ── Render ────────────────────────────────────────────────────
     summary   = st.session_state.get("scan_summary", {})
@@ -3733,6 +3808,10 @@ def _market_intelligence_fragment():
          "oi": st.session_state.get("sensex_oi_resistance", {}), "badge": "",
          "ema": st.session_state.get("sensex_ema_levels", {}),
          "dore": st.session_state.get("sensex_dore")},
+        {"label": "BANK NIFTY", "snapshot": st.session_state.get("banknifty_snapshot", {}),
+         "oi": st.session_state.get("banknifty_oi_resistance", {}), "badge": "",
+         "ema": st.session_state.get("banknifty_ema_levels", {}),
+         "dore": st.session_state.get("banknifty_dore")},
     ]
     st.markdown(
         _market_overview_panel(summary, breadth, scan_time, index_cards),
@@ -3956,11 +4035,13 @@ def render(settings: dict | None = None):
             return
 
         with st.spinner("Classifying regime & computing composite scores…"):
-            nifty_series = fetch_nifty("1y")
+            _scan_source = effective.get("data_source", "yfinance")
+            nifty_series = fetch_nifty("1y", source=_scan_source)
             regime_ctx   = build_regime_context(
                 nifty             = nifty_series,
                 execute_threshold = effective.get("execute_threshold", 70),
                 auto_fetch_vix    = True,
+                source            = _scan_source,
             )
             df_aug = apply_regime_layer(df_raw, regime_ctx)
 
