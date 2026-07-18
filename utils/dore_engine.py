@@ -840,8 +840,8 @@ def stage5_decision(
     2. NO POSITION, bias == NEUTRAL, MTF conflicts, IV-crush risk flagged,
        or OI conflicts with bias -> WAIT
     3. NO POSITION, bias BULLISH (mirror for BEARISH):
-         a. Trend EXTENDED or Premium expensive or Corridor tight or OEQ low
-              -> WAIT
+         a. Trend EXTENDED or Premium expensive or Corridor tight
+              or Momentum weak or OEQ low -> WAIT
          b. OI confirms + Premium healthy + Corridor OK + OEQ passes
               + Leadership/Conviction/EntryQuality/Freshness/Component
               strength all pass
@@ -982,7 +982,7 @@ def stage5_decision(
         warnings.append(f"Trend Freshness={inp.trend_freshness:.0f} below floor "
                          f"({cfg.decision_freshness_min}) — trend may be stale")
 
-    if trend_extended or premium_expensive or corridor_tight or oeq_low:
+    if trend_extended or premium_expensive or corridor_tight or momentum_weak or oeq_low:
         reasons.append("One or more entry gates failed — waiting for better structure")
         return (WAIT, direction, None, premium_quality_score, corridor_score,
                 momentum_score, oeq_score, reasons, warnings)
@@ -1139,10 +1139,6 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         mtf_conflict=mtf_conflict, component_score=component_score, iv_crush_risk=iv_crush_risk,
     )
 
-    strike_type, recommended_expiry, strike_reasons = stage5b_strike_and_expiry(
-        inp, cfg, direction, intraday_momentum_score, iv_crush_risk,
-    )
-
     confidence = stage6_confidence(
         cfg, bias_score, oi_score, premium_quality_score, corridor_score,
         oeq_score, intraday_momentum_score, mtf_score, component_score, iv_health_score,
@@ -1158,6 +1154,18 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         logger.info("[DORE:%s] Downgrading %s -> WAIT (confidence %.1f < %.1f)",
                      inp.symbol, recommendation, confidence, cfg.min_confidence_to_act)
         recommendation = WAIT
+
+    # Strike/expiry is an EXECUTION recommendation — only meaningful (and
+    # only shown) when the final recommendation is an actual entry signal.
+    # Computed after the confidence-floor downgrade above so a WAIT never
+    # carries a stale "trade this strike" recommendation from a
+    # not-taken BUY_* call.
+    if recommendation in (BUY_CE_NOW, BUY_CE_BREAKOUT, BUY_PE_NOW, BUY_PE_BREAKDOWN):
+        strike_type, recommended_expiry, strike_reasons = stage5b_strike_and_expiry(
+            inp, cfg, direction, intraday_momentum_score, iv_crush_risk,
+        )
+    else:
+        strike_type, recommended_expiry, strike_reasons = None, None, []
 
     if iv_health_score < cfg.iv_health_score_min:
         warnings.append(f"IV Health={iv_health_score:.0f} below floor ({cfg.iv_health_score_min}) — "
