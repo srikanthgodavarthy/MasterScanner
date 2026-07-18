@@ -1244,6 +1244,24 @@ def _estimate_exhaustion_score(rsi: float, cci: float, adx: float, trend_phase: 
     return _clamp(score)
 
 
+def _days_to_expiry(expiry_str: str) -> int:
+    """Trading-day-agnostic calendar-day count from today (IST) to
+    `expiry_str` ("YYYY-MM-DD"). Returns 0 if unparseable/blank/past —
+    Stage 5b then treats it as "not eligible for the scalp window" only
+    if momentum/IV conditions also fail, so an unparseable expiry never
+    silently unlocks 0-DTE scalping on bad data.
+    """
+    if not expiry_str:
+        return 0
+    try:
+        from datetime import datetime, timedelta
+        now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        exp = datetime.strptime(expiry_str[:10], "%Y-%m-%d")
+        return max((exp.date() - now_ist.date()).days, 0)
+    except Exception:
+        return 0
+
+
 def build_dore_input_for_index(
     symbol: str,                       # "NIFTY" | "SENSEX" | "BANKNIFTY"
     index_df,                          # OHLCV DataFrame: fetch_nifty_ohlcv() / fetch_sensex_ohlcv()
@@ -1254,6 +1272,10 @@ def build_dore_input_for_index(
     ce_oi_change: float = 0.0,         # 2026-07-18: from utils.oi_snapshot_store.record_and_diff() —
     pe_oi_change: float = 0.0,         # see that module's docstring. Caller computes the diff (this
                                         # function stays a pure builder, no cache access of its own).
+    india_vix: Optional[float] = None,       # 2026-07-18: live India VIX (utils.regime_engine.fetch_india_vix())
+    constituents: Optional[dict] = None,     # 2026-07-18: {symbol: bullish-bias score 0-100} for this
+                                               # index's heavyweight constituents (Stage 1c)
+    event_risk_today: bool = False,          # 2026-07-18: caller-supplied macro/earnings-event flag
 ) -> Optional[DOREInput]:
     """Index-level counterpart to build_dore_input_from_scanner(). Nifty and
     Sensex aren't part of the Nifty-500 scan universe, so there's no
@@ -1316,6 +1338,9 @@ def build_dore_input_for_index(
         breadth=breadth,
         position=position,
         atr_override=cur_atr,
+        india_vix=india_vix,
+        constituents=constituents,
+        event_risk_today=event_risk_today,
     )
 
 
@@ -1329,6 +1354,9 @@ def build_dore_input_from_scanner(
     breadth: Optional[float] = None,
     position: Optional[dict] = None,   # {"side": "CE"/"PE", "entry_price": float} if holding
     atr_override: Optional[float] = None,  # pass a real, always-on ATR(14) — see note below
+    india_vix: Optional[float] = None,       # 2026-07-18: live India VIX, e.g. utils.regime_engine.fetch_india_vix()
+    constituents: Optional[dict] = None,     # 2026-07-18: {symbol: bullish-bias score 0-100} — see Stage 1c
+    event_risk_today: bool = False,          # 2026-07-18: caller-supplied macro/earnings-event flag
 ) -> DOREInput:
     """Adapter that assembles a DOREInput from objects MasterScanner
     already has in memory during a scan — see docs/DORE_ARCHITECTURE.md
@@ -1356,6 +1384,24 @@ def build_dore_input_from_scanner(
       - exhaustion_score is estimated via _estimate_exhaustion_score()
         from RSI/CCI/ADX/Trend Phase — see that function's docstring for
         why (no first-class exhaustion field exists on BarResult).
+      - ce_delta/pe_delta/iv_percentile (2026-07-18) are read from
+        `atm_chain_row`/`oi_resistance` IF the caller's option-chain
+        fetch included them (see utils.upstox_client.fetch_oi_resistance's
+        optional `ce_delta`/`pe_delta`/`ce_iv`/`pe_iv` keys) — None if the
+        chain fetch didn't request Greeks, and DORE degrades gracefully
+        (Stage 5b defaults to ATM / Stage 4c treats IV as neutral).
+      - days_to_expiry is computed here from `nearest_expiry`, not passed
+        in — pure date arithmetic, no reason to make every caller redo it.
+      - ema9/ema21 and htf_trend are NOT wired yet: MasterScanner's scoring
+        pipeline runs on daily bars end-to-end (no 5m/15m intraday fetch
+        or 9/21-period EMA computed anywhere in scoring_core), so there is
+        no real data to put here without a new intraday data pipeline.
+        They stay at their neutral defaults until that exists — see
+        docs/DORE_ARCHITECTURE.md for the follow-up.
+      - event_risk_today has no calendar data source yet (no economic/
+        earnings calendar integration exists) — caller must pass it
+        explicitly (e.g. a hardcoded RBI-policy-day / results-day flag)
+        until one is built; defaults to False.
     """
     atm_chain_row = atm_chain_row or {}
     oi_resistance = oi_resistance or {}
@@ -1366,6 +1412,7 @@ def build_dore_input_from_scanner(
     trend_phase = getattr(bar_result, "trend_phase", "NONE")
     price = getattr(bar_result, "entry", 0.0)
     atr = atr_override if atr_override is not None else getattr(bar_result, "atr_at_setup", 0.0)
+    nearest_expiry = oi_resistance.get("expiry", "")
 
     return DOREInput(
         symbol=symbol,
@@ -1382,6 +1429,10 @@ def build_dore_input_from_scanner(
         vol_ratio=getattr(bar_result, "vol_ratio", 1.0),
         trend_phase=trend_phase,
         market_breadth=breadth,
+        india_vix=india_vix if india_vix is not None else 0.0,
+        iv=atm_chain_row.get("iv") or oi_resistance.get("iv") or 0.0,
+        event_risk_today=event_risk_today,
+        constituents=constituents,
 
         leadership=getattr(cv1_scores, "leadership", 0.0),
         conviction=getattr(cv1_scores, "conviction", 0.0),
@@ -1402,9 +1453,14 @@ def build_dore_input_from_scanner(
         ce_bid_ask_spread_pct=atm_chain_row.get("ce_spread_pct"),
         pe_bid_ask_spread_pct=atm_chain_row.get("pe_spread_pct"),
         pcr=atm_chain_row.get("pcr", oi_resistance.get("pcr", 1.0)),
+        pcr_prev=atm_chain_row.get("pcr_prev", oi_resistance.get("pcr_prev")),
+        ce_delta=atm_chain_row.get("ce_delta", oi_resistance.get("ce_delta")),
+        pe_delta=atm_chain_row.get("pe_delta", oi_resistance.get("pe_delta")),
+        iv_percentile=atm_chain_row.get("iv_percentile", oi_resistance.get("iv_percentile")),
         highest_ce_oi_strike=oi_resistance.get("ce_strike", 0.0),
         highest_pe_oi_strike=oi_resistance.get("pe_strike", 0.0),
-        nearest_expiry=oi_resistance.get("expiry", ""),
+        nearest_expiry=nearest_expiry,
+        days_to_expiry=_days_to_expiry(nearest_expiry),
 
         in_position=bool(position),
         position_side=(position or {}).get("side"),

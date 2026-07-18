@@ -49,6 +49,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 import requests
@@ -735,12 +736,33 @@ def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
         def _premium(row: dict, leg: str) -> float:
             return ((row.get(leg) or {}).get("market_data") or {}).get("ltp", 0) or 0
 
+        def _greeks(row: dict, leg: str) -> tuple[Optional[float], Optional[float]]:
+            g = (row.get(leg) or {}).get("option_greeks") or {}
+            return g.get("delta"), g.get("iv")
+
         best_ce = max(chain, key=lambda r: _oi(r, "call_options"))
         best_pe = max(chain, key=lambda r: _oi(r, "put_options"))
         ce_oi   = _oi(best_ce, "call_options")
         pe_oi   = _oi(best_pe, "put_options")
         total_ce_oi = sum(_oi(r, "call_options") for r in chain)
         total_pe_oi = sum(_oi(r, "put_options") for r in chain)
+
+        # 2026-07-18: locate the row nearest the underlying's live spot
+        # (Upstox returns `underlying_spot_price` on every chain row) to
+        # pull Delta/IV off the actual ATM leg — NOT off best_ce/best_pe
+        # above, which are the highest-OI (wall) strikes and usually
+        # aren't ATM at all. Falls soft to None on any missing/odd data;
+        # DORE treats missing Delta/IV as neutral, never as zero.
+        atm_strike_val = ce_delta = pe_delta = ce_iv = pe_iv = None
+        try:
+            spot = next((r.get("underlying_spot_price") for r in chain if r.get("underlying_spot_price")), None)
+            if spot:
+                atm_row = min(chain, key=lambda r: abs((r.get("strike_price") or 0) - spot))
+                atm_strike_val = atm_row.get("strike_price")
+                ce_delta, ce_iv = _greeks(atm_row, "call_options")
+                pe_delta, pe_iv = _greeks(atm_row, "put_options")
+        except Exception:
+            logger.exception("fetch_oi_resistance: ATM Greeks lookup failed for %s (non-fatal)", index)
 
         return {
             "expiry":     expiry,
@@ -761,6 +783,14 @@ def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
             # highest-OI strikes above, which OI Resistance/Support use).
             "total_ce_oi": total_ce_oi,
             "total_pe_oi": total_pe_oi,
+            # 2026-07-18: ATM leg Greeks/IV for DORE Stage 5b (strike/delta
+            # selection) and Stage 4c (IV health) — None if Upstox's plan/
+            # endpoint doesn't return option_greeks, which DORE handles as
+            # "unavailable, treat as neutral" rather than a false zero.
+            "atm_strike": atm_strike_val,
+            "ce_delta":   ce_delta,
+            "pe_delta":   pe_delta,
+            "iv":         round((ce_iv + pe_iv) / 2.0, 2) if (ce_iv is not None and pe_iv is not None) else (ce_iv or pe_iv),
         }
     except Exception:
         logger.warning("Upstox option-chain fetch failed for %s", index, exc_info=True)
