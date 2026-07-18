@@ -1962,6 +1962,54 @@ def _vix_band(vix: float) -> tuple[str, str]:
     return "HIGH", "#f85149"
 
 
+def _dore_debug_html(dore: dict, reasons: list, warnings: list) -> str:
+    """Collapsible raw-data block for one index's DORE card — surfaces
+    every sub-score DOREResult computes (including the ones added
+    2026-07-18 that the card itself doesn't otherwise show: MTF,
+    Component Strength, IV Health, OEQ, Intraday Momentum, conviction/10,
+    strike/expiry) plus the FULL reasons/warnings lists (not just the one
+    line the card shows above) — e.g. Stage 1c's per-symbol "Diverging
+    constituents: X, Y" line only exists in here, not in the main card.
+    Closed by default; a <details> element rather than a real
+    st.expander() since this whole card is one HTML string, not a tree
+    of Streamlit widgets — cheap to add, no extra Streamlit render calls.
+    """
+    def _row(label: str, value) -> str:
+        return (f'<div style="display:flex;justify-content:space-between;padding:2px 0;">'
+                f'<span style="color:var(--muted)">{label}</span>'
+                f'<span style="color:var(--text);font-weight:600">{value}</span></div>')
+
+    crush = dore.get("iv_crush_risk")
+    scores_html = "".join([
+        _row("OI Structure",        f'{dore.get("oi_structure_score", 0):.0f}'),
+        _row("Premium Quality",     f'{dore.get("premium_quality_score", 0):.0f}'),
+        _row("Intraday Momentum",   f'{dore.get("intraday_momentum_score", 0):.0f}'),
+        _row("Corridor Score",      f'{dore.get("corridor_score", 0):.0f}'),
+        _row("OEQ",                 f'{dore.get("oeq_score", 0):.0f}'),
+        _row("MTF Score",           f'{dore.get("mtf_score", 0):.0f}'),
+        _row("Component Strength",  f'{dore.get("component_strength_score", 0):.0f}'),
+        _row("IV Health",           f'{dore.get("iv_health_score", 0):.0f}'),
+        _row("IV Crush Risk",       "⚠ YES" if crush else "no"),
+        _row("Conviction (/10)",    f'{dore.get("conviction_score_10", 0):.1f}'),
+        _row("Strike Type",         dore.get("recommended_strike_type") or "—"),
+        _row("Expiry",              dore.get("recommended_expiry") or "—"),
+    ])
+    reasons_html  = "".join(f'<li style="margin-bottom:2px">{r}</li>' for r in reasons) or "<li>—</li>"
+    warnings_html = "".join(f'<li style="margin-bottom:2px">{w}</li>' for w in warnings) or "<li>—</li>"
+
+    return f"""
+  <details style="margin-top:8px;font-size:11px;">
+    <summary style="cursor:pointer;color:var(--muted);user-select:none;">🔬 DORE debug</summary>
+    <div style="margin-top:6px;padding:8px;background:rgba(255,255,255,0.03);border-radius:6px;">
+      {scores_html}
+      <div style="margin-top:8px;color:var(--muted);font-weight:600;">Reasons</div>
+      <ul style="margin:4px 0 0 16px;padding:0;color:var(--text);">{reasons_html}</ul>
+      <div style="margin-top:8px;color:var(--muted);font-weight:600;">Warnings</div>
+      <ul style="margin:4px 0 0 16px;padding:0;color:var(--text);">{warnings_html}</ul>
+    </div>
+  </details>"""
+
+
 def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
                       grad_id: str, badge: str = "", ema: dict | None = None,
                       dore: dict | None = None) -> str:
@@ -2107,7 +2155,8 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
     <span class="mo-index-dore-conf" style="color:{color}">{conf:.0f}%</span>
   </div>
   <div class="mo-index-dore-reason">{top_reason}</div>
-  {warn_html}"""
+  {warn_html}
+  {_dore_debug_html(dore, reasons, warnings)}"""
 
     return f"""
 <div class="mo-index-card">
