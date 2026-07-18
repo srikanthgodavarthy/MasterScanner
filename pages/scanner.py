@@ -3774,6 +3774,45 @@ def _market_intelligence_fragment():
 
         _dore_cfg = DORESettings.from_dict(st.session_state.get("dore_settings", {}))
 
+        # 2026-07-18: India VIX for DORE Stage 4c (IV/VIX Health) — reuse
+        # the scan run's own regime_ctx.vix if a full scan has already
+        # populated it this session (avoids a second yfinance round-trip);
+        # else fetch directly. fetch_india_vix() itself fails soft to 16.0.
+        try:
+            _regime_ctx = st.session_state.get("regime_ctx")
+            if _regime_ctx is not None and getattr(_regime_ctx, "vix", None):
+                _dore_vix = float(_regime_ctx.vix)
+            else:
+                from utils.regime_engine import fetch_india_vix
+                _dore_vix = fetch_india_vix()
+        except Exception:
+            _dore_vix = None
+
+        # 2026-07-18: heavyweight constituent alignment for DORE Stage 1c
+        # (Component Strength) — pulled from the last completed Nifty-500
+        # scan's own per-stock Leadership score + today's %Chg sign (the
+        # same "fold quality toward observed direction" pattern DORE's own
+        # Stage 1 uses for Leadership/Conviction). Soft-fails to {} (Stage
+        # 1c then reports neutral, doesn't block) if no scan has run yet
+        # or a symbol isn't present in it.
+        def _constituent_scores(symbols: list[str]) -> dict:
+            out: dict = {}
+            try:
+                _df = st.session_state.get("scan_df")
+                if _df is None or _df.empty or "Stock" not in _df.columns:
+                    return out
+                for sym in symbols:
+                    _rows = _df[_df["Stock"].astype(str).str.upper() == sym]
+                    if _rows.empty:
+                        continue
+                    _row = _rows.iloc[0]
+                    _lead = float(_row.get("CV1_Leadership", 50.0) or 50.0)
+                    _chg  = float(_row.get("%Chg", 0.0) or 0.0)
+                    out[sym] = _lead if _chg >= 0 else (100.0 - _lead)
+            except Exception:
+                logger.exception("DORE constituents lookup failed (non-fatal)")
+            return out
+
         _nifty_ohlcv = fetch_nifty_ohlcv("1y", source="upstox")
         _nifty_ce_chg, _nifty_pe_chg = _oi_changes.get("NIFTY", (0.0, 0.0))
         _nifty_dore_input = build_dore_input_for_index(
@@ -3781,6 +3820,8 @@ def _market_intelligence_fragment():
             st.session_state.get("oi_resistance", {}),
             position=st.session_state.get("nifty_option_position"),
             ce_oi_change=_nifty_ce_chg, pe_oi_change=_nifty_pe_chg,
+            india_vix=_dore_vix,
+            constituents=_constituent_scores(["RELIANCE", "HDFCBANK", "ICICIBANK"]),
         )
         st.session_state["nifty_dore"] = (
             compute_dore(_nifty_dore_input, _dore_cfg).as_dict() if _nifty_dore_input else None
@@ -3793,6 +3834,8 @@ def _market_intelligence_fragment():
             st.session_state.get("sensex_oi_resistance", {}),
             position=st.session_state.get("sensex_option_position"),
             ce_oi_change=_sensex_ce_chg, pe_oi_change=_sensex_pe_chg,
+            india_vix=_dore_vix,
+            constituents=_constituent_scores(["RELIANCE", "HDFCBANK", "ICICIBANK"]),
         )
         st.session_state["sensex_dore"] = (
             compute_dore(_sensex_dore_input, _dore_cfg).as_dict() if _sensex_dore_input else None
@@ -3805,6 +3848,8 @@ def _market_intelligence_fragment():
             st.session_state.get("banknifty_oi_resistance", {}),
             position=st.session_state.get("banknifty_option_position"),
             ce_oi_change=_banknifty_ce_chg, pe_oi_change=_banknifty_pe_chg,
+            india_vix=_dore_vix,
+            constituents=_constituent_scores(["HDFCBANK", "ICICIBANK"]),
         )
         st.session_state["banknifty_dore"] = (
             compute_dore(_banknifty_dore_input, _dore_cfg).as_dict() if _banknifty_dore_input else None
