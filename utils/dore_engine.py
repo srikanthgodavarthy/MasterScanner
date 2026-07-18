@@ -20,20 +20,30 @@ recommendations:
 Architecture (see docs/DORE_ARCHITECTURE.md for the full diagram):
 
     Stage 1   Market Bias         -> bias direction + Market Bias Score (0-100)
+    Stage 1b  MTF Confirmation    -> does the higher-timeframe trend agree? (hard gate)
+    Stage 1c  Component Strength  -> are index heavyweights backing this move?
     Stage 2   OI Structure        -> does the option chain confirm the bias?
     Stage 3   Premium Quality     -> is the trade priced sanely / liquid?
     Stage 3b  Intraday Momentum   -> is short-term momentum still fresh, or fading?
     Stage 4   Corridor Score      -> is there room to run before the next OI wall?
     Stage 4b  Option Entry Quality (OEQ) -> blend of the 4 scores above into one
                                      options-side "is THIS entry good right now" gate
+    Stage 4c  IV / VIX Health     -> is the volatility backdrop safe, or IV-crush risk? (hard gate)
     Stage 5   Decision Engine     -> ONE recommendation, deterministically
-    Stage 6   Confidence          -> 0-100 confidence blended from stages 1-4b
+    Stage 5b  Strike & Expiry     -> ATM/ITM strike (target Delta 0.55-0.70) + weekly-vs-next-week
+    Stage 6   Confidence          -> 0-100 confidence blended from stages 1-4c;
+                                     also exposed as conviction_score_10 (0-10 scale)
 
 DORE's five headline sub-scores — the ones meant to line up 1:1 with the
 "Options Intelligence Engine" box in MasterScanner's architecture diagram
 (OI Structure / Premium Quality / OEQ / Corridor Score / Intraday
 Momentum) — are all first-class fields on DOREResult: oi_structure_score,
 premium_quality_score, oeq_score, corridor_score, intraday_momentum_score.
+Location (MTF/Component) and Volatility (IV/VIX) checks are additional
+fields (mtf_score, component_strength_score, iv_health_score) that round
+out a full 5-pillar institutional framework (Price Action, Momentum,
+Derivatives Data, Volatility, Execution) on top of the Options
+Intelligence core.
 
 Every threshold is read from utils.dore_settings.DORESettings — nothing
 here is hardcoded, so the whole engine can be re-tuned from one config
@@ -98,7 +108,9 @@ class DOREInput:
 
     # ── Market data ──────────────────────────────────────────────
     price:            float = 0.0
+    ema9:             float = 0.0
     ema20:            float = 0.0
+    ema21:            float = 0.0
     ema50:            float = 0.0
     ema200:           float = 0.0
     # Preferred over the three raw EMA floats above when available: most
@@ -116,6 +128,23 @@ class DOREInput:
     vol_ratio:        float = 1.0
     trend_phase:      str   = "NONE"      # EMERGING | ESTABLISHED | EXTENDED | NONE
     market_breadth:   Optional[float] = None   # 0-100, advances/declines style; optional
+    htf_trend:        str   = "NONE"      # "UP" | "DOWN" | "NONE" — higher-timeframe (15m/1h)
+                                            # trend, precomputed upstream; used for MTF alignment
+
+    # ── Volatility & event risk ──────────────────────────────────
+    iv:               float = 0.0    # ATM option implied volatility, % (informational)
+    iv_percentile:    Optional[float] = None   # 0-100 rank of current IV vs its own recent range
+    india_vix:        float = 0.0
+    india_vix_prev:   Optional[float] = None   # optional, for a VIX-trend read
+    event_risk_today: bool = False   # major macro/earnings event flagged for today
+                                       # (RBI/Fed policy, results, budget, etc.) — IV-crush risk
+
+    # ── Heavyweight constituent alignment ────────────────────────
+    constituents: Optional[dict] = None
+    # e.g. {"HDFCBANK": 78.0, "ICICIBANK": 71.0, "RELIANCE": 60.0}
+    # Each value = that stock's own bullish-bias score (0-100, 50=neutral),
+    # already computed upstream by the Equity Intelligence Engine for that
+    # single stock — DORE does not evaluate individual stocks itself.
 
     # ── MasterScanner scores (already computed upstream) ────────
     leadership:       float = 0.0   # 0-100
@@ -138,9 +167,13 @@ class DOREInput:
     ce_bid_ask_spread_pct: Optional[float] = None
     pe_bid_ask_spread_pct: Optional[float] = None
     pcr:              float = 1.0
+    pcr_prev:         Optional[float] = None   # PCR ~15-30 min ago, for an intraday PCR-trend read
+    ce_delta:         Optional[float] = None   # ATM/near-ATM CE option Delta
+    pe_delta:         Optional[float] = None   # ATM/near-ATM PE option Delta
     highest_ce_oi_strike: float = 0.0   # nearest CE "wall" (resistance)
     highest_pe_oi_strike: float = 0.0   # nearest PE "wall" (support)
     nearest_expiry:   str = ""
+    days_to_expiry:   int = 0     # trading days to nearest_expiry, precomputed upstream
 
     # ── Existing position context (optional; enables HOLD/BOOK) ─
     in_position:        bool = False
@@ -165,6 +198,16 @@ class DOREResult:
     intraday_momentum_score:  float = 0.0   # Stage 3b — Intraday Momentum
     corridor_score:           float = 0.0   # Stage 4  — Corridor Score
     oeq_score:                float = 0.0   # Stage 4b — Option Entry Quality (OEQ)
+
+    # ── Extended pillars (Price-Action location + Volatility health) ──
+    mtf_score:                 float = 50.0   # Stage 1b — higher-timeframe alignment
+    component_strength_score:  float = 50.0   # Stage 1c — heavyweight constituent alignment
+    iv_health_score:           float = 50.0   # Stage 4c — IV/VIX pricing health
+    iv_crush_risk:             bool = False   # hard flag: event risk or IV richness detected
+
+    recommended_strike_type: Optional[str] = None   # "ATM" | "ITM"
+    recommended_expiry:      Optional[str] = None   # "CURRENT_WEEK" | "NEXT_WEEK"
+    conviction_score_10:     float = 0.0     # confidence/10, rounded — 1-10 scale, reject if < 8
 
     suggested_direction: Optional[str] = None   # "CE" | "PE" | None
     suggested_strike:  Optional[float] = None
@@ -307,6 +350,88 @@ def stage1_market_bias(inp: DOREInput, cfg: DORESettings) -> tuple[float, str, l
 
 
 # ══════════════════════════════════════════════════════════════════
+#  STAGE 1b — MULTI-TIMEFRAME (MTF) CONFIRMATION
+# ══════════════════════════════════════════════════════════════════
+
+def stage1b_mtf_confirmation(
+    inp: DOREInput, cfg: DORESettings, bias_label: str
+) -> tuple[float, list[str], bool]:
+    """Does the higher-timeframe trend (15m/1h, precomputed upstream into
+    `inp.htf_trend`) agree with Stage 1's bias? This is a LOCATION check,
+    not a momentum one — a 5m bullish bias fighting a 1h downtrend is
+    exactly the "trapped, low-probability" setup this framework rejects.
+    Returns (mtf_score, reasons, hard_conflict).
+    """
+    reasons: list[str] = []
+    htf = (inp.htf_trend or "NONE").upper()
+
+    if bias_label == "NEUTRAL" or htf == "NONE":
+        if htf == "NONE":
+            reasons.append("Higher-timeframe trend not supplied — MTF check skipped (neutral)")
+        return cfg.mtf_unknown_score, reasons, False
+
+    agrees = (htf == "UP" and bias_label == "BULLISH") or (htf == "DOWN" and bias_label == "BEARISH")
+    conflicts = (htf == "UP" and bias_label == "BEARISH") or (htf == "DOWN" and bias_label == "BULLISH")
+
+    if agrees:
+        reasons.append(f"Higher-timeframe trend ({htf}) confirms {bias_label} bias — multi-timeframe aligned")
+        return cfg.mtf_agree_score, reasons, False
+    if conflicts:
+        reasons.append(f"Higher-timeframe trend ({htf}) CONFLICTS with {bias_label} bias — "
+                        f"multi-timeframe misalignment, trapped-range risk")
+        return cfg.mtf_conflict_score, reasons, cfg.mtf_conflict_blocks_entry
+
+    reasons.append(f"Higher-timeframe trend ({htf}) neither confirms nor conflicts")
+    return cfg.mtf_unknown_score, reasons, False
+
+
+# ══════════════════════════════════════════════════════════════════
+#  STAGE 1c — COMPONENT / HEAVYWEIGHT STRENGTH
+# ══════════════════════════════════════════════════════════════════
+
+def stage1c_component_strength(
+    inp: DOREInput, cfg: DORESettings, bias_label: str
+) -> tuple[float, list[str]]:
+    """Are the index's heavyweight constituents (HDFC Bank/ICICI Bank for
+    Bank Nifty; Reliance/HDFC Bank/ICICI Bank/IT majors for Nifty/Sensex)
+    moving in tandem with the index bias, or diverging from it? A
+    breakout its own heavyweights aren't backing is a fragile one.
+
+    `inp.constituents` = {symbol: bullish-bias score 0-100, 50=neutral},
+    already computed upstream (same 0-100 scale as Leadership/Conviction)
+    — DORE does not evaluate individual stocks itself.
+    """
+    reasons: list[str] = []
+    if not inp.constituents:
+        reasons.append("No constituent data supplied — component strength check skipped (neutral)")
+        return 50.0, reasons
+    if bias_label == "NEUTRAL":
+        reasons.append("Bias NEUTRAL — component alignment not evaluated")
+        return 50.0, reasons
+
+    want_bull = bias_label == "BULLISH"
+    agree, total, lagging = 0, 0, []
+    for name, score in inp.constituents.items():
+        total += 1
+        is_bull = score >= cfg.component_agree_threshold
+        is_bear = score <= (100.0 - cfg.component_agree_threshold)
+        if (want_bull and is_bull) or ((not want_bull) and is_bear):
+            agree += 1
+        else:
+            lagging.append(name)
+
+    agree_pct = (agree / total * 100.0) if total else 0.0
+    component_score = _clamp(agree_pct)
+    reasons.append(f"Heavyweight alignment: {agree}/{total} constituents agree with {bias_label} "
+                    f"bias ({agree_pct:.0f}%)")
+    if lagging:
+        reasons.append(f"Diverging constituents: {', '.join(lagging)}")
+
+    logger.info("[DORE:%s] Stage1c ComponentStrength score=%.1f", inp.symbol, component_score)
+    return component_score, reasons
+
+
+# ══════════════════════════════════════════════════════════════════
 #  STAGE 2 — OI STRUCTURE
 # ══════════════════════════════════════════════════════════════════
 
@@ -355,6 +480,16 @@ def stage2_oi_structure(inp: DOREInput, cfg: DORESettings, bias_label: str) -> t
     else:
         pcr_score = 50.0
     reasons.append(f"PCR={inp.pcr:.2f}")
+    if inp.pcr_prev is not None and inp.pcr_prev > 0:
+        pcr_delta = inp.pcr - inp.pcr_prev
+        if abs(pcr_delta) >= 0.03:
+            trend_word = "rising" if pcr_delta > 0 else "falling"
+            reasons.append(f"PCR {trend_word} intraday ({inp.pcr_prev:.2f} -> {inp.pcr:.2f}) — "
+                            f"{'put writers adding' if pcr_delta > 0 else 'put writers unwinding'}")
+        else:
+            reasons.append(f"PCR flat intraday ({inp.pcr_prev:.2f} -> {inp.pcr:.2f})")
+    else:
+        reasons.append("Prior PCR not supplied — intraday PCR-trend read skipped")
 
     # Base strength: compare OI stacked on the wall in the direction that
     # would HELP the trade (put base for bullish, call base for bearish)
@@ -487,13 +622,34 @@ def stage3b_intraday_momentum(inp: DOREInput, cfg: DORESettings, direction: Opti
     adx_score = _pct_score(inp.adx, 10.0, max(cfg.momentum_adx_strong_min * 1.5, 25.0))
     vol_score = _pct_score(inp.vol_ratio, cfg.momentum_vol_ratio_min * 0.5, cfg.momentum_vol_ratio_min * 1.5)
 
+    # EMA9/21 "riding vs chopping" — is price cleanly riding the fast EMA
+    # stack in the trade direction, or whipsawing through it? Only scored
+    # when both EMAs were actually supplied (both > 0); else neutral.
+    if inp.ema9 > 0 and inp.ema21 > 0:
+        if direction == "CE":
+            ride_score = 100.0 if (inp.price > inp.ema9 > inp.ema21) else (
+                40.0 if inp.price > inp.ema9 else 15.0)
+            reasons.append("Price cleanly riding 9>21 EMA" if inp.price > inp.ema9 > inp.ema21
+                            else "Price chopping through the 9/21 EMA stack")
+        elif direction == "PE":
+            ride_score = 100.0 if (inp.price < inp.ema9 < inp.ema21) else (
+                40.0 if inp.price < inp.ema9 else 15.0)
+            reasons.append("Price cleanly riding 9<21 EMA" if inp.price < inp.ema9 < inp.ema21
+                            else "Price chopping through the 9/21 EMA stack")
+        else:
+            ride_score = 50.0
+    else:
+        ride_score = 55.0
+        reasons.append("EMA9/EMA21 not supplied — riding/chopping check skipped (neutral)")
+
     reasons.append(f"RSI={inp.rsi:.1f}, CCI={inp.cci:.0f}, ADX={inp.adx:.1f}, VolRatio={inp.vol_ratio:.2f}x")
 
     momentum_score = _weighted([
-        (rsi_score, cfg.w_mom_rsi),
-        (cci_score, cfg.w_mom_cci),
-        (adx_score, cfg.w_mom_adx),
-        (vol_score, cfg.w_mom_volume),
+        (rsi_score,   cfg.w_mom_rsi),
+        (cci_score,   cfg.w_mom_cci),
+        (adx_score,   cfg.w_mom_adx),
+        (vol_score,   cfg.w_mom_volume),
+        (ride_score,  cfg.w_mom_ema_ride),
     ])
 
     logger.info("[DORE:%s] Stage3b IntradayMomentum(%s) score=%.1f", inp.symbol, direction, momentum_score)
@@ -595,6 +751,61 @@ def stage4b_option_entry_quality(
 
 
 # ══════════════════════════════════════════════════════════════════
+#  STAGE 4c — IV / VIX PRICING HEALTH
+# ══════════════════════════════════════════════════════════════════
+
+def stage4c_iv_health(inp: DOREInput, cfg: DORESettings) -> tuple[float, list[str], bool]:
+    """Score the volatility backdrop: is IV normal/cheap (clean premium,
+    room to expand) or already rich (crush risk)? Is India VIX supporting
+    a clean directional expansion, or too compressed to trend?
+
+    Returns (iv_health_score, reasons, hard_crush_risk). A flagged
+    `event_risk_today` (results/RBI/Fed/budget-type event) is treated as
+    a HARD crush-risk regardless of the numeric IV reading — a vol event
+    can erase an option buyer's edge in one candle via IV collapse even
+    when the direction call was completely correct.
+    """
+    reasons: list[str] = []
+    crush_risk = False
+
+    if inp.event_risk_today:
+        crush_risk = True
+        reasons.append("Event-risk flagged today (earnings/RBI/Fed/budget-type event) — IV crush risk")
+
+    if inp.iv_percentile is not None:
+        iv_score = _pct_score(inp.iv_percentile, cfg.iv_percentile_expensive_max * 1.3, cfg.iv_percentile_cheap_min)
+        reasons.append(f"IV percentile={inp.iv_percentile:.0f}")
+        if inp.iv_percentile >= cfg.iv_percentile_expensive_max:
+            reasons.append("IV rich vs its own recent range — premium expensive, crush risk on any calm-down")
+            if inp.iv_percentile >= 90.0:
+                crush_risk = True
+    else:
+        iv_score = 60.0
+        reasons.append("IV percentile unavailable — treated as mildly favourable")
+
+    if inp.india_vix > 0:
+        if inp.india_vix < cfg.vix_compressed_max:
+            vix_score = _pct_score(inp.india_vix, cfg.vix_compressed_max * 0.5, cfg.vix_compressed_max)
+            reasons.append(f"India VIX={inp.india_vix:.1f} — compressed, clean directional expansion less likely")
+        elif inp.india_vix > cfg.vix_elevated_min:
+            vix_score = _pct_score(inp.india_vix, cfg.vix_elevated_min * 1.6, cfg.vix_elevated_min)
+            reasons.append(f"India VIX={inp.india_vix:.1f} — elevated, fear/event regime, widen stops")
+        else:
+            vix_score = 80.0
+            reasons.append(f"India VIX={inp.india_vix:.1f} — normal regime")
+    else:
+        vix_score = 60.0
+        reasons.append("India VIX not supplied — treated as mildly favourable")
+
+    iv_health_score = _weighted([(iv_score, 55.0), (vix_score, 45.0)])
+    if crush_risk:
+        iv_health_score = min(iv_health_score, 30.0)
+
+    logger.info("[DORE:%s] Stage4c IVHealth score=%.1f crush_risk=%s", inp.symbol, iv_health_score, crush_risk)
+    return iv_health_score, reasons, crush_risk
+
+
+# ══════════════════════════════════════════════════════════════════
 #  STAGE 5 — DECISION ENGINE  (the decision tree)
 # ══════════════════════════════════════════════════════════════════
 
@@ -608,6 +819,9 @@ def stage5_decision(
     downside_score: float,
     resistance: float,
     support: float,
+    mtf_conflict: bool = False,
+    component_score: float = 50.0,
+    iv_crush_risk: bool = False,
 ) -> tuple[str, Optional[str], Optional[float], float, float, float, float, list[str], list[str]]:
     """Deterministic decision tree. Returns
     (recommendation, direction, suggested_strike, premium_quality_score,
@@ -621,15 +835,16 @@ def stage5_decision(
 
     1. EXISTING POSITION?
          └─ Exhaustion high OR momentum reversing/fading OR near OI wall
-              -> BOOK_{CE,PE}_PROFITS
+              OR IV-crush risk just appeared -> BOOK_{CE,PE}_PROFITS
          └─ else -> HOLD_{CE,PE}
-    2. NO POSITION, bias == NEUTRAL or OI conflicts with bias
-              -> WAIT
+    2. NO POSITION, bias == NEUTRAL, MTF conflicts, IV-crush risk flagged,
+       or OI conflicts with bias -> WAIT
     3. NO POSITION, bias BULLISH (mirror for BEARISH):
          a. Trend EXTENDED or Premium expensive or Corridor tight or OEQ low
               -> WAIT
          b. OI confirms + Premium healthy + Corridor OK + OEQ passes
-              + Leadership/Conviction/EntryQuality/Freshness all pass
+              + Leadership/Conviction/EntryQuality/Freshness/Component
+              strength all pass
               -> if price already through resistance -> BUY_CE_NOW
                  else                                 -> BUY_CE_BREAKOUT
          c. otherwise -> NO_TRADE
@@ -663,7 +878,7 @@ def stage5_decision(
             or (direction == "PE" and bias_label == "BULLISH")
         )
 
-        if near_wall or exhaustion_high or momentum_fading or oi_reversal:
+        if near_wall or exhaustion_high or momentum_fading or oi_reversal or iv_crush_risk:
             rec = BOOK_CE_PROFITS if direction == "CE" else BOOK_PE_PROFITS
             if near_wall:
                 reasons.append("Price at/near OI wall — take profits")
@@ -675,13 +890,16 @@ def stage5_decision(
                                 f"({cfg.intraday_momentum_score_min}) — momentum fading")
             if oi_reversal:
                 reasons.append("OI structure has reversed against the open position")
+            if iv_crush_risk:
+                reasons.append("IV-crush risk flagged (event risk / rich IV) — protect gains")
             strike = inp.atm_strike
             logger.info("[DORE:%s] Stage5 decision=%s (managing position)", inp.symbol, rec)
             return (rec, direction, strike, premium_quality_score, corridor_score,
                     momentum_score, oeq_score, reasons, warnings)
 
         rec = HOLD_CE if direction == "CE" else HOLD_PE
-        reasons.append("Position intact: no wall proximity, exhaustion, momentum fade, or OI reversal trigger")
+        reasons.append("Position intact: no wall proximity, exhaustion, momentum fade, IV-crush, "
+                        "or OI reversal trigger")
         strike = inp.atm_strike
         logger.info("[DORE:%s] Stage5 decision=%s (managing position)", inp.symbol, rec)
         return (rec, direction, strike, premium_quality_score, corridor_score,
@@ -690,6 +908,22 @@ def stage5_decision(
     # ── Branch 2: no position, deciding whether to enter ────────
     if bias_label == "NEUTRAL":
         reasons.append("Market Bias NEUTRAL — no directional edge")
+        corridor_score = _corridor_score(cfg, None, upside_score, downside_score)
+        momentum_score, m_reasons = stage3b_intraday_momentum(inp, cfg, None)
+        oeq_score, _ = stage4b_option_entry_quality(cfg, oi_score, premium_quality_score, corridor_score, momentum_score)
+        return (WAIT, None, None, premium_quality_score, corridor_score,
+                momentum_score, oeq_score, reasons, warnings)
+
+    if mtf_conflict:
+        reasons.append("Higher-timeframe trend conflicts with this bias — trapped-range risk, no entry")
+        corridor_score = _corridor_score(cfg, None, upside_score, downside_score)
+        momentum_score, m_reasons = stage3b_intraday_momentum(inp, cfg, None)
+        oeq_score, _ = stage4b_option_entry_quality(cfg, oi_score, premium_quality_score, corridor_score, momentum_score)
+        return (WAIT, None, None, premium_quality_score, corridor_score,
+                momentum_score, oeq_score, reasons, warnings)
+
+    if iv_crush_risk and cfg.event_risk_forces_wait:
+        reasons.append("IV-crush risk flagged (event risk / rich IV) — sitting out regardless of setup quality")
         corridor_score = _corridor_score(cfg, None, upside_score, downside_score)
         momentum_score, m_reasons = stage3b_intraday_momentum(inp, cfg, None)
         oeq_score, _ = stage4b_option_entry_quality(cfg, oi_score, premium_quality_score, corridor_score, momentum_score)
@@ -719,10 +953,12 @@ def stage5_decision(
     corridor_tight = corridor_score < cfg.corridor_score_min
     momentum_weak = momentum_score < cfg.intraday_momentum_score_min
     oeq_low = oeq_score < cfg.oeq_score_min
+    component_weak = component_score < cfg.component_strength_score_min
     low_conviction = (
         inp.leadership < cfg.decision_leadership_min
         or inp.conviction < cfg.decision_conviction_min
         or inp.entry_quality < cfg.decision_entry_quality_min
+        or component_weak
     )
 
     if trend_extended:
@@ -737,8 +973,11 @@ def stage5_decision(
                          f"({cfg.intraday_momentum_score_min}) — momentum not confirming yet")
     if oeq_low:
         warnings.append(f"OEQ={oeq_score:.0f} below floor ({cfg.oeq_score_min}) — options-side entry not justified")
+    if component_weak:
+        warnings.append(f"Component Strength={component_score:.0f} below floor "
+                         f"({cfg.component_strength_score_min}) — heavyweights not backing this move")
     if low_conviction:
-        warnings.append("Leadership/Conviction/Entry Quality below decision thresholds")
+        warnings.append("Leadership/Conviction/Entry Quality/Component Strength below decision thresholds")
     if inp.trend_freshness < cfg.decision_freshness_min:
         warnings.append(f"Trend Freshness={inp.trend_freshness:.0f} below floor "
                          f"({cfg.decision_freshness_min}) — trend may be stale")
@@ -754,11 +993,12 @@ def stage5_decision(
         and inp.conviction >= cfg.decision_conviction_min
         and inp.entry_quality >= cfg.decision_entry_quality_min
         and inp.trend_freshness >= cfg.decision_freshness_min
+        and not component_weak
     )
 
     if oi_confirms and quality_ok:
         reasons.append(f"OI confirms {bias_label} bias, premium healthy, corridor open, OEQ={oeq_score:.0f} passes, "
-                        f"quality scores pass thresholds")
+                        f"heavyweights aligned, quality scores pass thresholds")
         broke_resistance = direction == "CE" and inp.price > resistance
         broke_support    = direction == "PE" and inp.price < support
         if broke_resistance or broke_support:
@@ -781,6 +1021,64 @@ def stage5_decision(
 
 
 # ══════════════════════════════════════════════════════════════════
+#  STAGE 5b — STRIKE & EXPIRY SELECTION
+# ══════════════════════════════════════════════════════════════════
+
+def stage5b_strike_and_expiry(
+    inp: DOREInput,
+    cfg: DORESettings,
+    direction: Optional[str],
+    intraday_momentum_score: float,
+    iv_crush_risk: bool,
+) -> tuple[Optional[str], Optional[str], list[str]]:
+    """Pick ATM vs ITM strike — targeting Delta 0.55-0.70 for a healthy
+    Delta that mitigates theta decay — and current-week vs next-week
+    expiry: current week only if momentum is genuinely strong AND
+    days-to-expiry is short AND there's no IV-crush risk in play.
+    Returns (recommended_strike_type, recommended_expiry, reasons).
+    """
+    reasons: list[str] = []
+    if direction is None:
+        return None, None, reasons
+
+    delta = inp.ce_delta if direction == "CE" else inp.pe_delta
+    if delta is not None:
+        d = abs(delta)
+        if cfg.target_delta_min <= d <= cfg.target_delta_max:
+            strike_type = "ATM"
+            reasons.append(f"Delta={d:.2f} already in the {cfg.target_delta_min:.2f}-"
+                            f"{cfg.target_delta_max:.2f} band — ATM strike")
+        elif d < cfg.target_delta_min:
+            strike_type = "ITM"
+            reasons.append(f"Delta={d:.2f} below target band — move one strike ITM to lift Delta into "
+                            f"{cfg.target_delta_min:.2f}-{cfg.target_delta_max:.2f}")
+        else:
+            strike_type = "ATM"
+            reasons.append(f"Delta={d:.2f} already above target band — stay ATM, don't go further ITM")
+    else:
+        strike_type = "ATM"
+        reasons.append("Option Delta not supplied — defaulting to ATM")
+
+    scalp_ok = (
+        inp.days_to_expiry <= cfg.expiry_days_scalp_max
+        and intraday_momentum_score >= cfg.momentum_score_scalp_min
+        and not iv_crush_risk
+    )
+    if scalp_ok:
+        expiry = "CURRENT_WEEK"
+        reasons.append(f"{inp.days_to_expiry}d to expiry + strong Intraday Momentum "
+                        f"({intraday_momentum_score:.0f}) — current-week scalp justified")
+    else:
+        expiry = "NEXT_WEEK"
+        if inp.days_to_expiry <= cfg.expiry_days_scalp_max:
+            reasons.append(f"{inp.days_to_expiry}d to expiry but momentum/IV conditions don't justify the "
+                            f"theta risk — use next week to protect capital")
+        else:
+            reasons.append(f"{inp.days_to_expiry}d to expiry — comfortably outside the scalp window")
+    return strike_type, expiry, reasons
+
+
+# ══════════════════════════════════════════════════════════════════
 #  STAGE 6 — CONFIDENCE
 # ══════════════════════════════════════════════════════════════════
 
@@ -792,6 +1090,9 @@ def stage6_confidence(
     corridor_score: float,
     oeq_score: float,
     intraday_momentum_score: float,
+    mtf_score: float,
+    component_score: float,
+    iv_health_score: float,
     breadth: Optional[float],
 ) -> float:
     # Bias score is centred at 50 = neutral; rescale to a 0-100 "how
@@ -806,6 +1107,9 @@ def stage6_confidence(
         (corridor_score,           cfg.w_conf_corridor),
         (oeq_score,                cfg.w_conf_oeq),
         (intraday_momentum_score,  cfg.w_conf_momentum),
+        (mtf_score,                cfg.w_conf_mtf),
+        (component_score,          cfg.w_conf_component),
+        (iv_health_score,          cfg.w_conf_iv_health),
         (breadth_score,            cfg.w_conf_breadth),
     ])
     logger.info("Stage6 Confidence=%.1f", confidence)
@@ -823,17 +1127,26 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     cfg = settings or DORESettings.from_dict(DORE_DEFAULTS)
 
     bias_score, bias_label, bias_reasons = stage1_market_bias(inp, cfg)
+    mtf_score, mtf_reasons, mtf_conflict = stage1b_mtf_confirmation(inp, cfg, bias_label)
+    component_score, component_reasons = stage1c_component_strength(inp, cfg, bias_label)
     oi_score, oi_reasons = stage2_oi_structure(inp, cfg, bias_label)
     upside_score, downside_score, expected_move, resistance, support, corridor_reasons = stage4_oi_corridor(inp, cfg)
+    iv_health_score, iv_reasons, iv_crush_risk = stage4c_iv_health(inp, cfg)
 
     (recommendation, direction, strike, premium_quality_score, corridor_score,
      intraday_momentum_score, oeq_score, dec_reasons, warnings) = stage5_decision(
         inp, cfg, bias_score, bias_label, oi_score, upside_score, downside_score, resistance, support,
+        mtf_conflict=mtf_conflict, component_score=component_score, iv_crush_risk=iv_crush_risk,
+    )
+
+    strike_type, recommended_expiry, strike_reasons = stage5b_strike_and_expiry(
+        inp, cfg, direction, intraday_momentum_score, iv_crush_risk,
     )
 
     confidence = stage6_confidence(
         cfg, bias_score, oi_score, premium_quality_score, corridor_score,
-        oeq_score, intraday_momentum_score, inp.market_breadth,
+        oeq_score, intraday_momentum_score, mtf_score, component_score, iv_health_score,
+        inp.market_breadth,
     )
 
     # Confidence floor: even a technically-passing decision gets
@@ -846,7 +1159,12 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
                      inp.symbol, recommendation, confidence, cfg.min_confidence_to_act)
         recommendation = WAIT
 
-    reasons = bias_reasons + oi_reasons + corridor_reasons + dec_reasons
+    if iv_health_score < cfg.iv_health_score_min:
+        warnings.append(f"IV Health={iv_health_score:.0f} below floor ({cfg.iv_health_score_min}) — "
+                         f"volatility backdrop not ideal for clean directional expansion")
+
+    reasons = (bias_reasons + mtf_reasons + component_reasons + oi_reasons
+               + corridor_reasons + iv_reasons + dec_reasons + strike_reasons)
 
     result = DOREResult(
         recommendation=recommendation,
@@ -858,6 +1176,13 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         intraday_momentum_score=round(intraday_momentum_score, 1),
         corridor_score=round(corridor_score, 1),
         oeq_score=round(oeq_score, 1),
+        mtf_score=round(mtf_score, 1),
+        component_strength_score=round(component_score, 1),
+        iv_health_score=round(iv_health_score, 1),
+        iv_crush_risk=iv_crush_risk,
+        recommended_strike_type=strike_type,
+        recommended_expiry=recommended_expiry,
+        conviction_score_10=round(confidence / 10.0, 1),
         suggested_direction=direction,
         suggested_strike=strike,
         expected_move=expected_move,
@@ -868,10 +1193,12 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     )
 
     logger.info(
-        "[DORE:%s] FINAL recommendation=%s confidence=%.1f bias=%s(%.1f) "
-        "oi_structure=%.1f premium_quality=%.1f intraday_momentum=%.1f corridor=%.1f oeq=%.1f",
-        inp.symbol, result.recommendation, result.confidence, bias_label, bias_score,
-        oi_score, premium_quality_score, intraday_momentum_score, corridor_score, oeq_score,
+        "[DORE:%s] FINAL recommendation=%s confidence=%.1f (%.1f/10) bias=%s(%.1f) "
+        "oi_structure=%.1f premium_quality=%.1f intraday_momentum=%.1f corridor=%.1f oeq=%.1f "
+        "mtf=%.1f component=%.1f iv_health=%.1f crush_risk=%s",
+        inp.symbol, result.recommendation, result.confidence, result.conviction_score_10,
+        bias_label, bias_score, oi_score, premium_quality_score, intraday_momentum_score,
+        corridor_score, oeq_score, mtf_score, component_score, iv_health_score, iv_crush_risk,
     )
     return result
 

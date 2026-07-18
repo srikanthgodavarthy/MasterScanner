@@ -89,10 +89,11 @@ DORE_DEFAULTS: dict = {
     "momentum_vol_ratio_min":     1.0,    # volume ratio floor for "participation confirmed"
     "intraday_momentum_score_min": 50.0,  # Intraday Momentum >= this = momentum still supports entry
     # Stage-3b sub-weights (must sum to 100)
-    "w_mom_rsi":                  35.0,
-    "w_mom_cci":                  25.0,
-    "w_mom_adx":                  20.0,
-    "w_mom_volume":               20.0,
+    "w_mom_rsi":                  30.0,
+    "w_mom_cci":                  20.0,
+    "w_mom_adx":                  15.0,
+    "w_mom_volume":               15.0,
+    "w_mom_ema_ride":             20.0,   # EMA9/21 "riding vs chopping" factor
 
     # ── Stage 5: Decision Engine thresholds ─────────────────────
     "decision_leadership_min":   65.0,   # Leadership Score floor for BUY_*_NOW
@@ -114,14 +115,41 @@ DORE_DEFAULTS: dict = {
     "w_oeq_corridor":             20.0,
     "w_oeq_intraday_momentum":    25.0,
 
+    # ── Stage 1b: Multi-Timeframe (MTF) Confirmation ────────────
+    "mtf_agree_score":            100.0,
+    "mtf_unknown_score":           50.0,
+    "mtf_conflict_score":           0.0,
+    "mtf_conflict_blocks_entry":   True,   # HTF trend contradicts Stage-1 bias -> hard WAIT
+
+    # ── Stage 1c: Component / Heavyweight Strength ──────────────
+    "component_agree_threshold":       55.0,  # a constituent scoring >= this "agrees" with a bullish bias
+    "component_strength_score_min":    50.0,  # floor; below this -> warning + blocks entry (soft gate)
+
+    # ── Stage 4c: IV / VIX Pricing Health ────────────────────────
+    "iv_percentile_expensive_max": 75.0,   # IV percentile above this = rich, cut score / crush risk near 90+
+    "iv_percentile_cheap_min":     15.0,   # IV percentile below this = premium is cheap
+    "vix_compressed_max":          11.0,   # India VIX below this = compressed, clean expansion less likely
+    "vix_elevated_min":            22.0,   # India VIX above this = event/fear regime, widen stops
+    "iv_health_score_min":         45.0,   # informational floor (soft; feeds warnings/confidence, not a hard gate)
+    "event_risk_forces_wait":      True,   # event_risk_today=True -> hard WAIT regardless of setup quality
+
+    # ── Stage 5b: Strike & Expiry Selection ──────────────────────
+    "target_delta_min":            0.55,
+    "target_delta_max":            0.70,
+    "expiry_days_scalp_max":         1,    # days-to-expiry <= this = eligible for current-week scalping
+    "momentum_score_scalp_min":    70.0,   # Intraday Momentum floor required to justify 0-1 DTE scalping
+
     # ── Stage 6: Confidence blend weights (must sum to 100) ─────
-    "w_conf_market_bias":        20.0,
-    "w_conf_oi":                 20.0,
-    "w_conf_premium":            15.0,
-    "w_conf_corridor":           15.0,
-    "w_conf_oeq":                15.0,
-    "w_conf_momentum":           10.0,
-    "w_conf_breadth":             5.0,
+    "w_conf_market_bias":        15.0,
+    "w_conf_oi":                 15.0,
+    "w_conf_premium":            10.0,
+    "w_conf_corridor":           10.0,
+    "w_conf_oeq":                10.0,
+    "w_conf_momentum":            8.0,
+    "w_conf_breadth":             4.0,
+    "w_conf_mtf":                 8.0,
+    "w_conf_component":           7.0,
+    "w_conf_iv_health":          13.0,
 
     # ── Misc ─────────────────────────────────────────────────────
     "strike_step":                50.0,  # index strike interval (NIFTY=50, BANKNIFTY=100)
@@ -189,10 +217,11 @@ class DORESettings:
     momentum_adx_strong_min: float = 20.0
     momentum_vol_ratio_min: float = 1.0
     intraday_momentum_score_min: float = 50.0
-    w_mom_rsi: float = 35.0
-    w_mom_cci: float = 25.0
-    w_mom_adx: float = 20.0
-    w_mom_volume: float = 20.0
+    w_mom_rsi: float = 30.0
+    w_mom_cci: float = 20.0
+    w_mom_adx: float = 15.0
+    w_mom_volume: float = 15.0
+    w_mom_ema_ride: float = 20.0
 
     decision_leadership_min: float = 65.0
     decision_conviction_min: float = 60.0
@@ -207,13 +236,36 @@ class DORESettings:
     w_oeq_corridor: float = 20.0
     w_oeq_intraday_momentum: float = 25.0
 
-    w_conf_market_bias: float = 20.0
-    w_conf_oi: float = 20.0
-    w_conf_premium: float = 15.0
-    w_conf_corridor: float = 15.0
-    w_conf_oeq: float = 15.0
-    w_conf_momentum: float = 10.0
-    w_conf_breadth: float = 5.0
+    mtf_agree_score: float = 100.0
+    mtf_unknown_score: float = 50.0
+    mtf_conflict_score: float = 0.0
+    mtf_conflict_blocks_entry: bool = True
+
+    component_agree_threshold: float = 55.0
+    component_strength_score_min: float = 50.0
+
+    iv_percentile_expensive_max: float = 75.0
+    iv_percentile_cheap_min: float = 15.0
+    vix_compressed_max: float = 11.0
+    vix_elevated_min: float = 22.0
+    iv_health_score_min: float = 45.0
+    event_risk_forces_wait: bool = True
+
+    target_delta_min: float = 0.55
+    target_delta_max: float = 0.70
+    expiry_days_scalp_max: int = 1
+    momentum_score_scalp_min: float = 70.0
+
+    w_conf_market_bias: float = 15.0
+    w_conf_oi: float = 15.0
+    w_conf_premium: float = 10.0
+    w_conf_corridor: float = 10.0
+    w_conf_oeq: float = 10.0
+    w_conf_momentum: float = 8.0
+    w_conf_breadth: float = 4.0
+    w_conf_mtf: float = 8.0
+    w_conf_component: float = 7.0
+    w_conf_iv_health: float = 13.0
 
     strike_step: float = 50.0
     min_confidence_to_act: float = 55.0
