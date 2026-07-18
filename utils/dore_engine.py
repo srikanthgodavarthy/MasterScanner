@@ -19,12 +19,21 @@ recommendations:
 
 Architecture (see docs/DORE_ARCHITECTURE.md for the full diagram):
 
-    Stage 1  Market Bias        -> bias direction + Market Bias Score (0-100)
-    Stage 2  OI Structure       -> does the option chain confirm the bias?
-    Stage 3  Premium Evaluation -> is the trade priced sanely / liquid?
-    Stage 4  OI Corridor        -> is there room to run before the next OI wall?
-    Stage 5  Decision Engine    -> ONE recommendation, deterministically
-    Stage 6  Confidence         -> 0-100 confidence blended from stages 1-4
+    Stage 1   Market Bias         -> bias direction + Market Bias Score (0-100)
+    Stage 2   OI Structure        -> does the option chain confirm the bias?
+    Stage 3   Premium Quality     -> is the trade priced sanely / liquid?
+    Stage 3b  Intraday Momentum   -> is short-term momentum still fresh, or fading?
+    Stage 4   Corridor Score      -> is there room to run before the next OI wall?
+    Stage 4b  Option Entry Quality (OEQ) -> blend of the 4 scores above into one
+                                     options-side "is THIS entry good right now" gate
+    Stage 5   Decision Engine     -> ONE recommendation, deterministically
+    Stage 6   Confidence          -> 0-100 confidence blended from stages 1-4b
+
+DORE's five headline sub-scores — the ones meant to line up 1:1 with the
+"Options Intelligence Engine" box in MasterScanner's architecture diagram
+(OI Structure / Premium Quality / OEQ / Corridor Score / Intraday
+Momentum) — are all first-class fields on DOREResult: oi_structure_score,
+premium_quality_score, oeq_score, corridor_score, intraday_momentum_score.
 
 Every threshold is read from utils.dore_settings.DORESettings — nothing
 here is hardcoded, so the whole engine can be re-tuned from one config
@@ -149,9 +158,14 @@ class DOREResult:
     confidence:        float = 0.0
     market_bias:       float = 50.0     # 0-100 (Stage 1 score)
     market_bias_label: str = "NEUTRAL"  # BULLISH | BEARISH | NEUTRAL
-    oi_score:          float = 0.0
-    premium_score:     float = 0.0
-    corridor_score:    float = 0.0
+
+    # ── The 5 Options Intelligence sub-scores (see module docstring) ──
+    oi_structure_score:       float = 0.0   # Stage 2  — OI Structure
+    premium_quality_score:    float = 0.0   # Stage 3  — Premium Quality
+    intraday_momentum_score:  float = 0.0   # Stage 3b — Intraday Momentum
+    corridor_score:           float = 0.0   # Stage 4  — Corridor Score
+    oeq_score:                float = 0.0   # Stage 4b — Option Entry Quality (OEQ)
+
     suggested_direction: Optional[str] = None   # "CE" | "PE" | None
     suggested_strike:  Optional[float] = None
     expected_move:     float = 0.0
@@ -162,7 +176,12 @@ class DOREResult:
 
     def as_dict(self) -> dict:
         from dataclasses import asdict
-        return asdict(self)
+        d = asdict(self)
+        # Legacy aliases — some older callers/persisted rows may still read
+        # the pre-rename keys; keep them mirrored so nothing breaks silently.
+        d["oi_score"] = d["oi_structure_score"]
+        d["premium_score"] = d["premium_quality_score"]
+        return d
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -364,10 +383,10 @@ def stage2_oi_structure(inp: DOREInput, cfg: DORESettings, bias_label: str) -> t
 
 
 # ══════════════════════════════════════════════════════════════════
-#  STAGE 3 — PREMIUM EVALUATION
+#  STAGE 3 — PREMIUM QUALITY
 # ══════════════════════════════════════════════════════════════════
 
-def stage3_premium_evaluation(inp: DOREInput, cfg: DORESettings, direction: Optional[str]) -> tuple[float, list[str]]:
+def stage3_premium_quality(inp: DOREInput, cfg: DORESettings, direction: Optional[str]) -> tuple[float, list[str]]:
     """Reject/penalise expensive or illiquid trades. `direction` is "CE"
     or "PE" (whichever leg Stage 5 is currently evaluating) or None for
     a direction-agnostic read used only for the WAIT/NO_TRADE checks.
@@ -411,20 +430,79 @@ def stage3_premium_evaluation(inp: DOREInput, cfg: DORESettings, direction: Opti
         spread_score = 60.0
         reasons.append("Bid/Ask spread unavailable — treated as neutral")
 
-    premium_score = _weighted([
+    premium_quality_score = _weighted([
         (value_score,      cfg.w_premium_value),
         (expansion_score,  cfg.w_premium_expansion),
         (liquidity_score,  cfg.w_premium_liquidity),
         (spread_score,     cfg.w_premium_spread),
     ])
 
-    logger.info("[DORE:%s] Stage3 Premium(%s) score=%.1f", inp.symbol, direction, premium_score)
+    logger.info("[DORE:%s] Stage3 PremiumQuality(%s) score=%.1f", inp.symbol, direction, premium_quality_score)
     logger.debug("[DORE:%s] Stage3 reasons=%s", inp.symbol, reasons)
-    return premium_score, reasons
+    return premium_quality_score, reasons
+
+
+# Back-compat alias — old name, in case anything still imports it directly.
+stage3_premium_evaluation = stage3_premium_quality
 
 
 # ══════════════════════════════════════════════════════════════════
-#  STAGE 4 — OI CORRIDOR
+#  STAGE 3b — INTRADAY MOMENTUM
+# ══════════════════════════════════════════════════════════════════
+
+def stage3b_intraday_momentum(inp: DOREInput, cfg: DORESettings, direction: Optional[str]) -> tuple[float, list[str]]:
+    """Score whether short-term momentum (RSI zone, CCI, ADX strength,
+    volume participation) actually supports taking `direction` ("CE" or
+    "PE") RIGHT NOW.
+
+    This is deliberately distinct from Stage 1's Market Bias: Market Bias
+    blends Leadership/Conviction/EMA-structure — a slower, setup-quality
+    read. Intraday Momentum is the fast-moving read of whether momentum
+    is still fresh and accelerating, or already overbought/oversold and
+    fading — the same question an options desk asks before hitting the
+    buy button on an already-extended move.
+
+    direction=None (used only on early WAIT paths, before a direction has
+    been picked) returns a direction-agnostic read for reporting only —
+    no decision is ever gated on the None case.
+    """
+    reasons: list[str] = []
+
+    if direction == "CE":
+        rsi_score = _pct_score(inp.rsi, 35.0, cfg.momentum_rsi_bull_sweet_max)
+        if inp.rsi > cfg.momentum_rsi_bull_sweet_max + 8.0:
+            rsi_score = _clamp(rsi_score - 30.0)
+            reasons.append(f"RSI={inp.rsi:.1f} deep overbought — momentum may be exhausted")
+        cci_score = _pct_score(inp.cci, 0.0, cfg.momentum_cci_bull_min * 2.0)
+    elif direction == "PE":
+        rsi_score = _pct_score(inp.rsi, 65.0, cfg.momentum_rsi_bear_sweet_min)
+        if inp.rsi < cfg.momentum_rsi_bear_sweet_min - 8.0:
+            rsi_score = _clamp(rsi_score - 30.0)
+            reasons.append(f"RSI={inp.rsi:.1f} deep oversold — momentum may be exhausted")
+        cci_score = _pct_score(inp.cci, 0.0, cfg.momentum_cci_bear_max * 2.0)
+    else:
+        rsi_score = _pct_score(inp.rsi, 40.0, 60.0)
+        cci_score = 50.0
+
+    adx_score = _pct_score(inp.adx, 10.0, max(cfg.momentum_adx_strong_min * 1.5, 25.0))
+    vol_score = _pct_score(inp.vol_ratio, cfg.momentum_vol_ratio_min * 0.5, cfg.momentum_vol_ratio_min * 1.5)
+
+    reasons.append(f"RSI={inp.rsi:.1f}, CCI={inp.cci:.0f}, ADX={inp.adx:.1f}, VolRatio={inp.vol_ratio:.2f}x")
+
+    momentum_score = _weighted([
+        (rsi_score, cfg.w_mom_rsi),
+        (cci_score, cfg.w_mom_cci),
+        (adx_score, cfg.w_mom_adx),
+        (vol_score, cfg.w_mom_volume),
+    ])
+
+    logger.info("[DORE:%s] Stage3b IntradayMomentum(%s) score=%.1f", inp.symbol, direction, momentum_score)
+    logger.debug("[DORE:%s] Stage3b reasons=%s", inp.symbol, reasons)
+    return momentum_score, reasons
+
+
+# ══════════════════════════════════════════════════════════════════
+#  STAGE 4 — CORRIDOR SCORE
 # ══════════════════════════════════════════════════════════════════
 
 def stage4_oi_corridor(inp: DOREInput, cfg: DORESettings) -> tuple[float, float, float, float, float, list[str]]:
@@ -480,6 +558,43 @@ def _corridor_score(cfg: DORESettings, direction: Optional[str],
 
 
 # ══════════════════════════════════════════════════════════════════
+#  STAGE 4b — OPTION ENTRY QUALITY (OEQ)
+# ══════════════════════════════════════════════════════════════════
+
+def stage4b_option_entry_quality(
+    cfg: DORESettings,
+    oi_structure_score: float,
+    premium_quality_score: float,
+    corridor_score: float,
+    intraday_momentum_score: float,
+) -> tuple[float, list[str]]:
+    """Blend the other 4 Options Intelligence sub-scores (OI Structure,
+    Premium Quality, Corridor Score, Intraday Momentum) into ONE
+    'Option Entry Quality' (OEQ) read.
+
+    This is the options-side analogue of MasterScanner's equity Entry
+    Quality (inp.entry_quality): equity Entry Quality answers "is the
+    underlying setup good?"; OEQ answers "is THIS option leg — at this
+    strike/expiry, priced the way it's priced, with the chain and the
+    corridor and momentum looking the way they look, right now — actually
+    worth entering?" Stage 5 gates BUY_*_NOW / BUY_*_BREAKOUT on both.
+    """
+    reasons: list[str] = []
+    oeq_score = _weighted([
+        (oi_structure_score,      cfg.w_oeq_oi_structure),
+        (premium_quality_score,   cfg.w_oeq_premium_quality),
+        (corridor_score,          cfg.w_oeq_corridor),
+        (intraday_momentum_score, cfg.w_oeq_intraday_momentum),
+    ])
+    reasons.append(
+        f"OEQ blend: OI Structure={oi_structure_score:.0f}, Premium Quality={premium_quality_score:.0f}, "
+        f"Corridor={corridor_score:.0f}, Intraday Momentum={intraday_momentum_score:.0f} -> OEQ={oeq_score:.0f}"
+    )
+    logger.info("[DORE] Stage4b OEQ=%.1f", oeq_score)
+    return oeq_score, reasons
+
+
+# ══════════════════════════════════════════════════════════════════
 #  STAGE 5 — DECISION ENGINE  (the decision tree)
 # ══════════════════════════════════════════════════════════════════
 
@@ -493,9 +608,10 @@ def stage5_decision(
     downside_score: float,
     resistance: float,
     support: float,
-) -> tuple[str, Optional[str], Optional[float], float, float, list[str], list[str]]:
+) -> tuple[str, Optional[str], Optional[float], float, float, float, float, list[str], list[str]]:
     """Deterministic decision tree. Returns
-    (recommendation, direction, suggested_strike, premium_score, corridor_score, reasons, warnings).
+    (recommendation, direction, suggested_strike, premium_quality_score,
+     corridor_score, intraday_momentum_score, oeq_score, reasons, warnings).
 
     `corridor_score` returned here is direction-aware (see `_corridor_score()`):
     a CE trade is gated only on room to the CE wall, a PE trade only on room
@@ -504,15 +620,15 @@ def stage5_decision(
     Decision tree (evaluated top to bottom, first match wins):
 
     1. EXISTING POSITION?
-         └─ Exhaustion high OR momentum reversing OR near OI wall
+         └─ Exhaustion high OR momentum reversing/fading OR near OI wall
               -> BOOK_{CE,PE}_PROFITS
          └─ else -> HOLD_{CE,PE}
     2. NO POSITION, bias == NEUTRAL or OI conflicts with bias
               -> WAIT
     3. NO POSITION, bias BULLISH (mirror for BEARISH):
-         a. Trend EXTENDED or Premium expensive or Corridor tight
+         a. Trend EXTENDED or Premium expensive or Corridor tight or OEQ low
               -> WAIT
-         b. OI confirms + Premium healthy + Corridor OK
+         b. OI confirms + Premium healthy + Corridor OK + OEQ passes
               + Leadership/Conviction/EntryQuality/Freshness all pass
               -> if price already through resistance -> BUY_CE_NOW
                  else                                 -> BUY_CE_BREAKOUT
@@ -522,63 +638,87 @@ def stage5_decision(
     warnings: list[str] = []
     direction: Optional[str] = None
     strike: Optional[float] = None
-    premium_score = 0.0
+    premium_quality_score = 0.0
 
     # ── Branch 1: managing an existing position ─────────────────
     if inp.in_position and inp.position_side in ("CE", "PE"):
         direction = inp.position_side
         corridor_score = _corridor_score(cfg, direction, upside_score, downside_score)
-        premium_score, p_reasons = stage3_premium_evaluation(inp, cfg, direction)
+        premium_quality_score, p_reasons = stage3_premium_quality(inp, cfg, direction)
         reasons += p_reasons
+        momentum_score, m_reasons = stage3b_intraday_momentum(inp, cfg, direction)
+        reasons += m_reasons
+        oeq_score, oeq_reasons = stage4b_option_entry_quality(
+            cfg, oi_score, premium_quality_score, corridor_score, momentum_score)
+        reasons += oeq_reasons
 
         near_wall = (
             (direction == "CE" and (resistance - inp.price) <= inp.atr * cfg.corridor_near_wall_atr)
             or (direction == "PE" and (inp.price - support) <= inp.atr * cfg.corridor_near_wall_atr)
         )
         exhaustion_high = inp.exhaustion_score >= cfg.decision_exhaustion_book_min
+        momentum_fading = momentum_score < cfg.intraday_momentum_score_min
         oi_reversal = (
             (direction == "CE" and bias_label == "BEARISH")
             or (direction == "PE" and bias_label == "BULLISH")
         )
 
-        if near_wall or exhaustion_high or oi_reversal:
+        if near_wall or exhaustion_high or momentum_fading or oi_reversal:
             rec = BOOK_CE_PROFITS if direction == "CE" else BOOK_PE_PROFITS
             if near_wall:
                 reasons.append("Price at/near OI wall — take profits")
             if exhaustion_high:
                 reasons.append(f"Exhaustion Score={inp.exhaustion_score:.0f} (>= "
                                 f"{cfg.decision_exhaustion_book_min}) — momentum weakening")
+            if momentum_fading:
+                reasons.append(f"Intraday Momentum={momentum_score:.0f} below floor "
+                                f"({cfg.intraday_momentum_score_min}) — momentum fading")
             if oi_reversal:
                 reasons.append("OI structure has reversed against the open position")
             strike = inp.atm_strike
             logger.info("[DORE:%s] Stage5 decision=%s (managing position)", inp.symbol, rec)
-            return rec, direction, strike, premium_score, corridor_score, reasons, warnings
+            return (rec, direction, strike, premium_quality_score, corridor_score,
+                    momentum_score, oeq_score, reasons, warnings)
 
         rec = HOLD_CE if direction == "CE" else HOLD_PE
-        reasons.append("Position intact: no wall proximity, exhaustion, or OI reversal trigger")
+        reasons.append("Position intact: no wall proximity, exhaustion, momentum fade, or OI reversal trigger")
         strike = inp.atm_strike
         logger.info("[DORE:%s] Stage5 decision=%s (managing position)", inp.symbol, rec)
-        return rec, direction, strike, premium_score, corridor_score, reasons, warnings
+        return (rec, direction, strike, premium_quality_score, corridor_score,
+                momentum_score, oeq_score, reasons, warnings)
 
     # ── Branch 2: no position, deciding whether to enter ────────
     if bias_label == "NEUTRAL":
         reasons.append("Market Bias NEUTRAL — no directional edge")
         corridor_score = _corridor_score(cfg, None, upside_score, downside_score)
-        return WAIT, None, None, premium_score, corridor_score, reasons, warnings
+        momentum_score, m_reasons = stage3b_intraday_momentum(inp, cfg, None)
+        oeq_score, _ = stage4b_option_entry_quality(cfg, oi_score, premium_quality_score, corridor_score, momentum_score)
+        return (WAIT, None, None, premium_quality_score, corridor_score,
+                momentum_score, oeq_score, reasons, warnings)
 
     if oi_score <= cfg.oi_conflict_score_max:
         reasons.append(f"OI Structure Score={oi_score:.0f} conflicts with {bias_label} bias")
         corridor_score = _corridor_score(cfg, None, upside_score, downside_score)
-        return WAIT, None, None, premium_score, corridor_score, reasons, warnings
+        momentum_score, m_reasons = stage3b_intraday_momentum(inp, cfg, None)
+        oeq_score, _ = stage4b_option_entry_quality(cfg, oi_score, premium_quality_score, corridor_score, momentum_score)
+        return (WAIT, None, None, premium_quality_score, corridor_score,
+                momentum_score, oeq_score, reasons, warnings)
 
     direction = "CE" if bias_label == "BULLISH" else "PE"
     corridor_score = _corridor_score(cfg, direction, upside_score, downside_score)
-    premium_score, p_reasons = stage3_premium_evaluation(inp, cfg, direction)
+    premium_quality_score, p_reasons = stage3_premium_quality(inp, cfg, direction)
     reasons += p_reasons
+    momentum_score, m_reasons = stage3b_intraday_momentum(inp, cfg, direction)
+    reasons += m_reasons
+    oeq_score, oeq_reasons = stage4b_option_entry_quality(
+        cfg, oi_score, premium_quality_score, corridor_score, momentum_score)
+    reasons += oeq_reasons
 
     trend_extended = (inp.trend_phase or "").upper() == cfg.decision_extended_trend_phase.upper()
-    premium_expensive = premium_score < cfg.premium_score_min
+    premium_expensive = premium_quality_score < cfg.premium_score_min
     corridor_tight = corridor_score < cfg.corridor_score_min
+    momentum_weak = momentum_score < cfg.intraday_momentum_score_min
+    oeq_low = oeq_score < cfg.oeq_score_min
     low_conviction = (
         inp.leadership < cfg.decision_leadership_min
         or inp.conviction < cfg.decision_conviction_min
@@ -588,19 +728,25 @@ def stage5_decision(
     if trend_extended:
         warnings.append(f"Trend Phase={inp.trend_phase} — extended, chase risk")
     if premium_expensive:
-        warnings.append(f"Premium Score={premium_score:.0f} below healthy floor "
+        warnings.append(f"Premium Quality={premium_quality_score:.0f} below healthy floor "
                          f"({cfg.premium_score_min})")
     if corridor_tight:
         warnings.append(f"Corridor Score={corridor_score:.0f} — limited room before next OI wall")
+    if momentum_weak:
+        warnings.append(f"Intraday Momentum={momentum_score:.0f} below floor "
+                         f"({cfg.intraday_momentum_score_min}) — momentum not confirming yet")
+    if oeq_low:
+        warnings.append(f"OEQ={oeq_score:.0f} below floor ({cfg.oeq_score_min}) — options-side entry not justified")
     if low_conviction:
         warnings.append("Leadership/Conviction/Entry Quality below decision thresholds")
     if inp.trend_freshness < cfg.decision_freshness_min:
         warnings.append(f"Trend Freshness={inp.trend_freshness:.0f} below floor "
                          f"({cfg.decision_freshness_min}) — trend may be stale")
 
-    if trend_extended or premium_expensive or corridor_tight:
+    if trend_extended or premium_expensive or corridor_tight or oeq_low:
         reasons.append("One or more entry gates failed — waiting for better structure")
-        return WAIT, direction, None, premium_score, corridor_score, reasons, warnings
+        return (WAIT, direction, None, premium_quality_score, corridor_score,
+                momentum_score, oeq_score, reasons, warnings)
 
     oi_confirms = oi_score >= cfg.oi_confirm_score_min
     quality_ok = (
@@ -611,7 +757,7 @@ def stage5_decision(
     )
 
     if oi_confirms and quality_ok:
-        reasons.append(f"OI confirms {bias_label} bias, premium healthy, corridor open, "
+        reasons.append(f"OI confirms {bias_label} bias, premium healthy, corridor open, OEQ={oeq_score:.0f} passes, "
                         f"quality scores pass thresholds")
         broke_resistance = direction == "CE" and inp.price > resistance
         broke_support    = direction == "PE" and inp.price < support
@@ -624,12 +770,14 @@ def stage5_decision(
             reasons.append(f"Key OI level not yet broken (@{level:.0f}) — wait for confirmation")
         strike = inp.atm_strike
         logger.info("[DORE:%s] Stage5 decision=%s", inp.symbol, rec)
-        return rec, direction, strike, premium_score, corridor_score, reasons, warnings
+        return (rec, direction, strike, premium_quality_score, corridor_score,
+                momentum_score, oeq_score, reasons, warnings)
 
     reasons.append("Setup incomplete: " + ("OI unconfirmed. " if not oi_confirms else "")
                     + ("Quality scores below threshold." if not quality_ok else ""))
     logger.info("[DORE:%s] Stage5 decision=%s", inp.symbol, NO_TRADE)
-    return NO_TRADE, direction, None, premium_score, corridor_score, reasons, warnings
+    return (NO_TRADE, direction, None, premium_quality_score, corridor_score,
+            momentum_score, oeq_score, reasons, warnings)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -640,8 +788,10 @@ def stage6_confidence(
     cfg: DORESettings,
     bias_score: float,
     oi_score: float,
-    premium_score: float,
+    premium_quality_score: float,
     corridor_score: float,
+    oeq_score: float,
+    intraday_momentum_score: float,
     breadth: Optional[float],
 ) -> float:
     # Bias score is centred at 50 = neutral; rescale to a 0-100 "how
@@ -650,11 +800,13 @@ def stage6_confidence(
     breadth_score = _clamp(breadth) if breadth is not None else 50.0
 
     confidence = _weighted([
-        (bias_conviction, cfg.w_conf_market_bias),
-        (oi_score,         cfg.w_conf_oi),
-        (premium_score,    cfg.w_conf_premium),
-        (corridor_score,   cfg.w_conf_corridor),
-        (breadth_score,    cfg.w_conf_breadth),
+        (bias_conviction,          cfg.w_conf_market_bias),
+        (oi_score,                 cfg.w_conf_oi),
+        (premium_quality_score,    cfg.w_conf_premium),
+        (corridor_score,           cfg.w_conf_corridor),
+        (oeq_score,                cfg.w_conf_oeq),
+        (intraday_momentum_score,  cfg.w_conf_momentum),
+        (breadth_score,            cfg.w_conf_breadth),
     ])
     logger.info("Stage6 Confidence=%.1f", confidence)
     return confidence
@@ -665,7 +817,7 @@ def stage6_confidence(
 # ══════════════════════════════════════════════════════════════════
 
 def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOREResult:
-    """Run all six stages and return a single DOREResult. Deterministic:
+    """Run all stages and return a single DOREResult. Deterministic:
     same `inp` + same `settings` always produces the same output.
     """
     cfg = settings or DORESettings.from_dict(DORE_DEFAULTS)
@@ -674,11 +826,15 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     oi_score, oi_reasons = stage2_oi_structure(inp, cfg, bias_label)
     upside_score, downside_score, expected_move, resistance, support, corridor_reasons = stage4_oi_corridor(inp, cfg)
 
-    recommendation, direction, strike, premium_score, corridor_score, dec_reasons, warnings = stage5_decision(
+    (recommendation, direction, strike, premium_quality_score, corridor_score,
+     intraday_momentum_score, oeq_score, dec_reasons, warnings) = stage5_decision(
         inp, cfg, bias_score, bias_label, oi_score, upside_score, downside_score, resistance, support,
     )
 
-    confidence = stage6_confidence(cfg, bias_score, oi_score, premium_score, corridor_score, inp.market_breadth)
+    confidence = stage6_confidence(
+        cfg, bias_score, oi_score, premium_quality_score, corridor_score,
+        oeq_score, intraday_momentum_score, inp.market_breadth,
+    )
 
     # Confidence floor: even a technically-passing decision gets
     # downgraded to WAIT if overall confidence is too low to act on.
@@ -697,9 +853,11 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         confidence=round(confidence, 1),
         market_bias=round(bias_score, 1),
         market_bias_label=bias_label,
-        oi_score=round(oi_score, 1),
-        premium_score=round(premium_score, 1),
+        oi_structure_score=round(oi_score, 1),
+        premium_quality_score=round(premium_quality_score, 1),
+        intraday_momentum_score=round(intraday_momentum_score, 1),
         corridor_score=round(corridor_score, 1),
+        oeq_score=round(oeq_score, 1),
         suggested_direction=direction,
         suggested_strike=strike,
         expected_move=expected_move,
@@ -710,9 +868,10 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     )
 
     logger.info(
-        "[DORE:%s] FINAL recommendation=%s confidence=%.1f bias=%s(%.1f) oi=%.1f premium=%.1f corridor=%.1f",
+        "[DORE:%s] FINAL recommendation=%s confidence=%.1f bias=%s(%.1f) "
+        "oi_structure=%.1f premium_quality=%.1f intraday_momentum=%.1f corridor=%.1f oeq=%.1f",
         inp.symbol, result.recommendation, result.confidence, bias_label, bias_score,
-        oi_score, premium_score, corridor_score,
+        oi_score, premium_quality_score, intraday_momentum_score, corridor_score, oeq_score,
     )
     return result
 

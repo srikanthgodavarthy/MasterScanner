@@ -78,20 +78,50 @@ DORE_DEFAULTS: dict = {
     "w_corridor_upside_room":    50.0,
     "w_corridor_downside_room":  50.0,
 
+    # ── Stage 3b: Intraday Momentum ──────────────────────────────
+    "momentum_rsi_bull_sweet_min": 55.0,  # RSI zone read as fresh, still-running bullish momentum
+    "momentum_rsi_bull_sweet_max": 72.0,  # above sweet_max+8 -> exhaustion penalty applied
+    "momentum_rsi_bear_sweet_min": 28.0,  # mirror zone for fresh bearish momentum
+    "momentum_rsi_bear_sweet_max": 45.0,  # below sweet_min-8 -> exhaustion penalty applied
+    "momentum_cci_bull_min":      50.0,   # CCI at/above this supports bullish momentum
+    "momentum_cci_bear_max":     -50.0,   # CCI at/below this supports bearish momentum
+    "momentum_adx_strong_min":    20.0,   # ADX above this = real strength behind the move
+    "momentum_vol_ratio_min":     1.0,    # volume ratio floor for "participation confirmed"
+    "intraday_momentum_score_min": 50.0,  # Intraday Momentum >= this = momentum still supports entry
+    # Stage-3b sub-weights (must sum to 100)
+    "w_mom_rsi":                  35.0,
+    "w_mom_cci":                  25.0,
+    "w_mom_adx":                  20.0,
+    "w_mom_volume":               20.0,
+
     # ── Stage 5: Decision Engine thresholds ─────────────────────
     "decision_leadership_min":   65.0,   # Leadership Score floor for BUY_*_NOW
     "decision_conviction_min":   60.0,   # Conviction Score floor for BUY_*_NOW
-    "decision_entry_quality_min": 60.0,  # Entry Quality floor for BUY_*_NOW
+    "decision_entry_quality_min": 60.0,  # (equity) Entry Quality floor for BUY_*_NOW
     "decision_freshness_min":    40.0,   # Trend Freshness floor (avoid stale trends)
     "decision_exhaustion_book_min": 65.0,  # Exhaustion Score >= this -> lean BOOK_PROFITS
     "decision_extended_trend_phase": "EXTENDED",  # Trend Phase value treated as "extended"
 
+    # ── Option Entry Quality (OEQ) — blends the 4 Options Intelligence
+    #    sub-scores (OI Structure, Premium Quality, Corridor, Intraday
+    #    Momentum) into ONE options-side entry gate, mirroring the
+    #    equity-side Entry Quality gate above but scoped to the option
+    #    leg itself (strike/premium/timing), not the underlying setup ──
+    "oeq_score_min":              60.0,   # OEQ >= this = options-side entry justified
+    # OEQ sub-weights (must sum to 100)
+    "w_oeq_oi_structure":         25.0,
+    "w_oeq_premium_quality":      30.0,
+    "w_oeq_corridor":             20.0,
+    "w_oeq_intraday_momentum":    25.0,
+
     # ── Stage 6: Confidence blend weights (must sum to 100) ─────
-    "w_conf_market_bias":        25.0,
-    "w_conf_oi":                 25.0,
-    "w_conf_premium":            20.0,
-    "w_conf_corridor":           20.0,
-    "w_conf_breadth":            10.0,
+    "w_conf_market_bias":        20.0,
+    "w_conf_oi":                 20.0,
+    "w_conf_premium":            15.0,
+    "w_conf_corridor":           15.0,
+    "w_conf_oeq":                15.0,
+    "w_conf_momentum":           10.0,
+    "w_conf_breadth":             5.0,
 
     # ── Misc ─────────────────────────────────────────────────────
     "strike_step":                50.0,  # index strike interval (NIFTY=50, BANKNIFTY=100)
@@ -150,6 +180,20 @@ class DORESettings:
     w_corridor_upside_room: float = 50.0
     w_corridor_downside_room: float = 50.0
 
+    momentum_rsi_bull_sweet_min: float = 55.0
+    momentum_rsi_bull_sweet_max: float = 72.0
+    momentum_rsi_bear_sweet_min: float = 28.0
+    momentum_rsi_bear_sweet_max: float = 45.0
+    momentum_cci_bull_min: float = 50.0
+    momentum_cci_bear_max: float = -50.0
+    momentum_adx_strong_min: float = 20.0
+    momentum_vol_ratio_min: float = 1.0
+    intraday_momentum_score_min: float = 50.0
+    w_mom_rsi: float = 35.0
+    w_mom_cci: float = 25.0
+    w_mom_adx: float = 20.0
+    w_mom_volume: float = 20.0
+
     decision_leadership_min: float = 65.0
     decision_conviction_min: float = 60.0
     decision_entry_quality_min: float = 60.0
@@ -157,11 +201,19 @@ class DORESettings:
     decision_exhaustion_book_min: float = 65.0
     decision_extended_trend_phase: str = "EXTENDED"
 
-    w_conf_market_bias: float = 25.0
-    w_conf_oi: float = 25.0
-    w_conf_premium: float = 20.0
-    w_conf_corridor: float = 20.0
-    w_conf_breadth: float = 10.0
+    oeq_score_min: float = 60.0
+    w_oeq_oi_structure: float = 25.0
+    w_oeq_premium_quality: float = 30.0
+    w_oeq_corridor: float = 20.0
+    w_oeq_intraday_momentum: float = 25.0
+
+    w_conf_market_bias: float = 20.0
+    w_conf_oi: float = 20.0
+    w_conf_premium: float = 15.0
+    w_conf_corridor: float = 15.0
+    w_conf_oeq: float = 15.0
+    w_conf_momentum: float = 10.0
+    w_conf_breadth: float = 5.0
 
     strike_step: float = 50.0
     min_confidence_to_act: float = 55.0
