@@ -4191,10 +4191,21 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
 
 def _news_impact_panel():
     """Renders the 📰 News Impact (Latest) table card on the Scanner page,
-    right under the live Market Overview strip — matches the mockup layout."""
+    right under the live Market Overview strip — matches the mockup layout.
+
+    2026-07-19: classification is capped to 10 items, and those 10 are
+    chosen by relevance, not just recency. Previously every deduped
+    headline from all 5 feeds got sent to Groq for classification even
+    though only ~8-30 were ever shown — a straightforward multiple of
+    wasted token spend. Now: enrich_symbols() (regex-only, no LLM cost)
+    runs first, headlines that actually mention a tradeable stock are
+    prioritized to the front (newest-first within that group), and
+    generic market-wide headlines with no matched symbol fill any
+    remaining slots after that — kept, not dropped, just deprioritized,
+    since broad market context still has some value on this panel."""
     try:
         from utils.news_feed import fetch_all_news
-        from utils.news_sentiment import tag_news
+        from utils.news_sentiment import tag_news, enrich_symbols
         from utils.groq_client import _is_available as _groq_available
     except Exception as exc:
         # feedparser not yet installed (requirements.txt just changed) or
@@ -4202,9 +4213,15 @@ def _news_impact_panel():
         st.caption(f"News Impact panel unavailable: {exc}")
         return
 
+    _CLASSIFY_CAP = 10
+
     with st.spinner("Fetching news…"):
         raw_items = fetch_all_news()
-        items = tag_news(raw_items)
+        symbol_tagged = enrich_symbols(raw_items)  # cheap, no Groq cost
+        stock_specific = [it for it in symbol_tagged if it.get("symbols")]
+        market_wide = [it for it in symbol_tagged if not it.get("symbols")]
+        prioritized = (stock_specific + market_wide)[:_CLASSIFY_CAP]
+        items = tag_news(prioritized)
 
     if not items:
         st.markdown(
@@ -4241,7 +4258,7 @@ def _news_impact_panel():
         with st.expander(f"Show {len(items) - _VISIBLE} more headlines"):
             st.markdown(
                 f'<div class="ni-panel">{header_html}'
-                f'{_news_impact_rows_html(items[_VISIBLE:30], scan_df)}</div>',
+                f'{_news_impact_rows_html(items[_VISIBLE:_CLASSIFY_CAP], scan_df)}</div>',
                 unsafe_allow_html=True,
             )
 
