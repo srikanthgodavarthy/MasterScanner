@@ -3838,39 +3838,73 @@ def _market_intelligence_fragment():
             _dore_vix = None
 
         # 2026-07-18: heavyweight constituent alignment for DORE Stage 1c
-        # (Component Strength) — pulled from the last completed Nifty-500
-        # scan's own per-stock Leadership score + today's %Chg sign (the
-        # same "fold quality toward observed direction" pattern DORE's own
-        # Stage 1 uses for Leadership/Conviction). Soft-fails to {} (Stage
-        # 1c then reports neutral, doesn't block) if no scan has run yet
-        # or a symbol isn't present in it.
-        def _constituent_scores(symbols: list[str]) -> dict:
-            out: dict = {}
+        # (Component Strength) — INDEX-WEIGHTED, not a flat reference list.
+        # Weights below are each stock's real free-float weight % in THAT
+        # specific index (the same stock carries a different weight in
+        # Nifty vs Sensex vs Bank Nifty), sourced from NSE/BSE index
+        # factsheets as of ~Jul 2026. These drift on NSE/BSE's semi-annual
+        # rebalance (cutoffs Jan 31 / Jul 31) — refresh from
+        # niftyindices.com / bseindia.com / smart-investing.in periodically;
+        # this is NOT live-fetched. Only constituents that meaningfully
+        # move the index are listed — the long tail of sub-1% weights is
+        # omitted since it barely affects the weighted average below.
+        _INDEX_HEAVYWEIGHTS = {
+            "NIFTY": {
+                "RELIANCE": 9.11, "HDFCBANK": 6.48, "BHARTIARTL": 6.24, "ICICIBANK": 5.30,
+                "SBIN": 4.96, "TCS": 4.15, "BAJFINANCE": 3.36, "LT": 2.70,
+                "HINDUNILVR": 2.57, "SUNPHARMA": 2.44, "INFY": 2.28, "MARUTI": 2.26,
+            },
+            "SENSEX": {
+                "RELIANCE": 11.38, "HDFCBANK": 7.96, "BHARTIARTL": 7.51, "ICICIBANK": 6.52,
+                "SBIN": 6.19, "TCS": 4.88, "BAJFINANCE": 4.15, "LT": 3.57,
+                "HINDUNILVR": 3.33, "SUNPHARMA": 2.95,
+            },
+            "BANKNIFTY": {
+                "HDFCBANK": 25.92, "ICICIBANK": 20.53, "SBIN": 19.53, "AXISBANK": 8.41,
+                "KOTAKBANK": 7.67, "BANKBARODA": 2.65, "PNB": 2.47, "FEDERALBNK": 1.66,
+                "AUBANK": 1.64, "INDUSINDBK": 1.62,
+            },
+        }
+
+        def _constituent_scores(index_key: str) -> tuple[dict, dict]:
+            """Returns (scores, weights) for index_key's real heavyweight
+            constituents — scores from the last completed scan's own
+            Leadership + %Chg-direction fold (see Stage 1c docstring for
+            why), weights from _INDEX_HEAVYWEIGHTS above. A symbol missing
+            from the last scan (no scan run yet, or it fell out of the
+            universe) is simply omitted from `scores` — Stage 1c only
+            iterates what's actually present, so this degrades to "fewer
+            names, same weighting logic" rather than crashing or padding
+            with fake neutral entries.
+            """
+            weights = _INDEX_HEAVYWEIGHTS.get(index_key, {})
+            scores: dict = {}
             try:
                 _df = st.session_state.get("scan_df")
                 if _df is None or _df.empty or "Stock" not in _df.columns:
-                    return out
-                for sym in symbols:
+                    return scores, weights
+                for sym in weights:
                     _rows = _df[_df["Stock"].astype(str).str.upper() == sym]
                     if _rows.empty:
                         continue
                     _row = _rows.iloc[0]
                     _lead = float(_row.get("CV1_Leadership", 50.0) or 50.0)
                     _chg  = float(_row.get("%Chg", 0.0) or 0.0)
-                    out[sym] = _lead if _chg >= 0 else (100.0 - _lead)
+                    scores[sym] = _lead if _chg >= 0 else (100.0 - _lead)
             except Exception:
                 logger.exception("DORE constituents lookup failed (non-fatal)")
-            return out
+            return scores, weights
 
         _nifty_ohlcv = fetch_nifty_ohlcv("1y", source="upstox")
         _nifty_ce_chg, _nifty_pe_chg = _oi_changes.get("NIFTY", (0.0, 0.0))
+        _nifty_scores, _nifty_weights = _constituent_scores("NIFTY")
         _nifty_dore_input = build_dore_input_for_index(
             "NIFTY", _nifty_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
             st.session_state.get("oi_resistance", {}),
             position=st.session_state.get("nifty_option_position"),
             ce_oi_change=_nifty_ce_chg, pe_oi_change=_nifty_pe_chg,
             india_vix=_dore_vix,
-            constituents=_constituent_scores(["RELIANCE", "HDFCBANK", "ICICIBANK"]),
+            constituents=_nifty_scores, constituent_weights=_nifty_weights,
         )
         st.session_state["nifty_dore"] = (
             compute_dore(_nifty_dore_input, _dore_cfg).as_dict() if _nifty_dore_input else None
@@ -3878,13 +3912,14 @@ def _market_intelligence_fragment():
 
         _sensex_ohlcv = fetch_sensex_ohlcv("1y")
         _sensex_ce_chg, _sensex_pe_chg = _oi_changes.get("SENSEX", (0.0, 0.0))
+        _sensex_scores, _sensex_weights = _constituent_scores("SENSEX")
         _sensex_dore_input = build_dore_input_for_index(
             "SENSEX", _sensex_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
             st.session_state.get("sensex_oi_resistance", {}),
             position=st.session_state.get("sensex_option_position"),
             ce_oi_change=_sensex_ce_chg, pe_oi_change=_sensex_pe_chg,
             india_vix=_dore_vix,
-            constituents=_constituent_scores(["RELIANCE", "HDFCBANK", "ICICIBANK"]),
+            constituents=_sensex_scores, constituent_weights=_sensex_weights,
         )
         st.session_state["sensex_dore"] = (
             compute_dore(_sensex_dore_input, _dore_cfg).as_dict() if _sensex_dore_input else None
@@ -3892,13 +3927,14 @@ def _market_intelligence_fragment():
 
         _banknifty_ohlcv = fetch_banknifty_ohlcv("1y")
         _banknifty_ce_chg, _banknifty_pe_chg = _oi_changes.get("BANKNIFTY", (0.0, 0.0))
+        _banknifty_scores, _banknifty_weights = _constituent_scores("BANKNIFTY")
         _banknifty_dore_input = build_dore_input_for_index(
             "BANKNIFTY", _banknifty_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
             st.session_state.get("banknifty_oi_resistance", {}),
             position=st.session_state.get("banknifty_option_position"),
             ce_oi_change=_banknifty_ce_chg, pe_oi_change=_banknifty_pe_chg,
             india_vix=_dore_vix,
-            constituents=_constituent_scores(["HDFCBANK", "ICICIBANK"]),
+            constituents=_banknifty_scores, constituent_weights=_banknifty_weights,
         )
         st.session_state["banknifty_dore"] = (
             compute_dore(_banknifty_dore_input, _dore_cfg).as_dict() if _banknifty_dore_input else None
