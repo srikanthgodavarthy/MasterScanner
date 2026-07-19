@@ -2792,16 +2792,35 @@ def _news_impact_panel():
 
 
 
+# ── Auto-refresh: latest completed scan from Supabase ────────────────────
+# Dashboard never runs its own scan — pages/scanner.py (Yahoo Finance,
+# independent) is the only thing that writes scan_full_snapshots. Rather
+# than reload on every rerun (which would hammer Supabase for no reason —
+# a completed scan doesn't change until Scanner runs again), this polls
+# on its own timer via st.fragment(run_every=...), same pattern as
+# _market_intelligence_fragment above. It only forces a full-page rerun
+# (st.rerun()) when the latest run_at actually changed, so an idle
+# Dashboard with no new scan just re-checks quietly every cycle.
+_DASH_AUTOREFRESH_SECS = 120  # poll every 2 min for a newer completed scan
+
+
+@st.fragment(run_every=_DASH_AUTOREFRESH_SECS)
+def _dash_scan_autorefresh():
+    _df, _run_at = load_latest_full_scan()
+    if _run_at and _run_at != st.session_state.get("dash_scan_run_at"):
+        st.session_state["dash_scan_df"]     = _df
+        st.session_state["dash_scan_run_at"] = _run_at
+        st.rerun()
+
+
 def render(settings: dict | None = None):
     st.markdown(_CSS, unsafe_allow_html=True)
     settings = settings or {}
 
     # ── Load latest completed scan from Supabase ─────────────────────
-    # Dashboard never runs its own scan — pages/scanner.py (Yahoo Finance,
-    # independent) is the only thing that writes scan_full_snapshots. This
-    # loads once per session and on manual refresh; it deliberately does
-    # NOT re-run on every rerun (that would hammer Supabase for no reason —
-    # a completed scan doesn't change until Scanner runs again).
+    # First load of the session (or a manual click) is synchronous;
+    # _dash_scan_autorefresh() above then keeps it current in the
+    # background without the user needing to click Refresh.
     ctrl1, ctrl2 = st.columns([1, 5])
     with ctrl1:
         _refresh = st.button("🔄 Refresh", key="btn_dash_refresh",
@@ -2810,6 +2829,8 @@ def render(settings: dict | None = None):
         _df, _run_at = load_latest_full_scan()
         st.session_state["dash_scan_df"]      = _df
         st.session_state["dash_scan_run_at"]  = _run_at
+
+    _dash_scan_autorefresh()
 
     df_aug = st.session_state.get("dash_scan_df", pd.DataFrame())
     run_at = st.session_state.get("dash_scan_run_at", "")
