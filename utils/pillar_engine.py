@@ -280,7 +280,17 @@ def _safe_at(series: pd.Series, idx: int, default: float = 0.0) -> float:
 def _score_structure(close: pd.Series, e20: pd.Series, e50: pd.Series,
                       e200: pd.Series,
                       ph_series: pd.Series | None = None,
-                      pl_series: pd.Series | None = None) -> tuple[int, dict]:
+                      pl_series: pd.Series | None = None,
+                      precomputed_labels: pd.DataFrame | None = None) -> tuple[int, dict]:
+    """
+    precomputed_labels (optional): the output of compute_swing_labels(),
+    already sliced to this bar's window -- pass this (see
+    ll_opportunity.find_active_ll for the identical pattern) to avoid
+    re-walking the full swing-label history from scratch on every bar.
+    Without it, a 750-bar backtest calls compute_swing_labels() ~700
+    times instead of once per symbol -- profiled at ~11% of total time
+    in generate_signals_five_pillars (2026-07).
+    """
     cur_c    = _safe_last(close)
     cur_e20  = _safe_last(e20)
     cur_e50  = _safe_last(e50)
@@ -301,7 +311,8 @@ def _score_structure(close: pd.Series, e20: pd.Series, e50: pd.Series,
     hh_hl_intact = False
     if ph_series is not None and pl_series is not None and len(ph_series) > 0:
         try:
-            labels = compute_swing_labels(ph_series, pl_series)
+            labels = precomputed_labels if precomputed_labels is not None \
+                else compute_swing_labels(ph_series, pl_series)
             swing_label = labels["label_ffill"].iloc[-1] or ""
             hh_hl_intact = swing_label in ("HH", "HL")
         except Exception:
@@ -1041,7 +1052,8 @@ def compute_pillars_from_ia(df: pd.DataFrame, ia, cfg: dict | None = None) -> Pi
         # — CCI is never used for scoring anywhere in this engine.
         osc = getattr(ia, "rsi_s", None)
 
-        s_score, s_sub = _score_structure(close, ia.e20, ia.e50, ia.e200, ph_series, pl_series)
+        s_score, s_sub = _score_structure(close, ia.e20, ia.e50, ia.e200, ph_series, pl_series,
+                                           precomputed_labels=getattr(ia, "swing_labels", None))
         a_score, a_sub = _score_acceptance(close, high, low, volume)
         r_score, r_sub = _score_reversal(close, low, high, open_, volume,
                                           ph_series, pl_series, osc, ia.atr_s, vol_avg,
