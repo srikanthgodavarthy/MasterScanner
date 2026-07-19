@@ -65,13 +65,32 @@ import logging
 
 import streamlit as st
 
-from utils.groq_client import get_client, get_model, _is_available
+from utils.groq_client import get_client, _is_available
 from utils.sector_map import get_sector
 from utils.symbol_name_map import match_symbols
 
 logger = logging.getLogger(__name__)
 
 _BATCH_SIZE = 15
+
+# 2026-07-19: news classification gets its OWN model, deliberately
+# decoupled from utils.groq_client.get_model() / DEFAULT_MODEL.
+# Context: this panel hit a 429 (tokens-per-day cap on
+# llama-3.3-70b-versatile) mid-session -- the free-tier Groq org has a
+# single shared daily token budget across every caller of that model, and
+# a news panel polling 5 RSS feeds with a 5-field classification per
+# headline is a heavy, recurring consumer of that budget all on its own.
+# Rather than fight other Groq usage for the same 100k TPD pool, news
+# classification runs on a smaller/cheaper model with its own headroom.
+# Override via GROQ_NEWS_MODEL in secrets if you want to point this at
+# something else (or back at 70b) without touching groq_client.py's
+# shared default.
+_NEWS_MODEL = "llama-3.1-8b-instant"
+
+# Summaries are stored at up to 280 chars (utils/news_feed.py) for
+# display, but the classifier doesn't need that much to judge direction/
+# category -- trimmed further here purely to cut prompt tokens per call.
+_SUMMARY_CHARS_FOR_LLM = 150
 
 _EVENT_TYPES = (
     "Earnings", "Order/Contract", "Regulatory/Legal", "Rating/Brokerage",
@@ -108,10 +127,26 @@ Rules:
 - No markdown, no commentary outside the JSON object."""
 
 
+def _get_news_model() -> str:
+    """GROQ_NEWS_MODEL override via secrets, falling back to _NEWS_MODEL.
+    Deliberately separate from groq_client.get_model() -- see the module
+    docstring / _NEWS_MODEL comment for why."""
+    try:
+        return st.secrets.get("GROQ_NEWS_MODEL", _NEWS_MODEL) or _NEWS_MODEL
+    except Exception:
+        return _NEWS_MODEL
+
+
 def _classify_batch(texts: list[str]) -> list[dict]:
     """One Groq call for one batch of 'title — summary' strings. Returns a
-    fail-soft list of neutral/unclassified defaults on any error, same
-    length as input, so callers never have to special-case failures."""
+    fail-soft list of same length as input, so callers never have to
+    special-case failures. Two distinct failure shapes on purpose:
+      - 'Unclassified': no client (key missing) or an unexpected error.
+      - 'RateLimited': the daily/per-minute token cap was hit -- this is
+        a *known, temporary* state, not a broken integration, so it gets
+        its own label rather than being lumped in with 'Unclassified'
+        (which previously made "no key configured" and "hit the daily
+        cap" look identical in the UI -- no way to tell them apart)."""
     fallback = [
         {"sentiment": "Unclassified", "event_type": None, "magnitude": None,
          "horizon": None, "note": ""}
@@ -124,7 +159,7 @@ def _classify_batch(texts: list[str]) -> list[dict]:
 
     try:
         resp = client.chat.completions.create(
-            model=get_model(),
+            model=_get_news_model(),
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": json.dumps(texts)},
@@ -174,6 +209,19 @@ def _classify_batch(texts: list[str]) -> list[dict]:
         return cleaned
 
     except Exception as exc:
+        exc_text = str(exc)
+        is_rate_limit = (
+            "429" in exc_text
+            or "rate_limit" in exc_text.lower()
+            or getattr(exc, "status_code", None) == 429
+        )
+        if is_rate_limit:
+            logger.warning("news_sentiment: Groq rate-limited: %s", exc)
+            return [
+                {"sentiment": "RateLimited", "event_type": None, "magnitude": None,
+                 "horizon": None, "note": "Groq token limit reached — retry later"}
+                for _ in texts
+            ]
         logger.warning("news_sentiment: Groq classification failed: %s", exc)
         return fallback
 
@@ -183,7 +231,7 @@ def _classify_cached(pairs: tuple[tuple[str, str], ...]) -> list[dict]:
     """Cache wrapper -- st.cache_data needs hashable args, hence tuples of
     (title, summary) rather than dicts."""
     texts = [
-        f"{title} — {summary}".strip(" —") if summary else title
+        f"{title} — {summary[:_SUMMARY_CHARS_FOR_LLM]}".strip(" —") if summary else title
         for title, summary in pairs
     ]
     out: list[dict] = []
@@ -198,7 +246,7 @@ def tag_news(items: list[dict]) -> list[dict]:
     Enrich raw feed items (from utils.news_feed.fetch_all_news) with:
       - symbols:      list[str]           (regex-matched NSE tickers, may be empty)
       - sector:       str | None          (sector of the first matched symbol, if any)
-      - sentiment:    'Positive' | 'Negative' | 'Neutral' | 'Unclassified'
+      - sentiment:    'Positive' | 'Negative' | 'Neutral' | 'Unclassified' | 'RateLimited'
       - event_type:   str | None          (Earnings, Order/Contract, ... or None)
       - magnitude:    'High' | 'Medium' | 'Low' | None
       - horizon:      'Immediate' | 'Days' | 'Weeks' | None
