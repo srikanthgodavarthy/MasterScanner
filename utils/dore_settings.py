@@ -95,6 +95,20 @@ DORE_DEFAULTS: dict = {
     "w_mom_volume":               15.0,
     "w_mom_ema_ride":             20.0,   # EMA9/21 "riding vs chopping" factor
 
+    # ── Early Signal (Bias + Component Strength blend, 2026-07-19) ──
+    # Catches a CE/PE early — before OI Structure/Premium/Corridor/OEQ
+    # have caught up — using only the two LEADING reads: Market Bias
+    # (Stage 1, MasterScanner's own Leadership/Conviction/EntryQuality +
+    # EMA-structure "strength") and Component Strength (Stage 1c,
+    # index-weighted heavyweight alignment). Fires WATCH_CE/WATCH_PE
+    # alongside (never instead of) the existing confirmed BUY signals —
+    # it never overrides a WAIT caused by an active contradiction (MTF
+    # conflict, OI conflict, IV-crush risk, NEUTRAL bias), only a WAIT/
+    # NO_TRADE caused by "not yet confirmed."
+    "early_score_min":   65.0,   # Early Score >= this -> upgrade WAIT/NO_TRADE to WATCH_CE/WATCH_PE
+    "w_early_bias":       50.0,  # Stage-1d sub-weights (must sum to 100)
+    "w_early_component":  50.0,
+
     # ── Stage 5: Decision Engine thresholds ─────────────────────
     "decision_leadership_min":   65.0,   # Leadership Score floor for BUY_*_NOW
     "decision_conviction_min":   60.0,   # Conviction Score floor for BUY_*_NOW
@@ -222,6 +236,10 @@ class DORESettings:
     w_mom_adx: float = 15.0
     w_mom_volume: float = 15.0
     w_mom_ema_ride: float = 20.0
+
+    early_score_min: float = 65.0
+    w_early_bias: float = 50.0
+    w_early_component: float = 50.0
 
     decision_leadership_min: float = 65.0
     decision_conviction_min: float = 60.0

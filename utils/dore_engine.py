@@ -22,6 +22,11 @@ Architecture (see docs/DORE_ARCHITECTURE.md for the full diagram):
     Stage 1   Market Bias         -> bias direction + Market Bias Score (0-100)
     Stage 1b  MTF Confirmation    -> does the higher-timeframe trend agree? (hard gate)
     Stage 1c  Component Strength  -> are index heavyweights backing this move?
+    Stage 1d  Early Signal        -> Bias+Component blend ONLY (leading, not lagging) —
+                                     can upgrade a not-yet-confirmed WAIT/NO_TRADE to
+                                     WATCH_CE/WATCH_PE; never overrides an active
+                                     contradiction (MTF conflict, OI conflict, IV-crush,
+                                     NEUTRAL bias) — see stage1d_early_signal's docstring
     Stage 2   OI Structure        -> does the option chain confirm the bias?
     Stage 3   Premium Quality     -> is the trade priced sanely / liquid?
     Stage 3b  Intraday Momentum   -> is short-term momentum still fresh, or fading?
@@ -75,11 +80,13 @@ logger = logging.getLogger(__name__)
 
 BUY_CE_NOW        = "BUY_CE_NOW"
 BUY_CE_BREAKOUT   = "BUY_CE_BREAKOUT"
-HOLD_CE           = "HOLD_CE"
+WATCH_CE          = "WATCH_CE"     # 2026-07-19: early signal — Bias+Component strong, OI/Premium/
+HOLD_CE           = "HOLD_CE"      # Corridor/OEQ haven't confirmed yet. NOT actionable; a heads-up.
 BOOK_CE_PROFITS   = "BOOK_CE_PROFITS"
 
 BUY_PE_NOW        = "BUY_PE_NOW"
 BUY_PE_BREAKDOWN  = "BUY_PE_BREAKDOWN"
+WATCH_PE          = "WATCH_PE"     # 2026-07-19: mirror of WATCH_CE for the bearish side
 HOLD_PE           = "HOLD_PE"
 BOOK_PE_PROFITS   = "BOOK_PE_PROFITS"
 
@@ -87,8 +94,8 @@ WAIT              = "WAIT"
 NO_TRADE          = "NO_TRADE"
 
 ALL_RECOMMENDATIONS = {
-    BUY_CE_NOW, BUY_CE_BREAKOUT, HOLD_CE, BOOK_CE_PROFITS,
-    BUY_PE_NOW, BUY_PE_BREAKDOWN, HOLD_PE, BOOK_PE_PROFITS,
+    BUY_CE_NOW, BUY_CE_BREAKOUT, WATCH_CE, HOLD_CE, BOOK_CE_PROFITS,
+    BUY_PE_NOW, BUY_PE_BREAKDOWN, WATCH_PE, HOLD_PE, BOOK_PE_PROFITS,
     WAIT, NO_TRADE,
 }
 
@@ -203,6 +210,8 @@ class DOREResult:
     intraday_momentum_score:  float = 0.0   # Stage 3b — Intraday Momentum
     corridor_score:           float = 0.0   # Stage 4  — Corridor Score
     oeq_score:                float = 0.0   # Stage 4b — Option Entry Quality (OEQ)
+    early_score:              float = 0.0   # Stage 1d — Early Signal (Bias + Component blend);
+                                              # see stage1d_early_signal's docstring
 
     # ── Extended pillars (Price-Action location + Volatility health) ──
     mtf_score:                 float = 50.0   # Stage 1b — higher-timeframe alignment
@@ -474,6 +483,43 @@ def stage1c_component_strength(
 
     logger.info("[DORE:%s] Stage1c ComponentStrength score=%.1f", inp.symbol, component_score)
     return component_score, reasons
+
+
+# ══════════════════════════════════════════════════════════════════
+#  STAGE 1d — EARLY SIGNAL (Bias + Component Strength blend)
+# ══════════════════════════════════════════════════════════════════
+
+def stage1d_early_signal(
+    bias_score: float, bias_label: str, component_score: float, cfg: DORESettings
+) -> tuple[float, list[str]]:
+    """Blend ONLY the two LEADING reads — Market Bias (Stage 1: Master
+    Scanner's own Leadership/Conviction/EntryQuality + EMA-structure
+    "strength") and Component Strength (Stage 1c: index-weighted
+    heavyweight alignment) — into one Early Score, roughly equal weight.
+
+    This intentionally excludes OI Structure / Premium Quality / Corridor
+    / OEQ: those are all LAGGING confirmations that only catch up once
+    the option chain and price have already moved. The whole point of
+    Early Score is to flag a promising CE/PE setup building BEFORE that
+    confirmation shows up, using Stage 5's WATCH_CE/WATCH_PE tier — see
+    that function's docstring for exactly which WAIT/NO_TRADE paths this
+    can and can't upgrade.
+    """
+    reasons: list[str] = []
+    if bias_label == "NEUTRAL":
+        reasons.append("Market Bias NEUTRAL — no direction for an early read")
+        return 0.0, reasons
+
+    # bias_score is centred at 50=neutral; rescale to "how decisive is
+    # this bias" (0-100), same transform Stage 6 uses for bias_conviction.
+    bias_conviction = abs(bias_score - 50.0) * 2.0
+    early_score = _weighted([
+        (bias_conviction,  cfg.w_early_bias),
+        (component_score,  cfg.w_early_component),
+    ])
+    reasons.append(f"Early Score blend: Market Bias conviction={bias_conviction:.0f}, "
+                   f"Component Strength={component_score:.0f} -> Early Score={early_score:.0f}")
+    return early_score, reasons
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -867,10 +913,11 @@ def stage5_decision(
     mtf_conflict: bool = False,
     component_score: float = 50.0,
     iv_crush_risk: bool = False,
-) -> tuple[str, Optional[str], Optional[float], float, float, float, float, list[str], list[str]]:
+) -> tuple[str, Optional[str], Optional[float], float, float, float, float, float, list[str], list[str]]:
     """Deterministic decision tree. Returns
     (recommendation, direction, suggested_strike, premium_quality_score,
-     corridor_score, intraday_momentum_score, oeq_score, reasons, warnings).
+     corridor_score, intraday_momentum_score, oeq_score, early_score,
+     reasons, warnings).
 
     `corridor_score` returned here is direction-aware (see `_corridor_score()`):
     a CE trade is gated only on room to the CE wall, a PE trade only on room
@@ -883,16 +930,24 @@ def stage5_decision(
               OR IV-crush risk just appeared -> BOOK_{CE,PE}_PROFITS
          └─ else -> HOLD_{CE,PE}
     2. NO POSITION, bias == NEUTRAL, MTF conflicts, IV-crush risk flagged,
-       or OI conflicts with bias -> WAIT
+       or OI conflicts with bias -> WAIT (an ACTIVE contradiction — Early
+       Score never upgrades these, no matter how strong; a contradiction
+       is a contradiction, not "not yet confirmed").
     3. NO POSITION, bias BULLISH (mirror for BEARISH):
          a. Trend EXTENDED or Premium expensive or Corridor tight
-              or Momentum weak or OEQ low -> WAIT
+              or Momentum weak or OEQ low -> WAIT, UNLESS Early Score
+              (Market Bias + Component Strength) clears its own bar, in
+              which case this upgrades to WATCH_CE — "not confirmed yet
+              by the lagging OI/Premium/Corridor reads, but the leading
+              Bias+Component reads are already strong: worth watching."
          b. OI confirms + Premium healthy + Corridor OK + OEQ passes
               + Leadership/Conviction/EntryQuality/Freshness/Component
               strength all pass
               -> if price already through resistance -> BUY_CE_NOW
                  else                                 -> BUY_CE_BREAKOUT
-         c. otherwise -> NO_TRADE
+         c. otherwise -> NO_TRADE, same Early-Score upgrade to WATCH_CE
+              as (a) — "setup incomplete" is also a not-yet-confirmed
+              state, not a contradiction.
     """
     reasons: list[str] = []
     warnings: list[str] = []
@@ -911,6 +966,7 @@ def stage5_decision(
         oeq_score, oeq_reasons = stage4b_option_entry_quality(
             cfg, oi_score, premium_quality_score, corridor_score, momentum_score)
         reasons += oeq_reasons
+        early_score, e_reasons = stage1d_early_signal(bias_score, bias_label, component_score, cfg)
 
         near_wall = (
             (direction == "CE" and (resistance - inp.price) <= inp.atr * cfg.corridor_near_wall_atr)
@@ -940,7 +996,7 @@ def stage5_decision(
             strike = inp.atm_strike
             logger.info("[DORE:%s] Stage5 decision=%s (managing position)", inp.symbol, rec)
             return (rec, direction, strike, premium_quality_score, corridor_score,
-                    momentum_score, oeq_score, reasons, warnings)
+                    momentum_score, oeq_score, early_score, reasons, warnings)
 
         rec = HOLD_CE if direction == "CE" else HOLD_PE
         reasons.append("Position intact: no wall proximity, exhaustion, momentum fade, IV-crush, "
@@ -948,7 +1004,7 @@ def stage5_decision(
         strike = inp.atm_strike
         logger.info("[DORE:%s] Stage5 decision=%s (managing position)", inp.symbol, rec)
         return (rec, direction, strike, premium_quality_score, corridor_score,
-                momentum_score, oeq_score, reasons, warnings)
+                momentum_score, oeq_score, early_score, reasons, warnings)
 
     # ── Branch 2: no position, deciding whether to enter ────────
     if bias_label == "NEUTRAL":
@@ -956,32 +1012,36 @@ def stage5_decision(
         corridor_score = _corridor_score(cfg, None, upside_score, downside_score)
         momentum_score, m_reasons = stage3b_intraday_momentum(inp, cfg, None)
         oeq_score, _ = stage4b_option_entry_quality(cfg, oi_score, premium_quality_score, corridor_score, momentum_score)
+        early_score, _ = stage1d_early_signal(bias_score, bias_label, component_score, cfg)
         return (WAIT, None, None, premium_quality_score, corridor_score,
-                momentum_score, oeq_score, reasons, warnings)
+                momentum_score, oeq_score, early_score, reasons, warnings)
 
     if mtf_conflict:
         reasons.append("Higher-timeframe trend conflicts with this bias — trapped-range risk, no entry")
         corridor_score = _corridor_score(cfg, None, upside_score, downside_score)
         momentum_score, m_reasons = stage3b_intraday_momentum(inp, cfg, None)
         oeq_score, _ = stage4b_option_entry_quality(cfg, oi_score, premium_quality_score, corridor_score, momentum_score)
+        early_score, _ = stage1d_early_signal(bias_score, bias_label, component_score, cfg)
         return (WAIT, None, None, premium_quality_score, corridor_score,
-                momentum_score, oeq_score, reasons, warnings)
+                momentum_score, oeq_score, early_score, reasons, warnings)
 
     if iv_crush_risk and cfg.event_risk_forces_wait:
         reasons.append("IV-crush risk flagged (event risk / rich IV) — sitting out regardless of setup quality")
         corridor_score = _corridor_score(cfg, None, upside_score, downside_score)
         momentum_score, m_reasons = stage3b_intraday_momentum(inp, cfg, None)
         oeq_score, _ = stage4b_option_entry_quality(cfg, oi_score, premium_quality_score, corridor_score, momentum_score)
+        early_score, _ = stage1d_early_signal(bias_score, bias_label, component_score, cfg)
         return (WAIT, None, None, premium_quality_score, corridor_score,
-                momentum_score, oeq_score, reasons, warnings)
+                momentum_score, oeq_score, early_score, reasons, warnings)
 
     if oi_score <= cfg.oi_conflict_score_max:
         reasons.append(f"OI Structure Score={oi_score:.0f} conflicts with {bias_label} bias")
         corridor_score = _corridor_score(cfg, None, upside_score, downside_score)
         momentum_score, m_reasons = stage3b_intraday_momentum(inp, cfg, None)
         oeq_score, _ = stage4b_option_entry_quality(cfg, oi_score, premium_quality_score, corridor_score, momentum_score)
+        early_score, _ = stage1d_early_signal(bias_score, bias_label, component_score, cfg)
         return (WAIT, None, None, premium_quality_score, corridor_score,
-                momentum_score, oeq_score, reasons, warnings)
+                momentum_score, oeq_score, early_score, reasons, warnings)
 
     direction = "CE" if bias_label == "BULLISH" else "PE"
     corridor_score = _corridor_score(cfg, direction, upside_score, downside_score)
@@ -992,6 +1052,7 @@ def stage5_decision(
     oeq_score, oeq_reasons = stage4b_option_entry_quality(
         cfg, oi_score, premium_quality_score, corridor_score, momentum_score)
     reasons += oeq_reasons
+    early_score, e_reasons = stage1d_early_signal(bias_score, bias_label, component_score, cfg)
 
     trend_extended = (inp.trend_phase or "").upper() == cfg.decision_extended_trend_phase.upper()
     premium_expensive = premium_quality_score < cfg.premium_score_min
@@ -1029,8 +1090,16 @@ def stage5_decision(
 
     if trend_extended or premium_expensive or corridor_tight or momentum_weak or oeq_low:
         reasons.append("One or more entry gates failed — waiting for better structure")
-        return (WAIT, direction, None, premium_quality_score, corridor_score,
-                momentum_score, oeq_score, reasons, warnings)
+        if early_score >= cfg.early_score_min:
+            rec = WATCH_CE if direction == "CE" else WATCH_PE
+            reasons += e_reasons
+            reasons.append(f"Early Score={early_score:.0f} clears the {cfg.early_score_min} floor — "
+                            f"Bias+Component already strong, upgrading WAIT to {rec} (not yet actionable, "
+                            f"OI/Premium/Corridor/OEQ haven't confirmed)")
+        else:
+            rec = WAIT
+        return (rec, direction, None, premium_quality_score, corridor_score,
+                momentum_score, oeq_score, early_score, reasons, warnings)
 
     oi_confirms = oi_score >= cfg.oi_confirm_score_min
     quality_ok = (
@@ -1056,13 +1125,21 @@ def stage5_decision(
         strike = inp.atm_strike
         logger.info("[DORE:%s] Stage5 decision=%s", inp.symbol, rec)
         return (rec, direction, strike, premium_quality_score, corridor_score,
-                momentum_score, oeq_score, reasons, warnings)
+                momentum_score, oeq_score, early_score, reasons, warnings)
 
     reasons.append("Setup incomplete: " + ("OI unconfirmed. " if not oi_confirms else "")
                     + ("Quality scores below threshold." if not quality_ok else ""))
-    logger.info("[DORE:%s] Stage5 decision=%s", inp.symbol, NO_TRADE)
-    return (NO_TRADE, direction, None, premium_quality_score, corridor_score,
-            momentum_score, oeq_score, reasons, warnings)
+    if early_score >= cfg.early_score_min:
+        rec = WATCH_CE if direction == "CE" else WATCH_PE
+        reasons += e_reasons
+        reasons.append(f"Early Score={early_score:.0f} clears the {cfg.early_score_min} floor — "
+                        f"Bias+Component already strong, upgrading NO_TRADE to {rec} (not yet actionable, "
+                        f"OI confirmation/quality thresholds haven't caught up)")
+    else:
+        rec = NO_TRADE
+    logger.info("[DORE:%s] Stage5 decision=%s", inp.symbol, rec)
+    return (rec, direction, None, premium_quality_score, corridor_score,
+            momentum_score, oeq_score, early_score, reasons, warnings)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1179,7 +1256,7 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     iv_health_score, iv_reasons, iv_crush_risk = stage4c_iv_health(inp, cfg)
 
     (recommendation, direction, strike, premium_quality_score, corridor_score,
-     intraday_momentum_score, oeq_score, dec_reasons, warnings) = stage5_decision(
+     intraday_momentum_score, oeq_score, early_score, dec_reasons, warnings) = stage5_decision(
         inp, cfg, bias_score, bias_label, oi_score, upside_score, downside_score, resistance, support,
         mtf_conflict=mtf_conflict, component_score=component_score, iv_crush_risk=iv_crush_risk,
     )
@@ -1229,6 +1306,7 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         intraday_momentum_score=round(intraday_momentum_score, 1),
         corridor_score=round(corridor_score, 1),
         oeq_score=round(oeq_score, 1),
+        early_score=round(early_score, 1),
         mtf_score=round(mtf_score, 1),
         component_strength_score=round(component_score, 1),
         iv_health_score=round(iv_health_score, 1),
@@ -1248,10 +1326,10 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     logger.info(
         "[DORE:%s] FINAL recommendation=%s confidence=%.1f (%.1f/10) bias=%s(%.1f) "
         "oi_structure=%.1f premium_quality=%.1f intraday_momentum=%.1f corridor=%.1f oeq=%.1f "
-        "mtf=%.1f component=%.1f iv_health=%.1f crush_risk=%s",
+        "early=%.1f mtf=%.1f component=%.1f iv_health=%.1f crush_risk=%s",
         inp.symbol, result.recommendation, result.confidence, result.conviction_score_10,
         bias_label, bias_score, oi_score, premium_quality_score, intraday_momentum_score,
-        corridor_score, oeq_score, mtf_score, component_score, iv_health_score, iv_crush_risk,
+        corridor_score, oeq_score, early_score, mtf_score, component_score, iv_health_score, iv_crush_risk,
     )
     return result
 
