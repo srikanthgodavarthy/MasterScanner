@@ -100,6 +100,15 @@ _EVENT_TYPES = (
 )
 _MAGNITUDES = ("High", "Medium", "Low")
 _HORIZONS = ("Immediate", "Days", "Weeks")
+# 2026-07-19: Recommendation is now a direct Groq read of the headline
+# itself (BUY/HOLD/AVOID), deliberately independent of any scan state --
+# see pages/scanner.py _resolve_scan_recommendation, which is now labeled
+# "Current State" and shows the scan's own tier (Elite/Execute/etc.) as a
+# SEPARATE column. Previously this panel's "Recommendation" column
+# reused the scan tier directly, which conflated "what does this
+# headline suggest" with "what does the scanner currently say about this
+# stock" -- two different questions that happened to share a column.
+_RECOMMENDATIONS = ("BUY", "HOLD", "AVOID")
 
 _SYSTEM_PROMPT = f"""You are a terse financial news classifier for Indian equity markets.
 For each headline (with a short summary, when available) you are given,
@@ -111,6 +120,7 @@ Return ONLY a JSON object of the form:
   "event_type": "Earnings" | "Order/Contract" | "Regulatory/Legal" | "Rating/Brokerage" | "Promoter/Insider" | "M&A" | "Macro/Policy" | "Corporate Action" | "Other",
   "magnitude": "High" | "Medium" | "Low",
   "horizon": "Immediate" | "Days" | "Weeks",
+  "recommendation": "BUY" | "HOLD" | "AVOID",
   "note": "<=15 words"}}, ...]}}
 
 Rules:
@@ -129,6 +139,11 @@ Rules:
   minor corporate action is usually Low.
 - "horizon": how long the effect typically persists before being priced
   in or forgotten -- Immediate (same/next session), Days, or Weeks.
+- "recommendation": your own terse trading read of THIS headline alone,
+  independent of any external system state. BUY = the news is a clear
+  bullish trigger worth acting on. AVOID = a clear bearish trigger, stay
+  away / exit. HOLD = informational, mixed, low-magnitude, or not
+  actionable on its own.
 - "note": a terse reason (max 15 words), not a restatement of the headline.
 - No markdown, no commentary outside the JSON object."""
 
@@ -155,7 +170,7 @@ def _classify_batch(texts: list[str]) -> list[dict]:
         cap" look identical in the UI -- no way to tell them apart)."""
     fallback = [
         {"sentiment": "Unclassified", "event_type": None, "magnitude": None,
-         "horizon": None, "note": ""}
+         "horizon": None, "recommendation": None, "note": ""}
         for _ in texts
     ]
 
@@ -209,11 +224,20 @@ def _classify_batch(texts: list[str]) -> list[dict]:
             if horizon not in _HORIZONS:
                 horizon = "Days" if sentiment != "Unclassified" else None
 
+            recommendation = str(r.get("recommendation", "")).strip().upper()
+            if recommendation not in _RECOMMENDATIONS:
+                # sentiment-based fallback if the model omitted/mangled
+                # this field but still gave a usable sentiment read
+                recommendation = {
+                    "Positive": "BUY", "Negative": "AVOID", "Neutral": "HOLD",
+                }.get(sentiment)
+
             by_index[idx] = {
                 "sentiment": sentiment,
                 "event_type": event_type,
                 "magnitude": magnitude,
                 "horizon": horizon,
+                "recommendation": recommendation,
                 "note": str(r.get("note", "")).strip()[:140],
             }
 
@@ -238,7 +262,8 @@ def _classify_batch(texts: list[str]) -> list[dict]:
             logger.warning("news_sentiment: Groq rate-limited: %s", exc)
             return [
                 {"sentiment": "RateLimited", "event_type": None, "magnitude": None,
-                 "horizon": None, "note": "Groq token limit reached — retry later"}
+                 "horizon": None, "recommendation": None,
+                 "note": "Groq token limit reached — retry later"}
                 for _ in texts
             ]
         logger.warning("news_sentiment: Groq classification failed: %s", exc)
@@ -281,13 +306,17 @@ def enrich_symbols(items: list[dict]) -> list[dict]:
 def tag_news(items: list[dict]) -> list[dict]:
     """
     Enrich raw feed items (from utils.news_feed.fetch_all_news) with:
-      - symbols:      list[str]           (regex-matched NSE tickers, may be empty)
-      - sector:       str | None          (sector of the first matched symbol, if any)
-      - sentiment:    'Positive' | 'Negative' | 'Neutral' | 'Unclassified' | 'RateLimited'
-      - event_type:   str | None          (Earnings, Order/Contract, ... or None)
-      - magnitude:    'High' | 'Medium' | 'Low' | None
-      - horizon:      'Immediate' | 'Days' | 'Weeks' | None
-      - impact_note:  str
+      - symbols:        list[str]           (regex-matched NSE tickers, may be empty)
+      - sector:         str | None          (sector of the first matched symbol, if any)
+      - sentiment:      'Positive' | 'Negative' | 'Neutral' | 'Unclassified' | 'RateLimited'
+      - event_type:     str | None          (Earnings, Order/Contract, ... or None)
+      - magnitude:      'High' | 'Medium' | 'Low' | None
+      - horizon:        'Immediate' | 'Days' | 'Weeks' | None
+      - recommendation: 'BUY' | 'HOLD' | 'AVOID' | None  (Groq's own read of
+                         THIS headline alone -- deliberately independent of
+                         any scan state; see pages/scanner.py "Current
+                         State" column for the scan-tier-based view)
+      - impact_note:    str
 
     Classification is skipped (all items 'Unclassified', other fields None)
     if GROQ_API_KEY isn't configured -- the panel still renders with raw
@@ -315,6 +344,7 @@ def tag_news(items: list[dict]) -> list[dict]:
             item["event_type"] = None
             item["magnitude"] = None
             item["horizon"] = None
+            item["recommendation"] = None
             item["impact_note"] = "Groq API key not configured"
         return enriched
 
@@ -326,6 +356,7 @@ def tag_news(items: list[dict]) -> list[dict]:
         item["event_type"] = cls["event_type"]
         item["magnitude"] = cls["magnitude"]
         item["horizon"] = cls["horizon"]
+        item["recommendation"] = cls["recommendation"]
         item["impact_note"] = cls["note"]
 
     return enriched
