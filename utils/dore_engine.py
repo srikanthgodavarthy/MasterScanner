@@ -145,6 +145,11 @@ class DOREInput:
     # Each value = that stock's own bullish-bias score (0-100, 50=neutral),
     # already computed upstream by the Equity Intelligence Engine for that
     # single stock — DORE does not evaluate individual stocks itself.
+    constituent_weights: Optional[dict] = None
+    # e.g. {"HDFCBANK": 25.92, "ICICIBANK": 20.53, ...} — each stock's real
+    # free-float index weight % in THIS index (Nifty/Sensex/Bank Nifty
+    # weights differ for the same stock). Missing symbols fall back to
+    # equal weight (1.0) in Stage 1c rather than being dropped.
 
     # ── MasterScanner scores (already computed upstream) ────────
     leadership:       float = 0.0   # 0-100
@@ -392,14 +397,25 @@ def stage1b_mtf_confirmation(
 def stage1c_component_strength(
     inp: DOREInput, cfg: DORESettings, bias_label: str
 ) -> tuple[float, list[str]]:
-    """Are the index's heavyweight constituents (HDFC Bank/ICICI Bank for
-    Bank Nifty; Reliance/HDFC Bank/ICICI Bank/IT majors for Nifty/Sensex)
-    moving in tandem with the index bias, or diverging from it? A
-    breakout its own heavyweights aren't backing is a fragile one.
+    """Are the index's heavyweight constituents moving in tandem with the
+    index bias, or diverging from it? A breakout its own heavyweights
+    aren't backing is a fragile one — and a heavyweight (e.g. HDFC Bank
+    at ~26% of Bank Nifty) diverging matters far more than a small
+    constituent doing so, so this is an INDEX-WEIGHTED average, not a
+    simple count of how many names agree.
 
     `inp.constituents` = {symbol: bullish-bias score 0-100, 50=neutral},
     already computed upstream (same 0-100 scale as Leadership/Conviction)
     — DORE does not evaluate individual stocks itself.
+    `inp.constituent_weights` = {symbol: index free-float weight %} for
+    the SAME symbols — the actual weight each stock carries in this
+    specific index (Nifty/Sensex/Bank Nifty weights differ for the same
+    stock). Any symbol missing from this dict falls back to equal
+    weight (1.0) rather than being dropped, so a caller that only has
+    `constituents` (no weight table) still gets a sensible unweighted
+    average — see docs/DORE_ARCHITECTURE.md for where to source real
+    weights (NSE/BSE index factsheets; these drift on each semi-annual
+    rebalance, so refresh periodically rather than treating as static).
     """
     reasons: list[str] = []
     if not inp.constituents:
@@ -409,23 +425,52 @@ def stage1c_component_strength(
         reasons.append("Bias NEUTRAL — component alignment not evaluated")
         return 50.0, reasons
 
+    weights = inp.constituent_weights or {}
     want_bull = bias_label == "BULLISH"
-    agree, total, lagging = 0, 0, []
+    total = 0
+    weight_total = 0.0
+    aligned_weighted_sum = 0.0
+    agree_weight = 0.0
+    lagging: list[tuple[str, float]] = []
+
     for name, score in inp.constituents.items():
         total += 1
+        w = weights.get(name, 1.0)
+        weight_total += w
+        # Fold each stock's own bullish-bias score toward "how well does
+        # THIS stock align with the CURRENT bias direction" (mirrors how
+        # corridor/OI scores are direction-normalized elsewhere in DORE) —
+        # so component_score stays on the same "higher = better aligned"
+        # 0-100 scale regardless of whether bias_label is BULLISH/BEARISH.
+        aligned = score if want_bull else (100.0 - score)
+        aligned_weighted_sum += aligned * w
+
         is_bull = score >= cfg.component_agree_threshold
         is_bear = score <= (100.0 - cfg.component_agree_threshold)
         if (want_bull and is_bull) or ((not want_bull) and is_bear):
-            agree += 1
+            agree_weight += w
         else:
-            lagging.append(name)
+            lagging.append((name, w))
 
-    agree_pct = (agree / total * 100.0) if total else 0.0
-    component_score = _clamp(agree_pct)
-    reasons.append(f"Heavyweight alignment: {agree}/{total} constituents agree with {bias_label} "
-                    f"bias ({agree_pct:.0f}%)")
+    if weight_total <= 0:
+        reasons.append("Constituent weights invalid — component strength check skipped (neutral)")
+        return 50.0, reasons
+
+    component_score = _clamp(aligned_weighted_sum / weight_total)
+    agree_weight_pct = agree_weight / weight_total * 100.0
+
+    if weights:
+        reasons.append(f"Heavyweight alignment (index-weighted): {agree_weight_pct:.0f}% of tracked "
+                        f"index weight backing {bias_label} bias ({len(inp.constituents) - len(lagging)}/"
+                        f"{total} names)")
+    else:
+        reasons.append(f"Heavyweight alignment (unweighted — no index-weight table supplied): "
+                        f"{agree_weight_pct:.0f}% of names agree with {bias_label} bias")
     if lagging:
-        reasons.append(f"Diverging constituents: {', '.join(lagging)}")
+        lagging.sort(key=lambda t: -t[1])   # biggest-weight laggards first
+        names = ", ".join(f"{n} ({w:.1f}%)" for n, w in lagging[:5]) if weights else \
+                ", ".join(n for n, _ in lagging[:5])
+        reasons.append(f"Diverging constituents: {names}")
 
     logger.info("[DORE:%s] Stage1c ComponentStrength score=%.1f", inp.symbol, component_score)
     return component_score, reasons
@@ -1275,6 +1320,8 @@ def build_dore_input_for_index(
     india_vix: Optional[float] = None,       # 2026-07-18: live India VIX (utils.regime_engine.fetch_india_vix())
     constituents: Optional[dict] = None,     # 2026-07-18: {symbol: bullish-bias score 0-100} for this
                                                # index's heavyweight constituents (Stage 1c)
+    constituent_weights: Optional[dict] = None,  # 2026-07-18: {symbol: index free-float weight %} — see
+                                                   # stage1c_component_strength's docstring
     event_risk_today: bool = False,          # 2026-07-18: caller-supplied macro/earnings-event flag
 ) -> Optional[DOREInput]:
     """Index-level counterpart to build_dore_input_from_scanner(). Nifty and
@@ -1340,6 +1387,7 @@ def build_dore_input_for_index(
         atr_override=cur_atr,
         india_vix=india_vix,
         constituents=constituents,
+        constituent_weights=constituent_weights,
         event_risk_today=event_risk_today,
     )
 
@@ -1356,6 +1404,8 @@ def build_dore_input_from_scanner(
     atr_override: Optional[float] = None,  # pass a real, always-on ATR(14) — see note below
     india_vix: Optional[float] = None,       # 2026-07-18: live India VIX, e.g. utils.regime_engine.fetch_india_vix()
     constituents: Optional[dict] = None,     # 2026-07-18: {symbol: bullish-bias score 0-100} — see Stage 1c
+    constituent_weights: Optional[dict] = None,  # 2026-07-18: {symbol: index free-float weight %} — see
+                                                   # stage1c_component_strength's docstring
     event_risk_today: bool = False,          # 2026-07-18: caller-supplied macro/earnings-event flag
 ) -> DOREInput:
     """Adapter that assembles a DOREInput from objects MasterScanner
@@ -1433,6 +1483,7 @@ def build_dore_input_from_scanner(
         iv=atm_chain_row.get("iv") or oi_resistance.get("iv") or 0.0,
         event_risk_today=event_risk_today,
         constituents=constituents,
+        constituent_weights=constituent_weights,
 
         leadership=getattr(cv1_scores, "leadership", 0.0),
         conviction=getattr(cv1_scores, "conviction", 0.0),
