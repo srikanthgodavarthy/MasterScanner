@@ -422,6 +422,13 @@ class IndicatorArrays:
     _cloud_top_arr:    np.ndarray = None
     _cloud_bottom_arr: np.ndarray = None
     _squeeze_arr:      np.ndarray = None
+    # Precomputed once per symbol (see build_indicators) and sliced causally
+    # per bar in compute_bar()'s score_ll_opportunity call -- without this,
+    # find_active_ll() falls back to compute_swing_labels() from scratch on
+    # every bar (profiled: ~9% of total backtest time per symbol, identical
+    # bug pattern to the one already fixed in pillar_engine._score_structure
+    # for the Five Pillars path).
+    swing_labels_full: pd.DataFrame = None
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -545,6 +552,13 @@ def build_indicators(
     from utils.pivot_engine import build_pivot_series
     ph_series, pl_series = build_pivot_series(h, l, params.pvt_lb)
 
+    # Precompute swing labels once too -- compute_bar()'s score_ll_opportunity
+    # call reads the exact same ph_series/pl_series pair, and without this
+    # find_active_ll() falls back to compute_swing_labels() from scratch on
+    # every bar (~9% of total backtest time/symbol, profiled 2026-07).
+    from utils.swing_structure import compute_swing_labels
+    swing_labels_full = compute_swing_labels(ph_series, pl_series)
+
     # ── Dimension 2 (structural ceiling): causal pivot series ────────
     # NOT the same as ph_series/pl_series above. Those use a centered
     # rolling window (lookahead-safe only for live scanning, where
@@ -592,6 +606,7 @@ def build_indicators(
         nifty_aligned=nifty_aligned,
         ph_series=ph_series, pl_series=pl_series,
         ph_causal=ph_causal, pl_causal=pl_causal,
+        swing_labels_full=swing_labels_full,
         _c_arr=_c_arr, _h_arr=_h_arr, _l_arr=_l_arr, _cci_arr=_cci_arr,
         _e20_arr=_e20_arr, _e50_arr=_e50_arr, _e200_arr=_e200_arr,
         _atr_arr=_atr_arr, _vol_arr=_vol_arr, _vavg_arr=_vavg_arr,
@@ -1379,12 +1394,14 @@ def compute_bar(
         if i >= _ll_min_bars:
             try:
                 from utils.ll_opportunity import score_ll_opportunity
+                _swing_labels = getattr(ia, "swing_labels_full", None)
                 _ll_sig = score_ll_opportunity(
                     close=ia.c.iloc[_sl], low=ia.l.iloc[_sl], volume=ia.v.iloc[_sl],
                     ph_series=ia.ph_series.iloc[_sl] if ia.ph_series is not None else None,
                     pl_series=ia.pl_series.iloc[_sl] if ia.pl_series is not None else None,
                     atr_s=ia.atr_s.iloc[_sl], vol_avg=ia.vol_avg.iloc[_sl],
                     max_bonus=params.ll_bonus_max,
+                    precomputed_labels=_swing_labels.iloc[_sl] if _swing_labels is not None else None,
                 )
                 ll_actionable   = _ll_sig.actionable_ll
                 ll_defended     = _ll_sig.ll_defended
