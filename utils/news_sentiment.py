@@ -260,6 +260,24 @@ def _classify_cached(pairs: tuple[tuple[str, str], ...]) -> list[dict]:
     return out
 
 
+def enrich_symbols(items: list[dict]) -> list[dict]:
+    """Deterministic, regex-based symbol/sector attachment -- NO LLM call,
+    NO Groq token cost. Split out from tag_news() specifically so callers
+    can prioritize/filter items by "does this even mention a stock"
+    BEFORE paying for classification, rather than classifying everything
+    fetched and only capping what's rendered afterward (see
+    pages/scanner.py _news_impact_panel -- 2026-07-19: this was the
+    actual biggest source of wasted Groq spend, not the schema/model
+    choice: every deduped headline from all 5 feeds was being classified
+    even though only ~10 are ever shown)."""
+    enriched = []
+    for item in items:
+        symbols = match_symbols(f"{item['title']} {item.get('summary', '')}")
+        sector = get_sector(symbols[0]) if symbols else None
+        enriched.append({**item, "symbols": symbols, "sector": sector})
+    return enriched
+
+
 def tag_news(items: list[dict]) -> list[dict]:
     """
     Enrich raw feed items (from utils.news_feed.fetch_all_news) with:
@@ -275,6 +293,11 @@ def tag_news(items: list[dict]) -> list[dict]:
     if GROQ_API_KEY isn't configured -- the panel still renders with raw
     headlines + symbol tags, it just won't have the bullish/bearish read.
 
+    Callers that want to filter/prioritize BEFORE spending Groq tokens
+    should call enrich_symbols() themselves first (it's idempotent and
+    cheap to call again here) rather than passing the full unfiltered
+    feed straight into this function -- see pages/scanner.py.
+
     NOTE: this is a display-only enrichment. It intentionally does not
     feed CV1, the Promotion Engine, or the Decision Orchestrator -- it's
     context for a human reading the News Impact panel, not a scored
@@ -284,11 +307,7 @@ def tag_news(items: list[dict]) -> list[dict]:
     if not items:
         return []
 
-    enriched = []
-    for item in items:
-        symbols = match_symbols(f"{item['title']} {item.get('summary', '')}")
-        sector = get_sector(symbols[0]) if symbols else None
-        enriched.append({**item, "symbols": symbols, "sector": sector})
+    enriched = enrich_symbols(items)
 
     if not _is_available():
         for item in enriched:
