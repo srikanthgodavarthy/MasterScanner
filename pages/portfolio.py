@@ -14,9 +14,13 @@ Standalone page (separate from the scanner) with its own "Bought" entry
 form — you decide what you bought and when; nothing here auto-promotes a
 scanner row into a position. Once bought, a position lives in Supabase
 (portfolio_positions) and is re-scored on every page load by
-utils/portfolio_engine.compute_exit_score(), which returns HOLD / REDUCE /
-EXIT plus a factor-by-factor breakdown. ADD is surfaced separately (see
-suggest_add) since it is an entry-side judgement, not part of the exit model.
+utils/exit_intelligence_engine.compute_exit_strength() — a fully
+independent Exit Intelligence Engine (Trend Integrity / Momentum Decay /
+Distribution / Exhaustion / Price Action) that never reads Leadership,
+Conviction, or Entry Quality. It returns a native Exit Strength Score
+(0-100, higher = healthier) plus a legacy HOLD/REDUCE/EXIT mirror and a
+factor-by-factor breakdown. ADD is surfaced separately (see suggest_add)
+since it is an entry-side judgement, not part of the exit model.
 A REDUCE/EXIT position with a meaningfully better-scoring replacement in the
 latest saved scan is promoted to ROTATE directly in the table (see
 _apply_rotation / _render_rotation_rationale).
@@ -45,8 +49,9 @@ from utils.supabase_client import (
     close_portfolio_position, reduce_portfolio_position, update_portfolio_position,
     load_lifecycle_latest,
 )
-from utils.portfolio_engine import (
-    ExitScoreConfig, compute_exit_score, suggest_add, DISPLAY_FACTOR_DIRECTION, _atr,
+from utils.portfolio_engine import suggest_add  # entry-side "top up a winner" judgement — kept separate from the exit model
+from utils.exit_intelligence_engine import (
+    ExitIntelligenceConfig, compute_exit_strength, DISPLAY_FACTOR_DIRECTION, RECOMMENDATION_LABEL, _atr,
 )
 from utils.adaptive_target_engine import compute_adaptive_targets
 from utils.lifecycle_engine import STAGE_META
@@ -463,34 +468,47 @@ def _derive_live_extras(df: pd.DataFrame) -> dict:
 #  CONFIG (unchanged from prior version)
 # ══════════════════════════════════════════════════════════════════
 
-def _get_config() -> ExitScoreConfig:
+def _get_config() -> ExitIntelligenceConfig:
     if "portfolio_exit_cfg" not in st.session_state:
-        st.session_state["portfolio_exit_cfg"] = ExitScoreConfig()
+        st.session_state["portfolio_exit_cfg"] = ExitIntelligenceConfig()
     return st.session_state["portfolio_exit_cfg"]
 
 
-def _config_editor(cfg: ExitScoreConfig):
-    c1, c2, c3, c4 = st.columns(4)
+def _config_editor(cfg: ExitIntelligenceConfig):
+    st.caption(
+        "Exit Strength Score (0-100, higher = healthier) — five independent pillars, "
+        "no Leadership/Conviction/Entry Quality reused from the entry engine."
+    )
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        cfg.w_trend_structure = st.number_input("Trend Structure wt", 0.0, 100.0, cfg.w_trend_structure, 1.0)
-        cfg.w_leadership_decay = st.number_input("Leadership Decay wt", 0.0, 100.0, cfg.w_leadership_decay, 1.0)
+        cfg.trend_integrity_max = st.number_input("Trend Integrity max", 0.0, 100.0, cfg.trend_integrity_max, 1.0)
     with c2:
-        cfg.w_conviction_decay = st.number_input("Conviction Decay wt", 0.0, 100.0, cfg.w_conviction_decay, 1.0)
-        cfg.w_rs_decline = st.number_input("RS Decline wt", 0.0, 100.0, cfg.w_rs_decline, 1.0)
+        cfg.momentum_decay_max = st.number_input("Momentum Decay max", 0.0, 100.0, cfg.momentum_decay_max, 1.0)
     with c3:
-        cfg.w_momentum_exhaustion = st.number_input("Momentum Exhaustion wt", 0.0, 100.0, cfg.w_momentum_exhaustion, 1.0)
-        cfg.w_profit_protection = st.number_input("Profit Protection wt", 0.0, 100.0, cfg.w_profit_protection, 1.0)
+        cfg.distribution_max = st.number_input("Distribution max", 0.0, 100.0, cfg.distribution_max, 1.0)
     with c4:
-        cfg.w_time_decay = st.number_input("Time Decay wt", 0.0, 100.0, cfg.w_time_decay, 1.0)
-        st.caption("Weights auto-normalize; don't need to sum to 100.")
-
-    c5, c6, c7 = st.columns(3)
+        cfg.exhaustion_max = st.number_input("Exhaustion max", 0.0, 100.0, cfg.exhaustion_max, 1.0)
     with c5:
-        cfg.reduce_threshold = st.number_input("Reduce threshold", 0.0, 100.0, cfg.reduce_threshold, 1.0)
+        cfg.price_action_max = st.number_input("Price Action max", 0.0, 100.0, cfg.price_action_max, 1.0)
+    pillar_total = (cfg.trend_integrity_max + cfg.momentum_decay_max + cfg.distribution_max
+                     + cfg.exhaustion_max + cfg.price_action_max)
+    if abs(pillar_total - 100.0) > 0.5:
+        st.caption(f"⚠️ Pillar maxima sum to {pillar_total:.0f}, not 100 — ESS will be scaled off that total.")
+
+    c6, c7, c8, c9 = st.columns(4)
     with c6:
-        cfg.exit_threshold = st.number_input("Exit threshold", 0.0, 100.0, cfg.exit_threshold, 1.0)
+        cfg.strong_hold_min = st.number_input("Strong Hold ≥", 0.0, 100.0, cfg.strong_hold_min, 1.0)
     with c7:
-        cfg.atr_trail_mult = st.number_input("ATR trailing-stop multiple", 0.5, 6.0, cfg.atr_trail_mult, 0.25)
+        cfg.healthy_min = st.number_input("Healthy ≥", 0.0, 100.0, cfg.healthy_min, 1.0)
+    with c8:
+        cfg.caution_min = st.number_input("Caution ≥", 0.0, 100.0, cfg.caution_min, 1.0)
+    with c9:
+        cfg.defensive_min = st.number_input("Defensive ≥ (below = Exit)", 0.0, 100.0, cfg.defensive_min, 1.0)
+
+    cfg.atr_trail_mult = st.number_input(
+        "ATR trailing-stop multiple (Risk Management suggestion only, not part of ESS)",
+        0.5, 6.0, cfg.atr_trail_mult, 0.25,
+    )
 
     st.session_state["portfolio_exit_cfg"] = cfg
 
@@ -578,7 +596,7 @@ def _lm_get(row, key, default=None):
     return float(row.get(key)) if isinstance(row.get(key), (int, float)) else row.get(key)
 
 
-def _compute_row(pos: dict, cfg: ExitScoreConfig, live_metrics: pd.DataFrame) -> dict | None:
+def _compute_row(pos: dict, cfg: ExitIntelligenceConfig, live_metrics: pd.DataFrame) -> dict | None:
     symbol = pos.get("symbol", "")
     entry_price = float(pos.get("entry_price") or 0)
     qty = float(pos.get("qty") or 0)
@@ -593,14 +611,13 @@ def _compute_row(pos: dict, cfg: ExitScoreConfig, live_metrics: pd.DataFrame) ->
     current_conviction = _lm_get(lm_row, "conviction")
     current_rs = _lm_get(lm_row, "rs_composite")
 
-    result = compute_exit_score(
+    # NOTE: locked/current Leadership, Conviction, and RS-rank are still
+    # pulled above (current_leadership/current_conviction/current_rs) for
+    # informational display in the Score Breakdown tiles below, but are
+    # deliberately NOT passed into the exit engine — the Exit Intelligence
+    # Engine judges the position on its own price/volume action only.
+    result = compute_exit_strength(
         symbol=symbol, df=df, entry_price=entry_price,
-        locked_leadership=float(pos.get("locked_leadership") or 0),
-        locked_conviction=float(pos.get("locked_conviction") or 0),
-        entry_rs_rank=pos.get("entry_rs_rank"),
-        current_leadership=current_leadership,
-        current_conviction=current_conviction,
-        current_rs_rank=current_rs,
         entry_date=pos.get("entry_date"),
         initial_stop=float(initial_stop) if initial_stop else None,
         cfg=cfg,
@@ -660,7 +677,7 @@ def _compute_row(pos: dict, cfg: ExitScoreConfig, live_metrics: pd.DataFrame) ->
     rs = current_rs if current_rs is not None else pos.get("entry_rs_rank")
     ts = _lm_get(lm_row, "trend_quality")
     if ts is None:
-        ts = round(100 - result.factor_scores.get("trend_structure", 50), 1)
+        ts = result.factor_scores.get("Trend Health", 50)
 
     stage_raw = lm_row.get("stage") if lm_row is not None else None
     stage_meta = STAGE_META.get(stage_raw, {"label": "—", "color": "#64748b"})
@@ -1000,7 +1017,7 @@ def _journey_bar_html(sl, entry, current, t1) -> str:
     """
 
 
-def _render_stock_cards(rows: list[dict], cfg: ExitScoreConfig, total_value: float = 0.0):
+def _render_stock_cards(rows: list[dict], cfg: ExitIntelligenceConfig, total_value: float = 0.0):
     """Grid of compact stock cards, 5 per row, sorted by action urgency —
     each with a mini score strip and an SL→Entry→Current→T1 journey bar;
     full detail (thesis checks, Reduce/Exit/Notes) lives in the expander
@@ -1078,7 +1095,7 @@ def _factor_bar_html(label: str, value: float, direction: str) -> str:
     """
 
 
-def _render_detail_card(r: dict, cfg: ExitScoreConfig, total_value: float = 0.0):
+def _render_detail_card(r: dict, cfg: ExitIntelligenceConfig, total_value: float = 0.0):
     result = r["result"]
     pos = r["pos"]
     symbol = r["symbol"]
@@ -1208,12 +1225,16 @@ def _render_detail_card(r: dict, cfg: ExitScoreConfig, total_value: float = 0.0)
         with col_e:
             _md('<div class="pcc-section-label">Exit Score</div>')
             es_sub, es_color = _exit_score_sub(result.exit_score)
+            rec_label = RECOMMENDATION_LABEL.get(result.recommendation, result.recommendation)
             _md(f"""
             <div class="pcc-exit-box">
               <div class="pcc-exit-score" style="color:{es_color};">{result.exit_score:.0f}<span style="font-size:0.9rem;color:#64748b;">/100</span></div>
               <div class="pcc-exit-sub" style="color:{es_color};">🛡️ {es_sub} Risk</div>
+              <div class="pcc-exit-sub" style="color:#64748b;margin-top:2px;">ESS {result.exit_strength_score:.0f}/100 · {rec_label}</div>
             </div>
             """)
+            if result.suggested_stop:
+                _md(f'<div style="font-size:0.72rem;color:#54607a;margin-top:0.3rem;">Suggested stop: ₹{result.suggested_stop:.2f} — {result.suggested_stop_note}</div>')
 
         # ── Lifecycle progress (kept as a bonus visual, not in the reference) ──
         _md(f"""
