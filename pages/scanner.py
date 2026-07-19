@@ -1980,6 +1980,7 @@ def _dore_debug_html(dore: dict, reasons: list, warnings: list) -> str:
                 f'<span style="color:var(--text);font-weight:600">{value}</span></div>')
 
     crush = dore.get("iv_crush_risk")
+    const_note = dore.get("_constituent_debug")
     scores_html = "".join([
         _row("OI Structure",        f'{dore.get("oi_structure_score", 0):.0f}'),
         _row("Premium Quality",     f'{dore.get("premium_quality_score", 0):.0f}'),
@@ -1994,6 +1995,11 @@ def _dore_debug_html(dore: dict, reasons: list, warnings: list) -> str:
         _row("Strike Type",         dore.get("recommended_strike_type") or "—"),
         _row("Expiry",              dore.get("recommended_expiry") or "—"),
     ])
+    const_html = (
+        f'<div style="margin-top:8px;color:var(--muted);font-weight:600;">Constituent lookup</div>'
+        f'<div style="color:var(--text);font-family:monospace;font-size:10px;margin-top:2px;">{const_note}</div>'
+        if const_note else ""
+    )
     reasons_html  = "".join(f'<li style="margin-bottom:2px">{r}</li>' for r in reasons) or "<li>—</li>"
     warnings_html = "".join(f'<li style="margin-bottom:2px">{w}</li>' for w in warnings) or "<li>—</li>"
 
@@ -2002,6 +2008,7 @@ def _dore_debug_html(dore: dict, reasons: list, warnings: list) -> str:
     <summary style="cursor:pointer;color:var(--muted);user-select:none;">🔬 DORE debug</summary>
     <div style="margin-top:6px;padding:8px;background:rgba(255,255,255,0.03);border-radius:6px;">
       {scores_html}
+      {const_html}
       <div style="margin-top:8px;color:var(--muted);font-weight:600;">Reasons</div>
       <ul style="margin:4px 0 0 16px;padding:0;color:var(--text);">{reasons_html}</ul>
       <div style="margin-top:8px;color:var(--muted);font-weight:600;">Warnings</div>
@@ -3866,24 +3873,36 @@ def _market_intelligence_fragment():
             },
         }
 
-        def _constituent_scores(index_key: str) -> tuple[dict, dict]:
-            """Returns (scores, weights) for index_key's real heavyweight
-            constituents — scores from the last completed scan's own
-            Leadership + %Chg-direction fold (see Stage 1c docstring for
-            why), weights from _INDEX_HEAVYWEIGHTS above. A symbol missing
-            from the last scan (no scan run yet, or it fell out of the
-            universe) is simply omitted from `scores` — Stage 1c only
-            iterates what's actually present, so this degrades to "fewer
-            names, same weighting logic" rather than crashing or padding
-            with fake neutral entries.
+        def _constituent_scores(index_key: str) -> tuple[dict, dict, str]:
+            """Returns (scores, weights, debug_note) for index_key's real
+            heavyweight constituents — scores from the last completed
+            scan's own Leadership + %Chg-direction fold (see Stage 1c
+            docstring for why), weights from _INDEX_HEAVYWEIGHTS above.
+            A symbol missing from the last scan (no scan run yet, or it
+            fell out of the universe) is simply omitted from `scores` —
+            Stage 1c only iterates what's actually present, so this
+            degrades to "fewer names, same weighting logic" rather than
+            crashing or padding with fake neutral entries.
+
+            `debug_note` is a one-line, always-populated diagnostic (scan_df
+            presence/row count + exactly which target symbols matched or
+            didn't) — surfaced in the card's "DORE debug" panel so a stuck
+            "no constituent data" state is directly diagnosable from a
+            screenshot instead of requiring another guess-and-check round.
             """
             weights = _INDEX_HEAVYWEIGHTS.get(index_key, {})
             scores: dict = {}
+            targets = list(weights.keys())
             try:
                 _df = st.session_state.get("scan_df")
-                if _df is None or _df.empty or "Stock" not in _df.columns:
-                    return scores, weights
-                for sym in weights:
+                if _df is None:
+                    return scores, weights, f"scan_df: NOT SET (no scan run yet this session) | targets={targets}"
+                if _df.empty:
+                    return scores, weights, "scan_df: present but EMPTY (0 rows)"
+                if "Stock" not in _df.columns:
+                    return scores, weights, f"scan_df: {len(_df)} rows but NO 'Stock' column — cols={list(_df.columns)[:8]}..."
+                available = set(_df["Stock"].astype(str).str.upper())
+                for sym in targets:
                     _rows = _df[_df["Stock"].astype(str).str.upper() == sym]
                     if _rows.empty:
                         continue
@@ -3891,13 +3910,18 @@ def _market_intelligence_fragment():
                     _lead = float(_row.get("CV1_Leadership", 50.0) or 50.0)
                     _chg  = float(_row.get("%Chg", 0.0) or 0.0)
                     scores[sym] = _lead if _chg >= 0 else (100.0 - _lead)
-            except Exception:
+                missing = [s for s in targets if s not in scores]
+                note = f"scan_df: {len(_df)} rows | matched {len(scores)}/{len(targets)}"
+                if missing:
+                    note += f" | missing: {', '.join(missing)}"
+                return scores, weights, note
+            except Exception as e:
                 logger.exception("DORE constituents lookup failed (non-fatal)")
-            return scores, weights
+                return scores, weights, f"lookup EXCEPTION: {e!r}"
 
         _nifty_ohlcv = fetch_nifty_ohlcv("1y", source="upstox")
         _nifty_ce_chg, _nifty_pe_chg = _oi_changes.get("NIFTY", (0.0, 0.0))
-        _nifty_scores, _nifty_weights = _constituent_scores("NIFTY")
+        _nifty_scores, _nifty_weights, _nifty_const_note = _constituent_scores("NIFTY")
         _nifty_dore_input = build_dore_input_for_index(
             "NIFTY", _nifty_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
             st.session_state.get("oi_resistance", {}),
@@ -3906,13 +3930,14 @@ def _market_intelligence_fragment():
             india_vix=_dore_vix,
             constituents=_nifty_scores, constituent_weights=_nifty_weights,
         )
-        st.session_state["nifty_dore"] = (
-            compute_dore(_nifty_dore_input, _dore_cfg).as_dict() if _nifty_dore_input else None
-        )
+        _nifty_dore_dict = compute_dore(_nifty_dore_input, _dore_cfg).as_dict() if _nifty_dore_input else None
+        if _nifty_dore_dict is not None:
+            _nifty_dore_dict["_constituent_debug"] = _nifty_const_note
+        st.session_state["nifty_dore"] = _nifty_dore_dict
 
         _sensex_ohlcv = fetch_sensex_ohlcv("1y")
         _sensex_ce_chg, _sensex_pe_chg = _oi_changes.get("SENSEX", (0.0, 0.0))
-        _sensex_scores, _sensex_weights = _constituent_scores("SENSEX")
+        _sensex_scores, _sensex_weights, _sensex_const_note = _constituent_scores("SENSEX")
         _sensex_dore_input = build_dore_input_for_index(
             "SENSEX", _sensex_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
             st.session_state.get("sensex_oi_resistance", {}),
@@ -3921,13 +3946,14 @@ def _market_intelligence_fragment():
             india_vix=_dore_vix,
             constituents=_sensex_scores, constituent_weights=_sensex_weights,
         )
-        st.session_state["sensex_dore"] = (
-            compute_dore(_sensex_dore_input, _dore_cfg).as_dict() if _sensex_dore_input else None
-        )
+        _sensex_dore_dict = compute_dore(_sensex_dore_input, _dore_cfg).as_dict() if _sensex_dore_input else None
+        if _sensex_dore_dict is not None:
+            _sensex_dore_dict["_constituent_debug"] = _sensex_const_note
+        st.session_state["sensex_dore"] = _sensex_dore_dict
 
         _banknifty_ohlcv = fetch_banknifty_ohlcv("1y")
         _banknifty_ce_chg, _banknifty_pe_chg = _oi_changes.get("BANKNIFTY", (0.0, 0.0))
-        _banknifty_scores, _banknifty_weights = _constituent_scores("BANKNIFTY")
+        _banknifty_scores, _banknifty_weights, _banknifty_const_note = _constituent_scores("BANKNIFTY")
         _banknifty_dore_input = build_dore_input_for_index(
             "BANKNIFTY", _banknifty_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
             st.session_state.get("banknifty_oi_resistance", {}),
@@ -3936,9 +3962,12 @@ def _market_intelligence_fragment():
             india_vix=_dore_vix,
             constituents=_banknifty_scores, constituent_weights=_banknifty_weights,
         )
-        st.session_state["banknifty_dore"] = (
+        _banknifty_dore_dict = (
             compute_dore(_banknifty_dore_input, _dore_cfg).as_dict() if _banknifty_dore_input else None
         )
+        if _banknifty_dore_dict is not None:
+            _banknifty_dore_dict["_constituent_debug"] = _banknifty_const_note
+        st.session_state["banknifty_dore"] = _banknifty_dore_dict
     except Exception:
         logger.exception("DORE computation failed in _market_intelligence_fragment")
         st.session_state.setdefault("nifty_dore", None)
