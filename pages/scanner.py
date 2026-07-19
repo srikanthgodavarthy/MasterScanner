@@ -1206,7 +1206,7 @@ _CSS = """
 
 .ni-grid {
   display: grid;
-  grid-template-columns: 62px 1fr 104px 92px 54px 112px 100px;
+  grid-template-columns: 62px 1fr 104px 84px 118px 128px 92px;
   column-gap: 14px;
   align-items: center;
 }
@@ -1245,6 +1245,25 @@ _CSS = """
 .ni-impact-neg { background: rgba(248,81,73,0.12);  border: 1px solid rgba(248,81,73,0.35); color: var(--red); }
 .ni-impact-neu { background: rgba(139,148,158,0.1); border: 1px solid rgba(139,148,158,0.3); color: var(--muted); }
 .ni-rec-dash { color: var(--muted); font-size: 11px; font-family: var(--mono); }
+
+/* ── 2026-07-19: richer news classification (event type / magnitude) ── */
+.ni-impact-stack { display: flex; flex-direction: column; gap: 2px; }
+.ni-event-type {
+  font-size: 9.5px; color: var(--muted); font-family: var(--mono);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 108px;
+}
+.ni-magnitude-dots { font-size: 8px; letter-spacing: 1.5px; }
+.ni-mag-high { color: var(--text); }
+.ni-mag-medium { color: var(--muted); }
+.ni-mag-low { color: var(--muted); opacity: 0.5; }
+
+/* signal-check: flags when a headline's sentiment agrees/disagrees with
+   the stock's CURRENT scan Recommendation. Display-only -- purely a
+   human-readable cross-check, never feeds back into CV1/gates. */
+.ni-rec-wrap { display: flex; align-items: center; gap: 5px; }
+.ni-signal-check { font-size: 11px; font-weight: 700; cursor: default; }
+.ni-signal-confirm { color: var(--green); }
+.ni-signal-contradict { color: var(--red); }
 </style>
 """
 
@@ -4038,6 +4057,31 @@ def _resolve_scan_recommendation(symbols: list[str], scan_df: pd.DataFrame) -> t
     return None
 
 
+# 2026-07-19: display-only cross-check between a headline's LLM sentiment
+# and the stock's CURRENT scan Recommendation. This does NOT feed CV1, the
+# Promotion Engine, or the Decision Orchestrator -- it's a human-readable
+# flag ("this headline agrees/disagrees with what the scanner is already
+# saying about this stock"), nothing more. Only fires for the bullish
+# scan tiers (Actionable/Execute/Elite) since this app is long-only --
+# there's no bearish scan tier for a Positive headline to "confirm".
+_NI_BULLISH_TIERS = {"ACTIONABLE", "EXECUTE", "ELITE"}
+
+
+def _news_evidence_check(sentiment: str, rec: tuple[str, str] | None) -> tuple[str, str, str] | None:
+    """Returns (icon, css_class, tooltip) or None if there's nothing to
+    check against (no matched symbol in the current scan, non-bullish
+    tier, or a Neutral/Unclassified headline with no direction to compare)."""
+    if not rec or sentiment not in ("Positive", "Negative"):
+        return None
+    label = rec[0]
+    if label not in _NI_BULLISH_TIERS:
+        return None
+    tier_title = label.title()
+    if sentiment == "Positive":
+        return ("✓", "ni-signal-confirm", f"Confirms current {tier_title} setup")
+    return ("⚠", "ni-signal-contradict", f"Contradicts current {tier_title} setup")
+
+
 def _news_ago(published) -> str:
     if published is None:
         return ""
@@ -4065,10 +4109,30 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
         }.get(sentiment, "ni-impact-neu")
         impact_label = {"Positive": "+ve", "Negative": "-ve"}.get(sentiment, "n/a")
 
+        # 2026-07-19: event_type/magnitude/horizon — richer classification
+        # layered under the existing +ve/-ve/n/a pill rather than replacing
+        # it, so the panel stays scannable at a glance while still exposing
+        # WHAT kind of news this is and how much it typically matters.
+        event_type = item.get("event_type")
+        magnitude = item.get("magnitude")
+        _MAG_DOTS = {"High": "●●●", "Medium": "●●○", "Low": "●○○"}
+        mag_dots = _MAG_DOTS.get(magnitude, "")
+        mag_class = f"ni-mag-{magnitude.lower()}" if magnitude else ""
+        impact_extra = "".join([
+            f'<span class="ni-event-type">{event_type}</span>' if event_type else "",
+            f'<span class="ni-magnitude-dots {mag_class}">{mag_dots}</span>' if mag_dots else "",
+        ])
+
         rec = _resolve_scan_recommendation(symbols, scan_df)
-        rec_html = (
+        check = _news_evidence_check(sentiment, rec)
+        rec_pill_html = (
             f'<span class="ni-pill" style="background:{rec[1]}22;border:1px solid {rec[1]}66;color:{rec[1]}">{rec[0]}</span>'
             if rec else '<span class="ni-rec-dash">—</span>'
+        )
+        rec_html = (
+            f'<div class="ni-rec-wrap">{rec_pill_html}'
+            f'<span class="ni-signal-check {check[1]}" title="{check[2]}">{check[0]}</span></div>'
+            if check else rec_pill_html
         )
 
         # 2026-07-17 fix: this used to fall back to symbols[0] only when
@@ -4097,15 +4161,18 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
             if item.get("published") else "—"
         )
 
+        horizon = item.get("horizon")
+        row_tooltip = item.get("impact_note", "") + (f" · {horizon} effect" if horizon else "")
+
         rows.append(f"""
-<div class="ni-grid ni-row" title="{item.get('impact_note', '')}">
+<div class="ni-grid ni-row" title="{row_tooltip}">
   <div class="ni-time">{time_label}</div>
   <div>
     <a class="ni-headline" href="{item['link']}" target="_blank" title="{item['title']}">{item['title']}</a>
   </div>
   <div class="ni-stocks">{stock_chips_html}</div>
   <div class="ni-sector">{sector_label}</div>
-  <div><span class="ni-pill {impact_class}">{impact_label}</span></div>
+  <div class="ni-impact-stack"><span class="ni-pill {impact_class}">{impact_label}</span>{impact_extra}</div>
   <div>{rec_html}</div>
   <div class="ni-source">{item['source']}</div>
 </div>""")
