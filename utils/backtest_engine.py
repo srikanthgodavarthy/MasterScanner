@@ -785,6 +785,34 @@ def generate_signals_five_pillars(
     nf.index = _strip_tz(nf.index)
     nifty_aligned = nf.reindex(c_idx, method="ffill")
 
+    # ── Convert to numpy ONCE for the per-bar loop below ────────────────
+    # Slicing an *indexed* pandas Series 700 times/symbol (e20.iloc[lo:i+1])
+    # profiles heavily in pandas-internal overhead unrelated to the actual
+    # math: __finalize__ (attrs/flags propagation), index slicing/copy,
+    # and the Series.__init__ path it triggers on the way out. None of the
+    # _score_*() functions below ever read .index or rely on real dates
+    # (verified: only compute_pillars(), the standalone/non-hot-path
+    # wrapper, touches .index) -- they only use positional access
+    # (.iloc[-1], .iloc[idx]) and windowed pandas ops that work the same
+    # on a fresh RangeIndex. So each bar now slices plain numpy arrays
+    # (a view, not a copy) and wraps the view in a bare pd.Series with a
+    # default index -- same data, same downstream behaviour, without
+    # re-propagating the original DatetimeIndex machinery every bar.
+    # Safe to share the underlying view (no .copy() needed) because
+    # nothing in pillar_engine.py mutates these Series in place -- checked
+    # via grep for any `.iloc[...] =` / `[...] =` write against these
+    # names; only ph/pl_series get masked in-place, and those already get
+    # an explicit .copy() below for exactly that reason.
+    c_np, h_np, l_np, v_np, o_np = (
+        close.to_numpy(), high.to_numpy(), low.to_numpy(),
+        volume.to_numpy(), open_.to_numpy(),
+    )
+    e20_np, e50_np, e200_np = e20.to_numpy(), e50.to_numpy(), e200.to_numpy()
+    rsi_np, atr_np = rsi_s.to_numpy(), atr_s.to_numpy()
+    ph_np, pl_np   = ph_full.to_numpy(), pl_full.to_numpy()
+    vol_avg_np     = vol_avg.to_numpy()
+    nifty_np       = nifty_aligned.to_numpy()
+
     class _IA:
         pass
 
@@ -802,32 +830,43 @@ def generate_signals_five_pillars(
         # Blank out the last _PIVOT_LB bars of the pivot slice so a pivot
         # can't be "confirmed" before it would have been in the original
         # windowed computation (see PERF FIX note above).
-        _ph_slice = ph_full.iloc[lo:i + 1].copy()
-        _pl_slice = pl_full.iloc[lo:i + 1].copy()
+        _ph_slice = ph_np[lo:i + 1].copy()
+        _pl_slice = pl_np[lo:i + 1].copy()
         _mask_n = min(_PIVOT_LB, len(_ph_slice))
         if _mask_n > 0:
-            _ph_slice.iloc[-_mask_n:] = float("nan")
-            _pl_slice.iloc[-_mask_n:] = float("nan")
+            _ph_slice[-_mask_n:] = float("nan")
+            _pl_slice[-_mask_n:] = float("nan")
 
         # Same confirmation cutoff as the pivot masking above, applied to
         # the label walk: truncate (not mask-to-NaN) so find_active_ll
         # never sees a pivot/label beyond what bar i would actually know.
+        # (swing_labels_full stays a DataFrame slice -- it carries named
+        # columns find_active_ll/_score_structure read by label, and it's
+        # already O(1) per bar since the PERF FIX above, so there's no
+        # index-propagation cost worth avoiding here.)
         _labels_slice = swing_labels_full.iloc[lo: i + 1 - _mask_n]
 
         ia = _IA()
         ia.c, ia.h, ia.l, ia.v, ia.o = (
-            close.iloc[lo:i + 1], high.iloc[lo:i + 1], low.iloc[lo:i + 1],
-            volume.iloc[lo:i + 1], open_.iloc[lo:i + 1],
+            pd.Series(c_np[lo:i + 1]), pd.Series(h_np[lo:i + 1]),
+            pd.Series(l_np[lo:i + 1]), pd.Series(v_np[lo:i + 1]),
+            pd.Series(o_np[lo:i + 1]),
         )
-        ia.e20, ia.e50, ia.e200 = e20.iloc[lo:i + 1], e50.iloc[lo:i + 1], e200.iloc[lo:i + 1]
-        ia.rsi_s, ia.atr_s = rsi_s.iloc[lo:i + 1], atr_s.iloc[lo:i + 1]
-        ia.nifty_aligned = nifty_aligned.iloc[lo:i + 1]
-        ia.ph_series, ia.pl_series = _ph_slice, _pl_slice
-        ia.vol_avg = vol_avg.iloc[lo:i + 1]
+        ia.e20, ia.e50, ia.e200 = (
+            pd.Series(e20_np[lo:i + 1]), pd.Series(e50_np[lo:i + 1]), pd.Series(e200_np[lo:i + 1]),
+        )
+        ia.rsi_s, ia.atr_s = pd.Series(rsi_np[lo:i + 1]), pd.Series(atr_np[lo:i + 1])
+        ia.nifty_aligned = pd.Series(nifty_np[lo:i + 1])
+        ia.ph_series, ia.pl_series = pd.Series(_ph_slice), pd.Series(_pl_slice)
+        ia.vol_avg = pd.Series(vol_avg_np[lo:i + 1])
         ia.swing_labels = _labels_slice
 
         try:
-            r = compute_pillars_from_ia(df.iloc[lo:i + 1], ia, cfg=cfg)
+            # df is accepted but never read inside compute_pillars_from_ia
+            # (verified: grepped the function body) -- passing the full,
+            # unsliced df avoids re-slicing all OHLCV columns every bar
+            # for a value that was always thrown away.
+            r = compute_pillars_from_ia(df, ia, cfg=cfg)
             fp_scores.append(float(r.final_score) if not r.error else float("nan"))
             fp_results.append(r)
         except Exception:
