@@ -1244,6 +1244,7 @@ _CSS = """
 .ni-impact-pos { background: rgba(63,185,80,0.15);  border: 1px solid rgba(63,185,80,0.4);  color: var(--green); }
 .ni-impact-neg { background: rgba(248,81,73,0.12);  border: 1px solid rgba(248,81,73,0.35); color: var(--red); }
 .ni-impact-neu { background: rgba(139,148,158,0.1); border: 1px solid rgba(139,148,158,0.3); color: var(--muted); }
+.ni-impact-limit { background: rgba(210,153,34,0.12); border: 1px solid rgba(210,153,34,0.4); color: #d29922; }
 .ni-rec-dash { color: var(--muted); font-size: 11px; font-family: var(--mono); }
 
 /* ── 2026-07-19: richer news classification (event type / magnitude) ── */
@@ -4104,10 +4105,19 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
     for item in items:
         symbols = item.get("symbols", [])
         sentiment = item["sentiment"]
+        # 2026-07-19: Neutral (a real LLM read), RateLimited (Groq's daily
+        # token cap was hit -- temporary, known cause), and Unclassified
+        # (no API key, or an unexpected error) used to all render as the
+        # same "n/a" pill -- impossible to tell "the model said neutral"
+        # apart from "the model never ran". Each now gets its own label.
         impact_class = {
             "Positive": "ni-impact-pos", "Negative": "ni-impact-neg",
+            "Neutral": "ni-impact-neu", "RateLimited": "ni-impact-limit",
         }.get(sentiment, "ni-impact-neu")
-        impact_label = {"Positive": "+ve", "Negative": "-ve"}.get(sentiment, "n/a")
+        impact_label = {
+            "Positive": "+ve", "Negative": "-ve",
+            "Neutral": "flat", "RateLimited": "limit",
+        }.get(sentiment, "n/a")
 
         # 2026-07-19: event_type/magnitude/horizon — richer classification
         # layered under the existing +ve/-ve/n/a pill rather than replacing
