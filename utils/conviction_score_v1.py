@@ -836,9 +836,11 @@ V3_THRESHOLD_DEFAULTS = {
     # Backtest-derived (2026-07), equal-weight (1/3/1/3/1/3) composite.
     # Base funnel (classify_tier_v3: Watch/Developing/Actionable) is kept
     # in sync with the natural signal class (_classify_v3: Watch/Execute/
-    # Elite) — Actionable == Execute's floors, Developing is the midpoint
-    # between Watch (50) and Actionable/Execute (60) pending its own
-    # backtest fit.
+    # Elite) — Actionable shares Execute's Leadership/Conviction/composite
+    # floors, but deliberately uses a LOWER Entry Quality floor (36 vs 50)
+    # so it stays the funnel's non-Extended catch-all rather than
+    # duplicating Execute exactly. Developing is the midpoint between
+    # Watch (50) and Actionable/Execute (60) pending its own backtest fit.
     "v3_watch_leadership_min":      50,
     "v3_watch_conviction_min":      50,
     "v3_watch_entry_quality_min":   50,
@@ -846,6 +848,14 @@ V3_THRESHOLD_DEFAULTS = {
     "v3_developing_composite_min":  55,   # TODO: not yet backtest-fit — midpoint placeholder
     "v3_actionable_leadership_min": 60,
     "v3_actionable_conviction_min": 70,
+    # Added: Actionable previously had no Entry Quality floor, so a stock
+    # with high Leadership+Conviction could carry a composite >=60 with
+    # EQ=0 (e.g. L=90/C=90/EQ=0 -> composite=60). 36 is not arbitrary:
+    # _entry_quality() hard-caps EQ at 35 whenever trend_phase=="EXTENDED",
+    # so this floor makes any EXTENDED-phase stock structurally ineligible
+    # for Actionable regardless of how strong its other two pillars look.
+    # NOT YET backtest-validated — same caveat as v3_developing_composite_min.
+    "v3_actionable_entry_quality_min": 36,
     "v3_actionable_composite_min":  60,
     "v3_execute_leadership_min":    60,
     "v3_execute_conviction_min":    70,
@@ -878,8 +888,12 @@ def classify_tier_v3(leadership: int, conviction: int, entry_quality: int,
     # Actionable requires its own Leadership and Conviction floors on top
     # of the composite bar — a strong percentage built almost entirely
     # off Entry Quality still can't compensate its way to Actionable.
+    # It also requires its own (low) Entry Quality floor — otherwise a
+    # stock with very high Leadership+Conviction could clear composite
+    # with EQ=0, i.e. no timing justification at all for entering now.
     if (leadership >= t["v3_actionable_leadership_min"]
             and conviction >= t["v3_actionable_conviction_min"]
+            and entry_quality >= t["v3_actionable_entry_quality_min"]
             and composite  >= t["v3_actionable_composite_min"]):
         return "Actionable"
     if composite >= t["v3_developing_composite_min"]:
