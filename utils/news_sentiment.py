@@ -42,10 +42,12 @@ not as inputs to CV1 or any gate. Display-only, deliberately.
 Batching
 --------
 Headlines are sent to Groq in batches (default 15/call) as a single JSON
-array of "title — summary" strings, with the model asked to return a JSON
-array of the same length in the same order. This keeps call count low
-against Groq's free-tier rate limits while staying well inside context
-limits for even the longest realistic batch.
+array of "title — summary" strings. The model tags each result with the
+0-based index of the input item it belongs to (see _classify_batch) --
+matched back by identity rather than trusted by list position, since a
+lighter model occasionally drops or reorders one item out of a batch.
+This keeps call count low against Groq's free-tier rate limits while
+staying well inside context limits for even the longest realistic batch.
 
 Caching
 -------
@@ -104,14 +106,18 @@ For each headline (with a short summary, when available) you are given,
 classify its likely near-term market impact.
 
 Return ONLY a JSON object of the form:
-{{"results": [{{"sentiment": "Positive" | "Negative" | "Neutral",
+{{"results": [{{"index": <0-based position of this item in the input array>,
+  "sentiment": "Positive" | "Negative" | "Neutral",
   "event_type": "Earnings" | "Order/Contract" | "Regulatory/Legal" | "Rating/Brokerage" | "Promoter/Insider" | "M&A" | "Macro/Policy" | "Corporate Action" | "Other",
   "magnitude": "High" | "Medium" | "Low",
   "horizon": "Immediate" | "Days" | "Weeks",
   "note": "<=15 words"}}, ...]}}
 
 Rules:
-- One result per input item, in the same order, same count.
+- Exactly one result per input item. "index" MUST equal that item's
+  0-based position in the input array -- this is how results are matched
+  back, not the order you list them in.
+- Every index from 0 to (input length - 1) must appear exactly once.
 - "sentiment": Positive = bullish/favourable for the stock(s)/sector/market
   it concerns. Negative = bearish/unfavourable. Neutral = no clear
   directional read, purely informational, or genuinely mixed.
@@ -169,20 +175,24 @@ def _classify_batch(texts: list[str]) -> list[dict]:
             max_tokens=1800,
         )
         payload = json.loads(resp.choices[0].message.content)
-        results = payload.get("results", [])
+        raw_results = payload.get("results", [])
 
-        if len(results) != len(texts):
-            logger.warning(
-                "news_sentiment: batch size mismatch (%d in, %d out); padding.",
-                len(texts), len(results),
-            )
-            # pad/truncate defensively rather than dropping the whole batch
-            results = (results + fallback)[:len(texts)]
+        # 2026-07-19 fix: match results back to inputs by the model's
+        # "index" field, not list position. A lighter model (this runs on
+        # llama-3.1-8b-instant, see _NEWS_MODEL) occasionally drops or
+        # merges one item out of a batch -- if we trusted position, every
+        # item AFTER the dropped one would silently shift and come back
+        # attributed to the wrong headline (confidently wrong, not just
+        # missing). Index-matching means a dropped item only affects
+        # itself; everything else stays correctly attributed.
+        by_index: dict[int, dict] = {}
+        for r in raw_results:
+            idx = r.get("index")
+            if not isinstance(idx, int) or not (0 <= idx < len(texts)):
+                continue
+            if idx in by_index:
+                continue  # duplicate index from the model; keep the first
 
-        # normalise every field defensively -- don't trust the model to
-        # always respect the enums even when asked nicely
-        cleaned = []
-        for r in results:
             sentiment = str(r.get("sentiment", "")).strip().title()
             if sentiment not in ("Positive", "Negative", "Neutral"):
                 sentiment = "Unclassified"
@@ -199,14 +209,23 @@ def _classify_batch(texts: list[str]) -> list[dict]:
             if horizon not in _HORIZONS:
                 horizon = "Days" if sentiment != "Unclassified" else None
 
-            cleaned.append({
+            by_index[idx] = {
                 "sentiment": sentiment,
                 "event_type": event_type,
                 "magnitude": magnitude,
                 "horizon": horizon,
                 "note": str(r.get("note", "")).strip()[:140],
-            })
-        return cleaned
+            }
+
+        missing = [i for i in range(len(texts)) if i not in by_index]
+        if missing:
+            logger.warning(
+                "news_sentiment: model omitted/misindexed %d/%d items (indices %s); "
+                "backfilling those as Unclassified -- everything else is unaffected.",
+                len(missing), len(texts), missing,
+            )
+
+        return [by_index.get(i, fallback[i]) for i in range(len(texts))]
 
     except Exception as exc:
         exc_text = str(exc)
