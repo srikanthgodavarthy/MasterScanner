@@ -1206,7 +1206,12 @@ _CSS = """
 
 .ni-grid {
   display: grid;
-  grid-template-columns: 62px 1fr 104px 84px 118px 128px 92px;
+  /* 2026-07-19: reordered to match refreshed mockup — Time / Sector /
+     Stock / Impact / Confidence / Recommendation / Headline / Source.
+     Headline moved to the wide trailing slot (1fr) since it's the only
+     variable-length field; everything left of it is a fixed-width
+     label/badge column. */
+  grid-template-columns: 58px 88px 92px 104px 74px 118px 1fr 84px;
   column-gap: 14px;
   align-items: center;
 }
@@ -1236,27 +1241,40 @@ _CSS = """
 .ni-sector { font-size: 11px; color: var(--muted); }
 .ni-source { font-size: 10px; color: var(--muted); text-align: right; }
 
+/* 2026-07-19: Impact is now plain colored text (mockup style) rather
+   than a filled/bordered pill — Recommendation keeps the pill treatment
+   below since that's still a badge-like decision, whereas Impact reads
+   more like a labeled fact. */
+.ni-impact-text { font-size: 12px; font-weight: 700; white-space: nowrap; }
+.ni-impact-pos { color: var(--green); }
+.ni-impact-neg { color: var(--red); }
+.ni-impact-neu { color: var(--muted); }
+.ni-impact-limit { color: #d29922; }
+
 .ni-pill {
-  display: inline-block; padding: 2px 9px; border-radius: 10px;
-  font-size: 10px; font-weight: 700; font-family: var(--mono);
+  display: inline-block; padding: 3px 11px; border-radius: 12px;
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.03em;
   white-space: nowrap;
 }
-.ni-impact-pos { background: rgba(63,185,80,0.15);  border: 1px solid rgba(63,185,80,0.4);  color: var(--green); }
-.ni-impact-neg { background: rgba(248,81,73,0.12);  border: 1px solid rgba(248,81,73,0.35); color: var(--red); }
-.ni-impact-neu { background: rgba(139,148,158,0.1); border: 1px solid rgba(139,148,158,0.3); color: var(--muted); }
-.ni-impact-limit { background: rgba(210,153,34,0.12); border: 1px solid rgba(210,153,34,0.4); color: #d29922; }
 .ni-rec-dash { color: var(--muted); font-size: 11px; font-family: var(--mono); }
 
-/* ── 2026-07-19: richer news classification (event type / magnitude) ── */
+/* ── 2026-07-19: richer news classification (event type) ── */
 .ni-impact-stack { display: flex; flex-direction: column; gap: 2px; }
 .ni-event-type {
   font-size: 9.5px; color: var(--muted); font-family: var(--mono);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 108px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100px;
 }
-.ni-magnitude-dots { font-size: 8px; letter-spacing: 1.5px; }
 .ni-mag-high { color: var(--text); }
 .ni-mag-medium { color: var(--muted); }
 .ni-mag-low { color: var(--muted); opacity: 0.5; }
+
+/* 2026-07-19: standalone Confidence column — reuses the same magnitude
+   value (High/Medium/Low) already returned by news_sentiment.py, just
+   surfaced as its own labeled column (mockup) instead of only living as
+   dots tucked under Impact. Same ni-mag-* color scale for consistency
+   between the two spots it now appears. */
+.ni-confidence { font-size: 11.5px; font-weight: 600; }
+.ni-confidence-dash { color: var(--muted); font-size: 11px; font-family: var(--mono); }
 
 /* signal-check: flags when a headline's sentiment agrees/disagrees with
    the stock's CURRENT scan Recommendation. Display-only -- purely a
@@ -4114,24 +4132,30 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
             "Positive": "ni-impact-pos", "Negative": "ni-impact-neg",
             "Neutral": "ni-impact-neu", "RateLimited": "ni-impact-limit",
         }.get(sentiment, "ni-impact-neu")
+        # 2026-07-19: full words (Positive/Negative/Neutral), not the old
+        # +ve/-ve/flat abbreviations — Impact is now plain colored text
+        # per the refreshed mockup, so the word itself carries the
+        # meaning instead of leaning on a filled pill background.
         impact_label = {
-            "Positive": "+ve", "Negative": "-ve",
-            "Neutral": "flat", "RateLimited": "limit",
-        }.get(sentiment, "n/a")
+            "Positive": "Positive", "Negative": "Negative",
+            "Neutral": "Neutral", "RateLimited": "Limited",
+        }.get(sentiment, "N/A")
 
-        # 2026-07-19: event_type/magnitude/horizon — richer classification
-        # layered under the existing +ve/-ve/n/a pill rather than replacing
-        # it, so the panel stays scannable at a glance while still exposing
-        # WHAT kind of news this is and how much it typically matters.
+        # 2026-07-19: event_type stays layered under the Impact word.
+        # Magnitude dots were dropped from here — magnitude now lives
+        # ONLY in the standalone Confidence column (below), since showing
+        # the same High/Medium/Low value in two places on one row was
+        # pure redundancy.
         event_type = item.get("event_type")
         magnitude = item.get("magnitude")
-        _MAG_DOTS = {"High": "●●●", "Medium": "●●○", "Low": "●○○"}
-        mag_dots = _MAG_DOTS.get(magnitude, "")
         mag_class = f"ni-mag-{magnitude.lower()}" if magnitude else ""
-        impact_extra = "".join([
-            f'<span class="ni-event-type">{event_type}</span>' if event_type else "",
-            f'<span class="ni-magnitude-dots {mag_class}">{mag_dots}</span>' if mag_dots else "",
-        ])
+        impact_extra = (
+            f'<span class="ni-event-type">{event_type}</span>' if event_type else ""
+        )
+        confidence_html = (
+            f'<span class="ni-confidence {mag_class}">{magnitude}</span>'
+            if magnitude else '<span class="ni-confidence-dash">—</span>'
+        )
 
         rec = _resolve_scan_recommendation(symbols, scan_df)
         check = _news_evidence_check(sentiment, rec)
@@ -4177,13 +4201,14 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
         rows.append(f"""
 <div class="ni-grid ni-row" title="{row_tooltip}">
   <div class="ni-time">{time_label}</div>
+  <div class="ni-sector">{sector_label}</div>
+  <div class="ni-stocks">{stock_chips_html}</div>
+  <div class="ni-impact-stack"><span class="ni-impact-text {impact_class}">{impact_label}</span>{impact_extra}</div>
+  <div>{confidence_html}</div>
+  <div>{rec_html}</div>
   <div>
     <a class="ni-headline" href="{item['link']}" target="_blank" title="{item['title']}">{item['title']}</a>
   </div>
-  <div class="ni-stocks">{stock_chips_html}</div>
-  <div class="ni-sector">{sector_label}</div>
-  <div class="ni-impact-stack"><span class="ni-pill {impact_class}">{impact_label}</span>{impact_extra}</div>
-  <div>{rec_html}</div>
   <div class="ni-source">{item['source']}</div>
 </div>""")
     return "".join(rows)
@@ -4243,7 +4268,7 @@ def _news_impact_panel():
 
     header_html = """
 <div class="ni-grid ni-head">
-  <div>TIME</div><div>HEADLINE</div><div>STOCK(S)</div><div>SECTOR</div><div>IMPACT</div><div>RECOMMENDATION</div><div></div>
+  <div>TIME</div><div>SECTOR</div><div>STOCK(S)</div><div>IMPACT</div><div>CONFIDENCE</div><div>RECOMMENDATION</div><div>HEADLINE</div><div></div>
 </div>"""
 
     panel_html = f"""
