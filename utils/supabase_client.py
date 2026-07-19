@@ -143,6 +143,91 @@ def load_scan_history(limit: int = 10) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+# ─── FULL SCAN SNAPSHOTS (Dashboard/Scanner split, 2026-07) ────────────────────
+#
+# scan_snapshots (above) only keeps a narrow top-50 subset — fine for
+# history.py/validation.py, but pages/dashboard.py needs every column/row
+# from a completed scan (CV1_*, TrendPhase, sector, etc.) to rebuild Market
+# Health / Sector Rotation / Signal Class counts without ever running its
+# own scan. Rather than hand-maintain a wide fixed-column table that has to
+# track every column scanner_engine.py might emit, this stores the whole
+# DataFrame as one JSON blob per run — Scanner writes it, Dashboard reads
+# the latest one back into an equivalent DataFrame.
+
+def save_full_scan_snapshot(df: pd.DataFrame) -> bool:
+    """
+    Persist the FULL scanner result (all rows, all columns) as a single
+    JSON snapshot row in scan_full_snapshots.
+
+    Parameters
+    ----------
+    df : DataFrame returned by run_scanner()/apply_regime_layer() — every
+         column is kept as-is.
+
+    Returns True on success, False otherwise.
+    """
+    client = get_client()
+    if client is None or df.empty:
+        return False
+
+    run_ts = datetime.now(timezone.utc).isoformat()
+
+    try:
+        # Coerce to plain JSON-safe types (numpy/pandas scalars, NaT, NaN
+        # all choke json/postgrest otherwise).
+        safe_df = df.astype(object).where(pd.notnull(df), None)
+        records = json.loads(safe_df.to_json(orient="records", date_format="iso"))
+    except Exception as exc:
+        logger.error("save_full_scan_snapshot: serialization failed: %s", exc)
+        return False
+
+    row = {
+        "run_at":    run_ts,
+        "row_count": len(records),
+        "data":      records,
+    }
+
+    try:
+        resp = client.table("scan_full_snapshots").insert(row).execute()
+        if resp.data is None:
+            logger.error("scan_full_snapshots insert returned no data.")
+            return False
+        return True
+    except Exception as exc:
+        logger.error("save_full_scan_snapshot failed: %s", exc)
+        return False
+
+
+def load_latest_full_scan() -> tuple[pd.DataFrame, str]:
+    """
+    Returns (df, run_at) for the most recent full scan snapshot, or
+    (empty DataFrame, "") if none exists / Supabase is unavailable.
+    """
+    client = get_client()
+    if client is None:
+        return pd.DataFrame(), ""
+
+    try:
+        resp = (
+            client.table("scan_full_snapshots")
+            .select("run_at, data")
+            .order("run_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not resp.data:
+            return pd.DataFrame(), ""
+
+        latest  = resp.data[0]
+        records = latest.get("data") or []
+        run_at  = latest.get("run_at", "")
+        df = pd.DataFrame(records)
+        return df, run_at
+    except Exception as exc:
+        logger.error("load_latest_full_scan failed: %s", exc)
+        return pd.DataFrame(), ""
+
+
 # ─── WATCHLIST ────────────────────────────────────────────────────────────────
 
 def load_watchlist() -> list[dict]:
@@ -965,6 +1050,17 @@ CREATE TABLE IF NOT EXISTS scan_snapshots (
     t3         integer
 );
 CREATE INDEX IF NOT EXISTS idx_scan_snapshots_run_at ON scan_snapshots(run_at DESC);
+
+-- 1b. Full scan snapshots (Dashboard/Scanner split, 2026-07) — one row per
+--     completed Scanner run, whole result as JSON. pages/dashboard.py reads
+--     only the single latest row; older rows are kept for history/debugging.
+CREATE TABLE IF NOT EXISTS scan_full_snapshots (
+    id         bigserial PRIMARY KEY,
+    run_at     timestamptz NOT NULL DEFAULT now(),
+    row_count  integer     NOT NULL DEFAULT 0,
+    data       jsonb       NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scan_full_snapshots_run_at ON scan_full_snapshots(run_at DESC);
 
 -- 2. Backtest results
 CREATE TABLE IF NOT EXISTS backtest_results (
