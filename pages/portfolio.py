@@ -1158,20 +1158,19 @@ def _render_detail_card(r: dict, cfg: ExitIntelligenceConfig, total_value: float
         </div>
         """)
 
-        # ── Score Breakdown (Leadership / Conviction / Entry Quality / Acceptance /
-        #    Relative Strength / Momentum / Structure / Trend Score) ──
-        _md('<div class="pcc-section-label">Score Breakdown</div>')
-        momentum_val = result.display_factors.get("Momentum")
-        structure_val = result.display_factors.get("Trend Health")
+        # ── Scanner Context — Leadership / Conviction / Entry Quality /
+        #    Acceptance / Relative Strength. These come from the latest
+        #    scanner snapshot and are shown for reference ONLY — the Exit
+        #    Intelligence Engine below does not read any of them. Kept
+        #    deliberately separate from "Exit Pillars" so it's never
+        #    mistaken for something driving the HOLD/REDUCE/EXIT call. ──
+        _md('<div class="pcc-section-label">Scanner Context <span style="font-weight:400;color:#54607a;text-transform:none;letter-spacing:0;">— informational, not used in the exit decision</span></div>')
         breakdown = [
             ("🌱", "Leadership", r["ls"]),
             ("🎯", "Conviction", r["cv"]),
             ("✅", "Entry Quality", r["eq"]),
             ("👥", "Acceptance", r.get("acceptance_proxy")),
             ("📈", "Relative Strength", r["rs"]),
-            ("〰️", "Momentum", momentum_val),
-            ("🏛️", "Structure", structure_val),
-            ("📊", "Trend Score", r["ts"]),
         ]
         tiles = "".join(f"""
             <div class="pcc-breakdown-tile">
@@ -1181,6 +1180,27 @@ def _render_detail_card(r: dict, cfg: ExitIntelligenceConfig, total_value: float
             </div>
         """ for icon, lbl, val in breakdown)
         _md(f'<div class="pcc-breakdown-grid">{tiles}</div>')
+
+        # ── Exit Pillars — the five factors that actually drive the Exit
+        #    Strength Score / recommendation below. This is the "why". ──
+        _md('<div class="pcc-section-label" style="margin-top:0.7rem;">Exit Pillars <span style="font-weight:400;color:#54607a;text-transform:none;letter-spacing:0;">— what the recommendation is based on</span></div>')
+        pillar_breakdown = [
+            ("🏛️", "Trend Integrity", result.display_factors.get("Trend Health")),
+            ("〰️", "Momentum", result.display_factors.get("Momentum")),
+            ("📦", "Distribution", result.display_factors.get("Distribution")),
+            ("🔥", "Exhaustion", result.display_factors.get("Exhaustion")),
+            ("🕯️", "Price Action", result.display_factors.get("Price Action")),
+        ]
+        pillar_tiles = "".join(f"""
+            <div class="pcc-breakdown-tile">
+              <div class="pcc-breakdown-icon">{icon}</div>
+              <div class="pcc-breakdown-val" style="color:{_score_color(val)};">{f"{val:.0f}" if val is not None else "—"}</div>
+              <div class="pcc-breakdown-lbl">{lbl}</div>
+            </div>
+        """ for icon, lbl, val in pillar_breakdown)
+        _md(f'<div class="pcc-breakdown-grid">{pillar_tiles}</div>')
+
+
 
         # ── Key Metrics ──
         _md('<div class="pcc-section-label">Key Metrics</div>')
