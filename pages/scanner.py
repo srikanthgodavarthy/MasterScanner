@@ -1211,18 +1211,36 @@ _CSS = """
      Headline moved to the wide trailing slot (1fr) since it's the only
      variable-length field; everything left of it is a fixed-width
      label/badge column. */
-  grid-template-columns: 58px 88px 92px 104px 74px 118px 1fr 84px;
-  column-gap: 14px;
-  align-items: center;
+  grid-template-columns: 58px 88px 92px 104px 74px 96px 118px 1fr 84px;
+  column-gap: 0;
+  /* 2026-07-19: top-align, not center — rows with a wrapped stock-chip
+     line or an event-type line under Impact are taller than plain rows;
+     center-aligning made those rows' single-line cells float at
+     different heights row-to-row, which read as messy rather than
+     tabular. Top-aligning keeps every cell's first line flush, so the
+     grid reads as a real table even when row heights vary. */
+  align-items: start;
 }
 .ni-head {
   font-size: 9.5px; font-weight: 700; letter-spacing: 0.06em;
   text-transform: uppercase; color: var(--muted);
-  padding-bottom: 8px; border-bottom: 1px solid var(--border);
+  padding: 7px 0;
+  background: rgba(255,255,255,0.035);
+  border-bottom: 1px solid var(--border);
 }
 .ni-row {
-  padding: 9px 0; border-bottom: 1px solid var(--border);
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border);
 }
+/* 2026-07-19: real table feel — a light vertical rule between columns
+   (matches the mockup's grid lines) and alternating row tint so the eye
+   tracks across a row instead of the columns blurring together. Applied
+   to every grid cell via the shared .ni-grid > div selector rather than
+   per-column classes, so it holds even as columns get added/reordered. */
+.ni-grid > div { border-right: 1px solid var(--border); padding: 0 10px; }
+.ni-grid > div:first-child { padding-left: 2px; }
+.ni-grid > div:last-child { border-right: none; padding-right: 0; }
+.ni-row:nth-of-type(even) { background: rgba(255,255,255,0.018); }
 .ni-row:last-child { border-bottom: none; }
 .ni-time { font-size: 11px; font-family: var(--mono); color: var(--muted); }
 .ni-headline {
@@ -4047,20 +4065,20 @@ def _market_intelligence_fragment():
 # cheap to call on every render() — no fragment/timer needed the way the
 # live index-quote strip above needs one.
 #
-# Recommendation column: deliberately reuses the SAME vocabulary/colors as
-# the live scan's own Recommendation field (_SC_STYLE — Elite/Execute/
-# Actionable/Developing/Watch/Skip) rather than inventing a parallel
-# "Accumulate/Book Partial" taxonomy. That's a direct consequence of how
-# this codebase is built: Recommendation is decision-engine output, an
-# explicit business rule over scored evidence — not something a headline's
-# sentiment should independently assert. A news item only gets a
-# Recommendation pill if one of its matched symbols is in the current scan;
-# otherwise it shows "—" rather than guessing. If you'd rather have Groq
-# suggest an action straight from the headline, or derive one from
-# sentiment + portfolio holdings instead, that's a one-function swap in
-# _resolve_scan_recommendation() below — nothing else depends on how this
-# is computed.
-def _resolve_scan_recommendation(symbols: list[str], scan_df: pd.DataFrame) -> tuple[str, str] | None:
+# 2026-07-19: split into TWO columns, deliberately.
+# ---------------------------------------------------------------------
+# "Recommendation" now shows Groq's own BUY/HOLD/AVOID read of the
+# headline (utils/news_sentiment.py's "recommendation" field) -- purely
+# a function of the headline text, independent of any scan state.
+# "Current State" shows the SAME vocabulary/colors as the live scan's
+# own Recommendation field (_SC_STYLE -- Elite/Execute/Actionable/
+# Developing/Watch/Skip) via _resolve_current_state() below -- what the
+# decision engine currently says about this stock, if it's in this run's
+# scan. These used to be conflated into one column (the old
+# "Recommendation" reused the scan tier directly); keeping them separate
+# means you can see both "what does this news suggest" and "what is the
+# scanner currently saying" without one silently overriding the other.
+def _resolve_current_state(symbols: list[str], scan_df: pd.DataFrame) -> tuple[str, str] | None:
     """Returns (label, hex_color) from the current scan's own Recommendation
     column for the first matched symbol found in it, or None if no matched
     symbol is in the current scan (no scan run yet, or none of the
@@ -4076,29 +4094,44 @@ def _resolve_scan_recommendation(symbols: list[str], scan_df: pd.DataFrame) -> t
     return None
 
 
-# 2026-07-19: display-only cross-check between a headline's LLM sentiment
-# and the stock's CURRENT scan Recommendation. This does NOT feed CV1, the
-# Promotion Engine, or the Decision Orchestrator -- it's a human-readable
-# flag ("this headline agrees/disagrees with what the scanner is already
-# saying about this stock"), nothing more. Only fires for the bullish
-# scan tiers (Actionable/Execute/Elite) since this app is long-only --
-# there's no bearish scan tier for a Positive headline to "confirm".
+# Color palette for the new Groq-derived Recommendation pill — separate
+# from _SC_STYLE (which is scan-tier vocabulary) since BUY/HOLD/AVOID is
+# its own taxonomy now.
+_NI_REC_STYLE = {
+    "BUY":   "#3fb950",
+    "HOLD":  "#d29922",
+    "AVOID": "#f85149",
+}
+
+
+# 2026-07-19: display-only cross-check between Groq's headline-level
+# Recommendation and the stock's Current State (scan tier). This does NOT
+# feed CV1, the Promotion Engine, or the Decision Orchestrator -- it's a
+# human-readable flag ("this headline's own read agrees/disagrees with
+# what the scanner is already saying about this stock"), nothing more.
+# Only fires for the bullish scan tiers (Actionable/Execute/Elite) since
+# this app is long-only -- there's no bearish scan tier for a BUY read to
+# "confirm" against.
 _NI_BULLISH_TIERS = {"ACTIONABLE", "EXECUTE", "ELITE"}
 
 
-def _news_evidence_check(sentiment: str, rec: tuple[str, str] | None) -> tuple[str, str, str] | None:
+def _news_evidence_check(recommendation: str | None, state: tuple[str, str] | None) -> tuple[str, str, str] | None:
     """Returns (icon, css_class, tooltip) or None if there's nothing to
     check against (no matched symbol in the current scan, non-bullish
-    tier, or a Neutral/Unclassified headline with no direction to compare)."""
-    if not rec or sentiment not in ("Positive", "Negative"):
+    tier, or a HOLD/unclassified recommendation with no direction to
+    compare). Compares Groq's headline-level Recommendation against the
+    stock's Current State (scan tier) -- these are now two independent
+    reads (see the module comment above), so this flag tells you whether
+    they happen to agree."""
+    if not state or recommendation not in ("BUY", "AVOID"):
         return None
-    label = rec[0]
+    label = state[0]
     if label not in _NI_BULLISH_TIERS:
         return None
     tier_title = label.title()
-    if sentiment == "Positive":
-        return ("✓", "ni-signal-confirm", f"Confirms current {tier_title} setup")
-    return ("⚠", "ni-signal-contradict", f"Contradicts current {tier_title} setup")
+    if recommendation == "BUY":
+        return ("✓", "ni-signal-confirm", f"Agrees with current {tier_title} state")
+    return ("⚠", "ni-signal-contradict", f"Conflicts with current {tier_title} state")
 
 
 def _news_ago(published) -> str:
@@ -4157,16 +4190,28 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
             if magnitude else '<span class="ni-confidence-dash">—</span>'
         )
 
-        rec = _resolve_scan_recommendation(symbols, scan_df)
-        check = _news_evidence_check(sentiment, rec)
+        # 2026-07-19: Recommendation is now Groq's own read of THIS
+        # headline (BUY/HOLD/AVOID), independent of scan state.
+        recommendation = item.get("recommendation")
+        rec_color = _NI_REC_STYLE.get(recommendation)
         rec_pill_html = (
-            f'<span class="ni-pill" style="background:{rec[1]}22;border:1px solid {rec[1]}66;color:{rec[1]}">{rec[0]}</span>'
-            if rec else '<span class="ni-rec-dash">—</span>'
+            f'<span class="ni-pill" style="background:{rec_color}22;border:1px solid {rec_color}66;color:{rec_color}">{recommendation}</span>'
+            if recommendation else '<span class="ni-rec-dash">—</span>'
         )
-        rec_html = (
-            f'<div class="ni-rec-wrap">{rec_pill_html}'
+
+        # Current State is the scan's own tier (Elite/Execute/Actionable/
+        # etc.) for this symbol, if it's in the current run — a SEPARATE
+        # column from Recommendation now (see module comment above).
+        state = _resolve_current_state(symbols, scan_df)
+        check = _news_evidence_check(recommendation, state)
+        state_pill_html = (
+            f'<span class="ni-pill" style="background:{state[1]}22;border:1px solid {state[1]}66;color:{state[1]}">{state[0]}</span>'
+            if state else '<span class="ni-rec-dash">—</span>'
+        )
+        state_html = (
+            f'<div class="ni-rec-wrap">{state_pill_html}'
             f'<span class="ni-signal-check {check[1]}" title="{check[2]}">{check[0]}</span></div>'
-            if check else rec_pill_html
+            if check else state_pill_html
         )
 
         # 2026-07-17 fix: this used to fall back to symbols[0] only when
@@ -4195,6 +4240,7 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
             if item.get("published") else "—"
         )
 
+
         horizon = item.get("horizon")
         row_tooltip = item.get("impact_note", "") + (f" · {horizon} effect" if horizon else "")
 
@@ -4205,7 +4251,8 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
   <div class="ni-stocks">{stock_chips_html}</div>
   <div class="ni-impact-stack"><span class="ni-impact-text {impact_class}">{impact_label}</span>{impact_extra}</div>
   <div>{confidence_html}</div>
-  <div>{rec_html}</div>
+  <div>{rec_pill_html}</div>
+  <div>{state_html}</div>
   <div>
     <a class="ni-headline" href="{item['link']}" target="_blank" title="{item['title']}">{item['title']}</a>
   </div>
@@ -4268,7 +4315,7 @@ def _news_impact_panel():
 
     header_html = """
 <div class="ni-grid ni-head">
-  <div>TIME</div><div>SECTOR</div><div>STOCK(S)</div><div>IMPACT</div><div>CONFIDENCE</div><div>RECOMMENDATION</div><div>HEADLINE</div><div></div>
+  <div>TIME</div><div>SECTOR</div><div>STOCK(S)</div><div>IMPACT</div><div>CONFIDENCE</div><div>RECOMMENDATION</div><div>CURRENT STATE</div><div>HEADLINE</div><div></div>
 </div>"""
 
     panel_html = f"""
@@ -4451,8 +4498,10 @@ def render(settings: dict | None = None):
 
     # ── News Impact — independent of scan state too, same reasoning as
     #    the market intel strip above: news relevance doesn't wait for
-    #    someone to click Run Scan. Recommendation column only populates
-    #    once a scan has been run (see _resolve_scan_recommendation).
+    #    someone to click Run Scan. Recommendation (BUY/HOLD/AVOID) is
+    #    Groq's own read of the headline and always populates; Current
+    #    State only populates once a scan has been run (see
+    #    _resolve_current_state).
     _news_impact_panel()
 
     if df_aug.empty:
