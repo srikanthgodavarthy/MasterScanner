@@ -191,6 +191,7 @@ with st.expander("🔌 Upstox Pilot Check (token sanity test)", expanded=False):
                         else:
                             st.warning("Empty response — market may be closed or instrument_key is stale.")
 
+from pages.dashboard     import render as render_dashboard
 from pages.scanner       import render as render_scanner
 from pages.backtest      import render as render_backtest
 from pages.settings      import render as render_settings
@@ -258,6 +259,9 @@ settings = {
     "bt_default_engine":         ss.get("bt_default_engine",         "scanner"),
 }
 
+def _page_dashboard():
+    render_dashboard(settings)
+
 def _page_scanner():
     render_scanner(settings)
 
@@ -307,7 +311,8 @@ def _page_data_source_check():
 # user actually has selected — the other nine pages simply don't run.
 pg = st.navigation(
     [
-        st.Page(_page_scanner,      title="Live Scanner",         icon="📡", default=True),
+        st.Page(_page_dashboard,    title="Dashboard",            icon="🖥️", default=True),
+        st.Page(_page_scanner,      title="Live Scanner",         icon="📡"),
         st.Page(_page_pre_breakout, title="Pre-Breakout Scanner", icon="📍"),
         st.Page(_page_backtest,     title="Backtest Engine",      icon="📈"),
         st.Page(_page_lifecycle,    title="Lifecycle",            icon="🔄"),
