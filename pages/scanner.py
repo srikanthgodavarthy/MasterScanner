@@ -1211,7 +1211,7 @@ _CSS = """
      Headline moved to the wide trailing slot (1fr) since it's the only
      variable-length field; everything left of it is a fixed-width
      label/badge column. */
-  grid-template-columns: 58px 88px 92px 104px 74px 96px 118px 1fr 84px;
+  grid-template-columns: 54px 80px 86px 98px 100px 140px 128px 1fr 90px;
   column-gap: 0;
   /* 2026-07-19: top-align, not center — rows with a wrapped stock-chip
      line or an event-type line under Impact are taller than plain rows;
@@ -1222,11 +1222,12 @@ _CSS = """
   align-items: start;
 }
 .ni-head {
-  font-size: 9.5px; font-weight: 700; letter-spacing: 0.06em;
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.04em;
   text-transform: uppercase; color: var(--muted);
   padding: 7px 0;
   background: rgba(255,255,255,0.035);
   border-bottom: 1px solid var(--border);
+  white-space: nowrap;
 }
 .ni-row {
   padding: 9px 0;
@@ -1257,7 +1258,10 @@ _CSS = """
 }
 .ni-symbol-chip:hover { background: rgba(88,166,255,0.22); text-decoration: none; }
 .ni-sector { font-size: 11px; color: var(--muted); }
-.ni-source { font-size: 10px; color: var(--muted); text-align: right; }
+.ni-source {
+  font-size: 10px; color: var(--muted); text-align: right;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 
 /* 2026-07-19: Impact is now plain colored text (mockup style) rather
    than a filled/bordered pill — Recommendation keeps the pill treatment
