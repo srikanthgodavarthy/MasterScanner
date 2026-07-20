@@ -1311,12 +1311,36 @@ def fo_eligible_symbols() -> set:
         return fut_names
 
     type_upper = df[type_col].astype(str).str.upper()
-    eq = df[type_upper == "EQ"] if "EQ" in type_upper.unique() else df
+    eq_fallback_used = "EQ" not in type_upper.unique()
+    eq = df[type_upper == "EQ"] if not eq_fallback_used else df
     name_to_tradingsymbol = {
         str(row[name_col]).strip().upper(): str(row[symbol_col]).strip().upper()
         for _, row in eq.iterrows()
         if pd.notna(row.get(name_col)) and pd.notna(row.get(symbol_col))
     }
+
+    # 2026-07-20 TEMP DIAGNOSTIC — 209/210 F&O symbols are coming back from
+    # this function as raw full names (e.g. "RELIANCE INDUSTRIES LTD")
+    # instead of short tradingsymbols, even though the translation step
+    # above should have converted them. The only way that happens is if
+    # name_to_tradingsymbol[n] == n for these rows — i.e. symbol_col isn't
+    # actually holding short codes for them. This block logs the raw
+    # column values for a couple of known names so the next run's logs
+    # show definitively whether it's a column-resolution bug (wrong
+    # column picked) or an Upstox data-quality issue (tradingsymbol field
+    # itself holding full names for some rows). Remove once diagnosed.
+    logger.info("[fo_eligible_symbols][DIAG] type_col=%s name_col=%s symbol_col=%s "
+                "eq_fallback_used=%s eq_rows=%d df_rows=%d",
+                type_col, name_col, symbol_col, eq_fallback_used, len(eq), len(df))
+    for probe in ("RELIANCE", "BHEL"):
+        hits = eq[eq[name_col].astype(str).str.upper().str.contains(probe, na=False)]
+        if hits.empty:
+            logger.info("[fo_eligible_symbols][DIAG] no eq row with name containing %r", probe)
+            continue
+        for _, row in hits.head(3).iterrows():
+            logger.info("[fo_eligible_symbols][DIAG] probe=%s eq row -> %s=%r  %s=%r  instrument_type=%r",
+                        probe, name_col, row.get(name_col), symbol_col, row.get(symbol_col),
+                        row.get(type_col))
 
     result = set()
     unmatched = []
