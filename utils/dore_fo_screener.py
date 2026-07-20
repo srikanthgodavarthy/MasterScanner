@@ -213,24 +213,23 @@ def stage2_execution_qualification(
     "execution_state", "execution_features"}}. Expected survivors: 15-25.
     """
     cfg = _load_settings(cfg)
-    from utils.upstox_client import fetch_batch_intraday_5m_upstox
+    from utils.upstox_client import fetch_stock_intraday_5m_upstox, fetch_index_intraday_5m_upstox
 
     pool: dict = {}
     symbols = list(daily_pool.keys())
-
-    # 2026-07-20: was a sequential one-symbol-at-a-time loop here (2 real
-    # HTTP calls per symbol * 50-70 symbols = 100-140 blocking calls against
-    # Upstox's 25 req/s / 250-per-min ceiling) despite this function's own
-    # docstring claiming "batched intraday" — see fetch_batch_intraday_5m_
-    # upstox()'s docstring for why that silently collapsed the Stage 2
-    # survivor count once Upstox started 429-ing partway through the run.
-    # Fetching concurrently up front fixes that; everything below this is
-    # otherwise unchanged (still one execution-engine call per symbol,
-    # that part was always cheap/local).
-    intraday_dfs = fetch_batch_intraday_5m_upstox(symbols, progress_cb=progress_cb)
-
+    done = 0
     for symbol in symbols:
-        df = intraday_dfs.get(symbol)
+        try:
+            df = (fetch_index_intraday_5m_upstox(symbol) if symbol in _INDICES
+                  else fetch_stock_intraday_5m_upstox(symbol))
+        except Exception:
+            logger.exception("[DORE Stage2] intraday fetch failed for %s", symbol)
+            df = None
+        finally:
+            done += 1
+            if progress_cb:
+                progress_cb(done, len(symbols))
+
         exec_features = execution_features_from_intraday_5m(df, cfg)
         row = daily_pool[symbol]
         probe = DOREInput(
@@ -288,20 +287,25 @@ def compute_fo_opportunities(
     carrying the full DOREResult (recommendation, scores, TradePlan).
     """
     cfg = _load_settings(cfg)
-    from utils.upstox_client import fetch_oi_resistance, fetch_batch_stock_atm_options_upstox
+    from utils.upstox_client import fetch_oi_resistance, fetch_stock_atm_option
     from utils.oi_snapshot_store import record_and_diff
+    from utils.regime_engine import fetch_india_vix
 
-    # 2026-07-20: was fetch_stock_atm_option() called ONE SYMBOL AT A TIME
-    # inside the loop below — same sequential-fetch anti-pattern Stage 2
-    # had, just one stage later, and the single-symbol call itself had no
-    # 429 retry until this refactor (see _get_option_chain_with_retry()'s
-    # docstring). Pre-fetching concurrently here fixes both at once for
-    # the stock leg; only 3 indices ever go through fetch_oi_resistance(),
-    # so a sequential call for those inside the loop is fine as-is.
-    stock_symbols = [s for s in live_pool if s not in _INDICES]
-    stock_options = fetch_batch_stock_atm_options_upstox(stock_symbols)
+    # Fetched once per run, not once per symbol — VIX is a single market-
+    # wide number, and this list can be 50-100+ symbols; re-fetching it
+    # per symbol would be both wasteful and (if the endpoint fails
+    # partway through the loop) inconsistent across rows in the same
+    # table. A failure here degrades to DORE's existing "not supplied"
+    # neutral fallback (stage4c_iv_health) rather than aborting the scan.
+    try:
+        india_vix = fetch_india_vix()
+    except Exception:
+        logger.warning("[DORE Stage3] India VIX fetch failed — proceeding without it", exc_info=True)
+        india_vix = None
 
     rows = []
+    skipped = 0
+    total = len(live_pool)
     for symbol, row in live_pool.items():
         try:
             if symbol in _INDICES:
@@ -317,8 +321,13 @@ def compute_fo_opportunities(
                                        "expiry": opt.get("expiry")}
                 ce_chg, pe_chg = record_and_diff(symbol, opt.get("total_ce_oi", 0.0), opt.get("total_pe_oi", 0.0))
             else:
-                opt = stock_options.get(symbol)
+                opt = fetch_stock_atm_option(symbol)
                 if opt is None:
+                    logger.warning(
+                        "[DORE Stage3] %s: fetch_stock_atm_option returned None "
+                        "(no listed options / auth expired / empty chain / no "
+                        "valid expiry) — skipped this run", symbol)
+                    skipped += 1
                     continue
                 atm_chain_row = dict(opt)
                 oi_resistance_like = {"ce_strike": opt.get("ce_wall_strike"),
@@ -329,17 +338,28 @@ def compute_fo_opportunities(
             atm_chain_row["pe_oi_change"] = pe_chg
         except Exception:
             logger.exception("[DORE Stage3] option-chain fetch failed for %s", symbol)
+            skipped += 1
             continue
 
         dore_input = build_dore_input(
             symbol=symbol, price=row["price"], trend_features=row.get("trend_features"),
             execution_features=row.get("execution_features"),
             atm_chain_row=atm_chain_row, oi_resistance=oi_resistance_like,
+            india_vix=india_vix,
         )
         result = compute_dore(dore_input, cfg)
         rows.append((result.opportunity_score, result.to_dashboard_row(symbol)))
 
+    if skipped:
+        # A single aggregate line so a mass-skip (token expiry, an Upstox
+        # outage mid-run) reads as one obvious signal in the logs instead
+        # of scrolling past N near-identical per-symbol warnings above.
+        level = logger.error if skipped == total else logger.warning
+        level("[DORE Stage3] %d/%d symbols skipped this run (see warnings above for reasons)",
+              skipped, total)
+
     if not rows:
+        logger.warning("[DORE Stage3] compute_fo_opportunities: 0 rows produced from %d live-pool symbols", total)
         return pd.DataFrame()
     rows.sort(key=lambda pair: pair[0], reverse=True)
     out = pd.DataFrame([row for _, row in rows])

@@ -1487,6 +1487,13 @@ def build_dore_input(
     execution_features: Optional[dict] = None,
     atm_chain_row: Optional[dict] = None,
     oi_resistance: Optional[dict] = None,
+    india_vix: Optional[float] = None,   # 2026-07-20: live India VIX, e.g.
+                                           # utils.regime_engine.fetch_india_vix();
+                                           # caller fetches once per run and passes
+                                           # the same value to every symbol's build —
+                                           # this stays a pure builder, no fetch of
+                                           # its own (same convention as ce_oi_change/
+                                           # pe_oi_change above).
 ) -> DOREInput:
     """DORE 2.0's builder (Section 4/13): assembles a DOREInput purely
     from the shared Market Data Layer (trend_features from
@@ -1544,6 +1551,7 @@ def build_dore_input(
         nearest_expiry=nearest_expiry,
         days_to_expiry=_days_to_expiry(nearest_expiry),
         event_risk_today=atm_chain_row.get("event_risk_today", False),
+        india_vix=india_vix if india_vix is not None else 0.0,
     )
 
 
