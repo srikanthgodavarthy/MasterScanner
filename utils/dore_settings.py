@@ -168,6 +168,57 @@ DORE_DEFAULTS: dict = {
     # ── Misc ─────────────────────────────────────────────────────
     "strike_step":                50.0,  # index strike interval (NIFTY=50, BANKNIFTY=100)
     "min_confidence_to_act":      55.0,  # below this, decision is downgraded to WAIT
+
+    # ══════════════════════════════════════════════════════════════
+    #  DORE 2.0 (docs/DORE_2_0_ARCHITECTURE.md, Rev 3 — FROZEN)
+    # ══════════════════════════════════════════════════════════════
+
+    # ── Stage 1 — Trend Engine (Directional Intent, Section 6) ──
+    "trend_adx_min":              18.0,  # ADX below this = not trending -> forced NEUTRAL
+    "trend_bullish_score_min":    60.0,
+    "trend_bearish_score_max":    40.0,
+    "w_trend_ema_align":          35.0,
+    "w_trend_slope":              20.0,
+    "w_trend_adx":                20.0,
+    "w_trend_rsi":                15.0,
+    "w_trend_volume":             10.0,
+
+    # ── Stage 2 — Execution Engine (Execution State, Section 7) ──
+    "execution_ready_score_min":  70.0,
+    "execution_watch_score_min":  45.0,
+    "w_exec_trigger":             45.0,   # fresh crossover/crossunder or ORB break
+    "w_exec_pullback":            20.0,   # EMA21 pullback/rejection held
+    "w_exec_vwap":                15.0,   # VWAP reclaim/rejection
+    "w_exec_compression":         10.0,   # compression/NR7 coil
+    "w_exec_expansion":           10.0,   # volume/ATR expansion
+
+    # ── Stage 4 — Risk Engine (Section 8) ─────────────────────────
+    "risk_min_rr":                  1.5,  # min Target1:Stop reward:risk
+    "risk_atr_stop_mult":           1.5,  # stop distance, in ATR
+    "risk_target1_atr_mult":        1.5,
+    "risk_target2_atr_mult":        2.5,
+    "risk_target3_atr_mult":        4.0,
+    "risk_iv_percentile_hard_max": 90.0,  # IV percentile hard trip-wire (Section 8)
+    "w_risk_rr":                   35.0,
+    "w_risk_corridor":              25.0,
+    "w_risk_iv_health":             25.0,
+    "w_risk_liquidity":             15.0,
+
+    # ── Stage 3 — Derivative Confidence blend (Section 9) ────────
+    "w_deriv_oi":                   35.0,
+    "w_deriv_premium":              25.0,
+    "w_deriv_momentum":             20.0,
+    "w_deriv_corridor":             20.0,
+
+    # ── Stage 5 — Opportunity Engine (Section 10 weight table) ───
+    "w_opp_trend":                  30.0,
+    "w_opp_execution":              25.0,
+    "w_opp_derivatives":            30.0,
+    "w_opp_risk":                   15.0,
+    "opportunity_score_min":        55.0,  # below this, an otherwise-valid BUY/WATCH downgrades to WAIT
+
+    # ── Stage 0 — Universe / funnel ───────────────────────────────
+    "execution_orb_lookback_bars":    3,   # number of 5m bars forming the opening range
 }
 
 
@@ -287,6 +338,48 @@ class DORESettings:
 
     strike_step: float = 50.0
     min_confidence_to_act: float = 55.0
+
+    # ── DORE 2.0 ─────────────────────────────────────────────────
+    trend_adx_min: float = 18.0
+    trend_bullish_score_min: float = 60.0
+    trend_bearish_score_max: float = 40.0
+    w_trend_ema_align: float = 35.0
+    w_trend_slope: float = 20.0
+    w_trend_adx: float = 20.0
+    w_trend_rsi: float = 15.0
+    w_trend_volume: float = 10.0
+
+    execution_ready_score_min: float = 70.0
+    execution_watch_score_min: float = 45.0
+    w_exec_trigger: float = 45.0
+    w_exec_pullback: float = 20.0
+    w_exec_vwap: float = 15.0
+    w_exec_compression: float = 10.0
+    w_exec_expansion: float = 10.0
+
+    risk_min_rr: float = 1.5
+    risk_atr_stop_mult: float = 1.5
+    risk_target1_atr_mult: float = 1.5
+    risk_target2_atr_mult: float = 2.5
+    risk_target3_atr_mult: float = 4.0
+    risk_iv_percentile_hard_max: float = 90.0
+    w_risk_rr: float = 35.0
+    w_risk_corridor: float = 25.0
+    w_risk_iv_health: float = 25.0
+    w_risk_liquidity: float = 15.0
+
+    w_deriv_oi: float = 35.0
+    w_deriv_premium: float = 25.0
+    w_deriv_momentum: float = 20.0
+    w_deriv_corridor: float = 20.0
+
+    w_opp_trend: float = 30.0
+    w_opp_execution: float = 25.0
+    w_opp_derivatives: float = 30.0
+    w_opp_risk: float = 15.0
+    opportunity_score_min: float = 55.0
+
+    execution_orb_lookback_bars: int = 3
 
     @classmethod
     def from_dict(cls, d: dict | None = None) -> "DORESettings":

@@ -69,6 +69,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
+import pandas as pd
+
 from utils.dore_settings import DORESettings, DORE_DEFAULTS
 
 logger = logging.getLogger(__name__)
@@ -98,6 +100,22 @@ ALL_RECOMMENDATIONS = {
     BUY_PE_NOW, BUY_PE_BREAKDOWN, WATCH_PE, HOLD_PE, BOOK_PE_PROFITS,
     WAIT, NO_TRADE,
 }
+
+# ── DORE 2.0 (docs/DORE_2_0_ARCHITECTURE.md, Section 2.4) ────────────
+# Directional Intent (Stage 1 — Trend Engine) and Execution State
+# (Stage 2 — Execution Engine) are two independent output dimensions,
+# not one collapsed signal — see Principle 2.4.
+
+BULLISH = "BULLISH"
+BEARISH = "BEARISH"
+NEUTRAL = "NEUTRAL"
+ALL_DIRECTIONAL_INTENTS = {BULLISH, BEARISH, NEUTRAL}
+
+READY_NOW        = "READY_NOW"
+BREAKOUT_PENDING = "BREAKOUT_PENDING"
+WATCH            = "WATCH"
+NOT_READY        = "NOT_READY"
+ALL_EXECUTION_STATES = {READY_NOW, BREAKOUT_PENDING, WATCH, NOT_READY}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -192,6 +210,44 @@ class DOREInput:
     position_side:       Optional[str] = None   # "CE" | "PE" | None
     position_entry_price: Optional[float] = None
 
+    # ── DORE 2.0 (docs/DORE_2_0_ARCHITECTURE.md) ─────────────────────
+    # Stage 1 Trend Engine inputs (Section 6) — computed once per completed
+    # daily candle by compute_trend_features(), independent of any
+    # MasterScanner score (Principle 2.1).
+    ema9_slope_pct:   float = 0.0   # % change in EMA9 over the last few daily bars
+    rel_volume:       float = 1.0   # today's daily volume vs its own recent average
+
+    # Stage 2 Execution Engine inputs (Section 7) — computed once per
+    # intraday refresh by execution_features_from_intraday_5m().
+    fresh_crossover:      bool = False    # EMA9/21 crossed bullish this bar
+    fresh_crossunder:     bool = False    # EMA9/21 crossed bearish this bar
+    ema_pullback_bull:    bool = False    # bullish stack, price pulled back to EMA21 and held
+    ema_rejection_bear:   bool = False    # bearish stack, price rallied to EMA21 and rejected
+    vwap:                  float = 0.0
+    orb_high:               float = 0.0   # opening-range high
+    orb_low:                float = 0.0   # opening-range low
+    compression:            bool = False  # range compressed vs recent bars — coiling
+    nr7:                     bool = False # narrowest range in the recent lookback
+    intraday_vol_ratio:     float = 1.0
+    intraday_atr_expansion_pct: float = 0.0
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DORE 2.0 — TRADE PLAN (Section 11)
+# ══════════════════════════════════════════════════════════════════
+
+@dataclass
+class TradePlan:
+    """Direction-aware trade structure — single set of fields, no
+    duplicated long_*/short_* variants (Section 11). Direction determines
+    whether targets sit above or below entry."""
+    direction:  Optional[str] = None   # "CE" | "PE" | None
+    entry:      float = 0.0
+    stop_loss:  float = 0.0
+    target1:    float = 0.0
+    target2:    float = 0.0
+    target3:    float = 0.0
+
 
 # ══════════════════════════════════════════════════════════════════
 #  OUTPUT CONTRACT
@@ -230,6 +286,17 @@ class DOREResult:
     nearest_support:    Optional[float] = None
     reasons:  list = field(default_factory=list)
     warnings: list = field(default_factory=list)
+
+    # ── DORE 2.0 (docs/DORE_2_0_ARCHITECTURE.md, Section 2.4/10) ──────
+    directional_intent: str = "NEUTRAL"     # Stage 1 — BULLISH | BEARISH | NEUTRAL
+    execution_state:    str = "NOT_READY"   # Stage 2 — READY_NOW | BREAKOUT_PENDING | WATCH | NOT_READY
+    trend_score:            float = 50.0    # Stage 1 score (0-100)
+    execution_score:        float = 0.0     # Stage 2 score (0-100)
+    derivative_confidence:  float = 50.0    # Stage 3 composite (0-100)
+    risk_quality:           float = 50.0    # Stage 4 score (0-100)
+    risk_hard_gate_pass:    bool = True      # Stage 4 hard-gate boolean
+    opportunity_score:      float = 0.0     # Stage 5 weighted composite (0-100)
+    trade_plan: "TradePlan" = field(default_factory=TradePlan)   # Section 11
 
     def as_dict(self) -> dict:
         from dataclasses import asdict
@@ -918,7 +985,547 @@ def stage4c_iv_health(inp: DOREInput, cfg: DORESettings) -> tuple[float, list[st
 
 
 # ══════════════════════════════════════════════════════════════════
+#  DORE 2.0 (docs/DORE_2_0_ARCHITECTURE.md, Rev 3 — FROZEN)
+#  STAGE 1 — TREND ENGINE (Directional Intent, Section 6)
+# ══════════════════════════════════════════════════════════════════
+
+def compute_trend_features(df) -> dict:
+    """Derive Stage 1's raw trend indicators from a daily OHLCV
+    DataFrame (oldest-first, columns open/high/low/close/volume) — the
+    shared cached Daily OHLCV Market Data Layer (Section 4, Stage 1).
+    No MasterScanner indicator code is reused here (Principle 2.1):
+    EMA9/21, RSI(14), ATR(14) and ADX(14) are computed directly with
+    Wilder smoothing, independent of utils.scoring_core.
+
+    Returns {} if there isn't enough history for a stable ADX(14)/RSI(14)
+    read (needs ~30+ bars) — callers should skip the symbol on empty dict.
+    """
+    if df is None or len(df) < 30:
+        return {}
+    try:
+        close = df["close"].astype(float)
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+        volume = df["volume"].astype(float) if "volume" in df.columns else None
+
+        ema9 = close.ewm(span=9, adjust=False).mean()
+        ema21 = close.ewm(span=21, adjust=False).mean()
+        lookback = min(5, len(ema9) - 1)
+        prior_ema9 = ema9.iloc[-1 - lookback]
+        ema9_slope_pct = float((ema9.iloc[-1] - prior_ema9) / prior_ema9 * 100.0) if prior_ema9 else 0.0
+
+        delta = close.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, 1e-9)
+        rsi_series = 100 - (100 / (1 + rs))
+        rsi = float(rsi_series.iloc[-1]) if not math.isnan(rsi_series.iloc[-1]) else 50.0
+
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        atr_series = tr.ewm(alpha=1 / 14, adjust=False).mean()
+        atr = float(atr_series.iloc[-1]) if not math.isnan(atr_series.iloc[-1]) else 0.0
+
+        up_move = high.diff()
+        down_move = -low.diff()
+        plus_dm = ((up_move > down_move) & (up_move > 0)) * up_move.clip(lower=0)
+        minus_dm = ((down_move > up_move) & (down_move > 0)) * down_move.clip(lower=0)
+        atr_for_di = tr.ewm(alpha=1 / 14, adjust=False).mean().replace(0, 1e-9)
+        plus_di = 100 * plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_for_di
+        minus_di = 100 * minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_for_di
+        dx = (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-9) * 100
+        adx_series = dx.ewm(alpha=1 / 14, adjust=False).mean()
+        adx = float(adx_series.iloc[-1]) if not math.isnan(adx_series.iloc[-1]) else 0.0
+
+        rel_volume = 1.0
+        if volume is not None and len(volume) >= 21:
+            avg_vol = volume.iloc[-21:-1].mean()
+            rel_volume = float(volume.iloc[-1] / avg_vol) if avg_vol else 1.0
+
+        return {
+            "price": float(close.iloc[-1]),
+            "ema9": float(ema9.iloc[-1]),
+            "ema21": float(ema21.iloc[-1]),
+            "ema9_slope_pct": ema9_slope_pct,
+            "rsi": rsi,
+            "atr": atr,
+            "adx": adx,
+            "rel_volume": rel_volume,
+        }
+    except Exception:
+        logger.exception("compute_trend_features failed")
+        return {}
+
+
+def stage1_trend_engine(inp: DOREInput, cfg: DORESettings) -> tuple[float, str, list[str]]:
+    """Blend EMA9/21 alignment, EMA9 slope, ADX, RSI, and relative volume
+    into a single 0-100 Trend Score, then bucket into Directional Intent
+    — BULLISH / BEARISH / NEUTRAL (Section 6). Score is centred at 50;
+    low ADX (no real trend) forces NEUTRAL outright, since the whole
+    point of Stage 1 is to remove obviously non-trending symbols before
+    anything more expensive runs (Section 4).
+    """
+    reasons: list[str] = []
+
+    ema_bull = inp.ema9 > inp.ema21
+    ema_align_score = 100.0 if ema_bull else 0.0
+    reasons.append(f"EMA9 {'>' if ema_bull else '<'} EMA21")
+
+    slope_score = _pct_score(inp.ema9_slope_pct, -1.5, 1.5)
+    reasons.append(f"EMA9 slope={inp.ema9_slope_pct:.2f}%")
+
+    adx_score = _pct_score(inp.adx, 10.0, 35.0)
+    reasons.append(f"ADX={inp.adx:.1f}")
+
+    rsi_score = _pct_score(inp.rsi, cfg.bias_rsi_bear_max, cfg.bias_rsi_bull_min)
+    reasons.append(f"RSI={inp.rsi:.1f}")
+
+    vol_score = _pct_score(inp.rel_volume, 0.5, max(cfg.bias_vol_ratio_min * 2, 1.5))
+    reasons.append(f"Relative Volume={inp.rel_volume:.2f}x")
+
+    trend_score = _weighted([
+        (ema_align_score, cfg.w_trend_ema_align),
+        (slope_score,     cfg.w_trend_slope),
+        (adx_score,        cfg.w_trend_adx),
+        (rsi_score,         cfg.w_trend_rsi),
+        (vol_score,          cfg.w_trend_volume),
+    ])
+
+    if inp.adx < cfg.trend_adx_min:
+        intent = NEUTRAL
+        reasons.append(f"ADX={inp.adx:.1f} below trending floor ({cfg.trend_adx_min}) — forced NEUTRAL")
+    elif trend_score >= cfg.trend_bullish_score_min:
+        intent = BULLISH
+    elif trend_score <= cfg.trend_bearish_score_max:
+        intent = BEARISH
+    else:
+        intent = NEUTRAL
+
+    logger.info("[DORE2:%s] Stage1 Trend score=%.1f intent=%s", inp.symbol, trend_score, intent)
+    return trend_score, intent, reasons
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DORE 2.0 — STAGE 2 — EXECUTION ENGINE (Execution State, Section 7)
+# ══════════════════════════════════════════════════════════════════
+
+def stage2_execution_engine(
+    inp: DOREInput, cfg: DORESettings, directional_intent: str,
+) -> tuple[float, str, list[str]]:
+    """Score whether THIS moment is tradeable on the side Stage 1 already
+    picked. Only the signals relevant to `directional_intent` are
+    evaluated (Section 7) — a BEARISH trend never gets credit for a
+    bullish VWAP reclaim. Returns (execution_score, execution_state,
+    reasons); NEUTRAL intent short-circuits straight to NOT_READY since
+    there is no side to execute on.
+    """
+    reasons: list[str] = []
+    if directional_intent == NEUTRAL:
+        return 0.0, NOT_READY, ["Directional Intent NEUTRAL — nothing to execute"]
+
+    bullish = directional_intent == BULLISH
+    fresh_trigger = inp.fresh_crossover if bullish else inp.fresh_crossunder
+    pullback_held = inp.ema_pullback_bull if bullish else inp.ema_rejection_bear
+    orb_break = (inp.price > inp.orb_high > 0) if bullish else (0 < inp.price < inp.orb_low)
+    vwap_side = (inp.vwap > 0 and inp.price > inp.vwap) if bullish else (inp.vwap > 0 and inp.price < inp.vwap)
+    expansion = inp.intraday_vol_ratio >= 1.2 or inp.intraday_atr_expansion_pct >= 15.0
+
+    trigger_score = 100.0 if (fresh_trigger or orb_break) else 0.0
+    if fresh_trigger:
+        reasons.append(f"Fresh EMA9/21 {'crossover' if bullish else 'crossunder'}")
+    if orb_break:
+        reasons.append(f"Price through opening-range {'high' if bullish else 'low'}")
+
+    pullback_score = 100.0 if pullback_held else 0.0
+    if pullback_held:
+        reasons.append(f"EMA21 {'pullback held' if bullish else 'rejection held'}")
+
+    vwap_score = 100.0 if vwap_side else 0.0
+    if vwap_side:
+        reasons.append(f"Price {'above' if bullish else 'below'} VWAP")
+
+    compression_score = 100.0 if (inp.compression or inp.nr7) else 0.0
+    if inp.compression or inp.nr7:
+        reasons.append("Range compressed (NR7/compression) — coiling")
+
+    expansion_score = 100.0 if expansion else 0.0
+    if expansion:
+        reasons.append(f"Volume/ATR expansion (vol ratio={inp.intraday_vol_ratio:.2f}x, "
+                        f"ATR expansion={inp.intraday_atr_expansion_pct:.1f}%)")
+
+    execution_score = _weighted([
+        (trigger_score,      cfg.w_exec_trigger),
+        (pullback_score,     cfg.w_exec_pullback),
+        (vwap_score,          cfg.w_exec_vwap),
+        (compression_score,   cfg.w_exec_compression),
+        (expansion_score,     cfg.w_exec_expansion),
+    ])
+
+    if (fresh_trigger or orb_break) and execution_score >= cfg.execution_ready_score_min:
+        state = READY_NOW
+    elif (inp.compression or inp.nr7) and execution_score >= cfg.execution_watch_score_min:
+        state = BREAKOUT_PENDING
+    elif execution_score >= cfg.execution_watch_score_min:
+        state = WATCH
+    else:
+        state = NOT_READY
+
+    logger.info("[DORE2:%s] Stage2 Execution score=%.1f state=%s", inp.symbol, execution_score, state)
+    return execution_score, state, reasons
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DORE 2.0 — TRADE PLAN (Section 11)
+# ══════════════════════════════════════════════════════════════════
+
+def build_trade_plan(inp: DOREInput, cfg: DORESettings, direction: Optional[str]) -> "TradePlan":
+    """ATR-scaled Entry/Stop/Target1-3, direction-aware (Section 11).
+    `direction` "CE" targets above entry / stop below; "PE" mirrors it.
+    None direction returns a flat plan (entry only) — used only for
+    reporting on WAIT/NO_TRADE reads."""
+    entry = inp.price
+    atr = inp.atr if inp.atr > 0 else max(entry * 0.01, 1e-6)
+
+    if direction == "CE":
+        return TradePlan(
+            direction="CE", entry=round(entry, 2),
+            stop_loss=round(entry - atr * cfg.risk_atr_stop_mult, 2),
+            target1=round(entry + atr * cfg.risk_target1_atr_mult, 2),
+            target2=round(entry + atr * cfg.risk_target2_atr_mult, 2),
+            target3=round(entry + atr * cfg.risk_target3_atr_mult, 2),
+        )
+    if direction == "PE":
+        return TradePlan(
+            direction="PE", entry=round(entry, 2),
+            stop_loss=round(entry + atr * cfg.risk_atr_stop_mult, 2),
+            target1=round(entry - atr * cfg.risk_target1_atr_mult, 2),
+            target2=round(entry - atr * cfg.risk_target2_atr_mult, 2),
+            target3=round(entry - atr * cfg.risk_target3_atr_mult, 2),
+        )
+    return TradePlan(direction=None, entry=round(entry, 2))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DORE 2.0 — STAGE 4 — RISK ENGINE (Section 8)
+# ══════════════════════════════════════════════════════════════════
+
+def stage4_risk_engine(
+    inp: DOREInput, cfg: DORESettings, trade_plan: "TradePlan",
+    corridor_score: float, iv_health_score: float, iv_crush_risk: bool,
+) -> tuple[float, bool, list[str]]:
+    """'If we take this trade, what could go wrong, and is it
+    acceptable?' — a distinct concern from Stage 3's chain confirmation
+    (Section 8). Reuses Stage 4's corridor room and Stage 4c's IV health
+    rather than recomputing them. Returns (risk_score, hard_gate_pass,
+    reasons); hard_gate_pass=False forces NO_TRADE regardless of score
+    (the trip-wire concept from the original Stage 4c, actually wired
+    here this time).
+    """
+    reasons: list[str] = []
+    hard_gate_pass = True
+
+    if trade_plan.direction and trade_plan.stop_loss:
+        risk = abs(trade_plan.entry - trade_plan.stop_loss)
+        reward = abs(trade_plan.target1 - trade_plan.entry)
+        rr = (reward / risk) if risk > 1e-9 else 0.0
+        rr_score = _pct_score(rr, cfg.risk_min_rr * 0.5, cfg.risk_min_rr * 1.5)
+        reasons.append(f"Reward:Risk (Entry->Target1 vs Entry->Stop)={rr:.2f}")
+        if rr < cfg.risk_min_rr:
+            reasons.append(f"R:R {rr:.2f} below floor ({cfg.risk_min_rr}) — thin edge")
+    else:
+        rr_score = 50.0
+        reasons.append("No direction yet — R:R not evaluated")
+
+    liquidity_oi = max(inp.ce_oi, inp.pe_oi)
+    liquidity_score = _pct_score(liquidity_oi, cfg.premium_min_oi_liquidity * 0.3, cfg.premium_min_oi_liquidity * 1.5)
+    reasons.append(f"Liquidity OI={liquidity_oi:,.0f}")
+
+    if inp.iv_percentile is not None and inp.iv_percentile >= cfg.risk_iv_percentile_hard_max:
+        hard_gate_pass = False
+        reasons.append(f"IV percentile={inp.iv_percentile:.0f} >= hard trip-wire "
+                        f"({cfg.risk_iv_percentile_hard_max}) — event/IV-crush risk, NO_TRADE")
+    if inp.event_risk_today:
+        hard_gate_pass = False
+        reasons.append("Event risk flagged today — hard trip-wire, NO_TRADE")
+
+    risk_score = _weighted([
+        (rr_score,          cfg.w_risk_rr),
+        (corridor_score,     cfg.w_risk_corridor),
+        (iv_health_score,     cfg.w_risk_iv_health),
+        (liquidity_score,     cfg.w_risk_liquidity),
+    ])
+    if iv_crush_risk:
+        risk_score = min(risk_score, 40.0)
+
+    logger.info("[DORE2:%s] Stage4 Risk score=%.1f hard_gate_pass=%s", inp.symbol, risk_score, hard_gate_pass)
+    return risk_score, hard_gate_pass, reasons
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DORE 2.0 — STAGE 5 — OPPORTUNITY RANKING (Section 10)
+# ══════════════════════════════════════════════════════════════════
+
+_OPPORTUNITY_TABLE = {
+    (BULLISH, READY_NOW):        BUY_CE_NOW,
+    (BULLISH, BREAKOUT_PENDING): BUY_CE_BREAKOUT,
+    (BULLISH, WATCH):            WATCH_CE,
+    (BEARISH, READY_NOW):        BUY_PE_NOW,
+    (BEARISH, BREAKOUT_PENDING): BUY_PE_BREAKDOWN,
+    (BEARISH, WATCH):            WATCH_PE,
+}
+
+
+def stage5_opportunity_ranking(
+    cfg: DORESettings, directional_intent: str, execution_state: str,
+    trend_score: float, execution_score: float, derivative_confidence: float,
+    risk_score: float, risk_hard_gate_pass: bool,
+) -> tuple[str, Optional[str], float, list[str]]:
+    """Merge Stages 1-4 into one recommendation via the composition table
+    (Section 10) plus a single weighted Opportunity Score — no new
+    market-data requests, pure composition (Section 4, Stage 5).
+    Returns (recommendation, direction, opportunity_score, reasons).
+    """
+    reasons: list[str] = []
+    opportunity_score = _weighted([
+        (trend_score,             cfg.w_opp_trend),
+        (execution_score,         cfg.w_opp_execution),
+        (derivative_confidence,   cfg.w_opp_derivatives),
+        (risk_score,              cfg.w_opp_risk),
+    ])
+
+    if execution_state == NOT_READY:
+        reasons.append("Execution State NOT_READY — WAIT")
+        return WAIT, None, opportunity_score, reasons
+    if directional_intent == NEUTRAL:
+        reasons.append("Directional Intent NEUTRAL — WAIT")
+        return WAIT, None, opportunity_score, reasons
+    if not risk_hard_gate_pass:
+        reasons.append("Risk Engine hard gate failed — NO_TRADE")
+        return NO_TRADE, None, opportunity_score, reasons
+
+    recommendation = _OPPORTUNITY_TABLE.get((directional_intent, execution_state), WAIT)
+    direction = "CE" if directional_intent == BULLISH else "PE"
+
+    if recommendation != WAIT and opportunity_score < cfg.opportunity_score_min:
+        reasons.append(f"Opportunity Score={opportunity_score:.0f} below floor "
+                        f"({cfg.opportunity_score_min}) — downgraded to WAIT")
+        return WAIT, direction, opportunity_score, reasons
+
+    reasons.append(f"Directional Intent={directional_intent} + Execution State={execution_state} "
+                    f"-> {recommendation} (Opportunity Score={opportunity_score:.0f})")
+    return recommendation, direction, opportunity_score, reasons
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DORE 2.0 — INPUT BUILDERS
+# ══════════════════════════════════════════════════════════════════
+
+def build_dore_input(
+    symbol: str,
+    price: float,
+    trend_features: Optional[dict] = None,
+    execution_features: Optional[dict] = None,
+    atm_chain_row: Optional[dict] = None,
+    oi_resistance: Optional[dict] = None,
+) -> DOREInput:
+    """DORE 2.0's builder (Section 4/13): assembles a DOREInput purely
+    from the shared Market Data Layer (trend_features from
+    compute_trend_features(), execution_features from
+    execution_features_from_intraday_5m()) plus the live option chain —
+    never from a MasterScanner score (Principle 2.1)."""
+    trend_features = trend_features or {}
+    execution_features = execution_features or {}
+    atm_chain_row = atm_chain_row or {}
+    oi_resistance = oi_resistance or {}
+
+    nearest_expiry = atm_chain_row.get("expiry") or oi_resistance.get("expiry", "")
+
+    return DOREInput(
+        symbol=symbol,
+        price=price or trend_features.get("price", 0.0),
+        ema9=trend_features.get("ema9", 0.0),
+        ema21=trend_features.get("ema21", 0.0),
+        ema9_slope_pct=trend_features.get("ema9_slope_pct", 0.0),
+        rsi=trend_features.get("rsi", 50.0),
+        atr=trend_features.get("atr", 0.0),
+        adx=trend_features.get("adx", 0.0),
+        rel_volume=trend_features.get("rel_volume", 1.0),
+
+        fresh_crossover=execution_features.get("fresh_crossover", False),
+        fresh_crossunder=execution_features.get("fresh_crossunder", False),
+        ema_pullback_bull=execution_features.get("ema_pullback_bull", False),
+        ema_rejection_bear=execution_features.get("ema_rejection_bear", False),
+        vwap=execution_features.get("vwap", 0.0),
+        orb_high=execution_features.get("orb_high", 0.0),
+        orb_low=execution_features.get("orb_low", 0.0),
+        compression=execution_features.get("compression", False),
+        nr7=execution_features.get("nr7", False),
+        intraday_vol_ratio=execution_features.get("intraday_vol_ratio", 1.0),
+        intraday_atr_expansion_pct=execution_features.get("intraday_atr_expansion_pct", 0.0),
+
+        atm_strike=atm_chain_row.get("atm_strike", 0.0),
+        ce_premium=atm_chain_row.get("ce_premium", 0.0),
+        pe_premium=atm_chain_row.get("pe_premium", 0.0),
+        ce_premium_prev=atm_chain_row.get("ce_premium_prev"),
+        pe_premium_prev=atm_chain_row.get("pe_premium_prev"),
+        ce_oi=atm_chain_row.get("ce_oi", 0.0),
+        pe_oi=atm_chain_row.get("pe_oi", 0.0),
+        ce_oi_change=atm_chain_row.get("ce_oi_change", 0.0),
+        pe_oi_change=atm_chain_row.get("pe_oi_change", 0.0),
+        ce_bid_ask_spread_pct=atm_chain_row.get("ce_spread_pct"),
+        pe_bid_ask_spread_pct=atm_chain_row.get("pe_spread_pct"),
+        pcr=atm_chain_row.get("pcr", 1.0),
+        pcr_prev=atm_chain_row.get("pcr_prev"),
+        ce_delta=atm_chain_row.get("ce_delta"),
+        pe_delta=atm_chain_row.get("pe_delta"),
+        iv_percentile=atm_chain_row.get("iv_percentile"),
+        highest_ce_oi_strike=oi_resistance.get("ce_strike", 0.0),
+        highest_pe_oi_strike=oi_resistance.get("pe_strike", 0.0),
+        nearest_expiry=nearest_expiry,
+        days_to_expiry=_days_to_expiry(nearest_expiry),
+        event_risk_today=atm_chain_row.get("event_risk_today", False),
+    )
+
+
+def build_dore_input_for_index(
+    index_key: str,                    # "NIFTY" | "SENSEX" | "BANKNIFTY"
+    ohlcv,                              # daily OHLCV DataFrame for the index
+    oi_resistance: Optional[dict],      # utils.upstox_client.fetch_oi_resistance() output
+    atm_chain_row: Optional[dict] = None,
+    execution_features: Optional[dict] = None,
+) -> Optional[DOREInput]:
+    """DORE 2.0's index-level counterpart to build_dore_input() — Nifty/
+    Sensex/BankNifty aren't part of the F&O stock universe, so this
+    derives Trend features straight from the index's own daily OHLCV
+    (compute_trend_features) rather than any MasterScanner bar/CV1
+    object (Principle 2.1). Execution features are computed by the
+    caller (execution_features_from_intraday_5m on the index's own 5m
+    candles) and passed straight through. Returns None if there isn't
+    enough OHLCV history for a stable Trend Engine read.
+    """
+    features = compute_trend_features(ohlcv)
+    if not features:
+        logger.warning("[DORE2:%s] insufficient daily OHLCV for Trend Engine — skipping", index_key)
+        return None
+    return build_dore_input(
+        symbol=index_key,
+        price=features.get("price", 0.0),
+        trend_features=features,
+        execution_features=execution_features,
+        atm_chain_row=atm_chain_row,
+        oi_resistance=oi_resistance,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DORE 2.0 — ORCHESTRATOR
+# ══════════════════════════════════════════════════════════════════
+
+def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOREResult:
+    """Run the full DORE 2.0 funnel (Stages 1-5) on a DOREInput already
+    assembled by build_dore_input()/build_dore_input_for_index() and
+    return one DOREResult. Independent of MasterScanner's own scores
+    throughout (Principle 2.1) — deterministic given the same inp+cfg.
+    """
+    cfg = settings or DORESettings.from_dict(DORE_DEFAULTS)
+
+    trend_score, directional_intent, trend_reasons = stage1_trend_engine(inp, cfg)
+    execution_score, execution_state, exec_reasons = stage2_execution_engine(inp, cfg, directional_intent)
+
+    # Stage 3 — Derivative Intelligence: reuse the OI/Premium/Momentum/
+    # Corridor sub-engines (they operate on live-chain fields only, never
+    # on a MasterScanner score, so they're already DORE-2.0-clean).
+    oi_score, oi_reasons = stage2_oi_structure(inp, cfg, directional_intent)
+    direction = "CE" if directional_intent == BULLISH else ("PE" if directional_intent == BEARISH else None)
+    premium_score, premium_reasons = stage3_premium_quality(inp, cfg, direction)
+    momentum_score, momentum_reasons = stage3b_intraday_momentum(inp, cfg, direction)
+    upside_score, downside_score, expected_move, resistance, support, corridor_reasons = stage4_oi_corridor(inp, cfg)
+    corridor_score = _corridor_score(cfg, direction, upside_score, downside_score)
+
+    derivative_confidence = _weighted([
+        (oi_score,          cfg.w_deriv_oi),
+        (premium_score,      cfg.w_deriv_premium),
+        (momentum_score,      cfg.w_deriv_momentum),
+        (corridor_score,       cfg.w_deriv_corridor),
+    ])
+
+    iv_health_score, iv_reasons, iv_crush_risk = stage4c_iv_health(inp, cfg)
+    trade_plan = build_trade_plan(inp, cfg, direction)
+    risk_score, risk_hard_gate_pass, risk_reasons = stage4_risk_engine(
+        inp, cfg, trade_plan, corridor_score, iv_health_score, iv_crush_risk)
+
+    recommendation, opp_direction, opportunity_score, opp_reasons = stage5_opportunity_ranking(
+        cfg, directional_intent, execution_state, trend_score, execution_score,
+        derivative_confidence, risk_score, risk_hard_gate_pass,
+    )
+    direction = opp_direction or direction
+
+    if recommendation in (BUY_CE_NOW, BUY_CE_BREAKOUT, BUY_PE_NOW, BUY_PE_BREAKDOWN):
+        strike_type, recommended_expiry, strike_reasons = stage5b_strike_and_expiry(
+            inp, cfg, direction, momentum_score, iv_crush_risk)
+    else:
+        strike_type, recommended_expiry, strike_reasons = None, None, []
+
+    warnings: list[str] = []
+    if iv_health_score < cfg.iv_health_score_min:
+        warnings.append(f"IV Health={iv_health_score:.0f} below floor ({cfg.iv_health_score_min})")
+    if not risk_hard_gate_pass:
+        warnings.append("Risk Engine hard gate failed (IV-crush / event risk)")
+
+    reasons = (trend_reasons + exec_reasons + oi_reasons + premium_reasons + momentum_reasons
+               + corridor_reasons + iv_reasons + risk_reasons + opp_reasons + strike_reasons)
+
+    result = DOREResult(
+        recommendation=recommendation,
+        confidence=round(opportunity_score, 1),
+        market_bias=round(trend_score, 1),
+        market_bias_label=directional_intent,
+        oi_structure_score=round(oi_score, 1),
+        premium_quality_score=round(premium_score, 1),
+        intraday_momentum_score=round(momentum_score, 1),
+        corridor_score=round(corridor_score, 1),
+        iv_health_score=round(iv_health_score, 1),
+        iv_crush_risk=iv_crush_risk,
+        recommended_strike_type=strike_type,
+        recommended_expiry=recommended_expiry,
+        conviction_score_10=round(opportunity_score / 10.0, 1),
+        suggested_direction=direction,
+        suggested_strike=inp.atm_strike or None,
+        expected_move=expected_move,
+        nearest_resistance=round(resistance, 2) if resistance else None,
+        nearest_support=round(support, 2) if support else None,
+        reasons=reasons,
+        warnings=warnings,
+        directional_intent=directional_intent,
+        execution_state=execution_state,
+        trend_score=round(trend_score, 1),
+        execution_score=round(execution_score, 1),
+        derivative_confidence=round(derivative_confidence, 1),
+        risk_quality=round(risk_score, 1),
+        risk_hard_gate_pass=risk_hard_gate_pass,
+        opportunity_score=round(opportunity_score, 1),
+        trade_plan=trade_plan,
+    )
+
+    logger.info(
+        "[DORE2:%s] FINAL recommendation=%s intent=%s exec_state=%s trend=%.1f execution=%.1f "
+        "derivative_confidence=%.1f risk=%.1f opportunity=%.1f hard_gate_pass=%s",
+        inp.symbol, recommendation, directional_intent, execution_state, trend_score,
+        execution_score, derivative_confidence, risk_score, opportunity_score, risk_hard_gate_pass,
+    )
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
 #  STAGE 5 — DECISION ENGINE  (the decision tree)
+#  [PRE-2.0 — drives compute_dore_cv1_legacy() only, see that function's
+#  docstring. Superseded by stage5_opportunity_ranking() above.]
 # ══════════════════════════════════════════════════════════════════
 
 def stage5_decision(
@@ -1263,8 +1870,16 @@ def stage6_confidence(
 #  ORCHESTRATOR
 # ══════════════════════════════════════════════════════════════════
 
-def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOREResult:
-    """Run all stages and return a single DOREResult. Deterministic:
+def compute_dore_cv1_legacy(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOREResult:
+    """PRE-2.0 orchestrator (Leadership/Conviction/Entry-Quality-coupled).
+    Superseded 2026-07-20 by the DORE 2.0 `compute_dore()` below, which
+    is independent of MasterScanner's scores (Principle 2.1). Kept here,
+    unused by anything else in the codebase, only as a reference for the
+    stage1_market_bias/stage5_decision CV1-based decision tree it drove —
+    do not wire this back in without also reverting build_dore_input_for_index
+    and utils.dore_fo_screener to their pre-2.0 versions.
+
+    Run all stages and return a single DOREResult. Deterministic:
     same `inp` + same `settings` always produces the same output.
     """
     cfg = settings or DORESettings.from_dict(DORE_DEFAULTS)
@@ -1406,7 +2021,7 @@ def _days_to_expiry(expiry_str: str) -> int:
         return 0
 
 
-def build_dore_input_for_index(
+def build_dore_input_for_index_cv1_legacy(
     symbol: str,                       # "NIFTY" | "SENSEX" | "BANKNIFTY"
     index_df,                          # OHLCV DataFrame: fetch_nifty_ohlcv() / fetch_sensex_ohlcv()
     nifty_series,                      # pd.Series of Nifty closes, for the RS-composite sub-score
