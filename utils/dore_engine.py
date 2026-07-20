@@ -243,13 +243,50 @@ class DOREInput:
 class TradePlan:
     """Direction-aware trade structure — single set of fields, no
     duplicated long_*/short_* variants (Section 11). Direction determines
-    whether targets sit above or below entry."""
+    whether targets sit above or below entry.
+
+    NOTE: these levels are on the UNDERLYING (spot), not the option
+    premium — that's deliberate. Section 8's Risk Engine R:R input reads
+    off this spread precisely because ATR-on-spot is a clean, delta-
+    independent measure of "how far does the underlying need to move".
+    For a premium-denominated trade plan (what a trader actually places
+    orders against), see PremiumPlan / build_premium_plan below — it's
+    derived FROM this TradePlan, not a replacement for it.
+    """
     direction:  Optional[str] = None   # "CE" | "PE" | None
     entry:      float = 0.0
     stop_loss:  float = 0.0
     target1:    float = 0.0
     target2:    float = 0.0
     target3:    float = 0.0
+
+
+@dataclass
+class PremiumPlan:
+    """Option-premium-denominated counterpart to TradePlan — what the
+    dashboard/output table shows (Entry/SL/T1/T2 in ₹ premium, not spot
+    points), since that's what a trader actually enters/exits at.
+
+    Derived from TradePlan's spot levels via delta scaling: a spot move
+    of `dS` is approximated as a premium move of `abs(delta) * dS`. This
+    is a first-order approximation only — it ignores gamma (delta itself
+    changes as spot moves), theta decay between now and target, and IV
+    change — so it will drift from the live premium on a slow-grinding
+    trade or near expiry. `is_approximate=True` whenever no live delta
+    was available and a fallback constant had to be used instead;
+    surface that in the UI (e.g. an asterisk) rather than presenting a
+    fallback-derived number with the same confidence as a delta-backed
+    one. Target 3 is deliberately dropped here — see the "simplify the
+    output" request; TradePlan still carries target3 for anyone who
+    needs the fuller spot-based plan.
+    """
+    direction:      Optional[str] = None   # "CE" | "PE" | None
+    current_premium: float = 0.0            # live ATM/near-ATM LTP right now (inp.ce_premium/pe_premium)
+    entry:          float = 0.0
+    stop_loss:      float = 0.0
+    target1:        float = 0.0
+    target2:        float = 0.0
+    is_approximate: bool = False            # True if delta was unavailable and a fallback was used
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -300,6 +337,7 @@ class DOREResult:
     risk_hard_gate_pass:    bool = True      # Stage 4 hard-gate boolean
     opportunity_score:      float = 0.0     # Stage 5 weighted composite (0-100)
     trade_plan: "TradePlan" = field(default_factory=TradePlan)   # Section 11
+    premium_plan: "PremiumPlan" = field(default_factory=PremiumPlan)  # dashboard display (see PremiumPlan docstring)
 
     def as_dict(self) -> dict:
         from dataclasses import asdict
@@ -309,6 +347,61 @@ class DOREResult:
         d["oi_score"] = d["oi_structure_score"]
         d["premium_score"] = d["premium_quality_score"]
         return d
+
+    def to_dashboard_row(self, symbol: str) -> dict:
+        """One row in the simplified dashboard format — Hard Gate Pass
+        dropped (it's already expressed as NO_TRADE in Recommendation),
+        Target 3 dropped, Entry/SL/T1/T2 are option premium (₹) via
+        PremiumPlan, not the underlying spot levels TradePlan carries.
+        A "Premium" column is included separately as the live current
+        LTP (PremiumPlan.current_premium) — for a READY_NOW recommendation
+        this equals Entry; for BREAKOUT_PENDING/WATCH they can differ,
+        which is the point of keeping both columns.
+
+        `Reason` is HTML — a small collapsed header (the single most
+        decisive reason line) that expands to the full reasons list on
+        click, via the same <details>/<summary> idiom pages/dashboard.py
+        already uses for the DORE debug block (_dore_debug_html), rather
+        than introducing a second collapsible pattern. If this row is
+        rendered through st.dataframe (which does not render HTML), pass
+        the row dict through st.markdown per-cell instead, or build a
+        plain HTML <table> the way the index DORE cards already do.
+        """
+        pp = self.premium_plan
+        leg = self.suggested_direction or ""
+        headline = self.reasons[0] if self.reasons else "—"
+        rest = self.reasons[1:] if len(self.reasons) > 1 else []
+        if rest:
+            items_html = "".join(f'<li style="margin-bottom:2px">{r}</li>' for r in rest)
+            reason_html = (
+                f'<details style="font-size:11px;">'
+                f'<summary style="cursor:pointer;color:var(--text);user-select:none;">{headline}</summary>'
+                f'<ul style="margin:4px 0 0 16px;padding:0;color:var(--muted);">{items_html}</ul>'
+                f'</details>'
+            )
+        else:
+            reason_html = headline
+        return {
+            "Symbol": symbol,
+            "Recommendation": self.recommendation,
+            "Leg": leg,
+            "Strike": self.suggested_strike,
+            "Premium": pp.current_premium if pp.direction else None,
+            "Directional Intent": self.directional_intent,
+            "Strike Type": self.recommended_strike_type,
+            "Execution State": self.execution_state,
+            "Trend": round(self.trend_score),
+            "Execution": round(self.execution_score),
+            "Derivatives": round(self.derivative_confidence),
+            "Risk": round(self.risk_quality),
+            "Opportunity": round(self.opportunity_score),
+            "Entry": pp.entry if pp.direction else None,
+            "SL": pp.stop_loss if pp.direction else None,
+            "T1": pp.target1 if pp.direction else None,
+            "T2": pp.target2 if pp.direction else None,
+            "Expiry": self.recommended_expiry,
+            "Reason": reason_html,
+        }
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1214,6 +1307,47 @@ def build_trade_plan(inp: DOREInput, cfg: DORESettings, direction: Optional[str]
     return TradePlan(direction=None, entry=round(entry, 2))
 
 
+def build_premium_plan(
+    inp: DOREInput, cfg: DORESettings, trade_plan: "TradePlan", direction: Optional[str],
+) -> "PremiumPlan":
+    """Convert TradePlan's spot-based Entry/SL/T1/T2/T3 into an option-
+    premium-denominated plan (see PremiumPlan's docstring for the delta-
+    scaling approximation and its limits). T3 is intentionally dropped
+    from the premium view.
+
+    `current_premium` is always the live ATM/near-ATM LTP
+    (inp.ce_premium/pe_premium) regardless of delta availability — that
+    number is a direct read, never derived, so it's never approximate.
+    """
+    if direction not in ("CE", "PE"):
+        return PremiumPlan(direction=None)
+
+    current_premium = inp.ce_premium if direction == "CE" else inp.pe_premium
+    delta = inp.ce_delta if direction == "CE" else inp.pe_delta
+    is_approximate = delta is None
+    d = abs(delta) if delta is not None else cfg.premium_plan_fallback_delta
+
+    spot_entry = trade_plan.entry
+    # CE premium falls when spot falls toward stop, rises toward target;
+    # PE is the mirror (premium rises as spot falls toward its target).
+    sign = 1.0 if direction == "CE" else -1.0
+
+    def _premium_at(spot_level: float) -> float:
+        spot_move = spot_level - spot_entry
+        premium_move = sign * d * spot_move
+        return max(round(current_premium + premium_move, 2), 0.05)  # premium can't go to/below 0
+
+    return PremiumPlan(
+        direction=direction,
+        current_premium=round(current_premium, 2),
+        entry=round(current_premium, 2),   # entering now means paying the current premium
+        stop_loss=_premium_at(trade_plan.stop_loss),
+        target1=_premium_at(trade_plan.target1),
+        target2=_premium_at(trade_plan.target2),
+        is_approximate=is_approximate,
+    )
+
+
 # ══════════════════════════════════════════════════════════════════
 #  DORE 2.0 — STAGE 4 — RISK ENGINE (Section 8)
 # ══════════════════════════════════════════════════════════════════
@@ -1486,6 +1620,7 @@ def compute_dore(
 
     iv_health_score, iv_reasons, iv_crush_risk = stage4c_iv_health(inp, cfg)
     trade_plan = build_trade_plan(inp, cfg, direction)
+    premium_plan = build_premium_plan(inp, cfg, trade_plan, direction)
     risk_score, risk_hard_gate_pass, risk_reasons = stage4_risk_engine(
         inp, cfg, trade_plan, corridor_score, iv_health_score, iv_crush_risk,
         event_intel=event_intel)
@@ -1541,6 +1676,7 @@ def compute_dore(
         risk_hard_gate_pass=risk_hard_gate_pass,
         opportunity_score=round(opportunity_score, 1),
         trade_plan=trade_plan,
+        premium_plan=premium_plan,
     )
 
     logger.info(
@@ -2375,4 +2511,118 @@ def build_dore_input_from_scanner(
         in_position=bool(position),
         position_side=(position or {}).get("side"),
         position_entry_price=(position or {}).get("entry_price"),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DASHBOARD RENDERING HELPERS (Section 15 — simplified table view)
+# ══════════════════════════════════════════════════════════════════
+# Deliberately UI-agnostic: pure string-building, no Streamlit import.
+# Reuses pages/dashboard.py's own CSS variables (--bg1/--border/--mono/
+# --text/--muted) and its existing _DORE_BADGE_STYLE recommendation
+# color palette, so a row rendered here matches the look of the index
+# DORE cards already on that page rather than introducing a second
+# visual language. Output is a ready-to-embed HTML <table> string —
+# use with st.markdown(html, unsafe_allow_html=True), same as
+# _dore_debug_html's usage elsewhere on that page. NOT for
+# st.dataframe()/st.table(), which don't render embedded HTML
+# (the Reason cell's <details>/<summary> tooltip would show as literal
+# tag text there).
+
+# Local fallback so this module has no hard import-time dependency on
+# pages/dashboard.py (a utils/ module importing from pages/ would be a
+# backwards layering violation). If the caller already has the live
+# palette (dashboard.py's own _DORE_BADGE_STYLE), pass it in via
+# `badge_style` and it takes precedence — this dict only covers the
+# subset of recommendations DORE 2.0's composition table (Section 10)
+# actually produces.
+_DEFAULT_BADGE_STYLE: dict[str, tuple[str, str]] = {
+    "BUY_CE_NOW":        ("#3fb950", "🟢 BUY CE NOW"),
+    "BUY_PE_NOW":        ("#3fb950", "🟢 BUY PE NOW"),
+    "BUY_CE_BREAKOUT":   ("#58a6ff", "🔵 BUY CE ON BREAKOUT"),
+    "BUY_PE_BREAKDOWN":  ("#58a6ff", "🔵 BUY PE ON BREAKDOWN"),
+    "WATCH_CE":          ("#a371f7", "🟣 WATCH CE"),
+    "WATCH_PE":          ("#a371f7", "🟣 WATCH PE"),
+    "WAIT":              ("#8b949e", "⚪ WAIT"),
+    "NO_TRADE":          ("#484f58", "⚫ NO TRADE"),
+}
+
+
+def render_dashboard_table_html(
+    rows: list[dict],
+    badge_style: Optional[dict[str, tuple[str, str]]] = None,
+) -> str:
+    """Build the simplified DORE opportunity table (Symbol / Recommendation
+    / Leg / Strike / Premium / Directional Intent / Strike Type /
+    Execution State / Trend / Execution / Derivatives / Risk /
+    Opportunity / Entry / SL / T1 / T2 / Expiry / Reason) as one HTML
+    <table> string, ready to hand to st.markdown(..., unsafe_allow_html=True).
+
+    `rows`: list of dicts from DOREResult.to_dashboard_row(symbol) — call
+    that once per candidate, collect into a list, pass here. This
+    function does no DORE computation itself, only rendering — callers
+    stay in charge of which candidates make the table and in what order
+    (e.g. sorted by Opportunity Score, or Live Candidate Pool order).
+
+    `badge_style`: optional override, e.g. pass pages/dashboard.py's own
+    `_DORE_BADGE_STYLE` dict so Recommendation badges match that page's
+    existing palette exactly instead of this module's local subset.
+
+    Empty `rows` renders a single "No opportunities" row rather than an
+    empty <table> tag, so a 0-candidate refresh is visibly a state, not
+    a rendering failure.
+    """
+    palette = badge_style or _DEFAULT_BADGE_STYLE
+    columns = [
+        "Symbol", "Recommendation", "Leg", "Strike", "Premium",
+        "Directional Intent", "Strike Type", "Execution State",
+        "Trend", "Execution", "Derivatives", "Risk", "Opportunity",
+        "Entry", "SL", "T1", "T2", "Expiry", "Reason",
+    ]
+
+    header_html = "".join(
+        f'<th style="text-align:left;padding:6px 10px;color:var(--muted);'
+        f'font-weight:600;border-bottom:1px solid var(--border);'
+        f'white-space:nowrap;">{col}</th>'
+        for col in columns
+    )
+
+    if not rows:
+        body_html = (
+            f'<tr><td colspan="{len(columns)}" style="padding:14px;'
+            f'text-align:center;color:var(--muted);">No opportunities '
+            f'right now.</td></tr>'
+        )
+    else:
+        body_rows = []
+        for row in rows:
+            rec = row.get("Recommendation", "")
+            color, label = palette.get(rec, ("#8b949e", rec))
+            cells = []
+            for col in columns:
+                val = row.get(col)
+                display = "—" if val is None or val == "" else val
+                if col == "Recommendation":
+                    cell_html = (
+                        f'<span style="color:{color};font-weight:700;'
+                        f'white-space:nowrap;">{label}</span>'
+                    )
+                elif col == "Reason":
+                    cell_html = str(display)   # already HTML (details/summary) from to_dashboard_row
+                else:
+                    cell_html = str(display)
+                cells.append(
+                    f'<td style="padding:6px 10px;font-family:var(--mono);'
+                    f'color:var(--text);white-space:nowrap;">{cell_html}</td>'
+                )
+            body_rows.append(f'<tr style="border-bottom:1px solid var(--border);">{"".join(cells)}</tr>')
+        body_html = "".join(body_rows)
+
+    return (
+        f'<div style="overflow-x:auto;background:var(--bg1);'
+        f'border:1px solid var(--border);border-radius:8px;">'
+        f'<table style="width:100%;border-collapse:collapse;font-size:12px;">'
+        f'<thead><tr>{header_html}</tr></thead>'
+        f'<tbody>{body_html}</tbody>'
+        f'</table></div>'
     )
