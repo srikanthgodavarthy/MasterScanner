@@ -2224,6 +2224,7 @@ def _fo_opportunities_panel(df_aug: pd.DataFrame):
             st.dataframe(
                 opt_df, hide_index=True, use_container_width=True,
                 column_config={
+                    "Spot":           st.column_config.NumberColumn("Spot", format="₹%.2f"),
                     "Strike":         st.column_config.NumberColumn("Strike", format="%.0f"),
                     "Premium":        st.column_config.NumberColumn("Premium", format="₹%.2f"),
                     "Target Premium": st.column_config.NumberColumn("Target Premium", format="₹%.2f"),
@@ -2235,10 +2236,14 @@ def _fo_opportunities_panel(df_aug: pd.DataFrame):
                 },
             )
             st.caption("CE only, nearest-expiry ATM — this screener is long-only (see Futures tab's "
-                       "Target note: the scanner has no downside/PE target model). "
-                       "Target Premium is a Delta-adjusted projection to the equity T1 — see "
-                       "'Target Basis' when Delta wasn't available from the feed. This is a screener, "
-                       "not an order ticket — confirm liquidity (bid/ask) before acting on any row.")
+                       "Target note: the scanner has no downside/PE target model). Strike is the listed "
+                       "strike closest to 'Spot' (the live cash-market price the option chain matched "
+                       "ATM against) — NOT the Futures tab's CMP or the scanner's Entry price, which can "
+                       "differ slightly (futures LTP vs cash spot, and Entry can be a stale scan-time "
+                       "price). 'Moneyness' shows how far the chosen strike sits from that same Spot. "
+                       "Target Premium is a Delta-adjusted projection of Spot moving to the equity T1 — "
+                       "see 'Target Basis' when Delta wasn't available from the feed. This is a "
+                       "screener, not an order ticket — confirm liquidity (bid/ask) before acting on any row.")
 
 
 # st.fragment(run_every=...) reruns ONLY this function on its own timer,
