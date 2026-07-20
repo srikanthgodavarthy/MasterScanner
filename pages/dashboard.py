@@ -59,6 +59,7 @@ from utils.regime_engine   import build_regime_context, regime_summary
 from utils.supabase_client import load_latest_full_scan
 from utils.sector_map      import build_sector_stats
 from utils.dore_fo_screener import top_futures_opportunities, top_options_opportunities
+from utils.dore_engine import render_dashboard_table_html
 
 # ── CONSTANTS ─────────────────────────────────────────────────────
 
@@ -2315,28 +2316,19 @@ def _fo_opportunities_panel():
                        "checking, or every F&O candidate is currently gated to WAIT/NO_TRADE (see "
                        "the Market Intelligence index cards for why).")
         else:
-            st.dataframe(
-                opt_df, hide_index=True, use_container_width=True,
-                column_config={
-                    "Entry":                st.column_config.NumberColumn("Entry", format="₹%.2f"),
-                    "Stop Loss":             st.column_config.NumberColumn("Stop Loss", format="₹%.2f"),
-                    "Target 1":              st.column_config.NumberColumn("Target 1", format="₹%.2f"),
-                    "Target 2":              st.column_config.NumberColumn("Target 2", format="₹%.2f"),
-                    "Target 3":              st.column_config.NumberColumn("Target 3", format="₹%.2f"),
-                    "Strike":                st.column_config.NumberColumn("Strike", format="%.0f"),
-                    "Trend Score":           st.column_config.NumberColumn("Trend", format="%.0f"),
-                    "Execution Score":       st.column_config.NumberColumn("Execution", format="%.0f"),
-                    "Derivative Confidence": st.column_config.NumberColumn("Derivatives", format="%.0f"),
-                    "Risk Quality":          st.column_config.NumberColumn("Risk", format="%.0f"),
-                    "Opportunity Score":     st.column_config.NumberColumn("Opportunity", format="%.0f"),
-                },
+            st.markdown(
+                render_dashboard_table_html(opt_df.to_dict("records"), badge_style=_DORE_BADGE_STYLE),
+                unsafe_allow_html=True,
             )
             st.caption("Runs DORE 2.0's full 5-stage funnel (Trend Engine, Execution Engine, "
                        "Derivative Intelligence, Risk Engine, Opportunity Engine) — only rows DORE "
                        "actually recommends acting on are shown, so this list can legitimately be "
                        "empty or short on a quiet day. 'Leg' is CE or PE, composed from Directional "
-                       "Intent x Execution State, gated by the Risk Engine's hard-gate. This is a "
-                       "screener, not an order ticket — confirm liquidity (bid/ask) before acting.")
+                       "Intent x Execution State, gated by the Risk Engine's hard-gate. Entry/SL/T1/T2 "
+                       "are option premium (₹), delta-scaled from the underlying TradePlan — an "
+                       "approximation, not a live quote; see PremiumPlan's docstring in "
+                       "utils/dore_engine.py. This is a screener, not an order ticket — confirm "
+                       "liquidity (bid/ask) before acting.")
 
 
 # st.fragment(run_every=...) reruns ONLY this function on its own timer,
