@@ -1429,6 +1429,15 @@ def score_stock(
         "_score_components": r.score_components,
         # Suggestion 4: raw BarResult for typed regime engine extraction
         "_bar_result":  r,
+        # 2026-07-20: real always-on ATR(14) for the current bar — unlike
+        # r.atr_at_setup (0.0 on any bar without an active setup trigger,
+        # which is most bars most of the time), this is populated every
+        # bar. Needed by utils.dore_fo_screener so stock-level DORE runs
+        # get the same real ATR the index path already pulls via
+        # ia.atr_s.iloc[-1] in utils.dore_engine.build_dore_input_for_index
+        # — without it, Stage 3/4 (Premium Quality / Corridor) silently
+        # zero out for any stock with no live setup on this bar.
+        "_atr_current": float(ia.atr_s.iloc[-1]),
     }
 
     # ── Conviction Score v3 — LIVE (2026-07, replaces v1) ─────────
