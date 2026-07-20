@@ -2234,8 +2234,8 @@ def _fo_opportunities_panel(df_aug: pd.DataFrame):
                     "OppScore":       st.column_config.NumberColumn("OppScore", format="%.0f"),
                 },
             )
-            st.caption("Leg (CE/PE) and strike are the nearest-expiry ATM option, chosen by each "
-                       "stock's own directional bias (Trend, falling back to today's %Chg sign). "
+            st.caption("CE only, nearest-expiry ATM — this screener is long-only (see Futures tab's "
+                       "Target note: the scanner has no downside/PE target model). "
                        "Target Premium is a Delta-adjusted projection to the equity T1 — see "
                        "'Target Basis' when Delta wasn't available from the feed. This is a screener, "
                        "not an order ticket — confirm liquidity (bid/ask) before acting on any row.")
