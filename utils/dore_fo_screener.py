@@ -215,13 +215,18 @@ def top_options_opportunities(scan_df: pd.DataFrame, top_n: int = 15,
             continue
         leg = "CE"
 
+        spot    = opt.get("spot")
         strike  = opt.get("ce_strike")
         premium = opt.get("ce_premium")
         delta   = opt.get("ce_delta")
         iv      = opt.get("ce_iv")
         oi      = opt.get("ce_oi")
 
-        cmp_ = pd.to_numeric(r.get("Entry"), errors="coerce")
+        # Prefer the live spot the option chain itself matched ATM
+        # against — the scanner's Entry can be a stale scan-time price,
+        # which would make the underlying-move (and so Target Premium)
+        # wrong even though the strike selection itself was correct.
+        cmp_ = spot if spot is not None else pd.to_numeric(r.get("Entry"), errors="coerce")
         target_price = pd.to_numeric(r.get("T1"), errors="coerce")
         target_premium, basis = None, "—"
         if premium is not None and cmp_ is not None and target_price is not None:
@@ -233,10 +238,17 @@ def top_options_opportunities(scan_df: pd.DataFrame, top_n: int = 15,
                 target_premium = round(premium * 1.6, 2)
                 basis = "flat 1.6x (no Delta from feed)"
 
+        moneyness = "—"
+        if spot is not None and strike is not None:
+            diff_pct = (strike - spot) / spot * 100 if spot else 0
+            moneyness = f"ATM ({diff_pct:+.1f}% vs spot)"
+
         rows.append({
             "Stock":          sym,
             "Leg":            leg,
+            "Spot":           spot,
             "Strike":         strike,
+            "Moneyness":      moneyness,
             "Premium":        premium,
             "Target Premium": target_premium,
             "Target Basis":   basis,
