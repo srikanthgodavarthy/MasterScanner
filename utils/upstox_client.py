@@ -865,3 +865,213 @@ def fetch_batch_today_ohlc_upstox(symbols: list) -> dict:
                 "volume": quote.get("volume"),
             }
     return result
+
+
+# ══════════════════════════════════════════════════════════════════
+#  STOCK-LEVEL F&O — futures snapshot + ATM option chain
+#  (generalizes the index-only OI-resistance/option-chain plumbing
+#  above to individual Nifty 500 constituents, for
+#  utils.dore_fo_screener's Futures/Options opportunity tabs)
+# ══════════════════════════════════════════════════════════════════
+
+def _fo_column(df: pd.DataFrame, *candidates: str) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_fo_instrument_master() -> pd.DataFrame:
+    """The same instrument master as load_nse_instrument_master(), cached
+    separately and unfiltered by segment — F&O rows (segment NSE_FO,
+    instrument_type FUTSTK/OPTSTK) live in the same file as the NSE_EQ
+    rows that function keeps. Column names are defensively resolved
+    (see _fo_column) since Upstox's published schema for this file has
+    drifted before (trading_symbol vs tradingsymbol, etc.)."""
+    return load_nse_instrument_master()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fo_eligible_symbols() -> set:
+    """Underlying stock symbols that currently have listed stock futures
+    (instrument_type == FUTSTK) — i.e. the subset of the Nifty 500 (or
+    any universe) actually tradeable via futures/options. Only ~180-220
+    of the Nifty 500 have derivatives; screening the rest is pointless."""
+    df = load_fo_instrument_master()
+    type_col = _fo_column(df, "instrument_type", "instrumenttype")
+    name_col = _fo_column(df, "name", "underlying_symbol", "asset_symbol")
+    if type_col is None or name_col is None:
+        return set()
+    fut = df[df[type_col].astype(str).str.upper() == "FUTSTK"]
+    return set(fut[name_col].astype(str).str.strip().str.upper())
+
+
+def _stock_futures_contracts(symbol: str) -> pd.DataFrame:
+    df = load_fo_instrument_master()
+    type_col = _fo_column(df, "instrument_type", "instrumenttype")
+    name_col = _fo_column(df, "name", "underlying_symbol", "asset_symbol")
+    if type_col is None or name_col is None:
+        return pd.DataFrame()
+    return df[(df[type_col].astype(str).str.upper() == "FUTSTK")
+              & (df[name_col].astype(str).str.strip().str.upper() == symbol.strip().upper())]
+
+
+def resolve_futures_instrument_key(symbol: str) -> Optional[str]:
+    """Nearest-expiry FUTSTK instrument_key for `symbol`, or None if the
+    stock has no listed futures contract."""
+    contracts = _stock_futures_contracts(symbol)
+    expiry_col = _fo_column(contracts, "expiry")
+    key_col = _fo_column(contracts, "instrument_key")
+    if contracts.empty or expiry_col is None or key_col is None:
+        return None
+    contracts = contracts.sort_values(expiry_col)
+    return contracts.iloc[0][key_col]
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_futures_snapshot_batch(symbols: tuple) -> dict:
+    """
+    Batch near-month futures LTP/OI/volume/%chg for `symbols` (an
+    F&O-eligible subset — see fo_eligible_symbols()). One HTTP call per
+    _QUOTE_BATCH_SIZE symbols via the same /v2/market-quote/quotes
+    endpoint fetch_batch_today_ohlc_upstox() uses, just on FUTSTK
+    instrument_keys instead of NSE_EQ ones.
+
+    Returns {symbol: {"ltp", "oi", "volume", "pct_chg", "expiry"}} — a
+    symbol is simply absent if its futures instrument_key couldn't be
+    resolved or its quote wasn't in the batch response (fail-soft, same
+    contract as the rest of this module).
+    """
+    headers = _auth_headers()
+    if headers is None or not symbols:
+        return {}
+
+    df = load_fo_instrument_master()
+    type_col = _fo_column(df, "instrument_type", "instrumenttype")
+    name_col = _fo_column(df, "name", "underlying_symbol", "asset_symbol")
+    expiry_col = _fo_column(df, "expiry")
+    key_col = _fo_column(df, "instrument_key")
+    if any(c is None for c in (type_col, name_col, expiry_col, key_col)):
+        return {}
+
+    fut = df[df[type_col].astype(str).str.upper() == "FUTSTK"].copy()
+    fut["_sym"] = fut[name_col].astype(str).str.strip().str.upper()
+    fut = fut.sort_values(expiry_col)
+    near_month = fut.drop_duplicates(subset="_sym", keep="first")  # nearest expiry per symbol
+    sym_to_key = dict(zip(near_month["_sym"], near_month[key_col]))
+    sym_to_expiry = dict(zip(near_month["_sym"], near_month[expiry_col]))
+
+    key_to_sym = {}
+    for s in symbols:
+        k = sym_to_key.get(s.strip().upper())
+        if k:
+            key_to_sym[k] = s.strip().upper()
+    if not key_to_sym:
+        return {}
+
+    result = {}
+    keys = list(key_to_sym.keys())
+    for i in range(0, len(keys), _QUOTE_BATCH_SIZE):
+        chunk = keys[i:i + _QUOTE_BATCH_SIZE]
+        quotes = _fetch_quotes_batch(chunk)
+        for ikey, quote in quotes.items():
+            sym = key_to_sym.get(ikey)
+            if sym is None:
+                continue
+            last_price = quote.get("last_price")
+            net_change = quote.get("net_change")
+            if last_price is None:
+                continue
+            prev_close = (last_price - net_change) if net_change is not None else None
+            pct_chg = round(net_change / prev_close * 100, 2) if prev_close else None
+            result[sym] = {
+                "ltp":      float(last_price),
+                "oi":       quote.get("oi", 0) or 0,
+                "volume":   quote.get("volume", 0) or 0,
+                "pct_chg":  pct_chg,
+                "expiry":   sym_to_expiry.get(sym),
+            }
+    return result
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
+    """
+    Nearest-expiry ATM Call + Put for a single stock underlying, via the
+    same /v2/option/chain endpoint fetch_oi_resistance() uses for
+    indices — generalized here to take any equity instrument_key
+    (resolve_instrument_key(symbol)) rather than the fixed
+    _INDEX_INSTRUMENT_KEYS map.
+
+    Returns {"expiry", "atm_strike", "ce_strike","ce_premium","ce_oi","ce_delta","ce_iv",
+             "pe_strike","pe_premium","pe_oi","pe_delta","pe_iv", "pcr"} or None on
+    any failure / if the symbol has no listed options.
+    """
+    headers = _auth_headers()
+    instrument_key = resolve_instrument_key(symbol)
+    if headers is None or instrument_key is None or is_token_expired():
+        return None
+
+    df = load_fo_instrument_master()
+    type_col = _fo_column(df, "instrument_type", "instrumenttype")
+    name_col = _fo_column(df, "name", "underlying_symbol", "asset_symbol")
+    expiry_col = _fo_column(df, "expiry")
+    opt = df[(df[type_col].astype(str).str.upper() == "OPTSTK")
+             & (df[name_col].astype(str).str.strip().str.upper() == symbol.strip().upper())] if (type_col and name_col) else pd.DataFrame()
+    if opt.empty or expiry_col is None:
+        return None
+    today_str = date.today().isoformat()
+    expiries = sorted({e for e in opt[expiry_col].astype(str) if e >= today_str})
+    if not expiries:
+        return None
+    expiry = expiries[0]
+
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/v2/option/chain",
+            headers=headers,
+            params={"instrument_key": instrument_key, "expiry_date": expiry},
+            timeout=15,
+        )
+        if resp.status_code == 401:
+            logger.warning("Upstox 401 on stock option-chain for %s", symbol)
+            return None
+        resp.raise_for_status()
+        chain = resp.json().get("data", [])
+        if not chain:
+            return None
+
+        def _md(row, leg, field, default=0):
+            return ((row.get(leg) or {}).get("market_data") or {}).get(field, default) or default
+
+        def _greeks(row, leg):
+            g = (row.get(leg) or {}).get("option_greeks") or {}
+            return g.get("delta"), g.get("iv")
+
+        spot = next((r.get("underlying_spot_price") for r in chain if r.get("underlying_spot_price")), None)
+        if not spot:
+            return None
+        atm_row = min(chain, key=lambda r: abs((r.get("strike_price") or 0) - spot))
+        ce_delta, ce_iv = _greeks(atm_row, "call_options")
+        pe_delta, pe_iv = _greeks(atm_row, "put_options")
+        total_ce_oi = sum(_md(r, "call_options", "oi") for r in chain)
+        total_pe_oi = sum(_md(r, "put_options", "oi") for r in chain)
+
+        return {
+            "expiry":      expiry,
+            "spot":        float(spot),
+            "atm_strike":  atm_row.get("strike_price"),
+            "ce_strike":   atm_row.get("strike_price"),
+            "ce_premium":  _md(atm_row, "call_options", "ltp"),
+            "ce_oi":       _md(atm_row, "call_options", "oi"),
+            "ce_delta":    ce_delta, "ce_iv": ce_iv,
+            "pe_strike":   atm_row.get("strike_price"),
+            "pe_premium":  _md(atm_row, "put_options", "ltp"),
+            "pe_oi":       _md(atm_row, "put_options", "oi"),
+            "pe_delta":    pe_delta, "pe_iv": pe_iv,
+            "pcr":         round(total_pe_oi / total_ce_oi, 3) if total_ce_oi else None,
+        }
+    except Exception:
+        logger.warning("Upstox stock option-chain fetch failed for %s", symbol, exc_info=True)
+        return None

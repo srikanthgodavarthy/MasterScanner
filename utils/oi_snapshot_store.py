@@ -88,6 +88,16 @@ def record_and_diff(index: str, total_ce_oi: float, total_pe_oi: float) -> tuple
         return ce_change, pe_change
 
 
+def record_and_diff_value(key: str, value: float) -> float:
+    """Single-series counterpart to record_and_diff() — same day-rollover
+    baseline behaviour, just one number in/out instead of a CE/PE pair.
+    Used for per-stock futures OI (utils.dore_fo_screener's buildup
+    classifier needs today's OI change, and a stock future has one OI
+    series, not two legs)."""
+    ce_change, _ = record_and_diff(f"__single__{key}", float(value or 0), 0.0)
+    return ce_change
+
+
 def reset(index: Optional[str] = None) -> None:
     """Debug/testing helper — clear the stored baseline for one index,
     or every index if none given. Not called anywhere in normal
