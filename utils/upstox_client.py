@@ -241,15 +241,49 @@ def resolve_instrument_key(trading_symbol: str) -> str | None:
 #  HISTORICAL CANDLES
 # ══════════════════════════════════════════════════════════════════
 
+def _parse_candles_response(resp: requests.Response, instrument_key: str,
+                             keep_time: bool) -> pd.DataFrame:
+    """Shared candle-JSON -> DataFrame parser for both the historical and
+    intraday endpoints (same response shape). `keep_time=False` (the
+    original daily-bar behaviour) collapses the index to a naive date via
+    .normalize() — harmless for one-bar-per-day data. `keep_time=True`
+    keeps the full HH:MM timestamp, which is REQUIRED for any unit=
+    "minutes"/"hours" caller (intraday 9/21 EMA etc.) — .normalize() would
+    otherwise collapse every bar in a session onto the same midnight
+    timestamp and silently destroy the series.
+    """
+    candles = resp.json().get("data", {}).get("candles", [])
+    if not candles:
+        return pd.DataFrame()
+    df = pd.DataFrame(
+        candles,
+        columns=["timestamp", "open", "high", "low", "close", "volume", "open_interest"],
+    )
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.set_index("timestamp").sort_index()
+    df.index = df.index.tz_convert("Asia/Kolkata").tz_localize(None)
+    if not keep_time:
+        df.index = df.index.normalize()
+    df.index.name = None
+    return df[["open", "high", "low", "close", "volume"]]
+
+
 def _fetch_candles(instrument_key: str, from_date: date, to_date: date,
-                    unit: str = "days", interval: str = "1") -> pd.DataFrame:
+                    unit: str = "days", interval: str = "1",
+                    keep_time: bool = False) -> pd.DataFrame:
     """
     One instrument, one request, via the v3 historical-candle endpoint:
       GET /v3/historical-candle/{instrument_key}/{unit}/{interval}/{to_date}/{from_date}
     unit in {"minutes","hours","days","weeks","months"}. days/weeks/months
     are available back to Jan 2000 — no lookback ceiling issue for the 1y/3y
-    windows this app uses. Fail-soft: returns an empty DataFrame rather than
+    windows this app uses. minutes/hours are only available back to Jan
+    2022 (Upstox v3 limit) — fine for a few days of EMA warm-up, not for
+    a 1y backtest. Fail-soft: returns an empty DataFrame rather than
     raising, matching fetch_ohlcv()'s existing contract.
+
+    keep_time: pass True for any intraday (unit="minutes"/"hours") call —
+    see _parse_candles_response()'s docstring for why. Defaults to False
+    so every existing daily-bar caller is untouched.
     """
     headers = _auth_headers()
     if headers is None:
@@ -271,23 +305,54 @@ def _fetch_candles(instrument_key: str, from_date: date, to_date: date,
                 logger.warning("Upstox 401 on %s — token expired or invalid", instrument_key)
                 return pd.DataFrame()
             resp.raise_for_status()
-            candles = resp.json().get("data", {}).get("candles", [])
-            if not candles:
-                return pd.DataFrame()
-            df = pd.DataFrame(
-                candles,
-                columns=["timestamp", "open", "high", "low", "close", "volume", "open_interest"],
-            )
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
-            df = df.set_index("timestamp").sort_index()
-            df.index = df.index.tz_convert("Asia/Kolkata").tz_localize(None).normalize()
-            df.index.name = None
-            return df[["open", "high", "low", "close", "volume"]]
+            return _parse_candles_response(resp, instrument_key, keep_time)
         except Exception as exc:
             last_exc = exc
             time.sleep(_RETRY_BASE_S * attempt)
 
     logger.warning("Upstox historical-candle failed for %s after %d attempts: %s",
+                    instrument_key, _MAX_RETRIES, last_exc)
+    return pd.DataFrame()
+
+
+def _fetch_intraday_candles(instrument_key: str, unit: str = "minutes",
+                             interval: str = "5") -> pd.DataFrame:
+    """
+    Today's (in-progress trading day) candles via the SEPARATE v3 intraday
+    endpoint — this is NOT the same endpoint as _fetch_candles():
+      GET /v3/historical-candle/intraday/{instrument_key}/{unit}/{interval}
+    No date range params — Upstox scopes this to "current trading day"
+    server-side. Returns completed bars plus the currently-forming bar.
+    Always keep_time=True (see _parse_candles_response()) since this is
+    inherently intraday data. Fail-soft: empty DataFrame outside market
+    hours / on any error, same contract as _fetch_candles().
+    """
+    headers = _auth_headers()
+    if headers is None:
+        return pd.DataFrame()
+
+    url = f"{BASE_URL}/v3/historical-candle/intraday/{instrument_key}/{unit}/{interval}"
+
+    last_exc = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        _wait_for_spacing()
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 429:
+                backoff = _RETRY_BASE_S * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                logger.warning("Upstox rate-limited on intraday %s, retrying in %.1fs", instrument_key, backoff)
+                time.sleep(backoff)
+                continue
+            if resp.status_code == 401:
+                logger.warning("Upstox 401 on intraday %s — token expired or invalid", instrument_key)
+                return pd.DataFrame()
+            resp.raise_for_status()
+            return _parse_candles_response(resp, instrument_key, keep_time=True)
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(_RETRY_BASE_S * attempt)
+
+    logger.warning("Upstox intraday-candle failed for %s after %d attempts: %s",
                     instrument_key, _MAX_RETRIES, last_exc)
     return pd.DataFrame()
 
@@ -346,6 +411,86 @@ def fetch_index_ohlcv_upstox(index: str, period: str = "1y") -> pd.DataFrame:
     if df.empty or len(df) < 60:
         return pd.DataFrame()
     return df
+
+
+# ══════════════════════════════════════════════════════════════════
+#  INTRADAY 5-MINUTE OHLCV + 9/21 EMA (index only — NIFTY/SENSEX/BANKNIFTY)
+# ══════════════════════════════════════════════════════════════════
+#
+# For DORE's Stage 3b "riding vs chopping" read, which wants the classic
+# fast-scalping 9/21 EMA pair on a 5-minute chart of the underlying INDEX
+# (not the option premium — premium bounces on IV/theta/delta noise, not
+# clean trend structure; not the futures contract — avoids basis/roll
+# handling near expiry for no benefit here).
+#
+# Two separate Upstox endpoints are needed and stitched together:
+#   - _fetch_candles(..., unit="minutes") for prior-day WARM-UP bars
+#     (EMA21 needs several multiples of its period to settle — a bare
+#     today's-session-so-far series gives a noisy/meaningless EMA for the
+#     first ~hour of every day).
+#   - _fetch_intraday_candles(...) for TODAY's session (completed bars +
+#     the currently-forming one) — historical-candle does not include the
+#     live/in-progress day at all, that's what this second endpoint is for.
+# The EMA itself is a continuous rolling series across day boundaries
+# (the standard charting-platform convention) — NOT reset at each day's
+# open, which would just recreate the same noisy-first-hour problem daily.
+
+_INTRADAY_EMA_WARMUP_DAYS = 5   # trading-day lookback for EMA9/21 warm-up
+                                 # history — ~5 sessions * ~75 5m bars/session
+                                 # = ~375 bars, comfortably enough for a
+                                 # 9/21-period EMA to have converged.
+
+
+def fetch_index_intraday_5m_upstox(index: str) -> pd.DataFrame:
+    """5-minute OHLCV for "NIFTY"/"BANKNIFTY"/"SENSEX", warm-up history +
+    today's session stitched into one continuous series, indexed by full
+    (date+time) timestamp. Empty DataFrame outside market hours (no
+    intraday data yet) or on any failure — callers should treat that as
+    "no fresh intraday read available" rather than fatal, same fail-soft
+    contract as the rest of this module.
+    """
+    instrument_key = _INDEX_INSTRUMENT_KEYS.get(index.upper())
+    if instrument_key is None:
+        return pd.DataFrame()
+
+    to_date = date.today() - timedelta(days=1)   # historical-candle excludes today by design
+    from_date = to_date - timedelta(days=_INTRADAY_EMA_WARMUP_DAYS * 3)  # *3 to clear weekends/holidays
+
+    warmup_df = _fetch_candles(instrument_key, from_date, to_date,
+                                unit="minutes", interval="5", keep_time=True)
+    today_df = _fetch_intraday_candles(instrument_key, unit="minutes", interval="5")
+
+    if warmup_df.empty and today_df.empty:
+        return pd.DataFrame()
+
+    combined = pd.concat([warmup_df, today_df])
+    combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+    return combined
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_index_ema9_21(index: str) -> Optional[dict]:
+    """Latest 9-period / 21-period EMA (5-minute chart) for an index,
+    plus the price they were computed on — e.g.
+      {"price": 24123.4, "ema9": 24110.2, "ema21": 24095.8}
+    None if there's no intraday data available (market closed, token
+    expired, endpoint failure) — caller should leave DOREInput's
+    ema9/ema21 at their neutral defaults in that case rather than treat
+    this as fatal. Cached 60s: a 5-minute bar doesn't need sub-minute
+    freshness, and this keeps a busy dashboard from re-fetching the full
+    warm-up window on every rerun.
+    """
+    df = fetch_index_intraday_5m_upstox(index)
+    if df.empty or len(df) < 21:
+        return None
+
+    ema9_series = df["close"].ewm(span=9, adjust=False).mean()
+    ema21_series = df["close"].ewm(span=21, adjust=False).mean()
+    return {
+        "price": float(df["close"].iloc[-1]),
+        "ema9":  float(ema9_series.iloc[-1]),
+        "ema21": float(ema21_series.iloc[-1]),
+    }
 
 
 def fetch_ohlcv_range_upstox(symbol: str, start: date, end: date) -> pd.DataFrame:
