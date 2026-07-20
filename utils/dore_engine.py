@@ -280,10 +280,21 @@ def stage1_market_bias(inp: DOREInput, cfg: DORESettings) -> tuple[float, str, l
     """
     reasons: list[str] = []
 
-    # Leadership / Conviction: already 0-100, "quality" not "direction" —
-    # but MasterScanner only carries these forward for names showing
-    # bullish structure, so we treat high values as bias-confirming
-    # in whichever direction the EMA stack already points (see below).
+    # Leadership / Conviction: already 0-100, but they are LONG-ONLY reads
+    # — MasterScanner's scoring_core.py has no bearish/short setup logic
+    # at all (is_norm_buy / is_fib_buy_base / is_cci_buy etc. have no
+    # "sell" counterparts), so these two scores only ever measure "how
+    # good is this as a long setup". 2026-07-20: previously this function
+    # inverted them (100 - score) and folded them in as bearish
+    # confirmation whenever the EMA stack pointed down — but a flipped
+    # long-only quality score is not a real read on bearish structure, it
+    # is a guess dressed up as confirmation. That silently made every
+    # bearish bias read partly built on invented data. Leadership/
+    # Conviction are now only trusted when the EMA stack is actually
+    # bullish; on a bearish stack they are neutralised out (see
+    # direction_sign branch below) and Stage 1 leans on the genuinely
+    # bidirectional signals — EMA alignment, Trend Phase, ADX, RSI,
+    # Volume — instead.
     if inp.ema_stack_up is not None or inp.ema_stack_down is not None:
         ema_bull = bool(inp.ema_stack_up)
         ema_bear = bool(inp.ema_stack_down)
@@ -334,16 +345,26 @@ def stage1_market_bias(inp: DOREInput, cfg: DORESettings) -> tuple[float, str, l
     leadership_score = _clamp(inp.leadership)
     conviction_score  = _clamp(inp.conviction)
 
-    # Leadership/Conviction are directionless quality reads; fold them
-    # toward the EMA-implied direction (a "good" setup in a bearish
-    # stack still means good bearish structure, not bullish).
+    # Leadership/Conviction only ever measure long-setup quality (see note
+    # above), so they are only meaningful confirmation when the EMA stack
+    # itself is bullish. On a bearish stack there is no real bearish
+    # Leadership/Conviction read to fall back on, so both are dropped to
+    # neutral weight rather than inverted — an inverted long-only score
+    # would masquerade as bearish confirmation without being one. The
+    # weight that would have gone to them is picked up automatically by
+    # _weighted()'s normalisation, so Stage 1 leans harder on EMA
+    # alignment / Trend Phase / ADX / RSI / Volume for bearish reads.
+    leadership_weight = cfg.w_bias_leadership
+    conviction_weight = cfg.w_bias_conviction
     if direction_sign < 0:
-        leadership_score = 100.0 - leadership_score
-        conviction_score  = 100.0 - conviction_score
+        reasons.append("Leadership/Conviction are long-only scanner reads — neutralised "
+                        "(not inverted) for this bearish EMA stack")
+        leadership_score = conviction_score = 50.0
+        leadership_weight = conviction_weight = 0.0
 
     bias_score = _weighted([
-        (leadership_score,  cfg.w_bias_leadership),
-        (conviction_score,  cfg.w_bias_conviction),
+        (leadership_score,  leadership_weight),
+        (conviction_score,  conviction_weight),
         (trend_phase_score, cfg.w_bias_trend_phase),
         (ema_align_score,   cfg.w_bias_ema_alignment),
         (adx_score,         cfg.w_bias_adx),
