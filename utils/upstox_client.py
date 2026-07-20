@@ -577,6 +577,61 @@ def fetch_batch_ema9_21_upstox(symbols: list, progress_cb=None) -> dict:
     return result
 
 
+def fetch_batch_intraday_5m_upstox(symbols: list, progress_cb=None) -> dict:
+    """Concurrent full 5-minute OHLCV fetch for a MIXED list of index
+    and/or stock symbols — same ThreadPoolExecutor + throttle pattern as
+    fetch_batch_ema9_21_upstox(), but returns the whole DataFrame per
+    symbol rather than just the EMA9/21 numbers, for callers that need
+    more than the EMA read (VWAP/ORB/NR7/volume expansion etc. — see
+    utils.dore_fo_screener.execution_features_from_intraday_5m()).
+
+    2026-07-20: added specifically to fix utils.dore_fo_screener.
+    stage2_execution_qualification(), which was fetching intraday data
+    ONE SYMBOL AT A TIME in a sequential for-loop despite claiming to be
+    "batched" — 50-70 symbols * 2 calls each, sequential, burns through
+    Upstox's 25 req/s / 250-per-min ceiling fast enough that most calls
+    after the first handful can start 429-ing, which silently collapses
+    the Stage 2 survivor count (a failed fetch -> {} execution features
+    -> NOT_READY). This function fixes that by fetching concurrently
+    instead, same as the rest of this module's batch fetchers.
+
+    Index membership is resolved via _INDEX_INSTRUMENT_KEYS rather than
+    importing dore_fo_screener's _INDICES tuple, to avoid a circular
+    import (dore_fo_screener already imports from this module).
+
+    Returns {symbol: DataFrame} — symbols with no intraday data (market
+    closed, fetch failure, illiquid/no recent bars) are simply omitted,
+    same fail-soft-per-symbol contract as every other batch fetcher here.
+    """
+    if not symbols:
+        return {}
+    if is_token_expired():
+        logger.warning("Upstox token likely expired (past 3:30 AM IST) — skipping intraday batch fetch")
+        return {}
+
+    def _fetch_one(sym: str) -> pd.DataFrame:
+        if sym.upper() in _INDEX_INSTRUMENT_KEYS:
+            return fetch_index_intraday_5m_upstox(sym)
+        return fetch_stock_intraday_5m_upstox(sym)
+
+    result: dict = {}
+    done = 0
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {pool.submit(_fetch_one, sym): sym for sym in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                df = fut.result()
+                if df is not None and not df.empty:
+                    result[sym] = df
+            except Exception as exc:
+                logger.warning("Upstox intraday 5m batch fetch failed for %s: %s", sym, exc)
+            done += 1
+            if progress_cb:
+                progress_cb(done, len(symbols))
+    return result
+
+
 def fetch_ohlcv_range_upstox(symbol: str, start: date, end: date) -> pd.DataFrame:
     """
     Date-range counterpart to fetch_ohlcv_upstox(), for callers (history_store)
