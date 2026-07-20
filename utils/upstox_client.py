@@ -399,6 +399,16 @@ def fetch_ohlcv_upstox(symbol: str, period: str = "1y", interval: str = "1d") ->
 
     instrument_key = resolve_instrument_key(symbol)
     if instrument_key is None:
+        # 2026-07-20: was a silent empty-DataFrame return with zero logging —
+        # if resolve_instrument_key() can't match most of a symbol list (e.g.
+        # a "name" vs "tradingsymbol" column mismatch for multi-word/hyphenated
+        # company names — see fetch_batch_ohlcv_upstox()'s summary log for the
+        # aggregate count), every one of those symbols silently vanishes from
+        # the daily pool with no trace. Logging each miss here is the only way
+        # to tell "no instrument_key match" apart from "fetch failed".
+        logger.warning("[fetch_ohlcv_upstox] could not resolve instrument_key for %r — "
+                        "check whether this symbol string matches the instrument master's "
+                        "tradingsymbol column", symbol)
         return pd.DataFrame()
 
     days_back = _PERIOD_TO_DAYS.get(period, 375)
@@ -725,6 +735,18 @@ def fetch_batch_ohlcv_upstox(symbols: list, period: str = "1y", interval: str = 
         logger.warning("Upstox token likely expired (past 3:30 AM IST) — skipping fetch")
         return {}
 
+    # 2026-07-20: split out up front so the summary log below can tell
+    # "couldn't resolve to an instrument_key" apart from "resolved fine but
+    # the candle fetch itself failed" — these have completely different
+    # fixes (a symbol-string/column-mismatch problem vs a network/rate-limit
+    # one) and were previously indistinguishable from the caller's side,
+    # both just showing up as "missing from the result dict".
+    unresolved = [s for s in symbols if resolve_instrument_key(s) is None]
+    if unresolved:
+        logger.warning("[fetch_batch_ohlcv_upstox] %d/%d symbols have NO instrument_key match "
+                        "at all (name/tradingsymbol mismatch?) — examples: %s",
+                        len(unresolved), len(symbols), unresolved[:10])
+
     result: dict = {}
     done = 0
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
@@ -743,6 +765,10 @@ def fetch_batch_ohlcv_upstox(symbols: list, period: str = "1y", interval: str = 
             done += 1
             if progress_cb:
                 progress_cb(done, len(symbols))
+    logger.info("[fetch_batch_ohlcv_upstox] %d/%d symbols returned usable daily OHLCV "
+                "(%d had no instrument_key match, %d resolved but the candle fetch itself failed/was too short)",
+                len(result), len(symbols), len(unresolved),
+                len(symbols) - len(result) - len(unresolved))
     return result
 
 
