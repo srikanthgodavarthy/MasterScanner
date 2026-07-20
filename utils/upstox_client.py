@@ -233,6 +233,20 @@ def load_nse_instrument_master() -> pd.DataFrame:
     return df
 
 
+# 2026-07-20: Upstox's NSE instrument master labels the equity segment
+# 'EQUITY' (confirmed via [InstrumentMaster] instrument_type distribution
+# logging), not 'EQ'. Both _symbol_to_instrument_key_map() and
+# fo_eligible_symbols() previously hardcoded the literal string "EQ",
+# which matched zero rows — silently disabling the EQ-priority filter in
+# the former (mostly harmless there, since tradingsymbol rarely collides
+# across instrument types) and causing fo_eligible_symbols() to fall back
+# to the entire 88k-row unfiltered file in the latter (fatal there, since
+# it joins on `name`, which DOES collide — every option contract for a
+# stock shares its underlying's `name`). Matching against both labels
+# keeps this working if Upstox ever reverts to the shorter form.
+_EQUITY_TYPE_LABELS = {"EQ", "EQUITY"}
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def _symbol_to_instrument_key_map() -> dict:
     """Builds the full symbol -> instrument_key lookup once per day
@@ -245,7 +259,7 @@ def _symbol_to_instrument_key_map() -> dict:
     if symbol_col is None:
         return {}
     if type_col in df.columns:
-        eq = df[df[type_col].astype(str).str.upper() == "EQ"]
+        eq = df[df[type_col].astype(str).str.upper().isin(_EQUITY_TYPE_LABELS)]
         # keep non-EQ rows too, but EQ wins ties via the update order below
         base = df
     else:
@@ -1311,36 +1325,19 @@ def fo_eligible_symbols() -> set:
         return fut_names
 
     type_upper = df[type_col].astype(str).str.upper()
-    eq_fallback_used = "EQ" not in type_upper.unique()
-    eq = df[type_upper == "EQ"] if not eq_fallback_used else df
+    eq_fallback_used = not type_upper.isin(_EQUITY_TYPE_LABELS).any()
+    eq = df[type_upper.isin(_EQUITY_TYPE_LABELS)] if not eq_fallback_used else df
+    if eq_fallback_used:
+        logger.warning("[fo_eligible_symbols] none of %s found in instrument_type — falling back to "
+                        "the unfiltered file for the name->tradingsymbol join, which WILL produce "
+                        "garbage (option-contract tradingsymbols instead of equity ones) since `name` "
+                        "collides across instrument types. instrument_type values seen: %s",
+                        sorted(_EQUITY_TYPE_LABELS), sorted(type_upper.unique())[:20])
     name_to_tradingsymbol = {
         str(row[name_col]).strip().upper(): str(row[symbol_col]).strip().upper()
         for _, row in eq.iterrows()
         if pd.notna(row.get(name_col)) and pd.notna(row.get(symbol_col))
     }
-
-    # 2026-07-20 TEMP DIAGNOSTIC — 209/210 F&O symbols are coming back from
-    # this function as raw full names (e.g. "RELIANCE INDUSTRIES LTD")
-    # instead of short tradingsymbols, even though the translation step
-    # above should have converted them. The only way that happens is if
-    # name_to_tradingsymbol[n] == n for these rows — i.e. symbol_col isn't
-    # actually holding short codes for them. This block logs the raw
-    # column values for a couple of known names so the next run's logs
-    # show definitively whether it's a column-resolution bug (wrong
-    # column picked) or an Upstox data-quality issue (tradingsymbol field
-    # itself holding full names for some rows). Remove once diagnosed.
-    logger.info("[fo_eligible_symbols][DIAG] type_col=%s name_col=%s symbol_col=%s "
-                "eq_fallback_used=%s eq_rows=%d df_rows=%d",
-                type_col, name_col, symbol_col, eq_fallback_used, len(eq), len(df))
-    for probe in ("RELIANCE", "BHEL"):
-        hits = eq[eq[name_col].astype(str).str.upper().str.contains(probe, na=False)]
-        if hits.empty:
-            logger.info("[fo_eligible_symbols][DIAG] no eq row with name containing %r", probe)
-            continue
-        for _, row in hits.head(3).iterrows():
-            logger.info("[fo_eligible_symbols][DIAG] probe=%s eq row -> %s=%r  %s=%r  instrument_type=%r",
-                        probe, name_col, row.get(name_col), symbol_col, row.get(symbol_col),
-                        row.get(type_col))
 
     result = set()
     unmatched = []
