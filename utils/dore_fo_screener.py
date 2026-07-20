@@ -288,8 +288,18 @@ def compute_fo_opportunities(
     carrying the full DOREResult (recommendation, scores, TradePlan).
     """
     cfg = _load_settings(cfg)
-    from utils.upstox_client import fetch_oi_resistance, fetch_stock_atm_option
+    from utils.upstox_client import fetch_oi_resistance, fetch_batch_stock_atm_options_upstox
     from utils.oi_snapshot_store import record_and_diff
+
+    # 2026-07-20: was fetch_stock_atm_option() called ONE SYMBOL AT A TIME
+    # inside the loop below — same sequential-fetch anti-pattern Stage 2
+    # had, just one stage later, and the single-symbol call itself had no
+    # 429 retry until this refactor (see _get_option_chain_with_retry()'s
+    # docstring). Pre-fetching concurrently here fixes both at once for
+    # the stock leg; only 3 indices ever go through fetch_oi_resistance(),
+    # so a sequential call for those inside the loop is fine as-is.
+    stock_symbols = [s for s in live_pool if s not in _INDICES]
+    stock_options = fetch_batch_stock_atm_options_upstox(stock_symbols)
 
     rows = []
     for symbol, row in live_pool.items():
@@ -307,7 +317,7 @@ def compute_fo_opportunities(
                                        "expiry": opt.get("expiry")}
                 ce_chg, pe_chg = record_and_diff(symbol, opt.get("total_ce_oi", 0.0), opt.get("total_pe_oi", 0.0))
             else:
-                opt = fetch_stock_atm_option(symbol)
+                opt = stock_options.get(symbol)
                 if opt is None:
                     continue
                 atm_chain_row = dict(opt)
