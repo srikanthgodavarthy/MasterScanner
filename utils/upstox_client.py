@@ -441,18 +441,14 @@ _INTRADAY_EMA_WARMUP_DAYS = 5   # trading-day lookback for EMA9/21 warm-up
                                  # 9/21-period EMA to have converged.
 
 
-def fetch_index_intraday_5m_upstox(index: str) -> pd.DataFrame:
-    """5-minute OHLCV for "NIFTY"/"BANKNIFTY"/"SENSEX", warm-up history +
-    today's session stitched into one continuous series, indexed by full
-    (date+time) timestamp. Empty DataFrame outside market hours (no
-    intraday data yet) or on any failure — callers should treat that as
-    "no fresh intraday read available" rather than fatal, same fail-soft
-    contract as the rest of this module.
+def _fetch_intraday_5m_by_key(instrument_key: str) -> pd.DataFrame:
+    """Instrument-key-generic core: warm-up history + today's session,
+    stitched into one continuous 5-minute series. Works for an index
+    instrument_key (_INDEX_INSTRUMENT_KEYS) or a stock instrument_key
+    (resolve_instrument_key()) identically — see
+    fetch_index_intraday_5m_upstox() / fetch_stock_intraday_5m_upstox()
+    for the thin symbol-resolving wrappers callers should actually use.
     """
-    instrument_key = _INDEX_INSTRUMENT_KEYS.get(index.upper())
-    if instrument_key is None:
-        return pd.DataFrame()
-
     to_date = date.today() - timedelta(days=1)   # historical-candle excludes today by design
     from_date = to_date - timedelta(days=_INTRADAY_EMA_WARMUP_DAYS * 3)  # *3 to clear weekends/holidays
 
@@ -468,6 +464,34 @@ def fetch_index_intraday_5m_upstox(index: str) -> pd.DataFrame:
     return combined
 
 
+def _ema9_21_from_df(df: pd.DataFrame) -> Optional[dict]:
+    """Shared EMA9/21-from-5m-series computation — used by both the
+    index and stock EMA fetchers below."""
+    if df.empty or len(df) < 21:
+        return None
+    ema9_series = df["close"].ewm(span=9, adjust=False).mean()
+    ema21_series = df["close"].ewm(span=21, adjust=False).mean()
+    return {
+        "price": float(df["close"].iloc[-1]),
+        "ema9":  float(ema9_series.iloc[-1]),
+        "ema21": float(ema21_series.iloc[-1]),
+    }
+
+
+def fetch_index_intraday_5m_upstox(index: str) -> pd.DataFrame:
+    """5-minute OHLCV for "NIFTY"/"BANKNIFTY"/"SENSEX", warm-up history +
+    today's session stitched into one continuous series, indexed by full
+    (date+time) timestamp. Empty DataFrame outside market hours (no
+    intraday data yet) or on any failure — callers should treat that as
+    "no fresh intraday read available" rather than fatal, same fail-soft
+    contract as the rest of this module.
+    """
+    instrument_key = _INDEX_INSTRUMENT_KEYS.get(index.upper())
+    if instrument_key is None:
+        return pd.DataFrame()
+    return _fetch_intraday_5m_by_key(instrument_key)
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_index_ema9_21(index: str) -> Optional[dict]:
     """Latest 9-period / 21-period EMA (5-minute chart) for an index,
@@ -480,17 +504,77 @@ def fetch_index_ema9_21(index: str) -> Optional[dict]:
     freshness, and this keeps a busy dashboard from re-fetching the full
     warm-up window on every rerun.
     """
-    df = fetch_index_intraday_5m_upstox(index)
-    if df.empty or len(df) < 21:
-        return None
+    return _ema9_21_from_df(fetch_index_intraday_5m_upstox(index))
 
-    ema9_series = df["close"].ewm(span=9, adjust=False).mean()
-    ema21_series = df["close"].ewm(span=21, adjust=False).mean()
-    return {
-        "price": float(df["close"].iloc[-1]),
-        "ema9":  float(ema9_series.iloc[-1]),
-        "ema21": float(ema21_series.iloc[-1]),
-    }
+
+# ── STOCK-LEVEL (500-stock universe) — GATED, not a blanket fetch ────
+#
+# 2026-07-20: same 9/21 EMA read as above, but for individual stocks.
+# DELIBERATELY NOT exposed as "fetch for all 500" — the historical-candle
+# endpoint is single-instrument-per-request with no batch variant (Upstox's
+# own docs are explicit: "comma-separated values or multiple identifiers
+# are not supported"), so 500 names * 2 calls each (warm-up + today) is
+# ~1,000 single-instrument requests against a documented 25 req/s / 250-
+# per-minute account-wide ceiling — shared with everything else the app
+# does. See utils.dore_engine.select_symbols_for_intraday_ema() for the
+# gate this is meant to be called AFTER (only names whose Stage 1 Market
+# Bias already cleared NEUTRAL using data already sitting in memory from
+# the day's scan — zero extra network calls to compute that gate).
+
+def fetch_stock_intraday_5m_upstox(symbol: str) -> pd.DataFrame:
+    """Stock counterpart to fetch_index_intraday_5m_upstox() — same
+    contract, keyed off resolve_instrument_key() instead of
+    _INDEX_INSTRUMENT_KEYS. Not cached itself; fetch_batch_ema9_21_upstox()
+    below is the intended entry point for the stock path (single-symbol
+    calls are only useful for ad-hoc debugging)."""
+    instrument_key = resolve_instrument_key(symbol)
+    if instrument_key is None:
+        return pd.DataFrame()
+    return _fetch_intraday_5m_by_key(instrument_key)
+
+
+def fetch_batch_ema9_21_upstox(symbols: list, progress_cb=None) -> dict:
+    """Concurrent EMA9/21 fetch for a (already-gated, short) list of
+    stock symbols — mirrors fetch_batch_ohlcv_upstox()'s ThreadPoolExecutor
+    + per-request throttle pattern, since there's no multi-symbol
+    historical-candle call to batch these into one request.
+
+    Caller is responsible for gating `symbols` down from the full 500
+    first — see select_symbols_for_intraday_ema() in dore_engine.py. This
+    function does not gate or cap the list itself; passing all 500 in
+    here will genuinely fire ~1,000 requests and likely trip Upstox's
+    rate limit despite the built-in throttle/backoff.
+
+    Returns {symbol: {"price", "ema9", "ema21"}} for whatever came back —
+    symbols with no intraday data (market closed, illiquid/no recent
+    bars, fetch failure) are simply omitted, matching fetch_batch_
+    ohlcv_upstox()'s fail-soft-per-symbol contract.
+    """
+    if not symbols:
+        return {}
+    if is_token_expired():
+        logger.warning("Upstox token likely expired (past 3:30 AM IST) — skipping intraday EMA batch fetch")
+        return {}
+
+    result: dict = {}
+    done = 0
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(lambda s: _ema9_21_from_df(fetch_stock_intraday_5m_upstox(s)), sym): sym
+            for sym in symbols
+        }
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                ema = fut.result()
+                if ema is not None:
+                    result[sym] = ema
+            except Exception as exc:
+                logger.warning("Upstox intraday EMA9/21 fetch failed for %s: %s", sym, exc)
+            done += 1
+            if progress_cb:
+                progress_cb(done, len(symbols))
+    return result
 
 
 def fetch_ohlcv_range_upstox(symbol: str, start: date, end: date) -> pd.DataFrame:
