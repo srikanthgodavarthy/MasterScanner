@@ -1359,14 +1359,69 @@ def fo_eligible_symbols() -> set:
     return result
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def _tradingsymbol_to_underlying_name_map() -> dict:
+    """Reverse of the join fo_eligible_symbols() already does (name ->
+    tradingsymbol) — this is tradingsymbol -> name.
+
+    2026-07-21: added because every OPTSTK/FUTSTK filter downstream of
+    Stage 0 (fetch_stock_atm_option, _stock_futures_contracts,
+    fetch_futures_snapshot_batch) was matching `name_col == symbol`
+    directly, where `symbol` is a tradingsymbol like "RELIANCE" — the
+    exact name/tradingsymbol mismatch fo_eligible_symbols() was patched
+    for on 2026-07-20, just never propagated past Stage 0. Since
+    Upstox's F&O rows (FUTSTK/OPTSTK) are keyed by `name` (the
+    underlying's display name, e.g. "RELIANCE INDUSTRIES"), not by
+    tradingsymbol, that comparison silently matched zero rows for any
+    stock whose display name isn't identical to its ticker — which is
+    almost every stock except a handful of PSU-style tickers (BHEL,
+    ONGC, NTPC, ...) where name happens to equal the tradingsymbol. That
+    is why DORE's Stage 3 (compute_fo_opportunities ->
+    fetch_batch_stock_atm_options_upstox -> fetch_stock_atm_option) was
+    collapsing a 15-25 symbol Live Candidate Pool down to ~1 name (BHEL)
+    even after Stage 0-2's concurrency/retry fixes: those fixes made the
+    *pool* healthy again, but Stage 3's own name-matching was still
+    broken underneath.
+
+    Built once per day from the same EQ rows fo_eligible_symbols() uses
+    for its name->tradingsymbol join, just inverted.
+    """
+    df = load_fo_instrument_master()
+    type_col = _fo_column(df, "instrument_type", "instrumenttype")
+    name_col = _fo_column(df, "name", "underlying_symbol", "asset_symbol")
+    symbol_col = _fo_column(df, "tradingsymbol", "trading_symbol", "symbol")
+    if type_col is None or name_col is None or symbol_col is None:
+        return {}
+    type_upper = df[type_col].astype(str).str.upper()
+    eq_fallback_used = not type_upper.isin(_EQUITY_TYPE_LABELS).any()
+    eq = df[type_upper.isin(_EQUITY_TYPE_LABELS)] if not eq_fallback_used else df
+    mapping = {}
+    for _, row in eq.iterrows():
+        ts, nm = row.get(symbol_col), row.get(name_col)
+        if pd.notna(ts) and pd.notna(nm):
+            mapping[str(ts).strip().upper()] = str(nm).strip().upper()
+    return mapping
+
+
+def _underlying_name_for_tradingsymbol(symbol: str) -> str:
+    """tradingsymbol (e.g. 'RELIANCE') -> the `name` value its FUTSTK/
+    OPTSTK rows are actually keyed by in Upstox's instrument master
+    (e.g. 'RELIANCE INDUSTRIES'). Falls back to the tradingsymbol itself
+    if no EQ row matched, so any symbol this mapping doesn't cover keeps
+    the old (sometimes-correct, e.g. BHEL) behaviour rather than
+    hard-failing."""
+    return _tradingsymbol_to_underlying_name_map().get(symbol.strip().upper(), symbol.strip().upper())
+
+
 def _stock_futures_contracts(symbol: str) -> pd.DataFrame:
     df = load_fo_instrument_master()
     type_col = _fo_column(df, "instrument_type", "instrumenttype")
     name_col = _fo_column(df, "name", "underlying_symbol", "asset_symbol")
     if type_col is None or name_col is None:
         return pd.DataFrame()
+    underlying_name = _underlying_name_for_tradingsymbol(symbol)
     return df[(df[type_col].astype(str).str.upper() == "FUTSTK")
-              & (df[name_col].astype(str).str.strip().str.upper() == symbol.strip().upper())]
+              & (df[name_col].astype(str).str.strip().str.upper() == underlying_name)]
 
 
 def resolve_futures_instrument_key(symbol: str) -> Optional[str]:
@@ -1407,18 +1462,29 @@ def fetch_futures_snapshot_batch(symbols: tuple) -> dict:
     if any(c is None for c in (type_col, name_col, expiry_col, key_col)):
         return {}
 
+    # 2026-07-21: was matching FUTSTK rows on `name_col == symbol` where
+    # `symbol` is a tradingsymbol (see _tradingsymbol_to_underlying_name_map()'s
+    # docstring for why that silently matches almost nothing) — resolve to
+    # the underlying's actual `name` first. Separately, the final expiry
+    # lookup (`sym_to_expiry.get(sym)`) was ALSO broken independent of that:
+    # sym_to_expiry was keyed by `name`, but looked up by tradingsymbol —
+    # fixed here by keying everything off instrument_key instead, which is
+    # unambiguous and avoids a second name/tradingsymbol indirection entirely.
     fut = df[df[type_col].astype(str).str.upper() == "FUTSTK"].copy()
-    fut["_sym"] = fut[name_col].astype(str).str.strip().str.upper()
+    fut["_name"] = fut[name_col].astype(str).str.strip().str.upper()
     fut = fut.sort_values(expiry_col)
-    near_month = fut.drop_duplicates(subset="_sym", keep="first")  # nearest expiry per symbol
-    sym_to_key = dict(zip(near_month["_sym"], near_month[key_col]))
-    sym_to_expiry = dict(zip(near_month["_sym"], near_month[expiry_col]))
+    near_month = fut.drop_duplicates(subset="_name", keep="first")  # nearest expiry per underlying
+    name_to_key = dict(zip(near_month["_name"], near_month[key_col]))
+    name_to_expiry = dict(zip(near_month["_name"], near_month[expiry_col]))
 
     key_to_sym = {}
+    key_to_expiry = {}
     for s in symbols:
-        k = sym_to_key.get(s.strip().upper())
+        underlying_name = _underlying_name_for_tradingsymbol(s)
+        k = name_to_key.get(underlying_name)
         if k:
             key_to_sym[k] = s.strip().upper()
+            key_to_expiry[k] = name_to_expiry.get(underlying_name)
     if not key_to_sym:
         return {}
 
@@ -1442,7 +1508,7 @@ def fetch_futures_snapshot_batch(symbols: tuple) -> dict:
                 "oi":       quote.get("oi", 0) or 0,
                 "volume":   quote.get("volume", 0) or 0,
                 "pct_chg":  pct_chg,
-                "expiry":   sym_to_expiry.get(sym),
+                "expiry":   key_to_expiry.get(ikey),
             }
     return result
 
@@ -1459,6 +1525,18 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
     Returns {"expiry", "atm_strike", "ce_strike","ce_premium","ce_oi","ce_delta","ce_iv",
              "pe_strike","pe_premium","pe_oi","pe_delta","pe_iv", "pcr"} or None on
     any failure / if the symbol has no listed options.
+
+    2026-07-21: previously matched OPTSTK rows on `name_col == symbol`
+    where `symbol` is a tradingsymbol (e.g. "RELIANCE") — but Upstox's
+    F&O rows are keyed by `name`, the underlying's display name (e.g.
+    "RELIANCE INDUSTRIES"), not tradingsymbol. That silently matched
+    zero rows for almost every stock (opt.empty -> return None -> symbol
+    dropped), except a handful of PSU-style tickers (BHEL, ONGC, NTPC,
+    ...) where name happens to equal the tradingsymbol — which is why
+    DORE's Stage 3 kept collapsing a healthy Live Candidate Pool down to
+    ~1 name even after the Stage 0-2 concurrency/retry fixes. Fixed by
+    resolving to the underlying's real `name` first via
+    _underlying_name_for_tradingsymbol() (see its docstring).
     """
     headers = _auth_headers()
     instrument_key = resolve_instrument_key(symbol)
@@ -1469,8 +1547,9 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
     type_col = _fo_column(df, "instrument_type", "instrumenttype")
     name_col = _fo_column(df, "name", "underlying_symbol", "asset_symbol")
     expiry_col = _fo_column(df, "expiry")
+    underlying_name = _underlying_name_for_tradingsymbol(symbol)
     opt = df[(df[type_col].astype(str).str.upper() == "OPTSTK")
-             & (df[name_col].astype(str).str.strip().str.upper() == symbol.strip().upper())] if (type_col and name_col) else pd.DataFrame()
+             & (df[name_col].astype(str).str.strip().str.upper() == underlying_name)] if (type_col and name_col) else pd.DataFrame()
     if opt.empty or expiry_col is None:
         return None
     today_str = date.today().isoformat()
