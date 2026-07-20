@@ -204,6 +204,10 @@ DORE_DEFAULTS: dict = {
     "w_risk_iv_health":             25.0,
     "w_risk_liquidity":             15.0,
 
+    # ── PremiumPlan (dashboard display — delta-scaled TradePlan) ──
+    "premium_plan_fallback_delta": 0.5,   # used only when live ce_delta/pe_delta is unavailable;
+                                            # 0.5 ~= ATM. Result is flagged is_approximate=True.
+
     # ── Stage 3 — Derivative Confidence blend (Section 9) ────────
     "w_deriv_oi":                   35.0,
     "w_deriv_premium":              25.0,
@@ -367,6 +371,7 @@ class DORESettings:
     w_risk_corridor: float = 25.0
     w_risk_iv_health: float = 25.0
     w_risk_liquidity: float = 15.0
+    premium_plan_fallback_delta: float = 0.5
 
     w_deriv_oi: float = 35.0
     w_deriv_premium: float = 25.0
