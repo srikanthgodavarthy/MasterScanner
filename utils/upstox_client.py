@@ -1273,19 +1273,68 @@ def fo_eligible_symbols() -> set:
     """Underlying stock symbols that currently have listed stock futures
     (instrument_type == FUTSTK) — i.e. the subset of the Nifty 500 (or
     any universe) actually tradeable via futures/options. Only ~180-220
-    of the Nifty 500 have derivatives; screening the rest is pointless."""
+    of the Nifty 500 have derivatives; screening the rest is pointless.
+
+    2026-07-20: previously returned the FUTSTK rows' `name` column
+    (the underlying's display name, e.g. "Bajaj Auto") directly, on the
+    assumption it doubles as a tradingsymbol. It often doesn't —
+    resolve_instrument_key() (used by every OHLCV/EMA fetch from Stage 1
+    onward) looks symbols up against the SAME file's `tradingsymbol`
+    column instead, so any name/tradingsymbol mismatch (hyphens,
+    ampersands, spacing, "LTD" suffixes, casing) meant that stock was
+    handed to Stage 0 by name, then silently failed to resolve at
+    Stage 1 and vanished from the Daily Candidate Pool with only a
+    debug-level "no instrument_key match" log line as a trace — DORE
+    never got a chance to evaluate it at all.
+
+    Fixed by translating each FUTSTK row's `name` to its own EQ row's
+    `tradingsymbol` (joined on `name`, which IS shared verbatim across
+    a company's EQ/FUTSTK/OPTSTK rows in this file) before returning —
+    so callers get strings resolve_instrument_key() can actually use.
+    """
     df = load_fo_instrument_master()
     type_col = _fo_column(df, "instrument_type", "instrumenttype")
     name_col = _fo_column(df, "name", "underlying_symbol", "asset_symbol")
+    symbol_col = _fo_column(df, "tradingsymbol", "trading_symbol", "symbol")
     if type_col is None or name_col is None:
         logger.warning("[fo_eligible_symbols] type_col=%s name_col=%s — returning empty set, "
                         "see load_nse_instrument_master()'s log lines for what columns actually came back",
                         type_col, name_col)
         return set()
+
     fut = df[df[type_col].astype(str).str.upper() == "FUTSTK"]
-    result = set(fut[name_col].astype(str).str.strip().str.upper())
-    logger.info("[fo_eligible_symbols] %d FUTSTK rows -> %d unique underlying symbols "
-                "(expected ~180-220)", len(fut), len(result))
+    fut_names = set(fut[name_col].astype(str).str.strip().str.upper())
+
+    if symbol_col is None:
+        logger.warning("[fo_eligible_symbols] no tradingsymbol column found — falling back to raw "
+                        "`name` values, which will likely fail resolve_instrument_key() for some symbols")
+        return fut_names
+
+    type_upper = df[type_col].astype(str).str.upper()
+    eq = df[type_upper == "EQ"] if "EQ" in type_upper.unique() else df
+    name_to_tradingsymbol = {
+        str(row[name_col]).strip().upper(): str(row[symbol_col]).strip().upper()
+        for _, row in eq.iterrows()
+        if pd.notna(row.get(name_col)) and pd.notna(row.get(symbol_col))
+    }
+
+    result = set()
+    unmatched = []
+    for n in fut_names:
+        ts = name_to_tradingsymbol.get(n)
+        if ts:
+            result.add(ts)
+        else:
+            unmatched.append(n)
+
+    logger.info("[fo_eligible_symbols] %d FUTSTK rows -> %d unique underlying names -> %d "
+                "translated to a real tradingsymbol (expected ~180-220)",
+                len(fut), len(fut_names), len(result))
+    if unmatched:
+        logger.warning("[fo_eligible_symbols] %d/%d underlying names had NO matching EQ tradingsymbol "
+                        "in this same file — dropped rather than passed through untranslated "
+                        "(they would only have failed later at Stage 1 anyway): %s",
+                        len(unmatched), len(fut_names), sorted(unmatched)[:15])
     return result
 
 
