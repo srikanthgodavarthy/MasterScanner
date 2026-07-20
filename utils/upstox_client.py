@@ -196,13 +196,55 @@ def load_nse_instrument_master() -> pd.DataFrame:
     """Downloads Upstox's NSE instrument master (refreshed daily by
     Upstox) so plain stock names like 'RELIANCE' can be resolved to the
     instrument_key Upstox's API actually requires
-    (e.g. NSE_EQ|INE002A01018)."""
+    (e.g. NSE_EQ|INE002A01018).
+
+    2026-07-20: added row-count/instrument_type-distribution logging —
+    this file has been reported blank/truncated by Upstox before (their
+    own community forum has multiple such reports), and the CSV format
+    is being deprecated by Upstox in favour of JSON, so a silently
+    near-empty or malformed download here is a real, recurring failure
+    mode. Previously there was zero visibility into this: fo_eligible_
+    symbols() (and everything downstream of it — the entire Stage 0
+    Universe) would just silently work with whatever came back, with no
+    signal that the source data itself had collapsed to a handful of
+    rows until the funnel's final output looked wrong two stages later.
+    """
     resp = requests.get(_INSTRUMENT_MASTER_URL, timeout=15)
     resp.raise_for_status()
     with gzip.open(io.BytesIO(resp.content)) as f:
         df = pd.read_csv(f)
     df.columns = [c.strip().lower() for c in df.columns]
+
+    type_col = next((c for c in ("instrument_type", "instrumenttype") if c in df.columns), None)
+    logger.info("[InstrumentMaster] downloaded %d rows, %d bytes gzipped, columns=%s",
+                len(df), len(resp.content), list(df.columns))
+    if type_col is not None:
+        counts = df[type_col].astype(str).str.upper().value_counts()
+        logger.info("[InstrumentMaster] instrument_type distribution (top 10): %s",
+                    counts.head(10).to_dict())
+    else:
+        logger.warning("[InstrumentMaster] no instrument_type/instrumenttype column found at all — "
+                        "columns were: %s", list(df.columns))
+    if len(df) < 1000:
+        logger.warning("[InstrumentMaster] only %d rows — Upstox's NSE.csv.gz has been reported "
+                        "blank/truncated before; expected tens of thousands of rows for the full "
+                        "NSE instrument set. Downstream universes (fo_eligible_symbols(), "
+                        "resolve_instrument_key()) will be built from this same undersized data.", len(df))
     return df
+
+
+# 2026-07-20: Upstox's NSE instrument master labels the equity segment
+# 'EQUITY' (confirmed via [InstrumentMaster] instrument_type distribution
+# logging), not 'EQ'. Both _symbol_to_instrument_key_map() and
+# fo_eligible_symbols() previously hardcoded the literal string "EQ",
+# which matched zero rows — silently disabling the EQ-priority filter in
+# the former (mostly harmless there, since tradingsymbol rarely collides
+# across instrument types) and causing fo_eligible_symbols() to fall back
+# to the entire 88k-row unfiltered file in the latter (fatal there, since
+# it joins on `name`, which DOES collide — every option contract for a
+# stock shares its underlying's `name`). Matching against both labels
+# keeps this working if Upstox ever reverts to the shorter form.
+_EQUITY_TYPE_LABELS = {"EQ", "EQUITY"}
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -217,7 +259,7 @@ def _symbol_to_instrument_key_map() -> dict:
     if symbol_col is None:
         return {}
     if type_col in df.columns:
-        eq = df[df[type_col].astype(str).str.upper() == "EQ"]
+        eq = df[df[type_col].astype(str).str.upper().isin(_EQUITY_TYPE_LABELS)]
         # keep non-EQ rows too, but EQ wins ties via the update order below
         base = df
     else:
@@ -371,6 +413,16 @@ def fetch_ohlcv_upstox(symbol: str, period: str = "1y", interval: str = "1d") ->
 
     instrument_key = resolve_instrument_key(symbol)
     if instrument_key is None:
+        # 2026-07-20: was a silent empty-DataFrame return with zero logging —
+        # if resolve_instrument_key() can't match most of a symbol list (e.g.
+        # a "name" vs "tradingsymbol" column mismatch for multi-word/hyphenated
+        # company names — see fetch_batch_ohlcv_upstox()'s summary log for the
+        # aggregate count), every one of those symbols silently vanishes from
+        # the daily pool with no trace. Logging each miss here is the only way
+        # to tell "no instrument_key match" apart from "fetch failed".
+        logger.warning("[fetch_ohlcv_upstox] could not resolve instrument_key for %r — "
+                        "check whether this symbol string matches the instrument master's "
+                        "tradingsymbol column", symbol)
         return pd.DataFrame()
 
     days_back = _PERIOD_TO_DAYS.get(period, 375)
@@ -577,6 +629,61 @@ def fetch_batch_ema9_21_upstox(symbols: list, progress_cb=None) -> dict:
     return result
 
 
+def fetch_batch_intraday_5m_upstox(symbols: list, progress_cb=None) -> dict:
+    """Concurrent full 5-minute OHLCV fetch for a MIXED list of index
+    and/or stock symbols — same ThreadPoolExecutor + throttle pattern as
+    fetch_batch_ema9_21_upstox(), but returns the whole DataFrame per
+    symbol rather than just the EMA9/21 numbers, for callers that need
+    more than the EMA read (VWAP/ORB/NR7/volume expansion etc. — see
+    utils.dore_fo_screener.execution_features_from_intraday_5m()).
+
+    2026-07-20: added specifically to fix utils.dore_fo_screener.
+    stage2_execution_qualification(), which was fetching intraday data
+    ONE SYMBOL AT A TIME in a sequential for-loop despite claiming to be
+    "batched" — 50-70 symbols * 2 calls each, sequential, burns through
+    Upstox's 25 req/s / 250-per-min ceiling fast enough that most calls
+    after the first handful can start 429-ing, which silently collapses
+    the Stage 2 survivor count (a failed fetch -> {} execution features
+    -> NOT_READY). This function fixes that by fetching concurrently
+    instead, same as the rest of this module's batch fetchers.
+
+    Index membership is resolved via _INDEX_INSTRUMENT_KEYS rather than
+    importing dore_fo_screener's _INDICES tuple, to avoid a circular
+    import (dore_fo_screener already imports from this module).
+
+    Returns {symbol: DataFrame} — symbols with no intraday data (market
+    closed, fetch failure, illiquid/no recent bars) are simply omitted,
+    same fail-soft-per-symbol contract as every other batch fetcher here.
+    """
+    if not symbols:
+        return {}
+    if is_token_expired():
+        logger.warning("Upstox token likely expired (past 3:30 AM IST) — skipping intraday batch fetch")
+        return {}
+
+    def _fetch_one(sym: str) -> pd.DataFrame:
+        if sym.upper() in _INDEX_INSTRUMENT_KEYS:
+            return fetch_index_intraday_5m_upstox(sym)
+        return fetch_stock_intraday_5m_upstox(sym)
+
+    result: dict = {}
+    done = 0
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {pool.submit(_fetch_one, sym): sym for sym in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                df = fut.result()
+                if df is not None and not df.empty:
+                    result[sym] = df
+            except Exception as exc:
+                logger.warning("Upstox intraday 5m batch fetch failed for %s: %s", sym, exc)
+            done += 1
+            if progress_cb:
+                progress_cb(done, len(symbols))
+    return result
+
+
 def fetch_ohlcv_range_upstox(symbol: str, start: date, end: date) -> pd.DataFrame:
     """
     Date-range counterpart to fetch_ohlcv_upstox(), for callers (history_store)
@@ -642,6 +749,18 @@ def fetch_batch_ohlcv_upstox(symbols: list, period: str = "1y", interval: str = 
         logger.warning("Upstox token likely expired (past 3:30 AM IST) — skipping fetch")
         return {}
 
+    # 2026-07-20: split out up front so the summary log below can tell
+    # "couldn't resolve to an instrument_key" apart from "resolved fine but
+    # the candle fetch itself failed" — these have completely different
+    # fixes (a symbol-string/column-mismatch problem vs a network/rate-limit
+    # one) and were previously indistinguishable from the caller's side,
+    # both just showing up as "missing from the result dict".
+    unresolved = [s for s in symbols if resolve_instrument_key(s) is None]
+    if unresolved:
+        logger.warning("[fetch_batch_ohlcv_upstox] %d/%d symbols have NO instrument_key match "
+                        "at all (name/tradingsymbol mismatch?) — examples: %s",
+                        len(unresolved), len(symbols), unresolved[:10])
+
     result: dict = {}
     done = 0
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
@@ -660,6 +779,10 @@ def fetch_batch_ohlcv_upstox(symbols: list, period: str = "1y", interval: str = 
             done += 1
             if progress_cb:
                 progress_cb(done, len(symbols))
+    logger.info("[fetch_batch_ohlcv_upstox] %d/%d symbols returned usable daily OHLCV "
+                "(%d had no instrument_key match, %d resolved but the candle fetch itself failed/was too short)",
+                len(result), len(symbols), len(unresolved),
+                len(symbols) - len(result) - len(unresolved))
     return result
 
 
@@ -915,6 +1038,54 @@ def fetch_nearest_expiry(index: str = "NIFTY") -> str | None:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
+def _get_option_chain_with_retry(instrument_key: str, expiry: str) -> Optional[list]:
+    """Throttled, retrying GET for /v2/option/chain — shared by
+    fetch_oi_resistance() and fetch_stock_atm_option(). 2026-07-20: both
+    previously called requests.get() directly with ZERO rate-limit
+    protection (no _wait_for_spacing(), no 429 backoff/retry) — unlike
+    every candle-fetching function in this module. That made Stage 3's
+    per-symbol option-chain fetch (15-25 stocks, one call each) fragile
+    to a single early 429: raise_for_status() throws, the caller's
+    generic except catches it, the symbol is silently dropped, no retry
+    is ever attempted. That's the second half of why the F&O Opportunity
+    Engine was still surfacing ~1 name after Stage 2's concurrency fix —
+    Stage 3 could still collapse the same way, just later in the funnel.
+
+    Returns the parsed chain list (resp.json()["data"]), or None on a
+    401 / repeated failure — same fail-soft contract both callers had
+    before this refactor.
+    """
+    headers = _auth_headers()
+    if headers is None:
+        return None
+    last_exc = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        _wait_for_spacing()
+        try:
+            resp = requests.get(
+                f"{BASE_URL}/v2/option/chain",
+                headers=headers,
+                params={"instrument_key": instrument_key, "expiry_date": expiry},
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                backoff = _RETRY_BASE_S * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                logger.warning("Upstox rate-limited on option-chain %s, retrying in %.1fs", instrument_key, backoff)
+                time.sleep(backoff)
+                continue
+            if resp.status_code == 401:
+                logger.warning("Upstox 401 on option-chain %s — token expired or invalid", instrument_key)
+                return None
+            resp.raise_for_status()
+            return resp.json().get("data", [])
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(_RETRY_BASE_S * attempt)
+    logger.warning("Upstox option-chain failed for %s after %d attempts: %s",
+                    instrument_key, _MAX_RETRIES, last_exc)
+    return None
+
+
 def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
     """
     Return the nearest-expiry Call/Put OI resistance levels for `index`
@@ -944,21 +1115,11 @@ def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
     if not expiry:
         return None
 
-    try:
-        resp = requests.get(
-            f"{BASE_URL}/v2/option/chain",
-            headers=headers,
-            params={"instrument_key": instrument_key, "expiry_date": expiry},
-            timeout=15,
-        )
-        if resp.status_code == 401:
-            logger.warning("Upstox 401 on option-chain for %s — token expired or invalid", index)
-            return None
-        resp.raise_for_status()
-        chain = resp.json().get("data", [])
-        if not chain:
-            return None
+    chain = _get_option_chain_with_retry(instrument_key, expiry)
+    if not chain:
+        return None
 
+    try:
         def _oi(row: dict, leg: str) -> float:
             return ((row.get(leg) or {}).get("market_data") or {}).get("oi", 0) or 0
 
@@ -1126,14 +1287,76 @@ def fo_eligible_symbols() -> set:
     """Underlying stock symbols that currently have listed stock futures
     (instrument_type == FUTSTK) — i.e. the subset of the Nifty 500 (or
     any universe) actually tradeable via futures/options. Only ~180-220
-    of the Nifty 500 have derivatives; screening the rest is pointless."""
+    of the Nifty 500 have derivatives; screening the rest is pointless.
+
+    2026-07-20: previously returned the FUTSTK rows' `name` column
+    (the underlying's display name, e.g. "Bajaj Auto") directly, on the
+    assumption it doubles as a tradingsymbol. It often doesn't —
+    resolve_instrument_key() (used by every OHLCV/EMA fetch from Stage 1
+    onward) looks symbols up against the SAME file's `tradingsymbol`
+    column instead, so any name/tradingsymbol mismatch (hyphens,
+    ampersands, spacing, "LTD" suffixes, casing) meant that stock was
+    handed to Stage 0 by name, then silently failed to resolve at
+    Stage 1 and vanished from the Daily Candidate Pool with only a
+    debug-level "no instrument_key match" log line as a trace — DORE
+    never got a chance to evaluate it at all.
+
+    Fixed by translating each FUTSTK row's `name` to its own EQ row's
+    `tradingsymbol` (joined on `name`, which IS shared verbatim across
+    a company's EQ/FUTSTK/OPTSTK rows in this file) before returning —
+    so callers get strings resolve_instrument_key() can actually use.
+    """
     df = load_fo_instrument_master()
     type_col = _fo_column(df, "instrument_type", "instrumenttype")
     name_col = _fo_column(df, "name", "underlying_symbol", "asset_symbol")
+    symbol_col = _fo_column(df, "tradingsymbol", "trading_symbol", "symbol")
     if type_col is None or name_col is None:
+        logger.warning("[fo_eligible_symbols] type_col=%s name_col=%s — returning empty set, "
+                        "see load_nse_instrument_master()'s log lines for what columns actually came back",
+                        type_col, name_col)
         return set()
+
     fut = df[df[type_col].astype(str).str.upper() == "FUTSTK"]
-    return set(fut[name_col].astype(str).str.strip().str.upper())
+    fut_names = set(fut[name_col].astype(str).str.strip().str.upper())
+
+    if symbol_col is None:
+        logger.warning("[fo_eligible_symbols] no tradingsymbol column found — falling back to raw "
+                        "`name` values, which will likely fail resolve_instrument_key() for some symbols")
+        return fut_names
+
+    type_upper = df[type_col].astype(str).str.upper()
+    eq_fallback_used = not type_upper.isin(_EQUITY_TYPE_LABELS).any()
+    eq = df[type_upper.isin(_EQUITY_TYPE_LABELS)] if not eq_fallback_used else df
+    if eq_fallback_used:
+        logger.warning("[fo_eligible_symbols] none of %s found in instrument_type — falling back to "
+                        "the unfiltered file for the name->tradingsymbol join, which WILL produce "
+                        "garbage (option-contract tradingsymbols instead of equity ones) since `name` "
+                        "collides across instrument types. instrument_type values seen: %s",
+                        sorted(_EQUITY_TYPE_LABELS), sorted(type_upper.unique())[:20])
+    name_to_tradingsymbol = {
+        str(row[name_col]).strip().upper(): str(row[symbol_col]).strip().upper()
+        for _, row in eq.iterrows()
+        if pd.notna(row.get(name_col)) and pd.notna(row.get(symbol_col))
+    }
+
+    result = set()
+    unmatched = []
+    for n in fut_names:
+        ts = name_to_tradingsymbol.get(n)
+        if ts:
+            result.add(ts)
+        else:
+            unmatched.append(n)
+
+    logger.info("[fo_eligible_symbols] %d FUTSTK rows -> %d unique underlying names -> %d "
+                "translated to a real tradingsymbol (expected ~180-220)",
+                len(fut), len(fut_names), len(result))
+    if unmatched:
+        logger.warning("[fo_eligible_symbols] %d/%d underlying names had NO matching EQ tradingsymbol "
+                        "in this same file — dropped rather than passed through untranslated "
+                        "(they would only have failed later at Stage 1 anyway): %s",
+                        len(unmatched), len(fut_names), sorted(unmatched)[:15])
+    return result
 
 
 def _stock_futures_contracts(symbol: str) -> pd.DataFrame:
@@ -1234,11 +1457,8 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
     _INDEX_INSTRUMENT_KEYS map.
 
     Returns {"expiry", "atm_strike", "ce_strike","ce_premium","ce_oi","ce_delta","ce_iv",
-             "ce_spread_pct", "pe_strike","pe_premium","pe_oi","pe_delta","pe_iv",
-             "pe_spread_pct", "pcr"} or None on any failure / if the symbol has no
-             listed options. ce_spread_pct/pe_spread_pct are None (not 0.0) whenever
-             Upstox doesn't return usable bid/ask quotes for that leg — see
-             _spread_pct()'s docstring inline for why that distinction matters.
+             "pe_strike","pe_premium","pe_oi","pe_delta","pe_iv", "pcr"} or None on
+    any failure / if the symbol has no listed options.
     """
     headers = _auth_headers()
     instrument_key = resolve_instrument_key(symbol)
@@ -1259,21 +1479,11 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
         return None
     expiry = expiries[0]
 
-    try:
-        resp = requests.get(
-            f"{BASE_URL}/v2/option/chain",
-            headers=headers,
-            params={"instrument_key": instrument_key, "expiry_date": expiry},
-            timeout=15,
-        )
-        if resp.status_code == 401:
-            logger.warning("Upstox 401 on stock option-chain for %s", symbol)
-            return None
-        resp.raise_for_status()
-        chain = resp.json().get("data", [])
-        if not chain:
-            return None
+    chain = _get_option_chain_with_retry(instrument_key, expiry)
+    if not chain:
+        return None
 
+    try:
         def _md(row, leg, field, default=0):
             return ((row.get(leg) or {}).get("market_data") or {}).get(field, default) or default
 
@@ -1281,32 +1491,12 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
             g = (row.get(leg) or {}).get("option_greeks") or {}
             return g.get("delta"), g.get("iv")
 
-        def _spread_pct(row, leg):
-            # Upstox's market_data carries bid_price/ask_price per leg
-            # (same object _md() already reads ltp/oi from). Spread as a
-            # % of mid-price — the standard normalization so a spread can
-            # be compared across strikes/symbols with very different
-            # premium levels. None (not 0.0) when quotes are missing or
-            # degenerate, so DORE's "unavailable -> neutral" fallback
-            # (stage3_premium_quality) fires instead of silently scoring
-            # a fake 0%-spread as perfectly liquid.
-            bid = _md(row, leg, "bid_price", default=0.0)
-            ask = _md(row, leg, "ask_price", default=0.0)
-            if not bid or not ask or ask <= bid:
-                return None
-            mid = (bid + ask) / 2.0
-            if mid <= 0:
-                return None
-            return round((ask - bid) / mid * 100.0, 3)
-
         spot = next((r.get("underlying_spot_price") for r in chain if r.get("underlying_spot_price")), None)
         if not spot:
             return None
         atm_row = min(chain, key=lambda r: abs((r.get("strike_price") or 0) - spot))
         ce_delta, ce_iv = _greeks(atm_row, "call_options")
         pe_delta, pe_iv = _greeks(atm_row, "put_options")
-        ce_spread_pct = _spread_pct(atm_row, "call_options")
-        pe_spread_pct = _spread_pct(atm_row, "put_options")
         total_ce_oi = sum(_md(r, "call_options", "oi") for r in chain)
         total_pe_oi = sum(_md(r, "put_options", "oi") for r in chain)
 
@@ -1331,12 +1521,10 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
             "ce_premium":  _md(atm_row, "call_options", "ltp"),
             "ce_oi":       _md(atm_row, "call_options", "oi"),
             "ce_delta":    ce_delta, "ce_iv": ce_iv,
-            "ce_spread_pct": ce_spread_pct,
             "pe_strike":   atm_row.get("strike_price"),
             "pe_premium":  _md(atm_row, "put_options", "ltp"),
             "pe_oi":       _md(atm_row, "put_options", "oi"),
             "pe_delta":    pe_delta, "pe_iv": pe_iv,
-            "pe_spread_pct": pe_spread_pct,
             "pcr":         round(total_pe_oi / total_ce_oi, 3) if total_ce_oi else None,
             # ── Real OI wall (for DORE's Corridor stage) ──────────────
             "ce_wall_strike": best_ce.get("strike_price"),
@@ -1349,3 +1537,47 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
     except Exception:
         logger.warning("Upstox stock option-chain fetch failed for %s", symbol, exc_info=True)
         return None
+
+
+def fetch_batch_stock_atm_options_upstox(symbols: list, progress_cb=None) -> dict:
+    """Concurrent ATM Call+Put fetch for a (already-gated, short) list of
+    stock symbols — same ThreadPoolExecutor + throttle pattern as
+    fetch_batch_intraday_5m_upstox()/fetch_batch_ema9_21_upstox(), since
+    /v2/option/chain has no multi-symbol batch variant either.
+
+    2026-07-20: added alongside _get_option_chain_with_retry() to fix
+    utils.dore_fo_screener.compute_fo_opportunities() (Stage 3), which
+    was calling fetch_stock_atm_option() ONE SYMBOL AT A TIME in a
+    sequential for-loop — the same anti-pattern Stage 2 had, just one
+    stage later in the funnel, and with the added problem that the
+    underlying single-symbol call had zero rate-limit retry protection
+    until this refactor. Together those two issues meant Stage 3 could
+    still collapse a healthy 15-25-symbol Live Candidate Pool down to
+    ~1 successful option-chain fetch even after Stage 2 was fixed.
+
+    Returns {symbol: {...fetch_stock_atm_option()'s dict...}} — symbols
+    with no listed options / a failed fetch are simply omitted, same
+    fail-soft-per-symbol contract as every other batch fetcher here.
+    """
+    if not symbols:
+        return {}
+    if is_token_expired():
+        logger.warning("Upstox token likely expired (past 3:30 AM IST) — skipping ATM-option batch fetch")
+        return {}
+
+    result: dict = {}
+    done = 0
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {pool.submit(fetch_stock_atm_option, sym): sym for sym in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                opt = fut.result()
+                if opt is not None:
+                    result[sym] = opt
+            except Exception as exc:
+                logger.warning("Upstox ATM-option batch fetch failed for %s: %s", sym, exc)
+            done += 1
+            if progress_cb:
+                progress_cb(done, len(symbols))
+    return result
