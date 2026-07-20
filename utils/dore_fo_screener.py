@@ -336,18 +336,27 @@ def compute_fo_opportunities(
                                                   opt.get("total_pe_oi", 0.0))
             atm_chain_row["ce_oi_change"] = ce_chg
             atm_chain_row["pe_oi_change"] = pe_chg
+
+            dore_input = build_dore_input(
+                symbol=symbol, price=row["price"], trend_features=row.get("trend_features"),
+                execution_features=row.get("execution_features"),
+                atm_chain_row=atm_chain_row, oi_resistance=oi_resistance_like,
+                india_vix=india_vix,
+            )
+            result = compute_dore(dore_input, cfg)
         except Exception:
-            logger.exception("[DORE Stage3] option-chain fetch failed for %s", symbol)
+            # Was previously OUTSIDE this try block — one symbol raising
+            # here (bad chain value, unexpected None deep in a stage
+            # function, etc.) would silently kill the entire run: every
+            # symbol after the one that failed just never got processed,
+            # with no error surfaced anywhere in these logs (whatever
+            # caught it further up the stack, e.g. Streamlit's own
+            # exception boundary, doesn't have this function's context).
+            # That's the exact "why do I only see BHEL" bug.
+            logger.exception("[DORE Stage3] build_dore_input/compute_dore failed for %s", symbol)
             skipped += 1
             continue
 
-        dore_input = build_dore_input(
-            symbol=symbol, price=row["price"], trend_features=row.get("trend_features"),
-            execution_features=row.get("execution_features"),
-            atm_chain_row=atm_chain_row, oi_resistance=oi_resistance_like,
-            india_vix=india_vix,
-        )
-        result = compute_dore(dore_input, cfg)
         rows.append((result.opportunity_score, result.to_dashboard_row(symbol)))
 
     if skipped:
