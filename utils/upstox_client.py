@@ -1287,6 +1287,19 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
         total_ce_oi = sum(_md(r, "call_options", "oi") for r in chain)
         total_pe_oi = sum(_md(r, "put_options", "oi") for r in chain)
 
+        # 2026-07-20: real OI-wall detection (highest-OI CE/PE strike across
+        # the whole chain), same logic as fetch_oi_resistance() uses for
+        # indices. Previously this function had no wall data at all — only
+        # the ATM strike duplicated under both ce_strike/pe_strike — so
+        # DORE's Stage 4 Corridor gate (room to the next OI wall) had
+        # nothing real to measure for a stock. best_ce/best_pe below are
+        # exposed as ce_wall_strike/pe_wall_strike so callers can tell them
+        # apart from the ATM strike; ce_strike/pe_strike are left as the
+        # ATM strike (unchanged) for backward compatibility with existing
+        # callers that want the tradeable leg's own strike.
+        best_ce = max(chain, key=lambda r: _md(r, "call_options", "oi"))
+        best_pe = max(chain, key=lambda r: _md(r, "put_options", "oi"))
+
         return {
             "expiry":      expiry,
             "spot":        float(spot),
@@ -1300,6 +1313,13 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
             "pe_oi":       _md(atm_row, "put_options", "oi"),
             "pe_delta":    pe_delta, "pe_iv": pe_iv,
             "pcr":         round(total_pe_oi / total_ce_oi, 3) if total_ce_oi else None,
+            # ── Real OI wall (for DORE's Corridor stage) ──────────────
+            "ce_wall_strike": best_ce.get("strike_price"),
+            "ce_wall_oi":      _md(best_ce, "call_options", "oi"),
+            "pe_wall_strike": best_pe.get("strike_price"),
+            "pe_wall_oi":      _md(best_pe, "put_options", "oi"),
+            "total_ce_oi":     total_ce_oi,
+            "total_pe_oi":     total_pe_oi,
         }
     except Exception:
         logger.warning("Upstox stock option-chain fetch failed for %s", symbol, exc_info=True)
