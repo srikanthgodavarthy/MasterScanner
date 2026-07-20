@@ -970,6 +970,54 @@ def fetch_nearest_expiry(index: str = "NIFTY") -> str | None:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
+def _get_option_chain_with_retry(instrument_key: str, expiry: str) -> Optional[list]:
+    """Throttled, retrying GET for /v2/option/chain — shared by
+    fetch_oi_resistance() and fetch_stock_atm_option(). 2026-07-20: both
+    previously called requests.get() directly with ZERO rate-limit
+    protection (no _wait_for_spacing(), no 429 backoff/retry) — unlike
+    every candle-fetching function in this module. That made Stage 3's
+    per-symbol option-chain fetch (15-25 stocks, one call each) fragile
+    to a single early 429: raise_for_status() throws, the caller's
+    generic except catches it, the symbol is silently dropped, no retry
+    is ever attempted. That's the second half of why the F&O Opportunity
+    Engine was still surfacing ~1 name after Stage 2's concurrency fix —
+    Stage 3 could still collapse the same way, just later in the funnel.
+
+    Returns the parsed chain list (resp.json()["data"]), or None on a
+    401 / repeated failure — same fail-soft contract both callers had
+    before this refactor.
+    """
+    headers = _auth_headers()
+    if headers is None:
+        return None
+    last_exc = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        _wait_for_spacing()
+        try:
+            resp = requests.get(
+                f"{BASE_URL}/v2/option/chain",
+                headers=headers,
+                params={"instrument_key": instrument_key, "expiry_date": expiry},
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                backoff = _RETRY_BASE_S * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                logger.warning("Upstox rate-limited on option-chain %s, retrying in %.1fs", instrument_key, backoff)
+                time.sleep(backoff)
+                continue
+            if resp.status_code == 401:
+                logger.warning("Upstox 401 on option-chain %s — token expired or invalid", instrument_key)
+                return None
+            resp.raise_for_status()
+            return resp.json().get("data", [])
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(_RETRY_BASE_S * attempt)
+    logger.warning("Upstox option-chain failed for %s after %d attempts: %s",
+                    instrument_key, _MAX_RETRIES, last_exc)
+    return None
+
+
 def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
     """
     Return the nearest-expiry Call/Put OI resistance levels for `index`
@@ -999,21 +1047,11 @@ def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
     if not expiry:
         return None
 
-    try:
-        resp = requests.get(
-            f"{BASE_URL}/v2/option/chain",
-            headers=headers,
-            params={"instrument_key": instrument_key, "expiry_date": expiry},
-            timeout=15,
-        )
-        if resp.status_code == 401:
-            logger.warning("Upstox 401 on option-chain for %s — token expired or invalid", index)
-            return None
-        resp.raise_for_status()
-        chain = resp.json().get("data", [])
-        if not chain:
-            return None
+    chain = _get_option_chain_with_retry(instrument_key, expiry)
+    if not chain:
+        return None
 
+    try:
         def _oi(row: dict, leg: str) -> float:
             return ((row.get(leg) or {}).get("market_data") or {}).get("oi", 0) or 0
 
@@ -1311,21 +1349,11 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
         return None
     expiry = expiries[0]
 
-    try:
-        resp = requests.get(
-            f"{BASE_URL}/v2/option/chain",
-            headers=headers,
-            params={"instrument_key": instrument_key, "expiry_date": expiry},
-            timeout=15,
-        )
-        if resp.status_code == 401:
-            logger.warning("Upstox 401 on stock option-chain for %s", symbol)
-            return None
-        resp.raise_for_status()
-        chain = resp.json().get("data", [])
-        if not chain:
-            return None
+    chain = _get_option_chain_with_retry(instrument_key, expiry)
+    if not chain:
+        return None
 
+    try:
         def _md(row, leg, field, default=0):
             return ((row.get(leg) or {}).get("market_data") or {}).get(field, default) or default
 
@@ -1379,3 +1407,47 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
     except Exception:
         logger.warning("Upstox stock option-chain fetch failed for %s", symbol, exc_info=True)
         return None
+
+
+def fetch_batch_stock_atm_options_upstox(symbols: list, progress_cb=None) -> dict:
+    """Concurrent ATM Call+Put fetch for a (already-gated, short) list of
+    stock symbols — same ThreadPoolExecutor + throttle pattern as
+    fetch_batch_intraday_5m_upstox()/fetch_batch_ema9_21_upstox(), since
+    /v2/option/chain has no multi-symbol batch variant either.
+
+    2026-07-20: added alongside _get_option_chain_with_retry() to fix
+    utils.dore_fo_screener.compute_fo_opportunities() (Stage 3), which
+    was calling fetch_stock_atm_option() ONE SYMBOL AT A TIME in a
+    sequential for-loop — the same anti-pattern Stage 2 had, just one
+    stage later in the funnel, and with the added problem that the
+    underlying single-symbol call had zero rate-limit retry protection
+    until this refactor. Together those two issues meant Stage 3 could
+    still collapse a healthy 15-25-symbol Live Candidate Pool down to
+    ~1 successful option-chain fetch even after Stage 2 was fixed.
+
+    Returns {symbol: {...fetch_stock_atm_option()'s dict...}} — symbols
+    with no listed options / a failed fetch are simply omitted, same
+    fail-soft-per-symbol contract as every other batch fetcher here.
+    """
+    if not symbols:
+        return {}
+    if is_token_expired():
+        logger.warning("Upstox token likely expired (past 3:30 AM IST) — skipping ATM-option batch fetch")
+        return {}
+
+    result: dict = {}
+    done = 0
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {pool.submit(fetch_stock_atm_option, sym): sym for sym in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                opt = fut.result()
+                if opt is not None:
+                    result[sym] = opt
+            except Exception as exc:
+                logger.warning("Upstox ATM-option batch fetch failed for %s: %s", sym, exc)
+            done += 1
+            if progress_cb:
+                progress_cb(done, len(symbols))
+    return result
