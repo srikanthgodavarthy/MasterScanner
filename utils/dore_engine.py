@@ -67,11 +67,14 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import pandas as pd
 
 from utils.dore_settings import DORESettings, DORE_DEFAULTS
+
+if TYPE_CHECKING:
+    from utils.event_intelligence import EventIntelligence
 
 logger = logging.getLogger(__name__)
 
@@ -1218,6 +1221,7 @@ def build_trade_plan(inp: DOREInput, cfg: DORESettings, direction: Optional[str]
 def stage4_risk_engine(
     inp: DOREInput, cfg: DORESettings, trade_plan: "TradePlan",
     corridor_score: float, iv_health_score: float, iv_crush_risk: bool,
+    event_intel: Optional["EventIntelligence"] = None,
 ) -> tuple[float, bool, list[str]]:
     """'If we take this trade, what could go wrong, and is it
     acceptable?' — a distinct concern from Stage 3's chain confirmation
@@ -1226,9 +1230,24 @@ def stage4_risk_engine(
     reasons); hard_gate_pass=False forces NO_TRADE regardless of score
     (the trip-wire concept from the original Stage 4c, actually wired
     here this time).
+
+    `event_intel`: an EventIntelligence instance (utils.event_intelligence)
+    is the real producer of event risk now — see that module's docstring
+    for the Providers -> Cache -> Intelligence pipeline. When supplied,
+    it REPLACES the caller-supplied `inp.event_risk_today` flag entirely
+    (a service call, not a merge with the flag — a hand-set flag and a
+    service-computed one should never both be "sort of" trusted at once).
+    When None, falls back to `inp.event_risk_today` for callers not yet
+    migrated; that flag still defaults to False with no producer, so
+    `event_intel=None` is a transitional state, not a destination.
     """
     reasons: list[str] = []
     hard_gate_pass = True
+
+    if event_intel is not None:
+        event_risk_today = event_intel.event_risk_today(inp.symbol)
+    else:
+        event_risk_today = inp.event_risk_today
 
     if trade_plan.direction and trade_plan.stop_loss:
         risk = abs(trade_plan.entry - trade_plan.stop_loss)
@@ -1250,9 +1269,10 @@ def stage4_risk_engine(
         hard_gate_pass = False
         reasons.append(f"IV percentile={inp.iv_percentile:.0f} >= hard trip-wire "
                         f"({cfg.risk_iv_percentile_hard_max}) — event/IV-crush risk, NO_TRADE")
-    if inp.event_risk_today:
+    if event_risk_today:
         hard_gate_pass = False
-        reasons.append("Event risk flagged today — hard trip-wire, NO_TRADE")
+        source = "EventIntelligence" if event_intel is not None else "caller-supplied flag"
+        reasons.append(f"Event risk flagged today ({source}) — hard trip-wire, NO_TRADE")
 
     risk_score = _weighted([
         (rr_score,          cfg.w_risk_rr),
@@ -1427,11 +1447,20 @@ def build_dore_input_for_index(
 #  DORE 2.0 — ORCHESTRATOR
 # ══════════════════════════════════════════════════════════════════
 
-def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOREResult:
+def compute_dore(
+    inp: DOREInput, settings: Optional[DORESettings] = None,
+    event_intel: Optional["EventIntelligence"] = None,
+) -> DOREResult:
     """Run the full DORE 2.0 funnel (Stages 1-5) on a DOREInput already
     assembled by build_dore_input()/build_dore_input_for_index() and
     return one DOREResult. Independent of MasterScanner's own scores
     throughout (Principle 2.1) — deterministic given the same inp+cfg.
+
+    `event_intel`: optional utils.event_intelligence.EventIntelligence
+    instance, forwarded to Stage 4's Risk Engine. See
+    stage4_risk_engine's docstring — pass this once event caches have
+    been refreshed for the session; omit only for callers not yet
+    migrated off the raw `inp.event_risk_today` flag.
     """
     cfg = settings or DORESettings.from_dict(DORE_DEFAULTS)
 
@@ -1458,7 +1487,8 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     iv_health_score, iv_reasons, iv_crush_risk = stage4c_iv_health(inp, cfg)
     trade_plan = build_trade_plan(inp, cfg, direction)
     risk_score, risk_hard_gate_pass, risk_reasons = stage4_risk_engine(
-        inp, cfg, trade_plan, corridor_score, iv_health_score, iv_crush_risk)
+        inp, cfg, trade_plan, corridor_score, iv_health_score, iv_crush_risk,
+        event_intel=event_intel)
 
     recommendation, opp_direction, opportunity_score, opp_reasons = stage5_opportunity_ranking(
         cfg, directional_intent, execution_state, trend_score, execution_score,
