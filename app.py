@@ -3,6 +3,8 @@ import sys
 import os
 import gzip
 import io
+import logging
+import logging.handlers
 import requests
 import pandas as pd
 from dotenv import load_dotenv
@@ -10,6 +12,36 @@ from dotenv import load_dotenv
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+
+# 2026-07-20: nothing in this codebase ever called logging.basicConfig()
+# (or any other handler/level setup) anywhere — the root logger's default
+# level is WARNING, which silently drops every logger.info(...) call
+# throughout the app (DORE's Stage1/Stage2/Stage3/Stage4 funnel-count
+# diagnostics, Upstox rate-limit warnings, etc.) before it ever reaches a
+# console or file. Configured here, once, at the actual entrypoint —
+# NOT inside a page/util module, since Streamlit re-imports/reruns this
+# script on every interaction and re-adding handlers each time would
+# duplicate every log line. `if not logging.getLogger().handlers` guards
+# against that duplication across reruns within the same process.
+#
+# Logs go to BOTH:
+#   - a rotating file (logs/app.log, 5MB x 3 backups) — survives across
+#     reruns and container restarts, the one to check after the fact
+#   - stderr — visible directly in a local terminal / `docker logs` /
+#     whatever your process manager captures, for watching a scan live
+if not logging.getLogger().handlers:
+    _log_dir = os.path.join(ROOT, "logs")
+    os.makedirs(_log_dir, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            logging.handlers.RotatingFileHandler(
+                os.path.join(_log_dir, "app.log"), maxBytes=5 * 1024 * 1024, backupCount=3,
+            ),
+            logging.StreamHandler(sys.stderr),
+        ],
+    )
 
 load_dotenv()  # picks up UPSTOX_ACCESS_TOKEN from a local .env if present
 
