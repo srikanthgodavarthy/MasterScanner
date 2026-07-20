@@ -1310,6 +1310,93 @@ _CSS = """
 .ni-signal-check { font-size: 11px; font-weight: 700; cursor: default; }
 .ni-signal-confirm { color: var(--green); }
 .ni-signal-contradict { color: var(--red); }
+
+/* ══════════════════════════════════════════════════════════════════
+   MOBILE — 2026-07-20. Two breakpoints: 640px (small tablet / large
+   phone landscape) and 480px (phone portrait, the common case for this
+   page per user feedback). Streamlit's own frontend already stacks
+   st.columns() vertically below ~640px on its own — everything here is
+   the CUSTOM HTML/CSS this file renders directly, which Streamlit's
+   built-in responsiveness has no way to touch. Strategy throughout:
+   fixed-column grids collapse to fewer columns (never force 1-per-row
+   if 2 still reads fine — that wastes vertical scroll), font sizes and
+   padding come down a notch, and anything with a hard pixel-width grid
+   (the News Impact table) gets horizontal scroll instead of clipping
+   or breaking the page's own layout.
+   ══════════════════════════════════════════════════════════════════ */
+@media (max-width: 640px) {
+  /* Score cards (top of page) — 4 → 2 columns */
+  .card-grid { grid-template-columns: repeat(2, 1fr); }
+  .sc-value  { font-size: 22px; }
+
+  /* Five Pillars strip already handles 900px; tighten further */
+  .fp-strip { grid-template-columns: repeat(2, 1fr); gap: 6px; }
+
+  /* Locked Plan Grid — 5 → 3, wraps to a 2nd row rather than squeezing */
+  .locked-plan-grid { grid-template-columns: repeat(3, 1fr); }
+
+  /* Market Intelligence stat grid — 3 → 2 */
+  .ti-mi-grid { grid-template-columns: repeat(2, 1fr); gap: 10px 12px; }
+
+  /* Sector Opportunity Board — sparkline column stacks under the list
+     instead of squeezing into a fixed 130px rail */
+  .ti-sob-wrap { grid-template-columns: 1fr; }
+  .ti-sob-grid { grid-template-columns: repeat(2, 1fr); }
+
+  /* Market Breadth mini-stats — 4 → 2 */
+  .ti-breadth-grid { grid-template-columns: repeat(2, 1fr); }
+
+  /* Leadership Rotation two-column layout stacks */
+  .ti-lead-cols { grid-template-columns: 1fr; gap: 10px; }
+
+  /* Index card OHLC row — 4 → 2 */
+  .mo-index-ohlc-row { grid-template-columns: repeat(2, 1fr); }
+  .mo-index-price { font-size: 22px; }
+
+  /* Panel padding/typography — tighter on a narrow viewport */
+  .ni-panel, .lifecycle-panel { padding: 12px 12px 10px; }
+  .ti-panel-title, .ni-title { font-size: 12px; }
+
+  /* Top Gainers rows and Signal Class count pills wrap instead of
+     forcing horizontal scroll on the whole page */
+  .sc-counts { gap: 3px; }
+  .sc-count-pill { font-size: 10px; padding: 3px 7px; }
+  .ti-gainers-badge { width: auto; padding: 1px 6px; }
+
+  /* News Impact — the 9-column fixed-px grid (ni-grid) is wider than
+     any phone screen; scope the scroll to the panel itself rather than
+     letting it overflow the page or silently clip columns. */
+  .ni-panel { overflow-x: auto; }
+  .ni-grid { min-width: 720px; }
+}
+
+@media (max-width: 480px) {
+  .card-grid { grid-template-columns: repeat(2, 1fr); gap: 6px; }
+  .score-card { padding: 9px 10px 8px; }
+  .sc-value { font-size: 19px; }
+
+  .locked-plan-grid { grid-template-columns: repeat(2, 1fr); }
+  .ti-mi-grid, .ti-sob-grid, .ti-breadth-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .mo-index-ohlc-row { grid-template-columns: repeat(2, 1fr); }
+  .mo-index-oi-row { grid-template-columns: 1fr; }
+  .mo-index-price { font-size: 19px; }
+  .mo-index-grid { grid-template-columns: 1fr; }
+
+  /* Result table (Actionable/Developing/Fib/Active Setups) — already
+     horizontally scrollable via .rt-wrap; just cap its height a bit
+     tighter so it doesn't dominate a phone screen's first viewport */
+  .rt-wrap { max-height: 380px; }
+  .rt { font-size: 0.7rem; }
+  .rt thead th { padding: 6px 7px; font-size: 0.62rem; }
+  .rt td { padding: 5px 7px; }
+
+  /* Lifecycle timeline — narrower node spacing so more of it is visible
+     without scrolling before the user even notices it scrolls */
+  .lc-node { min-width: 64px; }
+
+  .msr-chip, .last-scan-chip { font-size: 10px; padding: 3px 8px; }
+  .regime-pill-solid { font-size: 10px; padding: 3px 10px; }
+}
 </style>
 """
 
