@@ -1628,28 +1628,27 @@ def _dore_debug_html(dore: dict, reasons: list, warnings: list) -> str:
                 f'<span style="color:var(--muted)">{label}</span>'
                 f'<span style="color:var(--text);font-weight:600">{value}</span></div>')
 
-    crush = dore.get("iv_crush_risk")
-    const_note = dore.get("_constituent_debug")
+    gate_fail = dore.get("risk_hard_gate_pass") is False
+    plan = dore.get("trade_plan") or {}
     scores_html = "".join([
+        _row("Execution State",     dore.get("execution_state", "—")),
+        _row("Execution Score",     f'{dore.get("execution_score", 0):.0f}'),
+        _row("Derivative Confidence", f'{dore.get("derivative_confidence", 0):.0f}'),
         _row("OI Structure",        f'{dore.get("oi_structure_score", 0):.0f}'),
         _row("Premium Quality",     f'{dore.get("premium_quality_score", 0):.0f}'),
-        _row("Intraday Momentum",   f'{dore.get("intraday_momentum_score", 0):.0f}'),
         _row("Corridor Score",      f'{dore.get("corridor_score", 0):.0f}'),
-        _row("OEQ",                 f'{dore.get("oeq_score", 0):.0f}'),
-        _row("Early Score",         f'{dore.get("early_score", 0):.0f}'),
-        _row("MTF Score",           f'{dore.get("mtf_score", 0):.0f}'),
-        _row("Component Strength",  f'{dore.get("component_strength_score", 0):.0f}'),
-        _row("IV Health",           f'{dore.get("iv_health_score", 0):.0f}'),
-        _row("IV Crush Risk",       "⚠ YES" if crush else "no"),
+        _row("Risk Quality",        f'{dore.get("risk_quality", 0):.0f}'),
+        _row("Risk Hard-Gate",      "⚠ FAILED" if gate_fail else "pass"),
+        _row("Opportunity Score",   f'{dore.get("opportunity_score", 0):.0f}'),
         _row("Conviction (/10)",    f'{dore.get("conviction_score_10", 0):.1f}'),
         _row("Strike Type",         dore.get("recommended_strike_type") or "—"),
         _row("Expiry",              dore.get("recommended_expiry") or "—"),
+        _row("Entry / SL",          f'{plan.get("entry", 0):.1f} / {plan.get("stop_loss", 0):.1f}'
+                                     if plan else "—"),
+        _row("Target 1/2/3",        f'{plan.get("target1", 0):.1f} / {plan.get("target2", 0):.1f} / '
+                                     f'{plan.get("target3", 0):.1f}' if plan else "—"),
     ])
-    const_html = (
-        f'<div style="margin-top:8px;color:var(--muted);font-weight:600;">Constituent lookup</div>'
-        f'<div style="color:var(--text);font-family:monospace;font-size:10px;margin-top:2px;">{const_note}</div>'
-        if const_note else ""
-    )
+    const_html = ""
     reasons_html  = "".join(f'<li style="margin-bottom:2px">{r}</li>' for r in reasons) or "<li>—</li>"
     warnings_html = "".join(f'<li style="margin-bottom:2px">{w}</li>' for w in warnings) or "<li>—</li>"
 
@@ -2264,72 +2263,80 @@ def _sc_counts_html(df: pd.DataFrame) -> str:
     return '<div class="sc-counts">' + "".join(parts) + '</div>'
 
 
-# ── DORE F&O OPPORTUNITIES — Futures / Options tabs ────────────────
-def _fo_opportunities_panel(df_aug: pd.DataFrame):
-    st.markdown('<div class="ti-panel-title" style="margin-top:0.6rem;">🎯 DORE F&amp;O OPPORTUNITIES — NIFTY 500</div>',
+# ── DORE 2.0 F&O OPPORTUNITIES — Futures / Options tabs ────────────
+# 2026-07-20: DORE 2.0 is architecturally independent of MasterScanner
+# (shares only the Market Data Layer — see docs/DORE_2_0_ARCHITECTURE.md
+# Principle 2.1). Both tabs now run DORE's own Stage 0-5 hierarchical
+# funnel (Universe -> Trend Qualification -> Execution Qualification ->
+# Derivative Intelligence -> Risk Engine -> Opportunity Ranking) instead
+# of ranking off the scanner's OppScore/Recommendation/T1 columns.
+def _fo_opportunities_panel():
+    st.markdown('<div class="ti-panel-title" style="margin-top:0.6rem;">🎯 DORE 2.0 F&amp;O OPPORTUNITY ENGINE</div>',
                 unsafe_allow_html=True)
     tab_fut, tab_opt = st.tabs(["📈 Futures", "🎯 Options"])
 
     with tab_fut:
         try:
-            fut_df = top_futures_opportunities(df_aug)
+            fut_df = top_futures_opportunities()
         except Exception:
             logger.exception("Futures opportunities panel failed (non-fatal)")
             fut_df = pd.DataFrame()
         if fut_df.empty:
-            st.caption("No live futures data available right now — check the Upstox token, "
-                       "or run a scan on the Scanner page if this is the first load.")
+            st.caption("No live futures data available right now — check the Upstox token, or "
+                       "every F&O name is currently NEUTRAL on DORE's own Trend Engine (Stage 1).")
         else:
             st.dataframe(
                 fut_df, hide_index=True, use_container_width=True,
                 column_config={
-                    "CMP":      st.column_config.NumberColumn("CMP", format="₹%.2f"),
-                    "%Chg":     st.column_config.NumberColumn("%Chg", format="%.2f%%"),
-                    "OI":       st.column_config.NumberColumn("OI", format="%d"),
-                    "OI Chg":   st.column_config.NumberColumn("OI Chg (today)", format="%d"),
-                    "Entry":    st.column_config.NumberColumn("Entry", format="₹%.2f"),
-                    "Target":   st.column_config.NumberColumn("Target (T1)", format="₹%.2f"),
-                    "SL":       st.column_config.NumberColumn("SL", format="₹%.2f"),
-                    "OppScore": st.column_config.NumberColumn("OppScore", format="%.0f"),
+                    "CMP":        st.column_config.NumberColumn("CMP", format="₹%.2f"),
+                    "%Chg":       st.column_config.NumberColumn("%Chg", format="%.2f%%"),
+                    "OI":         st.column_config.NumberColumn("OI", format="%d"),
+                    "OI Chg":     st.column_config.NumberColumn("OI Chg (today)", format="%d"),
+                    "Entry":      st.column_config.NumberColumn("Entry", format="₹%.2f"),
+                    "Target":     st.column_config.NumberColumn("Target (T1)", format="₹%.2f"),
+                    "SL":         st.column_config.NumberColumn("SL", format="₹%.2f"),
+                    "Trend Score": st.column_config.NumberColumn("Trend Score", format="%.0f"),
                 },
             )
             st.caption("Buildup = today's price change vs today's OI change (Long Buildup: price↑ "
                        "OI↑ · Short Covering: price↑ OI↓ · Short Buildup: price↓ OI↑ · Long Unwinding: "
-                       "price↓ OI↓). OI Chg resets at market open each session. Target is the scanner's "
-                       "own swing target (T1), not a separate futures-specific projection.")
+                       "price↓ OI↓). OI Chg resets at market open each session. Directional Intent/"
+                       "Trend Score/Entry-Target-SL are DORE's own Stage 1 read and TradePlan — "
+                       "bidirectional (CE and PE), independent of the equity scanner's own targets.")
 
     with tab_opt:
         try:
-            opt_df = top_options_opportunities(df_aug)
+            opt_df = top_options_opportunities()
         except Exception:
             logger.exception("Options opportunities panel failed (non-fatal)")
             opt_df = pd.DataFrame()
         if opt_df.empty:
             st.caption("No DORE-qualified option setups right now — either the Upstox token needs "
-                       "checking, no scan has run yet, or every F&O candidate is currently gated to "
-                       "WAIT (see the Market Intelligence index cards for why a WAIT happens).")
+                       "checking, or every F&O candidate is currently gated to WAIT/NO_TRADE (see "
+                       "the Market Intelligence index cards for why).")
         else:
             st.dataframe(
                 opt_df, hide_index=True, use_container_width=True,
                 column_config={
-                    "Spot":           st.column_config.NumberColumn("Spot", format="₹%.2f"),
-                    "Strike":         st.column_config.NumberColumn("Strike", format="%.0f"),
-                    "Premium":        st.column_config.NumberColumn("Premium", format="₹%.2f"),
-                    "Delta":          st.column_config.NumberColumn("Delta", format="%.2f"),
-                    "IV":             st.column_config.NumberColumn("IV", format="%.1f"),
-                    "OI":             st.column_config.NumberColumn("OI", format="%d"),
-                    "PCR":            st.column_config.NumberColumn("PCR", format="%.2f"),
-                    "Confidence":     st.column_config.NumberColumn("Confidence", format="%.0f%%"),
-                    "OppScore":       st.column_config.NumberColumn("OppScore", format="%.0f"),
+                    "Entry":                st.column_config.NumberColumn("Entry", format="₹%.2f"),
+                    "Stop Loss":             st.column_config.NumberColumn("Stop Loss", format="₹%.2f"),
+                    "Target 1":              st.column_config.NumberColumn("Target 1", format="₹%.2f"),
+                    "Target 2":              st.column_config.NumberColumn("Target 2", format="₹%.2f"),
+                    "Target 3":              st.column_config.NumberColumn("Target 3", format="₹%.2f"),
+                    "Strike":                st.column_config.NumberColumn("Strike", format="%.0f"),
+                    "Trend Score":           st.column_config.NumberColumn("Trend", format="%.0f"),
+                    "Execution Score":       st.column_config.NumberColumn("Execution", format="%.0f"),
+                    "Derivative Confidence": st.column_config.NumberColumn("Derivatives", format="%.0f"),
+                    "Risk Quality":          st.column_config.NumberColumn("Risk", format="%.0f"),
+                    "Opportunity Score":     st.column_config.NumberColumn("Opportunity", format="%.0f"),
                 },
             )
-            st.caption("2026-07-20: this tab now runs the same 6-stage DORE engine (Market Bias, OI "
-                       "Structure, Premium Quality, Corridor, IV Health, etc.) as the NIFTY/SENSEX/"
-                       "BANKNIFTY cards above — only rows DORE actually recommends acting on are shown, "
-                       "so this list can legitimately be empty or short on a quiet day. 'Leg' is CE or "
-                       "PE, picked by DORE's own directional bias, not hardcoded to CE. Strike/Premium/"
-                       "Delta/IV/OI are for the recommended leg specifically. This is a screener, not an "
-                       "order ticket — confirm liquidity (bid/ask) before acting on any row.")
+            st.caption("Runs DORE 2.0's full 5-stage funnel (Trend Engine, Execution Engine, "
+                       "Derivative Intelligence, Risk Engine, Opportunity Engine) — only rows DORE "
+                       "actually recommends acting on are shown, so this list can legitimately be "
+                       "empty or short on a quiet day. 'Leg' is CE or PE, composed from Directional "
+                       "Intent x Execution State, gated by the Risk Engine's hard-gate. This is a "
+                       "screener, not an order ticket — confirm liquidity (bid/ask) before acting.")
 
 
 # st.fragment(run_every=...) reruns ONLY this function on its own timer,
@@ -2481,163 +2488,59 @@ def _market_intelligence_fragment():
             st.session_state[_key] = {}
             _oi_changes[_idx] = (0.0, 0.0)
 
-    # ── DORE (Dynamic Options Recommendation Engine) ────────────────
-    # NIFTY/SENSEX/BANKNIFTY aren't part of the scanned Nifty-500
-    # universe, so there's no BarResult/CV1 sitting in memory for them
-    # the way there is for a scanned stock — build one on demand from
-    # each index's own OHLCV history via the same scoring_core pipeline
-    # every stock goes through. 2026-07-16: this OHLCV base — a DORE
-    # input — is now fetched with source="upstox" (Market Intelligence's
-    # "always Upstox" rule; each fetch still fails soft to yfinance
-    # internally if Upstox is unreachable — see fetch_nifty_ohlcv() /
-    # fetch_sensex_ohlcv() / fetch_banknifty_ohlcv()). Fails soft to None
-    # (card renders without the DORE row) on any error — a DORE hiccup
-    # should never take down the rest of this already-live fragment.
+    # ── DORE 2.0 (independent F&O Opportunity Engine) ────────────────
+    # 2026-07-20: rewritten for DORE 2.0 (docs/DORE_2_0_ARCHITECTURE.md).
+    # DORE now shares ONLY the Market Data Layer with MasterScanner
+    # (Principle 2.1) — no CV1/Leadership/Conviction, no MTF/Component-
+    # Strength blend (those were bolted onto the old bias score and are
+    # not part of the frozen Rev-3 architecture). Each index's Trend
+    # features come straight from its own daily OHLCV
+    # (compute_trend_features), Execution features from its own 5-minute
+    # intraday candles (execution_features_from_intraday_5m), and
+    # Derivative Confidence from its live option chain (fetch_oi_
+    # resistance) — the same three-layer pipeline every F&O stock in
+    # the funnel goes through (utils.dore_fo_screener). Fails soft to
+    # None (card renders without the DORE row) on any error.
     try:
         from utils.dore_engine import build_dore_input_for_index, compute_dore
         from utils.dore_settings import DORESettings
+        from utils.dore_fo_screener import execution_features_from_intraday_5m
         from utils.scanner_engine import fetch_nifty_ohlcv, fetch_sensex_ohlcv, fetch_banknifty_ohlcv
+        from utils.upstox_client import fetch_index_intraday_5m_upstox
 
         _dore_cfg = DORESettings.from_dict(st.session_state.get("dore_settings", {}))
 
-        # 2026-07-18: India VIX for DORE Stage 4c (IV/VIX Health) — reuse
-        # the scan run's own regime_ctx.vix if a full scan has already
-        # populated it this session (avoids a second yfinance round-trip);
-        # else fetch directly. fetch_india_vix() itself fails soft to 16.0.
-        try:
-            _regime_ctx = st.session_state.get("dash_regime_ctx")
-            if _regime_ctx is not None and getattr(_regime_ctx, "vix", None):
-                _dore_vix = float(_regime_ctx.vix)
-            else:
-                from utils.regime_engine import fetch_india_vix
-                _dore_vix = fetch_india_vix()
-        except Exception:
-            _dore_vix = None
-
-        # 2026-07-18: heavyweight constituent alignment for DORE Stage 1c
-        # (Component Strength) — INDEX-WEIGHTED, not a flat reference list.
-        # Weights below are each stock's real free-float weight % in THAT
-        # specific index (the same stock carries a different weight in
-        # Nifty vs Sensex vs Bank Nifty), sourced from NSE/BSE index
-        # factsheets as of ~Jul 2026. These drift on NSE/BSE's semi-annual
-        # rebalance (cutoffs Jan 31 / Jul 31) — refresh from
-        # niftyindices.com / bseindia.com / smart-investing.in periodically;
-        # this is NOT live-fetched. Only constituents that meaningfully
-        # move the index are listed — the long tail of sub-1% weights is
-        # omitted since it barely affects the weighted average below.
-        _INDEX_HEAVYWEIGHTS = {
-            "NIFTY": {
-                "RELIANCE": 9.11, "HDFCBANK": 6.48, "BHARTIARTL": 6.24, "ICICIBANK": 5.30,
-                "SBIN": 4.96, "TCS": 4.15, "BAJFINANCE": 3.36, "LT": 2.70,
-                "HINDUNILVR": 2.57, "SUNPHARMA": 2.44, "INFY": 2.28, "MARUTI": 2.26,
-            },
-            "SENSEX": {
-                "RELIANCE": 11.38, "HDFCBANK": 7.96, "BHARTIARTL": 7.51, "ICICIBANK": 6.52,
-                "SBIN": 6.19, "TCS": 4.88, "BAJFINANCE": 4.15, "LT": 3.57,
-                "HINDUNILVR": 3.33, "SUNPHARMA": 2.95,
-            },
-            "BANKNIFTY": {
-                "HDFCBANK": 25.92, "ICICIBANK": 20.53, "SBIN": 19.53, "AXISBANK": 8.41,
-                "KOTAKBANK": 7.67, "BANKBARODA": 2.65, "PNB": 2.47, "FEDERALBNK": 1.66,
-                "AUBANK": 1.64, "INDUSINDBK": 1.62,
-            },
-        }
-
-        def _constituent_scores(index_key: str) -> tuple[dict, dict, str]:
-            """Returns (scores, weights, debug_note) for index_key's real
-            heavyweight constituents — scores from the last completed
-            scan's own Leadership + %Chg-direction fold (see Stage 1c
-            docstring for why), weights from _INDEX_HEAVYWEIGHTS above.
-            A symbol missing from the last scan (no scan run yet, or it
-            fell out of the universe) is simply omitted from `scores` —
-            Stage 1c only iterates what's actually present, so this
-            degrades to "fewer names, same weighting logic" rather than
-            crashing or padding with fake neutral entries.
-
-            `debug_note` is a one-line, always-populated diagnostic (scan_df
-            presence/row count + exactly which target symbols matched or
-            didn't) — surfaced in the card's "DORE debug" panel so a stuck
-            "no constituent data" state is directly diagnosable from a
-            screenshot instead of requiring another guess-and-check round.
-            """
-            weights = _INDEX_HEAVYWEIGHTS.get(index_key, {})
-            scores: dict = {}
-            targets = list(weights.keys())
+        def _index_dore(index_key: str, ohlcv, oi_key: str, ce_pe_chg: tuple):
             try:
-                _df = st.session_state.get("dash_scan_df")
-                if _df is None:
-                    return scores, weights, f"scan_df: NOT SET (no scan run yet this session) | targets={targets}"
-                if _df.empty:
-                    return scores, weights, "scan_df: present but EMPTY (0 rows)"
-                if "Stock" not in _df.columns:
-                    return scores, weights, f"scan_df: {len(_df)} rows but NO 'Stock' column — cols={list(_df.columns)[:8]}..."
-                available = set(_df["Stock"].astype(str).str.upper())
-                for sym in targets:
-                    _rows = _df[_df["Stock"].astype(str).str.upper() == sym]
-                    if _rows.empty:
-                        continue
-                    _row = _rows.iloc[0]
-                    _lead = float(_row.get("CV1_Leadership", 50.0) or 50.0)
-                    _chg  = float(_row.get("%Chg", 0.0) or 0.0)
-                    scores[sym] = _lead if _chg >= 0 else (100.0 - _lead)
-                missing = [s for s in targets if s not in scores]
-                note = f"scan_df: {len(_df)} rows | matched {len(scores)}/{len(targets)}"
-                if missing:
-                    note += f" | missing: {', '.join(missing)}"
-                return scores, weights, note
-            except Exception as e:
-                logger.exception("DORE constituents lookup failed (non-fatal)")
-                return scores, weights, f"lookup EXCEPTION: {e!r}"
+                intraday_5m = fetch_index_intraday_5m_upstox(index_key)
+                exec_features = execution_features_from_intraday_5m(intraday_5m, _dore_cfg)
+                ce_chg, pe_chg = ce_pe_chg
+                oi = st.session_state.get(oi_key, {}) or {}
+                atm_chain_row = {
+                    "ce_premium": oi.get("ce_premium", 0.0), "pe_premium": oi.get("pe_premium", 0.0),
+                    "ce_oi": oi.get("ce_oi", 0.0), "pe_oi": oi.get("pe_oi", 0.0),
+                    "ce_oi_change": ce_chg, "pe_oi_change": pe_chg,
+                    "pcr": oi.get("pcr", 1.0), "expiry": oi.get("expiry", ""),
+                }
+                dore_input = build_dore_input_for_index(
+                    index_key, ohlcv, oi, atm_chain_row=atm_chain_row, execution_features=exec_features,
+                )
+                return compute_dore(dore_input, _dore_cfg).as_dict() if dore_input else None
+            except Exception:
+                logger.exception("DORE 2.0 computation failed for %s (non-fatal)", index_key)
+                return None
 
         _nifty_ohlcv = fetch_nifty_ohlcv("1y", source="upstox")
-        _nifty_ce_chg, _nifty_pe_chg = _oi_changes.get("NIFTY", (0.0, 0.0))
-        _nifty_scores, _nifty_weights, _nifty_const_note = _constituent_scores("NIFTY")
-        _nifty_dore_input = build_dore_input_for_index(
-            "NIFTY", _nifty_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
-            st.session_state.get("oi_resistance", {}),
-            position=st.session_state.get("nifty_option_position"),
-            ce_oi_change=_nifty_ce_chg, pe_oi_change=_nifty_pe_chg,
-            india_vix=_dore_vix,
-            constituents=_nifty_scores, constituent_weights=_nifty_weights,
-        )
-        _nifty_dore_dict = compute_dore(_nifty_dore_input, _dore_cfg).as_dict() if _nifty_dore_input else None
-        if _nifty_dore_dict is not None:
-            _nifty_dore_dict["_constituent_debug"] = _nifty_const_note
-        st.session_state["nifty_dore"] = _nifty_dore_dict
+        st.session_state["nifty_dore"] = _index_dore(
+            "NIFTY", _nifty_ohlcv, "oi_resistance", _oi_changes.get("NIFTY", (0.0, 0.0)))
 
         _sensex_ohlcv = fetch_sensex_ohlcv("1y")
-        _sensex_ce_chg, _sensex_pe_chg = _oi_changes.get("SENSEX", (0.0, 0.0))
-        _sensex_scores, _sensex_weights, _sensex_const_note = _constituent_scores("SENSEX")
-        _sensex_dore_input = build_dore_input_for_index(
-            "SENSEX", _sensex_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
-            st.session_state.get("sensex_oi_resistance", {}),
-            position=st.session_state.get("sensex_option_position"),
-            ce_oi_change=_sensex_ce_chg, pe_oi_change=_sensex_pe_chg,
-            india_vix=_dore_vix,
-            constituents=_sensex_scores, constituent_weights=_sensex_weights,
-        )
-        _sensex_dore_dict = compute_dore(_sensex_dore_input, _dore_cfg).as_dict() if _sensex_dore_input else None
-        if _sensex_dore_dict is not None:
-            _sensex_dore_dict["_constituent_debug"] = _sensex_const_note
-        st.session_state["sensex_dore"] = _sensex_dore_dict
+        st.session_state["sensex_dore"] = _index_dore(
+            "SENSEX", _sensex_ohlcv, "sensex_oi_resistance", _oi_changes.get("SENSEX", (0.0, 0.0)))
 
         _banknifty_ohlcv = fetch_banknifty_ohlcv("1y")
-        _banknifty_ce_chg, _banknifty_pe_chg = _oi_changes.get("BANKNIFTY", (0.0, 0.0))
-        _banknifty_scores, _banknifty_weights, _banknifty_const_note = _constituent_scores("BANKNIFTY")
-        _banknifty_dore_input = build_dore_input_for_index(
-            "BANKNIFTY", _banknifty_ohlcv, _nifty_ohlcv["close"] if not _nifty_ohlcv.empty else None,
-            st.session_state.get("banknifty_oi_resistance", {}),
-            position=st.session_state.get("banknifty_option_position"),
-            ce_oi_change=_banknifty_ce_chg, pe_oi_change=_banknifty_pe_chg,
-            india_vix=_dore_vix,
-            constituents=_banknifty_scores, constituent_weights=_banknifty_weights,
-        )
-        _banknifty_dore_dict = (
-            compute_dore(_banknifty_dore_input, _dore_cfg).as_dict() if _banknifty_dore_input else None
-        )
-        if _banknifty_dore_dict is not None:
-            _banknifty_dore_dict["_constituent_debug"] = _banknifty_const_note
-        st.session_state["banknifty_dore"] = _banknifty_dore_dict
+        st.session_state["banknifty_dore"] = _index_dore(
+            "BANKNIFTY", _banknifty_ohlcv, "banknifty_oi_resistance", _oi_changes.get("BANKNIFTY", (0.0, 0.0)))
     except Exception:
         logger.exception("DORE computation failed in _market_intelligence_fragment")
         st.session_state.setdefault("nifty_dore", None)
@@ -3052,12 +2955,12 @@ def render(settings: dict | None = None):
     if "Recommendation" in df_aug.columns:
         st.markdown(_sc_counts_html(df_aug), unsafe_allow_html=True)
 
-    # ── DORE F&O Opportunities — Futures / Options, scoped to the same
-    #    Nifty 500 universe as everything else on this page. Ranked off
-    #    the scanner's own OppScore/T1, live futures & option-chain data
-    #    layered in only for the top candidates (see
-    #    utils.dore_fo_screener docstring for why not all 500). ────────
-    _fo_opportunities_panel(df_aug)
+    # ── DORE 2.0 F&O Opportunities — Futures / Options. DORE 2.0 is
+    #    independent of the equity scanner (Principle 2.1) — it runs its
+    #    own Stage 0-5 funnel over the shared F&O universe rather than
+    #    reading df_aug's OppScore/Recommendation/T1 columns. See
+    #    utils.dore_fo_screener docstring. ─────────────────────────────
+    _fo_opportunities_panel()
 
     # ── Top Gainers | Sector Heatmap | Leadership Rotation ────────────
     sector_stats = build_sector_stats(df_aug)
