@@ -196,12 +196,40 @@ def load_nse_instrument_master() -> pd.DataFrame:
     """Downloads Upstox's NSE instrument master (refreshed daily by
     Upstox) so plain stock names like 'RELIANCE' can be resolved to the
     instrument_key Upstox's API actually requires
-    (e.g. NSE_EQ|INE002A01018)."""
+    (e.g. NSE_EQ|INE002A01018).
+
+    2026-07-20: added row-count/instrument_type-distribution logging —
+    this file has been reported blank/truncated by Upstox before (their
+    own community forum has multiple such reports), and the CSV format
+    is being deprecated by Upstox in favour of JSON, so a silently
+    near-empty or malformed download here is a real, recurring failure
+    mode. Previously there was zero visibility into this: fo_eligible_
+    symbols() (and everything downstream of it — the entire Stage 0
+    Universe) would just silently work with whatever came back, with no
+    signal that the source data itself had collapsed to a handful of
+    rows until the funnel's final output looked wrong two stages later.
+    """
     resp = requests.get(_INSTRUMENT_MASTER_URL, timeout=15)
     resp.raise_for_status()
     with gzip.open(io.BytesIO(resp.content)) as f:
         df = pd.read_csv(f)
     df.columns = [c.strip().lower() for c in df.columns]
+
+    type_col = next((c for c in ("instrument_type", "instrumenttype") if c in df.columns), None)
+    logger.info("[InstrumentMaster] downloaded %d rows, %d bytes gzipped, columns=%s",
+                len(df), len(resp.content), list(df.columns))
+    if type_col is not None:
+        counts = df[type_col].astype(str).str.upper().value_counts()
+        logger.info("[InstrumentMaster] instrument_type distribution (top 10): %s",
+                    counts.head(10).to_dict())
+    else:
+        logger.warning("[InstrumentMaster] no instrument_type/instrumenttype column found at all — "
+                        "columns were: %s", list(df.columns))
+    if len(df) < 1000:
+        logger.warning("[InstrumentMaster] only %d rows — Upstox's NSE.csv.gz has been reported "
+                        "blank/truncated before; expected tens of thousands of rows for the full "
+                        "NSE instrument set. Downstream universes (fo_eligible_symbols(), "
+                        "resolve_instrument_key()) will be built from this same undersized data.", len(df))
     return df
 
 
@@ -1224,9 +1252,15 @@ def fo_eligible_symbols() -> set:
     type_col = _fo_column(df, "instrument_type", "instrumenttype")
     name_col = _fo_column(df, "name", "underlying_symbol", "asset_symbol")
     if type_col is None or name_col is None:
+        logger.warning("[fo_eligible_symbols] type_col=%s name_col=%s — returning empty set, "
+                        "see load_nse_instrument_master()'s log lines for what columns actually came back",
+                        type_col, name_col)
         return set()
     fut = df[df[type_col].astype(str).str.upper() == "FUTSTK"]
-    return set(fut[name_col].astype(str).str.strip().str.upper())
+    result = set(fut[name_col].astype(str).str.strip().str.upper())
+    logger.info("[fo_eligible_symbols] %d FUTSTK rows -> %d unique underlying symbols "
+                "(expected ~180-220)", len(fut), len(result))
+    return result
 
 
 def _stock_futures_contracts(symbol: str) -> pd.DataFrame:
