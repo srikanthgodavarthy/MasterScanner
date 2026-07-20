@@ -213,23 +213,24 @@ def stage2_execution_qualification(
     "execution_state", "execution_features"}}. Expected survivors: 15-25.
     """
     cfg = _load_settings(cfg)
-    from utils.upstox_client import fetch_stock_intraday_5m_upstox, fetch_index_intraday_5m_upstox
+    from utils.upstox_client import fetch_batch_intraday_5m_upstox
 
     pool: dict = {}
     symbols = list(daily_pool.keys())
-    done = 0
-    for symbol in symbols:
-        try:
-            df = (fetch_index_intraday_5m_upstox(symbol) if symbol in _INDICES
-                  else fetch_stock_intraday_5m_upstox(symbol))
-        except Exception:
-            logger.exception("[DORE Stage2] intraday fetch failed for %s", symbol)
-            df = None
-        finally:
-            done += 1
-            if progress_cb:
-                progress_cb(done, len(symbols))
 
+    # 2026-07-20: was a sequential one-symbol-at-a-time loop here (2 real
+    # HTTP calls per symbol * 50-70 symbols = 100-140 blocking calls against
+    # Upstox's 25 req/s / 250-per-min ceiling) despite this function's own
+    # docstring claiming "batched intraday" — see fetch_batch_intraday_5m_
+    # upstox()'s docstring for why that silently collapsed the Stage 2
+    # survivor count once Upstox started 429-ing partway through the run.
+    # Fetching concurrently up front fixes that; everything below this is
+    # otherwise unchanged (still one execution-engine call per symbol,
+    # that part was always cheap/local).
+    intraday_dfs = fetch_batch_intraday_5m_upstox(symbols, progress_cb=progress_cb)
+
+    for symbol in symbols:
+        df = intraday_dfs.get(symbol)
         exec_features = execution_features_from_intraday_5m(df, cfg)
         row = daily_pool[symbol]
         probe = DOREInput(
