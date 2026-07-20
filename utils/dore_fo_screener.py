@@ -53,8 +53,18 @@ logger = logging.getLogger(__name__)
 def classify_buildup(price_chg_pct: Optional[float], oi_chg: Optional[float]) -> str:
     """Standard four-way futures buildup read off the sign of today's
     price change vs today's OI change. `oi_chg` is an absolute change
-    (contracts), only its sign matters here."""
-    if price_chg_pct is None or oi_chg is None:
+    (contracts), only its sign matters here.
+
+    oi_chg == 0 is NOT "OI flat" in practice — utils.oi_snapshot_store
+    returns exactly 0.0 on the first observation of each calendar day
+    (nothing to diff against yet, see that module's docstring), which
+    happens on every symbol's first appearance in this screener each
+    session. Treating that as a real "OI didn't move" reading silently
+    mislabels every first-of-day row as Long Unwinding (price down,
+    0 not > 0) — so it's reported as insufficient data instead, and
+    becomes informative from the session's second refresh onward.
+    """
+    if price_chg_pct is None or oi_chg is None or oi_chg == 0:
         return "—"
     price_up = price_chg_pct > 0
     oi_up = oi_chg > 0
@@ -75,6 +85,11 @@ _BUILDUP_COLOR = {
     "—":              "#8b949e",
 }
 
+# Recommendation categories that mean "not a fresh/valid setup right now"
+# — see pages/dashboard.py's _CATEGORY_TO_SC ("Extended"/"Avoid" both map
+# to SKIP there). Excluded here for the same reason.
+_NOT_QUALIFIED = {"Extended", "Avoid"}
+
 
 # ══════════════════════════════════════════════════════════════════
 #  CANDIDATE RANKING (off the already-computed scanner columns —
@@ -82,6 +97,12 @@ _BUILDUP_COLOR = {
 # ══════════════════════════════════════════════════════════════════
 
 def _rank_candidates(scan_df: pd.DataFrame, candidate_pool: int) -> pd.DataFrame:
+    """LONG-ONLY, deliberately: utils.scoring_core's T1/T2/T3 are
+    entry + risk×1.5/3/5 unconditionally (an upside target), with no
+    corresponding downside/short target computed anywhere in this
+    codebase. A stock trading down on the day is not a "bearish
+    opportunity" here — it either still has a valid, fresh long setup
+    (kept) or it doesn't (dropped), never a manufactured short one."""
     if scan_df is None or scan_df.empty or "Stock" not in scan_df.columns:
         return pd.DataFrame()
 
@@ -89,6 +110,15 @@ def _rank_candidates(scan_df: pd.DataFrame, candidate_pool: int) -> pd.DataFrame
     fo_syms = fo_eligible_symbols()
     if fo_syms:
         df = df[df["Stock"].astype(str).str.upper().isin(fo_syms)]
+    if df.empty:
+        return df
+
+    if "Recommendation" in df.columns:
+        df = df[~df["Recommendation"].astype(str).isin(_NOT_QUALIFIED)]
+    entry = pd.to_numeric(df.get("Entry"), errors="coerce")
+    t1 = pd.to_numeric(df.get("T1"), errors="coerce")
+    if entry is not None and t1 is not None:
+        df = df[(t1 > entry)]   # valid long target only
     if df.empty:
         return df
 
@@ -100,18 +130,11 @@ def _rank_candidates(scan_df: pd.DataFrame, candidate_pool: int) -> pd.DataFrame
     return df.head(candidate_pool)
 
 
-def _direction_for_row(row: pd.Series) -> str:
-    """'BULLISH' / 'BEARISH', off whatever directional field the scanner
-    row actually has — Trend label first, then sign of %Chg as a
-    fallback so a row is never silently dropped just because Trend is
-    blank."""
-    trend = str(row.get("Trend", "")).strip().upper()
-    if "BULL" in trend or "UP" in trend:
-        return "BULLISH"
-    if "BEAR" in trend or "DOWN" in trend:
-        return "BEARISH"
-    chg = pd.to_numeric(row.get("%Chg"), errors="coerce")
-    return "BULLISH" if (chg is not None and chg >= 0) else "BEARISH"
+# _rank_candidates already restricts to rows with a valid long target
+# (T1 > Entry) and a qualified Recommendation — every row reaching the
+# Futures/Options tabs IS a long/bullish setup. No direction inference
+# needed, and no BEARISH/PE branch exists because this codebase has no
+# downside target to back one with (see _rank_candidates docstring).
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -121,8 +144,9 @@ def _direction_for_row(row: pd.Series) -> str:
 def top_futures_opportunities(scan_df: pd.DataFrame, top_n: int = 15,
                                candidate_pool: int = 40) -> pd.DataFrame:
     """Returns a DataFrame: Stock, CMP, %Chg, OI, OI Chg, Buildup,
-    Direction, Entry, Target (T1), SL, OppScore — sorted by OppScore,
-    limited to `top_n` rows that actually got a live futures quote."""
+    Entry, Target (T1), SL, OppScore — sorted by OppScore, limited to
+    `top_n` rows that actually got a live futures quote. Long-only, see
+    _rank_candidates."""
     candidates = _rank_candidates(scan_df, candidate_pool)
     if candidates.empty:
         return pd.DataFrame()
@@ -147,7 +171,6 @@ def top_futures_opportunities(scan_df: pd.DataFrame, top_n: int = 15,
             "OI":        fq.get("oi"),
             "OI Chg":    round(oi_chg) if oi_chg else 0,
             "Buildup":   buildup,
-            "Direction": _direction_for_row(r),
             "Entry":     r.get("Entry"),
             "Target":    r.get("T1"),
             "SL":        r.get("SL"),
@@ -167,9 +190,12 @@ def top_futures_opportunities(scan_df: pd.DataFrame, top_n: int = 15,
 
 def top_options_opportunities(scan_df: pd.DataFrame, top_n: int = 15,
                                candidate_pool: int = 25) -> pd.DataFrame:
-    """Returns a DataFrame: Stock, Leg (CE/PE), Strike, Premium, Target
+    """Returns a DataFrame: Stock, Leg, Strike, Premium, Target
     Premium, Delta, IV, OI, PCR, Expiry, OppScore — one row per
-    candidate, leg chosen by that stock's own directional bias.
+    candidate. Leg is always CE: _rank_candidates already restricts to
+    validated long setups, and this codebase has no downside target to
+    back a PE pick with (see _rank_candidates docstring) — a real PE
+    tab would need its own bearish scoring model, not a relabeled CE.
 
     Target Premium = current premium + |Delta| * (equity Target - CMP),
     a standard delta-approximation of how the premium moves if the
@@ -187,14 +213,13 @@ def top_options_opportunities(scan_df: pd.DataFrame, top_n: int = 15,
         opt = fetch_stock_atm_option(sym)
         if opt is None:
             continue
-        direction = _direction_for_row(r)
-        leg = "CE" if direction == "BULLISH" else "PE"
+        leg = "CE"
 
-        strike  = opt.get(f"{leg.lower()}_strike")
-        premium = opt.get(f"{leg.lower()}_premium")
-        delta   = opt.get(f"{leg.lower()}_delta")
-        iv      = opt.get(f"{leg.lower()}_iv")
-        oi      = opt.get(f"{leg.lower()}_oi")
+        strike  = opt.get("ce_strike")
+        premium = opt.get("ce_premium")
+        delta   = opt.get("ce_delta")
+        iv      = opt.get("ce_iv")
+        oi      = opt.get("ce_oi")
 
         cmp_ = pd.to_numeric(r.get("Entry"), errors="coerce")
         target_price = pd.to_numeric(r.get("T1"), errors="coerce")
