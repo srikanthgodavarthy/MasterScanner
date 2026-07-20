@@ -189,20 +189,50 @@ def top_futures_opportunities(scan_df: pd.DataFrame, top_n: int = 15,
 # ══════════════════════════════════════════════════════════════════
 
 def top_options_opportunities(scan_df: pd.DataFrame, top_n: int = 15,
-                               candidate_pool: int = 25) -> pd.DataFrame:
-    """Returns a DataFrame: Stock, Leg, Strike, Premium, Target
-    Premium, Delta, IV, OI, PCR, Expiry, OppScore — one row per
-    candidate. Leg is always CE: _rank_candidates already restricts to
-    validated long setups, and this codebase has no downside target to
-    back a PE pick with (see _rank_candidates docstring) — a real PE
-    tab would need its own bearish scoring model, not a relabeled CE.
+                               candidate_pool: int = 25,
+                               cfg=None) -> pd.DataFrame:
+    """Returns a DataFrame: Stock, Leg, Strike, Premium, Delta, IV, OI,
+    PCR, Expiry, Recommendation, Confidence, Reason, OppScore — one row
+    per candidate that DORE actually recommends acting on.
 
-    Target Premium = current premium + |Delta| * (equity Target - CMP),
-    a standard delta-approximation of how the premium moves if the
-    underlying reaches the scanner's own T1. Falls back to a flat 1.6x
-    premium target if Delta wasn't available (Upstox plan-dependent) —
-    clearly distinguishable via the `Target Basis` column.
+    2026-07-20: this now runs utils.dore_engine.compute_dore() per
+    candidate — the SAME 6-stage gated engine (Market Bias, MTF,
+    Component Strength, OI Structure, Premium Quality, Intraday
+    Momentum, Corridor, OEQ, IV/VIX Health) the Market Intelligence
+    index cards (NIFTY/SENSEX/BANKNIFTY) use — instead of the old
+    approach (rank by the equity scanner's OppScore, take the ATM CE,
+    hand-roll a delta-projected premium target). The old version had
+    NO options-side risk gating at all: a stock could top this table
+    with a rich/illiquid/wall-adjacent option and nothing here would
+    have caught it, even though the exact same conditions would block
+    an index from getting a BUY recommendation. See
+    docs/DORE_ARCHITECTURE.md.
+
+    `Leg` is now CE or PE, picked by DORE's own Stage 5 direction based
+    on the bearish/bullish bias — not hardcoded to CE. Only rows where
+    DORE actually recommends BUY_*_NOW / BUY_*_BREAKOUT / WATCH_* are
+    returned; WAIT/NO_TRADE candidates are dropped, same as an index
+    card would show "WAIT" rather than a numbered opportunity.
+
+    `candidate_pool` is still a coarse OppScore-based pre-filter (see
+    _rank_candidates) purely to bound how many live Upstox calls this
+    makes per refresh — DORE itself does the real gating after that.
     """
+    from utils.dore_engine import build_dore_input_from_scanner, compute_dore
+    from utils.dore_settings import DORESettings
+
+    if cfg is None:
+        try:
+            import streamlit as st
+            cfg = DORESettings.from_dict(st.session_state.get("dore_settings", {}))
+        except Exception:
+            cfg = DORESettings()
+
+    _ACTIONABLE = {
+        "BUY_CE_NOW", "BUY_CE_BREAKOUT", "WATCH_CE",
+        "BUY_PE_NOW", "BUY_PE_BREAKDOWN", "WATCH_PE",
+    }
+
     candidates = _rank_candidates(scan_df, candidate_pool)
     if candidates.empty:
         return pd.DataFrame()
@@ -210,57 +240,86 @@ def top_options_opportunities(scan_df: pd.DataFrame, top_n: int = 15,
     rows = []
     for _, r in candidates.iterrows():
         sym = str(r["Stock"]).upper()
+
+        # No live BarResult -> can't build a real DOREInput the same way
+        # the index path does (see utils.dore_engine.
+        # build_dore_input_from_scanner's field-mapping notes) — skip
+        # rather than fabricate one.
+        bar_result = r.get("_bar_result")
+        if bar_result is None:
+            continue
+
         opt = fetch_stock_atm_option(sym)
         if opt is None:
             continue
-        leg = "CE"
 
-        spot    = opt.get("spot")
-        strike  = opt.get("ce_strike")
-        premium = opt.get("ce_premium")
-        delta   = opt.get("ce_delta")
-        iv      = opt.get("ce_iv")
-        oi      = opt.get("ce_oi")
+        from types import SimpleNamespace
+        cv1_scores = SimpleNamespace(
+            leadership=float(r.get("CV1_Leadership", 0.0) or 0.0),
+            conviction=float(r.get("CV1_Conviction", 0.0) or 0.0),
+            entry_quality=float(r.get("CV1_EntryQuality", 0.0) or 0.0),
+            composite=float(r.get("CV1_Composite", 0.0) or 0.0),
+        )
 
-        # Prefer the live spot the option chain itself matched ATM
-        # against — the scanner's Entry can be a stale scan-time price,
-        # which would make the underlying-move (and so Target Premium)
-        # wrong even though the strike selection itself was correct.
-        cmp_ = spot if spot is not None else pd.to_numeric(r.get("Entry"), errors="coerce")
-        target_price = pd.to_numeric(r.get("T1"), errors="coerce")
-        target_premium, basis = None, "—"
-        if premium is not None and cmp_ is not None and target_price is not None:
-            move = abs(target_price - cmp_)
-            if delta is not None and delta != 0:
-                target_premium = round(premium + abs(delta) * move, 2)
-                basis = "delta-adjusted"
-            else:
-                target_premium = round(premium * 1.6, 2)
-                basis = "flat 1.6x (no Delta from feed)"
+        # OI-change tracking, same pattern as the index path (utils.
+        # oi_snapshot_store.record_and_diff) — a distinct "STK_" key
+        # namespace so this never collides with the index trackers or
+        # the Futures tab's per-symbol "FUT_" OI tracker.
+        ce_chg, pe_chg = record_and_diff(
+            f"STK_{sym}", opt.get("total_ce_oi", 0.0), opt.get("total_pe_oi", 0.0)
+        )
 
-        moneyness = "—"
-        if spot is not None and strike is not None:
-            diff_pct = (strike - spot) / spot * 100 if spot else 0
-            moneyness = f"ATM ({diff_pct:+.1f}% vs spot)"
+        # oi_resistance-shaped dict pointing at the REAL OI wall (see
+        # utils.upstox_client.fetch_stock_atm_option's 2026-07-20
+        # ce_wall_strike/pe_wall_strike addition) — not the ATM strike,
+        # which is a different thing (the tradeable leg, not the wall
+        # Stage 4's Corridor gate needs room to run to).
+        oi_resistance_like = {
+            "ce_strike": opt.get("ce_wall_strike"),
+            "pe_strike": opt.get("pe_wall_strike"),
+            "expiry":    opt.get("expiry"),
+        }
+        atm_chain_row = dict(opt)
+        atm_chain_row["ce_oi_change"] = ce_chg
+        atm_chain_row["pe_oi_change"] = pe_chg
+
+        dore_input = build_dore_input_from_scanner(
+            symbol=sym,
+            bar_result=bar_result,
+            cv1_scores=cv1_scores,
+            oi_resistance=oi_resistance_like,
+            atm_chain_row=atm_chain_row,
+            atr_override=r.get("_atr_current"),
+        )
+        result = compute_dore(dore_input, cfg)
+        if result.recommendation not in _ACTIONABLE:
+            continue
+
+        direction = result.suggested_direction or "CE"
+        premium = opt.get("ce_premium") if direction == "CE" else opt.get("pe_premium")
+        strike  = opt.get("ce_strike")  if direction == "CE" else opt.get("pe_strike")
+        delta   = opt.get("ce_delta")   if direction == "CE" else opt.get("pe_delta")
+        iv      = opt.get("ce_iv")      if direction == "CE" else opt.get("pe_iv")
+        oi      = opt.get("ce_oi")      if direction == "CE" else opt.get("pe_oi")
 
         rows.append({
             "Stock":          sym,
-            "Leg":            leg,
-            "Spot":           spot,
+            "Leg":            direction,
+            "Spot":           opt.get("spot"),
             "Strike":         strike,
-            "Moneyness":      moneyness,
             "Premium":        premium,
-            "Target Premium": target_premium,
-            "Target Basis":   basis,
             "Delta":          delta,
             "IV":             iv,
             "OI":             oi,
             "PCR":            opt.get("pcr"),
             "Expiry":         opt.get("expiry"),
+            "Recommendation": result.recommendation,
+            "Confidence":     result.confidence,
+            "Reason":         (result.reasons[-1] if result.reasons else ""),
             "OppScore":       r.get("OppScore") if "OppScore" in candidates.columns else r.get("Score"),
         })
 
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    return out.sort_values("OppScore", ascending=False).head(top_n).reset_index(drop=True)
+    return out.sort_values("Confidence", ascending=False).head(top_n).reset_index(drop=True)
