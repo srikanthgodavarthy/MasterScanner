@@ -1511,6 +1511,87 @@ def build_dore_input_for_index(
     return dore_input
 
 
+# ══════════════════════════════════════════════════════════════════
+#  500-STOCK INTRADAY 9/21 EMA — GATED, not a blanket fetch
+# ══════════════════════════════════════════════════════════════════
+#
+# 2026-07-20: intraday 9/21 EMA for the full Nifty-500 universe costs
+# ~1,000 single-instrument Upstox requests (no batch endpoint exists for
+# historical-candle — see utils.upstox_client.fetch_batch_ema9_21_upstox's
+# docstring), against a documented 25 req/s / 250-per-minute account-wide
+# ceiling on the standard Upstox tier. Fetching it for every scanned name
+# regardless of setup quality would burn most of that budget on names
+# that were never going anywhere. Instead: gate first (free — reuses
+# BarResult/CV1 the day's scan already computed, zero network calls),
+# fetch second (only for names that cleared the gate).
+
+def select_symbols_for_intraday_ema(scan_rows: dict, cfg: DORESettings) -> list[str]:
+    """`scan_rows` = {symbol: row_dict} from utils.scanner_engine.score_stock()
+    output (or run_scanner()'s aggregated results) — each row_dict must
+    carry "_bar_result" (the raw BarResult stashed by score_stock()) and
+    the CV1_Leadership/CV1_Conviction fields it also already sets.
+
+    Runs Stage 1 Market Bias off data ALREADY IN MEMORY from the day's
+    scan (no network call) and returns only the symbols whose bias
+    cleared NEUTRAL — i.e. names with an actual directional read worth
+    spending an intraday-EMA fetch on. Pass this list straight into
+    utils.upstox_client.fetch_batch_ema9_21_upstox().
+
+    Symbols missing "_bar_result" are skipped (can't gate without it).
+    """
+    gated: list[str] = []
+    for symbol, row in scan_rows.items():
+        bar_result = row.get("_bar_result")
+        if bar_result is None:
+            continue
+        try:
+            probe_input = DOREInput(
+                symbol=symbol,
+                price=getattr(bar_result, "entry", 0.0),
+                ema_stack_up=getattr(bar_result, "trend_up", None),
+                ema_stack_down=getattr(bar_result, "trend_down", None),
+                rsi=getattr(bar_result, "cur_rsi", 50.0),
+                adx=getattr(bar_result, "adx_val", 0.0),
+                vol_ratio=getattr(bar_result, "vol_ratio", 1.0),
+                trend_phase=getattr(bar_result, "trend_phase", "NONE"),
+                leadership=row.get("CV1_Leadership", 0.0) or 0.0,
+                conviction=row.get("CV1_Conviction", 0.0) or 0.0,
+            )
+            _, bias_label, _ = stage1_market_bias(probe_input, cfg)
+        except Exception:
+            logger.exception("[DORE:%s] Stage1 bias gate failed (non-fatal, skipping)", symbol)
+            continue
+        if bias_label != "NEUTRAL":
+            gated.append(symbol)
+    logger.info("[DORE] intraday-EMA gate: %d/%d scanned names cleared NEUTRAL", len(gated), len(scan_rows))
+    return gated
+
+
+def enrich_scan_rows_with_intraday_ema(scan_rows: dict, cfg: DORESettings, progress_cb=None) -> int:
+    """Convenience wrapper: gate scan_rows via select_symbols_for_intraday_ema(),
+    fetch real intraday 9/21 EMA only for the gated names, and set
+    "_intraday_ema9"/"_intraday_ema21" directly on each matching row dict
+    (mutates scan_rows in place). Returns how many rows were enriched.
+
+    This is the intended single call for pages/scanner.py's per-scan
+    pipeline — call it once, after the full scan's score_stock() loop has
+    populated scan_rows, not per-symbol inside that loop (the gate needs
+    every row's CV1 scores already computed to decide who's worth an
+    intraday fetch).
+    """
+    from utils.upstox_client import fetch_batch_ema9_21_upstox
+
+    gated_symbols = select_symbols_for_intraday_ema(scan_rows, cfg)
+    if not gated_symbols:
+        return 0
+
+    ema_results = fetch_batch_ema9_21_upstox(gated_symbols, progress_cb=progress_cb)
+    for symbol, ema in ema_results.items():
+        if symbol in scan_rows:
+            scan_rows[symbol]["_intraday_ema9"] = ema["ema9"]
+            scan_rows[symbol]["_intraday_ema21"] = ema["ema21"]
+    return len(ema_results)
+
 
 def build_dore_input_from_scanner(
     symbol: str,
@@ -1526,6 +1607,11 @@ def build_dore_input_from_scanner(
     constituent_weights: Optional[dict] = None,  # 2026-07-18: {symbol: index free-float weight %} — see
                                                    # stage1c_component_strength's docstring
     event_risk_today: bool = False,          # 2026-07-18: caller-supplied macro/earnings-event flag
+    intraday_ema9: Optional[float] = None,   # 2026-07-20: from enrich_scan_rows_with_intraday_ema() /
+    intraday_ema21: Optional[float] = None,  # scan_rows[symbol]["_intraday_ema9"/"_intraday_ema21"] —
+                                               # only set for symbols that cleared the Stage 1 bias gate
+                                               # (see select_symbols_for_intraday_ema()); left at neutral
+                                               # defaults (0.0) for everything else, same as before.
 ) -> DOREInput:
     """Adapter that assembles a DOREInput from objects MasterScanner
     already has in memory during a scan — see docs/DORE_ARCHITECTURE.md
@@ -1561,19 +1647,17 @@ def build_dore_input_from_scanner(
         (Stage 5b defaults to ATM / Stage 4c treats IV as neutral).
       - days_to_expiry is computed here from `nearest_expiry`, not passed
         in — pure date arithmetic, no reason to make every caller redo it.
-      - ema9/ema21: this adapter itself still leaves them at neutral
-        defaults, since scoring_core's own pipeline runs on daily bars
-        end-to-end. 2026-07-20: for the INDEX path specifically
-        (build_dore_input_for_index — NIFTY/SENSEX/BANKNIFTY), a real
-        intraday 9/21 EMA (5-minute chart, utils.upstox_client.
-        fetch_index_ema9_21()) is now fetched and set on the DOREInput
-        *after* this function returns — see build_dore_input_for_index()
-        for why it happens there rather than here (this function has no
-        symbol-to-index-instrument-key mapping and stays a pure,
-        already-well-tested builder). Per-stock scans (this function
-        called directly, not via build_dore_input_for_index) still get
-        neutral ema9/ema21 — there's no intraday feed wired for the
-        500-stock universe, only the 3 indices DORE actually trades.
+      - ema9/ema21: this adapter now accepts intraday_ema9/intraday_ema21
+        as direct pass-through params (2026-07-20) — pass scan_rows[symbol]
+        ["_intraday_ema9"/"_intraday_ema21"] from enrich_scan_rows_with_
+        intraday_ema() here if you have them; they're set on the returned
+        DOREInput below. Left at neutral defaults (0.0) if not supplied,
+        which is still the common case (only names that cleared the
+        Stage 1 bias gate get a real intraday fetch — see
+        select_symbols_for_intraday_ema()). For the INDEX path
+        (build_dore_input_for_index — NIFTY/SENSEX/BANKNIFTY), this
+        happens automatically via a direct fetch_index_ema9_21() call
+        after this function returns instead — see that function.
       - htf_trend is NOT wired yet — same "no data source" reasoning,
         see docs/DORE_ARCHITECTURE.md for the follow-up.
       - event_risk_today has no calendar data source yet (no economic/
@@ -1598,6 +1682,8 @@ def build_dore_input_from_scanner(
         ema20=price / (1 + getattr(bar_result, "ema20_pct_dist", 0.0) / 100.0) if price else 0.0,
         ema50=price / (1 + getattr(bar_result, "ema50_pct_dist", 0.0) / 100.0) if price else 0.0,
         ema200=0.0,   # not carried as a raw float on BarResult — use ema_stack_up/down instead
+        ema9=intraday_ema9 if intraday_ema9 is not None else 0.0,
+        ema21=intraday_ema21 if intraday_ema21 is not None else 0.0,
         ema_stack_up=getattr(bar_result, "trend_up", None),
         ema_stack_down=getattr(bar_result, "trend_down", None),
         rsi=rsi,
