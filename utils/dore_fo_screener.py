@@ -326,34 +326,13 @@ def compute_fo_opportunities(
             atm_chain_row=atm_chain_row, oi_resistance=oi_resistance_like,
         )
         result = compute_dore(dore_input, cfg)
+        rows.append((result.opportunity_score, result.to_dashboard_row(symbol)))
 
-        rows.append({
-            "Symbol": symbol,
-            "Recommendation": result.recommendation,
-            "Leg": result.suggested_direction,
-            "Directional Intent": result.directional_intent,
-            "Execution State": result.execution_state,
-            "Trend Score": result.trend_score,
-            "Execution Score": result.execution_score,
-            "Derivative Confidence": result.derivative_confidence,
-            "Risk Quality": result.risk_quality,
-            "Opportunity Score": result.opportunity_score,
-            "Hard Gate Pass": result.risk_hard_gate_pass,
-            "Entry": result.trade_plan.entry,
-            "Stop Loss": result.trade_plan.stop_loss,
-            "Target 1": result.trade_plan.target1,
-            "Target 2": result.trade_plan.target2,
-            "Target 3": result.trade_plan.target3,
-            "Strike": result.suggested_strike,
-            "Strike Type": result.recommended_strike_type,
-            "Expiry": result.recommended_expiry,
-            "Reason": result.reasons[-1] if result.reasons else "",
-        })
-
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    return out.sort_values("Opportunity Score", ascending=False).reset_index(drop=True)
+    if not rows:
+        return pd.DataFrame()
+    rows.sort(key=lambda pair: pair[0], reverse=True)
+    out = pd.DataFrame([row for _, row in rows])
+    return out
 
 
 def top_fo_opportunities(
