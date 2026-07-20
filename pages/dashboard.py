@@ -58,6 +58,7 @@ from utils.scanner_engine  import fetch_nifty
 from utils.regime_engine   import build_regime_context, regime_summary
 from utils.supabase_client import load_latest_full_scan
 from utils.sector_map      import build_sector_stats
+from utils.dore_fo_screener import top_futures_opportunities, top_options_opportunities
 
 # ── CONSTANTS ─────────────────────────────────────────────────────
 
@@ -2176,6 +2177,70 @@ def _sc_counts_html(df: pd.DataFrame) -> str:
     return '<div class="sc-counts">' + "".join(parts) + '</div>'
 
 
+# ── DORE F&O OPPORTUNITIES — Futures / Options tabs ────────────────
+def _fo_opportunities_panel(df_aug: pd.DataFrame):
+    st.markdown('<div class="ti-panel-title" style="margin-top:0.6rem;">🎯 DORE F&amp;O OPPORTUNITIES — NIFTY 500</div>',
+                unsafe_allow_html=True)
+    tab_fut, tab_opt = st.tabs(["📈 Futures", "🎯 Options"])
+
+    with tab_fut:
+        try:
+            fut_df = top_futures_opportunities(df_aug)
+        except Exception:
+            logger.exception("Futures opportunities panel failed (non-fatal)")
+            fut_df = pd.DataFrame()
+        if fut_df.empty:
+            st.caption("No live futures data available right now — check the Upstox token, "
+                       "or run a scan on the Scanner page if this is the first load.")
+        else:
+            st.dataframe(
+                fut_df, hide_index=True, use_container_width=True,
+                column_config={
+                    "CMP":      st.column_config.NumberColumn("CMP", format="₹%.2f"),
+                    "%Chg":     st.column_config.NumberColumn("%Chg", format="%.2f%%"),
+                    "OI":       st.column_config.NumberColumn("OI", format="%d"),
+                    "OI Chg":   st.column_config.NumberColumn("OI Chg (today)", format="%d"),
+                    "Entry":    st.column_config.NumberColumn("Entry", format="₹%.2f"),
+                    "Target":   st.column_config.NumberColumn("Target (T1)", format="₹%.2f"),
+                    "SL":       st.column_config.NumberColumn("SL", format="₹%.2f"),
+                    "OppScore": st.column_config.NumberColumn("OppScore", format="%.0f"),
+                },
+            )
+            st.caption("Buildup = today's price change vs today's OI change (Long Buildup: price↑ "
+                       "OI↑ · Short Covering: price↑ OI↓ · Short Buildup: price↓ OI↑ · Long Unwinding: "
+                       "price↓ OI↓). OI Chg resets at market open each session. Target is the scanner's "
+                       "own swing target (T1), not a separate futures-specific projection.")
+
+    with tab_opt:
+        try:
+            opt_df = top_options_opportunities(df_aug)
+        except Exception:
+            logger.exception("Options opportunities panel failed (non-fatal)")
+            opt_df = pd.DataFrame()
+        if opt_df.empty:
+            st.caption("No live option-chain data available right now — check the Upstox token, "
+                       "or run a scan on the Scanner page if this is the first load.")
+        else:
+            st.dataframe(
+                opt_df, hide_index=True, use_container_width=True,
+                column_config={
+                    "Strike":         st.column_config.NumberColumn("Strike", format="%.0f"),
+                    "Premium":        st.column_config.NumberColumn("Premium", format="₹%.2f"),
+                    "Target Premium": st.column_config.NumberColumn("Target Premium", format="₹%.2f"),
+                    "Delta":          st.column_config.NumberColumn("Delta", format="%.2f"),
+                    "IV":             st.column_config.NumberColumn("IV", format="%.1f"),
+                    "OI":             st.column_config.NumberColumn("OI", format="%d"),
+                    "PCR":            st.column_config.NumberColumn("PCR", format="%.2f"),
+                    "OppScore":       st.column_config.NumberColumn("OppScore", format="%.0f"),
+                },
+            )
+            st.caption("Leg (CE/PE) and strike are the nearest-expiry ATM option, chosen by each "
+                       "stock's own directional bias (Trend, falling back to today's %Chg sign). "
+                       "Target Premium is a Delta-adjusted projection to the equity T1 — see "
+                       "'Target Basis' when Delta wasn't available from the feed. This is a screener, "
+                       "not an order ticket — confirm liquidity (bid/ask) before acting on any row.")
+
+
 # st.fragment(run_every=...) reruns ONLY this function on its own timer,
 # independent of the rest of the page and of any button click. It always
 # uses Upstox first (live quotes) with yfinance fallback only if the
@@ -2895,6 +2960,13 @@ def render(settings: dict | None = None):
     # ── Signal Class counts ("Scanner Summary") ───────────────────────
     if "Recommendation" in df_aug.columns:
         st.markdown(_sc_counts_html(df_aug), unsafe_allow_html=True)
+
+    # ── DORE F&O Opportunities — Futures / Options, scoped to the same
+    #    Nifty 500 universe as everything else on this page. Ranked off
+    #    the scanner's own OppScore/T1, live futures & option-chain data
+    #    layered in only for the top candidates (see
+    #    utils.dore_fo_screener docstring for why not all 500). ────────
+    _fo_opportunities_panel(df_aug)
 
     # ── Top Gainers | Sector Heatmap | Leadership Rotation ────────────
     sector_stats = build_sector_stats(df_aug)
