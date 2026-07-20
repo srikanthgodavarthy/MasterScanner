@@ -2305,8 +2305,9 @@ def _fo_opportunities_panel(df_aug: pd.DataFrame):
             logger.exception("Options opportunities panel failed (non-fatal)")
             opt_df = pd.DataFrame()
         if opt_df.empty:
-            st.caption("No live option-chain data available right now — check the Upstox token, "
-                       "or run a scan on the Scanner page if this is the first load.")
+            st.caption("No DORE-qualified option setups right now — either the Upstox token needs "
+                       "checking, no scan has run yet, or every F&O candidate is currently gated to "
+                       "WAIT (see the Market Intelligence index cards for why a WAIT happens).")
         else:
             st.dataframe(
                 opt_df, hide_index=True, use_container_width=True,
@@ -2314,23 +2315,21 @@ def _fo_opportunities_panel(df_aug: pd.DataFrame):
                     "Spot":           st.column_config.NumberColumn("Spot", format="₹%.2f"),
                     "Strike":         st.column_config.NumberColumn("Strike", format="%.0f"),
                     "Premium":        st.column_config.NumberColumn("Premium", format="₹%.2f"),
-                    "Target Premium": st.column_config.NumberColumn("Target Premium", format="₹%.2f"),
                     "Delta":          st.column_config.NumberColumn("Delta", format="%.2f"),
                     "IV":             st.column_config.NumberColumn("IV", format="%.1f"),
                     "OI":             st.column_config.NumberColumn("OI", format="%d"),
                     "PCR":            st.column_config.NumberColumn("PCR", format="%.2f"),
+                    "Confidence":     st.column_config.NumberColumn("Confidence", format="%.0f%%"),
                     "OppScore":       st.column_config.NumberColumn("OppScore", format="%.0f"),
                 },
             )
-            st.caption("CE only, nearest-expiry ATM — this screener is long-only (see Futures tab's "
-                       "Target note: the scanner has no downside/PE target model). Strike is the listed "
-                       "strike closest to 'Spot' (the live cash-market price the option chain matched "
-                       "ATM against) — NOT the Futures tab's CMP or the scanner's Entry price, which can "
-                       "differ slightly (futures LTP vs cash spot, and Entry can be a stale scan-time "
-                       "price). 'Moneyness' shows how far the chosen strike sits from that same Spot. "
-                       "Target Premium is a Delta-adjusted projection of Spot moving to the equity T1 — "
-                       "see 'Target Basis' when Delta wasn't available from the feed. This is a "
-                       "screener, not an order ticket — confirm liquidity (bid/ask) before acting on any row.")
+            st.caption("2026-07-20: this tab now runs the same 6-stage DORE engine (Market Bias, OI "
+                       "Structure, Premium Quality, Corridor, IV Health, etc.) as the NIFTY/SENSEX/"
+                       "BANKNIFTY cards above — only rows DORE actually recommends acting on are shown, "
+                       "so this list can legitimately be empty or short on a quiet day. 'Leg' is CE or "
+                       "PE, picked by DORE's own directional bias, not hardcoded to CE. Strike/Premium/"
+                       "Delta/IV/OI are for the recommended leg specifically. This is a screener, not an "
+                       "order ticket — confirm liquidity (bid/ask) before acting on any row.")
 
 
 # st.fragment(run_every=...) reruns ONLY this function on its own timer,
