@@ -1475,7 +1475,7 @@ def build_dore_input_for_index(
     except Exception:
         cur_atr = 0.0
 
-    return build_dore_input_from_scanner(
+    dore_input = build_dore_input_from_scanner(
         symbol=symbol,
         bar_result=bar_result,
         cv1_scores=cv1,
@@ -1489,6 +1489,26 @@ def build_dore_input_for_index(
         constituent_weights=constituent_weights,
         event_risk_today=event_risk_today,
     )
+
+    # 2026-07-20: real intraday 9/21 EMA (5-minute chart) — see
+    # utils.upstox_client.fetch_index_ema9_21()'s docstring for why this
+    # is index-only (NIFTY/SENSEX/BANKNIFTY) and 5m-on-the-underlying
+    # rather than on the option premium. Only NIFTY/SENSEX/BANKNIFTY are
+    # in _INDEX_INSTRUMENT_KEYS — fetch_index_ema9_21() returns None for
+    # anything else (or outside market hours / on a fetch failure), which
+    # leaves DOREInput.ema9/ema21 at their inherited neutral defaults, so
+    # this fails soft exactly like every other optional DORE input.
+    if dore_input is not None:
+        try:
+            from utils.upstox_client import fetch_index_ema9_21
+            ema_9_21 = fetch_index_ema9_21(symbol)
+            if ema_9_21 is not None:
+                dore_input.ema9 = ema_9_21["ema9"]
+                dore_input.ema21 = ema_9_21["ema21"]
+        except Exception:
+            logger.exception("[DORE:%s] intraday 9/21 EMA fetch failed (non-fatal)", symbol)
+
+    return dore_input
 
 
 
@@ -1541,12 +1561,21 @@ def build_dore_input_from_scanner(
         (Stage 5b defaults to ATM / Stage 4c treats IV as neutral).
       - days_to_expiry is computed here from `nearest_expiry`, not passed
         in — pure date arithmetic, no reason to make every caller redo it.
-      - ema9/ema21 and htf_trend are NOT wired yet: MasterScanner's scoring
-        pipeline runs on daily bars end-to-end (no 5m/15m intraday fetch
-        or 9/21-period EMA computed anywhere in scoring_core), so there is
-        no real data to put here without a new intraday data pipeline.
-        They stay at their neutral defaults until that exists — see
-        docs/DORE_ARCHITECTURE.md for the follow-up.
+      - ema9/ema21: this adapter itself still leaves them at neutral
+        defaults, since scoring_core's own pipeline runs on daily bars
+        end-to-end. 2026-07-20: for the INDEX path specifically
+        (build_dore_input_for_index — NIFTY/SENSEX/BANKNIFTY), a real
+        intraday 9/21 EMA (5-minute chart, utils.upstox_client.
+        fetch_index_ema9_21()) is now fetched and set on the DOREInput
+        *after* this function returns — see build_dore_input_for_index()
+        for why it happens there rather than here (this function has no
+        symbol-to-index-instrument-key mapping and stays a pure,
+        already-well-tested builder). Per-stock scans (this function
+        called directly, not via build_dore_input_for_index) still get
+        neutral ema9/ema21 — there's no intraday feed wired for the
+        500-stock universe, only the 3 indices DORE actually trades.
+      - htf_trend is NOT wired yet — same "no data source" reasoning,
+        see docs/DORE_ARCHITECTURE.md for the follow-up.
       - event_risk_today has no calendar data source yet (no economic/
         earnings calendar integration exists) — caller must pass it
         explicitly (e.g. a hardcoded RBI-policy-day / results-day flag)
