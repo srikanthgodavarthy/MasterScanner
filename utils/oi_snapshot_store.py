@@ -98,6 +98,52 @@ def record_and_diff_value(key: str, value: float) -> float:
     return ce_change
 
 
+_premium_history: dict = {}   # {key: {"ce": [t-1, t-2, ...], "pe": [t-1, t-2, ...]}}
+
+
+def record_and_diff_premium(
+    key: str, ce_premium: float, pe_premium: float,
+) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    Record this poll's ATM CE/PE premium for `key` (an index name, or
+    "STK_<symbol>" for a stock — see utils.dore_fo_screener) and return
+    the PRIOR two polls' premiums as
+    (ce_premium_prev, ce_premium_prev2, pe_premium_prev, pe_premium_prev2).
+
+    This is a separate tracker from record_and_diff() above and does NOT
+    reset at day-rollover: DORE's Premium Behaviour pillar (Stage 3)
+    needs genuine tick-to-tick history — was it falling and is now
+    rising, versus one noisy uptick — which a fixed day-open baseline
+    can't distinguish (see utils.dore_engine's Premium Behaviour
+    scoring). "prev" is the value from the immediately preceding call for
+    this key; "prev2" is the value from the call before that. Thread-
+    safe; cheap; safe to call on every Market Intelligence / F&O funnel
+    tick.
+
+    Returns None (not 0.0) for any leg that hasn't been observed yet —
+    on the first call for a key both prev/prev2 are None, on the second
+    call prev is populated but prev2 is still None. A real premium is
+    never genuinely 0, so 0.0 would be indistinguishable from "no
+    history yet"; callers already guard on `is None` rather than
+    truthiness (see utils.dore_engine's premium_prev handling).
+    """
+    with _LOCK:
+        state = _premium_history.get(key, {"ce": [], "pe": []})
+        ce_hist = state["ce"]
+        pe_hist = state["pe"]
+
+        ce_prev = ce_hist[0] if len(ce_hist) >= 1 else None
+        ce_prev2 = ce_hist[1] if len(ce_hist) >= 2 else None
+        pe_prev = pe_hist[0] if len(pe_hist) >= 1 else None
+        pe_prev2 = pe_hist[1] if len(pe_hist) >= 2 else None
+
+        _premium_history[key] = {
+            "ce": [float(ce_premium or 0.0)] + ce_hist[:1],
+            "pe": [float(pe_premium or 0.0)] + pe_hist[:1],
+        }
+        return ce_prev, ce_prev2, pe_prev, pe_prev2
+
+
 def reset(index: Optional[str] = None) -> None:
     """Debug/testing helper — clear the stored baseline for one index,
     or every index if none given. Not called anywhere in normal
@@ -106,5 +152,7 @@ def reset(index: Optional[str] = None) -> None:
     with _LOCK:
         if index is None:
             _snapshots.clear()
+            _premium_history.clear()
         else:
             _snapshots.pop(index, None)
+            _premium_history.pop(index, None)
