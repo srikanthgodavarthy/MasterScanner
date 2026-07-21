@@ -34,8 +34,8 @@ from typing import Optional
 import pandas as pd
 
 from utils.dore_engine import (
-    DOREInput, compute_dore, compute_trend_features, build_dore_input, build_trade_plan,
-    stage1_trend_engine, stage2_execution_engine, reason_html_for,
+    DOREInput, compute_dore, compute_trend_features, build_dore_input, build_underlying_trade_plan,
+    stage1_trend_engine, stage2_execution_engine,
     BULLISH, BEARISH, NEUTRAL, NOT_READY,
 )
 from utils.dore_settings import DORESettings
@@ -43,42 +43,6 @@ from utils.dore_settings import DORESettings
 logger = logging.getLogger(__name__)
 
 _INDICES = ("NIFTY", "SENSEX", "BANKNIFTY")
-
-# 2026-07-21: short TTL cache for Stage 3's live option-chain fetch — "the
-# expensive stage" (see module docstring). A single _fo_opportunities_panel()
-# render can trigger this twice today (Futures + Options tabs each probing
-# roughly the same names) and, once _fo_opportunities_panel() is wrapped in
-# st.fragment(run_every=...) per DORE_Performance_Audit.md Section 10.2,
-# every fragment tick within the TTL window reuses the same chain snapshot
-# instead of re-hitting Upstox. 45s is short enough that intraday premium
-# staleness stays well under what a manual click-to-click refresh already
-# tolerates, long enough to collapse a burst of reruns onto one fetch. See
-# DORE_Performance_Audit.md Section 10.5. Falls back to a no-op decorator
-# outside a Streamlit run (e.g. a script/test importing this module
-# directly), same defensive pattern _load_settings() below already uses.
-try:
-    import streamlit as _st
-    _option_chain_cache = _st.cache_data(ttl=45, show_spinner=False)
-except Exception:
-    def _option_chain_cache(fn):
-        return fn
-
-
-@_option_chain_cache
-def _cached_batch_stock_atm_options(symbols: tuple) -> dict:
-    """TTL-cached wrapper around fetch_batch_stock_atm_options_upstox() —
-    must be a module-level function (not defined inside another function)
-    for st.cache_data's memoization to actually persist across calls.
-    `symbols` is a tuple (not list) so it's hashable for the cache key."""
-    from utils.upstox_client import fetch_batch_stock_atm_options_upstox
-    return fetch_batch_stock_atm_options_upstox(list(symbols))
-
-
-@_option_chain_cache
-def _cached_oi_resistance(index: str) -> dict:
-    """TTL-cached wrapper around fetch_oi_resistance() for the 3 indices."""
-    from utils.upstox_client import fetch_oi_resistance
-    return fetch_oi_resistance(index) or {}
 
 
 def _load_settings(cfg: Optional[DORESettings]) -> DORESettings:
@@ -151,7 +115,7 @@ def stage1_trend_qualification(
             atr=features.get("atr", 0.0), rel_volume=features.get("rel_volume", 1.0),
         )
         try:
-            trend_score, intent, trend_reasons = stage1_trend_engine(probe, cfg)
+            trend_score, intent, _ = stage1_trend_engine(probe, cfg)
         except Exception:
             logger.exception("[DORE Stage1] trend engine failed for %s", symbol)
             continue
@@ -160,7 +124,6 @@ def stage1_trend_qualification(
         pool[symbol] = {
             "trend_score": trend_score,
             "directional_intent": intent,
-            "trend_reasons": trend_reasons,
             "price": features.get("price", 0.0),
             "trend_features": features,
         }
@@ -250,24 +213,23 @@ def stage2_execution_qualification(
     "execution_state", "execution_features"}}. Expected survivors: 15-25.
     """
     cfg = _load_settings(cfg)
-    from utils.upstox_client import fetch_batch_intraday_5m_upstox
+    from utils.upstox_client import fetch_stock_intraday_5m_upstox, fetch_index_intraday_5m_upstox
 
     pool: dict = {}
     symbols = list(daily_pool.keys())
-
-    # 2026-07-20: was a sequential one-symbol-at-a-time loop here (2 real
-    # HTTP calls per symbol * 50-70 symbols = 100-140 blocking calls against
-    # Upstox's 25 req/s / 250-per-min ceiling) despite this function's own
-    # docstring claiming "batched intraday" — see fetch_batch_intraday_5m_
-    # upstox()'s docstring for why that silently collapsed the Stage 2
-    # survivor count once Upstox started 429-ing partway through the run.
-    # Fetching concurrently up front fixes that; everything below this is
-    # otherwise unchanged (still one execution-engine call per symbol,
-    # that part was always cheap/local).
-    intraday_dfs = fetch_batch_intraday_5m_upstox(symbols, progress_cb=progress_cb)
-
+    done = 0
     for symbol in symbols:
-        df = intraday_dfs.get(symbol)
+        try:
+            df = (fetch_index_intraday_5m_upstox(symbol) if symbol in _INDICES
+                  else fetch_stock_intraday_5m_upstox(symbol))
+        except Exception:
+            logger.exception("[DORE Stage2] intraday fetch failed for %s", symbol)
+            df = None
+        finally:
+            done += 1
+            if progress_cb:
+                progress_cb(done, len(symbols))
+
         exec_features = execution_features_from_intraday_5m(df, cfg)
         row = daily_pool[symbol]
         probe = DOREInput(
@@ -285,7 +247,7 @@ def stage2_execution_qualification(
             intraday_atr_expansion_pct=exec_features.get("intraday_atr_expansion_pct", 0.0),
         )
         try:
-            execution_score, state, exec_reasons = stage2_execution_engine(probe, cfg, row["directional_intent"])
+            execution_score, state, _ = stage2_execution_engine(probe, cfg, row["directional_intent"])
         except Exception:
             logger.exception("[DORE Stage2] execution engine failed for %s", symbol)
             continue
@@ -295,7 +257,6 @@ def stage2_execution_qualification(
             **row,
             "execution_score": execution_score,
             "execution_state": state,
-            "execution_reasons": exec_reasons,
             "execution_features": exec_features,
         }
 
@@ -326,26 +287,15 @@ def compute_fo_opportunities(
     carrying the full DOREResult (recommendation, scores, TradePlan).
     """
     cfg = _load_settings(cfg)
-    from utils.oi_snapshot_store import record_and_diff
-
-    # 2026-07-20: was fetch_stock_atm_option() called ONE SYMBOL AT A TIME
-    # inside the loop below — same sequential-fetch anti-pattern Stage 2
-    # had, just one stage later, and the single-symbol call itself had no
-    # 429 retry until this refactor (see _get_option_chain_with_retry()'s
-    # docstring). Pre-fetching concurrently here fixes both at once for
-    # the stock leg; only 3 indices ever go through fetch_oi_resistance(),
-    # so a sequential call for those inside the loop is fine as-is.
-    # 2026-07-21: both fetches now go through a short TTL cache (see
-    # _option_chain_cache above) — see DORE_Performance_Audit.md Sec 10.5.
-    stock_symbols = tuple(s for s in live_pool if s not in _INDICES)
-    stock_options = _cached_batch_stock_atm_options(stock_symbols)
+    from utils.upstox_client import fetch_oi_resistance, fetch_stock_atm_option
+    from utils.oi_snapshot_store import record_and_diff, record_and_diff_premium
 
     rows = []
     for symbol, row in live_pool.items():
         try:
             if symbol in _INDICES:
                 key_map = {"NIFTY": "NIFTY", "SENSEX": "SENSEX", "BANKNIFTY": "BANKNIFTY"}
-                opt = _cached_oi_resistance(key_map[symbol])
+                opt = fetch_oi_resistance(key_map[symbol]) or {}
                 atm_chain_row = {
                     "ce_premium": opt.get("ce_premium", 0.0), "pe_premium": opt.get("pe_premium", 0.0),
                     "ce_oi": opt.get("ce_oi", 0.0), "pe_oi": opt.get("pe_oi", 0.0),
@@ -355,8 +305,9 @@ def compute_fo_opportunities(
                 oi_resistance_like = {"ce_strike": opt.get("ce_strike"), "pe_strike": opt.get("pe_strike"),
                                        "expiry": opt.get("expiry")}
                 ce_chg, pe_chg = record_and_diff(symbol, opt.get("total_ce_oi", 0.0), opt.get("total_pe_oi", 0.0))
+                premium_key = symbol
             else:
-                opt = stock_options.get(symbol)
+                opt = fetch_stock_atm_option(symbol)
                 if opt is None:
                     continue
                 atm_chain_row = dict(opt)
@@ -364,8 +315,22 @@ def compute_fo_opportunities(
                                        "pe_strike": opt.get("pe_wall_strike"), "expiry": opt.get("expiry")}
                 ce_chg, pe_chg = record_and_diff(f"STK_{symbol}", opt.get("total_ce_oi", 0.0),
                                                   opt.get("total_pe_oi", 0.0))
+                premium_key = f"STK_{symbol}"
             atm_chain_row["ce_oi_change"] = ce_chg
             atm_chain_row["pe_oi_change"] = pe_chg
+
+            # Premium Behaviour pillar (Stage 3, 2026-07-21) needs the
+            # last TWO polls, tick-to-tick — not vs day-open — to tell a
+            # genuine falling->rising reversal apart from noise. See
+            # utils.oi_snapshot_store.record_and_diff_premium()'s
+            # docstring for why this is a separate tracker from the OI
+            # one above.
+            ce_prev, ce_prev2, pe_prev, pe_prev2 = record_and_diff_premium(
+                premium_key, atm_chain_row.get("ce_premium", 0.0), atm_chain_row.get("pe_premium", 0.0))
+            atm_chain_row["ce_premium_prev"] = ce_prev
+            atm_chain_row["ce_premium_prev2"] = ce_prev2
+            atm_chain_row["pe_premium_prev"] = pe_prev
+            atm_chain_row["pe_premium_prev2"] = pe_prev2
         except Exception:
             logger.exception("[DORE Stage3] option-chain fetch failed for %s", symbol)
             continue
@@ -374,49 +339,38 @@ def compute_fo_opportunities(
             symbol=symbol, price=row["price"], trend_features=row.get("trend_features"),
             execution_features=row.get("execution_features"),
             atm_chain_row=atm_chain_row, oi_resistance=oi_resistance_like,
-            precomputed_trend=(row.get("trend_score"), row.get("directional_intent"), row.get("trend_reasons")),
-            precomputed_execution=(row.get("execution_score"), row.get("execution_state"), row.get("execution_reasons")),
         )
         result = compute_dore(dore_input, cfg)
-        # 2026-07-21: reason_html=False here — build the cheap plain-text
-        # headline for every row; the expensive <details>/<summary> markup
-        # is only built below for the small actionable subset that
-        # survives to top_fo_opportunities()'s filter. See
-        # DORE_Performance_Audit.md Section 6/10.4.
-        rows.append((result.opportunity_score, result, result.to_dashboard_row(symbol, reason_html=False)))
 
-    if not rows:
-        return pd.DataFrame()
-    rows.sort(key=lambda triple: triple[0], reverse=True)
-    dict_rows = [row for _, _, row in rows]
+        rows.append({
+            "Symbol": symbol,
+            "Recommendation": result.recommendation,
+            "Leg": result.suggested_direction,
+            "Directional Intent": result.directional_intent,
+            "Execution State": result.execution_state,
+            "Trend Score": result.trend_score,
+            "Execution Score": result.execution_score,
+            "Derivative Confidence": result.derivative_confidence,
+            "Premium Behavior": "Strengthening" if result.premium_strengthening else "Not confirmed",
+            "Premium Behavior Score": result.premium_behavior_score,
+            "Risk Quality": result.risk_quality,
+            "Opportunity Score": result.opportunity_score,
+            "Hard Gate Pass": result.risk_hard_gate_pass,
+            "Entry (Premium)": result.trade_plan.entry,
+            "Stop Loss": result.trade_plan.stop_loss,
+            "Target 1": result.trade_plan.target1,
+            "Target 2": result.trade_plan.target2,
+            "Target 3": result.trade_plan.target3,
+            "Strike": result.suggested_strike,
+            "Strike Type": result.recommended_strike_type,
+            "Expiry": result.recommended_expiry,
+            "Reason": result.reasons[-1] if result.reasons else "",
+        })
 
-    # Upgrade "Reason" to the full collapsible HTML only for rows that
-    # actually clear the actionable filter — everything else (WAIT/
-    # NO_TRADE, the majority of the live pool) keeps the cheap headline
-    # string built above, since it's discarded by top_fo_opportunities()
-    # a few lines from here and never reaches the UI.
-    for (_, result, row) in rows:
-        if row.get("Recommendation") in _ACTIONABLE:
-            row["Reason"] = reason_html_for(result.reasons)
-
-    # 2026-07-21: "lock the entry" — mint/advance Supabase-persisted
-    # FOSetupPlans (utils.fo_setup_persistence) so Entry/SL/T1/T2 stop
-    # drifting on every rerun once a genuine BUY_* recommendation fires.
-    # Fails soft to the live (unlocked) rows on any persistence error —
-    # a lock failure should never take down the opportunity table itself.
-    try:
-        from utils.supabase_client import load_open_fo_setup_plans, upsert_fo_setup_plans_batch
-        from utils.fo_setup_persistence import enrich_fo_opportunities_df
-
-        existing_plans = load_open_fo_setup_plans()
-        dict_rows, updated_plans = enrich_fo_opportunities_df(dict_rows, existing_plans)
-        if updated_plans:
-            upsert_fo_setup_plans_batch([p.to_db_dict() for p in updated_plans])
-    except Exception:
-        logger.exception("[DORE Stage5] FO setup-plan locking failed (non-fatal, rows stay live/unlocked)")
-
-    out = pd.DataFrame(dict_rows)
-    return out
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values("Opportunity Score", ascending=False).reset_index(drop=True)
 
 
 def top_fo_opportunities(
@@ -424,7 +378,6 @@ def top_fo_opportunities(
     daily_pool_period: str = "6mo",
     cfg: Optional[DORESettings] = None,
     universe: Optional[list[str]] = None,
-    daily_pool: Optional[dict] = None,
     progress_cb=None,
 ) -> pd.DataFrame:
     """Convenience single call running the full DORE 2.0 funnel
@@ -437,20 +390,11 @@ def top_fo_opportunities(
     scheduled refresh job; `universe` lets a caller pass a pre-fetched
     Stage-0 list (e.g. cached at session startup) instead of re-deriving
     it from utils.upstox_client.fo_eligible_symbols() every call.
-
-    `daily_pool`: 2026-07-21 — lets a caller that has ALREADY run
-    stage1_trend_qualification() (e.g. the Futures tab, see
-    top_futures_opportunities()) pass that same Stage 1 result straight
-    through instead of this function re-fetching the daily OHLCV batch
-    and re-scoring the Trend Engine a second time for the same universe
-    on the same trading day (see DORE_Performance_Audit.md Sec 3a/10.1).
-    When provided, `universe`/`daily_pool_period` are ignored for Stage 1.
     """
     cfg = _load_settings(cfg)
     universe = universe if universe is not None else stage0_universe()
 
-    if daily_pool is None:
-        daily_pool = stage1_trend_qualification(universe, cfg, period=daily_pool_period, progress_cb=progress_cb)
+    daily_pool = stage1_trend_qualification(universe, cfg, period=daily_pool_period, progress_cb=progress_cb)
     if not daily_pool:
         return pd.DataFrame()
 
@@ -493,28 +437,20 @@ def classify_buildup(price_chg_pct: Optional[float], oi_chg: Optional[float]) ->
 
 
 def top_futures_opportunities(top_n: int = 15, universe: Optional[list[str]] = None,
-                               cfg: Optional[DORESettings] = None,
-                               daily_pool: Optional[dict] = None) -> pd.DataFrame:
+                               cfg: Optional[DORESettings] = None) -> pd.DataFrame:
     """Futures tab: Stock, CMP, %Chg, buildup classification, and DORE's
     own TradePlan (Entry/Target1/SL) for symbols DORE's Stage 1 Trend
     Engine has qualified — ranked by Trend Score, not MasterScanner's
     OppScore (Principle 2.1). Long AND short buildups both surface now
     that DORE is bidirectional by design (Section 14), unlike the old
     long-only screener.
-
-    `daily_pool`: 2026-07-21 — pass the Options tab's already-computed
-    Stage 1 result here (both tabs share the same universe/cfg/period)
-    to avoid re-fetching daily OHLCV + re-running the Trend Engine for
-    ~200-250 symbols a second time in the same panel render. See
-    DORE_Performance_Audit.md Section 3a/10.1.
     """
     cfg = _load_settings(cfg)
     from utils.upstox_client import fo_eligible_symbols, fetch_futures_snapshot_batch
     from utils.oi_snapshot_store import record_and_diff_value
 
-    if daily_pool is None:
-        universe = universe if universe is not None else sorted(fo_eligible_symbols() or set())
-        daily_pool = stage1_trend_qualification(universe, cfg)
+    universe = universe if universe is not None else sorted(fo_eligible_symbols() or set())
+    daily_pool = stage1_trend_qualification(universe, cfg)
     if not daily_pool:
         return pd.DataFrame()
 
@@ -532,7 +468,7 @@ def top_futures_opportunities(top_n: int = 15, universe: Optional[list[str]] = N
         buildup = classify_buildup(fq.get("pct_chg"), oi_chg)
         direction = "CE" if row["directional_intent"] == BULLISH else "PE"
         probe = DOREInput(symbol=sym, price=row["price"], atr=row["trend_features"].get("atr", 0.0))
-        plan = build_trade_plan(probe, cfg, direction)
+        plan = build_underlying_trade_plan(probe, cfg, direction)
         rows.append({
             "Stock": sym, "CMP": fq.get("ltp"), "%Chg": fq.get("pct_chg"),
             "OI": fq.get("oi"), "OI Chg": round(oi_chg) if oi_chg else 0,
