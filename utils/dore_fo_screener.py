@@ -342,29 +342,50 @@ def compute_fo_opportunities(
         )
         result = compute_dore(dore_input, cfg)
 
+        # Live premium + tick-to-tick %Chg for the LEG DORE actually
+        # recommends — read off the ce/pe premium + ce/pe premium_prev
+        # already tracked above for the Premium Behaviour pillar.
+        leg = result.suggested_direction
+        premium_now  = dore_input.ce_premium if leg == "CE" else dore_input.pe_premium if leg == "PE" else 0.0
+        premium_prev = (dore_input.ce_premium_prev if leg == "CE" else
+                         dore_input.pe_premium_prev if leg == "PE" else None)
+        premium_pct_chg = (
+            (premium_now - premium_prev) / premium_prev * 100.0
+            if premium_prev not in (None, 0) else None
+        )
+
         rows.append({
             "Symbol": symbol,
             "Recommendation": result.recommendation,
-            "Leg": result.suggested_direction,
+            "Leg": leg,
+            "Strike": result.suggested_strike,
+            "Premium": premium_now,
+            "Premium %Chg": premium_pct_chg,
             "Directional Intent": result.directional_intent,
+            "Strike Type": result.recommended_strike_type,
             "Execution State": result.execution_state,
             "Trend Score": result.trend_score,
             "Execution Score": result.execution_score,
             "Derivative Confidence": result.derivative_confidence,
-            "Premium Behavior": "Strengthening" if result.premium_strengthening else "Not confirmed",
-            "Premium Behavior Score": result.premium_behavior_score,
             "Risk Quality": result.risk_quality,
             "Opportunity Score": result.opportunity_score,
-            "Hard Gate Pass": result.risk_hard_gate_pass,
-            "Entry (Premium)": result.trade_plan.entry,
-            "Stop Loss": result.trade_plan.stop_loss,
-            "Target 1": result.trade_plan.target1,
-            "Target 2": result.trade_plan.target2,
-            "Target 3": result.trade_plan.target3,
-            "Strike": result.suggested_strike,
-            "Strike Type": result.recommended_strike_type,
+            # Canonical short names — also the exact schema
+            # utils.fo_setup_persistence.enrich_fo_opportunities_df()
+            # expects (Symbol/Leg/Strike/Expiry/Recommendation/Entry/
+            # SL/T1/T2/Premium), so the Plan column can lock these in
+            # place once a plan opens.
+            "Entry": result.trade_plan.entry,
+            "SL": result.trade_plan.stop_loss,
+            "T1": result.trade_plan.target1,
+            "T2": result.trade_plan.target2,
             "Expiry": result.recommended_expiry,
             "Reason": result.reasons[-1] if result.reasons else "",
+            # Kept for internal gating/filtering, not part of the
+            # Options-tab display column set (see dashboard.py).
+            "Target 3": result.trade_plan.target3,
+            "Premium Behavior": "Strengthening" if result.premium_strengthening else "Not confirmed",
+            "Premium Behavior Score": result.premium_behavior_score,
+            "Hard Gate Pass": result.risk_hard_gate_pass,
         })
 
     out = pd.DataFrame(rows)
@@ -407,7 +428,29 @@ def top_fo_opportunities(
         return opportunities
 
     actionable = opportunities[opportunities["Recommendation"].isin(_ACTIONABLE)]
-    return actionable.head(top_n).reset_index(drop=True)
+    actionable = actionable.head(top_n).reset_index(drop=True)
+    if actionable.empty:
+        return actionable
+
+    # Attach the 'Plan' lifecycle column (WAITING/ACTIVE/T1_HIT/...) and
+    # lock Entry/SL/T1/T2 to the plan's frozen levels for any symbol with
+    # an open FOSetupPlan. This was previously built (fo_setup_persistence
+    # .enrich_fo_opportunities_df) but never called from here.
+    try:
+        from utils.fo_setup_persistence import enrich_fo_opportunities_df
+        from utils.supabase_client import load_open_fo_setup_plans, upsert_fo_setup_plans_batch
+
+        existing_plans = load_open_fo_setup_plans()
+        enriched_rows, updated_plans = enrich_fo_opportunities_df(
+            actionable.to_dict("records"), existing_plans)
+        if updated_plans:
+            upsert_fo_setup_plans_batch([p.to_db_dict() for p in updated_plans])
+        actionable = pd.DataFrame(enriched_rows)
+    except Exception:
+        logger.exception("[DORE Options] Plan lifecycle enrichment failed (non-fatal, "
+                          "table renders without the Plan column)")
+
+    return actionable
 
 
 # ══════════════════════════════════════════════════════════════════
