@@ -43,6 +43,10 @@ PIPELINE
     Stage 2  Execution Engine             -> Execution State
     Stage 2  ...batched over the Daily Candidate Pool -> Live Candidate Pool
     Stage 3  Derivative Intelligence      -> Derivative Confidence
+    Stage 3.5 Option Intelligence         -> Option Intelligence Score
+                                              (RFC-001: DORE 3.0 — is the
+                                              CONTRACT worth buying,
+                                              independent of direction)
     Stage 4  Risk Engine                  -> Risk Quality + hard-gate
     Stage 5  Opportunity Engine           -> weighted Opportunity Score +
                                               composed Recommendation
@@ -190,8 +194,22 @@ class DOREInput:
     nearest_expiry:   str = ""
     days_to_expiry:   int = 0
 
+    # ── Stage 3.5 (Option Intelligence) — is the CONTRACT worth buying,
+    #    independent of direction (RFC-001 §7). Nothing here may carry
+    #    directional, execution, or recommendation logic.
+    india_vix:          Optional[float] = None   # market-wide IV context
+    current_iv:         Optional[float] = None   # ATM option's own annualised IV, %
+    iv_rank:            Optional[float] = None   # 0-100 rank of current IV within its 1yr hi/lo range
+    iv_percentile:      Optional[float] = None   # 0-100 percentile of days IV was below current level
+    iv_trend_pct:       Optional[float] = None   # % change in IV over the recent lookback (+ve = rising)
+    iv_expansion_rate:  Optional[float] = None   # % change in IV per day (rate of the move above)
+    iv_compression:     Optional[bool] = None     # explicit compression flag from the chain, if the
+                                                    # caller already knows it — None lets Stage 3.5 derive
+                                                    # it from iv_trend_pct instead
+    iv_skew:            Optional[float] = None    # CE IV - PE IV at the ATM strike
+    term_structure_slope: Optional[float] = None  # near-expiry IV - far-expiry IV (+ve = backwardation)
+
     # ── Stage 4 (Risk Engine) — event/volatility risk inputs ─────────
-    iv_percentile:     Optional[float] = None   # 0-100 rank of current IV vs its own recent range
     event_risk_today:  bool = False             # major macro/earnings event flagged for today
 
 
@@ -345,6 +363,11 @@ class DOREResult:
     premium_behavior_score: float = 0.0  # Stage-3 sub-score (first-class pillar, 2026-07-21)
     premium_strengthening:  bool = False  # gates BUY_CE_NOW/BUY_PE_NOW — see stage5_opportunity_engine()
     corridor_score:          float = 0.0  # Stage-3 sub-score (direction-aware room-to-run)
+
+    option_intelligence_score: float = 50.0    # 0-100                    (Stage 3.5)
+    option_valuation_status:   str = "UNKNOWN"  # CHEAP | FAIR | EXPENSIVE | RICH | UNKNOWN
+    expected_move_coverage:    Optional[float] = None  # IV move / distance-to-target (Stage 3.5)
+    iv_warnings:                list = field(default_factory=list)  # Stage-3.5-specific warnings
 
     risk_quality:        float = 0.0     # 0-100                          (Stage 4)
     risk_hard_gate_pass: bool = True      # False = a trip-wire fired -> forces NO_TRADE
@@ -937,6 +960,168 @@ def stage3_derivative_intelligence(
 
 
 # ══════════════════════════════════════════════════════════════════
+#  STAGE 3.5 — OPTION INTELLIGENCE  (RFC-001: DORE 3.0 Decision Engine
+#  Architecture — "Is this option contract worth buying?")
+#
+#  Evaluates the CONTRACT independently of direction. Per the RFC this
+#  stage carries no directional logic, no execution logic, and produces
+#  no recommendation — it answers exactly one business question. Its
+#  output is one more independent piece of evidence for Stage 5 to
+#  weigh; it never overrides Stage 1-3, and Stage 4 (Risk Intelligence)
+#  intentionally excludes everything computed here (option valuation is
+#  no longer read anywhere inside stage4_risk_engine — see RFC-001 §2).
+# ══════════════════════════════════════════════════════════════════
+
+CHEAP     = "CHEAP"
+FAIR      = "FAIR"
+EXPENSIVE = "EXPENSIVE"
+RICH      = "RICH"
+UNKNOWN   = "UNKNOWN"
+
+
+@dataclass
+class OptionIntelligenceResult:
+    score:                  float = 50.0        # Option Intelligence Score, 0-100
+    valuation_status:       str = UNKNOWN        # CHEAP | FAIR | EXPENSIVE | RICH | UNKNOWN
+    expected_move_coverage: Optional[float] = None  # IV-implied move / distance-to-technical-target
+    iv_expected_move:       Optional[float] = None
+    hard_gate_pass:         bool = True          # False = Extreme IV Crush Risk trip-wire fired
+    warnings:               list = field(default_factory=list)
+    reasons:                list = field(default_factory=list)
+
+
+def stage3_5_option_intelligence(
+    inp: DOREInput,
+    cfg: DORESettings,
+    atr_expected_move: float,
+    technical_target: Optional[float],
+) -> OptionIntelligenceResult:
+    """Stage 3.5 (RFC-001 §7). Reads Market Context / Valuation /
+    Volatility Behaviour / Pricing / Structure inputs and produces a
+    single independent read on whether the OPTION CONTRACT itself is
+    attractive to buy — never which direction, never whether now is the
+    moment, never a recommendation. `atr_expected_move` and
+    `technical_target` are REUSED from Stage 3 (not recomputed) so the
+    Expected Move Coverage output is always internally consistent with
+    the corridor Stage 3 already reported.
+    """
+    reasons: list[str] = []
+    warnings: list[str] = []
+
+    # ── Valuation: is current IV cheap or rich vs its own range? ─────
+    iv_level = inp.iv_rank if inp.iv_rank is not None else inp.iv_percentile
+    if iv_level is not None:
+        valuation_score = _pct_score(iv_level, cfg.oi_iv_rank_rich_min, cfg.oi_iv_rank_cheap_max)
+        if iv_level < cfg.oi_iv_rank_cheap_max:
+            valuation_status = CHEAP
+        elif iv_level >= cfg.oi_iv_rank_rich_min:
+            valuation_status = RICH
+        elif iv_level >= cfg.oi_iv_rank_expensive_min:
+            valuation_status = EXPENSIVE
+        else:
+            valuation_status = FAIR
+        reasons.append(f"IV Rank/Percentile={iv_level:.0f} -> {valuation_status}")
+    else:
+        valuation_score = 50.0
+        valuation_status = UNKNOWN
+        reasons.append("No IV Rank/Percentile supplied — Option Valuation is UNKNOWN")
+
+    # ── Volatility Behaviour: is IV expanding (favours buyers) or ────
+    #    compressing (erodes long-premium edge)?
+    compression = inp.iv_compression
+    if compression is None and inp.iv_trend_pct is not None:
+        compression = inp.iv_trend_pct <= cfg.oi_iv_compression_trend_pct
+    if inp.iv_trend_pct is not None or inp.iv_expansion_rate is not None:
+        trend_val = inp.iv_expansion_rate if inp.iv_expansion_rate is not None else inp.iv_trend_pct
+        volatility_behavior_score = _clamp(50.0 + trend_val * cfg.oi_iv_trend_scale)
+        reasons.append(f"IV Trend={inp.iv_trend_pct if inp.iv_trend_pct is not None else 0.0:+.1f}%, "
+                        f"Expansion Rate={inp.iv_expansion_rate if inp.iv_expansion_rate is not None else 0.0:+.1f}%/day")
+    else:
+        volatility_behavior_score = 50.0
+        reasons.append("No IV Trend/Expansion Rate supplied — Volatility Behaviour is neutral")
+    if compression:
+        volatility_behavior_score = _clamp(volatility_behavior_score - 15.0)
+        warnings.append("IV compressing — reduces edge for long-premium buyers (theta/IV both working "
+                         "against the position)")
+
+    # ── Pricing: does the IV-implied move cover the distance to the ──
+    #    technical target the underlying actually needs to travel?
+    iv_expected_move = None
+    if inp.current_iv is not None and inp.current_iv > 0 and inp.days_to_expiry > 0:
+        iv_expected_move = round(
+            inp.price * (inp.current_iv / 100.0) * ((inp.days_to_expiry / 365.0) ** 0.5), 2
+        )
+        reasons.append(f"IV Expected Move={iv_expected_move:.2f} vs ATR Expected Move={atr_expected_move:.2f}")
+
+    expected_move_coverage = None
+    if iv_expected_move is not None and technical_target and inp.price:
+        distance_to_target = abs(technical_target - inp.price)
+        if distance_to_target > 1e-6:
+            expected_move_coverage = round(iv_expected_move / distance_to_target, 2)
+            reasons.append(f"Expected Move Coverage={expected_move_coverage:.2f} "
+                            f"(IV move vs distance-to-target {distance_to_target:.2f})")
+
+    if expected_move_coverage is not None:
+        pricing_score = _pct_score(expected_move_coverage, 0.4, 1.2)
+        if expected_move_coverage < cfg.oi_expected_move_coverage_min:
+            warnings.append(f"Expected Move Coverage={expected_move_coverage:.2f} below "
+                             f"{cfg.oi_expected_move_coverage_min:.2f} — the IV-implied move may not reach "
+                             f"the technical target")
+    else:
+        pricing_score = 50.0
+        reasons.append("Insufficient data for Expected Move Coverage — Pricing read is neutral")
+
+    # ── Structure: skew / term structure sanity ───────────────────────
+    structure_penalties = []
+    if inp.iv_skew is not None:
+        structure_penalties.append(min(abs(inp.iv_skew) * cfg.oi_skew_penalty_scale, 40.0))
+        reasons.append(f"IV Skew (CE-PE)={inp.iv_skew:+.2f}")
+    if inp.term_structure_slope is not None:
+        structure_penalties.append(min(max(inp.term_structure_slope, 0.0) * cfg.oi_term_structure_penalty_scale, 40.0))
+        reasons.append(f"Term Structure slope (near-far)={inp.term_structure_slope:+.2f}")
+        if inp.term_structure_slope > cfg.oi_term_structure_backwardation_warn:
+            warnings.append(f"Term structure in backwardation ({inp.term_structure_slope:+.2f}) — often "
+                             f"event-driven IV pricing")
+    if structure_penalties:
+        structure_score = _clamp(100.0 - sum(structure_penalties))
+    else:
+        structure_score = 50.0
+        reasons.append("No IV Skew/Term Structure supplied — Structure read is neutral")
+
+    score = _weighted([
+        (valuation_score,           cfg.w_oi_valuation),
+        (volatility_behavior_score, cfg.w_oi_volatility),
+        (pricing_score,             cfg.w_oi_pricing),
+        (structure_score,           cfg.w_oi_structure),
+    ])
+
+    # ── Extreme IV Crush Risk — a hard-gate CANDIDATE only. This stage
+    #    never overrides a recommendation itself (Section 10 of the
+    #    RFC: hard gates live outside the scoring framework); it just
+    #    reports whether its own trip-wire fired. The orchestrator
+    #    (compute_dore) is what actually applies it.
+    hard_gate_pass = True
+    if iv_level is not None and iv_level >= cfg.oi_hard_gate_iv_rank:
+        hard_gate_pass = False
+        warnings.append(f"IV Rank/Percentile={iv_level:.0f} >= hard-gate floor "
+                         f"({cfg.oi_hard_gate_iv_rank:.0f}) — Extreme IV Crush Risk")
+
+    logger.info("[DORE:%s] Stage3.5 Option Intelligence score=%.1f valuation=%s coverage=%s hard_gate_pass=%s",
+                inp.symbol, score, valuation_status, expected_move_coverage, hard_gate_pass)
+    logger.debug("[DORE:%s] Stage3.5 reasons=%s", inp.symbol, reasons)
+
+    return OptionIntelligenceResult(
+        score=score,
+        valuation_status=valuation_status,
+        expected_move_coverage=expected_move_coverage,
+        iv_expected_move=iv_expected_move,
+        hard_gate_pass=hard_gate_pass,
+        warnings=warnings,
+        reasons=reasons,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
 #  STAGE 4 — RISK ENGINE  (Risk Quality + hard-gate)
 # ══════════════════════════════════════════════════════════════════
 
@@ -953,12 +1138,15 @@ def stage4_risk_engine(
     plus price/ATR already in cache.
 
     Returns (risk_quality 0-100, hard_gate_pass, reasons, warnings).
-    hard_gate_pass=False means a trip-wire fired (IV richness >= the
-    hard-gate percentile, or a flagged macro/earnings event today) —
-    Stage 5 forces NO_TRADE whenever this is False, regardless of every
-    other score. This is the gate the pre-2.0 DORE documented but never
-    actually wired to live data (its old Stage 4c) — real inputs feed it
-    here and it is genuinely enforced downstream.
+    hard_gate_pass=False means the Event Risk trip-wire fired (a flagged
+    macro/earnings event today) — the orchestrator forces NO_TRADE
+    whenever this is False, regardless of every other score. Option
+    valuation (IV richness / crush risk) is intentionally NOT read here
+    (RFC-001 §2, §7: "Risk Intelligence intentionally excludes option
+    valuation") — that trip-wire now lives in Stage 3.5 Option
+    Intelligence and is combined with this one only by the orchestrator,
+    never inside either stage's own score (RFC-001 §10: hard gates
+    "override recommendations but never alter evidence scores").
     """
     reasons: list[str] = []
     warnings: list[str] = []
@@ -967,15 +1155,12 @@ def stage4_risk_engine(
         reasons.append("No direction yet — Risk Engine has nothing to size (reporting-only read)")
         return 50.0, True, reasons, warnings
 
-    # ── Hard trip-wires ──────────────────────────────────────────────
+    # ── Hard trip-wire: Event Risk only (Option Intelligence owns the
+    #    IV-crush trip-wire — see stage3_5_option_intelligence) ───────
     hard_gate_pass = True
     if inp.event_risk_today and cfg.risk_event_hard_gate:
         hard_gate_pass = False
         reasons.append("Event-risk flagged today (earnings/RBI/Fed/budget-type event) — hard NO_TRADE")
-    if inp.iv_percentile is not None and inp.iv_percentile >= cfg.risk_iv_percentile_hard_gate:
-        hard_gate_pass = False
-        reasons.append(f"IV percentile={inp.iv_percentile:.0f} >= hard-gate floor "
-                        f"({cfg.risk_iv_percentile_hard_gate:.0f}) — IV-crush risk, hard NO_TRADE")
 
     # ── Reward:Risk off the TradePlan's own entry/SL/Target1 spread ──
     rr = trade_plan.reward_to_risk
@@ -993,8 +1178,6 @@ def stage4_risk_engine(
         warnings.append(f"{inp.days_to_expiry}d to expiry — meaningful theta-decay exposure")
     else:
         theta_score = _pct_score(inp.days_to_expiry, cfg.risk_theta_days_scalp_max, cfg.risk_theta_days_scalp_max + 5)
-    if inp.iv_percentile is not None:
-        reasons.append(f"IV percentile={inp.iv_percentile:.0f}, days_to_expiry={inp.days_to_expiry}")
 
     # ── Liquidity / spread, reused as a RISK factor (can we get out
     #    cleanly) rather than an entry-confirmation factor ────────────
@@ -1013,9 +1196,6 @@ def stage4_risk_engine(
         (theta_score,       cfg.w_risk_theta_iv),
         (liquidity_score,   cfg.w_risk_liquidity),
     ])
-    if not hard_gate_pass:
-        risk_quality = min(risk_quality, 20.0)
-
     if risk_quality < cfg.risk_quality_min:
         warnings.append(f"Risk Quality={risk_quality:.0f} below the {cfg.risk_quality_min:.0f} floor")
 
@@ -1035,6 +1215,7 @@ def stage5_opportunity_engine(
     execution_score: float,
     execution_state: str,
     derivative_confidence: float,
+    option_intelligence_score: float,
     risk_quality: float,
     risk_hard_gate_pass: bool,
     premium_strengthening: bool = False,
@@ -1065,14 +1246,15 @@ def stage5_opportunity_engine(
     # setups are otherwise fully supported.
     trend_conviction = _trend_conviction(trend_score)
     opportunity_score = _weighted([
-        (trend_conviction,        cfg.w_opp_trend),
-        (execution_score,         cfg.w_opp_execution),
-        (derivative_confidence,   cfg.w_opp_derivatives),
-        (risk_quality,            cfg.w_opp_risk),
+        (trend_conviction,          cfg.w_opp_trend),
+        (execution_score,           cfg.w_opp_execution),
+        (derivative_confidence,     cfg.w_opp_derivatives),
+        (option_intelligence_score, cfg.w_opp_option_intelligence),
+        (risk_quality,              cfg.w_opp_risk),
     ])
 
     if not risk_hard_gate_pass:
-        reasons.append("Risk Engine hard-gate FAILED (event risk / IV crush) — NO_TRADE regardless of score")
+        reasons.append("Hard-gate FAILED (event risk and/or extreme IV crush risk) — NO_TRADE regardless of score")
         return opportunity_score, NO_TRADE, reasons
 
     if directional_intent == NEUTRAL:
@@ -1174,29 +1356,40 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     deriv = stage3_derivative_intelligence(inp, cfg, directional_intent)
 
     direction = "CE" if directional_intent == BULLISH else ("PE" if directional_intent == BEARISH else None)
+
+    technical_target = deriv.resistance if direction == "CE" else (deriv.support if direction == "PE" else None)
+    oi_intel = stage3_5_option_intelligence(inp, cfg, deriv.expected_move, technical_target)
+
     trade_plan = build_trade_plan(inp, cfg, direction)
 
-    risk_quality, risk_hard_gate_pass, risk_reasons, risk_warnings = stage4_risk_engine(
+    risk_quality, event_hard_gate_pass, risk_reasons, risk_warnings = stage4_risk_engine(
         inp, cfg, direction, deriv.corridor_score, trade_plan,
     )
 
+    # Hard gates live outside the scoring framework (RFC-001 §10) — this
+    # is the ONLY place Stage 4's event-risk trip-wire and Stage 3.5's
+    # IV-crush trip-wire are combined. Neither stage's own evidence score
+    # is touched by this; it only ever overrides the recommendation.
+    hard_gate_pass = event_hard_gate_pass and oi_intel.hard_gate_pass
+
     opportunity_score, recommendation, opp_reasons = stage5_opportunity_engine(
         cfg, trend_score, directional_intent, execution_score, execution_state,
-        deriv.confidence, risk_quality, risk_hard_gate_pass, deriv.premium_strengthening,
+        deriv.confidence, oi_intel.score, risk_quality, hard_gate_pass, deriv.premium_strengthening,
     )
 
     strike_type, recommended_expiry, strike_reasons = stage5b_strike_and_expiry(
-        inp, cfg, direction, execution_score, risk_hard_gate_pass,
+        inp, cfg, direction, execution_score, hard_gate_pass,
     ) if recommendation in (BUY_CE_NOW, BUY_CE_BREAKOUT, BUY_PE_NOW, BUY_PE_BREAKDOWN) else (None, None, [])
 
-    warnings = list(risk_warnings)
+    warnings = list(risk_warnings) + list(oi_intel.warnings)
     if deriv.confidence < cfg.derivative_confidence_min and direction is not None:
         warnings.append(f"Derivative Confidence={deriv.confidence:.0f} below the "
                          f"{cfg.derivative_confidence_min:.0f} confirmation floor")
     if direction is not None and not deriv.premium_strengthening:
         warnings.append("Premium Behaviour not confirmed — option premium hasn't started strengthening yet")
 
-    reasons = trend_reasons + exec_reasons + deriv.reasons + risk_reasons + opp_reasons + strike_reasons
+    reasons = (trend_reasons + exec_reasons + deriv.reasons + oi_intel.reasons
+               + risk_reasons + opp_reasons + strike_reasons)
 
     result = DOREResult(
         recommendation=recommendation,
@@ -1212,8 +1405,12 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         premium_behavior_score=round(deriv.premium_behavior_score, 1),
         premium_strengthening=deriv.premium_strengthening,
         corridor_score=round(deriv.corridor_score, 1),
+        option_intelligence_score=round(oi_intel.score, 1),
+        option_valuation_status=oi_intel.valuation_status,
+        expected_move_coverage=oi_intel.expected_move_coverage,
+        iv_warnings=oi_intel.warnings,
         risk_quality=round(risk_quality, 1),
-        risk_hard_gate_pass=risk_hard_gate_pass,
+        risk_hard_gate_pass=hard_gate_pass,
         trade_plan=trade_plan,
         recommended_strike_type=strike_type,
         recommended_expiry=recommended_expiry,
@@ -1228,9 +1425,11 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
 
     logger.info(
         "[DORE:%s] FINAL recommendation=%s opportunity_score=%.1f intent=%s(%.1f) "
-        "execution=%s(%.1f) derivative_confidence=%.1f risk_quality=%.1f hard_gate_pass=%s",
+        "execution=%s(%.1f) derivative_confidence=%.1f option_intelligence=%.1f(%s) "
+        "risk_quality=%.1f hard_gate_pass=%s",
         inp.symbol, result.recommendation, result.opportunity_score, directional_intent, trend_score,
-        execution_state, execution_score, deriv.confidence, risk_quality, risk_hard_gate_pass,
+        execution_state, execution_score, deriv.confidence, oi_intel.score, oi_intel.valuation_status,
+        risk_quality, hard_gate_pass,
     )
     return result
 
@@ -1333,6 +1532,9 @@ def build_dore_input(
     oi_resistance: Optional[dict] = None,        # {ce_strike, pe_strike, expiry} — nearest OI walls
     iv_percentile: Optional[float] = None,
     event_risk_today: bool = False,
+    option_intel: Optional[dict] = None,          # Stage 3.5 (RFC-001): {india_vix, current_iv, iv_rank,
+                                                    #  iv_trend_pct, iv_expansion_rate, iv_compression,
+                                                    #  iv_skew, term_structure_slope}
 ) -> DOREInput:
     """Adapter that assembles a DOREInput purely from Market Data Layer
     objects — no MasterScanner score is read anywhere in this function
@@ -1343,6 +1545,7 @@ def build_dore_input(
     execution_features = execution_features or {}
     atm_chain_row = atm_chain_row or {}
     oi_resistance = oi_resistance or {}
+    option_intel = option_intel or {}
     nearest_expiry = oi_resistance.get("expiry", "") or atm_chain_row.get("expiry", "")
 
     return DOREInput(
@@ -1390,8 +1593,17 @@ def build_dore_input(
         nearest_expiry=nearest_expiry,
         days_to_expiry=_days_to_expiry(nearest_expiry),
 
-        iv_percentile=atm_chain_row.get("iv_percentile", oi_resistance.get("iv_percentile")),
+        iv_percentile=atm_chain_row.get("iv_percentile", oi_resistance.get("iv_percentile", iv_percentile)),
         event_risk_today=event_risk_today,
+
+        india_vix=option_intel.get("india_vix"),
+        current_iv=option_intel.get("current_iv", atm_chain_row.get("iv")),
+        iv_rank=option_intel.get("iv_rank"),
+        iv_trend_pct=option_intel.get("iv_trend_pct"),
+        iv_expansion_rate=option_intel.get("iv_expansion_rate"),
+        iv_compression=option_intel.get("iv_compression"),
+        iv_skew=option_intel.get("iv_skew"),
+        term_structure_slope=option_intel.get("term_structure_slope"),
     )
 
 
@@ -1403,6 +1615,7 @@ def build_dore_input_for_index(
     execution_features: Optional[dict] = None,
     iv_percentile: Optional[float] = None,
     event_risk_today: bool = False,
+    option_intel: Optional[dict] = None,
 ) -> Optional[DOREInput]:
     """Index-level convenience wrapper: derives Stage 1's Trend features
     from the index's own daily OHLCV via compute_trend_features(), then
@@ -1423,6 +1636,7 @@ def build_dore_input_for_index(
         oi_resistance=oi_resistance,
         iv_percentile=iv_percentile,
         event_risk_today=event_risk_today,
+        option_intel=option_intel,
     )
 
 
