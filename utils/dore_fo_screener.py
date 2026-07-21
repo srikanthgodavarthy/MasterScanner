@@ -524,7 +524,17 @@ def top_futures_opportunities(top_n: int = 15, universe: Optional[list[str]] = N
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    return out.sort_values("Trend Score", ascending=False).head(top_n).reset_index(drop=True)
+    # Sort by conviction (distance from the NEUTRAL midpoint), not the
+    # raw signed Trend Score — trend_score is 0=max BEARISH..100=max
+    # BULLISH, so sorting on the raw value always ranks every BULLISH
+    # symbol above every BEARISH one regardless of how strong the
+    # bearish read is. See utils.dore_engine._trend_conviction()'s
+    # docstring; this is the futures-tab-local equivalent of the same
+    # fix applied there for the options tab's Opportunity Score.
+    out["_conviction"] = (out["Trend Score"] - 50.0).abs()
+    return (out.sort_values("_conviction", ascending=False)
+               .drop(columns="_conviction")
+               .head(top_n).reset_index(drop=True))
 
 
 # Back-compat alias — the old options-tab entry point. Now the full
