@@ -10,10 +10,16 @@ F&O Opportunity Engine with its own five stages:
     Stage 1  Trend Engine          -> Directional Intent
     Stage 2  Execution Engine      -> Execution State
     Stage 3  Derivative Intelligence -> Derivative Confidence
-    Stage 4  Risk Engine           -> Risk Quality + hard-gate
+    Stage 3.5 Option Intelligence  -> Option Intelligence Score (RFC-001:
+                                       DORE 3.0 — is the contract worth
+                                       buying, independent of direction)
+    Stage 4  Risk Engine           -> Risk Quality + hard-gate (Event
+                                       Risk only — option valuation is
+                                       intentionally excluded, RFC-001 §2)
     Stage 5  Opportunity Engine    -> weighted score + recommendation
                                        (Directional Intent x Execution
-                                       State, gated by Risk hard-gate)
+                                       State, gated by the combined
+                                       Event-Risk / IV-Crush hard-gate)
 
 Every threshold/weight used by any stage lives here — nothing is
 hardcoded in utils/dore_engine.py — so the whole engine can be re-tuned
@@ -106,9 +112,34 @@ DORE_DEFAULTS: dict = {
     "w_deriv_premium_behavior":   20.0,   # NEW — has the premium itself turned/started rising
     "w_deriv_corridor":           15.0,   # room to run before the next OI wall
 
+    # ── Stage 3.5: Option Intelligence (RFC-001: DORE 3.0) ────────
+    # "Is this option contract worth buying?" — independent of direction.
+    # Reuses Stage 3's ATR Expected Move and technical target (resistance/
+    # support); no new fetch beyond the IV fields on DOREInput.
+    "oi_iv_rank_cheap_max":        25.0,   # IV Rank/Percentile below this -> CHEAP
+    "oi_iv_rank_expensive_min":    70.0,   # >= this (below rich) -> EXPENSIVE
+    "oi_iv_rank_rich_min":         85.0,   # >= this -> RICH
+    "oi_iv_trend_scale":            1.5,   # points added/removed to Volatility Behaviour per 1% IV move
+    "oi_iv_compression_trend_pct": -10.0,  # IV Trend % at/below this auto-flags compression when the
+                                             # caller didn't supply an explicit iv_compression flag
+    "oi_expected_move_coverage_min": 0.8,  # coverage below this -> warning (IV move may not reach target)
+    "oi_skew_penalty_scale":        4.0,   # Structure-score penalty per point of |IV Skew|
+    "oi_term_structure_penalty_scale": 5.0, # Structure-score penalty per point of backwardation slope
+    "oi_term_structure_backwardation_warn": 1.0,  # near-far slope above this -> backwardation warning
+    # Extreme IV Crush Risk hard-gate CANDIDATE (Section 10) — combined
+    # with Stage 4's Event Risk trip-wire only by the orchestrator; never
+    # alters either stage's own evidence score.
+    "oi_hard_gate_iv_rank":        90.0,   # IV Rank/Percentile >= this -> Extreme IV Crush Risk
+    # Stage-3.5 sub-weights (must sum to 100)
+    "w_oi_valuation":              35.0,   # cheap/rich vs IV's own range
+    "w_oi_volatility":             25.0,   # IV Trend / Expansion Rate / Compression
+    "w_oi_pricing":                25.0,   # Expected Move Coverage
+    "w_oi_structure":              15.0,   # IV Skew / Term Structure
+
     # ── Stage 4: Risk Engine (Risk Quality + hard-gate) ──────────
     # No new fetch — scores/gates Stage 3 survivors using Stages 1-3
-    # outputs plus price/ATR already in cache.
+    # outputs plus price/ATR already in cache. Option valuation is
+    # intentionally NOT read here (RFC-001 §2/§7) — see Stage 3.5 above.
     "risk_atr_stop_mult":          1.0,   # underlying ATR * this = base stop distance, before delta-scaling
     "default_option_delta":        0.5,   # fallback |Delta| when the chain didn't supply one
     "risk_premium_stop_min_pct":  15.0,   # stop can never be closer than this % of premium (was the ~0 bug)
@@ -119,11 +150,11 @@ DORE_DEFAULTS: dict = {
     "risk_liquidity_min_oi":    50_000,   # OI floor reused as a risk (exit-cleanly) factor
     "risk_spread_max_pct":         3.0,   # spread ceiling reused as a risk (exit-cleanly) factor
     "risk_quality_min":            50.0,  # Risk Quality >= this = acceptable structure (soft)
-    # Hard trip-wires — force NO_TRADE regardless of score. 2026-07-20:
-    # this is the gate the original DORE Stage 4c documented but never
-    # wired to live data — now real inputs (iv_percentile, event_risk_today)
-    # feed it directly, and the boolean is actually enforced in Stage 5.
-    "risk_iv_percentile_hard_gate": 90.0,  # iv_percentile >= this -> hard NO_TRADE
+    # Hard trip-wire — force NO_TRADE regardless of score. Event Risk
+    # only; the IV-crush trip-wire moved to oi_hard_gate_iv_rank above
+    # (RFC-001 §7/§10). risk_iv_percentile_hard_gate is kept only so old
+    # saved settings blobs stay forward-compatible; it is no longer read.
+    "risk_iv_percentile_hard_gate": 90.0,  # DEPRECATED — superseded by oi_hard_gate_iv_rank
     "risk_event_hard_gate":         True,  # event_risk_today=True -> hard NO_TRADE
     # Stage-4 sub-weights (must sum to 100)
     "w_risk_reward_ratio":        35.0,
@@ -133,10 +164,13 @@ DORE_DEFAULTS: dict = {
 
     # ── Stage 5: Opportunity Engine ───────────────────────────────
     # Weighted score components (Section 10 of the spec) — must sum to 100.
-    "w_opp_trend":                30.0,
-    "w_opp_execution":            25.0,
-    "w_opp_derivatives":          30.0,
-    "w_opp_risk":                 15.0,
+    # Rebalanced 2026-07-21 (RFC-001: DORE 3.0) to make room for Option
+    # Intelligence as a first-class input; placeholder split, not re-fit.
+    "w_opp_trend":                25.0,
+    "w_opp_execution":            20.0,
+    "w_opp_derivatives":          25.0,
+    "w_opp_option_intelligence":  20.0,
+    "w_opp_risk":                 10.0,
     "min_opportunity_score_to_show": 0.0,  # pure ranking floor; recommendation itself comes
                                              # from the composition table, not this score
 
@@ -210,6 +244,21 @@ class DORESettings:
     w_deriv_premium_behavior: float = 20.0
     w_deriv_corridor: float = 15.0
 
+    oi_iv_rank_cheap_max: float = 25.0
+    oi_iv_rank_expensive_min: float = 70.0
+    oi_iv_rank_rich_min: float = 85.0
+    oi_iv_trend_scale: float = 1.5
+    oi_iv_compression_trend_pct: float = -10.0
+    oi_expected_move_coverage_min: float = 0.8
+    oi_skew_penalty_scale: float = 4.0
+    oi_term_structure_penalty_scale: float = 5.0
+    oi_term_structure_backwardation_warn: float = 1.0
+    oi_hard_gate_iv_rank: float = 90.0
+    w_oi_valuation: float = 35.0
+    w_oi_volatility: float = 25.0
+    w_oi_pricing: float = 25.0
+    w_oi_structure: float = 15.0
+
     risk_atr_stop_mult: float = 1.0
     default_option_delta: float = 0.5
     risk_premium_stop_min_pct: float = 15.0
@@ -220,17 +269,18 @@ class DORESettings:
     risk_liquidity_min_oi: float = 50_000
     risk_spread_max_pct: float = 3.0
     risk_quality_min: float = 50.0
-    risk_iv_percentile_hard_gate: float = 90.0
+    risk_iv_percentile_hard_gate: float = 90.0  # DEPRECATED — superseded by oi_hard_gate_iv_rank
     risk_event_hard_gate: bool = True
     w_risk_reward_ratio: float = 35.0
     w_risk_corridor_room: float = 25.0
     w_risk_theta_iv: float = 20.0
     w_risk_liquidity: float = 20.0
 
-    w_opp_trend: float = 30.0
-    w_opp_execution: float = 25.0
-    w_opp_derivatives: float = 30.0
-    w_opp_risk: float = 15.0
+    w_opp_trend: float = 25.0
+    w_opp_execution: float = 20.0
+    w_opp_derivatives: float = 25.0
+    w_opp_option_intelligence: float = 20.0
+    w_opp_risk: float = 10.0
     min_opportunity_score_to_show: float = 0.0
 
     target_delta_min: float = 0.55
