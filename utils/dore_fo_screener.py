@@ -393,6 +393,8 @@ def compute_fo_opportunities(
             "Trend Score": result.trend_score,
             "Execution Score": result.execution_score,
             "Derivative Confidence": result.derivative_confidence,
+            "Option Intelligence": result.option_intelligence_score,
+            "Option Valuation": result.option_valuation_status,
             "Risk Quality": result.risk_quality,
             "Opportunity Score": result.opportunity_score,
             # Canonical short names — also the exact schema
