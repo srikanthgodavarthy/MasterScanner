@@ -400,6 +400,23 @@ def _weighted(parts: list[tuple[float, float]]) -> float:
     return _clamp(sum(s * w for s, w in parts) / total_w)
 
 
+def _trend_conviction(trend_score: float) -> float:
+    """Direction-agnostic conviction magnitude derived from the signed
+    0-100 Trend Score (0=max BEARISH, 50=NEUTRAL, 100=max BULLISH).
+    0 at trend_score=50 (no directional edge), 100 at either extreme.
+
+    Stage 5 ranks candidates on this, NOT the raw signed trend_score —
+    using the signed value directly would always rank a mildly BULLISH
+    symbol (e.g. 65) above a strongly BEARISH one (e.g. 10), even though
+    the BEARISH read is the higher-conviction setup. Since Stage 1 only
+    passes symbols that already cleared NEUTRAL (>=60 BULLISH or <=40
+    BEARISH — see stage1_trend_qualification), sorting by raw trend_score
+    silently makes every ranked list long-only. Display fields
+    (DOREResult.trend_score) stay signed/raw; only ranking uses this.
+    """
+    return _clamp(abs(trend_score - 50.0) * 2.0)
+
+
 @dataclass
 class GateCheck:
     """One named, evaluable condition inside a stage's score blend.
@@ -1041,8 +1058,14 @@ def stage5_opportunity_engine(
     """
     reasons: list[str] = []
 
+    # Ranking uses conviction (magnitude, direction-agnostic), not the
+    # raw signed trend_score — see _trend_conviction()'s docstring for
+    # why using the signed value here silently long-only-biases every
+    # ranked list (Futures tab, Options tab) even though BEARISH/PE
+    # setups are otherwise fully supported.
+    trend_conviction = _trend_conviction(trend_score)
     opportunity_score = _weighted([
-        (trend_score,             cfg.w_opp_trend),
+        (trend_conviction,        cfg.w_opp_trend),
         (execution_score,         cfg.w_opp_execution),
         (derivative_confidence,   cfg.w_opp_derivatives),
         (risk_quality,            cfg.w_opp_risk),
