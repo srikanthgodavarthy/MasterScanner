@@ -58,7 +58,10 @@ from utils.scanner_engine  import fetch_nifty
 from utils.regime_engine   import build_regime_context, regime_summary
 from utils.supabase_client import load_latest_full_scan
 from utils.sector_map      import build_sector_stats
-from utils.dore_fo_screener import top_futures_opportunities, top_options_opportunities
+from utils.dore_fo_screener import (
+    top_futures_opportunities, top_options_opportunities,
+    stage0_universe, stage1_trend_qualification,
+)
 from utils.dore_engine import render_dashboard_table_html
 
 # ── CONSTANTS ─────────────────────────────────────────────────────
@@ -2271,14 +2274,39 @@ def _sc_counts_html(df: pd.DataFrame) -> str:
 # funnel (Universe -> Trend Qualification -> Execution Qualification ->
 # Derivative Intelligence -> Risk Engine -> Opportunity Ranking) instead
 # of ranking off the scanner's OppScore/Recommendation/T1 columns.
+# 2026-07-21: was a plain function called inline from render() — reran
+# the ENTIRE Stage 0-5 funnel (both tabs) on every Streamlit script rerun
+# of the whole Dashboard page (any widget click anywhere, not just here).
+# @st.fragment isolates it onto its own timer instead, same pattern as
+# _market_intelligence_fragment() above. 60s (vs Market Intelligence's
+# 20s) because this funnel does a ~200-250 symbol daily OHLCV batch fetch
+# (Stage 1) rather than a handful of index quotes. See
+# DORE_Performance_Audit.md Section 8 (Rank 1) / Section 10.2.
+_FO_OPP_REFRESH_SECS = 60
+
+
+@st.fragment(run_every=_FO_OPP_REFRESH_SECS)
 def _fo_opportunities_panel():
     st.markdown('<div class="ti-panel-title" style="margin-top:0.6rem;">🎯 DORE 2.0 F&amp;O OPPORTUNITY ENGINE</div>',
                 unsafe_allow_html=True)
     tab_fut, tab_opt = st.tabs(["📈 Futures", "🎯 Options"])
 
+    # 2026-07-21: Stage 1 (Trend Qualification — the most expensive stage,
+    # a ~200-250 symbol daily OHLCV fetch + Trend Engine scoring pass) run
+    # ONCE here and shared by both tabs below, instead of each tab's
+    # top_futures_opportunities()/top_options_opportunities() call
+    # independently re-deriving an identical daily_pool for the same
+    # universe/cfg/day. See DORE_Performance_Audit.md Section 3a/10.1.
+    try:
+        universe = stage0_universe()
+        shared_daily_pool = stage1_trend_qualification(universe, None)
+    except Exception:
+        logger.exception("Shared Stage 1 daily_pool computation failed (non-fatal, tabs fall back to their own)")
+        shared_daily_pool = None
+
     with tab_fut:
         try:
-            fut_df = top_futures_opportunities()
+            fut_df = top_futures_opportunities(daily_pool=shared_daily_pool)
         except Exception:
             logger.exception("Futures opportunities panel failed (non-fatal)")
             fut_df = pd.DataFrame()
@@ -2307,7 +2335,7 @@ def _fo_opportunities_panel():
 
     with tab_opt:
         try:
-            opt_df = top_options_opportunities()
+            opt_df = top_options_opportunities(daily_pool=shared_daily_pool)
         except Exception:
             logger.exception("Options opportunities panel failed (non-fatal)")
             opt_df = pd.DataFrame()
