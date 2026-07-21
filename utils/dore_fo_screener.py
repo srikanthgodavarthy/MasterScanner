@@ -342,7 +342,25 @@ def compute_fo_opportunities(
     if not rows:
         return pd.DataFrame()
     rows.sort(key=lambda pair: pair[0], reverse=True)
-    out = pd.DataFrame([row for _, row in rows])
+    dict_rows = [row for _, row in rows]
+
+    # 2026-07-21: "lock the entry" — mint/advance Supabase-persisted
+    # FOSetupPlans (utils.fo_setup_persistence) so Entry/SL/T1/T2 stop
+    # drifting on every rerun once a genuine BUY_* recommendation fires.
+    # Fails soft to the live (unlocked) rows on any persistence error —
+    # a lock failure should never take down the opportunity table itself.
+    try:
+        from utils.supabase_client import load_open_fo_setup_plans, upsert_fo_setup_plans_batch
+        from utils.fo_setup_persistence import enrich_fo_opportunities_df
+
+        existing_plans = load_open_fo_setup_plans()
+        dict_rows, updated_plans = enrich_fo_opportunities_df(dict_rows, existing_plans)
+        if updated_plans:
+            upsert_fo_setup_plans_batch([p.to_db_dict() for p in updated_plans])
+    except Exception:
+        logger.exception("[DORE Stage5] FO setup-plan locking failed (non-fatal, rows stay live/unlocked)")
+
+    out = pd.DataFrame(dict_rows)
     return out
 
 

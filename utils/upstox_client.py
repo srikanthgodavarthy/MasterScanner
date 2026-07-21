@@ -1126,6 +1126,20 @@ def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
         def _premium(row: dict, leg: str) -> float:
             return ((row.get(leg) or {}).get("market_data") or {}).get("ltp", 0) or 0
 
+        # 2026-07-21: option premium's own %Chg (LTP vs prior session's
+        # close), for the DORE Options table's "Premium %Chg" column —
+        # distinct from the underlying's %Chg (Futures tab already has
+        # that). Upstox's option-chain market_data block carries
+        # close_price alongside ltp; falls soft to None (rendered as "—"
+        # downstream) if close_price is missing/zero, same fail-soft
+        # convention as ce_delta/pe_delta below.
+        def _premium_pct_chg(row: dict, leg: str) -> Optional[float]:
+            md = (row.get(leg) or {}).get("market_data") or {}
+            ltp, close = md.get("ltp"), md.get("close_price")
+            if not ltp or not close:
+                return None
+            return round((ltp - close) / close * 100, 2)
+
         def _greeks(row: dict, leg: str) -> tuple[Optional[float], Optional[float]]:
             g = (row.get(leg) or {}).get("option_greeks") or {}
             return g.get("delta"), g.get("iv")
@@ -1159,9 +1173,11 @@ def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
             "ce_strike":  best_ce.get("strike_price"),   # highest-OI Call strike -> OI Resistance
             "ce_oi":      ce_oi,
             "ce_premium": _premium(best_ce, "call_options"),
+            "ce_premium_pct_chg": _premium_pct_chg(best_ce, "call_options"),
             "pe_strike":  best_pe.get("strike_price"),   # highest-OI Put strike -> OI Support
             "pe_oi":      pe_oi,
             "pe_premium": _premium(best_pe, "put_options"),
+            "pe_premium_pct_chg": _premium_pct_chg(best_pe, "put_options"),
             # PCR = total Put OI / total Call OI across the whole chain (the
             # standard definition) — NOT ce_oi/pe_oi at the two individual
             # max-OI strikes, which would be a different, narrower ratio.
@@ -1566,6 +1582,15 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
         def _md(row, leg, field, default=0):
             return ((row.get(leg) or {}).get("market_data") or {}).get(field, default) or default
 
+        # 2026-07-21: see the identical helper in fetch_oi_resistance() —
+        # option premium's own %Chg vs prior session's close_price, for
+        # the DORE Options table's "Premium %Chg" column.
+        def _premium_pct_chg(row, leg) -> Optional[float]:
+            ltp, close = _md(row, leg, "ltp", 0), _md(row, leg, "close_price", 0)
+            if not ltp or not close:
+                return None
+            return round((ltp - close) / close * 100, 2)
+
         def _greeks(row, leg):
             g = (row.get(leg) or {}).get("option_greeks") or {}
             return g.get("delta"), g.get("iv")
@@ -1598,10 +1623,12 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
             "atm_strike":  atm_row.get("strike_price"),
             "ce_strike":   atm_row.get("strike_price"),
             "ce_premium":  _md(atm_row, "call_options", "ltp"),
+            "ce_premium_pct_chg": _premium_pct_chg(atm_row, "call_options"),
             "ce_oi":       _md(atm_row, "call_options", "oi"),
             "ce_delta":    ce_delta, "ce_iv": ce_iv,
             "pe_strike":   atm_row.get("strike_price"),
             "pe_premium":  _md(atm_row, "put_options", "ltp"),
+            "pe_premium_pct_chg": _premium_pct_chg(atm_row, "put_options"),
             "pe_oi":       _md(atm_row, "put_options", "oi"),
             "pe_delta":    pe_delta, "pe_iv": pe_iv,
             "pcr":         round(total_pe_oi / total_ce_oi, 3) if total_ce_oi else None,

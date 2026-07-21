@@ -881,6 +881,161 @@ def close_setup_plan_manually(setup_id: str, reason: str = "Manual exit") -> boo
         return False
 
 
+# ─── F&O SETUP PLANS (frozen option-premium levels — DORE Options tab) ────────
+# Same shape/contract as the equity setup_plans block above; see
+# utils/fo_setup_persistence.py for the FOSetupPlan dataclass + lifecycle
+# state machine this wraps. Kept in a separate table (fo_setup_plans) since
+# the identity key is symbol+leg+strike+expiry, not just symbol.
+
+def upsert_fo_setup_plan(plan_dict: dict) -> bool:
+    """Persist (insert or update) one FOSetupPlan — plan_dict is the
+    output of FOSetupPlan.to_db_dict(). Upserts on setup_id."""
+    client = get_client()
+    if client is None or not plan_dict:
+        return False
+
+    def _safe(v):
+        if v is None:
+            return None
+        if isinstance(v, float) and (v != v):
+            return None
+        return v
+
+    row = {k: _safe(v) for k, v in plan_dict.items()}
+    try:
+        resp = client.table("fo_setup_plans").upsert(row, on_conflict="setup_id").execute()
+        return resp.data is not None
+    except Exception as exc:
+        logger.error("upsert_fo_setup_plan failed: %s", exc)
+        return False
+
+
+def upsert_fo_setup_plans_batch(plans: list[dict]) -> bool:
+    """Persist a batch of FOSetupPlan dicts. Returns True if all batches succeeded."""
+    client = get_client()
+    if client is None or not plans:
+        return False
+
+    def _safe(v):
+        if v is None:
+            return None
+        if isinstance(v, float) and (v != v):
+            return None
+        return v
+
+    clean = [{k: _safe(v) for k, v in p.items()} for p in plans]
+    try:
+        batch_size = 200
+        for i in range(0, len(clean), batch_size):
+            resp = (
+                client.table("fo_setup_plans")
+                .upsert(clean[i: i + batch_size], on_conflict="setup_id")
+                .execute()
+            )
+            if resp.data is None:
+                return False
+        return True
+    except Exception as exc:
+        logger.error("upsert_fo_setup_plans_batch failed: %s", exc)
+        return False
+
+
+def _fo_setup_plan_from_row(row: dict) -> "object":
+    from utils.fo_setup_persistence import FOSetupPlan
+
+    return FOSetupPlan(
+        setup_id                 = row.get("setup_id", ""),
+        symbol                    = row.get("symbol", ""),
+        leg                       = row.get("leg", ""),
+        strike                    = float(row.get("strike", 0) or 0),
+        expiry                    = row.get("expiry", "") or "",
+        first_seen_date           = str(row.get("first_seen_date", "")),
+        created_date               = str(row.get("created_date", "")),
+        entry_locked               = float(row.get("entry_locked", 0) or 0),
+        sl_locked                   = float(row.get("sl_locked", 0) or 0),
+        t1_locked                   = float(row.get("t1_locked", 0) or 0),
+        t2_locked                   = float(row.get("t2_locked", 0) or 0),
+        locked_recommendation      = row.get("locked_recommendation", "") or "",
+        locked_opportunity_score  = float(row.get("locked_opportunity_score", 0) or 0),
+        locked_strike_type         = row.get("locked_strike_type", "") or "",
+        status                     = row.get("status", "WAITING") or "WAITING",
+        status_reason               = row.get("status_reason", "") or "",
+        created_at                  = str(row.get("created_at", "") or ""),
+        activated_at                = str(row.get("activated_at", "") or ""),
+        t1_hit_at                    = str(row.get("t1_hit_at", "") or ""),
+        closed_at                   = str(row.get("closed_at", "") or ""),
+    )
+
+
+def load_open_fo_setup_plans() -> dict:
+    """Return every OPEN F&O setup plan as {contract_key: FOSetupPlan},
+    where contract_key == symbol|leg|strike|expiry (FOSetupPlan.contract_key).
+    Called once per DORE Options-tab run to seed the in-memory cache that
+    enrich_fo_opportunities_df()/advance_fo_lifecycle() update."""
+    client = get_client()
+    if client is None:
+        return {}
+    try:
+        resp = (
+            client.table("fo_setup_plans")
+            .select("*")
+            .in_("status", ["WAITING", "ACTIVE", "T1_HIT"])
+            .execute()
+        )
+        if not resp.data:
+            return {}
+        result = {}
+        for row in resp.data:
+            plan = _fo_setup_plan_from_row(row)
+            result[plan.contract_key] = plan
+        return result
+    except Exception as exc:
+        logger.error("load_open_fo_setup_plans failed: %s", exc)
+        return {}
+
+
+def load_all_fo_setup_plans(limit: int = 500) -> pd.DataFrame:
+    """All F&O setup plans (any status), for history/audit views."""
+    client = get_client()
+    if client is None:
+        return pd.DataFrame()
+    try:
+        resp = (
+            client.table("fo_setup_plans")
+            .select("*")
+            .order("created_date", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        if not resp.data:
+            return pd.DataFrame()
+        return pd.DataFrame(resp.data)
+    except Exception as exc:
+        logger.error("load_all_fo_setup_plans failed: %s", exc)
+        return pd.DataFrame()
+
+
+def close_fo_setup_plan_manually(setup_id: str, reason: str = "Manual exit") -> bool:
+    """Manual exit hook (ACTIVE/T1_HIT → CLOSED only)."""
+    client = get_client()
+    if client is None or not setup_id:
+        return False
+    try:
+        resp = client.table("fo_setup_plans").select("*").eq("setup_id", setup_id).limit(1).execute()
+        if not resp.data:
+            return False
+        plan = _fo_setup_plan_from_row(resp.data[0])
+        if plan.status not in ("ACTIVE", "T1_HIT"):
+            return False
+        from utils.fo_setup_persistence import FOSetupPlanStatus, _now_iso
+        plan.status, plan.status_reason = FOSetupPlanStatus.CLOSED, reason
+        plan.closed_at = _now_iso()
+        return upsert_fo_setup_plan(plan.to_db_dict())
+    except Exception as exc:
+        logger.error("close_fo_setup_plan_manually failed for %s: %s", setup_id, exc)
+        return False
+
+
 def load_watchlist_enriched(lc_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Return the watchlist joined with the latest lifecycle state for each symbol.
@@ -1182,6 +1337,53 @@ CREATE INDEX IF NOT EXISTS idx_setup_plans_symbol ON setup_plans(symbol);
 CREATE INDEX IF NOT EXISTS idx_setup_plans_status ON setup_plans(status);
 CREATE INDEX IF NOT EXISTS idx_setup_plans_date   ON setup_plans(first_actionable_date DESC);
 """
+
+# Append fo_setup_plans SQL to the canonical SCHEMA_SQL for easy copy-paste
+SCHEMA_SQL += """
+-- 8. F&O Setup Plans — DORE Options tab's "lock the entry" equivalent of
+--    setup_plans above, but premium-denominated (₹) and keyed on the
+--    option CONTRACT (symbol+leg+strike+expiry), not just symbol. See
+--    utils/fo_setup_persistence.py for the lifecycle state machine.
+--    Run this in Supabase SQL Editor after the tables above.
+CREATE TABLE IF NOT EXISTS fo_setup_plans (
+    setup_id                  text        PRIMARY KEY,
+    symbol                     text        NOT NULL,
+    leg                        text        NOT NULL,       -- 'CE' | 'PE'
+    strike                     numeric(12,2) NOT NULL DEFAULT 0,
+    expiry                     date,
+    first_seen_date            date        NOT NULL,
+    created_date                date        NOT NULL,
+
+    -- Frozen premium levels (set once, never recalculated)
+    entry_locked                numeric(12,2) NOT NULL DEFAULT 0,
+    sl_locked                    numeric(12,2) NOT NULL DEFAULT 0,
+    t1_locked                    numeric(12,2) NOT NULL DEFAULT 0,
+    t2_locked                    numeric(12,2) NOT NULL DEFAULT 0,
+
+    -- Locked trade thesis (audit trail — set once, never overwritten)
+    locked_recommendation       text        NOT NULL DEFAULT '',
+    locked_opportunity_score   numeric(6,2) NOT NULL DEFAULT 0,
+    locked_strike_type          text        NOT NULL DEFAULT '',
+
+    -- Lifecycle — WAITING / ACTIVE / T1_HIT / CLOSED / EXPIRED
+    status                      text        NOT NULL DEFAULT 'WAITING',
+    status_reason                text        NOT NULL DEFAULT '',
+    created_at                   timestamptz NOT NULL DEFAULT now(),
+    activated_at                  timestamptz,
+    t1_hit_at                      timestamptz,
+    closed_at                     timestamptz,
+
+    updated_at                    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_fo_setup_plans_symbol ON fo_setup_plans(symbol);
+CREATE INDEX IF NOT EXISTS idx_fo_setup_plans_status ON fo_setup_plans(status);
+CREATE INDEX IF NOT EXISTS idx_fo_setup_plans_date   ON fo_setup_plans(created_date DESC);
+"""
+
+# ── If fo_setup_plans doesn't exist yet in your Supabase project, run the
+#    CREATE TABLE block above once. This is a brand-new table (2026-07-21),
+#    so there is no separate ALTER-TABLE migration needed the way
+#    SETUP_PLANS_MIGRATION_SQL exists for the older equity table.
 
 
 # ── MIGRATION for an EXISTING setup_plans table created before this v9

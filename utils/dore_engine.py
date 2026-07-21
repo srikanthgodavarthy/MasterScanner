@@ -193,6 +193,13 @@ class DOREInput:
     pe_premium:       float = 0.0
     ce_premium_prev:  Optional[float] = None   # prior bar's ATM CE premium, for expansion
     pe_premium_prev:  Optional[float] = None
+    # 2026-07-21: today's %Chg on the premium itself (LTP vs prior
+    # session's close_price) — NOT the same thing as ce_premium_prev
+    # above (which is an intraday-bar-to-bar read used for the expansion
+    # score). This is a plain day-over-day read, for the dashboard's
+    # "Premium %Chg" column only; DORE's own scoring does not consume it.
+    ce_premium_pct_chg: Optional[float] = None
+    pe_premium_pct_chg: Optional[float] = None
     ce_oi:            float = 0.0
     pe_oi:            float = 0.0
     ce_oi_change:     float = 0.0    # net OI change, current session
@@ -287,6 +294,7 @@ class PremiumPlan:
     target1:        float = 0.0
     target2:        float = 0.0
     is_approximate: bool = False            # True if delta was unavailable and a fallback was used
+    premium_pct_chg: Optional[float] = None  # today's %Chg on current_premium (LTP vs prior close)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -387,6 +395,7 @@ class DOREResult:
             "Leg": leg,
             "Strike": self.suggested_strike,
             "Premium": pp.current_premium if pp.direction else None,
+            "Premium %Chg": pp.premium_pct_chg if pp.direction else None,
             "Directional Intent": self.directional_intent,
             "Strike Type": self.recommended_strike_type,
             "Execution State": self.execution_state,
@@ -1345,6 +1354,7 @@ def build_premium_plan(
         target1=_premium_at(trade_plan.target1),
         target2=_premium_at(trade_plan.target2),
         is_approximate=is_approximate,
+        premium_pct_chg=(inp.ce_premium_pct_chg if direction == "CE" else inp.pe_premium_pct_chg),
     )
 
 
@@ -1528,6 +1538,8 @@ def build_dore_input(
         pe_premium=atm_chain_row.get("pe_premium", 0.0),
         ce_premium_prev=atm_chain_row.get("ce_premium_prev"),
         pe_premium_prev=atm_chain_row.get("pe_premium_prev"),
+        ce_premium_pct_chg=atm_chain_row.get("ce_premium_pct_chg"),
+        pe_premium_pct_chg=atm_chain_row.get("pe_premium_pct_chg"),
         ce_oi=atm_chain_row.get("ce_oi", 0.0),
         pe_oi=atm_chain_row.get("pe_oi", 0.0),
         ce_oi_change=atm_chain_row.get("ce_oi_change", 0.0),
@@ -2492,6 +2504,8 @@ def build_dore_input_from_scanner(
         pe_premium=atm_chain_row.get("pe_premium", oi_resistance.get("pe_premium", 0.0)),
         ce_premium_prev=atm_chain_row.get("ce_premium_prev"),
         pe_premium_prev=atm_chain_row.get("pe_premium_prev"),
+        ce_premium_pct_chg=atm_chain_row.get("ce_premium_pct_chg"),
+        pe_premium_pct_chg=atm_chain_row.get("pe_premium_pct_chg"),
         ce_oi=atm_chain_row.get("ce_oi", oi_resistance.get("ce_oi", 0.0)),
         pe_oi=atm_chain_row.get("pe_oi", oi_resistance.get("pe_oi", 0.0)),
         ce_oi_change=atm_chain_row.get("ce_oi_change", 0.0),
@@ -2574,10 +2588,10 @@ def render_dashboard_table_html(
     """
     palette = badge_style or _DEFAULT_BADGE_STYLE
     columns = [
-        "Symbol", "Recommendation", "Leg", "Strike", "Premium",
+        "Symbol", "Recommendation", "Leg", "Strike", "Premium", "Premium %Chg",
         "Directional Intent", "Strike Type", "Execution State",
         "Trend", "Execution", "Derivatives", "Risk", "Opportunity",
-        "Entry", "SL", "T1", "T2", "Expiry", "Reason",
+        "Entry", "SL", "T1", "T2", "Plan", "Expiry", "Reason",
     ]
 
     header_html = "".join(
@@ -2609,6 +2623,15 @@ def render_dashboard_table_html(
                     )
                 elif col == "Reason":
                     cell_html = str(display)   # already HTML (details/summary) from to_dashboard_row
+                elif col == "Premium %Chg" and isinstance(val, (int, float)):
+                    pct_color = "#3fb950" if val >= 0 else "#f85149"
+                    cell_html = f'<span style="color:{pct_color};">{val:+.2f}%</span>'
+                elif col == "Plan" and display != "—":
+                    # 🔒 Locked = a persisted FOSetupPlan is open for this
+                    # row (see utils.fo_setup_persistence) — Entry/SL/T1/T2
+                    # above are the frozen levels, not the live premium
+                    # plan, for as long as this badge shows.
+                    cell_html = f'<span style="color:#d29922;white-space:nowrap;">🔒 {display}</span>'
                 else:
                     cell_html = str(display)
                 cells.append(
