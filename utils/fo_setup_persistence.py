@@ -202,11 +202,11 @@ def _format_setup_age(days: int, status: str) -> str:
 def _plan_status_label(status: str) -> str:
     """Short label for the 'Plan' column badge in render_dashboard_table_html."""
     return {
-        FOSetupPlanStatus.WAITING.value: "Waiting",
-        FOSetupPlanStatus.ACTIVE.value:  "Active",
-        FOSetupPlanStatus.T1_HIT.value:  "T1 Hit",
-        FOSetupPlanStatus.CLOSED.value:  "Closed",
-        FOSetupPlanStatus.EXPIRED.value: "Expired",
+        FOSetupPlanStatus.WAITING.value: "🔒 Waiting",
+        FOSetupPlanStatus.ACTIVE.value:  "🔒 Active",
+        FOSetupPlanStatus.T1_HIT.value:  "🎯 T1 Hit",
+        FOSetupPlanStatus.CLOSED.value:  "⚪ Closed",
+        FOSetupPlanStatus.EXPIRED.value: "🔴 Expired",
     }.get(_sval(status), "")
 
 
