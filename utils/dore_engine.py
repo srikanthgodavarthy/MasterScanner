@@ -241,6 +241,24 @@ class DOREInput:
     intraday_vol_ratio:     float = 1.0
     intraday_atr_expansion_pct: float = 0.0
 
+    # 2026-07-21: optional precomputed Stage 1/Stage 2 results — set by a
+    # caller (dore_fo_screener.build_dore_input()) that already ran
+    # stage1_trend_engine()/stage2_execution_engine() once during Stage 1
+    # Trend Qualification / Stage 2 Execution Qualification, over the
+    # SAME feature inputs above. When both of a pair are provided,
+    # compute_dore() reuses them instead of recalculating — the inputs
+    # are unchanged between the qualification probe and this call, so
+    # the two pure functions would return identical values either way.
+    # See DORE_Performance_Audit.md Section 3b/10.3. Leave None (the
+    # default) to have compute_dore() compute them itself, e.g. for
+    # ad-hoc/manual DOREInput construction that skipped the funnel.
+    precomputed_trend_score:        Optional[float] = None
+    precomputed_directional_intent: Optional[str] = None
+    precomputed_trend_reasons:      Optional[list] = None
+    precomputed_execution_score:    Optional[float] = None
+    precomputed_execution_state:    Optional[str] = None
+    precomputed_execution_reasons:  Optional[list] = None
+
 
 # ══════════════════════════════════════════════════════════════════
 #  DORE 2.0 — TRADE PLAN (Section 11)
@@ -356,7 +374,7 @@ class DOREResult:
         d["premium_score"] = d["premium_quality_score"]
         return d
 
-    def to_dashboard_row(self, symbol: str) -> dict:
+    def to_dashboard_row(self, symbol: str, reason_html: bool = True) -> dict:
         """One row in the simplified dashboard format — Hard Gate Pass
         dropped (it's already expressed as NO_TRADE in Recommendation),
         Target 3 dropped, Entry/SL/T1/T2 are option premium (₹) via
@@ -374,21 +392,21 @@ class DOREResult:
         rendered through st.dataframe (which does not render HTML), pass
         the row dict through st.markdown per-cell instead, or build a
         plain HTML <table> the way the index DORE cards already do.
+
+        `reason_html`: 2026-07-21 — pass False to skip building the
+        <details>/<summary> markup and get back just the plain headline
+        string instead. Every row in a scan population gets this method
+        called on it (Section 6 of DORE_Performance_Audit.md), but only
+        the small top_n actionable subset ever reaches the UI, so
+        dore_fo_screener.compute_fo_opportunities() calls this with
+        reason_html=False for the full population and upgrades just the
+        surviving rows afterward via reason_html_for(). See
+        DORE_Performance_Audit.md Section 6/10.4.
         """
         pp = self.premium_plan
         leg = self.suggested_direction or ""
         headline = self.reasons[0] if self.reasons else "—"
-        rest = self.reasons[1:] if len(self.reasons) > 1 else []
-        if rest:
-            items_html = "".join(f'<li style="margin-bottom:2px">{r}</li>' for r in rest)
-            reason_html = (
-                f'<details style="font-size:11px;">'
-                f'<summary style="cursor:pointer;color:var(--text);user-select:none;">{headline}</summary>'
-                f'<ul style="margin:4px 0 0 16px;padding:0;color:var(--muted);">{items_html}</ul>'
-                f'</details>'
-            )
-        else:
-            reason_html = headline
+        reason_cell = reason_html_for(self.reasons) if reason_html else headline
         return {
             "Symbol": symbol,
             "Recommendation": self.recommendation,
@@ -409,13 +427,32 @@ class DOREResult:
             "T1": pp.target1 if pp.direction else None,
             "T2": pp.target2 if pp.direction else None,
             "Expiry": self.recommended_expiry,
-            "Reason": reason_html,
+            "Reason": reason_cell,
         }
 
 
 # ══════════════════════════════════════════════════════════════════
 #  SMALL HELPERS
 # ══════════════════════════════════════════════════════════════════
+
+def reason_html_for(reasons: list) -> str:
+    """The <details>/<summary> collapsible reasons block, extracted out
+    of DOREResult.to_dashboard_row() (2026-07-21) so it can be built
+    lazily — only for the small top_n actionable subset that actually
+    reaches the UI — instead of for every scanned symbol. See
+    DORE_Performance_Audit.md Section 6/10.4."""
+    headline = reasons[0] if reasons else "—"
+    rest = reasons[1:] if len(reasons) > 1 else []
+    if not rest:
+        return headline
+    items_html = "".join(f'<li style="margin-bottom:2px">{r}</li>' for r in rest)
+    return (
+        f'<details style="font-size:11px;">'
+        f'<summary style="cursor:pointer;color:var(--text);user-select:none;">{headline}</summary>'
+        f'<ul style="margin:4px 0 0 16px;padding:0;color:var(--muted);">{items_html}</ul>'
+        f'</details>'
+    )
+
 
 def _clamp(x: float, lo: float = 0.0, hi: float = 100.0) -> float:
     return max(lo, min(hi, x))
@@ -1497,18 +1534,35 @@ def build_dore_input(
     execution_features: Optional[dict] = None,
     atm_chain_row: Optional[dict] = None,
     oi_resistance: Optional[dict] = None,
+    precomputed_trend: Optional[tuple] = None,
+    precomputed_execution: Optional[tuple] = None,
 ) -> DOREInput:
     """DORE 2.0's builder (Section 4/13): assembles a DOREInput purely
     from the shared Market Data Layer (trend_features from
     compute_trend_features(), execution_features from
     execution_features_from_intraday_5m()) plus the live option chain —
-    never from a MasterScanner score (Principle 2.1)."""
+    never from a MasterScanner score (Principle 2.1).
+
+    `precomputed_trend`/`precomputed_execution`: 2026-07-21 — optional
+    (score, label_or_state, reasons) tuples from a caller that already
+    ran stage1_trend_engine()/stage2_execution_engine() once during
+    Stage 1/Stage 2 Qualification on these SAME trend_features/
+    execution_features (dore_fo_screener.stage1_trend_qualification()/
+    stage2_execution_qualification() now return these alongside their
+    pool dict). Passing them through here lets compute_dore() skip
+    recalculating both — see DOREInput.precomputed_* fields' docstring
+    and DORE_Performance_Audit.md Section 3b/10.3. Omit either tuple to
+    have compute_dore() compute it itself, unchanged from before.
+    """
     trend_features = trend_features or {}
     execution_features = execution_features or {}
     atm_chain_row = atm_chain_row or {}
     oi_resistance = oi_resistance or {}
 
     nearest_expiry = atm_chain_row.get("expiry") or oi_resistance.get("expiry", "")
+
+    pt_score, pt_intent, pt_reasons = precomputed_trend if precomputed_trend else (None, None, None)
+    pe_score, pe_state, pe_reasons = precomputed_execution if precomputed_execution else (None, None, None)
 
     return DOREInput(
         symbol=symbol,
@@ -1532,6 +1586,13 @@ def build_dore_input(
         nr7=execution_features.get("nr7", False),
         intraday_vol_ratio=execution_features.get("intraday_vol_ratio", 1.0),
         intraday_atr_expansion_pct=execution_features.get("intraday_atr_expansion_pct", 0.0),
+
+        precomputed_trend_score=pt_score,
+        precomputed_directional_intent=pt_intent,
+        precomputed_trend_reasons=pt_reasons,
+        precomputed_execution_score=pe_score,
+        precomputed_execution_state=pe_state,
+        precomputed_execution_reasons=pe_reasons,
 
         atm_strike=atm_chain_row.get("atm_strike", 0.0),
         ce_premium=atm_chain_row.get("ce_premium", 0.0),
@@ -1610,8 +1671,23 @@ def compute_dore(
     """
     cfg = settings or DORESettings.from_dict(DORE_DEFAULTS)
 
-    trend_score, directional_intent, trend_reasons = stage1_trend_engine(inp, cfg)
-    execution_score, execution_state, exec_reasons = stage2_execution_engine(inp, cfg, directional_intent)
+    # 2026-07-21: reuse Stage 1/Stage 2 Qualification's own probe results
+    # when the caller supplied them (see DOREInput.precomputed_* fields'
+    # docstring) instead of recalculating stage1_trend_engine()/
+    # stage2_execution_engine() on the same inputs a second time.
+    if inp.precomputed_trend_score is not None and inp.precomputed_directional_intent is not None:
+        trend_score, directional_intent, trend_reasons = (
+            inp.precomputed_trend_score, inp.precomputed_directional_intent,
+            list(inp.precomputed_trend_reasons or []))
+    else:
+        trend_score, directional_intent, trend_reasons = stage1_trend_engine(inp, cfg)
+
+    if inp.precomputed_execution_score is not None and inp.precomputed_execution_state is not None:
+        execution_score, execution_state, exec_reasons = (
+            inp.precomputed_execution_score, inp.precomputed_execution_state,
+            list(inp.precomputed_execution_reasons or []))
+    else:
+        execution_score, execution_state, exec_reasons = stage2_execution_engine(inp, cfg, directional_intent)
 
     # Stage 3 — Derivative Intelligence: reuse the OI/Premium/Momentum/
     # Corridor sub-engines (they operate on live-chain fields only, never
