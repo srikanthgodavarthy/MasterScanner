@@ -1644,6 +1644,8 @@ def _dore_debug_html(dore: dict, reasons: list, warnings: list) -> str:
         _row("Risk Hard-Gate",      "⚠ FAILED" if gate_fail else "pass"),
         _row("Opportunity Score",   f'{dore.get("opportunity_score", 0):.0f}'),
         _row("Conviction (/10)",    f'{dore.get("conviction_score_10", 0):.1f}'),
+        _row("Strike",              f'{dore.get("suggested_strike"):,.0f}'
+                                     if dore.get("suggested_strike") else "—"),
         _row("Strike Type",         dore.get("recommended_strike_type") or "—"),
         _row("Expiry",              dore.get("recommended_expiry") or "—"),
         _row("Entry / SL (Premium)", f'{plan.get("entry", 0):.1f} / {plan.get("stop_loss", 0):.1f}'
@@ -1802,6 +1804,13 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
         warnings   = dore.get("warnings") or []
         top_reason = reasons[-1] if reasons else ""   # Stage 5's own reason is appended last
         tooltip    = " · ".join(reasons)[:500].replace('"', "'")
+        strike     = dore.get("suggested_strike")
+        strike_type = dore.get("recommended_strike_type")
+        strike_html = (
+            f'<span class="mo-index-dore-strike" style="color:var(--muted);margin-left:6px;">'
+            f'{strike:,.0f}{f" {strike_type}" if strike_type else ""}</span>'
+            if strike else ""
+        )
         warn_html  = (
             f'<div class="mo-index-dore-warn">⚠ {warnings[0]}</div>' if warnings else ""
         )
@@ -1818,6 +1827,7 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
             f'<div class="mo-index-dore-row" title="{tooltip}">'
             f'<span class="mo-index-dore-badge" style="color:{color};border-color:{color}55;background:{color}14">{lbl}</span>'
             f'<span class="mo-index-dore-conf" style="color:{color}">{conf:.0f}%</span>'
+            f'{strike_html}'
             f'</div>',
             f'<div class="mo-index-dore-reason">{top_reason}</div>',
         ]
@@ -2339,7 +2349,21 @@ def _fo_opportunities_panel():
             # Older cached runs (or a plan-enrichment failure) may not have
             # every column yet — filter to what's actually present rather
             # than KeyError on a partial frame.
-            opt_df_display = opt_df[[c for c in _opt_display_cols if c in opt_df.columns]]
+            opt_df_display = opt_df[[c for c in _opt_display_cols if c in opt_df.columns]].copy()
+            # WATCH_* rows legitimately have no Strike Type/Expiry (never
+            # reach stage5b_strike_and_expiry — see compute_dore()), and
+            # rows with no open FOSetupPlan legitimately have Plan=None.
+            # Both are real None, not missing data — but st.dataframe
+            # renders a bare None as the literal text "None" rather than
+            # blank, so format explicitly instead of leaving it to pandas.
+            for _col in ("Strike Type", "Plan", "Expiry"):
+                if _col in opt_df_display.columns:
+                    opt_df_display[_col] = opt_df_display[_col].fillna("—")
+            if "Premium %Chg" in opt_df_display.columns:
+                # Numeric column — coerce to NaN (renders blank via the
+                # NumberColumn format below) rather than the object "None".
+                opt_df_display["Premium %Chg"] = pd.to_numeric(
+                    opt_df_display["Premium %Chg"], errors="coerce")
             st.dataframe(
                 opt_df_display, hide_index=True, use_container_width=True,
                 column_config={
@@ -2356,6 +2380,7 @@ def _fo_opportunities_panel():
                     "Risk Quality":          st.column_config.NumberColumn("Risk", format="%.0f"),
                     "Opportunity Score":     st.column_config.NumberColumn("Opportunity", format="%.0f"),
                     "Plan":                  st.column_config.TextColumn("Plan"),
+                    "Reason":                st.column_config.TextColumn("Reason", width="large"),
                 },
             )
             st.caption("Runs DORE 2.0's full 5-stage funnel (Trend Engine, Execution Engine, "
