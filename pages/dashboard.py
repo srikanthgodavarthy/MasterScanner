@@ -58,11 +58,7 @@ from utils.scanner_engine  import fetch_nifty
 from utils.regime_engine   import build_regime_context, regime_summary
 from utils.supabase_client import load_latest_full_scan
 from utils.sector_map      import build_sector_stats
-from utils.dore_fo_screener import (
-    top_futures_opportunities, top_options_opportunities,
-    stage0_universe, stage1_trend_qualification,
-)
-from utils.dore_engine import render_dashboard_table_html
+from utils.dore_fo_screener import top_futures_opportunities, top_options_opportunities
 
 # ── CONSTANTS ─────────────────────────────────────────────────────
 
@@ -1633,6 +1629,7 @@ def _dore_debug_html(dore: dict, reasons: list, warnings: list) -> str:
                 f'<span style="color:var(--text);font-weight:600">{value}</span></div>')
 
     gate_fail = dore.get("risk_hard_gate_pass") is False
+    premium_not_confirmed = dore.get("premium_strengthening") is False
     plan = dore.get("trade_plan") or {}
     scores_html = "".join([
         _row("Execution State",     dore.get("execution_state", "—")),
@@ -1640,6 +1637,8 @@ def _dore_debug_html(dore: dict, reasons: list, warnings: list) -> str:
         _row("Derivative Confidence", f'{dore.get("derivative_confidence", 0):.0f}'),
         _row("OI Structure",        f'{dore.get("oi_structure_score", 0):.0f}'),
         _row("Premium Quality",     f'{dore.get("premium_quality_score", 0):.0f}'),
+        _row("Premium Behavior",    ("⚠ not confirmed " if premium_not_confirmed else "✓ strengthening ")
+                                     + f'({dore.get("premium_behavior_score", 0):.0f})'),
         _row("Corridor Score",      f'{dore.get("corridor_score", 0):.0f}'),
         _row("Risk Quality",        f'{dore.get("risk_quality", 0):.0f}'),
         _row("Risk Hard-Gate",      "⚠ FAILED" if gate_fail else "pass"),
@@ -1647,7 +1646,7 @@ def _dore_debug_html(dore: dict, reasons: list, warnings: list) -> str:
         _row("Conviction (/10)",    f'{dore.get("conviction_score_10", 0):.1f}'),
         _row("Strike Type",         dore.get("recommended_strike_type") or "—"),
         _row("Expiry",              dore.get("recommended_expiry") or "—"),
-        _row("Entry / SL",          f'{plan.get("entry", 0):.1f} / {plan.get("stop_loss", 0):.1f}'
+        _row("Entry / SL (Premium)", f'{plan.get("entry", 0):.1f} / {plan.get("stop_loss", 0):.1f}'
                                      if plan else "—"),
         _row("Target 1/2/3",        f'{plan.get("target1", 0):.1f} / {plan.get("target2", 0):.1f} / '
                                      f'{plan.get("target3", 0):.1f}' if plan else "—"),
@@ -2274,39 +2273,14 @@ def _sc_counts_html(df: pd.DataFrame) -> str:
 # funnel (Universe -> Trend Qualification -> Execution Qualification ->
 # Derivative Intelligence -> Risk Engine -> Opportunity Ranking) instead
 # of ranking off the scanner's OppScore/Recommendation/T1 columns.
-# 2026-07-21: was a plain function called inline from render() — reran
-# the ENTIRE Stage 0-5 funnel (both tabs) on every Streamlit script rerun
-# of the whole Dashboard page (any widget click anywhere, not just here).
-# @st.fragment isolates it onto its own timer instead, same pattern as
-# _market_intelligence_fragment() above. 60s (vs Market Intelligence's
-# 20s) because this funnel does a ~200-250 symbol daily OHLCV batch fetch
-# (Stage 1) rather than a handful of index quotes. See
-# DORE_Performance_Audit.md Section 8 (Rank 1) / Section 10.2.
-_FO_OPP_REFRESH_SECS = 60
-
-
-@st.fragment(run_every=_FO_OPP_REFRESH_SECS)
 def _fo_opportunities_panel():
     st.markdown('<div class="ti-panel-title" style="margin-top:0.6rem;">🎯 DORE 2.0 F&amp;O OPPORTUNITY ENGINE</div>',
                 unsafe_allow_html=True)
     tab_fut, tab_opt = st.tabs(["📈 Futures", "🎯 Options"])
 
-    # 2026-07-21: Stage 1 (Trend Qualification — the most expensive stage,
-    # a ~200-250 symbol daily OHLCV fetch + Trend Engine scoring pass) run
-    # ONCE here and shared by both tabs below, instead of each tab's
-    # top_futures_opportunities()/top_options_opportunities() call
-    # independently re-deriving an identical daily_pool for the same
-    # universe/cfg/day. See DORE_Performance_Audit.md Section 3a/10.1.
-    try:
-        universe = stage0_universe()
-        shared_daily_pool = stage1_trend_qualification(universe, None)
-    except Exception:
-        logger.exception("Shared Stage 1 daily_pool computation failed (non-fatal, tabs fall back to their own)")
-        shared_daily_pool = None
-
     with tab_fut:
         try:
-            fut_df = top_futures_opportunities(daily_pool=shared_daily_pool)
+            fut_df = top_futures_opportunities()
         except Exception:
             logger.exception("Futures opportunities panel failed (non-fatal)")
             fut_df = pd.DataFrame()
@@ -2335,7 +2309,7 @@ def _fo_opportunities_panel():
 
     with tab_opt:
         try:
-            opt_df = top_options_opportunities(daily_pool=shared_daily_pool)
+            opt_df = top_options_opportunities()
         except Exception:
             logger.exception("Options opportunities panel failed (non-fatal)")
             opt_df = pd.DataFrame()
@@ -2344,22 +2318,34 @@ def _fo_opportunities_panel():
                        "checking, or every F&O candidate is currently gated to WAIT/NO_TRADE (see "
                        "the Market Intelligence index cards for why).")
         else:
-            st.markdown(
-                render_dashboard_table_html(opt_df.to_dict("records"), badge_style=_DORE_BADGE_STYLE),
-                unsafe_allow_html=True,
+            st.dataframe(
+                opt_df, hide_index=True, use_container_width=True,
+                column_config={
+                    "Entry (Premium)":       st.column_config.NumberColumn("Entry (Premium)", format="₹%.2f"),
+                    "Stop Loss":             st.column_config.NumberColumn("Stop Loss", format="₹%.2f"),
+                    "Target 1":              st.column_config.NumberColumn("Target 1", format="₹%.2f"),
+                    "Target 2":              st.column_config.NumberColumn("Target 2", format="₹%.2f"),
+                    "Target 3":              st.column_config.NumberColumn("Target 3", format="₹%.2f"),
+                    "Strike":                st.column_config.NumberColumn("Strike", format="%.0f"),
+                    "Trend Score":           st.column_config.NumberColumn("Trend", format="%.0f"),
+                    "Execution Score":       st.column_config.NumberColumn("Execution", format="%.0f"),
+                    "Derivative Confidence": st.column_config.NumberColumn("Derivatives", format="%.0f"),
+                    "Premium Behavior Score": st.column_config.NumberColumn("Premium Behavior", format="%.0f"),
+                    "Risk Quality":          st.column_config.NumberColumn("Risk", format="%.0f"),
+                    "Opportunity Score":     st.column_config.NumberColumn("Opportunity", format="%.0f"),
+                },
             )
             st.caption("Runs DORE 2.0's full 5-stage funnel (Trend Engine, Execution Engine, "
                        "Derivative Intelligence, Risk Engine, Opportunity Engine) — only rows DORE "
                        "actually recommends acting on are shown, so this list can legitimately be "
                        "empty or short on a quiet day. 'Leg' is CE or PE, composed from Directional "
-                       "Intent x Execution State, gated by the Risk Engine's hard-gate. Entry/SL/T1/T2 "
-                       "are option premium (₹), delta-scaled from the underlying TradePlan — an "
-                       "approximation, not a live quote; see PremiumPlan's docstring in "
-                       "utils/dore_engine.py. 'Premium %Chg' is the live premium's own day change "
-                       "vs prior close. Once a row fires a genuine BUY_* recommendation, its "
-                       "Entry/SL/T1/T2 lock (🔒 badge in 'Plan') and stop drifting on later refreshes "
-                       "— see utils/fo_setup_persistence.py; Premium/Premium %Chg stay live regardless. "
-                       "This is a screener, not an order ticket — confirm liquidity (bid/ask) before acting.")
+                       "Intent x Execution State, gated by the Risk Engine's hard-gate. 2026-07-21: "
+                       "BUY_CE_NOW/BUY_PE_NOW additionally require Premium Behavior to show the option "
+                       "premium itself strengthening (not just the underlying trend) — a setup where "
+                       "the underlying is ready but the premium hasn't turned yet shows as WATCH_CE/"
+                       "WATCH_PE instead. Entry/Stop/Targets are in PREMIUM rupees (the instrument you "
+                       "actually trade), not the underlying's price. This is a screener, not an order "
+                       "ticket — confirm liquidity (bid/ask) before acting.")
 
 
 # st.fragment(run_every=...) reruns ONLY this function on its own timer,
@@ -2530,6 +2516,7 @@ def _market_intelligence_fragment():
         from utils.dore_fo_screener import execution_features_from_intraday_5m
         from utils.scanner_engine import fetch_nifty_ohlcv, fetch_sensex_ohlcv, fetch_banknifty_ohlcv
         from utils.upstox_client import fetch_index_intraday_5m_upstox
+        from utils.oi_snapshot_store import record_and_diff_premium
 
         _dore_cfg = DORESettings.from_dict(st.session_state.get("dore_settings", {}))
 
@@ -2539,8 +2526,16 @@ def _market_intelligence_fragment():
                 exec_features = execution_features_from_intraday_5m(intraday_5m, _dore_cfg)
                 ce_chg, pe_chg = ce_pe_chg
                 oi = st.session_state.get(oi_key, {}) or {}
+                ce_premium = oi.get("ce_premium", 0.0)
+                pe_premium = oi.get("pe_premium", 0.0)
+                # Premium Behaviour pillar (Stage 3) — tick-to-tick history,
+                # same mechanism the F&O funnel uses (utils.dore_fo_screener).
+                ce_prem_prev, ce_prem_prev2, pe_prem_prev, pe_prem_prev2 = record_and_diff_premium(
+                    index_key, ce_premium, pe_premium)
                 atm_chain_row = {
-                    "ce_premium": oi.get("ce_premium", 0.0), "pe_premium": oi.get("pe_premium", 0.0),
+                    "ce_premium": ce_premium, "pe_premium": pe_premium,
+                    "ce_premium_prev": ce_prem_prev, "ce_premium_prev2": ce_prem_prev2,
+                    "pe_premium_prev": pe_prem_prev, "pe_premium_prev2": pe_prem_prev2,
                     "ce_oi": oi.get("ce_oi", 0.0), "pe_oi": oi.get("pe_oi", 0.0),
                     "ce_oi_change": ce_chg, "pe_oi_change": pe_chg,
                     "pcr": oi.get("pcr", 1.0), "expiry": oi.get("expiry", ""),
