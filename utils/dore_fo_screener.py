@@ -72,6 +72,31 @@ def stage0_universe() -> list[str]:
 #  STAGE 1 — TREND QUALIFICATION -> Daily Candidate Pool
 # ══════════════════════════════════════════════════════════════════
 
+# Coarse action tier for a DORE recommendation string — collapses the
+# 11 granular Recommendation values (BUY_CE_NOW, BUY_PE_BREAKDOWN,
+# WATCH_CE, HOLD_PE, ...) into buckets that answer "can I act on this
+# right now" without the caller decoding the strings themselves. Kept
+# as plain data here (label only) — dashboard.py owns the color.
+_ACTION_TIER = {
+    "BUY_CE_NOW":        "Buy Now",
+    "BUY_PE_NOW":        "Buy Now",
+    "BUY_CE_BREAKOUT":   "Wait for Trigger",
+    "BUY_PE_BREAKDOWN":  "Wait for Trigger",
+    "WATCH_CE":          "Watch Only",
+    "WATCH_PE":          "Watch Only",
+    "HOLD_CE":           "Hold",
+    "HOLD_PE":           "Hold",
+    "BOOK_CE_PROFITS":   "Book Profits",
+    "BOOK_PE_PROFITS":   "Book Profits",
+    "WAIT":              "Wait",
+    "NO_TRADE":          "No Trade",
+}
+
+
+def _action_tier(recommendation: str) -> str:
+    return _ACTION_TIER.get(recommendation, "Wait")
+
+
 def stage1_trend_qualification(
     symbols: list[str], cfg: Optional[DORESettings] = None,
     period: str = "6mo", progress_cb=None,
@@ -356,6 +381,7 @@ def compute_fo_opportunities(
 
         rows.append({
             "Symbol": symbol,
+            "Action": _action_tier(result.recommendation),
             "Recommendation": result.recommendation,
             "Leg": leg,
             "Strike": result.suggested_strike,
