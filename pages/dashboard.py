@@ -1651,16 +1651,13 @@ def _dore_debug_html(dore: dict, reasons: list, warnings: list) -> str:
         _row("Target 1/2/3",        f'{plan.get("target1", 0):.1f} / {plan.get("target2", 0):.1f} / '
                                      f'{plan.get("target3", 0):.1f}' if plan else "—"),
     ])
-    const_html = ""
     reasons_html  = "".join(f'<li style="margin-bottom:2px">{r}</li>' for r in reasons) or "<li>—</li>"
     warnings_html = "".join(f'<li style="margin-bottom:2px">{w}</li>' for w in warnings) or "<li>—</li>"
 
-    return f"""
-  <details style="margin-top:8px;font-size:11px;">
+    return f"""  <details style="margin-top:8px;font-size:11px;">
     <summary style="cursor:pointer;color:var(--muted);user-select:none;">🔬 DORE debug</summary>
     <div style="margin-top:6px;padding:8px;background:rgba(255,255,255,0.03);border-radius:6px;">
       {scores_html}
-      {const_html}
       <div style="margin-top:8px;color:var(--muted);font-weight:600;">Reasons</div>
       <ul style="margin:4px 0 0 16px;padding:0;color:var(--text);">{reasons_html}</ul>
       <div style="margin-top:8px;color:var(--muted);font-weight:600;">Warnings</div>
@@ -1808,32 +1805,47 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
         warn_html  = (
             f'<div class="mo-index-dore-warn">⚠ {warnings[0]}</div>' if warnings else ""
         )
-        dore_html = f"""
-  <div class="mo-index-dore-row" title="{tooltip}">
-    <span class="mo-index-dore-badge" style="color:{color};border-color:{color}55;background:{color}14">{lbl}</span>
-    <span class="mo-index-dore-conf" style="color:{color}">{conf:.0f}%</span>
-  </div>
-  <div class="mo-index-dore-reason">{top_reason}</div>
-  {warn_html}
-  {_dore_debug_html(dore, reasons, warnings)}"""
+        # Built via list+join rather than an f-string with {warn_html} on
+        # its own line: when there are no warnings, warn_html is "" and an
+        # interpolated-empty line like "  \n" is a whitespace-only line —
+        # CommonMark treats that as blank, which terminates the raw-HTML
+        # block Streamlit's markdown parser opened at the top-level
+        # <div class="mo-index-card"> and makes everything after it
+        # (including sibling cards, since all three share one st.markdown
+        # call) fall back to indented-code-block parsing and render as
+        # literal escaped tags instead of HTML.
+        dore_html_parts = [
+            f'<div class="mo-index-dore-row" title="{tooltip}">'
+            f'<span class="mo-index-dore-badge" style="color:{color};border-color:{color}55;background:{color}14">{lbl}</span>'
+            f'<span class="mo-index-dore-conf" style="color:{color}">{conf:.0f}%</span>'
+            f'</div>',
+            f'<div class="mo-index-dore-reason">{top_reason}</div>',
+        ]
+        if warn_html:
+            dore_html_parts.append(warn_html)
+        dore_html_parts.append(_dore_debug_html(dore, reasons, warnings))
+        dore_html = "\n".join(dore_html_parts)
 
-    return f"""
-<div class="mo-index-card">
-  {ema_row_html}
-  <div class="mo-index-label"><span>{label}</span>{badge_html}{bias_html}</div>
-  <div class="mo-index-row">
-    <div>
-      <div class="mo-index-price">{price_str}</div>
-      <div class="mo-index-chg">{chg_html}</div>
-    </div>
-    {spark_svg}
-  </div>
-  <div class="mo-index-ohlc-row">{ohlc_html}</div>
-  <div class="mo-index-oi-row">{oi_html}</div>
-  <div class="mo-index-expiry">{expiry_html}</div>
-  {dore_html}
-</div>
-"""
+    card_parts = [
+        '<div class="mo-index-card">',
+    ]
+    if ema_row_html:
+        card_parts.append(ema_row_html)
+    card_parts.append(f'<div class="mo-index-label"><span>{label}</span>{badge_html}{bias_html}</div>')
+    card_parts.append(
+        f'<div class="mo-index-row">'
+        f'<div><div class="mo-index-price">{price_str}</div>'
+        f'<div class="mo-index-chg">{chg_html}</div></div>'
+        f'{spark_svg}'
+        f'</div>'
+    )
+    card_parts.append(f'<div class="mo-index-ohlc-row">{ohlc_html}</div>')
+    card_parts.append(f'<div class="mo-index-oi-row">{oi_html}</div>')
+    card_parts.append(f'<div class="mo-index-expiry">{expiry_html}</div>')
+    if dore_html:
+        card_parts.append(dore_html)
+    card_parts.append('</div>')
+    return "\n".join(card_parts)
 
 
 def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
