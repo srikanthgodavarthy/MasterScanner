@@ -1654,6 +1654,10 @@ def _dore_debug_html(dore: dict, reasons: list, warnings: list) -> str:
         _row("Premium Behavior",    ("⚠ not confirmed " if premium_not_confirmed else "✓ strengthening ")
                                      + f'({dore.get("premium_behavior_score", 0):.0f})'),
         _row("Corridor Score",      f'{dore.get("corridor_score", 0):.0f}'),
+        _row("Option Intelligence", f'{dore.get("option_intelligence_score", 0):.0f} '
+                                     f'({dore.get("option_valuation_status", "UNKNOWN")})'),
+        _row("Expected Move Coverage", (f'{dore.get("expected_move_coverage"):.2f}'
+                                        if dore.get("expected_move_coverage") is not None else "—")),
         _row("Risk Quality",        f'{dore.get("risk_quality", 0):.0f}'),
         _row("Risk Hard-Gate",      "⚠ FAILED" if gate_fail else "pass"),
         _row("Opportunity Score",   f'{dore.get("opportunity_score", 0):.0f}'),
