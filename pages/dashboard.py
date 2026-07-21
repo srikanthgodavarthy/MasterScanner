@@ -96,6 +96,20 @@ _DORE_BADGE_STYLE = {
     "NO_TRADE":         ("#484f58", "⚫ NO TRADE"),
 }
 
+# Action-tier coloring for the Options tab table (utils.dore_fo_screener.
+# _action_tier's label set) — same color logic as _DORE_BADGE_STYLE above,
+# collapsed to the 7 coarse buckets so the whole row can be tinted by
+# "can I act on this right now" rather than the specific CE/PE recommendation.
+_ACTION_TIER_STYLE = {
+    "Buy Now":          ("#3fb950", "🟢"),
+    "Wait for Trigger":  ("#58a6ff", "🔵"),
+    "Watch Only":        ("#a371f7", "🟣"),
+    "Hold":               ("#d29922", "🟡"),
+    "Book Profits":       ("#f85149", "🔴"),
+    "Wait":                ("#8b949e", "⚪"),
+    "No Trade":            ("#484f58", "⚫"),
+}
+
 _CAT_ORDER = [
     "Elite Opportunity", "High Conviction",
     "Setup Building", "Leader", "Extended", "Avoid",
@@ -2295,6 +2309,92 @@ def _sc_counts_html(df: pd.DataFrame) -> str:
 # funnel (Universe -> Trend Qualification -> Execution Qualification ->
 # Derivative Intelligence -> Risk Engine -> Opportunity Ranking) instead
 # of ranking off the scanner's OppScore/Recommendation/T1 columns.
+def _options_table_html(df: pd.DataFrame) -> str:
+    """Render the Options-tab opportunity table as a colored HTML table
+    instead of st.dataframe — st.dataframe's column_config can format
+    numbers/text but can't tint a cell/row by value, and the whole point
+    of the Action column is 'can I act on this at a glance', which needs
+    color. Each row is tinted by Action tier (see _ACTION_TIER_STYLE);
+    Recommendation/Leg/Directional Intent get their own cell coloring on
+    top of that so CE vs PE and BULLISH vs BEARISH stay visually obvious
+    even for a colorblind-unfriendly tier color.
+    """
+    def _fmt_money(v):
+        return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
+
+    def _fmt_num(v, decimals=0):
+        return f"{v:,.{decimals}f}" if v not in (None, "") and pd.notna(v) else "—"
+
+    def _fmt_pct(v):
+        if v in (None, "") or pd.isna(v):
+            return "—"
+        color = "#3fb950" if v >= 0 else "#f85149"
+        return f'<span style="color:{color}">{"+" if v >= 0 else ""}{v:.2f}%</span>'
+
+    def _fmt_text(v):
+        return v if v not in (None, "") and pd.notna(v) else "—"
+
+    headers = ["Symbol", "Action", "Recommendation", "Leg", "Strike", "Premium", "Premium %Chg",
+               "Directional Intent", "Strike Type", "Execution State", "Trend", "Execution",
+               "Derivatives", "Risk", "Opportunity", "Entry", "SL", "T1", "T2", "Plan", "Expiry", "Reason"]
+
+    rows_html = []
+    for _, r in df.iterrows():
+        tier = r.get("Action", "Wait")
+        tier_color, tier_dot = _ACTION_TIER_STYLE.get(tier, ("#8b949e", "⚪"))
+        rec = r.get("Recommendation", "")
+        rec_color, _ = _DORE_BADGE_STYLE.get(rec, ("#8b949e", rec))
+        leg = r.get("Leg", "")
+        leg_color = "#3fb950" if leg == "CE" else "#f85149" if leg == "PE" else "#8b949e"
+        intent = r.get("Directional Intent", "")
+        intent_color = "#3fb950" if intent == "BULLISH" else "#f85149" if intent == "BEARISH" else "#8b949e"
+
+        cells = [
+            f'<td style="font-weight:700;color:var(--text)">{r.get("Symbol", "—")}</td>',
+            f'<td><span style="color:{tier_color};font-weight:700;white-space:nowrap;">{tier_dot} {tier}</span></td>',
+            f'<td style="color:{rec_color};font-weight:600;white-space:nowrap;">{rec}</td>',
+            f'<td style="color:{leg_color};font-weight:700;">{_fmt_text(leg)}</td>',
+            f'<td>{_fmt_num(r.get("Strike"))}</td>',
+            f'<td>{_fmt_money(r.get("Premium"))}</td>',
+            f'<td>{_fmt_pct(r.get("Premium %Chg"))}</td>',
+            f'<td style="color:{intent_color};font-weight:600;">{_fmt_text(intent)}</td>',
+            f'<td>{_fmt_text(r.get("Strike Type"))}</td>',
+            f'<td>{_fmt_text(r.get("Execution State"))}</td>',
+            f'<td>{_fmt_num(r.get("Trend Score"))}</td>',
+            f'<td>{_fmt_num(r.get("Execution Score"))}</td>',
+            f'<td>{_fmt_num(r.get("Derivative Confidence"))}</td>',
+            f'<td>{_fmt_num(r.get("Risk Quality"))}</td>',
+            f'<td style="font-weight:700;">{_fmt_num(r.get("Opportunity Score"))}</td>',
+            f'<td>{_fmt_money(r.get("Entry"))}</td>',
+            f'<td>{_fmt_money(r.get("SL"))}</td>',
+            f'<td>{_fmt_money(r.get("T1"))}</td>',
+            f'<td>{_fmt_money(r.get("T2"))}</td>',
+            f'<td>{_fmt_text(r.get("Plan"))}</td>',
+            f'<td>{_fmt_text(r.get("Expiry"))}</td>',
+            f'<td style="color:var(--muted);font-size:11px;max-width:260px;">{_fmt_text(r.get("Reason"))}</td>',
+        ]
+        rows_html.append(
+            f'<tr style="background:{tier_color}14;border-left:3px solid {tier_color};">'
+            + "".join(cells) + "</tr>"
+        )
+
+    header_html = "".join(
+        f'<th style="text-align:left;padding:6px 10px;color:var(--muted);'
+        f'font-size:11px;text-transform:uppercase;white-space:nowrap;">{h}</th>'
+        for h in headers
+    )
+    return (
+        '<div style="overflow-x:auto;">'
+        '<table style="width:100%;border-collapse:collapse;font-size:13px;">'
+        f'<thead><tr>{header_html}</tr></thead>'
+        f'<tbody>{"".join(rows_html)}</tbody>'
+        '</table></div>'
+        '<style>'
+        'table td{padding:6px 10px;color:var(--text);border-bottom:1px solid rgba(255,255,255,0.05);white-space:nowrap;}'
+        '</style>'
+    )
+
+
 def _fo_opportunities_panel():
     st.markdown('<div class="ti-panel-title" style="margin-top:0.6rem;">🎯 DORE 2.0 F&amp;O OPPORTUNITY ENGINE</div>',
                 unsafe_allow_html=True)
@@ -2341,7 +2441,7 @@ def _fo_opportunities_panel():
                        "the Market Intelligence index cards for why).")
         else:
             _opt_display_cols = [
-                "Symbol", "Recommendation", "Leg", "Strike", "Premium", "Premium %Chg",
+                "Symbol", "Action", "Recommendation", "Leg", "Strike", "Premium", "Premium %Chg",
                 "Directional Intent", "Strike Type", "Execution State",
                 "Trend Score", "Execution Score", "Derivative Confidence", "Risk Quality",
                 "Opportunity Score", "Entry", "SL", "T1", "T2", "Plan", "Expiry", "Reason",
@@ -2350,50 +2450,27 @@ def _fo_opportunities_panel():
             # every column yet — filter to what's actually present rather
             # than KeyError on a partial frame.
             opt_df_display = opt_df[[c for c in _opt_display_cols if c in opt_df.columns]].copy()
-            # WATCH_* rows legitimately have no Strike Type/Expiry (never
-            # reach stage5b_strike_and_expiry — see compute_dore()), and
-            # rows with no open FOSetupPlan legitimately have Plan=None.
-            # Both are real None, not missing data — but st.dataframe
-            # renders a bare None as the literal text "None" rather than
-            # blank, so format explicitly instead of leaving it to pandas.
-            for _col in ("Strike Type", "Plan", "Expiry"):
-                if _col in opt_df_display.columns:
-                    opt_df_display[_col] = opt_df_display[_col].fillna("—")
+            if "Action" not in opt_df_display.columns:
+                # Back-compat: a cached df from before the Action column
+                # existed. Derive it inline rather than failing the panel.
+                from utils.dore_fo_screener import _action_tier
+                opt_df_display["Action"] = opt_df_display["Recommendation"].map(_action_tier)
             if "Premium %Chg" in opt_df_display.columns:
-                # Numeric column — coerce to NaN (renders blank via the
-                # NumberColumn format below) rather than the object "None".
                 opt_df_display["Premium %Chg"] = pd.to_numeric(
                     opt_df_display["Premium %Chg"], errors="coerce")
-            st.dataframe(
-                opt_df_display, hide_index=True, use_container_width=True,
-                column_config={
-                    "Strike":                st.column_config.NumberColumn("Strike", format="%.0f"),
-                    "Premium":               st.column_config.NumberColumn("Premium", format="₹%.2f"),
-                    "Premium %Chg":          st.column_config.NumberColumn("Premium %Chg", format="%.2f%%"),
-                    "Entry":                 st.column_config.NumberColumn("Entry", format="₹%.2f"),
-                    "SL":                    st.column_config.NumberColumn("SL", format="₹%.2f"),
-                    "T1":                    st.column_config.NumberColumn("T1", format="₹%.2f"),
-                    "T2":                    st.column_config.NumberColumn("T2", format="₹%.2f"),
-                    "Trend Score":           st.column_config.NumberColumn("Trend", format="%.0f"),
-                    "Execution Score":       st.column_config.NumberColumn("Execution", format="%.0f"),
-                    "Derivative Confidence": st.column_config.NumberColumn("Derivatives", format="%.0f"),
-                    "Risk Quality":          st.column_config.NumberColumn("Risk", format="%.0f"),
-                    "Opportunity Score":     st.column_config.NumberColumn("Opportunity", format="%.0f"),
-                    "Plan":                  st.column_config.TextColumn("Plan"),
-                    "Reason":                st.column_config.TextColumn("Reason", width="large"),
-                },
-            )
-            st.caption("Runs DORE 2.0's full 5-stage funnel (Trend Engine, Execution Engine, "
-                       "Derivative Intelligence, Risk Engine, Opportunity Engine) — only rows DORE "
-                       "actually recommends acting on are shown, so this list can legitimately be "
-                       "empty or short on a quiet day. 'Leg' is CE or PE, composed from Directional "
-                       "Intent x Execution State, gated by the Risk Engine's hard-gate. 2026-07-21: "
-                       "BUY_CE_NOW/BUY_PE_NOW additionally require Premium Behavior to show the option "
-                       "premium itself strengthening (not just the underlying trend) — a setup where "
-                       "the underlying is ready but the premium hasn't turned yet shows as WATCH_CE/"
-                       "WATCH_PE instead. Entry/Stop/Targets are in PREMIUM rupees (the instrument you "
-                       "actually trade), not the underlying's price. This is a screener, not an order "
-                       "ticket — confirm liquidity (bid/ask) before acting.")
+            st.markdown(_options_table_html(opt_df_display), unsafe_allow_html=True)
+            st.caption("🟢 Buy Now = DORE says enter immediately · 🔵 Wait for Trigger = levels are "
+                       "locked but price hasn't confirmed yet (BREAKOUT_PENDING) · 🟣 Watch Only = "
+                       "setup exists, not confirmed to enter · Row tint follows the Action column, "
+                       "not Recommendation directly.")
+            st.caption("Runs DORE 2.0's full 5-stage funnel — only rows DORE actually recommends "
+                       "acting on are shown, so this list can legitimately be empty or short on a "
+                       "quiet day. 2026-07-21: BUY_CE_NOW/BUY_PE_NOW additionally require Premium "
+                       "Behavior to show the option premium itself strengthening — a setup where the "
+                       "underlying is ready but the premium hasn't turned yet shows as WATCH_CE/WATCH_PE "
+                       "(Action: Watch Only) instead. Entry/Stop/Targets are in PREMIUM rupees, not the "
+                       "underlying's price. This is a screener, not an order ticket — confirm liquidity "
+                       "(bid/ask) before acting.")
 
 
 # st.fragment(run_every=...) reruns ONLY this function on its own timer,
