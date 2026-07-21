@@ -2327,8 +2327,11 @@ def _fo_opportunities_panel():
                        "Intent x Execution State, gated by the Risk Engine's hard-gate. Entry/SL/T1/T2 "
                        "are option premium (₹), delta-scaled from the underlying TradePlan — an "
                        "approximation, not a live quote; see PremiumPlan's docstring in "
-                       "utils/dore_engine.py. This is a screener, not an order ticket — confirm "
-                       "liquidity (bid/ask) before acting.")
+                       "utils/dore_engine.py. 'Premium %Chg' is the live premium's own day change "
+                       "vs prior close. Once a row fires a genuine BUY_* recommendation, its "
+                       "Entry/SL/T1/T2 lock (🔒 badge in 'Plan') and stop drifting on later refreshes "
+                       "— see utils/fo_setup_persistence.py; Premium/Premium %Chg stay live regardless. "
+                       "This is a screener, not an order ticket — confirm liquidity (bid/ask) before acting.")
 
 
 # st.fragment(run_every=...) reruns ONLY this function on its own timer,
