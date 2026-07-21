@@ -2330,21 +2330,32 @@ def _fo_opportunities_panel():
                        "checking, or every F&O candidate is currently gated to WAIT/NO_TRADE (see "
                        "the Market Intelligence index cards for why).")
         else:
+            _opt_display_cols = [
+                "Symbol", "Recommendation", "Leg", "Strike", "Premium", "Premium %Chg",
+                "Directional Intent", "Strike Type", "Execution State",
+                "Trend Score", "Execution Score", "Derivative Confidence", "Risk Quality",
+                "Opportunity Score", "Entry", "SL", "T1", "T2", "Plan", "Expiry", "Reason",
+            ]
+            # Older cached runs (or a plan-enrichment failure) may not have
+            # every column yet — filter to what's actually present rather
+            # than KeyError on a partial frame.
+            opt_df_display = opt_df[[c for c in _opt_display_cols if c in opt_df.columns]]
             st.dataframe(
-                opt_df, hide_index=True, use_container_width=True,
+                opt_df_display, hide_index=True, use_container_width=True,
                 column_config={
-                    "Entry (Premium)":       st.column_config.NumberColumn("Entry (Premium)", format="₹%.2f"),
-                    "Stop Loss":             st.column_config.NumberColumn("Stop Loss", format="₹%.2f"),
-                    "Target 1":              st.column_config.NumberColumn("Target 1", format="₹%.2f"),
-                    "Target 2":              st.column_config.NumberColumn("Target 2", format="₹%.2f"),
-                    "Target 3":              st.column_config.NumberColumn("Target 3", format="₹%.2f"),
                     "Strike":                st.column_config.NumberColumn("Strike", format="%.0f"),
+                    "Premium":               st.column_config.NumberColumn("Premium", format="₹%.2f"),
+                    "Premium %Chg":          st.column_config.NumberColumn("Premium %Chg", format="%.2f%%"),
+                    "Entry":                 st.column_config.NumberColumn("Entry", format="₹%.2f"),
+                    "SL":                    st.column_config.NumberColumn("SL", format="₹%.2f"),
+                    "T1":                    st.column_config.NumberColumn("T1", format="₹%.2f"),
+                    "T2":                    st.column_config.NumberColumn("T2", format="₹%.2f"),
                     "Trend Score":           st.column_config.NumberColumn("Trend", format="%.0f"),
                     "Execution Score":       st.column_config.NumberColumn("Execution", format="%.0f"),
                     "Derivative Confidence": st.column_config.NumberColumn("Derivatives", format="%.0f"),
-                    "Premium Behavior Score": st.column_config.NumberColumn("Premium Behavior", format="%.0f"),
                     "Risk Quality":          st.column_config.NumberColumn("Risk", format="%.0f"),
                     "Opportunity Score":     st.column_config.NumberColumn("Opportunity", format="%.0f"),
+                    "Plan":                  st.column_config.TextColumn("Plan"),
                 },
             )
             st.caption("Runs DORE 2.0's full 5-stage funnel (Trend Engine, Execution Engine, "
