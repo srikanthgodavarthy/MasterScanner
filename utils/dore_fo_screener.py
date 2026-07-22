@@ -90,6 +90,50 @@ def _load_position_sizing_inputs() -> tuple[float, dict, list[ExistingPosition]]
         return 0.0, {"STOCK": 1, "NIFTY": 1, "BANKNIFTY": 1, "SENSEX": 1}, []
 
 
+def _persist_reversal_alert(symbol: str, result) -> None:
+    """Latches the Intraday Reversal Alert for the rest of TODAY's
+    session once it fires, so a move that reverses back before close
+    doesn't make the alert vanish as if it never happened.
+
+    compute_dore()/check_intraday_reversal_alert() themselves stay pure
+    and stateless (same reasoning as _load_position_sizing_inputs()
+    above — no Streamlit dependency inside utils.dore_engine, so it
+    stays trivially testable/backtest-safe). This wrapper is the ONLY
+    place that persists it, keyed per symbol per calendar date so it
+    clears naturally at the next session — no manual reset needed.
+
+    Fails soft: outside a Streamlit runtime (e.g. a backtest or a
+    script), leaves `result` exactly as compute_dore() returned it —
+    the transient, this-poll-only read.
+    """
+    try:
+        import streamlit as st
+        from datetime import date
+
+        key = f"_reversal_alert_peak:{symbol}:{date.today().isoformat()}"
+        cache = st.session_state.setdefault(
+            key, {"triggered": False, "peak_abs_move_pct": 0.0, "reason": ""})
+
+        if result.intraday_reversal_alert and abs(result.intraday_reversal_move_pct) >= cache["peak_abs_move_pct"]:
+            cache["triggered"] = True
+            cache["peak_abs_move_pct"] = abs(result.intraday_reversal_move_pct)
+            cache["reason"] = result.intraday_reversal_reason
+
+        if cache["triggered"]:
+            result.intraday_reversal_alert = True
+            if not result.intraday_reversal_reason:
+                # This poll's own read didn't trigger (price moved back
+                # within range) — surface the earlier trigger instead of
+                # silently dropping it, and add the warning line ourselves
+                # since compute_dore() only adds it on a triggering poll.
+                result.intraday_reversal_reason = (
+                    f"Earlier today: {cache['reason']} (currently back within range)")
+                result.warnings.append(f"⚠ Intraday Reversal Alert — {result.intraday_reversal_reason}")
+    except Exception:
+        logger.exception("reversal-alert persistence failed (non-fatal) — using transient per-poll read for %s",
+                          symbol)
+
+
 # ══════════════════════════════════════════════════════════════════
 #  STAGE 0 — UNIVERSE
 # ══════════════════════════════════════════════════════════════════
@@ -212,6 +256,10 @@ def execution_features_from_intraday_5m(df: pd.DataFrame, cfg: DORESettings) -> 
     """Derive Stage 2's raw execution indicators from a 5-minute
     intraday OHLCV DataFrame (oldest-first): EMA9/21 interaction,
     VWAP, opening range, compression/NR7, volume & ATR expansion.
+    Also derives day_open/prev_close from the same df's calendar-date
+    grouping — these feed ONLY the Intraday Reversal Alert (a same-day
+    check that sits alongside Stage 1, not inside it); no Stage 2 score
+    reads them.
     """
     if df is None or len(df) < 10:
         return {}
@@ -254,6 +302,23 @@ def execution_features_from_intraday_5m(df: pd.DataFrame, cfg: DORESettings) -> 
         avg_range = lookback.mean() if len(lookback) else recent_range
         intraday_atr_expansion_pct = float((recent_range - avg_range) / avg_range * 100.0) if avg_range else 0.0
 
+        # day_open/prev_close: derived from the SAME df's calendar-date
+        # grouping, not a separate API call. The df is warm-up history +
+        # today's session stitched together (see _fetch_intraday_5m_by_key),
+        # so the last date group is today and the one before it is the
+        # prior session — exactly what the Intraday Reversal Alert needs.
+        day_open, prev_close = 0.0, 0.0
+        try:
+            session_dates = df.index.normalize().unique()
+            if len(session_dates) >= 1:
+                today_key = session_dates[-1]
+                day_open = float(df.loc[df.index.normalize() == today_key, "open"].iloc[0])
+            if len(session_dates) >= 2:
+                prior_key = session_dates[-2]
+                prev_close = float(df.loc[df.index.normalize() == prior_key, "close"].iloc[-1])
+        except Exception:
+            logger.exception("day_open/prev_close derivation failed — Intraday Reversal Alert will skip")
+
         return {
             "fresh_crossover": bool(fresh_crossover),
             "fresh_crossunder": bool(fresh_crossunder),
@@ -266,6 +331,8 @@ def execution_features_from_intraday_5m(df: pd.DataFrame, cfg: DORESettings) -> 
             "nr7": nr7,
             "intraday_vol_ratio": intraday_vol_ratio,
             "intraday_atr_expansion_pct": intraday_atr_expansion_pct,
+            "day_open": day_open,
+            "prev_close": prev_close,
         }
     except Exception:
         logger.exception("execution feature extraction failed")
@@ -315,6 +382,8 @@ def stage2_execution_qualification(
             nr7=exec_features.get("nr7", False),
             intraday_vol_ratio=exec_features.get("intraday_vol_ratio", 1.0),
             intraday_atr_expansion_pct=exec_features.get("intraday_atr_expansion_pct", 0.0),
+            day_open=exec_features.get("day_open", 0.0),
+            prev_close=exec_features.get("prev_close", 0.0),
         )
         try:
             execution = stage2_execution_engine(probe, cfg, row["directional_intent"])
@@ -429,6 +498,7 @@ def compute_fo_opportunities(
             atm_chain_row=atm_chain_row, oi_resistance=oi_resistance_like,
         )
         result = compute_dore(dore_input, cfg)
+        _persist_reversal_alert(symbol, result)
 
         # Live premium + tick-to-tick %Chg for the LEG DORE actually
         # recommends — read off the ce/pe premium + ce/pe premium_prev
