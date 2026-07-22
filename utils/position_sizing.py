@@ -283,6 +283,7 @@ def size_position(
 def build_portfolio_context(
     available_capital: float,
     lot_size: int,
+    candidate_symbol: Optional[str] = None,
     candidate_sector: Optional[str] = None,
     risk_used_today_pct: float = 0.0,
     sector_map: Optional[dict] = None,
@@ -291,14 +292,31 @@ def build_portfolio_context(
     and maps them into ExistingPosition rows. Isolated here so
     size_position() itself stays a pure function with zero I/O.
 
-    portfolio_positions currently has no `sector` or `initial_risk`
-    column (see utils/supabase_client.py add_to_portfolio()) — sector is
-    resolved from the optional sector_map (symbol -> sector) if given,
-    and capital_at_risk falls back to 0 when initial_stop is missing, so
-    the sector-exposure and risk-budget gates degrade to "no data, don't
-    block" rather than silently skipping positions.
+    portfolio_positions has no `sector` or `initial_risk` column (see
+    utils/supabase_client.py add_to_portfolio()), and per the design
+    decision to leave that schema untouched, this does not add one.
+    Instead:
+
+    - Sector is resolved via utils.sector_map.get_sector() (the same
+      static NSE symbol->sector table the Sector Heatmap / Leadership
+      Rotation panels already use) rather than a new stored column.
+      Pass an explicit sector_map to override it (e.g. in tests); it is
+      a fallback source, not a disabled-by-default state — the
+      sector-exposure gate is meant to actually bind by default.
+    - candidate_sector, if not passed explicitly, is resolved the same
+      way from candidate_symbol.
+    - capital_at_risk still falls back to 0 when initial_stop is missing
+      on a row (real schema gap — that field is optional today), so the
+      risk-budget gate degrades to "no data for this position" rather
+      than blocking on a guess.
     """
     from utils.supabase_client import load_portfolio  # local import: keep this the only I/O entry point
+    from utils.sector_map import get_sector
+
+    def _sector_for(sym: str) -> Optional[str]:
+        if sector_map is not None:
+            return sector_map.get(sym)
+        return get_sector(sym)
 
     df = load_portfolio(status="OPEN")
     positions: list[ExistingPosition] = []
@@ -313,16 +331,20 @@ def build_portfolio_context(
         positions.append(
             ExistingPosition(
                 symbol=symbol,
-                sector=(sector_map or {}).get(symbol),
+                sector=_sector_for(symbol),
                 capital_deployed=entry_price * qty,
                 capital_at_risk=capital_at_risk,
             )
         )
 
+    resolved_candidate_sector = candidate_sector
+    if resolved_candidate_sector is None and candidate_symbol:
+        resolved_candidate_sector = _sector_for(str(candidate_symbol).upper().strip())
+
     return PortfolioContext(
         available_capital=available_capital,
         existing_positions=positions,
         lot_size=lot_size,
-        sector=candidate_sector,
+        sector=resolved_candidate_sector,
         risk_used_today_pct=risk_used_today_pct,
     )
