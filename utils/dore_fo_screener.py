@@ -239,23 +239,22 @@ def stage2_execution_qualification(
     "execution_state", "execution_features"}}. Expected survivors: 15-25.
     """
     cfg = _load_settings(cfg)
-    from utils.upstox_client import fetch_stock_intraday_5m_upstox, fetch_index_intraday_5m_upstox
+    from utils.upstox_client import fetch_batch_intraday_5m_upstox
 
     pool: dict = {}
     symbols = list(daily_pool.keys())
-    done = 0
-    for symbol in symbols:
-        try:
-            df = (fetch_index_intraday_5m_upstox(symbol) if symbol in _INDICES
-                  else fetch_stock_intraday_5m_upstox(symbol))
-        except Exception:
-            logger.exception("[DORE Stage2] intraday fetch failed for %s", symbol)
-            df = None
-        finally:
-            done += 1
-            if progress_cb:
-                progress_cb(done, len(symbols))
 
+    # 2026-07-22: was fetching one symbol at a time in a sequential
+    # for-loop (~50-70 symbols * one HTTP round-trip each). Switched to
+    # the concurrent batch fetcher that already existed in
+    # utils.upstox_client for exactly this — see its docstring. This is
+    # the single biggest contributor to the "5 minutes on first round"
+    # options-screener latency: everything downstream of this call
+    # (Stage 3's option-chain fetch) was already blocked waiting on it.
+    intraday_dfs = fetch_batch_intraday_5m_upstox(symbols, progress_cb=progress_cb)
+
+    for symbol in symbols:
+        df = intraday_dfs.get(symbol)
         exec_features = execution_features_from_intraday_5m(df, cfg)
         row = daily_pool[symbol]
         probe = DOREInput(
@@ -303,7 +302,7 @@ _ACTIONABLE = {
 
 
 def compute_fo_opportunities(
-    live_pool: dict, cfg: Optional[DORESettings] = None,
+    live_pool: dict, cfg: Optional[DORESettings] = None, progress_cb=None,
 ) -> pd.DataFrame:
     """Runs Stage 3 (Derivative Intelligence, live Upstox chain — the
     one expensive stage) + Stage 4 (Risk Engine) + Stage 5 (Opportunity
@@ -314,8 +313,22 @@ def compute_fo_opportunities(
     carrying the full DOREResult (recommendation, scores, TradePlan).
     """
     cfg = _load_settings(cfg)
-    from utils.upstox_client import fetch_oi_resistance, fetch_stock_atm_option
+    from utils.upstox_client import fetch_oi_resistance, fetch_batch_stock_atm_options_upstox
     from utils.oi_snapshot_store import record_and_diff, record_and_diff_premium
+
+    symbols = list(live_pool.keys())
+    stock_symbols = [s for s in symbols if s not in _INDICES]
+
+    # 2026-07-22: was calling fetch_stock_atm_option() one symbol at a
+    # time in a sequential for-loop — the same anti-pattern Stage 2 had
+    # (see stage2_execution_qualification()), just one stage later and
+    # against the single most expensive call in the whole pipeline (a
+    # full option-chain fetch per symbol). Switched to the concurrent
+    # batch fetcher that already existed in utils.upstox_client for
+    # exactly this. Indices (NIFTY/BANKNIFTY/SENSEX — at most 3) stay on
+    # fetch_oi_resistance() per-symbol below; batching 3 calls isn't
+    # worth the complexity.
+    stock_atm_options = fetch_batch_stock_atm_options_upstox(stock_symbols, progress_cb=progress_cb) if stock_symbols else {}
 
     rows = []
     for symbol, row in live_pool.items():
@@ -334,7 +347,7 @@ def compute_fo_opportunities(
                 ce_chg, pe_chg = record_and_diff(symbol, opt.get("total_ce_oi", 0.0), opt.get("total_pe_oi", 0.0))
                 premium_key = symbol
             else:
-                opt = fetch_stock_atm_option(symbol)
+                opt = stock_atm_options.get(symbol)
                 if opt is None:
                     continue
                 atm_chain_row = dict(opt)
@@ -453,7 +466,7 @@ def top_fo_opportunities(
     if not live_pool:
         return pd.DataFrame()
 
-    opportunities = compute_fo_opportunities(live_pool, cfg)
+    opportunities = compute_fo_opportunities(live_pool, cfg, progress_cb=progress_cb)
     if opportunities.empty:
         return opportunities
 
@@ -510,7 +523,7 @@ def classify_buildup(price_chg_pct: Optional[float], oi_chg: Optional[float]) ->
 
 
 def top_futures_opportunities(top_n: int = 15, universe: Optional[list[str]] = None,
-                               cfg: Optional[DORESettings] = None) -> pd.DataFrame:
+                               cfg: Optional[DORESettings] = None, progress_cb=None) -> pd.DataFrame:
     """Futures tab: Stock, CMP, %Chg, buildup classification, and DORE's
     own TradePlan (Entry/Target1/SL) for symbols DORE's Stage 1 Trend
     Engine has qualified — ranked by Trend Score, not MasterScanner's
@@ -523,7 +536,7 @@ def top_futures_opportunities(top_n: int = 15, universe: Optional[list[str]] = N
     from utils.oi_snapshot_store import record_and_diff_value
 
     universe = universe if universe is not None else sorted(fo_eligible_symbols() or set())
-    daily_pool = stage1_trend_qualification(universe, cfg)
+    daily_pool = stage1_trend_qualification(universe, cfg, progress_cb=progress_cb)
     if not daily_pool:
         return pd.DataFrame()
 
