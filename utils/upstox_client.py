@@ -399,7 +399,7 @@ def _fetch_intraday_candles(instrument_key: str, unit: str = "minutes",
     return pd.DataFrame()
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_ohlcv_upstox(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
     """
     Drop-in counterpart to scanner_engine.fetch_ohlcv(symbol, period, interval)
@@ -407,6 +407,21 @@ def fetch_ohlcv_upstox(symbol: str, period: str = "1y", interval: str = "1d") ->
     than 60 bars or on any failure), same [open,high,low,close,volume]
     lowercase columns indexed by naive date. Only daily ("1d") is wired up;
     extend the unit/interval mapping below if intraday scanning is needed.
+
+    2026-07-22: TTL raised from 60s to 30min. This is exclusively the
+    DAILY-bars path (raises below for anything else) and is the single
+    largest request count in the whole DORE F&O funnel — Stage 1 calls it
+    for the full ~200-250 symbol Stage-0 universe via
+    fetch_batch_ohlcv_upstox(). A 60s TTL against a panel that
+    auto-refreshes every 120s (utils.dore_fo_screener via pages.dashboard's
+    _DASH_AUTOREFRESH_SECS) meant every refresh was always past the TTL,
+    so the ENTIRE 200-250-symbol daily-candle history got re-fetched from
+    Upstox from scratch on every cycle — even though only today's
+    still-forming candle actually changes intraday; the other ~5 months of
+    bars are immutable. True intraday freshness for execution timing is
+    Stage 2's job (fetch_batch_intraday_5m_upstox, its own separate 60s
+    cache) — Stage 1's daily trend read was never the part that needed
+    minute-level freshness.
     """
     if interval != "1d":
         raise NotImplementedError("fetch_ohlcv_upstox currently only supports interval='1d'")
@@ -435,6 +450,7 @@ def fetch_ohlcv_upstox(symbol: str, period: str = "1y", interval: str = "1d") ->
     return df
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_index_ohlcv_upstox(index: str, period: str = "1y") -> pd.DataFrame:
     """
     Index counterpart to fetch_ohlcv_upstox() — historical daily OHLCV for
