@@ -2405,11 +2405,16 @@ def _fo_opportunities_panel():
     tab_fut, tab_opt = st.tabs(["📈 Futures", "🎯 Options"])
 
     with tab_fut:
+        fut_progress = st.progress(0.0, text="Scanning futures universe...")
+        def _fut_progress_cb(done: int, total: int, _bar=fut_progress) -> None:
+            if total:
+                _bar.progress(min(done / total, 1.0), text=f"Scanning futures universe... ({done}/{total})")
         try:
-            fut_df = top_futures_opportunities()
+            fut_df = top_futures_opportunities(progress_cb=_fut_progress_cb)
         except Exception:
             logger.exception("Futures opportunities panel failed (non-fatal)")
             fut_df = pd.DataFrame()
+        fut_progress.empty()
         if fut_df.empty:
             st.caption("No live futures data available right now — check the Upstox token, or "
                        "every F&O name is currently NEUTRAL on DORE's own Trend Engine (Stage 1).")
@@ -2434,11 +2439,16 @@ def _fo_opportunities_panel():
                        "bidirectional (CE and PE), independent of the equity scanner's own targets.")
 
     with tab_opt:
+        opt_progress = st.progress(0.0, text="Scanning F&O universe...")
+        def _opt_progress_cb(done: int, total: int, _bar=opt_progress) -> None:
+            if total:
+                _bar.progress(min(done / total, 1.0), text=f"Scanning F&O universe... ({done}/{total})")
         try:
-            opt_df = top_options_opportunities()
+            opt_df = top_options_opportunities(progress_cb=_opt_progress_cb)
         except Exception:
             logger.exception("Options opportunities panel failed (non-fatal)")
             opt_df = pd.DataFrame()
+        opt_progress.empty()
         if opt_df.empty:
             st.caption("No DORE-qualified option setups right now — either the Upstox token needs "
                        "checking, or every F&O candidate is currently gated to WAIT/NO_TRADE (see "
