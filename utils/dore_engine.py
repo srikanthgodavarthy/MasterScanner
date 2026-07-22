@@ -94,6 +94,13 @@ WATCH             = "WATCH"
 NOT_READY         = "NOT_READY"
 ALL_EXECUTION_STATES = {READY_NOW, BREAKOUT_PENDING, WATCH, NOT_READY}
 
+# Stage 3.5 Option Valuation Status (RFC-001 §7)
+CHEAP     = "CHEAP"
+FAIR      = "FAIR"
+EXPENSIVE = "EXPENSIVE"
+RICH      = "RICH"
+UNKNOWN   = "UNKNOWN"
+
 
 # ══════════════════════════════════════════════════════════════════
 #  RECOMMENDATION CONSTANTS  (Section 10 — composition table)
@@ -495,10 +502,94 @@ def _gate_lines(checks: list[GateCheck]) -> list[str]:
 
 
 # ══════════════════════════════════════════════════════════════════
+#  DATA CONTRACTS  (RFC-001 §8 — "Every stage publishes immutable
+#  outputs... No stage modifies upstream outputs. All contracts are
+#  append-only.") One frozen dataclass per stage, in the RFC's own
+#  order (§8's example list: TrendResult, ExecutionResult,
+#  DerivativeResult, OptionIntelligenceResult, RiskResult,
+#  OpportunityResult). `frozen=True` makes "no stage modifies upstream
+#  outputs" a structural guarantee, not just a convention — and
+#  `reasons`/`warnings` are tuples, not lists, so a frozen instance
+#  can't be mutated in place through its own fields either. Downstream
+#  stages read these by attribute, never by unpacking a tuple
+#  positionally, so adding a field here can never silently shift what
+#  the next stage reads.
+# ══════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class TrendResult:
+    """Stage 1 output — Directional Intent (RFC-001 §7)."""
+    trend_score: float
+    directional_intent: str
+    reasons: tuple = ()
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    """Stage 2 output — Execution State (RFC-001 §7)."""
+    execution_score: float
+    execution_state: str
+    reasons: tuple = ()
+
+
+@dataclass(frozen=True)
+class DerivativeResult:
+    """Stage 3 output — Derivative Confidence (RFC-001 §7). Must not
+    evaluate option pricing — see stage3_derivative_intelligence()."""
+    confidence: float
+    oi_structure_score: float
+    premium_quality_score: float
+    premium_behavior_score: float
+    premium_strengthening: bool
+    corridor_score: float
+    upside_room_score: float
+    downside_room_score: float
+    resistance: float
+    support: float
+    expected_move: float
+    reasons: tuple = ()
+
+
+@dataclass(frozen=True)
+class OptionIntelligenceResult:
+    """Stage 3.5 output — Option Intelligence Score, Option Valuation
+    Status, Expected Move Coverage, IV Warnings (RFC-001 §7). No
+    directional logic, no execution logic, no recommendation
+    generation — see stage3_5_option_intelligence()."""
+    score: float = 50.0
+    valuation_status: str = "UNKNOWN"
+    expected_move_coverage: Optional[float] = None
+    iv_expected_move: Optional[float] = None
+    hard_gate_pass: bool = True
+    warnings: tuple = ()
+    reasons: tuple = ()
+
+
+@dataclass(frozen=True)
+class RiskResult:
+    """Stage 4 output — Risk Quality + hard-gate (RFC-001 §7).
+    Intentionally excludes option valuation — see stage4_risk_engine()."""
+    risk_quality: float
+    hard_gate_pass: bool
+    reasons: tuple = ()
+    warnings: tuple = ()
+
+
+@dataclass(frozen=True)
+class OpportunityResult:
+    """Stage 5 output — the synthesized Opportunity Score + composed
+    Recommendation (RFC-001 §7). Only this stage combines evidence
+    into a recommendation — see stage5_opportunity_engine()."""
+    opportunity_score: float
+    recommendation: str
+    reasons: tuple = ()
+
+
+# ══════════════════════════════════════════════════════════════════
 #  STAGE 1 — TREND ENGINE  (Directional Intent)
 # ══════════════════════════════════════════════════════════════════
 
-def stage1_trend_engine(inp: DOREInput, cfg: DORESettings) -> tuple[float, str, list[str]]:
+def stage1_trend_engine(inp: DOREInput, cfg: DORESettings) -> TrendResult:
     """Blend EMA9/EMA21 alignment, EMA9/21 slope, ADX, RSI and relative
     volume into a single 0-100 Trend Score, then bucket it into
     BULLISH / BEARISH / NEUTRAL — Directional Intent. Persistent by
@@ -589,7 +680,7 @@ def stage1_trend_engine(inp: DOREInput, cfg: DORESettings) -> tuple[float, str, 
     )
     logger.debug("[DORE:%s] Stage1 reasons=%s", inp.symbol, reasons)
     reasons += _gate_lines(checks)
-    return trend_score, intent, reasons
+    return TrendResult(trend_score=trend_score, directional_intent=intent, reasons=tuple(reasons))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -598,7 +689,7 @@ def stage1_trend_engine(inp: DOREInput, cfg: DORESettings) -> tuple[float, str, 
 
 def stage2_execution_engine(
     inp: DOREInput, cfg: DORESettings, directional_intent: str
-) -> tuple[float, str, list[str]]:
+) -> ExecutionResult:
     """Score whether THIS specific intraday moment is tradeable on the
     side Stage 1 already committed to. Execution-oriented, not pattern-
     oriented (Section 7) — does not attempt to mirror every equity swing
@@ -758,32 +849,16 @@ def stage2_execution_engine(
     )
     logger.debug("[DORE:%s] Stage2 reasons=%s", inp.symbol, reasons)
     reasons += _gate_lines(checks)
-    return execution_score, state, reasons
+    return ExecutionResult(execution_score=execution_score, execution_state=state, reasons=tuple(reasons))
 
 
 # ══════════════════════════════════════════════════════════════════
 #  STAGE 3 — DERIVATIVE INTELLIGENCE  (Derivative Confidence)
 # ══════════════════════════════════════════════════════════════════
 
-@dataclass
-class _DerivativeResult:
-    confidence: float
-    oi_structure_score: float
-    premium_quality_score: float
-    premium_behavior_score: float
-    premium_strengthening: bool
-    corridor_score: float
-    upside_room_score: float
-    downside_room_score: float
-    resistance: float
-    support: float
-    expected_move: float
-    reasons: list
-
-
 def stage3_derivative_intelligence(
     inp: DOREInput, cfg: DORESettings, directional_intent: str
-) -> _DerivativeResult:
+) -> DerivativeResult:
     """Validate execution using live option-chain behaviour — "does the
     options market confirm this trade?" (Section 9). Bidirectional:
     scores whichever side `directional_intent` names; a NEUTRAL intent
@@ -844,21 +919,15 @@ def stage3_derivative_intelligence(
         (base_strength_score, cfg.w_deriv_base_strength),
     ])
 
-    # ── Premium quality (value / liquidity / spread — NOT behaviour) ─
-    premium      = (inp.ce_premium if direction == "CE" else
-                    inp.pe_premium if direction == "PE" else max(inp.ce_premium, inp.pe_premium))
-    premium_prev = (inp.ce_premium_prev if direction == "CE" else
-                    inp.pe_premium_prev if direction == "PE" else None)
-    premium_prev2 = (inp.ce_premium_prev2 if direction == "CE" else
-                    inp.pe_premium_prev2 if direction == "PE" else None)
+    # ── Premium quality (liquidity / spread — NOT valuation, NOT ──────
+    #    behaviour). RFC-001 §7: Stage 3 "Must not evaluate option
+    #    pricing" — the premium-vs-ATR-ceiling richness read that used
+    #    to live here moved to Stage 3.5's Valuation pillar (it's
+    #    computed there, from the same premium/ATR inputs, as part of
+    #    "is the CONTRACT worth buying").
     oi           = inp.ce_oi if direction == "CE" else (inp.pe_oi if direction == "PE" else max(inp.ce_oi, inp.pe_oi))
     spread_pct   = (inp.ce_bid_ask_spread_pct if direction == "CE" else
                     inp.pe_bid_ask_spread_pct if direction == "PE" else None)
-
-    atr_ref = max(inp.atr, 1e-6)
-    expensive_ceiling = atr_ref * cfg.premium_atr_expensive_mult
-    value_score = _pct_score(premium, expensive_ceiling * 1.6, expensive_ceiling * 0.4)
-    reasons.append(f"Premium={premium:.2f} vs ATR-scaled ceiling={expensive_ceiling:.2f}")
 
     liquidity_score = _pct_score(oi, cfg.premium_min_oi_liquidity * 0.3, cfg.premium_min_oi_liquidity * 1.5)
     reasons.append(f"OI(liquidity)={oi:,.0f}")
@@ -870,19 +939,24 @@ def stage3_derivative_intelligence(
         spread_score = 60.0
 
     premium_quality_score = _weighted([
-        (value_score,      55.0),
-        (liquidity_score,  25.0),
-        (spread_score,     20.0),
+        (liquidity_score,  60.0),
+        (spread_score,     40.0),
     ])
 
     # ── Premium Behaviour (first-class pillar, 2026-07-21) ───────────
     # A bullish underlying + a ready execution can STILL be a bad entry
     # if the option premium itself hasn't turned yet — this is exactly
-    # what Premium Quality above never checked (it prices whether the
-    # premium is cheap/expensive/liquid, not whether it's MOVING the
-    # right way). No prior reading -> treated as UNCONFIRMED, not a
-    # free pass: absence of evidence must not be enough to justify a
-    # NOW-tier entry (see the gate in stage5_opportunity_engine()).
+    # what Premium Quality above never checked (it prices liquidity and
+    # exit-cleanliness, not whether the premium is MOVING the right
+    # way). No prior reading -> treated as UNCONFIRMED, not a free
+    # pass: absence of evidence must not be enough to justify a NOW-tier
+    # entry (see the gate in stage5_opportunity_engine()).
+    premium = (inp.ce_premium if direction == "CE" else
+               inp.pe_premium if direction == "PE" else max(inp.ce_premium, inp.pe_premium))
+    premium_prev = (inp.ce_premium_prev if direction == "CE" else
+                    inp.pe_premium_prev if direction == "PE" else None)
+    premium_prev2 = (inp.ce_premium_prev2 if direction == "CE" else
+                    inp.pe_premium_prev2 if direction == "PE" else None)
     if direction is None or premium <= 0:
         premium_behavior_score = 50.0
         premium_strengthening = False
@@ -912,6 +986,7 @@ def stage3_derivative_intelligence(
                            f"(needs >= +{cfg.premium_behavior_min_rise_pct:.1f}%) — direction unconfirmed by premium")
 
     # ── OI corridor — room to run before the next wall ──────────────
+    atr_ref = max(inp.atr, 1e-6)
     resistance = inp.highest_ce_oi_strike or (inp.price + atr_ref * 2)
     support    = inp.highest_pe_oi_strike or (inp.price - atr_ref * 2)
     upside_room_atr   = max((resistance - inp.price) / atr_ref, 0.0)
@@ -943,7 +1018,7 @@ def stage3_derivative_intelligence(
                 corridor_score, direction)
     logger.debug("[DORE:%s] Stage3 reasons=%s", inp.symbol, reasons)
 
-    return _DerivativeResult(
+    return DerivativeResult(
         confidence=confidence,
         oi_structure_score=oi_structure_score,
         premium_quality_score=premium_quality_score,
@@ -955,7 +1030,7 @@ def stage3_derivative_intelligence(
         resistance=resistance,
         support=support,
         expected_move=expected_move,
-        reasons=reasons,
+        reasons=tuple(reasons),
     )
 
 
@@ -970,29 +1045,19 @@ def stage3_derivative_intelligence(
 #  weigh; it never overrides Stage 1-3, and Stage 4 (Risk Intelligence)
 #  intentionally excludes everything computed here (option valuation is
 #  no longer read anywhere inside stage4_risk_engine — see RFC-001 §2).
+#
+#  `direction` is accepted purely to know WHICH leg's premium to read
+#  (same reason Stage 4 accepts it) — it is not used to make any
+#  directional decision. A NEUTRAL/None direction still gets a full,
+#  direction-agnostic Valuation/Volatility/Structure read; only the
+#  premium-richness half of Valuation (which needs a specific leg's
+#  premium) falls back to the more expensive of the two legs.
 # ══════════════════════════════════════════════════════════════════
-
-CHEAP     = "CHEAP"
-FAIR      = "FAIR"
-EXPENSIVE = "EXPENSIVE"
-RICH      = "RICH"
-UNKNOWN   = "UNKNOWN"
-
-
-@dataclass
-class OptionIntelligenceResult:
-    score:                  float = 50.0        # Option Intelligence Score, 0-100
-    valuation_status:       str = UNKNOWN        # CHEAP | FAIR | EXPENSIVE | RICH | UNKNOWN
-    expected_move_coverage: Optional[float] = None  # IV-implied move / distance-to-technical-target
-    iv_expected_move:       Optional[float] = None
-    hard_gate_pass:         bool = True          # False = Extreme IV Crush Risk trip-wire fired
-    warnings:               list = field(default_factory=list)
-    reasons:                list = field(default_factory=list)
-
 
 def stage3_5_option_intelligence(
     inp: DOREInput,
     cfg: DORESettings,
+    direction: Optional[str],
     atr_expected_move: float,
     technical_target: Optional[float],
 ) -> OptionIntelligenceResult:
@@ -1008,10 +1073,44 @@ def stage3_5_option_intelligence(
     reasons: list[str] = []
     warnings: list[str] = []
 
-    # ── Valuation: is current IV cheap or rich vs its own range? ─────
+    # ── Valuation: is the CONTRACT cheap or rich? Two independent ────
+    #    reads, blended: (a) current IV vs its own historical range
+    #    (IV Rank / IV Percentile), and (b) the premium itself vs an
+    #    ATR-scaled ceiling — this second read is what used to live in
+    #    Stage 3's Premium Quality pillar (RFC-001 §7: Stage 3 "Must
+    #    not evaluate option pricing"; that responsibility belongs here).
     iv_level = inp.iv_rank if inp.iv_rank is not None else inp.iv_percentile
+    iv_valuation_score = None
     if iv_level is not None:
-        valuation_score = _pct_score(iv_level, cfg.oi_iv_rank_rich_min, cfg.oi_iv_rank_cheap_max)
+        iv_valuation_score = _pct_score(iv_level, cfg.oi_iv_rank_rich_min, cfg.oi_iv_rank_cheap_max)
+        reasons.append(f"IV Rank/Percentile={iv_level:.0f}")
+    else:
+        reasons.append("No IV Rank/Percentile supplied")
+
+    premium = (inp.ce_premium if direction == "CE" else
+               inp.pe_premium if direction == "PE" else max(inp.ce_premium, inp.pe_premium))
+    premium_richness_score = None
+    if premium and inp.atr:
+        atr_ref = max(inp.atr, 1e-6)
+        expensive_ceiling = atr_ref * cfg.premium_atr_expensive_mult
+        premium_richness_score = _pct_score(premium, expensive_ceiling * 1.6, expensive_ceiling * 0.4)
+        reasons.append(f"Premium={premium:.2f} vs ATR-scaled ceiling={expensive_ceiling:.2f}")
+    else:
+        reasons.append("No live premium/ATR supplied — premium-richness read skipped")
+
+    valuation_parts = []
+    if iv_valuation_score is not None:
+        valuation_parts.append((iv_valuation_score, cfg.oi_valuation_iv_weight))
+    if premium_richness_score is not None:
+        valuation_parts.append((premium_richness_score, cfg.oi_valuation_premium_weight))
+    if valuation_parts:
+        valuation_score = _weighted(valuation_parts)
+    else:
+        valuation_score = 50.0
+
+    if iv_level is not None:
+        # IV Rank/Percentile is the more authoritative read when present
+        # — bucket status off it directly, per the RFC's named inputs.
         if iv_level < cfg.oi_iv_rank_cheap_max:
             valuation_status = CHEAP
         elif iv_level >= cfg.oi_iv_rank_rich_min:
@@ -1020,11 +1119,20 @@ def stage3_5_option_intelligence(
             valuation_status = EXPENSIVE
         else:
             valuation_status = FAIR
-        reasons.append(f"IV Rank/Percentile={iv_level:.0f} -> {valuation_status}")
+    elif premium_richness_score is not None:
+        # Fall back to bucketing the blended score itself (same 0-100
+        # scale, higher = cheaper) when no IV Rank/Percentile exists.
+        if valuation_score >= 75.0:
+            valuation_status = CHEAP
+        elif valuation_score >= 40.0:
+            valuation_status = FAIR
+        elif valuation_score >= 15.0:
+            valuation_status = EXPENSIVE
+        else:
+            valuation_status = RICH
     else:
-        valuation_score = 50.0
         valuation_status = UNKNOWN
-        reasons.append("No IV Rank/Percentile supplied — Option Valuation is UNKNOWN")
+    reasons.append(f"Option Valuation -> {valuation_status}")
 
     # ── Volatility Behaviour: is IV expanding (favours buyers) or ────
     #    compressing (erodes long-premium edge)?
@@ -1116,8 +1224,8 @@ def stage3_5_option_intelligence(
         expected_move_coverage=expected_move_coverage,
         iv_expected_move=iv_expected_move,
         hard_gate_pass=hard_gate_pass,
-        warnings=warnings,
-        reasons=reasons,
+        warnings=tuple(warnings),
+        reasons=tuple(reasons),
     )
 
 
@@ -1131,13 +1239,12 @@ def stage4_risk_engine(
     direction: Optional[str],
     corridor_score: float,
     trade_plan: TradePlan,
-) -> tuple[float, bool, list[str], list[str]]:
+) -> RiskResult:
     """"If we take this trade, what could go wrong, and is it
     acceptable?" (Section 8) — a distinct concern from whether the chain
     CONFIRMS direction (Stage 3). No new fetch: reuses Stage 1-3 outputs
     plus price/ATR already in cache.
 
-    Returns (risk_quality 0-100, hard_gate_pass, reasons, warnings).
     hard_gate_pass=False means the Event Risk trip-wire fired (a flagged
     macro/earnings event today) — the orchestrator forces NO_TRADE
     whenever this is False, regardless of every other score. Option
@@ -1153,7 +1260,7 @@ def stage4_risk_engine(
 
     if direction not in ("CE", "PE"):
         reasons.append("No direction yet — Risk Engine has nothing to size (reporting-only read)")
-        return 50.0, True, reasons, warnings
+        return RiskResult(risk_quality=50.0, hard_gate_pass=True, reasons=tuple(reasons), warnings=tuple(warnings))
 
     # ── Hard trip-wire: Event Risk only (Option Intelligence owns the
     #    IV-crush trip-wire — see stage3_5_option_intelligence) ───────
@@ -1201,7 +1308,8 @@ def stage4_risk_engine(
 
     logger.info("[DORE:%s] Stage4 Risk quality=%.1f hard_gate_pass=%s (rr=%.2f)",
                 inp.symbol, risk_quality, hard_gate_pass, rr)
-    return risk_quality, hard_gate_pass, reasons, warnings
+    return RiskResult(risk_quality=risk_quality, hard_gate_pass=hard_gate_pass,
+                       reasons=tuple(reasons), warnings=tuple(warnings))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1219,7 +1327,7 @@ def stage5_opportunity_engine(
     risk_quality: float,
     risk_hard_gate_pass: bool,
     premium_strengthening: bool = False,
-) -> tuple[float, str, list[str]]:
+) -> OpportunityResult:
     """Merge Directional Intent, Execution State, Derivative Confidence
     and Risk Quality into ONE recommendation (Section 10). The
     recommendation is COMPOSED from the two independent Stage 1/2
@@ -1255,40 +1363,45 @@ def stage5_opportunity_engine(
 
     if not risk_hard_gate_pass:
         reasons.append("Hard-gate FAILED (event risk and/or extreme IV crush risk) — NO_TRADE regardless of score")
-        return opportunity_score, NO_TRADE, reasons
+        recommendation = NO_TRADE
 
-    if directional_intent == NEUTRAL:
+    elif directional_intent == NEUTRAL:
         reasons.append("Directional Intent NEUTRAL — no directional edge, WAIT")
-        return opportunity_score, WAIT, reasons
+        recommendation = WAIT
 
-    if execution_state == NOT_READY:
+    elif execution_state == NOT_READY:
         reasons.append(f"Execution State NOT_READY — {directional_intent} intent exists but "
                         f"this moment isn't tradeable yet, WAIT")
-        return opportunity_score, WAIT, reasons
+        recommendation = WAIT
 
-    recommendation = _COMPOSITION_TABLE.get((directional_intent, execution_state))
-    if recommendation is None:
-        # Defensive: any (intent, state) pair not in the table (should not
-        # happen given the enums above) falls back to WAIT rather than
-        # raising, so a config/enum mismatch degrades safely.
-        logger.warning("DORE composition table miss for (%s, %s) — defaulting to WAIT",
-                       directional_intent, execution_state)
-        reasons.append(f"No composition entry for ({directional_intent}, {execution_state}) — WAIT")
-        return opportunity_score, WAIT, reasons
+    else:
+        recommendation = _COMPOSITION_TABLE.get((directional_intent, execution_state))
+        if recommendation is None:
+            # Defensive: any (intent, state) pair not in the table (should not
+            # happen given the enums above) falls back to WAIT rather than
+            # raising, so a config/enum mismatch degrades safely.
+            logger.warning("DORE composition table miss for (%s, %s) — defaulting to WAIT",
+                           directional_intent, execution_state)
+            reasons.append(f"No composition entry for ({directional_intent}, {execution_state}) — WAIT")
+            recommendation = WAIT
 
-    if recommendation in (BUY_CE_NOW, BUY_PE_NOW) and cfg.gate_now_on_premium_behavior and not premium_strengthening:
-        downgraded_to = WATCH_CE if recommendation == BUY_CE_NOW else WATCH_PE
-        reasons.append(f"Premium Behaviour gate: underlying/execution justify {recommendation}, but the "
-                        f"option premium itself hasn't confirmed (not yet strengthening) — downgraded to "
-                        f"{downgraded_to}")
-        logger.info("Stage5 Opportunity score=%.1f recommendation=%s (downgraded from %s by Premium "
-                    "Behaviour gate)", opportunity_score, downgraded_to, recommendation)
-        return opportunity_score, downgraded_to, reasons
+        elif (recommendation in (BUY_CE_NOW, BUY_PE_NOW) and cfg.gate_now_on_premium_behavior
+              and not premium_strengthening):
+            downgraded_to = WATCH_CE if recommendation == BUY_CE_NOW else WATCH_PE
+            reasons.append(f"Premium Behaviour gate: underlying/execution justify {recommendation}, but the "
+                            f"option premium itself hasn't confirmed (not yet strengthening) — downgraded to "
+                            f"{downgraded_to}")
+            logger.info("Stage5 Opportunity score=%.1f recommendation=%s (downgraded from %s by Premium "
+                        "Behaviour gate)", opportunity_score, downgraded_to, recommendation)
+            recommendation = downgraded_to
 
-    reasons.append(f"Composed from Directional Intent={directional_intent} x "
-                   f"Execution State={execution_state} -> {recommendation}")
+        else:
+            reasons.append(f"Composed from Directional Intent={directional_intent} x "
+                           f"Execution State={execution_state} -> {recommendation}")
+
     logger.info("Stage5 Opportunity score=%.1f recommendation=%s", opportunity_score, recommendation)
-    return opportunity_score, recommendation, reasons
+    return OpportunityResult(opportunity_score=opportunity_score, recommendation=recommendation,
+                              reasons=tuple(reasons))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1351,54 +1464,52 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     """
     cfg = settings or DORESettings.from_dict(DORE_DEFAULTS)
 
-    trend_score, directional_intent, trend_reasons = stage1_trend_engine(inp, cfg)
-    execution_score, execution_state, exec_reasons = stage2_execution_engine(inp, cfg, directional_intent)
-    deriv = stage3_derivative_intelligence(inp, cfg, directional_intent)
+    trend = stage1_trend_engine(inp, cfg)
+    execution = stage2_execution_engine(inp, cfg, trend.directional_intent)
+    deriv = stage3_derivative_intelligence(inp, cfg, trend.directional_intent)
 
-    direction = "CE" if directional_intent == BULLISH else ("PE" if directional_intent == BEARISH else None)
+    direction = "CE" if trend.directional_intent == BULLISH else ("PE" if trend.directional_intent == BEARISH else None)
 
     technical_target = deriv.resistance if direction == "CE" else (deriv.support if direction == "PE" else None)
-    oi_intel = stage3_5_option_intelligence(inp, cfg, deriv.expected_move, technical_target)
+    oi_intel = stage3_5_option_intelligence(inp, cfg, direction, deriv.expected_move, technical_target)
 
     trade_plan = build_trade_plan(inp, cfg, direction)
 
-    risk_quality, event_hard_gate_pass, risk_reasons, risk_warnings = stage4_risk_engine(
-        inp, cfg, direction, deriv.corridor_score, trade_plan,
-    )
+    risk = stage4_risk_engine(inp, cfg, direction, deriv.corridor_score, trade_plan)
 
     # Hard gates live outside the scoring framework (RFC-001 §10) — this
     # is the ONLY place Stage 4's event-risk trip-wire and Stage 3.5's
     # IV-crush trip-wire are combined. Neither stage's own evidence score
     # is touched by this; it only ever overrides the recommendation.
-    hard_gate_pass = event_hard_gate_pass and oi_intel.hard_gate_pass
+    hard_gate_pass = risk.hard_gate_pass and oi_intel.hard_gate_pass
 
-    opportunity_score, recommendation, opp_reasons = stage5_opportunity_engine(
-        cfg, trend_score, directional_intent, execution_score, execution_state,
-        deriv.confidence, oi_intel.score, risk_quality, hard_gate_pass, deriv.premium_strengthening,
+    opportunity = stage5_opportunity_engine(
+        cfg, trend.trend_score, trend.directional_intent, execution.execution_score, execution.execution_state,
+        deriv.confidence, oi_intel.score, risk.risk_quality, hard_gate_pass, deriv.premium_strengthening,
     )
 
     strike_type, recommended_expiry, strike_reasons = stage5b_strike_and_expiry(
-        inp, cfg, direction, execution_score, hard_gate_pass,
-    ) if recommendation in (BUY_CE_NOW, BUY_CE_BREAKOUT, BUY_PE_NOW, BUY_PE_BREAKDOWN) else (None, None, [])
+        inp, cfg, direction, execution.execution_score, hard_gate_pass,
+    ) if opportunity.recommendation in (BUY_CE_NOW, BUY_CE_BREAKOUT, BUY_PE_NOW, BUY_PE_BREAKDOWN) else (None, None, [])
 
-    warnings = list(risk_warnings) + list(oi_intel.warnings)
+    warnings = list(risk.warnings) + list(oi_intel.warnings)
     if deriv.confidence < cfg.derivative_confidence_min and direction is not None:
         warnings.append(f"Derivative Confidence={deriv.confidence:.0f} below the "
                          f"{cfg.derivative_confidence_min:.0f} confirmation floor")
     if direction is not None and not deriv.premium_strengthening:
         warnings.append("Premium Behaviour not confirmed — option premium hasn't started strengthening yet")
 
-    reasons = (trend_reasons + exec_reasons + deriv.reasons + oi_intel.reasons
-               + risk_reasons + opp_reasons + strike_reasons)
+    reasons = (list(trend.reasons) + list(execution.reasons) + list(deriv.reasons) + list(oi_intel.reasons)
+               + list(risk.reasons) + list(opportunity.reasons) + strike_reasons)
 
     result = DOREResult(
-        recommendation=recommendation,
-        opportunity_score=round(opportunity_score, 1),
-        conviction_score_10=round(opportunity_score / 10.0, 1),
-        directional_intent=directional_intent,
-        trend_score=round(trend_score, 1),
-        execution_state=execution_state,
-        execution_score=round(execution_score, 1),
+        recommendation=opportunity.recommendation,
+        opportunity_score=round(opportunity.opportunity_score, 1),
+        conviction_score_10=round(opportunity.opportunity_score / 10.0, 1),
+        directional_intent=trend.directional_intent,
+        trend_score=round(trend.trend_score, 1),
+        execution_state=execution.execution_state,
+        execution_score=round(execution.execution_score, 1),
         derivative_confidence=round(deriv.confidence, 1),
         oi_structure_score=round(deriv.oi_structure_score, 1),
         premium_quality_score=round(deriv.premium_quality_score, 1),
@@ -1408,8 +1519,8 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         option_intelligence_score=round(oi_intel.score, 1),
         option_valuation_status=oi_intel.valuation_status,
         expected_move_coverage=oi_intel.expected_move_coverage,
-        iv_warnings=oi_intel.warnings,
-        risk_quality=round(risk_quality, 1),
+        iv_warnings=list(oi_intel.warnings),
+        risk_quality=round(risk.risk_quality, 1),
         risk_hard_gate_pass=hard_gate_pass,
         trade_plan=trade_plan,
         recommended_strike_type=strike_type,
@@ -1427,9 +1538,9 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         "[DORE:%s] FINAL recommendation=%s opportunity_score=%.1f intent=%s(%.1f) "
         "execution=%s(%.1f) derivative_confidence=%.1f option_intelligence=%.1f(%s) "
         "risk_quality=%.1f hard_gate_pass=%s",
-        inp.symbol, result.recommendation, result.opportunity_score, directional_intent, trend_score,
-        execution_state, execution_score, deriv.confidence, oi_intel.score, oi_intel.valuation_status,
-        risk_quality, hard_gate_pass,
+        inp.symbol, result.recommendation, result.opportunity_score, trend.directional_intent, trend.trend_score,
+        execution.execution_state, execution.execution_score, deriv.confidence, oi_intel.score,
+        oi_intel.valuation_status, risk.risk_quality, hard_gate_pass,
     )
     return result
 

@@ -119,6 +119,12 @@ DORE_DEFAULTS: dict = {
     "oi_iv_rank_cheap_max":        25.0,   # IV Rank/Percentile below this -> CHEAP
     "oi_iv_rank_expensive_min":    70.0,   # >= this (below rich) -> EXPENSIVE
     "oi_iv_rank_rich_min":         85.0,   # >= this -> RICH
+    # Valuation blend: IV Rank/Percentile vs premium-vs-ATR-ceiling
+    # richness (the latter moved here from Stage 3's old Premium
+    # Quality pillar — RFC-001 §7: Stage 3 "Must not evaluate option
+    # pricing"). Falls back to whichever one is actually available.
+    "oi_valuation_iv_weight":      65.0,
+    "oi_valuation_premium_weight": 35.0,
     "oi_iv_trend_scale":            1.5,   # points added/removed to Volatility Behaviour per 1% IV move
     "oi_iv_compression_trend_pct": -10.0,  # IV Trend % at/below this auto-flags compression when the
                                              # caller didn't supply an explicit iv_compression flag
@@ -247,6 +253,8 @@ class DORESettings:
     oi_iv_rank_cheap_max: float = 25.0
     oi_iv_rank_expensive_min: float = 70.0
     oi_iv_rank_rich_min: float = 85.0
+    oi_valuation_iv_weight: float = 65.0
+    oi_valuation_premium_weight: float = 35.0
     oi_iv_trend_scale: float = 1.5
     oi_iv_compression_trend_pct: float = -10.0
     oi_expected_move_coverage_min: float = 0.8

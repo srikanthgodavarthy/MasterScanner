@@ -140,7 +140,8 @@ def stage1_trend_qualification(
             atr=features.get("atr", 0.0), rel_volume=features.get("rel_volume", 1.0),
         )
         try:
-            trend_score, intent, _ = stage1_trend_engine(probe, cfg)
+            trend = stage1_trend_engine(probe, cfg)
+            trend_score, intent = trend.trend_score, trend.directional_intent
         except Exception:
             logger.exception("[DORE Stage1] trend engine failed for %s", symbol)
             continue
@@ -272,7 +273,8 @@ def stage2_execution_qualification(
             intraday_atr_expansion_pct=exec_features.get("intraday_atr_expansion_pct", 0.0),
         )
         try:
-            execution_score, state, _ = stage2_execution_engine(probe, cfg, row["directional_intent"])
+            execution = stage2_execution_engine(probe, cfg, row["directional_intent"])
+            execution_score, state = execution.execution_score, execution.execution_state
         except Exception:
             logger.exception("[DORE Stage2] execution engine failed for %s", symbol)
             continue
