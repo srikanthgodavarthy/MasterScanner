@@ -2313,15 +2313,52 @@ def _sc_counts_html(df: pd.DataFrame) -> str:
 # funnel (Universe -> Trend Qualification -> Execution Qualification ->
 # Derivative Intelligence -> Risk Engine -> Opportunity Ranking) instead
 # of ranking off the scanner's OppScore/Recommendation/T1 columns.
+# 2026-07-22 dashboard revisit: Action and Execution State were two
+# separate columns saying overlapping things (Action derives from the
+# Recommendation, which is itself gated partly by Execution State) —
+# collapsed into one "Action / Execution" column. Recommendation-driven
+# sort replaces the old Opportunity-Score sort so Buy-Now rows always
+# lead regardless of score, matching how a trader actually scans this
+# table (can I act right now?, then what's the best of those).
+_RECOMMENDATION_SORT_PRIORITY = {
+    "BUY_CE_NOW": 0, "BUY_PE_NOW": 0,
+    "BUY_CE_BREAKOUT": 1, "BUY_PE_BREAKDOWN": 1,
+    "WATCH_CE": 2, "WATCH_PE": 2,
+    "HOLD_CE": 3, "HOLD_PE": 3,
+    "BOOK_CE_PROFITS": 4, "BOOK_PE_PROFITS": 4,
+    "WAIT": 5, "NO_TRADE": 6,
+}
+
+
+def _sort_by_recommendation(df: pd.DataFrame, rec_col: str = "Recommendation") -> pd.DataFrame:
+    """Sort by Recommendation's action-urgency tier (Buy Now first, No
+    Trade last); Opportunity Score (if present) breaks ties within a
+    tier so the strongest setups still surface first inside each tier."""
+    if rec_col not in df.columns:
+        return df
+    tier_rank = df[rec_col].map(lambda r: _RECOMMENDATION_SORT_PRIORITY.get(r, 9))
+    out = df.assign(_tier_rank=tier_rank)
+    if "Opportunity Score" in df.columns:
+        out = out.assign(_opp_desc=-out["Opportunity Score"].fillna(0))
+        out = out.sort_values(["_tier_rank", "_opp_desc"], kind="stable").drop(columns=["_tier_rank", "_opp_desc"])
+    else:
+        out = out.sort_values("_tier_rank", kind="stable").drop(columns="_tier_rank")
+    return out
+
+
 def _options_table_html(df: pd.DataFrame) -> str:
     """Render the Options-tab opportunity table as a colored HTML table
     instead of st.dataframe — st.dataframe's column_config can format
     numbers/text but can't tint a cell/row by value, and the whole point
     of the Action column is 'can I act on this at a glance', which needs
-    color. Each row is tinted by Action tier (see _ACTION_TIER_STYLE);
-    Recommendation/Leg/Directional Intent get their own cell coloring on
-    top of that so CE vs PE and BULLISH vs BEARISH stay visually obvious
-    even for a colorblind-unfriendly tier color.
+    color. Each row is tinted by Action tier (see _ACTION_TIER_STYLE).
+
+    Column order (2026-07-22 revisit): Symbol, LTP, Leg, Strike, Premium,
+    Premium %Chg, Strike Type, Opportunity, Entry, Entry Timestamp (IST),
+    SL, T1, T2, Plan, Expiry, Reason, Action/Execution State — Action and
+    Execution State merged into one trailing column since they were
+    saying overlapping things. Rows are sorted by Recommendation's
+    urgency tier before rendering (see _sort_by_recommendation).
     """
     def _fmt_money(v):
         return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
@@ -2338,44 +2375,48 @@ def _options_table_html(df: pd.DataFrame) -> str:
     def _fmt_text(v):
         return v if v not in (None, "") and pd.notna(v) else "—"
 
-    headers = ["Symbol", "Action", "Recommendation", "Leg", "Strike", "Premium", "Premium %Chg",
-               "Directional Intent", "Strike Type", "Execution State", "Trend", "Execution",
-               "Derivatives", "Risk", "Opportunity", "Entry", "SL", "T1", "T2", "Plan", "Expiry", "Reason"]
+    def _fmt_ts(v):
+        """Entry Timestamp is stored as 'YYYY-MM-DD HH:MM:SS' IST —
+        show just the time in the cell, full stamp in the title tooltip."""
+        if v in (None, "") or pd.isna(v):
+            return "—"
+        s = str(v)
+        time_part = s.split(" ")[-1] if " " in s else s
+        return f'<span title="{s} IST">{time_part} IST</span>'
+
+    df = _sort_by_recommendation(df)
+
+    headers = ["Symbol", "LTP", "Leg", "Strike", "Premium", "Premium %Chg",
+               "Strike Type", "Opportunity", "Entry", "Entry Timestamp (IST)",
+               "SL", "T1", "T2", "Plan", "Expiry", "Reason", "Action / Execution"]
 
     rows_html = []
     for _, r in df.iterrows():
         tier = r.get("Action", "Wait")
         tier_color, tier_dot = _ACTION_TIER_STYLE.get(tier, ("#8b949e", "⚪"))
-        rec = r.get("Recommendation", "")
-        rec_color, _ = _DORE_BADGE_STYLE.get(rec, ("#8b949e", rec))
+        exec_state = r.get("Execution State", "")
         leg = r.get("Leg", "")
         leg_color = "#3fb950" if leg == "CE" else "#f85149" if leg == "PE" else "#8b949e"
-        intent = r.get("Directional Intent", "")
-        intent_color = "#3fb950" if intent == "BULLISH" else "#f85149" if intent == "BEARISH" else "#8b949e"
 
         cells = [
-            f'<td style="font-weight:700;color:var(--text)">{r.get("Symbol", "—")}</td>',
-            f'<td><span style="color:{tier_color};font-weight:700;white-space:nowrap;">{tier_dot} {tier}</span></td>',
-            f'<td style="color:{rec_color};font-weight:600;white-space:nowrap;">{rec}</td>',
+            f'<td style="font-weight:700;">{_tv_link(r.get("Symbol", "—"))}</td>',
+            f'<td>{_fmt_money(r.get("LTP"))}</td>',
             f'<td style="color:{leg_color};font-weight:700;">{_fmt_text(leg)}</td>',
             f'<td>{_fmt_num(r.get("Strike"))}</td>',
             f'<td>{_fmt_money(r.get("Premium"))}</td>',
             f'<td>{_fmt_pct(r.get("Premium %Chg"))}</td>',
-            f'<td style="color:{intent_color};font-weight:600;">{_fmt_text(intent)}</td>',
             f'<td>{_fmt_text(r.get("Strike Type"))}</td>',
-            f'<td>{_fmt_text(r.get("Execution State"))}</td>',
-            f'<td>{_fmt_num(r.get("Trend Score"))}</td>',
-            f'<td>{_fmt_num(r.get("Execution Score"))}</td>',
-            f'<td>{_fmt_num(r.get("Derivative Confidence"))}</td>',
-            f'<td>{_fmt_num(r.get("Risk Quality"))}</td>',
             f'<td style="font-weight:700;">{_fmt_num(r.get("Opportunity Score"))}</td>',
             f'<td>{_fmt_money(r.get("Entry"))}</td>',
+            f'<td style="color:var(--muted);font-size:11px;">{_fmt_ts(r.get("Entry Timestamp"))}</td>',
             f'<td>{_fmt_money(r.get("SL"))}</td>',
             f'<td>{_fmt_money(r.get("T1"))}</td>',
             f'<td>{_fmt_money(r.get("T2"))}</td>',
             f'<td>{_fmt_text(r.get("Plan"))}</td>',
             f'<td>{_fmt_text(r.get("Expiry"))}</td>',
-            f'<td style="color:var(--muted);font-size:11px;max-width:260px;">{_fmt_text(r.get("Reason"))}</td>',
+            f'<td style="color:var(--muted);font-size:11px;max-width:220px;white-space:normal;">{_fmt_text(r.get("Reason"))}</td>',
+            f'<td style="white-space:nowrap;"><span style="color:{tier_color};font-weight:700;">{tier_dot} {tier}</span>'
+            f'<br><span style="color:var(--muted);font-size:10px;">{_fmt_text(exec_state)}</span></td>',
         ]
         rows_html.append(
             f'<tr style="background:{tier_color}14;border-left:3px solid {tier_color};">'
@@ -2395,6 +2436,89 @@ def _options_table_html(df: pd.DataFrame) -> str:
         '</table></div>'
         '<style>'
         'table td{padding:6px 10px;color:var(--text);border-bottom:1px solid rgba(255,255,255,0.05);white-space:nowrap;}'
+        '.tv-link{color:inherit;text-decoration:none;border-bottom:1px dotted var(--muted);}'
+        '.tv-link:hover{color:#58a6ff;border-bottom-color:#58a6ff;}'
+        '</style>'
+    )
+
+
+def _futures_table_html(df: pd.DataFrame) -> str:
+    """Futures tab, styled to match the Options table (2026-07-22
+    revisit): TradingView-linked symbol, colored %Chg/Directional
+    Intent, IST Entry Timestamp. Futures has no Action/Execution-State
+    concept (that's an options-chain thing), so rows are tinted by
+    Directional Intent instead and there's no merged tier column.
+    """
+    def _fmt_money(v):
+        return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
+
+    def _fmt_num(v, decimals=0):
+        return f"{v:,.{decimals}f}" if v not in (None, "") and pd.notna(v) else "—"
+
+    def _fmt_pct(v):
+        if v in (None, "") or pd.isna(v):
+            return "—"
+        color = "#3fb950" if v >= 0 else "#f85149"
+        return f'<span style="color:{color}">{"+" if v >= 0 else ""}{v:.2f}%</span>'
+
+    def _fmt_text(v):
+        return v if v not in (None, "") and pd.notna(v) else "—"
+
+    def _fmt_ts(v):
+        if v in (None, "") or pd.isna(v):
+            return "—"
+        s = str(v)
+        time_part = s.split(" ")[-1] if " " in s else s
+        return f'<span title="{s} IST">{time_part} IST</span>'
+
+    if "Directional Intent" in df.columns:
+        df = df.sort_values(
+            by=["Directional Intent", "Trend Score"] if "Trend Score" in df.columns else ["Directional Intent"],
+            ascending=[True, False] if "Trend Score" in df.columns else [True],
+            kind="stable",
+        )
+
+    headers = ["Stock", "CMP", "%Chg", "Directional Intent", "Buildup", "OI", "OI Chg",
+               "Entry", "Entry Timestamp (IST)", "SL", "Target", "Expiry"]
+
+    rows_html = []
+    for _, r in df.iterrows():
+        intent = r.get("Directional Intent", "")
+        intent_color = "#3fb950" if intent == "BULLISH" else "#f85149" if intent == "BEARISH" else "#8b949e"
+        cells = [
+            f'<td style="font-weight:700;">{_tv_link(r.get("Stock", "—"))}</td>',
+            f'<td>{_fmt_money(r.get("CMP"))}</td>',
+            f'<td>{_fmt_pct(r.get("%Chg"))}</td>',
+            f'<td style="color:{intent_color};font-weight:600;">{_fmt_text(intent)}</td>',
+            f'<td>{_fmt_text(r.get("Buildup"))}</td>',
+            f'<td>{_fmt_num(r.get("OI"))}</td>',
+            f'<td>{_fmt_num(r.get("OI Chg"))}</td>',
+            f'<td>{_fmt_money(r.get("Entry"))}</td>',
+            f'<td style="color:var(--muted);font-size:11px;">{_fmt_ts(r.get("Entry Timestamp"))}</td>',
+            f'<td>{_fmt_money(r.get("SL"))}</td>',
+            f'<td>{_fmt_money(r.get("Target"))}</td>',
+            f'<td>{_fmt_text(r.get("Expiry"))}</td>',
+        ]
+        rows_html.append(
+            f'<tr style="background:{intent_color}14;border-left:3px solid {intent_color};">'
+            + "".join(cells) + "</tr>"
+        )
+
+    header_html = "".join(
+        f'<th style="text-align:left;padding:6px 10px;color:var(--muted);'
+        f'font-size:11px;text-transform:uppercase;white-space:nowrap;">{h}</th>'
+        for h in headers
+    )
+    return (
+        '<div style="overflow-x:auto;">'
+        '<table style="width:100%;border-collapse:collapse;font-size:13px;">'
+        f'<thead><tr>{header_html}</tr></thead>'
+        f'<tbody>{"".join(rows_html)}</tbody>'
+        '</table></div>'
+        '<style>'
+        'table td{padding:6px 10px;color:var(--text);border-bottom:1px solid rgba(255,255,255,0.05);white-space:nowrap;}'
+        '.tv-link{color:inherit;text-decoration:none;border-bottom:1px dotted var(--muted);}'
+        '.tv-link:hover{color:#58a6ff;border-bottom-color:#58a6ff;}'
         '</style>'
     )
 
@@ -2419,19 +2543,11 @@ def _fo_opportunities_panel():
             st.caption("No live futures data available right now — check the Upstox token, or "
                        "every F&O name is currently NEUTRAL on DORE's own Trend Engine (Stage 1).")
         else:
-            st.dataframe(
-                fut_df, hide_index=True, use_container_width=True,
-                column_config={
-                    "CMP":        st.column_config.NumberColumn("CMP", format="₹%.2f"),
-                    "%Chg":       st.column_config.NumberColumn("%Chg", format="%.2f%%"),
-                    "OI":         st.column_config.NumberColumn("OI", format="%d"),
-                    "OI Chg":     st.column_config.NumberColumn("OI Chg (today)", format="%d"),
-                    "Entry":      st.column_config.NumberColumn("Entry", format="₹%.2f"),
-                    "Target":     st.column_config.NumberColumn("Target (T1)", format="₹%.2f"),
-                    "SL":         st.column_config.NumberColumn("SL", format="₹%.2f"),
-                    "Trend Score": st.column_config.NumberColumn("Trend Score", format="%.0f"),
-                },
-            )
+            if "Entry Timestamp" not in fut_df.columns:
+                # Back-compat: cached df from before this column existed.
+                fut_df = fut_df.copy()
+                fut_df["Entry Timestamp"] = None
+            st.markdown(_futures_table_html(fut_df), unsafe_allow_html=True)
             st.caption("Buildup = today's price change vs today's OI change (Long Buildup: price↑ "
                        "OI↑ · Short Covering: price↑ OI↓ · Short Buildup: price↓ OI↑ · Long Unwinding: "
                        "price↓ OI↓). OI Chg resets at market open each session. Directional Intent/"
@@ -2455,15 +2571,19 @@ def _fo_opportunities_panel():
                        "the Market Intelligence index cards for why).")
         else:
             _opt_display_cols = [
-                "Symbol", "Action", "Recommendation", "Leg", "Strike", "Premium", "Premium %Chg",
-                "Directional Intent", "Strike Type", "Execution State",
-                "Trend Score", "Execution Score", "Derivative Confidence", "Risk Quality",
-                "Opportunity Score", "Entry", "SL", "T1", "T2", "Plan", "Expiry", "Reason",
+                "Symbol", "LTP", "Action", "Recommendation", "Leg", "Strike", "Premium", "Premium %Chg",
+                "Strike Type", "Execution State",
+                "Opportunity Score", "Entry", "Entry Timestamp", "SL", "T1", "T2", "Plan", "Expiry", "Reason",
             ]
             # Older cached runs (or a plan-enrichment failure) may not have
             # every column yet — filter to what's actually present rather
             # than KeyError on a partial frame.
             opt_df_display = opt_df[[c for c in _opt_display_cols if c in opt_df.columns]].copy()
+            for _missing_col in ("LTP", "Entry Timestamp"):
+                # Back-compat: a cached df from before these columns
+                # existed — render blank rather than KeyError.
+                if _missing_col not in opt_df_display.columns:
+                    opt_df_display[_missing_col] = None
             if "Action" not in opt_df_display.columns:
                 # Back-compat: a cached df from before the Action column
                 # existed. Derive it inline rather than failing the panel.
