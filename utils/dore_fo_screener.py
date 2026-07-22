@@ -39,6 +39,10 @@ from utils.dore_engine import (
     BULLISH, BEARISH, NEUTRAL, NOT_READY,
 )
 from utils.dore_settings import DORESettings
+from utils.position_sizing import (
+    size_position, PositionSizingSettings, PortfolioContext, ExistingPosition,
+)
+from utils.sector_map import get_sector
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +57,37 @@ def _load_settings(cfg: Optional[DORESettings]) -> DORESettings:
         return DORESettings.from_dict(st.session_state.get("dore_settings", {}))
     except Exception:
         return DORESettings()
+
+
+def _load_position_sizing_inputs() -> tuple[float, dict, list[ExistingPosition]]:
+    """Reads the 💰 Position Sizing settings (pages/settings.py, System
+    tab) plus the portfolio's open positions, ONCE per screener run —
+    not per candidate, since utils.position_sizing.load_existing_positions()
+    is a Supabase round-trip and this function is called inside a loop
+    over up to ~10 Stage-3 survivors (see compute_fo_opportunities()).
+
+    Fails soft to (0.0 capital, lot=1 everywhere, no positions) — same
+    pattern as _load_settings() above. A 0-capital PortfolioContext
+    blocks every candidate in size_position() rather than sizing off
+    stale/wrong numbers, which is the safe failure mode here.
+    """
+    try:
+        import streamlit as st
+        from utils.position_sizing import load_existing_positions
+
+        ss = st.session_state
+        available_capital = float(ss.get("available_capital", 0.0))
+        lot_sizes = {
+            "STOCK":     int(ss.get("stock_lot_size", 1)),
+            "NIFTY":     int(ss.get("nifty_lot_size", 1)),
+            "BANKNIFTY": int(ss.get("banknifty_lot_size", 1)),
+            "SENSEX":    int(ss.get("sensex_lot_size", 1)),
+        }
+        positions = load_existing_positions()
+        return available_capital, lot_sizes, positions
+    except Exception:
+        logger.exception("Position sizing inputs failed to load (non-fatal) — sizing columns will show blocked")
+        return 0.0, {"STOCK": 1, "NIFTY": 1, "BANKNIFTY": 1, "SENSEX": 1}, []
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -340,6 +375,9 @@ def compute_fo_opportunities(
     # worth the complexity.
     stock_atm_options = fetch_batch_stock_atm_options_upstox(stock_symbols, progress_cb=progress_cb) if stock_symbols else {}
 
+    _avail_capital, _lot_sizes, _existing_positions = _load_position_sizing_inputs()
+    _sizing_cfg = PositionSizingSettings()
+
     rows = []
     for symbol, row in live_pool.items():
         try:
@@ -404,6 +442,19 @@ def compute_fo_opportunities(
             if premium_prev not in (None, 0) else None
         )
 
+        # ── Position Sizing (utils/position_sizing.py) — downstream of
+        # DORE, per RFC-001 §4/§12. Never re-derives result's own
+        # direction/strike/expiry/entry/stop/targets; only decides lots.
+        _lot_size = _lot_sizes["NIFTY" if symbol == "NIFTY" else
+                                "BANKNIFTY" if symbol == "BANKNIFTY" else
+                                "SENSEX" if symbol == "SENSEX" else "STOCK"]
+        _sector = None if symbol in _INDICES else get_sector(symbol)
+        _portfolio_ctx = PortfolioContext(
+            available_capital=_avail_capital, existing_positions=_existing_positions,
+            lot_size=_lot_size, sector=_sector,
+        )
+        _sized = size_position(result, _portfolio_ctx, _sizing_cfg, symbol=symbol)
+
         rows.append({
             "Symbol": symbol,
             "LTP": row.get("price"),
@@ -441,6 +492,19 @@ def compute_fo_opportunities(
             "Premium Behavior": "Strengthening" if result.premium_strengthening else "Not confirmed",
             "Premium Behavior Score": result.premium_behavior_score,
             "Hard Gate Pass": result.risk_hard_gate_pass,
+            # ── Position Sizing — see utils/position_sizing.py. Blocked
+            # is independent of Hard Gate Pass: a trade can clear DORE's
+            # own risk gate and still be blocked here on portfolio-level
+            # caps (open positions, sector exposure, daily risk budget).
+            "Lots": _sized.lots,
+            "Quantity": _sized.quantity,
+            "Capital Deployed": _sized.capital_deployed,
+            "Capital at Risk": _sized.capital_at_risk,
+            "Capital at Risk %": _sized.capital_at_risk_pct,
+            "Sizing Blocked": _sized.blocked,
+            "Sizing Reason": _sized.block_reasons[-1] if _sized.block_reasons else (
+                _sized.warnings[-1] if _sized.warnings else ""
+            ),
         })
 
     out = pd.DataFrame(rows)
