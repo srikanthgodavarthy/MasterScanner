@@ -309,6 +309,48 @@ def build_portfolio_context(
       on a row (real schema gap — that field is optional today), so the
       risk-budget gate degrades to "no data for this position" rather
       than blocking on a guess.
+
+    For a single trade-decision (one candidate) this is fine as-is. A
+    caller sizing MANY candidates in one pass (e.g. the F&O screener's
+    results table) should call load_existing_positions() once instead
+    and build one PortfolioContext per candidate directly — see that
+    function's docstring.
+    """
+    positions = load_existing_positions(sector_map)
+
+    def _sector_for(sym: str) -> Optional[str]:
+        if sector_map is not None:
+            return sector_map.get(sym)
+        from utils.sector_map import get_sector
+        return get_sector(sym)
+
+    resolved_candidate_sector = candidate_sector
+    if resolved_candidate_sector is None and candidate_symbol:
+        resolved_candidate_sector = _sector_for(str(candidate_symbol).upper().strip())
+
+    return PortfolioContext(
+        available_capital=available_capital,
+        existing_positions=positions,
+        lot_size=lot_size,
+        sector=resolved_candidate_sector,
+        risk_used_today_pct=risk_used_today_pct,
+    )
+
+
+def load_existing_positions(sector_map: Optional[dict] = None) -> list[ExistingPosition]:
+    """The I/O core of build_portfolio_context(), split out so callers
+    that need to size MANY candidates in one pass (the F&O screener)
+    can fetch open positions ONCE and construct a PortfolioContext per
+    candidate directly, instead of one Supabase round-trip per row:
+
+        positions = load_existing_positions()
+        for candidate in candidates:
+            ctx = PortfolioContext(available_capital=cap, existing_positions=positions,
+                                    lot_size=lot_for(candidate), sector=sector_for(candidate))
+            size_position(dore_result, ctx)
+
+    Sector resolution and the initial_stop fallback behave exactly as
+    documented on build_portfolio_context().
     """
     from utils.supabase_client import load_portfolio  # local import: keep this the only I/O entry point
     from utils.sector_map import get_sector
@@ -336,15 +378,4 @@ def build_portfolio_context(
                 capital_at_risk=capital_at_risk,
             )
         )
-
-    resolved_candidate_sector = candidate_sector
-    if resolved_candidate_sector is None and candidate_symbol:
-        resolved_candidate_sector = _sector_for(str(candidate_symbol).upper().strip())
-
-    return PortfolioContext(
-        available_capital=available_capital,
-        existing_positions=positions,
-        lot_size=lot_size,
-        sector=resolved_candidate_sector,
-        risk_used_today_pct=risk_used_today_pct,
-    )
+    return positions
