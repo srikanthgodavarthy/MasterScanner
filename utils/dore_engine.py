@@ -50,7 +50,11 @@ PIPELINE
     Stage 4  Risk Engine                  -> Risk Quality + hard-gate
     Stage 5  Opportunity Engine           -> weighted Opportunity Score +
                                               composed Recommendation
-    Stage 5b Strike & Expiry Selection    -> ATM/ITM + weekly/next-week
+    Stage 5b Strike & Expiry Selection    -> adaptive ATM/ITM strike
+                                              optimizer (delta-band baseline,
+                                              walked further ITM against the
+                                              nearest OI wall) + weekly/
+                                              next-week expiry
 
 Every threshold is read from utils.dore_settings.DORESettings — nothing
 here is hardcoded.
@@ -249,7 +253,13 @@ class TradePlan:
         return abs(self.target1 - self.entry) / risk
 
 
-def build_trade_plan(inp: "DOREInput", cfg: DORESettings, direction: Optional[str]) -> TradePlan:
+def build_trade_plan(
+    inp: "DOREInput",
+    cfg: DORESettings,
+    direction: Optional[str],
+    strike_type: Optional[str] = None,
+    itm_steps: int = 0,
+) -> TradePlan:
     """Premium-denominated TradePlan. A BUY_CE/BUY_PE recommendation
     trades the OPTION, not the underlying — so Entry/Stop/Targets must
     be in premium rupees, not underlying rupees. Mixing the two
@@ -273,6 +283,20 @@ def build_trade_plan(inp: "DOREInput", cfg: DORESettings, direction: Optional[st
 
     direction=None returns an empty (all-zero) plan — no direction means
     no trade structure to plan yet.
+
+    strike_type / itm_steps — Stage 5b's actual pick (RFC-001 §5's
+    "trade-construction runs at the end of the same pipeline that
+    produces the recommendation"): `inp.ce_delta`/`inp.pe_delta` are read
+    off the ATM chain row, so they describe the ATM leg's delta even when
+    Stage 5b has walked the strike ITM (baseline delta-band preference,
+    or the OI-wall-avoidance walk). An ITM leg's own delta is always
+    higher than the ATM leg's, so once Stage 5b confirms an ITM pick,
+    the premium-move scaling here is bumped up by
+    `cfg.itm_delta_bump_per_step` per step walked ITM (capped at
+    `cfg.itm_delta_cap`) instead of silently reusing the ATM delta. Callers
+    that haven't run Stage 5b yet (e.g. the Risk Engine's own preliminary
+    R:R read, before strike selection exists) can omit these and get the
+    same ATM-assumption plan as before.
     """
     if direction not in ("CE", "PE"):
         return TradePlan(direction=None)
@@ -283,6 +307,9 @@ def build_trade_plan(inp: "DOREInput", cfg: DORESettings, direction: Optional[st
 
     delta = inp.ce_delta if direction == "CE" else inp.pe_delta
     delta_mag = abs(delta) if delta is not None else cfg.default_option_delta
+    if strike_type == "ITM" and itm_steps > 0:
+        delta_mag += cfg.itm_delta_bump_per_step * itm_steps
+        delta_mag = min(delta_mag, cfg.itm_delta_cap)
     delta_mag = max(min(delta_mag, 1.0), 0.05)  # sane bounds — deltas are never 0 or >1 in practice
 
     underlying_atr = max(inp.atr, 1e-6)
@@ -1414,30 +1441,93 @@ def stage5b_strike_and_expiry(
     direction: Optional[str],
     execution_score: float,
     risk_hard_gate_pass: bool,
-) -> tuple[Optional[str], Optional[str], list[str]]:
-    """Pick ATM vs ITM strike (target Delta 0.55-0.70) and current-week
-    vs next-week expiry: current week only if execution is genuinely
-    strong AND days-to-expiry is short AND no risk hard-gate fired.
+) -> tuple[Optional[str], Optional[str], Optional[float], int, list[str]]:
+    """Adaptive strike optimizer + expiry selection.
+
+    Two independent passes decide the strike, then expiry is decided last:
+
+      1. Delta-band baseline — same as before: target Delta 0.55-0.70.
+         Below the band -> prefer ITM (1 step); above or inside -> ATM.
+      2. OI-wall-based adjustment — the baseline pick above is only a
+         starting point. If it doesn't leave `cfg.strike_wall_buffer_steps`
+         worth of room to the nearest HOSTILE OI wall (the CE wall =
+         resistance for a CE trade, the PE wall = support for a PE trade
+         — Stage 3's own `highest_ce_oi_strike` / `highest_pe_oi_strike`
+         reads, reused here rather than re-fetched), the optimizer walks
+         the strike further ITM, one `cfg.strike_step` at a time, up to
+         `cfg.strike_max_itm_steps`. This is the actual "trade construction"
+         piece RFC-001 places at the end of the pipeline: it is informed
+         by the same OI walls Stage 3's corridor score reads, but decides
+         a concrete tradeable strike, not a 0-100 score.
+
+    Returns (strike_type, expiry, suggested_strike, itm_steps, reasons).
+    `itm_steps` is exposed so the orchestrator can pass it straight into
+    build_trade_plan()'s delta adjustment — no strike math needs to be
+    redone downstream.
     """
     reasons: list[str] = []
     if direction is None:
-        return None, None, reasons
+        return None, None, None, 0, reasons
 
     delta = inp.ce_delta if direction == "CE" else inp.pe_delta
     if delta is not None:
         d = abs(delta)
         if cfg.target_delta_min <= d <= cfg.target_delta_max:
             strike_type = "ATM"
+            itm_steps = 0
             reasons.append(f"Delta={d:.2f} in target band — ATM strike")
         elif d < cfg.target_delta_min:
             strike_type = "ITM"
+            itm_steps = 1
             reasons.append(f"Delta={d:.2f} below target band — move ITM")
         else:
             strike_type = "ATM"
+            itm_steps = 0
             reasons.append(f"Delta={d:.2f} above target band — stay ATM")
     else:
         strike_type = "ATM"
+        itm_steps = 0
         reasons.append("Option Delta not supplied — defaulting to ATM")
+
+    step = cfg.strike_step if cfg.strike_step > 0 else 1.0
+    sign = -1.0 if direction == "CE" else 1.0  # CE moves ITM at LOWER strikes, PE at HIGHER strikes
+
+    def _strike_after(n: int) -> float:
+        return inp.atm_strike + sign * n * step
+
+    def _room_to_wall_steps(strike_px: float, wall_px: float) -> float:
+        # CE: wall is resistance ABOVE the strike -> room = wall - strike.
+        # PE: wall is support BELOW the strike     -> room = strike - wall.
+        room = (wall_px - strike_px) if direction == "CE" else (strike_px - wall_px)
+        return room / step
+
+    wall = inp.highest_ce_oi_strike if direction == "CE" else inp.highest_pe_oi_strike
+    suggested_strike = _strike_after(itm_steps)
+
+    if wall:
+        room_steps = _room_to_wall_steps(suggested_strike, wall)
+        if room_steps < cfg.strike_wall_buffer_steps:
+            wall_label = "CE (resistance)" if direction == "CE" else "PE (support)"
+            reasons.append(
+                f"{wall_label} OI wall at {wall:.0f} leaves only {room_steps:.1f} "
+                f"strike-step(s) of room at {suggested_strike:.0f} — walking further ITM"
+            )
+            while room_steps < cfg.strike_wall_buffer_steps and itm_steps < cfg.strike_max_itm_steps:
+                itm_steps += 1
+                strike_type = "ITM"
+                suggested_strike = _strike_after(itm_steps)
+                room_steps = _room_to_wall_steps(suggested_strike, wall)
+            if room_steps < cfg.strike_wall_buffer_steps:
+                reasons.append(
+                    f"Still only {room_steps:.1f} strike-step(s) of room after "
+                    f"{itm_steps} ITM step(s) (cap={cfg.strike_max_itm_steps}) — "
+                    f"proceeding at the cap; size/stop should account for wall proximity"
+                )
+            else:
+                reasons.append(
+                    f"{itm_steps} ITM step(s) -> {suggested_strike:.0f}, now clears the wall "
+                    f"by {room_steps:.1f} strike-step(s)"
+                )
 
     scalp_ok = (
         inp.days_to_expiry <= cfg.expiry_days_scalp_max
@@ -1451,7 +1541,7 @@ def stage5b_strike_and_expiry(
     else:
         expiry = "NEXT_WEEK"
         reasons.append(f"{inp.days_to_expiry}d to expiry — using next week to protect capital")
-    return strike_type, expiry, reasons
+    return strike_type, expiry, suggested_strike, itm_steps, reasons
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1473,9 +1563,17 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     technical_target = deriv.resistance if direction == "CE" else (deriv.support if direction == "PE" else None)
     oi_intel = stage3_5_option_intelligence(inp, cfg, direction, deriv.expected_move, technical_target)
 
-    trade_plan = build_trade_plan(inp, cfg, direction)
+    # Stage 4's Risk Engine needs a trade_plan to compute R:R (Section 8),
+    # but Stage 5b's strike optimizer needs Stage 4's hard_gate_pass (it
+    # only allows CURRENT_WEEK scalps when no hard gate fired) — a genuine
+    # circular dependency, not an ordering bug. Resolved by building a
+    # PRELIMINARY, ATM-assumption trade_plan here purely to feed the Risk
+    # Engine's R:R gate, then rebuilding the FINAL, strike-aware trade_plan
+    # below once Stage 5b has actually picked a strike. The preliminary
+    # plan is never returned to the caller.
+    prelim_trade_plan = build_trade_plan(inp, cfg, direction)
 
-    risk = stage4_risk_engine(inp, cfg, direction, deriv.corridor_score, trade_plan)
+    risk = stage4_risk_engine(inp, cfg, direction, deriv.corridor_score, prelim_trade_plan)
 
     # Hard gates live outside the scoring framework (RFC-001 §10) — this
     # is the ONLY place Stage 4's event-risk trip-wire and Stage 3.5's
@@ -1488,9 +1586,19 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         deriv.confidence, oi_intel.score, risk.risk_quality, hard_gate_pass, deriv.premium_strengthening,
     )
 
-    strike_type, recommended_expiry, strike_reasons = stage5b_strike_and_expiry(
-        inp, cfg, direction, execution.execution_score, hard_gate_pass,
-    ) if opportunity.recommendation in (BUY_CE_NOW, BUY_CE_BREAKOUT, BUY_PE_NOW, BUY_PE_BREAKDOWN) else (None, None, [])
+    if opportunity.recommendation in (BUY_CE_NOW, BUY_CE_BREAKOUT, BUY_PE_NOW, BUY_PE_BREAKDOWN):
+        strike_type, recommended_expiry, suggested_strike, itm_steps, strike_reasons = stage5b_strike_and_expiry(
+            inp, cfg, direction, execution.execution_score, hard_gate_pass,
+        )
+    else:
+        strike_type, recommended_expiry, suggested_strike, itm_steps, strike_reasons = None, None, None, 0, []
+
+    # Now that Stage 5b has picked an actual strike, rebuild the trade plan
+    # so it can incorporate that pick (RFC-001 §5 — trade construction runs
+    # at the end of the pipeline that produces the recommendation, not
+    # before strike selection exists). This is the plan that ships in the
+    # DOREResult; the preliminary one above only ever fed Stage 4's gate.
+    trade_plan = build_trade_plan(inp, cfg, direction, strike_type=strike_type, itm_steps=itm_steps)
 
     warnings = list(risk.warnings) + list(oi_intel.warnings)
     if deriv.confidence < cfg.derivative_confidence_min and direction is not None:
@@ -1526,7 +1634,7 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         recommended_strike_type=strike_type,
         recommended_expiry=recommended_expiry,
         suggested_direction=direction,
-        suggested_strike=inp.atm_strike if direction else None,
+        suggested_strike=suggested_strike,
         expected_move=deriv.expected_move,
         nearest_resistance=round(deriv.resistance, 2) if deriv.resistance else None,
         nearest_support=round(deriv.support, 2) if deriv.support else None,

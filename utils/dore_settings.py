@@ -185,6 +185,20 @@ DORE_DEFAULTS: dict = {
     "target_delta_max":            0.70,
     "expiry_days_scalp_max":         1,    # days-to-expiry <= this = eligible for current-week scalping
     "execution_score_scalp_min":  70.0,    # Execution Score floor required to justify 0-1 DTE scalping
+    # OI-wall-based adaptive strike optimizer (2026-07-22): the delta-band
+    # check above picks a BASELINE ATM/ITM preference; this block walks the
+    # strike further ITM, one strike_step at a time, whenever the baseline
+    # strike doesn't leave enough room to the nearest hostile OI wall
+    # (highest_ce_oi_strike = resistance for a CE trade, highest_pe_oi_strike
+    # = support for a PE trade — same Stage-3 wall reads used by the
+    # corridor score, reused here rather than re-fetched).
+    "strike_wall_buffer_steps":     1.0,   # min room to the wall, in strike_step multiples
+    "strike_max_itm_steps":            3,   # hard cap on how far the optimizer will walk ITM
+    # build_trade_plan() delta-scaling adjustment once Stage 5b has actually
+    # picked an ITM strike (an ITM leg's own delta is higher than whatever
+    # delta was read off the ATM chain row) — see build_trade_plan().
+    "itm_delta_bump_per_step":     0.08,
+    "itm_delta_cap":                0.95,
 
     # ── Misc ─────────────────────────────────────────────────────
     "strike_step":                50.0,   # index strike interval (NIFTY=50, BANKNIFTY=100)
@@ -295,6 +309,11 @@ class DORESettings:
     target_delta_max: float = 0.70
     expiry_days_scalp_max: int = 1
     execution_score_scalp_min: float = 70.0
+
+    strike_wall_buffer_steps: float = 1.0
+    strike_max_itm_steps: int = 3
+    itm_delta_bump_per_step: float = 0.08
+    itm_delta_cap: float = 0.95
 
     strike_step: float = 50.0
 
