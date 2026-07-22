@@ -1832,6 +1832,23 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
         warn_html  = (
             f'<div class="mo-index-dore-warn">⚠ {warnings[0]}</div>' if warnings else ""
         )
+        # Position Sizing (utils/position_sizing.py) — downstream of DORE,
+        # never re-deriving anything above. Only rendered when the card
+        # is actually holding a DOREResult with a resolvable sizing state
+        # (i.e. dore.get("lots") is present — a plain WAIT/NO_TRADE dict
+        # from an older cache without sizing fields just skips this row).
+        sizing_html = ""
+        if "lots" in dore:
+            if dore.get("sizing_blocked"):
+                _size_reason = dore.get("sizing_reason", "") or "blocked"
+                sizing_html = f'<div class="mo-index-dore-warn">🚫 Sizing: {_size_reason}</div>'
+            elif dore.get("lots"):
+                sizing_html = (
+                    f'<div class="mo-index-dore-reason">'
+                    f'{dore["lots"]} lot(s) · {dore.get("quantity", 0)} qty · '
+                    f'₹{dore.get("capital_at_risk", 0):,.0f} at risk '
+                    f'({dore.get("capital_at_risk_pct", 0):.1f}%)</div>'
+                )
         # Built via list+join rather than an f-string with {warn_html} on
         # its own line: when there are no warnings, warn_html is "" and an
         # interpolated-empty line like "  \n" is a whitespace-only line —
@@ -1851,6 +1868,8 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
         ]
         if warn_html:
             dore_html_parts.append(warn_html)
+        if sizing_html:
+            dore_html_parts.append(sizing_html)
         dore_html_parts.append(_dore_debug_html(dore, reasons, warnings))
         dore_html = "\n".join(dore_html_parts)
 
@@ -2779,6 +2798,26 @@ def _market_intelligence_fragment():
 
         _dore_cfg = DORESettings.from_dict(st.session_state.get("dore_settings", {}))
 
+        # ── Position Sizing inputs, loaded ONCE for all three index
+        # cards (utils/position_sizing.py) — RFC-001 §4/§12 scopes this
+        # out of DORE itself; it's a downstream layer over a finished
+        # DOREResult, never touching direction/strike/expiry/entry/stop.
+        from utils.position_sizing import (
+            size_position, PositionSizingSettings, PortfolioContext, load_existing_positions,
+        )
+        try:
+            _avail_capital = float(st.session_state.get("available_capital", 0.0))
+            _index_lot_sizes = {
+                "NIFTY":     int(st.session_state.get("nifty_lot_size", 1)),
+                "SENSEX":    int(st.session_state.get("sensex_lot_size", 1)),
+                "BANKNIFTY": int(st.session_state.get("banknifty_lot_size", 1)),
+            }
+            _existing_positions = load_existing_positions()
+        except Exception:
+            logger.exception("Position sizing inputs failed to load for index cards (non-fatal)")
+            _avail_capital, _index_lot_sizes, _existing_positions = 0.0, {"NIFTY": 1, "SENSEX": 1, "BANKNIFTY": 1}, []
+        _sizing_cfg = PositionSizingSettings()
+
         def _index_dore(index_key: str, ohlcv, oi_key: str, ce_pe_chg: tuple):
             try:
                 intraday_5m = fetch_index_intraday_5m_upstox(index_key)
@@ -2802,7 +2841,22 @@ def _market_intelligence_fragment():
                 dore_input = build_dore_input_for_index(
                     index_key, ohlcv, oi, atm_chain_row=atm_chain_row, execution_features=exec_features,
                 )
-                return compute_dore(dore_input, _dore_cfg).as_dict() if dore_input else None
+                if not dore_input:
+                    return None
+                result = compute_dore(dore_input, _dore_cfg)
+                out = result.as_dict()
+                ctx = PortfolioContext(
+                    available_capital=_avail_capital, existing_positions=_existing_positions,
+                    lot_size=_index_lot_sizes.get(index_key, 1), sector=None,  # indices have no sector
+                )
+                sized = size_position(result, ctx, _sizing_cfg, symbol=index_key)
+                out["lots"] = sized.lots
+                out["quantity"] = sized.quantity
+                out["capital_at_risk"] = sized.capital_at_risk
+                out["capital_at_risk_pct"] = sized.capital_at_risk_pct
+                out["sizing_blocked"] = sized.blocked
+                out["sizing_reason"] = sized.block_reasons[-1] if sized.block_reasons else ""
+                return out
             except Exception:
                 logger.exception("DORE 2.0 computation failed for %s (non-fatal)", index_key)
                 return None
