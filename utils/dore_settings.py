@@ -79,6 +79,13 @@ DORE_DEFAULTS: dict = {
     "w_exec_volume_expansion":    15.0,   # volume expansion
     "w_exec_atr_expansion":       10.0,   # ATR/range expansion
 
+    # ── Intraday Reversal Alert (informational — separate from Stage 1) ─
+    # Surfaces "big move against trend today" without touching Stage 1's
+    # own Directional Intent / Trend Score. Purely a same-day sanity flag
+    # sitting alongside the daily call, not a re-vote on it.
+    "reversal_alert_move_pct_min": 1.5,   # |intraday % move from day_open| >= this to qualify
+    "reversal_alert_atr_mult_min": 0.75,  # AND move >= this many multiples of daily ATR
+
     # ── Stage 3: Derivative Intelligence (Derivative Confidence) ─
     # Live Upstox option chain — the one expensive stage. Refresh 30-60s
     # or on Live Candidate Pool change.
@@ -242,6 +249,9 @@ class DORESettings:
     w_exec_compression: float = 15.0
     w_exec_volume_expansion: float = 15.0
     w_exec_atr_expansion: float = 10.0
+
+    reversal_alert_move_pct_min: float = 1.5
+    reversal_alert_atr_mult_min: float = 0.75
 
     oi_pcr_bull_min: float = 1.10
     oi_pcr_bear_max: float = 0.85
