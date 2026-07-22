@@ -97,6 +97,16 @@ def _action_tier(recommendation: str) -> str:
     return _ACTION_TIER.get(recommendation, "Wait")
 
 
+def _now_ist_str() -> str:
+    """Current time formatted as IST (Asia/Kolkata), HH:MM:SS — same
+    tz convention already used by utils.scanner_engine for 'today'
+    comparisons. Used to stamp when a row's recommendation/plan was
+    computed, since DORE recomputes every scan (Section 4)."""
+    import pytz
+    return pd.Timestamp.now(tz=pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
+
+
+
 def stage1_trend_qualification(
     symbols: list[str], cfg: Optional[DORESettings] = None,
     period: str = "6mo", progress_cb=None,
@@ -396,6 +406,7 @@ def compute_fo_opportunities(
 
         rows.append({
             "Symbol": symbol,
+            "LTP": row.get("price"),
             "Action": _action_tier(result.recommendation),
             "Recommendation": result.recommendation,
             "Leg": leg,
@@ -418,6 +429,7 @@ def compute_fo_opportunities(
             # SL/T1/T2/Premium), so the Plan column can lock these in
             # place once a plan opens.
             "Entry": result.trade_plan.entry,
+            "Entry Timestamp": _now_ist_str(),
             "SL": result.trade_plan.stop_loss,
             "T1": result.trade_plan.target1,
             "T2": result.trade_plan.target2,
@@ -560,7 +572,8 @@ def top_futures_opportunities(top_n: int = 15, universe: Optional[list[str]] = N
             "OI": fq.get("oi"), "OI Chg": round(oi_chg) if oi_chg else 0,
             "Buildup": buildup, "Directional Intent": row["directional_intent"],
             "Trend Score": row["trend_score"],
-            "Entry": plan.entry, "Target": plan.target1, "SL": plan.stop_loss,
+            "Entry": plan.entry, "Entry Timestamp": _now_ist_str(),
+            "Target": plan.target1, "SL": plan.stop_loss,
             "Expiry": fq.get("expiry"),
         })
 
