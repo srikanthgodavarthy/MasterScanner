@@ -181,6 +181,8 @@ class DOREInput:
     nr7:               bool = False   # narrowest range of the last 7 bars
     intraday_vol_ratio: float = 1.0   # intraday volume expansion vs its own recent average
     intraday_atr_expansion_pct: float = 0.0   # intraday ATR/range expansion vs its own recent average, %
+    day_open:  float = 0.0   # today's session open — feeds the Intraday Reversal Alert only
+    prev_close: float = 0.0  # prior day's close — fallback baseline if day_open isn't available yet
 
     # ── Stage 3 (Derivative Intelligence) — live Upstox option chain ─
     atm_strike:       float = 0.0
@@ -388,6 +390,10 @@ class DOREResult:
     directional_intent: str = NEUTRAL   # BULLISH | BEARISH | NEUTRAL   (Stage 1)
     trend_score:        float = 50.0    # 0-100                          (Stage 1)
 
+    intraday_reversal_alert:     bool = False   # informational only — never gates the recommendation
+    intraday_reversal_move_pct:  float = 0.0
+    intraday_reversal_reason:    str = ""
+
     execution_state:    str = NOT_READY  # READY_NOW | BREAKOUT_PENDING | WATCH | NOT_READY (Stage 2)
     execution_score:    float = 0.0      # 0-100                          (Stage 2)
 
@@ -552,6 +558,20 @@ class TrendResult:
 
 
 @dataclass(frozen=True)
+class IntradayReversalAlert:
+    """Informational, same-day flag — NOT part of Stage 1. Surfaces 'big
+    move against trend today' without re-running or overriding Stage 1's
+    Directional Intent / Trend Score, which stay a persistent daily read
+    (Section 12's refresh cadence). This check re-evaluates every poll on
+    the existing Stage 1 output; it never feeds back into it. See
+    check_intraday_reversal_alert()."""
+    triggered:  bool = False
+    move_pct:   float = 0.0    # signed % move from day_open (or prev_close fallback)
+    move_direction: Optional[str] = None   # "UP" | "DOWN" | None
+    reason:     str = ""
+
+
+@dataclass(frozen=True)
 class ExecutionResult:
     """Stage 2 output — Execution State (RFC-001 §7)."""
     execution_score: float
@@ -708,6 +728,66 @@ def stage1_trend_engine(inp: DOREInput, cfg: DORESettings) -> TrendResult:
     logger.debug("[DORE:%s] Stage1 reasons=%s", inp.symbol, reasons)
     reasons += _gate_lines(checks)
     return TrendResult(trend_score=trend_score, directional_intent=intent, reasons=tuple(reasons))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  INTRADAY REVERSAL ALERT  (informational — separate from Stage 1)
+# ══════════════════════════════════════════════════════════════════
+
+def check_intraday_reversal_alert(
+    inp: DOREInput, cfg: DORESettings, directional_intent: str
+) -> IntradayReversalAlert:
+    """Flags a big same-day move AGAINST Stage 1's Directional Intent.
+    Purely additive: reads `directional_intent` (Stage 1's already-
+    computed output) but does not touch Stage 1's trend_score or intent,
+    and Stage 1 does not call this — callers run it alongside Stage 1,
+    not inside it. Safe to re-run every poll even though Stage 1 itself
+    is only re-run once per completed daily candle.
+
+    Two conditions must BOTH hold to trigger, so a routine wiggle on a
+    NEUTRAL day or a small move on a high-ATR name doesn't fire:
+      1. |% move from day_open| >= cfg.reversal_alert_move_pct_min
+      2. that same move >= cfg.reversal_alert_atr_mult_min x daily ATR
+    ...and the move's direction must be opposite Stage 1's intent. On
+    NEUTRAL intent there is no "against trend" to violate, so it never
+    triggers regardless of move size.
+    """
+    baseline = inp.day_open or inp.prev_close
+    if not baseline or not inp.price:
+        return IntradayReversalAlert(reason="day_open/prev_close or price not supplied — check skipped")
+
+    move_pct = (inp.price - baseline) / baseline * 100.0
+    move_direction = "UP" if move_pct > 0 else ("DOWN" if move_pct < 0 else None)
+
+    if directional_intent == NEUTRAL or move_direction is None:
+        return IntradayReversalAlert(move_pct=round(move_pct, 2), move_direction=move_direction,
+                                      reason="NEUTRAL Directional Intent — no trend to move against")
+
+    against_trend = (directional_intent == BULLISH and move_direction == "DOWN") or \
+                     (directional_intent == BEARISH and move_direction == "UP")
+    if not against_trend:
+        return IntradayReversalAlert(move_pct=round(move_pct, 2), move_direction=move_direction,
+                                      reason="Move is with, not against, today's Directional Intent")
+
+    pct_ok = abs(move_pct) >= cfg.reversal_alert_move_pct_min
+    atr_ok = inp.atr > 0 and abs(inp.price - baseline) >= cfg.reversal_alert_atr_mult_min * inp.atr
+    triggered = pct_ok and atr_ok
+
+    if triggered:
+        reason = (f"Big move against trend today: {move_pct:+.2f}% vs {directional_intent} "
+                  f"Directional Intent ({abs(inp.price - baseline):.2f} pts, "
+                  f"{abs(inp.price - baseline) / inp.atr:.2f}x ATR)" if inp.atr > 0 else
+                  f"Big move against trend today: {move_pct:+.2f}% vs {directional_intent} Directional Intent")
+    elif not pct_ok:
+        reason = f"{move_pct:+.2f}% move against trend — below the {cfg.reversal_alert_move_pct_min:.1f}% floor"
+    else:
+        reason = f"{move_pct:+.2f}% move against trend — below the {cfg.reversal_alert_atr_mult_min:.2f}x ATR floor"
+
+    logger.info("[DORE:%s] IntradayReversalAlert triggered=%s move_pct=%.2f intent=%s",
+                inp.symbol, triggered, move_pct, directional_intent)
+
+    return IntradayReversalAlert(triggered=triggered, move_pct=round(move_pct, 2),
+                                  move_direction=move_direction, reason=reason)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1555,6 +1635,7 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     cfg = settings or DORESettings.from_dict(DORE_DEFAULTS)
 
     trend = stage1_trend_engine(inp, cfg)
+    reversal_alert = check_intraday_reversal_alert(inp, cfg, trend.directional_intent)
     execution = stage2_execution_engine(inp, cfg, trend.directional_intent)
     deriv = stage3_derivative_intelligence(inp, cfg, trend.directional_intent)
 
@@ -1601,6 +1682,8 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     trade_plan = build_trade_plan(inp, cfg, direction, strike_type=strike_type, itm_steps=itm_steps)
 
     warnings = list(risk.warnings) + list(oi_intel.warnings)
+    if reversal_alert.triggered:
+        warnings.append(f"⚠ Intraday Reversal Alert — {reversal_alert.reason}")
     if deriv.confidence < cfg.derivative_confidence_min and direction is not None:
         warnings.append(f"Derivative Confidence={deriv.confidence:.0f} below the "
                          f"{cfg.derivative_confidence_min:.0f} confirmation floor")
@@ -1616,6 +1699,9 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         conviction_score_10=round(opportunity.opportunity_score / 10.0, 1),
         directional_intent=trend.directional_intent,
         trend_score=round(trend.trend_score, 1),
+        intraday_reversal_alert=reversal_alert.triggered,
+        intraday_reversal_move_pct=reversal_alert.move_pct,
+        intraday_reversal_reason=reversal_alert.reason,
         execution_state=execution.execution_state,
         execution_score=round(execution.execution_score, 1),
         derivative_confidence=round(deriv.confidence, 1),
@@ -1645,10 +1731,10 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     logger.info(
         "[DORE:%s] FINAL recommendation=%s opportunity_score=%.1f intent=%s(%.1f) "
         "execution=%s(%.1f) derivative_confidence=%.1f option_intelligence=%.1f(%s) "
-        "risk_quality=%.1f hard_gate_pass=%s",
+        "risk_quality=%.1f hard_gate_pass=%s reversal_alert=%s",
         inp.symbol, result.recommendation, result.opportunity_score, trend.directional_intent, trend.trend_score,
         execution.execution_state, execution.execution_score, deriv.confidence, oi_intel.score,
-        oi_intel.valuation_status, risk.risk_quality, hard_gate_pass,
+        oi_intel.valuation_status, risk.risk_quality, hard_gate_pass, reversal_alert.triggered,
     )
     return result
 
@@ -1745,7 +1831,9 @@ def build_dore_input(
     execution_features: Optional[dict] = None,  # {"fresh_crossover", "fresh_crossunder", "ema_pullback_bull",
                                                   #  "ema_rejection_bear", "vwap", "orb_high", "orb_low",
                                                   #  "compression", "nr7", "intraday_vol_ratio",
-                                                  #  "intraday_atr_expansion_pct"}
+                                                  #  "intraday_atr_expansion_pct", "day_open", "prev_close"}
+                                                  #  day_open/prev_close feed ONLY the Intraday Reversal
+                                                  #  Alert — no other stage reads them.
     atm_chain_row: Optional[dict] = None,        # {ce_premium, pe_premium, ce_oi, pe_oi, pcr, ce_delta,
                                                   #  pe_delta, ce_spread_pct, pe_spread_pct, ...}
     oi_resistance: Optional[dict] = None,        # {ce_strike, pe_strike, expiry} — nearest OI walls
@@ -1789,6 +1877,8 @@ def build_dore_input(
         nr7=execution_features.get("nr7", False),
         intraday_vol_ratio=execution_features.get("intraday_vol_ratio", 1.0),
         intraday_atr_expansion_pct=execution_features.get("intraday_atr_expansion_pct", 0.0),
+        day_open=execution_features.get("day_open", 0.0),
+        prev_close=execution_features.get("prev_close", 0.0),
 
         atm_strike=atm_chain_row.get("atm_strike", oi_resistance.get("ce_strike", 0.0)),
         ce_premium=atm_chain_row.get("ce_premium", 0.0),
