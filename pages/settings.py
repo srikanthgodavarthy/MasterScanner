@@ -55,6 +55,20 @@ DEFAULTS = {
     "t2_atr_ratio":      0.80,
     "t2_vol_mult":       1.5,
     "nifty_regime_filter": True,
+    # ── Position Sizing (utils/position_sizing.py) ─────────────────
+    # Not fabricated NSE lot sizes — exchange-published lot sizes
+    # change quarterly (last Friday of the expiry cycle), so these
+    # default to 1 and MUST be set to the current published value
+    # before sizing is meaningful. See NSE's F&O lot-size circular.
+    "available_capital":  0.0,
+    "stock_lot_size":     1,   # single value applied to every F&O stock
+                                # in the screener — the app has no
+                                # per-stock lot-size table; if that
+                                # matters, size individual trades by
+                                # hand for now rather than trust this.
+    "nifty_lot_size":     1,
+    "banknifty_lot_size": 1,
+    "sensex_lot_size":    1,
     # [A/B flag — pending 2-4wk backtest before default-on, see decision review 2026-06-17]
     # Adds a Fib golden-zone-pullback pattern rung (independent of CCI recovery state)
     # to the Conviction pattern slot. Targets stocks stuck at pat=8 purely because no
@@ -1009,6 +1023,70 @@ def _tab_system() -> None:
                     st.session_state["watchlist"] = [
                         w for w in st.session_state.get("watchlist", []) if w["symbol"] != rm]
                     st.rerun()
+
+    # ── Position Sizing (utils/position_sizing.py) ──────────────────
+    # Feeds utils.position_sizing.PortfolioContext for both the F&O
+    # screener table and the dashboard index cards. Deliberately NOT
+    # part of DORESettings/dore_settings — RFC-001 §4 scopes portfolio
+    # sizing out of DORE entirely; this is read straight from
+    # st.session_state by whichever page calls size_position(), the
+    # same way dore_settings is.
+    with st.expander("💰 Position Sizing", expanded=False):
+        st.caption(
+            "Feeds Lots / Capital-at-Risk columns on the F&O screener and "
+            "dashboard index cards. Lot sizes are NOT looked up automatically "
+            "— NSE republishes them quarterly, so verify the current value "
+            "before relying on this."
+        )
+        _label("Available Capital (₹)")
+        avail_cap = st.number_input(
+            "Available Capital", min_value=0.0,
+            value=float(_g("available_capital")), step=10_000.0, format="%.2f",
+            key="ni_available_capital", label_visibility="collapsed",
+        )
+        _s("available_capital", float(avail_cap))
+
+        st.markdown("**Lot sizes** (current exchange-published values)")
+        lc1, lc2 = st.columns(2)
+        with lc1:
+            _label("F&O Stocks (applied uniformly)")
+            stock_lot = st.number_input(
+                "Stock lot size", min_value=1, value=int(_g("stock_lot_size")), step=1,
+                key="ni_stock_lot_size", label_visibility="collapsed",
+                help="One value used for every stock in the screener table — "
+                     "there's no per-stock lot-size table in the app. If your "
+                     "stocks span multiple lot sizes, treat this column as "
+                     "indicative, not exact.",
+            )
+            _s("stock_lot_size", int(stock_lot))
+
+            _label("NIFTY")
+            nifty_lot = st.number_input(
+                "Nifty lot size", min_value=1, value=int(_g("nifty_lot_size")), step=1,
+                key="ni_nifty_lot_size", label_visibility="collapsed",
+            )
+            _s("nifty_lot_size", int(nifty_lot))
+        with lc2:
+            _label("BANK NIFTY")
+            bn_lot = st.number_input(
+                "Bank Nifty lot size", min_value=1, value=int(_g("banknifty_lot_size")), step=1,
+                key="ni_banknifty_lot_size", label_visibility="collapsed",
+            )
+            _s("banknifty_lot_size", int(bn_lot))
+
+            _label("SENSEX")
+            sensex_lot = st.number_input(
+                "Sensex lot size", min_value=1, value=int(_g("sensex_lot_size")), step=1,
+                key="ni_sensex_lot_size", label_visibility="collapsed",
+            )
+            _s("sensex_lot_size", int(sensex_lot))
+
+        if avail_cap <= 0:
+            st.warning(
+                "Available Capital is 0 — Lots/Capital-at-Risk columns will show "
+                "every candidate as blocked until this is set.",
+                icon="⚠️",
+            )
 
     with st.expander("🗄️ Database schema", expanded=False):
         st.code(SCHEMA_SQL, language="sql")
