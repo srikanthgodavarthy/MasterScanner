@@ -13,10 +13,28 @@ rendering. Three independent producers write versioned snapshots to
 Supabase on their own cadence, completely outside any Streamlit session
 (see scheduler/scan_worker.py):
 
-    market_intelligence  — every 30s  (utils/market_intelligence.py)
-    fo_scan              — every 60s  (utils/fo_scan.py)
-    live_scanner         — every 2min (utils/live_scanner_job.py, or the
-                            manual Run Scan button in pages/scanner.py)
+    market_intelligence  — every 30s   (utils/market_intelligence.py)
+    fo_scan              — every 60s   (utils/fo_scan.py)
+    live_scanner         — every ~5min, batched (utils/live_scanner_job.py
+                            + scheduler/scan_worker.py's sub-scheduler, or
+                            the manual Run Scan button in pages/scanner.py)
+
+[2026-07-23] render() also starts the background scan loops itself, via
+utils.inprocess_scheduler.start_background_scans(), AFTER its own first
+synchronous Supabase read + render — not app.py at import time. The
+sequence on every fresh session is: read Supabase and show whatever's
+already there, THEN kick off the scanners. st.cache_resource still
+means those loops only launch once per process no matter how many
+reruns/sessions call this.
+
+[2026-07-23] The embedded "🔍 Live Scanner" expander (which wrapped
+pages.scanner.render() — Run Scan button and all) has been removed.
+Now that live_scanner is populated automatically by the background
+sub-scheduler, the Dashboard has no manual-scan button of its own: it
+just shows whatever's in `dash_scan_df` (loaded from Supabase above)
+directly, no fold/expander and no click required. The standalone
+Scanner page (pages/scanner.py) still has its own Run Scan button for
+an on-demand re-run.
 
 Each snapshot row carries scan_id/created_at/status/version (see
 utils/scan_state.py). This page polls only the lightweight metadata for
@@ -3180,6 +3198,17 @@ def render(settings: dict | None = None):
                 unsafe_allow_html=True,
             )
 
+    # ── Kick off the background scanners ──────────────────────────────
+    # Deliberately placed here: AFTER the synchronous Supabase read above
+    # and the ctrl2 block that displays it, so the sequence on a fresh
+    # session is always "read Supabase, show it" first, "start the
+    # market_intelligence/fo_scan/live_scanner loops" second — never the
+    # other way round. @st.cache_resource inside start_background_scans()
+    # means this is a no-op lookup (not a re-launch) on every rerun after
+    # the very first one in this process's lifetime.
+    from utils.inprocess_scheduler import start_background_scans
+    start_background_scans()
+
     # 2026-07-23: the live Nifty-regime computation that used to live here
     # (fetch_nifty(source="upstox") + build_regime_context(auto_fetch_vix=
     # True), unfragmented — i.e. re-run on EVERY Dashboard interaction) is
@@ -3196,27 +3225,12 @@ def render(settings: dict | None = None):
     # ── News Impact — independent of scan state too.
     _news_impact_panel()
 
-    # ── Embedded Scanner — lets Run Scan happen without leaving the
-    # Dashboard. pages.scanner.render() is the same function the
-    # standalone "Live Scanner" page calls (app.py _page_scanner());
-    # calling it here does NOT change the "Dashboard never runs its
-    # own scan" design (see the Auto-refresh comment block below) —
-    # Dashboard still only *reads* scan_full_snapshots on its own,
-    # this just puts the button that writes it on the same page.
-    # Placed before the df_aug.empty early-return below, so it's the
-    # thing you see (and can act on) on a completely fresh session too.
-    # No st.session_state key collisions with pages.scanner's own
-    # widgets — verified against every key= in both files.
-    with st.expander("🔍 Live Scanner", expanded=df_aug.empty):
-        from pages.scanner import render as render_scanner
-        render_scanner(settings)
-
     if df_aug.empty:
         st.markdown("""
         <div style="text-align:center;padding:4rem 2rem;color:#8b949e;">
             <div style="font-size:3rem">📡</div>
             <div style="font-size:1.1rem;margin-top:0.5rem;color:var(--text);">No scan data yet</div>
-            <div style="font-size:0.8rem;margin-top:0.3rem;">Run a scan in the <b>🔍 Live Scanner</b> section above to populate Market Health, Sector Rotation, and Signal Class counts.</div>
+            <div style="font-size:0.8rem;margin-top:0.3rem;">The background scanner populates this automatically within a few minutes — or run one now on the <b>Live Scanner</b> page to populate Market Health, Sector Rotation, and Signal Class counts immediately.</div>
         </div>""", unsafe_allow_html=True)
         return
 
