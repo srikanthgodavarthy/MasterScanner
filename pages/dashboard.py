@@ -2453,14 +2453,21 @@ def _options_table_html(df: pd.DataFrame) -> str:
     color. Each row is tinted by Action tier (see _ACTION_TIER_STYLE).
 
     Column order (2026-07-23 revisit): Symbol, LTP, Leg, Strike, Premium,
-    Premium %Chg, Opportunity, Entry, Entry Drift %, Entry Timestamp
-    (IST), SL, T1, T2, Plan, Expiry, Strike Type, Reason,
-    Action/Execution State — Strike Type moved to just after Expiry;
-    Action and Execution State remain merged into one trailing column
-    since they were saying overlapping things. "Watch Only" rows are
-    dropped entirely (not actionable, just clutter). Rows are sorted by
-    Action/Execution tier, then Opportunity Score, then Leg (see
-    _sort_by_action_then_score_then_leg).
+    Premium %Chg, Opportunity, Entry, Entry Drift %, SL, T1, T2, Plan,
+    Expiry, Strike Type, Reason, Action/Execution State — Strike Type
+    moved to just after Expiry; Action and Execution State remain merged
+    into one trailing column since they were saying overlapping things.
+    "Watch Only" rows are dropped entirely (not actionable, just
+    clutter). Rows are sorted by Action/Execution tier, then Opportunity
+    Score, then Leg (see _sort_by_action_then_score_then_leg).
+
+    2026-07-23 fix: dropped the standalone "Entry Timestamp (IST)"
+    column — it was confusing next to "Entry" (the price), reading like
+    it timestamped the Entry price rather than the plan's current
+    lifecycle state. The same timestamp (WAITING->created_at,
+    ACTIVE->activated_at, T1_HIT->t1_hit_at) now renders as a second
+    line directly under the Plan status badge instead, where "when did
+    this plan reach its current state" actually belongs.
     """
     def _fmt_money(v):
         return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
@@ -2477,19 +2484,17 @@ def _options_table_html(df: pd.DataFrame) -> str:
     def _fmt_text(v):
         return v if v not in (None, "") and pd.notna(v) else "—"
 
-    def _fmt_ts(v):
-        """Entry Timestamp is stored as 'YYYY-MM-DD HH:MM:SS' IST — this
-        is the timestamp of the plan's CURRENT lifecycle state (see
-        enrich_fo_opportunities_df step 3), e.g. when a Manage Trade row
-        actually hit T1, not just when it originally entered.
-        2026-07-23: previously showed only the time part, which made a
-        plan from yesterday look identical to one from today — now shows
-        the full date + time in the cell itself (tooltip kept for the
-        explicit '... IST' framing)."""
+    def _fmt_plan_ts(v):
+        """Timestamp of the plan's CURRENT lifecycle state (see
+        enrich_fo_opportunities_df step 3): created_at while WAITING,
+        activated_at once ACTIVE, t1_hit_at once T1_HIT — e.g. a Manage
+        Trade row shows when T1 actually hit, not just the original
+        entry. 2026-07-23: moved out of its own "Entry Timestamp"
+        column (confusing next to the Entry price column) and rendered
+        as a muted sub-line directly under the Plan status badge."""
         if v in (None, "") or pd.isna(v):
-            return "—"
-        s = str(v)
-        return f'<span title="{s} IST">{s} IST</span>'
+            return ""
+        return f'<br><span style="color:var(--muted);font-size:10px;">{v} IST</span>'
 
     if "Action" in df.columns:
         df = df[df["Action"] != "Watch Only"]
@@ -2497,7 +2502,6 @@ def _options_table_html(df: pd.DataFrame) -> str:
 
     headers = ["Symbol", "LTP", "Leg", "Strike", "Premium", "Premium %Chg",
                "Opportunity", "Entry", "Entry Drift %",
-               "Entry Timestamp (IST)",
                "SL", "T1", "T2", "Plan", "Expiry", "Strike Type", "Reason", "Action / Execution"]
 
     rows_html = []
@@ -2518,11 +2522,10 @@ def _options_table_html(df: pd.DataFrame) -> str:
             f'<td style="font-weight:700;">{_fmt_num(r.get("Opportunity Score"))}</td>',
             f'<td>{_fmt_money(r.get("Entry"))}</td>',
             f'<td>{_fmt_pct(r.get("Entry Drift %"))}</td>',
-            f'<td style="color:var(--muted);font-size:11px;">{_fmt_ts(r.get("Entry Timestamp"))}</td>',
             f'<td>{_fmt_money(r.get("SL"))}</td>',
             f'<td>{_fmt_money(r.get("T1"))}</td>',
             f'<td>{_fmt_money(r.get("T2"))}</td>',
-            f'<td>{_fmt_text(r.get("Plan"))}</td>',
+            f'<td style="white-space:nowrap;">{_fmt_text(r.get("Plan"))}{_fmt_plan_ts(r.get("Entry Timestamp"))}</td>',
             f'<td>{_fmt_text(r.get("Expiry"))}</td>',
             f'<td>{_fmt_text(r.get("Strike Type"))}</td>',
             f'<td style="color:var(--muted);font-size:11px;max-width:220px;white-space:normal;">{_fmt_text(r.get("Reason"))}</td>',
