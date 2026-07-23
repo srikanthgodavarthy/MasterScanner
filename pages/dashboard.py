@@ -108,6 +108,12 @@ _ACTION_TIER_STYLE = {
     "Book Profits":       ("#f85149", "🔴"),
     "Wait":                ("#8b949e", "⚪"),
     "No Trade":            ("#484f58", "⚫"),
+    # 2026-07-23: plan-aware overrides — see utils.fo_setup_persistence.
+    # enrich_fo_opportunities_df() step 4. Once a plan is ACTIVE or has
+    # hit T1, these replace the live Recommendation-derived tier so the
+    # Action column never contradicts the Plan column again.
+    "In Trade":            ("#3fb950", "🟢"),
+    "Manage Trade":        ("#f5c542", "🎯"),
 }
 
 _CAT_ORDER = [
@@ -2470,7 +2476,8 @@ def _options_table_html(df: pd.DataFrame) -> str:
     df = _sort_by_recommendation(df)
 
     headers = ["Symbol", "LTP", "Leg", "Strike", "Premium", "Premium %Chg",
-               "Strike Type", "Opportunity", "Entry", "Entry Timestamp (IST)",
+               "Strike Type", "Opportunity", "Entry", "Entry Drift %",
+               "Entry Timestamp (IST)",
                "SL", "T1", "T2", "Plan", "Expiry", "Reason", "Action / Execution"]
 
     rows_html = []
@@ -2491,6 +2498,7 @@ def _options_table_html(df: pd.DataFrame) -> str:
             f'<td>{_fmt_text(r.get("Strike Type"))}</td>',
             f'<td style="font-weight:700;">{_fmt_num(r.get("Opportunity Score"))}</td>',
             f'<td>{_fmt_money(r.get("Entry"))}</td>',
+            f'<td>{_fmt_pct(r.get("Entry Drift %"))}</td>',
             f'<td style="color:var(--muted);font-size:11px;">{_fmt_ts(r.get("Entry Timestamp"))}</td>',
             f'<td>{_fmt_money(r.get("SL"))}</td>',
             f'<td>{_fmt_money(r.get("T1"))}</td>',
@@ -2656,13 +2664,14 @@ def _fo_opportunities_panel():
             _opt_display_cols = [
                 "Symbol", "LTP", "Action", "Recommendation", "Leg", "Strike", "Premium", "Premium %Chg",
                 "Strike Type", "Execution State",
-                "Opportunity Score", "Entry", "Entry Timestamp", "SL", "T1", "T2", "Plan", "Expiry", "Reason",
+                "Opportunity Score", "Entry", "Entry Drift %", "Entry Timestamp",
+                "SL", "T1", "T2", "Plan", "Expiry", "Reason",
             ]
             # Older cached runs (or a plan-enrichment failure) may not have
             # every column yet — filter to what's actually present rather
             # than KeyError on a partial frame.
             opt_df_display = opt_df[[c for c in _opt_display_cols if c in opt_df.columns]].copy()
-            for _missing_col in ("LTP", "Entry Timestamp"):
+            for _missing_col in ("LTP", "Entry Timestamp", "Entry Drift %"):
                 # Back-compat: a cached df from before these columns
                 # existed — render blank rather than KeyError.
                 if _missing_col not in opt_df_display.columns:
@@ -2678,8 +2687,13 @@ def _fo_opportunities_panel():
             st.markdown(_options_table_html(opt_df_display), unsafe_allow_html=True)
             st.caption("🟢 Buy Now = DORE says enter immediately · 🔵 Wait for Trigger = levels are "
                        "locked but price hasn't confirmed yet (BREAKOUT_PENDING) · 🟣 Watch Only = "
-                       "setup exists, not confirmed to enter · Row tint follows the Action column, "
-                       "not Recommendation directly.")
+                       "setup exists, not confirmed to enter · 🟢 In Trade = plan is ACTIVE, hold for "
+                       "T1 · 🎯 Manage Trade = T1 already hit, trail the remainder to T2/SL · Row tint "
+                       "follows the Action column, not Recommendation directly. Once a plan reaches "
+                       "ACTIVE or T1_HIT, Action reflects the plan's own state instead of the live "
+                       "(and by then often stale/contradictory) Recommendation. Entry Timestamp for a "
+                       "locked plan is when that plan actually triggered/was created — not the current "
+                       "scan time — so it stops changing once a plan is open.")
             st.caption("Runs DORE 2.0's full 5-stage funnel — only rows DORE actually recommends "
                        "acting on are shown, so this list can legitimately be empty or short on a "
                        "quiet day. 2026-07-21: BUY_CE_NOW/BUY_PE_NOW additionally require Premium "
