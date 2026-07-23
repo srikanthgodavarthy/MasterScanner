@@ -2405,33 +2405,43 @@ def _sc_counts_html(df: pd.DataFrame) -> str:
 # 2026-07-22 dashboard revisit: Action and Execution State were two
 # separate columns saying overlapping things (Action derives from the
 # Recommendation, which is itself gated partly by Execution State) —
-# collapsed into one "Action / Execution" column. Recommendation-driven
-# sort replaces the old Opportunity-Score sort so Buy-Now rows always
-# lead regardless of score, matching how a trader actually scans this
-# table (can I act right now?, then what's the best of those).
-_RECOMMENDATION_SORT_PRIORITY = {
-    "BUY_CE_NOW": 0, "BUY_PE_NOW": 0,
-    "BUY_CE_BREAKOUT": 1, "BUY_PE_BREAKDOWN": 1,
-    "WATCH_CE": 2, "WATCH_PE": 2,
-    "HOLD_CE": 3, "HOLD_PE": 3,
-    "BOOK_CE_PROFITS": 4, "BOOK_PE_PROFITS": 4,
-    "WAIT": 5, "NO_TRADE": 6,
+# collapsed into one "Action / Execution" column.
+# 2026-07-23: sort now keys directly off that merged Action column
+# (using the same tier order as _ACTION_TIER_STYLE, i.e. Buy Now / In
+# Trade first, No Trade last) instead of the raw Recommendation string —
+# so the sort order always matches what the row's own Action badge
+# shows, including the plan-aware "In Trade"/"Manage Trade" overrides
+# from enrich_fo_opportunities_df. Opportunity Score (desc) breaks ties
+# within a tier, then Leg (CE before PE) breaks any remaining ties.
+_ACTION_SORT_PRIORITY = {
+    "Buy Now": 0,
+    "In Trade": 1,
+    "Manage Trade": 2,
+    "Wait for Trigger": 3,
+    "Watch Only": 4,
+    "Hold": 5,
+    "Book Profits": 6,
+    "Wait": 7,
+    "No Trade": 8,
 }
+_LEG_SORT_PRIORITY = {"CE": 0, "PE": 1}
 
 
-def _sort_by_recommendation(df: pd.DataFrame, rec_col: str = "Recommendation") -> pd.DataFrame:
-    """Sort by Recommendation's action-urgency tier (Buy Now first, No
-    Trade last); Opportunity Score (if present) breaks ties within a
-    tier so the strongest setups still surface first inside each tier."""
-    if rec_col not in df.columns:
+def _sort_by_action_then_score_then_leg(df: pd.DataFrame, action_col: str = "Action") -> pd.DataFrame:
+    """Sort by Action/Execution tier first (Buy Now / In Trade lead, No
+    Trade trails), then Opportunity Score descending, then Leg (CE
+    before PE) — matches how a trader scans this table: can I act right
+    now?, then what's the best of those?, then CE before PE."""
+    if action_col not in df.columns:
         return df
-    tier_rank = df[rec_col].map(lambda r: _RECOMMENDATION_SORT_PRIORITY.get(r, 9))
-    out = df.assign(_tier_rank=tier_rank)
-    if "Opportunity Score" in df.columns:
-        out = out.assign(_opp_desc=-out["Opportunity Score"].fillna(0))
-        out = out.sort_values(["_tier_rank", "_opp_desc"], kind="stable").drop(columns=["_tier_rank", "_opp_desc"])
-    else:
-        out = out.sort_values("_tier_rank", kind="stable").drop(columns="_tier_rank")
+    out = df.assign(
+        _action_rank=df[action_col].map(lambda a: _ACTION_SORT_PRIORITY.get(a, 9)),
+        _opp_desc=-df["Opportunity Score"].fillna(0) if "Opportunity Score" in df.columns else 0,
+        _leg_rank=df["Leg"].map(lambda l: _LEG_SORT_PRIORITY.get(l, 2)) if "Leg" in df.columns else 0,
+    )
+    out = out.sort_values(
+        ["_action_rank", "_opp_desc", "_leg_rank"], kind="stable"
+    ).drop(columns=["_action_rank", "_opp_desc", "_leg_rank"])
     return out
 
 
@@ -2442,12 +2452,15 @@ def _options_table_html(df: pd.DataFrame) -> str:
     of the Action column is 'can I act on this at a glance', which needs
     color. Each row is tinted by Action tier (see _ACTION_TIER_STYLE).
 
-    Column order (2026-07-22 revisit): Symbol, LTP, Leg, Strike, Premium,
-    Premium %Chg, Strike Type, Opportunity, Entry, Entry Timestamp (IST),
-    SL, T1, T2, Plan, Expiry, Reason, Action/Execution State — Action and
-    Execution State merged into one trailing column since they were
-    saying overlapping things. Rows are sorted by Recommendation's
-    urgency tier before rendering (see _sort_by_recommendation).
+    Column order (2026-07-23 revisit): Symbol, LTP, Leg, Strike, Premium,
+    Premium %Chg, Opportunity, Entry, Entry Drift %, Entry Timestamp
+    (IST), SL, T1, T2, Plan, Expiry, Strike Type, Reason,
+    Action/Execution State — Strike Type moved to just after Expiry;
+    Action and Execution State remain merged into one trailing column
+    since they were saying overlapping things. "Watch Only" rows are
+    dropped entirely (not actionable, just clutter). Rows are sorted by
+    Action/Execution tier, then Opportunity Score, then Leg (see
+    _sort_by_action_then_score_then_leg).
     """
     def _fmt_money(v):
         return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
@@ -2465,20 +2478,27 @@ def _options_table_html(df: pd.DataFrame) -> str:
         return v if v not in (None, "") and pd.notna(v) else "—"
 
     def _fmt_ts(v):
-        """Entry Timestamp is stored as 'YYYY-MM-DD HH:MM:SS' IST —
-        show just the time in the cell, full stamp in the title tooltip."""
+        """Entry Timestamp is stored as 'YYYY-MM-DD HH:MM:SS' IST — this
+        is the timestamp of the plan's CURRENT lifecycle state (see
+        enrich_fo_opportunities_df step 3), e.g. when a Manage Trade row
+        actually hit T1, not just when it originally entered.
+        2026-07-23: previously showed only the time part, which made a
+        plan from yesterday look identical to one from today — now shows
+        the full date + time in the cell itself (tooltip kept for the
+        explicit '... IST' framing)."""
         if v in (None, "") or pd.isna(v):
             return "—"
         s = str(v)
-        time_part = s.split(" ")[-1] if " " in s else s
-        return f'<span title="{s} IST">{time_part} IST</span>'
+        return f'<span title="{s} IST">{s} IST</span>'
 
-    df = _sort_by_recommendation(df)
+    if "Action" in df.columns:
+        df = df[df["Action"] != "Watch Only"]
+    df = _sort_by_action_then_score_then_leg(df)
 
     headers = ["Symbol", "LTP", "Leg", "Strike", "Premium", "Premium %Chg",
-               "Strike Type", "Opportunity", "Entry", "Entry Drift %",
+               "Opportunity", "Entry", "Entry Drift %",
                "Entry Timestamp (IST)",
-               "SL", "T1", "T2", "Plan", "Expiry", "Reason", "Action / Execution"]
+               "SL", "T1", "T2", "Plan", "Expiry", "Strike Type", "Reason", "Action / Execution"]
 
     rows_html = []
     for _, r in df.iterrows():
@@ -2495,7 +2515,6 @@ def _options_table_html(df: pd.DataFrame) -> str:
             f'<td>{_fmt_num(r.get("Strike"))}</td>',
             f'<td>{_fmt_money(r.get("Premium"))}</td>',
             f'<td>{_fmt_pct(r.get("Premium %Chg"))}</td>',
-            f'<td>{_fmt_text(r.get("Strike Type"))}</td>',
             f'<td style="font-weight:700;">{_fmt_num(r.get("Opportunity Score"))}</td>',
             f'<td>{_fmt_money(r.get("Entry"))}</td>',
             f'<td>{_fmt_pct(r.get("Entry Drift %"))}</td>',
@@ -2505,6 +2524,7 @@ def _options_table_html(df: pd.DataFrame) -> str:
             f'<td>{_fmt_money(r.get("T2"))}</td>',
             f'<td>{_fmt_text(r.get("Plan"))}</td>',
             f'<td>{_fmt_text(r.get("Expiry"))}</td>',
+            f'<td>{_fmt_text(r.get("Strike Type"))}</td>',
             f'<td style="color:var(--muted);font-size:11px;max-width:220px;white-space:normal;">{_fmt_text(r.get("Reason"))}</td>',
             f'<td style="white-space:nowrap;"><span style="color:{tier_color};font-weight:700;">{tier_dot} {tier}</span>'
             f'<br><span style="color:var(--muted);font-size:10px;">{_fmt_text(exec_state)}</span></td>',
