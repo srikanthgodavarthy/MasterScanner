@@ -2874,6 +2874,7 @@ def _market_intelligence_fragment():
                 ce_prem_prev, ce_prem_prev2, pe_prem_prev, pe_prem_prev2 = record_and_diff_premium(
                     index_key, ce_premium, pe_premium)
                 atm_chain_row = {
+                    "atm_strike": oi.get("atm_strike") or 0.0,
                     "ce_premium": ce_premium, "pe_premium": pe_premium,
                     "ce_premium_prev": ce_prem_prev, "ce_premium_prev2": ce_prem_prev2,
                     "pe_premium_prev": pe_prem_prev, "pe_premium_prev2": pe_prem_prev2,
