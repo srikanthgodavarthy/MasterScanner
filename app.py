@@ -45,6 +45,15 @@ if not logging.getLogger().handlers:
 
 load_dotenv()  # picks up UPSTOX_ACCESS_TOKEN from a local .env if present
 
+# 2026-07-23: starts the Market Intelligence (30s) / F&O Scan (60s) /
+# Live Scanner (2min) background loops inside THIS process, on their own
+# daemon threads — see utils/inprocess_scheduler.py's docstring for why
+# (no separate host to run scheduler/scan_worker.py on). st.cache_resource
+# inside start_background_scans() guarantees this only actually launches
+# threads once per process, not once per browser session/tab.
+from utils.inprocess_scheduler import start_background_scans
+start_background_scans()
+
 st.set_page_config(
     page_title="Trinity — Nifty 500",
     page_icon="🔱",

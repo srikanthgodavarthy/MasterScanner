@@ -1,30 +1,41 @@
 """
-pages/dashboard.py — Market Dashboard (Scanner/Dashboard split, 2026-07)
+pages/dashboard.py — Market Dashboard (Scanner/Dashboard split, 2026-07;
+event-aware rewrite, 2026-07-23)
 
 Everything on the old pages/scanner.py EXCEPT the stock-discovery table
 (Run Scan button, Elite/Execute/Actionable/... tabs, per-stock table) —
 that's pages/scanner.py now, and it runs completely independently on
 Yahoo Finance.
 
+[2026-07-23] Event-aware rewrite: this page no longer runs ANY live
+Upstox/DORE/regime computation itself, and no scan of any kind blocks its
+rendering. Three independent producers write versioned snapshots to
+Supabase on their own cadence, completely outside any Streamlit session
+(see scheduler/scan_worker.py):
+
+    market_intelligence  — every 30s  (utils/market_intelligence.py)
+    fo_scan              — every 60s  (utils/fo_scan.py)
+    live_scanner         — every 2min (utils/live_scanner_job.py, or the
+                            manual Run Scan button in pages/scanner.py)
+
+Each snapshot row carries scan_id/created_at/status/version (see
+utils/scan_state.py). This page polls only the lightweight metadata for
+each section every 30s and fetches/re-renders a section's full payload
+ONLY when its version changed since the last poll — an idle Dashboard
+with nothing new costs three tiny metadata queries per tick, not three
+scans.
+
 Data sourcing on this page, by design:
-  • Live index quotes (Nifty/Sensex/Bank Nifty), OI resistance, and DORE
-    inputs — always Upstox (fetch_index_quote / fetch_oi_resistance /
-    fetch_*_ohlcv(source="upstox")), same as before. No Yahoo fallback is
-    introduced here; Upstox client's own internal fail-soft behavior is
-    unchanged.
+  • Market Intelligence (index quotes, OI, DORE, regime, breadth) — read
+    from the latest `market_intelligence` snapshot only; never computed
+    here.
+  • F&O Opportunity Engine (Futures/Options tabs) — read from the latest
+    `fo_scan` snapshot only; never computed here.
   • Everything computed from the scanned Nifty-500 universe (Market
     Breadth, 52W Hi/Lo, EMA20/200 breadth, Sector Rotation, Signal Class
-    counts, Top Gainers, Leadership Rotation) — read from the LATEST
-    completed Scanner run via utils.supabase_client.load_latest_full_scan().
-    This page never runs its own scan and never depends on Scanner having
-    been opened in the same browser session.
-  • Nifty regime (TREND/RANGE/VOLATILE) — computed live, right here, off
-    an Upstox-sourced Nifty benchmark (build_regime_context(nifty=
-    fetch_nifty("1y", source="upstox"))). This is intentionally NOT read
-    from Scanner's own regime call, which stays pinned to Yahoo Finance
-    for its own internal consistency (see pages/scanner.py's "Run scan"
-    block) — Dashboard's regime read is Upstox-sourced end to end, per
-    this page's data-source contract.
+    counts, Top Gainers, Leadership Rotation) — read from the latest
+    `live_scanner` snapshot (falling back to the legacy
+    utils.supabase_client.load_latest_full_scan() during migration).
 
 [Refactor 2026-07] This file was split out of the single, monolithic
 pages/scanner.py (formerly ~4900 lines covering both the market-wide
@@ -54,11 +65,8 @@ except ImportError:
     _IST = pytz.timezone("Asia/Kolkata")
     def _now_ist(): return datetime.now(_IST)
 
-from utils.scanner_engine  import fetch_nifty
-from utils.regime_engine   import build_regime_context, regime_summary
 from utils.supabase_client import load_latest_full_scan
 from utils.sector_map      import build_sector_stats
-from utils.dore_fo_screener import top_futures_opportunities, top_options_opportunities
 
 # ── CONSTANTS ─────────────────────────────────────────────────────
 
@@ -2641,22 +2649,50 @@ def _futures_table_html(df: pd.DataFrame) -> str:
     )
 
 
+_FO_SCAN_REFRESH_SECS = 30  # metadata poll cadence, per spec (producer itself runs every 60s)
+
+
+@st.fragment(run_every=_FO_SCAN_REFRESH_SECS)
 def _fo_opportunities_panel():
+    """
+    2026-07-23: rewritten to be event-aware. scheduler/scan_worker.py runs
+    the full futures+options DORE 2.0 universe scan on its own 60s timer
+    (utils/fo_scan.py::compute_fo_scan()) — this function no longer calls
+    top_futures_opportunities()/top_options_opportunities() itself. Before
+    this rewrite this panel had NO fragment isolation at all and re-ran
+    the full scan on every single Dashboard interaction; now it's a cheap
+    metadata poll + (only-when-changed) table render.
+    """
+    from utils.scan_state import load_snapshot_meta, load_snapshot_payload
+
     st.markdown('<div class="ti-panel-title" style="margin-top:0.6rem;">🎯 DORE 2.0 F&amp;O OPPORTUNITY ENGINE</div>',
                 unsafe_allow_html=True)
+
+    meta = load_snapshot_meta("fo_scan")
+    if meta is None:
+        st.caption("F&O Opportunity Engine: waiting for the first scheduled scan "
+                   "(scheduler/scan_worker.py) — nothing to show yet.")
+        return
+
+    if meta.get("version") != st.session_state.get("fo_scan_version"):
+        full = load_snapshot_payload("fo_scan")
+        if full is not None:
+            st.session_state["fo_scan_version"] = full.get("version")
+            st.session_state["fo_scan_payload"] = full.get("payload") or {}
+        # else: latest row is "running"/"failed" — keep the last good
+        # cached payload rather than blanking the panel.
+
+    payload = st.session_state.get("fo_scan_payload")
+    if not payload:
+        st.caption("F&O Opportunity Engine: latest scan hasn't completed successfully yet.")
+        return
+
+    fut_df = pd.DataFrame(payload.get("futures") or [])
+    opt_df = pd.DataFrame(payload.get("options") or [])
+
     tab_fut, tab_opt = st.tabs(["📈 Futures", "🎯 Options"])
 
     with tab_fut:
-        fut_progress = st.progress(0.0, text="Scanning futures universe...")
-        def _fut_progress_cb(done: int, total: int, _bar=fut_progress) -> None:
-            if total:
-                _bar.progress(min(done / total, 1.0), text=f"Scanning futures universe... ({done}/{total})")
-        try:
-            fut_df = top_futures_opportunities(progress_cb=_fut_progress_cb)
-        except Exception:
-            logger.exception("Futures opportunities panel failed (non-fatal)")
-            fut_df = pd.DataFrame()
-        fut_progress.empty()
         if fut_df.empty:
             st.caption("No live futures data available right now — check the Upstox token, or "
                        "every F&O name is currently NEUTRAL on DORE's own Trend Engine (Stage 1).")
@@ -2673,16 +2709,6 @@ def _fo_opportunities_panel():
                        "bidirectional (CE and PE), independent of the equity scanner's own targets.")
 
     with tab_opt:
-        opt_progress = st.progress(0.0, text="Scanning F&O universe...")
-        def _opt_progress_cb(done: int, total: int, _bar=opt_progress) -> None:
-            if total:
-                _bar.progress(min(done / total, 1.0), text=f"Scanning F&O universe... ({done}/{total})")
-        try:
-            opt_df = top_options_opportunities(progress_cb=_opt_progress_cb)
-        except Exception:
-            logger.exception("Options opportunities panel failed (non-fatal)")
-            opt_df = pd.DataFrame()
-        opt_progress.empty()
         if opt_df.empty:
             st.caption("No DORE-qualified option setups right now — either the Upstox token needs "
                        "checking, or every F&O candidate is currently gated to WAIT/NO_TRADE (see "
@@ -2731,282 +2757,59 @@ def _fo_opportunities_panel():
                        "(bid/ask) before acting.")
 
 
-# st.fragment(run_every=...) reruns ONLY this function on its own timer,
-# independent of the rest of the page and of any button click. It always
-# uses Upstox first (live quotes) with yfinance fallback only if the
-# token's missing/expired or the request fails — see fetch_index_quote()/
-# fetch_oi_resistance() in utils/upstox_client.py.
-_MARKET_INTEL_REFRESH_SECS = 20  # matches fetch_index_quote's own ttl=15
-                                   # cache reasonably closely without
-                                   # hammering Upstox on every tick
+# 2026-07-23: rewritten to be event-aware. scheduler/scan_worker.py computes
+# ALL of this (live Nifty/Sensex/Bank Nifty quotes, EMA levels, OI resistance,
+# DORE 2.0 per index, regime classification, breadth) on its own 30s timer,
+# completely outside any Streamlit session — see utils/market_intelligence.py
+# for the extracted compute and utils/scan_state.py for the snapshot store.
+#
+# This fragment is now a pure read: poll cheap metadata every
+# _MARKET_INTEL_REFRESH_SECS, and only pull + re-render the (larger) full
+# payload when its version actually changed since the last tick. No Upstox
+# call, no DORE computation, and no regime classification happens in this
+# process anymore.
+_MARKET_INTEL_REFRESH_SECS = 30  # metadata poll cadence, per spec
 
 
 @st.fragment(run_every=_MARKET_INTEL_REFRESH_SECS)
 def _market_intelligence_fragment():
-    """
-    Fetches live Nifty/Sensex quotes, EMA20/50/200 levels, and nearest-
-    expiry OI resistance, then renders the full Market Overview panel.
-    Runs on its own _MARKET_INTEL_REFRESH_SECS timer via st.fragment,
-    whether or not a scan has ever been triggered. The regime/trend/
-    breadth portion of the panel still reflects the most recent scan
-    (session_state["scan_summary"]/["scan_df"]) since those are properties
-    of the scored universe, not something a live quote feed can supply on
-    its own — only the index-card portion (price, OHLC, OI, EMA) is truly
-    live here.
-    """
-    # ── Nifty snapshot ──────────────────────────────────────────────
-    # 2026-07-16: EMA levels now sourced via fetch_nifty(source="upstox")
-    # — this is the Market Intelligence card's EMA badge row, not the
-    # scanner's RS/regime benchmark (that stays wired to the Scanner Data
-    # Source setting via run_scanner()/build_regime_context(), separately,
-    # in the "Run scan" block above). Two different call sites of the same
-    # shared fetch_nifty() intentionally passing different `source` — see
-    # its docstring.
-    try:
-        from utils.scanner_engine import fetch_nifty_intraday_snapshot, fetch_nifty, compute_ema_levels
-        _nifty_series = fetch_nifty("1y", source="upstox")
-        _snap = fetch_nifty_intraday_snapshot()
-        if _snap.get("price"):
-            st.session_state["nifty_snapshot"] = _snap
-        elif _nifty_series is not None and len(_nifty_series) >= 2:
-            last = float(_nifty_series.iloc[-1])
-            prev = float(_nifty_series.iloc[-2])
-            st.session_state["nifty_snapshot"] = {
-                "price": last,
-                "pct_chg": round((last - prev) / prev * 100, 2),
-                "open": 0.0, "high": 0.0, "low": 0.0,
-                "prev_close": prev,
-                "spark": _nifty_series.tail(15).tolist(),
-            }
-        st.session_state["nifty_ema_levels"] = (
-            compute_ema_levels(_nifty_series) if _nifty_series is not None else {}
-        )
-    except Exception:
-        st.session_state.setdefault("nifty_snapshot", {})
-        st.session_state.setdefault("nifty_ema_levels", {})
+    from utils.scan_state import load_snapshot_meta, load_snapshot_payload
 
-    # ── Sensex snapshot — Upstox first (live price/OHLC), yfinance
-    #    backfill for spark only (Upstox's quote endpoint is a single
-    #    point-in-time snapshot with no historical series in it at all —
-    #    there's nothing to draw a sparkline from until we add one).
-    try:
-        from utils.upstox_client import fetch_index_quote
-        _sx = fetch_index_quote("SENSEX")
-        if _sx is not None:
-            _sx["source"] = "upstox"
-    except Exception:
-        _sx = None
-    if _sx is None:
+    meta = load_snapshot_meta("market_intelligence")
+    if meta is None:
+        st.caption("Market Intelligence: waiting for the first scheduled scan "
+                   "(scheduler/scan_worker.py) — nothing to show yet.")
+        return
+
+    if meta.get("version") != st.session_state.get("mi_snapshot_version"):
+        full = load_snapshot_payload("market_intelligence")
+        if full is not None:
+            st.session_state["mi_snapshot_version"] = full.get("version")
+            st.session_state["mi_snapshot_payload"] = full.get("payload") or {}
+            st.session_state["mi_snapshot_created_at"] = full.get("created_at", "")
+        # else: latest row is "running"/"failed" — keep showing the last
+        # good cached payload rather than blanking the panel.
+
+    payload = st.session_state.get("mi_snapshot_payload")
+    if not payload:
+        st.caption("Market Intelligence: latest scan hasn't completed successfully yet.")
+        return
+
+    summary     = payload.get("summary", {})
+    breadth     = payload.get("breadth", {})
+    index_cards = payload.get("index_cards", [])
+    scan_time   = ""
+    _created_at = st.session_state.get("mi_snapshot_created_at", "")
+    if _created_at:
         try:
-            from utils.scanner_engine import fetch_sensex_intraday_snapshot
-            _sx = fetch_sensex_intraday_snapshot()
-            _sx["source"] = "yfinance"
+            scan_time = pd.to_datetime(_created_at).tz_convert(_IST).strftime("%H:%M:%S")
         except Exception:
-            _sx = {}
-    elif not _sx.get("spark"):
-        # Upstox gave us live price/OHLC — just missing the spark. Pull
-        # yfinance's intraday snapshot (cheap, @st.cache_data ttl=30) for
-        # its "spark" list only; leave everything else Upstox-sourced.
-        try:
-            from utils.scanner_engine import fetch_sensex_intraday_snapshot
-            _yf_spark = fetch_sensex_intraday_snapshot().get("spark") or []
-            if _yf_spark:
-                _sx["spark"] = _yf_spark
-        except Exception:
-            pass
-    st.session_state["sensex_snapshot"] = _sx or {}
+            scan_time = ""
 
-    try:
-        from utils.scanner_engine import fetch_sensex_ema_levels
-        st.session_state["sensex_ema_levels"] = fetch_sensex_ema_levels()
-    except Exception:
-        st.session_state["sensex_ema_levels"] = {}
-
-    # ── Bank Nifty snapshot — same Upstox-first / yfinance-spark-backfill
-    #    pattern as Sensex above.
-    try:
-        from utils.upstox_client import fetch_index_quote
-        _bn = fetch_index_quote("BANKNIFTY")
-        if _bn is not None:
-            _bn["source"] = "upstox"
-    except Exception:
-        _bn = None
-    if _bn is None:
-        try:
-            from utils.scanner_engine import fetch_banknifty_intraday_snapshot
-            _bn = fetch_banknifty_intraday_snapshot()
-            _bn["source"] = "yfinance"
-        except Exception:
-            _bn = {}
-    elif not _bn.get("spark"):
-        try:
-            from utils.scanner_engine import fetch_banknifty_intraday_snapshot
-            _yf_spark = fetch_banknifty_intraday_snapshot().get("spark") or []
-            if _yf_spark:
-                _bn["spark"] = _yf_spark
-        except Exception:
-            pass
-    st.session_state["banknifty_snapshot"] = _bn or {}
-
-    try:
-        from utils.scanner_engine import fetch_banknifty_ema_levels
-        st.session_state["banknifty_ema_levels"] = fetch_banknifty_ema_levels()
-    except Exception:
-        st.session_state["banknifty_ema_levels"] = {}
-
-    # ── Nearest-expiry OI resistance/support + PCR (Upstox option chain)
-    #    — Nifty, Sensex, Bank Nifty. Always Upstox; no yfinance fallback
-    #    exists for option-chain data (yfinance doesn't carry NSE/BSE
-    #    option chains), so this comes back {} rather than a wrong-source
-    #    substitute if the Upstox token is missing/expired.
-    #
-    # 2026-07-18: also runs each index's fresh total_ce_oi/total_pe_oi
-    # through utils.oi_snapshot_store.record_and_diff() right here, so
-    # the resulting (ce_oi_change, pe_oi_change) is ready for the DORE
-    # block below — see that module's docstring for why this needs to
-    # happen once, right after the fetch, rather than inside DORE itself.
-    from utils.oi_snapshot_store import record_and_diff
-    _oi_changes: dict = {}   # {"NIFTY": (ce_chg, pe_chg), "SENSEX": ..., "BANKNIFTY": ...}
-    for _idx, _key in (("NIFTY", "oi_resistance"), ("SENSEX", "sensex_oi_resistance"),
-                        ("BANKNIFTY", "banknifty_oi_resistance")):
-        try:
-            from utils.upstox_client import fetch_oi_resistance
-            _oi = fetch_oi_resistance(_idx) or {}
-            st.session_state[_key] = _oi
-            _oi_changes[_idx] = record_and_diff(
-                _idx, _oi.get("total_ce_oi", 0.0), _oi.get("total_pe_oi", 0.0)
-            )
-        except Exception:
-            st.session_state[_key] = {}
-            _oi_changes[_idx] = (0.0, 0.0)
-
-    # ── DORE 2.0 (independent F&O Opportunity Engine) ────────────────
-    # 2026-07-20: rewritten for DORE 2.0 (docs/DORE_2_0_ARCHITECTURE.md).
-    # DORE now shares ONLY the Market Data Layer with MasterScanner
-    # (Principle 2.1) — no CV1/Leadership/Conviction, no MTF/Component-
-    # Strength blend (those were bolted onto the old bias score and are
-    # not part of the frozen Rev-3 architecture). Each index's Trend
-    # features come straight from its own daily OHLCV
-    # (compute_trend_features), Execution features from its own 5-minute
-    # intraday candles (execution_features_from_intraday_5m), and
-    # Derivative Confidence from its live option chain (fetch_oi_
-    # resistance) — the same three-layer pipeline every F&O stock in
-    # the funnel goes through (utils.dore_fo_screener). Fails soft to
-    # None (card renders without the DORE row) on any error.
-    try:
-        from utils.dore_engine import build_dore_input_for_index, compute_dore
-        from utils.dore_settings import DORESettings
-        from utils.dore_fo_screener import execution_features_from_intraday_5m
-        from utils.scanner_engine import fetch_nifty_ohlcv, fetch_sensex_ohlcv, fetch_banknifty_ohlcv
-        from utils.upstox_client import fetch_index_intraday_5m_upstox
-        from utils.oi_snapshot_store import record_and_diff_premium
-
-        _dore_cfg = DORESettings.from_dict(st.session_state.get("dore_settings", {}))
-
-        # ── Position Sizing inputs, loaded ONCE for all three index
-        # cards (utils/position_sizing.py) — RFC-001 §4/§12 scopes this
-        # out of DORE itself; it's a downstream layer over a finished
-        # DOREResult, never touching direction/strike/expiry/entry/stop.
-        from utils.position_sizing import (
-            size_position, PositionSizingSettings, PortfolioContext, load_existing_positions,
-        )
-        try:
-            _avail_capital = float(st.session_state.get("available_capital", 0.0))
-            _index_lot_sizes = {
-                "NIFTY":     int(st.session_state.get("nifty_lot_size", 1)),
-                "SENSEX":    int(st.session_state.get("sensex_lot_size", 1)),
-                "BANKNIFTY": int(st.session_state.get("banknifty_lot_size", 1)),
-            }
-            _existing_positions = load_existing_positions()
-        except Exception:
-            logger.exception("Position sizing inputs failed to load for index cards (non-fatal)")
-            _avail_capital, _index_lot_sizes, _existing_positions = 0.0, {"NIFTY": 1, "SENSEX": 1, "BANKNIFTY": 1}, []
-        _sizing_cfg = PositionSizingSettings()
-
-        def _index_dore(index_key: str, ohlcv, oi_key: str, ce_pe_chg: tuple):
-            try:
-                intraday_5m = fetch_index_intraday_5m_upstox(index_key)
-                exec_features = execution_features_from_intraday_5m(intraday_5m, _dore_cfg)
-                ce_chg, pe_chg = ce_pe_chg
-                oi = st.session_state.get(oi_key, {}) or {}
-                ce_premium = oi.get("ce_premium", 0.0)
-                pe_premium = oi.get("pe_premium", 0.0)
-                # Premium Behaviour pillar (Stage 3) — tick-to-tick history,
-                # same mechanism the F&O funnel uses (utils.dore_fo_screener).
-                ce_prem_prev, ce_prem_prev2, pe_prem_prev, pe_prem_prev2 = record_and_diff_premium(
-                    index_key, ce_premium, pe_premium)
-                atm_chain_row = {
-                    "atm_strike": oi.get("atm_strike") or 0.0,
-                    "ce_premium": ce_premium, "pe_premium": pe_premium,
-                    "ce_premium_prev": ce_prem_prev, "ce_premium_prev2": ce_prem_prev2,
-                    "pe_premium_prev": pe_prem_prev, "pe_premium_prev2": pe_prem_prev2,
-                    "ce_oi": oi.get("ce_oi", 0.0), "pe_oi": oi.get("pe_oi", 0.0),
-                    "ce_oi_change": ce_chg, "pe_oi_change": pe_chg,
-                    "pcr": oi.get("pcr", 1.0), "expiry": oi.get("expiry", ""),
-                }
-                dore_input = build_dore_input_for_index(
-                    index_key, ohlcv, oi, atm_chain_row=atm_chain_row, execution_features=exec_features,
-                )
-                if not dore_input:
-                    return None
-                result = compute_dore(dore_input, _dore_cfg)
-                out = result.as_dict()
-                ctx = PortfolioContext(
-                    available_capital=_avail_capital, existing_positions=_existing_positions,
-                    lot_size=_index_lot_sizes.get(index_key, 1), sector=None,  # indices have no sector
-                )
-                sized = size_position(result, ctx, _sizing_cfg, symbol=index_key)
-                out["lots"] = sized.lots
-                out["quantity"] = sized.quantity
-                out["capital_at_risk"] = sized.capital_at_risk
-                out["capital_at_risk_pct"] = sized.capital_at_risk_pct
-                out["sizing_blocked"] = sized.blocked
-                out["sizing_reason"] = sized.block_reasons[-1] if sized.block_reasons else ""
-                return out
-            except Exception:
-                logger.exception("DORE 2.0 computation failed for %s (non-fatal)", index_key)
-                return None
-
-        _nifty_ohlcv = fetch_nifty_ohlcv("1y", source="upstox")
-        st.session_state["nifty_dore"] = _index_dore(
-            "NIFTY", _nifty_ohlcv, "oi_resistance", _oi_changes.get("NIFTY", (0.0, 0.0)))
-
-        _sensex_ohlcv = fetch_sensex_ohlcv("1y")
-        st.session_state["sensex_dore"] = _index_dore(
-            "SENSEX", _sensex_ohlcv, "sensex_oi_resistance", _oi_changes.get("SENSEX", (0.0, 0.0)))
-
-        _banknifty_ohlcv = fetch_banknifty_ohlcv("1y")
-        st.session_state["banknifty_dore"] = _index_dore(
-            "BANKNIFTY", _banknifty_ohlcv, "banknifty_oi_resistance", _oi_changes.get("BANKNIFTY", (0.0, 0.0)))
-    except Exception:
-        logger.exception("DORE computation failed in _market_intelligence_fragment")
-        st.session_state.setdefault("nifty_dore", None)
-        st.session_state.setdefault("sensex_dore", None)
-        st.session_state.setdefault("banknifty_dore", None)
-
-    # ── Render ────────────────────────────────────────────────────
-    summary   = st.session_state.get("dash_scan_summary", {})
-    scan_time = st.session_state.get("dash_scan_time", "")
-    breadth   = _compute_breadth_stats(st.session_state.get("dash_scan_df", pd.DataFrame()))
-    index_cards = [
-        {"label": "NIFTY 50", "snapshot": st.session_state.get("nifty_snapshot", {}),
-         "oi": st.session_state.get("oi_resistance", {}), "badge": "",
-         "ema": st.session_state.get("nifty_ema_levels", {}),
-         "dore": st.session_state.get("nifty_dore")},
-        {"label": "SENSEX",   "snapshot": st.session_state.get("sensex_snapshot", {}),
-         "oi": st.session_state.get("sensex_oi_resistance", {}), "badge": "",
-         "ema": st.session_state.get("sensex_ema_levels", {}),
-         "dore": st.session_state.get("sensex_dore")},
-        {"label": "BANK NIFTY", "snapshot": st.session_state.get("banknifty_snapshot", {}),
-         "oi": st.session_state.get("banknifty_oi_resistance", {}), "badge": "",
-         "ema": st.session_state.get("banknifty_ema_levels", {}),
-         "dore": st.session_state.get("banknifty_dore")},
-    ]
     st.markdown(
         _market_overview_panel(summary, breadth, scan_time, index_cards),
         unsafe_allow_html=True,
     )
-
 
 # ── NEWS IMPACT — ET + Moneycontrol headlines, free-LLM sentiment tag ──
 # ── NEWS IMPACT — ET + Moneycontrol headlines, free-LLM sentiment tag ──
@@ -3289,24 +3092,41 @@ def _news_impact_panel():
 
 
 # ── Auto-refresh: latest completed scan from Supabase ────────────────────
-# Dashboard never runs its own scan — pages/scanner.py (Yahoo Finance,
-# independent) is the only thing that writes scan_full_snapshots. Rather
-# than reload on every rerun (which would hammer Supabase for no reason —
-# a completed scan doesn't change until Scanner runs again), this polls
-# on its own timer via st.fragment(run_every=...), same pattern as
-# _market_intelligence_fragment above. It only forces a full-page rerun
-# (st.rerun()) when the latest run_at actually changed, so an idle
-# Dashboard with no new scan just re-checks quietly every cycle.
-_DASH_AUTOREFRESH_SECS = 60  # poll every 1 min for a newer completed scan
+# 2026-07-23: rewritten to be event-aware. scheduler/scan_worker.py (or a
+# manual Run Scan click, see pages/scanner.py) writes live_scanner_snapshots
+# with a scan_id/version/status/created_at + payload row every ~2 minutes.
+# This fragment polls ONLY the lightweight metadata columns every 30s
+# (load_snapshot_meta never touches `payload`) and fetches the full
+# DataFrame only when `version` actually differs from what's already
+# cached in session_state — an idle Dashboard between scans costs one
+# tiny metadata query per tick, not a full JSON blob.
+_DASH_AUTOREFRESH_SECS = 30  # metadata poll cadence, per spec
 
 
 @st.fragment(run_every=_DASH_AUTOREFRESH_SECS)
 def _dash_scan_autorefresh():
-    _df, _run_at = load_latest_full_scan()
-    if _run_at and _run_at != st.session_state.get("dash_scan_run_at"):
-        st.session_state["dash_scan_df"]     = _df
-        st.session_state["dash_scan_run_at"] = _run_at
-        st.rerun()
+    from utils.scan_state import load_snapshot_meta, load_snapshot_payload
+
+    meta = load_snapshot_meta("live_scanner")
+    if meta and meta.get("version") != st.session_state.get("dash_scan_version"):
+        full = load_snapshot_payload("live_scanner")
+        if full:
+            _records = (full.get("payload") or {}).get("data", [])
+            st.session_state["dash_scan_df"]      = pd.DataFrame(_records)
+            st.session_state["dash_scan_run_at"]  = full.get("created_at", "")
+            st.session_state["dash_scan_version"] = full.get("version")
+            st.rerun()
+        return
+
+    if meta is None and "dash_scan_df" not in st.session_state:
+        # Migration fallback: new table has no rows yet (fresh Supabase
+        # project, or scheduler not started) — use the legacy path so the
+        # page isn't empty during rollout.
+        _df, _run_at = load_latest_full_scan()
+        if _run_at and _run_at != st.session_state.get("dash_scan_run_at"):
+            st.session_state["dash_scan_df"]     = _df
+            st.session_state["dash_scan_run_at"] = _run_at
+            st.rerun()
 
 
 def render(settings: dict | None = None):
@@ -3322,9 +3142,16 @@ def render(settings: dict | None = None):
         _refresh = st.button("🔄 Refresh", key="btn_dash_refresh",
                               help="Reload the latest completed scan from Supabase")
     if _refresh or "dash_scan_df" not in st.session_state:
-        _df, _run_at = load_latest_full_scan()
-        st.session_state["dash_scan_df"]      = _df
-        st.session_state["dash_scan_run_at"]  = _run_at
+        from utils.scan_state import load_snapshot_payload
+        _full = load_snapshot_payload("live_scanner")
+        if _full:
+            st.session_state["dash_scan_df"]      = pd.DataFrame((_full.get("payload") or {}).get("data", []))
+            st.session_state["dash_scan_run_at"]  = _full.get("created_at", "")
+            st.session_state["dash_scan_version"] = _full.get("version")
+        else:
+            _df, _run_at = load_latest_full_scan()
+            st.session_state["dash_scan_df"]      = _df
+            st.session_state["dash_scan_run_at"]  = _run_at
 
     _dash_scan_autorefresh()
 
@@ -3353,24 +3180,14 @@ def render(settings: dict | None = None):
                 unsafe_allow_html=True,
             )
 
-    # ── Nifty regime — computed live, right here, off an Upstox-sourced
-    #    benchmark. Independent of Scanner's own (Yahoo-anchored) regime
-    #    call and of whether Scanner has been run this session at all.
-    try:
-        _nifty_upstox = fetch_nifty("1y", source="upstox")
-        regime_ctx = build_regime_context(
-            nifty             = _nifty_upstox,
-            execute_threshold = settings.get("execute_threshold", 70),
-            auto_fetch_vix    = True,
-        )
-        summary = regime_summary(df_aug, regime_ctx) if not df_aug.empty else {}
-    except Exception:
-        logger.exception("Dashboard regime computation failed (non-fatal)")
-        regime_ctx, summary = None, {}
-
-    st.session_state["dash_regime_ctx"]  = regime_ctx
-    st.session_state["dash_scan_summary"] = summary
-    st.session_state["dash_scan_time"]    = scan_time
+    # 2026-07-23: the live Nifty-regime computation that used to live here
+    # (fetch_nifty(source="upstox") + build_regime_context(auto_fetch_vix=
+    # True), unfragmented — i.e. re-run on EVERY Dashboard interaction) is
+    # gone. scheduler/scan_worker.py's market_intelligence job now computes
+    # regime + summary itself (utils.market_intelligence.compute_market_
+    # intelligence()) and _market_intelligence_fragment() below reads
+    # `summary`/`breadth` straight out of that snapshot's payload — no
+    # session_state relay, no per-render Upstox/VIX call.
 
     # ── Market Overview + Option Flow + DORE — continuous, live via
     #    Upstox, on its own refresh timer, independent of everything above.
