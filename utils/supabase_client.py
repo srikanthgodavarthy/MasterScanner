@@ -1350,7 +1350,14 @@ CREATE TABLE IF NOT EXISTS fo_setup_plans (
     symbol                     text        NOT NULL,
     leg                        text        NOT NULL,       -- 'CE' | 'PE'
     strike                     numeric(12,2) NOT NULL DEFAULT 0,
-    expiry                     date,
+    -- 2026-07-23 fix: expiry is DORE's recommended_expiry LABEL
+    -- ("CURRENT_WEEK" / "NEXT_WEEK"), not an actual calendar date —
+    -- a 'date' column rejects that string outright, which silently
+    -- failed every upsert_fo_setup_plans_batch() call (caught,
+    -- logged, returns False) and meant NOTHING ever persisted here.
+    -- If you already ran the old CREATE TABLE with `expiry date`,
+    -- run this once: ALTER TABLE fo_setup_plans ALTER COLUMN expiry TYPE text;
+    expiry                     text,
     first_seen_date            date        NOT NULL,
     created_date                date        NOT NULL,
 
