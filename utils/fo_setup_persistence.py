@@ -452,11 +452,19 @@ def enrich_fo_opportunities_df(rows: list[dict], existing_plans: dict) -> tuple[
             # kept showing dore_fo_screener's live _now_ist_str() — "now",
             # every single scan — even though Entry itself was frozen.
             # A plan that triggered yesterday looked like a brand-new
-            # signal on every refresh. Lock it to the actual event time:
-            # when price crossed the trigger (activated_at) once the plan
-            # is ACTIVE/T1_HIT, or when the level was first locked
-            # (created_at) while still WAITING for that trigger.
-            if plan.status in (FOSetupPlanStatus.ACTIVE, FOSetupPlanStatus.T1_HIT):
+            # signal on every refresh. Lock it to the actual event time
+            # of the CURRENT lifecycle state:
+            #   WAITING -> created_at (level first locked)
+            #   ACTIVE  -> activated_at (price crossed the trigger)
+            #   T1_HIT  -> t1_hit_at (T1 was actually hit) — falls back
+            #              to activated_at/created_at if t1_hit_at wasn't
+            #              stamped for some reason.
+            # 2026-07-23 fix: T1_HIT previously fell through to
+            # activated_at, so "Manage Trade" rows kept showing the
+            # original entry time instead of when T1 actually hit.
+            if plan.status == FOSetupPlanStatus.T1_HIT:
+                event_ts = plan.t1_hit_at or plan.activated_at or plan.created_at
+            elif plan.status == FOSetupPlanStatus.ACTIVE:
                 event_ts = plan.activated_at or plan.created_at
             else:  # WAITING
                 event_ts = plan.created_at
