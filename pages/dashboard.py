@@ -3135,7 +3135,7 @@ def _dash_scan_autorefresh():
             st.session_state["dash_scan_df"]      = pd.DataFrame(_records)
             st.session_state["dash_scan_run_at"]  = full.get("created_at", "")
             st.session_state["dash_scan_version"] = full.get("version")
-            st.rerun()
+            st.rerun(scope="fragment")
         return
 
     if meta is None and "dash_scan_df" not in st.session_state:
@@ -3146,7 +3146,7 @@ def _dash_scan_autorefresh():
         if _run_at and _run_at != st.session_state.get("dash_scan_run_at"):
             st.session_state["dash_scan_df"]     = _df
             st.session_state["dash_scan_run_at"] = _run_at
-            st.rerun()
+            st.rerun(scope="fragment")
 
 
 def render(settings: dict | None = None):
