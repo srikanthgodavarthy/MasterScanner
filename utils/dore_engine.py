@@ -192,6 +192,11 @@ class DOREInput:
                                      # STRIKE_STEP_BY_SYMBOL / cfg.strike_step (index-only, coarse)
     ce_premium:       float = 0.0
     pe_premium:       float = 0.0
+    strike_chain:     dict = field(default_factory=dict)   # {strike: {"ce_premium","pe_premium","ce_oi","pe_oi"}}
+                                     # — full chain, same fetch as ce_premium/pe_premium above (ATM/wall
+                                     # reference only). Used to look up the REAL premium at whatever strike
+                                     # Stage 5b (stage5b_strike_and_expiry) actually recommends, since that
+                                     # can be a different, ITM-walked strike — see build_dore_input().
     ce_premium_prev:  Optional[float] = None   # premium 1 poll ago (tick-to-tick, not day-open baseline)
     pe_premium_prev:  Optional[float] = None
     ce_premium_prev2: Optional[float] = None   # premium 2 polls ago — lets Stage 3 tell "was falling, now
@@ -1923,6 +1928,7 @@ def build_dore_input(
         strike_interval=atm_chain_row.get("strike_interval", 0.0) or oi_resistance.get("strike_interval", 0.0),
         ce_premium=atm_chain_row.get("ce_premium", 0.0),
         pe_premium=atm_chain_row.get("pe_premium", 0.0),
+        strike_chain=atm_chain_row.get("strike_premiums") or {},
         ce_premium_prev=atm_chain_row.get("ce_premium_prev"),
         pe_premium_prev=atm_chain_row.get("pe_premium_prev"),
         ce_premium_prev2=atm_chain_row.get("ce_premium_prev2"),
