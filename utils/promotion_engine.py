@@ -51,6 +51,14 @@ setup with a great Promo Score but a poor R:R does not get promoted past
 Actionable, since the whole point of Execute/Elite is "this is a good
 trade to take right now", not just "the tape looks confirming".
 
+2026-07-23: Stochastic Up Convergence and VWAP Touch & Reverse are not
+independent signals — VWAP reclaim detection finds its own %K/%D
+confluence internally, using the same crossover Stochastic Up
+Convergence is built on. When both fire from that same crossover
+(r.stoch_confluence), they're collapsed into one CONFLUENT_STOCH_VWAP_
+WEIGHT-point signal instead of being double-counted as 25+25 — see
+evaluate_promotion() below.
+
 Usage
 ─────
     from utils.promotion_engine import evaluate_promotion
@@ -76,6 +84,20 @@ if TYPE_CHECKING:
 
 # Signal weights — mirrors the "Promo Score /100" shown on the Scanner
 SIGNAL_WEIGHT = 25
+
+# 2026-07-23: Stochastic Up Convergence and VWAP Touch & Reverse are NOT
+# statistically independent — detect_vwap_reclaim() (continuation_
+# patterns.py) finds its own %K/%D confluence using the SAME crossover
+# stoch_convergence.py uses to set stoch_reignition in the first place
+# (see its docstring: "Stochastic Confluence: Most recent %K > %D
+# crossover..."). When both fire AND the detector's own r.stoch_confluence
+# flag confirms they came from the same bars, that's one real market
+# event (stochastic reversal + VWAP reclaim happening together) being
+# counted as two independent confirmations worth 25 each — 50 points,
+# clearing EXECUTE_SCORE_MIN on its own. Confluent stoch+VWAP now counts
+# as ONE combined signal at this weight instead of 25+25, so reaching
+# Execute needs a genuinely independent third leg (LL or Institutional).
+CONFLUENT_STOCH_VWAP_WEIGHT = 30
 
 # Promo Score thresholds
 ELITE_SCORE_MIN   = 75   # Strong — 3+ of 4 signals confirming
@@ -137,6 +159,12 @@ class PromotionResult:
     vwap_reversal:  bool = False
     institutional:  bool = False
 
+    # True when stoch_up + vwap_reversal both fired from the SAME
+    # underlying crossover (r.stoch_confluence) — see
+    # CONFLUENT_STOCH_VWAP_WEIGHT above. When True, promo_score counted
+    # them as one combined signal, not 25+25.
+    stoch_vwap_confluent: bool = False
+
     risk_reward:    float = 0.0
     rr_ok_execute:  bool = False
     rr_ok_elite:    bool = False
@@ -151,6 +179,7 @@ class PromotionResult:
             "LL Confirmed":   self.ll_confirmed,
             "VWAP Reversal":  self.vwap_reversal,
             "Institutional":  self.institutional,
+            "Stoch+VWAP Confluent": self.stoch_vwap_confluent,
         }
 
 
@@ -276,11 +305,24 @@ def evaluate_promotion(
     res.vwap_reversal = bool(getattr(r, "stoch_vwap_touch", False)) and bool(getattr(r, "stoch_vwap_reclaim", False)) and _vwap_fresh
     res.institutional = _institutional_confirmation(r, ia)
 
-    res.promo_score = sum(
-        SIGNAL_WEIGHT for ok in
-        (res.stoch_up, res.ll_confirmed, res.vwap_reversal, res.institutional)
-        if ok
+    # Confluence check — only collapse the pair when BOTH fired AND the
+    # detector itself (stoch_convergence.py) confirms they came from the
+    # same crossover, not just two signals that happened to both be true
+    # today for unrelated reasons.
+    res.stoch_vwap_confluent = (
+        res.stoch_up and res.vwap_reversal and bool(getattr(r, "stoch_confluence", False))
     )
+
+    if res.stoch_vwap_confluent:
+        res.promo_score = CONFLUENT_STOCH_VWAP_WEIGHT + sum(
+            SIGNAL_WEIGHT for ok in (res.ll_confirmed, res.institutional) if ok
+        )
+    else:
+        res.promo_score = sum(
+            SIGNAL_WEIGHT for ok in
+            (res.stoch_up, res.ll_confirmed, res.vwap_reversal, res.institutional)
+            if ok
+        )
 
     # ── Reward : Risk sanity gate ───────────────────────────────
     # All thresholds in this module (Promo Score and R:R alike) are now
@@ -293,20 +335,28 @@ def evaluate_promotion(
     res.rr_ok_elite = res.risk_reward >= min_rr_elite
 
     # ── Reasons (for the "why promoted" explanation) ────────────
-    if res.stoch_up:
+    if res.stoch_vwap_confluent:
         _kind = getattr(r, "stoch_reignition_kind", "") or "cross"
-        res.reasons.append(f"Stochastic re-ignition ({_kind}) — {_stoch_bars} bar(s) ago")
-    elif bool(getattr(r, "stoch_reignition", False)) and not _stoch_fresh:
-        res.blocked.append(f"Stoch re-ignition found but {_stoch_bars} bars ago (>{STOCH_MAX_BARS_SINCE_REIGNITION}) — too stale to count as timing")
+        res.reasons.append(
+            f"Stochastic re-ignition ({_kind}) + VWAP reclaim — same crossover, "
+            f"counted as ONE combined confirmation ({CONFLUENT_STOCH_VWAP_WEIGHT} pts, "
+            f"not {SIGNAL_WEIGHT}+{SIGNAL_WEIGHT})"
+        )
+    else:
+        if res.stoch_up:
+            _kind = getattr(r, "stoch_reignition_kind", "") or "cross"
+            res.reasons.append(f"Stochastic re-ignition ({_kind}) — {_stoch_bars} bar(s) ago")
+        elif bool(getattr(r, "stoch_reignition", False)) and not _stoch_fresh:
+            res.blocked.append(f"Stoch re-ignition found but {_stoch_bars} bars ago (>{STOCH_MAX_BARS_SINCE_REIGNITION}) — too stale to count as timing")
+        if res.vwap_reversal:
+            res.reasons.append(f"VWAP touch & reclaim — touched {_vwap_bars} bar(s) ago, location and momentum aligned")
+        elif bool(getattr(r, "stoch_vwap_touch", False)) and bool(getattr(r, "stoch_vwap_reclaim", False)) and not _vwap_fresh:
+            res.blocked.append(f"VWAP touch/reclaim found but {_vwap_bars} bars ago (>{VWAP_MAX_BARS_SINCE_TOUCH}) — too stale to count as timing")
     if res.ll_confirmed:
         res.reasons.append(f"Defended Lower-Low spring — reclaimed {_ll_bars} bar(s) ago, never re-broken")
     elif bool(getattr(r, "ll_actionable", False)) and bool(getattr(r, "ll_defended", False)) and not _ll_fresh:
         _age = f"{_ll_bars} bars ago" if _ll_bars >= 0 else "an unknown number of bars ago"
         res.blocked.append(f"LL spring is defended but reclaimed {_age} (>{LL_MAX_BARS_SINCE_RECLAIM}) — too stale to count as timing")
-    if res.vwap_reversal:
-        res.reasons.append(f"VWAP touch & reclaim — touched {_vwap_bars} bar(s) ago, location and momentum aligned")
-    elif bool(getattr(r, "stoch_vwap_touch", False)) and bool(getattr(r, "stoch_vwap_reclaim", False)) and not _vwap_fresh:
-        res.blocked.append(f"VWAP touch/reclaim found but {_vwap_bars} bars ago (>{VWAP_MAX_BARS_SINCE_TOUCH}) — too stale to count as timing")
     if res.institutional:
         res.reasons.append("Institutional confirmation — elevated volume + OBV at a fresh high, today")
 
