@@ -1220,8 +1220,25 @@ def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
         except Exception:
             logger.exception("fetch_oi_resistance: ATM Greeks lookup failed for %s (non-fatal)", index)
 
+        # 2026-07-23: same fix as fetch_stock_atm_option() — full
+        # per-strike premium map from this SAME chain fetch, no extra
+        # API call. ce_premium/pe_premium below stay pinned to the
+        # OI-wall strike (by design, DORE's own reference point); the
+        # UI's displayed Premium for whatever strike Stage 5 actually
+        # recommends should be looked up here instead.
+        strike_premiums = {
+            r.get("strike_price"): {
+                "ce_premium": _premium(r, "call_options"),
+                "pe_premium": _premium(r, "put_options"),
+                "ce_oi": _oi(r, "call_options"),
+                "pe_oi": _oi(r, "put_options"),
+            }
+            for r in chain if r.get("strike_price") is not None
+        }
+
         return {
             "expiry":     expiry,
+            "strike_premiums": strike_premiums,
             "ce_strike":  best_ce.get("strike_price"),   # highest-OI Call strike -> OI Resistance
             "ce_oi":      ce_oi,
             "ce_premium": _premium(best_ce, "call_options"),
@@ -1670,11 +1687,32 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
         best_ce = max(chain, key=lambda r: _md(r, "call_options", "oi"))
         best_pe = max(chain, key=lambda r: _md(r, "put_options", "oi"))
 
+        # 2026-07-23: full per-strike premium map, built from the SAME
+        # chain fetch above — no extra API call. Fixes a bug where the
+        # UI's "Premium" column showed the ATM strike's premium next to
+        # whatever strike DORE's Stage 5 ITM-walk (stage5b_strike_and_expiry)
+        # actually recommended, which is very often a DIFFERENT strike
+        # once itm_steps > 0 (i.e. any "ITM" Strike Type row). Callers
+        # should look up the recommended strike's real premium here
+        # rather than trust ce_premium/pe_premium below, which stay
+        # ATM-only (by design — Stage 3/4 scoring wants a stable ATM
+        # reference point, not a moving target).
+        strike_premiums = {
+            r.get("strike_price"): {
+                "ce_premium": _md(r, "call_options", "ltp"),
+                "pe_premium": _md(r, "put_options", "ltp"),
+                "ce_oi": _md(r, "call_options", "oi"),
+                "pe_oi": _md(r, "put_options", "oi"),
+            }
+            for r in chain if r.get("strike_price") is not None
+        }
+
         return {
             "expiry":      expiry,
             "spot":        float(spot),
             "atm_strike":  atm_row.get("strike_price"),
             "strike_interval": _derive_strike_interval(chain, atm_row.get("strike_price")),
+            "strike_premiums": strike_premiums,
             "ce_strike":   atm_row.get("strike_price"),
             "ce_premium":  _md(atm_row, "call_options", "ltp"),
             "ce_premium_pct_chg": _premium_pct_chg(atm_row, "call_options"),
