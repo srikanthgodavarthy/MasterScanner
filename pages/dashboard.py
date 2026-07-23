@@ -235,6 +235,23 @@ _CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
 
+/* Suppress Streamlit's stale-dim opacity transition on fragment reruns.
+   _market_intelligence_fragment() and _dash_scan_autorefresh() both use
+   st.fragment(run_every=...) — on every tick, Streamlit marks that
+   fragment's existing DOM [data-stale="true"] and dims it via an
+   opacity transition until the new content arrives, then un-dims. With
+   3 sequential Upstox/yfinance calls per Market Intelligence tick, that
+   dim window is long enough to read as a visible flicker every 20s,
+   independent of whether the underlying quotes actually moved. This
+   can't be verified visually in a non-browser environment — test in
+   an actual session and drop this block if it turns out not to be the
+   cause here.
+*/
+[data-stale="true"] {
+  opacity: 1 !important;
+  transition: none !important;
+}
+
 :root {
   --bg0: #0d1117;
   --bg1: #161b22;
@@ -1674,16 +1691,29 @@ def _dore_debug_html(dore: dict, reasons: list, warnings: list) -> str:
     reasons_html  = "".join(f'<li style="margin-bottom:2px">{r}</li>' for r in reasons) or "<li>—</li>"
     warnings_html = "".join(f'<li style="margin-bottom:2px">{w}</li>' for w in warnings) or "<li>—</li>"
 
-    return f"""  <details style="margin-top:8px;font-size:11px;">
-    <summary style="cursor:pointer;color:var(--muted);user-select:none;">🔬 DORE debug</summary>
-    <div style="margin-top:6px;padding:8px;background:rgba(255,255,255,0.03);border-radius:6px;">
-      {scores_html}
-      <div style="margin-top:8px;color:var(--muted);font-weight:600;">Reasons</div>
-      <ul style="margin:4px 0 0 16px;padding:0;color:var(--text);">{reasons_html}</ul>
-      <div style="margin-top:8px;color:var(--muted);font-weight:600;">Warnings</div>
-      <ul style="margin:4px 0 0 16px;padding:0;color:var(--text);">{warnings_html}</ul>
-    </div>
-  </details>"""
+    # Zero-indent, single-line-per-part construction — deliberately NOT
+    # a triple-quoted f-string. A multi-line f-string here indents each
+    # line (for source readability), and those leading spaces are
+    # exactly what CommonMark's indented-code-block rule catches once
+    # this gets joined into the larger card HTML inside st.markdown():
+    # a line starting with 4+ spaces outside an existing HTML block can
+    # make the parser bail out of raw-HTML mode and print the rest of
+    # the block as literal escaped text — the "visible raw tags" bug.
+    # Every part below is single-line with no leading whitespace, and
+    # the pieces are joined with "" (not "\n") so no line boundary can
+    # ever introduce indentation by accident.
+    return "".join([
+        '<details style="margin-top:8px;font-size:11px;">',
+        '<summary style="cursor:pointer;color:var(--muted);user-select:none;">🔬 DORE debug</summary>',
+        '<div style="margin-top:6px;padding:8px;background:rgba(255,255,255,0.03);border-radius:6px;">',
+        scores_html,
+        '<div style="margin-top:8px;color:var(--muted);font-weight:600;">Reasons</div>',
+        f'<ul style="margin:4px 0 0 16px;padding:0;color:var(--text);">{reasons_html}</ul>',
+        '<div style="margin-top:8px;color:var(--muted);font-weight:600;">Warnings</div>',
+        f'<ul style="margin:4px 0 0 16px;padding:0;color:var(--text);">{warnings_html}</ul>',
+        '</div>',
+        '</details>',
+    ])
 
 
 def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
@@ -2272,33 +2302,46 @@ def _leadership_rotation_panel(sector_stats: pd.DataFrame,
         if inflow_days < 5 else ""
     )
 
-    return f"""
-<div class="ti-panel">
-  <div class="ti-panel-title">⇅ LEADERSHIP ROTATION</div>
-  <div class="ti-lead-cols">
-    <div>
-      <div class="ti-mom-title">Sector Momentum (vs 20D ago)</div>
-      {mom_rows}
-      {mom_note}
-    </div>
-    <div>
-      <div class="ti-mom-title">Net Inflow (5D)</div>
-      <div class="ti-inflow-ring-wrap">
-        {ring_svg}
-        <div class="ti-inflow-center">
-          <div class="ti-inflow-value" style="color:{ring_color}">{"+" if total_inflow >= 0 else ""}{total_inflow:,.0f} Cr</div>
-          <div class="ti-inflow-label">Net Inflow</div>
-        </div>
-      </div>
-      <div class="ti-inflow-list-title up">Top 3 Inflow Sectors</div>
-      {_flow_rows(top_in)}
-      <div class="ti-inflow-list-title down">Top 3 Outflow Sectors</div>
-      {_flow_rows(top_out)}
-      {inflow_note}
-    </div>
-  </div>
-</div>
-"""
+    # Built via list+join, not the multi-line f-string this used to be —
+    # mom_note and inflow_note are each "" in the common case (once
+    # max_days>=20 / inflow_days>=5, i.e. after the app's been running a
+    # while), and each sat alone on its own indented line in the old
+    # f-string. A line that's ONLY an interpolated empty string is a
+    # blank line to CommonMark, which ends the raw-HTML block right
+    # there — everything the return produces after it stops being
+    # parsed as HTML and prints as literal escaped tags instead. Same
+    # failure mode documented on _index_card_html's warn_html; this
+    # panel just wasn't guarded against it yet. Only appending truthy
+    # parts here removes the blank line entirely.
+    parts = [
+        '<div class="ti-panel">',
+        '<div class="ti-panel-title">⇅ LEADERSHIP ROTATION</div>',
+        '<div class="ti-lead-cols">',
+        '<div>',
+        '<div class="ti-mom-title">Sector Momentum (vs 20D ago)</div>',
+        mom_rows,
+    ]
+    if mom_note:
+        parts.append(mom_note)
+    parts += [
+        '</div>',
+        '<div>',
+        '<div class="ti-mom-title">Net Inflow (5D)</div>',
+        '<div class="ti-inflow-ring-wrap">',
+        ring_svg,
+        f'<div class="ti-inflow-center"><div class="ti-inflow-value" style="color:{ring_color}">'
+        f'{"+" if total_inflow >= 0 else ""}{total_inflow:,.0f} Cr</div>'
+        f'<div class="ti-inflow-label">Net Inflow</div></div>',
+        '</div>',
+        '<div class="ti-inflow-list-title up">Top 3 Inflow Sectors</div>',
+        _flow_rows(top_in),
+        '<div class="ti-inflow-list-title down">Top 3 Outflow Sectors</div>',
+        _flow_rows(top_out),
+    ]
+    if inflow_note:
+        parts.append(inflow_note)
+    parts += ['</div>', '</div>', '</div>']
+    return "".join(parts)
 
 
 # ── SIGNAL CLASS COUNTS ────────────────────────────────────────────
@@ -3191,7 +3234,7 @@ def _news_impact_panel():
 # _market_intelligence_fragment above. It only forces a full-page rerun
 # (st.rerun()) when the latest run_at actually changed, so an idle
 # Dashboard with no new scan just re-checks quietly every cycle.
-_DASH_AUTOREFRESH_SECS = 120  # poll every 2 min for a newer completed scan
+_DASH_AUTOREFRESH_SECS = 60  # poll every 1 min for a newer completed scan
 
 
 @st.fragment(run_every=_DASH_AUTOREFRESH_SECS)
@@ -3273,12 +3316,27 @@ def render(settings: dict | None = None):
     # ── News Impact — independent of scan state too.
     _news_impact_panel()
 
+    # ── Embedded Scanner — lets Run Scan happen without leaving the
+    # Dashboard. pages.scanner.render() is the same function the
+    # standalone "Live Scanner" page calls (app.py _page_scanner());
+    # calling it here does NOT change the "Dashboard never runs its
+    # own scan" design (see the Auto-refresh comment block below) —
+    # Dashboard still only *reads* scan_full_snapshots on its own,
+    # this just puts the button that writes it on the same page.
+    # Placed before the df_aug.empty early-return below, so it's the
+    # thing you see (and can act on) on a completely fresh session too.
+    # No st.session_state key collisions with pages.scanner's own
+    # widgets — verified against every key= in both files.
+    with st.expander("🔍 Live Scanner", expanded=df_aug.empty):
+        from pages.scanner import render as render_scanner
+        render_scanner(settings)
+
     if df_aug.empty:
         st.markdown("""
         <div style="text-align:center;padding:4rem 2rem;color:#8b949e;">
             <div style="font-size:3rem">📡</div>
             <div style="font-size:1.1rem;margin-top:0.5rem;color:var(--text);">No scan data yet</div>
-            <div style="font-size:0.8rem;margin-top:0.3rem;">Run a scan on the <b>Scanner</b> page to populate Market Health, Sector Rotation, and Signal Class counts.</div>
+            <div style="font-size:0.8rem;margin-top:0.3rem;">Run a scan in the <b>🔍 Live Scanner</b> section above to populate Market Health, Sector Rotation, and Signal Class counts.</div>
         </div>""", unsafe_allow_html=True)
         return
 
