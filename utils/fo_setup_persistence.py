@@ -184,6 +184,29 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _to_ist_display(iso_ts: str) -> str:
+    """Convert a stored UTC ISO timestamp (what actually goes into the
+    timestamptz columns) to the same 'YYYY-MM-DD HH:MM:SS' IST display
+    format dore_fo_screener._now_ist_str() uses for the live 'Entry
+    Timestamp' column — so a locked plan's stamp renders identically to
+    a live one. Deliberately keeps the stored field itself as proper
+    UTC ISO-with-offset (never a naive local string) since it's written
+    straight into a `timestamptz` Supabase column — a naive
+    'YYYY-MM-DD HH:MM:SS' with no offset would get silently
+    mis-interpreted as UTC/session-tz on insert, shifting it by IST's
+    +5:30. Falls back to the raw string if parsing fails."""
+    if not iso_ts:
+        return ""
+    try:
+        import pytz
+        dt = datetime.fromisoformat(iso_ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(iso_ts)
+
+
 def _format_setup_age(days: int, status: str) -> str:
     s = _sval(status)
     if s == FOSetupPlanStatus.NO_PLAN:
@@ -214,7 +237,7 @@ def _plan_status_label(status: str) -> str:
 #  LIFECYCLE STATE MACHINE — premium / entry / sl / target / age ONLY
 # ══════════════════════════════════════════════════════════════════
 
-def _advance_step(plan: FOSetupPlan, premium: float, today_str: str) -> tuple[bool, str]:
+def _advance_step(plan: FOSetupPlan, premium: float, today_str: str, now_ts: str) -> tuple[bool, str]:
     days = _compute_days_active(plan.created_date)
     plan.days_active = days
 
@@ -225,17 +248,17 @@ def _advance_step(plan: FOSetupPlan, premium: float, today_str: str) -> tuple[bo
         if has_premium and sl > 0 and premium < sl:
             reason = f"Stop hit ({premium:.2f} < SL {sl:.2f}) before entry triggered"
             plan.status, plan.status_reason = FOSetupPlanStatus.CLOSED, reason
-            plan.closed_at = today_str
+            plan.closed_at = now_ts
             return True, reason
         if has_premium and entry > 0 and premium >= entry:
             reason = f"Entry triggered at {premium:.2f}"
             plan.status, plan.status_reason = FOSetupPlanStatus.ACTIVE, reason
-            plan.activated_at = today_str
+            plan.activated_at = now_ts
             return True, reason
         if days > MAX_FO_SETUP_AGE_DAYS:
             reason = f"Expired after {days}d — entry never triggered"
             plan.status, plan.status_reason = FOSetupPlanStatus.EXPIRED, reason
-            plan.closed_at = today_str
+            plan.closed_at = now_ts
             return True, reason
         return False, ""
 
@@ -243,12 +266,12 @@ def _advance_step(plan: FOSetupPlan, premium: float, today_str: str) -> tuple[bo
         if has_premium and sl > 0 and premium < sl:
             reason = f"Stop hit at {premium:.2f}"
             plan.status, plan.status_reason = FOSetupPlanStatus.CLOSED, reason
-            plan.closed_at = today_str
+            plan.closed_at = now_ts
             return True, reason
         if has_premium and t1 > 0 and premium >= t1:
             reason = f"T1 hit at {premium:.2f}"
             plan.status, plan.status_reason = FOSetupPlanStatus.T1_HIT, reason
-            plan.t1_hit_at = today_str
+            plan.t1_hit_at = now_ts
             return True, reason
         return False, ""
 
@@ -256,12 +279,12 @@ def _advance_step(plan: FOSetupPlan, premium: float, today_str: str) -> tuple[bo
         if has_premium and sl > 0 and premium < sl:
             reason = f"Stopped out on remainder at {premium:.2f}"
             plan.status, plan.status_reason = FOSetupPlanStatus.CLOSED, reason
-            plan.closed_at = today_str
+            plan.closed_at = now_ts
             return True, reason
         if has_premium and t2 > 0 and premium >= t2:
             reason = f"Final target T2 hit at {premium:.2f}"
             plan.status, plan.status_reason = FOSetupPlanStatus.CLOSED, reason
-            plan.closed_at = today_str
+            plan.closed_at = now_ts
             return True, reason
         return False, ""
 
@@ -270,11 +293,19 @@ def _advance_step(plan: FOSetupPlan, premium: float, today_str: str) -> tuple[bo
 
 def advance_fo_lifecycle(plan: FOSetupPlan, current_premium: float, today_str: str | None = None) -> tuple[bool, str]:
     today_str = today_str or date.today().isoformat()
+    # 2026-07-23: today_str is date-only (used for day-boundary bookkeeping
+    # like days_active / the 5-day WAITING expiry) — it was also being
+    # reused to stamp activated_at/t1_hit_at/closed_at, which meant a
+    # plan's own recorded trigger time had no time-of-day at all (couldn't
+    # tell a 9:20am entry from a 3:20pm one). now_ts is a real UTC ISO
+    # timestamp (timestamptz-column-safe) used for those event stamps
+    # specifically — see _to_ist_display() for how it's rendered.
+    now_ts = _now_iso()
     if plan.is_terminal():
         return False, ""
     changed_any, last_reason = False, ""
     for _ in range(4):
-        changed, reason = _advance_step(plan, float(current_premium or 0), today_str)
+        changed, reason = _advance_step(plan, float(current_premium or 0), today_str, now_ts)
         if not changed:
             break
         changed_any, last_reason = True, reason
@@ -315,7 +346,12 @@ def _create_fo_plan(row: dict, first_seen: str, today_str: str) -> Optional[FOSe
         t1_locked         = float(row.get("T1", 0) or 0),
         t2_locked         = float(row.get("T2", 0) or 0),
         locked_recommendation   = str(row.get("Recommendation", "")),
-        locked_opportunity_score = float(row.get("Opportunity", 0) or 0),
+        # 2026-07-23: was reading "Opportunity" — the dashboard-row key is
+        # actually "Opportunity Score" (see dore_fo_screener.compute_fo_
+        # opportunities' rows.append dict), so this silently locked 0.0
+        # into every plan's audit trail. Fall back to the old key too in
+        # case a caller still passes the short name.
+        locked_opportunity_score = float(row.get("Opportunity Score", row.get("Opportunity", 0)) or 0),
         locked_strike_type = str(row.get("Strike Type", "") or ""),
         status           = FOSetupPlanStatus.WAITING,
         status_reason     = "Plan created — awaiting entry trigger",
@@ -412,9 +448,58 @@ def enrich_fo_opportunities_df(rows: list[dict], existing_plans: dict) -> tuple[
             row["SL"] = plan.sl_locked
             row["T1"] = plan.t1_locked
             row["T2"] = plan.t2_locked
+            # 2026-07-23: Entry Timestamp was left untouched here, so it
+            # kept showing dore_fo_screener's live _now_ist_str() — "now",
+            # every single scan — even though Entry itself was frozen.
+            # A plan that triggered yesterday looked like a brand-new
+            # signal on every refresh. Lock it to the actual event time:
+            # when price crossed the trigger (activated_at) once the plan
+            # is ACTIVE/T1_HIT, or when the level was first locked
+            # (created_at) while still WAITING for that trigger.
+            if plan.status in (FOSetupPlanStatus.ACTIVE, FOSetupPlanStatus.T1_HIT):
+                event_ts = plan.activated_at or plan.created_at
+            else:  # WAITING
+                event_ts = plan.created_at
+            row["Entry Timestamp"] = _to_ist_display(event_ts)
         else:
             row["Plan"] = None
             row["SetupID"] = None
             row["SetupAge"] = None
+
+        # 4. Plan-aware Action/Execution override.
+        # 2026-07-23: Action/Execution State were always derived from
+        # DORE's LIVE, every-scan-recomputed Recommendation — completely
+        # independent of the persistent Plan lifecycle above. That let a
+        # contract whose plan already reached ACTIVE or T1_HIT keep
+        # showing "Wait for Trigger / BREAKOUT_PENDING" any time the raw
+        # indicator dipped back under its own breakout condition, even
+        # though the trade itself had already triggered and moved on —
+        # a live, unrelated read overwriting a persisted trade state.
+        # Once a plan is actually ACTIVE or has hit T1, the plan's own
+        # status is the truth for "what should I do", not the
+        # recomputed Recommendation — so override the display fields
+        # (never the underlying Recommendation string itself, which
+        # stays untouched for audit/backtest purposes).
+        if plan is not None:
+            if plan.status == FOSetupPlanStatus.ACTIVE:
+                row["Action"] = "In Trade"
+                row["Execution State"] = "POSITION_ACTIVE — holding for T1"
+            elif plan.status == FOSetupPlanStatus.T1_HIT:
+                row["Action"] = "Manage Trade"
+                row["Execution State"] = "T1_HIT — trail remainder to T2/SL"
+            # WAITING keeps the live Action/Execution State as-is — the
+            # trade genuinely hasn't triggered yet, so "Wait for Trigger"
+            # / BREAKOUT_PENDING is still an accurate read.
+
+        # 5. Drift % — how far the live Premium has moved from the
+        # displayed Entry (locked once a plan is open, otherwise DORE's
+        # live trigger price). Distinct from "Premium %Chg" (session-
+        # over-session change); this is "how far in/out of the money on
+        # this specific plan am I right now".
+        entry_for_drift = float(row.get("Entry", 0) or 0)
+        if entry_for_drift > 0:
+            row["Entry Drift %"] = (current_premium - entry_for_drift) / entry_for_drift * 100.0
+        else:
+            row["Entry Drift %"] = None
 
     return rows, updated_plans
