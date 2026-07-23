@@ -1677,6 +1677,8 @@ def _dore_debug_html(dore: dict, reasons: list, warnings: list) -> str:
                                         if dore.get("expected_move_coverage") is not None else "—")),
         _row("Risk Quality",        f'{dore.get("risk_quality", 0):.0f}'),
         _row("Risk Hard-Gate",      "⚠ FAILED" if gate_fail else "pass"),
+        _row("Intraday Reversal",   (f'⚡ {dore.get("intraday_reversal_move_pct", 0):+.2f}%'
+                                     if dore.get("intraday_reversal_alert") else "—")),
         _row("Opportunity Score",   f'{dore.get("opportunity_score", 0):.0f}'),
         _row("Conviction (/10)",    f'{dore.get("conviction_score_10", 0):.1f}'),
         _row("Strike",              f'{dore.get("suggested_strike"):,.0f}'
@@ -1862,6 +1864,23 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
         warn_html  = (
             f'<div class="mo-index-dore-warn">⚠ {warnings[0]}</div>' if warnings else ""
         )
+        # Intraday Reversal Alert (2026-07-22, see check_intraday_reversal_alert
+        # in dore_engine.py) — deliberately informational-only, never gates
+        # the recommendation, but it was ALSO never actually visible on this
+        # card: it's appended near the end of the `warnings` list above, and
+        # warn_html only ever renders warnings[0] — so any risk/OI warning
+        # ahead of it (very common) silently buried it. Reads the dedicated
+        # DOREResult fields directly instead of relying on warnings order, so
+        # a genuine big-move-against-trend day always shows up regardless of
+        # what else is in the warnings list.
+        reversal_html = ""
+        if dore.get("intraday_reversal_alert"):
+            _rev_pct = dore.get("intraday_reversal_move_pct", 0.0)
+            reversal_html = (
+                f'<div class="mo-index-dore-warn" style="color:#d29922;border-color:#d2992255;">'
+                f'⚡ Intraday Reversal Alert ({_rev_pct:+.2f}%) — {dore.get("intraday_reversal_reason", "")}'
+                f'</div>'
+            )
         # Position Sizing (utils/position_sizing.py) — downstream of DORE,
         # never re-deriving anything above. Only rendered when the card
         # is actually holding a DOREResult with a resolvable sizing state
@@ -1898,6 +1917,8 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
         ]
         if warn_html:
             dore_html_parts.append(warn_html)
+        if reversal_html:
+            dore_html_parts.append(reversal_html)
         if sizing_html:
             dore_html_parts.append(sizing_html)
         dore_html_parts.append(_dore_debug_html(dore, reasons, warnings))
