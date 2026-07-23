@@ -45,14 +45,16 @@ if not logging.getLogger().handlers:
 
 load_dotenv()  # picks up UPSTOX_ACCESS_TOKEN from a local .env if present
 
-# 2026-07-23: starts the Market Intelligence (30s) / F&O Scan (60s) /
-# Live Scanner (2min) background loops inside THIS process, on their own
-# daemon threads — see utils/inprocess_scheduler.py's docstring for why
-# (no separate host to run scheduler/scan_worker.py on). st.cache_resource
-# inside start_background_scans() guarantees this only actually launches
-# threads once per process, not once per browser session/tab.
-from utils.inprocess_scheduler import start_background_scans
-start_background_scans()
+# 2026-07-23: the Market Intelligence (30s) / F&O Scan (60s) / Live
+# Scanner (~5min, batched) background loops are started from
+# pages/dashboard.py's render() instead of here — deliberately AFTER
+# the Dashboard's own first synchronous Supabase read+display, so the
+# sequence on a fresh session is always "show what's already in
+# Supabase" first, "kick off the background scanners" second, never the
+# other way round. st.cache_resource inside start_background_scans()
+# still guarantees the loops only actually launch once per process no
+# matter how many times/pages that call happens from. See
+# utils/inprocess_scheduler.py's docstring for the full rationale.
 
 st.set_page_config(
     page_title="Trinity — Nifty 500",
