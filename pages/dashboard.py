@@ -2491,10 +2491,14 @@ def _options_table_html(df: pd.DataFrame) -> str:
         Trade row shows when T1 actually hit, not just the original
         entry. 2026-07-23: moved out of its own "Entry Timestamp"
         column (confusing next to the Entry price column) and rendered
-        as a muted sub-line directly under the Plan status badge."""
+        as a sub-line directly under the Plan status badge.
+        2026-07-23 fix: was 10px in --muted (#8b949e) — too small/low-
+        contrast on the dark theme to read at a glance. Bumped to 12px
+        in --text (the theme's primary readable color) instead of
+        --muted."""
         if v in (None, "") or pd.isna(v):
             return ""
-        return f'<br><span style="color:var(--muted);font-size:10px;">{v} IST</span>'
+        return f'<br><span style="color:var(--text);font-size:12px;">{v} IST</span>'
 
     if "Action" in df.columns:
         df = df[df["Action"] != "Watch Only"]
