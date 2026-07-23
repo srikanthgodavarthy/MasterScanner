@@ -28,11 +28,13 @@ means those loops only launch once per process no matter how many
 reruns/sessions call this.
 
 [2026-07-23] The embedded "🔍 Live Scanner" expander (which wrapped
-pages.scanner.render() — Run Scan button and all) has been removed.
-Now that live_scanner is populated automatically by the background
-sub-scheduler, the Dashboard has no manual-scan button of its own: it
-just shows whatever's in `dash_scan_df` (loaded from Supabase above)
-directly, no fold/expander and no click required. The standalone
+pages.scanner.render() — Run Scan button, controls row, and all) has
+been removed. Now that live_scanner is populated automatically by the
+background sub-scheduler, the Dashboard has no manual-scan button of
+its own: it calls pages.scanner.render_scan_results() directly — the
+same Elite/Execute/Actionable/... tabbed table the standalone Scanner
+page shows — passing it `dash_scan_df` (already loaded from Supabase
+above). Shown unfolded, no expander, no click required. The standalone
 Scanner page (pages/scanner.py) still has its own Run Scan button for
 an on-demand re-run.
 
@@ -3233,6 +3235,22 @@ def render(settings: dict | None = None):
             <div style="font-size:0.8rem;margin-top:0.3rem;">The background scanner populates this automatically within a few minutes — or run one now on the <b>Live Scanner</b> page to populate Market Health, Sector Rotation, and Signal Class counts immediately.</div>
         </div>""", unsafe_allow_html=True)
         return
+
+    # ── Live Scanner results — Elite/Execute/Actionable/Developing/Fib-
+    # Pullback/Active-Setups tables. Shown directly, unfolded, straight
+    # from `df_aug` (already read from the `live_scanner` Supabase
+    # snapshot above) — no expander, no "Run Scan" button on this page.
+    # pages/scanner.py's render_scan_results() is the exact same
+    # tab/table renderer the standalone Scanner page uses; only its Run
+    # Scan controls are Scanner-page-only. The regime `summary` dict
+    # reuses whatever _market_intelligence_fragment() already loaded
+    # into session_state above, rather than re-fetching Nifty/VIX here.
+    from pages.scanner import render_scan_results
+    render_scan_results(
+        df_aug,
+        summary=(st.session_state.get("mi_snapshot_payload") or {}).get("summary", {}),
+        scan_time=scan_time,
+    )
 
     # ── Signal Class counts ("Scanner Summary") ───────────────────────
     if "Recommendation" in df_aug.columns:

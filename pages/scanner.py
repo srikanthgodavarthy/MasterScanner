@@ -3164,6 +3164,35 @@ def render(settings: dict | None = None):
             # without permanently occupying a row.
             st.toast("Saved to Supabase.", icon="✅")
 
+    render_scan_results(
+        df_aug=st.session_state.get("scan_df", pd.DataFrame()),
+        summary=st.session_state.get("scan_summary", {}),
+        scan_time=st.session_state.get("scan_time", ""),
+        supabase_ok=supabase_ok,
+    )
+
+
+def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
+                         scan_time: str = "", supabase_ok: bool | None = None) -> None:
+    """
+    Renders the Elite/Execute/Actionable/Developing/Fib-Pullback/Active-
+    Setups tabbed results table for an already-scanned df_aug — no Run
+    Scan button, no controls row, just the display. Factored out of
+    render() (2026-07-23) so pages/dashboard.py can show this directly,
+    unfolded, straight from whatever `live_scanner` already has in
+    Supabase — the Dashboard should never need its own "Run Scan" click
+    to see the same tables the standalone Scanner page shows.
+
+    render() (above) still calls this itself at the end of a manual Run
+    Scan, using its own session_state-held df_aug/summary/scan_time.
+    Nothing in here reads or writes session_state keys that render()'s
+    own controls-row logic (run_btn, save_db, etc.) depends on.
+    """
+    summary = summary or {}
+    if supabase_ok is None:
+        from utils.supabase_client import _is_available
+        supabase_ok = _is_available()
+
     # ── Display ────────────────────────────────────────────────
     # [Dashboard/Scanner split] Market Overview, News Impact, Signal Class
     # counts, Top Gainers, Sector Rotation, and Leadership Rotation all
@@ -3173,9 +3202,6 @@ def render(settings: dict | None = None):
     # of Dashboard's session_state keys (those are namespaced "dash_*");
     # the two pages run fully independently of each other in the same
     # browser session.
-    df_aug          = st.session_state.get("scan_df",       pd.DataFrame())
-    summary         = st.session_state.get("scan_summary",  {})
-    scan_time       = st.session_state.get("scan_time",     "")
 
     if df_aug.empty:
         st.markdown("""
