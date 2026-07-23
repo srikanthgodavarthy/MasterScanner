@@ -376,6 +376,21 @@ def enrich_fo_opportunities_df(rows: list[dict], existing_plans: dict) -> tuple[
             new_plan = _create_fo_plan(row, first_seen=today_str, today_str=today_str)
             if new_plan is not None:
                 plan = new_plan
+                # 2026-07-23: a freshly-minted plan was never checked against
+                # its own entry trigger until the NEXT scan — step 1 above
+                # (advance existing OPEN plans) runs BEFORE this mint step,
+                # so a plan created THIS pass skipped it entirely. That's
+                # exactly the "Plan is always Waiting" symptom: DORE's
+                # build_trade_plan() sets entry_locked = the live premium
+                # AT MINT TIME (entry == premium, no offset), so the
+                # WAITING -> ACTIVE condition (premium >= entry) is very
+                # often already true the instant the plan is created — it
+                # just never got evaluated. If premium then drifts even
+                # slightly below entry_locked before the next scan (normal
+                # for a volatile option premium), the plan is stuck WAITING
+                # for a long time since it has to climb back to that exact
+                # frozen level. Advancing immediately here closes that gap.
+                advance_fo_lifecycle(plan, current_premium, today_str)
                 updated_plans.append(plan)
 
         # 3. Attach display fields.
