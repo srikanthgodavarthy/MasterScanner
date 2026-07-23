@@ -501,11 +501,44 @@ def compute_fo_opportunities(
         result = compute_dore(dore_input, cfg)
         _persist_reversal_alert(symbol, result)
 
-        # Live premium + tick-to-tick %Chg for the LEG DORE actually
-        # recommends — read off the ce/pe premium + ce/pe premium_prev
-        # already tracked above for the Premium Behaviour pillar.
+        # Live premium for the LEG + STRIKE DORE actually recommends.
+        #
+        # 2026-07-23 bugfix: this used to read dore_input.ce_premium /
+        # .pe_premium directly — but those are captured ONCE at a FIXED
+        # reference strike (ATM for stocks, the OI-wall strike for
+        # indices — see fetch_stock_atm_option()/fetch_oi_resistance()),
+        # while result.suggested_strike can be a DIFFERENT strike
+        # whenever Stage 5b's ITM-walk fires (stage5b_strike_and_expiry,
+        # any "ITM" Strike Type row, itm_steps > 0). The table was
+        # showing the correct recommended strike next to the WRONG
+        # strike's premium — e.g. an ITM strike shown with its ATM
+        # neighbour's premium instead of its own live LTP. Fixed by
+        # looking the real premium up in dore_input.strike_chain, keyed
+        # by result.suggested_strike itself.
         leg = result.suggested_direction
-        premium_now  = dore_input.ce_premium if leg == "CE" else dore_input.pe_premium if leg == "PE" else 0.0
+        strike_row = dore_input.strike_chain.get(result.suggested_strike) if result.suggested_strike else None
+        if strike_row:
+            premium_now = strike_row.get("ce_premium", 0.0) if leg == "CE" else \
+                          strike_row.get("pe_premium", 0.0) if leg == "PE" else 0.0
+        else:
+            # Fail-soft: strike not found in this poll's chain (rare —
+            # e.g. a stale/short chain right at expiry). Falls back to
+            # the old reference-strike premium rather than showing
+            # nothing, but flags it so it's visibly a fallback, not a
+            # silent return to the buggy behavior.
+            premium_now = dore_input.ce_premium if leg == "CE" else dore_input.pe_premium if leg == "PE" else 0.0
+            if result.suggested_strike:
+                result.warnings.append(
+                    f"Premium shown is the reference strike's, not {result.suggested_strike:.0f} "
+                    f"{leg}'s — exact strike missing from this poll's chain")
+
+        # NOTE: premium_prev/%Chg below still track the reference
+        # strike's own tick-to-tick history (record_and_diff_premium()
+        # is keyed per-symbol, not per-strike), so "Premium %Chg" is a
+        # separate metric from "Premium" whenever suggested_strike !=
+        # the reference strike. Correct fix is a per-strike premium
+        # history tracker — left as a follow-up, not bundled into this
+        # display-value fix.
         premium_prev = (dore_input.ce_premium_prev if leg == "CE" else
                          dore_input.pe_premium_prev if leg == "PE" else None)
         premium_pct_chg = (
