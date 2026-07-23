@@ -1102,6 +1102,42 @@ def _get_option_chain_with_retry(instrument_key: str, expiry: str) -> Optional[l
     return None
 
 
+def _derive_strike_interval(chain: list, atm_strike: Optional[float]) -> float:
+    """Real listed strike interval for THIS symbol's THIS expiry, read
+    straight off the live chain — not guessed from a static per-symbol
+    map. A flat map (e.g. {'NIFTY': 50, 'BANKNIFTY': 100}) can only ever
+    cover a handful of indices; every individual F&O stock has its own
+    interval that depends on its price band, and those bands are set by
+    the exchange and do change — so hardcoding them per-stock is exactly
+    the class of bug this function exists to avoid (2026-07-22: this is
+    what was producing suggested strikes 46-98 points away from spot for
+    stocks like BEL/LICHSGFIN/ICICIGI/POLICYBZR, using NIFTY's 50-point
+    step against symbols whose real interval is much smaller).
+
+    Takes the median gap between consecutive distinct strikes within a
+    small window around the ATM strike (median, not just the nearest
+    single gap, to stay robust if the chain has one missing/sparse
+    strike near the edge of that window). Returns 0.0 if the chain is
+    too thin to tell (caller should fall back to a coarse default, but
+    that fallback should be logged as a data-quality issue, not treated
+    as normal).
+    """
+    if not chain or not atm_strike:
+        return 0.0
+    strikes = sorted({float(r["strike_price"]) for r in chain if r.get("strike_price")})
+    if len(strikes) < 3:
+        return 0.0
+    # Narrow to the ~10 strikes around ATM so a single wide gap far out
+    # in the chain (thin liquidity at the wings) can't skew the median.
+    idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - atm_strike))
+    window = strikes[max(0, idx - 5): idx + 6]
+    gaps = [round(b - a, 4) for a, b in zip(window, window[1:]) if b > a]
+    if not gaps:
+        return 0.0
+    gaps.sort()
+    return gaps[len(gaps) // 2]  # median gap
+
+
 def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
     """
     Return the nearest-expiry Call/Put OI resistance levels for `index`
@@ -1210,6 +1246,7 @@ def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
             # endpoint doesn't return option_greeks, which DORE handles as
             # "unavailable, treat as neutral" rather than a false zero.
             "atm_strike": atm_strike_val,
+            "strike_interval": _derive_strike_interval(chain, atm_strike_val),
             "ce_delta":   ce_delta,
             "pe_delta":   pe_delta,
             "iv":         round((ce_iv + pe_iv) / 2.0, 2) if (ce_iv is not None and pe_iv is not None) else (ce_iv or pe_iv),
@@ -1637,6 +1674,7 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
             "expiry":      expiry,
             "spot":        float(spot),
             "atm_strike":  atm_row.get("strike_price"),
+            "strike_interval": _derive_strike_interval(chain, atm_row.get("strike_price")),
             "ce_strike":   atm_row.get("strike_price"),
             "ce_premium":  _md(atm_row, "call_options", "ltp"),
             "ce_premium_pct_chg": _premium_pct_chg(atm_row, "call_options"),

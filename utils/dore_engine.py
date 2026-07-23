@@ -186,6 +186,10 @@ class DOREInput:
 
     # ── Stage 3 (Derivative Intelligence) — live Upstox option chain ─
     atm_strike:       float = 0.0
+    strike_interval:  float = 0.0   # real listed strike gap for THIS symbol/expiry, read off the live
+                                     # chain (utils.upstox_client._derive_strike_interval) — 0.0 means
+                                     # "not supplied", in which case Stage 5b falls back to
+                                     # STRIKE_STEP_BY_SYMBOL / cfg.strike_step (index-only, coarse)
     ce_premium:       float = 0.0
     pe_premium:       float = 0.0
     ce_premium_prev:  Optional[float] = None   # premium 1 poll ago (tick-to-tick, not day-open baseline)
@@ -1515,19 +1519,21 @@ def stage5_opportunity_engine(
 #  STAGE 5b — STRIKE & EXPIRY SELECTION
 # ══════════════════════════════════════════════════════════════════
 
-# Strike interval by symbol — NOT uniform across indices. cfg.strike_step
-# (DORESettings, default 50.0) is a single global value that's correct for
-# NIFTY but wrong for BANKNIFTY/SENSEX (100-point strikes), which is
-# exactly the bug this map fixes: stage5b was walking BANKNIFTY strikes in
-# 50-point increments, producing suggested strikes like 57,250 that don't
-# exist on the exchange (BANKNIFTY only lists multiples of 100).
-# Current standard NSE/BSE strike intervals as of this writing — these are
-# exchange-set and do change periodically (like lot sizes, see
-# utils/position_sizing.py's docstring on that same caution), so verify
-# against the current F&O contract spec if strikes still look wrong after
-# this fix. Falls back to cfg.strike_step for any symbol not listed here
-# (individual stocks, whose strike intervals vary per stock and aren't
-# captured by a single map like this one).
+# Last-resort fallback ONLY — Stage 5b's real source of truth is
+# inp.strike_interval, read off the live option chain per-symbol
+# (utils.upstox_client._derive_strike_interval, added 2026-07-23). This
+# map exists purely for the case a caller didn't populate strike_interval
+# at all (e.g. an older cached DOREInput, or a chain fetch that came back
+# too thin to derive an interval from — see that function's docstring).
+# It is NOT a substitute for the live chain: it only covers the 3 index
+# symbols, and individual-stock intervals vary by price band (which the
+# exchange changes periodically, like lot sizes — see
+# utils/position_sizing.py's docstring on that same caution) — hardcoding
+# them per-stock here doesn't scale and silently goes stale. Falling back
+# to cfg.strike_step (index-shaped, default 50.0) for any stock not in
+# this map is exactly the bug this whole comment is warning against; if
+# you see stage5b actually using that fallback for a stock in production,
+# the live chain fetch is the thing to debug, not this map.
 STRIKE_STEP_BY_SYMBOL: dict[str, float] = {
     "NIFTY":     50.0,
     "BANKNIFTY": 100.0,
@@ -1589,7 +1595,20 @@ def stage5b_strike_and_expiry(
         itm_steps = 0
         reasons.append("Option Delta not supplied — defaulting to ATM")
 
-    step = STRIKE_STEP_BY_SYMBOL.get(inp.symbol, cfg.strike_step if cfg.strike_step > 0 else 1.0)
+    # Real listed strike interval, straight off THIS symbol's live chain
+    # (utils.upstox_client._derive_strike_interval), takes priority — it's
+    # correct for every stock, not just the 3 indices in the static map
+    # below. STRIKE_STEP_BY_SYMBOL / cfg.strike_step are only a fallback
+    # for the (should-be-rare) case a caller didn't supply strike_interval
+    # at all — that fallback is index-shaped (50/100-point steps) and
+    # WRONG for most individual stocks, so treat it as a data-quality gap
+    # worth a reason line, not silently accept it as normal.
+    if inp.strike_interval > 0:
+        step = inp.strike_interval
+    else:
+        step = STRIKE_STEP_BY_SYMBOL.get(inp.symbol, cfg.strike_step if cfg.strike_step > 0 else 1.0)
+        reasons.append(f"No live strike_interval for {inp.symbol} — falling back to {step:.0f}pt "
+                        f"step (index-shaped; verify against the actual chain if this is a stock)")
     sign = -1.0 if direction == "CE" else 1.0  # CE moves ITM at LOWER strikes, PE at HIGHER strikes
 
     def _strike_after(n: int) -> float:
@@ -1901,6 +1920,7 @@ def build_dore_input(
         prev_close=execution_features.get("prev_close", 0.0),
 
         atm_strike=atm_chain_row.get("atm_strike", oi_resistance.get("ce_strike", 0.0)),
+        strike_interval=atm_chain_row.get("strike_interval", 0.0) or oi_resistance.get("strike_interval", 0.0),
         ce_premium=atm_chain_row.get("ce_premium", 0.0),
         pe_premium=atm_chain_row.get("pe_premium", 0.0),
         ce_premium_prev=atm_chain_row.get("ce_premium_prev"),

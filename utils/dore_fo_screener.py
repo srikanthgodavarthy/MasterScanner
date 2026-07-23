@@ -458,6 +458,7 @@ def compute_fo_opportunities(
                     "ce_oi": opt.get("ce_oi", 0.0), "pe_oi": opt.get("pe_oi", 0.0),
                     "pcr": opt.get("pcr", 1.0), "expiry": opt.get("expiry", ""),
                     "atm_strike": opt.get("atm_strike") or 0.0,
+                    "strike_interval": opt.get("strike_interval") or 0.0,
                 }
                 oi_resistance_like = {"ce_strike": opt.get("ce_strike"), "pe_strike": opt.get("pe_strike"),
                                        "expiry": opt.get("expiry")}
