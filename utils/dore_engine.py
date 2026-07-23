@@ -1515,6 +1515,26 @@ def stage5_opportunity_engine(
 #  STAGE 5b — STRIKE & EXPIRY SELECTION
 # ══════════════════════════════════════════════════════════════════
 
+# Strike interval by symbol — NOT uniform across indices. cfg.strike_step
+# (DORESettings, default 50.0) is a single global value that's correct for
+# NIFTY but wrong for BANKNIFTY/SENSEX (100-point strikes), which is
+# exactly the bug this map fixes: stage5b was walking BANKNIFTY strikes in
+# 50-point increments, producing suggested strikes like 57,250 that don't
+# exist on the exchange (BANKNIFTY only lists multiples of 100).
+# Current standard NSE/BSE strike intervals as of this writing — these are
+# exchange-set and do change periodically (like lot sizes, see
+# utils/position_sizing.py's docstring on that same caution), so verify
+# against the current F&O contract spec if strikes still look wrong after
+# this fix. Falls back to cfg.strike_step for any symbol not listed here
+# (individual stocks, whose strike intervals vary per stock and aren't
+# captured by a single map like this one).
+STRIKE_STEP_BY_SYMBOL: dict[str, float] = {
+    "NIFTY":     50.0,
+    "BANKNIFTY": 100.0,
+    "SENSEX":    100.0,
+}
+
+
 def stage5b_strike_and_expiry(
     inp: DOREInput,
     cfg: DORESettings,
@@ -1534,7 +1554,7 @@ def stage5b_strike_and_expiry(
          resistance for a CE trade, the PE wall = support for a PE trade
          — Stage 3's own `highest_ce_oi_strike` / `highest_pe_oi_strike`
          reads, reused here rather than re-fetched), the optimizer walks
-         the strike further ITM, one `cfg.strike_step` at a time, up to
+         the strike further ITM, one strike-interval step at a time, up to
          `cfg.strike_max_itm_steps`. This is the actual "trade construction"
          piece RFC-001 places at the end of the pipeline: it is informed
          by the same OI walls Stage 3's corridor score reads, but decides
@@ -1569,7 +1589,7 @@ def stage5b_strike_and_expiry(
         itm_steps = 0
         reasons.append("Option Delta not supplied — defaulting to ATM")
 
-    step = cfg.strike_step if cfg.strike_step > 0 else 1.0
+    step = STRIKE_STEP_BY_SYMBOL.get(inp.symbol, cfg.strike_step if cfg.strike_step > 0 else 1.0)
     sign = -1.0 if direction == "CE" else 1.0  # CE moves ITM at LOWER strikes, PE at HIGHER strikes
 
     def _strike_after(n: int) -> float:
