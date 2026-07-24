@@ -845,26 +845,32 @@ V3_THRESHOLD_DEFAULTS = {
     "v3_watch_conviction_min":      50,
     "v3_watch_entry_quality_min":   50,
     "v3_watch_composite_min":       50,
-    "v3_developing_composite_min":  55,   # TODO: not yet backtest-fit — midpoint placeholder
-    "v3_actionable_leadership_min": 60,
-    "v3_actionable_conviction_min": 70,
-    # Added: Actionable previously had no Entry Quality floor, so a stock
-    # with high Leadership+Conviction could carry a composite >=60 with
-    # EQ=0 (e.g. L=90/C=90/EQ=0 -> composite=60). 36 is not arbitrary:
-    # _entry_quality() hard-caps EQ at 35 whenever trend_phase=="EXTENDED",
-    # so this floor makes any EXTENDED-phase stock structurally ineligible
-    # for Actionable regardless of how strong its other two pillars look.
-    # NOT YET backtest-validated — same caveat as v3_developing_composite_min.
-    "v3_actionable_entry_quality_min": 36,
-    "v3_actionable_composite_min":  60,
-    "v3_execute_leadership_min":    60,
-    "v3_execute_conviction_min":    70,
-    "v3_execute_entry_quality_min": 50,
-    "v3_execute_composite_min":     60,
-    "v3_elite_leadership_min":      70,
-    "v3_elite_conviction_min":      70,
-    "v3_elite_entry_quality_min":   60,
-    "v3_elite_composite_min":       66,  # raw (70+70+60)/3 = 66.67; 67 only holds post-rounding
+    # Developing — previously composite-only (no per-factor floor at all).
+    # 2026-07 revision gives it its own Leadership/Conviction/Entry Quality
+    # floors, AND-gated the same way as Actionable/Execute/Elite below —
+    # see classify_tier_v3()'s Developing branch. Values set via the
+    # Settings UI tier-floor table; not yet backtest-validated.
+    "v3_developing_leadership_min":    70,
+    "v3_developing_conviction_min":    55,
+    "v3_developing_entry_quality_min": 80,
+    "v3_developing_composite_min":     55,   # TODO: not yet backtest-fit — midpoint placeholder
+    "v3_actionable_leadership_min":    70,
+    "v3_actionable_conviction_min":    60,
+    # 2026-07 revision (was 36) — raised via the Settings UI tier-floor
+    # table. NOT YET backtest-validated at this level; the original 36
+    # rationale (_entry_quality() hard-caps EQ at 35 during "EXTENDED"
+    # trend phase, so >35 already excludes EXTENDED-phase stocks) still
+    # holds, this just tightens the bar well past that floor.
+    "v3_actionable_entry_quality_min": 80,
+    "v3_actionable_composite_min":     60,
+    "v3_execute_leadership_min":       80,
+    "v3_execute_conviction_min":       70,
+    "v3_execute_entry_quality_min":    80,
+    "v3_execute_composite_min":        60,
+    "v3_elite_leadership_min":         85,
+    "v3_elite_conviction_min":         75,
+    "v3_elite_entry_quality_min":      85,
+    "v3_elite_composite_min":          66,  # raw (70+70+60)/3 = 66.67; 67 only holds post-rounding
 }
 
 
@@ -896,7 +902,15 @@ def classify_tier_v3(leadership: int, conviction: int, entry_quality: int,
             and entry_quality >= t["v3_actionable_entry_quality_min"]
             and composite  >= t["v3_actionable_composite_min"]):
         return "Actionable"
-    if composite >= t["v3_developing_composite_min"]:
+    # 2026-07: Developing now requires its own Leadership/Conviction/Entry
+    # Quality floors on top of the composite bar, same AND-gate pattern as
+    # Actionable above — previously this branch was composite-only, so a
+    # stock could reach Developing on a single strong pillar dragging the
+    # average up. BEHAVIOR CHANGE vs prior releases.
+    if (leadership >= t["v3_developing_leadership_min"]
+            and conviction >= t["v3_developing_conviction_min"]
+            and entry_quality >= t["v3_developing_entry_quality_min"]
+            and composite >= t["v3_developing_composite_min"]):
         return "Developing"
     # Watch — strict AND per decile backtest: all three pillars must
     # independently clear their floor (composite alone can't compensate).
