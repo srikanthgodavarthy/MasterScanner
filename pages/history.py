@@ -29,14 +29,7 @@ import pandas as pd
 import numpy as np
 from datetime import date, datetime, timedelta
 
-try:
-    from zoneinfo import ZoneInfo
-    _IST = ZoneInfo("Asia/Kolkata")
-    def _now_ist(): return datetime.now(_IST)
-except ImportError:
-    import pytz
-    _IST = pytz.timezone("Asia/Kolkata")
-    def _now_ist(): return datetime.now(_IST)
+from utils.time_utils import now_ist as _now_ist, IST as _IST
 
 from utils.lifecycle_engine import (
     STAGE_META, _STAGE_ORDER, _ORDERED_STAGES,
