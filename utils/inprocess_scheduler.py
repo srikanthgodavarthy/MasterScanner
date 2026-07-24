@@ -9,14 +9,21 @@ every hosting setup has (e.g. Streamlit Community Cloud only runs
 `streamlit run app.py` — there's nowhere else to `python -m
 scheduler.scan_worker`).
 
-This module is the fallback: the exact same interval loops
-(market_intelligence / fo_scan via JOBS, plus the live_scanner
-sub-scheduler — all from scheduler.scan_worker), started as background
+This module is the fallback: the market_intelligence / fo_scan interval
+loops (via JOBS, from scheduler.scan_worker), started as background
 daemon threads inside the Streamlit app's own process. st.cache_resource
 guarantees start_background_scans() actually runs its body only ONCE
 per process no matter how many browser sessions/tabs call it — a
 Streamlit process (one per deployed app, NOT one per session/tab) is
 exactly the right lifetime for "start these loops once, forever".
+
+live_scanner is deliberately NOT among these background threads
+(2026-07-24) — it's the heaviest job (full Nifty-500 universe,
+threaded network fetches) and was the leading suspect behind this app's
+OOM-pattern crashes when run continuously, unattended, in the same
+process as the UI. It now runs only on-demand via pages/scanner.py's
+"Run Scan" button. See start_background_scans()'s body for the full
+rationale.
 
 Call this AFTER the Dashboard has done its own first synchronous read
 of Supabase and rendered — see pages/dashboard.py's render(), which
@@ -61,19 +68,22 @@ logger = logging.getLogger(__name__)
 @st.cache_resource(show_spinner=False)
 def start_background_scans() -> bool:
     """
-    Starts the market_intelligence / fo_scan loops (every 30s / 60s) and
-    the live_scanner sub-scheduler (batched, ~5 min per full-universe
-    cycle) as daemon threads. @st.cache_resource means this function's
-    body runs at most once per process — every subsequent call (from
-    any session, any rerun) just returns the cached True instantly
-    without spawning duplicate threads.
+    Starts the market_intelligence / fo_scan loops (every 30s / 60s) as
+    daemon threads. @st.cache_resource means this function's body runs
+    at most once per process — every subsequent call (from any session,
+    any rerun) just returns the cached True instantly without spawning
+    duplicate threads.
+
+    live_scanner is NOT started here — see the comment below and the
+    module docstring for why. It runs on-demand only, via pages/
+    scanner.py's "Run Scan" button.
 
     Returns True once threads are launched. (The return value itself
     isn't meaningful beyond "don't call this twice" — cache_resource is
     what actually enforces that.)
     """
     import threading
-    from scheduler.scan_worker import JOBS, _run_loop, _run_live_scanner_loop
+    from scheduler.scan_worker import JOBS, _run_loop
 
     for name, section, interval, compute_fn, to_payload in JOBS:
         t = threading.Thread(
@@ -83,10 +93,22 @@ def start_background_scans() -> bool:
         t.start()
         logger.info("In-process scheduler: started %s thread (every %ss)", name, interval)
 
-    t_live = threading.Thread(
-        target=_run_live_scanner_loop, name="scan-live_scanner", daemon=True,
-    )
-    t_live.start()
-    logger.info("In-process scheduler: started live_scanner sub-scheduler thread (batched, ~5 min/cycle)")
+    # live_scanner intentionally NOT started here (2026-07-24). Its
+    # batched sub-scheduler (_run_live_scanner_loop, scheduler/scan_worker.py)
+    # called update_live_cache() -> _flush_executor.submit() once per
+    # batch (~10x/cycle) with no bound on how far a slow Supabase Storage
+    # write could let that queue grow, on top of being the heaviest single
+    # consumer of CPU/network/memory in a process shared with the UI —
+    # together the leading suspects for the OOM-pattern crashes
+    # (healthz "connection reset by peer") this app was hitting.
+    #
+    # live_scanner now runs ONLY on-demand via pages/scanner.py's "Run
+    # Scan" button, which calls run_scanner() ONCE for the whole universe
+    # (not batched) -> at most one flush task per click, and only while a
+    # person is actively present to notice if it hangs, rather than
+    # unattended for hours. See scheduler/scan_worker.py's
+    # _run_live_scanner_loop docstring — that code is left intact and
+    # still used by `python -m scheduler.scan_worker`'s standalone
+    # main(), for if/when this moves to a fully separate Phase 3 process.
 
     return True
