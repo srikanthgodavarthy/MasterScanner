@@ -17,7 +17,7 @@ import logging
 import time
 import random
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -2059,15 +2059,55 @@ def run_scanner(
             row["Stock"] = sym
         return row
 
-    with ThreadPoolExecutor(max_workers=max_workers) as exe:
+    # 2026-07-24: bounded wait, not unbounded as_completed(). score_stock()
+    # itself makes no network calls (pure pandas/numpy on data already
+    # fetched into all_data above), so a hang here would have to come from
+    # something pathological in the scoring path itself (e.g. malformed/
+    # degenerate OHLCV for one symbol) rather than the yfinance/curl_cffi
+    # timeout issue documented on yf_download_with_retry() above — that
+    # risk lives earlier, in the get_live_history_cached() fetch loop, and
+    # isn't addressed by this change. This is defense-in-depth for THIS
+    # executor specifically: previously a single stuck future would block
+    # every other future's result from ever being collected, since
+    # as_completed()/fut.result() have no timeout — one bad symbol could
+    # silently stall the whole scan (and, via _run_live_scanner_loop,
+    # every future batch) forever. Now a stuck symbol just gets skipped
+    # for this run (logged, not silently dropped) while every other
+    # symbol's already-finished result still gets collected and returned.
+    _SCORE_WAIT_TIMEOUT_S = 45
+    exe = ThreadPoolExecutor(max_workers=max_workers)
+    try:
         futures = {exe.submit(process, s): s for s in symbols}
-        for fut in as_completed(futures):
+        finished, pending = wait(futures, timeout=_SCORE_WAIT_TIMEOUT_S)
+        for fut in finished:
             done += 1
             if progress_cb:
                 progress_cb(0.5 + 0.5 * done / total)
-            row = fut.result()
+            try:
+                row = fut.result()
+            except Exception:
+                _log.exception("scanner_engine: score_stock failed for %s", futures[fut])
+                row = None
             if row:
                 results.append(row)
+        if pending:
+            stuck = [futures[f] for f in pending]
+            _log.warning(
+                "scanner_engine: %d symbol(s) still scoring after %ss — skipping "
+                "for this run (last-good values elsewhere are unaffected): %s",
+                len(pending), _SCORE_WAIT_TIMEOUT_S, stuck,
+            )
+    finally:
+        # wait=False: don't let a stuck thread hold up returning from
+        # run_scanner() the way the old `with ThreadPoolExecutor(...) as exe`
+        # block would have (its __exit__ calls shutdown(wait=True) by
+        # default, which would silently re-introduce the same unbounded
+        # block the wait(timeout=...) above was meant to avoid). Any
+        # genuinely stuck worker thread keeps running in the background
+        # until it finishes on its own (Python can't force-kill a running
+        # thread) — harmless here since it only ever tries to append to a
+        # local `results` list that's already been returned by then.
+        exe.shutdown(wait=False)
 
     if not results:
         return pd.DataFrame()
