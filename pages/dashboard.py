@@ -2384,16 +2384,14 @@ def _render_sector_rotation_analysis(df_aug: pd.DataFrame, sector_stats: pd.Data
     cards = []
     for i, r in top3.iterrows():
         icon = _SRX_SECTOR_ICON.get(r["Sector"], "🏷️")
-        cards.append(f"""
-        <div class="srx-focus-card">
+        cards.append(f"""<div class="srx-focus-card">
           <span class="srx-focus-rank" style="background:{rank_colors[i]};">{i+1}</span> {icon}
           <div class="srx-focus-name">{r['Sector']}</div>
           <div class="srx-focus-lbl">Rotation Strength (Composite)</div>
           <div class="srx-focus-score" style="color:{rank_colors[i]};">{r['RotationStrength']:.0f}<span style="font-size:0.8rem;color:#64748b;">/100</span></div>
           <div class="srx-focus-lbl">Suggested Action</div>
           {_srx_action_badge(r['SuggestedAction'])}
-        </div>
-        """)
+        </div>""")
     st.markdown(f"""
     <div class="srx-panel-title" style="margin-top:1.1rem;">TOP SECTORS TO FOCUS TODAY</div>
     <div class="srx-focus-grid">{''.join(cards)}</div>

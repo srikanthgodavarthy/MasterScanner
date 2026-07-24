@@ -858,8 +858,7 @@ def _render_kpi_strip(rows: list[dict]):
 def _panel_row_html(r: dict, extra_line: str | None = None) -> str:
     pct = r["result"].unrealized_pct
     color = "#00ff88" if pct >= 0 else "#ff4d6d"
-    return f"""
-    <div class="pcc-panel-row">
+    return f"""<div class="pcc-panel-row">
       <div class="pcc-panel-row-top">
         <span class="pcc-panel-sym">{r['symbol']}</span>
         <span class="pcc-panel-ltp">₹{r['price']:.2f}</span>
@@ -868,8 +867,7 @@ def _panel_row_html(r: dict, extra_line: str | None = None) -> str:
         <span class="pcc-panel-pct" style="color:{color};">{pct:+.2f}%</span>
         <span class="pcc-panel-reason">{extra_line or _reason_for_row(r)}</span>
       </div>
-    </div>
-    """
+    </div>"""
 
 
 def _render_action_panels(rows: list[dict]):
@@ -883,22 +881,18 @@ def _render_action_panels(rows: list[dict]):
             body = '<div class="pcc-panel-empty">Nothing flagged</div>'
         else:
             body = "".join(_panel_row_html(r, reason_fn(r) if reason_fn else None) for r in items)
-        return f"""
-        <div class="pcc-panel">
+        return f"""<div class="pcc-panel">
           <div class="pcc-panel-head" style="color:{color};">{icon} {title} ({len(items)})</div>
           {body}
-        </div>
-        """
+        </div>"""
 
     rotate_reason = lambda r: f"→ {r.get('rotate_target', '—')}"
-    html = f"""
-    <div class="pcc-panel-grid">
+    html = f"""<div class="pcc-panel-grid">
       {_panel("EXIT IMMEDIATELY", "❌", "#ff4d6d", exits)}
       {_panel("ROTATE", "🔄", "#a78bfa", rotates, rotate_reason)}
       {_panel("REDUCE", "🟡", "#f59e0b", reduces)}
       {_panel("ADD / ACCUMULATE", "➕", "#00ff88", adds)}
-    </div>
-    """
+    </div>"""
     _md(html)
 
 
@@ -919,8 +913,7 @@ def _render_holdings_table(rows: list[dict]):
         today_color = "#00ff88" if r["today_pct"] >= 0 else "#ff4d6d"
         rr_txt = f"{r['rr']:.2f}" if r["rr"] is not None else "—"
         dot = _rr_dot_color(r["display_action"])
-        trs.append(f"""
-        <tr>
+        trs.append(f"""<tr>
           <td style="color:#64748b;">{i}</td>
           <td><span class="pcc-sym">{r['symbol']}</span></td>
           <td>{r['price']:.2f}</td>
@@ -933,8 +926,7 @@ def _render_holdings_table(rows: list[dict]):
           <td class="pcc-next-action">{_next_action_text(r)}</td>
           <td>{r['result'].days_held}</td>
           <td>{rr_txt}<span class="pcc-rr-dot" style="background:{dot};"></span></td>
-        </tr>
-        """)
+        </tr>""")
 
     html = f"""
     <div class="pcc-section-label">CURRENT PORTFOLIO HOLDINGS</div>
