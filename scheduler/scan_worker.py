@@ -33,6 +33,19 @@ Each job is independent: a slow/failing F&O scan never delays or blocks
 the Market Intelligence job, and vice versa (separate threads, separate
 try/except, separate snapshot table).
 
+System state / backtest coordination (2026-07-23)
+---------------------------------------------------
+Every loop below checks utils.system_state.should_scheduler_run() at
+its cycle boundary before starting a new cycle. When a backtest is
+running (utils.system_state.backtest_pause(), used by pages/backtest.py)
+this returns False and the loop skips that tick instead of computing —
+a cooperative, cycle-boundary pause, not a mid-batch preemption; nothing
+here can forcibly stop a thread mid-computation. _run_live_scanner_loop
+additionally rechecks between batches so a backtest starting mid-cycle
+doesn't have to wait out the rest of a 5-minute cycle before backing
+off. See utils/system_state.py for the full design and why it replaces
+having each loop track its own pause flag.
+
 Live Scanner: why a sub-scheduler (2026-07-23)
 -----------------------------------------------
 The Nifty-500 universe scan legitimately took longer than its old 120s
@@ -92,10 +105,17 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
                           goes in the snapshot's `payload` column
     """
     from utils.scan_state import save_snapshot
+    from utils.system_state import should_scheduler_run
 
     logger.info("[%s] loop starting, every %ss", name, interval_secs)
     while True:
         started = time.time()
+
+        if not should_scheduler_run():
+            logger.debug("[%s] system_state is paused (backtest/maintenance) — skipping this tick", name)
+            time.sleep(5)
+            continue
+
         try:
             raw = compute_fn()
             payload, row_count = to_payload(raw)
@@ -169,11 +189,12 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
     a sub-scheduler") for the full rationale. Runs forever, one 5-minute
     cycle at a time; never raises out of the loop.
     """
-    from utils.scan_state import save_snapshot
+    from utils.scan_state import save_snapshot, load_snapshot_payload
     from utils.live_scanner_job import compute_live_scan_batch, build_regime_context_for_cycle
     from utils.regime_engine import apply_regime_layer
     from utils.scanner_engine import NIFTY500_SYMBOLS
     from utils.supabase_client import save_scan_snapshot, save_full_scan_snapshot
+    from utils.system_state import should_scheduler_run, manual_override_active, clear_manual_override
 
     symbols = list(NIFTY500_SYMBOLS)
     batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)] or [[]]
@@ -185,6 +206,11 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
     merged: dict = {}   # symbol -> latest scored row dict, carried across cycles
 
     while True:
+        if not should_scheduler_run():
+            logger.debug("[live_scanner] system_state is paused (backtest/maintenance) — skipping this cycle")
+            time.sleep(5)
+            continue
+
         cycle_started = time.time()
 
         try:
@@ -199,6 +225,12 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
         per_batch_budget = max(2.0, (interval_secs * 0.9) / n_batches)
 
         for batch_i, chunk in enumerate(batches):
+            if not should_scheduler_run():
+                logger.info("[live_scanner] system_state paused mid-cycle (batch %d/%d) — "
+                            "backing off rather than waiting out the rest of this cycle",
+                            batch_i + 1, n_batches)
+                break
+
             batch_started = time.time()
             if chunk:
                 try:
@@ -216,6 +248,25 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                     logger.exception(
                         "[live_scanner] batch %d/%d failed — those %d symbol(s) keep their last-good "
                         "values and will be retried next cycle", batch_i + 1, n_batches, len(chunk))
+
+            # If a manual "Run Scan" (pages/scanner.py) wrote a fresh
+            # full-universe snapshot since our last batch, our in-memory
+            # `merged` cache is stale for whatever we haven't re-batched
+            # yet this cycle — reseed from the manual snapshot first so
+            # this progressive save doesn't clobber it with old values.
+            # See utils/system_state.py.
+            if manual_override_active("live_scanner"):
+                try:
+                    latest = load_snapshot_payload("live_scanner")
+                    manual_records = (latest or {}).get("payload", {}).get("data", []) or []
+                    for rec in manual_records:
+                        key = _row_key(rec)
+                        if key:
+                            merged[key] = rec
+                    clear_manual_override("live_scanner")
+                    logger.info("[live_scanner] reseeded %d symbol(s) from a manual scan snapshot", len(manual_records))
+                except Exception:
+                    logger.exception("[live_scanner] failed to reseed from manual override snapshot (non-fatal)")
 
             # Progressive snapshot after every batch — the Dashboard
             # doesn't have to wait for the whole 5-minute cycle to see
