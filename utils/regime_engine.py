@@ -661,6 +661,23 @@ def apply_regime_layer(
     aug = pd.DataFrame(records, index=df_scan.index)
     out = pd.concat([df_scan, aug], axis=1)
 
+    # 2026-07-24: _bar_result (raw scoring_core.BarResult dataclass,
+    # written by scanner_engine.score_stock() purely so the typed
+    # extraction above could skip re-deriving fields from a flat dict)
+    # was riding through untouched all the way into every downstream
+    # snapshot save — pages/scanner.py's manual "Run Scan" and
+    # scheduler/scan_worker.py's live_scanner loop both eventually call
+    # .to_dict("records") on this DataFrame, which (unlike .to_json())
+    # doesn't serialize anything, just hands back the raw object — and
+    # that raw BarResult then blew up json.dumps() deep inside the
+    # Supabase insert with "Object of type BarResult is not JSON
+    # serializable". Nothing downstream of this function ever reads
+    # _bar_result — this was the last point anything did — so drop it
+    # here rather than relying on a save-path sanitizer to coerce (and
+    # bloat every one of ~500 symbols' snapshot rows with) a 50+ field
+    # dataclass nobody needs persisted.
+    out = out.drop(columns=["_bar_result"], errors="ignore")
+
     out = out.sort_values(
         ["execute_flag", "composite_score"],
         ascending=[False, False],
