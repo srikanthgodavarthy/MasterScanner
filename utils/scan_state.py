@@ -17,7 +17,7 @@ own wall-clock cadence, completely outside of any Streamlit session, and
 write versioned snapshots here:
 
     market_intelligence   — every 30s
-    live_scanner          — every 2 min
+    live_scanner          — every 5 min (worked through in batches)
     fo_scan               — every 60s
 
 Each snapshot row carries `scan_id`, `created_at`, `status`, and
