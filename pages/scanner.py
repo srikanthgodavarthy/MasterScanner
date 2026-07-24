@@ -3115,12 +3115,20 @@ def render(settings: dict | None = None):
             # Event-aware snapshot (2026-07-23) — same data, new
             # scan_id/version/status table so a manual Run Scan is picked
             # up by the Dashboard's 30s metadata poll immediately instead
-            # of waiting for scheduler/scan_worker.py's next 2-min cycle.
+            # of waiting for scheduler/scan_worker.py's next 5-min cycle.
             try:
                 from utils.scan_state import save_snapshot
+                from utils.system_state import set_manual_override
                 _safe = df_aug.astype(object).where(df_aug.notnull(), None)
                 save_snapshot("live_scanner", payload={"data": _safe.to_dict("records")},
                               row_count=len(df_aug), status="completed")
+                # Tell the live_scanner sub-scheduler this snapshot is
+                # fresher than its own in-memory cache, so its next
+                # progressive batch-save reseeds from it instead of
+                # silently overwriting these rows with stale cached
+                # values for whatever it hasn't re-batched yet this
+                # cycle. See utils/system_state.py ("snapshot integrity").
+                set_manual_override("live_scanner", ttl_secs=90)
             except Exception:
                 logger.exception("live_scanner_snapshots write failed (non-fatal)")
             # ── Sprint 2 / 3: persist lifecycle snapshot + transitions ──

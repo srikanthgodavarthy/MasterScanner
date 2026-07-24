@@ -22,6 +22,7 @@ from utils.scanner_engine import NIFTY500_SYMBOLS
 from pages.scanner import _now_ist
 from utils.backtest_engine import run_backtest, compute_stats, fetch_all_bt_data
 from utils.supabase_client import save_backtest_results, load_backtest_summary
+from utils.system_state import backtest_pause
 
 # All recognised buy types produced by compute_bar
 ALL_BUY_TYPES = ["Norm", "Fib", "Fib+CCI", "Harm", "ABCD", "CCI", "CmpBrk"]
@@ -390,24 +391,35 @@ def render(settings=None):
                 save_backtest_results(delta_trades, run_ts=_bt_run_ts)
 
         try:
-            trades_df, rejections_df = run_backtest(
-                bt_universe,
-                settings         = bt_settings,
-                cci_len          = int(bt_cci_len),
-                cci_ob           = int(bt_cci_ob),
-                cci_os           = int(bt_cci_os),
-                min_score        = bt_min_score,
-                hold_days        = bt_hold_days,
-                workers          = settings.get("workers", 10) if settings else 10,
-                tier_filter      = bt_tier_filter,
-                buy_type_filter  = buy_type_filter,
-                rs_positive_only = bt_rs_positive_only,
-                progress_cb      = _bt_progress,
-                mode             = _bt_mode,
-                checkpoint_cb    = _bt_checkpoint,
-                checkpoint_every = 25,
-                source           = settings.get("data_source", "yfinance") if settings else "yfinance",
-            )
+            # Pauses the background scheduler (market_intelligence/fo_scan/
+            # live_scanner) for the duration of this run — see
+            # utils/system_state.py. It's a cooperative, cycle-boundary
+            # pause: the loops check between cycles/batches, so this
+            # doesn't stop anything already mid-batch, but it stops new
+            # scan cycles from starting and competing for the GIL with
+            # this ThreadPoolExecutor-based run. Ref-counted (a second
+            # concurrent backtest in another tab/user is handled
+            # correctly), and a heartbeat keeps the pause from wedging
+            # forever if this run crashes before the finally below runs.
+            with backtest_pause():
+                trades_df, rejections_df = run_backtest(
+                    bt_universe,
+                    settings         = bt_settings,
+                    cci_len          = int(bt_cci_len),
+                    cci_ob           = int(bt_cci_ob),
+                    cci_os           = int(bt_cci_os),
+                    min_score        = bt_min_score,
+                    hold_days        = bt_hold_days,
+                    workers          = settings.get("workers", 10) if settings else 10,
+                    tier_filter      = bt_tier_filter,
+                    buy_type_filter  = buy_type_filter,
+                    rs_positive_only = bt_rs_positive_only,
+                    progress_cb      = _bt_progress,
+                    mode             = _bt_mode,
+                    checkpoint_cb    = _bt_checkpoint,
+                    checkpoint_every = 25,
+                    source           = settings.get("data_source", "yfinance") if settings else "yfinance",
+                )
         except Exception as _bt_exc:
             # Previously an exception (or host kill) here left the run
             # looking "abandoned" — nothing saved, no message. Now: whatever
@@ -1317,40 +1329,45 @@ for each combination and outputs a ranked sensitivity table.
             prog = st.progress(0)
             results = []
 
-            for k, (atr_m, lb, rxn, cfb, min_r) in enumerate(combos):
-                ic_override = {
-                    "ic_vwap_touch_atr_mult": atr_m,
-                    "ic_vwap_touch_lookback": lb,
-                    "ic_reaction_max_atr":    rxn,
-                    "ic_confluence_window":   cfb,
-                    "ic_min_reaction_score":  min_r,
-                }
-                try:
-                    _summary, _trades = run_backtest(
-                        mode="five_pillars",
-                        symbols=st.session_state.get("bt_symbols", [])[:30],
-                        hold_days=st.session_state.get("bt_hold_days", 20),
-                        extra_pillar_cfg=ic_override,
-                    )
-                    vra_r = build_vwap_reclaim_analysis(_trades)
-                    ov = vra_r.get("overall", {})
-                    results.append({
-                        "ATR Mult":       atr_m,
-                        "Lookback":       lb,
-                        "Rxn Max ATR":    rxn,
-                        "Conf Bars":      cfb,
-                        "Min RS":         min_r,
-                        "Trades":         ov.get("count", 0),
-                        "Win%":           ov.get("win_rate", 0),
-                        "PF":             ov.get("profit_factor", 0),
-                        "Expectancy":     ov.get("expectancy", 0),
-                        "Timeout%":       ov.get("timeout_pct", 0),
-                    })
-                except Exception as _e:
-                    results.append({"ATR Mult": atr_m, "Lookback": lb,
-                                    "Rxn Max ATR": rxn, "Conf Bars": cfb,
-                                    "Min RS": min_r, "Error": str(_e)})
-                prog.progress((k + 1) / len(combos))
+            # One lock held for the whole sweep, not one per combo — an
+            # acquire/release per combo would flip system_state back to
+            # LIVE between combos and let the scheduler start a cycle
+            # mid-sweep. See utils/system_state.py.
+            with backtest_pause():
+                for k, (atr_m, lb, rxn, cfb, min_r) in enumerate(combos):
+                    ic_override = {
+                        "ic_vwap_touch_atr_mult": atr_m,
+                        "ic_vwap_touch_lookback": lb,
+                        "ic_reaction_max_atr":    rxn,
+                        "ic_confluence_window":   cfb,
+                        "ic_min_reaction_score":  min_r,
+                    }
+                    try:
+                        _summary, _trades = run_backtest(
+                            mode="five_pillars",
+                            symbols=st.session_state.get("bt_symbols", [])[:30],
+                            hold_days=st.session_state.get("bt_hold_days", 20),
+                            extra_pillar_cfg=ic_override,
+                        )
+                        vra_r = build_vwap_reclaim_analysis(_trades)
+                        ov = vra_r.get("overall", {})
+                        results.append({
+                            "ATR Mult":       atr_m,
+                            "Lookback":       lb,
+                            "Rxn Max ATR":    rxn,
+                            "Conf Bars":      cfb,
+                            "Min RS":         min_r,
+                            "Trades":         ov.get("count", 0),
+                            "Win%":           ov.get("win_rate", 0),
+                            "PF":             ov.get("profit_factor", 0),
+                            "Expectancy":     ov.get("expectancy", 0),
+                            "Timeout%":       ov.get("timeout_pct", 0),
+                        })
+                    except Exception as _e:
+                        results.append({"ATR Mult": atr_m, "Lookback": lb,
+                                        "Rxn Max ATR": rxn, "Conf Bars": cfb,
+                                        "Min RS": min_r, "Error": str(_e)})
+                    prog.progress((k + 1) / len(combos))
 
             if results:
                 df_opt = _pd.DataFrame(results).sort_values("PF", ascending=False)

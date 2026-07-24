@@ -3114,7 +3114,8 @@ def _news_impact_panel():
 # ── Auto-refresh: latest completed scan from Supabase ────────────────────
 # 2026-07-23: rewritten to be event-aware. scheduler/scan_worker.py (or a
 # manual Run Scan click, see pages/scanner.py) writes live_scanner_snapshots
-# with a scan_id/version/status/created_at + payload row every ~2 minutes.
+# with a scan_id/version/status/created_at + payload row roughly every 5
+# minutes (progressively, per-batch — see scan_worker.py's module docstring).
 # This fragment polls ONLY the lightweight metadata columns every 30s
 # (load_snapshot_meta never touches `payload`) and fetches the full
 # DataFrame only when `version` actually differs from what's already
@@ -3152,6 +3153,22 @@ def _dash_scan_autorefresh():
 def render(settings: dict | None = None):
     st.markdown(_CSS, unsafe_allow_html=True)
     settings = settings or {}
+
+    # ── System state banner — scheduler paused for backtest/maintenance ──
+    # Single source of truth (utils/system_state.py) read once per render;
+    # cheap (one row, id=1) and fails open to LIVE if Supabase is briefly
+    # unreachable, so this never blocks the rest of the Dashboard.
+    from utils.system_state import get_system_state
+    _sys_state = get_system_state()
+    if _sys_state["mode"] != "LIVE":
+        _reason = ("a running backtest" if _sys_state["mode"] == "BACKTEST"
+                    else "maintenance mode")
+        st.warning(
+            f"⏸️ Background scans are paused for {_reason}. Market Intelligence, "
+            f"F&O Scanner, and Live Scanner will resume automatically once it finishes. "
+            f"Data shown below is from the last completed cycle.",
+            icon="⏸️",
+        )
 
     # ── Load latest completed scan from Supabase ─────────────────────
     # First load of the session (or a manual click) is synchronous;
