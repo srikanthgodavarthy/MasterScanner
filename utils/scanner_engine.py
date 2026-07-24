@@ -1177,27 +1177,28 @@ def _primary_blocker(r, result: dict) -> str:
         ext = int(result.get("Extension", result.get("Legacy_EntryQuality", result.get("DE_EntryQuality", 0))) or 0)
         return f"Extended ({ext}) — wait for pullback to EMA/Fib"
 
-    # Pull scores — use CV1 (v4: Leadership-primary hierarchy, live since
-    # 2026-07) for Leadership; fall back to Legacy_* (diagnostic-only,
+    # Pull scores — use CV1 (v3: equal-weight 1/3/1/3/1/3 composite, live
+    # since 2026-07) for Leadership; fall back to Legacy_* (diagnostic-only,
     # no longer DE production logic) when CV1 is absent, then to the old
     # "DE_*" key name for rows/cache written before the rename.
     ls  = float(result.get("CV1_Leadership",  result.get("Legacy_Leadership",   result.get("DE_Leadership",   0))) or 0)
     cv  = float(result.get("CV1_Conviction",   result.get("Legacy_Conviction",   result.get("DE_Conviction",   0))) or 0)
     eq  = float(result.get("CV1_EntryQuality", result.get("Legacy_EntryQuality", result.get("DE_EntryQuality", 0))) or 0)
     ext = float(result.get("Extension",       0) or 0)
-    # v4 has no blended composite (CV1_Composite == CV1_Leadership by
-    # construction — see compute_conviction_v4). Every tier under v4 is a
-    # non-compensatory AND-gate across all three pillars, so there is no
-    # "composite fell short" blocker case any more — only Leadership,
-    # Conviction, and Entry Quality floors, checked independently below.
+    # v3 composite (equal-weight 1/3 each) — prefer the value CV3 already
+    # computed; recompute only as a fallback for rows/cache predating
+    # CV1_Composite.
+    composite = float(result.get("CV1_Composite", 0) or 0)
+    if not composite:
+        composite = (ls + cv + eq) / 3
 
-    from utils.conviction_score_v1 import V4_THRESHOLD_DEFAULTS as _T
-    _ls_floor = _T["v4_execute_leadership_min"]
-    _cv_floor = _T["v4_execute_conviction_min"]
-    _eq_floor = _T["v4_execute_entry_quality_min"]
+    from utils.conviction_score_v1 import V3_THRESHOLD_DEFAULTS as _T
+    _ls_floor   = _T["v3_actionable_leadership_min"]
+    _cv_floor   = _T["v3_actionable_conviction_min"]
+    _comp_floor = _T["v3_actionable_composite_min"]
 
-    # Priority 1: Leadership gate — aligned with classify_tier_v4()'s
-    # Actionable floor. v4 has been the live gate since 2026-07; this
+    # Priority 1: Leadership gate — aligned with classify_tier_v3()'s
+    # Actionable floor. v3 has been the live gate since 2026-07; this
     # blocker message must match whatever tier logic actually decided
     # the Category, or the "why not Actionable" text lies about the
     # real reason.
@@ -1211,8 +1212,8 @@ def _primary_blocker(r, result: dict) -> str:
     if ext >= 60:
         return f"Extended ({int(ext)}) — wait for pullback"
 
-    # Priority 3: Conviction gate — v4's Actionable floor (confidence
-    # modifier, independently gated — 2026-07).
+    # Priority 3: Conviction gate — v3's Actionable floor (equal-weight
+    # composite, backtest-fit 2026-07).
     if cv < _cv_floor:
         # Prefer CV1's cv_fib_zone which accounts for both pullback AND
         # continuation paths (stock above Fib 61.8% / above pivot high).
@@ -1227,11 +1228,13 @@ def _primary_blocker(r, result: dict) -> str:
             sub = f"DE score {int(cv)}"
         return f"Low Conviction ({int(cv)}) — {sub}"
 
-    # Priority 4: Entry Quality gate — v4's Actionable floor (execution
-    # timing modifier). Unlike v3, this is a direct, non-compensatory
-    # floor: a strong Leadership+Conviction can no longer buy its way
-    # past a weak entry timing via a blended composite.
-    if eq < _eq_floor:
+    # Priority 4: v3 has no standalone Entry Quality floor — EQ only
+    # enters the decision via its equal-weight (1/3) composite share. So
+    # once Leadership and Conviction clear their floors, the remaining
+    # blocker (if any) is the composite itself falling short of v3's
+    # Actionable bar, which in practice is almost always an Entry Quality
+    # drag since LS/CV already passed their own floors above.
+    if composite < _comp_floor:
         eq_ema = int(result.get("_ds_eq_ema20_dist", result.get("_cv1_eq_ema20", 0)) or 0)
         eq_piv = int(result.get("_ds_eq_pivot_dist", result.get("_cv1_eq_piv",  0)) or 0)
         if eq_ema < 10:
@@ -1240,7 +1243,10 @@ def _primary_blocker(r, result: dict) -> str:
             sub = "too far above pivot"
         else:
             sub = f"EQ score {int(eq)}"
-        return f"Entry Quality {int(eq)} (need {int(_eq_floor)}) — {sub}"
+        # composite is now unrounded (see conviction_score_v1.py) — show one
+        # decimal so this can't read as self-contradictory (e.g. "Composite
+        # 60 (need 60)" while still being the rejection reason).
+        return f"Composite {composite:.1f} (need {_comp_floor}) — Low Entry Quality ({int(eq)}) — {sub}"
 
     # Priority 5: CCI momentum not confirmed
     try:
@@ -1278,7 +1284,7 @@ def score_stock(
     if df.empty or len(df) < 210:
         return {}
 
-    from utils.scoring_core import ScoringParams, build_indicators, compute_bar, leadership_prescreen
+    from utils.scoring_core import ScoringParams, build_indicators, compute_bar
 
     if settings:
         params = ScoringParams.from_settings(settings)
@@ -1287,26 +1293,6 @@ def score_stock(
             cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
             pvt_lb=pvt_lb, atr_prox=atr_prox,
         )
-
-    # Staged elimination, stage 1: cheap Leadership-only check BEFORE the
-    # expensive full indicator build (ADX/BB/KC/CCI/pivots/fib). This is
-    # where scan-time reduction actually comes from — see
-    # leadership_prescreen()'s docstring for why gating inside CV1 itself
-    # (after build_indicators has already run) can't achieve this.
-    #
-    # prescreen_diagnostic (settings key, default False): validation mode
-    # for calibrating the prescreen before trusting it unattended. When on,
-    # a prescreen REJECT does NOT skip the full build — every symbol gets
-    # fully scored either way, and the result row is tagged with
-    # _prescreen_pass / _prescreen_mismatch so you can check, after a scan,
-    # whether the prescreen ever rejected something that would have scored
-    # Watch-or-better on full CV1. Costs the full scan time (no speedup)
-    # while diagnostic mode is on — turn it off once mismatches are ~0%
-    # across a few live scans to get the actual time saving.
-    diagnostic    = bool((settings or {}).get("prescreen_diagnostic", False))
-    prescreen_ok  = leadership_prescreen(df, nifty)
-    if not prescreen_ok and not diagnostic:
-        return {}
 
     ia = build_indicators(df, nifty, params)
     r  = compute_bar(ia, i=-1, params=params)   # -1 = latest bar
@@ -1474,24 +1460,14 @@ def score_stock(
     # including the objective Lifecycle stage, not just the Recommendation.
     cv1 = None
     try:
-        from utils.conviction_score_v1 import compute_conviction_v4
-        cv1 = compute_conviction_v4(r, settings=settings)
+        from utils.conviction_score_v1 import compute_conviction_v3
+        cv1 = compute_conviction_v3(r, settings=settings)
         result.update({
             "CV1_Leadership":    cv1.leadership,
             "CV1_Conviction":    cv1.conviction,
             "CV1_EntryQuality":  cv1.entry_quality,
             "CV1_Composite":     cv1.composite,
             "CV1_SignalClass":   cv1.signal_class,
-            # Staged-elimination diagnostic tags (see prescreen_diagnostic
-            # above). _prescreen_mismatch=True means the cheap prescreen
-            # would have rejected this symbol before full scoring, but the
-            # full CV1 score actually reached Watch-or-better — a false
-            # negative that would silently drop a real setup from the scan
-            # once diagnostic mode is turned off and the prescreen goes live
-            # as the actual filter. Check this column is ~0% across a few
-            # scans before relying on the prescreen unattended.
-            "_prescreen_pass":     prescreen_ok,
-            "_prescreen_mismatch": (not prescreen_ok) and cv1.signal_class in ("WATCH", "EXECUTE", "ELITE"),
             # Grade labels
             "CV1_LS_Grade":      cv1.leadership_grade,
             "CV1_CV_Grade":      cv1.conviction_grade,
@@ -1622,10 +1598,10 @@ def score_stock(
         if cv1 is None:
             raise RuntimeError("CV1 unavailable — cannot classify Recommendation")
 
-        from utils.conviction_score_v1 import classify_tier_v4
+        from utils.conviction_score_v1 import classify_tier_v3
         from utils.promotion_engine import evaluate_promotion
 
-        base_tier = classify_tier_v4(cv1.leadership, cv1.conviction, cv1.entry_quality, thresholds=settings)
+        base_tier = classify_tier_v3(cv1.leadership, cv1.conviction, cv1.entry_quality, thresholds=settings)
 
         # ── STRUCTURAL GATE (opt-in — default False for A/B backtesting) ──
         # Decision Engine computes hard structural failure conditions and
@@ -2063,13 +2039,7 @@ def run_scanner(
         return pd.DataFrame()
 
     df_out = pd.DataFrame(results)
-    # v4: Leadership is the primary ranking signal (not a blended
-    # composite) — sort by it first, "Score" (tier/promotion rank) as
-    # tiebreaker for stocks with equal Leadership.
-    if "CV1_Leadership" in df_out.columns:
-        df_out = df_out.sort_values(["CV1_Leadership", "Score"], ascending=[False, False]).reset_index(drop=True)
-    else:
-        df_out = df_out.sort_values("Score", ascending=False).reset_index(drop=True)
+    df_out = df_out.sort_values("Score", ascending=False).reset_index(drop=True)
     df_out.index += 1
 
     # ── RS Universe Ranking ───────────────────────────────────────
