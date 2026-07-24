@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 import plotly.graph_objects as go
 
 from utils.scanner_engine import NIFTY500_SYMBOLS
-from pages.scanner import _now_ist
+from utils.time_utils import now_ist as _now_ist
 from utils.backtest_engine import run_backtest, compute_stats, fetch_all_bt_data
 from utils.supabase_client import save_backtest_results, load_backtest_summary
 from utils.system_state import backtest_pause

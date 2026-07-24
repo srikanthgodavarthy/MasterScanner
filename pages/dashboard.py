@@ -76,14 +76,7 @@ logger = logging.getLogger(__name__)
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-try:
-    from zoneinfo import ZoneInfo
-    _IST = ZoneInfo("Asia/Kolkata")
-    def _now_ist(): return datetime.now(_IST)
-except ImportError:
-    import pytz
-    _IST = pytz.timezone("Asia/Kolkata")
-    def _now_ist(): return datetime.now(_IST)
+from utils.time_utils import now_ist as _now_ist, IST as _IST
 
 from utils.supabase_client import load_latest_full_scan
 from utils.sector_map      import build_sector_stats

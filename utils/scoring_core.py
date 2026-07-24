@@ -682,6 +682,72 @@ def _get_pivots(ia: IndicatorArrays, i: int, pvt_lb: int):
 #  COMPUTE_BAR  — THE SINGLE SOURCE OF TRUTH
 # ══════════════════════════════════════════════════════════════════
 
+def leadership_prescreen(df: pd.DataFrame, nifty: pd.Series, min_bars: int = 210) -> bool:
+    """
+    Cheap Leadership approximation, run BEFORE build_indicators().
+
+    Re-added 2026-07-24 after being pulled out along with the broken
+    compute_conviction_v4 reference (see scanner_engine.py's score_stock
+    docstring note) — this function itself never depended on v4; it's a
+    standalone RS/trend approximation with its own hardcoded threshold,
+    not a v4 threshold. Restored as-is, just re-pointed at v3's real
+    floor in the docstring/comment below.
+
+    Leadership-first staged elimination only reduces scan time if the
+    elimination happens before the expensive part of the pipeline —
+    build_indicators() computes EMA20/50/200, RSI, ATR, CCI, ADX
+    (Wilder-smoothed, not vectorisable), Bollinger/Keltner bands, pivots,
+    and fib levels for EVERY symbol regardless of whether Leadership will
+    later reject it. Gating inside CV1 (which only ever sees the output
+    of build_indicators) is too late to save that cost.
+
+    This function computes ONLY what a rough RS + trend read needs — three
+    pct_change() comparisons against Nifty and two EMAs — skipping ADX,
+    Bollinger/Keltner, CCI, and pivot/fib detection entirely. Those are the
+    costliest parts of build_indicators(), so a reject here is the actual
+    time saving.
+
+    DELIBERATELY LOOSE: this is an approximation of ls_rs_composite +
+    trend, not the real Leadership score (no ADX, no persistent_strength,
+    no EMA slope). A false negative here silently drops a symbol from the
+    scan with no diagnostic, so the bar is set well below v3's real
+    Actionable Leadership floor. Validate the false-negative rate against
+    a full (non-prescreened) run before trusting this in a live scan
+    you're relying on for the day's trades.
+
+    Returns True  -> proceed to build_indicators() / full CV1 scoring
+    Returns False -> reject now, skip the full indicator build entirely
+    """
+    if len(df) < min_bars or len(nifty) < min_bars:
+        return True   # not enough history to prescreen safely — let it through
+
+    c = df["close"]
+    n = nifty.reindex(df.index).ffill()
+
+    try:
+        rs1 = float(c.pct_change(21).iloc[-1]  - n.pct_change(21).iloc[-1])
+        rs3 = float(c.pct_change(63).iloc[-1]  - n.pct_change(63).iloc[-1])
+        rs6 = float(c.pct_change(126).iloc[-1] - n.pct_change(126).iloc[-1])
+    except (IndexError, ZeroDivisionError):
+        return True   # can't compute cleanly — don't risk a false reject
+
+    # Mirrors rs_composite's weighting (rs1*0.15 + rs3*0.50 + rs6*0.25) minus
+    # the 21-bar-vs-longer-window rs term, close enough for a coarse filter.
+    rs_composite_approx = rs1 * 0.15 + rs3 * 0.50 + rs6 * 0.25
+
+    e20 = c.ewm(span=20, adjust=False).mean().iloc[-1]
+    e50 = c.ewm(span=50, adjust=False).mean().iloc[-1]
+    trend_up = bool(e20 > e50)
+
+    # Reject only when BOTH signals are weak — either one passing is enough
+    # to proceed to full scoring. -0.02 (not 0.0) gives a buffer below the
+    # real ls_rs breakpoints so mild RS weakness with an intact trend still
+    # gets a full evaluation.
+    if rs_composite_approx <= -0.02 and not trend_up:
+        return False
+    return True
+
+
 def compute_bar(
     ia:             IndicatorArrays,
     i:              int,

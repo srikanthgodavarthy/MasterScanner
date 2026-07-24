@@ -55,21 +55,9 @@ from utils.exit_intelligence_engine import (
 )
 from utils.adaptive_target_engine import compute_adaptive_targets
 from utils.lifecycle_engine import STAGE_META
-from utils.scanner_engine import fetch_ohlcv
+from utils.market_data import fetch_ohlcv  # lightweight — no scanner/NSE-universe import cost
 
-try:
-    from zoneinfo import ZoneInfo
-    _IST = ZoneInfo("Asia/Kolkata")
-    def _now_ist():
-        return datetime.now(_IST)
-except ImportError:
-    import pytz
-    _IST = pytz.timezone("Asia/Kolkata")
-    def _now_ist():
-        return datetime.now(_IST)
-
-def _today_ist():
-    return _now_ist().date()
+from utils.time_utils import now_ist as _now_ist, today_ist as _today_ist, IST as _IST
 
 
 # ══════════════════════════════════════════════════════════════════

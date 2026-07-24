@@ -21,6 +21,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings("ignore")
 
+# fetch_ohlcv/_strip_tz now live in utils/market_data.py (2026-07-24) —
+# that module has no NSE/regime dependencies, so pages that only need
+# single-symbol OHLCV (pages/portfolio.py) can import from there directly
+# instead of pulling in this module's import-time NSE constituent fetch.
+# Re-exported here so existing `from utils.scanner_engine import
+# fetch_ohlcv` call sites keep working unchanged.
+from utils.market_data import fetch_ohlcv, _strip_tz  # noqa: F401  (re-export)
+
 _log = logging.getLogger(__name__)
 
 try:
@@ -206,16 +214,8 @@ def yf_download_with_retry(tickers, **kwargs):
 
 
 # ══════════════════════════════════════════════════════════════════
-#  TIMEZONE HELPER
+#  TIMEZONE HELPER — now utils/market_data._strip_tz, imported above
 # ══════════════════════════════════════════════════════════════════
-
-def _strip_tz(index: pd.Index) -> pd.Index:
-    idx = pd.to_datetime(index)
-    if hasattr(idx, "tz") and idx.tz is not None:
-        idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
-    if hasattr(idx, "as_unit"):
-        idx = idx.as_unit("ns")
-    return idx
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -467,16 +467,27 @@ def fetch_nifty500_constituents() -> list[str]:
     -------
     list[str] — NSE trading symbols (no ".NS" suffix), e.g. "RELIANCE".
     """
+    # 2026-07-24: this runs at import time via `NIFTY500_SYMBOLS =
+    # fetch_nifty500_constituents()` below — on a cold cache (first
+    # import in a fresh process) it's two live NSE round-trips before
+    # a single page can render. Timed explicitly (not just "probably
+    # slow") so app.log shows the real number on the next cold start
+    # instead of us guessing whether it's worth lazy-loading.
+    _t0 = time.time()
     try:
         session = requests.Session()
         session.headers.update(_NSE_HEADERS)
 
         # Prime cookies — NSE's CSV endpoint 403s without a prior hit to
         # the site root in the same session.
+        _t_home0 = time.time()
         session.get(_NSE_HOME_URL, timeout=10)
+        _log.info("fetch_nifty500_constituents: home-page cookie priming took %.2fs", time.time() - _t_home0)
 
+        _t_csv0 = time.time()
         resp = session.get(_NSE_CSV_URL, timeout=10)
         resp.raise_for_status()
+        _log.info("fetch_nifty500_constituents: CSV fetch took %.2fs", time.time() - _t_csv0)
 
         df = pd.read_csv(io.StringIO(resp.text))
 
@@ -503,10 +514,12 @@ def fetch_nifty500_constituents() -> list[str]:
         if len(symbols) < 450:
             raise ValueError(f"NSE CSV returned only {len(symbols)} symbols, expected ~500")
 
+        _log.info("fetch_nifty500_constituents: succeeded, %d symbols, %.2fs total", len(symbols), time.time() - _t0)
         return symbols
 
     except Exception as e:
         logging.warning(f"fetch_nifty500_constituents: NSE fetch failed ({e}); using hardcoded fallback")
+        _log.info("fetch_nifty500_constituents: fell back to hardcoded list, %.2fs total", time.time() - _t0)
         return list(_NIFTY500_FALLBACK)
 
 
@@ -521,17 +534,7 @@ NIFTY500_SYMBOLS = fetch_nifty500_constituents()
 #  DATA FETCHING
 # ══════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
-    try:
-        df = yf.Ticker(f"{symbol}.NS").history(period=period, interval=interval, auto_adjust=True)
-        if df.empty or len(df) < 60:
-            return pd.DataFrame()
-        df.index   = _strip_tz(pd.to_datetime(df.index))
-        df.columns = [c.lower() for c in df.columns]
-        return df[["open", "high", "low", "close", "volume"]]
-    except Exception:
-        return pd.DataFrame()
+# fetch_ohlcv now lives in utils/market_data.py, imported above.
 
 @st.cache_data(ttl=30, show_spinner=False)   # 30s TTL — live price patch
 def _fetch_live_prices(symbols: tuple) -> dict:
@@ -1284,7 +1287,7 @@ def score_stock(
     if df.empty or len(df) < 210:
         return {}
 
-    from utils.scoring_core import ScoringParams, build_indicators, compute_bar
+    from utils.scoring_core import ScoringParams, build_indicators, compute_bar, leadership_prescreen
 
     if settings:
         params = ScoringParams.from_settings(settings)
@@ -1293,6 +1296,27 @@ def score_stock(
             cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
             pvt_lb=pvt_lb, atr_prox=atr_prox,
         )
+
+    # Staged elimination, stage 1: cheap Leadership-only check BEFORE the
+    # expensive full indicator build (ADX/BB/KC/CCI/pivots/fib). Re-added
+    # 2026-07-24 alongside leadership_prescreen() itself — see that
+    # function's docstring in utils/scoring_core.py. This gate is
+    # independent of the CV1 version in use (v3, currently) — it runs
+    # before CV1 is ever computed.
+    #
+    # prescreen_diagnostic (settings key, default False): validation mode
+    # for calibrating the prescreen before trusting it unattended. When on,
+    # a prescreen REJECT does NOT skip the full build — every symbol gets
+    # fully scored either way, and the result row is tagged with
+    # _prescreen_pass / _prescreen_mismatch so you can check, after a scan,
+    # whether the prescreen ever rejected something that would have scored
+    # Watch-or-better on full CV1. Costs the full scan time (no speedup)
+    # while diagnostic mode is on — turn it off once mismatches are ~0%
+    # across a few live scans to get the actual time saving.
+    diagnostic    = bool((settings or {}).get("prescreen_diagnostic", False))
+    prescreen_ok  = leadership_prescreen(df, nifty)
+    if not prescreen_ok and not diagnostic:
+        return {}
 
     ia = build_indicators(df, nifty, params)
     r  = compute_bar(ia, i=-1, params=params)   # -1 = latest bar
@@ -1468,6 +1492,16 @@ def score_stock(
             "CV1_EntryQuality":  cv1.entry_quality,
             "CV1_Composite":     cv1.composite,
             "CV1_SignalClass":   cv1.signal_class,
+            # Staged-elimination diagnostic tags (see prescreen_diagnostic
+            # above). _prescreen_mismatch=True means the cheap prescreen
+            # would have rejected this symbol before full scoring, but the
+            # full CV1 score actually reached Watch-or-better — a false
+            # negative that would silently drop a real setup from the scan
+            # once diagnostic mode is turned off and the prescreen goes live
+            # as the actual filter. Check this column is ~0% across a few
+            # scans before relying on the prescreen unattended.
+            "_prescreen_pass":     prescreen_ok,
+            "_prescreen_mismatch": (not prescreen_ok) and cv1.signal_class in ("WATCH", "EXECUTE", "ELITE"),
             # Grade labels
             "CV1_LS_Grade":      cv1.leadership_grade,
             "CV1_CV_Grade":      cv1.conviction_grade,

@@ -88,8 +88,32 @@ import pandas as pd
 logger = logging.getLogger("scan_worker")
 
 # ── Live Scanner sub-scheduler tuning ─────────────────────────────────
-LIVE_SCANNER_INTERVAL_SECS = 300   # full-universe cycle target (5 min)
-LIVE_SCANNER_BATCH_SIZE    = 50    # symbols scored per sub-batch
+LIVE_SCANNER_INTERVAL_SECS  = 300   # full-universe cycle target (5 min)
+LIVE_SCANNER_BATCH_SIZE     = 50    # symbols scored per sub-batch
+LIVE_SCANNER_MAX_WORKERS    = 4     # ThreadPoolExecutor size for BACKGROUND
+                                     # scans specifically — deliberately lower
+                                     # than the manual "Run Scan" button's
+                                     # default of 10 (utils/live_scanner_job.py
+                                     # _run_batch). This loop runs unattended,
+                                     # sharing CPU with the Streamlit UI in
+                                     # the same process/container — 10
+                                     # concurrent CPU-bound scoring threads,
+                                     # fired every cycle with no human
+                                     # watching, is what actually saturates a
+                                     # Streamlit Cloud CPU quota and triggers
+                                     # the "contact support" throttling
+                                     # warning. The manual button stays at 10
+                                     # since a person is present and it's a
+                                     # one-off, not a recurring background load.
+                                     # Re-added 2026-07-24 after being pulled
+                                     # out along with the broken v4 revert —
+                                     # this constant never depended on v4.
+LIVE_SCANNER_BATCH_COOLDOWN_SECS = 1.5   # brief pause between batches, just
+                                     # enough for CPU usage to settle between
+                                     # bursts instead of the worker threads
+                                     # immediately spinning back up for the
+                                     # next batch. Re-added alongside the
+                                     # worker cap above.
 
 
 def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payload):
@@ -229,10 +253,15 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             logger.exception("[live_scanner] regime context fetch failed — reusing previous cycle's regime")
             regime_ctx = None
 
-        # Leave ~10% headroom in the interval for the final merge/save
-        # and any per-batch overrun, rather than scheduling batches
-        # back-to-back with zero slack.
-        per_batch_budget = max(2.0, (interval_secs * 0.9) / n_batches)
+        # Batches run back-to-back, as fast as they can — no per-batch
+        # pacing. With leadership_prescreen (re-added 2026-07-24 — see
+        # utils/scoring_core.py) skipping the expensive part of scoring for
+        # most rejected symbols, a full cycle typically finishes well
+        # inside the 5-minute window. Stretching batches out to fill idle
+        # time is pure waste once the work itself is fast; the loop runs
+        # all batches as fast as it can, then sleeps out whatever's left of
+        # the interval before starting the next cycle (see the end-of-loop
+        # sleep below) — so it scans once per interval, not continuously.
 
         for batch_i, chunk in enumerate(batches):
             if not should_scheduler_run():
@@ -244,7 +273,7 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             batch_started = time.time()
             if chunk:
                 try:
-                    df_raw = compute_live_scan_batch(chunk)
+                    df_raw = compute_live_scan_batch(chunk, settings={"workers": LIVE_SCANNER_MAX_WORKERS})
                     df_batch = apply_regime_layer(df_raw, regime_ctx) if (regime_ctx and df_raw is not None and not df_raw.empty) else df_raw
                     n_ok = 0
                     for rec in _live_scan_records(df_batch):
@@ -291,9 +320,15 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             except Exception:
                 logger.exception("[live_scanner] failed to save progressive snapshot")
 
-            elapsed = time.time() - batch_started
+            # Brief CPU cooldown, not window-filling pacing — just enough
+            # gap for the worker threads from this batch to fully wind down
+            # before the next batch spins up its own, so we're not
+            # sustaining back-to-back CPU bursts on a shared Streamlit Cloud
+            # quota. Skipped after the last batch.
             if batch_i < n_batches - 1:
-                time.sleep(max(0.5, per_batch_budget - elapsed))
+                time.sleep(LIVE_SCANNER_BATCH_COOLDOWN_SECS)
+
+        # end of batches loop
 
         # Legacy tables (history.py / validation.py consumers) — full
         # merged universe, once per completed cycle, not per batch.
