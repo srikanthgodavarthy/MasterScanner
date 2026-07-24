@@ -962,6 +962,7 @@ def _fo_setup_plan_from_row(row: dict) -> "object":
         status_reason               = row.get("status_reason", "") or "",
         created_at                  = str(row.get("created_at", "") or ""),
         activated_at                = str(row.get("activated_at", "") or ""),
+        activation_price            = float(row.get("activation_price", 0) or 0),
         t1_hit_at                    = str(row.get("t1_hit_at", "") or ""),
         closed_at                   = str(row.get("closed_at", "") or ""),
     )
@@ -1377,6 +1378,12 @@ CREATE TABLE IF NOT EXISTS fo_setup_plans (
     status_reason                text        NOT NULL DEFAULT '',
     created_at                   timestamptz NOT NULL DEFAULT now(),
     activated_at                  timestamptz,
+    -- 2026-07-24: the premium the plan actually activated at — always
+    -- entry_locked at the moment activated_at's trigger candle crossed
+    -- it (see utils/fo_setup_persistence.py's find_activation_candle()),
+    -- kept alongside activated_at so a reload doesn't need to re-derive
+    -- it. Immutable once set, same as activated_at itself.
+    activation_price               numeric(12,2),
     t1_hit_at                      timestamptz,
     closed_at                     timestamptz,
 
@@ -1391,6 +1398,19 @@ CREATE INDEX IF NOT EXISTS idx_fo_setup_plans_date   ON fo_setup_plans(created_d
 #    CREATE TABLE block above once. This is a brand-new table (2026-07-21),
 #    so there is no separate ALTER-TABLE migration needed the way
 #    SETUP_PLANS_MIGRATION_SQL exists for the older equity table.
+
+# ── MIGRATION for an EXISTING fo_setup_plans table created before the
+#    2026-07-24 activation-timestamp fix (utils/fo_setup_persistence.py's
+#    trigger-candle detection). Idempotent — safe to run multiple times.
+#    Only adds the new column; existing WAITING/ACTIVE/T1_HIT/CLOSED rows
+#    and their activated_at values are untouched. Rows already ACTIVE (or
+#    beyond) from before this migration will simply have a NULL
+#    activation_price until they naturally re-trigger on a fresh plan —
+#    nothing here retroactively fabricates one, consistent with the "never
+#    fabricate a timestamp" rule the fix itself follows.
+FO_SETUP_PLANS_MIGRATION_SQL = """
+ALTER TABLE fo_setup_plans ADD COLUMN IF NOT EXISTS activation_price numeric(12,2);
+"""
 
 
 # ── MIGRATION for an EXISTING setup_plans table created before this v9
