@@ -254,6 +254,39 @@ def _inject_css():
     .pcc-why-title { font-size:0.85rem; font-weight:700; margin:0.9rem 0 0.4rem; }
     .pcc-why-row { display:flex; align-items:flex-start; gap:0.5rem; padding:0.22rem 0; font-size:0.78rem; }
     .pcc-why-check { color:#00ff88; font-weight:800; }
+
+    /* ── Dashboard v3: KPI strip + action panels + dense holdings table ── */
+    .pcc-kpi-grid { display:grid; grid-template-columns:repeat(4,1fr) 1.4fr; gap:0.8rem; margin-bottom:1.2rem; align-items:stretch; }
+    .pcc-kpi-card { background:#111827; border:1px solid #1e293b; border-radius:10px; padding:0.9rem 1.1rem; min-width:0; }
+    .pcc-kpi-label { color:#64748b; font-size:0.68rem; text-transform:uppercase; letter-spacing:0.08em; }
+    .pcc-kpi-value { font-family:'JetBrains Mono',monospace; font-size:1.4rem; font-weight:700; color:#e2e8f0; margin-top:0.15rem; }
+    .pcc-kpi-sub { font-size:0.72rem; margin-top:0.15rem; }
+    .pcc-kpi-summary-row { display:flex; justify-content:space-around; text-align:center; margin-top:0.3rem; }
+    .pcc-kpi-summary-num { font-family:'JetBrains Mono',monospace; font-size:1.3rem; font-weight:800; }
+    .pcc-kpi-summary-lbl { font-size:0.6rem; color:#64748b; text-transform:uppercase; letter-spacing:0.04em; margin-top:0.1rem; }
+
+    .pcc-panel-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:0.8rem; margin-bottom:1.2rem; align-items:start; }
+    .pcc-panel { background:#111827; border:1px solid #1e293b; border-radius:10px; padding:0.9rem 1rem; min-width:0; }
+    .pcc-panel-head { display:flex; align-items:center; gap:0.4rem; font-size:0.85rem; font-weight:800; margin-bottom:0.7rem; }
+    .pcc-panel-empty { color:#3a4658; font-size:0.75rem; padding:0.4rem 0; }
+    .pcc-panel-row { padding:0.5rem 0; border-bottom:1px solid #1a2436; }
+    .pcc-panel-row:last-child { border-bottom:none; }
+    .pcc-panel-row-top { display:flex; justify-content:space-between; align-items:baseline; }
+    .pcc-panel-sym { font-weight:700; font-size:0.82rem; color:#f1f5f9; }
+    .pcc-panel-ltp { font-family:'JetBrains Mono',monospace; font-size:0.75rem; color:#94a3b8; }
+    .pcc-panel-row-bottom { display:flex; justify-content:space-between; align-items:baseline; margin-top:2px; }
+    .pcc-panel-pct { font-weight:700; font-size:0.78rem; }
+    .pcc-panel-reason { font-size:0.68rem; color:#64748b; }
+    .pcc-panel-viewall { font-size:0.72rem; margin-top:0.6rem; display:block; }
+
+    table.pcc-htable { width:100%; border-collapse:collapse; font-family:'JetBrains Mono',monospace; font-size:0.78rem; }
+    table.pcc-htable th { background:#0d1420; color:#64748b; text-transform:uppercase; font-size:0.62rem;
+        letter-spacing:0.05em; text-align:left; padding:0.5rem 0.65rem; border-bottom:1px solid #1e293b; white-space:nowrap; }
+    table.pcc-htable td { padding:0.5rem 0.65rem; border-bottom:1px solid #161d2e; color:#e2e8f0; white-space:nowrap; }
+    table.pcc-htable tr:last-child td { border-bottom:none; }
+    table.pcc-htable tr:hover td { background:#131b2e; }
+    .pcc-rr-dot { display:inline-block; width:6px; height:6px; border-radius:50%; margin-left:5px; }
+    .pcc-next-action { font-size:0.72rem; color:#94a3b8; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -714,7 +747,209 @@ def _compute_row(pos: dict, cfg: ExitIntelligenceConfig, live_metrics: pd.DataFr
 
 
 # ══════════════════════════════════════════════════════════════════
-#  SUMMARY CARDS
+#  DASHBOARD v3 — reason text, KPI strip, action panels, holdings table
+# ══════════════════════════════════════════════════════════════════
+
+def _reason_for_row(r: dict) -> str:
+    """Short human reason shown on the EXIT/ROTATE/REDUCE/ADD panels and the
+    'Next Action' table column. Derived entirely from fields _compute_row
+    already computes — no new scoring, just labeling the existing read."""
+    result = r["result"]
+    action = r["display_action"]
+
+    if action == "EXIT":
+        if result.structure_break:
+            return "Breakdown"
+        if result.exit_score >= 80:
+            return "Severe Weakness"
+        if (r.get("ls") or 100) < 40:
+            return "Leadership Weak"
+        return "Weak Trend"
+
+    if action == "REDUCE":
+        if (r.get("risk_pct") or 0) >= 8:
+            return "High Risk"
+        if r.get("cci_state") == "Overbought" or (r.get("extension") or 0) >= 8:
+            return "Overbought"
+        return "Elevated Risk"
+
+    if action == "ROTATE":
+        return f"To {r.get('rotate_target', '—')}"
+
+    if action in ("ADD", "STRONG ADD"):
+        return "Strong Setup" if action == "STRONG ADD" else "Add-On Signal"
+
+    return "—"
+
+
+def _next_action_text(r: dict) -> str:
+    action = r["display_action"]
+    if action == "EXIT":
+        return "Exit Position"
+    if action == "ROTATE":
+        return f"Rotate → {r.get('rotate_target', '—')}"
+    if action == "REDUCE":
+        return "Reduce Exposure"
+    if action in ("ADD", "STRONG ADD"):
+        return "Add Position"
+    return "Hold"
+
+
+def _rr_dot_color(action: str) -> str:
+    return {"EXIT": "#ff4d6d", "ROTATE": "#f59e0b", "REDUCE": "#f59e0b",
+            "ADD": "#00ff88", "STRONG ADD": "#00ff88"}.get(action, "#00ff88")
+
+
+def _render_kpi_strip(rows: list[dict]):
+    invested = sum(r["entry_price"] * r["qty"] for r in rows)
+    current = sum(r["market_val"] for r in rows)
+    open_pnl = current - invested
+    today_pnl = sum(r["today_pnl"] for r in rows)
+    open_pct = (open_pnl / invested * 100) if invested else 0.0
+    today_pct = (today_pnl / current * 100) if current else 0.0
+    utilization = min(100.0, (invested / current * 100)) if current else 0.0
+
+    def _c(v):
+        return "#00ff88" if v >= 0 else "#ff4d6d"
+
+    counts = {"EXIT": 0, "ROTATE": 0, "REDUCE": 0, "ADD": 0}
+    for r in rows:
+        a = r["display_action"]
+        if a in ("ADD", "STRONG ADD"):
+            counts["ADD"] += 1
+        elif a in counts:
+            counts[a] += 1
+
+    html = f"""
+    <div class="pcc-kpi-grid">
+      <div class="pcc-kpi-card">
+        <div class="pcc-kpi-label">Portfolio Value</div>
+        <div class="pcc-kpi-value">{_fmt_inr(current)}</div>
+        <div class="pcc-kpi-sub" style="color:{_c(today_pnl)};">Today's P&amp;L: {'+' if today_pnl>=0 else ''}{_fmt_inr(today_pnl)} ({'+' if today_pct>=0 else ''}{today_pct:.2f}%)</div>
+      </div>
+      <div class="pcc-kpi-card">
+        <div class="pcc-kpi-label">Invested Capital</div>
+        <div class="pcc-kpi-value">{_fmt_inr(invested)}</div>
+        <div class="pcc-kpi-sub" style="color:#64748b;">Utilization: {utilization:.1f}%</div>
+      </div>
+      <div class="pcc-kpi-card">
+        <div class="pcc-kpi-label">Total P&amp;L</div>
+        <div class="pcc-kpi-value" style="color:{_c(open_pnl)};">{'+' if open_pnl>=0 else ''}{_fmt_inr(open_pnl)} ({'+' if open_pct>=0 else ''}{open_pct:.2f}%)</div>
+        <div class="pcc-kpi-sub" style="color:#64748b;">Unrealized P&amp;L: {'+' if open_pnl>=0 else ''}{_fmt_inr(open_pnl)} ({'+' if open_pct>=0 else ''}{open_pct:.1f}%)</div>
+      </div>
+      <div class="pcc-kpi-card">
+        <div class="pcc-kpi-label">Today's P&amp;L</div>
+        <div class="pcc-kpi-value" style="color:{_c(today_pnl)};">{'+' if today_pnl>=0 else ''}{_fmt_inr(today_pnl)} ({'+' if today_pct>=0 else ''}{today_pct:.2f}%)</div>
+      </div>
+      <div class="pcc-kpi-card">
+        <div class="pcc-kpi-label">Portfolio Summary</div>
+        <div class="pcc-kpi-summary-row">
+          <div><div class="pcc-kpi-summary-num" style="color:#ff4d6d;">{counts['EXIT']}</div><div class="pcc-kpi-summary-lbl">Exit</div></div>
+          <div><div class="pcc-kpi-summary-num" style="color:#a78bfa;">{counts['ROTATE']}</div><div class="pcc-kpi-summary-lbl">Rotate</div></div>
+          <div><div class="pcc-kpi-summary-num" style="color:#f59e0b;">{counts['REDUCE']}</div><div class="pcc-kpi-summary-lbl">Reduce</div></div>
+          <div><div class="pcc-kpi-summary-num" style="color:#00ff88;">{counts['ADD']}</div><div class="pcc-kpi-summary-lbl">Add</div></div>
+        </div>
+      </div>
+    </div>
+    """
+    _md(html)
+
+
+def _panel_row_html(r: dict, extra_line: str | None = None) -> str:
+    pct = r["result"].unrealized_pct
+    color = "#00ff88" if pct >= 0 else "#ff4d6d"
+    return f"""
+    <div class="pcc-panel-row">
+      <div class="pcc-panel-row-top">
+        <span class="pcc-panel-sym">{r['symbol']}</span>
+        <span class="pcc-panel-ltp">₹{r['price']:.2f}</span>
+      </div>
+      <div class="pcc-panel-row-bottom">
+        <span class="pcc-panel-pct" style="color:{color};">{pct:+.2f}%</span>
+        <span class="pcc-panel-reason">{extra_line or _reason_for_row(r)}</span>
+      </div>
+    </div>
+    """
+
+
+def _render_action_panels(rows: list[dict]):
+    exits = [r for r in rows if r["display_action"] == "EXIT"]
+    rotates = [r for r in rows if r["display_action"] == "ROTATE"]
+    reduces = [r for r in rows if r["display_action"] == "REDUCE"]
+    adds = [r for r in rows if r["display_action"] in ("ADD", "STRONG ADD")]
+
+    def _panel(title: str, icon: str, color: str, items: list[dict], reason_fn=None):
+        if not items:
+            body = '<div class="pcc-panel-empty">Nothing flagged</div>'
+        else:
+            body = "".join(_panel_row_html(r, reason_fn(r) if reason_fn else None) for r in items)
+        return f"""
+        <div class="pcc-panel">
+          <div class="pcc-panel-head" style="color:{color};">{icon} {title} ({len(items)})</div>
+          {body}
+        </div>
+        """
+
+    rotate_reason = lambda r: f"→ {r.get('rotate_target', '—')}"
+    html = f"""
+    <div class="pcc-panel-grid">
+      {_panel("EXIT IMMEDIATELY", "❌", "#ff4d6d", exits)}
+      {_panel("ROTATE", "🔄", "#a78bfa", rotates, rotate_reason)}
+      {_panel("REDUCE", "🟡", "#f59e0b", reduces)}
+      {_panel("ADD / ACCUMULATE", "➕", "#00ff88", adds)}
+    </div>
+    """
+    _md(html)
+
+
+def _render_holdings_table(rows: list[dict]):
+    order = {"EXIT": 0, "ROTATE": 1, "REDUCE": 2, "STRONG ADD": 3, "ADD": 4, "HOLD": 5}
+    sorted_rows = sorted(rows, key=lambda r: order.get(r["display_action"], 9))
+
+    thead = """
+    <tr>
+      <th>#</th><th>Symbol</th><th>LTP (₹)</th><th>Today's Change %</th><th>Today's P&amp;L (₹)</th>
+      <th>Avg Entry (₹)</th><th>P&amp;L %</th><th>Total P&amp;L (₹)</th>
+      <th>Recommendation</th><th>Next Action</th><th>Days Held</th><th>R:R</th>
+    </tr>
+    """
+    trs = []
+    for i, r in enumerate(sorted_rows, start=1):
+        pnl_color = "#00ff88" if r["pnl_val"] >= 0 else "#ff4d6d"
+        today_color = "#00ff88" if r["today_pct"] >= 0 else "#ff4d6d"
+        rr_txt = f"{r['rr']:.2f}" if r["rr"] is not None else "—"
+        dot = _rr_dot_color(r["display_action"])
+        trs.append(f"""
+        <tr>
+          <td style="color:#64748b;">{i}</td>
+          <td><span class="pcc-sym">{r['symbol']}</span></td>
+          <td>{r['price']:.2f}</td>
+          <td style="color:{today_color};">{r['today_pct']:+.2f}%</td>
+          <td style="color:{today_color};">{'+' if r['today_pnl']>=0 else ''}{r['today_pnl']:,.0f}</td>
+          <td>{r['entry_price']:.2f}</td>
+          <td style="color:{pnl_color};font-weight:700;">{r['result'].unrealized_pct:+.2f}%</td>
+          <td style="color:{pnl_color};font-weight:700;">{'+' if r['pnl_val']>=0 else ''}{r['pnl_val']:,.0f}</td>
+          <td>{_action_badge_for_row(r)}</td>
+          <td class="pcc-next-action">{_next_action_text(r)}</td>
+          <td>{r['result'].days_held}</td>
+          <td>{rr_txt}<span class="pcc-rr-dot" style="background:{dot};"></span></td>
+        </tr>
+        """)
+
+    html = f"""
+    <div class="pcc-section-label">CURRENT PORTFOLIO HOLDINGS</div>
+    <div class="pcc-table-wrap">
+      <table class="pcc-htable">
+        <thead>{thead}</thead>
+        <tbody>{''.join(trs)}</tbody>
+      </table>
+    </div>
+    """
+    _md(html)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SUMMARY CARDS (legacy — kept for _health_score/_alert_html callers only)
 # ══════════════════════════════════════════════════════════════════
 
 def _render_summary_cards(rows: list[dict]):
@@ -1438,15 +1673,9 @@ def render():
 
         if rows:
             _apply_rotation(rows, live_metrics)
-            _render_summary_cards(rows)
-
-            st.markdown("### 📊 Current Portfolio")
-            _render_positions_table(rows)
-            _render_rotation_rationale(rows)
-
-            st.markdown("### 🗂️ Position Cards")
-            total_value = sum(x["market_val"] for x in rows)
-            _render_stock_cards(rows, cfg, total_value)
+            _render_kpi_strip(rows)
+            _render_action_panels(rows)
+            _render_holdings_table(rows)
 
             if live_metrics is None or live_metrics.empty:
                 st.caption(
