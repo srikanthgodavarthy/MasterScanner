@@ -56,12 +56,21 @@ completed cycle. Two things changed:
   1. The cadence moved from 120s to 300s (5 min) for the full universe.
   2. Instead of one blocking call per cycle, _run_live_scanner_loop
      splits the universe into small batches (LIVE_SCANNER_BATCH_SIZE
-     symbols each) and works through them one at a time, each a fast,
-     independent call spaced out across the 5-minute window. A batch
-     that fails or times out only drops THAT batch's symbols for this
-     cycle — they keep their last-good scored values and get retried
-     next cycle — instead of failing the whole run the way one giant
-     call did.
+     symbols each) and works through them one at a time, back-to-back
+     with no pacing between them. A batch that fails or times out only
+     drops THAT batch's symbols for this cycle — they keep their
+     last-good scored values and get retried next cycle — instead of
+     failing the whole run the way one giant call did.
+
+  Batches are no longer paced to spread evenly across the 5-minute
+  window (2026-07-24 change) — with the Leadership pre-screen (see
+  utils/scoring_core.leadership_prescreen) now skipping the expensive
+  part of scoring for most rejected symbols, a full cycle typically
+  finishes well inside 5 minutes. Stretching batches out to fill idle
+  time was pure waste once the work itself got faster; the loop now
+  runs all batches as fast as it can, then sleeps out whatever's left
+  of the interval before starting the next cycle — so it scans once
+  per interval, not continuously.
 
 Merged results are written to Supabase after every batch, not just at
 the end of a cycle, so the Dashboard sees the universe refresh
@@ -88,8 +97,30 @@ import pandas as pd
 logger = logging.getLogger("scan_worker")
 
 # ── Live Scanner sub-scheduler tuning ─────────────────────────────────
-LIVE_SCANNER_INTERVAL_SECS = 300   # full-universe cycle target (5 min)
-LIVE_SCANNER_BATCH_SIZE    = 50    # symbols scored per sub-batch
+LIVE_SCANNER_INTERVAL_SECS  = 300   # full-universe cycle target (5 min)
+LIVE_SCANNER_BATCH_SIZE     = 50    # symbols scored per sub-batch
+LIVE_SCANNER_MAX_WORKERS    = 4     # ThreadPoolExecutor size for BACKGROUND
+                                     # scans specifically — deliberately lower
+                                     # than the manual "Run Scan" button's
+                                     # default of 10 (utils/live_scanner_job.py
+                                     # _run_batch). This loop runs unattended,
+                                     # sharing CPU with the Streamlit UI in
+                                     # the same process/container — 10
+                                     # concurrent CPU-bound scoring threads,
+                                     # fired every cycle with no human
+                                     # watching, is what actually saturates a
+                                     # Streamlit Cloud CPU quota and triggers
+                                     # the "contact support" throttling
+                                     # warning. The manual button stays at 10
+                                     # since a person is present and it's a
+                                     # one-off, not a recurring background load.
+LIVE_SCANNER_BATCH_COOLDOWN_SECS = 1.5   # brief pause between batches — NOT
+                                     # pacing to fill the 5-minute window
+                                     # (removed 2026-07-24, see module note
+                                     # above), just enough for CPU usage to
+                                     # settle between bursts instead of the
+                                     # 10 (now 4) worker threads immediately
+                                     # spinning back up for the next batch.
 
 
 def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payload):
@@ -229,10 +260,17 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             logger.exception("[live_scanner] regime context fetch failed — reusing previous cycle's regime")
             regime_ctx = None
 
-        # Leave ~10% headroom in the interval for the final merge/save
-        # and any per-batch overrun, rather than scheduling batches
-        # back-to-back with zero slack.
-        per_batch_budget = max(2.0, (interval_secs * 0.9) / n_batches)
+        # Batches run back-to-back, as fast as they can — no per-batch
+        # pacing. Pacing made sense when a full-universe pass took close
+        # to the full 5-minute window and needed to be spread out to avoid
+        # front-loading load; with the Leadership pre-screen (see
+        # scoring_core.leadership_prescreen) cutting the expensive part of
+        # per-symbol scoring for most rejects, a cycle now typically
+        # finishes well inside the window. The end-of-loop sleep below
+        # (interval_secs - cycle_elapsed) is what enforces the 5-minute
+        # cadence — it waits out whatever's left AFTER all batches are
+        # done, rather than the old approach of stretching the batches
+        # themselves to fill the window.
 
         for batch_i, chunk in enumerate(batches):
             if not should_scheduler_run():
@@ -244,7 +282,7 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             batch_started = time.time()
             if chunk:
                 try:
-                    df_raw = compute_live_scan_batch(chunk)
+                    df_raw = compute_live_scan_batch(chunk, settings={"workers": LIVE_SCANNER_MAX_WORKERS})
                     df_batch = apply_regime_layer(df_raw, regime_ctx) if (regime_ctx and df_raw is not None and not df_raw.empty) else df_raw
                     n_ok = 0
                     for rec in _live_scan_records(df_batch):
@@ -279,9 +317,9 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                     logger.exception("[live_scanner] failed to reseed from manual override snapshot (non-fatal)")
 
             # Progressive snapshot after every batch — the Dashboard
-            # doesn't have to wait for the whole 5-minute cycle to see
-            # fresher data, and a mid-cycle crash loses at most one
-            # batch's worth of progress.
+            # doesn't have to wait for the whole cycle to see fresher
+            # data, and a mid-cycle crash loses at most one batch's worth
+            # of progress.
             try:
                 records = list(merged.values())
                 scan_id = save_snapshot("live_scanner", payload={"data": records},
@@ -291,9 +329,15 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             except Exception:
                 logger.exception("[live_scanner] failed to save progressive snapshot")
 
-            elapsed = time.time() - batch_started
+            # Brief CPU cooldown, not window-filling pacing (that was
+            # removed above) — just enough gap for the worker threads from
+            # this batch to fully wind down before the next batch spins up
+            # its own, so we're not sustaining back-to-back CPU bursts on a
+            # shared Streamlit Cloud quota. Skipped after the last batch.
             if batch_i < n_batches - 1:
-                time.sleep(max(0.5, per_batch_budget - elapsed))
+                time.sleep(LIVE_SCANNER_BATCH_COOLDOWN_SECS)
+
+        # end of batches loop
 
         # Legacy tables (history.py / validation.py consumers) — full
         # merged universe, once per completed cycle, not per batch.
