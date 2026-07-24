@@ -174,6 +174,16 @@ JOBS = [
 def _live_scan_records(df: pd.DataFrame) -> list[dict]:
     if df is None or df.empty:
         return []
+    # Belt-and-suspenders: apply_regime_layer() (utils/regime_engine.py)
+    # already drops the internal-only _bar_result column (raw
+    # scoring_core.BarResult — see its 2026-07-24 comment), but
+    # _run_live_scanner_loop falls back to the un-augmented df_raw
+    # whenever regime_ctx is None (a failed regime-context fetch this
+    # cycle — see the except block above), which skips
+    # apply_regime_layer() entirely. Drop it here too so that fallback
+    # path can't reintroduce the same "Object of type BarResult is not
+    # JSON serializable" crash on .to_dict("records") below.
+    df = df.drop(columns=["_bar_result"], errors="ignore")
     safe = df.astype(object).where(pd.notnull(df), None)
     return safe.to_dict("records")
 
