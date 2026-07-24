@@ -590,6 +590,74 @@ def load_lifecycle_history(symbol: str, limit_days: int = 90) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+# ─── SECTOR SNAPSHOTS ──────────────────────────────────────────────────────
+
+def save_sector_snapshot(rows: list[dict]) -> bool:
+    """
+    Persist a batch of per-sector daily aggregates to sector_snapshots.
+    Each dict: sector, scan_date, avg_chg, avg_leadership, opp_score,
+    elite_count, execute_count, watch_count, actionable_count, stock_count,
+    net_inflow_cr. Upserts on (sector, scan_date) — re-running a scan the
+    same day updates rather than duplicates. See utils/sector_rotation.py
+    for how build_sector_snapshot_rows() builds these from df_aug.
+    """
+    client = get_client()
+    if client is None or not rows:
+        return False
+
+    def _safe(v):
+        if v is None:
+            return None
+        if isinstance(v, float) and (v != v):
+            return None
+        if isinstance(v, (pd.Timestamp, datetime)):
+            return v.isoformat()
+        return v
+
+    clean = [{k: _safe(v) for k, v in r.items()} for r in rows]
+
+    try:
+        resp = (
+            client.table("sector_snapshots")
+            .upsert(clean, on_conflict="sector,scan_date")
+            .execute()
+        )
+        return resp.data is not None
+    except Exception as exc:
+        logger.error("save_sector_snapshot failed: %s", exc)
+        return False
+
+
+def load_sector_snapshot_history(days: int = 30) -> pd.DataFrame:
+    """
+    Return all sector_snapshots rows over the trailing ``days`` calendar
+    days, ordered by scan_date ascending — the raw feed
+    utils.sector_rotation.compute_rotation_metrics() and
+    compute_rotation_timeline() aggregate into momentum/direction/timeline.
+    """
+    client = get_client()
+    if client is None:
+        return pd.DataFrame()
+
+    from datetime import timezone, timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+
+    try:
+        resp = (
+            client.table("sector_snapshots")
+            .select("*")
+            .gte("scan_date", cutoff)
+            .order("scan_date", desc=False)
+            .execute()
+        )
+        if not resp.data:
+            return pd.DataFrame()
+        return pd.DataFrame(resp.data)
+    except Exception as exc:
+        logger.error("load_sector_snapshot_history failed: %s", exc)
+        return pd.DataFrame()
+
+
 # ─── LIFECYCLE TRANSITIONS ────────────────────────────────────────────────────
 
 def save_lifecycle_transitions(transitions: list[dict]) -> bool:
@@ -1288,6 +1356,31 @@ CREATE TABLE IF NOT EXISTS lifecycle_transitions (
 );
 CREATE INDEX IF NOT EXISTS idx_lifecycle_transitions_symbol  ON lifecycle_transitions(symbol);
 CREATE INDEX IF NOT EXISTS idx_lifecycle_transitions_to_date ON lifecycle_transitions(to_date DESC);
+
+-- 6b. Sector snapshots — one row per sector per scan_date, aggregated from
+--     the full scan (df_aug). Powers Sector Rotation Analysis (5D/20D
+--     momentum, rotation timeline, net sector inflow). See
+--     utils/sector_rotation.py for how these roll up into momentum/
+--     direction/suggested-action; all "money flow" figures here remain the
+--     same vol_ratio-weighted PROXY documented in utils/sector_map.py,
+--     not real traded value.
+CREATE TABLE IF NOT EXISTS sector_snapshots (
+    id               bigserial PRIMARY KEY,
+    sector           text        NOT NULL,
+    scan_date        date        NOT NULL,
+    avg_chg          numeric(8,4) NOT NULL DEFAULT 0,
+    avg_leadership   numeric(8,4),
+    opp_score        numeric(6,2),
+    elite_count      integer     NOT NULL DEFAULT 0,
+    execute_count    integer     NOT NULL DEFAULT 0,
+    watch_count      integer     NOT NULL DEFAULT 0,
+    actionable_count integer     NOT NULL DEFAULT 0,
+    stock_count      integer     NOT NULL DEFAULT 0,
+    net_inflow_cr    numeric(10,2) NOT NULL DEFAULT 0,
+    UNIQUE (sector, scan_date)
+);
+CREATE INDEX IF NOT EXISTS idx_sector_snapshots_date   ON sector_snapshots(scan_date DESC);
+CREATE INDEX IF NOT EXISTS idx_sector_snapshots_sector ON sector_snapshots(sector);
 """
 
 
