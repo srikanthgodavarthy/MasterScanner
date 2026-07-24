@@ -3158,7 +3158,28 @@ def render(settings: dict | None = None):
                     if _transitions:
                         save_lifecycle_transitions(_transitions)
             except Exception:
-                pass  # non-critical
+                logger.exception("lifecycle snapshot/transitions write failed (non-fatal)")
+
+            # ── Sector Rotation Analysis: persist today's per-sector row ──
+            try:
+                from utils.sector_map import build_sector_stats
+                from utils.sector_rotation import build_sector_snapshot_rows
+                from utils.supabase_client import save_sector_snapshot
+                _sector_stats_today = build_sector_stats(df_aug)
+                _sec_rows = build_sector_snapshot_rows(_sector_stats_today, _today)
+                if _sec_rows:
+                    lead_col = "Legacy_Leadership" if "Legacy_Leadership" in df_aug.columns else (
+                        "Leadership" if "Leadership" in df_aug.columns else None)
+                    if lead_col:
+                        _df_sec = df_aug.copy()
+                        _df_sec["_sector"] = _df_sec["Stock"].astype(str).map(
+                            __import__("utils.sector_map", fromlist=["get_sector"]).get_sector)
+                        _lead_by_sector = _df_sec.groupby("_sector")[lead_col].mean()
+                        for _row in _sec_rows:
+                            _row["avg_leadership"] = float(_lead_by_sector.get(_row["sector"], 0.0) or 0.0)
+                    save_sector_snapshot(_sec_rows)
+            except Exception:
+                logger.exception("sector snapshot write failed (non-fatal)")
             # [Restructure 2026-07] Was a persistent full-width st.success()
             # banner that stayed on screen (and pushed everything below it
             # down) until the next scan. A toast confirms the same thing

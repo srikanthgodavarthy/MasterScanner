@@ -80,6 +80,9 @@ from utils.time_utils import now_ist as _now_ist, IST as _IST
 
 from utils.supabase_client import load_latest_full_scan
 from utils.sector_map      import build_sector_stats
+from utils.sector_rotation import (
+    compute_rotation_metrics, compute_rotation_timeline, compute_sector_flow,
+)
 
 # ── CONSTANTS ─────────────────────────────────────────────────────
 
@@ -2159,6 +2162,259 @@ def _top_gainers_panel(df: pd.DataFrame, top_n: int = 10) -> str:
 """
 
 
+# ── SECTOR ROTATION ANALYSIS (full block, replaces Sector Opportunity
+#    Board + Leadership Rotation panels) ───────────────────────────────
+
+_SRX_ACTION_COLOR = {"BUY": "#00ff88", "ACCUMULATE": "#f59e0b", "WATCH": "#60a5fa",
+                      "REDUCE": "#f59e0b", "EXIT": "#ff4d6d"}
+_SRX_DIR_ARROW = {"Rotating In": "↑", "Rotating Out": "↓", "Stable": "→"}
+_SRX_DIR_COLOR = {"Rotating In": "#00ff88", "Rotating Out": "#ff4d6d", "Stable": "#f59e0b"}
+_SRX_SECTOR_ICON = {
+    "Healthcare": "❤️", "Textiles": "🧵", "Banking": "🏦", "Media": "📺",
+    "Chemicals": "🧪", "Engineering": "⚙️", "IT": "💻", "Power": "⚡",
+    "Financials": "🏛️", "Auto": "🚗", "Pharma": "💊", "FMCG": "🛒",
+    "Realty": "🏗️", "Metals": "🔩", "Defence": "🛡️", "Cement": "🧱",
+    "Oil & Gas": "🛢️", "Telecom": "📡", "Consumer Durables": "📦", "Diversified": "🧭",
+}
+
+
+def _srx_action_badge(action: str) -> str:
+    color = _SRX_ACTION_COLOR.get(action, "#94a3b8")
+    return (f'<span style="display:inline-block;padding:2px 14px;border-radius:5px;'
+            f'border:1px solid {color}88;color:{color};font-weight:800;font-size:0.72rem;'
+            f'letter-spacing:0.03em;">{action}</span>')
+
+
+def _render_sector_rotation_analysis(df_aug: pd.DataFrame, sector_stats: pd.DataFrame,
+                                      history: pd.DataFrame, scan_time: str = "") -> None:
+    """Full Sector Rotation Analysis block: KPI strip, rotation dashboard
+    table, today's sector flow, rotation timeline, top-3 focus cards, and
+    a 'how it's calculated' strip. All figures trace back to
+    utils/sector_rotation.py's documented proxies — see that module's
+    docstring for what's real vs. a best-effort proxy."""
+    st.markdown("""
+    <style>
+    .srx-wrap { font-family:'Inter',sans-serif; }
+    .srx-kpi-grid { display:grid; grid-template-columns:repeat(5,1fr); gap:0.7rem; margin:0.6rem 0 1rem; }
+    .srx-kpi { background:#111827; border:1px solid #1e293b; border-radius:10px; padding:0.8rem 1rem; min-width:0; }
+    .srx-kpi-head { display:flex; align-items:center; gap:0.35rem; font-size:0.68rem; font-weight:700;
+        text-transform:uppercase; letter-spacing:0.04em; }
+    .srx-kpi-num { font-family:'JetBrains Mono',monospace; font-size:1.6rem; font-weight:800; margin-top:0.3rem; }
+    .srx-kpi-sub { font-size:0.68rem; color:#64748b; margin-top:0.15rem; }
+    .srx-kpi-sub2 { font-size:0.68rem; color:#94a3b8; margin-top:0.4rem; }
+
+    .srx-panel { background:#111827; border:1px solid #1e293b; border-radius:10px; padding:0.9rem 1rem; }
+    .srx-panel-title { font-size:0.82rem; font-weight:800; letter-spacing:0.02em; margin-bottom:0.6rem; }
+
+    table.srx-table { width:100%; border-collapse:collapse; font-size:0.78rem; }
+    table.srx-table th { color:#64748b; text-transform:uppercase; font-size:0.62rem; letter-spacing:0.04em;
+        text-align:left; padding:0.4rem 0.5rem; border-bottom:1px solid #1e293b; }
+    table.srx-table td { padding:0.45rem 0.5rem; border-bottom:1px solid #161d2e; white-space:nowrap; color:#e2e8f0; }
+    table.srx-table tr:last-child td { border-bottom:none; }
+    table.srx-table tr:hover td { background:#151f36; }
+
+    .srx-flow-col-head { font-weight:800; font-size:0.72rem; margin-bottom:0.4rem; }
+    .srx-flow-row { display:flex; justify-content:space-between; padding:0.3rem 0; font-size:0.78rem; }
+
+    .srx-timeline-grid { display:grid; grid-template-columns:repeat(5,1fr); gap:0.4rem; font-size:0.72rem; }
+    .srx-timeline-head { color:#64748b; text-align:center; font-size:0.65rem; margin-bottom:0.3rem; }
+    .srx-timeline-cell { text-align:center; padding:0.3rem 0.2rem; border-radius:6px; margin-bottom:0.3rem;
+        border:1px solid #1e293b; font-weight:700; }
+
+    .srx-focus-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:0.8rem; margin-top:1rem; }
+    .srx-focus-card { background:#111827; border:1px solid #1e293b; border-radius:10px; padding:1rem; }
+    .srx-focus-rank { display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px;
+        border-radius:50%; font-size:0.7rem; font-weight:800; color:#0d1420; }
+    .srx-focus-name { font-size:1.05rem; font-weight:800; margin:0.5rem 0 0.15rem; }
+    .srx-focus-lbl { font-size:0.65rem; color:#64748b; text-transform:uppercase; margin-top:0.4rem; }
+    .srx-focus-score { font-size:1.4rem; font-weight:800; }
+
+    .srx-calc-grid { display:grid; grid-template-columns:repeat(5,1fr); gap:0.5rem; margin-top:0.6rem; text-align:center; }
+    .srx-calc-item { font-size:0.68rem; color:#94a3b8; }
+    .srx-calc-icon { font-size:1.1rem; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    rot = compute_rotation_metrics(history, sector_stats)
+    if rot.empty:
+        st.markdown('<div class="srx-panel">No sector data for Sector Rotation Analysis yet — run a scan.</div>',
+                     unsafe_allow_html=True)
+        return
+
+    flow = compute_sector_flow(sector_stats)
+    timeline = compute_rotation_timeline(history)
+
+    n_in, n_stable, n_out = (rot["Direction"] == "Rotating In").sum(), \
+        (rot["Direction"] == "Stable").sum(), (rot["Direction"] == "Rotating Out").sum()
+
+    tier_counts = df_aug["Recommendation"].value_counts() if "Recommendation" in df_aug.columns else pd.Series(dtype=int)
+    total_opp = int(tier_counts.sum())
+
+    # ── header ──
+    st.markdown(f"""
+    <div class="srx-wrap">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:0.3rem;">
+      <div>
+        <div style="font-size:1.15rem;font-weight:800;">📊 SECTOR ROTATION ANALYSIS</div>
+        <div style="font-size:0.75rem;color:#64748b;">Identify where money is moving and which sectors offer the best opportunities</div>
+      </div>
+      <div style="text-align:right;font-size:0.72rem;color:#64748b;">As on {scan_time or 'latest scan'}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── KPI strip ──
+    st.markdown(f"""
+    <div class="srx-kpi-grid">
+      <div class="srx-kpi">
+        <div class="srx-kpi-head" style="color:#00ff88;">↑ ROTATING IN</div>
+        <div class="srx-kpi-num" style="color:#00ff88;">{n_in}</div>
+        <div class="srx-kpi-sub">Sectors</div>
+      </div>
+      <div class="srx-kpi">
+        <div class="srx-kpi-head" style="color:#f59e0b;">→ STABLE</div>
+        <div class="srx-kpi-num" style="color:#f59e0b;">{n_stable}</div>
+        <div class="srx-kpi-sub">Sectors</div>
+      </div>
+      <div class="srx-kpi">
+        <div class="srx-kpi-head" style="color:#ff4d6d;">↓ ROTATING OUT</div>
+        <div class="srx-kpi-num" style="color:#ff4d6d;">{n_out}</div>
+        <div class="srx-kpi-sub">Sectors</div>
+      </div>
+      <div class="srx-kpi">
+        <div class="srx-kpi-head" style="color:#60a5fa;">🎯 TOTAL OPPORTUNITIES</div>
+        <div class="srx-kpi-num">{total_opp}</div>
+        <div class="srx-kpi-sub2">Elite: {int(tier_counts.get('Elite', 0))} &nbsp; Execute: {int(tier_counts.get('Execute', 0))} &nbsp;
+          Actionable: {int(tier_counts.get('Actionable', 0))} &nbsp; Watch: {int(tier_counts.get('Watch', 0))}</div>
+      </div>
+      <div class="srx-kpi">
+        <div class="srx-kpi-head" style="color:#00ff88;">💰 NET SECTOR INFLOW (5D)</div>
+        <div class="srx-kpi-num" style="color:{'#00ff88' if flow['net']>=0 else '#ff4d6d'};">{'+' if flow['net']>=0 else ''}{flow['net']:.0f} Cr</div>
+        <div class="srx-kpi-sub">Proxy, not real traded value</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── main grid: rotation dashboard table (left) + flow/timeline (right) ──
+    left, right = st.columns([1.55, 1])
+    with left:
+        thead = "<tr><th>#</th><th>Sector</th><th>5D Momentum</th><th>20D Momentum</th><th>Direction</th><th>Suggested Action</th></tr>"
+        trs = []
+        for i, r in enumerate(rot.itertuples(), start=1):
+            icon = _SRX_SECTOR_ICON.get(r.Sector, "🏷️")
+            dcolor = _SRX_DIR_COLOR[r.Direction]
+            m5c = "#00ff88" if r.Mom5D >= 0 else "#ff4d6d"
+            m20c = "#00ff88" if r.Mom20D >= 0 else "#ff4d6d"
+            trs.append(f"""<tr>
+              <td style="color:#64748b;">{i}</td>
+              <td>{icon} {r.Sector}</td>
+              <td style="color:{m5c};font-weight:700;">{r.Mom5D:+.1f}%</td>
+              <td style="color:{m20c};font-weight:700;">{r.Mom20D:+.1f}%</td>
+              <td style="color:{dcolor};font-weight:700;">{r.Direction} {_SRX_DIR_ARROW[r.Direction]}</td>
+              <td>{_srx_action_badge(r.SuggestedAction)}</td>
+            </tr>""")
+        st.markdown(f"""
+        <div class="srx-panel">
+          <div class="srx-panel-title">SECTOR ROTATION DASHBOARD</div>
+          <table class="srx-table"><thead>{thead}</thead><tbody>{''.join(trs)}</tbody></table>
+          <div style="color:#3a4658;font-size:0.65rem;margin-top:0.5rem;">
+            Momentum = cumulative sector %Chg over trailing persisted scan days (under-states true N-day
+            momentum until {5 if rot['DaysOfHistory'].max() < 20 else 20}+ days of history accumulate — currently {int(rot['DaysOfHistory'].max())} day(s) saved).
+            Direction is based on 20D momentum trend.
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with right:
+        inflow_rows = "".join(f'<div class="srx-flow-row"><span>↑ {s}</span><span style="color:#00ff88;font-weight:700;">+{v:.0f} Cr</span></div>'
+                               for s, v in flow["inflow"]) or '<div style="color:#3a4658;font-size:0.72rem;">No data</div>'
+        outflow_rows = "".join(f'<div class="srx-flow-row"><span>↓ {s}</span><span style="color:#ff4d6d;font-weight:700;">{v:.0f} Cr</span></div>'
+                                for s, v in flow["outflow"]) or '<div style="color:#3a4658;font-size:0.72rem;">No data</div>'
+        st.markdown(f"""
+        <div class="srx-panel" style="margin-bottom:0.8rem;">
+          <div class="srx-panel-title">TODAY'S SECTOR FLOW <span style="color:#64748b;font-weight:400;">(Net Inflow)</span></div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.8rem;">
+            <div><div class="srx-flow-col-head" style="color:#00ff88;">TOP INFLOW SECTORS</div>{inflow_rows}</div>
+            <div><div class="srx-flow-col-head" style="color:#ff4d6d;">TOP OUTFLOW SECTORS</div>{outflow_rows}</div>
+          </div>
+          <div style="margin-top:0.6rem;font-size:0.72rem;color:#64748b;display:flex;justify-content:space-between;">
+            <span>Net Inflow (5D): <b style="color:{'#00ff88' if flow['net']>=0 else '#ff4d6d'};">{'+' if flow['net']>=0 else ''}{flow['net']:.0f} Cr</b></span>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if timeline:
+            dates = timeline["dates"]
+            head_cells = "".join(f'<div class="srx-timeline-head">{d}</div>' for d in dates)
+            body_rows = []
+            for rank_i in range(max(len(r) for r in timeline["ranks"])):
+                row_cells = []
+                for col_i, ranks in enumerate(timeline["ranks"]):
+                    if rank_i >= len(ranks):
+                        row_cells.append('<div></div>')
+                        continue
+                    sec = ranks[rank_i]
+                    prev_ranks = timeline["ranks"][col_i - 1] if col_i > 0 else None
+                    if prev_ranks is None or sec not in prev_ranks:
+                        arrow, acolor = "", "#94a3b8"
+                    else:
+                        prev_pos = prev_ranks.index(sec)
+                        if prev_pos > rank_i: arrow, acolor = "↑", "#00ff88"
+                        elif prev_pos < rank_i: arrow, acolor = "↓", "#ff4d6d"
+                        else: arrow, acolor = "—", "#64748b"
+                    row_cells.append(f'<div class="srx-timeline-cell" style="color:{acolor};">{sec} {arrow}</div>')
+                body_rows.append("".join(row_cells))
+            st.markdown(f"""
+            <div class="srx-panel">
+              <div class="srx-panel-title">SECTOR ROTATION TIMELINE <span style="color:#64748b;font-weight:400;">(Top {len(timeline['ranks'][0])} Sectors)</span></div>
+              <div class="srx-timeline-grid">{head_cells}</div>
+              <div class="srx-timeline-grid">{''.join(f'<div style="display:contents;">{row}</div>' for row in body_rows)}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div class="srx-panel">
+              <div class="srx-panel-title">SECTOR ROTATION TIMELINE</div>
+              <div style="color:#3a4658;font-size:0.75rem;">Needs 2+ days of saved scans to show — accumulating history.</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    # ── top 3 focus cards ──
+    top3 = rot.sort_values("RotationStrength", ascending=False).head(3).reset_index(drop=True)
+    rank_colors = ["#00ff88", "#f59e0b", "#60a5fa"]
+    cards = []
+    for i, r in top3.iterrows():
+        icon = _SRX_SECTOR_ICON.get(r["Sector"], "🏷️")
+        cards.append(f"""
+        <div class="srx-focus-card">
+          <span class="srx-focus-rank" style="background:{rank_colors[i]};">{i+1}</span> {icon}
+          <div class="srx-focus-name">{r['Sector']}</div>
+          <div class="srx-focus-lbl">Rotation Strength (Composite)</div>
+          <div class="srx-focus-score" style="color:{rank_colors[i]};">{r['RotationStrength']:.0f}<span style="font-size:0.8rem;color:#64748b;">/100</span></div>
+          <div class="srx-focus-lbl">Suggested Action</div>
+          {_srx_action_badge(r['SuggestedAction'])}
+        </div>
+        """)
+    st.markdown(f"""
+    <div class="srx-panel-title" style="margin-top:1.1rem;">TOP SECTORS TO FOCUS TODAY</div>
+    <div class="srx-focus-grid">{''.join(cards)}</div>
+    """, unsafe_allow_html=True)
+
+    # ── how it's calculated ──
+    st.markdown("""
+    <div class="srx-panel" style="margin-top:1rem;">
+      <div class="srx-panel-title">ℹ️ HOW SECTOR ROTATION IS CALCULATED</div>
+      <div class="srx-calc-grid">
+        <div class="srx-calc-item"><div class="srx-calc-icon">📈</div>Leadership Momentum<br/>Improving vs 20D ago</div>
+        <div class="srx-calc-item"><div class="srx-calc-icon">📋</div>Opportunity-Score Momentum<br/>Improving vs 20D ago</div>
+        <div class="srx-calc-item"><div class="srx-calc-icon">🆕</div>New Opportunities<br/>Increase in actionable setups</div>
+        <div class="srx-calc-item"><div class="srx-calc-icon">💰</div>Money Flow (proxy)<br/>5D Net Inflow/Outflow</div>
+        <div class="srx-calc-item"><div class="srx-calc-icon">📊</div>20D Momentum<br/>Cumulative sector %Chg</div>
+      </div>
+    </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
 # ── SECTOR OPPORTUNITY BOARD PANEL ────────────────────────────────────
 # ── SECTOR OPPORTUNITY BOARD PANEL ────────────────────────────────────
 
@@ -3273,15 +3529,10 @@ def render(settings: dict | None = None):
     #    utils.dore_fo_screener docstring. ─────────────────────────────
     _fo_opportunities_panel()
 
-    # ── Top Gainers | Sector Heatmap | Leadership Rotation ────────────
+    # ── Top Gainers | Sector Rotation Analysis ─────────────────────────
     sector_stats = build_sector_stats(df_aug)
-    row2_a, row2_b, row2_c = st.columns([1.3, 1.8, 1.5])
-    with row2_a:
-        st.markdown(_top_gainers_panel(df_aug), unsafe_allow_html=True)
-    with row2_b:
-        st.markdown(_sector_opportunity_board_panel(sector_stats), unsafe_allow_html=True)
-    with row2_c:
-        # See _leadership_rotation_panel docstring — no real day-over-day
-        # rotation_metrics feed exists yet, so None triggers its documented
-        # single-scan fallback (AvgChg as momentum, NetInflowCr as inflow).
-        st.markdown(_leadership_rotation_panel(sector_stats, None), unsafe_allow_html=True)
+    st.markdown(_top_gainers_panel(df_aug), unsafe_allow_html=True)
+
+    from utils.supabase_client import load_sector_snapshot_history
+    _sector_history = load_sector_snapshot_history(days=45)
+    _render_sector_rotation_analysis(df_aug, sector_stats, _sector_history, scan_time=scan_time)
