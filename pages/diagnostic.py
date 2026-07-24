@@ -38,15 +38,7 @@ from utils.backtest_engine import (
     simulate_trades,
 )
 
-try:
-    from zoneinfo import ZoneInfo
-    _IST = ZoneInfo("Asia/Kolkata")
-except ImportError:
-    import pytz
-    _IST = pytz.timezone("Asia/Kolkata")
-
-def _now_ist():
-    return datetime.now(_IST)
+from utils.time_utils import now_ist as _now_ist, IST as _IST
 
 # ── Default symbol set (diverse stride across Nifty 500) ─────────────────────
 _ALL_SYMS = list(NIFTY500_SYMBOLS)
