@@ -107,18 +107,29 @@ DEFAULTS = {
     "v3_watch_conviction_min":      50,
     "v3_watch_entry_quality_min":   50,
     "v3_watch_composite_min":       50,
-    "v3_developing_composite_min":  55,
-    "v3_actionable_leadership_min": 60,
-    "v3_actionable_conviction_min": 70,
-    "v3_actionable_composite_min":  60,
-    "v3_execute_leadership_min":    60,
-    "v3_execute_conviction_min":    70,
-    "v3_execute_entry_quality_min": 50,
-    "v3_execute_composite_min":     60,
-    "v3_elite_leadership_min":      70,
-    "v3_elite_conviction_min":      70,
-    "v3_elite_entry_quality_min":   60,
-    "v3_elite_composite_min":       66,
+    # ── Developing — previously composite-only; now has its own
+    # Leadership/Conviction/Entry Quality floors (2026-07 revision), same
+    # AND-gated pattern as Actionable/Execute/Elite. See classify_tier_v3()
+    # in utils/conviction_score_v1.py.
+    "v3_developing_leadership_min":    70,
+    "v3_developing_conviction_min":    55,
+    "v3_developing_entry_quality_min": 80,
+    "v3_developing_composite_min":     55,
+    "v3_actionable_leadership_min":    70,
+    "v3_actionable_conviction_min":    60,
+    # Was 36 (module-default only, not previously mirrored here — this
+    # key was missing from Settings entirely, so the UI never actually
+    # controlled it). Now 80 per 2026-07 revision.
+    "v3_actionable_entry_quality_min": 80,
+    "v3_actionable_composite_min":     60,
+    "v3_execute_leadership_min":       80,
+    "v3_execute_conviction_min":       70,
+    "v3_execute_entry_quality_min":    80,
+    "v3_execute_composite_min":        60,
+    "v3_elite_leadership_min":         85,
+    "v3_elite_conviction_min":         75,
+    "v3_elite_entry_quality_min":      85,
+    "v3_elite_composite_min":          66,
     # ── Promotion Engine (utils/promotion_engine.py) — Promo Score and
     # R:R thresholds are all plain overrides, freely adjustable either
     # direction (see evaluate_promotion docstring) ──
@@ -639,35 +650,44 @@ def _tab_advanced() -> None:
         st.markdown(
             "<small style='color:#8b949e'>These are PLACEHOLDER THRESHOLDS "
             "(utils/conviction_score_v1.py) — proportionally scaled, not yet "
-            "re-validated against a real v3 score distribution. Adjust here "
-            "without a code change; re-run the backtest to see the effect.</small>",
+            "re-validated against a real v3 score distribution. Edit any cell "
+            "below; changes apply on next Run Scan or Backtest.</small>",
             unsafe_allow_html=True,
         )
 
-        # ── Simple view: the composite bar per tier is what actually
-        # separates most setups day-to-day. Leadership/Conviction/Entry
-        # Quality sub-floors and the Watch/Developing floors rarely need
-        # touching, so they're tucked behind the toggle below instead of
-        # always taking up screen space.
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("**Actionable** (base funnel floor)")
-            _label("Composite ≥")
-            v = st.slider("Actionable Composite", 0, 100, int(_g("v3_actionable_composite_min")),
-                step=5, key="sl_v3_act_comp", label_visibility="collapsed")
-            _s("v3_actionable_composite_min", int(v))
-        with c2:
-            st.markdown("**Execute** (natural score)")
-            _label("Composite ≥")
-            v = st.slider("Execute Composite", 0, 100, int(_g("v3_execute_composite_min")),
-                step=5, key="sl_v3_exec_comp", label_visibility="collapsed")
-            _s("v3_execute_composite_min", int(v))
-        with c3:
-            st.markdown("**Elite** (natural score)")
-            _label("Composite ≥")
-            v = st.slider("Elite Composite", 0, 100, int(_g("v3_elite_composite_min")),
-                step=5, key="sl_v3_elite_comp", label_visibility="collapsed")
-            _s("v3_elite_composite_min", int(v))
+        # ── Tier floor table — strict AND across all four columns per row
+        # (see classify_tier_v3() / _classify_v3() in utils/conviction_score_v1.py).
+        # Replaces the old slider-per-field layout with a single editable
+        # grid so all four tiers are visible and editable at once.
+        st.markdown("**Tier floors** (Leadership / Conviction / Entry Quality / Composite — AND-gated per row)")
+
+        _V3_TIER_ROWS = ["Elite", "Execute", "Actionable", "Developing"]
+        _V3_TIER_KEY  = {"Elite": "elite", "Execute": "execute",
+                         "Actionable": "actionable", "Developing": "developing"}
+        _v3_tier_df = pd.DataFrame(
+            {
+                "Leadership":    [int(_g(f"v3_{_V3_TIER_KEY[r]}_leadership_min"))    for r in _V3_TIER_ROWS],
+                "Conviction":    [int(_g(f"v3_{_V3_TIER_KEY[r]}_conviction_min"))    for r in _V3_TIER_ROWS],
+                "Entry Quality": [int(_g(f"v3_{_V3_TIER_KEY[r]}_entry_quality_min")) for r in _V3_TIER_ROWS],
+                "Composite":     [int(_g(f"v3_{_V3_TIER_KEY[r]}_composite_min"))     for r in _V3_TIER_ROWS],
+            },
+            index=_V3_TIER_ROWS,
+        )
+        _v3_edited = st.data_editor(
+            _v3_tier_df,
+            key="de_v3_tier_floors",
+            width='stretch',
+            column_config={
+                col: st.column_config.NumberColumn(col, min_value=0, max_value=100, step=1)
+                for col in _v3_tier_df.columns
+            },
+        )
+        for _r in _V3_TIER_ROWS:
+            _tk = _V3_TIER_KEY[_r]
+            _s(f"v3_{_tk}_leadership_min",    int(_v3_edited.loc[_r, "Leadership"]))
+            _s(f"v3_{_tk}_conviction_min",    int(_v3_edited.loc[_r, "Conviction"]))
+            _s(f"v3_{_tk}_entry_quality_min", int(_v3_edited.loc[_r, "Entry Quality"]))
+            _s(f"v3_{_tk}_composite_min",     int(_v3_edited.loc[_r, "Composite"]))
 
         _divider()
         st.markdown(
@@ -692,80 +712,27 @@ def _tab_advanced() -> None:
                 step=0.1, key="sl_promo_elite_rr", label_visibility="collapsed")
             _s("promo_min_rr_elite", float(v))
 
-        # ── Advanced view: individual Leadership/Conviction/Entry Quality
-        # floors per tier, plus the Watch/Developing base-funnel floors.
-        # Off by default — composite alone is usually enough.
+        # ── Watch — the one tier not in the table above (no Composite
+        # column shown; base-funnel entry point). Left as plain, always-
+        # visible number inputs since it's just three values.
         _divider()
-        show_advanced = st.toggle(
-            "Show individual factor floors (Leadership / Conviction / Entry Quality, Watch / Developing)",
-            value=st.session_state.get("v3_show_advanced_thresholds", False),
-            key="v3_show_advanced_thresholds",
-        )
-        if show_advanced:
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.markdown("**Actionable**")
-                _label("Leadership ≥")
-                v = st.slider("Actionable Leadership", 0, 100, int(_g("v3_actionable_leadership_min")),
-                    step=5, key="sl_v3_act_ls", label_visibility="collapsed")
-                _s("v3_actionable_leadership_min", int(v))
-                _label("Conviction ≥")
-                v = st.slider("Actionable Conviction", 0, 100, int(_g("v3_actionable_conviction_min")),
-                    step=5, key="sl_v3_act_cv", label_visibility="collapsed")
-                _s("v3_actionable_conviction_min", int(v))
-
-            with c2:
-                st.markdown("**Execute**")
-                _label("Leadership ≥")
-                v = st.slider("Execute Leadership", 0, 100, int(_g("v3_execute_leadership_min")),
-                    step=5, key="sl_v3_exec_ls", label_visibility="collapsed")
-                _s("v3_execute_leadership_min", int(v))
-                _label("Conviction ≥")
-                v = st.slider("Execute Conviction", 0, 100, int(_g("v3_execute_conviction_min")),
-                    step=5, key="sl_v3_exec_cv", label_visibility="collapsed")
-                _s("v3_execute_conviction_min", int(v))
-                _label("Entry Quality ≥")
-                v = st.slider("Execute Entry Quality", 0, 100, int(_g("v3_execute_entry_quality_min")),
-                    step=5, key="sl_v3_exec_eq", label_visibility="collapsed")
-                _s("v3_execute_entry_quality_min", int(v))
-
-            with c3:
-                st.markdown("**Elite**")
-                _label("Leadership ≥")
-                v = st.slider("Elite Leadership", 0, 100, int(_g("v3_elite_leadership_min")),
-                    step=5, key="sl_v3_elite_ls", label_visibility="collapsed")
-                _s("v3_elite_leadership_min", int(v))
-                _label("Conviction ≥")
-                v = st.slider("Elite Conviction", 0, 100, int(_g("v3_elite_conviction_min")),
-                    step=5, key="sl_v3_elite_cv", label_visibility="collapsed")
-                _s("v3_elite_conviction_min", int(v))
-                _label("Entry Quality ≥")
-                v = st.slider("Elite Entry Quality", 0, 100, int(_g("v3_elite_entry_quality_min")),
-                    step=5, key="sl_v3_elite_eq", label_visibility="collapsed")
-                _s("v3_elite_entry_quality_min", int(v))
-
-            st.markdown("**Watch floors** (base funnel — strict AND across all three, per decile backtest)")
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                _label("Watch: Leadership ≥")
-                v = st.slider("Watch Leadership", 0, 100, int(_g("v3_watch_leadership_min")),
-                    step=5, key="sl_v3_watch_ls", label_visibility="collapsed")
-                _s("v3_watch_leadership_min", int(v))
-            with c2:
-                _label("Watch: Conviction ≥")
-                v = st.slider("Watch Conviction", 0, 100, int(_g("v3_watch_conviction_min")),
-                    step=5, key="sl_v3_watch_cv", label_visibility="collapsed")
-                _s("v3_watch_conviction_min", int(v))
-            with c3:
-                _label("Watch: Entry Quality ≥")
-                v = st.slider("Watch Entry Quality", 0, 100, int(_g("v3_watch_entry_quality_min")),
-                    step=5, key="sl_v3_watch_eq", label_visibility="collapsed")
-                _s("v3_watch_entry_quality_min", int(v))
-            with c4:
-                _label("Developing: Composite ≥")
-                v = st.slider("Developing Composite", 0, 100, int(_g("v3_developing_composite_min")),
-                    step=5, key="sl_v3_dev_comp", label_visibility="collapsed")
-                _s("v3_developing_composite_min", int(v))
+        st.markdown("**Watch floor** (base funnel — strict AND across all three, per decile backtest)")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            _label("Watch: Leadership ≥")
+            v = st.number_input("Watch Leadership", 0, 100, int(_g("v3_watch_leadership_min")),
+                step=5, key="ni_v3_watch_ls", label_visibility="collapsed")
+            _s("v3_watch_leadership_min", int(v))
+        with c2:
+            _label("Watch: Conviction ≥")
+            v = st.number_input("Watch Conviction", 0, 100, int(_g("v3_watch_conviction_min")),
+                step=5, key="ni_v3_watch_cv", label_visibility="collapsed")
+            _s("v3_watch_conviction_min", int(v))
+        with c3:
+            _label("Watch: Entry Quality ≥")
+            v = st.number_input("Watch Entry Quality", 0, 100, int(_g("v3_watch_entry_quality_min")),
+                step=5, key="ni_v3_watch_eq", label_visibility="collapsed")
+            _s("v3_watch_entry_quality_min", int(v))
 
     # ── Institutional Continuation (VWAP Reclaim) ────────────────
     with st.expander("Institutional Continuation", expanded=False):
@@ -1187,9 +1154,13 @@ def render() -> dict:
         "v3_watch_conviction_min":      ss.get("v3_watch_conviction_min",      DEFAULTS["v3_watch_conviction_min"]),
         "v3_watch_entry_quality_min":   ss.get("v3_watch_entry_quality_min",   DEFAULTS["v3_watch_entry_quality_min"]),
         "v3_watch_composite_min":       ss.get("v3_watch_composite_min",       DEFAULTS["v3_watch_composite_min"]),
+        "v3_developing_leadership_min":    ss.get("v3_developing_leadership_min",    DEFAULTS["v3_developing_leadership_min"]),
+        "v3_developing_conviction_min":    ss.get("v3_developing_conviction_min",    DEFAULTS["v3_developing_conviction_min"]),
+        "v3_developing_entry_quality_min": ss.get("v3_developing_entry_quality_min", DEFAULTS["v3_developing_entry_quality_min"]),
         "v3_developing_composite_min":  ss.get("v3_developing_composite_min",  DEFAULTS["v3_developing_composite_min"]),
         "v3_actionable_leadership_min": ss.get("v3_actionable_leadership_min", DEFAULTS["v3_actionable_leadership_min"]),
         "v3_actionable_conviction_min": ss.get("v3_actionable_conviction_min", DEFAULTS["v3_actionable_conviction_min"]),
+        "v3_actionable_entry_quality_min": ss.get("v3_actionable_entry_quality_min", DEFAULTS["v3_actionable_entry_quality_min"]),
         "v3_actionable_composite_min":  ss.get("v3_actionable_composite_min",  DEFAULTS["v3_actionable_composite_min"]),
         "v3_execute_leadership_min":    ss.get("v3_execute_leadership_min",    DEFAULTS["v3_execute_leadership_min"]),
         "v3_execute_conviction_min":    ss.get("v3_execute_conviction_min",    DEFAULTS["v3_execute_conviction_min"]),
