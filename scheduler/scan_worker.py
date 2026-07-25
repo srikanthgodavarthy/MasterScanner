@@ -202,8 +202,17 @@ def _fo_scan_payload(raw: dict):
 # via _run_live_scanner_loop on its own dedicated thread (see main()
 # and utils/inprocess_scheduler.py).
 JOBS = [
-    ("market_intelligence", "market_intelligence", 30, _market_intelligence_compute, _market_intelligence_payload),
-    ("fo_scan",             "fo_scan",             60, _fo_scan_compute,             _fo_scan_payload),
+    # [2026-07-25 ops fix] Was 30s. _market_intelligence_compute() does
+    # 3-4 full index OHLCV/OI fetches (Nifty/Sensex/BankNifty + options
+    # OI) plus 3 DORE computations every single call — real network +
+    # CPU work, not just re-processing the live_scanner snapshot. 30s
+    # was far more frequent than any of that data actually changes;
+    # combined with adding @st.cache_data(ttl=60) to the previously-
+    # uncached fetch_nifty()/fetch_sensex_ohlcv()/fetch_banknifty_ohlcv()
+    # (utils/scanner_engine.py), 180s keeps this comfortably fresh while
+    # cutting sustained CPU/network load roughly 6x.
+    ("market_intelligence", "market_intelligence", 180, _market_intelligence_compute, _market_intelligence_payload),
+    ("fo_scan",             "fo_scan",             60,  _fo_scan_compute,             _fo_scan_payload),
 ]
 
 
