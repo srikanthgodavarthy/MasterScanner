@@ -299,18 +299,36 @@ CREATE INDEX IF NOT EXISTS idx_fo_snap_version ON fo_scan_snapshots(version DESC
 -- helper (utils.scan_state.prune_all_snapshots()) rather than three
 -- independent DELETE statements someone has to remember to keep in
 -- sync.
+-- [Ops fix, 2026-07-25] Extended to also cover scan_snapshots and
+-- scan_full_snapshots (utils/supabase_client.py) — a second, older
+-- pair of insert-only tables discovered while auditing every Supabase
+-- write path; they had NO retention at all until now (they predate
+-- this fix and live in a different module, so the original H1 pass
+-- never touched them). Those two order by `run_at`, not `version`, so
+-- the correct ordering column is picked per-table internally (a CASE,
+-- not a caller-supplied column name) rather than trusting the caller —
+-- same whitelist-as-defense-in-depth principle as the table name check.
 CREATE OR REPLACE FUNCTION prune_snapshot_table(p_table text, p_keep int DEFAULT 500)
 RETURNS int AS $$
 DECLARE
     n_deleted int;
+    order_col text;
 BEGIN
-    IF p_table NOT IN ('market_intelligence_snapshots', 'live_scanner_snapshots', 'fo_scan_snapshots') THEN
+    order_col := CASE p_table
+        WHEN 'market_intelligence_snapshots' THEN 'version'
+        WHEN 'live_scanner_snapshots'        THEN 'version'
+        WHEN 'fo_scan_snapshots'             THEN 'version'
+        WHEN 'scan_snapshots'                THEN 'run_at'
+        WHEN 'scan_full_snapshots'           THEN 'run_at'
+        ELSE NULL
+    END;
+    IF order_col IS NULL THEN
         RAISE EXCEPTION 'prune_snapshot_table: % is not an allowed snapshot table', p_table;
     END IF;
 
     EXECUTE format(
-        'DELETE FROM %I WHERE id NOT IN (SELECT id FROM %I ORDER BY version DESC LIMIT $1)',
-        p_table, p_table
+        'DELETE FROM %I WHERE id NOT IN (SELECT id FROM %I ORDER BY %I DESC LIMIT $1)',
+        p_table, p_table, order_col
     ) USING p_keep;
 
     GET DIAGNOSTICS n_deleted = ROW_COUNT;

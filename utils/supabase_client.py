@@ -228,6 +228,69 @@ def load_latest_full_scan() -> tuple[pd.DataFrame, str]:
         return pd.DataFrame(), ""
 
 
+# ─── RETENTION [Ops fix, 2026-07-25] ────────────────────────────────────
+# scan_snapshots and scan_full_snapshots are both insert-only and, until
+# this fix, had NO cleanup at all — discovered while auditing every
+# Supabase write path in the app (they predate, and live in a separate
+# module from, utils/scan_state.py's snapshot-retention fix, which never
+# touched these two). Both now prune via the same prune_snapshot_table()
+# RPC utils/scan_state.py's tables already use (extended there to
+# support run_at-ordered tables, not just version-ordered ones).
+#
+# scan_snapshots keeps far MORE rows than the other snapshot tables'
+# defaults (500) — it stores ~50 rows per scan (top-50 subset), and
+# load_scan_history(limit=50), called from pages/scanner.py, needs up to
+# 50 scans' worth (2,500 rows) of history for its streak calculation.
+# Pruning to the generic 500-row default would have silently broken that
+# feature by discarding history it still actively reads. 5,000 gives
+# ~100 scans of headroom above what's actually consumed today.
+#
+# scan_full_snapshots is one row per full scan (same shape as the other
+# snapshot tables) and only ever read as a single latest row
+# (load_latest_full_scan()'s `.limit(1)`) or for occasional history/
+# debugging per its own schema comment — the standard 500-row default
+# is already generous for that.
+_SCAN_SNAPSHOTS_KEEP_ROWS = 5000
+_SCAN_FULL_SNAPSHOTS_KEEP_ROWS = 500
+
+
+def prune_legacy_scan_snapshots() -> dict:
+    """
+    Prunes scan_snapshots and scan_full_snapshots down to their
+    respective retention windows (see module comment above for why
+    their keep-counts differ). Called periodically by
+    scheduler/scan_worker.py's _run_retention_loop(), alongside
+    utils.scan_state.prune_all_snapshots() for the newer three tables.
+    Returns {table_name: n_deleted_or_None}; None means the prune
+    failed (logged, non-fatal — same fail-soft convention as
+    utils.scan_state.prune_old_snapshots()).
+    """
+    client = get_client()
+    if client is None:
+        return {"scan_snapshots": None, "scan_full_snapshots": None}
+
+    results = {}
+    for table, keep in (
+        ("scan_snapshots", _SCAN_SNAPSHOTS_KEEP_ROWS),
+        ("scan_full_snapshots", _SCAN_FULL_SNAPSHOTS_KEEP_ROWS),
+    ):
+        try:
+            resp = client.rpc("prune_snapshot_table", {"p_table": table, "p_keep": keep}).execute()
+            n = resp.data
+            if n:
+                logger.info("prune_legacy_scan_snapshots(%s): deleted %s row(s), keeping latest %s",
+                            table, n, keep)
+            results[table] = n
+        except Exception as exc:
+            from utils.system_state import _is_missing_function_error, _log_migration_required_once
+            if _is_missing_function_error(exc):
+                _log_migration_required_once("prune_snapshot_table", "prune_snapshot_table")
+            else:
+                logger.exception("prune_legacy_scan_snapshots(%s) failed (non-fatal — will retry next cycle)", table)
+            results[table] = None
+    return results
+
+
 # ─── WATCHLIST ────────────────────────────────────────────────────────────────
 
 def load_watchlist() -> list[dict]:
@@ -587,74 +650,6 @@ def load_lifecycle_history(symbol: str, limit_days: int = 90) -> pd.DataFrame:
         return pd.DataFrame(resp.data)
     except Exception as exc:
         logger.error("load_lifecycle_history failed: %s", exc)
-        return pd.DataFrame()
-
-
-# ─── SECTOR SNAPSHOTS ──────────────────────────────────────────────────────
-
-def save_sector_snapshot(rows: list[dict]) -> bool:
-    """
-    Persist a batch of per-sector daily aggregates to sector_snapshots.
-    Each dict: sector, scan_date, avg_chg, avg_leadership, opp_score,
-    elite_count, execute_count, watch_count, actionable_count, stock_count,
-    net_inflow_cr. Upserts on (sector, scan_date) — re-running a scan the
-    same day updates rather than duplicates. See utils/sector_rotation.py
-    for how build_sector_snapshot_rows() builds these from df_aug.
-    """
-    client = get_client()
-    if client is None or not rows:
-        return False
-
-    def _safe(v):
-        if v is None:
-            return None
-        if isinstance(v, float) and (v != v):
-            return None
-        if isinstance(v, (pd.Timestamp, datetime)):
-            return v.isoformat()
-        return v
-
-    clean = [{k: _safe(v) for k, v in r.items()} for r in rows]
-
-    try:
-        resp = (
-            client.table("sector_snapshots")
-            .upsert(clean, on_conflict="sector,scan_date")
-            .execute()
-        )
-        return resp.data is not None
-    except Exception as exc:
-        logger.error("save_sector_snapshot failed: %s", exc)
-        return False
-
-
-def load_sector_snapshot_history(days: int = 30) -> pd.DataFrame:
-    """
-    Return all sector_snapshots rows over the trailing ``days`` calendar
-    days, ordered by scan_date ascending — the raw feed
-    utils.sector_rotation.compute_rotation_metrics() and
-    compute_rotation_timeline() aggregate into momentum/direction/timeline.
-    """
-    client = get_client()
-    if client is None:
-        return pd.DataFrame()
-
-    from datetime import timezone, timedelta
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
-
-    try:
-        resp = (
-            client.table("sector_snapshots")
-            .select("*")
-            .gte("scan_date", cutoff)
-            .order("scan_date", desc=False)
-            .execute()
-        )
-        if not resp.data:
-            return pd.DataFrame()
-        return pd.DataFrame(resp.data)
-    except Exception as exc:
-        logger.error("load_sector_snapshot_history failed: %s", exc)
         return pd.DataFrame()
 
 
@@ -1356,31 +1351,6 @@ CREATE TABLE IF NOT EXISTS lifecycle_transitions (
 );
 CREATE INDEX IF NOT EXISTS idx_lifecycle_transitions_symbol  ON lifecycle_transitions(symbol);
 CREATE INDEX IF NOT EXISTS idx_lifecycle_transitions_to_date ON lifecycle_transitions(to_date DESC);
-
--- 6b. Sector snapshots — one row per sector per scan_date, aggregated from
---     the full scan (df_aug). Powers Sector Rotation Analysis (5D/20D
---     momentum, rotation timeline, net sector inflow). See
---     utils/sector_rotation.py for how these roll up into momentum/
---     direction/suggested-action; all "money flow" figures here remain the
---     same vol_ratio-weighted PROXY documented in utils/sector_map.py,
---     not real traded value.
-CREATE TABLE IF NOT EXISTS sector_snapshots (
-    id               bigserial PRIMARY KEY,
-    sector           text        NOT NULL,
-    scan_date        date        NOT NULL,
-    avg_chg          numeric(8,4) NOT NULL DEFAULT 0,
-    avg_leadership   numeric(8,4),
-    opp_score        numeric(6,2),
-    elite_count      integer     NOT NULL DEFAULT 0,
-    execute_count    integer     NOT NULL DEFAULT 0,
-    watch_count      integer     NOT NULL DEFAULT 0,
-    actionable_count integer     NOT NULL DEFAULT 0,
-    stock_count      integer     NOT NULL DEFAULT 0,
-    net_inflow_cr    numeric(10,2) NOT NULL DEFAULT 0,
-    UNIQUE (sector, scan_date)
-);
-CREATE INDEX IF NOT EXISTS idx_sector_snapshots_date   ON sector_snapshots(scan_date DESC);
-CREATE INDEX IF NOT EXISTS idx_sector_snapshots_sector ON sector_snapshots(sector);
 """
 
 
