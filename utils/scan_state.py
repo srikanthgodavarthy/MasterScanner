@@ -224,8 +224,12 @@ def prune_old_snapshots(section: str, keep: int = RETENTION_KEEP_ROWS) -> Option
         if n:
             logger.info("prune_old_snapshots(%s): deleted %s row(s), keeping latest %s", section, n, keep)
         return n
-    except Exception:
-        logger.exception("prune_old_snapshots(%s) failed (non-fatal — will retry next cycle)", section)
+    except Exception as exc:
+        from utils.system_state import _is_missing_function_error, _log_migration_required_once
+        if _is_missing_function_error(exc):
+            _log_migration_required_once("prune_snapshot_table", "prune_snapshot_table")
+        else:
+            logger.exception("prune_old_snapshots(%s) failed (non-fatal — will retry next cycle)", section)
         return None
 
 

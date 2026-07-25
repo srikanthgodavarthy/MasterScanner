@@ -199,6 +199,47 @@ def make_scheduler_owner_id() -> str:
     return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 
+# [Ops fix, 2026-07-25] Every C3/H1 RPC (try_acquire_scheduler_lock,
+# renew_scheduler_heartbeat, release_scheduler_lock, and scan_state.py's
+# prune_snapshot_table) requires a one-time SQL migration in Supabase
+# (see each function's SCHEMA_SQL block) before it exists. Deployments
+# that skip that migration would otherwise get a full Python traceback
+# on EVERY heartbeat call (every ~20s) forever. _is_missing_function_error()
+# lets each call site detect that specific failure mode and log ONE loud,
+# actionable message instead of spamming tracebacks — the underlying
+# behavior (fail open / skip this cycle) is unchanged either way.
+_MIGRATION_WARNING_LOGGED: set[str] = set()
+
+
+def _is_missing_function_error(exc: Exception) -> bool:
+    """True if `exc` looks like PostgREST's 'function does not exist'
+    error (PGRST202 / Postgres 42883) — i.e. the required migration
+    hasn't been applied yet, as opposed to a transient network/DB
+    issue. String-matched rather than exception-type-matched since the
+    supabase-py client re-raises these as a generic APIError with the
+    detail only in the message payload."""
+    msg = str(exc)
+    return "PGRST202" in msg or "42883" in msg or "Could not find the function" in msg
+
+
+def _log_migration_required_once(rpc_name: str, key: str) -> None:
+    if key in _MIGRATION_WARNING_LOGGED:
+        return
+    _MIGRATION_WARNING_LOGGED.add(key)
+    logger.error(
+        "=" * 70 + "\n"
+        "MIGRATION REQUIRED: the '%s' Postgres function does not exist yet.\n"
+        "This is expected on a fresh deployment of the 2026-07-25 scheduler-\n"
+        "ownership-lock / snapshot-retention fix (Architecture review C3/H1) —\n"
+        "run the SQL in utils/system_state.py's SCHEMA_SQL (scheduler lock\n"
+        "functions) and utils/scan_state.py's SCHEMA_SQL (prune_snapshot_table)\n"
+        "once in the Supabase SQL Editor. Behavior is unaffected in the\n"
+        "meantime (this fails open / skips its cycle, same as any other\n"
+        "transient RPC failure) — this message will not repeat.\n" + "=" * 70,
+        rpc_name,
+    )
+
+
 def _client():
     # Local import — same rationale as utils/scan_state.py: this module
     # is imported by the standalone scheduler process too, which never
@@ -466,9 +507,12 @@ def try_acquire_scheduler_lock(owner_id: str) -> bool:
         if acquired:
             logger.info("[system_state] scheduler ownership lock acquired (owner=%s)", owner_id)
         return acquired
-    except Exception:
-        logger.exception("try_acquire_scheduler_lock RPC failed — failing OPEN "
-                          "(assuming ownership) for owner=%s", owner_id)
+    except Exception as exc:
+        if _is_missing_function_error(exc):
+            _log_migration_required_once("try_acquire_scheduler_lock", "try_acquire_scheduler_lock")
+        else:
+            logger.exception("try_acquire_scheduler_lock RPC failed — failing OPEN "
+                              "(assuming ownership) for owner=%s", owner_id)
         return True
 
 
@@ -520,9 +564,12 @@ def renew_scheduler_heartbeat(owner_id: str) -> bool:
     try:
         resp = client.rpc("renew_scheduler_heartbeat", {"p_owner": owner_id}).execute()
         return bool(resp.data)
-    except Exception:
-        logger.exception("renew_scheduler_heartbeat RPC failed (owner=%s) — "
-                          "failing OPEN (assuming ownership still held)", owner_id)
+    except Exception as exc:
+        if _is_missing_function_error(exc):
+            _log_migration_required_once("renew_scheduler_heartbeat", "renew_scheduler_heartbeat")
+        else:
+            logger.exception("renew_scheduler_heartbeat RPC failed (owner=%s) — "
+                              "failing OPEN (assuming ownership still held)", owner_id)
         return True
 
 
@@ -537,9 +584,12 @@ def release_scheduler_lock(owner_id: str) -> None:
     try:
         client.rpc("release_scheduler_lock", {"p_owner": owner_id}).execute()
         logger.info("[system_state] scheduler ownership lock released (owner=%s)", owner_id)
-    except Exception:
-        logger.exception("release_scheduler_lock RPC failed (owner=%s) — non-fatal, "
-                          "lock will go stale naturally", owner_id)
+    except Exception as exc:
+        if _is_missing_function_error(exc):
+            _log_migration_required_once("release_scheduler_lock", "release_scheduler_lock")
+        else:
+            logger.exception("release_scheduler_lock RPC failed (owner=%s) — non-fatal, "
+                              "lock will go stale naturally", owner_id)
 
 
 class SchedulerHeartbeatThread(threading.Thread):
