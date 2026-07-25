@@ -3215,12 +3215,54 @@ def render(settings: dict | None = None):
         except Exception:
             scan_time = ""
 
+    # [Architecture review C4 Step 1 fix, 2026-07-25] Live Scanner
+    # staleness visibility. On a Streamlit-only deployment (no separate
+    # `scheduler/scan_worker.py` process), utils.inprocess_scheduler
+    # deliberately does NOT run live_scanner in the background (see its
+    # module docstring) — it only runs via this page's manual "Run Scan"
+    # button. Without an explicit signal, the Dashboard could silently
+    # keep showing data that's hours old with nothing distinguishing it
+    # from a genuinely fresh scan. This computes the age of the scan
+    # already loaded above (no extra Supabase call) and surfaces it
+    # plainly once it crosses a threshold, rather than leaving staleness
+    # implicit in a timestamp someone has to notice and do the math on.
+    _LIVE_SCANNER_STALE_WARN_MINS  = 15   # badge appears
+    _LIVE_SCANNER_STALE_ALERT_MINS = 60   # full warning banner appears
+    scan_age_mins = None
+    if run_at:
+        try:
+            _run_dt = pd.to_datetime(run_at)
+            _run_dt = _run_dt.tz_localize("UTC") if _run_dt.tzinfo is None else _run_dt.tz_convert("UTC")
+            scan_age_mins = (pd.Timestamp.now(tz="UTC") - _run_dt).total_seconds() / 60.0
+        except Exception:
+            scan_age_mins = None
+
+    if scan_age_mins is not None and scan_age_mins >= _LIVE_SCANNER_STALE_ALERT_MINS:
+        _age_txt = f"{scan_age_mins / 60:.1f}h" if scan_age_mins >= 90 else f"{scan_age_mins:.0f}m"
+        st.warning(
+            f"🕒 The Live Scanner hasn't run in **{_age_txt}**. Everything below "
+            f"(scan results, recommendations, and any dependent panels) is from "
+            f"that stale scan, not the current market. Click **🔄 Refresh** to "
+            f"check for a newer completed scan, or run a fresh one on the "
+            f"Scanner page.",
+            icon="🕒",
+        )
+
     with ctrl2:
         if run_at:
+            _stale_badge = ""
+            if scan_age_mins is not None and scan_age_mins >= _LIVE_SCANNER_STALE_WARN_MINS:
+                _age_txt = f"{scan_age_mins / 60:.1f}h" if scan_age_mins >= 90 else f"{scan_age_mins:.0f}m"
+                _stale_badge = (
+                    f" &nbsp;·&nbsp; <span style='color:#d29922;font-weight:600;' "
+                    f"title='Live Scanner has not produced a newer completed scan in "
+                    f"over {_LIVE_SCANNER_STALE_WARN_MINS} minutes'>🕒 {_age_txt} old</span>"
+                )
             st.markdown(
                 f"<div style='padding:0.55rem 0;color:#8b949e;font-size:0.78rem;'>"
                 f"Showing latest completed scan · <b style='color:var(--text)'>{len(df_aug)}</b> symbols"
-                f" &nbsp;·&nbsp; {scan_time} IST &nbsp;·&nbsp; Source: <b style='color:var(--text)'>Scanner (Yahoo Finance)</b></div>",
+                f" &nbsp;·&nbsp; {scan_time} IST &nbsp;·&nbsp; Source: <b style='color:var(--text)'>Scanner (Yahoo Finance)</b>"
+                f"{_stale_badge}</div>",
                 unsafe_allow_html=True,
             )
         else:
