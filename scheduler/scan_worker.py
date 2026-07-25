@@ -116,7 +116,8 @@ LIVE_SCANNER_BATCH_COOLDOWN_SECS = 1.5   # brief pause between batches, just
                                      # worker cap above.
 
 
-def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payload):
+def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payload,
+              owner_event: "threading.Event | None" = None):
     """
     Generic "compute on an interval, save a versioned snapshot" loop.
     Used by market_intelligence and fo_scan, whose single-call compute
@@ -127,12 +128,23 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
                           naturally produces)
     to_payload(raw)   -> JSON-safe dict + row_count, i.e. what actually
                           goes in the snapshot's `payload` column
+    owner_event       : [Architecture review C3 fix, 2026-07-25] optional
+                          threading.Event — SchedulerHeartbeatThread's
+                          `lost_ownership` event (utils/system_state.py).
+                          When set, this process has lost the scheduler
+                          ownership lock (another process reclaimed it)
+                          and this loop stops immediately rather than
+                          keep running alongside a second scanner.
     """
     from utils.scan_state import save_snapshot
     from utils.system_state import should_scheduler_run
 
     logger.info("[%s] loop starting, every %ss", name, interval_secs)
     while True:
+        if owner_event is not None and owner_event.is_set():
+            logger.error("[%s] scheduler ownership lock lost — stopping this loop", name)
+            return
+
         started = time.time()
 
         if not should_scheduler_run():
@@ -216,12 +228,55 @@ def _row_key(rec: dict):
     return rec.get("Stock") or rec.get("Symbol")
 
 
+# ── Retention — every hour ──────────────────────────────────────────
+# [Architecture review H1 fix, 2026-07-25] The only automated cleanup
+# in this codebase before this fix — none. See utils/scan_state.py's
+# "RETENTION" section for the full design.
+RETENTION_INTERVAL_SECS = 3600   # once an hour is plenty for a 500-row keep
+
+
+def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
+                         owner_event: "threading.Event | None" = None):
+    """
+    Periodically prunes all three snapshot tables down to their most
+    recent RETENTION_KEEP_ROWS rows. Deliberately does NOT check
+    should_scheduler_run() — pruning old rows is unrelated to (and much
+    cheaper than) the actual scan compute that function pauses for
+    during a backtest, so there's no reason to also pause this. DOES
+    respect owner_event / the scheduler ownership lock, same as every
+    other loop here — only the process that currently owns the
+    scheduler lock should be the one pruning, even though a redundant
+    prune from a second process wouldn't itself be harmful (it would
+    just be wasted work, same as any other duplicated job).
+    """
+    from utils.scan_state import prune_all_snapshots
+
+    logger.info("[retention] loop starting, every %ss", interval_secs)
+    while True:
+        if owner_event is not None and owner_event.is_set():
+            logger.error("[retention] scheduler ownership lock lost — stopping this loop")
+            return
+        try:
+            results = prune_all_snapshots()
+            logger.info("[retention] pruned snapshot tables: %s", results)
+        except Exception:
+            logger.exception("[retention] prune_all_snapshots failed (non-fatal — retrying next cycle)")
+        time.sleep(interval_secs)
+
+
 def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
-                            batch_size: int = LIVE_SCANNER_BATCH_SIZE):
+                            batch_size: int = LIVE_SCANNER_BATCH_SIZE,
+                            owner_event: "threading.Event | None" = None):
     """
     Live Scanner sub-scheduler. See module docstring ("Live Scanner: why
     a sub-scheduler") for the full rationale. Runs forever, one 5-minute
     cycle at a time; never raises out of the loop.
+
+    owner_event : [Architecture review C3 fix, 2026-07-25] see
+                  _run_loop()'s docstring — same semantics, checked both
+                  at the cycle boundary and between batches so a lost
+                  lock stops this loop within one batch, not one full
+                  5-minute cycle.
     """
     from utils.scan_state import save_snapshot, load_snapshot_payload
     from utils.live_scanner_job import compute_live_scan_batch, build_regime_context_for_cycle
@@ -240,6 +295,10 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
     merged: dict = {}   # symbol -> latest scored row dict, carried across cycles
 
     while True:
+        if owner_event is not None and owner_event.is_set():
+            logger.error("[live_scanner] scheduler ownership lock lost — stopping this loop")
+            return
+
         if not should_scheduler_run():
             logger.debug("[live_scanner] system_state is paused (backtest/maintenance) — skipping this cycle")
             time.sleep(5)
@@ -264,6 +323,11 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
         # sleep below) — so it scans once per interval, not continuously.
 
         for batch_i, chunk in enumerate(batches):
+            if owner_event is not None and owner_event.is_set():
+                logger.error("[live_scanner] scheduler ownership lock lost mid-cycle "
+                              "(batch %d/%d) — stopping this loop", batch_i + 1, n_batches)
+                return
+
             if not should_scheduler_run():
                 logger.info("[live_scanner] system_state paused mid-cycle (batch %d/%d) — "
                             "backing off rather than waiting out the rest of this cycle",
@@ -351,25 +415,74 @@ def main():
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    # [Architecture review C3 fix, 2026-07-25] Claim exclusive ownership
+    # of the scan loops before starting anything. Blocks (polling) if
+    # another process — a previous scan_worker.py instance, or
+    # utils.inprocess_scheduler running inside a Streamlit session
+    # against this same Supabase project — currently holds a fresh
+    # lock, and automatically takes over once that lock goes stale or
+    # is released cleanly. See utils/system_state.py's "Scheduler
+    # ownership" docstring section for the full design and why this
+    # exists (two unlocked producers writing every 30s/60s/5min doubles
+    # both Supabase write volume and actual scan compute).
+    from utils.system_state import (
+        make_scheduler_owner_id, acquire_scheduler_lock_blocking,
+        start_scheduler_heartbeat, release_scheduler_lock,
+    )
+
+    owner_id = make_scheduler_owner_id()
+    logger.info("[scheduler] acquiring scheduler ownership lock (owner=%s)...", owner_id)
+    acquire_scheduler_lock_blocking(owner_id)
+    hb_thread = start_scheduler_heartbeat(owner_id)
+    logger.info("[scheduler] ownership lock held — starting scan loops.")
+
     threads = []
     for name, section, interval, compute_fn, to_payload in JOBS:
         t = threading.Thread(
             target=_run_loop, args=(name, section, interval, compute_fn, to_payload),
+            kwargs={"owner_event": hb_thread.lost_ownership},
             name=f"scan-{name}", daemon=True,
         )
         t.start()
         threads.append(t)
 
-    t_live = threading.Thread(target=_run_live_scanner_loop, name="scan-live_scanner", daemon=True)
+    t_live = threading.Thread(
+        target=_run_live_scanner_loop,
+        kwargs={"owner_event": hb_thread.lost_ownership},
+        name="scan-live_scanner", daemon=True,
+    )
     t_live.start()
     threads.append(t_live)
 
-    # Keep the main thread alive; the loops themselves never return.
-    while True:
-        time.sleep(60)
-        for t in threads:
-            if not t.is_alive():
-                logger.error("Thread %s died — restart the process (supervisor should do this).", t.name)
+    # [Architecture review H1 fix, 2026-07-25]
+    t_retention = threading.Thread(
+        target=_run_retention_loop,
+        kwargs={"owner_event": hb_thread.lost_ownership},
+        name="scan-retention", daemon=True,
+    )
+    t_retention.start()
+    threads.append(t_retention)
+
+    # Keep the main thread alive; the loops themselves never return
+    # UNLESS the ownership lock is lost, in which case they all exit on
+    # their own (see owner_event checks above) and we exit the process
+    # entirely so a process supervisor restarts it — it will then block
+    # in acquire_scheduler_lock_blocking() above until it's safe to run
+    # again, rather than silently sitting alive with all its loops dead.
+    try:
+        while True:
+            time.sleep(10)
+            if hb_thread.lost_ownership.is_set():
+                logger.error("[scheduler] ownership lock lost — all loops have stopped "
+                              "themselves; exiting process for a supervisor restart.")
+                raise SystemExit(1)
+            for t in threads:
+                if not t.is_alive():
+                    logger.error("Thread %s died — restart the process (supervisor should do this).", t.name)
+    finally:
+        hb_thread.stop()
+        release_scheduler_lock(owner_id)
 
 
 if __name__ == "__main__":
