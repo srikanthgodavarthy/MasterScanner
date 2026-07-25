@@ -640,10 +640,21 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d",
     return get_history(list(symbols), years=years, min_bars=60, source=source)
 
 @st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_nifty(period: str = "1y", source: str = "yfinance") -> pd.Series:
     """
     Fetch Nifty 50 close series for regime classification and as the
     Relative Strength benchmark.
+
+    [2026-07-25 ops fix] Added the same @st.cache_data(ttl=60) its
+    sibling fetch_nifty_ohlcv() already had — this was previously
+    UNcached, so every caller (including utils/market_intelligence.py's
+    market_intelligence loop, which calls this every 30s) re-fetched a
+    full 1-year history from Upstox/yfinance on every single call, even
+    though nothing about a 1-year index history meaningfully changes
+    inside a 60-second window. A benchmark series used for RS/regime
+    doesn't need sub-minute freshness any more than fetch_nifty_ohlcv's
+    ADX input already didn't.
 
     2026-07-16: added `source`. RS/regime is only a meaningful comparison
     when the benchmark and the stock data come from the SAME provider
@@ -711,6 +722,7 @@ def fetch_nifty_ohlcv(period: str = "1y", source: str = "yfinance") -> pd.DataFr
     return pd.DataFrame()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_sensex_ohlcv(period: str = "1y", source: str = "upstox") -> pd.DataFrame:
     """
     Fetch full OHLCV for BSE Sensex — the Sensex counterpart to
@@ -719,6 +731,13 @@ def fetch_sensex_ohlcv(period: str = "1y", source: str = "upstox") -> pd.DataFra
     defaults to source="upstox" per the Market Intelligence pipeline's
     "always Upstox" rule, falling back to yfinance (^BSESN) only if the
     Upstox fetch fails.
+
+    [2026-07-25 ops fix] Added @st.cache_data(ttl=60), matching
+    fetch_nifty_ohlcv() — this had NO caching at all before, so Market
+    Intelligence's 30s loop was re-fetching a full 1-year Sensex history
+    on every single cycle. See fetch_nifty()'s docstring for the same
+    fix applied there.
+
     Returns an empty DataFrame on failure.
     """
     if source == "upstox":
@@ -740,6 +759,7 @@ def fetch_sensex_ohlcv(period: str = "1y", source: str = "upstox") -> pd.DataFra
     return pd.DataFrame()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_banknifty_ohlcv(period: str = "1y", source: str = "upstox") -> pd.DataFrame:
     """
     Fetch full OHLCV for Nifty Bank (^NSEBANK) — the Bank Nifty counterpart
@@ -747,6 +767,10 @@ def fetch_banknifty_ohlcv(period: str = "1y", source: str = "upstox") -> pd.Data
     Intelligence (DORE for the new Bank Nifty card). Defaults to
     source="upstox" per the Market Intelligence pipeline's "always Upstox"
     rule, falling back to yfinance (^NSEBANK) only if the Upstox fetch fails.
+
+    [2026-07-25 ops fix] Added @st.cache_data(ttl=60) — see
+    fetch_sensex_ohlcv()'s docstring; same gap, same fix.
+
     Returns an empty DataFrame on failure.
     """
     if source == "upstox":
