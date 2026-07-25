@@ -1378,6 +1378,17 @@ def score_stock(
         "T1":           r.t1,
         "T2":           r.t2,
         "T3":           r.t3,
+        # [Architecture review C1/H4/H5 fix, 2026-07-25] "Entry" above is
+        # the clean DISPLAY price (unpadded signal close) and stays
+        # that way for the UI. These three are new, separate columns:
+        # EntryRef is the price SL/T1/T2 were actually computed from
+        # (what a locked trade plan's entry should be anchored to — H4),
+        # and Low/High are this bar's real traded range, used by the
+        # lifecycle engine to detect SL/T1/T2 crossings correctly (C1)
+        # instead of overloading "Entry" as a live-price feed (H5).
+        "EntryRef":     r.entry_ref,
+        "Low":          r.cur_low,
+        "High":         r.cur_high,
         # ── internals ────────────────────────────────────────────
         "_qualified":           r.qualified,
         "_persistent_strength": r.persistent_strength,
@@ -2203,6 +2214,12 @@ def _enrich_with_setup_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
             _logger.info("[SETUP PLAN SCAN] qualifying_list=%s", qualifying_symbols)
 
         # Enrich DataFrame
+        # [Architecture review C1 fix, 2026-07-25] df_out now also carries
+        # "Low"/"High" columns (this bar's actual traded range — see the
+        # BarResult.cur_low/cur_high plumbing in scoring_core.py).
+        # enrich_scanner_dataframe()'s low_col/high_col default to those
+        # column names, so SL/T1/T2 crossings are checked against the
+        # real bar range rather than only the single "Entry" price.
         enriched_df, updated_plans = enrich_scanner_dataframe(
             df_out,
             existing_plans,

@@ -105,7 +105,20 @@ EXECUTE_SCORE_MIN = 50   # Moderate — 2+ of 4 signals confirming
 
 # Reward:Risk sanity gates — a setup only gets promoted past Actionable
 # when the trade itself is still worth taking, not just "confirming".
-MIN_RR_EXECUTE = 1.5
+# [Architecture review H6 fix, 2026-07-25] MIN_RR_EXECUTE / _MIN_RR_MAP
+# used to be declared here only, and decision_engine.py separately
+# hardcoded its own copy for the structural Execute route — so a
+# trader's `min_risk_reward` setting (resolved via _MIN_RR_MAP below)
+# applied to THIS module's timing route but silently NOT to the
+# structural route. Both now import the same constants/resolver from
+# utils/trade_levels.py, so there is exactly one place this threshold is
+# defined and both routes to Execute honor the same setting.
+from utils.trade_levels import (
+    MIN_RR_EXECUTE_DEFAULT as MIN_RR_EXECUTE,
+    MIN_RR_MAP as _MIN_RR_MAP,
+    resolve_min_rr_execute,
+    compute_risk_reward,
+)
 MIN_RR_ELITE   = 2.0
 
 # LL recency gate — a "defended" low is only a TIMING signal if it was
@@ -137,8 +150,6 @@ STOCH_MAX_BARS_SINCE_REIGNITION = 3
 # run hard in the bars since it fired, in which case promoting it here
 # is chasing, not catching a fresh reversal.
 PROMOTION_STOCH_MAX_LEVEL = 40
-
-_MIN_RR_MAP = {"1.5R": 1.5, "2R": 2.0, "2.5R": 2.5, "3R": 3.0}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -188,19 +199,16 @@ class PromotionResult:
 # ══════════════════════════════════════════════════════════════════
 
 def _risk_reward(r: "BarResult") -> float:
-    entry = float(getattr(r, "entry", 0.0) or 0.0)
-    sl    = float(getattr(r, "sl", 0.0) or 0.0)
-    t1    = float(getattr(r, "t1", 0.0) or 0.0)
-    t2    = float(getattr(r, "t2", 0.0) or 0.0)
-
-    if entry <= 0 or sl <= 0 or entry <= sl:
-        return 0.0
-
-    risk   = max(entry - sl, 0.001)
-    reward = (t2 - entry) if t2 > entry else (t1 - entry if t1 > entry else 0.0)
-    if reward <= 0:
-        return 0.0
-    return round(reward / risk, 2)
+    # [DRY cleanup, 2026-07-25] delegates to utils.trade_levels.compute_risk_reward
+    # — previously an identical-but-separate implementation lived here AND in
+    # utils/legacy_scoring_diagnostic.py::legacy_entry_quality(); now one shared
+    # implementation backs both.
+    return compute_risk_reward(
+        entry=getattr(r, "entry", 0.0),
+        sl=getattr(r, "sl", 0.0),
+        t1=getattr(r, "t1", 0.0),
+        t2=getattr(r, "t2", 0.0),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -329,7 +337,7 @@ def evaluate_promotion(
     # treated the same way: a plain override via `settings`, adjustable
     # in either direction, falling back to the module default when absent.
     res.risk_reward = _risk_reward(r)
-    min_rr_execute = _MIN_RR_MAP.get(settings.get("min_risk_reward"), MIN_RR_EXECUTE)
+    min_rr_execute = resolve_min_rr_execute(settings)
     res.rr_ok_execute = res.risk_reward >= min_rr_execute
     min_rr_elite = settings.get("promo_min_rr_elite", MIN_RR_ELITE)
     res.rr_ok_elite = res.risk_reward >= min_rr_elite

@@ -416,12 +416,17 @@ def _classify_stage(
 # ══════════════════════════════════════════════════════════════════
 
 # Minimum Risk:Reward for an Actionable setup to already qualify as
-# Execute on structure alone. Mirrors Promotion Engine's own
-# MIN_RR_EXECUTE gate (utils/promotion_engine.py) so a setup is never
-# held to a *looser* bar here than it would be held to for the timing
-# path — Execute must mean the same thing regardless of which route
-# produced it.
-EXECUTE_MIN_RR = 1.5
+# Execute on structure alone. [Architecture review H6 fix, 2026-07-25]
+# This used to be a hardcoded local constant that the comment claimed
+# "mirrors Promotion Engine's own MIN_RR_EXECUTE gate... so a setup is
+# never held to a looser bar here than it would be held to for the
+# timing path" — but promotion_engine.py's threshold is overridable via
+# the trader-facing `min_risk_reward` Setting and this one wasn't, so
+# that invariant silently didn't hold whenever a trader changed that
+# setting. Both routes now resolve the threshold through the same
+# utils.trade_levels.resolve_min_rr_execute(settings) call, so they are
+# guaranteed to agree, not just coincidentally equal at their defaults.
+from utils.trade_levels import resolve_min_rr_execute
 
 # Bars-since-setup band required for "still fresh enough to execute on
 # structure alone" — reuses the same Actionable band Decision Engine
@@ -456,8 +461,12 @@ def decide_operational_state(
                 when structural context is unavailable.
     r         : the scanner BarResult — read only for fields already
                 computed elsewhere (no new indicators).
-    settings  : optional settings dict, currently unused but accepted for
-                forward-compatibility with trader-facing R:R preferences.
+    settings  : optional settings dict — [H6 fix] now actually used to
+                resolve the minimum R:R for structural Execute via
+                utils.trade_levels.resolve_min_rr_execute(), the same
+                resolver promotion_engine.py's timing route uses, so a
+                trader's `min_risk_reward` setting applies identically
+                to both routes to Execute.
 
     Returns
     -------
@@ -477,12 +486,13 @@ def decide_operational_state(
     if ds.bars_band != EXECUTE_REQUIRED_BARS_BAND:
         return "Actionable", f"BarsBand={ds.bars_band} — setup no longer fresh enough for structural Execute"
 
-    if ds.risk_reward < EXECUTE_MIN_RR:
-        return "Actionable", f"R:R {ds.risk_reward:.1f} below {EXECUTE_MIN_RR} — structure alone doesn't justify Execute"
+    execute_min_rr = resolve_min_rr_execute(settings)
+    if ds.risk_reward < execute_min_rr:
+        return "Actionable", f"R:R {ds.risk_reward:.1f} below {execute_min_rr} — structure alone doesn't justify Execute"
 
     return "Execute", (
         f"Structural Execute — Lifecycle={ds.lifecycle}, fresh ({ds.bars_band}), "
-        f"R:R {ds.risk_reward:.1f} ≥ {EXECUTE_MIN_RR}"
+        f"R:R {ds.risk_reward:.1f} ≥ {execute_min_rr}"
     )
 
 

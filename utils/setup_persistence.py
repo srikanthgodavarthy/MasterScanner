@@ -396,22 +396,55 @@ def _trade_plan_label(plan: "SetupPlan") -> str:
 #  whole point of the separation.
 # ══════════════════════════════════════════════════════════════════
 
-def _advance_lifecycle_step(plan: "SetupPlan", price: float, today_str: str) -> tuple[bool, str]:
-    """One single-step transition check. Returns (changed, reason)."""
+def _advance_lifecycle_step(
+    plan: "SetupPlan",
+    price: float,
+    today_str: str,
+    bar_low: float | None = None,
+    bar_high: float | None = None,
+) -> tuple[bool, str]:
+    """
+    One single-step transition check. Returns (changed, reason).
+
+    [Architecture review C1 fix, 2026-07-25] SL/entry/target checks are
+    now evaluated against the bar's actual LOW/HIGH range via
+    utils.trade_levels.evaluate_bar_crossing() — a single sampled `price`
+    (previously the only input) can miss an intrabar stop or target touch
+    that reverses before the next scan sample. `bar_low`/`bar_high`
+    default to `price` when not supplied, reproducing the old point-
+    sample behaviour exactly for any caller not yet passing real bar
+    ranges — this is a safe, non-breaking default, not a silent
+    degradation of new callers.
+
+    Stop-loss checks are always listed before target/entry checks (no
+    tie_break_reference is passed) — on an ambiguous bar that touches
+    both, this deliberately favours recognising the stop, the more
+    conservative read for a LIVE risk-management engine. (Contrast with
+    utils/backtest_engine.py, which uses a distance-from-open tie-break
+    for realistic performance modelling — see utils/trade_levels.py.)
+    """
+    from utils.trade_levels import evaluate_bar_crossing, LevelCheck
+
     days = _compute_days_active(plan.first_actionable_date)
     plan.days_active = days
 
     entry, sl, t1, t2 = plan.entry_locked, plan.sl_locked, plan.t1_locked, plan.t2_locked
-    has_price = price > 0
+    price = float(price or 0)
+    lo = float(bar_low)  if bar_low  is not None and bar_low  > 0 else price
+    hi = float(bar_high) if bar_high is not None and bar_high > 0 else price
 
     if plan.status == SetupPlanStatus.WAITING:
-        if has_price and sl > 0 and price < sl:
-            reason = f"Stop hit ({price:.2f} < SL {sl:.2f}) before entry triggered"
+        cross = evaluate_bar_crossing(lo, hi, [
+            LevelCheck("STOP", "below", sl),
+            LevelCheck("ENTRY", "above", entry),
+        ])
+        if cross.triggered and cross.label == "STOP":
+            reason = f"Stop hit ({cross.trigger_price:.2f} < SL {sl:.2f}) before entry triggered"
             plan.status, plan.status_reason = SetupPlanStatus.CLOSED, reason
             plan.closed_at = today_str
             return True, reason
-        if has_price and entry > 0 and price >= entry:
-            reason = f"Entry triggered at {price:.2f}"
+        if cross.triggered and cross.label == "ENTRY":
+            reason = f"Entry triggered at {cross.trigger_price:.2f}"
             plan.status, plan.status_reason = SetupPlanStatus.ACTIVE, reason
             plan.activated_at = today_str
             return True, reason
@@ -423,26 +456,34 @@ def _advance_lifecycle_step(plan: "SetupPlan", price: float, today_str: str) -> 
         return False, ""
 
     if plan.status == SetupPlanStatus.ACTIVE:
-        if has_price and sl > 0 and price < sl:
-            reason = f"Stop hit at {price:.2f}"
+        cross = evaluate_bar_crossing(lo, hi, [
+            LevelCheck("STOP", "below", sl),
+            LevelCheck("T1", "above", t1),
+        ])
+        if cross.triggered and cross.label == "STOP":
+            reason = f"Stop hit at {cross.trigger_price:.2f}"
             plan.status, plan.status_reason = SetupPlanStatus.CLOSED, reason
             plan.closed_at = today_str
             return True, reason
-        if has_price and t1 > 0 and price >= t1:
-            reason = f"T1 hit at {price:.2f}"
+        if cross.triggered and cross.label == "T1":
+            reason = f"T1 hit at {cross.trigger_price:.2f}"
             plan.status, plan.status_reason = SetupPlanStatus.T1_HIT, reason
             plan.t1_hit_at = today_str
             return True, reason
         return False, ""
 
     if plan.status == SetupPlanStatus.T1_HIT:
-        if has_price and sl > 0 and price < sl:
-            reason = f"Stopped out on remainder at {price:.2f}"
+        cross = evaluate_bar_crossing(lo, hi, [
+            LevelCheck("STOP", "below", sl),
+            LevelCheck("T2", "above", t2),
+        ])
+        if cross.triggered and cross.label == "STOP":
+            reason = f"Stopped out on remainder at {cross.trigger_price:.2f}"
             plan.status, plan.status_reason = SetupPlanStatus.CLOSED, reason
             plan.closed_at = today_str
             return True, reason
-        if has_price and t2 > 0 and price >= t2:
-            reason = f"Final target T2 hit at {price:.2f}"
+        if cross.triggered and cross.label == "T2":
+            reason = f"Final target T2 hit at {cross.trigger_price:.2f}"
             plan.status, plan.status_reason = SetupPlanStatus.CLOSED, reason
             plan.closed_at = today_str
             return True, reason
@@ -455,6 +496,8 @@ def advance_lifecycle(
     plan: "SetupPlan",
     current_price: float,
     today_str: str | None = None,
+    bar_low: float | None = None,
+    bar_high: float | None = None,
 ) -> tuple[bool, str]:
     """
     Deterministic trade-lifecycle state machine.
@@ -462,6 +505,13 @@ def advance_lifecycle(
     Inputs: price, the plan's own locked entry/sl/target, and calendar age.
     Never reads Recommendation / Category / Leadership / Conviction —
     a scanner downgrade has zero effect on an open trade.
+
+    [Architecture review C1 fix, 2026-07-25] `bar_low`/`bar_high`, when
+    supplied, let SL/entry/target checks see the full bar range instead
+    of only `current_price` — see _advance_lifecycle_step()'s docstring.
+    Omitting them falls back to the previous point-sample behaviour
+    exactly (both default to `current_price`), so existing callers are
+    unaffected until they're updated to pass real bar ranges.
 
     Re-applies single steps until stable (bounded) so a single large gap
     (e.g. price jumps straight through entry AND T1 between two scans)
@@ -476,7 +526,10 @@ def advance_lifecycle(
     changed_any = False
     last_reason = ""
     for _ in range(4):  # WAITING→ACTIVE→T1_HIT→CLOSED is at most 3 hops
-        changed, reason = _advance_lifecycle_step(plan, float(current_price or 0), today_str)
+        changed, reason = _advance_lifecycle_step(
+            plan, float(current_price or 0), today_str,
+            bar_low=bar_low, bar_high=bar_high,
+        )
         if not changed:
             break
         changed_any = True
@@ -532,7 +585,15 @@ def _create_plan(
     """
     setup_id = _make_setup_id(symbol, today_str)
 
-    entry = float(scanner_row.get("Entry", 0) or 0)
+    # [Architecture review H4 fix, 2026-07-25] Lock the price SL/T1/T2
+    # were actually computed relative to (EntryRef — scoring_core.py's
+    # padded signal close), not the unpadded "Entry" display price. Prior
+    # to this fix these two numbers silently differed by ~0.5%, so the
+    # locked/persisted R:R didn't match the R:R the engine actually used
+    # to size the trade. Falls back to "Entry" for any row source that
+    # doesn't carry "EntryRef" yet (e.g. an older cached scan payload).
+    entry_ref = float(scanner_row.get("EntryRef", 0) or 0)
+    entry = entry_ref if entry_ref > 0 else float(scanner_row.get("Entry", 0) or 0)
     sl    = float(scanner_row.get("SL",    0) or 0)
     t1    = float(scanner_row.get("T1",    0) or 0)
     t2    = float(scanner_row.get("T2",    0) or 0)
@@ -584,6 +645,8 @@ def enrich_scanner_row(
     existing_plan:    Optional["SetupPlan"],
     first_seen_date:  str = "",
     current_price:    float = 0.0,
+    bar_low:          float | None = None,
+    bar_high:         float | None = None,
 ) -> tuple[dict, Optional["SetupPlan"], bool]:
     """
     Attach setup persistence fields to a scanner result dict.
@@ -595,6 +658,13 @@ def enrich_scanner_row(
     first_seen_date  : earliest date this symbol appeared in ANY scan category
     current_price    : latest live price (used ONLY by the lifecycle state
                         machine — never the Recommendation field)
+    bar_low, bar_high : [Architecture review C1 fix, 2026-07-25] this bar's
+                        actual traded range, when available — lets the
+                        lifecycle machine detect an intrabar SL/T1/T2
+                        touch that reverses before the next scan sample,
+                        instead of only ever seeing `current_price`.
+                        Defaults to `current_price` (old point-sample
+                        behaviour) when not supplied.
 
     Returns
     -------
@@ -611,7 +681,10 @@ def enrich_scanner_row(
     #     Driven purely by price vs. the plan's own locked levels and
     #     age. Recommendation/Category is NEVER consulted here.
     if plan is not None and plan.is_open():
-        changed, _ = advance_lifecycle(plan, current_price, today_str)
+        changed, _ = advance_lifecycle(
+            plan, current_price, today_str,
+            bar_low=bar_low, bar_high=bar_high,
+        )
         if changed:
             plan_was_updated = True
 
@@ -713,6 +786,8 @@ def enrich_scanner_dataframe(
     existing_plans: dict,      # {symbol: SetupPlan}
     first_seen_map: dict,      # {symbol: "YYYY-MM-DD"}
     price_col:      str = "Entry",
+    low_col:        str = "Low",
+    high_col:       str = "High",
 ) -> tuple:
     """
     Enrich an entire scanner result DataFrame with setup persistence fields.
@@ -725,9 +800,21 @@ def enrich_scanner_dataframe(
                       i.e. every OPEN plan, not just ACTIVE ones)
     first_seen_map : dict {symbol: first_seen_date} from signal_first_seen table
     price_col      : column to use as the live current_price fed to the
-                      lifecycle state machine (default "Entry", which the
-                      scoring engine sets to the live close — see
-                      decision_engine.py's docstring on "display entry")
+                      lifecycle state machine as a FALLBACK when low_col/
+                      high_col aren't present in `df` (default "Entry",
+                      the scoring engine's display/live-close column —
+                      see decision_engine.py's docstring on "display
+                      entry"). When low_col/high_col ARE present (they
+                      are, on any row produced after the 2026-07-25
+                      Architecture-review fix — see scanner_engine.py),
+                      those take priority so SL/T1/T2 are checked against
+                      the bar's actual traded range, not a single price.
+    low_col, high_col : [Architecture review C1 fix, 2026-07-25] columns
+                      holding this bar's actual low/high. Missing/zero
+                      values fall back to price_col (old point-sample
+                      behaviour) per-row, so this is safe to enable by
+                      default even against older cached scan payloads
+                      that don't have these columns yet.
 
     Returns
     -------
@@ -741,6 +828,8 @@ def enrich_scanner_dataframe(
 
     rows_out      = []
     updated_plans = []
+    has_low_col   = low_col  in df.columns
+    has_high_col  = high_col in df.columns
 
     for _, row in df.iterrows():
         row_dict = row.to_dict()
@@ -749,9 +838,12 @@ def enrich_scanner_dataframe(
         plan     = existing_plans.get(symbol)
         first_s  = first_seen_map.get(symbol, date.today().isoformat())
         cur_price= float(row_dict.get(price_col, 0) or 0)
+        bar_low  = float(row_dict.get(low_col,  0) or 0) if has_low_col  else None
+        bar_high = float(row_dict.get(high_col, 0) or 0) if has_high_col else None
 
         enriched, plan_out, was_updated = enrich_scanner_row(
-            row_dict, plan, first_s, cur_price
+            row_dict, plan, first_s, cur_price,
+            bar_low=bar_low, bar_high=bar_high,
         )
         rows_out.append(enriched)
         if was_updated:

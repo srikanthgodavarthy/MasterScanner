@@ -36,6 +36,7 @@ from utils.decision_engine import _extension as _ext_fn
 from utils.conviction_score_v1 import compute_conviction_v3, classify_tier_v3, _classify_v3
 from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
 from utils.adaptive_target_engine import AdaptiveTargetParams, compute_adaptive_targets, check_momentum_exit
+from utils.trade_levels import evaluate_bar_crossing, LevelCheck
 from utils.structural_levels import structural_ceiling
 from utils.regime_engine  import (
     build_regime_context, RegimeContext,
@@ -1164,28 +1165,29 @@ def simulate_trades(
                 exit_reason = "CCI_EXIT"
                 break
 
-            sl_hit = bar_low  <= sl
-            t1_hit = bar_high >= t1
-
-            if sl_hit and t1_hit:
-                # BUG-3: both levels touched intrabar — resolve by distance
-                # from the open (whichever level price was closer to is
-                # assumed to have been reached first).
-                dist_sl = abs(bar_open - sl)
-                dist_t1 = abs(bar_open - t1)
-                if dist_t1 <= dist_sl:
-                    exit_price, exit_reason = t1, "T1 HIT"
-                else:
-                    exit_price, exit_reason = sl, "SL HIT"
-                exit_date = dt
-                break
-            elif sl_hit:
-                exit_price, exit_reason = sl, "SL HIT"
-                exit_date = dt
-                break
-            elif t1_hit:
-                exit_price, exit_reason = t1, "T1 HIT"
-                exit_date = dt
+            # [Architecture review C1/C2 fix, 2026-07-25] Shared with the
+            # live lifecycle engine (utils/setup_persistence.py) via
+            # utils.trade_levels.evaluate_bar_crossing() — same bar-range
+            # crossing test, same "distance from open" tie-break (this
+            # function's own prior "BUG-3" fix, now generalized into the
+            # shared primitive) — so Backtest and Live can no longer
+            # silently diverge on what counts as a stop/target hit.
+            _cross = evaluate_bar_crossing(
+                bar_low, bar_high,
+                # T1 listed first: on an exact equidistant-from-open tie,
+                # the original "BUG-3" fix favored T1 (`dist_t1 <= dist_sl`)
+                # — evaluate_bar_crossing() keeps first-in-list-order on an
+                # exact tie, so this ordering reproduces that exactly.
+                checks=[
+                    LevelCheck("T1 HIT", "above", t1),
+                    LevelCheck("SL HIT", "below", sl),
+                ],
+                tie_break_reference=bar_open,
+            )
+            if _cross.triggered:
+                exit_price  = sl if _cross.label == "SL HIT" else t1
+                exit_reason = _cross.label
+                exit_date   = dt
                 break
 
         pnl_pct = round((exit_price - entry_price) / entry_price * 100, 2)

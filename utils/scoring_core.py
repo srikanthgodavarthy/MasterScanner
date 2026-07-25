@@ -188,6 +188,25 @@ class BarResult:
     t2:     float = 0.0
     t3:     float = 0.0
 
+    # [Architecture review C1/H4/H5 fix, 2026-07-25]
+    # entry_ref  — the actual price SL/T1/T2 were computed relative to
+    #              (padded signal close ≈ next-bar open — see
+    #              `_entry_pad` below). `entry` above stays the "clean"
+    #              display price (unpadded signal close); this field is
+    #              what should be LOCKED as a trade plan's true entry
+    #              reference so the persisted R:R matches the R:R the
+    #              engine actually used (previously these two numbers
+    #              silently differed by the ~0.5% padding — H4).
+    # cur_low / cur_high — this bar's actual traded range. Used by the
+    #              lifecycle engine (utils/setup_persistence.py, via
+    #              utils/trade_levels.py) to test SL/T1/T2 against the
+    #              full bar range instead of a single sampled close,
+    #              which could previously miss an intrabar stop/target
+    #              touch that reversed before the next scan (C1).
+    entry_ref: float = 0.0
+    cur_low:   float = 0.0
+    cur_high:  float = 0.0
+
     # ── Tier / display labels ────────────────────────────────────
     tier:       str = "Other"
     acc_tier:   str = "D"
@@ -800,6 +819,10 @@ def compute_bar(
 
     cur_c    = ca[i]    if ca   is not None else float(c.iloc[i])
     cur_o    = oa[i]    if oa   is not None else float(ia.o.iloc[i])
+    # [Architecture review C1 fix] this bar's actual traded range — see
+    # BarResult.cur_low/cur_high docstring.
+    cur_l_bar = la[i]   if la   is not None else float(l.iloc[i])
+    cur_h_bar = ha[i]   if ha   is not None else float(h.iloc[i])
     cur_e20  = e20a[i]  if e20a is not None else float(ia.e20.iloc[i])
     cur_e50  = e50a[i]  if e50a is not None else float(ia.e50.iloc[i])
     cur_e200 = e200a[i] if e200a is not None else float(ia.e200.iloc[i])
@@ -1869,6 +1892,9 @@ def compute_bar(
         t1     = t1_lv,
         t2     = t2_lv,
         t3     = t3_lv,
+        entry_ref = _entry_pad,     # [C1/H4 fix] true price SL/T1/T2 are anchored to
+        cur_low   = cur_l_bar,      # [C1 fix] this bar's actual low
+        cur_high  = cur_h_bar,      # [C1 fix] this bar's actual high
         tier       = tier,
         acc_tier   = acc_tier,
         acc_score  = acc_score,
