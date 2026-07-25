@@ -2662,7 +2662,10 @@ def _futures_table_html(df: pd.DataFrame) -> str:
     )
 
 
-_FO_SCAN_REFRESH_SECS = 30  # metadata poll cadence, per spec (producer itself runs every 60s)
+_FO_SCAN_REFRESH_SECS = 60  # [2026-07-25 ops fix] was 30 — matches the producer's
+                            # own 60s cadence (scheduler/scan_worker.py); polling
+                            # faster than that just re-checked unchanged metadata,
+                            # once per open browser session, every tick
 
 
 @st.fragment(run_every=_FO_SCAN_REFRESH_SECS)
@@ -2781,7 +2784,13 @@ def _fo_opportunities_panel():
 # payload when its version actually changed since the last tick. No Upstox
 # call, no DORE computation, and no regime classification happens in this
 # process anymore.
-_MARKET_INTEL_REFRESH_SECS = 30  # metadata poll cadence, per spec
+_MARKET_INTEL_REFRESH_SECS = 180  # [2026-07-25 ops fix] was 30 — matches the
+                                   # producer's own interval (scheduler/scan_worker.py's
+                                   # JOBS list, also bumped 30->180 the same day, see
+                                   # its comment there for why). Polling every 30s
+                                   # against data that changes at most every 180s
+                                   # meant ~5 of every 6 metadata checks, per open
+                                   # browser session, could never find anything new.
 
 
 @st.fragment(run_every=_MARKET_INTEL_REFRESH_SECS)
@@ -3130,7 +3139,14 @@ def _news_impact_panel():
 # MasterScanner_Architecture_Review_Addendum.md (C5) for the alternative
 # (move the widgets inside this fragment) if the redraw cost ever matters
 # more than the simplicity of this fix.
-_DASH_AUTOREFRESH_SECS = 30  # metadata poll cadence, per spec
+_DASH_AUTOREFRESH_SECS = 60  # [2026-07-25 ops fix] was 30. live_scanner only
+                             # produces a new completed snapshot on-demand (manual
+                             # "Run Scan") in this deployment mode, or at most every
+                             # 5 min if a standalone scan_worker.py is also running
+                             # — either way, far less often than 30s. Kept at 60s
+                             # rather than matching that more loosely (unlike the
+                             # other two fragments above) so a manual Run Scan is
+                             # still picked up reasonably promptly.
 
 
 @st.fragment(run_every=_DASH_AUTOREFRESH_SECS)
