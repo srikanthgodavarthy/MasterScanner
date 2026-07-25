@@ -92,6 +92,70 @@ from utils import upstox_client
 
 logger = logging.getLogger(__name__)
 
+
+# ─── BOUNDED BACKGROUND EXECUTOR [Architecture review H2 fix, 2026-07-25] ───
+# ThreadPoolExecutor's internal work queue is unbounded by default. This
+# module's _flush_executor (below) receives one fire-and-forget submit()
+# per live_scanner batch (~10x per 5-minute cycle — see
+# scheduler/scan_worker.py's _run_live_scanner_loop) with nothing waiting
+# on the result, so if disk/Supabase Storage writes ever fall behind the
+# submission rate (a slow disk, a burst of manual "Run Scan" clicks, etc),
+# queued tasks — and the DataFrames each one closes over — accumulate in
+# memory without limit. utils/inprocess_scheduler.py's own module
+# docstring already names this the LEADING SUSPECT behind this app's
+# OOM-pattern crashes ("connection reset by peer"); the fix applied so far
+# (pulling live_scanner out of the in-process background threads) treats
+# the symptom, not this root cause — anything that still calls
+# update_live_cache() (including the manual "Run Scan" button path) can
+# still trigger it.
+#
+# _BoundedThreadPoolExecutor caps how many tasks may be queued/in-flight
+# at once via a semaphore. Once full, submit_or_drop() DROPS the new task
+# rather than queuing it — safe specifically for this module's use case,
+# since every caller is a fire-and-forget cache write whose own docstring
+# already states losing one is safe (see update_live_cache(): "worst case
+# is re-fetching that symbol's tail next boot, not a corrupted cache").
+# Dropping bounds memory; blocking would stall the scan loop that's
+# calling this, which is worse for a background cache write that nothing
+# is waiting on.
+class _BoundedThreadPoolExecutor:
+    def __init__(self, max_workers: int, max_queue: int, thread_name_prefix: str):
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=thread_name_prefix)
+        self._capacity = max_workers + max_queue
+        self._sem = threading.Semaphore(self._capacity)
+        self._dropped_count = 0
+        self._dropped_lock = threading.Lock()
+
+    def submit_or_drop(self, fn, *args, **kwargs) -> bool:
+        """Returns True if the task was accepted, False if it was
+        dropped because the queue was already at capacity."""
+        if not self._sem.acquire(blocking=False):
+            with self._dropped_lock:
+                self._dropped_count += 1
+                n = self._dropped_count
+            logger.warning(
+                "history_store: background flush queue is at capacity "
+                "(%d tasks already queued/in-flight) — DROPPING this flush "
+                "task instead of growing the queue unboundedly (%d dropped "
+                "total this process). This is expected/safe under sustained "
+                "load per this module's design (see the H2-fix comment "
+                "above); if it happens routinely rather than only during "
+                "bursts, that's a signal disk/Storage writes are "
+                "chronically slower than the submission rate and the "
+                "underlying cause is worth investigating.",
+                self._capacity, n,
+            )
+            return False
+
+        def _wrapped():
+            try:
+                fn(*args, **kwargs)
+            finally:
+                self._sem.release()
+
+        self._executor.submit(_wrapped)
+        return True
+
 # ─── SUPABASE CALL TIMEOUT ──────────────────────────────────────────────────
 # utils/supabase_client.get_client() creates the Supabase client with no
 # timeout configured anywhere (create_client(url, key), no ClientOptions).
@@ -583,7 +647,12 @@ def get_history(
 # scanner_engine.py, which already has that logic).
 _live_cache: dict = {}   # {source: {"data": {symbol: DataFrame}, "loaded_date": date}}
 _LIVE_CACHE_LOCK = threading.Lock()
-_flush_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="history-flush")
+_flush_executor = _BoundedThreadPoolExecutor(
+    max_workers=2, max_queue=20, thread_name_prefix="history-flush",
+)   # [Architecture review H2 fix] max_queue=20 ~= 2 full live_scanner
+    # cycles' worth of batches (10 batches/cycle) of slack before
+    # dropping — enough to absorb a normal burst without ever growing
+    # unboundedly.
 
 
 def get_live_history_cached(
@@ -666,6 +735,13 @@ def update_live_cache(source: str, patched: dict, dirty_symbols) -> None:
     completes, the worst case is re-fetching that symbol's tail next
     boot, not a corrupted cache: _local_save() only ever writes a
     complete DataFrame, never a partial one.
+
+    [Architecture review H2 fix, 2026-07-25] The flush is submitted via
+    _BoundedThreadPoolExecutor.submit_or_drop(), which DROPS this flush
+    (logged, non-fatal — see _BoundedThreadPoolExecutor's docstring)
+    rather than queuing it if the background queue is already at
+    capacity, instead of the previous unbounded ThreadPoolExecutor
+    queue that could grow without limit under sustained load.
     """
     if source not in _VALID_SOURCES or not patched:
         return
@@ -694,4 +770,4 @@ def update_live_cache(source: str, patched: dict, dirty_symbols) -> None:
                     sym, source, exc,
                 )
 
-    _flush_executor.submit(_flush)
+    _flush_executor.submit_or_drop(_flush)

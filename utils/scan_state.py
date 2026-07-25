@@ -189,6 +189,55 @@ def load_snapshot_payload(section: str) -> Optional[dict]:
         return None
 
 
+# ─── RETENTION ──────────────────────────────────────────────────────────
+# [Architecture review H1 fix, 2026-07-25] Before this, the only
+# retention logic in the whole codebase was a commented-out DELETE
+# statement in SCHEMA_SQL (below) — market_intelligence (30s),
+# live_scanner (5min, full-universe JSON payload), and fo_scan (60s)
+# snapshots accumulated forever. One shared, parameterized prune
+# function (prune_snapshot_table RPC) is applied identically to all
+# three tables here, rather than three independent call sites that
+# could drift (one gets updated, another forgotten) — see the
+# architecture review's L1 note about exactly that risk.
+
+RETENTION_KEEP_ROWS = 500   # applied identically to every snapshot table
+
+
+def prune_old_snapshots(section: str, keep: int = RETENTION_KEEP_ROWS) -> Optional[int]:
+    """
+    Deletes all but the most recent `keep` rows (by version) for
+    `section`'s snapshot table, via the prune_snapshot_table() Postgres
+    RPC (see SCHEMA_SQL). Returns the number of rows deleted, or None
+    if Supabase was unavailable or the RPC failed — logged, non-fatal;
+    a skipped prune just means slightly more rows survive until the
+    next scheduled attempt, never data loss for anything still within
+    the retention window.
+    """
+    client = _client()
+    if client is None:
+        return None
+    try:
+        resp = client.rpc("prune_snapshot_table", {
+            "p_table": _table(section), "p_keep": keep,
+        }).execute()
+        n = resp.data
+        if n:
+            logger.info("prune_old_snapshots(%s): deleted %s row(s), keeping latest %s", section, n, keep)
+        return n
+    except Exception:
+        logger.exception("prune_old_snapshots(%s) failed (non-fatal — will retry next cycle)", section)
+        return None
+
+
+def prune_all_snapshots(keep: int = RETENTION_KEEP_ROWS) -> dict:
+    """Convenience: prune every registered snapshot table in one call.
+    Returns {section: n_deleted_or_None}. Called periodically by
+    scheduler/scan_worker.py's retention loop (and, when the in-process
+    fallback owns the scheduler lock, by utils.inprocess_scheduler) —
+    see scheduler/scan_worker.py's _run_retention_loop()."""
+    return {section: prune_old_snapshots(section, keep) for section in _TABLES}
+
+
 # ─── SCHEMA ─────────────────────────────────────────────────────────────
 # Run ONCE in Supabase → SQL Editor. Safe to re-run (IF NOT EXISTS).
 
@@ -233,9 +282,35 @@ CREATE TABLE IF NOT EXISTS fo_scan_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_fo_snap_version ON fo_scan_snapshots(version DESC);
 
--- Optional retention: keep last 500 rows per table so these don't grow
--- unbounded (30s/60s/120s cadences add up fast). Run periodically, or
--- skip if you'd rather keep full history.
--- DELETE FROM market_intelligence_snapshots WHERE id NOT IN
---   (SELECT id FROM market_intelligence_snapshots ORDER BY version DESC LIMIT 500);
+-- ── Retention [Architecture review H1 fix, 2026-07-25] ─────────────────
+-- Deletes all but the most recent p_keep rows (by version) from ONE of
+-- the three whitelisted snapshot tables. Whitelist check + format(%I)
+-- both guard against SQL injection via p_table (this function is
+-- called from application code with a fixed, hardcoded table name via
+-- utils.scan_state._table(), never user input — the whitelist is
+-- defense in depth, not the only guard).
+--
+-- Called periodically (once an hour, see scheduler/scan_worker.py's
+-- _run_retention_loop) for ALL THREE tables via one shared Python
+-- helper (utils.scan_state.prune_all_snapshots()) rather than three
+-- independent DELETE statements someone has to remember to keep in
+-- sync.
+CREATE OR REPLACE FUNCTION prune_snapshot_table(p_table text, p_keep int DEFAULT 500)
+RETURNS int AS $$
+DECLARE
+    n_deleted int;
+BEGIN
+    IF p_table NOT IN ('market_intelligence_snapshots', 'live_scanner_snapshots', 'fo_scan_snapshots') THEN
+        RAISE EXCEPTION 'prune_snapshot_table: % is not an allowed snapshot table', p_table;
+    END IF;
+
+    EXECUTE format(
+        'DELETE FROM %I WHERE id NOT IN (SELECT id FROM %I ORDER BY version DESC LIMIT $1)',
+        p_table, p_table
+    ) USING p_keep;
+
+    GET DIAGNOSTICS n_deleted = ROW_COUNT;
+    RETURN n_deleted;
+END;
+$$ LANGUAGE plpgsql;
 """

@@ -51,9 +51,16 @@ at import time — see "Call this AFTER..." above):
     from utils.inprocess_scheduler import start_background_scans
     start_background_scans()
 
-Do NOT also run `python -m scheduler.scan_worker` alongside this in the
-same deployment — that would double up every job (two writers per
-section racing each other every cycle). Pick ONE of the two.
+Running `python -m scheduler.scan_worker` alongside this in the same
+deployment is no longer a silent double-up [Architecture review C3
+fix, 2026-07-25] — both sides now coordinate through a scheduler
+ownership lock (utils/system_state.py). Whichever one starts first
+claims it; the other detects that and skips starting its own threads
+(this module) or blocks until the lock frees up (scan_worker.py's
+main()). It's still simplest to deliberately pick ONE of the two for a
+given deployment rather than relying on the lock as your only
+safeguard, but an accidental second instance is now safe rather than
+silently doubling every job.
 """
 
 from __future__ import annotations
@@ -78,20 +85,63 @@ def start_background_scans() -> bool:
     module docstring for why. It runs on-demand only, via pages/
     scanner.py's "Run Scan" button.
 
-    Returns True once threads are launched. (The return value itself
-    isn't meaningful beyond "don't call this twice" — cache_resource is
-    what actually enforces that.)
+    [Architecture review C3 fix, 2026-07-25] Before starting anything,
+    this now makes ONE non-blocking attempt to claim the scheduler
+    ownership lock (utils/system_state.py). If a standalone
+    `scheduler/scan_worker.py` process (or another Streamlit process)
+    already holds it, this returns False WITHOUT starting any threads —
+    the Dashboard still reads snapshots normally, they're just being
+    produced by whichever process actually owns the lock. This can't
+    block (unlike scheduler/scan_worker.py's main(), which polls) since
+    it runs on Streamlit's own thread during a page render.
+
+    Returns True once threads are launched, False if the lock couldn't
+    be acquired (another process owns it) — callers don't need to do
+    anything differently either way; the Dashboard's own data reads are
+    unaffected in both cases.
     """
     import threading
-    from scheduler.scan_worker import JOBS, _run_loop
+    from scheduler.scan_worker import JOBS, _run_loop, _run_retention_loop, RETENTION_INTERVAL_SECS
+    from utils.system_state import (
+        make_scheduler_owner_id, try_acquire_scheduler_lock, start_scheduler_heartbeat,
+    )
+
+    owner_id = make_scheduler_owner_id()
+    if not try_acquire_scheduler_lock(owner_id):
+        logger.warning(
+            "In-process scheduler: another process already owns the scheduler "
+            "ownership lock (owner_id=%s attempted) — NOT starting background "
+            "scan threads in this process. This is expected if a standalone "
+            "`scheduler/scan_worker.py` process is running against this same "
+            "Supabase project; the Dashboard will keep reading its snapshots "
+            "normally. If you did NOT intend that, see Architecture review "
+            "finding C3.", owner_id,
+        )
+        return False
+
+    hb_thread = start_scheduler_heartbeat(owner_id)
+    logger.info("In-process scheduler: acquired scheduler ownership lock (owner=%s)", owner_id)
 
     for name, section, interval, compute_fn, to_payload in JOBS:
         t = threading.Thread(
             target=_run_loop, args=(name, section, interval, compute_fn, to_payload),
+            kwargs={"owner_event": hb_thread.lost_ownership},
             name=f"scan-{name}", daemon=True,
         )
         t.start()
         logger.info("In-process scheduler: started %s thread (every %ss)", name, interval)
+
+    # [Architecture review H1 fix, 2026-07-25] Snapshot retention — same
+    # loop scheduler/scan_worker.py's main() uses, started here too so a
+    # Streamlit-only deployment (no separate scan_worker.py process)
+    # still prunes old snapshot rows instead of growing them forever.
+    t_retention = threading.Thread(
+        target=_run_retention_loop,
+        kwargs={"owner_event": hb_thread.lost_ownership},
+        name="scan-retention", daemon=True,
+    )
+    t_retention.start()
+    logger.info("In-process scheduler: started retention thread (every %ss)", RETENTION_INTERVAL_SECS)
 
     # live_scanner intentionally NOT started here (2026-07-24). Its
     # batched sub-scheduler (_run_live_scanner_loop, scheduler/scan_worker.py)

@@ -41,22 +41,51 @@ that's already owned per-section by utils.scan_state's
 (scan_id/version/status). Duplicating "last completed" here would give
 two places that can disagree about it.
 
-Concurrency
------------
-backtest_lock_count is incremented/decremented via a Postgres RPC
-function (see SCHEMA_SQL), not a client-side read-modify-write —
-two Streamlit sessions both doing read-count/count+1/write from
-PostgREST can race and undercount. The RPC does the increment/decrement
-atomically in the database.
+Scheduler ownership (2026-07-25) [Architecture review C3 fix]
+---------------------------------------------------------------
+Before this, nothing prevented `python -m scheduler.scan_worker`
+(scheduler/scan_worker.py) and the in-process fallback
+(utils.inprocess_scheduler.start_background_scans(), started from
+pages/dashboard.py's render()) from BOTH running against the same
+Supabase project at once — the module docstrings in both files warned
+"don't do this" in a comment, but nothing enforced it. Two producers
+racing on the same section doubles Supabase write volume and, more
+importantly, doubles the actual scan compute (two independent sets of
+Upstox/yfinance fetches) — exactly the kind of resource contention a
+500-symbol, continuous, long-running deployment can't afford.
 
-Fail-open
----------
-Every read helper here returns a LIVE-shaped default if Supabase is
-briefly unreachable, matching the fail-open pattern the rest of the app
-already uses for save_snapshot() etc. (utils/scan_state.py). Treating
-an unreadable flag as "stay paused" would turn a transient network
-blip into an indefinite scan outage — worse than the race this module
-fixes.
+Same singleton row, three more columns:
+
+    scheduler_owner               an opaque string identifying ONE
+                                   process (hostname:pid:random — see
+                                   make_scheduler_owner_id()), or NULL
+                                   if nothing currently owns the lock
+    scheduler_owner_heartbeat_at  refreshed periodically by whoever
+                                   holds it; a stale heartbeat means the
+                                   owning process crashed/was killed
+                                   without releasing cleanly, and the
+                                   lock is up for grabs again
+
+Any process wanting to run the scan loops calls
+try_acquire_scheduler_lock(owner_id) at startup. It succeeds if the
+lock is unclaimed, already held by that same owner_id (idempotent
+re-acquire), or its heartbeat has gone stale (the previous owner is
+presumed dead). Only ONE process ever holds a *fresh* lock at a time —
+enforced atomically in Postgres (see SCHEMA_SQL), not a client-side
+read-modify-write.
+
+    scheduler/scan_worker.py's main() BLOCKS (polling) until it
+    acquires the lock — it's meant to be the primary, always-on
+    process, so it's worth waiting for the other side to go stale or
+    exit cleanly rather than giving up.
+
+    utils.inprocess_scheduler.start_background_scans() tries ONCE,
+    non-blocking — it can't block Streamlit's render thread. If it
+    can't acquire (a standalone scan_worker.py is already running and
+    healthy), it logs once and simply doesn't start its background
+    threads for that process's lifetime; the Dashboard still reads
+    snapshots normally, they're just being produced by the other
+    process instead.
 
 Usage
 -----
@@ -77,6 +106,47 @@ Usage
     # scheduler/scan_worker.py's live_scanner batch-save
     if manual_override_active("live_scanner"):
         merged = reseed_from_latest_snapshot(merged)  # see scan_worker.py
+
+    # scheduler/scan_worker.py's main() — blocks until this process owns
+    # the scheduler lock, then starts a heartbeat thread
+    owner_id = make_scheduler_owner_id()
+    acquire_scheduler_lock_blocking(owner_id)
+    hb = start_scheduler_heartbeat(owner_id)
+    ... start job threads, checking hb.lost_ownership.is_set() too ...
+
+    # utils/inprocess_scheduler.py's start_background_scans() — tries
+    # once, non-blocking; skips starting threads if it can't acquire
+    owner_id = make_scheduler_owner_id()
+    if not try_acquire_scheduler_lock(owner_id):
+        logger.warning("another process already owns the scheduler lock")
+        return False
+    hb = start_scheduler_heartbeat(owner_id)
+    ... start job threads ...
+
+Concurrency
+-----------
+backtest_lock_count is incremented/decremented via a Postgres RPC
+function (see SCHEMA_SQL), not a client-side read-modify-write —
+two Streamlit sessions both doing read-count/count+1/write from
+PostgREST can race and undercount. The RPC does the increment/decrement
+atomically in the database. The scheduler-ownership lock (above) uses
+the same pattern — try_acquire_scheduler_lock()/release_scheduler_lock()/
+renew_scheduler_heartbeat() are all atomic Postgres functions, not
+client-side compare-and-swap.
+
+Fail-open
+---------
+Every read helper here returns a LIVE-shaped default if Supabase is
+briefly unreachable, matching the fail-open pattern the rest of the app
+already uses for save_snapshot() etc. (utils/scan_state.py). Treating
+an unreadable flag as "stay paused" would turn a transient network
+blip into an indefinite scan outage — worse than the race this module
+fixes. The scheduler-ownership lock intentionally does NOT fail open in
+quite the same way (see try_acquire_scheduler_lock()'s docstring) — a
+Supabase outage there fails open to "assume we own it" for whichever
+process asks first, since refusing to scan at all because a lock table
+was briefly unreachable would be worse than the rare double-scan a
+network blip could cause.
 """
 
 from __future__ import annotations
@@ -104,7 +174,29 @@ _LIVE_DEFAULT = {
     "heartbeat_at": None,
     "manual_override_section": None,
     "manual_override_until": None,
+    "scheduler_owner": None,
+    "scheduler_owner_heartbeat_at": None,
 }
+
+# [Architecture review C3 fix, 2026-07-25] Scheduler ownership lock tuning.
+# Stale-after is longer than the backtest lock's (300s) — a scan_worker.py
+# process legitimately goes quiet for longer stretches between heartbeats
+# under normal operation (e.g. a slow live_scanner batch), and reclaiming
+# the lock too eagerly would risk two processes both believing they own
+# it right at the handoff boundary.
+_SCHEDULER_HEARTBEAT_STALE_AFTER_SECS = 120
+_SCHEDULER_HEARTBEAT_INTERVAL_SECS    = 20
+
+
+def make_scheduler_owner_id() -> str:
+    """A reasonably-unique identifier for THIS process, used to prove
+    ownership of the scheduler lock (so a stale lock can be safely
+    reclaimed by a different owner, and so a process never accidentally
+    releases or renews a lock some other, newer owner now holds)."""
+    import os
+    import socket
+    import uuid
+    return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 
 def _client():
@@ -340,6 +432,159 @@ def backtest_pause():
         _release_backtest_lock()
 
 
+# ─── WRITE: scheduler ownership lock (RPC, atomic) ─────────────────────
+# [Architecture review C3 fix, 2026-07-25] See module docstring
+# ("Scheduler ownership") for the full design.
+
+def try_acquire_scheduler_lock(owner_id: str) -> bool:
+    """
+    One non-blocking attempt to claim the scheduler-ownership lock for
+    `owner_id`. Returns True if this owner now holds it (either it was
+    unclaimed, already held by this same owner_id, or the previous
+    owner's heartbeat had gone stale) — False if a DIFFERENT owner
+    currently holds a fresh lock.
+
+    Fails OPEN (returns True) if Supabase itself is unreachable — a
+    deliberate exception to this module's general fail-open philosophy
+    being about the mode flag, not this lock: refusing to run the
+    scanner at all because the lock table was briefly unreachable would
+    turn a transient network blip into a full scan outage, which is
+    worse than the rare double-scan a genuine simultaneous-startup race
+    could cause. Logged loudly either way so it's visible in practice.
+    """
+    client = _client()
+    if client is None:
+        logger.warning("try_acquire_scheduler_lock: Supabase client unavailable — "
+                        "failing OPEN (assuming ownership) for owner=%s", owner_id)
+        return True
+    try:
+        resp = client.rpc("try_acquire_scheduler_lock", {
+            "p_owner": owner_id,
+            "p_stale_secs": _SCHEDULER_HEARTBEAT_STALE_AFTER_SECS,
+        }).execute()
+        acquired = bool(resp.data)
+        if acquired:
+            logger.info("[system_state] scheduler ownership lock acquired (owner=%s)", owner_id)
+        return acquired
+    except Exception:
+        logger.exception("try_acquire_scheduler_lock RPC failed — failing OPEN "
+                          "(assuming ownership) for owner=%s", owner_id)
+        return True
+
+
+def acquire_scheduler_lock_blocking(owner_id: str, poll_secs: int = 30) -> None:
+    """
+    Blocks — polling every `poll_secs` — until `owner_id` acquires the
+    scheduler-ownership lock. Intended for scheduler/scan_worker.py's
+    main(), which is meant to be the primary always-on process: it's
+    worth waiting for a previous instance to go stale or exit cleanly
+    rather than giving up. Logs once when it starts waiting and once
+    when it succeeds, not on every poll, so a long wait doesn't spam.
+    """
+    logged_waiting = False
+    while True:
+        if try_acquire_scheduler_lock(owner_id):
+            if logged_waiting:
+                logger.info("[system_state] scheduler ownership lock acquired "
+                             "after waiting (owner=%s)", owner_id)
+            return
+        if not logged_waiting:
+            logger.warning(
+                "[system_state] scheduler ownership lock is currently held by "
+                "another process — waiting (retrying every %ss). This process "
+                "will take over automatically once the current owner's "
+                "heartbeat goes stale (>%ss) or it releases cleanly on exit. "
+                "If you did NOT intend to run two scheduler processes against "
+                "this Supabase project at once, that's likely what's "
+                "happening right now (see Architecture review finding C3).",
+                poll_secs, _SCHEDULER_HEARTBEAT_STALE_AFTER_SECS,
+            )
+            logged_waiting = True
+        time.sleep(poll_secs)
+
+
+def renew_scheduler_heartbeat(owner_id: str) -> bool:
+    """
+    Refreshes the heartbeat for `owner_id`'s scheduler lock. Returns
+    False if `owner_id` no longer actually holds the lock (some other
+    owner must have reclaimed it after ours went stale — e.g. this
+    process was paused too long by a GC pause/debugger breakpoint) —
+    callers should treat False as "stop running immediately", since a
+    False here means another process may now ALSO be running,
+    reintroducing the exact double-scan scenario this lock exists to
+    prevent.
+    """
+    client = _client()
+    if client is None:
+        return True   # fail-open — see try_acquire_scheduler_lock()
+    try:
+        resp = client.rpc("renew_scheduler_heartbeat", {"p_owner": owner_id}).execute()
+        return bool(resp.data)
+    except Exception:
+        logger.exception("renew_scheduler_heartbeat RPC failed (owner=%s) — "
+                          "failing OPEN (assuming ownership still held)", owner_id)
+        return True
+
+
+def release_scheduler_lock(owner_id: str) -> None:
+    """Called on clean shutdown so a restart doesn't have to wait out
+    the full staleness window before reacquiring. Best-effort — if this
+    fails, the lock simply goes stale on its own after
+    _SCHEDULER_HEARTBEAT_STALE_AFTER_SECS."""
+    client = _client()
+    if client is None:
+        return
+    try:
+        client.rpc("release_scheduler_lock", {"p_owner": owner_id}).execute()
+        logger.info("[system_state] scheduler ownership lock released (owner=%s)", owner_id)
+    except Exception:
+        logger.exception("release_scheduler_lock RPC failed (owner=%s) — non-fatal, "
+                          "lock will go stale naturally", owner_id)
+
+
+class SchedulerHeartbeatThread(threading.Thread):
+    """
+    Background thread that renews a held scheduler-ownership lock every
+    _SCHEDULER_HEARTBEAT_INTERVAL_SECS. Exposes `lost_ownership`
+    (threading.Event) — set if a renewal is ever rejected, meaning
+    another process reclaimed the lock after ours went stale. Callers
+    should check `lost_ownership.is_set()` at their own cycle
+    boundaries (alongside should_scheduler_run()) and stop running if
+    it's set, to avoid two processes both scanning at once.
+    """
+    def __init__(self, owner_id: str):
+        super().__init__(name="scheduler-ownership-heartbeat", daemon=True)
+        self.owner_id = owner_id
+        self.lost_ownership = threading.Event()
+        self._stop = threading.Event()
+
+    def run(self):
+        while not self._stop.wait(_SCHEDULER_HEARTBEAT_INTERVAL_SECS):
+            if not renew_scheduler_heartbeat(self.owner_id):
+                logger.error(
+                    "[system_state] scheduler ownership lock LOST (owner=%s) — "
+                    "another process reclaimed it, most likely because this "
+                    "process's heartbeat went stale (paused >%ss, e.g. a long "
+                    "GC pause or debugger break). Stopping to avoid a "
+                    "double-scan against the same Supabase project.",
+                    self.owner_id, _SCHEDULER_HEARTBEAT_STALE_AFTER_SECS,
+                )
+                self.lost_ownership.set()
+                return
+
+    def stop(self):
+        self._stop.set()
+
+
+def start_scheduler_heartbeat(owner_id: str) -> SchedulerHeartbeatThread:
+    """Convenience: start and return a running SchedulerHeartbeatThread
+    for an already-acquired lock. Caller is responsible for calling
+    .stop() (and release_scheduler_lock(owner_id)) on shutdown."""
+    hb = SchedulerHeartbeatThread(owner_id)
+    hb.start()
+    return hb
+
+
 # ─── SCHEMA ─────────────────────────────────────────────────────────────
 # Run ONCE in Supabase → SQL Editor. Safe to re-run (IF NOT EXISTS /
 # CREATE OR REPLACE).
@@ -356,8 +601,16 @@ CREATE TABLE IF NOT EXISTS system_state (
     heartbeat_at             timestamptz,
     manual_override_section  text,
     manual_override_until    timestamptz,
+    scheduler_owner              text,
+    scheduler_owner_heartbeat_at timestamptz,
     updated_at               timestamptz NOT NULL DEFAULT now()
 );
+
+-- 2026-07-25 [Architecture review C3 fix]: adds the two scheduler-
+-- ownership columns to a system_state table that may already exist
+-- from before this fix — safe to re-run.
+ALTER TABLE system_state ADD COLUMN IF NOT EXISTS scheduler_owner text;
+ALTER TABLE system_state ADD COLUMN IF NOT EXISTS scheduler_owner_heartbeat_at timestamptz;
 
 -- Seed the singleton row if it doesn't exist yet.
 INSERT INTO system_state (id, mode) VALUES (1, 'LIVE')
@@ -401,6 +654,68 @@ BEGIN
         END,
         updated_at = now()
     WHERE id = 1;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── Scheduler ownership lock RPCs [Architecture review C3 fix, 2026-07-25] ──
+-- Same atomic-in-Postgres pattern as the backtest lock above, applied to
+-- coordinating scheduler/scan_worker.py vs utils.inprocess_scheduler so
+-- at most one process ever runs the scan loops against this project.
+
+-- Claims the lock for p_owner if it's unclaimed, already held by
+-- p_owner (idempotent re-acquire / heartbeat refresh), or the current
+-- holder's heartbeat is older than p_stale_secs (presumed dead).
+-- Returns true iff p_owner now holds it.
+CREATE OR REPLACE FUNCTION try_acquire_scheduler_lock(p_owner text, p_stale_secs int DEFAULT 120)
+RETURNS boolean AS $$
+DECLARE
+    n_updated int;
+BEGIN
+    UPDATE system_state
+    SET scheduler_owner = p_owner,
+        scheduler_owner_heartbeat_at = now(),
+        updated_at = now()
+    WHERE id = 1
+      AND (
+          scheduler_owner IS NULL
+          OR scheduler_owner = p_owner
+          OR scheduler_owner_heartbeat_at IS NULL
+          OR scheduler_owner_heartbeat_at < now() - (p_stale_secs || ' seconds')::interval
+      );
+    GET DIAGNOSTICS n_updated = ROW_COUNT;
+    RETURN n_updated > 0;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Refreshes the heartbeat for p_owner ONLY if p_owner still actually
+-- holds the lock. Returns false if some other owner now holds it
+-- (e.g. this owner's heartbeat had already gone stale and someone
+-- else reclaimed it) — callers must stop running when this is false.
+CREATE OR REPLACE FUNCTION renew_scheduler_heartbeat(p_owner text)
+RETURNS boolean AS $$
+DECLARE
+    n_updated int;
+BEGIN
+    UPDATE system_state
+    SET scheduler_owner_heartbeat_at = now(),
+        updated_at = now()
+    WHERE id = 1 AND scheduler_owner = p_owner;
+    GET DIAGNOSTICS n_updated = ROW_COUNT;
+    RETURN n_updated > 0;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Releases the lock, but ONLY if p_owner is still the current holder —
+-- an owner that already lost the lock (see renew_scheduler_heartbeat)
+-- must not be able to clear a newer owner's claim on its way out.
+CREATE OR REPLACE FUNCTION release_scheduler_lock(p_owner text)
+RETURNS void AS $$
+BEGIN
+    UPDATE system_state
+    SET scheduler_owner = NULL,
+        scheduler_owner_heartbeat_at = NULL,
+        updated_at = now()
+    WHERE id = 1 AND scheduler_owner = p_owner;
 END;
 $$ LANGUAGE plpgsql;
 """
