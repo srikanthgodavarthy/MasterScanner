@@ -19,12 +19,16 @@ Data source — hardcoded, always, independently of Dashboard:
     THIS scan is also Yahoo Finance (fetch_nifty("1y"), no source= override)
     — see the "Run scan" block below for why that benchmark is pinned to
     one source rather than following any toggle.
-  • On a successful run, this page writes TWO snapshots to Supabase:
+  • On a successful run, this page writes to Supabase:
     save_scan_snapshot() (legacy, narrow, top-50 — kept for history.py/
-    validation.py, unchanged) and save_full_scan_snapshot() (new, full
-    columns/rows — this is the ONLY thing pages/dashboard.py reads to
-    rebuild Market Health/Sector Rotation/Signal Class counts without
-    ever running its own scan).
+    validation.py, unchanged), save_full_scan_snapshot() (full
+    columns/rows — [2026-07-25 correction] this was originally "the
+    ONLY thing pages/dashboard.py reads", but since the C4/C5
+    architecture-review fixes it's now only a FALLBACK dashboard.py
+    uses when live_scanner_snapshots has no rows yet), and
+    save_snapshot("live_scanner", ...) (utils/scan_state.py — this is
+    now the Dashboard's actual PRIMARY read path, via
+    _dash_scan_autorefresh() in pages/dashboard.py).
 
 Session state on this page is namespaced under plain keys ("scan_df",
 "scan_summary", "scan_time", ...) — pages/dashboard.py uses its own
@@ -3097,12 +3101,23 @@ def render(settings: dict | None = None):
 
         if supabase_ok and save_db:
             save_scan_snapshot(df_aug)
-            # [Dashboard/Scanner split] full-result save — this is the ONLY
-            # thing pages/dashboard.py reads to rebuild Market Health /
-            # Sector Rotation / Signal Class counts. save_scan_snapshot()
-            # above only keeps a narrow top-50 subset (kept as-is for
-            # history.py/validation.py, which already depend on it) — this
-            # is a separate, full-column, full-row write.
+            # [Dashboard/Scanner split] full-result save.
+            #
+            # [2026-07-25 correction] This comment previously said this was
+            # "the ONLY thing pages/dashboard.py reads" — that was true when
+            # this was written, but is NOT true anymore. Since the C4/C5
+            # architecture-review fixes, the Dashboard's PRIMARY source for
+            # Market Health / Sector Rotation / Signal Class counts is
+            # live_scanner_snapshots (utils/scan_state.py — see
+            # _dash_scan_autorefresh() in pages/dashboard.py). This table
+            # (scan_full_snapshots) is now only a FALLBACK dashboard.py
+            # reads from when live_scanner_snapshots has no rows yet (a
+            # fresh Supabase project, or the scheduler hasn't run yet) —
+            # see load_latest_full_scan()'s callers there. Still written
+            # here (and pruned via prune_legacy_scan_snapshots(), see
+            # utils/supabase_client.py) to keep that fallback populated;
+            # save_scan_snapshot() above still keeps its own narrow top-50
+            # subset for history.py/validation.py, unrelated to this.
             if not save_full_scan_snapshot(df_aug):
                 logger.warning("save_full_scan_snapshot failed — Dashboard will keep showing its previously loaded scan.")
             # Event-aware snapshot (2026-07-23) — same data, new
@@ -3158,28 +3173,7 @@ def render(settings: dict | None = None):
                     if _transitions:
                         save_lifecycle_transitions(_transitions)
             except Exception:
-                logger.exception("lifecycle snapshot/transitions write failed (non-fatal)")
-
-            # ── Sector Rotation Analysis: persist today's per-sector row ──
-            try:
-                from utils.sector_map import build_sector_stats
-                from utils.sector_rotation import build_sector_snapshot_rows
-                from utils.supabase_client import save_sector_snapshot
-                _sector_stats_today = build_sector_stats(df_aug)
-                _sec_rows = build_sector_snapshot_rows(_sector_stats_today, _today)
-                if _sec_rows:
-                    lead_col = "Legacy_Leadership" if "Legacy_Leadership" in df_aug.columns else (
-                        "Leadership" if "Leadership" in df_aug.columns else None)
-                    if lead_col:
-                        _df_sec = df_aug.copy()
-                        _df_sec["_sector"] = _df_sec["Stock"].astype(str).map(
-                            __import__("utils.sector_map", fromlist=["get_sector"]).get_sector)
-                        _lead_by_sector = _df_sec.groupby("_sector")[lead_col].mean()
-                        for _row in _sec_rows:
-                            _row["avg_leadership"] = float(_lead_by_sector.get(_row["sector"], 0.0) or 0.0)
-                    save_sector_snapshot(_sec_rows)
-            except Exception:
-                logger.exception("sector snapshot write failed (non-fatal)")
+                pass  # non-critical
             # [Restructure 2026-07] Was a persistent full-width st.success()
             # banner that stayed on screen (and pushed everything below it
             # down) until the next scan. A toast confirms the same thing
