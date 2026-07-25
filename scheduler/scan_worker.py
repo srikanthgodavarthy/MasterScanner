@@ -259,6 +259,7 @@ def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
     just be wasted work, same as any other duplicated job).
     """
     from utils.scan_state import prune_all_snapshots
+    from utils.supabase_client import prune_legacy_scan_snapshots
 
     logger.info("[retention] loop starting, every %ss", interval_secs)
     while True:
@@ -267,6 +268,11 @@ def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
             return
         try:
             results = prune_all_snapshots()
+            # [Ops fix, 2026-07-25] scan_snapshots/scan_full_snapshots
+            # (utils/supabase_client.py) — discovered during the write-path
+            # audit to have no retention at all; see prune_legacy_scan_snapshots()'s
+            # docstring.
+            results.update(prune_legacy_scan_snapshots())
             logger.info("[retention] pruned snapshot tables: %s", results)
         except Exception:
             logger.exception("[retention] prune_all_snapshots failed (non-fatal — retrying next cycle)")
