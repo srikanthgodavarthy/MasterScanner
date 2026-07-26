@@ -21,14 +21,17 @@ Data source — hardcoded, always, independently of Dashboard:
     one source rather than following any toggle.
   • On a successful run, this page writes to Supabase:
     save_scan_snapshot() (legacy, narrow, top-50 — kept for history.py/
-    validation.py, unchanged), save_full_scan_snapshot() (full
-    columns/rows — [2026-07-25 correction] this was originally "the
-    ONLY thing pages/dashboard.py reads", but since the C4/C5
-    architecture-review fixes it's now only a FALLBACK dashboard.py
-    uses when live_scanner_snapshots has no rows yet), and
-    save_snapshot("live_scanner", ...) (utils/scan_state.py — this is
-    now the Dashboard's actual PRIMARY read path, via
-    _dash_scan_autorefresh() in pages/dashboard.py).
+    validation.py, unchanged), archive_daily_scan() (full columns/rows,
+    into scan_daily_archive — formerly scan_full_snapshots, renamed and
+    repurposed 2026-07-25. [Final architecture] This is NOT an
+    operational table and is read by NO Dashboard code path — it's a
+    long-term, one-row-per-TRADING-DAY archive for historical/research
+    lookups only; see archive_daily_scan()'s docstring in
+    utils/supabase_client.py), and save_snapshot("live_scanner", ...)
+    (utils/scan_state.py — this is the Dashboard's ONLY operational
+    read path, via _dash_scan_autorefresh() in pages/dashboard.py; an
+    empty live_scanner_snapshots now shows an honest "no scan data yet"
+    state rather than falling back to the archive).
 
 Session state on this page is namespaced under plain keys ("scan_df",
 "scan_summary", "scan_time", ...) — pages/dashboard.py uses its own
@@ -60,7 +63,7 @@ from utils.regime_engine   import (
     regime_summary,
 )
 from utils.supabase_client import (
-    save_scan_snapshot, save_full_scan_snapshot,
+    save_scan_snapshot, archive_daily_scan,
     load_watchlist, add_to_watchlist, _is_available,
 )
 
@@ -3101,25 +3104,22 @@ def render(settings: dict | None = None):
 
         if supabase_ok and save_db:
             save_scan_snapshot(df_aug)
-            # [Dashboard/Scanner split] full-result save.
-            #
-            # [2026-07-25 correction] This comment previously said this was
-            # "the ONLY thing pages/dashboard.py reads" — that was true when
-            # this was written, but is NOT true anymore. Since the C4/C5
-            # architecture-review fixes, the Dashboard's PRIMARY source for
-            # Market Health / Sector Rotation / Signal Class counts is
+            # [Dashboard/Scanner split, updated 2026-07-25] scan_daily_archive
+            # (formerly scan_full_snapshots — renamed+repurposed the same day
+            # as this comment). This is now a long-term ARCHIVE, not an
+            # operational table: the Dashboard's PRIMARY (and, since the
+            # same day's fallback-removal fix, ONLY) source for Market
+            # Health / Sector Rotation / Signal Class counts is
             # live_scanner_snapshots (utils/scan_state.py — see
-            # _dash_scan_autorefresh() in pages/dashboard.py). This table
-            # (scan_full_snapshots) is now only a FALLBACK dashboard.py
-            # reads from when live_scanner_snapshots has no rows yet (a
-            # fresh Supabase project, or the scheduler hasn't run yet) —
-            # see load_latest_full_scan()'s callers there. Still written
-            # here (and pruned via prune_legacy_scan_snapshots(), see
-            # utils/supabase_client.py) to keep that fallback populated;
-            # save_scan_snapshot() above still keeps its own narrow top-50
-            # subset for history.py/validation.py, unrelated to this.
-            if not save_full_scan_snapshot(df_aug):
-                logger.warning("save_full_scan_snapshot failed — Dashboard will keep showing its previously loaded scan.")
+            # _dash_scan_autorefresh() in pages/dashboard.py). This call
+            # writes at most once per TRADING DAY — archive_daily_scan()
+            # itself gates that, so calling it on every manual Run Scan is
+            # intentional and cheap (a fast no-op after the first
+            # successful call each day). save_scan_snapshot() above still
+            # keeps its own narrow top-50 subset for history.py/
+            # validation.py, unrelated to this.
+            if not archive_daily_scan(df_aug, metadata=regime_summary(df_aug, regime_ctx)):
+                logger.warning("archive_daily_scan failed (non-fatal — daily archive just won't have today's row).")
             # Event-aware snapshot (2026-07-23) — same data, new
             # scan_id/version/status table so a manual Run Scan is picked
             # up by the Dashboard's 30s metadata poll immediately instead

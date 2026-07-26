@@ -54,8 +54,17 @@ Data sourcing on this page, by design:
   • Everything computed from the scanned Nifty-500 universe (Market
     Breadth, 52W Hi/Lo, EMA20/200 breadth, Sector Rotation, Signal Class
     counts, Top Gainers, Leadership Rotation) — read from the latest
-    `live_scanner` snapshot (falling back to the legacy
-    utils.supabase_client.load_latest_full_scan() during migration).
+    `live_scanner` snapshot ONLY. [2026-07-25 architecture change] The
+    legacy utils.supabase_client.load_latest_full_scan() migration
+    fallback was removed — live_scanner_snapshots is now the single
+    operational source of truth (per that day's architecture
+    discussion); if it's empty (fresh Supabase project, or the
+    scheduler hasn't produced a completed scan yet), this page shows an
+    honest "no scan data yet" state instead of silently reaching into
+    a different table. The old full-scan table still exists, renamed
+    to scan_daily_archive and repurposed as a once-per-trading-day
+    historical archive (see utils/supabase_client.py's
+    archive_daily_scan()) — nothing on this page reads it.
 
 [Refactor 2026-07] This file was split out of the single, monolithic
 pages/scanner.py (formerly ~4900 lines covering both the market-wide
@@ -78,7 +87,6 @@ import pandas as pd
 from datetime import datetime
 from utils.time_utils import now_ist as _now_ist, IST as _IST
 
-from utils.supabase_client import load_latest_full_scan
 from utils.sector_map      import build_sector_stats
 
 # ── CONSTANTS ─────────────────────────────────────────────────────
@@ -3168,15 +3176,13 @@ def _dash_scan_autorefresh():
             st.rerun()
         return
 
-    if meta is None and "dash_scan_df" not in st.session_state:
-        # Migration fallback: new table has no rows yet (fresh Supabase
-        # project, or scheduler not started) — use the legacy path so the
-        # page isn't empty during rollout.
-        _df, _run_at = load_latest_full_scan()
-        if _run_at and _run_at != st.session_state.get("dash_scan_run_at"):
-            st.session_state["dash_scan_df"]     = _df
-            st.session_state["dash_scan_run_at"] = _run_at
-            st.rerun()
+    # [2026-07-25 architecture change] The legacy-table fallback that used
+    # to live here (load_latest_full_scan(), when live_scanner_snapshots
+    # had no rows yet) was removed — live_scanner_snapshots is now the
+    # single operational source of truth. If it's genuinely empty, we
+    # leave dash_scan_df unset; render() below shows an honest "no scan
+    # data yet" state rather than silently substituting a different
+    # table's data.
 
 
 def render(settings: dict | None = None):
@@ -3215,9 +3221,14 @@ def render(settings: dict | None = None):
             st.session_state["dash_scan_run_at"]  = _full.get("created_at", "")
             st.session_state["dash_scan_version"] = _full.get("version")
         else:
-            _df, _run_at = load_latest_full_scan()
-            st.session_state["dash_scan_df"]      = _df
-            st.session_state["dash_scan_run_at"]  = _run_at
+            # [2026-07-25 architecture change] No fallback to the legacy
+            # full-scan table anymore — live_scanner_snapshots is the
+            # single operational source of truth. An empty result here
+            # means genuinely no completed scan exists yet; shown as an
+            # honest empty state below, not silently backfilled from a
+            # different table.
+            st.session_state["dash_scan_df"]      = pd.DataFrame()
+            st.session_state["dash_scan_run_at"]  = ""
 
     _dash_scan_autorefresh()
 
