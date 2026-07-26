@@ -259,7 +259,7 @@ def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
     just be wasted work, same as any other duplicated job).
     """
     from utils.scan_state import prune_all_snapshots
-    from utils.supabase_client import prune_legacy_scan_snapshots
+    from utils.supabase_client import prune_scan_snapshot_tables
 
     logger.info("[retention] loop starting, every %ss", interval_secs)
     while True:
@@ -268,11 +268,11 @@ def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
             return
         try:
             results = prune_all_snapshots()
-            # [Ops fix, 2026-07-25] scan_snapshots/scan_full_snapshots
+            # [Ops fix, 2026-07-25] scan_snapshots/scan_daily_archive
             # (utils/supabase_client.py) — discovered during the write-path
-            # audit to have no retention at all; see prune_legacy_scan_snapshots()'s
+            # audit to have no retention at all; see prune_scan_snapshot_tables()'s
             # docstring.
-            results.update(prune_legacy_scan_snapshots())
+            results.update(prune_scan_snapshot_tables())
             logger.info("[retention] pruned snapshot tables: %s", results)
         except Exception:
             logger.exception("[retention] prune_all_snapshots failed (non-fatal — retrying next cycle)")
@@ -297,7 +297,7 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
     from utils.live_scanner_job import compute_live_scan_batch, build_regime_context_for_cycle
     from utils.regime_engine import apply_regime_layer
     from utils.scanner_engine import NIFTY500_SYMBOLS
-    from utils.supabase_client import save_scan_snapshot, save_full_scan_snapshot
+    from utils.supabase_client import save_scan_snapshot, archive_daily_scan
     from utils.system_state import should_scheduler_run, manual_override_active, clear_manual_override
 
     symbols = list(NIFTY500_SYMBOLS)
@@ -409,15 +409,33 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
 
         # end of batches loop
 
-        # Legacy tables (history.py / validation.py consumers) — full
-        # merged universe, once per completed cycle, not per batch.
+        # scan_snapshots: still a genuine "legacy" table, kept as-is for
+        # history.py/validation.py's streak calculation — unaffected by
+        # the 2026-07-25 architecture change below.
+        #
+        # scan_daily_archive (formerly one of these "legacy" writes,
+        # renamed+repurposed 2026-07-25): archive_daily_scan() itself
+        # gates this to once per TRADING DAY (see its docstring), so
+        # calling it every completed cycle here is intentional and
+        # cheap — it's a fast no-op after the first successful call
+        # each day. regime_ctx may be None if this cycle's regime fetch
+        # failed (see above) — regime_summary() needs it, so metadata is
+        # only attached when available; the archive itself doesn't
+        # require metadata to succeed (defaults to '{}').
         try:
             full_df = pd.DataFrame(list(merged.values()))
             if not full_df.empty:
                 save_scan_snapshot(full_df)
-                save_full_scan_snapshot(full_df)
+                _archive_metadata = None
+                if regime_ctx is not None:
+                    try:
+                        from utils.regime_engine import regime_summary
+                        _archive_metadata = regime_summary(full_df, regime_ctx)
+                    except Exception:
+                        logger.exception("[live_scanner] regime_summary failed for daily archive metadata (non-fatal)")
+                archive_daily_scan(full_df, metadata=_archive_metadata)
         except Exception:
-            logger.exception("[live_scanner] legacy snapshot write failed (non-fatal)")
+            logger.exception("[live_scanner] legacy/archive snapshot write failed (non-fatal)")
 
         cycle_elapsed = time.time() - cycle_started
         logger.info("[live_scanner] cycle complete: %d/%d symbols merged (%.1fs)",
