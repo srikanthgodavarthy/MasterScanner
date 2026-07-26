@@ -7,9 +7,11 @@ independently of anyone having the Scanner page open.
 This does NOT replace the manual "Run Scan" button — that stays exactly
 as-is for an on-demand re-run (e.g. right after a settings change).
 Both paths now write to the same event-aware `live_scanner_snapshots`
-table via utils.scan_state, in addition to the legacy
-scan_snapshots/scan_full_snapshots tables (kept for
-history.py/validation.py, unchanged).
+table via utils.scan_state (the Dashboard's only operational read
+path), plus scan_snapshots (legacy, kept for history.py/validation.py's
+streak calculation) and scan_daily_archive (formerly
+scan_full_snapshots — renamed+repurposed 2026-07-25 as a long-term,
+one-row-per-trading-day archive; not read by any operational code).
 
 Three entry points
 -------------------

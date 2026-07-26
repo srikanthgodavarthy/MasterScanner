@@ -300,14 +300,18 @@ CREATE INDEX IF NOT EXISTS idx_fo_snap_version ON fo_scan_snapshots(version DESC
 -- independent DELETE statements someone has to remember to keep in
 -- sync.
 -- [Ops fix, 2026-07-25] Extended to also cover scan_snapshots and
--- scan_full_snapshots (utils/supabase_client.py) — a second, older
--- pair of insert-only tables discovered while auditing every Supabase
--- write path; they had NO retention at all until now (they predate
--- this fix and live in a different module, so the original H1 pass
--- never touched them). Those two order by `run_at`, not `version`, so
--- the correct ordering column is picked per-table internally (a CASE,
--- not a caller-supplied column name) rather than trusting the caller —
--- same whitelist-as-defense-in-depth principle as the table name check.
+-- scan_daily_archive (formerly scan_full_snapshots — renamed and
+-- repurposed as a daily archive the same day, see
+-- utils/supabase_client.py's SCHEMA_SQL) — a second, older pair of
+-- insert-only tables discovered while auditing every Supabase write
+-- path; they had NO retention at all until now (they predate this fix
+-- and live in a different module, so the original H1 pass never
+-- touched them). scan_snapshots orders by `run_at`; scan_daily_archive
+-- orders by its own `trading_date` (its actual identity/uniqueness
+-- column post-rename) — the correct ordering column is picked
+-- per-table internally (a CASE, not a caller-supplied column name)
+-- rather than trusting the caller, same whitelist-as-defense-in-depth
+-- principle as the table name check.
 CREATE OR REPLACE FUNCTION prune_snapshot_table(p_table text, p_keep int DEFAULT 500)
 RETURNS int AS $$
 DECLARE
@@ -319,7 +323,7 @@ BEGIN
         WHEN 'live_scanner_snapshots'        THEN 'version'
         WHEN 'fo_scan_snapshots'             THEN 'version'
         WHEN 'scan_snapshots'                THEN 'run_at'
-        WHEN 'scan_full_snapshots'           THEN 'run_at'
+        WHEN 'scan_daily_archive'            THEN 'trading_date'
         ELSE NULL
     END;
     IF order_col IS NULL THEN

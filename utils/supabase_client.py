@@ -154,21 +154,109 @@ def load_scan_history(limit: int = 10) -> pd.DataFrame:
 # DataFrame as one JSON blob per run — Scanner writes it, Dashboard reads
 # the latest one back into an equivalent DataFrame.
 
-def save_full_scan_snapshot(df: pd.DataFrame) -> bool:
+def _latest_archived_trading_date() -> Optional[date]:
     """
-    Persist the FULL scanner result (all rows, all columns) as a single
-    JSON snapshot row in scan_full_snapshots.
+    Lightweight check — returns just the `trading_date` of the most
+    recent scan_daily_archive row (or None if the table is empty /
+    Supabase unavailable), without pulling its `data` JSON blob. Used
+    by archive_daily_scan() to decide whether today's trading day
+    already has an archive row.
+    """
+    client = get_client()
+    if client is None:
+        return None
+    try:
+        resp = (
+            client.table("scan_daily_archive")
+            .select("trading_date")
+            .order("trading_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not resp.data:
+            return None
+        return pd.to_datetime(resp.data[0]["trading_date"]).date()
+    except Exception as exc:
+        logger.error("_latest_archived_trading_date failed: %s", exc)
+        return None
+
+
+def _is_unique_violation_error(exc: Exception) -> bool:
+    """True if `exc` looks like a Postgres unique-constraint violation
+    (code 23505) — i.e. two processes both tried to archive the same
+    trading_date and the DB-level UNIQUE constraint (see SCHEMA_SQL)
+    correctly let only one win. Not an error for archive_daily_scan()'s
+    purposes — the other process already did the job."""
+    msg = str(exc)
+    return "23505" in msg or "duplicate key value violates unique constraint" in msg
+
+
+def archive_daily_scan(df: pd.DataFrame, metadata: Optional[dict] = None) -> bool:
+    """
+    Archive the FULL scanner result (all rows, all columns) as a single
+    immutable JSON row in scan_daily_archive — ONE ROW PER TRADING DAY.
+
+    [2026-07-25 architecture change] This table (formerly
+    scan_full_snapshots, renamed — see SCHEMA_SQL) was originally
+    written on every scan_worker.py cycle AND every manual Run Scan,
+    redundant with live_scanner_snapshots (utils/scan_state.py), which
+    is now the Dashboard's ONLY operational read path (see
+    pages/dashboard.py — the fallback read here was removed the same
+    day; an empty live_scanner_snapshots now shows an honest "no scan
+    data yet" state instead of reaching into this table). Per that
+    architecture (Market Data → Scanner → live_scanner_snapshots →
+    Dashboard → Trade Engine), this table's only remaining purpose is a
+    long-term, immutable, daily ARCHIVE for historical/research
+    lookups — something live_scanner_snapshots can't provide on its
+    own, since it only retains ~500 rows (a day or two at 5-min
+    cadence) before pruning.
+
+    Gating is TWO-LAYERED:
+      1. Application-level: checks _latest_archived_trading_date()
+         before writing at all, so the common case never even attempts
+         a redundant insert.
+      2. Database-level: trading_date has a UNIQUE constraint (see
+         SCHEMA_SQL), so even if two processes both pass check #1 in a
+         race (scheduler's cycle-end write and a manual Run Scan
+         landing on the same trading day), only one insert can ever
+         succeed — the other's unique-violation is caught here and
+         treated as "already archived", not a failure.
+
+    "Trading day" is computed via utils.time_utils.today_ist() (IST
+    calendar day), matching how the rest of the app reasons about
+    trading days — not a naive UTC date, which could be off by one
+    near midnight IST.
+
+    This function is called from the same places as before
+    (scan_worker.py's cycle-end, pages/scanner.py's manual Run Scan) —
+    the gating lives HERE, not at the call sites, so callers don't need
+    their own "should I archive today" logic. It's a fast no-op (one
+    lightweight query, no write) on every call after the first
+    successful one for a given trading day.
 
     Parameters
     ----------
     df : DataFrame returned by run_scanner()/apply_regime_layer() — every
          column is kept as-is.
+    metadata : optional summary dict for historical/research lookups —
+         e.g. utils.regime_engine.regime_summary(df, regime_ctx)'s
+         output (regime/VIX/ADX/breadth-by-tier/avg scores). Stored
+         as-is in the `metadata` jsonb column. Pass None if a regime
+         context isn't available at the call site (metadata defaults
+         to '{}' — the archived `data` itself is unaffected either way).
 
-    Returns True on success, False otherwise.
+    Returns True if archived (or already archived for today's trading
+    day — not an error), False only on an actual failure.
     """
+    from utils.time_utils import today_ist
+
     client = get_client()
     if client is None or df.empty:
         return False
+
+    trading_date = today_ist()
+    if _latest_archived_trading_date() == trading_date:
+        return True   # already archived today — not a failure, just a no-op
 
     run_ts = datetime.now(timezone.utc).isoformat()
 
@@ -178,64 +266,81 @@ def save_full_scan_snapshot(df: pd.DataFrame) -> bool:
         safe_df = df.astype(object).where(pd.notnull(df), None)
         records = json.loads(safe_df.to_json(orient="records", date_format="iso"))
     except Exception as exc:
-        logger.error("save_full_scan_snapshot: serialization failed: %s", exc)
+        logger.error("archive_daily_scan: serialization failed: %s", exc)
         return False
 
     row = {
-        "run_at":    run_ts,
-        "row_count": len(records),
-        "data":      records,
+        "run_at":       run_ts,
+        "trading_date": trading_date.isoformat(),
+        "row_count":    len(records),
+        "metadata":     metadata or {},
+        "data":         records,
     }
 
     try:
-        resp = client.table("scan_full_snapshots").insert(row).execute()
+        resp = client.table("scan_daily_archive").insert(row).execute()
         if resp.data is None:
-            logger.error("scan_full_snapshots insert returned no data.")
+            logger.error("scan_daily_archive insert returned no data.")
             return False
+        logger.info("archive_daily_scan: archived trading day %s (%d rows)", trading_date, len(records))
         return True
     except Exception as exc:
-        logger.error("save_full_scan_snapshot failed: %s", exc)
+        if _is_unique_violation_error(exc):
+            logger.info("archive_daily_scan: trading day %s already archived by another "
+                        "process (unique constraint) — not an error.", trading_date)
+            return True
+        logger.error("archive_daily_scan failed: %s", exc)
         return False
 
 
-def load_latest_full_scan() -> tuple[pd.DataFrame, str]:
+def load_latest_daily_archive() -> tuple[pd.DataFrame, dict, str]:
     """
-    Returns (df, run_at) for the most recent full scan snapshot, or
-    (empty DataFrame, "") if none exists / Supabase is unavailable.
+    Returns (df, metadata, trading_date_str) for the most recently
+    archived trading day, or (empty DataFrame, {}, "") if none exists /
+    Supabase is unavailable.
+
+    [2026-07-25] NOT called by any operational code path — see
+    archive_daily_scan()'s docstring. This exists purely for future
+    historical/research lookups (e.g. a "what did the market look like
+    on date X" page), kept alongside the write side rather than
+    removed, per the 2026-07-25 architecture discussion's explicit
+    goal of preserving that capability.
     """
     client = get_client()
     if client is None:
-        return pd.DataFrame(), ""
+        return pd.DataFrame(), {}, ""
 
     try:
         resp = (
-            client.table("scan_full_snapshots")
-            .select("run_at, data")
-            .order("run_at", desc=True)
+            client.table("scan_daily_archive")
+            .select("trading_date, metadata, data")
+            .order("trading_date", desc=True)
             .limit(1)
             .execute()
         )
         if not resp.data:
-            return pd.DataFrame(), ""
+            return pd.DataFrame(), {}, ""
 
-        latest  = resp.data[0]
-        records = latest.get("data") or []
-        run_at  = latest.get("run_at", "")
+        latest        = resp.data[0]
+        records       = latest.get("data") or []
+        metadata      = latest.get("metadata") or {}
+        trading_date  = latest.get("trading_date", "")
         df = pd.DataFrame(records)
-        return df, run_at
+        return df, metadata, trading_date
     except Exception as exc:
-        logger.error("load_latest_full_scan failed: %s", exc)
-        return pd.DataFrame(), ""
+        logger.error("load_latest_daily_archive failed: %s", exc)
+        return pd.DataFrame(), {}, ""
 
 
 # ─── RETENTION [Ops fix, 2026-07-25] ────────────────────────────────────
-# scan_snapshots and scan_full_snapshots are both insert-only and, until
-# this fix, had NO cleanup at all — discovered while auditing every
-# Supabase write path in the app (they predate, and live in a separate
-# module from, utils/scan_state.py's snapshot-retention fix, which never
-# touched these two). Both now prune via the same prune_snapshot_table()
-# RPC utils/scan_state.py's tables already use (extended there to
-# support run_at-ordered tables, not just version-ordered ones).
+# scan_snapshots and scan_daily_archive (formerly scan_full_snapshots)
+# are both insert-only. scan_snapshots had NO cleanup at all until this
+# fix — discovered while auditing every Supabase write path in the app
+# (it predates, and lives in a separate module from, utils/scan_state.py's
+# snapshot-retention fix, which never touched it). Both prune via the
+# same prune_snapshot_table() RPC utils/scan_state.py's tables already
+# use (extended there to support run_at-ordered tables, not just
+# version-ordered ones).
 #
 # scan_snapshots keeps far MORE rows than the other snapshot tables'
 # defaults (500) — it stores ~50 rows per scan (top-50 subset), and
@@ -245,40 +350,44 @@ def load_latest_full_scan() -> tuple[pd.DataFrame, str]:
 # feature by discarding history it still actively reads. 5,000 gives
 # ~100 scans of headroom above what's actually consumed today.
 #
-# scan_full_snapshots is one row per full scan (same shape as the other
-# snapshot tables) and only ever read as a single latest row
-# (load_latest_full_scan()'s `.limit(1)`) or for occasional history/
-# debugging per its own schema comment — the standard 500-row default
-# is already generous for that.
+# scan_daily_archive keeps MUCH more than the other tables too, but for
+# the opposite reason — it's now genuinely meant to be a long-term
+# archive (one row per TRADING DAY, not per scan/cycle — see
+# archive_daily_scan()), so a generous keep-count is cheap: 3,650 rows
+# is ~10 years of daily history before the oldest row would ever be
+# pruned, which functions as a safety cap against unbounded growth
+# (e.g. if a future bug ever bypassed the one-row-per-day UNIQUE
+# constraint) rather than a practically-reached limit.
 _SCAN_SNAPSHOTS_KEEP_ROWS = 5000
-_SCAN_FULL_SNAPSHOTS_KEEP_ROWS = 500
+_SCAN_DAILY_ARCHIVE_KEEP_ROWS = 3650
 
 
-def prune_legacy_scan_snapshots() -> dict:
+def prune_scan_snapshot_tables() -> dict:
     """
-    Prunes scan_snapshots and scan_full_snapshots down to their
+    Prunes scan_snapshots and scan_daily_archive down to their
     respective retention windows (see module comment above for why
-    their keep-counts differ). Called periodically by
+    their keep-counts differ so much). Called periodically by
     scheduler/scan_worker.py's _run_retention_loop(), alongside
-    utils.scan_state.prune_all_snapshots() for the newer three tables.
+    utils.scan_state.prune_all_snapshots() for the operational three
+    (market_intelligence/live_scanner/fo_scan) tables.
     Returns {table_name: n_deleted_or_None}; None means the prune
     failed (logged, non-fatal — same fail-soft convention as
     utils.scan_state.prune_old_snapshots()).
     """
     client = get_client()
     if client is None:
-        return {"scan_snapshots": None, "scan_full_snapshots": None}
+        return {"scan_snapshots": None, "scan_daily_archive": None}
 
     results = {}
     for table, keep in (
         ("scan_snapshots", _SCAN_SNAPSHOTS_KEEP_ROWS),
-        ("scan_full_snapshots", _SCAN_FULL_SNAPSHOTS_KEEP_ROWS),
+        ("scan_daily_archive", _SCAN_DAILY_ARCHIVE_KEEP_ROWS),
     ):
         try:
             resp = client.rpc("prune_snapshot_table", {"p_table": table, "p_keep": keep}).execute()
             n = resp.data
             if n:
-                logger.info("prune_legacy_scan_snapshots(%s): deleted %s row(s), keeping latest %s",
+                logger.info("prune_scan_snapshot_tables(%s): deleted %s row(s), keeping latest %s",
                             table, n, keep)
             results[table] = n
         except Exception as exc:
@@ -286,7 +395,7 @@ def prune_legacy_scan_snapshots() -> dict:
             if _is_missing_function_error(exc):
                 _log_migration_required_once("prune_snapshot_table", "prune_snapshot_table")
             else:
-                logger.exception("prune_legacy_scan_snapshots(%s) failed (non-fatal — will retry next cycle)", table)
+                logger.exception("prune_scan_snapshot_tables(%s) failed (non-fatal — will retry next cycle)", table)
             results[table] = None
     return results
 
@@ -1270,16 +1379,60 @@ CREATE TABLE IF NOT EXISTS scan_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_scan_snapshots_run_at ON scan_snapshots(run_at DESC);
 
--- 1b. Full scan snapshots (Dashboard/Scanner split, 2026-07) — one row per
---     completed Scanner run, whole result as JSON. pages/dashboard.py reads
---     only the single latest row; older rows are kept for history/debugging.
-CREATE TABLE IF NOT EXISTS scan_full_snapshots (
-    id         bigserial PRIMARY KEY,
-    run_at     timestamptz NOT NULL DEFAULT now(),
-    row_count  integer     NOT NULL DEFAULT 0,
-    data       jsonb       NOT NULL
+-- 1b. Daily scan archive (2026-07, renamed+repurposed 2026-07-25).
+--
+--     ARCHITECTURE (per the 2026-07-25 discussion): live_scanner_snapshots
+--     (utils/scan_state.py) is the ONLY operational source of truth the
+--     Dashboard and runtime logic read from. This table is a SEPARATE,
+--     deliberately-decoupled long-term ARCHIVE — one immutable row per
+--     TRADING DAY (not per scan, not per cycle), carrying the full
+--     scanner result plus a `metadata` summary (regime/VIX/ADX/breadth —
+--     see utils.regime_engine.regime_summary()) for historical/research
+--     lookups. Nothing operational reads from this table; the Dashboard
+--     shows an honest "no scan data yet" state if live_scanner_snapshots
+--     is empty, rather than falling back here (see pages/dashboard.py).
+--
+--     `trading_date` + the UNIQUE constraint below enforce "one row per
+--     day" at the database level, not just in application logic — two
+--     processes (scheduler + a manual Run Scan) racing to archive the
+--     same day both attempt the insert; the DB guarantees only one wins,
+--     and utils.supabase_client.archive_daily_scan() treats the other's
+--     unique-violation as "already archived today", not an error.
+--
+--     Safe/idempotent to run this block again on a deployment that
+--     already had the OLD scan_full_snapshots table — the DO block
+--     renames it in place (keeping existing archived rows) only if the
+--     old name still exists and the new one doesn't; every ALTER/CREATE
+--     below is itself also IF EXISTS/IF NOT EXISTS-guarded.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'scan_full_snapshots')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'scan_daily_archive')
+    THEN
+        ALTER TABLE scan_full_snapshots RENAME TO scan_daily_archive;
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS scan_daily_archive (
+    id            bigserial PRIMARY KEY,
+    run_at        timestamptz NOT NULL DEFAULT now(),
+    trading_date  date        NOT NULL DEFAULT CURRENT_DATE,
+    row_count     integer     NOT NULL DEFAULT 0,
+    metadata      jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    data          jsonb       NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_scan_full_snapshots_run_at ON scan_full_snapshots(run_at DESC);
+-- Backfill for rows that existed before trading_date/metadata existed
+-- (i.e. migrated from the old scan_full_snapshots) — best-effort, UTC
+-- calendar date of run_at; exact historical accuracy for old,
+-- already-superseded rows doesn't matter, only going forward does.
+ALTER TABLE scan_daily_archive ADD COLUMN IF NOT EXISTS trading_date date;
+UPDATE scan_daily_archive SET trading_date = run_at::date WHERE trading_date IS NULL;
+ALTER TABLE scan_daily_archive ALTER COLUMN trading_date SET NOT NULL;
+ALTER TABLE scan_daily_archive ALTER COLUMN trading_date SET DEFAULT CURRENT_DATE;
+ALTER TABLE scan_daily_archive ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+CREATE UNIQUE INDEX IF NOT EXISTS scan_daily_archive_trading_date_unique ON scan_daily_archive(trading_date);
+CREATE INDEX IF NOT EXISTS idx_scan_daily_archive_run_at ON scan_daily_archive(run_at DESC);
 
 -- 2. Backtest results
 CREATE TABLE IF NOT EXISTS backtest_results (
