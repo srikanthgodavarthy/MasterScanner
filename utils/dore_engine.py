@@ -913,19 +913,19 @@ def compute_effective_bias(
     # ── same-day evidence sub-scores (0-100, 100=most bullish) ─────
     ev_scores: list[tuple[float, float]] = []   # (score, weight)
     if inp.vwap > 0 and inp.price > 0:
-        ev_scores.append((100.0 if inp.price > inp.vwap else 0.0, 20.0))
+        ev_scores.append((100.0 if inp.price > inp.vwap else 0.0, cfg.w_reversal_vwap))
     if atr_mult is not None:
         move_strength = min(1.0, atr_mult / max(required_atr_mult, 0.01))
         move_score = 50.0 + (50.0 * move_strength if reversal_alert.move_direction == "UP"
                               else (-50.0 * move_strength if reversal_alert.move_direction == "DOWN" else 0.0))
-        ev_scores.append((_clamp(move_score), 40.0))
+        ev_scores.append((_clamp(move_score), cfg.w_reversal_atr_move))
     if inp.fresh_crossover:
-        ev_scores.append((100.0, 15.0))
+        ev_scores.append((100.0, cfg.w_reversal_ema_cross))
     elif inp.fresh_crossunder:
-        ev_scores.append((0.0, 15.0))
+        ev_scores.append((0.0, cfg.w_reversal_ema_cross))
     oi_score = _raw_oi_bullish_score(inp, cfg)
     if oi_score is not None:
-        ev_scores.append((oi_score, 25.0))
+        ev_scores.append((oi_score, cfg.w_reversal_oi))
         reasons.append(f"OI/PCR read (direction-agnostic)={oi_score:.0f}")
 
     intraday_score = _weighted(ev_scores) if ev_scores else 50.0
