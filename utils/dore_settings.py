@@ -86,6 +86,31 @@ DORE_DEFAULTS: dict = {
     "reversal_alert_move_pct_min": 1.5,   # |intraday % move from day_open| >= this to qualify
     "reversal_alert_atr_mult_min": 0.75,  # AND move >= this many multiples of daily ATR
 
+    # ── Effective Bias (2026-07-27) — SG's hybrid daily/intraday design ─
+    # Stage 1's Directional Intent stays a persistent daily read (see its
+    # own docstring) — this layer sits BETWEEN Stage 1 and Stage 2 and
+    # blends it with same-day evidence rather than passing it through
+    # untouched. Two mechanisms:
+    #   1. Weighted blend, every poll: daily_weight% Trend Score +
+    #      intraday_weight% same-day evidence score (VWAP side, move off
+    #      day_open, fresh EMA cross) -> re-bucketed via the existing
+    #      trend_bullish_score_min/trend_bearish_score_max thresholds.
+    #      Under normal conditions this rarely flips the bucket by itself
+    #      — it's meant to soften the blend near the boundary, not replace
+    #      Stage 1.
+    #   2. Override, only on an EXCEPTIONAL same-day move (stricter than
+    #      the Intraday Reversal Alert's own floors below) — the effective
+    #      intent is forced to match today's move direction outright, and
+    #      intraday_override_active=True ships an "Intraday Override
+    #      Active" badge. This is the only place daily bias is fully
+    #      overridden rather than blended.
+    # See compute_effective_bias() in dore_engine.py.
+    "intraday_override_enabled":      True,
+    "effective_bias_daily_weight":    65.0,   # % weight on Stage 1's Trend Score
+    "effective_bias_intraday_weight": 35.0,   # % weight on same-day evidence score
+    "override_move_pct_min":           2.5,   # stricter than reversal_alert_move_pct_min (1.5)
+    "override_atr_mult_min":           1.5,   # stricter than reversal_alert_atr_mult_min (0.75)
+
     # ── Stage 3: Derivative Intelligence (Derivative Confidence) ─
     # Live Upstox option chain — the one expensive stage. Refresh 30-60s
     # or on Live Candidate Pool change.
@@ -252,6 +277,12 @@ class DORESettings:
 
     reversal_alert_move_pct_min: float = 1.5
     reversal_alert_atr_mult_min: float = 0.75
+
+    intraday_override_enabled: bool = True
+    effective_bias_daily_weight: float = 65.0
+    effective_bias_intraday_weight: float = 35.0
+    override_move_pct_min: float = 2.5
+    override_atr_mult_min: float = 1.5
 
     oi_pcr_bull_min: float = 1.10
     oi_pcr_bear_max: float = 0.85
