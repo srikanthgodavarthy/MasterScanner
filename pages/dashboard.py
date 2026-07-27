@@ -2123,281 +2123,398 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
 """
 
 
-# ── TOP GAINERS TODAY PANEL ──────────────────────────────────────────
-# ── TOP GAINERS TODAY PANEL ──────────────────────────────────────────
+# ── SECTOR ROTATION ANALYSIS (full panel, replaces the old Top Gainers /
+# Sector Opportunity Board / Leadership Rotation row) ──────────────────
+# Built on utils.sector_rotation's compute_rotation_metrics()/
+# compute_rotation_timeline()/compute_sector_flow() — the persistence
+# layer connecting sector_snapshots to these three functions was wired
+# in the [2026-07-26] change below; compute_rotation_timeline()/
+# compute_sector_flow() had no call site anywhere until this panel.
+#
+# Tier-count honesty note: build_sector_stats()'s EliteCount/
+# ExecuteCount/WatchCount (checked against the short "Elite"/"Execute"/
+# "Watch" tokens) is a DIFFERENT convention from this module's
+# _CATEGORY_TO_SC long-form mapping ("Elite Opportunity"/"High
+# Conviction"/...) used for the Signal Class pills elsewhere on this
+# page — both read a column named "Recommendation" but expect different
+# value sets, a pre-existing inconsistency in the codebase (not
+# introduced here). This panel uses build_sector_stats()'s own
+# EliteCount/ExecuteCount/WatchCount for the Total Opportunities /
+# per-bucket breakdowns rather than inventing a fourth "Actionable"
+# bucket with no matching field in the sector-stats pipeline, so the
+# numbers shown always foot exactly to what's persisted in
+# sector_snapshots.
 
-def _top_gainers_panel(df: pd.DataFrame, top_n: int = 10) -> str:
-    if df is None or df.empty or "%Chg" not in df.columns:
-        return '<div class="ti-panel"><div class="ti-panel-title">🔥 TOP GAINERS TODAY</div>' \
-               '<div style="color:var(--muted);font-size:11px">No data</div></div>'
+_SR_SECTOR_ICON = {
+    "Healthcare": "❤️", "Pharma": "💊", "Textiles": "🧵", "Banking": "🏦",
+    "Financials": "🏛️", "Media": "📺", "Chemicals": "🧪", "Engineering": "⚙️",
+    "IT": "💻", "Power": "⚡", "Auto": "🚗", "FMCG": "🛒", "Realty": "🏗️",
+    "Metals": "⛏️", "Oil & Gas": "🛢️", "Defence": "🛡️", "Cement": "🧱",
+    "Telecom": "📡", "Diversified": "🔀", "Capital Goods": "🏭",
+    "Consumer Durables": "🛋️",
+}
 
-    work = df.copy()
-    work["_chg"] = pd.to_numeric(work["%Chg"], errors="coerce")
-    top = work.sort_values("_chg", ascending=False).head(top_n)
+_SR_DIRECTION_STYLE = {
+    "Rotating In":  ("#3fb950", "↑"),
+    "Stable":       ("#d29922", "→"),
+    "Rotating Out": ("#f85149", "↓"),
+}
 
-    rows = []
-    for i, (_, row) in enumerate(top.iterrows(), start=1):
-        sym = row.get("Stock", "—")
-        chg = row.get("_chg", 0) or 0
-        rec = str(row.get("Recommendation", "")).strip()
-        color, label = _SC_STYLE.get(rec.upper(), ("#484f58", "Not Qualified"))
-        badge_label = label if rec else "Not Qualified"
-        try:
-            price = float(row.get("CMP", 0) or row.get("LTP", 0) or row.get("Entry", 0) or 0)
-        except (TypeError, ValueError):
-            price = 0.0
-        price_html = f'<span class="ti-gainers-price">₹{price:,.2f}</span>' if price > 0 else '<span class="ti-gainers-price"></span>'
-        sym_html = _tv_link(str(sym)) if sym != "—" else sym
-        rows.append(
-            f'<div class="ti-gainers-row">'
-            f'<span class="ti-gainers-rank">{i}</span>'
-            f'<span class="ti-gainers-sym">{sym_html}</span>'
-            f'{price_html}'
-            f'<span class="ti-gainers-chg">+{chg:.2f}%</span>'
-            f'<span class="ti-gainers-badge" style="background:{color}22;color:{color};border:1px solid {color}55">'
-            f'{badge_label}</span>'
-            f'</div>'
-        )
+_SR_ACTION_STYLE = {
+    "BUY":        "#3fb950",
+    "ACCUMULATE": "#d29922",
+    "WATCH":      "#58a6ff",
+    "REDUCE":     "#f0883e",
+    "EXIT":       "#f85149",
+}
 
-    return f"""
-<div class="ti-panel">
-  <div class="ti-panel-title">🔥 TOP GAINERS TODAY</div>
-  {"".join(rows)}
-</div>
+_SR_CSS = """
+<style>
+.sr-wrap { font-family:'JetBrains Mono',monospace; color:#e6edf3; }
+.sr-cards { display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin:12px 0 16px; }
+.sr-card  { background:#111826; border:1px solid #1e293b; border-radius:10px; padding:14px 16px; }
+.sr-card-label { font-size:0.68rem; letter-spacing:0.06em; color:#8b949e; display:flex; align-items:center; gap:6px; }
+.sr-card-num   { font-size:1.7rem; font-weight:800; margin-top:6px; }
+.sr-card-sub   { font-size:0.68rem; color:#8b949e; margin-top:2px; }
+.sr-card-opp   { font-size:1.15rem; font-weight:700; margin-top:8px; }
+.sr-card-delta.up   { color:#3fb950; }
+.sr-card-delta.down { color:#f85149; }
+
+.sr-panel { background:#111826; border:1px solid #1e293b; border-radius:10px; padding:16px; }
+.sr-panel-title { font-size:0.82rem; font-weight:700; letter-spacing:0.03em; margin-bottom:10px; }
+
+table.sr-table { width:100%; border-collapse:collapse; font-size:0.8rem; }
+table.sr-table th { text-align:left; color:#8b949e; font-weight:600; font-size:0.68rem;
+                     letter-spacing:0.05em; padding:6px 8px; border-bottom:1px solid #1e293b; }
+table.sr-table td { padding:8px; border-bottom:1px solid #161d2c; vertical-align:middle; }
+.sr-sector-name { display:flex; align-items:center; gap:8px; font-weight:600; }
+.sr-pos { color:#3fb950; } .sr-neg { color:#f85149; }
+.sr-action-badge { display:inline-block; padding:3px 12px; border-radius:5px; font-size:0.7rem;
+                    font-weight:700; text-align:center; min-width:78px; }
+
+.sr-flow-col-title { font-size:0.7rem; font-weight:700; margin-bottom:8px; }
+.sr-flow-row { display:flex; justify-content:space-between; font-size:0.78rem; padding:4px 0; }
+
+.sr-timeline table { width:100%; border-collapse:collapse; font-size:0.72rem; }
+.sr-timeline th { color:#8b949e; font-weight:600; text-align:center; padding:4px; }
+.sr-timeline td { text-align:center; padding:3px; }
+.sr-tl-pill { display:inline-block; padding:3px 9px; border-radius:5px; font-size:0.68rem;
+              font-weight:600; min-width:64px; }
+
+.sr-focus-cards { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:14px 0; }
+.sr-focus-card { background:#111826; border:1px solid #1e293b; border-radius:10px; padding:14px; }
+.sr-focus-rank { display:inline-block; width:20px; height:20px; border-radius:50%; text-align:center;
+                 line-height:20px; font-size:0.7rem; font-weight:700; color:#0a0e1a; }
+.sr-focus-name { font-size:1.05rem; font-weight:700; margin-top:8px; }
+.sr-focus-score-label { font-size:0.68rem; color:#8b949e; margin-top:8px; }
+.sr-focus-score { font-size:1.5rem; font-weight:800; }
+
+.sr-calc-row { display:flex; justify-content:space-between; gap:8px; margin-top:10px; }
+.sr-calc-item { flex:1; text-align:center; font-size:0.65rem; color:#8b949e; }
+.sr-calc-icon { font-size:1.1rem; }
+
+.sr-footer { display:flex; justify-content:space-between; font-size:0.72rem; color:#8b949e;
+             border-top:1px solid #1e293b; margin-top:16px; padding-top:10px; }
+</style>
 """
 
 
-# ── SECTOR OPPORTUNITY BOARD PANEL ────────────────────────────────────
-# ── SECTOR OPPORTUNITY BOARD PANEL ────────────────────────────────────
-
-def _opp_color(score: float) -> str:
-    """Background color for a sector card, banded by OppScore (0-100) --
-    deep green at the top, deep red at the bottom, matching the reference
-    design's saturation banding."""
-    if score >= 80: return "#1f7a3d"
-    if score >= 60: return "#2d8f4e"
-    if score >= 45: return "#8a6d1f"
-    if score >= 30: return "#8f2d2d"
-    return "#a11d1d"
+def _sr_tier_bucket_counts(stats: pd.DataFrame) -> dict:
+    """Elite/Execute/Watch counts + total, straight off build_sector_stats()."""
+    if stats is None or stats.empty:
+        return {"Elite": 0, "Execute": 0, "Watch": 0, "Total": 0}
+    elite = int(stats.get("EliteCount", pd.Series(dtype=int)).sum())
+    execute = int(stats.get("ExecuteCount", pd.Series(dtype=int)).sum())
+    watch = int(stats.get("WatchCount", pd.Series(dtype=int)).sum())
+    return {"Elite": elite, "Execute": execute, "Watch": watch,
+            "Total": elite + execute + watch}
 
 
-_TREND_ARROW = {"up": "↑", "down": "↓", "neutral": "→"}
+def _sr_prior_day_metrics(history: pd.DataFrame):
+    """Recompute rotation metrics as of the previous persisted scan date
+    (not today's), purely for vs-yesterday deltas. Returns (metrics_df,
+    day_stats_df) or (None, None) if fewer than 2 persisted days exist."""
+    from utils.sector_rotation import compute_rotation_metrics as _crm
+    if history is None or history.empty or "scan_date" not in history.columns:
+        return None, None
+    dates = sorted(history["scan_date"].unique())
+    if len(dates) < 2:
+        return None, None
+    prior_date = dates[-2]
+    day_rows = history[history["scan_date"] == prior_date].copy()
+    day_stats = day_rows.rename(columns={
+        "sector": "Sector", "avg_chg": "AvgChg", "opp_score": "OppScore",
+        "net_inflow_cr": "NetInflowCr", "elite_count": "EliteCount",
+        "execute_count": "ExecuteCount", "watch_count": "WatchCount",
+        "stock_count": "StockCount",
+    })
+    older_hist = history[history["scan_date"] < prior_date]
+    metrics = _crm(older_hist, day_stats)
+    return metrics, day_stats
 
 
-def _sparkline_svg(values: list[float], color: str = "rgba(255,255,255,0.85)",
-                    width: int = 54, height: int = 15) -> str:
-    """Small inline trend line from real recent daily values (cumulative
-    sum of AvgChg, so a run of positive days reads as a rising line).
-    Falls back to a flat dash when there isn't enough history yet --
-    honest about the cold-start rather than faking a trend."""
-    if not values or len(values) < 2:
-        y = height / 2
-        return (f'<svg class="ti-sob-spark" width="{width}" height="{height}" viewBox="0 0 {width} {height}">'
-                f'<line x1="2" y1="{y}" x2="{width-2}" y2="{y}" stroke="{color}" stroke-width="1.4" opacity="0.45"/></svg>')
-    lo, hi = min(values), max(values)
-    span = (hi - lo) or 1.0
-    step = (width - 4) / (len(values) - 1)
-    pts = []
-    for i, v in enumerate(values):
-        x = 2 + i * step
-        y = height - 2 - ((v - lo) / span) * (height - 4)
-        pts.append(f"{x:.1f},{y:.1f}")
-    return (f'<svg class="ti-sob-spark" width="{width}" height="{height}" viewBox="0 0 {width} {height}">'
-            f'<polyline points="{" ".join(pts)}" fill="none" stroke="{color}" '
-            f'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>')
+def _sr_bucket_opportunity_total(stats: pd.DataFrame, metrics: pd.DataFrame, direction: str) -> int:
+    """Elite+Execute+Watch summed over sectors currently classified in `direction`."""
+    if stats is None or stats.empty or metrics is None or metrics.empty:
+        return 0
+    merged = stats.merge(metrics[["Sector", "Direction"]], on="Sector", how="left")
+    bucket = merged[merged["Direction"] == direction]
+    if bucket.empty:
+        return 0
+    return int(bucket[["EliteCount", "ExecuteCount", "WatchCount"]].sum().sum())
 
 
-def _sector_opportunity_board_panel(sector_stats: pd.DataFrame,
-                                     history: pd.DataFrame | None = None,
-                                     max_tiles: int = 12) -> str:
-    if sector_stats is None or sector_stats.empty:
-        return '<div class="ti-panel"><div class="ti-panel-title">🧭 SECTOR OPPORTUNITY BOARD</div>' \
-               '<div style="color:var(--muted);font-size:11px">No sector data</div></div>'
+def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.DataFrame,
+                                       sector_history: pd.DataFrame, as_of, run_at: str) -> None:
+    """Renders the full Sector Rotation Analysis block: summary cards,
+    main dashboard table, Today's Sector Flow, Sector Rotation Timeline,
+    Top Sectors to Focus Today, How It's Calculated, footer. Call inside
+    an already-running Streamlit script (uses st.markdown/st.columns
+    directly rather than returning HTML, since the two-column layout
+    needs real st.columns)."""
+    from utils.sector_rotation import compute_rotation_metrics, compute_rotation_timeline, compute_sector_flow
 
-    # Real recent daily AvgChg per sector (cumulative, for the sparkline) --
-    # only present once sector_snapshots has accumulated a few days.
-    spark_by_sector: dict[str, list[float]] = {}
-    if history is not None and not history.empty and "sector" in history.columns:
-        for sector, grp in history.groupby("sector"):
-            vals = pd.to_numeric(grp.sort_values("scan_date")["avg_chg"], errors="coerce").fillna(0.0).tail(8).tolist()
-            spark_by_sector[sector] = list(pd.Series(vals).cumsum())
+    st.markdown(_SR_CSS, unsafe_allow_html=True)
 
-    tiles = sector_stats.sort_values("OppScore", ascending=False).head(max_tiles)
-    cells = []
-    for _, row in tiles.iterrows():
-        sector = str(row["Sector"])
-        score  = float(row.get("OppScore", 0) or 0)
-        trend  = str(row.get("Trend", "neutral"))
-        color  = _opp_color(score)
-        arrow  = _TREND_ARROW.get(trend, "→")
-        e_ct, x_ct, w_ct = int(row.get("EliteCount", 0)), int(row.get("ExecuteCount", 0)), int(row.get("WatchCount", 0))
-        spark  = _sparkline_svg(spark_by_sector.get(sector, []))
-        cells.append(
-            f'<div class="ti-sob-card" style="background:{color}">'
-            f'<div class="ti-sob-top"><span class="ti-sob-name">{sector}</span>'
-            f'<span class="ti-sob-trend {trend}">{arrow}</span></div>'
-            f'<div class="ti-sob-score">{score:.0f}</div>'
-            f'<div class="ti-sob-meta">E {e_ct} &middot; X {x_ct} &middot; W {w_ct}</div>'
-            f'{spark}'
-            f'</div>'
-        )
+    rotation_metrics = compute_rotation_metrics(sector_history, sector_stats)
+    timeline = compute_rotation_timeline(sector_history)
+    flow = compute_sector_flow(sector_stats)
+    prior_metrics, prior_stats = _sr_prior_day_metrics(sector_history)
 
-    legend = """
-<div class="ti-sob-legend">
-  <div class="ti-sob-legend-title">Leadership Score</div>
-  <div class="ti-sob-legend-range">(0 &ndash; 100)</div>
-  <div class="ti-sob-legend-title">Entry Quality Score</div>
-  <div class="ti-sob-legend-range">(0 &ndash; 100)</div>
-  <div class="ti-sob-legend-title" style="margin-top:6px">Trend</div>
-  <div class="ti-sob-legend-key">↑ <span>Improving</span></div>
-  <div class="ti-sob-legend-key">→ <span>Neutral</span></div>
-  <div class="ti-sob-legend-key">↓ <span>Weakening</span></div>
-  <div class="ti-sob-legend-title" style="margin-top:6px"><b>E</b>: Elite &middot; <b>X</b>: Execute &middot; <b>W</b>: Watch</div>
-</div>
-"""
+    st.markdown('<div class="sr-wrap">', unsafe_allow_html=True)
+    st.markdown('<div class="sr-panel-title" style="font-size:1rem;">📊 SECTOR ROTATION ANALYSIS</div>'
+                 '<div style="font-size:0.78rem;color:#8b949e;margin-bottom:4px;">'
+                 'Identify where money is moving and which sectors offer the best opportunities</div>',
+                 unsafe_allow_html=True)
 
-    return f"""
-<div class="ti-panel">
-  <div class="ti-panel-title">🧭 SECTOR OPPORTUNITY BOARD</div>
-  <div class="ti-sob-wrap">
-    <div class="ti-sob-grid">{"".join(cells)}</div>
-    {legend}
-  </div>
-  <div class="ti-sob-hint">Click a sector to filter scanner &rarr;</div>
-</div>
-"""
+    # ── summary cards ───────────────────────────────────────────────
+    tiers = _sr_tier_bucket_counts(sector_stats)
+    buckets = {}
+    for d in ("Rotating In", "Stable", "Rotating Out"):
+        n_sectors = int((rotation_metrics["Direction"] == d).sum()) if not rotation_metrics.empty else 0
+        opp_total = _sr_bucket_opportunity_total(sector_stats, rotation_metrics, d)
+        opp_prior = _sr_bucket_opportunity_total(prior_stats, prior_metrics, d) if prior_metrics is not None else None
+        delta = None if opp_prior is None else opp_total - opp_prior
+        buckets[d] = (n_sectors, opp_total, delta)
 
+    net_inflow_5d = round(float(rotation_metrics["NetInflow5D"].sum()), 0) if not rotation_metrics.empty else 0.0
+    net_inflow_5d_prior = (round(float(prior_metrics["NetInflow5D"].sum()), 0)
+                            if prior_metrics is not None and not prior_metrics.empty else None)
+    net_inflow_delta = None if net_inflow_5d_prior is None else round(net_inflow_5d - net_inflow_5d_prior, 0)
 
-# ── LEADERSHIP ROTATION PANEL (Sector Momentum + Net Inflow) ──────────
-# ── LEADERSHIP ROTATION PANEL (Sector Momentum + Net Inflow) ──────────
+    def _delta_html(delta, unit=""):
+        if delta is None:
+            return '<div class="sr-card-sub">vs Yesterday —</div>'
+        cls = "up" if delta >= 0 else "down"
+        sign = "+" if delta >= 0 else ""
+        return f'<div class="sr-card-sub">vs Yesterday <span class="sr-card-delta {cls}">{sign}{delta:g}{unit}</span></div>'
 
-def _donut_ring_svg(fraction: float, color: str, size: int = 108, stroke: int = 10) -> str:
-    fraction = max(0.0, min(1.0, fraction))
-    r = (size - stroke) / 2
-    circumference = 2 * 3.14159265 * r
-    dash = fraction * circumference
-    return (
-        f'<svg width="{size}" height="{size}" viewBox="0 0 {size} {size}">'
-        f'<circle cx="{size/2}" cy="{size/2}" r="{r}" fill="none" '
-        f'stroke="rgba(255,255,255,0.08)" stroke-width="{stroke}"/>'
-        f'<circle cx="{size/2}" cy="{size/2}" r="{r}" fill="none" stroke="{color}" '
-        f'stroke-width="{stroke}" stroke-dasharray="{dash:.2f} {circumference:.2f}" '
-        f'stroke-linecap="round" transform="rotate(-90 {size/2} {size/2})"/>'
-        f'</svg>'
-    )
-
-
-def _leadership_rotation_panel(sector_stats: pd.DataFrame,
-                                rotation_metrics: pd.DataFrame | None = None,
-                                limit: int = 10) -> str:
-    if sector_stats is None or sector_stats.empty:
-        return '<div class="ti-panel"><div class="ti-panel-title">⇅ LEADERSHIP ROTATION</div>' \
-               '<div style="color:var(--muted);font-size:11px">No sector data</div></div>'
-
-    has_history = rotation_metrics is not None and not rotation_metrics.empty
-
-    # ── Sector Momentum (vs 20D ago) — falls back to today's AvgChg,
-    #    clearly noted, until sector_snapshots has real multi-day history. ──
-    if has_history:
-        mom = sector_stats[["Sector"]].merge(rotation_metrics, on="Sector", how="left")
-        mom["Momentum"]     = mom["Momentum"].fillna(0.0)
-        mom["MomentumDays"] = mom["MomentumDays"].fillna(0).astype(int)
-    else:
-        mom = sector_stats[["Sector", "AvgChg"]].rename(columns={"AvgChg": "Momentum"})
-        mom["MomentumDays"] = 1
-
-    mom = mom.sort_values("Momentum", ascending=False).head(limit)
-    max_days = int(mom["MomentumDays"].max()) if not mom.empty else 0
-
-    mom_rows = "".join(
-        f'<div class="ti-mom-row"><span class="ti-mom-name">'
-        f'<span class="{"arrow-up" if m >= 0 else "arrow-down"}">{"↑" if m >= 0 else "↓"}</span>{s}</span>'
-        f'<span class="ti-mom-val {"up" if m >= 0 else "down"}">{"+" if m >= 0 else ""}{m:.1f}</span></div>'
-        for s, m in zip(mom["Sector"], mom["Momentum"])
-    ) or '<div style="color:var(--muted);font-size:11px">—</div>'
-
-    mom_note = (
-        f'<div class="ti-mom-note">Based on {max_days} trading day{"s" if max_days != 1 else ""} of history '
-        f'collected so far &mdash; full 20-day window builds up over time.</div>'
-        if max_days < 20 else ""
-    )
-
-    # ── Net Inflow (5D) ─────────────────────────────────────────────
-    if has_history and "NetInflow5D" in rotation_metrics.columns:
-        inflow = sector_stats[["Sector"]].merge(
-            rotation_metrics[["Sector", "NetInflow5D", "InflowDays"]], on="Sector", how="left"
-        )
-        inflow["NetInflow5D"] = inflow["NetInflow5D"].fillna(0.0)
-        inflow["InflowDays"]  = inflow["InflowDays"].fillna(0).astype(int)
-        inflow_days = int(inflow["InflowDays"].max()) if not inflow.empty else 0
-    else:
-        inflow = sector_stats[["Sector", "NetInflowCr"]].rename(columns={"NetInflowCr": "NetInflow5D"})
-        inflow_days = 1
-
-    total_inflow = float(inflow["NetInflow5D"].sum())
-    pos_sum = float(inflow.loc[inflow["NetInflow5D"] > 0, "NetInflow5D"].sum())
-    abs_sum = float(inflow["NetInflow5D"].abs().sum())
-    fraction = (pos_sum / abs_sum) if abs_sum > 0 else 0.5
-    ring_color = "var(--green)" if total_inflow >= 0 else "var(--red)"
-    ring_svg = _donut_ring_svg(fraction, "#3fb950" if total_inflow >= 0 else "#f85149")
-
-    top_in  = inflow.sort_values("NetInflow5D", ascending=False).head(3)
-    top_out = inflow.sort_values("NetInflow5D", ascending=True).head(3)
-
-    def _flow_rows(df_):
-        rows = ""
-        for i, (_, r) in enumerate(df_.iterrows(), 1):
-            v = float(r["NetInflow5D"])
-            rows += (f'<div class="ti-inflow-list-row"><span>{i}&nbsp; {r["Sector"]}</span>'
-                      f'<span class="ti-inflow-list-val {"up" if v >= 0 else "down"}">'
-                      f'{"+" if v >= 0 else ""}{v:,.0f} Cr</span></div>')
-        return rows or '<div style="color:var(--muted);font-size:10.5px">—</div>'
-
-    inflow_note = (
-        f'<div class="ti-mom-note">{inflow_days}d of {"5" if inflow_days >= 5 else "5"}-day window collected.</div>'
-        if inflow_days < 5 else ""
-    )
-
-    # Built via list+join, not the multi-line f-string this used to be —
-    # mom_note and inflow_note are each "" in the common case (once
-    # max_days>=20 / inflow_days>=5, i.e. after the app's been running a
-    # while), and each sat alone on its own indented line in the old
-    # f-string. A line that's ONLY an interpolated empty string is a
-    # blank line to CommonMark, which ends the raw-HTML block right
-    # there — everything the return produces after it stops being
-    # parsed as HTML and prints as literal escaped tags instead. Same
-    # failure mode documented on _index_card_html's warn_html; this
-    # panel just wasn't guarded against it yet. Only appending truthy
-    # parts here removes the blank line entirely.
-    parts = [
-        '<div class="ti-panel">',
-        '<div class="ti-panel-title">⇅ LEADERSHIP ROTATION</div>',
-        '<div class="ti-lead-cols">',
-        '<div>',
-        '<div class="ti-mom-title">Sector Momentum (vs 20D ago)</div>',
-        mom_rows,
+    _CARD_META = [
+        ("ROTATING IN", "Rotating In", "↑", "#3fb950"),
+        ("STABLE", "Stable", "⇄", "#d29922"),
+        ("ROTATING OUT", "Rotating Out", "↓", "#f85149"),
     ]
-    if mom_note:
-        parts.append(mom_note)
-    parts += [
-        '</div>',
-        '<div>',
-        '<div class="ti-mom-title">Net Inflow (5D)</div>',
-        '<div class="ti-inflow-ring-wrap">',
-        ring_svg,
-        f'<div class="ti-inflow-center"><div class="ti-inflow-value" style="color:{ring_color}">'
-        f'{"+" if total_inflow >= 0 else ""}{total_inflow:,.0f} Cr</div>'
-        f'<div class="ti-inflow-label">Net Inflow</div></div>',
-        '</div>',
-        '<div class="ti-inflow-list-title up">Top 3 Inflow Sectors</div>',
-        _flow_rows(top_in),
-        '<div class="ti-inflow-list-title down">Top 3 Outflow Sectors</div>',
-        _flow_rows(top_out),
-    ]
-    if inflow_note:
-        parts.append(inflow_note)
-    parts += ['</div>', '</div>', '</div>']
-    return "".join(parts)
+    cards_html = '<div class="sr-cards">'
+    for label, direction_key, icon, color in _CARD_META:
+        n, opp, delta = buckets[direction_key]
+        cards_html += f"""
+        <div class="sr-card">
+          <div class="sr-card-label" style="color:{color}">{icon} {label}</div>
+          <div class="sr-card-num" style="color:{color}">{n}</div>
+          <div class="sr-card-sub">Sectors</div>
+          <div class="sr-card-opp">{opp}</div>
+          <div class="sr-card-sub">Total Opportunities</div>
+          {_delta_html(delta)}
+        </div>"""
+
+    cards_html += f"""
+        <div class="sr-card">
+          <div class="sr-card-label">◎ TOTAL OPPORTUNITIES</div>
+          <div class="sr-card-num">{tiers['Total']}</div>
+          <div class="sr-card-sub">Elite: {tiers['Elite']} &nbsp; Execute: {tiers['Execute']} &nbsp; Watch: {tiers['Watch']}</div>
+        </div>
+        <div class="sr-card">
+          <div class="sr-card-label">💰 NET SECTOR INFLOW (5D)</div>
+          <div class="sr-card-num" style="color:{'#3fb950' if net_inflow_5d >= 0 else '#f85149'}">
+            {'+' if net_inflow_5d >= 0 else ''}{net_inflow_5d:g} Cr</div>
+          {_delta_html(net_inflow_delta, ' Cr')}
+        </div>
+    """
+    cards_html += "</div>"
+    st.markdown(cards_html, unsafe_allow_html=True)
+
+    # ── main dashboard table + right column ────────────────────────
+    col_left, col_right = st.columns([1.6, 1])
+
+    with col_left:
+        rows_html = ""
+        for i, (_, r) in enumerate(rotation_metrics.iterrows(), start=1):
+            sector = r["Sector"]
+            icon = _SR_SECTOR_ICON.get(sector, "🏷️")
+            m5, m20 = r["Mom5D"], r["Mom20D"]
+            direction = r["Direction"]
+            dcolor, darrow = _SR_DIRECTION_STYLE.get(direction, ("#8b949e", "→"))
+            action = r["SuggestedAction"]
+            acolor = _SR_ACTION_STYLE.get(action, "#8b949e")
+            rows_html += f"""
+            <tr>
+              <td>{i}</td>
+              <td><span class="sr-sector-name">{icon} {sector}</span></td>
+              <td class="{'sr-pos' if m5 >= 0 else 'sr-neg'}">{'+' if m5 >= 0 else ''}{m5:.1f}%</td>
+              <td class="{'sr-pos' if m20 >= 0 else 'sr-neg'}">{'+' if m20 >= 0 else ''}{m20:.1f}%</td>
+              <td style="color:{dcolor}">{direction} {darrow}</td>
+              <td><span class="sr-action-badge" style="background:{acolor}22;color:{acolor};border:1px solid {acolor}">{action}</span></td>
+            </tr>"""
+
+        st.markdown(f"""
+        <div class="sr-panel">
+          <div class="sr-panel-title">SECTOR ROTATION DASHBOARD</div>
+          <table class="sr-table">
+            <tr><th>#</th><th>SECTOR</th><th>5D MOMENTUM</th><th>20D MOMENTUM</th><th>DIRECTION</th><th>SUGGESTED ACTION</th></tr>
+            {rows_html}
+          </table>
+          <div style="font-size:0.65rem;color:#8b949e;margin-top:8px;">
+            Momentum is the cumulative %Chg over trailing persisted scan dates (proxy for a day-count window until
+            more history accumulates). Direction is based on 20D momentum vs a small deadband.
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Top sectors to focus today ──────────────────────────────
+        top3 = rotation_metrics.sort_values("RotationStrength", ascending=False).head(3).reset_index(drop=True)
+        rank_colors = ["#3fb950", "#d29922", "#58a6ff"]
+        focus_html = '<div class="sr-focus-cards">'
+        for i, (_, r) in enumerate(top3.iterrows()):
+            sector = r["Sector"]
+            icon = _SR_SECTOR_ICON.get(sector, "🏷️")
+            strength = r["RotationStrength"]
+            action = r["SuggestedAction"]
+            acolor = _SR_ACTION_STYLE.get(action, "#8b949e")
+            focus_html += f"""
+            <div class="sr-focus-card">
+              <span class="sr-focus-rank" style="background:{rank_colors[i]}">{i+1}</span> {icon}
+              <div class="sr-focus-name">{sector}</div>
+              <div class="sr-focus-score-label">Rotation Strength (Composite)</div>
+              <div class="sr-focus-score">{strength:.0f}<span style="font-size:0.9rem;color:#8b949e">/100</span></div>
+              <div class="sr-focus-score-label" style="margin-top:6px;">Suggested Action
+                <span class="sr-action-badge" style="background:{acolor}22;color:{acolor};border:1px solid {acolor};margin-left:4px;">{action}</span>
+              </div>
+            </div>"""
+        focus_html += "</div>"
+        st.markdown(f'<div class="sr-panel-title" style="margin-top:16px;">TOP SECTORS TO FOCUS TODAY</div>{focus_html}',
+                     unsafe_allow_html=True)
+
+    with col_right:
+        # ── Today's Sector Flow ─────────────────────────────────────
+        inflow_rows = "".join(
+            f'<div class="sr-flow-row"><span>↑ {s}</span><span class="sr-pos">+{v:.0f} Cr</span></div>'
+            for s, v in flow["inflow"]
+        ) or '<div style="color:#8b949e;font-size:0.75rem;">—</div>'
+        outflow_rows = "".join(
+            f'<div class="sr-flow-row"><span>↓ {s}</span><span class="sr-neg">{v:.0f} Cr</span></div>'
+            for s, v in flow["outflow"]
+        ) or '<div style="color:#8b949e;font-size:0.75rem;">—</div>'
+
+        st.markdown(f"""
+        <div class="sr-panel">
+          <div class="sr-panel-title">TODAY'S SECTOR FLOW <span style="color:#8b949e;font-weight:400;">(Net Inflow)</span></div>
+          <div style="display:flex;gap:16px;">
+            <div style="flex:1;">
+              <div class="sr-flow-col-title" style="color:#3fb950;">TOP INFLOW SECTORS</div>
+              {inflow_rows}
+            </div>
+            <div style="flex:1;">
+              <div class="sr-flow-col-title" style="color:#f85149;">TOP OUTFLOW SECTORS</div>
+              {outflow_rows}
+            </div>
+          </div>
+          <div style="border-top:1px solid #1e293b;margin-top:10px;padding-top:8px;font-size:0.75rem;
+                       display:flex;justify-content:space-between;">
+            <span>Net Inflow (Today): <b class="{'sr-pos' if flow['net']>=0 else 'sr-neg'}">
+              {'+' if flow['net']>=0 else ''}{flow['net']:.0f} Cr</b></span>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Sector Rotation Timeline ─────────────────────────────────
+        if timeline:
+            dates, ranks = timeline["dates"], timeline["ranks"]
+            n_rows = max(len(r) for r in ranks)
+            prior_ranks = {s: idx for idx, s in enumerate(ranks[-2])} if len(ranks) >= 2 else {}
+            n_cols = len(dates)
+            header_labels = []
+            for idx in range(n_cols):
+                back = (n_cols - 1) - idx
+                header_labels.append("Today" if back == 0 else f"{back}D Ago")
+            header = "".join(f"<th>{h}</th>" for h in header_labels)
+
+            body_rows = ""
+            for row_i in range(n_rows):
+                cells = ""
+                for col_i, day_list in enumerate(ranks):
+                    if row_i >= len(day_list):
+                        cells += "<td>—</td>"
+                        continue
+                    sector = day_list[row_i]
+                    is_today = (col_i == n_cols - 1)
+                    if is_today and sector in prior_ranks:
+                        prior_pos = prior_ranks[sector]
+                        if prior_pos > row_i:
+                            arrow, acol = " ↑", "#3fb950"
+                        elif prior_pos < row_i:
+                            arrow, acol = " ↓", "#f85149"
+                        else:
+                            arrow, acol = "", "#8b949e"
+                    else:
+                        arrow, acol = "", "#8b949e"
+                    pill_color = "#58a6ff22" if not is_today else "#3fb95022"
+                    text_color = "#58a6ff" if not is_today else "#3fb950"
+                    cells += (f'<td><span class="sr-tl-pill" style="background:{pill_color};color:{text_color}">'
+                              f'{sector}<span style="color:{acol}">{arrow}</span></span></td>')
+                body_rows += f"<tr>{cells}</tr>"
+
+            st.markdown(f"""
+            <div class="sr-panel" style="margin-top:16px;">
+              <div class="sr-panel-title">SECTOR ROTATION TIMELINE <span style="color:#8b949e;font-weight:400;">(Top {n_rows} Sectors)</span></div>
+              <div class="sr-timeline">
+                <table><tr>{header}</tr>{body_rows}</table>
+              </div>
+              <div style="font-size:0.65rem;color:#8b949e;margin-top:8px;">
+                ↑ Moved Up &nbsp; ↓ Moved Down &nbsp; — No Change (vs previous persisted scan date)
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div class="sr-panel" style="margin-top:16px;">
+              <div class="sr-panel-title">SECTOR ROTATION TIMELINE</div>
+              <div style="color:#8b949e;font-size:0.75rem;">Builds up as more scan days are persisted — needs at least 2.</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ── How it's calculated ───────────────────────────────────────
+        st.markdown("""
+        <div class="sr-panel" style="margin-top:16px;">
+          <div class="sr-panel-title">HOW SECTOR ROTATION IS CALCULATED</div>
+          <div class="sr-calc-row">
+            <div class="sr-calc-item"><div class="sr-calc-icon">📈</div>Leadership Momentum<br>vs 20D ago</div>
+            <div class="sr-calc-item"><div class="sr-calc-icon">📋</div>Entry Quality Momentum<br>vs 20D ago</div>
+            <div class="sr-calc-item"><div class="sr-calc-icon">📊</div>New Opportunities<br>Increase in actionable setups</div>
+            <div class="sr-calc-item"><div class="sr-calc-icon">💰</div>Money Flow<br>5D Net Inflow/Outflow</div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── footer ──────────────────────────────────────────────────────
+    scanned = len(df_aug)
+    scan_time = as_of.strftime("%H:%M:%S IST") if run_at else "—"
+    st.markdown(f"""
+      <div class="sr-footer">
+        <div>Universe: NIFTY 500 &nbsp;&middot;&nbsp; Scanned: {scanned} / 500 &nbsp;&middot;&nbsp; Data Source: Scanner (MasterScanner)</div>
+        <div>Last Scan: {scan_time}</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 # ── SIGNAL CLASS COUNTS ────────────────────────────────────────────
@@ -3362,23 +3479,20 @@ def render(settings: dict | None = None):
     #    utils.dore_fo_screener docstring. ─────────────────────────────
     _fo_opportunities_panel()
 
-    # ── Top Gainers | Sector Heatmap | Leadership Rotation ────────────
+    # ── Sector Rotation Analysis (full panel) ─────────────────────────
     sector_stats = build_sector_stats(df_aug)
 
-    # [2026-07-26] Completes the Sector Rotation tool wiring — see
-    # utils/supabase_client.py's "SECTOR ROTATION PERSISTENCE" section
-    # for why this was previously disconnected (the compute layer and
-    # the rendering functions below both already existed; only the
-    # persistence layer connecting them did not). Best-effort: any
-    # failure here (save or load) falls back to the single-day figures
-    # the panels already knew how to show, so a Supabase hiccup degrades
-    # this to what the Dashboard looked like before this fix, not to an
-    # error.
+    # [2026-07-26] Persists today's sector_snapshots row — see
+    # utils/supabase_client.py's "SECTOR ROTATION PERSISTENCE" section.
+    # Best-effort: any failure here (save or load) falls back to
+    # single-day figures inside _sector_rotation_analysis_section()'s
+    # own compute calls (compute_rotation_metrics/_timeline/_flow all
+    # handle an empty/missing history gracefully), so a Supabase hiccup
+    # degrades gracefully rather than erroring the whole Dashboard.
     from utils.supabase_client import save_sector_snapshot, load_sector_snapshot_history
-    from utils.sector_rotation import build_sector_snapshot_rows, compute_rotation_metrics
+    from utils.sector_rotation import build_sector_snapshot_rows
 
     sector_history = pd.DataFrame()
-    rotation_metrics = pd.DataFrame()
     try:
         # Use the scan's own date (parsed from run_at), not "today" —
         # if the Dashboard is showing a stale scan (see the staleness
@@ -3388,25 +3502,9 @@ def render(settings: dict | None = None):
         _scan_date = pd.to_datetime(run_at).tz_convert(_IST).date() if run_at else today_ist()
         save_sector_snapshot(build_sector_snapshot_rows(sector_stats, _scan_date))
         sector_history = load_sector_snapshot_history(days=60)
-        if not sector_history.empty:
-            rotation_metrics = compute_rotation_metrics(sector_history, sector_stats)
-            # _leadership_rotation_panel()'s naming predates
-            # sector_rotation.py's — bridge the two here rather than
-            # renaming either side's already-established API.
-            rotation_metrics = rotation_metrics.rename(columns={
-                "Mom20D": "Momentum", "DaysOfHistory": "MomentumDays",
-            })
-            rotation_metrics["InflowDays"] = rotation_metrics["MomentumDays"]
     except Exception:
-        logger.exception("Sector Rotation persistence/compute failed (non-fatal — "
-                          "panels fall back to single-day figures)")
+        logger.exception("Sector Rotation persistence failed (non-fatal — "
+                          "panel falls back to single-day figures)")
 
-    row2_a, row2_b, row2_c = st.columns([1.3, 1.8, 1.5])
-    with row2_a:
-        st.markdown(_top_gainers_panel(df_aug), unsafe_allow_html=True)
-    with row2_b:
-        st.markdown(_sector_opportunity_board_panel(sector_stats, sector_history if not sector_history.empty else None),
-                    unsafe_allow_html=True)
-    with row2_c:
-        st.markdown(_leadership_rotation_panel(sector_stats, rotation_metrics if not rotation_metrics.empty else None),
-                    unsafe_allow_html=True)
+    _as_of = pd.to_datetime(run_at).tz_convert(_IST) if run_at else _now_ist()
+    _sector_rotation_analysis_section(df_aug, sector_stats, sector_history, _as_of, run_at)
