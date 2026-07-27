@@ -28,6 +28,87 @@ from __future__ import annotations
 
 import pandas as pd
 
+from utils.sector_map import get_sector
+
+# ── StockEdge-style breadth & momentum-score classification ───────────
+# StockEdge's Sector Rotation screen (Breadth tab) reports, per sector,
+# the *percentage of constituent stocks* clearing a set of technical
+# filters (RS>0, RSI>50, price above SMA20/50/100) — a cross-sectional
+# breadth read, not a single day-over-day %Chg average. Its Scores tab
+# then buckets a 0-100 momentum score per lookback window (1M/3M/6M)
+# into Bearish (0-40) / Neutral (41-60) / Bullish (61-100).
+#
+# We don't have a live SMA50/100-above/below flag per stock wired into
+# df_aug, so this is built from the three breadth proxies the scanner
+# does carry per stock: RSI, rs_composite (RS proxy), and the trend-up
+# flag (SMA/price-structure proxy). Same "proxy, not a published
+# relative-strength index" honesty convention as the rest of this file.
+_SE_BULLISH = 61.0
+_SE_BEARISH = 40.0
+
+
+def _se_score_bucket(score: float) -> str:
+    if score >= _SE_BULLISH:
+        return "Bullish"
+    if score <= _SE_BEARISH:
+        return "Bearish"
+    return "Neutral"
+
+
+def compute_sector_breadth(df_aug: pd.DataFrame, symbol_col: str = "Stock") -> pd.DataFrame:
+    """
+    One row per sector: Sector, PctRsiAbove50, PctRsPositive, PctTrendUp,
+    BreadthScore (mean of the three, 0-100), BreadthBucket
+    (Bullish/Neutral/Bearish per the StockEdge 61/40 cutoffs), StockCount.
+
+    Mirrors StockEdge's "MCap Above" breadth grid (% of stocks per
+    sector clearing RS55>0 / RSI>50 / SMA20/50/100) using the closest
+    equivalents available in df_aug:
+      - RSI>50            -> _rsi / RSI column
+      - RS55>0             -> rs_composite > 0 (composite RS, not a
+                               published RS-vs-index rating)
+      - price above SMA20  -> _trend_up / TrendPhase != NONE
+    """
+    empty = pd.DataFrame(columns=["Sector", "PctRsiAbove50", "PctRsPositive",
+                                   "PctTrendUp", "BreadthScore", "BreadthBucket",
+                                   "StockCount"])
+    if df_aug is None or df_aug.empty or symbol_col not in df_aug.columns:
+        return empty
+
+    work = df_aug.copy()
+    work["_sector"] = work[symbol_col].astype(str).map(get_sector)
+
+    rsi_col = "RSI" if "RSI" in work.columns else ("_rsi" if "_rsi" in work.columns else None)
+    rs_col = "rs_composite" if "rs_composite" in work.columns else None
+    if "_trend_up" in work.columns:
+        trend_up = work["_trend_up"].astype(bool)
+    elif "TrendPhase" in work.columns:
+        trend_up = work["TrendPhase"].astype(str).str.upper() != "NONE"
+    else:
+        trend_up = None
+
+    rows = []
+    for sector, grp in work.groupby("_sector"):
+        n = len(grp)
+        if n == 0:
+            continue
+        pct_rsi = float((pd.to_numeric(grp[rsi_col], errors="coerce") > 50).mean() * 100) if rsi_col else 0.0
+        pct_rs = float((pd.to_numeric(grp[rs_col], errors="coerce") > 0).mean() * 100) if rs_col else 0.0
+        pct_trend = float(trend_up.loc[grp.index].mean() * 100) if trend_up is not None else 0.0
+        breadth = round((pct_rsi + pct_rs + pct_trend) / 3.0, 1)
+        rows.append({
+            "Sector": sector,
+            "PctRsiAbove50": round(pct_rsi, 1),
+            "PctRsPositive": round(pct_rs, 1),
+            "PctTrendUp": round(pct_trend, 1),
+            "BreadthScore": breadth,
+            "BreadthBucket": _se_score_bucket(breadth),
+            "StockCount": n,
+        })
+    return pd.DataFrame(rows, columns=["Sector", "PctRsiAbove50", "PctRsPositive",
+                                        "PctTrendUp", "BreadthScore", "BreadthBucket",
+                                        "StockCount"])
+
 # Deadband for classifying 20D momentum into a rotation direction.
 _DIRECTION_DEADBAND = 3.0
 # Below this 20D momentum, an "Out" sector is severe enough to say EXIT
@@ -103,21 +184,36 @@ def _suggested_action(direction: str, mom20d: float, strength: float) -> str:
     return "EXIT" if mom20d <= _EXIT_THRESHOLD else "REDUCE"
 
 
-def compute_rotation_metrics(history: pd.DataFrame, today_stats: pd.DataFrame) -> pd.DataFrame:
+def compute_rotation_metrics(history: pd.DataFrame, today_stats: pd.DataFrame,
+                              breadth: pd.DataFrame = None) -> pd.DataFrame:
     """
     One row per sector: Sector, Mom5D, Mom20D, Direction, RotationStrength,
     SuggestedAction, NetInflow5D, DaysOfHistory (how many persisted scan
-    dates back this sector's momentum actually covers).
+    dates back this sector's momentum actually covers), plus
+    BreadthScore/BreadthBucket when `breadth` (compute_sector_breadth()
+    output) is supplied.
 
     `history` — load_sector_snapshot_history() output (may be empty on a
     fresh install; every sector then falls back to today's single-day
     AvgChg as both Mom5D and Mom20D, Direction defaulting to Stable unless
     that single day already clears the deadband).
+
+    StockEdge alignment: direction and RotationStrength now weight in
+    cross-sectional breadth (BreadthScore, see compute_sector_breadth())
+    rather than relying on the day-over-day AvgChg composite alone —
+    matching StockEdge's approach of classifying a sector primarily off
+    the % of its constituents confirming strength (RSI/RS/trend), with
+    price momentum as a secondary input.
     """
     cols = ["Sector", "Mom5D", "Mom20D", "Direction", "RotationStrength",
-            "SuggestedAction", "NetInflow5D", "DaysOfHistory"]
+            "SuggestedAction", "NetInflow5D", "DaysOfHistory",
+            "BreadthScore", "BreadthBucket"]
     if today_stats is None or today_stats.empty:
         return pd.DataFrame(columns=cols)
+
+    breadth_map = {}
+    if breadth is not None and not breadth.empty:
+        breadth_map = breadth.set_index("Sector")[["BreadthScore", "BreadthBucket"]].to_dict("index")
 
     has_history = history is not None and not history.empty and "sector" in history.columns
 
@@ -139,9 +235,24 @@ def compute_rotation_metrics(history: pd.DataFrame, today_stats: pd.DataFrame) -
             leadership_delta = 0.0
             oppscore_delta = 0.0
 
-        direction = _direction(mom20d)
+        b = breadth_map.get(sector, {})
+        breadth_score = b.get("BreadthScore")
+        breadth_bucket = b.get("BreadthBucket")
+
+        # Breadth (when available) is the primary strength signal, as in
+        # StockEdge — the price-momentum composite is the fallback /
+        # secondary weight so behaviour is unchanged when no breadth data
+        # is passed in (backward compatible with existing call sites).
         strength = round(max(0.0, min(100.0,
             50.0 + 0.4 * mom20d + 0.3 * leadership_delta + 0.3 * oppscore_delta)), 1)
+        if breadth_score is not None:
+            strength = round(max(0.0, min(100.0, 0.6 * breadth_score + 0.4 * strength)), 1)
+
+        direction = _direction(mom20d)
+        if breadth_bucket == "Bullish" and direction != "Rotating Out":
+            direction = "Rotating In"
+        elif breadth_bucket == "Bearish" and direction != "Rotating In":
+            direction = "Rotating Out"
         action = _suggested_action(direction, mom20d, strength)
 
         rows.append({
@@ -149,6 +260,7 @@ def compute_rotation_metrics(history: pd.DataFrame, today_stats: pd.DataFrame) -
             "Direction": direction, "RotationStrength": strength,
             "SuggestedAction": action, "NetInflow5D": round(net_inflow_5d, 1),
             "DaysOfHistory": n_days,
+            "BreadthScore": breadth_score, "BreadthBucket": breadth_bucket,
         })
 
     out = pd.DataFrame(rows, columns=cols)
