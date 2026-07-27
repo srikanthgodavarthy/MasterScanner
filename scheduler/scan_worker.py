@@ -281,11 +281,35 @@ def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
 
 def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                             batch_size: int = LIVE_SCANNER_BATCH_SIZE,
+                            max_workers: int = LIVE_SCANNER_MAX_WORKERS,
+                            batch_cooldown_secs: float = LIVE_SCANNER_BATCH_COOLDOWN_SECS,
+                            health_checks: bool = True,
                             owner_event: "threading.Event | None" = None):
     """
     Live Scanner sub-scheduler. See module docstring ("Live Scanner: why
     a sub-scheduler") for the full rationale. Runs forever, one 5-minute
     cycle at a time; never raises out of the loop.
+
+    max_workers, batch_cooldown_secs : [Ring-buffer fix, 2026-07-27]
+                  broken out from the module-level LIVE_SCANNER_MAX_WORKERS
+                  / LIVE_SCANNER_BATCH_COOLDOWN_SECS constants (which
+                  remain the defaults for `python -m scheduler.scan_worker`
+                  standalone use) so utils.inprocess_scheduler can run
+                  this loop with a tighter concurrency budget than a
+                  dedicated standalone process would need, since the
+                  in-process variant shares CPU/memory with the
+                  Streamlit UI in the same container.
+
+    health_checks : [Ring-buffer fix, 2026-07-27] when True (default),
+                  consults utils.scan_health_monitor.check_health() at
+                  each cycle boundary — RAM/CPU/flush-queue pressure can
+                  widen this cycle's inter-batch cooldown ("slow_down")
+                  or skip the cycle entirely ("skip_cycle") rather than
+                  piling more scan compute onto an already-stressed
+                  process. Exposed as a flag (rather than always-on) so
+                  a dedicated standalone process with its own external
+                  monitoring can turn this off if it'd rather not pay
+                  the psutil sampling cost every cycle.
 
     owner_event : [Architecture review C3 fix, 2026-07-25] see
                   _run_loop()'s docstring — same semantics, checked both
@@ -299,6 +323,8 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
     from utils.scanner_engine import NIFTY500_SYMBOLS
     from utils.supabase_client import save_scan_snapshot, archive_daily_scan
     from utils.system_state import should_scheduler_run, manual_override_active, clear_manual_override
+    if health_checks:
+        from utils.scan_health_monitor import check_health, record_cycle_result
 
     symbols = list(NIFTY500_SYMBOLS)
     batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)] or [[]]
@@ -318,6 +344,26 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             logger.debug("[live_scanner] system_state is paused (backtest/maintenance) — skipping this cycle")
             time.sleep(5)
             continue
+
+        effective_cooldown = batch_cooldown_secs
+        if health_checks:
+            decision = check_health("live_scanner")
+            if decision.action == "skip_cycle":
+                logger.warning(
+                    "[live_scanner] skipping this cycle — %s (ram=%.0fMB cpu=%.0f%% "
+                    "flush_backlog=%.0f%%)", "; ".join(decision.reasons),
+                    decision.ram_mb, decision.cpu_pct, decision.flush_backlog_pct * 100,
+                )
+                record_cycle_result("live_scanner", ok=False)
+                time.sleep(interval_secs)
+                continue
+            elif decision.action == "slow_down":
+                effective_cooldown = batch_cooldown_secs * 2
+                logger.info(
+                    "[live_scanner] backpressure detected — widening inter-batch "
+                    "cooldown to %.1fs this cycle (%s)",
+                    effective_cooldown, "; ".join(decision.reasons),
+                )
 
         cycle_started = time.time()
 
@@ -352,7 +398,7 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             batch_started = time.time()
             if chunk:
                 try:
-                    df_raw = compute_live_scan_batch(chunk, settings={"workers": LIVE_SCANNER_MAX_WORKERS})
+                    df_raw = compute_live_scan_batch(chunk, settings={"workers": max_workers})
                     df_batch = apply_regime_layer(df_raw, regime_ctx) if (regime_ctx and df_raw is not None and not df_raw.empty) else df_raw
                     n_ok = 0
                     for rec in _live_scan_records(df_batch):
@@ -405,7 +451,7 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             # sustaining back-to-back CPU bursts on a shared Streamlit Cloud
             # quota. Skipped after the last batch.
             if batch_i < n_batches - 1:
-                time.sleep(LIVE_SCANNER_BATCH_COOLDOWN_SECS)
+                time.sleep(effective_cooldown)
 
         # end of batches loop
 
@@ -440,6 +486,8 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
         cycle_elapsed = time.time() - cycle_started
         logger.info("[live_scanner] cycle complete: %d/%d symbols merged (%.1fs)",
                     len(merged), len(symbols), cycle_elapsed)
+        if health_checks:
+            record_cycle_result("live_scanner", ok=True)
         time.sleep(max(1.0, interval_secs - cycle_elapsed))
 
 
