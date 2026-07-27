@@ -125,6 +125,27 @@ class _BoundedThreadPoolExecutor:
         self._sem = threading.Semaphore(self._capacity)
         self._dropped_count = 0
         self._dropped_lock = threading.Lock()
+        # [Ring-buffer fix, 2026-07-27] Explicit in-flight counter, separate
+        # from the semaphore. threading.Semaphore doesn't expose its
+        # current count via public API (only CPython's private _value),
+        # and utils.scan_health_monitor needs a real, documented way to
+        # read "how full is this queue right now" rather than only
+        # learning about saturation after the fact via dropped-task logs.
+        self._in_flight = 0
+        self._in_flight_lock = threading.Lock()
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    def backlog(self) -> int:
+        """Current number of tasks queued or running."""
+        with self._in_flight_lock:
+            return self._in_flight
+
+    def backlog_pct(self) -> float:
+        """Current backlog as a fraction (0.0-1.0) of total capacity."""
+        return self.backlog() / self._capacity if self._capacity else 0.0
 
     def submit_or_drop(self, fn, *args, **kwargs) -> bool:
         """Returns True if the task was accepted, False if it was
@@ -147,11 +168,16 @@ class _BoundedThreadPoolExecutor:
             )
             return False
 
+        with self._in_flight_lock:
+            self._in_flight += 1
+
         def _wrapped():
             try:
                 fn(*args, **kwargs)
             finally:
                 self._sem.release()
+                with self._in_flight_lock:
+                    self._in_flight -= 1
 
         self._executor.submit(_wrapped)
         return True
@@ -654,6 +680,39 @@ _flush_executor = _BoundedThreadPoolExecutor(
     # dropping — enough to absorb a normal burst without ever growing
     # unboundedly.
 
+# [Ring-buffer fix, 2026-07-27] RING_BUFFER_MAX_BARS bounds every symbol's
+# RAM-resident DataFrame to a fixed number of most-recent rows. Without
+# this, update_live_cache() appends one new row per symbol per trading
+# day for as long as the process stays alive (Streamlit Cloud processes
+# routinely run for weeks), so the live cache grew without bound — the
+# leading suspect, alongside unbounded flush-queue growth (see the H2
+# fix above, already bounded), behind the OOM-pattern crashes that got
+# live_scanner excluded from utils.inprocess_scheduler's background
+# threads (2026-07-24). 280 covers the longest lookback any scoring
+# stage actually needs — utils/structural_levels.py's 252-trading-day
+# window — with ~28 bars of slack for holidays/weekends inside that
+# span, so trimming to this cap changes memory behaviour only, never
+# indicator output. Applied uniformly regardless of `years` requested,
+# since the live scanner (the only caller of get_live_history_cached /
+# update_live_cache) never legitimately needs more than this; the
+# backtester and other years=3/5 callers go through get_history()
+# directly and are untouched by this cap.
+RING_BUFFER_MAX_BARS = 280
+
+
+def flush_queue_backlog_pct() -> float:
+    """Public accessor for utils.scan_health_monitor — current background
+    parquet-flush queue depth as a fraction (0.0-1.0) of its capacity,
+    without other modules reaching into the private _flush_executor."""
+    return _flush_executor.backlog_pct()
+
+
+def _trim_to_ring_buffer(df):
+    """Keep only the most recent RING_BUFFER_MAX_BARS rows of `df`."""
+    if df is None or len(df) <= RING_BUFFER_MAX_BARS:
+        return df
+    return df.iloc[-RING_BUFFER_MAX_BARS:]
+
 
 def get_live_history_cached(
     symbols: list,
@@ -677,6 +736,10 @@ def get_live_history_cached(
         grew), in which case ONLY the missing symbols are fetched, or
       - force_refresh=True.
     Otherwise this returns straight from RAM with zero disk I/O.
+
+    Every DataFrame held here (and patched by update_live_cache()) is
+    trimmed to RING_BUFFER_MAX_BARS most-recent rows — see that
+    constant's comment for why and for the lookback it's sized against.
 
     Does not include today's live/intraday bar — see update_live_cache().
     """
@@ -702,6 +765,8 @@ def get_live_history_cached(
     # from reading the existing RAM cache while it runs.
     fetched = get_history(to_fetch, years=years, min_bars=0,
                            progress_cb=progress_cb, source=source)
+
+    fetched = {s: _trim_to_ring_buffer(df) for s, df in fetched.items()}
 
     with _LIVE_CACHE_LOCK:
         state = _live_cache.get(source)
@@ -754,6 +819,11 @@ def update_live_cache(source: str, patched: dict, dirty_symbols) -> None:
         else:
             merged = dict(state["data"])
             merged.update(patched)
+        # Ring-buffer trim — see RING_BUFFER_MAX_BARS above. This is the
+        # path that grows by one row/symbol/day for the life of the
+        # process, so it's the one that actually needs trimming on every
+        # call, not just at daily resync.
+        merged = {s: _trim_to_ring_buffer(df) for s, df in merged.items()}
         _live_cache[source] = {"data": merged, "loaded_date": today}
 
     dirty = set(dirty_symbols) & set(patched.keys())
