@@ -396,8 +396,13 @@ class DOREResult:
     opportunity_score: float = 0.0     # 0-100, Stage 5 weighted blend — for RANKING
     conviction_score_10: float = 0.0   # opportunity_score/10, rounded — 1-10 scale
 
-    directional_intent: str = NEUTRAL   # BULLISH | BEARISH | NEUTRAL   (Stage 1)
+    directional_intent: str = NEUTRAL   # BULLISH | BEARISH | NEUTRAL   (Stage 1 — DAILY, persistent)
     trend_score:        float = 50.0    # 0-100                          (Stage 1)
+
+    effective_directional_intent: str = NEUTRAL  # daily blended with same-day evidence — see compute_effective_bias()
+    effective_bias_score:         float = 50.0   # 0-100 blended score (or 0/100 on override)
+    intraday_evidence_score:      float = 50.0   # 0-100 same-day-only evidence (VWAP side / move / fresh cross)
+    intraday_override_active:     bool = False   # True = daily intent was fully overridden this poll, not just blended
 
     intraday_reversal_alert:     bool = False   # informational only — never gates the recommendation
     intraday_reversal_move_pct:  float = 0.0
@@ -578,6 +583,23 @@ class IntradayReversalAlert:
     move_pct:   float = 0.0    # signed % move from day_open (or prev_close fallback)
     move_direction: Optional[str] = None   # "UP" | "DOWN" | None
     reason:     str = ""
+
+
+@dataclass(frozen=True)
+class EffectiveBiasResult:
+    """Effective Bias (2026-07-27) — sits between Stage 1 and Stage 2.
+    Blends Stage 1's persistent daily Directional Intent with same-day
+    evidence (weighted, every poll) and, on an exceptional same-day move,
+    can override the daily read outright. See compute_effective_bias().
+    Downstream stages (2/3/3.5/4/5) key off `effective_intent`, not
+    Stage 1's `directional_intent` directly — that field is kept as-is on
+    TrendResult/DOREResult purely for display ("today started BEARISH").
+    """
+    effective_intent: str = NEUTRAL
+    blended_score:    float = 50.0    # 0-100, daily/intraday weighted blend
+    intraday_score:   float = 50.0    # 0-100, same-day-only evidence (VWAP side / move / fresh cross)
+    override_active:  bool = False
+    reasons: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -798,10 +820,122 @@ def check_intraday_reversal_alert(
     return IntradayReversalAlert(triggered=triggered, move_pct=round(move_pct, 2),
                                   move_direction=move_direction, reason=reason)
 
+# ══════════════════════════════════════════════════════════════════
+#  EFFECTIVE BIAS  (2026-07-27 — hybrid daily/intraday blend + override)
+# ══════════════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════════
-#  STAGE 2 — EXECUTION ENGINE  (Execution State)
-# ══════════════════════════════════════════════════════════════════
+def compute_effective_bias(
+    inp: DOREInput, cfg: DORESettings, trend: TrendResult, reversal_alert: IntradayReversalAlert,
+) -> EffectiveBiasResult:
+    """Blend Stage 1's daily Trend Score with same-day evidence, and, on
+    an exceptional same-day move, override it outright. Runs every poll
+    (same cadence as check_intraday_reversal_alert) — Stage 1 itself is
+    untouched and still only re-runs once per completed daily candle.
+
+    Design (SG, 2026-07-27): daily trend gives useful context and cuts
+    noise, so it isn't discarded — but it also isn't left immutable
+    through the session, since option buying reacts to same-day
+    institutional flow, VWAP reclaim, and OI shifts that can invalidate
+    yesterday's read. Two mechanisms, in order:
+
+      1. OVERRIDE — only when reversal_alert already qualifies as
+         "against trend" AND clears a STRICTER bar than the alert's own
+         (override_move_pct_min/override_atr_mult_min, both above the
+         alert's floors). On trigger, effective_intent flips to match
+         today's move outright (BULLISH on an UP override, BEARISH on a
+         DOWN override) and override_active=True — this is the only path
+         that fully overrides the daily read rather than blending it.
+      2. BLEND — otherwise, effective_bias_daily_weight% of Stage 1's
+         Trend Score + effective_bias_intraday_weight% of a same-day-only
+         evidence score (VWAP side, % move off day_open scaled by ATR,
+         fresh EMA9/21 cross), re-bucketed through the same
+         trend_bullish_score_min/trend_bearish_score_max thresholds Stage
+         1 uses. Under ordinary conditions this rarely flips the bucket
+         on its own — it's meant to soften a borderline daily read, not
+         replace it.
+
+    If intraday_override_enabled=False, mechanism 1 is skipped entirely
+    (mechanism 2 still runs) — a rollback switch without touching Stage 1.
+    """
+    reasons: list[str] = []
+
+    # ── same-day-only evidence score (0-100, 100=most bullish) ────
+    # Independent of Stage 1's intent — unlike Stage 2's execution score,
+    # this doesn't ask "is today confirming what Stage 1 already believes"
+    # so it can point either way regardless of the daily read.
+    ev_scores: list[float] = []
+    if inp.vwap > 0 and inp.price > 0:
+        ev_scores.append(100.0 if inp.price > inp.vwap else 0.0)
+    if reversal_alert.move_direction is not None:
+        # scale the day_open move by ATR so a big move on a low-ATR name
+        # still registers as strong evidence
+        baseline = inp.day_open or inp.prev_close
+        if baseline and inp.atr > 0:
+            atr_mult = abs(inp.price - baseline) / inp.atr
+            move_strength = min(1.0, atr_mult / max(cfg.override_atr_mult_min, 0.01))
+        else:
+            move_strength = min(1.0, abs(reversal_alert.move_pct) / max(cfg.override_move_pct_min, 0.01))
+        move_score = 50.0 + (50.0 * move_strength if reversal_alert.move_direction == "UP"
+                              else -50.0 * move_strength)
+        ev_scores.append(_clamp(move_score))
+    if inp.fresh_crossover:
+        ev_scores.append(100.0)
+    elif inp.fresh_crossunder:
+        ev_scores.append(0.0)
+
+    intraday_score = sum(ev_scores) / len(ev_scores) if ev_scores else 50.0
+    reasons.append(f"Same-day evidence score={intraday_score:.0f} "
+                    f"({'no same-day evidence supplied — neutral' if not ev_scores else f'{len(ev_scores)} input(s)'})")
+
+    # ── mechanism 1: override on an exceptional same-day move ─────
+    if cfg.intraday_override_enabled and reversal_alert.move_direction is not None:
+        baseline = inp.day_open or inp.prev_close
+        pct_ok = abs(reversal_alert.move_pct) >= cfg.override_move_pct_min
+        atr_ok = (inp.atr > 0 and baseline
+                  and abs(inp.price - baseline) >= cfg.override_atr_mult_min * inp.atr)
+        against_trend = (trend.directional_intent == BULLISH and reversal_alert.move_direction == "DOWN") or \
+                         (trend.directional_intent == BEARISH and reversal_alert.move_direction == "UP") or \
+                         trend.directional_intent == NEUTRAL
+        if pct_ok and atr_ok and against_trend:
+            override_intent = BULLISH if reversal_alert.move_direction == "UP" else BEARISH
+            reasons.append(
+                f"Intraday Override Active: {reversal_alert.move_pct:+.2f}% same-day move clears the "
+                f"{cfg.override_move_pct_min:.1f}%/{cfg.override_atr_mult_min:.2f}x-ATR override floor — "
+                f"effective bias forced {override_intent} regardless of {trend.directional_intent} daily intent"
+            )
+            override_score = 100.0 if override_intent == BULLISH else 0.0
+            return EffectiveBiasResult(effective_intent=override_intent, blended_score=override_score,
+                                        intraday_score=round(intraday_score, 1), override_active=True,
+                                        reasons=tuple(reasons))
+
+    # ── mechanism 2: weighted blend ────────────────────────────────
+    dw = cfg.effective_bias_daily_weight / 100.0
+    iw = cfg.effective_bias_intraday_weight / 100.0
+    total = dw + iw
+    dw, iw = (dw / total, iw / total) if total > 0 else (1.0, 0.0)
+    blended = trend.trend_score * dw + intraday_score * iw
+
+    if blended >= cfg.trend_bullish_score_min:
+        effective_intent = BULLISH
+    elif blended <= cfg.trend_bearish_score_max:
+        effective_intent = BEARISH
+    else:
+        effective_intent = NEUTRAL
+
+    if effective_intent != trend.directional_intent:
+        reasons.append(f"Blend ({dw*100:.0f}% daily / {iw*100:.0f}% intraday) = {blended:.1f} — "
+                        f"effective bias {effective_intent}, daily was {trend.directional_intent}")
+    else:
+        reasons.append(f"Blend ({dw*100:.0f}% daily / {iw*100:.0f}% intraday) = {blended:.1f} — "
+                        f"unchanged from daily {trend.directional_intent}")
+
+    logger.info("[DORE:%s] EffectiveBias daily=%s intraday_score=%.1f blended=%.1f -> %s (override=%s)",
+                inp.symbol, trend.directional_intent, intraday_score, blended, effective_intent, False)
+
+    return EffectiveBiasResult(effective_intent=effective_intent, blended_score=round(blended, 1),
+                                intraday_score=round(intraday_score, 1), override_active=False,
+                                reasons=tuple(reasons))
+
 
 def stage2_execution_engine(
     inp: DOREInput, cfg: DORESettings, directional_intent: str
@@ -1680,10 +1814,13 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
 
     trend = stage1_trend_engine(inp, cfg)
     reversal_alert = check_intraday_reversal_alert(inp, cfg, trend.directional_intent)
-    execution = stage2_execution_engine(inp, cfg, trend.directional_intent)
-    deriv = stage3_derivative_intelligence(inp, cfg, trend.directional_intent)
+    effective_bias = compute_effective_bias(inp, cfg, trend, reversal_alert)
+    effective_intent = effective_bias.effective_intent
 
-    direction = "CE" if trend.directional_intent == BULLISH else ("PE" if trend.directional_intent == BEARISH else None)
+    execution = stage2_execution_engine(inp, cfg, effective_intent)
+    deriv = stage3_derivative_intelligence(inp, cfg, effective_intent)
+
+    direction = "CE" if effective_intent == BULLISH else ("PE" if effective_intent == BEARISH else None)
 
     technical_target = deriv.resistance if direction == "CE" else (deriv.support if direction == "PE" else None)
     oi_intel = stage3_5_option_intelligence(inp, cfg, direction, deriv.expected_move, technical_target)
@@ -1707,7 +1844,7 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     hard_gate_pass = risk.hard_gate_pass and oi_intel.hard_gate_pass
 
     opportunity = stage5_opportunity_engine(
-        cfg, trend.trend_score, trend.directional_intent, execution.execution_score, execution.execution_state,
+        cfg, effective_bias.blended_score, effective_intent, execution.execution_score, execution.execution_state,
         deriv.confidence, oi_intel.score, risk.risk_quality, hard_gate_pass, deriv.premium_strengthening,
     )
 
@@ -1726,7 +1863,9 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     trade_plan = build_trade_plan(inp, cfg, direction, strike_type=strike_type, itm_steps=itm_steps)
 
     warnings = list(risk.warnings) + list(oi_intel.warnings)
-    if reversal_alert.triggered:
+    if effective_bias.override_active:
+        warnings.append(f"🔁 Intraday Override Active — {effective_bias.reasons[-1] if effective_bias.reasons else ''}")
+    elif reversal_alert.triggered:
         warnings.append(f"⚠ Intraday Reversal Alert — {reversal_alert.reason}")
     if deriv.confidence < cfg.derivative_confidence_min and direction is not None:
         warnings.append(f"Derivative Confidence={deriv.confidence:.0f} below the "
@@ -1734,8 +1873,8 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     if direction is not None and not deriv.premium_strengthening:
         warnings.append("Premium Behaviour not confirmed — option premium hasn't started strengthening yet")
 
-    reasons = (list(trend.reasons) + list(execution.reasons) + list(deriv.reasons) + list(oi_intel.reasons)
-               + list(risk.reasons) + list(opportunity.reasons) + strike_reasons)
+    reasons = (list(trend.reasons) + list(effective_bias.reasons) + list(execution.reasons) + list(deriv.reasons)
+               + list(oi_intel.reasons) + list(risk.reasons) + list(opportunity.reasons) + strike_reasons)
 
     result = DOREResult(
         recommendation=opportunity.recommendation,
@@ -1743,6 +1882,10 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         conviction_score_10=round(opportunity.opportunity_score / 10.0, 1),
         directional_intent=trend.directional_intent,
         trend_score=round(trend.trend_score, 1),
+        effective_directional_intent=effective_intent,
+        effective_bias_score=effective_bias.blended_score,
+        intraday_evidence_score=effective_bias.intraday_score,
+        intraday_override_active=effective_bias.override_active,
         intraday_reversal_alert=reversal_alert.triggered,
         intraday_reversal_move_pct=reversal_alert.move_pct,
         intraday_reversal_reason=reversal_alert.reason,
