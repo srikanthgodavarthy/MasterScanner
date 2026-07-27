@@ -92,6 +92,16 @@ BEARISH = "BEARISH"
 NEUTRAL = "NEUTRAL"
 ALL_DIRECTIONAL_INTENTS = {BULLISH, BEARISH, NEUTRAL}
 
+# NSE lists weekly options only on these three (NIFTY/SENSEX weekly, plus
+# BANKNIFTY historically) — every other underlying (individual stocks,
+# OPTSTK) only has MONTHLY contracts. fetch_stock_atm_option() only ever
+# fetches ONE nearest expiry (expiries[0] — this month's) for stocks, so
+# there is no second "next week" chain to fall back to the way there is
+# for indices; stage5b_strike_and_expiry() uses this to pick the right
+# label instead of applying the weekly CURRENT_WEEK/NEXT_WEEK vocabulary
+# to a monthly-only contract (2026-07-27 fix — see its docstring).
+_WEEKLY_EXPIRY_SYMBOLS = {"NIFTY", "SENSEX", "BANKNIFTY"}
+
 READY_NOW         = "READY_NOW"
 BREAKOUT_PENDING  = "BREAKOUT_PENDING"
 WATCH             = "WATCH"
@@ -429,7 +439,7 @@ class DOREResult:
     trade_plan: TradePlan = field(default_factory=TradePlan)
 
     recommended_strike_type: Optional[str] = None   # "ATM" | "ITM"
-    recommended_expiry:      Optional[str] = None   # "CURRENT_WEEK" | "NEXT_WEEK"
+    recommended_expiry:      Optional[str] = None   # "CURRENT_WEEK" | "NEXT_WEEK" (index weekly) | "MONTHLY" (stocks)
 
     suggested_direction: Optional[str] = None   # "CE" | "PE" | None
     suggested_strike:    Optional[float] = None
@@ -1838,13 +1848,35 @@ def stage5b_strike_and_expiry(
         and execution_score >= cfg.execution_score_scalp_min
         and risk_hard_gate_pass
     )
-    if scalp_ok:
-        expiry = "CURRENT_WEEK"
-        reasons.append(f"{inp.days_to_expiry}d to expiry + strong Execution Score "
-                        f"({execution_score:.0f}) — current-week scalp justified")
+    is_weekly_underlying = inp.symbol.upper() in _WEEKLY_EXPIRY_SYMBOLS
+    if is_weekly_underlying:
+        # Index weekly options: fetch_oi_resistance() genuinely offers a
+        # this-week-vs-next-week choice, so CURRENT_WEEK/NEXT_WEEK are
+        # both real, fetchable contracts.
+        if scalp_ok:
+            expiry = "CURRENT_WEEK"
+            reasons.append(f"{inp.days_to_expiry}d to expiry + strong Execution Score "
+                            f"({execution_score:.0f}) — current-week scalp justified")
+        else:
+            expiry = "NEXT_WEEK"
+            reasons.append(f"{inp.days_to_expiry}d to expiry — using next week to protect capital")
     else:
-        expiry = "NEXT_WEEK"
-        reasons.append(f"{inp.days_to_expiry}d to expiry — using next week to protect capital")
+        # Individual-stock options (OPTSTK) are monthly-only on NSE.
+        # fetch_stock_atm_option() only ever fetches the ONE nearest
+        # (current-month) expiry — there is no second "next week" chain
+        # behind it — so labeling this NEXT_WEEK when Execution Score is
+        # weak would claim a contract that was never actually fetched,
+        # and the strike/premium shown would silently still be the
+        # current month's. Always label it what it actually is; a weak
+        # Execution Score this close to expiry becomes a reason/warning
+        # about theta risk instead of a fabricated rollover.
+        expiry = "MONTHLY"
+        if inp.days_to_expiry <= cfg.expiry_days_scalp_max and not scalp_ok:
+            reasons.append(f"{inp.days_to_expiry}d to expiry on the current-month contract with "
+                            f"Execution Score={execution_score:.0f} — meaningful theta-decay risk this "
+                            f"close to expiry; no next-month chain to roll into for a stock option")
+        else:
+            reasons.append(f"{inp.days_to_expiry}d to expiry — current-month contract (stocks are monthly-only on NSE)")
     return strike_type, expiry, suggested_strike, itm_steps, reasons
 
 
