@@ -2516,6 +2516,9 @@ _FIB_PB_BOOST_META = {
     "vcp":                 ("#38bdf8", "VCP"),
     "nr7":                 ("#a78bfa", "NR7"),
     "harmonic_bull":       ("#f59e0b", "🦋"),
+    "squeeze_on":          ("#38bdf8", "SQZ"),
+    "squeeze_release":     ("#f97316", "🚀REL"),
+    "vol_surge":           ("#eab308", "VOL"),
 }
 
 def _ap_status_badge(status: str) -> str:
@@ -2727,13 +2730,16 @@ def _compute_days_active_safe(first_actionable_date: str) -> int:
         return 0
 
 
-def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None:
+def _render_pre_breakout_tab(records: list, df: pd.DataFrame, mode: str) -> None:
     """
-    Fib Pullback Opportunities — table styled identically to the main scanner table.
-    Criteria: trend_up AND in_golden AND CCI ≤ -100
+    Pre-Breakout Scan — table styled identically to the main scanner table.
+    Criteria: trend_up AND (squeeze_on OR squeeze_release) AND 45 <= RSI <= 70
+    Stocks coiling (volatility contracted, energy building) or whose squeeze
+    just fired (momentum burst starting) — i.e. "about to move" / "just
+    starting to move", as opposed to already-extended Actionable/Elite names.
     """
     if not records:
-        st.info("No stocks meet SETUP_FIB_PULLBACK criteria in this scan.")
+        st.info("No stocks meet SETUP_PRE_BREAKOUT criteria in this scan.")
         return
 
     # ── Controls row ─────────────────────────────────────────────────────────
@@ -2741,14 +2747,19 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
     with col_sort:
         sort_mode = st.selectbox(
             "Sort by",
-            ["CCI (most OS)", "Score ↓", "Symbol A→Z"],
-            key="fib_pb_sort",
+            ["Squeeze Release first", "Vol Ratio ↓", "Score ↓", "Symbol A→Z"],
+            key="pre_breakout_sort",
             label_visibility="collapsed",
         )
 
     display_records = list(records)
-    if sort_mode == "CCI (most OS)":
-        display_records.sort(key=lambda r: float(r.get("CCI") or r.get("_cci_raw") or 0))
+    if sort_mode == "Squeeze Release first":
+        display_records.sort(key=lambda r: (
+            0 if bool(r.get("_squeeze_release", False)) else 1,
+            -float(r.get("VolRatio") or r.get("_vol_ratio") or 0),
+        ))
+    elif sort_mode == "Vol Ratio ↓":
+        display_records.sort(key=lambda r: -(float(r.get("VolRatio") or r.get("_vol_ratio") or 0)))
     elif sort_mode == "Score ↓":
         display_records.sort(key=lambda r: -(float(r.get("Score") or 0)))
     else:
@@ -2773,11 +2784,11 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
         except (TypeError, ValueError):
             return '<td class="col-num">—</td>'
 
-    def _pb_cci(v):
+    def _pb_vol_ratio(v):
         try:
             fv = float(v)
-            color = "#3fb950" if fv <= -150 else "#84cc16" if fv <= -100 else "#f59e0b"
-            return f'<td class="col-num" style="color:{color};font-weight:700">{fv:+.0f}</td>'
+            color = "#3fb950" if fv >= 1.5 else "#84cc16" if fv >= 1.0 else "#8b949e"
+            return f'<td class="col-num" style="color:{color};font-weight:700">{fv:.2f}x</td>'
         except (TypeError, ValueError):
             return '<td class="col-num">—</td>'
 
@@ -2851,11 +2862,11 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
 
     # ── Build thead ───────────────────────────────────────────────────────────
     _COLS = [
-        ("STOCK",      "col-stock"), ("SCORE",      ""),  ("CCI",       ""),
-        ("CCI STATE",  ""),          ("%CHG",        ""),  ("ENTRY",     ""),
-        ("SL",         ""),          ("T1",          ""),  ("T2",        ""),
-        ("LEADERSHIP", ""),          ("CONVICTION",  ""),  ("EQ",        ""),
-        ("BOOSTS",     ""),          ("TIER",        ""),
+        ("STOCK",      "col-stock"), ("SCORE",      ""),  ("SQUEEZE",   ""),
+        ("RSI",        ""),          ("VOL RATIO",  ""),  ("%CHG",      ""),
+        ("ENTRY",      ""),          ("SL",          ""),  ("T1",        ""),
+        ("T2",         ""),          ("LEADERSHIP",  ""),  ("CONVICTION",""),
+        ("EQ",         ""),          ("BOOSTS",      ""),  ("TIER",      ""),
     ]
     # Gate threshold tooltips on headers — mirror CV1 v3's actual
     # classify_tier_v3() gate (utils/conviction_score_v1.py, backtest-fit
@@ -2865,6 +2876,7 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
         "LEADERSHIP": 'title="CV1 Leadership — gate: Leadership ≥ 60 (v3 floor)"',
         "CONVICTION": 'title="CV1 Conviction — gate: Conviction ≥ 70 (v3 floor)"',
         "EQ":         'title="CV1 Entry Quality — no standalone floor in v3; gates via equal-weight composite ≥ 60"',
+        "SQUEEZE":    'title="Bollinger squeeze state — COILING = energy building, not fired yet; RELEASED = squeeze just fired"',
     }
     thead = (
         '<thead><tr>'
@@ -2880,17 +2892,13 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
     rows_html = ""
     for rank, r in enumerate(display_records, 1):
         sym    = r.get("Symbol") or r.get("Stock") or "?"
-        cci    = r.get("CCI") or r.get("_cci_raw") or 0
         rsi    = r.get("RSI") or r.get("_rsi") or 0
+        vol_r  = r.get("VolRatio") or r.get("_vol_ratio") or 0
         tier   = r.get("Recommendation") or r.get("Tier") or "—"
-        boosts = r.get("_fib_pb_boosts") or []
+        boosts = r.get("_pre_breakout_boosts") or []
         # [Scanner Refactor] CV1 is the single source of truth for setup
-        # quality — this tab used to read the legacy scoring formula
-        # (Legacy_Leadership/Legacy_Conviction/Legacy_EntryQuality, née
-        # DE_Leadership/DE_Conviction/DE_EntryQuality), which could disagree
-        # with the Recommendation/Tier shown in the same row (that's computed
-        # from CV1 + the Promotion Engine). Reading CV1_* here keeps this tab
-        # consistent with the rest of the app — one scoring system everywhere.
+        # quality — this tab reads CV1_* directly so it stays consistent
+        # with the Recommendation/Tier shown in the same row everywhere else.
         ls     = r.get("CV1_Leadership",   0)
         cv     = r.get("CV1_Conviction",   0)
         eq     = r.get("CV1_EntryQuality", 0)
@@ -2898,26 +2906,17 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
             (float(ls or 0) + float(cv or 0) + float(eq or 0)) / 3
         )
 
-        # CCI state label — mirrors the main scanner
-        try:
-            cci_f = float(cci)
-            if cci_f <= -150:
-                cci_state = ("DEEP OS", "#3fb950")
-            elif cci_f <= -100:
-                cci_state = ("OVERSOLD", "#84cc16")
-            elif cci_f < 0:
-                cci_state = ("BEAR", "#f59e0b")
-            elif cci_f < 100:
-                cci_state = ("BULL", "#58a6ff")
-            else:
-                cci_state = ("OB", "#f85149")
-        except (TypeError, ValueError):
-            cci_state = ("—", "#8b949e")
-
-        cci_state_cell = (
-            f'<td><span style="background:{cci_state[1]}22;border:1px solid {cci_state[1]}55;'
-            f'color:{cci_state[1]};font-size:0.68rem;padding:2px 8px;border-radius:4px;'
-            f'font-weight:700;">{cci_state[0]}</span></td>'
+        # Squeeze state label
+        if bool(r.get("_squeeze_release", False)):
+            sq_state = ("RELEASED", "#f97316")
+        elif bool(r.get("_squeeze_on", False)):
+            sq_state = ("COILING", "#38bdf8")
+        else:
+            sq_state = ("—", "#8b949e")
+        sq_cell = (
+            f'<td><span style="background:{sq_state[1]}22;border:1px solid {sq_state[1]}55;'
+            f'color:{sq_state[1]};font-size:0.68rem;padding:2px 8px;border-radius:4px;'
+            f'font-weight:700;">{sq_state[0]}</span></td>'
         )
 
         rows_html += (
@@ -2925,8 +2924,9 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
             f'<td class="col-rank">{rank}</td>'
             f'<td class="col-stock">{_tv_link(sym)}</td>'
             + _pb_score(r.get("Score"))
-            + _pb_cci(cci)
-            + cci_state_cell
+            + sq_cell
+            + _pb_num(rsi, "{:.0f}")
+            + _pb_vol_ratio(vol_r)
             + _pb_chg(r.get("%Change") or r.get("%Chg"))
             + _pb_num(r.get("Entry"), "{:.2f}")
             + _pb_num(r.get("SL"),    "{:.2f}", color="#f85149")
@@ -2944,7 +2944,7 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
     subtitle = (
         f'<span style="color:var(--muted);font-size:0.72rem;">'
         f'<code style="color:#f97316;background:var(--bg2);padding:1px 6px;border-radius:3px;">'
-        f'trend_up AND in_golden AND CCI ≤ −100</code>'
+        f'trend_up AND (squeeze_on OR squeeze_release) AND 45 ≤ RSI ≤ 70</code>'
         f'&nbsp;·&nbsp;{n} stock{"s" if n != 1 else ""}</span>'
     )
     st.markdown(subtitle, unsafe_allow_html=True)
@@ -2966,8 +2966,8 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
         if not df.empty:
             st.download_button(
                 "⬇️ CSV", data=df.to_csv(index=False),
-                file_name=f"fib_pullback_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv", key="dl_FIB_PULLBACK",
+                file_name=f"pre_breakout_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv", key="dl_PRE_BREAKOUT",
             )
 
 
@@ -2988,410 +2988,6 @@ def _render_fib_pullback_tab(records: list, df: pd.DataFrame, mode: str) -> None
 # fetch_oi_resistance() in utils/upstox_client.py. The Run Scan button's
 # `source` selector (yfinance/upstox) is unrelated to this — that toggle
 # controls the historical OHLCV fetch for scoring, not the live strip.
-# ── SIGNAL CLASS COUNTS ────────────────────────────────────────────
-# [2026-07-27] Moved here from pages/dashboard.py — Signal Class counts
-# are Scanner output, shown right after the Elite/Execute/Actionable/...
-# tables in render_scan_results() below.
-def _sc_counts_html(df: pd.DataFrame) -> str:
-    sc_col = "Recommendation"
-    if sc_col not in df.columns:
-        return ""
-    counts = df[sc_col].value_counts()
-    parts = []
-    for sc in _CAT_ORDER:
-        n = counts.get(sc, 0)
-        if n == 0:
-            continue
-        color, label = _CAT_STYLE.get(sc, ("#484f58", sc))
-        parts.append(
-            f'<span class="sc-count-pill">'
-            f'<span class="sc-dot" style="background:{color}"></span>'
-            f'<span class="sc-count-label">{label}:</span>'
-            f'<span class="sc-count-num" style="color:{color}">{n}</span>'
-            f'</span>'
-        )
-    if not parts:
-        return ""
-    return '<div class="sc-counts">' + "".join(parts) + '</div>'
-
-
-# ── DORE 2.0 F&O OPPORTUNITIES — Futures / Options tabs ────────────
-# [2026-07-27] Moved here from pages/dashboard.py — the F&O Opportunity
-# Engine now renders on the Scanner page, right after the Scanner's own
-# Elite/Execute/Actionable/... output (see render() below: Scanner
-# output, then Futures and Options).
-# 2026-07-20: DORE 2.0 is architecturally independent of MasterScanner
-# (shares only the Market Data Layer — see docs/DORE_2_0_ARCHITECTURE.md
-# Principle 2.1). Both tabs now run DORE's own Stage 0-5 hierarchical
-# funnel (Universe -> Trend Qualification -> Execution Qualification ->
-# Derivative Intelligence -> Risk Engine -> Opportunity Ranking) instead
-# of ranking off the scanner's OppScore/Recommendation/T1 columns.
-# 2026-07-22 dashboard revisit: Action and Execution State were two
-# separate columns saying overlapping things (Action derives from the
-# Recommendation, which is itself gated partly by Execution State) —
-# collapsed into one "Action / Execution" column.
-# 2026-07-23: sort now keys directly off that merged Action column
-# (using the same tier order as _ACTION_TIER_STYLE, i.e. Buy Now / In
-# Trade first, No Trade last) instead of the raw Recommendation string —
-# so the sort order always matches what the row's own Action badge
-# shows, including the plan-aware "In Trade"/"Manage Trade" overrides
-# from enrich_fo_opportunities_df. Opportunity Score (desc) breaks ties
-# within a tier, then Leg (CE before PE) breaks any remaining ties.
-
-# Action-tier coloring for the Options tab table (utils.dore_fo_screener.
-# _action_tier's label set), collapsed to 7 coarse buckets so the whole
-# row can be tinted by "can I act on this right now" rather than the
-# specific CE/PE recommendation.
-_ACTION_TIER_STYLE = {
-    "Buy Now":          ("#3fb950", "🟢"),
-    "Wait for Trigger":  ("#58a6ff", "🔵"),
-    "Watch Only":        ("#a371f7", "🟣"),
-    "Hold":               ("#d29922", "🟡"),
-    "Book Profits":       ("#f85149", "🔴"),
-    "Wait":                ("#8b949e", "⚪"),
-    "No Trade":            ("#484f58", "⚫"),
-    # 2026-07-23: plan-aware overrides — see utils.fo_setup_persistence.
-    # enrich_fo_opportunities_df() step 4. Once a plan is ACTIVE or has
-    # hit T1, these replace the live Recommendation-derived tier so the
-    # Action column never contradicts the Plan column again.
-    "In Trade":            ("#3fb950", "🟢"),
-    "Manage Trade":        ("#f5c542", "🎯"),
-}
-
-_ACTION_SORT_PRIORITY = {
-    "Buy Now": 0,
-    "In Trade": 1,
-    "Manage Trade": 2,
-    "Wait for Trigger": 3,
-    "Watch Only": 4,
-    "Hold": 5,
-    "Book Profits": 6,
-    "Wait": 7,
-    "No Trade": 8,
-}
-_LEG_SORT_PRIORITY = {"CE": 0, "PE": 1}
-
-
-def _sort_by_action_then_score_then_leg(df: pd.DataFrame, action_col: str = "Action") -> pd.DataFrame:
-    """Sort by Action/Execution tier first (Buy Now / In Trade lead, No
-    Trade trails), then Opportunity Score descending, then Leg (CE
-    before PE) — matches how a trader scans this table: can I act right
-    now?, then what's the best of those?, then CE before PE."""
-    if action_col not in df.columns:
-        return df
-    out = df.assign(
-        _action_rank=df[action_col].map(lambda a: _ACTION_SORT_PRIORITY.get(a, 9)),
-        _opp_desc=-df["Opportunity Score"].fillna(0) if "Opportunity Score" in df.columns else 0,
-        _leg_rank=df["Leg"].map(lambda l: _LEG_SORT_PRIORITY.get(l, 2)) if "Leg" in df.columns else 0,
-    )
-    out = out.sort_values(
-        ["_action_rank", "_opp_desc", "_leg_rank"], kind="stable"
-    ).drop(columns=["_action_rank", "_opp_desc", "_leg_rank"])
-    return out
-
-
-def _options_table_html(df: pd.DataFrame) -> str:
-    """Render the Options-tab opportunity table as a colored HTML table
-    instead of st.dataframe — st.dataframe's column_config can format
-    numbers/text but can't tint a cell/row by value, and the whole point
-    of the Action column is 'can I act on this at a glance', which needs
-    color. Each row is tinted by Action tier (see _ACTION_TIER_STYLE).
-
-    Column order (2026-07-23 revisit): Symbol, LTP, Leg, Strike, Premium,
-    Premium %Chg, Opportunity, Entry, Entry Drift %, SL, T1, T2, Plan,
-    Expiry, Strike Type, Reason, Action/Execution State — Strike Type
-    moved to just after Expiry; Action and Execution State remain merged
-    into one trailing column since they were saying overlapping things.
-    "Watch Only" rows are dropped entirely (not actionable, just
-    clutter). Rows are sorted by Action/Execution tier, then Opportunity
-    Score, then Leg (see _sort_by_action_then_score_then_leg).
-
-    2026-07-23 fix: dropped the standalone "Entry Timestamp (IST)"
-    column — it was confusing next to "Entry" (the price), reading like
-    it timestamped the Entry price rather than the plan's current
-    lifecycle state. The same timestamp (WAITING->created_at,
-    ACTIVE->activated_at, T1_HIT->t1_hit_at) now renders as a second
-    line directly under the Plan status badge instead, where "when did
-    this plan reach its current state" actually belongs.
-    """
-    def _fmt_money(v):
-        return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
-
-    def _fmt_num(v, decimals=0):
-        return f"{v:,.{decimals}f}" if v not in (None, "") and pd.notna(v) else "—"
-
-    def _fmt_pct(v):
-        if v in (None, "") or pd.isna(v):
-            return "—"
-        color = "#3fb950" if v >= 0 else "#f85149"
-        return f'<span style="color:{color}">{"+" if v >= 0 else ""}{v:.2f}%</span>'
-
-    def _fmt_text(v):
-        return v if v not in (None, "") and pd.notna(v) else "—"
-
-    def _fmt_plan_ts(v):
-        """Timestamp of the plan's CURRENT lifecycle state (see
-        enrich_fo_opportunities_df step 3): created_at while WAITING,
-        activated_at once ACTIVE, t1_hit_at once T1_HIT — e.g. a Manage
-        Trade row shows when T1 actually hit, not just the original
-        entry. 2026-07-23: moved out of its own "Entry Timestamp"
-        column (confusing next to the Entry price column) and rendered
-        as a sub-line directly under the Plan status badge.
-        2026-07-23 fix: was 10px in --muted (#8b949e) — too small/low-
-        contrast on the dark theme to read at a glance. Bumped to 12px
-        in --text (the theme's primary readable color) instead of
-        --muted."""
-        if v in (None, "") or pd.isna(v):
-            return ""
-        return f'<br><span style="color:var(--text);font-size:12px;">{v} IST</span>'
-
-    if "Action" in df.columns:
-        df = df[df["Action"] != "Watch Only"]
-    df = _sort_by_action_then_score_then_leg(df)
-
-    headers = ["Symbol", "LTP", "Leg", "Strike", "Premium", "Premium %Chg",
-               "Opportunity", "Entry", "Entry Drift %",
-               "SL", "T1", "T2", "Plan", "Expiry", "Strike Type", "Reason", "Action / Execution"]
-
-    rows_html = []
-    for _, r in df.iterrows():
-        tier = r.get("Action", "Wait")
-        tier_color, tier_dot = _ACTION_TIER_STYLE.get(tier, ("#8b949e", "⚪"))
-        exec_state = r.get("Execution State", "")
-        leg = r.get("Leg", "")
-        leg_color = "#3fb950" if leg == "CE" else "#f85149" if leg == "PE" else "#8b949e"
-
-        cells = [
-            f'<td style="font-weight:700;">{_tv_link(r.get("Symbol", "—"))}</td>',
-            f'<td>{_fmt_money(r.get("LTP"))}</td>',
-            f'<td style="color:{leg_color};font-weight:700;">{_fmt_text(leg)}</td>',
-            f'<td>{_fmt_num(r.get("Strike"))}</td>',
-            f'<td>{_fmt_money(r.get("Premium"))}</td>',
-            f'<td>{_fmt_pct(r.get("Premium %Chg"))}</td>',
-            f'<td style="font-weight:700;">{_fmt_num(r.get("Opportunity Score"))}</td>',
-            f'<td>{_fmt_money(r.get("Entry"))}</td>',
-            f'<td>{_fmt_pct(r.get("Entry Drift %"))}</td>',
-            f'<td>{_fmt_money(r.get("SL"))}</td>',
-            f'<td>{_fmt_money(r.get("T1"))}</td>',
-            f'<td>{_fmt_money(r.get("T2"))}</td>',
-            f'<td style="white-space:nowrap;">{_fmt_text(r.get("Plan"))}{_fmt_plan_ts(r.get("Entry Timestamp"))}</td>',
-            f'<td>{_fmt_text(r.get("Expiry"))}</td>',
-            f'<td>{_fmt_text(r.get("Strike Type"))}</td>',
-            f'<td style="color:var(--muted);font-size:11px;max-width:220px;white-space:normal;">{_fmt_text(r.get("Reason"))}</td>',
-            f'<td style="white-space:nowrap;"><span style="color:{tier_color};font-weight:700;">{tier_dot} {tier}</span>'
-            f'<br><span style="color:var(--muted);font-size:10px;">{_fmt_text(exec_state)}</span></td>',
-        ]
-        rows_html.append(
-            f'<tr style="background:{tier_color}14;border-left:3px solid {tier_color};">'
-            + "".join(cells) + "</tr>"
-        )
-
-    header_html = "".join(
-        f'<th style="text-align:left;padding:6px 10px;color:var(--muted);'
-        f'font-size:11px;text-transform:uppercase;white-space:nowrap;">{h}</th>'
-        for h in headers
-    )
-    return (
-        '<div style="overflow-x:auto;">'
-        '<table style="width:100%;border-collapse:collapse;font-size:13px;">'
-        f'<thead><tr>{header_html}</tr></thead>'
-        f'<tbody>{"".join(rows_html)}</tbody>'
-        '</table></div>'
-        '<style>'
-        'table td{padding:6px 10px;color:var(--text);border-bottom:1px solid rgba(255,255,255,0.05);white-space:nowrap;}'
-        '.tv-link{color:inherit;text-decoration:none;border-bottom:1px dotted var(--muted);}'
-        '.tv-link:hover{color:#58a6ff;border-bottom-color:#58a6ff;}'
-        '</style>'
-    )
-
-
-def _futures_table_html(df: pd.DataFrame) -> str:
-    """Futures tab, styled to match the Options table (2026-07-22
-    revisit): TradingView-linked symbol, colored %Chg/Directional
-    Intent, IST Entry Timestamp. Futures has no Action/Execution-State
-    concept (that's an options-chain thing), so rows are tinted by
-    Directional Intent instead and there's no merged tier column.
-    """
-    def _fmt_money(v):
-        return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
-
-    def _fmt_num(v, decimals=0):
-        return f"{v:,.{decimals}f}" if v not in (None, "") and pd.notna(v) else "—"
-
-    def _fmt_pct(v):
-        if v in (None, "") or pd.isna(v):
-            return "—"
-        color = "#3fb950" if v >= 0 else "#f85149"
-        return f'<span style="color:{color}">{"+" if v >= 0 else ""}{v:.2f}%</span>'
-
-    def _fmt_text(v):
-        return v if v not in (None, "") and pd.notna(v) else "—"
-
-    def _fmt_ts(v):
-        if v in (None, "") or pd.isna(v):
-            return "—"
-        s = str(v)
-        time_part = s.split(" ")[-1] if " " in s else s
-        return f'<span title="{s} IST">{time_part} IST</span>'
-
-    if "Directional Intent" in df.columns:
-        df = df.sort_values(
-            by=["Directional Intent", "Trend Score"] if "Trend Score" in df.columns else ["Directional Intent"],
-            ascending=[True, False] if "Trend Score" in df.columns else [True],
-            kind="stable",
-        )
-
-    headers = ["Stock", "CMP", "%Chg", "Directional Intent", "Buildup", "OI", "OI Chg",
-               "Entry", "Entry Timestamp (IST)", "SL", "Target", "Expiry"]
-
-    rows_html = []
-    for _, r in df.iterrows():
-        intent = r.get("Directional Intent", "")
-        intent_color = "#3fb950" if intent == "BULLISH" else "#f85149" if intent == "BEARISH" else "#8b949e"
-        cells = [
-            f'<td style="font-weight:700;">{_tv_link(r.get("Stock", "—"))}</td>',
-            f'<td>{_fmt_money(r.get("CMP"))}</td>',
-            f'<td>{_fmt_pct(r.get("%Chg"))}</td>',
-            f'<td style="color:{intent_color};font-weight:600;">{_fmt_text(intent)}</td>',
-            f'<td>{_fmt_text(r.get("Buildup"))}</td>',
-            f'<td>{_fmt_num(r.get("OI"))}</td>',
-            f'<td>{_fmt_num(r.get("OI Chg"))}</td>',
-            f'<td>{_fmt_money(r.get("Entry"))}</td>',
-            f'<td style="color:var(--muted);font-size:11px;">{_fmt_ts(r.get("Entry Timestamp"))}</td>',
-            f'<td>{_fmt_money(r.get("SL"))}</td>',
-            f'<td>{_fmt_money(r.get("Target"))}</td>',
-            f'<td>{_fmt_text(r.get("Expiry"))}</td>',
-        ]
-        rows_html.append(
-            f'<tr style="background:{intent_color}14;border-left:3px solid {intent_color};">'
-            + "".join(cells) + "</tr>"
-        )
-
-    header_html = "".join(
-        f'<th style="text-align:left;padding:6px 10px;color:var(--muted);'
-        f'font-size:11px;text-transform:uppercase;white-space:nowrap;">{h}</th>'
-        for h in headers
-    )
-    return (
-        '<div style="overflow-x:auto;">'
-        '<table style="width:100%;border-collapse:collapse;font-size:13px;">'
-        f'<thead><tr>{header_html}</tr></thead>'
-        f'<tbody>{"".join(rows_html)}</tbody>'
-        '</table></div>'
-        '<style>'
-        'table td{padding:6px 10px;color:var(--text);border-bottom:1px solid rgba(255,255,255,0.05);white-space:nowrap;}'
-        '.tv-link{color:inherit;text-decoration:none;border-bottom:1px dotted var(--muted);}'
-        '.tv-link:hover{color:#58a6ff;border-bottom-color:#58a6ff;}'
-        '</style>'
-    )
-
-
-_FO_SCAN_REFRESH_SECS = 60  # [2026-07-25 ops fix] was 30 — matches the producer's
-                            # own 60s cadence (scheduler/scan_worker.py); polling
-                            # faster than that just re-checked unchanged metadata,
-                            # once per open browser session, every tick
-
-
-@st.fragment(run_every=_FO_SCAN_REFRESH_SECS)
-def _fo_opportunities_panel():
-    """
-    2026-07-23: rewritten to be event-aware. scheduler/scan_worker.py runs
-    the full futures+options DORE 2.0 universe scan on its own 60s timer
-    (utils/fo_scan.py::compute_fo_scan()) — this function no longer calls
-    top_futures_opportunities()/top_options_opportunities() itself. Before
-    this rewrite this panel had NO fragment isolation at all and re-ran
-    the full scan on every single Dashboard interaction; now it's a cheap
-    metadata poll + (only-when-changed) table render.
-    """
-    from utils.scan_state import load_snapshot_meta, load_snapshot_payload
-
-    st.markdown('<div class="ti-panel-title" style="margin-top:0.6rem;">🎯 DORE 2.0 F&amp;O OPPORTUNITY ENGINE</div>',
-                unsafe_allow_html=True)
-
-    meta = load_snapshot_meta("fo_scan")
-    if meta is None:
-        st.caption("F&O Opportunity Engine: waiting for the first scheduled scan "
-                   "(scheduler/scan_worker.py) — nothing to show yet.")
-        return
-
-    if meta.get("version") != st.session_state.get("fo_scan_version"):
-        full = load_snapshot_payload("fo_scan")
-        if full is not None:
-            st.session_state["fo_scan_version"] = full.get("version")
-            st.session_state["fo_scan_payload"] = full.get("payload") or {}
-        # else: latest row is "running"/"failed" — keep the last good
-        # cached payload rather than blanking the panel.
-
-    payload = st.session_state.get("fo_scan_payload")
-    if not payload:
-        st.caption("F&O Opportunity Engine: latest scan hasn't completed successfully yet.")
-        return
-
-    fut_df = pd.DataFrame(payload.get("futures") or [])
-    opt_df = pd.DataFrame(payload.get("options") or [])
-
-    tab_fut, tab_opt = st.tabs(["📈 Futures", "🎯 Options"])
-
-    with tab_fut:
-        if fut_df.empty:
-            st.caption("No live futures data available right now — check the Upstox token, or "
-                       "every F&O name is currently NEUTRAL on DORE's own Trend Engine (Stage 1).")
-        else:
-            if "Entry Timestamp" not in fut_df.columns:
-                # Back-compat: cached df from before this column existed.
-                fut_df = fut_df.copy()
-                fut_df["Entry Timestamp"] = None
-            st.markdown(_futures_table_html(fut_df), unsafe_allow_html=True)
-
-    with tab_opt:
-        if opt_df.empty:
-            st.caption("No DORE-qualified option setups right now — either the Upstox token needs "
-                       "checking, or every F&O candidate is currently gated to WAIT/NO_TRADE (see "
-                       "the Market Intelligence index cards for why).")
-        else:
-            _opt_display_cols = [
-                "Symbol", "LTP", "Action", "Recommendation", "Leg", "Strike", "Premium", "Premium %Chg",
-                "Strike Type", "Execution State",
-                "Opportunity Score", "Entry", "Entry Drift %", "Entry Timestamp",
-                "SL", "T1", "T2", "Plan", "Expiry", "Reason",
-            ]
-            # Older cached runs (or a plan-enrichment failure) may not have
-            # every column yet — filter to what's actually present rather
-            # than KeyError on a partial frame.
-            opt_df_display = opt_df[[c for c in _opt_display_cols if c in opt_df.columns]].copy()
-            for _missing_col in ("LTP", "Entry Timestamp", "Entry Drift %"):
-                # Back-compat: a cached df from before these columns
-                # existed — render blank rather than KeyError.
-                if _missing_col not in opt_df_display.columns:
-                    opt_df_display[_missing_col] = None
-            if "Action" not in opt_df_display.columns:
-                # Back-compat: a cached df from before the Action column
-                # existed. Derive it inline rather than failing the panel.
-                from utils.dore_fo_screener import _action_tier
-                opt_df_display["Action"] = opt_df_display["Recommendation"].map(_action_tier)
-            if "Premium %Chg" in opt_df_display.columns:
-                opt_df_display["Premium %Chg"] = pd.to_numeric(
-                    opt_df_display["Premium %Chg"], errors="coerce")
-            st.markdown(_options_table_html(opt_df_display), unsafe_allow_html=True)
-            st.caption("🟢 Buy Now = DORE says enter immediately · 🔵 Wait for Trigger = levels are "
-                       "locked but price hasn't confirmed yet (BREAKOUT_PENDING) · 🟣 Watch Only = "
-                       "setup exists, not confirmed to enter · 🟢 In Trade = plan is ACTIVE, hold for "
-                       "T1 · 🎯 Manage Trade = T1 already hit, trail the remainder to T2/SL · Row tint "
-                       "follows the Action column, not Recommendation directly. Once a plan reaches "
-                       "ACTIVE or T1_HIT, Action reflects the plan's own state instead of the live "
-                       "(and by then often stale/contradictory) Recommendation. Entry Timestamp for a "
-                       "locked plan is when that plan actually triggered/was created — not the current "
-                       "scan time — so it stops changing once a plan is open.")
-            st.caption("Runs DORE 2.0's full 5-stage funnel — only rows DORE actually recommends "
-                       "acting on are shown, so this list can legitimately be empty or short on a "
-                       "quiet day. 2026-07-21: BUY_CE_NOW/BUY_PE_NOW additionally require Premium "
-                       "Behavior to show the option premium itself strengthening — a setup where the "
-                       "underlying is ready but the premium hasn't turned yet shows as WATCH_CE/WATCH_PE "
-                       "(Action: Watch Only) instead. Entry/Stop/Targets are in PREMIUM rupees, not the "
-                       "underlying's price. This is a screener, not an order ticket — confirm liquidity "
-                       "(bid/ask) before acting.")
-
-
 def render(settings: dict | None = None):
     st.markdown(_CSS, unsafe_allow_html=True)
     settings = settings or {}
@@ -3584,27 +3180,12 @@ def render(settings: dict | None = None):
             # without permanently occupying a row.
             st.toast("Saved to Supabase.", icon="✅")
 
-    _scan_df_for_page = st.session_state.get("scan_df", pd.DataFrame())
-
     render_scan_results(
-        df_aug=_scan_df_for_page,
+        df_aug=st.session_state.get("scan_df", pd.DataFrame()),
         summary=st.session_state.get("scan_summary", {}),
         scan_time=st.session_state.get("scan_time", ""),
         supabase_ok=supabase_ok,
     )
-
-    # ── Signal Class counts ("Scanner Summary") ─────────────────────────
-    if not _scan_df_for_page.empty and "Recommendation" in _scan_df_for_page.columns:
-        st.markdown(_sc_counts_html(_scan_df_for_page), unsafe_allow_html=True)
-
-    # [2026-07-27 page split] Scanner page layout: Scanner output above,
-    # Futures and Options below. DORE 2.0 is independent of the equity
-    # scanner (Principle 2.1) — it runs its own Stage 0-5 funnel over the
-    # shared F&O universe rather than reading df_aug's OppScore/
-    # Recommendation/T1 columns, so it renders unconditionally here (not
-    # gated on _scan_df_for_page being non-empty). See
-    # utils.dore_fo_screener docstring.
-    _fo_opportunities_panel()
 
 
 def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
@@ -3702,42 +3283,52 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
         developing_df = df_aug[df_aug[_rec_col] == "Setup Building"].copy() if has_cat else pd.DataFrame()
         watch_df      = df_aug[df_aug[_rec_col] == "Leader"].copy() if has_cat else pd.DataFrame()
 
-    # ── SETUP_FIB_PULLBACK detection ─────────────────────────────────────────────
-    # Rules: trend_up AND in_golden AND cci <= -100
-    # Boosts (optional): fib_grade_good, fib_grade_excellent, vcp, nr7, harmonic_bull
-    # These are the stocks being filtered OUT of Elite/Execute but still high quality.
-    def _is_fib_pullback(row) -> bool:
-        trend_up  = bool(row.get("_trend_up", False)) or (
+    # ── SETUP_PRE_BREAKOUT detection ─────────────────────────────────────────────
+    # Rules: trend_up AND (squeeze_on OR squeeze_release) AND 45 <= RSI <= 70
+    # Boosts (optional): squeeze_release, fib_grade_good/excellent, harmonic_bull, vol_surge
+    # squeeze_on   = still coiling, volatility contracted, energy building (not fired yet)
+    # squeeze_release = the BB squeeze just fired — momentum burst starting, the
+    #                    breakout itself is just beginning to confirm
+    # RSI 45-70 keeps this from overlapping the already-overbought Actionable/
+    # Elite tiers on one side and outright weakness on the other — this tab is
+    # specifically "coiled and about to move", not "already moved" or "fading".
+    def _is_pre_breakout(row) -> bool:
+        trend_up = bool(row.get("_trend_up", False)) or (
             str(row.get("TrendPhase", "NONE")).upper() != "NONE"
         )
-        in_golden = bool(row.get("_in_golden", False)) or bool(row.get("_in_golden_relaxed", False))
-        cci_val   = float(row.get("CCI") or row.get("_cci_raw") or 0)
-        return trend_up and in_golden and cci_val <= -100
+        squeeze_on      = bool(row.get("_squeeze_on", False))
+        squeeze_release = bool(row.get("_squeeze_release", False))
+        rsi_val = float(row.get("_rsi") or row.get("RSI") or 0)
+        return trend_up and (squeeze_on or squeeze_release) and 45 <= rsi_val <= 70
 
-    def _fib_pullback_boosts(row) -> list:
-        """Return list of active boost tags for a FIB_PULLBACK stock."""
+    def _pre_breakout_boosts(row) -> list:
+        """Return list of active boost tags for a PRE_BREAKOUT stock."""
         boosts = []
+        if bool(row.get("_squeeze_release", False)):
+            boosts.append("squeeze_release")
+        elif bool(row.get("_squeeze_on", False)):
+            boosts.append("squeeze_on")
         if bool(row.get("_in_golden", False)):
             boosts.append("fib_grade_excellent")
         elif bool(row.get("_in_golden_relaxed", False)):
             boosts.append("fib_grade_good")
-        if bool(row.get("_t2_compression", False)) or bool(row.get("_squeeze_on", False)):
-            boosts.append("vcp")
-        # nr7: proxy via compression_break flag (tight range expansion)
-        if bool(row.get("_compression_break", False)):
-            boosts.append("nr7")
         if bool(row.get("_harm_bull", False)):
             boosts.append("harmonic_bull")
+        try:
+            if float(row.get("_vol_ratio") or 0) >= 1.5:
+                boosts.append("vol_surge")
+        except (TypeError, ValueError):
+            pass
         return boosts
 
-    fib_pb_records = []
+    pre_breakout_records = []
     if not df_aug.empty:
         for _, row in df_aug.iterrows():
-            if _is_fib_pullback(row):
+            if _is_pre_breakout(row):
                 rec = row.to_dict()
-                rec["Setup"] = "FIB_PULLBACK"
-                rec["_fib_pb_boosts"] = _fib_pullback_boosts(row)
-                # Normalise field names for render_fib_tab compatibility
+                rec["Setup"] = "PRE_BREAKOUT"
+                rec["_pre_breakout_boosts"] = _pre_breakout_boosts(row)
+                # Normalise field names for render_pre_breakout_tab compatibility
                 rec.setdefault("Symbol",        rec.get("Stock", ""))
                 rec.setdefault("LTP",           rec.get("CMP",   rec.get("Entry", 0)))
                 rec.setdefault("%Change",        rec.get("%Chg",  0))
@@ -3746,10 +3337,11 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
                     str(rec.get("TrendPhase","NONE")).upper() != "NONE"))
                 rec.setdefault("ReadinessScore", rec.get("Score", 0))
                 rec.setdefault("RSI",            rec.get("_rsi", 0))
+                rec.setdefault("VolRatio",       rec.get("_vol_ratio", 0))
                 rec.setdefault("ATR",            0)
-                fib_pb_records.append(rec)
+                pre_breakout_records.append(rec)
 
-    fib_pb_df = pd.DataFrame(fib_pb_records) if fib_pb_records else pd.DataFrame()
+    pre_breakout_df = pd.DataFrame(pre_breakout_records) if pre_breakout_records else pd.DataFrame()
 
     try:
         from utils.supabase_client import load_open_setup_plans as _load_open_plans_for_count
@@ -3760,11 +3352,11 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
     tab_labels = [
         f"✅ Actionable ({len(elite_df) + len(execute_df) + len(actionable_df)})",
         f"🧭 Developing ({len(developing_df) + len(watch_df)})",
-        f"📐 Fib Pullback ({len(fib_pb_records)})",
+        f"🎯 Pre-Breakout ({len(pre_breakout_records)})",
         f"📋 Active Setups ({len(_open_plans_preview)})",
     ]
-    df_sets  = [pd.DataFrame(), pd.DataFrame(), fib_pb_df, pd.DataFrame()]
-    set_keys = ["ELITE_EXEC_ACTIONABLE", "DEV_WATCH", "FIB_PULLBACK", "ACTIVE_PLANS"]
+    df_sets  = [pd.DataFrame(), pd.DataFrame(), pre_breakout_df, pd.DataFrame()]
+    set_keys = ["ELITE_EXEC_ACTIONABLE", "DEV_WATCH", "PRE_BREAKOUT", "ACTIVE_PLANS"]
 
     if show_skip:
         skip_df = _sc_df("Skip") if has_cv1 else pd.DataFrame()
@@ -3779,9 +3371,9 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
 
     for tab, df_subset, sc_key in zip(tabs, df_sets, set_keys):
         with tab:
-            # ── FIB_PULLBACK tab gets its own rich renderer ──────────────────────
-            if sc_key == "FIB_PULLBACK":
-                _render_fib_pullback_tab(fib_pb_records, df_subset, "Swing")
+            # ── PRE_BREAKOUT tab gets its own rich renderer ──────────────────────
+            if sc_key == "PRE_BREAKOUT":
+                _render_pre_breakout_tab(pre_breakout_records, df_subset, "Swing")
                 continue
 
             # ── ACTIVE_PLANS: the Trade Lifecycle dashboard, independent of
