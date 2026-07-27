@@ -824,84 +824,130 @@ def check_intraday_reversal_alert(
 #  EFFECTIVE BIAS  (2026-07-27 — hybrid daily/intraday blend + override)
 # ══════════════════════════════════════════════════════════════════
 
+def _raw_oi_bullish_score(inp: DOREInput, cfg: DORESettings) -> Optional[float]:
+    """Direction-agnostic OI read: 'is the option chain leaning bullish
+    right now', independent of what Stage 1/effective bias currently
+    believes. Mirrors stage3_derivative_intelligence()'s CE-side writing/
+    PCR logic exactly (same thresholds, same booleans) so this doesn't
+    become a second, drifting copy of that scoring — it's evaluated
+    unconditionally-CE here purely to get a direction-agnostic 0-100
+    scale (100=most bullish), not because CE is assumed.
+    Returns None if no OI data was supplied (all-zero defaults) so
+    callers can skip it rather than silently treating "no data" as 50/neutral.
+    """
+    if inp.ce_oi_change == 0.0 and inp.pe_oi_change == 0.0 and inp.pcr == 1.0 and inp.pcr_prev is None:
+        return None
+    ce_writing   = inp.ce_oi_change > cfg.oi_writing_change_min
+    pe_writing   = inp.pe_oi_change > cfg.oi_writing_change_min
+    ce_unwinding = inp.ce_oi_change < cfg.oi_unwinding_change_max
+    writing_score = 100.0 if (pe_writing and not ce_writing) else (
+        75.0 if pe_writing else (25.0 if ce_writing else 50.0))
+    if ce_unwinding:
+        writing_score = _clamp(writing_score + 15.0)
+    pcr_score = _pct_score(inp.pcr, cfg.oi_pcr_bear_max, cfg.oi_pcr_bull_min)
+    return _weighted([(writing_score, cfg.w_deriv_oi_writing), (pcr_score, cfg.w_deriv_pcr)])
+
+
 def compute_effective_bias(
     inp: DOREInput, cfg: DORESettings, trend: TrendResult, reversal_alert: IntradayReversalAlert,
 ) -> EffectiveBiasResult:
     """Blend Stage 1's daily Trend Score with same-day evidence, and, on
-    an exceptional same-day move, override it outright. Runs every poll
-    (same cadence as check_intraday_reversal_alert) — Stage 1 itself is
-    untouched and still only re-runs once per completed daily candle.
+    strong-enough same-day evidence, override it outright. Runs every
+    poll (same cadence as check_intraday_reversal_alert) — Stage 1 itself
+    is untouched and still only re-runs once per completed daily candle.
 
-    Design (SG, 2026-07-27): daily trend gives useful context and cuts
-    noise, so it isn't discarded — but it also isn't left immutable
-    through the session, since option buying reacts to same-day
-    institutional flow, VWAP reclaim, and OI shifts that can invalidate
-    yesterday's read. Two mechanisms, in order:
+    2026-07-27 v2 (SG feedback on the v1 cut): v1 gated the override on
+    |%move| >= a fixed 2.5% floor AND |move| >= 1.5x ATR — on NIFTY/
+    SENSEX/BANKNIFTY that fixed % floor means a 600+ point NIFTY move,
+    which real trending days essentially never produce, so the override
+    was "technically present, practically dormant". v2 fixes the three
+    problems that caused that:
 
-      1. OVERRIDE — only when reversal_alert already qualifies as
-         "against trend" AND clears a STRICTER bar than the alert's own
-         (override_move_pct_min/override_atr_mult_min, both above the
-         alert's floors). On trigger, effective_intent flips to match
-         today's move outright (BULLISH on an UP override, BEARISH on a
-         DOWN override) and override_active=True — this is the only path
-         that fully overrides the daily read rather than blending it.
-      2. BLEND — otherwise, effective_bias_daily_weight% of Stage 1's
-         Trend Score + effective_bias_intraday_weight% of a same-day-only
-         evidence score (VWAP side, % move off day_open scaled by ATR,
-         fresh EMA9/21 cross), re-bucketed through the same
-         trend_bullish_score_min/trend_bearish_score_max thresholds Stage
-         1 uses. Under ordinary conditions this rarely flips the bucket
-         on its own — it's meant to soften a borderline daily read, not
-         replace it.
+      1. NO FIXED % FLOOR. The size gate is now purely ATR-relative
+         (move / ATR), and ATR is itself the regime-adaptive unit — a
+         calm-regime day has a smaller ATR, so the same move-in-ATR-
+         multiples bar is easier to clear, which is exactly what should
+         happen on a bigger relative move.
+      2. VIX-SCALED on top of that. Where india_vix is supplied, the
+         required ATR-multiple is additionally scaled by
+         (india_vix / override_vix_reference) — a sub-1.0 scalar on a
+         low-VIX day, a bit above 1.0 on an elevated-VIX day, clamped to
+         [override_vix_scalar_min, override_vix_scalar_max] so a VIX
+         reading of 0 or missing never zeroes the requirement out.
+      3. COMPOSITE, not a hard AND of independent gates. Same-day
+         evidence — ATR-relative move, VWAP side, fresh EMA9/21 cross,
+         and (new) a direction-agnostic OI/PCR read (_raw_oi_bullish_score,
+         mirrors Stage 3's own writing/PCR logic) — is blended into one
+         0-100 Intraday Reversal Score. The override fires off THAT
+         composite crossing override_score_bullish_min/
+         override_score_bearish_max, so several moderately-strong,
+         mutually-confirming signals (e.g. a solid-but-not-huge ATR move
+         PLUS PE writing PLUS a VWAP reclaim) can trigger it together —
+         not just one single huge move in isolation.
+      Stage 3's remaining evidence (premium behaviour, corridor/wall
+      room) stays out of this composite for now: both need an assumed
+      direction to evaluate (which strike's premium, which wall) and
+      folding them in without one would mean re-deriving a second,
+      inconsistent copy of Stage 3's own logic. TODO: once Stage 3 is
+      itself made callable with a "probe direction" instead of only the
+      committed one, feed its premium-behaviour/corridor reads in here too.
 
-    If intraday_override_enabled=False, mechanism 1 is skipped entirely
-    (mechanism 2 still runs) — a rollback switch without touching Stage 1.
+    If intraday_override_enabled=False, the override path is skipped
+    entirely (the blend still runs) — a rollback switch without touching
+    Stage 1 or Stage 3.
     """
     reasons: list[str] = []
 
-    # ── same-day-only evidence score (0-100, 100=most bullish) ────
-    # Independent of Stage 1's intent — unlike Stage 2's execution score,
-    # this doesn't ask "is today confirming what Stage 1 already believes"
-    # so it can point either way regardless of the daily read.
-    ev_scores: list[float] = []
+    baseline = inp.day_open or inp.prev_close
+    atr_mult = None
+    if baseline and inp.atr > 0:
+        atr_mult = abs(inp.price - baseline) / inp.atr
+
+    # ── VIX-scaled ATR-multiple requirement (regime adaptivity) ────
+    vix_scalar = 1.0
+    if inp.india_vix and inp.india_vix > 0:
+        vix_scalar = _clamp(inp.india_vix / cfg.override_vix_reference,
+                             cfg.override_vix_scalar_min, cfg.override_vix_scalar_max)
+    required_atr_mult = cfg.override_atr_mult_min * vix_scalar
+
+    # ── same-day evidence sub-scores (0-100, 100=most bullish) ─────
+    ev_scores: list[tuple[float, float]] = []   # (score, weight)
     if inp.vwap > 0 and inp.price > 0:
-        ev_scores.append(100.0 if inp.price > inp.vwap else 0.0)
-    if reversal_alert.move_direction is not None:
-        # scale the day_open move by ATR so a big move on a low-ATR name
-        # still registers as strong evidence
-        baseline = inp.day_open or inp.prev_close
-        if baseline and inp.atr > 0:
-            atr_mult = abs(inp.price - baseline) / inp.atr
-            move_strength = min(1.0, atr_mult / max(cfg.override_atr_mult_min, 0.01))
-        else:
-            move_strength = min(1.0, abs(reversal_alert.move_pct) / max(cfg.override_move_pct_min, 0.01))
+        ev_scores.append((100.0 if inp.price > inp.vwap else 0.0, 20.0))
+    if atr_mult is not None:
+        move_strength = min(1.0, atr_mult / max(required_atr_mult, 0.01))
         move_score = 50.0 + (50.0 * move_strength if reversal_alert.move_direction == "UP"
-                              else -50.0 * move_strength)
-        ev_scores.append(_clamp(move_score))
+                              else (-50.0 * move_strength if reversal_alert.move_direction == "DOWN" else 0.0))
+        ev_scores.append((_clamp(move_score), 40.0))
     if inp.fresh_crossover:
-        ev_scores.append(100.0)
+        ev_scores.append((100.0, 15.0))
     elif inp.fresh_crossunder:
-        ev_scores.append(0.0)
+        ev_scores.append((0.0, 15.0))
+    oi_score = _raw_oi_bullish_score(inp, cfg)
+    if oi_score is not None:
+        ev_scores.append((oi_score, 25.0))
+        reasons.append(f"OI/PCR read (direction-agnostic)={oi_score:.0f}")
 
-    intraday_score = sum(ev_scores) / len(ev_scores) if ev_scores else 50.0
-    reasons.append(f"Same-day evidence score={intraday_score:.0f} "
-                    f"({'no same-day evidence supplied — neutral' if not ev_scores else f'{len(ev_scores)} input(s)'})")
+    intraday_score = _weighted(ev_scores) if ev_scores else 50.0
+    reasons.append(f"Intraday Reversal Score={intraday_score:.0f} "
+                    f"({len(ev_scores)} input(s); required ATR-multiple={required_atr_mult:.2f}x"
+                    + (f", VIX scalar={vix_scalar:.2f}x on VIX={inp.india_vix:.1f}" if inp.india_vix else "") + ")")
 
-    # ── mechanism 1: override on an exceptional same-day move ─────
+    # ── mechanism 1: override on strong-enough composite evidence ──
     if cfg.intraday_override_enabled and reversal_alert.move_direction is not None:
-        baseline = inp.day_open or inp.prev_close
-        pct_ok = abs(reversal_alert.move_pct) >= cfg.override_move_pct_min
-        atr_ok = (inp.atr > 0 and baseline
-                  and abs(inp.price - baseline) >= cfg.override_atr_mult_min * inp.atr)
         against_trend = (trend.directional_intent == BULLISH and reversal_alert.move_direction == "DOWN") or \
                          (trend.directional_intent == BEARISH and reversal_alert.move_direction == "UP") or \
                          trend.directional_intent == NEUTRAL
-        if pct_ok and atr_ok and against_trend:
-            override_intent = BULLISH if reversal_alert.move_direction == "UP" else BEARISH
+        crosses_bullish = intraday_score >= cfg.override_score_bullish_min and reversal_alert.move_direction == "UP"
+        crosses_bearish = intraday_score <= cfg.override_score_bearish_max and reversal_alert.move_direction == "DOWN"
+        if against_trend and (crosses_bullish or crosses_bearish):
+            override_intent = BULLISH if crosses_bullish else BEARISH
             reasons.append(
-                f"Intraday Override Active: {reversal_alert.move_pct:+.2f}% same-day move clears the "
-                f"{cfg.override_move_pct_min:.1f}%/{cfg.override_atr_mult_min:.2f}x-ATR override floor — "
-                f"effective bias forced {override_intent} regardless of {trend.directional_intent} daily intent"
+                f"Intraday Override Active: Intraday Reversal Score={intraday_score:.0f} clears the "
+                f"{cfg.override_score_bullish_min:.0f}/{cfg.override_score_bearish_max:.0f} override bar — "
+                f"effective bias forced {override_intent} regardless of {trend.directional_intent} daily intent "
+                f"({reversal_alert.move_pct:+.2f}%"
+                + (f", {atr_mult:.2f}x ATR" if atr_mult is not None else "") + ")"
             )
             override_score = 100.0 if override_intent == BULLISH else 0.0
             return EffectiveBiasResult(effective_intent=override_intent, blended_score=override_score,
