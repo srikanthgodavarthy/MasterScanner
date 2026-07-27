@@ -47,6 +47,7 @@ from utils.supabase_client import (
     _is_available,
     add_to_portfolio, load_portfolio,
     close_portfolio_position, reduce_portfolio_position, update_portfolio_position,
+    increase_portfolio_position, delete_portfolio_position,
     load_lifecycle_latest,
 )
 from utils.portfolio_engine import suggest_add  # entry-side "top up a winner" judgement — kept separate from the exit model
@@ -1547,6 +1548,44 @@ def _render_detail_card(r: dict, cfg: ExitIntelligenceConfig, total_value: float
                 if update_portfolio_position(pos.get("id"), {"notes": new_notes}):
                     st.success("Notes saved.")
                     st.rerun()
+
+        act2_c1, act2_c2 = st.columns(2)
+        with act2_c1:
+            _md('<div class="pcc-section-label" style="margin-top:0.4rem;font-size:0.72rem;">Add More (average up/down)</div>')
+            add_qty_col, add_price_col = st.columns(2)
+            with add_qty_col:
+                add_qty = st.number_input(
+                    "Additional qty", min_value=0.0, step=1.0, format="%.2f",
+                    key=f"add_qty_{pos.get('id')}",
+                )
+            with add_price_col:
+                add_price = st.number_input(
+                    "Buy price", min_value=0.0, step=0.05, format="%.2f",
+                    value=float(r["price"]), key=f"add_price_{pos.get('id')}",
+                )
+            if st.button(f"➕ Add {add_qty:g} to {symbol}", key=f"btn_add_{pos.get('id')}"):
+                if add_qty <= 0 or add_price <= 0:
+                    st.error("Enter both a qty and a buy price greater than 0.")
+                elif increase_portfolio_position(
+                    pos.get("id"), r["qty"], r["entry_price"], add_qty, add_price,
+                    reason=f"Added {add_qty:g} @ {add_price:.2f}",
+                ):
+                    st.success(f"Added {add_qty:g} more {symbol} — new average entry recalculated.")
+                    st.rerun()
+                else:
+                    st.error("Add failed.")
+        with act2_c2:
+            _md('<div class="pcc-section-label" style="margin-top:0.4rem;font-size:0.72rem;">Delete position (permanent)</div>')
+            confirm_key = f"confirm_delete_{pos.get('id')}"
+            confirm = st.checkbox(f"Confirm permanent delete of {symbol}", key=confirm_key)
+            if st.button(f"🗑️ Delete {symbol}", key=f"btn_delete_{pos.get('id')}", disabled=not confirm):
+                if delete_portfolio_position(pos.get("id")):
+                    st.success(f"{symbol} permanently deleted from the portfolio.")
+                    st.rerun()
+                else:
+                    st.error("Delete failed.")
+            st.caption("Removes the row entirely — for correcting a mistaken entry. "
+                       "To close a genuine trade, use Exit instead so it stays in your history.")
 
 
 
