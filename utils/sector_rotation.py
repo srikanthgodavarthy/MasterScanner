@@ -65,9 +65,16 @@ def compute_sector_breadth(df_aug: pd.DataFrame, symbol_col: str = "Stock") -> p
     sector clearing RS55>0 / RSI>50 / SMA20/50/100) using the closest
     equivalents available in df_aug:
       - RSI>50            -> _rsi / RSI column
-      - RS55>0             -> rs_composite > 0 (composite RS, not a
+      - RS55>0             -> RScomp > 0 (composite RS, not a
                                published RS-vs-index rating)
       - price above SMA20  -> _trend_up / TrendPhase != NONE
+
+    This is the fast, single-column-per-metric version with no extra
+    price-history fetch — kept as the default input to
+    compute_rotation_metrics() so Direction/Suggested Action don't pay
+    for a per-stock history re-fetch on every dashboard render. For a
+    breadth grid that actually splits SMA20/50/100 into three real
+    columns and uses a genuine 55-bar RS, see compute_stockedge_breadth().
     """
     empty = pd.DataFrame(columns=["Sector", "PctRsiAbove50", "PctRsPositive",
                                    "PctTrendUp", "BreadthScore", "BreadthBucket",
@@ -79,7 +86,13 @@ def compute_sector_breadth(df_aug: pd.DataFrame, symbol_col: str = "Stock") -> p
     work["_sector"] = work[symbol_col].astype(str).map(get_sector)
 
     rsi_col = "RSI" if "RSI" in work.columns else ("_rsi" if "_rsi" in work.columns else None)
-    rs_col = "rs_composite" if "rs_composite" in work.columns else None
+    # 2026-07-27 fix: df_aug exposes the composite RS column as "RScomp"
+    # (see scanner_engine.py's result dict) — "rs_composite" is the
+    # canonical/lifecycle-snapshot name, not a df_aug column, so this
+    # lookup previously always missed and PctRsPositive silently read as
+    # 0.0% for every sector. Checks both so this also works if a caller
+    # ever passes a canonicalized frame instead of raw df_aug.
+    rs_col = next((c for c in ("RScomp", "rs_composite") if c in work.columns), None)
     if "_trend_up" in work.columns:
         trend_up = work["_trend_up"].astype(bool)
     elif "TrendPhase" in work.columns:
@@ -109,7 +122,197 @@ def compute_sector_breadth(df_aug: pd.DataFrame, symbol_col: str = "Stock") -> p
                                         "PctTrendUp", "BreadthScore", "BreadthBucket",
                                         "StockCount"])
 
-# Deadband for classifying 20D momentum into a rotation direction.
+
+# ── Real SMA20/50/100 + 55-bar RS breadth (StockEdge Breadth tab match) ──
+# The fast compute_sector_breadth() above collapses "price above
+# SMA20/50/100" into a single trend_up flag because df_aug doesn't carry
+# per-stock SMA20/50/100 flags. This version computes the real thing —
+# each symbol's own cached OHLCV (same RAM cache the scanner itself just
+# populated, via history_store.get_live_history_cached — no extra network
+# hit in the common case) gives us actual SMA20/50/100 and a genuine
+# 55-trading-day excess-return-vs-Nifty (RS55), matching StockEdge's
+# Breadth grid columns one-for-one instead of approximating them.
+#
+# Still a proxy in one sense: StockEdge's own "RS 55" rating formula
+# isn't published, so ours is the same excess-return-vs-benchmark math
+# the scanner already uses for RS1m/RS3m/RS6m (utils/scoring_core.py's
+# _rs()), just evaluated at a 55-bar window instead of 21/63/126. The
+# RSI>50 and SMA20/50/100 columns are exact, not proxies.
+_RS_LOOKBACK_BARS = 55
+
+
+def _stock_close_series(history: dict, symbol: str) -> "pd.Series | None":
+    df = history.get(symbol)
+    if df is None or df.empty:
+        return None
+    close_col = "close" if "close" in df.columns else ("Close" if "Close" in df.columns else None)
+    if close_col is None:
+        return None
+    s = df[close_col].dropna()
+    return s if not s.empty else None
+
+
+def _sma_above_flags(closes: "pd.Series") -> dict:
+    """{'above_sma20': bool, 'above_sma50': bool, 'above_sma100': bool} —
+    a span is simply omitted if there isn't enough history for it yet."""
+    if closes is None or closes.empty:
+        return {}
+    last = float(closes.iloc[-1])
+    out = {}
+    for span in (20, 50, 100):
+        if len(closes) >= span:
+            sma = float(closes.tail(span).mean())
+            out[f"above_sma{span}"] = last >= sma
+    return out
+
+
+def _rs55(closes: "pd.Series", nifty: "pd.Series", bars: int = _RS_LOOKBACK_BARS) -> "float | None":
+    """Stock return minus Nifty return over the trailing `bars` trading
+    days — same excess-return-vs-benchmark math as scoring_core.py's
+    _rs(), just at StockEdge's 55-bar window instead of 21/63/126."""
+    if closes is None or nifty is None or len(closes) <= bars:
+        return None
+    aligned = nifty.reindex(closes.index).ffill().dropna()
+    if len(aligned) <= bars:
+        return None
+    c_now, c_ago = float(closes.iloc[-1]), float(closes.iloc[-1 - bars])
+    n_now, n_ago = float(aligned.iloc[-1]), float(aligned.iloc[-1 - bars])
+    if c_ago <= 0 or n_ago <= 0:
+        return None
+    return (c_now / c_ago - 1) - (n_now / n_ago - 1)
+
+
+def compute_stockedge_breadth(df_aug: pd.DataFrame, symbol_col: str = "Stock",
+                               source: str = "yfinance") -> pd.DataFrame:
+    """
+    StockEdge-matching Breadth grid: one row per sector with
+    PctRs55Positive, PctRsiAbove50, PctAboveSma20, PctAboveSma50,
+    PctAboveSma100, BreadthScore (mean of the five, 0-100), BreadthBucket,
+    StockCount.
+
+    Reuses the scanner's own RAM history cache (history_store.
+    get_live_history_cached) and Nifty benchmark (scanner_engine.
+    fetch_nifty) — both already warm from the scan that produced df_aug in
+    the common case, so this doesn't re-fetch price data from the network
+    on every dashboard render.
+    """
+    cols = ["Sector", "PctRs55Positive", "PctRsiAbove50", "PctAboveSma20",
+            "PctAboveSma50", "PctAboveSma100", "BreadthScore", "BreadthBucket", "StockCount"]
+    empty = pd.DataFrame(columns=cols)
+    if df_aug is None or df_aug.empty or symbol_col not in df_aug.columns:
+        return empty
+
+    from utils.history_store import get_live_history_cached
+    from utils.scanner_engine import fetch_nifty
+
+    work = df_aug.copy()
+    work["_sector"] = work[symbol_col].astype(str).map(get_sector)
+    rsi_col = "RSI" if "RSI" in work.columns else ("_rsi" if "_rsi" in work.columns else None)
+
+    symbols = work[symbol_col].astype(str).unique().tolist()
+    try:
+        history = get_live_history_cached(symbols, years=1.0, source=source)
+    except Exception:
+        history = {}
+    nifty = fetch_nifty(period="1y", source=source)
+    nifty = nifty if nifty is not None and not nifty.empty else None
+
+    per_stock = {}
+    for sym in symbols:
+        closes = _stock_close_series(history, sym)
+        flags = _sma_above_flags(closes)
+        rs55 = _rs55(closes, nifty) if closes is not None else None
+        per_stock[sym] = {**flags, "rs55": rs55}
+
+    rows = []
+    for sector, grp in work.groupby("_sector"):
+        n = len(grp)
+        if n == 0:
+            continue
+        syms = grp[symbol_col].astype(str).tolist()
+        pct_rsi = float((pd.to_numeric(grp[rsi_col], errors="coerce") > 50).mean() * 100) if rsi_col else 0.0
+
+        def _pct(key):
+            vals = [per_stock[s].get(key) for s in syms if per_stock.get(s, {}).get(key) is not None]
+            return round(float(sum(1 for v in vals if v) / len(vals) * 100), 1) if vals else None
+
+        rs55_vals = [per_stock[s]["rs55"] for s in syms if per_stock.get(s, {}).get("rs55") is not None]
+        pct_rs55 = round(float(sum(1 for v in rs55_vals if v > 0) / len(rs55_vals) * 100), 1) if rs55_vals else 0.0
+        pct_sma20 = _pct("above_sma20") or 0.0
+        pct_sma50 = _pct("above_sma50") or 0.0
+        pct_sma100 = _pct("above_sma100") or 0.0
+
+        breadth = round((pct_rsi + pct_rs55 + pct_sma20 + pct_sma50 + pct_sma100) / 5.0, 1)
+        rows.append({
+            "Sector": sector,
+            "PctRs55Positive": pct_rs55,
+            "PctRsiAbove50": round(pct_rsi, 1),
+            "PctAboveSma20": pct_sma20,
+            "PctAboveSma50": pct_sma50,
+            "PctAboveSma100": pct_sma100,
+            "BreadthScore": breadth,
+            "BreadthBucket": _se_score_bucket(breadth),
+            "StockCount": n,
+        })
+    return pd.DataFrame(rows, columns=cols)
+
+
+# ── 1M/3M/6M Momentum Scores (StockEdge Scores tab match) ────────────
+# The scanner already computes per-stock RS1m/RS3m/RS6m (excess return
+# vs Nifty over 21/63/126 bars — see scoring_core.py's _rs()), so no new
+# price-history fetch is needed here at all; this just aggregates those
+# existing columns per sector and rescales them onto StockEdge's 0-100
+# score scale.
+#
+# The 0-100 SCALE itself is our own — StockEdge doesn't publish the
+# formula behind its Momentum Score, so a sector averaging +8% excess
+# return over a window being called "score 70" is a judgment call, not a
+# reproduction of their math. The Bearish(0-40)/Neutral(41-60)/
+# Bullish(61-100) bucket cutoffs are StockEdge's own and are reused as-is.
+_MOMENTUM_SCALE_PCT = 20.0  # a sector at +/-20% avg excess return maps to the 0/100 ends
+
+
+def _pct_to_score(pct: float) -> float:
+    return round(max(0.0, min(100.0, 50.0 + (pct / _MOMENTUM_SCALE_PCT) * 50.0)), 1)
+
+
+def compute_sector_momentum_scores(df_aug: pd.DataFrame, symbol_col: str = "Stock") -> pd.DataFrame:
+    """
+    One row per sector: Sector, Momentum1M/3M/6M (0-100 scores) and their
+    Bucket columns (Bearish/Neutral/Bullish), StockCount. Built entirely
+    from df_aug's existing RS1m/RS3m/RS6m columns (already computed by
+    the scanner for every stock) — no extra fetch or computation needed.
+    """
+    cols = ["Sector", "Momentum1M", "Momentum1MBucket", "Momentum3M", "Momentum3MBucket",
+            "Momentum6M", "Momentum6MBucket", "StockCount"]
+    empty = pd.DataFrame(columns=cols)
+    if df_aug is None or df_aug.empty or symbol_col not in df_aug.columns:
+        return empty
+    needed = ("RS1m", "RS3m", "RS6m")
+    if not any(c in df_aug.columns for c in needed):
+        return empty
+
+    work = df_aug.copy()
+    work["_sector"] = work[symbol_col].astype(str).map(get_sector)
+
+    rows = []
+    for sector, grp in work.groupby("_sector"):
+        n = len(grp)
+        if n == 0:
+            continue
+        row = {"Sector": sector, "StockCount": n}
+        for label, col in (("Momentum1M", "RS1m"), ("Momentum3M", "RS3m"), ("Momentum6M", "RS6m")):
+            if col in grp.columns:
+                avg_pct = float(pd.to_numeric(grp[col], errors="coerce").mean())
+                score = _pct_to_score(avg_pct)
+            else:
+                score = 50.0
+            row[label] = score
+            row[f"{label}Bucket"] = _se_score_bucket(score)
+        rows.append(row)
+    return pd.DataFrame(rows, columns=cols)
+
+
 _DIRECTION_DEADBAND = 3.0
 # Below this 20D momentum, an "Out" sector is severe enough to say EXIT
 # rather than REDUCE.
