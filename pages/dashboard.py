@@ -2284,8 +2284,42 @@ table.sr-table td:nth-child(3), table.sr-table td:nth-child(4), table.sr-table t
 
 .sr-footer { display:flex; justify-content:space-between; font-size:0.72rem; color:#8b949e;
              border-top:1px solid #1e293b; margin-top:16px; padding-top:10px; }
+
+table.sr-se-table { width:100%; border-collapse:separate; border-spacing:4px; font-size:0.78rem; }
+table.sr-se-table th { text-align:center; color:#8b949e; font-weight:600; font-size:0.68rem;
+                        letter-spacing:0.04em; padding:4px 6px; }
+table.sr-se-table th:first-child { text-align:left; }
+table.sr-se-table td.sr-se-cell { text-align:center; font-weight:700; border-radius:6px;
+                                   padding:10px 6px; color:#0a0e1a; }
 </style>
 """
+
+
+def _se_cell_color(pct) -> str:
+    """Green-to-red heatmap color for a 0-100 breadth %/momentum score,
+    loosely matching StockEdge's own Breadth/Scores color scale."""
+    if pct is None:
+        return "#2a3346"
+    try:
+        v = float(pct)
+    except (TypeError, ValueError):
+        return "#2a3346"
+    if v <= 40:
+        return "#f0883e" if v >= 25 else "#f85149"
+    if v <= 60:
+        return "#d29922"
+    if v <= 75:
+        return "#8fce6a"
+    if v <= 90:
+        return "#3fb950"
+    return "#1f9d55"
+
+
+def _se_cell_html(pct) -> str:
+    color = _se_cell_color(pct)
+    txt = f"{pct:.0f}%" if pct is not None and not pd.isna(pct) else "—"
+    return f'<td class="sr-se-cell" style="background:{color}">{txt}</td>'
+
 
 
 def _sr_tier_bucket_counts(stats: pd.DataFrame) -> dict:
@@ -2518,7 +2552,8 @@ def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.Dat
     directly rather than returning HTML, since the two-column layout
     needs real st.columns)."""
     from utils.sector_rotation import (compute_rotation_metrics, compute_rotation_timeline,
-                                        compute_sector_flow, compute_sector_breadth)
+                                        compute_sector_flow, compute_sector_breadth,
+                                        compute_stockedge_breadth, compute_sector_momentum_scores)
 
     st.markdown(_SR_CSS, unsafe_allow_html=True)
 
@@ -2761,6 +2796,74 @@ def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.Dat
           </div>
         </div>
         """.strip(), unsafe_allow_html=True)
+
+    # ── StockEdge-style Breadth & Momentum Scores (real SMA20/50/100 +
+    #    55-bar RS breadth, and 1M/3M/6M momentum scores) ──────────────
+    se_breadth = compute_stockedge_breadth(df_aug)
+    se_momentum = compute_sector_momentum_scores(df_aug)
+    if not se_breadth.empty or not se_momentum.empty:
+        st.markdown(
+            '<div class="sr-panel" style="margin-top:16px;">'
+            '<div class="sr-panel-title">📱 STOCKEDGE-STYLE SECTOR GRIDS</div>'
+            '<div style="font-size:0.7rem;color:#8b949e;margin-bottom:10px;">'
+            "% of each sector's stocks clearing RS55&gt;0 / RSI&gt;50 / SMA20 / SMA50 / SMA100, "
+            "and 1M/3M/6M momentum scores (Bearish 0-40 / Neutral 41-60 / Bullish 61-100) &mdash; "
+            "RSI&gt;50 and SMA20/50/100 are exact; RS55 and the 0-100 momentum scale are our own "
+            "excess-return-vs-Nifty proxies, since StockEdge's own RS/scoring formulas aren't published."
+            "</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        tab_breadth, tab_scores = st.tabs(["Breadth", "Scores"])
+
+        with tab_breadth:
+            if se_breadth.empty:
+                st.caption("No breadth data yet — needs at least one completed scan.")
+            else:
+                bdf = se_breadth.sort_values("BreadthScore", ascending=False)
+                rows_html = "".join(
+                    "<tr>"
+                    f'<td style="text-align:left;">{_SR_SECTOR_ICON.get(r["Sector"], "🏷️")} {r["Sector"]}<br>'
+                    f'<span style="font-size:0.62rem;color:#8b949e;">{int(r["StockCount"])} stocks</span></td>'
+                    f'{_se_cell_html(r["PctRs55Positive"])}'
+                    f'{_se_cell_html(r["PctRsiAbove50"])}'
+                    f'{_se_cell_html(r["PctAboveSma20"])}'
+                    f'{_se_cell_html(r["PctAboveSma50"])}'
+                    f'{_se_cell_html(r["PctAboveSma100"])}'
+                    "</tr>"
+                    for _, r in bdf.iterrows()
+                )
+                table_html = (
+                    '<table class="sr-se-table">'
+                    "<tr><th>Sector</th><th>RS55&gt;0</th><th>RSI&gt;50</th>"
+                    "<th>SMA20</th><th>SMA50</th><th>SMA100</th></tr>"
+                    f"{rows_html}"
+                    "</table>"
+                )
+                st.markdown(table_html, unsafe_allow_html=True)
+
+        with tab_scores:
+            if se_momentum.empty:
+                st.caption("No momentum-score data yet — needs RS1m/RS3m/RS6m from a completed scan.")
+            else:
+                mdf = se_momentum.sort_values("Momentum3M", ascending=False)
+                rows_html = "".join(
+                    "<tr>"
+                    f'<td style="text-align:left;">{_SR_SECTOR_ICON.get(r["Sector"], "🏷️")} {r["Sector"]}<br>'
+                    f'<span style="font-size:0.62rem;color:#8b949e;">{int(r["StockCount"])} stocks</span></td>'
+                    f'{_se_cell_html(r["Momentum1M"])}'
+                    f'{_se_cell_html(r["Momentum3M"])}'
+                    f'{_se_cell_html(r["Momentum6M"])}'
+                    "</tr>"
+                    for _, r in mdf.iterrows()
+                )
+                table_html = (
+                    '<table class="sr-se-table">'
+                    "<tr><th>Sector</th><th>1M</th><th>3M</th><th>6M</th></tr>"
+                    f"{rows_html}"
+                    "</table>"
+                )
+                st.markdown(table_html, unsafe_allow_html=True)
 
     # ── footer ──────────────────────────────────────────────────────
     scanned = len(df_aug)
