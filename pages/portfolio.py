@@ -1041,6 +1041,84 @@ def _render_positions_table(rows: list[dict]):
 
 
 # ══════════════════════════════════════════════════════════════════
+#  POSITION MANAGEMENT (lightweight, always-available — independent of
+#  the detailed Exit Intelligence cards further down the page)
+# ══════════════════════════════════════════════════════════════════
+
+def _render_position_management(rows: list[dict]):
+    """Compact Manage panel: pick any open position from a dropdown, then
+    Reduce / Add / Notes / Delete it. Purely additive — sits in its own
+    expander under the holdings table and doesn't touch the KPI strip,
+    action panels, or holdings table above it."""
+    if not rows:
+        return
+
+    symbol_by_label = {f"{r['symbol']}": r for r in sorted(rows, key=lambda x: x["symbol"])}
+    labels = list(symbol_by_label.keys())
+    sel_label = st.selectbox("Select Position", labels, key="posmgmt_select")
+    r = symbol_by_label[sel_label]
+    pos = r["pos"]
+    symbol = r["symbol"]
+    pid = pos.get("id")
+
+    tab_reduce, tab_add, tab_notes, tab_delete = st.tabs(["Reduce", "Add", "Notes", "Delete"])
+
+    with tab_reduce:
+        reduce_pct = st.slider(f"Reduce % — {symbol}", 10, 90, 50, 10, key=f"pm_reduce_pct_{pid}")
+        if st.button(f"Reduce {reduce_pct}%", key=f"pm_btn_reduce_{pid}"):
+            new_qty = round(r["qty"] * (1 - reduce_pct / 100), 4)
+            if reduce_portfolio_position(pid, new_qty, reason=f"Manual reduce {reduce_pct}%"):
+                st.success(f"Reduced {symbol} to qty {new_qty:g}.")
+                st.rerun()
+            else:
+                st.error("Reduce failed.")
+
+    with tab_add:
+        add_qty_col, add_price_col = st.columns(2)
+        with add_qty_col:
+            add_qty = st.number_input(
+                "Additional qty", min_value=0.0, step=1.0, format="%.2f",
+                key=f"pm_add_qty_{pid}",
+            )
+        with add_price_col:
+            add_price = st.number_input(
+                "Buy price", min_value=0.0, step=0.05, format="%.2f",
+                value=float(r["price"]), key=f"pm_add_price_{pid}",
+            )
+        if st.button(f"➕ Add {add_qty:g} to {symbol}", key=f"pm_btn_add_{pid}"):
+            if add_qty <= 0 or add_price <= 0:
+                st.error("Enter both a qty and a buy price greater than 0.")
+            elif increase_portfolio_position(
+                pid, r["qty"], r["entry_price"], add_qty, add_price,
+                reason=f"Added {add_qty:g} @ {add_price:.2f}",
+            ):
+                st.success(f"Added {add_qty:g} more {symbol} — new average entry recalculated.")
+                st.rerun()
+            else:
+                st.error("Add failed.")
+
+    with tab_notes:
+        new_notes = st.text_area("Notes", pos.get("notes", "") or "", key=f"pm_notes_{pid}")
+        if st.button("💾 Save notes", key=f"pm_btn_notes_{pid}"):
+            if update_portfolio_position(pid, {"notes": new_notes}):
+                st.success("Notes saved.")
+                st.rerun()
+            else:
+                st.error("Save failed.")
+
+    with tab_delete:
+        confirm = st.checkbox(f"Confirm permanent delete of {symbol}", key=f"pm_confirm_delete_{pid}")
+        if st.button(f"🗑️ Delete {symbol}", key=f"pm_btn_delete_{pid}", disabled=not confirm):
+            if delete_portfolio_position(pid):
+                st.success(f"{symbol} permanently deleted from the portfolio.")
+                st.rerun()
+            else:
+                st.error("Delete failed.")
+        st.caption("Removes the row entirely — for correcting a mistaken entry. "
+                   "To close a genuine trade, use Exit instead so it stays in your history.")
+
+
+# ══════════════════════════════════════════════════════════════════
 #  OPPORTUNITY COST ANALYZER
 # ══════════════════════════════════════════════════════════════════
 
@@ -1707,6 +1785,9 @@ def render():
             _render_kpi_strip(rows)
             _render_action_panels(rows)
             _render_holdings_table(rows)
+
+            with st.expander("⚙️ Manage Positions", expanded=False):
+                _render_position_management(rows)
 
             if live_metrics is None or live_metrics.empty:
                 st.caption(
