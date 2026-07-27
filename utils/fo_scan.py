@@ -1,6 +1,10 @@
 """
 utils/fo_scan.py — F&O Opportunity Engine compute, extracted from
-pages/dashboard.py's _fo_opportunities_panel() (2026-07-23).
+_fo_opportunities_panel() (2026-07-23). [2026-07-27] That panel — and
+the render, table-html, and sort helpers it depends on — now lives in
+pages/scanner.py (Scanner page: Scanner output, then Futures and
+Options), having moved out of pages/dashboard.py in the Dashboard/
+Scanner content split.
 
 Before this split, _fo_opportunities_panel() called
 top_futures_opportunities()/top_options_opportunities() directly inside
