@@ -85,7 +85,7 @@ logger = logging.getLogger(__name__)
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from utils.time_utils import now_ist as _now_ist, IST as _IST
+from utils.time_utils import now_ist as _now_ist, today_ist, IST as _IST
 
 from utils.sector_map      import build_sector_stats
 
@@ -3364,13 +3364,49 @@ def render(settings: dict | None = None):
 
     # ── Top Gainers | Sector Heatmap | Leadership Rotation ────────────
     sector_stats = build_sector_stats(df_aug)
+
+    # [2026-07-26] Completes the Sector Rotation tool wiring — see
+    # utils/supabase_client.py's "SECTOR ROTATION PERSISTENCE" section
+    # for why this was previously disconnected (the compute layer and
+    # the rendering functions below both already existed; only the
+    # persistence layer connecting them did not). Best-effort: any
+    # failure here (save or load) falls back to the single-day figures
+    # the panels already knew how to show, so a Supabase hiccup degrades
+    # this to what the Dashboard looked like before this fix, not to an
+    # error.
+    from utils.supabase_client import save_sector_snapshot, load_sector_snapshot_history
+    from utils.sector_rotation import build_sector_snapshot_rows, compute_rotation_metrics
+
+    sector_history = pd.DataFrame()
+    rotation_metrics = pd.DataFrame()
+    try:
+        # Use the scan's own date (parsed from run_at), not "today" —
+        # if the Dashboard is showing a stale scan (see the staleness
+        # banner above), the sector snapshot should be dated to when
+        # that data actually came from, not to whenever it happened to
+        # be viewed.
+        _scan_date = pd.to_datetime(run_at).tz_convert(_IST).date() if run_at else today_ist()
+        save_sector_snapshot(build_sector_snapshot_rows(sector_stats, _scan_date))
+        sector_history = load_sector_snapshot_history(days=60)
+        if not sector_history.empty:
+            rotation_metrics = compute_rotation_metrics(sector_history, sector_stats)
+            # _leadership_rotation_panel()'s naming predates
+            # sector_rotation.py's — bridge the two here rather than
+            # renaming either side's already-established API.
+            rotation_metrics = rotation_metrics.rename(columns={
+                "Mom20D": "Momentum", "DaysOfHistory": "MomentumDays",
+            })
+            rotation_metrics["InflowDays"] = rotation_metrics["MomentumDays"]
+    except Exception:
+        logger.exception("Sector Rotation persistence/compute failed (non-fatal — "
+                          "panels fall back to single-day figures)")
+
     row2_a, row2_b, row2_c = st.columns([1.3, 1.8, 1.5])
     with row2_a:
         st.markdown(_top_gainers_panel(df_aug), unsafe_allow_html=True)
     with row2_b:
-        st.markdown(_sector_opportunity_board_panel(sector_stats), unsafe_allow_html=True)
+        st.markdown(_sector_opportunity_board_panel(sector_stats, sector_history if not sector_history.empty else None),
+                    unsafe_allow_html=True)
     with row2_c:
-        # See _leadership_rotation_panel docstring — no real day-over-day
-        # rotation_metrics feed exists yet, so None triggers its documented
-        # single-scan fallback (AvgChg as momentum, NetInflowCr as inflow).
-        st.markdown(_leadership_rotation_panel(sector_stats, None), unsafe_allow_html=True)
+        st.markdown(_leadership_rotation_panel(sector_stats, rotation_metrics if not rotation_metrics.empty else None),
+                    unsafe_allow_html=True)
