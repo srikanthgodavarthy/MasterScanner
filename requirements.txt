@@ -15,3 +15,7 @@ scipy
 openai>=1.40.0
 pyarrow>=15.0.0  # ADDED 2026-07-16: parquet read/write for utils/history_store.py
 feedparser>=6.0.0  # ADDED 2026-07-17: RSS ingestion for utils/news_feed.py (ET / Moneycontrol)
+psutil>=5.9.0  # ADDED 2026-07-27: RAM/CPU checks for utils/scan_health_monitor.py
+                # (self-protecting live_scanner in-process loop). Cross-platform
+                # (Windows/Mac/Linux) — deliberately not stdlib `resource`, which
+                # is POSIX-only and unusable for local dev/testing off-Linux.
