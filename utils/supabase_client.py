@@ -1516,6 +1516,50 @@ def reduce_portfolio_position(position_id, new_qty: float, reason: str = "Partia
     return update_portfolio_position(position_id, updates)
 
 
+def increase_portfolio_position(position_id, current_qty: float, current_entry_price: float,
+                                 add_qty: float, add_price: float,
+                                 reason: str = "Added to position") -> bool:
+    """Average up/down an existing OPEN position: blends the new shares'
+    price into a new weighted-average entry price and bumps qty. Used by
+    the 'Add More' control so a top-up doesn't require creating a second,
+    duplicate row for the same symbol."""
+    if add_qty <= 0 or add_price <= 0:
+        return False
+    new_qty = round(current_qty + add_qty, 4)
+    new_entry_price = round(
+        ((current_qty * current_entry_price) + (add_qty * add_price)) / new_qty, 4
+    ) if new_qty > 0 else current_entry_price
+    return update_portfolio_position(position_id, {
+        "qty":             new_qty,
+        "entry_price":     new_entry_price,
+        "last_added_at":   datetime.now(timezone.utc).isoformat(),
+        "add_reason":      reason,
+    })
+
+
+def delete_portfolio_position(position_id) -> bool:
+    """Permanently remove a position row (hard delete) — distinct from
+    close_portfolio_position, which only marks status CLOSED and keeps
+    the row for history. Use for correcting mistaken entries, not for
+    normal exits (which should go through Exit/close so the trade stays
+    in the record)."""
+    client = get_client()
+    if client is None:
+        return False
+
+    try:
+        resp = (
+            client.table("portfolio_positions")
+            .delete()
+            .eq("id", position_id)
+            .execute()
+        )
+        return bool(resp.data)
+    except Exception as exc:
+        logger.error("delete_portfolio_position failed: %s", exc)
+        return False
+
+
 # ─── SCHEMA SQL ───────────────────────────────────────────────────────────────
 
 SCHEMA_SQL = """
@@ -1873,7 +1917,9 @@ CREATE TABLE IF NOT EXISTS portfolio_positions (
     closed_at           timestamptz,
     close_reason        text,
     last_reduced_at     timestamptz,
-    reduce_reason       text
+    reduce_reason       text,
+    last_added_at       timestamptz,
+    add_reason          text
 );
 CREATE INDEX IF NOT EXISTS idx_portfolio_positions_symbol ON portfolio_positions(symbol);
 CREATE INDEX IF NOT EXISTS idx_portfolio_positions_status ON portfolio_positions(status);
@@ -1881,4 +1927,9 @@ CREATE INDEX IF NOT EXISTS idx_portfolio_positions_status ON portfolio_positions
 -- Idempotent migration for installs that created portfolio_positions before
 -- initial_stop existed (safe to re-run).
 ALTER TABLE portfolio_positions ADD COLUMN IF NOT EXISTS initial_stop numeric(12,2);
+
+-- Idempotent migration for installs that created portfolio_positions before
+-- the "Add More" (average-up) control existed (safe to re-run).
+ALTER TABLE portfolio_positions ADD COLUMN IF NOT EXISTS last_added_at timestamptz;
+ALTER TABLE portfolio_positions ADD COLUMN IF NOT EXISTS add_reason text;
 """
