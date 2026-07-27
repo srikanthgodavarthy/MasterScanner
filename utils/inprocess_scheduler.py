@@ -17,13 +17,27 @@ per process no matter how many browser sessions/tabs call it — a
 Streamlit process (one per deployed app, NOT one per session/tab) is
 exactly the right lifetime for "start these loops once, forever".
 
-live_scanner is deliberately NOT among these background threads
-(2026-07-24) — it's the heaviest job (full Nifty-500 universe,
-threaded network fetches) and was the leading suspect behind this app's
-OOM-pattern crashes when run continuously, unattended, in the same
-process as the UI. It now runs only on-demand via pages/scanner.py's
-"Run Scan" button. See start_background_scans()'s body for the full
-rationale.
+live_scanner (2026-07-24 -> 2026-07-27): was excluded from these
+background threads because it's the heaviest job (full Nifty-500
+universe, threaded network fetches) and was the leading suspect behind
+this app's OOM-pattern crashes when run continuously, unattended, in
+the same process as the UI. It ran only on-demand via
+pages/scanner.py's "Run Scan" button in the interim — which meant the
+Dashboard's live-scan data was only ever as fresh as the last person to
+click that button, with no autonomous refresh at all on a
+Streamlit-Cloud-only deployment (no separate scheduler/scan_worker.py
+process).
+
+[Ring-buffer fix, 2026-07-27] Re-enabled here, now that
+utils.history_store.get_live_history_cached / update_live_cache trim
+every symbol's RAM DataFrame to RING_BUFFER_MAX_BARS (280 rows) instead
+of growing by one row/symbol/day forever — the actual unbounded-memory
+mechanism behind the earlier OOM pattern, as distinct from raw
+per-cycle CPU/network load. Started here with a deliberately tighter
+concurrency budget than scheduler/scan_worker.py's standalone defaults
+(see start_background_scans()'s body) precisely because it's still
+sharing a container with the UI, even though it's no longer sharing an
+unbounded cache with it.
 
 Call this AFTER the Dashboard has done its own first synchronous read
 of Supabase and rendered — see pages/dashboard.py's render(), which
@@ -81,9 +95,10 @@ def start_background_scans() -> bool:
     any rerun) just returns the cached True instantly without spawning
     duplicate threads.
 
-    live_scanner is NOT started here — see the comment below and the
-    module docstring for why. It runs on-demand only, via pages/
-    scanner.py's "Run Scan" button.
+    live_scanner is started here too, as of the 2026-07-27 ring-buffer
+    fix — see the comment below and the module docstring for why it was
+    previously excluded and what changed. pages/scanner.py's "Run Scan"
+    button still works for an on-demand full re-score alongside it.
 
     [Architecture review C3 fix, 2026-07-25] Before starting anything,
     this now makes ONE non-blocking attempt to claim the scheduler
@@ -101,7 +116,11 @@ def start_background_scans() -> bool:
     unaffected in both cases.
     """
     import threading
-    from scheduler.scan_worker import JOBS, _run_loop, _run_retention_loop, RETENTION_INTERVAL_SECS
+    from scheduler.scan_worker import (
+        JOBS, _run_loop, _run_retention_loop, RETENTION_INTERVAL_SECS,
+        _run_live_scanner_loop, LIVE_SCANNER_INTERVAL_SECS,
+    )
+    from utils.history_store import RING_BUFFER_MAX_BARS
     from utils.system_state import (
         make_scheduler_owner_id, try_acquire_scheduler_lock, start_scheduler_heartbeat,
     )
@@ -143,22 +162,44 @@ def start_background_scans() -> bool:
     t_retention.start()
     logger.info("In-process scheduler: started retention thread (every %ss)", RETENTION_INTERVAL_SECS)
 
-    # live_scanner intentionally NOT started here (2026-07-24). Its
-    # batched sub-scheduler (_run_live_scanner_loop, scheduler/scan_worker.py)
-    # called update_live_cache() -> _flush_executor.submit() once per
-    # batch (~10x/cycle) with no bound on how far a slow Supabase Storage
-    # write could let that queue grow, on top of being the heaviest single
-    # consumer of CPU/network/memory in a process shared with the UI —
-    # together the leading suspects for the OOM-pattern crashes
-    # (healthz "connection reset by peer") this app was hitting.
+    # live_scanner [Ring-buffer fix, 2026-07-27]: re-enabled as a bounded
+    # in-process background thread. The two OOM suspects from 2026-07-24
+    # were (a) the RAM live-cache growing without bound over the
+    # process's lifetime, and (b) unbounded concurrency/queue growth.
+    # (a) is now fixed at the source — see
+    # utils.history_store.RING_BUFFER_MAX_BARS — so every symbol's
+    # DataFrame is capped at 280 rows regardless of how long this
+    # process has been running. (b) was already independently bounded
+    # by _BoundedThreadPoolExecutor (Architecture review H2 fix,
+    # history_store.py's _flush_executor). What's left is ordinary
+    # per-cycle CPU/network load, which this thread runs deliberately
+    # lighter than a dedicated standalone scheduler/scan_worker.py
+    # process would: fewer scoring workers per batch and a longer
+    # inter-batch cooldown, since it's still sharing the container's CPU
+    # with whatever the Streamlit UI is doing at the same time.
     #
-    # live_scanner now runs ONLY on-demand via pages/scanner.py's "Run
-    # Scan" button, which calls run_scanner() ONCE for the whole universe
-    # (not batched) -> at most one flush task per click, and only while a
-    # person is actively present to notice if it hangs, rather than
-    # unattended for hours. See scheduler/scan_worker.py's
-    # _run_live_scanner_loop docstring — that code is left intact and
-    # still used by `python -m scheduler.scan_worker`'s standalone
-    # main(), for if/when this moves to a fully separate Phase 3 process.
+    # A person can still use pages/scanner.py's "Run Scan" button for an
+    # on-demand full re-score (e.g. right after a settings change) —
+    # that path is unaffected and coexists fine with this loop, exactly
+    # as market_intelligence/fo_scan already coexist with manual reruns.
+    INPROCESS_LIVE_SCANNER_MAX_WORKERS = 2          # vs. standalone's 4
+    INPROCESS_LIVE_SCANNER_BATCH_COOLDOWN_SECS = 3.0  # vs. standalone's 1.5
+
+    t_live_scanner = threading.Thread(
+        target=_run_live_scanner_loop,
+        kwargs={
+            "max_workers": INPROCESS_LIVE_SCANNER_MAX_WORKERS,
+            "batch_cooldown_secs": INPROCESS_LIVE_SCANNER_BATCH_COOLDOWN_SECS,
+            "owner_event": hb_thread.lost_ownership,
+        },
+        name="scan-live_scanner", daemon=True,
+    )
+    t_live_scanner.start()
+    logger.info(
+        "In-process scheduler: started live_scanner thread (every %ss, "
+        "max_workers=%d, batch_cooldown=%.1fs, ring-buffer-capped at %d bars)",
+        LIVE_SCANNER_INTERVAL_SECS, INPROCESS_LIVE_SCANNER_MAX_WORKERS,
+        INPROCESS_LIVE_SCANNER_BATCH_COOLDOWN_SECS, RING_BUFFER_MAX_BARS,
+    )
 
     return True
