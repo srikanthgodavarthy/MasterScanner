@@ -3858,7 +3858,7 @@ def render(settings: dict | None = None):
         st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
         _sr = st.session_state.get("dash_sr", {})
         st.markdown(_sr_flow_timeline_html(_sr.get("flow"), _sr.get("timeline")), unsafe_allow_html=True)
-        st.markdown(_sr_how_calculated_html(), unsafe_allow_html=True)
+        #st.markdown(_sr_how_calculated_html(), unsafe_allow_html=True)
 
         # ── News Impact — independent of scan state too.
         _news_impact_panel()
