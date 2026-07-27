@@ -1032,10 +1032,12 @@ _CSS = """
 .mo-bar-legend .d { color: var(--red); }
 
 /* ── Health row: Regime / Trend / Breadth / Sector Rotating In-Stable-Out /
-      VIX / Today's Sector Flow (wide) ── */
+      VIX ── (Today's Sector Flow moved out — now merged with the Sector
+      Rotation Timeline into one 4-column table in the right sidebar,
+      see .sr-flowtl-table) */
 .mo-health-row {
   display: grid;
-  grid-template-columns: 1.3fr 0.9fr 0.9fr 0.7fr 0.7fr 0.7fr 0.7fr 1.7fr;
+  grid-template-columns: 1.3fr 0.9fr 0.9fr 0.7fr 0.7fr 0.7fr 0.7fr;
   gap: 10px;
   margin-bottom: 14px;
 }
@@ -1260,6 +1262,12 @@ _CSS = """
   border-radius: 12px;
   padding: 18px 20px 16px;
   margin-bottom: 14px;
+  /* the detailed ni-grid below is a fixed-px 9-column grid (776px+
+     before its 1fr headline slot even grows) — wider than this panel
+     whenever it sits in a narrow sidebar column. Without this, the
+     extra columns were just clipped/invisible with no way to reach
+     them; scrolling is the honest fix vs. silently losing columns. */
+  overflow-x: auto;
 }
 .ni-title {
   font-size: 12px;
@@ -2157,35 +2165,17 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
   <div class="mo-mini-label" style="margin-top:2px;color:{vix_color};">{vix_label} · {"BEAR" if vix >= 18 else "BULL"}</div>
 </div>"""
 
-    # ── Today's Sector Flow (wide) card ─────────────────────────────
-    sr_flow = sr_flow or {"inflow": [], "outflow": [], "net": 0.0}
-    inflow_rows = "".join(
-        f'<div class="mo-flow-row"><span>{i}&nbsp;{s}</span><span class="a">+{v:.0f} Cr</span></div>'
-        for i, (s, v) in enumerate(sr_flow.get("inflow", [])[:3], start=1)
-    ) or '<div class="mo-mini-label">—</div>'
-    outflow_rows = "".join(
-        f'<div class="mo-flow-row"><span>{i}&nbsp;{s}</span><span class="d">{v:.0f} Cr</span></div>'
-        for i, (s, v) in enumerate(sr_flow.get("outflow", [])[:3], start=1)
-    ) or '<div class="mo-mini-label">—</div>'
-    net = sr_flow.get("net", 0.0)
-    flow_card = f"""
-<div class="mo-health-card mo-flow-card">
-  <div class="mo-health-label">TODAY'S SECTOR FLOW <span style="text-transform:none;font-weight:400;">(Net Inflow)</span></div>
-  <div class="mo-flow-cols">
-    <div class="mo-flow-col">
-      <div class="mo-flow-col-title a">TOP INFLOW SECTORS</div>
-      {inflow_rows}
-    </div>
-    <div class="mo-flow-col">
-      <div class="mo-flow-col-title d">TOP OUTFLOW SECTORS</div>
-      {outflow_rows}
-    </div>
-  </div>
-  <div class="mo-flow-net">Net Inflow (Today): <b style="color:{'#3fb950' if net>=0 else '#f85149'}">{'+' if net>=0 else ''}{net:.0f} Cr</b></div>
-</div>"""
+    # 2026-07-27: Today's Sector Flow card removed from this row — it's
+    # now merged with the Sector Rotation Timeline into one 4-column
+    # table (_sr_flow_timeline_html) that lives in the right sidebar,
+    # where there's actually enough width for Inflow/Outflow/1D-Ago/
+    # Today side by side. This "wide" 1.7fr slot in a strip of otherwise
+    # ~80-150px tiles was never wide enough for that data to breathe.
+    # sr_flow is still accepted as a param (harmless if a caller still
+    # passes it) but no longer rendered here.
 
     health_html = (regime_card + trend_card + breadth_card + rotation_cards
-                    + vix_card + flow_card)
+                    + vix_card)
 
     scan_chip = f'<span class="mo-scan-chip">Last scan: <b>{scan_time} IST</b></span>' if scan_time else ""
 
@@ -2261,6 +2251,16 @@ table.sr-table { width:100%; border-collapse:collapse; font-size:0.8rem; }
 table.sr-table th { text-align:left; color:#8b949e; font-weight:600; font-size:0.68rem;
                      letter-spacing:0.05em; padding:6px 8px; border-bottom:1px solid #1e293b; }
 table.sr-table td { padding:8px; border-bottom:1px solid #161d2c; vertical-align:middle; }
+/* columns 3-5 are always the numeric ones in both tables that reuse this
+   class (LTP/%CHG/VOL RATIO here, 5D/20D Momentum/Breadth in the Sector
+   Rotation Dashboard table) — right-align + tabular-nums so magnitudes
+   line up on their decimal point instead of ragging left like prose. */
+table.sr-table th:nth-child(1) { text-align:right; }
+table.sr-table td:nth-child(1) { text-align:right; }
+table.sr-table th:nth-child(3), table.sr-table th:nth-child(4), table.sr-table th:nth-child(5) { text-align:right; }
+table.sr-table td:nth-child(3), table.sr-table td:nth-child(4), table.sr-table td:nth-child(5) {
+  text-align:right; font-variant-numeric:tabular-nums;
+}
 .sr-sector-name { display:flex; align-items:center; gap:8px; font-weight:600; }
 .sr-pos { color:#3fb950; } .sr-neg { color:#f85149; }
 .sr-action-badge { display:inline-block; padding:3px 12px; border-radius:5px; font-size:0.7rem;
@@ -2269,11 +2269,34 @@ table.sr-table td { padding:8px; border-bottom:1px solid #161d2c; vertical-align
 .sr-flow-col-title { font-size:0.7rem; font-weight:700; margin-bottom:8px; }
 .sr-flow-row { display:flex; justify-content:space-between; font-size:0.78rem; padding:4px 0; }
 
-.sr-timeline table { width:100%; border-collapse:collapse; font-size:0.72rem; }
+/* 2026-07-27: table-layout:fixed + equal-width th/td so every column
+   (1D Ago / Today / etc.) takes the SAME width regardless of how long
+   the sector name + arrow glyph in any one cell happens to be. Before
+   this, the browser auto-sized each column to its widest pill (e.g.
+   "Diversified ↑" vs "IT"), so the "Today" column visibly drifted
+   wider/narrower than "1D Ago" and the grid read as crooked instead of
+   tabular. Pill itself now fills the fixed-width cell (width:100% +
+   box-sizing:border-box) and clips gracefully instead of stretching it. */
+.sr-timeline table { width:100%; table-layout:fixed; border-collapse:collapse; font-size:0.72rem; }
 .sr-timeline th { color:#8b949e; font-weight:600; text-align:center; padding:4px; }
 .sr-timeline td { text-align:center; padding:3px; }
-.sr-tl-pill { display:inline-block; padding:3px 9px; border-radius:5px; font-size:0.68rem;
-              font-weight:600; min-width:64px; }
+.sr-tl-pill { display:inline-block; box-sizing:border-box; width:100%; padding:3px 9px;
+              border-radius:5px; font-size:0.68rem; font-weight:600;
+              overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+/* ── Merged Today's Sector Flow + Sector Rotation Timeline table ── */
+.sr-flowtl-table { width:100%; border-collapse:collapse; font-size:0.76rem; table-layout:fixed; }
+.sr-flowtl-table th { text-align:left; color:#8b949e; font-weight:600; font-size:0.66rem;
+                       letter-spacing:0.05em; padding:6px 8px; border-bottom:1px solid #1e293b; }
+.sr-flowtl-table th.sr-flowtl-tl { text-align:center; }
+.sr-flowtl-table td { padding:6px 8px; border-bottom:1px solid #161d2c; vertical-align:middle;
+                       font-size:0.74rem; }
+.sr-flowtl-table td:nth-child(1), .sr-flowtl-table td:nth-child(2) {
+  display:flex; justify-content:space-between; align-items:center; gap:6px; white-space:nowrap;
+}
+.sr-flowtl-table td:nth-child(3), .sr-flowtl-table td:nth-child(4) { text-align:center; }
+.sr-flowtl-name { overflow:hidden; text-overflow:ellipsis; }
+.sr-flowtl-val { font-weight:600; font-variant-numeric:tabular-nums; flex-shrink:0; }
 
 .sr-focus-cards { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:14px 0; }
 .sr-focus-card { background:#111826; border:1px solid #1e293b; border-radius:10px; padding:14px; }
@@ -2362,50 +2385,79 @@ def _sr_quick_metrics(df_aug: pd.DataFrame, sector_stats: pd.DataFrame, sector_h
     return {"buckets": buckets, "flow": flow, "timeline": timeline}
 
 
-def _sr_timeline_html(timeline: dict | None) -> str:
-    """Standalone 'Sector Rotation Timeline' card — extracted from the
-    full Sector Rotation Analysis section so it can sit in the right
-    sidebar on its own."""
-    if not timeline:
-        return ('<div class="sr-panel"><div class="sr-panel-title">SECTOR ROTATION TIMELINE</div>'
-                '<div style="color:#8b949e;font-size:0.75rem;">Builds up as more scan days are '
-                'persisted — needs at least 2.</div></div>')
+def _sr_flow_timeline_html(flow: dict | None, timeline: dict | None) -> str:
+    """Merged 'Today's Sector Flow' + 'Sector Rotation Timeline' card —
+    one 4-column table (Top Inflow | Top Outflow | 1D Ago | Today)
+    instead of two separate stacked panels. Only the most recent 2
+    timeline columns are shown (whatever "yesterday"/"today" are for the
+    latest persisted scan) so the row count stays aligned to the 4-column
+    layout regardless of how many scan-days of history exist.
 
-    dates, ranks = timeline["dates"], timeline["ranks"]
-    n_rows = max(len(r) for r in ranks)
-    prior_ranks = {s: idx for idx, s in enumerate(ranks[-2])} if len(ranks) >= 2 else {}
-    n_cols = len(dates)
-    header_labels = ["Today" if (n_cols - 1 - idx) == 0 else f"{n_cols - 1 - idx}D Ago" for idx in range(n_cols)]
-    header = "".join(f"<th>{h}</th>" for h in header_labels)
+    Colors reuse .sr-pos/.sr-neg (already correctly wired, unlike the old
+    top-strip flow tile's bare .a/.d classes which had no matching CSS
+    rule anywhere and rendered in plain text)."""
+    flow = flow or {"inflow": [], "outflow": [], "net": 0.0}
+    inflow, outflow = flow.get("inflow", [])[:5], flow.get("outflow", [])[:5]
 
-    body_rows = ""
-    for row_i in range(n_rows):
-        cells = ""
-        for col_i, day_list in enumerate(ranks):
-            if row_i >= len(day_list):
-                cells += "<td>—</td>"
-                continue
-            sector = day_list[row_i]
-            is_today = (col_i == n_cols - 1)
-            arrow, acol = "", "#8b949e"
-            if is_today and sector in prior_ranks:
-                prior_pos = prior_ranks[sector]
-                if prior_pos > row_i:
-                    arrow, acol = " ↑", "#3fb950"
-                elif prior_pos < row_i:
-                    arrow, acol = " ↓", "#f85149"
-            pill_color = "#3fb95022" if is_today else "#58a6ff22"
-            text_color = "#3fb950" if is_today else "#58a6ff"
-            cells += (f'<td><span class="sr-tl-pill" style="background:{pill_color};color:{text_color}">'
-                      f'{sector}<span style="color:{acol}">{arrow}</span></span></td>')
-        body_rows += f"<tr>{cells}</tr>"
+    tl_1d, tl_today, prior_ranks = [], [], {}
+    if timeline:
+        ranks = timeline["ranks"]
+        if len(ranks) >= 2:
+            tl_1d, tl_today = ranks[-2][:5], ranks[-1][:5]
+            prior_ranks = {s: idx for idx, s in enumerate(ranks[-2])}
+        elif ranks:
+            tl_today = ranks[-1][:5]
 
+    n_rows = max(len(inflow), len(outflow), len(tl_1d), len(tl_today), 1)
+
+    def _flow_cell(pairs, i, cls, arrow):
+        if i >= len(pairs):
+            return '<td>—</td>'
+        s, v = pairs[i]
+        sign = "+" if v >= 0 else ""
+        return (f'<td><span class="sr-flowtl-name">{arrow} {s}</span>'
+                f'<span class="{cls} sr-flowtl-val">{sign}{v:.0f} Cr</span></td>')
+
+    def _tl_cell(sectors, i, is_today):
+        if i >= len(sectors):
+            return '<td>—</td>'
+        sector = sectors[i]
+        arrow, acol = "", "#8b949e"
+        if is_today and sector in prior_ranks:
+            prior_pos = prior_ranks[sector]
+            if prior_pos > i:
+                arrow, acol = " ↑", "#3fb950"
+            elif prior_pos < i:
+                arrow, acol = " ↓", "#f85149"
+        pill_color = "#3fb95022" if is_today else "#58a6ff22"
+        text_color = "#3fb950" if is_today else "#58a6ff"
+        return (f'<td><span class="sr-tl-pill" style="background:{pill_color};color:{text_color}">'
+                f'{sector}<span style="color:{acol}">{arrow}</span></span></td>')
+
+    body_rows = "".join(
+        f"<tr>{_flow_cell(inflow, i, 'sr-pos', '↑')}{_flow_cell(outflow, i, 'sr-neg', '↓')}"
+        f"{_tl_cell(tl_1d, i, False)}{_tl_cell(tl_today, i, True)}</tr>"
+        for i in range(n_rows)
+    )
+
+    net = flow.get("net", 0.0)
+    net_color = "sr-pos" if net >= 0 else "sr-neg"
     return f"""
     <div class="sr-panel">
-      <div class="sr-panel-title">SECTOR ROTATION TIMELINE <span style="color:#8b949e;font-weight:400;">(Top {n_rows} Sectors)</span></div>
-      <div class="sr-timeline"><table><tr>{header}</tr>{body_rows}</table></div>
-      <div style="font-size:0.65rem;color:#8b949e;margin-top:8px;">
-        ↑ Moved Up &nbsp; ↓ Moved Down &nbsp; — No Change (vs previous persisted scan date)
+      <div class="sr-panel-title">TODAY'S SECTOR FLOW &amp; ROTATION
+        <span style="color:#8b949e;font-weight:400;">(Net Inflow · Top {n_rows} Sectors)</span></div>
+      <table class="sr-flowtl-table">
+        <tr>
+          <th style="color:#3fb950;">TOP INFLOW</th>
+          <th style="color:#f85149;">TOP OUTFLOW</th>
+          <th class="sr-flowtl-tl">1D AGO</th>
+          <th class="sr-flowtl-tl">TODAY</th>
+        </tr>
+        {body_rows}
+      </table>
+      <div style="border-top:1px solid #1e293b;margin-top:10px;padding-top:8px;font-size:0.72rem;color:#8b949e;">
+        Net Inflow (Today): <b class="{net_color}">{'+' if net >= 0 else ''}{net:.0f} Cr</b>
+        &nbsp;·&nbsp; ↑ Moved Up &nbsp; ↓ Moved Down &nbsp; — No Change (vs previous persisted scan date)
       </div>
     </div>""".strip()
 
@@ -3805,7 +3857,7 @@ def render(settings: dict | None = None):
     with col_right:
         st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
         _sr = st.session_state.get("dash_sr", {})
-        st.markdown(_sr_timeline_html(_sr.get("timeline")), unsafe_allow_html=True)
+        st.markdown(_sr_flow_timeline_html(_sr.get("flow"), _sr.get("timeline")), unsafe_allow_html=True)
         st.markdown(_sr_how_calculated_html(), unsafe_allow_html=True)
 
         # ── News Impact — independent of scan state too.
