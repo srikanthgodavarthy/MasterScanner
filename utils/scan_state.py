@@ -324,6 +324,7 @@ BEGIN
         WHEN 'fo_scan_snapshots'             THEN 'version'
         WHEN 'scan_snapshots'                THEN 'run_at'
         WHEN 'scan_daily_archive'            THEN 'trading_date'
+        WHEN 'sector_snapshots'              THEN 'scan_date'
         ELSE NULL
     END;
     IF order_col IS NULL THEN

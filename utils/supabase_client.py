@@ -332,6 +332,157 @@ def load_latest_daily_archive() -> tuple[pd.DataFrame, dict, str]:
         return pd.DataFrame(), {}, ""
 
 
+# ─── SECTOR ROTATION PERSISTENCE [2026-07-26] ───────────────────────────
+# Completes the Sector Rotation tool: utils/sector_rotation.py's compute
+# layer (compute_rotation_metrics(), etc.) and pages/dashboard.py's
+# rendering functions (_sector_opportunity_board_panel(),
+# _leadership_rotation_panel()) already existed and already accepted a
+# `history`/`rotation_metrics` parameter — but nothing ever called these
+# two functions to actually persist or load that history, so both call
+# sites always passed None/empty and the day-over-day view never
+# appeared. These two functions are that missing persistence layer.
+
+def _latest_sector_snapshot_is_fresh(trading_date: date, min_refresh_mins: int) -> bool:
+    """
+    True if `trading_date` already has a sector_snapshots row written
+    within the last `min_refresh_mins` minutes. Used by
+    save_sector_snapshot() to throttle (not fully block) same-day
+    writes — see its docstring for why "skip entirely once today has
+    any row" would have silently prevented the refinement the docstring
+    was supposed to provide.
+    """
+    client = get_client()
+    if client is None:
+        return False
+    try:
+        resp = (
+            client.table("sector_snapshots")
+            .select("scan_date, created_at")
+            .eq("scan_date", trading_date.isoformat())
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not resp.data:
+            return False
+        last_written = pd.to_datetime(resp.data[0]["created_at"])
+        if last_written.tzinfo is None:
+            last_written = last_written.tz_localize("UTC")
+        age_mins = (pd.Timestamp.now(tz="UTC") - last_written.tz_convert("UTC")).total_seconds() / 60.0
+        return age_mins < min_refresh_mins
+    except Exception as exc:
+        logger.error("_latest_sector_snapshot_is_fresh failed: %s", exc)
+        return False
+
+
+# Minimum gap between refinement writes for the SAME trading day. Not a
+# hard "once per day" gate (see save_sector_snapshot()'s docstring) —
+# this just caps write frequency across however many sessions have the
+# Dashboard open, while still letting today's numbers get more accurate
+# as the day's trading data accumulates.
+_SECTOR_SNAPSHOT_MIN_REFRESH_MINS = 15
+
+
+def save_sector_snapshot(rows: list[dict]) -> bool:
+    """
+    Upsert one trading day's worth of per-sector rows (the output of
+    utils.sector_rotation.build_sector_snapshot_rows()) into
+    sector_snapshots.
+
+    Throttled, not blocked: a lightweight check skips the write if
+    today's trading day was already written within the last
+    _SECTOR_SNAPSHOT_MIN_REFRESH_MINS minutes, so calling this on every
+    Dashboard render (across every open session) doesn't turn into
+    repeated writes on every rerun — but ALSO doesn't freeze today's row
+    at whatever the very first call of the day happened to see. Uses
+    upsert (on_conflict=sector,scan_date), not a bare insert, so each
+    refresh safely replaces today's numbers with the latest scan's,
+    rather than erroring or duplicating — deliberately different from
+    archive_daily_scan()'s pure immutability, since this table's whole
+    purpose is a same-day-refinable rollup, not a point-in-time archive.
+
+    Parameters
+    ----------
+    rows : list of dicts from build_sector_snapshot_rows(sector_stats, scan_date)
+
+    Returns True if upserted (or throttled — not an error), False only
+    on an actual failure. A no-op (empty `rows`) returns True without
+    touching Supabase.
+    """
+    if not rows:
+        return True
+
+    client = get_client()
+    if client is None:
+        return False
+
+    try:
+        trading_date = pd.to_datetime(rows[0]["scan_date"]).date()
+    except Exception:
+        trading_date = None
+
+    if trading_date is not None and _latest_sector_snapshot_is_fresh(trading_date, _SECTOR_SNAPSHOT_MIN_REFRESH_MINS):
+        return True   # written recently enough — not a failure, just throttled
+
+    try:
+        resp = (
+            client.table("sector_snapshots")
+            .upsert(rows, on_conflict="sector,scan_date")
+            .execute()
+        )
+        if resp.data is None:
+            logger.error("sector_snapshots upsert returned no data.")
+            return False
+        logger.info("save_sector_snapshot: upserted %d sector row(s) for %s", len(rows), trading_date)
+        return True
+    except Exception as exc:
+        logger.error("save_sector_snapshot failed: %s", exc)
+        return False
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_sector_snapshot_history(days: int = 60) -> pd.DataFrame:
+    """
+    Returns up to `days` trading days of sector_snapshots rows (all
+    sectors, all columns) as a DataFrame ready for
+    utils.sector_rotation.compute_rotation_metrics()/
+    compute_rotation_timeline()/compute_sector_flow(), or the raw
+    `history` parameter pages/dashboard.py's
+    _sector_opportunity_board_panel() sparklines read directly.
+
+    Cached 5 minutes (@st.cache_data) — this is day-level history that
+    doesn't change intraday except for today's own row, so there's no
+    value in re-querying it on every Dashboard render/rerun the way an
+    uncached call would.
+
+    Returns an empty DataFrame (not an error) if the table doesn't
+    exist yet, is empty, or Supabase is unavailable — every consumer in
+    utils/sector_rotation.py already handles an empty/missing history
+    gracefully (falls back to single-day figures).
+    """
+    client = get_client()
+    if client is None:
+        return pd.DataFrame()
+
+    cutoff = (datetime.now(timezone.utc) - pd.Timedelta(days=days)).date().isoformat()
+
+    try:
+        resp = (
+            client.table("sector_snapshots")
+            .select("sector, scan_date, avg_chg, avg_leadership, opp_score, "
+                    "elite_count, execute_count, watch_count, actionable_count, "
+                    "stock_count, net_inflow_cr")
+            .gte("scan_date", cutoff)
+            .execute()
+        )
+        if not resp.data:
+            return pd.DataFrame()
+        return pd.DataFrame(resp.data)
+    except Exception as exc:
+        logger.error("load_sector_snapshot_history failed: %s", exc)
+        return pd.DataFrame()
+
+
 # ─── RETENTION [Ops fix, 2026-07-25] ────────────────────────────────────
 # scan_snapshots and scan_daily_archive (formerly scan_full_snapshots)
 # are both insert-only. scan_snapshots had NO cleanup at all until this
@@ -358,15 +509,26 @@ def load_latest_daily_archive() -> tuple[pd.DataFrame, dict, str]:
 # pruned, which functions as a safety cap against unbounded growth
 # (e.g. if a future bug ever bypassed the one-row-per-day UNIQUE
 # constraint) rather than a practically-reached limit.
+# sector_snapshots [2026-07-26] also prunes via the same mechanism —
+# note its keep-count is a ROW cap, not a DATE cap: unlike the other
+# tables, sector_snapshots has multiple rows (one per sector) sharing
+# each scan_date, so "keep the most recent N rows" covers roughly
+# N / (number of sectors) days, not N days. 50,000 rows at ~18 sectors/
+# day is ~7-8 years of daily history — a distant safety cap, same
+# spirit as scan_daily_archive's, not a limit anything realistically
+# reaches. (Aligning the cutoff exactly to date boundaries would need a
+# dedicated pruning query rather than reusing this shared RPC — not
+# worth it for a boundary this many years out.)
 _SCAN_SNAPSHOTS_KEEP_ROWS = 5000
 _SCAN_DAILY_ARCHIVE_KEEP_ROWS = 3650
+_SECTOR_SNAPSHOTS_KEEP_ROWS = 50000
 
 
 def prune_scan_snapshot_tables() -> dict:
     """
-    Prunes scan_snapshots and scan_daily_archive down to their
-    respective retention windows (see module comment above for why
-    their keep-counts differ so much). Called periodically by
+    Prunes scan_snapshots, scan_daily_archive, and sector_snapshots down
+    to their respective retention windows (see module comment above for
+    why their keep-counts differ so much). Called periodically by
     scheduler/scan_worker.py's _run_retention_loop(), alongside
     utils.scan_state.prune_all_snapshots() for the operational three
     (market_intelligence/live_scanner/fo_scan) tables.
@@ -376,12 +538,13 @@ def prune_scan_snapshot_tables() -> dict:
     """
     client = get_client()
     if client is None:
-        return {"scan_snapshots": None, "scan_daily_archive": None}
+        return {"scan_snapshots": None, "scan_daily_archive": None, "sector_snapshots": None}
 
     results = {}
     for table, keep in (
         ("scan_snapshots", _SCAN_SNAPSHOTS_KEEP_ROWS),
         ("scan_daily_archive", _SCAN_DAILY_ARCHIVE_KEEP_ROWS),
+        ("sector_snapshots", _SECTOR_SNAPSHOTS_KEEP_ROWS),
     ):
         try:
             resp = client.rpc("prune_snapshot_table", {"p_table": table, "p_keep": keep}).execute()
@@ -1433,6 +1596,34 @@ ALTER TABLE scan_daily_archive ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL 
 
 CREATE UNIQUE INDEX IF NOT EXISTS scan_daily_archive_trading_date_unique ON scan_daily_archive(trading_date);
 CREATE INDEX IF NOT EXISTS idx_scan_daily_archive_run_at ON scan_daily_archive(run_at DESC);
+
+-- 1c. Sector snapshots [2026-07-26 — completes the Sector Rotation tool
+--     wiring]. One row per (sector, scan_date) — the day-over-day feed
+--     utils/sector_rotation.py's compute_rotation_metrics()/_trailing()/
+--     _delta() turn into Momentum/Direction/Rotation Strength/Suggested
+--     Action, and pages/dashboard.py's Sector Opportunity Board sparklines
+--     read directly. UNIQUE(sector, scan_date) means save_sector_snapshot()
+--     safely upserts — calling it more than once on the same trading day
+--     (e.g. multiple sessions rendering the Dashboard) always converges on
+--     one row per sector per day, refined with each call's latest numbers,
+--     rather than accumulating duplicates.
+CREATE TABLE IF NOT EXISTS sector_snapshots (
+    id                bigserial PRIMARY KEY,
+    sector            text        NOT NULL,
+    scan_date         date        NOT NULL,
+    avg_chg           numeric,
+    avg_leadership    numeric,
+    opp_score         numeric,
+    elite_count       integer     NOT NULL DEFAULT 0,
+    execute_count     integer     NOT NULL DEFAULT 0,
+    watch_count       integer     NOT NULL DEFAULT 0,
+    actionable_count  integer     NOT NULL DEFAULT 0,
+    stock_count       integer     NOT NULL DEFAULT 0,
+    net_inflow_cr     numeric,
+    created_at        timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS sector_snapshots_sector_date_unique ON sector_snapshots(sector, scan_date);
+CREATE INDEX IF NOT EXISTS idx_sector_snapshots_scan_date ON sector_snapshots(scan_date DESC);
 
 -- 2. Backtest results
 CREATE TABLE IF NOT EXISTS backtest_results (
