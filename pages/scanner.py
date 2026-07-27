@@ -2640,7 +2640,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
     )
 
     sort_key = st.selectbox(
-        "Sort by", ["Days Active (oldest first)", "PnL% ↓", "Symbol A→Z"],
+        "Sort by", ["Days Active (low → high)", "PnL% ↓", "Symbol A→Z"],
         key="active_plans_sort", label_visibility="collapsed",
     )
     if sort_key == "PnL% ↓":
@@ -2648,7 +2648,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
     elif sort_key == "Symbol A→Z":
         rows_df = rows_df.sort_values("Symbol")
     else:
-        rows_df = rows_df.sort_values("DaysActive", ascending=False)
+        rows_df = rows_df.sort_values("DaysActive", ascending=True)
 
     # ── Table ───────────────────────────────────────────────────────
     header = (
