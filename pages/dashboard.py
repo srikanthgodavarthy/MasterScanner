@@ -2272,11 +2272,13 @@ def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.Dat
     an already-running Streamlit script (uses st.markdown/st.columns
     directly rather than returning HTML, since the two-column layout
     needs real st.columns)."""
-    from utils.sector_rotation import compute_rotation_metrics, compute_rotation_timeline, compute_sector_flow
+    from utils.sector_rotation import (compute_rotation_metrics, compute_rotation_timeline,
+                                        compute_sector_flow, compute_sector_breadth)
 
     st.markdown(_SR_CSS, unsafe_allow_html=True)
 
-    rotation_metrics = compute_rotation_metrics(sector_history, sector_stats)
+    sector_breadth = compute_sector_breadth(df_aug)
+    rotation_metrics = compute_rotation_metrics(sector_history, sector_stats, sector_breadth)
     timeline = compute_rotation_timeline(sector_history)
     flow = compute_sector_flow(sector_stats)
     prior_metrics, prior_stats = _sr_prior_day_metrics(sector_history)
@@ -2356,12 +2358,17 @@ def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.Dat
             dcolor, darrow = _SR_DIRECTION_STYLE.get(direction, ("#8b949e", "→"))
             action = r["SuggestedAction"]
             acolor = _SR_ACTION_STYLE.get(action, "#8b949e")
+            breadth = r.get("BreadthScore")
+            bcolor = {"Bullish": "#3fb950", "Neutral": "#d29922", "Bearish": "#f85149"}.get(
+                r.get("BreadthBucket"), "#8b949e")
+            breadth_cell = f'<span style="color:{bcolor}">{breadth:.0f}%</span>' if breadth is not None else "—"
             rows_html += f"""
             <tr>
               <td>{i}</td>
               <td><span class="sr-sector-name">{icon} {sector}</span></td>
               <td class="{'sr-pos' if m5 >= 0 else 'sr-neg'}">{'+' if m5 >= 0 else ''}{m5:.1f}%</td>
               <td class="{'sr-pos' if m20 >= 0 else 'sr-neg'}">{'+' if m20 >= 0 else ''}{m20:.1f}%</td>
+              <td>{breadth_cell}</td>
               <td style="color:{dcolor}">{direction} {darrow}</td>
               <td><span class="sr-action-badge" style="background:{acolor}22;color:{acolor};border:1px solid {acolor}">{action}</span></td>
             </tr>"""
@@ -2370,15 +2377,17 @@ def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.Dat
         <div class="sr-panel">
           <div class="sr-panel-title">SECTOR ROTATION DASHBOARD</div>
           <table class="sr-table">
-            <tr><th>#</th><th>SECTOR</th><th>5D MOMENTUM</th><th>20D MOMENTUM</th><th>DIRECTION</th><th>SUGGESTED ACTION</th></tr>
+            <tr><th>#</th><th>SECTOR</th><th>5D MOMENTUM</th><th>20D MOMENTUM</th><th>BREADTH</th><th>DIRECTION</th><th>SUGGESTED ACTION</th></tr>
             {rows_html}
           </table>
           <div style="font-size:0.65rem;color:#8b949e;margin-top:8px;">
             Momentum is the cumulative %Chg over trailing persisted scan dates (proxy for a day-count window until
-            more history accumulates). Direction is based on 20D momentum vs a small deadband.
+            more history accumulates). Breadth is the % of sector constituents with RSI&gt;50, positive composite RS,
+            and price in an uptrend (StockEdge-style breadth read) — it's the primary input to Direction/Suggested
+            Action, with price momentum as a secondary weight.
           </div>
         </div>
-        """, unsafe_allow_html=True)
+        """.strip(), unsafe_allow_html=True)
 
         # ── Top sectors to focus today ──────────────────────────────
         top3 = rotation_metrics.sort_values("RotationStrength", ascending=False).head(3).reset_index(drop=True)
@@ -2434,7 +2443,7 @@ def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.Dat
               {'+' if flow['net']>=0 else ''}{flow['net']:.0f} Cr</b></span>
           </div>
         </div>
-        """, unsafe_allow_html=True)
+        """.strip(), unsafe_allow_html=True)
 
         # ── Sector Rotation Timeline ─────────────────────────────────
         if timeline:
@@ -2483,14 +2492,14 @@ def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.Dat
                 ↑ Moved Up &nbsp; ↓ Moved Down &nbsp; — No Change (vs previous persisted scan date)
               </div>
             </div>
-            """, unsafe_allow_html=True)
+            """.strip(), unsafe_allow_html=True)
         else:
             st.markdown("""
             <div class="sr-panel" style="margin-top:16px;">
               <div class="sr-panel-title">SECTOR ROTATION TIMELINE</div>
               <div style="color:#8b949e;font-size:0.75rem;">Builds up as more scan days are persisted — needs at least 2.</div>
             </div>
-            """, unsafe_allow_html=True)
+            """.strip(), unsafe_allow_html=True)
 
         # ── How it's calculated ───────────────────────────────────────
         st.markdown("""
@@ -2503,7 +2512,7 @@ def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.Dat
             <div class="sr-calc-item"><div class="sr-calc-icon">💰</div>Money Flow<br>5D Net Inflow/Outflow</div>
           </div>
         </div>
-        """, unsafe_allow_html=True)
+        """.strip(), unsafe_allow_html=True)
 
     # ── footer ──────────────────────────────────────────────────────
     scanned = len(df_aug)
@@ -2514,7 +2523,7 @@ def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.Dat
         <div>Last Scan: {scan_time}</div>
       </div>
     </div>
-    """, unsafe_allow_html=True)
+    """.strip(), unsafe_allow_html=True)
 
 
 # ── SIGNAL CLASS COUNTS ────────────────────────────────────────────
