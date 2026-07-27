@@ -117,6 +117,13 @@ DORE_DEFAULTS: dict = {
     "override_vix_scalar_max":         2.5,   # ceiling on the VIX scalar (never let a VIX spike make the bar impossible)
     "override_score_bullish_min":     70.0,   # Intraday Reversal Score >= this (+ against-trend UP move) -> override BULLISH
     "override_score_bearish_max":     30.0,   # Intraday Reversal Score <= this (+ against-trend DOWN move) -> override BEARISH
+    # Intraday Reversal Score sub-weights (must sum to 100; SG 2026-07-27:
+    # lean more on OI/PCR as the highest-conviction same-day signal, less
+    # on the raw ATR-relative move by itself)
+    "w_reversal_vwap":                20.0,
+    "w_reversal_atr_move":            25.0,
+    "w_reversal_ema_cross":           15.0,
+    "w_reversal_oi":                  40.0,
 
     # ── Stage 3: Derivative Intelligence (Derivative Confidence) ─
     # Live Upstox option chain — the one expensive stage. Refresh 30-60s
@@ -294,6 +301,10 @@ class DORESettings:
     override_vix_scalar_max: float = 2.5
     override_score_bullish_min: float = 70.0
     override_score_bearish_max: float = 30.0
+    w_reversal_vwap: float = 20.0
+    w_reversal_atr_move: float = 25.0
+    w_reversal_ema_cross: float = 15.0
+    w_reversal_oi: float = 40.0
 
     oi_pcr_bull_min: float = 1.10
     oi_pcr_bear_max: float = 0.85
