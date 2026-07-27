@@ -1031,15 +1031,23 @@ _CSS = """
 .mo-bar-legend .a { color: var(--green); }
 .mo-bar-legend .d { color: var(--red); }
 
-/* ── Health row: Regime / Trend / Breadth / 52W Hi-Lo / EMA / Gate ── */
+/* ── Health row: Regime / Trend / Breadth / Sector Rotating In-Stable-Out /
+      VIX / Today's Sector Flow (wide) ── */
 .mo-health-row {
   display: grid;
-  grid-template-columns: 1.4fr 1fr 1fr 0.85fr 0.85fr 0.85fr;
+  grid-template-columns: 1.3fr 0.9fr 0.9fr 0.7fr 0.7fr 0.7fr 0.7fr 1.7fr;
   gap: 10px;
   margin-bottom: 14px;
 }
-@media (max-width: 1100px) { .mo-health-row { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 1300px) { .mo-health-row { grid-template-columns: repeat(4, 1fr); } }
 @media (max-width: 700px)  { .mo-health-row { grid-template-columns: repeat(2, 1fr); } }
+.mo-flow-card { display: flex; flex-direction: column; }
+.mo-flow-cols { display: flex; gap: 14px; flex: 1; }
+.mo-flow-col { flex: 1; min-width: 0; }
+.mo-flow-col-title { font-size: 9px; font-weight: 700; margin-bottom: 4px; letter-spacing: 0.03em; }
+.mo-flow-row { display: flex; justify-content: space-between; font-size: 10.5px; padding: 2px 0; gap: 6px; }
+.mo-flow-row span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mo-flow-net { font-size: 10px; color: var(--muted); border-top: 1px solid var(--border); margin-top: 6px; padding-top: 6px; }
 .mo-health-card {
   background: var(--bg2);
   border: 1px solid var(--border);
@@ -1981,21 +1989,102 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
     return "\n".join(card_parts)
 
 
-def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
-                            index_cards: list[dict]) -> str:
-    """
-    Full-width 'Market Overview' card — a compact market-health strip
-    (Regime / Trend Strength / Market Breadth / 52W Hi-Lo / EMA20-EMA200 /
-    VIX-ADX) on top, and three equal-width index cards (NIFTY 50, SENSEX,
-    BANK NIFTY) underneath. Replaces the single-Nifty-card + stats-grid
-    layout (2026-07 redesign) with an institutional-terminal-style,
-    information-dense strip that doesn't grow the page height.
+def _index_cards_html(index_cards: list[dict]) -> str:
+    """The NIFTY 50 / SENSEX / BANK NIFTY index-card row, split out of
+    _market_overview_panel so it can be placed in the left column
+    (under the top strip) rather than bundled into the top strip itself."""
+    cards_html = "".join(
+        _index_card_html(
+            c.get("label", ""), c.get("snapshot"), c.get("oi"),
+            grad_id=f"moSpark{i}", badge=c.get("badge", ""), ema=c.get("ema"),
+            dore=c.get("dore"),
+        )
+        for i, c in enumerate(index_cards)
+    )
+    return f'<div class="mo-index-grid">{cards_html}</div>'
 
-    index_cards: list of {"label", "snapshot", "oi", "badge", "ema", "dore"}
-    dicts, one per index, rendered via _index_card_html() in the given
-    order. "ema" is the compute_ema_levels()/fetch_sensex_ema_levels()
-    output. "dore" is utils.dore_engine.DOREResult.as_dict() (optional —
-    omit or leave None/{} to render the card without the DORE row).
+
+def _market_health_detail_html(summary: dict, breadth: dict) -> str:
+    """52W Hi/Lo, EMA20/EMA200 breadth, and VIX/ADX gate — the three
+    mini-cards that used to live in the main top strip. Kept (not
+    dropped) but moved into a small expander under the top strip once
+    the strip itself was redesigned to match the Rotating In/Stable/Out
+    + Sector Flow layout, so none of this data is lost."""
+    adx         = float(summary.get("adx", 0))
+    adx_is_real = summary.get("adx_is_real", False)
+    vix         = float(summary.get("vix", 0))
+    ema50_up    = summary.get("nifty_ema50", False)
+    ema200_up   = summary.get("nifty_ema200", False)
+    trend_label = _trend_strength_label(adx, adx_is_real)
+    vix_label, vix_color = _vix_band(vix)
+    trend_color = {"WEAK": "#f85149", "MODERATE": "#d29922", "STRONG": "#3fb950"}[trend_label]
+
+    hi, lo = breadth.get("n_52w_high", 0), breadth.get("n_52w_low", 0)
+    hilo_card = f"""
+<div class="mo-health-card">
+  <div class="mo-mini-pair">
+    <div class="mo-mini-item">
+      <div class="mo-mini-label" title="Stocks within range of their 52-week high">52W High</div>
+      <div class="mo-mini-val a">{hi}</div>
+    </div>
+    <div class="mo-mini-item">
+      <div class="mo-mini-label" title="Stocks within range of their 52-week low">52W Low</div>
+      <div class="mo-mini-val d">{lo}</div>
+    </div>
+  </div>
+</div>"""
+
+    e20, e200 = breadth.get("pct_above_ema20", 0), breadth.get("pct_above_ema200", 0)
+    ema_card = f"""
+<div class="mo-health-card">
+  <div class="mo-mini-pair">
+    <div class="mo-mini-item">
+      <div class="mo-mini-label" title="Share of scanned universe trading above EMA20">Above EMA20</div>
+      <div class="mo-mini-val" style="color:{'#3fb950' if ema50_up else 'var(--text)'}">{e20}%</div>
+    </div>
+    <div class="mo-mini-item">
+      <div class="mo-mini-label" title="Share of scanned universe trading above EMA200">Above EMA200</div>
+      <div class="mo-mini-val" style="color:{'#3fb950' if ema200_up else 'var(--text)'}">{e200}%</div>
+    </div>
+  </div>
+</div>"""
+
+    adx_note   = "" if adx_is_real else "·proxy"
+    vix_ok     = vix <= 22.0
+    adx_ok     = adx >= 25.0
+    vix_gate_c = vix_color if vix_ok else "#f85149"
+    adx_gate_c = trend_color if adx_is_real else "#8b949e"
+    gate_card = f"""
+<div class="mo-health-card">
+  <div class="mo-mini-pair">
+    <div class="mo-mini-item">
+      <div class="mo-gate-mini-top"><span class="mo-gate-mini-icon">💓</span><span class="mo-mini-label">VIX</span>
+        <span class="mo-gate-mini-check" style="color:{vix_gate_c}">{"✓" if vix_ok else "✕"}</span></div>
+      <div class="mo-mini-val" style="color:{vix_gate_c}">{vix:.1f}<span class="mo-gate-mini-qual">{vix_label}</span></div>
+    </div>
+    <div class="mo-mini-item">
+      <div class="mo-gate-mini-top"><span class="mo-gate-mini-icon">🛡️</span><span class="mo-mini-label">ADX</span>
+        <span class="mo-gate-mini-check" style="color:{adx_gate_c}">{"✓" if adx_ok else "✕"}</span></div>
+      <div class="mo-mini-val" style="color:{adx_gate_c}">{adx:.0f}{adx_note}<span class="mo-gate-mini-qual">{trend_label}</span></div>
+    </div>
+  </div>
+</div>"""
+    return f'<div class="mo-health-row" style="grid-template-columns:repeat(3,1fr);margin-bottom:0;">{hilo_card}{ema_card}{gate_card}</div>'
+
+
+def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
+                            sr_buckets: dict | None = None,
+                            sr_flow: dict | None = None) -> str:
+    """
+    Full-width top strip: Regime / Trend Strength / Market Breadth /
+    Sector Rotating In / Stable / Rotating Out / VIX / Today's Sector
+    Flow. Index cards (NIFTY 50, SENSEX, BANK NIFTY) are rendered
+    separately via _index_cards_html() in the left column, not inside
+    this panel — see _market_health_detail_html() for the 52W Hi/Lo /
+    EMA / VIX-ADX-gate cards this strip used to also carry.
+
+    sr_buckets: {"Rotating In": n, "Stable": n, "Rotating Out": n}
+    sr_flow: {"inflow": [(sector, cr), ...], "outflow": [...], "net": float}
     """
     r = summary.get("regime", "RANGE")
     regime_color, _, _ = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
@@ -2046,71 +2135,57 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
   <div class="mo-bar-track mo-bar-split"><div class="mo-bar-fill" style="width:{adv_pct}%;background:#3fb950"></div></div>
 </div>"""
 
-    # ── 52W High/Low card ──────────────────────────────────────────
-    hi, lo = breadth.get("n_52w_high", 0), breadth.get("n_52w_low", 0)
-    hilo_card = f"""
+    # ── Sector Rotating In / Stable / Rotating Out cards ────────────
+    sr_buckets = sr_buckets or {"Rotating In": 0, "Stable": 0, "Rotating Out": 0}
+    _ROT_META = [
+        ("Rotating In",  "SECTOR ROTATING IN",  "#3fb950"),
+        ("Stable",       "SECTOR STABLE",       "#d29922"),
+        ("Rotating Out", "SECTOR ROTATING OUT", "#f85149"),
+    ]
+    rotation_cards = "".join(f"""
 <div class="mo-health-card">
-  <div class="mo-mini-pair">
-    <div class="mo-mini-item">
-      <div class="mo-mini-label" title="Stocks within range of their 52-week high">52W High</div>
-      <div class="mo-mini-val a">{hi}</div>
-    </div>
-    <div class="mo-mini-item">
-      <div class="mo-mini-label" title="Stocks within range of their 52-week low">52W Low</div>
-      <div class="mo-mini-val d">{lo}</div>
-    </div>
-  </div>
+  <div class="mo-health-label">{label}</div>
+  <div class="mo-health-value" style="color:{color}">{sr_buckets.get(key, 0)}</div>
+  <div class="mo-mini-label" style="margin-top:2px;">Sectors</div>
+</div>""" for key, label, color in _ROT_META)
+
+    # ── Standalone VIX card ──────────────────────────────────────────
+    vix_card = f"""
+<div class="mo-health-card">
+  <div class="mo-health-label">VIX</div>
+  <div class="mo-health-value" style="color:{vix_color}">{vix:.1f}</div>
+  <div class="mo-mini-label" style="margin-top:2px;color:{vix_color};">{vix_label} · {"BEAR" if vix >= 18 else "BULL"}</div>
 </div>"""
 
-    # ── EMA20/EMA200 breadth card ──────────────────────────────────
-    e20, e200 = breadth.get("pct_above_ema20", 0), breadth.get("pct_above_ema200", 0)
-    ema_card = f"""
-<div class="mo-health-card">
-  <div class="mo-mini-pair">
-    <div class="mo-mini-item">
-      <div class="mo-mini-label" title="Share of scanned universe trading above EMA20">Above EMA20</div>
-      <div class="mo-mini-val" style="color:{'#3fb950' if ema50_up else 'var(--text)'}">{e20}%</div>
+    # ── Today's Sector Flow (wide) card ─────────────────────────────
+    sr_flow = sr_flow or {"inflow": [], "outflow": [], "net": 0.0}
+    inflow_rows = "".join(
+        f'<div class="mo-flow-row"><span>{i}&nbsp;{s}</span><span class="a">+{v:.0f} Cr</span></div>'
+        for i, (s, v) in enumerate(sr_flow.get("inflow", [])[:3], start=1)
+    ) or '<div class="mo-mini-label">—</div>'
+    outflow_rows = "".join(
+        f'<div class="mo-flow-row"><span>{i}&nbsp;{s}</span><span class="d">{v:.0f} Cr</span></div>'
+        for i, (s, v) in enumerate(sr_flow.get("outflow", [])[:3], start=1)
+    ) or '<div class="mo-mini-label">—</div>'
+    net = sr_flow.get("net", 0.0)
+    flow_card = f"""
+<div class="mo-health-card mo-flow-card">
+  <div class="mo-health-label">TODAY'S SECTOR FLOW <span style="text-transform:none;font-weight:400;">(Net Inflow)</span></div>
+  <div class="mo-flow-cols">
+    <div class="mo-flow-col">
+      <div class="mo-flow-col-title a">TOP INFLOW SECTORS</div>
+      {inflow_rows}
     </div>
-    <div class="mo-mini-item">
-      <div class="mo-mini-label" title="Share of scanned universe trading above EMA200">Above EMA200</div>
-      <div class="mo-mini-val" style="color:{'#3fb950' if ema200_up else 'var(--text)'}">{e200}%</div>
-    </div>
-  </div>
-</div>"""
-
-    # ── VIX/ADX gate card ───────────────────────────────────────────
-    adx_note   = "" if adx_is_real else "·proxy"
-    vix_ok     = vix <= 22.0
-    adx_ok     = adx >= 25.0
-    vix_gate_c = vix_color if vix_ok else "#f85149"
-    adx_gate_c = trend_color if adx_is_real else "#8b949e"
-    gate_card = f"""
-<div class="mo-health-card">
-  <div class="mo-mini-pair">
-    <div class="mo-mini-item">
-      <div class="mo-gate-mini-top"><span class="mo-gate-mini-icon">💓</span><span class="mo-mini-label">VIX</span>
-        <span class="mo-gate-mini-check" style="color:{vix_gate_c}">{"✓" if vix_ok else "✕"}</span></div>
-      <div class="mo-mini-val" style="color:{vix_gate_c}">{vix:.1f}<span class="mo-gate-mini-qual">{vix_label}</span></div>
-    </div>
-    <div class="mo-mini-item">
-      <div class="mo-gate-mini-top"><span class="mo-gate-mini-icon">🛡️</span><span class="mo-mini-label">ADX</span>
-        <span class="mo-gate-mini-check" style="color:{adx_gate_c}">{"✓" if adx_ok else "✕"}</span></div>
-      <div class="mo-mini-val" style="color:{adx_gate_c}">{adx:.0f}{adx_note}<span class="mo-gate-mini-qual">{trend_label}</span></div>
+    <div class="mo-flow-col">
+      <div class="mo-flow-col-title d">TOP OUTFLOW SECTORS</div>
+      {outflow_rows}
     </div>
   </div>
+  <div class="mo-flow-net">Net Inflow (Today): <b style="color:{'#3fb950' if net>=0 else '#f85149'}">{'+' if net>=0 else ''}{net:.0f} Cr</b></div>
 </div>"""
 
-    health_html = regime_card + trend_card + breadth_card + hilo_card + ema_card + gate_card
-
-    # ── Index cards row ─────────────────────────────────────────────
-    cards_html = "".join(
-        _index_card_html(
-            c.get("label", ""), c.get("snapshot"), c.get("oi"),
-            grad_id=f"moSpark{i}", badge=c.get("badge", ""), ema=c.get("ema"),
-            dore=c.get("dore"),
-        )
-        for i, c in enumerate(index_cards)
-    )
+    health_html = (regime_card + trend_card + breadth_card + rotation_cards
+                    + vix_card + flow_card)
 
     scan_chip = f'<span class="mo-scan-chip">Last scan: <b>{scan_time} IST</b></span>' if scan_time else ""
 
@@ -2118,7 +2193,6 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
 <div class="mo-panel">
   <div class="mo-title">MARKET OVERVIEW ⓘ {scan_chip}</div>
   <div class="mo-health-row">{health_html}</div>
-  <div class="mo-index-grid">{cards_html}</div>
 </div>
 """
 
@@ -2262,6 +2336,153 @@ def _sr_bucket_opportunity_total(stats: pd.DataFrame, metrics: pd.DataFrame, dir
     if bucket.empty:
         return 0
     return int(bucket[["EliteCount", "ExecuteCount", "WatchCount"]].sum().sum())
+
+
+def _sr_quick_metrics(df_aug: pd.DataFrame, sector_stats: pd.DataFrame, sector_history: pd.DataFrame) -> dict:
+    """Lightweight recompute of the Rotating In/Stable/Out bucket counts,
+    Today's Sector Flow, and the Sector Rotation Timeline — same source
+    functions (utils.sector_rotation) the full Sector Rotation Analysis
+    section below also uses, just returned as plain data so the top
+    strip and right sidebar can each pick out what they need without
+    pulling in that section's full HTML."""
+    from utils.sector_rotation import (compute_rotation_metrics, compute_rotation_timeline,
+                                        compute_sector_flow, compute_sector_breadth)
+    empty = {"buckets": {"Rotating In": 0, "Stable": 0, "Rotating Out": 0},
+             "flow": {"inflow": [], "outflow": [], "net": 0.0}, "timeline": None}
+    if sector_stats is None or sector_stats.empty:
+        return empty
+    sector_breadth = compute_sector_breadth(df_aug)
+    rotation_metrics = compute_rotation_metrics(sector_history, sector_stats, sector_breadth)
+    timeline = compute_rotation_timeline(sector_history)
+    flow = compute_sector_flow(sector_stats)
+    buckets = {"Rotating In": 0, "Stable": 0, "Rotating Out": 0}
+    if not rotation_metrics.empty:
+        for d in buckets:
+            buckets[d] = int((rotation_metrics["Direction"] == d).sum())
+    return {"buckets": buckets, "flow": flow, "timeline": timeline}
+
+
+def _sr_timeline_html(timeline: dict | None) -> str:
+    """Standalone 'Sector Rotation Timeline' card — extracted from the
+    full Sector Rotation Analysis section so it can sit in the right
+    sidebar on its own."""
+    if not timeline:
+        return ('<div class="sr-panel"><div class="sr-panel-title">SECTOR ROTATION TIMELINE</div>'
+                '<div style="color:#8b949e;font-size:0.75rem;">Builds up as more scan days are '
+                'persisted — needs at least 2.</div></div>')
+
+    dates, ranks = timeline["dates"], timeline["ranks"]
+    n_rows = max(len(r) for r in ranks)
+    prior_ranks = {s: idx for idx, s in enumerate(ranks[-2])} if len(ranks) >= 2 else {}
+    n_cols = len(dates)
+    header_labels = ["Today" if (n_cols - 1 - idx) == 0 else f"{n_cols - 1 - idx}D Ago" for idx in range(n_cols)]
+    header = "".join(f"<th>{h}</th>" for h in header_labels)
+
+    body_rows = ""
+    for row_i in range(n_rows):
+        cells = ""
+        for col_i, day_list in enumerate(ranks):
+            if row_i >= len(day_list):
+                cells += "<td>—</td>"
+                continue
+            sector = day_list[row_i]
+            is_today = (col_i == n_cols - 1)
+            arrow, acol = "", "#8b949e"
+            if is_today and sector in prior_ranks:
+                prior_pos = prior_ranks[sector]
+                if prior_pos > row_i:
+                    arrow, acol = " ↑", "#3fb950"
+                elif prior_pos < row_i:
+                    arrow, acol = " ↓", "#f85149"
+            pill_color = "#3fb95022" if is_today else "#58a6ff22"
+            text_color = "#3fb950" if is_today else "#58a6ff"
+            cells += (f'<td><span class="sr-tl-pill" style="background:{pill_color};color:{text_color}">'
+                      f'{sector}<span style="color:{acol}">{arrow}</span></span></td>')
+        body_rows += f"<tr>{cells}</tr>"
+
+    return f"""
+    <div class="sr-panel">
+      <div class="sr-panel-title">SECTOR ROTATION TIMELINE <span style="color:#8b949e;font-weight:400;">(Top {n_rows} Sectors)</span></div>
+      <div class="sr-timeline"><table><tr>{header}</tr>{body_rows}</table></div>
+      <div style="font-size:0.65rem;color:#8b949e;margin-top:8px;">
+        ↑ Moved Up &nbsp; ↓ Moved Down &nbsp; — No Change (vs previous persisted scan date)
+      </div>
+    </div>""".strip()
+
+
+def _sr_how_calculated_html() -> str:
+    """Standalone 'How Sector Rotation Is Calculated' card for the
+    right sidebar — static content, extracted from the full Sector
+    Rotation Analysis section."""
+    return """
+    <div class="sr-panel">
+      <div class="sr-panel-title">HOW SECTOR ROTATION IS CALCULATED</div>
+      <div class="sr-calc-row">
+        <div class="sr-calc-item"><div class="sr-calc-icon">📈</div>Leadership Momentum<br>vs 20D ago</div>
+        <div class="sr-calc-item"><div class="sr-calc-icon">📋</div>Entry Quality Momentum<br>vs 20D ago</div>
+        <div class="sr-calc-item"><div class="sr-calc-icon">📊</div>New Opportunities<br>Increase in actionable setups</div>
+        <div class="sr-calc-item"><div class="sr-calc-icon">💰</div>Money Flow<br>5D Net Inflow/Outflow</div>
+      </div>
+    </div>""".strip()
+
+
+# ── NSE TOP GAINERS (right sidebar) ─────────────────────────────────
+# Reuses the live scan dataframe already loaded for the Actionable table
+# (Stock/%Chg/Recommendation) plus utils.sector_map.get_sector() for the
+# SECTOR column — no new data source, just a fresh presentation of what
+# the scan already produced, sorted by %Chg.
+def _nse_top_gainers_html(df_aug: pd.DataFrame, top_n: int = 5) -> str:
+    from utils.sector_map import get_sector
+
+    if df_aug is None or df_aug.empty or "%Chg" not in df_aug.columns:
+        return ('<div class="sr-panel"><div class="sr-panel-title">NSE TOP GAINERS</div>'
+                '<div style="color:#8b949e;font-size:0.75rem;">No scan data yet.</div></div>')
+
+    work = df_aug.copy()
+    work["%Chg"] = pd.to_numeric(work["%Chg"], errors="coerce")
+    work = work.dropna(subset=["%Chg"]).sort_values("%Chg", ascending=False).head(top_n)
+
+    def _ltp(row):
+        for col in ("LTP", "CMP", "Entry"):
+            if col in row and pd.notna(row.get(col)):
+                return float(row[col])
+        return None
+
+    def _vol_ratio(row):
+        for col in ("_vol_ratio", "Vol Ratio", "VolRatio"):
+            if col in row and pd.notna(row.get(col)):
+                return float(row[col])
+        return None
+
+    rows_html = ""
+    for i, (_, r) in enumerate(work.iterrows(), start=1):
+        symbol = r.get("Stock", "—")
+        ltp = _ltp(r)
+        chg = r["%Chg"]
+        vr = _vol_ratio(r)
+        sector = get_sector(str(symbol)) if symbol != "—" else "—"
+        rec = str(r.get("Recommendation") or "").upper()
+        badge = _sc_badge(rec) if rec else _sc_badge("NONE")
+        rows_html += (
+            "<tr>"
+            f"<td style='color:#8b949e;'>{i}</td>"
+            f'<td><span class="sr-sector-name" style="font-weight:700;">{symbol}</span></td>'
+            f"<td>{f'{ltp:,.2f}' if ltp is not None else '—'}</td>"
+            f'<td class="{"sr-pos" if chg >= 0 else "sr-neg"}">{"+" if chg >= 0 else ""}{chg:.2f}%</td>'
+            f"<td>{f'{vr:.1f}x' if vr is not None else '—'}</td>"
+            f"<td>{sector}</td>"
+            f"<td>{badge}</td>"
+            "</tr>"
+        )
+
+    return f"""
+    <div class="sr-panel">
+      <div class="sr-panel-title">NSE TOP GAINERS</div>
+      <table class="sr-table">
+        <tr><th>#</th><th>SYMBOL</th><th>LTP</th><th>%CHG</th><th>VOL RATIO</th><th>SECTOR</th><th>SCANNER</th></tr>
+        {rows_html}
+      </table>
+    </div>"""
 
 
 def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.DataFrame,
@@ -2855,11 +3076,6 @@ def _fo_opportunities_panel():
                 fut_df = fut_df.copy()
                 fut_df["Entry Timestamp"] = None
             st.markdown(_futures_table_html(fut_df), unsafe_allow_html=True)
-            st.caption("Buildup = today's price change vs today's OI change (Long Buildup: price↑ "
-                       "OI↑ · Short Covering: price↑ OI↓ · Short Buildup: price↓ OI↑ · Long Unwinding: "
-                       "price↓ OI↓). OI Chg resets at market open each session. Directional Intent/"
-                       "Trend Score/Entry-Target-SL are DORE's own Stage 1 read and TradePlan — "
-                       "bidirectional (CE and PE), independent of the equity scanner's own targets.")
 
     with tab_opt:
         if opt_df.empty:
@@ -2965,10 +3181,24 @@ def _market_intelligence_fragment():
         except Exception:
             scan_time = ""
 
+    # index_cards is stashed for the left column (_index_cards_html(), called
+    # separately in render()) rather than rendered inside this panel — see
+    # _market_overview_panel()'s docstring for why the two were split.
+    st.session_state["dash_index_cards"] = index_cards
+
+    # Sector rotation counts/flow are computed from df_aug earlier in
+    # render() (independent refresh cadence from this fragment) and
+    # stashed in session_state as "dash_sr" — read here rather than
+    # recomputed, so this fragment's own timer doesn't need df_aug at all.
+    _sr = st.session_state.get("dash_sr") or {}
     st.markdown(
-        _market_overview_panel(summary, breadth, scan_time, index_cards),
+        _market_overview_panel(summary, breadth, scan_time,
+                                sr_buckets=_sr.get("buckets"), sr_flow=_sr.get("flow")),
         unsafe_allow_html=True,
     )
+
+    with st.expander("More market health detail (52W Hi/Lo · EMA breadth · VIX/ADX gate)", expanded=False):
+        st.markdown(_market_health_detail_html(summary, breadth), unsafe_allow_html=True)
 
 # ── NEWS IMPACT — ET + Moneycontrol headlines, free-LLM sentiment tag ──
 # ── NEWS IMPACT — ET + Moneycontrol headlines, free-LLM sentiment tag ──
@@ -3175,9 +3405,51 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
     return "".join(rows)
 
 
+def _news_impact_compact_rows_html(items: list[dict]) -> str:
+    """Compact TIME / STOCK / IMPACT / EVENT row — matches the reference
+    sidebar's News Impact Alerts design. Recommendation/Current State/
+    Confidence/Source aren't shown as separate columns here to fit a
+    narrow column, but stay available via the row's tooltip and in the
+    full grid inside the 'Show detailed view' expander below."""
+    rows = []
+    for item in items:
+        sentiment = item["sentiment"]
+        impact_class = {
+            "Positive": "ni-impact-pos", "Negative": "ni-impact-neg",
+            "Neutral": "ni-impact-neu", "RateLimited": "ni-impact-limit",
+        }.get(sentiment, "ni-impact-neu")
+        impact_label = {
+            "Positive": "Positive", "Negative": "Negative",
+            "Neutral": "Neutral", "RateLimited": "Limited",
+        }.get(sentiment, "N/A")
+        symbols = item.get("symbols", [])
+        stock_label = symbols[0] if symbols else (item.get("sector") or "Market")
+        time_label = (
+            item["published"].astimezone(_IST).strftime("%I:%M") if item.get("published") else "—"
+        )
+        recommendation = item.get("recommendation")
+        state = _resolve_current_state(symbols, st.session_state.get("dash_scan_df", pd.DataFrame()))
+        tooltip = item.get("impact_note", "")
+        if recommendation:
+            tooltip += f" · Rec: {recommendation}"
+        if state:
+            tooltip += f" · Current state: {state[0]}"
+        rows.append(f"""
+        <div style="display:flex;gap:10px;padding:7px 0;border-bottom:1px solid #161d2c;font-size:0.75rem;align-items:baseline;" title="{tooltip}">
+          <div style="color:#8b949e;width:38px;flex-shrink:0;">{time_label}</div>
+          <div style="color:#e6edf3;font-weight:700;width:78px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{stock_label}</div>
+          <div class="{impact_class}" style="width:62px;flex-shrink:0;font-weight:600;">{impact_label}</div>
+          <a href="{item['link']}" target="_blank" style="color:#e6edf3;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;" title="{item['title']}">{item['title']}</a>
+        </div>""")
+    return "".join(rows)
+
+
 def _news_impact_panel():
-    """Renders the 📰 News Impact (Latest) table card on the Scanner page,
-    right under the live Market Overview strip — matches the mockup layout.
+    """Renders the 📰 News Impact Alerts card — a compact TIME/STOCK/
+    IMPACT/EVENT list by default (matches the reference sidebar layout),
+    with the full detailed grid (Confidence/Recommendation/Current
+    State/Source) available in an expander using the same fetched
+    items, so nothing from the original wide table is lost.
 
     2026-07-19: classification is capped to 10 items, and those 10 are
     chosen by relevance, not just recency. Previously every deduped
@@ -3211,7 +3483,7 @@ def _news_impact_panel():
 
     if not items:
         st.markdown(
-            '<div class="ni-panel"><div class="ni-title">📰 NEWS IMPACT (LATEST)</div>'
+            '<div class="ni-panel"><div class="ni-title">📰 NEWS IMPACT ALERTS</div>'
             '<div style="color:var(--muted);font-size:12px;">No headlines available right now — '
             'feeds may be temporarily unreachable.</div></div>',
             unsafe_allow_html=True,
@@ -3227,26 +3499,23 @@ def _news_impact_panel():
     scan_df = st.session_state.get("dash_scan_df", pd.DataFrame())
     _VISIBLE = 8
 
+    st.markdown(
+        f'<div class="ni-panel"><div class="ni-title">📰 NEWS IMPACT ALERTS '
+        f'<span class="ni-viewall">View all news →</span></div>'
+        f'{_news_impact_compact_rows_html(items[:_VISIBLE])}</div>',
+        unsafe_allow_html=True,
+    )
+
     header_html = """
 <div class="ni-grid ni-head">
   <div>TIME</div><div>SECTOR</div><div>STOCK(S)</div><div>IMPACT</div><div>CONFIDENCE</div><div>RECOMMENDATION</div><div>CURRENT STATE</div><div>HEADLINE</div><div></div>
 </div>"""
-
-    panel_html = f"""
-<div class="ni-panel">
-  <div class="ni-title">📰 NEWS IMPACT (LATEST) <span class="ni-viewall">View all news →</span></div>
-  {header_html}
-  {_news_impact_rows_html(items[:_VISIBLE], scan_df)}
-</div>"""
-    st.markdown(panel_html, unsafe_allow_html=True)
-
-    if len(items) > _VISIBLE:
-        with st.expander(f"Show {len(items) - _VISIBLE} more headlines"):
-            st.markdown(
-                f'<div class="ni-panel">{header_html}'
-                f'{_news_impact_rows_html(items[_VISIBLE:_CLASSIFY_CAP], scan_df)}</div>',
-                unsafe_allow_html=True,
-            )
+    with st.expander("Show detailed news impact table (Confidence · Recommendation · Current State)"):
+        st.markdown(
+            f'<div class="ni-panel">{header_html}'
+            f'{_news_impact_rows_html(items[:_CLASSIFY_CAP], scan_df)}</div>',
+            unsafe_allow_html=True,
+        )
 
 
 
@@ -3316,6 +3585,9 @@ def _dash_scan_autorefresh():
 
 def render(settings: dict | None = None):
     st.markdown(_CSS, unsafe_allow_html=True)
+    st.markdown(_SR_CSS, unsafe_allow_html=True)  # sr-panel/sr-table/sr-timeline styles —
+                                                    # used by the top strip's flow card and by
+                                                    # the right-sidebar panels below.
     settings = settings or {}
 
     # ── System state banner — scheduler paused for backtest/maintenance ──
@@ -3439,6 +3711,38 @@ def render(settings: dict | None = None):
     from utils.inprocess_scheduler import start_background_scans
     start_background_scans()
 
+    # ── Sector Rotation compute — moved up (used to happen after the
+    # Actionable table further down) so the top strip's Sector Rotating
+    # In/Stable/Out + Today's Sector Flow cards, and the right sidebar's
+    # Sector Rotation Timeline, have data available before anything
+    # renders. build_sector_stats()/_sr_quick_metrics() both handle an
+    # empty df_aug gracefully (all-zero buckets, empty flow), so this is
+    # safe to run even before a first scan has completed. ──────────────
+    sector_stats = build_sector_stats(df_aug)
+
+    from utils.supabase_client import save_sector_snapshot, load_sector_snapshot_history
+    from utils.sector_rotation import build_sector_snapshot_rows
+
+    sector_history = pd.DataFrame()
+    if not df_aug.empty:
+        try:
+            # Use the scan's own date (parsed from run_at), not "today" —
+            # if the Dashboard is showing a stale scan (see the staleness
+            # banner above), the sector snapshot should be dated to when
+            # that data actually came from, not to whenever it happened
+            # to be viewed.
+            _scan_date = pd.to_datetime(run_at).tz_convert(_IST).date() if run_at else today_ist()
+            save_sector_snapshot(build_sector_snapshot_rows(sector_stats, _scan_date))
+        except Exception:
+            logger.exception("Sector Rotation persistence (save) failed (non-fatal — "
+                              "panel falls back to single-day figures)")
+    try:
+        sector_history = load_sector_snapshot_history(days=60)
+    except Exception:
+        logger.exception("Sector Rotation persistence (load) failed (non-fatal)")
+
+    st.session_state["dash_sr"] = _sr_quick_metrics(df_aug, sector_stats, sector_history)
+
     # 2026-07-23: the live Nifty-regime computation that used to live here
     # (fetch_nifty(source="upstox") + build_regime_context(auto_fetch_vix=
     # True), unfragmented — i.e. re-run on EVERY Dashboard interaction) is
@@ -3448,75 +3752,73 @@ def render(settings: dict | None = None):
     # `summary`/`breadth` straight out of that snapshot's payload — no
     # session_state relay, no per-render Upstox/VIX call.
 
-    # ── Market Overview + Option Flow + DORE — continuous, live via
-    #    Upstox, on its own refresh timer, independent of everything above.
+    # ── Top strip — Regime / Trend / Breadth / Sector Rotating In-Stable-
+    #    Out / VIX / Today's Sector Flow. Continuous, live via Upstox, on
+    #    its own refresh timer, independent of everything below. ────────
     _market_intelligence_fragment()
 
-    # ── News Impact — independent of scan state too.
-    _news_impact_panel()
+    # ── Two-column body: index cards + Actionable table + DORE on the
+    #    left; NSE Top Gainers, Sector Rotation Timeline, How It's
+    #    Calculated, and News Impact Alerts on the right. ───────────────
+    col_left, col_right = st.columns([1.7, 1], gap="medium")
 
-    if df_aug.empty:
-        st.markdown("""
-        <div style="text-align:center;padding:4rem 2rem;color:#8b949e;">
-            <div style="font-size:3rem">📡</div>
-            <div style="font-size:1.1rem;margin-top:0.5rem;color:var(--text);">No scan data yet</div>
-            <div style="font-size:0.8rem;margin-top:0.3rem;">The background scanner populates this automatically within a few minutes — or run one now on the <b>Live Scanner</b> page to populate Market Health, Sector Rotation, and Signal Class counts immediately.</div>
-        </div>""", unsafe_allow_html=True)
-        return
+    with col_left:
+        st.markdown(_index_cards_html(st.session_state.get("dash_index_cards", [])),
+                    unsafe_allow_html=True)
 
-    # ── Live Scanner results — Elite/Execute/Actionable/Developing/Fib-
-    # Pullback/Active-Setups tables. Shown directly, unfolded, straight
-    # from `df_aug` (already read from the `live_scanner` Supabase
-    # snapshot above) — no expander, no "Run Scan" button on this page.
-    # pages/scanner.py's render_scan_results() is the exact same
-    # tab/table renderer the standalone Scanner page uses; only its Run
-    # Scan controls are Scanner-page-only. The regime `summary` dict
-    # reuses whatever _market_intelligence_fragment() already loaded
-    # into session_state above, rather than re-fetching Nifty/VIX here.
-    from pages.scanner import render_scan_results
-    render_scan_results(
-        df_aug,
-        summary=(st.session_state.get("mi_snapshot_payload") or {}).get("summary", {}),
-        scan_time=scan_time,
-    )
+        if df_aug.empty:
+            st.markdown("""
+            <div style="text-align:center;padding:4rem 2rem;color:#8b949e;">
+                <div style="font-size:3rem">📡</div>
+                <div style="font-size:1.1rem;margin-top:0.5rem;color:var(--text);">No scan data yet</div>
+                <div style="font-size:0.8rem;margin-top:0.3rem;">The background scanner populates this automatically within a few minutes — or run one now on the <b>Live Scanner</b> page to populate Market Health, Sector Rotation, and Signal Class counts immediately.</div>
+            </div>""", unsafe_allow_html=True)
+        else:
+            # ── Live Scanner results — Elite/Execute/Actionable/Developing/
+            # Fib-Pullback/Active-Setups tables. Shown directly, unfolded,
+            # straight from `df_aug` (already read from the `live_scanner`
+            # Supabase snapshot above) — no expander, no "Run Scan" button
+            # on this page. pages/scanner.py's render_scan_results() is the
+            # exact same tab/table renderer the standalone Scanner page
+            # uses; only its Run Scan controls are Scanner-page-only. The
+            # regime `summary` dict reuses whatever _market_intelligence_
+            # fragment() already loaded into session_state above, rather
+            # than re-fetching Nifty/VIX here.
+            from pages.scanner import render_scan_results
+            render_scan_results(
+                df_aug,
+                summary=(st.session_state.get("mi_snapshot_payload") or {}).get("summary", {}),
+                scan_time=scan_time,
+            )
 
-    # ── Signal Class counts ("Scanner Summary") ───────────────────────
-    if "Recommendation" in df_aug.columns:
-        st.markdown(_sc_counts_html(df_aug), unsafe_allow_html=True)
+            # ── Signal Class counts ("Scanner Summary") ─────────────────
+            if "Recommendation" in df_aug.columns:
+                st.markdown(_sc_counts_html(df_aug), unsafe_allow_html=True)
 
-    # ── DORE 2.0 F&O Opportunities — Futures / Options. DORE 2.0 is
-    #    independent of the equity scanner (Principle 2.1) — it runs its
-    #    own Stage 0-5 funnel over the shared F&O universe rather than
-    #    reading df_aug's OppScore/Recommendation/T1 columns. See
-    #    utils.dore_fo_screener docstring. ─────────────────────────────
-    _fo_opportunities_panel()
+            # ── DORE 2.0 F&O Opportunities — Futures / Options. DORE 2.0
+            #    is independent of the equity scanner (Principle 2.1) — it
+            #    runs its own Stage 0-5 funnel over the shared F&O universe
+            #    rather than reading df_aug's OppScore/Recommendation/T1
+            #    columns. See utils.dore_fo_screener docstring. ──────────
+            _fo_opportunities_panel()
 
-    # ── Sector Rotation Analysis (full panel) ─────────────────────────
-    sector_stats = build_sector_stats(df_aug)
+    with col_right:
+        st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
+        _sr = st.session_state.get("dash_sr", {})
+        st.markdown(_sr_timeline_html(_sr.get("timeline")), unsafe_allow_html=True)
+        st.markdown(_sr_how_calculated_html(), unsafe_allow_html=True)
 
-    # [2026-07-26] Persists today's sector_snapshots row — see
-    # utils/supabase_client.py's "SECTOR ROTATION PERSISTENCE" section.
-    # Best-effort: any failure here (save or load) falls back to
-    # single-day figures inside _sector_rotation_analysis_section()'s
-    # own compute calls (compute_rotation_metrics/_timeline/_flow all
-    # handle an empty/missing history gracefully), so a Supabase hiccup
-    # degrades gracefully rather than erroring the whole Dashboard.
-    from utils.supabase_client import save_sector_snapshot, load_sector_snapshot_history
-    from utils.sector_rotation import build_sector_snapshot_rows
+        # ── News Impact — independent of scan state too.
+        _news_impact_panel()
 
-    sector_history = pd.DataFrame()
-    try:
-        # Use the scan's own date (parsed from run_at), not "today" —
-        # if the Dashboard is showing a stale scan (see the staleness
-        # banner above), the sector snapshot should be dated to when
-        # that data actually came from, not to whenever it happened to
-        # be viewed.
-        _scan_date = pd.to_datetime(run_at).tz_convert(_IST).date() if run_at else today_ist()
-        save_sector_snapshot(build_sector_snapshot_rows(sector_stats, _scan_date))
-        sector_history = load_sector_snapshot_history(days=60)
-    except Exception:
-        logger.exception("Sector Rotation persistence failed (non-fatal — "
-                          "panel falls back to single-day figures)")
-
-    _as_of = pd.to_datetime(run_at).tz_convert(_IST) if run_at else _now_ist()
-    _sector_rotation_analysis_section(df_aug, sector_stats, sector_history, _as_of, run_at)
+    # ── Full Sector Rotation Analysis — the detailed dashboard table,
+    #    Top Sectors To Focus Today, summary cards (incl. Total
+    #    Opportunities / Net Inflow 5D) and footer that used to render in
+    #    full on the page. Kept in full (nothing removed), just moved
+    #    into an expander since its Rotating-In/Stable/Out counts and
+    #    Today's Sector Flow now also appear, in lighter form, in the top
+    #    strip above. ──────────────────────────────────────────────────
+    if not df_aug.empty:
+        _as_of = pd.to_datetime(run_at).tz_convert(_IST) if run_at else _now_ist()
+        with st.expander("📊 Full Sector Rotation Analysis (detailed table, focus sectors, summary cards)"):
+            _sector_rotation_analysis_section(df_aug, sector_stats, sector_history, _as_of, run_at)
