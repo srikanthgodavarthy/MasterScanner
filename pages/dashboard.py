@@ -2362,32 +2362,35 @@ def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.Dat
             bcolor = {"Bullish": "#3fb950", "Neutral": "#d29922", "Bearish": "#f85149"}.get(
                 r.get("BreadthBucket"), "#8b949e")
             breadth_cell = f'<span style="color:{bcolor}">{breadth:.0f}%</span>' if breadth is not None else "—"
-            rows_html += f"""
-            <tr>
-              <td>{i}</td>
-              <td><span class="sr-sector-name">{icon} {sector}</span></td>
-              <td class="{'sr-pos' if m5 >= 0 else 'sr-neg'}">{'+' if m5 >= 0 else ''}{m5:.1f}%</td>
-              <td class="{'sr-pos' if m20 >= 0 else 'sr-neg'}">{'+' if m20 >= 0 else ''}{m20:.1f}%</td>
-              <td>{breadth_cell}</td>
-              <td style="color:{dcolor}">{direction} {darrow}</td>
-              <td><span class="sr-action-badge" style="background:{acolor}22;color:{acolor};border:1px solid {acolor}">{action}</span></td>
-            </tr>"""
+            rows_html += (
+                "<tr>"
+                f"<td>{i}</td>"
+                f'<td><span class="sr-sector-name">{icon} {sector}</span></td>'
+                f'<td class="{"sr-pos" if m5 >= 0 else "sr-neg"}">{"+" if m5 >= 0 else ""}{m5:.1f}%</td>'
+                f'<td class="{"sr-pos" if m20 >= 0 else "sr-neg"}">{"+" if m20 >= 0 else ""}{m20:.1f}%</td>'
+                f"<td>{breadth_cell}</td>"
+                f'<td style="color:{dcolor}">{direction} {darrow}</td>'
+                f'<td><span class="sr-action-badge" style="background:{acolor}22;color:{acolor};border:1px solid {acolor}">{action}</span></td>'
+                "</tr>"
+            )
 
-        st.markdown(f"""
-        <div class="sr-panel">
-          <div class="sr-panel-title">SECTOR ROTATION DASHBOARD</div>
-          <table class="sr-table">
-            <tr><th>#</th><th>SECTOR</th><th>5D MOMENTUM</th><th>20D MOMENTUM</th><th>BREADTH</th><th>DIRECTION</th><th>SUGGESTED ACTION</th></tr>
-            {rows_html}
-          </table>
-          <div style="font-size:0.65rem;color:#8b949e;margin-top:8px;">
-            Momentum is the cumulative %Chg over trailing persisted scan dates (proxy for a day-count window until
-            more history accumulates). Breadth is the % of sector constituents with RSI&gt;50, positive composite RS,
-            and price in an uptrend (StockEdge-style breadth read) — it's the primary input to Direction/Suggested
-            Action, with price momentum as a secondary weight.
-          </div>
-        </div>
-        """.strip(), unsafe_allow_html=True)
+        table_html = (
+            '<div class="sr-panel">'
+            '<div class="sr-panel-title">SECTOR ROTATION DASHBOARD</div>'
+            '<table class="sr-table">'
+            "<tr><th>#</th><th>SECTOR</th><th>5D MOMENTUM</th><th>20D MOMENTUM</th>"
+            "<th>BREADTH</th><th>DIRECTION</th><th>SUGGESTED ACTION</th></tr>"
+            f"{rows_html}"
+            "</table>"
+            '<div style="font-size:0.65rem;color:#8b949e;margin-top:8px;">'
+            "Momentum is the cumulative %Chg over trailing persisted scan dates (proxy for a day-count window until "
+            "more history accumulates). Breadth is the % of sector constituents with RSI&gt;50, positive composite RS, "
+            "and price in an uptrend (StockEdge-style breadth read) &mdash; it's the primary input to Direction/Suggested "
+            "Action, with price momentum as a secondary weight."
+            "</div>"
+            "</div>"
+        )
+        st.markdown(table_html, unsafe_allow_html=True)
 
         # ── Top sectors to focus today ──────────────────────────────
         top3 = rotation_metrics.sort_values("RotationStrength", ascending=False).head(3).reset_index(drop=True)
