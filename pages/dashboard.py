@@ -1096,140 +1096,140 @@ _CSS = """
 .mo-index-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 14px;
+  gap: 8px;
 }
 @media (max-width: 1200px) { .mo-index-grid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 900px) { .mo-index-grid { grid-template-columns: 1fr; } }
 .mo-index-card {
   background: var(--bg2);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 14px 16px;
+  border-radius: 8px;
+  padding: 9px 10px;
 }
 .mo-index-label {
-  font-size: 11px;
+  font-size: 9.5px;
   font-weight: 700;
   letter-spacing: 0.05em;
   text-transform: uppercase;
   color: var(--muted);
-  margin-bottom: 8px;
+  margin-bottom: 5px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 .mo-index-badge {
-  font-size: 9.5px;
+  font-size: 8.5px;
   font-weight: 600;
   color: var(--muted);
   background: rgba(255,255,255,0.05);
   border: 1px solid var(--border);
   border-radius: 5px;
-  padding: 1px 6px;
+  padding: 1px 5px;
 }
 
 /* ── EMA20/50/200 badge row ── */
-.mo-index-ema-row { display: flex; gap: 6px; margin-bottom: 10px; }
+.mo-index-ema-row { display: flex; gap: 4px; margin-bottom: 6px; }
 .mo-index-ema-item {
   flex: 1;
   background: var(--bg1);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 5px 7px;
+  border-radius: 5px;
+  padding: 3px 5px;
   text-align: center;
 }
 .mo-index-ema-label {
-  font-size: 8.5px;
+  font-size: 7.5px;
   font-weight: 700;
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.03em;
-  margin-bottom: 2px;
+  margin-bottom: 1px;
 }
-.mo-index-ema-val { font-size: 11.5px; font-weight: 700; font-family: var(--mono); }
-.mo-index-ema-check { font-size: 10px; }
+.mo-index-ema-val { font-size: 10px; font-weight: 700; font-family: var(--mono); }
+.mo-index-ema-check { font-size: 9px; }
 
 .mo-index-row {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px;
 }
 .mo-index-price {
-  font-size: 28px;
+  font-size: 19px;
   font-weight: 700;
   font-family: var(--mono);
   color: var(--text);
   line-height: 1.1;
 }
-.mo-index-chg { margin-top: 6px; font-family: var(--mono); font-size: 12.5px; }
+.mo-index-chg { margin-top: 4px; font-family: var(--mono); font-size: 10.5px; }
 
 .mo-index-ohlc-row {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 6px;
-  margin-top: 12px;
-  padding-top: 10px;
+  gap: 4px;
+  margin-top: 8px;
+  padding-top: 7px;
   border-top: 1px solid var(--border);
 }
 .mo-index-ohlc-item { text-align: left; }
 .mo-index-ohlc-label {
-  font-size: 9px;
+  font-size: 7.5px;
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  margin-bottom: 3px;
+  margin-bottom: 2px;
 }
-.mo-index-ohlc-val { font-size: 12px; font-weight: 700; font-family: var(--mono); }
+.mo-index-ohlc-val { font-size: 10.5px; font-weight: 700; font-family: var(--mono); }
 
 .mo-index-oi-row {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: 8px;
-  margin-top: 10px;
-  padding-top: 10px;
+  gap: 6px;
+  margin-top: 7px;
+  padding-top: 7px;
   border-top: 1px solid var(--border);
 }
 .mo-index-oi-item { text-align: left; }
 .mo-index-oi-label {
-  font-size: 9px;
+  font-size: 7.5px;
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  margin-bottom: 3px;
+  margin-bottom: 2px;
 }
-.mo-index-oi-val { font-size: 12.5px; font-weight: 700; font-family: var(--mono); }
-.mo-index-oi-meta { font-size: 9px; color: var(--muted); margin-top: 2px; }
+.mo-index-oi-val { font-size: 11px; font-weight: 700; font-family: var(--mono); }
+.mo-index-oi-meta { font-size: 8px; color: var(--muted); margin-top: 1px; }
 
-.mo-index-expiry { font-size: 9.5px; color: var(--muted); margin-top: 8px; }
+.mo-index-expiry { font-size: 8.5px; color: var(--muted); margin-top: 6px; }
 
 .mo-index-dore-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  margin-top: 10px;
-  padding-top: 10px;
+  gap: 6px;
+  margin-top: 7px;
+  padding-top: 7px;
   border-top: 1px solid var(--border);
   cursor: help;
 }
 .mo-index-dore-badge {
-  font-size: 10.5px;
+  font-size: 9.5px;
   font-weight: 700;
   letter-spacing: 0.02em;
-  padding: 3px 8px;
+  padding: 2px 6px;
   border-radius: 5px;
   border: 1px solid;
   font-family: var(--mono);
 }
-.mo-index-dore-conf { font-size: 11px; font-weight: 700; font-family: var(--mono); }
+.mo-index-dore-conf { font-size: 10px; font-weight: 700; font-family: var(--mono); }
 .mo-index-dore-reason {
-  font-size: 9.5px;
+  font-size: 8.5px;
   color: var(--muted);
-  margin-top: 4px;
-  line-height: 1.35;
+  margin-top: 3px;
+  line-height: 1.3;
 }
 .mo-index-dore-warn {
-  font-size: 9px;
+  font-size: 8.5px;
   color: #d29922;
   margin-top: 2px;
 }
@@ -1412,7 +1412,7 @@ _CSS = """
 
   /* Index card OHLC row — 4 → 2 */
   .mo-index-ohlc-row { grid-template-columns: repeat(2, 1fr); }
-  .mo-index-price { font-size: 22px; }
+  .mo-index-price { font-size: 17px; }
 
   /* Panel padding/typography — tighter on a narrow viewport */
   .ni-panel, .lifecycle-panel { padding: 12px 12px 10px; }
@@ -1440,7 +1440,7 @@ _CSS = """
   .ti-mi-grid, .ti-sob-grid, .ti-breadth-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
   .mo-index-ohlc-row { grid-template-columns: repeat(2, 1fr); }
   .mo-index-oi-row { grid-template-columns: 1fr; }
-  .mo-index-price { font-size: 19px; }
+  .mo-index-price { font-size: 15px; }
   .mo-index-grid { grid-template-columns: 1fr; }
 
   /* Result table (Actionable/Developing/Fib/Active Setups) — already
@@ -1803,7 +1803,7 @@ def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
         spark_color = "#8b949e"
 
     price_str = f"{price:,.0f}" if price else "—"
-    spark_svg = _nifty_spark_svg(spark_vals, spark_color, width=130, height=46, grad_id=grad_id)
+    spark_svg = _nifty_spark_svg(spark_vals, spark_color, width=88, height=32, grad_id=grad_id)
 
     def _ohlc_item(lbl, val, color="var(--text)"):
         txt = f"{val:,.0f}" if val else "—"
@@ -2976,12 +2976,14 @@ def _news_impact_compact_rows_html(items: list[dict]) -> str:
 
 def _news_impact_panel():
     """Renders the detailed news impact table (TIME/SECTOR/STOCK(S)/
-    IMPACT/CONFIDENCE/RECOMMENDATION/CURRENT STATE/HEADLINE).
+    IMPACT/CONFIDENCE/RECOMMENDATION/CURRENT STATE/HEADLINE), always
+    open (no expander).
 
     2026-07-28: the compact "📰 NEWS IMPACT ALERTS" strip (TIME/STOCK/
     IMPACT/HEADLINE rows + "View all news →") that used to render above
-    this table has been removed from the dashboard per request — this
-    detailed table is the one thing that's meant to stay.
+    this table has been removed from the dashboard per request, and the
+    "Show detailed news impact table" expander this table used to sit
+    behind has also been removed — it's now unfolded permanently.
 
     2026-07-19: classification is capped to 10 items, and those 10 are
     chosen by relevance, not just recency. Previously every deduped
@@ -3029,12 +3031,15 @@ def _news_impact_panel():
 <div class="ni-grid ni-head">
   <div>TIME</div><div>SECTOR</div><div>STOCK(S)</div><div>IMPACT</div><div>CONFIDENCE</div><div>RECOMMENDATION</div><div>CURRENT STATE</div><div>HEADLINE</div><div></div>
 </div>"""
-    with st.expander("Show detailed news impact table (Confidence · Recommendation · Current State)"):
-        st.markdown(
-            f'<div class="ni-panel">{header_html}'
-            f'{_news_impact_rows_html(items[:_CLASSIFY_CAP], scan_df)}</div>',
-            unsafe_allow_html=True,
-        )
+    # 2026-07-28: was behind an st.expander("Show detailed news impact
+    # table …") — now always rendered open, per request.
+    st.markdown(
+        '<div class="ni-title" style="margin-bottom:6px;">'
+        'Detailed news impact (Confidence · Recommendation · Current State)</div>'
+        f'<div class="ni-panel">{header_html}'
+        f'{_news_impact_rows_html(items[:_CLASSIFY_CAP], scan_df)}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 
@@ -3274,8 +3279,16 @@ def render(settings: dict | None = None):
     #    below. Sector-related content no longer lives here — see the
     #    "Full Sector Rotation Analysis" section further down. ──────────
     _market_intelligence_fragment()
-    st.markdown(_index_cards_html(st.session_state.get("dash_index_cards", [])),
-                unsafe_allow_html=True)
+
+    # 2026-07-28: index cards were shrunk (smaller fonts/padding/
+    # sparkline, see .mo-index-card CSS) so NSE Top Gainers can sit to
+    # their right on the same row instead of its own row further down.
+    idx_col, gainers_col = st.columns([1.7, 1], gap="medium")
+    with idx_col:
+        st.markdown(_index_cards_html(st.session_state.get("dash_index_cards", [])),
+                    unsafe_allow_html=True)
+    with gainers_col:
+        st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
 
     # [Dashboard/Scanner split] Scanner output (Elite/Execute/Actionable/
     # ... tables, Signal Class counts) and the DORE 2.0 F&O Opportunity
@@ -3284,17 +3297,13 @@ def render(settings: dict | None = None):
     # by Futures and Options. Dashboard stays focused on market-wide
     # context: Top Gainers, News, and Sector data below.
 
-    # ── Top Gainers / News. ─────────────────────────────────────────────
-    # 2026-07-28: the compact "News Impact Alerts" strip is gone from
-    # this column (see _news_impact_panel's docstring) — the detailed
-    # news table stays.
-    col_left, col_right = st.columns([1.4, 1], gap="medium")
+    # ── News. ────────────────────────────────────────────────────────
+    # 2026-07-28: Top Gainers moved up next to the index cards (see
+    # above); the detailed news table now takes the full row width and
+    # is always open — no more "Show detailed news impact table"
+    # expander, see _news_impact_panel's docstring.
+    _news_impact_panel()
 
-    with col_left:
-        st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
-
-    with col_right:
-        _news_impact_panel()
 
     # ── Full Sector Rotation Analysis — everything sector-related lives
     #    here now and only here: summary cards (Rotating In/Stable/Out,
