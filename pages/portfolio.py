@@ -89,6 +89,17 @@ _TREND_BADGE = {
 }
 
 
+def _tv_link(symbol: str, css_class: str = "tv-link") -> str:
+    """Return an anchor that opens TradingView NSE chart in a new tab.
+    Same helper/link format as pages/dashboard.py and pages/scanner.py."""
+    tv_sym = f"NSE:{str(symbol).upper().replace('.NS', '').replace('-EQ', '')}"
+    url = f"https://www.tradingview.com/chart/?symbol={tv_sym}"
+    return (
+        f'<a class="{css_class}" href="{url}" target="_blank" '
+        f'title="Open {symbol} on TradingView">{symbol}</a>'
+    )
+
+
 def _md(html: str):
     """Render a multi-line HTML block via st.markdown safely.
 
@@ -132,6 +143,8 @@ def _inject_css():
     table.pcc-table tr:hover td { background:#131b2e; }
     .pcc-badge { padding:2px 10px; border-radius:12px; font-size:0.72rem; font-weight:700; border:1px solid; }
     .pcc-sym { font-weight:700; color:#f1f5f9; }
+    .pcc-sym .tv-link, .pcc-panel-sym .tv-link { color:inherit; text-decoration:none; }
+    .pcc-sym .tv-link:hover, .pcc-panel-sym .tv-link:hover { text-decoration:underline; }
     .pcc-sub { color:#64748b; font-size:0.7rem; }
     .pcc-score { font-weight:700; }
 
@@ -213,6 +226,8 @@ def _inject_css():
     .pcc-swap-card { background:#111827; border:1px solid #1e293b; border-radius:10px; padding:0.6rem 0.75rem; margin-bottom:0.5rem; }
     .pcc-swap-toprow { display:flex; justify-content:space-between; align-items:center; }
     .pcc-swap-syms { font-weight:700; font-size:0.85rem; }
+    .pcc-swap-syms .tv-link { color:inherit; text-decoration:none; }
+    .pcc-swap-syms .tv-link:hover { text-decoration:underline; }
     .pcc-swap-arrow { color:#54607a; margin:0 0.3rem; }
     .pcc-swap-target { color:#00ff88; }
     .pcc-swap-score { font-weight:700; font-size:0.9rem; }
@@ -223,6 +238,8 @@ def _inject_css():
     /* ── Execute-style detail card header ── */
     .pcc-dc-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:0.7rem; }
     .pcc-dc-title { display:flex; align-items:center; gap:0.4rem; font-size:1.05rem; font-weight:800; font-family:'Syne',sans-serif; }
+    .pcc-dc-title .tv-link { color:inherit; text-decoration:none; }
+    .pcc-dc-title .tv-link:hover { text-decoration:underline; }
     .pcc-dc-exch { font-size:0.62rem; color:#64748b; background:#0d1420; border:1px solid #1e293b; border-radius:5px; padding:1px 6px; }
     .pcc-dc-tier { padding:3px 12px; border-radius:6px; font-size:0.72rem; font-weight:800; letter-spacing:0.03em; }
     .pcc-dc-toprow { display:grid; grid-template-columns:repeat(4,1fr); gap:0.6rem; margin-bottom:0.7rem; }
@@ -892,7 +909,7 @@ def _panel_row_html(r: dict, extra_line: str | None = None) -> str:
     color = "#00ff88" if pct >= 0 else "#ff4d6d"
     return f"""<div class="pcc-panel-row">
       <div class="pcc-panel-row-top">
-        <span class="pcc-panel-sym">{r['symbol']}</span>
+        <span class="pcc-panel-sym">{_tv_link(r['symbol'])}</span>
         <span class="pcc-panel-ltp">₹{r['price']:.2f}</span>
       </div>
       <div class="pcc-panel-row-bottom">
@@ -947,7 +964,7 @@ def _render_holdings_table(rows: list[dict]):
         dot = _rr_dot_color(r["display_action"])
         trs.append(f"""<tr>
           <td style="color:#64748b;">{i}</td>
-          <td><span class="pcc-sym">{r['symbol']}</span></td>
+          <td><span class="pcc-sym">{_tv_link(r['symbol'])}</span></td>
           <td>{r['price']:.2f}</td>
           <td style="color:{today_color};">{r['today_pct']:+.2f}%</td>
           <td style="color:{today_color};">{'+' if r['today_pnl']>=0 else ''}{r['today_pnl']:,.0f}</td>
@@ -1036,7 +1053,7 @@ def _render_positions_table(rows: list[dict]):
         trs.append(f"""
         <tr>
           <td>
-            <span class="pcc-sym">{r['symbol']}</span><br/>
+            <span class="pcc-sym">{_tv_link(r['symbol'])}</span><br/>
             <span class="pcc-sub">NSE</span>
           </td>
           <td>{_ring_html(_health_score(r))}</td>
@@ -1267,8 +1284,8 @@ def _render_rotation_rationale(rows: list[dict]):
         <div class="pcc-swap-card">
           <div class="pcc-swap-toprow">
             <div class="pcc-swap-syms">
-              <span>{r['symbol']}</span><span class="pcc-swap-arrow">→</span>
-              <span class="pcc-swap-target">{r['rotate_target']}</span>
+              <span>{_tv_link(r['symbol'])}</span><span class="pcc-swap-arrow">→</span>
+              <span class="pcc-swap-target">{_tv_link(r['rotate_target'])}</span>
             </div>
             <div class="pcc-swap-score" style="color:#00ff88;">+{r['rotate_score']:.0f}</div>
           </div>
@@ -1399,7 +1416,7 @@ def _render_stock_cards(rows: list[dict], cfg: ExitIntelligenceConfig, total_val
                 <div class="pcc-stockcard" style="border-left-color:{accent}; background:linear-gradient(160deg,{accent}22 0%,#151d30 65%);">
                   <div class="pcc-stockcard-top">
                     <div>
-                      <span class="pcc-sym">{r['symbol']}</span><br/>
+                      <span class="pcc-sym">{_tv_link(r['symbol'])}</span><br/>
                       <span style="font-size:0.75rem;font-weight:600;color:{day_color};">
                         {'+' if r['today_pct']>=0 else ''}{r['today_pct']:.2f}% today</span>
                     </div>
@@ -1450,7 +1467,7 @@ def _render_detail_card(r: dict, cfg: ExitIntelligenceConfig, total_value: float
         star = "⭐ " if r["display_action"] == "STRONG ADD" else ""
         _md(f"""
         <div class="pcc-dc-header">
-          <div class="pcc-dc-title">{star}{symbol} <span class="pcc-dc-exch">NSE</span></div>
+          <div class="pcc-dc-title">{star}{_tv_link(symbol)} <span class="pcc-dc-exch">NSE</span></div>
           <div class="pcc-dc-tier" style="background:{tier_color}22;color:{tier_color};border:1px solid {tier_color}66;">{tier_label}</div>
         </div>
         """)
@@ -1462,7 +1479,7 @@ def _render_detail_card(r: dict, cfg: ExitIntelligenceConfig, total_value: float
               <div class="pcc-swap-toprow">
                 <div class="pcc-swap-syms">
                   <span>Rotate into</span><span class="pcc-swap-arrow">→</span>
-                  <span class="pcc-swap-target">{r['rotate_target']}</span>
+                  <span class="pcc-swap-target">{_tv_link(r['rotate_target'])}</span>
                 </div>
                 <div class="pcc-swap-score" style="color:#00ff88;">+{r['rotate_score']:.0f}</div>
               </div>
