@@ -74,6 +74,7 @@ logger = logging.getLogger(__name__)
 
 _snapshots: dict = {}   # {index: {"date": date, "baseline_ce_oi": float, "baseline_pe_oi": float}}
 _premium_history: dict = {}   # {key: {"ce": [t-1, t-2, ...], "pe": [t-1, t-2, ...]}}
+_strike_premium_history: dict = {}   # {"SYMBOL_LEG_STRIKE": [t-1]} — see record_and_diff_strike_premium()
 _LOCK = threading.Lock()
 
 # ── Lazy one-time hydrate from Supabase, per process lifetime ─────────
@@ -234,6 +235,45 @@ def record_and_diff_premium(
             "pe": [float(pe_premium or 0.0)] + pe_hist[:1],
         }
         return ce_prev, ce_prev2, pe_prev, pe_prev2
+
+
+def record_and_diff_strike_premium(key: str, premium: float) -> Optional[float]:
+    """
+    Per-strike counterpart to record_and_diff_premium() above, for the
+    DORE Options table's displayed "Premium %Chg" column specifically.
+
+    2026-07-28 bugfix: record_and_diff_premium() tracks the ATM/OI-wall
+    REFERENCE strike's premium history — needed for Stage 3.5's Premium
+    Behaviour pillar, which is deliberately pinned to one stable strike
+    (see that function's docstring), and that use is left untouched.
+    But the UI's "Premium" column already shows result.suggested_strike's
+    OWN live LTP (utils.fo_scan's 2026-07-23 fix), which is frequently a
+    DIFFERENT strike than the reference once Stage 5b's ITM-walk fires
+    (any "ITM" Strike Type row). "Premium %Chg" was still being computed
+    against the reference strike's prior-poll premium, so an ITM strike
+    trading around ₹18 could get diffed against its ATM neighbour's own
+    tiny prior premium (e.g. ~50 paise) — producing a meaningless swing
+    like "+3236%" that has nothing to do with that option's own move.
+
+    Call this with a key that encodes symbol + leg + the ACTUAL
+    recommended strike (e.g. "COFORGE_PE_1700"), not the plain per-symbol
+    key record_and_diff_premium() uses — so the % change is always this
+    SAME strike's own tick-to-tick move. Returns the previous poll's
+    premium for that exact key (None on the first observation, which
+    renders as "—" downstream, same fail-soft convention as the
+    reference-strike tracker).
+
+    RAM-only / not flushed to Supabase — a restart just costs one poll
+    cycle of "—" for each strike rather than a wrong number, which is
+    the same trade-off record_and_diff_premium() accepts before its
+    first call for a key.
+    """
+    _ensure_loaded()
+    with _LOCK:
+        hist = _strike_premium_history.get(key, [])
+        prev = hist[0] if hist else None
+        _strike_premium_history[key] = [float(premium or 0.0)] + hist[:1]
+        return prev
 
 
 def flush_to_supabase() -> None:
