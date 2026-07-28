@@ -2467,7 +2467,9 @@ def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.Dat
         )
         st.markdown(table_html, unsafe_allow_html=True)
 
-        # ── Top sectors to focus today ──────────────────────────────
+    with col_right:
+        # ── Top sectors to focus today — moved here, above Today's
+        #    Sector Flow, so it's the first thing in the right column. ──
         top3 = rotation_metrics.sort_values("RotationStrength", ascending=False).head(3).reset_index(drop=True)
         rank_colors = ["#3fb950", "#d29922", "#58a6ff"]
         focus_html = '<div class="sr-focus-cards">'
@@ -2488,10 +2490,9 @@ def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.Dat
               </div>
             </div>"""
         focus_html += "</div>"
-        st.markdown(f'<div class="sr-panel-title" style="margin-top:16px;">TOP SECTORS TO FOCUS TODAY</div>{focus_html}',
+        st.markdown(f'<div class="sr-panel-title">TOP SECTORS TO FOCUS TODAY</div>{focus_html}',
                      unsafe_allow_html=True)
 
-    with col_right:
         # ── Today's Sector Flow ─────────────────────────────────────
         inflow_rows = "".join(
             f'<div class="sr-flow-row"><span>↑ {s}</span><span class="sr-pos">+{v:.0f} Cr</span></div>'
@@ -2503,7 +2504,7 @@ def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.Dat
         ) or '<div style="color:#8b949e;font-size:0.75rem;">—</div>'
 
         st.markdown(f"""
-        <div class="sr-panel">
+        <div class="sr-panel" style="margin-top:16px;">
           <div class="sr-panel-title">TODAY'S SECTOR FLOW <span style="color:#8b949e;font-weight:400;">(Net Inflow)</span></div>
           <div style="display:flex;gap:16px;">
             <div style="flex:1;">
