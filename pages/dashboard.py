@@ -2975,11 +2975,13 @@ def _news_impact_compact_rows_html(items: list[dict]) -> str:
 
 
 def _news_impact_panel():
-    """Renders the 📰 News Impact Alerts card — a compact TIME/STOCK/
-    IMPACT/EVENT list by default (matches the reference sidebar layout),
-    with the full detailed grid (Confidence/Recommendation/Current
-    State/Source) available in an expander using the same fetched
-    items, so nothing from the original wide table is lost.
+    """Renders the detailed news impact table (TIME/SECTOR/STOCK(S)/
+    IMPACT/CONFIDENCE/RECOMMENDATION/CURRENT STATE/HEADLINE).
+
+    2026-07-28: the compact "📰 NEWS IMPACT ALERTS" strip (TIME/STOCK/
+    IMPACT/HEADLINE rows + "View all news →") that used to render above
+    this table has been removed from the dashboard per request — this
+    detailed table is the one thing that's meant to stay.
 
     2026-07-19: classification is capped to 10 items, and those 10 are
     chosen by relevance, not just recency. Previously every deduped
@@ -3012,12 +3014,7 @@ def _news_impact_panel():
         items = tag_news(prioritized)
 
     if not items:
-        st.markdown(
-            '<div class="ni-panel"><div class="ni-title">📰 NEWS IMPACT ALERTS</div>'
-            '<div style="color:var(--muted);font-size:12px;">No headlines available right now — '
-            'feeds may be temporarily unreachable.</div></div>',
-            unsafe_allow_html=True,
-        )
+        st.caption("No headlines available right now — feeds may be temporarily unreachable.")
         return
 
     if not _groq_available():
@@ -3027,14 +3024,6 @@ def _news_impact_panel():
         )
 
     scan_df = st.session_state.get("dash_scan_df", pd.DataFrame())
-    _VISIBLE = 8
-
-    st.markdown(
-        f'<div class="ni-panel"><div class="ni-title">📰 NEWS IMPACT ALERTS '
-        f'<span class="ni-viewall">View all news →</span></div>'
-        f'{_news_impact_compact_rows_html(items[:_VISIBLE])}</div>',
-        unsafe_allow_html=True,
-    )
 
     header_html = """
 <div class="ni-grid ni-head">
@@ -3046,6 +3035,7 @@ def _news_impact_panel():
             f'{_news_impact_rows_html(items[:_CLASSIFY_CAP], scan_df)}</div>',
             unsafe_allow_html=True,
         )
+
 
 
 
@@ -3294,12 +3284,17 @@ def render(settings: dict | None = None):
     # by Futures and Options. Dashboard stays focused on market-wide
     # context: Top Gainers, News, and Sector data below.
 
-    # ── Top Gainers. ──────────────────────────────────────────────────
-    # 2026-07-28: News Impact Alerts panel removed from the dashboard
-    # (was in a right-hand column alongside this) — Top Gainers now
-    # takes the full row width. _news_impact_panel() is left defined
-    # above in case it's wanted back on a different page later.
-    st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
+    # ── Top Gainers / News. ─────────────────────────────────────────────
+    # 2026-07-28: the compact "News Impact Alerts" strip is gone from
+    # this column (see _news_impact_panel's docstring) — the detailed
+    # news table stays.
+    col_left, col_right = st.columns([1.4, 1], gap="medium")
+
+    with col_left:
+        st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
+
+    with col_right:
+        _news_impact_panel()
 
     # ── Full Sector Rotation Analysis — everything sector-related lives
     #    here now and only here: summary cards (Rotating In/Stable/Out,
