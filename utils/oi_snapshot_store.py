@@ -11,8 +11,8 @@ sub-weight (w_oi_writing_unwinding = 40%), and until this module existed
 it was permanently fed 0.0 for both legs, which resolves to a fixed
 neutral-50 in that branch regardless of actual market conditions.
 
-This module is a RAM-resident baseline tracker, one entry per index,
-that resets at the start of each calendar day (same day-rollover
+This module is a RAM-resident baseline tracker, one entry per index/
+stock, that resets at the start of each calendar day (same day-rollover
 pattern as history_store.get_live_history_cached()): the FIRST snapshot
 recorded each day becomes that day's baseline, and every later call
 returns (current_total - baseline_total) for both legs — "aggregate OI
@@ -23,136 +23,125 @@ close. There is no data source available in this codebase to seed a
 truer baseline (yesterday's closing OI) before that first call — Upstox's
 option-chain endpoint doesn't expose a prior-day-close OI field.
 
-Known limitation, intentional and documented rather than a bug: on the
-FIRST call of each day the change is always (0.0, 0.0) — nothing to diff
-against yet. Writing/unwinding only becomes informative from the second
-Market Intelligence refresh of the day onward.
+[2026-07-28] PERSISTENCE — fixes the restart gap documented below.
+Both trackers (`_snapshots` for OI baseline, `_premium_history` for
+Premium Behaviour) are RAM-first for zero added latency on the hot
+per-symbol path, but now:
+  - lazy-hydrate ONCE from Supabase (utils.supabase_client's
+    dore_oi_baseline / dore_premium_history tables) on first use per
+    process lifetime, via _ensure_loaded() — so a fresh process restart
+    mid-day picks up where the last process left off instead of
+    starting cold. Rows from a prior calendar day are never loaded (see
+    _ensure_loaded()'s date guard) — that's the same day-rollover reset
+    this module already applies, now also enforced across a restart.
+  - get flush_to_supabase() called ONCE per full universe scan cycle
+    (from utils.fo_scan.compute_fo_scan(), after both the futures and
+    options passes complete) — a single batched upsert per table, never
+    a per-symbol write, so this never adds Supabase round-trip latency
+    inside the per-symbol DORE funnel loop. Fire-and-forget on a small
+    background thread; a failed/slow flush is logged and skipped, never
+    allowed to block or fail the scan cycle that triggered it.
 
-Persistence (Supabase, best-effort — 2026-07-28 fix)
------------------------------------------------------
-Both trackers below (daily OI baseline, and tick-to-tick premium
-history) are now write-through persisted to Supabase's oi_snapshot_state
-table, same get_client()/fail-open pattern as utils/event_cache.py. A
-fresh process (Streamlit Cloud recycle, redeploy, crash) hydrates its
-in-memory state from the last-persisted row on first use instead of
-re-seeding from whatever snapshot arrives first — which previously lost
-the morning's OI buildup, and separately made record_and_diff_premium()
-return None for ce_premium_prev/pe_premium_prev right after a restart,
-silently downgrading DORE's Premium Behaviour pillar (Stage 3) to a
-forced UNCONFIRMED=40 score, which gate_now_on_premium_behavior then
-turns into every BUY_CE_NOW/BUY_PE_NOW being downgraded to WATCH until a
-full poll cycle passes. If Supabase is unavailable (get_client() returns
-None — no secrets configured), this module still works exactly as
-before: in-memory only, re-seeding on restart, nothing gets worse.
+Prior to this, on a fresh process restart mid-day the baseline
+re-seeded from whatever snapshot came in first (losing the morning's
+buildup for that process's lifetime) — acceptable for infrequent
+restarts, but a real problem on a host that restarts/redeploys often,
+since Stage 3's OI-writing read and Stage 3.5's Premium Behaviour read
+would both sit at their neutral/"UNCONFIRMED" defaults for a full poll
+cycle after every restart (see utils.dore_engine's premium_behavior_score
+docstring) — visibly biasing recommendations toward WATCH/WAIT for
+reasons that have nothing to do with the market.
 
-Feed this from total_ce_oi/total_pe_oi (chain-wide totals), NOT ce_oi/
-pe_oi at the single highest-OI strike — the highest-OI strike can itself
-shift day to day as OI migrates, which would make a per-strike diff noisy
-and occasionally nonsensical (comparing OI at two different strikes).
-The chain-wide total is the same aggregate PCR is already computed from
-(see fetch_oi_resistance()'s total_ce_oi/total_pe_oi), so this stays
-internally consistent with the PCR sub-signal sitting right next to it
-in Stage 2.
+Feed record_and_diff() from total_ce_oi/total_pe_oi (chain-wide totals),
+NOT ce_oi/pe_oi at the single highest-OI strike — the highest-OI strike
+can itself shift day to day as OI migrates, which would make a
+per-strike diff noisy and occasionally nonsensical (comparing OI at two
+different strikes). The chain-wide total is the same aggregate PCR is
+already computed from (see fetch_oi_resistance()'s total_ce_oi/
+total_pe_oi), so this stays internally consistent with the PCR
+sub-signal sitting right next to it in Stage 2.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from typing import Optional
-
-from utils.supabase_client import get_client
 
 logger = logging.getLogger(__name__)
 
 _snapshots: dict = {}   # {index: {"date": date, "baseline_ce_oi": float, "baseline_pe_oi": float}}
+_premium_history: dict = {}   # {key: {"ce": [t-1, t-2, ...], "pe": [t-1, t-2, ...]}}
 _LOCK = threading.Lock()
 
-_TABLE = "oi_snapshot_state"
-_hydrated = False
-_hydrate_lock = threading.Lock()
+# ── Lazy one-time hydrate from Supabase, per process lifetime ─────────
+_loaded_from_supabase = False
+_LOAD_LOCK = threading.Lock()
+
+# ── Background flush executor — tiny, fire-and-forget, never blocks
+#    the scan cycle that calls flush_to_supabase(). max_workers=1 is
+#    deliberate: flushes are cheap (<300 rows/table) and infrequent
+#    (once per ~60s scan cycle), so serializing them on one thread is
+#    simpler than a bounded queue and can never pile up faster than the
+#    scan cycle that triggers them.
+_flush_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="oi-snapshot-flush")
 
 
-def _hydrate_once() -> None:
-    """Load persisted state into the in-memory dicts, exactly once per
-    process. Best-effort: any failure (no Supabase configured, network
-    error, table doesn't exist yet) just leaves the in-memory dicts
-    empty, same as before this fix existed — never raises into a
-    caller's hot path."""
-    global _hydrated
-    if _hydrated:
+def _ensure_loaded() -> None:
+    """Hydrate _snapshots/_premium_history from Supabase exactly once
+    per process lifetime, on whichever caller (record_and_diff or
+    record_and_diff_premium) happens to run first. Best-effort: any
+    failure (Supabase unavailable, table missing) just leaves both
+    trackers empty, i.e. exactly today's pre-persistence cold-start
+    behaviour — never raises into the caller."""
+    global _loaded_from_supabase
+    if _loaded_from_supabase:
         return
-    with _hydrate_lock:
-        if _hydrated:   # re-check inside the lock (another thread may have just finished)
+    with _LOAD_LOCK:
+        if _loaded_from_supabase:   # re-check inside the lock
             return
-        client = get_client()
-        if client is None:
-            _hydrated = True
-            return
-        try:
-            resp = client.table(_TABLE).select("*").execute()
-            rows = resp.data or []
-        except Exception as exc:
-            logger.warning("[oi_snapshot_store] hydration read failed (staying in-memory-only): %s", exc)
-            _hydrated = True
-            return
-
+        _loaded_from_supabase = True   # set first — a failed load should not retry every call
         today = date.today()
-        with _LOCK:
-            for row in rows:
-                key = row.get("key")
-                if not key:
-                    continue
-                if row.get("kind") == "daily_baseline":
-                    row_date = row.get("baseline_date")
-                    # Only hydrate today's baseline — an old day's row is
-                    # exactly what the day-rollover check would discard
-                    # anyway, so skip it rather than reviving a stale one.
-                    if row_date and str(row_date) == today.isoformat():
-                        _snapshots[key] = {
-                            "date": today,
-                            "baseline_ce_oi": float(row.get("baseline_ce_oi") or 0.0),
-                            "baseline_pe_oi": float(row.get("baseline_pe_oi") or 0.0),
-                        }
-                elif row.get("kind") == "premium_history":
-                    _premium_history[key] = {
-                        "ce": list(row.get("ce_history") or []),
-                        "pe": list(row.get("pe_history") or []),
+        try:
+            from utils.supabase_client import load_oi_baseline_snapshots, load_premium_history_snapshots
+
+            oi_rows = load_oi_baseline_snapshots()
+            n_oi = 0
+            for row in oi_rows:
+                try:
+                    if str(row.get("snapshot_date")) != str(today):
+                        continue   # yesterday's (or older) baseline — not today's reset point
+                    _snapshots[row["key"]] = {
+                        "date": today,
+                        "baseline_ce_oi": float(row.get("baseline_ce_oi") or 0.0),
+                        "baseline_pe_oi": float(row.get("baseline_pe_oi") or 0.0),
                     }
-        logger.info("[oi_snapshot_store] hydrated %d rows from Supabase", len(rows))
-        _hydrated = True
+                    n_oi += 1
+                except Exception:
+                    continue
 
+            premium_rows = load_premium_history_snapshots()
+            n_prem = 0
+            for row in premium_rows:
+                try:
+                    if str(row.get("snapshot_date")) != str(today):
+                        continue   # yesterday's close — not genuine intraday history
+                    ce_hist = [v for v in (row.get("ce_h0"), row.get("ce_h1")) if v is not None]
+                    pe_hist = [v for v in (row.get("pe_h0"), row.get("pe_h1")) if v is not None]
+                    if ce_hist or pe_hist:
+                        _premium_history[row["key"]] = {"ce": ce_hist, "pe": pe_hist}
+                        n_prem += 1
+                except Exception:
+                    continue
 
-def _persist_daily_baseline(key: str, state: dict) -> None:
-    client = get_client()
-    if client is None:
-        return
-    try:
-        client.table(_TABLE).upsert({
-            "key": key,
-            "kind": "daily_baseline",
-            "baseline_date": state["date"].isoformat(),
-            "baseline_ce_oi": state["baseline_ce_oi"],
-            "baseline_pe_oi": state["baseline_pe_oi"],
-        }, on_conflict="key,kind").execute()
-    except Exception as exc:
-        logger.warning("[oi_snapshot_store] daily_baseline persist failed for %s: %s", key, exc)
-
-
-def _persist_premium_history(key: str, ce_hist: list, pe_hist: list) -> None:
-    client = get_client()
-    if client is None:
-        return
-    try:
-        client.table(_TABLE).upsert({
-            "key": key,
-            "kind": "premium_history",
-            "ce_history": ce_hist,
-            "pe_history": pe_hist,
-        }, on_conflict="key,kind").execute()
-    except Exception as exc:
-        logger.warning("[oi_snapshot_store] premium_history persist failed for %s: %s", key, exc)
+            logger.info(
+                "oi_snapshot_store: rehydrated %d OI-baseline key(s) and %d premium-history "
+                "key(s) from Supabase for %s", n_oi, n_prem, today,
+            )
+        except Exception:
+            logger.exception("oi_snapshot_store: Supabase rehydrate failed — starting cold (RAM-only)")
 
 
 def record_and_diff(index: str, total_ce_oi: float, total_pe_oi: float) -> tuple[float, float]:
@@ -168,7 +157,7 @@ def record_and_diff(index: str, total_ce_oi: float, total_pe_oi: float) -> tuple
     for this index) — see module docstring for why that's expected, not
     a failure.
     """
-    _hydrate_once()
+    _ensure_loaded()
     if not total_ce_oi and not total_pe_oi:
         # Upstream fetch failed / returned nothing this tick — return
         # "no change" rather than letting a single bad fetch (both totals
@@ -185,16 +174,10 @@ def record_and_diff(index: str, total_ce_oi: float, total_pe_oi: float) -> tuple
                 "baseline_ce_oi": total_ce_oi,
                 "baseline_pe_oi": total_pe_oi,
             }
-            new_state = dict(_snapshots[index])
-        else:
-            new_state = None
-            ce_change = total_ce_oi - state["baseline_ce_oi"]
-            pe_change = total_pe_oi - state["baseline_pe_oi"]
-
-    if new_state is not None:
-        _persist_daily_baseline(index, new_state)   # network call — outside the lock
-        return 0.0, 0.0
-    return ce_change, pe_change
+            return 0.0, 0.0
+        ce_change = total_ce_oi - state["baseline_ce_oi"]
+        pe_change = total_pe_oi - state["baseline_pe_oi"]
+        return ce_change, pe_change
 
 
 def record_and_diff_value(key: str, value: float) -> float:
@@ -207,9 +190,6 @@ def record_and_diff_value(key: str, value: float) -> float:
     return ce_change
 
 
-_premium_history: dict = {}   # {key: {"ce": [t-1, t-2, ...], "pe": [t-1, t-2, ...]}}
-
-
 def record_and_diff_premium(
     key: str, ce_premium: float, pe_premium: float,
 ) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
@@ -220,14 +200,16 @@ def record_and_diff_premium(
     (ce_premium_prev, ce_premium_prev2, pe_premium_prev, pe_premium_prev2).
 
     This is a separate tracker from record_and_diff() above and does NOT
-    reset at day-rollover: DORE's Premium Behaviour pillar (Stage 3)
-    needs genuine tick-to-tick history — was it falling and is now
-    rising, versus one noisy uptick — which a fixed day-open baseline
-    can't distinguish (see utils.dore_engine's Premium Behaviour
-    scoring). "prev" is the value from the immediately preceding call for
-    this key; "prev2" is the value from the call before that. Thread-
-    safe; cheap; safe to call on every Market Intelligence / F&O funnel
-    tick.
+    reset at day-rollover within a single process's RAM (DORE's Premium
+    Behaviour pillar needs genuine tick-to-tick history — was it falling
+    and is now rising, versus one noisy uptick — which a fixed day-open
+    baseline can't distinguish); a restart's REHYDRATE from Supabase,
+    however, IS gated to today's date (see _ensure_loaded()), so a
+    restart never resurrects yesterday's close as if it were live
+    intraday history. "prev" is the value from the immediately preceding
+    call for this key; "prev2" is the value from the call before that.
+    Thread-safe; cheap; safe to call on every Market Intelligence / F&O
+    funnel tick.
 
     Returns None (not 0.0) for any leg that hasn't been observed yet —
     on the first call for a key both prev/prev2 are None, on the second
@@ -236,7 +218,7 @@ def record_and_diff_premium(
     history yet"; callers already guard on `is None` rather than
     truthiness (see utils.dore_engine's premium_prev handling).
     """
-    _hydrate_once()
+    _ensure_loaded()
     with _LOCK:
         state = _premium_history.get(key, {"ce": [], "pe": []})
         ce_hist = state["ce"]
@@ -247,23 +229,81 @@ def record_and_diff_premium(
         pe_prev = pe_hist[0] if len(pe_hist) >= 1 else None
         pe_prev2 = pe_hist[1] if len(pe_hist) >= 2 else None
 
-        new_ce_hist = [float(ce_premium or 0.0)] + ce_hist[:1]
-        new_pe_hist = [float(pe_premium or 0.0)] + pe_hist[:1]
-        _premium_history[key] = {"ce": new_ce_hist, "pe": new_pe_hist}
+        _premium_history[key] = {
+            "ce": [float(ce_premium or 0.0)] + ce_hist[:1],
+            "pe": [float(pe_premium or 0.0)] + pe_hist[:1],
+        }
+        return ce_prev, ce_prev2, pe_prev, pe_prev2
 
-    _persist_premium_history(key, new_ce_hist, new_pe_hist)   # network call — outside the lock
-    return ce_prev, ce_prev2, pe_prev, pe_prev2
+
+def flush_to_supabase() -> None:
+    """
+    Batch-upsert the current in-memory state of both trackers to
+    Supabase (dore_oi_baseline / dore_premium_history) so the NEXT
+    process restart can rehydrate from here instead of starting cold.
+
+    Call this ONCE per full universe scan cycle — utils.fo_scan.
+    compute_fo_scan() is the intended (and only) caller, after both
+    top_futures_opportunities() and top_options_opportunities() have
+    finished their per-symbol record_and_diff*() calls for this cycle.
+    Runs on a background thread and returns immediately; a slow or
+    failed flush is logged, never allowed to delay or fail the scan
+    cycle that triggered it — the RAM trackers are already correct and
+    serving live reads regardless of whether this flush lands.
+    """
+    with _LOCK:
+        oi_snapshot = {k: dict(v) for k, v in _snapshots.items()}
+        premium_snapshot = {k: dict(v) for k, v in _premium_history.items()}
+
+    def _flush():
+        today_str = date.today().isoformat()
+        try:
+            from utils.supabase_client import save_oi_baseline_snapshot, save_premium_history_snapshot
+
+            oi_rows = [
+                {
+                    "key": key,
+                    "snapshot_date": state["date"].isoformat() if hasattr(state["date"], "isoformat") else today_str,
+                    "baseline_ce_oi": state.get("baseline_ce_oi", 0.0),
+                    "baseline_pe_oi": state.get("baseline_pe_oi", 0.0),
+                }
+                for key, state in oi_snapshot.items()
+            ]
+            save_oi_baseline_snapshot(oi_rows)
+
+            premium_rows = []
+            for key, state in premium_snapshot.items():
+                ce_hist = state.get("ce", [])
+                pe_hist = state.get("pe", [])
+                if not ce_hist and not pe_hist:
+                    continue
+                premium_rows.append({
+                    "key": key,
+                    "snapshot_date": today_str,
+                    "ce_h0": ce_hist[0] if len(ce_hist) >= 1 else None,
+                    "ce_h1": ce_hist[1] if len(ce_hist) >= 2 else None,
+                    "pe_h0": pe_hist[0] if len(pe_hist) >= 1 else None,
+                    "pe_h1": pe_hist[1] if len(pe_hist) >= 2 else None,
+                })
+            save_premium_history_snapshot(premium_rows)
+
+            logger.info(
+                "oi_snapshot_store: flushed %d OI-baseline key(s) and %d premium-history "
+                "key(s) to Supabase", len(oi_rows), len(premium_rows),
+            )
+        except Exception:
+            logger.exception("oi_snapshot_store: Supabase flush failed (non-fatal — RAM state unaffected)")
+
+    _flush_executor.submit(_flush)
 
 
 def reset(index: Optional[str] = None) -> None:
     """Debug/testing helper — clear the stored baseline for one index,
     or every index if none given. Not called anywhere in normal
     operation; the day-rollover check in record_and_diff() handles the
-    normal reset case on its own. In-memory only — does NOT delete the
-    corresponding persisted Supabase rows, so a later hydration in a
-    fresh process would bring the cleared state back. That's fine for
-    its actual use (tests resetting in-process state mid-run); it is
-    NOT a way to wipe persisted history."""
+    normal reset case on its own. Does NOT touch Supabase — this only
+    clears the in-process RAM cache (a restart would rehydrate right
+    back from whatever's already persisted there)."""
     with _LOCK:
         if index is None:
             _snapshots.clear()
@@ -271,36 +311,3 @@ def reset(index: Optional[str] = None) -> None:
         else:
             _snapshots.pop(index, None)
             _premium_history.pop(index, None)
-
-
-SCHEMA_SQL = """
--- Run once in Supabase -> SQL Editor.
--- One row per (key, kind): kind='daily_baseline' rows back
--- record_and_diff()'s day-open OI baseline; kind='premium_history' rows
--- back record_and_diff_premium()'s tick-to-tick history. Both are
--- write-through persisted on every update (see utils/oi_snapshot_store.py's
--- module docstring for why this exists: without it, a mid-day process
--- restart loses the day's OI buildup and forces Premium Behaviour to a
--- fixed UNCONFIRMED=40 score until a fresh poll cycle re-establishes
--- prev/prev2 from scratch).
-create table if not exists oi_snapshot_state (
-    key             text not null,
-    kind            text not null,        -- 'daily_baseline' | 'premium_history'
-    baseline_date   date,                 -- daily_baseline only
-    baseline_ce_oi  numeric(18,2),
-    baseline_pe_oi  numeric(18,2),
-    ce_history      jsonb,                -- premium_history only: [t-1, t-2]
-    pe_history      jsonb,
-    updated_at      timestamptz not null default now(),
-    primary key (key, kind)
-);
-create index if not exists idx_oi_snapshot_state_kind on oi_snapshot_state(kind);
-
--- Idempotent migration for an existing table created with the old
--- single-column `key text primary key` (pre-2026-07-28 fix): the two
--- trackers sharing one symbol name (e.g. both "NIFTY") would silently
--- overwrite each other's row under that PK. Run this once if you
--- already created the table before this migration existed.
--- ALTER TABLE oi_snapshot_state DROP CONSTRAINT IF EXISTS oi_snapshot_state_pkey;
--- ALTER TABLE oi_snapshot_state ADD PRIMARY KEY (key, kind);
-"""
