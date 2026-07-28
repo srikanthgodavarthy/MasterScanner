@@ -467,7 +467,7 @@ def compute_rotation_metrics(history: pd.DataFrame, today_stats: pd.DataFrame,
         })
 
     out = pd.DataFrame(rows, columns=cols)
-    return out.sort_values("Mom20D", ascending=False).reset_index(drop=True)
+    return out.sort_values("BreadthScore", ascending=False, na_position="last").reset_index(drop=True)
 
 
 def compute_rotation_timeline(history: pd.DataFrame, n_snapshots: int = 5, top_n: int = 5) -> dict:
