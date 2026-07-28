@@ -1560,68 +1560,115 @@ def delete_portfolio_position(position_id) -> bool:
         return False
 
 
-def upsert_rotate_flags(rows: list[dict]) -> dict[str, str]:
+# ─── DORE OI / PREMIUM BASELINE (RAM-cache persistence) ───────────────────────
+#
+# Backs utils.oi_snapshot_store's RAM-resident trackers. That module's own
+# docstring flagged this exact gap: "on a fresh process restart mid-day, the
+# baseline re-seeds from whatever snapshot comes in first (losing the
+# morning's buildup)... would need a persisted (e.g. Supabase) baseline to
+# survive restarts." These two table pairs are that persistence layer.
+#
+# Both are written in ONE BATCH UPSERT per scan cycle (oi_snapshot_store.
+# flush_to_supabase(), called once from utils.fo_scan.compute_fo_scan()
+# after a full universe pass) — never per-symbol — so this never adds
+# per-symbol Supabase latency to the DORE funnel's hot loop. Reads happen
+# once per process lifetime (lazy-loaded on first use), not once per call.
+
+def save_oi_baseline_snapshot(rows: list[dict]) -> bool:
     """
-    Persist the date each currently-ROTATE-flagged symbol was FIRST
-    recommended to rotate into its CURRENT target.
+    Batch-upsert today's OI baseline rows (one per index/key tracked by
+    utils.oi_snapshot_store.record_and_diff()) into dore_oi_baseline.
 
-    ``rows`` is the full set of ROTATE-flagged positions this render, each
-    ``{"symbol": ..., "rotate_target": ...}``. For every symbol: if a stored
-    row already exists with the SAME rotate_target, its original
-    first_flagged_at is kept; otherwise (no stored row, or the target
-    changed — a different swap candidate now scores better) this counts as
-    a fresh flag and first_flagged_at is stamped as now.
+    rows: [{"key": ..., "snapshot_date": "YYYY-MM-DD",
+            "baseline_ce_oi": ..., "baseline_pe_oi": ...}, ...]
 
-    Returns {symbol: first_flagged_at_iso} for every row passed in. Falls
-    back to "now" per symbol if Supabase is unavailable, so the caller
-    always has something to display even without persistence.
+    Returns True on success (or a no-op empty `rows`), False only on an
+    actual failure — mirrors save_sector_snapshot()'s contract so a
+    failed flush is logged but never raises into the scan loop.
     """
-    now_iso = datetime.now(timezone.utc).isoformat()
-    clean = [
-        {"symbol": r["symbol"].upper().strip(), "rotate_target": (r.get("rotate_target") or "").upper().strip()}
-        for r in rows if r.get("symbol")
-    ]
-    if not clean:
-        return {}
-
+    if not rows:
+        return True
     client = get_client()
     if client is None:
-        return {r["symbol"]: now_iso for r in clean}
-
-    symbols = [r["symbol"] for r in clean]
+        return False
     try:
-        resp = (
-            client.table("portfolio_rotate_flags")
-            .select("symbol, rotate_target, first_flagged_at")
-            .in_("symbol", symbols)
-            .execute()
-        )
-        existing = {row["symbol"]: row for row in (resp.data or [])}
+        resp = client.table("dore_oi_baseline").upsert(rows, on_conflict="key").execute()
+        if resp.data is None:
+            logger.error("dore_oi_baseline upsert returned no data.")
+            return False
+        return True
     except Exception as exc:
-        logger.error("upsert_rotate_flags: load existing failed: %s", exc)
-        existing = {}
+        logger.error("save_oi_baseline_snapshot failed: %s", exc)
+        return False
 
-    out: dict[str, str] = {}
-    upserts = []
-    for r in clean:
-        sym, target = r["symbol"], r["rotate_target"]
-        prev = existing.get(sym)
-        if prev and (prev.get("rotate_target") or "").upper() == target:
-            first_flagged = prev["first_flagged_at"]
-        else:
-            first_flagged = now_iso
-        out[sym] = first_flagged
-        upserts.append({
-            "symbol": sym, "rotate_target": target,
-            "first_flagged_at": first_flagged, "updated_at": now_iso,
-        })
 
+def load_oi_baseline_snapshots() -> list[dict]:
+    """
+    Returns every persisted OI-baseline row as a list of dicts (empty
+    list if Supabase is unavailable or the table is empty/missing) —
+    utils.oi_snapshot_store filters these down to today's date itself,
+    the same day-rollover rule record_and_diff() already applies, so a
+    stale (yesterday's) row never gets treated as today's baseline.
+    """
+    client = get_client()
+    if client is None:
+        return []
     try:
-        client.table("portfolio_rotate_flags").upsert(upserts, on_conflict="symbol").execute()
+        resp = client.table("dore_oi_baseline").select(
+            "key, snapshot_date, baseline_ce_oi, baseline_pe_oi"
+        ).execute()
+        return resp.data or []
     except Exception as exc:
-        logger.error("upsert_rotate_flags: upsert failed: %s", exc)
+        logger.warning("load_oi_baseline_snapshots failed (non-fatal — starts cold): %s", exc)
+        return []
 
-    return out
+
+def save_premium_history_snapshot(rows: list[dict]) -> bool:
+    """
+    Batch-upsert the last-two-polls premium history (one row per
+    key tracked by utils.oi_snapshot_store.record_and_diff_premium())
+    into dore_premium_history.
+
+    rows: [{"key": ..., "snapshot_date": "YYYY-MM-DD",
+            "ce_h0": ..., "ce_h1": ..., "pe_h0": ..., "pe_h1": ...}, ...]
+    ("h0" = most recent poll, "h1" = the one before that.)
+    """
+    if not rows:
+        return True
+    client = get_client()
+    if client is None:
+        return False
+    try:
+        resp = client.table("dore_premium_history").upsert(rows, on_conflict="key").execute()
+        if resp.data is None:
+            logger.error("dore_premium_history upsert returned no data.")
+            return False
+        return True
+    except Exception as exc:
+        logger.error("save_premium_history_snapshot failed: %s", exc)
+        return False
+
+
+def load_premium_history_snapshots() -> list[dict]:
+    """
+    Returns every persisted premium-history row as a list of dicts
+    (empty list if Supabase is unavailable/empty). Same same-day guard
+    as load_oi_baseline_snapshots() — utils.oi_snapshot_store only
+    rehydrates rows whose snapshot_date is today, since a prior
+    session's close-to-open premium jump isn't genuine intraday
+    "Premium Behaviour" evidence (see that module's docstring).
+    """
+    client = get_client()
+    if client is None:
+        return []
+    try:
+        resp = client.table("dore_premium_history").select(
+            "key, snapshot_date, ce_h0, ce_h1, pe_h0, pe_h1"
+        ).execute()
+        return resp.data or []
+    except Exception as exc:
+        logger.warning("load_premium_history_snapshots failed (non-fatal — starts cold): %s", exc)
+        return []
 
 
 # ─── SCHEMA SQL ───────────────────────────────────────────────────────────────
@@ -1998,19 +2045,43 @@ ALTER TABLE portfolio_positions ADD COLUMN IF NOT EXISTS last_added_at timestamp
 ALTER TABLE portfolio_positions ADD COLUMN IF NOT EXISTS add_reason text;
 """
 
+# Append DORE OI/premium baseline persistence SQL to the canonical SCHEMA_SQL
+# for easy copy-paste. See utils/oi_snapshot_store.py's module docstring —
+# this is the fix for its documented "loses the morning's buildup on a
+# restart" limitation.
 SCHEMA_SQL += """
--- 9. Portfolio Rotate Flags — pages/portfolio.py's _apply_rotation()
---    recomputes ROTATE/rotate_target fresh on every render (pure function
---    of the current scan + current holdings), so there was previously no
---    record of WHEN a rotate recommendation first appeared. This table
---    is the single row of truth per symbol for that date: first_flagged_at
---    is set once and kept forever as long as rotate_target doesn't change;
---    a different target (the swap candidate changed) counts as a fresh
---    flag and resets the date. See upsert_rotate_flags() below.
-CREATE TABLE IF NOT EXISTS portfolio_rotate_flags (
-    symbol            text        PRIMARY KEY,
-    rotate_target     text        NOT NULL DEFAULT '',
-    first_flagged_at  timestamptz NOT NULL,
-    updated_at        timestamptz NOT NULL DEFAULT now()
+-- 9. DORE OI baseline — one row per index/stock key tracked by
+--    utils.oi_snapshot_store.record_and_diff(). "baseline_ce_oi"/
+--    "baseline_pe_oi" are that key's FIRST-observed chain-wide OI totals
+--    for `snapshot_date`; every later poll's ce_oi_change/pe_oi_change is
+--    (current total - this baseline). UNIQUE key means
+--    save_oi_baseline_snapshot() always upserts one row per key,
+--    refined as the day's baseline gets (re-)established, rather than
+--    accumulating a row per poll.
+CREATE TABLE IF NOT EXISTS dore_oi_baseline (
+    key              text        PRIMARY KEY,
+    snapshot_date    date        NOT NULL,
+    baseline_ce_oi   numeric     NOT NULL DEFAULT 0,
+    baseline_pe_oi   numeric     NOT NULL DEFAULT 0,
+    updated_at       timestamptz NOT NULL DEFAULT now()
+);
+
+-- 10. DORE premium history — one row per index/stock key tracked by
+--     utils.oi_snapshot_store.record_and_diff_premium(). ce_h0/pe_h0 are
+--     the most recent poll's ATM premium for that leg; ce_h1/pe_h1 are
+--     the poll before that — exactly the two values Stage 3.5's Premium
+--     Behaviour pillar needs as ce_premium_prev/ce_premium_prev2 (and
+--     the PE mirrors). Gated to `snapshot_date` = today on read (see
+--     load_premium_history_snapshots()) so a restart doesn't resurrect
+--     yesterday's close-to-open jump as if it were live intraday
+--     evidence.
+CREATE TABLE IF NOT EXISTS dore_premium_history (
+    key              text        PRIMARY KEY,
+    snapshot_date    date        NOT NULL,
+    ce_h0            numeric,
+    ce_h1            numeric,
+    pe_h0            numeric,
+    pe_h1            numeric,
+    updated_at       timestamptz NOT NULL DEFAULT now()
 );
 """
