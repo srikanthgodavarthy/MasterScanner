@@ -643,7 +643,42 @@ def render(settings: dict | None = None):
         unsafe_allow_html=True,
     )
 
+    # ── Load last completed scan from Supabase on first render ───────
+    # [2026-07-28 fix] This tab previously only read st.session_state
+    # ["scan_df"] — which is only ever set inside pages/scanner.py's
+    # `if run_btn:` block, or (as of the same-day fix there) its own
+    # Supabase-load-on-first-render block. Since st.navigation only
+    # executes the currently-selected page, landing on "Pre-Breakout
+    # Scanner" directly (without visiting "Live Scanner" first in this
+    # browser session) meant scan_df was never set here at all — "No
+    # scan data" even with a completed scan sitting in Supabase.
+    # Mirrors pages/scanner.py's fix: load the latest live_scanner
+    # snapshot once per session if scan_df isn't already present.
+    if "scan_df" not in st.session_state:
+        from utils.supabase_client import _is_available
+        if _is_available():
+            from utils.scan_state import load_snapshot_payload
+            _snap = load_snapshot_payload("live_scanner")
+            if _snap:
+                _records = (_snap.get("payload") or {}).get("data", [])
+                if _records:
+                    st.session_state["scan_df"]      = pd.DataFrame(_records)
+                    st.session_state["last_scan_df"] = st.session_state["scan_df"]
+                    _created_at = _snap.get("created_at", "")
+                    if _created_at:
+                        from utils.time_utils import IST as _IST
+                        st.session_state["scan_time"] = (
+                            pd.to_datetime(_created_at).tz_convert(_IST).strftime("%Y-%m-%d %H:%M:%S")
+                        )
+                    st.session_state["scan_loaded_from_db"] = True
+
     df_aug = st.session_state.get("scan_df", pd.DataFrame())
+
+    _last_scan_stamp = st.session_state.get("scan_time", "")
+    if _last_scan_stamp:
+        _stamp_label = ("Last scan (from DB)" if st.session_state.get("scan_loaded_from_db")
+                         else "Last scan")
+        st.caption(f"{_stamp_label}: **{_last_scan_stamp} IST**")
 
     if df_aug.empty:
         st.markdown(
