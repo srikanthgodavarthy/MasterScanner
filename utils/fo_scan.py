@@ -55,4 +55,18 @@ def compute_fo_scan() -> dict:
         safe = df.astype(object).where(pd.notnull(df), None)
         return safe.to_dict("records")
 
-    return {"futures": _records(fut_df), "options": _records(opt_df)}
+    result = {"futures": _records(fut_df), "options": _records(opt_df)}
+
+    # [2026-07-28] Flush this cycle's OI-baseline/premium-history state to
+    # Supabase — ONCE here, after both passes' per-symbol record_and_diff*()
+    # calls are done, never per-symbol. See utils.oi_snapshot_store's module
+    # docstring for why this exists (fixes the "loses history on restart"
+    # gap) and why it's safe to call unconditionally: it's fire-and-forget
+    # on a background thread and never raises.
+    try:
+        from utils.oi_snapshot_store import flush_to_supabase
+        flush_to_supabase()
+    except Exception:
+        logger.exception("compute_fo_scan: oi_snapshot_store flush failed to even schedule")
+
+    return result
