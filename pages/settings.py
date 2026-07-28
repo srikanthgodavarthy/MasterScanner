@@ -890,6 +890,7 @@ def _tab_system() -> None:
         "scanner":      "📡 Scanner (Decision Engine)",
         "five_pillars": "🏛️ Five Pillars",
         "cci_master":   "📐 CCI Master",
+        "pre_breakout": "🎯 Pre-Breakout",
     }
     _cur_engine = _g("bt_default_engine", "scanner")
     _engine_choice = st.selectbox(

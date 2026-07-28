@@ -80,23 +80,26 @@ def _symbols_from_source(source: str, settings: dict | None) -> tuple[list[str],
         syms = sorted(sub[sc].dropna().unique().tolist()) if sc else default_syms
         return (syms or default_syms), "Execute"
 
-    if source == "📐 Fib Pullback (Scanner)":
+    if source == "🎯 Pre-Breakout (Scanner)":
         if scan_df.empty:
             st.warning("⚠️ No scanner data — run the Live Scanner first, then return here.", icon="⚠️")
             return default_syms, "All"
-        # Reproduce _is_fib_pullback logic
-        def _is_fib(row):
-            trend_up  = bool(row.get("_trend_up", False)) or (
+        # Reproduce pages/scanner.py's _is_pre_breakout() exactly (renamed
+        # from _is_fib_pullback 2026-07-27 — trend_up + golden-zone + CCI
+        # is no longer this tab's criteria at all, it's squeeze + RSI band).
+        def _is_pre_breakout(row):
+            trend_up = bool(row.get("_trend_up", False)) or (
                 str(row.get("TrendPhase", "NONE")).upper() != "NONE"
             )
-            in_golden = bool(row.get("_in_golden", False)) or bool(row.get("_in_golden_relaxed", False))
-            cci_val   = float(row.get("CCI") or row.get("_cci_raw") or 0)
-            return trend_up and in_golden and cci_val <= -100
-        sub = scan_df[scan_df.apply(_is_fib, axis=1)]
+            squeeze_on      = bool(row.get("_squeeze_on", False))
+            squeeze_release = bool(row.get("_squeeze_release", False))
+            rsi_val = float(row.get("_rsi") or row.get("RSI") or 0)
+            return trend_up and (squeeze_on or squeeze_release) and 45 <= rsi_val <= 70
+        sub = scan_df[scan_df.apply(_is_pre_breakout, axis=1)]
         sc = _sym_col(sub)
         syms = sorted(sub[sc].dropna().unique().tolist()) if sc else default_syms
         if not syms:
-            st.info("📐 No Fib Pullback stocks in current scan. Using default symbols.")
+            st.info("🎯 No Pre-Breakout stocks in current scan. Using default symbols.")
             return default_syms, "All"
         return syms, "All"
 
@@ -129,7 +132,7 @@ def render(settings=None):
         "Custom",
         "🌟 Elite (Scanner)",
         "⚡ Execute (Scanner)",
-        "📐 Fib Pullback (Scanner)",
+        "🎯 Pre-Breakout (Scanner)",
         "🏛️ Five Pillars",
         "📐 CCI Master",
     ]
@@ -137,7 +140,7 @@ def render(settings=None):
         "Custom":                    "Manually pick symbols — uses full scanner engine.",
         "🌟 Elite (Scanner)":        "Scanner engine · symbols from Elite Opportunity tab of last scan.",
         "⚡ Execute (Scanner)":      "Scanner engine · symbols from High Conviction / Actionable tab of last scan.",
-        "📐 Fib Pullback (Scanner)": "Scanner engine · Fib Pullback stocks (trend-up + golden zone + CCI ≤ −100) from last scan.",
+        "🎯 Pre-Breakout (Scanner)": "Pre-Breakout engine · entry on trend_up + (squeeze_on or squeeze_release) + RSI 45-70, walked bar-by-bar over each symbol's full history — not just today's scan hit.",
         "🏛️ Five Pillars":           "Five Pillars engine · entry when FP score crosses ≥ 90 (Execute class), exit < 65.",
         "📐 CCI Master":             "CCI Master engine · entry on CCI crossover from oversold, exit on crossunder 0/OB.",
     }
@@ -145,7 +148,7 @@ def render(settings=None):
         "Custom":                    "",
         "🌟 Elite (Scanner)":        "<span style='background:#1a2a00;color:#ffd700;border:1px solid #ffd700;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>engine: scanner</span>",
         "⚡ Execute (Scanner)":      "<span style='background:#001a12;color:#22c55e;border:1px solid #22c55e;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>engine: scanner</span>",
-        "📐 Fib Pullback (Scanner)": "<span style='background:#0a1628;color:#58a6ff;border:1px solid #58a6ff;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>engine: scanner</span>",
+        "🎯 Pre-Breakout (Scanner)": "<span style='background:#1a0a28;color:#a371f7;border:1px solid #a371f7;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>engine: pre_breakout · squeeze+RSI 45-70 → entry</span>",
         "🏛️ Five Pillars":           "<span style='background:#1a1200;color:#d29922;border:1px solid #d29922;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>engine: five_pillars · FP ≥ 90 → entry</span>",
         "📐 CCI Master":             "<span style='background:#001a1a;color:#00e676;border:1px solid #00e676;border-radius:4px;padding:1px 7px;font-size:0.72rem;'>engine: cci_master · BUY crossover → entry</span>",
     }
@@ -154,7 +157,7 @@ def render(settings=None):
         "scanner":      "Custom",
         "five_pillars": "🏛️ Five Pillars",
         "cci_master":   "📐 CCI Master",
-        "fib_pullback": "📐 Fib Pullback (Scanner)",
+        "pre_breakout": "🎯 Pre-Breakout (Scanner)",
     }
     _default_source = _ENGINE_TO_SOURCE.get((settings or {}).get("bt_default_engine", "scanner"), "Custom")
 
@@ -297,7 +300,7 @@ def render(settings=None):
             "Custom":                    "<b style='color:#94a3b8'>Custom</b>",
             "🌟 Elite (Scanner)":        "<b style='color:#ffd700'>Elite (Scanner)</b>",
             "⚡ Execute (Scanner)":      "<b style='color:#22c55e'>Execute (Scanner)</b>",
-            "📐 Fib Pullback (Scanner)": "<b style='color:#58a6ff'>Fib Pullback (Scanner)</b>",
+            "🎯 Pre-Breakout (Scanner)": "<b style='color:#a371f7'>Pre-Breakout (Scanner)</b>",
             "🏛️ Five Pillars":           "<b style='color:#d29922'>Five Pillars</b>",
             "📐 CCI Master":             "<b style='color:#00e676'>CCI Master</b>",
         }
@@ -346,7 +349,7 @@ def render(settings=None):
             "Custom":                    "scanner",
             "🌟 Elite (Scanner)":        "scanner",
             "⚡ Execute (Scanner)":      "scanner",
-            "📐 Fib Pullback (Scanner)": "scanner",
+            "🎯 Pre-Breakout (Scanner)": "pre_breakout",
             "🏛️ Five Pillars":           "five_pillars",
             "📐 CCI Master":             "cci_master",
         }
@@ -455,7 +458,7 @@ def render(settings=None):
             _src_hints = {
                 "🌟 Elite (Scanner)":        " — Only Elite Opportunity stocks from your last scan were tested.",
                 "⚡ Execute (Scanner)":      " — Only Execute/High Conviction stocks from your last scan were tested.",
-                "📐 Fib Pullback (Scanner)": " — Only Fib Pullback stocks from your last scan were tested.",
+                "🎯 Pre-Breakout (Scanner)": " — Only Pre-Breakout stocks from your last scan were tested.",
                 "🏛️ Five Pillars":           " — Only Execute+Watch FP_Class stocks from your last scan were tested.",
                 "📐 CCI Master":             " — Only STRONG BUY+BUY rated stocks from the last CCI Master scan were tested.",
             }
