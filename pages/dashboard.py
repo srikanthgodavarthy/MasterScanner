@@ -2367,7 +2367,7 @@ def _nse_top_gainers_html(df_aug: pd.DataFrame, top_n: int = 5) -> str:
         rows_html += (
             "<tr>"
             f"<td style='color:#8b949e;'>{i}</td>"
-            f'<td><span class="sr-sector-name" style="font-weight:700;">{symbol}</span></td>'
+            f'<td><span class="sr-sector-name" style="font-weight:700;">{_tv_link(str(symbol)) if symbol != "—" else symbol}</span></td>'
             f"<td>{f'{ltp:,.2f}' if ltp is not None else '—'}</td>"
             f'<td class="{"sr-pos" if chg >= 0 else "sr-neg"}">{"+" if chg >= 0 else ""}{chg:.2f}%</td>'
             f"<td>{f'{vr:.1f}x' if vr is not None else '—'}</td>"
