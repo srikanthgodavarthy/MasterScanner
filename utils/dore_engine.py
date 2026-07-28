@@ -257,6 +257,11 @@ class TradePlan:
     target1:    float = 0.0
     target2:    float = 0.0
     target3:    float = 0.0
+    # True when one or more targets were pulled in below their fixed
+    # 1.5x/3x/5x-of-stop multiple because a real OI wall sits closer than
+    # that — see build_trade_plan()'s technical_target handling.
+    wall_capped: bool = False
+    reasons: tuple = ()
 
     @property
     def risk_per_unit(self) -> float:
@@ -280,6 +285,7 @@ def build_trade_plan(
     direction: Optional[str],
     strike_type: Optional[str] = None,
     itm_steps: int = 0,
+    technical_target: Optional[float] = None,
 ) -> TradePlan:
     """Premium-denominated TradePlan. A BUY_CE/BUY_PE recommendation
     trades the OPTION, not the underlying — so Entry/Stop/Targets must
@@ -318,6 +324,25 @@ def build_trade_plan(
     that haven't run Stage 5b yet (e.g. the Risk Engine's own preliminary
     R:R read, before strike selection exists) can omit these and get the
     same ATM-assumption plan as before.
+
+    technical_target — the nearest OI wall in UNDERLYING price terms
+    (Stage 3's `resistance` for CE, `support` for PE — same value
+    `compute_dore` already computes for its `technical_target` local and
+    feeds into Stage 3.5's Expected Move Coverage). Targets were
+    previously ALWAYS a fixed 1.5x/3x/5x multiple of the stop distance,
+    never anchored to anything on the chart — Expected Move Coverage was
+    computed in Stage 3.5 but only used for scoring, never fed back here.
+    When supplied, the underlying-space distance to that wall is scaled
+    into an equivalent premium move (same delta-scaling as the stop
+    above) and used to CAP — never stretch — each target: a wall closer
+    than the fixed multiple pulls that target in; a wall further away
+    changes nothing, since "the wall is far" isn't a reason to aim
+    further than the stop-based multiple already does. A wall sitting
+    too close to usefully cap anything (closer than 1.2x the stop
+    distance) is ignored rather than collapsing targets into an
+    unviable R:R — that scenario already shows up as a low corridor
+    score in Stage 3, this just avoids compounding it with a broken
+    trade plan too.
     """
     if direction not in ("CE", "PE"):
         return TradePlan(direction=None)
@@ -347,9 +372,34 @@ def build_trade_plan(
     # other around the underlying's price.
     entry = premium
     stop_loss = max(entry - stop_dist, entry * 0.05)   # never quote a stop that's ~0
-    target1 = entry + stop_dist * 1.5
-    target2 = entry + stop_dist * 3.0
-    target3 = entry + stop_dist * 5.0
+
+    target1_dist = stop_dist * 1.5
+    target2_dist = stop_dist * 3.0
+    target3_dist = stop_dist * 5.0
+
+    reasons: list[str] = []
+    wall_capped = False
+    if technical_target and inp.price:
+        wall_dist_underlying = abs(technical_target - inp.price)
+        wall_dist_premium = wall_dist_underlying * delta_mag
+        wall_floor = stop_dist * 1.2   # keep a viable R:R even when a wall sits close
+        if wall_dist_premium > wall_floor:
+            capped_any = (wall_dist_premium < target1_dist or wall_dist_premium < target2_dist
+                          or wall_dist_premium < target3_dist)
+            target1_dist = min(target1_dist, wall_dist_premium)
+            target2_dist = min(target2_dist, wall_dist_premium)
+            target3_dist = min(target3_dist, wall_dist_premium)
+            if capped_any:
+                wall_capped = True
+                reasons.append(f"Target(s) capped by nearest OI wall @{technical_target:.0f} "
+                                f"(~{wall_dist_underlying:.1f} underlying / ~{wall_dist_premium:.2f} premium away)")
+        else:
+            reasons.append(f"OI wall @{technical_target:.0f} too close (~{wall_dist_premium:.2f} premium) "
+                            f"to usefully anchor targets — kept fixed-multiple targets")
+
+    target1 = entry + target1_dist
+    target2 = entry + target2_dist
+    target3 = entry + target3_dist
 
     return TradePlan(
         direction=direction,
@@ -358,6 +408,8 @@ def build_trade_plan(
         target1=round(target1, 2),
         target2=round(target2, 2),
         target3=round(target3, 2),
+        wall_capped=wall_capped,
+        reasons=tuple(reasons),
     )
 
 
@@ -618,6 +670,11 @@ class ExecutionResult:
     execution_score: float
     execution_state: str
     reasons: tuple = ()
+    # Out of 6 possible components (EMA cross, VWAP, ORB, compression,
+    # volume, ATR expansion). Missing VWAP/ORB data drops the count to 4
+    # rather than silently scoring those components at neutral-50 — see
+    # the vwap_available/orb_available handling above.
+    components_used: int = 6
 
 
 @dataclass(frozen=True)
@@ -1041,7 +1098,8 @@ def stage2_execution_engine(
         cross_score = 50.0
 
     # VWAP reclaim/rejection
-    if inp.vwap > 0 and inp.price > 0:
+    vwap_available = inp.vwap > 0 and inp.price > 0
+    if vwap_available:
         if want_bull:
             vwap_score = 100.0 if inp.price > inp.vwap else 20.0
             reasons.append("Price above VWAP" if inp.price > inp.vwap else "Price below VWAP — bullish intent unconfirmed")
@@ -1052,10 +1110,11 @@ def stage2_execution_engine(
             vwap_score = 50.0
     else:
         vwap_score = 50.0
-        reasons.append("VWAP not supplied — check skipped (neutral)")
+        reasons.append("VWAP not supplied — excluded from Execution Score (not scored as neutral)")
 
     # Opening-range breakout/breakdown
-    if inp.orb_high > 0 and inp.orb_low > 0 and inp.price > 0:
+    orb_available = inp.orb_high > 0 and inp.orb_low > 0 and inp.price > 0
+    if orb_available:
         if want_bull:
             orb_score = 100.0 if inp.price > inp.orb_high else (60.0 if inp.price > inp.orb_low else 30.0)
             reasons.append("Price through opening-range high (ORB)" if inp.price > inp.orb_high
@@ -1068,7 +1127,7 @@ def stage2_execution_engine(
             orb_score = 50.0
     else:
         orb_score = 50.0
-        reasons.append("Opening range not supplied — ORB check skipped (neutral)")
+        reasons.append("Opening range not supplied — excluded from Execution Score (not scored as neutral)")
 
     # Compression -> expansion (NR7 etc.) — a coiled range about to
     # release is READY-adjacent regardless of direction; it's the
@@ -1088,14 +1147,25 @@ def stage2_execution_engine(
                                       cfg.execution_atr_expansion_min_pct * 1.5)
     reasons.append(f"Intraday ATR Expansion={inp.intraday_atr_expansion_pct:.1f}%")
 
-    execution_score = _weighted([
+    execution_score_parts = [
         (cross_score,           cfg.w_exec_ema_cross),
-        (vwap_score,            cfg.w_exec_vwap),
-        (orb_score,             cfg.w_exec_orb),
         (compression_score,     cfg.w_exec_compression),
         (volume_score,          cfg.w_exec_volume_expansion),
         (atr_expansion_score,   cfg.w_exec_atr_expansion),
-    ])
+    ]
+    # Only fold VWAP/ORB into the average when the underlying data was
+    # actually supplied. Including them at a forced neutral-50 when
+    # missing structurally caps Execution Score below READY_NOW even on
+    # a genuinely strong directional setup — see oi_snapshot_store.py's
+    # docstring for the same "don't silently treat no-data as neutral"
+    # principle applied to premium history.
+    if vwap_available:
+        execution_score_parts.append((vwap_score, cfg.w_exec_vwap))
+    if orb_available:
+        execution_score_parts.append((orb_score, cfg.w_exec_orb))
+
+    execution_score = _weighted(execution_score_parts)
+    execution_score_components_used = len(execution_score_parts)
 
     if execution_score >= cfg.execution_ready_min:
         state = READY_NOW
@@ -1110,8 +1180,8 @@ def stage2_execution_engine(
     #    Score=25" into "here are the specific triggers that did/didn't
     #    fire", so a WATCH/NOT_READY read is traceable to a named
     #    condition instead of only the blended total.
-    vwap_supplied = inp.vwap > 0 and inp.price > 0
-    orb_supplied = inp.orb_high > 0 and inp.orb_low > 0 and inp.price > 0
+    vwap_supplied = vwap_available
+    orb_supplied = orb_available
     has_direction = want_bull or want_bear
 
     if not has_direction:
@@ -1155,7 +1225,8 @@ def stage2_execution_engine(
     )
     logger.debug("[DORE:%s] Stage2 reasons=%s", inp.symbol, reasons)
     reasons += _gate_lines(checks)
-    return ExecutionResult(execution_score=execution_score, execution_state=state, reasons=tuple(reasons))
+    return ExecutionResult(execution_score=execution_score, execution_state=state, reasons=tuple(reasons),
+                            components_used=execution_score_components_used)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1938,7 +2009,8 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     # at the end of the pipeline that produces the recommendation, not
     # before strike selection exists). This is the plan that ships in the
     # DOREResult; the preliminary one above only ever fed Stage 4's gate.
-    trade_plan = build_trade_plan(inp, cfg, direction, strike_type=strike_type, itm_steps=itm_steps)
+    trade_plan = build_trade_plan(inp, cfg, direction, strike_type=strike_type, itm_steps=itm_steps,
+                                   technical_target=technical_target)
 
     warnings = list(risk.warnings) + list(oi_intel.warnings)
     if effective_bias.override_active:
@@ -1952,7 +2024,8 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         warnings.append("Premium Behaviour not confirmed — option premium hasn't started strengthening yet")
 
     reasons = (list(trend.reasons) + list(effective_bias.reasons) + list(execution.reasons) + list(deriv.reasons)
-               + list(oi_intel.reasons) + list(risk.reasons) + list(opportunity.reasons) + strike_reasons)
+               + list(oi_intel.reasons) + list(risk.reasons) + list(opportunity.reasons) + strike_reasons
+               + list(trade_plan.reasons))
 
     result = DOREResult(
         recommendation=opportunity.recommendation,
