@@ -50,3 +50,38 @@ def fetch_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> pd.Dat
         return df[["open", "high", "low", "close", "volume"]]
     except Exception:
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_previous_close(symbol: str) -> float | None:
+    """
+    Authoritative previous-close for a symbol, straight from yfinance's
+    fast_info — the same reference brokers use for "today's change %".
+
+    [2026-07-28] Added because deriving "previous close" from
+    fetch_ohlcv()'s history() array (df["close"].iloc[-2]) can be wrong
+    around a dividend: history() is fetched with auto_adjust=True, which
+    retroactively rescales OLDER closes for any dividend declared since —
+    but the CURRENT day's still-live intraday bar isn't adjusted (there's
+    nothing to adjust it for yet). On/around an ex-dividend date this
+    produces a same-symbol comparison between an adjusted prior close and
+    an unadjusted live price, throwing "today's %" off by roughly the
+    dividend's size — reported live for BEML. fast_info.previous_close
+    is Yahoo's own reference value, independent of that history-array
+    adjustment, so it doesn't have this failure mode.
+
+    Returns None on any failure — callers should fall back to the
+    history-array method rather than error out.
+    """
+    try:
+        fi = yf.Ticker(f"{symbol}.NS").fast_info
+        for key in ("previous_close", "previousClose"):
+            try:
+                val = fi[key]
+            except (KeyError, TypeError):
+                val = getattr(fi, key, None)
+            if val is not None and val == val:  # not NaN
+                return float(val)
+        return None
+    except Exception:
+        return None
