@@ -56,7 +56,7 @@ from utils.exit_intelligence_engine import (
 )
 from utils.adaptive_target_engine import compute_adaptive_targets
 from utils.lifecycle_engine import STAGE_META
-from utils.market_data import fetch_ohlcv  # lightweight — no scanner/NSE-universe import cost
+from utils.market_data import fetch_ohlcv, fetch_previous_close  # lightweight — no scanner/NSE-universe import cost
 
 from utils.time_utils import now_ist as _now_ist, today_ist as _today_ist, IST as _IST
 
@@ -688,22 +688,25 @@ def _compute_row(pos: dict, cfg: ExitIntelligenceConfig, live_metrics: pd.DataFr
         display_action = result.action
 
     # ── Today's P&L (prior close vs LTP) ──
-    # [2026-07-28 fix] `if prev_close else 0.0` only guarded against
-    # prev_close being exactly 0/None — a NaN close (a data gap/holiday
-    # row for one symbol, e.g. DLF) is truthy in Python, so it sailed
-    # through, made today_pnl/today_pct NaN for that one row, and then
-    # poisoned the portfolio-wide `sum(r["today_pnl"] for r in rows)` —
-    # turning the whole Today's P&L KPI into NaN, not just that row.
-    # Walk back further for the nearest valid close instead of a bare
-    # iloc[-2]; if nothing valid is found, fall back to today's own
-    # price (today_pnl becomes 0 for that symbol only, never NaN).
-    _closes = df["close"]
-    prev_close = result.price
-    for _i in range(2, min(len(_closes), 6) + 1):
-        _cand = _closes.iloc[-_i]
-        if pd.notna(_cand):
-            prev_close = float(_cand)
-            break
+    # [2026-07-28] Primary source is fetch_previous_close() — Yahoo's own
+    # fast_info reference close, immune to the auto_adjust dividend-
+    # adjustment mismatch that can throw off history()'s iloc[-2] on/
+    # around an ex-dividend date (see fetch_previous_close()'s docstring
+    # — this was making BEML's "Today's %" wrong). Falls back to walking
+    # the history array (skipping NaN gaps, e.g. a holiday row) only if
+    # the fast_info call itself fails; if neither works, defaults to
+    # result.price so today_pnl/today_pct come out 0 for that symbol
+    # only, never NaN (a single bad row must not poison the portfolio-
+    # wide sum() below).
+    prev_close = fetch_previous_close(symbol)
+    if prev_close is None:
+        _closes = df["close"]
+        prev_close = result.price
+        for _i in range(2, min(len(_closes), 6) + 1):
+            _cand = _closes.iloc[-_i]
+            if pd.notna(_cand):
+                prev_close = float(_cand)
+                break
     today_pnl = (result.price - prev_close) * qty
     today_pct = ((result.price - prev_close) / prev_close * 100) if prev_close else 0.0
 
