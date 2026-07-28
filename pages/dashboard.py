@@ -3337,40 +3337,15 @@ def render(settings: dict | None = None):
     except Exception:
         logger.exception("Sector Rotation persistence (load) failed (non-fatal)")
 
-    # 2026-07-23: the live Nifty-regime computation that used to live here
-    # (fetch_nifty(source="upstox") + build_regime_context(auto_fetch_vix=
-    # True), unfragmented — i.e. re-run on EVERY Dashboard interaction) is
-    # gone. scheduler/scan_worker.py's market_intelligence job now computes
-    # regime + summary itself (utils.market_intelligence.compute_market_
-    # intelligence()) and _market_intelligence_fragment() below reads
-    # `summary`/`breadth` straight out of that snapshot's payload — no
-    # session_state relay, no per-render Upstox/VIX call.
-
-    # ── Market Intelligence — Regime / Trend / Breadth / VIX, plus the
-    #    Nifty/Sensex/Bank Nifty index cards. Continuous, live via
-    #    Upstox, on its own refresh timer, independent of everything
-    #    below. Sector-related content no longer lives here — see the
-    #    "Full Sector Rotation Analysis" section further down. ──────────
-    _market_intelligence_fragment()
-    st.markdown(_index_cards_html(st.session_state.get("dash_index_cards", [])),
-                unsafe_allow_html=True)
-
-    # [Dashboard/Scanner split] Scanner output (Elite/Execute/Actionable/
-    # ... tables, Signal Class counts) and the DORE 2.0 F&O Opportunity
-    # Engine (Futures/Options tabs) now live on the Scanner page only —
-    # see pages/scanner.py render(), which shows Scanner output followed
-    # by Futures and Options. Dashboard stays focused on market-wide
-    # context: Top Gainers, News, and Sector data below.
-
-    # ── Top Gainers / News Impact. ──────────────────────────────────────
-    col_left, col_right = st.columns([1.4, 1], gap="medium")
-
-    with col_left:
-        st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
-
-    with col_right:
-        # ── News Impact — independent of scan state too.
-        _news_impact_panel()
+    # [2026-07-28 dashboard scope change] Market Intelligence (Regime/
+    # Trend/Breadth/VIX + index cards) and Top Gainers / News Impact were
+    # removed from this page — Dashboard is now sector-analysis-only.
+    # Market Intelligence still runs in the background (other pages may
+    # use it) and Scanner output/DORE F&O Engine live on the Scanner page
+    # (pages/scanner.py). If any of these need to come back here later,
+    # the calls were `_market_intelligence_fragment()`,
+    # `st.markdown(_index_cards_html(...))`, `_nse_top_gainers_html(df_aug)`
+    # and `_news_impact_panel()`.
 
     # ── Full Sector Rotation Analysis — everything sector-related lives
     #    here now and only here: summary cards (Rotating In/Stable/Out,
