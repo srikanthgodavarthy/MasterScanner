@@ -778,3 +778,35 @@ def top_futures_opportunities(top_n: int = 15, universe: Optional[list[str]] = N
 # Stage 0-5 funnel rather than an OppScore pre-filter + single-stage
 # compute_dore() call.
 top_options_opportunities = top_fo_opportunities
+
+
+def compute_fo_scan(cfg: Optional[DORESettings] = None, universe: Optional[list[str]] = None,
+                     progress_cb=None) -> dict:
+    """Single scheduled-scan entry point (scheduler/scan_worker.py's
+    60s cycle, see its docstring). Runs the full futures + options
+    DORE 2.0 universe scan — top_futures_opportunities() then
+    top_options_opportunities() — and, once both have finished their
+    per-symbol record_and_diff*() calls for this cycle, flushes the
+    OI/premium RAM trackers to Supabase exactly once (see
+    utils.oi_snapshot_store.flush_to_supabase()'s docstring: "the
+    intended (and only) caller").
+
+    Returns {"futures": [...], "options": [...]} — list-of-dict rows,
+    matching what scheduler/scan_worker.py's _fo_scan_payload() expects.
+    """
+    cfg = _load_settings(cfg)
+    universe = universe if universe is not None else stage0_universe()
+
+    futures_df = top_futures_opportunities(universe=universe, cfg=cfg, progress_cb=progress_cb)
+    options_df = top_options_opportunities(universe=universe, cfg=cfg, progress_cb=progress_cb)
+
+    from utils.oi_snapshot_store import flush_to_supabase
+    try:
+        flush_to_supabase()
+    except Exception:
+        logger.exception("[DORE] flush_to_supabase failed (non-fatal) — RAM trackers still correct")
+
+    return {
+        "futures": futures_df.to_dict("records") if futures_df is not None and not futures_df.empty else [],
+        "options": options_df.to_dict("records") if options_df is not None and not options_df.empty else [],
+    }
