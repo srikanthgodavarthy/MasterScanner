@@ -428,7 +428,7 @@ def compute_fo_opportunities(
     """
     cfg = _load_settings(cfg)
     from utils.upstox_client import fetch_oi_resistance, fetch_batch_stock_atm_options_upstox
-    from utils.oi_snapshot_store import record_and_diff, record_and_diff_premium
+    from utils.oi_snapshot_store import record_and_diff, record_and_diff_premium, record_and_diff_strike_premium
 
     symbols = list(live_pool.keys())
     stock_symbols = [s for s in symbols if s not in _INDICES]
@@ -532,15 +532,21 @@ def compute_fo_opportunities(
                     f"Premium shown is the reference strike's, not {result.suggested_strike:.0f} "
                     f"{leg}'s — exact strike missing from this poll's chain")
 
-        # NOTE: premium_prev/%Chg below still track the reference
-        # strike's own tick-to-tick history (record_and_diff_premium()
-        # is keyed per-symbol, not per-strike), so "Premium %Chg" is a
-        # separate metric from "Premium" whenever suggested_strike !=
-        # the reference strike. Correct fix is a per-strike premium
-        # history tracker — left as a follow-up, not bundled into this
-        # display-value fix.
-        premium_prev = (dore_input.ce_premium_prev if leg == "CE" else
-                         dore_input.pe_premium_prev if leg == "PE" else None)
+        # 2026-07-28 bugfix: premium_prev/%Chg used to read
+        # dore_input.ce_premium_prev/.pe_premium_prev, which track the
+        # reference (ATM/OI-wall) strike's history, not suggested_strike's
+        # — see utils.oi_snapshot_store.record_and_diff_strike_premium()'s
+        # docstring for the COFORGE PE 1700 case (+3236% from diffing an
+        # ITM premium against its ATM neighbour's own tiny prior value)
+        # this was producing. Now keyed by symbol+leg+strike so "Premium
+        # %Chg" is always this SAME strike's own tick-to-tick move —
+        # consistent with "Premium" itself, which already reflects
+        # suggested_strike (see premium_now above).
+        if result.suggested_strike and leg in ("CE", "PE"):
+            strike_premium_key = f"{premium_key}_{leg}_{result.suggested_strike:.0f}"
+            premium_prev = record_and_diff_strike_premium(strike_premium_key, premium_now)
+        else:
+            premium_prev = None
         premium_pct_chg = (
             (premium_now - premium_prev) / premium_prev * 100.0
             if premium_prev not in (None, 0) else None
