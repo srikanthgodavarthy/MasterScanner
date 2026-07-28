@@ -3106,6 +3106,16 @@ def _options_table_html(df: pd.DataFrame) -> str:
     clutter). Rows are sorted by Action/Execution tier, then Opportunity
     Score, then Leg (see _sort_by_action_then_score_then_leg).
 
+    2026-07-28 revisit: Leg + Strike merged into one "Contract" column
+    ("PE 1700" instead of two separate cells reading "PE" / "1700") —
+    that's how the strike is actually referred to when acting on it.
+    Expiry now renders as the real calendar date + days-to-expiry
+    ("27 Aug (12d)") instead of a bare "MONTHLY"/"CURRENT_WEEK" label,
+    using the "Expiry Date"/"Days To Expiry" columns (see utils.fo_scan's
+    2026-07-28 addition) with the original label kept as a small
+    sub-line since it's still meaningful (index weekly vs stock
+    monthly).
+
     2026-07-23 fix: dropped the standalone "Entry Timestamp (IST)"
     column — it was confusing next to "Entry" (the price), reading like
     it timestamped the Entry price rather than the plan's current
@@ -3129,6 +3139,24 @@ def _options_table_html(df: pd.DataFrame) -> str:
     def _fmt_text(v):
         return v if v not in (None, "") and pd.notna(v) else "—"
 
+    def _fmt_expiry(label, date_str, days):
+        """'27 Aug (12d)' with the MONTHLY/CURRENT_WEEK/NEXT_WEEK label
+        as a small sub-line — falls back to the bare label alone for
+        back-compat rows that don't have Expiry Date/Days To Expiry
+        yet (see the back-compat fill in _fo_opportunities_panel)."""
+        label_txt = _fmt_text(label)
+        if date_str in (None, "") or pd.isna(date_str):
+            return label_txt
+        try:
+            from datetime import datetime
+            d = datetime.strptime(str(date_str)[:10], "%Y-%m-%d")
+            date_disp = d.strftime("%d %b")
+        except Exception:
+            return label_txt
+        days_disp = f" ({int(days)}d)" if days not in (None, "") and pd.notna(days) else ""
+        return (f'{date_disp}{days_disp}'
+                f'<br><span style="color:var(--muted);font-size:10px;">{label_txt}</span>')
+
     def _fmt_plan_ts(v):
         """Timestamp of the plan's CURRENT lifecycle state (see
         enrich_fo_opportunities_df step 3): created_at while WAITING,
@@ -3149,7 +3177,7 @@ def _options_table_html(df: pd.DataFrame) -> str:
         df = df[df["Action"] != "Watch Only"]
     df = _sort_by_action_then_score_then_leg(df)
 
-    headers = ["Symbol", "LTP", "Leg", "Strike", "Premium", "Premium %Chg",
+    headers = ["Symbol", "LTP", "Contract", "Premium", "Premium %Chg",
                "Opportunity", "Entry", "Entry Drift %",
                "SL", "T1", "T2", "Plan", "Expiry", "Strike Type", "Reason", "Action / Execution"]
 
@@ -3161,11 +3189,13 @@ def _options_table_html(df: pd.DataFrame) -> str:
         leg = r.get("Leg", "")
         leg_color = "#3fb950" if leg == "CE" else "#f85149" if leg == "PE" else "#8b949e"
 
+        strike_disp = _fmt_num(r.get("Strike")) if r.get("Strike") not in (None, "") and pd.notna(r.get("Strike")) else ""
+        contract_disp = f"{_fmt_text(leg)} {strike_disp}".strip() if leg else (strike_disp or "—")
+
         cells = [
             f'<td style="font-weight:700;">{_tv_link(r.get("Symbol", "—"))}</td>',
             f'<td>{_fmt_money(r.get("LTP"))}</td>',
-            f'<td style="color:{leg_color};font-weight:700;">{_fmt_text(leg)}</td>',
-            f'<td>{_fmt_num(r.get("Strike"))}</td>',
+            f'<td style="color:{leg_color};font-weight:700;">{contract_disp}</td>',
             f'<td>{_fmt_money(r.get("Premium"))}</td>',
             f'<td>{_fmt_pct(r.get("Premium %Chg"))}</td>',
             f'<td style="font-weight:700;">{_fmt_num(r.get("Opportunity Score"))}</td>',
@@ -3175,7 +3205,7 @@ def _options_table_html(df: pd.DataFrame) -> str:
             f'<td>{_fmt_money(r.get("T1"))}</td>',
             f'<td>{_fmt_money(r.get("T2"))}</td>',
             f'<td style="white-space:nowrap;">{_fmt_text(r.get("Plan"))}{_fmt_plan_ts(r.get("Entry Timestamp"))}</td>',
-            f'<td>{_fmt_text(r.get("Expiry"))}</td>',
+            f'<td style="white-space:nowrap;">{_fmt_expiry(r.get("Expiry"), r.get("Expiry Date"), r.get("Days To Expiry"))}</td>',
             f'<td>{_fmt_text(r.get("Strike Type"))}</td>',
             f'<td style="color:var(--muted);font-size:11px;max-width:220px;white-space:normal;">{_fmt_text(r.get("Reason"))}</td>',
             f'<td style="white-space:nowrap;"><span style="color:{tier_color};font-weight:700;">{tier_dot} {tier}</span>'
@@ -3353,13 +3383,13 @@ def _fo_opportunities_panel():
                 "Symbol", "LTP", "Action", "Recommendation", "Leg", "Strike", "Premium", "Premium %Chg",
                 "Strike Type", "Execution State",
                 "Opportunity Score", "Entry", "Entry Drift %", "Entry Timestamp",
-                "SL", "T1", "T2", "Plan", "Expiry", "Reason",
+                "SL", "T1", "T2", "Plan", "Expiry", "Expiry Date", "Days To Expiry", "Reason",
             ]
             # Older cached runs (or a plan-enrichment failure) may not have
             # every column yet — filter to what's actually present rather
             # than KeyError on a partial frame.
             opt_df_display = opt_df[[c for c in _opt_display_cols if c in opt_df.columns]].copy()
-            for _missing_col in ("LTP", "Entry Timestamp", "Entry Drift %"):
+            for _missing_col in ("LTP", "Entry Timestamp", "Entry Drift %", "Expiry Date", "Days To Expiry"):
                 # Back-compat: a cached df from before these columns
                 # existed — render blank rather than KeyError.
                 if _missing_col not in opt_df_display.columns:
