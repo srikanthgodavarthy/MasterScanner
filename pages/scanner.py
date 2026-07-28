@@ -2695,7 +2695,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             st.caption("These trades are still open purely on price/SL/target — the scanner's opinion of them has changed since they were locked. Useful for checking whether a scanner downgrade tends to predict trade failure.")
             for _, r in drifted.iterrows():
                 st.markdown(
-                    f'**{r["Symbol"]}** — Original: {_ap_rec_badge(r["OriginalRec"])} '
+                    f'<b>{_tv_link(r["Symbol"])}</b> — Original: {_ap_rec_badge(r["OriginalRec"])} '
                     f'→ Current: {_ap_rec_badge(r["CurrentRec"])} · Status: {_ap_status_badge(r["Status"])}',
                     unsafe_allow_html=True,
                 )
