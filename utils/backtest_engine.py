@@ -562,6 +562,136 @@ def generate_signals_historical(
 
 
 # ══════════════════════════════════════════════════════════════════
+#  PRE-BREAKOUT SIGNAL GENERATOR
+#  Entry : trend_up AND (squeeze_on OR squeeze_release) AND 45<=RSI<=70
+#          — exactly pages/scanner.py's _is_pre_breakout() gate, evaluated
+#          bar-by-bar instead of only on the latest bar of a live scan.
+#  SL/T1/T2/T3: read straight off compute_bar()'s BarResult (r.sl/r.t1/
+#          r.t2/r.t3) — the same swing/ATR-anchored trade levels the live
+#          Pre-Breakout tab already displays for these stocks (see
+#          _render_pre_breakout_tab in pages/scanner.py), not a separate
+#          formula invented just for this backtest.
+#  Exit  : no native exit signal (unlike CCI Master) — simulate_trades'
+#          default SL/T1/TIMEOUT model applies.
+# ══════════════════════════════════════════════════════════════════
+
+def generate_signals_pre_breakout(
+    df:       pd.DataFrame,
+    nifty:    pd.Series,
+    settings: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Walk-forward signal scan for the Pre-Breakout setup.
+
+    Unlike CCI Master/Five Pillars (which run their own independent
+    scoring engines), Pre-Breakout is just a boolean filter over the same
+    scoring_core.compute_bar() output every other Scanner tab uses — so
+    this reuses build_indicators()/compute_bar() directly rather than
+    recomputing EMA/RSI/Bollinger/Keltner from scratch. That also means
+    entry/SL/T1/T2/T3 and every diagnostic column below (RS, ADX, trend
+    age, extension, etc.) are the real values compute_bar() produced for
+    that bar, not stand-ins.
+
+    Returns one row per admitted signal bar — same shape as
+    generate_signals_cci_master()/generate_signals_five_pillars(), so it
+    plugs into simulate_trades()/compute_stats() unmodified.
+    """
+    if df.empty or len(df) < 210:
+        return pd.DataFrame()
+
+    if settings:
+        params = ScoringParams.from_settings(settings)
+    else:
+        params = ScoringParams()
+
+    ia = build_indicators(df, nifty, params)
+    signals = []
+    last_signal_bar = -999  # same 3-bar cooldown as every other generator
+
+    for i in range(210, len(df)):
+        r = compute_bar(ia, i, params)
+        if r is None:
+            continue
+        if i - last_signal_bar < 3:
+            continue
+
+        # ── The exact _is_pre_breakout() gate from pages/scanner.py ────
+        if not (r.trend_up and (r.squeeze_on or r.squeeze_release) and 45 <= r.cur_rsi <= 70):
+            continue
+        if r.sl >= r.entry or r.t1 <= r.entry:
+            continue
+
+        last_signal_bar = i
+        signals.append({
+            "date":            df.index[i],
+            "score":           r.norm_score,
+            "entry":           r.entry,
+            "sl":              r.sl,
+            "t1":              r.t1,
+            "t2":              r.t2,
+            "t3":              r.t3,
+            "t1_mult":         1.5,
+            "t2_mult":         3.0,
+            "t3_mult":         5.0,
+            "target_category": "Pre-Breakout",
+            "target_adj":      0.0,
+            "target_notes":    f"squeeze_on={r.squeeze_on} squeeze_release={r.squeeze_release} RSI={r.cur_rsi:.1f}",
+            "cci":             round(r.cur_cci),
+            "rsi":             round(r.cur_rsi, 1),
+            "tier1_prime":     r.tier1_prime,
+            "tier2_momentum":  r.tier2_momentum,
+            "elite_tier":      r.elite_tier,
+            "squeeze_on":      r.squeeze_on,
+            "squeeze_release": r.squeeze_release,
+            "vol_ratio":       r.vol_ratio,
+            "setup":           "PRE_BREAKOUT",
+            "buy_type":        r.buy_type,
+            "tier":            r.tier,
+            "structural_entry": r.structural_entry,
+            "rs_positive":     r.rs_positive,
+            "rs_val":          r.rs_val,
+            "rs3":             r.rs3,
+            "rs_composite":    r.rs_composite,
+            "rs_top_decile":   r.rs_top_decile,
+            "fresh_base":      r.fresh_base_breakout,
+            "trend_age_bars":  r.trend_age_bars,
+            "trend_freshness": r.trend_freshness,
+            "adx_val":         r.adx_val,
+            "ema20_slope":     r.ema20_slope,
+            "trend_phase":     r.trend_phase,
+            "ema20_pct_dist":        r.ema20_pct_dist,
+            "ema50_pct_dist":        r.ema50_pct_dist,
+            "pivot_high_dist":       r.pivot_high_dist,
+            "price_move_since_setup":r.price_move_since_setup,
+            "bars_since_setup":      r.bars_since_setup,
+            "bars_band": (
+                "No Signal"  if r.bars_since_setup < 0  else
+                "Actionable" if r.bars_since_setup <= 3 else
+                "Late"       if r.bars_since_setup <= 7 else
+                "Extended"
+            ),
+            "atr_at_setup":       r.atr_at_setup,
+            "extension_atr":      r.extension_atr,
+            "extension_score_atr":r.extension_score_atr,
+            "atr_band":           r.atr_band,
+            "pct_band": (
+                "Actionable" if r.price_move_since_setup <= 2.0 else
+                "Late"       if r.price_move_since_setup <= 6.5 else
+                "Extended"
+            ),
+            "bars_since_setup_actual": r.bars_since_setup_actual,
+            "bars_since_setup_band":   r.bars_since_setup_band,
+            "entry_quality_score":     0,
+            "entry_quality_band":      "Acceptable",
+            "entry_rejection_reason":  "",
+            "leadership_score":        0,
+            "conviction_score":        0,
+        })
+
+    return pd.DataFrame(signals)
+
+
+# ══════════════════════════════════════════════════════════════════
 #  CCI MASTER SIGNAL GENERATOR
 #  Entry: CCI crosses UP through os_level (crossover from BEAR → BUY signal)
 #  Exit signal: CCI crosses DOWN through 0 or OB level
@@ -1392,6 +1522,10 @@ def _score_symbol_worker(
         sigs = generate_signals_five_pillars(df, nifty, cfg=fp_cfg)
         rejs = pd.DataFrame()
 
+    elif mode == "pre_breakout":
+        sigs = generate_signals_pre_breakout(df, nifty, settings=effective_settings)
+        rejs = pd.DataFrame()
+
     else:  # default: "scanner"
         sigs, rejs = generate_signals_historical(
             df, nifty,
@@ -1441,6 +1575,11 @@ def run_backtest(
     mode="scanner"      — default; scoring_core.compute_bar() (full engine)
     mode="cci_master"   — CCI Master crossover signals
     mode="five_pillars" — Five Pillars FP score crossover signals
+    mode="pre_breakout" — Pre-Breakout setup: trend_up AND (squeeze_on OR
+                           squeeze_release) AND 45<=RSI<=70 — same
+                           compute_bar() engine as "scanner" mode, just a
+                           different entry gate (see generate_signals_
+                           pre_breakout's docstring)
 
     source: "yfinance" (default) or "upstox" — which provider fetch_all_bt_data()
     and the Nifty benchmark (_fetch_bt_nifty()) pull from. 2026-07-17: added
