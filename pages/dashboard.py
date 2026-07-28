@@ -1003,18 +1003,18 @@ _CSS = """
 .mo-bar-legend .a { color: var(--green); }
 .mo-bar-legend .d { color: var(--red); }
 
-/* ── Health row: Regime / Trend / Breadth / Sector Rotating In-Stable-Out /
-      VIX ── (Today's Sector Flow moved out — now merged with the Sector
-      Rotation Timeline into one 4-column table in the right sidebar,
-      see .sr-flowtl-table) */
+/* ── Health row: Regime / Trend / Breadth / VIX ── (Sector Rotating
+      In-Stable-Out and Today's Sector Flow removed entirely — they now
+      live only in the "Full Sector Rotation Analysis" expander, see
+      pages/dashboard.py's 2026-07-27 consolidation notes) */
 .mo-health-row {
   display: grid;
-  grid-template-columns: 1.3fr 0.9fr 0.9fr 0.7fr 0.7fr 0.7fr 0.7fr;
+  grid-template-columns: 1.6fr 1fr 1fr 0.8fr;
   gap: 10px;
   margin-bottom: 14px;
 }
-@media (max-width: 1300px) { .mo-health-row { grid-template-columns: repeat(4, 1fr); } }
-@media (max-width: 700px)  { .mo-health-row { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 1300px) { .mo-health-row { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 700px)  { .mo-health-row { grid-template-columns: 1fr; } }
 .mo-flow-card { display: flex; flex-direction: column; }
 .mo-flow-cols { display: flex; gap: 14px; flex: 1; }
 .mo-flow-col { flex: 1; min-width: 0; }
@@ -2052,19 +2052,21 @@ def _market_health_detail_html(summary: dict, breadth: dict) -> str:
     return f'<div class="mo-health-row" style="grid-template-columns:repeat(3,1fr);margin-bottom:0;">{hilo_card}{ema_card}{gate_card}</div>'
 
 
-def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
-                            sr_buckets: dict | None = None,
-                            sr_flow: dict | None = None) -> str:
+def _market_overview_panel(summary: dict, breadth: dict, scan_time: str) -> str:
     """
-    Full-width top strip: Regime / Trend Strength / Market Breadth /
-    Sector Rotating In / Stable / Rotating Out / VIX / Today's Sector
-    Flow. Index cards (NIFTY 50, SENSEX, BANK NIFTY) are rendered
-    separately via _index_cards_html() in the left column, not inside
-    this panel — see _market_health_detail_html() for the 52W Hi/Lo /
-    EMA / VIX-ADX-gate cards this strip used to also carry.
+    Full-width top strip: Regime / Trend Strength / Market Breadth / VIX.
+    Index cards (NIFTY 50, SENSEX, BANK NIFTY) are rendered separately
+    via _index_cards_html() in the left column, not inside this panel —
+    see _market_health_detail_html() for the 52W Hi/Lo / EMA / VIX-ADX-gate
+    cards this strip used to also carry.
 
-    sr_buckets: {"Rotating In": n, "Stable": n, "Rotating Out": n}
-    sr_flow: {"inflow": [(sector, cr), ...], "outflow": [...], "net": float}
+    2026-07-27: Sector Rotating In/Stable/Out counts and Today's Sector
+    Flow were removed from this strip and from the right-sidebar
+    _sr_flow_timeline_html widget — both were duplicating (and, for the
+    sidebar 1D-Ago/Today columns, under-populating) numbers already shown
+    in the "📊 Full Sector Rotation Analysis" expander below. All sector
+    rotation content — counts, flow, timeline, breadth, momentum scores —
+    now lives in that one place instead of being split across three.
     """
     r = summary.get("regime", "RANGE")
     regime_color, _, _ = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
@@ -2115,20 +2117,6 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
   <div class="mo-bar-track mo-bar-split"><div class="mo-bar-fill" style="width:{adv_pct}%;background:#3fb950"></div></div>
 </div>"""
 
-    # ── Sector Rotating In / Stable / Rotating Out cards ────────────
-    sr_buckets = sr_buckets or {"Rotating In": 0, "Stable": 0, "Rotating Out": 0}
-    _ROT_META = [
-        ("Rotating In",  "SECTOR ROTATING IN",  "#3fb950"),
-        ("Stable",       "SECTOR STABLE",       "#d29922"),
-        ("Rotating Out", "SECTOR ROTATING OUT", "#f85149"),
-    ]
-    rotation_cards = "".join(f"""
-<div class="mo-health-card">
-  <div class="mo-health-label">{label}</div>
-  <div class="mo-health-value" style="color:{color}">{sr_buckets.get(key, 0)}</div>
-  <div class="mo-mini-label" style="margin-top:2px;">Sectors</div>
-</div>""" for key, label, color in _ROT_META)
-
     # ── Standalone VIX card ──────────────────────────────────────────
     vix_card = f"""
 <div class="mo-health-card">
@@ -2137,17 +2125,12 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
   <div class="mo-mini-label" style="margin-top:2px;color:{vix_color};">{vix_label} · {"BEAR" if vix >= 18 else "BULL"}</div>
 </div>"""
 
-    # 2026-07-27: Today's Sector Flow card removed from this row — it's
-    # now merged with the Sector Rotation Timeline into one 4-column
-    # table (_sr_flow_timeline_html) that lives in the right sidebar,
-    # where there's actually enough width for Inflow/Outflow/1D-Ago/
-    # Today side by side. This "wide" 1.7fr slot in a strip of otherwise
-    # ~80-150px tiles was never wide enough for that data to breathe.
-    # sr_flow is still accepted as a param (harmless if a caller still
-    # passes it) but no longer rendered here.
+    # 2026-07-27: Sector Rotating In/Stable/Out cards and Today's Sector
+    # Flow removed from this row entirely (not just merged) — see this
+    # function's docstring. Everything sector-related now lives only in
+    # the "📊 Full Sector Rotation Analysis" expander.
 
-    health_html = (regime_card + trend_card + breadth_card + rotation_cards
-                    + vix_card)
+    health_html = regime_card + trend_card + breadth_card + vix_card
 
     scan_chip = f'<span class="mo-scan-chip">Last scan: <b>{scan_time} IST</b></span>' if scan_time else ""
 
@@ -2256,20 +2239,6 @@ table.sr-table td:nth-child(3), table.sr-table td:nth-child(4), table.sr-table t
               border-radius:5px; font-size:0.68rem; font-weight:600;
               overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
-/* ── Merged Today's Sector Flow + Sector Rotation Timeline table ── */
-.sr-flowtl-table { width:100%; border-collapse:collapse; font-size:0.76rem; table-layout:fixed; }
-.sr-flowtl-table th { text-align:left; color:#8b949e; font-weight:600; font-size:0.66rem;
-                       letter-spacing:0.05em; padding:6px 8px; border-bottom:1px solid #1e293b; }
-.sr-flowtl-table th.sr-flowtl-tl { text-align:center; }
-.sr-flowtl-table td { padding:6px 8px; border-bottom:1px solid #161d2c; vertical-align:middle;
-                       font-size:0.74rem; }
-.sr-flowtl-table td:nth-child(1), .sr-flowtl-table td:nth-child(2) {
-  display:flex; justify-content:space-between; align-items:center; gap:6px; white-space:nowrap;
-}
-.sr-flowtl-table td:nth-child(3), .sr-flowtl-table td:nth-child(4) { text-align:center; }
-.sr-flowtl-name { overflow:hidden; text-overflow:ellipsis; }
-.sr-flowtl-val { font-weight:600; font-variant-numeric:tabular-nums; flex-shrink:0; }
-
 .sr-focus-cards { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:14px 0; }
 .sr-focus-card { background:#111826; border:1px solid #1e293b; border-radius:10px; padding:14px; }
 .sr-focus-rank { display:inline-block; width:20px; height:20px; border-radius:50%; text-align:center;
@@ -2365,123 +2334,6 @@ def _sr_bucket_opportunity_total(stats: pd.DataFrame, metrics: pd.DataFrame, dir
     if bucket.empty:
         return 0
     return int(bucket[["EliteCount", "ExecuteCount", "WatchCount"]].sum().sum())
-
-
-def _sr_quick_metrics(df_aug: pd.DataFrame, sector_stats: pd.DataFrame, sector_history: pd.DataFrame) -> dict:
-    """Lightweight recompute of the Rotating In/Stable/Out bucket counts,
-    Today's Sector Flow, and the Sector Rotation Timeline — same source
-    functions (utils.sector_rotation) the full Sector Rotation Analysis
-    section below also uses, just returned as plain data so the top
-    strip and right sidebar can each pick out what they need without
-    pulling in that section's full HTML."""
-    from utils.sector_rotation import (compute_rotation_metrics, compute_rotation_timeline,
-                                        compute_sector_flow, compute_sector_breadth)
-    empty = {"buckets": {"Rotating In": 0, "Stable": 0, "Rotating Out": 0},
-             "flow": {"inflow": [], "outflow": [], "net": 0.0}, "timeline": None}
-    if sector_stats is None or sector_stats.empty:
-        return empty
-    sector_breadth = compute_sector_breadth(df_aug)
-    rotation_metrics = compute_rotation_metrics(sector_history, sector_stats, sector_breadth)
-    timeline = compute_rotation_timeline(sector_history)
-    flow = compute_sector_flow(sector_stats)
-    buckets = {"Rotating In": 0, "Stable": 0, "Rotating Out": 0}
-    if not rotation_metrics.empty:
-        for d in buckets:
-            buckets[d] = int((rotation_metrics["Direction"] == d).sum())
-    return {"buckets": buckets, "flow": flow, "timeline": timeline}
-
-
-def _sr_flow_timeline_html(flow: dict | None, timeline: dict | None) -> str:
-    """Merged 'Today's Sector Flow' + 'Sector Rotation Timeline' card —
-    one 4-column table (Top Inflow | Top Outflow | 1D Ago | Today)
-    instead of two separate stacked panels. Only the most recent 2
-    timeline columns are shown (whatever "yesterday"/"today" are for the
-    latest persisted scan) so the row count stays aligned to the 4-column
-    layout regardless of how many scan-days of history exist.
-
-    Colors reuse .sr-pos/.sr-neg (already correctly wired, unlike the old
-    top-strip flow tile's bare .a/.d classes which had no matching CSS
-    rule anywhere and rendered in plain text)."""
-    flow = flow or {"inflow": [], "outflow": [], "net": 0.0}
-    inflow, outflow = flow.get("inflow", [])[:5], flow.get("outflow", [])[:5]
-
-    tl_1d, tl_today, prior_ranks = [], [], {}
-    if timeline:
-        ranks = timeline["ranks"]
-        if len(ranks) >= 2:
-            tl_1d, tl_today = ranks[-2][:5], ranks[-1][:5]
-            prior_ranks = {s: idx for idx, s in enumerate(ranks[-2])}
-        elif ranks:
-            tl_today = ranks[-1][:5]
-
-    n_rows = max(len(inflow), len(outflow), len(tl_1d), len(tl_today), 1)
-
-    def _flow_cell(pairs, i, cls, arrow):
-        if i >= len(pairs):
-            return '<td>—</td>'
-        s, v = pairs[i]
-        sign = "+" if v >= 0 else ""
-        return (f'<td><span class="sr-flowtl-name">{arrow} {s}</span>'
-                f'<span class="{cls} sr-flowtl-val">{sign}{v:.0f} Cr</span></td>')
-
-    def _tl_cell(sectors, i, is_today):
-        if i >= len(sectors):
-            return '<td>—</td>'
-        sector = sectors[i]
-        arrow, acol = "", "#8b949e"
-        if is_today and sector in prior_ranks:
-            prior_pos = prior_ranks[sector]
-            if prior_pos > i:
-                arrow, acol = " ↑", "#3fb950"
-            elif prior_pos < i:
-                arrow, acol = " ↓", "#f85149"
-        pill_color = "#3fb95022" if is_today else "#58a6ff22"
-        text_color = "#3fb950" if is_today else "#58a6ff"
-        return (f'<td><span class="sr-tl-pill" style="background:{pill_color};color:{text_color}">'
-                f'{sector}<span style="color:{acol}">{arrow}</span></span></td>')
-
-    body_rows = "".join(
-        f"<tr>{_flow_cell(inflow, i, 'sr-pos', '↑')}{_flow_cell(outflow, i, 'sr-neg', '↓')}"
-        f"{_tl_cell(tl_1d, i, False)}{_tl_cell(tl_today, i, True)}</tr>"
-        for i in range(n_rows)
-    )
-
-    net = flow.get("net", 0.0)
-    net_color = "sr-pos" if net >= 0 else "sr-neg"
-    return f"""
-    <div class="sr-panel">
-      <div class="sr-panel-title">TODAY'S SECTOR FLOW &amp; ROTATION
-        <span style="color:#8b949e;font-weight:400;">(Net Inflow · Top {n_rows} Sectors)</span></div>
-      <table class="sr-flowtl-table">
-        <tr>
-          <th style="color:#3fb950;">TOP INFLOW</th>
-          <th style="color:#f85149;">TOP OUTFLOW</th>
-          <th class="sr-flowtl-tl">1D AGO</th>
-          <th class="sr-flowtl-tl">TODAY</th>
-        </tr>
-        {body_rows}
-      </table>
-      <div style="border-top:1px solid #1e293b;margin-top:10px;padding-top:8px;font-size:0.72rem;color:#8b949e;">
-        Net Inflow (Today): <b class="{net_color}">{'+' if net >= 0 else ''}{net:.0f} Cr</b>
-        &nbsp;·&nbsp; ↑ Moved Up &nbsp; ↓ Moved Down &nbsp; — No Change (vs previous persisted scan date)
-      </div>
-    </div>""".strip()
-
-
-def _sr_how_calculated_html() -> str:
-    """Standalone 'How Sector Rotation Is Calculated' card for the
-    right sidebar — static content, extracted from the full Sector
-    Rotation Analysis section."""
-    return """
-    <div class="sr-panel">
-      <div class="sr-panel-title">HOW SECTOR ROTATION IS CALCULATED</div>
-      <div class="sr-calc-row">
-        <div class="sr-calc-item"><div class="sr-calc-icon">📈</div>Leadership Momentum<br>vs 20D ago</div>
-        <div class="sr-calc-item"><div class="sr-calc-icon">📋</div>Entry Quality Momentum<br>vs 20D ago</div>
-        <div class="sr-calc-item"><div class="sr-calc-icon">📊</div>New Opportunities<br>Increase in actionable setups</div>
-        <div class="sr-calc-item"><div class="sr-calc-icon">💰</div>Money Flow<br>5D Net Inflow/Outflow</div>
-      </div>
-    </div>""".strip()
 
 
 # ── NSE TOP GAINERS (right sidebar) ─────────────────────────────────
@@ -2937,16 +2789,11 @@ def _market_intelligence_fragment():
     # _market_overview_panel()'s docstring for why the two were split.
     st.session_state["dash_index_cards"] = index_cards
 
-    # Sector rotation counts/flow are computed from df_aug earlier in
-    # render() (independent refresh cadence from this fragment) and
-    # stashed in session_state as "dash_sr" — read here rather than
-    # recomputed, so this fragment's own timer doesn't need df_aug at all.
-    _sr = st.session_state.get("dash_sr") or {}
-    st.markdown(
-        _market_overview_panel(summary, breadth, scan_time,
-                                sr_buckets=_sr.get("buckets"), sr_flow=_sr.get("flow")),
-        unsafe_allow_html=True,
-    )
+    # 2026-07-27: this panel no longer shows Sector Rotating In/Stable/Out
+    # or Today's Sector Flow (removed — see _market_overview_panel's
+    # docstring), so this fragment no longer needs df_aug/sector data at
+    # all, just the summary/breadth snapshot payload.
+    st.markdown(_market_overview_panel(summary, breadth, scan_time), unsafe_allow_html=True)
 
     with st.expander("More market health detail (52W Hi/Lo · EMA breadth · VIX/ADX gate)", expanded=False):
         st.markdown(_market_health_detail_html(summary, breadth), unsafe_allow_html=True)
@@ -3463,12 +3310,10 @@ def render(settings: dict | None = None):
     start_background_scans()
 
     # ── Sector Rotation compute — moved up (used to happen after the
-    # Actionable table further down) so the top strip's Sector Rotating
-    # In/Stable/Out + Today's Sector Flow cards, and the right sidebar's
-    # Sector Rotation Timeline, have data available before anything
-    # renders. build_sector_stats()/_sr_quick_metrics() both handle an
-    # empty df_aug gracefully (all-zero buckets, empty flow), so this is
-    # safe to run even before a first scan has completed. ──────────────
+    # Actionable table further down) so the "Full Sector Rotation
+    # Analysis" section below has its history/persistence data ready
+    # before anything renders. build_sector_stats() handles an empty
+    # df_aug gracefully, so this is safe even before a first scan. ──────
     sector_stats = build_sector_stats(df_aug)
 
     from utils.supabase_client import save_sector_snapshot, load_sector_snapshot_history
@@ -3492,8 +3337,6 @@ def render(settings: dict | None = None):
     except Exception:
         logger.exception("Sector Rotation persistence (load) failed (non-fatal)")
 
-    st.session_state["dash_sr"] = _sr_quick_metrics(df_aug, sector_stats, sector_history)
-
     # 2026-07-23: the live Nifty-regime computation that used to live here
     # (fetch_nifty(source="upstox") + build_regime_context(auto_fetch_vix=
     # True), unfragmented — i.e. re-run on EVERY Dashboard interaction) is
@@ -3503,10 +3346,11 @@ def render(settings: dict | None = None):
     # `summary`/`breadth` straight out of that snapshot's payload — no
     # session_state relay, no per-render Upstox/VIX call.
 
-    # ── Market Intelligence — Regime / Trend / Breadth / Sector Rotating
-    #    In-Stable-Out / VIX / Today's Sector Flow, plus the Nifty/Sensex/
-    #    Bank Nifty index cards. Continuous, live via Upstox, on its own
-    #    refresh timer, independent of everything below. ─────────────────
+    # ── Market Intelligence — Regime / Trend / Breadth / VIX, plus the
+    #    Nifty/Sensex/Bank Nifty index cards. Continuous, live via
+    #    Upstox, on its own refresh timer, independent of everything
+    #    below. Sector-related content no longer lives here — see the
+    #    "Full Sector Rotation Analysis" section further down. ──────────
     _market_intelligence_fragment()
     st.markdown(_index_cards_html(st.session_state.get("dash_index_cards", [])),
                 unsafe_allow_html=True)
@@ -3518,27 +3362,29 @@ def render(settings: dict | None = None):
     # by Futures and Options. Dashboard stays focused on market-wide
     # context: Top Gainers, News, and Sector data below.
 
-    # ── Top Gainers / News Impact / Sector Rotation body. ────────────────
+    # ── Top Gainers / News Impact. ──────────────────────────────────────
     col_left, col_right = st.columns([1.4, 1], gap="medium")
 
     with col_left:
         st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
+
+    with col_right:
         # ── News Impact — independent of scan state too.
         _news_impact_panel()
 
-    with col_right:
-        _sr = st.session_state.get("dash_sr", {})
-        st.markdown(_sr_flow_timeline_html(_sr.get("flow"), _sr.get("timeline")), unsafe_allow_html=True)
-        #st.markdown(_sr_how_calculated_html(), unsafe_allow_html=True)
-
-    # ── Full Sector Rotation Analysis — the detailed dashboard table,
-    #    Top Sectors To Focus Today, summary cards (incl. Total
-    #    Opportunities / Net Inflow 5D) and footer that used to render in
-    #    full on the page. Kept in full (nothing removed), just moved
-    #    into an expander since its Rotating-In/Stable/Out counts and
-    #    Today's Sector Flow now also appear, in lighter form, in the top
-    #    strip above. ──────────────────────────────────────────────────
+    # ── Full Sector Rotation Analysis — everything sector-related lives
+    #    here now and only here: summary cards (Rotating In/Stable/Out,
+    #    Total Opportunities, Net Inflow), the detailed dashboard table,
+    #    Today's Sector Flow, Sector Rotation Timeline, StockEdge-style
+    #    Breadth & Momentum-Score grids, How It's Calculated, and Top
+    #    Sectors To Focus Today. 2026-07-27: consolidated out of the top
+    #    strip and right-sidebar widgets, which duplicated (and, for the
+    #    sidebar's 1D-Ago/Today columns, under-populated) these same
+    #    numbers in three different places — this is now the one place.
+    #    Expanded by default since it no longer has an always-visible
+    #    summary elsewhere on the page. ───────────────────────────────
     if not df_aug.empty:
         _as_of = pd.to_datetime(run_at).tz_convert(_IST) if run_at else _now_ist()
-        with st.expander("📊 Full Sector Rotation Analysis (detailed table, focus sectors, summary cards)"):
+        with st.expander("📊 Sector Rotation Analysis (table, breadth & momentum grids, flow, timeline, focus sectors)",
+                          expanded=True):
             _sector_rotation_analysis_section(df_aug, sector_stats, sector_history, _as_of, run_at)
