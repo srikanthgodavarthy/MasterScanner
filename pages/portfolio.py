@@ -688,7 +688,22 @@ def _compute_row(pos: dict, cfg: ExitIntelligenceConfig, live_metrics: pd.DataFr
         display_action = result.action
 
     # ── Today's P&L (prior close vs LTP) ──
-    prev_close = float(df["close"].iloc[-2]) if len(df) >= 2 else result.price
+    # [2026-07-28 fix] `if prev_close else 0.0` only guarded against
+    # prev_close being exactly 0/None — a NaN close (a data gap/holiday
+    # row for one symbol, e.g. DLF) is truthy in Python, so it sailed
+    # through, made today_pnl/today_pct NaN for that one row, and then
+    # poisoned the portfolio-wide `sum(r["today_pnl"] for r in rows)` —
+    # turning the whole Today's P&L KPI into NaN, not just that row.
+    # Walk back further for the nearest valid close instead of a bare
+    # iloc[-2]; if nothing valid is found, fall back to today's own
+    # price (today_pnl becomes 0 for that symbol only, never NaN).
+    _closes = df["close"]
+    prev_close = result.price
+    for _i in range(2, min(len(_closes), 6) + 1):
+        _cand = _closes.iloc[-_i]
+        if pd.notna(_cand):
+            prev_close = float(_cand)
+            break
     today_pnl = (result.price - prev_close) * qty
     today_pct = ((result.price - prev_close) / prev_close * 100) if prev_close else 0.0
 
@@ -775,7 +790,7 @@ def _reason_for_row(r: dict) -> str:
         return "Elevated Risk"
 
     if action == "ROTATE":
-        return f"To {r.get('rotate_target', '—')}"
+        return f"To {r.get('rotate_target', '—')}{_rotate_since_suffix(r)}"
 
     if action in ("ADD", "STRONG ADD"):
         return "Strong Setup" if action == "STRONG ADD" else "Add-On Signal"
@@ -783,12 +798,25 @@ def _reason_for_row(r: dict) -> str:
     return "—"
 
 
+def _rotate_since_suffix(r: dict) -> str:
+    """' (since 2026-07-21)' if a persisted first-flagged date is available,
+    else '' — Supabase-unavailable or first-render-this-symbol cases both
+    fall back to no stamp rather than a misleading one."""
+    since = r.get("rotate_since")
+    if not since:
+        return ""
+    try:
+        return f" (since {pd.to_datetime(since).strftime('%Y-%m-%d')})"
+    except Exception:
+        return ""
+
+
 def _next_action_text(r: dict) -> str:
     action = r["display_action"]
     if action == "EXIT":
         return "Exit Position"
     if action == "ROTATE":
-        return f"Rotate → {r.get('rotate_target', '—')}"
+        return f"Rotate → {r.get('rotate_target', '—')}{_rotate_since_suffix(r)}"
     if action == "REDUCE":
         return "Reduce Exposure"
     if action in ("ADD", "STRONG ADD"):
@@ -805,7 +833,7 @@ def _render_kpi_strip(rows: list[dict]):
     invested = sum(r["entry_price"] * r["qty"] for r in rows)
     current = sum(r["market_val"] for r in rows)
     open_pnl = current - invested
-    today_pnl = sum(r["today_pnl"] for r in rows)
+    today_pnl = sum(r["today_pnl"] for r in rows if pd.notna(r["today_pnl"]))
     open_pct = (open_pnl / invested * 100) if invested else 0.0
     today_pct = (today_pnl / current * 100) if current else 0.0
     utilization = min(100.0, (invested / current * 100)) if current else 0.0
@@ -887,7 +915,7 @@ def _render_action_panels(rows: list[dict]):
           {body}
         </div>"""
 
-    rotate_reason = lambda r: f"→ {r.get('rotate_target', '—')}"
+    rotate_reason = lambda r: f"→ {r.get('rotate_target', '—')}{_rotate_since_suffix(r)}"
     html = f"""<div class="pcc-panel-grid">
       {_panel("EXIT IMMEDIATELY", "❌", "#ff4d6d", exits)}
       {_panel("ROTATE", "🔄", "#a78bfa", rotates, rotate_reason)}
@@ -949,7 +977,7 @@ def _render_summary_cards(rows: list[dict]):
     invested = sum(r["entry_price"] * r["qty"] for r in rows)
     current = sum(r["market_val"] for r in rows)
     open_pnl = current - invested
-    today_pnl = sum(r["today_pnl"] for r in rows)
+    today_pnl = sum(r["today_pnl"] for r in rows if pd.notna(r["today_pnl"]))
     open_pct = (open_pnl / invested * 100) if invested else 0.0
     today_pct = (today_pnl / current * 100) if current else 0.0
 
@@ -1200,6 +1228,23 @@ def _apply_rotation(rows: list[dict], live_metrics: pd.DataFrame, min_swap_score
             r["rotate_score"] = best["swap_score"]
             r["rotate_tags"] = best["tags"]
             recommended_symbols.add(best["symbol"].upper())
+
+    # ── Persist + attach the "since" date ─────────────────────────
+    # [2026-07-28] display_action/rotate_target above are recomputed
+    # fresh every render — nothing tracked WHEN a rotate call first
+    # appeared. upsert_rotate_flags() keeps the original date as long as
+    # rotate_target is unchanged, and resets it if the swap target
+    # changes (a genuinely new call). r["rotate_since"] is left unset
+    # (None) if Supabase is unavailable — renderers treat that as "no
+    # stamp available" rather than guessing.
+    rotated_now = [r for r in rows if r["display_action"] == "ROTATE"]
+    if rotated_now:
+        from utils.supabase_client import upsert_rotate_flags
+        _flags = upsert_rotate_flags([
+            {"symbol": r["symbol"], "rotate_target": r["rotate_target"]} for r in rotated_now
+        ])
+        for r in rotated_now:
+            r["rotate_since"] = _flags.get(r["symbol"].upper().strip())
 
 
 def _render_rotation_rationale(rows: list[dict]):
