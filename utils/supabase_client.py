@@ -1560,6 +1560,70 @@ def delete_portfolio_position(position_id) -> bool:
         return False
 
 
+def upsert_rotate_flags(rows: list[dict]) -> dict[str, str]:
+    """
+    Persist the date each currently-ROTATE-flagged symbol was FIRST
+    recommended to rotate into its CURRENT target.
+
+    ``rows`` is the full set of ROTATE-flagged positions this render, each
+    ``{"symbol": ..., "rotate_target": ...}``. For every symbol: if a stored
+    row already exists with the SAME rotate_target, its original
+    first_flagged_at is kept; otherwise (no stored row, or the target
+    changed — a different swap candidate now scores better) this counts as
+    a fresh flag and first_flagged_at is stamped as now.
+
+    Returns {symbol: first_flagged_at_iso} for every row passed in. Falls
+    back to "now" per symbol if Supabase is unavailable, so the caller
+    always has something to display even without persistence.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    clean = [
+        {"symbol": r["symbol"].upper().strip(), "rotate_target": (r.get("rotate_target") or "").upper().strip()}
+        for r in rows if r.get("symbol")
+    ]
+    if not clean:
+        return {}
+
+    client = get_client()
+    if client is None:
+        return {r["symbol"]: now_iso for r in clean}
+
+    symbols = [r["symbol"] for r in clean]
+    try:
+        resp = (
+            client.table("portfolio_rotate_flags")
+            .select("symbol, rotate_target, first_flagged_at")
+            .in_("symbol", symbols)
+            .execute()
+        )
+        existing = {row["symbol"]: row for row in (resp.data or [])}
+    except Exception as exc:
+        logger.error("upsert_rotate_flags: load existing failed: %s", exc)
+        existing = {}
+
+    out: dict[str, str] = {}
+    upserts = []
+    for r in clean:
+        sym, target = r["symbol"], r["rotate_target"]
+        prev = existing.get(sym)
+        if prev and (prev.get("rotate_target") or "").upper() == target:
+            first_flagged = prev["first_flagged_at"]
+        else:
+            first_flagged = now_iso
+        out[sym] = first_flagged
+        upserts.append({
+            "symbol": sym, "rotate_target": target,
+            "first_flagged_at": first_flagged, "updated_at": now_iso,
+        })
+
+    try:
+        client.table("portfolio_rotate_flags").upsert(upserts, on_conflict="symbol").execute()
+    except Exception as exc:
+        logger.error("upsert_rotate_flags: upsert failed: %s", exc)
+
+    return out
+
+
 # ─── SCHEMA SQL ───────────────────────────────────────────────────────────────
 
 SCHEMA_SQL = """
@@ -1932,4 +1996,21 @@ ALTER TABLE portfolio_positions ADD COLUMN IF NOT EXISTS initial_stop numeric(12
 -- the "Add More" (average-up) control existed (safe to re-run).
 ALTER TABLE portfolio_positions ADD COLUMN IF NOT EXISTS last_added_at timestamptz;
 ALTER TABLE portfolio_positions ADD COLUMN IF NOT EXISTS add_reason text;
+"""
+
+SCHEMA_SQL += """
+-- 9. Portfolio Rotate Flags — pages/portfolio.py's _apply_rotation()
+--    recomputes ROTATE/rotate_target fresh on every render (pure function
+--    of the current scan + current holdings), so there was previously no
+--    record of WHEN a rotate recommendation first appeared. This table
+--    is the single row of truth per symbol for that date: first_flagged_at
+--    is set once and kept forever as long as rotate_target doesn't change;
+--    a different target (the swap candidate changed) counts as a fresh
+--    flag and resets the date. See upsert_rotate_flags() below.
+CREATE TABLE IF NOT EXISTS portfolio_rotate_flags (
+    symbol            text        PRIMARY KEY,
+    rotate_target     text        NOT NULL DEFAULT '',
+    first_flagged_at  timestamptz NOT NULL,
+    updated_at        timestamptz NOT NULL DEFAULT now()
+);
 """
