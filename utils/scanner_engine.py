@@ -2038,7 +2038,11 @@ def run_scanner(
                 batch_data.update(fallback)
         all_data.update(batch_data)
         if progress_cb:
-            progress_cb(0.5 * (batch_i + 1) / n_batches)
+            progress_cb(
+                0.5 * (batch_i + 1) / n_batches,
+                text=f"Fetching data — batch {batch_i + 1}/{n_batches} "
+                     f"({len(all_data)}/{total} symbols, {fetch_source})",
+            )
 
     # ── Patch live prices (today's intraday bar) ──────────────────
     # FIX: only call _fetch_live_prices when today's bar is missing from the
@@ -2117,7 +2121,10 @@ def run_scanner(
         for fut in finished:
             done += 1
             if progress_cb:
-                progress_cb(0.5 + 0.5 * done / total)
+                progress_cb(
+                    0.5 + 0.5 * done / total,
+                    text=f"Scoring stocks — {done}/{total}",
+                )
             try:
                 row = fut.result()
             except Exception:
