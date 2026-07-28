@@ -2413,69 +2413,12 @@ def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.Dat
     rotation_metrics = compute_rotation_metrics(sector_history, sector_stats, sector_breadth)
     timeline = compute_rotation_timeline(sector_history)
     flow = compute_sector_flow(sector_stats)
-    prior_metrics, prior_stats = _sr_prior_day_metrics(sector_history)
 
     st.markdown('<div class="sr-wrap">', unsafe_allow_html=True)
     st.markdown('<div class="sr-panel-title" style="font-size:1rem;">📊 SECTOR ROTATION ANALYSIS</div>'
                  '<div style="font-size:0.78rem;color:#8b949e;margin-bottom:4px;">'
                  'Identify where money is moving and which sectors offer the best opportunities</div>',
                  unsafe_allow_html=True)
-
-    # ── summary cards ───────────────────────────────────────────────
-    tiers = _sr_tier_bucket_counts(sector_stats)
-    buckets = {}
-    for d in ("Rotating In", "Stable", "Rotating Out"):
-        n_sectors = int((rotation_metrics["Direction"] == d).sum()) if not rotation_metrics.empty else 0
-        opp_total = _sr_bucket_opportunity_total(sector_stats, rotation_metrics, d)
-        opp_prior = _sr_bucket_opportunity_total(prior_stats, prior_metrics, d) if prior_metrics is not None else None
-        delta = None if opp_prior is None else opp_total - opp_prior
-        buckets[d] = (n_sectors, opp_total, delta)
-
-    net_inflow_5d = round(float(rotation_metrics["NetInflow5D"].sum()), 0) if not rotation_metrics.empty else 0.0
-    net_inflow_5d_prior = (round(float(prior_metrics["NetInflow5D"].sum()), 0)
-                            if prior_metrics is not None and not prior_metrics.empty else None)
-    net_inflow_delta = None if net_inflow_5d_prior is None else round(net_inflow_5d - net_inflow_5d_prior, 0)
-
-    def _delta_html(delta, unit=""):
-        if delta is None:
-            return '<div class="sr-card-sub">vs Yesterday —</div>'
-        cls = "up" if delta >= 0 else "down"
-        sign = "+" if delta >= 0 else ""
-        return f'<div class="sr-card-sub">vs Yesterday <span class="sr-card-delta {cls}">{sign}{delta:g}{unit}</span></div>'
-
-    _CARD_META = [
-        ("ROTATING IN", "Rotating In", "↑", "#3fb950"),
-        ("STABLE", "Stable", "⇄", "#d29922"),
-        ("ROTATING OUT", "Rotating Out", "↓", "#f85149"),
-    ]
-    cards_html = '<div class="sr-cards">'
-    for label, direction_key, icon, color in _CARD_META:
-        n, opp, delta = buckets[direction_key]
-        cards_html += f"""
-        <div class="sr-card">
-          <div class="sr-card-label" style="color:{color}">{icon} {label}</div>
-          <div class="sr-card-num" style="color:{color}">{n}</div>
-          <div class="sr-card-sub">Sectors</div>
-          <div class="sr-card-opp">{opp}</div>
-          <div class="sr-card-sub">Total Opportunities</div>
-          {_delta_html(delta)}
-        </div>"""
-
-    cards_html += f"""
-        <div class="sr-card">
-          <div class="sr-card-label">◎ TOTAL OPPORTUNITIES</div>
-          <div class="sr-card-num">{tiers['Total']}</div>
-          <div class="sr-card-sub">Elite: {tiers['Elite']} &nbsp; Execute: {tiers['Execute']} &nbsp; Watch: {tiers['Watch']}</div>
-        </div>
-        <div class="sr-card">
-          <div class="sr-card-label">💰 NET SECTOR INFLOW (5D)</div>
-          <div class="sr-card-num" style="color:{'#3fb950' if net_inflow_5d >= 0 else '#f85149'}">
-            {'+' if net_inflow_5d >= 0 else ''}{net_inflow_5d:g} Cr</div>
-          {_delta_html(net_inflow_delta, ' Cr')}
-        </div>
-    """
-    cards_html += "</div>"
-    st.markdown(cards_html, unsafe_allow_html=True)
 
     # ── main dashboard table + right column ────────────────────────
     col_left, col_right = st.columns([1.6, 1])
@@ -3337,15 +3280,40 @@ def render(settings: dict | None = None):
     except Exception:
         logger.exception("Sector Rotation persistence (load) failed (non-fatal)")
 
-    # [2026-07-28 dashboard scope change] Market Intelligence (Regime/
-    # Trend/Breadth/VIX + index cards) and Top Gainers / News Impact were
-    # removed from this page — Dashboard is now sector-analysis-only.
-    # Market Intelligence still runs in the background (other pages may
-    # use it) and Scanner output/DORE F&O Engine live on the Scanner page
-    # (pages/scanner.py). If any of these need to come back here later,
-    # the calls were `_market_intelligence_fragment()`,
-    # `st.markdown(_index_cards_html(...))`, `_nse_top_gainers_html(df_aug)`
-    # and `_news_impact_panel()`.
+    # 2026-07-23: the live Nifty-regime computation that used to live here
+    # (fetch_nifty(source="upstox") + build_regime_context(auto_fetch_vix=
+    # True), unfragmented — i.e. re-run on EVERY Dashboard interaction) is
+    # gone. scheduler/scan_worker.py's market_intelligence job now computes
+    # regime + summary itself (utils.market_intelligence.compute_market_
+    # intelligence()) and _market_intelligence_fragment() below reads
+    # `summary`/`breadth` straight out of that snapshot's payload — no
+    # session_state relay, no per-render Upstox/VIX call.
+
+    # ── Market Intelligence — Regime / Trend / Breadth / VIX, plus the
+    #    Nifty/Sensex/Bank Nifty index cards. Continuous, live via
+    #    Upstox, on its own refresh timer, independent of everything
+    #    below. Sector-related content no longer lives here — see the
+    #    "Full Sector Rotation Analysis" section further down. ──────────
+    _market_intelligence_fragment()
+    st.markdown(_index_cards_html(st.session_state.get("dash_index_cards", [])),
+                unsafe_allow_html=True)
+
+    # [Dashboard/Scanner split] Scanner output (Elite/Execute/Actionable/
+    # ... tables, Signal Class counts) and the DORE 2.0 F&O Opportunity
+    # Engine (Futures/Options tabs) now live on the Scanner page only —
+    # see pages/scanner.py render(), which shows Scanner output followed
+    # by Futures and Options. Dashboard stays focused on market-wide
+    # context: Top Gainers, News, and Sector data below.
+
+    # ── Top Gainers / News Impact. ──────────────────────────────────────
+    col_left, col_right = st.columns([1.4, 1], gap="medium")
+
+    with col_left:
+        st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
+
+    with col_right:
+        # ── News Impact — independent of scan state too.
+        _news_impact_panel()
 
     # ── Full Sector Rotation Analysis — everything sector-related lives
     #    here now and only here: summary cards (Rotating In/Stable/Out,
