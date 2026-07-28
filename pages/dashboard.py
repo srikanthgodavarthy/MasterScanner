@@ -1013,7 +1013,14 @@ _CSS = """
   gap: 10px;
   margin-bottom: 14px;
 }
+/* 2026-07-28: single-row layout — 52W Hi/Lo + EMA breadth folded in
+   here (the VIX/ADX gate card that used to sit alongside them in a
+   separate expander was dropped as a duplicate of the VIX/Trend
+   Strength cards, see _market_overview_panel's docstring). */
+.mo-health-row-6 { grid-template-columns: 1.3fr 0.9fr 0.9fr 0.7fr 0.9fr 0.9fr; }
 @media (max-width: 1300px) { .mo-health-row { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 1300px) { .mo-health-row-6 { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 900px)  { .mo-health-row-6 { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 700px)  { .mo-health-row { grid-template-columns: 1fr; } }
 .mo-flow-card { display: flex; flex-direction: column; }
 .mo-flow-cols { display: flex; gap: 14px; flex: 1; }
@@ -1984,20 +1991,17 @@ def _index_cards_html(index_cards: list[dict]) -> str:
     return f'<div class="mo-index-grid">{cards_html}</div>'
 
 
-def _market_health_detail_html(summary: dict, breadth: dict) -> str:
-    """52W Hi/Lo, EMA20/EMA200 breadth, and VIX/ADX gate — the three
-    mini-cards that used to live in the main top strip. Kept (not
-    dropped) but moved into a small expander under the top strip once
-    the strip itself was redesigned to match the Rotating In/Stable/Out
-    + Sector Flow layout, so none of this data is lost."""
-    adx         = float(summary.get("adx", 0))
-    adx_is_real = summary.get("adx_is_real", False)
-    vix         = float(summary.get("vix", 0))
-    ema50_up    = summary.get("nifty_ema50", False)
-    ema200_up   = summary.get("nifty_ema200", False)
-    trend_label = _trend_strength_label(adx, adx_is_real)
-    vix_label, vix_color = _vix_band(vix)
-    trend_color = {"WEAK": "#f85149", "MODERATE": "#d29922", "STRONG": "#3fb950"}[trend_label]
+def _market_health_extra_cards_html(summary: dict, breadth: dict) -> str:
+    """52W Hi/Lo and EMA20/EMA200 breadth — folded into the single
+    MARKET OVERVIEW row. 2026-07-28: this used to also render a
+    separate VIX/ADX 'gate' card in a second row behind an expander,
+    but that card only restated the VIX value (already its own card
+    in this row) and the ADX/Trend Strength reading (already the
+    Trend Strength card) with a pass/fail check — no new information,
+    just duplicated numbers — so it was dropped and the two rows
+    merged into one."""
+    ema50_up  = summary.get("nifty_ema50", False)
+    ema200_up = summary.get("nifty_ema200", False)
 
     hi, lo = breadth.get("n_52w_high", 0), breadth.get("n_52w_low", 0)
     hilo_card = f"""
@@ -2028,37 +2032,16 @@ def _market_health_detail_html(summary: dict, breadth: dict) -> str:
     </div>
   </div>
 </div>"""
-
-    adx_note   = "" if adx_is_real else "·proxy"
-    vix_ok     = vix <= 22.0
-    adx_ok     = adx >= 25.0
-    vix_gate_c = vix_color if vix_ok else "#f85149"
-    adx_gate_c = trend_color if adx_is_real else "#8b949e"
-    gate_card = f"""
-<div class="mo-health-card">
-  <div class="mo-mini-pair">
-    <div class="mo-mini-item">
-      <div class="mo-gate-mini-top"><span class="mo-gate-mini-icon">💓</span><span class="mo-mini-label">VIX</span>
-        <span class="mo-gate-mini-check" style="color:{vix_gate_c}">{"✓" if vix_ok else "✕"}</span></div>
-      <div class="mo-mini-val" style="color:{vix_gate_c}">{vix:.1f}<span class="mo-gate-mini-qual">{vix_label}</span></div>
-    </div>
-    <div class="mo-mini-item">
-      <div class="mo-gate-mini-top"><span class="mo-gate-mini-icon">🛡️</span><span class="mo-mini-label">ADX</span>
-        <span class="mo-gate-mini-check" style="color:{adx_gate_c}">{"✓" if adx_ok else "✕"}</span></div>
-      <div class="mo-mini-val" style="color:{adx_gate_c}">{adx:.0f}{adx_note}<span class="mo-gate-mini-qual">{trend_label}</span></div>
-    </div>
-  </div>
-</div>"""
-    return f'<div class="mo-health-row" style="grid-template-columns:repeat(3,1fr);margin-bottom:0;">{hilo_card}{ema_card}{gate_card}</div>'
+    return hilo_card + ema_card
 
 
 def _market_overview_panel(summary: dict, breadth: dict, scan_time: str) -> str:
     """
-    Full-width top strip: Regime / Trend Strength / Market Breadth / VIX.
-    Index cards (NIFTY 50, SENSEX, BANK NIFTY) are rendered separately
-    via _index_cards_html() in the left column, not inside this panel —
-    see _market_health_detail_html() for the 52W Hi/Lo / EMA / VIX-ADX-gate
-    cards this strip used to also carry.
+    Full-width single row: Regime / Trend Strength / Market Breadth /
+    VIX / 52W Hi-Lo / EMA breadth. Index cards (NIFTY 50, SENSEX, BANK
+    NIFTY) are rendered separately via _index_cards_html() in the left
+    column, not inside this panel — see _market_health_extra_cards_html()
+    for the 52W Hi/Lo and EMA breadth cards folded into this row.
 
     2026-07-27: Sector Rotating In/Stable/Out counts and Today's Sector
     Flow were removed from this strip and from the right-sidebar
@@ -2130,14 +2113,22 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str) -> str:
     # function's docstring. Everything sector-related now lives only in
     # the "📊 Full Sector Rotation Analysis" expander.
 
-    health_html = regime_card + trend_card + breadth_card + vix_card
+    # 2026-07-28: 52W Hi/Lo and EMA20/EMA200 breadth used to sit in a
+    # separate "More market health detail" expander below this strip,
+    # alongside a VIX/ADX gate card that just duplicated the VIX and
+    # Trend Strength cards above. The gate card is gone and the two
+    # non-duplicate cards now live directly in this single row instead.
+    health_html = (
+        regime_card + trend_card + breadth_card + vix_card
+        + _market_health_extra_cards_html(summary, breadth)
+    )
 
     scan_chip = f'<span class="mo-scan-chip">Last scan: <b>{scan_time} IST</b></span>' if scan_time else ""
 
     return f"""
 <div class="mo-panel">
   <div class="mo-title">MARKET OVERVIEW ⓘ {scan_chip}</div>
-  <div class="mo-health-row">{health_html}</div>
+  <div class="mo-health-row mo-health-row-6">{health_html}</div>
 </div>
 """
 
@@ -2739,9 +2730,6 @@ def _market_intelligence_fragment():
     # all, just the summary/breadth snapshot payload.
     st.markdown(_market_overview_panel(summary, breadth, scan_time), unsafe_allow_html=True)
 
-    with st.expander("More market health detail (52W Hi/Lo · EMA breadth · VIX/ADX gate)", expanded=False):
-        st.markdown(_market_health_detail_html(summary, breadth), unsafe_allow_html=True)
-
 # ── NEWS IMPACT — ET + Moneycontrol headlines, free-LLM sentiment tag ──
 # ── NEWS IMPACT — ET + Moneycontrol headlines, free-LLM sentiment tag ──
 # 2026-07-17: uses the Agent's existing OpenAI-SDK-style client pattern but
@@ -3306,15 +3294,12 @@ def render(settings: dict | None = None):
     # by Futures and Options. Dashboard stays focused on market-wide
     # context: Top Gainers, News, and Sector data below.
 
-    # ── Top Gainers / News Impact. ──────────────────────────────────────
-    col_left, col_right = st.columns([1.4, 1], gap="medium")
-
-    with col_left:
-        st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
-
-    with col_right:
-        # ── News Impact — independent of scan state too.
-        _news_impact_panel()
+    # ── Top Gainers. ──────────────────────────────────────────────────
+    # 2026-07-28: News Impact Alerts panel removed from the dashboard
+    # (was in a right-hand column alongside this) — Top Gainers now
+    # takes the full row width. _news_impact_panel() is left defined
+    # above in case it's wanted back on a different page later.
+    st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
 
     # ── Full Sector Rotation Analysis — everything sector-related lives
     #    here now and only here: summary cards (Rotating In/Stable/Out,
