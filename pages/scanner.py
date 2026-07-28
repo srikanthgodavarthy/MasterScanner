@@ -3397,6 +3397,38 @@ def render(settings: dict | None = None):
     settings = settings or {}
     supabase_ok = _is_available()
 
+    # ── Load last completed scan from Supabase on first render ───────
+    # [2026-07-28 fix] Previously scan_df only ever got set inside the
+    # `if run_btn:` block below, so a fresh browser session / page
+    # reload / Streamlit rerun always started at "No scan data" even
+    # though live_scanner_snapshots already had a completed scan from
+    # this session or an earlier one — the same table pages/dashboard.py
+    # (_dash_scan_autorefresh / its own first-render block) reads from.
+    # Mirrors that pattern here so Scanner behaves the same way: only
+    # goes to Supabase once per session (scan_df not yet in
+    # session_state); a manual Run Scan afterwards always overwrites
+    # scan_df/scan_time itself regardless of what this loaded.
+    if "scan_df" not in st.session_state and supabase_ok:
+        from utils.scan_state import load_snapshot_payload
+        _snap = load_snapshot_payload("live_scanner")
+        if _snap:
+            _records = (_snap.get("payload") or {}).get("data", [])
+            if _records:
+                st.session_state["scan_df"]      = pd.DataFrame(_records)
+                st.session_state["last_scan_df"] = st.session_state["scan_df"]
+                _created_at = _snap.get("created_at", "")
+                st.session_state["scan_time"] = (
+                    pd.to_datetime(_created_at).tz_convert(_IST).strftime("%Y-%m-%d %H:%M:%S")
+                    if _created_at else ""
+                )
+                # summary/regime_ctx aren't part of this payload (only
+                # `data` is — see save_snapshot("live_scanner", ...) in
+                # the run_btn block below) — render_scan_results only
+                # reads summary.get(...) with safe defaults, so leaving
+                # it unset (empty dict) just skips the regime-gate info
+                # banner rather than erroring.
+                st.session_state["scan_loaded_from_db"] = True
+
     # ── Controls row ────────────────────────────────────────────
     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.2, 1, 4, 1])
     with ctrl1:
@@ -3408,17 +3440,30 @@ def render(settings: dict | None = None):
         # independently of Dashboard (which is Upstox-sourced) and of any
         # "data_source" setting from the Settings page. No toggle: Scanner
         # refetches everything itself, from Yahoo, every run.
+        _last_scan_stamp = st.session_state.get("scan_time", "")
+        if _last_scan_stamp:
+            _stamp_label = ("Last scan (from DB)" if st.session_state.get("scan_loaded_from_db")
+                             else "Last scan")
+            _stamp_html = (
+                f" &nbsp;·&nbsp; {_stamp_label}: "
+                f"<b style='color:var(--text)'>{_last_scan_stamp} IST</b>"
+            )
+        else:
+            _stamp_html = ""
         st.markdown(
             f"<div style='padding:0.55rem 0;color:#8b949e;font-size:0.78rem;'>"
             f"Universe: <b style='color:var(--text)'>{len(settings.get('symbols', NIFTY500_SYMBOLS))}</b> symbols"
             f" &nbsp;·&nbsp; Execute threshold: <b style='color:var(--text)'>{settings.get('execute_threshold', 70)}</b>"
             f" &nbsp;·&nbsp; Workers: <b style='color:var(--text)'>{settings.get('workers', 10)}</b>"
-            f" &nbsp;·&nbsp; Source: <b style='color:var(--text)'>📈 Yahoo Finance</b></div>",
+            f" &nbsp;·&nbsp; Source: <b style='color:var(--text)'>📈 Yahoo Finance</b>"
+            f"{_stamp_html}</div>",
             unsafe_allow_html=True)
     with ctrl4:
         if st.button("🗑️", key="sb_clear_cache", help="Clear data cache"):
             st.cache_data.clear()
             st.session_state.pop("scan_df", None)
+            st.session_state.pop("scan_time", None)
+            st.session_state.pop("scan_loaded_from_db", None)
             st.toast("Cache cleared.")
 
     # ── Run scan ────────────────────────────────────────────────
@@ -3494,8 +3539,9 @@ def render(settings: dict | None = None):
         st.session_state["last_scan_df"]  = df_aug   # Sprint 2: lifecycle page reads this
         st.session_state["regime_ctx"]    = regime_ctx
         st.session_state["scan_summary"]  = regime_summary(df_aug, regime_ctx)
-        st.session_state["scan_time"]     = _now_ist().strftime("%H:%M:%S")
+        st.session_state["scan_time"]     = _now_ist().strftime("%Y-%m-%d %H:%M:%S")
         st.session_state["scan_settings"] = effective
+        st.session_state["scan_loaded_from_db"] = False
 
         # 2026-07-16: Nifty/Sensex live quotes, EMA levels, and OI
         # resistance used to be fetched here on every scan click — moved
