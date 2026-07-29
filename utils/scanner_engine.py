@@ -246,9 +246,20 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     return tr.ewm(com=period - 1, adjust=False).mean()
 
 def stochastic(high: pd.Series, low: pd.Series, close: pd.Series,
-                k_period: int = 14, d_period: int = 3) -> tuple[pd.Series, pd.Series]:
+                k_period: int = 14, d_period: int = 3, k_smooth: int = 1) -> tuple[pd.Series, pd.Series]:
     """
     Standard Stochastic Oscillator. %K = (C - LLn)/(HHn - LLn)*100, %D = SMA(%K, d).
+
+    ``k_smooth`` (default 1 = no smoothing) applies an extra SMA(k_smooth) to
+    the raw %K before %D is derived from it — this is what turns "Fast
+    Stochastic" into TradingView's default "Stochastic" ("Slow Stochastic")
+    study, whose %K Length / %K Smoothing / %D Smoothing inputs default to
+    14 / 3 / 3. Defaults to 1 here (no smoothing, i.e. raw %K) to keep every
+    existing caller's behavior byte-for-byte unchanged; pass k_smooth=3 to
+    match TradingView's out-of-the-box Stochastic exactly (see
+    utils.stoch_convergence.score_stochastic_convergence, and
+    utils.cci_stochastic_signal.SignalParams which already defaults to
+    k_period=14/d_period=3/smooth_k=3 — this mirrors that convention).
 
     Single-owner home for this primitive (architecture cleanup): it used to
     be a private copy (_stochastic) living only inside utils/pillar_engine.py.
@@ -257,12 +268,14 @@ def stochastic(high: pd.Series, low: pd.Series, close: pd.Series,
     real Stochastic Oscillator too instead of not having one at all.
     pillar_engine now imports this function rather than defining its own.
     """
-    hh  = high.rolling(k_period).max()
-    ll  = low.rolling(k_period).min()
-    rng = (hh - ll).replace(0, np.nan)
-    k   = (close - ll) / rng * 100
-    d   = k.rolling(d_period).mean()
+    hh    = high.rolling(k_period).max()
+    ll    = low.rolling(k_period).min()
+    rng   = (hh - ll).replace(0, np.nan)
+    raw_k = (close - ll) / rng * 100
+    k     = raw_k.rolling(k_smooth).mean() if k_smooth > 1 else raw_k
+    d     = k.rolling(d_period).mean()
     return k, d
+
 
 
 def cci(close: pd.Series, period: int = 20) -> pd.Series:
