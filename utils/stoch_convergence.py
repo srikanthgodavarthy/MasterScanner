@@ -103,6 +103,9 @@ def score_stochastic_convergence(
     max_bonus: int = STOCH_CONVERGENCE_MAX_BONUS,
     reignition_max_level: float = STOCH_REIGNITION_MAX_LEVEL,
     reignition_lookback: int = STOCH_REIGNITION_LOOKBACK,
+    k_period: int = 14,
+    d_period: int = 3,
+    k_smooth: int = 3,
 ) -> StochConvergenceSignal:
     """
     Grade "Stochastic Convergence" on a 0..max_bonus scale:
@@ -122,10 +125,19 @@ def score_stochastic_convergence(
     no such ceiling since it's unambiguously fresh by construction. Either
     kind is discarded entirely if today's bar no longer holds %K >= %D —
     a cross that has since reversed is invalidated, not merely aged.
+
+    [2026-07-29] k_period/d_period/k_smooth default to 14/3/3 — TradingView's
+    out-of-the-box "Stochastic" study inputs — so the STOCH↑ column can be
+    validated bar-for-bar against a chart with default settings. Previously
+    this called the shared stochastic() with no k_smooth at all (raw,
+    unsmoothed %K), which cross-timed differently from what any TradingView
+    "Stochastic" chart shows. Also matches the convention already used in
+    utils.cci_stochastic_signal.SignalParams (k_period=14, d_period=3,
+    smooth_k=3).
     """
     sig = StochConvergenceSignal()
 
-    k_s, d_s = stochastic(high, low, close)
+    k_s, d_s = stochastic(high, low, close, k_period=k_period, d_period=d_period, k_smooth=k_smooth)
     n = len(k_s)
     cur_k  = _safe_last(k_s, default=50.0)
     cur_d  = _safe_last(d_s, default=50.0)
