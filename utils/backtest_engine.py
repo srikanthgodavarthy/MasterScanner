@@ -382,6 +382,47 @@ def generate_signals_historical(
             elif _rr < (settings or {}).get("backtest_min_rr", 2.0):
                 _rejection_reason = "POOR_RR"
 
+        # ── UNIVERSE-WIDE PROMO BYPASS [2026-07-29] ──────────────────
+        # Mirrors the live Scanner's bypass (utils/promotion_engine.py
+        # evaluate_promotion(..., bypass_tier_gate=True)): a bar CV1
+        # rejected (BELOW_ACTIONABLE) can still be admitted on timing
+        # signals alone (Stoch/VWAP/LL/Institutional) — no Leadership/
+        # Conviction/Entry Quality floor. This is the SAME admission
+        # rule the live Scanner now applies, so this backtest can
+        # actually validate it before it's trusted live.
+        #
+        # CRITICAL — causal OBV slicing: evaluate_promotion()'s
+        # Institutional Confirmation leg calls obv_new_high(obv, 10),
+        # which reads obv.iloc[-1] — "the last row of whatever series
+        # you pass it." The live Scanner's `ia` is naturally sliced to
+        # "as of today," so -1 means today. This backtest's `ia` is
+        # built ONCE for the full historical range and reused across
+        # every bar in this loop — passing it in unsliced would let
+        # obv_new_high() see OBV values from bars AFTER i, a lookahead
+        # bug identical in kind to the VIX-snapshot and
+        # rolling(center=True) bugs already fixed in this engine. We
+        # build a causally-sliced ia (ia.c/.v truncated to :i+1) just
+        # for this call so "today" inside evaluate_promotion() really
+        # means bar i, not the end of the dataset.
+        _bypass_promoted = False
+        if _rejection_reason.startswith("BELOW_ACTIONABLE"):
+            from utils.promotion_engine import evaluate_promotion as _eval_promo_bypass
+
+            class _CausalIA:
+                __slots__ = ("c", "v")
+
+            _ia_causal = _CausalIA()
+            _ia_causal.c = ia.c.iloc[: i + 1]
+            _ia_causal.v = ia.v.iloc[: i + 1]
+
+            _promo_bypass = _eval_promo_bypass(
+                r, _base_tier, ia=_ia_causal, settings=settings or {},
+                bypass_tier_gate=True,
+            )
+            if _promo_bypass.promoted:
+                _bypass_promoted = True
+                _rejection_reason = ""   # admit — timing alone qualified it
+
         # ── Shadow diagnostic: Entry-Quality component audit ─────────
         # Default OFF — zero production behavior change. When explicitly
         # enabled via settings["shadow_no_admission_gate"], gate 2/3
@@ -480,6 +521,7 @@ def generate_signals_historical(
             # ── Shadow diagnostic: EQ component audit (additive only) ──
             "passed_gate":         _passed_gate,
             "gate_rejection_reason": _rejection_reason,
+            "admitted_via_promo_bypass": _bypass_promoted,
             "eq_ema20_dist":       _cv1.eq_ema20_dist,
             "eq_ema50_dist":       _cv1.eq_ema50_dist,
             "eq_pivot_dist":       _cv1.eq_pivot_dist,

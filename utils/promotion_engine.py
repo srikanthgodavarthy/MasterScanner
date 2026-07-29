@@ -161,6 +161,11 @@ class PromotionResult:
     applicable: bool = False     # False when called on a non-Actionable setup
     promoted:   bool = False     # True when timing confirms Execute/Elite
     tier:       str  = "Actionable"   # "Actionable" | "Execute" | "Elite"
+    bypassed:   bool = False     # True when this result came from a
+                                  # bypass_tier_gate=True call on a setup
+                                  # CV1 had NOT classified as Actionable
+                                  # (i.e. Leadership/Conviction/EQ never
+                                  # qualified it — timing alone did)
 
     promo_score: int = 0         # 0-100, sum of the four signal weights
 
@@ -253,6 +258,7 @@ def evaluate_promotion(
     tier: str,
     ia=None,
     settings: Optional[dict] = None,
+    bypass_tier_gate: bool = False,
 ) -> PromotionResult:
     """
     Evaluate whether an Actionable setup should be promoted to
@@ -263,7 +269,8 @@ def evaluate_promotion(
     r        : the scanner BarResult for this stock (already computed —
                no new indicators are calculated here)
     tier     : the base CV1 tier from conviction_score_v1.classify_tier().
-               Promotion only ever runs when tier == "Actionable".
+               Promotion only ever runs when tier == "Actionable", unless
+               bypass_tier_gate is set (see below).
     ia       : optional IndicatorArrays — enables the OBV leg of the
                Institutional Confirmation signal. Safe to omit.
     settings : optional settings dict — reads "min_risk_reward" (Execute
@@ -271,19 +278,29 @@ def evaluate_promotion(
                2.0), "promo_execute_score_min" (default 50) and
                "promo_elite_score_min" (default 75) if present. All four
                are plain overrides, freely adjustable in either direction.
+    bypass_tier_gate : [2026-07-29, universe-wide promo bypass] when True,
+               timing signals are evaluated regardless of `tier` —
+               including on Skip/Watch/Developing setups CV1 rejected.
+               A qualifying Promo Score is sufficient on its own; CV1
+               Leadership/Conviction/Entry Quality are NOT re-checked
+               here. Caller decides what a bypassed promotion means
+               downstream — this module only reports `applicable=True`
+               plus the tier the timing signals earned.
 
     Returns
     -------
-    PromotionResult — never demotes; if tier != "Actionable" the result
-    is `applicable=False` and callers should just keep the original tier.
+    PromotionResult — never demotes; if tier != "Actionable" and
+    bypass_tier_gate is False, the result is `applicable=False` and
+    callers should just keep the original tier.
     """
     settings = settings or {}
     res = PromotionResult()
 
-    if tier != "Actionable":
+    if tier != "Actionable" and not bypass_tier_gate:
         return res   # Promotion Engine only evaluates Actionable setups
 
     res.applicable = True
+    res.bypassed = bool(bypass_tier_gate and tier != "Actionable")
 
     # ── Timing signals ──────────────────────────────────────────
     # Three independent stochastic checks — each answers a different

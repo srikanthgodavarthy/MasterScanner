@@ -1685,6 +1685,25 @@ def score_stock(
 
         base_tier = classify_tier_v3(cv1.leadership, cv1.conviction, cv1.entry_quality, thresholds=settings)
 
+        # ── UNIVERSE-WIDE PROMO BYPASS [2026-07-29] ──
+        # Evaluate timing signals on EVERY symbol, not just ones CV1 has
+        # already qualified as Actionable. If Promo Score clears the
+        # Execute/Elite bar (with its own R:R gate) on its own, that's
+        # sufficient — the symbol goes straight to action even if
+        # base_tier is Skip/Watch/Developing (CV1 never vetted its
+        # Leadership/Conviction/Entry Quality). This is a deliberate,
+        # requested trade-off: pure timing confirmation, no quality
+        # floor. A stock can reach Execute/Elite here on stochastic +
+        # VWAP + LL + volume signals alone. See promotion_engine.py's
+        # `bypass_tier_gate` docstring.
+        _promo_bypass = evaluate_promotion(
+            r, base_tier, ia=ia, settings=settings or {}, bypass_tier_gate=True
+        )
+        if _promo_bypass.bypassed and _promo_bypass.promoted:
+            promo = _promo_bypass
+        else:
+            promo = evaluate_promotion(r, base_tier, ia=ia, settings=settings or {})
+
         # ── STRUCTURAL GATE (opt-in — default False for A/B backtesting) ──
         # Decision Engine computes hard structural failure conditions and
         # an independent Lifecycle read (which factors in its own fuller
@@ -1714,8 +1733,6 @@ def score_stock(
             elif ds is not None and ds.lifecycle == "EXTENDED":
                 base_tier = "Watch"
                 _gate_reason = "lifecycle=EXTENDED"
-
-        promo = evaluate_promotion(r, base_tier, ia=ia, settings=settings or {})
 
         # ── NATURAL V3 SCORE → EXECUTE/ELITE (not gated by Promo Score) ──
         # cv1.signal_class (_classify_v3) independently qualifies EXECUTE/
@@ -1764,6 +1781,12 @@ def score_stock(
             and promo_rank > max(base_rank, natural_rank)
         )
         result["PromoScore"]         = promo.promo_score
+        # True only when this symbol reached Execute/Elite via the
+        # universe-wide bypass — i.e. CV1 never classified it Actionable
+        # (base_tier was Skip/Watch/Developing) and timing signals alone
+        # carried it. Distinguish these in any UI/export that cares —
+        # they never had Leadership/Conviction/Entry Quality vetted.
+        result["PromotedByBypass"]   = bool(promo.bypassed and promo.promoted)
         result["PromoRR"]            = promo.risk_reward
         result["Promo_StochUp"]      = promo.stoch_up
         result["Promo_LLConfirmed"]  = promo.ll_confirmed
