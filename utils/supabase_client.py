@@ -64,6 +64,44 @@ def _is_available() -> bool:
     return get_client() is not None
 
 
+def _execute_with_retry(request_builder, max_retries: int = 2):
+    """Execute a supabase-py request builder (anything with .execute()),
+    retrying on a transient dropped-connection error.
+
+    2026-07-29: get_client() above is @st.cache_resource — ONE Supabase
+    client, and one underlying httpx/httpcore HTTP/2 connection pool,
+    lives for the entire process lifetime, including
+    scheduler/scan_worker.py's background threads which can run for
+    hours. Supabase's edge periodically closes idle HTTP/2 connections
+    server-side; the pool doesn't find out until it tries to reuse that
+    connection, surfacing as httpx.RemoteProtocolError("Server
+    disconnected") on an otherwise healthy request — this hit
+    upsert_fo_setup_plans_batch() and scan_state.save_snapshot() in the
+    SAME instant on 2026-07-29 because both share this one cached
+    client; it was one dropped connection, not two separate failures.
+    A retry almost always succeeds immediately (the pool either reuses
+    a still-alive connection or opens a fresh one) — this is cheap
+    insurance against that specific transient class, not a fix for the
+    underlying idle-connection teardown itself. Only retries
+    httpx.RemoteProtocolError; any other exception (auth, schema,
+    payload) is raised on the first attempt as before, unchanged.
+    """
+    import httpx
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_retries + 1):
+        try:
+            return request_builder.execute()
+        except httpx.RemoteProtocolError as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                logger.warning(
+                    "Supabase request hit a dropped connection (attempt %d/%d): %s — retrying",
+                    attempt + 1, max_retries + 1, exc,
+                )
+    raise last_exc
+
+
 # ─── SCAN SNAPSHOTS ───────────────────────────────────────────────────────────
 
 def save_scan_snapshot(df: pd.DataFrame, label: str = "") -> bool:
@@ -1262,10 +1300,9 @@ def upsert_fo_setup_plans_batch(plans: list[dict]) -> bool:
     try:
         batch_size = 200
         for i in range(0, len(clean), batch_size):
-            resp = (
+            resp = _execute_with_retry(
                 client.table("fo_setup_plans")
                 .upsert(clean[i: i + batch_size], on_conflict="setup_id")
-                .execute()
             )
             if resp.data is None:
                 return False

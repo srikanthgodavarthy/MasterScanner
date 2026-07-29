@@ -168,7 +168,8 @@ def save_snapshot(
         "payload":    payload if status == "completed" else None,
     }
     try:
-        resp = client.table(_table(section)).insert(row).execute()
+        from utils.supabase_client import _execute_with_retry
+        resp = _execute_with_retry(client.table(_table(section)).insert(row))
         if not resp.data:
             logger.error("save_snapshot(%s) insert returned no data.", section)
             return None
