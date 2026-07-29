@@ -3225,22 +3225,20 @@ def render(settings: dict | None = None):
                 unsafe_allow_html=True,
             )
 
-    # ── Kick off the background scanners ──────────────────────────────
-    # Deliberately placed here: AFTER the synchronous Supabase read above
-    # and the ctrl2 block that displays it, so the sequence on a fresh
-    # session is always "read Supabase, show it" first, "start the
-    # market_intelligence/fo_scan/live_scanner loops" second — never the
-    # other way round. @st.cache_resource inside start_background_scans()
-    # means this is a no-op lookup (not a re-launch) on every rerun after
-    # the very first one in this process's lifetime.
-    from utils.inprocess_scheduler import start_background_scans
-    start_background_scans()
-
-    # ── Sector Rotation compute — moved up (used to happen after the
-    # Actionable table further down) so the "Full Sector Rotation
-    # Analysis" section below has its history/persistence data ready
-    # before anything renders. build_sector_stats() handles an empty
-    # df_aug gracefully, so this is safe even before a first scan. ──────
+    # ── Background scanners ─────────────────────────────────────────────
+    # [2026-07-29 bugfix] Used to be kicked off HERE, which meant the
+    # market_intelligence/fo_scan/live_scanner loops only ever started in
+    # a process that had rendered the Dashboard page at least once. On a
+    # session that deep-links straight into another page (e.g. Scanner,
+    # via st.navigation's URL routing) — or a fresh container where the
+    # first hit just happens to land elsewhere — start_background_scans()
+    # never fired, so fo_scan_snapshots/market_intelligence_snapshots
+    # stayed permanently empty and their panels showed "hasn't completed
+    # successfully yet" forever, no matter how long the app had been
+    # running. Moved to app.py, called once after st.navigation routes to
+    # whichever page was actually opened first — same @st.cache_resource
+    # dedup, same "show what's already in Supabase first" ordering, just
+    # no longer dependent on Dashboard specifically being that first page.
     sector_stats = build_sector_stats(df_aug)
 
     from utils.supabase_client import save_sector_snapshot, load_sector_snapshot_history
