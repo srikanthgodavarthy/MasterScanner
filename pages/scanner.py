@@ -3607,7 +3607,15 @@ def render(settings: dict | None = None):
             try:
                 from utils.scan_state import save_snapshot
                 from utils.system_state import set_manual_override
-                _safe = df_aug.astype(object).where(df_aug.notnull(), None)
+                # 2026-07-29: was `df_aug.astype(object).where(df_aug.notnull(), None)`
+                # — that only ever catches NaN, since notnull() treats +/-inf
+                # as a valid, non-null value. sanitize_dataframe() (see
+                # utils/json_sanitize.py) replaces inf/-inf too, and logs any
+                # column that needed it — same fix applied to fo_scan and the
+                # background live_scanner loop after the F&O snapshot
+                # serialization bug (utils/fo_scan.py's compute_fo_scan()).
+                from utils.json_sanitize import sanitize_dataframe
+                _safe = sanitize_dataframe(df_aug, "scanner.manual_run_scan")
                 save_snapshot("live_scanner", payload={"data": _safe.to_dict("records")},
                               row_count=len(df_aug), status="completed")
                 # Tell the live_scanner sub-scheduler this snapshot is

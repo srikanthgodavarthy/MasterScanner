@@ -109,10 +109,54 @@ def save_snapshot(
     inserts from a single producer without needing a DB sequence, and
     directly comparable as an int on the read side (no datetime parsing
     in the hot polling path).
+
+    2026-07-29 bugfix — NaN/inf JSON serialization: `payload` can contain
+    Python float('nan')/float('inf') values (a producer's DataFrame had a
+    missing indicator input, or a ratio divided by zero) that Python's
+    JSON encoder — invoked internally by supabase-py's insert() below —
+    rejects with `ValueError: Out of range float values are not JSON
+    compliant: nan`. Previously that exception was caught by the generic
+    `except Exception` below, logged as an opaque "save_snapshot failed",
+    and surfaced to callers (scheduler/scan_worker.py's _run_loop) as a
+    bare `None` — indistinguishable from an actual Supabase outage, and
+    the resulting "save_snapshot returned no scan_id (Supabase
+    unavailable?)" warning actively misled whoever was debugging it.
+
+    Two things fix this:
+    1. `sanitize_for_json()` runs on every completed payload before
+       insert — a safety net for every section (market_intelligence,
+       live_scanner, fo_scan, and anything added later), regardless of
+       whether the producer already sanitized its own DataFrame (see
+       utils.fo_scan.compute_fo_scan() for the producer-side fix, which
+       should mean this rarely finds anything left to do — a hit here
+       is itself a signal that some OTHER producer needs the same
+       treatment upstream).
+    2. `ValueError` from the insert call is now caught and logged
+       separately from any other exception, with the specific field
+       names that were the problem, so a genuinely NEW way to still
+       produce invalid JSON (something sanitize_for_json() doesn't
+       cover) is immediately diagnosable instead of looking like a
+       connectivity issue.
     """
     client = _client()
     if client is None:
         return None
+
+    from utils.json_sanitize import collect_invalid_field_names, sanitize_for_json
+
+    if status == "completed" and payload is not None:
+        invalid_fields = collect_invalid_field_names(payload)
+        if invalid_fields:
+            logger.warning(
+                "[%s] payload contained non-JSON-compliant float value(s) "
+                "(NaN/inf) in field(s) %s — replacing with null before "
+                "save. This should normally be caught upstream by the "
+                "producer's own sanitize_dataframe() call; if you're "
+                "seeing this regularly for %s, check the DataFrame that "
+                "field comes from.",
+                section, sorted(invalid_fields), section,
+            )
+        payload = sanitize_for_json(payload)
 
     scan_id = str(uuid.uuid4())
     row = {
@@ -129,6 +173,21 @@ def save_snapshot(
             logger.error("save_snapshot(%s) insert returned no data.", section)
             return None
         return scan_id
+    except ValueError as exc:
+        # Should be rare now that the sanitization above runs unconditionally
+        # — reaching here means a value slipped past both the producer's
+        # sanitize_dataframe() and this function's sanitize_for_json(), e.g.
+        # a non-float type the JSON encoder also rejects. Logged distinctly
+        # from the generic except-Exception below (which still handles real
+        # connectivity/auth/schema failures) precisely so this specific,
+        # previously-silent-and-misleading failure mode is never mistaken
+        # for "Supabase is down" again.
+        logger.error(
+            "[%s] snapshot serialization failed — invalid JSON value(s) "
+            "detected in payload even after sanitization. Original error: %s",
+            section, exc, exc_info=True,
+        )
+        return None
     except Exception:
         logger.exception("save_snapshot(%s) failed", section)
         return None

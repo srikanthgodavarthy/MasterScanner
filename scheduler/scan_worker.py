@@ -160,7 +160,15 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
                 logger.info("[%s] snapshot saved scan_id=%s rows=%s (%.1fs)",
                             name, scan_id, row_count, time.time() - started)
             else:
-                logger.warning("[%s] save_snapshot returned no scan_id (Supabase unavailable?)", name)
+                # 2026-07-29: no longer assume "Supabase unavailable?" here —
+                # save_snapshot() (utils/scan_state.py) now logs the SPECIFIC
+                # reason a save returns None (missing client, insert-returned-
+                # no-data, a JSON-serialization ValueError with the offending
+                # field names, or a genuine other exception) right above this
+                # line. This warning is just the "so no new snapshot exists
+                # this cycle" summary — check the save_snapshot log line
+                # immediately preceding it for the actual cause.
+                logger.warning("[%s] save_snapshot returned no scan_id — see save_snapshot log above for the reason", name)
         except Exception as exc:
             logger.exception("[%s] compute failed", name)
             try:
@@ -229,7 +237,26 @@ def _live_scan_records(df: pd.DataFrame) -> list[dict]:
     # path can't reintroduce the same "Object of type BarResult is not
     # JSON serializable" crash on .to_dict("records") below.
     df = df.drop(columns=["_bar_result"], errors="ignore")
-    safe = df.astype(object).where(pd.notnull(df), None)
+    # 2026-07-29: the previous `.astype(object).where(df.notnull(), None)`
+    # here only ever caught NaN — `notnull()` treats +/-inf as a valid,
+    # non-null value, so a ratio-divided-by-zero anywhere in the scoring
+    # pipeline (e.g. a relative-strength or volume-ratio column) could
+    # still reach save_snapshot("live_scanner", ...) as a raw inf and hit
+    # the same "Out of range float values are not JSON compliant" failure
+    # diagnosed and fixed for fo_scan (see utils/fo_scan.py's
+    # compute_fo_scan() and utils/json_sanitize.py for the full writeup).
+    # utils.scan_state.save_snapshot()'s own generic safety net would have
+    # caught it too, but sanitizing at the source gives column-level
+    # diagnostics instead of a generic warning.
+    from utils.json_sanitize import find_invalid_columns, sanitize_dataframe
+
+    invalid = find_invalid_columns(df)
+    if invalid:
+        logger.warning(
+            "[live_scanner] invalid numeric values (NaN/inf) detected "
+            "before snapshot save: %s", invalid,
+        )
+    safe = sanitize_dataframe(df, "live_scanner")
     return safe.to_dict("records")
 
 

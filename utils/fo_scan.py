@@ -802,12 +802,47 @@ def compute_fo_scan(cfg: Optional[DORESettings] = None) -> dict:
     pool over the shared universe (each is already a self-contained
     "convenience single call" — see their own docstrings), so this is
     a plain two-call orchestrator, not a rewrite of either.
+
+    2026-07-29 bugfix #2 — NaN/inf serialization: top_futures_opportunities()
+    / top_options_opportunities() can legitimately produce NaN (an
+    indicator input missing for a thin contract) or +/-inf (a ratio
+    divided by a prior value of zero — e.g. premium-change % when the
+    prior premium was 0) in their numeric columns. Passed straight
+    through .to_dict("records"), those become Python float('nan') /
+    float('inf'), which Python's JSON encoder — called internally by
+    supabase-py's insert(), deep inside utils.scan_state.save_snapshot()
+    — rejects with `ValueError: Out of range float values are not JSON
+    compliant: nan`. That exception was previously only visible as a
+    misleading "save_snapshot returned no scan_id (Supabase unavailable?)"
+    warning in scheduler/scan_worker.py's loop, with the actual traceback
+    buried in save_snapshot()'s own exception log — the Scanner page
+    then just kept showing the last (or empty) snapshot forever, with no
+    obvious link back to the real cause.
+    utils.json_sanitize.sanitize_dataframe() below fixes it at the
+    source (logging exactly which column(s) and how many invalid values,
+    before nulling them) rather than relying solely on save_snapshot()'s
+    generic safety net to catch it after the fact.
     """
     cfg = _load_settings(cfg)
     universe = stage0_universe()
 
     futures_df = top_futures_opportunities(universe=universe, cfg=cfg)
     options_df = top_options_opportunities(universe=universe, cfg=cfg)
+
+    from utils.json_sanitize import find_invalid_columns, sanitize_dataframe
+
+    futures_invalid = find_invalid_columns(futures_df)
+    options_invalid = find_invalid_columns(options_df)
+    if futures_invalid or options_invalid:
+        logger.warning(
+            "[fo_scan] invalid numeric values (NaN/inf) detected before "
+            "snapshot save — futures=%s options=%s (see per-column detail "
+            "below from sanitize_dataframe)",
+            futures_invalid, options_invalid,
+        )
+
+    futures_df = sanitize_dataframe(futures_df, "fo_scan.futures")
+    options_df = sanitize_dataframe(options_df, "fo_scan.options")
 
     return {
         "futures": futures_df.to_dict("records") if not futures_df.empty else [],
