@@ -1053,30 +1053,55 @@ def fetch_nearest_expiry(index: str = "NIFTY") -> str | None:
         return None
 
 
-@st.cache_data(ttl=60, show_spinner=False)
 def _get_option_chain_with_retry(instrument_key: str, expiry: str) -> Optional[list]:
-    """Throttled, retrying GET for /v2/option/chain — shared by
-    fetch_oi_resistance() and fetch_stock_atm_option(). 2026-07-20: both
-    previously called requests.get() directly with ZERO rate-limit
-    protection (no _wait_for_spacing(), no 429 backoff/retry) — unlike
-    every candle-fetching function in this module. That made Stage 3's
-    per-symbol option-chain fetch (15-25 stocks, one call each) fragile
-    to a single early 429: raise_for_status() throws, the caller's
-    generic except catches it, the symbol is silently dropped, no retry
-    is ever attempted. That's the second half of why the F&O Opportunity
-    Engine was still surfacing ~1 name after Stage 2's concurrency fix —
-    Stage 3 could still collapse the same way, just later in the funnel.
+    """Cached + rate-limited + retrying GET for /v2/option/chain —
+    shared by fetch_oi_resistance() and fetch_stock_atm_option().
+
+    2026-07-20: both previously called requests.get() directly with
+    ZERO rate-limit protection (no _wait_for_spacing(), no 429
+    backoff/retry) — unlike every candle-fetching function in this
+    module. That made Stage 3's per-symbol option-chain fetch (15-25
+    stocks, one call each) fragile to a single early 429: the symbol
+    was silently dropped, no retry ever attempted.
+
+    2026-07-29: option-chain requests were STILL 429-ing in bursts
+    (~18 distinct instrument_keys within 2s of each other) even with
+    that fix, because every option-chain call shared the SAME
+    process-wide 20 req/s budget (_wait_for_spacing()) as candle/quote
+    traffic — a budget sized for small candle/quote payloads, not the
+    much heavier option-chain endpoint. Fixed by moving option-chain
+    onto its own dedicated, more conservative token bucket
+    (utils.option_chain_diagnostics.acquire_option_chain_slot(), 3
+    req/s) instead of _wait_for_spacing(), and by adding an explicit,
+    instrumented 60s cache in front of the network call (replacing the
+    opaque @st.cache_data(ttl=60) this used to carry) so repeat lookups
+    for the same (instrument_key, expiry) within a scan cycle — e.g.
+    fetch_oi_resistance() and fetch_stock_atm_option() both touching an
+    index chain, or two DORE stages polling the same symbol — cost zero
+    extra requests. Every attempt, cache hit/miss, rate-limit, and
+    failure is recorded via utils.option_chain_diagnostics for the
+    scan-level diagnostics report (Stage 3's "Option Chain Diagnostics").
 
     Returns the parsed chain list (resp.json()["data"]), or None on a
     401 / repeated failure — same fail-soft contract both callers had
     before this refactor.
     """
+    from utils.option_chain_diagnostics import (
+        acquire_option_chain_slot, get_cached_chain, store_chain,
+        record_request, record_rate_limited, record_failed,
+    )
+
+    cached = get_cached_chain(instrument_key, expiry)
+    if cached is not None:
+        return cached
+
     headers = _auth_headers()
     if headers is None:
         return None
     last_exc = None
     for attempt in range(1, _MAX_RETRIES + 1):
-        _wait_for_spacing()
+        acquire_option_chain_slot()
+        t0 = time.monotonic()
         try:
             resp = requests.get(
                 f"{BASE_URL}/v2/option/chain",
@@ -1084,7 +1109,9 @@ def _get_option_chain_with_retry(instrument_key: str, expiry: str) -> Optional[l
                 params={"instrument_key": instrument_key, "expiry_date": expiry},
                 timeout=15,
             )
+            record_request(time.monotonic() - t0)
             if resp.status_code == 429:
+                record_rate_limited()
                 backoff = _RETRY_BASE_S * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
                 logger.warning("Upstox rate-limited on option-chain %s, retrying in %.1fs", instrument_key, backoff)
                 time.sleep(backoff)
@@ -1093,10 +1120,14 @@ def _get_option_chain_with_retry(instrument_key: str, expiry: str) -> Optional[l
                 logger.warning("Upstox 401 on option-chain %s — token expired or invalid", instrument_key)
                 return None
             resp.raise_for_status()
-            return resp.json().get("data", [])
+            chain = resp.json().get("data", [])
+            store_chain(instrument_key, expiry, chain)
+            return chain
         except Exception as exc:
+            record_request(time.monotonic() - t0)
             last_exc = exc
             time.sleep(_RETRY_BASE_S * attempt)
+    record_failed(instrument_key)
     logger.warning("Upstox option-chain failed for %s after %d attempts: %s",
                     instrument_key, _MAX_RETRIES, last_exc)
     return None
@@ -1757,15 +1788,29 @@ def fetch_batch_stock_atm_options_upstox(symbols: list, progress_cb=None) -> dic
     with no listed options / a failed fetch are simply omitted, same
     fail-soft-per-symbol contract as every other batch fetcher here.
     """
+    from utils.option_chain_diagnostics import (
+        _OC_MAX_WORKERS, record_symbols_evaluated, record_failed,
+    )
+
     if not symbols:
         return {}
     if is_token_expired():
         logger.warning("Upstox token likely expired (past 3:30 AM IST) — skipping ATM-option batch fetch")
         return {}
 
+    record_symbols_evaluated(len(symbols))
+
     result: dict = {}
     done = 0
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+    # 2026-07-29: was using the general _MAX_WORKERS=12 pool sized for
+    # candle/quote fetches. Option-chain now has its own smaller worker
+    # cap (_OC_MAX_WORKERS, see utils.option_chain_diagnostics) so this
+    # batch can't fan out more concurrent /v2/option/chain requests than
+    # the dedicated rate limiter is tuned for — the workers would just
+    # queue up behind acquire_option_chain_slot() otherwise, but keeping
+    # the pool itself smaller avoids holding 12 threads + retries open
+    # at once for an endpoint budgeted at 3 req/s.
+    with ThreadPoolExecutor(max_workers=_OC_MAX_WORKERS) as pool:
         futures = {pool.submit(fetch_stock_atm_option, sym): sym for sym in symbols}
         for fut in as_completed(futures):
             sym = futures[fut]
@@ -1773,8 +1818,17 @@ def fetch_batch_stock_atm_options_upstox(symbols: list, progress_cb=None) -> dic
                 opt = fut.result()
                 if opt is not None:
                     result[sym] = opt
+                else:
+                    # Fetch returned cleanly but no data (no listed
+                    # options / repeated failure already logged +
+                    # recorded inside _get_option_chain_with_retry).
+                    # Mark explicitly so the caller (DORE Stage 3) can
+                    # report OPTION_CHAIN_UNAVAILABLE instead of the
+                    # symbol just silently vanishing from the funnel.
+                    record_failed(sym)
             except Exception as exc:
                 logger.warning("Upstox ATM-option batch fetch failed for %s: %s", sym, exc)
+                record_failed(sym)
             done += 1
             if progress_cb:
                 progress_cb(done, len(symbols))

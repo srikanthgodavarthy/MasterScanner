@@ -417,21 +417,66 @@ _ACTIONABLE = {
 
 def compute_fo_opportunities(
     live_pool: dict, cfg: Optional[DORESettings] = None, progress_cb=None,
+    max_option_chain_symbols: int = 25,
 ) -> pd.DataFrame:
     """Runs Stage 3 (Derivative Intelligence, live Upstox chain — the
     one expensive stage) + Stage 4 (Risk Engine) + Stage 5 (Opportunity
     Ranking) over the Stage-2 Live Candidate Pool. No new fetch happens
     after this function — Stages 4-5 are pure composition of Stages 1-3.
 
+    2026-07-29: Stage 2's Live Candidate Pool is documented as "15-25"
+    but that's an expectation, not an enforced cap — on a volatile
+    session it can run well past that, and every one of those symbols
+    used to get its own /v2/option/chain call. Combined with Stage 3
+    having no dedicated rate budget (see utils.upstox_client's
+    2026-07-29 note on _get_option_chain_with_retry), that's what
+    produced bursts of 429s. `max_option_chain_symbols` now hard-caps
+    how many stock symbols reach the option-chain fetch, shortlisted by
+    Execution Score (falling back to Trend Score) — the same signals
+    Stage 2 already used to decide readiness, just now also used to
+    pick WHO among the ready symbols gets the expensive call first.
+    Indices are never shortlisted (at most 3, and Market Intelligence
+    already depends on their OI/PCR regardless of DORE).
+
     Returns one row per live-pool symbol with a live option chain,
     carrying the full DOREResult (recommendation, scores, TradePlan).
+    Diagnostics for this pass (symbols evaluated, option-chain requests,
+    cache hits/misses, rate-limited/failed counts, avg latency, and
+    which symbols came back OPTION_CHAIN_UNAVAILABLE) are attached to
+    the returned DataFrame at `.attrs["option_chain_diagnostics"]` —
+    see utils.option_chain_diagnostics.get_option_chain_stats().
     """
     cfg = _load_settings(cfg)
     from utils.upstox_client import fetch_oi_resistance, fetch_batch_stock_atm_options_upstox
     from utils.oi_snapshot_store import record_and_diff, record_and_diff_premium
+    from utils.option_chain_diagnostics import reset_option_chain_stats, get_option_chain_stats
+
+    # Reset once per Stage-3 pass so diagnostics reflect THIS scan
+    # cycle only (same pattern as utils.scan_diagnostics.reset_fetch_stats()).
+    reset_option_chain_stats()
 
     symbols = list(live_pool.keys())
     stock_symbols = [s for s in symbols if s not in _INDICES]
+
+    # Shortlist: only the top `max_option_chain_symbols` stock symbols
+    # (by Execution Score, then Trend Score as a tiebreak/fallback) go
+    # on to the expensive option-chain fetch. Symbols trimmed here never
+    # reach Stage 3-5 this cycle — same fail-soft contract as any other
+    # symbol Stage 1/2 didn't qualify; they're simply re-evaluated next
+    # cycle once the pool refreshes.
+    if len(stock_symbols) > max_option_chain_symbols:
+        stock_symbols = sorted(
+            stock_symbols,
+            key=lambda s: (
+                live_pool[s].get("execution_score", 0) or 0,
+                live_pool[s].get("trend_score", 0) or 0,
+            ),
+            reverse=True,
+        )[:max_option_chain_symbols]
+        logger.info(
+            "[DORE Stage3] Live Candidate Pool exceeded max_option_chain_symbols=%d; "
+            "shortlisted top %d by Execution/Trend Score", max_option_chain_symbols, len(stock_symbols),
+        )
 
     # 2026-07-22: was calling fetch_stock_atm_option() one symbol at a
     # time in a sequential for-loop — the same anti-pattern Stage 2 had
@@ -467,6 +512,16 @@ def compute_fo_opportunities(
             else:
                 opt = stock_atm_options.get(symbol)
                 if opt is None:
+                    # Either the option-chain fetch failed after
+                    # retries (already recorded as OPTION_CHAIN_UNAVAILABLE
+                    # by fetch_batch_stock_atm_options_upstox — see
+                    # utils.option_chain_diagnostics.get_option_chain_stats()
+                    # ["unavailable_symbols"]) or `symbol` was trimmed by
+                    # the max_option_chain_symbols shortlist above. Either
+                    # way: skip THIS symbol only and keep processing the
+                    # rest of the pool — never retry the whole universe.
+                    logger.debug("[DORE Stage3] %s has no option-chain data this cycle "
+                                 "(unavailable or not shortlisted) — skipping", symbol)
                     continue
                 atm_chain_row = dict(opt)
                 oi_resistance_like = {"ce_strike": opt.get("ce_wall_strike"),
@@ -612,9 +667,29 @@ def compute_fo_opportunities(
         })
 
     out = pd.DataFrame(rows)
+    # Diagnostics for THIS Stage-3 pass — symbols evaluated, option-chain
+    # requests made, cache hits/misses, rate-limited/failed counts, avg
+    # latency, and which symbols came back OPTION_CHAIN_UNAVAILABLE.
+    # Attached via .attrs (a side channel pandas ignores for column-wise
+    # ops — same pattern as utils.scan_diagnostics), so existing callers
+    # that only read out's columns are unaffected.
+    diagnostics = get_option_chain_stats()
+    if diagnostics["failed"] or diagnostics["rate_limited"]:
+        logger.warning(
+            "[DORE Stage3] Option Chain Diagnostics: evaluated=%d requests=%d "
+            "cache_hits=%d cache_misses=%d rate_limited=%d failed=%d "
+            "avg_latency=%.3fs unavailable=%s",
+            diagnostics["symbols_evaluated"], diagnostics["requests_made"],
+            diagnostics["cache_hits"], diagnostics["cache_misses"],
+            diagnostics["rate_limited"], diagnostics["failed"],
+            diagnostics["avg_latency_s"], diagnostics["unavailable_symbols"],
+        )
     if out.empty:
+        out.attrs["option_chain_diagnostics"] = diagnostics
         return out
-    return out.sort_values("Opportunity Score", ascending=False).reset_index(drop=True)
+    out = out.sort_values("Opportunity Score", ascending=False).reset_index(drop=True)
+    out.attrs["option_chain_diagnostics"] = diagnostics
+    return out
 
 
 def top_fo_opportunities(
@@ -647,12 +722,15 @@ def top_fo_opportunities(
         return pd.DataFrame()
 
     opportunities = compute_fo_opportunities(live_pool, cfg, progress_cb=progress_cb)
+    diagnostics = opportunities.attrs.get("option_chain_diagnostics")
     if opportunities.empty:
         return opportunities
 
     actionable = opportunities[opportunities["Recommendation"].isin(_ACTIONABLE)]
     actionable = actionable.head(top_n).reset_index(drop=True)
     if actionable.empty:
+        if diagnostics is not None:
+            actionable.attrs["option_chain_diagnostics"] = diagnostics
         return actionable
 
     # Attach the 'Plan' lifecycle column (WAITING/ACTIVE/T1_HIT/...) and
@@ -673,6 +751,8 @@ def top_fo_opportunities(
         logger.exception("[DORE Options] Plan lifecycle enrichment failed (non-fatal, "
                           "table renders without the Plan column)")
 
+    if diagnostics is not None:
+        actionable.attrs["option_chain_diagnostics"] = diagnostics
     return actionable
 
 
