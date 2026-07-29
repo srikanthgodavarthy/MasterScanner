@@ -408,11 +408,18 @@ def _rsi(close: pd.Series, period: int) -> pd.Series:
 
 
 def _stoch(df: pd.DataFrame, period: int, smooth: int) -> tuple[pd.Series, pd.Series]:
+    """TradingView-matching Stochastic: %K itself is smoothed by `smooth`
+    (not just %D) — previously this only smoothed %D on top of raw %K,
+    which is TradingView's "Fast Stochastic," not its default "Stochastic"
+    study. [2026-07-29] fixed to smooth %K first so k_last (used for the
+    >=80 overbought check above) lines up with what a TradingView chart
+    with default (14, 3, 3) settings shows."""
     low_min = df["low"].rolling(period).min()
     high_max = df["high"].rolling(period).max()
     rng = (high_max - low_min).replace(0, np.nan)
-    k = 100 * (df["close"] - low_min) / rng
-    k = k.fillna(50)
+    raw_k = 100 * (df["close"] - low_min) / rng
+    raw_k = raw_k.fillna(50)
+    k = raw_k.rolling(smooth).mean().fillna(raw_k)
     d = k.rolling(smooth).mean().fillna(k)
     return k, d
 
