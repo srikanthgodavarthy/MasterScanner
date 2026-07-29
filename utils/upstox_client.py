@@ -1541,6 +1541,76 @@ def _stock_futures_contracts(symbol: str) -> pd.DataFrame:
               & (df[name_col].astype(str).str.strip().str.upper() == underlying_name)]
 
 
+_LEG_TO_CHAIN_KEY = {"CE": "call_options", "PE": "put_options"}
+
+
+def resolve_option_contract_instrument_key(symbol: str, leg: str, strike: float,
+                                            expiry: str) -> Optional[str]:
+    """Resolve the EXACT option contract's own instrument_key — distinct
+    from resolve_instrument_key()/_INDEX_INSTRUMENT_KEYS, which only ever
+    resolve the UNDERLYING's key — by looking up (strike, leg) inside
+    that underlying's option chain for `expiry` via
+    _get_option_chain_with_retry(), the same 60s-cached, rate-limited
+    fetch fetch_stock_atm_option()/fetch_oi_resistance() already use —
+    so if Stage 3 touched this same chain earlier in the scan, this adds
+    zero extra network calls.
+
+    2026-07-29: added as the missing piece for
+    utils.fo_setup_persistence.enrich_fo_opportunities_df()'s
+    option_history_provider — every FOSetupPlan was stuck WAITING
+    forever (even with premium far past its locked Entry) because
+    neither utils.fo_scan nor utils.dore_fo_screener ever supplied one,
+    so find_level_cross_candle() never had real candle history to check
+    against. See fetch_option_contract_intraday_candles() below, which
+    is the actual provider wired into enrich_fo_opportunities_df().
+
+    Returns None (fail-soft) if `leg` isn't CE/PE, the underlying/chain
+    can't be resolved, or no row matches `strike` for this expiry.
+    """
+    chain_key = _LEG_TO_CHAIN_KEY.get(str(leg).upper())
+    if chain_key is None:
+        return None
+
+    symbol = symbol.upper().strip()
+    instrument_key = _INDEX_INSTRUMENT_KEYS.get(symbol) or resolve_instrument_key(symbol)
+    if instrument_key is None:
+        return None
+
+    chain = _get_option_chain_with_retry(instrument_key, expiry)
+    if not chain:
+        return None
+
+    row = next(
+        (r for r in chain if abs(float(r.get("strike_price") or 0) - float(strike)) < 0.01),
+        None,
+    )
+    if row is None:
+        return None
+    return ((row.get(chain_key) or {}).get("instrument_key")) or None
+
+
+def fetch_option_contract_intraday_candles(symbol: str, leg: str, strike: float,
+                                            expiry: str) -> pd.DataFrame:
+    """option_history_provider callable for
+    utils.fo_setup_persistence.enrich_fo_opportunities_df() — today's
+    intraday 5-minute candles for the EXACT option contract a
+    FOSetupPlan is tracking (not the ATM strike, not the underlying),
+    so find_level_cross_candle() can pinpoint the real candle where
+    premium actually crossed a locked Entry/SL/T1/T2 level instead of
+    the plan deferring forever.
+
+    Fail-soft, matching every other candle fetcher in this module:
+    returns an empty DataFrame if the contract's instrument_key can't be
+    resolved or the candle fetch itself fails — fo_setup_persistence
+    already treats a missing/unusable history as "defer to next scan",
+    never fabricates a trigger timestamp off it.
+    """
+    instrument_key = resolve_option_contract_instrument_key(symbol, leg, strike, expiry)
+    if instrument_key is None:
+        return pd.DataFrame()
+    return _fetch_intraday_candles(instrument_key, unit="minutes", interval="5")
+
+
 def resolve_futures_instrument_key(symbol: str) -> Optional[str]:
     """Nearest-expiry FUTSTK instrument_key for `symbol`, or None if the
     stock has no listed futures contract."""
