@@ -778,3 +778,38 @@ def top_futures_opportunities(top_n: int = 15, universe: Optional[list[str]] = N
 # Stage 0-5 funnel rather than an OppScore pre-filter + single-stage
 # compute_dore() call.
 top_options_opportunities = top_fo_opportunities
+
+
+def compute_fo_scan(cfg: Optional[DORESettings] = None) -> dict:
+    """
+    2026-07-29 bugfix: the missing piece from the 2026-07-23 event-aware
+    rewrite. That rewrite moved pages/scanner.py's F&O panel over to
+    reading pre-computed snapshots (utils.scan_state) instead of calling
+    top_futures_opportunities()/top_options_opportunities() inline, and
+    scheduler/scan_worker.py's _fo_scan_compute() was written to call
+    `compute_fo_scan()` as the new single entry point that produces
+    those snapshots every 60s — but this function itself was never
+    actually added here. Every fo_scan cycle has been failing with
+    ImportError since the rewrite; it just went unnoticed because a
+    separate bug (start_background_scans() only firing when Dashboard
+    happened to be the first page opened in a process) meant the loop
+    calling it usually never even started.
+
+    Runs the full futures + options funnels and returns them combined —
+    the exact shape utils.scan_state.save_snapshot("fo_scan", ...) and
+    pages/scanner.py's payload.get("futures")/payload.get("options")
+    expect. Both funnels independently re-derive their own Stage 0-2
+    pool over the shared universe (each is already a self-contained
+    "convenience single call" — see their own docstrings), so this is
+    a plain two-call orchestrator, not a rewrite of either.
+    """
+    cfg = _load_settings(cfg)
+    universe = stage0_universe()
+
+    futures_df = top_futures_opportunities(universe=universe, cfg=cfg)
+    options_df = top_options_opportunities(universe=universe, cfg=cfg)
+
+    return {
+        "futures": futures_df.to_dict("records") if not futures_df.empty else [],
+        "options": options_df.to_dict("records") if not options_df.empty else [],
+    }
