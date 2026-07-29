@@ -117,6 +117,13 @@ DORE_DEFAULTS: dict = {
     "override_vix_scalar_max":         2.5,   # ceiling on the VIX scalar (never let a VIX spike make the bar impossible)
     "override_score_bullish_min":     70.0,   # Intraday Reversal Score >= this (+ against-trend UP move) -> override BULLISH
     "override_score_bearish_max":     30.0,   # Intraday Reversal Score <= this (+ against-trend DOWN move) -> override BEARISH
+    "override_trend_conviction_weight": 0.6,  # 0-1: how much a deeply-established daily trend (trend_score
+                                               # far past trend_bullish_score_min/trend_bearish_score_max —
+                                               # e.g. after a multi-day rally) raises the override bar before
+                                               # an against-trend day can flip it. 0 = old behaviour (fixed
+                                               # 70/30 bar regardless of trend strength); 1 = a maximally
+                                               # strong trend needs an almost-0/almost-100 Intraday Reversal
+                                               # Score to override at all. See compute_effective_bias().
     # Intraday Reversal Score sub-weights (must sum to 100; SG 2026-07-27:
     # lean more on OI/PCR as the highest-conviction same-day signal, less
     # on the raw ATR-relative move by itself)
@@ -301,6 +308,7 @@ class DORESettings:
     override_vix_scalar_max: float = 2.5
     override_score_bullish_min: float = 70.0
     override_score_bearish_max: float = 30.0
+    override_trend_conviction_weight: float = 0.6
     w_reversal_vwap: float = 20.0
     w_reversal_atr_move: float = 25.0
     w_reversal_ema_cross: float = 15.0
