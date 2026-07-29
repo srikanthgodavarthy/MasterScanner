@@ -1671,6 +1671,104 @@ def load_premium_history_snapshots() -> list[dict]:
         return []
 
 
+# ─── ROTATE FLAGS ─────────────────────────────────────────────────────────────
+
+def upsert_rotate_flags(flags: list[dict]) -> dict[str, str]:
+    """
+    Persist ROTATE flags so the "since" date is stamped once and only
+    resets when the rotate target itself changes — not on every render
+    (display_action/rotate_target are recomputed fresh each render in
+    pages/portfolio.py's _apply_rotation()).
+
+    ``flags`` is a list of {"symbol": ..., "rotate_target": ...} dicts.
+
+    Returns a dict mapping UPPERCASE symbol -> since date string
+    ("YYYY-MM-DD"). Returns {} if Supabase is unavailable or ``flags``
+    is empty — callers treat a missing key as "no stamp available".
+    """
+    client = get_client()
+    if client is None or not flags:
+        return {}
+
+    symbols = [str(f.get("symbol", "")).upper().strip() for f in flags if f.get("symbol")]
+    symbols = [s for s in symbols if s]
+    if not symbols:
+        return {}
+
+    try:
+        existing_resp = (
+            client.table("rotate_flags")
+            .select("symbol, rotate_target, since")
+            .in_("symbol", symbols)
+            .execute()
+        )
+        existing = {row["symbol"]: row for row in (existing_resp.data or [])}
+    except Exception as exc:
+        logger.warning("upsert_rotate_flags read failed (non-fatal): %s", exc)
+        existing = {}
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    rows: list[dict] = []
+    result: dict[str, str] = {}
+
+    for f in flags:
+        sym = str(f.get("symbol", "")).upper().strip()
+        if not sym:
+            continue
+        target = str(f.get("rotate_target", "")).upper().strip()
+        prev = existing.get(sym)
+
+        if prev and prev.get("rotate_target") == target and prev.get("since"):
+            since = prev["since"]
+        else:
+            since = today
+
+        rows.append({"symbol": sym, "rotate_target": target, "since": since})
+        result[sym] = since
+
+    if not rows:
+        return {}
+
+    try:
+        client.table("rotate_flags").upsert(rows, on_conflict="symbol").execute()
+    except Exception as exc:
+        logger.error("upsert_rotate_flags upsert failed: %s", exc)
+
+    return result
+
+
+def load_rotate_flags() -> dict[str, dict]:
+    """
+    Return every persisted rotate flag as {SYMBOL: {"rotate_target": ..,
+    "since": ..}}. Empty dict if Supabase is unavailable/empty.
+    """
+    client = get_client()
+    if client is None:
+        return {}
+    try:
+        resp = client.table("rotate_flags").select("symbol, rotate_target, since").execute()
+        return {row["symbol"]: row for row in (resp.data or [])}
+    except Exception as exc:
+        logger.warning("load_rotate_flags failed (non-fatal): %s", exc)
+        return {}
+
+
+def clear_rotate_flags(symbols: list[str]) -> bool:
+    """Remove rotate-flag rows for symbols that are no longer ROTATE (e.g.
+    they moved back to HOLD/ADD, or were closed/sold). Safe no-op if
+    Supabase is unavailable or ``symbols`` is empty."""
+    client = get_client()
+    syms = [str(s).upper().strip() for s in symbols if str(s).strip()]
+    if client is None or not syms:
+        return False
+    try:
+        client.table("rotate_flags").delete().in_("symbol", syms).execute()
+        return True
+    except Exception as exc:
+        logger.error("clear_rotate_flags failed: %s", exc)
+        return False
+
+
 # ─── SCHEMA SQL ───────────────────────────────────────────────────────────────
 
 SCHEMA_SQL = """
@@ -2083,5 +2181,21 @@ CREATE TABLE IF NOT EXISTS dore_premium_history (
     pe_h0            numeric,
     pe_h1            numeric,
     updated_at       timestamptz NOT NULL DEFAULT now()
+);
+"""
+
+# Append rotate_flags SQL to the canonical SCHEMA_SQL for easy copy-paste
+SCHEMA_SQL += """
+-- 11. Rotate flags — one row per currently-ROTATE-flagged portfolio
+--     position. `since` is the date the ROTATE call first appeared for
+--     that symbol; it only resets when `rotate_target` changes (a
+--     genuinely new swap call), not on every render. See
+--     pages/portfolio.py's _apply_rotation() and
+--     utils.supabase_client.upsert_rotate_flags().
+CREATE TABLE IF NOT EXISTS rotate_flags (
+    symbol         text PRIMARY KEY,
+    rotate_target  text        NOT NULL DEFAULT '',
+    since          date        NOT NULL,
+    updated_at     timestamptz NOT NULL DEFAULT now()
 );
 """
