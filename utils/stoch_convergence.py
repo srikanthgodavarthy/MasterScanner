@@ -37,7 +37,14 @@ STOCH_CONVERGENCE_MAX_BONUS = 10   # points budget (0-10 scale)
 # in an already-extended move. Only count cross-ups below this ceiling as
 # genuine location+momentum re-ignition. Crossing OUT of oversold (<20) has
 # no such ceiling — that's a different, unambiguously-fresh event by nature.
-STOCH_REIGNITION_MAX_LEVEL = 40
+#
+# [2026-07-29] Tightened 40 -> 20: a cross while %K is still under the
+# oversold line is the strong, unambiguous "this stock got hit hard and is
+# turning" signal; a cross anywhere in the 20-40 band is a much weaker,
+# more ambiguous case that doesn't deserve the same "fresh re-ignition"
+# label. On a synthetic-data check this roughly halves the cross-up pass
+# rate (~47% -> ~25% of all cross-ups qualify), i.e. meaningfully stricter.
+STOCH_REIGNITION_MAX_LEVEL = 20
 
 # How far back to search for the most recent qualifying reignition bar, so
 # staleness can be tracked the same way LL and VWAP signals already are
