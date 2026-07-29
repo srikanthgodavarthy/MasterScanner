@@ -1027,13 +1027,55 @@ def compute_effective_bias(
         against_trend = (trend.directional_intent == BULLISH and reversal_alert.move_direction == "DOWN") or \
                          (trend.directional_intent == BEARISH and reversal_alert.move_direction == "UP") or \
                          trend.directional_intent == NEUTRAL
-        crosses_bullish = intraday_score >= cfg.override_score_bullish_min and reversal_alert.move_direction == "UP"
-        crosses_bearish = intraday_score <= cfg.override_score_bearish_max and reversal_alert.move_direction == "DOWN"
+
+        # ── trend-conviction protection (2026-07-29) ────────────────
+        # Bug this fixes: a daily trend that's barely BULLISH (trend_score
+        # just above trend_bullish_score_min, e.g. 61) and one that's deep,
+        # freshly-rallying BULLISH (trend_score 90+, e.g. after a 500pt
+        # NIFTY / 1500pt SENSEX 2-day rally) were treated identically by
+        # the override — ANY against-trend day clearing the fixed 30/70
+        # bar flipped the effective bias outright. In practice that meant
+        # one ordinary profit-booking red candle the day after a strong
+        # rally was enough to fully discard the rally and force a PE
+        # (BEARISH) recommendation, even though the underlying trend had
+        # just gotten stronger, not weaker.
+        #
+        # Fix: scale how hard the override bar is to clear by how deep
+        # into BULLISH/BEARISH territory the daily trend already sits.
+        # A borderline trend (conviction ~0) keeps today's configured
+        # override_score_bullish_min/bearish_max untouched — same
+        # behaviour as before. A deeply-established trend (conviction ~1)
+        # pushes that bar toward the far extreme (near 0 or near 100), so
+        # only an overwhelming, multi-signal same-day reversal — not a
+        # routine pullback — can still flip it. This never disables the
+        # override; a strong-enough reversal can always still fire.
+        if trend.directional_intent == BULLISH:
+            conviction = _clamp((trend.trend_score - cfg.trend_bullish_score_min) /
+                                 max(100.0 - cfg.trend_bullish_score_min, 0.01), 0.0, 1.0)
+        elif trend.directional_intent == BEARISH:
+            conviction = _clamp((cfg.trend_bearish_score_max - trend.trend_score) /
+                                 max(cfg.trend_bearish_score_max, 0.01), 0.0, 1.0)
+        else:
+            conviction = 0.0   # NEUTRAL daily trend has no conviction to protect
+
+        damping = cfg.override_trend_conviction_weight * conviction
+        effective_bearish_max = cfg.override_score_bearish_max * (1.0 - damping)
+        effective_bullish_min = cfg.override_score_bullish_min + (100.0 - cfg.override_score_bullish_min) * damping
+
+        crosses_bullish = intraday_score >= effective_bullish_min and reversal_alert.move_direction == "UP"
+        crosses_bearish = intraday_score <= effective_bearish_max and reversal_alert.move_direction == "DOWN"
+        if conviction > 0.0:
+            reasons.append(
+                f"Trend conviction={conviction:.2f} (daily Trend Score={trend.trend_score:.0f}, "
+                f"{trend.directional_intent}) -> override bar adjusted to "
+                f"bullish>={effective_bullish_min:.0f}/bearish<={effective_bearish_max:.0f} "
+                f"(base {cfg.override_score_bullish_min:.0f}/{cfg.override_score_bearish_max:.0f})"
+            )
         if against_trend and (crosses_bullish or crosses_bearish):
             override_intent = BULLISH if crosses_bullish else BEARISH
             reasons.append(
                 f"Intraday Override Active: Intraday Reversal Score={intraday_score:.0f} clears the "
-                f"{cfg.override_score_bullish_min:.0f}/{cfg.override_score_bearish_max:.0f} override bar — "
+                f"{effective_bullish_min:.0f}/{effective_bearish_max:.0f} override bar — "
                 f"effective bias forced {override_intent} regardless of {trend.directional_intent} daily intent "
                 f"({reversal_alert.move_pct:+.2f}%"
                 + (f", {atr_mult:.2f}x ATR" if atr_mult is not None else "") + ")"
