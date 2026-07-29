@@ -787,6 +787,11 @@ def enrich_fo_opportunities_df(
                       -> option candle history (see find_activation_candle()
                       for the accepted shapes), used only to pin down the
                       WAITING -> ACTIVE trigger candle's real timestamp.
+                      NOTE: internally this is called with the row's real
+                      "Expiry Date" (a "YYYY-MM-DD" calendar date) when
+                      present, NOT the "Expiry" column's DORE label
+                      ("MONTHLY"/"NEXT_WEEK"/...) — see _history_for()
+                      below. Write providers expecting a real date.
                       This module makes no Upstox/network calls itself
                       (see module docstring) — the caller (e.g.
                       dore_fo_screener.py) owns fetching today's candles
@@ -809,13 +814,28 @@ def enrich_fo_opportunities_df(
             return row["OptionHistory"]
         if option_history_provider is None:
             return None
+        # 2026-07-29: `expiry` here is DORE's recommended_expiry LABEL
+        # ("MONTHLY"/"NEXT_WEEK"/"CURRENT_WEEK" — see dore_engine.py's
+        # DOREResult), not a real "YYYY-MM-DD" date — but a live provider
+        # (e.g. utils.upstox_client.fetch_option_contract_intraday_
+        # candles) needs a real date to call Upstox's /v2/option/chain.
+        # Passing the label straight through silently returned an empty
+        # chain every time, so every plan kept deferring exactly like
+        # the no-provider case this was meant to fix. The row already
+        # carries the real date under "Expiry Date" (dore_input.
+        # nearest_expiry — the same date DORE's own Entry/SL/T1/T2 were
+        # computed against), so prefer that; only fall back to the label
+        # if a caller hasn't supplied "Expiry Date" (a provider expecting
+        # a real date then simply won't resolve a chain, same fail-soft
+        # deferral as before — not worse than the pre-fix behaviour).
+        expiry_for_history = str(row.get("Expiry Date") or expiry)
         try:
-            return option_history_provider(symbol, leg, strike, expiry)
+            return option_history_provider(symbol, leg, strike, expiry_for_history)
         except Exception:
             logger.warning(
                 "[FO SETUP] option_history_provider failed for %s %s %.1f %s — "
                 "deferring activation this scan, will retry next scan",
-                symbol, leg, strike, expiry, exc_info=True,
+                symbol, leg, strike, expiry_for_history, exc_info=True,
             )
             return None
 
