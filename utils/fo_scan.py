@@ -753,10 +753,17 @@ def top_fo_opportunities(
     try:
         from utils.fo_setup_persistence import enrich_fo_opportunities_df
         from utils.supabase_client import load_open_fo_setup_plans, upsert_fo_setup_plans_batch
+        from utils.upstox_client import fetch_option_contract_intraday_candles
 
         existing_plans = load_open_fo_setup_plans()
+        # 2026-07-29: option_history_provider was never supplied here, so
+        # every Plan sat WAITING forever regardless of how far premium
+        # had already moved past its locked Entry — see
+        # fetch_option_contract_intraday_candles()'s docstring in
+        # utils.upstox_client.
         enriched_rows, updated_plans = enrich_fo_opportunities_df(
-            actionable.to_dict("records"), existing_plans)
+            actionable.to_dict("records"), existing_plans,
+            option_history_provider=fetch_option_contract_intraday_candles)
         if updated_plans:
             upsert_fo_setup_plans_batch([p.to_db_dict() for p in updated_plans])
         actionable = pd.DataFrame(enriched_rows)
