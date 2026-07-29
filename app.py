@@ -56,6 +56,29 @@ load_dotenv()  # picks up UPSTOX_ACCESS_TOKEN from a local .env if present
 # matter how many times/pages that call happens from. See
 # utils/inprocess_scheduler.py's docstring for the full rationale.
 
+# 2026-07-23: the Market Intelligence (30s) / F&O Scan (60s) / Live
+# Scanner (~5min, batched) background loops used to be started from
+# pages/dashboard.py's render() instead of here — deliberately AFTER
+# the Dashboard's own first synchronous Supabase read+display, so the
+# sequence on a fresh session is always "show what's already in
+# Supabase" first, "kick off the background scanners" second, never the
+# other way round.
+#
+# [2026-07-29 bugfix] That tied the loops' first start to the Dashboard
+# specifically being the first page a given process ever rendered. A
+# session that deep-links straight into e.g. the Scanner page (st.
+# navigation supports direct URL routing to any page) never triggered
+# it — fo_scan_snapshots/market_intelligence_snapshots stayed empty
+# forever on that container, and the Scanner page's "DORE 2.0 F&O
+# Opportunity Engine" panel just showed "hasn't completed successfully
+# yet" indefinitely, since nothing was ever going to produce a row.
+# Moved here, called once per process right after pg.run() below — so
+# it fires after WHICHEVER page the user actually opened first has had
+# its own synchronous read+render (same ordering guarantee as before,
+# just page-agnostic), and st.cache_resource inside
+# start_background_scans() still guarantees the loops launch at most
+# once per process no matter how many pages/reruns call it.
+
 st.set_page_config(
     page_title="Trinity — Nifty 500",
     page_icon="🔱",
@@ -371,3 +394,8 @@ pg = st.navigation(
     position="top",   # matches the original inline-controls look (sidebar stays collapsed)
 )
 pg.run()
+
+# See the "2026-07-29 bugfix" comment near the top of this file for why
+# this moved here from pages/dashboard.py.
+from utils.inprocess_scheduler import start_background_scans
+start_background_scans()
