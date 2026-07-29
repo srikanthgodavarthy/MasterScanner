@@ -1766,27 +1766,38 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
             g = (row.get(leg) or {}).get("option_greeks") or {}
             return g.get("delta"), g.get("iv")
 
-        spot = next((r.get("underlying_spot_price") for r in chain if r.get("underlying_spot_price")), None)
-        if not spot:
-            return None
-        atm_row = min(chain, key=lambda r: abs((r.get("strike_price") or 0) - spot))
-        ce_delta, ce_iv = _greeks(atm_row, "call_options")
-        pe_delta, pe_iv = _greeks(atm_row, "put_options")
-        total_ce_oi = sum(_md(r, "call_options", "oi") for r in chain)
-        total_pe_oi = sum(_md(r, "put_options", "oi") for r in chain)
-
-        # 2026-07-20: real OI-wall detection (highest-OI CE/PE strike across
-        # the whole chain), same logic as fetch_oi_resistance() uses for
-        # indices. Previously this function had no wall data at all — only
-        # the ATM strike duplicated under both ce_strike/pe_strike — so
-        # DORE's Stage 4 Corridor gate (room to the next OI wall) had
-        # nothing real to measure for a stock. best_ce/best_pe below are
-        # exposed as ce_wall_strike/pe_wall_strike so callers can tell them
-        # apart from the ATM strike; ce_strike/pe_strike are left as the
-        # ATM strike (unchanged) for backward compatibility with existing
-        # callers that want the tradeable leg's own strike.
         best_ce = max(chain, key=lambda r: _md(r, "call_options", "oi"))
         best_pe = max(chain, key=lambda r: _md(r, "put_options", "oi"))
+
+        # 2026-07-29: spot-dependent ATM lookup used to be a hard gate
+        # (`if not spot: return None`) that dropped the ENTIRE row —
+        # including ce_wall_strike/pe_wall_strike/total OI/PCR below,
+        # none of which need spot at all. That's what was making stocks
+        # vanish from the Options table (post-close, or any time
+        # Upstox's `underlying_spot_price` field comes back empty for
+        # that stock's chain — index chains kept reporting a spot value
+        # so SENSEX/NIFTY/BANKNIFTY never hit this). Now matches
+        # fetch_oi_resistance()'s fail-soft pattern: missing spot only
+        # costs the ATM-specific fields (atm_strike/Greeks/IV/ATM
+        # premium), never the whole row. ce_strike/pe_strike/ce_premium/
+        # pe_premium fall back to the wall strike (best_ce/best_pe,
+        # already computed) when there's no ATM row to pin them to.
+        spot = next((r.get("underlying_spot_price") for r in chain if r.get("underlying_spot_price")), None)
+        atm_row = None
+        ce_delta = pe_delta = ce_iv = pe_iv = None
+        if spot:
+            try:
+                atm_row = min(chain, key=lambda r: abs((r.get("strike_price") or 0) - spot))
+                ce_delta, ce_iv = _greeks(atm_row, "call_options")
+                pe_delta, pe_iv = _greeks(atm_row, "put_options")
+            except Exception:
+                logger.exception("fetch_stock_atm_option: ATM Greeks lookup failed for %s (non-fatal)", symbol)
+                atm_row = None
+        _ref_row = atm_row if atm_row is not None else best_ce   # fallback reference for ce_* below
+        _ref_row_pe = atm_row if atm_row is not None else best_pe
+
+        total_ce_oi = sum(_md(r, "call_options", "oi") for r in chain)
+        total_pe_oi = sum(_md(r, "put_options", "oi") for r in chain)
 
         # 2026-07-23: full per-strike premium map, built from the SAME
         # chain fetch above — no extra API call. Fixes a bug where the
@@ -1810,19 +1821,24 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
 
         return {
             "expiry":      expiry,
-            "spot":        float(spot),
-            "atm_strike":  atm_row.get("strike_price"),
-            "strike_interval": _derive_strike_interval(chain, atm_row.get("strike_price")),
+            "spot":        float(spot) if spot else 0.0,
+            "atm_strike":  atm_row.get("strike_price") if atm_row is not None else None,
+            "strike_interval": _derive_strike_interval(chain, (atm_row or best_ce).get("strike_price")),
             "strike_premiums": strike_premiums,
-            "ce_strike":   atm_row.get("strike_price"),
-            "ce_premium":  _md(atm_row, "call_options", "ltp"),
-            "ce_premium_pct_chg": _premium_pct_chg(atm_row, "call_options"),
-            "ce_oi":       _md(atm_row, "call_options", "oi"),
+            # Falls back to the OI-wall strike/premium (spot-independent)
+            # when there's no live spot to pin an ATM row to — same
+            # fail-soft contract as fetch_oi_resistance() for indices.
+            # `atm_strike` above stays None in that case so callers can
+            # still tell "true ATM" apart from "wall fallback."
+            "ce_strike":   _ref_row.get("strike_price"),
+            "ce_premium":  _md(_ref_row, "call_options", "ltp"),
+            "ce_premium_pct_chg": _premium_pct_chg(_ref_row, "call_options"),
+            "ce_oi":       _md(_ref_row, "call_options", "oi"),
             "ce_delta":    ce_delta, "ce_iv": ce_iv,
-            "pe_strike":   atm_row.get("strike_price"),
-            "pe_premium":  _md(atm_row, "put_options", "ltp"),
-            "pe_premium_pct_chg": _premium_pct_chg(atm_row, "put_options"),
-            "pe_oi":       _md(atm_row, "put_options", "oi"),
+            "pe_strike":   _ref_row_pe.get("strike_price"),
+            "pe_premium":  _md(_ref_row_pe, "put_options", "ltp"),
+            "pe_premium_pct_chg": _premium_pct_chg(_ref_row_pe, "put_options"),
+            "pe_oi":       _md(_ref_row_pe, "put_options", "oi"),
             "pe_delta":    pe_delta, "pe_iv": pe_iv,
             "pcr":         round(total_pe_oi / total_ce_oi, 3) if total_ce_oi else None,
             # ── Real OI wall (for DORE's Corridor stage) ──────────────
