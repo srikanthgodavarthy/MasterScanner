@@ -361,6 +361,7 @@ class BarResult:
     stoch_k:            float = 0.0
     stoch_d:             float = 0.0
     stoch_reignition:      bool  = False   # fresh %K/%D cross-up or cross out of oversold
+    stoch_reignition_kind:  str   = ""      # "cross_up" | "from_oversold" | "" — see stoch_convergence.py
     stoch_bars_since_reignition: int = -1  # bars since qualifying reignition; -1 = none found within lookback
     stoch_confluence:        bool  = False   # stoch cross lines up with a VWAP touch/reclaim
     stoch_vwap_touch:          bool  = False   # price touched VWAP intraday (pre-reversal)
@@ -1469,6 +1470,7 @@ def compute_bar(
     ll_bonus = 0
     stoch_k_v = stoch_d_v = 0.0
     stoch_reignition = stoch_confluence = False
+    stoch_reignition_kind = ""
     stoch_bars_since_reignition = -1
     stoch_vwap_touch = stoch_vwap_reclaim = False
     stoch_vwap_bars_since_touch = -1
@@ -1512,6 +1514,7 @@ def compute_bar(
                 stoch_k_v        = _stoch_sig.stoch_k
                 stoch_d_v        = _stoch_sig.stoch_d
                 stoch_reignition = _stoch_sig.reignition
+                stoch_reignition_kind = _stoch_sig.reignition_kind
                 stoch_bars_since_reignition = _stoch_sig.bars_since_reignition
                 stoch_confluence = _stoch_sig.confluence
                 stoch_vwap_touch    = _stoch_sig.vwap_touch_found
@@ -1916,6 +1919,7 @@ def compute_bar(
         stoch_k                   = stoch_k_v,
         stoch_d                    = stoch_d_v,
         stoch_reignition             = stoch_reignition,
+        stoch_reignition_kind        = stoch_reignition_kind,
         stoch_bars_since_reignition  = stoch_bars_since_reignition,
         stoch_confluence               = stoch_confluence,
         stoch_vwap_touch                = stoch_vwap_touch,
