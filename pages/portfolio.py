@@ -1254,17 +1254,49 @@ def _apply_rotation(rows: list[dict], live_metrics: pd.DataFrame, min_swap_score
     # fresh every render — nothing tracked WHEN a rotate call first
     # appeared. upsert_rotate_flags() keeps the original date as long as
     # rotate_target is unchanged, and resets it if the swap target
-    # changes (a genuinely new call). r["rotate_since"] is left unset
-    # (None) if Supabase is unavailable — renderers treat that as "no
-    # stamp available" rather than guessing.
+    # changes (a genuinely new call).
+    #
+    # [2026-07-29] Two-tier stamp: Supabase is the durable, cross-session
+    # source of truth when configured; st.session_state["_rotate_since_mem"]
+    # is an always-available in-memory fallback so the date still holds
+    # steady across reruns within the same browser session even when
+    # Supabase is unavailable (or a given symbol's row hasn't landed there
+    # yet). Same "keep unless target changed" rule applies to the memory
+    # copy. r["rotate_since"] is left unset (None) only if neither layer
+    # has a stamp — renderers treat that as "no stamp available" rather
+    # than guessing.
     rotated_now = [r for r in rows if r["display_action"] == "ROTATE"]
     if rotated_now:
         from utils.supabase_client import upsert_rotate_flags
         _flags = upsert_rotate_flags([
             {"symbol": r["symbol"], "rotate_target": r["rotate_target"]} for r in rotated_now
         ])
+
+        _mem: dict = st.session_state.setdefault("_rotate_since_mem", {})
+        _today = _today_ist().isoformat()
+
         for r in rotated_now:
-            r["rotate_since"] = _flags.get(r["symbol"].upper().strip())
+            sym = r["symbol"].upper().strip()
+            target = str(r.get("rotate_target", "")).upper().strip()
+
+            since = _flags.get(sym)  # Supabase value, if available
+
+            if not since:
+                prev_mem = _mem.get(sym)
+                if prev_mem and prev_mem.get("rotate_target") == target and prev_mem.get("since"):
+                    since = prev_mem["since"]
+                else:
+                    since = _today
+
+            _mem[sym] = {"rotate_target": target, "since": since}
+            r["rotate_since"] = since
+
+        # Drop memory entries for symbols no longer flagged ROTATE this
+        # render, so a later re-flag (possibly with a different target)
+        # doesn't inherit a stale date.
+        _rotated_syms = {r["symbol"].upper().strip() for r in rotated_now}
+        for stale_sym in [s for s in _mem if s not in _rotated_syms]:
+            del _mem[stale_sym]
 
 
 def _render_rotation_rationale(rows: list[dict]):
