@@ -286,6 +286,7 @@ def build_trade_plan(
     strike_type: Optional[str] = None,
     itm_steps: int = 0,
     technical_target: Optional[float] = None,
+    suggested_strike: Optional[float] = None,
 ) -> TradePlan:
     """Premium-denominated TradePlan. A BUY_CE/BUY_PE recommendation
     trades the OPTION, not the underlying — so Entry/Stop/Targets must
@@ -347,7 +348,28 @@ def build_trade_plan(
     if direction not in ("CE", "PE"):
         return TradePlan(direction=None)
 
-    premium = inp.ce_premium if direction == "CE" else inp.pe_premium
+    # 2026-07-29: was ALWAYS `inp.ce_premium`/`inp.pe_premium` — the ATM
+    # (or index OI-wall) REFERENCE strike's premium, captured once at
+    # Stage 3 — even after Stage 5b has walked the pick to a DIFFERENT
+    # strike (any ITM row, itm_steps > 0). Entry (and therefore SL/T1/T2)
+    # was silently priced off the wrong contract, then FROZEN into
+    # FOSetupPlan.entry_locked the moment a plan is minted — unlike the
+    # live "Premium" display column, which was already fixed for this
+    # exact bug class on 2026-07-23 by reading dore_input.strike_chain
+    # keyed by suggested_strike. This is that same fix applied to the
+    # actual trade-plan levels. A real case: WAAREEENER PE 2750 locked
+    # Entry=2.75 — a value that strike's premium never actually held —
+    # while its own live premium sat around ₹130-180 the entire time;
+    # 2.75 belonged to whatever the ATM strike's premium was that scan.
+    # Falls back to the ATM reference premium when suggested_strike is
+    # None (the preliminary, pre-strike-selection call in compute_dore())
+    # or isn't present in this poll's strike_chain (fail-soft, same as
+    # fo_scan.py's own fallback).
+    strike_row = inp.strike_chain.get(suggested_strike) if suggested_strike else None
+    if strike_row:
+        premium = strike_row.get("ce_premium", 0.0) if direction == "CE" else strike_row.get("pe_premium", 0.0)
+    else:
+        premium = inp.ce_premium if direction == "CE" else inp.pe_premium
     if premium <= 0:
         return TradePlan(direction=direction)  # no live premium yet — nothing to plan against
 
@@ -2010,7 +2032,7 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     # before strike selection exists). This is the plan that ships in the
     # DOREResult; the preliminary one above only ever fed Stage 4's gate.
     trade_plan = build_trade_plan(inp, cfg, direction, strike_type=strike_type, itm_steps=itm_steps,
-                                   technical_target=technical_target)
+                                   technical_target=technical_target, suggested_strike=suggested_strike)
 
     warnings = list(risk.warnings) + list(oi_intel.warnings)
     if effective_bias.override_active:
