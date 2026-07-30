@@ -1552,14 +1552,42 @@ def _th_tooltip(label: str, col_key: str) -> str:
     return f'<th>{label}</th>'
 
 
-def _tv_link(symbol: str, css_class: str = "tv-link") -> str:
-    """Return an anchor that opens TradingView NSE chart in a new tab."""
+def _daychg_badge(pct_chg) -> str:
+    """Small color-graded day %chg badge, meant to sit right next to a
+    stock name wherever one is rendered. Color intensity scales with the
+    size of the move; returns "" (no badge) when pct_chg is missing."""
+    if pct_chg is None:
+        return ""
+    try:
+        v = float(pct_chg)
+    except (TypeError, ValueError):
+        return ""
+    if pd.isna(v):
+        return ""
+    if v > 0:
+        arrow = "▲"
+        color = "#2ea043" if v >= 3 else "#3fb950" if v >= 1 else "#56d364"
+    elif v < 0:
+        arrow = "▼"
+        color = "#f85149" if v <= -1 else "#ff7b72"
+    else:
+        arrow, color = "•", "#8b949e"
+    return (
+        f'<span style="color:{color};font-size:10px;font-weight:700;'
+        f'margin-left:5px;white-space:nowrap;">{arrow}{v:+.2f}%</span>'
+    )
+
+
+def _tv_link(symbol: str, css_class: str = "tv-link", pct_chg=None) -> str:
+    """Return an anchor that opens TradingView NSE chart in a new tab,
+    optionally followed by a small color-graded day %chg badge."""
     # TradingView NSE symbol format: NSE:SYMBOLNAME
     tv_sym = f"NSE:{symbol.upper().replace('.NS', '').replace('-EQ', '')}"
     url = f"https://www.tradingview.com/chart/?symbol={tv_sym}"
     return (
         f'<a class="{css_class}" href="{url}" target="_blank" '
         f'title="Open {symbol} on TradingView">{symbol}</a>'
+        f'{_daychg_badge(pct_chg)}'
     )
 
 
@@ -2367,7 +2395,7 @@ def _nse_top_gainers_html(df_aug: pd.DataFrame, top_n: int = 5) -> str:
         rows_html += (
             "<tr>"
             f"<td style='color:#8b949e;'>{i}</td>"
-            f'<td><span class="sr-sector-name" style="font-weight:700;">{_tv_link(str(symbol)) if symbol != "—" else symbol}</span></td>'
+            f'<td><span class="sr-sector-name" style="font-weight:700;">{_tv_link(str(symbol), pct_chg=chg) if symbol != "—" else symbol}</span></td>'
             f"<td>{f'{ltp:,.2f}' if ltp is not None else '—'}</td>"
             f'<td class="{"sr-pos" if chg >= 0 else "sr-neg"}">{"+" if chg >= 0 else ""}{chg:.2f}%</td>'
             f"<td>{f'{vr:.1f}x' if vr is not None else '—'}</td>"
@@ -2826,6 +2854,13 @@ def _news_ago(published) -> str:
 
 
 def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
+    # Symbol -> %Chg lookup, built once, reused for every matched-ticker
+    # chip below -- reuses the scan's own already-computed %Chg column
+    # (utils.scoring_core), so no extra fetch per headline.
+    _chg_lookup: dict = {}
+    if scan_df is not None and not scan_df.empty and "Stock" in scan_df.columns and "%Chg" in scan_df.columns:
+        _chg_lookup = dict(zip(scan_df["Stock"].astype(str), pd.to_numeric(scan_df["%Chg"], errors="coerce")))
+
     rows = []
     for item in items:
         symbols = item.get("symbols", [])
@@ -2902,7 +2937,7 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
         # market-wide story with no single stock behind it).
         sector_label = item.get("sector") or "Market"
         stock_chips_html = (
-            "".join(_tv_link(s, css_class="ni-symbol-chip") for s in symbols[:4])
+            "".join(_tv_link(s, css_class="ni-symbol-chip", pct_chg=_chg_lookup.get(str(s))) for s in symbols[:4])
             if symbols else '<span class="ni-rec-dash">—</span>'
         )
         # 2026-07-18 FIX: item["published"] is UTC (see news_feed.py) —

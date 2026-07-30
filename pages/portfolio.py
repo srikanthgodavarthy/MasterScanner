@@ -89,14 +89,42 @@ _TREND_BADGE = {
 }
 
 
-def _tv_link(symbol: str, css_class: str = "tv-link") -> str:
+def _daychg_badge(pct_chg) -> str:
+    """Small color-graded day %chg badge, meant to sit right next to a
+    stock name wherever one is rendered. Color intensity scales with the
+    size of the move; returns "" (no badge) when pct_chg is missing."""
+    if pct_chg is None:
+        return ""
+    try:
+        v = float(pct_chg)
+    except (TypeError, ValueError):
+        return ""
+    if pd.isna(v):
+        return ""
+    if v > 0:
+        arrow = "▲"
+        color = "#2ea043" if v >= 3 else "#3fb950" if v >= 1 else "#56d364"
+    elif v < 0:
+        arrow = "▼"
+        color = "#f85149" if v <= -1 else "#ff7b72"
+    else:
+        arrow, color = "•", "#8b949e"
+    return (
+        f'<span style="color:{color};font-size:10px;font-weight:700;'
+        f'margin-left:5px;white-space:nowrap;">{arrow}{v:+.2f}%</span>'
+    )
+
+
+def _tv_link(symbol: str, css_class: str = "tv-link", pct_chg=None) -> str:
     """Return an anchor that opens TradingView NSE chart in a new tab.
-    Same helper/link format as pages/dashboard.py and pages/scanner.py."""
+    Same helper/link format as pages/dashboard.py and pages/scanner.py,
+    optionally followed by a small color-graded day %chg badge."""
     tv_sym = f"NSE:{str(symbol).upper().replace('.NS', '').replace('-EQ', '')}"
     url = f"https://www.tradingview.com/chart/?symbol={tv_sym}"
     return (
         f'<a class="{css_class}" href="{url}" target="_blank" '
         f'title="Open {symbol} on TradingView">{symbol}</a>'
+        f'{_daychg_badge(pct_chg)}'
     )
 
 
@@ -909,7 +937,7 @@ def _panel_row_html(r: dict, extra_line: str | None = None) -> str:
     color = "#00ff88" if pct >= 0 else "#ff4d6d"
     return f"""<div class="pcc-panel-row">
       <div class="pcc-panel-row-top">
-        <span class="pcc-panel-sym">{_tv_link(r['symbol'])}</span>
+        <span class="pcc-panel-sym">{_tv_link(r['symbol'], pct_chg=r.get('today_pct'))}</span>
         <span class="pcc-panel-ltp">₹{r['price']:.2f}</span>
       </div>
       <div class="pcc-panel-row-bottom">
@@ -964,7 +992,7 @@ def _render_holdings_table(rows: list[dict]):
         dot = _rr_dot_color(r["display_action"])
         trs.append(f"""<tr>
           <td style="color:#64748b;">{i}</td>
-          <td><span class="pcc-sym">{_tv_link(r['symbol'])}</span></td>
+          <td><span class="pcc-sym">{_tv_link(r['symbol'], pct_chg=r['today_pct'])}</span></td>
           <td>{r['price']:.2f}</td>
           <td style="color:{today_color};">{r['today_pct']:+.2f}%</td>
           <td style="color:{today_color};">{'+' if r['today_pnl']>=0 else ''}{r['today_pnl']:,.0f}</td>
@@ -1053,7 +1081,7 @@ def _render_positions_table(rows: list[dict]):
         trs.append(f"""
         <tr>
           <td>
-            <span class="pcc-sym">{_tv_link(r['symbol'])}</span><br/>
+            <span class="pcc-sym">{_tv_link(r['symbol'], pct_chg=r.get('today_pct'))}</span><br/>
             <span class="pcc-sub">NSE</span>
           </td>
           <td>{_ring_html(_health_score(r))}</td>
@@ -1316,7 +1344,7 @@ def _render_rotation_rationale(rows: list[dict]):
         <div class="pcc-swap-card">
           <div class="pcc-swap-toprow">
             <div class="pcc-swap-syms">
-              <span>{_tv_link(r['symbol'])}</span><span class="pcc-swap-arrow">→</span>
+              <span>{_tv_link(r['symbol'], pct_chg=r.get('today_pct'))}</span><span class="pcc-swap-arrow">→</span>
               <span class="pcc-swap-target">{_tv_link(r['rotate_target'])}</span>
             </div>
             <div class="pcc-swap-score" style="color:#00ff88;">+{r['rotate_score']:.0f}</div>
@@ -1448,7 +1476,7 @@ def _render_stock_cards(rows: list[dict], cfg: ExitIntelligenceConfig, total_val
                 <div class="pcc-stockcard" style="border-left-color:{accent}; background:linear-gradient(160deg,{accent}22 0%,#151d30 65%);">
                   <div class="pcc-stockcard-top">
                     <div>
-                      <span class="pcc-sym">{_tv_link(r['symbol'])}</span><br/>
+                      <span class="pcc-sym">{_tv_link(r['symbol'], pct_chg=r['today_pct'])}</span><br/>
                       <span style="font-size:0.75rem;font-weight:600;color:{day_color};">
                         {'+' if r['today_pct']>=0 else ''}{r['today_pct']:.2f}% today</span>
                     </div>
@@ -1499,7 +1527,7 @@ def _render_detail_card(r: dict, cfg: ExitIntelligenceConfig, total_value: float
         star = "⭐ " if r["display_action"] == "STRONG ADD" else ""
         _md(f"""
         <div class="pcc-dc-header">
-          <div class="pcc-dc-title">{star}{_tv_link(symbol)} <span class="pcc-dc-exch">NSE</span></div>
+          <div class="pcc-dc-title">{star}{_tv_link(symbol, pct_chg=r.get('today_pct'))} <span class="pcc-dc-exch">NSE</span></div>
           <div class="pcc-dc-tier" style="background:{tier_color}22;color:{tier_color};border:1px solid {tier_color}66;">{tier_label}</div>
         </div>
         """)

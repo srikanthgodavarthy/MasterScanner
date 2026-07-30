@@ -423,7 +423,7 @@ def render():
         ls_txt    = f"LS {t.get('from_leadership',0)} → {t.get('to_leadership',0)} ({'+' if ls_chg>0 else ''}{ls_chg})"
         return f"""
     <div class="tr-card {direction}">
-      <div class="tr-symbol">{sym}
+      <div class="tr-symbol">{sym}{_daychg_badge(_lc_chg_lookup.get(sym))}
         <span style="font-size:11px;font-weight:400;color:#8b949e;margin-left:8px">{ls_txt}</span>
       </div>
       <div class="tr-label">
@@ -528,6 +528,42 @@ def render():
                 lc_df = lc_df.drop_duplicates("symbol", keep="first")
     
     
+    # Symbol -> day %Chg lookup, sourced from the in-session scan only.
+    # lifecycle_states (Supabase) doesn't persist %Chg, and fetching it
+    # fresh per symbol here would mean a live quote call for every row in
+    # a 150+ stock table — so this stays a free, cache-only lookup: rows
+    # with no matching session-scan symbol simply render without a badge
+    # rather than triggering new network calls.
+    _lc_chg_lookup: dict = {}
+    if _session_scan is not None and not _session_scan.empty and "Stock" in _session_scan.columns and "%Chg" in _session_scan.columns:
+        _lc_chg_lookup = dict(
+            zip(_session_scan["Stock"].astype(str), pd.to_numeric(_session_scan["%Chg"], errors="coerce"))
+        )
+
+    def _daychg_badge(pct_chg) -> str:
+        """Small color-graded day %chg badge shown next to a symbol.
+        Returns "" when no live figure is available for that symbol."""
+        if pct_chg is None:
+            return ""
+        try:
+            v = float(pct_chg)
+        except (TypeError, ValueError):
+            return ""
+        if pd.isna(v):
+            return ""
+        if v > 0:
+            arrow = "▲"
+            color = "#2ea043" if v >= 3 else "#3fb950" if v >= 1 else "#56d364"
+        elif v < 0:
+            arrow = "▼"
+            color = "#f85149" if v <= -1 else "#ff7b72"
+        else:
+            arrow, color = "•", "#8b949e"
+        return (
+            f'<span style="color:{color};font-size:10px;font-weight:700;'
+            f'margin-left:5px;white-space:nowrap;">{arrow}{v:+.2f}%</span>'
+        )
+
     # ══════════════════════════════════════════════════════════════════
     #  TABS
     # ══════════════════════════════════════════════════════════════════
@@ -664,7 +700,7 @@ def render():
                 rows_html += (
                     f'<tr style="background:{row_bg}">'
                     f'<td style="padding:7px 10px;font-weight:700;font-size:13px;'
-                    f'font-family:monospace;white-space:nowrap">{sym}</td>'
+                    f'font-family:monospace;white-space:nowrap">{sym}{_daychg_badge(_lc_chg_lookup.get(sym))}</td>'
                     f'<td style="padding:7px 10px">{stage_cell}</td>'
                     f'<td style="padding:7px 10px">{cat_cell}</td>'
                     f'<td style="padding:7px 10px;text-align:center">{_pill(ls)}</td>'
@@ -938,7 +974,7 @@ def render():
                     row_bg = "rgba(255,255,255,0.02)" if i % 2 == 0 else "transparent"
                     rows_html += (
                         f'<tr style="background:{row_bg}">'
-                        f'<td style="padding:7px 10px;font-weight:700;font-size:13px;font-family:monospace;white-space:nowrap">{sym}</td>'
+                        f'<td style="padding:7px 10px;font-weight:700;font-size:13px;font-family:monospace;white-space:nowrap">{sym}{_daychg_badge(_lc_chg_lookup.get(sym))}</td>'
                         f'<td style="padding:7px 10px">{stage_cell}</td>'
                         f'<td style="padding:7px 10px">{cat_cell}</td>'
                         f'<td style="padding:7px 10px;text-align:center">{_pill(ls)}</td>'
@@ -1110,6 +1146,15 @@ def render():
             _avail_cols = {k: v for k, v in _display_cols.items() if k in _fp_df.columns}
             _show_df = _fp_df[list(_avail_cols.keys())].rename(columns=_avail_cols).copy()
 
+            # Day %Chg — same session-scan lookup used elsewhere on this
+            # page; NaN (shown as "—") for symbols with no live figure
+            # available rather than firing a fetch per row of this table.
+            if "Symbol" in _show_df.columns:
+                _show_df.insert(
+                    _show_df.columns.get_loc("Symbol") + 1, "Day %Chg",
+                    _show_df["Symbol"].map(_lc_chg_lookup),
+                )
+
             # Colour-code status column
             def _colour_status(val):
                 v = str(val).upper()
@@ -1120,11 +1165,25 @@ def render():
                 if v in ("CLOSED", "INVALIDATED"): return "background-color:#3a1a1a;color:#f85149"
                 return ""
 
+            # Colour-grade Day %Chg the same way as everywhere else on
+            # this page: green shades up, red shades down, gray at 0.
+            def _colour_daychg(val):
+                if pd.isna(val):
+                    return "color:#484f58"
+                v = float(val)
+                if v > 0:   return "color:" + ("#2ea043" if v >= 3 else "#3fb950" if v >= 1 else "#56d364")
+                if v < 0:   return "color:" + ("#f85149" if v <= -1 else "#ff7b72")
+                return "color:#8b949e"
+
             if "Plan Status" in _show_df.columns:
                 st.write(_show_df.columns.tolist())
                 styled = _show_df.style.map(_colour_status, subset=["Plan Status"])
             else:
                 styled = _show_df.style
+
+            if "Day %Chg" in _show_df.columns:
+                styled = styled.map(_colour_daychg, subset=["Day %Chg"]) \
+                                .format({"Day %Chg": lambda v: "—" if pd.isna(v) else f"{v:+.2f}%"})
 
             st.dataframe(styled, width='stretch', hide_index=True)
 

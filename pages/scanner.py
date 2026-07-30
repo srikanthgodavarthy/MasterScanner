@@ -1499,14 +1499,44 @@ def _th_tooltip(label: str, col_key: str) -> str:
     return f'<th>{label}</th>'
 
 
-def _tv_link(symbol: str, css_class: str = "tv-link") -> str:
-    """Return an anchor that opens TradingView NSE chart in a new tab."""
+def _daychg_badge(pct_chg) -> str:
+    """Small color-graded day %chg badge, meant to sit right next to a
+    stock name wherever one is rendered. Color intensity scales with the
+    size of the move (light for <1%, mid for 1-3%, strong for 3%+);
+    returns "" (no badge) when pct_chg is missing so callers never have
+    to special-case an unavailable value."""
+    if pct_chg is None:
+        return ""
+    try:
+        v = float(pct_chg)
+    except (TypeError, ValueError):
+        return ""
+    if pd.isna(v):
+        return ""
+    if v > 0:
+        arrow = "▲"
+        color = "#2ea043" if v >= 3 else "#3fb950" if v >= 1 else "#56d364"
+    elif v < 0:
+        arrow = "▼"
+        color = "#f85149" if v <= -3 else "#f85149" if v <= -1 else "#ff7b72"
+    else:
+        arrow, color = "•", "#8b949e"
+    return (
+        f'<span style="color:{color};font-size:10px;font-weight:700;'
+        f'margin-left:5px;white-space:nowrap;">{arrow}{v:+.2f}%</span>'
+    )
+
+
+def _tv_link(symbol: str, css_class: str = "tv-link", pct_chg=None) -> str:
+    """Return an anchor that opens TradingView NSE chart in a new tab,
+    optionally followed by a small color-graded day %chg badge."""
     # TradingView NSE symbol format: NSE:SYMBOLNAME
     tv_sym = f"NSE:{symbol.upper().replace('.NS', '').replace('-EQ', '')}"
     url = f"https://www.tradingview.com/chart/?symbol={tv_sym}"
     return (
         f'<a class="{css_class}" href="{url}" target="_blank" '
         f'title="Open {symbol} on TradingView">{symbol}</a>'
+        f'{_daychg_badge(pct_chg)}'
     )
 
 
@@ -2381,7 +2411,9 @@ def _render_html_table(df: pd.DataFrame) -> str:
     for rank, (_, row) in enumerate(df.iterrows(), 1):
         cells = f'<td class="col-rank">{rank}</td>'
         stock_sym = row.get("Stock", "—")
-        cells += f'<td class="col-stock">{_tv_link(str(stock_sym)) if stock_sym != "—" else "—"}</td>'
+        cells += (
+            f'<td class="col-stock">{_tv_link(str(stock_sym), pct_chg=row.get("%Chg")) if stock_sym != "—" else "—"}</td>'
+        )
 
         for c in cols:
             if c == "Stock":
@@ -2922,7 +2954,7 @@ def _render_pre_breakout_tab(records: list, df: pd.DataFrame, mode: str) -> None
         rows_html += (
             f'<tr>'
             f'<td class="col-rank">{rank}</td>'
-            f'<td class="col-stock">{_tv_link(sym)}</td>'
+            f'<td class="col-stock">{_tv_link(sym, pct_chg=r.get("%Change") or r.get("%Chg"))}</td>'
             + _pb_score(r.get("Score"))
             + sq_cell
             + _pb_num(rsi, "{:.0f}")
@@ -3279,7 +3311,7 @@ def _futures_table_html(df: pd.DataFrame) -> str:
         intent = r.get("Directional Intent", "")
         intent_color = "#3fb950" if intent == "BULLISH" else "#f85149" if intent == "BEARISH" else "#8b949e"
         cells = [
-            f'<td style="font-weight:700;">{_tv_link(r.get("Stock", "—"))}</td>',
+            f'<td style="font-weight:700;">{_tv_link(r.get("Stock", "—"), pct_chg=r.get("%Chg"))}</td>',
             f'<td>{_fmt_money(r.get("CMP"))}</td>',
             f'<td>{_fmt_pct(r.get("%Chg"))}</td>',
             f'<td style="color:{intent_color};font-weight:600;">{_fmt_text(intent)}</td>',
