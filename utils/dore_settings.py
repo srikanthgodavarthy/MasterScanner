@@ -254,6 +254,10 @@ DORE_DEFAULTS: dict = {
     # corridor score, reused here rather than re-fetched).
     "strike_wall_buffer_steps":     1.0,   # min room to the wall, in strike_step multiples
     "strike_max_itm_steps":            3,   # hard cap on how far the optimizer will walk ITM
+    "strike_max_otm_steps":            2,   # hard cap on how far the optimizer will lean OTM (pass 4)
+    "oi_otm_coverage_min":           1.5,   # Expected Move Coverage at/above this = comfortably clears
+                                             # the target -> eligible to lean OTM for cheaper premium/more
+                                             # leverage (only when nothing else already picked ITM this pass)
     # build_trade_plan() delta-scaling adjustment once Stage 5b has actually
     # picked an ITM strike (an ITM leg's own delta is higher than whatever
     # delta was read off the ATM chain row) — see build_trade_plan().
@@ -391,6 +395,8 @@ class DORESettings:
 
     strike_wall_buffer_steps: float = 1.0
     strike_max_itm_steps: int = 3
+    strike_max_otm_steps: int = 2
+    oi_otm_coverage_min: float = 1.5
     itm_delta_bump_per_step: float = 0.08
     itm_delta_cap: float = 0.95
 

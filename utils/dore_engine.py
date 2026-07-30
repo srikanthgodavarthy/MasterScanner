@@ -400,6 +400,14 @@ def build_trade_plan(
     if strike_type == "ITM" and itm_steps > 0:
         delta_mag += cfg.itm_delta_bump_per_step * itm_steps
         delta_mag = min(delta_mag, cfg.itm_delta_cap)
+    elif strike_type == "OTM" and itm_steps < 0:
+        # 2026-07-30: mirror of the ITM bump above for Stage 5b's new
+        # OTM lean (pass 4) — moving OTM lowers delta (less directly
+        # tied to the underlying, more convexity-reliant), same
+        # per-step magnitude as the ITM bump, floored rather than
+        # capped since delta can't sensibly go to 0.
+        delta_mag -= cfg.itm_delta_bump_per_step * abs(itm_steps)
+        delta_mag = max(delta_mag, 0.05)
     delta_mag = max(min(delta_mag, 1.0), 0.05)  # sane bounds — deltas are never 0 or >1 in practice
 
     underlying_atr = max(inp.atr, 1e-6)
@@ -534,7 +542,7 @@ class DOREResult:
 
     trade_plan: TradePlan = field(default_factory=TradePlan)
 
-    recommended_strike_type: Optional[str] = None   # "ATM" | "ITM"
+    recommended_strike_type: Optional[str] = None   # "ATM" | "ITM" | "OTM"
     recommended_expiry:      Optional[str] = None   # "CURRENT_WEEK" | "NEXT_WEEK" (index weekly) | "MONTHLY" (stocks)
 
     suggested_direction: Optional[str] = None   # "CE" | "PE" | None
@@ -1862,7 +1870,7 @@ def stage5b_strike_and_expiry(
 ) -> tuple[Optional[str], Optional[str], Optional[float], int, list[str]]:
     """Adaptive strike optimizer + expiry selection.
 
-    Three independent passes decide the strike, then expiry is decided last:
+    Four independent passes decide the strike, then expiry is decided last:
 
       1. Delta-band baseline — same as before: target Delta 0.55-0.70.
          Below the band -> prefer ITM (1 step); above or inside -> ATM.
@@ -1896,11 +1904,23 @@ def stage5b_strike_and_expiry(
          uncertain, don't get cuter when comfortable" bias already used
          elsewhere in this stage (see the CURRENT_WEEK/NEXT_WEEK scalp
          gate below).
+      4. OTM lean (2026-07-30) — passes 1-3 only ever push ITM; nothing
+         ever pushed the pick the OTHER way even when nothing forced ITM
+         and the setup is comfortable. When the strike is still exactly
+         where pass 1 left it (ATM, itm_steps == 0) AND coverage is
+         comfortably ABOVE cfg.oi_otm_coverage_min AND the reference
+         strike's bid/ask spread is within cfg.risk_spread_max_pct, walks
+         OTM instead — cheaper premium, more leverage, same "the evidence
+         genuinely supports this" bar as the ITM passes, just in the
+         opposite direction. Deliberately NOT DTE-gated (unlike passes
+         2/3): comfortable coverage is a reason to lean OTM at any point
+         in the cycle, not just close to expiry.
 
     Returns (strike_type, expiry, suggested_strike, itm_steps, reasons).
     `itm_steps` is exposed so the orchestrator can pass it straight into
     build_trade_plan()'s delta adjustment — no strike math needs to be
-    redone downstream.
+    redone downstream. Negative `itm_steps` means an OTM lean (pass 4);
+    positive means ITM (passes 1-3); zero means ATM.
     """
     reasons: list[str] = []
     if direction is None:
@@ -1959,7 +1979,14 @@ def stage5b_strike_and_expiry(
     wall = inp.highest_ce_oi_strike if direction == "CE" else inp.highest_pe_oi_strike
     suggested_strike = _strike_after(itm_steps)
 
-    if wall:
+    # 2026-07-30: gated by DTE, same reasoning as pass 3 below. A wall
+    # sitting close to today's strike is only a real risk if there isn't
+    # much time left for the underlying to clear it before expiry — with
+    # 20-30 days still on the clock the position has plenty of room to
+    # move past a nearby wall long before it matters. Ungated, this was
+    # walking ITM off wall proximity alone all cycle long, same failure
+    # shape as pass 3's DTE-blind coverage check.
+    if wall and inp.days_to_expiry <= cfg.oi_reachability_dte_max:
         room_steps = _room_to_wall_steps(suggested_strike, wall)
         if room_steps < cfg.strike_wall_buffer_steps:
             wall_label = "CE (resistance)" if direction == "CE" else "PE (support)"
@@ -1983,6 +2010,11 @@ def stage5b_strike_and_expiry(
                     f"{itm_steps} ITM step(s) -> {suggested_strike:.0f}, now clears the wall "
                     f"by {room_steps:.1f} strike-step(s)"
                 )
+    elif wall and inp.days_to_expiry > cfg.oi_reachability_dte_max:
+        reasons.append(
+            f"OI wall at {wall:.0f} noted, but {inp.days_to_expiry}d to expiry is still beyond the "
+            f"{cfg.oi_reachability_dte_max}d reachability window — not walking ITM for it yet"
+        )
 
     # 2026-07-30: target/time-reachability adjustment (pass 3 — see
     # docstring). expected_move_coverage is Stage 3.5's iv_expected_move
@@ -2048,6 +2080,50 @@ def stage5b_strike_and_expiry(
             f"{cfg.oi_expected_move_coverage_min:.2f}, but {inp.days_to_expiry}d to expiry is still "
             f"beyond the {cfg.oi_reachability_dte_max}d reachability window — no ITM walk yet"
         )
+
+    # 2026-07-30: pass 4 — OTM lean. Passes 1-3 only ever push ITM; there
+    # was no path back the other way even when nothing forced ITM and the
+    # setup is comfortable. Fires ONLY when the strike is still exactly
+    # where pass 1 left it (itm_steps == 0, strike_type == "ATM") — OTM is
+    # strictly an add-on lean for the clean case, never overrides an ITM
+    # call from delta/wall/reachability. Two gates, both must hold:
+    #   - expected_move_coverage comfortably ABOVE cfg.oi_otm_coverage_min
+    #     (IV-implied move clears the target with room to spare — the
+    #     mirror image of pass 3's "not enough time/IV" check, and,
+    #     unlike passes 2/3, deliberately NOT DTE-gated: a move that
+    #     comfortably clears the target is a reason to lean OTM at ANY
+    #     point in the cycle, not just close to expiry).
+    #   - live bid/ask spread within cfg.risk_spread_max_pct — OTM strikes
+    #     are typically thinner, and a wide spread eats the cheaper-
+    #     premium advantage on entry alone. Only the reference (ATM)
+    #     strike's spread is available here, so this is a conservative
+    #     proxy, not the exact OTM strike's own spread.
+    if strike_type == "ATM" and itm_steps == 0 and expected_move_coverage is not None \
+            and expected_move_coverage >= cfg.oi_otm_coverage_min:
+        spread_pct = inp.ce_bid_ask_spread_pct if direction == "CE" else inp.pe_bid_ask_spread_pct
+        if spread_pct is None or spread_pct <= cfg.risk_spread_max_pct:
+            otm_steps = min(
+                1 + int((expected_move_coverage - cfg.oi_otm_coverage_min) / 0.3),
+                cfg.strike_max_otm_steps,
+            )
+            if otm_steps > 0:
+                itm_steps = -otm_steps  # negative = OTM steps; build_trade_plan reads the sign
+                strike_type = "OTM"
+                suggested_strike = _strike_after(itm_steps)
+                reasons.append(
+                    f"Expected Move Coverage={expected_move_coverage:.2f} comfortably above "
+                    f"{cfg.oi_otm_coverage_min:.2f}"
+                    + (f", spread {spread_pct:.2f}% within {cfg.risk_spread_max_pct:.2f}%"
+                       if spread_pct is not None else ", spread unknown")
+                    + f" — leaning {otm_steps} OTM step(s) -> {suggested_strike:.0f} for cheaper "
+                    f"premium/more leverage"
+                )
+        else:
+            reasons.append(
+                f"Expected Move Coverage={expected_move_coverage:.2f} comfortable but spread "
+                f"{spread_pct:.2f}% too wide (> {cfg.risk_spread_max_pct:.2f}%) — staying ATM rather "
+                f"than risk an illiquid OTM fill"
+            )
 
     scalp_ok = (
         inp.days_to_expiry <= cfg.expiry_days_scalp_max
