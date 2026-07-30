@@ -203,23 +203,10 @@ class DOREInput:
     ce_premium:       float = 0.0
     pe_premium:       float = 0.0
     strike_chain:     dict = field(default_factory=dict)   # {strike: {"ce_premium","pe_premium","ce_oi","pe_oi"}}
-                                     # — full chain for `nearest_expiry` ONLY, same fetch as ce_premium/
-                                     # pe_premium above (ATM/wall reference only). Used to look up the REAL
-                                     # premium at whatever strike Stage 5b (stage5b_strike_and_expiry)
-                                     # actually recommends, since that can be a different, ITM-walked strike
-                                     # — see build_dore_input().
-    strike_chain_next: dict = field(default_factory=dict)  # 2026-07-30: same shape as strike_chain, but for
-                                     # the SECOND-nearest weekly expiry (weekly-underlying indices only —
-                                     # see utils.upstox_client._WEEKLY_EXPIRY_SYMBOLS / fetch_oi_resistance's
-                                     # `next_week` arg). Stage 5b can recommend expiry="NEXT_WEEK" (see
-                                     # stage5b_strike_and_expiry, close-to-expiry capital-protection branch),
-                                     # in which case suggested_strike must be priced off THIS chain, not
-                                     # strike_chain above — strike_chain only ever holds the current week's
-                                     # contract, so a same-numbered strike there belongs to a different
-                                     # expiry date entirely. Empty when not near expiry (not fetched — no
-                                     # need to spend the extra Upstox call every scan) or for stocks (monthly-
-                                     # only, no "next week" contract exists to roll into).
-    next_expiry:      str = ""      # actual "YYYY-MM-DD" the row above in strike_chain_next belongs to
+                                     # — full chain, same fetch as ce_premium/pe_premium above (ATM/wall
+                                     # reference only). Used to look up the REAL premium at whatever strike
+                                     # Stage 5b (stage5b_strike_and_expiry) actually recommends, since that
+                                     # can be a different, ITM-walked strike — see build_dore_input().
     ce_premium_prev:  Optional[float] = None   # premium 1 poll ago (tick-to-tick, not day-open baseline)
     pe_premium_prev:  Optional[float] = None
     ce_premium_prev2: Optional[float] = None   # premium 2 polls ago — lets Stage 3 tell "was falling, now
@@ -300,7 +287,6 @@ def build_trade_plan(
     itm_steps: int = 0,
     technical_target: Optional[float] = None,
     suggested_strike: Optional[float] = None,
-    expiry_label: Optional[str] = None,
 ) -> TradePlan:
     """Premium-denominated TradePlan. A BUY_CE/BUY_PE recommendation
     trades the OPTION, not the underlying — so Entry/Stop/Targets must
@@ -379,25 +365,7 @@ def build_trade_plan(
     # None (the preliminary, pre-strike-selection call in compute_dore())
     # or isn't present in this poll's strike_chain (fail-soft, same as
     # fo_scan.py's own fallback).
-    #
-    # 2026-07-30: strike_chain is keyed by strike price ONLY, with no
-    # expiry tag — it only ever holds ONE expiry's chain (nearest). But
-    # Stage 5b (stage5b_strike_and_expiry) can set expiry_label to
-    # "NEXT_WEEK" for weekly-underlying indices close to expiry (the
-    # "using next week to protect capital" branch) — a suggested_strike
-    # under that label is a NEXT WEEK contract, and looking it up in
-    # strike_chain (current week's chain) returns whatever THIS week's
-    # contract happens to trade at that same strike number: a real,
-    # live premium, just for the wrong contract entirely. That produced
-    # Entry/Premium values that never existed for the option actually
-    # being recommended. Route to strike_chain_next whenever the label
-    # says NEXT_WEEK; fail soft to the ATM reference premium (same as
-    # the "no strike_row" branch below) if that chain wasn't fetched.
-    if expiry_label == "NEXT_WEEK":
-        chain = inp.strike_chain_next
-    else:
-        chain = inp.strike_chain
-    strike_row = chain.get(suggested_strike) if suggested_strike else None
+    strike_row = inp.strike_chain.get(suggested_strike) if suggested_strike else None
     if strike_row:
         premium = strike_row.get("ce_premium", 0.0) if direction == "CE" else strike_row.get("pe_premium", 0.0)
     else:
@@ -1867,10 +1835,12 @@ def stage5b_strike_and_expiry(
     direction: Optional[str],
     execution_score: float,
     risk_hard_gate_pass: bool,
+    expected_move_coverage: Optional[float] = None,
+    technical_target: Optional[float] = None,
 ) -> tuple[Optional[str], Optional[str], Optional[float], int, list[str]]:
     """Adaptive strike optimizer + expiry selection.
 
-    Two independent passes decide the strike, then expiry is decided last:
+    Three independent passes decide the strike, then expiry is decided last:
 
       1. Delta-band baseline — same as before: target Delta 0.55-0.70.
          Below the band -> prefer ITM (1 step); above or inside -> ATM.
@@ -1885,6 +1855,25 @@ def stage5b_strike_and_expiry(
          piece RFC-001 places at the end of the pipeline: it is informed
          by the same OI walls Stage 3's corridor score reads, but decides
          a concrete tradeable strike, not a 0-100 score.
+      3. Target/time-reachability adjustment (2026-07-30) — `expected_
+         move_coverage` (Stage 3.5's `iv_expected_move / distance_to_
+         target`, itself already time-scaled via `sqrt(days_to_expiry /
+         365)` — see stage3_5_option_intelligence) tells us whether the
+         underlying's IV-implied move, GIVEN the time actually remaining,
+         can plausibly reach the technical target at all. Previously this
+         number was computed and used only to print a warning — it never
+         fed back into which strike gets recommended (see this stage's
+         2026-07-30 changelog entry). If coverage is thin (below
+         `cfg.oi_expected_move_coverage_min`), the position is walked
+         further ITM the same way the OI-wall pass does: a higher-delta
+         contract tracks the underlying more directly and needs less of
+         a genuinely-uncertain big move to work, rather than staying
+         ATM/OTM and relying on a move the time/IV combination doesn't
+         actually support. Deliberately one-directional (never walks
+         OTM for comfortable coverage) — same "protect capital when
+         uncertain, don't get cuter when comfortable" bias already used
+         elsewhere in this stage (see the CURRENT_WEEK/NEXT_WEEK scalp
+         gate below).
 
     Returns (strike_type, expiry, suggested_strike, itm_steps, reasons).
     `itm_steps` is exposed so the orchestrator can pass it straight into
@@ -1967,6 +1956,47 @@ def stage5b_strike_and_expiry(
                     f"{itm_steps} ITM step(s) -> {suggested_strike:.0f}, now clears the wall "
                     f"by {room_steps:.1f} strike-step(s)"
                 )
+
+    # 2026-07-30: target/time-reachability adjustment (pass 3 — see
+    # docstring). expected_move_coverage is Stage 3.5's iv_expected_move
+    # / distance_to_target, already scaled by sqrt(days_to_expiry / 365)
+    # — so this is genuinely "given the target and the time actually
+    # remaining, can the IV-implied move plausibly get there", not a
+    # re-derivation. Only fires when we have a real technical_target to
+    # reach for (direction is not None -> always true here) and a
+    # computed coverage number; missing IV/target data means this pass
+    # is a no-op, same fail-soft contract as the wall-walk above.
+    if expected_move_coverage is not None and expected_move_coverage < cfg.oi_expected_move_coverage_min:
+        target_disp = f"{technical_target:.0f}" if technical_target else "target"
+        # Coverage is a function of distance-to-target and time/IV, not
+        # of which strike we pick — walking ITM doesn't change the
+        # underlying's required move, it changes how much of the
+        # position's P&L depends on that move actually completing
+        # (higher delta = closer to 1, less convexity-reliant). So the
+        # adjustment size is graded by HOW short coverage is of the
+        # threshold (one extra ITM step per full 0.2 shortfall), not by
+        # re-checking coverage in a loop — re-deriving it here would
+        # never change since it isn't a function of itm_steps.
+        shortfall = cfg.oi_expected_move_coverage_min - expected_move_coverage
+        extra_steps = min(1 + int(shortfall / 0.2), cfg.strike_max_itm_steps - itm_steps)
+        extra_steps = max(extra_steps, 0)
+        if extra_steps > 0:
+            itm_steps += extra_steps
+            strike_type = "ITM"
+            suggested_strike = _strike_after(itm_steps)
+            reasons.append(
+                f"Expected Move Coverage={expected_move_coverage:.2f} below "
+                f"{cfg.oi_expected_move_coverage_min:.2f} — {inp.days_to_expiry}d to expiry may not be "
+                f"enough time/IV to reach {target_disp}; {extra_steps} additional ITM step(s) -> "
+                f"{suggested_strike:.0f} (delta closer to 1 -> tracks the underlying more directly, "
+                f"needs less of the uncertain move to work)"
+            )
+        else:
+            reasons.append(
+                f"Expected Move Coverage={expected_move_coverage:.2f} below "
+                f"{cfg.oi_expected_move_coverage_min:.2f} but already at the ITM step cap "
+                f"({cfg.strike_max_itm_steps}) — size/stop should account for the reachability gap"
+            )
 
     scalp_ok = (
         inp.days_to_expiry <= cfg.expiry_days_scalp_max
@@ -2054,6 +2084,7 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     if opportunity.recommendation in (BUY_CE_NOW, BUY_CE_BREAKOUT, BUY_PE_NOW, BUY_PE_BREAKDOWN):
         strike_type, recommended_expiry, suggested_strike, itm_steps, strike_reasons = stage5b_strike_and_expiry(
             inp, cfg, direction, execution.execution_score, hard_gate_pass,
+            expected_move_coverage=oi_intel.expected_move_coverage, technical_target=technical_target,
         )
     else:
         strike_type, recommended_expiry, suggested_strike, itm_steps, strike_reasons = None, None, None, 0, []
@@ -2064,8 +2095,7 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     # before strike selection exists). This is the plan that ships in the
     # DOREResult; the preliminary one above only ever fed Stage 4's gate.
     trade_plan = build_trade_plan(inp, cfg, direction, strike_type=strike_type, itm_steps=itm_steps,
-                                   technical_target=technical_target, suggested_strike=suggested_strike,
-                                   expiry_label=recommended_expiry)
+                                   technical_target=technical_target, suggested_strike=suggested_strike)
 
     warnings = list(risk.warnings) + list(oi_intel.warnings)
     if effective_bias.override_active:
@@ -2230,12 +2260,6 @@ def build_dore_input(
     atm_chain_row: Optional[dict] = None,        # {ce_premium, pe_premium, ce_oi, pe_oi, pcr, ce_delta,
                                                   #  pe_delta, ce_spread_pct, pe_spread_pct, ...}
     oi_resistance: Optional[dict] = None,        # {ce_strike, pe_strike, expiry} — nearest OI walls
-    next_chain_row: Optional[dict] = None,        # 2026-07-30: same shape as atm_chain_row, but from
-                                                  # fetch_oi_resistance(index, expiry_date=fetch_next_expiry(...))
-                                                  # — the SECOND-nearest weekly expiry's chain. Only meaningful
-                                                  # for weekly-underlying indices close to expiry; leave None
-                                                  # otherwise (stocks, or indices not near expiry) and
-                                                  # strike_chain_next/next_expiry simply stay empty.
     iv_percentile: Optional[float] = None,
     event_risk_today: bool = False,
     option_intel: Optional[dict] = None,          # Stage 3.5 (RFC-001): {india_vix, current_iv, iv_rank,
@@ -2252,7 +2276,6 @@ def build_dore_input(
     atm_chain_row = atm_chain_row or {}
     oi_resistance = oi_resistance or {}
     option_intel = option_intel or {}
-    next_chain_row = next_chain_row or {}
     nearest_expiry = oi_resistance.get("expiry", "") or atm_chain_row.get("expiry", "")
 
     return DOREInput(
@@ -2285,8 +2308,6 @@ def build_dore_input(
         ce_premium=atm_chain_row.get("ce_premium", 0.0),
         pe_premium=atm_chain_row.get("pe_premium", 0.0),
         strike_chain=atm_chain_row.get("strike_premiums") or {},
-        strike_chain_next=next_chain_row.get("strike_premiums") or {},
-        next_expiry=next_chain_row.get("expiry", ""),
         ce_premium_prev=atm_chain_row.get("ce_premium_prev"),
         pe_premium_prev=atm_chain_row.get("pe_premium_prev"),
         ce_premium_prev2=atm_chain_row.get("ce_premium_prev2"),
