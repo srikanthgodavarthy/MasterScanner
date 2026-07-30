@@ -850,13 +850,36 @@ def top_fo_opportunities(
     # call (typically single digits of contracts) fills those in without
     # touching the discovery funnel at all — see
     # utils.upstox_client.fetch_open_plan_option_quotes()'s docstring.
+    # 2026-07-30 bugfix: this used to key plan_keys on `plan.expiry` — DORE's
+    # recommended_expiry LABEL ("MONTHLY"/"CURRENT_WEEK"/"NEXT_WEEK"), not a
+    # calendar date. fetch_open_plan_option_quotes() -> resolve_option_
+    # contract_instrument_key() passes that straight through as Upstox's
+    # `expiry_date` query param, which rejects a label as an invalid date —
+    # so the chain fetch failed for EVERY plan, every cycle, and the whole
+    # batch came back {} regardless of market/token state. That's why every
+    # persisted-plan row showed "no fresh data this cycle" rather than a
+    # handful of genuine per-symbol misses. Fixed by keying on
+    # plan.expiry_date (the real "YYYY-MM-DD" locked in at plan creation —
+    # see utils.fo_setup_persistence.FOSetupPlan.expiry_date's docstring)
+    # instead. Plans minted before this fix have no expiry_date yet; those
+    # are skipped here (not sent to the batch at all) rather than sent with
+    # an empty string, and simply keep showing "—" until they close out and
+    # get re-minted with expiry_date populated.
     live_quotes = {}
-    if unreproduced:
+    quotable = [(key, plan) for key, plan in unreproduced if plan.expiry_date]
+    skipped_no_date = len(unreproduced) - len(quotable)
+    if skipped_no_date:
+        logger.debug(
+            "[DORE Options] %d persisted plan(s) have no expiry_date (minted before the "
+            "2026-07-30 fix) — skipping live-quote backfill for those, will show \"—\"",
+            skipped_no_date,
+        )
+    if quotable:
         try:
             from utils.upstox_client import fetch_open_plan_option_quotes
             plan_keys = tuple(
-                (plan.symbol, plan.leg, plan.strike, plan.expiry)
-                for _, plan in unreproduced
+                (plan.symbol, plan.leg, plan.strike, plan.expiry_date)
+                for _, plan in quotable
             )
             live_quotes = fetch_open_plan_option_quotes(plan_keys)
         except Exception:
@@ -864,7 +887,7 @@ def top_fo_opportunities(
                               "failed (non-fatal, those rows just show \"—\" as before)")
 
     for _, plan in unreproduced:
-        quote = live_quotes.get((plan.symbol, plan.leg, plan.strike, plan.expiry))
+        quote = live_quotes.get((plan.symbol, plan.leg, plan.strike, plan.expiry_date))
         enriched_rows.append(_plan_only_row(plan, quote))
 
     actionable = pd.DataFrame(enriched_rows)

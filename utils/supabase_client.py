@@ -1321,6 +1321,7 @@ def _fo_setup_plan_from_row(row: dict) -> "object":
         leg                       = row.get("leg", ""),
         strike                    = float(row.get("strike", 0) or 0),
         expiry                    = row.get("expiry", "") or "",
+        expiry_date               = row.get("expiry_date", "") or "",
         first_seen_date           = str(row.get("first_seen_date", "")),
         created_date               = str(row.get("created_date", "")),
         entry_locked               = float(row.get("entry_locked", 0) or 0),
@@ -2056,6 +2057,16 @@ CREATE TABLE IF NOT EXISTS fo_setup_plans (
     -- If you already ran the old CREATE TABLE with `expiry date`,
     -- run this once: ALTER TABLE fo_setup_plans ALTER COLUMN expiry TYPE text;
     expiry                     text,
+    -- 2026-07-30: the real "YYYY-MM-DD" calendar date behind the label
+    -- above (row["Expiry Date"] at plan-creation time). Genuinely a
+    -- date this time (unlike `expiry`), needed so
+    -- resolve_option_contract_instrument_key() can actually fetch this
+    -- contract's option chain for the persisted-plan live-quote
+    -- backfill — passing the LABEL there was silently failing every
+    -- lookup. See utils/fo_setup_persistence.py's FOSetupPlan.expiry_date
+    -- docstring. Nullable: plans minted before this fix have no value
+    -- and simply keep rendering "—" until they close and re-mint.
+    expiry_date                date,
     first_seen_date            date        NOT NULL,
     created_date                date        NOT NULL,
 
@@ -2107,6 +2118,12 @@ CREATE INDEX IF NOT EXISTS idx_fo_setup_plans_date   ON fo_setup_plans(created_d
 #    fabricate a timestamp" rule the fix itself follows.
 FO_SETUP_PLANS_MIGRATION_SQL = """
 ALTER TABLE fo_setup_plans ADD COLUMN IF NOT EXISTS activation_price numeric(12,2);
+-- 2026-07-30: real calendar date behind the `expiry` label — see the
+-- expiry_date column comment on the CREATE TABLE block above and
+-- FOSetupPlan.expiry_date's docstring. Existing OPEN rows will have
+-- NULL here (no retroactive fabrication) and stay "—" in the
+-- persisted-plan live-quote backfill until they close and re-mint.
+ALTER TABLE fo_setup_plans ADD COLUMN IF NOT EXISTS expiry_date date;
 """
 
 

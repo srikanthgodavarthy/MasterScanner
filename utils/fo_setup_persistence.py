@@ -103,7 +103,26 @@ class FOSetupPlan:
     symbol:           str   = ""
     leg:              str   = ""    # "CE" | "PE"
     strike:           float = 0.0
-    expiry:           str   = ""
+    expiry:           str   = ""    # DORE's recommended_expiry LABEL ("MONTHLY"/"CURRENT_WEEK"/
+                                     # "NEXT_WEEK") — kept as-is because contract_key/dedup against
+                                     # live discovery rows (whose own "Expiry" column is this same
+                                     # label) depends on it matching exactly. NOT a calendar date —
+                                     # see expiry_date below for that.
+    # 2026-07-30: the actual "YYYY-MM-DD" calendar date behind the label
+    # above (row["Expiry Date"] / dore_input.nearest_expiry at creation
+    # time). Added because utils.fo_scan.py's persisted-plan live-quote
+    # backfill (fetch_open_plan_option_quotes ->
+    # resolve_option_contract_instrument_key) was passing `expiry` — the
+    # LABEL — straight through as Upstox's `expiry_date` query param,
+    # which Upstox rejects as an invalid date. That made
+    # resolve_option_contract_instrument_key() return None for every
+    # open plan every cycle, so the batched backfill came back {} in
+    # full — not per-symbol — which is why EVERY persisted-plan row
+    # showed "no fresh data this cycle" regardless of market/token state.
+    # Empty for any plan created before this fix; those rows keep
+    # rendering "—" (fail-soft, unchanged) until they close out and get
+    # re-minted with this populated.
+    expiry_date:      str   = ""
 
     first_seen_date:  str   = ""
     created_date:      str   = ""    # date this plan was minted (== today when created)
@@ -156,6 +175,7 @@ class FOSetupPlan:
             "leg":                     self.leg,
             "strike":                  self.strike,
             "expiry":                  self.expiry,
+            "expiry_date":             self.expiry_date or None,
             "first_seen_date":         self.first_seen_date,
             "created_date":            self.created_date,
             "entry_locked":            self.entry_locked,
@@ -729,6 +749,12 @@ def _create_fo_plan(row: dict, first_seen: str, today_str: str) -> Optional[FOSe
     leg    = str(row.get("Leg", "") or "")
     strike = float(row.get("Strike", 0) or 0)
     expiry = str(row.get("Expiry", "") or "")
+    # 2026-07-30: the real calendar date behind the label above — see
+    # FOSetupPlan.expiry_date's docstring for why this is locked in
+    # separately from `expiry`. Sourced from "Expiry Date"
+    # (dore_input.nearest_expiry, fo_scan.py's top_fo_opportunities()),
+    # NOT from `expiry` itself.
+    expiry_date = str(row.get("Expiry Date", "") or "")
     if not symbol or leg not in ("CE", "PE") or strike <= 0:
         return None
 
@@ -740,6 +766,7 @@ def _create_fo_plan(row: dict, first_seen: str, today_str: str) -> Optional[FOSe
         leg             = leg,
         strike          = strike,
         expiry          = expiry,
+        expiry_date     = expiry_date,
         first_seen_date = first_seen or today_str,
         created_date     = today_str,
         entry_locked     = float(row.get("Entry", 0) or 0),
@@ -758,9 +785,16 @@ def _create_fo_plan(row: dict, first_seen: str, today_str: str) -> Optional[FOSe
         status_reason     = "Plan created — awaiting entry trigger",
         created_at        = now_ts,
     )
+    if not expiry_date:
+        logger.warning(
+            "[FO SETUP PLAN CREATED] symbol=%s leg=%s strike=%.1f expiry=%s id=%s has NO expiry_date "
+            "(row missing 'Expiry Date') — this plan's live-quote backfill will stay \"—\" until it "
+            "closes and re-mints", symbol, leg, strike, expiry, setup_id,
+        )
     logger.info(
-        "[FO SETUP PLAN CREATED] symbol=%s leg=%s strike=%.1f expiry=%s id=%s entry=%.2f sl=%.2f t1=%.2f",
-        symbol, leg, strike, expiry, setup_id, plan.entry_locked, plan.sl_locked, plan.t1_locked,
+        "[FO SETUP PLAN CREATED] symbol=%s leg=%s strike=%.1f expiry=%s expiry_date=%s id=%s "
+        "entry=%.2f sl=%.2f t1=%.2f",
+        symbol, leg, strike, expiry, expiry_date, setup_id, plan.entry_locked, plan.sl_locked, plan.t1_locked,
     )
     return plan
 

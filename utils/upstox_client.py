@@ -1650,7 +1650,14 @@ def resolve_option_contract_instrument_key(symbol: str, leg: str, strike: float,
 def fetch_open_plan_option_quotes(plan_keys: tuple) -> dict:
     """
     Live LTP for a small batch of open FOSetupPlan contracts, keyed by
-    (symbol, leg, strike, expiry) tuples.
+    (symbol, leg, strike, expiry) tuples — `expiry` here MUST be the real
+    "YYYY-MM-DD" calendar date (FOSetupPlan.expiry_date), NOT DORE's
+    recommended_expiry LABEL (FOSetupPlan.expiry, e.g. "MONTHLY"). This
+    value is passed straight through to resolve_option_contract_
+    instrument_key() -> Upstox's `expiry_date` query param, which rejects
+    a label as an invalid date. Passing the label here silently failed
+    resolution for every plan (fo_scan.py's 2026-07-30 bugfix) — see that
+    file's top_fo_opportunities() for the caller-side fix.
 
     2026-07-30: added because utils.fo_scan.top_fo_opportunities() only
     ever showed live LTP/Premium/Entry Drift % for symbols this cycle's
