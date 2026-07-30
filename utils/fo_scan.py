@@ -235,15 +235,6 @@ def stage1_trend_qualification(
             logger.exception("[DORE Stage1] trend engine failed for %s", symbol)
             continue
         if intent == NEUTRAL:
-            # 2026-07-30: only 3 index symbols exist total, so identify
-            # them by name when dropped — a missing NIFTY/BANKNIFTY row in
-            # the F&O Options table is otherwise indistinguishable from a
-            # real fetch failure without this. Not logged for the ~200
-            # stock symbols (too noisy; the aggregate count below covers
-            # those).
-            if symbol in _INDICES:
-                logger.info("[DORE Stage1] %s dropped — Directional Intent=NEUTRAL "
-                            "(trend_score=%.1f); won't reach Stage 2/3 this cycle", symbol, trend_score)
             continue
         pool[symbol] = {
             "trend_score": trend_score,
@@ -251,11 +242,6 @@ def stage1_trend_qualification(
             "price": features.get("price", 0.0),
             "trend_features": features,
         }
-    for idx in index_symbols:
-        if idx not in daily_dfs:
-            logger.warning("[DORE Stage1] %s OHLCV fetch returned nothing — dropped before "
-                            "Directional Intent was even evaluated (see the exception logged "
-                            "above by fetch_index_ohlcv_upstox, if any)", idx)
 
     logger.info("[DORE Stage1] Daily Candidate Pool: %d/%d symbols cleared NEUTRAL",
                 len(pool), len(daily_dfs))
@@ -406,10 +392,6 @@ def stage2_execution_qualification(
             logger.exception("[DORE Stage2] execution engine failed for %s", symbol)
             continue
         if state == NOT_READY:
-            if symbol in _INDICES:
-                logger.info("[DORE Stage2] %s dropped — Execution State=NOT_READY "
-                            "(execution_score=%.1f); cleared Stage 1 but won't reach Stage 3 "
-                            "this cycle", symbol, execution_score)
             continue
         pool[symbol] = {
             **row,
@@ -465,8 +447,7 @@ def compute_fo_opportunities(
     see utils.option_chain_diagnostics.get_option_chain_stats().
     """
     cfg = _load_settings(cfg)
-    from utils.upstox_client import fetch_oi_resistance, fetch_next_expiry, fetch_batch_stock_atm_options_upstox
-    from datetime import date as _date
+    from utils.upstox_client import fetch_oi_resistance, fetch_batch_stock_atm_options_upstox
     from utils.oi_snapshot_store import record_and_diff, record_and_diff_premium, record_and_diff_strike_premium
     from utils.option_chain_diagnostics import reset_option_chain_stats, get_option_chain_stats
 
@@ -528,29 +509,6 @@ def compute_fo_opportunities(
                                        "expiry": opt.get("expiry")}
                 ce_chg, pe_chg = record_and_diff(symbol, opt.get("total_ce_oi", 0.0), opt.get("total_pe_oi", 0.0))
                 premium_key = symbol
-
-                # 2026-07-30: only fetch the second-nearest weekly chain
-                # when we're actually close enough to expiry for Stage 5b
-                # (stage5b_strike_and_expiry) to potentially recommend
-                # "NEXT_WEEK" — same threshold it uses (cfg.expiry_days_scalp_max),
-                # so this extra Upstox call only happens on the days it's
-                # needed, not every scan. Without this, strike_chain_next
-                # stays empty and a NEXT_WEEK recommendation falls back to
-                # the ATM reference premium (fail-soft, flagged in a
-                # warning) rather than the current week's wrong-contract
-                # premium it used to silently show.
-                next_chain_row = None
-                try:
-                    _dte = (_date.fromisoformat(opt["expiry"]) - _date.today()).days if opt.get("expiry") else 999
-                except Exception:
-                    _dte = 999
-                if _dte <= cfg.expiry_days_scalp_max:
-                    _next_expiry = fetch_next_expiry(key_map[symbol])
-                    if _next_expiry:
-                        _next_opt = fetch_oi_resistance(key_map[symbol], expiry_date=_next_expiry) or {}
-                        if _next_opt:
-                            next_chain_row = {"strike_premiums": _next_opt.get("strike_premiums") or {},
-                                               "expiry": _next_opt.get("expiry", _next_expiry)}
             else:
                 opt = stock_atm_options.get(symbol)
                 if opt is None:
@@ -571,7 +529,6 @@ def compute_fo_opportunities(
                 ce_chg, pe_chg = record_and_diff(f"STK_{symbol}", opt.get("total_ce_oi", 0.0),
                                                   opt.get("total_pe_oi", 0.0))
                 premium_key = f"STK_{symbol}"
-                next_chain_row = None  # stocks are monthly-only — no "next week" contract to roll into
             atm_chain_row["ce_oi_change"] = ce_chg
             atm_chain_row["pe_oi_change"] = pe_chg
 
@@ -595,7 +552,6 @@ def compute_fo_opportunities(
             symbol=symbol, price=row["price"], trend_features=row.get("trend_features"),
             execution_features=row.get("execution_features"),
             atm_chain_row=atm_chain_row, oi_resistance=oi_resistance_like,
-            next_chain_row=next_chain_row,
         )
         result = compute_dore(dore_input, cfg)
         _persist_reversal_alert(symbol, result)
@@ -615,13 +571,7 @@ def compute_fo_opportunities(
         # looking the real premium up in dore_input.strike_chain, keyed
         # by result.suggested_strike itself.
         leg = result.suggested_direction
-        # 2026-07-30: same wrong-expiry gap as build_trade_plan() — when
-        # Stage 5b recommends NEXT_WEEK, suggested_strike belongs to the
-        # second-nearest weekly chain, not dore_input.strike_chain (current
-        # week only). Route accordingly; strike_chain_next is empty unless
-        # we were close enough to expiry to have fetched it above.
-        _premium_chain = dore_input.strike_chain_next if result.recommended_expiry == "NEXT_WEEK" else dore_input.strike_chain
-        strike_row = _premium_chain.get(result.suggested_strike) if result.suggested_strike else None
+        strike_row = dore_input.strike_chain.get(result.suggested_strike) if result.suggested_strike else None
         if strike_row:
             premium_now = strike_row.get("ce_premium", 0.0) if leg == "CE" else \
                           strike_row.get("pe_premium", 0.0) if leg == "PE" else 0.0
@@ -776,54 +726,149 @@ def top_fo_opportunities(
     cfg = _load_settings(cfg)
     universe = universe if universe is not None else stage0_universe()
 
+    # 2026-07-30: load already-open plans FIRST and unconditionally,
+    # before Stage 1/2 even run. Previously this load sat behind three
+    # early-return gates below (`if not daily_pool/live_pool: return
+    # pd.DataFrame()`, `if actionable.empty: return actionable`) — so
+    # any time this cycle's LIVE funnel found nothing (e.g. post-market,
+    # when there's no fresh intraday data for Stage 2 to qualify any
+    # symbol on), load_open_fo_setup_plans() never even ran, and a
+    # WAITING/ACTIVE/T1_HIT plan that was still open and untouched in
+    # Supabase silently vanished from the table. Whether a plan is open
+    # is independent of whether today's live scan currently re-discovers
+    # its symbol — it shouldn't need to be rediscovered to stay visible.
+    try:
+        from utils.supabase_client import load_open_fo_setup_plans
+        existing_plans = load_open_fo_setup_plans()
+    except Exception:
+        logger.exception("[DORE Options] load_open_fo_setup_plans failed "
+                          "(non-fatal, open plans won't render this cycle)")
+        existing_plans = {}
+
     daily_pool = stage1_trend_qualification(universe, cfg, period=daily_pool_period, progress_cb=progress_cb)
-    if not daily_pool:
-        return pd.DataFrame()
+    live_pool = stage2_execution_qualification(daily_pool, cfg, progress_cb=progress_cb) if daily_pool else {}
 
-    live_pool = stage2_execution_qualification(daily_pool, cfg, progress_cb=progress_cb)
-    if not live_pool:
-        return pd.DataFrame()
-
-    opportunities = compute_fo_opportunities(live_pool, cfg, progress_cb=progress_cb)
-    diagnostics = opportunities.attrs.get("option_chain_diagnostics")
-    if opportunities.empty:
-        return opportunities
-
-    actionable = opportunities[opportunities["Recommendation"].isin(_ACTIONABLE)]
-    actionable = actionable.head(top_n).reset_index(drop=True)
-    if actionable.empty:
-        if diagnostics is not None:
-            actionable.attrs["option_chain_diagnostics"] = diagnostics
-        return actionable
+    diagnostics = None
+    actionable = pd.DataFrame()
+    if live_pool:
+        opportunities = compute_fo_opportunities(live_pool, cfg, progress_cb=progress_cb)
+        diagnostics = opportunities.attrs.get("option_chain_diagnostics")
+        if not opportunities.empty:
+            actionable = opportunities[opportunities["Recommendation"].isin(_ACTIONABLE)]
+            actionable = actionable.head(top_n).reset_index(drop=True)
 
     # Attach the 'Plan' lifecycle column (WAITING/ACTIVE/T1_HIT/...) and
     # lock Entry/SL/T1/T2 to the plan's frozen levels for any symbol with
-    # an open FOSetupPlan. This was previously built (fo_setup_persistence
-    # .enrich_fo_opportunities_df) but never called from here.
-    try:
-        from utils.fo_setup_persistence import enrich_fo_opportunities_df
-        from utils.supabase_client import load_open_fo_setup_plans, upsert_fo_setup_plans_batch
-        from utils.upstox_client import fetch_option_contract_intraday_candles
+    # an open FOSetupPlan among THIS cycle's live rows (may be zero rows,
+    # e.g. post-market — enrich_fo_opportunities_df handles an empty
+    # `rows` list fine, it just won't mint/advance anything from it).
+    enriched_rows = actionable.to_dict("records")
+    if existing_plans:
+        try:
+            from utils.fo_setup_persistence import enrich_fo_opportunities_df
+            from utils.supabase_client import upsert_fo_setup_plans_batch
+            from utils.upstox_client import fetch_option_contract_intraday_candles
 
-        existing_plans = load_open_fo_setup_plans()
-        # 2026-07-29: option_history_provider was never supplied here, so
-        # every Plan sat WAITING forever regardless of how far premium
-        # had already moved past its locked Entry — see
-        # fetch_option_contract_intraday_candles()'s docstring in
-        # utils.upstox_client.
-        enriched_rows, updated_plans = enrich_fo_opportunities_df(
-            actionable.to_dict("records"), existing_plans,
-            option_history_provider=fetch_option_contract_intraday_candles)
-        if updated_plans:
-            upsert_fo_setup_plans_batch([p.to_db_dict() for p in updated_plans])
-        actionable = pd.DataFrame(enriched_rows)
-    except Exception:
-        logger.exception("[DORE Options] Plan lifecycle enrichment failed (non-fatal, "
-                          "table renders without the Plan column)")
+            # 2026-07-29: option_history_provider was never supplied here, so
+            # every Plan sat WAITING forever regardless of how far premium
+            # had already moved past its locked Entry — see
+            # fetch_option_contract_intraday_candles()'s docstring in
+            # utils.upstox_client.
+            enriched_rows, updated_plans = enrich_fo_opportunities_df(
+                enriched_rows, existing_plans,
+                option_history_provider=fetch_option_contract_intraday_candles)
+            if updated_plans:
+                upsert_fo_setup_plans_batch([p.to_db_dict() for p in updated_plans])
+        except Exception:
+            logger.exception("[DORE Options] Plan lifecycle enrichment failed (non-fatal, "
+                              "table renders without the Plan column)")
 
+    # 2026-07-30: any OPEN plan whose contract wasn't among this cycle's
+    # live rows (its symbol didn't clear Stage 1/2 this cycle — the
+    # post-market case) still needs to render from its own frozen
+    # fields, or it silently disappears the moment the live funnel stops
+    # reproducing it even though the plan itself is still open.
+    seen_keys = {
+        f"{str(r.get('Symbol', '')).upper().strip()}|{r.get('Leg', '')}|"
+        f"{float(r.get('Strike', 0) or 0):.1f}|{r.get('Expiry', '')}"
+        for r in enriched_rows
+    }
+    for key, plan in existing_plans.items():
+        if key in seen_keys or not plan.is_open():
+            continue
+        enriched_rows.append(_plan_only_row(plan))
+
+    actionable = pd.DataFrame(enriched_rows)
     if diagnostics is not None:
         actionable.attrs["option_chain_diagnostics"] = diagnostics
     return actionable
+
+
+def _plan_only_row(plan) -> dict:
+    """Build a display row straight from a persisted FOSetupPlan, for a
+    contract that's still open but wasn't reproduced by this cycle's
+    live Stage 1/2/3 funnel (see the 2026-07-30 fix in
+    top_fo_opportunities() above). No live LTP/Premium/Opportunity
+    Score exists this cycle by definition — those render as "—" rather
+    than a stale or fabricated number. Entry/SL/T1/T2 come from the
+    plan's own frozen levels, same as a live row with an open plan
+    would show.
+    """
+    from utils.fo_setup_persistence import FOSetupPlanStatus, _to_ist_display
+
+    plan.days_active = _compute_days_active_safe(plan.created_date)
+    if plan.status == FOSetupPlanStatus.T1_HIT:
+        event_ts = plan.t1_hit_at or plan.activated_at or plan.created_at
+        action, exec_state = "Manage Trade", "T1_HIT — trail remainder to T2/SL (no fresh data this cycle)"
+    elif plan.status == FOSetupPlanStatus.ACTIVE:
+        event_ts = plan.activated_at or plan.created_at
+        action, exec_state = "In Trade", "POSITION_ACTIVE — holding for T1 (no fresh data this cycle)"
+    else:  # WAITING
+        event_ts = plan.created_at
+        action, exec_state = "Wait for Trigger", "BREAKOUT_PENDING (no fresh data this cycle)"
+
+    return {
+        "Symbol": plan.symbol,
+        "Leg": plan.leg,
+        "Strike": plan.strike,
+        "LTP": None,
+        "Premium": None,
+        "Premium %Chg": None,
+        "Opportunity Score": plan.locked_opportunity_score,
+        "Entry": plan.entry_locked,
+        "Entry Drift %": None,
+        "SL": plan.sl_locked,
+        "T1": plan.t1_locked,
+        "T2": plan.t2_locked,
+        "Plan": _plan_status_label_safe(plan),
+        "SetupID": plan.setup_id,
+        "SetupAge": _format_setup_age_safe(plan.days_active, plan.status),
+        "Entry Timestamp": _to_ist_display(event_ts),
+        "Expiry": plan.expiry,
+        "Expiry Date": None,
+        "Days To Expiry": None,
+        "Strike Type": plan.locked_strike_type,
+        "Reason": "Persisted plan — symbol didn't clear this cycle's live scan "
+                  "(e.g. post-market); showing last-locked levels only.",
+        "Recommendation": plan.locked_recommendation,
+        "Action": action,
+        "Execution State": exec_state,
+    }
+
+
+def _compute_days_active_safe(created_date: str) -> int:
+    from utils.fo_setup_persistence import _compute_days_active
+    return _compute_days_active(created_date)
+
+
+def _plan_status_label_safe(plan) -> str:
+    from utils.fo_setup_persistence import _plan_status_label
+    return _plan_status_label(plan.status)
+
+
+def _format_setup_age_safe(days_active: int, status) -> str:
+    from utils.fo_setup_persistence import _format_setup_age
+    return _format_setup_age(days_active, status)
 
 
 # ══════════════════════════════════════════════════════════════════
