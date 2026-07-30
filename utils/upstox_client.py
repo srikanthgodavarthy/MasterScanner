@@ -1169,11 +1169,57 @@ def _derive_strike_interval(chain: list, atm_strike: Optional[float]) -> float:
     return gaps[len(gaps) // 2]  # median gap
 
 
-def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_next_expiry(index: str = "NIFTY") -> str | None:
+    """
+    Return the SECOND-nearest upcoming options expiry ("YYYY-MM-DD") for
+    `index` — the contract Stage 5b means by "NEXT_WEEK" in
+    stage5b_strike_and_expiry(). Same endpoint/shape as
+    fetch_nearest_expiry(); returns None if there's no second expiry
+    (or the request fails), same fail-soft contract.
+    """
+    headers = _auth_headers()
+    instrument_key = _INDEX_INSTRUMENT_KEYS.get(index.upper())
+    if headers is None or instrument_key is None:
+        return None
+
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/v2/option/contract",
+            headers=headers,
+            params={"instrument_key": instrument_key},
+            timeout=10,
+        )
+        if resp.status_code == 401:
+            logger.warning("Upstox 401 on option-contract for %s — token expired or invalid", index)
+            return None
+        resp.raise_for_status()
+        contracts = resp.json().get("data", [])
+        expiries = sorted({c["expiry"] for c in contracts if c.get("expiry")})
+        if not expiries:
+            return None
+        today_str = date.today().isoformat()
+        upcoming = [e for e in expiries if e >= today_str]
+        return upcoming[1] if len(upcoming) > 1 else None
+    except Exception:
+        logger.warning("Upstox option-contract fetch failed for %s", index, exc_info=True)
+        return None
+
+
+def fetch_oi_resistance(index: str = "NIFTY", expiry_date: str | None = None) -> dict | None:
     """
     Return the nearest-expiry Call/Put OI resistance levels for `index`
     ("NIFTY", "SENSEX", or "BANKNIFTY") via Upstox's option-chain endpoint:
       GET /v2/option/chain?instrument_key=...&expiry_date=...
+
+    `expiry_date` — 2026-07-30: optional override, "YYYY-MM-DD". When
+    omitted (the default — every call site before today), fetches
+    fetch_nearest_expiry(index) same as always. Pass fetch_next_expiry(index)
+    here to fetch the SECOND-nearest weekly expiry's chain instead — used
+    by compute_fo_opportunities() to build DOREInput.strike_chain_next so
+    Stage 5b's "NEXT_WEEK" recommendation (stage5b_strike_and_expiry, the
+    close-to-expiry capital-protection branch) has a real chain to price
+    against, instead of silently reusing the current week's.
 
     {
       "expiry":     "2026-07-24",
@@ -1194,7 +1240,7 @@ def fetch_oi_resistance(index: str = "NIFTY") -> dict | None:
     if headers is None or instrument_key is None or is_token_expired():
         return None
 
-    expiry = fetch_nearest_expiry(index)
+    expiry = expiry_date or fetch_nearest_expiry(index)
     if not expiry:
         return None
 

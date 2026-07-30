@@ -235,6 +235,15 @@ def stage1_trend_qualification(
             logger.exception("[DORE Stage1] trend engine failed for %s", symbol)
             continue
         if intent == NEUTRAL:
+            # 2026-07-30: only 3 index symbols exist total, so identify
+            # them by name when dropped — a missing NIFTY/BANKNIFTY row in
+            # the F&O Options table is otherwise indistinguishable from a
+            # real fetch failure without this. Not logged for the ~200
+            # stock symbols (too noisy; the aggregate count below covers
+            # those).
+            if symbol in _INDICES:
+                logger.info("[DORE Stage1] %s dropped — Directional Intent=NEUTRAL "
+                            "(trend_score=%.1f); won't reach Stage 2/3 this cycle", symbol, trend_score)
             continue
         pool[symbol] = {
             "trend_score": trend_score,
@@ -242,6 +251,11 @@ def stage1_trend_qualification(
             "price": features.get("price", 0.0),
             "trend_features": features,
         }
+    for idx in index_symbols:
+        if idx not in daily_dfs:
+            logger.warning("[DORE Stage1] %s OHLCV fetch returned nothing — dropped before "
+                            "Directional Intent was even evaluated (see the exception logged "
+                            "above by fetch_index_ohlcv_upstox, if any)", idx)
 
     logger.info("[DORE Stage1] Daily Candidate Pool: %d/%d symbols cleared NEUTRAL",
                 len(pool), len(daily_dfs))
@@ -392,6 +406,10 @@ def stage2_execution_qualification(
             logger.exception("[DORE Stage2] execution engine failed for %s", symbol)
             continue
         if state == NOT_READY:
+            if symbol in _INDICES:
+                logger.info("[DORE Stage2] %s dropped — Execution State=NOT_READY "
+                            "(execution_score=%.1f); cleared Stage 1 but won't reach Stage 3 "
+                            "this cycle", symbol, execution_score)
             continue
         pool[symbol] = {
             **row,
@@ -447,7 +465,8 @@ def compute_fo_opportunities(
     see utils.option_chain_diagnostics.get_option_chain_stats().
     """
     cfg = _load_settings(cfg)
-    from utils.upstox_client import fetch_oi_resistance, fetch_batch_stock_atm_options_upstox
+    from utils.upstox_client import fetch_oi_resistance, fetch_next_expiry, fetch_batch_stock_atm_options_upstox
+    from datetime import date as _date
     from utils.oi_snapshot_store import record_and_diff, record_and_diff_premium, record_and_diff_strike_premium
     from utils.option_chain_diagnostics import reset_option_chain_stats, get_option_chain_stats
 
@@ -509,6 +528,29 @@ def compute_fo_opportunities(
                                        "expiry": opt.get("expiry")}
                 ce_chg, pe_chg = record_and_diff(symbol, opt.get("total_ce_oi", 0.0), opt.get("total_pe_oi", 0.0))
                 premium_key = symbol
+
+                # 2026-07-30: only fetch the second-nearest weekly chain
+                # when we're actually close enough to expiry for Stage 5b
+                # (stage5b_strike_and_expiry) to potentially recommend
+                # "NEXT_WEEK" — same threshold it uses (cfg.expiry_days_scalp_max),
+                # so this extra Upstox call only happens on the days it's
+                # needed, not every scan. Without this, strike_chain_next
+                # stays empty and a NEXT_WEEK recommendation falls back to
+                # the ATM reference premium (fail-soft, flagged in a
+                # warning) rather than the current week's wrong-contract
+                # premium it used to silently show.
+                next_chain_row = None
+                try:
+                    _dte = (_date.fromisoformat(opt["expiry"]) - _date.today()).days if opt.get("expiry") else 999
+                except Exception:
+                    _dte = 999
+                if _dte <= cfg.expiry_days_scalp_max:
+                    _next_expiry = fetch_next_expiry(key_map[symbol])
+                    if _next_expiry:
+                        _next_opt = fetch_oi_resistance(key_map[symbol], expiry_date=_next_expiry) or {}
+                        if _next_opt:
+                            next_chain_row = {"strike_premiums": _next_opt.get("strike_premiums") or {},
+                                               "expiry": _next_opt.get("expiry", _next_expiry)}
             else:
                 opt = stock_atm_options.get(symbol)
                 if opt is None:
@@ -529,6 +571,7 @@ def compute_fo_opportunities(
                 ce_chg, pe_chg = record_and_diff(f"STK_{symbol}", opt.get("total_ce_oi", 0.0),
                                                   opt.get("total_pe_oi", 0.0))
                 premium_key = f"STK_{symbol}"
+                next_chain_row = None  # stocks are monthly-only — no "next week" contract to roll into
             atm_chain_row["ce_oi_change"] = ce_chg
             atm_chain_row["pe_oi_change"] = pe_chg
 
@@ -552,6 +595,7 @@ def compute_fo_opportunities(
             symbol=symbol, price=row["price"], trend_features=row.get("trend_features"),
             execution_features=row.get("execution_features"),
             atm_chain_row=atm_chain_row, oi_resistance=oi_resistance_like,
+            next_chain_row=next_chain_row,
         )
         result = compute_dore(dore_input, cfg)
         _persist_reversal_alert(symbol, result)
@@ -571,7 +615,13 @@ def compute_fo_opportunities(
         # looking the real premium up in dore_input.strike_chain, keyed
         # by result.suggested_strike itself.
         leg = result.suggested_direction
-        strike_row = dore_input.strike_chain.get(result.suggested_strike) if result.suggested_strike else None
+        # 2026-07-30: same wrong-expiry gap as build_trade_plan() — when
+        # Stage 5b recommends NEXT_WEEK, suggested_strike belongs to the
+        # second-nearest weekly chain, not dore_input.strike_chain (current
+        # week only). Route accordingly; strike_chain_next is empty unless
+        # we were close enough to expiry to have fetched it above.
+        _premium_chain = dore_input.strike_chain_next if result.recommended_expiry == "NEXT_WEEK" else dore_input.strike_chain
+        strike_row = _premium_chain.get(result.suggested_strike) if result.suggested_strike else None
         if strike_row:
             premium_now = strike_row.get("ce_premium", 0.0) if leg == "CE" else \
                           strike_row.get("pe_premium", 0.0) if leg == "PE" else 0.0

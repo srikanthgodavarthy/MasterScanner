@@ -203,10 +203,23 @@ class DOREInput:
     ce_premium:       float = 0.0
     pe_premium:       float = 0.0
     strike_chain:     dict = field(default_factory=dict)   # {strike: {"ce_premium","pe_premium","ce_oi","pe_oi"}}
-                                     # — full chain, same fetch as ce_premium/pe_premium above (ATM/wall
-                                     # reference only). Used to look up the REAL premium at whatever strike
-                                     # Stage 5b (stage5b_strike_and_expiry) actually recommends, since that
-                                     # can be a different, ITM-walked strike — see build_dore_input().
+                                     # — full chain for `nearest_expiry` ONLY, same fetch as ce_premium/
+                                     # pe_premium above (ATM/wall reference only). Used to look up the REAL
+                                     # premium at whatever strike Stage 5b (stage5b_strike_and_expiry)
+                                     # actually recommends, since that can be a different, ITM-walked strike
+                                     # — see build_dore_input().
+    strike_chain_next: dict = field(default_factory=dict)  # 2026-07-30: same shape as strike_chain, but for
+                                     # the SECOND-nearest weekly expiry (weekly-underlying indices only —
+                                     # see utils.upstox_client._WEEKLY_EXPIRY_SYMBOLS / fetch_oi_resistance's
+                                     # `next_week` arg). Stage 5b can recommend expiry="NEXT_WEEK" (see
+                                     # stage5b_strike_and_expiry, close-to-expiry capital-protection branch),
+                                     # in which case suggested_strike must be priced off THIS chain, not
+                                     # strike_chain above — strike_chain only ever holds the current week's
+                                     # contract, so a same-numbered strike there belongs to a different
+                                     # expiry date entirely. Empty when not near expiry (not fetched — no
+                                     # need to spend the extra Upstox call every scan) or for stocks (monthly-
+                                     # only, no "next week" contract exists to roll into).
+    next_expiry:      str = ""      # actual "YYYY-MM-DD" the row above in strike_chain_next belongs to
     ce_premium_prev:  Optional[float] = None   # premium 1 poll ago (tick-to-tick, not day-open baseline)
     pe_premium_prev:  Optional[float] = None
     ce_premium_prev2: Optional[float] = None   # premium 2 polls ago — lets Stage 3 tell "was falling, now
@@ -287,6 +300,7 @@ def build_trade_plan(
     itm_steps: int = 0,
     technical_target: Optional[float] = None,
     suggested_strike: Optional[float] = None,
+    expiry_label: Optional[str] = None,
 ) -> TradePlan:
     """Premium-denominated TradePlan. A BUY_CE/BUY_PE recommendation
     trades the OPTION, not the underlying — so Entry/Stop/Targets must
@@ -365,7 +379,25 @@ def build_trade_plan(
     # None (the preliminary, pre-strike-selection call in compute_dore())
     # or isn't present in this poll's strike_chain (fail-soft, same as
     # fo_scan.py's own fallback).
-    strike_row = inp.strike_chain.get(suggested_strike) if suggested_strike else None
+    #
+    # 2026-07-30: strike_chain is keyed by strike price ONLY, with no
+    # expiry tag — it only ever holds ONE expiry's chain (nearest). But
+    # Stage 5b (stage5b_strike_and_expiry) can set expiry_label to
+    # "NEXT_WEEK" for weekly-underlying indices close to expiry (the
+    # "using next week to protect capital" branch) — a suggested_strike
+    # under that label is a NEXT WEEK contract, and looking it up in
+    # strike_chain (current week's chain) returns whatever THIS week's
+    # contract happens to trade at that same strike number: a real,
+    # live premium, just for the wrong contract entirely. That produced
+    # Entry/Premium values that never existed for the option actually
+    # being recommended. Route to strike_chain_next whenever the label
+    # says NEXT_WEEK; fail soft to the ATM reference premium (same as
+    # the "no strike_row" branch below) if that chain wasn't fetched.
+    if expiry_label == "NEXT_WEEK":
+        chain = inp.strike_chain_next
+    else:
+        chain = inp.strike_chain
+    strike_row = chain.get(suggested_strike) if suggested_strike else None
     if strike_row:
         premium = strike_row.get("ce_premium", 0.0) if direction == "CE" else strike_row.get("pe_premium", 0.0)
     else:
@@ -1027,55 +1059,13 @@ def compute_effective_bias(
         against_trend = (trend.directional_intent == BULLISH and reversal_alert.move_direction == "DOWN") or \
                          (trend.directional_intent == BEARISH and reversal_alert.move_direction == "UP") or \
                          trend.directional_intent == NEUTRAL
-
-        # ── trend-conviction protection (2026-07-29) ────────────────
-        # Bug this fixes: a daily trend that's barely BULLISH (trend_score
-        # just above trend_bullish_score_min, e.g. 61) and one that's deep,
-        # freshly-rallying BULLISH (trend_score 90+, e.g. after a 500pt
-        # NIFTY / 1500pt SENSEX 2-day rally) were treated identically by
-        # the override — ANY against-trend day clearing the fixed 30/70
-        # bar flipped the effective bias outright. In practice that meant
-        # one ordinary profit-booking red candle the day after a strong
-        # rally was enough to fully discard the rally and force a PE
-        # (BEARISH) recommendation, even though the underlying trend had
-        # just gotten stronger, not weaker.
-        #
-        # Fix: scale how hard the override bar is to clear by how deep
-        # into BULLISH/BEARISH territory the daily trend already sits.
-        # A borderline trend (conviction ~0) keeps today's configured
-        # override_score_bullish_min/bearish_max untouched — same
-        # behaviour as before. A deeply-established trend (conviction ~1)
-        # pushes that bar toward the far extreme (near 0 or near 100), so
-        # only an overwhelming, multi-signal same-day reversal — not a
-        # routine pullback — can still flip it. This never disables the
-        # override; a strong-enough reversal can always still fire.
-        if trend.directional_intent == BULLISH:
-            conviction = _clamp((trend.trend_score - cfg.trend_bullish_score_min) /
-                                 max(100.0 - cfg.trend_bullish_score_min, 0.01), 0.0, 1.0)
-        elif trend.directional_intent == BEARISH:
-            conviction = _clamp((cfg.trend_bearish_score_max - trend.trend_score) /
-                                 max(cfg.trend_bearish_score_max, 0.01), 0.0, 1.0)
-        else:
-            conviction = 0.0   # NEUTRAL daily trend has no conviction to protect
-
-        damping = cfg.override_trend_conviction_weight * conviction
-        effective_bearish_max = cfg.override_score_bearish_max * (1.0 - damping)
-        effective_bullish_min = cfg.override_score_bullish_min + (100.0 - cfg.override_score_bullish_min) * damping
-
-        crosses_bullish = intraday_score >= effective_bullish_min and reversal_alert.move_direction == "UP"
-        crosses_bearish = intraday_score <= effective_bearish_max and reversal_alert.move_direction == "DOWN"
-        if conviction > 0.0:
-            reasons.append(
-                f"Trend conviction={conviction:.2f} (daily Trend Score={trend.trend_score:.0f}, "
-                f"{trend.directional_intent}) -> override bar adjusted to "
-                f"bullish>={effective_bullish_min:.0f}/bearish<={effective_bearish_max:.0f} "
-                f"(base {cfg.override_score_bullish_min:.0f}/{cfg.override_score_bearish_max:.0f})"
-            )
+        crosses_bullish = intraday_score >= cfg.override_score_bullish_min and reversal_alert.move_direction == "UP"
+        crosses_bearish = intraday_score <= cfg.override_score_bearish_max and reversal_alert.move_direction == "DOWN"
         if against_trend and (crosses_bullish or crosses_bearish):
             override_intent = BULLISH if crosses_bullish else BEARISH
             reasons.append(
                 f"Intraday Override Active: Intraday Reversal Score={intraday_score:.0f} clears the "
-                f"{effective_bullish_min:.0f}/{effective_bearish_max:.0f} override bar — "
+                f"{cfg.override_score_bullish_min:.0f}/{cfg.override_score_bearish_max:.0f} override bar — "
                 f"effective bias forced {override_intent} regardless of {trend.directional_intent} daily intent "
                 f"({reversal_alert.move_pct:+.2f}%"
                 + (f", {atr_mult:.2f}x ATR" if atr_mult is not None else "") + ")"
@@ -2074,7 +2064,8 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     # before strike selection exists). This is the plan that ships in the
     # DOREResult; the preliminary one above only ever fed Stage 4's gate.
     trade_plan = build_trade_plan(inp, cfg, direction, strike_type=strike_type, itm_steps=itm_steps,
-                                   technical_target=technical_target, suggested_strike=suggested_strike)
+                                   technical_target=technical_target, suggested_strike=suggested_strike,
+                                   expiry_label=recommended_expiry)
 
     warnings = list(risk.warnings) + list(oi_intel.warnings)
     if effective_bias.override_active:
@@ -2239,6 +2230,12 @@ def build_dore_input(
     atm_chain_row: Optional[dict] = None,        # {ce_premium, pe_premium, ce_oi, pe_oi, pcr, ce_delta,
                                                   #  pe_delta, ce_spread_pct, pe_spread_pct, ...}
     oi_resistance: Optional[dict] = None,        # {ce_strike, pe_strike, expiry} — nearest OI walls
+    next_chain_row: Optional[dict] = None,        # 2026-07-30: same shape as atm_chain_row, but from
+                                                  # fetch_oi_resistance(index, expiry_date=fetch_next_expiry(...))
+                                                  # — the SECOND-nearest weekly expiry's chain. Only meaningful
+                                                  # for weekly-underlying indices close to expiry; leave None
+                                                  # otherwise (stocks, or indices not near expiry) and
+                                                  # strike_chain_next/next_expiry simply stay empty.
     iv_percentile: Optional[float] = None,
     event_risk_today: bool = False,
     option_intel: Optional[dict] = None,          # Stage 3.5 (RFC-001): {india_vix, current_iv, iv_rank,
@@ -2255,6 +2252,7 @@ def build_dore_input(
     atm_chain_row = atm_chain_row or {}
     oi_resistance = oi_resistance or {}
     option_intel = option_intel or {}
+    next_chain_row = next_chain_row or {}
     nearest_expiry = oi_resistance.get("expiry", "") or atm_chain_row.get("expiry", "")
 
     return DOREInput(
@@ -2287,6 +2285,8 @@ def build_dore_input(
         ce_premium=atm_chain_row.get("ce_premium", 0.0),
         pe_premium=atm_chain_row.get("pe_premium", 0.0),
         strike_chain=atm_chain_row.get("strike_premiums") or {},
+        strike_chain_next=next_chain_row.get("strike_premiums") or {},
+        next_expiry=next_chain_row.get("expiry", ""),
         ce_premium_prev=atm_chain_row.get("ce_premium_prev"),
         pe_premium_prev=atm_chain_row.get("pe_premium_prev"),
         ce_premium_prev2=atm_chain_row.get("ce_premium_prev2"),
