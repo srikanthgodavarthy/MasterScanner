@@ -182,6 +182,13 @@ DORE_DEFAULTS: dict = {
     "oi_iv_compression_trend_pct": -10.0,  # IV Trend % at/below this auto-flags compression when the
                                              # caller didn't supply an explicit iv_compression flag
     "oi_expected_move_coverage_min": 0.8,  # coverage below this -> warning (IV move may not reach target)
+    "oi_reachability_dte_max":       10,   # Stage 5b's reachability ITM-walk (pass 3) only fires at/below
+                                             # this many days-to-expiry. sqrt(DTE/365) is small for ANY
+                                             # point in a monthly cycle (~0.23 at 20d, ~0.29 at 30d), so
+                                             # coverage reads "thin" almost all month regardless of actual
+                                             # time pressure — this gate restricts the walk to genuine
+                                             # late-cycle reachability risk instead of firing broadly at
+                                             # the start of every expiry cycle.
     "oi_skew_penalty_scale":        4.0,   # Structure-score penalty per point of |IV Skew|
     "oi_term_structure_penalty_scale": 5.0, # Structure-score penalty per point of backwardation slope
     "oi_term_structure_backwardation_warn": 1.0,  # near-far slope above this -> backwardation warning
@@ -343,6 +350,7 @@ class DORESettings:
     oi_iv_trend_scale: float = 1.5
     oi_iv_compression_trend_pct: float = -10.0
     oi_expected_move_coverage_min: float = 0.8
+    oi_reachability_dte_max: int = 10
     oi_skew_penalty_scale: float = 4.0
     oi_term_structure_penalty_scale: float = 5.0
     oi_term_structure_backwardation_warn: float = 1.0

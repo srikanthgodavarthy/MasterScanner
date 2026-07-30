@@ -448,7 +448,7 @@ def compute_fo_opportunities(
     """
     cfg = _load_settings(cfg)
     from utils.upstox_client import fetch_oi_resistance, fetch_batch_stock_atm_options_upstox
-    from utils.oi_snapshot_store import record_and_diff, record_and_diff_premium, record_and_diff_strike_premium
+    from utils.oi_snapshot_store import record_and_diff, record_and_diff_premium
     from utils.option_chain_diagnostics import reset_option_chain_stats, get_option_chain_stats
 
     # Reset once per Stage-3 pass so diagnostics reflect THIS scan
@@ -571,7 +571,8 @@ def compute_fo_opportunities(
         # looking the real premium up in dore_input.strike_chain, keyed
         # by result.suggested_strike itself.
         leg = result.suggested_direction
-        strike_row = dore_input.strike_chain.get(result.suggested_strike) if result.suggested_strike else None
+        _lookup_strike = round(result.suggested_strike, 2) if result.suggested_strike else None
+        strike_row = dore_input.strike_chain.get(_lookup_strike) if _lookup_strike else None
         if strike_row:
             premium_now = strike_row.get("ce_premium", 0.0) if leg == "CE" else \
                           strike_row.get("pe_premium", 0.0) if leg == "PE" else 0.0
@@ -587,24 +588,27 @@ def compute_fo_opportunities(
                     f"Premium shown is the reference strike's, not {result.suggested_strike:.0f} "
                     f"{leg}'s — exact strike missing from this poll's chain")
 
-        # 2026-07-28 bugfix: premium_prev/%Chg used to read
-        # dore_input.ce_premium_prev/.pe_premium_prev, which track the
-        # reference (ATM/OI-wall) strike's history, not suggested_strike's
-        # — see utils.oi_snapshot_store.record_and_diff_strike_premium()'s
-        # docstring for the COFORGE PE 1700 case (+3236% from diffing an
-        # ITM premium against its ATM neighbour's own tiny prior value)
-        # this was producing. Now keyed by symbol+leg+strike so "Premium
-        # %Chg" is always this SAME strike's own tick-to-tick move —
-        # consistent with "Premium" itself, which already reflects
-        # suggested_strike (see premium_now above).
-        if result.suggested_strike and leg in ("CE", "PE"):
-            strike_premium_key = f"{premium_key}_{leg}_{result.suggested_strike:.0f}"
-            premium_prev = record_and_diff_strike_premium(strike_premium_key, premium_now)
-        else:
-            premium_prev = None
+        # 2026-07-30: Premium %Chg is now vs the PRIOR SESSION'S CLOSE for
+        # this exact strike/leg (strike_row["ce_close"]/["pe_close"], read
+        # straight off Upstox's market_data.close_price on this same chain
+        # fetch — no extra API call), not vs the previous scan tick.
+        #
+        # The old record_and_diff_strike_premium() approach diffed
+        # scan-to-scan, which meant %Chg reset to 0 on the very first scan
+        # a strike was picked and drifted with however often the scanner
+        # happened to poll — not a genuine "how has today's premium moved"
+        # read, and it's what produced the COFORGE PE 1700 "+3236%" class
+        # of blowup this file's history (see the removed 07-28/07-29
+        # comments) kept having to re-patch. Close-price is a stable,
+        # market-defined reference point that doesn't depend on scan
+        # cadence. Fails soft to None (rendered "—" downstream) when
+        # close_price is missing/zero — same convention as elsewhere.
+        _close = None
+        if strike_row:
+            _close = strike_row.get("ce_close") if leg == "CE" else strike_row.get("pe_close") if leg == "PE" else None
         premium_pct_chg = (
-            (premium_now - premium_prev) / premium_prev * 100.0
-            if premium_prev not in (None, 0) else None
+            round((premium_now - _close) / _close * 100.0, 2)
+            if _close not in (None, 0) and premium_now is not None else None
         )
 
         # ── Position Sizing (utils/position_sizing.py) — downstream of

@@ -1303,12 +1303,23 @@ def fetch_oi_resistance(index: str = "NIFTY", expiry_date: str | None = None) ->
         # OI-wall strike (by design, DORE's own reference point); the
         # UI's displayed Premium for whatever strike Stage 5 actually
         # recommends should be looked up here instead.
+        # Keys rounded to 2dp: suggested_strike is computed downstream as
+        # atm_strike + sign*n*step, both sourced from this same chain's
+        # floats — plain float arithmetic can drift (e.g. 1750.0000000002),
+        # which made exact-float dict lookups miss and silently fall back
+        # to the reference strike's premium (see fo_scan.py's premium
+        # lookup). Rounding both sides of the lookup to the same precision
+        # removes that class of miss.
         strike_premiums = {
-            r.get("strike_price"): {
+            round(r.get("strike_price"), 2): {
                 "ce_premium": _premium(r, "call_options"),
                 "pe_premium": _premium(r, "put_options"),
                 "ce_oi": _oi(r, "call_options"),
                 "pe_oi": _oi(r, "put_options"),
+                # Prior session's close per-leg — used for Premium %Chg
+                # against close, not scan-to-scan (see fo_scan.py).
+                "ce_close": ((r.get("call_options") or {}).get("market_data") or {}).get("close_price", 0) or 0,
+                "pe_close": ((r.get("put_options") or {}).get("market_data") or {}).get("close_price", 0) or 0,
             }
             for r in chain if r.get("strike_price") is not None
         }
@@ -1855,12 +1866,18 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
         # rather than trust ce_premium/pe_premium below, which stay
         # ATM-only (by design — Stage 3/4 scoring wants a stable ATM
         # reference point, not a moving target).
+        # Keys rounded to 2dp — see identical fix/comment in
+        # fetch_oi_resistance() above. Also carries ce_close/pe_close
+        # (prior session's close) so Premium %Chg can be computed against
+        # close, not scan-to-scan.
         strike_premiums = {
-            r.get("strike_price"): {
+            round(r.get("strike_price"), 2): {
                 "ce_premium": _md(r, "call_options", "ltp"),
                 "pe_premium": _md(r, "put_options", "ltp"),
                 "ce_oi": _md(r, "call_options", "oi"),
                 "pe_oi": _md(r, "put_options", "oi"),
+                "ce_close": _md(r, "call_options", "close_price"),
+                "pe_close": _md(r, "put_options", "close_price"),
             }
             for r in chain if r.get("strike_price") is not None
         }

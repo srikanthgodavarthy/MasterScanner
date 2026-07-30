@@ -365,7 +365,7 @@ def build_trade_plan(
     # None (the preliminary, pre-strike-selection call in compute_dore())
     # or isn't present in this poll's strike_chain (fail-soft, same as
     # fo_scan.py's own fallback).
-    strike_row = inp.strike_chain.get(suggested_strike) if suggested_strike else None
+    strike_row = inp.strike_chain.get(round(suggested_strike, 2)) if suggested_strike else None
     if strike_row:
         premium = strike_row.get("ce_premium", 0.0) if direction == "CE" else strike_row.get("pe_premium", 0.0)
     else:
@@ -1921,7 +1921,12 @@ def stage5b_strike_and_expiry(
     sign = -1.0 if direction == "CE" else 1.0  # CE moves ITM at LOWER strikes, PE at HIGHER strikes
 
     def _strike_after(n: int) -> float:
-        return inp.atm_strike + sign * n * step
+        # Rounded to 2dp to match strike_premiums'/strike_chain's dict
+        # keys (utils.upstox_client) — plain float arithmetic here can
+        # drift by a fraction of a paisa, which was making exact-float
+        # lookups miss and silently fall back to the reference strike's
+        # premium downstream (fo_scan.py).
+        return round(inp.atm_strike + sign * n * step, 2)
 
     def _room_to_wall_steps(strike_px: float, wall_px: float) -> float:
         # CE: wall is resistance ABOVE the strike -> room = wall - strike.
@@ -1966,7 +1971,21 @@ def stage5b_strike_and_expiry(
     # reach for (direction is not None -> always true here) and a
     # computed coverage number; missing IV/target data means this pass
     # is a no-op, same fail-soft contract as the wall-walk above.
-    if expected_move_coverage is not None and expected_move_coverage < cfg.oi_expected_move_coverage_min:
+    # 2026-07-30 follow-up fix: pass 3 used to fire off `coverage <
+    # oi_expected_move_coverage_min` alone. sqrt(days_to_expiry / 365) is
+    # small for ANY point in a monthly cycle (~0.23 at 20d, ~0.29 at a
+    # fresh 30d), while distance_to_target isn't time-scaled at all — so
+    # coverage reads "thin" almost every day of the cycle, not just when
+    # time is actually running out. That was walking nearly every stock
+    # to ATM/ITM right after a fresh monthly expiry, defeating the whole
+    # point of an ATM-by-default optimizer. Gated behind
+    # `oi_reachability_dte_max` so this pass is what it was meant to be:
+    # a late-cycle "running out of time" check, not a standing bias.
+    if (
+        expected_move_coverage is not None
+        and expected_move_coverage < cfg.oi_expected_move_coverage_min
+        and inp.days_to_expiry <= cfg.oi_reachability_dte_max
+    ):
         target_disp = f"{technical_target:.0f}" if technical_target else "target"
         # Coverage is a function of distance-to-target and time/IV, not
         # of which strike we pick — walking ITM doesn't change the
@@ -1997,6 +2016,16 @@ def stage5b_strike_and_expiry(
                 f"{cfg.oi_expected_move_coverage_min:.2f} but already at the ITM step cap "
                 f"({cfg.strike_max_itm_steps}) — size/stop should account for the reachability gap"
             )
+    elif (
+        expected_move_coverage is not None
+        and expected_move_coverage < cfg.oi_expected_move_coverage_min
+        and inp.days_to_expiry > cfg.oi_reachability_dte_max
+    ):
+        reasons.append(
+            f"Expected Move Coverage={expected_move_coverage:.2f} below "
+            f"{cfg.oi_expected_move_coverage_min:.2f}, but {inp.days_to_expiry}d to expiry is still "
+            f"beyond the {cfg.oi_reachability_dte_max}d reachability window — no ITM walk yet"
+        )
 
     scalp_ok = (
         inp.days_to_expiry <= cfg.expiry_days_scalp_max
