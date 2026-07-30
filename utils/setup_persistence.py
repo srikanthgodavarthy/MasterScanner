@@ -44,10 +44,12 @@ Lifecycle state machine
     ACTIVE
      ├── T1 Hit (price ≥ t1)               → T1_HIT
      ├── Stop Hit (price < sl)             → CLOSED
+     ├── Age > MAX_SETUP_AGE_DAYS (2026-07-30) → CLOSED   [auto-close, SL/T1 never hit]
      └── Manual Exit                       → CLOSED
 
     T1_HIT
      ├── Final Exit (price ≥ t2, or price < sl on the trailing remainder) → CLOSED
+     ├── Age > MAX_SETUP_AGE_DAYS (2026-07-30) → CLOSED   [auto-close, T2/SL never hit]
      └── Manual Exit                       → CLOSED
 
   Note on the WAITING→CLOSED safety rule: the textbook diagram only
@@ -94,8 +96,12 @@ logger = logging.getLogger(__name__)
 _FREEZE_CATEGORIES = {"Elite", "Execute", "Actionable"}
 
 # A WAITING plan expires if price never reaches the entry zone within
-# N calendar days of creation. Does NOT apply once ACTIVE / T1_HIT —
-# an open trade runs until SL / target / manual exit, never on a clock.
+# N calendar days of creation.
+# 2026-07-30: ALSO now the max holding period once ACTIVE / T1_HIT — a
+# trade that hasn't hit SL/T1/T2 within N calendar days of first_actionable_date
+# is force-closed at the next scan that observes it, so a position can't
+# sit open indefinitely just because price never touched either level.
+# See _advance_lifecycle_step()'s ACTIVE/T1_HIT branches below.
 MAX_SETUP_AGE_DAYS = 20
 
 
@@ -470,6 +476,16 @@ def _advance_lifecycle_step(
             plan.status, plan.status_reason = SetupPlanStatus.T1_HIT, reason
             plan.t1_hit_at = today_str
             return True, reason
+        # 2026-07-30: force-close a trade that's been ACTIVE for
+        # MAX_SETUP_AGE_DAYS without hitting SL or T1 — a position no
+        # longer just sits open indefinitely because price never touched
+        # either level. Checked last (after SL/T1) so a genuine same-day
+        # SL/T1 cross always takes priority over the age-out.
+        if days > MAX_SETUP_AGE_DAYS:
+            reason = f"Auto-closed after {days}d — max holding period reached (SL/T1 not hit)"
+            plan.status, plan.status_reason = SetupPlanStatus.CLOSED, reason
+            plan.closed_at = today_str
+            return True, reason
         return False, ""
 
     if plan.status == SetupPlanStatus.T1_HIT:
@@ -484,6 +500,14 @@ def _advance_lifecycle_step(
             return True, reason
         if cross.triggered and cross.label == "T2":
             reason = f"Final target T2 hit at {cross.trigger_price:.2f}"
+            plan.status, plan.status_reason = SetupPlanStatus.CLOSED, reason
+            plan.closed_at = today_str
+            return True, reason
+        # 2026-07-30: same age-out as the ACTIVE branch above, for the
+        # trailing remainder after T1 — otherwise a plan that hit T1 but
+        # never reaches T2 or SL on the remainder could run forever too.
+        if days > MAX_SETUP_AGE_DAYS:
+            reason = f"Auto-closed after {days}d — max holding period reached (T2/SL not hit on remainder)"
             plan.status, plan.status_reason = SetupPlanStatus.CLOSED, reason
             plan.closed_at = today_str
             return True, reason
