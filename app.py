@@ -331,7 +331,7 @@ def _page_dashboard():
 def _page_scanner():
     render_scanner(settings)
 
-def _page_pre_breakout():
+def _page_five_pillar():
     render_five_pillars(settings)
 
 def _page_backtest():
@@ -379,7 +379,7 @@ pg = st.navigation(
     [
         st.Page(_page_dashboard,    title="Dashboard",            icon="🖥️", default=True),
         st.Page(_page_scanner,      title="Live Scanner",         icon="📡"),
-        st.Page(_page_pre_breakout, title="Pre-Breakout Scanner", icon="📍"),
+        st.Page(_page_five_pillar, title="five_pillar Scanner", icon="📍"),
         st.Page(_page_backtest,     title="Backtest Engine",      icon="📈"),
         st.Page(_page_lifecycle,    title="Lifecycle",            icon="🔄"),
         st.Page(_page_history,      title="History",              icon="📊"),
