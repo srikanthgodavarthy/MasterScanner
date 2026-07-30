@@ -31,7 +31,6 @@ Usage
 from __future__ import annotations
 
 import time
-from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 

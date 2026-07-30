@@ -67,18 +67,6 @@ from utils.supabase_client import (
     load_watchlist, add_to_watchlist, _is_available,
 )
 
-# Reuse the Five Pillars page's own individual-stock breakdown renderer so
-# the Scanner page's per-stock panel is pixel-identical to
-# pages/five_pillars.py (same tiles: Structure/Acceptance/Leadership/
-# Momentum/Risk + Opportunity Quality Bonus + Promotion Engine). It reads
-# the FP_*/_fp_* columns that utils/scanner_engine.py already attaches to
-# every scanned row, so no new computation is needed here.
-
-try:
-    from fib_tab import render_fib_tab as _render_fib_tab
-    _FIB_TAB_OK = True
-except ImportError:
-    _FIB_TAB_OK = False
 _SC_STYLE = {
     "ELITE":      ("#f5c542", "ELITE"),
     "EXECUTE":    ("#3fb950", "EXECUTE"),
