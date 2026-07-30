@@ -207,6 +207,19 @@ class DOREInput:
                                      # reference only). Used to look up the REAL premium at whatever strike
                                      # Stage 5b (stage5b_strike_and_expiry) actually recommends, since that
                                      # can be a different, ITM-walked strike — see build_dore_input().
+                                     # NOTE: this is always the NEAREST/current-week chain. When Stage 5b
+                                     # recommends NEXT_WEEK (index weeklies only — see recommended_expiry),
+                                     # callers must look in `strike_chain_next` instead, or the premium/
+                                     # close shown belongs to a DIFFERENT (current-week) contract than the
+                                     # one actually recommended — see strike_chain_next below.
+    strike_chain_next: dict = field(default_factory=dict)  # 2026-07-30: same shape as strike_chain, but
+                                     # for the SECOND-nearest weekly expiry (indices only — stocks are
+                                     # monthly-only, so this is always empty for them). Was described in
+                                     # fetch_oi_resistance()'s docstring as feeding a "DOREInput.
+                                     # strike_chain_next" but never actually wired up anywhere — every
+                                     # NEXT_WEEK recommendation was silently priced off the current week's
+                                     # chain instead (same strike number, wrong underlying contract). Now
+                                     # actually populated by build_dore_input() below.
     ce_premium_prev:  Optional[float] = None   # premium 1 poll ago (tick-to-tick, not day-open baseline)
     pe_premium_prev:  Optional[float] = None
     ce_premium_prev2: Optional[float] = None   # premium 2 polls ago — lets Stage 3 tell "was falling, now
@@ -287,6 +300,7 @@ def build_trade_plan(
     itm_steps: int = 0,
     technical_target: Optional[float] = None,
     suggested_strike: Optional[float] = None,
+    recommended_expiry: Optional[str] = None,
 ) -> TradePlan:
     """Premium-denominated TradePlan. A BUY_CE/BUY_PE recommendation
     trades the OPTION, not the underlying — so Entry/Stop/Targets must
@@ -365,7 +379,15 @@ def build_trade_plan(
     # None (the preliminary, pre-strike-selection call in compute_dore())
     # or isn't present in this poll's strike_chain (fail-soft, same as
     # fo_scan.py's own fallback).
-    strike_row = inp.strike_chain.get(round(suggested_strike, 2)) if suggested_strike else None
+    # 2026-07-30: indices can recommend NEXT_WEEK (stage5b_strike_and_
+    # expiry's capital-protection branch) — strike_chain is always the
+    # NEAREST/current-week chain, so a NEXT_WEEK pick used to be looked
+    # up in the wrong contract's chain entirely (same strike NUMBER,
+    # different underlying option, different premium/close). Route to
+    # strike_chain_next for that case; everything else (CURRENT_WEEK,
+    # MONTHLY stocks) keeps using strike_chain as before.
+    _chain = inp.strike_chain_next if recommended_expiry == "NEXT_WEEK" else inp.strike_chain
+    strike_row = _chain.get(round(suggested_strike, 2)) if suggested_strike else None
     if strike_row:
         premium = strike_row.get("ce_premium", 0.0) if direction == "CE" else strike_row.get("pe_premium", 0.0)
     else:
@@ -2124,7 +2146,8 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     # before strike selection exists). This is the plan that ships in the
     # DOREResult; the preliminary one above only ever fed Stage 4's gate.
     trade_plan = build_trade_plan(inp, cfg, direction, strike_type=strike_type, itm_steps=itm_steps,
-                                   technical_target=technical_target, suggested_strike=suggested_strike)
+                                   technical_target=technical_target, suggested_strike=suggested_strike,
+                                   recommended_expiry=recommended_expiry)
 
     warnings = list(risk.warnings) + list(oi_intel.warnings)
     if effective_bias.override_active:
@@ -2294,6 +2317,12 @@ def build_dore_input(
     option_intel: Optional[dict] = None,          # Stage 3.5 (RFC-001): {india_vix, current_iv, iv_rank,
                                                     #  iv_trend_pct, iv_expansion_rate, iv_compression,
                                                     #  iv_skew, term_structure_slope}
+    atm_chain_row_next: Optional[dict] = None,    # 2026-07-30: same shape as atm_chain_row, but for the
+                                                    #  SECOND-nearest weekly expiry (fetch_oi_resistance(
+                                                    #  index, expiry_date=fetch_next_expiry(index))) —
+                                                    #  indices only. Feeds strike_chain_next so a NEXT_WEEK
+                                                    #  recommendation prices off the actual NEXT_WEEK
+                                                    #  contract instead of the current week's.
 ) -> DOREInput:
     """Adapter that assembles a DOREInput purely from Market Data Layer
     objects — no MasterScanner score is read anywhere in this function
@@ -2305,6 +2334,7 @@ def build_dore_input(
     atm_chain_row = atm_chain_row or {}
     oi_resistance = oi_resistance or {}
     option_intel = option_intel or {}
+    atm_chain_row_next = atm_chain_row_next or {}
     nearest_expiry = oi_resistance.get("expiry", "") or atm_chain_row.get("expiry", "")
 
     return DOREInput(
@@ -2337,6 +2367,7 @@ def build_dore_input(
         ce_premium=atm_chain_row.get("ce_premium", 0.0),
         pe_premium=atm_chain_row.get("pe_premium", 0.0),
         strike_chain=atm_chain_row.get("strike_premiums") or {},
+        strike_chain_next=atm_chain_row_next.get("strike_premiums") or {},
         ce_premium_prev=atm_chain_row.get("ce_premium_prev"),
         pe_premium_prev=atm_chain_row.get("pe_premium_prev"),
         ce_premium_prev2=atm_chain_row.get("ce_premium_prev2"),

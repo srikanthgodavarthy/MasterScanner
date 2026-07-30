@@ -447,7 +447,7 @@ def compute_fo_opportunities(
     see utils.option_chain_diagnostics.get_option_chain_stats().
     """
     cfg = _load_settings(cfg)
-    from utils.upstox_client import fetch_oi_resistance, fetch_batch_stock_atm_options_upstox
+    from utils.upstox_client import fetch_oi_resistance, fetch_batch_stock_atm_options_upstox, fetch_next_expiry
     from utils.oi_snapshot_store import record_and_diff, record_and_diff_premium
     from utils.option_chain_diagnostics import reset_option_chain_stats, get_option_chain_stats
 
@@ -504,7 +504,28 @@ def compute_fo_opportunities(
                     "pcr": opt.get("pcr", 1.0), "expiry": opt.get("expiry", ""),
                     "atm_strike": opt.get("atm_strike") or 0.0,
                     "strike_interval": opt.get("strike_interval") or 0.0,
+                    # 2026-07-30 bugfix: this dict is built field-by-field
+                    # (unlike the stock branch below, which keeps the
+                    # WHOLE `opt` dict via dict(opt)) and was silently
+                    # dropping "strike_premiums" — so DOREInput.strike_chain
+                    # was ALWAYS {} for every index, every scan. Every
+                    # index row was falling back to the OI-wall strike's
+                    # premium (mislabeled as the recommended strike's) and
+                    # had no close_price data at all to compute Premium
+                    # %Chg against (hence the permanent "—"). This is why
+                    # only indices looked wrong while stocks (which never
+                    # dropped the field) were already correct.
+                    "strike_premiums": opt.get("strike_premiums") or {},
                 }
+                # 2026-07-30: NEXT_WEEK chain, for when Stage 5b picks the
+                # second-nearest weekly expiry instead of the current one
+                # (its capital-protection branch) — without this, a
+                # NEXT_WEEK recommendation would price off the CURRENT
+                # week's chain: same strike number, wrong underlying
+                # contract, wrong premium and close. Only fetched for
+                # indices (stocks are monthly-only — no "next week").
+                opt_next = fetch_oi_resistance(key_map[symbol], expiry_date=fetch_next_expiry(key_map[symbol])) or {}
+                atm_chain_row_next = {"strike_premiums": opt_next.get("strike_premiums") or {}}
                 oi_resistance_like = {"ce_strike": opt.get("ce_strike"), "pe_strike": opt.get("pe_strike"),
                                        "expiry": opt.get("expiry")}
                 ce_chg, pe_chg = record_and_diff(symbol, opt.get("total_ce_oi", 0.0), opt.get("total_pe_oi", 0.0))
@@ -524,6 +545,7 @@ def compute_fo_opportunities(
                                  "(unavailable or not shortlisted) — skipping", symbol)
                     continue
                 atm_chain_row = dict(opt)
+                atm_chain_row_next = {}  # stocks are monthly-only — no "next week" chain
                 oi_resistance_like = {"ce_strike": opt.get("ce_wall_strike"),
                                        "pe_strike": opt.get("pe_wall_strike"), "expiry": opt.get("expiry")}
                 ce_chg, pe_chg = record_and_diff(f"STK_{symbol}", opt.get("total_ce_oi", 0.0),
@@ -552,6 +574,7 @@ def compute_fo_opportunities(
             symbol=symbol, price=row["price"], trend_features=row.get("trend_features"),
             execution_features=row.get("execution_features"),
             atm_chain_row=atm_chain_row, oi_resistance=oi_resistance_like,
+            atm_chain_row_next=atm_chain_row_next,
         )
         result = compute_dore(dore_input, cfg)
         _persist_reversal_alert(symbol, result)
@@ -572,7 +595,11 @@ def compute_fo_opportunities(
         # by result.suggested_strike itself.
         leg = result.suggested_direction
         _lookup_strike = round(result.suggested_strike, 2) if result.suggested_strike else None
-        strike_row = dore_input.strike_chain.get(_lookup_strike) if _lookup_strike else None
+        # 2026-07-30: NEXT_WEEK (indices only) must look in strike_chain_next,
+        # not strike_chain (current week) — see DOREInput.strike_chain_next's
+        # docstring. CURRENT_WEEK/MONTHLY keep using strike_chain as before.
+        _chain = dore_input.strike_chain_next if result.recommended_expiry == "NEXT_WEEK" else dore_input.strike_chain
+        strike_row = _chain.get(_lookup_strike) if _lookup_strike else None
         if strike_row:
             premium_now = strike_row.get("ce_premium", 0.0) if leg == "CE" else \
                           strike_row.get("pe_premium", 0.0) if leg == "PE" else 0.0
@@ -767,25 +794,37 @@ def top_fo_opportunities(
     # e.g. post-market — enrich_fo_opportunities_df handles an empty
     # `rows` list fine, it just won't mint/advance anything from it).
     enriched_rows = actionable.to_dict("records")
-    if existing_plans:
-        try:
-            from utils.fo_setup_persistence import enrich_fo_opportunities_df
-            from utils.supabase_client import upsert_fo_setup_plans_batch
-            from utils.upstox_client import fetch_option_contract_intraday_candles
+    # 2026-07-30 bugfix: this used to be `if existing_plans:` — but
+    # existing_plans is the dict of ALREADY-OPEN plans, while MINTING a
+    # brand-new plan (enrich_fo_opportunities_df's step 2, "should_create")
+    # happens inside this SAME call. Gating the whole call on existing_plans
+    # being non-empty meant: the very first BUY_CE_NOW/BUY_PE_NOW signal of
+    # a fresh day (or any day where every prior plan had already closed
+    # out — T1/T2/SL hit) had existing_plans == {}, skipped this block
+    # entirely, and never minted anything — Plan stayed "—" and Entry
+    # Timestamp kept re-stamping "now" every scan instead of locking, no
+    # matter how clean the BUY signal was. A bootstrap deadlock: you
+    # needed an open plan to create a plan. Always call it — an empty
+    # existing_plans dict is a completely normal state (start of day,
+    # all setups already closed), not a reason to skip minting new ones.
+    try:
+        from utils.fo_setup_persistence import enrich_fo_opportunities_df
+        from utils.supabase_client import upsert_fo_setup_plans_batch
+        from utils.upstox_client import fetch_option_contract_intraday_candles
 
-            # 2026-07-29: option_history_provider was never supplied here, so
-            # every Plan sat WAITING forever regardless of how far premium
-            # had already moved past its locked Entry — see
-            # fetch_option_contract_intraday_candles()'s docstring in
-            # utils.upstox_client.
-            enriched_rows, updated_plans = enrich_fo_opportunities_df(
-                enriched_rows, existing_plans,
-                option_history_provider=fetch_option_contract_intraday_candles)
-            if updated_plans:
-                upsert_fo_setup_plans_batch([p.to_db_dict() for p in updated_plans])
-        except Exception:
-            logger.exception("[DORE Options] Plan lifecycle enrichment failed (non-fatal, "
-                              "table renders without the Plan column)")
+        # 2026-07-29: option_history_provider was never supplied here, so
+        # every Plan sat WAITING forever regardless of how far premium
+        # had already moved past its locked Entry — see
+        # fetch_option_contract_intraday_candles()'s docstring in
+        # utils.upstox_client.
+        enriched_rows, updated_plans = enrich_fo_opportunities_df(
+            enriched_rows, existing_plans,
+            option_history_provider=fetch_option_contract_intraday_candles)
+        if updated_plans:
+            upsert_fo_setup_plans_batch([p.to_db_dict() for p in updated_plans])
+    except Exception:
+        logger.exception("[DORE Options] Plan lifecycle enrichment failed (non-fatal, "
+                          "table renders without the Plan column)")
 
     # 2026-07-30: any OPEN plan whose contract wasn't among this cycle's
     # live rows (its symbol didn't clear Stage 1/2 this cycle — the
