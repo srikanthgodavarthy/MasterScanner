@@ -836,10 +836,36 @@ def top_fo_opportunities(
         f"{float(r.get('Strike', 0) or 0):.1f}|{r.get('Expiry', '')}"
         for r in enriched_rows
     }
-    for key, plan in existing_plans.items():
-        if key in seen_keys or not plan.is_open():
-            continue
-        enriched_rows.append(_plan_only_row(plan))
+    unreproduced = [
+        (key, plan) for key, plan in existing_plans.items()
+        if key not in seen_keys and plan.is_open()
+    ]
+
+    # [2026-07-30] These are real open positions (ACTIVE/T1_HIT) or still-
+    # live WAITING setups — their symbol simply didn't clear THIS cycle's
+    # discovery funnel (it's not being re-evaluated as a fresh "buy
+    # opportunity" any more once you're already in the trade). That's
+    # correct for discovery, but it left LTP/Premium/Premium %Chg/Entry
+    # Drift % blank for every such row. A small separate batched quote
+    # call (typically single digits of contracts) fills those in without
+    # touching the discovery funnel at all — see
+    # utils.upstox_client.fetch_open_plan_option_quotes()'s docstring.
+    live_quotes = {}
+    if unreproduced:
+        try:
+            from utils.upstox_client import fetch_open_plan_option_quotes
+            plan_keys = tuple(
+                (plan.symbol, plan.leg, plan.strike, plan.expiry)
+                for _, plan in unreproduced
+            )
+            live_quotes = fetch_open_plan_option_quotes(plan_keys)
+        except Exception:
+            logger.exception("[DORE Options] Live-quote backfill for persisted plans "
+                              "failed (non-fatal, those rows just show \"—\" as before)")
+
+    for _, plan in unreproduced:
+        quote = live_quotes.get((plan.symbol, plan.leg, plan.strike, plan.expiry))
+        enriched_rows.append(_plan_only_row(plan, quote))
 
     actionable = pd.DataFrame(enriched_rows)
     if diagnostics is not None:
@@ -847,39 +873,57 @@ def top_fo_opportunities(
     return actionable
 
 
-def _plan_only_row(plan) -> dict:
+def _plan_only_row(plan, live_quote: dict | None = None) -> dict:
     """Build a display row straight from a persisted FOSetupPlan, for a
     contract that's still open but wasn't reproduced by this cycle's
     live Stage 1/2/3 funnel (see the 2026-07-30 fix in
-    top_fo_opportunities() above). No live LTP/Premium/Opportunity
-    Score exists this cycle by definition — those render as "—" rather
-    than a stale or fabricated number. Entry/SL/T1/T2 come from the
-    plan's own frozen levels, same as a live row with an open plan
-    would show.
+    top_fo_opportunities() above). Opportunity Score always renders as
+    "—" here (it's a discovery-funnel output with no live equivalent to
+    fall back to), but LTP/Premium/Premium %Chg/Entry Drift % now use
+    `live_quote` (utils.upstox_client.fetch_open_plan_option_quotes())
+    when available, and only fall back to "—" if that lookup itself came
+    up empty — never a stale or fabricated number either way.
     """
     from utils.fo_setup_persistence import FOSetupPlanStatus, _to_ist_display
 
     plan.days_active = _compute_days_active_safe(plan.created_date)
     if plan.status == FOSetupPlanStatus.T1_HIT:
         event_ts = plan.t1_hit_at or plan.activated_at or plan.created_at
-        action, exec_state = "Manage Trade", "T1_HIT — trail remainder to T2/SL (no fresh data this cycle)"
+        action, exec_state = "Manage Trade", "T1_HIT — trail remainder to T2/SL"
     elif plan.status == FOSetupPlanStatus.ACTIVE:
         event_ts = plan.activated_at or plan.created_at
-        action, exec_state = "In Trade", "POSITION_ACTIVE — holding for T1 (no fresh data this cycle)"
+        action, exec_state = "In Trade", "POSITION_ACTIVE — holding for T1"
     else:  # WAITING
         event_ts = plan.created_at
-        action, exec_state = "Wait for Trigger", "BREAKOUT_PENDING (no fresh data this cycle)"
+        action, exec_state = "Wait for Trigger", "BREAKOUT_PENDING"
+
+    ltp = premium_chg = entry_drift = None
+    reason = ("Persisted plan — symbol didn't clear this cycle's live scan "
+              "(e.g. post-market); showing last-locked levels only.")
+    if live_quote:
+        ltp = live_quote.get("ltp")
+        prev_close = live_quote.get("prev_close")
+        if ltp is not None and prev_close:
+            premium_chg = round((ltp - prev_close) / prev_close * 100, 2)
+        if ltp is not None and plan.entry_locked:
+            entry_drift = round((ltp - plan.entry_locked) / plan.entry_locked * 100, 2)
+        exec_state += " (live LTP; not re-evaluated as a new opportunity this cycle)"
+        reason = ("Persisted plan — symbol didn't clear this cycle's discovery funnel, "
+                  "so it isn't being re-scored as a new opportunity; LTP/Premium refreshed "
+                  "separately since the position is still open.")
+    else:
+        exec_state += " (no fresh data this cycle)"
 
     return {
         "Symbol": plan.symbol,
         "Leg": plan.leg,
         "Strike": plan.strike,
-        "LTP": None,
-        "Premium": None,
-        "Premium %Chg": None,
+        "LTP": ltp,
+        "Premium": ltp,
+        "Premium %Chg": premium_chg,
         "Opportunity Score": plan.locked_opportunity_score,
         "Entry": plan.entry_locked,
-        "Entry Drift %": None,
+        "Entry Drift %": entry_drift,
         "SL": plan.sl_locked,
         "T1": plan.t1_locked,
         "T2": plan.t2_locked,
@@ -891,8 +935,7 @@ def _plan_only_row(plan) -> dict:
         "Expiry Date": None,
         "Days To Expiry": None,
         "Strike Type": plan.locked_strike_type,
-        "Reason": "Persisted plan — symbol didn't clear this cycle's live scan "
-                  "(e.g. post-market); showing last-locked levels only.",
+        "Reason": reason,
         "Recommendation": plan.locked_recommendation,
         "Action": action,
         "Execution State": exec_state,
