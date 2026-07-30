@@ -1646,6 +1646,66 @@ def resolve_option_contract_instrument_key(symbol: str, leg: str, strike: float,
     return ((row.get(chain_key) or {}).get("instrument_key")) or None
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_open_plan_option_quotes(plan_keys: tuple) -> dict:
+    """
+    Live LTP for a small batch of open FOSetupPlan contracts, keyed by
+    (symbol, leg, strike, expiry) tuples.
+
+    2026-07-30: added because utils.fo_scan.top_fo_opportunities() only
+    ever showed live LTP/Premium/Entry Drift % for symbols this cycle's
+    Stage 1/2/3 discovery funnel happened to re-select — an ACTIVE/T1_HIT
+    plan is a real open position, not a fresh "opportunity" candidate,
+    so its symbol naturally drops out of that funnel once its BUY signal
+    has already played out (Recommendation moves off BUY_*/WATCH_*, or it
+    simply misses this cycle's top_n cut). The Reason column correctly
+    labelled this "no fresh data this cycle" — but a still-open,
+    capital-at-risk position shouldn't go dark just because it stopped
+    looking like a new opportunity. This is a *separate*, deliberately
+    tiny batched quote call (typically single digits of contracts — one
+    per open plan the main funnel didn't already cover this cycle), fully
+    decoupled from the discovery funnel and its own rate limiter/cache.
+
+    Each contract's instrument_key is resolved via
+    resolve_option_contract_instrument_key() (60s-cached chain lookup,
+    zero extra cost if Stage 3 already touched that chain this cycle),
+    then batched through the same _fetch_quotes_batch() every other
+    live-quote path in this module uses.
+
+    Returns {(symbol, leg, strike, expiry): {"ltp": float, "prev_close":
+    float | None}} for whatever resolved and returned data; fail-soft
+    (missing key) for anything that couldn't be resolved or quoted —
+    callers should render "—" for those exactly as before, never a stale
+    or fabricated number.
+    """
+    if not plan_keys or is_token_expired():
+        return {}
+
+    ikey_to_plan_key = {}
+    for symbol, leg, strike, expiry in plan_keys:
+        ikey = resolve_option_contract_instrument_key(symbol, leg, strike, expiry)
+        if ikey:
+            ikey_to_plan_key[ikey] = (symbol, leg, strike, expiry)
+    if not ikey_to_plan_key:
+        return {}
+
+    quotes = _fetch_quotes_batch(list(ikey_to_plan_key.keys()))
+    result = {}
+    for ikey, quote in quotes.items():
+        plan_key = ikey_to_plan_key.get(ikey)
+        if plan_key is None:
+            continue
+        ltp = quote.get("last_price")
+        if ltp is None:
+            continue
+        ohlc = quote.get("ohlc") or {}
+        result[plan_key] = {
+            "ltp": float(ltp),
+            "prev_close": ohlc.get("close"),
+        }
+    return result
+
+
 def fetch_option_contract_intraday_candles(symbol: str, leg: str, strike: float,
                                             expiry: str) -> pd.DataFrame:
     """option_history_provider callable for
