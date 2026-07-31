@@ -28,7 +28,13 @@ What this module owns:
      Drift % is reported as the live premium's move away from that one
      saved number — the plan's own "how far has this moved since I'd
      have entered" readout, independent of the entry-zone-vs-LTP check
-     Stage 6 already does inside dore_options_engine.py.
+     Stage 6 already does inside dore_options_engine.py. Every cycle a
+     contract is reproduced, its `last_premium`/`last_drift_pct`/
+     `last_seen_at` are refreshed too (2026-08-01) — entry_locked itself
+     never moves, but this gives a "last known" reading for the
+     dedicated Active Plans tab (see below) to show even when the main
+     DORE Options table's own scan cycle hasn't reproduced this
+     contract recently.
 
 Contract identity — like the legacy module, an option contract is
 symbol + direction (CE/PE) + strike + expiry (calendar date here, not
@@ -42,13 +48,31 @@ future ticks) once its own expiry date has passed — options are wasting
 assets; there is no reason to keep comparing drift against a dead
 contract's frozen entry.
 
+2026-08-01 — Active Plans tab: the main DORE Options Engine table
+(pages/scanner.py's _dore_options_plan_table_html) only ever shows THIS
+cycle's live OptionTradePlan output — a contract whose symbol drops out
+of MasterScanner's own Stage 0-2 funnel, or misses this cycle's
+option-chain-fetch shortlist, simply isn't in that list, even though its
+locked plan is still OPEN. Rather than folding "stale" rows into that
+live table (which would mean rendering a recommendation the engine
+didn't actually reaffirm this cycle), every OPEN locked plan is instead
+always visible in a SEPARATE "Active Plans" tab — its own read
+straight off dore_options_plans, independent of whatever this cycle's
+live scan did or didn't reproduce, the same way the Live Scanner tab
+reads its own snapshot independent of the F&O panel.
+
 Public API
 ──────────
   DoreOptionsPlan                  dataclass — one frozen entry (+ locked
-                                    SL/T1/T2) for one option contract
+                                    SL/T1/T2, + last-known premium/drift)
+                                    for one option contract
   DoreOptionsPlanStatus            enum — OPEN / CLOSED
   enrich_trade_plans_with_persistence()  main integration point, called
-                                    by utils.dore_options_scan
+                                    by utils.dore_options_scan (locks
+                                    entries, computes Drift % for the
+                                    live table)
+  active_plan_rows()                builds the Active Plans tab's rows
+                                    from every currently-OPEN plan
 
 All Supabase calls live in utils/supabase_client.py (dore_options_plans
 table). This module is pure logic — no Streamlit, no Upstox calls, safe
@@ -107,6 +131,15 @@ class DoreOptionsPlan:
     target2_locked:      Optional[float] = None
     confidence_at_entry: float = 0.0   # confidence_score at the moment entry was locked (audit trail)
 
+    # 2026-08-01: refreshed every cycle this contract is reproduced by
+    # the live scan (never on cycles it isn't) — lets the Active Plans
+    # tab show a "last known" premium/drift even between live sightings,
+    # without re-fetching the option chain itself. entry_locked/sl/t1/t2
+    # above are never touched by this — those stay frozen at mint time.
+    last_premium:        Optional[float] = None
+    last_drift_pct:       Optional[float] = None
+    last_seen_at:         str   = ""
+
     status:              str   = DoreOptionsPlanStatus.OPEN
     closed_at:           str   = ""
     closed_reason:       str   = ""
@@ -132,6 +165,9 @@ class DoreOptionsPlan:
             "target1_locked":      self.target1_locked,
             "target2_locked":      self.target2_locked,
             "confidence_at_entry": self.confidence_at_entry,
+            "last_premium":        self.last_premium,
+            "last_drift_pct":      self.last_drift_pct,
+            "last_seen_at":        self.last_seen_at or None,
             "status":              _sval(self.status),
             "closed_at":           self.closed_at or None,
             "closed_reason":       self.closed_reason,
@@ -182,13 +218,14 @@ def _drift_pct(current_premium: Optional[float], entry_locked: Optional[float]) 
 
 
 def _plan_status_label(days_active: int, created_date: str, just_minted: bool) -> str:
-    """'Plan' column badge — 2026-07-31: there is no WAITING state in
-    this engine (unlike the legacy fo_setup_plans lifecycle) because a
-    contract's entry is locked the instant it's first seen, so every row
-    returned by enrich_trade_plans_with_persistence() is, by
-    construction, ACTIVE the moment it exists. This just makes that
-    state (and how long it's been true) visible on the table, which
-    previously showed no lifecycle information at all."""
+    """'Plan' column badge on the main DORE Options table — 2026-07-31:
+    there is no WAITING state in this engine (unlike the legacy
+    fo_setup_plans lifecycle) because a contract's entry is locked the
+    instant it's first seen, so every row returned by
+    enrich_trade_plans_with_persistence() is, by construction, ACTIVE
+    the moment it exists. This just makes that state (and how long it's
+    been true) visible on the table, which previously showed no
+    lifecycle information at all."""
     if just_minted:
         return f"🟢 Active (new · {created_date})"
     return f"🟢 Active ({days_active}d · since {created_date})"
@@ -214,12 +251,13 @@ def enrich_trade_plans_with_persistence(
         (enriched_rows, updated_plans)
         enriched_rows — list of dicts (OptionTradePlan.to_dict() plus
             entry_locked / saved_stop_loss / saved_target1 /
-            saved_target2 / drift_pct / plan_age_days / plan_created_at),
-            one per input plan, same order.
-        updated_plans — DoreOptionsPlan objects that are new or need
-            re-persisting this cycle (newly minted, or newly closed for
-            having passed their own expiry). Callers upsert this list;
-            an empty list is normal (nothing changed this cycle).
+            saved_target2 / drift_pct / plan_age_days / plan_created_at /
+            plan_status_label), one per input plan, same order.
+        updated_plans — DoreOptionsPlan objects to upsert this cycle:
+            every reproduced OPEN contract (its last_premium/
+            last_drift_pct/last_seen_at just refreshed) plus any newly
+            minted or newly expired-closed entries. An empty list means
+            `plans` was empty this cycle — nothing to persist.
     """
     today = _today_str()
     enriched_rows: list[dict] = []
@@ -261,17 +299,27 @@ def enrich_trade_plans_with_persistence(
                     confidence_at_entry=getattr(p, "confidence_score", 0.0) or 0.0,
                     status=DoreOptionsPlanStatus.OPEN,
                 )
-                updated_plans.append(locked)
                 just_minted = True
 
-            row["entry_locked"]     = locked.entry_locked or None
-            row["saved_stop_loss"]  = locked.sl_locked
-            row["saved_target1"]    = locked.target1_locked
-            row["saved_target2"]    = locked.target2_locked
-            row["drift_pct"]        = _drift_pct(current_premium, locked.entry_locked)
-            row["plan_created_at"] = locked.created_at
+            drift = _drift_pct(current_premium, locked.entry_locked)
+
+            # Refresh the "last known" fields every cycle this contract
+            # is actually reproduced — and persist regardless of
+            # just_minted, so the Active Plans tab stays current even on
+            # cycles that only reused (not re-minted) the locked entry.
+            locked.last_premium = current_premium
+            locked.last_drift_pct = drift
+            locked.last_seen_at = _now_iso()
+            updated_plans.append(locked)
+
+            row["entry_locked"]      = locked.entry_locked or None
+            row["saved_stop_loss"]   = locked.sl_locked
+            row["saved_target1"]     = locked.target1_locked
+            row["saved_target2"]     = locked.target2_locked
+            row["drift_pct"]         = drift
+            row["plan_created_at"]   = locked.created_at
             row["plan_created_date"] = locked.created_date
-            row["plan_age_days"]    = _compute_days_active(locked.created_date)
+            row["plan_age_days"]     = _compute_days_active(locked.created_date)
             row["plan_status_label"] = _plan_status_label(row["plan_age_days"], locked.created_date, just_minted)
             enriched_rows.append(row)
         except Exception:
@@ -282,9 +330,8 @@ def enrich_trade_plans_with_persistence(
     # Auto-close any OPEN locked entry whose own expiry has passed —
     # mirrors fo_setup_persistence's age-out, but keyed off the
     # contract's real expiry date (always known here) rather than a
-    # fixed day count. Only entries not already re-minted above (i.e.
-    # not in seen_keys this cycle, since a re-mint already produced a
-    # fresh OPEN row) need this pass.
+    # fixed day count. Only entries not already refreshed above (i.e.
+    # not in seen_keys this cycle) need this pass.
     for key, plan in existing_plans.items():
         if key in seen_keys or not plan.is_open():
             continue
@@ -295,3 +342,57 @@ def enrich_trade_plans_with_persistence(
             updated_plans.append(plan)
 
     return enriched_rows, updated_plans
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ACTIVE PLANS TAB — every currently-OPEN locked entry, independent of
+#  whether this cycle's live scan reproduced it. 2026-08-01.
+# ══════════════════════════════════════════════════════════════════
+
+def _active_plan_status_label(days_active: int, created_date: str, last_seen_at: str) -> str:
+    if not last_seen_at:
+        return f"🟢 Active ({days_active}d · since {created_date})"
+    return f"🟢 Active ({days_active}d · since {created_date})"
+
+
+def active_plan_rows(open_plans: dict) -> list[dict]:
+    """Builds one row per currently-OPEN DoreOptionsPlan, for the Active
+    Plans tab (pages/scanner.py's _active_plans_table_html). `open_plans`
+    is {contract_key: DoreOptionsPlan}, as returned by
+    utils.supabase_client.load_open_dore_options_plans() — call that
+    fresh each render, this function does no I/O of its own.
+
+    Every field here comes from the persisted plan itself — current
+    premium/drift are "last known" (as of last_seen_at), not re-fetched
+    live, since that would mean an extra option-chain fetch per open
+    plan outside DORE's own shortlisted scan cycle (see
+    utils.dore_options_scan._shortlist_for_option_chain's docstring for
+    why that fetch is budgeted, not unlimited). A plan whose last_seen_at
+    is old simply shows its own age — never fabricated as fresher than
+    it is.
+    """
+    rows: list[dict] = []
+    for plan in open_plans.values():
+        try:
+            days_active = _compute_days_active(plan.created_date)
+            rows.append({
+                "symbol": plan.symbol,
+                "direction": plan.direction,
+                "strike": plan.strike,
+                "expiry": plan.expiry,
+                "entry_locked": plan.entry_locked or None,
+                "saved_stop_loss": plan.sl_locked,
+                "saved_target1": plan.target1_locked,
+                "saved_target2": plan.target2_locked,
+                "last_premium": plan.last_premium,
+                "last_drift_pct": plan.last_drift_pct,
+                "last_seen_at": plan.last_seen_at,
+                "created_date": plan.created_date,
+                "plan_age_days": days_active,
+                "plan_status_label": _active_plan_status_label(days_active, plan.created_date, plan.last_seen_at),
+            })
+        except Exception:
+            logger.exception("[dore_options_persistence] active_plan_rows failed for one plan — skipped")
+    # Newest-locked first.
+    rows.sort(key=lambda r: r.get("created_date") or "", reverse=True)
+    return rows
