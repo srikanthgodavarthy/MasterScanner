@@ -702,7 +702,13 @@ def _get_pivots(ia: IndicatorArrays, i: int, pvt_lb: int):
 #  COMPUTE_BAR  — THE SINGLE SOURCE OF TRUTH
 # ══════════════════════════════════════════════════════════════════
 
-def leadership_prescreen(df: pd.DataFrame, nifty: pd.Series, min_bars: int = 210) -> bool:
+def leadership_prescreen(
+    df: pd.DataFrame, nifty: pd.Series, min_bars: int = 210,
+    early_momentum_pct_move_floor: float = 0.8,
+    early_momentum_vol_ratio: float = 2.0,
+    early_momentum_rs_slope_lookback: int = 5,
+    early_momentum_breakout_lookback: int = 20,
+) -> bool:
     """
     Cheap Leadership approximation, run BEFORE build_indicators().
 
@@ -735,6 +741,53 @@ def leadership_prescreen(df: pd.DataFrame, nifty: pd.Series, min_bars: int = 210
     a full (non-prescreened) run before trusting this in a live scan
     you're relying on for the day's trades.
 
+    EARLY-MOMENTUM OVERRIDE (structural — closes a structural blind spot):
+    the base RS+trend reject fires when BOTH rs_composite_approx (a
+    21/63/126-day weighted RS read) AND EMA20>EMA50 are weak. That's
+    exactly the signature of a fresh breakout or reversal — a stock whose
+    medium-term RS is still negative from a prior downtrend and whose
+    EMA20 hasn't crossed EMA50 yet, but whose *character* is already
+    changing. Without an override, that stock is eliminated here and
+    never reaches full CV1 scoring, the live scan output, or DORE —
+    regardless of how DORE's own ranking is tuned, since DORE only ever
+    sees what's still in the universe by the time it runs.
+
+    Deliberately NOT primarily a price-move filter: the objective is to
+    catch a change in structure, not a big move — professional entries
+    often happen at +1-2%, on the evidence that a larger move is
+    beginning, not after it's already happened. A big move today is
+    actually the case the base prescreen already lets through (a large
+    move usually drags rs_composite/EMA20 far enough to pass on its
+    own); the override exists for the SMALL early move with real
+    structural evidence behind it. So the override fires on:
+
+        (EMA9 crossed above/below EMA21 in the trade's direction)
+              AND
+        (Volume Ratio >= early_momentum_vol_ratio)
+              AND
+        (RS slope improving/worsening in the trade's direction, i.e.
+         rs_composite_approx is trending toward strength, not just
+         weak-but-flat)
+              OR
+        (a cheap breakout proxy: today's close clears the prior
+         `early_momentum_breakout_lookback`-day high/low — a stand-in
+         for a real pivot/resistance breakout, which needs the
+         pivot/fib detection build_indicators() does and so isn't
+         available this early)
+
+    `early_momentum_pct_move_floor` (default 0.8%) is deliberately NOT
+    the primary signal — it's just a noise guard so a fractional-percent
+    wiggle inside the day's bid/ask spread can't trigger the override on
+    EMA/volume/RS alone. All of this is computed only inside this
+    already-cold branch (RS at an earlier bar, two more EMA spans, a
+    rolling high/low) on the same "already-have-the-columns" budget as
+    the rest of this function — still no ADX, Bollinger/Keltner, CCI, or
+    real pivot/fib detection. Tune early_momentum_pct_move_floor /
+    early_momentum_vol_ratio / early_momentum_rs_slope_lookback /
+    early_momentum_breakout_lookback to control how aggressively this
+    catches early structural change vs. how much of the original
+    compute saving it gives back.
+
     Returns True  -> proceed to build_indicators() / full CV1 scoring
     Returns False -> reject now, skip the full indicator build entirely
     """
@@ -764,6 +817,58 @@ def leadership_prescreen(df: pd.DataFrame, nifty: pd.Series, min_bars: int = 210
     # real ls_rs breakpoints so mild RS weakness with an intact trend still
     # gets a full evaluation.
     if rs_composite_approx <= -0.02 and not trend_up:
+        # Early-momentum override — see docstring. Checked only in this
+        # branch (not on every symbol) to keep the common-case cost
+        # identical to before.
+        try:
+            raw_move_today = float(c.pct_change().iloc[-1]) * 100
+            pct_move_today = abs(raw_move_today)
+            if pct_move_today < early_momentum_pct_move_floor:
+                return False  # not even a noise-guard-clearing wiggle — no point checking structure
+
+            # EMA9/21 — short-term structure only, deliberately separate
+            # from the base check's EMA20/50 medium-term trend read.
+            ema9 = c.ewm(span=9, adjust=False).mean().iloc[-1]
+            ema21 = c.ewm(span=21, adjust=False).mean().iloc[-1]
+            ema9_bullish = ema9 > ema21
+            ema9_bearish = ema9 < ema21
+
+            # Volume expansion.
+            if "volume" in df.columns:
+                vol = df["volume"]
+                avg_vol20 = float(vol.tail(21).iloc[:-1].mean())  # prior 20 bars, excludes today
+                vol_ratio_today = float(vol.iloc[-1]) / avg_vol20 if avg_vol20 > 0 else 0.0
+            else:
+                vol_ratio_today = 0.0
+            vol_expanding = vol_ratio_today >= early_momentum_vol_ratio
+
+            # RS slope — is rs_composite_approx itself improving (or
+            # worsening, for the short side) vs. `lookback` bars ago,
+            # i.e. accelerating toward strength rather than just weak.
+            lb = early_momentum_rs_slope_lookback
+            rs1_p = float(c.pct_change(21).iloc[-1 - lb]  - n.pct_change(21).iloc[-1 - lb])
+            rs3_p = float(c.pct_change(63).iloc[-1 - lb]  - n.pct_change(63).iloc[-1 - lb])
+            rs6_p = float(c.pct_change(126).iloc[-1 - lb] - n.pct_change(126).iloc[-1 - lb])
+            rs_composite_prior = rs1_p * 0.15 + rs3_p * 0.50 + rs6_p * 0.25
+            rs_slope_up = rs_composite_approx > rs_composite_prior
+            rs_slope_down = rs_composite_approx < rs_composite_prior
+
+            # Cheap breakout proxy — real pivot/resistance detection needs
+            # build_indicators(), so this is a rolling-high/low stand-in.
+            bl = early_momentum_breakout_lookback
+            prior_high = float(c.iloc[-1 - bl:-1].max())
+            prior_low = float(c.iloc[-1 - bl:-1].min())
+            breakout_up = float(c.iloc[-1]) > prior_high
+            breakout_down = float(c.iloc[-1]) < prior_low
+
+            structural_bullish = ema9_bullish and vol_expanding and rs_slope_up and raw_move_today > 0
+            structural_bearish = ema9_bearish and vol_expanding and rs_slope_down and raw_move_today < 0
+            breakout_trigger = breakout_up or breakout_down
+
+            if structural_bullish or structural_bearish or breakout_trigger:
+                return True
+        except (IndexError, ZeroDivisionError, ValueError):
+            pass  # can't compute the override cleanly — fall through to the base reject
         return False
     return True
 
