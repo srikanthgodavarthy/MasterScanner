@@ -247,12 +247,29 @@ def load_nse_instrument_master() -> pd.DataFrame:
 _EQUITY_TYPE_LABELS = {"EQ", "EQUITY"}
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_resource(ttl=86400, show_spinner=False)
 def _symbol_to_instrument_key_map() -> dict:
     """Builds the full symbol -> instrument_key lookup once per day
     instead of re-filtering the instrument master on every call —
     resolve_instrument_key() gets called once per symbol per scan, and
-    a 500-row .str.upper() == filter x 500 symbols adds up."""
+    a 500-row .str.upper() == filter x 500 symbols adds up.
+
+    Uses st.cache_resource (not st.cache_data) deliberately: this is a
+    read-only lookup table hit from resolve_instrument_key() at
+    multiple call sites, many inside per-symbol worker functions
+    submitted to ThreadPoolExecutor pools (fetch_stock_atm_option,
+    single-symbol quote/candle fetchers, the Stage 3 ATM-option batch,
+    etc.). With st.cache_data, every .get() call triggers Streamlit's
+    mandatory deep-copy-on-access safety behavior — during a
+    500-symbol batch with up to _MAX_WORKERS/_OC_MAX_WORKERS threads
+    running concurrently, that's up to 500 full deep-copies of an
+    ~88k-entry dict, several happening at once. The copies are freed
+    almost immediately after each .get(), so they show up as a
+    transient allocation spike (and glibc-arena fragmentation
+    malloc_trim has to reclaim) rather than as live memory a profiler
+    would catch. st.cache_resource returns the same object reference
+    to every caller instead of copying, which is safe here because
+    nothing downstream mutates the returned dict."""
     df = load_nse_instrument_master()
     symbol_col = next((c for c in ("tradingsymbol", "trading_symbol", "symbol") if c in df.columns), None)
     type_col   = next((c for c in ("instrument_type", "instrumenttype") if c in df.columns), None)
