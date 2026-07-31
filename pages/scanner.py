@@ -3255,6 +3255,120 @@ def _options_table_html(df: pd.DataFrame) -> str:
     )
 
 
+def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
+    """[2026-07-31] DORE Options Engine Integration — renders the new
+    utils.dore_options_engine/utils.dore_options_scan pipeline's output
+    (one OptionTradePlan per row, from utils.scan_state's
+    "dore_options_scan" snapshot section). This is now the Options tab's
+    PRIMARY table — see _fo_opportunities_panel's engine toggle for how
+    to switch back to the legacy DORE 2.0 table (_options_table_html,
+    reading "fo_scan") for rollback/comparison.
+
+    Column set differs from the legacy table on purpose: this engine
+    emits a complete plan (primary/conservative/aggressive strikes,
+    entry zone, POP, confidence score) rather than the legacy screener's
+    single-recommendation + Action-tier shape, so this is a fresh
+    renderer rather than a reshape into _options_table_html's columns.
+    """
+    def _fmt_money(v):
+        return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
+
+    def _fmt_num(v, decimals=0):
+        return f"{v:,.{decimals}f}" if v not in (None, "") and pd.notna(v) else "—"
+
+    def _fmt_text(v):
+        return v if v not in (None, "") and pd.notna(v) else "—"
+
+    def _fmt_score(v):
+        return f"{v:.0f}" if v not in (None, "") and pd.notna(v) else "—"
+
+    def _fmt_entry_zone(v):
+        # entry_zone is a (low, high) tuple/list; JSON round-trips it as
+        # a 2-element list.
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return "—"
+        try:
+            lo, hi = v[0], v[1]
+            if lo is None or hi is None:
+                return "—"
+            return f"₹{lo:,.2f} – ₹{hi:,.2f}"
+        except Exception:
+            return "—"
+
+    def _confidence_style(score):
+        if score is None or (isinstance(score, float) and pd.isna(score)):
+            return ("#8b949e", "⚪")
+        if score >= 75:
+            return ("#3fb950", "🟢")
+        if score >= 55:
+            return ("#58a6ff", "🔵")
+        if score >= 35:
+            return ("#d29922", "🟡")
+        return ("#8b949e", "⚪")
+
+    if "confidence_score" in df.columns:
+        df = df.sort_values("confidence_score", ascending=False, kind="stable")
+
+    headers = ["Symbol", "Direction", "Primary Strike", "Entry Zone", "Stop Loss",
+               "Target 1", "Target 2", "POP %", "Confidence", "Qualification",
+               "Conviction", "Entry Quality", "Regime", "Expiry", "DTE", "Exit Before Expiry"]
+
+    rows_html = []
+    for _, r in df.iterrows():
+        conf = r.get("confidence_score")
+        conf_color, conf_dot = _confidence_style(conf)
+        direction = r.get("direction", "")
+        dir_color = "#3fb950" if direction == "CE" else "#f85149" if direction == "PE" else "#8b949e"
+
+        primary = r.get("primary") or {}
+        if not isinstance(primary, dict):
+            primary = {}
+        strike = primary.get("strike")
+        strike_disp = f"{_fmt_text(direction)} {_fmt_num(strike)}".strip() if strike not in (None, "") else "—"
+
+        cells = [
+            f'<td style="font-weight:700;">{_tv_link(r.get("symbol", "—"))}</td>',
+            f'<td style="color:{dir_color};font-weight:700;">{_fmt_text(direction)}</td>',
+            f'<td style="font-weight:700;">{strike_disp}</td>',
+            f'<td>{_fmt_entry_zone(r.get("entry_zone"))}</td>',
+            f'<td>{_fmt_money(r.get("stop_loss"))}</td>',
+            f'<td>{_fmt_money(r.get("target1"))}</td>',
+            f'<td>{_fmt_money(r.get("target2"))}</td>',
+            f'<td>{_fmt_score(r.get("probability_of_profit"))}</td>',
+            f'<td style="white-space:nowrap;"><span style="color:{conf_color};font-weight:700;">'
+            f'{conf_dot} {_fmt_score(conf)}</span></td>',
+            f'<td>{_fmt_score(r.get("qualification_score"))}</td>',
+            f'<td>{_fmt_score(r.get("conviction"))}</td>',
+            f'<td>{_fmt_score(r.get("entry_quality"))}</td>',
+            f'<td>{_fmt_text(r.get("market_regime"))}</td>',
+            f'<td>{_fmt_text(r.get("expiry"))}</td>',
+            f'<td>{_fmt_num(r.get("dte"))}</td>',
+            f'<td style="color:var(--muted);font-size:11px;">{_fmt_text(r.get("exit_before_expiry"))}</td>',
+        ]
+        rows_html.append(
+            f'<tr style="background:{conf_color}14;border-left:3px solid {conf_color};">'
+            + "".join(cells) + "</tr>"
+        )
+
+    header_html = "".join(
+        f'<th style="text-align:left;padding:6px 10px;color:var(--muted);'
+        f'font-size:11px;text-transform:uppercase;white-space:nowrap;">{h}</th>'
+        for h in headers
+    )
+    return (
+        '<div style="overflow-x:auto;">'
+        '<table style="width:100%;border-collapse:collapse;font-size:13px;">'
+        f'<thead><tr>{header_html}</tr></thead>'
+        f'<tbody>{"".join(rows_html)}</tbody>'
+        '</table></div>'
+        '<style>'
+        'table td{padding:6px 10px;color:var(--text);border-bottom:1px solid rgba(255,255,255,0.05);white-space:nowrap;}'
+        '.tv-link{color:inherit;text-decoration:none;border-bottom:1px dotted var(--muted);}'
+        '.tv-link:hover{color:#58a6ff;border-bottom-color:#58a6ff;}'
+        '</style>'
+    )
+
+
 def _futures_table_html(df: pd.DataFrame) -> str:
     """Futures tab, styled to match the Options table (2026-07-22
     revisit): TradingView-linked symbol, colored %Chg/Directional
@@ -3352,6 +3466,18 @@ def _fo_opportunities_panel():
     this rewrite this panel had NO fragment isolation at all and re-ran
     the full scan on every single Dashboard interaction; now it's a cheap
     metadata poll + (only-when-changed) table render.
+
+    2026-07-31 — DORE Options Engine Integration: the Options tab's
+    PRIMARY source is now utils.dore_options_scan's "dore_options_scan"
+    snapshot (utils/dore_options_engine.py's independent trade-plan
+    pipeline). The legacy "fo_scan" pipeline (utils/fo_scan.py +
+    utils/dore_engine.py, formerly the only source) keeps running on its
+    own 60s scheduler loop unchanged and stays one radio-button away —
+    "Legacy DORE 2.0" — for rollback or side-by-side comparison. Neither
+    pipeline writes to or reads from the other's snapshot; switching the
+    radio only changes what this panel reads, not which producers run.
+    The Futures tab is untouched — it has always been, and remains,
+    fo_scan/dore_engine's output only; this task is scoped to Options.
     """
     from utils.scan_state import load_snapshot_meta, load_snapshot_payload
 
@@ -3380,6 +3506,21 @@ def _fo_opportunities_panel():
     fut_df = pd.DataFrame(payload.get("futures") or [])
     opt_df = pd.DataFrame(payload.get("options") or [])
 
+    # ── DORE Options Engine (primary, 2026-07-31) — separate poll, same
+    # cheap meta-then-payload pattern as fo_scan above, own session_state
+    # cache keys so a stale/failed cycle on either pipeline never blanks
+    # the other's last-good cached payload.
+    dore_opt_meta = load_snapshot_meta("dore_options_scan")
+    if dore_opt_meta is not None and dore_opt_meta.get("version") != st.session_state.get("dore_options_scan_version"):
+        dore_opt_full = load_snapshot_payload("dore_options_scan")
+        if dore_opt_full is not None:
+            st.session_state["dore_options_scan_version"] = dore_opt_full.get("version")
+            st.session_state["dore_options_scan_payload"] = dore_opt_full.get("payload") or {}
+
+    dore_opt_payload = st.session_state.get("dore_options_scan_payload") or {}
+    dore_opt_df = pd.DataFrame(dore_opt_payload.get("trade_plans") or [])
+    dore_opt_rejections = dore_opt_payload.get("rejections") or []
+
     tab_fut, tab_opt = st.tabs(["📈 Futures", "🎯 Options"])
 
     with tab_fut:
@@ -3394,52 +3535,86 @@ def _fo_opportunities_panel():
             st.markdown(_futures_table_html(fut_df), unsafe_allow_html=True)
 
     with tab_opt:
-        if opt_df.empty:
-            st.caption("No DORE-qualified option setups right now — either the Upstox token needs "
-                       "checking, or every F&O candidate is currently gated to WAIT/NO_TRADE (see "
-                       "the Market Intelligence index cards for why).")
+        engine_choice = st.radio(
+            "Options engine",
+            options=["DORE Options Engine (primary)", "Legacy DORE 2.0 (rollback / comparison)"],
+            index=0,
+            horizontal=True,
+            key="options_engine_choice",
+            label_visibility="collapsed",
+        )
+
+        if engine_choice.startswith("DORE Options Engine"):
+            if dore_opt_meta is None:
+                st.caption("DORE Options Engine: waiting for the first scheduled scan "
+                           "(scheduler/scan_worker.py's dore_options_scan loop) — nothing to show yet.")
+            elif dore_opt_df.empty:
+                n_rej = len(dore_opt_rejections)
+                st.caption("No DORE Options trade plans right now — every shortlisted candidate "
+                           f"was hard-rejected this cycle ({n_rej} rejection(s): missing option "
+                           "chain, no OHLCV history, or no liquid strike found) or the live_scanner "
+                           "universe is currently empty.")
+            else:
+                st.markdown(_dore_options_plan_table_html(dore_opt_df), unsafe_allow_html=True)
+                st.caption("🟢 Confidence ≥75 · 🔵 ≥55 · 🟡 ≥35 · ⚪ below — DORE's own final_score, "
+                           "blending qualification, direction strength, and premium/liquidity "
+                           "validation into one ranking. Primary Strike is the balanced pick; "
+                           "Conservative/Aggressive alternatives aren't shown here — see the full "
+                           "trade plan via utils.dore_options_engine.OptionTradePlan.format_output() "
+                           "for those. Entry Zone / Stop Loss / Targets are in PREMIUM rupees, not "
+                           "the underlying's price. This is a screener, not an order ticket — confirm "
+                           "liquidity (bid/ask) before acting.")
+                if dore_opt_rejections:
+                    st.caption(f"{len(dore_opt_rejections)} shortlisted candidate(s) hard-rejected "
+                               "this cycle (missing chain/OHLCV/liquidity) — not shown above.")
         else:
-            _opt_display_cols = [
-                "Symbol", "LTP", "Action", "Recommendation", "Leg", "Strike", "Premium", "Premium %Chg",
-                "Strike Type", "Execution State",
-                "Opportunity Score", "Entry", "Entry Drift %", "Entry Timestamp",
-                "SL", "T1", "T2", "Plan", "Expiry", "Expiry Date", "Days To Expiry", "Reason",
-            ]
-            # Older cached runs (or a plan-enrichment failure) may not have
-            # every column yet — filter to what's actually present rather
-            # than KeyError on a partial frame.
-            opt_df_display = opt_df[[c for c in _opt_display_cols if c in opt_df.columns]].copy()
-            for _missing_col in ("LTP", "Entry Timestamp", "Entry Drift %", "Expiry Date", "Days To Expiry"):
-                # Back-compat: a cached df from before these columns
-                # existed — render blank rather than KeyError.
-                if _missing_col not in opt_df_display.columns:
-                    opt_df_display[_missing_col] = None
-            if "Action" not in opt_df_display.columns:
-                # Back-compat: a cached df from before the Action column
-                # existed. Derive it inline rather than failing the panel.
-                from utils.dore_fo_screener import _action_tier
-                opt_df_display["Action"] = opt_df_display["Recommendation"].map(_action_tier)
-            if "Premium %Chg" in opt_df_display.columns:
-                opt_df_display["Premium %Chg"] = pd.to_numeric(
-                    opt_df_display["Premium %Chg"], errors="coerce")
-            st.markdown(_options_table_html(opt_df_display), unsafe_allow_html=True)
-            st.caption("🟢 Buy Now = DORE says enter immediately · 🔵 Wait for Trigger = levels are "
-                       "locked but price hasn't confirmed yet (BREAKOUT_PENDING) · 🟣 Watch Only = "
-                       "setup exists, not confirmed to enter · 🟢 In Trade = plan is ACTIVE, hold for "
-                       "T1 · 🎯 Manage Trade = T1 already hit, trail the remainder to T2/SL · Row tint "
-                       "follows the Action column, not Recommendation directly. Once a plan reaches "
-                       "ACTIVE or T1_HIT, Action reflects the plan's own state instead of the live "
-                       "(and by then often stale/contradictory) Recommendation. Entry Timestamp for a "
-                       "locked plan is when that plan actually triggered/was created — not the current "
-                       "scan time — so it stops changing once a plan is open.")
-            st.caption("Runs DORE 2.0's full 5-stage funnel — only rows DORE actually recommends "
-                       "acting on are shown, so this list can legitimately be empty or short on a "
-                       "quiet day. 2026-07-21: BUY_CE_NOW/BUY_PE_NOW additionally require Premium "
-                       "Behavior to show the option premium itself strengthening — a setup where the "
-                       "underlying is ready but the premium hasn't turned yet shows as WATCH_CE/WATCH_PE "
-                       "(Action: Watch Only) instead. Entry/Stop/Targets are in PREMIUM rupees, not the "
-                       "underlying's price. This is a screener, not an order ticket — confirm liquidity "
-                       "(bid/ask) before acting.")
+            if opt_df.empty:
+                st.caption("No DORE-qualified option setups right now — either the Upstox token needs "
+                           "checking, or every F&O candidate is currently gated to WAIT/NO_TRADE (see "
+                           "the Market Intelligence index cards for why).")
+            else:
+                _opt_display_cols = [
+                    "Symbol", "LTP", "Action", "Recommendation", "Leg", "Strike", "Premium", "Premium %Chg",
+                    "Strike Type", "Execution State",
+                    "Opportunity Score", "Entry", "Entry Drift %", "Entry Timestamp",
+                    "SL", "T1", "T2", "Plan", "Expiry", "Expiry Date", "Days To Expiry", "Reason",
+                ]
+                # Older cached runs (or a plan-enrichment failure) may not have
+                # every column yet — filter to what's actually present rather
+                # than KeyError on a partial frame.
+                opt_df_display = opt_df[[c for c in _opt_display_cols if c in opt_df.columns]].copy()
+                for _missing_col in ("LTP", "Entry Timestamp", "Entry Drift %", "Expiry Date", "Days To Expiry"):
+                    # Back-compat: a cached df from before these columns
+                    # existed — render blank rather than KeyError.
+                    if _missing_col not in opt_df_display.columns:
+                        opt_df_display[_missing_col] = None
+                if "Action" not in opt_df_display.columns:
+                    # Back-compat: a cached df from before the Action column
+                    # existed. Derive it inline rather than failing the panel.
+                    from utils.dore_fo_screener import _action_tier
+                    opt_df_display["Action"] = opt_df_display["Recommendation"].map(_action_tier)
+                if "Premium %Chg" in opt_df_display.columns:
+                    opt_df_display["Premium %Chg"] = pd.to_numeric(
+                        opt_df_display["Premium %Chg"], errors="coerce")
+                st.markdown(_options_table_html(opt_df_display), unsafe_allow_html=True)
+                st.caption("🟢 Buy Now = DORE says enter immediately · 🔵 Wait for Trigger = levels are "
+                           "locked but price hasn't confirmed yet (BREAKOUT_PENDING) · 🟣 Watch Only = "
+                           "setup exists, not confirmed to enter · 🟢 In Trade = plan is ACTIVE, hold for "
+                           "T1 · 🎯 Manage Trade = T1 already hit, trail the remainder to T2/SL · Row tint "
+                           "follows the Action column, not Recommendation directly. Once a plan reaches "
+                           "ACTIVE or T1_HIT, Action reflects the plan's own state instead of the live "
+                           "(and by then often stale/contradictory) Recommendation. Entry Timestamp for a "
+                           "locked plan is when that plan actually triggered/was created — not the current "
+                           "scan time — so it stops changing once a plan is open.")
+                st.caption("Runs DORE 2.0's full 5-stage funnel — only rows DORE actually recommends "
+                           "acting on are shown, so this list can legitimately be empty or short on a "
+                           "quiet day. 2026-07-21: BUY_CE_NOW/BUY_PE_NOW additionally require Premium "
+                           "Behavior to show the option premium itself strengthening — a setup where the "
+                           "underlying is ready but the premium hasn't turned yet shows as WATCH_CE/WATCH_PE "
+                           "(Action: Watch Only) instead. Entry/Stop/Targets are in PREMIUM rupees, not the "
+                           "underlying's price. This is a screener, not an order ticket — confirm liquidity "
+                           "(bid/ask) before acting. Kept here for rollback/comparison against the DORE "
+                           "Options Engine — this pipeline is no longer the primary source.")
 
 
 def render(settings: dict | None = None):

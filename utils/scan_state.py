@@ -72,6 +72,14 @@ _TABLES = {
     "market_intelligence": "market_intelligence_snapshots",
     "live_scanner":        "live_scanner_snapshots",
     "fo_scan":             "fo_scan_snapshots",
+    # 2026-07-31: DORE Options Engine Integration — utils.dore_options_scan's
+    # own snapshot section, deliberately separate from "fo_scan" (the
+    # legacy utils.fo_scan/utils.dore_engine pipeline) so both can run
+    # side by side; the legacy section is kept for rollback/comparison,
+    # never overwritten by this one. See pages/scanner.py's
+    # _fo_opportunities_panel for the primary/legacy toggle that reads
+    # from each.
+    "dore_options_scan":   "dore_options_scan_snapshots",
 }
 
 _META_COLUMNS = "scan_id, created_at, status, version, row_count, error"
@@ -346,6 +354,22 @@ CREATE TABLE IF NOT EXISTS fo_scan_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_fo_snap_version ON fo_scan_snapshots(version DESC);
 
+-- 2026-07-31: DORE Options Engine Integration — separate snapshot table
+-- for utils.dore_options_scan.compute_dore_options_scan(), independent
+-- of fo_scan_snapshots (the legacy pipeline, kept for rollback/
+-- comparison — see pages/scanner.py's _fo_opportunities_panel).
+CREATE TABLE IF NOT EXISTS dore_options_scan_snapshots (
+    id         bigserial   PRIMARY KEY,
+    scan_id    uuid        NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    status     text        NOT NULL DEFAULT 'completed',
+    version    bigint      NOT NULL,
+    row_count  integer     NOT NULL DEFAULT 0,
+    error      text,
+    payload    jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_dore_opt_snap_version ON dore_options_scan_snapshots(version DESC);
+
 -- ── Retention [Architecture review H1 fix, 2026-07-25] ─────────────────
 -- Deletes all but the most recent p_keep rows (by version) from ONE of
 -- the three whitelisted snapshot tables. Whitelist check + format(%I)
@@ -382,6 +406,7 @@ BEGIN
         WHEN 'market_intelligence_snapshots' THEN 'version'
         WHEN 'live_scanner_snapshots'        THEN 'version'
         WHEN 'fo_scan_snapshots'             THEN 'version'
+        WHEN 'dore_options_scan_snapshots'   THEN 'version'
         WHEN 'scan_snapshots'                THEN 'run_at'
         WHEN 'scan_daily_archive'            THEN 'trading_date'
         WHEN 'sector_snapshots'              THEN 'scan_date'
