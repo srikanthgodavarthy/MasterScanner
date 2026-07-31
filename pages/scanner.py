@@ -3306,11 +3306,42 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
             return ("#d29922", "🟡")
         return ("#8b949e", "⚪")
 
+    def _fmt_pct_chg(v):
+        # Colored +/- %, matching _futures_table_html's _fmt_pct — used
+        # here for the option contract's OWN %Chg (premium vs its prior
+        # close), not the underlying's.
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return '<span style="color:var(--muted)">—</span>'
+        color = "#3fb950" if v >= 0 else "#f85149"
+        return f'<span style="color:{color};font-weight:600;">{"+" if v >= 0 else ""}{v:.2f}%</span>'
+
+    def _fmt_current_premium(row):
+        # "₹123.45 (+2.10%)" — current premium with the contract's own
+        # %Chg vs its previous close folded in, 2026-07-31.
+        cur = row.get("current_premium")
+        if cur in (None, "") or pd.isna(cur):
+            return "—"
+        pct = row.get("premium_change_pct")
+        return f'{_fmt_money(cur)} {_fmt_pct_chg(pct)}'
+
+    def _fmt_drift(row):
+        # Drift % — how far the live premium has moved from the ONE
+        # saved entry locked the first time this contract was seen
+        # (utils.dore_options_persistence), not from this tick's own
+        # primary premium. "—" until a locked entry/Supabase connection
+        # exists (fail-soft, see enrich_trade_plans_with_persistence).
+        entry = row.get("entry_locked")
+        drift = row.get("drift_pct")
+        if entry in (None, "") or pd.isna(entry):
+            return '<span style="color:var(--muted)">—</span>'
+        entry_html = f'<div style="color:var(--muted);font-size:11px;">Entry {_fmt_money(entry)}</div>'
+        return f'{_fmt_pct_chg(drift)}{entry_html}'
+
     if "confidence_score" in df.columns:
         df = df.sort_values("confidence_score", ascending=False, kind="stable")
 
-    headers = ["Symbol", "Direction", "Primary Strike", "Entry Zone", "Stop Loss",
-               "Target 1", "Target 2", "POP %", "Confidence", "Qualification",
+    headers = ["Symbol", "Direction", "Primary Strike", "Current Premium", "Entry Zone", "Stop Loss",
+               "Target 1", "Target 2", "Saved Entry / Drift %", "POP %", "Confidence", "Qualification",
                "Conviction", "Entry Quality", "Regime", "Expiry", "DTE", "Exit Before Expiry"]
 
     rows_html = []
@@ -3330,10 +3361,12 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
             f'<td style="font-weight:700;">{_tv_link(r.get("symbol", "—"))}</td>',
             f'<td style="color:{dir_color};font-weight:700;">{_fmt_text(direction)}</td>',
             f'<td style="font-weight:700;">{strike_disp}</td>',
+            f'<td>{_fmt_current_premium(r)}</td>',
             f'<td>{_fmt_entry_zone(r.get("entry_zone"))}</td>',
             f'<td>{_fmt_money(r.get("stop_loss"))}</td>',
             f'<td>{_fmt_money(r.get("target1"))}</td>',
             f'<td>{_fmt_money(r.get("target2"))}</td>',
+            f'<td>{_fmt_drift(r)}</td>',
             f'<td>{_fmt_score(r.get("probability_of_profit"))}</td>',
             f'<td style="white-space:nowrap;"><span style="color:{conf_color};font-weight:700;">'
             f'{conf_dot} {_fmt_score(conf)}</span></td>',
