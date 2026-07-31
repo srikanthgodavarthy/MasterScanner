@@ -127,7 +127,8 @@ LIVE_SCANNER_BATCH_COOLDOWN_SECS = 1.5   # brief pause between batches, just
 def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payload,
               owner_event: "threading.Event | None" = None,
               require_fresh_live_scanner: bool = False,
-              max_live_scanner_staleness_secs: int = 600):
+              max_live_scanner_staleness_secs: int = 600,
+              priority_name: "str | None" = None):
     """
     Generic "compute on an interval, save a versioned snapshot" loop.
     Used by market_intelligence and fo_scan, whose single-call compute
@@ -189,6 +190,12 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
             logger.warning("[%s] skipping this cycle — %s", name, "; ".join(health.reasons))
             time.sleep(max(1.0, interval_secs))
             continue
+
+        if priority_name is not None:
+            from utils.scan_priority import wait_for_priority
+            # Bounded wait at the cycle boundary only — never mid-batch,
+            # never Streamlit's render thread. See utils/scan_priority.py.
+            wait_for_priority(priority_name, max_wait_secs=interval_secs * 4)
 
         if require_fresh_live_scanner:
             live = None
@@ -516,6 +523,14 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                             batch_i + 1, n_batches)
                 break
 
+            # [2026-08-03, SG request] Bounded wait for live_scanner's
+            # 3-minute priority window before starting the next batch —
+            # never mid-batch. Capped well under one full cycle so a
+            # coordinator hiccup can't stall live_scanner past its own
+            # interval_secs. See utils/scan_priority.py.
+            from utils.scan_priority import wait_for_priority
+            wait_for_priority("live_scanner", max_wait_secs=min(interval_secs, 240))
+
             batch_started = time.time()
             if chunk:
                 try:
@@ -652,6 +667,10 @@ def main():
                 # its own heavy option-chain/OHLCV cycle against a stale
                 # or missing live_scanner snapshot.
                 "require_fresh_live_scanner": (name == "dore_options_scan"),
+                # [2026-08-03, SG request] DORE gets a 60s priority
+                # window, live_scanner gets 3min — see
+                # utils/scan_priority.py.
+                "priority_name": ("dore" if name == "dore_options_scan" else None),
             },
             name=f"scan-{name}", daemon=True,
         )
