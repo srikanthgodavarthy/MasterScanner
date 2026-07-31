@@ -3415,6 +3415,117 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
     )
 
 
+def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
+    """[2026-08-01] DORE Options Engine — Active Plans tab. Renders every
+    currently-OPEN DoreOptionsPlan (utils.dore_options_persistence.
+    active_plan_rows() output), independent of whether this cycle's live
+    scan reproduced the contract — see that function's docstring for why
+    Current Premium/Drift here are "last known" (as of Last Seen) rather
+    than freshly fetched.
+
+    Column set is deliberately narrower than
+    _dore_options_plan_table_html's live table: there's no qualification/
+    conviction/entry-quality/regime breakdown here because those are
+    THIS cycle's live scoring, not something a persisted plan carries —
+    a plan can be Active for days after the underlying stops qualifying
+    at all, same as the equity Active Plans tab's Original vs Current
+    Recommendation split.
+    """
+    def _fmt_money(v):
+        return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
+
+    def _fmt_text(v):
+        return v if v not in (None, "") and pd.notna(v) else "—"
+
+    def _fmt_pct_chg(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return '<span style="color:var(--muted)">—</span>'
+        color = "#3fb950" if v >= 0 else "#f85149"
+        return f'<span style="color:{color};font-weight:600;">{"+" if v >= 0 else ""}{v:.2f}%</span>'
+
+    def _fmt_last_premium(row):
+        cur = row.get("last_premium")
+        if cur in (None, "") or pd.isna(cur):
+            return '<span style="color:var(--muted)">—</span>'
+        drift = row.get("last_drift_pct")
+        return f'{_fmt_money(cur)} {_fmt_pct_chg(drift)}'
+
+    def _fmt_last_seen(row):
+        ts = row.get("last_seen_at")
+        if ts in (None, "") or pd.isna(ts):
+            return '<span style="color:var(--muted)">Never reproduced</span>'
+        return f'<span style="color:var(--muted);font-size:11px;">{_fmt_text(ts)[:16].replace("T", " ")}</span>'
+
+    if df.empty:
+        return '<div style="color:var(--muted);padding:8px;">No open plans.</div>'
+
+    headers = ["Symbol", "Direction", "Strike", "Expiry", "Status", "Entry (Locked)", "Stop Loss",
+               "Target 1", "Target 2", "Last Known Premium / Drift", "Last Seen", "Days Active"]
+
+    rows_html = []
+    for _, r in df.iterrows():
+        direction = r.get("direction", "")
+        dir_color = "#3fb950" if direction == "CE" else "#f85149" if direction == "PE" else "#8b949e"
+        cells = [
+            f'<td style="font-weight:700;">{_tv_link(r.get("symbol", "—"))}</td>',
+            f'<td style="color:{dir_color};font-weight:700;">{_fmt_text(direction)}</td>',
+            f'<td>{_fmt_text(r.get("strike"))}</td>',
+            f'<td>{_fmt_text(r.get("expiry"))}</td>',
+            f'<td>{r.get("plan_status_label", "—")}</td>',
+            f'<td style="font-weight:700;">{_fmt_money(r.get("entry_locked"))}</td>',
+            f'<td>{_fmt_money(r.get("saved_stop_loss"))}</td>',
+            f'<td>{_fmt_money(r.get("saved_target1"))}</td>',
+            f'<td>{_fmt_money(r.get("saved_target2"))}</td>',
+            f'<td>{_fmt_last_premium(r)}</td>',
+            f'<td>{_fmt_last_seen(r)}</td>',
+            f'<td>{_fmt_text(r.get("plan_age_days"))}d</td>',
+        ]
+        rows_html.append(f'<tr class="ap-row">{"".join(cells)}</tr>')
+
+    header_html = "".join(f'<th>{h}</th>' for h in headers)
+    return (
+        '<div style="overflow-x:auto;">'
+        f'<table class="ap-table"><thead><tr>{header_html}</tr></thead>'
+        f'<tbody>{"".join(rows_html)}</tbody></table></div>'
+    )
+
+
+def _render_dore_options_active_plans_tab() -> None:
+    """[2026-08-01] DORE Options Engine — Active Plans tab. Reads every
+    currently-OPEN DoreOptionsPlan straight from Supabase
+    (utils.supabase_client.load_open_dore_options_plans()), independent
+    of whatever pages/scanner.py's own dore_options_scan poll did or
+    didn't reproduce this cycle — the same separation-of-concerns as
+    _render_active_plans_tab (equity SetupPlan) vs the main scanner
+    table. See utils/dore_options_persistence.py's module docstring for
+    the full rationale.
+    """
+    try:
+        from utils.supabase_client import load_open_dore_options_plans, _is_available
+        from utils.dore_options_persistence import active_plan_rows
+    except Exception:
+        st.warning("DORE Options plan persistence isn't available right now.")
+        return
+
+    if not _is_available():
+        st.info("Supabase isn't configured, so Active Plans can't be loaded. "
+                 "DORE Options trade-plan persistence requires Supabase.")
+        return
+
+    open_plans = load_open_dore_options_plans()
+    if not open_plans:
+        st.info("No open DORE Options plans right now. A plan is locked automatically the "
+                 "first time a contract (symbol + direction + strike + expiry) is seen by "
+                 "the live scan.")
+        return
+
+    rows = active_plan_rows(open_plans)
+    rows_df = pd.DataFrame(rows)
+    st.caption(f"{len(rows_df)} open plan(s) — independent of whether this cycle's live scan "
+               "reproduced the contract. Auto-closes once the contract's own expiry passes.")
+    st.markdown(_dore_options_active_plans_table_html(rows_df), unsafe_allow_html=True)
+
+
 def _futures_table_html(df: pd.DataFrame) -> str:
     """Futures tab, styled to match the Options table (2026-07-22
     revisit): TradingView-linked symbol, colored %Chg/Directional
@@ -3591,28 +3702,38 @@ def _fo_opportunities_panel():
         )
 
         if engine_choice.startswith("DORE Options Engine"):
-            if dore_opt_meta is None:
-                st.caption("DORE Options Engine: waiting for the first scheduled scan "
-                           "(scheduler/scan_worker.py's dore_options_scan loop) — nothing to show yet.")
-            elif dore_opt_df.empty:
-                n_rej = len(dore_opt_rejections)
-                st.caption("No DORE Options trade plans right now — every shortlisted candidate "
-                           f"was hard-rejected this cycle ({n_rej} rejection(s): missing option "
-                           "chain, no OHLCV history, or no liquid strike found) or the live_scanner "
-                           "universe is currently empty.")
-            else:
-                st.markdown(_dore_options_plan_table_html(dore_opt_df), unsafe_allow_html=True)
-                st.caption("🟢 Confidence ≥75 · 🔵 ≥55 · 🟡 ≥35 · ⚪ below — DORE's own final_score, "
-                           "blending qualification, direction strength, and premium/liquidity "
-                           "validation into one ranking. Primary Strike is the balanced pick; "
-                           "Conservative/Aggressive alternatives aren't shown here — see the full "
-                           "trade plan via utils.dore_options_engine.OptionTradePlan.format_output() "
-                           "for those. Entry Zone / Stop Loss / Targets are in PREMIUM rupees, not "
-                           "the underlying's price. This is a screener, not an order ticket — confirm "
-                           "liquidity (bid/ask) before acting.")
-                if dore_opt_rejections:
-                    st.caption(f"{len(dore_opt_rejections)} shortlisted candidate(s) hard-rejected "
-                               "this cycle (missing chain/OHLCV/liquidity) — not shown above.")
+            # 2026-08-01: split into Live Scan (this cycle's reproduced
+            # recommendations, as before) vs Active Plans (every
+            # currently-OPEN locked entry, read straight from Supabase —
+            # see _render_dore_options_active_plans_tab's docstring).
+            live_scan_tab, active_plans_tab = st.tabs(["📡 Live Scan", "📋 Active Plans"])
+
+            with live_scan_tab:
+                if dore_opt_meta is None:
+                    st.caption("DORE Options Engine: waiting for the first scheduled scan "
+                               "(scheduler/scan_worker.py's dore_options_scan loop) — nothing to show yet.")
+                elif dore_opt_df.empty:
+                    n_rej = len(dore_opt_rejections)
+                    st.caption("No DORE Options trade plans right now — every shortlisted candidate "
+                               f"was hard-rejected this cycle ({n_rej} rejection(s): missing option "
+                               "chain, no OHLCV history, or no liquid strike found) or the live_scanner "
+                               "universe is currently empty.")
+                else:
+                    st.markdown(_dore_options_plan_table_html(dore_opt_df), unsafe_allow_html=True)
+                    st.caption("🟢 Confidence ≥75 · 🔵 ≥55 · 🟡 ≥35 · ⚪ below — DORE's own final_score, "
+                               "blending qualification, direction strength, and premium/liquidity "
+                               "validation into one ranking. Primary Strike is the balanced pick; "
+                               "Conservative/Aggressive alternatives aren't shown here — see the full "
+                               "trade plan via utils.dore_options_engine.OptionTradePlan.format_output() "
+                               "for those. Entry Zone / Stop Loss / Targets are in PREMIUM rupees, not "
+                               "the underlying's price. This is a screener, not an order ticket — confirm "
+                               "liquidity (bid/ask) before acting.")
+                    if dore_opt_rejections:
+                        st.caption(f"{len(dore_opt_rejections)} shortlisted candidate(s) hard-rejected "
+                                   "this cycle (missing chain/OHLCV/liquidity) — not shown above.")
+
+            with active_plans_tab:
+                _render_dore_options_active_plans_tab()
         else:
             if opt_df.empty:
                 st.caption("No DORE-qualified option setups right now — either the Upstox token needs "
