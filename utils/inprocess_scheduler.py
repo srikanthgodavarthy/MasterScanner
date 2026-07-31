@@ -161,7 +161,16 @@ def start_background_scans() -> bool:
         for name, section, interval, compute_fn, to_payload in JOBS:
             t = threading.Thread(
                 target=_run_loop, args=(name, section, interval, compute_fn, to_payload),
-                kwargs={"owner_event": hb_thread.lost_ownership},
+                kwargs={
+                    "owner_event": hb_thread.lost_ownership,
+                    # [2026-08-02] see scheduler/scan_worker.py's main() for
+                    # the matching change and rationale — dore_options_scan
+                    # reads live_scanner's snapshot as its whole input, so
+                    # skip its own (heavy) cycle rather than run it against
+                    # stale/missing data and pile more load on a process
+                    # that's already RAM/CPU constrained.
+                    "require_fresh_live_scanner": (name == "dore_options_scan"),
+                },
                 name=f"scan-{name}", daemon=True,
             )
             t.start()
