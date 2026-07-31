@@ -273,6 +273,67 @@ def _rss_mb() -> float:
         return -1.0
 
 
+def _thread_stats() -> dict:
+    """Live OS/Python thread enumeration. Thread stacks are invisible to
+    gc.get_objects() by construction (they're not Python heap objects),
+    so this is the other half of explaining any RSS-vs-tracked-objects
+    gap alongside _malloc_trim_probe() below. Grouped by thread_name
+    PREFIX (split on the last '-' or '_' + digits) since pools like
+    history-flush / sb-storage / oi-snapshot-flush name workers
+    "prefix-N" — this collapses "history-flush-0", "history-flush-1"
+    etc. into one "history-flush" bucket so a genuinely growing pool
+    (e.g. scanner_engine.py's per-batch ThreadPoolExecutor abandoning
+    stuck workers via shutdown(wait=False)) stands out as a rising
+    count under one name instead of N separate one-off entries."""
+    import re
+    threads = threading.enumerate()
+    by_prefix: Counter = Counter()
+    for t in threads:
+        name = t.name or "unnamed"
+        prefix = re.sub(r"[-_]\d+$", "", name)
+        by_prefix[prefix] += 1
+    return {
+        "count": len(threads),
+        "by_name_prefix": by_prefix.most_common(_TOP_N),
+    }
+
+
+def _malloc_trim_probe() -> dict:
+    """Optional (MASTERSCANNER_MEMORY_PROFILE_MALLOC_TRIM=1) and
+    deliberately read-adjacent rather than fully read-only: calling
+    glibc's malloc_trim(0) asks the allocator to return freed-but-
+    retained arena pages to the OS. It does not touch any live Python
+    object — only pages malloc itself is already holding as free space
+    — so it cannot corrupt state, but it's gated behind its own env var
+    (default off) since it does real allocator work and a before/after
+    RSS delta is only meaningful, not free.
+
+    If RSS drops substantially after this call, that's a direct
+    confirmation that the gap between RSS and tracked-object totals is
+    native allocator retention (freed C-level memory glibc hadn't
+    handed back to the OS yet) rather than something still reachable
+    from Python. If RSS barely moves, the gap is more likely live OS
+    thread stacks (see _thread_stats()) or memory held by a native
+    extension outside glibc's default arena (e.g. a library using its
+    own mmap regions)."""
+    if os.environ.get("MASTERSCANNER_MEMORY_PROFILE_MALLOC_TRIM", "") != "1":
+        return {"enabled": False}
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+    except Exception as e:
+        return {"enabled": True, "ran": False, "reason": f"libc.so.6 unavailable ({e.__class__.__name__})"}
+
+    before = _rss_mb()
+    try:
+        libc.malloc_trim(0)
+    except Exception as e:
+        return {"enabled": True, "ran": False, "reason": f"malloc_trim call failed ({e.__class__.__name__})"}
+    after = _rss_mb()
+    return {"enabled": True, "ran": True, "rss_before_mb": before, "rss_after_mb": after,
+            "reclaimed_mb": round(before - after, 1) if before >= 0 and after >= 0 else None}
+
+
 def run_memory_profile() -> dict:
     """Collect one full profile snapshot and log it. Returns the dict
     too (for callers that want it, e.g. a future diagnostics page) but
@@ -284,12 +345,14 @@ def run_memory_profile() -> dict:
     df_np_stats = _dataframe_and_ndarray_scan()
     cache_stats = _cache_stats()
     session_stats = _session_state_stats()
+    thread_stats = _thread_stats()
     tm_stats = _tracemalloc_top()
+    trim_stats = _malloc_trim_probe()
     elapsed = time.time() - t0
 
     logger.info(
         "[memory_profiler] RSS=%.0fMB objects=%d dataframes=%d(%s) ndarrays=%d(%s) "
-        "cache_data=%s cache_resource=%s session_state=%s profile_took=%.2fs",
+        "cache_data=%s cache_resource=%s session_state=%s threads=%d profile_took=%.2fs",
         rss_mb, gc_stats["total_objects"],
         df_np_stats["dataframe_count"], df_np_stats["dataframe_total"],
         df_np_stats["ndarray_count"], df_np_stats["ndarray_total"],
@@ -297,8 +360,10 @@ def run_memory_profile() -> dict:
         cache_stats.get("cache_resource_total", "unavailable"),
         session_stats.get("shallow_total") if session_stats.get("reachable")
             else f"unreachable ({session_stats.get('reason', '?')})",
+        thread_stats["count"],
         elapsed,
     )
+    logger.info("[memory_profiler] threads by name prefix: %s", thread_stats["by_name_prefix"])
     logger.info("[memory_profiler] top gc types by shallow bytes: %s", gc_stats["top_by_shallow_bytes"])
     logger.info("[memory_profiler] top gc types by count: %s", gc_stats["top_by_count"])
     if df_np_stats["top_dataframes"]:
@@ -312,6 +377,11 @@ def run_memory_profile() -> dict:
         logger.info("[memory_profiler] top session_state keys: %s", session_stats["top_keys"])
     if tm_stats.get("enabled") and tm_stats.get("top_allocations"):
         logger.info("[memory_profiler] top tracemalloc allocation sites: %s", tm_stats["top_allocations"])
+    if trim_stats.get("ran"):
+        logger.info("[memory_profiler] malloc_trim probe: RSS %.0fMB -> %.0fMB (reclaimed %sMB)",
+                    trim_stats["rss_before_mb"], trim_stats["rss_after_mb"], trim_stats["reclaimed_mb"])
+    elif trim_stats.get("enabled"):
+        logger.info("[memory_profiler] malloc_trim probe enabled but did not run: %s", trim_stats.get("reason"))
 
     return {
         "rss_mb": rss_mb,
@@ -319,7 +389,9 @@ def run_memory_profile() -> dict:
         "dataframes_ndarrays": df_np_stats,
         "cache": cache_stats,
         "session_state": session_stats,
+        "threads": thread_stats,
         "tracemalloc": tm_stats,
+        "malloc_trim": trim_stats,
         "profile_seconds": elapsed,
     }
 
