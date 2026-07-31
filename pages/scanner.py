@@ -1530,34 +1530,34 @@ def _tv_link(symbol: str, css_class: str = "tv-link", pct_chg=None) -> str:
 
 def _tv_option_symbol(symbol: str, direction: str, strike, expiry: str) -> str:
     """Builds a TradingView NSE F&O *contract* symbol — e.g.
-    NSE:NIFTY25AUG2625000CE for symbol=NIFTY, direction=CE, strike=25000,
-    expiry=2026-08-25. TradingView's option-contract convention is
-    <UNDERLYING><DD><MMM><YY><STRIKE><CE|PE>: day zero-padded, month a
-    3-letter uppercase abbreviation, year 2-digit, strike as a bare
-    integer when it's a whole number (true for virtually every NSE F&O
-    strike). Returns "" if expiry/strike/direction don't parse cleanly —
-    callers fall back to a plain (non-linked) label in that case rather
-    than emitting a broken link.
+    NSE:NIFTY240314C22450 for symbol=NIFTY, direction=CE, strike=22450,
+    expiry=2024-03-14. Confirmed against TradingView's own docs
+    (https://in.tradingview.com/support/solutions/43000480528 — "How can
+    I open NSE options on the chart?"): <UNDERLYING><YYMMDD><C|P><STRIKE>
+    — 2-digit year/month/day (in that order, NOT day-month-year), a
+    single C/P letter (not CE/PE), and the strike as a bare number (NOT
+    ×1000 the way US OCC tickers pad it). Returns "" if expiry/strike/
+    direction don't parse cleanly — callers fall back to a plain
+    (non-linked) label in that case rather than emitting a broken link.
     """
     try:
         d = datetime.fromisoformat(str(expiry)[:10])
     except Exception:
         return ""
     direction = str(direction or "").upper().strip()
-    if direction not in ("CE", "PE"):
+    opt_letter = {"CE": "C", "PE": "P"}.get(direction)
+    if opt_letter is None:
         return ""
     try:
         strike_val = float(strike)
     except (TypeError, ValueError):
         return ""
     strike_str = f"{int(strike_val)}" if strike_val.is_integer() else f"{strike_val:g}"
-    day = f"{d.day:02d}"
-    mon = d.strftime("%b").upper()
-    yr = f"{d.year % 100:02d}"
+    yymmdd = d.strftime("%y%m%d")
     sym = str(symbol or "").upper().strip()
     if not sym:
         return ""
-    return f"NSE:{sym}{day}{mon}{yr}{strike_str}{direction}"
+    return f"NSE:{sym}{yymmdd}{opt_letter}{strike_str}"
 
 
 def _tv_option_link(symbol: str, direction: str, strike, expiry: str, css_class: str = "tv-link", label: str = None) -> str:
