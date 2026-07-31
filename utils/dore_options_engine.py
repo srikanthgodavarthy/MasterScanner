@@ -286,8 +286,18 @@ class OptionChainSnapshot:
             total_ce_oi=float(option_data.get("total_ce_oi") or 0.0),
             total_pe_oi=float(option_data.get("total_pe_oi") or 0.0),
             pcr=option_data.get("pcr"),
-            ce_wall_strike=option_data.get("ce_wall_strike"),
-            pe_wall_strike=option_data.get("pe_wall_strike"),
+            # 2026-07-31: utils.upstox_client.fetch_stock_atm_option()
+            # (stocks) names these ce_wall_strike/pe_wall_strike;
+            # fetch_oi_resistance() (indices) names the identical
+            # highest-OI-strike value ce_strike/pe_strike instead — same
+            # data, different key. Without this fallback, every index
+            # candidate silently lost its OI-wall bonus/reason in
+            # validate_oi_liquidity() even when the data was right there
+            # in option_data. Falls back only when the primary key is
+            # absent, so stock behavior (which always sets
+            # ce_wall_strike/pe_wall_strike) is unchanged.
+            ce_wall_strike=option_data.get("ce_wall_strike", option_data.get("ce_strike")),
+            pe_wall_strike=option_data.get("pe_wall_strike", option_data.get("pe_strike")),
         )
 
 
