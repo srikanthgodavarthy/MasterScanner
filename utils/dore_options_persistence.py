@@ -181,6 +181,19 @@ def _drift_pct(current_premium: Optional[float], entry_locked: Optional[float]) 
         return None
 
 
+def _plan_status_label(days_active: int, created_date: str, just_minted: bool) -> str:
+    """'Plan' column badge — 2026-07-31: there is no WAITING state in
+    this engine (unlike the legacy fo_setup_plans lifecycle) because a
+    contract's entry is locked the instant it's first seen, so every row
+    returned by enrich_trade_plans_with_persistence() is, by
+    construction, ACTIVE the moment it exists. This just makes that
+    state (and how long it's been true) visible on the table, which
+    previously showed no lifecycle information at all."""
+    if just_minted:
+        return f"🟢 Active (new · {created_date})"
+    return f"🟢 Active ({days_active}d · since {created_date})"
+
+
 def enrich_trade_plans_with_persistence(
     plans: list,
     existing_plans: dict,
@@ -228,6 +241,7 @@ def enrich_trade_plans_with_persistence(
             existing = existing_plans.get(key)
             if existing is not None and existing.is_open():
                 locked = existing
+                just_minted = False
             else:
                 # Fresh contract (or the prior entry for this exact key
                 # had already been closed) — mint + lock a new entry at
@@ -248,6 +262,7 @@ def enrich_trade_plans_with_persistence(
                     status=DoreOptionsPlanStatus.OPEN,
                 )
                 updated_plans.append(locked)
+                just_minted = True
 
             row["entry_locked"]     = locked.entry_locked or None
             row["saved_stop_loss"]  = locked.sl_locked
@@ -255,7 +270,9 @@ def enrich_trade_plans_with_persistence(
             row["saved_target2"]    = locked.target2_locked
             row["drift_pct"]        = _drift_pct(current_premium, locked.entry_locked)
             row["plan_created_at"] = locked.created_at
+            row["plan_created_date"] = locked.created_date
             row["plan_age_days"]    = _compute_days_active(locked.created_date)
+            row["plan_status_label"] = _plan_status_label(row["plan_age_days"], locked.created_date, just_minted)
             enriched_rows.append(row)
         except Exception:
             logger.exception("[dore_options_persistence] enrichment failed for one row — "
