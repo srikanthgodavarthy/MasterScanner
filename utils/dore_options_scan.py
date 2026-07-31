@@ -360,6 +360,45 @@ def compute_dore_options_scan(cfg: Optional[DoreOptionsSettings] = None) -> dict
     records = (latest or {}).get("payload", {}).get("data", []) or []
     live_pool = {r.get("Stock") or r.get("Symbol"): r for r in records if (r.get("Stock") or r.get("Symbol"))}
 
+    # [2026-08-03, SG request] DORE only trades options, so it should
+    # only ever rank/shortlist the subset of live_scanner's ~500-symbol
+    # universe that actually HAS listed derivatives (~180-220 of the
+    # Nifty 500 — see utils.upstox_client.fo_eligible_symbols()), not
+    # the full equity universe. Filtering here (before the shortlist
+    # cost-ranking in top_dore_trade_plans) rather than downstream
+    # means: (a) the shortlist's top-N cut is spent entirely on
+    # symbols that CAN produce a plan, instead of occasionally handing
+    # a slot to a non-F&O stock that will just hard-reject for
+    # "missing chain" and waste that cycle's option-chain fetch
+    # budget, and (b) diagnostics.universe_size below reflects the
+    # real tradeable universe, not the raw live_scanner count.
+    # Indices (_INDICES) are always F&O-eligible and aren't in
+    # fo_eligible_symbols()'s stock list, so they're kept unconditionally.
+    try:
+        from utils.upstox_client import fo_eligible_symbols
+        fo_symbols = fo_eligible_symbols()
+        if fo_symbols:
+            before = len(live_pool)
+            live_pool = {
+                sym: row for sym, row in live_pool.items()
+                if sym in fo_symbols or sym in _INDICES
+            }
+            logger.info(
+                "[dore_options_scan] filtered live_scanner universe to F&O-eligible "
+                "symbols: %d -> %d", before, len(live_pool),
+            )
+        else:
+            logger.warning(
+                "[dore_options_scan] fo_eligible_symbols() returned empty — "
+                "falling back to the full live_scanner universe this cycle "
+                "rather than filtering everything out"
+            )
+    except Exception:
+        logger.exception(
+            "[dore_options_scan] fo_eligible_symbols() failed — falling back "
+            "to the full live_scanner universe this cycle (non-fatal)"
+        )
+
     if not live_pool:
         logger.info("[dore_options_scan] live_scanner snapshot is empty this cycle — nothing to rank")
         return {"trade_plans": [], "rejections": [], "diagnostics": {"universe_size": 0}}

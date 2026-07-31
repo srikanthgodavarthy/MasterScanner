@@ -170,6 +170,12 @@ def start_background_scans() -> bool:
                     # stale/missing data and pile more load on a process
                     # that's already RAM/CPU constrained.
                     "require_fresh_live_scanner": (name == "dore_options_scan"),
+                    # [2026-08-03, SG request] DORE gets a 60s priority
+                    # window, live_scanner gets 3min — see
+                    # utils/scan_priority.py. Same coordinator instance
+                    # (module-level state) is shared with the live_scanner
+                    # thread started below.
+                    "priority_name": ("dore" if name == "dore_options_scan" else None),
                 },
                 name=f"scan-{name}", daemon=True,
             )
