@@ -1410,6 +1410,115 @@ def close_fo_setup_plan_manually(setup_id: str, reason: str = "Manual exit") -> 
         return False
 
 
+# ─── DORE OPTIONS ENGINE PLANS (locked entry premium — DORE Options tab,
+#     "DORE Options Engine (primary)" table) ────────────────────────────
+# See utils/dore_options_persistence.py for the DoreOptionsPlan dataclass
+# this wraps. Kept in its own table (dore_options_plans), separate from
+# fo_setup_plans, because the two pipelines (utils.dore_options_engine
+# vs. the legacy utils.fo_scan/dore_fo_screener) are architecturally
+# independent by design.
+
+def upsert_dore_options_plans_batch(plans: list[dict]) -> bool:
+    """Persist a batch of DoreOptionsPlan dicts (to_db_dict() output).
+    Upserts on plan_id. Returns True if all batches succeeded."""
+    client = get_client()
+    if client is None or not plans:
+        return False
+
+    def _safe(v):
+        if v is None:
+            return None
+        if isinstance(v, float) and (v != v):
+            return None
+        return v
+
+    clean = [{k: _safe(v) for k, v in p.items()} for p in plans]
+    try:
+        batch_size = 200
+        for i in range(0, len(clean), batch_size):
+            resp = _execute_with_retry(
+                client.table("dore_options_plans")
+                .upsert(clean[i: i + batch_size], on_conflict="plan_id")
+            )
+            if resp.data is None:
+                return False
+        return True
+    except Exception as exc:
+        logger.error("upsert_dore_options_plans_batch failed: %s", exc)
+        return False
+
+
+def _dore_options_plan_from_row(row: dict) -> "object":
+    from utils.dore_options_persistence import DoreOptionsPlan
+
+    return DoreOptionsPlan(
+        plan_id             = row.get("plan_id", ""),
+        symbol               = row.get("symbol", ""),
+        direction            = row.get("direction", ""),
+        strike               = float(row.get("strike", 0) or 0),
+        expiry               = str(row.get("expiry", "") or ""),
+        created_date         = str(row.get("created_date", "")),
+        created_at           = str(row.get("created_at", "") or ""),
+        entry_locked         = float(row.get("entry_locked", 0) or 0),
+        sl_locked            = row.get("sl_locked"),
+        target1_locked       = row.get("target1_locked"),
+        target2_locked       = row.get("target2_locked"),
+        confidence_at_entry  = float(row.get("confidence_at_entry", 0) or 0),
+        status               = row.get("status", "OPEN") or "OPEN",
+        closed_at            = str(row.get("closed_at", "") or ""),
+        closed_reason        = row.get("closed_reason", "") or "",
+    )
+
+
+def load_open_dore_options_plans() -> dict:
+    """Return every OPEN DORE Options locked entry as
+    {contract_key: DoreOptionsPlan}, where contract_key ==
+    symbol|direction|strike|expiry (DoreOptionsPlan.contract_key).
+    Called once per DORE Options Engine run to seed the in-memory
+    lookup enrich_trade_plans_with_persistence() reads/updates."""
+    client = get_client()
+    if client is None:
+        return {}
+    try:
+        resp = (
+            client.table("dore_options_plans")
+            .select("*")
+            .eq("status", "OPEN")
+            .execute()
+        )
+        if not resp.data:
+            return {}
+        result = {}
+        for row in resp.data:
+            plan = _dore_options_plan_from_row(row)
+            result[plan.contract_key] = plan
+        return result
+    except Exception as exc:
+        logger.error("load_open_dore_options_plans failed: %s", exc)
+        return {}
+
+
+def load_all_dore_options_plans(limit: int = 500) -> pd.DataFrame:
+    """All DORE Options locked entries (any status), for history/audit views."""
+    client = get_client()
+    if client is None:
+        return pd.DataFrame()
+    try:
+        resp = (
+            client.table("dore_options_plans")
+            .select("*")
+            .order("created_date", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        if not resp.data:
+            return pd.DataFrame()
+        return pd.DataFrame(resp.data)
+    except Exception as exc:
+        logger.error("load_all_dore_options_plans failed: %s", exc)
+        return pd.DataFrame()
+
+
 def load_watchlist_enriched(lc_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Return the watchlist joined with the latest lifecycle state for each symbol.
@@ -2124,6 +2233,46 @@ ALTER TABLE fo_setup_plans ADD COLUMN IF NOT EXISTS activation_price numeric(12,
 -- NULL here (no retroactive fabrication) and stay "—" in the
 -- persisted-plan live-quote backfill until they close and re-mint.
 ALTER TABLE fo_setup_plans ADD COLUMN IF NOT EXISTS expiry_date date;
+"""
+
+# Append dore_options_plans SQL to the canonical SCHEMA_SQL for easy
+# copy-paste. See utils/dore_options_persistence.py for the
+# DoreOptionsPlan dataclass this table backs — the DORE Options Engine's
+# (utils/dore_options_engine.py + utils/dore_options_scan.py) own
+# "lock the entry premium once" store, deliberately separate from
+# fo_setup_plans above (that one belongs to the older/legacy DORE 2.0
+# "fo_scan" pipeline).
+SCHEMA_SQL += """
+-- 9. DORE Options Engine Plans — locked entry premium (+ SL/T1/T2 at
+--    lock time) per option contract (symbol+direction+strike+expiry),
+--    used to compute Drift % against a saved entry rather than
+--    re-freezing it every scan tick. Run this in Supabase SQL Editor
+--    after the tables above.
+CREATE TABLE IF NOT EXISTS dore_options_plans (
+    plan_id                text        PRIMARY KEY,
+    symbol                  text        NOT NULL,
+    direction                text        NOT NULL,        -- 'CE' | 'PE'
+    strike                   numeric(12,2) NOT NULL DEFAULT 0,
+    expiry                   date,                          -- real calendar date, not a label
+
+    created_date              date        NOT NULL,
+    created_at                 timestamptz NOT NULL DEFAULT now(),
+
+    entry_locked               numeric(12,2) NOT NULL DEFAULT 0,
+    sl_locked                    numeric(12,2),
+    target1_locked               numeric(12,2),
+    target2_locked               numeric(12,2),
+    confidence_at_entry          numeric(6,2) NOT NULL DEFAULT 0,
+
+    status                      text        NOT NULL DEFAULT 'OPEN',   -- OPEN / CLOSED
+    closed_at                    timestamptz,
+    closed_reason                text        NOT NULL DEFAULT '',
+
+    updated_at                   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_dore_options_plans_symbol ON dore_options_plans(symbol);
+CREATE INDEX IF NOT EXISTS idx_dore_options_plans_status ON dore_options_plans(status);
+CREATE INDEX IF NOT EXISTS idx_dore_options_plans_date   ON dore_options_plans(created_date DESC);
 """
 
 

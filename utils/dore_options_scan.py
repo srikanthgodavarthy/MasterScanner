@@ -264,7 +264,26 @@ def top_dore_trade_plans(
             rejections.append(DoreRejection(symbol, "Exception", "Unhandled error — see logs"))
 
     ranked = rank_recommendations(plans)
-    df = pd.DataFrame([p.to_dict() for p in ranked])
+
+    # 2026-07-31: Persistent Trade Plan — lock each contract's entry
+    # premium the first time it's seen, then report Drift % against that
+    # saved entry on every later tick instead of re-freezing it. Kept
+    # fail-soft (falls back to plain to_dict() rows, no persistence
+    # fields) so a Supabase hiccup degrades the table, not the scan.
+    try:
+        from utils.dore_options_persistence import enrich_trade_plans_with_persistence
+        from utils.supabase_client import load_open_dore_options_plans, upsert_dore_options_plans_batch
+
+        existing_plans = load_open_dore_options_plans()
+        enriched_rows, updated_plans = enrich_trade_plans_with_persistence(ranked, existing_plans)
+        if updated_plans:
+            upsert_dore_options_plans_batch([p.to_db_dict() for p in updated_plans])
+        df = pd.DataFrame(enriched_rows)
+    except Exception:
+        logger.exception("[dore_options_scan] Trade-plan persistence enrichment failed "
+                          "(non-fatal, table renders without locked entry/Drift %%)")
+        df = pd.DataFrame([p.to_dict() for p in ranked])
+
     df.attrs["dore_rejections"] = [r.__dict__ for r in rejections]
     return df
 

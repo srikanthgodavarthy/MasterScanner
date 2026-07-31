@@ -385,6 +385,17 @@ class OptionTradePlan:
     current_price:        float
     market_regime:        Optional[str]
 
+    # 2026-07-31: current option premium (== primary.premium, restated at
+    # the top level so table renderers don't have to reach into the
+    # nested `primary` dict) alongside the option's own previous-close
+    # premium and the %-change between them (Premium %Chg, mirroring the
+    # underlying's own %Chg elsewhere in the app). All three are None
+    # when the feed doesn't carry a prior-close premium for this
+    # contract (e.g. a freshly-listed weekly strike) — never fabricated.
+    current_premium:       Optional[float] = None
+    premium_prev_close:    Optional[float] = None
+    premium_change_pct:    Optional[float] = None
+
     reasons:              list = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -849,10 +860,13 @@ def _exit_before_expiry_rule(dte: int) -> str:
 
 
 def _build_candidate(label: str, strike_data: dict, dir_: str, chain: OptionChainSnapshot,
-                      sig: MasterScannerSignal, settings: DoreOptionsSettings) -> tuple[StrikeCandidate, list[str], float, float]:
+                      sig: MasterScannerSignal, settings: DoreOptionsSettings) -> tuple[StrikeCandidate, list[str], float, float, bool, PremiumQuote]:
     """Builds one StrikeCandidate + its own OI/premium reasons, premium
     quality and OI quality (needed by Stage 8 for the Balanced/primary
-    leg only, but computed uniformly for all three)."""
+    leg only, but computed uniformly for all three). Also returns the
+    raw PremiumQuote so the caller can surface the contract's own
+    prior-close premium (Current Premium / Premium %Chg, 2026-07-31)
+    without re-reading the chain row itself."""
     strike = strike_data["strike"]
     row = chain.strike_premiums.get(strike) or chain.strike_premiums.get(round(strike, 2))
     quote = PremiumQuote.from_chain_row(row or {}, dir_)
@@ -883,7 +897,7 @@ def _build_candidate(label: str, strike_data: dict, dir_: str, chain: OptionChai
         risk_reward_ratio=rr,
     )
     ok = premium_ok and oi_ok
-    return candidate, (premium_reasons + oi_reasons), premium_quality, oi_quality, ok
+    return candidate, (premium_reasons + oi_reasons), premium_quality, oi_quality, ok, quote
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -930,9 +944,10 @@ def compute_dore_trade_plan(
     candidates: dict[str, StrikeCandidate] = {}
     all_reasons: list[str] = []
     primary_premium_quality = primary_oi_quality = 0.0
+    primary_quote: Optional[PremiumQuote] = None
     any_ok = False
     for label in (CONSERVATIVE, BALANCED, AGGRESSIVE):
-        candidate, reasons, premium_quality, oi_quality, ok = _build_candidate(
+        candidate, reasons, premium_quality, oi_quality, ok, quote = _build_candidate(
             label, strikes[label], dir_, chain, sig, settings,
         )
         candidates[label] = candidate
@@ -940,6 +955,7 @@ def compute_dore_trade_plan(
             any_ok = True
         if label == BALANCED:
             primary_premium_quality, primary_oi_quality = premium_quality, oi_quality
+            primary_quote = quote
             all_reasons.extend(reasons)
 
     if not any_ok:
@@ -957,6 +973,17 @@ def compute_dore_trade_plan(
     stop_loss = round(primary.premium * (1 - settings.stop_loss_premium_pct), 2) if primary.premium else None
     target1 = round(primary.premium * (1 + settings.target1_premium_pct), 2) if primary.premium else None
     target2 = round(primary.premium * (1 + settings.target2_premium_pct), 2) if primary.premium else None
+
+    # 2026-07-31: Current Premium / Premium %Chg — the option contract's
+    # own move today, distinct from the underlying's %Chg. prev_close
+    # here is the CONTRACT's prior-close premium (PremiumQuote.prev_close,
+    # from the chain row's ce_close/pe_close), not the stock's. Left as
+    # None (never 0.0) when the feed doesn't carry a prior-close premium
+    # for this contract, so the table renders "—" instead of a false 0%.
+    premium_prev_close = primary_quote.prev_close if primary_quote else None
+    premium_change_pct = None
+    if primary.premium and premium_prev_close:
+        premium_change_pct = round((primary.premium - premium_prev_close) / premium_prev_close * 100, 2)
 
     reasons = (
         [f"Conviction {sig.conviction:.0f}", f"Entry Quality {sig.entry_quality:.0f}",
@@ -988,6 +1015,9 @@ def compute_dore_trade_plan(
         target_price=sig.target_price,
         current_price=sig.current_price,
         market_regime=sig.market_regime,
+        current_premium=primary.premium,
+        premium_prev_close=premium_prev_close,
+        premium_change_pct=premium_change_pct,
         reasons=reasons,
     )
 
