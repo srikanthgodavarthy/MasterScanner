@@ -2183,29 +2183,6 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str) -> str:
 # numbers shown always foot exactly to what's persisted in
 # sector_snapshots.
 
-_SR_SECTOR_ICON = {
-    "Healthcare": "❤️", "Pharma": "💊", "Textiles": "🧵", "Banking": "🏦",
-    "Financials": "🏛️", "Media": "📺", "Chemicals": "🧪", "Engineering": "⚙️",
-    "IT": "💻", "Power": "⚡", "Auto": "🚗", "FMCG": "🛒", "Realty": "🏗️",
-    "Metals": "⛏️", "Oil & Gas": "🛢️", "Defence": "🛡️", "Cement": "🧱",
-    "Telecom": "📡", "Diversified": "🔀", "Capital Goods": "🏭",
-    "Consumer Durables": "🛋️",
-}
-
-_SR_DIRECTION_STYLE = {
-    "Rotating In":  ("#3fb950", "↑"),
-    "Stable":       ("#d29922", "→"),
-    "Rotating Out": ("#f85149", "↓"),
-}
-
-_SR_ACTION_STYLE = {
-    "BUY":        "#3fb950",
-    "ACCUMULATE": "#d29922",
-    "WATCH":      "#58a6ff",
-    "REDUCE":     "#f0883e",
-    "EXIT":       "#f85149",
-}
-
 _SR_CSS = """
 <style>
 .sr-wrap { font-family:'JetBrains Mono',monospace; color:#e6edf3; }
@@ -2283,78 +2260,6 @@ table.sr-se-table td.sr-se-cell { text-align:center; font-weight:700; border-rad
 """
 
 
-def _se_cell_color(pct) -> str:
-    """Green-to-red heatmap color for a 0-100 breadth %/momentum score,
-    loosely matching StockEdge's own Breadth/Scores color scale."""
-    if pct is None:
-        return "#2a3346"
-    try:
-        v = float(pct)
-    except (TypeError, ValueError):
-        return "#2a3346"
-    if v <= 40:
-        return "#f0883e" if v >= 25 else "#f85149"
-    if v <= 60:
-        return "#d29922"
-    if v <= 75:
-        return "#8fce6a"
-    if v <= 90:
-        return "#3fb950"
-    return "#1f9d55"
-
-
-def _se_cell_html(pct) -> str:
-    color = _se_cell_color(pct)
-    txt = f"{pct:.0f}%" if pct is not None and not pd.isna(pct) else "—"
-    return f'<td class="sr-se-cell" style="background:{color}">{txt}</td>'
-
-
-
-def _sr_tier_bucket_counts(stats: pd.DataFrame) -> dict:
-    """Elite/Execute/Watch counts + total, straight off build_sector_stats()."""
-    if stats is None or stats.empty:
-        return {"Elite": 0, "Execute": 0, "Watch": 0, "Total": 0}
-    elite = int(stats.get("EliteCount", pd.Series(dtype=int)).sum())
-    execute = int(stats.get("ExecuteCount", pd.Series(dtype=int)).sum())
-    watch = int(stats.get("WatchCount", pd.Series(dtype=int)).sum())
-    return {"Elite": elite, "Execute": execute, "Watch": watch,
-            "Total": elite + execute + watch}
-
-
-def _sr_prior_day_metrics(history: pd.DataFrame):
-    """Recompute rotation metrics as of the previous persisted scan date
-    (not today's), purely for vs-yesterday deltas. Returns (metrics_df,
-    day_stats_df) or (None, None) if fewer than 2 persisted days exist."""
-    from utils.sector_rotation import compute_rotation_metrics as _crm
-    if history is None or history.empty or "scan_date" not in history.columns:
-        return None, None
-    dates = sorted(history["scan_date"].unique())
-    if len(dates) < 2:
-        return None, None
-    prior_date = dates[-2]
-    day_rows = history[history["scan_date"] == prior_date].copy()
-    day_stats = day_rows.rename(columns={
-        "sector": "Sector", "avg_chg": "AvgChg", "opp_score": "OppScore",
-        "net_inflow_cr": "NetInflowCr", "elite_count": "EliteCount",
-        "execute_count": "ExecuteCount", "watch_count": "WatchCount",
-        "stock_count": "StockCount",
-    })
-    older_hist = history[history["scan_date"] < prior_date]
-    metrics = _crm(older_hist, day_stats)
-    return metrics, day_stats
-
-
-def _sr_bucket_opportunity_total(stats: pd.DataFrame, metrics: pd.DataFrame, direction: str) -> int:
-    """Elite+Execute+Watch summed over sectors currently classified in `direction`."""
-    if stats is None or stats.empty or metrics is None or metrics.empty:
-        return 0
-    merged = stats.merge(metrics[["Sector", "Direction"]], on="Sector", how="left")
-    bucket = merged[merged["Direction"] == direction]
-    if bucket.empty:
-        return 0
-    return int(bucket[["EliteCount", "ExecuteCount", "WatchCount"]].sum().sum())
-
-
 # ── NSE TOP GAINERS (right sidebar) ─────────────────────────────────
 # Reuses the live scan dataframe already loaded for the Actionable table
 # (Stock/%Chg/Recommendation) plus utils.sector_map.get_sector() for the
@@ -2414,282 +2319,166 @@ def _nse_top_gainers_html(df_aug: pd.DataFrame, top_n: int = 5) -> str:
     </div>"""
 
 
-def _sector_rotation_analysis_section(df_aug: pd.DataFrame, sector_stats: pd.DataFrame,
-                                       sector_history: pd.DataFrame, as_of, run_at: str) -> None:
-    """Renders the full Sector Rotation Analysis block: summary cards,
-    main dashboard table, Today's Sector Flow, Sector Rotation Timeline,
-    Top Sectors to Focus Today, How It's Calculated, footer. Call inside
-    an already-running Streamlit script (uses st.markdown/st.columns
-    directly rather than returning HTML, since the two-column layout
-    needs real st.columns)."""
-    from utils.sector_rotation import (compute_rotation_metrics, compute_rotation_timeline,
-                                        compute_sector_flow, compute_sector_breadth,
-                                        compute_stockedge_breadth, compute_sector_momentum_scores)
+# ── TODAY'S SECTOR FLOW (compact card) ──────────────────────────────
+# [Dashboard/Sectors split, 2026-07-31] Full Sector Rotation Analysis
+# (dashboard table, Timeline, StockEdge grids, "How It's Calculated",
+# footer) moved to its own page — pages/sectors.py. Dashboard keeps only
+# this compact Net-Inflow card, built from the SAME utils.sector_rotation.
+# compute_sector_flow(sector_stats) call the full page uses, plus an
+# st.page_link back to it — so the two never show different numbers,
+# they just show a different amount of detail.
+def _today_sector_flow_compact_html(flow: dict) -> str:
+    inflow_rows = "".join(
+        f'<div class="sr-flow-row"><span>↑ {s}</span><span class="sr-pos">+{v:.0f} Cr</span></div>'
+        for s, v in flow.get("inflow", [])
+    ) or '<div style="color:#8b949e;font-size:0.75rem;">—</div>'
+    outflow_rows = "".join(
+        f'<div class="sr-flow-row"><span>↓ {s}</span><span class="sr-neg">{v:.0f} Cr</span></div>'
+        for s, v in flow.get("outflow", [])
+    ) or '<div style="color:#8b949e;font-size:0.75rem;">—</div>'
+    net = flow.get("net", 0) or 0
 
-    st.markdown(_SR_CSS, unsafe_allow_html=True)
-
-    sector_breadth = compute_sector_breadth(df_aug)
-    rotation_metrics = compute_rotation_metrics(sector_history, sector_stats, sector_breadth)
-    timeline = compute_rotation_timeline(sector_history)
-    flow = compute_sector_flow(sector_stats)
-
-    st.markdown('<div class="sr-wrap">', unsafe_allow_html=True)
-    st.markdown('<div class="sr-panel-title" style="font-size:1rem;">📊 SECTOR ROTATION ANALYSIS</div>'
-                 '<div style="font-size:0.78rem;color:#8b949e;margin-bottom:4px;">'
-                 'Identify where money is moving and which sectors offer the best opportunities</div>',
-                 unsafe_allow_html=True)
-
-    # ── main dashboard table + right column ────────────────────────
-    col_left, col_right = st.columns([1.6, 1])
-
-    with col_left:
-        rows_html = ""
-        for i, (_, r) in enumerate(rotation_metrics.iterrows(), start=1):
-            sector = r["Sector"]
-            icon = _SR_SECTOR_ICON.get(sector, "🏷️")
-            m5, m20 = r["Mom5D"], r["Mom20D"]
-            direction = r["Direction"]
-            dcolor, darrow = _SR_DIRECTION_STYLE.get(direction, ("#8b949e", "→"))
-            action = r["SuggestedAction"]
-            acolor = _SR_ACTION_STYLE.get(action, "#8b949e")
-            breadth = r.get("BreadthScore")
-            bcolor = {"Bullish": "#3fb950", "Neutral": "#d29922", "Bearish": "#f85149"}.get(
-                r.get("BreadthBucket"), "#8b949e")
-            breadth_cell = f'<span style="color:{bcolor}">{breadth:.0f}%</span>' if breadth is not None else "—"
-            rows_html += (
-                "<tr>"
-                f"<td>{i}</td>"
-                f'<td><span class="sr-sector-name">{icon} {sector}</span></td>'
-                f'<td class="{"sr-pos" if m5 >= 0 else "sr-neg"}">{"+" if m5 >= 0 else ""}{m5:.1f}%</td>'
-                f'<td class="{"sr-pos" if m20 >= 0 else "sr-neg"}">{"+" if m20 >= 0 else ""}{m20:.1f}%</td>'
-                f"<td>{breadth_cell}</td>"
-                f'<td style="color:{dcolor}">{direction} {darrow}</td>'
-                f'<td><span class="sr-action-badge" style="background:{acolor}22;color:{acolor};border:1px solid {acolor}">{action}</span></td>'
-                "</tr>"
-            )
-
-        table_html = (
-            '<div class="sr-panel">'
-            '<div class="sr-panel-title">SECTOR ROTATION DASHBOARD</div>'
-            '<table class="sr-table">'
-            "<tr><th>#</th><th>SECTOR</th><th>5D MOMENTUM</th><th>20D MOMENTUM</th>"
-            "<th>BREADTH</th><th>DIRECTION</th><th>SUGGESTED ACTION</th></tr>"
-            f"{rows_html}"
-            "</table>"
-            '<div style="font-size:0.65rem;color:#8b949e;margin-top:8px;">'
-            "Momentum is the cumulative %Chg over trailing persisted scan dates (proxy for a day-count window until "
-            "more history accumulates). Breadth is the % of sector constituents with RSI&gt;50, positive composite RS, "
-            "and price in an uptrend (StockEdge-style breadth read) &mdash; it's the primary input to Direction/Suggested "
-            "Action, with price momentum as a secondary weight."
-            "</div>"
-            "</div>"
-        )
-        st.markdown(table_html, unsafe_allow_html=True)
-
-    with col_right:
-        # ── Top sectors to focus today — moved here, above Today's
-        #    Sector Flow, so it's the first thing in the right column. ──
-        top3 = rotation_metrics.sort_values("RotationStrength", ascending=False).head(3).reset_index(drop=True)
-        rank_colors = ["#3fb950", "#d29922", "#58a6ff"]
-        focus_html = '<div class="sr-focus-cards">'
-        for i, (_, r) in enumerate(top3.iterrows()):
-            sector = r["Sector"]
-            icon = _SR_SECTOR_ICON.get(sector, "🏷️")
-            strength = r["RotationStrength"]
-            action = r["SuggestedAction"]
-            acolor = _SR_ACTION_STYLE.get(action, "#8b949e")
-            focus_html += f"""
-            <div class="sr-focus-card">
-              <span class="sr-focus-rank" style="background:{rank_colors[i]}">{i+1}</span> {icon}
-              <div class="sr-focus-name">{sector}</div>
-              <div class="sr-focus-score-label">Rotation Strength (Composite)</div>
-              <div class="sr-focus-score">{strength:.0f}<span style="font-size:0.9rem;color:#8b949e">/100</span></div>
-              <div class="sr-focus-score-label" style="margin-top:6px;">Suggested Action
-                <span class="sr-action-badge" style="background:{acolor}22;color:{acolor};border:1px solid {acolor};margin-left:4px;">{action}</span>
-              </div>
-            </div>"""
-        focus_html += "</div>"
-        st.markdown(f'<div class="sr-panel-title">TOP SECTORS TO FOCUS TODAY</div>{focus_html}',
-                     unsafe_allow_html=True)
-
-        # ── Today's Sector Flow ─────────────────────────────────────
-        inflow_rows = "".join(
-            f'<div class="sr-flow-row"><span>↑ {s}</span><span class="sr-pos">+{v:.0f} Cr</span></div>'
-            for s, v in flow["inflow"]
-        ) or '<div style="color:#8b949e;font-size:0.75rem;">—</div>'
-        outflow_rows = "".join(
-            f'<div class="sr-flow-row"><span>↓ {s}</span><span class="sr-neg">{v:.0f} Cr</span></div>'
-            for s, v in flow["outflow"]
-        ) or '<div style="color:#8b949e;font-size:0.75rem;">—</div>'
-
-        st.markdown(f"""
-        <div class="sr-panel" style="margin-top:16px;">
-          <div class="sr-panel-title">TODAY'S SECTOR FLOW <span style="color:#8b949e;font-weight:400;">(Net Inflow)</span></div>
-          <div style="display:flex;gap:16px;">
-            <div style="flex:1;">
-              <div class="sr-flow-col-title" style="color:#3fb950;">TOP INFLOW SECTORS</div>
-              {inflow_rows}
-            </div>
-            <div style="flex:1;">
-              <div class="sr-flow-col-title" style="color:#f85149;">TOP OUTFLOW SECTORS</div>
-              {outflow_rows}
-            </div>
-          </div>
-          <div style="border-top:1px solid #1e293b;margin-top:10px;padding-top:8px;font-size:0.75rem;
-                       display:flex;justify-content:space-between;">
-            <span>Net Inflow (Today): <b class="{'sr-pos' if flow['net']>=0 else 'sr-neg'}">
-              {'+' if flow['net']>=0 else ''}{flow['net']:.0f} Cr</b></span>
-          </div>
+    return f"""
+    <div class="sr-panel">
+      <div class="sr-panel-title">TODAY'S SECTOR FLOW <span style="color:#8b949e;font-weight:400;">(Net Inflow)</span></div>
+      <div style="display:flex;gap:16px;">
+        <div style="flex:1;">
+          <div class="sr-flow-col-title" style="color:#3fb950;">TOP INFLOW SECTORS</div>
+          {inflow_rows}
         </div>
-        """.strip(), unsafe_allow_html=True)
-
-        # ── Sector Rotation Timeline ─────────────────────────────────
-        if timeline:
-            dates, ranks = timeline["dates"], timeline["ranks"]
-            n_rows = max(len(r) for r in ranks)
-            prior_ranks = {s: idx for idx, s in enumerate(ranks[-2])} if len(ranks) >= 2 else {}
-            n_cols = len(dates)
-            header_labels = []
-            for idx in range(n_cols):
-                back = (n_cols - 1) - idx
-                header_labels.append("Today" if back == 0 else f"{back}D Ago")
-            header = "".join(f"<th>{h}</th>" for h in header_labels)
-
-            body_rows = ""
-            for row_i in range(n_rows):
-                cells = ""
-                for col_i, day_list in enumerate(ranks):
-                    if row_i >= len(day_list):
-                        cells += "<td>—</td>"
-                        continue
-                    sector = day_list[row_i]
-                    is_today = (col_i == n_cols - 1)
-                    if is_today and sector in prior_ranks:
-                        prior_pos = prior_ranks[sector]
-                        if prior_pos > row_i:
-                            arrow, acol = " ↑", "#3fb950"
-                        elif prior_pos < row_i:
-                            arrow, acol = " ↓", "#f85149"
-                        else:
-                            arrow, acol = "", "#8b949e"
-                    else:
-                        arrow, acol = "", "#8b949e"
-                    pill_color = "#58a6ff22" if not is_today else "#3fb95022"
-                    text_color = "#58a6ff" if not is_today else "#3fb950"
-                    cells += (f'<td><span class="sr-tl-pill" style="background:{pill_color};color:{text_color}">'
-                              f'{sector}<span style="color:{acol}">{arrow}</span></span></td>')
-                body_rows += f"<tr>{cells}</tr>"
-
-            st.markdown(f"""
-            <div class="sr-panel" style="margin-top:16px;">
-              <div class="sr-panel-title">SECTOR ROTATION TIMELINE <span style="color:#8b949e;font-weight:400;">(Top {n_rows} Sectors)</span></div>
-              <div class="sr-timeline">
-                <table><tr>{header}</tr>{body_rows}</table>
-              </div>
-              <div style="font-size:0.65rem;color:#8b949e;margin-top:8px;">
-                ↑ Moved Up &nbsp; ↓ Moved Down &nbsp; — No Change (vs previous persisted scan date)
-              </div>
-            </div>
-            """.strip(), unsafe_allow_html=True)
-        else:
-            st.markdown("""
-            <div class="sr-panel" style="margin-top:16px;">
-              <div class="sr-panel-title">SECTOR ROTATION TIMELINE</div>
-              <div style="color:#8b949e;font-size:0.75rem;">Builds up as more scan days are persisted — needs at least 2.</div>
-            </div>
-            """.strip(), unsafe_allow_html=True)
-
-        # ── How it's calculated ───────────────────────────────────────
-        st.markdown("""
-        <div class="sr-panel" style="margin-top:16px;">
-          <div class="sr-panel-title">HOW SECTOR ROTATION IS CALCULATED</div>
-          <div class="sr-calc-row">
-            <div class="sr-calc-item"><div class="sr-calc-icon">📈</div>Leadership Momentum<br>vs 20D ago</div>
-            <div class="sr-calc-item"><div class="sr-calc-icon">📋</div>Entry Quality Momentum<br>vs 20D ago</div>
-            <div class="sr-calc-item"><div class="sr-calc-icon">📊</div>New Opportunities<br>Increase in actionable setups</div>
-            <div class="sr-calc-item"><div class="sr-calc-icon">💰</div>Money Flow<br>5D Net Inflow/Outflow</div>
-          </div>
+        <div style="flex:1;">
+          <div class="sr-flow-col-title" style="color:#f85149;">TOP OUTFLOW SECTORS</div>
+          {outflow_rows}
         </div>
-        """.strip(), unsafe_allow_html=True)
-
-    # ── StockEdge-style Breadth & Momentum Scores (real SMA20/50/100 +
-    #    55-bar RS breadth, and 1M/3M/6M momentum scores) ──────────────
-    se_breadth = compute_stockedge_breadth(df_aug)
-    se_momentum = compute_sector_momentum_scores(df_aug)
-    if not se_breadth.empty or not se_momentum.empty:
-        st.markdown(
-            '<div class="sr-panel" style="margin-top:16px;">'
-            '<div class="sr-panel-title">📱 STOCKEDGE-STYLE SECTOR GRIDS</div>'
-            '<div style="font-size:0.7rem;color:#8b949e;margin-bottom:10px;">'
-            "% of each sector's stocks clearing RS55&gt;0 / RSI&gt;50 / SMA20 / SMA50 / SMA100, "
-            "and 1M/3M/6M momentum scores (Bearish 0-40 / Neutral 41-60 / Bullish 61-100) &mdash; "
-            "RSI&gt;50 and SMA20/50/100 are exact; RS55 and the 0-100 momentum scale are our own "
-            "excess-return-vs-Nifty proxies, since StockEdge's own RS/scoring formulas aren't published."
-            "</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        tab_breadth, tab_scores = st.tabs(["Breadth", "Scores"])
-
-        with tab_breadth:
-            if se_breadth.empty:
-                st.caption("No breadth data yet — needs at least one completed scan.")
-            else:
-                bdf = se_breadth.sort_values("BreadthScore", ascending=False)
-                rows_html = "".join(
-                    "<tr>"
-                    f'<td style="text-align:left;">{_SR_SECTOR_ICON.get(r["Sector"], "🏷️")} {r["Sector"]}<br>'
-                    f'<span style="font-size:0.62rem;color:#8b949e;">{int(r["StockCount"])} stocks</span></td>'
-                    f'{_se_cell_html(r["PctRs55Positive"])}'
-                    f'{_se_cell_html(r["PctRsiAbove50"])}'
-                    f'{_se_cell_html(r["PctAboveSma20"])}'
-                    f'{_se_cell_html(r["PctAboveSma50"])}'
-                    f'{_se_cell_html(r["PctAboveSma100"])}'
-                    "</tr>"
-                    for _, r in bdf.iterrows()
-                )
-                table_html = (
-                    '<table class="sr-se-table">'
-                    "<tr><th>Sector</th><th>RS55&gt;0</th><th>RSI&gt;50</th>"
-                    "<th>SMA20</th><th>SMA50</th><th>SMA100</th></tr>"
-                    f"{rows_html}"
-                    "</table>"
-                )
-                st.markdown(table_html, unsafe_allow_html=True)
-
-        with tab_scores:
-            if se_momentum.empty:
-                st.caption("No momentum-score data yet — needs RS1m/RS3m/RS6m from a completed scan.")
-            else:
-                mdf = se_momentum.sort_values("Momentum3M", ascending=False)
-                rows_html = "".join(
-                    "<tr>"
-                    f'<td style="text-align:left;">{_SR_SECTOR_ICON.get(r["Sector"], "🏷️")} {r["Sector"]}<br>'
-                    f'<span style="font-size:0.62rem;color:#8b949e;">{int(r["StockCount"])} stocks</span></td>'
-                    f'{_se_cell_html(r["Momentum1M"])}'
-                    f'{_se_cell_html(r["Momentum3M"])}'
-                    f'{_se_cell_html(r["Momentum6M"])}'
-                    "</tr>"
-                    for _, r in mdf.iterrows()
-                )
-                table_html = (
-                    '<table class="sr-se-table">'
-                    "<tr><th>Sector</th><th>1M</th><th>3M</th><th>6M</th></tr>"
-                    f"{rows_html}"
-                    "</table>"
-                )
-                st.markdown(table_html, unsafe_allow_html=True)
-
-    # ── footer ──────────────────────────────────────────────────────
-    scanned = len(df_aug)
-    scan_time = as_of.strftime("%H:%M:%S IST") if run_at else "—"
-    st.markdown(f"""
-      <div class="sr-footer">
-        <div>Universe: NIFTY 500 &nbsp;&middot;&nbsp; Scanned: {scanned} / 500 &nbsp;&middot;&nbsp; Data Source: Scanner (MasterScanner)</div>
-        <div>Last Scan: {scan_time}</div>
       </div>
-    </div>
-    """.strip(), unsafe_allow_html=True)
+      <div style="border-top:1px solid #1e293b;margin-top:10px;padding-top:8px;font-size:0.75rem;
+                   display:flex;justify-content:space-between;">
+        <span>Net Inflow (Today): <b class="{'sr-pos' if net >= 0 else 'sr-neg'}">
+          {'+' if net >= 0 else ''}{net:.0f} Cr</b></span>
+      </div>
+    </div>""".strip()
+
+
+# ── LIVE SCANNER SNAPSHOT (compact card) ────────────────────────────
+# Small read-only preview of currently-locked equity setups — reuses the
+# SetupAge/EntryLocked/EntryDriftPct columns utils.setup_persistence
+# already merges onto df_aug for the Scanner page's own tables (see
+# utils/setup_persistence.py's scanner_row["SetupAge"/"EntryLocked"/
+# "EntryDriftPct"]), just a narrower column set and fewer rows. The full
+# equity Active Plans tab (with status, targets, R:R, etc.) stays on the
+# Scanner page — this is only a glance, not a replacement for it.
+def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
+    need = {"Stock", "%Chg", "SetupAge", "EntryLocked", "EntryDriftPct"}
+    if df_aug is None or df_aug.empty or not need.issubset(df_aug.columns):
+        return ('<div class="sr-panel"><div class="sr-panel-title">LIVE SCANNER SNAPSHOT</div>'
+                '<div style="color:#8b949e;font-size:0.75rem;">No scan data yet.</div></div>')
+
+    work = df_aug.copy()
+    work["SetupAge"] = work["SetupAge"].astype(str)
+    work = work[work["SetupAge"].str.strip().replace({"nan": "", "None": ""}) != ""]
+    work["%Chg"] = pd.to_numeric(work["%Chg"], errors="coerce")
+    work = work.dropna(subset=["%Chg"]).sort_values("%Chg", ascending=False).head(top_n)
+
+    if work.empty:
+        return ('<div class="sr-panel"><div class="sr-panel-title">LIVE SCANNER SNAPSHOT</div>'
+                '<div style="color:#8b949e;font-size:0.75rem;">No active setups right now.</div></div>')
+
+    rows_html = ""
+    for _, r in work.iterrows():
+        symbol = r.get("Stock", "—")
+        chg = r["%Chg"]
+        entry = r.get("EntryLocked")
+        drift = r.get("EntryDriftPct")
+        drift_val = float(drift) if drift not in (None, "") and pd.notna(drift) else None
+        rows_html += (
+            "<tr>"
+            f'<td><span class="sr-sector-name" style="font-weight:700;">{_tv_link(str(symbol), pct_chg=chg) if symbol != "—" else symbol}</span></td>'
+            f'<td class="{"sr-pos" if chg >= 0 else "sr-neg"}">{"+" if chg >= 0 else ""}{chg:.2f}%</td>'
+            f"<td>{r.get('SetupAge', '—')}</td>"
+            f"<td>{f'{float(entry):,.2f}' if entry not in (None, '') and pd.notna(entry) else '—'}</td>"
+            f'<td class="{"sr-pos" if (drift_val or 0) >= 0 else "sr-neg"}">{f"{"+" if drift_val >= 0 else ""}{drift_val:.2f}%" if drift_val is not None else "—"}</td>'
+            "</tr>"
+        )
+
+    return f"""
+    <div class="sr-panel">
+      <div class="sr-panel-title">LIVE SCANNER SNAPSHOT</div>
+      <table class="sr-table">
+        <tr><th>SYMBOL</th><th>%CHG</th><th>SETUP AGE</th><th>ENTRY</th><th>DRIFT</th></tr>
+        {rows_html}
+      </table>
+    </div>"""
+
+
+# ── ACTIVE OPTIONS PLANS (compact card) ─────────────────────────────
+# Compact read of every currently-OPEN DoreOptionsPlan, reusing
+# utils.dore_options_persistence.active_plan_rows() — the exact same
+# persisted-plan rows pages/scanner.py's own Active Plans tab shows, just
+# a narrower column set (Symbol / Direction / Strike / Status / Entry
+# (Locked) / Last Known Premium / P&L / Stop Loss / Target 1) and capped
+# to top_n most-recently-locked plans. No separate loop, no new
+# persistence — this is purely a smaller read of the same table.
+def _active_options_plans_html(top_n: int = 6) -> str:
+    try:
+        from utils.supabase_client import load_open_dore_options_plans, _is_available
+        from utils.dore_options_persistence import active_plan_rows
+    except Exception:
+        return ('<div class="sr-panel"><div class="sr-panel-title">ACTIVE OPTIONS PLANS</div>'
+                '<div style="color:#8b949e;font-size:0.75rem;">Plan persistence isn\'t available right now.</div></div>')
+
+    if not _is_available():
+        return ('<div class="sr-panel"><div class="sr-panel-title">ACTIVE OPTIONS PLANS</div>'
+                '<div style="color:#8b949e;font-size:0.75rem;">Supabase isn\'t configured — '
+                'Options plan persistence requires it.</div></div>')
+
+    try:
+        open_plans = load_open_dore_options_plans()
+        rows = active_plan_rows(open_plans) if open_plans else []
+    except Exception:
+        logger.exception("Dashboard Active Options Plans card failed to load (non-fatal)")
+        rows = []
+
+    if not rows:
+        return ('<div class="sr-panel"><div class="sr-panel-title">ACTIVE OPTIONS PLANS</div>'
+                '<div style="color:#8b949e;font-size:0.75rem;">No open DORE Options plans right now.</div></div>')
+
+    def _money(v):
+        return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
+
+    rows_html = ""
+    for r in rows[:top_n]:
+        direction = r.get("direction", "")
+        dir_color = "#3fb950" if direction == "CE" else "#f85149" if direction == "PE" else "#8b949e"
+        entry = r.get("entry_locked")
+        last_premium = r.get("last_premium")
+        pnl_html = "—"
+        if entry not in (None, "") and pd.notna(entry) and last_premium not in (None, "") and pd.notna(last_premium):
+            pnl = last_premium - entry
+            pcolor = "#3fb950" if pnl >= 0 else "#f85149"
+            pnl_html = f'<span style="color:{pcolor};font-weight:700;">{"+" if pnl >= 0 else ""}{_money(pnl)}</span>'
+        rows_html += (
+            "<tr>"
+            f'<td style="font-weight:700;">{r.get("symbol", "—")}</td>'
+            f'<td style="color:{dir_color};font-weight:700;">{direction or "—"}</td>'
+            f"<td>{r.get('strike', '—')}</td>"
+            f"<td>{r.get('plan_status_label', '—')}</td>"
+            f'<td style="font-weight:700;">{_money(entry)}</td>'
+            f"<td>{_money(last_premium)}</td>"
+            f"<td>{pnl_html}</td>"
+            f"<td>{_money(r.get('saved_stop_loss'))}</td>"
+            f"<td>{_money(r.get('saved_target1'))}</td>"
+            "</tr>"
+        )
+
+    return f"""
+    <div class="sr-panel">
+      <div class="sr-panel-title">ACTIVE OPTIONS PLANS</div>
+      <table class="sr-table">
+        <tr><th>SYMBOL</th><th>DIR</th><th>STRIKE</th><th>STATUS</th><th>ENTRY (LOCKED)</th>
+            <th>LAST KNOWN PREMIUM</th><th>P&amp;L</th><th>STOP LOSS</th><th>TARGET 1</th></tr>
+        {rows_html}
+      </table>
+    </div>"""
 
 
 # 2026-07-23: rewritten to be event-aware. scheduler/scan_worker.py computes
@@ -3338,19 +3127,28 @@ def render(settings: dict | None = None):
     _news_impact_panel()
 
 
-    # ── Full Sector Rotation Analysis — everything sector-related lives
-    #    here now and only here: summary cards (Rotating In/Stable/Out,
-    #    Total Opportunities, Net Inflow), the detailed dashboard table,
-    #    Today's Sector Flow, Sector Rotation Timeline, StockEdge-style
-    #    Breadth & Momentum-Score grids, How It's Calculated, and Top
-    #    Sectors To Focus Today. 2026-07-27: consolidated out of the top
-    #    strip and right-sidebar widgets, which duplicated (and, for the
-    #    sidebar's 1D-Ago/Today columns, under-populated) these same
-    #    numbers in three different places — this is now the one place.
-    #    Expanded by default since it no longer has an always-visible
-    #    summary elsewhere on the page. ───────────────────────────────
-    if not df_aug.empty:
-        _as_of = pd.to_datetime(run_at).tz_convert(_IST) if run_at else _now_ist()
-        with st.expander("📊 Sector Rotation Analysis (table, breadth & momentum grids, flow, timeline, focus sectors)",
-                          expanded=True):
-            _sector_rotation_analysis_section(df_aug, sector_stats, sector_history, _as_of, run_at)
+    # ── Today's Sector Flow (compact) + Live Scanner Snapshot ─────────
+    # [Dashboard/Sectors split, 2026-07-31] The full Sector Rotation
+    # Analysis (dashboard table, Timeline, StockEdge grids, "How It's
+    # Calculated", footer) moved to its own page — pages/sectors.py.
+    # Dashboard keeps only the compact Net-Inflow flow card (same
+    # compute_sector_flow(sector_stats) numbers as the full page) side
+    # by side with a small preview of currently-locked equity setups,
+    # plus a link across to the full page for anyone who wants the rest.
+    from utils.sector_rotation import compute_sector_flow
+    flow = compute_sector_flow(sector_stats)
+
+    flow_col, snap_col = st.columns([1, 1], gap="medium")
+    with flow_col:
+        st.markdown(_today_sector_flow_compact_html(flow), unsafe_allow_html=True)
+        _sectors_page = settings.get("sectors_page")
+        if _sectors_page is not None:
+            st.page_link(_sectors_page, label="View full Sector Rotation Analysis →", icon="🧭")
+    with snap_col:
+        st.markdown(_live_scanner_snapshot_html(df_aug), unsafe_allow_html=True)
+
+    # ── Active Options Plans (compact) ────────────────────────────────
+    # Every currently-OPEN DoreOptionsPlan, narrowed to the columns most
+    # useful at a glance. The full Active Plans tab (with Days Active,
+    # Last Seen, Target 2, etc.) stays on the Scanner page.
+    st.markdown(_active_options_plans_html(), unsafe_allow_html=True)
