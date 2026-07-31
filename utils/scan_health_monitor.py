@@ -170,6 +170,16 @@ def check_health(job_name: str) -> HealthDecision:
     except Exception:
         logger.exception("scan_health_monitor: flush-backlog check failed (non-fatal)")
 
+    # No-op unless MASTERSCANNER_MEMORY_PROFILE=1 is set — see
+    # utils/memory_profiler.py's module docstring. Safe to call on every
+    # check_health() invocation; the profiler's own internal throttle
+    # (not this module's) decides whether it actually does anything.
+    try:
+        from utils.memory_profiler import maybe_log_memory_profile
+        maybe_log_memory_profile()
+    except Exception:
+        logger.exception("scan_health_monitor: memory_profiler hook failed (non-fatal)")
+
     with _records_lock:
         rec = _cycle_records.get(job_name)
     if rec is not None and rec.last_completed_at:
