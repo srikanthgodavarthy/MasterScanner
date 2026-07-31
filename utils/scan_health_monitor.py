@@ -102,6 +102,46 @@ _cycle_records: dict[str, _CycleRecord] = {}
 _records_lock = threading.Lock()
 
 
+def _malloc_trim_reclaim() -> float:
+    """
+    Call glibc's malloc_trim(0) to release freed-but-unreturned arena
+    pages back to the OS. Safe: only touches already-freed heap, never
+    live Python objects — confirmed via utils/memory_profiler.py's
+    malloc_trim probe, which measured 42-59% of RSS as reclaimable this
+    way on this workload (multiple ThreadPoolExecutor pools doing bursty
+    allocate/free cycles fragment glibc's per-thread malloc arenas; see
+    MALLOC_ARENA_MAX env var for the underlying fix — this call is a
+    cheap safety net for the gap before that setting is confirmed to
+    hold over a full trading day).
+
+    Returns MB reclaimed (0.0 if unavailable or nothing was reclaimed).
+    """
+    if not _PSUTIL_AVAILABLE:
+        return 0.0
+    try:
+        import ctypes
+        proc = psutil.Process()
+        rss_before = proc.memory_info().rss / (1024 * 1024)
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+        rss_after = proc.memory_info().rss / (1024 * 1024)
+        reclaimed = rss_before - rss_after
+        if reclaimed > 0:
+            logger.info(
+                "[scan_health_monitor] malloc_trim reclaimed %.1fMB (%.0fMB -> %.0fMB)",
+                reclaimed, rss_before, rss_after,
+            )
+        return max(0.0, reclaimed)
+    except (OSError, AttributeError) as e:
+        # OSError: libc.so.6 not found (non-glibc platform, e.g. macOS/musl)
+        # AttributeError: malloc_trim not exposed on this libc
+        logger.warning("[scan_health_monitor] malloc_trim unavailable: %s", e)
+        return 0.0
+    except Exception:
+        logger.exception("scan_health_monitor: malloc_trim failed (non-fatal)")
+        return 0.0
+
+
 def record_cycle_result(job_name: str, ok: bool) -> None:
     """Call once at the end of every completed (or failed) cycle. Used by
     check_health()'s stale-cycle check to detect a loop that's silently
@@ -150,8 +190,29 @@ def check_health(job_name: str) -> HealthDecision:
             logger.exception("scan_health_monitor: CPU check failed (non-fatal)")
 
         if ram_mb >= RAM_CRITICAL_MB:
-            action = "skip_cycle"
-            reasons.append(f"RAM {ram_mb:.0f}MB >= critical {RAM_CRITICAL_MB}MB")
+            # Give it one cheap chance to reclaim fragmented glibc arena
+            # memory before actually skipping the cycle — malloc_trim only
+            # returns already-freed pages, so this is safe to call
+            # unconditionally here (see _malloc_trim_reclaim's docstring).
+            reclaimed = _malloc_trim_reclaim()
+            if reclaimed > 0:
+                try:
+                    ram_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+                except Exception:
+                    logger.exception("scan_health_monitor: post-trim RAM re-check failed (non-fatal)")
+
+            if ram_mb >= RAM_CRITICAL_MB:
+                action = "skip_cycle"
+                reasons.append(
+                    f"RAM {ram_mb:.0f}MB >= critical {RAM_CRITICAL_MB}MB"
+                    + (f" (post-trim, reclaimed {reclaimed:.0f}MB)" if reclaimed > 0 else "")
+                )
+            else:
+                logger.info(
+                    "[scan_health_monitor] %s -> proceed (RAM was >= critical, "
+                    "malloc_trim reclaimed %.0fMB, now %.0fMB)",
+                    job_name, reclaimed, ram_mb,
+                )
         elif ram_mb >= RAM_WARN_MB:
             action = "slow_down"
             reasons.append(f"RAM {ram_mb:.0f}MB >= warn {RAM_WARN_MB}MB")
