@@ -29,6 +29,8 @@ score (Section 5).
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from typing import Optional
 
 import pandas as pd
@@ -1071,6 +1073,68 @@ def top_futures_opportunities(top_n: int = 15, universe: Optional[list[str]] = N
 top_options_opportunities = top_fo_opportunities
 
 
+# ══════════════════════════════════════════════════════════════════
+#  [2026-08-02] Untangling the legacy options funnel from the 60s
+#  futures cadence.
+#
+#  compute_fo_scan() used to rerun BOTH top_futures_opportunities() and
+#  top_options_opportunities() every single 60s cycle, unconditionally,
+#  forever. That was fine when this was the only options pipeline —
+#  but since the 2026-07-31 DORE Options Engine integration
+#  (utils/dore_options_scan.py), the LEGACY options funnel here exists
+#  for exactly one purpose: the "Legacy DORE 2.0" comparison radio in
+#  pages/scanner.py's Options tab (default OFF — primary source is
+#  dore_options_scan). It was still doing a FULL real option-chain
+#  fetch, for the full universe, every 60s, in parallel with
+#  dore_options_scan's own 60s option-chain fetch for largely the same
+#  symbols — the two pipelines contending for the same rate-limited
+#  Upstox endpoint every single cycle is the direct cause of the
+#  "Upstox rate-limited on option-chain..." spam seen alongside the
+#  RAM pressure this app has been fighting.
+#
+#  Futures still needs (and gets) full 60s freshness — nothing reads
+#  it from anywhere else, and the Futures tab is always-on, not a
+#  rollback comparison. Only the options half is now decoupled: it
+#  recomputes at most once every _LEGACY_OPTIONS_REFRESH_SECS, and any
+#  in-between 60s cycle reuses the last computed options_df instead of
+#  re-fetching option chains for it. "Legacy DORE 2.0" is a comparison
+#  view, not a live trading source — a few minutes of staleness there
+#  is the right trade for cutting its network/RAM footprint ~5x (at
+#  the default below) with zero change to what the Futures tab sees.
+# ══════════════════════════════════════════════════════════════════
+
+_LEGACY_OPTIONS_REFRESH_SECS = 300  # recompute at most every 5 min
+
+_legacy_options_cache_lock = threading.Lock()
+_legacy_options_cache: dict = {"df": None, "computed_at": 0.0}
+
+
+def _get_legacy_options_df(universe: list[str], cfg: DORESettings) -> pd.DataFrame:
+    """Returns top_options_opportunities()'s result, recomputing (a real
+    option-chain fetch over the whole universe) at most once every
+    _LEGACY_OPTIONS_REFRESH_SECS — see the module-level note above for
+    why. Thread-safe: compute_fo_scan() runs on its own dedicated
+    scheduler thread, but this guards against any other caller too."""
+    now = time.time()
+    with _legacy_options_cache_lock:
+        cached_df = _legacy_options_cache["df"]
+        age = now - _legacy_options_cache["computed_at"]
+        if cached_df is not None and age < _LEGACY_OPTIONS_REFRESH_SECS:
+            return cached_df
+
+    # Compute OUTSIDE the lock — this is the expensive network call, and
+    # holding the lock across it would block every other caller for the
+    # full fetch duration for no benefit (worst case here is a harmless
+    # redundant fetch if two callers race past the staleness check at
+    # once, which given this is one dedicated thread in practice, won't
+    # happen).
+    fresh_df = top_options_opportunities(universe=universe, cfg=cfg)
+    with _legacy_options_cache_lock:
+        _legacy_options_cache["df"] = fresh_df
+        _legacy_options_cache["computed_at"] = now
+    return fresh_df
+
+
 def compute_fo_scan(cfg: Optional[DORESettings] = None) -> dict:
     """
     2026-07-29 bugfix: the missing piece from the 2026-07-23 event-aware
@@ -1086,13 +1150,16 @@ def compute_fo_scan(cfg: Optional[DORESettings] = None) -> dict:
     happened to be the first page opened in a process) meant the loop
     calling it usually never even started.
 
-    Runs the full futures + options funnels and returns them combined —
-    the exact shape utils.scan_state.save_snapshot("fo_scan", ...) and
+    Runs the full futures funnel every call (60s), and the legacy
+    options funnel at most every _LEGACY_OPTIONS_REFRESH_SECS (see
+    _get_legacy_options_df's docstring) — the exact shape
+    utils.scan_state.save_snapshot("fo_scan", ...) and
     pages/scanner.py's payload.get("futures")/payload.get("options")
-    expect. Both funnels independently re-derive their own Stage 0-2
-    pool over the shared universe (each is already a self-contained
-    "convenience single call" — see their own docstrings), so this is
-    a plain two-call orchestrator, not a rewrite of either.
+    expect either way. Both funnels independently re-derive their own
+    Stage 0-2 pool over the shared universe (each is already a
+    self-contained "convenience single call" — see their own
+    docstrings), so this is a plain two-call orchestrator, not a
+    rewrite of either.
 
     2026-07-29 bugfix #2 — NaN/inf serialization: top_futures_opportunities()
     / top_options_opportunities() can legitimately produce NaN (an
@@ -1118,7 +1185,7 @@ def compute_fo_scan(cfg: Optional[DORESettings] = None) -> dict:
     universe = stage0_universe()
 
     futures_df = top_futures_opportunities(universe=universe, cfg=cfg)
-    options_df = top_options_opportunities(universe=universe, cfg=cfg)
+    options_df = _get_legacy_options_df(universe, cfg)
 
     from utils.json_sanitize import find_invalid_columns, sanitize_dataframe
 
