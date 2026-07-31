@@ -170,19 +170,21 @@ def _get_upstox_token() -> str | None:
     return os.environ.get("UPSTOX_ACCESS_TOKEN")
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
 def _load_nse_instrument_master() -> pd.DataFrame:
-    """Downloads Upstox's NSE instrument master (refreshed daily by
-    Upstox) and returns it as a DataFrame so plain stock names like
-    'RELIANCE' can be resolved to the instrument_key Upstox's API
-    actually requires (e.g. NSE_EQ|INE002A01018)."""
-    url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz"
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-    with gzip.open(io.BytesIO(resp.content)) as f:
-        df = pd.read_csv(f)
-    df.columns = [c.strip().lower() for c in df.columns]
-    return df
+    """Resolves plain stock names like 'RELIANCE' to the instrument_key
+    Upstox's API actually requires (e.g. NSE_EQ|INE002A01018).
+
+    [Memory audit fix, 2026-07-31] This used to independently download
+    and @st.cache_data-cache the exact same Upstox NSE instrument master
+    as utils.upstox_client.load_nse_instrument_master() -- a third
+    ~20-40MB copy of the same 88k-row file alive in this process
+    alongside that module's own cached copy (and load_fo_instrument_
+    master()'s, before that one was de-duplicated too). No local caching
+    needed here any more: utils.upstox_client.load_nse_instrument_master()
+    is already @st.cache_data(ttl=86400)-cached, so this is just a thin
+    delegate, not a second download or a second cache entry."""
+    from utils.upstox_client import load_nse_instrument_master
+    return load_nse_instrument_master()
 
 
 def _resolve_instrument_key(trading_symbol: str) -> str | None:
