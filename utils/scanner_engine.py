@@ -549,7 +549,7 @@ NIFTY500_SYMBOLS = fetch_nifty500_constituents()
 
 # fetch_ohlcv now lives in utils/market_data.py, imported above.
 
-@st.cache_data(ttl=30, show_spinner=False)   # 30s TTL — live price patch
+@st.cache_data(ttl=30, max_entries=8, show_spinner=False)   # 30s TTL — live price patch
 def _fetch_live_prices(symbols: tuple) -> dict:
     """
     Fetch today's live bar (partial or complete) using period='5d', interval='1d'.
@@ -632,7 +632,7 @@ def _patch_live_prices(data: dict, live: dict) -> dict:
 _PERIOD_TO_YEARS = {"3mo": 0.25, "6mo": 0.5, "1y": 1.0, "2y": 2.0, "5y": 5.0}
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, max_entries=8, show_spinner=False)
 def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d",
                        source: str = "yfinance") -> dict:
     """
@@ -652,7 +652,7 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d",
     years = _PERIOD_TO_YEARS.get(period, 1.0)
     return get_history(list(symbols), years=years, min_bars=60, source=source)
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, max_entries=4, show_spinner=False)
 def fetch_nifty(period: str = "1y", source: str = "yfinance") -> pd.Series:
     """
     Fetch Nifty 50 close series for regime classification and as the
@@ -703,7 +703,7 @@ def fetch_nifty(period: str = "1y", source: str = "yfinance") -> pd.Series:
     return pd.Series(dtype=float)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, max_entries=4, show_spinner=False)
 def fetch_nifty_ohlcv(period: str = "1y", source: str = "yfinance") -> pd.DataFrame:
     """
     Fetch full OHLCV for Nifty 50 (^NSEI).
@@ -734,7 +734,7 @@ def fetch_nifty_ohlcv(period: str = "1y", source: str = "yfinance") -> pd.DataFr
     return pd.DataFrame()
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, max_entries=4, show_spinner=False)
 def fetch_sensex_ohlcv(period: str = "1y", source: str = "upstox") -> pd.DataFrame:
     """
     Fetch full OHLCV for BSE Sensex — the Sensex counterpart to
@@ -771,7 +771,7 @@ def fetch_sensex_ohlcv(period: str = "1y", source: str = "upstox") -> pd.DataFra
     return pd.DataFrame()
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, max_entries=4, show_spinner=False)
 def fetch_banknifty_ohlcv(period: str = "1y", source: str = "upstox") -> pd.DataFrame:
     """
     Fetch full OHLCV for Nifty Bank (^NSEBANK) — the Bank Nifty counterpart

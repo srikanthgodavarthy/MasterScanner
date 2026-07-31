@@ -270,7 +270,7 @@ def _classify_batch(texts: list[str]) -> list[dict]:
         return fallback
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800, max_entries=6, show_spinner=False)
 def _classify_cached(pairs: tuple[tuple[str, str], ...]) -> list[dict]:
     """Cache wrapper -- st.cache_data needs hashable args, hence tuples of
     (title, summary) rather than dicts."""

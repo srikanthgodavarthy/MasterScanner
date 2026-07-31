@@ -255,7 +255,17 @@ def top_dore_trade_plans(
         fetch_batch_stock_atm_options_upstox(stock_symbols, progress_cb=progress_cb)
         if stock_symbols else {}
     )
-    ohlcv_map = fetch_batch_ohlcv(tuple(stock_symbols), period="3mo") if stock_symbols else {}
+    # [Memory audit fix, 2026-07-31] fetch_batch_ohlcv is @st.cache_data-
+    # keyed on this tuple. stock_symbols comes from
+    # _shortlist_for_option_chain()'s score-based sort, so its ORDER
+    # changes almost every cycle even when the underlying SET of
+    # symbols doesn't -- each reorder was hashing to a brand-new cache
+    # key, so a logically-single 60s cache was instead accumulating a
+    # new entry every cycle (nothing evicts them until their own TTL
+    # expires). Sorting here doesn't change which symbols get fetched,
+    # only the cache key -- fetch_batch_ohlcv returns a dict, so the
+    # order of stock_symbols never mattered to its output.
+    ohlcv_map = fetch_batch_ohlcv(tuple(sorted(stock_symbols)), period="3mo") if stock_symbols else {}
 
     plans: list[OptionTradePlan] = []
     rejections: list[DoreRejection] = []

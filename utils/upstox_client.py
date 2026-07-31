@@ -1445,14 +1445,17 @@ def _fo_column(df: pd.DataFrame, *candidates: str) -> Optional[str]:
     return None
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
 def load_fo_instrument_master() -> pd.DataFrame:
-    """The same instrument master as load_nse_instrument_master(), cached
-    separately and unfiltered by segment — F&O rows (segment NSE_FO,
-    instrument_type FUTSTK/OPTSTK) live in the same file as the NSE_EQ
-    rows that function keeps. Column names are defensively resolved
-    (see _fo_column) since Upstox's published schema for this file has
-    drifted before (trading_symbol vs tradingsymbol, etc.)."""
+    """The same instrument master as load_nse_instrument_master() -- this
+    is just a named alias, not a separate download or computation, so it
+    intentionally has NO @st.cache_data of its own [Memory audit fix,
+    2026-07-31]: it used to be independently cached, which meant every
+    call held a second, independent ~20-40MB copy of the exact same
+    88k-row DataFrame in memory alongside load_nse_instrument_master()'s
+    own cached copy, for zero benefit -- there's no extra work here to
+    save by caching it a second time. Column names are defensively
+    resolved (see _fo_column) since Upstox's published schema for this
+    file has drifted before (trading_symbol vs tradingsymbol, etc.)."""
     return load_nse_instrument_master()
 
 
@@ -1646,7 +1649,7 @@ def resolve_option_contract_instrument_key(symbol: str, leg: str, strike: float,
     return ((row.get(chain_key) or {}).get("instrument_key")) or None
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=30, max_entries=8, show_spinner=False)
 def fetch_open_plan_option_quotes(plan_keys: tuple) -> dict:
     """
     Live LTP for a small batch of open FOSetupPlan contracts, keyed by
@@ -1747,7 +1750,7 @@ def resolve_futures_instrument_key(symbol: str) -> Optional[str]:
     return contracts.iloc[0][key_col]
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, max_entries=8, show_spinner=False)
 def fetch_futures_snapshot_batch(symbols: tuple) -> dict:
     """
     Batch near-month futures LTP/OI/volume/%chg for `symbols` (an

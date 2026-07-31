@@ -98,6 +98,16 @@ def acquire_option_chain_slot() -> float:
 # ══════════════════════════════════════════════════════════════════
 
 _CACHE_TTL_S = 60.0
+
+# [Memory audit fix, 2026-07-31] This cache was TTL-checked only on a
+# GET of that exact key -- a symbol that rotates out of the DORE
+# shortlist (which re-ranks every cycle) or an expiry that rolls over
+# never gets looked up again, so its entry just sat here forever with
+# no upper bound and no periodic sweep. _MAX_ENTRIES + the sweep in
+# store_chain() below bound it without adding a new dependency
+# (cachetools isn't in requirements.txt) or changing either public
+# function's signature.
+_MAX_ENTRIES = 200
 _cache: dict[tuple[str, str], tuple[float, list]] = {}
 _cache_lock = threading.Lock()
 
@@ -119,9 +129,26 @@ def get_cached_chain(instrument_key: str, expiry: str) -> Optional[list]:
     return None
 
 
+def _sweep_locked(now: float) -> None:
+    """Must be called with _cache_lock held. Drops every expired entry
+    regardless of whether anyone has looked it up since, then -- if
+    still over _MAX_ENTRIES -- evicts oldest-first until back at cap.
+    Cheap relative to the option-chain HTTP call this sits in front of,
+    and only runs on writes, not on every read."""
+    expired = [k for k, (ts, _) in _cache.items() if now - ts >= _CACHE_TTL_S]
+    for k in expired:
+        del _cache[k]
+    if len(_cache) > _MAX_ENTRIES:
+        oldest_first = sorted(_cache.items(), key=lambda kv: kv[1][0])
+        for k, _ in oldest_first[: len(_cache) - _MAX_ENTRIES]:
+            del _cache[k]
+
+
 def store_chain(instrument_key: str, expiry: str, chain: list) -> None:
+    now = time.monotonic()
     with _cache_lock:
-        _cache[(instrument_key, expiry)] = (time.monotonic(), chain)
+        _cache[(instrument_key, expiry)] = (now, chain)
+        _sweep_locked(now)
 
 
 def clear_option_chain_cache() -> None:
