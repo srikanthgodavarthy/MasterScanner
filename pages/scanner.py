@@ -1528,6 +1528,66 @@ def _tv_link(symbol: str, css_class: str = "tv-link", pct_chg=None) -> str:
     )
 
 
+def _tv_option_symbol(symbol: str, direction: str, strike, expiry: str) -> str:
+    """Builds a TradingView NSE F&O *contract* symbol — e.g.
+    NSE:NIFTY25AUG2625000CE for symbol=NIFTY, direction=CE, strike=25000,
+    expiry=2026-08-25. TradingView's option-contract convention is
+    <UNDERLYING><DD><MMM><YY><STRIKE><CE|PE>: day zero-padded, month a
+    3-letter uppercase abbreviation, year 2-digit, strike as a bare
+    integer when it's a whole number (true for virtually every NSE F&O
+    strike). Returns "" if expiry/strike/direction don't parse cleanly —
+    callers fall back to a plain (non-linked) label in that case rather
+    than emitting a broken link.
+    """
+    try:
+        d = datetime.fromisoformat(str(expiry)[:10])
+    except Exception:
+        return ""
+    direction = str(direction or "").upper().strip()
+    if direction not in ("CE", "PE"):
+        return ""
+    try:
+        strike_val = float(strike)
+    except (TypeError, ValueError):
+        return ""
+    strike_str = f"{int(strike_val)}" if strike_val.is_integer() else f"{strike_val:g}"
+    day = f"{d.day:02d}"
+    mon = d.strftime("%b").upper()
+    yr = f"{d.year % 100:02d}"
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return ""
+    return f"NSE:{sym}{day}{mon}{yr}{strike_str}{direction}"
+
+
+def _tv_option_link(symbol: str, direction: str, strike, expiry: str, css_class: str = "tv-link", label: str = None) -> str:
+    """Anchor for an option CONTRACT (not the underlying) — used by the
+    Active Plans tab's Strike column and the DORE Options Engine's Live
+    Scan table so both open the actual traded contract's chart, not the
+    underlying's. Falls back to a plain (non-linked) strike label
+    whenever _tv_option_symbol can't build a valid contract symbol
+    (missing/malformed strike, direction, or expiry), rather than ever
+    emitting a dead or wrong link. Pass `label` to override the default
+    bare-strike-number text (e.g. "CE 6000" instead of "6000").
+    """
+    if label is None:
+        label = "—"
+        if strike not in (None, "") and not (isinstance(strike, float) and strike != strike):
+            try:
+                strike_f = float(strike)
+                label = f"{int(strike_f)}" if strike_f.is_integer() else f"{strike_f:g}"
+            except (TypeError, ValueError):
+                label = str(strike)
+    tv_sym = _tv_option_symbol(symbol, direction, strike, expiry)
+    if not tv_sym:
+        return f'<span>{label}</span>'
+    url = f"https://www.tradingview.com/chart/?symbol={tv_sym}"
+    return (
+        f'<a class="{css_class}" href="{url}" target="_blank" '
+        f'title="Open {tv_sym} on TradingView">{label}</a>'
+    )
+
+
 def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     """
     Render a scrollable sub-factor table for every stock in df.
@@ -3367,7 +3427,8 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
         if not isinstance(primary, dict):
             primary = {}
         strike = primary.get("strike")
-        strike_disp = f"{_fmt_text(direction)} {_fmt_num(strike)}".strip() if strike not in (None, "") else "—"
+        strike_label = f"{_fmt_text(direction)} {_fmt_num(strike)}".strip() if strike not in (None, "") else "—"
+        strike_disp = _tv_option_link(r.get("symbol", ""), direction, strike, r.get("expiry", ""), label=strike_label)
 
         cells = [
             f'<td style="font-weight:700;">{_tv_link(r.get("symbol", "—"))}</td>',
@@ -3490,7 +3551,7 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
         cells = [
             f'<td style="font-weight:700;">{_tv_link(r.get("symbol", "—"))}</td>',
             f'<td style="color:{dir_color};font-weight:700;">{_fmt_text(direction)}</td>',
-            f'<td>{_fmt_text(r.get("strike"))}</td>',
+            f'<td>{_tv_option_link(r.get("symbol", ""), direction, r.get("strike"), r.get("expiry", ""))}</td>',
             f'<td>{_fmt_text(r.get("expiry"))}</td>',
             f'<td>{r.get("plan_status_label", "—")}</td>',
             f'<td style="font-weight:700;">{_fmt_money(r.get("entry_locked"))}</td>',
