@@ -3420,8 +3420,10 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
     currently-OPEN DoreOptionsPlan (utils.dore_options_persistence.
     active_plan_rows() output), independent of whether this cycle's live
     scan reproduced the contract — see that function's docstring for why
-    Current Premium/Drift here are "last known" (as of Last Seen) rather
-    than freshly fetched.
+    Last Known Premium/P&L here are "last known" (as of Last Seen) rather
+    than freshly fetched. P&L is entry_locked vs last_premium — the same
+    long-premium-position math as last_drift_pct, just also shown in ₹
+    alongside the %.
 
     Column set is deliberately narrower than
     _dore_options_plan_table_html's live table: there's no qualification/
@@ -3447,8 +3449,27 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
         cur = row.get("last_premium")
         if cur in (None, "") or pd.isna(cur):
             return '<span style="color:var(--muted)">—</span>'
-        drift = row.get("last_drift_pct")
-        return f'{_fmt_money(cur)} {_fmt_pct_chg(drift)}'
+        return _fmt_money(cur)
+
+    def _fmt_pnl(row):
+        # Premium P&L for the locked long option position: last known
+        # premium vs the ONE frozen entry_locked value — same numerator/
+        # denominator as DoreOptionsPlan.last_drift_pct (utils.
+        # dore_options_persistence._drift_pct), just also shown as an
+        # absolute ₹-per-unit figure here rather than % alone. "—" until
+        # this contract has been reproduced by a live cycle at least once
+        # (last_premium is None on mint until then).
+        cur = row.get("last_premium")
+        entry = row.get("entry_locked")
+        pct = row.get("last_drift_pct")
+        if cur in (None, "") or pd.isna(cur) or entry in (None, "") or pd.isna(entry):
+            return '<span style="color:var(--muted)">—</span>'
+        pnl_rupees = cur - entry
+        color = "#3fb950" if pnl_rupees >= 0 else "#f85149"
+        sign = "+" if pnl_rupees >= 0 else ""
+        pct_html = _fmt_pct_chg(pct)
+        return (f'<span style="color:{color};font-weight:700;">{sign}{_fmt_money(pnl_rupees)}</span> '
+                f'{pct_html}')
 
     def _fmt_last_seen(row):
         ts = row.get("last_seen_at")
@@ -3460,7 +3481,7 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
         return '<div style="color:var(--muted);padding:8px;">No open plans.</div>'
 
     headers = ["Symbol", "Direction", "Strike", "Expiry", "Status", "Entry (Locked)", "Stop Loss",
-               "Target 1", "Target 2", "Last Known Premium / Drift", "Last Seen", "Days Active"]
+               "Target 1", "Target 2", "Last Known Premium", "P&L", "Last Seen", "Days Active"]
 
     rows_html = []
     for _, r in df.iterrows():
@@ -3477,6 +3498,7 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
             f'<td>{_fmt_money(r.get("saved_target1"))}</td>',
             f'<td>{_fmt_money(r.get("saved_target2"))}</td>',
             f'<td>{_fmt_last_premium(r)}</td>',
+            f'<td>{_fmt_pnl(r)}</td>',
             f'<td>{_fmt_last_seen(r)}</td>',
             f'<td>{_fmt_text(r.get("plan_age_days"))}d</td>',
         ]
