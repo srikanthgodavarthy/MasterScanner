@@ -258,6 +258,7 @@ with st.expander("🔌 Upstox Pilot Check (token sanity test)", expanded=False):
                             st.warning("Empty response — market may be closed or instrument_key is stale.")
 
 from pages.dashboard     import render as render_dashboard
+from pages.sectors       import render as render_sectors
 from pages.scanner       import render as render_scanner
 from pages.backtest      import render as render_backtest
 from pages.settings      import render as render_settings
@@ -328,6 +329,9 @@ settings = {
 def _page_dashboard():
     render_dashboard(settings)
 
+def _page_sectors():
+    render_sectors(settings)
+
 def _page_scanner():
     render_scanner(settings)
 
@@ -375,9 +379,19 @@ def _page_data_source_check():
 #
 # st.navigation + st.Page only ever executes the ONE page function the
 # user actually has selected — the other nine pages simply don't run.
+# _page_sectors is wrapped in its own st.Page here (rather than inline in
+# the list below) so the object can be handed to Dashboard via `settings`
+# for its "→ Full Sector Rotation Analysis" st.page_link — with callable-
+# based pages (as opposed to physical pages/*.py files Streamlit runs
+# directly), st.page_link needs the actual st.Page instance, a bare
+# "pages/sectors.py" string doesn't resolve to anything.
+_page_sectors_obj = st.Page(_page_sectors, title="Sectors", icon="🧭")
+settings["sectors_page"] = _page_sectors_obj
+
 pg = st.navigation(
     [
         st.Page(_page_dashboard,    title="Dashboard",            icon="🖥️", default=True),
+        _page_sectors_obj,
         st.Page(_page_scanner,      title="Live Scanner",         icon="📡"),
         st.Page(_page_five_pillar, title="five_pillar Scanner", icon="📍"),
         st.Page(_page_backtest,     title="Backtest Engine",      icon="📈"),
