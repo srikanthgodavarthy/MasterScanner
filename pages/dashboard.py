@@ -2198,27 +2198,71 @@ _SR_CSS = """
 .sr-panel { background:#111826; border:1px solid #1e293b; border-radius:10px; padding:16px; }
 .sr-panel-title { font-size:0.82rem; font-weight:700; letter-spacing:0.03em; margin-bottom:10px; }
 
-table.sr-table { width:100%; border-collapse:collapse; font-size:0.8rem; }
+/* 2026-07-31: fixed length & width for every glance-card table (Today's
+   Sector Flow, NSE Top Gainers, Live Scanner Snapshot, Active Options
+   Plans) so columns hold a constant width and panels hold a constant
+   height regardless of what today's data happens to contain — a long
+   status string or a symbol name no longer reflows the whole grid.
+   table-layout:fixed makes each <col>'s inline width (set per-table in
+   the HTML below) authoritative instead of the browser auto-sizing
+   columns to their widest cell; overflow content clips with an ellipsis
+   and keeps the full value in a title="" tooltip instead. .sr-panel-body
+   caps the visible row count at a fixed pixel height (scrolls, doesn't
+   grow) so cards with 3 rows and cards with 8 rows still sit flush next
+   to each other in the same st.columns() row. */
+.sr-panel-body { max-height:296px; overflow-y:auto; }
+table.sr-table { width:100%; table-layout:fixed; border-collapse:collapse; font-size:0.8rem; }
+table.sr-table th, table.sr-table td {
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
 table.sr-table th { text-align:left; color:#8b949e; font-weight:600; font-size:0.68rem;
                      letter-spacing:0.05em; padding:6px 8px; border-bottom:1px solid #1e293b; }
 table.sr-table td { padding:8px; border-bottom:1px solid #161d2c; vertical-align:middle; }
-/* columns 3-5 are always the numeric ones in both tables that reuse this
-   class (LTP/%CHG/VOL RATIO here, 5D/20D Momentum/Breadth in the Sector
-   Rotation Dashboard table) — right-align + tabular-nums so magnitudes
-   line up on their decimal point instead of ragging left like prose. */
-table.sr-table th:nth-child(1) { text-align:right; }
-table.sr-table td:nth-child(1) { text-align:right; }
-table.sr-table th:nth-child(3), table.sr-table th:nth-child(4), table.sr-table th:nth-child(5) { text-align:right; }
-table.sr-table td:nth-child(3), table.sr-table td:nth-child(4), table.sr-table td:nth-child(5) {
+
+/* NSE Top Gainers only (# / SYMBOL / LTP / %CHG / VOL RATIO / SECTOR /
+   SCANNER) — columns 3-5 are the numeric ones, right-aligned + tabular-
+   nums so magnitudes line up on their decimal point instead of ragging
+   left like prose. Scoped to --gainers (rather than sr-table generally)
+   since the Live Scanner Snapshot and Active Options Plans tables below
+   have a different column count/shape and need their own alignment. */
+table.sr-table--gainers th:nth-child(1) { text-align:right; }
+table.sr-table--gainers td:nth-child(1) { text-align:right; }
+table.sr-table--gainers th:nth-child(3), table.sr-table--gainers th:nth-child(4), table.sr-table--gainers th:nth-child(5) { text-align:right; }
+table.sr-table--gainers td:nth-child(3), table.sr-table--gainers td:nth-child(4), table.sr-table--gainers td:nth-child(5) {
   text-align:right; font-variant-numeric:tabular-nums;
 }
-.sr-sector-name { display:flex; align-items:center; gap:8px; font-weight:600; }
+
+/* Live Scanner Snapshot (SYMBOL / %CHG / SETUP AGE / ENTRY / DRIFT) —
+   %CHG, ENTRY, DRIFT are numeric. */
+table.sr-table--snapshot th:nth-child(2), table.sr-table--snapshot th:nth-child(4), table.sr-table--snapshot th:nth-child(5) { text-align:right; }
+table.sr-table--snapshot td:nth-child(2), table.sr-table--snapshot td:nth-child(4), table.sr-table--snapshot td:nth-child(5) {
+  text-align:right; font-variant-numeric:tabular-nums;
+}
+
+/* Active Options Plans (SYMBOL / DIR / STRIKE / STATUS / ENTRY / LAST
+   PREMIUM / P&L / STOP LOSS / TARGET 1) — everything from STRIKE on is
+   numeric except STATUS. */
+table.sr-table--plans th:nth-child(3), table.sr-table--plans th:nth-child(5),
+table.sr-table--plans th:nth-child(6), table.sr-table--plans th:nth-child(7),
+table.sr-table--plans th:nth-child(8), table.sr-table--plans th:nth-child(9) { text-align:right; }
+table.sr-table--plans td:nth-child(3), table.sr-table--plans td:nth-child(5),
+table.sr-table--plans td:nth-child(6), table.sr-table--plans td:nth-child(7),
+table.sr-table--plans td:nth-child(8), table.sr-table--plans td:nth-child(9) {
+  text-align:right; font-variant-numeric:tabular-nums;
+}
+
+.sr-sector-name { display:flex; align-items:center; gap:8px; font-weight:600; overflow:hidden; }
+.sr-sector-name span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .sr-pos { color:#3fb950; } .sr-neg { color:#f85149; }
 .sr-action-badge { display:inline-block; padding:3px 12px; border-radius:5px; font-size:0.7rem;
                     font-weight:700; text-align:center; min-width:78px; }
 
 .sr-flow-col-title { font-size:0.7rem; font-weight:700; margin-bottom:8px; }
-.sr-flow-row { display:flex; justify-content:space-between; font-size:0.78rem; padding:4px 0; }
+.sr-flow-row { display:flex; justify-content:space-between; font-size:0.78rem; padding:4px 0;
+               overflow:hidden; }
+.sr-flow-row span:first-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-right:8px; }
+.sr-flow-row span:last-child { flex-shrink:0; }
+
 
 /* 2026-07-27: table-layout:fixed + equal-width th/td so every column
    (1D Ago / Today / etc.) takes the SAME width regardless of how long
@@ -2300,11 +2344,11 @@ def _nse_top_gainers_html(df_aug: pd.DataFrame, top_n: int = 5) -> str:
         rows_html += (
             "<tr>"
             f"<td style='color:#8b949e;'>{i}</td>"
-            f'<td><span class="sr-sector-name" style="font-weight:700;">{_tv_link(str(symbol), pct_chg=chg) if symbol != "—" else symbol}</span></td>'
+            f'<td><span class="sr-sector-name" style="font-weight:700;" title="{symbol}">{_tv_link(str(symbol), pct_chg=chg) if symbol != "—" else symbol}</span></td>'
             f"<td>{f'{ltp:,.2f}' if ltp is not None else '—'}</td>"
             f'<td class="{"sr-pos" if chg >= 0 else "sr-neg"}">{"+" if chg >= 0 else ""}{chg:.2f}%</td>'
             f"<td>{f'{vr:.1f}x' if vr is not None else '—'}</td>"
-            f"<td>{sector}</td>"
+            f'<td title="{sector}">{sector}</td>'
             f"<td>{badge}</td>"
             "</tr>"
         )
@@ -2312,10 +2356,16 @@ def _nse_top_gainers_html(df_aug: pd.DataFrame, top_n: int = 5) -> str:
     return f"""
     <div class="sr-panel">
       <div class="sr-panel-title">NSE TOP GAINERS</div>
-      <table class="sr-table">
+      <div class="sr-panel-body">
+      <table class="sr-table sr-table--gainers">
+        <colgroup>
+          <col style="width:6%"><col style="width:24%"><col style="width:14%">
+          <col style="width:12%"><col style="width:14%"><col style="width:18%"><col style="width:12%">
+        </colgroup>
         <tr><th>#</th><th>SYMBOL</th><th>LTP</th><th>%CHG</th><th>VOL RATIO</th><th>SECTOR</th><th>SCANNER</th></tr>
         {rows_html}
       </table>
+      </div>
     </div>"""
 
 
@@ -2327,15 +2377,20 @@ def _nse_top_gainers_html(df_aug: pd.DataFrame, top_n: int = 5) -> str:
 # compute_sector_flow(sector_stats) call the full page uses, plus an
 # st.page_link back to it — so the two never show different numbers,
 # they just show a different amount of detail.
-def _today_sector_flow_compact_html(flow: dict) -> str:
+def _today_sector_flow_compact_html(flow: dict, rows: int = 3) -> str:
+    inflow_list = list(flow.get("inflow", []))[:rows]
+    outflow_list = list(flow.get("outflow", []))[:rows]
+    # Pad both columns to a fixed `rows` length (blank placeholder rows for
+    # any that are short) so the card's height is constant regardless of
+    # how many sectors qualified as inflow/outflow today.
     inflow_rows = "".join(
-        f'<div class="sr-flow-row"><span>↑ {s}</span><span class="sr-pos">+{v:.0f} Cr</span></div>'
-        for s, v in flow.get("inflow", [])
-    ) or '<div style="color:#8b949e;font-size:0.75rem;">—</div>'
+        f'<div class="sr-flow-row"><span title="{s}">↑ {s}</span><span class="sr-pos">+{v:.0f} Cr</span></div>'
+        for s, v in inflow_list
+    ) + '<div class="sr-flow-row">&nbsp;</div>' * (rows - len(inflow_list))
     outflow_rows = "".join(
-        f'<div class="sr-flow-row"><span>↓ {s}</span><span class="sr-neg">{v:.0f} Cr</span></div>'
-        for s, v in flow.get("outflow", [])
-    ) or '<div style="color:#8b949e;font-size:0.75rem;">—</div>'
+        f'<div class="sr-flow-row"><span title="{s}">↓ {s}</span><span class="sr-neg">{v:.0f} Cr</span></div>'
+        for s, v in outflow_list
+    ) + '<div class="sr-flow-row">&nbsp;</div>' * (rows - len(outflow_list))
     net = flow.get("net", 0) or 0
 
     return f"""
@@ -2392,7 +2447,7 @@ def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
         drift_val = float(drift) if drift not in (None, "") and pd.notna(drift) else None
         rows_html += (
             "<tr>"
-            f'<td><span class="sr-sector-name" style="font-weight:700;">{_tv_link(str(symbol), pct_chg=chg) if symbol != "—" else symbol}</span></td>'
+            f'<td><span class="sr-sector-name" style="font-weight:700;" title="{symbol}">{_tv_link(str(symbol), pct_chg=chg) if symbol != "—" else symbol}</span></td>'
             f'<td class="{"sr-pos" if chg >= 0 else "sr-neg"}">{"+" if chg >= 0 else ""}{chg:.2f}%</td>'
             f"<td>{r.get('SetupAge', '—')}</td>"
             f"<td>{f'{float(entry):,.2f}' if entry not in (None, '') and pd.notna(entry) else '—'}</td>"
@@ -2403,10 +2458,16 @@ def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
     return f"""
     <div class="sr-panel">
       <div class="sr-panel-title">LIVE SCANNER SNAPSHOT</div>
-      <table class="sr-table">
+      <div class="sr-panel-body">
+      <table class="sr-table sr-table--snapshot">
+        <colgroup>
+          <col style="width:26%"><col style="width:16%"><col style="width:24%">
+          <col style="width:17%"><col style="width:17%">
+        </colgroup>
         <tr><th>SYMBOL</th><th>%CHG</th><th>SETUP AGE</th><th>ENTRY</th><th>DRIFT</th></tr>
         {rows_html}
       </table>
+      </div>
     </div>"""
 
 
@@ -2458,10 +2519,10 @@ def _active_options_plans_html(top_n: int = 6) -> str:
             pnl_html = f'<span style="color:{pcolor};font-weight:700;">{"+" if pnl >= 0 else ""}{_money(pnl)}</span>'
         rows_html += (
             "<tr>"
-            f'<td style="font-weight:700;">{r.get("symbol", "—")}</td>'
+            f'<td style="font-weight:700;" title="{r.get("symbol", "—")}">{r.get("symbol", "—")}</td>'
             f'<td style="color:{dir_color};font-weight:700;">{direction or "—"}</td>'
             f"<td>{r.get('strike', '—')}</td>"
-            f"<td>{r.get('plan_status_label', '—')}</td>"
+            f'<td title="{r.get("plan_status_label", "—")}">{r.get("plan_status_label", "—")}</td>'
             f'<td style="font-weight:700;">{_money(entry)}</td>'
             f"<td>{_money(last_premium)}</td>"
             f"<td>{pnl_html}</td>"
@@ -2473,7 +2534,13 @@ def _active_options_plans_html(top_n: int = 6) -> str:
     return f"""
     <div class="sr-panel">
       <div class="sr-panel-title">ACTIVE OPTIONS PLANS</div>
-      <table class="sr-table">
+      <div class="sr-panel-body">
+      <table class="sr-table sr-table--plans">
+        <colgroup>
+          <col style="width:12%"><col style="width:6%"><col style="width:8%"><col style="width:24%">
+          <col style="width:12%"><col style="width:12%"><col style="width:9%">
+          <col style="width:9%"><col style="width:8%">
+        </colgroup>
         <tr><th>SYMBOL</th><th>DIR</th><th>STRIKE</th><th>STATUS</th><th>ENTRY (LOCKED)</th>
             <th>LAST KNOWN PREMIUM</th><th>P&amp;L</th><th>STOP LOSS</th><th>TARGET 1</th></tr>
         {rows_html}
