@@ -125,7 +125,9 @@ LIVE_SCANNER_BATCH_COOLDOWN_SECS = 1.5   # brief pause between batches, just
 
 
 def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payload,
-              owner_event: "threading.Event | None" = None):
+              owner_event: "threading.Event | None" = None,
+              require_fresh_live_scanner: bool = False,
+              max_live_scanner_staleness_secs: int = 600):
     """
     Generic "compute on an interval, save a versioned snapshot" loop.
     Used by market_intelligence and fo_scan, whose single-call compute
@@ -143,9 +145,31 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
                           ownership lock (another process reclaimed it)
                           and this loop stops immediately rather than
                           keep running alongside a second scanner.
+
+    [2026-08-02] Two additions, both born from live_scanner skip-cycling
+    on RAM pressure while every OTHER loop (this function) kept firing
+    its own network/CPU work completely regardless — worsening the exact
+    pressure live_scanner was backing off from:
+
+    1. This loop now calls utils.scan_health_monitor.check_health(name)
+       itself, same as _run_live_scanner_loop already does. A
+       "skip_cycle" decision here skips compute_fn() entirely for this
+       tick (not just the save) — the whole point is not doing the
+       expensive work, not just withholding its result.
+    2. require_fresh_live_scanner=True (set for dore_options_scan, whose
+       compute_fn feeds entirely off the live_scanner snapshot — see
+       utils.dore_options_scan.compute_dore_options_scan): if the most
+       recent live_scanner snapshot is older than
+       max_live_scanner_staleness_secs (or doesn't exist), this loop
+       skips too. Running DORE's own heavy option-chain/OHLCV fetch
+       cycle against a snapshot live_scanner never got to refresh is
+       both wasted work (re-ranking the same stale universe) and, worse,
+       exactly the kind of load that's currently starving live_scanner
+       of the RAM headroom it needs to complete a fresh cycle at all.
     """
-    from utils.scan_state import save_snapshot
+    from utils.scan_state import save_snapshot, load_snapshot_payload
     from utils.system_state import should_scheduler_run
+    from utils.scan_health_monitor import check_health
 
     logger.info("[%s] loop starting, every %ss", name, interval_secs)
     while True:
@@ -159,6 +183,42 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
             logger.debug("[%s] system_state is paused (backtest/maintenance) — skipping this tick", name)
             time.sleep(5)
             continue
+
+        health = check_health(name)
+        if health.action == "skip_cycle":
+            logger.warning("[%s] skipping this cycle — %s", name, "; ".join(health.reasons))
+            time.sleep(max(1.0, interval_secs))
+            continue
+
+        if require_fresh_live_scanner:
+            live = None
+            live_age = None
+            try:
+                live = load_snapshot_payload("live_scanner")
+                if live and live.get("created_at"):
+                    from datetime import datetime, timezone
+                    created = datetime.fromisoformat(str(live["created_at"]).replace("Z", "+00:00"))
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    live_age = (datetime.now(timezone.utc) - created).total_seconds()
+            except Exception:
+                logger.exception("[%s] could not determine live_scanner snapshot age "
+                                  "(non-fatal, treating as stale)", name)
+                live_age = None
+            # "no snapshot at all" or "created_at unparseable" both count as
+            # stale (fail toward skipping DORE's own expensive cycle, not
+            # toward running it against data of unknown age).
+            if not live:
+                logger.warning("[%s] skipping this cycle — no live_scanner snapshot available yet", name)
+                time.sleep(max(1.0, interval_secs))
+                continue
+            if live_age is None or live_age >= max_live_scanner_staleness_secs:
+                logger.warning("[%s] skipping this cycle — live_scanner snapshot is %s "
+                                "(>= %ss staleness limit)", name,
+                                f"{live_age:.0f}s old" if live_age is not None else "of unknown age",
+                                max_live_scanner_staleness_secs)
+                time.sleep(max(1.0, interval_secs))
+                continue
 
         try:
             raw = compute_fn()
@@ -583,7 +643,16 @@ def main():
     for name, section, interval, compute_fn, to_payload in JOBS:
         t = threading.Thread(
             target=_run_loop, args=(name, section, interval, compute_fn, to_payload),
-            kwargs={"owner_event": hb_thread.lost_ownership},
+            kwargs={
+                "owner_event": hb_thread.lost_ownership,
+                # [2026-08-02] dore_options_scan reads the live_scanner
+                # snapshot as its entire input — see
+                # utils.dore_options_scan.compute_dore_options_scan() —
+                # so there's no point (and real RAM/network cost) running
+                # its own heavy option-chain/OHLCV cycle against a stale
+                # or missing live_scanner snapshot.
+                "require_fresh_live_scanner": (name == "dore_options_scan"),
+            },
             name=f"scan-{name}", daemon=True,
         )
         t.start()
