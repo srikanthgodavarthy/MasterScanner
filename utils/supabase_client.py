@@ -1464,6 +1464,8 @@ def _dore_options_plan_from_row(row: dict) -> "object":
         target1_locked       = row.get("target1_locked"),
         target2_locked       = row.get("target2_locked"),
         confidence_at_entry  = float(row.get("confidence_at_entry", 0) or 0),
+        last_premium         = row.get("last_premium"),
+        last_seen_at         = str(row.get("last_seen_at", "") or ""),
         status               = row.get("status", "OPEN") or "OPEN",
         closed_at            = str(row.get("closed_at", "") or ""),
         closed_reason        = row.get("closed_reason", "") or "",
@@ -2264,6 +2266,15 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
     target2_locked               numeric(12,2),
     confidence_at_entry          numeric(6,2) NOT NULL DEFAULT 0,
 
+    -- 2026-08-01: refreshed every cycle this contract is reproduced by
+    -- the live scan — lets the Active Plans tab show a "last known"
+    -- premium even between live sightings. Drift/P&L is deliberately
+    -- NOT its own column — it's derived from last_premium vs
+    -- entry_locked at read time (see
+    -- utils/dore_options_persistence.py's DoreOptionsPlan docstring).
+    last_premium                 numeric(12,2),
+    last_seen_at                  timestamptz,
+
     status                      text        NOT NULL DEFAULT 'OPEN',   -- OPEN / CLOSED
     closed_at                    timestamptz,
     closed_reason                text        NOT NULL DEFAULT '',
@@ -2273,6 +2284,21 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
 CREATE INDEX IF NOT EXISTS idx_dore_options_plans_symbol ON dore_options_plans(symbol);
 CREATE INDEX IF NOT EXISTS idx_dore_options_plans_status ON dore_options_plans(status);
 CREATE INDEX IF NOT EXISTS idx_dore_options_plans_date   ON dore_options_plans(created_date DESC);
+"""
+
+# ── MIGRATION for an EXISTING dore_options_plans table created before the
+#    2026-08-01 Active Plans tab (last_premium/last_seen_at didn't exist
+#    yet — this is the "Could not find the 'last_drift_pct' column ... in
+#    the schema cache" PGRST204 error from upsert_dore_options_plans_batch()).
+#    Idempotent — safe to re-run. Run this in Supabase SQL Editor if
+#    dore_options_plans already exists.
+#    NOTE: no last_drift_pct column — it's derived from last_premium vs
+#    entry_locked at read time, never persisted, so there's nothing to
+#    add/backfill for it here even though it was the column named in the
+#    original error (the code that used to write it has been reverted).
+DORE_OPTIONS_PLANS_MIGRATION_SQL = """
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS last_premium   numeric(12,2);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS last_seen_at   timestamptz;
 """
 
 

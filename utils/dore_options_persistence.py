@@ -29,12 +29,20 @@ What this module owns:
      saved number — the plan's own "how far has this moved since I'd
      have entered" readout, independent of the entry-zone-vs-LTP check
      Stage 6 already does inside dore_options_engine.py. Every cycle a
-     contract is reproduced, its `last_premium`/`last_drift_pct`/
-     `last_seen_at` are refreshed too (2026-08-01) — entry_locked itself
-     never moves, but this gives a "last known" reading for the
-     dedicated Active Plans tab (see below) to show even when the main
-     DORE Options table's own scan cycle hasn't reproduced this
-     contract recently.
+     contract is reproduced, its `last_premium`/`last_seen_at` are
+     refreshed too (2026-08-01) — entry_locked itself never moves, but
+     this gives a "last known" reading for the dedicated Active Plans
+     tab (see below) to show even when the main DORE Options table's
+     own scan cycle hasn't reproduced this contract recently.
+
+     2026-08-01 (revised): Drift %/P&L is deliberately NOT persisted as
+     its own column — it's fully derived from last_premium and
+     entry_locked (both already stored), so a stored last_drift_pct
+     would just be redundant state that could drift out of sync with
+     its own inputs. Every consumer computes it fresh via _drift_pct()
+     at read time instead — enrich_trade_plans_with_persistence() for
+     the live table's THIS-tick current_premium, active_plan_rows() for
+     the Active Plans tab's last-known last_premium.
 
 Contract identity — like the legacy module, an option contract is
 symbol + direction (CE/PE) + strike + expiry (calendar date here, not
@@ -64,8 +72,8 @@ reads its own snapshot independent of the F&O panel.
 Public API
 ──────────
   DoreOptionsPlan                  dataclass — one frozen entry (+ locked
-                                    SL/T1/T2, + last-known premium/drift)
-                                    for one option contract
+                                    SL/T1/T2, + last-known premium) for
+                                    one option contract
   DoreOptionsPlanStatus            enum — OPEN / CLOSED
   enrich_trade_plans_with_persistence()  main integration point, called
                                     by utils.dore_options_scan (locks
@@ -133,11 +141,13 @@ class DoreOptionsPlan:
 
     # 2026-08-01: refreshed every cycle this contract is reproduced by
     # the live scan (never on cycles it isn't) — lets the Active Plans
-    # tab show a "last known" premium/drift even between live sightings,
+    # tab show a "last known" premium even between live sightings,
     # without re-fetching the option chain itself. entry_locked/sl/t1/t2
     # above are never touched by this — those stay frozen at mint time.
+    # NOTE: drift/P&L is intentionally NOT stored alongside this — it's
+    # derived from last_premium vs entry_locked at read time (see
+    # _drift_pct()), since storing it too would just be redundant state.
     last_premium:        Optional[float] = None
-    last_drift_pct:       Optional[float] = None
     last_seen_at:         str   = ""
 
     status:              str   = DoreOptionsPlanStatus.OPEN
@@ -166,7 +176,6 @@ class DoreOptionsPlan:
             "target2_locked":      self.target2_locked,
             "confidence_at_entry": self.confidence_at_entry,
             "last_premium":        self.last_premium,
-            "last_drift_pct":      self.last_drift_pct,
             "last_seen_at":        self.last_seen_at or None,
             "status":              _sval(self.status),
             "closed_at":           self.closed_at or None,
@@ -255,9 +264,9 @@ def enrich_trade_plans_with_persistence(
             plan_status_label), one per input plan, same order.
         updated_plans — DoreOptionsPlan objects to upsert this cycle:
             every reproduced OPEN contract (its last_premium/
-            last_drift_pct/last_seen_at just refreshed) plus any newly
-            minted or newly expired-closed entries. An empty list means
-            `plans` was empty this cycle — nothing to persist.
+            last_seen_at just refreshed) plus any newly minted or newly
+            expired-closed entries. An empty list means `plans` was
+            empty this cycle — nothing to persist.
     """
     today = _today_str()
     enriched_rows: list[dict] = []
@@ -303,12 +312,12 @@ def enrich_trade_plans_with_persistence(
 
             drift = _drift_pct(current_premium, locked.entry_locked)
 
-            # Refresh the "last known" fields every cycle this contract
+            # Refresh the "last known" premium every cycle this contract
             # is actually reproduced — and persist regardless of
             # just_minted, so the Active Plans tab stays current even on
             # cycles that only reused (not re-minted) the locked entry.
+            # Drift itself is derived, not stored (see class docstring).
             locked.last_premium = current_premium
-            locked.last_drift_pct = drift
             locked.last_seen_at = _now_iso()
             updated_plans.append(locked)
 
@@ -363,13 +372,15 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
     fresh each render, this function does no I/O of its own.
 
     Every field here comes from the persisted plan itself — current
-    premium/drift are "last known" (as of last_seen_at), not re-fetched
-    live, since that would mean an extra option-chain fetch per open
-    plan outside DORE's own shortlisted scan cycle (see
+    premium is "last known" (as of last_seen_at), not re-fetched live,
+    since that would mean an extra option-chain fetch per open plan
+    outside DORE's own shortlisted scan cycle (see
     utils.dore_options_scan._shortlist_for_option_chain's docstring for
     why that fetch is budgeted, not unlimited). A plan whose last_seen_at
     is old simply shows its own age — never fabricated as fresher than
-    it is.
+    it is. `last_drift_pct` in the returned row is computed here from
+    last_premium/entry_locked, not read off a stored column — see
+    DoreOptionsPlan's docstring for why that's derived, not persisted.
     """
     rows: list[dict] = []
     for plan in open_plans.values():
@@ -385,7 +396,7 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
                 "saved_target1": plan.target1_locked,
                 "saved_target2": plan.target2_locked,
                 "last_premium": plan.last_premium,
-                "last_drift_pct": plan.last_drift_pct,
+                "last_drift_pct": _drift_pct(plan.last_premium, plan.entry_locked),
                 "last_seen_at": plan.last_seen_at,
                 "created_date": plan.created_date,
                 "plan_age_days": days_active,
