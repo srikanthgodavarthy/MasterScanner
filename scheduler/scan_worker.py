@@ -308,7 +308,7 @@ JOBS = [
     # (utils/scanner_engine.py), 180s keeps this comfortably fresh while
     # cutting sustained CPU/network load roughly 6x.
     ("market_intelligence", "market_intelligence", 180, _market_intelligence_compute, _market_intelligence_payload),
-    ("fo_scan",             "fo_scan",             60,  _fo_scan_compute,             _fo_scan_payload),
+    #("fo_scan",             "fo_scan",             60,  _fo_scan_compute,             _fo_scan_payload),
     # [2026-07-31] DORE Options Engine Integration — new primary options
     # pipeline. Same 60s cadence as fo_scan (it reads the same
     # live_scanner snapshot fo_scan's universe is built from, and the
