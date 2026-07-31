@@ -3337,10 +3337,22 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
         entry_html = f'<div style="color:var(--muted);font-size:11px;">Entry {_fmt_money(entry)}</div>'
         return f'{_fmt_pct_chg(drift)}{entry_html}'
 
+    def _fmt_plan_status(row):
+        # 2026-07-31: "Plan" column — is this recommendation actually a
+        # persisted/live entry, and since when. "—" (not "🟢 Active") when
+        # persistence never ran this cycle (Supabase unavailable — see
+        # enrich_trade_plans_with_persistence's fail-soft path in
+        # utils.dore_options_scan), so a missing badge always means
+        # "unknown", never a false positive.
+        label = row.get("plan_status_label")
+        if label in (None, "") or (isinstance(label, float) and pd.isna(label)):
+            return '<span style="color:var(--muted)">—</span>'
+        return f'<span style="color:#3fb950;font-size:12px;">{label}</span>'
+
     if "confidence_score" in df.columns:
         df = df.sort_values("confidence_score", ascending=False, kind="stable")
 
-    headers = ["Symbol", "Direction", "Primary Strike", "Current Premium", "Entry Zone", "Stop Loss",
+    headers = ["Symbol", "Direction", "Primary Strike", "Current Premium", "Plan", "Entry Zone", "Stop Loss",
                "Target 1", "Target 2", "Saved Entry / Drift %", "POP %", "Confidence", "Qualification",
                "Conviction", "Entry Quality", "Regime", "Expiry", "DTE", "Exit Before Expiry"]
 
@@ -3362,6 +3374,7 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
             f'<td style="color:{dir_color};font-weight:700;">{_fmt_text(direction)}</td>',
             f'<td style="font-weight:700;">{strike_disp}</td>',
             f'<td>{_fmt_current_premium(r)}</td>',
+            f'<td>{_fmt_plan_status(r)}</td>',
             f'<td>{_fmt_entry_zone(r.get("entry_zone"))}</td>',
             f'<td>{_fmt_money(r.get("stop_loss"))}</td>',
             f'<td>{_fmt_money(r.get("target1"))}</td>',
