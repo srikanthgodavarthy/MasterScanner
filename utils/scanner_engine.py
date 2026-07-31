@@ -653,7 +653,6 @@ def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d",
     return get_history(list(symbols), years=years, min_bars=60, source=source)
 
 @st.cache_data(ttl=60, show_spinner=False)
-@st.cache_data(ttl=60, show_spinner=False)
 def fetch_nifty(period: str = "1y", source: str = "yfinance") -> pd.Series:
     """
     Fetch Nifty 50 close series for regime classification and as the
