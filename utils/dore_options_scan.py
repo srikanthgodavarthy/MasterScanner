@@ -147,12 +147,31 @@ def _shortlist_score(row: dict, w: ShortlistWeights) -> float:
 #  Pre-rank blends: Conviction, Entry Quality, today's %-move, volume
 #  expansion, and recent momentum (see ShortlistWeights / _shortlist_
 #  score above).
+#
+#  2026-08-02: `always_include` exempts symbols with an already-OPEN
+#  DoreOptionsPlan from this cost cutoff entirely. Before this, an open
+#  plan and a fresh candidate competed on identical terms — a plan
+#  minted on a strong day could later cool off on today's %-move/
+#  volume/momentum, drop out of the top N, and then NEVER get its
+#  last_premium/last_seen_at refreshed again (Active Plans tab shows
+#  "Never reproduced" / "—" indefinitely even though the position is
+#  still open — see utils/dore_options_persistence.py's docstrings).
+#  An open position isn't optional discovery work; its premium/P&L
+#  needs refreshing regardless of how it scores today. These symbols
+#  are added on top of the top-`max_symbols` cut, so they never
+#  displace a fresh candidate's slot and never count against the
+#  budget — this is a floor, not part of the ranked competition.
 # ══════════════════════════════════════════════════════════════════
 
 def _shortlist_for_option_chain(
-    live_pool: dict, max_symbols: int, weights: Optional[ShortlistWeights] = None,
+    live_pool: dict,
+    max_symbols: int,
+    weights: Optional[ShortlistWeights] = None,
+    always_include: Optional[set] = None,
 ) -> list[str]:
     symbols = [s for s in live_pool.keys() if s not in _INDICES]
+    always = {s for s in (always_include or ()) if s in live_pool and s not in _INDICES}
+
     if len(symbols) <= max_symbols:
         return symbols
 
@@ -161,7 +180,21 @@ def _shortlist_for_option_chain(
     def _rank_key(sym: str) -> float:
         return _shortlist_score(live_pool[sym], w)
 
-    return sorted(symbols, key=_rank_key, reverse=True)[:max_symbols]
+    ranked = sorted(symbols, key=_rank_key, reverse=True)[:max_symbols]
+    if not always:
+        return ranked
+
+    # Exempt symbols on top of the ranked cut, preserving rank order
+    # for the ranked portion and appending the rest.
+    ranked_set = set(ranked)
+    exempted = [s for s in always if s not in ranked_set]
+    if exempted:
+        logger.debug(
+            "[DORE Options] %d open-plan symbol(s) exempted onto this cycle's "
+            "shortlist despite ranking outside the top %d: %s",
+            len(exempted), max_symbols, sorted(exempted),
+        )
+    return ranked + exempted
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -178,6 +211,7 @@ def top_dore_trade_plans(
     iv_lookup: Optional[dict] = None,
     shortlist_weights: Optional[ShortlistWeights] = None,
     progress_cb=None,
+    open_plan_symbols: Optional[set] = None,
 ) -> pd.DataFrame:
     """
     Args:
@@ -190,6 +224,13 @@ def top_dore_trade_plans(
         iv_lookup: optional symbol -> {"iv_rank": .., "iv_percentile": ..}
             — pluggable per Improvement #7; omit entirely until an IV
             engine exists, every symbol just gets IVContext() (no-op).
+        open_plan_symbols: symbols with a currently-OPEN DoreOptionsPlan
+            (from utils.supabase_client.load_open_dore_options_plans()).
+            Exempted onto this cycle's option-chain shortlist regardless
+            of score, so an open position's last_premium/last_seen_at
+            keep refreshing even on days it wouldn't rank in the top
+            `max_option_chain_symbols` — see _shortlist_for_option_
+            chain's docstring. Omit to keep the old score-only behavior.
 
     Returns a DataFrame, one row per symbol that produced an
     OptionTradePlan, sorted by confidence_score descending (ties broken
@@ -204,7 +245,10 @@ def top_dore_trade_plans(
     settings = _load_settings(cfg)
     iv_lookup = iv_lookup or {}
 
-    stock_symbols = _shortlist_for_option_chain(live_pool, max_option_chain_symbols, weights=shortlist_weights)
+    stock_symbols = _shortlist_for_option_chain(
+        live_pool, max_option_chain_symbols, weights=shortlist_weights,
+        always_include=open_plan_symbols,
+    )
     index_symbols = [s for s in live_pool.keys() if s in _INDICES]
 
     stock_atm_options = (
@@ -310,7 +354,23 @@ def compute_dore_options_scan(cfg: Optional[DoreOptionsSettings] = None) -> dict
         logger.info("[dore_options_scan] live_scanner snapshot is empty this cycle — nothing to rank")
         return {"trade_plans": [], "rejections": [], "diagnostics": {"universe_size": 0}}
 
-    df = top_dore_trade_plans(live_pool, cfg=cfg)
+    # 2026-08-02: exempt symbols with an already-OPEN plan from the
+    # shortlist's cost cutoff — see top_dore_trade_plans'/_shortlist_
+    # for_option_chain's docstrings. Best-effort: if Supabase is down
+    # or this raises for any reason, fall through with no exemptions
+    # rather than fail the whole scan cycle over it.
+    open_plan_symbols: set = set()
+    try:
+        from utils.supabase_client import load_open_dore_options_plans
+        open_plan_symbols = {
+            plan.symbol for plan in load_open_dore_options_plans().values()
+            if getattr(plan, "symbol", None)
+        }
+    except Exception:
+        logger.exception("[dore_options_scan] could not load open plan symbols for shortlist "
+                          "exemption (non-fatal, shortlist falls back to score-only this cycle)")
+
+    df = top_dore_trade_plans(live_pool, cfg=cfg, open_plan_symbols=open_plan_symbols)
     rejections = df.attrs.get("dore_rejections", [])
 
     invalid = find_invalid_columns(df)
