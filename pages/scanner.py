@@ -3095,240 +3095,34 @@ def _sc_counts_html(df: pd.DataFrame) -> str:
     return '<div class="sc-counts">' + "".join(parts) + '</div>'
 
 
-# ── DORE 2.0 F&O OPPORTUNITIES — Futures / Options tabs ────────────
-# [2026-07-27] Moved here from pages/dashboard.py — the F&O Opportunity
-# Engine now renders on the Scanner page, right after the Scanner's own
-# Elite/Execute/Actionable/... output (see render() below: Scanner
-# output, then Futures and Options).
-# 2026-07-20: DORE 2.0 is architecturally independent of MasterScanner
+# ── DORE OPTIONS ENGINE ─────────────────────────────────────────────
+# [2026-07-27] Moved here from pages/dashboard.py — the Options
+# Opportunity Engine now renders on the Scanner page, right after the
+# Scanner's own Elite/Execute/Actionable/... output (see render()
+# below).
+# 2026-07-20: DORE is architecturally independent of MasterScanner
 # (shares only the Market Data Layer — see docs/DORE_2_0_ARCHITECTURE.md
-# Principle 2.1). Both tabs now run DORE's own Stage 0-5 hierarchical
-# funnel (Universe -> Trend Qualification -> Execution Qualification ->
-# Derivative Intelligence -> Risk Engine -> Opportunity Ranking) instead
-# of ranking off the scanner's OppScore/Recommendation/T1 columns.
-# 2026-07-22 dashboard revisit: Action and Execution State were two
-# separate columns saying overlapping things (Action derives from the
-# Recommendation, which is itself gated partly by Execution State) —
-# collapsed into one "Action / Execution" column.
-# 2026-07-23: sort now keys directly off that merged Action column
-# (using the same tier order as _ACTION_TIER_STYLE, i.e. Buy Now / In
-# Trade first, No Trade last) instead of the raw Recommendation string —
-# so the sort order always matches what the row's own Action badge
-# shows, including the plan-aware "In Trade"/"Manage Trade" overrides
-# from enrich_fo_opportunities_df. Opportunity Score (desc) breaks ties
-# within a tier, then Leg (CE before PE) breaks any remaining ties.
-
-# Action-tier coloring for the Options tab table (utils.dore_fo_screener.
-# _action_tier's label set), collapsed to 7 coarse buckets so the whole
-# row can be tinted by "can I act on this right now" rather than the
-# specific CE/PE recommendation.
-_ACTION_TIER_STYLE = {
-    "Buy Now":          ("#3fb950", "🟢"),
-    "Wait for Trigger":  ("#58a6ff", "🔵"),
-    "Watch Only":        ("#a371f7", "🟣"),
-    "Hold":               ("#d29922", "🟡"),
-    "Book Profits":       ("#f85149", "🔴"),
-    "Wait":                ("#8b949e", "⚪"),
-    "No Trade":            ("#484f58", "⚫"),
-    # 2026-07-23: plan-aware overrides — see utils.fo_setup_persistence.
-    # enrich_fo_opportunities_df() step 4. Once a plan is ACTIVE or has
-    # hit T1, these replace the live Recommendation-derived tier so the
-    # Action column never contradicts the Plan column again.
-    "In Trade":            ("#3fb950", "🟢"),
-    "Manage Trade":        ("#f5c542", "🎯"),
-}
-
-_ACTION_SORT_PRIORITY = {
-    "Buy Now": 0,
-    "In Trade": 1,
-    "Manage Trade": 2,
-    "Wait for Trigger": 3,
-    "Watch Only": 4,
-    "Hold": 5,
-    "Book Profits": 6,
-    "Wait": 7,
-    "No Trade": 8,
-}
-_LEG_SORT_PRIORITY = {"CE": 0, "PE": 1}
-
-
-def _sort_by_action_then_score_then_leg(df: pd.DataFrame, action_col: str = "Action") -> pd.DataFrame:
-    """Sort by Action/Execution tier first (Buy Now / In Trade lead, No
-    Trade trails), then Opportunity Score descending, then Leg (CE
-    before PE) — matches how a trader scans this table: can I act right
-    now?, then what's the best of those?, then CE before PE."""
-    if action_col not in df.columns:
-        return df
-    out = df.assign(
-        _action_rank=df[action_col].map(lambda a: _ACTION_SORT_PRIORITY.get(a, 9)),
-        _opp_desc=-df["Opportunity Score"].fillna(0) if "Opportunity Score" in df.columns else 0,
-        _leg_rank=df["Leg"].map(lambda l: _LEG_SORT_PRIORITY.get(l, 2)) if "Leg" in df.columns else 0,
-    )
-    out = out.sort_values(
-        ["_action_rank", "_opp_desc", "_leg_rank"], kind="stable"
-    ).drop(columns=["_action_rank", "_opp_desc", "_leg_rank"])
-    return out
-
-
-def _options_table_html(df: pd.DataFrame) -> str:
-    """Render the Options-tab opportunity table as a colored HTML table
-    instead of st.dataframe — st.dataframe's column_config can format
-    numbers/text but can't tint a cell/row by value, and the whole point
-    of the Action column is 'can I act on this at a glance', which needs
-    color. Each row is tinted by Action tier (see _ACTION_TIER_STYLE).
-
-    Column order (2026-07-23 revisit): Symbol, LTP, Leg, Strike, Premium,
-    Premium %Chg, Opportunity, Entry, Entry Drift %, SL, T1, T2, Plan,
-    Expiry, Strike Type, Reason, Action/Execution State — Strike Type
-    moved to just after Expiry; Action and Execution State remain merged
-    into one trailing column since they were saying overlapping things.
-    "Watch Only" rows are dropped entirely (not actionable, just
-    clutter). Rows are sorted by Action/Execution tier, then Opportunity
-    Score, then Leg (see _sort_by_action_then_score_then_leg).
-
-    2026-07-28 revisit: Leg + Strike merged into one "Contract" column
-    ("PE 1700" instead of two separate cells reading "PE" / "1700") —
-    that's how the strike is actually referred to when acting on it.
-    Expiry now renders as the real calendar date + days-to-expiry
-    ("27 Aug (12d)") instead of a bare "MONTHLY"/"CURRENT_WEEK" label,
-    using the "Expiry Date"/"Days To Expiry" columns (see utils.fo_scan's
-    2026-07-28 addition) with the original label kept as a small
-    sub-line since it's still meaningful (index weekly vs stock
-    monthly).
-
-    2026-07-23 fix: dropped the standalone "Entry Timestamp (IST)"
-    column — it was confusing next to "Entry" (the price), reading like
-    it timestamped the Entry price rather than the plan's current
-    lifecycle state. The same timestamp (WAITING->created_at,
-    ACTIVE->activated_at, T1_HIT->t1_hit_at) now renders as a second
-    line directly under the Plan status badge instead, where "when did
-    this plan reach its current state" actually belongs.
-    """
-    def _fmt_money(v):
-        return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
-
-    def _fmt_num(v, decimals=0):
-        return f"{v:,.{decimals}f}" if v not in (None, "") and pd.notna(v) else "—"
-
-    def _fmt_pct(v):
-        if v in (None, "") or pd.isna(v):
-            return "—"
-        color = "#3fb950" if v >= 0 else "#f85149"
-        return f'<span style="color:{color}">{"+" if v >= 0 else ""}{v:.2f}%</span>'
-
-    def _fmt_text(v):
-        return v if v not in (None, "") and pd.notna(v) else "—"
-
-    def _fmt_expiry(label, date_str, days):
-        """'27 Aug (12d)' with the MONTHLY/CURRENT_WEEK/NEXT_WEEK label
-        as a small sub-line — falls back to the bare label alone for
-        back-compat rows that don't have Expiry Date/Days To Expiry
-        yet (see the back-compat fill in _fo_opportunities_panel)."""
-        label_txt = _fmt_text(label)
-        if date_str in (None, "") or pd.isna(date_str):
-            return label_txt
-        try:
-            from datetime import datetime
-            d = datetime.strptime(str(date_str)[:10], "%Y-%m-%d")
-            date_disp = d.strftime("%d %b")
-        except Exception:
-            return label_txt
-        days_disp = f" ({int(days)}d)" if days not in (None, "") and pd.notna(days) else ""
-        return (f'{date_disp}{days_disp}'
-                f'<br><span style="color:var(--muted);font-size:10px;">{label_txt}</span>')
-
-    def _fmt_plan_ts(v):
-        """Timestamp of the plan's CURRENT lifecycle state (see
-        enrich_fo_opportunities_df step 3): created_at while WAITING,
-        activated_at once ACTIVE, t1_hit_at once T1_HIT — e.g. a Manage
-        Trade row shows when T1 actually hit, not just the original
-        entry. 2026-07-23: moved out of its own "Entry Timestamp"
-        column (confusing next to the Entry price column) and rendered
-        as a sub-line directly under the Plan status badge.
-        2026-07-23 fix: was 10px in --muted (#8b949e) — too small/low-
-        contrast on the dark theme to read at a glance. Bumped to 12px
-        in --text (the theme's primary readable color) instead of
-        --muted."""
-        if v in (None, "") or pd.isna(v):
-            return ""
-        return f'<br><span style="color:var(--text);font-size:12px;">{v} IST</span>'
-
-    if "Action" in df.columns:
-        df = df[df["Action"] != "Watch Only"]
-    df = _sort_by_action_then_score_then_leg(df)
-
-    headers = ["Symbol", "LTP", "Contract", "Premium", "Premium %Chg",
-               "Opportunity", "Entry", "Entry Drift %",
-               "SL", "T1", "T2", "Plan", "Expiry", "Strike Type", "Reason", "Action / Execution"]
-
-    rows_html = []
-    for _, r in df.iterrows():
-        tier = r.get("Action", "Wait")
-        tier_color, tier_dot = _ACTION_TIER_STYLE.get(tier, ("#8b949e", "⚪"))
-        exec_state = r.get("Execution State", "")
-        leg = r.get("Leg", "")
-        leg_color = "#3fb950" if leg == "CE" else "#f85149" if leg == "PE" else "#8b949e"
-
-        strike_disp = _fmt_num(r.get("Strike")) if r.get("Strike") not in (None, "") and pd.notna(r.get("Strike")) else ""
-        contract_disp = f"{_fmt_text(leg)} {strike_disp}".strip() if leg else (strike_disp or "—")
-
-        cells = [
-            f'<td style="font-weight:700;">{_tv_link(r.get("Symbol", "—"))}</td>',
-            f'<td>{_fmt_money(r.get("LTP"))}</td>',
-            f'<td style="color:{leg_color};font-weight:700;">{contract_disp}</td>',
-            f'<td>{_fmt_money(r.get("Premium"))}</td>',
-            f'<td>{_fmt_pct(r.get("Premium %Chg"))}</td>',
-            f'<td style="font-weight:700;">{_fmt_num(r.get("Opportunity Score"))}</td>',
-            f'<td>{_fmt_money(r.get("Entry"))}</td>',
-            f'<td>{_fmt_pct(r.get("Entry Drift %"))}</td>',
-            f'<td>{_fmt_money(r.get("SL"))}</td>',
-            f'<td>{_fmt_money(r.get("T1"))}</td>',
-            f'<td>{_fmt_money(r.get("T2"))}</td>',
-            f'<td style="white-space:nowrap;">{_fmt_text(r.get("Plan"))}{_fmt_plan_ts(r.get("Entry Timestamp"))}</td>',
-            f'<td style="white-space:nowrap;">{_fmt_expiry(r.get("Expiry"), r.get("Expiry Date"), r.get("Days To Expiry"))}</td>',
-            f'<td>{_fmt_text(r.get("Strike Type"))}</td>',
-            f'<td style="color:var(--muted);font-size:11px;max-width:220px;white-space:normal;">{_fmt_text(r.get("Reason"))}</td>',
-            f'<td style="white-space:nowrap;"><span style="color:{tier_color};font-weight:700;">{tier_dot} {tier}</span>'
-            f'<br><span style="color:var(--muted);font-size:10px;">{_fmt_text(exec_state)}</span></td>',
-        ]
-        rows_html.append(
-            f'<tr style="background:{tier_color}14;border-left:3px solid {tier_color};">'
-            + "".join(cells) + "</tr>"
-        )
-
-    header_html = "".join(
-        f'<th style="text-align:left;padding:6px 10px;color:var(--muted);'
-        f'font-size:11px;text-transform:uppercase;white-space:nowrap;">{h}</th>'
-        for h in headers
-    )
-    return (
-        '<div style="overflow-x:auto;">'
-        '<table style="width:100%;border-collapse:collapse;font-size:13px;">'
-        f'<thead><tr>{header_html}</tr></thead>'
-        f'<tbody>{"".join(rows_html)}</tbody>'
-        '</table></div>'
-        '<style>'
-        'table td{padding:6px 10px;color:var(--text);border-bottom:1px solid rgba(255,255,255,0.05);white-space:nowrap;}'
-        '.tv-link{color:inherit;text-decoration:none;border-bottom:1px dotted var(--muted);}'
-        '.tv-link:hover{color:#58a6ff;border-bottom-color:#58a6ff;}'
-        '</style>'
-    )
+# Principle 2.1).
+# 2026-07-31: removed the Futures tab and all reading of the legacy
+# "fo_scan" snapshot from this page — utils/fo_scan.py and
+# utils/dore_engine.py are untouched and keep running on their own
+# scheduler loop, they're just no longer read or rendered here. See
+# _dore_options_plan_table_html below for the Options pipeline.
 
 
 def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
-    """[2026-07-31] DORE Options Engine Integration — renders the new
+    """[2026-07-31] DORE Options Engine Integration — renders the
     utils.dore_options_engine/utils.dore_options_scan pipeline's output
     (one OptionTradePlan per row, from utils.scan_state's
-    "dore_options_scan" snapshot section). This is now the Options tab's
-    PRIMARY table — see _fo_opportunities_panel's engine toggle for how
-    to switch back to the legacy DORE 2.0 table (_options_table_html,
-    reading "fo_scan") for rollback/comparison.
+    "dore_options_scan" snapshot section). This is the Scanner page's
+    only options table (the legacy fo_scan/dore_engine options table
+    and its engine-choice toggle were removed, and the Futures tab was
+    removed entirely — this page no longer reads the "fo_scan"
+    snapshot at all).
 
-    Column set differs from the legacy table on purpose: this engine
-    emits a complete plan (primary/conservative/aggressive strikes,
-    entry zone, POP, confidence score) rather than the legacy screener's
-    single-recommendation + Action-tier shape, so this is a fresh
-    renderer rather than a reshape into _options_table_html's columns.
+    Column set: this engine emits a complete plan (primary/conservative/
+    aggressive strikes, entry zone, POP, confidence score) rather than a
+    single-recommendation + Action-tier shape.
     """
     def _fmt_money(v):
         return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
@@ -3367,9 +3161,8 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
         return ("#8b949e", "⚪")
 
     def _fmt_pct_chg(v):
-        # Colored +/- %, matching _futures_table_html's _fmt_pct — used
-        # here for the option contract's OWN %Chg (premium vs its prior
-        # close), not the underlying's.
+        # Colored +/- % — used here for the option contract's OWN %Chg
+        # (premium vs its prior close), not the underlying's.
         if v is None or (isinstance(v, float) and pd.isna(v)):
             return '<span style="color:var(--muted)">—</span>'
         color = "#3fb950" if v >= 0 else "#f85149"
@@ -3609,87 +3402,6 @@ def _render_dore_options_active_plans_tab() -> None:
     st.markdown(_dore_options_active_plans_table_html(rows_df), unsafe_allow_html=True)
 
 
-def _futures_table_html(df: pd.DataFrame) -> str:
-    """Futures tab, styled to match the Options table (2026-07-22
-    revisit): TradingView-linked symbol, colored %Chg/Directional
-    Intent, IST Entry Timestamp. Futures has no Action/Execution-State
-    concept (that's an options-chain thing), so rows are tinted by
-    Directional Intent instead and there's no merged tier column.
-    """
-    def _fmt_money(v):
-        return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
-
-    def _fmt_num(v, decimals=0):
-        return f"{v:,.{decimals}f}" if v not in (None, "") and pd.notna(v) else "—"
-
-    def _fmt_pct(v):
-        if v in (None, "") or pd.isna(v):
-            return "—"
-        color = "#3fb950" if v >= 0 else "#f85149"
-        return f'<span style="color:{color}">{"+" if v >= 0 else ""}{v:.2f}%</span>'
-
-    def _fmt_text(v):
-        return v if v not in (None, "") and pd.notna(v) else "—"
-
-    def _fmt_ts(v):
-        if v in (None, "") or pd.isna(v):
-            return "—"
-        s = str(v)
-        time_part = s.split(" ")[-1] if " " in s else s
-        return f'<span title="{s} IST">{time_part} IST</span>'
-
-    if "Directional Intent" in df.columns:
-        df = df.sort_values(
-            by=["Directional Intent", "Trend Score"] if "Trend Score" in df.columns else ["Directional Intent"],
-            ascending=[True, False] if "Trend Score" in df.columns else [True],
-            kind="stable",
-        )
-
-    headers = ["Stock", "CMP", "%Chg", "Directional Intent", "Buildup", "OI", "OI Chg",
-               "Entry", "Entry Timestamp (IST)", "SL", "Target", "Expiry"]
-
-    rows_html = []
-    for _, r in df.iterrows():
-        intent = r.get("Directional Intent", "")
-        intent_color = "#3fb950" if intent == "BULLISH" else "#f85149" if intent == "BEARISH" else "#8b949e"
-        cells = [
-            f'<td style="font-weight:700;">{_tv_link(r.get("Stock", "—"), pct_chg=r.get("%Chg"))}</td>',
-            f'<td>{_fmt_money(r.get("CMP"))}</td>',
-            f'<td>{_fmt_pct(r.get("%Chg"))}</td>',
-            f'<td style="color:{intent_color};font-weight:600;">{_fmt_text(intent)}</td>',
-            f'<td>{_fmt_text(r.get("Buildup"))}</td>',
-            f'<td>{_fmt_num(r.get("OI"))}</td>',
-            f'<td>{_fmt_num(r.get("OI Chg"))}</td>',
-            f'<td>{_fmt_money(r.get("Entry"))}</td>',
-            f'<td style="color:var(--muted);font-size:11px;">{_fmt_ts(r.get("Entry Timestamp"))}</td>',
-            f'<td>{_fmt_money(r.get("SL"))}</td>',
-            f'<td>{_fmt_money(r.get("Target"))}</td>',
-            f'<td>{_fmt_text(r.get("Expiry"))}</td>',
-        ]
-        rows_html.append(
-            f'<tr style="background:{intent_color}14;border-left:3px solid {intent_color};">'
-            + "".join(cells) + "</tr>"
-        )
-
-    header_html = "".join(
-        f'<th style="text-align:left;padding:6px 10px;color:var(--muted);'
-        f'font-size:11px;text-transform:uppercase;white-space:nowrap;">{h}</th>'
-        for h in headers
-    )
-    return (
-        '<div style="overflow-x:auto;">'
-        '<table style="width:100%;border-collapse:collapse;font-size:13px;">'
-        f'<thead><tr>{header_html}</tr></thead>'
-        f'<tbody>{"".join(rows_html)}</tbody>'
-        '</table></div>'
-        '<style>'
-        'table td{padding:6px 10px;color:var(--text);border-bottom:1px solid rgba(255,255,255,0.05);white-space:nowrap;}'
-        '.tv-link{color:inherit;text-decoration:none;border-bottom:1px dotted var(--muted);}'
-        '.tv-link:hover{color:#58a6ff;border-bottom-color:#58a6ff;}'
-        '</style>'
-    )
-
-
 _FO_SCAN_REFRESH_SECS = 60  # [2026-07-25 ops fix] was 30 — matches the producer's
                             # own 60s cadence (scheduler/scan_worker.py); polling
                             # faster than that just re-checked unchanged metadata,
@@ -3697,59 +3409,36 @@ _FO_SCAN_REFRESH_SECS = 60  # [2026-07-25 ops fix] was 30 — matches the produc
 
 
 @st.fragment(run_every=_FO_SCAN_REFRESH_SECS)
-def _fo_opportunities_panel():
+def _dore_options_panel():
     """
     2026-07-23: rewritten to be event-aware. scheduler/scan_worker.py runs
-    the full futures+options DORE 2.0 universe scan on its own 60s timer
-    (utils/fo_scan.py::compute_fo_scan()) — this function no longer calls
-    top_futures_opportunities()/top_options_opportunities() itself. Before
-    this rewrite this panel had NO fragment isolation at all and re-ran
-    the full scan on every single Dashboard interaction; now it's a cheap
-    metadata poll + (only-when-changed) table render.
+    the option-scan pipeline on its own 60s timer — this function no
+    longer computes anything itself, only polls the snapshot metadata
+    and re-renders the table only when it changes.
 
-    2026-07-31 — DORE Options Engine Integration: the Options tab's
-    PRIMARY source is now utils.dore_options_scan's "dore_options_scan"
-    snapshot (utils/dore_options_engine.py's independent trade-plan
-    pipeline). The legacy "fo_scan" pipeline (utils/fo_scan.py +
-    utils/dore_engine.py, formerly the only source) keeps running on its
-    own 60s scheduler loop unchanged and stays one radio-button away —
-    "Legacy DORE 2.0" — for rollback or side-by-side comparison. Neither
-    pipeline writes to or reads from the other's snapshot; switching the
-    radio only changes what this panel reads, not which producers run.
-    The Futures tab is untouched — it has always been, and remains,
-    fo_scan/dore_engine's output only; this task is scoped to Options.
+    2026-07-31 — DORE Options Engine Integration: source is
+    utils.dore_options_scan's "dore_options_scan" snapshot
+    (utils/dore_options_engine.py's independent trade-plan pipeline).
+
+    2026-07-31 — removed the legacy "fo_scan"-backed options table and
+    its "DORE Options Engine (primary) / Legacy DORE 2.0" radio toggle;
+    this panel always renders the DORE Options Engine output.
+
+    2026-07-31 — removed the Futures tab and all "fo_scan" snapshot
+    reading from this page (fo_scan/dore_engine's futures output was
+    this panel's only remaining fo_scan consumer once the legacy
+    options table above was removed). utils/fo_scan.py and
+    utils/dore_engine.py are untouched and keep running on their own
+    scheduler loop — this only removes what pages/scanner.py reads and
+    renders from them.
     """
     from utils.scan_state import load_snapshot_meta, load_snapshot_payload
 
-    st.markdown('<div class="ti-panel-title" style="margin-top:0.6rem;">🎯 DORE 2.0 F&amp;O OPPORTUNITY ENGINE</div>',
+    st.markdown('<div class="ti-panel-title" style="margin-top:0.6rem;">🎯 DORE OPTIONS ENGINE</div>',
                 unsafe_allow_html=True)
 
-    meta = load_snapshot_meta("fo_scan")
-    if meta is None:
-        st.caption("F&O Opportunity Engine: waiting for the first scheduled scan "
-                   "(scheduler/scan_worker.py) — nothing to show yet.")
-        return
-
-    if meta.get("version") != st.session_state.get("fo_scan_version"):
-        full = load_snapshot_payload("fo_scan")
-        if full is not None:
-            st.session_state["fo_scan_version"] = full.get("version")
-            st.session_state["fo_scan_payload"] = full.get("payload") or {}
-        # else: latest row is "running"/"failed" — keep the last good
-        # cached payload rather than blanking the panel.
-
-    payload = st.session_state.get("fo_scan_payload")
-    if not payload:
-        st.caption("F&O Opportunity Engine: latest scan hasn't completed successfully yet.")
-        return
-
-    fut_df = pd.DataFrame(payload.get("futures") or [])
-    opt_df = pd.DataFrame(payload.get("options") or [])
-
-    # ── DORE Options Engine (primary, 2026-07-31) — separate poll, same
-    # cheap meta-then-payload pattern as fo_scan above, own session_state
-    # cache keys so a stale/failed cycle on either pipeline never blanks
-    # the other's last-good cached payload.
+    # ── DORE Options Engine — same cheap meta-then-payload poll pattern
+    # as the rest of this page's snapshot panels.
     dore_opt_meta = load_snapshot_meta("dore_options_scan")
     if dore_opt_meta is not None and dore_opt_meta.get("version") != st.session_state.get("dore_options_scan_version"):
         dore_opt_full = load_snapshot_payload("dore_options_scan")
@@ -3761,110 +3450,38 @@ def _fo_opportunities_panel():
     dore_opt_df = pd.DataFrame(dore_opt_payload.get("trade_plans") or [])
     dore_opt_rejections = dore_opt_payload.get("rejections") or []
 
-    tab_fut, tab_opt = st.tabs(["📈 Futures", "🎯 Options"])
+    # 2026-08-01: split into Live Scan (this cycle's reproduced
+    # recommendations) vs Active Plans (every currently-OPEN locked
+    # entry, read straight from Supabase — see
+    # _render_dore_options_active_plans_tab's docstring).
+    live_scan_tab, active_plans_tab = st.tabs(["📡 Live Scan", "📋 Active Plans"])
 
-    with tab_fut:
-        if fut_df.empty:
-            st.caption("No live futures data available right now — check the Upstox token, or "
-                       "every F&O name is currently NEUTRAL on DORE's own Trend Engine (Stage 1).")
+    with live_scan_tab:
+        if dore_opt_meta is None:
+            st.caption("DORE Options Engine: waiting for the first scheduled scan "
+                       "(scheduler/scan_worker.py's dore_options_scan loop) — nothing to show yet.")
+        elif dore_opt_df.empty:
+            n_rej = len(dore_opt_rejections)
+            st.caption("No DORE Options trade plans right now — every shortlisted candidate "
+                       f"was hard-rejected this cycle ({n_rej} rejection(s): missing option "
+                       "chain, no OHLCV history, or no liquid strike found) or the live_scanner "
+                       "universe is currently empty.")
         else:
-            if "Entry Timestamp" not in fut_df.columns:
-                # Back-compat: cached df from before this column existed.
-                fut_df = fut_df.copy()
-                fut_df["Entry Timestamp"] = None
-            st.markdown(_futures_table_html(fut_df), unsafe_allow_html=True)
+            st.markdown(_dore_options_plan_table_html(dore_opt_df), unsafe_allow_html=True)
+            st.caption("🟢 Confidence ≥75 · 🔵 ≥55 · 🟡 ≥35 · ⚪ below — DORE's own final_score, "
+                       "blending qualification, direction strength, and premium/liquidity "
+                       "validation into one ranking. Primary Strike is the balanced pick; "
+                       "Conservative/Aggressive alternatives aren't shown here — see the full "
+                       "trade plan via utils.dore_options_engine.OptionTradePlan.format_output() "
+                       "for those. Entry Zone / Stop Loss / Targets are in PREMIUM rupees, not "
+                       "the underlying's price. This is a screener, not an order ticket — confirm "
+                       "liquidity (bid/ask) before acting.")
+            if dore_opt_rejections:
+                st.caption(f"{len(dore_opt_rejections)} shortlisted candidate(s) hard-rejected "
+                           "this cycle (missing chain/OHLCV/liquidity) — not shown above.")
 
-    with tab_opt:
-        engine_choice = st.radio(
-            "Options engine",
-            options=["DORE Options Engine (primary)", "Legacy DORE 2.0 (rollback / comparison)"],
-            index=0,
-            horizontal=True,
-            key="options_engine_choice",
-            label_visibility="collapsed",
-        )
-
-        if engine_choice.startswith("DORE Options Engine"):
-            # 2026-08-01: split into Live Scan (this cycle's reproduced
-            # recommendations, as before) vs Active Plans (every
-            # currently-OPEN locked entry, read straight from Supabase —
-            # see _render_dore_options_active_plans_tab's docstring).
-            live_scan_tab, active_plans_tab = st.tabs(["📡 Live Scan", "📋 Active Plans"])
-
-            with live_scan_tab:
-                if dore_opt_meta is None:
-                    st.caption("DORE Options Engine: waiting for the first scheduled scan "
-                               "(scheduler/scan_worker.py's dore_options_scan loop) — nothing to show yet.")
-                elif dore_opt_df.empty:
-                    n_rej = len(dore_opt_rejections)
-                    st.caption("No DORE Options trade plans right now — every shortlisted candidate "
-                               f"was hard-rejected this cycle ({n_rej} rejection(s): missing option "
-                               "chain, no OHLCV history, or no liquid strike found) or the live_scanner "
-                               "universe is currently empty.")
-                else:
-                    st.markdown(_dore_options_plan_table_html(dore_opt_df), unsafe_allow_html=True)
-                    st.caption("🟢 Confidence ≥75 · 🔵 ≥55 · 🟡 ≥35 · ⚪ below — DORE's own final_score, "
-                               "blending qualification, direction strength, and premium/liquidity "
-                               "validation into one ranking. Primary Strike is the balanced pick; "
-                               "Conservative/Aggressive alternatives aren't shown here — see the full "
-                               "trade plan via utils.dore_options_engine.OptionTradePlan.format_output() "
-                               "for those. Entry Zone / Stop Loss / Targets are in PREMIUM rupees, not "
-                               "the underlying's price. This is a screener, not an order ticket — confirm "
-                               "liquidity (bid/ask) before acting.")
-                    if dore_opt_rejections:
-                        st.caption(f"{len(dore_opt_rejections)} shortlisted candidate(s) hard-rejected "
-                                   "this cycle (missing chain/OHLCV/liquidity) — not shown above.")
-
-            with active_plans_tab:
-                _render_dore_options_active_plans_tab()
-        else:
-            if opt_df.empty:
-                st.caption("No DORE-qualified option setups right now — either the Upstox token needs "
-                           "checking, or every F&O candidate is currently gated to WAIT/NO_TRADE (see "
-                           "the Market Intelligence index cards for why).")
-            else:
-                _opt_display_cols = [
-                    "Symbol", "LTP", "Action", "Recommendation", "Leg", "Strike", "Premium", "Premium %Chg",
-                    "Strike Type", "Execution State",
-                    "Opportunity Score", "Entry", "Entry Drift %", "Entry Timestamp",
-                    "SL", "T1", "T2", "Plan", "Expiry", "Expiry Date", "Days To Expiry", "Reason",
-                ]
-                # Older cached runs (or a plan-enrichment failure) may not have
-                # every column yet — filter to what's actually present rather
-                # than KeyError on a partial frame.
-                opt_df_display = opt_df[[c for c in _opt_display_cols if c in opt_df.columns]].copy()
-                for _missing_col in ("LTP", "Entry Timestamp", "Entry Drift %", "Expiry Date", "Days To Expiry"):
-                    # Back-compat: a cached df from before these columns
-                    # existed — render blank rather than KeyError.
-                    if _missing_col not in opt_df_display.columns:
-                        opt_df_display[_missing_col] = None
-                if "Action" not in opt_df_display.columns:
-                    # Back-compat: a cached df from before the Action column
-                    # existed. Derive it inline rather than failing the panel.
-                    from utils.dore_fo_screener import _action_tier
-                    opt_df_display["Action"] = opt_df_display["Recommendation"].map(_action_tier)
-                if "Premium %Chg" in opt_df_display.columns:
-                    opt_df_display["Premium %Chg"] = pd.to_numeric(
-                        opt_df_display["Premium %Chg"], errors="coerce")
-                st.markdown(_options_table_html(opt_df_display), unsafe_allow_html=True)
-                st.caption("🟢 Buy Now = DORE says enter immediately · 🔵 Wait for Trigger = levels are "
-                           "locked but price hasn't confirmed yet (BREAKOUT_PENDING) · 🟣 Watch Only = "
-                           "setup exists, not confirmed to enter · 🟢 In Trade = plan is ACTIVE, hold for "
-                           "T1 · 🎯 Manage Trade = T1 already hit, trail the remainder to T2/SL · Row tint "
-                           "follows the Action column, not Recommendation directly. Once a plan reaches "
-                           "ACTIVE or T1_HIT, Action reflects the plan's own state instead of the live "
-                           "(and by then often stale/contradictory) Recommendation. Entry Timestamp for a "
-                           "locked plan is when that plan actually triggered/was created — not the current "
-                           "scan time — so it stops changing once a plan is open.")
-                st.caption("Runs DORE 2.0's full 5-stage funnel — only rows DORE actually recommends "
-                           "acting on are shown, so this list can legitimately be empty or short on a "
-                           "quiet day. 2026-07-21: BUY_CE_NOW/BUY_PE_NOW additionally require Premium "
-                           "Behavior to show the option premium itself strengthening — a setup where the "
-                           "underlying is ready but the premium hasn't turned yet shows as WATCH_CE/WATCH_PE "
-                           "(Action: Watch Only) instead. Entry/Stop/Targets are in PREMIUM rupees, not the "
-                           "underlying's price. This is a screener, not an order ticket — confirm liquidity "
-                           "(bid/ask) before acting. Kept here for rollback/comparison against the DORE "
-                           "Options Engine — this pipeline is no longer the primary source.")
+    with active_plans_tab:
+        _render_dore_options_active_plans_tab()
 
 
 def render(settings: dict | None = None):
@@ -4127,13 +3744,13 @@ def render(settings: dict | None = None):
         st.markdown(_sc_counts_html(_scan_df_for_page), unsafe_allow_html=True)
 
     # [2026-07-27 page split] Scanner page layout: Scanner output above,
-    # Futures and Options below. DORE 2.0 is independent of the equity
-    # scanner (Principle 2.1) — it runs its own Stage 0-5 funnel over the
-    # shared F&O universe rather than reading df_aug's OppScore/
-    # Recommendation/T1 columns, so it renders unconditionally here (not
-    # gated on _scan_df_for_page being non-empty). See
-    # utils.dore_fo_screener docstring.
-    _fo_opportunities_panel()
+    # Options below. DORE is independent of the equity scanner
+    # (Principle 2.1) — it runs its own pipeline over the shared F&O
+    # universe rather than reading df_aug's OppScore/Recommendation/T1
+    # columns, so it renders unconditionally here (not gated on
+    # _scan_df_for_page being non-empty). See utils.dore_fo_screener
+    # docstring.
+    _dore_options_panel()
 
 
 def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
