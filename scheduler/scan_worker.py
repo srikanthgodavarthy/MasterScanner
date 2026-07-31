@@ -26,6 +26,14 @@ Cadence
 -------
     market_intelligence   — every 30s   (_run_loop, single call/cycle)
     fo_scan               — every 60s   (_run_loop, single call/cycle)
+                             legacy futures+options pipeline
+                             (utils/fo_scan.py + utils/dore_engine.py) —
+                             kept running for rollback/comparison, no
+                             longer the Options tab's primary source.
+    dore_options_scan     — every 60s   (_run_loop, single call/cycle)
+                             utils/dore_options_scan.py — the primary
+                             options pipeline as of 2026-07-31 (DORE
+                             Options Engine Integration).
     live_scanner           — every 5 min, worked through in batches
                               (_run_live_scanner_loop — see below)
 
@@ -205,10 +213,30 @@ def _fo_scan_payload(raw: dict):
     return raw, n
 
 
-# JOBS covers only the two single-call jobs that run through the
-# generic _run_loop. live_scanner is intentionally NOT here — it runs
-# via _run_live_scanner_loop on its own dedicated thread (see main()
-# and utils/inprocess_scheduler.py).
+# ── DORE Options Engine — every 60s ──────────────────────────────────
+# [2026-07-31] DORE Options Engine Integration. Runs alongside, not
+# instead of, _fo_scan_compute above — utils.dore_options_scan writes
+# to its OWN "dore_options_scan" snapshot section (see
+# utils/scan_state.py), so a failure or bad cycle here never touches
+# "fo_scan"'s rows. utils/fo_scan.py + utils/dore_engine.py (the
+# legacy pipeline pages/scanner.py's Options tab used to render
+# exclusively) keep running exactly as before, for rollback/
+# comparison — see pages/scanner.py's _fo_opportunities_panel, which
+# now reads dore_options_scan as the primary source and falls back to
+# / can be switched to fo_scan.
+def _dore_options_scan_compute():
+    from utils.dore_options_scan import compute_dore_options_scan
+    return compute_dore_options_scan()
+
+
+def _dore_options_scan_payload(raw: dict):
+    return raw, len((raw or {}).get("trade_plans", []))
+
+
+# JOBS covers only the single-call jobs that run through the generic
+# _run_loop. live_scanner is intentionally NOT here — it runs via
+# _run_live_scanner_loop on its own dedicated thread (see main() and
+# utils/inprocess_scheduler.py).
 JOBS = [
     # [2026-07-25 ops fix] Was 30s. _market_intelligence_compute() does
     # 3-4 full index OHLCV/OI fetches (Nifty/Sensex/BankNifty + options
@@ -221,6 +249,12 @@ JOBS = [
     # cutting sustained CPU/network load roughly 6x.
     ("market_intelligence", "market_intelligence", 180, _market_intelligence_compute, _market_intelligence_payload),
     ("fo_scan",             "fo_scan",             60,  _fo_scan_compute,             _fo_scan_payload),
+    # [2026-07-31] DORE Options Engine Integration — new primary options
+    # pipeline. Same 60s cadence as fo_scan (it reads the same
+    # live_scanner snapshot fo_scan's universe is built from, and the
+    # option-chain fetch it shortlists against is the same cost class),
+    # independent thread/section — see _dore_options_scan_compute above.
+    ("dore_options_scan",   "dore_options_scan",   60,  _dore_options_scan_compute,   _dore_options_scan_payload),
 ]
 
 

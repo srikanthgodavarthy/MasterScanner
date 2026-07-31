@@ -1,3 +1,5 @@
 echo ".ms_history_cache/" > .gitignore
 logs/
  
+__pycache__/
+*.pyc
