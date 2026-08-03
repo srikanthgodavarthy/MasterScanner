@@ -2011,7 +2011,9 @@ def run_scanner(
     cci_len:     int  = 20,
     cci_ob:      int  = 100,
     cci_os:      int  = -100,
-    max_workers: int  = 10,
+    max_workers: int  = 5,   # [Blunt RAM fix, 2026-08-03] was 10 -- see utils/upstox_client.py's
+                              # _MAX_WORKERS comment for the reasoning (halved every fetch pool
+                              # to cut peak concurrent native-buffer memory).
     progress_cb       = None,
     source:      str  = "yfinance",
     source_warn_cb    = None,
