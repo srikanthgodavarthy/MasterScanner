@@ -53,7 +53,8 @@ logger = logging.getLogger(__name__)
 # more; nothing else needs to change.
 _OC_RATE_PER_SEC = 3.0
 _OC_BUCKET_CAPACITY = 3.0
-_OC_MAX_WORKERS = 4  # concurrent option-chain fetches (vs. 12 for candles/quotes)
+_OC_MAX_WORKERS = 2  # concurrent option-chain fetches (vs. 6 for candles/quotes)
+# [Blunt RAM fix, 2026-08-03] was 4 -- halved alongside _MAX_WORKERS, same reasoning.
 
 
 class _TokenBucket:
