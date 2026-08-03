@@ -1,52 +1,27 @@
 """
-utils/dore_options_scan.py — DORE Technical Engine (Stage 1 of 2)
+utils/dore_options_scan.py — Wiring for utils.dore_options_engine
 ────────────────────────────────────────────────────────────────────────────
-[2026-07-31, restructured 2026-08-05 per DORE Integration spec] This is the
-glue that makes utils.dore_options_engine reachable from the running app.
-On its own, dore_options_engine.py is a pure, unimported function library
-— this module is the ONE place that:
+This is the glue that makes utils.dore_options_engine reachable from the
+running app. On its own, dore_options_engine.py is a pure, unimported
+function library — this module is the ONE place that:
 
     1. Reads MasterScanner's own scan output (the "live_scanner" snapshot
        utils.scan_state already produces every cycle) instead of building
        a new/duplicate universe funnel.
-    2. Fetches the two pieces DORE needs to produce a TECHNICAL plan
-       (option chain — for strike interval/expiry/liquidity gating —
-       and recent OHLCV for EMA9/21) via the SAME batch fetchers
-       utils/fo_scan.py already uses, so this adds no new rate-limit
-       pressure pattern.
+    2. Fetches the two pieces DORE still needs live (option chain, recent
+       OHLCV) via the SAME batch fetchers utils/fo_scan.py already uses,
+       so this adds no new rate-limit pressure pattern.
     3. Calls utils.dore_options_engine.compute_dore_trade_plan() once per
        symbol and hands the ranked result to utils.scan_state.save_snapshot()
-       under its OWN section ("dore_technical_plans") — deliberately
-       separate from "fo_scan" (DORE 2.0's snapshot), so this ships
-       without touching or risking the existing DORE 2.0 pipeline at all.
+       under its OWN section ("dore_options_scan") — deliberately separate
+       from "fo_scan" (DORE 2.0's snapshot), so this ships without
+       touching or risking the existing DORE 2.0 pipeline at all. Both can
+       run side by side; nothing here replaces utils/dore_engine.py or
+       utils/fo_scan.py.
 
-Two-stage pipeline (DORE Integration with Live Scanner & Market
-Intelligence — see MasterScanner_DORE_Integration_Spec.docx)
-──────────────────────────────────────────────────────────────
-This module is now Stage 1 ONLY — the Technical Decision Stage. It is no
-longer run on its own standalone 60s schedule (that was the "standalone
-DORE scheduler" the spec eliminates — see scheduler/scan_worker.py's
-module docstring). Instead compute_dore_technical_plans() is called
-exactly ONCE per Live Scanner cycle (every 5 minutes), immediately after
-the final F&O-eligible batch of that cycle finishes — see
-scheduler/scan_worker.py's _run_live_scanner_loop. This is the only place
-EMA9/21 (Leadership), Conviction, Entry Quality, Strike Recommendation,
-Expected Move, Target, Stop Loss, Risk/Reward, Confidence and the
-Technical Recommendation are computed; nothing recomputes them anywhere
-else, so there is no duplicate OHLCV/indicator work.
-
-Stage 2 — the Live Market Refresh Stage — lives in utils/dore_live_state.py
-and runs every 60 seconds from Market Intelligence's own job. It reads
-this stage's output (the "dore_technical_plans" snapshot) and refreshes
-ONLY the market-dependent fields (Current Premium, Premium %, OI, Volume,
-IV, POP, Drift %, Entry Trigger Status, Current Risk/Reward) — it never
-re-runs qualification/EMA/strike-selection logic. See that module's
-docstring for the full split.
-
-compute_dore_options_scan() is kept as a thin backward-compatible alias
-of compute_dore_technical_plans() for any external caller that hasn't
-been updated yet — new code should call compute_dore_technical_plans()
-directly.
+Wiring it into the scheduler is a two-line addition to
+scheduler/scan_worker.py's LOOPS tuple — see the bottom of this file's
+docstring for the exact snippet.
 """
 
 from __future__ import annotations
@@ -344,16 +319,25 @@ def top_dore_trade_plans(
 
     ranked = rank_recommendations(plans)
 
-    # [DORE Integration, 2026-08-05] Entry-locking / Drift % used to be
-    # computed HERE, every time this function ran (previously every 60s
-    # on its own standalone schedule). That's now Stage 2's job — see
-    # utils/dore_live_state.py — because a locked entry / Drift % is a
-    # LIVE-market concept that needs a fresh premium every 60s, not a
-    # technical recomputation every 5 minutes. This function returns
-    # the pure Technical Plan only; no persistence, no live premium
-    # re-validation beyond what compute_dore_trade_plan() itself already
-    # did against the option-chain snapshot fetched above.
-    df = pd.DataFrame([p.to_dict() for p in ranked])
+    # 2026-07-31: Persistent Trade Plan — lock each contract's entry
+    # premium the first time it's seen, then report Drift % against that
+    # saved entry on every later tick instead of re-freezing it. Kept
+    # fail-soft (falls back to plain to_dict() rows, no persistence
+    # fields) so a Supabase hiccup degrades the table, not the scan.
+    try:
+        from utils.dore_options_persistence import enrich_trade_plans_with_persistence
+        from utils.supabase_client import load_open_dore_options_plans, upsert_dore_options_plans_batch
+
+        existing_plans = load_open_dore_options_plans()
+        enriched_rows, updated_plans = enrich_trade_plans_with_persistence(ranked, existing_plans)
+        if updated_plans:
+            upsert_dore_options_plans_batch([p.to_db_dict() for p in updated_plans])
+        df = pd.DataFrame(enriched_rows)
+    except Exception:
+        logger.exception("[dore_options_scan] Trade-plan persistence enrichment failed "
+                          "(non-fatal, table renders without locked entry/Drift %%)")
+        df = pd.DataFrame([p.to_dict() for p in ranked])
+
     df.attrs["dore_rejections"] = [r.__dict__ for r in rejections]
     return df
 
@@ -364,28 +348,17 @@ def top_dore_trade_plans(
 #  collides with or replaces "fo_scan".
 # ══════════════════════════════════════════════════════════════════
 
-def compute_dore_technical_plans(cfg: Optional[DoreOptionsSettings] = None,
-                                  live_pool: Optional[dict] = None) -> dict:
-    """Stage 1 — DORE Technical Engine. Reads the live_scanner snapshot
-    (MasterScanner's own latest scan) — or, when the caller already has
-    it in hand this cycle (scheduler/scan_worker.py's
-    _run_live_scanner_loop calls this with the F&O-eligible subset it
-    just finished scoring, rather than re-reading Supabase), uses
-    `live_pool` directly — runs the full DORE technical pipeline over
-    it, and returns the exact shape
-    utils.scan_state.save_snapshot("dore_technical_plans", ...) expects.
-
-    Called exactly ONCE per Live Scanner cycle (every 5 minutes), never
-    on its own schedule — see this module's docstring."""
+def compute_dore_options_scan(cfg: Optional[DoreOptionsSettings] = None) -> dict:
+    """Reads the live_scanner snapshot (MasterScanner's own latest scan),
+    runs the full DORE trade-plan pipeline over it, and returns the
+    exact shape utils.scan_state.save_snapshot("dore_options_scan", ...)
+    expects."""
+    from utils.scan_state import load_snapshot_payload
     from utils.json_sanitize import find_invalid_columns, sanitize_dataframe
 
-    if live_pool is None:
-        from utils.scan_state import load_snapshot_payload
-        latest = load_snapshot_payload("live_scanner")
-        records = (latest or {}).get("payload", {}).get("data", []) or []
-        live_pool = {r.get("Stock") or r.get("Symbol"): r for r in records if (r.get("Stock") or r.get("Symbol"))}
-    else:
-        live_pool = dict(live_pool)
+    latest = load_snapshot_payload("live_scanner")
+    records = (latest or {}).get("payload", {}).get("data", []) or []
+    live_pool = {r.get("Stock") or r.get("Symbol"): r for r in records if (r.get("Stock") or r.get("Symbol"))}
 
     # [2026-08-03, SG request] DORE only trades options, so it should
     # only ever rank/shortlist the subset of live_scanner's ~500-symbol
@@ -427,8 +400,8 @@ def compute_dore_technical_plans(cfg: Optional[DoreOptionsSettings] = None,
         )
 
     if not live_pool:
-        logger.info("[dore_technical] live_scanner snapshot/pool is empty this cycle — nothing to rank")
-        return {"technical_plans": [], "rejections": [], "diagnostics": {"universe_size": 0}}
+        logger.info("[dore_options_scan] live_scanner snapshot is empty this cycle — nothing to rank")
+        return {"trade_plans": [], "rejections": [], "diagnostics": {"universe_size": 0}}
 
     # 2026-08-02: exempt symbols with an already-OPEN plan from the
     # shortlist's cost cutoff — see top_dore_trade_plans'/_shortlist_
@@ -451,38 +424,34 @@ def compute_dore_technical_plans(cfg: Optional[DoreOptionsSettings] = None,
 
     invalid = find_invalid_columns(df)
     if invalid:
-        logger.warning("[dore_technical] invalid numeric values (NaN/inf) before snapshot save — %s", invalid)
-    df = sanitize_dataframe(df, "dore_technical_plans.technical_plans")
+        logger.warning("[dore_options_scan] invalid numeric values (NaN/inf) before snapshot save — %s", invalid)
+    df = sanitize_dataframe(df, "dore_options_scan.trade_plans")
 
     return {
-        "technical_plans": df.to_dict("records") if not df.empty else [],
+        "trade_plans": df.to_dict("records") if not df.empty else [],
         "rejections": rejections,
         "diagnostics": {"universe_size": len(live_pool), "plans_produced": len(df)},
     }
 
 
-# Back-compat alias — new code should call compute_dore_technical_plans()
-# directly. Kept so any external caller written against the pre-DORE-
-# Integration name still works.
-def compute_dore_options_scan(cfg: Optional[DoreOptionsSettings] = None) -> dict:
-    return compute_dore_technical_plans(cfg=cfg)
-
-
 # ══════════════════════════════════════════════════════════════════
-#  Scheduler wiring [DORE Integration, 2026-08-05] — this stage is no
-#  longer wired into scan_worker.py's JOBS list at all (that was the
-#  standalone 60s DORE schedule the integration spec eliminates).
-#  Instead scheduler/scan_worker.py's _run_live_scanner_loop calls
-#  compute_dore_technical_plans() directly, exactly once per 5-minute
-#  cycle, right after the last F&O-eligible batch — see that function's
-#  docstring and _run_live_scanner_loop's own comments for the exact
-#  call site.
+#  Scheduler wiring (apply by hand in scheduler/scan_worker.py — kept
+#  as a snippet rather than an automatic edit so the existing "fo_scan"
+#  loop/cadence/health-check behavior is never touched by this file):
 #
-#  Stage 2 (utils/dore_live_state.py) IS still wired into JOBS as a
-#  lightweight 60s job — see that module for its own scheduler wiring
-#  note.
+#     def _dore_options_scan_compute():
+#         from utils.dore_options_scan import compute_dore_options_scan
+#         return compute_dore_options_scan()
 #
-#  pages/scanner.py reads both snapshots:
-#     utils.scan_state.load_snapshot_payload("dore_technical_plans")
-#     utils.scan_state.load_snapshot_payload("dore_live_state")
+#     def _dore_options_scan_payload(raw: dict):
+#         return raw
+#
+#     LOOPS = (
+#         ...,
+#         ("dore_options_scan", "dore_options_scan", 60,
+#          _dore_options_scan_compute, _dore_options_scan_payload),
+#     )
+#
+# pages/scanner.py can then read it exactly like fo_scan:
+#     utils.scan_state.load_snapshot_payload("dore_options_scan")
 # ══════════════════════════════════════════════════════════════════

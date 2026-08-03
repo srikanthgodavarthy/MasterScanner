@@ -3420,16 +3420,6 @@ def _dore_options_panel():
     utils.dore_options_scan's "dore_options_scan" snapshot
     (utils/dore_options_engine.py's independent trade-plan pipeline).
 
-    [DORE Integration, 2026-08-05] Restructured into two stages per
-    MasterScanner_DORE_Integration_Spec.docx — source is now
-    "dore_live_state" (utils/dore_live_state.py's Stage 2 output: every
-    Technical Plan field from Stage 1 PLUS the live-refreshed premium/
-    OI/IV/POP/Drift %/Entry Trigger/Current RR fields), falling back to
-    "dore_technical_plans" (Stage 1 alone — no live/drift fields yet)
-    for the brief window after a restart before Stage 2 has run once.
-    "dore_options_scan" (the pre-integration single-stage snapshot) is
-    no longer read here.
-
     2026-07-31 — removed the legacy "fo_scan"-backed options table and
     its "DORE Options Engine (primary) / Legacy DORE 2.0" radio toggle;
     this panel always renders the DORE Options Engine output.
@@ -3447,35 +3437,18 @@ def _dore_options_panel():
     st.markdown('<div class="ti-panel-title" style="margin-top:0.6rem;">🎯 DORE OPTIONS ENGINE</div>',
                 unsafe_allow_html=True)
 
-    # ── DORE Live State (Stage 2) — same cheap meta-then-payload poll
-    # pattern as the rest of this page's snapshot panels. Falls back to
-    # the Stage 1 (Technical) snapshot when Stage 2 hasn't produced
-    # anything yet (e.g. right after a deploy, before its first 60s
-    # tick) so the page shows the technical read instead of nothing.
-    dore_opt_meta = load_snapshot_meta("dore_live_state")
-    if dore_opt_meta is not None and dore_opt_meta.get("version") != st.session_state.get("dore_live_state_version"):
-        dore_opt_full = load_snapshot_payload("dore_live_state")
+    # ── DORE Options Engine — same cheap meta-then-payload poll pattern
+    # as the rest of this page's snapshot panels.
+    dore_opt_meta = load_snapshot_meta("dore_options_scan")
+    if dore_opt_meta is not None and dore_opt_meta.get("version") != st.session_state.get("dore_options_scan_version"):
+        dore_opt_full = load_snapshot_payload("dore_options_scan")
         if dore_opt_full is not None:
-            st.session_state["dore_live_state_version"] = dore_opt_full.get("version")
-            st.session_state["dore_live_state_payload"] = dore_opt_full.get("payload") or {}
+            st.session_state["dore_options_scan_version"] = dore_opt_full.get("version")
+            st.session_state["dore_options_scan_payload"] = dore_opt_full.get("payload") or {}
 
-    dore_opt_payload = st.session_state.get("dore_live_state_payload") or {}
-    dore_opt_df = pd.DataFrame(dore_opt_payload.get("live_state") or [])
-
-    dore_tech_meta = None
-    dore_opt_rejections = []
-    if dore_opt_df.empty:
-        dore_tech_meta = load_snapshot_meta("dore_technical_plans")
-        if dore_tech_meta is not None and dore_tech_meta.get("version") != st.session_state.get("dore_technical_plans_version"):
-            dore_tech_full = load_snapshot_payload("dore_technical_plans")
-            if dore_tech_full is not None:
-                st.session_state["dore_technical_plans_version"] = dore_tech_full.get("version")
-                st.session_state["dore_technical_plans_payload"] = dore_tech_full.get("payload") or {}
-        dore_tech_payload = st.session_state.get("dore_technical_plans_payload") or {}
-        dore_opt_df = pd.DataFrame(dore_tech_payload.get("technical_plans") or [])
-        dore_opt_rejections = dore_tech_payload.get("rejections") or []
-
-    dore_opt_meta = dore_opt_meta or dore_tech_meta
+    dore_opt_payload = st.session_state.get("dore_options_scan_payload") or {}
+    dore_opt_df = pd.DataFrame(dore_opt_payload.get("trade_plans") or [])
+    dore_opt_rejections = dore_opt_payload.get("rejections") or []
 
     # 2026-08-01: split into Live Scan (this cycle's reproduced
     # recommendations) vs Active Plans (every currently-OPEN locked
@@ -3486,8 +3459,7 @@ def _dore_options_panel():
     with live_scan_tab:
         if dore_opt_meta is None:
             st.caption("DORE Options Engine: waiting for the first scheduled scan "
-                       "(the live_scanner cycle's DORE Technical Engine step, then "
-                       "the dore_live_state 60s refresh) — nothing to show yet.")
+                       "(scheduler/scan_worker.py's dore_options_scan loop) — nothing to show yet.")
         elif dore_opt_df.empty:
             n_rej = len(dore_opt_rejections)
             st.caption("No DORE Options trade plans right now — every shortlisted candidate "

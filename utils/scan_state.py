@@ -72,18 +72,13 @@ _TABLES = {
     "market_intelligence": "market_intelligence_snapshots",
     "live_scanner":        "live_scanner_snapshots",
     "fo_scan":             "fo_scan_snapshots",
-    # [DORE Integration, 2026-08-05] Two-stage DORE pipeline per
-    # MasterScanner_DORE_Integration_Spec.docx — deliberately separate
-    # from "fo_scan" (the legacy utils.fo_scan/utils.dore_engine
-    # pipeline, kept running for rollback/comparison) and from each
-    # other, since they're written on different cadences by different
-    # jobs (Stage 1 once per 5-min live_scanner cycle, Stage 2 every
-    # 60s) — see utils/dore_options_scan.py and utils/dore_live_state.py.
-    "dore_technical_plans": "dore_technical_plans_snapshots",
-    "dore_live_state":       "dore_live_state_snapshots",
-    # Back-compat: the pre-integration "dore_options_scan" table is kept
-    # registered (unwritten going forward) so any historical rows /
-    # in-flight readers don't 404 during rollout.
+    # 2026-07-31: DORE Options Engine Integration — utils.dore_options_scan's
+    # own snapshot section, deliberately separate from "fo_scan" (the
+    # legacy utils.fo_scan/utils.dore_engine pipeline) so both can run
+    # side by side; the legacy section is kept for rollback/comparison,
+    # never overwritten by this one. See pages/scanner.py's
+    # _fo_opportunities_panel for the primary/legacy toggle that reads
+    # from each.
     "dore_options_scan":   "dore_options_scan_snapshots",
 }
 
@@ -359,38 +354,10 @@ CREATE TABLE IF NOT EXISTS fo_scan_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_fo_snap_version ON fo_scan_snapshots(version DESC);
 
--- [DORE Integration, 2026-08-05] Two-stage DORE pipeline — separate
--- tables for Stage 1 (Technical, written once per 5-min live_scanner
--- cycle) and Stage 2 (Live State, written every 60s), independent of
--- fo_scan_snapshots (the legacy pipeline, kept for rollback/
+-- 2026-07-31: DORE Options Engine Integration — separate snapshot table
+-- for utils.dore_options_scan.compute_dore_options_scan(), independent
+-- of fo_scan_snapshots (the legacy pipeline, kept for rollback/
 -- comparison — see pages/scanner.py's _fo_opportunities_panel).
-CREATE TABLE IF NOT EXISTS dore_technical_plans_snapshots (
-    id         bigserial   PRIMARY KEY,
-    scan_id    uuid        NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    status     text        NOT NULL DEFAULT 'completed',
-    version    bigint      NOT NULL,
-    row_count  integer     NOT NULL DEFAULT 0,
-    error      text,
-    payload    jsonb
-);
-CREATE INDEX IF NOT EXISTS idx_dore_tech_snap_version ON dore_technical_plans_snapshots(version DESC);
-
-CREATE TABLE IF NOT EXISTS dore_live_state_snapshots (
-    id         bigserial   PRIMARY KEY,
-    scan_id    uuid        NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    status     text        NOT NULL DEFAULT 'completed',
-    version    bigint      NOT NULL,
-    row_count  integer     NOT NULL DEFAULT 0,
-    error      text,
-    payload    jsonb
-);
-CREATE INDEX IF NOT EXISTS idx_dore_live_snap_version ON dore_live_state_snapshots(version DESC);
-
--- Pre-integration table — no longer written by the scheduler (see
--- utils/scan_state.py's _TABLES comment) but left in place so existing
--- rows / any lagging reader survive the rollout.
 CREATE TABLE IF NOT EXISTS dore_options_scan_snapshots (
     id         bigserial   PRIMARY KEY,
     scan_id    uuid        NOT NULL,
@@ -439,8 +406,6 @@ BEGIN
         WHEN 'market_intelligence_snapshots' THEN 'version'
         WHEN 'live_scanner_snapshots'        THEN 'version'
         WHEN 'fo_scan_snapshots'             THEN 'version'
-        WHEN 'dore_technical_plans_snapshots' THEN 'version'
-        WHEN 'dore_live_state_snapshots'     THEN 'version'
         WHEN 'dore_options_scan_snapshots'   THEN 'version'
         WHEN 'scan_snapshots'                THEN 'run_at'
         WHEN 'scan_daily_archive'            THEN 'trading_date'
