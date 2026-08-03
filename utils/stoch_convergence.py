@@ -46,10 +46,16 @@ STOCH_CONVERGENCE_MAX_BONUS = 10   # points budget (0-10 scale)
 # rate (~47% -> ~25% of all cross-ups qualify), i.e. meaningfully stricter.
 STOCH_REIGNITION_MAX_LEVEL = 20
 
-# How far back to search for the most recent qualifying reignition bar, so
-# staleness can be tracked the same way LL and VWAP signals already are
-# (see promotion_engine.py LL_MAX_BARS_SINCE_RECLAIM / VWAP_MAX_BARS_SINCE_TOUCH).
-STOCH_REIGNITION_LOOKBACK = 5
+# How far back to search for the most recent qualifying reignition bar.
+# [2026-08-03] Narrowed 5 -> 1: only today's bar or the one immediately
+# before it can qualify as a "fresh" reignition. A cross found further back
+# than that is no longer considered fresh enough to act on, even if it
+# still technically holds (%K >= %D). This is stricter than the old 5-bar
+# search window used for LL and VWAP staleness (see promotion_engine.py
+# LL_MAX_BARS_SINCE_RECLAIM / VWAP_MAX_BARS_SINCE_TOUCH, which still use
+# wider windows) — stochastic convergence specifically wants near-immediate
+# confirmation, not a multi-bar grace period.
+STOCH_REIGNITION_LOOKBACK = 1
 
 
 def _safe_last(series: pd.Series, default: float = 0.0) -> float:
@@ -110,7 +116,7 @@ def score_stochastic_convergence(
     max_bonus: int = STOCH_CONVERGENCE_MAX_BONUS,
     reignition_max_level: float = STOCH_REIGNITION_MAX_LEVEL,
     reignition_lookback: int = STOCH_REIGNITION_LOOKBACK,
-    k_period: int = 14,
+    k_period: int = 4,
     d_period: int = 3,
     k_smooth: int = 3,
 ) -> StochConvergenceSignal:
@@ -133,14 +139,16 @@ def score_stochastic_convergence(
     kind is discarded entirely if today's bar no longer holds %K >= %D —
     a cross that has since reversed is invalidated, not merely aged.
 
-    [2026-07-29] k_period/d_period/k_smooth default to 14/3/3 — TradingView's
-    out-of-the-box "Stochastic" study inputs — so the STOCH↑ column can be
-    validated bar-for-bar against a chart with default settings. Previously
+    [2026-08-03] k_period/d_period/k_smooth default to 4/3/3 — matching the
+    user's actual TradingView "Stoch" study settings (%K Length=4, %K
+    Smoothing=3, %D Smoothing=3), NOT TradingView's generic out-of-the-box
+    default (14/3/3) — so the STOCH↑ column can be validated bar-for-bar
+    against the user's own chart. [2026-07-29 note, superseded:] previously
     this called the shared stochastic() with no k_smooth at all (raw,
-    unsmoothed %K), which cross-timed differently from what any TradingView
-    "Stochastic" chart shows. Also matches the convention already used in
-    utils.cci_stochastic_signal.SignalParams (k_period=14, d_period=3,
-    smooth_k=3).
+    unsmoothed %K); the 14/3/3 default from that change is now replaced by
+    4/3/3 above. NOTE: utils.cci_stochastic_signal.SignalParams still
+    defaults to k_period=14 — that module has NOT been updated to match and
+    may need the same change for consistency (flagged, not yet applied).
     """
     sig = StochConvergenceSignal()
 
