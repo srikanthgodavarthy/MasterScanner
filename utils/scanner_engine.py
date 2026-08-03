@@ -2213,12 +2213,15 @@ def run_scanner(
     # ── Setup Persistence (frozen trade plans) ────────────────────
     # Entry / SL / Targets are LOCKED on first Actionable detection.
     # Subsequent scans READ frozen levels — no daily drift.
-    df_out = _enrich_with_setup_persistence(df_out)
+    df_out = _enrich_with_setup_persistence(df_out, all_data)
 
     return df_out
 
 
-def _enrich_with_setup_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
+def _enrich_with_setup_persistence(
+    df_out: pd.DataFrame,
+    all_data: dict | None = None,
+) -> pd.DataFrame:
     """
     Load existing setup plans from Supabase, enrich the scanner DataFrame
     with frozen trade levels and lifecycle metadata, then persist any new
@@ -2226,6 +2229,25 @@ def _enrich_with_setup_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
 
     Designed to be a silent no-op when Supabase is unavailable.
     All errors are caught and logged; scanner output is never blocked.
+
+    2026-08-03 [Active-setup coverage fix]: a symbol that already has an
+    OPEN plan (WAITING/ACTIVE/T1_HIT) but drops out of df_out this run —
+    e.g. score_stock() raised, its future got skipped by the 45s bounded
+    wait, or its OHLCV came back empty/stale — used to mean its plan
+    never got re-evaluated against current price at all this run. It
+    just sat frozen until a future scan happened to succeed for that
+    symbol again, which could be indefinitely on a chronically flaky
+    symbol. That's the root cause behind plans stuck in WAITING (or
+    ACTIVE) long after price has clearly moved past entry/SL/T1.
+    Every OPEN-plan symbol must go through lifecycle evaluation every
+    run regardless of whether the full scoring pipeline succeeded for
+    it — scoring failure can drop a symbol from the *displayed* scanner
+    table, but never from plan-lifecycle advancement, as long as we
+    still have a raw price bar for it in `all_data` (already fetched by
+    run_scanner — no extra network calls here). Recovered symbols are
+    NOT added to df_out (the scanner table's appearance/columns are
+    unchanged); they only advance/persist plan state, which the Active
+    Plans / lifecycle dashboard reads straight from Supabase.
     """
     try:
         from utils.supabase_client import (
@@ -2294,6 +2316,55 @@ def _enrich_with_setup_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
             first_seen_map,
             price_col="Entry",
         )
+
+        # ── Recovery pass: OPEN-plan symbols missing from df_out ───────
+        # See the "Active-setup coverage fix" note in this function's
+        # docstring. `existing_plans` was mutated in-place by
+        # enrich_scanner_dataframe() above for every symbol IT saw, so
+        # anything still not reflected is exactly the set that dropped
+        # out of the scan this run despite having an open plan.
+        scanned_syms = set(
+            str(s).upper().strip() for s in df_out.get("Stock", pd.Series(dtype=str))
+        )
+        orphaned_syms = [
+            sym for sym, plan in existing_plans.items()
+            if sym not in scanned_syms and plan is not None and plan.is_open()
+        ]
+        recovered_count = 0
+        if orphaned_syms and all_data:
+            from utils.setup_persistence import enrich_scanner_row
+            for sym in orphaned_syms:
+                bar_df = all_data.get(sym)
+                if bar_df is None or bar_df.empty:
+                    continue   # genuinely no price data anywhere — nothing to advance against
+                try:
+                    last_bar = bar_df.iloc[-1]
+                    last_close = float(last_bar.get("Close", last_bar.get("close", 0)) or 0)
+                    last_low   = float(last_bar.get("Low",   last_bar.get("low",   0)) or 0)
+                    last_high  = float(last_bar.get("High",  last_bar.get("high",  0)) or 0)
+                except Exception:
+                    continue
+                if last_close <= 0:
+                    continue
+                stub_row = {"Stock": sym, "Entry": last_close}
+                _, plan_out, was_updated = enrich_scanner_row(
+                    stub_row,
+                    existing_plans[sym],
+                    first_seen_map.get(sym, ""),
+                    current_price=last_close,
+                    bar_low=last_low or None,
+                    bar_high=last_high or None,
+                )
+                existing_plans[sym] = plan_out
+                if was_updated:
+                    updated_plans.append(plan_out)
+                    recovered_count += 1
+        if orphaned_syms:
+            _logger.info(
+                "[SETUP PLAN RECOVERY] open_plan_symbols_missing_from_scan=%d  "
+                "advanced_with_available_price_data=%d  symbols=%s",
+                len(orphaned_syms), recovered_count, orphaned_syms,
+            )
 
         # Persist changed plans back to Supabase.
         # New plans are minted in status=WAITING (not ACTIVE — that now
