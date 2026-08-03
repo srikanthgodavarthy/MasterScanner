@@ -83,7 +83,14 @@ _PERIOD_TO_DAYS = {"3mo": 95, "6mo": 190, "1y": 375, "2y": 740, "5y": 1850}
 # 6 workers / 120ms floor capped it at just over 8/s, far below what the
 # account is actually allowed. If you're on a plan with different limits,
 # adjust these two numbers; nothing else needs to change.
-_MAX_WORKERS      = 12     # concurrent historical-candle / quote requests
+_MAX_WORKERS      = 6      # concurrent historical-candle / quote requests
+# [Blunt RAM fix, 2026-08-03] was 12 -- halved to cut peak concurrent
+# fetch-buffer memory (each worker thread holds its own in-flight
+# response/DataFrame until it returns). See utils/memory_profiler.py's
+# 2026-08-03 RSS reading: 886MB actual vs ~150MB accounted-for by
+# Python's own GC-tracked objects -- the gap points at native buffers
+# (numpy arrays, HTTP response bodies) held by concurrently-running
+# threads, which this pool size directly controls.
 _MIN_SPACING_S     = 0.05   # floor between request *starts*, process-wide (~20 req/s)
 _MAX_RETRIES       = 3
 _RETRY_BASE_S      = 1.5
@@ -416,7 +423,7 @@ def _fetch_intraday_candles(instrument_key: str, unit: str = "minutes",
     return pd.DataFrame()
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800, max_entries=40, show_spinner=False)
 def fetch_ohlcv_upstox(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
     """
     Drop-in counterpart to scanner_engine.fetch_ohlcv(symbol, period, interval)
@@ -467,7 +474,7 @@ def fetch_ohlcv_upstox(symbol: str, period: str = "1y", interval: str = "1d") ->
     return df
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800, max_entries=10, show_spinner=False)
 def fetch_index_ohlcv_upstox(index: str, period: str = "1y") -> pd.DataFrame:
     """
     Index counterpart to fetch_ohlcv_upstox() — historical daily OHLCV for
@@ -1844,7 +1851,7 @@ def fetch_futures_snapshot_batch(symbols: tuple) -> dict:
     return result
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, max_entries=40, show_spinner=False)
 def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
     """
     Nearest-expiry ATM Call + Put for a single stock underlying, via the
