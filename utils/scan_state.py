@@ -80,6 +80,13 @@ _TABLES = {
     # _fo_opportunities_panel for the primary/legacy toggle that reads
     # from each.
     "dore_options_scan":   "dore_options_scan_snapshots",
+    # 2026-08-03: previously 404ing — DDL existed nowhere until the Trinity
+    # project rebuild. Tables now exist (see masterscanner_full_schema.sql);
+    # this mapping is what actually makes save_snapshot("dore_live_state", ...)
+    # and load_snapshot_payload("dore_technical_plans") resolve to them
+    # instead of failing to find a section.
+    "dore_live_state":       "dore_live_state_snapshots",
+    "dore_technical_plans":  "dore_technical_plans_snapshots",
 }
 
 _META_COLUMNS = "scan_id, created_at, status, version, row_count, error"
@@ -407,6 +414,8 @@ BEGIN
         WHEN 'live_scanner_snapshots'        THEN 'version'
         WHEN 'fo_scan_snapshots'             THEN 'version'
         WHEN 'dore_options_scan_snapshots'   THEN 'version'
+        WHEN 'dore_live_state_snapshots'     THEN 'version'
+        WHEN 'dore_technical_plans_snapshots' THEN 'version'
         WHEN 'scan_snapshots'                THEN 'run_at'
         WHEN 'scan_daily_archive'            THEN 'trading_date'
         WHEN 'sector_snapshots'              THEN 'scan_date'
