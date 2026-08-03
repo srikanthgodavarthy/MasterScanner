@@ -196,7 +196,9 @@ class _BoundedThreadPoolExecutor:
 # that blows the deadline is abandoned (fail-soft, like yfinance) rather than
 # left to hang the whole run.
 _SB_TIMEOUT = 15   # seconds per Supabase Storage call
-_sb_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sb-storage")
+_sb_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sb-storage")
+# [Blunt RAM fix, 2026-08-03] was 4 -- see utils/upstox_client.py's
+# _MAX_WORKERS comment for the reasoning.
 
 
 def _with_timeout(fn, *args, timeout: float = _SB_TIMEOUT, **kwargs):
