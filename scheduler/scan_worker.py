@@ -30,12 +30,31 @@ Cadence
                              (utils/fo_scan.py + utils/dore_engine.py) —
                              kept running for rollback/comparison, no
                              longer the Options tab's primary source.
-    dore_options_scan     — every 60s   (_run_loop, single call/cycle)
-                             utils/dore_options_scan.py — the primary
-                             options pipeline as of 2026-07-31 (DORE
-                             Options Engine Integration).
+    dore_live_state        — every 60s   (_run_loop, single call/cycle)
+                             utils/dore_live_state.py — Stage 2 (Live
+                             Market Refresh) of the DORE Integration
+                             pipeline (2026-08-05). Refreshes ONLY
+                             market-dependent fields (premium/OI/IV/
+                             POP/Drift %/Entry Trigger/Current RR) for
+                             whatever Stage 1 last produced; never runs
+                             OHLCV/EMA/qualification/strike-selection
+                             itself. See that module's docstring.
     live_scanner           — every 5 min, worked through in batches
-                              (_run_live_scanner_loop — see below)
+                              (_run_live_scanner_loop — see below).
+                              Also runs Stage 1 of the DORE Integration
+                              pipeline (utils.dore_options_scan.
+                              compute_dore_technical_plans, "DORE
+                              Technical Engine") exactly once per cycle,
+                              right after the last F&O-eligible batch —
+                              see _run_live_scanner_loop's own comments.
+                              There is NO standalone DORE scheduler
+                              anymore: this replaces the 60s
+                              dore_options_scan job that used to
+                              recompute the full technical pipeline
+                              every minute (duplicate OHLCV/indicator
+                              work, and scheduler contention with
+                              live_scanner — see utils/scan_priority.py's
+                              docstring for the problem this eliminates).
 
 Each job is independent: a slow/failing F&O scan never delays or blocks
 the Market Intelligence job, and vice versa (separate threads, separate
@@ -157,16 +176,17 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
        "skip_cycle" decision here skips compute_fn() entirely for this
        tick (not just the save) — the whole point is not doing the
        expensive work, not just withholding its result.
-    2. require_fresh_live_scanner=True (set for dore_options_scan, whose
-       compute_fn feeds entirely off the live_scanner snapshot — see
-       utils.dore_options_scan.compute_dore_options_scan): if the most
-       recent live_scanner snapshot is older than
-       max_live_scanner_staleness_secs (or doesn't exist), this loop
-       skips too. Running DORE's own heavy option-chain/OHLCV fetch
-       cycle against a snapshot live_scanner never got to refresh is
-       both wasted work (re-ranking the same stale universe) and, worse,
-       exactly the kind of load that's currently starving live_scanner
-       of the RAM headroom it needs to complete a fresh cycle at all.
+    2. require_fresh_live_scanner (a per-job flag passed at thread
+       start, see main()/utils.inprocess_scheduler.py) — [DORE
+       Integration, 2026-08-05] no job currently sets this to True.
+       It was originally added for the standalone dore_options_scan
+       job, whose compute_fn fed entirely off the live_scanner
+       snapshot; that job no longer exists (Stage 1 of DORE now runs
+       inline inside _run_live_scanner_loop itself, and Stage 2 —
+       utils.dore_live_state.refresh_dore_live_state — checks its own
+       input's staleness internally instead). Left in place as a
+       general-purpose gate for any future job that has the same
+       "my whole input is the live_scanner snapshot" shape.
     """
     from utils.scan_state import save_snapshot, load_snapshot_payload
     from utils.system_state import should_scheduler_run
@@ -280,24 +300,19 @@ def _fo_scan_payload(raw: dict):
     return raw, n
 
 
-# ── DORE Options Engine — every 60s ──────────────────────────────────
-# [2026-07-31] DORE Options Engine Integration. Runs alongside, not
-# instead of, _fo_scan_compute above — utils.dore_options_scan writes
-# to its OWN "dore_options_scan" snapshot section (see
-# utils/scan_state.py), so a failure or bad cycle here never touches
-# "fo_scan"'s rows. utils/fo_scan.py + utils/dore_engine.py (the
-# legacy pipeline pages/scanner.py's Options tab used to render
-# exclusively) keep running exactly as before, for rollback/
-# comparison — see pages/scanner.py's _fo_opportunities_panel, which
-# now reads dore_options_scan as the primary source and falls back to
-# / can be switched to fo_scan.
-def _dore_options_scan_compute():
-    from utils.dore_options_scan import compute_dore_options_scan
-    return compute_dore_options_scan()
+# ── DORE Live State (Stage 2) — every 60s ────────────────────────────
+# [DORE Integration, 2026-08-05] Replaces the old standalone
+# dore_options_scan job. This is deliberately lightweight — no OHLCV,
+# no re-scoring — see utils/dore_live_state.py's module docstring.
+# Stage 1 (the heavy technical recompute) now runs once per 5-minute
+# live_scanner cycle instead — see _run_live_scanner_loop below.
+def _dore_live_state_compute():
+    from utils.dore_live_state import refresh_dore_live_state
+    return refresh_dore_live_state()
 
 
-def _dore_options_scan_payload(raw: dict):
-    return raw, len((raw or {}).get("trade_plans", []))
+def _dore_live_state_payload(raw: dict):
+    return raw, len((raw or {}).get("live_state", []))
 
 
 # JOBS covers only the single-call jobs that run through the generic
@@ -316,12 +331,11 @@ JOBS = [
     # cutting sustained CPU/network load roughly 6x.
     ("market_intelligence", "market_intelligence", 180, _market_intelligence_compute, _market_intelligence_payload),
     #("fo_scan",             "fo_scan",             60,  _fo_scan_compute,             _fo_scan_payload),
-    # [2026-07-31] DORE Options Engine Integration — new primary options
-    # pipeline. Same 60s cadence as fo_scan (it reads the same
-    # live_scanner snapshot fo_scan's universe is built from, and the
-    # option-chain fetch it shortlists against is the same cost class),
-    # independent thread/section — see _dore_options_scan_compute above.
-    ("dore_options_scan",   "dore_options_scan",   60,  _dore_options_scan_compute,   _dore_options_scan_payload),
+    # [DORE Integration, 2026-08-05] Stage 2 (Live Market Refresh) — see
+    # _dore_live_state_compute above. Reads whatever Stage 1 last wrote
+    # to "dore_technical_plans" (produced once per live_scanner cycle,
+    # not by this job) and refreshes only market-dependent fields.
+    ("dore_live_state",     "dore_live_state",     60,  _dore_live_state_compute,     _dore_live_state_payload),
 ]
 
 
@@ -455,8 +469,36 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
         from utils.scan_health_monitor import check_health, record_cycle_result
 
     symbols = list(NIFTY500_SYMBOLS)
+
+    # [DORE Integration, 2026-08-05] Stage 1 (DORE Technical Engine) needs
+    # the F&O-eligible subset of this cycle's scan to be complete before
+    # it runs — see module docstring's Cadence section and
+    # compute_dore_technical_plans()'s docstring. Reordering here (F&O-
+    # eligible symbols + indices first, everything else after) means we
+    # can fire Stage 1 right after the batch that completes that subset,
+    # instead of waiting for the full ~500-symbol cycle, without
+    # touching compute_live_scan_batch's own per-batch logic at all.
+    try:
+        from utils.upstox_client import fo_eligible_symbols
+        from utils.dore_options_scan import _INDICES as _dore_index_symbols
+        _fo_symbols = fo_eligible_symbols() or set()
+    except Exception:
+        logger.exception("[live_scanner] fo_eligible_symbols() failed while ordering batches for DORE "
+                          "Technical Engine — falling back to unordered symbols (Stage 1 will fire "
+                          "after the LAST batch of the cycle instead of the F&O-only prefix)")
+        _fo_symbols, _dore_index_symbols = set(), ()
+    _dore_priority = {sym: 0 for sym in _fo_symbols} | {sym: 0 for sym in _dore_index_symbols}
+    symbols = sorted(symbols, key=lambda s: (0 if s in _dore_priority else 1,))
+    n_fo_symbols = sum(1 for s in symbols if s in _dore_priority)
+
     batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)] or [[]]
     n_batches = len(batches)
+    # Index of the LAST batch that's still entirely within the F&O-
+    # eligible prefix (0-based). Falls back to the final batch of the
+    # cycle if the prefix is empty (fo_eligible_symbols() failed/
+    # returned nothing) — same place Stage 1 used to effectively run
+    # before batch reordering existed, just later than ideal.
+    _dore_trigger_batch_i = (n_fo_symbols - 1) // batch_size if n_fo_symbols else (n_batches - 1)
 
     logger.info("[live_scanner] sub-scheduler starting: %d symbols in %d batches of ~%d, target cycle %ss",
                 len(symbols), n_batches, batch_size, interval_secs)
@@ -589,6 +631,35 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             if batch_i < n_batches - 1:
                 time.sleep(effective_cooldown)
 
+            # [DORE Integration, 2026-08-05] Stage 1 — DORE Technical
+            # Engine, fired exactly once per cycle, right after the batch
+            # above completes the F&O-eligible prefix (see
+            # _dore_trigger_batch_i above; `merged` at this point holds
+            # every F&O-eligible symbol's fresh scan row plus whatever
+            # non-F&O symbols carried over from a previous cycle, which
+            # compute_dore_technical_plans() filters back down to F&O-
+            # eligible + indices only anyway — see that function's own
+            # fo_eligible_symbols() filtering). Runs on THIS thread,
+            # in-line with the batch loop, deliberately — not its own
+            # scheduler/thread — which is the whole point of the
+            # integration (see module docstring's Cadence section).
+            if batch_i == _dore_trigger_batch_i:
+                try:
+                    from utils.dore_options_scan import compute_dore_technical_plans
+                    dore_result = compute_dore_technical_plans(live_pool=dict(merged))
+                    technical_plans = dore_result.get("technical_plans", [])
+                    scan_id = save_snapshot("dore_technical_plans", payload=dore_result,
+                                             row_count=len(technical_plans), status="completed")
+                    if not scan_id:
+                        logger.warning("[live_scanner] dore_technical_plans save_snapshot returned "
+                                        "no scan_id (Supabase unavailable?)")
+                    logger.info("[live_scanner] DORE Technical Engine: %d plan(s) produced after "
+                                "F&O batch %d/%d", len(technical_plans), batch_i + 1, n_batches)
+                except Exception:
+                    logger.exception("[live_scanner] DORE Technical Engine failed this cycle "
+                                      "(non-fatal — dore_live_state keeps refreshing against last "
+                                      "cycle's technical plans until this succeeds again)")
+
         # end of batches loop
 
         # scan_snapshots: still a genuine "legacy" table, kept as-is for
@@ -660,17 +731,25 @@ def main():
             target=_run_loop, args=(name, section, interval, compute_fn, to_payload),
             kwargs={
                 "owner_event": hb_thread.lost_ownership,
-                # [2026-08-02] dore_options_scan reads the live_scanner
-                # snapshot as its entire input — see
-                # utils.dore_options_scan.compute_dore_options_scan() —
-                # so there's no point (and real RAM/network cost) running
-                # its own heavy option-chain/OHLCV cycle against a stale
-                # or missing live_scanner snapshot.
-                "require_fresh_live_scanner": (name == "dore_options_scan"),
-                # [2026-08-03, SG request] DORE gets a 60s priority
-                # window, live_scanner gets 3min — see
-                # utils/scan_priority.py.
-                "priority_name": ("dore" if name == "dore_options_scan" else None),
+                # [DORE Integration, 2026-08-05] dore_live_state checks
+                # its own input's (dore_technical_plans) staleness
+                # internally — see utils.dore_live_state.
+                # refresh_dore_live_state()'s MAX_TECHNICAL_PLAN_
+                # STALENESS_SECS check — so this generic live_scanner
+                # freshness gate (built for the old, heavier
+                # dore_options_scan job) no longer applies to any
+                # current job.
+                "require_fresh_live_scanner": False,
+                # [DORE Integration, 2026-08-05] No job here contends
+                # with live_scanner for API/CPU priority anymore — the
+                # heavy technical recompute moved INTO live_scanner's
+                # own loop (see _run_live_scanner_loop), and
+                # dore_live_state is light enough (one option-chain
+                # fetch per already-small technical-plan symbol list,
+                # no OHLCV) not to need scan_priority.py's arbitration.
+                # See that module's docstring for the contention this
+                # replaces.
+                "priority_name": None,
             },
             name=f"scan-{name}", daemon=True,
         )
