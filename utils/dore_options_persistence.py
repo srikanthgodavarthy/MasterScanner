@@ -317,7 +317,19 @@ def enrich_trade_plans_with_persistence(
             # just_minted, so the Active Plans tab stays current even on
             # cycles that only reused (not re-minted) the locked entry.
             # Drift itself is derived, not stored (see class docstring).
-            locked.last_premium = current_premium
+            # [2026-08-06 bugfix] This used to be an unconditional
+            # `locked.last_premium = current_premium`, which meant ANY
+            # cycle where this tick's fetch came back empty (a
+            # transient API miss, or — before utils/dore_live_state.py's
+            # 2026-08-06 fix — every index-based plan, since the old
+            # fetch path could never resolve an index's exact strike)
+            # blanked out a perfectly good previous reading. The Active
+            # Plans tab's whole point is showing a last-KNOWN premium
+            # even between fresh sightings (see this function's own
+            # docstring above) — so only overwrite when this tick
+            # actually produced one; keep the prior value otherwise.
+            if current_premium is not None:
+                locked.last_premium = current_premium
             locked.last_seen_at = _now_iso()
             updated_plans.append(locked)
 
