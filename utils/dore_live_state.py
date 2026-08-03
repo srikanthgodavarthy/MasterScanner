@@ -37,6 +37,24 @@ Entry-locking / Drift % persistence (utils/dore_options_persistence.py)
 also moved here from Stage 1 — a locked entry and its drift are live-
 premium concepts that need a fresh premium every 60s, not a technical
 recompute every 5 minutes.
+
+Every OPEN plan gets refreshed, even ones Stage 1 didn't reproduce
+[2026-08-07]
+─────────────────────────────────────────────────────────────────────
+Stage 1's `always_include` mechanism (see utils/dore_options_scan.py)
+exempts open-plan symbols from its shortlist CUTOFF, but that's not a
+guarantee the symbol actually produces a technical plan this cycle —
+hard_reject() can still fire, an option-chain fetch can still fail, or
+the whole "dore_technical_plans" snapshot can simply be stale. None of
+that should stop a real, currently-open position from getting its
+premium refreshed. So this function loads every OPEN
+utils.dore_options_persistence.DoreOptionsPlan straight from Supabase
+and merges in any not already covered by this cycle's technical plans,
+synthesizing a minimal refresh target from the plan's own LOCKED
+fields (direction/strike/expiry/stop_loss/target1/target2) rather than
+a fresh technical recompute. These rows carry "_carried_forward":
+True and leave setup_type/expected_move/etc. as None (not guessed) so
+the UI can tell them apart from a fresh Stage-1 read.
 """
 
 from __future__ import annotations
@@ -207,34 +225,98 @@ def refresh_dore_live_state(cfg=None) -> dict:
     from utils.scan_state import load_snapshot_payload
     from utils.upstox_client import fetch_open_plan_option_quotes, fetch_index_quote, resolve_instrument_key
     from utils.json_sanitize import find_invalid_columns, sanitize_dataframe
+    from utils.supabase_client import load_open_dore_options_plans
+    from utils.dore_options_engine import DORE_OPTIONS_DEFAULTS
     import pandas as pd
 
+    # [2026-08-07 bugfix] This used to return early (nothing refreshed
+    # at all) whenever "dore_technical_plans" was missing or stale. That
+    # meant any OPEN plan whose symbol simply didn't get reproduced by
+    # Stage 1 THIS cycle — dropped from the shortlist, hit
+    # hard_reject(), a transient option-chain fetch failure, or the
+    # whole technical snapshot being stale — silently stopped getting
+    # its premium refreshed at all, with no fallback. An active,
+    # real-money position shouldn't go dark just because Stage 1 didn't
+    # reproduce it this cycle; every OPEN plan gets refreshed here
+    # regardless of whether Stage 1 currently likes it.
+    plans: list[dict] = []
     tech_snap = load_snapshot_payload("dore_technical_plans")
     if not tech_snap:
-        logger.info("[dore_live_state] no dore_technical_plans snapshot yet — nothing to refresh")
-        return {"live_state": [], "diagnostics": {"reason": "no_technical_snapshot"}}
+        logger.info("[dore_live_state] no dore_technical_plans snapshot yet — "
+                     "refreshing OPEN plans directly from Supabase only, if any")
+    else:
+        created_at = tech_snap.get("created_at")
+        stale = False
+        if created_at:
+            try:
+                created = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                age = (datetime.now(timezone.utc) - created).total_seconds()
+                stale = age >= MAX_TECHNICAL_PLAN_STALENESS_SECS
+                if stale:
+                    logger.warning(
+                        "[dore_live_state] dore_technical_plans snapshot is %.0fs old "
+                        "(>= %ss staleness limit) — not using it as this cycle's technical "
+                        "read, but still refreshing OPEN plans directly from Supabase",
+                        age, MAX_TECHNICAL_PLAN_STALENESS_SECS,
+                    )
+            except Exception:
+                logger.exception("[dore_live_state] could not parse dore_technical_plans snapshot age (non-fatal)")
+        if not stale:
+            plans = (tech_snap.get("payload", {}) or {}).get("technical_plans", []) or []
 
-    created_at = tech_snap.get("created_at")
-    if created_at:
-        try:
-            created = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=timezone.utc)
-            age = (datetime.now(timezone.utc) - created).total_seconds()
-            if age >= MAX_TECHNICAL_PLAN_STALENESS_SECS:
-                logger.warning(
-                    "[dore_live_state] dore_technical_plans snapshot is %.0fs old "
-                    "(>= %ss staleness limit) — skipping this cycle rather than "
-                    "refreshing against a stale technical read",
-                    age, MAX_TECHNICAL_PLAN_STALENESS_SECS,
-                )
-                return {"live_state": [], "diagnostics": {"reason": "stale_technical_snapshot", "age_secs": age}}
-        except Exception:
-            logger.exception("[dore_live_state] could not parse dore_technical_plans snapshot age (non-fatal)")
+    # Every OPEN plan, straight from Supabase — the source of truth for
+    # "what's currently active," independent of what Stage 1 happened
+    # to reproduce this cycle.
+    existing_plans: dict = {}
+    try:
+        existing_plans = load_open_dore_options_plans()
+    except Exception:
+        logger.exception("[dore_live_state] could not load open DORE plans (non-fatal — "
+                          "falls back to refreshing only this cycle's technical plans)")
 
-    plans = (tech_snap.get("payload", {}) or {}).get("technical_plans", []) or []
+    def _key(symbol, direction, strike, expiry):
+        return (symbol, direction, round(float(strike or 0.0), 1), expiry)
+
+    covered = {
+        _key(p.get("symbol"), p.get("direction"), (p.get("primary") or {}).get("strike"), p.get("expiry"))
+        for p in plans
+    }
+    band = DORE_OPTIONS_DEFAULTS.entry_zone_band_pct
+    carried_forward = 0
+    for db_plan in existing_plans.values():
+        if not db_plan.is_open():
+            continue
+        k = _key(db_plan.symbol, db_plan.direction, db_plan.strike, db_plan.expiry)
+        if k in covered:
+            continue   # Stage 1 already reproduced this contract this cycle — don't double up
+        entry = db_plan.entry_locked or None
+        # [2026-08-07] Synthesized from the plan's own LOCKED fields —
+        # NOT from a fresh technical recompute (Stage 1 didn't reproduce
+        # this one this cycle, that's the whole point). setup_type/
+        # leadership/expected_move etc. are left unset (None) rather
+        # than guessed, so the UI can tell a carried-forward row apart
+        # from a fresh Stage-1 read — see "_carried_forward" below.
+        plans.append({
+            "symbol": db_plan.symbol,
+            "direction": db_plan.direction,
+            "expiry": db_plan.expiry,
+            "primary": {"strike": db_plan.strike},
+            "stop_loss": db_plan.sl_locked,
+            "target1": db_plan.target1_locked,
+            "target2": db_plan.target2_locked,
+            "confidence_score": db_plan.confidence_at_entry,
+            "entry_zone": (entry * (1 - band), entry * (1 + band)) if entry else (None, None),
+            "expected_move": None,
+            "probability_of_profit": None,
+            "setup_type": None,
+            "_carried_forward": True,   # not reproduced by Stage 1 this cycle — see docstring above
+        })
+        carried_forward += 1
+
     if not plans:
-        return {"live_state": [], "diagnostics": {"reason": "no_technical_plans"}}
+        return {"live_state": [], "diagnostics": {"reason": "no_technical_plans_and_no_open_plans"}}
 
     stock_symbols = [p.get("symbol") for p in plans if p.get("symbol") and p.get("symbol") not in _INDICES]
     index_symbols = sorted({p.get("symbol") for p in plans if p.get("symbol") in _INDICES})
@@ -274,16 +356,9 @@ def refresh_dore_live_state(cfg=None) -> dict:
             logger.exception("[dore_live_state] stock spot batch fetch failed (non-fatal — "
                               "POP falls back to Stage 1's own reading for these symbols)")
 
-    # Entry-locking / Drift % — see module docstring. Best-effort: a
-    # Supabase hiccup degrades to "no locked entry/Drift %" rather than
-    # failing the whole live-state refresh.
-    existing_plans: dict = {}
-    try:
-        from utils.supabase_client import load_open_dore_options_plans
-        existing_plans = load_open_dore_options_plans()
-    except Exception:
-        logger.exception("[dore_live_state] could not load open DORE plans for entry-locking (non-fatal)")
-
+    # Entry-locking / Drift % — see module docstring. Reuses the
+    # existing_plans already loaded above (for the carried-forward-plan
+    # merge) rather than fetching it from Supabase twice.
     rows: list[dict] = []
     plan_views = []
     live_by_key = []
@@ -327,7 +402,8 @@ def refresh_dore_live_state(cfg=None) -> dict:
     return {
         "live_state": df.to_dict("records") if not df.empty else [],
         "diagnostics": {
-            "technical_plans_refreshed": len(plans),
+            "technical_plans_refreshed": len(plans) - carried_forward,
+            "carried_forward_active_plans": carried_forward,
             "rows_produced": len(df),
             "last_refresh_timestamp": now_iso,
         },

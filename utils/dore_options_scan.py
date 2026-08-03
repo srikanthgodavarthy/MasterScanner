@@ -454,10 +454,62 @@ def compute_dore_technical_plans(cfg: Optional[DoreOptionsSettings] = None,
         logger.warning("[dore_technical] invalid numeric values (NaN/inf) before snapshot save — %s", invalid)
     df = sanitize_dataframe(df, "dore_technical_plans.technical_plans")
 
+    records = df.to_dict("records") if not df.empty else []
+
+    # [2026-08-07] Same principle as utils.dore_live_state's carried-
+    # forward fix, one stage earlier: open_plan_symbols is exempted
+    # from the shortlist CUTOFF above, but that's not a guarantee
+    # compute_dore_trade_plan() actually SUCCEEDS this cycle for that
+    # symbol — hard_reject(), a missing option chain, no OHLCV history,
+    # or an exception inside _process() all silently drop it into
+    # `rejections` instead, with no fallback. An open position's
+    # technical read (direction/setup_type/conviction/etc.) shouldn't
+    # just vanish from "dore_technical_plans" because of a transient
+    # miss — so any open-plan symbol missing from this cycle's records
+    # gets its LAST successfully-computed row carried forward from the
+    # previous "dore_technical_plans" snapshot instead, tagged
+    # "_carried_forward_technical": True with the original cycle's
+    # timestamp, so the UI can show it's stale rather than presenting
+    # it as a fresh read. (utils.dore_live_state's own carry-forward —
+    # which synthesizes from the DB's LOCKED fields when nothing else
+    # is available — still runs downstream of this regardless, so a
+    # position is covered even on the first cycle this fails, before
+    # any previous technical snapshot exists to carry forward from.)
+    missing = open_plan_symbols - {r.get("symbol") for r in records}
+    if missing:
+        try:
+            from utils.scan_state import load_snapshot_payload
+            prev_snap = load_snapshot_payload("dore_technical_plans")
+            prev_records = (prev_snap.get("payload", {}) or {}).get("technical_plans", []) or [] if prev_snap else []
+            prev_created_at = (prev_snap or {}).get("created_at")
+            prev_by_symbol = {r.get("symbol"): r for r in prev_records if r.get("symbol")}
+            carried = 0
+            for sym in missing:
+                stale_row = prev_by_symbol.get(sym)
+                if stale_row is None:
+                    continue   # no previous read to carry forward either — dore_live_state's
+                                # own DB-fields fallback still covers the position downstream
+                row = dict(stale_row)
+                row["_carried_forward_technical"] = True
+                row["_carried_forward_as_of"] = prev_created_at
+                records.append(row)
+                carried += 1
+            if carried:
+                logger.info("[dore_technical] carried forward %d open-plan symbol(s) that "
+                            "didn't produce a fresh technical plan this cycle: %s",
+                            carried, sorted(s for s in missing if s in prev_by_symbol))
+        except Exception:
+            logger.exception("[dore_technical] carry-forward of missing open-plan technical "
+                              "reads failed (non-fatal — dore_live_state's own DB-fields "
+                              "fallback still covers premium/drift for these positions)")
+
     return {
-        "technical_plans": df.to_dict("records") if not df.empty else [],
+        "technical_plans": records,
         "rejections": rejections,
-        "diagnostics": {"universe_size": len(live_pool), "plans_produced": len(df)},
+        "diagnostics": {
+            "universe_size": len(live_pool), "plans_produced": len(df),
+            "open_plan_symbols_missing_this_cycle": sorted(missing) if missing else [],
+        },
     }
 
 
