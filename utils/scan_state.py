@@ -71,7 +71,11 @@ logger = logging.getLogger(__name__)
 _TABLES = {
     "market_intelligence": "market_intelligence_snapshots",
     "live_scanner":        "live_scanner_snapshots",
-    "fo_scan":             "fo_scan_snapshots",
+    # "fo_scan" removed [2026-08-03] — fo_scan_snapshots dropped; the
+    # writer job was already commented out of scheduler/scan_worker.py's
+    # JOBS list and the reader removed from pages/scanner.py on 2026-07-31.
+    # Leaving this entry in would make prune_all_snapshots() try to prune
+    # a table that no longer exists on every retention cycle.
     # 2026-07-31: DORE Options Engine Integration — utils.dore_options_scan's
     # own snapshot section, deliberately separate from "fo_scan" (the
     # legacy utils.fo_scan/utils.dore_engine pipeline) so both can run
@@ -349,17 +353,8 @@ CREATE TABLE IF NOT EXISTS live_scanner_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_ls_snap_version ON live_scanner_snapshots(version DESC);
 
-CREATE TABLE IF NOT EXISTS fo_scan_snapshots (
-    id         bigserial   PRIMARY KEY,
-    scan_id    uuid        NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    status     text        NOT NULL DEFAULT 'completed',
-    version    bigint      NOT NULL,
-    row_count  integer     NOT NULL DEFAULT 0,
-    error      text,
-    payload    jsonb
-);
-CREATE INDEX IF NOT EXISTS idx_fo_snap_version ON fo_scan_snapshots(version DESC);
+-- fo_scan_snapshots removed [2026-08-03] — dead table, dropped from
+-- Supabase. See the "fo_scan" removal note above _TABLES for why.
 
 -- 2026-07-31: DORE Options Engine Integration — separate snapshot table
 -- for utils.dore_options_scan.compute_dore_options_scan(), independent
@@ -412,13 +407,25 @@ BEGIN
     order_col := CASE p_table
         WHEN 'market_intelligence_snapshots' THEN 'version'
         WHEN 'live_scanner_snapshots'        THEN 'version'
-        WHEN 'fo_scan_snapshots'             THEN 'version'
+        -- fo_scan_snapshots removed [2026-08-03] — dead table: writer job
+        -- has been commented out of scheduler/scan_worker.py's JOBS list
+        -- since the DORE Options Engine took over, and pages/scanner.py's
+        -- fo_scan-backed reader was removed 2026-07-31. Table itself
+        -- dropped from Supabase; keeping it here would just make this RPC
+        -- fail every retention cycle against a table that no longer exists.
         WHEN 'dore_options_scan_snapshots'   THEN 'version'
         WHEN 'dore_live_state_snapshots'     THEN 'version'
         WHEN 'dore_technical_plans_snapshots' THEN 'version'
         WHEN 'scan_snapshots'                THEN 'run_at'
         WHEN 'scan_daily_archive'            THEN 'trading_date'
         WHEN 'sector_snapshots'              THEN 'scan_date'
+        -- [Free-plan retention audit, 2026-08-03] lifecycle_transitions is
+        -- an insert-only append log (utils.supabase_client.save_lifecycle_
+        -- transitions) that had no pruning anywhere — added here rather
+        -- than a new RPC since, unlike backtest_results, each row is
+        -- independent (no multi-row "run" grouping a row-count cap could
+        -- truncate mid-way through).
+        WHEN 'lifecycle_transitions'         THEN 'to_date'
         ELSE NULL
     END;
     IF order_col IS NULL THEN
