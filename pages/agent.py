@@ -152,7 +152,8 @@ def render(settings: dict | None = None) -> None:
             unsafe_allow_html=True,
         )
 
-    prompt = st.chat_input("Ask about a Nifty 500 stock…")
+    with st.bottom():
+        prompt = st.chat_input("Ask about a Nifty 500 stock…")
     if prompt:
         messages.append({"role": "user", "content": prompt})
         with st.chat_message("user", avatar="🧑"):

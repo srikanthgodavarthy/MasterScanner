@@ -203,6 +203,49 @@ class MasterScannerSignal:
     target_price:    float
     market_regime:   Optional[str] = None   # read from MasterScanner's own regime context, never recomputed
 
+    # [Setup-Aware Conviction, 2026-08-06] Raw pattern signals — already
+    # surfaced as columns on MasterScanner's own scan row (see
+    # utils/conviction_score_v1.py's BarResult / utils/scanner_engine.py's
+    # result dict), read here for the FIRST time by DORE so it can
+    # classify a candidate's setup type (Pullback / Breakout /
+    # Continuation / Base-Building) itself, rather than relying solely
+    # on utils.conviction_score_v1's single blended Conviction score —
+    # see setup_aware_conviction() below for why.
+    # None of these are recomputed or reinterpreted from OHLCV here —
+    # straight pass-through of what MasterScanner already measured.
+    in_golden:              bool  = False   # 50-61.8% Fib retracement — ideal pullback depth
+    in_golden_relaxed:      bool  = False   # 38.2-61.8% — acceptable pullback depth
+    in_golden_cci:          bool  = False   # CCI oversold confluence inside the golden zone
+    trend_up:               bool  = False
+    ema_alignment:          bool  = False
+    above_cloud:            bool  = False
+    inside_cloud:           bool  = False
+    trend_structure:        bool  = False   # full structural pillar confirmed
+    vol_ratio:              float = 1.0     # today's volume vs its own average (>1 = expanding)
+    pivot_high_dist:        float = 0.0     # % distance from the last pivot high (>0 = above/past it)
+    ema20_pct_dist:         float = 0.0
+    price_move_since_setup: float = 0.0     # % moved since the setup was first flagged
+    bars_since_setup:       int   = 0
+    trend_age_bars:         int   = 0       # how long the current trend has been running — kept for
+                                             # display/diagnostics only; NOT a scoring input for
+                                             # continuation_conviction as of 2026-08-07 (see that
+                                             # function's docstring for why)
+    ema20_slope:            float = 0.0     # 5-bar EMA20 slope — "EMA acceleration" input
+    rs_composite_pct:       float = 0.0     # RS composite vs Nifty, already *100 (row's "RScomp")
+    adx_val:                float = 0.0     # ADX level — "ADX expansion" input (see caveat on
+                                             # continuation_conviction() re: level vs. true slope)
+
+    # Populated by from_scan_row() via setup_aware_conviction() — see
+    # that function's docstring.
+    setup_type:             str   = ""      # PULLBACK | BREAKOUT | CONTINUATION | BASE_BUILDING
+    setup_conviction:       float = 0.0      # setup-type-specific score, 0-100 on its OWN scale
+    # [2026-08-07] The other two formulas' scores, kept for diagnostics
+    # and any future ranking use — see setup_aware_conviction()'s
+    # docstring for why all three are always computed now.
+    pullback_score:         float = 0.0
+    breakout_score:         float = 0.0
+    continuation_score:     float = 0.0
+
     @staticmethod
     def from_scan_row(
         row: dict,
@@ -235,7 +278,10 @@ class MasterScannerSignal:
             _dte = dte if dte and dte > 0 else 5
             expected_move = round(atr * math.sqrt(_dte), 2)
 
-        return MasterScannerSignal(
+        # [Setup-Aware Conviction, 2026-08-06] see MasterScannerSignal's
+        # field-block docstring — straight pass-through of columns
+        # utils/scanner_engine.py already writes onto the scan row.
+        sig = MasterScannerSignal(
             symbol=symbol or str(row.get("Stock") or row.get("Symbol") or ""),
             conviction=conviction,
             entry_quality=entry_quality,
@@ -248,7 +294,247 @@ class MasterScannerSignal:
             current_price=current_price,
             target_price=target_price,
             market_regime=(str(regime).upper() if regime else None),
+            in_golden=bool(row.get("_in_golden")),
+            in_golden_relaxed=bool(row.get("_in_golden_relaxed")),
+            in_golden_cci=bool(row.get("_in_golden_cci")),
+            trend_up=bool(row.get("_trend_up")),
+            ema_alignment=bool(row.get("_ema_alignment")),
+            above_cloud=bool(row.get("_above_cloud")),
+            inside_cloud=bool(row.get("_inside_cloud")),
+            trend_structure=bool(row.get("_trend_structure")),
+            vol_ratio=float(row.get("_vol_ratio") if row.get("_vol_ratio") is not None else 1.0),
+            pivot_high_dist=float(row.get("PivotDist") or 0.0),
+            ema20_pct_dist=float(row.get("EMA20Dist") or 0.0),
+            price_move_since_setup=float(row.get("MoveSince") or 0.0),
+            bars_since_setup=int(row.get("BarsSince") or 0),
+            trend_age_bars=int(row.get("TrendAge") or 0),
+            ema20_slope=float(row.get("EMA Slope") or 0.0),
+            rs_composite_pct=float(row.get("RScomp") or 0.0),
+            adx_val=float(row.get("ADX") or 0.0),
         )
+        sig.setup_type, sig.setup_conviction, _setup_scores = setup_aware_conviction(sig)
+        sig.pullback_score     = _setup_scores[SETUP_PULLBACK]
+        sig.breakout_score     = _setup_scores[SETUP_BREAKOUT]
+        sig.continuation_score = _setup_scores[SETUP_CONTINUATION]
+        return sig
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SETUP-AWARE CONVICTION [2026-08-06]
+# ──────────────────────────────────────────────────────────────────
+#  utils.conviction_score_v1's blended Conviction/Entry Quality scores
+#  fold Pullback and Breakout/Continuation into ONE shared 0-100 scale
+#  with an asymmetric ceiling baked in (see _conviction()'s Fibonacci
+#  Zone component: pullback path caps at 25/25, continuation path caps
+#  at 17/25 even with volume confirmation) — a deliberate choice for
+#  the main scanner's own purposes, but it means a genuinely strong
+#  breakout can never outscore a comparable pullback, no matter how
+#  clean the breakout is, because the SAME blended number feeds
+#  DORE's qualification_score()/final_score() regardless of which
+#  pattern actually produced it.
+#
+#  This section classifies the setup FIRST, then scores each type on
+#  its OWN 0-100 scale using the same raw signals (already surfaced on
+#  the scan row — see MasterScannerSignal's field-block docstring),
+#  instead of inheriting one path's cap. qualification_score() and
+#  final_score() below use setup_conviction (not the blended
+#  conviction) as their Conviction input; rank_recommendations() then
+#  ranks WITHIN each setup type before merging, so pullback candidates
+#  can no longer crowd breakout/continuation candidates out of the top
+#  of the list purely by sharing a friendlier scale.
+#
+#  sig.conviction (utils.conviction_score_v1's blended score) is left
+#  untouched on MasterScannerSignal — still shown in reasons/diagnostics
+#  for comparison, just no longer the scoring input.
+# ══════════════════════════════════════════════════════════════════
+
+SETUP_PULLBACK      = "PULLBACK"
+SETUP_BREAKOUT      = "BREAKOUT"
+SETUP_CONTINUATION  = "CONTINUATION"
+SETUP_BASE_BUILDING = "BASE_BUILDING"   # diagnostic label only — see setup_aware_conviction()
+
+_BREAKOUT_MAX_BARS = 3   # "fresh" reclaim — feeds breakout_conviction's own freshness bonus,
+                         # not a gate on which formula runs (see 2026-08-07 rewrite below)
+
+# A setup label is only meaningful once something actually beat the
+# other two — below this, none of the three trade theses really fit,
+# and the winning score is more a tie-break artifact than a signal.
+# BASE_BUILDING is reported in that case, purely as a diagnostic label
+# (it has no scoring formula of its own — see setup_aware_conviction()).
+_MIN_MEANINGFUL_SETUP_SCORE = 40.0
+
+
+def _trend_structure_score(sig: "MasterScannerSignal") -> float:
+    """0-40 — structural quality shared by all three formulas below (the
+    same trend-alignment facts shouldn't be scored differently just
+    because of which setup path a candidate is on)."""
+    score = 0.0
+    if sig.trend_up:        score += 12
+    if sig.ema_alignment:   score += 12
+    if sig.above_cloud:     score += 10
+    elif sig.inside_cloud:  score += 4
+    if sig.trend_structure: score += 6
+    return min(score, 40)
+
+
+def pullback_conviction(sig: "MasterScannerSignal") -> float:
+    """0-100. Trend structure + retracement depth (unclipped — no
+    shared-scale cap) + CCI confluence + volume dry-up during the
+    pullback. Self-gated: every bonus here requires actually being IN
+    a retracement zone (in_golden/in_golden_relaxed) — a candidate
+    that isn't in one scores structure-only, same as the other two
+    formulas score a candidate that doesn't fit THEM."""
+    score = _trend_structure_score(sig)                       # 0-40
+    if sig.in_golden:                        score += 40      # ideal depth
+    elif sig.in_golden_relaxed:               score += 28      # acceptable depth
+    if sig.in_golden_cci:                     score += 12      # oversold confluence
+    if sig.in_golden_relaxed and sig.vol_ratio < 0.80:
+        score += 8                                             # volume dry-up (selling exhausted)
+    return round(min(score, 100.0), 1)
+
+
+def breakout_conviction(sig: "MasterScannerSignal") -> float:
+    """0-100. Trend structure + volume confirmation weighted hard (a
+    breakout without volume isn't a real breakout) + cleanliness of the
+    pivot reclaim + freshness.
+
+    [2026-08-07] Self-gated on `pivot_high_dist > 0` for the pivot-
+    cleanliness and freshness bonuses — this used to be enforced
+    upstream by classify_setup_type()'s `pivot_high_dist > 0` gate
+    before this function ever ran; now that all three formulas run
+    unconditionally on every candidate (see setup_aware_conviction()),
+    each has to defend its own bonuses. Without this guard, a deep
+    PULLBACK candidate (pivot_high_dist very negative, e.g. -8) would
+    satisfy `pvtd <= 1.0` on sign alone and collect a breakout-
+    cleanliness bonus it has no business getting."""
+    score = _trend_structure_score(sig)                       # 0-40
+    if   sig.vol_ratio >= 2.0: score += 30
+    elif sig.vol_ratio >= 1.5: score += 22
+    elif sig.vol_ratio >= 1.2: score += 12
+    if sig.pivot_high_dist > 0:
+        pvtd = sig.pivot_high_dist
+        if   pvtd <= 1.0: score += 20   # just reclaimed — cleanest entry
+        elif pvtd <= 2.0: score += 15
+        elif pvtd <= 4.0: score += 8
+        if sig.bars_since_setup <= _BREAKOUT_MAX_BARS:
+            score += 10                                        # freshness bonus
+    return round(min(score, 100.0), 1)
+
+
+def continuation_conviction(sig: "MasterScannerSignal") -> float:
+    """0-100. [2026-08-07 v2 — replaces the trend-age-heavy v1] Rewards
+    fresh momentum EXPANSION rather than a trend simply having existed
+    longer. v1 scored trend_age_bars monotonically (older = more
+    points, uncapped), which meant an old, tired trend could outscore
+    a fresh momentum expansion purely for longevity — backwards for an
+    options-focused engine, where the best entries tend to be early in
+    a move, not late.
+
+    Components (60-pt budget, on top of the shared 0-40
+    _trend_structure_score() baseline every formula uses):
+        EMA acceleration (EMA20 slope)                    up to 15
+        ADX level (expansion-tier proxy — see caveat)      up to 15
+        Rising volume (vol_ratio — proxy, see caveat)      up to 12
+        Relative strength (RS composite vs Nifty)          up to 12
+        Controlled extension (banded pivot distance —
+            penalizes BOTH "hasn't moved" and "already
+            extended too far", not monotonic)              up to  6
+
+    RS/ADX/EMA-slope bands mirror utils.conviction_score_v1's own
+    already-validated Leadership sub-score thresholds (see that
+    module's _leadership() docstring for the backtested PF/win-rate
+    rationale behind each band) rescaled to this function's point
+    budget, rather than inventing new arbitrary cutoffs.
+
+    [Caveat] "ADX expansion" and "rising volume" here are levels
+    (ADX's current magnitude, today's volume vs its own average), not
+    literal bar-over-bar derivatives — no such trend/slope field exists
+    on the scan row today, only these snapshots. A true multi-bar
+    ADX/volume slope would require a change in
+    utils/conviction_score_v1.py or utils/scanner_engine.py, which is
+    intentionally out of scope here to keep DORE's changes
+    self-contained (see this module's own docstring on staying
+    architecturally independent).
+
+    trend_age_bars is NOT a scoring input anymore — it's still on
+    MasterScannerSignal for display/diagnostics, just not rewarded in
+    its own right."""
+    score = _trend_structure_score(sig)                       # 0-40
+
+    # EMA acceleration — mirrors _leadership()'s ema20_slope bands
+    # (>0.3 / >0 / else), rescaled from a 10pt to a 15pt budget.
+    slope = sig.ema20_slope
+    if   slope > 0.3: score += 15
+    elif slope > 0.0: score += 7
+
+    # ADX level — mirrors _leadership()'s adx_val bands (>=40/>30/>25),
+    # rescaled from a 20pt to a 15pt budget.
+    adx = sig.adx_val
+    if   adx >= 40: score += 15
+    elif adx > 30:  score += 9
+    elif adx > 25:  score += 4
+
+    # Rising volume (proxy — see caveat above)
+    if   sig.vol_ratio >= 2.0: score += 12
+    elif sig.vol_ratio >= 1.5: score += 9
+    elif sig.vol_ratio >= 1.2: score += 5
+
+    # Relative strength — mirrors _leadership()'s rs_composite bands
+    # (already *100-scaled on the row, see rs_composite_pct), rescaled
+    # from a 30pt to a 12pt budget.
+    rs = sig.rs_composite_pct
+    if   rs > 15: score += 12
+    elif rs > 10: score += 10
+    elif rs > 5:  score += 8
+    elif rs > 3:  score += 6
+    elif rs > 0:  score += 4
+    elif rs > -3: score += 2
+
+    # Controlled extension — a continuation needs to actually be past
+    # the pivot (pvtd > 0) to earn this at all, but past a point
+    # further extension is a warning sign, not a bonus — unlike v1,
+    # this is NOT monotonic in pvtd.
+    pvtd = sig.pivot_high_dist
+    if 0 < pvtd <= 8:
+        score += 6
+    elif 8 < pvtd <= 15:
+        score += 3
+    # pvtd <= 0 (hasn't broken out) or pvtd > 15 (overextended): 0
+
+    return round(min(score, 100.0), 1)
+
+
+def setup_aware_conviction(sig: "MasterScannerSignal") -> tuple[str, float, dict]:
+    """[2026-08-07 rewrite] All three formulas are now computed
+    unconditionally — no upstream classifier decides which one gets to
+    run. The setup type is simply whichever scored highest; the other
+    two scores are kept (see the `scores` dict returned, and the three
+    corresponding fields added to MasterScannerSignal/OptionTradePlan)
+    for diagnostics and any future ranking use, per the rationale that
+    prompted this rewrite: a hard classify-then-score boundary meant a
+    candidate sitting right at the pullback/breakout edge got scored by
+    only ONE formula and never got to show how it'd have scored under
+    the other — including cases where the "wrong" formula was actually
+    the better fit. Computing all three and taking the max removes that
+    edge case entirely, while still letting genuine pullbacks win on
+    pullback merit and genuine breakouts win on breakout merit.
+
+    Returns (setup_type, setup_conviction, scores) where scores =
+    {"PULLBACK": ..., "BREAKOUT": ..., "CONTINUATION": ...}. setup_type
+    is BASE_BUILDING (no dedicated formula) when even the winning score
+    doesn't clear _MIN_MEANINGFUL_SETUP_SCORE — none of the three
+    trade theses really fit, so the winner is more tie-break noise than
+    a real signal at that point."""
+    scores = {
+        SETUP_PULLBACK:     pullback_conviction(sig),
+        SETUP_BREAKOUT:     breakout_conviction(sig),
+        SETUP_CONTINUATION: continuation_conviction(sig),
+    }
+    best_type = max(scores, key=scores.get)
+    best_score = scores[best_type]
+    if best_score < _MIN_MEANINGFUL_SETUP_SCORE:
+        return SETUP_BASE_BUILDING, best_score, scores
+    return best_type, best_score, scores
 
 
 @dataclass
@@ -396,6 +682,22 @@ class OptionTradePlan:
     premium_prev_close:    Optional[float] = None
     premium_change_pct:    Optional[float] = None
 
+    # [DORE Integration, 2026-07-31] Fields the DORE Technical Plans
+    # persistence layer (utils/dore_options_scan.py) needs at the top
+    # level so it doesn't have to reach into `primary`/EmaMomentum
+    # internals — see MasterScanner_DORE_Integration_Spec.docx section
+    # 2 & 5. All three are derived, read-only summaries of state
+    # already computed above; none of them add a new computation.
+    leadership:             Optional[str] = None    # "Bullish (EMA9>EMA21)" / "Bearish (EMA9<EMA21)"
+    technical_recommendation: Optional[str] = None  # e.g. "BUY CE — High Confidence (Breakout)"
+    risk_reward_ratio:      Optional[float] = None  # == primary.risk_reward_ratio, restated at top level
+    setup_type:             Optional[str] = None    # PULLBACK | BREAKOUT | CONTINUATION | BASE_BUILDING — see setup_aware_conviction()
+    # [2026-08-07] The other two formulas' scores — kept for diagnostics/
+    # UI transparency (e.g. "won Breakout 78 vs Pullback 61") and any
+    # future ranking use. See setup_aware_conviction()'s docstring.
+    pullback_score:         Optional[float] = None
+    breakout_score:         Optional[float] = None
+    continuation_score:     Optional[float] = None
     reasons:              list = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -461,11 +763,18 @@ class DoreRejection:
 def qualification_score(sig: MasterScannerSignal, mom: "EmaMomentum", settings: DoreOptionsSettings) -> float:
     """Every candidate that reaches DORE gets scored, not filtered.
     Ranking (rank_recommendations()) uses this instead of a hard
-    Conviction/Entry-Quality gate."""
+    Conviction/Entry-Quality gate.
+
+    [Setup-Aware Conviction, 2026-08-06, argmax rewrite 2026-08-07] Uses
+    sig.setup_conviction (the highest of the three independently-
+    computed setup scores — see setup_aware_conviction() above) instead
+    of utils.conviction_score_v1's blended sig.conviction, so a strong
+    breakout/continuation candidate is judged on its own type's scale
+    rather than one that structurally favors pullbacks."""
     score = (
-        sig.conviction     * settings.w_qual_conviction +
-        sig.entry_quality  * settings.w_qual_entry_quality +
-        mom.momentum_score * settings.w_qual_ema_momentum
+        sig.setup_conviction * settings.w_qual_conviction +
+        sig.entry_quality    * settings.w_qual_entry_quality +
+        mom.momentum_score   * settings.w_qual_ema_momentum
     )
     return round(max(0.0, min(100.0, score)), 1)
 
@@ -833,13 +1142,16 @@ def final_score(
     sig: MasterScannerSignal, mom: EmaMomentum, oi_quality: float,
     expiry_suitability: float, premium_quality: float, settings: DoreOptionsSettings,
 ) -> float:
+    """[Setup-Aware Conviction, 2026-08-06] Uses sig.setup_conviction,
+    not the blended sig.conviction — see qualification_score()'s
+    docstring above for why."""
     score = (
-        sig.conviction      * settings.w_conviction +
-        sig.entry_quality   * settings.w_entry_quality +
-        mom.momentum_score  * settings.w_ema_momentum +
-        oi_quality          * settings.w_oi_quality +
-        premium_quality     * settings.w_premium_quality +
-        expiry_suitability  * settings.w_expiry_suitability
+        sig.setup_conviction * settings.w_conviction +
+        sig.entry_quality     * settings.w_entry_quality +
+        mom.momentum_score    * settings.w_ema_momentum +
+        oi_quality            * settings.w_oi_quality +
+        premium_quality       * settings.w_premium_quality +
+        expiry_suitability    * settings.w_expiry_suitability
     ) / 100.0
     return round(score, 1)
 
@@ -986,12 +1298,31 @@ def compute_dore_trade_plan(
         premium_change_pct = round((primary.premium - premium_prev_close) / premium_prev_close * 100, 2)
 
     reasons = (
-        [f"Conviction {sig.conviction:.0f}", f"Entry Quality {sig.entry_quality:.0f}",
+        [f"Setup: {sig.setup_type} {sig.setup_conviction:.0f} "
+         f"(Pullback {sig.pullback_score:.0f} / Breakout {sig.breakout_score:.0f} / "
+         f"Continuation {sig.continuation_score:.0f})",
+         f"Blended Conviction {sig.conviction:.0f}", f"Entry Quality {sig.entry_quality:.0f}",
          f"Qualification Score {qual_score:.0f}"]
         + direction_reasons
         + [f"Expected Move supports {primary.strike:g} {dir_} (Balanced)"]
         + all_reasons
     )
+
+    # [DORE Integration, 2026-07-31] Leadership / Technical Recommendation
+    # — plain-language restatements of state already computed above
+    # (EmaMomentum.bullish and the final confidence score), persisted
+    # as DORE Technical Plan fields per the integration spec. Neither
+    # is a new calculation.
+    leadership = f"Bullish (EMA9>EMA21, {mom.momentum_score:.0f})" if mom.bullish \
+        else f"Bearish (EMA9<EMA21, {mom.momentum_score:.0f})"
+
+    if score >= 75:
+        conf_tier = "High Confidence"
+    elif score >= 55:
+        conf_tier = "Moderate Confidence"
+    else:
+        conf_tier = "Low Confidence"
+    technical_recommendation = f"BUY {dir_} \u2014 {conf_tier} ({sig.setup_type.replace('_', ' ').title()})"
 
     return OptionTradePlan(
         symbol=sig.symbol,
@@ -1018,13 +1349,53 @@ def compute_dore_trade_plan(
         current_premium=primary.premium,
         premium_prev_close=premium_prev_close,
         premium_change_pct=premium_change_pct,
+        leadership=leadership,
+        technical_recommendation=technical_recommendation,
+        risk_reward_ratio=primary.risk_reward_ratio,
+        setup_type=sig.setup_type,
+        pullback_score=sig.pullback_score,
+        breakout_score=sig.breakout_score,
+        continuation_score=sig.continuation_score,
         reasons=reasons,
     )
 
 
 def rank_recommendations(results: Sequence) -> list[OptionTradePlan]:
-    """Stage 8/Final Ranking — DORE ranks by confidence_score (which
-    itself is dominated by MasterScanner's Conviction/Entry Quality per
-    Improvement #8), it does not filter by a hard threshold."""
+    """Stage 8/Final Ranking — confidence_score itself (see final_score())
+    now uses setup_conviction rather than the blended Conviction score,
+    but a single global sort by confidence_score would still let one
+    setup type's scores simply run systematically higher than another's
+    and crowd the front of the list purely on scale, not merit.
+
+    [Setup-Aware Conviction, 2026-08-06] Ranks WITHIN each setup_type
+    first (each candidate competes only against its own type), then
+    interleaves — rank 1 of every type, then rank 2 of every type, and
+    so on — so a strong Breakout or Continuation candidate is
+    guaranteed a seat near the top instead of needing to outscore every
+    Pullback candidate on a shared scale. Within-type order is still
+    confidence_score, so quality still matters — just not cross-type
+    comparability, which was never the point of this ranking anyway
+    (DORE's per-symbol shortlist cost cutoff, _shortlist_for_option_chain
+    in utils/dore_options_scan.py, is untouched by this — this only
+    reorders candidates that already made it through to a computed
+    trade plan)."""
     plans = [r for r in results if isinstance(r, OptionTradePlan)]
-    return sorted(plans, key=lambda r: r.confidence_score, reverse=True)
+
+    by_type: dict[str, list[OptionTradePlan]] = {}
+    for p in plans:
+        by_type.setdefault(p.setup_type or "", []).append(p)
+    for group in by_type.values():
+        group.sort(key=lambda r: r.confidence_score, reverse=True)
+
+    # Type order: strongest-scoring type first (by its own #1 candidate),
+    # purely for stable, sensible interleaving — not a preference weight.
+    type_order = sorted(by_type.keys(), key=lambda t: by_type[t][0].confidence_score, reverse=True)
+
+    ranked: list[OptionTradePlan] = []
+    i = 0
+    while any(i < len(by_type[t]) for t in type_order):
+        for t in type_order:
+            if i < len(by_type[t]):
+                ranked.append(by_type[t][i])
+        i += 1
+    return ranked

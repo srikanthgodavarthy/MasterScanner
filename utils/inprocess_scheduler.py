@@ -163,19 +163,23 @@ def start_background_scans() -> bool:
                 target=_run_loop, args=(name, section, interval, compute_fn, to_payload),
                 kwargs={
                     "owner_event": hb_thread.lost_ownership,
-                    # [2026-08-02] see scheduler/scan_worker.py's main() for
-                    # the matching change and rationale — dore_options_scan
-                    # reads live_scanner's snapshot as its whole input, so
-                    # skip its own (heavy) cycle rather than run it against
-                    # stale/missing data and pile more load on a process
-                    # that's already RAM/CPU constrained.
-                    "require_fresh_live_scanner": (name == "dore_options_scan"),
-                    # [2026-08-03, SG request] DORE gets a 60s priority
-                    # window, live_scanner gets 3min — see
-                    # utils/scan_priority.py. Same coordinator instance
-                    # (module-level state) is shared with the live_scanner
-                    # thread started below.
-                    "priority_name": ("dore" if name == "dore_options_scan" else None),
+                    # [DORE Integration, 2026-08-05] see
+                    # scheduler/scan_worker.py's main() for the matching
+                    # change and rationale — dore_live_state checks its
+                    # own input's (dore_technical_plans) staleness
+                    # internally, so this generic gate (built for the old,
+                    # heavier dore_options_scan job) no longer applies to
+                    # any current job.
+                    "require_fresh_live_scanner": False,
+                    # [DORE Integration, 2026-08-05] No job here contends
+                    # with live_scanner for API/CPU priority anymore — the
+                    # heavy technical recompute moved INTO live_scanner's
+                    # own loop, and dore_live_state is light enough not to
+                    # need scan_priority.py's arbitration. Same coordinator
+                    # instance (module-level state) is shared with the
+                    # live_scanner thread started below, kept in case a
+                    # future job needs it again.
+                    "priority_name": None,
                 },
                 name=f"scan-{name}", daemon=True,
             )
