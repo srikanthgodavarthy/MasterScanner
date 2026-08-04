@@ -70,7 +70,8 @@ logger = logging.getLogger(__name__)
 # at the bottom of this file).
 _TABLES = {
     "market_intelligence": "market_intelligence_snapshots",
-    "live_scanner":        "live_scanner_snapshots",
+    # "live_scanner" removed from this map [2026-08-04] — see _STATE_SECTIONS
+    # below. It no longer writes an append-only snapshot table at all.
     # "fo_scan" removed [2026-08-03] — fo_scan_snapshots dropped; the
     # writer job was already commented out of scheduler/scan_worker.py's
     # JOBS list and the reader removed from pages/scanner.py on 2026-07-31.
@@ -84,16 +85,60 @@ _TABLES = {
     # _fo_opportunities_panel for the primary/legacy toggle that reads
     # from each.
     "dore_options_scan":   "dore_options_scan_snapshots",
-    # 2026-08-03: previously 404ing — DDL existed nowhere until the Trinity
-    # project rebuild. Tables now exist (see masterscanner_full_schema.sql);
-    # this mapping is what actually makes save_snapshot("dore_live_state", ...)
-    # and load_snapshot_payload("dore_technical_plans") resolve to them
-    # instead of failing to find a section.
-    "dore_live_state":       "dore_live_state_snapshots",
+    # "dore_live_state" removed from this map [2026-08-04] — see
+    # _STATE_SECTIONS below, same reason as "live_scanner".
     "dore_technical_plans":  "dore_technical_plans_snapshots",
 }
 
 _META_COLUMNS = "scan_id, created_at, status, version, row_count, error"
+
+# ─── SYMBOL-KEYED STATE SECTIONS (2026-08-04 Trinity migration) ─────────
+# "live_scanner" and "dore_live_state" used to be append-only snapshot
+# tables like everything else in _TABLES above: every producer cycle
+# INSERTed a new row holding the FULL universe as one big jsonb payload.
+# live_scanner_snapshots hit 1.22GB (98% of the whole database) in ~28
+# hours — ~861KB/row, ~1 row every ~2 minutes, zero dedup, growing at
+# roughly 1GB/day on a free-tier project. The 500-row retention cap
+# (RETENTION_KEEP_ROWS below) wasn't enough at that per-row size, and
+# wasn't even being applied to live_scanner_snapshots when this was
+# caught (1398 rows found against a 500-row cap).
+#
+# Root cause: a snapshot is fundamentally the wrong shape for this data.
+# There's exactly one current record per stock (or per DORE symbol) that
+# matters — not a growing history of full-universe blobs. So instead of
+# INSERT-per-cycle into a *_snapshots table, these two sections now
+# UPSERT one row per symbol (keyed on that record's identity field) into
+# a fixed-size *_state table. Table size is bounded by the number of
+# distinct symbols (377 for live_scanner, ~27 for dore_live_state as of
+# this migration), not by how long the app has been running.
+#
+# save_snapshot()/load_snapshot_meta()/load_snapshot_payload() below
+# dispatch to _save_state()/_load_state_meta()/_load_state_payload() for
+# these two sections and preserve their exact input/output shapes, so
+# every existing caller (scheduler/scan_worker.py, pages/scanner.py,
+# pages/dashboard.py, pages/five_pillars.py, pages/sectors.py,
+# utils/dore_options_scan.py, utils/dore_live_state.py) needed ZERO
+# changes — they still call save_snapshot("live_scanner", payload=
+# {"data": [...]}, row_count=...) and read back load_snapshot_payload(
+# "live_scanner")["payload"]["data"] exactly as before.
+#
+# "extra" sibling fields that used to live next to the record list in
+# the payload dict (e.g. dore_live_state's "diagnostics") have nowhere
+# to sit inside a per-symbol row, so they're kept in state_meta — one
+# row per state section, holding scan_id/status/error/row_count plus
+# those extra fields, refreshed on every completed save.
+_STATE_SECTIONS = {
+    "live_scanner": {
+        "table": "live_scanner_state",
+        "records_key": "data",     # payload["data"] is the record list
+        "id_field": "Stock",       # each record's identity field
+    },
+    "dore_live_state": {
+        "table": "dore_live_state",
+        "records_key": "live_state",
+        "id_field": "symbol",
+    },
+}
 
 
 def _client():
@@ -170,6 +215,9 @@ def save_snapshot(
        cover) is immediately diagnosable instead of looking like a
        connectivity issue.
     """
+    if section in _STATE_SECTIONS:
+        return _save_state(section, payload, row_count, status, error)
+
     client = _client()
     if client is None:
         return None
@@ -232,6 +280,9 @@ def load_snapshot_meta(section: str) -> Optional[dict]:
     only — never touches the (possibly large) payload column, so this is
     safe to call every 30s from a Streamlit fragment.
     """
+    if section in _STATE_SECTIONS:
+        return _load_state_meta(section)
+
     client = _client()
     if client is None:
         return None
@@ -259,6 +310,9 @@ def load_snapshot_payload(section: str) -> Optional[dict]:
     "completed" (a "running"/"failed" row has no usable payload — callers
     should keep showing their last-good cached payload in that case).
     """
+    if section in _STATE_SECTIONS:
+        return _load_state_payload(section)
+
     client = _client()
     if client is None:
         return None
@@ -278,6 +332,187 @@ def load_snapshot_payload(section: str) -> Optional[dict]:
         return row
     except Exception:
         logger.exception("load_snapshot_payload(%s) failed", section)
+        return None
+
+
+# ─── STATE SECTION IMPLEMENTATION (backs "live_scanner" / "dore_live_state") ──
+
+def _save_state(
+    section: str,
+    payload: Optional[dict],
+    row_count: Optional[int],
+    status: str,
+    error: Optional[str],
+) -> Optional[str]:
+    cfg = _STATE_SECTIONS[section]
+    client = _client()
+    if client is None:
+        return None
+
+    scan_id = str(uuid.uuid4())
+
+    if status != "completed" or payload is None:
+        # No payload means nothing to upsert — unlike the old append-only
+        # table, there's no "row with payload=None" to write for a
+        # failed/running cycle. The last-good per-symbol state simply
+        # stays live, which is the correct behavior for a current-state
+        # table. We still record the failure in state_meta so
+        # load_snapshot_meta() callers can see status/error if they check.
+        try:
+            from utils.supabase_client import _execute_with_retry
+            _execute_with_retry(
+                client.table("state_meta").upsert(
+                    {"section": section, "scan_id": scan_id, "status": status,
+                     "error": error, "updated_at": "now()"},
+                    on_conflict="section",
+                )
+            )
+        except Exception:
+            logger.exception("_save_state(%s) meta-only upsert failed", section)
+        return None
+
+    from utils.json_sanitize import collect_invalid_field_names, sanitize_for_json
+
+    invalid_fields = collect_invalid_field_names(payload)
+    if invalid_fields:
+        logger.warning(
+            "[%s] state payload contained non-JSON-compliant float value(s) "
+            "(NaN/inf) in field(s) %s — replacing with null before save.",
+            section, sorted(invalid_fields),
+        )
+    payload = sanitize_for_json(payload)
+
+    records = payload.get(cfg["records_key"]) or []
+    extra = {k: v for k, v in payload.items() if k != cfg["records_key"]}
+
+    id_field = cfg["id_field"]
+    rows = []
+    skipped = 0
+    for rec in records:
+        symbol = rec.get(id_field)
+        if not symbol:
+            skipped += 1
+            continue
+        rows.append({"symbol": symbol, "record": rec, "scan_id": scan_id, "updated_at": "now()"})
+    if skipped:
+        logger.warning("[%s] skipped %d record(s) with no %r key", section, skipped, id_field)
+
+    try:
+        from utils.supabase_client import _execute_with_retry
+        if rows:
+            _execute_with_retry(
+                client.table(cfg["table"]).upsert(rows, on_conflict="symbol")
+            )
+        _execute_with_retry(
+            client.table("state_meta").upsert(
+                {"section": section, "scan_id": scan_id, "status": "completed",
+                 "row_count": row_count if row_count is not None else len(rows),
+                 "error": None, "extra": extra, "updated_at": "now()"},
+                on_conflict="section",
+            )
+        )
+        logger.info("_save_state(%s): upserted %d row(s)", section, len(rows))
+        return scan_id
+    except ValueError as exc:
+        logger.error(
+            "[%s] state upsert serialization failed — invalid JSON value(s) "
+            "detected even after sanitization. Original error: %s",
+            section, exc, exc_info=True,
+        )
+        return None
+    except Exception:
+        logger.exception("_save_state(%s) failed", section)
+        return None
+
+
+def _load_state_meta(section: str) -> Optional[dict]:
+    cfg = _STATE_SECTIONS[section]
+    client = _client()
+    if client is None:
+        return None
+    try:
+        from utils.supabase_client import _execute_with_retry
+        resp = _execute_with_retry(
+            client.table("state_meta").select("*").eq("section", section).limit(1)
+        )
+        if resp.data:
+            row = resp.data[0]
+            created_at = row.get("updated_at")
+        else:
+            # No meta row yet (e.g. state table was seeded directly without
+            # ever going through _save_state) — fall back to deriving meta
+            # from the state table itself so callers still get something.
+            state_resp = _execute_with_retry(
+                client.table(cfg["table"]).select("updated_at", count="exact")
+                .order("updated_at", desc=True).limit(1)
+            )
+            if not state_resp.data:
+                return None
+            created_at = state_resp.data[0]["updated_at"]
+            row = {"scan_id": None, "status": "completed",
+                   "row_count": state_resp.count, "error": None}
+        return {
+            "scan_id": row.get("scan_id"),
+            "created_at": created_at,
+            "status": row.get("status", "completed"),
+            "version": _iso_to_epoch_ms(created_at),
+            "row_count": row.get("row_count", 0),
+            "error": row.get("error"),
+        }
+    except Exception:
+        logger.exception("_load_state_meta(%s) failed", section)
+        return None
+
+
+def _load_state_payload(section: str) -> Optional[dict]:
+    cfg = _STATE_SECTIONS[section]
+    meta = _load_state_meta(section)
+    if meta is None or meta.get("status") != "completed":
+        return None
+
+    client = _client()
+    if client is None:
+        return None
+    try:
+        from utils.supabase_client import _execute_with_retry
+        resp = _execute_with_retry(client.table(cfg["table"]).select("record"))
+        records = [r["record"] for r in (resp.data or [])]
+
+        extra = {}
+        meta_resp = _execute_with_retry(
+            client.table("state_meta").select("extra").eq("section", section).limit(1)
+        )
+        if meta_resp.data and meta_resp.data[0].get("extra"):
+            extra = meta_resp.data[0]["extra"]
+
+        payload = {cfg["records_key"]: records, **extra}
+        return {
+            "scan_id": meta.get("scan_id"),
+            "created_at": meta.get("created_at"),
+            "status": "completed",
+            "version": meta.get("version"),
+            "row_count": len(records),
+            "payload": payload,
+        }
+    except Exception:
+        logger.exception("_load_state_payload(%s) failed", section)
+        return None
+
+
+def _iso_to_epoch_ms(iso_ts) -> Optional[int]:
+    """Mirrors the old snapshot tables' `version` column (epoch-ms int)
+    so dashboard polling code comparing versions numerically keeps
+    working unchanged against state-section meta too."""
+    if not iso_ts:
+        return None
+    try:
+        from datetime import datetime
+        if isinstance(iso_ts, str):
+            ts = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        else:
+            ts = iso_ts
+        return int(ts.timestamp() * 1000)
+    except Exception:
         return None
 
 
@@ -331,7 +566,12 @@ def prune_all_snapshots(keep: int = RETENTION_KEEP_ROWS) -> dict:
     Returns {section: n_deleted_or_None}. Called periodically by
     scheduler/scan_worker.py's retention loop (and, when the in-process
     fallback owns the scheduler lock, by utils.inprocess_scheduler) —
-    see scheduler/scan_worker.py's _run_retention_loop()."""
+    see scheduler/scan_worker.py's _run_retention_loop().
+
+    [2026-08-04] Only iterates _TABLES (the append-only snapshot
+    sections) — "live_scanner" and "dore_live_state" moved to
+    _STATE_SECTIONS' upsert-per-symbol tables, which are self-bounded by
+    distinct-symbol count and need no row-count pruning."""
     return {section: prune_old_snapshots(section, keep) for section in _TABLES}
 
 
@@ -355,17 +595,62 @@ CREATE TABLE IF NOT EXISTS market_intelligence_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_mi_snap_version ON market_intelligence_snapshots(version DESC);
 
-CREATE TABLE IF NOT EXISTS live_scanner_snapshots (
-    id         bigserial   PRIMARY KEY,
-    scan_id    uuid        NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now(),
+-- live_scanner_snapshots [RETIRED 2026-08-04] — was an append-only
+-- snapshot log (one full-universe jsonb blob per producer cycle). Hit
+-- 1.22GB / ~1GB-a-day growth with zero dedup before the 500-row
+-- retention cap even had a chance to apply. Table is now truncated and
+-- unused; "live_scanner" resolves through _STATE_SECTIONS below
+-- instead. Left commented here for historical/rollback reference only
+-- — do not re-create and point save_snapshot() back at it.
+--
+-- CREATE TABLE IF NOT EXISTS live_scanner_snapshots (
+--     id         bigserial   PRIMARY KEY,
+--     scan_id    uuid        NOT NULL,
+--     created_at timestamptz NOT NULL DEFAULT now(),
+--     status     text        NOT NULL DEFAULT 'completed',
+--     version    bigint      NOT NULL,
+--     row_count  integer     NOT NULL DEFAULT 0,
+--     error      text,
+--     payload    jsonb
+-- );
+-- CREATE INDEX IF NOT EXISTS idx_ls_snap_version ON live_scanner_snapshots(version DESC);
+
+-- ── Symbol-keyed state tables [2026-08-04 Trinity migration] ───────────
+-- One row per symbol, UPSERTed every producer cycle instead of appended.
+-- Replaces live_scanner_snapshots and dore_live_state_snapshots (both
+-- retired above/below) — see the _STATE_SECTIONS docstring in this file
+-- for the full rationale.
+CREATE TABLE IF NOT EXISTS live_scanner_state (
+    symbol     text        PRIMARY KEY,
+    record     jsonb       NOT NULL,
+    scan_id    uuid,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_live_scanner_state_updated_at ON live_scanner_state(updated_at);
+
+CREATE TABLE IF NOT EXISTS dore_live_state (
+    symbol     text        PRIMARY KEY,
+    record     jsonb       NOT NULL,
+    scan_id    uuid,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_dore_live_state_updated_at ON dore_live_state(updated_at);
+
+-- state_meta holds the one-row-per-section wrapper (scan_id/status/
+-- error/row_count) plus any "extra" sibling fields that used to live
+-- next to a state section's record list in its payload dict — e.g.
+-- dore_live_state's "diagnostics". There's nowhere for those to sit
+-- inside a per-symbol row, so they're kept here instead, refreshed on
+-- every completed save alongside the per-symbol upserts.
+CREATE TABLE IF NOT EXISTS state_meta (
+    section    text        PRIMARY KEY,
+    scan_id    uuid,
     status     text        NOT NULL DEFAULT 'completed',
-    version    bigint      NOT NULL,
     row_count  integer     NOT NULL DEFAULT 0,
     error      text,
-    payload    jsonb
+    extra      jsonb,
+    updated_at timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_ls_snap_version ON live_scanner_snapshots(version DESC);
 
 -- fo_scan_snapshots removed [2026-08-03] — dead table, dropped from
 -- Supabase. See the "fo_scan" removal note above _TABLES for why.
@@ -420,7 +705,11 @@ DECLARE
 BEGIN
     order_col := CASE p_table
         WHEN 'market_intelligence_snapshots' THEN 'version'
-        WHEN 'live_scanner_snapshots'        THEN 'version'
+        -- live_scanner_snapshots / dore_live_state_snapshots entries
+        -- removed from prune_all_snapshots()'s call sites [2026-08-04] —
+        -- both sections moved to upsert-per-symbol state tables (see
+        -- _STATE_SECTIONS). Left in this CASE as dead-but-harmless: the
+        -- RPC just never gets invoked with those table names anymore.
         -- fo_scan_snapshots removed [2026-08-03] — dead table: writer job
         -- has been commented out of scheduler/scan_worker.py's JOBS list
         -- since the DORE Options Engine took over, and pages/scanner.py's
