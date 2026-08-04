@@ -452,8 +452,14 @@ def _raw_fetch_yfinance(symbols: list, start: date, end: date) -> dict:
             progress=False,
         )
         if raw.empty:
+            logger.error(
+                "history_store: yf.download() returned an empty frame for this "
+                "%d-symbol chunk (first: %s) — see yf_download_with_retry()'s own "
+                "warning/error log (if any) just above for why", len(chunk), chunk[0],
+            )
             continue
         is_multi = isinstance(raw.columns, pd.MultiIndex)
+        chunk_failures = 0
         for sym, ticker in zip(chunk, tickers):
             try:
                 df = raw[ticker] if is_multi else raw
@@ -463,8 +469,34 @@ def _raw_fetch_yfinance(symbols: list, start: date, end: date) -> dict:
                 df.index = _strip_tz(pd.to_datetime(df.index))
                 df.columns = [c.lower() for c in df.columns]
                 result[sym] = df[_REQUIRED_COLS]
-            except Exception:
-                continue
+            except Exception as exc:
+                chunk_failures += 1
+                if chunk_failures == 1:
+                    # [2026-08-04 diagnostic] This used to be a bare `except
+                    # Exception: continue` — every symbol in a batch could
+                    # fail extraction identically and SILENTLY (0 rows
+                    # merged, no warning/error anywhere) if yf.download()'s
+                    # actual response shape stopped matching what this code
+                    # assumes (e.g. a yfinance version changing its
+                    # group_by="ticker" MultiIndex level order/keys — see
+                    # yf_download_with_retry()'s own docstring for the
+                    # yfinance/curl_cffi issue-tracker history this app has
+                    # already hit once). Logging only the FIRST failure per
+                    # chunk (not all ~50) keeps this from flooding the log
+                    # the way a real structural break would if every symbol
+                    # logged individually.
+                    logger.error(
+                        "history_store: yfinance extraction failed for %s (chunk of %d) — "
+                        "%s: %s | raw.columns=%s%s",
+                        sym, len(chunk), type(exc).__name__, exc,
+                        list(raw.columns[:6]),
+                        " (+more)" if len(raw.columns) > 6 else "",
+                    )
+        if chunk_failures:
+            logger.error(
+                "history_store: %d/%d symbol(s) in this chunk failed extraction "
+                "(see first-failure detail above)", chunk_failures, len(chunk),
+            )
     return result
 
 
