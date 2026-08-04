@@ -98,12 +98,33 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# A locked entry that's never within its own trigger zone for this many
-# calendar days is treated the same way fo_setup_persistence treats a
-# stale WAITING plan — closed out rather than drifting indefinitely.
-# Kept shorter than the equity side (20d) for the same reason
-# fo_setup_persistence.MAX_FO_SETUP_AGE_DAYS is: options decay.
-MAX_DORE_OPTIONS_PLAN_AGE_DAYS = 5
+# [2026-08-04, SG request] Every OPEN locked plan auto-closes once it's
+# been open this many calendar days, full stop — regardless of whether
+# it ever entered its trigger zone. Options decay; there's no reason to
+# keep carrying a multi-day-old locked entry's Drift %/RR as though it
+# were still a live opportunity.
+#
+# This constant existed before with this exact name and a similar
+# intent (was 5, and per its own comment meant to apply only to a plan
+# that's "never within its own trigger zone") but was never actually
+# wired into enrich_trade_plans_with_persistence() — see
+# _is_stale_by_age() below for where that gap is now closed. Lowered
+# to 2 and made unconditional (age alone, not "never triggered") per
+# SG's request.
+MAX_DORE_OPTIONS_PLAN_AGE_DAYS = 2
+
+# [2026-08-08, confidence floor] A contract only becomes a tracked,
+# locked Active Plan (DoreOptionsPlanStatus.OPEN) the first time it's
+# seen with a confidence_score at/above this floor. A weak read simply
+# isn't worth locking an entry premium and tracking Drift %/RR for —
+# it still shows up as an ordinary Live Scan recommendation, it just
+# doesn't get promoted to a persisted Active Plan. This is a floor on
+# MINTING only: an ALREADY-open plan keeps being tracked through normal
+# confidence fluctuation on later cycles (see the minting site below
+# for why the check only applies in the `else` branch, not the
+# already-open one) — separate from the age/expiry auto-close logic,
+# which is what decides when a tracked plan stops being tracked.
+MIN_CONFIDENCE_TO_ACTIVATE = 70
 
 
 class DoreOptionsPlanStatus(str, Enum):
@@ -236,6 +257,17 @@ def _is_expired(expiry: str, today: str) -> bool:
         return False
 
 
+def _is_stale_by_age(created_date: str, today: str, max_days: int = MAX_DORE_OPTIONS_PLAN_AGE_DAYS) -> bool:
+    """True once a locked plan has been open >= max_days calendar days,
+    regardless of expiry or whether it ever triggered — see
+    MAX_DORE_OPTIONS_PLAN_AGE_DAYS' docstring."""
+    try:
+        d0 = date.fromisoformat(str(created_date)[:10])
+        return (date.fromisoformat(today) - d0).days >= max_days
+    except Exception:
+        return False
+
+
 def _drift_pct(current_premium: Optional[float], entry_locked: Optional[float]) -> Optional[float]:
     if not current_premium or not entry_locked:
         return None
@@ -316,6 +348,18 @@ def enrich_trade_plans_with_persistence(
                 locked = existing
                 just_minted = False
             else:
+                # [2026-08-08, confidence floor] Only mint a NEW locked
+                # Active Plan when this cycle's confidence_score clears
+                # MIN_CONFIDENCE_TO_ACTIVATE — see that constant's
+                # docstring. Deliberately only gates the mint path (this
+                # `else` branch); an already-open plan (the `if` branch
+                # above) is exempt and keeps being tracked regardless of
+                # later confidence fluctuation.
+                confidence_score = float(getattr(p, "confidence_score", 0.0) or 0.0)
+                if confidence_score < MIN_CONFIDENCE_TO_ACTIVATE:
+                    enriched_rows.append(row)   # still shown as a Live Scan recommendation, just not tracked
+                    continue
+
                 # Fresh contract (or the prior entry for this exact key
                 # had already been closed) — mint + lock a new entry at
                 # THIS tick's primary premium.
@@ -331,12 +375,28 @@ def enrich_trade_plans_with_persistence(
                     sl_locked=getattr(p, "stop_loss", None),
                     target1_locked=getattr(p, "target1", None),
                     target2_locked=getattr(p, "target2", None),
-                    confidence_at_entry=getattr(p, "confidence_score", 0.0) or 0.0,
+                    confidence_at_entry=confidence_score,
                     status=DoreOptionsPlanStatus.OPEN,
                 )
                 just_minted = True
 
             drift = _drift_pct(current_premium, locked.entry_locked)
+
+            # [2026-08-04, SG request] Age-based auto-close — checked
+            # here (not only in the not-reproduced cleanup pass below)
+            # because a contract Stage 1 keeps recommending every cycle
+            # never shows up as "not reproduced", so it would otherwise
+            # never reach that pass and could stay OPEN indefinitely.
+            if not just_minted and _is_stale_by_age(locked.created_date, today):
+                if current_premium is not None:
+                    locked.last_premium = current_premium
+                locked.last_seen_at = _now_iso()
+                locked.status = DoreOptionsPlanStatus.CLOSED
+                locked.closed_at = _now_iso()
+                locked.closed_reason = f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS}d)"
+                updated_plans.append(locked)
+                enriched_rows.append(p.to_dict())   # still shown this cycle as a fresh recommendation, just no longer a tracked Active Plan
+                continue
 
             # Refresh the "last known" premium every cycle this contract
             # is actually reproduced — and persist regardless of
@@ -374,11 +434,13 @@ def enrich_trade_plans_with_persistence(
                               "row kept without persistence fields (fail-soft)")
             enriched_rows.append(p.to_dict())
 
-    # Auto-close any OPEN locked entry whose own expiry has passed —
-    # mirrors fo_setup_persistence's age-out, but keyed off the
-    # contract's real expiry date (always known here) rather than a
-    # fixed day count. Only entries not already refreshed above (i.e.
-    # not in seen_keys this cycle) need this pass.
+    # Auto-close any OPEN locked entry whose own expiry has passed, OR
+    # that's hit the age cap ([2026-08-04] MAX_DORE_OPTIONS_PLAN_AGE_
+    # DAYS) — mirrors fo_setup_persistence's age-out, but keyed off the
+    # contract's real expiry date (always known here) for the expiry
+    # case. Only entries not already refreshed above (i.e. not in
+    # seen_keys this cycle) need this pass — a still-reproduced
+    # contract's age is checked inline in the loop above instead.
     for key, plan in existing_plans.items():
         if key in seen_keys or not plan.is_open():
             continue
@@ -386,6 +448,11 @@ def enrich_trade_plans_with_persistence(
             plan.status = DoreOptionsPlanStatus.CLOSED
             plan.closed_at = _now_iso()
             plan.closed_reason = "Expired"
+            updated_plans.append(plan)
+        elif _is_stale_by_age(plan.created_date, today):
+            plan.status = DoreOptionsPlanStatus.CLOSED
+            plan.closed_at = _now_iso()
+            plan.closed_reason = f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS}d)"
             updated_plans.append(plan)
 
     return enriched_rows, updated_plans
