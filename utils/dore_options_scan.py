@@ -117,6 +117,20 @@ class ShortlistWeights:
 
 SHORTLIST_DEFAULTS = ShortlistWeights()
 
+# [2026-08-04, SG request] Squeeze-release shortlist exemption (see
+# compute_dore_technical_plans below): only symbols scoring above this
+# on MasterScanner's own composite ("Score" — scoring_core.norm_score,
+# 0-100) qualify, and even then only the top N of that day's releases
+# by _shortlist_score get the guaranteed floor — the rest fall back
+# into the normal ranked competition rather than being dropped
+# outright. See top_dore_trade_plans' squeeze_release_symbols
+# docstring for why this needs a floor rather than just a score boost,
+# and this constant's own reasoning: uncapped, a market-wide vol-crush
+# day could fire 30-50+ releases at once and blow the shortlist's
+# fetch budget several times over.
+_SQUEEZE_RELEASE_MIN_SCORE = 60
+_SQUEEZE_RELEASE_MAX_EXEMPT = 10
+
 
 def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
@@ -237,6 +251,7 @@ def top_dore_trade_plans(
     shortlist_weights: Optional[ShortlistWeights] = None,
     progress_cb=None,
     open_plan_symbols: Optional[set] = None,
+    squeeze_release_symbols: Optional[set] = None,
 ) -> pd.DataFrame:
     """
     Args:
@@ -256,6 +271,17 @@ def top_dore_trade_plans(
             keep refreshing even on days it wouldn't rank in the top
             `max_option_chain_symbols` — see _shortlist_for_option_
             chain's docstring. Omit to keep the old score-only behavior.
+        squeeze_release_symbols: [2026-08-04] symbols whose Pre-Breakout
+            scanner criteria (utils.scoring_core's BB-inside-KC squeeze
+            just released — trend_up AND squeeze_release AND 45<=RSI<=70,
+            the same rule pages/scanner.py's Pre-Breakout tab already
+            uses) fired THIS cycle. Exempted onto the shortlist the same
+            way open_plan_symbols is — a release is a one-cycle event
+            (by next cycle squeeze_release is back to False regardless
+            of whether the move follows through), unlike Conviction/
+            Entry Quality which persist and get another shot next cycle
+            if missed. Missing this cycle's shortlist cut means missing
+            the signal entirely, not just deferring it.
 
     Returns a DataFrame, one row per symbol that produced an
     OptionTradePlan, sorted by confidence_score descending (ties broken
@@ -270,9 +296,10 @@ def top_dore_trade_plans(
     settings = _load_settings(cfg)
     iv_lookup = iv_lookup or {}
 
+    always_include = set(open_plan_symbols or ()) | set(squeeze_release_symbols or ())
     stock_symbols = _shortlist_for_option_chain(
         live_pool, max_option_chain_symbols, weights=shortlist_weights,
-        always_include=open_plan_symbols,
+        always_include=always_include,
     )
     index_symbols = [s for s in live_pool.keys() if s in _INDICES]
 
@@ -446,7 +473,41 @@ def compute_dore_technical_plans(cfg: Optional[DoreOptionsSettings] = None,
         logger.exception("[dore_options_scan] could not load open plan symbols for shortlist "
                           "exemption (non-fatal, shortlist falls back to score-only this cycle)")
 
-    df = top_dore_trade_plans(live_pool, cfg=cfg, open_plan_symbols=open_plan_symbols)
+    # [2026-08-04, SG request] Symbols whose Pre-Breakout scanner
+    # criteria fired THIS cycle (see top_dore_trade_plans' squeeze_
+    # release_symbols docstring for why this needs to be a shortlist
+    # floor, not just a ranking boost). "_squeeze_release" is already
+    # on every live_pool row — utils.scanner_engine.run_scanner() sets
+    # it from utils.scoring_core's BarResult.squeeze_release, the same
+    # field pages/scanner.py's Pre-Breakout tab reads. Gated on
+    # MasterScanner's own composite "Score" (norm_score) being above
+    # _SQUEEZE_RELEASE_MIN_SCORE — a squeeze releasing on a genuinely
+    # weak setup isn't worth a guaranteed fetch slot — and capped to
+    # the top _SQUEEZE_RELEASE_MAX_EXEMPT of that day's qualifying
+    # releases by _shortlist_score, so a multi-release day degrades to
+    # "best N releases get the floor, rest compete normally" instead
+    # of blowing out this cycle's fetch budget.
+    squeeze_release_candidates = [
+        sym for sym, row in live_pool.items()
+        if row.get("_squeeze_release") and float(row.get("Score") or 0.0) > _SQUEEZE_RELEASE_MIN_SCORE
+    ]
+    squeeze_release_symbols = set(
+        sorted(
+            squeeze_release_candidates,
+            key=lambda sym: _shortlist_score(live_pool[sym], SHORTLIST_DEFAULTS),
+            reverse=True,
+        )[:_SQUEEZE_RELEASE_MAX_EXEMPT]
+    )
+    if squeeze_release_symbols:
+        logger.info(
+            "[dore_options_scan] %d/%d squeeze-release symbol(s) (Score>%d) "
+            "exempted onto this cycle's shortlist: %s",
+            len(squeeze_release_symbols), len(squeeze_release_candidates),
+            _SQUEEZE_RELEASE_MIN_SCORE, sorted(squeeze_release_symbols),
+        )
+
+    df = top_dore_trade_plans(live_pool, cfg=cfg, open_plan_symbols=open_plan_symbols,
+                               squeeze_release_symbols=squeeze_release_symbols)
     rejections = df.attrs.get("dore_rejections", [])
 
     invalid = find_invalid_columns(df)
