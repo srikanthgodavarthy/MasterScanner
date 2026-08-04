@@ -3202,12 +3202,34 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
             return '<span style="color:var(--muted)">—</span>'
         return f'<span style="color:#3fb950;font-size:12px;">{label}</span>'
 
+    def _fmt_source(row):
+        # [2026-08-08, SG request] "PB" (Pre-Breakout squeeze-release
+        # exemption) vs "LS" (ordinary Live Scanner ranking) — see
+        # utils.dore_options_engine.OptionTradePlan.source's docstring.
+        src = row.get("source")
+        if src == "PB":
+            return ('<span style="color:#d29922;font-weight:700;font-size:11px;'
+                    'background:rgba(210,153,34,0.12);border:1px solid rgba(210,153,34,0.3);'
+                    'border-radius:4px;padding:1px 6px;" title="Pre-Breakout squeeze-release">PB</span>')
+        if src == "LS":
+            return ('<span style="color:#58a6ff;font-weight:700;font-size:11px;'
+                    'background:rgba(88,166,255,0.10);border:1px solid rgba(88,166,255,0.28);'
+                    'border-radius:4px;padding:1px 6px;" title="Live Scanner">LS</span>')
+        return '<span style="color:var(--muted)">—</span>'
+
+    # [2026-08-08, SG request] Live dashboard only shows candidates DORE
+    # itself considers reasonably confident — everything below 65 is
+    # still ranked/scored internally, just not surfaced here.
     if "confidence_score" in df.columns:
+        df = df[pd.to_numeric(df["confidence_score"], errors="coerce") >= 65]
         df = df.sort_values("confidence_score", ascending=False, kind="stable")
 
-    headers = ["Symbol", "Direction", "Primary Strike", "Current Premium", "Plan", "Entry Zone", "Stop Loss",
-               "Target 1", "Target 2", "Saved Entry / Drift %", "POP %", "Confidence", "Qualification",
-               "Conviction", "Entry Quality", "Regime", "Expiry", "DTE", "Exit Before Expiry"]
+    if df.empty:
+        return '<div style="color:var(--muted);padding:8px;">No candidates with Confidence ≥ 65 this cycle.</div>'
+
+    headers = ["Symbol", "Direction", "Source", "Primary Strike", "Current Premium", "Plan", "Entry Zone",
+               "Stop Loss", "Target 1", "Target 2", "Saved Entry / Drift %", "POP %", "Confidence",
+               "Expiry", "DTE", "Exit Before Expiry"]
 
     rows_html = []
     for _, r in df.iterrows():
@@ -3226,6 +3248,7 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
         cells = [
             f'<td style="font-weight:700;">{_tv_link(r.get("symbol", "—"))}</td>',
             f'<td style="color:{dir_color};font-weight:700;">{_fmt_text(direction)}</td>',
+            f'<td>{_fmt_source(r)}</td>',
             f'<td style="font-weight:700;">{strike_disp}</td>',
             f'<td>{_fmt_current_premium(r)}</td>',
             f'<td>{_fmt_plan_status(r)}</td>',
@@ -3237,10 +3260,6 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
             f'<td>{_fmt_score(r.get("probability_of_profit"))}</td>',
             f'<td style="white-space:nowrap;"><span style="color:{conf_color};font-weight:700;">'
             f'{conf_dot} {_fmt_score(conf)}</span></td>',
-            f'<td>{_fmt_score(r.get("qualification_score"))}</td>',
-            f'<td>{_fmt_score(r.get("conviction"))}</td>',
-            f'<td>{_fmt_score(r.get("entry_quality"))}</td>',
-            f'<td>{_fmt_text(r.get("market_regime"))}</td>',
             f'<td>{_fmt_text(r.get("expiry"))}</td>',
             f'<td>{_fmt_num(r.get("dte"))}</td>',
             f'<td style="color:var(--muted);font-size:11px;">{_fmt_text(r.get("exit_before_expiry"))}</td>',
@@ -3326,28 +3345,47 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
                 f'{pct_html}')
 
     def _fmt_last_seen(row):
-        # [2026-08-04 fix] last_seen_at is stored via _now_iso() =
+        # [2026-08-08, SG request] Short TIME-only stamp (no date) — the
+        # adjacent Days Active column already carries "how long ago" in
+        # a much more scannable form, so the full "YYYY-MM-DD HH:MM"
+        # here was redundant. last_seen_at is stored via _now_iso() =
         # datetime.now(timezone.utc).isoformat() (utils/dore_options_
-        # persistence.py) — a genuine UTC timestamp. This was previously
-        # just string-sliced and displayed as-is, silently showing raw UTC
-        # mislabeled as local time (off by +5:30 from actual IST). Same
-        # tz_convert(_IST) pattern already used a few hundred lines up for
-        # scan_time — see that block's comment for why _created_at needs
-        # tz-aware parsing rather than a naive string slice.
+        # persistence.py) — a genuine UTC timestamp — so this still
+        # needs the same tz_convert(_IST) parsing as before, just a
+        # narrower display format.
         ts = row.get("last_seen_at")
         if ts in (None, "") or pd.isna(ts):
             return '<span style="color:var(--muted)">Never reproduced</span>'
         try:
-            ist_str = pd.to_datetime(ts).tz_convert(_IST).strftime("%Y-%m-%d %H:%M")
+            ist_str = pd.to_datetime(ts).tz_convert(_IST).strftime("%H:%M")
         except Exception:
-            ist_str = _fmt_text(ts)[:16].replace("T", " ")
+            ist_str = _fmt_text(ts)[11:16] or _fmt_text(ts)
         return f'<span style="color:var(--muted);font-size:11px;">{ist_str}</span>'
+
+    def _fmt_source(row):
+        # [2026-08-08, SG request] "PB" (Pre-Breakout squeeze-release
+        # exemption) vs "LS" (ordinary Live Scanner ranking) — captured
+        # once at mint time, see DoreOptionsPlan.source's docstring.
+        src = row.get("source")
+        if src == "PB":
+            return ('<span style="color:#d29922;font-weight:700;font-size:11px;'
+                    'background:rgba(210,153,34,0.12);border:1px solid rgba(210,153,34,0.3);'
+                    'border-radius:4px;padding:1px 6px;" title="Pre-Breakout squeeze-release">PB</span>')
+        if src == "LS":
+            return ('<span style="color:#58a6ff;font-weight:700;font-size:11px;'
+                    'background:rgba(88,166,255,0.10);border:1px solid rgba(88,166,255,0.28);'
+                    'border-radius:4px;padding:1px 6px;" title="Live Scanner">LS</span>')
+        return '<span style="color:var(--muted)">—</span>'
 
     if df.empty:
         return '<div style="color:var(--muted);padding:8px;">No open plans.</div>'
 
-    headers = ["Symbol", "Direction", "Strike", "Expiry", "Status", "Entry (Locked)", "Stop Loss",
-               "Target 1", "Target 2", "Last Known Premium", "P&L", "Last Seen", "Days Active"]
+    # [2026-08-08, SG request] Status moved to the very last column (it's
+    # a secondary/audit detail once a plan is open — every row here is
+    # OPEN by definition, see this function's docstring) and Source
+    # added right after Direction.
+    headers = ["Symbol", "Direction", "Source", "Strike", "Expiry", "Entry (Locked)", "Stop Loss",
+               "Target 1", "Target 2", "Last Known Premium", "P&L", "Last Seen", "Days Active", "Status"]
 
     rows_html = []
     for _, r in df.iterrows():
@@ -3356,9 +3394,9 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
         cells = [
             f'<td style="font-weight:700;">{_tv_link(r.get("symbol", "—"))}</td>',
             f'<td style="color:{dir_color};font-weight:700;">{_fmt_text(direction)}</td>',
+            f'<td>{_fmt_source(r)}</td>',
             f'<td>{_tv_option_link(r.get("symbol", ""), direction, r.get("strike"), r.get("expiry", ""))}</td>',
             f'<td>{_fmt_text(r.get("expiry"))}</td>',
-            f'<td>{r.get("plan_status_label", "—")}</td>',
             f'<td style="font-weight:700;">{_fmt_money(r.get("entry_locked"))}</td>',
             f'<td>{_fmt_money(r.get("saved_stop_loss"))}</td>',
             f'<td>{_fmt_money(r.get("saved_target1"))}</td>',
@@ -3367,6 +3405,7 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
             f'<td>{_fmt_pnl(r)}</td>',
             f'<td>{_fmt_last_seen(r)}</td>',
             f'<td>{_fmt_text(r.get("plan_age_days"))}d</td>',
+            f'<td>{r.get("plan_status_label", "—")}</td>',
         ]
         rows_html.append(f'<tr class="ap-row">{"".join(cells)}</tr>')
 
@@ -3508,14 +3547,15 @@ def _dore_options_panel():
                        "universe is currently empty.")
         else:
             st.markdown(_dore_options_plan_table_html(dore_opt_df), unsafe_allow_html=True)
-            st.caption("🟢 Confidence ≥75 · 🔵 ≥55 · 🟡 ≥35 · ⚪ below — DORE's own final_score, "
-                       "blending qualification, direction strength, and premium/liquidity "
-                       "validation into one ranking. Primary Strike is the balanced pick; "
-                       "Conservative/Aggressive alternatives aren't shown here — see the full "
-                       "trade plan via utils.dore_options_engine.OptionTradePlan.format_output() "
-                       "for those. Entry Zone / Stop Loss / Targets are in PREMIUM rupees, not "
-                       "the underlying's price. This is a screener, not an order ticket — confirm "
-                       "liquidity (bid/ask) before acting.")
+            st.caption("Showing Confidence ≥ 65 only. 🟢 Confidence ≥75 · 🔵 ≥55–74 (n/a below 65 here) — "
+                       "DORE's own final_score, blending qualification, direction strength, and "
+                       "premium/liquidity validation into one ranking. Source: PB = Pre-Breakout "
+                       "squeeze-release exemption, LS = ordinary Live Scanner ranking. Primary "
+                       "Strike is the balanced pick; Conservative/Aggressive alternatives aren't "
+                       "shown here — see the full trade plan via utils.dore_options_engine."
+                       "OptionTradePlan.format_output() for those. Entry Zone / Stop Loss / "
+                       "Targets are in PREMIUM rupees, not the underlying's price. This is a "
+                       "screener, not an order ticket — confirm liquidity (bid/ask) before acting.")
             if dore_opt_rejections:
                 st.caption(f"{len(dore_opt_rejections)} shortlisted candidate(s) hard-rejected "
                            "this cycle (missing chain/OHLCV/liquidity) — not shown above.")

@@ -698,6 +698,16 @@ class OptionTradePlan:
     pullback_score:         Optional[float] = None
     breakout_score:         Optional[float] = None
     continuation_score:     Optional[float] = None
+
+    # [2026-08-08, SG request] Where this candidate entered the DORE
+    # shortlist from — "PB" (Pre-Breakout squeeze-release exemption,
+    # see utils.dore_options_scan's squeeze_release_symbols) or "LS"
+    # (ordinary Live Scanner ranking). Set by utils.dore_options_scan's
+    # top_dore_trade_plans() after compute_dore_trade_plan() returns;
+    # left unset (None) here since this module has no notion of the
+    # shortlist a candidate came from. Short-form only — see
+    # pages/scanner.py's Source column for the badge rendering.
+    source:                 Optional[str] = None
     reasons:              list = field(default_factory=list)
 
     def to_dict(self) -> dict:

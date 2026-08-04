@@ -296,7 +296,8 @@ def top_dore_trade_plans(
     settings = _load_settings(cfg)
     iv_lookup = iv_lookup or {}
 
-    always_include = set(open_plan_symbols or ()) | set(squeeze_release_symbols or ())
+    squeeze_release_symbols = set(squeeze_release_symbols or ())
+    always_include = set(open_plan_symbols or ()) | squeeze_release_symbols
     stock_symbols = _shortlist_for_option_chain(
         live_pool, max_option_chain_symbols, weights=shortlist_weights,
         always_include=always_include,
@@ -350,6 +351,14 @@ def top_dore_trade_plans(
             high_prices=highs, low_prices=lows,
         )
         if isinstance(result, OptionTradePlan):
+            # [2026-08-08, SG request] "PB" when this symbol only made
+            # this cycle's shortlist via the Pre-Breakout squeeze-
+            # release exemption (see squeeze_release_symbols' docstring
+            # above), "LS" otherwise (ordinary Live Scanner ranking).
+            # A symbol can be in both always_include sets at once
+            # (open-plan + squeeze-release) — squeeze-release still
+            # wins the label here since it's the more specific signal.
+            result.source = "PB" if symbol in squeeze_release_symbols else "LS"
             plans.append(result)
         else:
             rejections.append(result)

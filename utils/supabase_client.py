@@ -1469,6 +1469,7 @@ def _dore_options_plan_from_row(row: dict) -> "object":
         status               = row.get("status", "OPEN") or "OPEN",
         closed_at            = str(row.get("closed_at", "") or ""),
         closed_reason        = row.get("closed_reason", "") or "",
+        source               = row.get("source", "") or "",
     )
 
 
@@ -2279,6 +2280,12 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
     closed_at                    timestamptz,
     closed_reason                text        NOT NULL DEFAULT '',
 
+    -- 2026-08-08: "PB" (Pre-Breakout squeeze-release exemption) or "LS"
+    -- (ordinary Live Scanner ranking) — captured once at mint time from
+    -- OptionTradePlan.source. See utils/dore_options_persistence.py's
+    -- DoreOptionsPlan.source docstring.
+    source                      text        NOT NULL DEFAULT '',
+
     updated_at                   timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_dore_options_plans_symbol ON dore_options_plans(symbol);
@@ -2299,6 +2306,14 @@ CREATE INDEX IF NOT EXISTS idx_dore_options_plans_date   ON dore_options_plans(c
 DORE_OPTIONS_PLANS_MIGRATION_SQL = """
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS last_premium   numeric(12,2);
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS last_seen_at   timestamptz;
+"""
+
+# ── MIGRATION for an EXISTING dore_options_plans table created before
+#    the 2026-08-08 Source column (Pre-Breakout vs Live Scanner). Safe
+#    to re-run. Run this in Supabase SQL Editor if dore_options_plans
+#    already exists and predates this change.
+DORE_OPTIONS_PLANS_SOURCE_MIGRATION_SQL = """
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT '';
 """
 
 

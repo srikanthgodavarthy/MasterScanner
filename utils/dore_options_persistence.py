@@ -175,6 +175,15 @@ class DoreOptionsPlan:
     closed_at:           str   = ""
     closed_reason:       str   = ""
 
+    # [2026-08-08, SG request] "PB" (Pre-Breakout squeeze-release
+    # exemption) or "LS" (ordinary Live Scanner ranking) — captured
+    # once, at mint time, from the OptionTradePlan.source that produced
+    # this entry (utils.dore_options_engine.OptionTradePlan.source).
+    # Frozen like entry_locked/sl_locked/etc. above — a plan doesn't
+    # change which scanner originally surfaced it just because a later
+    # cycle's technical read differs.
+    source:              str   = ""
+
     @property
     def contract_key(self) -> str:
         return f"{self.symbol.upper()}|{self.direction}|{self.strike:.1f}|{self.expiry}"
@@ -201,6 +210,7 @@ class DoreOptionsPlan:
             "status":              _sval(self.status),
             "closed_at":           self.closed_at or None,
             "closed_reason":       self.closed_reason,
+            "source":              self.source or None,
         }
 
 
@@ -377,6 +387,7 @@ def enrich_trade_plans_with_persistence(
                     target2_locked=getattr(p, "target2", None),
                     confidence_at_entry=confidence_score,
                     status=DoreOptionsPlanStatus.OPEN,
+                    source=row.get("source") or "",
                 )
                 just_minted = True
 
@@ -497,6 +508,7 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
             rows.append({
                 "symbol": plan.symbol,
                 "direction": plan.direction,
+                "source": plan.source or "",
                 "strike": plan.strike,
                 "expiry": plan.expiry,
                 "entry_locked": plan.entry_locked or None,
