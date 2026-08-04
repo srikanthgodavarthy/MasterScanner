@@ -2210,8 +2210,8 @@ _SR_CSS = """
    caps the visible row count at a fixed pixel height (scrolls, doesn't
    grow) so cards with 3 rows and cards with 8 rows still sit flush next
    to each other in the same st.columns() row. */
-.sr-panel-body { max-height:296px; overflow-y:auto; }
-table.sr-table { width:100%; table-layout:fixed; border-collapse:collapse; font-size:0.8rem; }
+.sr-panel-body { max-height:296px; overflow-y:auto; overflow-x:auto; -webkit-overflow-scrolling:touch; }
+table.sr-table { width:100%; min-width:540px; table-layout:fixed; border-collapse:collapse; font-size:0.8rem; }
 table.sr-table th, table.sr-table td {
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
 }
@@ -2423,7 +2423,7 @@ def _today_sector_flow_compact_html(flow: dict, rows: int = 3) -> str:
 # equity Active Plans tab (with status, targets, R:R, etc.) stays on the
 # Scanner page — this is only a glance, not a replacement for it.
 def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
-    need = {"Stock", "%Chg", "SetupAge", "EntryLocked", "EntryDriftPct"}
+    need = {"Stock", "%Chg", "SetupAge", "EntryLocked", "EntryDriftPct", "ActivatedAt"}
     if df_aug is None or df_aug.empty or not need.issubset(df_aug.columns):
         return ('<div class="sr-panel"><div class="sr-panel-title">LIVE SCANNER SNAPSHOT</div>'
                 '<div style="color:#8b949e;font-size:0.75rem;">No scan data yet.</div></div>')
@@ -2432,11 +2432,22 @@ def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
     work["SetupAge"] = work["SetupAge"].astype(str)
     work = work[work["SetupAge"].str.strip().replace({"nan": "", "None": ""}) != ""]
     work["%Chg"] = pd.to_numeric(work["%Chg"], errors="coerce")
-    work = work.dropna(subset=["%Chg"]).sort_values("%Chg", ascending=False).head(top_n)
+    work = work.dropna(subset=["%Chg"])
+    # [2026-08-04] Sort by most-recently-activated, not %Chg. Previously this
+    # copy-pasted _nse_top_gainers_html's sort_values("%Chg", ascending=False)
+    # pattern, which made this panel just a second "top movers" ranking of a
+    # subset of the same stocks — defeating the point of a *scanner* snapshot
+    # (which should surface what the scanner just did, not who's up the most
+    # today). ActivatedAt is the raw ISO timestamp set on WAITING -> ACTIVE
+    # (utils/setup_persistence.py); rows with no timestamp sort last rather
+    # than being dropped, so a setup missing ActivatedAt still shows up.
+    work["_activated_at"] = pd.to_datetime(work["ActivatedAt"], errors="coerce")
+    work = work.sort_values("_activated_at", ascending=False, na_position="last").head(top_n)
 
     if work.empty:
         return ('<div class="sr-panel"><div class="sr-panel-title">LIVE SCANNER SNAPSHOT</div>'
                 '<div style="color:#8b949e;font-size:0.75rem;">No active setups right now.</div></div>')
+
 
     rows_html = ""
     for _, r in work.iterrows():

@@ -3326,10 +3326,22 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
                 f'{pct_html}')
 
     def _fmt_last_seen(row):
+        # [2026-08-04 fix] last_seen_at is stored via _now_iso() =
+        # datetime.now(timezone.utc).isoformat() (utils/dore_options_
+        # persistence.py) — a genuine UTC timestamp. This was previously
+        # just string-sliced and displayed as-is, silently showing raw UTC
+        # mislabeled as local time (off by +5:30 from actual IST). Same
+        # tz_convert(_IST) pattern already used a few hundred lines up for
+        # scan_time — see that block's comment for why _created_at needs
+        # tz-aware parsing rather than a naive string slice.
         ts = row.get("last_seen_at")
         if ts in (None, "") or pd.isna(ts):
             return '<span style="color:var(--muted)">Never reproduced</span>'
-        return f'<span style="color:var(--muted);font-size:11px;">{_fmt_text(ts)[:16].replace("T", " ")}</span>'
+        try:
+            ist_str = pd.to_datetime(ts).tz_convert(_IST).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            ist_str = _fmt_text(ts)[:16].replace("T", " ")
+        return f'<span style="color:var(--muted);font-size:11px;">{ist_str}</span>'
 
     if df.empty:
         return '<div style="color:var(--muted);padding:8px;">No open plans.</div>'
