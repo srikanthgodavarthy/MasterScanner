@@ -147,6 +147,24 @@ class DoreOptionsSettings:
     conservative_capture_scale: float = 0.55
     aggressive_capture_scale:   float = 1.35
 
+    # [2026-08-08, SG request] "The recommendation is good for long
+    # strike, but that's too long — with higher confidence and long
+    # DTE, target 5% of the current price." Uncapped, expected_move
+    # (== atr * sqrt(dte)) grows with sqrt(DTE), so a long-dated,
+    # high-ATR candidate could get pushed deep OTM even though it's a
+    # high-confidence setup — exactly the "too long" case. This caps
+    # the strike OFFSET (not expected_move/target_price themselves,
+    # which stay untouched for POP/premium-sanity math elsewhere) at
+    # a flat % of spot, but ONLY when BOTH conditions the request named
+    # are true: DTE is "long" (> long_dte_days, matching the existing
+    # >10-DTE capture bucket) AND direction confidence clears
+    # high_confidence_capture_cap_threshold. A low-confidence long-DTE
+    # trade, or a high-confidence short-DTE trade, is unaffected — see
+    # select_strikes()'s cap application below.
+    long_dte_days:                       int   = 10
+    high_confidence_capture_cap_threshold: float = 70.0
+    long_dte_high_confidence_target_pct:  float = 0.05   # 5% of spot
+
     # ── Stage 6: Premium Validation ─────────────────────────────
     premium_atr_min_mult: float = 0.05      # premium too low relative to ATR (floor check)
     premium_move_max_mult: float = 0.55     # premium too high relative to Expected Move
@@ -1046,10 +1064,21 @@ def select_strikes(
         AGGRESSIVE:   settings.aggressive_capture_scale,
     }
 
+    # [2026-08-08, SG request] see DoreOptionsSettings.long_dte_days'
+    # docstring — flat 5%-of-spot ceiling on how far OTM a strike can
+    # be pushed, applied only for long-DTE + high-confidence candidates.
+    max_offset = None
+    if (dte > settings.long_dte_days
+            and confidence >= settings.high_confidence_capture_cap_threshold
+            and sig.current_price > 0):
+        max_offset = sig.current_price * settings.long_dte_high_confidence_target_pct
+
     out: dict[str, dict] = {}
     for label, scale in scales.items():
         capture = max(settings.capture_ratio_floor, min(settings.capture_ratio_ceiling, balanced_capture * scale))
         offset = sig.expected_move * capture
+        if max_offset is not None:
+            offset = min(offset, max_offset)
         raw_strike = sig.current_price + offset if dir_ == CE else sig.current_price - offset
         strike = _round_to_strike(raw_strike, strike_interval)
         out[label] = {
