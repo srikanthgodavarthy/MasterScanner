@@ -32,29 +32,20 @@ from utils.continuation_patterns import detect_vwap_reclaim
 
 STOCH_CONVERGENCE_MAX_BONUS = 10   # points budget (0-10 scale)
 
-# A %K/%D cross-up happening while %K is already deep in overbought territory
-# isn't a fresh re-ignition — it's a continuation (or outright rollover risk)
-# in an already-extended move. Only count cross-ups below this ceiling as
-# genuine location+momentum re-ignition. Crossing OUT of oversold (<20) has
-# no such ceiling — that's a different, unambiguously-fresh event by nature.
-#
-# [2026-07-29] Tightened 40 -> 20: a cross while %K is still under the
-# oversold line is the strong, unambiguous "this stock got hit hard and is
-# turning" signal; a cross anywhere in the 20-40 band is a much weaker,
-# more ambiguous case that doesn't deserve the same "fresh re-ignition"
-# label. On a synthetic-data check this roughly halves the cross-up pass
-# rate (~47% -> ~25% of all cross-ups qualify), i.e. meaningfully stricter.
-STOCH_REIGNITION_MAX_LEVEL = 20
+# [2026-08-07, redefined per explicit spec] The cross rule is now exactly
+# two conditions, checked on the most recent bar ONLY — nothing else is
+# considered (no separate "from oversold" path, no post-cross "still
+# holding" invalidation, no multi-bar search):
+#   Bullish upcross:   %K crosses above %D AND BOTH %K and %D < 22
+#   Bearish downcross: %K crosses below %D AND BOTH %K and %D >= 80
+STOCH_UPCROSS_MAX_LEVEL   = 22
+STOCH_DOWNCROSS_MIN_LEVEL = 80
 
-# How far back to search for the most recent qualifying reignition bar.
-# [2026-08-03] Narrowed 5 -> 1: only today's bar or the one immediately
-# before it can qualify as a "fresh" reignition. A cross found further back
-# than that is no longer considered fresh enough to act on, even if it
-# still technically holds (%K >= %D). This is stricter than the old 5-bar
-# search window used for LL and VWAP staleness (see promotion_engine.py
-# LL_MAX_BARS_SINCE_RECLAIM / VWAP_MAX_BARS_SINCE_TOUCH, which still use
-# wider windows) — stochastic convergence specifically wants near-immediate
-# confirmation, not a multi-bar grace period.
+# Lookback is fixed at 1 bar by definition now — the cross rule only ever
+# compares the latest bar to the one immediately before it (a cross being
+# a same-bar event by nature). Kept as a named constant for backward
+# compatibility with anything still importing STOCH_REIGNITION_LOOKBACK,
+# not because a wider search is supported anymore.
 STOCH_REIGNITION_LOOKBACK = 1
 
 
@@ -78,8 +69,8 @@ def _safe_at(series: pd.Series, idx: int, default: float = 0.0) -> float:
 class StochConvergenceSignal:
     stoch_k:              float = 0.0
     stoch_d:               float = 0.0
-    reignition:              bool  = False   # fresh %K/%D cross-up OR cross out of oversold
-    reignition_kind:              str   = ""      # "cross_up" | "from_oversold" | ""
+    reignition:              bool  = False   # fresh %K/%D cross, either direction — see reignition_kind
+    reignition_kind:              str   = ""      # "cross_up" | "cross_down" | ""
     bars_since_reignition:           int   = -1     # -1 = none found within lookback window
     vwap_touch_found:          bool  = False
     returned_above_vwap:         bool  = False
@@ -114,7 +105,8 @@ def score_stochastic_convergence(
     reaction_max_atr: float = 1.5,
     confluence_bars: int = 2,
     max_bonus: int = STOCH_CONVERGENCE_MAX_BONUS,
-    reignition_max_level: float = STOCH_REIGNITION_MAX_LEVEL,
+    upcross_max_level: float = STOCH_UPCROSS_MAX_LEVEL,
+    downcross_min_level: float = STOCH_DOWNCROSS_MIN_LEVEL,
     reignition_lookback: int = STOCH_REIGNITION_LOOKBACK,
     k_period: int = 4,
     d_period: int = 3,
@@ -122,33 +114,38 @@ def score_stochastic_convergence(
 ) -> StochConvergenceSignal:
     """
     Grade "Stochastic Convergence" on a 0..max_bonus scale:
-        Fresh %K/%D re-ignition (cross-up or out of oversold)   4 pts
+        Fresh %K/%D cross (up or down — see below)              4 pts
         Price has reclaimed VWAP                                 3 pts
         Confluence: the VWAP touch and the stoch cross           3 pts
           happened within `confluence_bars` of each other
           (momentum and location agreeing, not two stray
           disconnected signals)
 
-    Reignition detection searches back up to `reignition_lookback` bars for
-    the most recent qualifying event (not just the latest bar), so callers
-    can gate on staleness the same way LL/VWAP signals already do. A
-    %K/%D cross-up only qualifies while %K is below `reignition_max_level` —
-    a crossover deep in overbought territory is a continuation/rollover risk,
-    not a fresh location+momentum re-ignition. Crossing out of oversold has
-    no such ceiling since it's unambiguously fresh by construction. Either
-    kind is discarded entirely if today's bar no longer holds %K >= %D —
-    a cross that has since reversed is invalidated, not merely aged.
+    [2026-08-07, redefined per explicit spec] The cross rule itself is
+    now exactly two conditions, checked ONLY on the most recent bar —
+    nothing else is considered:
+        Bullish upcross:   %K crosses above %D AND BOTH %K and %D
+                            are below `upcross_max_level` (22)
+        Bearish downcross: %K crosses below %D AND BOTH %K and %D
+                            are at/above `downcross_min_level` (80)
+
+    This replaces the previous rule, which: (a) only required %K (not
+    %D) to be below the ceiling on an up-cross, (b) had a separate
+    "crossing out of oversold (<20)" path with no ceiling at all, (c)
+    searched back up to `reignition_lookback` bars for a qualifying
+    event rather than checking only the latest bar, and (d) discarded
+    an otherwise-qualifying cross if today's bar no longer held %K >=
+    %D ("still holding" invalidation). None of that remains — just the
+    two conditions above, on the latest bar only.
 
     [2026-08-03] k_period/d_period/k_smooth default to 4/3/3 — matching the
     user's actual TradingView "Stoch" study settings (%K Length=4, %K
     Smoothing=3, %D Smoothing=3), NOT TradingView's generic out-of-the-box
     default (14/3/3) — so the STOCH↑ column can be validated bar-for-bar
-    against the user's own chart. [2026-07-29 note, superseded:] previously
-    this called the shared stochastic() with no k_smooth at all (raw,
-    unsmoothed %K); the 14/3/3 default from that change is now replaced by
-    4/3/3 above. NOTE: utils.cci_stochastic_signal.SignalParams still
-    defaults to k_period=14 — that module has NOT been updated to match and
-    may need the same change for consistency (flagged, not yet applied).
+    against the user's own chart. NOTE: utils.cci_stochastic_signal.
+    SignalParams still defaults to k_period=14 — that module has NOT been
+    updated to match and may need the same change for consistency
+    (flagged, not yet applied).
     """
     sig = StochConvergenceSignal()
 
@@ -160,30 +157,24 @@ def score_stochastic_convergence(
     sig.stoch_k = round(cur_k, 1)
     sig.stoch_d = round(cur_d, 1)
 
-    # A cross found further back in the lookback window is only a live
-    # signal if today's bar still holds the relationship it created — if
-    # %K has already fallen back below %D since the cross, the cross has
-    # been invalidated by today, not merely "aged." This is stricter than
-    # staleness: an aged-but-still-holding cross is discounted by the bars
-    # gate downstream; an already-reversed cross is excluded here entirely,
-    # regardless of how recent it was.
-    _still_holding = cur_k >= cur_d
+    # Latest bar vs. the one immediately before it — a cross is a
+    # same-bar event by nature, so there's no window to search.
+    if n >= 2:
+        k_prev, d_prev = _safe_at(k_s, -2), _safe_at(d_s, -2)
 
-    max_back = min(reignition_lookback, n - 2) if n >= 2 else -1
-    if _still_holding:
-        for back in range(0, max(max_back, -1) + 1):
-            i = n - 1 - back
-            k_i, d_i = _safe_at(k_s, i), _safe_at(d_s, i)
-            k_prev, d_prev = _safe_at(k_s, i - 1, k_i), _safe_at(d_s, i - 1, d_i)
+        upcross = bool(k_prev <= d_prev and cur_k > cur_d
+                       and cur_k < upcross_max_level and cur_d < upcross_max_level)
+        downcross = bool(k_prev >= d_prev and cur_k < cur_d
+                          and cur_k >= downcross_min_level and cur_d >= downcross_min_level)
 
-            cross_up_i = bool(k_prev <= d_prev and k_i > d_i and k_i < reignition_max_level)
-            from_os_i  = bool(k_prev <= 20 and k_i > 20)
-
-            if cross_up_i or from_os_i:
-                sig.reignition             = True
-                sig.reignition_kind        = "cross_up" if cross_up_i else "from_oversold"
-                sig.bars_since_reignition  = back
-                break
+        if upcross:
+            sig.reignition            = True
+            sig.reignition_kind       = "cross_up"
+            sig.bars_since_reignition = 0
+        elif downcross:
+            sig.reignition            = True
+            sig.reignition_kind       = "cross_down"
+            sig.bars_since_reignition = 0
 
     vwap_typical = (high + low + close) / 3.0
     vwap_series  = (vwap_typical * volume).cumsum() / volume.cumsum().replace(0, np.nan)
