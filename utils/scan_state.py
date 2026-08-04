@@ -103,6 +103,19 @@ def _client():
     # `st.cache_resource`, both of which work fine without a live session —
     # but importing streamlit-heavy modules at module load time everywhere
     # they're merely referenced is unnecessary coupling.
+    #
+    # [2026-08-07] All of this module's own .execute() calls go through
+    # utils.supabase_client._execute_with_retry(), same as this client's
+    # other callers — this module shares that SAME cached client/HTTP2
+    # connection pool (see _execute_with_retry's own docstring for the
+    # 2026-07-29 finding: Supabase's edge periodically closes idle HTTP/2
+    # connections server-side, surfacing as httpx.RemoteProtocolError on
+    # an otherwise-healthy request from ANY caller of this shared client).
+    # save_snapshot() already had this; load_snapshot_meta(),
+    # load_snapshot_payload(), and prune_old_snapshots() didn't — so a
+    # dropped connection hit them immediately with no retry while a
+    # concurrent supabase_client.py call in the same instant retried and
+    # likely succeeded. Now all four go through the same wrapper.
     from utils.supabase_client import get_client
     return get_client()
 
@@ -223,12 +236,12 @@ def load_snapshot_meta(section: str) -> Optional[dict]:
     if client is None:
         return None
     try:
-        resp = (
+        from utils.supabase_client import _execute_with_retry
+        resp = _execute_with_retry(
             client.table(_table(section))
             .select(_META_COLUMNS)
             .order("version", desc=True)
             .limit(1)
-            .execute()
         )
         if not resp.data:
             return None
@@ -250,12 +263,12 @@ def load_snapshot_payload(section: str) -> Optional[dict]:
     if client is None:
         return None
     try:
-        resp = (
+        from utils.supabase_client import _execute_with_retry
+        resp = _execute_with_retry(
             client.table(_table(section))
             .select("scan_id, created_at, status, version, row_count, payload")
             .order("version", desc=True)
             .limit(1)
-            .execute()
         )
         if not resp.data:
             return None
@@ -296,9 +309,10 @@ def prune_old_snapshots(section: str, keep: int = RETENTION_KEEP_ROWS) -> Option
     if client is None:
         return None
     try:
-        resp = client.rpc("prune_snapshot_table", {
+        from utils.supabase_client import _execute_with_retry
+        resp = _execute_with_retry(client.rpc("prune_snapshot_table", {
             "p_table": _table(section), "p_keep": keep,
-        }).execute()
+        }))
         n = resp.data
         if n:
             logger.info("prune_old_snapshots(%s): deleted %s row(s), keeping latest %s", section, n, keep)
