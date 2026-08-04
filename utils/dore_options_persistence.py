@@ -192,6 +192,25 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _to_ist_display(iso_ts: str) -> str:
+    """Convert a stored UTC ISO timestamp (created_at / last_seen_at — both
+    from _now_iso()) to 'YYYY-MM-DD HH:MM' IST for display. Mirrors
+    utils.fo_setup_persistence._to_ist_display's logic/rationale exactly
+    (see that docstring) — duplicated rather than imported to keep this
+    module's stated architectural independence from the DORE 2.0 pipeline.
+    Falls back to the raw string if parsing fails; "" in, "" out."""
+    if not iso_ts:
+        return ""
+    try:
+        import pytz
+        dt = datetime.fromisoformat(iso_ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(iso_ts)
+
+
 def _today_str() -> str:
     # IST, matching the rest of the DORE Options pipeline's day boundary
     # (utils.dore_options_scan._days_to_expiry uses the same UTC+5:30
@@ -226,7 +245,7 @@ def _drift_pct(current_premium: Optional[float], entry_locked: Optional[float]) 
         return None
 
 
-def _plan_status_label(days_active: int, created_date: str, just_minted: bool) -> str:
+def _plan_status_label(days_active: int, created_date: str, just_minted: bool, created_at: str = "") -> str:
     """'Plan' column badge on the main DORE Options table — 2026-07-31:
     there is no WAITING state in this engine (unlike the legacy
     fo_setup_plans lifecycle) because a contract's entry is locked the
@@ -234,10 +253,17 @@ def _plan_status_label(days_active: int, created_date: str, just_minted: bool) -
     enrich_trade_plans_with_persistence() is, by construction, ACTIVE
     the moment it exists. This just makes that state (and how long it's
     been true) visible on the table, which previously showed no
-    lifecycle information at all."""
+    lifecycle information at all.
+
+    [2026-08-04] Now shows the full IST timestamp (via created_at, the
+    UTC ISO stamp set by _now_iso() at lock time) rather than just the
+    IST calendar date (created_date) — same "since" wording, more
+    precision. Falls back to date-only if created_at wasn't passed
+    (e.g. an older cached row) so this never breaks on missing data."""
+    since = _to_ist_display(created_at) if created_at else created_date
     if just_minted:
-        return f"🟢 Active (new · {created_date})"
-    return f"🟢 Active ({days_active}d · since {created_date})"
+        return f"🟢 Active (new · {since})"
+    return f"🟢 Active ({days_active}d · since {since})"
 
 
 def enrich_trade_plans_with_persistence(
@@ -341,7 +367,7 @@ def enrich_trade_plans_with_persistence(
             row["plan_created_at"]   = locked.created_at
             row["plan_created_date"] = locked.created_date
             row["plan_age_days"]     = _compute_days_active(locked.created_date)
-            row["plan_status_label"] = _plan_status_label(row["plan_age_days"], locked.created_date, just_minted)
+            row["plan_status_label"] = _plan_status_label(row["plan_age_days"], locked.created_date, just_minted, locked.created_at)
             enriched_rows.append(row)
         except Exception:
             logger.exception("[dore_options_persistence] enrichment failed for one row — "
@@ -370,10 +396,13 @@ def enrich_trade_plans_with_persistence(
 #  whether this cycle's live scan reproduced it. 2026-08-01.
 # ══════════════════════════════════════════════════════════════════
 
-def _active_plan_status_label(days_active: int, created_date: str, last_seen_at: str) -> str:
-    if not last_seen_at:
-        return f"🟢 Active ({days_active}d · since {created_date})"
-    return f"🟢 Active ({days_active}d · since {created_date})"
+def _active_plan_status_label(days_active: int, created_date: str, last_seen_at: str, created_at: str = "") -> str:
+    # [2026-08-04] Now shows full IST timestamp via created_at, same as
+    # _plan_status_label above — was previously date-only (created_date)
+    # regardless of the last_seen_at argument, which this function took
+    # but never actually used.
+    since = _to_ist_display(created_at) if created_at else created_date
+    return f"🟢 Active ({days_active}d · since {since})"
 
 
 def active_plan_rows(open_plans: dict) -> list[dict]:
@@ -412,7 +441,7 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
                 "last_seen_at": plan.last_seen_at,
                 "created_date": plan.created_date,
                 "plan_age_days": days_active,
-                "plan_status_label": _active_plan_status_label(days_active, plan.created_date, plan.last_seen_at),
+                "plan_status_label": _active_plan_status_label(days_active, plan.created_date, plan.last_seen_at, plan.created_at),
             })
         except Exception:
             logger.exception("[dore_options_persistence] active_plan_rows failed for one plan — skipped")
