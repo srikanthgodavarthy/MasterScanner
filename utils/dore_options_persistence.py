@@ -210,7 +210,14 @@ class DoreOptionsPlan:
             "status":              _sval(self.status),
             "closed_at":           self.closed_at or None,
             "closed_reason":       self.closed_reason,
-            "source":              self.source or None,
+            # NOT NULL DEFAULT '' in the DB (unlike closed_at/expiry
+            # etc. above, which are nullable) — must send "" for an
+            # unset source, never None, or upsert_dore_options_plans_
+            # batch's NOT NULL constraint rejects the row. Plans minted
+            # before the 2026-08-08 Source migration have source=""
+            # (the dataclass default), so this hits on every refresh of
+            # any pre-existing open plan until they're closed out.
+            "source":              self.source or "",
         }
 
 
