@@ -1732,10 +1732,22 @@ def fetch_open_plan_option_quotes(plan_keys: tuple) -> dict:
         ltp = quote.get("last_price")
         if ltp is None:
             continue
-        ohlc = quote.get("ohlc") or {}
+        # [2026-08-04 bugfix] Was `ohlc.get("close")`. For an OPTION
+        # contract's intraday quote, Upstox's ohlc.close tracks the
+        # still-forming CURRENT day's candle (commonly mirrors last_price,
+        # or 0, until end of day) — it is NOT yesterday's close, unlike
+        # what ohlc.close means for an equity/index quote fetched during
+        # market hours. That made current_premium == premium_prev_close
+        # every tick, so premium_change_pct always rounded to +0.00% (see
+        # pages/scanner.py's Active Plans "Current Premium" column).
+        # net_change IS genuinely "vs previous close" regardless of
+        # instrument type — same pattern already used correctly by this
+        # module's index-quote and futures-quote fetchers just above.
+        net_change = quote.get("net_change")
+        prev_close = (ltp - net_change) if net_change is not None else None
         result[plan_key] = {
             "ltp": float(ltp),
-            "prev_close": ohlc.get("close"),
+            "prev_close": prev_close,
         }
     return result
 
