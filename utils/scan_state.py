@@ -411,7 +411,22 @@ def _save_state(
     before = len(rows)
     deduped: dict[str, dict] = {}
     for row in rows:
-        deduped[row["symbol"]] = row
+        sym = row["symbol"]
+        if sym not in deduped:
+            deduped[sym] = row
+        else:
+            # Merge legs instead of overwriting: keep any non-null field
+            # already captured, fill in anything new from this occurrence.
+            # Later occurrence's non-null values take precedence on
+            # conflicts, matching prior "last occurrence wins" semantics
+            # but without dropping the fields only the earlier leg knew.
+            merged_record = dict(deduped[sym]["record"])
+            for k, v in row["record"].items():
+                if v is not None:
+                    merged_record[k] = v
+            deduped[sym]["record"] = merged_record
+            deduped[sym]["scan_id"] = row["scan_id"]
+            deduped[sym]["updated_at"] = row["updated_at"]
     rows = list(deduped.values())
     if len(rows) != before:
         logger.warning(
