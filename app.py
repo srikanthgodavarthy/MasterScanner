@@ -42,6 +42,13 @@ if not logging.getLogger().handlers:
             logging.StreamHandler(sys.stderr),
         ],
     )
+    # 2026-08-05: "httpx" logs a line for every single outbound HTTP
+    # request (Supabase, Upstox, etc.), which drowns out everything else
+    # during a live scan. It's third-party code, so its logger.* calls
+    # can't be deleted the way utils/setup_persistence.py's own calls
+    # were — instead the logger itself is fully disabled here so nothing
+    # it emits, at any level, ever reaches a handler.
+    logging.getLogger("httpx").disabled = True
 
 load_dotenv()  # picks up UPSTOX_ACCESS_TOKEN from a local .env if present
 
