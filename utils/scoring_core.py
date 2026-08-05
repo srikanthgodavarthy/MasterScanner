@@ -92,6 +92,16 @@ class ScoringParams:
     t1_adx_min:  float = 20.0  # ADX must be > this
     t1_use_adx:  bool  = True  # True=ADX gate, False=EMA20 slope gate
 
+    # ── Leadership EMA periods ───────────────────────────────────
+    # Feed build_indicators()'s e20/e50/e200 series — trend_structure,
+    # ema_alignment, ema20_slope, trend_age_bars, ema20_pct_dist/
+    # ema50_pct_dist all derive from these three. "20/50/200" were
+    # hardcoded until this became configurable; the field names below
+    # keep their fast/mid/slow role regardless of the period you set.
+    ema_fast_period: int = 20   # was hardcoded ema(c, 20)
+    ema_mid_period:  int = 50   # was hardcoded ema(c, 50)
+    ema_slow_period: int = 200  # was hardcoded ema(c, 200)
+
     # Tier 2 — compression
     t2_comp_bars:  int   = 10
     t2_atr_ratio:  float = 0.85
@@ -151,6 +161,9 @@ class ScoringParams:
             t1_rs_min        = float(s.get("t1_rs_min",          0.0)),
             t1_adx_min       = float(s.get("t1_adx_min",        20.0)),
             t1_use_adx       = bool(s.get("t1_use_adx",         True)),
+            ema_fast_period  = int(s.get("ema_fast_period",     20)),
+            ema_mid_period   = int(s.get("ema_mid_period",      50)),
+            ema_slow_period  = int(s.get("ema_slow_period",     200)),
             t2_comp_bars     = int(s.get("t2_comp_bars",        10)),
             t2_atr_ratio     = float(s.get("t2_atr_ratio",      0.85)),
             t2_vol_mult      = float(s.get("t2_vol_mult",        1.2)),
@@ -533,9 +546,9 @@ def build_indicators(
     o = df["open"]
     v = df["volume"]
 
-    e20  = ema(c, 20)
-    e50  = ema(c, 50)
-    e200 = ema(c, 200)
+    e20  = ema(c, params.ema_fast_period)
+    e50  = ema(c, params.ema_mid_period)
+    e200 = ema(c, params.ema_slow_period)
     rsi_s    = rsi(c, 21)
     atr_s    = atr(h, l, c, 14)
     cci_s    = cci(c, params.cci_len)

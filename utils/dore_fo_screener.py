@@ -218,7 +218,7 @@ def stage1_trend_qualification(
             logger.exception("[DORE Stage1] index OHLCV fetch failed for %s", idx)
 
     for symbol, df in daily_dfs.items():
-        features = compute_trend_features(df)
+        features = compute_trend_features(df, cfg)
         if not features:
             continue
         probe = DOREInput(
@@ -269,8 +269,8 @@ def execution_features_from_intraday_5m(df: pd.DataFrame, cfg: DORESettings) -> 
         low = df["low"].astype(float)
         volume = df["volume"].astype(float) if "volume" in df.columns else None
 
-        ema9 = close.ewm(span=9, adjust=False).mean()
-        ema21 = close.ewm(span=21, adjust=False).mean()
+        ema9 = close.ewm(span=cfg.ema_fast_period, adjust=False).mean()
+        ema21 = close.ewm(span=cfg.ema_slow_period, adjust=False).mean()
         bull_now = ema9.iloc[-1] > ema21.iloc[-1]
         bull_prev = ema9.iloc[-2] > ema21.iloc[-2] if len(ema9) > 1 else bull_now
         fresh_crossover = bull_now and not bull_prev

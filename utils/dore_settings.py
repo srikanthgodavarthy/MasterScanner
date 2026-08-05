@@ -53,6 +53,14 @@ DORE_DEFAULTS: dict = {
     "trend_rsi_bear_max":         45.0,   # RSI below this supports bearish intent
     "trend_rel_volume_min":        1.0,   # relative-volume floor to count as "confirmed"
     "trend_ema_slope_flat_pct":    0.02,  # |EMA9 slope| below this (%/bar) = flat/no-trend
+    # EMA fast/slow periods — shared by Stage 1's daily Trend Engine
+    # (compute_trend_features() in dore_engine.py) AND Stage 2's intraday
+    # Execution Engine (execution_features_from_intraday_5m() in
+    # dore_fo_screener.py / fo_scan.py). Both were hardcoded to 9/21
+    # until this became configurable; every "EMA9"/"EMA21" label in this
+    # file's comments refers to whatever these two are actually set to.
+    "ema_fast_period":              9,
+    "ema_slow_period":             21,
     "trend_bullish_score_min":    60.0,   # Trend Score >= this -> BULLISH
     "trend_bearish_score_max":    40.0,   # Trend Score <= this -> BEARISH
     # Stage-1 sub-weights (must sum to 100)
@@ -286,6 +294,8 @@ class DORESettings:
     trend_rsi_bear_max: float = 45.0
     trend_rel_volume_min: float = 1.0
     trend_ema_slope_flat_pct: float = 0.02
+    ema_fast_period: int = 9
+    ema_slow_period: int = 21
     trend_bullish_score_min: float = 60.0
     trend_bearish_score_max: float = 40.0
     w_trend_ema_alignment: float = 30.0

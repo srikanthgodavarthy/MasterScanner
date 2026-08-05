@@ -2325,13 +2325,14 @@ def compute_trend_features(daily_df, cfg: Optional[DORESettings] = None) -> dict
         return {}
     try:
         import pandas as pd
+        cfg = cfg or DORESettings()
         close = daily_df["close"].astype(float)
         high = daily_df["high"].astype(float)
         low = daily_df["low"].astype(float)
         volume = daily_df["volume"].astype(float) if "volume" in daily_df.columns else None
 
-        ema9 = close.ewm(span=9, adjust=False).mean()
-        ema21 = close.ewm(span=21, adjust=False).mean()
+        ema9 = close.ewm(span=cfg.ema_fast_period, adjust=False).mean()
+        ema21 = close.ewm(span=cfg.ema_slow_period, adjust=False).mean()
         ema9_prev = ema9.iloc[-2] if len(ema9) > 1 else ema9.iloc[-1]
         ema9_slope_pct = ((ema9.iloc[-1] - ema9_prev) / ema9_prev * 100.0) if ema9_prev else 0.0
 

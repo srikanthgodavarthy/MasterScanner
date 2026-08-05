@@ -51,6 +51,16 @@ DEFAULTS = {
     "t1_rs_min":         0.01,
     "t1_adx_min":        23,
     "t1_use_adx":        True,
+    # ── EMA periods — Leadership (utils/scoring_core.py build_indicators) ──
+    "ema_fast_period":   20,
+    "ema_mid_period":    50,
+    "ema_slow_period":   200,
+    # ── EMA periods — DORE Engine (utils/dore_settings.py DORESettings) ────
+    # Mirrors, at the UI layer, the ema_fast_period/ema_slow_period keys
+    # inside st.session_state["dore_settings"] — see the "EMA Periods —
+    # DORE Engine" expander in _tab_advanced() for how the two stay synced.
+    "dore_ema_fast_period": 9,
+    "dore_ema_slow_period": 21,
     "t2_comp_bars":      12,
     "t2_atr_ratio":      0.80,
     "t2_vol_mult":       1.5,
@@ -571,6 +581,71 @@ def _tab_advanced() -> None:
             f'<span class="ok">AND</span> {strength_str} '
             f'<span class="ok">AND</span> rs_5bar &gt; <b>{_g("t1_rs_min"):.3f}</b>{nifty_str}'
         )
+
+    # ── EMA Periods — Leadership ────────────────────────────────
+    with st.expander("EMA Periods — Leadership", expanded=False):
+        st.caption(
+            "Feeds build_indicators()'s fast/mid/slow EMA series — trend "
+            "structure, EMA alignment, EMA20-slope gate, trend age, and "
+            "the EMA distance columns all derive from these three. "
+            "Defaults (20/50/200) match every backtest this scanner has "
+            "been tuned against — change with care."
+        )
+        ec1, ec2, ec3 = st.columns(3)
+        with ec1:
+            _label("Fast EMA period")
+            ema_fast = st.number_input("Fast EMA", 5, 100, int(_g("ema_fast_period")),
+                step=1, key="ni_ema_fast", label_visibility="collapsed")
+            _s("ema_fast_period", int(ema_fast))
+        with ec2:
+            _label("Mid EMA period")
+            ema_mid = st.number_input("Mid EMA", 10, 150, int(_g("ema_mid_period")),
+                step=1, key="ni_ema_mid", label_visibility="collapsed")
+            _s("ema_mid_period", int(ema_mid))
+        with ec3:
+            _label("Slow EMA period")
+            ema_slow = st.number_input("Slow EMA", 50, 300, int(_g("ema_slow_period")),
+                step=5, key="ni_ema_slow", label_visibility="collapsed")
+            _s("ema_slow_period", int(ema_slow))
+
+        if not (ema_fast < ema_mid < ema_slow):
+            st.error("Periods must be strictly increasing: fast < mid < slow.")
+
+    # ── EMA Periods — DORE Engine ───────────────────────────────
+    with st.expander("EMA Periods — DORE Engine", expanded=False):
+        st.caption(
+            "Shared by DORE's Stage 1 daily Trend Engine and Stage 2 "
+            "intraday Execution Engine (EMA alignment, slope, fresh "
+            "crossover/crossunder, pullback/rejection reads). Defaults "
+            "are 9/21 — change with care, since Stage 1's "
+            "trend_ema_slope_flat_pct threshold above was calibrated "
+            "against the default fast period."
+        )
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            _label("Fast EMA period")
+            dore_ema_fast = st.number_input("DORE Fast EMA", 3, 50, int(_g("dore_ema_fast_period")),
+                step=1, key="ni_dore_ema_fast", label_visibility="collapsed")
+            _s("dore_ema_fast_period", int(dore_ema_fast))
+        with dc2:
+            _label("Slow EMA period")
+            dore_ema_slow = st.number_input("DORE Slow EMA", 5, 100, int(_g("dore_ema_slow_period")),
+                step=1, key="ni_dore_ema_slow", label_visibility="collapsed")
+            _s("dore_ema_slow_period", int(dore_ema_slow))
+
+        if not (dore_ema_fast < dore_ema_slow):
+            st.error("Periods must be strictly increasing: fast < slow.")
+
+        # DORE reads its config from st.session_state["dore_settings"]
+        # (utils.dore_fo_screener._load_settings() / utils.fo_scan.
+        # _load_settings()) rather than the flat per-key session_state
+        # pattern the rest of this page uses — merge these two in
+        # immediately so a scan started right after this edit picks
+        # them up without needing a page reload.
+        _dore_settings = dict(st.session_state.get("dore_settings", {}))
+        _dore_settings["ema_fast_period"] = int(dore_ema_fast)
+        _dore_settings["ema_slow_period"] = int(dore_ema_slow)
+        st.session_state["dore_settings"] = _dore_settings
 
     # ── Tier 2 ───────────────────────────────────────────────────
     with st.expander("Tier 2 — Compression breakout", expanded=False):
@@ -1137,6 +1212,9 @@ def render() -> dict:
         "t1_rs_min":           ss.get("t1_rs_min",           DEFAULTS["t1_rs_min"]),
         "t1_adx_min":          ss.get("t1_adx_min",          DEFAULTS["t1_adx_min"]),
         "t1_use_adx":          ss.get("t1_use_adx",          DEFAULTS["t1_use_adx"]),
+        "ema_fast_period":     ss.get("ema_fast_period",     DEFAULTS["ema_fast_period"]),
+        "ema_mid_period":      ss.get("ema_mid_period",      DEFAULTS["ema_mid_period"]),
+        "ema_slow_period":     ss.get("ema_slow_period",     DEFAULTS["ema_slow_period"]),
         "ic_enable_vwap_reclaim":    ss.get("ic_enable_vwap_reclaim",    DEFAULTS["ic_enable_vwap_reclaim"]),
         "ic_enable_vwap_stoch_conf": ss.get("ic_enable_vwap_stoch_conf", DEFAULTS["ic_enable_vwap_stoch_conf"]),
         "ic_vwap_touch_atr_mult":    ss.get("ic_vwap_touch_atr_mult",    DEFAULTS["ic_vwap_touch_atr_mult"]),
