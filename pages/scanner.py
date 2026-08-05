@@ -3191,21 +3191,27 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
         return f'{_fmt_pct_chg(drift)}{entry_html}'
 
     def _fmt_plan_status(row):
-        # 2026-08-08: "Plan" column trimmed down to just the timestamp
-        # (was the full "🟢 Active (Xd · since ...)" badge) — moved to
-        # the last column, so it now reads as a lightweight "as of" note
-        # rather than a status badge. "—" (not a timestamp) when
-        # persistence never ran this cycle (Supabase unavailable — see
-        # enrich_trade_plans_with_persistence's fail-soft path in
-        # utils.dore_options_scan), so a missing value always means
-        # "unknown", never a false positive.
+        # 2026-08-08: "Plan" column trimmed down to just the time (no
+        # date) — moved next to Confidence, so it reads as a quick
+        # "what time did this get picked up" glance rather than a full
+        # status badge. Rendered in the normal text color (not muted)
+        # since it sits right next to Confidence now and should be easy
+        # to read at a glance, not treated as secondary metadata.
+        # "—" (not a time) when persistence never ran this cycle
+        # (Supabase unavailable — see enrich_trade_plans_with_persistence's
+        # fail-soft path in utils.dore_options_scan), so a missing value
+        # always means "unknown", never a false positive.
         label = row.get("plan_status_label")
         if label in (None, "") or (isinstance(label, float) and pd.isna(label)):
             return '<span style="color:var(--muted)">—</span>'
         import re
-        m = re.search(r"since\s+(.+?)\)\s*$", str(label))
-        ts = m.group(1) if m else str(label)
-        return f'<span style="color:var(--muted);font-size:12px;">{ts}</span>'
+        m = re.search(r"since\s+(?:\d{4}-\d{2}-\d{2}\s+)?(\d{1,2}:\d{2})\)\s*$", str(label))
+        if m:
+            ts = m.group(1)
+        else:
+            m2 = re.search(r"since\s+(.+?)\)\s*$", str(label))
+            ts = m2.group(1) if m2 else str(label)
+        return f'<span style="color:var(--text);font-weight:600;font-size:12px;">{ts}</span>'
 
     def _fmt_source(row):
         # [2026-08-08, SG request] "PB" (Pre-Breakout squeeze-release
@@ -3247,9 +3253,9 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
     if df.empty:
         return '<div style="color:var(--muted);padding:8px;">No candidates with Confidence ≥ 65 today.</div>'
 
-    headers = ["Symbol", "Direction", "Source", "Primary Strike", "Confidence", "Current Premium",
+    headers = ["Symbol", "Direction", "Source", "Primary Strike", "Confidence", "Plan", "Current Premium",
                "Entry Zone", "Stop Loss", "Target 1", "Target 2", "Saved Entry / Drift %", "POP %",
-               "Expiry", "DTE", "Plan"]
+               "Expiry", "DTE"]
 
     rows_html = []
     for _, r in df.iterrows():
@@ -3272,6 +3278,7 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
             f'<td style="font-weight:700;">{strike_disp}</td>',
             f'<td style="white-space:nowrap;"><span style="color:{conf_color};font-weight:700;">'
             f'{conf_dot} {_fmt_score(conf)}</span></td>',
+            f'<td>{_fmt_plan_status(r)}</td>',
             f'<td>{_fmt_current_premium(r)}</td>',
             f'<td>{_fmt_entry_zone(r.get("entry_zone"))}</td>',
             f'<td>{_fmt_money(r.get("stop_loss"))}</td>',
@@ -3281,7 +3288,6 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
             f'<td>{_fmt_score(r.get("probability_of_profit"))}</td>',
             f'<td>{_fmt_text(r.get("expiry"))}</td>',
             f'<td>{_fmt_num(r.get("dte"))}</td>',
-            f'<td>{_fmt_plan_status(r)}</td>',
         ]
         rows_html.append(
             f'<tr style="background:{conf_color}14;border-left:3px solid {conf_color};">'

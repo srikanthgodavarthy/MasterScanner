@@ -2239,15 +2239,17 @@ table.sr-table--snapshot td:nth-child(2), table.sr-table--snapshot td:nth-child(
   text-align:right; font-variant-numeric:tabular-nums;
 }
 
-/* Active Options Plans (SYMBOL / DIR / STRIKE / STATUS / ENTRY / LAST
-   PREMIUM / P&L / STOP LOSS / TARGET 1) — everything from STRIKE on is
-   numeric except STATUS. */
-table.sr-table--plans th:nth-child(3), table.sr-table--plans th:nth-child(5),
+/* Active Options Plans (SYMBOL / DIR / STRIKE / CONF / PLAN / PREMIUM /
+   STOP LOSS / TARGET 1) — everything from STRIKE on is numeric except
+   PLAN (a clock time). [2026-08-08] Card switched from persisted/locked
+   plans to the same DORE live-scan candidates pages/scanner.py's Live
+   Scan tab shows (short form) — see _active_options_plans_html. */
+table.sr-table--plans th:nth-child(3), table.sr-table--plans th:nth-child(4),
 table.sr-table--plans th:nth-child(6), table.sr-table--plans th:nth-child(7),
-table.sr-table--plans th:nth-child(8), table.sr-table--plans th:nth-child(9) { text-align:right; }
-table.sr-table--plans td:nth-child(3), table.sr-table--plans td:nth-child(5),
+table.sr-table--plans th:nth-child(8) { text-align:right; }
+table.sr-table--plans td:nth-child(3), table.sr-table--plans td:nth-child(4),
 table.sr-table--plans td:nth-child(6), table.sr-table--plans td:nth-child(7),
-table.sr-table--plans td:nth-child(8), table.sr-table--plans td:nth-child(9) {
+table.sr-table--plans td:nth-child(8) {
   text-align:right; font-variant-numeric:tabular-nums;
 }
 
@@ -2436,13 +2438,15 @@ def _today_sector_flow_compact_html(flow: dict, rows: int = 3, compact: bool = F
 
 
 # ── LIVE SCANNER SNAPSHOT (compact card) ────────────────────────────
-# Small read-only preview of currently-locked equity setups — reuses the
+# Small read-only preview of TODAY's triggered equity setups — reuses the
 # SetupAge/EntryLocked/EntryDriftPct columns utils.setup_persistence
 # already merges onto df_aug for the Scanner page's own tables (see
 # utils/setup_persistence.py's scanner_row["SetupAge"/"EntryLocked"/
-# "EntryDriftPct"]), just a narrower column set and fewer rows. The full
-# equity Active Plans tab (with status, targets, R:R, etc.) stays on the
-# Scanner page — this is only a glance, not a replacement for it.
+# "EntryDriftPct"]), just a narrower column set, today-only, and fewer
+# rows — same "today's live output only" rule as the ACTIVE OPTIONS
+# PLANS card next to it. The full equity Active Plans tab (with status,
+# targets, R:R, multi-day history, etc.) stays on the Scanner page —
+# this is only a glance, not a replacement for it.
 def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
     need = {"Stock", "%Chg", "SetupAge", "EntryLocked", "EntryDriftPct", "ActivatedAt", "PlanStatus"}
     if df_aug is None or df_aug.empty or not need.issubset(df_aug.columns):
@@ -2469,14 +2473,29 @@ def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
     # subset of the same stocks — defeating the point of a *scanner* snapshot
     # (which should surface what the scanner just did, not who's up the most
     # today). ActivatedAt is the raw ISO timestamp set on WAITING -> ACTIVE
-    # (utils/setup_persistence.py); rows with no timestamp sort last rather
-    # than being dropped, so a setup missing ActivatedAt still shows up.
+    # (utils/setup_persistence.py). [2026-08-08] Rows with no parseable
+    # ActivatedAt are now dropped by the today-only filter below rather than
+    # sorting last, since an unverifiable timestamp can't be confirmed as
+    # "today" either.
     work["_activated_at"] = pd.to_datetime(work["ActivatedAt"], errors="coerce")
+
+    # [2026-08-08, SG request] Today-only — same rule just applied to the
+    # ACTIVE OPTIONS PLANS card next to this one: a setup triggered on a
+    # prior day (and still technically ACTIVE) is carryover, not
+    # something today's scan cycle actually produced. ActivatedAt is
+    # stored UTC (utils/setup_persistence.py); shift +5:30 for the IST
+    # day boundary before comparing, matching _today_ist_date_str()
+    # below. Rows with no parseable ActivatedAt (NaT) fall out of this
+    # comparison naturally (NaT + timedelta is still NaT, never equals
+    # `today`), so an unverifiable timestamp doesn't earn a slot either.
+    today = _today_ist_date_str()
+    work = work[(work["_activated_at"] + pd.Timedelta(hours=5, minutes=30)).dt.strftime("%Y-%m-%d") == today]
+
     work = work.sort_values("_activated_at", ascending=False, na_position="last").head(top_n)
 
     if work.empty:
         return ('<div class="sr-panel"><div class="sr-panel-title">LIVE SCANNER SNAPSHOT</div>'
-                '<div style="color:#8b949e;font-size:0.75rem;">No active setups right now.</div></div>')
+                '<div style="color:#8b949e;font-size:0.75rem;">No active setups triggered today.</div></div>')
 
 
     rows_html = ""
@@ -2513,13 +2532,17 @@ def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
 
 
 # ── ACTIVE OPTIONS PLANS (compact card) ─────────────────────────────
-# Compact read of every currently-OPEN DoreOptionsPlan, reusing
-# utils.dore_options_persistence.active_plan_rows() — the exact same
-# persisted-plan rows pages/scanner.py's own Active Plans tab shows, just
-# a narrower column set (Symbol / Direction / Strike / Status / Entry
-# (Locked) / Last Known Premium / P&L / Stop Loss / Target 1) and capped
-# to top_n most-recently-locked plans. No separate loop, no new
-# persistence — this is purely a smaller read of the same table.
+# [2026-08-08, SG request] Switched from reading persisted/locked
+# DoreOptionsPlan rows (Supabase "open plans") to the SAME source as
+# pages/scanner.py's DORE Options Engine → Live Scan tab: the
+# "dore_live_state" snapshot (falling back to "dore_technical_plans"
+# when Stage 2 hasn't produced anything yet), filtered to
+# Confidence >= 65 and today's plan only, sorted by Confidence
+# descending — identical filters to the Scanner page's Live Scan tab,
+# just rendered as a short/compact column set here instead of the full
+# table. This card is now "what is DORE's live scan surfacing right
+# now", not "what's currently locked open" — that fuller, multi-day
+# history still lives on the Scanner page's own Active Plans tab.
 def _today_ist_date_str() -> str:
     # Same UTC+5:30 day-boundary convention as
     # utils.dore_options_persistence._today_str() (kept local rather than
@@ -2529,10 +2552,8 @@ def _today_ist_date_str() -> str:
 
 
 def _time_only_ist(iso_ts: str) -> str:
-    """'2026-08-05T09:15:32+00:00' -> '09:15 IST'. Falls back to '—' on
-    missing/unparseable input — this card only ever shows today's plans
-    (see the created_date filter below), so the date itself is redundant
-    and only the clock time is worth a column."""
+    """'2026-08-05T09:15:32+00:00' -> '09:15'. Falls back to '—' on
+    missing/unparseable input."""
     if not iso_ts:
         return "—"
     try:
@@ -2548,67 +2569,92 @@ def _time_only_ist(iso_ts: str) -> str:
 
 
 def _active_options_plans_html(top_n: int = 6) -> str:
-    try:
-        from utils.supabase_client import load_open_dore_options_plans, _is_available
-        from utils.dore_options_persistence import active_plan_rows
-    except Exception:
-        return ('<div class="sr-panel"><div class="sr-panel-title">ACTIVE OPTIONS PLANS</div>'
-                '<div style="color:#8b949e;font-size:0.75rem;">Plan persistence isn\'t available right now.</div></div>')
-
-    if not _is_available():
-        return ('<div class="sr-panel"><div class="sr-panel-title">ACTIVE OPTIONS PLANS</div>'
-                '<div style="color:#8b949e;font-size:0.75rem;">Supabase isn\'t configured — '
-                'Options plan persistence requires it.</div></div>')
+    from utils.scan_state import load_snapshot_meta
+    from utils.snapshot_cache import get_snapshot
 
     try:
-        open_plans = load_open_dore_options_plans()
-        rows = active_plan_rows(open_plans) if open_plans else []
+        payload = None
+        meta = load_snapshot_meta("dore_live_state")
+        if meta is not None:
+            full = get_snapshot("dore_live_state")
+            payload = (full or {}).get("payload") or {}
+        rows = list(payload.get("live_state") or []) if payload else []
+
+        if not rows:
+            # Same Stage 1 fallback pages/scanner.py's Live Scan tab uses
+            # when Stage 2 (dore_live_state) hasn't produced anything yet.
+            tech_meta = load_snapshot_meta("dore_technical_plans")
+            if tech_meta is not None:
+                tech_full = get_snapshot("dore_technical_plans")
+                tech_payload = (tech_full or {}).get("payload") or {}
+                rows = list(tech_payload.get("technical_plans") or [])
     except Exception:
         logger.exception("Dashboard Active Options Plans card failed to load (non-fatal)")
         rows = []
 
-    # [2026-08-05] Today's list only — created_date is the IST calendar
-    # date the plan was locked (utils/dore_options_persistence.py), so
-    # this excludes plans carried over from prior sessions even though
-    # they're still technically OPEN. The full multi-day history stays
-    # on the Scanner page's Active Plans tab.
-    today = _today_ist_date_str()
-    rows = [r for r in rows if str(r.get("created_date") or "") == today]
-
     if not rows:
         return ('<div class="sr-panel"><div class="sr-panel-title">ACTIVE OPTIONS PLANS</div>'
-                '<div style="color:#8b949e;font-size:0.75rem;">No DORE Options plans opened today.</div></div>')
+                '<div style="color:#8b949e;font-size:0.75rem;">DORE Options Engine: waiting for '
+                'the first scheduled scan — nothing to show yet.</div></div>')
+
+    df = pd.DataFrame(rows)
+
+    # Same Confidence >= 65 floor as the Scanner page's Live Scan tab.
+    if "confidence_score" in df.columns:
+        df = df[pd.to_numeric(df["confidence_score"], errors="coerce") >= 65]
+
+    # Today-only — a plan locked on a prior day (still OPEN) is
+    # carryover, not something this cycle's scan actually produced.
+    # Rows with no persisted plan yet are kept — they ARE this cycle's
+    # fresh output. Same rule as the Scanner page's Live Scan tab.
+    today = _today_ist_date_str()
+    if "plan_created_date" in df.columns:
+        created = df["plan_created_date"].astype(str)
+        df = df[(created == "") | (created == "None") | (created == "nan") | (created == today)]
+
+    if "confidence_score" in df.columns:
+        df = df.sort_values("confidence_score", ascending=False, kind="stable")
+
+    if df.empty:
+        return ('<div class="sr-panel"><div class="sr-panel-title">ACTIVE OPTIONS PLANS</div>'
+                '<div style="color:#8b949e;font-size:0.75rem;">No DORE candidates with '
+                'Confidence ≥ 65 today.</div></div>')
 
     def _money(v):
         return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
 
+    def _conf_style(score):
+        if score is None or (isinstance(score, float) and pd.isna(score)):
+            return ("#8b949e", "⚪")
+        if score >= 75:
+            return ("#3fb950", "🟢")
+        if score >= 55:
+            return ("#58a6ff", "🔵")
+        return ("#8b949e", "⚪")
+
     rows_html = ""
-    for r in rows[:top_n]:
+    for _, r in df.head(top_n).iterrows():
         direction = r.get("direction", "")
         dir_color = "#3fb950" if direction == "CE" else "#f85149" if direction == "PE" else "#8b949e"
-        entry = r.get("entry_locked")
-        last_premium = r.get("last_premium")
-        pnl_html = "—"
-        if entry not in (None, "") and pd.notna(entry) and last_premium not in (None, "") and pd.notna(last_premium):
-            pnl = last_premium - entry
-            pcolor = "#3fb950" if pnl >= 0 else "#f85149"
-            pnl_html = f'<span style="color:{pcolor};font-weight:700;">{"+" if pnl >= 0 else ""}{_money(pnl)}</span>'
-        # [2026-08-05] Status column now shows just the lock time (e.g.
-        # "09:15 IST") instead of the full "🟢 Active (Nd · since
-        # YYYY-MM-DD HH:MM)" label — the day-count and "Active" wording
-        # were redundant now that this card only ever lists today's plans.
-        status_time = _time_only_ist(r.get("created_at"))
+        primary = r.get("primary") or {}
+        if not isinstance(primary, dict):
+            primary = {}
+        strike = primary.get("strike")
+        strike_disp = f"{strike:,.0f}" if strike not in (None, "") and pd.notna(strike) else "—"
+        conf = r.get("confidence_score")
+        conf_color, conf_dot = _conf_style(conf)
+        conf_disp = f"{conf:.0f}" if conf not in (None, "") and pd.notna(conf) else "—"
+        plan_time = _time_only_ist(r.get("plan_created_at"))
         rows_html += (
             "<tr>"
             f'<td style="font-weight:700;" title="{r.get("symbol", "—")}">{r.get("symbol", "—")}</td>'
             f'<td style="color:{dir_color};font-weight:700;">{direction or "—"}</td>'
-            f"<td>{r.get('strike', '—')}</td>"
-            f'<td title="Locked at {status_time} IST">{status_time}</td>'
-            f'<td style="font-weight:700;">{_money(entry)}</td>'
-            f"<td>{_money(last_premium)}</td>"
-            f"<td>{pnl_html}</td>"
-            f"<td>{_money(r.get('saved_stop_loss'))}</td>"
-            f"<td>{_money(r.get('saved_target1'))}</td>"
+            f"<td>{strike_disp}</td>"
+            f'<td><span style="color:{conf_color};font-weight:700;">{conf_dot} {conf_disp}</span></td>'
+            f'<td title="Plan locked at {plan_time} IST">{plan_time}</td>'
+            f"<td>{_money(r.get('current_premium'))}</td>"
+            f"<td>{_money(r.get('stop_loss'))}</td>"
+            f"<td>{_money(r.get('target1'))}</td>"
             "</tr>"
         )
 
@@ -2618,12 +2664,11 @@ def _active_options_plans_html(top_n: int = 6) -> str:
       <div class="sr-panel-body">
       <table class="sr-table sr-table--plans">
         <colgroup>
-          <col style="width:14%"><col style="width:7%"><col style="width:9%"><col style="width:9%">
-          <col style="width:14%"><col style="width:14%"><col style="width:11%">
-          <col style="width:11%"><col style="width:11%">
+          <col style="width:16%"><col style="width:8%"><col style="width:12%"><col style="width:11%">
+          <col style="width:11%"><col style="width:14%"><col style="width:14%"><col style="width:14%">
         </colgroup>
-        <tr><th>SYMBOL</th><th>DIR</th><th>STRIKE</th><th>TIME</th><th>ENTRY</th>
-            <th>LAST PREMIUM</th><th>P&amp;L</th><th>STOP LOSS</th><th>TARGET 1</th></tr>
+        <tr><th>SYMBOL</th><th>DIR</th><th>STRIKE</th><th>CONF</th><th>PLAN</th>
+            <th>PREMIUM</th><th>STOP LOSS</th><th>TARGET 1</th></tr>
         {rows_html}
       </table>
     </div>"""
