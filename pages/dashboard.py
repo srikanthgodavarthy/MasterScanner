@@ -2263,6 +2263,12 @@ table.sr-table--plans td:nth-child(8), table.sr-table--plans td:nth-child(9) {
 .sr-flow-row span:first-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-right:8px; }
 .sr-flow-row span:last-child { flex-shrink:0; }
 
+/* Compact Today's Sector Flow — sits under NSE Top Gainers in the same
+   narrow column, so it needs a smaller footprint than the standalone
+   full-row version: tighter panel padding + smaller row/title text. */
+.sr-panel--compact { padding:12px; margin-top:12px; }
+.sr-flow-row--sm { font-size:0.68rem; padding:2px 0; }
+
 
 /* 2026-07-27: table-layout:fixed + equal-width th/td so every column
    (1D Ago / Today / etc.) takes the SAME width regardless of how long
@@ -2344,7 +2350,7 @@ def _nse_top_gainers_html(df_aug: pd.DataFrame, top_n: int = 5) -> str:
         rows_html += (
             "<tr>"
             f"<td style='color:#8b949e;'>{i}</td>"
-            f'<td><span class="sr-sector-name" style="font-weight:700;" title="{symbol}">{_tv_link(str(symbol), pct_chg=chg) if symbol != "—" else symbol}</span></td>'
+            f'<td><span class="sr-sector-name" style="font-weight:700;" title="{symbol}">{_tv_link(str(symbol)) if symbol != "—" else symbol}</span></td>'
             f"<td>{f'{ltp:,.2f}' if ltp is not None else '—'}</td>"
             f'<td class="{"sr-pos" if chg >= 0 else "sr-neg"}">{"+" if chg >= 0 else ""}{chg:.2f}%</td>'
             f"<td>{f'{vr:.1f}x' if vr is not None else '—'}</td>"
@@ -2377,37 +2383,52 @@ def _nse_top_gainers_html(df_aug: pd.DataFrame, top_n: int = 5) -> str:
 # compute_sector_flow(sector_stats) call the full page uses, plus an
 # st.page_link back to it — so the two never show different numbers,
 # they just show a different amount of detail.
-def _today_sector_flow_compact_html(flow: dict, rows: int = 3) -> str:
+def _today_sector_flow_compact_html(flow: dict, rows: int = 3, compact: bool = False) -> str:
     inflow_list = list(flow.get("inflow", []))[:rows]
     outflow_list = list(flow.get("outflow", []))[:rows]
     # Pad both columns to a fixed `rows` length (blank placeholder rows for
     # any that are short) so the card's height is constant regardless of
     # how many sectors qualified as inflow/outflow today.
+    row_cls = "sr-flow-row sr-flow-row--sm" if compact else "sr-flow-row"
     inflow_rows = "".join(
-        f'<div class="sr-flow-row"><span title="{s}">↑ {s}</span><span class="sr-pos">+{v:.0f} Cr</span></div>'
+        f'<div class="{row_cls}"><span title="{s}">↑ {s}</span><span class="sr-pos">+{v:.0f} Cr</span></div>'
         for s, v in inflow_list
-    ) + '<div class="sr-flow-row">&nbsp;</div>' * (rows - len(inflow_list))
+    ) + f'<div class="{row_cls}">&nbsp;</div>' * (rows - len(inflow_list))
     outflow_rows = "".join(
-        f'<div class="sr-flow-row"><span title="{s}">↓ {s}</span><span class="sr-neg">{v:.0f} Cr</span></div>'
+        f'<div class="{row_cls}"><span title="{s}">↓ {s}</span><span class="sr-neg">{v:.0f} Cr</span></div>'
         for s, v in outflow_list
-    ) + '<div class="sr-flow-row">&nbsp;</div>' * (rows - len(outflow_list))
+    ) + f'<div class="{row_cls}">&nbsp;</div>' * (rows - len(outflow_list))
     net = flow.get("net", 0) or 0
 
+    # [Top Gainers/Sector Flow merge] `compact=True` renders this card at
+    # ~60% of its normal footprint (tighter padding, smaller title/col
+    # headers, no footer whitespace) so it can sit directly beneath NSE Top
+    # Gainers in the same narrow column instead of claiming its own full
+    # row further down the page. Numbers/logic are unchanged — only sizing.
+    panel_cls = "sr-panel sr-panel--compact" if compact else "sr-panel"
+    title_style = "font-size:0.72rem;margin-bottom:6px;" if compact else ""
+    gap = "10px" if compact else "16px"
+    col_title_style = "font-size:0.62rem;margin-bottom:4px;"
+    footer_style = (
+        "border-top:1px solid #1e293b;margin-top:6px;padding-top:6px;font-size:0.68rem;"
+        if compact else
+        "border-top:1px solid #1e293b;margin-top:10px;padding-top:8px;font-size:0.75rem;"
+    )
+
     return f"""
-    <div class="sr-panel">
-      <div class="sr-panel-title">TODAY'S SECTOR FLOW <span style="color:#8b949e;font-weight:400;">(Net Inflow)</span></div>
-      <div style="display:flex;gap:16px;">
+    <div class="{panel_cls}">
+      <div class="sr-panel-title" style="{title_style}">TODAY'S SECTOR FLOW <span style="color:#8b949e;font-weight:400;">(Net Inflow)</span></div>
+      <div style="display:flex;gap:{gap};">
         <div style="flex:1;">
-          <div class="sr-flow-col-title" style="color:#3fb950;">TOP INFLOW SECTORS</div>
+          <div class="sr-flow-col-title" style="color:#3fb950;{col_title_style}">TOP INFLOW SECTORS</div>
           {inflow_rows}
         </div>
         <div style="flex:1;">
-          <div class="sr-flow-col-title" style="color:#f85149;">TOP OUTFLOW SECTORS</div>
+          <div class="sr-flow-col-title" style="color:#f85149;{col_title_style}">TOP OUTFLOW SECTORS</div>
           {outflow_rows}
         </div>
       </div>
-      <div style="border-top:1px solid #1e293b;margin-top:10px;padding-top:8px;font-size:0.75rem;
-                   display:flex;justify-content:space-between;">
+      <div style="{footer_style}display:flex;justify-content:space-between;">
         <span>Net Inflow (Today): <b class="{'sr-pos' if net >= 0 else 'sr-neg'}">
           {'+' if net >= 0 else ''}{net:.0f} Cr</b></span>
       </div>
@@ -2423,7 +2444,7 @@ def _today_sector_flow_compact_html(flow: dict, rows: int = 3) -> str:
 # equity Active Plans tab (with status, targets, R:R, etc.) stays on the
 # Scanner page — this is only a glance, not a replacement for it.
 def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
-    need = {"Stock", "%Chg", "SetupAge", "EntryLocked", "EntryDriftPct", "ActivatedAt"}
+    need = {"Stock", "%Chg", "SetupAge", "EntryLocked", "EntryDriftPct", "ActivatedAt", "PlanStatus"}
     if df_aug is None or df_aug.empty or not need.issubset(df_aug.columns):
         return ('<div class="sr-panel"><div class="sr-panel-title">LIVE SCANNER SNAPSHOT</div>'
                 '<div style="color:#8b949e;font-size:0.75rem;">No scan data yet.</div></div>')
@@ -2431,6 +2452,15 @@ def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
     work = df_aug.copy()
     work["SetupAge"] = work["SetupAge"].astype(str)
     work = work[work["SetupAge"].str.strip().replace({"nan": "", "None": ""}) != ""]
+    # [2026-08-05] Restrict to PlanStatus == ACTIVE (entry actually
+    # triggered — utils/setup_persistence.py's SetupPlanStatus.ACTIVE).
+    # Previously any row with a non-empty SetupAge qualified, which
+    # included WAITING setups (not yet triggered) too — that made this
+    # panel a near-duplicate of whichever symbols the scanner touched
+    # today, which is how it ended up overlapping with NSE Top Gainers.
+    # ACTIVE-only means every row here is a genuinely *live* (open,
+    # triggered) scanner setup, not just anything on the scanner's radar.
+    work = work[work["PlanStatus"].astype(str).str.upper() == "ACTIVE"]
     work["%Chg"] = pd.to_numeric(work["%Chg"], errors="coerce")
     work = work.dropna(subset=["%Chg"])
     # [2026-08-04] Sort by most-recently-activated, not %Chg. Previously this
@@ -2458,7 +2488,7 @@ def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
         drift_val = float(drift) if drift not in (None, "") and pd.notna(drift) else None
         rows_html += (
             "<tr>"
-            f'<td><span class="sr-sector-name" style="font-weight:700;" title="{symbol}">{_tv_link(str(symbol), pct_chg=chg) if symbol != "—" else symbol}</span></td>'
+            f'<td><span class="sr-sector-name" style="font-weight:700;" title="{symbol}">{_tv_link(str(symbol)) if symbol != "—" else symbol}</span></td>'
             f'<td class="{"sr-pos" if chg >= 0 else "sr-neg"}">{"+" if chg >= 0 else ""}{chg:.2f}%</td>'
             f"<td>{r.get('SetupAge', '—')}</td>"
             f"<td>{f'{float(entry):,.2f}' if entry not in (None, '') and pd.notna(entry) else '—'}</td>"
@@ -2490,6 +2520,33 @@ def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
 # (Locked) / Last Known Premium / P&L / Stop Loss / Target 1) and capped
 # to top_n most-recently-locked plans. No separate loop, no new
 # persistence — this is purely a smaller read of the same table.
+def _today_ist_date_str() -> str:
+    # Same UTC+5:30 day-boundary convention as
+    # utils.dore_options_persistence._today_str() (kept local rather than
+    # importing that module's private helper across module boundaries).
+    from datetime import datetime, timedelta
+    return (datetime.utcnow() + timedelta(hours=5, minutes=30)).date().isoformat()
+
+
+def _time_only_ist(iso_ts: str) -> str:
+    """'2026-08-05T09:15:32+00:00' -> '09:15 IST'. Falls back to '—' on
+    missing/unparseable input — this card only ever shows today's plans
+    (see the created_date filter below), so the date itself is redundant
+    and only the clock time is worth a column."""
+    if not iso_ts:
+        return "—"
+    try:
+        import pytz
+        from datetime import datetime
+        dt = datetime.fromisoformat(str(iso_ts))
+        if dt.tzinfo is None:
+            from datetime import timezone
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(pytz.timezone("Asia/Kolkata")).strftime("%H:%M")
+    except Exception:
+        return "—"
+
+
 def _active_options_plans_html(top_n: int = 6) -> str:
     try:
         from utils.supabase_client import load_open_dore_options_plans, _is_available
@@ -2510,9 +2567,17 @@ def _active_options_plans_html(top_n: int = 6) -> str:
         logger.exception("Dashboard Active Options Plans card failed to load (non-fatal)")
         rows = []
 
+    # [2026-08-05] Today's list only — created_date is the IST calendar
+    # date the plan was locked (utils/dore_options_persistence.py), so
+    # this excludes plans carried over from prior sessions even though
+    # they're still technically OPEN. The full multi-day history stays
+    # on the Scanner page's Active Plans tab.
+    today = _today_ist_date_str()
+    rows = [r for r in rows if str(r.get("created_date") or "") == today]
+
     if not rows:
         return ('<div class="sr-panel"><div class="sr-panel-title">ACTIVE OPTIONS PLANS</div>'
-                '<div style="color:#8b949e;font-size:0.75rem;">No open DORE Options plans right now.</div></div>')
+                '<div style="color:#8b949e;font-size:0.75rem;">No DORE Options plans opened today.</div></div>')
 
     def _money(v):
         return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
@@ -2528,12 +2593,17 @@ def _active_options_plans_html(top_n: int = 6) -> str:
             pnl = last_premium - entry
             pcolor = "#3fb950" if pnl >= 0 else "#f85149"
             pnl_html = f'<span style="color:{pcolor};font-weight:700;">{"+" if pnl >= 0 else ""}{_money(pnl)}</span>'
+        # [2026-08-05] Status column now shows just the lock time (e.g.
+        # "09:15 IST") instead of the full "🟢 Active (Nd · since
+        # YYYY-MM-DD HH:MM)" label — the day-count and "Active" wording
+        # were redundant now that this card only ever lists today's plans.
+        status_time = _time_only_ist(r.get("created_at"))
         rows_html += (
             "<tr>"
             f'<td style="font-weight:700;" title="{r.get("symbol", "—")}">{r.get("symbol", "—")}</td>'
             f'<td style="color:{dir_color};font-weight:700;">{direction or "—"}</td>'
             f"<td>{r.get('strike', '—')}</td>"
-            f'<td title="{r.get("plan_status_label", "—")}">{r.get("plan_status_label", "—")}</td>'
+            f'<td title="Locked at {status_time} IST">{status_time}</td>'
             f'<td style="font-weight:700;">{_money(entry)}</td>'
             f"<td>{_money(last_premium)}</td>"
             f"<td>{pnl_html}</td>"
@@ -2548,12 +2618,12 @@ def _active_options_plans_html(top_n: int = 6) -> str:
       <div class="sr-panel-body">
       <table class="sr-table sr-table--plans">
         <colgroup>
-          <col style="width:12%"><col style="width:6%"><col style="width:8%"><col style="width:24%">
-          <col style="width:12%"><col style="width:12%"><col style="width:9%">
-          <col style="width:9%"><col style="width:8%">
+          <col style="width:14%"><col style="width:7%"><col style="width:9%"><col style="width:9%">
+          <col style="width:14%"><col style="width:14%"><col style="width:11%">
+          <col style="width:11%"><col style="width:11%">
         </colgroup>
-        <tr><th>SYMBOL</th><th>DIR</th><th>STRIKE</th><th>STATUS</th><th>ENTRY (LOCKED)</th>
-            <th>LAST KNOWN PREMIUM</th><th>P&amp;L</th><th>STOP LOSS</th><th>TARGET 1</th></tr>
+        <tr><th>SYMBOL</th><th>DIR</th><th>STRIKE</th><th>TIME</th><th>ENTRY</th>
+            <th>LAST PREMIUM</th><th>P&amp;L</th><th>STOP LOSS</th><th>TARGET 1</th></tr>
         {rows_html}
       </table>
     </div>"""
@@ -3189,6 +3259,19 @@ def render(settings: dict | None = None):
                     unsafe_allow_html=True)
     with gainers_col:
         st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
+        # [2026-08-05] Today's Sector Flow moved up to sit directly below
+        # Top Gainers in this same narrow column, rendered at compact=True
+        # (smaller padding/fonts, see _today_sector_flow_compact_html) so
+        # it fits without pushing the column much taller. Previously this
+        # lived in its own full-width row further down next to Live
+        # Scanner Snapshot — see that row below, now Snapshot-only.
+        from utils.sector_rotation import compute_sector_flow
+        _flow = compute_sector_flow(sector_stats)
+        st.markdown(_today_sector_flow_compact_html(_flow, rows=2, compact=True),
+                    unsafe_allow_html=True)
+        _sectors_page = settings.get("sectors_page")
+        if _sectors_page is not None:
+            st.page_link(_sectors_page, label="View full Sector Rotation Analysis →", icon="🧭")
 
     # [Dashboard/Scanner split] Scanner output (Elite/Execute/Actionable/
     # ... tables, Signal Class counts) and the DORE 2.0 F&O Opportunity
@@ -3197,36 +3280,21 @@ def render(settings: dict | None = None):
     # by Futures and Options. Dashboard stays focused on market-wide
     # context: Top Gainers, News, and Sector data below.
 
+    # ── Live Scanner Snapshot + Active Options Plans, side by side ────
+    # [2026-08-05] These two "what's currently open" cards now sit next
+    # to each other (equity setups on the left, options plans on the
+    # right) instead of stacking full-width one after another, with News
+    # pushed below both — News is market-wide context, these two are the
+    # "what did the scanner actually do" glance and read better together.
+    live_col, plans_col = st.columns([1, 1], gap="medium")
+    with live_col:
+        st.markdown(_live_scanner_snapshot_html(df_aug), unsafe_allow_html=True)
+    with plans_col:
+        st.markdown(_active_options_plans_html(), unsafe_allow_html=True)
+
     # ── News. ────────────────────────────────────────────────────────
     # 2026-07-28: Top Gainers moved up next to the index cards (see
     # above); the detailed news table now takes the full row width and
     # is always open — no more "Show detailed news impact table"
     # expander, see _news_impact_panel's docstring.
     _news_impact_panel()
-
-
-    # ── Today's Sector Flow (compact) + Live Scanner Snapshot ─────────
-    # [Dashboard/Sectors split, 2026-07-31] The full Sector Rotation
-    # Analysis (dashboard table, Timeline, StockEdge grids, "How It's
-    # Calculated", footer) moved to its own page — pages/sectors.py.
-    # Dashboard keeps only the compact Net-Inflow flow card (same
-    # compute_sector_flow(sector_stats) numbers as the full page) side
-    # by side with a small preview of currently-locked equity setups,
-    # plus a link across to the full page for anyone who wants the rest.
-    from utils.sector_rotation import compute_sector_flow
-    flow = compute_sector_flow(sector_stats)
-
-    flow_col, snap_col = st.columns([1, 1], gap="medium")
-    with flow_col:
-        st.markdown(_today_sector_flow_compact_html(flow), unsafe_allow_html=True)
-        _sectors_page = settings.get("sectors_page")
-        if _sectors_page is not None:
-            st.page_link(_sectors_page, label="View full Sector Rotation Analysis →", icon="🧭")
-    with snap_col:
-        st.markdown(_live_scanner_snapshot_html(df_aug), unsafe_allow_html=True)
-
-    # ── Active Options Plans (compact) ────────────────────────────────
-    # Every currently-OPEN DoreOptionsPlan, narrowed to the columns most
-    # useful at a glance. The full Active Plans tab (with Days Active,
-    # Last Seen, Target 2, etc.) stays on the Scanner page.
-    st.markdown(_active_options_plans_html(), unsafe_allow_html=True)
