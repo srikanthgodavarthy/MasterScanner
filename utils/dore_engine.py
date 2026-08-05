@@ -933,9 +933,6 @@ def check_intraday_reversal_alert(
     else:
         reason = f"{move_pct:+.2f}% move against trend — below the {cfg.reversal_alert_atr_mult_min:.2f}x ATR floor"
 
-    logger.debug("[DORE:%s] IntradayReversalAlert triggered=%s move_pct=%.2f intent=%s",
-                 inp.symbol, triggered, move_pct, directional_intent)
-
     return IntradayReversalAlert(triggered=triggered, move_pct=round(move_pct, 2),
                                   move_direction=move_direction, reason=reason)
 
@@ -1093,9 +1090,6 @@ def compute_effective_bias(
     else:
         reasons.append(f"Blend ({dw*100:.0f}% daily / {iw*100:.0f}% intraday) = {blended:.1f} — "
                         f"unchanged from daily {trend.directional_intent}")
-
-    logger.debug("[DORE:%s] EffectiveBias daily=%s intraday_score=%.1f blended=%.1f -> %s (override=%s)",
-                 inp.symbol, trend.directional_intent, intraday_score, blended, effective_intent, False)
 
     return EffectiveBiasResult(effective_intent=effective_intent, blended_score=round(blended, 1),
                                 intraday_score=round(intraday_score, 1), override_active=False,

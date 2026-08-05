@@ -561,11 +561,6 @@ def advance_lifecycle(
         if plan.is_terminal():
             break
 
-    if changed_any:
-        logger.info(
-            "[SETUP PLAN UPDATED] symbol=%s id=%s new_status=%s reason=%s",
-            plan.symbol, plan.setup_id, _sval(plan.status), last_reason,
-        )
     return changed_any, last_reason
 
 
@@ -583,10 +578,6 @@ def close_plan_manually(plan: "SetupPlan", reason: str = "Manual exit") -> bool:
     plan.closed_at      = _now_iso()
     plan.invalidation_reason = reason
     plan.invalidated_date     = plan.closed_at[:10]
-    logger.info(
-        "[SETUP PLAN UPDATED] symbol=%s id=%s new_status=CLOSED reason=%s (manual)",
-        plan.symbol, plan.setup_id, reason,
-    )
     return True
 
 
@@ -652,10 +643,6 @@ def _create_plan(
         status                 = SetupPlanStatus.WAITING,
         status_reason           = "Plan created — awaiting entry trigger",
         created_at              = now_ts,
-    )
-    logger.info(
-        "[SETUP PLAN CREATED] symbol=%s id=%s locked_recommendation=%s entry=%.2f sl=%.2f t1=%.2f",
-        symbol, plan.setup_id, recommendation, entry, sl, t1,
     )
     return plan
 
@@ -729,17 +716,6 @@ def enrich_scanner_row(
         recommendation in _FREEZE_CATEGORIES
         and (plan is None or plan.is_terminal())
     )
-    if not should_create:
-        if recommendation not in _FREEZE_CATEGORIES:
-            logger.info(
-                "[SETUP PLAN SKIPPED] symbol=%s recommendation=%s reason=recommendation_not_qualifying",
-                symbol, recommendation,
-            )
-        elif plan is not None and plan.is_open():
-            logger.info(
-                "[SETUP PLAN SKIPPED] symbol=%s id=%s reason=plan_already_open status=%s locked_entry=%.2f",
-                symbol, plan.setup_id, _sval(plan.status), plan.entry_locked,
-            )
     if should_create:
         plan = _create_plan(symbol, scanner_row, first_seen_date, today_str)
         plan_was_updated = True
