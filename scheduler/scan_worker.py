@@ -574,6 +574,7 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             wait_for_priority("live_scanner", max_wait_secs=min(interval_secs, 240))
 
             batch_started = time.time()
+            batch_records: dict[str, dict] = {}
             if chunk:
                 try:
                     df_raw = compute_live_scan_batch(chunk, settings={"workers": max_workers})
@@ -583,6 +584,7 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                         key = _row_key(rec)
                         if key:
                             merged[key] = rec
+                            batch_records[key] = rec
                             n_ok += 1
                     logger.info("[live_scanner] batch %d/%d done: %d/%d symbols (%.1fs)",
                                 batch_i + 1, n_batches, n_ok, len(chunk), time.time() - batch_started)
@@ -597,6 +599,15 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             # yet this cycle — reseed from the manual snapshot first so
             # this progressive save doesn't clobber it with old values.
             # See utils/system_state.py.
+            #
+            # [2026-08-XX write-amplification fix] Reseeded rows are NOT
+            # added to `batch_records` below — they came straight from
+            # load_snapshot_payload("live_scanner"), i.e. they're already
+            # correct in live_scanner_state right now. Re-upserting them
+            # here would just be writing back the same values we only
+            # just read, purely to keep this loop's in-memory `merged`
+            # cache from clobbering them later — a real reason to update
+            # `merged`, not a reason to also touch the DB.
             if manual_override_active("live_scanner"):
                 try:
                     latest = load_snapshot_payload("live_scanner")
@@ -614,10 +625,35 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             # doesn't have to wait for the whole 5-minute cycle to see
             # fresher data, and a mid-cycle crash loses at most one
             # batch's worth of progress.
+            #
+            # [2026-08-XX write-amplification fix] Upserts only THIS
+            # batch's records now, not list(merged.values()) (every
+            # symbol processed so far this cycle). The old code re-wrote
+            # every already-processed symbol on every single batch's
+            # save — for an N-batch cycle, symbols from batch 1 got
+            # upserted N times, batch 2's symbols N-1 times, etc. Found
+            # via Supabase MCP: live_scanner_state showed 577,528 updates
+            # against a 397-row table (~1,455 effective full-table
+            # upserts over ~576 real 5-minute cycles since project
+            # creation — about 2.5x the necessary write volume) with
+            # zero HOT updates (every write a full jsonb row rewrite).
+            # UPSERT semantics make this safe: a row not included in
+            # `rows` this call simply isn't touched, so a reader hitting
+            # load_snapshot_payload()/get_snapshot() mid-cycle still sees
+            # every symbol processed so far (unaffected rows keep their
+            # last-good value from an earlier batch's upsert) — the
+            # "fresher data without waiting for the full cycle" behavior
+            # this comment block describes is unchanged, only the
+            # redundant re-writing of unchanged rows is gone.
+            # row_count is still the TOTAL known so far this cycle
+            # (len(merged)), independent of how many rows this specific
+            # call upserts — see utils.scan_state._save_state's row_count
+            # param, which defaults to len(rows) only when not given
+            # explicitly.
             try:
-                records = list(merged.values())
+                records = list(batch_records.values())
                 scan_id = save_snapshot("live_scanner", payload={"data": records},
-                                         row_count=len(records), status="completed")
+                                         row_count=len(merged), status="completed")
                 if not scan_id:
                     logger.warning("[live_scanner] save_snapshot returned no scan_id (Supabase unavailable?)")
             except Exception:
