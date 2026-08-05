@@ -433,6 +433,39 @@ def _save_state(
             "[%s] collapsed %d duplicate-symbol record(s) before upsert (%d -> %d rows)",
             section, before - len(rows), before, len(rows),
         )
+        # [2026-08-05] Verify the merge above actually kept both legs'
+        # fields instead of one overwriting the other. FUTURES_ONLY_FIELDS
+        # / OPTIONS_ONLY_FIELDS are the field names each leg alone
+        # contributes (per the comment above); a row missing either set
+        # entirely means merge fell back to one leg only, for that symbol,
+        # which is the exact failure mode this fix targets.
+        futures_only = {"conviction", "target_price", "breakout_score",
+                         "pullback_score", "continuation_score",
+                         "qualification_score", "expected_move"}
+        options_only = {"entry_locked", "saved_stop_loss", "saved_target1",
+                         "saved_target2", "drift_pct", "plan_age_days"}
+        both_present = 0
+        futures_only_present = 0
+        options_only_present = 0
+        neither_present = 0
+        for row in rows:
+            rec = row.get("record") or {}
+            has_futures = any(rec.get(f) is not None for f in futures_only)
+            has_options = any(rec.get(f) is not None for f in options_only)
+            if has_futures and has_options:
+                both_present += 1
+            elif has_futures:
+                futures_only_present += 1
+            elif has_options:
+                options_only_present += 1
+            else:
+                neither_present += 1
+        logger.warning(
+            "[%s] post-merge field coverage: %d row(s) with BOTH legs, "
+            "%d futures-only, %d options-only, %d neither",
+            section, both_present, futures_only_present,
+            options_only_present, neither_present,
+        )
 
     try:
         from utils.supabase_client import _execute_with_retry
