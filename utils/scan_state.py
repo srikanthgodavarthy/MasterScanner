@@ -397,6 +397,28 @@ def _save_state(
     if skipped:
         logger.warning("[%s] skipped %d record(s) with no %r key", section, skipped, id_field)
 
+    # [2026-08-05] De-dupe by symbol, keeping the LAST occurrence, before
+    # upserting. Postgres rejects an upsert batch that contains the same
+    # on_conflict key twice in one command ("ON CONFLICT DO UPDATE command
+    # cannot affect row a second time") — it can't apply two UPDATEs to
+    # the same row within a single statement. dore_live_state's
+    # "live_state" records list can legitimately contain the same symbol
+    # more than once in a cycle (e.g. a futures leg and an options leg
+    # both keyed by the underlying symbol), so this collapses to one row
+    # per symbol instead of letting the DB error out and the whole save
+    # silently fail. "Last occurrence wins" matches how a plain dict-merge
+    # of the same records would behave.
+    before = len(rows)
+    deduped: dict[str, dict] = {}
+    for row in rows:
+        deduped[row["symbol"]] = row
+    rows = list(deduped.values())
+    if len(rows) != before:
+        logger.warning(
+            "[%s] collapsed %d duplicate-symbol record(s) before upsert (%d -> %d rows)",
+            section, before - len(rows), before, len(rows),
+        )
+
     try:
         from utils.supabase_client import _execute_with_retry
         if rows:
