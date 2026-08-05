@@ -224,7 +224,7 @@ def refresh_dore_live_state(cfg=None) -> dict:
     """
     from utils.scan_state import load_snapshot_payload
     from utils.upstox_client import fetch_open_plan_option_quotes, fetch_index_quote, resolve_instrument_key
-    from utils.json_sanitize import find_invalid_columns, sanitize_dataframe
+    from utils.json_sanitize import find_invalid_columns, find_invalid_columns_by_source, sanitize_dataframe
     from utils.supabase_client import load_open_dore_options_plans
     from utils.dore_options_engine import DORE_OPTIONS_DEFAULTS
     import pandas as pd
@@ -394,9 +394,62 @@ def refresh_dore_live_state(cfg=None) -> dict:
         rows.append(row)
 
     df = pd.DataFrame(rows)
-    invalid = find_invalid_columns(df)
-    if invalid:
-        logger.warning("[dore_live_state] invalid numeric values (NaN/inf) before snapshot save — %s", invalid)
+
+    # [2026-08-05, source-aware validation] This table interleaves two
+    # genuinely different row shapes — freshly-recomputed Stage 1
+    # technical candidates (breakout_score/conviction/qualification_score/
+    # ...) and carried-forward OPEN plans read straight from Supabase
+    # (entry_locked/saved_stop_loss/plan_age_days/...), see the
+    # "_carried_forward" merge above. A plain find_invalid_columns() call
+    # can't tell "this column doesn't apply to this source" apart from
+    # "this value should have been computed and wasn't" — every carried-
+    # forward row is Stage-1-score-shaped NaN by construction, and every
+    # fresh Stage-1 row is entry-lock-shaped NaN because it was never
+    # opened. Grouping by source separates the two: "structural" (NaN in
+    # 100% of one source's rows — expected, logged at INFO) from
+    # "partial" (NaN in SOME of one source's rows — a genuine per-row gap
+    # worth a WARNING, the same way utils.dore_options_scan's single-
+    # source technical_plans table already gets one flat check because it
+    # has no such source split).
+    #
+    # "_source_label" below is diagnostic-only — a temporary column built
+    # from "_carried_forward" purely to group by, dropped before the df
+    # is sanitized/persisted so it never changes the "_carried_forward"
+    # field's actual published shape (True for carried-forward rows,
+    # absent for fresh ones — unchanged).
+    if "_carried_forward" in df.columns:
+        df["_source_label"] = df["_carried_forward"].map(
+            lambda v: "carried_forward_open" if v is True else "fresh_stage1"
+        )
+        breakdown = find_invalid_columns_by_source(df, "_source_label")
+        df = df.drop(columns=["_source_label"])
+    else:
+        breakdown = {"group_sizes": {}}
+
+    if breakdown["group_sizes"]:
+        for group_name, cols in breakdown["partial"].items():
+            logger.warning(
+                "[dore_live_state] partial (not all-rows) NaN/inf in source=%s "
+                "(%d row(s)) — %s — likely a genuine per-row calc gap, not a "
+                "source-shape artifact",
+                group_name, breakdown["group_sizes"].get(group_name, 0), cols,
+            )
+        if breakdown["structural"]:
+            logger.info(
+                "[dore_live_state] structural NaN/inf (column doesn't apply to "
+                "that source, expected) before snapshot save — %s",
+                breakdown["structural"],
+            )
+    else:
+        # No "_carried_forward" column present (e.g. every row this cycle
+        # happens to be one source) — fall back to the flat, source-blind
+        # check rather than silently skipping validation.
+        invalid = find_invalid_columns(df)
+        if invalid:
+            logger.warning("[dore_live_state] invalid numeric values (NaN/inf) before snapshot save — %s", invalid)
+
+    # Sanitization itself is unconditional and source-blind on purpose —
+    # every NaN/inf becomes JSON-safe None regardless of why it's there.
     df = sanitize_dataframe(df, "dore_live_state.live_state")
 
     return {

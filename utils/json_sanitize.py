@@ -25,9 +25,9 @@ module gets used.
 Two layers, on purpose
 ----------------------
 1. sanitize_dataframe() — run by each producer (fo_scan, and anywhere else
-   building a payload from a DataFrame) BEFORE .to_dict("records"), with
-   column-level "N invalid values found" logging so a bad upstream
-   calculation is diagnosable, not just silently nulled.
+   building a payload from a DataFrame) BEFORE .to_dict("records"). Pure
+   by default — see that function's docstring for why logging moved out
+   of it and into producers as of 2026-08-05.
 2. sanitize_for_json() — run once more, generically, inside
    utils.scan_state.save_snapshot() over the final plain-Python payload
    dict, regardless of section/producer. This is deliberately redundant
@@ -38,6 +38,17 @@ Two layers, on purpose
    pre-existing `.where(df.notnull(), None)` calls elsewhere in this repo
    handle NaN but NOT +/-inf, since `notnull()` treats inf as a valid,
    non-null value).
+
+Sanitization itself (layers 1/2 above) always runs unconditionally over
+every row, regardless of source — a null has to become JSON-safe `None`
+no matter which producer wrote it. Diagnostic LOGGING of what was invalid
+and why is a separate concern, owned by each producer (find_invalid_
+columns() for a single-shape DataFrame, find_invalid_columns_by_source()
+for one that interleaves rows from more than one source/shape — see
+utils.dore_live_state for why a flat count is misleading there) — not by
+sanitize_dataframe() itself, which stays a pure replace-and-return utility
+so a producer's own (possibly smarter) diagnostic is never duplicated or
+contradicted by a second, dumber pass underneath it.
 """
 
 from __future__ import annotations
@@ -70,29 +81,94 @@ def find_invalid_columns(df: pd.DataFrame) -> dict[str, int]:
     return out
 
 
-def sanitize_dataframe(df: pd.DataFrame, df_name: str = "dataframe") -> pd.DataFrame:
+def find_invalid_columns_by_source(df: pd.DataFrame, source_col: str) -> dict:
+    """
+    Source-aware version of find_invalid_columns(), for DataFrames that
+    interleave rows from genuinely different producers/shapes under one
+    table — e.g. utils.dore_live_state's "live_state" rows, which mix
+    freshly-recomputed Stage 1 technical candidates (carry breakout_score,
+    conviction, qualification_score, ...) with carried-forward OPEN plans
+    from Supabase (carry entry_locked, saved_stop_loss, plan_age_days,
+    ...) under `_carried_forward`. A column that's simply not part of one
+    source's shape will be NaN for 100% of that source's rows — that's
+    structural, not a data-quality problem, and drowns out the columns
+    where a value SHOULD have been there but wasn't computed.
+
+    Groups `df` by `source_col` (rows with a missing/NaN source value are
+    grouped under "unknown") and classifies each (column, group) pair:
+      - "structural": NaN/inf in every row of that group — the column
+        simply doesn't apply to this source. Informational, not a bug.
+      - "partial": NaN/inf in some but not all rows of that group — a
+        value that should exist for at least some rows in this source
+        didn't get computed. This is the case worth a WARNING.
+
+    Returns {"structural": {group: {col: n}}, "partial": {group: {col: n}},
+    "group_sizes": {group: n}}. Safe to call on an empty/None DataFrame or
+    a DataFrame lacking `source_col` (returns empty structure in both
+    cases — caller should fall back to find_invalid_columns() then).
+    """
+    empty = {"structural": {}, "partial": {}, "group_sizes": {}}
+    if df is None or df.empty or source_col not in df.columns:
+        return empty
+
+    structural: dict[str, dict[str, int]] = {}
+    partial: dict[str, dict[str, int]] = {}
+    group_sizes: dict[str, int] = {}
+
+    groups = df.groupby(df[source_col].fillna("unknown").astype(str), dropna=False)
+    for group_name, group_df in groups:
+        group_sizes[group_name] = len(group_df)
+        invalid = find_invalid_columns(group_df)
+        for col, n_invalid in invalid.items():
+            if n_invalid == len(group_df):
+                structural.setdefault(group_name, {})[col] = n_invalid
+            else:
+                partial.setdefault(group_name, {})[col] = n_invalid
+
+    return {"structural": structural, "partial": partial, "group_sizes": group_sizes}
+
+
+def sanitize_dataframe(df: pd.DataFrame, df_name: str = "dataframe", log_warnings: bool = False) -> pd.DataFrame:
     """
     Replace +inf/-inf with NaN, then NaN with None, across every numeric
     column of `df`, returning a new DataFrame safe to pass to
-    .to_dict("records") and then json.dumps/Supabase insert. Logs, per
-    affected column, the column name and the count of invalid values found
-    (BEFORE replacement) at WARNING level — so a bad upstream calculation
-    (e.g. a ratio divided by zero) shows up in the logs instead of quietly
-    becoming a null and being forgotten. Safe to call on an empty/None
-    DataFrame (no-op, returned unchanged).
+    .to_dict("records") and then json.dumps/Supabase insert. Safe to call
+    on an empty/None DataFrame (no-op, returned unchanged).
+
+    Pure by default (log_warnings=False) — this is a sanitization step,
+    not a diagnostic one. [2026-08-05] Every current producer except
+    pages/scanner.py's manual "Run Scan" path already calls
+    find_invalid_columns() itself and logs its own column-level summary
+    BEFORE calling this function (see utils/fo_scan.py, utils/
+    dore_options_scan.py, scheduler/scan_worker.py) — utils.dore_live_state
+    goes further and classifies each column as "structural" (expected,
+    doesn't apply to that row's source) vs "partial" (a genuine per-row
+    gap) before deciding what's even worth a WARNING. This function used
+    to ALSO log a flat per-column WARNING unconditionally on top of
+    whichever of those the producer already did, which was pure noise for
+    producers with their own summary and actively MISLEADING for
+    dore_live_state — its "structural" columns (NaN in 100% of one
+    source's rows by design) got re-logged here as if they were
+    unexplained anomalies, flooding the log with false alarms right next
+    to the one or two genuine "partial" gaps worth looking at.
+
+    Pass log_warnings=True only for a caller with NO diagnostic of its own
+    that still wants a log line per affected column (currently just
+    pages/scanner.py's manual Run Scan path — see that call site).
     """
     if df is None or df.empty:
         return df
 
-    invalid = find_invalid_columns(df)
-    for col, n_invalid in invalid.items():
-        n_inf = int(np.isinf(df[col]).sum())
-        n_nan = n_invalid - n_inf
-        logger.warning(
-            "[json_sanitize] %s.%s: %d inf/-inf, %d NaN value(s) — "
-            "replacing with null before JSON serialization",
-            df_name, col, n_inf, n_nan,
-        )
+    if log_warnings:
+        invalid = find_invalid_columns(df)
+        for col, n_invalid in invalid.items():
+            n_inf = int(np.isinf(df[col]).sum())
+            n_nan = n_invalid - n_inf
+            logger.warning(
+                "[json_sanitize] %s.%s: %d inf/-inf, %d NaN value(s) — "
+                "replacing with null before JSON serialization",
+                df_name, col, n_inf, n_nan,
+            )
 
     # astype(object) BEFORE assigning None is required, not cosmetic: a
     # float64 column can't hold Python None — pandas silently re-coerces
