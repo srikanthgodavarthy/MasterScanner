@@ -57,23 +57,52 @@ MasterScanner/
 │   ├── cci_master.py              # CCI-focused standalone view
 │   └── data_source_check.py       # Upstox vs. yfinance data comparison
 │
-├── utils/                          # ~60 modules — engines, data clients, persistence
+├── utils/                          # ~70 modules — engines, data clients, persistence
 │   ├── scanner_engine.py          # Legacy points-based scoring (Pine Script → Python origin)
 │   ├── scoring_core.py            # Core scoring/decision logic shared across engines
 │   ├── dore_engine.py             # DORE 2.0 — independent F&O Opportunity Engine
 │   ├── dore_settings.py           # All DORE thresholds/weights (nothing hardcoded in the engine)
 │   ├── dore_fo_screener.py        # DORE Stage 0 universe screener
+│   ├── dore_options_scan.py       # DORE two-stage integration — Stage 1 (Technical Plans):
+│   │                               # qualification/direction/strike selection, once per
+│   │                               # live_scanner cycle (~5min)
+│   ├── dore_live_state.py         # DORE two-stage integration — Stage 2 (Live Market
+│   │                               # Refresh): per-plan premium/quote refresh AND index-level
+│   │                               # (NIFTY/SENSEX/BANKNIFTY) DORE compute, every 60s — see
+│   │                               # its module docstring for the full Stage1/Stage2 split
+│   ├── dore_options_engine.py     # DORE options-specific scoring support
+│   ├── dore_options_persistence.py # Stage 1/2 plan persistence helpers
+│   ├── market_intelligence.py     # Market Intelligence compute — index snapshot/OI/EMA every
+│   │                               # cycle, regime/breadth classification; reads index-level
+│   │                               # DORE state from dore_live_state's snapshot rather than
+│   │                               # computing it itself (consolidated 2026-08)
 │   ├── pillar_engine.py           # Five Pillars ranking engine
 │   ├── portfolio_engine.py        # Multi-factor position exit-scoring
+│   ├── position_sizing.py         # Capital-aware lot/quantity sizing shared by DORE stages
 │   ├── backtest_engine.py         # Walk-forward signal generation + trade simulation
 │   ├── decision_engine.py         # Decision-centric data contracts (MarketContext, DecisionTrace, etc.)
 │   ├── upstox_client.py           # Upstox auth, instrument resolution, OHLCV/option-chain fetch
+│   ├── oi_snapshot_store.py       # OI/premium change-tracking state used by DORE's derivative stages
 │   ├── history_store.py           # Two-tier Parquet + Supabase OHLCV cache
-│   ├── supabase_client.py         # Supabase read/write helpers + schema
+│   ├── supabase_client.py         # Supabase read/write helpers, schema, and free-plan retention pruning
+│   ├── scan_state.py              # Snapshot/state persistence — see "Data Layer" below for the
+│   │                               # 2026-08-04 snapshot-vs-state table migration
+│   ├── snapshot_cache.py          # Process-wide, version-keyed st.cache_data layer in front of
+│   │                               # scan_state's Supabase reads, for Streamlit-side (page/fragment)
+│   │                               # callers only — NOT used by the scheduler or DORE producers,
+│   │                               # which need a genuinely fresh read every cycle
+│   ├── scan_health_monitor.py     # RAM/CPU self-protection for the background scan loops —
+│   │                               # skips a cycle rather than risk OOM on constrained hosts
+│   ├── scan_priority.py           # Cross-job coordination so scan loops don't contend mid-cycle
 │   ├── news_feed.py / news_sentiment.py  # RSS ingestion + Groq LLM sentiment tagging
 │   ├── openai_client.py / groq_client.py # LLM client helpers (fail-soft if unconfigured)
 │   ├── inprocess_scheduler.py     # Background scan loops as daemon threads (single-process hosts)
 │   └── system_state.py            # Scheduler ownership lock (see "Background Scheduling" below)
+│
+│   # fo_scan.py — legacy F&O pipeline, superseded by dore_options_scan.py /
+│   # dore_live_state.py above (2026-07-31). Its scheduler job is disabled
+│   # and its table dropped; kept in-tree for rollback reference only.
+│
 │
 ├── scheduler/
 │   └── scan_worker.py             # Standalone-process scheduler (preferred for multi-process hosts)
@@ -196,6 +225,14 @@ Every threshold and weight lives in `utils/dore_settings.py` — nothing is hard
 `dore_engine.py`. The architecture is documented as "frozen" (Revision 3) pending any
 future RFC-driven change.
 
+> **Terminology note:** the Stage 0–5b pipeline above is DORE's internal *scoring*
+> pipeline — how a single opportunity gets evaluated. It's a separate axis from the
+> "Stage 1 / Stage 2" split mentioned under "Background Scheduling" (`dore_options_scan.py`
+> vs. `dore_live_state.py`), which is about *when/how often* things get recomputed —
+> Stage 1 runs the full pipeline above once per ~5min Live Scanner cycle to pick
+> qualification/direction/strike; Stage 2 refreshes only market-dependent fields
+> (premiums, index-level state) every ~60s without re-running Stage 0–5b.
+
 ---
 
 ## 🧪 Backtest Methodology
@@ -224,12 +261,41 @@ future RFC-driven change.
 - **Supabase** — persistence for scan snapshots, backtest trade logs, portfolio state, OI/premium
   snapshot history, watchlists, etc. RLS policies gate access; configure via `SUPABASE_URL`/`SUPABASE_KEY`.
 
+  **Snapshot vs. state tables (2026-08-04 migration):** most sections (`market_intelligence`,
+  `dore_options_scan`, `dore_technical_plans`, `scan_snapshots`/archive/sector history) are
+  still append-only — one new row per producer cycle, pruned on a retention schedule (see
+  `utils/supabase_client.py`'s `prune_scan_snapshot_tables()`). `live_scanner` and
+  `dore_live_state` are the exception: they used to follow the same append-only pattern but
+  hit real Free-plan trouble — `live_scanner_snapshots` alone reached 1.22GB (~98% of the
+  whole database) in about 28 hours, since there's only ever one current record per stock
+  that matters, not a growing history of full-universe blobs. Both sections now UPSERT one
+  row per symbol into a fixed-size `*_state` table instead, keeping table size bounded by
+  symbol count rather than uptime — see `utils/scan_state.py`'s `_STATE_SECTIONS` for the
+  current mapping and full rationale.
+
+  **Read-side caching:** `utils/snapshot_cache.py` sits in front of `scan_state`'s reads for
+  Streamlit-side (page/fragment) callers, keyed on `(section, version)` rather than a fixed
+  TTL — the first caller in any browser tab to see a new version pays for the real Supabase
+  read, every other caller sharing that version gets the same cached object, and a genuine
+  version bump is never served stale. Deliberately **not** used by the scheduler or by DORE
+  Stage 1/2 producer code, which need a fresh read every cycle regardless of what any
+  browser tab has cached.
+
+  **Free-plan discipline:** the project runs on Supabase's Free plan (500 MB database cap),
+  so every insert-only table needs an explicit retention cap — see
+  `utils/supabase_client.py`'s `prune_scan_snapshot_tables()` and the `prune_snapshot_table`/
+  `prune_backtest_results` Postgres functions it calls. `backtest_results` in particular is
+  pruned by **run count** (most recent N `run_at` values), not row count, since a plain
+  row-count cap could silently truncate the older half of the oldest surviving run.
+
 ---
 
 ## ⏱️ Background Scheduling
 
-Market Intelligence (~30s), F&O Scan (~60s), and the Live Scanner (~5min, batched) run as
-background loops, coordinated by **one of two interchangeable mechanisms**:
+Market Intelligence (~180s), DORE Stage 2 / Live Market Refresh (~60s, includes index-level
+DORE compute for NIFTY/SENSEX/BANKNIFTY), and the Live Scanner (~5min, batched, with
+DORE Stage 1 Technical Plans produced once per Live Scanner cycle) run as background loops,
+coordinated by **one of two interchangeable mechanisms**:
 
 - `scheduler/scan_worker.py` — a standalone process (`python -m scheduler.scan_worker`),
   the preferred setup for hosts that can run a second process.
@@ -240,6 +306,18 @@ background loops, coordinated by **one of two interchangeable mechanisms**:
 Both coordinate through an ownership lock in `utils/system_state.py`, so accidentally
 running both in the same deployment is safe (one claims the lock, the other backs off)
 rather than silently double-executing every job.
+
+> **Note:** the legacy standalone F&O Scan job (`fo_scan.py`, ~60s) was superseded by the
+> DORE two-stage integration above (2026-07-31) and its scheduler entry is disabled.
+> Market Intelligence's cadence was slowed from an original 30s to 180s (2026-07-25) once
+> profiling showed the 30s interval was doing 3-4 full index OHLCV/OI fetches per call —
+> far more frequently than that data actually changes.
+
+**Self-protection:** both loop mechanisms check `utils/scan_health_monitor.py` before each
+cycle and skip it (rather than risk an OOM kill) if resident memory or CPU is over a
+configured threshold — see that module for current `RAM_WARN_MB`/`RAM_CRITICAL_MB` values,
+which are tuned for Streamlit Community Cloud's free-tier container ceiling and may need
+raising/lowering on a different host.
 
 ---
 
