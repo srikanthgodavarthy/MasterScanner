@@ -871,11 +871,6 @@ def stage1_trend_engine(inp: DOREInput, cfg: DORESettings) -> TrendResult:
                    else f"{inp.rel_volume:.2f}x"),
     ]
 
-    logger.info(
-        "[DORE:%s] Stage1\nTrend Score : %.1f\nIntent      : %s\n\n%s",
-        inp.symbol, trend_score, intent, _format_gate_block(checks),
-    )
-    logger.debug("[DORE:%s] Stage1 reasons=%s", inp.symbol, reasons)
     reasons += _gate_lines(checks)
     return TrendResult(trend_score=trend_score, directional_intent=intent, reasons=tuple(reasons))
 
@@ -1265,11 +1260,6 @@ def stage2_execution_engine(
                    else f"{inp.intraday_atr_expansion_pct:.1f}%"),
     ]
 
-    logger.info(
-        "[DORE:%s] Stage2\nExecution Score : %.1f\nState           : %s (intent=%s)\n\n%s",
-        inp.symbol, execution_score, state, directional_intent, _format_gate_block(checks),
-    )
-    logger.debug("[DORE:%s] Stage2 reasons=%s", inp.symbol, reasons)
     reasons += _gate_lines(checks)
     return ExecutionResult(execution_score=execution_score, execution_state=state, reasons=tuple(reasons),
                             components_used=execution_score_components_used)
@@ -1434,11 +1424,6 @@ def stage3_derivative_intelligence(
         (corridor_score,          cfg.w_deriv_corridor),
     ])
 
-    logger.info("[DORE:%s] Stage3 Derivative confidence=%.1f (oi=%.1f premium_quality=%.1f "
-                "premium_behavior=%.1f[%s] corridor=%.1f, dir=%s)",
-                inp.symbol, confidence, oi_structure_score, premium_quality_score,
-                premium_behavior_score, "strengthening" if premium_strengthening else "not confirmed",
-                corridor_score, direction)
     logger.debug("[DORE:%s] Stage3 reasons=%s", inp.symbol, reasons)
 
     return DerivativeResult(
@@ -1637,8 +1622,6 @@ def stage3_5_option_intelligence(
         warnings.append(f"IV Rank/Percentile={iv_level:.0f} >= hard-gate floor "
                          f"({cfg.oi_hard_gate_iv_rank:.0f}) — Extreme IV Crush Risk")
 
-    logger.info("[DORE:%s] Stage3.5 Option Intelligence score=%.1f valuation=%s coverage=%s hard_gate_pass=%s",
-                inp.symbol, score, valuation_status, expected_move_coverage, hard_gate_pass)
     logger.debug("[DORE:%s] Stage3.5 reasons=%s", inp.symbol, reasons)
 
     return OptionIntelligenceResult(
@@ -1729,8 +1712,6 @@ def stage4_risk_engine(
     if risk_quality < cfg.risk_quality_min:
         warnings.append(f"Risk Quality={risk_quality:.0f} below the {cfg.risk_quality_min:.0f} floor")
 
-    logger.info("[DORE:%s] Stage4 Risk quality=%.1f hard_gate_pass=%s (rr=%.2f)",
-                inp.symbol, risk_quality, hard_gate_pass, rr)
     return RiskResult(risk_quality=risk_quality, hard_gate_pass=hard_gate_pass,
                        reasons=tuple(reasons), warnings=tuple(warnings))
 
@@ -1814,15 +1795,12 @@ def stage5_opportunity_engine(
             reasons.append(f"Premium Behaviour gate: underlying/execution justify {recommendation}, but the "
                             f"option premium itself hasn't confirmed (not yet strengthening) — downgraded to "
                             f"{downgraded_to}")
-            logger.info("Stage5 Opportunity score=%.1f recommendation=%s (downgraded from %s by Premium "
-                        "Behaviour gate)", opportunity_score, downgraded_to, recommendation)
             recommendation = downgraded_to
 
         else:
             reasons.append(f"Composed from Directional Intent={directional_intent} x "
                            f"Execution State={execution_state} -> {recommendation}")
 
-    logger.info("Stage5 Opportunity score=%.1f recommendation=%s", opportunity_score, recommendation)
     return OpportunityResult(opportunity_score=opportunity_score, recommendation=recommendation,
                               reasons=tuple(reasons))
 
@@ -2273,14 +2251,6 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         warnings=warnings,
     )
 
-    logger.info(
-        "[DORE:%s] FINAL recommendation=%s opportunity_score=%.1f intent=%s(%.1f) "
-        "execution=%s(%.1f) derivative_confidence=%.1f option_intelligence=%.1f(%s) "
-        "risk_quality=%.1f hard_gate_pass=%s reversal_alert=%s",
-        inp.symbol, result.recommendation, result.opportunity_score, trend.directional_intent, trend.trend_score,
-        execution.execution_state, execution.execution_score, deriv.confidence, oi_intel.score,
-        oi_intel.valuation_status, risk.risk_quality, hard_gate_pass, reversal_alert.triggered,
-    )
     return result
 
 
