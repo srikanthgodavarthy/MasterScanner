@@ -3191,16 +3191,21 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
         return f'{_fmt_pct_chg(drift)}{entry_html}'
 
     def _fmt_plan_status(row):
-        # 2026-07-31: "Plan" column — is this recommendation actually a
-        # persisted/live entry, and since when. "—" (not "🟢 Active") when
+        # 2026-08-08: "Plan" column trimmed down to just the timestamp
+        # (was the full "🟢 Active (Xd · since ...)" badge) — moved to
+        # the last column, so it now reads as a lightweight "as of" note
+        # rather than a status badge. "—" (not a timestamp) when
         # persistence never ran this cycle (Supabase unavailable — see
         # enrich_trade_plans_with_persistence's fail-soft path in
-        # utils.dore_options_scan), so a missing badge always means
+        # utils.dore_options_scan), so a missing value always means
         # "unknown", never a false positive.
         label = row.get("plan_status_label")
         if label in (None, "") or (isinstance(label, float) and pd.isna(label)):
             return '<span style="color:var(--muted)">—</span>'
-        return f'<span style="color:#3fb950;font-size:12px;">{label}</span>'
+        import re
+        m = re.search(r"since\s+(.+?)\)\s*$", str(label))
+        ts = m.group(1) if m else str(label)
+        return f'<span style="color:var(--muted);font-size:12px;">{ts}</span>'
 
     def _fmt_source(row):
         # [2026-08-08, SG request] "PB" (Pre-Breakout squeeze-release
@@ -3222,14 +3227,29 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
     # still ranked/scored internally, just not surfaced here.
     if "confidence_score" in df.columns:
         df = df[pd.to_numeric(df["confidence_score"], errors="coerce") >= 65]
+
+    # [2026-08-08, SG request] Today-only — a row whose Plan was locked
+    # on a previous day (and just happens to still be OPEN) is carryover,
+    # not something this cycle's scan actually produced. Rows with no
+    # persisted plan at all are still kept: those ARE this cycle's fresh
+    # output, they just haven't been promoted to a locked entry yet.
+    # IST day boundary, matching utils.dore_options_persistence._today_str.
+    from datetime import timedelta
+    today_ist = (datetime.utcnow() + timedelta(hours=5, minutes=30)).date().isoformat()
+    if "plan_created_date" in df.columns:
+        created = df["plan_created_date"].astype(str)
+        df = df[(created == "") | (created == "None") | (created == "nan") | (created == today_ist)]
+
+    # [2026-08-08, SG request] Highest-confidence candidates first.
+    if "confidence_score" in df.columns:
         df = df.sort_values("confidence_score", ascending=False, kind="stable")
 
     if df.empty:
-        return '<div style="color:var(--muted);padding:8px;">No candidates with Confidence ≥ 65 this cycle.</div>'
+        return '<div style="color:var(--muted);padding:8px;">No candidates with Confidence ≥ 65 today.</div>'
 
-    headers = ["Symbol", "Direction", "Source", "Primary Strike", "Current Premium", "Plan", "Entry Zone",
-               "Stop Loss", "Target 1", "Target 2", "Saved Entry / Drift %", "POP %", "Confidence",
-               "Expiry", "DTE", "Exit Before Expiry"]
+    headers = ["Symbol", "Direction", "Source", "Primary Strike", "Confidence", "Current Premium",
+               "Entry Zone", "Stop Loss", "Target 1", "Target 2", "Saved Entry / Drift %", "POP %",
+               "Expiry", "DTE", "Plan"]
 
     rows_html = []
     for _, r in df.iterrows():
@@ -3250,19 +3270,18 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
             f'<td style="color:{dir_color};font-weight:700;">{_fmt_text(direction)}</td>',
             f'<td>{_fmt_source(r)}</td>',
             f'<td style="font-weight:700;">{strike_disp}</td>',
+            f'<td style="white-space:nowrap;"><span style="color:{conf_color};font-weight:700;">'
+            f'{conf_dot} {_fmt_score(conf)}</span></td>',
             f'<td>{_fmt_current_premium(r)}</td>',
-            f'<td>{_fmt_plan_status(r)}</td>',
             f'<td>{_fmt_entry_zone(r.get("entry_zone"))}</td>',
             f'<td>{_fmt_money(r.get("stop_loss"))}</td>',
             f'<td>{_fmt_money(r.get("target1"))}</td>',
             f'<td>{_fmt_money(r.get("target2"))}</td>',
             f'<td>{_fmt_drift(r)}</td>',
             f'<td>{_fmt_score(r.get("probability_of_profit"))}</td>',
-            f'<td style="white-space:nowrap;"><span style="color:{conf_color};font-weight:700;">'
-            f'{conf_dot} {_fmt_score(conf)}</span></td>',
             f'<td>{_fmt_text(r.get("expiry"))}</td>',
             f'<td>{_fmt_num(r.get("dte"))}</td>',
-            f'<td style="color:var(--muted);font-size:11px;">{_fmt_text(r.get("exit_before_expiry"))}</td>',
+            f'<td>{_fmt_plan_status(r)}</td>',
         ]
         rows_html.append(
             f'<tr style="background:{conf_color}14;border-left:3px solid {conf_color};">'
