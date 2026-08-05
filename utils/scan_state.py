@@ -130,13 +130,30 @@ _META_COLUMNS = "scan_id, created_at, status, version, row_count, error"
 _STATE_SECTIONS = {
     "live_scanner": {
         "table": "live_scanner_state",
-        "records_key": "data",     # payload["data"] is the record list
+        "records_key": "data",
         "id_field": "Stock",       # each record's identity field
+        "key_column": "symbol",    # DB column holding that identity value / on_conflict target
     },
     "dore_live_state": {
         "table": "dore_live_state",
         "records_key": "live_state",
-        "id_field": "symbol",
+        # [2026-08-05 redesign] Was just "symbol". A single underlying
+        # can have more than one live plan open at once — e.g. a CE and
+        # a PE, or two different strikes/expiries from Stage 1's plan
+        # evolving cycle to cycle — and utils/dore_live_state.py's own
+        # `_key()` helper already treats (symbol, direction, strike,
+        # expiry) as the real identity of a plan (that's exactly the
+        # tuple it uses to decide whether a carried-forward OPEN plan is
+        # "already covered" by this cycle's fresh technical read). Keying
+        # this table on "symbol" alone silently collided two distinct,
+        # real plans into one row — first as an overwrite (one plan's
+        # data replaced the other's), then as a field-merge (worse: an
+        # internally inconsistent Frankenstein row mixing one plan's
+        # strike/confidence with the other's stop_loss/target1). Matching
+        # dore_live_state.py's own identity tuple here removes the
+        # collision at the root instead of patching how it's resolved.
+        "id_field": ("symbol", "direction", "primary.strike", "expiry"),
+        "key_column": "row_key",   # composite key column, see migration in SCHEMA_SQL below
     },
 }
 
@@ -386,92 +403,82 @@ def _save_state(
     extra = {k: v for k, v in payload.items() if k != cfg["records_key"]}
 
     id_field = cfg["id_field"]
+    key_column = cfg["key_column"]
+    composite = isinstance(id_field, (tuple, list))
+
+    def _get_path(rec: dict, path: str):
+        """Dotted-path lookup, e.g. "primary.strike" -> rec["primary"]["strike"].
+        dore_live_state's records nest strike under "primary" (matching
+        how utils/dore_live_state.py and the Dashboard card both already
+        read it: primary = rec.get("primary") or {}; primary.get("strike"))."""
+        cur = rec
+        for part in path.split("."):
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(part)
+        return cur
+
     rows = []
     skipped = 0
     for rec in records:
-        symbol = rec.get(id_field)
-        if not symbol:
-            skipped += 1
-            continue
-        rows.append({"symbol": symbol, "record": rec, "scan_id": scan_id, "updated_at": "now()"})
+        if composite:
+            # First component (symbol) is mandatory; the rest may be
+            # legitimately missing (e.g. a carried-forward row before its
+            # strike is known) and still get a stable, distinct key.
+            parts = [_get_path(rec, f) for f in id_field]
+            if parts[0] in (None, ""):
+                skipped += 1
+                continue
+            key = "|".join("" if p is None else str(p) for p in parts)
+            row = {key_column: key, "symbol": rec.get(id_field[0]), "record": rec,
+                   "scan_id": scan_id, "updated_at": "now()"}
+        else:
+            val = rec.get(id_field)
+            if not val:
+                skipped += 1
+                continue
+            row = {key_column: val, "record": rec, "scan_id": scan_id, "updated_at": "now()"}
+        rows.append(row)
     if skipped:
         logger.warning("[%s] skipped %d record(s) with no %r key", section, skipped, id_field)
 
-    # [2026-08-05] De-dupe by symbol, keeping the LAST occurrence, before
-    # upserting. Postgres rejects an upsert batch that contains the same
-    # on_conflict key twice in one command ("ON CONFLICT DO UPDATE command
-    # cannot affect row a second time") — it can't apply two UPDATEs to
-    # the same row within a single statement. dore_live_state's
-    # "live_state" records list can legitimately contain the same symbol
-    # more than once in a cycle (e.g. a futures leg and an options leg
-    # both keyed by the underlying symbol), so this collapses to one row
-    # per symbol instead of letting the DB error out and the whole save
-    # silently fail. "Last occurrence wins" matches how a plain dict-merge
-    # of the same records would behave.
+    # De-dupe by key, merging rather than overwriting, before upserting.
+    # Postgres rejects an upsert batch that contains the same on_conflict
+    # key twice in one command ("ON CONFLICT DO UPDATE command cannot
+    # affect row a second time"), so a genuine same-key repeat within one
+    # cycle's record list still needs collapsing to one row. With the
+    # composite key above, a same-key repeat now means it's actually the
+    # SAME plan (identical symbol/direction/strike/expiry) appearing
+    # twice, not two different plans colliding — so merging non-null
+    # fields across the repeat is safe: keep whatever's already captured,
+    # fill in anything new, later occurrence's non-null values win on
+    # conflicts.
     before = len(rows)
     deduped: dict[str, dict] = {}
     for row in rows:
-        sym = row["symbol"]
-        if sym not in deduped:
-            deduped[sym] = row
+        k = row[key_column]
+        if k not in deduped:
+            deduped[k] = row
         else:
-            # Merge legs instead of overwriting: keep any non-null field
-            # already captured, fill in anything new from this occurrence.
-            # Later occurrence's non-null values take precedence on
-            # conflicts, matching prior "last occurrence wins" semantics
-            # but without dropping the fields only the earlier leg knew.
-            merged_record = dict(deduped[sym]["record"])
-            for k, v in row["record"].items():
+            merged_record = dict(deduped[k]["record"])
+            for kk, v in row["record"].items():
                 if v is not None:
-                    merged_record[k] = v
-            deduped[sym]["record"] = merged_record
-            deduped[sym]["scan_id"] = row["scan_id"]
-            deduped[sym]["updated_at"] = row["updated_at"]
+                    merged_record[kk] = v
+            deduped[k]["record"] = merged_record
+            deduped[k]["scan_id"] = row["scan_id"]
+            deduped[k]["updated_at"] = row["updated_at"]
     rows = list(deduped.values())
     if len(rows) != before:
         logger.warning(
-            "[%s] collapsed %d duplicate-symbol record(s) before upsert (%d -> %d rows)",
+            "[%s] collapsed %d exact-duplicate-key record(s) before upsert (%d -> %d rows)",
             section, before - len(rows), before, len(rows),
-        )
-        # [2026-08-05] Verify the merge above actually kept both legs'
-        # fields instead of one overwriting the other. FUTURES_ONLY_FIELDS
-        # / OPTIONS_ONLY_FIELDS are the field names each leg alone
-        # contributes (per the comment above); a row missing either set
-        # entirely means merge fell back to one leg only, for that symbol,
-        # which is the exact failure mode this fix targets.
-        futures_only = {"conviction", "target_price", "breakout_score",
-                         "pullback_score", "continuation_score",
-                         "qualification_score", "expected_move"}
-        options_only = {"entry_locked", "saved_stop_loss", "saved_target1",
-                         "saved_target2", "drift_pct", "plan_age_days"}
-        both_present = 0
-        futures_only_present = 0
-        options_only_present = 0
-        neither_present = 0
-        for row in rows:
-            rec = row.get("record") or {}
-            has_futures = any(rec.get(f) is not None for f in futures_only)
-            has_options = any(rec.get(f) is not None for f in options_only)
-            if has_futures and has_options:
-                both_present += 1
-            elif has_futures:
-                futures_only_present += 1
-            elif has_options:
-                options_only_present += 1
-            else:
-                neither_present += 1
-        logger.warning(
-            "[%s] post-merge field coverage: %d row(s) with BOTH legs, "
-            "%d futures-only, %d options-only, %d neither",
-            section, both_present, futures_only_present,
-            options_only_present, neither_present,
         )
 
     try:
         from utils.supabase_client import _execute_with_retry
         if rows:
             _execute_with_retry(
-                client.table(cfg["table"]).upsert(rows, on_conflict="symbol")
+                client.table(cfg["table"]).upsert(rows, on_conflict=key_column)
             )
         _execute_with_retry(
             client.table("state_meta").upsert(
@@ -698,13 +705,39 @@ CREATE TABLE IF NOT EXISTS live_scanner_state (
 );
 CREATE INDEX IF NOT EXISTS idx_live_scanner_state_updated_at ON live_scanner_state(updated_at);
 
+-- [2026-08-05 redesign] dore_live_state was keyed on `symbol` alone,
+-- which silently collided distinct plans on the same underlying (a CE
+-- and a PE, or two different strikes/expiries) into one row. Now keyed
+-- on `row_key`, a "|"-joined (symbol, direction, strike, expiry) string
+-- matching utils/dore_live_state.py's own `_key()` identity tuple —
+-- see the 2026-08-05 note on _STATE_SECTIONS in this file for the full
+-- investigation. `symbol` is kept as a plain (non-unique, indexed)
+-- column for readability/future filtering, no longer the key.
+--
+-- MIGRATION for an already-deployed table (this CREATE TABLE below only
+-- fires on a fresh deploy where the table doesn't exist yet):
+--
+--   ALTER TABLE dore_live_state DROP CONSTRAINT dore_live_state_pkey;
+--   ALTER TABLE dore_live_state ADD COLUMN IF NOT EXISTS row_key text;
+--   -- Old rows only ever held one plan per symbol under the previous
+--   -- schema (that was the bug), so there's nothing worth backfilling —
+--   -- the next 60s dore_live_state refresh cycle repopulates the whole
+--   -- table under the new key anyway. Truncating avoids stale rows
+--   -- sitting alongside fresh ones with a NULL row_key.
+--   TRUNCATE dore_live_state;
+--   ALTER TABLE dore_live_state ALTER COLUMN row_key SET NOT NULL;
+--   ALTER TABLE dore_live_state ADD PRIMARY KEY (row_key);
+--   CREATE INDEX IF NOT EXISTS idx_dore_live_state_symbol ON dore_live_state(symbol);
+--
 CREATE TABLE IF NOT EXISTS dore_live_state (
-    symbol     text        PRIMARY KEY,
+    row_key    text        PRIMARY KEY,
+    symbol     text        NOT NULL,
     record     jsonb       NOT NULL,
     scan_id    uuid,
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_dore_live_state_updated_at ON dore_live_state(updated_at);
+CREATE INDEX IF NOT EXISTS idx_dore_live_state_symbol ON dore_live_state(symbol);
 
 -- state_meta holds the one-row-per-section wrapper (scan_id/status/
 -- error/row_count) plus any "extra" sibling fields that used to live

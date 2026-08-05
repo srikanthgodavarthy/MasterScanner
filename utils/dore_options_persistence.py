@@ -175,6 +175,16 @@ class DoreOptionsPlan:
     closed_at:           str   = ""
     closed_reason:       str   = ""
 
+    # [2026-08-05, SG request: "new plan on the same symbol only after
+    # hitting T1"] Timestamp the first time this contract's live premium
+    # reached target1_locked — empty until then, set once and never
+    # cleared (a historical fact about this plan's life, not a live
+    # state). Read by _has_blocking_open_plan_on_symbol() below to decide
+    # whether a fresh contract on the SAME underlying is allowed to mint
+    # while this one is still open. Naming matches setup_plans'
+    # t1_hit_at column (utils/setup_persistence.py) for consistency.
+    t1_hit_at:            str   = ""
+
     # [2026-08-08, SG request] "PB" (Pre-Breakout squeeze-release
     # exemption) or "LS" (ordinary Live Scanner ranking) — captured
     # once, at mint time, from the OptionTradePlan.source that produced
@@ -190,6 +200,9 @@ class DoreOptionsPlan:
 
     def is_open(self) -> bool:
         return _sval(self.status) == DoreOptionsPlanStatus.OPEN.value
+
+    def is_t1_hit(self) -> bool:
+        return bool(self.t1_hit_at)
 
     def to_db_dict(self) -> dict:
         return {
@@ -210,6 +223,7 @@ class DoreOptionsPlan:
             "status":              _sval(self.status),
             "closed_at":           self.closed_at or None,
             "closed_reason":       self.closed_reason,
+            "t1_hit_at":           self.t1_hit_at or None,
             # NOT NULL DEFAULT '' in the DB (unlike closed_at/expiry
             # etc. above, which are nullable) — must send "" for an
             # unset source, never None, or upsert_dore_options_plans_
@@ -315,6 +329,25 @@ def _plan_status_label(days_active: int, created_date: str, just_minted: bool, c
     return f"🟢 Active ({days_active}d · since {since})"
 
 
+def _has_blocking_open_plan_on_symbol(symbol: str, this_key: str, existing_plans: dict) -> bool:
+    """[2026-08-05, SG request: "new plan on the same symbol only after
+    hitting T1"] True if `symbol` already has another OPEN contract
+    that hasn't reached target1_locked yet. Only blocks MINTING a new
+    contract — an already-open plan (the `if existing...` branch in
+    enrich_trade_plans_with_persistence) never goes through this check,
+    it just keeps refreshing. `this_key` is excluded so a plan doesn't
+    block its own (re-)mint after being closed and reopened same-day."""
+    sym = symbol.upper().strip()
+    for key, plan in existing_plans.items():
+        if key == this_key:
+            continue
+        if plan.symbol.upper().strip() != sym:
+            continue
+        if plan.is_open() and not plan.is_t1_hit():
+            return True
+    return False
+
+
 def enrich_trade_plans_with_persistence(
     plans: list,
     existing_plans: dict,
@@ -377,6 +410,17 @@ def enrich_trade_plans_with_persistence(
                     enriched_rows.append(row)   # still shown as a Live Scan recommendation, just not tracked
                     continue
 
+                # [2026-08-05, SG request] Don't stack a second live
+                # contract on a symbol whose existing open plan hasn't
+                # even reached T1 yet. Still shown as an ordinary Live
+                # Scan recommendation (row unchanged, not tracked) —
+                # same treatment as the confidence-floor reject above,
+                # just a different reason.
+                if _has_blocking_open_plan_on_symbol(symbol, key, existing_plans):
+                    row["blocked_reason"] = "Existing open plan on this symbol hasn't hit T1 yet"
+                    enriched_rows.append(row)
+                    continue
+
                 # Fresh contract (or the prior entry for this exact key
                 # had already been closed) — mint + lock a new entry at
                 # THIS tick's primary premium.
@@ -399,6 +443,16 @@ def enrich_trade_plans_with_persistence(
                 just_minted = True
 
             drift = _drift_pct(current_premium, locked.entry_locked)
+
+            # [2026-08-05, SG request] Detect T1 the moment it's reached
+            # and freeze it — sticky, never cleared even if premium later
+            # falls back below target1_locked. This is what
+            # _has_blocking_open_plan_on_symbol() checks before allowing
+            # a new contract to mint on the same symbol.
+            if (not locked.t1_hit_at and current_premium is not None
+                    and locked.target1_locked is not None
+                    and current_premium >= locked.target1_locked):
+                locked.t1_hit_at = _now_iso()
 
             # [2026-08-04, SG request] Age-based auto-close — checked
             # here (not only in the not-reproduced cleanup pass below)
@@ -442,6 +496,7 @@ def enrich_trade_plans_with_persistence(
             row["saved_target1"]     = locked.target1_locked
             row["saved_target2"]     = locked.target2_locked
             row["drift_pct"]         = drift
+            row["t1_hit_at"]         = locked.t1_hit_at or None
             row["plan_created_at"]   = locked.created_at
             row["plan_created_date"] = locked.created_date
             row["plan_age_days"]     = _compute_days_active(locked.created_date)

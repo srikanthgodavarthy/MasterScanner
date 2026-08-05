@@ -1470,6 +1470,7 @@ def _dore_options_plan_from_row(row: dict) -> "object":
         closed_at            = str(row.get("closed_at", "") or ""),
         closed_reason        = row.get("closed_reason", "") or "",
         source               = row.get("source", "") or "",
+        t1_hit_at            = str(row.get("t1_hit_at", "") or ""),
     )
 
 
@@ -2280,6 +2281,13 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
     closed_at                    timestamptz,
     closed_reason                text        NOT NULL DEFAULT '',
 
+    -- [2026-08-05, SG request: "new plan on the same symbol only after
+    -- hitting T1"] First time this contract's live premium reached
+    -- target1_locked — null until then, set once, never cleared. See
+    -- utils/dore_options_persistence.py's DoreOptionsPlan.t1_hit_at /
+    -- _has_blocking_open_plan_on_symbol() docstrings.
+    t1_hit_at                    timestamptz,
+
     -- 2026-08-08: "PB" (Pre-Breakout squeeze-release exemption) or "LS"
     -- (ordinary Live Scanner ranking) — captured once at mint time from
     -- OptionTradePlan.source. See utils/dore_options_persistence.py's
@@ -2314,6 +2322,15 @@ ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS last_seen_at   timestamp
 #    already exists and predates this change.
 DORE_OPTIONS_PLANS_SOURCE_MIGRATION_SQL = """
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT '';
+"""
+
+# ── MIGRATION for an EXISTING dore_options_plans table created before
+#    the 2026-08-05 T1 gating change ("new plan on the same symbol only
+#    after hitting T1"). Safe to re-run. Run this in Supabase SQL
+#    Editor if dore_options_plans already exists and predates this
+#    change.
+DORE_OPTIONS_PLANS_T1_HIT_MIGRATION_SQL = """
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS t1_hit_at timestamptz;
 """
 
 
