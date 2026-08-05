@@ -1,3 +1,11 @@
+starlette<1.0  # PINNED 2026-08-05: Streamlit Cloud resolved starlette==1.4.0
+                # (floating, no prior constraint), whose GZipResponder no longer
+                # matches the signature Streamlit 1.61.0's bundled
+                # starlette_gzip_middleware.py calls -> TypeError: missing
+                # 'thread_minimum_size' -> app 500s on every health check before
+                # any app code runs. Constrain below the breaking major bump.
+                # Re-test before removing this pin.
+
 streamlit>=1.35.0
 yfinance==0.2.66  # PINNED 2026-07-15: was >=0.2.40 (floating), which silently
                   # resolved to 1.5.1 on the last reinstall and coincided with
