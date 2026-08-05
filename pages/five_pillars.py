@@ -657,12 +657,12 @@ def render(settings: dict | None = None):
     if "scan_df" not in st.session_state:
         from utils.supabase_client import _is_available
         if _is_available():
-            from utils.scan_state import load_snapshot_payload
-            _snap = load_snapshot_payload("live_scanner")
+            from utils.snapshot_cache import get_snapshot, get_snapshot_df
+            _snap = get_snapshot("live_scanner")
             if _snap:
-                _records = (_snap.get("payload") or {}).get("data", [])
-                if _records:
-                    st.session_state["scan_df"]      = pd.DataFrame(_records)
+                _df = get_snapshot_df("live_scanner")
+                if not _df.empty:
+                    st.session_state["scan_df"]      = _df
                     st.session_state["last_scan_df"] = st.session_state["scan_df"]
                     _created_at = _snap.get("created_at", "")
                     if _created_at:

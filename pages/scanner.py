@@ -3493,19 +3493,22 @@ def _dore_options_panel():
     scheduler loop — this only removes what pages/scanner.py reads and
     renders from them.
     """
-    from utils.scan_state import load_snapshot_meta, load_snapshot_payload
+    from utils.scan_state import load_snapshot_meta
+    from utils.snapshot_cache import get_snapshot
 
     st.markdown('<div class="ti-panel-title" style="margin-top:0.6rem;">🎯 DORE OPTIONS ENGINE</div>',
                 unsafe_allow_html=True)
 
     # ── DORE Live State (Stage 2) — same cheap meta-then-payload poll
-    # pattern as the rest of this page's snapshot panels. Falls back to
-    # the Stage 1 (Technical) snapshot when Stage 2 hasn't produced
-    # anything yet (e.g. right after a deploy, before its first 60s
-    # tick) so the page shows the technical read instead of nothing.
+    # pattern as the rest of this page's snapshot panels, now backed by
+    # the shared version-keyed cache (utils/snapshot_cache.py) instead of
+    # a raw load_snapshot_payload call. Falls back to the Stage 1
+    # (Technical) snapshot when Stage 2 hasn't produced anything yet
+    # (e.g. right after a deploy, before its first 60s tick) so the page
+    # shows the technical read instead of nothing.
     dore_opt_meta = load_snapshot_meta("dore_live_state")
     if dore_opt_meta is not None and dore_opt_meta.get("version") != st.session_state.get("dore_live_state_version"):
-        dore_opt_full = load_snapshot_payload("dore_live_state")
+        dore_opt_full = get_snapshot("dore_live_state")
         if dore_opt_full is not None:
             st.session_state["dore_live_state_version"] = dore_opt_full.get("version")
             st.session_state["dore_live_state_payload"] = dore_opt_full.get("payload") or {}
@@ -3518,7 +3521,7 @@ def _dore_options_panel():
     if dore_opt_df.empty:
         dore_tech_meta = load_snapshot_meta("dore_technical_plans")
         if dore_tech_meta is not None and dore_tech_meta.get("version") != st.session_state.get("dore_technical_plans_version"):
-            dore_tech_full = load_snapshot_payload("dore_technical_plans")
+            dore_tech_full = get_snapshot("dore_technical_plans")
             if dore_tech_full is not None:
                 st.session_state["dore_technical_plans_version"] = dore_tech_full.get("version")
                 st.session_state["dore_technical_plans_payload"] = dore_tech_full.get("payload") or {}
@@ -3581,12 +3584,12 @@ def render(settings: dict | None = None):
     # session_state); a manual Run Scan afterwards always overwrites
     # scan_df/scan_time itself regardless of what this loaded.
     if "scan_df" not in st.session_state and supabase_ok:
-        from utils.scan_state import load_snapshot_payload
-        _snap = load_snapshot_payload("live_scanner")
+        from utils.snapshot_cache import get_snapshot, get_snapshot_df
+        _snap = get_snapshot("live_scanner")
         if _snap:
-            _records = (_snap.get("payload") or {}).get("data", [])
-            if _records:
-                st.session_state["scan_df"]      = pd.DataFrame(_records)
+            _df = get_snapshot_df("live_scanner")
+            if not _df.empty:
+                st.session_state["scan_df"]      = _df
                 st.session_state["last_scan_df"] = st.session_state["scan_df"]
                 _created_at = _snap.get("created_at", "")
                 st.session_state["scan_time"] = (

@@ -2651,7 +2651,8 @@ _MARKET_INTEL_REFRESH_SECS = 180  # [2026-07-25 ops fix] was 30 — matches the
 
 @st.fragment(run_every=_MARKET_INTEL_REFRESH_SECS)
 def _market_intelligence_fragment():
-    from utils.scan_state import load_snapshot_meta, load_snapshot_payload
+    from utils.scan_state import load_snapshot_meta
+    from utils.snapshot_cache import get_snapshot
 
     meta = load_snapshot_meta("market_intelligence")
     if meta is None:
@@ -2660,7 +2661,10 @@ def _market_intelligence_fragment():
         return
 
     if meta.get("version") != st.session_state.get("mi_snapshot_version"):
-        full = load_snapshot_payload("market_intelligence")
+        # get_snapshot() re-checks meta internally and is version-cached
+        # process-wide, so if another open tab already fetched this exact
+        # version this is a cache hit, not a second Supabase read.
+        full = get_snapshot("market_intelligence")
         if full is not None:
             st.session_state["mi_snapshot_version"] = full.get("version")
             st.session_state["mi_snapshot_payload"] = full.get("payload") or {}
@@ -3054,14 +3058,18 @@ _DASH_AUTOREFRESH_SECS = 60  # [2026-07-25 ops fix] was 30. live_scanner only
 
 @st.fragment(run_every=_DASH_AUTOREFRESH_SECS)
 def _dash_scan_autorefresh():
-    from utils.scan_state import load_snapshot_meta, load_snapshot_payload
+    from utils.scan_state import load_snapshot_meta
+    from utils.snapshot_cache import get_snapshot, get_snapshot_df
 
     meta = load_snapshot_meta("live_scanner")
     if meta and meta.get("version") != st.session_state.get("dash_scan_version"):
-        full = load_snapshot_payload("live_scanner")
+        # get_snapshot_df() shares both the raw payload fetch *and* the
+        # pd.DataFrame() construction with every other tab/page reading
+        # this same version — see utils/snapshot_cache.py.
+        df = get_snapshot_df("live_scanner")
+        full = get_snapshot("live_scanner")
         if full:
-            _records = (full.get("payload") or {}).get("data", [])
-            st.session_state["dash_scan_df"]      = pd.DataFrame(_records)
+            st.session_state["dash_scan_df"]      = df
             st.session_state["dash_scan_run_at"]  = full.get("created_at", "")
             st.session_state["dash_scan_version"] = full.get("version")
             # Unscoped rerun (see 2026-07-25 note above) — a scoped
@@ -3112,10 +3120,10 @@ def render(settings: dict | None = None):
         _refresh = st.button("🔄 Refresh", key="btn_dash_refresh",
                               help="Reload the latest completed scan from Supabase")
     if _refresh or "dash_scan_df" not in st.session_state:
-        from utils.scan_state import load_snapshot_payload
-        _full = load_snapshot_payload("live_scanner")
+        from utils.snapshot_cache import get_snapshot, get_snapshot_df
+        _full = get_snapshot("live_scanner")
         if _full:
-            st.session_state["dash_scan_df"]      = pd.DataFrame((_full.get("payload") or {}).get("data", []))
+            st.session_state["dash_scan_df"]      = get_snapshot_df("live_scanner")
             st.session_state["dash_scan_run_at"]  = _full.get("created_at", "")
             st.session_state["dash_scan_version"] = _full.get("version")
         else:

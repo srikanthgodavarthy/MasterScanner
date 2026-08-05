@@ -463,10 +463,10 @@ def render(settings: dict | None = None) -> None:
                               help="Reload the latest completed scan from Supabase")
 
     if _refresh or "dash_scan_df" not in st.session_state:
-        from utils.scan_state import load_snapshot_payload
-        _full = load_snapshot_payload("live_scanner")
+        from utils.snapshot_cache import get_snapshot, get_snapshot_df
+        _full = get_snapshot("live_scanner")
         if _full:
-            st.session_state["dash_scan_df"] = pd.DataFrame((_full.get("payload") or {}).get("data", []))
+            st.session_state["dash_scan_df"] = get_snapshot_df("live_scanner")
             st.session_state["dash_scan_run_at"] = _full.get("created_at", "")
             st.session_state["dash_scan_version"] = _full.get("version")
         else:
