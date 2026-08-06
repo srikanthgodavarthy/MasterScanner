@@ -1502,6 +1502,36 @@ def load_open_dore_options_plans() -> dict:
         return {}
 
 
+def load_recently_closed_dore_options_plans(limit: int = 15) -> pd.DataFrame:
+    """[Sprint 1 — Portfolio Admission UI, 2026-08-05] Most recently
+    CLOSED DORE Options plans, newest first — feeds the "Recently
+    Retired / Closed" panel under the Active Plans tab so a user can
+    see *why* a plan left the book (Superseded by a stronger same-
+    symbol/direction setup, Retired to make room in a full portfolio,
+    Expired, or aged out) rather than just watching it silently
+    disappear from the Active list. Ordered by closed_at (falls back to
+    created_date for any legacy row without one) since that's when the
+    plan actually left the book, not when it was originally minted."""
+    client = get_client()
+    if client is None:
+        return pd.DataFrame()
+    try:
+        resp = (
+            client.table("dore_options_plans")
+            .select("*")
+            .eq("status", "CLOSED")
+            .order("closed_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        if not resp.data:
+            return pd.DataFrame()
+        return pd.DataFrame(resp.data)
+    except Exception as exc:
+        logger.error("load_recently_closed_dore_options_plans failed: %s", exc)
+        return pd.DataFrame()
+
+
 def load_all_dore_options_plans(limit: int = 500) -> pd.DataFrame:
     """All DORE Options locked entries (any status), for history/audit views."""
     client = get_client()

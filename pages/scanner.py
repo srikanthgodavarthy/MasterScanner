@@ -3442,6 +3442,73 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
     )
 
 
+def _dore_options_closed_plans_table_html(df: pd.DataFrame) -> str:
+    """[Sprint 1 — Portfolio Admission UI, 2026-08-05] "Recently Retired /
+    Closed" panel under the Active Plans tab. Surfaces closed_reason for
+    each of the most recently CLOSED plans so the new Duplicate
+    Suppression / Portfolio Manager admission logic in
+    utils.dore_options_persistence is visible rather than silent —
+    "Superseded by stronger same-symbol/direction setup" and "Retired —
+    portfolio full, replaced by stronger candidate" are the two new
+    reasons from that logic; "Expired" and "Max holding period" are the
+    pre-existing auto-close reasons, shown here too for one consistent
+    audit trail rather than splitting it across two tables."""
+    def _fmt_text(v):
+        return v if v not in (None, "") and pd.notna(v) else "—"
+
+    def _fmt_money(v):
+        return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
+
+    def _fmt_closed_at(v):
+        if v in (None, "") or pd.isna(v):
+            return "—"
+        try:
+            return pd.to_datetime(v).tz_convert(_IST).strftime("%d %b, %H:%M")
+        except Exception:
+            return _fmt_text(v)
+
+    def _reason_badge(reason: str) -> str:
+        r = reason or ""
+        if r.startswith("Superseded"):
+            color, bg, border = "#58a6ff", "rgba(88,166,255,0.10)", "rgba(88,166,255,0.28)"
+        elif r.startswith("Retired"):
+            color, bg, border = "#d29922", "rgba(210,153,34,0.12)", "rgba(210,153,34,0.3)"
+        elif r.startswith("Expired") or r.startswith("Max holding"):
+            color, bg, border = "#8b949e", "rgba(139,148,158,0.10)", "rgba(139,148,158,0.28)"
+        else:
+            color, bg, border = "#8b949e", "transparent", "transparent"
+        return (f'<span style="color:{color};font-size:12px;background:{bg};'
+                f'border:1px solid {border};border-radius:4px;padding:2px 8px;">{_fmt_text(r)}</span>')
+
+    if df.empty:
+        return '<div style="color:var(--muted);padding:8px;">No plans have closed yet.</div>'
+
+    headers = ["Symbol", "Direction", "Strike", "Expiry", "Confidence at Entry", "Closed", "Reason"]
+    rows_html = []
+    for _, r in df.iterrows():
+        direction = r.get("direction", "")
+        dir_color = "#3fb950" if direction == "CE" else "#f85149" if direction == "PE" else "#8b949e"
+        conf = r.get("confidence_at_entry")
+        conf_str = f"{conf:.0f}" if conf not in (None, "") and pd.notna(conf) else "—"
+        cells = [
+            f'<td style="font-weight:700;">{_fmt_text(r.get("symbol"))}</td>',
+            f'<td style="color:{dir_color};font-weight:700;">{_fmt_text(direction)}</td>',
+            f'<td>{_fmt_money(r.get("strike"))}</td>',
+            f'<td>{_fmt_text(r.get("expiry"))}</td>',
+            f'<td>{conf_str}</td>',
+            f'<td>{_fmt_closed_at(r.get("closed_at"))}</td>',
+            f'<td>{_reason_badge(r.get("closed_reason", ""))}</td>',
+        ]
+        rows_html.append(f'<tr class="ap-row">{"".join(cells)}</tr>')
+
+    header_html = "".join(f'<th>{h}</th>' for h in headers)
+    return (
+        '<div style="overflow-x:auto;">'
+        f'<table class="ap-table"><thead><tr>{header_html}</tr></thead>'
+        f'<tbody>{"".join(rows_html)}</tbody></table></div>'
+    )
+
+
 def _render_dore_options_active_plans_tab() -> None:
     """[2026-08-01] DORE Options Engine — Active Plans tab. Reads every
     currently-OPEN DoreOptionsPlan straight from Supabase
@@ -3476,6 +3543,21 @@ def _render_dore_options_active_plans_tab() -> None:
     st.caption(f"{len(rows_df)} open plan(s) — independent of whether this cycle's live scan "
                "reproduced the contract. Auto-closes once the contract's own expiry passes.")
     st.markdown(_dore_options_active_plans_table_html(rows_df), unsafe_allow_html=True)
+
+    # [Sprint 1 — Portfolio Admission UI, 2026-08-05] Recently Retired /
+    # Closed panel, so Duplicate Suppression / Portfolio Manager
+    # retirements (and the pre-existing Expired / Max-holding-period
+    # auto-closes) are visible instead of a plan just quietly vanishing
+    # from the Active list above. Own try/except + _is_available guard
+    # since this is a secondary panel — a failure here shouldn't take
+    # down the Active Plans table itself.
+    try:
+        from utils.supabase_client import load_recently_closed_dore_options_plans
+        with st.expander("🗂️ Recently Retired / Closed Plans", expanded=False):
+            closed_df = load_recently_closed_dore_options_plans(limit=15)
+            st.markdown(_dore_options_closed_plans_table_html(closed_df), unsafe_allow_html=True)
+    except Exception:
+        logger.exception("[scanner] recently-closed DORE Options panel failed to render (non-fatal)")
 
 
 _FO_SCAN_REFRESH_SECS = 60  # [2026-07-25 ops fix] was 30 — matches the producer's

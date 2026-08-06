@@ -126,6 +126,25 @@ MAX_DORE_OPTIONS_PLAN_AGE_DAYS = 2
 # which is what decides when a tracked plan stops being tracked.
 MIN_CONFIDENCE_TO_ACTIVATE = 70
 
+# [Sprint 1 — Portfolio Admission, 2026-08-05] Hard cap on simultaneously
+# OPEN DORE Options plans. Once at cap, a new candidate can still mint —
+# but only by retiring the single weakest OPEN plan (see
+# _find_weakest_open_plan()), and only when it clears
+# MATERIALLY_BETTER_MARGIN over that plan's confidence_at_entry. This is
+# what keeps the book from growing without bound and concentrates
+# capital in the strongest live ideas instead.
+MAX_ACTIVE_DORE_OPTIONS_PLANS = 10
+
+# Minimum confidence_score edge a new candidate must clear over an
+# existing OPEN plan's confidence_at_entry before it's allowed to
+# either (a) supersede a same-symbol/same-direction plan that would
+# otherwise block minting (see _blocking_open_plan()), or (b) bump the
+# portfolio's weakest plan when the book is already at
+# MAX_ACTIVE_DORE_OPTIONS_PLANS. A same-or-marginal read isn't worth
+# closing a live plan for — this is the "materially better" bar from
+# both the Duplicate Suppression and Quality Ranking asks.
+MATERIALLY_BETTER_MARGIN = 15
+
 
 class DoreOptionsPlanStatus(str, Enum):
     OPEN   = "OPEN"     # entry is locked and still being tracked
@@ -179,7 +198,7 @@ class DoreOptionsPlan:
     # hitting T1"] Timestamp the first time this contract's live premium
     # reached target1_locked — empty until then, set once and never
     # cleared (a historical fact about this plan's life, not a live
-    # state). Read by _has_blocking_open_plan_on_symbol() below to decide
+    # state). Read by _blocking_open_plan() below to decide
     # whether a fresh contract on the SAME underlying is allowed to mint
     # while this one is still open. Naming matches setup_plans'
     # t1_hit_at column (utils/setup_persistence.py) for consistency.
@@ -329,23 +348,69 @@ def _plan_status_label(days_active: int, created_date: str, just_minted: bool, c
     return f"🟢 Active ({days_active}d · since {since})"
 
 
-def _has_blocking_open_plan_on_symbol(symbol: str, this_key: str, existing_plans: dict) -> bool:
+def _blocking_open_plan(symbol: str, direction: str, this_key: str,
+                         existing_plans: dict) -> Optional[DoreOptionsPlan]:
     """[2026-08-05, SG request: "new plan on the same symbol only after
-    hitting T1"] True if `symbol` already has another OPEN contract
-    that hasn't reached target1_locked yet. Only blocks MINTING a new
-    contract — an already-open plan (the `if existing...` branch in
-    enrich_trade_plans_with_persistence) never goes through this check,
-    it just keeps refreshing. `this_key` is excluded so a plan doesn't
-    block its own (re-)mint after being closed and reopened same-day."""
+    hitting T1"; extended Sprint 1 — Duplicate Suppression] Returns the
+    OPEN, not-yet-T1 plan (if any) that would block minting a new
+    contract on this exact (symbol, direction) pair — i.e. the same
+    underlying AND the same CE/PE side. A CE and a PE on the same
+    symbol are opposite bets, not duplicates, so they no longer block
+    each other (this used to be symbol-only).
+
+    Only blocks MINTING a new contract — an already-open plan (the `if
+    existing...` branch in enrich_trade_plans_with_persistence) never
+    goes through this check, it just keeps refreshing. `this_key` is
+    excluded so a plan doesn't block its own (re-)mint after being
+    closed and reopened same-day.
+
+    Returns the blocking DoreOptionsPlan itself (not just a bool) so
+    the caller can compare its confidence_at_entry against the new
+    candidate's confidence_score and decide whether the new one is
+    "materially better" and should supersede it (see
+    MATERIALLY_BETTER_MARGIN) rather than being unconditionally
+    rejected."""
     sym = symbol.upper().strip()
     for key, plan in existing_plans.items():
         if key == this_key:
             continue
         if plan.symbol.upper().strip() != sym:
             continue
+        if plan.direction != direction:
+            continue
         if plan.is_open() and not plan.is_t1_hit():
-            return True
-    return False
+            return plan
+    return None
+
+
+def _find_weakest_open_plan(existing_plans: dict) -> Optional[tuple[str, DoreOptionsPlan]]:
+    """[Sprint 1 — Portfolio Manager / Quality Ranking, 2026-08-05]
+    Among every currently-OPEN plan, returns the (key, plan) with the
+    lowest confidence_at_entry — the single weakest live idea, and
+    therefore the one a materially-better new candidate is allowed to
+    retire when the book is already at MAX_ACTIVE_DORE_OPTIONS_PLANS.
+    Returns None if nothing is open. Ties broken by created_date (older
+    plan is considered weaker, since it's had longer to prove itself)."""
+    weakest_key: Optional[str] = None
+    weakest_plan: Optional[DoreOptionsPlan] = None
+    for key, plan in existing_plans.items():
+        if not plan.is_open():
+            continue
+        if weakest_plan is None:
+            weakest_key, weakest_plan = key, plan
+            continue
+        if plan.confidence_at_entry < weakest_plan.confidence_at_entry:
+            weakest_key, weakest_plan = key, plan
+        elif (plan.confidence_at_entry == weakest_plan.confidence_at_entry
+                and plan.created_date < weakest_plan.created_date):
+            weakest_key, weakest_plan = key, plan
+    if weakest_plan is None:
+        return None
+    return weakest_key, weakest_plan
+
+
+def _count_open(existing_plans: dict) -> int:
+    return sum(1 for p in existing_plans.values() if p.is_open())
 
 
 def enrich_trade_plans_with_persistence(
@@ -381,6 +446,15 @@ def enrich_trade_plans_with_persistence(
     updated_plans: list[DoreOptionsPlan] = []
     seen_keys: set[str] = set()
 
+    # [Sprint 1 — Portfolio Admission] Working copy of the open book,
+    # mutated as we go (new mints added, superseded/retired plans
+    # marked closed) so that duplicate-suppression and the portfolio
+    # cap both see an accurate picture even when this SAME cycle mints
+    # several plans back-to-back and/or retires one to make room for
+    # another. `existing_plans` itself (the caller's dict) is left
+    # untouched.
+    open_now: dict = dict(existing_plans)
+
     for p in plans:
         try:
             direction = getattr(p, "direction", "") or ""
@@ -393,7 +467,7 @@ def enrich_trade_plans_with_persistence(
             row = p.to_dict()
             current_premium = getattr(p, "current_premium", None)
 
-            existing = existing_plans.get(key)
+            existing = open_now.get(key)
             if existing is not None and existing.is_open():
                 locked = existing
                 just_minted = False
@@ -410,16 +484,54 @@ def enrich_trade_plans_with_persistence(
                     enriched_rows.append(row)   # still shown as a Live Scan recommendation, just not tracked
                     continue
 
-                # [2026-08-05, SG request] Don't stack a second live
-                # contract on a symbol whose existing open plan hasn't
-                # even reached T1 yet. Still shown as an ordinary Live
-                # Scan recommendation (row unchanged, not tracked) —
-                # same treatment as the confidence-floor reject above,
-                # just a different reason.
-                if _has_blocking_open_plan_on_symbol(symbol, key, existing_plans):
-                    row["blocked_reason"] = "Existing open plan on this symbol hasn't hit T1 yet"
-                    enriched_rows.append(row)
-                    continue
+                # [Sprint 1 — Duplicate Suppression, extends 2026-08-05
+                # SG request] Same symbol + same direction (CE/PE),
+                # still open, hasn't hit T1 — normally blocks a second
+                # mint. But if THIS candidate is materially better
+                # (confidence_score clears the blocker's
+                # confidence_at_entry by MATERIALLY_BETTER_MARGIN or
+                # more), retire the weaker duplicate and let the
+                # stronger one take its place instead of just rejecting
+                # the new one outright.
+                dup = _blocking_open_plan(symbol, direction, key, open_now)
+                if dup is not None:
+                    if confidence_score >= dup.confidence_at_entry + MATERIALLY_BETTER_MARGIN:
+                        dup.status = DoreOptionsPlanStatus.CLOSED
+                        dup.closed_at = _now_iso()
+                        dup.closed_reason = (
+                            f"Superseded by stronger same-symbol/direction setup "
+                            f"({confidence_score:.0f} vs {dup.confidence_at_entry:.0f})"
+                        )
+                        updated_plans.append(dup)
+                        open_now.pop(dup.contract_key, None)
+                    else:
+                        row["blocked_reason"] = "Existing open plan on this symbol/direction hasn't hit T1 yet"
+                        enriched_rows.append(row)
+                        continue
+
+                # [Sprint 1 — Portfolio Manager / Quality Ranking,
+                # 2026-08-05] Book is full: only let a new candidate in
+                # by retiring the single weakest OPEN plan, and only
+                # when it clears that plan's confidence_at_entry by
+                # MATERIALLY_BETTER_MARGIN. Otherwise the candidate is
+                # rejected — shown as an ordinary Live Scan row, never
+                # tracked.
+                if _count_open(open_now) >= MAX_ACTIVE_DORE_OPTIONS_PLANS:
+                    weakest = _find_weakest_open_plan(open_now)
+                    if weakest is not None and confidence_score >= weakest[1].confidence_at_entry + MATERIALLY_BETTER_MARGIN:
+                        weakest_key, weakest_plan = weakest
+                        weakest_plan.status = DoreOptionsPlanStatus.CLOSED
+                        weakest_plan.closed_at = _now_iso()
+                        weakest_plan.closed_reason = (
+                            f"Retired — portfolio full, replaced by stronger candidate "
+                            f"({confidence_score:.0f} vs {weakest_plan.confidence_at_entry:.0f})"
+                        )
+                        updated_plans.append(weakest_plan)
+                        open_now.pop(weakest_key, None)
+                    else:
+                        row["blocked_reason"] = f"Portfolio full ({MAX_ACTIVE_DORE_OPTIONS_PLANS} active) — no materially weaker plan to replace"
+                        enriched_rows.append(row)
+                        continue
 
                 # Fresh contract (or the prior entry for this exact key
                 # had already been closed) — mint + lock a new entry at
@@ -441,6 +553,7 @@ def enrich_trade_plans_with_persistence(
                     source=row.get("source") or "",
                 )
                 just_minted = True
+                open_now[key] = locked
 
             drift = _drift_pct(current_premium, locked.entry_locked)
 
