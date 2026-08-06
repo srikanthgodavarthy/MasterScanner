@@ -93,7 +93,17 @@ _YF_LOCK_RETRY_S  = 0.5   # base backoff for "database is locked" (short + jitte
 _YF_LOCK_MAX_TRY  = 5     # locked-db is transient; worth a few extra quick attempts
 _YF_RATELIMIT_BASE_S = 20  # base cooldown for rate-limit errors (exponential: 20s, 40s, 80s...)
 
-_yf_call_lock  = threading.Lock()   # serializes spacing + protects _yf_last_call_ts
+_yf_call_lock  = threading.Lock()   # serializes spacing AND the actual yf.download()
+                                     # call itself (protects _yf_last_call_ts and,
+                                     # critically, prevents two threads' yf.download()
+                                     # calls from ever overlapping — yfinance is not
+                                     # thread-safe across concurrent download() calls
+                                     # and mixes up which symbol's columns belong to
+                                     # which request when they overlap; only held
+                                     # around the network call, not around backoff
+                                     # sleeps, so a rate-limit cooldown on one thread
+                                     # doesn't stall unrelated retries longer than
+                                     # necessary — see yf_download_with_retry())
 _yf_last_call_ts = 0.0
 
 
@@ -111,14 +121,18 @@ def _is_rate_limit_error(exc: Exception) -> bool:
 def _wait_for_spacing():
     """Blocks the caller (if needed) so consecutive yf.download() attempts
     across the whole process are never closer together than
-    _YF_MIN_SPACING_S. Cheap no-op once the process has been idle a bit."""
+    _YF_MIN_SPACING_S. Cheap no-op once the process has been idle a bit.
+
+    Caller MUST already hold _yf_call_lock (see yf_download_with_retry) —
+    this only does the spacing math/sleep, it doesn't acquire the lock
+    itself, since the lock now also has to stay held across the actual
+    yf.download() call (see _yf_call_lock's docstring)."""
     global _yf_last_call_ts
-    with _yf_call_lock:
-        now = time.monotonic()
-        wait = _YF_MIN_SPACING_S - (now - _yf_last_call_ts)
-        if wait > 0:
-            time.sleep(wait)
-        _yf_last_call_ts = time.monotonic()
+    now = time.monotonic()
+    wait = _YF_MIN_SPACING_S - (now - _yf_last_call_ts)
+    if wait > 0:
+        time.sleep(wait)
+    _yf_last_call_ts = time.monotonic()
 
 
 def yf_download_with_retry(tickers, **kwargs):
@@ -144,10 +158,31 @@ def yf_download_with_retry(tickers, **kwargs):
     max_total_attempts = _YF_MAX_RETRIES + _YF_LOCK_MAX_TRY  # locked-db retries are extra, not counted against the normal budget
 
     while attempt <= max_total_attempts:
-        _wait_for_spacing()
-        try:
-            result = yf.download(tickers, **kwargs)
-        except Exception as exc:
+        # _yf_call_lock is held across spacing AND the download call itself
+        # (not just the spacing sleep) — yfinance is not thread-safe for
+        # concurrent download() calls across threads, and this app runs
+        # several background threads (live scanner, retention, scheduled
+        # jobs — see inprocess_scheduler.py) that can all reach this
+        # function at once. Without full serialization here, two in-flight
+        # calls can cross-contaminate: one thread's returned DataFrame ends
+        # up carrying another thread's tickers as its MultiIndex columns,
+        # which then fails with a KeyError for every symbol in the chunk
+        # (confirmed via history_store's diagnostic logging — the tickers
+        # in raw.columns belonged to a completely different, concurrently
+        # running chunk, not the one being processed). The lock is
+        # released before any backoff sleep below, so a rate-limit
+        # cooldown on one thread doesn't stall unrelated retries longer
+        # than necessary.
+        download_exc = None
+        with _yf_call_lock:
+            _wait_for_spacing()
+            try:
+                result = yf.download(tickers, **kwargs)
+            except Exception as exc:
+                download_exc = exc
+
+        if download_exc is not None:
+            exc = download_exc
             last_exc = exc
 
             if _is_locked_db_error(exc) and lock_retry_count < _YF_LOCK_MAX_TRY:
