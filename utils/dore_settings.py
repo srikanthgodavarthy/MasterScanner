@@ -213,6 +213,17 @@ DORE_DEFAULTS: dict = {
                                              # more prone to fade than genuine fresh positioning.
     "gate_now_on_premium_behavior": True,  # if True, BUY_CE_NOW/BUY_PE_NOW downgrade to WATCH_CE/WATCH_PE
                                              # whenever premium hasn't actually confirmed yet
+    "premium_behavior_score_gate":   70.0,  # 2026-08-06: replaces the old flat "avg growth >= 1.5%"
+                                             # cliff. premium_strengthening (what the NOW-tier gate above
+                                             # actually reads) is now True when the fully-modified Premium
+                                             # Behaviour Score — rolling-average growth mapped through
+                                             # PREMIUM_CONFIDENCE_CURVE in dore_engine.py, plus acceleration
+                                             # and OI-confirmation bonuses/penalties — clears this bar.
+                                             # A smooth curve + one gate value beats a hard cutoff on the
+                                             # raw % because acceleration and OI confirmation can now push a
+                                             # merely-decent average growth reading over the line (or a
+                                             # strong one under it), instead of the average alone deciding
+                                             # everything at one arbitrary tick.
     # Stage-3 sub-weights (must sum to 100)
     # 2026-08-06: rebalanced to give Premium Behaviour (20 -> 30) a
     # materially stronger say in Stage 3's overall confidence score,
@@ -410,6 +421,7 @@ class DORESettings:
     premium_oi_confirm_bonus: float = 10.0
     premium_oi_diverge_penalty: float = 10.0
     gate_now_on_premium_behavior: bool = True
+    premium_behavior_score_gate: float = 70.0
     w_deriv_oi_writing: float = 20.0
     w_deriv_pcr: float = 13.0
     w_deriv_base_strength: float = 10.0

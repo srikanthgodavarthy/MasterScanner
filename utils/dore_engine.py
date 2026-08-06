@@ -575,6 +575,24 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 100.0) -> float:
     return max(lo, min(hi, x))
 
 
+# Premium Behaviour's confidence curve — replaces the old flat "avg
+# growth >= 1.5% -> pass, else fail" cliff (2026-08-06). Anchor points
+# are (avg %/interval, confidence 0-100); _interp_score() piecewise-
+# linearly interpolates between them (and extrapolates past the ends).
+# Not a DORESettings field: every other config value here is a plain
+# scalar (float/int/bool) that the settings UI can render as a single
+# control, and a 5-point curve doesn't fit that shape. The one knob that
+# IS meant to be tuned live is where the gate sits on this curve — see
+# DORESettings.premium_behavior_score_gate below.
+PREMIUM_CONFIDENCE_CURVE: tuple[tuple[float, float], ...] = (
+    (0.5, 20.0),
+    (1.0, 45.0),
+    (1.5, 70.0),
+    (2.0, 85.0),
+    (3.0, 100.0),
+)
+
+
 def _pct_score(value: float, lo: float, hi: float) -> float:
     """Linear-map `value` from [lo, hi] -> [0, 100], clamped at the ends.
     If lo > hi, the mapping is inverted (higher value -> lower score)."""
@@ -583,6 +601,37 @@ def _pct_score(value: float, lo: float, hi: float) -> float:
     if lo < hi:
         return _clamp((value - lo) / (hi - lo) * 100.0)
     return _clamp((lo - value) / (lo - hi) * 100.0)
+
+
+def _interp_score(value: float, anchors: tuple[tuple[float, float], ...]) -> float:
+    """Piecewise-linear map through `anchors` (sorted ascending by x),
+    each an (x, score_0_100) pair. Extrapolates the slope of the nearest
+    segment past either end, then clamps to [0, 100].
+
+    2026-08-06: introduced to replace flat-threshold gates (e.g. Premium
+    Behaviour's old ">= 1.5% -> pass, else fail" cliff) with a smooth
+    confidence curve — no single tick landing a hair under a hard number
+    flips the read from 100 to 0. See PREMIUM_CONFIDENCE_CURVE below for
+    the Premium Behaviour calling site's anchor points.
+    """
+    if not anchors:
+        return 50.0
+    if len(anchors) == 1:
+        return _clamp(anchors[0][1])
+    pts = sorted(anchors, key=lambda p: p[0])
+    if value <= pts[0][0]:
+        (x0, y0), (x1, y1) = pts[0], pts[1]
+    elif value >= pts[-1][0]:
+        (x0, y0), (x1, y1) = pts[-2], pts[-1]
+    else:
+        x0 = y0 = x1 = y1 = None
+        for (px0, py0), (px1, py1) in zip(pts, pts[1:]):
+            if px0 <= value <= px1:
+                x0, y0, x1, y1 = px0, py0, px1, py1
+                break
+    if x1 == x0:
+        return _clamp(y0)
+    return _clamp(y0 + (value - x0) * (y1 - y0) / (x1 - x0))
 
 
 def _weighted(parts: list[tuple[float, float]]) -> float:
@@ -1419,9 +1468,18 @@ def stage3_derivative_intelligence(
         # change_pct on the first poll or two for a key (graceful
         # degrade — same spirit as the prev/prev2 None-handling above).
         growth_pct = premium_avg_growth_pct if premium_avg_growth_pct is not None else change_pct
-        premium_strengthening = growth_pct >= cfg.premium_behavior_min_rise_pct
-        premium_behavior_score = _pct_score(
-            growth_pct, -cfg.premium_behavior_min_rise_pct * 2.0, cfg.premium_behavior_min_rise_pct * 2.0)
+        # 2026-08-06: base score comes from a smooth confidence curve
+        # (PREMIUM_CONFIDENCE_CURVE) rather than a linear map anchored on
+        # a single min-rise threshold. `premium_strengthening` is decided
+        # LATER, off the fully-modified score (base curve + acceleration
+        # + OI confirmation) against premium_behavior_score_gate — see
+        # below — so it reflects everything this pillar knows, not just
+        # the raw average growth in isolation.
+        premium_behavior_score = _interp_score(growth_pct, PREMIUM_CONFIDENCE_CURVE)
+        # Raw-growth read, used only for the reversal narrative below —
+        # NOT what gates BUY_*_NOW (that's the final score vs
+        # premium_behavior_score_gate, computed after all modifiers).
+        growth_rising = growth_pct >= cfg.premium_behavior_min_rise_pct
 
         # ── Acceleration — is the move speeding up or fading? ──────────
         if premium_prev2 is not None and premium_prev2 > 0:
@@ -1436,11 +1494,11 @@ def stage3_derivative_intelligence(
                                f"interval — momentum may be fading")
 
             was_falling = premium_prev < premium_prev2
-            if was_falling and premium_strengthening:
+            if was_falling and growth_rising:
                 premium_behavior_score = _clamp(premium_behavior_score + 15.0)
                 reasons.append(f"Premium REVERSAL confirmed — was falling ({premium_prev2:.2f} -> "
                                f"{premium_prev:.2f}), now rising ({premium_prev:.2f} -> {premium:.2f})")
-            elif was_falling and not premium_strengthening:
+            elif was_falling and not growth_rising:
                 reasons.append(f"Premium still falling ({premium_prev2:.2f} -> {premium_prev:.2f} -> "
                                f"{premium:.2f}) — underlying setup is NOT yet confirmed by the option itself")
 
@@ -1457,13 +1515,23 @@ def stage3_derivative_intelligence(
                 reasons.append(f"OI diverges: {direction} premium rising WHILE OI falls "
                                f"({oi_change:+,.0f}) — looks like short-covering, weaker signal")
 
+        # ── Final gate decision — score-based, not a flat % cliff ──────
+        # 2026-08-06: replaces the old binary "avg growth >= 1.5%" gate.
+        # premium_behavior_score already blends rolling-average growth
+        # (via the confidence curve), acceleration, and OI confirmation,
+        # so gating on the score lets all three contribute smoothly
+        # instead of a single average-growth tick flipping pass/fail at
+        # an arbitrary threshold.
+        premium_strengthening = premium_behavior_score >= cfg.premium_behavior_score_gate
+
         if premium_strengthening:
-            reasons.append(f"Premium strengthening: rolling avg {growth_pct:+.1f}%/interval "
-                           f"(latest tick {change_pct:+.1f}%) — confirms {direction}")
+            reasons.append(f"Premium strengthening: Premium Behaviour Score {premium_behavior_score:.0f} "
+                           f"(rolling avg {growth_pct:+.1f}%/interval, latest tick {change_pct:+.1f}%) — "
+                           f"confirms {direction}")
         else:
-            reasons.append(f"Premium NOT strengthening: rolling avg {growth_pct:+.1f}%/interval "
-                           f"(latest tick {change_pct:+.1f}%), needs >= +{cfg.premium_behavior_min_rise_pct:.1f}% "
-                           f"— direction unconfirmed by premium")
+            reasons.append(f"Premium NOT strengthening: Premium Behaviour Score {premium_behavior_score:.0f} "
+                           f"(rolling avg {growth_pct:+.1f}%/interval, latest tick {change_pct:+.1f}%), needs >= "
+                           f"{cfg.premium_behavior_score_gate:.0f} — direction unconfirmed by premium")
 
     # ── OI corridor — room to run before the next wall ──────────────
     atr_ref = max(inp.atr, 1e-6)
@@ -1807,9 +1875,13 @@ def stage5_opportunity_engine(
     ranking multiple candidates against each other (Stage 5's other job).
 
     `premium_strengthening` (Stage 3's Premium Behaviour pillar,
-    2026-07-21) gates the "_NOW" tier specifically: a trend/execution
-    setup can be entirely justified by the UNDERLYING and still be a bad
-    entry right now if the OPTION premium hasn't itself turned yet.
+    2026-07-21; score-gated 2026-08-06) gates the "_NOW" tier
+    specifically: a trend/execution setup can be entirely justified by
+    the UNDERLYING and still be a bad entry right now if the OPTION
+    premium hasn't itself turned yet. It's True when Premium Behaviour
+    Score >= cfg.premium_behavior_score_gate (default 70) — a smooth
+    confidence read blending rolling-average growth, acceleration, and
+    OI confirmation — not a flat "average growth >= 1.5%" cliff.
     BUY_CE_NOW/BUY_PE_NOW downgrade to WATCH_CE/WATCH_PE — not WAIT —
     when this fires: the directional setup is still real and worth
     watching, it's specifically the immediate-entry timing that isn't
@@ -1860,7 +1932,8 @@ def stage5_opportunity_engine(
               and not premium_strengthening):
             downgraded_to = WATCH_CE if recommendation == BUY_CE_NOW else WATCH_PE
             reasons.append(f"Premium Behaviour gate: underlying/execution justify {recommendation}, but the "
-                            f"option premium itself hasn't confirmed (not yet strengthening) — downgraded to "
+                            f"option premium's Behaviour Score hasn't cleared "
+                            f"{cfg.premium_behavior_score_gate:.0f} yet (not yet strengthening) — downgraded to "
                             f"{downgraded_to}")
             recommendation = downgraded_to
 
