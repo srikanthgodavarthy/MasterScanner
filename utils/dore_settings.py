@@ -61,6 +61,29 @@ DORE_DEFAULTS: dict = {
     # file's comments refers to whatever these two are actually set to.
     "ema_fast_period":              9,
     "ema_slow_period":             21,
+
+    # ── Leadership EMA settings (independent from the two above) ─
+    # The fast/slow pair above drives DORE's own Stage 1/2 EMA-cross
+    # trend/execution reads (compute_trend_features() / execution_
+    # features_from_intraday_5m()) and must NOT be touched by this
+    # block — see the comment above it.
+    #
+    # These three are DORE's own copy of the Live Scanner's Leadership
+    # EMA triad (pages/settings.py "EMA Periods — Leadership" ->
+    # ema_fast_period/ema_mid_period/ema_slow_period ->
+    # utils.scoring_core.ScoringParams). DORE 2.0 does not currently
+    # consume MasterScanner's Leadership score (see dore_engine.py's
+    # module docstring — "DORE 2.0 is architecturally independent...
+    # never [shares] scores or classifications"), so nothing reads
+    # these three yet. They exist so DORE can compute its own
+    # Leadership-style fast/mid/slow EMA triad in the future (e.g. for
+    # DORE-side candidate ranking) WITHOUT inheriting the Live
+    # Scanner's settings, per the "changing one must never affect the
+    # other" requirement — wiring them into a DORE scoring path is a
+    # separate follow-up once DORE has a concrete consumer for it.
+    "dore_leadership_fast_ema":     9,
+    "dore_leadership_mid_ema":     21,
+    "dore_leadership_slow_ema":    50,
     "trend_bullish_score_min":    60.0,   # Trend Score >= this -> BULLISH
     "trend_bearish_score_max":    40.0,   # Trend Score <= this -> BEARISH
     # Stage-1 sub-weights (must sum to 100)
@@ -296,6 +319,9 @@ class DORESettings:
     trend_ema_slope_flat_pct: float = 0.02
     ema_fast_period: int = 9
     ema_slow_period: int = 21
+    dore_leadership_fast_ema: int = 9
+    dore_leadership_mid_ema: int = 21
+    dore_leadership_slow_ema: int = 50
     trend_bullish_score_min: float = 60.0
     trend_bearish_score_max: float = 40.0
     w_trend_ema_alignment: float = 30.0

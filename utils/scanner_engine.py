@@ -1258,11 +1258,11 @@ def _primary_blocker(r, result: dict) -> str:
         # continuation paths (stock above Fib 61.8% / above pivot high).
         # Fall back to DE cv_fib (now also updated with continuation path).
         cv_fib  = int(result.get("_cv1_cv_fib",  result.get("_ds_cv_fib",  0)) or 0)
-        cv_cci  = int(result.get("_ds_cv_pattern",      result.get("_cv1_cv_cci",  0)) or 0)
+        cv_adx  = int(result.get("_ds_cv_pattern",      result.get("_cv1_cv_adx",  0)) or 0)
         if cv_fib < 8:
             sub = "no Fib setup / continuation"
-        elif cv_cci < 8:
-            sub = "CCI not recovered"
+        elif cv_adx < 6:
+            sub = "ADX not confirming trend"
         else:
             sub = f"DE score {int(cv)}"
         return f"Low Conviction ({int(cv)}) — {sub}"
@@ -1313,12 +1313,25 @@ def score_stock(
     cci_os:   int   = -100,
     pvt_lb:   int   = 20,
     atr_prox: float = 0.3,
+    symbol:   str | None = None,
+    sector_series: "pd.Series | None" = None,
 ) -> dict:
     """
     Evaluate the LATEST bar of df.
     Returns a flat dict ready for the scanner table, or {} on failure.
 
     settings dict (from pages/settings.py) takes priority over legacy kwargs.
+
+    symbol, sector_series : optional — Leadership redesign "RS vs Sector".
+        sector_series is a close-price benchmark Series for this symbol's
+        sector (see utils.sector_map.build_sector_benchmark_frames() /
+        sector_benchmark_for_symbol() for the leave-one-out peer-basket
+        builder used by the live scan loop). Purely additive: omit both
+        and scoring is unaffected — rs_vs_sector stays 0.0 /
+        rs_sector_available=False. `symbol` is otherwise unused here —
+        the caller builds sector_series itself (once per sector per
+        scan, not per symbol) since score_stock() has no access to the
+        full scan universe's history.
     """
     if df.empty or len(df) < 210:
         return {}
@@ -1354,7 +1367,7 @@ def score_stock(
     if not prescreen_ok and not diagnostic:
         return {}
 
-    ia = build_indicators(df, nifty, params)
+    ia = build_indicators(df, nifty, params, sector_series=sector_series)
     r  = compute_bar(ia, i=-1, params=params)   # -1 = latest bar
 
     if r is None:
@@ -1555,14 +1568,17 @@ def score_stock(
             "CV1_EQ_Grade":      cv1.entry_quality_grade,
             # Leadership sub-scores
             "_cv1_ls_rs":        cv1.ls_rs_composite,
+            "_cv1_ls_rs_market": cv1.ls_rs_market,
+            "_cv1_ls_rs_sector": cv1.ls_rs_sector,
+            "_cv1_ls_rs_consistency": cv1.ls_rs_consistency,
+            "_cv1_ls_rs_momentum":   cv1.ls_rs_momentum,
             "_cv1_ls_age":       cv1.ls_trend_age,
-            "_cv1_ls_adx":       cv1.ls_adx,
             "_cv1_ls_ps":        cv1.ls_persistent_strength,
             "_cv1_ls_slope":     cv1.ls_ema20_slope,
             # Conviction sub-scores
             "_cv1_cv_structure": cv1.cv_trend_structure,
             "_cv1_cv_fib":       cv1.cv_fib_zone,
-            "_cv1_cv_cci":       cv1.cv_cci_recovery,
+            "_cv1_cv_adx":       cv1.cv_adx,
             "_cv1_cv_volume":    cv1.cv_volume,
             "_cv1_cv_squeeze":   cv1.cv_squeeze,
             # Entry Quality sub-scores
@@ -2125,12 +2141,50 @@ def run_scanner(
     results = []
     done    = 0
 
+    # ── Leadership redesign: sector benchmarks, computed once per scan ──
+    # Peer-basket proxy (see utils.sector_map.build_sector_benchmark_frames
+    # docstring for why — no real sector-index feed is wired into this
+    # app). Built once from data already in `all_data`, no extra fetches.
+    # LEAVE-ONE-OUT: sector_benchmark_for_symbol() excludes each symbol's
+    # own rebased column before averaging, so a stock is never partially
+    # benchmarked against its own price. A symbol whose sector has fewer
+    # than 2 usable peers in this batch simply gets no sector_series ->
+    # rs_vs_sector stays neutral/unavailable for it, same as before this
+    # redesign.
+    #
+    # OFF BY DEFAULT (opt-in via settings["enable_sector_rs"]=True).
+    # 2026-08-06 incident: an earlier version of this block rebased each
+    # peer's FULL multi-year close history for up to ~300 symbols (20
+    # sectors x 15-peer cap) every scan cycle, causing a large RAM spike
+    # and scans being skipped in production — the whole redesign was
+    # reverted (a244b5d) as a result. build_sector_benchmark_frames() now
+    # trims each peer to a bounded recent window (lookback_bars, default
+    # 210) before rebasing, which fixes the memory blowup — kept opt-in
+    # until validated under real production load.
+    _sector_frames = {}
+    sector_benchmark_for_symbol = None
+    if effective_settings.get("enable_sector_rs", False):
+        try:
+            from utils.sector_map import build_sector_benchmark_frames, sector_benchmark_for_symbol
+            _close_by_symbol = {
+                s: d["close"] for s, d in all_data.items()
+                if d is not None and not d.empty and "close" in d.columns
+            }
+            _sector_frames = build_sector_benchmark_frames(_close_by_symbol)
+        except Exception:
+            _sector_frames = {}
+            sector_benchmark_for_symbol = None  # noqa: F811 — degrade to no sector RS if this fails
+
     def process(sym):
         df = all_data.get(sym, pd.DataFrame())
         if df.empty:
             return None
+        _sector_series = None
+        if sector_benchmark_for_symbol is not None:
+            _sector_series = sector_benchmark_for_symbol(_sector_frames, sym)
         row = score_stock(df, nifty_series, settings=effective_settings,
-                          cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os)
+                          cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
+                          symbol=sym, sector_series=_sector_series)
         if row:
             row["Stock"] = sym
         return row

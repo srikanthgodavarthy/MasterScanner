@@ -55,12 +55,24 @@ DEFAULTS = {
     "ema_fast_period":   20,
     "ema_mid_period":    50,
     "ema_slow_period":   200,
+    # ── RS vs Sector (utils/sector_map.py) — OFF by default; see 2026-08-06
+    # incident note in scanner_engine.py's scan loop for why. Turn on only
+    # after confirming RAM/scan-time is acceptable for your deployment.
+    "enable_sector_rs":  False,
     # ── EMA periods — DORE Engine (utils/dore_settings.py DORESettings) ────
     # Mirrors, at the UI layer, the ema_fast_period/ema_slow_period keys
     # inside st.session_state["dore_settings"] — see the "EMA Periods —
     # DORE Engine" expander in _tab_advanced() for how the two stay synced.
     "dore_ema_fast_period": 9,
     "dore_ema_slow_period": 21,
+    # ── EMA periods — DORE Leadership (utils/dore_settings.py DORESettings) ─
+    # Independent triad, mirroring the Live Scanner's Leadership EMA block
+    # above (ema_fast/mid/slow_period) at DORE's own defaults (9/21/50).
+    # Does NOT feed dore_ema_fast_period/dore_ema_slow_period above (DORE's
+    # Stage 1/2 trend-engine EMAs) — changing one must never affect the other.
+    "dore_leadership_fast_ema": 9,
+    "dore_leadership_mid_ema":  21,
+    "dore_leadership_slow_ema": 50,
     "t2_comp_bars":      12,
     "t2_atr_ratio":      0.80,
     "t2_vol_mult":       1.5,
@@ -611,6 +623,22 @@ def _tab_advanced() -> None:
         if not (ema_fast < ema_mid < ema_slow):
             st.error("Periods must be strictly increasing: fast < mid < slow.")
 
+    # ── RS vs Sector ─────────────────────────────────────────────
+    with st.expander("RS vs Sector (Leadership)", expanded=False):
+        st.caption(
+            "OFF by default. When on, the scan builds a leave-one-out "
+            "peer-basket benchmark per sector (utils/sector_map.py) and "
+            "scores each stock's RS vs Sector against it. Fixed as of "
+            "2026-08-06 to trim each peer to a bounded recent window "
+            "before rebasing (was: full multi-year history for up to "
+            "~300 symbols every scan — caused a production RAM spike / "
+            "skipped scans). Test on a small universe before enabling "
+            "on a full production scan."
+        )
+        sector_rs_on = st.toggle("Enable RS vs Sector", value=bool(_g("enable_sector_rs")),
+            key="tg_enable_sector_rs")
+        _s("enable_sector_rs", bool(sector_rs_on))
+
     # ── EMA Periods — DORE Engine ───────────────────────────────
     with st.expander("EMA Periods — DORE Engine", expanded=False):
         st.caption(
@@ -645,6 +673,44 @@ def _tab_advanced() -> None:
         _dore_settings = dict(st.session_state.get("dore_settings", {}))
         _dore_settings["ema_fast_period"] = int(dore_ema_fast)
         _dore_settings["ema_slow_period"] = int(dore_ema_slow)
+        st.session_state["dore_settings"] = _dore_settings
+
+    # ── EMA Periods — DORE Leadership ───────────────────────────
+    with st.expander("EMA Periods — DORE Leadership", expanded=False):
+        st.caption(
+            "Independent fast/mid/slow EMA triad for DORE, kept separate "
+            "from both the Live Scanner's Leadership EMA block above and "
+            "DORE's own Stage 1/2 trend-engine EMAs in the expander above "
+            "this one. Changing one of these three never affects the "
+            "other two EMA blocks. Defaults: 9 / 21 / 50."
+        )
+        lc1, lc2, lc3 = st.columns(3)
+        with lc1:
+            _label("Fast EMA period")
+            dore_ls_fast = st.number_input("DORE Leadership Fast EMA", 3, 100,
+                int(_g("dore_leadership_fast_ema")), step=1,
+                key="ni_dore_ls_fast", label_visibility="collapsed")
+            _s("dore_leadership_fast_ema", int(dore_ls_fast))
+        with lc2:
+            _label("Mid EMA period")
+            dore_ls_mid = st.number_input("DORE Leadership Mid EMA", 5, 150,
+                int(_g("dore_leadership_mid_ema")), step=1,
+                key="ni_dore_ls_mid", label_visibility="collapsed")
+            _s("dore_leadership_mid_ema", int(dore_ls_mid))
+        with lc3:
+            _label("Slow EMA period")
+            dore_ls_slow = st.number_input("DORE Leadership Slow EMA", 10, 300,
+                int(_g("dore_leadership_slow_ema")), step=1,
+                key="ni_dore_ls_slow", label_visibility="collapsed")
+            _s("dore_leadership_slow_ema", int(dore_ls_slow))
+
+        if not (dore_ls_fast < dore_ls_mid < dore_ls_slow):
+            st.error("Periods must be strictly increasing: fast < mid < slow.")
+
+        _dore_settings = dict(st.session_state.get("dore_settings", {}))
+        _dore_settings["dore_leadership_fast_ema"] = int(dore_ls_fast)
+        _dore_settings["dore_leadership_mid_ema"]  = int(dore_ls_mid)
+        _dore_settings["dore_leadership_slow_ema"] = int(dore_ls_slow)
         st.session_state["dore_settings"] = _dore_settings
 
     # ── Tier 2 ───────────────────────────────────────────────────
@@ -1215,6 +1281,7 @@ def render() -> dict:
         "ema_fast_period":     ss.get("ema_fast_period",     DEFAULTS["ema_fast_period"]),
         "ema_mid_period":      ss.get("ema_mid_period",      DEFAULTS["ema_mid_period"]),
         "ema_slow_period":     ss.get("ema_slow_period",     DEFAULTS["ema_slow_period"]),
+        "enable_sector_rs":    ss.get("enable_sector_rs",    DEFAULTS["enable_sector_rs"]),
         "ic_enable_vwap_reclaim":    ss.get("ic_enable_vwap_reclaim",    DEFAULTS["ic_enable_vwap_reclaim"]),
         "ic_enable_vwap_stoch_conf": ss.get("ic_enable_vwap_stoch_conf", DEFAULTS["ic_enable_vwap_stoch_conf"]),
         "ic_vwap_touch_atr_mult":    ss.get("ic_vwap_touch_atr_mult",    DEFAULTS["ic_vwap_touch_atr_mult"]),

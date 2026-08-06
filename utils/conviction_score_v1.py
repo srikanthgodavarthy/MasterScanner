@@ -86,17 +86,22 @@ class ConvictionV1:
                                  # in the 2026-07-14 EQ audit). Round only at the
                                  # point of display, never before comparison.
 
-    # Leadership sub-scores (weights: rs=30, age=25, adx=20, ps=15, slope=10)
-    ls_rs_composite:       int = 0   # 0-30
+    # Leadership sub-scores (raw weights: rs=30 [market12/sector10/consistency5/momentum3],
+    # age=25, ps=15, slope=10 -> 80 raw, rescaled x1.25 to 0-100; see _leadership() docstring)
+    ls_rs_composite:       int = 0   # 0-30 (sum of the 4 RS sub-parts below)
+    ls_rs_market:          int = 0   # 0-12
+    ls_rs_sector:          int = 0   # 0-10
+    ls_rs_consistency:     int = 0   # 0-5
+    ls_rs_momentum:        int = 0   # 0-3
     ls_trend_age:          int = 0   # 0-25
-    ls_adx:                int = 0   # 0-20
     ls_persistent_strength:int = 0   # 0-15
     ls_ema20_slope:        int = 0   # 0-10
 
-    # Conviction sub-scores (weights: structure=30, fib=25, cci=25, vol=15, squeeze=5)
+    # Conviction sub-scores (raw weights: structure=30, fib=25, adx=20, vol=15,
+    # squeeze=5 -> 95 raw, rescaled x(100/95) to 0-100; see _conviction() docstring)
     cv_trend_structure:    int = 0   # 0-30
     cv_fib_zone:           int = 0   # 0-25
-    cv_cci_recovery:       int = 0   # 0-25
+    cv_adx:                int = 0   # 0-20
     cv_volume:             int = 0   # 0-15
     cv_squeeze:            int = 0   # 0-5
 
@@ -117,6 +122,10 @@ class ConvictionV1:
 
     # Raw measurements (pass-through for display)
     rs_composite:          float = 0.0
+    rs_vs_sector:          float = 0.0
+    rs_sector_available:   bool  = False
+    rs_consistency:        float = 0.0
+    rs_momentum:           float = 0.0
     trend_age_bars:        int   = 0
     adx_val:               float = 0.0
     ema20_slope:           float = 0.0
@@ -166,19 +175,76 @@ def _grade(score: int) -> str:
 # ══════════════════════════════════════════════════════════════════
 
 def _leadership(r: "BarResult") -> tuple[int, dict]:
-    """Returns (0-100, sub_scores_dict)."""
+    """
+    Returns (0-100, sub_scores_dict).
 
-    # ── 1. RS Composite (0-30) ───────────────────────────────────
-    # v8.1: "Sweet-spot 0.05-0.15 earns 20-25pts; >0.15 = full 30pts"
-    # Negative RS (<-0.03) penalised at −10 (clamped to 0 here)
+    Leadership redesign (institutional-leadership rebalance):
+      - ADX removed (moved to Conviction — trend quality/conviction, not
+        leadership; see _conviction() below).
+      - RS Composite (30 pts) now decomposes into RS vs Market (12),
+        RS vs Sector (10), RS Consistency (5), RS Momentum (3).
+      - Trend Age (25), Persistent Strength (15), EMA20 Slope (10)
+        unchanged.
+      Raw weights sum to 80, not 100 (30+25+15+10). To keep every
+      existing 0-100 grade band (_grade()) and every v1/v2/v3 threshold
+      (classify_tier*, V3_THRESHOLD_DEFAULTS, etc — all calibrated
+      against a 0-100 Leadership scale) meaningful without a full
+      backtest recalibration, the raw 0-80 sub-total is rescaled to
+      0-100 (×1.25) before being returned/graded. Sub-scores below are
+      reported at their RAW (pre-rescale) point weights so the
+      breakdown always sums to the documented 12/10/5/3/25/15/10.
+    """
+
+    # ── 1a. RS vs Market (0-12) ────────────────────────────────────
+    # Same breakpoint ladder as the old 30pt RS Composite, rescaled to a
+    # 12pt max (12/30 of the old points) — v8.1: "Sweet-spot 0.05-0.15
+    # earns 20-25pts; >0.15 = full pts". Negative RS (<-0.03) penalised.
     rc = r.rs_composite
-    if   rc > 0.15:  ls_rs = 30
-    elif rc > 0.10:  ls_rs = 25
-    elif rc > 0.05:  ls_rs = 20
-    elif rc > 0.03:  ls_rs = 15
-    elif rc > 0.00:  ls_rs = 10
-    elif rc > -0.03: ls_rs = 4
-    else:            ls_rs = 0
+    if   rc > 0.15:  ls_rs_market = 12
+    elif rc > 0.10:  ls_rs_market = 10
+    elif rc > 0.05:  ls_rs_market = 8
+    elif rc > 0.03:  ls_rs_market = 6
+    elif rc > 0.00:  ls_rs_market = 4
+    elif rc > -0.03: ls_rs_market = 2
+    else:            ls_rs_market = 0
+
+    # ── 1b. RS vs Sector (0-10) ──────────────────────────────────────
+    # Same shape of ladder as RS vs Market, applied to r.rs_vs_sector.
+    # If no sector benchmark was wired in for this symbol (rs_sector_
+    # available=False — see scoring_core.build_indicators/sector_map.
+    # build_sector_benchmark_series), award a flat neutral half-credit
+    # (5/10) rather than 0 — the same "no sector benchmark wired in ->
+    # flat neutral credit" convention pillar_engine.l_sector_leadership_note
+    # already uses, so Leadership doesn't silently collapse for every
+    # symbol until sector data is plumbed into every caller.
+    if not r.rs_sector_available:
+        ls_rs_sector = 5
+    else:
+        rsec = r.rs_vs_sector
+        if   rsec > 0.15:  ls_rs_sector = 10
+        elif rsec > 0.10:  ls_rs_sector = 8
+        elif rsec > 0.05:  ls_rs_sector = 7
+        elif rsec > 0.03:  ls_rs_sector = 5
+        elif rsec > 0.00:  ls_rs_sector = 3
+        elif rsec > -0.03: ls_rs_sector = 1
+        else:              ls_rs_sector = 0
+
+    # ── 1c. RS Consistency (0-5) ─────────────────────────────────────
+    # r.rs_consistency: 0-1 fraction — how directionally aligned rs1/
+    # rs3/rs6 (vs Nifty) are with each other. 1.0 = all three pulling
+    # the same way (true multi-timeframe leadership, not a 1-week spike).
+    ls_rs_consistency = round(r.rs_consistency * 5)
+
+    # ── 1d. RS Momentum / Acceleration (0-3) ─────────────────────────
+    # r.rs_momentum: change in rs_composite vs ~2 weeks ago. Reward
+    # IMPROVING relative strength, not just static/already-priced-in RS.
+    mom = r.rs_momentum
+    if   mom > 0.03: ls_rs_momentum = 3
+    elif mom > 0.01: ls_rs_momentum = 2
+    elif mom > 0.00: ls_rs_momentum = 1
+    else:            ls_rs_momentum = 0
+
+    ls_rs = ls_rs_market + ls_rs_sector + ls_rs_consistency + ls_rs_momentum  # 0-30
 
     # ── 2. Trend Age (0-25) ──────────────────────────────────────
     # v8.1: "21-50 bar sweet-spot = +20pts (was +5 via freshness)"
@@ -191,31 +257,27 @@ def _leadership(r: "BarResult") -> tuple[int, dict]:
     elif age <= 100: ls_age = 8    # aged — edge fades (PF 0.81)
     else:            ls_age = 0    # extended (PF 0.72)
 
-    # ── 3. ADX (0-20) ─────────────────────────────────────────────
-    # v8.1: "bonus raised at >=40 level (15→20). ADX 25-30 dead zone = 5pts."
-    adx = r.adx_val
-    if   adx >= 40:  ls_adx = 20
-    elif adx > 30:   ls_adx = 12
-    elif adx > 25:   ls_adx = 5
-    else:            ls_adx = 0
-
-    # ── 4. Persistent Strength (0-15) ────────────────────────────
+    # ── 3. Persistent Strength (0-15) ────────────────────────────
     # Boolean gate from scoring_core: mom3 > t1_mom3 AND mom6 > t1_mom6
     ls_ps = 15 if r.persistent_strength else 0
 
-    # ── 5. EMA20 Slope (0-10) ─────────────────────────────────────
+    # ── 4. EMA20 Slope (0-10) ─────────────────────────────────────
     # v8.1 scoring_core: "10 if ema20_slope > 0.3 else 5 if ema20_slope > 0 else 0"
     slope = r.ema20_slope
     if   slope > 0.3: ls_slope = 10
     elif slope > 0:   ls_slope = 5
     else:             ls_slope = 0
 
-    total = min(ls_rs + ls_age + ls_adx + ls_ps + ls_slope, 100)
+    raw_total = ls_rs + ls_age + ls_ps + ls_slope   # 0-80
+    total = min(round(raw_total * 1.25), 100)        # rescale 0-80 -> 0-100 (see docstring)
 
     return total, {
-        "ls_rs_composite":        ls_rs,
+        "ls_rs_composite":        ls_rs,   # 0-30 — sum of the 4 RS sub-parts below
+        "ls_rs_market":           ls_rs_market,
+        "ls_rs_sector":           ls_rs_sector,
+        "ls_rs_consistency":      ls_rs_consistency,
+        "ls_rs_momentum":         ls_rs_momentum,
         "ls_trend_age":           ls_age,
-        "ls_adx":                 ls_adx,
         "ls_persistent_strength": ls_ps,
         "ls_ema20_slope":         ls_slope,
     }
@@ -248,7 +310,18 @@ def _leadership(r: "BarResult") -> tuple[int, dict]:
 # ══════════════════════════════════════════════════════════════════
 
 def _conviction(r: "BarResult") -> tuple[int, dict]:
-    """Returns (0-100, sub_scores_dict)."""
+    """
+    Returns (0-100, sub_scores_dict).
+
+    Conviction redesign: CCI Recovery removed (short-term trigger, noisy
+    — Trend Structure/Volume Sponsorship/Squeeze already capture the same
+    intent more stably). ADX Strength added (moved in from Leadership —
+    ADX measures trend quality/trade conviction, not "is this a leader").
+    Raw weights: trend_structure(30) + fib_zone(25) + adx(20) +
+    volume(15) + squeeze(5) = 95, not 100. Rescaled ×(100/95) before
+    return/grading for the same reason _leadership() rescales — see its
+    docstring. Sub-scores below are reported at RAW point weights.
+    """
 
     # ── 1. Trend Structure (0-30) ─────────────────────────────────
     # trend_structure = ema_alignment AND (above/inside cloud)
@@ -308,12 +381,15 @@ def _conviction(r: "BarResult") -> tuple[int, dict]:
         cv_fib = min(cv_fib + 3, 25)
     cv_fib = min(cv_fib, 25)
 
-    # ── 3. CCI Recovery (0-25) ───────────────────────────────────
-    cv_cci = 0
-    if r.recent_cci_recovery:  cv_cci = 25   # cross above OS — Tier-1 pillar
-    elif r.cci_rising:         cv_cci = 12   # building before cross (early signal)
-    elif r.t3_cci_rec:         cv_cci = 6    # CCI recovering below 0
-    cv_cci = min(cv_cci, 25)
+    # ── 3. ADX Strength (0-20) ────────────────────────────────────
+    # Moved in from Leadership — trend quality/conviction, not "is this
+    # a leader". Same ladder Leadership used to apply: v8.1 "bonus raised
+    # at >=40 level (15→20). ADX 25-30 dead zone = 5pts."
+    adx = r.adx_val
+    if   adx >= 40:  cv_adx = 20
+    elif adx > 30:   cv_adx = 12
+    elif adx > 25:   cv_adx = 5
+    else:            cv_adx = 0
 
     # ── 4. Volume Sponsorship (0-15) ─────────────────────────────
     vr = r.vol_ratio
@@ -333,12 +409,13 @@ def _conviction(r: "BarResult") -> tuple[int, dict]:
     else:                    cv_sq = 0
     cv_sq = min(cv_sq, 5)
 
-    total = min(cv_ts + cv_fib + cv_cci + cv_vol + cv_sq, 100)
+    raw_total = cv_ts + cv_fib + cv_adx + cv_vol + cv_sq   # 0-95
+    total = min(round(raw_total * (100 / 95)), 100)         # rescale 0-95 -> 0-100 (see docstring)
 
     return total, {
         "cv_trend_structure": cv_ts,
         "cv_fib_zone":        cv_fib,
-        "cv_cci_recovery":    cv_cci,
+        "cv_adx":             cv_adx,
         "cv_volume":          cv_vol,
         "cv_squeeze":         cv_sq,
     }
@@ -556,14 +633,17 @@ def compute_conviction_v1(r: "BarResult") -> ConvictionV1:
         signal_class  = signal,
         # Leadership subs
         ls_rs_composite        = ls_subs["ls_rs_composite"],
+        ls_rs_market           = ls_subs["ls_rs_market"],
+        ls_rs_sector           = ls_subs["ls_rs_sector"],
+        ls_rs_consistency      = ls_subs["ls_rs_consistency"],
+        ls_rs_momentum         = ls_subs["ls_rs_momentum"],
         ls_trend_age           = ls_subs["ls_trend_age"],
-        ls_adx                 = ls_subs["ls_adx"],
         ls_persistent_strength = ls_subs["ls_persistent_strength"],
         ls_ema20_slope         = ls_subs["ls_ema20_slope"],
         # Conviction subs
         cv_trend_structure = cv_subs["cv_trend_structure"],
         cv_fib_zone        = cv_subs["cv_fib_zone"],
-        cv_cci_recovery    = cv_subs["cv_cci_recovery"],
+        cv_adx             = cv_subs["cv_adx"],
         cv_volume          = cv_subs["cv_volume"],
         cv_squeeze         = cv_subs["cv_squeeze"],
         # Entry Quality subs
@@ -578,6 +658,10 @@ def compute_conviction_v1(r: "BarResult") -> ConvictionV1:
         entry_quality_grade = _grade(entry_quality),
         # Raw measurements (pass-through for display)
         rs_composite           = r.rs_composite,
+        rs_vs_sector            = r.rs_vs_sector,
+        rs_sector_available     = r.rs_sector_available,
+        rs_consistency          = r.rs_consistency,
+        rs_momentum             = r.rs_momentum,
         trend_age_bars         = r.trend_age_bars,
         adx_val                = r.adx_val,
         ema20_slope            = r.ema20_slope,
@@ -602,15 +686,20 @@ SIGNAL_STYLE: dict[str, dict] = {
 
 FACTOR_LABELS: dict[str, str] = {
     # Leadership
-    "ls_rs_composite":        "RS Composite (multi-TF)",
+    "ls_rs_composite":        "RS Composite (multi-TF, market+sector)",
+    "ls_rs_market":           "RS vs Market (Nifty)",
+    "ls_rs_sector":           "RS vs Sector",
+    "ls_rs_consistency":      "RS Consistency (20D/50D/100D)",
+    "ls_rs_momentum":         "RS Momentum / Acceleration",
     "ls_trend_age":           "Trend Age (21-50 bar sweet-spot)",
-    "ls_adx":                 "ADX Strength (≥40 tier)",
     "ls_persistent_strength": "Persistent Strength (mom3 & mom6)",
     "ls_ema20_slope":         "EMA20 Slope (5-bar velocity)",
     # Conviction
     "cv_trend_structure":     "Trend Structure (EMA + Cloud)",
     "cv_fib_zone":            "Fibonacci Pullback Zone",
-    "cv_cci_recovery":        "CCI Recovery / OS Cross",
+    "cv_trend_structure":     "Trend Structure (EMA + Cloud)",
+    "cv_fib_zone":            "Fibonacci Pullback Zone",
+    "cv_adx":                 "ADX Strength (≥40 tier)",
     "cv_volume":              "Volume Sponsorship",
     "cv_squeeze":             "Squeeze Release (energy)",
     # Entry Quality
@@ -622,8 +711,14 @@ FACTOR_LABELS: dict[str, str] = {
 }
 
 FACTOR_WEIGHTS: dict[str, dict] = {
-    "Leadership":    {"rs_composite": 30, "trend_age": 25, "adx": 20, "persistent_strength": 15, "ema20_slope": 10},
-    "Conviction":    {"trend_structure": 30, "fib_zone": 25, "cci_recovery": 25, "volume": 15, "squeeze": 5},
+    # Leadership: raw sub-weights sum to 80 (rescaled x1.25 to 0-100 — see
+    # _leadership() docstring). rs_composite (30) decomposes into
+    # market(12)/sector(10)/consistency(5)/momentum(3).
+    "Leadership":    {"rs_market": 12, "rs_sector": 10, "rs_consistency": 5, "rs_momentum": 3,
+                       "trend_age": 25, "persistent_strength": 15, "ema20_slope": 10},
+    # Conviction: raw sub-weights sum to 95 (rescaled x(100/95) to 0-100).
+    # cci_recovery removed; adx added (moved in from Leadership).
+    "Conviction":    {"trend_structure": 30, "fib_zone": 25, "adx": 20, "volume": 15, "squeeze": 5},
     "Entry Quality": {"ema20_dist": 30, "pivot_dist": 20, "move_since": 20, "ema50_dist": 15, "bars_since": 15},
 }
 
@@ -761,16 +856,19 @@ def compute_conviction_v2(r: "BarResult") -> ConvictionV2:
         signal_class  = signal,
         # Leadership subs
         ls_rs_composite        = ls_subs["ls_rs_composite"],
+        ls_rs_market           = ls_subs["ls_rs_market"],
+        ls_rs_sector           = ls_subs["ls_rs_sector"],
+        ls_rs_consistency      = ls_subs["ls_rs_consistency"],
+        ls_rs_momentum         = ls_subs["ls_rs_momentum"],
         ls_trend_age           = ls_subs["ls_trend_age"],
-        ls_adx                 = ls_subs["ls_adx"],
         ls_persistent_strength = ls_subs["ls_persistent_strength"],
         ls_ema20_slope         = ls_subs["ls_ema20_slope"],
         # Conviction subs
         cv_trend_structure = cv_subs["cv_trend_structure"],
         cv_fib_zone        = cv_subs["cv_fib_zone"],
-        cv_cci_recovery    = cv_subs["cv_cci_recovery"],
-        cv_volume           = cv_subs["cv_volume"],
-        cv_squeeze          = cv_subs["cv_squeeze"],
+        cv_adx             = cv_subs["cv_adx"],
+        cv_volume          = cv_subs["cv_volume"],
+        cv_squeeze         = cv_subs["cv_squeeze"],
         # Entry Quality subs
         eq_ema20_dist       = eq_subs["eq_ema20_dist"],
         eq_ema50_dist       = eq_subs["eq_ema50_dist"],
@@ -783,6 +881,10 @@ def compute_conviction_v2(r: "BarResult") -> ConvictionV2:
         entry_quality_grade = _grade(entry_quality),
         # Raw measurements (pass-through for display)
         rs_composite           = r.rs_composite,
+        rs_vs_sector            = r.rs_vs_sector,
+        rs_sector_available     = r.rs_sector_available,
+        rs_consistency          = r.rs_consistency,
+        rs_momentum             = r.rs_momentum,
         trend_age_bars         = r.trend_age_bars,
         adx_val                = r.adx_val,
         ema20_slope            = r.ema20_slope,
@@ -995,16 +1097,19 @@ def compute_conviction_v3(r: "BarResult", settings: Optional[dict] = None) -> Co
         signal_class  = signal,
         # Leadership subs
         ls_rs_composite        = ls_subs["ls_rs_composite"],
+        ls_rs_market           = ls_subs["ls_rs_market"],
+        ls_rs_sector           = ls_subs["ls_rs_sector"],
+        ls_rs_consistency      = ls_subs["ls_rs_consistency"],
+        ls_rs_momentum         = ls_subs["ls_rs_momentum"],
         ls_trend_age           = ls_subs["ls_trend_age"],
-        ls_adx                 = ls_subs["ls_adx"],
         ls_persistent_strength = ls_subs["ls_persistent_strength"],
         ls_ema20_slope         = ls_subs["ls_ema20_slope"],
         # Conviction subs
         cv_trend_structure = cv_subs["cv_trend_structure"],
         cv_fib_zone        = cv_subs["cv_fib_zone"],
-        cv_cci_recovery    = cv_subs["cv_cci_recovery"],
-        cv_volume           = cv_subs["cv_volume"],
-        cv_squeeze          = cv_subs["cv_squeeze"],
+        cv_adx             = cv_subs["cv_adx"],
+        cv_volume          = cv_subs["cv_volume"],
+        cv_squeeze         = cv_subs["cv_squeeze"],
         # Entry Quality subs
         eq_ema20_dist       = eq_subs["eq_ema20_dist"],
         eq_ema50_dist       = eq_subs["eq_ema50_dist"],
@@ -1017,6 +1122,10 @@ def compute_conviction_v3(r: "BarResult", settings: Optional[dict] = None) -> Co
         entry_quality_grade = _grade(entry_quality),
         # Raw measurements (pass-through for display)
         rs_composite           = r.rs_composite,
+        rs_vs_sector            = r.rs_vs_sector,
+        rs_sector_available     = r.rs_sector_available,
+        rs_consistency          = r.rs_consistency,
+        rs_momentum             = r.rs_momentum,
         trend_age_bars         = r.trend_age_bars,
         adx_val                = r.adx_val,
         ema20_slope            = r.ema20_slope,
