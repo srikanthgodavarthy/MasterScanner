@@ -2447,65 +2447,72 @@ def _today_sector_flow_compact_html(flow: dict, rows: int = 3, compact: bool = F
 
 
 # ── LIVE SCANNER SNAPSHOT (compact card) ────────────────────────────
-# Small read-only preview of TODAY's triggered equity setups — reuses the
-# SetupAge/EntryLocked/EntryDriftPct columns utils.setup_persistence
-# already merges onto df_aug for the Scanner page's own tables (see
-# utils/setup_persistence.py's scanner_row["SetupAge"/"EntryLocked"/
-# "EntryDriftPct"]), just a narrower column set, today-only, and fewer
-# rows — same "today's live output only" rule as the ACTIVE OPTIONS
-# PLANS card next to it. The full equity Active Plans tab (with status,
+# Compact preview of everything currently actionable — a single rule:
+# CURRENT tier is Elite/Execute/Actionable (Recommendation, or Category
+# for legacy cached scans — same split pages/scanner.py's own
+# has_cv1/_sc_df logic uses). [2026-08-09, SG request, simplified] This
+# used to also pull in any row with PlanStatus == ACTIVE regardless of
+# tier, on the theory that an open position is inherently "actionable" —
+# but a plan mints on Elite/Execute/Actionable and then tracks by price,
+# so its tier can decay to Watch/Skip while the position stays
+# technically ACTIVE. Pulling those in was the exact "still have non
+# actionable list" bug: e.g. GODREJPROP/FEDERALBNK/AEGISVOPAK/GODREJIND/
+# KARURVYSYA showing here while sitting at Watch/Skip tier. Tier alone
+# already covers both "live scanner just flagged this" and "this is an
+# active setup" — an ACTIVE plan whose tier is still Actionable+ passes
+# this filter same as before, it just no longer gets a free pass once
+# its tier drops. The full equity Active Plans tab (with status,
 # targets, R:R, multi-day history, etc.) stays on the Scanner page —
 # this is only a glance, not a replacement for it.
 def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
-    need = {"Stock", "%Chg", "SetupAge", "EntryLocked", "EntryDriftPct", "ActivatedAt", "PlanStatus"}
+    need = {"Stock", "%Chg", "EntryLocked", "EntryDriftPct", "PlanStatus"}
     if df_aug is None or df_aug.empty or not need.issubset(df_aug.columns):
         return ('<div class="sr-panel"><div class="sr-panel-title">LIVE SCANNER SNAPSHOT</div>'
                 '<div style="color:#8b949e;font-size:0.75rem;">No scan data yet.</div></div>')
 
     work = df_aug.copy()
-    work["SetupAge"] = work["SetupAge"].astype(str)
-    work = work[work["SetupAge"].str.strip().replace({"nan": "", "None": ""}) != ""]
-    # [2026-08-05] Restrict to PlanStatus == ACTIVE (entry actually
-    # triggered — utils/setup_persistence.py's SetupPlanStatus.ACTIVE).
-    # Previously any row with a non-empty SetupAge qualified, which
-    # included WAITING setups (not yet triggered) too — that made this
-    # panel a near-duplicate of whichever symbols the scanner touched
-    # today, which is how it ended up overlapping with NSE Top Gainers.
-    # ACTIVE-only means every row here is a genuinely *live* (open,
-    # triggered) scanner setup, not just anything on the scanner's radar.
-    work = work[work["PlanStatus"].astype(str).str.upper() == "ACTIVE"]
     work["%Chg"] = pd.to_numeric(work["%Chg"], errors="coerce")
     work = work.dropna(subset=["%Chg"])
-    # [2026-08-04] Sort by most-recently-activated, not %Chg. Previously this
-    # copy-pasted _nse_top_gainers_html's sort_values("%Chg", ascending=False)
-    # pattern, which made this panel just a second "top movers" ranking of a
-    # subset of the same stocks — defeating the point of a *scanner* snapshot
-    # (which should surface what the scanner just did, not who's up the most
-    # today). ActivatedAt is the raw ISO timestamp set on WAITING -> ACTIVE
-    # (utils/setup_persistence.py). [2026-08-08] Rows with no parseable
-    # ActivatedAt are now dropped by the today-only filter below rather than
-    # sorting last, since an unverifiable timestamp can't be confirmed as
-    # "today" either.
-    work["_activated_at"] = pd.to_datetime(work["ActivatedAt"], errors="coerce")
 
-    # [2026-08-08, SG request] Today-only — same rule just applied to the
-    # ACTIVE OPTIONS PLANS card next to this one: a setup triggered on a
-    # prior day (and still technically ACTIVE) is carryover, not
-    # something today's scan cycle actually produced. ActivatedAt is
-    # stored UTC (utils/setup_persistence.py); shift +5:30 for the IST
-    # day boundary before comparing, matching _today_ist_date_str()
-    # below. Rows with no parseable ActivatedAt (NaT) fall out of this
-    # comparison naturally (NaT + timedelta is still NaT, never equals
-    # `today`), so an unverifiable timestamp doesn't earn a slot either.
-    today = _today_ist_date_str()
-    work = work[(work["_activated_at"] + pd.Timedelta(hours=5, minutes=30)).dt.strftime("%Y-%m-%d") == today]
+    # Recommendation is the modern CV1 tier column; Category is the
+    # legacy fallback for cached scans predating that refactor — same
+    # split as pages/scanner.py's `has_cv1` check. A row qualifies here
+    # purely on CURRENT tier, not on whether a plan ever triggered.
+    if "Recommendation" in work.columns:
+        tier_col, actionable_vals = "Recommendation", {"Elite", "Execute", "Actionable"}
+    elif "Category" in work.columns:
+        tier_col, actionable_vals = "Category", {"Elite Opportunity", "High Conviction", "Actionable"}
+    else:
+        tier_col, actionable_vals = None, set()
 
-    work = work.sort_values("_activated_at", ascending=False, na_position="last").head(top_n)
+    work["_actionable_now"] = (
+        work[tier_col].astype(str).isin(actionable_vals) if tier_col else False
+    )
+
+    # PlanStatus == ACTIVE is used only to break ties in sort order below
+    # (an already-triggered plan is the most actionable form of
+    # "actionable"), never as a separate inclusion path.
+    work["_is_active"] = work["PlanStatus"].astype(str).str.upper() == "ACTIVE"
+
+    work = work[work["_actionable_now"]]
 
     if work.empty:
         return ('<div class="sr-panel"><div class="sr-panel-title">LIVE SCANNER SNAPSHOT</div>'
-                '<div style="color:#8b949e;font-size:0.75rem;">No active setups triggered today.</div></div>')
+                '<div style="color:#8b949e;font-size:0.75rem;">No actionable setups right now.</div></div>')
 
+    # Open (triggered) setups first — already actionable in the fullest
+    # sense — then the rest ranked by score (CV1_Composite, same field
+    # pages/scanner.py's own _sc_df sorts by; falls back to Leadership,
+    # then %Chg if neither is present in this scan's columns).
+    score_col = (
+        "CV1_Composite" if "CV1_Composite" in work.columns
+        else "CV1_Leadership" if "CV1_Leadership" in work.columns
+        else "%Chg"
+    )
+    work[score_col] = pd.to_numeric(work[score_col], errors="coerce")
+    work = work.sort_values(
+        ["_is_active", score_col], ascending=[False, False], na_position="last"
+    ).head(top_n)
 
     def _current_price(row):
         # Same fallback chain as _nse_top_gainers_html's _ltp() next to
