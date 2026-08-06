@@ -56,6 +56,7 @@ Usage
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from typing import Any, Optional
@@ -266,10 +267,15 @@ def save_snapshot(
     }
     try:
         from utils.supabase_client import _execute_with_retry
-        resp = _execute_with_retry(client.table(_table(section)).insert(row))
-        if not resp.data:
-            logger.error("save_snapshot(%s) insert returned no data.", section)
-            return None
+        # returning="minimal": scan_id is already known (generated above,
+        # client-side) so nothing here needs the row Supabase would
+        # otherwise echo back — that echo was pure wasted egress on every
+        # single insert (market_intelligence/fo_scan payloads can be
+        # substantial). Success is now determined by "insert() didn't
+        # raise" (_execute_with_retry / postgrest raises APIError on any
+        # real failure) rather than by resp.data being non-empty, which
+        # is always [] under minimal returning regardless of outcome.
+        _execute_with_retry(client.table(_table(section)).insert(row, returning="minimal"))
         return scan_id
     except ValueError as exc:
         # Should be rare now that the sanitization above runs unconditionally
@@ -352,6 +358,82 @@ def load_snapshot_payload(section: str) -> Optional[dict]:
         return None
 
 
+# ─── Scheduler-safe version-gated payload cache ────────────────────────────
+# [Egress/RAM fix, 2026-08-06] utils.snapshot_cache already solves this
+# exact problem for Streamlit-side (session/render/fragment) callers with
+# an st.cache_data layer — but that module's own docstring explicitly
+# forbids importing it from scheduler/scan_worker.py or Stage-1/Stage-2
+# producer code, since those run in a plain Python thread with no
+# Streamlit runtime.
+#
+# Without any caching there, jobs that read another job's snapshot on a
+# SHORTER cadence than that snapshot actually changes re-fetch identical
+# data every tick. The clearest case: utils.dore_live_state.
+# refresh_dore_live_state() (Stage 2) runs every 60s and reads
+# "dore_technical_plans", but Stage 1 (utils.dore_options_scan.
+# compute_dore_technical_plans) only writes a new version once every
+# 5 minutes — so 4 out of every 5 of those 60s reads were pulling a
+# byte-for-byte identical payload. utils.scan_state._market_intelligence_
+# compute's read of "live_scanner" every 180s has the same shape against
+# live_scanner's 5-minute cadence.
+#
+# This is the same meta-then-payload, version-keyed idea as
+# snapshot_cache.py, just backed by a plain dict + lock instead of
+# st.cache_data, so it works in any thread/process with no Streamlit
+# runtime. Capped at _SCHED_CACHE_MAX_ENTRIES for the same reason
+# snapshot_cache.py caps at 12 — a small, known set of sections, with
+# headroom for a version or two of overlap during rollover, not meant to
+# grow unbounded as versions churn over days.
+
+_SCHED_CACHE_MAX_ENTRIES = 12
+_sched_payload_cache: dict[tuple[str, Any], Optional[dict]] = {}
+_sched_payload_cache_lock = threading.Lock()
+
+
+def load_snapshot_payload_cached(section: str) -> Optional[dict]:
+    """
+    Version-gated replacement for calling load_snapshot_meta() then
+    load_snapshot_payload() by hand, safe to call from
+    scheduler/scan_worker.py, utils.inprocess_scheduler's background
+    threads, or any Stage-1/Stage-2 producer — no Streamlit dependency.
+
+    The underlying Supabase payload read only happens once per
+    (section, version) per process; every call after the first for an
+    unchanged version returns the same cached dict instead of re-fetching.
+    """
+    meta = load_snapshot_meta(section)
+    if meta is None or meta.get("status") != "completed":
+        return None
+    version = meta.get("version")
+    key = (section, version)
+
+    with _sched_payload_cache_lock:
+        if key in _sched_payload_cache:
+            return _sched_payload_cache[key]
+
+    # Deliberately fetched OUTSIDE the lock — this is a real Supabase
+    # network call, and holding the lock across it would serialize every
+    # section's reads behind whichever one happens to miss first. A
+    # duplicate concurrent miss on the exact same (section, version) is
+    # possible but harmless (worst case: two threads each pay for one
+    # real fetch instead of one) — vastly cheaper than the redundant
+    # reads this cache exists to eliminate in the first place.
+    payload = load_snapshot_payload(section)
+
+    with _sched_payload_cache_lock:
+        _sched_payload_cache[key] = payload
+        if len(_sched_payload_cache) > _SCHED_CACHE_MAX_ENTRIES:
+            # Evict oldest-inserted entries first (dict preserves
+            # insertion order since Py3.7) — good enough for a handful of
+            # known sections with occasional version-rollover overlap;
+            # doesn't need true LRU semantics.
+            for stale_key in list(_sched_payload_cache)[: len(_sched_payload_cache) - _SCHED_CACHE_MAX_ENTRIES]:
+                if stale_key != key:
+                    _sched_payload_cache.pop(stale_key, None)
+
+    return payload
+
+
 # ─── STATE SECTION IMPLEMENTATION (backs "live_scanner" / "dore_live_state") ──
 
 def _save_state(
@@ -381,7 +463,7 @@ def _save_state(
                 client.table("state_meta").upsert(
                     {"section": section, "scan_id": scan_id, "status": status,
                      "error": error, "updated_at": "now()"},
-                    on_conflict="section",
+                    on_conflict="section", returning="minimal",
                 )
             )
         except Exception:
@@ -476,16 +558,26 @@ def _save_state(
 
     try:
         from utils.supabase_client import _execute_with_retry
+        # returning="minimal" on both upserts below: this function never
+        # reads the response (it already has scan_id/rows in hand), so
+        # the default representation echo was pure waste — and the worst
+        # offender for it, since `rows` here is the FULL current state
+        # for every symbol/plan in live_scanner_state or dore_live_state,
+        # rewritten unconditionally every cycle from an in-process
+        # background thread (utils/inprocess_scheduler.py) sharing the
+        # same heap as the Streamlit UI on Streamlit Cloud. Every one of
+        # those cycles was also downloading a full copy of what it just
+        # uploaded before this fix.
         if rows:
             _execute_with_retry(
-                client.table(cfg["table"]).upsert(rows, on_conflict=key_column)
+                client.table(cfg["table"]).upsert(rows, on_conflict=key_column, returning="minimal")
             )
         _execute_with_retry(
             client.table("state_meta").upsert(
                 {"section": section, "scan_id": scan_id, "status": "completed",
                  "row_count": row_count if row_count is not None else len(rows),
                  "error": None, "extra": extra, "updated_at": "now()"},
-                on_conflict="section",
+                on_conflict="section", returning="minimal",
             )
         )
         logger.info("_save_state(%s): upserted %d row(s)", section, len(rows))

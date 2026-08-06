@@ -188,7 +188,7 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
        general-purpose gate for any future job that has the same
        "my whole input is the live_scanner snapshot" shape.
     """
-    from utils.scan_state import save_snapshot, load_snapshot_payload
+    from utils.scan_state import save_snapshot, load_snapshot_payload, load_snapshot_meta
     from utils.system_state import should_scheduler_run
     from utils.scan_health_monitor import check_health
 
@@ -221,7 +221,17 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
             live = None
             live_age = None
             try:
-                live = load_snapshot_payload("live_scanner")
+                # [Egress/RAM fix, 2026-08-06] This only ever reads
+                # created_at and existence — never the payload — so it
+                # should call load_snapshot_meta() (a small metadata-only
+                # query that never touches the payload column) rather
+                # than load_snapshot_payload(), which was fetching the
+                # entire live_scanner_state table just to check one
+                # timestamp. Currently dead code (no job sets
+                # require_fresh_live_scanner=True — see this function's
+                # docstring) but fixed anyway so any future job that
+                # flips this flag on doesn't inherit the old cost.
+                live = load_snapshot_meta("live_scanner")
                 if live and live.get("created_at"):
                     from datetime import datetime, timezone
                     created = datetime.fromisoformat(str(live["created_at"]).replace("Z", "+00:00"))
@@ -277,10 +287,10 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
 
 # ── Market Intelligence — every 30s ──────────────────────────────────
 def _market_intelligence_compute():
-    from utils.scan_state import load_snapshot_payload
+    from utils.scan_state import load_snapshot_payload_cached
     from utils.market_intelligence import compute_market_intelligence
 
-    live = load_snapshot_payload("live_scanner")
+    live = load_snapshot_payload_cached("live_scanner")
     df_aug = pd.DataFrame((live or {}).get("payload", {}).get("data", [])) if live else pd.DataFrame()
     return compute_market_intelligence(df_aug=df_aug)
 
@@ -401,7 +411,7 @@ def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
     just be wasted work, same as any other duplicated job).
     """
     from utils.scan_state import prune_all_snapshots
-    from utils.supabase_client import prune_scan_snapshot_tables
+    from utils.supabase_client import prune_scan_snapshot_tables, prune_oi_and_premium_history
 
     logger.info("[retention] loop starting, every %ss", interval_secs)
     while True:
@@ -415,6 +425,10 @@ def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
             # audit to have no retention at all; see prune_scan_snapshot_tables()'s
             # docstring.
             results.update(prune_scan_snapshot_tables())
+            # [Egress/RAM fix, 2026-08-06] dore_oi_baseline/dore_premium_history
+            # previously had no retention at all — see
+            # prune_oi_and_premium_history()'s docstring.
+            results.update(prune_oi_and_premium_history())
             logger.info("[retention] pruned snapshot tables: %s", results)
         except Exception:
             logger.exception("[retention] prune_all_snapshots failed (non-fatal — retrying next cycle)")
@@ -459,7 +473,7 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                   lock stops this loop within one batch, not one full
                   5-minute cycle.
     """
-    from utils.scan_state import save_snapshot, load_snapshot_payload
+    from utils.scan_state import save_snapshot, load_snapshot_payload_cached
     from utils.live_scanner_job import compute_live_scan_batch, build_regime_context_for_cycle
     from utils.regime_engine import apply_regime_layer
     from utils.scanner_engine import NIFTY500_SYMBOLS
@@ -610,7 +624,7 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             # `merged`, not a reason to also touch the DB.
             if manual_override_active("live_scanner"):
                 try:
-                    latest = load_snapshot_payload("live_scanner")
+                    latest = load_snapshot_payload_cached("live_scanner")
                     manual_records = (latest or {}).get("payload", {}).get("data", []) or []
                     for rec in manual_records:
                         key = _row_key(rec)

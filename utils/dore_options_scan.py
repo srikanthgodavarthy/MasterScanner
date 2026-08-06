@@ -416,8 +416,8 @@ def compute_dore_technical_plans(cfg: Optional[DoreOptionsSettings] = None,
     from utils.json_sanitize import find_invalid_columns, sanitize_dataframe
 
     if live_pool is None:
-        from utils.scan_state import load_snapshot_payload
-        latest = load_snapshot_payload("live_scanner")
+        from utils.scan_state import load_snapshot_payload_cached
+        latest = load_snapshot_payload_cached("live_scanner")
         records = (latest or {}).get("payload", {}).get("data", []) or []
         live_pool = {r.get("Stock") or r.get("Symbol"): r for r in records if (r.get("Stock") or r.get("Symbol"))}
     else:
@@ -548,8 +548,8 @@ def compute_dore_technical_plans(cfg: Optional[DoreOptionsSettings] = None,
     missing = open_plan_symbols - {r.get("symbol") for r in records}
     if missing:
         try:
-            from utils.scan_state import load_snapshot_payload
-            prev_snap = load_snapshot_payload("dore_technical_plans")
+            from utils.scan_state import load_snapshot_payload_cached
+            prev_snap = load_snapshot_payload_cached("dore_technical_plans")
             prev_records = (prev_snap.get("payload", {}) or {}).get("technical_plans", []) or [] if prev_snap else []
             prev_created_at = (prev_snap or {}).get("created_at")
             prev_by_symbol = {r.get("symbol"): r for r in prev_records if r.get("symbol")}

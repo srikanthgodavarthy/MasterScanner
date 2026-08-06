@@ -222,7 +222,7 @@ def refresh_dore_live_state(cfg=None) -> dict:
     exact shape utils.scan_state.save_snapshot("dore_live_state", ...)
     expects.
     """
-    from utils.scan_state import load_snapshot_payload
+    from utils.scan_state import load_snapshot_payload_cached
     from utils.upstox_client import fetch_open_plan_option_quotes, fetch_index_quote, resolve_instrument_key
     from utils.json_sanitize import find_invalid_columns, find_invalid_columns_by_source, sanitize_dataframe
     from utils.supabase_client import load_open_dore_options_plans
@@ -240,7 +240,7 @@ def refresh_dore_live_state(cfg=None) -> dict:
     # reproduce it this cycle; every OPEN plan gets refreshed here
     # regardless of whether Stage 1 currently likes it.
     plans: list[dict] = []
-    tech_snap = load_snapshot_payload("dore_technical_plans")
+    tech_snap = load_snapshot_payload_cached("dore_technical_plans")
     if not tech_snap:
         logger.info("[dore_live_state] no dore_technical_plans snapshot yet — "
                      "refreshing OPEN plans directly from Supabase only, if any")

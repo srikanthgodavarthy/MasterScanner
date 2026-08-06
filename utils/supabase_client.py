@@ -143,8 +143,10 @@ def save_scan_snapshot(df: pd.DataFrame, label: str = "") -> bool:
         })
 
     try:
-        resp = client.table("scan_snapshots").insert(rows).execute()
-        # supabase-py v2: resp.data is a list; empty list means failure
+        # returning="minimal": nothing below reads resp.data, only whether
+        # the call raised — the default echo-back of every inserted row
+        # was wasted egress on every scan cycle.
+        resp = client.table("scan_snapshots").insert(rows, returning="minimal").execute()
         if resp.data is None:
             logger.error("scan_snapshots insert returned no data.")
             return False
@@ -316,7 +318,12 @@ def archive_daily_scan(df: pd.DataFrame, metadata: Optional[dict] = None) -> boo
     }
 
     try:
-        resp = client.table("scan_daily_archive").insert(row).execute()
+        # returning="minimal": this row contains the FULL scanner output
+        # (all rows, all columns) for the day — the largest single write
+        # in the app. Nothing here reads resp.data, so the default
+        # representation echo was doubling this write's egress for no
+        # reason.
+        resp = client.table("scan_daily_archive").insert(row, returning="minimal").execute()
         if resp.data is None:
             logger.error("scan_daily_archive insert returned no data.")
             return False
@@ -465,7 +472,7 @@ def save_sector_snapshot(rows: list[dict]) -> bool:
     try:
         resp = (
             client.table("sector_snapshots")
-            .upsert(rows, on_conflict="sector,scan_date")
+            .upsert(rows, on_conflict="sector,scan_date", returning="minimal")
             .execute()
         )
         if resp.data is None:
@@ -756,7 +763,9 @@ def save_backtest_results(trades_df: pd.DataFrame, run_label: str = "",
         # Insert in batches of 500 (Supabase row limit per request)
         batch_size = 500
         for i in range(0, len(rows), batch_size):
-            resp = client.table("backtest_results").insert(rows[i : i + batch_size]).execute()
+            resp = client.table("backtest_results").insert(
+                rows[i : i + batch_size], returning="minimal"
+            ).execute()
             if resp.data is None:
                 return False
         return True
@@ -823,7 +832,7 @@ def upsert_first_seen(symbol_categories: list[tuple[str, str]]) -> bool:
         # upsert with ignoreDuplicates=True → existing rows are left untouched
         resp = (
             client.table("signal_first_seen")
-            .upsert(rows, on_conflict="symbol", ignore_duplicates=True)
+            .upsert(rows, on_conflict="symbol", ignore_duplicates=True, returning="minimal")
             .execute()
         )
         return resp.data is not None
@@ -890,7 +899,7 @@ def save_lifecycle_snapshot(rows: list[dict]) -> bool:
         for i in range(0, len(clean), batch):
             resp = (
                 client.table("lifecycle_states")
-                .upsert(clean[i : i + batch], on_conflict="symbol,scan_date")
+                .upsert(clean[i : i + batch], on_conflict="symbol,scan_date", returning="minimal")
                 .execute()
             )
             if resp.data is None:
@@ -980,7 +989,7 @@ def save_lifecycle_transitions(transitions: list[dict]) -> bool:
         for i in range(0, len(transitions), batch):
             resp = (
                 client.table("lifecycle_transitions")
-                .insert(transitions[i : i + batch])
+                .insert(transitions[i : i + batch], returning="minimal")
                 .execute()
             )
             if resp.data is None:
@@ -1056,7 +1065,7 @@ def upsert_setup_plan(plan_dict: dict) -> bool:
     try:
         resp = (
             client.table("setup_plans")
-            .upsert(row, on_conflict="setup_id")
+            .upsert(row, on_conflict="setup_id", returning="minimal")
             .execute()
         )
         return resp.data is not None
@@ -1085,7 +1094,7 @@ def upsert_setup_plans_batch(plans: list[dict]) -> bool:
         for i in range(0, len(clean), batch_size):
             resp = (
                 client.table("setup_plans")
-                .upsert(clean[i: i + batch_size], on_conflict="setup_id")
+                .upsert(clean[i: i + batch_size], on_conflict="setup_id", returning="minimal")
                 .execute()
             )
             if resp.data is None:
@@ -1276,7 +1285,9 @@ def upsert_fo_setup_plan(plan_dict: dict) -> bool:
 
     row = {k: _safe(v) for k, v in plan_dict.items()}
     try:
-        resp = client.table("fo_setup_plans").upsert(row, on_conflict="setup_id").execute()
+        resp = client.table("fo_setup_plans").upsert(
+            row, on_conflict="setup_id", returning="minimal"
+        ).execute()
         return resp.data is not None
     except Exception as exc:
         logger.error("upsert_fo_setup_plan failed: %s", exc)
@@ -1302,7 +1313,7 @@ def upsert_fo_setup_plans_batch(plans: list[dict]) -> bool:
         for i in range(0, len(clean), batch_size):
             resp = _execute_with_retry(
                 client.table("fo_setup_plans")
-                .upsert(clean[i: i + batch_size], on_conflict="setup_id")
+                .upsert(clean[i: i + batch_size], on_conflict="setup_id", returning="minimal")
             )
             if resp.data is None:
                 return False
@@ -1438,7 +1449,7 @@ def upsert_dore_options_plans_batch(plans: list[dict]) -> bool:
         for i in range(0, len(clean), batch_size):
             resp = _execute_with_retry(
                 client.table("dore_options_plans")
-                .upsert(clean[i: i + batch_size], on_conflict="plan_id")
+                .upsert(clean[i: i + batch_size], on_conflict="plan_id", returning="minimal")
             )
             if resp.data is None:
                 return False
@@ -1773,7 +1784,9 @@ def save_oi_baseline_snapshot(rows: list[dict]) -> bool:
     if client is None:
         return False
     try:
-        resp = client.table("dore_oi_baseline").upsert(rows, on_conflict="key").execute()
+        resp = client.table("dore_oi_baseline").upsert(
+            rows, on_conflict="key", returning="minimal"
+        ).execute()
         if resp.data is None:
             logger.error("dore_oi_baseline upsert returned no data.")
             return False
@@ -1781,6 +1794,56 @@ def save_oi_baseline_snapshot(rows: list[dict]) -> bool:
     except Exception as exc:
         logger.error("save_oi_baseline_snapshot failed: %s", exc)
         return False
+
+
+def prune_oi_and_premium_history(keep_days: int = 2) -> dict:
+    """
+    [Egress/RAM fix, 2026-08-06] dore_oi_baseline and dore_premium_history
+    had NO retention logic at all — every row ever written stayed
+    forever, and both load_oi_baseline_snapshots()/
+    load_premium_history_snapshots() do an unfiltered `select("*")`-style
+    full-table read every DORE cycle (filtering down to "today" only
+    AFTER the fetch, client-side). That meant both the egress AND the
+    in-process memory footprint of every single cycle's read grew a
+    little more every day the tables weren't pruned — a genuine slow
+    RAM-creep mechanism, not just a one-off spike.
+
+    Deletes rows older than `keep_days` calendar days (by snapshot_date).
+    Both tables only ever need "today" (and briefly "yesterday", for any
+    process still finishing a cycle that started right at midnight IST) —
+    see the same-day rollover rule documented in utils.oi_snapshot_store.
+
+    Returns {table_name: n_deleted_or_None}, same fail-soft convention as
+    prune_scan_snapshot_tables() — a failed prune is logged and skipped,
+    never fatal to the caller.
+    """
+    client = get_client()
+    if client is None:
+        return {"dore_oi_baseline": None, "dore_premium_history": None}
+
+    from datetime import timezone as _tz, timedelta as _td
+    cutoff = (datetime.now(_tz.utc) - _td(days=keep_days)).date().isoformat()
+
+    results = {}
+    for table in ("dore_oi_baseline", "dore_premium_history"):
+        try:
+            # count="exact" reports how many rows matched via the
+            # Content-Range response header — not the response body — so
+            # this still avoids echoing the deleted rows themselves.
+            resp = (
+                client.table(table)
+                .delete(returning="minimal", count="exact")
+                .lt("snapshot_date", cutoff)
+                .execute()
+            )
+            if resp.count:
+                logger.info("prune_oi_and_premium_history(%s): deleted %s row(s) older than %s",
+                            table, resp.count, cutoff)
+            results[table] = resp.count
+        except Exception:
+            logger.exception("prune_oi_and_premium_history(%s) failed (non-fatal)", table)
+            results[table] = None
+    return results
 
 
 def load_oi_baseline_snapshots() -> list[dict]:
@@ -1824,7 +1887,9 @@ def save_premium_history_snapshot(rows: list[dict]) -> bool:
     if client is None:
         return False
     try:
-        resp = client.table("dore_premium_history").upsert(rows, on_conflict="key").execute()
+        resp = client.table("dore_premium_history").upsert(
+            rows, on_conflict="key", returning="minimal"
+        ).execute()
         if resp.data is None:
             logger.error("dore_premium_history upsert returned no data.")
             return False
@@ -1915,7 +1980,9 @@ def upsert_rotate_flags(flags: list[dict]) -> dict[str, str]:
         return {}
 
     try:
-        client.table("rotate_flags").upsert(rows, on_conflict="symbol").execute()
+        client.table("rotate_flags").upsert(
+            rows, on_conflict="symbol", returning="minimal"
+        ).execute()
     except Exception as exc:
         logger.error("upsert_rotate_flags upsert failed: %s", exc)
 
@@ -1947,7 +2014,7 @@ def clear_rotate_flags(symbols: list[str]) -> bool:
     if client is None or not syms:
         return False
     try:
-        client.table("rotate_flags").delete().in_("symbol", syms).execute()
+        client.table("rotate_flags").delete(returning="minimal").in_("symbol", syms).execute()
         return True
     except Exception as exc:
         logger.error("clear_rotate_flags failed: %s", exc)
