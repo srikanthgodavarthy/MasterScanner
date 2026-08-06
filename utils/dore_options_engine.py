@@ -1087,6 +1087,56 @@ def select_strikes(
             "capture_ratio": round(capture, 3),
             "probability_of_profit": round(_probability_of_profit(offset, sig.expected_move), 1),
         }
+
+    # [Sprint 2 — Strike Clustering, 2026-08-06] For a low-volatility
+    # underlying (small expected_move) against a coarse strike_interval,
+    # the three raw offsets above can all round to the SAME strike —
+    # e.g. expected_move=40 vs strike_interval=50 collapses Conservative/
+    # Balanced/Aggressive onto one ATM strike, silently losing the
+    # ITM/ATM/OTM spread the three labels are supposed to represent
+    # (confirmed against real trade history — this was the actual
+    # "strike clustering" symptom, not multiple candidates being minted
+    # per symbol, which compute_dore_trade_plan()/top_dore_trade_plans()
+    # never did in the first place — one symbol always produced exactly
+    # one OptionTradePlan with these three as its primary/conservative/
+    # aggressive fields).
+    #
+    # Walks the three labels in increasing-offset order (Conservative ->
+    # Balanced -> Aggressive is already that order by construction — see
+    # `scales` above) and nudges any strike that collided with (or, from
+    # floating-point/rounding quirks, crossed) the previous one out by
+    # one more strike_interval in the same away-from-spot direction.
+    # Never nudges Conservative itself (nothing "more ITM" to fall back
+    # to) and respects max_offset when it's set — if the long-DTE/high-
+    # confidence OTM cap (see max_offset above) doesn't leave room for a
+    # 3rd distinct strike, Aggressive is left equal to Balanced rather
+    # than pushed past the cap; a duplicate-but-capped strike is a lesser
+    # problem than silently blowing through a deliberately-set risk cap.
+    # Distinct strikes only ever move OTM (further from spot), so a
+    # collapsed one never becomes more ITM than intended.
+    step = strike_interval if strike_interval > 0 else 1.0
+    ordered_labels = [CONSERVATIVE, BALANCED, AGGRESSIVE]
+    for prev_label, label in zip(ordered_labels, ordered_labels[1:]):
+        prev_strike = out[prev_label]["strike"]
+        cur = out[label]
+        if dir_ == CE:
+            collided = cur["strike"] <= prev_strike
+            bumped_strike = prev_strike + step
+            capped = max_offset is not None and (bumped_strike - sig.current_price) > max_offset
+        else:
+            collided = cur["strike"] >= prev_strike
+            bumped_strike = prev_strike - step
+            capped = max_offset is not None and (sig.current_price - bumped_strike) > max_offset
+        if collided and not capped:
+            bumped_offset = abs(bumped_strike - sig.current_price)
+            cur["strike"] = bumped_strike
+            cur["offset"] = round(bumped_offset, 2)
+            cur["probability_of_profit"] = round(_probability_of_profit(bumped_offset, sig.expected_move), 1)
+            # capture_ratio left as originally computed — it's the input
+            # that drove the offset calc, not a function of the final
+            # (possibly nudged) strike; recomputing it from the bumped
+            # offset would misrepresent what settings actually produced.
+
     return out
 
 
