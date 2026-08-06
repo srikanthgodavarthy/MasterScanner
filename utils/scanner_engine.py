@@ -93,17 +93,7 @@ _YF_LOCK_RETRY_S  = 0.5   # base backoff for "database is locked" (short + jitte
 _YF_LOCK_MAX_TRY  = 5     # locked-db is transient; worth a few extra quick attempts
 _YF_RATELIMIT_BASE_S = 20  # base cooldown for rate-limit errors (exponential: 20s, 40s, 80s...)
 
-_yf_call_lock  = threading.Lock()   # serializes spacing AND the actual yf.download()
-                                     # call itself (protects _yf_last_call_ts and,
-                                     # critically, prevents two threads' yf.download()
-                                     # calls from ever overlapping — yfinance is not
-                                     # thread-safe across concurrent download() calls
-                                     # and mixes up which symbol's columns belong to
-                                     # which request when they overlap; only held
-                                     # around the network call, not around backoff
-                                     # sleeps, so a rate-limit cooldown on one thread
-                                     # doesn't stall unrelated retries longer than
-                                     # necessary — see yf_download_with_retry())
+_yf_call_lock  = threading.Lock()   # serializes spacing + protects _yf_last_call_ts
 _yf_last_call_ts = 0.0
 
 
@@ -121,18 +111,14 @@ def _is_rate_limit_error(exc: Exception) -> bool:
 def _wait_for_spacing():
     """Blocks the caller (if needed) so consecutive yf.download() attempts
     across the whole process are never closer together than
-    _YF_MIN_SPACING_S. Cheap no-op once the process has been idle a bit.
-
-    Caller MUST already hold _yf_call_lock (see yf_download_with_retry) —
-    this only does the spacing math/sleep, it doesn't acquire the lock
-    itself, since the lock now also has to stay held across the actual
-    yf.download() call (see _yf_call_lock's docstring)."""
+    _YF_MIN_SPACING_S. Cheap no-op once the process has been idle a bit."""
     global _yf_last_call_ts
-    now = time.monotonic()
-    wait = _YF_MIN_SPACING_S - (now - _yf_last_call_ts)
-    if wait > 0:
-        time.sleep(wait)
-    _yf_last_call_ts = time.monotonic()
+    with _yf_call_lock:
+        now = time.monotonic()
+        wait = _YF_MIN_SPACING_S - (now - _yf_last_call_ts)
+        if wait > 0:
+            time.sleep(wait)
+        _yf_last_call_ts = time.monotonic()
 
 
 def yf_download_with_retry(tickers, **kwargs):
@@ -158,31 +144,10 @@ def yf_download_with_retry(tickers, **kwargs):
     max_total_attempts = _YF_MAX_RETRIES + _YF_LOCK_MAX_TRY  # locked-db retries are extra, not counted against the normal budget
 
     while attempt <= max_total_attempts:
-        # _yf_call_lock is held across spacing AND the download call itself
-        # (not just the spacing sleep) — yfinance is not thread-safe for
-        # concurrent download() calls across threads, and this app runs
-        # several background threads (live scanner, retention, scheduled
-        # jobs — see inprocess_scheduler.py) that can all reach this
-        # function at once. Without full serialization here, two in-flight
-        # calls can cross-contaminate: one thread's returned DataFrame ends
-        # up carrying another thread's tickers as its MultiIndex columns,
-        # which then fails with a KeyError for every symbol in the chunk
-        # (confirmed via history_store's diagnostic logging — the tickers
-        # in raw.columns belonged to a completely different, concurrently
-        # running chunk, not the one being processed). The lock is
-        # released before any backoff sleep below, so a rate-limit
-        # cooldown on one thread doesn't stall unrelated retries longer
-        # than necessary.
-        download_exc = None
-        with _yf_call_lock:
-            _wait_for_spacing()
-            try:
-                result = yf.download(tickers, **kwargs)
-            except Exception as exc:
-                download_exc = exc
-
-        if download_exc is not None:
-            exc = download_exc
+        _wait_for_spacing()
+        try:
+            result = yf.download(tickers, **kwargs)
+        except Exception as exc:
             last_exc = exc
 
             if _is_locked_db_error(exc) and lock_retry_count < _YF_LOCK_MAX_TRY:
@@ -1348,26 +1313,12 @@ def score_stock(
     cci_os:   int   = -100,
     pvt_lb:   int   = 20,
     atr_prox: float = 0.3,
-    symbol:   str | None = None,
-    sector_series: "pd.Series | None" = None,
 ) -> dict:
     """
     Evaluate the LATEST bar of df.
     Returns a flat dict ready for the scanner table, or {} on failure.
 
     settings dict (from pages/settings.py) takes priority over legacy kwargs.
-
-    symbol, sector_series : optional — Leadership redesign "RS vs Sector".
-        sector_series is a close-price benchmark Series for this symbol's
-        sector (see utils.sector_map.build_sector_benchmark_series() for a
-        peer-basket proxy builder, or wire in a real sector-index feed if
-        you have one). Purely additive: omit both and scoring is
-        unaffected — rs_vs_sector stays 0.0 / rs_sector_available=False,
-        same as before this redesign. `symbol` is otherwise unused here
-        (kept for callers that want a single kwarg pair to pass through)
-        — the caller is responsible for building sector_series itself
-        (typically once per sector per scan, not per symbol) since
-        score_stock() has no access to the full scan universe's history.
     """
     if df.empty or len(df) < 210:
         return {}
@@ -1403,7 +1354,7 @@ def score_stock(
     if not prescreen_ok and not diagnostic:
         return {}
 
-    ia = build_indicators(df, nifty, params, sector_series=sector_series)
+    ia = build_indicators(df, nifty, params)
     r  = compute_bar(ia, i=-1, params=params)   # -1 = latest bar
 
     if r is None:
@@ -1604,17 +1555,14 @@ def score_stock(
             "CV1_EQ_Grade":      cv1.entry_quality_grade,
             # Leadership sub-scores
             "_cv1_ls_rs":        cv1.ls_rs_composite,
-            "_cv1_ls_rs_market": cv1.ls_rs_market,
-            "_cv1_ls_rs_sector": cv1.ls_rs_sector,
-            "_cv1_ls_rs_consistency": cv1.ls_rs_consistency,
-            "_cv1_ls_rs_momentum":   cv1.ls_rs_momentum,
             "_cv1_ls_age":       cv1.ls_trend_age,
+            "_cv1_ls_adx":       cv1.ls_adx,
             "_cv1_ls_ps":        cv1.ls_persistent_strength,
             "_cv1_ls_slope":     cv1.ls_ema20_slope,
             # Conviction sub-scores
             "_cv1_cv_structure": cv1.cv_trend_structure,
             "_cv1_cv_fib":       cv1.cv_fib_zone,
-            "_cv1_cv_adx":       cv1.cv_adx,
+            "_cv1_cv_cci":       cv1.cv_cci_recovery,
             "_cv1_cv_volume":    cv1.cv_volume,
             "_cv1_cv_squeeze":   cv1.cv_squeeze,
             # Entry Quality sub-scores
@@ -2177,37 +2125,12 @@ def run_scanner(
     results = []
     done    = 0
 
-    # ── Leadership redesign: sector benchmarks, computed once per scan ──
-    # Peer-basket proxy (see utils.sector_map.build_sector_benchmark_frames
-    # docstring for why — no real sector-index feed is wired into this
-    # app). Built once from data already in `all_data`, no extra fetches.
-    # LEAVE-ONE-OUT: sector_benchmark_for_symbol() excludes each symbol's
-    # own rebased column before averaging, so a stock is never partially
-    # benchmarked against its own price. A symbol whose sector has fewer
-    # than 2 usable peers in this batch simply gets no sector_series ->
-    # rs_vs_sector stays neutral/unavailable for it, same as before this
-    # redesign.
-    try:
-        from utils.sector_map import build_sector_benchmark_frames, sector_benchmark_for_symbol
-        _close_by_symbol = {
-            s: d["close"] for s, d in all_data.items()
-            if d is not None and not d.empty and "close" in d.columns
-        }
-        _sector_frames = build_sector_benchmark_frames(_close_by_symbol)
-    except Exception:
-        _sector_frames = {}
-        sector_benchmark_for_symbol = None  # noqa: F811 — degrade to no sector RS if this fails
-
     def process(sym):
         df = all_data.get(sym, pd.DataFrame())
         if df.empty:
             return None
-        _sector_series = None
-        if sector_benchmark_for_symbol is not None:
-            _sector_series = sector_benchmark_for_symbol(_sector_frames, sym)
         row = score_stock(df, nifty_series, settings=effective_settings,
-                          cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
-                          symbol=sym, sector_series=_sector_series)
+                          cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os)
         if row:
             row["Stock"] = sym
         return row

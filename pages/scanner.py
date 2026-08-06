@@ -45,7 +45,7 @@ layout is intentionally unchanged for now (see reference mockups for the
 eventual look; not attempted this phase).
 """
 
-import sys, os, math
+import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import logging
@@ -1588,23 +1588,6 @@ def _tv_option_link(symbol: str, direction: str, strike, expiry: str, css_class:
     )
 
 
-def _safe_int(val, default: int = 0) -> int:
-    """int(row.get(col, 0)) blows up with ValueError (not TypeError) when
-    val is NaN — a per-stock sub-factor can be genuinely missing for a
-    given symbol even though the column exists in df, and pandas
-    represents that as float('nan'), not None. int(float('nan')) raises
-    ValueError: cannot convert float NaN to integer. Route every raw
-    numeric cell through this instead of a bare int(...) call."""
-    try:
-        if val is None:
-            return default
-        if isinstance(val, float) and math.isnan(val):
-            return default
-        return int(val)
-    except (ValueError, TypeError):
-        return default
-
-
 def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     """
     Render a scrollable sub-factor table for every stock in df.
@@ -1625,34 +1608,15 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     # (df_col, short_label, max_pts, dim_color, tooltip_lines)
     FACTORS = [
         # ── LEADERSHIP (purple) ────────────────────────────────────
-        ("_cv1_ls_rs_market", "RS vs Market", 12, "#a371f7",
+        ("_cv1_ls_rs", "RS Composite", 30, "#a371f7",
          "Multi-TF relative strength vs Nifty 50 (^NSEI)\n"
-         "RS > 0.15  →  +12 pts  (strong outperformance)\n"
-         "RS 0.10–0.15 →  +10 pts\n"
-         "RS 0.05–0.10 →  +8 pts\n"
-         "RS 0.03–0.05 →  +6 pts\n"
-         "RS 0.00–0.03 →  +4 pts\n"
-         "RS −0.03–0.00 → +2 pts\n"
+         "RS > 0.15  →  +30 pts  (strong outperformance)\n"
+         "RS 0.10–0.15 →  +25 pts\n"
+         "RS 0.05–0.10 →  +20 pts\n"
+         "RS 0.03–0.05 →  +15 pts\n"
+         "RS 0.00–0.03 →  +10 pts\n"
+         "RS −0.03–0.00 → +4 pts\n"
          "RS < −0.03   →   0 pts  (lagging the index)"),
-
-        ("_cv1_ls_rs_sector", "RS vs Sector", 10, "#a371f7",
-         "Multi-TF relative strength vs the stock's sector benchmark\n"
-         "(equal-weighted peer basket — see utils.sector_map)\n"
-         "Same breakpoint ladder as RS vs Market, scaled to 10 pts.\n"
-         "Flat 5 pts (neutral) if no sector benchmark is available yet."),
-
-        ("_cv1_ls_rs_consistency", "RS Consistency", 5, "#a371f7",
-         "How directionally aligned RS is across 20D/50D/100D-style\n"
-         "lookbacks (1-month / 3-month / 6-month vs Nifty)\n"
-         "All three lookbacks agree in direction → up to +5 pts\n"
-         "Mixed/conflicting signs across lookbacks →  0 pts"),
-
-        ("_cv1_ls_rs_momentum", "RS Momentum", 3, "#a371f7",
-         "Is composite RS improving vs ~2 weeks ago (acceleration)?\n"
-         "Improving > 0.03 → +3 pts\n"
-         "Improving 0.01–0.03 → +2 pts\n"
-         "Improving 0–0.01 → +1 pt\n"
-         "Flat or fading → 0 pts"),
 
         ("_cv1_ls_age", "Trend Age", 25, "#a371f7",
          "Bars since trend started (EMA structure)\n"
@@ -1661,6 +1625,13 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
          "51–100 bars →  +8 pts   (maturing, edge fades)\n"
          "> 100 bars  →   0 pts   (extended, PF 0.72)\n"
          "0–5 bars    →   0 pts   (too early)"),
+
+        ("_cv1_ls_adx", "ADX Strength", 20, "#a371f7",
+         "ADX(14) of the individual stock (directional strength proxy)\n"
+         "ADX ≥ 40    →  +20 pts  (strong trend, PF 1.41)\n"
+         "ADX 30–40   →  +12 pts\n"
+         "ADX 25–30   →   +5 pts  (dead zone)\n"
+         "ADX < 25    →    0 pts  (no trend)"),
 
         ("_cv1_ls_ps", "Pers. Strength", 15, "#a371f7",
          "Persistent momentum: stock must outperform on both lookbacks\n"
@@ -1693,12 +1664,12 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
          "+3 bonus if volume < 0.8× avg during pullback\n"
          "(controlled retracement = quality entry)"),
 
-        ("_cv1_cv_adx", "ADX Strength", 20, "#3fb950",
-         "ADX(14) of the individual stock (directional strength / conviction)\n"
-         "ADX ≥ 40    →  +20 pts  (strong trend, PF 1.41)\n"
-         "ADX 30–40   →  +12 pts\n"
-         "ADX 25–30   →   +5 pts  (dead zone)\n"
-         "ADX < 25    →    0 pts  (no trend)"),
+        ("_cv1_cv_cci", "CCI Recovery", 25, "#3fb950",
+         "CCI(20) crossing back above oversold level (−100)\n"
+         "recent_cci_recovery (cross above OS within window) → +25 pts\n"
+         "cci_rising (building before cross, early signal)   → +12 pts\n"
+         "t3_cci_rec (CCI recovering but still < 0)          →  +6 pts\n"
+         "No recovery signal                                 →   0 pts"),
 
         ("_cv1_cv_volume", "Vol Sponsor", 15, "#3fb950",
          "Today's volume vs 20-bar average (institutional sponsorship)\n"
@@ -1840,9 +1811,9 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
         # (CV1 tier + Promotion Engine) — the one and only recommendation
         # shown anywhere on the Scanner page.
         sc    = str(row.get("Recommendation", row.get("CV1_SignalClass", "Watch")))
-        ls    = _safe_int(row.get("CV1_Leadership",   0))
-        cv    = _safe_int(row.get("CV1_Conviction",   0))
-        eq    = _safe_int(row.get("CV1_EntryQuality", 0))
+        ls    = int(row.get("CV1_Leadership",   0))
+        cv    = int(row.get("CV1_Conviction",   0))
+        eq    = int(row.get("CV1_EntryQuality", 0))
         sc_c, _ = _SC_STYLE.get(sc.upper(), ("#94a3b8", sc))
         row_bg = "#ffffff" if i % 2 == 0 else "#f8fafc"
 
@@ -1883,7 +1854,7 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
 
         # Sub-factor cells
         for col, _, mx, clr, _ in avail:
-            pts = _safe_int(row.get(col, 0))
+            pts = int(row.get(col, 0))
             pct = int(pts / mx * 100) if mx > 0 else 0
             # Colour the bar: full = bright, partial = mid, zero = dark
             bar_clr = clr if pct >= 60 else (clr + "99" if pct > 0 else "rgba(15,23,42,0.06)")
