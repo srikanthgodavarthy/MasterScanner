@@ -61,6 +61,14 @@ DEFAULTS = {
     # DORE Engine" expander in _tab_advanced() for how the two stay synced.
     "dore_ema_fast_period": 9,
     "dore_ema_slow_period": 21,
+    # ── EMA periods — DORE Leadership (utils/dore_settings.py DORESettings) ─
+    # Independent triad, mirroring the Live Scanner's Leadership EMA block
+    # above (ema_fast/mid/slow_period) at DORE's own defaults (9/21/50).
+    # Does NOT feed dore_ema_fast_period/dore_ema_slow_period above (DORE's
+    # Stage 1/2 trend-engine EMAs) — changing one must never affect the other.
+    "dore_leadership_fast_ema": 9,
+    "dore_leadership_mid_ema":  21,
+    "dore_leadership_slow_ema": 50,
     "t2_comp_bars":      12,
     "t2_atr_ratio":      0.80,
     "t2_vol_mult":       1.5,
@@ -645,6 +653,44 @@ def _tab_advanced() -> None:
         _dore_settings = dict(st.session_state.get("dore_settings", {}))
         _dore_settings["ema_fast_period"] = int(dore_ema_fast)
         _dore_settings["ema_slow_period"] = int(dore_ema_slow)
+        st.session_state["dore_settings"] = _dore_settings
+
+    # ── EMA Periods — DORE Leadership ───────────────────────────
+    with st.expander("EMA Periods — DORE Leadership", expanded=False):
+        st.caption(
+            "Independent fast/mid/slow EMA triad for DORE, kept separate "
+            "from both the Live Scanner's Leadership EMA block above and "
+            "DORE's own Stage 1/2 trend-engine EMAs in the expander above "
+            "this one. Changing one of these three never affects the "
+            "other two EMA blocks. Defaults: 9 / 21 / 50."
+        )
+        lc1, lc2, lc3 = st.columns(3)
+        with lc1:
+            _label("Fast EMA period")
+            dore_ls_fast = st.number_input("DORE Leadership Fast EMA", 3, 100,
+                int(_g("dore_leadership_fast_ema")), step=1,
+                key="ni_dore_ls_fast", label_visibility="collapsed")
+            _s("dore_leadership_fast_ema", int(dore_ls_fast))
+        with lc2:
+            _label("Mid EMA period")
+            dore_ls_mid = st.number_input("DORE Leadership Mid EMA", 5, 150,
+                int(_g("dore_leadership_mid_ema")), step=1,
+                key="ni_dore_ls_mid", label_visibility="collapsed")
+            _s("dore_leadership_mid_ema", int(dore_ls_mid))
+        with lc3:
+            _label("Slow EMA period")
+            dore_ls_slow = st.number_input("DORE Leadership Slow EMA", 10, 300,
+                int(_g("dore_leadership_slow_ema")), step=1,
+                key="ni_dore_ls_slow", label_visibility="collapsed")
+            _s("dore_leadership_slow_ema", int(dore_ls_slow))
+
+        if not (dore_ls_fast < dore_ls_mid < dore_ls_slow):
+            st.error("Periods must be strictly increasing: fast < mid < slow.")
+
+        _dore_settings = dict(st.session_state.get("dore_settings", {}))
+        _dore_settings["dore_leadership_fast_ema"] = int(dore_ls_fast)
+        _dore_settings["dore_leadership_mid_ema"]  = int(dore_ls_mid)
+        _dore_settings["dore_leadership_slow_ema"] = int(dore_ls_slow)
         st.session_state["dore_settings"] = _dore_settings
 
     # ── Tier 2 ───────────────────────────────────────────────────

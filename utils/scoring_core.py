@@ -319,8 +319,25 @@ class BarResult:
     rs1:                float = 0.0      # 1-month RS vs Nifty
     rs3:                float = 0.0      # 3-month RS vs Nifty (primary)
     rs6:                float = 0.0      # 6-month RS vs Nifty
-    rs_composite:       float = 0.0      # weighted composite RS
+    rs_composite:       float = 0.0      # weighted composite RS vs Nifty — UNCHANGED,
+                                          # still the value every Tier-1/Tier-2 gate and
+                                          # legacy breakpoint ladder was calibrated against.
+                                          # Do not repurpose this field for the new
+                                          # Leadership RS Composite redesign — see
+                                          # rs_vs_sector / rs_consistency / rs_momentum below.
     trend_age_bars:     int   = 0        # bars since EMA20 first crossed above EMA50
+
+    # ── Leadership redesign: Relative Strength vs Sector ──────────
+    # Additive, backward-compatible: only populated when build_indicators()
+    # is given a sector benchmark series (see sector_series param / Sector
+    # RS section below). rs_vs_sector defaults to 0.0 (neutral) when no
+    # sector benchmark is wired in for a symbol — mirrors the existing
+    # "no sector benchmark wired in -> flat neutral credit" pattern already
+    # used by pillar_engine.l_sector_leadership_note.
+    rs_vs_sector:       float = 0.0      # weighted composite RS vs sector benchmark (or 0.0 if unavailable)
+    rs_sector_available: bool = False    # True only if a real sector benchmark series was used
+    rs_consistency:     float = 0.0      # 0-1: how directionally aligned rs1/rs3/rs6 are (vs Nifty)
+    rs_momentum:        float = 0.0      # rs_composite(now) - rs_composite(~10 bars ago); improving RS
     trend_freshness:    int   = 0        # 0-100: 100=brand-new cross, decays with age
 
     # ── Entry Quality / Extension: real measurements ──────────────
@@ -433,6 +450,12 @@ class IndicatorArrays:
     # from ph_series/pl_series above.
     ph_causal: pd.Series = None
     pl_causal: pd.Series = None
+    # Leadership redesign: sector benchmark close, reindexed to the symbol's
+    # trading days exactly like nifty_aligned. None when no sector benchmark
+    # is available for this symbol's sector (e.g. sector_map has no mapping,
+    # or caller didn't pass sector_series into build_indicators()) — every
+    # rs_vs_sector consumer must treat None as "unavailable", not "flat".
+    sector_aligned: pd.Series = None
     # Raw numpy arrays for P3 (fast scalar access)
     _c_arr:   np.ndarray = None
     _h_arr:   np.ndarray = None
@@ -446,6 +469,7 @@ class IndicatorArrays:
     _vavg_arr: np.ndarray = None
     _adx_arr:  np.ndarray = None
     _nifty_arr: np.ndarray = None
+    _sector_arr: np.ndarray = None   # None when no sector benchmark available (see sector_aligned)
     # PERF-6: numpy shadows for series that were still hitting .iloc[i]
     # in compute_bar() every bar (P3 was only partially applied).
     _o_arr:        np.ndarray = None
@@ -530,11 +554,20 @@ def build_indicators(
     df:     pd.DataFrame,
     nifty:  pd.Series,
     params: ScoringParams,
+    sector_series: "pd.Series | None" = None,
 ) -> IndicatorArrays:
     """
     Pre-compute every indicator Series for the full OHLCV history.
     Imported helpers come from scanner_engine to avoid circular deps.
     Speed: CCI is vectorised; ADX computed once here.
+
+    sector_series : optional close-price Series for this symbol's sector
+        benchmark (e.g. a sector-basket average — see utils.sector_map for
+        symbol->sector lookup). Purely additive: omit it (or pass None)
+        and every existing caller/backtest keeps computing bit-for-bit
+        identical output. When provided, it feeds the new Leadership
+        "RS vs Sector" component only — no existing Tier-1/Tier-2 gate
+        or rs_composite (vs Nifty) is affected.
     """
     from utils.scanner_engine import (
         ema, sma, rsi, atr, cci, ichimoku, _strip_tz,
@@ -581,6 +614,16 @@ def build_indicators(
     _nifty.index = _strip_tz(_nifty.index)
     nifty_aligned = _nifty.reindex(_c_idx, method="ffill")
 
+    # Sector alignment (tz-safe) — same pattern as Nifty above.
+    # Left as None when the caller has no sector benchmark for this symbol;
+    # every rs_vs_sector consumer treats None as "unavailable" (neutral),
+    # never as "flat 0% return".
+    sector_aligned = None
+    if sector_series is not None and len(sector_series) > 0:
+        _sector = sector_series.copy()
+        _sector.index = _strip_tz(_sector.index)
+        sector_aligned = _sector.reindex(_c_idx, method="ffill")
+
     # ── P1: Precompute pivot series once ─────────────────────────────
     from utils.pivot_engine import build_pivot_series
     ph_series, pl_series = build_pivot_series(h, l, params.pvt_lb)
@@ -616,6 +659,7 @@ def build_indicators(
     _vavg_arr = vol_avg.values.astype(np.float64)
     _adx_arr  = adx_s.values.astype(np.float64)
     _nifty_arr = nifty_aligned.values.astype(np.float64)
+    _sector_arr = sector_aligned.values.astype(np.float64) if sector_aligned is not None else None
 
     # PERF-6: the remaining series compute_bar() reads by index every bar.
     # squeeze_series is bool; keep it bool (not float) to skip a cast.
@@ -635,6 +679,7 @@ def build_indicators(
         bb_upper=bb_upper, bb_lower=bb_lower,
         kc_upper=kc_upper, kc_lower=kc_lower,
         squeeze_series=squeeze_series,
+        sector_aligned=sector_aligned,
         cloud_top=cloud_top, cloud_bottom=cloud_bottom,
         nifty_aligned=nifty_aligned,
         ph_series=ph_series, pl_series=pl_series,
@@ -643,7 +688,7 @@ def build_indicators(
         _c_arr=_c_arr, _h_arr=_h_arr, _l_arr=_l_arr, _cci_arr=_cci_arr,
         _e20_arr=_e20_arr, _e50_arr=_e50_arr, _e200_arr=_e200_arr,
         _atr_arr=_atr_arr, _vol_arr=_vol_arr, _vavg_arr=_vavg_arr,
-        _adx_arr=_adx_arr, _nifty_arr=_nifty_arr,
+        _adx_arr=_adx_arr, _nifty_arr=_nifty_arr, _sector_arr=_sector_arr,
         _o_arr=_o_arr, _rsi_arr=_rsi_arr, _atr_sma20_arr=_atr_sma20_arr,
         _atr_sma_comp_arr=_atr_sma_comp_arr, _cloud_top_arr=_cloud_top_arr,
         _cloud_bottom_arr=_cloud_bottom_arr, _squeeze_arr=_squeeze_arr,
@@ -1002,13 +1047,14 @@ def compute_bar(
     # rs6 = 126-bar (6-month) RS — long-term trend strength
     # rs_composite = weighted score for ranking (not just gating)
 
-    def _rs(bars):
+    def _rs(bars, bench_arr=None, bench_series=None):
         if i < bars:
             return 0.0
         c_prev = ca[i - bars] if ca is not None else float(c.iloc[i - bars])
-        n_arr  = ia._nifty_arr
-        n_now  = n_arr[i]   if n_arr is not None else float(ia.nifty_aligned.iloc[i])
-        n_prev = n_arr[i - bars] if n_arr is not None else float(ia.nifty_aligned.iloc[i - bars])
+        n_arr  = bench_arr if bench_arr is not None else ia._nifty_arr
+        n_ser  = bench_series if bench_series is not None else ia.nifty_aligned
+        n_now  = n_arr[i]   if n_arr is not None else float(n_ser.iloc[i])
+        n_prev = n_arr[i - bars] if n_arr is not None else float(n_ser.iloc[i - bars])
         if c_prev <= 0 or n_prev <= 0 or n_now <= 0 or np.isnan(n_now) or np.isnan(n_prev):
             return 0.0
         return (cur_c / c_prev - 1) - (n_now / n_prev - 1)
@@ -1020,6 +1066,60 @@ def compute_bar(
 
     # Composite RS: weight 3m most, then 6m, then 1m, then 1w
     rs_composite = rs1 * 0.15 + rs3 * 0.50 + rs6 * 0.25 + rs * 0.10
+
+    # ── RS vs Sector — Leadership redesign ────────────────────────
+    # Same multi-TF weighting as rs_composite, but against the sector
+    # benchmark instead of Nifty. Only populated when a sector benchmark
+    # was wired into build_indicators() (ia._sector_arr / ia.sector_aligned
+    # not None) — otherwise stays 0.0 / unavailable, same "flat neutral
+    # credit" convention pillar_engine already uses for sector leadership.
+    rs_sector_available = ia.sector_aligned is not None
+    if rs_sector_available:
+        rs1_sec = _rs(21,  bench_arr=ia._sector_arr, bench_series=ia.sector_aligned)
+        rs3_sec = _rs(63,  bench_arr=ia._sector_arr, bench_series=ia.sector_aligned)
+        rs6_sec = _rs(126, bench_arr=ia._sector_arr, bench_series=ia.sector_aligned)
+        rs_w_sec = _rs(5,  bench_arr=ia._sector_arr, bench_series=ia.sector_aligned)
+        rs_vs_sector = rs1_sec * 0.15 + rs3_sec * 0.50 + rs6_sec * 0.25 + rs_w_sec * 0.10
+    else:
+        rs_vs_sector = 0.0
+
+    # ── RS Consistency — Leadership redesign ───────────────────────
+    # How directionally aligned rs1/rs3/rs6 (vs Nifty) are with each other.
+    # 1.0 = all three positive (or all three negative) and pulling the same
+    # way; 0.0 = mixed signs across timeframes (noisy / inconsistent RS).
+    _rs_signs = [np.sign(rs1), np.sign(rs3), np.sign(rs6)]
+    _rs_nonzero = [s for s in _rs_signs if s != 0]
+    if len(_rs_nonzero) == 0:
+        rs_consistency = 0.0
+    else:
+        _agree = max(_rs_nonzero.count(1), _rs_nonzero.count(-1))
+        rs_consistency = _agree / len(_rs_nonzero)
+
+    # ── RS Momentum / Acceleration — Leadership redesign ───────────
+    # Is composite RS (vs Nifty) improving? Compares current rs_composite
+    # to its value ~10 bars ago (2-week lookback) using the same _rs()
+    # timeframes recomputed as-of bar i-10, so no lookahead.
+    _rs_mom_lb = 10
+    if i >= _rs_mom_lb + 126:
+        def _rs_asof(bars, asof):
+            c_prev = ca[asof - bars] if ca is not None else float(c.iloc[asof - bars])
+            c_now  = ca[asof]        if ca is not None else float(c.iloc[asof])
+            n_arr  = ia._nifty_arr
+            n_ser  = ia.nifty_aligned
+            n_now  = n_arr[asof]        if n_arr is not None else float(n_ser.iloc[asof])
+            n_prev = n_arr[asof - bars] if n_arr is not None else float(n_ser.iloc[asof - bars])
+            if c_prev <= 0 or n_prev <= 0 or n_now <= 0 or np.isnan(n_now) or np.isnan(n_prev):
+                return 0.0
+            return (c_now / c_prev - 1) - (n_now / n_prev - 1)
+
+        _asof = i - _rs_mom_lb
+        _rs_composite_prior = (
+            _rs_asof(21, _asof) * 0.15 + _rs_asof(63, _asof) * 0.50
+            + _rs_asof(126, _asof) * 0.25 + _rs_asof(5, _asof) * 0.10
+        )
+        rs_momentum = rs_composite - _rs_composite_prior
+    else:
+        rs_momentum = 0.0
 
     # RS filter for Tier-1: use 1-week RS as fast gate (original behaviour)
     rs_positive = rs > params.t1_rs_min
@@ -2107,6 +2207,10 @@ def compute_bar(
         rs3                 = round(rs3, 4),
         rs6                 = round(rs6, 4),
         rs_composite        = round(rs_composite, 4),
+        rs_vs_sector         = round(rs_vs_sector, 4),
+        rs_sector_available  = rs_sector_available,
+        rs_consistency       = round(rs_consistency, 4),
+        rs_momentum          = round(rs_momentum, 4),
         fresh_base_breakout = fresh_base_breakout,
         rs_top_decile       = rs_top_decile,
         trend_age_bars      = trend_age_bars,
