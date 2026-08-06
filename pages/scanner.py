@@ -45,7 +45,7 @@ layout is intentionally unchanged for now (see reference mockups for the
 eventual look; not attempted this phase).
 """
 
-import sys, os
+import sys, os, math
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import logging
@@ -1588,6 +1588,23 @@ def _tv_option_link(symbol: str, direction: str, strike, expiry: str, css_class:
     )
 
 
+def _safe_int(val, default: int = 0) -> int:
+    """int(row.get(col, 0)) blows up with ValueError (not TypeError) when
+    val is NaN — a per-stock sub-factor can be genuinely missing for a
+    given symbol even though the column exists in df, and pandas
+    represents that as float('nan'), not None. int(float('nan')) raises
+    ValueError: cannot convert float NaN to integer. Route every raw
+    numeric cell through this instead of a bare int(...) call."""
+    try:
+        if val is None:
+            return default
+        if isinstance(val, float) and math.isnan(val):
+            return default
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
 def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     """
     Render a scrollable sub-factor table for every stock in df.
@@ -1823,9 +1840,9 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
         # (CV1 tier + Promotion Engine) — the one and only recommendation
         # shown anywhere on the Scanner page.
         sc    = str(row.get("Recommendation", row.get("CV1_SignalClass", "Watch")))
-        ls    = int(row.get("CV1_Leadership",   0))
-        cv    = int(row.get("CV1_Conviction",   0))
-        eq    = int(row.get("CV1_EntryQuality", 0))
+        ls    = _safe_int(row.get("CV1_Leadership",   0))
+        cv    = _safe_int(row.get("CV1_Conviction",   0))
+        eq    = _safe_int(row.get("CV1_EntryQuality", 0))
         sc_c, _ = _SC_STYLE.get(sc.upper(), ("#94a3b8", sc))
         row_bg = "#ffffff" if i % 2 == 0 else "#f8fafc"
 
@@ -1866,7 +1883,7 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
 
         # Sub-factor cells
         for col, _, mx, clr, _ in avail:
-            pts = int(row.get(col, 0))
+            pts = _safe_int(row.get(col, 0))
             pct = int(pts / mx * 100) if mx > 0 else 0
             # Colour the bar: full = bright, partial = mid, zero = dark
             bar_clr = clr if pct >= 60 else (clr + "99" if pct > 0 else "rgba(15,23,42,0.06)")
