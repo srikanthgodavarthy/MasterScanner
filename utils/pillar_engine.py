@@ -92,6 +92,13 @@ from utils.obv_analyzer import (
 # so the rest of this module (and its point-scoring below) is unchanged.
 from utils.scanner_engine import stochastic as _stochastic
 from utils.ll_opportunity import score_ll_opportunity as _shared_score_ll_opportunity
+# 2026-08-07: Momentum's stoch-cross rule now delegates to the single-owner
+# spec in utils/stoch_convergence.py (STOCH_UPCROSS_MAX_LEVEL/
+# STOCH_DOWNCROSS_MIN_LEVEL) instead of keeping its own separate, looser
+# copy (previously: %K-only ceiling on up-cross, an uncapped "crossing out
+# of oversold <20" path with no %D check at all). See _score_momentum()
+# below for the redefined two-condition rule this replaces.
+from utils.stoch_convergence import STOCH_UPCROSS_MAX_LEVEL, STOCH_DOWNCROSS_MIN_LEVEL
 
 # ── Pillar point budgets (v5 — sum to 100; Risk deducted separately) ──────
 # "Today's Volume Ratio" (volume vs its 20d average) is owned exclusively
@@ -122,8 +129,13 @@ VOLUME_PROFILE_BARS = 60   # Fixed Range Volume Profile lookback (bars)
 VALUE_AREA_PCT      = 0.70 # 70% of volume defines the Value Area (standard)
 VP_BINS             = 24   # number of price bins for the volume profile histogram
 
-STOCH_K_PERIOD = 14   # %K lookback (highest high / lowest low window)
+STOCH_K_PERIOD = 4    # %K lookback — 2026-08-07: matches the user's actual TradingView
+                      # "Stoch" study (%K Length=4), same convention as
+                      # utils.stoch_convergence.score_stochastic_convergence(). Was 14
+                      # (generic TradingView out-of-the-box default) — not the user's chart.
 STOCH_D_PERIOD = 3    # %D = SMA(%K, 3) — signal line
+STOCH_K_SMOOTH = 3    # %K smoothing — turns this into "Slow Stochastic", matching the
+                      # user's chart (was unsmoothed/1, i.e. Fast Stochastic, before)
 
 # VWAP Touch-Reclaim (Pillar 5 — Momentum) ──────────────────────────
 RECLAIM_LOOKBACK        = 3     # bars to search for a VWAP touch / stoch cross
@@ -612,7 +624,8 @@ def _score_momentum(
     checks and restore the old lenient behavior.
     """
     cfg = cfg or {}
-    k_s, d_s = _stochastic(high, low, close)
+    k_s, d_s = _stochastic(high, low, close, k_period=STOCH_K_PERIOD, d_period=STOCH_D_PERIOD,
+                            k_smooth=STOCH_K_SMOOTH)
 
     cur_k   = _safe_last(k_s, default=50.0)
     prev_k  = _safe_at(k_s, -2, default=cur_k)
@@ -620,9 +633,23 @@ def _score_momentum(
     prev_d  = _safe_at(d_s, -2, default=cur_d)
     cur_rsi = _safe_last(rsi_s, default=50.0)
 
-    stoch_cross_up = bool(prev_k <= prev_d and cur_k > cur_d)
-    stoch_from_os  = bool(prev_k <= 20 and cur_k > 20)
-    fresh_stoch_reignition = stoch_cross_up or stoch_from_os
+    # 2026-08-07: redefined per the single-owner spec in
+    # utils/stoch_convergence.py — exactly two conditions, checked on the
+    # latest bar ONLY (a cross is a same-bar event; no multi-bar search):
+    #   Bullish upcross:   %K crosses above %D AND BOTH %K and %D < 22
+    #   Bearish downcross: %K crosses below %D AND BOTH %K and %D >= 80
+    # This replaces the previous rule, which: (a) only required %K (not
+    # %D) below the ceiling on an up-cross, (b) had a separate "crossing
+    # out of oversold (<20)" path with no ceiling check on %D at all, and
+    # (c) had no bearish-side equivalent. Momentum only ever cared about
+    # the bullish case, so only stoch_cross_up is kept as a scoring input
+    # here — stoch_cross_down is computed too (for the diagnostics dict)
+    # but does not affect the score below, consistent with prior behavior.
+    stoch_cross_up = bool(prev_k <= prev_d and cur_k > cur_d
+                           and cur_k < STOCH_UPCROSS_MAX_LEVEL and cur_d < STOCH_UPCROSS_MAX_LEVEL)
+    stoch_cross_down = bool(prev_k >= prev_d and cur_k < cur_d
+                             and cur_k >= STOCH_DOWNCROSS_MIN_LEVEL and cur_d >= STOCH_DOWNCROSS_MIN_LEVEL)
+    fresh_stoch_reignition = stoch_cross_up
     rsi_above_50 = cur_rsi > 50
 
     # ── VWAP reaction / return-above-VWAP (today's trigger) ──────────────
@@ -702,6 +729,7 @@ def _score_momentum(
         "stoch_k": round(cur_k, 1),
         "stoch_d": round(cur_d, 1),
         "stoch_cross_up": fresh_stoch_reignition,
+        "stoch_cross_down": stoch_cross_down,
         "rsi_val": round(cur_rsi, 1),
         "rsi_above_50": rsi_above_50,
         "m_vwap_reaction_pts": vwap_reaction_pts,
