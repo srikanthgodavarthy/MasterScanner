@@ -294,7 +294,7 @@ def _detail_breakdown(row: pd.Series) -> str:
 
     # ── Compact 5-tile strip: Structure / Acceptance / Leadership / Momentum / Risk ──
     def _tile(name, score, max_pts, color, lines):
-        score_disp = str(int(score)) if _is_valid_num(score) else "—"
+        score_disp = str(int(round(float(score)))) if _is_valid_num(score) else "—"
         lines_html = "".join(f'<div class="fp-tile-line" title="{l}">{l}</div>' for l in lines)
         return (
             f'<div class="fp-tile" style="--c:{color}">'
