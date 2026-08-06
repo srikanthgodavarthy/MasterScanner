@@ -2232,24 +2232,33 @@ table.sr-table--gainers td:nth-child(3), table.sr-table--gainers td:nth-child(4)
   text-align:right; font-variant-numeric:tabular-nums;
 }
 
-/* Live Scanner Snapshot (SYMBOL / %CHG / SETUP AGE / ENTRY / DRIFT) —
-   %CHG, ENTRY, DRIFT are numeric. */
-table.sr-table--snapshot th:nth-child(2), table.sr-table--snapshot th:nth-child(4), table.sr-table--snapshot th:nth-child(5) { text-align:right; }
-table.sr-table--snapshot td:nth-child(2), table.sr-table--snapshot td:nth-child(4), table.sr-table--snapshot td:nth-child(5) {
+/* Live Scanner Snapshot (SYMBOL / %CHG / PRICE / ENTRY / DRIFT) —
+   [2026-08-09] PRICE (LTP/CMP/Entry fallback) replaces SETUP AGE — all
+   of %CHG, PRICE, ENTRY, DRIFT are numeric, same column positions as
+   before so no nth-child change needed. */
+table.sr-table--snapshot th:nth-child(2), table.sr-table--snapshot th:nth-child(3), table.sr-table--snapshot th:nth-child(4), table.sr-table--snapshot th:nth-child(5) { text-align:right; }
+table.sr-table--snapshot td:nth-child(2), table.sr-table--snapshot td:nth-child(3), table.sr-table--snapshot td:nth-child(4), table.sr-table--snapshot td:nth-child(5) {
   text-align:right; font-variant-numeric:tabular-nums;
 }
 
-/* Active Options Plans (SYMBOL / DIR / STRIKE / CONF / PLAN / PREMIUM /
-   STOP LOSS / TARGET 1) — everything from STRIKE on is numeric except
-   PLAN (a clock time). [2026-08-08] Card switched from persisted/locked
-   plans to the same DORE live-scan candidates pages/scanner.py's Live
-   Scan tab shows (short form) — see _active_options_plans_html. */
+/* Active Options Plans (SYMBOL / DIR / STRIKE / CONF / PREMIUM / PLAN /
+   ENTRY / DRIFT / STOP LOSS / TARGET 1) — everything from STRIKE on is
+   numeric except PLAN (a clock time). [2026-08-08] Card switched from
+   persisted/locked plans to the same DORE live-scan candidates
+   pages/scanner.py's Live Scan tab shows (short form) — see
+   _active_options_plans_html. [2026-08-09] Reordered to PREMIUM before
+   PLAN, added ENTRY/DRIFT (entry_locked / drift_pct, same fields the
+   Scanner page's own Live Scan tab already carries) — nth-child indices
+   below updated to match: STRIKE=3, CONF=4, PREMIUM=5, ENTRY=7,
+   DRIFT=8, STOP LOSS=9, TARGET 1=10. PLAN(6) stays left-aligned. */
 table.sr-table--plans th:nth-child(3), table.sr-table--plans th:nth-child(4),
-table.sr-table--plans th:nth-child(6), table.sr-table--plans th:nth-child(7),
-table.sr-table--plans th:nth-child(8) { text-align:right; }
+table.sr-table--plans th:nth-child(5), table.sr-table--plans th:nth-child(7),
+table.sr-table--plans th:nth-child(8), table.sr-table--plans th:nth-child(9),
+table.sr-table--plans th:nth-child(10) { text-align:right; }
 table.sr-table--plans td:nth-child(3), table.sr-table--plans td:nth-child(4),
-table.sr-table--plans td:nth-child(6), table.sr-table--plans td:nth-child(7),
-table.sr-table--plans td:nth-child(8) {
+table.sr-table--plans td:nth-child(5), table.sr-table--plans td:nth-child(7),
+table.sr-table--plans td:nth-child(8), table.sr-table--plans td:nth-child(9),
+table.sr-table--plans td:nth-child(10) {
   text-align:right; font-variant-numeric:tabular-nums;
 }
 
@@ -2498,6 +2507,16 @@ def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
                 '<div style="color:#8b949e;font-size:0.75rem;">No active setups triggered today.</div></div>')
 
 
+    def _current_price(row):
+        # Same fallback chain as _nse_top_gainers_html's _ltp() next to
+        # this card, kept local since that one closes over its own
+        # `work` frame — no live re-fetch, just reads whichever price
+        # column this cycle's scan row already carries.
+        for col in ("LTP", "CMP", "Entry"):
+            if col in row and pd.notna(row.get(col)):
+                return float(row[col])
+        return None
+
     rows_html = ""
     for _, r in work.iterrows():
         symbol = r.get("Stock", "—")
@@ -2505,11 +2524,12 @@ def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
         entry = r.get("EntryLocked")
         drift = r.get("EntryDriftPct")
         drift_val = float(drift) if drift not in (None, "") and pd.notna(drift) else None
+        price = _current_price(r)
         rows_html += (
             "<tr>"
             f'<td><span class="sr-sector-name" style="font-weight:700;" title="{symbol}">{_tv_link(str(symbol)) if symbol != "—" else symbol}</span></td>'
             f'<td class="{"sr-pos" if chg >= 0 else "sr-neg"}">{"+" if chg >= 0 else ""}{chg:.2f}%</td>'
-            f"<td>{r.get('SetupAge', '—')}</td>"
+            f"<td>{f'{price:,.2f}' if price is not None else '—'}</td>"
             f"<td>{f'{float(entry):,.2f}' if entry not in (None, '') and pd.notna(entry) else '—'}</td>"
             f'<td class="{"sr-pos" if (drift_val or 0) >= 0 else "sr-neg"}">{f"{"+" if drift_val >= 0 else ""}{drift_val:.2f}%" if drift_val is not None else "—"}</td>'
             "</tr>"
@@ -2524,7 +2544,7 @@ def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
           <col style="width:26%"><col style="width:16%"><col style="width:24%">
           <col style="width:17%"><col style="width:17%">
         </colgroup>
-        <tr><th>SYMBOL</th><th>%CHG</th><th>SETUP AGE</th><th>ENTRY</th><th>DRIFT</th></tr>
+        <tr><th>SYMBOL</th><th>%CHG</th><th>PRICE</th><th>ENTRY</th><th>DRIFT</th></tr>
         {rows_html}
       </table>
       </div>
@@ -2645,14 +2665,19 @@ def _active_options_plans_html(top_n: int = 6) -> str:
         conf_color, conf_dot = _conf_style(conf)
         conf_disp = f"{conf:.0f}" if conf not in (None, "") and pd.notna(conf) else "—"
         plan_time = _time_only_ist(r.get("plan_created_at"))
+        entry = r.get("entry_locked")
+        drift = r.get("drift_pct")
+        drift_val = float(drift) if drift not in (None, "") and pd.notna(drift) else None
         rows_html += (
             "<tr>"
             f'<td style="font-weight:700;" title="{r.get("symbol", "—")}">{r.get("symbol", "—")}</td>'
             f'<td style="color:{dir_color};font-weight:700;">{direction or "—"}</td>'
             f"<td>{strike_disp}</td>"
             f'<td><span style="color:{conf_color};font-weight:700;">{conf_dot} {conf_disp}</span></td>'
-            f'<td title="Plan locked at {plan_time} IST">{plan_time}</td>'
             f"<td>{_money(r.get('current_premium'))}</td>"
+            f'<td title="Plan locked at {plan_time} IST">{plan_time}</td>'
+            f"<td>{_money(entry)}</td>"
+            f'<td class="{"sr-pos" if (drift_val or 0) >= 0 else "sr-neg"}">{f"{"+" if drift_val >= 0 else ""}{drift_val:.2f}%" if drift_val is not None else "—"}</td>'
             f"<td>{_money(r.get('stop_loss'))}</td>"
             f"<td>{_money(r.get('target1'))}</td>"
             "</tr>"
@@ -2664,11 +2689,13 @@ def _active_options_plans_html(top_n: int = 6) -> str:
       <div class="sr-panel-body">
       <table class="sr-table sr-table--plans">
         <colgroup>
-          <col style="width:16%"><col style="width:8%"><col style="width:12%"><col style="width:11%">
-          <col style="width:11%"><col style="width:14%"><col style="width:14%"><col style="width:14%">
+          <col style="width:12%"><col style="width:6%"><col style="width:10%"><col style="width:9%">
+          <col style="width:10%"><col style="width:8%"><col style="width:10%"><col style="width:9%">
+          <col style="width:13%"><col style="width:13%">
         </colgroup>
-        <tr><th>SYMBOL</th><th>DIR</th><th>STRIKE</th><th>CONF</th><th>PLAN</th>
-            <th>PREMIUM</th><th>STOP LOSS</th><th>TARGET 1</th></tr>
+        <tr><th>SYMBOL</th><th>DIR</th><th>STRIKE</th><th>CONF</th>
+            <th>PREMIUM</th><th>PLAN</th><th>ENTRY</th><th>DRIFT</th>
+            <th>STOP LOSS</th><th>TARGET 1</th></tr>
         {rows_html}
       </table>
     </div>"""
