@@ -45,7 +45,7 @@ layout is intentionally unchanged for now (see reference mockups for the
 eventual look; not attempted this phase).
 """
 
-import sys, os
+import sys, os, math
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import logging
@@ -1588,6 +1588,30 @@ def _tv_option_link(symbol: str, direction: str, strike, expiry: str, css_class:
     )
 
 
+def _safe_int(val, default: int = 0) -> int:
+    """int(row.get(col, 0)) blows up with ValueError (not TypeError) when
+    val is NaN — a per-stock sub-factor can be genuinely missing for a
+    given symbol even though the column exists in df, and pandas
+    represents that as float('nan'), not None. int(float('nan')) raises
+    ValueError: cannot convert float NaN to integer. Route every raw
+    numeric cell through this instead of a bare int(...) call.
+
+    2026-08-06: this was originally added (9628e54) then accidentally
+    dropped when the Leadership/Conviction redesign was reverted
+    (a244b5d used a pre-9628e54 base for this file) — restored here
+    alongside re-applying that redesign, since the crash it fixes
+    (_perstock_breakdown_table's per-stock breakdown table) is exactly
+    what surfaced in production once it was gone."""
+    try:
+        if val is None:
+            return default
+        if isinstance(val, float) and math.isnan(val):
+            return default
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
 def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     """
     Render a scrollable sub-factor table for every stock in df.
@@ -1824,9 +1848,9 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
         # (CV1 tier + Promotion Engine) — the one and only recommendation
         # shown anywhere on the Scanner page.
         sc    = str(row.get("Recommendation", row.get("CV1_SignalClass", "Watch")))
-        ls    = int(row.get("CV1_Leadership",   0))
-        cv    = int(row.get("CV1_Conviction",   0))
-        eq    = int(row.get("CV1_EntryQuality", 0))
+        ls    = _safe_int(row.get("CV1_Leadership",   0))
+        cv    = _safe_int(row.get("CV1_Conviction",   0))
+        eq    = _safe_int(row.get("CV1_EntryQuality", 0))
         sc_c, _ = _SC_STYLE.get(sc.upper(), ("#94a3b8", sc))
         row_bg = "#ffffff" if i % 2 == 0 else "#f8fafc"
 
@@ -1867,7 +1891,7 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
 
         # Sub-factor cells
         for col, _, mx, clr, _ in avail:
-            pts = int(row.get(col, 0))
+            pts = _safe_int(row.get(col, 0))
             pct = int(pts / mx * 100) if mx > 0 else 0
             # Colour the bar: full = bright, partial = mid, zero = dark
             bar_clr = clr if pct >= 60 else (clr + "99" if pct > 0 else "rgba(15,23,42,0.06)")
@@ -1939,7 +1963,7 @@ def _promotion_signals_table(df: pd.DataFrame) -> str:
     for _, row in _elig.iterrows():
         stock   = str(row.get("Stock", ""))
         rec     = str(row.get("Recommendation", ""))
-        score   = int(row.get("PromoScore", 0) or 0)
+        score   = _safe_int(row.get("PromoScore", 0))
         rr      = float(row.get("PromoRR", 0) or 0)
         promoted= bool(row.get("Promoted", False))
         rec_color = {"Elite": "#ffd700", "Execute": "#22c55e"}.get(rec, "#58a6ff")
@@ -4323,7 +4347,7 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
                         _included   = [s for s in str(_erow.get("_explain_included",   "")).split("|") if s]
                         _not_higher = [s for s in str(_erow.get("_explain_not_higher", "")).split("|") if s]
                         _risks      = [s for s in str(_erow.get("_explain_risks",      "")).split("|") if s]
-                        tq          = int(_erow.get("TrendQuality", 0))
+                        tq          = _safe_int(_erow.get("TrendQuality", 0))
 
                         st.markdown(
                             f"<div style='background:#ffffff;border:1px solid rgba(15,23,42,0.08);"
@@ -4348,7 +4372,7 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
                         _rec = str(_erow.get("Recommendation", ""))
                         if _rec == "Actionable":
                             _blocked = [s for s in str(_erow.get("_promo_blocked", "")).split("|") if s]
-                            _score   = int(_erow.get("PromoScore", 0) or 0)
+                            _score   = _safe_int(_erow.get("PromoScore", 0))
                             _rr      = float(_erow.get("PromoRR", 0) or 0)
                             _gap_note = "  ·  ".join(_blocked) if _blocked else f"Promo Score {_score}/100, R:R {_rr:.1f}"
                             st.markdown(
