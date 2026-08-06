@@ -185,15 +185,47 @@ DORE_DEFAULTS: dict = {
     # Quality alone (value/liquidity/spread) never checked that. See
     # stage3_derivative_intelligence()'s premium-behaviour block and
     # stage5_opportunity_engine()'s NOW-tier gate.
-    "premium_behavior_min_rise_pct": 3.0,  # min % rise vs the prior poll to count as "strengthening"
+    "premium_behavior_min_rise_pct": 1.5,  # min avg %/interval to count as "strengthening"
+                                             # (2026-08-06: lowered from 3.0, AND re-targeted — this now
+                                             # applies to the ROLLING AVERAGE %/interval over up to the
+                                             # last 3 intervals (ce/pe_premium_avg_growth_pct), not a
+                                             # single ~60s tick. A flat 3% single-tick bar was both too
+                                             # strict (most genuine setups don't move that violently in
+                                             # one interval, so most BUY_*_NOW signals were downgraded to
+                                             # WATCH_*) and structurally late (by the time one tick DID
+                                             # clear it, the sharp move had usually already happened).
+                                             # See stage3_derivative_intelligence()'s rebuilt premium-
+                                             # behaviour block and stage5_opportunity_engine()'s NOW gate.
+    "premium_accel_bonus_scale":      3.0,  # 2026-08-06: points of Premium Behaviour score per point of
+                                             # ACCELERATION (this interval's %chg minus the prior interval's)
+                                             # — rewards a genuinely speeding-up move, penalises a fading one
+                                             # even if the rolling average is still (barely) positive. Result
+                                             # is clamped to +/-15 — see the accel_bonus clamp in dore_engine.py.
+    "premium_oi_confirm_bonus":      10.0,  # 2026-08-06: Premium Behaviour score bonus when the option's
+                                             # own OI is building WITH the premium rise (long buildup, not
+                                             # short-covering) — reuses oi_writing_change_min as the "is OI
+                                             # building" cutoff. A SCORE MODIFIER, not a second hard gate —
+                                             # missing/thin OI-change data (None) is simply skipped, never
+                                             # blocks an otherwise-genuine breakout.
+    "premium_oi_diverge_penalty":    10.0,  # 2026-08-06: Premium Behaviour score penalty when premium is
+                                             # rising WHILE OI is falling (reuses oi_unwinding_change_max as
+                                             # the "is OI falling" cutoff) — short-covering-shaped moves are
+                                             # more prone to fade than genuine fresh positioning.
     "gate_now_on_premium_behavior": True,  # if True, BUY_CE_NOW/BUY_PE_NOW downgrade to WATCH_CE/WATCH_PE
                                              # whenever premium hasn't actually confirmed yet
     # Stage-3 sub-weights (must sum to 100)
-    "w_deriv_oi_writing":         25.0,   # long/short build-up, unwinding, covering
-    "w_deriv_pcr":                15.0,
+    # 2026-08-06: rebalanced to give Premium Behaviour (20 -> 30) a
+    # materially stronger say in Stage 3's overall confidence score,
+    # rather than acting only as a downstream NOW-tier pass/fail gate —
+    # a fast-strengthening-but-not-yet-3%-in-one-tick premium now moves
+    # the ranking, not just the recommendation label. Reduced from
+    # oi_writing (25->20), pcr (15->13), premium_quality (15->12);
+    # base_strength and corridor left untouched.
+    "w_deriv_oi_writing":         20.0,   # long/short build-up, unwinding, covering
+    "w_deriv_pcr":                13.0,
     "w_deriv_base_strength":      10.0,   # OI stacked helpful-side vs hostile-side
-    "w_deriv_premium_quality":    15.0,   # value + liquidity + spread (behaviour split out below)
-    "w_deriv_premium_behavior":   20.0,   # NEW — has the premium itself turned/started rising
+    "w_deriv_premium_quality":    12.0,   # value + liquidity + spread (behaviour split out below)
+    "w_deriv_premium_behavior":   30.0,   # has the premium itself turned/started rising (2026-08-06: 20 -> 30)
     "w_deriv_corridor":           15.0,   # room to run before the next OI wall
 
     # ── Stage 3.5: Option Intelligence (RFC-001: DORE 3.0) ────────
@@ -373,13 +405,16 @@ class DORESettings:
     corridor_near_wall_atr: float = 0.25
     derivative_confidence_min: float = 60.0
     derivative_conflict_max: float = 40.0
-    premium_behavior_min_rise_pct: float = 3.0
+    premium_behavior_min_rise_pct: float = 1.5
+    premium_accel_bonus_scale: float = 3.0
+    premium_oi_confirm_bonus: float = 10.0
+    premium_oi_diverge_penalty: float = 10.0
     gate_now_on_premium_behavior: bool = True
-    w_deriv_oi_writing: float = 25.0
-    w_deriv_pcr: float = 15.0
+    w_deriv_oi_writing: float = 20.0
+    w_deriv_pcr: float = 13.0
     w_deriv_base_strength: float = 10.0
-    w_deriv_premium_quality: float = 15.0
-    w_deriv_premium_behavior: float = 20.0
+    w_deriv_premium_quality: float = 12.0
+    w_deriv_premium_behavior: float = 30.0
     w_deriv_corridor: float = 15.0
 
     oi_iv_rank_cheap_max: float = 25.0

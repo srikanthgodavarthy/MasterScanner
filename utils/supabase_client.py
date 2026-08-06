@@ -1806,13 +1806,17 @@ def load_oi_baseline_snapshots() -> list[dict]:
 
 def save_premium_history_snapshot(rows: list[dict]) -> bool:
     """
-    Batch-upsert the last-two-polls premium history (one row per
+    Batch-upsert the last-4-polls premium history (one row per
     key tracked by utils.oi_snapshot_store.record_and_diff_premium())
     into dore_premium_history.
 
     rows: [{"key": ..., "snapshot_date": "YYYY-MM-DD",
-            "ce_h0": ..., "ce_h1": ..., "pe_h0": ..., "pe_h1": ...}, ...]
-    ("h0" = most recent poll, "h1" = the one before that.)
+            "ce_h0": ..., "ce_h1": ..., "ce_h2": ..., "ce_h3": ...,
+            "pe_h0": ..., "pe_h1": ..., "pe_h2": ..., "pe_h3": ...}, ...]
+    ("h0" = most recent poll, "h3" = 3 polls before that. 2026-08-06:
+    widened from h0/h1 only, so oi_snapshot_store can compute a rolling-
+    average growth rate across up to 3 intervals, not just the single
+    most recent one — see that module's _rolling_avg_growth_pct().)
     """
     if not rows:
         return True
@@ -1844,7 +1848,7 @@ def load_premium_history_snapshots() -> list[dict]:
         return []
     try:
         resp = client.table("dore_premium_history").select(
-            "key, snapshot_date, ce_h0, ce_h1, pe_h0, pe_h1"
+            "key, snapshot_date, ce_h0, ce_h1, ce_h2, ce_h3, pe_h0, pe_h1, pe_h2, pe_h3"
         ).execute()
         return resp.data or []
     except Exception as exc:
@@ -2458,9 +2462,13 @@ CREATE TABLE IF NOT EXISTS dore_oi_baseline (
 -- 10. DORE premium history — one row per index/stock key tracked by
 --     utils.oi_snapshot_store.record_and_diff_premium(). ce_h0/pe_h0 are
 --     the most recent poll's ATM premium for that leg; ce_h1/pe_h1 are
---     the poll before that — exactly the two values Stage 3.5's Premium
+--     the poll before that — the two values Stage 3.5's Premium
 --     Behaviour pillar needs as ce_premium_prev/ce_premium_prev2 (and
---     the PE mirrors). Gated to `snapshot_date` = today on read (see
+--     the PE mirrors). ce_h2/ce_h3 (and pe_h2/pe_h3) added 2026-08-06 —
+--     two further polls back, so a rolling-average growth rate can be
+--     computed across up to 3 intervals instead of just the single most
+--     recent one (see oi_snapshot_store._rolling_avg_growth_pct()).
+--     Gated to `snapshot_date` = today on read (see
 --     load_premium_history_snapshots()) so a restart doesn't resurrect
 --     yesterday's close-to-open jump as if it were live intraday
 --     evidence.
@@ -2469,10 +2477,22 @@ CREATE TABLE IF NOT EXISTS dore_premium_history (
     snapshot_date    date        NOT NULL,
     ce_h0            numeric,
     ce_h1            numeric,
+    ce_h2            numeric,
+    ce_h3            numeric,
     pe_h0            numeric,
     pe_h1            numeric,
+    pe_h2            numeric,
+    pe_h3            numeric,
     updated_at       timestamptz NOT NULL DEFAULT now()
 );
+
+-- 10a. Migration for an EXISTING dore_premium_history table created
+--      before 2026-08-06 (only had h0/h1) — run this once, by hand, if
+--      your table predates the rolling-average change above.
+-- ALTER TABLE dore_premium_history ADD COLUMN IF NOT EXISTS ce_h2 numeric;
+-- ALTER TABLE dore_premium_history ADD COLUMN IF NOT EXISTS ce_h3 numeric;
+-- ALTER TABLE dore_premium_history ADD COLUMN IF NOT EXISTS pe_h2 numeric;
+-- ALTER TABLE dore_premium_history ADD COLUMN IF NOT EXISTS pe_h3 numeric;
 """
 
 # Append rotate_flags SQL to the canonical SCHEMA_SQL for easy copy-paste

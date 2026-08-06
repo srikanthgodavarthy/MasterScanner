@@ -224,6 +224,9 @@ class DOREInput:
     pe_premium_prev:  Optional[float] = None
     ce_premium_prev2: Optional[float] = None   # premium 2 polls ago — lets Stage 3 tell "was falling, now
     pe_premium_prev2: Optional[float] = None   # rising" apart from "already rising" or one noisy uptick
+    ce_premium_avg_growth_pct: Optional[float] = None   # 2026-08-06: avg %/interval over up to the last 3
+    pe_premium_avg_growth_pct: Optional[float] = None   # intervals (utils.oi_snapshot_store._rolling_avg_growth_pct)
+                                                          # — steadier than the single-tick prev/prev2 compare
     ce_oi:            float = 0.0
     pe_oi:            float = 0.0
     ce_oi_change:     float = 0.0
@@ -1356,7 +1359,7 @@ def stage3_derivative_intelligence(
         (spread_score,     40.0),
     ])
 
-    # ── Premium Behaviour (first-class pillar, 2026-07-21) ───────────
+    # ── Premium Behaviour (first-class pillar, 2026-07-21; rebuilt 2026-08-06) ─
     # A bullish underlying + a ready execution can STILL be a bad entry
     # if the option premium itself hasn't turned yet — this is exactly
     # what Premium Quality above never checked (it prices liquidity and
@@ -1364,12 +1367,43 @@ def stage3_derivative_intelligence(
     # way). No prior reading -> treated as UNCONFIRMED, not a free
     # pass: absence of evidence must not be enough to justify a NOW-tier
     # entry (see the gate in stage5_opportunity_engine()).
+    #
+    # 2026-08-06 rebuild — gating on a single ~60s-apart tick clearing a
+    # flat % threshold was both too strict (a real move rarely covers
+    # the full bar in one interval, so most genuine NOW candidates were
+    # downgraded to WATCH) and structurally late (by the time one tick
+    # DOES clear a high bar, the sharp move has usually already
+    # happened — entries landed near the tail of the burst, not the
+    # start). Three changes address both without loosening the gate
+    # into a rubber stamp:
+    #   1. ROLLING AVERAGE — the primary "strengthening" read is now the
+    #      average %/interval over up to the last 3 intervals
+    #      (ce/pe_premium_avg_growth_pct — see oi_snapshot_store.
+    #      _rolling_avg_growth_pct()), not one single tick. This clears
+    #      the bar roughly as a genuine move BUILDS rather than only
+    #      after one (possibly noisy) sharp tick.
+    #   2. ACCELERATION — this interval's %chg vs the prior interval's;
+    #      a positive delta means the move is genuinely speeding up
+    #      (rewarded), a negative one means it's fading even though the
+    #      rolling average may still read positive (penalised).
+    #   3. OI CONFIRMATION — premium rising WITH OI building is a long
+    #      buildup (fresh conviction); premium rising WHILE OI falls is
+    #      short-covering (weaker, more prone to fade). Applied as a
+    #      score modifier here, NOT a second hard gate, so thin/missing
+    #      OI-change data never blocks an otherwise-genuine breakout.
+    # See w_deriv_premium_behavior in dore_settings.py for this pillar's
+    # increased weight in the overall Stage 3 confidence score.
     premium = (inp.ce_premium if direction == "CE" else
                inp.pe_premium if direction == "PE" else max(inp.ce_premium, inp.pe_premium))
     premium_prev = (inp.ce_premium_prev if direction == "CE" else
                     inp.pe_premium_prev if direction == "PE" else None)
     premium_prev2 = (inp.ce_premium_prev2 if direction == "CE" else
                     inp.pe_premium_prev2 if direction == "PE" else None)
+    premium_avg_growth_pct = (inp.ce_premium_avg_growth_pct if direction == "CE" else
+                               inp.pe_premium_avg_growth_pct if direction == "PE" else None)
+    oi_change = (inp.ce_oi_change if direction == "CE" else
+                 inp.pe_oi_change if direction == "PE" else None)
+
     if direction is None or premium <= 0:
         premium_behavior_score = 50.0
         premium_strengthening = False
@@ -1380,10 +1414,27 @@ def stage3_derivative_intelligence(
         reasons.append("Premium Behaviour UNCONFIRMED — no prior premium reading yet to compare against")
     else:
         change_pct = (premium - premium_prev) / premium_prev * 100.0
-        premium_strengthening = change_pct >= cfg.premium_behavior_min_rise_pct
+        # Rolling average is the primary momentum read once at least one
+        # full interval of history exists; falls back to the single-tick
+        # change_pct on the first poll or two for a key (graceful
+        # degrade — same spirit as the prev/prev2 None-handling above).
+        growth_pct = premium_avg_growth_pct if premium_avg_growth_pct is not None else change_pct
+        premium_strengthening = growth_pct >= cfg.premium_behavior_min_rise_pct
         premium_behavior_score = _pct_score(
-            change_pct, -cfg.premium_behavior_min_rise_pct * 2.0, cfg.premium_behavior_min_rise_pct * 2.0)
+            growth_pct, -cfg.premium_behavior_min_rise_pct * 2.0, cfg.premium_behavior_min_rise_pct * 2.0)
+
+        # ── Acceleration — is the move speeding up or fading? ──────────
         if premium_prev2 is not None and premium_prev2 > 0:
+            prior_change_pct = (premium_prev - premium_prev2) / premium_prev2 * 100.0
+            acceleration_pct = change_pct - prior_change_pct
+            accel_bonus = _clamp(acceleration_pct * cfg.premium_accel_bonus_scale, -15.0, 15.0)
+            premium_behavior_score = _clamp(premium_behavior_score + accel_bonus)
+            if acceleration_pct > 0.05:
+                reasons.append(f"Premium ACCELERATING: {prior_change_pct:+.1f}% -> {change_pct:+.1f}% per interval")
+            elif acceleration_pct < -0.05:
+                reasons.append(f"Premium DECELERATING: {prior_change_pct:+.1f}% -> {change_pct:+.1f}% per "
+                               f"interval — momentum may be fading")
+
             was_falling = premium_prev < premium_prev2
             if was_falling and premium_strengthening:
                 premium_behavior_score = _clamp(premium_behavior_score + 15.0)
@@ -1392,11 +1443,27 @@ def stage3_derivative_intelligence(
             elif was_falling and not premium_strengthening:
                 reasons.append(f"Premium still falling ({premium_prev2:.2f} -> {premium_prev:.2f} -> "
                                f"{premium:.2f}) — underlying setup is NOT yet confirmed by the option itself")
+
+        # ── OI confirmation — is the move backed by fresh positioning? ─
+        # A modifier, not a gate — missing/thin oi_change data (None)
+        # simply skips this block rather than blocking the signal.
+        if oi_change is not None:
+            if oi_change > cfg.oi_writing_change_min:
+                premium_behavior_score = _clamp(premium_behavior_score + cfg.premium_oi_confirm_bonus)
+                reasons.append(f"OI confirms: {direction} premium rising WITH OI building "
+                               f"({oi_change:+,.0f}) — genuine buildup, not short-covering")
+            elif oi_change < cfg.oi_unwinding_change_max:
+                premium_behavior_score = _clamp(premium_behavior_score - cfg.premium_oi_diverge_penalty)
+                reasons.append(f"OI diverges: {direction} premium rising WHILE OI falls "
+                               f"({oi_change:+,.0f}) — looks like short-covering, weaker signal")
+
         if premium_strengthening:
-            reasons.append(f"Premium strengthening: {change_pct:+.1f}% vs prior read — confirms {direction}")
+            reasons.append(f"Premium strengthening: rolling avg {growth_pct:+.1f}%/interval "
+                           f"(latest tick {change_pct:+.1f}%) — confirms {direction}")
         else:
-            reasons.append(f"Premium NOT strengthening: {change_pct:+.1f}% vs prior read "
-                           f"(needs >= +{cfg.premium_behavior_min_rise_pct:.1f}%) — direction unconfirmed by premium")
+            reasons.append(f"Premium NOT strengthening: rolling avg {growth_pct:+.1f}%/interval "
+                           f"(latest tick {change_pct:+.1f}%), needs >= +{cfg.premium_behavior_min_rise_pct:.1f}% "
+                           f"— direction unconfirmed by premium")
 
     # ── OI corridor — room to run before the next wall ──────────────
     atr_ref = max(inp.atr, 1e-6)
@@ -2413,6 +2480,8 @@ def build_dore_input(
         pe_premium_prev=atm_chain_row.get("pe_premium_prev"),
         ce_premium_prev2=atm_chain_row.get("ce_premium_prev2"),
         pe_premium_prev2=atm_chain_row.get("pe_premium_prev2"),
+        ce_premium_avg_growth_pct=atm_chain_row.get("ce_premium_avg_growth_pct"),
+        pe_premium_avg_growth_pct=atm_chain_row.get("pe_premium_avg_growth_pct"),
         ce_oi=atm_chain_row.get("ce_oi", 0.0),
         pe_oi=atm_chain_row.get("pe_oi", 0.0),
         ce_oi_change=atm_chain_row.get("ce_oi_change", 0.0),

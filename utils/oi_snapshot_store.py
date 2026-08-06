@@ -77,6 +77,18 @@ _premium_history: dict = {}   # {key: {"ce": [t-1, t-2, ...], "pe": [t-1, t-2, .
 _strike_premium_history: dict = {}   # {"SYMBOL_LEG_STRIKE": [t-1]} — see record_and_diff_strike_premium()
 _LOCK = threading.Lock()
 
+# 2026-08-06: widened from 2 to 4 (t-1..t-3 kept in RAM, current poll makes 4
+# points total -> 3 consecutive pct-change intervals) so record_and_diff_premium()
+# can also return a ROLLING AVERAGE growth rate, not just the single most-recent
+# poll-to-poll change. A single ~60s interval is noisy — one option-chain refresh
+# hiccup or a stale quote can make one tick look like a spike; averaging the last
+# few intervals is a materially steadier "is this genuinely strengthening" read
+# without needing a day-open baseline (which would defeat the tick-to-tick
+# reversal-detection this tracker exists for — see record_and_diff_premium()'s
+# docstring). ce_prev/ce_prev2 (single-interval) are still returned unchanged for
+# backward compatibility / the existing reversal-detection logic in dore_engine.py.
+_PREMIUM_HIST_DEPTH = 4
+
 # ── Lazy one-time hydrate from Supabase, per process lifetime ─────────
 _loaded_from_supabase = False
 _LOAD_LOCK = threading.Lock()
@@ -129,8 +141,14 @@ def _ensure_loaded() -> None:
                 try:
                     if str(row.get("snapshot_date")) != str(today):
                         continue   # yesterday's close — not genuine intraday history
-                    ce_hist = [v for v in (row.get("ce_h0"), row.get("ce_h1")) if v is not None]
-                    pe_hist = [v for v in (row.get("pe_h0"), row.get("pe_h1")) if v is not None]
+                    # 2026-08-06: rehydrate all 4 slots (h0..h3) now persisted —
+                    # older rows written before this change simply won't have
+                    # h2/h3 keys, .get() returns None for those and they're
+                    # filtered out below same as any other missing value.
+                    ce_hist = [v for v in (row.get("ce_h0"), row.get("ce_h1"),
+                                            row.get("ce_h2"), row.get("ce_h3")) if v is not None]
+                    pe_hist = [v for v in (row.get("pe_h0"), row.get("pe_h1"),
+                                            row.get("pe_h2"), row.get("pe_h3")) if v is not None]
                     if ce_hist or pe_hist:
                         _premium_history[row["key"]] = {"ce": ce_hist, "pe": pe_hist}
                         n_prem += 1
@@ -191,14 +209,47 @@ def record_and_diff_value(key: str, value: float) -> float:
     return ce_change
 
 
+def _rolling_avg_growth_pct(latest: float, hist: list[float]) -> Optional[float]:
+    """
+    Average % change per interval across `latest` + up to
+    `_PREMIUM_HIST_DEPTH - 1` prior polls (i.e. up to 3 consecutive
+    interval-over-interval pct changes from 4 data points), instead of
+    just the single most-recent interval. Smooths out one noisy/stale
+    tick without needing a day-open baseline. Returns None if there
+    isn't at least one full interval of history yet (same "None means
+    no history" convention as ce_prev/pe_prev above).
+    """
+    points = [latest] + hist  # most-recent first
+    points = [p for p in points if p is not None]
+    if len(points) < 2:
+        return None
+    changes = []
+    for newer, older in zip(points, points[1:]):
+        if older > 0:
+            changes.append((newer - older) / older * 100.0)
+    if not changes:
+        return None
+    return sum(changes) / len(changes)
+
+
 def record_and_diff_premium(
     key: str, ce_premium: float, pe_premium: float,
-) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float],
+           Optional[float], Optional[float]]:
     """
     Record this poll's ATM CE/PE premium for `key` (an index name, or
     "STK_<symbol>" for a stock — see utils.dore_fo_screener) and return
-    the PRIOR two polls' premiums as
-    (ce_premium_prev, ce_premium_prev2, pe_premium_prev, pe_premium_prev2).
+    (ce_premium_prev, ce_premium_prev2, pe_premium_prev, pe_premium_prev2,
+     ce_avg_growth_pct, pe_avg_growth_pct).
+
+    The first four are unchanged from before (single most-recent poll-to-
+    poll comparison, "prev"/"prev2"). The last two are new (2026-08-06):
+    the AVERAGE %-change per interval across up to the last 3 intervals
+    (4 data points including this poll) — see _rolling_avg_growth_pct().
+    Use avg_growth_pct where a steadier "is this genuinely strengthening,
+    not just one noisy tick" read is wanted; keep using prev/prev2 where
+    the tick-to-tick falling->rising REVERSAL check specifically needs
+    the single most recent interval.
 
     This is a separate tracker from record_and_diff() above and does NOT
     reset at day-rollover within a single process's RAM (DORE's Premium
@@ -212,11 +263,11 @@ def record_and_diff_premium(
     Thread-safe; cheap; safe to call on every Market Intelligence / F&O
     funnel tick.
 
-    Returns None (not 0.0) for any leg that hasn't been observed yet —
-    on the first call for a key both prev/prev2 are None, on the second
-    call prev is populated but prev2 is still None. A real premium is
-    never genuinely 0, so 0.0 would be indistinguishable from "no
-    history yet"; callers already guard on `is None` rather than
+    Returns None (not 0.0) for any leg/value that hasn't been observed
+    yet — on the first call for a key both prev/prev2 are None, on the
+    second call prev is populated but prev2 is still None. A real
+    premium is never genuinely 0, so 0.0 would be indistinguishable from
+    "no history yet"; callers already guard on `is None` rather than
     truthiness (see utils.dore_engine's premium_prev handling).
     """
     _ensure_loaded()
@@ -230,11 +281,14 @@ def record_and_diff_premium(
         pe_prev = pe_hist[0] if len(pe_hist) >= 1 else None
         pe_prev2 = pe_hist[1] if len(pe_hist) >= 2 else None
 
+        ce_avg_growth_pct = _rolling_avg_growth_pct(float(ce_premium or 0.0), ce_hist)
+        pe_avg_growth_pct = _rolling_avg_growth_pct(float(pe_premium or 0.0), pe_hist)
+
         _premium_history[key] = {
-            "ce": [float(ce_premium or 0.0)] + ce_hist[:1],
-            "pe": [float(pe_premium or 0.0)] + pe_hist[:1],
+            "ce": [float(ce_premium or 0.0)] + ce_hist[:_PREMIUM_HIST_DEPTH - 1],
+            "pe": [float(pe_premium or 0.0)] + pe_hist[:_PREMIUM_HIST_DEPTH - 1],
         }
-        return ce_prev, ce_prev2, pe_prev, pe_prev2
+        return ce_prev, ce_prev2, pe_prev, pe_prev2, ce_avg_growth_pct, pe_avg_growth_pct
 
 
 def record_and_diff_strike_premium(key: str, premium: float) -> Optional[float]:
@@ -322,8 +376,12 @@ def flush_to_supabase() -> None:
                     "snapshot_date": today_str,
                     "ce_h0": ce_hist[0] if len(ce_hist) >= 1 else None,
                     "ce_h1": ce_hist[1] if len(ce_hist) >= 2 else None,
+                    "ce_h2": ce_hist[2] if len(ce_hist) >= 3 else None,
+                    "ce_h3": ce_hist[3] if len(ce_hist) >= 4 else None,
                     "pe_h0": pe_hist[0] if len(pe_hist) >= 1 else None,
                     "pe_h1": pe_hist[1] if len(pe_hist) >= 2 else None,
+                    "pe_h2": pe_hist[2] if len(pe_hist) >= 3 else None,
+                    "pe_h3": pe_hist[3] if len(pe_hist) >= 4 else None,
                 })
             save_premium_history_snapshot(premium_rows)
 

@@ -562,12 +562,21 @@ def compute_fo_opportunities(
             # utils.oi_snapshot_store.record_and_diff_premium()'s
             # docstring for why this is a separate tracker from the OI
             # one above.
-            ce_prev, ce_prev2, pe_prev, pe_prev2 = record_and_diff_premium(
+            # 2026-08-06: record_and_diff_premium() now also returns a
+            # rolling-average growth rate (ce/pe_avg_growth_pct) across up
+            # to the last 3 intervals, alongside the existing single-
+            # interval prev/prev2 — see that function's docstring and
+            # utils.dore_engine's Stage 3 Premium Behaviour block for how
+            # it's blended with the single-tick change.
+            (ce_prev, ce_prev2, pe_prev, pe_prev2,
+             ce_avg_growth_pct, pe_avg_growth_pct) = record_and_diff_premium(
                 premium_key, atm_chain_row.get("ce_premium", 0.0), atm_chain_row.get("pe_premium", 0.0))
             atm_chain_row["ce_premium_prev"] = ce_prev
             atm_chain_row["ce_premium_prev2"] = ce_prev2
             atm_chain_row["pe_premium_prev"] = pe_prev
             atm_chain_row["pe_premium_prev2"] = pe_prev2
+            atm_chain_row["ce_premium_avg_growth_pct"] = ce_avg_growth_pct
+            atm_chain_row["pe_premium_avg_growth_pct"] = pe_avg_growth_pct
         except Exception:
             logger.exception("[DORE Stage3] option-chain fetch failed for %s", symbol)
             continue

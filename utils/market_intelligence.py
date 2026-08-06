@@ -155,13 +155,19 @@ def _index_dore(index_key: str, ohlcv, oi: dict, ce_pe_chg: tuple,
         ce_chg, pe_chg = ce_pe_chg
         ce_premium = oi.get("ce_premium", 0.0)
         pe_premium = oi.get("pe_premium", 0.0)
-        ce_prem_prev, ce_prem_prev2, pe_prem_prev, pe_prem_prev2 = record_and_diff_premium(
+        # 2026-08-06: record_and_diff_premium() now also returns a rolling-
+        # average growth rate (ce/pe_avg_growth_pct) — see utils/fo_scan.py's
+        # mirror of this same call for the fuller comment.
+        (ce_prem_prev, ce_prem_prev2, pe_prem_prev, pe_prem_prev2,
+         ce_avg_growth_pct, pe_avg_growth_pct) = record_and_diff_premium(
             index_key, ce_premium, pe_premium)
         atm_chain_row = {
             "atm_strike": oi.get("atm_strike") or 0.0,
             "ce_premium": ce_premium, "pe_premium": pe_premium,
             "ce_premium_prev": ce_prem_prev, "ce_premium_prev2": ce_prem_prev2,
             "pe_premium_prev": pe_prem_prev, "pe_premium_prev2": pe_prem_prev2,
+            "ce_premium_avg_growth_pct": ce_avg_growth_pct,
+            "pe_premium_avg_growth_pct": pe_avg_growth_pct,
             "ce_oi": oi.get("ce_oi", 0.0), "pe_oi": oi.get("pe_oi", 0.0),
             "ce_oi_change": ce_chg, "pe_oi_change": pe_chg,
             "pcr": oi.get("pcr", 1.0), "expiry": oi.get("expiry", ""),
