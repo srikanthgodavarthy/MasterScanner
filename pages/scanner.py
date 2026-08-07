@@ -3147,7 +3147,7 @@ def _sc_counts_html(df: pd.DataFrame) -> str:
 # _dore_options_plan_table_html below for the Options pipeline.
 
 
-def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
+def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
     """[2026-07-31] DORE Options Engine Integration — renders the
     utils.dore_options_engine/utils.dore_options_scan pipeline's output
     (one OptionTradePlan per row, from utils.scan_state's
@@ -3160,7 +3160,20 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
     Column set: this engine emits a complete plan (primary/conservative/
     aggressive strikes, entry zone, POP, confidence score) rather than a
     single-recommendation + Action-tier shape.
+
+    scan_time: 2026-08-07 — this cycle's snapshot created_at (the
+    dore_opt_meta the caller already loaded via load_snapshot_meta), used
+    as the timestamp for rows with no plan_created_at of their own (i.e.
+    fresh/unlocked candidates below MIN_CONFIDENCE_TO_ACTIVATE — see
+    utils.dore_options_persistence). Using the actual scan-cycle time
+    here, not render-time "now", means the value is stable across
+    reruns/page-refreshes of the SAME cycle and only advances when a new
+    scan genuinely completes. Falls back to render-time now() if the
+    caller doesn't have a meta timestamp handy (fail-soft, matches this
+    page's existing pattern elsewhere).
     """
+    scan_time = pd.Timestamp(scan_time, tz="UTC") if scan_time is not None else pd.Timestamp.now(tz="UTC")
+
     def _fmt_money(v):
         return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
 
@@ -3234,13 +3247,23 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
         # status badge. Rendered in the normal text color (not muted)
         # since it sits right next to Confidence now and should be easy
         # to read at a glance, not treated as secondary metadata.
-        # "—" (not a time) when persistence never ran this cycle
-        # (Supabase unavailable — see enrich_trade_plans_with_persistence's
-        # fail-soft path in utils.dore_options_scan), so a missing value
-        # always means "unknown", never a false positive.
+        #
+        # 2026-08-07: a row with no plan_status_label is NOT necessarily
+        # "unknown" — it's usually just a fresh/unlocked candidate below
+        # MIN_CONFIDENCE_TO_ACTIVATE that never got a persisted Active
+        # Plan (see enrich_trade_plans_with_persistence's fail-soft path
+        # in utils.dore_options_persistence — this is the SAME shape a
+        # total persistence outage produces, so this function genuinely
+        # can't tell the two cases apart from the row alone; either way,
+        # this cycle's scan_time is still an accurate "last seen" for
+        # the row). Shown lighter/un-bolded to read as "seen this cycle,
+        # not (yet) a locked plan" rather than a tracked Plan's own time.
         label = row.get("plan_status_label")
         if label in (None, "") or (isinstance(label, float) and pd.isna(label)):
-            return '<span style="color:var(--muted)">—</span>'
+            # Match _to_ist_display()'s convention (utils/dore_options_persistence.py)
+            # — every other timestamp in this table is IST, not UTC.
+            ts = scan_time.tz_convert("Asia/Kolkata").strftime("%H:%M")
+            return f'<span style="color:var(--muted);font-size:12px;">{ts}</span>'
         import re
         m = re.search(r"since\s+(?:\d{4}-\d{2}-\d{2}\s+)?(\d{1,2}:\d{2})\)\s*$", str(label))
         if m:
@@ -3284,8 +3307,22 @@ def _dore_options_plan_table_html(df: pd.DataFrame) -> str:
         df = df[(created == "") | (created == "None") | (created == "nan") | (created == today_ist)]
 
     # [2026-08-08, SG request] Highest-confidence candidates first.
+    # 2026-08-07: within a confidence tier, order by RECENCY too — most
+    # recently locked/updated first — instead of leaving ties to
+    # whatever order the scan happened to emit them in. plan_created_at
+    # only exists for rows that cleared MIN_CONFIDENCE_TO_ACTIVATE and
+    # got a locked Active Plan (see enrich_trade_plans_with_persistence
+    # in utils/dore_options_persistence.py); a row with none is, by
+    # definition, unlocked fresh output from THIS cycle — timestamped
+    # with scan_time (the snapshot's own created_at, passed in by the
+    # caller) rather than render-time now(), so it doesn't drift on
+    # every page refresh within the same still-current cycle.
     if "confidence_score" in df.columns:
-        df = df.sort_values("confidence_score", ascending=False, kind="stable")
+        sort_time = pd.to_datetime(df.get("plan_created_at"), errors="coerce", utc=True)
+        sort_time = sort_time.fillna(scan_time)
+        df = df.assign(_sort_time=sort_time)
+        df = df.sort_values(["confidence_score", "_sort_time"], ascending=[False, False], kind="stable")
+        df = df.drop(columns=["_sort_time"])
 
     if df.empty:
         return '<div style="color:var(--muted);padding:8px;">No candidates with Confidence ≥ 65 today.</div>'
@@ -3693,7 +3730,8 @@ def _dore_options_panel():
                        "chain, no OHLCV history, or no liquid strike found) or the live_scanner "
                        "universe is currently empty.")
         else:
-            st.markdown(_dore_options_plan_table_html(dore_opt_df), unsafe_allow_html=True)
+            st.markdown(_dore_options_plan_table_html(dore_opt_df, scan_time=(dore_opt_meta or {}).get("created_at")),
+                        unsafe_allow_html=True)
             st.caption("Showing Confidence ≥ 65 only. 🟢 Confidence ≥75 · 🔵 ≥55–74 (n/a below 65 here) — "
                        "DORE's own final_score, blending qualification, direction strength, and "
                        "premium/liquidity validation into one ranking. Source: PB = Pre-Breakout "
