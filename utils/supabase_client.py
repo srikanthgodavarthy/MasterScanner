@@ -1625,6 +1625,8 @@ CREATE TABLE IF NOT EXISTS setup_plans (
     invalidation_reason      text        NOT NULL DEFAULT '',
     invalidated_date           date,
 
+    source                   text        NOT NULL DEFAULT '',
+
     updated_at                timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_setup_plans_symbol ON setup_plans(symbol);
@@ -1715,6 +1717,7 @@ ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS last_seen_at   timestamp
 
 DORE_OPTIONS_PLANS_SOURCE_MIGRATION_SQL = """
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT '';
+ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT '';
 """
 
 DORE_OPTIONS_PLANS_T1_HIT_MIGRATION_SQL = """
