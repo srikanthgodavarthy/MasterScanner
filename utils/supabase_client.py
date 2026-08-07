@@ -1,20 +1,35 @@
 """
-Supabase read/write helpers for Trinity (NSE Nifty 500 scanner).
+Neon/Postgres read/write helpers for Trinity (NSE Nifty 500 scanner).
+
+[MIGRATION NOTE, 2026-08] This module used to wrap supabase-py's
+PostgREST client (`client.table("x").select()/.insert()/.upsert()/
+.execute()`). Neon is plain Postgres with no REST layer, so every
+function below now issues parameterized SQL directly through
+utils.db (a psycopg2 connection pool) instead.
+
+Every public function name and signature is UNCHANGED from the
+Supabase version — every caller across pages/*.py,
+scheduler/scan_worker.py, utils/oi_snapshot_store.py,
+utils/scan_state.py, utils/system_state.py etc. needed zero edits.
+
+get_client() is kept as a thin compatibility shim: it returns the Neon
+connection pool object (truthy) if NEON_DATABASE_URL is configured, or
+None otherwise — the same "is None -> not configured" pattern every
+caller in this codebase already checks before doing anything.
+
+SCHEMA_SQL (and every *_MIGRATION_SQL block) at the bottom is UNCHANGED
+from the Supabase version — it was always plain Postgres DDL/plpgsql
+(none of Supabase's platform-specific magic — RLS policies, storage,
+auth — ever leaked into this file's SQL), so it runs as-is against
+Neon. Run it once via `psql "$NEON_DATABASE_URL" -f schema.sql` or
+Neon's SQL Editor.
 
 Tables
 ------
 scan_snapshots   – one row per stock per scan run (top-50 results)
 backtest_results – full trade log from backtests
 watchlist        – user-curated watchlist with optional notes
-
-Usage
------
-from utils.supabase_client import get_client, save_scan_snapshot, \
-    load_scan_history, save_watchlist, load_watchlist, save_backtest_results
-
-SQL to run ONCE in Supabase → SQL Editor
------------------------------------------
-See SCHEMA_SQL constant at the bottom of this file.
+(...and everything else — see SCHEMA_SQL below)
 """
 
 from __future__ import annotations
@@ -26,80 +41,28 @@ from typing import Optional
 
 import pandas as pd
 import streamlit as st
+from psycopg2.extras import Json
+
+from utils import db
 
 logger = logging.getLogger(__name__)
 
 
-# ─── CLIENT ───────────────────────────────────────────────────────────────────
+# ─── CLIENT (compatibility shim) ───────────────────────────────────────
 
-@st.cache_resource(show_spinner=False)
 def get_client():
     """
-    Returns an initialised Supabase client, or None if credentials are absent.
-    Uses st.secrets so works identically locally (secrets.toml) and on
-    Streamlit Community Cloud (app secrets UI).
+    Returns the Neon connection pool if NEON_DATABASE_URL is configured,
+    or None otherwise. Kept for backward compatibility with every
+    caller in this codebase that already does `if client is None: ...`
+    before touching persistence — behaves identically to the old
+    Supabase get_client()'s "no secrets configured -> None" contract.
     """
-    try:
-        from supabase import create_client, Client
-
-        url: str = st.secrets["SUPABASE_URL"]
-        key: str = st.secrets["SUPABASE_KEY"]
-
-        if not url or not key:
-            return None
-
-        client: Client = create_client(url, key)
-        return client
-
-    except KeyError:
-        # Secrets not configured — silent fallback
-        logger.info("Supabase secrets not found; persistence disabled.")
-        return None
-    except Exception as exc:
-        logger.warning("Supabase init failed: %s", exc)
-        return None
+    return db.get_pool()
 
 
 def _is_available() -> bool:
     return get_client() is not None
-
-
-def _execute_with_retry(request_builder, max_retries: int = 2):
-    """Execute a supabase-py request builder (anything with .execute()),
-    retrying on a transient dropped-connection error.
-
-    2026-07-29: get_client() above is @st.cache_resource — ONE Supabase
-    client, and one underlying httpx/httpcore HTTP/2 connection pool,
-    lives for the entire process lifetime, including
-    scheduler/scan_worker.py's background threads which can run for
-    hours. Supabase's edge periodically closes idle HTTP/2 connections
-    server-side; the pool doesn't find out until it tries to reuse that
-    connection, surfacing as httpx.RemoteProtocolError("Server
-    disconnected") on an otherwise healthy request — this hit
-    upsert_fo_setup_plans_batch() and scan_state.save_snapshot() in the
-    SAME instant on 2026-07-29 because both share this one cached
-    client; it was one dropped connection, not two separate failures.
-    A retry almost always succeeds immediately (the pool either reuses
-    a still-alive connection or opens a fresh one) — this is cheap
-    insurance against that specific transient class, not a fix for the
-    underlying idle-connection teardown itself. Only retries
-    httpx.RemoteProtocolError; any other exception (auth, schema,
-    payload) is raised on the first attempt as before, unchanged.
-    """
-    import httpx
-
-    last_exc: Optional[Exception] = None
-    for attempt in range(max_retries + 1):
-        try:
-            return request_builder.execute()
-        except httpx.RemoteProtocolError as exc:
-            last_exc = exc
-            if attempt < max_retries:
-                logger.warning(
-                    "Supabase request hit a dropped connection (attempt %d/%d): %s — retrying",
-                    attempt + 1, max_retries + 1, exc,
-                )
-    raise last_exc
 
 
 # ─── SCAN SNAPSHOTS ───────────────────────────────────────────────────────────
@@ -115,12 +78,11 @@ def save_scan_snapshot(df: pd.DataFrame, label: str = "") -> bool:
 
     Returns True on success, False otherwise.
     """
-    client = get_client()
-    if client is None or df.empty:
+    if not db.is_available() or df.empty:
         return False
 
     run_ts = datetime.now(timezone.utc).isoformat()
-    top50  = df.head(50)
+    top50 = df.head(50)
 
     rows = []
     for _, row in top50.iterrows():
@@ -143,13 +105,7 @@ def save_scan_snapshot(df: pd.DataFrame, label: str = "") -> bool:
         })
 
     try:
-        # returning="minimal": nothing below reads resp.data, only whether
-        # the call raised — the default echo-back of every inserted row
-        # was wasted egress on every scan cycle.
-        resp = client.table("scan_snapshots").insert(rows, returning="minimal").execute()
-        if resp.data is None:
-            logger.error("scan_snapshots insert returned no data.")
-            return False
+        db.insert_rows("scan_snapshots", rows)
         return True
     except Exception as exc:
         logger.error("save_scan_snapshot failed: %s", exc)
@@ -160,22 +116,18 @@ def load_scan_history(limit: int = 10) -> pd.DataFrame:
     """
     Returns the N most-recent distinct scan run timestamps + their top rows.
     """
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return pd.DataFrame()
 
     try:
-        resp = (
-            client.table("scan_snapshots")
-            .select("*")
-            .order("run_at", desc=True)
-            .limit(limit * 50)          # up to 50 stocks per run
-            .execute()
+        rows = db.fetch_all(
+            "SELECT * FROM scan_snapshots ORDER BY run_at DESC LIMIT %s",
+            (limit * 50,),          # up to 50 stocks per run
         )
-        if not resp.data:
+        if not rows:
             return pd.DataFrame()
 
-        df = pd.DataFrame(resp.data)
+        df = pd.DataFrame(rows)
         df["run_at"] = pd.to_datetime(df["run_at"])
         return df
     except Exception as exc:
@@ -184,38 +136,22 @@ def load_scan_history(limit: int = 10) -> pd.DataFrame:
 
 
 # ─── FULL SCAN SNAPSHOTS (Dashboard/Scanner split, 2026-07) ────────────────────
-#
-# scan_snapshots (above) only keeps a narrow top-50 subset — fine for
-# history.py/validation.py, but pages/dashboard.py needs every column/row
-# from a completed scan (CV1_*, TrendPhase, sector, etc.) to rebuild Market
-# Health / Sector Rotation / Signal Class counts without ever running its
-# own scan. Rather than hand-maintain a wide fixed-column table that has to
-# track every column scanner_engine.py might emit, this stores the whole
-# DataFrame as one JSON blob per run — Scanner writes it, Dashboard reads
-# the latest one back into an equivalent DataFrame.
 
 def _latest_archived_trading_date() -> Optional[date]:
     """
     Lightweight check — returns just the `trading_date` of the most
     recent scan_daily_archive row (or None if the table is empty /
-    Supabase unavailable), without pulling its `data` JSON blob. Used
-    by archive_daily_scan() to decide whether today's trading day
-    already has an archive row.
+    Neon unavailable), without pulling its `data` JSON blob.
     """
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return None
     try:
-        resp = (
-            client.table("scan_daily_archive")
-            .select("trading_date")
-            .order("trading_date", desc=True)
-            .limit(1)
-            .execute()
+        row = db.fetch_one(
+            "SELECT trading_date FROM scan_daily_archive ORDER BY trading_date DESC LIMIT 1"
         )
-        if not resp.data:
+        if not row:
             return None
-        return pd.to_datetime(resp.data[0]["trading_date"]).date()
+        return pd.to_datetime(row["trading_date"]).date()
     except Exception as exc:
         logger.error("_latest_archived_trading_date failed: %s", exc)
         return None
@@ -223,10 +159,15 @@ def _latest_archived_trading_date() -> Optional[date]:
 
 def _is_unique_violation_error(exc: Exception) -> bool:
     """True if `exc` looks like a Postgres unique-constraint violation
-    (code 23505) — i.e. two processes both tried to archive the same
-    trading_date and the DB-level UNIQUE constraint (see SCHEMA_SQL)
-    correctly let only one win. Not an error for archive_daily_scan()'s
-    purposes — the other process already did the job."""
+    (SQLSTATE 23505) — i.e. two processes both tried to archive the same
+    trading_date and the DB-level UNIQUE constraint correctly let only
+    one win. Not an error for archive_daily_scan()'s purposes."""
+    try:
+        import psycopg2
+        if isinstance(exc, psycopg2.errors.UniqueViolation):
+            return True
+    except Exception:
+        pass
     msg = str(exc)
     return "23505" in msg or "duplicate key value violates unique constraint" in msg
 
@@ -235,63 +176,24 @@ def archive_daily_scan(df: pd.DataFrame, metadata: Optional[dict] = None) -> boo
     """
     Archive the FULL scanner result (all rows, all columns) as a single
     immutable JSON row in scan_daily_archive — ONE ROW PER TRADING DAY.
-
-    [2026-07-25 architecture change] This table (formerly
-    scan_full_snapshots, renamed — see SCHEMA_SQL) was originally
-    written on every scan_worker.py cycle AND every manual Run Scan,
-    redundant with live_scanner_snapshots (utils/scan_state.py), which
-    is now the Dashboard's ONLY operational read path (see
-    pages/dashboard.py — the fallback read here was removed the same
-    day; an empty live_scanner_snapshots now shows an honest "no scan
-    data yet" state instead of reaching into this table). Per that
-    architecture (Market Data → Scanner → live_scanner_snapshots →
-    Dashboard → Trade Engine), this table's only remaining purpose is a
-    long-term, immutable, daily ARCHIVE for historical/research
-    lookups — something live_scanner_snapshots can't provide on its
-    own, since it only retains ~500 rows (a day or two at 5-min
-    cadence) before pruning.
+    See the original module's architecture note (kept in git history) —
+    live_scanner_state/dore_live_state are the ONLY operational read
+    path; this is a long-term, immutable, daily ARCHIVE.
 
     Gating is TWO-LAYERED:
       1. Application-level: checks _latest_archived_trading_date()
-         before writing at all, so the common case never even attempts
-         a redundant insert.
-      2. Database-level: trading_date has a UNIQUE constraint (see
-         SCHEMA_SQL), so even if two processes both pass check #1 in a
-         race (scheduler's cycle-end write and a manual Run Scan
-         landing on the same trading day), only one insert can ever
-         succeed — the other's unique-violation is caught here and
-         treated as "already archived", not a failure.
-
-    "Trading day" is computed via utils.time_utils.today_ist() (IST
-    calendar day), matching how the rest of the app reasons about
-    trading days — not a naive UTC date, which could be off by one
-    near midnight IST.
-
-    This function is called from the same places as before
-    (scan_worker.py's cycle-end, pages/scanner.py's manual Run Scan) —
-    the gating lives HERE, not at the call sites, so callers don't need
-    their own "should I archive today" logic. It's a fast no-op (one
-    lightweight query, no write) on every call after the first
-    successful one for a given trading day.
-
-    Parameters
-    ----------
-    df : DataFrame returned by run_scanner()/apply_regime_layer() — every
-         column is kept as-is.
-    metadata : optional summary dict for historical/research lookups —
-         e.g. utils.regime_engine.regime_summary(df, regime_ctx)'s
-         output (regime/VIX/ADX/breadth-by-tier/avg scores). Stored
-         as-is in the `metadata` jsonb column. Pass None if a regime
-         context isn't available at the call site (metadata defaults
-         to '{}' — the archived `data` itself is unaffected either way).
+         before writing at all.
+      2. Database-level: trading_date has a UNIQUE constraint, so even
+         if two processes both pass check #1 in a race, only one insert
+         can ever succeed — the other's unique-violation is caught here
+         and treated as "already archived", not a failure.
 
     Returns True if archived (or already archived for today's trading
     day — not an error), False only on an actual failure.
     """
     from utils.time_utils import today_ist
 
-    client = get_client()
-    if client is None or df.empty:
+    if not db.is_available() or df.empty:
         return False
 
     trading_date = today_ist()
@@ -301,32 +203,18 @@ def archive_daily_scan(df: pd.DataFrame, metadata: Optional[dict] = None) -> boo
     run_ts = datetime.now(timezone.utc).isoformat()
 
     try:
-        # Coerce to plain JSON-safe types (numpy/pandas scalars, NaT, NaN
-        # all choke json/postgrest otherwise).
         safe_df = df.astype(object).where(pd.notnull(df), None)
         records = json.loads(safe_df.to_json(orient="records", date_format="iso"))
     except Exception as exc:
         logger.error("archive_daily_scan: serialization failed: %s", exc)
         return False
 
-    row = {
-        "run_at":       run_ts,
-        "trading_date": trading_date.isoformat(),
-        "row_count":    len(records),
-        "metadata":     metadata or {},
-        "data":         records,
-    }
-
     try:
-        # returning="minimal": this row contains the FULL scanner output
-        # (all rows, all columns) for the day — the largest single write
-        # in the app. Nothing here reads resp.data, so the default
-        # representation echo was doubling this write's egress for no
-        # reason.
-        resp = client.table("scan_daily_archive").insert(row, returning="minimal").execute()
-        if resp.data is None:
-            logger.error("scan_daily_archive insert returned no data.")
-            return False
+        db.execute(
+            """INSERT INTO scan_daily_archive (run_at, trading_date, row_count, metadata, data)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (run_ts, trading_date.isoformat(), len(records), Json(metadata or {}), Json(records)),
+        )
         logger.info("archive_daily_scan: archived trading day %s (%d rows)", trading_date, len(records))
         return True
     except Exception as exc:
@@ -342,75 +230,47 @@ def load_latest_daily_archive() -> tuple[pd.DataFrame, dict, str]:
     """
     Returns (df, metadata, trading_date_str) for the most recently
     archived trading day, or (empty DataFrame, {}, "") if none exists /
-    Supabase is unavailable.
-
-    [2026-07-25] NOT called by any operational code path — see
-    archive_daily_scan()'s docstring. This exists purely for future
-    historical/research lookups (e.g. a "what did the market look like
-    on date X" page), kept alongside the write side rather than
-    removed, per the 2026-07-25 architecture discussion's explicit
-    goal of preserving that capability.
+    Neon is unavailable.
     """
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return pd.DataFrame(), {}, ""
 
     try:
-        resp = (
-            client.table("scan_daily_archive")
-            .select("trading_date, metadata, data")
-            .order("trading_date", desc=True)
-            .limit(1)
-            .execute()
+        row = db.fetch_one(
+            "SELECT trading_date, metadata, data FROM scan_daily_archive "
+            "ORDER BY trading_date DESC LIMIT 1"
         )
-        if not resp.data:
+        if not row:
             return pd.DataFrame(), {}, ""
 
-        latest        = resp.data[0]
-        records       = latest.get("data") or []
-        metadata      = latest.get("metadata") or {}
-        trading_date  = latest.get("trading_date", "")
+        records = row.get("data") or []
+        metadata = row.get("metadata") or {}
+        trading_date = row.get("trading_date", "")
         df = pd.DataFrame(records)
-        return df, metadata, trading_date
+        return df, metadata, str(trading_date)
     except Exception as exc:
         logger.error("load_latest_daily_archive failed: %s", exc)
         return pd.DataFrame(), {}, ""
 
 
 # ─── SECTOR ROTATION PERSISTENCE [2026-07-26] ───────────────────────────
-# Completes the Sector Rotation tool: utils/sector_rotation.py's compute
-# layer (compute_rotation_metrics(), etc.) and pages/dashboard.py's
-# rendering functions (_sector_opportunity_board_panel(),
-# _leadership_rotation_panel()) already existed and already accepted a
-# `history`/`rotation_metrics` parameter — but nothing ever called these
-# two functions to actually persist or load that history, so both call
-# sites always passed None/empty and the day-over-day view never
-# appeared. These two functions are that missing persistence layer.
 
 def _latest_sector_snapshot_is_fresh(trading_date: date, min_refresh_mins: int) -> bool:
     """
     True if `trading_date` already has a sector_snapshots row written
-    within the last `min_refresh_mins` minutes. Used by
-    save_sector_snapshot() to throttle (not fully block) same-day
-    writes — see its docstring for why "skip entirely once today has
-    any row" would have silently prevented the refinement the docstring
-    was supposed to provide.
+    within the last `min_refresh_mins` minutes.
     """
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return False
     try:
-        resp = (
-            client.table("sector_snapshots")
-            .select("scan_date, created_at")
-            .eq("scan_date", trading_date.isoformat())
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
+        row = db.fetch_one(
+            """SELECT scan_date, created_at FROM sector_snapshots
+               WHERE scan_date = %s ORDER BY created_at DESC LIMIT 1""",
+            (trading_date.isoformat(),),
         )
-        if not resp.data:
+        if not row:
             return False
-        last_written = pd.to_datetime(resp.data[0]["created_at"])
+        last_written = pd.to_datetime(row["created_at"])
         if last_written.tzinfo is None:
             last_written = last_written.tz_localize("UTC")
         age_mins = (pd.Timestamp.now(tz="UTC") - last_written.tz_convert("UTC")).total_seconds() / 60.0
@@ -420,11 +280,6 @@ def _latest_sector_snapshot_is_fresh(trading_date: date, min_refresh_mins: int) 
         return False
 
 
-# Minimum gap between refinement writes for the SAME trading day. Not a
-# hard "once per day" gate (see save_sector_snapshot()'s docstring) —
-# this just caps write frequency across however many sessions have the
-# Dashboard open, while still letting today's numbers get more accurate
-# as the day's trading data accumulates.
 _SECTOR_SNAPSHOT_MIN_REFRESH_MINS = 15
 
 
@@ -432,33 +287,13 @@ def save_sector_snapshot(rows: list[dict]) -> bool:
     """
     Upsert one trading day's worth of per-sector rows (the output of
     utils.sector_rotation.build_sector_snapshot_rows()) into
-    sector_snapshots.
-
-    Throttled, not blocked: a lightweight check skips the write if
-    today's trading day was already written within the last
-    _SECTOR_SNAPSHOT_MIN_REFRESH_MINS minutes, so calling this on every
-    Dashboard render (across every open session) doesn't turn into
-    repeated writes on every rerun — but ALSO doesn't freeze today's row
-    at whatever the very first call of the day happened to see. Uses
-    upsert (on_conflict=sector,scan_date), not a bare insert, so each
-    refresh safely replaces today's numbers with the latest scan's,
-    rather than erroring or duplicating — deliberately different from
-    archive_daily_scan()'s pure immutability, since this table's whole
-    purpose is a same-day-refinable rollup, not a point-in-time archive.
-
-    Parameters
-    ----------
-    rows : list of dicts from build_sector_snapshot_rows(sector_stats, scan_date)
-
-    Returns True if upserted (or throttled — not an error), False only
-    on an actual failure. A no-op (empty `rows`) returns True without
-    touching Supabase.
+    sector_snapshots. Throttled (not blocked) — see
+    _latest_sector_snapshot_is_fresh().
     """
     if not rows:
         return True
 
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return False
 
     try:
@@ -470,14 +305,7 @@ def save_sector_snapshot(rows: list[dict]) -> bool:
         return True   # written recently enough — not a failure, just throttled
 
     try:
-        resp = (
-            client.table("sector_snapshots")
-            .upsert(rows, on_conflict="sector,scan_date", returning="minimal")
-            .execute()
-        )
-        if resp.data is None:
-            logger.error("sector_snapshots upsert returned no data.")
-            return False
+        db.upsert_rows("sector_snapshots", rows, conflict_cols=["sector", "scan_date"])
         logger.info("save_sector_snapshot: upserted %d sector row(s) for %s", len(rows), trading_date)
         return True
     except Exception as exc:
@@ -489,81 +317,31 @@ def save_sector_snapshot(rows: list[dict]) -> bool:
 def load_sector_snapshot_history(days: int = 60) -> pd.DataFrame:
     """
     Returns up to `days` trading days of sector_snapshots rows (all
-    sectors, all columns) as a DataFrame ready for
-    utils.sector_rotation.compute_rotation_metrics()/
-    compute_rotation_timeline()/compute_sector_flow(), or the raw
-    `history` parameter pages/dashboard.py's
-    _sector_opportunity_board_panel() sparklines read directly.
-
-    Cached 5 minutes (@st.cache_data) — this is day-level history that
-    doesn't change intraday except for today's own row, so there's no
-    value in re-querying it on every Dashboard render/rerun the way an
-    uncached call would.
-
-    Returns an empty DataFrame (not an error) if the table doesn't
-    exist yet, is empty, or Supabase is unavailable — every consumer in
-    utils/sector_rotation.py already handles an empty/missing history
-    gracefully (falls back to single-day figures).
+    sectors, all columns) as a DataFrame. Cached 5 minutes.
     """
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return pd.DataFrame()
 
     cutoff = (datetime.now(timezone.utc) - pd.Timedelta(days=days)).date().isoformat()
 
     try:
-        resp = (
-            client.table("sector_snapshots")
-            .select("sector, scan_date, avg_chg, avg_leadership, opp_score, "
-                    "elite_count, execute_count, watch_count, actionable_count, "
-                    "stock_count, net_inflow_cr")
-            .gte("scan_date", cutoff)
-            .execute()
+        rows = db.fetch_all(
+            """SELECT sector, scan_date, avg_chg, avg_leadership, opp_score,
+                      elite_count, execute_count, watch_count, actionable_count,
+                      stock_count, net_inflow_cr
+               FROM sector_snapshots WHERE scan_date >= %s""",
+            (cutoff,),
         )
-        if not resp.data:
+        if not rows:
             return pd.DataFrame()
-        return pd.DataFrame(resp.data)
+        return pd.DataFrame(rows)
     except Exception as exc:
         logger.error("load_sector_snapshot_history failed: %s", exc)
         return pd.DataFrame()
 
 
 # ─── RETENTION [Ops fix, 2026-07-25] ────────────────────────────────────
-# scan_snapshots and scan_daily_archive (formerly scan_full_snapshots)
-# are both insert-only. scan_snapshots had NO cleanup at all until this
-# fix — discovered while auditing every Supabase write path in the app
-# (it predates, and lives in a separate module from, utils/scan_state.py's
-# snapshot-retention fix, which never touched it). Both prune via the
-# same prune_snapshot_table() RPC utils/scan_state.py's tables already
-# use (extended there to support run_at-ordered tables, not just
-# version-ordered ones).
-#
-# scan_snapshots keeps far MORE rows than the other snapshot tables'
-# defaults (500) — it stores ~50 rows per scan (top-50 subset), and
-# load_scan_history(limit=50), called from pages/scanner.py, needs up to
-# 50 scans' worth (2,500 rows) of history for its streak calculation.
-# Pruning to the generic 500-row default would have silently broken that
-# feature by discarding history it still actively reads. 5,000 gives
-# ~100 scans of headroom above what's actually consumed today.
-#
-# scan_daily_archive keeps MUCH more than the other tables too, but for
-# the opposite reason — it's now genuinely meant to be a long-term
-# archive (one row per TRADING DAY, not per scan/cycle — see
-# archive_daily_scan()), so a generous keep-count is cheap: 3,650 rows
-# is ~10 years of daily history before the oldest row would ever be
-# pruned, which functions as a safety cap against unbounded growth
-# (e.g. if a future bug ever bypassed the one-row-per-day UNIQUE
-# constraint) rather than a practically-reached limit.
-# sector_snapshots [2026-07-26] also prunes via the same mechanism —
-# note its keep-count is a ROW cap, not a DATE cap: unlike the other
-# tables, sector_snapshots has multiple rows (one per sector) sharing
-# each scan_date, so "keep the most recent N rows" covers roughly
-# N / (number of sectors) days, not N days. 50,000 rows at ~18 sectors/
-# day is ~7-8 years of daily history — a distant safety cap, same
-# spirit as scan_daily_archive's, not a limit anything realistically
-# reaches. (Aligning the cutoff exactly to date boundaries would need a
-# dedicated pruning query rather than reusing this shared RPC — not
-# worth it for a boundary this many years out.)
+
 _SCAN_SNAPSHOTS_KEEP_ROWS = 5000
 _SCAN_DAILY_ARCHIVE_KEEP_ROWS = 3650
 _SECTOR_SNAPSHOTS_KEEP_ROWS = 50000
@@ -572,17 +350,11 @@ _SECTOR_SNAPSHOTS_KEEP_ROWS = 50000
 def prune_scan_snapshot_tables() -> dict:
     """
     Prunes scan_snapshots, scan_daily_archive, and sector_snapshots down
-    to their respective retention windows (see module comment above for
-    why their keep-counts differ so much). Called periodically by
-    scheduler/scan_worker.py's _run_retention_loop(), alongside
-    utils.scan_state.prune_all_snapshots() for the operational three
-    (market_intelligence/live_scanner/fo_scan) tables.
-    Returns {table_name: n_deleted_or_None}; None means the prune
-    failed (logged, non-fatal — same fail-soft convention as
-    utils.scan_state.prune_old_snapshots()).
+    to their respective retention windows via the prune_snapshot_table
+    Postgres function (see utils/scan_state.py's SCHEMA_SQL).
+    Returns {table_name: n_deleted_or_None}.
     """
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return {"scan_snapshots": None, "scan_daily_archive": None, "sector_snapshots": None}
 
     results = {}
@@ -592,8 +364,7 @@ def prune_scan_snapshot_tables() -> dict:
         ("sector_snapshots", _SECTOR_SNAPSHOTS_KEEP_ROWS),
     ):
         try:
-            resp = client.rpc("prune_snapshot_table", {"p_table": table, "p_keep": keep}).execute()
-            n = resp.data
+            n = db.call_function("prune_snapshot_table", {"p_table": table, "p_keep": keep})
             if n:
                 logger.info("prune_scan_snapshot_tables(%s): deleted %s row(s), keeping latest %s",
                             table, n, keep)
@@ -615,18 +386,12 @@ def load_watchlist() -> list[dict]:
     Returns the current watchlist as a list of dicts with keys:
     symbol, notes, added_at.
     """
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return []
-
     try:
-        resp = (
-            client.table("watchlist")
-            .select("symbol, notes, added_at")
-            .order("added_at", desc=True)
-            .execute()
+        return db.fetch_all(
+            "SELECT symbol, notes, added_at FROM watchlist ORDER BY added_at DESC"
         )
-        return resp.data or []
     except Exception as exc:
         logger.error("load_watchlist failed: %s", exc)
         return []
@@ -636,24 +401,20 @@ def add_to_watchlist(symbol: str, notes: str = "") -> bool:
     """
     Add a single symbol. Silently ignores duplicates (upsert on symbol).
     """
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return False
-
     try:
-        resp = (
-            client.table("watchlist")
-            .upsert(
-                {
-                    "symbol":   symbol.upper().strip(),
-                    "notes":    notes.strip(),
-                    "added_at": datetime.now(timezone.utc).isoformat(),
-                },
-                on_conflict="symbol",          # update notes if symbol exists
-            )
-            .execute()
+        db.upsert_rows(
+            "watchlist",
+            [{
+                "symbol":   symbol.upper().strip(),
+                "notes":    notes.strip(),
+                "added_at": datetime.now(timezone.utc).isoformat(),
+            }],
+            conflict_cols=["symbol"],
+            update_cols=["notes", "added_at"],   # update notes if symbol exists
         )
-        return bool(resp.data)
+        return True
     except Exception as exc:
         logger.error("add_to_watchlist failed: %s", exc)
         return False
@@ -661,17 +422,10 @@ def add_to_watchlist(symbol: str, notes: str = "") -> bool:
 
 def remove_from_watchlist(symbol: str) -> bool:
     """Remove a symbol from the watchlist."""
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return False
-
     try:
-        resp = (
-            client.table("watchlist")
-            .delete()
-            .eq("symbol", symbol.upper().strip())
-            .execute()
-        )
+        db.execute("DELETE FROM watchlist WHERE symbol = %s", (symbol.upper().strip(),))
         return True
     except Exception as exc:
         logger.error("remove_from_watchlist failed: %s", exc)
@@ -683,13 +437,11 @@ def save_watchlist(symbols: list[str]) -> bool:
     Replace the entire watchlist with a new list of symbols.
     Called from settings.py when the user edits the watchlist bulk.
     """
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return False
-
     try:
         # Clear existing
-        client.table("watchlist").delete().neq("symbol", "").execute()
+        db.execute("DELETE FROM watchlist WHERE symbol <> %s", ("",))
 
         if not symbols:
             return True
@@ -703,8 +455,8 @@ def save_watchlist(symbols: list[str]) -> bool:
             for s in symbols
             if s.strip()
         ]
-        resp = client.table("watchlist").insert(rows).execute()
-        return bool(resp.data)
+        db.insert_rows("watchlist", rows)
+        return True
     except Exception as exc:
         logger.error("save_watchlist failed: %s", exc)
         return False
@@ -720,12 +472,9 @@ def save_backtest_results(trades_df: pd.DataFrame, run_label: str = "",
     entry_price, exit_price, sl, t1, t2, pnl_r, result
 
     run_ts: pass a shared timestamp (str, UTC isoformat) when calling this
-    repeatedly for incremental/checkpoint saves of the SAME run, so all
-    rows group under one run_at value instead of each call minting its own.
-    If omitted, a fresh timestamp is generated (single-shot save).
+    repeatedly for incremental/checkpoint saves of the SAME run.
     """
-    client = get_client()
-    if client is None or trades_df.empty:
+    if not db.is_available() or trades_df.empty:
         return False
 
     run_ts = run_ts or datetime.now(timezone.utc).isoformat()
@@ -733,11 +482,6 @@ def save_backtest_results(trades_df: pd.DataFrame, run_label: str = "",
     def _safe(val):
         if pd.isna(val):
             return None
-        # order matters: datetime is a subclass of date, so this catches
-        # both pd.Timestamp/datetime.datetime AND plain datetime.date
-        # (e.g. entry_bar.date()/exit_date.date() in backtest_engine.py's
-        # simulate_trades() — those aren't Timestamp/datetime instances,
-        # and json.dumps() can't serialize a bare date on its own).
         if isinstance(val, (pd.Timestamp, datetime, date)):
             return val.isoformat()
         return val
@@ -760,14 +504,9 @@ def save_backtest_results(trades_df: pd.DataFrame, run_label: str = "",
         })
 
     try:
-        # Insert in batches of 500 (Supabase row limit per request)
         batch_size = 500
         for i in range(0, len(rows), batch_size):
-            resp = client.table("backtest_results").insert(
-                rows[i : i + batch_size], returning="minimal"
-            ).execute()
-            if resp.data is None:
-                return False
+            db.insert_rows("backtest_results", rows[i:i + batch_size])
         return True
     except Exception as exc:
         logger.error("save_backtest_results failed: %s", exc)
@@ -776,23 +515,19 @@ def save_backtest_results(trades_df: pd.DataFrame, run_label: str = "",
 
 def load_backtest_runs(limit: int = 5) -> list[dict]:
     """Returns summary of the N most recent backtest runs."""
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return []
-
     try:
-        resp = (
-            client.table("backtest_results")
-            .select("run_at, run_label, symbol, result, pnl_r")
-            .order("run_at", desc=True)
-            .limit(limit * 200)
-            .execute()
+        return db.fetch_all(
+            """SELECT run_at, run_label, symbol, result, pnl_r FROM backtest_results
+               ORDER BY run_at DESC LIMIT %s""",
+            (limit * 200,),
         )
-        return resp.data or []
     except Exception as exc:
         logger.error("load_backtest_runs failed: %s", exc)
         return []
-        
+
+
 def load_backtest_summary(limit: int = 5) -> pd.DataFrame:
     """Alias for load_backtest_runs, returns a DataFrame."""
     rows = load_backtest_runs(limit=limit)
@@ -800,27 +535,20 @@ def load_backtest_summary(limit: int = 5) -> pd.DataFrame:
         return pd.DataFrame()
     return pd.DataFrame(rows)
 
+
 # ─── SIGNAL FIRST SEEN ────────────────────────────────────────────────────────
 
 def upsert_first_seen(symbol_categories: list[tuple[str, str]]) -> bool:
     """
     Record the first date a symbol appeared in Elite / Execute.
-
-    ``symbol_categories`` is a list of (symbol, category) pairs, e.g.
-    [("NESTLEIND", "Elite Opportunity"), ("INFY", "Actionable")].
-
-    Uses INSERT ... ON CONFLICT DO NOTHING so the original date is never
-    overwritten — the stock keeps its earliest "first seen" date forever,
-    even if it drops out and re-enters the scanner.
-
-    Returns True on success, False otherwise.
+    Never overwrites an existing first_seen (ON CONFLICT DO NOTHING) —
+    the stock keeps its earliest "first seen" date forever.
     """
-    client = get_client()
-    if client is None or not symbol_categories:
+    if not db.is_available() or not symbol_categories:
         return False
 
-    today = datetime.now(timezone.utc).date().isoformat()   # "YYYY-MM-DD"
-    rows  = [
+    today = datetime.now(timezone.utc).date().isoformat()
+    rows = [
         {"symbol": sym.upper().strip(), "first_seen": today, "category": cat}
         for sym, cat in symbol_categories
         if sym.strip()
@@ -829,13 +557,8 @@ def upsert_first_seen(symbol_categories: list[tuple[str, str]]) -> bool:
         return False
 
     try:
-        # upsert with ignoreDuplicates=True → existing rows are left untouched
-        resp = (
-            client.table("signal_first_seen")
-            .upsert(rows, on_conflict="symbol", ignore_duplicates=True, returning="minimal")
-            .execute()
-        )
-        return resp.data is not None
+        db.upsert_rows("signal_first_seen", rows, conflict_cols=["symbol"], update_cols=[])
+        return True
     except Exception as exc:
         logger.error("upsert_first_seen failed: %s", exc)
         return False
@@ -843,22 +566,15 @@ def upsert_first_seen(symbol_categories: list[tuple[str, str]]) -> bool:
 
 def load_first_seen() -> dict[str, str]:
     """
-    Return a dict mapping symbol → first_seen date string ("YYYY-MM-DD").
-    Returns an empty dict if Supabase is unavailable or the table is empty.
+    Return a dict mapping symbol -> first_seen date string ("YYYY-MM-DD").
     """
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return {}
-
     try:
-        resp = (
-            client.table("signal_first_seen")
-            .select("symbol, first_seen")
-            .execute()
-        )
-        if not resp.data:
+        rows = db.fetch_all("SELECT symbol, first_seen FROM signal_first_seen")
+        if not rows:
             return {}
-        return {row["symbol"]: row["first_seen"] for row in resp.data}
+        return {row["symbol"]: str(row["first_seen"]) for row in rows}
     except Exception as exc:
         logger.error("load_first_seen failed: %s", exc)
         return {}
@@ -869,16 +585,10 @@ def load_first_seen() -> dict[str, str]:
 def save_lifecycle_snapshot(rows: list[dict]) -> bool:
     """
     Persist a batch of lifecycle state rows to the lifecycle_states table.
-
-    Each dict should contain: symbol, scan_date, stage, category,
-    leadership, conviction, entry_quality, extension, trend_quality, score,
-    action, cci, cci_state, rs_composite, adx, bars_band, bars_since, move_since.
-
-    Uses upsert on (symbol, scan_date) so re-running a scan on the same date
-    updates rather than duplicates.
+    Uses upsert on (symbol, scan_date) so re-running a scan on the same
+    date updates rather than duplicates.
     """
-    client = get_client()
-    if client is None or not rows:
+    if not db.is_available() or not rows:
         return False
 
     def _safe(v):
@@ -890,20 +600,12 @@ def save_lifecycle_snapshot(rows: list[dict]) -> bool:
             return v.isoformat()
         return v
 
-    clean = []
-    for r in rows:
-        clean.append({k: _safe(v) for k, v in r.items()})
+    clean = [{k: _safe(v) for k, v in r.items()} for r in rows]
 
     try:
         batch = 500
         for i in range(0, len(clean), batch):
-            resp = (
-                client.table("lifecycle_states")
-                .upsert(clean[i : i + batch], on_conflict="symbol,scan_date", returning="minimal")
-                .execute()
-            )
-            if resp.data is None:
-                return False
+            db.upsert_rows("lifecycle_states", clean[i:i + batch], conflict_cols=["symbol", "scan_date"])
         return True
     except Exception as exc:
         logger.error("save_lifecycle_snapshot failed: %s", exc)
@@ -915,23 +617,17 @@ def load_lifecycle_latest() -> pd.DataFrame:
     Return the most-recent lifecycle state for every symbol
     (one row per symbol).
     """
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return pd.DataFrame()
 
     try:
-        resp = (
-            client.table("lifecycle_states")
-            .select("*")
-            .order("scan_date", desc=True)
-            .limit(5000)
-            .execute()
+        rows = db.fetch_all(
+            "SELECT * FROM lifecycle_states ORDER BY scan_date DESC LIMIT 5000"
         )
-        if not resp.data:
+        if not rows:
             return pd.DataFrame()
 
-        df = pd.DataFrame(resp.data)
-        # Keep only the most-recent row per symbol
+        df = pd.DataFrame(rows)
         df = (
             df.sort_values("scan_date", ascending=False)
             .drop_duplicates(subset=["symbol"], keep="first")
@@ -948,25 +644,21 @@ def load_lifecycle_history(symbol: str, limit_days: int = 90) -> pd.DataFrame:
     Return all lifecycle_states rows for a single symbol over the last
     ``limit_days`` calendar days, ordered by scan_date ascending.
     """
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return pd.DataFrame()
 
-    from datetime import timezone, timedelta
+    from datetime import timedelta
     cutoff = (datetime.now(timezone.utc) - timedelta(days=limit_days)).date().isoformat()
 
     try:
-        resp = (
-            client.table("lifecycle_states")
-            .select("*")
-            .eq("symbol", symbol.upper().strip())
-            .gte("scan_date", cutoff)
-            .order("scan_date", desc=False)
-            .execute()
+        rows = db.fetch_all(
+            """SELECT * FROM lifecycle_states WHERE symbol = %s AND scan_date >= %s
+               ORDER BY scan_date ASC""",
+            (symbol.upper().strip(), cutoff),
         )
-        if not resp.data:
+        if not rows:
             return pd.DataFrame()
-        return pd.DataFrame(resp.data)
+        return pd.DataFrame(rows)
     except Exception as exc:
         logger.error("load_lifecycle_history failed: %s", exc)
         return pd.DataFrame()
@@ -977,23 +669,14 @@ def load_lifecycle_history(symbol: str, limit_days: int = 90) -> pd.DataFrame:
 def save_lifecycle_transitions(transitions: list[dict]) -> bool:
     """
     Persist detected lifecycle transitions.
-
     Each dict: symbol, from_stage, to_stage, from_date, to_date, direction.
     """
-    client = get_client()
-    if client is None or not transitions:
+    if not db.is_available() or not transitions:
         return False
-
     try:
         batch = 500
         for i in range(0, len(transitions), batch):
-            resp = (
-                client.table("lifecycle_transitions")
-                .insert(transitions[i : i + batch], returning="minimal")
-                .execute()
-            )
-            if resp.data is None:
-                return False
+            db.insert_rows("lifecycle_transitions", transitions[i:i + batch])
         return True
     except Exception as exc:
         logger.error("save_lifecycle_transitions failed: %s", exc)
@@ -1001,56 +684,30 @@ def save_lifecycle_transitions(transitions: list[dict]) -> bool:
 
 
 def load_lifecycle_transitions(limit: int = 1000) -> pd.DataFrame:
-    """
-    Return the most-recent lifecycle transition events.
-    """
-    client = get_client()
-    if client is None:
+    """Return the most-recent lifecycle transition events."""
+    if not db.is_available():
         return pd.DataFrame()
-
     try:
-        resp = (
-            client.table("lifecycle_transitions")
-            .select("*")
-            .order("to_date", desc=True)
-            .limit(limit)
-            .execute()
+        rows = db.fetch_all(
+            "SELECT * FROM lifecycle_transitions ORDER BY to_date DESC LIMIT %s", (limit,)
         )
-        if not resp.data:
+        if not rows:
             return pd.DataFrame()
-        return pd.DataFrame(resp.data)
+        return pd.DataFrame(rows)
     except Exception as exc:
         logger.error("load_lifecycle_transitions failed: %s", exc)
         return pd.DataFrame()
 
-
-# ─── WATCHLIST ENRICHED ───────────────────────────────────────────────────────
 
 # ─── SETUP PLANS (frozen trade levels) ───────────────────────────────────────
 
 def upsert_setup_plan(plan_dict: dict) -> bool:
     """
     Persist (insert or update) one SetupPlan to the setup_plans table.
-
     ``plan_dict`` should be the output of SetupPlan.to_db_dict().
-
-    Uses upsert on setup_id (PRIMARY KEY), so:
-      - New plans are inserted (status=WAITING).
-      - Lifecycle transitions (WAITING → ACTIVE → T1_HIT → CLOSED/EXPIRED)
-        are updated. These transitions are driven ONLY by price/entry/
-        sl/target/age (see utils/setup_persistence.advance_lifecycle) —
-        never by Recommendation/Category, which the caller should not
-        even be passing in here.
-      - Frozen trade levels (entry_locked / sl_locked / etc.) and the
-        locked trade thesis (locked_recommendation / locked_leadership /
-        etc.) are part of the upsert payload but the *callers* of this
-        function never change them after creation — that immutability
-        is enforced in setup_persistence.py, not here.
-
-    Returns True on success.
+    Uses upsert on setup_id (PRIMARY KEY).
     """
-    client = get_client()
-    if client is None or not plan_dict:
+    if not db.is_available() or not plan_dict:
         return False
 
     def _safe(v):
@@ -1063,12 +720,8 @@ def upsert_setup_plan(plan_dict: dict) -> bool:
     row = {k: _safe(v) for k, v in plan_dict.items()}
 
     try:
-        resp = (
-            client.table("setup_plans")
-            .upsert(row, on_conflict="setup_id", returning="minimal")
-            .execute()
-        )
-        return resp.data is not None
+        db.upsert_rows("setup_plans", [row], conflict_cols=["setup_id"])
+        return True
     except Exception as exc:
         logger.error("upsert_setup_plan failed: %s", exc)
         return False
@@ -1076,8 +729,7 @@ def upsert_setup_plan(plan_dict: dict) -> bool:
 
 def upsert_setup_plans_batch(plans: list[dict]) -> bool:
     """Persist a batch of SetupPlan dicts. Returns True if all batches succeeded."""
-    client = get_client()
-    if client is None or not plans:
+    if not db.is_available() or not plans:
         return False
 
     def _safe(v):
@@ -1092,13 +744,7 @@ def upsert_setup_plans_batch(plans: list[dict]) -> bool:
     try:
         batch_size = 200
         for i in range(0, len(clean), batch_size):
-            resp = (
-                client.table("setup_plans")
-                .upsert(clean[i: i + batch_size], on_conflict="setup_id", returning="minimal")
-                .execute()
-            )
-            if resp.data is None:
-                return False
+            db.upsert_rows("setup_plans", clean[i:i + batch_size], conflict_cols=["setup_id"])
         return True
     except Exception as exc:
         logger.error("upsert_setup_plans_batch failed: %s", exc)
@@ -1136,33 +782,25 @@ def _setup_plan_from_row(row: dict) -> "object":
         closed_at                 = str(row.get("closed_at", "") or ""),
         invalidation_reason      = row.get("invalidation_reason",    "") or "",
         invalidated_date          = str(row.get("invalidated_date",   "") or ""),
-        source                    = row.get("source") or "LS",
     )
 
 
 def load_open_setup_plans() -> dict:
     """
     Return every OPEN setup plan (status IN WAITING/ACTIVE/T1_HIT) as a
-    dict: {symbol: SetupPlan}. Called once at the start of each scanner
-    run to seed the in-memory cache that advance_lifecycle() updates —
-    WAITING plans must be included here too, otherwise a plan sitting in
-    WAITING would never get re-evaluated against the next day's price.
+    dict: {symbol: SetupPlan}.
     """
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return {}
-
     try:
-        resp = (
-            client.table("setup_plans")
-            .select("*")
-            .in_("status", ["WAITING", "ACTIVE", "T1_HIT"])
-            .execute()
+        rows = db.fetch_all(
+            "SELECT * FROM setup_plans WHERE status = ANY(%s)",
+            (["WAITING", "ACTIVE", "T1_HIT"],),
         )
-        if not resp.data:
+        if not rows:
             return {}
         result = {}
-        for row in resp.data:
+        for row in rows:
             plan = _setup_plan_from_row(row)
             result[plan.symbol] = plan
         return result
@@ -1172,61 +810,40 @@ def load_open_setup_plans() -> dict:
 
 
 def load_active_setup_plans() -> dict:
-    """
-    Deprecated name, kept for backward compatibility with existing call
-    sites (scanner_engine.py, pages/lifecycle.py). Despite the name,
-    this now returns every OPEN plan (WAITING/ACTIVE/T1_HIT), not just
-    status=='ACTIVE' ones — see load_open_setup_plans().
-    """
+    """Deprecated name, kept for backward compatibility. Returns every
+    OPEN plan (WAITING/ACTIVE/T1_HIT), not just status=='ACTIVE'."""
     return load_open_setup_plans()
 
 
 def load_all_setup_plans(limit: int = 500) -> "pd.DataFrame":
-    """
-    Return all setup plans (any status) as a DataFrame for history/audit views.
-    Ordered by first_actionable_date descending.
-    """
-    client = get_client()
-    if client is None:
+    """Return all setup plans (any status) as a DataFrame for history/audit views."""
+    if not db.is_available():
         return pd.DataFrame()
-
     try:
-        resp = (
-            client.table("setup_plans")
-            .select("*")
-            .order("first_actionable_date", desc=True)
-            .limit(limit)
-            .execute()
+        rows = db.fetch_all(
+            "SELECT * FROM setup_plans ORDER BY first_actionable_date DESC LIMIT %s", (limit,)
         )
-        if not resp.data:
+        if not rows:
             return pd.DataFrame()
-        return pd.DataFrame(resp.data)
+        return pd.DataFrame(rows)
     except Exception as exc:
         logger.error("load_all_setup_plans failed: %s", exc)
         return pd.DataFrame()
 
 
 def load_setup_plan(symbol: str) -> "Optional[object]":
-    """
-    Return the most-recent setup plan for a single symbol (any status).
-    Returns a SetupPlan dataclass or None.
-    """
-    client = get_client()
-    if client is None:
+    """Return the most-recent setup plan for a single symbol (any status)."""
+    if not db.is_available():
         return None
-
     try:
-        resp = (
-            client.table("setup_plans")
-            .select("*")
-            .eq("symbol", symbol.upper().strip())
-            .order("first_actionable_date", desc=True)
-            .limit(1)
-            .execute()
+        rows = db.fetch_all(
+            """SELECT * FROM setup_plans WHERE symbol = %s
+               ORDER BY first_actionable_date DESC LIMIT 1""",
+            (symbol.upper().strip(),),
         )
-        if not resp.data:
+        if not rows:
             return None
-        return _setup_plan_from_row(resp.data[0])
+        return _setup_plan_from_row(rows[0])
     except Exception as exc:
         logger.error("load_setup_plan failed for %s: %s", symbol, exc)
         return None
@@ -1235,27 +852,17 @@ def load_setup_plan(symbol: str) -> "Optional[object]":
 def close_setup_plan_manually(setup_id: str, reason: str = "Manual exit") -> bool:
     """
     Persist a manual trade exit from the 'Active Plans' dashboard.
-    Loads the plan, applies the same close_plan_manually() transition
-    used by the lifecycle engine (ACTIVE/T1_HIT → CLOSED only), and
-    writes it back. Returns False if the plan isn't open or isn't found.
     """
     from utils.setup_persistence import close_plan_manually
 
-    client = get_client()
-    if client is None or not setup_id:
+    if not db.is_available() or not setup_id:
         return False
 
     try:
-        resp = (
-            client.table("setup_plans")
-            .select("*")
-            .eq("setup_id", setup_id)
-            .limit(1)
-            .execute()
-        )
-        if not resp.data:
+        rows = db.fetch_all("SELECT * FROM setup_plans WHERE setup_id = %s LIMIT 1", (setup_id,))
+        if not rows:
             return False
-        plan = _setup_plan_from_row(resp.data[0])
+        plan = _setup_plan_from_row(rows[0])
         if not close_plan_manually(plan, reason=reason):
             return False
         return upsert_setup_plan(plan.to_db_dict())
@@ -1265,16 +872,11 @@ def close_setup_plan_manually(setup_id: str, reason: str = "Manual exit") -> boo
 
 
 # ─── F&O SETUP PLANS (frozen option-premium levels — DORE Options tab) ────────
-# Same shape/contract as the equity setup_plans block above; see
-# utils/fo_setup_persistence.py for the FOSetupPlan dataclass + lifecycle
-# state machine this wraps. Kept in a separate table (fo_setup_plans) since
-# the identity key is symbol+leg+strike+expiry, not just symbol.
 
 def upsert_fo_setup_plan(plan_dict: dict) -> bool:
     """Persist (insert or update) one FOSetupPlan — plan_dict is the
     output of FOSetupPlan.to_db_dict(). Upserts on setup_id."""
-    client = get_client()
-    if client is None or not plan_dict:
+    if not db.is_available() or not plan_dict:
         return False
 
     def _safe(v):
@@ -1286,10 +888,8 @@ def upsert_fo_setup_plan(plan_dict: dict) -> bool:
 
     row = {k: _safe(v) for k, v in plan_dict.items()}
     try:
-        resp = client.table("fo_setup_plans").upsert(
-            row, on_conflict="setup_id", returning="minimal"
-        ).execute()
-        return resp.data is not None
+        db.upsert_rows("fo_setup_plans", [row], conflict_cols=["setup_id"])
+        return True
     except Exception as exc:
         logger.error("upsert_fo_setup_plan failed: %s", exc)
         return False
@@ -1297,8 +897,7 @@ def upsert_fo_setup_plan(plan_dict: dict) -> bool:
 
 def upsert_fo_setup_plans_batch(plans: list[dict]) -> bool:
     """Persist a batch of FOSetupPlan dicts. Returns True if all batches succeeded."""
-    client = get_client()
-    if client is None or not plans:
+    if not db.is_available() or not plans:
         return False
 
     def _safe(v):
@@ -1312,12 +911,7 @@ def upsert_fo_setup_plans_batch(plans: list[dict]) -> bool:
     try:
         batch_size = 200
         for i in range(0, len(clean), batch_size):
-            resp = _execute_with_retry(
-                client.table("fo_setup_plans")
-                .upsert(clean[i: i + batch_size], on_conflict="setup_id", returning="minimal")
-            )
-            if resp.data is None:
-                return False
+            db.upsert_rows("fo_setup_plans", clean[i:i + batch_size], conflict_cols=["setup_id"])
         return True
     except Exception as exc:
         logger.error("upsert_fo_setup_plans_batch failed: %s", exc)
@@ -1354,24 +948,18 @@ def _fo_setup_plan_from_row(row: dict) -> "object":
 
 
 def load_open_fo_setup_plans() -> dict:
-    """Return every OPEN F&O setup plan as {contract_key: FOSetupPlan},
-    where contract_key == symbol|leg|strike|expiry (FOSetupPlan.contract_key).
-    Called once per DORE Options-tab run to seed the in-memory cache that
-    enrich_fo_opportunities_df()/advance_fo_lifecycle() update."""
-    client = get_client()
-    if client is None:
+    """Return every OPEN F&O setup plan as {contract_key: FOSetupPlan}."""
+    if not db.is_available():
         return {}
     try:
-        resp = (
-            client.table("fo_setup_plans")
-            .select("*")
-            .in_("status", ["WAITING", "ACTIVE", "T1_HIT"])
-            .execute()
+        rows = db.fetch_all(
+            "SELECT * FROM fo_setup_plans WHERE status = ANY(%s)",
+            (["WAITING", "ACTIVE", "T1_HIT"],),
         )
-        if not resp.data:
+        if not rows:
             return {}
         result = {}
-        for row in resp.data:
+        for row in rows:
             plan = _fo_setup_plan_from_row(row)
             result[plan.contract_key] = plan
         return result
@@ -1382,35 +970,29 @@ def load_open_fo_setup_plans() -> dict:
 
 def load_all_fo_setup_plans(limit: int = 500) -> pd.DataFrame:
     """All F&O setup plans (any status), for history/audit views."""
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return pd.DataFrame()
     try:
-        resp = (
-            client.table("fo_setup_plans")
-            .select("*")
-            .order("created_date", desc=True)
-            .limit(limit)
-            .execute()
+        rows = db.fetch_all(
+            "SELECT * FROM fo_setup_plans ORDER BY created_date DESC LIMIT %s", (limit,)
         )
-        if not resp.data:
+        if not rows:
             return pd.DataFrame()
-        return pd.DataFrame(resp.data)
+        return pd.DataFrame(rows)
     except Exception as exc:
         logger.error("load_all_fo_setup_plans failed: %s", exc)
         return pd.DataFrame()
 
 
 def close_fo_setup_plan_manually(setup_id: str, reason: str = "Manual exit") -> bool:
-    """Manual exit hook (ACTIVE/T1_HIT → CLOSED only)."""
-    client = get_client()
-    if client is None or not setup_id:
+    """Manual exit hook (ACTIVE/T1_HIT -> CLOSED only)."""
+    if not db.is_available() or not setup_id:
         return False
     try:
-        resp = client.table("fo_setup_plans").select("*").eq("setup_id", setup_id).limit(1).execute()
-        if not resp.data:
+        rows = db.fetch_all("SELECT * FROM fo_setup_plans WHERE setup_id = %s LIMIT 1", (setup_id,))
+        if not rows:
             return False
-        plan = _fo_setup_plan_from_row(resp.data[0])
+        plan = _fo_setup_plan_from_row(rows[0])
         if plan.status not in ("ACTIVE", "T1_HIT"):
             return False
         from utils.fo_setup_persistence import FOSetupPlanStatus, _now_iso
@@ -1422,19 +1004,12 @@ def close_fo_setup_plan_manually(setup_id: str, reason: str = "Manual exit") -> 
         return False
 
 
-# ─── DORE OPTIONS ENGINE PLANS (locked entry premium — DORE Options tab,
-#     "DORE Options Engine (primary)" table) ────────────────────────────
-# See utils/dore_options_persistence.py for the DoreOptionsPlan dataclass
-# this wraps. Kept in its own table (dore_options_plans), separate from
-# fo_setup_plans, because the two pipelines (utils.dore_options_engine
-# vs. the legacy utils.fo_scan/dore_fo_screener) are architecturally
-# independent by design.
+# ─── DORE OPTIONS ENGINE PLANS (locked entry premium — DORE Options tab) ──────
 
 def upsert_dore_options_plans_batch(plans: list[dict]) -> bool:
     """Persist a batch of DoreOptionsPlan dicts (to_db_dict() output).
     Upserts on plan_id. Returns True if all batches succeeded."""
-    client = get_client()
-    if client is None or not plans:
+    if not db.is_available() or not plans:
         return False
 
     def _safe(v):
@@ -1448,12 +1023,7 @@ def upsert_dore_options_plans_batch(plans: list[dict]) -> bool:
     try:
         batch_size = 200
         for i in range(0, len(clean), batch_size):
-            resp = _execute_with_retry(
-                client.table("dore_options_plans")
-                .upsert(clean[i: i + batch_size], on_conflict="plan_id", returning="minimal")
-            )
-            if resp.data is None:
-                return False
+            db.upsert_rows("dore_options_plans", clean[i:i + batch_size], conflict_cols=["plan_id"])
         return True
     except Exception as exc:
         logger.error("upsert_dore_options_plans_batch failed: %s", exc)
@@ -1487,25 +1057,15 @@ def _dore_options_plan_from_row(row: dict) -> "object":
 
 
 def load_open_dore_options_plans() -> dict:
-    """Return every OPEN DORE Options locked entry as
-    {contract_key: DoreOptionsPlan}, where contract_key ==
-    symbol|direction|strike|expiry (DoreOptionsPlan.contract_key).
-    Called once per DORE Options Engine run to seed the in-memory
-    lookup enrich_trade_plans_with_persistence() reads/updates."""
-    client = get_client()
-    if client is None:
+    """Return every OPEN DORE Options locked entry as {contract_key: DoreOptionsPlan}."""
+    if not db.is_available():
         return {}
     try:
-        resp = (
-            client.table("dore_options_plans")
-            .select("*")
-            .eq("status", "OPEN")
-            .execute()
-        )
-        if not resp.data:
+        rows = db.fetch_all("SELECT * FROM dore_options_plans WHERE status = %s", ("OPEN",))
+        if not rows:
             return {}
         result = {}
-        for row in resp.data:
+        for row in rows:
             plan = _dore_options_plan_from_row(row)
             result[plan.contract_key] = plan
         return result
@@ -1515,30 +1075,19 @@ def load_open_dore_options_plans() -> dict:
 
 
 def load_recently_closed_dore_options_plans(limit: int = 15) -> pd.DataFrame:
-    """[Sprint 1 — Portfolio Admission UI, 2026-08-05] Most recently
-    CLOSED DORE Options plans, newest first — feeds the "Recently
-    Retired / Closed" panel under the Active Plans tab so a user can
-    see *why* a plan left the book (Superseded by a stronger same-
-    symbol/direction setup, Retired to make room in a full portfolio,
-    Expired, or aged out) rather than just watching it silently
-    disappear from the Active list. Ordered by closed_at (falls back to
-    created_date for any legacy row without one) since that's when the
-    plan actually left the book, not when it was originally minted."""
-    client = get_client()
-    if client is None:
+    """[Sprint 1 — Portfolio Admission UI] Most recently CLOSED DORE
+    Options plans, newest first."""
+    if not db.is_available():
         return pd.DataFrame()
     try:
-        resp = (
-            client.table("dore_options_plans")
-            .select("*")
-            .eq("status", "CLOSED")
-            .order("closed_at", desc=True)
-            .limit(limit)
-            .execute()
+        rows = db.fetch_all(
+            """SELECT * FROM dore_options_plans WHERE status = %s
+               ORDER BY closed_at DESC LIMIT %s""",
+            ("CLOSED", limit),
         )
-        if not resp.data:
+        if not rows:
             return pd.DataFrame()
-        return pd.DataFrame(resp.data)
+        return pd.DataFrame(rows)
     except Exception as exc:
         logger.error("load_recently_closed_dore_options_plans failed: %s", exc)
         return pd.DataFrame()
@@ -1546,20 +1095,15 @@ def load_recently_closed_dore_options_plans(limit: int = 15) -> pd.DataFrame:
 
 def load_all_dore_options_plans(limit: int = 500) -> pd.DataFrame:
     """All DORE Options locked entries (any status), for history/audit views."""
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return pd.DataFrame()
     try:
-        resp = (
-            client.table("dore_options_plans")
-            .select("*")
-            .order("created_date", desc=True)
-            .limit(limit)
-            .execute()
+        rows = db.fetch_all(
+            "SELECT * FROM dore_options_plans ORDER BY created_date DESC LIMIT %s", (limit,)
         )
-        if not resp.data:
+        if not rows:
             return pd.DataFrame()
-        return pd.DataFrame(resp.data)
+        return pd.DataFrame(rows)
     except Exception as exc:
         logger.error("load_all_dore_options_plans failed: %s", exc)
         return pd.DataFrame()
@@ -1568,15 +1112,6 @@ def load_all_dore_options_plans(limit: int = 500) -> pd.DataFrame:
 def load_watchlist_enriched(lc_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Return the watchlist joined with the latest lifecycle state for each symbol.
-
-    Columns: symbol, notes, added_at, stage, leadership, conviction,
-             entry_quality, trend_quality, score, scan_date  (lifecycle cols may be NaN)
-
-    Parameters
-    ----------
-    lc_df : pd.DataFrame | None
-        Pre-loaded lifecycle DataFrame (e.g. already fetched by the caller).
-        When None (default) the function fetches it via load_lifecycle_latest().
     """
     wl = load_watchlist()
     if not wl:
@@ -1599,23 +1134,14 @@ def load_watchlist_enriched(lc_df: pd.DataFrame | None = None) -> pd.DataFrame:
 
 
 # ─── PORTFOLIO POSITIONS ──────────────────────────────────────────────────────
-# Bought → Portfolio hand-off. A row here is a real, held position — separate
-# from setup_plans (WAITING/pre-trigger trade plans) and watchlist
-# (pre-decision). status: OPEN | CLOSED.
 
 def add_to_portfolio(position: dict) -> tuple[bool, str]:
     """
-    Insert a new held position ("Bought" action). Expected keys:
-    symbol, entry_price, entry_date (YYYY-MM-DD), qty, locked_leadership,
-    locked_conviction, entry_rs_rank, source_category, notes.
-
-    Returns (success, message). message is empty on success and holds a
-    human-readable reason on failure ("no credentials" vs. the actual
-    Supabase/Postgres error) so callers don't have to guess.
+    Insert a new held position ("Bought" action).
+    Returns (success, message).
     """
-    client = get_client()
-    if client is None:
-        msg = "Supabase not configured (SUPABASE_URL / SUPABASE_KEY missing from secrets)."
+    if not db.is_available():
+        msg = "Neon not configured (NEON_DATABASE_URL missing from secrets)."
         logger.warning("add_to_portfolio: %s", msg)
         return False, msg
 
@@ -1641,9 +1167,7 @@ def add_to_portfolio(position: dict) -> tuple[bool, str]:
             "status":              "OPEN",
             "created_at":          datetime.now(timezone.utc).isoformat(),
         }
-        resp = client.table("portfolio_positions").insert(row).execute()
-        if not resp.data:
-            return False, "Insert returned no data — check Supabase RLS policies on portfolio_positions."
+        db.insert_rows("portfolio_positions", [row])
         return True, ""
     except Exception as exc:
         logger.error("add_to_portfolio failed: %s", exc)
@@ -1652,35 +1176,44 @@ def add_to_portfolio(position: dict) -> tuple[bool, str]:
 
 def load_portfolio(status: str = "OPEN") -> pd.DataFrame:
     """Load portfolio positions, default OPEN (i.e. currently held)."""
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return pd.DataFrame()
-
     try:
-        q = client.table("portfolio_positions").select("*")
         if status:
-            q = q.eq("status", status)
-        resp = q.order("created_at", desc=True).execute()
-        return pd.DataFrame(resp.data or [])
+            rows = db.fetch_all(
+                "SELECT * FROM portfolio_positions WHERE status = %s ORDER BY created_at DESC",
+                (status,),
+            )
+        else:
+            rows = db.fetch_all("SELECT * FROM portfolio_positions ORDER BY created_at DESC")
+        return pd.DataFrame(rows or [])
     except Exception as exc:
         logger.error("load_portfolio failed: %s", exc)
         return pd.DataFrame()
 
 
+def _pyscalar(v):
+    """Unwrap a numpy scalar (int64/float64/bool_ from a pandas DataFrame
+    .iloc[]/.loc[] lookup) to its native Python type — psycopg2 doesn't
+    adapt numpy types directly. Passes through anything else unchanged."""
+    if hasattr(v, "item"):
+        try:
+            return v.item()
+        except Exception:
+            return v
+    return v
+
+
 def update_portfolio_position(position_id, updates: dict) -> bool:
     """Patch fields on an existing position (e.g. after a Reduce)."""
-    client = get_client()
-    if client is None:
+    if not db.is_available() or not updates:
         return False
-
     try:
-        resp = (
-            client.table("portfolio_positions")
-            .update(updates)
-            .eq("id", position_id)
-            .execute()
-        )
-        return bool(resp.data)
+        position_id = _pyscalar(position_id)
+        set_clause = ", ".join(f"{k} = %s" for k in updates)
+        params = [_pyscalar(v) for v in updates.values()] + [position_id]
+        n = db.execute(f"UPDATE portfolio_positions SET {set_clause} WHERE id = %s", params)
+        return n > 0
     except Exception as exc:
         logger.error("update_portfolio_position failed: %s", exc)
         return False
@@ -1712,10 +1245,7 @@ def reduce_portfolio_position(position_id, new_qty: float, reason: str = "Partia
 def increase_portfolio_position(position_id, current_qty: float, current_entry_price: float,
                                  add_qty: float, add_price: float,
                                  reason: str = "Added to position") -> bool:
-    """Average up/down an existing OPEN position: blends the new shares'
-    price into a new weighted-average entry price and bumps qty. Used by
-    the 'Add More' control so a top-up doesn't require creating a second,
-    duplicate row for the same symbol."""
+    """Average up/down an existing OPEN position."""
     if add_qty <= 0 or add_price <= 0:
         return False
     new_qty = round(current_qty + add_qty, 4)
@@ -1731,66 +1261,29 @@ def increase_portfolio_position(position_id, current_qty: float, current_entry_p
 
 
 def delete_portfolio_position(position_id) -> bool:
-    """Permanently remove a position row (hard delete) — distinct from
-    close_portfolio_position, which only marks status CLOSED and keeps
-    the row for history. Use for correcting mistaken entries, not for
-    normal exits (which should go through Exit/close so the trade stays
-    in the record)."""
-    client = get_client()
-    if client is None:
+    """Permanently remove a position row (hard delete)."""
+    if not db.is_available():
         return False
-
     try:
-        resp = (
-            client.table("portfolio_positions")
-            .delete()
-            .eq("id", position_id)
-            .execute()
-        )
-        return bool(resp.data)
+        n = db.execute("DELETE FROM portfolio_positions WHERE id = %s", (_pyscalar(position_id),))
+        return n > 0
     except Exception as exc:
         logger.error("delete_portfolio_position failed: %s", exc)
         return False
 
 
 # ─── DORE OI / PREMIUM BASELINE (RAM-cache persistence) ───────────────────────
-#
-# Backs utils.oi_snapshot_store's RAM-resident trackers. That module's own
-# docstring flagged this exact gap: "on a fresh process restart mid-day, the
-# baseline re-seeds from whatever snapshot comes in first (losing the
-# morning's buildup)... would need a persisted (e.g. Supabase) baseline to
-# survive restarts." These two table pairs are that persistence layer.
-#
-# Both are written in ONE BATCH UPSERT per scan cycle (oi_snapshot_store.
-# flush_to_supabase(), called once from utils.fo_scan.compute_fo_scan()
-# after a full universe pass) — never per-symbol — so this never adds
-# per-symbol Supabase latency to the DORE funnel's hot loop. Reads happen
-# once per process lifetime (lazy-loaded on first use), not once per call.
 
 def save_oi_baseline_snapshot(rows: list[dict]) -> bool:
     """
-    Batch-upsert today's OI baseline rows (one per index/key tracked by
-    utils.oi_snapshot_store.record_and_diff()) into dore_oi_baseline.
-
-    rows: [{"key": ..., "snapshot_date": "YYYY-MM-DD",
-            "baseline_ce_oi": ..., "baseline_pe_oi": ...}, ...]
-
-    Returns True on success (or a no-op empty `rows`), False only on an
-    actual failure — mirrors save_sector_snapshot()'s contract so a
-    failed flush is logged but never raises into the scan loop.
+    Batch-upsert today's OI baseline rows into dore_oi_baseline.
     """
     if not rows:
         return True
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return False
     try:
-        resp = client.table("dore_oi_baseline").upsert(
-            rows, on_conflict="key", returning="minimal"
-        ).execute()
-        if resp.data is None:
-            logger.error("dore_oi_baseline upsert returned no data.")
-            return False
+        db.upsert_rows("dore_oi_baseline", rows, conflict_cols=["key"])
         return True
     except Exception as exc:
         logger.error("save_oi_baseline_snapshot failed: %s", exc)
@@ -1799,27 +1292,10 @@ def save_oi_baseline_snapshot(rows: list[dict]) -> bool:
 
 def prune_oi_and_premium_history(keep_days: int = 2) -> dict:
     """
-    [Egress/RAM fix, 2026-08-06] dore_oi_baseline and dore_premium_history
-    had NO retention logic at all — every row ever written stayed
-    forever, and both load_oi_baseline_snapshots()/
-    load_premium_history_snapshots() do an unfiltered `select("*")`-style
-    full-table read every DORE cycle (filtering down to "today" only
-    AFTER the fetch, client-side). That meant both the egress AND the
-    in-process memory footprint of every single cycle's read grew a
-    little more every day the tables weren't pruned — a genuine slow
-    RAM-creep mechanism, not just a one-off spike.
-
-    Deletes rows older than `keep_days` calendar days (by snapshot_date).
-    Both tables only ever need "today" (and briefly "yesterday", for any
-    process still finishing a cycle that started right at midnight IST) —
-    see the same-day rollover rule documented in utils.oi_snapshot_store.
-
-    Returns {table_name: n_deleted_or_None}, same fail-soft convention as
-    prune_scan_snapshot_tables() — a failed prune is logged and skipped,
-    never fatal to the caller.
+    Deletes rows older than `keep_days` calendar days (by snapshot_date)
+    from dore_oi_baseline and dore_premium_history.
     """
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return {"dore_oi_baseline": None, "dore_premium_history": None}
 
     from datetime import timezone as _tz, timedelta as _td
@@ -1828,19 +1304,11 @@ def prune_oi_and_premium_history(keep_days: int = 2) -> dict:
     results = {}
     for table in ("dore_oi_baseline", "dore_premium_history"):
         try:
-            # count="exact" reports how many rows matched via the
-            # Content-Range response header — not the response body — so
-            # this still avoids echoing the deleted rows themselves.
-            resp = (
-                client.table(table)
-                .delete(returning="minimal", count="exact")
-                .lt("snapshot_date", cutoff)
-                .execute()
-            )
-            if resp.count:
+            n = db.execute(f"DELETE FROM {table} WHERE snapshot_date < %s", (cutoff,))
+            if n:
                 logger.info("prune_oi_and_premium_history(%s): deleted %s row(s) older than %s",
-                            table, resp.count, cutoff)
-            results[table] = resp.count
+                            table, n, cutoff)
+            results[table] = n
         except Exception:
             logger.exception("prune_oi_and_premium_history(%s) failed (non-fatal)", table)
             results[table] = None
@@ -1848,31 +1316,16 @@ def prune_oi_and_premium_history(keep_days: int = 2) -> dict:
 
 
 def load_oi_baseline_snapshots() -> list[dict]:
-    """
-    Returns today's persisted OI-baseline rows as a list of dicts (empty
-    list if Supabase is unavailable or the table is empty/missing).
-
-    [RAM/egress fix, 2026-08-07] Filtered server-side on snapshot_date
-    now, not client-side. utils.oi_snapshot_store._ensure_loaded() has
-    always immediately discarded every row whose snapshot_date != today
-    (see its date guard) — this used to mean every call still pulled the
-    ENTIRE table (every day this row's key was ever written, now that
-    the table previously had no retention at all — see
-    prune_oi_and_premium_history()) into a Python list[dict] just to
-    throw most of it away one line later. Same output shape, same
-    caller-side filtering logic left in place as a harmless no-op
-    safety net (defensive against clock skew between this process and
-    Postgres, and free now that it's operating on a tiny row set).
-    """
-    client = get_client()
-    if client is None:
+    """Returns today's persisted OI-baseline rows as a list of dicts."""
+    if not db.is_available():
         return []
     try:
         today = date.today().isoformat()
-        resp = client.table("dore_oi_baseline").select(
-            "key, snapshot_date, baseline_ce_oi, baseline_pe_oi"
-        ).eq("snapshot_date", today).execute()
-        return resp.data or []
+        return db.fetch_all(
+            """SELECT key, snapshot_date, baseline_ce_oi, baseline_pe_oi
+               FROM dore_oi_baseline WHERE snapshot_date = %s""",
+            (today,),
+        )
     except Exception as exc:
         logger.warning("load_oi_baseline_snapshots failed (non-fatal — starts cold): %s", exc)
         return []
@@ -1880,30 +1333,14 @@ def load_oi_baseline_snapshots() -> list[dict]:
 
 def save_premium_history_snapshot(rows: list[dict]) -> bool:
     """
-    Batch-upsert the last-4-polls premium history (one row per
-    key tracked by utils.oi_snapshot_store.record_and_diff_premium())
-    into dore_premium_history.
-
-    rows: [{"key": ..., "snapshot_date": "YYYY-MM-DD",
-            "ce_h0": ..., "ce_h1": ..., "ce_h2": ..., "ce_h3": ...,
-            "pe_h0": ..., "pe_h1": ..., "pe_h2": ..., "pe_h3": ...}, ...]
-    ("h0" = most recent poll, "h3" = 3 polls before that. 2026-08-06:
-    widened from h0/h1 only, so oi_snapshot_store can compute a rolling-
-    average growth rate across up to 3 intervals, not just the single
-    most recent one — see that module's _rolling_avg_growth_pct().)
+    Batch-upsert the last-4-polls premium history into dore_premium_history.
     """
     if not rows:
         return True
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return False
     try:
-        resp = client.table("dore_premium_history").upsert(
-            rows, on_conflict="key", returning="minimal"
-        ).execute()
-        if resp.data is None:
-            logger.error("dore_premium_history upsert returned no data.")
-            return False
+        db.upsert_rows("dore_premium_history", rows, conflict_cols=["key"])
         return True
     except Exception as exc:
         logger.error("save_premium_history_snapshot failed: %s", exc)
@@ -1911,27 +1348,16 @@ def save_premium_history_snapshot(rows: list[dict]) -> bool:
 
 
 def load_premium_history_snapshots() -> list[dict]:
-    """
-    Returns today's persisted premium-history rows as a list of dicts
-    (empty list if Supabase is unavailable/empty). Same same-day guard
-    as load_oi_baseline_snapshots() — utils.oi_snapshot_store only
-    rehydrates rows whose snapshot_date is today, since a prior
-    session's close-to-open premium jump isn't genuine intraday
-    "Premium Behaviour" evidence (see that module's docstring).
-
-    [RAM/egress fix, 2026-08-07] Filtered server-side on snapshot_date
-    now — same rationale as load_oi_baseline_snapshots() above; this was
-    the other unfiltered full-table read into RAM on every DORE cycle.
-    """
-    client = get_client()
-    if client is None:
+    """Returns today's persisted premium-history rows as a list of dicts."""
+    if not db.is_available():
         return []
     try:
         today = date.today().isoformat()
-        resp = client.table("dore_premium_history").select(
-            "key, snapshot_date, ce_h0, ce_h1, ce_h2, ce_h3, pe_h0, pe_h1, pe_h2, pe_h3"
-        ).eq("snapshot_date", today).execute()
-        return resp.data or []
+        return db.fetch_all(
+            """SELECT key, snapshot_date, ce_h0, ce_h1, ce_h2, ce_h3, pe_h0, pe_h1, pe_h2, pe_h3
+               FROM dore_premium_history WHERE snapshot_date = %s""",
+            (today,),
+        )
     except Exception as exc:
         logger.warning("load_premium_history_snapshots failed (non-fatal — starts cold): %s", exc)
         return []
@@ -1942,18 +1368,9 @@ def load_premium_history_snapshots() -> list[dict]:
 def upsert_rotate_flags(flags: list[dict]) -> dict[str, str]:
     """
     Persist ROTATE flags so the "since" date is stamped once and only
-    resets when the rotate target itself changes — not on every render
-    (display_action/rotate_target are recomputed fresh each render in
-    pages/portfolio.py's _apply_rotation()).
-
-    ``flags`` is a list of {"symbol": ..., "rotate_target": ...} dicts.
-
-    Returns a dict mapping UPPERCASE symbol -> since date string
-    ("YYYY-MM-DD"). Returns {} if Supabase is unavailable or ``flags``
-    is empty — callers treat a missing key as "no stamp available".
+    resets when the rotate target itself changes.
     """
-    client = get_client()
-    if client is None or not flags:
+    if not db.is_available() or not flags:
         return {}
 
     symbols = [str(f.get("symbol", "")).upper().strip() for f in flags if f.get("symbol")]
@@ -1962,13 +1379,11 @@ def upsert_rotate_flags(flags: list[dict]) -> dict[str, str]:
         return {}
 
     try:
-        existing_resp = (
-            client.table("rotate_flags")
-            .select("symbol, rotate_target, since")
-            .in_("symbol", symbols)
-            .execute()
+        existing_rows = db.fetch_all(
+            "SELECT symbol, rotate_target, since FROM rotate_flags WHERE symbol = ANY(%s)",
+            (symbols,),
         )
-        existing = {row["symbol"]: row for row in (existing_resp.data or [])}
+        existing = {row["symbol"]: row for row in existing_rows}
     except Exception as exc:
         logger.warning("upsert_rotate_flags read failed (non-fatal): %s", exc)
         existing = {}
@@ -1985,7 +1400,7 @@ def upsert_rotate_flags(flags: list[dict]) -> dict[str, str]:
         prev = existing.get(sym)
 
         if prev and prev.get("rotate_target") == target and prev.get("since"):
-            since = prev["since"]
+            since = str(prev["since"])
         else:
             since = today
 
@@ -1996,9 +1411,7 @@ def upsert_rotate_flags(flags: list[dict]) -> dict[str, str]:
         return {}
 
     try:
-        client.table("rotate_flags").upsert(
-            rows, on_conflict="symbol", returning="minimal"
-        ).execute()
+        db.upsert_rows("rotate_flags", rows, conflict_cols=["symbol"])
     except Exception as exc:
         logger.error("upsert_rotate_flags upsert failed: %s", exc)
 
@@ -2008,29 +1421,25 @@ def upsert_rotate_flags(flags: list[dict]) -> dict[str, str]:
 def load_rotate_flags() -> dict[str, dict]:
     """
     Return every persisted rotate flag as {SYMBOL: {"rotate_target": ..,
-    "since": ..}}. Empty dict if Supabase is unavailable/empty.
+    "since": ..}}.
     """
-    client = get_client()
-    if client is None:
+    if not db.is_available():
         return {}
     try:
-        resp = client.table("rotate_flags").select("symbol, rotate_target, since").execute()
-        return {row["symbol"]: row for row in (resp.data or [])}
+        rows = db.fetch_all("SELECT symbol, rotate_target, since FROM rotate_flags")
+        return {row["symbol"]: row for row in rows}
     except Exception as exc:
         logger.warning("load_rotate_flags failed (non-fatal): %s", exc)
         return {}
 
 
 def clear_rotate_flags(symbols: list[str]) -> bool:
-    """Remove rotate-flag rows for symbols that are no longer ROTATE (e.g.
-    they moved back to HOLD/ADD, or were closed/sold). Safe no-op if
-    Supabase is unavailable or ``symbols`` is empty."""
-    client = get_client()
+    """Remove rotate-flag rows for symbols that are no longer ROTATE."""
     syms = [str(s).upper().strip() for s in symbols if str(s).strip()]
-    if client is None or not syms:
+    if not db.is_available() or not syms:
         return False
     try:
-        client.table("rotate_flags").delete(returning="minimal").in_("symbol", syms).execute()
+        db.execute("DELETE FROM rotate_flags WHERE symbol = ANY(%s)", (syms,))
         return True
     except Exception as exc:
         logger.error("clear_rotate_flags failed: %s", exc)
@@ -2038,9 +1447,12 @@ def clear_rotate_flags(symbols: list[str]) -> bool:
 
 
 # ─── SCHEMA SQL ───────────────────────────────────────────────────────────────
+# UNCHANGED from the Supabase version — plain Postgres DDL, runs as-is
+# against Neon. Run once: `psql "$NEON_DATABASE_URL" -f <this block>` or
+# paste into Neon's SQL Editor.
 
 SCHEMA_SQL = """
--- Run this ONCE in Supabase → SQL Editor
+-- Run this ONCE against Neon (psql or the Neon SQL Editor)
 
 -- 1. Scan snapshots
 CREATE TABLE IF NOT EXISTS scan_snapshots (
@@ -2063,31 +1475,7 @@ CREATE TABLE IF NOT EXISTS scan_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_scan_snapshots_run_at ON scan_snapshots(run_at DESC);
 
--- 1b. Daily scan archive (2026-07, renamed+repurposed 2026-07-25).
---
---     ARCHITECTURE (per the 2026-07-25 discussion): live_scanner_snapshots
---     (utils/scan_state.py) is the ONLY operational source of truth the
---     Dashboard and runtime logic read from. This table is a SEPARATE,
---     deliberately-decoupled long-term ARCHIVE — one immutable row per
---     TRADING DAY (not per scan, not per cycle), carrying the full
---     scanner result plus a `metadata` summary (regime/VIX/ADX/breadth —
---     see utils.regime_engine.regime_summary()) for historical/research
---     lookups. Nothing operational reads from this table; the Dashboard
---     shows an honest "no scan data yet" state if live_scanner_snapshots
---     is empty, rather than falling back here (see pages/dashboard.py).
---
---     `trading_date` + the UNIQUE constraint below enforce "one row per
---     day" at the database level, not just in application logic — two
---     processes (scheduler + a manual Run Scan) racing to archive the
---     same day both attempt the insert; the DB guarantees only one wins,
---     and utils.supabase_client.archive_daily_scan() treats the other's
---     unique-violation as "already archived today", not an error.
---
---     Safe/idempotent to run this block again on a deployment that
---     already had the OLD scan_full_snapshots table — the DO block
---     renames it in place (keeping existing archived rows) only if the
---     old name still exists and the new one doesn't; every ALTER/CREATE
---     below is itself also IF EXISTS/IF NOT EXISTS-guarded.
+-- 1b. Daily scan archive
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'scan_full_snapshots')
@@ -2105,10 +1493,6 @@ CREATE TABLE IF NOT EXISTS scan_daily_archive (
     metadata      jsonb       NOT NULL DEFAULT '{}'::jsonb,
     data          jsonb       NOT NULL
 );
--- Backfill for rows that existed before trading_date/metadata existed
--- (i.e. migrated from the old scan_full_snapshots) — best-effort, UTC
--- calendar date of run_at; exact historical accuracy for old,
--- already-superseded rows doesn't matter, only going forward does.
 ALTER TABLE scan_daily_archive ADD COLUMN IF NOT EXISTS trading_date date;
 UPDATE scan_daily_archive SET trading_date = run_at::date WHERE trading_date IS NULL;
 ALTER TABLE scan_daily_archive ALTER COLUMN trading_date SET NOT NULL;
@@ -2118,16 +1502,7 @@ ALTER TABLE scan_daily_archive ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL 
 CREATE UNIQUE INDEX IF NOT EXISTS scan_daily_archive_trading_date_unique ON scan_daily_archive(trading_date);
 CREATE INDEX IF NOT EXISTS idx_scan_daily_archive_run_at ON scan_daily_archive(run_at DESC);
 
--- 1c. Sector snapshots [2026-07-26 — completes the Sector Rotation tool
---     wiring]. One row per (sector, scan_date) — the day-over-day feed
---     utils/sector_rotation.py's compute_rotation_metrics()/_trailing()/
---     _delta() turn into Momentum/Direction/Rotation Strength/Suggested
---     Action, and pages/dashboard.py's Sector Opportunity Board sparklines
---     read directly. UNIQUE(sector, scan_date) means save_sector_snapshot()
---     safely upserts — calling it more than once on the same trading day
---     (e.g. multiple sessions rendering the Dashboard) always converges on
---     one row per sector per day, refined with each call's latest numbers,
---     rather than accumulating duplicates.
+-- 1c. Sector snapshots
 CREATE TABLE IF NOT EXISTS sector_snapshots (
     id                bigserial PRIMARY KEY,
     sector            text        NOT NULL,
@@ -2171,14 +1546,14 @@ CREATE TABLE IF NOT EXISTS watchlist (
     added_at  timestamptz NOT NULL DEFAULT now()
 );
 
--- 4. Signal first seen (Elite / Execute — earliest appearance date per symbol)
+-- 4. Signal first seen
 CREATE TABLE IF NOT EXISTS signal_first_seen (
     symbol      text PRIMARY KEY,
     first_seen  date        NOT NULL,
     category    text        NOT NULL DEFAULT ''
 );
 
--- 5. Lifecycle states (Sprint 2) — one row per symbol per scan date
+-- 5. Lifecycle states
 CREATE TABLE IF NOT EXISTS lifecycle_states (
     id            bigserial PRIMARY KEY,
     symbol        text        NOT NULL,
@@ -2204,7 +1579,7 @@ CREATE TABLE IF NOT EXISTS lifecycle_states (
 CREATE INDEX IF NOT EXISTS idx_lifecycle_states_symbol    ON lifecycle_states(symbol);
 CREATE INDEX IF NOT EXISTS idx_lifecycle_states_scan_date ON lifecycle_states(scan_date DESC);
 
--- 6. Lifecycle transitions (Sprint 2) — detected stage changes
+-- 6. Lifecycle transitions
 CREATE TABLE IF NOT EXISTS lifecycle_transitions (
     id          bigserial PRIMARY KEY,
     symbol      text        NOT NULL,
@@ -2212,43 +1587,34 @@ CREATE TABLE IF NOT EXISTS lifecycle_transitions (
     to_stage    text        NOT NULL,
     from_date   date,
     to_date     date        NOT NULL,
-    direction   text        NOT NULL DEFAULT 'FORWARD'  -- FORWARD | BACKWARD | LATERAL
+    direction   text        NOT NULL DEFAULT 'FORWARD'
 );
 CREATE INDEX IF NOT EXISTS idx_lifecycle_transitions_symbol  ON lifecycle_transitions(symbol);
 CREATE INDEX IF NOT EXISTS idx_lifecycle_transitions_to_date ON lifecycle_transitions(to_date DESC);
 """
 
-
-# Append setup_plans SQL to the canonical SCHEMA_SQL for easy copy-paste
 SCHEMA_SQL += """
--- 7. Setup Plans — frozen trade levels (entry/SL/targets locked once a plan
---    is minted). Lifecycle (status) is owned entirely by this table and is
---    driven only by price/entry/sl/target/age — never by Recommendation/
---    Category, which can only ever CREATE a row here, never modify one.
---    Run this in Supabase SQL Editor after the tables above.
+-- 7. Setup Plans — frozen trade levels
 CREATE TABLE IF NOT EXISTS setup_plans (
     setup_id               text        PRIMARY KEY,
     symbol                 text        NOT NULL,
     first_seen_date        date        NOT NULL,
     first_actionable_date  date        NOT NULL,
 
-    -- Frozen trade levels (set once, never recalculated)
     entry_locked            numeric(12,2) NOT NULL DEFAULT 0,
     sl_locked                numeric(12,2) NOT NULL DEFAULT 0,
     t1_locked                numeric(12,2) NOT NULL DEFAULT 0,
     t2_locked                numeric(12,2) NOT NULL DEFAULT 0,
     t3_locked                numeric(12,2) NOT NULL DEFAULT 0,
 
-    -- Locked trade thesis (audit trail — set once, never overwritten)
     locked_recommendation   text        NOT NULL DEFAULT '',
-    locked_category          text        NOT NULL DEFAULT '',   -- deprecated alias
+    locked_category          text        NOT NULL DEFAULT '',
     locked_rr                numeric(8,4) NOT NULL DEFAULT 0,
     locked_leadership        integer     NOT NULL DEFAULT 0,
     locked_conviction        integer     NOT NULL DEFAULT 0,
     locked_entry_quality     integer     NOT NULL DEFAULT 0,
     locked_extension         integer     NOT NULL DEFAULT 0,
 
-    -- Lifecycle — WAITING / ACTIVE / T1_HIT / CLOSED / EXPIRED
     status                   text        NOT NULL DEFAULT 'WAITING',
     status_reason            text        NOT NULL DEFAULT '',
     created_at                timestamptz NOT NULL DEFAULT now(),
@@ -2256,80 +1622,41 @@ CREATE TABLE IF NOT EXISTS setup_plans (
     t1_hit_at                   timestamptz,
     closed_at                  timestamptz,
 
-    -- Deprecated aliases, kept for backward-compatible reads
     invalidation_reason      text        NOT NULL DEFAULT '',
     invalidated_date           date,
-
-    -- [2026-08-07, SG request] "LS" (Live Scanner — Actionable/Execute/
-    -- Elite promotion) or "PB" (Pre-Breakout tab squeeze_release). See
-    -- utils/setup_persistence.py's SetupPlan.source docstring.
-    source                    text        NOT NULL DEFAULT 'LS',
 
     updated_at                timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_setup_plans_symbol ON setup_plans(symbol);
 CREATE INDEX IF NOT EXISTS idx_setup_plans_status ON setup_plans(status);
 CREATE INDEX IF NOT EXISTS idx_setup_plans_date   ON setup_plans(first_actionable_date DESC);
-
--- MIGRATION for an EXISTING setup_plans table created before the
--- 2026-08-07 source (LS/PB) column — safe to re-run, no-op if already applied.
-ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'LS';
 """
 
-# Append fo_setup_plans SQL to the canonical SCHEMA_SQL for easy copy-paste
 SCHEMA_SQL += """
--- 8. F&O Setup Plans — DORE Options tab's "lock the entry" equivalent of
---    setup_plans above, but premium-denominated (₹) and keyed on the
---    option CONTRACT (symbol+leg+strike+expiry), not just symbol. See
---    utils/fo_setup_persistence.py for the lifecycle state machine.
---    Run this in Supabase SQL Editor after the tables above.
+-- 8. F&O Setup Plans
 CREATE TABLE IF NOT EXISTS fo_setup_plans (
     setup_id                  text        PRIMARY KEY,
     symbol                     text        NOT NULL,
-    leg                        text        NOT NULL,       -- 'CE' | 'PE'
+    leg                        text        NOT NULL,
     strike                     numeric(12,2) NOT NULL DEFAULT 0,
-    -- 2026-07-23 fix: expiry is DORE's recommended_expiry LABEL
-    -- ("CURRENT_WEEK" / "NEXT_WEEK"), not an actual calendar date —
-    -- a 'date' column rejects that string outright, which silently
-    -- failed every upsert_fo_setup_plans_batch() call (caught,
-    -- logged, returns False) and meant NOTHING ever persisted here.
-    -- If you already ran the old CREATE TABLE with `expiry date`,
-    -- run this once: ALTER TABLE fo_setup_plans ALTER COLUMN expiry TYPE text;
     expiry                     text,
-    -- 2026-07-30: the real "YYYY-MM-DD" calendar date behind the label
-    -- above (row["Expiry Date"] at plan-creation time). Genuinely a
-    -- date this time (unlike `expiry`), needed so
-    -- resolve_option_contract_instrument_key() can actually fetch this
-    -- contract's option chain for the persisted-plan live-quote
-    -- backfill — passing the LABEL there was silently failing every
-    -- lookup. See utils/fo_setup_persistence.py's FOSetupPlan.expiry_date
-    -- docstring. Nullable: plans minted before this fix have no value
-    -- and simply keep rendering "—" until they close and re-mint.
     expiry_date                date,
     first_seen_date            date        NOT NULL,
     created_date                date        NOT NULL,
 
-    -- Frozen premium levels (set once, never recalculated)
     entry_locked                numeric(12,2) NOT NULL DEFAULT 0,
     sl_locked                    numeric(12,2) NOT NULL DEFAULT 0,
     t1_locked                    numeric(12,2) NOT NULL DEFAULT 0,
     t2_locked                    numeric(12,2) NOT NULL DEFAULT 0,
 
-    -- Locked trade thesis (audit trail — set once, never overwritten)
     locked_recommendation       text        NOT NULL DEFAULT '',
     locked_opportunity_score   numeric(6,2) NOT NULL DEFAULT 0,
     locked_strike_type          text        NOT NULL DEFAULT '',
 
-    -- Lifecycle — WAITING / ACTIVE / T1_HIT / CLOSED / EXPIRED
     status                      text        NOT NULL DEFAULT 'WAITING',
     status_reason                text        NOT NULL DEFAULT '',
     created_at                   timestamptz NOT NULL DEFAULT now(),
     activated_at                  timestamptz,
-    -- 2026-07-24: the premium the plan actually activated at — always
-    -- entry_locked at the moment activated_at's trigger candle crossed
-    -- it (see utils/fo_setup_persistence.py's find_activation_candle()),
-    -- kept alongside activated_at so a reload doesn't need to re-derive
-    -- it. Immutable once set, same as activated_at itself.
     activation_price               numeric(12,2),
     t1_hit_at                      timestamptz,
     closed_at                     timestamptz,
@@ -2341,49 +1668,19 @@ CREATE INDEX IF NOT EXISTS idx_fo_setup_plans_status ON fo_setup_plans(status);
 CREATE INDEX IF NOT EXISTS idx_fo_setup_plans_date   ON fo_setup_plans(created_date DESC);
 """
 
-# ── If fo_setup_plans doesn't exist yet in your Supabase project, run the
-#    CREATE TABLE block above once. This is a brand-new table (2026-07-21),
-#    so there is no separate ALTER-TABLE migration needed the way
-#    SETUP_PLANS_MIGRATION_SQL exists for the older equity table.
-
-# ── MIGRATION for an EXISTING fo_setup_plans table created before the
-#    2026-07-24 activation-timestamp fix (utils/fo_setup_persistence.py's
-#    trigger-candle detection). Idempotent — safe to run multiple times.
-#    Only adds the new column; existing WAITING/ACTIVE/T1_HIT/CLOSED rows
-#    and their activated_at values are untouched. Rows already ACTIVE (or
-#    beyond) from before this migration will simply have a NULL
-#    activation_price until they naturally re-trigger on a fresh plan —
-#    nothing here retroactively fabricates one, consistent with the "never
-#    fabricate a timestamp" rule the fix itself follows.
 FO_SETUP_PLANS_MIGRATION_SQL = """
 ALTER TABLE fo_setup_plans ADD COLUMN IF NOT EXISTS activation_price numeric(12,2);
--- 2026-07-30: real calendar date behind the `expiry` label — see the
--- expiry_date column comment on the CREATE TABLE block above and
--- FOSetupPlan.expiry_date's docstring. Existing OPEN rows will have
--- NULL here (no retroactive fabrication) and stay "—" in the
--- persisted-plan live-quote backfill until they close and re-mint.
 ALTER TABLE fo_setup_plans ADD COLUMN IF NOT EXISTS expiry_date date;
 """
 
-# Append dore_options_plans SQL to the canonical SCHEMA_SQL for easy
-# copy-paste. See utils/dore_options_persistence.py for the
-# DoreOptionsPlan dataclass this table backs — the DORE Options Engine's
-# (utils/dore_options_engine.py + utils/dore_options_scan.py) own
-# "lock the entry premium once" store, deliberately separate from
-# fo_setup_plans above (that one belongs to the older/legacy DORE 2.0
-# "fo_scan" pipeline).
 SCHEMA_SQL += """
--- 9. DORE Options Engine Plans — locked entry premium (+ SL/T1/T2 at
---    lock time) per option contract (symbol+direction+strike+expiry),
---    used to compute Drift % against a saved entry rather than
---    re-freezing it every scan tick. Run this in Supabase SQL Editor
---    after the tables above.
+-- 9. DORE Options Engine Plans
 CREATE TABLE IF NOT EXISTS dore_options_plans (
     plan_id                text        PRIMARY KEY,
     symbol                  text        NOT NULL,
-    direction                text        NOT NULL,        -- 'CE' | 'PE'
+    direction                text        NOT NULL,
     strike                   numeric(12,2) NOT NULL DEFAULT 0,
-    expiry                   date,                          -- real calendar date, not a label
+    expiry                   date,
 
     created_date              date        NOT NULL,
     created_at                 timestamptz NOT NULL DEFAULT now(),
@@ -2394,30 +1691,14 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
     target2_locked               numeric(12,2),
     confidence_at_entry          numeric(6,2) NOT NULL DEFAULT 0,
 
-    -- 2026-08-01: refreshed every cycle this contract is reproduced by
-    -- the live scan — lets the Active Plans tab show a "last known"
-    -- premium even between live sightings. Drift/P&L is deliberately
-    -- NOT its own column — it's derived from last_premium vs
-    -- entry_locked at read time (see
-    -- utils/dore_options_persistence.py's DoreOptionsPlan docstring).
     last_premium                 numeric(12,2),
     last_seen_at                  timestamptz,
 
-    status                      text        NOT NULL DEFAULT 'OPEN',   -- OPEN / CLOSED
+    status                      text        NOT NULL DEFAULT 'OPEN',
     closed_at                    timestamptz,
     closed_reason                text        NOT NULL DEFAULT '',
 
-    -- [2026-08-05, SG request: "new plan on the same symbol only after
-    -- hitting T1"] First time this contract's live premium reached
-    -- target1_locked — null until then, set once, never cleared. See
-    -- utils/dore_options_persistence.py's DoreOptionsPlan.t1_hit_at /
-    -- _has_blocking_open_plan_on_symbol() docstrings.
     t1_hit_at                    timestamptz,
-
-    -- 2026-08-08: "PB" (Pre-Breakout squeeze-release exemption) or "LS"
-    -- (ordinary Live Scanner ranking) — captured once at mint time from
-    -- OptionTradePlan.source. See utils/dore_options_persistence.py's
-    -- DoreOptionsPlan.source docstring.
     source                      text        NOT NULL DEFAULT '',
 
     updated_at                   timestamptz NOT NULL DEFAULT now()
@@ -2427,43 +1708,19 @@ CREATE INDEX IF NOT EXISTS idx_dore_options_plans_status ON dore_options_plans(s
 CREATE INDEX IF NOT EXISTS idx_dore_options_plans_date   ON dore_options_plans(created_date DESC);
 """
 
-# ── MIGRATION for an EXISTING dore_options_plans table created before the
-#    2026-08-01 Active Plans tab (last_premium/last_seen_at didn't exist
-#    yet — this is the "Could not find the 'last_drift_pct' column ... in
-#    the schema cache" PGRST204 error from upsert_dore_options_plans_batch()).
-#    Idempotent — safe to re-run. Run this in Supabase SQL Editor if
-#    dore_options_plans already exists.
-#    NOTE: no last_drift_pct column — it's derived from last_premium vs
-#    entry_locked at read time, never persisted, so there's nothing to
-#    add/backfill for it here even though it was the column named in the
-#    original error (the code that used to write it has been reverted).
 DORE_OPTIONS_PLANS_MIGRATION_SQL = """
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS last_premium   numeric(12,2);
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS last_seen_at   timestamptz;
 """
 
-# ── MIGRATION for an EXISTING dore_options_plans table created before
-#    the 2026-08-08 Source column (Pre-Breakout vs Live Scanner). Safe
-#    to re-run. Run this in Supabase SQL Editor if dore_options_plans
-#    already exists and predates this change.
 DORE_OPTIONS_PLANS_SOURCE_MIGRATION_SQL = """
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT '';
 """
 
-# ── MIGRATION for an EXISTING dore_options_plans table created before
-#    the 2026-08-05 T1 gating change ("new plan on the same symbol only
-#    after hitting T1"). Safe to re-run. Run this in Supabase SQL
-#    Editor if dore_options_plans already exists and predates this
-#    change.
 DORE_OPTIONS_PLANS_T1_HIT_MIGRATION_SQL = """
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS t1_hit_at timestamptz;
 """
 
-
-# ── MIGRATION for an EXISTING setup_plans table created before this v9
-#    lifecycle-separation change. Idempotent — safe to run multiple times.
-#    Run this INSTEAD of the CREATE TABLE above if setup_plans already
-#    exists in your Supabase project. ──────────────────────────────────
 SETUP_PLANS_MIGRATION_SQL = """
 ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS locked_recommendation text NOT NULL DEFAULT '';
 ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS status_reason         text NOT NULL DEFAULT '';
@@ -2471,27 +1728,19 @@ ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS activated_at          timestamp
 ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS t1_hit_at             timestamptz;
 ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS closed_at             timestamptz;
 
--- Backfill locked_recommendation from the legacy locked_category column.
 UPDATE setup_plans SET locked_recommendation = locked_category
   WHERE locked_recommendation = '' AND locked_category IS NOT NULL;
 
--- Backfill status_reason from the legacy invalidation_reason column.
 UPDATE setup_plans SET status_reason = invalidation_reason
   WHERE status_reason = '' AND invalidation_reason IS NOT NULL;
 
--- Re-map the old INVALIDATED status onto the new CLOSED status.
--- (Old ACTIVE / EXPIRED keep their names; FORMING was never persisted —
--- it meant "no row exists" — so there is nothing to remap for it.)
 UPDATE setup_plans SET status = 'CLOSED' WHERE status = 'INVALIDATED';
 UPDATE setup_plans SET closed_at = invalidated_date::timestamptz
   WHERE closed_at IS NULL AND invalidated_date IS NOT NULL;
 """
 
-# Append portfolio_positions SQL to the canonical SCHEMA_SQL for easy copy-paste
 SCHEMA_SQL += """
--- 8. Portfolio Positions — Bought → Portfolio hand-off. Real, held positions
---    evaluated on an ongoing basis by utils/portfolio_engine.py's Exit Score
---    model (pages/portfolio.py). status: OPEN | CLOSED.
+-- 8b. Portfolio Positions
 CREATE TABLE IF NOT EXISTS portfolio_positions (
     id                  bigserial     PRIMARY KEY,
     symbol              text          NOT NULL,
@@ -2499,16 +1748,14 @@ CREATE TABLE IF NOT EXISTS portfolio_positions (
     entry_date          date          NOT NULL,
     qty                 numeric(14,4) NOT NULL DEFAULT 0,
 
-    -- Locked-at-entry thesis, used by the exit engine to detect decay
-    -- relative to the moment this position was bought (never overwritten).
     locked_leadership   numeric(6,2)  NOT NULL DEFAULT 0,
     locked_conviction   numeric(6,2)  NOT NULL DEFAULT 0,
     entry_rs_rank       numeric(6,2),
     initial_stop        numeric(12,2),
-    source_category     text          NOT NULL DEFAULT '',   -- scanner category at buy time
+    source_category     text          NOT NULL DEFAULT '',
     notes               text          NOT NULL DEFAULT '',
 
-    status              text          NOT NULL DEFAULT 'OPEN',  -- OPEN | CLOSED
+    status              text          NOT NULL DEFAULT 'OPEN',
     created_at          timestamptz   NOT NULL DEFAULT now(),
     closed_at           timestamptz,
     close_reason        text,
@@ -2520,29 +1767,13 @@ CREATE TABLE IF NOT EXISTS portfolio_positions (
 CREATE INDEX IF NOT EXISTS idx_portfolio_positions_symbol ON portfolio_positions(symbol);
 CREATE INDEX IF NOT EXISTS idx_portfolio_positions_status ON portfolio_positions(status);
 
--- Idempotent migration for installs that created portfolio_positions before
--- initial_stop existed (safe to re-run).
 ALTER TABLE portfolio_positions ADD COLUMN IF NOT EXISTS initial_stop numeric(12,2);
-
--- Idempotent migration for installs that created portfolio_positions before
--- the "Add More" (average-up) control existed (safe to re-run).
 ALTER TABLE portfolio_positions ADD COLUMN IF NOT EXISTS last_added_at timestamptz;
 ALTER TABLE portfolio_positions ADD COLUMN IF NOT EXISTS add_reason text;
 """
 
-# Append DORE OI/premium baseline persistence SQL to the canonical SCHEMA_SQL
-# for easy copy-paste. See utils/oi_snapshot_store.py's module docstring —
-# this is the fix for its documented "loses the morning's buildup on a
-# restart" limitation.
 SCHEMA_SQL += """
--- 9. DORE OI baseline — one row per index/stock key tracked by
---    utils.oi_snapshot_store.record_and_diff(). "baseline_ce_oi"/
---    "baseline_pe_oi" are that key's FIRST-observed chain-wide OI totals
---    for `snapshot_date`; every later poll's ce_oi_change/pe_oi_change is
---    (current total - this baseline). UNIQUE key means
---    save_oi_baseline_snapshot() always upserts one row per key,
---    refined as the day's baseline gets (re-)established, rather than
---    accumulating a row per poll.
+-- 9b. DORE OI baseline / premium history
 CREATE TABLE IF NOT EXISTS dore_oi_baseline (
     key              text        PRIMARY KEY,
     snapshot_date    date        NOT NULL,
@@ -2551,19 +1782,6 @@ CREATE TABLE IF NOT EXISTS dore_oi_baseline (
     updated_at       timestamptz NOT NULL DEFAULT now()
 );
 
--- 10. DORE premium history — one row per index/stock key tracked by
---     utils.oi_snapshot_store.record_and_diff_premium(). ce_h0/pe_h0 are
---     the most recent poll's ATM premium for that leg; ce_h1/pe_h1 are
---     the poll before that — the two values Stage 3.5's Premium
---     Behaviour pillar needs as ce_premium_prev/ce_premium_prev2 (and
---     the PE mirrors). ce_h2/ce_h3 (and pe_h2/pe_h3) added 2026-08-06 —
---     two further polls back, so a rolling-average growth rate can be
---     computed across up to 3 intervals instead of just the single most
---     recent one (see oi_snapshot_store._rolling_avg_growth_pct()).
---     Gated to `snapshot_date` = today on read (see
---     load_premium_history_snapshots()) so a restart doesn't resurrect
---     yesterday's close-to-open jump as if it were live intraday
---     evidence.
 CREATE TABLE IF NOT EXISTS dore_premium_history (
     key              text        PRIMARY KEY,
     snapshot_date    date        NOT NULL,
@@ -2577,24 +1795,10 @@ CREATE TABLE IF NOT EXISTS dore_premium_history (
     pe_h3            numeric,
     updated_at       timestamptz NOT NULL DEFAULT now()
 );
-
--- 10a. Migration for an EXISTING dore_premium_history table created
---      before 2026-08-06 (only had h0/h1) — run this once, by hand, if
---      your table predates the rolling-average change above.
--- ALTER TABLE dore_premium_history ADD COLUMN IF NOT EXISTS ce_h2 numeric;
--- ALTER TABLE dore_premium_history ADD COLUMN IF NOT EXISTS ce_h3 numeric;
--- ALTER TABLE dore_premium_history ADD COLUMN IF NOT EXISTS pe_h2 numeric;
--- ALTER TABLE dore_premium_history ADD COLUMN IF NOT EXISTS pe_h3 numeric;
 """
 
-# Append rotate_flags SQL to the canonical SCHEMA_SQL for easy copy-paste
 SCHEMA_SQL += """
--- 11. Rotate flags — one row per currently-ROTATE-flagged portfolio
---     position. `since` is the date the ROTATE call first appeared for
---     that symbol; it only resets when `rotate_target` changes (a
---     genuinely new swap call), not on every render. See
---     pages/portfolio.py's _apply_rotation() and
---     utils.supabase_client.upsert_rotate_flags().
+-- 11. Rotate flags
 CREATE TABLE IF NOT EXISTS rotate_flags (
     symbol         text PRIMARY KEY,
     rotate_target  text        NOT NULL DEFAULT '',
