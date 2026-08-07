@@ -1136,6 +1136,7 @@ def _setup_plan_from_row(row: dict) -> "object":
         closed_at                 = str(row.get("closed_at", "") or ""),
         invalidation_reason      = row.get("invalidation_reason",    "") or "",
         invalidated_date          = str(row.get("invalidated_date",   "") or ""),
+        source                    = row.get("source") or "LS",
     )
 
 
@@ -2259,11 +2260,20 @@ CREATE TABLE IF NOT EXISTS setup_plans (
     invalidation_reason      text        NOT NULL DEFAULT '',
     invalidated_date           date,
 
+    -- [2026-08-07, SG request] "LS" (Live Scanner — Actionable/Execute/
+    -- Elite promotion) or "PB" (Pre-Breakout tab squeeze_release). See
+    -- utils/setup_persistence.py's SetupPlan.source docstring.
+    source                    text        NOT NULL DEFAULT 'LS',
+
     updated_at                timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_setup_plans_symbol ON setup_plans(symbol);
 CREATE INDEX IF NOT EXISTS idx_setup_plans_status ON setup_plans(status);
 CREATE INDEX IF NOT EXISTS idx_setup_plans_date   ON setup_plans(first_actionable_date DESC);
+
+-- MIGRATION for an EXISTING setup_plans table created before the
+-- 2026-08-07 source (LS/PB) column — safe to re-run, no-op if already applied.
+ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'LS';
 """
 
 # Append fo_setup_plans SQL to the canonical SCHEMA_SQL for easy copy-paste

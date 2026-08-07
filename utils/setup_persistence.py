@@ -239,6 +239,14 @@ class SetupPlan:
     invalidation_reason:      str   = ""
     invalidated_date:          str   = ""
 
+    # [2026-08-07, SG request] Where this plan was minted from — "LS"
+    # (Live Scanner — the normal Actionable/Execute/Elite promotion path)
+    # or "PB" (Pre-Breakout tab — minted early off a squeeze_release
+    # signal, ahead of the stock reaching an Actionable tier at all).
+    # Set once at creation, never overwritten — same immutability
+    # contract as the other locked_* thesis fields above.
+    source:                    str   = "LS"
+
     # Computed display fields (not stored — derived at read time)
     setup_age:                str   = ""    # "3d" / "1w 2d" / "expired"
     trade_plan_status:         str   = ""    # human label for UI
@@ -311,6 +319,7 @@ class SetupPlan:
             # deprecated aliases, kept for old dashboards / queries
             "invalidation_reason":    self.invalidation_reason,
             "invalidated_date":       self.invalidated_date or None,
+            "source":                 self.source or "LS",
         }
 
 
@@ -590,11 +599,15 @@ def _create_plan(
     scanner_row:   dict,
     first_seen:    str,
     today_str:     str,
+    source:        str = "LS",
 ) -> "SetupPlan":
     """
     Mint a new frozen trade plan from the current scanner row.
-    Called once when a stock first reaches Actionable / HC / Elite —
-    this is the Signal Discovery → Trade Management hand-off.
+    Called once when a stock first reaches Actionable / HC / Elite (source
+    "LS" — Live Scanner) OR when a Pre-Breakout squeeze_release fires
+    (source "PB", see `_is_pre_breakout_qualified` / the pre_breakout
+    param on enrich_scanner_row below) — this is the Signal Discovery →
+    Trade Management hand-off, whichever path triggered it.
     The plan starts in WAITING; it is up to advance_lifecycle() on a
     *later* scan to decide if/when the entry has actually triggered.
     """
@@ -643,6 +656,7 @@ def _create_plan(
         status                 = SetupPlanStatus.WAITING,
         status_reason           = "Plan created — awaiting entry trigger",
         created_at              = now_ts,
+        source                 = source,
     )
     return plan
 
@@ -658,6 +672,7 @@ def enrich_scanner_row(
     current_price:    float = 0.0,
     bar_low:          float | None = None,
     bar_high:         float | None = None,
+    pre_breakout:     bool = False,
 ) -> tuple[dict, Optional["SetupPlan"], bool]:
     """
     Attach setup persistence fields to a scanner result dict.
@@ -676,6 +691,14 @@ def enrich_scanner_row(
                         instead of only ever seeing `current_price`.
                         Defaults to `current_price` (old point-sample
                         behaviour) when not supplied.
+    pre_breakout      : [2026-08-07, SG request] when True, this row already
+                        passed the Pre-Breakout tab's own qualifying check
+                        (trend_up AND squeeze_release AND 45<=RSI<=70) at
+                        the call site — mint a plan off THAT signal, tagged
+                        source="PB", instead of requiring the Recommendation
+                        tier to reach Actionable/Execute/Elite first. Still
+                        only mints when no open/valid plan already exists —
+                        never overrides or duplicates an LS-sourced plan.
 
     Returns
     -------
@@ -700,9 +723,11 @@ def enrich_scanner_row(
             plan_was_updated = True
 
     # ── 2. Mint a new plan only if no open/valid plan exists AND the
-    #      live recommendation now qualifies. This is the one place
-    #      Recommendation is allowed to act — it can only *create*,
-    #      never modify or close, a plan. ─────────────────────────
+    #      live recommendation now qualifies (LS path) OR this row
+    #      already qualified as a Pre-Breakout squeeze_release (PB
+    #      path). This is the one place Recommendation/pre_breakout is
+    #      allowed to act — it can only *create*, never modify or
+    #      close, a plan. ─────────────────────────
     # [Scanner Refactor 2026-07] Setup Plan creation no longer waits for
     # _any_buy. Per the new lifecycle:
     #     Watch → Developing → Actionable → Create Setup Plan →
@@ -712,12 +737,23 @@ def enrich_scanner_row(
     # (or better). The buy trigger's only job from here is to advance an
     # existing plan's lifecycle state (WAITING → ACTIVE, in advance_lifecycle
     # above) — it no longer gates whether the plan gets created at all.
+    #
+    # [2026-08-07, SG request] The PB path bypasses the tier gate on
+    # purpose — Pre-Breakout is deliberately "coiled and about to move,
+    # not already moved" (see pages/scanner.py's _is_pre_breakout), so
+    # its stocks are routinely WATCH/SKIP tier, never Actionable. Gating
+    # PB on _FREEZE_CATEGORIES would mean it could never fire.
+    source_for_new_plan = "LS"
     should_create = (
         recommendation in _FREEZE_CATEGORIES
         and (plan is None or plan.is_terminal())
     )
+    if not should_create and pre_breakout and (plan is None or plan.is_terminal()):
+        should_create = True
+        source_for_new_plan = "PB"
+
     if should_create:
-        plan = _create_plan(symbol, scanner_row, first_seen_date, today_str)
+        plan = _create_plan(symbol, scanner_row, first_seen_date, today_str, source=source_for_new_plan)
         plan_was_updated = True
 
     # ── 3. Compute display fields on whatever plan we ended up with ─
@@ -780,6 +816,26 @@ def enrich_scanner_row(
 # ══════════════════════════════════════════════════════════════════
 #  BATCH ENRICHMENT  (called by run_scanner after all rows computed)
 # ══════════════════════════════════════════════════════════════════
+
+def _is_pre_breakout_qualified(row_dict: dict) -> bool:
+    """
+    Same criteria as pages/scanner.py's `_is_pre_breakout` (Pre-Breakout
+    tab filter): trend_up AND squeeze_release AND 45 <= RSI <= 70.
+    Deliberately narrower than the tab's own display filter — the tab
+    also shows squeeze_on (still coiling, hasn't fired), but a plan
+    should only mint once the squeeze has actually RELEASED, matching
+    the "persist entries which are released from Pre-Breakout" request.
+    Kept here (not imported from pages/scanner.py) so utils/ has no
+    dependency on pages/ — the two checks are duplicated on purpose;
+    if you change one, change the other.
+    """
+    trend_up = bool(row_dict.get("_trend_up", False)) or (
+        str(row_dict.get("TrendPhase", "NONE")).upper() != "NONE"
+    )
+    squeeze_release = bool(row_dict.get("_squeeze_release", False))
+    rsi_val = float(row_dict.get("_rsi") or row_dict.get("RSI") or 0)
+    return trend_up and squeeze_release and 45 <= rsi_val <= 70
+
 
 def enrich_scanner_dataframe(
     df,
@@ -844,6 +900,7 @@ def enrich_scanner_dataframe(
         enriched, plan_out, was_updated = enrich_scanner_row(
             row_dict, plan, first_s, cur_price,
             bar_low=bar_low, bar_high=bar_high,
+            pre_breakout=_is_pre_breakout_qualified(row_dict),
         )
         rows_out.append(enriched)
         if was_updated:
