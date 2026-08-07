@@ -119,6 +119,7 @@ network blip could cause.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -262,7 +263,24 @@ def should_scheduler_run() -> bool:
     _HEARTBEAT_STALE_AFTER_SECS, the lock holder almost certainly
     crashed or the tab closed before its finally-block ran. Rather than
     leaving scans paused forever, reset to LIVE and log a warning.
+
+    [2026-08-07] Market-hours gate: on top of the LIVE/BACKTEST/
+    MAINTENANCE mode check, LIVE mode itself now also requires the NSE
+    session to be open (utils.time_utils.is_market_hours_ist(), 09:15-
+    15:30 IST +/- buffer, Mon-Fri). Added because every scan loop in
+    scheduler/scan_worker.py (market_intelligence/fo_scan/
+    dore_live_state every 30-60s, live_scanner every 5min) was running
+    this same 24/7 regardless of market hours, keeping the Neon compute
+    endpoint permanently active and burning free-tier CU-hrs nights and
+    weekends for zero new data. Set MARKET_HOURS_GATE_ENABLED=0 in the
+    environment to disable (e.g. to let a scanner run after-hours for
+    manual testing/debugging) without a code change.
     """
+    if os.environ.get("MARKET_HOURS_GATE_ENABLED", "1") != "0":
+        from utils.time_utils import is_market_hours_ist
+        if not is_market_hours_ist():
+            return False
+
     state = get_system_state()
     if state["mode"] == "LIVE":
         return True
