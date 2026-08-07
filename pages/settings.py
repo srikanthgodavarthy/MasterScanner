@@ -1214,6 +1214,32 @@ def _tab_system() -> None:
             else:
                 st.info("No scan history found.")
 
+    with st.expander("🧠 Memory diagnostics (session_state)", expanded=False):
+        st.caption(
+            "utils.memory_profiler's background-thread profile (enabled via "
+            "MASTERSCANNER_MEMORY_PROFILE=1) cannot see st.session_state at all — "
+            "it only runs on the scheduler thread, which has no active browser "
+            "session attached. This is the one place session_state is actually "
+            "reachable, so it's the only way to get a real per-tab number instead "
+            "of a guess."
+        )
+        if st.button("Profile this session's session_state", key="btn_session_profile"):
+            from utils.memory_profiler import get_session_state_report
+            report = get_session_state_report()
+            st.metric("Total (this tab)", report["total"])
+            st.dataframe(
+                pd.DataFrame(report["by_key"])[["key", "size", "bytes"]],
+                width='stretch',
+            )
+            st.caption(
+                "DataFrame/ndarray values are sized with memory_usage(deep=True)/"
+                "nbytes, not shallow sys.getsizeof — the old profiler helper "
+                "undercounted DataFrames to just their object header. Multiply "
+                "'Total' by concurrent open tabs/sessions if this app ever runs "
+                "multi-user; each browser session gets its own independent copy "
+                "of everything shown here."
+            )
+
 
 # ══════════════════════════════════════════════════════════════════
 #  MAIN RENDER

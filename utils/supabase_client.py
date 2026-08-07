@@ -1848,19 +1848,29 @@ def prune_oi_and_premium_history(keep_days: int = 2) -> dict:
 
 def load_oi_baseline_snapshots() -> list[dict]:
     """
-    Returns every persisted OI-baseline row as a list of dicts (empty
-    list if Supabase is unavailable or the table is empty/missing) —
-    utils.oi_snapshot_store filters these down to today's date itself,
-    the same day-rollover rule record_and_diff() already applies, so a
-    stale (yesterday's) row never gets treated as today's baseline.
+    Returns today's persisted OI-baseline rows as a list of dicts (empty
+    list if Supabase is unavailable or the table is empty/missing).
+
+    [RAM/egress fix, 2026-08-07] Filtered server-side on snapshot_date
+    now, not client-side. utils.oi_snapshot_store._ensure_loaded() has
+    always immediately discarded every row whose snapshot_date != today
+    (see its date guard) — this used to mean every call still pulled the
+    ENTIRE table (every day this row's key was ever written, now that
+    the table previously had no retention at all — see
+    prune_oi_and_premium_history()) into a Python list[dict] just to
+    throw most of it away one line later. Same output shape, same
+    caller-side filtering logic left in place as a harmless no-op
+    safety net (defensive against clock skew between this process and
+    Postgres, and free now that it's operating on a tiny row set).
     """
     client = get_client()
     if client is None:
         return []
     try:
+        today = date.today().isoformat()
         resp = client.table("dore_oi_baseline").select(
             "key, snapshot_date, baseline_ce_oi, baseline_pe_oi"
-        ).execute()
+        ).eq("snapshot_date", today).execute()
         return resp.data or []
     except Exception as exc:
         logger.warning("load_oi_baseline_snapshots failed (non-fatal — starts cold): %s", exc)
@@ -1901,20 +1911,25 @@ def save_premium_history_snapshot(rows: list[dict]) -> bool:
 
 def load_premium_history_snapshots() -> list[dict]:
     """
-    Returns every persisted premium-history row as a list of dicts
+    Returns today's persisted premium-history rows as a list of dicts
     (empty list if Supabase is unavailable/empty). Same same-day guard
     as load_oi_baseline_snapshots() — utils.oi_snapshot_store only
     rehydrates rows whose snapshot_date is today, since a prior
     session's close-to-open premium jump isn't genuine intraday
     "Premium Behaviour" evidence (see that module's docstring).
+
+    [RAM/egress fix, 2026-08-07] Filtered server-side on snapshot_date
+    now — same rationale as load_oi_baseline_snapshots() above; this was
+    the other unfiltered full-table read into RAM on every DORE cycle.
     """
     client = get_client()
     if client is None:
         return []
     try:
+        today = date.today().isoformat()
         resp = client.table("dore_premium_history").select(
             "key, snapshot_date, ce_h0, ce_h1, ce_h2, ce_h3, pe_h0, pe_h1, pe_h2, pe_h3"
-        ).execute()
+        ).eq("snapshot_date", today).execute()
         return resp.data or []
     except Exception as exc:
         logger.warning("load_premium_history_snapshots failed (non-fatal — starts cold): %s", exc)

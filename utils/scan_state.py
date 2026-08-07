@@ -389,6 +389,71 @@ _SCHED_CACHE_MAX_ENTRIES = 12
 _sched_payload_cache: dict[tuple[str, Any], Optional[dict]] = {}
 _sched_payload_cache_lock = threading.Lock()
 
+# [Instrumentation, 2026-08-07] Added to settle, with real numbers instead
+# of assumption, whether load_snapshot_payload_cached()'s meta-then-payload
+# protocol is actually a net win for a given section. It only pays off when
+# the reader's poll cadence is faster than the writer's update cadence; if
+# a section's version changes on ~every poll, every call pays a NEW meta
+# round trip on top of the SAME payload round trip it always paid, i.e.
+# strictly more latency than calling load_snapshot_payload() directly.
+# Zero behavioral effect: pure counters + a rolling latency sample,
+# guarded by the same lock the cache already uses, no new locks or new
+# call sites required from existing callers.
+_sched_cache_stats_lock = threading.Lock()
+_sched_cache_stats: dict[str, dict[str, Any]] = {}
+_SCHED_STATS_LATENCY_SAMPLE_CAP = 200  # per section, per leg — bounded, not unbounded
+
+
+def _sched_stats_record(section: str, event: str, elapsed_s: Optional[float] = None) -> None:
+    with _sched_cache_stats_lock:
+        s = _sched_cache_stats.setdefault(section, {
+            "hits": 0, "misses": 0,
+            "meta_latency_s": [], "payload_latency_s": [],
+        })
+        if event == "hit":
+            s["hits"] += 1
+        elif event == "miss":
+            s["misses"] += 1
+        elif event in ("meta_latency_s", "payload_latency_s") and elapsed_s is not None:
+            bucket = s[event]
+            bucket.append(elapsed_s)
+            if len(bucket) > _SCHED_STATS_LATENCY_SAMPLE_CAP:
+                del bucket[: len(bucket) - _SCHED_STATS_LATENCY_SAMPLE_CAP]
+
+
+def get_sched_cache_stats() -> dict[str, dict[str, Any]]:
+    """
+    Returns a snapshot of hit/miss counts and recent (meta, payload)
+    latency samples per section. Call this from a diagnostics page or a
+    log line every N cycles — e.g.:
+
+        for section, s in get_sched_cache_stats().items():
+            total = s["hits"] + s["misses"]
+            hit_rate = s["hits"] / total if total else 0.0
+            avg_meta = mean(s["meta_latency_s"]) if s["meta_latency_s"] else None
+            avg_payload = mean(s["payload_latency_s"]) if s["payload_latency_s"] else None
+
+    A low hit_rate for a section (roughly < 0.5) means that section's
+    write cadence is not reliably slower than its read cadence, and this
+    wrapper is adding a meta round trip on top of the payload round trip
+    it always paid — i.e. it is net-negative for that section specifically.
+    In that case, either call load_snapshot_payload() directly for that
+    section again, or widen the poll interval to actually undercut the
+    write cadence.
+    """
+    with _sched_cache_stats_lock:
+        # Shallow-copy the outer dict and each section's lists so the
+        # caller can't mutate live counters, without holding the lock
+        # for longer than the copy itself.
+        return {
+            sec: {
+                "hits": v["hits"], "misses": v["misses"],
+                "meta_latency_s": list(v["meta_latency_s"]),
+                "payload_latency_s": list(v["payload_latency_s"]),
+            }
+            for sec, v in _sched_cache_stats.items()
+        }
+
 
 def load_snapshot_payload_cached(section: str) -> Optional[dict]:
     """
@@ -400,8 +465,13 @@ def load_snapshot_payload_cached(section: str) -> Optional[dict]:
     The underlying Supabase payload read only happens once per
     (section, version) per process; every call after the first for an
     unchanged version returns the same cached dict instead of re-fetching.
+
+    Instrumented (see get_sched_cache_stats()) so hit rate and per-leg
+    latency can be checked against real traffic rather than assumed.
     """
+    _t0 = time.monotonic()
     meta = load_snapshot_meta(section)
+    _sched_stats_record(section, "meta_latency_s", time.monotonic() - _t0)
     if meta is None or meta.get("status") != "completed":
         return None
     version = meta.get("version")
@@ -409,7 +479,10 @@ def load_snapshot_payload_cached(section: str) -> Optional[dict]:
 
     with _sched_payload_cache_lock:
         if key in _sched_payload_cache:
+            _sched_stats_record(section, "hit")
             return _sched_payload_cache[key]
+
+    _sched_stats_record(section, "miss")
 
     # Deliberately fetched OUTSIDE the lock — this is a real Supabase
     # network call, and holding the lock across it would serialize every
@@ -418,7 +491,9 @@ def load_snapshot_payload_cached(section: str) -> Optional[dict]:
     # possible but harmless (worst case: two threads each pay for one
     # real fetch instead of one) — vastly cheaper than the redundant
     # reads this cache exists to eliminate in the first place.
+    _t1 = time.monotonic()
     payload = load_snapshot_payload(section)
+    _sched_stats_record(section, "payload_latency_s", time.monotonic() - _t1)
 
     with _sched_payload_cache_lock:
         _sched_payload_cache[key] = payload

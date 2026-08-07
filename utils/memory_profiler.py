@@ -203,14 +203,61 @@ def _cache_stats() -> dict:
     }
 
 
+def _sizeof_value(v: Any) -> int:
+    """
+    [2026-08-07] sys.getsizeof() alone silently undercounts pandas
+    DataFrames — it reports only the ~56-byte Python object header, not
+    the actual column data, so a multi-MB DataFrame sitting in
+    session_state would show up as a few dozen bytes. Same issue for
+    dicts/lists that hold DataFrames or ndarrays one level down (e.g.
+    a DORE snapshot payload dict). This walks one level into dict/list/
+    tuple containers and uses DataFrame.memory_usage(deep=True) /
+    ndarray.nbytes for the objects actually likely to be large, falling
+    back to sys.getsizeof for everything else. Not a full deep-recursive
+    sizer (that's what pympler.asizeof is for, deliberately not added as
+    a new dependency here) — but correct for the concrete objects this
+    app actually stores in session_state (DataFrames and dicts of
+    DataFrames/scalars), which is what matters for this audit.
+    """
+    try:
+        import pandas as pd
+        import numpy as np
+    except ImportError:
+        pd = None
+        np = None
+
+    if pd is not None and isinstance(v, pd.DataFrame):
+        try:
+            return int(v.memory_usage(deep=True).sum())
+        except Exception:
+            return sys.getsizeof(v)
+    if np is not None and isinstance(v, np.ndarray):
+        return int(v.nbytes)
+    if isinstance(v, dict):
+        try:
+            return sys.getsizeof(v) + sum(_sizeof_value(x) for x in v.values())
+        except Exception:
+            return sys.getsizeof(v)
+    if isinstance(v, (list, tuple)):
+        try:
+            return sys.getsizeof(v) + sum(_sizeof_value(x) for x in v)
+        except Exception:
+            return sys.getsizeof(v)
+    try:
+        return sys.getsizeof(v)
+    except Exception:
+        return 0
+
+
 def _session_state_stats() -> dict:
     """Best-effort. See module docstring — this thread has no
     ScriptRunContext, so st.session_state is almost certainly
     unreachable from here, and that absence is itself the useful signal
     (it tells you session_state isn't where a background-thread-visible
-    leak would live; any real per-session growth would need to be
-    checked from inside a Streamlit page callback instead, not this
-    module)."""
+    leak would live). For a real per-session measurement, call
+    get_session_state_report() below from inside an actual page (e.g. a
+    sidebar diagnostics button) — that's the only place session_state is
+    genuinely reachable."""
     try:
         import streamlit as st
     except ImportError:
@@ -221,10 +268,7 @@ def _session_state_stats() -> dict:
         total = 0
         sized = []
         for k in keys:
-            try:
-                n = sys.getsizeof(st.session_state[k])
-            except Exception:
-                n = 0
+            n = _sizeof_value(st.session_state[k])
             total += n
             sized.append((k, n))
         sized.sort(key=lambda kv: kv[1], reverse=True)
@@ -242,6 +286,42 @@ def _session_state_stats() -> dict:
                       "Streamlit session; session_state is per-browser-tab and isn't visible "
                       "here even when sessions are open)",
         }
+
+
+def get_session_state_report() -> dict:
+    """
+    Public entry point meant to be called from WITHIN a real Streamlit
+    page (this module's own background-thread profile cannot see
+    session_state at all — see _session_state_stats()'s docstring).
+
+    Wire this into any page, e.g. a debug expander in pages/settings.py:
+
+        import streamlit as st
+        from utils.memory_profiler import get_session_state_report
+        if st.sidebar.button("Profile session_state"):
+            st.json(get_session_state_report())
+
+    Returns per-key sizes computed with the DataFrame-aware sizer above
+    (not the shallow sys.getsizeof the old code used), plus a total —
+    this is the number to trust for "how much does one browser tab's
+    session_state actually hold", and the number to multiply by
+    concurrent-session count if this app ever runs multi-user.
+    """
+    import streamlit as st
+    keys = list(st.session_state.keys())
+    total = 0
+    sized = []
+    for k in keys:
+        n = _sizeof_value(st.session_state[k])
+        total += n
+        sized.append((k, n))
+    sized.sort(key=lambda kv: kv[1], reverse=True)
+    return {
+        "key_count": len(keys),
+        "total_bytes": total,
+        "total": _fmt_mb(total),
+        "by_key": [{"key": k, "bytes": n, "size": _fmt_mb(n)} for k, n in sized],
+    }
 
 
 def _tracemalloc_top(limit: int = _TOP_N) -> dict:
@@ -334,6 +414,41 @@ def _malloc_trim_probe() -> dict:
             "reclaimed_mb": round(before - after, 1) if before >= 0 and after >= 0 else None}
 
 
+def _sched_payload_cache_stats() -> dict:
+    """
+    [2026-08-07] Pulls utils.scan_state.get_sched_cache_stats() into the
+    same periodic profile — this is the hit/miss + per-leg latency data
+    needed to confirm or rule out load_snapshot_payload_cached() as the
+    source of any scan-cadence slowdown (see that function's docstring).
+    Lazily imported so memory_profiler.py never hard-depends on
+    scan_state.py at module load time.
+    """
+    try:
+        from utils.scan_state import get_sched_cache_stats
+    except Exception as e:
+        return {"available": False, "reason": f"import failed ({e.__class__.__name__})"}
+
+    try:
+        raw = get_sched_cache_stats()
+    except Exception as e:
+        return {"available": False, "reason": f"get_sched_cache_stats() failed ({e.__class__.__name__})"}
+
+    def _avg_ms(samples):
+        return round(1000 * sum(samples) / len(samples), 1) if samples else None
+
+    by_section = {}
+    for section, s in raw.items():
+        total = s["hits"] + s["misses"]
+        by_section[section] = {
+            "hits": s["hits"],
+            "misses": s["misses"],
+            "hit_rate_pct": round(100 * s["hits"] / total, 1) if total else 0.0,
+            "avg_meta_ms": _avg_ms(s["meta_latency_s"]),
+            "avg_payload_ms": _avg_ms(s["payload_latency_s"]),
+        }
+    return {"available": True, "by_section": by_section}
+
+
 def run_memory_profile() -> dict:
     """Collect one full profile snapshot and log it. Returns the dict
     too (for callers that want it, e.g. a future diagnostics page) but
@@ -348,6 +463,7 @@ def run_memory_profile() -> dict:
     thread_stats = _thread_stats()
     tm_stats = _tracemalloc_top()
     trim_stats = _malloc_trim_probe()
+    sched_cache_stats = _sched_payload_cache_stats()
     elapsed = time.time() - t0
 
     logger.info(
@@ -382,6 +498,17 @@ def run_memory_profile() -> dict:
                     trim_stats["rss_before_mb"], trim_stats["rss_after_mb"], trim_stats["reclaimed_mb"])
     elif trim_stats.get("enabled"):
         logger.info("[memory_profiler] malloc_trim probe enabled but did not run: %s", trim_stats.get("reason"))
+    if sched_cache_stats.get("available"):
+        for section, row in sched_cache_stats["by_section"].items():
+            logger.info(
+                "[memory_profiler] sched_payload_cache[%s]: hit_rate=%.0f%% (%d hit / %d miss) "
+                "avg_meta=%sms avg_payload=%sms",
+                section, row["hit_rate_pct"], row["hits"], row["misses"],
+                row["avg_meta_ms"], row["avg_payload_ms"],
+            )
+    else:
+        logger.info("[memory_profiler] sched_payload_cache stats unavailable: %s",
+                     sched_cache_stats.get("reason"))
 
     return {
         "rss_mb": rss_mb,
@@ -392,6 +519,7 @@ def run_memory_profile() -> dict:
         "threads": thread_stats,
         "tracemalloc": tm_stats,
         "malloc_trim": trim_stats,
+        "sched_payload_cache": sched_cache_stats,
         "profile_seconds": elapsed,
     }
 
