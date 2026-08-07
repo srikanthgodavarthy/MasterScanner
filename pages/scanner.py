@@ -3189,7 +3189,16 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
     caller doesn't have a meta timestamp handy (fail-soft, matches this
     page's existing pattern elsewhere).
     """
-    scan_time = pd.Timestamp(scan_time, tz="UTC") if scan_time is not None else pd.Timestamp.now(tz="UTC")
+    # [2026-08] Post-Neon-migration fix: created_at now arrives as a
+    # tz-aware datetime.datetime (psycopg2 RealDictCursor on a
+    # timestamptz column), not the ISO string the old Supabase/
+    # PostgREST client returned. pd.Timestamp(..., tz="UTC") raises if
+    # the input is already tz-aware, so localize only when naive.
+    if scan_time is not None:
+        scan_time = pd.Timestamp(scan_time)
+        scan_time = scan_time.tz_localize("UTC") if scan_time.tzinfo is None else scan_time.tz_convert("UTC")
+    else:
+        scan_time = pd.Timestamp.now(tz="UTC")
 
     def _esc_attr(s):
         # [2026-08-10] Minimal HTML-attribute escape for values (like
