@@ -207,6 +207,16 @@ def check_health(job_name: str) -> HealthDecision:
                     f"RAM {ram_mb:.0f}MB >= critical {RAM_CRITICAL_MB}MB"
                     + (f" (post-trim, reclaimed {reclaimed:.0f}MB)" if reclaimed > 0 else "")
                 )
+                # Snapshot the native process layout (thread stacks, anon
+                # heap, shared libs, malloc arena) right here, at the exact
+                # moment RSS is confirmed still critical post-trim — not
+                # from a detached manual run. Throttled internally to once
+                # per 10min, so safe to call on every skip_cycle.
+                try:
+                    from utils.native_memory_probe import maybe_log_native_report
+                    maybe_log_native_report()
+                except Exception:
+                    logger.exception("scan_health_monitor: native_memory_probe hook failed (non-fatal)")
             else:
                 logger.info(
                     "[scan_health_monitor] %s -> proceed (RAM was >= critical, "
