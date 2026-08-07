@@ -3174,6 +3174,14 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
     """
     scan_time = pd.Timestamp(scan_time, tz="UTC") if scan_time is not None else pd.Timestamp.now(tz="UTC")
 
+    def _esc_attr(s):
+        # [2026-08-10] Minimal HTML-attribute escape for values (like
+        # blocked_reason) that originate from backend logic rather than
+        # a closed set of known strings, before dropping them into a
+        # title="..." attribute below.
+        import html as _html
+        return _html.escape(str(s), quote=True)
+
     def _fmt_money(v):
         return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
 
@@ -3236,6 +3244,21 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
         entry = row.get("entry_locked")
         drift = row.get("drift_pct")
         if entry in (None, "") or pd.isna(entry):
+            # [2026-08-10 fix] entry_locked is None either because this
+            # row is fresh/below MIN_CONFIDENCE_TO_ACTIVATE (nothing to
+            # explain), OR because it cleared the confidence floor but
+            # was still blocked from minting a locked plan by duplicate-
+            # suppression or the portfolio cap (see
+            # enrich_trade_plans_with_persistence in
+            # utils/dore_options_persistence.py) — that function already
+            # stamps row["blocked_reason"] in the latter case, but this
+            # dash used to swallow it silently. Surface it as a tooltip
+            # so e.g. "confidence 71 but no Saved Entry" is explainable
+            # at a glance instead of looking like a data gap.
+            reason = row.get("blocked_reason")
+            if reason:
+                return (f'<span style="color:var(--muted);cursor:help;" '
+                        f'title="{_esc_attr(str(reason))}">— ⓘ</span>')
             return '<span style="color:var(--muted)">—</span>'
         entry_html = f'<div style="color:var(--muted);font-size:11px;">Entry {_fmt_money(entry)}</div>'
         return f'{_fmt_pct_chg(drift)}{entry_html}'
@@ -3288,11 +3311,15 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
                     'border-radius:4px;padding:1px 6px;" title="Live Scanner">LS</span>')
         return '<span style="color:var(--muted)">—</span>'
 
-    # [2026-08-08, SG request] Live dashboard only shows candidates DORE
-    # itself considers reasonably confident — everything below 65 is
-    # still ranked/scored internally, just not surfaced here.
+    # [2026-08-10, SG request] Raised from 65 -> 70 to match
+    # MIN_CONFIDENCE_TO_ACTIVATE (utils/dore_options_persistence.py) —
+    # user didn't want the table filled with sub-70 candidates that
+    # can never mint a locked Active Plan anyway (see MIN_CONFIDENCE_
+    # TO_ACTIVATE gate in enrich_trade_plans_with_persistence). Rows
+    # below 70 are still ranked/scored internally, just not surfaced
+    # here.
     if "confidence_score" in df.columns:
-        df = df[pd.to_numeric(df["confidence_score"], errors="coerce") >= 65]
+        df = df[pd.to_numeric(df["confidence_score"], errors="coerce") >= 70]
 
     # [2026-08-08, SG request] Today-only — a row whose Plan was locked
     # on a previous day (and just happens to still be OPEN) is carryover,
@@ -3306,17 +3333,23 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
         created = df["plan_created_date"].astype(str)
         df = df[(created == "") | (created == "None") | (created == "nan") | (created == today_ist)]
 
-    # [2026-08-08, SG request] Highest-confidence candidates first.
-    # 2026-08-07: within a confidence tier, order by RECENCY too — most
-    # recently locked/updated first — instead of leaving ties to
-    # whatever order the scan happened to emit them in. plan_created_at
-    # only exists for rows that cleared MIN_CONFIDENCE_TO_ACTIVATE and
-    # got a locked Active Plan (see enrich_trade_plans_with_persistence
-    # in utils/dore_options_persistence.py); a row with none is, by
-    # definition, unlocked fresh output from THIS cycle — timestamped
-    # with scan_time (the snapshot's own created_at, passed in by the
-    # caller) rather than render-time now(), so it doesn't drift on
-    # every page refresh within the same still-current cycle.
+    # [2026-08-10, SG request] Most recent Plan time first — this is now
+    # the PRIMARY sort key, with confidence_score only as the tiebreaker
+    # for same-timestamp rows. Previously confidence_score was primary
+    # and recency was just the tiebreaker, which meant the Plan column
+    # visibly bounced around out of time order (e.g. a 71-confidence
+    # 11:04 row could rank above a 72-confidence 00:01 row). See
+    # plan_created_at / scan_time fallback notes below — unchanged.
+    #
+    # 2026-08-08, SG request: (superseded) Highest-confidence candidates
+    # first. plan_created_at only exists for rows that cleared
+    # MIN_CONFIDENCE_TO_ACTIVATE and got a locked Active Plan (see
+    # enrich_trade_plans_with_persistence in utils/dore_options_persistence.py);
+    # a row with none is, by definition, unlocked fresh output from THIS
+    # cycle — timestamped with scan_time (the snapshot's own created_at,
+    # passed in by the caller) rather than render-time now(), so it
+    # doesn't drift on every page refresh within the same still-current
+    # cycle.
     if "confidence_score" in df.columns:
         # [2026-08-08 fix] df.get("plan_created_at") returns a Series when
         # the column exists, but bare None when it's absent entirely — and
@@ -3334,11 +3367,11 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
         scan_time_ts = pd.to_datetime(scan_time, errors="coerce", utc=True)
         sort_time = sort_time.fillna(scan_time_ts)
         df = df.assign(_sort_time=sort_time)
-        df = df.sort_values(["confidence_score", "_sort_time"], ascending=[False, False], kind="stable")
+        df = df.sort_values(["_sort_time", "confidence_score"], ascending=[False, False], kind="stable")
         df = df.drop(columns=["_sort_time"])
 
     if df.empty:
-        return '<div style="color:var(--muted);padding:8px;">No candidates with Confidence ≥ 65 today.</div>'
+        return '<div style="color:var(--muted);padding:8px;">No candidates with Confidence ≥ 70 today.</div>'
 
     headers = ["Symbol", "Direction", "Source", "Primary Strike", "Confidence", "Plan", "Current Premium",
                "Entry Zone", "Stop Loss", "Target 1", "Target 2", "Saved Entry / Drift %", "POP %",
@@ -3745,7 +3778,7 @@ def _dore_options_panel():
         else:
             st.markdown(_dore_options_plan_table_html(dore_opt_df, scan_time=(dore_opt_meta or {}).get("created_at")),
                         unsafe_allow_html=True)
-            st.caption("Showing Confidence ≥ 65 only. 🟢 Confidence ≥75 · 🔵 ≥55–74 (n/a below 65 here) — "
+            st.caption("Showing Confidence ≥ 70 only. 🟢 Confidence ≥75 · 🔵 ≥55–74 (n/a below 70 here) — "
                        "DORE's own final_score, blending qualification, direction strength, and "
                        "premium/liquidity validation into one ranking. Source: PB = Pre-Breakout "
                        "squeeze-release exemption, LS = ordinary Live Scanner ranking. Primary "
