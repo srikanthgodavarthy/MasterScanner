@@ -53,9 +53,27 @@ import logging
 import os
 import threading
 from contextlib import contextmanager
+from decimal import Decimal
 from typing import Any, Optional, Sequence
 
 logger = logging.getLogger(__name__)
+
+
+def json_safe(v):
+    """Recursively convert decimal.Decimal (psycopg2's return type for
+    Postgres `numeric` columns) to float, so a value round-tripped from a
+    DB read back into a jsonb payload (via psycopg2.extras.Json) doesn't
+    blow up json.dumps — stdlib json has no default encoder for Decimal.
+    [2026-08] Post-Neon-migration: the old Supabase/PostgREST client
+    returned plain floats over JSON, so this never came up before.
+    Call this on any dict/list headed into psycopg2.extras.Json(...)."""
+    if isinstance(v, Decimal):
+        return float(v)
+    if isinstance(v, dict):
+        return {k: json_safe(vv) for k, vv in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [json_safe(vv) for vv in v]
+    return v
 
 _POOL = None
 _POOL_LOCK = threading.Lock()

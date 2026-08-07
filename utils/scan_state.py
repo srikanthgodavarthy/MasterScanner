@@ -222,7 +222,7 @@ def save_snapshot(
         "status":     status,
         "row_count":  row_count if row_count is not None else 0,
         "error":      error,
-        "payload":    Json(payload) if (status == "completed" and payload is not None) else None,
+        "payload":    Json(db.json_safe(payload)) if (status == "completed" and payload is not None) else None,
     }
     try:
         db.insert_rows(_table(section), [row])
@@ -568,7 +568,7 @@ def _save_state(
 
     # jsonb-wrap the "record" field just before the DB call — the dedup
     # logic above needs it as a plain dict.
-    db_rows = [{**r, "record": Json(r["record"])} for r in rows]
+    db_rows = [{**r, "record": Json(db.json_safe(r["record"]))} for r in rows]
 
     try:
         if db_rows:
@@ -577,7 +577,7 @@ def _save_state(
             "state_meta",
             [{"section": section, "scan_id": scan_id, "status": "completed",
               "row_count": row_count if row_count is not None else len(rows),
-              "error": None, "extra": Json(extra),
+              "error": None, "extra": Json(db.json_safe(extra)),
               "updated_at": datetime.now(timezone.utc).isoformat()}],
             conflict_cols=["section"],
         )

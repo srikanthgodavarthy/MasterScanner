@@ -213,7 +213,7 @@ def archive_daily_scan(df: pd.DataFrame, metadata: Optional[dict] = None) -> boo
         db.execute(
             """INSERT INTO scan_daily_archive (run_at, trading_date, row_count, metadata, data)
                VALUES (%s, %s, %s, %s, %s)""",
-            (run_ts, trading_date.isoformat(), len(records), Json(metadata or {}), Json(records)),
+            (run_ts, trading_date.isoformat(), len(records), Json(db.json_safe(metadata or {})), Json(records)),
         )
         logger.info("archive_daily_scan: archived trading day %s (%d rows)", trading_date, len(records))
         return True
