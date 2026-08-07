@@ -2706,7 +2706,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
 
     open_plans = preloaded_plans if preloaded_plans is not None else load_open_setup_plans()
     if not open_plans:
-        st.info("No open trade plans right now. A plan is minted automatically the first time a stock reaches Actionable, Execute, or Elite.")
+        st.info("No open trade plans right now. A plan is minted automatically the first time a stock reaches Actionable, Execute, or Elite (source LS) — or the first time a Pre-Breakout squeeze releases (source PB).")
         return
 
     # Look up today's live price + current recommendation for symbols
@@ -2731,6 +2731,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             "setup_id":     plan.setup_id,
             "Symbol":       sym,
             "Status":       plan.status.upper(),
+            "Source":       getattr(plan, "source", "LS") or "LS",
             "Entry":        plan.entry_locked,
             "SL":           plan.sl_locked,
             "T1":           plan.t1_locked,
@@ -2772,7 +2773,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
 
     # ── Table ───────────────────────────────────────────────────────
     header = (
-        '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th>'
+        '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th><th>Source</th>'
         '<th>Entry</th><th>SL</th><th>T1</th><th>Current Price</th><th>PnL%</th>'
         '<th>Days Active</th><th>Original Recommendation</th><th>Current Recommendation</th></tr>'
     )
@@ -2787,6 +2788,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             f'<tr><td class="col-rank">{rank}</td>'
             f'<td class="col-stock">{_tv_link(r["Symbol"])}</td>'
             f'<td>{_ap_status_badge(r["Status"])}</td>'
+            f'<td>{_ap_source_badge(r["Source"])}</td>'
             f'<td class="col-num">{_px(r["Entry"])}</td>'
             f'<td class="col-num">{_px(r["SL"])}</td>'
             f'<td class="col-num">{_px(r["T1"])}</td>'
@@ -2845,6 +2847,21 @@ def _compute_days_active_safe(first_actionable_date: str) -> int:
         return _compute_days_active(first_actionable_date)
     except Exception:
         return 0
+
+
+def _ap_source_badge(source: str) -> str:
+    """
+    LS/PB badge for the Active Setups table — same visual language as
+    the existing PB badge on the options plan tables (search "PB" /
+    "Pre-Breakout squeeze-release" elsewhere in this file for the
+    original), just extended to equity setup_plans' new source field.
+    """
+    src = str(source or "LS").upper().strip()
+    if src == "PB":
+        return ('<span style="background:#f97316;color:#0d1117;font-weight:700;font-size:10px;'
+                'border-radius:4px;padding:1px 6px;" title="Pre-Breakout squeeze-release">PB</span>')
+    return ('<span style="background:#21262d;color:var(--muted);font-weight:700;font-size:10px;'
+            'border-radius:4px;padding:1px 6px;" title="Live Scanner — Actionable/Execute/Elite promotion">LS</span>')
 
 
 def _render_pre_breakout_tab(records: list, df: pd.DataFrame, mode: str) -> None:
