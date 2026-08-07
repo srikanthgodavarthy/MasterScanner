@@ -3508,6 +3508,12 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
         pct = row.get("last_drift_pct")
         if cur in (None, "") or pd.isna(cur) or entry in (None, "") or pd.isna(entry):
             return '<span style="color:var(--muted)">—</span>'
+        # [2026-08] Post-Neon-migration: psycopg2 returns Postgres
+        # numeric columns as decimal.Decimal, not the plain float the
+        # old Supabase/PostgREST JSON client returned — Decimal-float
+        # arithmetic raises TypeError, so cast both to float here.
+        cur = float(cur)
+        entry = float(entry)
         pnl_rupees = cur - entry
         color = "#3fb950" if pnl_rupees >= 0 else "#f85149"
         sign = "+" if pnl_rupees >= 0 else ""
