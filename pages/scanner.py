@@ -3318,8 +3318,21 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
     # caller) rather than render-time now(), so it doesn't drift on
     # every page refresh within the same still-current cycle.
     if "confidence_score" in df.columns:
-        sort_time = pd.to_datetime(df.get("plan_created_at"), errors="coerce", utc=True)
-        sort_time = sort_time.fillna(scan_time)
+        # [2026-08-08 fix] df.get("plan_created_at") returns a Series when
+        # the column exists, but bare None when it's absent entirely — and
+        # every row from the dore_technical_plans fallback (unlocked, no
+        # Active Plan yet — see comment above) has NO plan_created_at
+        # column at all, not just NaN values in one. pd.to_datetime(None,
+        # ...) then returns a scalar NaT, which has no .fillna() method,
+        # crashing here. Most commonly hit when dore_live_state is empty
+        # (e.g. right after a manual clear, or before its first 60s tick)
+        # and every candidate falls back to unlocked technical-plan rows.
+        if "plan_created_at" in df.columns:
+            sort_time = pd.to_datetime(df["plan_created_at"], errors="coerce", utc=True)
+        else:
+            sort_time = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns, UTC]")
+        scan_time_ts = pd.to_datetime(scan_time, errors="coerce", utc=True)
+        sort_time = sort_time.fillna(scan_time_ts)
         df = df.assign(_sort_time=sort_time)
         df = df.sort_values(["confidence_score", "_sort_time"], ascending=[False, False], kind="stable")
         df = df.drop(columns=["_sort_time"])
