@@ -15,7 +15,7 @@ yfinance==0.2.66  # PINNED 2026-07-15: was >=0.2.40 (floating), which silently
 pandas==2.2.3
 numpy==1.26.4
 plotly>=5.22.0
-supabase>=2.5.0
+psycopg2-binary>=2.9.9  # CHANGED 2026-08: Neon/Postgres client, replaces supabase-py
 python-dotenv>=1.0.0
 requests>=2.31.0
 numba==0.59.1

@@ -1,5 +1,5 @@
 """
-Event-aware scan snapshot store (2026-07-23).
+Event-aware scan snapshot store (2026-07-23). [Neon migration, 2026-08]
 
 Problem this replaces
 ----------------------
@@ -18,7 +18,7 @@ write versioned snapshots here:
 
     market_intelligence   — every 30s
     live_scanner          — every 5 min (worked through in batches)
-    fo_scan               — every 60s
+    fo_scan                — every 60s
 
 Each snapshot row carries `scan_id`, `created_at`, `status`, and
 `version` (monotonic epoch-ms integer — cheap to compare, no datetime
@@ -59,14 +59,19 @@ import logging
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Optional
+
+from psycopg2.extras import Json
+
+from utils import db
 
 logger = logging.getLogger(__name__)
 
 # Section name -> physical table. Keeping these as separate tables (rather
 # than one shared table with a `section` column) per the explicit "each
 # snapshot table stores scan_id/created_at/status/version" spec — makes
-# per-section RLS/retention policies possible later without touching the
+# per-section retention policies possible later without touching the
 # others, at the cost of three near-identical DDL blocks (see SCHEMA_SQL
 # at the bottom of this file).
 _TABLES = {
@@ -159,31 +164,7 @@ _STATE_SECTIONS = {
 }
 
 
-def _client():
-    # Local import: this module gets imported by the standalone scheduler
-    # process too (scheduler/scan_worker.py runs outside `streamlit run`),
-    # and utils.supabase_client itself only touches `st.secrets` /
-    # `st.cache_resource`, both of which work fine without a live session —
-    # but importing streamlit-heavy modules at module load time everywhere
-    # they're merely referenced is unnecessary coupling.
-    #
-    # [2026-08-07] All of this module's own .execute() calls go through
-    # utils.supabase_client._execute_with_retry(), same as this client's
-    # other callers — this module shares that SAME cached client/HTTP2
-    # connection pool (see _execute_with_retry's own docstring for the
-    # 2026-07-29 finding: Supabase's edge periodically closes idle HTTP/2
-    # connections server-side, surfacing as httpx.RemoteProtocolError on
-    # an otherwise-healthy request from ANY caller of this shared client).
-    # save_snapshot() already had this; load_snapshot_meta(),
-    # load_snapshot_payload(), and prune_old_snapshots() didn't — so a
-    # dropped connection hit them immediately with no retry while a
-    # concurrent supabase_client.py call in the same instant retried and
-    # likely succeeded. Now all four go through the same wrapper.
-    from utils.supabase_client import get_client
-    return get_client()
-
-
-def _table(section: str):
+def _table(section: str) -> str:
     if section not in _TABLES:
         raise ValueError(f"Unknown scan section {section!r}; expected one of {list(_TABLES)}")
     return _TABLES[section]
@@ -198,7 +179,7 @@ def save_snapshot(
 ) -> Optional[str]:
     """
     Insert a new snapshot row for `section`. Returns the new scan_id (str)
-    on success, None if Supabase is unavailable or the insert failed.
+    on success, None if Neon is unavailable or the insert failed.
 
     `version` is epoch-ms at write time — monotonically increasing across
     inserts from a single producer without needing a DB sequence, and
@@ -207,37 +188,15 @@ def save_snapshot(
 
     2026-07-29 bugfix — NaN/inf JSON serialization: `payload` can contain
     Python float('nan')/float('inf') values (a producer's DataFrame had a
-    missing indicator input, or a ratio divided by zero) that Python's
-    JSON encoder — invoked internally by supabase-py's insert() below —
-    rejects with `ValueError: Out of range float values are not JSON
-    compliant: nan`. Previously that exception was caught by the generic
-    `except Exception` below, logged as an opaque "save_snapshot failed",
-    and surfaced to callers (scheduler/scan_worker.py's _run_loop) as a
-    bare `None` — indistinguishable from an actual Supabase outage, and
-    the resulting "save_snapshot returned no scan_id (Supabase
-    unavailable?)" warning actively misled whoever was debugging it.
-
-    Two things fix this:
-    1. `sanitize_for_json()` runs on every completed payload before
-       insert — a safety net for every section (market_intelligence,
-       live_scanner, fo_scan, and anything added later), regardless of
-       whether the producer already sanitized its own DataFrame (see
-       utils.fo_scan.compute_fo_scan() for the producer-side fix, which
-       should mean this rarely finds anything left to do — a hit here
-       is itself a signal that some OTHER producer needs the same
-       treatment upstream).
-    2. `ValueError` from the insert call is now caught and logged
-       separately from any other exception, with the specific field
-       names that were the problem, so a genuinely NEW way to still
-       produce invalid JSON (something sanitize_for_json() doesn't
-       cover) is immediately diagnosable instead of looking like a
-       connectivity issue.
+    missing indicator input, or a ratio divided by zero) that a strict
+    JSON encoder rejects. `sanitize_for_json()` runs on every completed
+    payload before insert as a safety net for every section, regardless
+    of whether the producer already sanitized its own DataFrame.
     """
     if section in _STATE_SECTIONS:
         return _save_state(section, payload, row_count, status, error)
 
-    client = _client()
-    if client is None:
+    if not db.is_available():
         return None
 
     from utils.json_sanitize import collect_invalid_field_names, sanitize_for_json
@@ -263,29 +222,18 @@ def save_snapshot(
         "status":     status,
         "row_count":  row_count if row_count is not None else 0,
         "error":      error,
-        "payload":    payload if status == "completed" else None,
+        "payload":    Json(payload) if (status == "completed" and payload is not None) else None,
     }
     try:
-        from utils.supabase_client import _execute_with_retry
-        # returning="minimal": scan_id is already known (generated above,
-        # client-side) so nothing here needs the row Supabase would
-        # otherwise echo back — that echo was pure wasted egress on every
-        # single insert (market_intelligence/fo_scan payloads can be
-        # substantial). Success is now determined by "insert() didn't
-        # raise" (_execute_with_retry / postgrest raises APIError on any
-        # real failure) rather than by resp.data being non-empty, which
-        # is always [] under minimal returning regardless of outcome.
-        _execute_with_retry(client.table(_table(section)).insert(row, returning="minimal"))
+        db.insert_rows(_table(section), [row])
         return scan_id
     except ValueError as exc:
-        # Should be rare now that the sanitization above runs unconditionally
-        # — reaching here means a value slipped past both the producer's
-        # sanitize_dataframe() and this function's sanitize_for_json(), e.g.
-        # a non-float type the JSON encoder also rejects. Logged distinctly
-        # from the generic except-Exception below (which still handles real
-        # connectivity/auth/schema failures) precisely so this specific,
-        # previously-silent-and-misleading failure mode is never mistaken
-        # for "Supabase is down" again.
+        # Reaching here means a value slipped past sanitize_for_json()
+        # — e.g. a non-float type a JSON encoder also rejects. Logged
+        # distinctly from the generic except-Exception below (which
+        # still handles real connectivity/auth/schema failures)
+        # precisely so this specific failure mode is never mistaken for
+        # "Neon is down".
         logger.error(
             "[%s] snapshot serialization failed — invalid JSON value(s) "
             "detected in payload even after sanitization. Original error: %s",
@@ -306,20 +254,15 @@ def load_snapshot_meta(section: str) -> Optional[dict]:
     if section in _STATE_SECTIONS:
         return _load_state_meta(section)
 
-    client = _client()
-    if client is None:
+    if not db.is_available():
         return None
     try:
-        from utils.supabase_client import _execute_with_retry
-        resp = _execute_with_retry(
-            client.table(_table(section))
-            .select(_META_COLUMNS)
-            .order("version", desc=True)
-            .limit(1)
+        rows = db.fetch_all(
+            f"SELECT {_META_COLUMNS} FROM {_table(section)} ORDER BY version DESC LIMIT 1"
         )
-        if not resp.data:
+        if not rows:
             return None
-        return resp.data[0]
+        return rows[0]
     except Exception:
         logger.exception("load_snapshot_meta(%s) failed", section)
         return None
@@ -336,20 +279,16 @@ def load_snapshot_payload(section: str) -> Optional[dict]:
     if section in _STATE_SECTIONS:
         return _load_state_payload(section)
 
-    client = _client()
-    if client is None:
+    if not db.is_available():
         return None
     try:
-        from utils.supabase_client import _execute_with_retry
-        resp = _execute_with_retry(
-            client.table(_table(section))
-            .select("scan_id, created_at, status, version, row_count, payload")
-            .order("version", desc=True)
-            .limit(1)
+        rows = db.fetch_all(
+            f"""SELECT scan_id, created_at, status, version, row_count, payload
+                FROM {_table(section)} ORDER BY version DESC LIMIT 1"""
         )
-        if not resp.data:
+        if not rows:
             return None
-        row = resp.data[0]
+        row = rows[0]
         if row.get("status") != "completed" or row.get("payload") is None:
             return None
         return row
@@ -442,9 +381,6 @@ def get_sched_cache_stats() -> dict[str, dict[str, Any]]:
     write cadence.
     """
     with _sched_cache_stats_lock:
-        # Shallow-copy the outer dict and each section's lists so the
-        # caller can't mutate live counters, without holding the lock
-        # for longer than the copy itself.
         return {
             sec: {
                 "hits": v["hits"], "misses": v["misses"],
@@ -462,7 +398,7 @@ def load_snapshot_payload_cached(section: str) -> Optional[dict]:
     scheduler/scan_worker.py, utils.inprocess_scheduler's background
     threads, or any Stage-1/Stage-2 producer — no Streamlit dependency.
 
-    The underlying Supabase payload read only happens once per
+    The underlying Neon payload read only happens once per
     (section, version) per process; every call after the first for an
     unchanged version returns the same cached dict instead of re-fetching.
 
@@ -484,8 +420,8 @@ def load_snapshot_payload_cached(section: str) -> Optional[dict]:
 
     _sched_stats_record(section, "miss")
 
-    # Deliberately fetched OUTSIDE the lock — this is a real Supabase
-    # network call, and holding the lock across it would serialize every
+    # Deliberately fetched OUTSIDE the lock — this is a real network
+    # call, and holding the lock across it would serialize every
     # section's reads behind whichever one happens to miss first. A
     # duplicate concurrent miss on the exact same (section, version) is
     # possible but harmless (worst case: two threads each pay for one
@@ -519,8 +455,7 @@ def _save_state(
     error: Optional[str],
 ) -> Optional[str]:
     cfg = _STATE_SECTIONS[section]
-    client = _client()
-    if client is None:
+    if not db.is_available():
         return None
 
     scan_id = str(uuid.uuid4())
@@ -533,13 +468,12 @@ def _save_state(
         # table. We still record the failure in state_meta so
         # load_snapshot_meta() callers can see status/error if they check.
         try:
-            from utils.supabase_client import _execute_with_retry
-            _execute_with_retry(
-                client.table("state_meta").upsert(
-                    {"section": section, "scan_id": scan_id, "status": status,
-                     "error": error, "updated_at": "now()"},
-                    on_conflict="section", returning="minimal",
-                )
+            db.upsert_rows(
+                "state_meta",
+                [{"section": section, "scan_id": scan_id, "status": status,
+                  "error": error, "updated_at": datetime.now(timezone.utc).isoformat()}],
+                conflict_cols=["section"],
+                update_cols=["scan_id", "status", "error", "updated_at"],
             )
         except Exception:
             logger.exception("_save_state(%s) meta-only upsert failed", section)
@@ -588,13 +522,14 @@ def _save_state(
                 continue
             key = "|".join("" if p is None else str(p) for p in parts)
             row = {key_column: key, "symbol": rec.get(id_field[0]), "record": rec,
-                   "scan_id": scan_id, "updated_at": "now()"}
+                   "scan_id": scan_id, "updated_at": datetime.now(timezone.utc).isoformat()}
         else:
             val = rec.get(id_field)
             if not val:
                 skipped += 1
                 continue
-            row = {key_column: val, "record": rec, "scan_id": scan_id, "updated_at": "now()"}
+            row = {key_column: val, "record": rec, "scan_id": scan_id,
+                   "updated_at": datetime.now(timezone.utc).isoformat()}
         rows.append(row)
     if skipped:
         logger.warning("[%s] skipped %d record(s) with no %r key", section, skipped, id_field)
@@ -631,29 +566,20 @@ def _save_state(
             section, before - len(rows), before, len(rows),
         )
 
+    # jsonb-wrap the "record" field just before the DB call — the dedup
+    # logic above needs it as a plain dict.
+    db_rows = [{**r, "record": Json(r["record"])} for r in rows]
+
     try:
-        from utils.supabase_client import _execute_with_retry
-        # returning="minimal" on both upserts below: this function never
-        # reads the response (it already has scan_id/rows in hand), so
-        # the default representation echo was pure waste — and the worst
-        # offender for it, since `rows` here is the FULL current state
-        # for every symbol/plan in live_scanner_state or dore_live_state,
-        # rewritten unconditionally every cycle from an in-process
-        # background thread (utils/inprocess_scheduler.py) sharing the
-        # same heap as the Streamlit UI on Streamlit Cloud. Every one of
-        # those cycles was also downloading a full copy of what it just
-        # uploaded before this fix.
-        if rows:
-            _execute_with_retry(
-                client.table(cfg["table"]).upsert(rows, on_conflict=key_column, returning="minimal")
-            )
-        _execute_with_retry(
-            client.table("state_meta").upsert(
-                {"section": section, "scan_id": scan_id, "status": "completed",
-                 "row_count": row_count if row_count is not None else len(rows),
-                 "error": None, "extra": extra, "updated_at": "now()"},
-                on_conflict="section", returning="minimal",
-            )
+        if db_rows:
+            db.upsert_rows(cfg["table"], db_rows, conflict_cols=[key_column])
+        db.upsert_rows(
+            "state_meta",
+            [{"section": section, "scan_id": scan_id, "status": "completed",
+              "row_count": row_count if row_count is not None else len(rows),
+              "error": None, "extra": Json(extra),
+              "updated_at": datetime.now(timezone.utc).isoformat()}],
+            conflict_cols=["section"],
         )
         logger.info("_save_state(%s): upserted %d row(s)", section, len(rows))
         return scan_id
@@ -671,30 +597,26 @@ def _save_state(
 
 def _load_state_meta(section: str) -> Optional[dict]:
     cfg = _STATE_SECTIONS[section]
-    client = _client()
-    if client is None:
+    if not db.is_available():
         return None
     try:
-        from utils.supabase_client import _execute_with_retry
-        resp = _execute_with_retry(
-            client.table("state_meta").select("*").eq("section", section).limit(1)
-        )
-        if resp.data:
-            row = resp.data[0]
+        rows = db.fetch_all("SELECT * FROM state_meta WHERE section = %s LIMIT 1", (section,))
+        if rows:
+            row = rows[0]
             created_at = row.get("updated_at")
         else:
             # No meta row yet (e.g. state table was seeded directly without
             # ever going through _save_state) — fall back to deriving meta
             # from the state table itself so callers still get something.
-            state_resp = _execute_with_retry(
-                client.table(cfg["table"]).select("updated_at", count="exact")
-                .order("updated_at", desc=True).limit(1)
+            state_rows = db.fetch_all(
+                f"SELECT updated_at FROM {cfg['table']} ORDER BY updated_at DESC LIMIT 1"
             )
-            if not state_resp.data:
+            if not state_rows:
                 return None
-            created_at = state_resp.data[0]["updated_at"]
+            created_at = state_rows[0]["updated_at"]
+            count_row = db.fetch_one(f"SELECT COUNT(*) AS n FROM {cfg['table']}")
             row = {"scan_id": None, "status": "completed",
-                   "row_count": state_resp.count, "error": None}
+                   "row_count": count_row["n"] if count_row else 0, "error": None}
         return {
             "scan_id": row.get("scan_id"),
             "created_at": created_at,
@@ -714,20 +636,16 @@ def _load_state_payload(section: str) -> Optional[dict]:
     if meta is None or meta.get("status") != "completed":
         return None
 
-    client = _client()
-    if client is None:
+    if not db.is_available():
         return None
     try:
-        from utils.supabase_client import _execute_with_retry
-        resp = _execute_with_retry(client.table(cfg["table"]).select("record"))
-        records = [r["record"] for r in (resp.data or [])]
+        rows = db.fetch_all(f"SELECT record FROM {cfg['table']}")
+        records = [r["record"] for r in (rows or [])]
 
         extra = {}
-        meta_resp = _execute_with_retry(
-            client.table("state_meta").select("extra").eq("section", section).limit(1)
-        )
-        if meta_resp.data and meta_resp.data[0].get("extra"):
-            extra = meta_resp.data[0]["extra"]
+        meta_rows = db.fetch_all("SELECT extra FROM state_meta WHERE section = %s LIMIT 1", (section,))
+        if meta_rows and meta_rows[0].get("extra"):
+            extra = meta_rows[0]["extra"]
 
         payload = {cfg["records_key"]: records, **extra}
         return {
@@ -750,7 +668,6 @@ def _iso_to_epoch_ms(iso_ts) -> Optional[int]:
     if not iso_ts:
         return None
     try:
-        from datetime import datetime
         if isinstance(iso_ts, str):
             ts = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
         else:
@@ -766,10 +683,11 @@ def _iso_to_epoch_ms(iso_ts) -> Optional[int]:
 # statement in SCHEMA_SQL (below) — market_intelligence (30s),
 # live_scanner (5min, full-universe JSON payload), and fo_scan (60s)
 # snapshots accumulated forever. One shared, parameterized prune
-# function (prune_snapshot_table RPC) is applied identically to all
-# three tables here, rather than three independent call sites that
-# could drift (one gets updated, another forgotten) — see the
-# architecture review's L1 note about exactly that risk.
+# function (prune_snapshot_table, called via utils.db.call_function) is
+# applied identically to all three tables here, rather than three
+# independent call sites that could drift (one gets updated, another
+# forgotten) — see the architecture review's L1 note about exactly that
+# risk.
 
 RETENTION_KEEP_ROWS = 500   # applied identically to every snapshot table
 
@@ -778,21 +696,18 @@ def prune_old_snapshots(section: str, keep: int = RETENTION_KEEP_ROWS) -> Option
     """
     Deletes all but the most recent `keep` rows (by version) for
     `section`'s snapshot table, via the prune_snapshot_table() Postgres
-    RPC (see SCHEMA_SQL). Returns the number of rows deleted, or None
-    if Supabase was unavailable or the RPC failed — logged, non-fatal;
+    function (see SCHEMA_SQL). Returns the number of rows deleted, or
+    None if Neon was unavailable or the call failed — logged, non-fatal;
     a skipped prune just means slightly more rows survive until the
     next scheduled attempt, never data loss for anything still within
     the retention window.
     """
-    client = _client()
-    if client is None:
+    if not db.is_available():
         return None
     try:
-        from utils.supabase_client import _execute_with_retry
-        resp = _execute_with_retry(client.rpc("prune_snapshot_table", {
+        n = db.call_function("prune_snapshot_table", {
             "p_table": _table(section), "p_keep": keep,
-        }))
-        n = resp.data
+        })
         if n:
             logger.info("prune_old_snapshots(%s): deleted %s row(s), keeping latest %s", section, n, keep)
         return n
@@ -820,7 +735,9 @@ def prune_all_snapshots(keep: int = RETENTION_KEEP_ROWS) -> dict:
 
 
 # ─── SCHEMA ─────────────────────────────────────────────────────────────
-# Run ONCE in Supabase → SQL Editor. Safe to re-run (IF NOT EXISTS).
+# Run ONCE against Neon (psql or the Neon SQL Editor). Safe to re-run
+# (IF NOT EXISTS). UNCHANGED from the Supabase version — plain Postgres
+# DDL/plpgsql, no Supabase-specific SQL ever lived here.
 
 SCHEMA_SQL = """
 -- Event-aware scan snapshots (2026-07-23) — one table per producer
@@ -839,31 +756,11 @@ CREATE TABLE IF NOT EXISTS market_intelligence_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_mi_snap_version ON market_intelligence_snapshots(version DESC);
 
--- live_scanner_snapshots [RETIRED 2026-08-04] — was an append-only
--- snapshot log (one full-universe jsonb blob per producer cycle). Hit
--- 1.22GB / ~1GB-a-day growth with zero dedup before the 500-row
--- retention cap even had a chance to apply. Table is now truncated and
--- unused; "live_scanner" resolves through _STATE_SECTIONS below
--- instead. Left commented here for historical/rollback reference only
--- — do not re-create and point save_snapshot() back at it.
---
--- CREATE TABLE IF NOT EXISTS live_scanner_snapshots (
---     id         bigserial   PRIMARY KEY,
---     scan_id    uuid        NOT NULL,
---     created_at timestamptz NOT NULL DEFAULT now(),
---     status     text        NOT NULL DEFAULT 'completed',
---     version    bigint      NOT NULL,
---     row_count  integer     NOT NULL DEFAULT 0,
---     error      text,
---     payload    jsonb
--- );
--- CREATE INDEX IF NOT EXISTS idx_ls_snap_version ON live_scanner_snapshots(version DESC);
-
 -- ── Symbol-keyed state tables [2026-08-04 Trinity migration] ───────────
 -- One row per symbol, UPSERTed every producer cycle instead of appended.
 -- Replaces live_scanner_snapshots and dore_live_state_snapshots (both
--- retired above/below) — see the _STATE_SECTIONS docstring in this file
--- for the full rationale.
+-- retired) — see the _STATE_SECTIONS docstring in this file for the
+-- full rationale.
 CREATE TABLE IF NOT EXISTS live_scanner_state (
     symbol     text        PRIMARY KEY,
     record     jsonb       NOT NULL,
@@ -876,26 +773,9 @@ CREATE INDEX IF NOT EXISTS idx_live_scanner_state_updated_at ON live_scanner_sta
 -- which silently collided distinct plans on the same underlying (a CE
 -- and a PE, or two different strikes/expiries) into one row. Now keyed
 -- on `row_key`, a "|"-joined (symbol, direction, strike, expiry) string
--- matching utils/dore_live_state.py's own `_key()` identity tuple —
--- see the 2026-08-05 note on _STATE_SECTIONS in this file for the full
--- investigation. `symbol` is kept as a plain (non-unique, indexed)
--- column for readability/future filtering, no longer the key.
---
--- MIGRATION for an already-deployed table (this CREATE TABLE below only
--- fires on a fresh deploy where the table doesn't exist yet):
---
---   ALTER TABLE dore_live_state DROP CONSTRAINT dore_live_state_pkey;
---   ALTER TABLE dore_live_state ADD COLUMN IF NOT EXISTS row_key text;
---   -- Old rows only ever held one plan per symbol under the previous
---   -- schema (that was the bug), so there's nothing worth backfilling —
---   -- the next 60s dore_live_state refresh cycle repopulates the whole
---   -- table under the new key anyway. Truncating avoids stale rows
---   -- sitting alongside fresh ones with a NULL row_key.
---   TRUNCATE dore_live_state;
---   ALTER TABLE dore_live_state ALTER COLUMN row_key SET NOT NULL;
---   ALTER TABLE dore_live_state ADD PRIMARY KEY (row_key);
---   CREATE INDEX IF NOT EXISTS idx_dore_live_state_symbol ON dore_live_state(symbol);
---
+-- matching utils/dore_live_state.py's own `_key()` identity tuple.
+-- `symbol` is kept as a plain (non-unique, indexed) column for
+-- readability/future filtering, no longer the key.
 CREATE TABLE IF NOT EXISTS dore_live_state (
     row_key    text        PRIMARY KEY,
     symbol     text        NOT NULL,
@@ -922,9 +802,6 @@ CREATE TABLE IF NOT EXISTS state_meta (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
--- fo_scan_snapshots removed [2026-08-03] — dead table, dropped from
--- Supabase. See the "fo_scan" removal note above _TABLES for why.
-
 -- 2026-07-31: DORE Options Engine Integration — separate snapshot table
 -- for utils.dore_options_scan.compute_dore_options_scan(), independent
 -- of fo_scan_snapshots (the legacy pipeline, kept for rollback/
@@ -941,32 +818,35 @@ CREATE TABLE IF NOT EXISTS dore_options_scan_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_dore_opt_snap_version ON dore_options_scan_snapshots(version DESC);
 
+CREATE TABLE IF NOT EXISTS dore_technical_plans_snapshots (
+    id         bigserial   PRIMARY KEY,
+    scan_id    uuid        NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    status     text        NOT NULL DEFAULT 'completed',
+    version    bigint      NOT NULL,
+    row_count  integer     NOT NULL DEFAULT 0,
+    error      text,
+    payload    jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_dore_tp_snap_version ON dore_technical_plans_snapshots(version DESC);
+
 -- ── Retention [Architecture review H1 fix, 2026-07-25] ─────────────────
 -- Deletes all but the most recent p_keep rows (by version) from ONE of
--- the three whitelisted snapshot tables. Whitelist check + format(%I)
--- both guard against SQL injection via p_table (this function is
--- called from application code with a fixed, hardcoded table name via
+-- the whitelisted snapshot tables. Whitelist check + format(%I) both
+-- guard against SQL injection via p_table (this function is called
+-- from application code with a fixed, hardcoded table name via
 -- utils.scan_state._table(), never user input — the whitelist is
 -- defense in depth, not the only guard).
 --
 -- Called periodically (once an hour, see scheduler/scan_worker.py's
--- _run_retention_loop) for ALL THREE tables via one shared Python
--- helper (utils.scan_state.prune_all_snapshots()) rather than three
+-- _run_retention_loop) for ALL registered tables via one shared Python
+-- helper (utils.scan_state.prune_all_snapshots()) rather than
 -- independent DELETE statements someone has to remember to keep in
--- sync.
--- [Ops fix, 2026-07-25] Extended to also cover scan_snapshots and
--- scan_daily_archive (formerly scan_full_snapshots — renamed and
--- repurposed as a daily archive the same day, see
--- utils/supabase_client.py's SCHEMA_SQL) — a second, older pair of
--- insert-only tables discovered while auditing every Supabase write
--- path; they had NO retention at all until now (they predate this fix
--- and live in a different module, so the original H1 pass never
--- touched them). scan_snapshots orders by `run_at`; scan_daily_archive
--- orders by its own `trading_date` (its actual identity/uniqueness
--- column post-rename) — the correct ordering column is picked
--- per-table internally (a CASE, not a caller-supplied column name)
--- rather than trusting the caller, same whitelist-as-defense-in-depth
--- principle as the table name check.
+-- sync. Also covers scan_snapshots, scan_daily_archive, sector_snapshots
+-- (utils/supabase_client.py's SCHEMA_SQL) and lifecycle_transitions —
+-- the correct ordering column is picked per-table internally (a CASE,
+-- not a caller-supplied column name) rather than trusting the caller,
+-- same whitelist-as-defense-in-depth principle as the table name check.
 CREATE OR REPLACE FUNCTION prune_snapshot_table(p_table text, p_keep int DEFAULT 500)
 RETURNS int AS $$
 DECLARE
@@ -975,29 +855,11 @@ DECLARE
 BEGIN
     order_col := CASE p_table
         WHEN 'market_intelligence_snapshots' THEN 'version'
-        -- live_scanner_snapshots / dore_live_state_snapshots entries
-        -- removed from prune_all_snapshots()'s call sites [2026-08-04] —
-        -- both sections moved to upsert-per-symbol state tables (see
-        -- _STATE_SECTIONS). Left in this CASE as dead-but-harmless: the
-        -- RPC just never gets invoked with those table names anymore.
-        -- fo_scan_snapshots removed [2026-08-03] — dead table: writer job
-        -- has been commented out of scheduler/scan_worker.py's JOBS list
-        -- since the DORE Options Engine took over, and pages/scanner.py's
-        -- fo_scan-backed reader was removed 2026-07-31. Table itself
-        -- dropped from Supabase; keeping it here would just make this RPC
-        -- fail every retention cycle against a table that no longer exists.
         WHEN 'dore_options_scan_snapshots'   THEN 'version'
-        WHEN 'dore_live_state_snapshots'     THEN 'version'
         WHEN 'dore_technical_plans_snapshots' THEN 'version'
         WHEN 'scan_snapshots'                THEN 'run_at'
         WHEN 'scan_daily_archive'            THEN 'trading_date'
         WHEN 'sector_snapshots'              THEN 'scan_date'
-        -- [Free-plan retention audit, 2026-08-03] lifecycle_transitions is
-        -- an insert-only append log (utils.supabase_client.save_lifecycle_
-        -- transitions) that had no pruning anywhere — added here rather
-        -- than a new RPC since, unlike backtest_results, each row is
-        -- independent (no multi-row "run" grouping a row-count cap could
-        -- truncate mid-way through).
         WHEN 'lifecycle_transitions'         THEN 'to_date'
         ELSE NULL
     END;

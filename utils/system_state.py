@@ -1,6 +1,6 @@
 """
 utils/system_state.py — single source of truth for execution mode
-(2026-07-23).
+(2026-07-23). [Neon migration, 2026-08]
 
 Problem this replaces
 ----------------------
@@ -15,7 +15,7 @@ batch and overwrites the rest with its own stale in-memory cache.
 
 New model
 ---------
-One singleton row in Supabase (`system_state`, always id=1) that every
+One singleton row in Neon (`system_state`, always id=1) that every
 component reads/writes instead of maintaining its own flag:
 
     mode                  LIVE | BACKTEST | MAINTENANCE
@@ -47,11 +47,11 @@ Before this, nothing prevented `python -m scheduler.scan_worker`
 (scheduler/scan_worker.py) and the in-process fallback
 (utils.inprocess_scheduler.start_background_scans(), started from
 pages/dashboard.py's render()) from BOTH running against the same
-Supabase project at once — the module docstrings in both files warned
+database project at once — the module docstrings in both files warned
 "don't do this" in a comment, but nothing enforced it. Two producers
-racing on the same section doubles Supabase write volume and, more
-importantly, doubles the actual scan compute (two independent sets of
-Upstox/yfinance fetches) — exactly the kind of resource contention a
+racing on the same section doubles write volume and, more importantly,
+doubles the actual scan compute (two independent sets of Upstox/
+yfinance fetches) — exactly the kind of resource contention a
 500-symbol, continuous, long-running deployment can't afford.
 
 Same singleton row, three more columns:
@@ -87,63 +87,30 @@ read-modify-write.
     snapshots normally, they're just being produced by the other
     process instead.
 
-Usage
------
-    from utils.system_state import should_scheduler_run, backtest_pause, \\
-        set_manual_override, manual_override_active
-
-    # scheduler/scan_worker.py — cycle boundary check
-    if not should_scheduler_run():
-        continue  # skip this cycle, don't suspend mid-batch
-
-    # pages/backtest.py — wraps the whole run
-    with backtest_pause():
-        run_backtest(...)
-
-    # pages/scanner.py — after a manual "Run Scan" writes live_scanner
-    set_manual_override("live_scanner", ttl_secs=90)
-
-    # scheduler/scan_worker.py's live_scanner batch-save
-    if manual_override_active("live_scanner"):
-        merged = reseed_from_latest_snapshot(merged)  # see scan_worker.py
-
-    # scheduler/scan_worker.py's main() — blocks until this process owns
-    # the scheduler lock, then starts a heartbeat thread
-    owner_id = make_scheduler_owner_id()
-    acquire_scheduler_lock_blocking(owner_id)
-    hb = start_scheduler_heartbeat(owner_id)
-    ... start job threads, checking hb.lost_ownership.is_set() too ...
-
-    # utils/inprocess_scheduler.py's start_background_scans() — tries
-    # once, non-blocking; skips starting threads if it can't acquire
-    owner_id = make_scheduler_owner_id()
-    if not try_acquire_scheduler_lock(owner_id):
-        logger.warning("another process already owns the scheduler lock")
-        return False
-    hb = start_scheduler_heartbeat(owner_id)
-    ... start job threads ...
-
 Concurrency
 -----------
-backtest_lock_count is incremented/decremented via a Postgres RPC
-function (see SCHEMA_SQL), not a client-side read-modify-write —
-two Streamlit sessions both doing read-count/count+1/write from
-PostgREST can race and undercount. The RPC does the increment/decrement
-atomically in the database. The scheduler-ownership lock (above) uses
-the same pattern — try_acquire_scheduler_lock()/release_scheduler_lock()/
+backtest_lock_count is incremented/decremented via a Postgres function
+(the old Supabase "RPC" — see SCHEMA_SQL), not a client-side
+read-modify-write — two Streamlit sessions both doing read-count/
+count+1/write can race and undercount. The function does the
+increment/decrement atomically in the database. The scheduler-
+ownership lock (above) uses the same pattern —
+try_acquire_scheduler_lock()/release_scheduler_lock()/
 renew_scheduler_heartbeat() are all atomic Postgres functions, not
-client-side compare-and-swap.
+client-side compare-and-swap. [2026-08] Called via utils.db.call_function()
+instead of supabase-py's .rpc() — the underlying Postgres functions
+themselves are UNCHANGED (see SCHEMA_SQL at the bottom).
 
 Fail-open
 ---------
-Every read helper here returns a LIVE-shaped default if Supabase is
+Every read helper here returns a LIVE-shaped default if Neon is
 briefly unreachable, matching the fail-open pattern the rest of the app
 already uses for save_snapshot() etc. (utils/scan_state.py). Treating
 an unreadable flag as "stay paused" would turn a transient network
 blip into an indefinite scan outage — worse than the race this module
 fixes. The scheduler-ownership lock intentionally does NOT fail open in
 quite the same way (see try_acquire_scheduler_lock()'s docstring) — a
-Supabase outage there fails open to "assume we own it" for whichever
+Neon outage there fails open to "assume we own it" for whichever
 process asks first, since refusing to scan at all because a lock table
 was briefly unreachable would be worse than the rare double-scan a
 network blip could cause.
@@ -158,9 +125,9 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+from utils import db
 
-_TABLE = "system_state"
+logger = logging.getLogger(__name__)
 
 # A stale heartbeat this old means the lock holder crashed/closed the
 # tab/hit an unhandled exception before its finally-block could run —
@@ -199,27 +166,33 @@ def make_scheduler_owner_id() -> str:
     return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 
-# [Ops fix, 2026-07-25] Every C3/H1 RPC (try_acquire_scheduler_lock,
+# [Ops fix, 2026-07-25] Every C3/H1 Postgres function (try_acquire_scheduler_lock,
 # renew_scheduler_heartbeat, release_scheduler_lock, and scan_state.py's
-# prune_snapshot_table) requires a one-time SQL migration in Supabase
-# (see each function's SCHEMA_SQL block) before it exists. Deployments
-# that skip that migration would otherwise get a full Python traceback
-# on EVERY heartbeat call (every ~20s) forever. _is_missing_function_error()
-# lets each call site detect that specific failure mode and log ONE loud,
+# prune_snapshot_table) requires a one-time SQL migration (see each
+# function's SCHEMA_SQL block) before it exists. Deployments that skip
+# that migration would otherwise get a full Python traceback on EVERY
+# heartbeat call (every ~20s) forever. _is_missing_function_error() lets
+# each call site detect that specific failure mode and log ONE loud,
 # actionable message instead of spamming tracebacks — the underlying
 # behavior (fail open / skip this cycle) is unchanged either way.
 _MIGRATION_WARNING_LOGGED: set[str] = set()
 
 
 def _is_missing_function_error(exc: Exception) -> bool:
-    """True if `exc` looks like PostgREST's 'function does not exist'
-    error (PGRST202 / Postgres 42883) — i.e. the required migration
-    hasn't been applied yet, as opposed to a transient network/DB
-    issue. String-matched rather than exception-type-matched since the
-    supabase-py client re-raises these as a generic APIError with the
-    detail only in the message payload."""
+    """True if `exc` looks like Postgres's 'function does not exist'
+    error (SQLSTATE 42883 / psycopg2.errors.UndefinedFunction) — i.e.
+    the required migration hasn't been applied yet, as opposed to a
+    transient network/DB issue. [2026-08] Was PostgREST's PGRST202
+    string match under Supabase; now checks the psycopg2 exception
+    type first, falling back to a string match for safety."""
+    try:
+        import psycopg2
+        if isinstance(exc, psycopg2.errors.UndefinedFunction):
+            return True
+    except Exception:
+        pass
     msg = str(exc)
-    return "PGRST202" in msg or "42883" in msg or "Could not find the function" in msg
+    return "42883" in msg or ("does not exist" in msg.lower() and "function" in msg.lower())
 
 
 def _log_migration_required_once(rpc_name: str, key: str) -> None:
@@ -229,23 +202,14 @@ def _log_migration_required_once(rpc_name: str, key: str) -> None:
     logger.error(
         "=" * 70 + "\n"
         "MIGRATION REQUIRED: the '%s' Postgres function does not exist yet.\n"
-        "This is expected on a fresh deployment of the 2026-07-25 scheduler-\n"
-        "ownership-lock / snapshot-retention fix (Architecture review C3/H1) —\n"
-        "run the SQL in utils/system_state.py's SCHEMA_SQL (scheduler lock\n"
+        "Run the SQL in utils/system_state.py's SCHEMA_SQL (scheduler lock\n"
         "functions) and utils/scan_state.py's SCHEMA_SQL (prune_snapshot_table)\n"
-        "once in the Supabase SQL Editor. Behavior is unaffected in the\n"
-        "meantime (this fails open / skips its cycle, same as any other\n"
-        "transient RPC failure) — this message will not repeat.\n" + "=" * 70,
+        "once against Neon (psql \"$NEON_DATABASE_URL\" -f schema.sql, or the\n"
+        "Neon SQL Editor). Behavior is unaffected in the meantime (this fails\n"
+        "open / skips its cycle, same as any other transient failure) — this\n"
+        "message will not repeat.\n" + "=" * 70,
         rpc_name,
     )
-
-
-def _client():
-    # Local import — same rationale as utils/scan_state.py: this module
-    # is imported by the standalone scheduler process too, which never
-    # touches streamlit-heavy modules unless it has to.
-    from utils.supabase_client import get_client
-    return get_client()
 
 
 def _now() -> datetime:
@@ -268,19 +232,18 @@ def _parse_ts(val) -> Optional[datetime]:
 
 def get_system_state() -> dict:
     """
-    Returns the singleton row, or the LIVE-shaped default if Supabase is
+    Returns the singleton row, or the LIVE-shaped default if Neon is
     unavailable or the row doesn't exist yet — fail-open, see module
     docstring. Never returns None so callers don't need a None-check on
     every field access.
     """
-    client = _client()
-    if client is None:
+    if not db.is_available():
         return dict(_LIVE_DEFAULT)
     try:
-        resp = client.table(_TABLE).select("*").eq("id", 1).limit(1).execute()
-        if not resp.data:
+        row = db.fetch_one("SELECT * FROM system_state WHERE id = 1 LIMIT 1")
+        if not row:
             return dict(_LIVE_DEFAULT)
-        return resp.data[0]
+        return row
     except Exception:
         logger.exception("get_system_state() failed — failing open to LIVE")
         return dict(_LIVE_DEFAULT)
@@ -338,20 +301,19 @@ def set_manual_override(section: str, ttl_secs: int = 90) -> None:
     Called right after a manual write to a snapshot section (e.g.
     pages/scanner.py's "Run Scan" button saving live_scanner). Tells the
     background loop for that section to treat its own in-memory cache
-    as stale for the next `ttl_secs` and reseed from Supabase before its
+    as stale for the next `ttl_secs` and reseed from Neon before its
     next progressive save, instead of clobbering the fresh manual
     result with partially-stale merged data.
     """
-    client = _client()
-    if client is None:
+    if not db.is_available():
         return
     until = (_now() + timedelta(seconds=ttl_secs)).isoformat()
     try:
-        client.table(_TABLE).update({
-            "manual_override_section": section,
-            "manual_override_until": until,
-            "updated_at": _now().isoformat(),
-        }).eq("id", 1).execute()
+        db.execute(
+            """UPDATE system_state SET manual_override_section = %s,
+               manual_override_until = %s, updated_at = %s WHERE id = 1""",
+            (section, until, _now().isoformat()),
+        )
     except Exception:
         logger.exception("set_manual_override(%s) failed (non-fatal)", section)
 
@@ -360,73 +322,66 @@ def clear_manual_override(section: str) -> None:
     """Called by the loop after it has reseeded from the manual snapshot,
     so a second background save in the same TTL window doesn't reseed
     again unnecessarily."""
-    client = _client()
-    if client is None:
+    if not db.is_available():
         return
     try:
-        client.table(_TABLE).update({
-            "manual_override_section": None,
-            "manual_override_until": None,
-            "updated_at": _now().isoformat(),
-        }).eq("id", 1).eq("manual_override_section", section).execute()
+        db.execute(
+            """UPDATE system_state SET manual_override_section = NULL,
+               manual_override_until = NULL, updated_at = %s
+               WHERE id = 1 AND manual_override_section = %s""",
+            (_now().isoformat(), section),
+        )
     except Exception:
         logger.exception("clear_manual_override(%s) failed (non-fatal)", section)
 
 
-# ─── WRITE: backtest lock (RPC, atomic) ────────────────────────────────
+# ─── WRITE: backtest lock (Postgres function, atomic) ──────────────────
 
 def _acquire_backtest_lock() -> None:
-    client = _client()
-    if client is None:
+    if not db.is_available():
         return
     try:
-        client.rpc("acquire_backtest_lock").execute()
+        db.call_function("acquire_backtest_lock")
     except Exception:
-        logger.exception("acquire_backtest_lock RPC failed — backtest will run "
-                          "unpaused against the scheduler this time.")
+        logger.exception("acquire_backtest_lock function call failed — backtest will run "
+                          "without a pause lock (scheduler contention possible)")
 
 
 def _release_backtest_lock() -> None:
-    client = _client()
-    if client is None:
+    if not db.is_available():
         return
     try:
-        client.rpc("release_backtest_lock").execute()
+        db.call_function("release_backtest_lock")
     except Exception:
-        logger.exception("release_backtest_lock RPC failed — system_state may "
+        logger.exception("release_backtest_lock function call failed — system_state may "
                           "stay wedged in BACKTEST mode until the heartbeat "
                           "watchdog in should_scheduler_run() times it out "
                           "(~%ss).", _HEARTBEAT_STALE_AFTER_SECS)
 
 
 def _force_reset_to_live() -> None:
-    """Watchdog path only — bypasses the ref-count RPC entirely, since an
-    abandoned lock's count can't be trusted. Guarded to never touch a
+    """Watchdog path only — bypasses the ref-count function entirely, since
+    an abandoned lock's count can't be trusted. Guarded to never touch a
     deliberately-set MAINTENANCE mode with a fresh heartbeat (only fires
     once that mode's own heartbeat is already stale, per
     should_scheduler_run())."""
-    client = _client()
-    if client is None:
+    if not db.is_available():
         return
     try:
-        client.table(_TABLE).update({
-            "mode": "LIVE",
-            "backtest_lock_count": 0,
-            "heartbeat_at": None,
-            "updated_at": _now().isoformat(),
-        }).eq("id", 1).execute()
+        db.execute(
+            """UPDATE system_state SET mode = 'LIVE', backtest_lock_count = 0,
+               heartbeat_at = NULL, updated_at = %s WHERE id = 1""",
+            (_now().isoformat(),),
+        )
     except Exception:
         logger.exception("_force_reset_to_live() failed")
 
 
 def _heartbeat() -> None:
-    client = _client()
-    if client is None:
+    if not db.is_available():
         return
     try:
-        client.table(_TABLE).update({
-            "heartbeat_at": _now().isoformat(),
-        }).eq("id", 1).execute()
+        db.execute("UPDATE system_state SET heartbeat_at = %s WHERE id = 1", (_now().isoformat(),))
     except Exception:
         logger.exception("system_state heartbeat write failed (non-fatal)")
 
@@ -448,10 +403,10 @@ class _HeartbeatThread(threading.Thread):
 def backtest_pause():
     """
     Wrap a backtest run with this. On entry: atomically increments
-    backtest_lock_count and sets mode=BACKTEST (the RPC only flips mode
-    away from LIVE on a 0->1 transition — a second concurrent backtest
-    just bumps the count, it doesn't need to also set the mode). Starts
-    a background thread that refreshes heartbeat_at every
+    backtest_lock_count and sets mode=BACKTEST (the function only flips
+    mode away from LIVE on a 0->1 transition — a second concurrent
+    backtest just bumps the count, it doesn't need to also set the
+    mode). Starts a background thread that refreshes heartbeat_at every
     _HEARTBEAT_INTERVAL_SECS so should_scheduler_run()'s watchdog knows
     this lock is still alive. On exit (including on exception): stops
     the heartbeat and decrements the count; mode only flips back to
@@ -473,7 +428,7 @@ def backtest_pause():
         _release_backtest_lock()
 
 
-# ─── WRITE: scheduler ownership lock (RPC, atomic) ─────────────────────
+# ─── WRITE: scheduler ownership lock (Postgres function, atomic) ───────
 # [Architecture review C3 fix, 2026-07-25] See module docstring
 # ("Scheduler ownership") for the full design.
 
@@ -485,7 +440,7 @@ def try_acquire_scheduler_lock(owner_id: str) -> bool:
     owner's heartbeat had gone stale) — False if a DIFFERENT owner
     currently holds a fresh lock.
 
-    Fails OPEN (returns True) if Supabase itself is unreachable — a
+    Fails OPEN (returns True) if Neon itself is unreachable — a
     deliberate exception to this module's general fail-open philosophy
     being about the mode flag, not this lock: refusing to run the
     scanner at all because the lock table was briefly unreachable would
@@ -493,17 +448,15 @@ def try_acquire_scheduler_lock(owner_id: str) -> bool:
     worse than the rare double-scan a genuine simultaneous-startup race
     could cause. Logged loudly either way so it's visible in practice.
     """
-    client = _client()
-    if client is None:
-        logger.warning("try_acquire_scheduler_lock: Supabase client unavailable — "
+    if not db.is_available():
+        logger.warning("try_acquire_scheduler_lock: Neon unavailable — "
                         "failing OPEN (assuming ownership) for owner=%s", owner_id)
         return True
     try:
-        resp = client.rpc("try_acquire_scheduler_lock", {
+        acquired = bool(db.call_function("try_acquire_scheduler_lock", {
             "p_owner": owner_id,
             "p_stale_secs": _SCHEDULER_HEARTBEAT_STALE_AFTER_SECS,
-        }).execute()
-        acquired = bool(resp.data)
+        }))
         if acquired:
             logger.info("[system_state] scheduler ownership lock acquired (owner=%s)", owner_id)
         return acquired
@@ -511,7 +464,7 @@ def try_acquire_scheduler_lock(owner_id: str) -> bool:
         if _is_missing_function_error(exc):
             _log_migration_required_once("try_acquire_scheduler_lock", "try_acquire_scheduler_lock")
         else:
-            logger.exception("try_acquire_scheduler_lock RPC failed — failing OPEN "
+            logger.exception("try_acquire_scheduler_lock failed — failing OPEN "
                               "(assuming ownership) for owner=%s", owner_id)
         return True
 
@@ -539,7 +492,7 @@ def acquire_scheduler_lock_blocking(owner_id: str, poll_secs: int = 30) -> None:
                 "will take over automatically once the current owner's "
                 "heartbeat goes stale (>%ss) or it releases cleanly on exit. "
                 "If you did NOT intend to run two scheduler processes against "
-                "this Supabase project at once, that's likely what's "
+                "this database project at once, that's likely what's "
                 "happening right now (see Architecture review finding C3).",
                 poll_secs, _SCHEDULER_HEARTBEAT_STALE_AFTER_SECS,
             )
@@ -558,17 +511,15 @@ def renew_scheduler_heartbeat(owner_id: str) -> bool:
     reintroducing the exact double-scan scenario this lock exists to
     prevent.
     """
-    client = _client()
-    if client is None:
+    if not db.is_available():
         return True   # fail-open — see try_acquire_scheduler_lock()
     try:
-        resp = client.rpc("renew_scheduler_heartbeat", {"p_owner": owner_id}).execute()
-        return bool(resp.data)
+        return bool(db.call_function("renew_scheduler_heartbeat", {"p_owner": owner_id}))
     except Exception as exc:
         if _is_missing_function_error(exc):
             _log_migration_required_once("renew_scheduler_heartbeat", "renew_scheduler_heartbeat")
         else:
-            logger.exception("renew_scheduler_heartbeat RPC failed (owner=%s) — "
+            logger.exception("renew_scheduler_heartbeat failed (owner=%s) — "
                               "failing OPEN (assuming ownership still held)", owner_id)
         return True
 
@@ -578,17 +529,16 @@ def release_scheduler_lock(owner_id: str) -> None:
     the full staleness window before reacquiring. Best-effort — if this
     fails, the lock simply goes stale on its own after
     _SCHEDULER_HEARTBEAT_STALE_AFTER_SECS."""
-    client = _client()
-    if client is None:
+    if not db.is_available():
         return
     try:
-        client.rpc("release_scheduler_lock", {"p_owner": owner_id}).execute()
+        db.call_function("release_scheduler_lock", {"p_owner": owner_id})
         logger.info("[system_state] scheduler ownership lock released (owner=%s)", owner_id)
     except Exception as exc:
         if _is_missing_function_error(exc):
             _log_migration_required_once("release_scheduler_lock", "release_scheduler_lock")
         else:
-            logger.exception("release_scheduler_lock RPC failed (owner=%s) — non-fatal, "
+            logger.exception("release_scheduler_lock failed (owner=%s) — non-fatal, "
                               "lock will go stale naturally", owner_id)
 
 
@@ -616,7 +566,7 @@ class SchedulerHeartbeatThread(threading.Thread):
                     "another process reclaimed it, most likely because this "
                     "process's heartbeat went stale (paused >%ss, e.g. a long "
                     "GC pause or debugger break). Stopping to avoid a "
-                    "double-scan against the same Supabase project.",
+                    "double-scan against the same database project.",
                     self.owner_id, _SCHEDULER_HEARTBEAT_STALE_AFTER_SECS,
                 )
                 self.lost_ownership.set()
@@ -636,8 +586,10 @@ def start_scheduler_heartbeat(owner_id: str) -> SchedulerHeartbeatThread:
 
 
 # ─── SCHEMA ─────────────────────────────────────────────────────────────
-# Run ONCE in Supabase → SQL Editor. Safe to re-run (IF NOT EXISTS /
-# CREATE OR REPLACE).
+# Run ONCE against Neon (psql or the Neon SQL Editor). Safe to re-run
+# (IF NOT EXISTS / CREATE OR REPLACE). UNCHANGED from the Supabase
+# version — plain Postgres DDL/plpgsql, no Supabase-specific SQL ever
+# lived here.
 
 SCHEMA_SQL = """
 -- Single source of truth for execution mode (2026-07-23). One row,
@@ -707,7 +659,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- ── Scheduler ownership lock RPCs [Architecture review C3 fix, 2026-07-25] ──
+-- ── Scheduler ownership lock functions [Architecture review C3 fix, 2026-07-25] ──
 -- Same atomic-in-Postgres pattern as the backtest lock above, applied to
 -- coordinating scheduler/scan_worker.py vs utils.inprocess_scheduler so
 -- at most one process ever runs the scan loops against this project.

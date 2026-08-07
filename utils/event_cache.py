@@ -1,5 +1,6 @@
 """
 utils/event_cache.py — DORE Event Intelligence: Cache layer
+[Neon migration, 2026-08]
 ─────────────────────────────────────────────────────────────────────
 Layer 2 of 4:
 
@@ -24,13 +25,12 @@ the exact bug class that made the original DORE Stage 4c gate inert):
     event" on a dashboard) can tolerate staleness as long as it's
     visibly labelled stale — that's what `staleness_report()` is for.
 
-Persistence: Supabase, via the same get_client() helper the rest of
-this codebase already uses (utils/supabase_client.py), so a restart
-doesn't silently forget upcoming events. If Supabase is unavailable
-(get_client() returns None — no secrets configured), the cache falls
-back to in-memory-only and marks itself perpetually stale, which is
-the correct fail-closed behaviour rather than pretending persistence
-succeeded.
+Persistence: Neon (Postgres), via utils.db — utils/db.py's connection
+pool — so a restart doesn't silently forget upcoming events. If Neon is
+unavailable (db.is_available() returns False — NEON_DATABASE_URL not
+configured), the cache falls back to in-memory-only and marks itself
+perpetually stale, which is the correct fail-closed behaviour rather
+than pretending persistence succeeded.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from utils.event_providers import EventProvider, RawEvent
-from utils.supabase_client import get_client
+from utils import db
 
 logger = logging.getLogger(__name__)
 
@@ -149,15 +149,14 @@ class EventCache:
             self._provider.source_name, len(raw_events), len(by_symbol),
         )
 
-    # ── persistence (Supabase, best-effort) ────────────────────
+    # ── persistence (Neon, best-effort) ────────────────────────
 
     def _persist(self, raw_events: list[RawEvent]) -> None:
-        client = get_client()
-        if client is None:
-            # No Supabase configured — in-memory only for this
-            # session. Not fatal, but worth knowing about, since a
-            # restart will lose everything until the next refresh().
-            logger.debug("[EventCache:%s] no Supabase client — persistence skipped", self._provider.source_name)
+        if not db.is_available():
+            # No Neon configured — in-memory only for this session.
+            # Not fatal, but worth knowing about, since a restart will
+            # lose everything until the next refresh().
+            logger.debug("[EventCache:%s] no Neon connection — persistence skipped", self._provider.source_name)
             return
         try:
             rows = [
@@ -173,13 +172,12 @@ class EventCache:
             ]
             for i in range(0, len(rows), 200):
                 batch = rows[i:i + 200]
-                (
-                    client.table("dore_event_cache")
-                    .upsert(batch, on_conflict="symbol,event_date,raw_type,source_name")
-                    .execute()
+                db.upsert_rows(
+                    "dore_event_cache", batch,
+                    conflict_cols=["symbol", "event_date", "raw_type", "source_name"],
                 )
         except Exception as exc:
-            logger.error("[EventCache:%s] Supabase persist failed: %s", self._provider.source_name, exc)
+            logger.error("[EventCache:%s] Neon persist failed: %s", self._provider.source_name, exc)
 
     def load_from_persistence(self) -> None:
         """Session-startup hydration so a fresh process isn't
@@ -188,19 +186,15 @@ class EventCache:
         this only seeds `_events_by_symbol`, it does NOT set
         `_last_fetch` to "now", since the persisted `fetched_at` is
         the true freshness signal."""
-        client = get_client()
-        if client is None:
+        if not db.is_available():
             return
         try:
-            resp = (
-                client.table("dore_event_cache")
-                .select("*")
-                .eq("source_name", self._provider.source_name)
-                .execute()
+            rows = db.fetch_all(
+                "SELECT * FROM dore_event_cache WHERE source_name = %s",
+                (self._provider.source_name,),
             )
-            rows = resp.data or []
         except Exception as exc:
-            logger.error("[EventCache:%s] Supabase load failed: %s", self._provider.source_name, exc)
+            logger.error("[EventCache:%s] Neon load failed: %s", self._provider.source_name, exc)
             return
 
         if not rows:
@@ -211,13 +205,15 @@ class EventCache:
         for row in rows:
             ev = RawEvent(
                 symbol=row["symbol"],
-                event_date=date.fromisoformat(row["event_date"]),
+                event_date=date.fromisoformat(str(row["event_date"])),
                 raw_type=row["raw_type"],
                 raw_text=row.get("raw_text", ""),
                 source_name=row["source_name"],
             )
             by_symbol.setdefault(ev.symbol, []).append(ev)
-            fetched_at = datetime.fromisoformat(row["fetched_at"])
+            fetched_at = row["fetched_at"]
+            if isinstance(fetched_at, str):
+                fetched_at = datetime.fromisoformat(fetched_at)
             if latest_fetch is None or fetched_at > latest_fetch:
                 latest_fetch = fetched_at
 
@@ -238,7 +234,7 @@ class EventCache:
 
 
 SCHEMA_SQL = """
--- Run once in Supabase → SQL Editor
+-- Run once against Neon (psql or the Neon SQL Editor)
 create table if not exists dore_event_cache (
     id           bigint generated always as identity primary key,
     symbol       text not null,
