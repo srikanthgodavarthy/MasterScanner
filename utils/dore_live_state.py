@@ -303,6 +303,14 @@ def refresh_dore_live_state(cfg=None) -> dict:
             "direction": db_plan.direction,
             "expiry": db_plan.expiry,
             "primary": {"strike": db_plan.strike},
+            # [2026-08-10 fix] db_plan.source is set once at mint time from
+            # the OptionTradePlan.source that produced this entry (PB/LS —
+            # see DoreOptionsPlan.source's docstring) but this dict was
+            # never copying it over, so every carried-forward row (an OPEN
+            # plan Stage 1 didn't reproduce this cycle) showed a blank "—"
+            # Source badge in the Live Scan table even though the plan's
+            # true origin was known and sitting right there on db_plan.
+            "source": db_plan.source or None,
             "stop_loss": db_plan.sl_locked,
             "target1": db_plan.target1_locked,
             "target2": db_plan.target2_locked,
