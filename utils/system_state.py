@@ -560,6 +560,24 @@ def release_scheduler_lock(owner_id: str) -> None:
                               "lock will go stale naturally", owner_id)
 
 
+def _scheduler_heartbeat_gate_open() -> bool:
+    """
+    [2026-08-07] Market-hours gate for SchedulerHeartbeatThread — see its
+    class docstring. Deliberately checks utils.time_utils.is_market_hours_ist()
+    directly rather than calling should_scheduler_run(): should_scheduler_run()
+    also carries LIVE/BACKTEST/MAINTENANCE mode self-heal logic keyed off a
+    DIFFERENT field (system_state.heartbeat_at) than the one this class
+    renews (scheduler_owner_heartbeat_at) — reusing it here would conflate
+    two unrelated locks and could trigger _force_reset_to_live() as a side
+    effect of a plain heartbeat tick. Same MARKET_HOURS_GATE_ENABLED escape
+    hatch applies, for consistency with should_scheduler_run().
+    """
+    if os.environ.get("MARKET_HOURS_GATE_ENABLED", "1") != "0":
+        from utils.time_utils import is_market_hours_ist
+        return is_market_hours_ist()
+    return True
+
+
 class SchedulerHeartbeatThread(threading.Thread):
     """
     Background thread that renews a held scheduler-ownership lock every
@@ -569,6 +587,29 @@ class SchedulerHeartbeatThread(threading.Thread):
     should check `lost_ownership.is_set()` at their own cycle
     boundaries (alongside should_scheduler_run()) and stop running if
     it's set, to avoid two processes both scanning at once.
+
+    [2026-08-07] Market-hours gate: outside is_market_hours_ist(), this
+    thread skips the DB write entirely instead of renewing — renewing
+    24/7 independent of should_scheduler_run() was the actual reason the
+    Neon compute endpoint stayed active nights/weekends even after every
+    scan loop itself started respecting market hours (this thread was the
+    only thing still hitting the DB on the old schedule). It does NOT stop
+    or release the lock while paused, it just stops writing:
+      - try_acquire_scheduler_lock's SQL treats "already owned by
+        p_owner" as an unconditional match (no staleness check), and
+        renew_scheduler_heartbeat's WHERE clause only checks current
+        ownership, not staleness either — so as long as nobody else
+        claims the lock while we're quiet, this same owner_id resumes
+        renewing for free the moment market hours return, no re-acquire
+        needed, regardless of how stale the timestamp got overnight.
+      - If another process DOES steal the lock while we're quiet (e.g. a
+        redeploy/restart during the gap, whose own
+        acquire_scheduler_lock_blocking() sees our heartbeat as stale >
+        _SCHEDULER_HEARTBEAT_STALE_AFTER_SECS and legitimately takes
+        over), our next renewal attempt after market hours resume will
+        correctly fail and set lost_ownership — that's the intended
+        C3 recovery path working as designed, not something this gate
+        should try to prevent.
     """
     def __init__(self, owner_id: str):
         super().__init__(name="scheduler-ownership-heartbeat", daemon=True)
@@ -578,6 +619,8 @@ class SchedulerHeartbeatThread(threading.Thread):
 
     def run(self):
         while not self._stop.wait(_SCHEDULER_HEARTBEAT_INTERVAL_SECS):
+            if not _scheduler_heartbeat_gate_open():
+                continue
             if not renew_scheduler_heartbeat(self.owner_id):
                 logger.error(
                     "[system_state] scheduler ownership lock LOST (owner=%s) — "
