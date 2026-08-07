@@ -616,11 +616,31 @@ class SchedulerHeartbeatThread(threading.Thread):
         self.owner_id = owner_id
         self.lost_ownership = threading.Event()
         self._stop = threading.Event()
+        # Tracks which side of the gate we logged last, so run() logs only
+        # on the open<->closed transition (once per market close/open)
+        # instead of every _SCHEDULER_HEARTBEAT_INTERVAL_SECS tick.
+        self._gate_was_open = True
 
     def run(self):
         while not self._stop.wait(_SCHEDULER_HEARTBEAT_INTERVAL_SECS):
             if not _scheduler_heartbeat_gate_open():
+                if self._gate_was_open:
+                    logger.info(
+                        "[system_state] scheduler ownership heartbeat PAUSED "
+                        "(owner=%s) — outside market hours, holding the lock "
+                        "passively without writing to Neon. Resumes "
+                        "automatically when market hours return.",
+                        self.owner_id,
+                    )
+                    self._gate_was_open = False
                 continue
+            if not self._gate_was_open:
+                logger.info(
+                    "[system_state] scheduler ownership heartbeat RESUMED "
+                    "(owner=%s) — market hours started, renewing normally again.",
+                    self.owner_id,
+                )
+                self._gate_was_open = True
             if not renew_scheduler_heartbeat(self.owner_id):
                 logger.error(
                     "[system_state] scheduler ownership lock LOST (owner=%s) — "
