@@ -3305,17 +3305,29 @@ def render(settings: dict | None = None):
 
     sector_history = pd.DataFrame()
     if not df_aug.empty:
-        try:
-            # Use the scan's own date (parsed from run_at), not "today" —
-            # if the Dashboard is showing a stale scan (see the staleness
-            # banner above), the sector snapshot should be dated to when
-            # that data actually came from, not to whenever it happened
-            # to be viewed.
-            _scan_date = pd.to_datetime(run_at).tz_convert(_IST).date() if run_at else today_ist()
-            save_sector_snapshot(build_sector_snapshot_rows(sector_stats, _scan_date))
-        except Exception:
-            logger.exception("Sector Rotation persistence (save) failed (non-fatal — "
-                              "panel falls back to single-day figures)")
+        # [2026-08-07] Market-hours gate: this write is a page-render side
+        # effect, not a scheduler loop, so it was never covered by
+        # should_scheduler_run() — a browser tab left open (or simply
+        # reloaded) after-hours kept writing to Neon on every render
+        # regardless of the scheduler-side fix. live_scanner itself is
+        # already paused outside market hours, so df_aug/run_at are stale
+        # by definition here anyway; skip the write and let the panel fall
+        # back to sector_history (loaded below, unconditionally, so the
+        # page itself still renders normally after-hours) rather than
+        # persisting a snapshot dated to a scan that's hours old.
+        from utils.time_utils import is_market_hours_ist
+        if is_market_hours_ist():
+            try:
+                # Use the scan's own date (parsed from run_at), not "today" —
+                # if the Dashboard is showing a stale scan (see the staleness
+                # banner above), the sector snapshot should be dated to when
+                # that data actually came from, not to whenever it happened
+                # to be viewed.
+                _scan_date = pd.to_datetime(run_at).tz_convert(_IST).date() if run_at else today_ist()
+                save_sector_snapshot(build_sector_snapshot_rows(sector_stats, _scan_date))
+            except Exception:
+                logger.exception("Sector Rotation persistence (save) failed (non-fatal — "
+                                  "panel falls back to single-day figures)")
     try:
         sector_history = load_sector_snapshot_history(days=60)
     except Exception:

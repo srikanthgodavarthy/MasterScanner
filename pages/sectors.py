@@ -486,12 +486,20 @@ def render(settings: dict | None = None) -> None:
     from utils.sector_rotation import build_sector_snapshot_rows
 
     sector_history = pd.DataFrame()
-    try:
-        _scan_date = pd.to_datetime(run_at).tz_convert(_IST).date() if run_at else today_ist()
-        save_sector_snapshot(build_sector_snapshot_rows(sector_stats, _scan_date))
-    except Exception:
-        logger.exception("Sector Rotation persistence (save) failed (non-fatal — "
-                          "panel falls back to single-day figures)")
+    # [2026-08-07] Market-hours gate — see pages/dashboard.py's matching
+    # save_sector_snapshot() call for the full rationale: this write is a
+    # page-render side effect (not a scheduler loop), so should_scheduler_run()
+    # never covered it. Skip the write after-hours; sector_history (loaded
+    # below, unconditionally) still lets this panel render from the last
+    # persisted snapshot.
+    from utils.time_utils import is_market_hours_ist
+    if is_market_hours_ist():
+        try:
+            _scan_date = pd.to_datetime(run_at).tz_convert(_IST).date() if run_at else today_ist()
+            save_sector_snapshot(build_sector_snapshot_rows(sector_stats, _scan_date))
+        except Exception:
+            logger.exception("Sector Rotation persistence (save) failed (non-fatal — "
+                              "panel falls back to single-day figures)")
     try:
         sector_history = load_sector_snapshot_history(days=60)
     except Exception:

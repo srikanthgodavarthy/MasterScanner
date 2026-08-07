@@ -193,6 +193,14 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
     from utils.scan_health_monitor import check_health
 
     logger.info("[%s] loop starting, every %ss", name, interval_secs)
+    # [2026-08-07] Edge-triggered (not per-tick) info log for the
+    # should_scheduler_run() gate — the gate is re-checked every 5s while
+    # paused, so logging every check at info would spam ~17k lines/day
+    # during a full market-closed stretch. This logs once on the
+    # paused<->resumed transition instead, so a market-hours (or
+    # backtest/maintenance) pause is actually visible in deploy logs
+    # without drowning them.
+    was_paused = False
     while True:
         if owner_event is not None and owner_event.is_set():
             logger.error("[%s] scheduler ownership lock lost — stopping this loop", name)
@@ -201,9 +209,16 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
         started = time.time()
 
         if not should_scheduler_run():
+            if not was_paused:
+                logger.info("[%s] system_state paused (backtest/maintenance/market-hours) — "
+                            "skipping cycles until it resumes", name)
+                was_paused = True
             logger.debug("[%s] system_state is paused (backtest/maintenance) — skipping this tick", name)
             time.sleep(5)
             continue
+        if was_paused:
+            logger.info("[%s] system_state resumed — running cycles normally again", name)
+            was_paused = False
 
         health = check_health(name)
         if health.action == "skip_cycle":
@@ -519,15 +534,25 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
 
     merged: dict = {}   # symbol -> latest scored row dict, carried across cycles
 
+    # [2026-08-07] Same edge-triggered-logging reasoning as _run_loop above.
+    was_paused = False
+
     while True:
         if owner_event is not None and owner_event.is_set():
             logger.error("[live_scanner] scheduler ownership lock lost — stopping this loop")
             return
 
         if not should_scheduler_run():
+            if not was_paused:
+                logger.info("[live_scanner] system_state paused (backtest/maintenance/market-hours) — "
+                            "skipping cycles until it resumes")
+                was_paused = True
             logger.debug("[live_scanner] system_state is paused (backtest/maintenance) — skipping this cycle")
             time.sleep(5)
             continue
+        if was_paused:
+            logger.info("[live_scanner] system_state resumed — running cycles normally again")
+            was_paused = False
 
         effective_cooldown = batch_cooldown_secs
         if health_checks:
