@@ -415,24 +415,57 @@ def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
                          owner_event: "threading.Event | None" = None):
     """
     Periodically prunes all three snapshot tables down to their most
-    recent RETENTION_KEEP_ROWS rows. Deliberately does NOT check
-    should_scheduler_run() — pruning old rows is unrelated to (and much
-    cheaper than) the actual scan compute that function pauses for
-    during a backtest, so there's no reason to also pause this. DOES
-    respect owner_event / the scheduler ownership lock, same as every
-    other loop here — only the process that currently owns the
-    scheduler lock should be the one pruning, even though a redundant
-    prune from a second process wouldn't itself be harmful (it would
-    just be wasted work, same as any other duplicated job).
+    recent RETENTION_KEEP_ROWS rows.
+
+    [2026-08-08 Neon compute-hour fix] Used to deliberately skip the
+    should_scheduler_run() gate entirely — the original reasoning was
+    that pruning is cheap and unrelated to the backtest/maintenance
+    pause, so there was no reason to also pause it for THAT. But this
+    loop's own hourly tick (RETENTION_INTERVAL_SECS = 3600) was, on
+    its own, enough to wake a scale-to-zero Neon compute endpoint every
+    single hour, 24/7 — including nights and weekends when every OTHER
+    loop here was already correctly paused by the market-hours gate
+    (see should_scheduler_run()'s 2026-08-07 note, utils/system_state.py).
+    Confirmed against a live deployment's Neon "System operations" log:
+    a start/suspend pair every hour, on the hour, with zero market
+    activity behind most of them.
+
+    Now respects the same gate as every other loop. Rows only
+    accumulate while a scan is actually writing snapshots — which only
+    happens during market hours anyway — so skipping prune cycles while
+    paused doesn't let anything grow unboundedly; the next in-market-hours
+    tick just prunes whatever built up since the last one ran. Still
+    DOES respect owner_event / the scheduler ownership lock, same as
+    every other loop here.
     """
     from utils.scan_state import prune_all_snapshots
     from utils.supabase_client import prune_scan_snapshot_tables, prune_oi_and_premium_history
+    from utils.system_state import should_scheduler_run
 
     logger.info("[retention] loop starting, every %ss", interval_secs)
+    was_paused = False
     while True:
         if owner_event is not None and owner_event.is_set():
             logger.error("[retention] scheduler ownership lock lost — stopping this loop")
             return
+
+        if not should_scheduler_run():
+            if not was_paused:
+                logger.info("[retention] system_state paused (backtest/maintenance/market-hours) — "
+                            "skipping prune cycles until it resumes")
+                was_paused = True
+            # Coarser poll than the 5s used by _run_loop/_run_live_scanner_loop
+            # on purpose — pruning has no freshness requirement, so there's no
+            # benefit to noticing "market just opened" within 5s the way a
+            # live scan does. 60s keeps this thread's own idle-CPU footprint
+            # negligible without adding any meaningful delay to the first
+            # post-open prune.
+            time.sleep(60)
+            continue
+        if was_paused:
+            logger.info("[retention] system_state resumed — running prune cycles normally again")
+            was_paused = False
+
         try:
             results = prune_all_snapshots()
             # [Ops fix, 2026-07-25] scan_snapshots/scan_daily_archive
