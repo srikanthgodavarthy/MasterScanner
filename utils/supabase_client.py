@@ -1742,6 +1742,21 @@ UPDATE setup_plans SET closed_at = invalidated_date::timestamptz
   WHERE closed_at IS NULL AND invalidated_date IS NOT NULL;
 """
 
+LIFECYCLE_TRANSITIONS_MIGRATION_SQL = """
+-- [2026-08-10] utils.lifecycle_engine.detect_transitions() has built
+-- delta/from_leadership/to_leadership/from_category/to_category into
+-- every transition dict for a while, but the base CREATE TABLE above
+-- (a no-op on an already-deployed table) was never followed by a
+-- matching ALTER TABLE — so every save_lifecycle_transitions() call hit
+-- 'column "delta" of relation "lifecycle_transitions" does not exist'
+-- in production. Run this once against the live DB to close the gap.
+ALTER TABLE lifecycle_transitions ADD COLUMN IF NOT EXISTS delta           integer NOT NULL DEFAULT 0;
+ALTER TABLE lifecycle_transitions ADD COLUMN IF NOT EXISTS from_leadership integer NOT NULL DEFAULT 0;
+ALTER TABLE lifecycle_transitions ADD COLUMN IF NOT EXISTS to_leadership   integer NOT NULL DEFAULT 0;
+ALTER TABLE lifecycle_transitions ADD COLUMN IF NOT EXISTS from_category   text    NOT NULL DEFAULT '';
+ALTER TABLE lifecycle_transitions ADD COLUMN IF NOT EXISTS to_category     text    NOT NULL DEFAULT '';
+"""
+
 SCHEMA_SQL += """
 -- 8b. Portfolio Positions
 CREATE TABLE IF NOT EXISTS portfolio_positions (
