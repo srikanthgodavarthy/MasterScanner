@@ -134,8 +134,28 @@ def _entry_trigger_status(current_premium: Optional[float], entry_zone) -> str:
 def _current_risk_reward(current_premium: Optional[float], stop_loss: Optional[float],
                           target1: Optional[float]) -> Optional[float]:
     """Unrealized RR from THIS tick's premium — distinct from the
-    technical plan's own (fixed, entry-time) risk_reward_ratio."""
+    technical plan's own (fixed, entry-time) risk_reward_ratio.
+
+    [2026-08-10 fix] stop_loss/target1 can arrive here as
+    decimal.Decimal rather than float — carried-forward plans (see
+    the "_carried_forward" block above) pull stop_loss/target1
+    straight off db_plan.sl_locked/target1_locked, i.e. whatever type
+    the DB driver deserializes a numeric column to (Decimal, typically),
+    while current_premium always comes from the live quote's "ltp"
+    field, a plain JSON float. float - Decimal raises TypeError, which
+    crashed refresh_dore_live_state for that symbol's whole row —
+    confirmed live against BAJAJFINSV, 2026-08-10. Explicit float()
+    coercion here makes this immune to whichever type the DB driver
+    hands back, without needing to chase every call site that builds
+    a "plan" dict.
+    """
     if current_premium is None or stop_loss is None or target1 is None:
+        return None
+    try:
+        current_premium = float(current_premium)
+        stop_loss = float(stop_loss)
+        target1 = float(target1)
+    except (TypeError, ValueError):
         return None
     risk = current_premium - stop_loss
     reward = target1 - current_premium
