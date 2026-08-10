@@ -49,6 +49,7 @@ between calls. On a transient hit, the dead connection is discarded
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import threading
@@ -60,15 +61,31 @@ logger = logging.getLogger(__name__)
 
 
 def json_safe(v):
-    """Recursively convert decimal.Decimal (psycopg2's return type for
-    Postgres `numeric` columns) to float, so a value round-tripped from a
-    DB read back into a jsonb payload (via psycopg2.extras.Json) doesn't
-    blow up json.dumps — stdlib json has no default encoder for Decimal.
+    """Recursively convert values psycopg2.extras.Json's underlying
+    json.dumps can't serialize into ones it can:
+      - decimal.Decimal (psycopg2's return type for Postgres `numeric`
+        columns) -> float, so a value round-tripped from a DB read back
+        into a jsonb payload doesn't blow up json.dumps — stdlib json
+        has no default encoder for Decimal.
+      - datetime.datetime / datetime.date -> ISO 8601 string, same
+        reasoning: any payload field that started life as a DB
+        timestamp column (e.g. entry_locked_at, expiry) or a bare
+        datetime.now() call is a live object at this point, not a
+        string, and stdlib json has no default encoder for it either.
     [2026-08] Post-Neon-migration: the old Supabase/PostgREST client
-    returned plain floats over JSON, so this never came up before.
+    serialized both these types to plain JSON-safe values over HTTP
+    before this code ever saw them, so neither case came up before.
+    [2026-08-10 fix] The datetime branch was missing entirely until a
+    live TypeError: Object of type datetime is not JSON serializable
+    took down dore_technical_plans' save_snapshot every cycle — see
+    utils/scan_state.py's save_snapshot() docstring for the Decimal
+    case this function already handled; datetime needed the same
+    treatment and hadn't gotten it.
     Call this on any dict/list headed into psycopg2.extras.Json(...)."""
     if isinstance(v, Decimal):
         return float(v)
+    if isinstance(v, (datetime.datetime, datetime.date)):
+        return v.isoformat()
     if isinstance(v, dict):
         return {k: json_safe(vv) for k, vv in v.items()}
     if isinstance(v, (list, tuple)):
