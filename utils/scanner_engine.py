@@ -2267,7 +2267,7 @@ def run_scanner(
     # ── Setup Persistence (frozen trade plans) ────────────────────
     # Entry / SL / Targets are LOCKED on first Actionable detection.
     # Subsequent scans READ frozen levels — no daily drift.
-    df_out = _enrich_with_setup_persistence(df_out, all_data)
+    df_out = _enrich_with_setup_persistence(df_out, all_data, fetch_source=fetch_source)
 
     return df_out
 
@@ -2275,6 +2275,7 @@ def run_scanner(
 def _enrich_with_setup_persistence(
     df_out: pd.DataFrame,
     all_data: dict | None = None,
+    fetch_source: str = "yfinance",
 ) -> pd.DataFrame:
     """
     Load existing setup plans from Supabase, enrich the scanner DataFrame
@@ -2385,10 +2386,51 @@ def _enrich_with_setup_persistence(
             if sym not in scanned_syms and plan is not None and plan.is_open()
         ]
         recovered_count = 0
-        if orphaned_syms and all_data:
+        if orphaned_syms:
             from utils.setup_persistence import enrich_scanner_row
+
+            # [Fix, 2026-08-11] `all_data` here is scoped to THIS single
+            # call — e.g. one ~50-symbol batch of scheduler/scan_worker.py's
+            # live_scanner sub-scheduler, not the full universe. An
+            # orphaned symbol is (by definition) NOT in this batch, so
+            # all_data.get(sym) was structurally always None for every
+            # orphaned symbol in the batched path — this recovery pass
+            # never actually recovered anything there (confirmed live:
+            # advanced_with_available_price_data=0 on every batch,
+            # every cycle). utils.history_store.get_live_history_cached()
+            # is a process-wide RAM cache that accumulates across batches
+            # (and across cycles, refreshed once/day) via the same
+            # get_live_history_cached()/update_live_cache() calls
+            # run_scanner() already makes — so for any orphaned symbol
+            # not in THIS batch's all_data, fall back to that shared
+            # cache instead of giving up. Falls back to yfinance for
+            # anything Upstox doesn't have cached, mirroring the
+            # primary/fallback pattern the main fetch loop above uses.
+            recovery_cache: dict = {}
+            missing_from_all_data = [s for s in orphaned_syms if all_data is None or s not in all_data]
+            if missing_from_all_data:
+                from utils.history_store import get_live_history_cached
+                try:
+                    recovery_cache = get_live_history_cached(
+                        missing_from_all_data, years=1.0, min_bars=0, source=fetch_source,
+                    )
+                except Exception:
+                    _logger.exception("[SETUP PLAN RECOVERY] get_live_history_cached(%s) failed — "
+                                       "non-fatal, falling back to no price data for these symbols", fetch_source)
+                    recovery_cache = {}
+                still_missing = [s for s in missing_from_all_data if s not in recovery_cache]
+                if still_missing and fetch_source != "yfinance":
+                    try:
+                        recovery_cache.update(get_live_history_cached(
+                            still_missing, years=1.0, min_bars=0, source="yfinance",
+                        ))
+                    except Exception:
+                        _logger.exception("[SETUP PLAN RECOVERY] yfinance fallback fetch failed — non-fatal")
+
             for sym in orphaned_syms:
-                bar_df = all_data.get(sym)
+                bar_df = (all_data or {}).get(sym)
+                if bar_df is None or bar_df.empty:
+                    bar_df = recovery_cache.get(sym)
                 if bar_df is None or bar_df.empty:
                     continue   # genuinely no price data anywhere — nothing to advance against
                 try:
