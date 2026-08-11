@@ -96,7 +96,41 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Optional
 
+from utils.plan_validation import DORE_PLAN_REQUIRED_FIELDS, validate_single_plan
+from utils.entry_snapshot import build_dore_entry_snapshot, save_dore_entry_snapshot
+from utils.outcome_tracking import record_final_outcome
+
 logger = logging.getLogger(__name__)
+
+
+def _final_outcome_for_closed_reason(closed_reason: str) -> str:
+    """[2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #3] Best-effort mapping
+    from this module's free-text closed_reason onto the audit's fixed
+    outcome vocabulary. 'Superseded'/'Retired' closes are a systemic
+    replacement, not a trader-initiated exit — mapped to MANUAL_EXIT as
+    the closest existing bucket rather than inventing a new one outside
+    the audit's list; the full closed_reason string is still visible on
+    the dore_options_plans row itself for anyone who needs the exact
+    cause."""
+    r = (closed_reason or "").lower()
+    if "expired" in r:
+        return "EXPIRED"
+    if "max holding period" in r:
+        return "TIMEOUT"
+    if "superseded" in r or "retired" in r:
+        return "MANUAL_EXIT"
+    return "MANUAL_EXIT"
+
+
+def _record_dore_final_outcome(plan: "DoreOptionsPlan") -> None:
+    try:
+        record_final_outcome(
+            plan_key=plan.plan_id, source="DORE", symbol=plan.symbol,
+            final_outcome=_final_outcome_for_closed_reason(plan.closed_reason),
+            closed_at=plan.closed_at,
+        )
+    except Exception:
+        logger.exception("[dore_options_persistence] record_final_outcome failed for plan_id=%s", plan.plan_id)
 
 # [2026-08-04, SG request] Every OPEN locked plan auto-closes once it's
 # been open this many calendar days, full stop — regardless of whether
@@ -504,6 +538,7 @@ def enrich_trade_plans_with_persistence(
                         )
                         updated_plans.append(dup)
                         open_now.pop(dup.contract_key, None)
+                        _record_dore_final_outcome(dup)
                     else:
                         row["blocked_reason"] = "Existing open plan on this symbol/direction hasn't hit T1 yet"
                         enriched_rows.append(row)
@@ -528,6 +563,7 @@ def enrich_trade_plans_with_persistence(
                         )
                         updated_plans.append(weakest_plan)
                         open_now.pop(weakest_key, None)
+                        _record_dore_final_outcome(weakest_plan)
                     else:
                         row["blocked_reason"] = f"Portfolio full ({MAX_ACTIVE_DORE_OPTIONS_PLANS} active) — no materially weaker plan to replace"
                         enriched_rows.append(row)
@@ -580,6 +616,7 @@ def enrich_trade_plans_with_persistence(
                 locked.closed_at = _now_iso()
                 locked.closed_reason = f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS}d)"
                 updated_plans.append(locked)
+                _record_dore_final_outcome(locked)
                 enriched_rows.append(p.to_dict())   # still shown this cycle as a fresh recommendation, just no longer a tracked Active Plan
                 continue
 
@@ -614,6 +651,34 @@ def enrich_trade_plans_with_persistence(
             row["plan_created_date"] = locked.created_date
             row["plan_age_days"]     = _compute_days_active(locked.created_date)
             row["plan_status_label"] = _plan_status_label(row["plan_age_days"], locked.created_date, just_minted, locked.created_at)
+
+            # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #1] Plan-bearing row
+            # (an entry has just been locked/refreshed) — validate before
+            # this contract's DoreOptionsPlan is allowed into the batch
+            # that upsert_dore_options_plans_batch() persists. A row that
+            # fails stays in `enriched_rows` (still visible in the Live
+            # Scan table, tagged _quarantined) but its `locked` plan is
+            # dropped from `updated_plans` this cycle rather than being
+            # upserted with NaN/inf silently nulled — see
+            # utils.plan_validation's module docstring for why
+            # json_sanitize alone isn't an acceptable gate here.
+            if not validate_single_plan(row, DORE_PLAN_REQUIRED_FIELDS,
+                                         source="dore_options_persistence", symbol_field="symbol"):
+                if just_minted:
+                    open_now.pop(key, None)
+                if locked in updated_plans:
+                    updated_plans.remove(locked)
+                enriched_rows.append(row)
+                continue
+
+            if just_minted:
+                try:
+                    snapshot = build_dore_entry_snapshot(row, locked.plan_id, symbol)
+                    save_dore_entry_snapshot(snapshot)
+                except Exception:
+                    logger.exception("[dore_options_persistence] entry-snapshot capture failed for plan_id=%s "
+                                      "(non-fatal — plan itself is still minted/persisted)", locked.plan_id)
+
             enriched_rows.append(row)
         except Exception:
             logger.exception("[dore_options_persistence] enrichment failed for one row — "
@@ -635,11 +700,13 @@ def enrich_trade_plans_with_persistence(
             plan.closed_at = _now_iso()
             plan.closed_reason = "Expired"
             updated_plans.append(plan)
+            _record_dore_final_outcome(plan)
         elif _is_stale_by_age(plan.created_date, today):
             plan.status = DoreOptionsPlanStatus.CLOSED
             plan.closed_at = _now_iso()
             plan.closed_reason = f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS}d)"
             updated_plans.append(plan)
+            _record_dore_final_outcome(plan)
 
     return enriched_rows, updated_plans
 

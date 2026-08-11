@@ -557,6 +557,15 @@ class DOREResult:
     reasons:  list = field(default_factory=list)
     warnings: list = field(default_factory=list)
 
+    # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P1 — Recommendation
+    # Explainability] Diagnostic-only overlay from utils.dore_explainability.
+    # Never fed back into opportunity_score/recommendation above — both are
+    # already final by the time these are computed. watch_quality is ""
+    # unless recommendation is WATCH_CE/WATCH_PE; waiting_for is "" unless
+    # recommendation is WATCH_CE/WATCH_PE/WAIT.
+    watch_quality: str = ""     # "WATCH_QUALIFIED" | "WATCH_WEAK" | ""
+    waiting_for:    str = ""     # "WAITING FOR: <primary missing condition>" | ""
+
     def as_dict(self) -> dict:
         d = asdict(self)
         # Back-compat aliases for callers/persisted rows still reading the
@@ -832,6 +841,15 @@ class OpportunityResult:
     opportunity_score: float
     recommendation: str
     reasons: tuple = ()
+    # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P1] True when this row was
+    # downgraded from BUY_CE_NOW/BUY_PE_NOW to WATCH_CE/WATCH_PE
+    # SPECIFICALLY by the premium-behaviour gate below (trend+execution
+    # already cleared the NOW bar; only premium timing didn't). Read-only
+    # signal for utils.dore_explainability's WATCH_QUALIFIED/WATCH_WEAK
+    # classification and "waiting for" reason — never influences
+    # opportunity_score or recommendation itself, both already final by
+    # the time this is set.
+    premium_gate_downgrade: bool = False
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1889,6 +1907,7 @@ def stage5_opportunity_engine(
     immediate-entry call) are deliberately left ungated here.
     """
     reasons: list[str] = []
+    premium_gate_downgrade = False
 
     # Ranking uses conviction (magnitude, direction-agnostic), not the
     # raw signed trend_score — see _trend_conviction()'s docstring for
@@ -1936,13 +1955,15 @@ def stage5_opportunity_engine(
                             f"{cfg.premium_behavior_score_gate:.0f} yet (not yet strengthening) — downgraded to "
                             f"{downgraded_to}")
             recommendation = downgraded_to
+            premium_gate_downgrade = True
 
         else:
             reasons.append(f"Composed from Directional Intent={directional_intent} x "
                            f"Execution State={execution_state} -> {recommendation}")
+            premium_gate_downgrade = False
 
     return OpportunityResult(opportunity_score=opportunity_score, recommendation=recommendation,
-                              reasons=tuple(reasons))
+                              reasons=tuple(reasons), premium_gate_downgrade=premium_gate_downgrade)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2352,6 +2373,21 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
                + list(oi_intel.reasons) + list(risk.reasons) + list(opportunity.reasons) + strike_reasons
                + list(trade_plan.reasons))
 
+    # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P1] Diagnostic-only overlay —
+    # see utils.dore_explainability's module docstring. Computed from the
+    # SAME stage outputs already built above; touches nothing upstream.
+    from utils.dore_explainability import classify_and_explain_watch
+    watch_explanation = classify_and_explain_watch(
+        cfg, opportunity.recommendation, opportunity.premium_gate_downgrade,
+        trend_conviction=_trend_conviction(effective_bias.blended_score),
+        execution_score=execution.execution_score,
+        derivative_confidence=deriv.confidence,
+        option_intelligence_score=oi_intel.score,
+        execution_reasons=execution.reasons,
+        derivative_reasons=deriv.reasons,
+        option_intelligence_reasons=oi_intel.reasons,
+    )
+
     result = DOREResult(
         recommendation=opportunity.recommendation,
         opportunity_score=round(opportunity.opportunity_score, 1),
@@ -2389,6 +2425,8 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         nearest_support=round(deriv.support, 2) if deriv.support else None,
         reasons=reasons,
         warnings=warnings,
+        watch_quality=watch_explanation.watch_quality,
+        waiting_for=watch_explanation.waiting_for,
     )
 
     return result

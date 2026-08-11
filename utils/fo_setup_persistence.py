@@ -737,7 +737,40 @@ def advance_fo_lifecycle(
             "[FO SETUP PLAN UPDATED] symbol=%s leg=%s id=%s new_status=%s reason=%s",
             plan.symbol, plan.leg, plan.setup_id, _sval(plan.status), last_reason,
         )
+        if plan.is_terminal():
+            _record_fo_final_outcome(plan, last_reason)
     return changed_any, last_reason
+
+
+# [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #3] Best-effort mapping from
+# _advance_step()'s free-text `reason` onto the audit's fixed outcome
+# vocabulary — same pattern/reasoning as
+# utils.setup_persistence._final_outcome_for_lifecycle_reason(). CLOSED
+# from T1_HIT (trailing-stop or T2) can't be told apart from a flat
+# SL_HIT before T1 by status alone, only by the reason string.
+def _final_outcome_for_fo_lifecycle_reason(status: str, reason: str) -> str:
+    r = (reason or "").lower()
+    if status == FOSetupPlanStatus.EXPIRED.value:
+        return "EXPIRED"
+    if "t2" in r or "final target" in r:
+        return "T2_HIT"
+    if "sl" in r or "stop" in r:
+        return "SL_HIT"
+    if "max holding" in r or "auto-closed" in r or "age" in r:
+        return "TIMEOUT"
+    return "MANUAL_EXIT"
+
+
+def _record_fo_final_outcome(plan: "FOSetupPlan", reason: str) -> None:
+    try:
+        from utils.outcome_tracking import record_final_outcome
+        record_final_outcome(
+            plan_key=plan.setup_id, source="DORE_STAGE5", symbol=plan.symbol,
+            final_outcome=_final_outcome_for_fo_lifecycle_reason(_sval(plan.status), reason),
+            closed_at=getattr(plan, "closed_at", None),
+        )
+    except Exception:
+        logger.exception("[fo_setup_persistence] record_final_outcome failed for setup_id=%s", plan.setup_id)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -791,6 +824,49 @@ def _create_fo_plan(row: dict, first_seen: str, today_str: str) -> Optional[FOSe
             "(row missing 'Expiry Date') — this plan's live-quote backfill will stay \"—\" until it "
             "closes and re-mints", symbol, leg, strike, expiry, setup_id,
         )
+
+    # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #1] Validate the frozen
+    # trade levels before this plan mints — same gate as
+    # utils.setup_persistence._create_plan(), applied to this pipeline's
+    # own field names. [Fix, this review round] Was warn-and-mint-anyway
+    # (tagged status_reason but still returned/persisted) — now actually
+    # rejects: returns None so this contract is skipped this cycle
+    # instead of a NaN/inf level entering fo_setup_plans, matching P0 #1
+    # ("Do not allow NaN or ±inf to enter the normal persisted
+    # trading-plan population"). Retried automatically next cycle once
+    # the underlying calc produces a clean number.
+    from utils.plan_validation import validate_plan_fields
+    _validation = validate_plan_fields(
+        {"entry_locked": plan.entry_locked, "sl_locked": plan.sl_locked,
+         "t1_locked": plan.t1_locked, "t2_locked": plan.t2_locked},
+        ["entry_locked", "sl_locked", "t1_locked", "t2_locked"],
+    )
+    if not _validation.is_valid:
+        logger.warning(
+            "[plan_validation] REJECTED plan-bearing row (source=fo_setup_persistence) for symbol=%s — "
+            "invalid numeric field(s): %s — plan NOT minted this cycle",
+            symbol, _validation.as_log_suffix(),
+        )
+        return None
+
+    # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #2] Validation passed —
+    # capture the immutable RFC-001 Stage 1-5 entry snapshot from the
+    # SAME row this plan was minted from. This is the actual "DORE"
+    # pipeline the audit's capture-field list (trend_score/execution_
+    # score/derivatives_score/option_intelligence_score/risk_score/
+    # opportunity_score/IV/OI/spread/delta/DTE/strike) describes — see
+    # utils.entry_snapshot.build_dore_stage5_entry_snapshot()'s
+    # docstring for why this is a separate table/function from
+    # build_dore_entry_snapshot() (which captures the OTHER DORE
+    # engine, utils.dore_options_engine, and does not have these
+    # pillar names).
+    try:
+        from utils.entry_snapshot import build_dore_stage5_entry_snapshot, save_dore_stage5_entry_snapshot
+        save_dore_stage5_entry_snapshot(build_dore_stage5_entry_snapshot(row, setup_id, symbol))
+    except Exception:
+        logger.exception("[fo_setup_persistence] Stage 1-5 entry-snapshot capture failed for setup_id=%s "
+                          "(non-fatal — plan itself is still minted)", setup_id)
+
     logger.info(
         "[FO SETUP PLAN CREATED] symbol=%s leg=%s strike=%.1f expiry=%s expiry_date=%s id=%s "
         "entry=%.2f sl=%.2f t1=%.2f",
@@ -960,6 +1036,30 @@ def enrich_fo_opportunities_df(
             else:  # WAITING
                 event_ts = plan.created_at
             row["Entry Timestamp"] = _to_ist_display(event_ts)
+
+            # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #3] Forward outcome
+            # tracking for the RFC-001 Stage 1-5 pipeline — separate
+            # `source` bucket ("DORE_STAGE5") from both Live Scanner and
+            # the other DORE engine (utils.dore_options_persistence's
+            # "DORE"), per the audit's "Live Scanner and DORE are
+            # separately identifiable" requirement, extended here to
+            # keep the two DORE engines from being conflated too.
+            # entry_premium is the frozen entry_locked level; underlying
+            # spot isn't tracked by FOSetupPlan itself, so MFE/MAE here
+            # is premium-only (the same instrument actually being traded).
+            if plan.entry_locked and plan.created_at:
+                try:
+                    from utils.outcome_tracking import update_forward_outcome
+                    update_forward_outcome(
+                        plan_key=plan.setup_id, source="DORE_STAGE5", symbol=plan.symbol,
+                        entry_timestamp=plan.created_at,
+                        entry_underlying=None, entry_premium=plan.entry_locked,
+                        current_underlying=None, current_premium=current_premium,
+                        direction=plan.leg,
+                    )
+                except Exception:
+                    logger.exception("[fo_setup_persistence] outcome-tracking update failed for setup_id=%s "
+                                      "(non-fatal)", plan.setup_id)
         else:
             row["Plan"] = None
             row["SetupID"] = None

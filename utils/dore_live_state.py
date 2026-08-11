@@ -390,6 +390,7 @@ def refresh_dore_live_state(cfg=None) -> dict:
     rows: list[dict] = []
     plan_views = []
     live_by_key = []
+    spot_by_key = []
     for plan in plans:
         try:
             key = (plan.get("symbol"), plan.get("direction"),
@@ -400,6 +401,7 @@ def refresh_dore_live_state(cfg=None) -> dict:
             view = _TechPlanView(plan, live.get("current_premium"))
             plan_views.append(view)
             live_by_key.append(live)
+            spot_by_key.append(spot)
         except Exception:
             logger.exception("[dore_live_state] live refresh failed for %s — row skipped", plan.get("symbol"))
 
@@ -416,10 +418,50 @@ def refresh_dore_live_state(cfg=None) -> dict:
         enriched_rows = [v.to_dict() for v in plan_views]
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    for row, live in zip(enriched_rows, live_by_key):
+    for row, live, spot in zip(enriched_rows, live_by_key, spot_by_key):
         row.update(live)
         row["last_refresh_timestamp"] = now_iso
         rows.append(row)
+
+        # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #3] Forward outcome
+        # tracking — only for plan-bearing rows (an entry has actually
+        # been locked; a fresh, not-yet-triggered Stage 1 candidate has
+        # nothing to track outcomes against yet). Non-fatal by design —
+        # see utils.outcome_tracking.update_forward_outcome()'s own
+        # try/except; never allowed to break this refresh cycle.
+        if row.get("entry_locked") and row.get("plan_created_at"):
+            try:
+                from utils.outcome_tracking import update_forward_outcome
+                update_forward_outcome(
+                    plan_key=row.get("plan_id") or f"{row.get('symbol')}|{row.get('direction')}|"
+                              f"{(row.get('primary') or {}).get('strike')}|{row.get('expiry')}",
+                    source="DORE",
+                    symbol=row.get("symbol") or "",
+                    entry_timestamp=row.get("plan_created_at"),
+                    entry_underlying=None,   # underlying spot isn't locked at entry today — see docstring below
+                    entry_premium=row.get("entry_locked"),
+                    current_underlying=spot,
+                    current_premium=row.get("current_premium"),
+                    direction=row.get("direction") or "",
+                )
+            except Exception:
+                logger.exception("[dore_live_state] outcome-tracking update failed for %s (non-fatal)",
+                                  row.get("symbol"))
+
+    # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #1] Plan-bearing-row
+    # validation gate — runs on the plain `rows` list (before the
+    # DataFrame/sanitize step below) so a rejected row can be excluded
+    # from what actually gets persisted while still being logged with
+    # its exact symbol/field and kept (tagged) for diagnostics. Only
+    # rows carrying a locked entry are plan-bearing; a fresh Stage 1
+    # candidate with no entry_locked yet is exempt by construction (see
+    # utils.plan_validation's module docstring — that's a structural
+    # absence, not a data-quality bug).
+    from utils.plan_validation import DORE_PLAN_REQUIRED_FIELDS, validate_and_quarantine_rows
+    rows, quarantined_rows = validate_and_quarantine_rows(
+        rows, DORE_PLAN_REQUIRED_FIELDS, source="dore_live_state",
+        is_plan_bearing=lambda r: bool(r.get("entry_locked")),
+    )
 
     df = pd.DataFrame(rows)
 
@@ -487,6 +529,17 @@ def refresh_dore_live_state(cfg=None) -> dict:
             "carried_forward_active_plans": carried_forward,
             "rows_produced": len(df),
             "last_refresh_timestamp": now_iso,
+            # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #1] Rows dropped
+            # from the persisted population this cycle for having
+            # NaN/inf in a required plan field — see
+            # utils.plan_validation. Kept visible here (count + the
+            # symbols/fields, not silently discarded) rather than
+            # folded into rows_produced.
+            "quarantined_plan_rows": len(quarantined_rows),
+            "quarantined_plan_details": [
+                {"symbol": r.get("symbol"), "reason": r.get("_quarantine_reason")}
+                for r in quarantined_rows
+            ],
         },
     }
 

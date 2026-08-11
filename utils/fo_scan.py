@@ -667,6 +667,14 @@ def compute_fo_opportunities(
             "LTP": row.get("price"),
             "Action": _action_tier(result.recommendation),
             "Recommendation": result.recommendation,
+            # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P1] Explainability
+            # overlay from utils.dore_explainability — "" unless
+            # Recommendation is WATCH_CE/WATCH_PE (Watch Quality) or
+            # WATCH_CE/WATCH_PE/WAIT (Waiting For). See utils.dore_engine's
+            # DOREResult docstring — purely descriptive, never fed back
+            # into Opportunity Score/Recommendation above.
+            "Watch Quality": result.watch_quality,
+            "Waiting For": result.waiting_for,
             "Leg": leg,
             "Strike": result.suggested_strike,
             "Premium": premium_now,
@@ -1213,8 +1221,39 @@ def compute_fo_scan(cfg: Optional[DORESettings] = None) -> dict:
     # Stage-3 option-chain diagnostics (see compute_fo_opportunities())
     # before that happens, not after, so a scheduler run that produced
     # zero actionable rows still surfaces WHY (rate-limited/failed
-    # counts) rather than just an empty "options" list.
+    # counts) rather than just an empty "options" list. Captured here,
+    # before the plan-validation gate below, since that gate may also
+    # rebuild options_df into a fresh frame that would drop .attrs too.
     option_chain_diagnostics = options_df.attrs.get("option_chain_diagnostics")
+
+    # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #1] Plan-bearing-row
+    # validation gate — a row only counts as plan-bearing once its
+    # Recommendation actually implies a trade plan (not NO_TRADE/WAIT);
+    # fresh candidates with no Entry/SL/T1/T2 are exempt by construction.
+    # Quarantined rows are excluded from the population handed to
+    # find_invalid_columns/sanitize_dataframe's downstream persistence
+    # path (utils.fo_setup_persistence) but kept — tagged — in a
+    # separate diagnostics bucket rather than silently dropped.
+    from utils.plan_validation import validate_and_quarantine_rows
+    options_records = options_df.to_dict("records") if not options_df.empty else []
+    options_records, quarantined_options_rows = validate_and_quarantine_rows(
+        options_records, ["Entry", "SL", "T1", "T2", "Premium %Chg"],
+        source="fo_scan.options", symbol_field="Symbol",
+        is_plan_bearing=lambda r: r.get("Recommendation") not in ("NO_TRADE", "WAIT", None),
+    )
+    if quarantined_options_rows:
+        import pandas as pd
+        options_df = pd.DataFrame(options_records) if options_records else options_df.iloc[0:0]
+
+    # [2026-08-10, DORE_LIVE_SCANNER_AUDIT — Required Diagnostics] DORE
+    # Stage 1-5 has no persisted per-contract plan to look back over
+    # (see utils.dore_diagnostics's module docstring) — the BUY_NOW /
+    # WATCH_QUALIFIED / WATCH_WEAK / NO_TRADE x CE/PE breakdown is
+    # therefore computed fresh from THIS cycle's rows, before sanitize
+    # nulls anything (breakdown only reads Recommendation/Leg/Watch
+    # Quality, none of which are ever NaN/inf).
+    from utils.dore_diagnostics import dore_stage5_recommendation_breakdown
+    recommendation_breakdown = dore_stage5_recommendation_breakdown(options_records)
 
     futures_df = sanitize_dataframe(futures_df, "fo_scan.futures")
     options_df = sanitize_dataframe(options_df, "fo_scan.options")
@@ -1223,4 +1262,13 @@ def compute_fo_scan(cfg: Optional[DORESettings] = None) -> dict:
         "futures": futures_df.to_dict("records") if not futures_df.empty else [],
         "options": options_df.to_dict("records") if not options_df.empty else [],
         "option_chain_diagnostics": option_chain_diagnostics or {},
+        # [2026-08-10, DORE_LIVE_SCANNER_AUDIT] Required Diagnostics +
+        # P0 #1 quarantine visibility — see utils.dore_diagnostics and
+        # utils.plan_validation.
+        "recommendation_breakdown": recommendation_breakdown,
+        "quarantined_options_rows": len(quarantined_options_rows),
+        "quarantined_options_details": [
+            {"symbol": r.get("Symbol"), "leg": r.get("Leg"), "reason": r.get("_quarantine_reason")}
+            for r in quarantined_options_rows
+        ],
     }

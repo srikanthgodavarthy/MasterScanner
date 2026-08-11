@@ -570,7 +570,44 @@ def advance_lifecycle(
         if plan.is_terminal():
             break
 
+    if changed_any and plan.is_terminal():
+        _record_live_scanner_final_outcome(plan, last_reason)
+
     return changed_any, last_reason
+
+
+# [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #3] Best-effort mapping from
+# _advance_lifecycle_step()'s free-text `reason` onto the audit's fixed
+# outcome vocabulary (T1_HIT/T2_HIT/SL_HIT/TIMEOUT/MANUAL_EXIT/EXPIRED).
+# A plan that reaches CLOSED can have gotten there via a T2 hit, a stop
+# on the remainder after T1, an age-out, or a flat stop before T1 ever
+# triggered — plan.status alone (just "CLOSED") can't tell those apart,
+# but the reason string _advance_lifecycle_step() already wrote can.
+def _final_outcome_for_lifecycle_reason(status: str, reason: str) -> str:
+    r = (reason or "").lower()
+    if status == str(SetupPlanStatus.EXPIRED.value):
+        return "EXPIRED"
+    if "final target t2 hit" in r:
+        return "T2_HIT"
+    if "stop" in r:
+        return "SL_HIT"
+    if "auto-closed" in r or "max holding period" in r:
+        return "TIMEOUT"
+    if "manual" in r:
+        return "MANUAL_EXIT"
+    return "MANUAL_EXIT"
+
+
+def _record_live_scanner_final_outcome(plan: "SetupPlan", reason: str) -> None:
+    try:
+        from utils.outcome_tracking import record_final_outcome
+        record_final_outcome(
+            plan_key=plan.setup_id, source="LIVE_SCANNER", symbol=plan.symbol,
+            final_outcome=_final_outcome_for_lifecycle_reason(_sval(plan.status), reason),
+            closed_at=plan.closed_at,
+        )
+    except Exception:
+        logger.exception("[setup_persistence] record_final_outcome failed for setup_id=%s", plan.setup_id)
 
 
 def close_plan_manually(plan: "SetupPlan", reason: str = "Manual exit") -> bool:
@@ -587,6 +624,7 @@ def close_plan_manually(plan: "SetupPlan", reason: str = "Manual exit") -> bool:
     plan.closed_at      = _now_iso()
     plan.invalidation_reason = reason
     plan.invalidated_date     = plan.closed_at[:10]
+    _record_live_scanner_final_outcome(plan, reason or "Manual exit")
     return True
 
 
@@ -600,7 +638,7 @@ def _create_plan(
     first_seen:    str,
     today_str:     str,
     source:        str = "LS",
-) -> "SetupPlan":
+) -> Optional["SetupPlan"]:
     """
     Mint a new frozen trade plan from the current scanner row.
     Called once when a stock first reaches Actionable / HC / Elite (source
@@ -610,6 +648,13 @@ def _create_plan(
     Trade Management hand-off, whichever path triggered it.
     The plan starts in WAITING; it is up to advance_lifecycle() on a
     *later* scan to decide if/when the entry has actually triggered.
+
+    Returns None — mints nothing — if the computed trade levels fail
+    the P0 #1 numeric validation gate (NaN/±inf in entry/SL/T1/T2/RR).
+    Callers must handle a None return (see enrich_scanner_row() below,
+    which already falls back to a NO_PLAN placeholder row whenever
+    _create_plan() doesn't return a plan — that fallback existed for the
+    "should_create was False" case and works identically here).
     """
     setup_id = _make_setup_id(symbol, today_str)
 
@@ -627,6 +672,28 @@ def _create_plan(
     t2    = float(scanner_row.get("T2",    0) or 0)
     t3    = float(scanner_row.get("T3",    0) or 0)
     recommendation = str(scanner_row.get("Recommendation", scanner_row.get("Category", "")))
+
+    # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #1] Validate the frozen
+    # trade levels BEFORE this plan is allowed to mint — a validation
+    # failure now actually rejects the plan (returns None) rather than
+    # minting it with a warning tacked on, which is what P0 #1 requires
+    # ("Do not allow NaN or ±inf to enter the normal persisted
+    # trading-plan population"). The scanner_row that produced the bad
+    # numbers is still logged with its exact symbol/field so the
+    # underlying calc bug stays traceable; the caller falls back to its
+    # existing NO_PLAN placeholder path (same as the "should_create was
+    # False" case) rather than needing any new handling.
+    from utils.plan_validation import LIVE_SCANNER_PLAN_REQUIRED_FIELDS, validate_plan_fields
+    _candidate_fields = {"entry_locked": entry, "sl_locked": sl, "t1_locked": t1,
+                         "t2_locked": t2, "locked_rr": float(scanner_row.get("RR", 0) or 0)}
+    _validation = validate_plan_fields(_candidate_fields, LIVE_SCANNER_PLAN_REQUIRED_FIELDS)
+    if not _validation.is_valid:
+        logger.warning(
+            "[plan_validation] REJECTED plan-bearing row (source=setup_persistence) for symbol=%s "
+            "setup_id=%s — invalid numeric field(s): %s — plan NOT minted this cycle",
+            symbol, setup_id, _validation.as_log_suffix(),
+        )
+        return None
 
     now_ts = _now_iso()
 
@@ -658,6 +725,20 @@ def _create_plan(
         created_at              = now_ts,
         source                 = source,
     )
+
+    # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #2] Numeric validation
+    # already passed (gate above, before this plan even minted) — capture
+    # the immutable entry snapshot from the SAME scanner_row in the same
+    # instant, so the snapshot and the locked levels can never drift
+    # apart. Non-fatal: a snapshot failure must never un-mint an
+    # otherwise-valid plan.
+    try:
+        from utils.entry_snapshot import build_live_scanner_entry_snapshot, save_live_scanner_entry_snapshot
+        save_live_scanner_entry_snapshot(build_live_scanner_entry_snapshot(scanner_row, setup_id, symbol))
+    except Exception:
+        logger.exception("[setup_persistence] entry-snapshot capture failed for setup_id=%s "
+                          "(non-fatal — plan itself is still minted)", setup_id)
+
     return plan
 
 
@@ -809,6 +890,24 @@ def enrich_scanner_row(
         )
     else:
         scanner_row["EntryDriftPct"] = 0.0
+
+    # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #3] Forward outcome
+    # tracking — only once a plan is actually open (WAITING/ACTIVE/
+    # T1_HIT) and has a locked entry to measure from. Non-fatal by
+    # design, same as the DORE side in utils.dore_live_state.
+    if plan.is_open() and plan.setup_id and plan.entry_locked and plan.created_at:
+        try:
+            from utils.outcome_tracking import update_forward_outcome
+            update_forward_outcome(
+                plan_key=plan.setup_id, source="LIVE_SCANNER", symbol=symbol,
+                entry_timestamp=plan.created_at,
+                entry_underlying=plan.entry_locked, entry_premium=None,
+                current_underlying=current_price or None, current_premium=None,
+                direction="",
+            )
+        except Exception:
+            logger.exception("[setup_persistence] outcome-tracking update failed for setup_id=%s (non-fatal)",
+                              plan.setup_id)
 
     return scanner_row, plan, plan_was_updated
 
