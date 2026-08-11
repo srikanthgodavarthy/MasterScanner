@@ -59,10 +59,68 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════
 
 # "For every executable/technical plan validate:" — the audit's exact list.
+# [Fix, this review round] Split into two stage-specific lists rather
+# than one shared constant. `current_risk_reward` genuinely does not
+# exist yet at the utils.dore_options_persistence mint-time call site —
+# it's computed later, in utils.dore_live_state._live_quote_for_plan(),
+# well after the plan is already minted. Validating the mint-time row
+# against the FULL list (including a field that hasn't been computed
+# yet anywhere in the pipeline) would reject every single mint — that
+# only didn't happen before this fix because validate_plan_fields()
+# used to silently skip any field missing from `row` entirely, which
+# was also the bug that let a genuinely-computed-but-NaN
+# risk_reward_ratio slip through on a row where the KEY happened to be
+# absent rather than explicitly NaN (see is_invalid_number's docstring
+# and validate_plan_fields' fix below). Two lists, one per call site,
+# so each only asserts on fields that actually exist by that point —
+# and validate_plan_fields() itself no longer silently exempts a
+# genuinely-missing field.
+# "For every executable/technical plan validate:" — the audit's exact list,
+# adapted to this pipeline's ACTUAL field names. [Fix, this review round]
+# The audit's literal "entry" does not exist as a key anywhere in this
+# pipeline — OptionTradePlan/row never has a field called "entry"; the
+# plan's actual entry price is `entry_locked` (set from `current_premium`
+# at mint — see utils.dore_options_persistence's mint branch:
+# `entry_locked=current_premium or 0.0`). Validating a field that can
+# never exist would have rejected every single mint once the missing-
+# key exemption below was fixed — caught before shipping, not after.
+DORE_PLAN_MINT_REQUIRED_FIELDS: tuple[str, ...] = (
+    "stop_loss", "target1", "target2",
+    "risk_reward_ratio", "drift_pct", "premium_change_pct", "entry_locked",
+)
+
+# [Fix, this review round] Same carried-forward exemption as
+# DORE_PLAN_CARRIED_FORWARD_REQUIRED_FIELDS below, but for the
+# utils.dore_options_persistence mint-time call site specifically —
+# current_risk_reward isn't computed yet at that point either (see
+# DORE_PLAN_MINT_REQUIRED_FIELDS above), so a carried-forward row
+# validated at mint time must be missing BOTH risk_reward_ratio (never
+# present on this row-shape) AND current_risk_reward (not computed yet
+# anywhere in the pipeline at this call site).
+DORE_PLAN_MINT_CARRIED_FORWARD_REQUIRED_FIELDS: tuple[str, ...] = (
+    "stop_loss", "target1", "target2", "drift_pct", "premium_change_pct", "entry_locked",
+)
+
 DORE_PLAN_REQUIRED_FIELDS: tuple[str, ...] = (
-    "entry", "stop_loss", "target1", "target2",
+    "stop_loss", "target1", "target2",
     "risk_reward_ratio", "current_risk_reward",
     "drift_pct", "premium_change_pct", "entry_locked",
+)
+
+# [Fix, this review round] A carried-forward OPEN plan (Stage 1 didn't
+# reproduce it this cycle — see utils.dore_live_state's "_carried_forward"
+# merge) is synthesized straight from the plan's own locked Supabase
+# fields, NOT from a real OptionTradePlan — it structurally never has
+# risk_reward_ratio (that's an entry-time technical read this row-shape
+# never carries, confirmed live: utils.dore_live_state's own source-aware
+# diagnostic buckets it as "structural," 100% of carried-forward rows,
+# not a per-row gap). Validating carried-forward rows against the same
+# field list as freshly-minted ones would quarantine every open position
+# every cycle. See utils.dore_live_state's validation call for how this
+# is applied per row-shape.
+DORE_PLAN_CARRIED_FORWARD_REQUIRED_FIELDS: tuple[str, ...] = (
+    "stop_loss", "target1", "target2",
+    "current_risk_reward", "drift_pct", "premium_change_pct", "entry_locked",
 )
 
 # The "fresh_stage1" / dore_live_state-specific subset called out first in
@@ -112,18 +170,36 @@ class ValidationResult:
 
 
 def validate_plan_fields(row: dict, required_fields: "tuple[str, ...] | list[str]") -> ValidationResult:
-    """Check `row[field]` for every field in `required_fields`. A field
-    absent from `row` entirely is NOT a violation here (that's a schema/
-    shape question, not a numeric-validity one) — only a field that IS
-    present and is NaN/±inf counts. Returns a ValidationResult; never
-    raises, never mutates `row`."""
+    """Check `row[field]` for every field in `required_fields`.
+
+    [Fix, this review round] A field absent from `row` entirely used to
+    be silently exempted here, on the reasoning that "not applicable
+    yet" (e.g. entry_locked on a fresh, not-yet-triggered candidate)
+    shouldn't be flagged. In practice that exemption fired at the wrong
+    granularity: by the time a row reaches this function, the caller has
+    ALREADY decided the row is plan-bearing (validate_and_quarantine_
+    rows' `is_plan_bearing` check, or a call site that only ever builds
+    already-plan-bearing rows) — so a required field missing from an
+    already-plan-bearing row is not "not applicable," it's the exact bug
+    this gate exists to catch. Confirmed live: a DORE row with
+    risk_reward_ratio simply absent from its dict (rather than present-
+    and-NaN) sailed through this gate, then showed up as a NaN column
+    once pandas backfilled the missing key while building the DataFrame
+    in utils.dore_live_state — i.e. this function and the DataFrame-
+    level find_invalid_columns_by_source() diagnostic disagreed about
+    the same row. A missing key now counts as invalid, same as NaN/inf.
+    "Not yet applicable" is handled entirely by which required_fields
+    list a call site passes (see DORE_PLAN_MINT_REQUIRED_FIELDS vs
+    DORE_PLAN_REQUIRED_FIELDS above) and by `is_plan_bearing` — not by
+    this function silently guessing.
+
+    Returns a ValidationResult; never raises, never mutates `row`."""
     invalid: dict[str, Any] = {}
+    _MISSING = object()
     for f in required_fields:
-        if f not in row:
-            continue
-        v = row[f]
-        if is_invalid_number(v):
-            invalid[f] = v
+        v = row.get(f, _MISSING)
+        if v is _MISSING or is_invalid_number(v):
+            invalid[f] = "<missing>" if v is _MISSING else v
     return ValidationResult(is_valid=not invalid, invalid_fields=invalid)
 
 

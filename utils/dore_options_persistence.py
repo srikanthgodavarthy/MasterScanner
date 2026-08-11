@@ -96,7 +96,9 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Optional
 
-from utils.plan_validation import DORE_PLAN_REQUIRED_FIELDS, validate_single_plan
+from utils.plan_validation import (
+    DORE_PLAN_MINT_REQUIRED_FIELDS, DORE_PLAN_MINT_CARRIED_FORWARD_REQUIRED_FIELDS, validate_single_plan,
+)
 from utils.entry_snapshot import build_dore_entry_snapshot, save_dore_entry_snapshot
 from utils.outcome_tracking import record_final_outcome
 
@@ -662,7 +664,17 @@ def enrich_trade_plans_with_persistence(
             # upserted with NaN/inf silently nulled — see
             # utils.plan_validation's module docstring for why
             # json_sanitize alone isn't an acceptable gate here.
-            if not validate_single_plan(row, DORE_PLAN_REQUIRED_FIELDS,
+            #
+            # [Fix, this review round] A carried-forward row (`p` wraps a
+            # synthesized dict — see utils.dore_live_state's
+            # "_carried_forward" merge) structurally lacks
+            # risk_reward_ratio; validating it against the same field
+            # list as a freshly-minted OptionTradePlan-based row would
+            # silently stop persisting the premium/drift refresh for
+            # every genuinely open carried-forward position, every cycle.
+            _required = (DORE_PLAN_MINT_CARRIED_FORWARD_REQUIRED_FIELDS if row.get("_carried_forward")
+                         else DORE_PLAN_MINT_REQUIRED_FIELDS)
+            if not validate_single_plan(row, _required,
                                          source="dore_options_persistence", symbol_field="symbol"):
                 if just_minted:
                     open_now.pop(key, None)

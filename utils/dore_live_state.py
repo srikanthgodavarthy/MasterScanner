@@ -457,11 +457,31 @@ def refresh_dore_live_state(cfg=None) -> dict:
     # candidate with no entry_locked yet is exempt by construction (see
     # utils.plan_validation's module docstring — that's a structural
     # absence, not a data-quality bug).
-    from utils.plan_validation import DORE_PLAN_REQUIRED_FIELDS, validate_and_quarantine_rows
-    rows, quarantined_rows = validate_and_quarantine_rows(
-        rows, DORE_PLAN_REQUIRED_FIELDS, source="dore_live_state",
+    #
+    # [Fix, this review round] Split by `_carried_forward` before
+    # validating, same distinction the source-aware diagnostic just above
+    # already draws (structural vs partial NaN) — a carried-forward row
+    # structurally lacks risk_reward_ratio (see
+    # DORE_PLAN_CARRIED_FORWARD_REQUIRED_FIELDS' docstring), so validating
+    # every row against one flat field list would quarantine every open
+    # position every cycle. Two batches, two field lists, results merged
+    # back in original order.
+    from utils.plan_validation import (
+        DORE_PLAN_REQUIRED_FIELDS, DORE_PLAN_CARRIED_FORWARD_REQUIRED_FIELDS,
+        validate_and_quarantine_rows,
+    )
+    _fresh_rows = [r for r in rows if not r.get("_carried_forward")]
+    _cf_rows = [r for r in rows if r.get("_carried_forward")]
+    _fresh_clean, _fresh_quarantined = validate_and_quarantine_rows(
+        _fresh_rows, DORE_PLAN_REQUIRED_FIELDS, source="dore_live_state.fresh_stage1",
         is_plan_bearing=lambda r: bool(r.get("entry_locked")),
     )
+    _cf_clean, _cf_quarantined = validate_and_quarantine_rows(
+        _cf_rows, DORE_PLAN_CARRIED_FORWARD_REQUIRED_FIELDS, source="dore_live_state.carried_forward_open",
+        is_plan_bearing=lambda r: bool(r.get("entry_locked")),
+    )
+    rows = _fresh_clean + _cf_clean
+    quarantined_rows = _fresh_quarantined + _cf_quarantined
 
     df = pd.DataFrame(rows)
 
