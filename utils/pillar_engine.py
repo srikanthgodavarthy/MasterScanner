@@ -233,6 +233,7 @@ class PillarResult:
     stoch_k:                float = 0.0
     stoch_d:                 float = 0.0
     stoch_cross_up:           bool  = False
+    stoch_cross_down:         bool  = False
     rsi_val:                  float = 50.0
     rsi_above_50:              bool  = False
     m_vwap_reaction_pts:        int   = 0     # 0-7, scaled by reaction quality
