@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from utils.time_utils import now_ist as _now_ist, IST as _IST
+from utils.time_utils import now_ist as _now_ist, IST as _IST, is_market_hours_ist
 
 from utils.scanner_engine  import run_scanner, fetch_nifty, NIFTY500_SYMBOLS
 from utils.regime_engine   import (
@@ -3808,6 +3808,56 @@ def _dore_options_panel():
                        "chain, no OHLCV history, or no liquid strike found) or the live_scanner "
                        "universe is currently empty.")
         else:
+            # [Fix, 2026-08-11, SG report] "Current Premium" in this table is
+            # whatever dore_live_state's LAST successful refresh cycle
+            # captured — not a truly live tick on every render. Nothing
+            # here previously told the viewer how old that capture is, so
+            # after the scheduler stops (market close + buffer — see
+            # utils.time_utils.is_market_hours_ist — or any scheduler
+            # outage) the same numbers kept rendering under a "CURRENT
+            # PREMIUM" header with no visual difference from a genuinely
+            # fresh tick, which read as live when it wasn't (confirmed
+            # live: a frozen post-15:25-IST snapshot compared against a
+            # broker's own live quote panel later the same session).
+            # Surface the actual capture time and flag it when it's
+            # stale, so "Current Premium" is read as "as of HH:MM", not
+            # "right now".
+            _snap_time = (dore_opt_meta or {}).get("created_at")
+            _age_secs = None
+            if _snap_time is not None:
+                try:
+                    _snap_ts = pd.Timestamp(_snap_time)
+                    _snap_ts = _snap_ts.tz_localize("UTC") if _snap_ts.tzinfo is None else _snap_ts.tz_convert("UTC")
+                    _age_secs = (pd.Timestamp.now(tz="UTC") - _snap_ts).total_seconds()
+                except Exception:
+                    _age_secs = None
+            _snap_ist_str = None
+            if _snap_time is not None:
+                try:
+                    _t = pd.Timestamp(_snap_time)
+                    _t = _t.tz_localize("UTC") if _t.tzinfo is None else _t.tz_convert("UTC")
+                    _snap_ist_str = _t.tz_convert(_IST).strftime("%H:%M:%S")
+                except Exception:
+                    _snap_ist_str = None
+            # Stale threshold: generous multiple of the 60s dore_live_state
+            # cadence (utils.dore_live_state.refresh_dore_live_state) —
+            # flags a paused/dead scheduler without false-alarming on one
+            # slow cycle.
+            _STALE_AFTER_SECS = 5 * 60
+            if _age_secs is not None and _age_secs >= _STALE_AFTER_SECS:
+                _age_mins = int(_age_secs // 60)
+                st.warning(
+                    f"⚠️ Prices below are **not live** — last refreshed at "
+                    f"{_snap_ist_str or '?'} IST ({_age_mins} min ago). "
+                    + ("Market is currently closed, so this is expected — these are the last "
+                       "known premiums before close, not this instant's."
+                       if not is_market_hours_ist() else
+                       "The scheduler appears to have stopped updating during market hours — "
+                       "check scan_worker/inprocess_scheduler health."),
+                    icon="⚠️",
+                )
+            elif _snap_ist_str:
+                st.caption(f"Live as of {_snap_ist_str} IST.")
             st.markdown(_dore_options_plan_table_html(dore_opt_df, scan_time=(dore_opt_meta or {}).get("created_at")),
                         unsafe_allow_html=True)
             st.caption("Showing Confidence ≥ 70 only. 🟢 Confidence ≥75 · 🔵 ≥55–74 (n/a below 70 here) — "
