@@ -97,12 +97,29 @@ class _TechPlanView:
     utils.dore_options_persistence.enrich_trade_plans_with_persistence()
     expects (it was written against live utils.dore_options_engine.
     OptionTradePlan instances). No technical field is recomputed —
-    everything except current_premium comes straight from the stored
-    plan.
+    everything except the live-quote fields below comes straight from
+    the stored plan.
+
+    [Fix, 2026-08-11] `to_dict()` used to return `dict(self._plan)` —
+    the raw stored plan only, silently dropping every field in `live`
+    (premium_prev_close, premium_change_pct, current_risk_reward,
+    entry_trigger_status, oi/volume/iv, the recomputed
+    probability_of_profit) except current_premium, which was passed
+    into __init__ separately. Since the stored plan snapshot never
+    carries premium_change_pct/current_risk_reward in the first place
+    (they're tick-derived, not stored), the resulting row was missing
+    those keys entirely — which utils.plan_validation's missing-key-is-
+    invalid check then correctly rejected as
+    "invalid numeric field(s): premium_change_pct='<missing>'" for
+    every plan refreshed through this path. `to_dict()` now merges the
+    full `live` dict on top of the stored plan so those fields are
+    actually present on the row handed to
+    enrich_trade_plans_with_persistence().
     """
 
-    def __init__(self, plan: dict, current_premium: Optional[float]):
+    def __init__(self, plan: dict, live: dict):
         self._plan = plan
+        self._live = live or {}
         self.symbol = plan.get("symbol", "")
         self.direction = plan.get("direction", "")
         self.expiry = plan.get("expiry", "")
@@ -111,12 +128,12 @@ class _TechPlanView:
         self.target1 = plan.get("target1")
         self.target2 = plan.get("target2")
         self.confidence_score = plan.get("confidence_score", 0.0)
-        self.current_premium = current_premium
+        self.current_premium = self._live.get("current_premium")
         primary = plan.get("primary") or {}
         self.primary = SimpleNamespace(strike=float(primary.get("strike") or 0.0))
 
     def to_dict(self) -> dict:
-        return dict(self._plan)
+        return {**self._plan, **self._live}
 
 
 def _entry_trigger_status(current_premium: Optional[float], entry_zone) -> str:
@@ -398,7 +415,7 @@ def refresh_dore_live_state(cfg=None) -> dict:
             quote = quotes.get(key)
             spot = spot_by_symbol.get(plan.get("symbol"))
             live = _live_quote_for_plan(plan, quote, spot)
-            view = _TechPlanView(plan, live.get("current_premium"))
+            view = _TechPlanView(plan, live)
             plan_views.append(view)
             live_by_key.append(live)
             spot_by_key.append(spot)
