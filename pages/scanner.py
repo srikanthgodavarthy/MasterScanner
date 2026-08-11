@@ -3661,6 +3661,83 @@ def _dore_options_closed_plans_table_html(df: pd.DataFrame) -> str:
     )
 
 
+def _fetch_live_premiums_for_table(df: pd.DataFrame) -> "tuple[pd.DataFrame, int]":
+    """[2026-08-11, SG request] Overlay a quote fetched RIGHT NOW (this
+    page render) onto df's current_premium/premium_change_pct, instead
+    of relying solely on dore_live_state's last cached snapshot — which
+    can be many minutes stale (see the staleness banner in
+    _dore_options_panel below; this is the actual fix for "I want
+    Current Premium to be live", not just a warning about it).
+
+    Uses the same utils.upstox_client.fetch_open_plan_option_quotes()
+    batched-LTP call utils.dore_live_state.py's own 60s refresh uses —
+    small batch (one call per row currently shown, typically <20), so
+    cheap enough to run on every fragment rerun (_FO_SCAN_REFRESH_SECS,
+    60s) without adding real load.
+
+    Fail-soft throughout: any row that doesn't resolve or quote (token
+    expired, contract not found, network hiccup) keeps its existing
+    snapshot value instead of being blanked or crashing the page.
+
+    Returns (df, n_updated) — n_updated lets the caller state honestly
+    whether the live fetch actually worked this render, rather than
+    assuming success just because the column exists.
+    """
+    if df.empty or "symbol" not in df.columns:
+        return df, 0
+
+    from utils.upstox_client import fetch_open_plan_option_quotes
+
+    def _strike_of(row):
+        primary = row.get("primary")
+        if isinstance(primary, dict):
+            try:
+                return float(primary.get("strike") or 0.0) or None
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    plan_keys = []
+    for _, row in df.iterrows():
+        symbol = row.get("symbol")
+        direction = row.get("direction")
+        expiry = row.get("expiry")
+        strike = _strike_of(row)
+        if symbol and direction and expiry and strike:
+            plan_keys.append((symbol, direction, strike, expiry))
+
+    if not plan_keys:
+        return df, 0
+
+    try:
+        quotes = fetch_open_plan_option_quotes(tuple(plan_keys))
+    except Exception:
+        logger.exception("[scanner] live premium fetch failed for Live Scan table (non-fatal, "
+                          "falling back to the last cached snapshot's values)")
+        return df, 0
+
+    if not quotes:
+        return df, 0
+
+    df = df.copy()
+    n_updated = 0
+    for idx, row in df.iterrows():
+        strike = _strike_of(row)
+        key = (row.get("symbol"), row.get("direction"), strike, row.get("expiry"))
+        q = quotes.get(key)
+        if not q:
+            continue
+        ltp = q.get("ltp")
+        if ltp is None:
+            continue
+        df.at[idx, "current_premium"] = ltp
+        prev_close = q.get("prev_close")
+        if prev_close:
+            df.at[idx, "premium_change_pct"] = round((ltp - prev_close) / prev_close * 100, 2)
+        n_updated += 1
+    return df, n_updated
+
+
 def _render_dore_options_active_plans_tab() -> None:
     """[2026-08-01] DORE Options Engine — Active Plans tab. Reads every
     currently-OPEN DoreOptionsPlan straight from Supabase
@@ -3844,20 +3921,28 @@ def _dore_options_panel():
             # flags a paused/dead scheduler without false-alarming on one
             # slow cycle.
             _STALE_AFTER_SECS = 5 * 60
+            dore_opt_df, _n_live_updated = _fetch_live_premiums_for_table(dore_opt_df)
+            _live_fetch_ok = _n_live_updated > 0
             if _age_secs is not None and _age_secs >= _STALE_AFTER_SECS:
                 _age_mins = int(_age_secs // 60)
                 st.warning(
-                    f"⚠️ Prices below are **not live** — last refreshed at "
+                    f"⚠️ Confidence / Plan / Drift figures below are from the last scan cycle — "
                     f"{_snap_ist_str or '?'} IST ({_age_mins} min ago). "
-                    + ("Market is currently closed, so this is expected — these are the last "
-                       "known premiums before close, not this instant's."
+                    + ("Market is currently closed, so this is expected — those are the last "
+                       "known values before close."
                        if not is_market_hours_ist() else
                        "The scheduler appears to have stopped updating during market hours — "
-                       "check scan_worker/inprocess_scheduler health."),
+                       "check scan_worker/inprocess_scheduler health.")
+                    + (" Current Premium above is still fetched live on every page load, "
+                       "independent of that cycle." if _live_fetch_ok else
+                       " Current Premium could not be fetched live this time either — showing "
+                       "the last cached value."),
                     icon="⚠️",
                 )
             elif _snap_ist_str:
-                st.caption(f"Live as of {_snap_ist_str} IST.")
+                st.caption(f"Current Premium fetched live on this page load. Other fields as of "
+                           f"{_snap_ist_str} IST." if _live_fetch_ok else
+                           f"Live as of {_snap_ist_str} IST.")
             st.markdown(_dore_options_plan_table_html(dore_opt_df, scan_time=(dore_opt_meta or {}).get("created_at")),
                         unsafe_allow_html=True)
             st.caption("Showing Confidence ≥ 70 only. 🟢 Confidence ≥75 · 🔵 ≥55–74 (n/a below 70 here) — "
