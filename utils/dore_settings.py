@@ -103,12 +103,31 @@ DORE_DEFAULTS: dict = {
     "execution_atr_expansion_min_pct": 10.0,  # ATR expansion vs its own recent average, %
     "execution_orb_lookback_bars": 6,     # opening-range bars (e.g. 6 x 5m = 30 min)
     # Stage-2 sub-weights (must sum to 100)
+    # [2026-08-11, DORE_DUAL_CONFIRMATION] w_exec_compression removed —
+    # compression moved to Stage 2b's own weights below. Kept out of this
+    # block (not zeroed) so a stale config dict from before this change
+    # can't silently reintroduce it; _weighted() renormalizes over
+    # whichever weights are actually passed in, so Stage 2a's remaining
+    # weights below don't need to be rebalanced to sum to 100 themselves.
     "w_exec_ema_cross":           25.0,   # fresh crossover/crossunder or clean 9/21 ride
     "w_exec_vwap":                20.0,   # VWAP reclaim/rejection
     "w_exec_orb":                 15.0,   # opening-range breakout/breakdown
-    "w_exec_compression":         15.0,   # compression -> expansion (NR7 etc.)
     "w_exec_volume_expansion":    15.0,   # volume expansion
     "w_exec_atr_expansion":       10.0,   # ATR/range expansion
+
+    # ── Stage 2b: Pre-Breakout Confirmation (independent of Stage 2a) ──
+    # [2026-08-11, DORE_DUAL_CONFIRMATION] "Is it about to move" — scored
+    # separately from Stage 2a's "is it moving now" so compression/IV
+    # squeeze/OI buildup evidence isn't diluted by (and can't be
+    # outvoted by) already-moved evidence. See
+    # stage2b_pre_breakout_confirmation()'s docstring.
+    "pre_breakout_ready_min":     65.0,   # Pre-Breakout Score >= this -> pre_breakout_ready=True
+    "prebreak_oi_change_strong_pct": 8.0,  # OI change on the directional side that maxes the OI-buildup sub-score
+    "w_prebreak_compression":     35.0,   # range compression / NR7 — the core "coiled" signal
+    "w_prebreak_volume_dryup":    25.0,   # quiet tape ahead of expansion (inverse of Stage 2a's volume check)
+    "w_prebreak_iv_compression":  20.0,   # option IV squeezing before the underlying confirms
+    "w_prebreak_oi_buildup":      20.0,   # OI building on the directional side ahead of price
+    "funnel_pre_breakout_gate_min": 78.0,  # stricter funnel-only gate — see DORESettings field comment
 
     # ── Intraday Reversal Alert (informational — separate from Stage 1) ─
     # Surfaces "big move against trend today" without touching Stage 1's
@@ -382,9 +401,30 @@ class DORESettings:
     w_exec_ema_cross: float = 25.0
     w_exec_vwap: float = 20.0
     w_exec_orb: float = 15.0
-    w_exec_compression: float = 15.0
     w_exec_volume_expansion: float = 15.0
     w_exec_atr_expansion: float = 10.0
+
+    # [2026-08-11, DORE_DUAL_CONFIRMATION] Stage 2b — Pre-Breakout Confirmation
+    pre_breakout_ready_min: float = 65.0
+    prebreak_oi_change_strong_pct: float = 8.0
+    w_prebreak_compression: float = 35.0
+    w_prebreak_volume_dryup: float = 25.0
+    w_prebreak_iv_compression: float = 20.0
+    w_prebreak_oi_buildup: float = 20.0
+
+    # [2026-08-11, DORE_DUAL_CONFIRMATION step 2] Funnel permeability gate
+    # — utils.dore_fo_screener / utils.fo_scan call stage2b BEFORE the
+    # option chain is fetched, so IV/OI data isn't available yet and
+    # Stage 2b's score is built from only 2 of its 4 components
+    # (compression + volume dry-up; ~60 of the full 100-weight scale,
+    # renormalized). That's structurally weaker evidence than the full
+    # 4-component score compute_dore() computes later once IV/OI are in
+    # hand, so this gate is intentionally STRICTER than
+    # pre_breakout_ready_min, not reused as-is: the funnel exists to
+    # protect the expensive per-symbol option-chain fetch (Section 4),
+    # so only a genuinely tight coil should buy its way past NOT_READY,
+    # not everything that would eventually clear the full-evidence bar.
+    funnel_pre_breakout_gate_min: float = 78.0
 
     reversal_alert_move_pct_min: float = 1.5
     reversal_alert_atr_mult_min: float = 0.75

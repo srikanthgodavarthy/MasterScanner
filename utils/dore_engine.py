@@ -108,6 +108,23 @@ WATCH             = "WATCH"
 NOT_READY         = "NOT_READY"
 ALL_EXECUTION_STATES = {READY_NOW, BREAKOUT_PENDING, WATCH, NOT_READY}
 
+# [2026-08-11, DORE_DUAL_CONFIRMATION] Confirmation Source — WHICH of the
+# two independent Stage 2 paths produced the Execution State, not just
+# what the state is. Added because collapsing Live Scanner evidence
+# (fresh cross / VWAP / ORB — "it's already moving") and Pre-Breakout
+# evidence (compression / IV squeeze / OI buildup — "it's about to move")
+# into one blended score structurally favours whichever path has more
+# ingredients feeding it, and silently starves the other (see
+# stage2a_live_confirmation / stage2b_pre_breakout_confirmation
+# docstrings). Downstream consumers (Stage 5's composition table, Stage
+# 5b's gate on entering strike selection) key off this, not a guess
+# reverse-engineered from the score.
+CONFIRMED_NONE         = "NONE"          # neither path cleared its own bar
+CONFIRMED_LIVE         = "LIVE"          # only the "moving now" path fired
+CONFIRMED_PRE_BREAKOUT = "PRE_BREAKOUT"  # only the "about to move" path fired
+CONFIRMED_BOTH         = "BOTH"          # both fired — strongest read
+ALL_CONFIRMATION_SOURCES = {CONFIRMED_NONE, CONFIRMED_LIVE, CONFIRMED_PRE_BREAKOUT, CONFIRMED_BOTH}
+
 # Stage 3.5 Option Valuation Status (RFC-001 §7)
 CHEAP     = "CHEAP"
 FAIR      = "FAIR"
@@ -128,12 +145,23 @@ BUY_PE_NOW        = "BUY_PE_NOW"
 BUY_PE_BREAKDOWN  = "BUY_PE_BREAKDOWN"
 WATCH_PE          = "WATCH_PE"
 
+# [2026-08-11, DORE_DUAL_CONFIRMATION] Pre-Breakout-ONLY tier — the
+# candidate coiled (compression/NR7 + IV squeeze + OI buildup) but Live
+# Scanner hasn't fired (no fresh cross, price hasn't cleared VWAP/ORB
+# yet). Deliberately NOT a "buy" tier: Stage 5b refuses to enter strike
+# selection for these (see compute_dore) until Live Scanner also
+# confirms, i.e. the candidate is promoted to BUY_CE_BREAKOUT/BUY_CE_NOW
+# once it does. This is a watchlist-only surface — earlier warning than
+# BREAKOUT_PENDING ever gave, but never auto-sized.
+PRE_BREAKOUT_CE   = "PRE_BREAKOUT_CE"
+PRE_BREAKOUT_PE   = "PRE_BREAKOUT_PE"
+
 WAIT              = "WAIT"
 NO_TRADE          = "NO_TRADE"
 
 ALL_RECOMMENDATIONS = {
-    BUY_CE_NOW, BUY_CE_BREAKOUT, WATCH_CE,
-    BUY_PE_NOW, BUY_PE_BREAKDOWN, WATCH_PE,
+    BUY_CE_NOW, BUY_CE_BREAKOUT, WATCH_CE, PRE_BREAKOUT_CE,
+    BUY_PE_NOW, BUY_PE_BREAKDOWN, WATCH_PE, PRE_BREAKOUT_PE,
     WAIT, NO_TRADE,
 }
 
@@ -144,6 +172,14 @@ ALL_RECOMMENDATIONS = {
 # hard-gate FAIL and NOT_READY/NEUTRAL rows are handled as override
 # checks in stage5_opportunity_engine() (they apply across every cell
 # of this table), not encoded here.
+#
+# [2026-08-11, DORE_DUAL_CONFIRMATION] BREAKOUT_PENDING now ONLY means
+# "Live Scanner's own score landed in the breakout-pending band" — it no
+# longer doubles as "no idea if this coiled beforehand". Whether a
+# candidate ALSO had Pre-Breakout evidence is a separate axis
+# (Confirmation Source, see stage5_opportunity_engine's confirmed_by
+# param), not folded into this table, so BUY_CE_BREAKOUT keeps meaning
+# exactly what it always meant and doesn't need new cells here.
 _COMPOSITION_TABLE = {
     (BULLISH, READY_NOW):        BUY_CE_NOW,
     (BULLISH, BREAKOUT_PENDING): BUY_CE_BREAKOUT,
@@ -525,8 +561,15 @@ class DOREResult:
     intraday_reversal_move_pct:  float = 0.0
     intraday_reversal_reason:    str = ""
 
-    execution_state:    str = NOT_READY  # READY_NOW | BREAKOUT_PENDING | WATCH | NOT_READY (Stage 2)
-    execution_score:    float = 0.0      # 0-100                          (Stage 2)
+    execution_state:    str = NOT_READY  # READY_NOW | BREAKOUT_PENDING | WATCH | NOT_READY (Stage 2a, Live Confirmation)
+    execution_score:    float = 0.0      # 0-100                          (Stage 2a, Live Confirmation)
+
+    # [2026-08-11, DORE_DUAL_CONFIRMATION] Stage 2b — Pre-Breakout
+    # Confirmation, independent of Stage 2a above. See
+    # stage2b_pre_breakout_confirmation() / merge_confirmation().
+    pre_breakout_score:  float = 0.0     # 0-100                          (Stage 2b)
+    pre_breakout_ready:  bool = False    # Stage 2b's own score cleared cfg.pre_breakout_ready_min
+    confirmed_by:         str = CONFIRMED_NONE  # NONE | LIVE | PRE_BREAKOUT | BOTH — which Stage 2 path(s) fired
 
     derivative_confidence: float = 0.0   # 0-100                          (Stage 3)
     oi_structure_score:     float = 0.0  # Stage-3 sub-score
@@ -779,15 +822,44 @@ class EffectiveBiasResult:
 
 @dataclass(frozen=True)
 class ExecutionResult:
-    """Stage 2 output — Execution State (RFC-001 §7)."""
+    """Stage 2a output — Live Confirmation ("is it moving right now").
+    Renamed conceptually from the old single-path Stage 2 (RFC-001 §7)
+    to Stage 2a as of DORE_DUAL_CONFIRMATION — see
+    stage2a_live_confirmation()'s docstring. Field names kept stable
+    (execution_score/execution_state) so every existing caller of Stage
+    2's output (Stage 5's composition table, dashboards, DOREResult)
+    keeps working unchanged; only the ingredients feeding the score
+    changed (compression moved OUT to Stage 2b, see below)."""
     execution_score: float
     execution_state: str
     reasons: tuple = ()
-    # Out of 6 possible components (EMA cross, VWAP, ORB, compression,
-    # volume, ATR expansion). Missing VWAP/ORB data drops the count to 4
-    # rather than silently scoring those components at neutral-50 — see
-    # the vwap_available/orb_available handling above.
-    components_used: int = 6
+    # Out of 5 possible components (EMA cross, VWAP, ORB, volume, ATR
+    # expansion — compression moved to Stage 2b). Missing VWAP/ORB data
+    # drops the count to 3 rather than silently scoring those components
+    # at neutral-50 — see the vwap_available/orb_available handling above.
+    components_used: int = 5
+
+
+@dataclass(frozen=True)
+class PreBreakoutResult:
+    """Stage 2b output — Pre-Breakout Confirmation ("is it about to
+    move"), independent of Stage 2a. See
+    stage2b_pre_breakout_confirmation()'s docstring for why this exists
+    as its own scored path rather than one ingredient folded into Stage
+    2a: a genuinely coiled setup (tight range + IV squeeze + OI building
+    ahead of price) was previously diluted to ~1/6th of Live
+    Confirmation's blended score, so it could never outrank a setup that
+    had already moved — starving exactly the earlier-entry signal this
+    stage exists to surface."""
+    pre_breakout_score: float
+    pre_breakout_ready: bool   # score cleared cfg.pre_breakout_ready_min
+    reasons: tuple = ()
+    # Out of up to 4 possible components (compression/NR7, volume
+    # dry-up, IV compression, OI buildup). IV/OI fields are Optional on
+    # DOREInput — a component is only included when its data was
+    # actually supplied, same "don't silently score missing data as
+    # neutral" rule Stage 2a follows.
+    components_used: int = 4
 
 
 @dataclass(frozen=True)
@@ -850,6 +922,63 @@ class OpportunityResult:
     # opportunity_score or recommendation itself, both already final by
     # the time this is set.
     premium_gate_downgrade: bool = False
+    # [2026-08-11, DORE_DUAL_CONFIRMATION] Which Stage 2 path(s) produced
+    # this recommendation — CONFIRMED_LIVE / CONFIRMED_PRE_BREAKOUT /
+    # CONFIRMED_BOTH / CONFIRMED_NONE. Read-only, set from the
+    # ConfirmationResult passed in; see merge_confirmation() and
+    # stage5_opportunity_engine()'s confirmation param.
+    confirmed_by: str = CONFIRMED_NONE
+
+
+@dataclass(frozen=True)
+class ConfirmationResult:
+    """Merges Stage 2a (Live) and Stage 2b (Pre-Breakout) into one
+    Execution State for Stage 5's composition table, while preserving
+    WHICH path(s) actually fired (confirmed_by) so downstream consumers
+    don't have to reverse-engineer it from the score. See
+    merge_confirmation(). [2026-08-11, DORE_DUAL_CONFIRMATION]
+    """
+    execution_state: str        # feeds the existing (intent, state) composition table unchanged
+    execution_score: float      # Stage 2a's score — kept as the primary number for ranking/display
+    confirmed_by: str           # CONFIRMED_NONE | CONFIRMED_LIVE | CONFIRMED_PRE_BREAKOUT | CONFIRMED_BOTH
+    pre_breakout_score: float = 0.0
+    reasons: tuple = ()
+
+
+def merge_confirmation(live: ExecutionResult, pre: PreBreakoutResult) -> ConfirmationResult:
+    """Combine Stage 2a + Stage 2b into one ConfirmationResult.
+    [2026-08-11, DORE_DUAL_CONFIRMATION]
+
+    Execution State itself is untouched — still driven purely by
+    Stage 2a's score/thresholds, so the existing composition table
+    (BULLISH/READY_NOW -> BUY_CE_NOW, etc.) doesn't need new cells and
+    every existing threshold config keeps meaning what it always meant.
+    What's new is confirmed_by, which Stage 5b (see compute_dore) uses
+    to decide whether a candidate is allowed to reach strike selection:
+      - CONFIRMED_LIVE / CONFIRMED_BOTH: Stage 2a itself cleared
+        BREAKOUT_PENDING or higher — already eligible today, unchanged.
+      - CONFIRMED_PRE_BREAKOUT: Stage 2a hasn't fired (state is WATCH or
+        NOT_READY) but Stage 2b is pre_breakout_ready — this is the new
+        surface. Stage 5's composition table still resolves WATCH/
+        NOT_READY the way it always did (WATCH_CE/PE or WAIT), but
+        compute_dore downgrades that specific case to PRE_BREAKOUT_CE/PE
+        instead, and Stage 5b refuses to enter strike selection for it.
+      - CONFIRMED_NONE: neither path fired — behaves exactly as before.
+    """
+    if live.execution_state in (READY_NOW, BREAKOUT_PENDING):
+        confirmed_by = CONFIRMED_BOTH if pre.pre_breakout_ready else CONFIRMED_LIVE
+    elif pre.pre_breakout_ready:
+        confirmed_by = CONFIRMED_PRE_BREAKOUT
+    else:
+        confirmed_by = CONFIRMED_NONE
+
+    return ConfirmationResult(
+        execution_state=live.execution_state,
+        execution_score=live.execution_score,
+        confirmed_by=confirmed_by,
+        pre_breakout_score=pre.pre_breakout_score,
+        reasons=tuple(live.reasons) + tuple(pre.reasons),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1161,16 +1290,26 @@ def compute_effective_bias(
                                 reasons=tuple(reasons))
 
 
-def stage2_execution_engine(
+def stage2a_live_confirmation(
     inp: DOREInput, cfg: DORESettings, directional_intent: str
 ) -> ExecutionResult:
     """Score whether THIS specific intraday moment is tradeable on the
-    side Stage 1 already committed to. Execution-oriented, not pattern-
-    oriented (Section 7) — does not attempt to mirror every equity swing
-    pattern MasterScanner uses. Volatile by design: re-evaluate every
-    intraday refresh (Section 12).
+    side Stage 1 already committed to — "is it moving RIGHT NOW".
+    Execution-oriented, not pattern-oriented (Section 7) — does not
+    attempt to mirror every equity swing pattern MasterScanner uses.
+    Volatile by design: re-evaluate every intraday refresh (Section 12).
 
-    directional_intent=NEUTRAL still returns a real Execution Score for
+    [2026-08-11, DORE_DUAL_CONFIRMATION] Renamed from
+    stage2_execution_engine; compression/NR7 moved OUT to
+    stage2b_pre_breakout_confirmation(). Reason: compression is
+    "hasn't moved yet" evidence — folding it into the same blended
+    average as fresh-cross/VWAP/ORB (all "already moved" evidence)
+    means a coiled-but-not-yet-triggered setup drags this score DOWN
+    via every other component while only compression_score pulls up,
+    so it can never surface here. It gets its own path instead, scored
+    on its own terms, in Stage 2b.
+
+    directional_intent=NEUTRAL still returns a real score for
     reporting/ranking, but Stage 5 always resolves NEUTRAL to WAIT
     regardless of what Execution State comes back as.
     """
@@ -1240,14 +1379,9 @@ def stage2_execution_engine(
         orb_score = 50.0
         reasons.append("Opening range not supplied — excluded from Execution Score (not scored as neutral)")
 
-    # Compression -> expansion (NR7 etc.) — a coiled range about to
-    # release is READY-adjacent regardless of direction; it's the
-    # "about to move" read, not a directional one.
-    if inp.nr7 or inp.compression:
-        compression_score = 90.0
-        reasons.append("NR7 / range compression detected — coiled, expansion likely imminent")
-    else:
-        compression_score = 50.0
+    # [2026-08-11, DORE_DUAL_CONFIRMATION] Compression/NR7 moved to Stage
+    # 2b (stage2b_pre_breakout_confirmation) — see this function's
+    # docstring. No compression_score term here anymore.
 
     volume_score = _pct_score(inp.intraday_vol_ratio, cfg.execution_vol_ratio_min * 0.5,
                                cfg.execution_vol_ratio_min * 1.5)
@@ -1260,7 +1394,6 @@ def stage2_execution_engine(
 
     execution_score_parts = [
         (cross_score,           cfg.w_exec_ema_cross),
-        (compression_score,     cfg.w_exec_compression),
         (volume_score,          cfg.w_exec_volume_expansion),
         (atr_expansion_score,   cfg.w_exec_atr_expansion),
     ]
@@ -1319,8 +1452,8 @@ def stage2_execution_engine(
         pullback_check,
         vwap_check,
         orb_check,
-        GateCheck("Range Compression / NR7", inp.nr7 or inp.compression,
-                   "" if (inp.nr7 or inp.compression) else "no compression/NR7 detected"),
+        # Compression/NR7 check moved to Stage 2b's own gate breakdown —
+        # see stage2b_pre_breakout_confirmation().
         GateCheck("Volume Expansion", inp.intraday_vol_ratio >= cfg.execution_vol_ratio_min,
                    f"{inp.intraday_vol_ratio:.2f}x < {cfg.execution_vol_ratio_min:.2f}x"
                    if inp.intraday_vol_ratio < cfg.execution_vol_ratio_min else f"{inp.intraday_vol_ratio:.2f}x"),
@@ -1333,6 +1466,136 @@ def stage2_execution_engine(
     reasons += _gate_lines(checks)
     return ExecutionResult(execution_score=execution_score, execution_state=state, reasons=tuple(reasons),
                             components_used=execution_score_components_used)
+
+
+# [2026-08-11, DORE_DUAL_CONFIRMATION] Back-compat alias — utils/fo_scan.py
+# and utils/dore_fo_screener.py both call stage2_execution_engine directly
+# (their own probe/what-if paths, not the compute_dore pipeline above).
+# They only need "is it moving now", so pointing them at Stage 2a as-is is
+# correct; NOT auto-upgraded to also run Stage 2b here, since those
+# call sites don't consume a ConfirmationResult and adding Pre-Breakout
+# scoring to them is a separate, deliberate decision — see this module's
+# docstring note near the bottom for the follow-up needed if/when those
+# callers should surface Pre-Breakout candidates too.
+stage2_execution_engine = stage2a_live_confirmation
+
+
+# ══════════════════════════════════════════════════════════════════
+#  STAGE 2b — PRE-BREAKOUT CONFIRMATION  (independent of Stage 2a)
+# ══════════════════════════════════════════════════════════════════
+
+def stage2b_pre_breakout_confirmation(
+    inp: DOREInput, cfg: DORESettings, directional_intent: str
+) -> PreBreakoutResult:
+    """Score whether this setup is COILING ahead of a move — "is it
+    about to move" — entirely independent of Stage 2a's "is it moving
+    right now". [2026-08-11, DORE_DUAL_CONFIRMATION]
+
+    Deliberately a separate scored path rather than one ingredient
+    folded into Stage 2a: see stage2a_live_confirmation()'s docstring
+    for why blending them starves this evidence. A candidate can score
+    high here and zero on Stage 2a (nothing has broken yet) — that's
+    the intended, useful case: it's what should light up a Pre-Breakout
+    watch tier BEFORE Live Scanner would ever surface it.
+
+    Four ingredients, each included only when its data was actually
+    supplied (same missing-data discipline as Stage 2a's VWAP/ORB):
+      - Range compression / NR7 (inp.compression, inp.nr7) — direction-
+        agnostic; a coiled range is "about to release" regardless of
+        which way.
+      - Volume dry-up (inp.intraday_vol_ratio well BELOW 1x) — the
+        quiet-before-the-move read; the inverse of Stage 2a's volume
+        EXPANSION check, which only fires after the move starts.
+      - IV compression (inp.iv_compression, or derived from a falling
+        inp.iv_trend_pct) — option premium pricing in a squeeze before
+        the underlying has confirmed one.
+      - OI buildup ahead of price (inp.ce_oi_change / inp.pe_oi_change
+        on the side matching directional_intent, positive, while price
+        hasn't moved yet) — positioning building before the breakout,
+        not chasing it.
+
+    directional_intent=NEUTRAL still returns a real score (compression
+    and volume dry-up are direction-agnostic; OI buildup and any
+    direction-specific reasoning are skipped) — same reporting-without-
+    forcing-a-side behaviour as Stage 2a.
+    """
+    reasons: list[str] = []
+    want_bull = directional_intent == BULLISH
+    want_bear = directional_intent == BEARISH
+
+    coiled = bool(inp.nr7 or inp.compression)
+    compression_score = 90.0 if coiled else 20.0
+    reasons.append("NR7 / range compression detected — coiled, expansion likely imminent" if coiled
+                    else "No compression/NR7 — range not currently coiling")
+
+    # Volume DRY-UP, not expansion — the mirror image of Stage 2a's
+    # volume_score. A ratio well under 1x (quiet tape) ahead of a
+    # breakout is the classic pre-move tell; scored so ~0.5x or below
+    # maxes out and >=1x (already expanding — that's Stage 2a's job)
+    # scores low here.
+    dryup_score = _pct_score(1.0 - inp.intraday_vol_ratio, 0.0, 0.5)
+    reasons.append(f"Intraday Volume Ratio={inp.intraday_vol_ratio:.2f}x (dry-up read)")
+
+    pre_breakout_score_parts = [
+        (compression_score, cfg.w_prebreak_compression),
+        (dryup_score,        cfg.w_prebreak_volume_dryup),
+    ]
+    components_used = 2
+
+    iv_available = inp.iv_compression is not None or inp.iv_trend_pct is not None
+    if iv_available:
+        if inp.iv_compression is True:
+            iv_score = 90.0
+            reasons.append("IV compression flagged directly on the chain")
+        elif inp.iv_trend_pct is not None and inp.iv_trend_pct < 0:
+            iv_score = _pct_score(-inp.iv_trend_pct, 0.0, 15.0)
+            reasons.append(f"IV Trend={inp.iv_trend_pct:.1f}% — compressing")
+        else:
+            iv_score = 30.0
+            reasons.append("IV not compressing — no squeeze evidence")
+        pre_breakout_score_parts.append((iv_score, cfg.w_prebreak_iv_compression))
+        components_used += 1
+    else:
+        reasons.append("IV compression data not supplied — excluded from Pre-Breakout Score (not scored as neutral)")
+
+    oi_available = (want_bull or want_bear) and (inp.ce_oi_change != 0.0 or inp.pe_oi_change != 0.0)
+    if oi_available:
+        side_oi_change = inp.ce_oi_change if want_bull else inp.pe_oi_change
+        if side_oi_change > 0:
+            oi_score = _pct_score(side_oi_change, 0.0, cfg.prebreak_oi_change_strong_pct)
+            reasons.append(f"{'CE' if want_bull else 'PE'} OI building on the "
+                            f"{directional_intent} side ahead of price ({side_oi_change:+.1f}%)")
+        else:
+            oi_score = 30.0
+            reasons.append(f"{'CE' if want_bull else 'PE'} OI not building on the {directional_intent} side yet")
+        pre_breakout_score_parts.append((oi_score, cfg.w_prebreak_oi_buildup))
+        components_used += 1
+    else:
+        reasons.append("OI-change data not supplied or Directional Intent NEUTRAL — "
+                        "excluded from Pre-Breakout Score (not scored as neutral)")
+
+    pre_breakout_score = _weighted(pre_breakout_score_parts)
+    pre_breakout_ready = pre_breakout_score >= cfg.pre_breakout_ready_min
+
+    checks = [
+        GateCheck("Range Compression / NR7", coiled,
+                   "" if coiled else "no compression/NR7 detected"),
+        GateCheck("Volume Dry-Up", inp.intraday_vol_ratio <= 0.7,
+                   f"{inp.intraday_vol_ratio:.2f}x — not quiet enough" if inp.intraday_vol_ratio > 0.7
+                   else f"{inp.intraday_vol_ratio:.2f}x"),
+    ]
+    if iv_available:
+        checks.append(GateCheck("IV Compression", inp.iv_compression is True or (inp.iv_trend_pct or 0) < 0,
+                                  "" if (inp.iv_compression is True or (inp.iv_trend_pct or 0) < 0)
+                                  else "IV not compressing"))
+    if oi_available:
+        side_oi_change = inp.ce_oi_change if want_bull else inp.pe_oi_change
+        checks.append(GateCheck("OI Buildup Ahead of Price", side_oi_change > 0,
+                                  "" if side_oi_change > 0 else "no OI buildup on the directional side"))
+
+    reasons += _gate_lines(checks)
+    return PreBreakoutResult(pre_breakout_score=pre_breakout_score, pre_breakout_ready=pre_breakout_ready,
+                              reasons=tuple(reasons), components_used=components_used)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1884,6 +2147,7 @@ def stage5_opportunity_engine(
     risk_quality: float,
     risk_hard_gate_pass: bool,
     premium_strengthening: bool = False,
+    confirmed_by: str = CONFIRMED_NONE,
 ) -> OpportunityResult:
     """Merge Directional Intent, Execution State, Derivative Confidence
     and Risk Quality into ONE recommendation (Section 10). The
@@ -1891,6 +2155,19 @@ def stage5_opportunity_engine(
     dimensions (gated by the Stage 4 hard-gate) — it does NOT depend on
     the weighted Opportunity Score below, which exists purely for
     ranking multiple candidates against each other (Stage 5's other job).
+
+    `confirmed_by` (from merge_confirmation(), 2026-08-11
+    DORE_DUAL_CONFIRMATION) handles the one new case this stage needs to
+    special-case: CONFIRMED_PRE_BREAKOUT means Stage 2a itself hasn't
+    fired (execution_state is WATCH, so the composition table would
+    normally resolve WATCH_CE/PE) but Stage 2b's independent evidence
+    says the setup is coiling. That gets promoted from WATCH_CE/PE to
+    PRE_BREAKOUT_CE/PE — a distinct watchlist tier, not a buy tier — so
+    it's visible as "coiling, not yet triggered" rather than folded into
+    the same generic WATCH bucket as a setup with no compelling evidence
+    either way. CONFIRMED_LIVE/CONFIRMED_BOTH change nothing here:
+    Stage 2a already fired, so the composition table's normal
+    BUY_CE_NOW/BUY_CE_BREAKOUT path already applies.
 
     `premium_strengthening` (Stage 3's Premium Behaviour pillar,
     2026-07-21; score-gated 2026-08-06) gates the "_NOW" tier
@@ -1932,9 +2209,24 @@ def stage5_opportunity_engine(
         recommendation = WAIT
 
     elif execution_state == NOT_READY:
-        reasons.append(f"Execution State NOT_READY — {directional_intent} intent exists but "
-                        f"this moment isn't tradeable yet, WAIT")
-        recommendation = WAIT
+        if confirmed_by == CONFIRMED_PRE_BREAKOUT:
+            # [2026-08-11, DORE_DUAL_CONFIRMATION] The common real case for
+            # a genuinely coiled setup: NOTHING on the live side has fired
+            # yet (no fresh cross, no VWAP/ORB clear), so Stage 2a's score
+            # sits below even its own WATCH floor — not just below READY.
+            # Without this branch, CONFIRMED_PRE_BREAKOUT candidates that
+            # haven't moved AT ALL would fall through to WAIT exactly like
+            # a candidate with no evidence either way, defeating the point
+            # of scoring Stage 2b independently. Promote instead.
+            direction_recommendation = PRE_BREAKOUT_CE if directional_intent == BULLISH else PRE_BREAKOUT_PE
+            reasons.append(f"Execution State NOT_READY on Live Scanner (Stage 2a), but Pre-Breakout Confirmation "
+                            f"(Stage 2b) fired independently — promoted to {direction_recommendation} "
+                            f"rather than WAIT")
+            recommendation = direction_recommendation
+        else:
+            reasons.append(f"Execution State NOT_READY — {directional_intent} intent exists but "
+                            f"this moment isn't tradeable yet, WAIT")
+            recommendation = WAIT
 
     else:
         recommendation = _COMPOSITION_TABLE.get((directional_intent, execution_state))
@@ -1957,13 +2249,27 @@ def stage5_opportunity_engine(
             recommendation = downgraded_to
             premium_gate_downgrade = True
 
+        elif recommendation in (WATCH_CE, WATCH_PE) and confirmed_by == CONFIRMED_PRE_BREAKOUT:
+            # [2026-08-11, DORE_DUAL_CONFIRMATION] Stage 2a gave a generic
+            # WATCH (nothing wrong, nothing confirmed either); Stage 2b
+            # independently says this is coiling. Promote to the
+            # dedicated Pre-Breakout tier rather than leaving it
+            # indistinguishable from a WATCH with no real evidence behind
+            # it. Still not a buy tier — see compute_dore's Stage 5b gate.
+            promoted_to = PRE_BREAKOUT_CE if recommendation == WATCH_CE else PRE_BREAKOUT_PE
+            reasons.append(f"Pre-Breakout Confirmation fired (Stage 2b) while Live Scanner (Stage 2a) hasn't yet — "
+                            f"promoted {recommendation} -> {promoted_to}")
+            recommendation = promoted_to
+            premium_gate_downgrade = False
+
         else:
             reasons.append(f"Composed from Directional Intent={directional_intent} x "
                            f"Execution State={execution_state} -> {recommendation}")
             premium_gate_downgrade = False
 
     return OpportunityResult(opportunity_score=opportunity_score, recommendation=recommendation,
-                              reasons=tuple(reasons), premium_gate_downgrade=premium_gate_downgrade)
+                              reasons=tuple(reasons), premium_gate_downgrade=premium_gate_downgrade,
+                              confirmed_by=confirmed_by)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2310,7 +2616,16 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     effective_bias = compute_effective_bias(inp, cfg, trend, reversal_alert)
     effective_intent = effective_bias.effective_intent
 
-    execution = stage2_execution_engine(inp, cfg, effective_intent)
+    # [2026-08-11, DORE_DUAL_CONFIRMATION] Two independent Stage 2 paths
+    # — "is it moving now" (2a) and "is it about to move" (2b) — merged
+    # into one ConfirmationResult. See merge_confirmation()'s docstring
+    # for exactly what confirmed_by does and doesn't change downstream.
+    live_confirmation = stage2a_live_confirmation(inp, cfg, effective_intent)
+    pre_breakout = stage2b_pre_breakout_confirmation(inp, cfg, effective_intent)
+    confirmation = merge_confirmation(live_confirmation, pre_breakout)
+    execution = live_confirmation  # kept as `execution` below — every downstream reference to
+                                    # execution.execution_score/execution_state is Stage 2a's own
+                                    # output, unchanged; only Stage 5 additionally receives confirmed_by.
     deriv = stage3_derivative_intelligence(inp, cfg, effective_intent)
 
     direction = "CE" if effective_intent == BULLISH else ("PE" if effective_intent == BEARISH else None)
@@ -2339,8 +2654,16 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     opportunity = stage5_opportunity_engine(
         cfg, effective_bias.blended_score, effective_intent, execution.execution_score, execution.execution_state,
         deriv.confidence, oi_intel.score, risk.risk_quality, hard_gate_pass, deriv.premium_strengthening,
+        confirmed_by=confirmation.confirmed_by,
     )
 
+    # [2026-08-11, DORE_DUAL_CONFIRMATION] PRE_BREAKOUT_CE/PE are new
+    # constants deliberately left OUT of this tuple — a candidate that
+    # only Stage 2b confirmed never reaches strike selection, however
+    # high its Pre-Breakout Score. It's promoted into a real BUY tier
+    # (and thus reaches here) automatically once Stage 2a ALSO fires on
+    # a later poll, exactly the "coiled -> now triggering" progression
+    # this two-path split exists to make visible.
     if opportunity.recommendation in (BUY_CE_NOW, BUY_CE_BREAKOUT, BUY_PE_NOW, BUY_PE_BREAKDOWN):
         strike_type, recommended_expiry, suggested_strike, itm_steps, strike_reasons = stage5b_strike_and_expiry(
             inp, cfg, direction, execution.execution_score, hard_gate_pass,
@@ -2369,7 +2692,8 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     if direction is not None and not deriv.premium_strengthening:
         warnings.append("Premium Behaviour not confirmed — option premium hasn't started strengthening yet")
 
-    reasons = (list(trend.reasons) + list(effective_bias.reasons) + list(execution.reasons) + list(deriv.reasons)
+    reasons = (list(trend.reasons) + list(effective_bias.reasons) + list(execution.reasons)
+               + list(pre_breakout.reasons) + list(deriv.reasons)
                + list(oi_intel.reasons) + list(risk.reasons) + list(opportunity.reasons) + strike_reasons
                + list(trade_plan.reasons))
 
@@ -2403,6 +2727,9 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         intraday_reversal_reason=reversal_alert.reason,
         execution_state=execution.execution_state,
         execution_score=round(execution.execution_score, 1),
+        pre_breakout_score=round(pre_breakout.pre_breakout_score, 1),
+        pre_breakout_ready=pre_breakout.pre_breakout_ready,
+        confirmed_by=confirmation.confirmed_by,
         derivative_confidence=round(deriv.confidence, 1),
         oi_structure_score=round(deriv.oi_structure_score, 1),
         premium_quality_score=round(deriv.premium_quality_score, 1),
@@ -2661,4 +2988,15 @@ def build_dore_input_for_index(
 #  Candidate Pool / Live Candidate Pool construction). The single-symbol
 #  stage functions above (stage1_trend_engine / stage2_execution_engine)
 #  are what that funnel calls per symbol.
+#
+#  [2026-08-11, DORE_DUAL_CONFIRMATION] utils.dore_fo_screener and
+#  utils.fo_scan both call stage2_execution_engine (Stage 2a via the
+#  back-compat alias above) directly in their own probe/what-if paths —
+#  neither runs Stage 2b or merge_confirmation, so their scan output has
+#  no Pre-Breakout-only tier yet. Follow-up: if Pre-Breakout candidates
+#  should surface in the Live Scan / F&O screener funnel (not just
+#  compute_dore's per-symbol full pipeline), those two call sites need
+#  the same stage2a + stage2b + merge_confirmation wiring added — not
+#  done here since it changes what that funnel's output rows mean and
+#  is a separate review, not an implied part of this split.
 # ══════════════════════════════════════════════════════════════════

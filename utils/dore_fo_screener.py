@@ -35,7 +35,7 @@ import pandas as pd
 
 from utils.dore_engine import (
     DOREInput, compute_dore, compute_trend_features, build_dore_input, build_underlying_trade_plan,
-    stage1_trend_engine, stage2_execution_engine,
+    stage1_trend_engine, stage2_execution_engine, stage2b_pre_breakout_confirmation,
     BULLISH, BEARISH, NEUTRAL, NOT_READY,
 )
 from utils.dore_settings import DORESettings
@@ -163,6 +163,12 @@ _ACTION_TIER = {
     "BUY_PE_BREAKDOWN":  "Wait for Trigger",
     "WATCH_CE":          "Watch Only",
     "WATCH_PE":          "Watch Only",
+    # [2026-08-11, DORE_DUAL_CONFIRMATION] Distinct from "Watch Only" —
+    # this candidate has genuine coiled evidence (Stage 2b), not just
+    # "nothing wrong yet". Deliberately its own label so it isn't
+    # visually indistinguishable from a WATCH with no real evidence.
+    "PRE_BREAKOUT_CE":   "Coiling — Pre-Breakout",
+    "PRE_BREAKOUT_PE":   "Coiling — Pre-Breakout",
     "HOLD_CE":           "Hold",
     "HOLD_PE":           "Hold",
     "BOOK_CE_PROFITS":   "Book Profits",
@@ -391,13 +397,46 @@ def stage2_execution_qualification(
         except Exception:
             logger.exception("[DORE Stage2] execution engine failed for %s", symbol)
             continue
+
+        # [2026-08-11, DORE_DUAL_CONFIRMATION step 2] Selective
+        # permeability: a NOT_READY symbol is normally dropped here to
+        # protect Stage 3's expensive per-symbol option-chain fetch from
+        # every weak/noisy candidate. But `probe` above already has the
+        # cheap OHLC-derived compression/NR7/volume fields (no IV/OI —
+        # those aren't fetched yet), so we can cheaply ask Stage 2b "is
+        # this genuinely coiling" before discarding. Only a candidate
+        # clearing the STRICTER funnel-only bar (funnel_pre_breakout_gate_min,
+        # not the full pre_breakout_ready_min — see that setting's
+        # comment) survives; an ordinary NOT_READY with no compression
+        # evidence is still discarded exactly as before. The full,
+        # IV/OI-complete Pre-Breakout Score is recomputed later once
+        # compute_dore() runs with the option chain in hand — this is
+        # only a permeability check, not the final read.
+        pre_breakout_probe = None
         if state == NOT_READY:
-            continue
+            try:
+                pre_breakout_probe = stage2b_pre_breakout_confirmation(probe, cfg, row["directional_intent"])
+            except Exception:
+                logger.exception("[DORE Stage2b] pre-breakout probe failed for %s", symbol)
+                continue
+            if pre_breakout_probe.pre_breakout_score < cfg.funnel_pre_breakout_gate_min:
+                continue
+            logger.info("[DORE Stage2b] %s: NOT_READY on Live Scanner but cleared funnel Pre-Breakout "
+                        "gate (%.1f >= %.1f) — admitted to Live Candidate Pool",
+                        symbol, pre_breakout_probe.pre_breakout_score, cfg.funnel_pre_breakout_gate_min)
         pool[symbol] = {
             **row,
             "execution_score": execution_score,
             "execution_state": state,
             "execution_features": exec_features,
+            # [2026-08-11, DORE_DUAL_CONFIRMATION step 2] Diagnostic only —
+            # True when this row survived NOT_READY purely on the funnel's
+            # cheap Pre-Breakout gate, not on Stage 2a. Lets downstream
+            # logging/UI distinguish "admitted because it's coiling" from
+            # the normal "admitted because Stage 2a cleared WATCH+" path,
+            # without changing pool shape for the normal case (None).
+            "funnel_admitted_via_pre_breakout": pre_breakout_probe.pre_breakout_score
+                                                 if pre_breakout_probe is not None else None,
         }
 
     logger.info("[DORE Stage2] Live Candidate Pool: %d/%d Daily-pool symbols cleared NOT_READY",

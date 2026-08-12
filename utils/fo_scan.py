@@ -37,7 +37,7 @@ import pandas as pd
 
 from utils.dore_engine import (
     DOREInput, compute_dore, compute_trend_features, build_dore_input, build_underlying_trade_plan,
-    stage1_trend_engine, stage2_execution_engine,
+    stage1_trend_engine, stage2_execution_engine, stage2b_pre_breakout_confirmation,
     BULLISH, BEARISH, NEUTRAL, NOT_READY,
 )
 from utils.dore_settings import DORESettings
@@ -165,6 +165,10 @@ _ACTION_TIER = {
     "BUY_PE_BREAKDOWN":  "Wait for Trigger",
     "WATCH_CE":          "Watch Only",
     "WATCH_PE":          "Watch Only",
+    # [2026-08-11, DORE_DUAL_CONFIRMATION] see matching comment in
+    # utils/dore_fo_screener.py's _ACTION_TIER.
+    "PRE_BREAKOUT_CE":   "Coiling — Pre-Breakout",
+    "PRE_BREAKOUT_PE":   "Coiling — Pre-Breakout",
     "HOLD_CE":           "Hold",
     "HOLD_PE":           "Hold",
     "BOOK_CE_PROFITS":   "Book Profits",
@@ -393,13 +397,33 @@ def stage2_execution_qualification(
         except Exception:
             logger.exception("[DORE Stage2] execution engine failed for %s", symbol)
             continue
+
+        # [2026-08-11, DORE_DUAL_CONFIRMATION step 2] Same selective-
+        # permeability gate as utils.dore_fo_screener — see that file's
+        # matching comment for the full rationale. Kept identical between
+        # the two funnels deliberately, not factored into a shared
+        # helper here, to match how the rest of this file already
+        # duplicates dore_fo_screener.py's structure rather than
+        # importing from it.
+        pre_breakout_probe = None
         if state == NOT_READY:
-            continue
+            try:
+                pre_breakout_probe = stage2b_pre_breakout_confirmation(probe, cfg, row["directional_intent"])
+            except Exception:
+                logger.exception("[DORE Stage2b] pre-breakout probe failed for %s", symbol)
+                continue
+            if pre_breakout_probe.pre_breakout_score < cfg.funnel_pre_breakout_gate_min:
+                continue
+            logger.info("[DORE Stage2b] %s: NOT_READY on Live Scanner but cleared funnel Pre-Breakout "
+                        "gate (%.1f >= %.1f) — admitted to Live Candidate Pool",
+                        symbol, pre_breakout_probe.pre_breakout_score, cfg.funnel_pre_breakout_gate_min)
         pool[symbol] = {
             **row,
             "execution_score": execution_score,
             "execution_state": state,
             "execution_features": exec_features,
+            "funnel_admitted_via_pre_breakout": pre_breakout_probe.pre_breakout_score
+                                                 if pre_breakout_probe is not None else None,
         }
 
     logger.info("[DORE Stage2] Live Candidate Pool: %d/%d Daily-pool symbols cleared NOT_READY",
