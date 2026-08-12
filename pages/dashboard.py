@@ -109,6 +109,11 @@ _DORE_BADGE_STYLE = {
     "BUY_PE_BREAKDOWN": ("#58a6ff", "🔵 BUY PE ON BREAKDOWN"),
     "WATCH_CE":         ("#a371f7", "🟣 WATCH CE — early"),
     "WATCH_PE":         ("#a371f7", "🟣 WATCH PE — early"),
+    # [2026-08-11, DORE_DUAL_CONFIRMATION] Own color (cyan) — distinct
+    # from WATCH's purple so a genuinely coiled Stage 2b candidate isn't
+    # visually lumped in with an ordinary "nothing confirmed yet" watch.
+    "PRE_BREAKOUT_CE":  ("#39c5cf", "🔷 COILING — pre-breakout"),
+    "PRE_BREAKOUT_PE":  ("#39c5cf", "🔷 COILING — pre-breakout"),
     "HOLD_CE":          ("#d29922", "🟡 HOLD CE"),
     "HOLD_PE":          ("#d29922", "🟡 HOLD PE"),
     "BOOK_CE_PROFITS":  ("#f85149", "🔴 BOOK CE PROFITS"),
