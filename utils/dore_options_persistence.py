@@ -113,8 +113,16 @@ def _final_outcome_for_closed_reason(closed_reason: str) -> str:
     the closest existing bucket rather than inventing a new one outside
     the audit's list; the full closed_reason string is still visible on
     the dore_options_plans row itself for anyone who needs the exact
-    cause."""
+    cause.
+
+    [2026-08-11] Added the SL_HIT branch for the new stop-loss
+    auto-close above — utils.outcome_tracking's own vocabulary already
+    defines SL_HIT/T1_HIT/T2_HIT, this function just never had a
+    reason string that could produce them before now.
+    """
     r = (closed_reason or "").lower()
+    if "stop-loss" in r or "stop loss" in r:
+        return "SL_HIT"
     if "expired" in r:
         return "EXPIRED"
     if "max holding period" in r:
@@ -160,7 +168,20 @@ MAX_DORE_OPTIONS_PLAN_AGE_DAYS = 2
 # for why the check only applies in the `else` branch, not the
 # already-open one) — separate from the age/expiry auto-close logic,
 # which is what decides when a tracked plan stops being tracked.
-MIN_CONFIDENCE_TO_ACTIVATE = 70
+#
+# [Raised 70 -> 82, 2026-08-11, SG request: "fewer recommendations,
+# but fair and with good momentum"] Paired with
+# DoreOptionsSettings.min_momentum_score_to_mint (utils/
+# dore_options_engine.py) — that gate cuts weak-momentum candidates
+# before scoring even runs; this floor separately cuts the volume of
+# what's left, since final_score() blends conviction/entry-quality/
+# liquidity/expiry-suitability alongside momentum, so a 70+ score
+# was reachable without being an especially strong setup on all
+# fronts at once. 82 is a deliberately aggressive cut, not a tuned
+# backtest-optimal number — revisit once there's enough closed-trade
+# history (see dore_options_plans WHERE status='CLOSED') to measure
+# whether it actually improved win rate rather than just volume.
+MIN_CONFIDENCE_TO_ACTIVATE = 82
 
 # [Sprint 1 — Portfolio Admission, 2026-08-05] Hard cap on simultaneously
 # OPEN DORE Options plans. Once at cap, a new candidate can still mint —
@@ -214,6 +235,21 @@ class DoreOptionsPlan:
     target1_locked:      Optional[float] = None
     target2_locked:      Optional[float] = None
     confidence_at_entry: float = 0.0   # confidence_score at the moment entry was locked (audit trail)
+
+    # [2026-08-11, SG request — DORE_LIVE_SCANNER_AUDIT follow-up]
+    # The underlying's spot price at the SAME instant entry_locked was
+    # frozen — OptionTradePlan.current_price on the mint-cycle row.
+    # Frozen exactly like entry_locked/sl_locked/etc. above (never
+    # touched again). Existed nowhere on this plan before: utils.
+    # outcome_tracking.update_forward_outcome() was being called with
+    # entry_underlying hardcoded to None for every DORE plan (see
+    # utils/dore_live_state.py), which meant underlying_return_pct —
+    # and therefore "underlying direction after 15m/30m" and
+    # underlying MFE/MAE — silently recorded as null in every
+    # outcome_checkpoints row ever written for DORE, even though the
+    # column and the checkpoint plumbing already existed. This field
+    # is what lets that call finally pass a real value.
+    entry_underlying:    Optional[float] = None
 
     # 2026-08-01: refreshed every cycle this contract is reproduced by
     # the live scan (never on cycles it isn't) — lets the Active Plans
@@ -273,6 +309,7 @@ class DoreOptionsPlan:
             "target1_locked":      self.target1_locked,
             "target2_locked":      self.target2_locked,
             "confidence_at_entry": self.confidence_at_entry,
+            "entry_underlying":    self.entry_underlying,
             "last_premium":        self.last_premium,
             "last_seen_at":        self.last_seen_at or None,
             "status":              _sval(self.status),
@@ -583,6 +620,7 @@ def enrich_trade_plans_with_persistence(
                     created_date=today,
                     created_at=_now_iso(),
                     entry_locked=current_premium or 0.0,
+                    entry_underlying=row.get("current_price"),
                     sl_locked=getattr(p, "stop_loss", None),
                     target1_locked=getattr(p, "target1", None),
                     target2_locked=getattr(p, "target2", None),
@@ -604,6 +642,28 @@ def enrich_trade_plans_with_persistence(
                     and locked.target1_locked is not None
                     and current_premium >= locked.target1_locked):
                 locked.t1_hit_at = _now_iso()
+
+            # [2026-08-11, SG request] Stop-loss auto-close — previously
+            # sl_locked was stored and displayed everywhere but nothing
+            # ever actually enforced it: the only auto-close triggers
+            # were age and expiry, so a plan could keep drifting well
+            # past its own stop indefinitely (confirmed live: PGEL,
+            # HINDALCO, FEDERALBNK all sitting OPEN 20-55% below their
+            # locked stop). Checked here, ahead of the age-based close
+            # below, so a stopped-out plan is reported as "Stop-loss
+            # hit" rather than possibly also qualifying for the age-out
+            # reason on the same cycle.
+            if (current_premium is not None and locked.sl_locked is not None
+                    and current_premium <= locked.sl_locked):
+                locked.last_premium = current_premium
+                locked.last_seen_at = _now_iso()
+                locked.status = DoreOptionsPlanStatus.CLOSED
+                locked.closed_at = _now_iso()
+                locked.closed_reason = "Stop-loss hit"
+                updated_plans.append(locked)
+                _record_dore_final_outcome(locked)
+                enriched_rows.append(p.to_dict())   # still shown this cycle as a fresh recommendation, just no longer a tracked Active Plan
+                continue
 
             # [2026-08-04, SG request] Age-based auto-close — checked
             # here (not only in the not-reproduced cleanup pass below)
@@ -644,6 +704,7 @@ def enrich_trade_plans_with_persistence(
             updated_plans.append(locked)
 
             row["entry_locked"]      = locked.entry_locked or None
+            row["saved_entry_underlying"] = locked.entry_underlying
             row["saved_stop_loss"]   = locked.sl_locked
             row["saved_target1"]     = locked.target1_locked
             row["saved_target2"]     = locked.target2_locked

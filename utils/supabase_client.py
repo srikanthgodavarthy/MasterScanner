@@ -1046,6 +1046,7 @@ def _dore_options_plan_from_row(row: dict) -> "object":
         target1_locked       = row.get("target1_locked"),
         target2_locked       = row.get("target2_locked"),
         confidence_at_entry  = float(row.get("confidence_at_entry", 0) or 0),
+        entry_underlying     = row.get("entry_underlying"),
         last_premium         = row.get("last_premium"),
         last_seen_at         = str(row.get("last_seen_at", "") or ""),
         status               = row.get("status", "OPEN") or "OPEN",
@@ -1692,6 +1693,13 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
     target1_locked               numeric(12,2),
     target2_locked               numeric(12,2),
     confidence_at_entry          numeric(6,2) NOT NULL DEFAULT 0,
+    -- [Added 2026-08-11, DORE_LIVE_SCANNER_AUDIT follow-up] Underlying
+    -- spot at the same instant entry_locked was frozen — see
+    -- utils.dore_options_persistence.DoreOptionsPlan.entry_underlying's
+    -- docstring for why (this was the missing piece behind
+    -- outcome_checkpoints.underlying_return_pct always being null for
+    -- DORE plans).
+    entry_underlying              numeric(12,2),
 
     last_premium                 numeric(12,2),
     last_seen_at                  timestamptz,
@@ -1722,6 +1730,10 @@ ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT ''
 
 DORE_OPTIONS_PLANS_T1_HIT_MIGRATION_SQL = """
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS t1_hit_at timestamptz;
+"""
+
+DORE_OPTIONS_PLANS_ENTRY_UNDERLYING_MIGRATION_SQL = """
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS entry_underlying numeric(12,2);
 """
 
 SETUP_PLANS_MIGRATION_SQL = """

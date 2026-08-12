@@ -446,6 +446,14 @@ def refresh_dore_live_state(cfg=None) -> dict:
         # nothing to track outcomes against yet). Non-fatal by design —
         # see utils.outcome_tracking.update_forward_outcome()'s own
         # try/except; never allowed to break this refresh cycle.
+        #
+        # [Fix, 2026-08-11] entry_underlying used to be hardcoded None
+        # here — every DORE outcome_checkpoints row ever written had a
+        # null underlying_return_pct as a result, silently. Now reads
+        # row["saved_entry_underlying"], set at mint time from
+        # OptionTradePlan.current_price and frozen on the DoreOptionsPlan
+        # exactly like entry_locked/sl_locked (utils.dore_options_
+        # persistence.DoreOptionsPlan.entry_underlying).
         if row.get("entry_locked") and row.get("plan_created_at"):
             try:
                 from utils.outcome_tracking import update_forward_outcome
@@ -455,7 +463,7 @@ def refresh_dore_live_state(cfg=None) -> dict:
                     source="DORE",
                     symbol=row.get("symbol") or "",
                     entry_timestamp=row.get("plan_created_at"),
-                    entry_underlying=None,   # underlying spot isn't locked at entry today — see docstring below
+                    entry_underlying=row.get("saved_entry_underlying"),
                     entry_premium=row.get("entry_locked"),
                     current_underlying=spot,
                     current_premium=row.get("current_premium"),
