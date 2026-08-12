@@ -169,7 +169,7 @@ MAX_DORE_OPTIONS_PLAN_AGE_DAYS = 2
 # already-open one) — separate from the age/expiry auto-close logic,
 # which is what decides when a tracked plan stops being tracked.
 #
-# [Raised 70 -> 82, 2026-08-11, SG request: "fewer recommendations,
+# [Raised 70 -> 80, 2026-08-11, SG request: "fewer recommendations,
 # but fair and with good momentum"] Paired with
 # DoreOptionsSettings.min_momentum_score_to_mint (utils/
 # dore_options_engine.py) — that gate cuts weak-momentum candidates
@@ -181,7 +181,7 @@ MAX_DORE_OPTIONS_PLAN_AGE_DAYS = 2
 # backtest-optimal number — revisit once there's enough closed-trade
 # history (see dore_options_plans WHERE status='CLOSED') to measure
 # whether it actually improved win rate rather than just volume.
-MIN_CONFIDENCE_TO_ACTIVATE = 82
+MIN_CONFIDENCE_TO_ACTIVATE = 80
 
 # [Sprint 1 — Portfolio Admission, 2026-08-05] Hard cap on simultaneously
 # OPEN DORE Options plans. Once at cap, a new candidate can still mint —
