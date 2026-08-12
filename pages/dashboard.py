@@ -2217,6 +2217,17 @@ _SR_CSS = """
    to each other in the same st.columns() row. */
 .sr-panel-body { max-height:296px; overflow-y:auto; overflow-x:auto; -webkit-overflow-scrolling:touch; }
 table.sr-table { width:100%; min-width:540px; table-layout:fixed; border-collapse:collapse; font-size:0.8rem; }
+/* [2026-08-12 fix] Active Options Plans got its own fixed-pixel <col>
+   widths (see _active_options_plans_html) instead of the shared
+   percentage-based ones, because percentage cols under table-layout:
+   fixed were getting squeezed below min-width on some mobile WebViews
+   instead of triggering .sr-panel-body's horizontal scroll — result
+   was clipped/truncated header and cell text ("PRE...", "HIND...")
+   with no way to scroll to see the rest. Pixel cols don't have that
+   failure mode. min-width raised to match the actual column-width sum
+   (78+36+56+58+72+50+72+60+72+72=626, +2px border fudge) so the table
+   never renders narrower than its own columns need. */
+table.sr-table--plans { min-width:628px; }
 table.sr-table th, table.sr-table td {
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
 }
@@ -2717,9 +2728,9 @@ def _active_options_plans_html(top_n: int = 6) -> str:
       <div class="sr-panel-body">
       <table class="sr-table sr-table--plans">
         <colgroup>
-          <col style="width:12%"><col style="width:6%"><col style="width:10%"><col style="width:9%">
-          <col style="width:10%"><col style="width:8%"><col style="width:10%"><col style="width:9%">
-          <col style="width:13%"><col style="width:13%">
+          <col style="width:78px"><col style="width:36px"><col style="width:56px"><col style="width:58px">
+          <col style="width:72px"><col style="width:50px"><col style="width:72px"><col style="width:60px">
+          <col style="width:72px"><col style="width:72px">
         </colgroup>
         <tr><th>SYMBOL</th><th>DIR</th><th>STRIKE</th><th>CONF</th>
             <th>PREMIUM</th><th>PLAN</th><th>ENTRY</th><th>DRIFT</th>
