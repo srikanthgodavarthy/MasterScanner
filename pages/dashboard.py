@@ -2635,6 +2635,22 @@ def _active_options_plans_html(top_n: int = 6) -> str:
     if "confidence_score" in df.columns:
         df = df[pd.to_numeric(df["confidence_score"], errors="coerce") >= 65]
 
+    # [2026-08-12 fix, SG request] This card is titled ACTIVE OPTIONS
+    # PLANS but wasn't actually checking activity — a row with
+    # entry_trigger_status == "Waiting" (premium hasn't reached the
+    # entry zone yet, no real position) passed the same as a
+    # "Triggered" one. Keep only rows that have actually triggered —
+    # matches the ACTIVE state in the two-level lifecycle refactor
+    # (utils.dore_options_persistence.DoreOptionsPlanStatus) at the
+    # concept level, even though this card's data source
+    # (dore_live_state, see the module comment above) doesn't carry
+    # that persisted status field directly — entry_trigger_status is
+    # the equivalent signal already available at this layer. Rows
+    # missing the field entirely are dropped rather than kept, since
+    # "unknown" shouldn't silently count as "active".
+    if "entry_trigger_status" in df.columns:
+        df = df[df["entry_trigger_status"].astype(str) == "Triggered"]
+
     # Today-only — a plan locked on a prior day (still OPEN) is
     # carryover, not something this cycle's scan actually produced.
     # Rows with no persisted plan yet are kept — they ARE this cycle's
@@ -2649,7 +2665,7 @@ def _active_options_plans_html(top_n: int = 6) -> str:
 
     if df.empty:
         return ('<div class="sr-panel"><div class="sr-panel-title">ACTIVE OPTIONS PLANS</div>'
-                '<div style="color:#8b949e;font-size:0.75rem;">No DORE candidates with '
+                '<div style="color:#8b949e;font-size:0.75rem;">No triggered DORE plans with '
                 'Confidence ≥ 65 today.</div></div>')
 
     def _money(v):
