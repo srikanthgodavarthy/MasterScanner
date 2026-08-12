@@ -143,6 +143,14 @@ h1,h2,h3 { font-family: 'Syne', sans-serif !important; }
     background:#00ff88; box-shadow:0 0 8px #00ff88;
     animation:pulse 2s infinite; margin-right:6px;
 }
+.trinity-i { position:relative; }
+.trinity-i::before {
+    content:''; position:absolute; left:50%; top:-0.7em;
+    transform:translateX(-50%);
+    width:7px; height:7px; border-radius:50%;
+    background:#00ff88; box-shadow:0 0 8px #00ff88;
+    animation:pulse 2s infinite;
+}
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
 div[data-testid="stDataFrame"] { border:1px solid #1e293b !important; border-radius:8px !important; }
 [data-testid="metric-container"] { background:#1a2235; border:1px solid #1e293b; border-radius:8px; padding:0.75rem; }
@@ -154,8 +162,7 @@ footer { display:none !important; }
 
 st.markdown("""
 <div class="scanner-header">
-    <p class="scanner-title">🔱 Trinity</p>
-    #<p class="scanner-subtitle"><span class="status-dot"></span>Nifty 500 · Regime Engine v2 · Leadership · Conviction · Entry Quality</p>
+    <p class="scanner-title">🔱 Tr<span class="trinity-i">i</span>nity</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -400,18 +407,18 @@ settings["sectors_page"] = _page_sectors_obj
 pg = st.navigation(
     [
         st.Page(_page_dashboard,    title="Dashboard",            icon="🖥️", default=True),
-        st.Page(_page_scanner,      title="Live Scanner",         icon="📡"),
         _page_sectors_obj,
+        st.Page(_page_scanner,      title="Live Scanner",         icon="📡"),
         st.Page(_page_five_pillar, title="five_pillar Scanner", icon="📍"),
-        st.Page(_page_settings,     title="Settings",             icon="⚙️"),
         st.Page(_page_backtest,     title="Backtest Engine",      icon="📈"),
-        st.Page(_page_cci_master,   title="CCI Master",           icon="📐"),
-        st.Page(_page_portfolio,    title="Portfolio",            icon="📁"),
         st.Page(_page_lifecycle,    title="Lifecycle",            icon="🔄"),
         st.Page(_page_history,      title="History",              icon="📊"),
+        st.Page(_page_settings,     title="Settings",             icon="⚙️"),
         st.Page(_page_validation,   title="CV/EQ Validation",     icon="🔬"),
         st.Page(_page_diagnostic,   title="Diagnostic",           icon="🧬"),
         st.Page(_page_agent,        title="Agent",                icon="🤖"),
+        st.Page(_page_cci_master,   title="CCI Master",           icon="📐"),
+        st.Page(_page_portfolio,    title="Portfolio",            icon="📁"),
         st.Page(_page_data_source_check, title="Data Source Check", icon="🔍"),
     ],
     position="top",   # matches the original inline-controls look (sidebar stays collapsed)
