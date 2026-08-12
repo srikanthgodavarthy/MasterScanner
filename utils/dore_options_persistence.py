@@ -1224,6 +1224,8 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
                 "expiry": plan.expiry,
                 "status": status,
                 "lifecycle_group": _lifecycle_group(status),
+                "confidence_at_entry": plan.confidence_at_entry,
+                "entry_triggered_at": plan.entry_triggered_at or "",
                 "entry_locked": plan.entry_locked or None,
                 "saved_stop_loss": plan.sl_locked,
                 "saved_target1": plan.target1_locked,
