@@ -400,18 +400,18 @@ settings["sectors_page"] = _page_sectors_obj
 pg = st.navigation(
     [
         st.Page(_page_dashboard,    title="Dashboard",            icon="🖥️", default=True),
-        _page_sectors_obj,
         st.Page(_page_scanner,      title="Live Scanner",         icon="📡"),
+        _page_sectors_obj,
         st.Page(_page_five_pillar, title="five_pillar Scanner", icon="📍"),
+        st.Page(_page_settings,     title="Settings",             icon="⚙️"),
         st.Page(_page_backtest,     title="Backtest Engine",      icon="📈"),
+        st.Page(_page_cci_master,   title="CCI Master",           icon="📐"),
+        st.Page(_page_portfolio,    title="Portfolio",            icon="📁"),
         st.Page(_page_lifecycle,    title="Lifecycle",            icon="🔄"),
         st.Page(_page_history,      title="History",              icon="📊"),
-        st.Page(_page_settings,     title="Settings",             icon="⚙️"),
         st.Page(_page_validation,   title="CV/EQ Validation",     icon="🔬"),
         st.Page(_page_diagnostic,   title="Diagnostic",           icon="🧬"),
         st.Page(_page_agent,        title="Agent",                icon="🤖"),
-        st.Page(_page_cci_master,   title="CCI Master",           icon="📐"),
-        st.Page(_page_portfolio,    title="Portfolio",            icon="📁"),
         st.Page(_page_data_source_check, title="Data Source Check", icon="🔍"),
     ],
     position="top",   # matches the original inline-controls look (sidebar stays collapsed)
