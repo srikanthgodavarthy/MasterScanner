@@ -531,6 +531,23 @@ def _drift_pct(current_premium: Optional[float], entry_locked: Optional[float]) 
     if not current_premium or not entry_locked:
         return None
     try:
+        # [2026-08-12 bugfix] entry_locked is written once, at the ACTIVE
+        # transition, from that cycle's in-memory current_premium (a
+        # plain float off the live scan's JSON) — but every subsequent
+        # read of this plan loads entry_locked back from Postgres as
+        # decimal.Decimal (psycopg2), and it's never reassigned after
+        # that (frozen by design). last_premium, meanwhile, keeps
+        # getting refreshed from a fresh in-memory float each cycle. So
+        # from the SECOND cycle onward this was Decimal-minus-float,
+        # which raises TypeError — silently caught below — meaning
+        # last_drift_pct was None for every ACTIVE plan past its very
+        # first tick. This is the same Post-Neon-migration Decimal/float
+        # mismatch already worked around ad hoc in pages/scanner.py's
+        # _fmt_pnl(); fixing it at the shared source here covers every
+        # caller (Active Plans tab's P&L %, this dashboard card's Drift
+        # column, etc.) instead of needing the cast repeated per call site.
+        current_premium = float(current_premium)
+        entry_locked = float(entry_locked)
         return round((current_premium - entry_locked) / entry_locked * 100, 2)
     except Exception:
         return None
