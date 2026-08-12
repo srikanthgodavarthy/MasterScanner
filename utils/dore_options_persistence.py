@@ -102,6 +102,13 @@ from utils.plan_validation import (
 )
 from utils.entry_snapshot import build_dore_entry_snapshot, save_dore_entry_snapshot
 from utils.outcome_tracking import record_final_outcome
+# [PRE_BREAKOUT activation guard] SETUP_BREAKOUT is the setup_type value
+# OptionTradePlan carries once a candidate's technical read is a genuinely
+# confirmed breakout (see utils.dore_options_engine.setup_aware_conviction).
+# Used below to decide whether a Pre-Breakout-origin plan (source == "PB",
+# see DoreOptionsPlan.source's docstring) has actually earned the right to
+# activate, or is still just coiling.
+from utils.dore_options_engine import SETUP_BREAKOUT
 
 logger = logging.getLogger(__name__)
 
@@ -496,6 +503,30 @@ def _is_stale_by_age(created_date: str, today: str, max_days: int = MAX_DORE_OPT
         return False
 
 
+def _lifecycle_age_start(plan: "DoreOptionsPlan") -> tuple[str, str]:
+    """[Timeout fix, 2026-08-12] Returns (age_date, age_at) — the clock a
+    plan's staleness/age should be measured from.
+
+    ACTIVE trades are timed from entry_triggered_at (the moment the trade
+    actually triggered), NEVER from created_at/created_date (when the
+    candidate merely started being TRACKED) — otherwise a candidate that
+    sat pre-active for N days before finally triggering would age out
+    (or report a misleading "Nd old") the instant it went ACTIVE, purely
+    because the TRACKED clock had already been running. Pre-active states
+    (TRACKED / WAITING_FOR_ENTRY / ENTRY_READY / IN_ENTRY_ZONE) have no
+    entry event yet, so they keep using created_at/created_date exactly as
+    before.
+
+    Falls back to created_at/created_date if entry_triggered_at is
+    unexpectedly empty on an ACTIVE plan (e.g. a legacy OPEN row minted
+    under the old single-step model, which never set entry_triggered_at)
+    rather than raising — matches this module's existing fail-soft style.
+    """
+    if plan.is_active() and plan.entry_triggered_at:
+        return plan.entry_triggered_at[:10], plan.entry_triggered_at
+    return plan.created_date, plan.created_at
+
+
 def _drift_pct(current_premium: Optional[float], entry_locked: Optional[float]) -> Optional[float]:
     if not current_premium or not entry_locked:
         return None
@@ -848,13 +879,39 @@ def enrich_trade_plans_with_persistence(
                 # Entry premium is locked ONLY here, at the real trigger
                 # event — never merely because the plan was tracked or
                 # confidence was high (CRITICAL BEHAVIOR CHANGE / target
-                # architecture). PRE_BREAKOUT_CE/PE candidates go through
-                # this exact same gate — nothing here special-cases
-                # source, so a Pre-Breakout setup can never jump straight
-                # to ACTIVE just because confidence cleared the floor.
+                # architecture).
                 # ══════════════════════════════════════════════════
                 in_zone = bool(execution_ok) and current_premium is not None \
                     and _ez_lo is not None and _ez_hi is not None and _ez_lo <= current_premium <= _ez_hi
+
+                # ══════════════════════════════════════════════════
+                # [2026-08-12, PRE_BREAKOUT activation guard] Explicit
+                # defensive gate — do NOT rely on the in_zone check above
+                # by itself to keep a Pre-Breakout candidate from
+                # activating. A plan minted via the Pre-Breakout squeeze-
+                # release exemption (source == "PB" — see
+                # OptionTradePlan.source's docstring; this is DORE's
+                # PRE_BREAKOUT_CE/PRE_BREAKOUT_PE tier) is still only a
+                # "coiling, about to move" read, not yet a genuine BUY/
+                # BREAKOUT recommendation. Confidence clearing
+                # MIN_CONFIDENCE_TO_TRACK or the premium wandering into
+                # the entry zone must NOT be enough to flip it to ACTIVE
+                # — this cycle's own technical read has to have actually
+                # graduated the setup to setup_type == SETUP_BREAKOUT
+                # first. Until then it stays tracked/monitored (still
+                # correctly classified as WAITING_FOR_ENTRY/ENTRY_READY/
+                # IN_ENTRY_ZONE below) rather than entering. Once the
+                # setup genuinely breaks out, setup_type flips to
+                # SETUP_BREAKOUT and normal Level 2 activation applies
+                # with no special-casing.
+                # ══════════════════════════════════════════════════
+                still_pre_breakout = locked.source == "PB" and getattr(p, "setup_type", None) != SETUP_BREAKOUT
+                if in_zone and still_pre_breakout:
+                    in_zone = False
+                    row["blocked_reason"] = (
+                        "Pre-Breakout candidate — waiting for a confirmed breakout "
+                        "before entry is allowed"
+                    )
 
                 if in_zone:
                     locked.entry_locked = current_premium
@@ -935,7 +992,14 @@ def enrich_trade_plans_with_persistence(
                 # indefinitely. Only applies once ACTIVE — the age clock
                 # is about a live position decaying, not about how long a
                 # candidate has merely been watched.
-                if not just_minted and _is_stale_by_age(locked.created_date, today):
+                # [Timeout fix, 2026-08-12] Anchored to entry_triggered_at
+                # (via _lifecycle_age_start), NOT created_date — an ACTIVE
+                # trade's holding-period clock starts at the real entry
+                # trigger, not at whenever this candidate first became
+                # TRACKED. See _lifecycle_age_start()'s docstring for the
+                # Day-0-tracked/Day-2-triggered scenario this fixes.
+                _age_date, _ = _lifecycle_age_start(locked)
+                if not just_minted and _is_stale_by_age(_age_date, today):
                     if current_premium is not None:
                         locked.last_premium = current_premium
                     locked.last_seen_at = _now_iso()
@@ -978,11 +1042,17 @@ def enrich_trade_plans_with_persistence(
             row["t1_hit_at"]         = locked.t1_hit_at or None
             row["plan_created_at"]   = locked.created_at
             row["plan_created_date"] = locked.created_date
-            row["plan_age_days"]     = _compute_days_active(locked.created_date)
+            # [Timeout fix, 2026-08-12] "Age" shown for an ACTIVE plan is
+            # time since it actually entered (entry_triggered_at), not
+            # time since it was first TRACKED — see
+            # _lifecycle_age_start()'s docstring. Pre-active statuses are
+            # unaffected (still created_date/created_at, as before).
+            _age_date, _age_at = _lifecycle_age_start(locked)
+            row["plan_age_days"]     = _compute_days_active(_age_date)
             row["status"]             = _sval(locked.status)
             row["plan_status_label"] = _lifecycle_label(
                 _sval(locked.status), row["plan_age_days"],
-                _to_ist_display(locked.created_at) or locked.created_date,
+                _to_ist_display(_age_at) or _age_date,
             )
 
             # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #1] Plan-bearing row
@@ -1058,7 +1128,11 @@ def enrich_trade_plans_with_persistence(
             plan.closed_reason_code = CLOSE_REASON_EXPIRY
             updated_plans.append(plan)
             _record_dore_final_outcome(plan)
-        elif _is_stale_by_age(plan.created_date, today):
+        elif _is_stale_by_age(_lifecycle_age_start(plan)[0], today):
+            # [Timeout fix, 2026-08-12] Same entry_triggered_at-anchored
+            # clock as the in-loop ACTIVE age-out above — a plan that
+            # wasn't reproduced this cycle still shouldn't be timed out
+            # off its TRACKED mint date if it's actually ACTIVE.
             plan.status = DoreOptionsPlanStatus.CLOSED
             plan.closed_at = _now_iso()
             plan.closed_reason = f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS}d)"
@@ -1135,7 +1209,12 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
     rows: list[dict] = []
     for plan in open_plans.values():
         try:
-            days_active = _compute_days_active(plan.created_date)
+            # [Timeout fix, 2026-08-12] ACTIVE plans show age since actual
+            # entry (entry_triggered_at), not since TRACKED mint — see
+            # _lifecycle_age_start()'s docstring. Pre-active statuses are
+            # unaffected.
+            _age_date, _age_at = _lifecycle_age_start(plan)
+            days_active = _compute_days_active(_age_date)
             status = _sval(plan.status)
             rows.append({
                 "symbol": plan.symbol,
@@ -1154,7 +1233,7 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
                 "last_seen_at": plan.last_seen_at,
                 "created_date": plan.created_date,
                 "plan_age_days": days_active,
-                "plan_status_label": _active_plan_status_label(status, days_active, plan.created_date, plan.created_at),
+                "plan_status_label": _active_plan_status_label(status, days_active, _age_date, _age_at),
             })
         except Exception:
             logger.exception("[dore_options_persistence] active_plan_rows failed for one plan — skipped")

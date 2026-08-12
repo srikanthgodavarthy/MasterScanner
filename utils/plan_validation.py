@@ -101,6 +101,24 @@ DORE_PLAN_MINT_CARRIED_FORWARD_REQUIRED_FIELDS: tuple[str, ...] = (
     "stop_loss", "target1", "target2", "drift_pct", "premium_change_pct", "entry_locked",
 )
 
+# [Fix, 2026-08-12] Referenced by utils.dore_options_persistence's
+# validate_single_plan() call site for a pre-active (TRACKED /
+# WAITING_FOR_ENTRY / ENTRY_READY / IN_ENTRY_ZONE) DoreOptionsPlan — see
+# that call site's own comment: "A plan that hasn't triggered yet ...
+# is only held to the Level 1 structural bar ... it legitimately has no
+# entry_locked/drift_pct/premium_change_pct yet." This is exactly
+# utils.dore_options_persistence._has_valid_plan_structure()'s own Level
+# 1 structural bar (stop_loss/target1/target2 must be real numbers) —
+# deliberately excludes entry_locked/drift_pct/premium_change_pct/
+# risk_reward_ratio/current_risk_reward, none of which exist yet before
+# an entry has actually triggered. Was referenced but never defined
+# here (import error on utils.dore_options_persistence — confirmed via
+# `git stash` that this predates the 2026-08-12 PRE_BREAKOUT-guard /
+# timeout-split changes).
+DORE_PLAN_TRACK_REQUIRED_FIELDS: tuple[str, ...] = (
+    "stop_loss", "target1", "target2",
+)
+
 DORE_PLAN_REQUIRED_FIELDS: tuple[str, ...] = (
     "stop_loss", "target1", "target2",
     "risk_reward_ratio", "current_risk_reward",
