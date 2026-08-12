@@ -97,7 +97,8 @@ from enum import Enum
 from typing import Optional
 
 from utils.plan_validation import (
-    DORE_PLAN_MINT_REQUIRED_FIELDS, DORE_PLAN_MINT_CARRIED_FORWARD_REQUIRED_FIELDS, validate_single_plan,
+    DORE_PLAN_MINT_REQUIRED_FIELDS, DORE_PLAN_MINT_CARRIED_FORWARD_REQUIRED_FIELDS,
+    DORE_PLAN_TRACK_REQUIRED_FIELDS, validate_single_plan,
 )
 from utils.entry_snapshot import build_dore_entry_snapshot, save_dore_entry_snapshot
 from utils.outcome_tracking import record_final_outcome
@@ -129,6 +130,10 @@ def _final_outcome_for_closed_reason(closed_reason: str) -> str:
         return "TIMEOUT"
     if "superseded" in r or "retired" in r:
         return "MANUAL_EXIT"
+    if "target 2" in r or "target2" in r:
+        return "T2_HIT"
+    if "invalidated" in r:
+        return "MANUAL_EXIT"
     return "MANUAL_EXIT"
 
 
@@ -157,31 +162,33 @@ def _record_dore_final_outcome(plan: "DoreOptionsPlan") -> None:
 # SG's request.
 MAX_DORE_OPTIONS_PLAN_AGE_DAYS = 2
 
-# [2026-08-08, confidence floor] A contract only becomes a tracked,
-# locked Active Plan (DoreOptionsPlanStatus.OPEN) the first time it's
-# seen with a confidence_score at/above this floor. A weak read simply
-# isn't worth locking an entry premium and tracking Drift %/RR for —
-# it still shows up as an ordinary Live Scan recommendation, it just
-# doesn't get promoted to a persisted Active Plan. This is a floor on
-# MINTING only: an ALREADY-open plan keeps being tracked through normal
-# confidence fluctuation on later cycles (see the minting site below
-# for why the check only applies in the `else` branch, not the
-# already-open one) — separate from the age/expiry auto-close logic,
-# which is what decides when a tracked plan stops being tracked.
+# [2026-08-12, two-level lifecycle refactor] Confidence floor for
+# LEVEL 1 — "is this opportunity good enough to remember and monitor?"
+# A contract only becomes a persisted TRACKED plan the first time it's
+# seen with confidence_score >= this floor AND a structurally valid
+# entry/SL/T1/T2 AND acceptable option liquidity (already enforced
+# upstream by utils.dore_options_engine.validate_oi_liquidity() before
+# an OptionTradePlan is ever produced — see this module's docstring).
+# This is deliberately NOT the bar for actually entering a trade —
+# entry is a separate, execution-driven event (see
+# _try_trigger_entry() below) that fires only once live premium enters
+# the plan's entry_zone. A weak read simply isn't worth remembering at
+# all; it still shows up as an ordinary Live Scan recommendation, it
+# just never becomes a persisted plan. Floor applies to MINTING only —
+# an already-TRACKED (non-CLOSED, non-ACTIVE) plan keeps being
+# monitored through normal confidence fluctuation on later cycles.
 #
-# [Raised 70 -> 80, 2026-08-11, SG request: "fewer recommendations,
-# but fair and with good momentum"] Paired with
-# DoreOptionsSettings.min_momentum_score_to_mint (utils/
-# dore_options_engine.py) — that gate cuts weak-momentum candidates
-# before scoring even runs; this floor separately cuts the volume of
-# what's left, since final_score() blends conviction/entry-quality/
-# liquidity/expiry-suitability alongside momentum, so a 70+ score
-# was reachable without being an especially strong setup on all
-# fronts at once. 82 is a deliberately aggressive cut, not a tuned
-# backtest-optimal number — revisit once there's enough closed-trade
-# history (see dore_options_plans WHERE status='CLOSED') to measure
-# whether it actually improved win rate rather than just volume.
-MIN_CONFIDENCE_TO_ACTIVATE = 80
+# [History] Was MIN_CONFIDENCE_TO_ACTIVATE = 80 under the old single-
+# step model, where crossing this floor meant "lock entry immediately"
+# — conflating "worth tracking" with "worth entering". Reset to 70 (its
+# original 2026-08-08 value) now that tracking and entering are two
+# separate gates: 70 is the Level 1 (tracking) bar; Level 2 (entry) is
+# governed by the entry-zone trigger, not by confidence at all.
+MIN_CONFIDENCE_TO_TRACK = 70
+
+# Backward-compatible alias — some call sites/tests may still reference
+# the old name. Do not use in new code.
+MIN_CONFIDENCE_TO_ACTIVATE = MIN_CONFIDENCE_TO_TRACK
 
 # [Sprint 1 — Portfolio Admission, 2026-08-05] Hard cap on simultaneously
 # OPEN DORE Options plans. Once at cap, a new candidate can still mint —
@@ -204,8 +211,69 @@ MATERIALLY_BETTER_MARGIN = 15
 
 
 class DoreOptionsPlanStatus(str, Enum):
-    OPEN   = "OPEN"     # entry is locked and still being tracked
-    CLOSED = "CLOSED"   # expiry passed, or aged out, or manually closed
+    """[2026-08-12, two-level lifecycle refactor] Replaces the old
+    binary OPEN/CLOSED model. LEVEL 1 (candidate/plan tracking):
+    TRACKED. LEVEL 2 (execution/lifecycle): WAITING_FOR_ENTRY,
+    ENTRY_READY, IN_ENTRY_ZONE, ACTIVE. Terminal: CLOSED.
+
+      TRACKED            Qualified candidate persisted, not yet
+                          executable — the instant-of-mint state,
+                          normally superseded same-cycle by whichever
+                          of the states below actually applies.
+      WAITING_FOR_ENTRY   Plan remains valid but either (a) this
+                          cycle's live premium is outside the entry
+                          zone, or (b) the plan wasn't reproduced by
+                          this cycle's fresh scan (carried-forward —
+                          still monitored, just not reaffirmed).
+      ENTRY_READY         This cycle's technical/execution conditions
+                          were freshly reaffirmed and are valid, but
+                          live premium is still outside the entry zone.
+      IN_ENTRY_ZONE       Current premium is inside the entry zone —
+                          transient: a plan reaching this state is
+                          immediately promoted to ACTIVE the same
+                          cycle (see _try_trigger_entry()), so this
+                          value is mostly informational (visible in
+                          this cycle's row/UI) rather than something
+                          that sits persisted for long.
+      ACTIVE              Entry has actually triggered — entry_locked/
+                          sl_locked/target1_locked/target2_locked are
+                          now frozen at the trigger tick's values.
+      CLOSED              Terminal — see `closed_reason_code`.
+
+    `OPEN` is kept as a legacy value only: rows written by the old
+    single-step model may still carry it in Supabase. Every read path
+    (see is_open()/is_active() and utils.supabase_client's
+    _dore_options_plan_from_row/load_open_dore_options_plans) treats a
+    legacy OPEN row as equivalent to ACTIVE — under the old model,
+    OPEN always meant "entry already locked," which is exactly what
+    ACTIVE means now. New rows never mint as OPEN.
+    """
+    TRACKED         = "TRACKED"
+    WAITING_FOR_ENTRY = "WAITING_FOR_ENTRY"
+    ENTRY_READY     = "ENTRY_READY"
+    IN_ENTRY_ZONE   = "IN_ENTRY_ZONE"
+    ACTIVE          = "ACTIVE"
+    CLOSED          = "CLOSED"
+    OPEN            = "OPEN"    # legacy — see docstring above
+
+
+# Non-terminal statuses that predate an actual locked entry (Level 1 /
+# pre-execution). Anything not in this set and not CLOSED is either
+# ACTIVE or the legacy OPEN value (both = "entry is locked").
+_PRE_ACTIVE_STATUSES = frozenset({
+    DoreOptionsPlanStatus.TRACKED.value,
+    DoreOptionsPlanStatus.WAITING_FOR_ENTRY.value,
+    DoreOptionsPlanStatus.ENTRY_READY.value,
+    DoreOptionsPlanStatus.IN_ENTRY_ZONE.value,
+})
+
+# closed_reason_code vocabulary — a short, queryable code alongside the
+# existing free-text closed_reason (kept for display/audit detail).
+CLOSE_REASON_STOP_LOSS   = "STOP_LOSS"
+CLOSE_REASON_TARGET_2    = "TARGET_2"
+CLOSE_REASON_TIMEOUT     = "TIMEOUT"
+CLOSE_REASON_EXPIRY      = "EXPIRY"
+CLOSE_REASON_INVALIDATED = "INVALIDATED"
 
 
 def _sval(status) -> str:
@@ -230,11 +298,27 @@ class DoreOptionsPlan:
     created_date:        str   = ""    # date this entry was locked (== today when minted)
     created_at:          str   = ""    # UTC ISO timestamp
 
-    entry_locked:        float = 0.0   # primary.premium at the moment this contract was first seen
+    # [2026-08-12] Now nullable/Optional — None until the entry actually
+    # triggers (Level 2). Under the old single-step model this froze at
+    # mint time and was never None; now it stays None through TRACKED /
+    # WAITING_FOR_ENTRY / ENTRY_READY / IN_ENTRY_ZONE and is only ever
+    # set once, at the moment status transitions to ACTIVE.
+    entry_locked:        Optional[float] = None   # primary.premium at the moment ENTRY actually triggered
+    # [2026-08-12] Before ACTIVE, these track the plan's CURRENT
+    # (dynamic) SL/T1/T2 from each cycle's fresh technical read — not
+    # yet frozen. The instant the plan goes ACTIVE, whatever these
+    # hold at that tick is frozen and never touched again. This is the
+    # same field/column as before; only when it stops being dynamic
+    # has changed.
     sl_locked:           Optional[float] = None
     target1_locked:      Optional[float] = None
     target2_locked:      Optional[float] = None
-    confidence_at_entry: float = 0.0   # confidence_score at the moment entry was locked (audit trail)
+    confidence_at_entry: float = 0.0   # confidence_score as of the most recent track/entry update (audit trail)
+    # [2026-08-12] UTC ISO timestamp of the ACTUAL entry trigger (premium
+    # entered the entry zone with valid execution conditions) — distinct
+    # from created_at, which is when the plan was first TRACKED. Empty
+    # until the plan goes ACTIVE.
+    entry_triggered_at:  str   = ""
 
     # [2026-08-11, SG request — DORE_LIVE_SCANNER_AUDIT follow-up]
     # The underlying's spot price at the SAME instant entry_locked was
@@ -262,9 +346,12 @@ class DoreOptionsPlan:
     last_premium:        Optional[float] = None
     last_seen_at:         str   = ""
 
-    status:              str   = DoreOptionsPlanStatus.OPEN
+    status:              str   = DoreOptionsPlanStatus.TRACKED
     closed_at:           str   = ""
     closed_reason:       str   = ""
+    # [2026-08-12] Short queryable code alongside closed_reason's free
+    # text — see the CLOSE_REASON_* constants above.
+    closed_reason_code:  str   = ""
 
     # [2026-08-05, SG request: "new plan on the same symbol only after
     # hitting T1"] Timestamp the first time this contract's live premium
@@ -290,7 +377,23 @@ class DoreOptionsPlan:
         return f"{self.symbol.upper()}|{self.direction}|{self.strike:.1f}|{self.expiry}"
 
     def is_open(self) -> bool:
-        return _sval(self.status) == DoreOptionsPlanStatus.OPEN.value
+        """True for ANY non-terminal state — TRACKED through ACTIVE
+        (plus the legacy OPEN value). This is the "still being
+        monitored, hasn't closed" check; use is_active() when you
+        specifically need "entry has actually been triggered"."""
+        return _sval(self.status) != DoreOptionsPlanStatus.CLOSED.value
+
+    def is_active(self) -> bool:
+        """True only once entry has actually triggered — ACTIVE, or
+        the legacy OPEN value (which always meant exactly that under
+        the old single-step model)."""
+        s = _sval(self.status)
+        return s == DoreOptionsPlanStatus.ACTIVE.value or s == DoreOptionsPlanStatus.OPEN.value
+
+    def is_pre_active(self) -> bool:
+        """True for a persisted-but-not-yet-entered Level 1 candidate
+        (TRACKED / WAITING_FOR_ENTRY / ENTRY_READY / IN_ENTRY_ZONE)."""
+        return _sval(self.status) in _PRE_ACTIVE_STATUSES
 
     def is_t1_hit(self) -> bool:
         return bool(self.t1_hit_at)
@@ -315,6 +418,8 @@ class DoreOptionsPlan:
             "status":              _sval(self.status),
             "closed_at":           self.closed_at or None,
             "closed_reason":       self.closed_reason,
+            "closed_reason_code":  self.closed_reason_code or "",
+            "entry_triggered_at":  self.entry_triggered_at or None,
             "t1_hit_at":           self.t1_hit_at or None,
             # NOT NULL DEFAULT '' in the DB (unlike closed_at/expiry
             # etc. above, which are nullable) — must send "" for an
@@ -421,6 +526,68 @@ def _plan_status_label(days_active: int, created_date: str, just_minted: bool, c
     return f"🟢 Active ({days_active}d · since {since})"
 
 
+def _lifecycle_label(status: str, days_active: int, since: str) -> str:
+    """[2026-08-12] Active Plans / Live Scan table badge — makes TRACKED
+    vs ENTERED visually obvious per the TARGET ARCHITECTURE's ACTIVE
+    PLAN UI requirement ("TRACKED ≠ ENTERED")."""
+    icons = {
+        DoreOptionsPlanStatus.TRACKED.value:           "🔵 Tracked",
+        DoreOptionsPlanStatus.WAITING_FOR_ENTRY.value:  "🟡 Waiting for entry",
+        DoreOptionsPlanStatus.ENTRY_READY.value:        "🟠 Entry ready",
+        DoreOptionsPlanStatus.IN_ENTRY_ZONE.value:      "🟠 In entry zone",
+        DoreOptionsPlanStatus.ACTIVE.value:             "🟢 Active",
+        DoreOptionsPlanStatus.OPEN.value:                "🟢 Active",
+    }
+    label = icons.get(status, status)
+    return f"{label} ({days_active}d · since {since})"
+
+
+def _classify_pre_active(execution_ok: bool, is_fresh: bool,
+                          current_premium: Optional[float], entry_zone) -> str:
+    """[2026-08-12] Level-2 classification for a plan that hasn't
+    triggered yet. Returns one of WAITING_FOR_ENTRY / ENTRY_READY /
+    IN_ENTRY_ZONE (never TRACKED/ACTIVE/CLOSED — callers handle those
+    separately). `is_fresh` = this cycle's live scan actually
+    reproduced/reaffirmed this contract (not a carried-forward row) —
+    distinguishes ENTRY_READY (freshly reaffirmed, still outside the
+    zone) from WAITING_FOR_ENTRY (either invalid this cycle or only
+    being monitored via a carried-forward row, not reaffirmed)."""
+    if not execution_ok:
+        return DoreOptionsPlanStatus.WAITING_FOR_ENTRY.value
+    try:
+        lo, hi = entry_zone
+    except Exception:
+        lo = hi = None
+    if current_premium is not None and lo is not None and hi is not None and lo <= current_premium <= hi:
+        return DoreOptionsPlanStatus.IN_ENTRY_ZONE.value
+    return (DoreOptionsPlanStatus.ENTRY_READY.value if is_fresh
+            else DoreOptionsPlanStatus.WAITING_FOR_ENTRY.value)
+
+
+def _has_valid_plan_structure(row: dict) -> bool:
+    """[2026-08-12, two-level lifecycle refactor] LEVEL 1 eligibility —
+    "valid entry zone exists AND valid stop loss exists AND valid
+    Target 1 / Target 2 exist". Unlike validate_single_plan() (which
+    treats a None field as "not applicable yet" — the right behavior
+    for a field like entry_locked that legitimately doesn't exist
+    before entry), a missing/None stop_loss, target1, target2, or
+    entry_zone bound here means the candidate genuinely isn't
+    structurally sound, not merely "not triggered yet" — so None is
+    treated as invalid, same as NaN/inf."""
+    from utils.plan_validation import is_invalid_number
+    for f in ("stop_loss", "target1", "target2"):
+        v = row.get(f)
+        if v is None or is_invalid_number(v):
+            return False
+    try:
+        lo, hi = row.get("entry_zone") or (None, None)
+    except Exception:
+        return False
+    if lo is None or hi is None or is_invalid_number(lo) or is_invalid_number(hi):
+        return False
+    return True
+
+
 def _blocking_open_plan(symbol: str, direction: str, this_key: str,
                          existing_plans: dict) -> Optional[DoreOptionsPlan]:
     """[2026-08-05, SG request: "new plan on the same symbol only after
@@ -451,7 +618,12 @@ def _blocking_open_plan(symbol: str, direction: str, this_key: str,
             continue
         if plan.direction != direction:
             continue
-        if plan.is_open() and not plan.is_t1_hit():
+        # [2026-08-12] Only an ACTUALLY ENTERED (ACTIVE) plan ties up
+        # real capital on this symbol/direction — a merely TRACKED /
+        # WAITING_FOR_ENTRY / ENTRY_READY candidate is just being
+        # monitored, so it no longer blocks a fresh mint the way an
+        # entered trade does.
+        if plan.is_active() and not plan.is_t1_hit():
             return plan
     return None
 
@@ -467,7 +639,10 @@ def _find_weakest_open_plan(existing_plans: dict) -> Optional[tuple[str, DoreOpt
     weakest_key: Optional[str] = None
     weakest_plan: Optional[DoreOptionsPlan] = None
     for key, plan in existing_plans.items():
-        if not plan.is_open():
+        # [2026-08-12] Portfolio cap protects capital tied up in
+        # ACTUALLY ENTERED trades — a TRACKED/WAITING/ENTRY_READY
+        # candidate isn't holding a position, so it's excluded here too.
+        if not plan.is_active():
             continue
         if weakest_plan is None:
             weakest_key, weakest_plan = key, plan
@@ -482,8 +657,11 @@ def _find_weakest_open_plan(existing_plans: dict) -> Optional[tuple[str, DoreOpt
     return weakest_key, weakest_plan
 
 
-def _count_open(existing_plans: dict) -> int:
-    return sum(1 for p in existing_plans.values() if p.is_open())
+def _count_active(existing_plans: dict) -> int:
+    """[2026-08-12] Portfolio cap counts ACTIVE (entered) plans only —
+    TRACKED/WAITING_FOR_ENTRY/ENTRY_READY candidates don't occupy a
+    capital slot. See MAX_ACTIVE_DORE_OPTIONS_PLANS."""
+    return sum(1 for p in existing_plans.values() if p.is_active())
 
 
 def enrich_trade_plans_with_persistence(
@@ -539,21 +717,30 @@ def enrich_trade_plans_with_persistence(
 
             row = p.to_dict()
             current_premium = getattr(p, "current_premium", None)
+            # [2026-08-12] Computed unconditionally (used both for the
+            # Level 1 mint gate below AND to refresh confidence_at_entry
+            # on an already-tracked, not-yet-active plan every cycle it's
+            # freshly reproduced).
+            confidence_score = float(getattr(p, "confidence_score", 0.0) or 0.0)
+            is_fresh = not row.get("_carried_forward")
 
             existing = open_now.get(key)
+            just_activated = False   # set True below only at the actual Level-2 entry trigger
             if existing is not None and existing.is_open():
                 locked = existing
                 just_minted = False
             else:
-                # [2026-08-08, confidence floor] Only mint a NEW locked
-                # Active Plan when this cycle's confidence_score clears
-                # MIN_CONFIDENCE_TO_ACTIVATE — see that constant's
-                # docstring. Deliberately only gates the mint path (this
-                # `else` branch); an already-open plan (the `if` branch
-                # above) is exempt and keeps being tracked regardless of
-                # later confidence fluctuation.
-                confidence_score = float(getattr(p, "confidence_score", 0.0) or 0.0)
-                if confidence_score < MIN_CONFIDENCE_TO_ACTIVATE:
+                # [2026-08-12, two-level lifecycle] Only mint a NEW
+                # Level 1 TRACKED plan when this cycle's confidence_score
+                # clears MIN_CONFIDENCE_TO_TRACK — see that constant's
+                # docstring. This is a "worth remembering" gate only; it
+                # does NOT lock an entry premium or mean the trade has
+                # been entered (that's Level 2, decided below regardless
+                # of how the plan came to exist). Deliberately only gates
+                # the mint path (this `else` branch); an already-tracked
+                # plan (the `if` branch above) is exempt and keeps being
+                # monitored regardless of later confidence fluctuation.
+                if confidence_score < MIN_CONFIDENCE_TO_TRACK:
                     enriched_rows.append(row)   # still shown as a Live Scan recommendation, just not tracked
                     continue
 
@@ -575,22 +762,25 @@ def enrich_trade_plans_with_persistence(
                             f"Superseded by stronger same-symbol/direction setup "
                             f"({confidence_score:.0f} vs {dup.confidence_at_entry:.0f})"
                         )
+                        dup.closed_reason_code = CLOSE_REASON_INVALIDATED
                         updated_plans.append(dup)
                         open_now.pop(dup.contract_key, None)
                         _record_dore_final_outcome(dup)
                     else:
-                        row["blocked_reason"] = "Existing open plan on this symbol/direction hasn't hit T1 yet"
+                        row["blocked_reason"] = "Existing active plan on this symbol/direction hasn't hit T1 yet"
                         enriched_rows.append(row)
                         continue
 
                 # [Sprint 1 — Portfolio Manager / Quality Ranking,
                 # 2026-08-05] Book is full: only let a new candidate in
-                # by retiring the single weakest OPEN plan, and only
+                # by retiring the single weakest ACTIVE plan, and only
                 # when it clears that plan's confidence_at_entry by
                 # MATERIALLY_BETTER_MARGIN. Otherwise the candidate is
                 # rejected — shown as an ordinary Live Scan row, never
-                # tracked.
-                if _count_open(open_now) >= MAX_ACTIVE_DORE_OPTIONS_PLANS:
+                # tracked. [2026-08-12] Counts ACTIVE (entered) plans
+                # only, not merely-tracked candidates — see
+                # _count_active()'s docstring.
+                if _count_active(open_now) >= MAX_ACTIVE_DORE_OPTIONS_PLANS:
                     weakest = _find_weakest_open_plan(open_now)
                     if weakest is not None and confidence_score >= weakest[1].confidence_at_entry + MATERIALLY_BETTER_MARGIN:
                         weakest_key, weakest_plan = weakest
@@ -600,6 +790,7 @@ def enrich_trade_plans_with_persistence(
                             f"Retired — portfolio full, replaced by stronger candidate "
                             f"({confidence_score:.0f} vs {weakest_plan.confidence_at_entry:.0f})"
                         )
+                        weakest_plan.closed_reason_code = CLOSE_REASON_INVALIDATED
                         updated_plans.append(weakest_plan)
                         open_now.pop(weakest_key, None)
                         _record_dore_final_outcome(weakest_plan)
@@ -609,8 +800,13 @@ def enrich_trade_plans_with_persistence(
                         continue
 
                 # Fresh contract (or the prior entry for this exact key
-                # had already been closed) — mint + lock a new entry at
-                # THIS tick's primary premium.
+                # had already been closed) — mint a new LEVEL 1 TRACKED
+                # plan. [2026-08-12] Entry is deliberately NOT locked
+                # here — entry_locked stays None until Level 2 actually
+                # triggers below. sl/target1/target2 are captured as this
+                # cycle's CURRENT (dynamic) levels, refreshed every cycle
+                # until the plan goes ACTIVE, at which point whatever
+                # they hold is frozen.
                 locked = DoreOptionsPlan(
                     plan_id=_make_plan_id(symbol, direction, strike, expiry, today),
                     symbol=symbol,
@@ -619,68 +815,138 @@ def enrich_trade_plans_with_persistence(
                     expiry=expiry,
                     created_date=today,
                     created_at=_now_iso(),
-                    entry_locked=current_premium or 0.0,
-                    entry_underlying=row.get("current_price"),
+                    entry_locked=None,
+                    entry_underlying=None,
                     sl_locked=getattr(p, "stop_loss", None),
                     target1_locked=getattr(p, "target1", None),
                     target2_locked=getattr(p, "target2", None),
                     confidence_at_entry=confidence_score,
-                    status=DoreOptionsPlanStatus.OPEN,
+                    status=DoreOptionsPlanStatus.TRACKED,
                     source=row.get("source") or "",
                 )
                 just_minted = True
                 open_now[key] = locked
 
+            # ══════════════════════════════════════════════════════
+            # LEVEL 1 eligibility (structural validity) for this cycle —
+            # used both to decide the pre-active classification below and
+            # (further down) to gate persistence. Liquidity is NOT
+            # re-checked here: validate_oi_liquidity() already gated the
+            # candidate strike before an OptionTradePlan was ever
+            # produced — see this module's docstring / TARGET ARCHITECTURE.
+            # ══════════════════════════════════════════════════════
+            execution_ok = _has_valid_plan_structure(row)
+            entry_zone = row.get("entry_zone") or getattr(p, "entry_zone", None) or (None, None)
+            try:
+                _ez_lo, _ez_hi = entry_zone
+            except Exception:
+                _ez_lo = _ez_hi = None
+
+            if not locked.is_active():
+                # ══════════════════════════════════════════════════
+                # LEVEL 2 — has execution actually triggered this cycle?
+                # Entry premium is locked ONLY here, at the real trigger
+                # event — never merely because the plan was tracked or
+                # confidence was high (CRITICAL BEHAVIOR CHANGE / target
+                # architecture). PRE_BREAKOUT_CE/PE candidates go through
+                # this exact same gate — nothing here special-cases
+                # source, so a Pre-Breakout setup can never jump straight
+                # to ACTIVE just because confidence cleared the floor.
+                # ══════════════════════════════════════════════════
+                in_zone = bool(execution_ok) and current_premium is not None \
+                    and _ez_lo is not None and _ez_hi is not None and _ez_lo <= current_premium <= _ez_hi
+
+                if in_zone:
+                    locked.entry_locked = current_premium
+                    locked.entry_underlying = row.get("current_price")
+                    locked.sl_locked = getattr(p, "stop_loss", None)
+                    locked.target1_locked = getattr(p, "target1", None)
+                    locked.target2_locked = getattr(p, "target2", None)
+                    locked.confidence_at_entry = confidence_score
+                    locked.status = DoreOptionsPlanStatus.ACTIVE
+                    locked.entry_triggered_at = _now_iso()
+                    just_activated = True
+                else:
+                    # Still pre-active. Keep SL/T1/T2 dynamic — refreshed
+                    # from this cycle's own technical read only when this
+                    # cycle actually reaffirmed the contract (not a
+                    # carried-forward row monitored between sightings).
+                    if is_fresh:
+                        locked.sl_locked = getattr(p, "stop_loss", None)
+                        locked.target1_locked = getattr(p, "target1", None)
+                        locked.target2_locked = getattr(p, "target2", None)
+                        locked.confidence_at_entry = confidence_score
+                    locked.status = _classify_pre_active(execution_ok, is_fresh, current_premium, entry_zone)
+
             drift = _drift_pct(current_premium, locked.entry_locked)
 
-            # [2026-08-05, SG request] Detect T1 the moment it's reached
-            # and freeze it — sticky, never cleared even if premium later
-            # falls back below target1_locked. This is what
-            # _has_blocking_open_plan_on_symbol() checks before allowing
-            # a new contract to mint on the same symbol.
-            if (not locked.t1_hit_at and current_premium is not None
-                    and locked.target1_locked is not None
-                    and current_premium >= locked.target1_locked):
-                locked.t1_hit_at = _now_iso()
+            if locked.is_active():
+                # [2026-08-05, SG request] Detect T1 the moment it's
+                # reached and freeze it — sticky, never cleared even if
+                # premium later falls back below target1_locked. This is
+                # what _blocking_open_plan() checks before allowing a new
+                # contract to mint on the same symbol. Only meaningful
+                # once ACTIVE — a pre-active plan's target1_locked is
+                # still a moving (dynamic) number, not a real target yet.
+                if (not locked.t1_hit_at and current_premium is not None
+                        and locked.target1_locked is not None
+                        and current_premium >= locked.target1_locked):
+                    locked.t1_hit_at = _now_iso()
 
-            # [2026-08-11, SG request] Stop-loss auto-close — previously
-            # sl_locked was stored and displayed everywhere but nothing
-            # ever actually enforced it: the only auto-close triggers
-            # were age and expiry, so a plan could keep drifting well
-            # past its own stop indefinitely (confirmed live: PGEL,
-            # HINDALCO, FEDERALBNK all sitting OPEN 20-55% below their
-            # locked stop). Checked here, ahead of the age-based close
-            # below, so a stopped-out plan is reported as "Stop-loss
-            # hit" rather than possibly also qualifying for the age-out
-            # reason on the same cycle.
-            if (current_premium is not None and locked.sl_locked is not None
-                    and current_premium <= locked.sl_locked):
-                locked.last_premium = current_premium
-                locked.last_seen_at = _now_iso()
-                locked.status = DoreOptionsPlanStatus.CLOSED
-                locked.closed_at = _now_iso()
-                locked.closed_reason = "Stop-loss hit"
-                updated_plans.append(locked)
-                _record_dore_final_outcome(locked)
-                enriched_rows.append(p.to_dict())   # still shown this cycle as a fresh recommendation, just no longer a tracked Active Plan
-                continue
-
-            # [2026-08-04, SG request] Age-based auto-close — checked
-            # here (not only in the not-reproduced cleanup pass below)
-            # because a contract Stage 1 keeps recommending every cycle
-            # never shows up as "not reproduced", so it would otherwise
-            # never reach that pass and could stay OPEN indefinitely.
-            if not just_minted and _is_stale_by_age(locked.created_date, today):
-                if current_premium is not None:
+                # [2026-08-11, SG request] Stop-loss auto-close — checked
+                # ahead of Target 2 / age-based close below, so a
+                # stopped-out plan is reported as "Stop-loss hit" rather
+                # than possibly also qualifying for another reason on the
+                # same cycle.
+                if (current_premium is not None and locked.sl_locked is not None
+                        and current_premium <= locked.sl_locked):
                     locked.last_premium = current_premium
-                locked.last_seen_at = _now_iso()
-                locked.status = DoreOptionsPlanStatus.CLOSED
-                locked.closed_at = _now_iso()
-                locked.closed_reason = f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS}d)"
-                updated_plans.append(locked)
-                _record_dore_final_outcome(locked)
-                enriched_rows.append(p.to_dict())   # still shown this cycle as a fresh recommendation, just no longer a tracked Active Plan
-                continue
+                    locked.last_seen_at = _now_iso()
+                    locked.status = DoreOptionsPlanStatus.CLOSED
+                    locked.closed_at = _now_iso()
+                    locked.closed_reason = "Stop-loss hit"
+                    locked.closed_reason_code = CLOSE_REASON_STOP_LOSS
+                    updated_plans.append(locked)
+                    _record_dore_final_outcome(locked)
+                    enriched_rows.append(p.to_dict())   # still shown this cycle as a fresh recommendation, just no longer a tracked Active Plan
+                    continue
+
+                # [2026-08-12] Target 2 auto-close — T1 stays a sticky
+                # milestone (t1_hit_at) rather than closing the plan, per
+                # the TARGET ARCHITECTURE; T2 is the actual close event.
+                if (current_premium is not None and locked.target2_locked is not None
+                        and current_premium >= locked.target2_locked):
+                    locked.last_premium = current_premium
+                    locked.last_seen_at = _now_iso()
+                    locked.status = DoreOptionsPlanStatus.CLOSED
+                    locked.closed_at = _now_iso()
+                    locked.closed_reason = "Target 2 hit"
+                    locked.closed_reason_code = CLOSE_REASON_TARGET_2
+                    updated_plans.append(locked)
+                    _record_dore_final_outcome(locked)
+                    enriched_rows.append(p.to_dict())
+                    continue
+
+                # [2026-08-04, SG request] Age-based auto-close — checked
+                # here (not only in the not-reproduced cleanup pass below)
+                # because a contract Stage 1 keeps recommending every
+                # cycle never shows up as "not reproduced", so it would
+                # otherwise never reach that pass and could stay ACTIVE
+                # indefinitely. Only applies once ACTIVE — the age clock
+                # is about a live position decaying, not about how long a
+                # candidate has merely been watched.
+                if not just_minted and _is_stale_by_age(locked.created_date, today):
+                    if current_premium is not None:
+                        locked.last_premium = current_premium
+                    locked.last_seen_at = _now_iso()
+                    locked.status = DoreOptionsPlanStatus.CLOSED
+                    locked.closed_at = _now_iso()
+                    locked.closed_reason = f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS}d)"
+                    locked.closed_reason_code = CLOSE_REASON_TIMEOUT
+                    updated_plans.append(locked)
+                    _record_dore_final_outcome(locked)
+                    enriched_rows.append(p.to_dict())   # still shown this cycle as a fresh recommendation, just no longer a tracked Active Plan
+                    continue
 
             # Refresh the "last known" premium every cycle this contract
             # is actually reproduced — and persist regardless of
@@ -713,28 +979,40 @@ def enrich_trade_plans_with_persistence(
             row["plan_created_at"]   = locked.created_at
             row["plan_created_date"] = locked.created_date
             row["plan_age_days"]     = _compute_days_active(locked.created_date)
-            row["plan_status_label"] = _plan_status_label(row["plan_age_days"], locked.created_date, just_minted, locked.created_at)
+            row["status"]             = _sval(locked.status)
+            row["plan_status_label"] = _lifecycle_label(
+                _sval(locked.status), row["plan_age_days"],
+                _to_ist_display(locked.created_at) or locked.created_date,
+            )
 
             # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #1] Plan-bearing row
-            # (an entry has just been locked/refreshed) — validate before
-            # this contract's DoreOptionsPlan is allowed into the batch
-            # that upsert_dore_options_plans_batch() persists. A row that
-            # fails stays in `enriched_rows` (still visible in the Live
-            # Scan table, tagged _quarantined) but its `locked` plan is
-            # dropped from `updated_plans` this cycle rather than being
-            # upserted with NaN/inf silently nulled — see
-            # utils.plan_validation's module docstring for why
+            # — validate before this contract's DoreOptionsPlan is
+            # allowed into the batch that upsert_dore_options_plans_batch()
+            # persists. A row that fails stays in `enriched_rows` (still
+            # visible in the Live Scan table, tagged _quarantined) but its
+            # `locked` plan is dropped from `updated_plans` this cycle
+            # rather than being upserted with NaN/inf silently nulled —
+            # see utils.plan_validation's module docstring for why
             # json_sanitize alone isn't an acceptable gate here.
             #
-            # [Fix, this review round] A carried-forward row (`p` wraps a
-            # synthesized dict — see utils.dore_live_state's
-            # "_carried_forward" merge) structurally lacks
-            # risk_reward_ratio; validating it against the same field
-            # list as a freshly-minted OptionTradePlan-based row would
-            # silently stop persisting the premium/drift refresh for
-            # every genuinely open carried-forward position, every cycle.
-            _required = (DORE_PLAN_MINT_CARRIED_FORWARD_REQUIRED_FIELDS if row.get("_carried_forward")
-                         else DORE_PLAN_MINT_REQUIRED_FIELDS)
+            # [2026-08-12] A plan that hasn't triggered yet (TRACKED /
+            # WAITING_FOR_ENTRY / ENTRY_READY / IN_ENTRY_ZONE) is only
+            # held to the Level 1 structural bar (DORE_PLAN_TRACK_
+            # REQUIRED_FIELDS) — it legitimately has no entry_locked/
+            # drift_pct/premium_change_pct yet (see that constant's
+            # docstring). Only an ACTIVE plan is held to the full
+            # entry-bearing field list, same as the old model. A
+            # carried-forward row (`p` wraps a synthesized dict — see
+            # utils.dore_live_state's "_carried_forward" merge)
+            # structurally lacks risk_reward_ratio; validating it against
+            # the same field list as a freshly-minted OptionTradePlan-
+            # based row would silently stop persisting the premium/drift
+            # refresh for every genuinely active carried-forward position.
+            if not locked.is_active():
+                _required = DORE_PLAN_TRACK_REQUIRED_FIELDS
+            else:
+                _required = (DORE_PLAN_MINT_CARRIED_FORWARD_REQUIRED_FIELDS if row.get("_carried_forward")
+                             else DORE_PLAN_MINT_REQUIRED_FIELDS)
             if not validate_single_plan(row, _required,
                                          source="dore_options_persistence", symbol_field="symbol"):
                 if just_minted:
@@ -744,13 +1022,18 @@ def enrich_trade_plans_with_persistence(
                 enriched_rows.append(row)
                 continue
 
-            if just_minted:
+            if just_activated:
+                # [2026-08-12] Snapshot captures the state AT ENTRY, not
+                # at tracking — gated on the real Level-2 trigger event
+                # (just_activated), not on just_minted (which now only
+                # means "just became a Level 1 candidate" and may have
+                # no locked entry at all).
                 try:
                     snapshot = build_dore_entry_snapshot(row, locked.plan_id, symbol)
                     save_dore_entry_snapshot(snapshot)
                 except Exception:
                     logger.exception("[dore_options_persistence] entry-snapshot capture failed for plan_id=%s "
-                                      "(non-fatal — plan itself is still minted/persisted)", locked.plan_id)
+                                      "(non-fatal — plan itself is still active/persisted)", locked.plan_id)
 
             enriched_rows.append(row)
         except Exception:
@@ -772,12 +1055,14 @@ def enrich_trade_plans_with_persistence(
             plan.status = DoreOptionsPlanStatus.CLOSED
             plan.closed_at = _now_iso()
             plan.closed_reason = "Expired"
+            plan.closed_reason_code = CLOSE_REASON_EXPIRY
             updated_plans.append(plan)
             _record_dore_final_outcome(plan)
         elif _is_stale_by_age(plan.created_date, today):
             plan.status = DoreOptionsPlanStatus.CLOSED
             plan.closed_at = _now_iso()
             plan.closed_reason = f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS}d)"
+            plan.closed_reason_code = CLOSE_REASON_TIMEOUT
             updated_plans.append(plan)
             _record_dore_final_outcome(plan)
 
@@ -785,25 +1070,56 @@ def enrich_trade_plans_with_persistence(
 
 
 # ══════════════════════════════════════════════════════════════════
-#  ACTIVE PLANS TAB — every currently-OPEN locked entry, independent of
-#  whether this cycle's live scan reproduced it. 2026-08-01.
+#  ACTIVE PLANS TAB — every currently-open (non-CLOSED) plan at ANY
+#  lifecycle stage, independent of whether this cycle's live scan
+#  reproduced it. 2026-08-01; renamed in spirit (not in code) 2026-08-12
+#  to cover the full TRACKED..ACTIVE range, not just locked entries —
+#  see _lifecycle_group() below for the UI's TRACKED-vs-ENTERED split.
 # ══════════════════════════════════════════════════════════════════
 
-def _active_plan_status_label(days_active: int, created_date: str, last_seen_at: str, created_at: str = "") -> str:
-    # [2026-08-04] Now shows full IST timestamp via created_at, same as
-    # _plan_status_label above — was previously date-only (created_date)
-    # regardless of the last_seen_at argument, which this function took
-    # but never actually used.
+def _lifecycle_group(status: str) -> str:
+    """[2026-08-12, ACTIVE PLAN UI] Coarse grouping for the Active Plans
+    tab so a merely-TRACKED/WAITING/ENTRY_READY candidate is never mixed
+    into the same visual bucket as an actually-ENTERED (ACTIVE) trade —
+    "TRACKED ≠ ENTERED" per the target architecture. Returns one of
+    "TRACKED" (Level 1 candidate, not yet executable), "MONITORING"
+    (Level 2, watching for entry), "ACTIVE" (entered), or the status
+    itself for CLOSED/unknown values."""
+    if status == DoreOptionsPlanStatus.TRACKED.value:
+        return "TRACKED"
+    if status in (DoreOptionsPlanStatus.WAITING_FOR_ENTRY.value,
+                  DoreOptionsPlanStatus.ENTRY_READY.value,
+                  DoreOptionsPlanStatus.IN_ENTRY_ZONE.value):
+        return "MONITORING"
+    if status in (DoreOptionsPlanStatus.ACTIVE.value, DoreOptionsPlanStatus.OPEN.value):
+        return "ACTIVE"
+    return status
+
+
+def _active_plan_status_label(status: str, days_active: int, created_date: str, created_at: str = "") -> str:
+    # [2026-08-12] Now reflects the plan's REAL lifecycle status
+    # (TRACKED/WAITING_FOR_ENTRY/ENTRY_READY/IN_ENTRY_ZONE/ACTIVE)
+    # instead of always claiming "Active" — see _lifecycle_label() for
+    # the icon map shared with the Live Scan table's badge.
     since = _to_ist_display(created_at) if created_at else created_date
-    return f"🟢 Active ({days_active}d · since {since})"
+    return _lifecycle_label(status, days_active, since)
 
 
 def active_plan_rows(open_plans: dict) -> list[dict]:
-    """Builds one row per currently-OPEN DoreOptionsPlan, for the Active
-    Plans tab (pages/scanner.py's _active_plans_table_html). `open_plans`
-    is {contract_key: DoreOptionsPlan}, as returned by
+    """Builds one row per currently-open (non-CLOSED) DoreOptionsPlan,
+    for the Active Plans tab (pages/scanner.py's _active_plans_table_html).
+    `open_plans` is {contract_key: DoreOptionsPlan}, as returned by
     utils.supabase_client.load_open_dore_options_plans() — call that
     fresh each render, this function does no I/O of its own.
+
+    [2026-08-12] Covers the FULL lifecycle now — TRACKED and
+    WAITING_FOR_ENTRY/ENTRY_READY/IN_ENTRY_ZONE candidates are included
+    alongside ACTIVE (entered) plans, each tagged with `lifecycle_group`
+    (TRACKED / MONITORING / ACTIVE) so the UI can group/filter them
+    distinctly rather than rendering every row as though it were an
+    entered trade. `entry_locked`/`last_drift_pct` are naturally None
+    for anything not yet ACTIVE — that's the correct, honest reading
+    (there IS no entry yet), not a data gap.
 
     Every field here comes from the persisted plan itself — current
     premium is "last known" (as of last_seen_at), not re-fetched live,
@@ -820,12 +1136,15 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
     for plan in open_plans.values():
         try:
             days_active = _compute_days_active(plan.created_date)
+            status = _sval(plan.status)
             rows.append({
                 "symbol": plan.symbol,
                 "direction": plan.direction,
                 "source": plan.source or "",
                 "strike": plan.strike,
                 "expiry": plan.expiry,
+                "status": status,
+                "lifecycle_group": _lifecycle_group(status),
                 "entry_locked": plan.entry_locked or None,
                 "saved_stop_loss": plan.sl_locked,
                 "saved_target1": plan.target1_locked,
@@ -835,7 +1154,7 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
                 "last_seen_at": plan.last_seen_at,
                 "created_date": plan.created_date,
                 "plan_age_days": days_active,
-                "plan_status_label": _active_plan_status_label(days_active, plan.created_date, plan.last_seen_at, plan.created_at),
+                "plan_status_label": _active_plan_status_label(status, days_active, plan.created_date, plan.created_at),
             })
         except Exception:
             logger.exception("[dore_options_persistence] active_plan_rows failed for one plan — skipped")

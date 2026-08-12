@@ -1033,6 +1033,7 @@ def upsert_dore_options_plans_batch(plans: list[dict]) -> bool:
 def _dore_options_plan_from_row(row: dict) -> "object":
     from utils.dore_options_persistence import DoreOptionsPlan
 
+    _entry_locked = row.get("entry_locked")
     return DoreOptionsPlan(
         plan_id             = row.get("plan_id", ""),
         symbol               = row.get("symbol", ""),
@@ -1041,7 +1042,12 @@ def _dore_options_plan_from_row(row: dict) -> "object":
         expiry               = str(row.get("expiry", "") or ""),
         created_date         = str(row.get("created_date", "")),
         created_at           = str(row.get("created_at", "") or ""),
-        entry_locked         = float(row.get("entry_locked", 0) or 0),
+        # [2026-08-12, two-level lifecycle] entry_locked is nullable now
+        # — None means "not yet entered" (TRACKED/WAITING_FOR_ENTRY/
+        # ENTRY_READY/IN_ENTRY_ZONE), not 0.0. A legacy row written
+        # before this migration always has a real (non-null) value here
+        # since the old model locked it at mint time.
+        entry_locked         = float(_entry_locked) if _entry_locked is not None else None,
         sl_locked            = row.get("sl_locked"),
         target1_locked       = row.get("target1_locked"),
         target2_locked       = row.get("target2_locked"),
@@ -1049,20 +1055,38 @@ def _dore_options_plan_from_row(row: dict) -> "object":
         entry_underlying     = row.get("entry_underlying"),
         last_premium         = row.get("last_premium"),
         last_seen_at         = str(row.get("last_seen_at", "") or ""),
-        status               = row.get("status", "OPEN") or "OPEN",
+        # [2026-08-12] A legacy row's status column literally says
+        # 'OPEN' — DoreOptionsPlan.is_active()/is_open() both already
+        # treat that value as equivalent to ACTIVE (see
+        # DoreOptionsPlanStatus's docstring), so no rewrite is needed
+        # here; the value is read through as-is.
+        status               = row.get("status", "TRACKED") or "TRACKED",
         closed_at            = str(row.get("closed_at", "") or ""),
         closed_reason        = row.get("closed_reason", "") or "",
+        closed_reason_code   = row.get("closed_reason_code", "") or "",
+        entry_triggered_at   = str(row.get("entry_triggered_at", "") or ""),
         source               = row.get("source", "") or "",
         t1_hit_at            = str(row.get("t1_hit_at", "") or ""),
     )
 
 
 def load_open_dore_options_plans() -> dict:
-    """Return every OPEN DORE Options locked entry as {contract_key: DoreOptionsPlan}."""
+    """Return every currently-open DORE Options plan — ANY non-CLOSED
+    lifecycle stage (TRACKED / WAITING_FOR_ENTRY / ENTRY_READY /
+    IN_ENTRY_ZONE / ACTIVE, plus the legacy OPEN value) — as
+    {contract_key: DoreOptionsPlan}.
+
+    [2026-08-12, two-level lifecycle refactor] Was `WHERE status = 'OPEN'`
+    under the old single-step model, where OPEN was the only non-CLOSED
+    value that ever existed. Now there are several non-CLOSED statuses,
+    so this selects everything EXCEPT CLOSED instead of matching one
+    literal value — this is what lets a merely-TRACKED candidate survive
+    a temporary scan disappearance exactly like an ACTIVE plan already
+    did (see utils.dore_options_persistence's PERSISTENCE REQUIREMENTS)."""
     if not db.is_available():
         return {}
     try:
-        rows = db.fetch_all("SELECT * FROM dore_options_plans WHERE status = %s", ("OPEN",))
+        rows = db.fetch_all("SELECT * FROM dore_options_plans WHERE status != %s", ("CLOSED",))
         if not rows:
             return {}
         result = {}
@@ -1688,7 +1712,13 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
     created_date              date        NOT NULL,
     created_at                 timestamptz NOT NULL DEFAULT now(),
 
-    entry_locked               numeric(12,2) NOT NULL DEFAULT 0,
+    -- [2026-08-12, two-level lifecycle refactor] Nullable now — None/
+    -- NULL means "not yet entered" (TRACKED / WAITING_FOR_ENTRY /
+    -- ENTRY_READY / IN_ENTRY_ZONE). Was NOT NULL DEFAULT 0 under the
+    -- old single-step model, where entry was always locked at mint
+    -- time. See DORE_OPTIONS_PLANS_LIFECYCLE_MIGRATION_SQL below for
+    -- the ALTER TABLE that relaxes this on an existing table.
+    entry_locked               numeric(12,2),
     sl_locked                    numeric(12,2),
     target1_locked               numeric(12,2),
     target2_locked               numeric(12,2),
@@ -1704,9 +1734,22 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
     last_premium                 numeric(12,2),
     last_seen_at                  timestamptz,
 
-    status                      text        NOT NULL DEFAULT 'OPEN',
+    -- [2026-08-12] TRACKED / WAITING_FOR_ENTRY / ENTRY_READY /
+    -- IN_ENTRY_ZONE / ACTIVE / CLOSED (legacy rows may still say OPEN —
+    -- treated as ACTIVE everywhere it's read, see
+    -- utils.dore_options_persistence.DoreOptionsPlanStatus's docstring).
+    -- Plain text column, no CHECK constraint, so this list can evolve
+    -- without a schema migration.
+    status                      text        NOT NULL DEFAULT 'TRACKED',
     closed_at                    timestamptz,
     closed_reason                text        NOT NULL DEFAULT '',
+    -- [2026-08-12] Short queryable code alongside closed_reason's free
+    -- text — STOP_LOSS / TARGET_2 / TIMEOUT / EXPIRY / INVALIDATED.
+    closed_reason_code           text        NOT NULL DEFAULT '',
+    -- [2026-08-12] UTC ISO timestamp of the actual Level-2 entry
+    -- trigger — distinct from created_at (when the plan was first
+    -- TRACKED). NULL until the plan goes ACTIVE.
+    entry_triggered_at           timestamptz,
 
     t1_hit_at                    timestamptz,
     source                      text        NOT NULL DEFAULT '',
@@ -1734,6 +1777,45 @@ ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS t1_hit_at timestamptz;
 
 DORE_OPTIONS_PLANS_ENTRY_UNDERLYING_MIGRATION_SQL = """
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS entry_underlying numeric(12,2);
+"""
+# [2026-08-12, two-level lifecycle refactor] Run this once against an
+# existing dore_options_plans table.
+#
+#   1. entry_locked's NOT NULL DEFAULT 0 is dropped — a pre-active
+#      (TRACKED/WAITING_FOR_ENTRY/ENTRY_READY/IN_ENTRY_ZONE) plan now
+#      legitimately has no locked entry yet. Existing rows are NEVER
+#      rewritten to NULL by this migration — every row that predates it
+#      already has a real, non-zero entry_locked (the old model always
+#      locked it at mint), so leaving existing values exactly as they
+#      are is both correct and the safe, non-destructive choice.
+#   2. Three new columns: closed_reason_code (STOP_LOSS / TARGET_2 /
+#      TIMEOUT / EXPIRY / INVALIDATED — short code alongside the
+#      existing free-text closed_reason), entry_triggered_at (UTC ISO
+#      timestamp of the real Level-2 entry event, distinct from
+#      created_at), and the status column's DEFAULT changes going
+#      forward to 'TRACKED' (existing rows are NOT rewritten — see the
+#      status backfill note below).
+#   3. Status backfill (see "MIGRATION / BACKWARD COMPATIBILITY" in the
+#      refactor spec): every existing row's status is either 'OPEN' or
+#      'CLOSED' under the old model. This migration leaves 'OPEN' rows
+#      exactly as 'OPEN' rather than rewriting them to 'ACTIVE' — no
+#      historical data is destroyed, and every read path
+#      (DoreOptionsPlan.is_open()/is_active(),
+#      load_open_dore_options_plans()'s "status != 'CLOSED'" filter)
+#      already treats a literal 'OPEN' value as equivalent to ACTIVE, so
+#      no functional gap exists either way. If a hard rewrite to the
+#      literal string 'ACTIVE' is ever wanted (e.g. for a downstream
+#      dashboard that filters on status='ACTIVE' specifically rather
+#      than going through this module's helpers), uncomment the UPDATE
+#      below — it is deliberately commented out by default since it's
+#      optional, not required for correctness:
+#   UPDATE dore_options_plans SET status = 'ACTIVE' WHERE status = 'OPEN';
+DORE_OPTIONS_PLANS_LIFECYCLE_MIGRATION_SQL = """
+ALTER TABLE dore_options_plans ALTER COLUMN entry_locked DROP NOT NULL;
+ALTER TABLE dore_options_plans ALTER COLUMN entry_locked DROP DEFAULT;
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS closed_reason_code text NOT NULL DEFAULT '';
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS entry_triggered_at timestamptz;
+ALTER TABLE dore_options_plans ALTER COLUMN status SET DEFAULT 'TRACKED';
 """
 
 SETUP_PLANS_MIGRATION_SQL = """
