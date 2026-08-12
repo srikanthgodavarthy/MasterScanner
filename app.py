@@ -143,9 +143,12 @@ h1,h2,h3 { font-family: 'Syne', sans-serif !important; }
     background:#00ff88; box-shadow:0 0 8px #00ff88;
     animation:pulse 2s infinite; margin-right:6px;
 }
-.trinity-i { position:relative; }
-.trinity-i::before {
-    content:''; position:absolute; left:50%; top:-0.7em;
+.trinity-symbol {
+    position:relative; display:inline-block;
+    color:#f59e0b; -webkit-text-fill-color:#f59e0b;
+}
+.trinity-symbol::after {
+    content:''; position:absolute; left:50%; bottom:-3px;
     transform:translateX(-50%);
     width:7px; height:7px; border-radius:50%;
     background:#00ff88; box-shadow:0 0 8px #00ff88;
@@ -162,7 +165,7 @@ footer { display:none !important; }
 
 st.markdown("""
 <div class="scanner-header">
-    <p class="scanner-title">🔱 Tr<span class="trinity-i">i</span>nity</p>
+    <p class="scanner-title"><span class="trinity-symbol">🔱</span> Trinity</p>
 </div>
 """, unsafe_allow_html=True)
 
