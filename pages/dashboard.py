@@ -2575,17 +2575,17 @@ def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
 
 
 # ── ACTIVE OPTIONS PLANS (compact card) ─────────────────────────────
-# [2026-08-08, SG request] Switched from reading persisted/locked
-# DoreOptionsPlan rows (Supabase "open plans") to the SAME source as
-# pages/scanner.py's DORE Options Engine → Live Scan tab: the
-# "dore_live_state" snapshot (falling back to "dore_technical_plans"
-# when Stage 2 hasn't produced anything yet), filtered to
-# Confidence >= 65 and today's plan only, sorted by Confidence
-# descending — identical filters to the Scanner page's Live Scan tab,
-# just rendered as a short/compact column set here instead of the full
-# table. This card is now "what is DORE's live scan surfacing right
-# now", not "what's currently locked open" — that fuller, multi-day
-# history still lives on the Scanner page's own Active Plans tab.
+# [2026-08-12, SG request — reverted the 2026-08-08 change below] Back
+# to reading persisted/locked DoreOptionsPlan rows (Supabase "open
+# plans"), same source as pages/scanner.py's DORE Options Engine →
+# Active Plans tab, filtered to lifecycle_group == "ACTIVE" (entry
+# actually locked). The 2026-08-08 switch to the "dore_live_state" Live
+# Scan feed let looser-confidence and merely-"Triggered"-this-tick rows
+# leak into a card titled ACTIVE OPTIONS PLANS that never appeared on
+# either the Live Scan or Active Plans tabs — see the docstring on
+# _active_options_plans_html() below for the specific failure modes.
+# This card is now a compact, top-N subset of the Active Plans tab's
+# own ACTIVE rows — never a superset of what either Scanner tab shows.
 def _today_ist_date_str() -> str:
     # Same UTC+5:30 day-boundary convention as
     # utils.dore_options_persistence._today_str() (kept local rather than
@@ -2612,72 +2612,41 @@ def _time_only_ist(iso_ts: str) -> str:
 
 
 def _active_options_plans_html(top_n: int = 6) -> str:
-    from utils.scan_state import load_snapshot_meta
-    from utils.snapshot_cache import get_snapshot
+    # [2026-08-12 fix, SG report] This card was sourcing "dore_live_state"
+    # (Confidence >= 65 + entry_trigger_status == "Triggered"), which is
+    # the Scanner page's LIVE SCAN feed, not its ACTIVE PLANS feed. Two
+    # problems fell out of that: (1) the confidence floor here (65) was
+    # looser than Live Scan's own >=70 display floor, so a 66-69
+    # confidence row (e.g. FEDERALBNK/MCX at 69) could show here despite
+    # not appearing on Live Scan at all; (2) "Triggered" only means the
+    # live premium is CURRENTLY sitting inside the entry zone this tick —
+    # it is a snapshot condition, not a persisted position, so a row
+    # like HINDZINC's second strike could show as "Triggered" with no
+    # entry ever actually locked (Entry/Drift both "—"). Neither of
+    # those is what "ACTIVE OPTIONS PLANS" should mean. Switched to the
+    # SAME persisted source as the Scanner page's own Active Plans tab
+    # (utils.dore_options_persistence.active_plan_rows() over
+    # utils.supabase_client.load_open_dore_options_plans()), filtered to
+    # lifecycle_group == "ACTIVE" (entry actually locked) — this card
+    # now shows a strict subset of what that tab shows, never more.
+    from utils.supabase_client import load_open_dore_options_plans
+    from utils.dore_options_persistence import active_plan_rows
 
     try:
-        payload = None
-        meta = load_snapshot_meta("dore_live_state")
-        if meta is not None:
-            full = get_snapshot("dore_live_state")
-            payload = (full or {}).get("payload") or {}
-        rows = list(payload.get("live_state") or []) if payload else []
-
-        if not rows:
-            # Same Stage 1 fallback pages/scanner.py's Live Scan tab uses
-            # when Stage 2 (dore_live_state) hasn't produced anything yet.
-            tech_meta = load_snapshot_meta("dore_technical_plans")
-            if tech_meta is not None:
-                tech_full = get_snapshot("dore_technical_plans")
-                tech_payload = (tech_full or {}).get("payload") or {}
-                rows = list(tech_payload.get("technical_plans") or [])
+        open_plans = load_open_dore_options_plans()
+        rows = [r for r in active_plan_rows(open_plans) if r.get("lifecycle_group") == "ACTIVE"]
     except Exception:
         logger.exception("Dashboard Active Options Plans card failed to load (non-fatal)")
         rows = []
 
     if not rows:
         return ('<div class="sr-panel"><div class="sr-panel-title">ACTIVE OPTIONS PLANS</div>'
-                '<div style="color:#8b949e;font-size:0.75rem;">DORE Options Engine: waiting for '
-                'the first scheduled scan — nothing to show yet.</div></div>')
+                '<div style="color:#8b949e;font-size:0.75rem;">No ACTIVE DORE plans right now — '
+                'see the Scanner page\'s Active Plans tab for TRACKED/MONITORING candidates.</div></div>')
 
     df = pd.DataFrame(rows)
-
-    # Same Confidence >= 65 floor as the Scanner page's Live Scan tab.
-    if "confidence_score" in df.columns:
-        df = df[pd.to_numeric(df["confidence_score"], errors="coerce") >= 65]
-
-    # [2026-08-12 fix, SG request] This card is titled ACTIVE OPTIONS
-    # PLANS but wasn't actually checking activity — a row with
-    # entry_trigger_status == "Waiting" (premium hasn't reached the
-    # entry zone yet, no real position) passed the same as a
-    # "Triggered" one. Keep only rows that have actually triggered —
-    # matches the ACTIVE state in the two-level lifecycle refactor
-    # (utils.dore_options_persistence.DoreOptionsPlanStatus) at the
-    # concept level, even though this card's data source
-    # (dore_live_state, see the module comment above) doesn't carry
-    # that persisted status field directly — entry_trigger_status is
-    # the equivalent signal already available at this layer. Rows
-    # missing the field entirely are dropped rather than kept, since
-    # "unknown" shouldn't silently count as "active".
-    if "entry_trigger_status" in df.columns:
-        df = df[df["entry_trigger_status"].astype(str) == "Triggered"]
-
-    # Today-only — a plan locked on a prior day (still OPEN) is
-    # carryover, not something this cycle's scan actually produced.
-    # Rows with no persisted plan yet are kept — they ARE this cycle's
-    # fresh output. Same rule as the Scanner page's Live Scan tab.
-    today = _today_ist_date_str()
-    if "plan_created_date" in df.columns:
-        created = df["plan_created_date"].astype(str)
-        df = df[(created == "") | (created == "None") | (created == "nan") | (created == today)]
-
-    if "confidence_score" in df.columns:
-        df = df.sort_values("confidence_score", ascending=False, kind="stable")
-
-    if df.empty:
-        return ('<div class="sr-panel"><div class="sr-panel-title">ACTIVE OPTIONS PLANS</div>'
-                '<div style="color:#8b949e;font-size:0.75rem;">No triggered DORE plans with '
-                'Confidence ≥ 65 today.</div></div>')
+    if "confidence_at_entry" in df.columns:
+        df = df.sort_values("confidence_at_entry", ascending=False, kind="stable")
 
     def _money(v):
         return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
@@ -2695,17 +2664,14 @@ def _active_options_plans_html(top_n: int = 6) -> str:
     for _, r in df.head(top_n).iterrows():
         direction = r.get("direction", "")
         dir_color = "#3fb950" if direction == "CE" else "#f85149" if direction == "PE" else "#8b949e"
-        primary = r.get("primary") or {}
-        if not isinstance(primary, dict):
-            primary = {}
-        strike = primary.get("strike")
+        strike = r.get("strike")
         strike_disp = f"{strike:,.0f}" if strike not in (None, "") and pd.notna(strike) else "—"
-        conf = r.get("confidence_score")
+        conf = r.get("confidence_at_entry")
         conf_color, conf_dot = _conf_style(conf)
         conf_disp = f"{conf:.0f}" if conf not in (None, "") and pd.notna(conf) else "—"
-        plan_time = _time_only_ist(r.get("plan_created_at"))
+        plan_time = _time_only_ist(r.get("entry_triggered_at"))
         entry = r.get("entry_locked")
-        drift = r.get("drift_pct")
+        drift = r.get("last_drift_pct")
         drift_val = float(drift) if drift not in (None, "") and pd.notna(drift) else None
         rows_html += (
             "<tr>"
@@ -2713,12 +2679,12 @@ def _active_options_plans_html(top_n: int = 6) -> str:
             f'<td style="color:{dir_color};font-weight:700;">{direction or "—"}</td>'
             f"<td>{strike_disp}</td>"
             f'<td><span style="color:{conf_color};font-weight:700;">{conf_dot} {conf_disp}</span></td>'
-            f"<td>{_money(r.get('current_premium'))}</td>"
-            f'<td title="Plan locked at {plan_time} IST">{plan_time}</td>'
+            f"<td>{_money(r.get('last_premium'))}</td>"
+            f'<td title="Entry triggered at {plan_time} IST">{plan_time}</td>'
             f"<td>{_money(entry)}</td>"
             f'<td class="{"sr-pos" if (drift_val or 0) >= 0 else "sr-neg"}">{f"{"+" if drift_val >= 0 else ""}{drift_val:.2f}%" if drift_val is not None else "—"}</td>'
-            f"<td>{_money(r.get('stop_loss'))}</td>"
-            f"<td>{_money(r.get('target1'))}</td>"
+            f"<td>{_money(r.get('saved_stop_loss'))}</td>"
+            f"<td>{_money(r.get('saved_target1'))}</td>"
             "</tr>"
         )
 
