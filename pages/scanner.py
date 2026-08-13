@@ -2102,10 +2102,10 @@ _DETAIL_EXTRA = [
 
 # Primary column order for HTML table (Scanner Refactor: CV1 + Promotion Engine)
 _PRIMARY_ORDERED = [
-    "Stock", "%Chg", "Setup Age", "Plan Status", "Recommendation", "Primary Blocker",
+    "Stock", "CMP", "Setup Age", "Plan Status", "Recommendation", "Primary Blocker",
     "Leadership", "Conviction", "Entry Quality",
     "Stoch↑", "LL✓", "VWAP↺", "Inst✓", "Promo Score",
-    "Extension", "CMP", "Entry", "SL", "T1", "R:R", "Drift%", "Size%",
+    "Extension", "Entry", "SL", "T1", "R:R", "Drift%", "Size%",
 ]
 
 # Tabs where "Primary Blocker" is meaningless — it explains why a stock is
@@ -2913,14 +2913,15 @@ def _render_pre_breakout_tab(records: list, df: pd.DataFrame, mode: str) -> None
         except (TypeError, ValueError):
             return '<td class="col-num">—</td>'
 
-    def _pb_chg(v):
+    def _pb_ltp(v):
         try:
             fv = float(v)
-            color = "#3fb950" if fv >= 0 else "#f85149"
-            arrow = "▲" if fv >= 0 else "▼"
-            return f'<td class="col-num" style="color:{color};font-weight:600">{arrow} {abs(fv):.2f}%</td>'
         except (TypeError, ValueError):
-            return '<td class="col-num">—</td>'
+            return '<td class="col-num" style="color:var(--muted)">—</td>'
+        return (
+            f'<td class="col-num" style="color:var(--text);font-weight:600;'
+            f'font-variant-numeric:tabular-nums">₹{fv:,.2f}</td>'
+        )
 
     def _pb_vol_ratio(v):
         try:
@@ -3001,7 +3002,7 @@ def _render_pre_breakout_tab(records: list, df: pd.DataFrame, mode: str) -> None
     # ── Build thead ───────────────────────────────────────────────────────────
     _COLS = [
         ("STOCK",      "col-stock"), ("SCORE",      ""),  ("SQUEEZE",   ""),
-        ("RSI",        ""),          ("VOL RATIO",  ""),  ("%CHG",      ""),
+        ("RSI",        ""),          ("VOL RATIO",  ""),  ("LTP",       ""),
         ("ENTRY",      ""),          ("SL",          ""),  ("T1",        ""),
         ("T2",         ""),          ("LEADERSHIP",  ""),  ("CONVICTION",""),
         ("EQ",         ""),          ("BOOSTS",      ""),  ("TIER",      ""),
@@ -3065,7 +3066,7 @@ def _render_pre_breakout_tab(records: list, df: pd.DataFrame, mode: str) -> None
             + sq_cell
             + _pb_num(rsi, "{:.0f}")
             + _pb_vol_ratio(vol_r)
-            + _pb_chg(r.get("%Change") or r.get("%Chg"))
+            + _pb_ltp(r.get("LTP"))
             + _pb_num(r.get("Entry"), "{:.2f}")
             + _pb_num(r.get("SL"),    "{:.2f}", color="#f85149")
             + _pb_num(r.get("T1"),    "{:.2f}", color="#58a6ff")
