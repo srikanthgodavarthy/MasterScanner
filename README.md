@@ -331,10 +331,28 @@ raising/lowering on a different host.
 4. Add secrets in **Advanced settings → Secrets** (paste your `secrets.toml` contents)
 5. Background scans run in-process automatically (`utils/inprocess_scheduler.py`) — no
    second process needed on this host.
+6. In the same **Advanced settings**, also add as an environment variable (not in
+   `secrets.toml` — this one just needs to exist in the process environment):
+   ```
+   MALLOC_ARENA_MAX=2
+   ```
+   Caps glibc's malloc arena count so the background scan threads' allocate/free churn
+   doesn't fragment memory the way it did pre-2026-08-13 (see `utils/scan_health_monitor.py`'s
+   `_malloc_trim_reclaim()` docstring). **Must be set before the process starts** — setting it
+   from inside `app.py` is too late, since pandas/numpy/streamlit already trigger glibc's
+   first arena allocation during import, before any of this app's own code runs. Requires a
+   full app reboot (not just a rerun) to take effect. `2` was chosen against this app's actual
+   background concurrency — `LIVE_SCANNER_MAX_WORKERS=4` is the sustained hot path
+   (`scheduler/scan_worker.py`); `1` would fully serialize those 4 threads on a single malloc
+   lock, `2` caps fragmentation while still giving them two lanes. If scan batch durations
+   creep up after enabling this (`[live_scanner] batch N/10 done: Xs` in the logs), try `4`
+   instead — the memory profiler's RSS/malloc_trim logging already gives you before/after
+   evidence either way.
 
 ### Self-hosted / VPS (with a standalone scheduler process)
 
 ```bash
+export MALLOC_ARENA_MAX=2   # see note above — must be set before either process starts
 streamlit run app.py --server.port 8501 --server.headless true
 python -m scheduler.scan_worker   # optional: run as a separate always-on process
 ```
