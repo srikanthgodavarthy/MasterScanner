@@ -142,6 +142,44 @@ LIVE_SCANNER_BATCH_COOLDOWN_SECS = 1.5   # brief pause between batches, just
                                      # next batch. Re-added alongside the
                                      # worker cap above.
 
+# ── Idle-window malloc_trim [2026-08-13] ──────────────────────────────
+# utils.scan_health_monitor._malloc_trim_reclaim() already reclaims
+# fragmented glibc arena pages REACTIVELY, mid-session, whenever a job
+# trips the RAM warn/critical threshold. That's the only time it ever
+# runs — market-hours-paused stretches (nights/weekends, the majority
+# of the week) do zero new allocation but also zero reclamation, so
+# whatever fragmentation existed at market close is still sitting there
+# unchanged at next open. market_intelligence/fo_scan/dore_live_state
+# all share _run_loop below and each independently poll
+# should_scheduler_run() every 5s while paused — without a shared
+# cooldown, all three would fire malloc_trim back-to-back on the same
+# tick for no extra benefit. _IDLE_TRIM_LOCK + _last_idle_trim_ts make
+# this a single, periodic action shared across all three loops:
+# fires once immediately on the paused transition (reclaims whatever
+# was fragmented up to close), then at most every _IDLE_TRIM_COOLDOWN_SECS
+# for the rest of the pause, so the process is fully trimmed well before
+# should_scheduler_run() flips back to True at next market open.
+_IDLE_TRIM_COOLDOWN_SECS = 900   # 15 min
+_IDLE_TRIM_LOCK = threading.Lock()
+_last_idle_trim_ts: float = 0.0
+
+
+def _idle_trim_if_due() -> None:
+    """Best-effort, cooldown-gated malloc_trim call for market-hours-paused
+    stretches. Safe to call from multiple threads concurrently — the lock
+    + cooldown check ensure only one thread actually does the (cheap but
+    non-zero) ctypes call per interval, not one per calling loop per tick.
+    Never raises: reuses scan_health_monitor's own try/except-wrapped
+    reclaim function, so a failure here is a no-op, not a crash."""
+    global _last_idle_trim_ts
+    now = time.time()
+    with _IDLE_TRIM_LOCK:
+        if now - _last_idle_trim_ts < _IDLE_TRIM_COOLDOWN_SECS:
+            return
+        _last_idle_trim_ts = now
+    from utils.scan_health_monitor import _malloc_trim_reclaim
+    _malloc_trim_reclaim()
+
 
 def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payload,
               owner_event: "threading.Event | None" = None,
@@ -214,6 +252,7 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
                             "skipping cycles until it resumes", name)
                 was_paused = True
             logger.debug("[%s] system_state is paused (backtest/maintenance) — skipping this tick", name)
+            _idle_trim_if_due()
             time.sleep(5)
             continue
         if was_paused:
