@@ -88,6 +88,11 @@ def _pct_return(entry: Optional[float], current: Optional[float], *, flip: bool 
     sites for when that applies and, critically, when it must NOT."""
     if entry in (None, 0) or current is None:
         return None
+    # entry/current can arrive as decimal.Decimal (numeric columns read
+    # back from Supabase) mixed with float (live quote feed) — Python
+    # refuses that arithmetic directly, so normalize both here.
+    entry = float(entry)
+    current = float(current)
     raw = (current - entry) / entry * 100.0
     return -raw if flip else raw
 
