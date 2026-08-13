@@ -743,9 +743,14 @@ def flush_queue_backlog_pct() -> float:
 
 def _trim_to_ring_buffer(df):
     """Keep only the most recent RING_BUFFER_MAX_BARS rows of `df`."""
-    if df is None or len(df) <= RING_BUFFER_MAX_BARS:
+    if df is None:
         return df
-    return df.iloc[-RING_BUFFER_MAX_BARS:]
+
+    if len(df) <= RING_BUFFER_MAX_BARS:
+        return df
+
+    # Must copy: iloc row slices can retain the full underlying NumPy buffers.
+    return df.iloc[-RING_BUFFER_MAX_BARS:].copy()
 
 
 def get_live_history_cached(
