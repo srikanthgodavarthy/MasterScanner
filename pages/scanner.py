@@ -2102,7 +2102,7 @@ _DETAIL_EXTRA = [
 
 # Primary column order for HTML table (Scanner Refactor: CV1 + Promotion Engine)
 _PRIMARY_ORDERED = [
-    "Stock", "CMP", "Setup Age", "Plan Status", "Recommendation", "Primary Blocker",
+    "Stock", "LTP", "%Chg", "Setup Age", "Plan Status", "Recommendation", "Primary Blocker",
     "Leadership", "Conviction", "Entry Quality",
     "Stoch↑", "LL✓", "VWAP↺", "Inst✓", "Promo Score",
     "Extension", "Entry", "SL", "T1", "R:R", "Drift%", "Size%",
@@ -2125,6 +2125,15 @@ _PROMO_COLS    = ["Stoch↑", "LL✓", "VWAP↺", "Inst✓", "Promo Score"]
 def _build_display_df(df: pd.DataFrame, detail: bool = False, sc_key: str | None = None) -> pd.DataFrame:
     out = df.rename(columns=_RENAME_MAP_FULL).copy()
     out = out.rename(columns=_RENAME_PRIMARY)
+    # This table (unlike Active Setups) carries no live-refreshed quote —
+    # "Entry" IS the scan-time price (see its own comment above: "the
+    # clean DISPLAY price (unpadded signal close)"), so LTP falls back to
+    # it the same way the Pre-Breakout tab's LTP already does.
+    if "LTP" not in out.columns:
+        if "CMP" in out.columns:
+            out["LTP"] = out["CMP"]
+        elif "Entry" in out.columns:
+            out["LTP"] = out["Entry"]
     ordered = _PRIMARY_ORDERED
     if sc_key in _NO_BLOCKER_TABS:
         ordered = [c for c in ordered if c != "Primary Blocker"]
