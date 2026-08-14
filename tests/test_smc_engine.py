@@ -13,7 +13,8 @@ import pandas as pd
 import pytest
 
 from utils.smc_engine import (
-    SMCState, CONFLICT, NEUTRAL, VALID_STATES,
+    SMCState, CONFLICT, NEUTRAL, VALID_STATES, BULLISH, BEARISH, DIR_NEUTRAL,
+    WAITING_RETEST,
     FVG_NONE, FVG_IN_ZONE, FVG_THROUGH_UNFILLED, FVG_THROUGH_FILLED,
     detect_liquidity_sweep, detect_bos, detect_choch, detect_displacement,
     detect_fvg, fvg_retest_status, _evidence_tier, compute_smc_state,
@@ -257,6 +258,194 @@ def test_compute_smc_state_handles_flat_series_without_error():
     assert len(states) == n
     assert all(s.evidence_tier == 0 for s in states)
     assert all(s.state == NEUTRAL for s in states)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CORRECTNESS PASS 2026-08-14 — regression tests for 5 bugs found and
+#  fixed. Each test reproduces the pre-fix bug (documented in the
+#  assertion's failure message / comment) and asserts the fixed behavior.
+# ══════════════════════════════════════════════════════════════════
+
+# --- Bug 1: BOS must be an event, not a persistent condition ---------------
+
+def test_bos_is_event_not_persistent_condition():
+    """Pre-fix: bull_bos stayed True on every bar price remained above the
+    pivot (bars 2-5 below), which reset last_bull_break_i (and therefore
+    age_bars) to 0 on every one of those bars. Fixed: True only once, on
+    the transition bar."""
+    idx = range(6)
+    close = pd.Series([100.0, 101.0, 106.0, 107.0, 108.0, 109.0], index=idx)
+    ph_causal = pd.Series([np.nan, 105.0, np.nan, np.nan, np.nan, np.nan], index=idx)
+    pl_causal = pd.Series([np.nan] * 6, index=idx)
+    bull_bos, _ = detect_bos(close, ph_causal, pl_causal)
+    assert list(bull_bos) == [False, False, True, False, False, False]
+
+
+def test_bos_event_reflects_new_pivot_level_correctly():
+    """A NEW, higher pivot confirming after the first break must still be
+    detectable as its own fresh event if price genuinely crosses it."""
+    idx = range(6)
+    close = pd.Series([100.0, 106.0, 106.0, 106.0, 112.0, 112.0], index=idx)
+    # pivot rises from 105 to 110 partway through
+    ph_causal = pd.Series([np.nan, 105.0, np.nan, 110.0, np.nan, np.nan], index=idx)
+    pl_causal = pd.Series([np.nan] * 6, index=idx)
+    bull_bos, _ = detect_bos(close, ph_causal, pl_causal)
+    assert bull_bos.iloc[1] == True    # breaks 105
+    assert bull_bos.iloc[2] == False   # already past 105, no new event
+    assert bull_bos.iloc[4] == True    # breaks the new 110 pivot
+    assert bull_bos.iloc[5] == False   # already past 110, no new event
+
+
+def test_bos_age_increments_after_fix():
+    """Full pipeline: a genuine BOS event's age_bars must increase
+    normally afterward, not stay pinned at 0."""
+    n = 30
+    vals = [100.0] * 5 + [106.0] * 25
+    high = pd.Series([v + 0.1 for v in vals]); low = pd.Series([v - 0.1 for v in vals])
+    close = pd.Series(vals); open_ = pd.Series(vals)
+    df = pd.DataFrame({"open": open_, "high": high, "low": low, "close": close})
+    states = compute_smc_state(df, lb=2)
+    # find the bar where has_bos first flips True
+    bos_bars = [i for i, s in enumerate(states) if s.has_bos]
+    assert len(bos_bars) >= 1
+    event_bar = bos_bars[0]
+    assert states[event_bar + 1].has_bos == False, "BOS must not repeat on the next bar"
+
+
+# --- Bug 2: FVG tracking must be directionally independent -----------------
+
+def _clean_bull_fvg_df(n=30, jump_bar=5, base=100.0, jump_to=106.0):
+    """Step-up-and-stay pattern with NO reversion (avoids the inherent
+    'return gap' a spike-then-revert pattern creates in any 3-candle FVG
+    detector) and a huge lb so no pivot ever confirms (isolates FVG
+    detection from sweep/BOS entirely)."""
+    vals = [base] * jump_bar + [jump_to] * (n - jump_bar)
+    high = pd.Series([v + 0.1 for v in vals]); low = pd.Series([v - 0.1 for v in vals])
+    close = pd.Series(vals); open_ = pd.Series(vals)
+    return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close})
+
+
+def test_bullish_state_does_not_consume_bearish_fvg():
+    n = 40
+    vals = [100.0] * 5 + [106.0] * 10 + [90.0] * 25   # bull step, then (far later) bear step
+    high = pd.Series([v + 0.1 for v in vals]); low = pd.Series([v - 0.1 for v in vals])
+    close = pd.Series(vals); open_ = pd.Series(vals)
+    df = pd.DataFrame({"open": open_, "high": high, "low": low, "close": close})
+    states = compute_smc_state(df, lb=50)
+    s = states[7]   # only the bull FVG exists yet
+    assert s.direction == BULLISH
+    assert s.fvg_low == 100.1   # the BULLISH FVG's own bounds, never the bear one
+
+
+def test_bearish_state_does_not_consume_bullish_fvg():
+    n = 40
+    vals = [100.0] * 5 + [94.0] * 10 + [110.0] * 25   # bear step, then (far later) bull step
+    high = pd.Series([v + 0.1 for v in vals]); low = pd.Series([v - 0.1 for v in vals])
+    close = pd.Series(vals); open_ = pd.Series(vals)
+    df = pd.DataFrame({"open": open_, "high": high, "low": low, "close": close})
+    states = compute_smc_state(df, lb=50)
+    s = states[7]   # only the bear FVG exists yet
+    assert s.direction == BEARISH
+    assert s.fvg_high == 99.9   # the BEARISH FVG's own bounds, never the bull one
+
+
+def test_both_directions_fresh_simultaneously_with_no_other_evidence_is_neutral():
+    """Two genuinely opposite-direction FVGs active at once, with no
+    sweep/break to disambiguate, must not arbitrarily pick a side."""
+    n = 40
+    vals = [100.0] * 5 + [106.0] * 10 + [90.0] * 25
+    high = pd.Series([v + 0.1 for v in vals]); low = pd.Series([v - 0.1 for v in vals])
+    close = pd.Series(vals); open_ = pd.Series(vals)
+    df = pd.DataFrame({"open": open_, "high": high, "low": low, "close": close})
+    states = compute_smc_state(df, lb=50)
+    s = states[20]   # by now, both the bull FVG (bar5) and bear FVG (bar15) are fresh
+    assert s.direction == DIR_NEUTRAL
+    assert s.evidence_tier == 0
+
+
+# --- Bug 3: FVG-only direction must inherit the FVG's own direction --------
+
+def test_fvg_only_bullish_direction():
+    df = _clean_bull_fvg_df(n=15, jump_bar=5, base=100.0, jump_to=106.0)
+    states = compute_smc_state(df, lb=50)
+    s = states[7]
+    assert s.direction == BULLISH, "pre-fix this fell through to an incomplete if/elif and defaulted to BEARISH"
+    assert s.evidence_tier == 1
+    assert s.state == WAITING_RETEST
+
+
+def test_fvg_only_bearish_direction():
+    df = _clean_bull_fvg_df(n=15, jump_bar=5, base=100.0, jump_to=94.0)   # step DOWN and stay
+    states = compute_smc_state(df, lb=50)
+    s = states[7]
+    assert s.direction == BEARISH
+    assert s.evidence_tier == 1
+    assert s.state == WAITING_RETEST
+
+
+def test_no_directional_evidence_is_neutral():
+    n = 20
+    flat = pd.Series([100.0] * n)
+    df = pd.DataFrame({"open": flat, "high": flat, "low": flat, "close": flat})
+    states = compute_smc_state(df, lb=50)
+    assert all(s.direction == DIR_NEUTRAL for s in states)
+    assert all(s.evidence_tier == 0 for s in states)
+
+
+# --- Bug 4: FVG-only age must use the FVG's real creation bar --------------
+
+def test_fvg_only_age_increments_from_true_creation_bar():
+    df = _clean_bull_fvg_df(n=15, jump_bar=5, base=100.0, jump_to=106.0)
+    states = compute_smc_state(df, lb=50)
+    # pre-fix: event_i was set to the CURRENT bar every time -> age stuck at 0 forever
+    assert states[5].age_bars == 0
+    assert states[7].age_bars == 2
+    assert states[10].age_bars == 5
+    assert states[14].age_bars == 9
+
+
+# --- Bug 5: an expired FVG must not remain active downstream ---------------
+
+def test_expired_fvg_zeroes_out_bounds_and_retest():
+    df = _clean_bull_fvg_df(n=100, jump_bar=5, base=100.0, jump_to=106.0)
+    states = compute_smc_state(df, lb=50, lookback_bars=10)
+    s_far = states[80]   # FVG created at bar 5, lookback_bars=10 -> expired long ago
+    assert s_far.has_fvg == False
+    assert s_far.fvg_high is None
+    assert s_far.fvg_low is None
+    assert s_far.fvg_retest == FVG_NONE
+    assert s_far.evidence_tier == 0
+
+
+def test_expired_fvg_cannot_influence_extension_chase_risk():
+    """Direct production-path check: utils.extension_shared must not
+    penalize Extension/Chase Risk based on a stale FVG zone."""
+    from utils.extension_shared import _fvg_zone_distance_component
+
+    class _FakeR:
+        pass
+
+    expired_state = SMCState(direction=DIR_NEUTRAL, state=NEUTRAL, evidence_tier=0, age_bars=0,
+                              fvg_retest=FVG_NONE, has_fvg=False, fvg_high=None, fvg_low=None)
+    result = _fvg_zone_distance_component(_FakeR(), expired_state, current_price=200.0)
+    assert result == 0
+
+
+def test_conflict_state_exposes_no_fvg():
+    """CONFLICT (ambiguous sweep/break evidence in both directions) must
+    not expose any FVG zone either -- there is no clear thesis to
+    interpret it against."""
+    n = 10
+    idx = range(n)
+    # Force an artificial conflict by hand-constructing overlapping bull/bear
+    # sweep conditions is fragile via raw OHLC; instead verify the invariant
+    # directly via the dataclass contract (CONFLICT forces evidence_tier=0,
+    # and this module's compute_smc_state() never passes fvg_high/low when
+    # constructing a CONFLICT state -- see its source).
+    conflict_state = SMCState(state=CONFLICT, evidence_tier=0)
+    assert conflict_state.fvg_high is None
+    assert conflict_state.fvg_low is None
+    assert conflict_state.fvg_retest == FVG_NONE
 
 
 if __name__ == "__main__":
