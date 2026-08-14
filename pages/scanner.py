@@ -3181,10 +3181,97 @@ def _render_pre_breakout_tab(records: list, df: pd.DataFrame, mode: str) -> None
 # fetch_oi_resistance() in utils/upstox_client.py. The Run Scan button's
 # `source` selector (yfinance/upstox) is unrelated to this — that toggle
 # controls the historical OHLCV fetch for scoring, not the live strip.
-# ── SIGNAL CLASS COUNTS ────────────────────────────────────────────
-# [2026-07-27] Moved here from pages/dashboard.py — Signal Class counts
-# are Scanner output, shown right after the Elite/Execute/Actionable/...
-# tables in render_scan_results() below.
+# ── FIVE PILLARS TAB (embedded, 2026-08-14 SG request) ──────────────
+# Pulled in from the standalone pages/five_pillars.py page. Reuses that
+# module's CSS/table-rendering/promotion-engine helpers directly (no
+# logic duplicated here) so the scoring/formatting stays in exactly one
+# place — only the layout differs from the standalone page:
+#   - single tab, no Elite/Execute/Watch/Developing/Avoid sub-tabs
+#   - Elite/Execute/Watch shown as three side-by-side columns
+#   - Developing and Avoid are NOT shown at all (by design — this is a
+#     "what's close to actionable" view, not a full-universe ranking)
+#   - the classification-count card grid is removed
+# NOTE: the standalone "five_pillar Scanner" nav page (pages/five_pillars.py)
+# still exists unchanged — it still shows all 5 classes via its own
+# tabs + the card grid. Flagging this rather than deleting it silently:
+# if you want that separate nav entry removed now that this tab covers
+# the same data, say so and I'll pull it from app.py's st.navigation.
+import pages.five_pillars as _fp_mod
+from utils.pillar_engine import CLASS_ELITE, CLASS_EXECUTE, CLASS_WATCH, CLASS_AVOID
+
+
+def _render_five_pillars_tab(df_aug: pd.DataFrame) -> None:
+    st.markdown(_fp_mod._CSS, unsafe_allow_html=True)
+
+    if df_aug.empty:
+        st.info("No scan data. Run a scan above first.")
+        return
+
+    if "FP_FinalScore" not in df_aug.columns:
+        st.warning(
+            "This scan was run before the Five Pillars engine was added. "
+            "Click **▶ Run Scan** again to populate Structure / Acceptance / "
+            "Reversal / Leadership / Momentum scores."
+        )
+        return
+
+    # ── Promotion Engine — Execute -> Elite (same computation as the
+    #    standalone page; cached onto df_aug so it only runs once per
+    #    scan even though this tab's content block runs on every rerun
+    #    of Live Scanner, not just when this tab is the active one —
+    #    st.tabs() content isn't lazy. See other lazy-tab call sites
+    #    (st.segmented_control/st.radio) if this needs to be deferred
+    #    later for performance. ────────────────────────────────────
+    if "FP_EffectiveClass" not in df_aug.columns:
+        _promo_cols = {"FP_Elite": [], "FP_EffectiveClass": []}
+        for _, _r in df_aug.iterrows():
+            _promo = _fp_mod.evaluate_promotion(_r, regime=_r.get("regime"))
+            _base_cls = _r.get("FP_Class", CLASS_AVOID)
+            _eff_cls = CLASS_ELITE if _promo.promoted else _base_cls
+            _promo_cols["FP_Elite"].append(_promo.promoted)
+            _promo_cols["FP_EffectiveClass"].append(_eff_cls)
+        for _col, _vals in _promo_cols.items():
+            df_aug[_col] = _vals
+
+    # ── Sort control ─────────────────────────────────────────────
+    sort_by = st.selectbox(
+        "Sort by",
+        ["Final Score ↓", "Structure ↓", "Acceptance ↓", "Opp Bonus ↓",
+         "Leadership ↓", "Momentum ↓"],
+        key="fp_sort_by_scanner_tab",
+    )
+    sort_map = {
+        "Final Score ↓": "FP_FinalScore", "Structure ↓": "FP_Structure",
+        "Acceptance ↓": "FP_Acceptance", "Opp Bonus ↓": "FP_Reversal",
+        "Leadership ↓": "FP_Leadership", "Momentum ↓": "FP_Momentum",
+    }
+    sort_field = sort_map.get(sort_by, "FP_FinalScore")
+
+    # ── Elite / Execute / Watch as three side-by-side columns ──────
+    # Developing and Avoid deliberately excluded from this tab.
+    _cols_spec = [
+        (CLASS_ELITE,   "🌟 Elite"),
+        (CLASS_EXECUTE, "⚡ Execute"),
+        (CLASS_WATCH,   "👁 Watch"),
+    ]
+    col_elite, col_execute, col_watch = st.columns(3)
+    for (cls, heading), col in zip(_cols_spec, (col_elite, col_execute, col_watch)):
+        with col:
+            color, _, note = _fp_mod._CLASS_STYLE[cls]
+            subset = df_aug[df_aug["FP_EffectiveClass"] == cls].copy()
+            st.markdown(
+                f'<div style="font-size:13px;font-weight:700;color:{color};'
+                f'margin-bottom:2px;">{heading} ({len(subset)})</div>'
+                f'<div style="font-size:10px;color:#8b949e;margin-bottom:8px;">{note}</div>',
+                unsafe_allow_html=True,
+            )
+            if subset.empty:
+                st.caption(f"No {heading.split(' ',1)[1]} candidates in this scan.")
+                continue
+            subset = subset.sort_values(sort_field, ascending=False)
+            st.markdown(_fp_mod._build_table_html(subset), unsafe_allow_html=True)
+
+
 def _sc_counts_html(df: pd.DataFrame) -> str:
     sc_col = "Recommendation"
     if sc_col not in df.columns:
@@ -4372,8 +4459,6 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
     elite_df      = _sc_df("Elite")
     execute_df    = _sc_df("Execute")
     actionable_df = _sc_df("Actionable")
-    developing_df = _sc_df("Developing")
-    watch_df      = _sc_df("Watch")
 
     if not has_cv1:
         # Legacy fallback for cached scans predating this refactor.
@@ -4382,8 +4467,6 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
         elite_df      = df_aug[df_aug[_rec_col] == "Elite Opportunity"].copy() if has_cat else pd.DataFrame()
         execute_df    = pd.DataFrame()
         actionable_df = df_aug[df_aug[_rec_col].isin(["High Conviction", "Actionable"])].copy() if has_cat else pd.DataFrame()
-        developing_df = df_aug[df_aug[_rec_col] == "Setup Building"].copy() if has_cat else pd.DataFrame()
-        watch_df      = df_aug[df_aug[_rec_col] == "Leader"].copy() if has_cat else pd.DataFrame()
 
     # ── SETUP_PRE_BREAKOUT detection ─────────────────────────────────────────────
     # Rules: trend_up AND (squeeze_on OR squeeze_release) AND 45 <= RSI <= 70
@@ -4453,12 +4536,12 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
 
     tab_labels = [
         f"✅ Actionable ({len(elite_df) + len(execute_df) + len(actionable_df)})",
-        f"🧭 Developing ({len(developing_df) + len(watch_df)})",
         f"🎯 Pre-Breakout ({len(pre_breakout_records)})",
         f"📋 Active Setups ({len(_open_plans_preview)})",
+        "🏛️ Five Pillars",
     ]
-    df_sets  = [pd.DataFrame(), pd.DataFrame(), pre_breakout_df, pd.DataFrame()]
-    set_keys = ["ELITE_EXEC_ACTIONABLE", "DEV_WATCH", "PRE_BREAKOUT", "ACTIVE_PLANS"]
+    df_sets  = [pd.DataFrame(), pre_breakout_df, pd.DataFrame(), pd.DataFrame()]
+    set_keys = ["ELITE_EXEC_ACTIONABLE", "PRE_BREAKOUT", "ACTIVE_PLANS", "FIVE_PILLARS"]
 
     if show_skip:
         skip_df = _sc_df("Skip") if has_cv1 else pd.DataFrame()
@@ -4484,6 +4567,16 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
                 _render_active_plans_tab(df_aug, preloaded_plans=_open_plans_preview)
                 continue
 
+            # ── FIVE_PILLARS: Structure/Acceptance/Reversal/Leadership/
+            #    Momentum ranking, pulled in from the standalone
+            #    pages/five_pillars.py page per [2026-08-14 SG request].
+            #    Single tab, no Elite/Execute/Watch/Developing/Avoid
+            #    sub-tabs and no classification-count cards — see
+            #    _render_five_pillars_tab() below.
+            if sc_key == "FIVE_PILLARS":
+                _render_five_pillars_tab(df_aug)
+                continue
+
             # ── ELITE_EXEC_ACTIONABLE: merged tab — Elite (highest
             #    conviction), Execute (timing-confirmed, higher urgency)
             #    and Actionable (quality-qualified, plan created, awaiting
@@ -4492,7 +4585,6 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
             #    Recommendation badge (ELITE/EXECUTE/ACTIONABLE), so no
             #    sub-filter is needed to tell them apart.
             _merged_actionable = False
-            _merged_dev_watch = False
 
             if sc_key == "ELITE_EXEC_ACTIONABLE":
                 _parts = [d for d in (elite_df, execute_df, actionable_df) if not d.empty]
@@ -4500,18 +4592,9 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
                 sc_key = "ACTIONABLE"   # column-set + accent color for the merged view
                 _merged_actionable = True
 
-            # ── DEV_WATCH: merged tab — Developing (closer to qualifying)
-            #    and Watch shown together in one table, Developing first.
-            if sc_key == "DEV_WATCH":
-                df_subset = pd.concat([developing_df, watch_df], ignore_index=True) if not (developing_df.empty and watch_df.empty) else pd.DataFrame()
-                sc_key = "DEVELOPING"   # column-set + accent color for the merged view
-                _merged_dev_watch = True
-
             sc_color, sc_label = _SC_STYLE.get(sc_key, ("#484f58", sc_key))
             if sc_key == "ACTIONABLE" and _merged_actionable:
                 sc_label = "ACTIONABLE (ELITE / EXECUTE / ACTIONABLE)"
-            elif sc_key == "DEVELOPING" and _merged_dev_watch:
-                sc_label = "DEVELOPING (DEVELOPING / WATCH)"
 
             if df_subset.empty:
                 if sc_key == "ACTIONABLE" and _merged_actionable:
