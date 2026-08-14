@@ -229,132 +229,72 @@ from utils.legacy_scoring_diagnostic import (
 def _extension(r: "BarResult") -> tuple[int, dict]:
     """Returns (0-100, sub_scores_dict).  Higher = more extended = avoid.
 
-    Uses actual measured distances from BarResult rather than boolean proxies.
-    Factors (sum to 100):
-      EMA20 Distance          32  — % above EMA20 (measured)
-      EMA50 Distance          15  — % above EMA50 (measured)
-      Pivot High Distance     20  — % past last pivot high (measured)
-      Price Move Since Setup  33  — % from trigger bar to now (measured)
+    [Redirected 2026-08-13 per masterscanner_scoring_redesign_FINAL.md §2/§3]
+    Internal computation now delegates to
+    utils.extension_shared.compute_extension_penalty() — the function
+    shared with CV4's `_entry_quality_v4()` Extension/Chase Risk component,
+    eliminating the previous two-independent-formulas drift risk.
 
-    Volume Climax Discount (v9.2)
-    ─────────────────────────────
-    Distance from EMA/pivot on a volume climax breakout is NOT staleness —
-    it is institutional confirmation.  When vol_ratio >= 1.5 AND setup quality
-    exists (fresh_base_breakout OR compression_break), ex_move and ex_pivot
-    penalties are discounted proportional to volume strength.
+    DISCLOSED BEHAVIOR CHANGE: this shared function uses the FINAL spec's
+    six named sub-factors (ATR extension, EMA20 distance, pivot distance,
+    bars-since-trigger, FVG-zone distance, expansion magnitude) rather than
+    the four factors this function used previously (EMA20/EMA50/Pivot/
+    Price-Move-Since-Setup), and — unlike before — now INCLUDES
+    bars-since-trigger, which this function's previous docstring explicitly
+    excluded to avoid double-counting with Entry Quality's eq_bars_since.
+    This is a deliberate, user-confirmed deviation from "meaning unchanged"
+    (§3), not a silent one — see extension_shared.py's module docstring and
+    the implementation's file-by-file change summary for the full conflict
+    record. `DecisionScores.extension`'s scale/semantics (0-100, higher =
+    more extended = avoid) and this function's callers are unchanged; only
+    the concrete 0-100 value a given bar now produces can differ from
+    before. The volume-climax discount and fresh-base-breakout hard cap are
+    NOT carried over into the shared function (they were specific to the
+    old four-factor shape); a plain trend-phase modifier and fresh-base hard
+    cap are retained inside extension_shared.py instead.
 
-    Discount only applies with setup quality.  High volume alone (momentum
-    chase, no base) does NOT get a discount — that's still a chase.
-
-    Hard cap: fresh_base_breakout stocks are capped at Extension=40.
-    A stock breaking out of a multi-week base cannot be "Extended" by definition.
-
-    NOTE: bars_since_setup intentionally excluded — it caused double-counting
-    with eq_bars_since in Entry Quality.
+    [PRODUCTION SMC WIRING, 2026-08-14] This function now reads
+    r.smc_state (real SMCState when utils.scanner_engine.score_stock()'s
+    SMC computation succeeded, else None -> SMC-NEUTRAL) and passes it
+    into compute_extension_penalty(), which feeds SMC's fvg_zone_distance
+    sub-factor for real. This is SMC's PRIMARY production role, by
+    explicit design: an active SMC retest/FVG zone can now genuinely
+    reduce/increase this function's 0-100 output. It does NOT touch
+    Recommendation -- this function's output (DecisionScores.extension)
+    only feeds Lifecycle/Stage classification (_classify_stage() below),
+    never CV1 or classify_tier_v3(); Recommendation remains sourced from
+    CV1 alone (see compute_decision()'s docstring). SMC does not determine
+    direction and does not determine Recommendation, by design.
     """
-
-    # ── Volume climax flag: vol_ratio >= 1.5 AND has setup quality ────
-    # Discount is gated on setup quality to avoid rewarding random momentum spikes.
-    _has_setup_quality = r.fresh_base_breakout or r.compression_break
-    _climax_hi  = _has_setup_quality and r.vol_ratio >= 2.5   # institutional: strong discount
-    _climax_mid = _has_setup_quality and r.vol_ratio >= 1.5   # elevated: moderate discount
-
-    # ── EMA20 Distance (0-32) ─────────────────────────────────────
-    ema20d = r.ema20_pct_dist   # % above EMA20
-    if ema20d <= 2.0:
-        ex_ema20 = 0
-    elif ema20d <= 4.0:
-        ex_ema20 = 6
-    elif ema20d <= 6.0:
-        ex_ema20 = 14
-    elif ema20d <= 10.0:
-        ex_ema20 = 22
-    else:
-        ex_ema20 = 32   # >10% above EMA20 — significantly extended
-    if r.t4_fib_resist:
-        ex_ema20 = max(ex_ema20, 26)
-    # Volume climax: distance from EMA is expected on breakout — discount
-    if _climax_hi:   ex_ema20 = round(ex_ema20 * 0.35)   # 65% discount — institutional
-    elif _climax_mid:ex_ema20 = round(ex_ema20 * 0.60)   # 40% discount — elevated
-
-    # ── EMA50 Distance (0-15) ─────────────────────────────────────
-    ema50d = r.ema50_pct_dist
-    if ema50d <= 5.0:
-        ex_ema50 = 0
-    elif ema50d <= 10.0:
-        ex_ema50 = 4
-    elif ema50d <= 15.0:
-        ex_ema50 = 8
-    elif ema50d <= 20.0:
-        ex_ema50 = 12
-    else:
-        ex_ema50 = 15
-    # EMA50 distance less sensitive to volume climax — smaller discount
-    if _climax_hi:   ex_ema50 = round(ex_ema50 * 0.50)
-    elif _climax_mid:ex_ema50 = round(ex_ema50 * 0.75)
-
-    # ── Pivot High Distance (0-20) ────────────────────────────────
-    pvt_d = r.pivot_high_dist   # % above last pivot high
-    if pvt_d <= 0.5:
-        ex_pivot = 0
-    elif pvt_d <= 2.0:
-        ex_pivot = 5
-    elif pvt_d <= 4.0:
-        ex_pivot = 12
-    elif pvt_d <= 7.0:
-        ex_pivot = 17
-    else:
-        ex_pivot = 20
-    # Volume climax: being above pivot is the breakout signal, not staleness
-    if _climax_hi:   ex_pivot = round(ex_pivot * 0.25)   # 75% discount — this IS the entry
-    elif _climax_mid:ex_pivot = round(ex_pivot * 0.50)
-
-    # ── Price Move Since Setup Trigger (0-33) ────────────────────
-    # At 5% target: 3% move = 60% of target consumed.
-    # Volume climax discount: move explained by institutional buying — not a chase.
-    move_pct = r.price_move_since_setup
-    if move_pct <= 0.5:
-        ex_move = 0
-    elif move_pct <= 1.5:
-        ex_move = 5
-    elif move_pct <= 3.0:
-        ex_move = 15  if not _climax_mid else (8  if not _climax_hi else 4)
-    elif move_pct <= 5.0:
-        ex_move = 25  if not _climax_mid else (12 if not _climax_hi else 5)
-    else:
-        ex_move = 33  if not _climax_mid else (18 if not _climax_hi else 10)
-
-    ex_bars = 0   # removed: double-counted with eq_bars_since in Entry Quality
-
-    total = ex_ema20 + ex_ema50 + ex_pivot + ex_move
-
-    # Trend phase modifier
-    if r.trend_phase == "EXTENDED":
-        total = min(total + 20, 100)
-    elif r.trend_phase == "NONE":
-        total = min(total + 15, 100)
-
-    # Hard cap: fresh base breakout or compression break cannot be "Extended"
-    # by definition — they are at the START of a move, not the end.
-    # Guard: only apply in ESTABLISHED/EMERGING trend phase.  If trend_phase
-    # is EXTENDED, the +20 penalty above was correct and must not be removed.
-    # Cap at 40 = Actionable ceiling, ensuring these stocks remain qualifiable.
-    if (r.fresh_base_breakout or r.compression_break) and r.trend_phase in ("ESTABLISHED", "EMERGING"):
-        total = min(total, 40)
-
-    total = min(total, 100)
-
+    from utils.extension_shared import compute_extension_penalty
+    # [Production wiring, 2026-08-14] SMC's Primary production role: an
+    # active SMC retest/FVG zone now genuinely affects Extension/Chase
+    # Risk's fvg_zone_distance sub-factor (see extension_shared.py). Reads
+    # r.smc_state (BarResult additive field, populated by
+    # utils.scanner_engine.score_stock() when SMC computation succeeds;
+    # None otherwise -> SMC-NEUTRAL, this sub-factor contributes 0, same
+    # as before this change). current_price defaults to the bar's own
+    # entry_ref/entry, matching extension_shared's existing fallback.
+    smc_state = getattr(r, "smc_state", None)
+    current_price = getattr(r, "entry_ref", None) or getattr(r, "entry", None)
+    pen = compute_extension_penalty(r, smc_state=smc_state, current_price=current_price)
+    total = int(round(pen["severity_0_100"]))
     subs = {
-        "ex_ema20_dist":  ex_ema20,
-        "ex_ema50_dist":  ex_ema50,
-        "ex_pivot_dist":  ex_pivot,
-        "ex_move_since":  ex_move,
-        "ex_bars_since":  ex_bars,
+        "ex_ema20_dist":  pen["ex_ema20_dist"],
+        "ex_ema50_dist":  pen["ex_ema50_dist"],
+        "ex_pivot_dist":  pen["ex_pivot_dist"],
+        "ex_move_since":  pen["ex_move_since"],
+        "ex_bars_since":  pen["ex_bars_since"],
         # Legacy keys for backwards compat
-        "ex_ema_dist":    ex_ema20,
-        "ex_trend_phase": (20 if r.trend_phase == "EXTENDED" else 0),
-        "ex_momentum":    ex_move,
-        "ex_days":        ex_bars,
+        "ex_ema_dist":    pen["ex_ema_dist"],
+        "ex_trend_phase": pen["ex_trend_phase"],
+        "ex_momentum":    pen["ex_momentum"],
+        "ex_days":        pen["ex_days"],
+        # New sub-factors, additive (not read by existing callers, available
+        # for the CV4-vs-DE comparison view added in Phase 4)
+        "ex_atr_extension":      pen["atr_extension"],
+        "ex_fvg_zone_distance":  pen["fvg_zone_distance"],
+        "ex_expansion_magnitude":pen["expansion_magnitude"],
     }
     return total, subs
 

@@ -96,6 +96,17 @@ CAN_SETUP           = "setup"
 # Trend phase
 CAN_TREND_PHASE     = "trend_phase"
 
+# CV4/SMC redesign shadow scores (masterscanner_scoring_redesign_FINAL.md §2)
+# — deliberately SEPARATE canonical slots from CAN_LEADERSHIP/CAN_CONVICTION/
+# CAN_ENTRY_QUALITY/CAN_CATEGORY above. CV4_* must never alias into (and
+# therefore never silently overwrite) the CV1-sourced canonical scores that
+# power production Recommendation/Category — that's the whole point of
+# "None — Recommendation still sourced from CV1" (§4, Phase 2).
+CAN_CV4_LEADERSHIP    = "cv4_leadership"
+CAN_CV4_CONVICTION    = "cv4_conviction"
+CAN_CV4_ENTRY_QUALITY = "cv4_entry_quality"
+CAN_CV4_CATEGORY      = "cv4_category"
+
 
 # ══════════════════════════════════════════════════════════════════
 #  COLUMN METADATA  (display labels + sort order)
@@ -133,6 +144,13 @@ CANONICAL_COLS: dict[str, dict] = {
     CAN_BUY_TYPE:       {"label": "Buy Type",      "fmt": "str",   "group": "setup"},
     CAN_SETUP:          {"label": "Setup",         "fmt": "str",   "group": "setup"},
     CAN_TREND_PHASE:    {"label": "Trend Phase",   "fmt": "str",   "group": "setup"},
+    # CV4/SMC redesign shadow scores — own "cv4" display group so they
+    # never get rendered interleaved with the production "scores"/"class"
+    # groups above (§2/§4 — comparison-only through Phase 6).
+    CAN_CV4_LEADERSHIP:    {"label": "CV4 Leadership",    "fmt": "int", "group": "cv4"},
+    CAN_CV4_CONVICTION:    {"label": "CV4 Conviction",    "fmt": "int", "group": "cv4"},
+    CAN_CV4_ENTRY_QUALITY: {"label": "CV4 Entry Quality", "fmt": "int", "group": "cv4"},
+    CAN_CV4_CATEGORY:      {"label": "CV4 Category",      "fmt": "str", "group": "cv4"},
 }
 
 
@@ -181,6 +199,14 @@ _ALIAS_MAP: dict[str, str] = {
     "Stage":               CAN_STAGE,
     "Lifecycle":           CAN_STAGE,      # v2 name for Stage (objective)
     "stage":               CAN_STAGE,
+
+    # CV4/SMC redesign shadow scores (§2) — separate canonical slots,
+    # deliberately NOT merged into CAN_LEADERSHIP/CAN_CONVICTION/
+    # CAN_ENTRY_QUALITY/CAN_CATEGORY above (see those constants' docstring).
+    "CV4_Leadership":      CAN_CV4_LEADERSHIP,
+    "CV4_Conviction":      CAN_CV4_CONVICTION,
+    "CV4_EntryQuality":    CAN_CV4_ENTRY_QUALITY,
+    "CV4_SignalClass":     CAN_CV4_CATEGORY,
 
     # Trade levels
     "entry":               CAN_ENTRY,

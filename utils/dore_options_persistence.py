@@ -379,6 +379,27 @@ class DoreOptionsPlan:
     # cycle's technical read differs.
     source:              str   = ""
 
+    # [Phase 3, masterscanner_scoring_redesign_FINAL.md §2/§4 —
+    # "DORE CV4/SMC persistence"] CV4EvidenceResult (utils.dore_engine.
+    # stage2_5_cv4_evidence()) captured ONCE at mint time, same frozen-
+    # snapshot pattern as `source` above — a plan's SMC/CV4 read at the
+    # moment it was surfaced is a historical fact about that plan, not a
+    # live value that should silently drift as later scan cycles produce
+    # different SMC evidence for the same underlying. NON-GATING: nothing
+    # reads these fields to decide entry/exit/status — they exist purely
+    # for Phase 5's outcome attribution (bucket A-E classification on
+    # closed plans) and Phase 4's CV1-vs-CV4 comparison view. All
+    # Optional/blank-default so existing rows and existing callers that
+    # don't pass them are unaffected (additive-only).
+    cv4_leadership_at_mint:      Optional[int]   = None
+    cv4_conviction_at_mint:      Optional[int]   = None
+    cv4_entry_quality_at_mint:   Optional[int]   = None
+    cv4_composite_at_mint:       Optional[float] = None
+    cv4_signal_class_at_mint:    str = ""    # ELITE | EXECUTE | WATCH | SKIP
+    cv4_smc_evidence_tier_at_mint: Optional[int] = None
+    cv4_smc_state_at_mint:       str = ""    # e.g. BULLISH_CONTINUATION, LIQUIDITY_SWEEP, ...
+    cv4_smc_fvg_retest_at_mint:  str = ""    # none | in_zone | through_unfilled | through_filled
+
     @property
     def contract_key(self) -> str:
         return f"{self.symbol.upper()}|{self.direction}|{self.strike:.1f}|{self.expiry}"
@@ -436,6 +457,16 @@ class DoreOptionsPlan:
             # (the dataclass default), so this hits on every refresh of
             # any pre-existing open plan until they're closed out.
             "source":              self.source or "",
+            # Phase 3 CV4/SMC mint-time snapshot (§2/§4) — non-gating,
+            # additive-only. See dataclass field comments above.
+            "cv4_leadership_at_mint":       self.cv4_leadership_at_mint,
+            "cv4_conviction_at_mint":       self.cv4_conviction_at_mint,
+            "cv4_entry_quality_at_mint":    self.cv4_entry_quality_at_mint,
+            "cv4_composite_at_mint":        self.cv4_composite_at_mint,
+            "cv4_signal_class_at_mint":     self.cv4_signal_class_at_mint or "",
+            "cv4_smc_evidence_tier_at_mint":self.cv4_smc_evidence_tier_at_mint,
+            "cv4_smc_state_at_mint":        self.cv4_smc_state_at_mint or "",
+            "cv4_smc_fvg_retest_at_mint":   self.cv4_smc_fvg_retest_at_mint or "",
         }
 
 
@@ -871,6 +902,22 @@ def enrich_trade_plans_with_persistence(
                     confidence_at_entry=confidence_score,
                     status=DoreOptionsPlanStatus.TRACKED,
                     source=row.get("source") or "",
+                    # [Phase 3, §2/§4] Captured at mint time IF the caller
+                    # already ran utils.dore_engine.stage2_5_cv4_evidence()
+                    # for this cycle and put its result on `row` — that
+                    # upstream wiring (Stage 2.5 -> row) is a Phase 4
+                    # integration step, not yet done as of Phase 3; until
+                    # then these read as None/"" from row.get(), which is
+                    # the same as omitting them (additive-only, no
+                    # behavior change to minting either way).
+                    cv4_leadership_at_mint=row.get("cv4_leadership"),
+                    cv4_conviction_at_mint=row.get("cv4_conviction"),
+                    cv4_entry_quality_at_mint=row.get("cv4_entry_quality"),
+                    cv4_composite_at_mint=row.get("cv4_composite"),
+                    cv4_signal_class_at_mint=row.get("cv4_signal_class") or "",
+                    cv4_smc_evidence_tier_at_mint=row.get("cv4_smc_evidence_tier"),
+                    cv4_smc_state_at_mint=row.get("cv4_smc_state") or "",
+                    cv4_smc_fvg_retest_at_mint=row.get("cv4_smc_fvg_retest") or "",
                 )
                 just_minted = True
                 open_now[key] = locked

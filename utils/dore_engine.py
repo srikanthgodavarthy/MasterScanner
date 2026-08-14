@@ -1599,6 +1599,159 @@ def stage2b_pre_breakout_confirmation(
 
 
 # ══════════════════════════════════════════════════════════════════
+#  STAGE 2.5 — CV4/SMC EVIDENCE  (masterscanner_scoring_redesign_FINAL.md
+#  §2/§4, Phase 3 — "DORE CV4/SMC persistence")
+#
+#  NON-GATING (§4: "Zero — enable_cv4_opportunity_weight=False; no effect
+#  on recommendation or opportunity_score"). This stage computes and
+#  returns a CV4EvidenceResult purely for persistence (DoreOptionsPlan's
+#  mint-time snapshot fields, below) and eventual Stage 5 ranking use —
+#  it is NEVER consulted by Stage 5's `recommendation` (the composition
+#  table, keyed only on directional_intent/execution_state/hard-gate) and
+#  its Stage 5 `opportunity_score` contribution is mathematically zero by
+#  default (see DORESettings.w_opp_cv4_evidence's docstring).
+#
+#  ADAPTER DISCLOSURE: `_leadership_v4`/`_conviction_v4`/`_entry_quality_v4`
+#  in utils/conviction_score_v1.py were built against
+#  utils.scoring_core.BarResult's field set (rs_composite, trend_up,
+#  ema_alignment, mom3/mom6, pivot_high_dist, ...) — Live Scanner's daily-
+#  OHLCV-derived technical-indicator schema. utils.dore_engine.DOREInput
+#  is a DIFFERENT, options-market-microstructure-oriented schema (ema9/
+#  ema21/adx/rsi/atr/rel_volume/compression/nr7/...) with no rs_composite,
+#  no mom3/mom6, no pivot_high_dist, etc. The FINAL spec does not specify
+#  an adapter between the two schemas. `_dore_input_to_pseudo_bar()` below
+#  is a documented, best-effort field mapping — NOT a spec-mandated
+#  formula — built so Stage 2.5 is exercisable in Phase 3/4 shadow runs.
+#  Refining this mapping is explicitly Phase 4/5/6 territory (comparison/
+#  calibration), not a Phase 3 blocker, since Stage 2.5 has zero
+#  production impact regardless of how accurate the mapping is.
+# ══════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class CV4EvidenceResult:
+    """Stage 2.5 output — persisted verbatim into DoreOptionsPlan's
+    mint-time snapshot fields (utils/dore_options_persistence.py), never
+    read back into Stage 5's `recommendation`."""
+    leadership:        int = 0
+    conviction:         int = 0
+    entry_quality:      int = 0
+    composite:          float = 0.0
+    signal_class:       str = "SKIP"        # ELITE | EXECUTE | WATCH | SKIP
+    thesis_direction:   str = "NEUTRAL"     # mirrors Stage 1's directional_intent
+    smc_direction:      str = "NEUTRAL"
+    smc_state_label:    str = "NEUTRAL"
+    smc_evidence_tier:  int = 0
+    smc_age_bars:       int = 0
+    smc_fvg_retest:     str = "none"
+
+
+def _dore_input_to_pseudo_bar(inp: DOREInput, trend: TrendResult):
+    """
+    Best-effort adapter, DOREInput/TrendResult -> a minimal object
+    exposing the BarResult attributes CV4's Leadership/Conviction/Entry
+    Quality sub-scoring functions read. See this section's module-level
+    ADAPTER DISCLOSURE above — not a literal 1:1 field match, since the
+    two schemas were built for different purposes. Fields DORE has no
+    analogue for are given conservative NEUTRAL defaults (never a value
+    that would fabricate false conviction).
+    """
+    from types import SimpleNamespace
+
+    trend_up = inp.ema9 > inp.ema21
+    trend_down = inp.ema9 < inp.ema21
+    ema_alignment = trend_up or trend_down   # DORE has no cloud/ichimoku equivalent — EMA9/21 cross is the closest analogue
+    vol_ratio = inp.rel_volume
+
+    return SimpleNamespace(
+        # RS — DORE tracks no relative-strength-vs-index series; neutral/
+        # unavailable, matching the "no sector benchmark wired in" convention
+        # _leadership_v4/_conviction_v4 already use elsewhere for missing RS.
+        rs_composite=0.0, rs_vs_sector=0.0, rs_sector_available=False,
+        rs_consistency=0.0, rs_momentum=0.0,
+        # Trend / structure
+        trend_up=trend_up, trend_down=trend_down, ema_alignment=ema_alignment,
+        above_cloud=False, inside_cloud=ema_alignment,
+        adx_val=inp.adx, ema20_slope=inp.ema9_slope_pct,
+        trend_age_bars=0,   # DORE doesn't track trend age the way BarResult does — no sweet-spot credit
+        nifty_regime_val="bullish" if trend.directional_intent == BULLISH
+                          else ("bearish" if trend.directional_intent == BEARISH else "neutral"),
+        # Momentum — DORE has no mom3/mom6 (multi-week % move); rsi is the
+        # closest available directional-momentum proxy, mapped conservatively.
+        mom3=(inp.rsi - 50) * 0.3, mom6=(inp.rsi - 50) * 0.3,
+        # Volume / participation
+        vol_ratio=vol_ratio,
+        # Setup/pattern evidence — DORE's compression/nr7 flags are the
+        # closest analogues to Live Scanner's squeeze_on/squeeze_release.
+        in_golden=False, in_golden_relaxed=False, above_fib786=False,
+        recent_cci_recovery=False, cci_rising=False, cci_momentum_break=inp.fresh_crossover,
+        squeeze_release=inp.fresh_crossover and inp.compression, squeeze_on=inp.compression or inp.nr7,
+        t4_downtrend=trend_down,
+        # Entry timing / extension — DORE has no pivot/EMA-distance/bars-
+        # since-setup measurements; neutral defaults so Extension/Chase
+        # Risk and Price Location degrade to 0 rather than fabricating a
+        # read, exactly like a None smc_state does elsewhere.
+        pivot_high_dist=0.0, ema20_pct_dist=0.0, ema50_pct_dist=0.0,
+        bars_since_setup_actual=-1, atr_band="Actionable",
+        extension_atr=0.0, atr_expansion_ratio=1.0,
+        trend_phase="ESTABLISHED" if ema_alignment else "NONE",
+        fresh_base_breakout=False, compression_break=inp.compression,
+        entry_ref=inp.price, entry=inp.price,
+    )
+
+
+def stage2_5_cv4_evidence(
+    inp: DOREInput, cfg: DORESettings, trend: TrendResult, smc_state=None,
+) -> CV4EvidenceResult:
+    """
+    Computes CV4 Leadership/Conviction/Entry Quality for this DORE read,
+    using Stage 1's `directional_intent` as CV4's `thesis_direction`
+    (§1.6/§1.7 — DORE's own directional read drives CV4 here, not a
+    default BULLISH the way Live Scanner's wiring does).
+
+    smc_state: utils.smc_engine.SMCState for this symbol, computed by the
+    caller from the same daily OHLCV cache Stage 1 already uses (DOREInput
+    itself only carries pre-reduced scalars — ema9/ema21/adx/rsi/atr — not
+    a raw OHLC series, so SMC detection cannot run inside this function).
+    None degrades every SMC-dependent component to its SMC-NEUTRAL value,
+    same contract as Live Scanner's wiring — never an error, never a gate.
+
+    NEUTRAL directional_intent scores CV4 against a "BULLISH" thesis by
+    convention (matching Live Scanner's default) purely so the numbers are
+    defined; a NEUTRAL read already means Stage 5's `recommendation` is
+    WAIT regardless of anything this function returns (§ stage5 docstring
+    — Directional Intent NEUTRAL -> WAIT), so this choice has no
+    behavioral consequence.
+    """
+    from utils.conviction_score_v1 import compute_conviction_v4
+
+    thesis_direction = trend.directional_intent if trend.directional_intent in (BULLISH, BEARISH) else BULLISH
+    pseudo_bar = _dore_input_to_pseudo_bar(inp, trend)
+
+    cv4 = compute_conviction_v4(
+        pseudo_bar, thesis_direction=thesis_direction, smc_state=smc_state,
+        swing_label=None, current_price=inp.price,
+    )
+
+    return CV4EvidenceResult(
+        leadership=cv4.leadership, conviction=cv4.conviction, entry_quality=cv4.entry_quality,
+        composite=cv4.composite, signal_class=cv4.signal_class,
+        thesis_direction=thesis_direction,
+        smc_direction=cv4.smc_direction, smc_state_label=cv4.smc_state_label,
+        smc_evidence_tier=cv4.smc_evidence_tier, smc_age_bars=cv4.smc_age_bars,
+        smc_fvg_retest=cv4.smc_fvg_retest,
+    )
+
+
+def _cv4_evidence_opportunity_term(cv4_evidence: Optional[CV4EvidenceResult]) -> float:
+    """0-100 read of CV4EvidenceResult for Stage 5's optional ranking
+    term — equal-weight blend of the three CV4 scores, same shape as
+    ConvictionV4.composite. Returns 50.0 (neutral) if unavailable."""
+    if cv4_evidence is None:
+        return 50.0
+    return cv4_evidence.composite
+
+
+# ══════════════════════════════════════════════════════════════════
 #  STAGE 3 — DERIVATIVE INTELLIGENCE  (Derivative Confidence)
 # ══════════════════════════════════════════════════════════════════
 
@@ -1606,6 +1759,7 @@ def stage3_derivative_intelligence(
     inp: DOREInput, cfg: DORESettings, directional_intent: str
 ) -> DerivativeResult:
     """Validate execution using live option-chain behaviour — "does the
+
     options market confirm this trade?" (Section 9). Bidirectional:
     scores whichever side `directional_intent` names; a NEUTRAL intent
     still gets a direction-agnostic read for reporting/ranking only.
@@ -2148,6 +2302,7 @@ def stage5_opportunity_engine(
     risk_hard_gate_pass: bool,
     premium_strengthening: bool = False,
     confirmed_by: str = CONFIRMED_NONE,
+    cv4_evidence: Optional["CV4EvidenceResult"] = None,
 ) -> OpportunityResult:
     """Merge Directional Intent, Execution State, Derivative Confidence
     and Risk Quality into ONE recommendation (Section 10). The
@@ -2192,12 +2347,22 @@ def stage5_opportunity_engine(
     # ranked list (Futures tab, Options tab) even though BEARISH/PE
     # setups are otherwise fully supported.
     trend_conviction = _trend_conviction(trend_score)
+    # CV4/SMC evidence term (§2/§4, Phase 3) — belt-and-braces double gate:
+    # the weight is forced to 0.0 unless enable_cv4_opportunity_weight is
+    # explicitly True, REGARDLESS of what w_opp_cv4_evidence is configured
+    # to. With the default (flag False), this term contributes exactly 0
+    # to both numerator and denominator of _weighted()'s normalisation —
+    # mathematically identical to the term not existing (§4: "Zero — no
+    # effect on ... opportunity_score"). `recommendation` below never
+    # reads opportunity_score at all, so it is unaffected either way.
+    _cv4_weight = cfg.w_opp_cv4_evidence if getattr(cfg, "enable_cv4_opportunity_weight", False) else 0.0
     opportunity_score = _weighted([
         (trend_conviction,          cfg.w_opp_trend),
         (execution_score,           cfg.w_opp_execution),
         (derivative_confidence,     cfg.w_opp_derivatives),
         (option_intelligence_score, cfg.w_opp_option_intelligence),
         (risk_quality,              cfg.w_opp_risk),
+        (_cv4_evidence_opportunity_term(cv4_evidence), _cv4_weight),
     ])
 
     if not risk_hard_gate_pass:

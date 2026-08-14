@@ -1067,6 +1067,18 @@ def _dore_options_plan_from_row(row: dict) -> "object":
         entry_triggered_at   = str(row.get("entry_triggered_at", "") or ""),
         source               = row.get("source", "") or "",
         t1_hit_at            = str(row.get("t1_hit_at", "") or ""),
+        # [Phase 3, §2/§4] CV4/SMC mint-time snapshot round-trip — see
+        # DoreOptionsPlan's field comments. Absent on rows written before
+        # this migration; reads back as None/"" for those, same as never
+        # having been set (additive-only, no behavior change).
+        cv4_leadership_at_mint         = row.get("cv4_leadership_at_mint"),
+        cv4_conviction_at_mint         = row.get("cv4_conviction_at_mint"),
+        cv4_entry_quality_at_mint      = row.get("cv4_entry_quality_at_mint"),
+        cv4_composite_at_mint          = row.get("cv4_composite_at_mint"),
+        cv4_signal_class_at_mint       = row.get("cv4_signal_class_at_mint", "") or "",
+        cv4_smc_evidence_tier_at_mint  = row.get("cv4_smc_evidence_tier_at_mint"),
+        cv4_smc_state_at_mint          = row.get("cv4_smc_state_at_mint", "") or "",
+        cv4_smc_fvg_retest_at_mint     = row.get("cv4_smc_fvg_retest_at_mint", "") or "",
     )
 
 
@@ -1754,6 +1766,19 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
     t1_hit_at                    timestamptz,
     source                      text        NOT NULL DEFAULT '',
 
+    -- [Phase 3, masterscanner_scoring_redesign_FINAL.md §2/§4 — "DORE
+    -- CV4/SMC persistence"] CV4EvidenceResult mint-time snapshot — see
+    -- utils.dore_options_persistence.DoreOptionsPlan's field comments.
+    -- Non-gating: nothing reads these to decide entry/exit/status.
+    cv4_leadership_at_mint         integer,
+    cv4_conviction_at_mint         integer,
+    cv4_entry_quality_at_mint      integer,
+    cv4_composite_at_mint          numeric(6,2),
+    cv4_signal_class_at_mint       text        NOT NULL DEFAULT '',
+    cv4_smc_evidence_tier_at_mint  integer,
+    cv4_smc_state_at_mint          text        NOT NULL DEFAULT '',
+    cv4_smc_fvg_retest_at_mint     text        NOT NULL DEFAULT '',
+
     updated_at                   timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_dore_options_plans_symbol ON dore_options_plans(symbol);
@@ -1778,6 +1803,22 @@ ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS t1_hit_at timestamptz;
 DORE_OPTIONS_PLANS_ENTRY_UNDERLYING_MIGRATION_SQL = """
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS entry_underlying numeric(12,2);
 """
+
+DORE_OPTIONS_PLANS_CV4_MIGRATION_SQL = """
+-- [Phase 3, masterscanner_scoring_redesign_FINAL.md §2/§4] Run once
+-- against an existing dore_options_plans table. Purely additive/
+-- nullable (or empty-string-default for the text columns, matching
+-- `source`'s convention) — no existing row or query is affected.
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS cv4_leadership_at_mint integer;
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS cv4_conviction_at_mint integer;
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS cv4_entry_quality_at_mint integer;
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS cv4_composite_at_mint numeric(6,2);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS cv4_signal_class_at_mint text NOT NULL DEFAULT '';
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS cv4_smc_evidence_tier_at_mint integer;
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS cv4_smc_state_at_mint text NOT NULL DEFAULT '';
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS cv4_smc_fvg_retest_at_mint text NOT NULL DEFAULT '';
+"""
+
 # [2026-08-12, two-level lifecycle refactor] Run this once against an
 # existing dore_options_plans table.
 #

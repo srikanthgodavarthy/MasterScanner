@@ -14,6 +14,7 @@ get rediscovered the hard way again.
 | **CV1** (Conviction Score v1) | `utils/conviction_score_v1.py` | `CV1_*` (e.g. `CV1_Leadership`) | `CV1_SignalClass` (ELITE / EXECUTE / WATCH / SKIP). Backtest-validated weights (see `FACTOR_WEIGHTS` in that file). |
 | **Decision Engine (DE)** | `utils/decision_engine.py` | `DE_*` (e.g. `DE_Leadership`) | `Recommendation` / `Category` (Elite Opportunity / High Conviction / Actionable / Avoid). Independent 4-score framework: Leadership, Conviction, Entry Quality, Extension. |
 | **Pillar Engine (Five Pillars)** | `utils/pillar_engine.py` | `FP_*` / its own labels (e.g. Structure, Acceptance, Leadership, Momentum) | Powers the Pre-Breakout Scanner tab (`pages/five_pillars.py`) entirely. Base-90 + 10pt Elite Bonus architecture. |
+| **CV4** (Conviction Score v4 / SMC redesign) | `utils/conviction_score_v1.py` (CV4 functions), `utils/smc_engine.py`, `utils/smc_freshness.py`, `utils/extension_shared.py` | `CV4_*` (e.g. `CV4_Leadership`) | Nothing, through Phase 6. `CV4_SignalClass` (ELITE / EXECUTE / WATCH / SKIP) is written for comparison only — `Recommendation`/`Category` stay sourced from CV1. DORE's Stage 2.5 (`utils/dore_engine.py`) computes and persists the same CV4 evidence for options plans but is likewise non-gating: `enable_cv4_opportunity_weight=False` by default means Stage 5's `opportunity_score` is computed exactly as before, with the CV4 evidence term excluded from the weighted sum entirely (not merely zero-weighted) until a human flips that setting after Phase 6 calibration. See `masterscanner_scoring_redesign_FINAL.md` for the full phase plan and production-cutover criteria (Phase 7). |
 
 There's also the original scanner engine's own **Score / Action / Tier / Buy
 Type** columns (`utils/scanner_engine.py`, norm_score + Opportunity Bonus from
@@ -24,7 +25,7 @@ original backtest-tuned engine, layered under all of the above.
 
 **No score column should ever be written under a bare name like
 `"Leadership"`, `"Conviction"`, or `"EntryQuality"`.** Every score column must
-carry its owning system's prefix (`CV1_`, `DE_`, `FP_`). This was fixed in
+carry its owning system's prefix (`CV1_`, `DE_`, `FP_`, `CV4_`). This was fixed in
 `utils/scanner_engine.py`, which used to write the Decision Engine's scores
 under bare `"Leadership"` / `"Conviction"` / `"EntryQuality"` — now it writes
 `DE_Leadership` / `DE_Conviction` / `DE_EntryQuality`.

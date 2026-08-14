@@ -400,6 +400,22 @@ class BarResult:
     stoch_bonus_pts:           int   = 0       # 0..params.stoch_bonus_max
     opportunity_bonus_pts:       int   = 0       # ll_bonus_pts + stoch_bonus_pts, already applied to norm_score
 
+    # ── CV4/SMC redesign additive fields (masterscanner_scoring_redesign_FINAL.md §2) ──
+    # SMCState carrier: populated by whichever caller ran
+    # utils.smc_engine.compute_smc_state() for this symbol/bar (Phase 2
+    # wiring in scanner_engine.py, Phase 3 wiring in dore_engine.py Stage
+    # 2.5). None until that wiring runs — every CV4 consumer must treat a
+    # None smc_state as SMC-NEUTRAL/tier-0, never as an error.
+    smc_state: object = None   # Optional["utils.smc_engine.SMCState"] — object to avoid a hard import cycle
+
+    # Recent volatility expansion ratio — recent-ATR / baseline-ATR.
+    # 1.0 = neutral/no expansion (the default below). NOT YET populated by
+    # compute_bar()'s indicator pipeline as of Phase 2/3; consumers
+    # (utils/extension_shared.py) must degrade gracefully (treat 1.0 as
+    # "no signal", never fabricate a penalty) until that wiring is
+    # scheduled — see extension_shared.py's _expansion_magnitude_component().
+    atr_expansion_ratio: float = 1.0
+
 
 # ══════════════════════════════════════════════════════════════════
 #  PRE-COMPUTED SERIES BUNDLE  (passed into the bar loop once)

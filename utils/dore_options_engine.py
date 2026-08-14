@@ -264,6 +264,25 @@ class MasterScannerSignal:
     breakout_score:         float = 0.0
     continuation_score:     float = 0.0
 
+    # [Phase 4, masterscanner_scoring_redesign_FINAL.md §2/§4 — "close
+    # the actual producer-to-persistence pipeline"] CV4/SMC shadow
+    # evidence, already computed by utils.scanner_engine.score_stock()
+    # (Phase 2) and surfaced as CV4_* columns on the SAME scan row this
+    # class already reads everything else from. Pure pass-through, same
+    # convention as in_golden/trend_up/etc. above — NOT recomputed here,
+    # NOT read by hard_reject()/qualification_score()/direction()/
+    # final_score() (unchanged — see those functions). None when the
+    # scan row has no CV4_* columns (e.g. CV4 shadow scoring failed for
+    # that symbol, or the row predates Phase 2) — never fabricated.
+    cv4_leadership:         Optional[float] = None
+    cv4_conviction:         Optional[float] = None
+    cv4_entry_quality:      Optional[float] = None
+    cv4_composite:          Optional[float] = None
+    cv4_signal_class:       Optional[str]   = None   # ELITE | EXECUTE | WATCH | SKIP
+    cv4_smc_evidence_tier:  Optional[int]   = None
+    cv4_smc_state:          Optional[str]   = None    # e.g. BULLISH_CONTINUATION, LIQUIDITY_SWEEP, ...
+    cv4_smc_fvg_retest:     Optional[str]   = None    # none | in_zone | through_unfilled | through_filled
+
     @staticmethod
     def from_scan_row(
         row: dict,
@@ -329,6 +348,20 @@ class MasterScannerSignal:
             ema20_slope=float(row.get("EMA Slope") or 0.0),
             rs_composite_pct=float(row.get("RScomp") or 0.0),
             adx_val=float(row.get("ADX") or 0.0),
+            # [Phase 4, §2/§4] CV4/SMC shadow evidence pass-through — see
+            # this class's field-block docstring. row.get(...) with no
+            # fallback/default coercion (unlike the fields above) so a
+            # missing column stays None rather than silently becoming 0.0
+            # or "" — CV4-unavailable must stay distinguishable from
+            # CV4-computed-as-zero.
+            cv4_leadership=(float(row["CV4_Leadership"]) if row.get("CV4_Leadership") is not None else None),
+            cv4_conviction=(float(row["CV4_Conviction"]) if row.get("CV4_Conviction") is not None else None),
+            cv4_entry_quality=(float(row["CV4_EntryQuality"]) if row.get("CV4_EntryQuality") is not None else None),
+            cv4_composite=(float(row["CV4_Composite"]) if row.get("CV4_Composite") is not None else None),
+            cv4_signal_class=(str(row["CV4_SignalClass"]) if row.get("CV4_SignalClass") is not None else None),
+            cv4_smc_evidence_tier=(int(row["CV4_SMC_EvidenceTier"]) if row.get("CV4_SMC_EvidenceTier") is not None else None),
+            cv4_smc_state=(str(row["CV4_SMC_State"]) if row.get("CV4_SMC_State") is not None else None),
+            cv4_smc_fvg_retest=(str(row["CV4_SMC_FvgRetest"]) if row.get("CV4_SMC_FvgRetest") is not None else None),
         )
         sig.setup_type, sig.setup_conviction, _setup_scores = setup_aware_conviction(sig)
         sig.pullback_score     = _setup_scores[SETUP_PULLBACK]
@@ -727,6 +760,27 @@ class OptionTradePlan:
     # pages/scanner.py's Source column for the badge rendering.
     source:                 Optional[str] = None
     reasons:              list = field(default_factory=list)
+
+    # [Phase 4, masterscanner_scoring_redesign_FINAL.md §2/§4 — "close
+    # the actual producer-to-persistence pipeline"] CV4/SMC shadow
+    # evidence snapshot, straight pass-through from MasterScannerSignal
+    # (see that class's field-block docstring) — set once here, at plan
+    # construction, then persisted verbatim by utils/dore_options_scan.py
+    # (via to_dict()==asdict(self), no extra mapping needed) into the
+    # "dore_technical_plans" snapshot, and from there read by
+    # utils/dore_options_persistence.py's mint call
+    # (row.get("cv4_leadership") etc. — field names below were chosen to
+    # match those .get() calls exactly). NON-GATING: not read by
+    # qualification_score()/direction()/final_score()/hard_reject() —
+    # confirmed unchanged, this is a pure passenger field.
+    cv4_leadership:         Optional[float] = None
+    cv4_conviction:         Optional[float] = None
+    cv4_entry_quality:      Optional[float] = None
+    cv4_composite:          Optional[float] = None
+    cv4_signal_class:       Optional[str]   = None
+    cv4_smc_evidence_tier:  Optional[int]   = None
+    cv4_smc_state:          Optional[str]   = None
+    cv4_smc_fvg_retest:     Optional[str]   = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1446,6 +1500,17 @@ def compute_dore_trade_plan(
         breakout_score=sig.breakout_score,
         continuation_score=sig.continuation_score,
         reasons=reasons,
+        # [Phase 4, §2/§4] CV4/SMC shadow evidence — pure pass-through
+        # from sig (MasterScannerSignal), never recomputed here. See
+        # OptionTradePlan's field-block docstring.
+        cv4_leadership=sig.cv4_leadership,
+        cv4_conviction=sig.cv4_conviction,
+        cv4_entry_quality=sig.cv4_entry_quality,
+        cv4_composite=sig.cv4_composite,
+        cv4_signal_class=sig.cv4_signal_class,
+        cv4_smc_evidence_tier=sig.cv4_smc_evidence_tier,
+        cv4_smc_state=sig.cv4_smc_state,
+        cv4_smc_fvg_retest=sig.cv4_smc_fvg_retest,
     )
 
 

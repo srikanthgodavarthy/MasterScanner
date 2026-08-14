@@ -330,6 +330,18 @@ DORE_DEFAULTS: dict = {
     "w_opp_derivatives":          25.0,
     "w_opp_option_intelligence":  20.0,
     "w_opp_risk":                 10.0,
+    # CV4/SMC redesign (masterscanner_scoring_redesign_FINAL.md §2/§4,
+    # Phase 3). w_opp_cv4_evidence=0.0 makes _weighted()'s normalisation
+    # mathematically identical to the term not existing at all (0/total_w
+    # contributes nothing to numerator OR denominator) — not merely a
+    # small weight. enable_cv4_opportunity_weight=False is a second,
+    # independent belt-and-braces gate in stage5_opportunity_engine():
+    # even if this weight were ever misconfigured to a nonzero value, the
+    # flag being False forces the term's effective weight back to 0
+    # before _weighted() ever sees it. Both default OFF through Phase 6
+    # (§4/§6) — only a human, after Phase 6 calibration, flips either.
+    "w_opp_cv4_evidence":         0.0,
+    "enable_cv4_opportunity_weight": False,
     "min_opportunity_score_to_show": 0.0,  # pure ranking floor; recommendation itself comes
                                              # from the composition table, not this score
 
@@ -509,6 +521,11 @@ class DORESettings:
     w_opp_derivatives: float = 25.0
     w_opp_option_intelligence: float = 20.0
     w_opp_risk: float = 10.0
+    # CV4/SMC redesign (§2/§4, Phase 3) — see the matching dict entries
+    # above for the "zero, not merely small" rationale. Both default OFF
+    # through Phase 6.
+    w_opp_cv4_evidence: float = 0.0
+    enable_cv4_opportunity_weight: bool = False
     min_opportunity_score_to_show: float = 0.0
 
     target_delta_min: float = 0.55

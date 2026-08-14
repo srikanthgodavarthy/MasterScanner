@@ -111,6 +111,12 @@ class ConvictionV1:
     eq_pivot_dist:         int = 0   # 0-20
     eq_move_since_setup:   int = 0   # 0-20
     eq_bars_since_setup:   int = 0   # 0-15
+    # [PRODUCTION SMC WIRING, 2026-08-14] Additive display field — always
+    # 0 for ConvictionV1/ConvictionV2 (they never pass smc_state to
+    # _entry_quality()); a real bounded adjustment (~-6..+9) for
+    # ConvictionV3 (CV1's production entry point) when a real SMCState is
+    # supplied. See _entry_quality()'s docstring.
+    eq_smc_confirmation:   int = 0   # roughly -6..+9, already added into eq totals above
 
     # Grade labels
     leadership_grade:    str = "D"
@@ -450,8 +456,84 @@ def _conviction(r: "BarResult") -> tuple[int, dict]:
 #       ATR band used as primary freshness metric (v9 PRIMARY)
 # ══════════════════════════════════════════════════════════════════
 
-def _entry_quality(r: "BarResult") -> tuple[int, dict]:
-    """Returns (0-100, sub_scores_dict)."""
+def _smc_entry_confirmation_adjustment(smc_state) -> int:
+    """
+    SECONDARY production role of SMC (explicit user direction, 2026-08-14):
+    a small, BOUNDED confirmation adjustment to CV1's Entry Quality —
+    never a replacement of the existing frozen ladder, never large enough
+    to single-handedly move a setup between tiers on its own. Targets the
+    stated goal directly: penalize late/already-run entries (a filled FVG
+    zone means price already swept through the level CV1 can't see),
+    reward genuinely fresh confirmed entries, and — critically — stay a
+    TRUE NO-OP when there is simply no SMC evidence either way. "No
+    evidence" is the OVERWHELMINGLY common case (most valid, quiet, early
+    continuation setups have no recent liquidity sweep at all) and must
+    never be treated as a penalty-worthy signal — doing so would
+    systematically drag down ordinary good setups, exactly the
+    "destroying valid early continuation opportunities" failure mode this
+    wiring was explicitly asked to avoid.
+
+    [BUG FOUND AND FIXED, 2026-08-14 — same session] An earlier version of
+    this function anchored "neutral" at evidence_tier==0 mapped through
+    smc_entry_structure_score()'s score=0, which actually gave EVERY
+    no-evidence symbol an automatic -6 penalty (confirmed via direct
+    test — see conversation). Fixed by returning 0 explicitly for
+    evidence_tier==0 (and CONFLICT, and non-bullish direction — CV1 is
+    long-only so a bearish/neutral SMC read is not a directional
+    confirmation signal for a long entry) BEFORE reaching the rescale,
+    and re-anchoring the rescale's zero-point at "Weak, no retest info"
+    (score=4) rather than "Moderate, no retest" (score=10) — the smallest
+    score a bar with genuine (tier>=1) evidence can have absent a
+    negative retest signal, so a bare, low-confidence-but-real signal
+    reads as ~neutral rather than a moderate bonus, and only a NEGATIVE
+    retest signal (through_filled — price already ran through and past
+    the zone, i.e. genuinely late/chased) pulls the adjustment negative.
+
+    Bounded roughly -2..+11 (only reachable when evidence_tier >= 1):
+      score  0  (tier1 + through_filled)     -> -2   (weak evidence AND late)
+      score  4  (tier1, no retest info)       ->  0   (baseline weak signal, neutral)
+      score 10  (tier2, no retest info)       -> +3
+      score 16  (tier3, no retest info)       -> +6
+      score 21  (tier3 + in_zone retest)      -> +9
+      score 25  (tier4 + in_zone retest)      -> +11  (best case: strong, fresh, in the zone)
+    smc_state is None, evidence_tier == 0, state == CONFLICT, or
+    direction != BULLISH -> 0 (exact no-op in every one of these cases).
+    """
+    if smc_state is None:
+        return 0
+    if smc_state.state == "CONFLICT":
+        return 0   # ambiguous evidence -> no opinion, not a penalty
+    if smc_state.direction != "BULLISH":
+        return 0   # CV1 is long-only; non-bullish SMC direction is not a
+                   # confirmation signal for a long entry, but also not
+                   # automatically disqualifying -- stay neutral, don't gate
+    if smc_state.evidence_tier == 0:
+        return 0   # no meaningful evidence either way -- the common case,
+                   # must be a true no-op, not a penalty (see docstring)
+    score = smc_entry_structure_score(smc_state)   # 0-25, tier>=1 guaranteed here
+    return round((score - 4) * 0.5)
+
+
+def _entry_quality(r: "BarResult", smc_state=None) -> tuple[int, dict]:
+    """Returns (0-100, sub_scores_dict).
+
+    [PRODUCTION SMC WIRING, 2026-08-14 — explicit user direction] SMC's
+    SECONDARY production role: `smc_state` (utils.smc_engine.SMCState,
+    default None) is a BOUNDED confirmation adjustment layered on top of
+    the five factors below — see _smc_entry_confirmation_adjustment()'s
+    docstring for the exact mapping and rationale. The five factors
+    themselves, their weights, and every threshold are UNCHANGED — this
+    is additive to the total, not a reweighting. smc_state=None (the
+    default) reproduces this function's exact pre-2026-08-14 behavior,
+    bit for bit — confirmed by regression test. Only
+    utils.conviction_score_v1.compute_conviction_v3() (CV1's production
+    entry point, used by utils.scanner_engine.py for Recommendation)
+    passes a real smc_state; compute_conviction_v1()/compute_conviction_v2()
+    do not, and are therefore completely unaffected by this change.
+    THIS DELIBERATELY CHANGES RECOMMENDATION counts/composition when real
+    SMC evidence exists, per explicit user confirmation — CV1 was frozen
+    through every phase of this project until this point.
+    """
 
     # ── 1. EMA20 Distance (0-30) ─────────────────────────────────
     # v8.1: Best entry = price at or just above EMA20 (0-2% above)
@@ -508,11 +590,26 @@ def _entry_quality(r: "BarResult") -> tuple[int, dict]:
 
     total = eq_ema20 + eq_pvt + eq_move + eq_ema50 + eq_bars
 
-    # Hard cap: EXTENDED trend phase degrades entry quality
+    # [PRODUCTION SMC WIRING, 2026-08-14] Bounded confirmation adjustment
+    # (Secondary use), applied to the raw 5-factor sum BEFORE the EXTENDED
+    # hard cap below — so the cap is the final ceiling: SMC can still push
+    # an already-capped, already-late setup even further down (e.g. a
+    # filled FVG zone confirms the chase is worse than the ladder alone
+    # suggests), but a positive SMC adjustment can NEVER lift a genuinely
+    # EXTENDED setup back above the cap. Getting this ordering backwards
+    # would let strong SMC evidence rescue a late chase into a higher
+    # tier — exactly the opposite of the stated goal (reduce low-quality
+    # late-momentum recommendations without destroying valid early
+    # continuation opportunities).
+    smc_adj = _smc_entry_confirmation_adjustment(smc_state)
+    total = total + smc_adj
+
+    # Hard cap: EXTENDED trend phase degrades entry quality — applied
+    # LAST, after the SMC adjustment, so it remains a true ceiling.
     if r.trend_phase == "EXTENDED":
         total = min(total, 35)
 
-    total = min(total, 100)
+    total = max(0, min(total, 100))
 
     return total, {
         "eq_ema20_dist":      eq_ema20,
@@ -520,6 +617,7 @@ def _entry_quality(r: "BarResult") -> tuple[int, dict]:
         "eq_move_since_setup":eq_move,
         "eq_ema50_dist":      eq_ema50,
         "eq_bars_since_setup":eq_bars,
+        "eq_smc_confirmation":smc_adj,
     }
 
 
@@ -652,6 +750,7 @@ def compute_conviction_v1(r: "BarResult") -> ConvictionV1:
         eq_pivot_dist       = eq_subs["eq_pivot_dist"],
         eq_move_since_setup = eq_subs["eq_move_since_setup"],
         eq_bars_since_setup = eq_subs["eq_bars_since_setup"],
+        eq_smc_confirmation = eq_subs["eq_smc_confirmation"],
         # Grade labels
         leadership_grade    = _grade(leadership),
         conviction_grade    = _grade(conviction),
@@ -875,6 +974,7 @@ def compute_conviction_v2(r: "BarResult") -> ConvictionV2:
         eq_pivot_dist       = eq_subs["eq_pivot_dist"],
         eq_move_since_setup = eq_subs["eq_move_since_setup"],
         eq_bars_since_setup = eq_subs["eq_bars_since_setup"],
+        eq_smc_confirmation = eq_subs["eq_smc_confirmation"],
         # Grade labels
         leadership_grade    = _grade(leadership),
         conviction_grade    = _grade(conviction),
@@ -1061,23 +1161,31 @@ def _classify_v3(leadership: int, conviction: int, entry_quality: int,
     return "SKIP"
 
 
-def compute_conviction_v3(r: "BarResult", settings: Optional[dict] = None) -> ConvictionV3:
+def compute_conviction_v3(r: "BarResult", settings: Optional[dict] = None, smc_state=None) -> ConvictionV3:
     """
     Compute Conviction Score v3 (equal-weight 1/3 each composite) from an
-    existing BarResult. Reuses v1's unchanged _leadership()/_conviction()/
-    _entry_quality() sub-scoring — only the composite blend and the
-    tier/signal thresholds differ (classify_tier_v3 / _classify_v3).
+    existing BarResult. Reuses v1's unchanged _leadership()/_conviction()
+    sub-scoring; _entry_quality() now additionally takes smc_state (see
+    that function's docstring — Secondary production use of SMC,
+    2026-08-14) — only the composite blend and the tier/signal thresholds
+    otherwise differ (classify_tier_v3 / _classify_v3) from v1.
 
     Inputs : scoring_core.BarResult (output of compute_bar())
              settings — optional; forwarded to _classify_v3() as
              threshold overrides (see V3_THRESHOLD_DEFAULTS). Unrelated
              keys in a full app `settings` dict are ignored.
+             smc_state — optional (default None); utils.smc_engine.SMCState
+             for this bar. None reproduces this function's pre-2026-08-14
+             behavior exactly (SMC-NEUTRAL, zero adjustment). This is the
+             ONLY CV1 entry point that accepts smc_state — compute_conviction_v1()/
+             compute_conviction_v2() deliberately do not, and remain
+             byte-for-byte frozen.
     Outputs: ConvictionV3 dataclass — same fields as ConvictionV1, with
              composite computed as an equal-weight (1/3 each) average.
     """
     leadership,    ls_subs = _leadership(r)
     conviction,    cv_subs = _conviction(r)
-    entry_quality, eq_subs = _entry_quality(r)
+    entry_quality, eq_subs = _entry_quality(r, smc_state=smc_state)
 
     # UNROUNDED — must exactly match the composite classify_tier_v3()/
     # _classify_v3() compute internally (same formula, same inputs) below.
@@ -1116,6 +1224,7 @@ def compute_conviction_v3(r: "BarResult", settings: Optional[dict] = None) -> Co
         eq_pivot_dist       = eq_subs["eq_pivot_dist"],
         eq_move_since_setup = eq_subs["eq_move_since_setup"],
         eq_bars_since_setup = eq_subs["eq_bars_since_setup"],
+        eq_smc_confirmation = eq_subs["eq_smc_confirmation"],
         # Grade labels
         leadership_grade    = _grade(leadership),
         conviction_grade    = _grade(conviction),
@@ -1134,4 +1243,592 @@ def compute_conviction_v3(r: "BarResult", settings: Optional[dict] = None) -> Co
         pivot_high_dist         = r.pivot_high_dist,
         price_move_since_setup  = r.price_move_since_setup,
         bars_since_setup        = r.bars_since_setup,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  CONVICTION SCORE v4 — CV4/SMC redesign
+#  (masterscanner_scoring_redesign_FINAL.md — additive, per §2 "Modified" list)
+#
+#  v1/v2/v3 above (_leadership, _conviction, _entry_quality,
+#  compute_conviction_v1/v2/v3, classify_tier/_classify and their v2/v3
+#  variants) are FROZEN — nothing above this comment is touched (§3 "leave
+#  untouched"). Everything below is new.
+#
+#  Three orthogonal 0-100 scores (§1.1): Leadership "WHO/WHAT is strong?",
+#  Conviction "WHY do we believe the direction?", Entry Quality "WHY NOW?".
+#  SMC (utils.smc_engine.SMCState) is a shared structural evidence input,
+#  never its own additive score, consumed through DIFFERENT lookup tables
+#  and DIFFERENT decay curves per score (§1.5) — the anti-double-counting
+#  mechanism.
+#
+#  Where the FINAL spec gives an exact formula (SMC Structure Confirmation
+#  §1.3, SMC Entry Structure §1.4, Market Regime table §1.3, Structural
+#  Price Quality split §1.2), it is implemented verbatim. Where the spec
+#  locks only the top-level weight table and leaves the internal
+#  sub-formula unspecified (e.g. how "Market/Sector Leadership" 15pts is
+#  itself computed), this file makes a reasonable, documented choice off
+#  existing validated BarResult fields — NOT a spec deviation, since no
+#  sub-formula was specified to deviate from. V4_THRESHOLD_DEFAULTS below
+#  is explicitly marked NOT BACKTEST-FIT until Phase 6 (§2), same status as
+#  smc_freshness.py's half-lives and extension_shared.py's sub-weights.
+# ══════════════════════════════════════════════════════════════════════════
+
+from utils.smc_freshness import conviction_freshness_multiplier, entry_freshness_multiplier
+from utils.extension_shared import compute_extension_penalty
+
+
+@dataclass
+class ConvictionV4:
+    """Three orthogonal 0-100 scores (§1.1) — NOT averaged into one blended
+    number anywhere in this dataclass or its consumers (§1.1)."""
+
+    leadership:    int = 0
+    conviction:    int = 0
+    entry_quality: int = 0
+
+    # Composite is provided for display/back-compat ONLY (equal-weight avg,
+    # same shape as v1/v2/v3's `composite` field) — §1.1 requires every
+    # CONSUMER to read the three scores independently; this field must
+    # never be treated as "the" CV4 number by classify_tier_v4/_classify_v4.
+    composite: float = 0.0
+
+    # Leadership sub-scores (§1.2 locked weights: RS=30, TrendStrength=25,
+    # TrendPersistence=15, MarketSectorLeadership=15, Participation=10,
+    # StructuralPriceQuality=5)
+    ls_relative_strength:       int = 0   # 0-30
+    ls_trend_strength:          int = 0   # 0-25
+    ls_trend_persistence:       int = 0   # 0-15
+    ls_market_sector_leadership:int = 0   # 0-15
+    ls_participation_volume:    int = 0   # 0-10
+    ls_structural_price_quality:int = 0   # 0-5
+
+    # Conviction sub-scores (§1.3 locked weights: DirectionalTrend=20,
+    # Momentum=20, RS(directional slope)=15, Volume=10, MarketRegime=10,
+    # SMCConfirmation=15, SetupPattern=10)
+    cv_directional_trend:  int = 0   # 0-20
+    cv_momentum:            int = 0   # 0-20
+    cv_relative_strength:   int = 0   # 0-15
+    cv_volume:              int = 0   # 0-10
+    cv_market_regime:       int = 0   # 0-10
+    cv_smc_confirmation:    int = 0   # 0-15
+    cv_setup_pattern:       int = 0   # 0-10
+
+    # Entry Quality sub-scores (§1.4 locked weights: TrendAlignment=20,
+    # MomentumTiming=15, SMCEntryStructure=25, PriceLocation=15,
+    # VolumeExecution=10, ExtensionChaseRisk=15 [subtractive])
+    eq_trend_alignment:     int = 0   # 0-20
+    eq_momentum_timing:     int = 0   # 0-15
+    eq_smc_entry_structure: int = 0   # 0-25
+    eq_price_location:      int = 0   # 0-15
+    eq_volume_execution:    int = 0   # 0-10
+    eq_extension_chase_risk:int = 0   # 0-15 (points RETAINED, i.e. 15 = no chase risk)
+
+    # Grade labels + classification
+    leadership_grade:    str = "D"
+    conviction_grade:    str = "D"
+    entry_quality_grade: str = "D"
+    signal_class:  str = "SKIP"   # ELITE | EXECUTE | WATCH | SKIP
+
+    # SMC pass-through for display (§1.5 — never re-derived by consumers)
+    smc_direction:     str = "NEUTRAL"
+    smc_state_label:   str = "NEUTRAL"
+    smc_evidence_tier: int = 0
+    smc_age_bars:      int = 0
+    smc_fvg_retest:    str = "none"
+
+    thesis_direction: str = "BULLISH"   # BULLISH | BEARISH — what this read was scored against
+
+
+# ══════════════════════════════════════════════════════════════════
+#  LEADERSHIP v4 (§1.2) — SMC is a modifier, never a requirement
+# ══════════════════════════════════════════════════════════════════
+
+def _leadership_v4(r: "BarResult", smc_state=None, swing_label: Optional[str] = None) -> tuple[int, dict]:
+    """
+    Returns (0-100, sub_scores_dict). Locked weights (§1.2):
+      Relative Strength 30, Trend Strength 25, Trend Persistence 15,
+      Market/Sector Leadership 15, Participation/Volume 10,
+      Structural Price Quality 5.
+
+    A stock with strong RS/sector-RS/trend/persistence/participation can
+    reach 90+ with SMC fully NEUTRAL (§1.2) — SMC never subtracts from or
+    gates Leadership; it only ever ADDS via the Structural Price Quality
+    component's SMC-confirmation half (up to 2 of its 5 pts).
+
+    swing_label: current HH/HL/LH/LL/EH/EL label (from
+    utils.swing_structure.compute_swing_labels()['label_ffill'] at this
+    bar's position) — optional; None degrades Structural Price Quality's
+    swing-alone component to 0 rather than fabricating a value.
+    """
+    # ── Relative Strength (0-30) — reuses v1's validated RS sub-ladder
+    # (market12 + sector10 + consistency5 + momentum3 = 30), unchanged
+    # math, just relabeled to this component's name. ──────────────────
+    rc = r.rs_composite
+    if   rc > 0.15:  rs_market = 12
+    elif rc > 0.10:  rs_market = 10
+    elif rc > 0.05:  rs_market = 8
+    elif rc > 0.03:  rs_market = 6
+    elif rc > 0.00:  rs_market = 4
+    elif rc > -0.03: rs_market = 2
+    else:            rs_market = 0
+
+    if not r.rs_sector_available:
+        rs_sector = 5
+    else:
+        rsec = r.rs_vs_sector
+        if   rsec > 0.15:  rs_sector = 10
+        elif rsec > 0.10:  rs_sector = 8
+        elif rsec > 0.05:  rs_sector = 7
+        elif rsec > 0.03:  rs_sector = 5
+        elif rsec > 0.00:  rs_sector = 3
+        elif rsec > -0.03: rs_sector = 1
+        else:              rs_sector = 0
+
+    rs_consistency = round(r.rs_consistency * 5)
+    mom = r.rs_momentum
+    if   mom > 0.03: rs_momentum = 3
+    elif mom > 0.01: rs_momentum = 2
+    elif mom > 0.00: rs_momentum = 1
+    else:            rs_momentum = 0
+
+    ls_rs = min(rs_market + rs_sector + rs_consistency + rs_momentum, 30)
+
+    # ── Trend Strength (0-25) — SMC-independent trend-quality read: EMA
+    # alignment/cloud position (structure) + ADX (quality) + EMA20 slope
+    # (velocity). No sub-formula specified in §1.2 beyond the weight; this
+    # blend mirrors v1's validated trend-quality signals. ──────────────
+    ts = 0
+    if r.trend_up:        ts += 6
+    if r.ema_alignment:   ts += 6
+    if r.above_cloud:     ts += 5
+    elif r.inside_cloud:  ts += 2
+    adx = r.adx_val
+    if   adx >= 40: ts += 6
+    elif adx > 30:  ts += 4
+    elif adx > 25:  ts += 2
+    slope = r.ema20_slope
+    if   slope > 0.3: ts += 2
+    elif slope > 0:   ts += 1
+    ls_trend_strength = min(ts, 25)
+
+    # ── Trend Persistence (0-15) — same sweet-spot age ladder v1 used for
+    # Leadership's Trend Age, rescaled 0-25 -> 0-15 (×0.6, locked-weight
+    # rescale, not a re-derivation of the ladder shape). ────────────────
+    age = r.trend_age_bars
+    if   age == 0:   age_raw = 0
+    elif age <= 5:   age_raw = 0
+    elif age <= 20:  age_raw = 8
+    elif age <= 50:  age_raw = 25   # sweet-spot
+    elif age <= 100: age_raw = 8
+    else:            age_raw = 0
+    ls_trend_persistence = round(age_raw * 0.6)   # 0-15
+
+    # ── Market/Sector Leadership (0-15) — distinct from the raw RS number
+    # above: rewards LEADERSHIP CONTEXT (regime alignment + genuine sector
+    # standing), not the RS magnitude itself. No sub-formula specified in
+    # §1.2 beyond the weight; documented design choice. ─────────────────
+    mkt = 0
+    if r.nifty_regime_val == "bullish" and r.trend_up:
+        mkt += 7
+    elif r.nifty_regime_val == "neutral":
+        mkt += 4
+    elif r.nifty_regime_val == "bearish" and r.trend_up:
+        mkt += 1   # leading despite a hostile regime — real, but discounted
+    if r.rs_sector_available:
+        if r.rs_vs_sector > 0.10:
+            mkt += 8
+        elif r.rs_vs_sector > 0.03:
+            mkt += 5
+        elif r.rs_vs_sector > 0.0:
+            mkt += 2
+    else:
+        mkt += 4   # flat neutral credit, same convention as rs_sector above
+    ls_market_sector = min(mkt, 15)
+
+    # ── Participation/Volume (0-10) — vol_ratio sponsorship ladder,
+    # rescaled from v1 Conviction's 0-15 volume ladder (×2/3). ──────────
+    vr = r.vol_ratio
+    if   vr >= 2.5:  vol_raw = 15
+    elif vr >= 2.0:  vol_raw = 12
+    elif vr >= 1.5:  vol_raw = 8
+    elif vr >= 1.2:  vol_raw = 5
+    elif vr >= 1.0:  vol_raw = 2
+    else:            vol_raw = 0
+    ls_participation = round(vol_raw * (10 / 15))
+
+    # ── Structural Price Quality (0-5) — EXACT split per §1.2: up to 3/5
+    # from swing structure alone (HH/HL), independent of any SMC event;
+    # up to 2/5 MORE only if SMCState.direction agrees with the existing
+    # trend AND evidence_tier >= 3. ──────────────────────────────────
+    spq = 0
+    if swing_label in ("HH", "HL"):
+        spq += 3
+    elif swing_label in ("EH", "EL"):
+        spq += 1   # tie/retest — partial credit, not a genuine new high/low
+    if smc_state is not None:
+        existing_trend_dir = "BULLISH" if r.trend_up else ("BEARISH" if r.trend_down else "NEUTRAL")
+        if smc_state.direction == existing_trend_dir and smc_state.direction != "NEUTRAL" \
+                and smc_state.evidence_tier >= 3:
+            spq += 2
+    ls_structural_price_quality = min(spq, 5)
+
+    total = min(ls_rs + ls_trend_strength + ls_trend_persistence
+                + ls_market_sector + ls_participation + ls_structural_price_quality, 100)
+
+    return total, {
+        "ls_relative_strength":        ls_rs,
+        "ls_trend_strength":           ls_trend_strength,
+        "ls_trend_persistence":        ls_trend_persistence,
+        "ls_market_sector_leadership": ls_market_sector,
+        "ls_participation_volume":     ls_participation,
+        "ls_structural_price_quality": ls_structural_price_quality,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CONVICTION v4 (§1.3) — directional, symmetric CE/PE
+# ══════════════════════════════════════════════════════════════════
+
+def _market_regime_score_v4(r: "BarResult", thesis_direction: str) -> int:
+    """
+    Market Regime (§1.3), symmetric for CE/PE — an opposing regime is a
+    PENALTY (1/10), never automatic disqualification, because some setups
+    legitimately trade counter-regime.
+    """
+    regime = (r.nifty_regime_val or "neutral").lower()
+    is_bull_regime = regime == "bullish"
+    is_bear_regime = regime == "bearish"
+
+    if thesis_direction == "BULLISH":
+        if is_bull_regime:  return 10
+        if is_bear_regime:  return 1
+        return 5
+    else:  # BEARISH
+        if is_bear_regime:  return 10
+        if is_bull_regime:  return 1
+        return 5
+
+
+def smc_conviction_score(smc_state, thesis_direction: str) -> int:
+    """
+    EXACT formula per §1.3. SLOW freshness decay (thesis stays informed
+    even as the structural evidence ages) — see smc_freshness.py.
+    """
+    if smc_state is None or smc_state.direction != thesis_direction or smc_state.state == "CONFLICT":
+        return 0
+    base = {0: 0, 1: 3, 2: 7, 3: 12, 4: 15}[smc_state.evidence_tier]
+    return round(base * conviction_freshness_multiplier(smc_state.age_bars))
+
+
+def _conviction_v4(r: "BarResult", thesis_direction: str = "BULLISH", smc_state=None) -> tuple[int, dict]:
+    """
+    Returns (0-100, sub_scores_dict). Locked weights (§1.3): Directional
+    Trend 20, Momentum 20 (directional, NO abs()), Relative Strength
+    (directional slope) 15, Volume/Participation 10, Market Regime
+    (thesis-relative) 10, SMC Structure Confirmation 15 (exact formula),
+    Setup/Pattern Evidence 10.
+
+    thesis_direction: "BULLISH" or "BEARISH" — what this read is being
+    scored FOR. Momentum/RS/Directional-Trend all flip sign for a bearish
+    thesis (symmetric CE/PE, §1.3) rather than using abs().
+    """
+    bullish = thesis_direction == "BULLISH"
+
+    # ── Directional Trend (0-20) — trend structure, signed by thesis ──
+    dt = 0
+    aligned_up = r.trend_up and r.ema_alignment
+    aligned_down = r.trend_down and r.ema_alignment
+    if bullish:
+        if aligned_up:       dt += 12
+        if r.above_cloud:    dt += 8
+        elif r.inside_cloud: dt += 3
+    else:
+        if aligned_down:      dt += 12
+        if r.trend_down and not r.above_cloud and not r.inside_cloud: dt += 8
+        elif r.inside_cloud: dt += 3
+    cv_directional_trend = min(dt, 20)
+
+    # ── Momentum (0-20) — DIRECTIONAL, no abs(): a bullish thesis is only
+    # rewarded for positive mom3/mom6; a bearish thesis only for negative
+    # mom3/mom6. Opposing momentum scores 0, never a mirrored bonus. ────
+    m3 = r.mom3 if bullish else -r.mom3
+    m6 = r.mom6 if bullish else -r.mom6
+    mo = 0
+    if m3 > 8:  mo += 10
+    elif m3 > 4: mo += 6
+    elif m3 > 0: mo += 2
+    if m6 > 12:  mo += 10
+    elif m6 > 6: mo += 6
+    elif m6 > 0: mo += 2
+    cv_momentum = min(mo, 20)
+
+    # ── Relative Strength, directional slope (0-15) — rs_momentum signed
+    # by thesis: improving RS in the thesis's favor scores; RS improving
+    # against the thesis scores 0. ───────────────────────────────────
+    rsm = r.rs_momentum if bullish else -r.rs_momentum
+    if   rsm > 0.03: cv_rs = 15
+    elif rsm > 0.01: cv_rs = 10
+    elif rsm > 0.00: cv_rs = 5
+    else:            cv_rs = 0
+
+    # ── Volume/Participation (0-10) ──────────────────────────────────
+    vr = r.vol_ratio
+    if   vr >= 2.5:  cv_vol = 10
+    elif vr >= 2.0:  cv_vol = 8
+    elif vr >= 1.5:  cv_vol = 6
+    elif vr >= 1.2:  cv_vol = 3
+    elif vr >= 1.0:  cv_vol = 1
+    else:            cv_vol = 0
+
+    # ── Market Regime, thesis-relative (0-10) — EXACT table §1.3 ───────
+    cv_regime = _market_regime_score_v4(r, thesis_direction)
+
+    # ── SMC Structure Confirmation (0-15) — EXACT formula §1.3 ─────────
+    cv_smc = smc_conviction_score(smc_state, thesis_direction)
+
+    # ── Setup/Pattern Evidence (0-10) — existing pattern-confirmation
+    # signals (Fib zone / CCI recovery / squeeze release), directional by
+    # thesis. No sub-formula specified beyond the weight. ──────────────
+    sp = 0
+    if bullish:
+        if r.in_golden or r.in_golden_relaxed: sp += 5
+        if r.recent_cci_recovery or r.cci_rising: sp += 3
+        if r.squeeze_release: sp += 2
+        elif r.squeeze_on: sp += 1
+    else:
+        if r.t4_downtrend: sp += 5
+        if r.squeeze_release: sp += 2
+        elif r.squeeze_on: sp += 1
+    cv_setup_pattern = min(sp, 10)
+
+    total = min(cv_directional_trend + cv_momentum + cv_rs + cv_vol + cv_regime + cv_smc + cv_setup_pattern, 100)
+
+    return total, {
+        "cv_directional_trend": cv_directional_trend,
+        "cv_momentum":          cv_momentum,
+        "cv_relative_strength": cv_rs,
+        "cv_volume":            cv_vol,
+        "cv_market_regime":     cv_regime,
+        "cv_smc_confirmation":  cv_smc,
+        "cv_setup_pattern":     cv_setup_pattern,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ENTRY QUALITY v4 (§1.4) — SMC's strongest influence
+# ══════════════════════════════════════════════════════════════════
+
+def smc_entry_structure_score(smc_state) -> int:
+    """EXACT formula per §1.4. FAST freshness decay (a stale entry
+    contributes nothing to "enter now") — see smc_freshness.py."""
+    if smc_state is None:
+        return 0
+    base = {0: 0, 1: 4, 2: 10, 3: 16, 4: 20}[smc_state.evidence_tier]
+    retest_adj = {"none": 0, "in_zone": 5, "through_unfilled": -3, "through_filled": -8}[smc_state.fvg_retest]
+    raw = max(0, min(base + retest_adj, 25))
+    return round(max(0, min(raw * entry_freshness_multiplier(smc_state.age_bars), 25)))
+
+
+def _entry_quality_v4(r: "BarResult", smc_state=None, current_price: Optional[float] = None) -> tuple[int, dict]:
+    """
+    Returns (0-100, sub_scores_dict). Locked weights (§1.4): Trend
+    Alignment 20, Momentum Timing 15, SMC Entry Structure 25 (exact
+    formula), Price Location 15, Volume/Execution 10, Extension/Chase Risk
+    15 (subtractive — via extension_shared.compute_extension_penalty(),
+    shared with decision_engine._extension() per §2).
+    """
+    # ── Trend Alignment (0-20) ────────────────────────────────────────
+    ta = 0
+    if r.trend_up:        ta += 8
+    if r.ema_alignment:   ta += 8
+    if r.above_cloud:     ta += 4
+    eq_trend_alignment = min(ta, 20)
+
+    # ── Momentum Timing (0-15) — is momentum firing NOW, not just present
+    if r.cci_momentum_break: mt = 15
+    elif r.recent_cci_recovery: mt = 10
+    elif r.cci_rising: mt = 5
+    else: mt = 0
+    eq_momentum_timing = min(mt, 15)
+
+    # ── SMC Entry Structure (0-25) — EXACT formula §1.4 ────────────────
+    eq_smc_entry_structure = smc_entry_structure_score(smc_state)
+
+    # ── Price Location (0-15) — pivot/fib positioning, timing not trend ─
+    pl_ = 0
+    pvtd = r.pivot_high_dist
+    if pvtd <= -2.0: pl_ += 8
+    elif pvtd <= 0.5: pl_ += 6
+    elif pvtd <= 2.0: pl_ += 3
+    if r.in_golden: pl_ += 7
+    elif r.in_golden_relaxed: pl_ += 5
+    elif r.above_fib786: pl_ += 2
+    eq_price_location = min(pl_, 15)
+
+    # ── Volume/Execution (0-10) ─────────────────────────────────────
+    vr = r.vol_ratio
+    if   vr >= 2.0:  ve = 10
+    elif vr >= 1.5:  ve = 7
+    elif vr >= 1.2:  ve = 4
+    elif vr >= 1.0:  ve = 1
+    else:            ve = 0
+    eq_volume_execution = ve
+
+    # ── Extension/Chase Risk (15 pts, SUBTRACTIVE) — shared function ──
+    pen = compute_extension_penalty(r, smc_state=smc_state, current_price=current_price)
+    severity = pen["severity_0_100"]
+    eq_extension_chase_risk = round(max(0.0, min(15.0, 15.0 * (1.0 - severity / 100.0))))
+
+    total = min(eq_trend_alignment + eq_momentum_timing + eq_smc_entry_structure
+                + eq_price_location + eq_volume_execution + eq_extension_chase_risk, 100)
+    total = max(total, 0)
+
+    return total, {
+        "eq_trend_alignment":      eq_trend_alignment,
+        "eq_momentum_timing":      eq_momentum_timing,
+        "eq_smc_entry_structure":  eq_smc_entry_structure,
+        "eq_price_location":       eq_price_location,
+        "eq_volume_execution":     eq_volume_execution,
+        "eq_extension_chase_risk": eq_extension_chase_risk,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CLASSIFICATION — CV4  (thresholds NOT BACKTEST-FIT until Phase 6, §2)
+# ══════════════════════════════════════════════════════════════════
+
+V4_THRESHOLD_DEFAULTS = {
+    # NOT BACKTEST-FIT — provisional placeholders only, mirroring v3's
+    # funnel shape so CV4 is exercisable in Phase 2-4 shadow/comparison
+    # runs. Real thresholds are set in Phase 6 ONLY IF Phase 5's outcome
+    # attribution (§5) shows CV4/SMC explains the current loss pattern —
+    # per §4's binding constraint, no tuning to hit a target recommendation
+    # count, and CV4 has ZERO production impact through Phase 6 regardless
+    # of what these say (enable_cv4_opportunity_weight=False, Recommendation
+    # still sourced from CV1 — see scanner_engine.py/dore_settings.py).
+    "v4_watch_leadership_min":      50,
+    "v4_watch_conviction_min":      50,
+    "v4_watch_entry_quality_min":   50,
+    "v4_watch_composite_min":       50,
+    "v4_actionable_leadership_min": 70,
+    "v4_actionable_conviction_min": 60,
+    "v4_actionable_entry_quality_min": 60,
+    "v4_actionable_composite_min":  60,
+    "v4_execute_leadership_min":    80,
+    "v4_execute_conviction_min":    70,
+    "v4_execute_entry_quality_min": 70,
+    "v4_execute_composite_min":     60,
+    "v4_elite_leadership_min":      85,
+    "v4_elite_conviction_min":      75,
+    "v4_elite_entry_quality_min":   80,
+    "v4_elite_composite_min":       66,
+}
+
+
+def _classify_v4(leadership: int, conviction: int, entry_quality: int,
+                  thresholds: Optional[dict] = None) -> str:
+    """CV4 signal classifier — same AND-gated floor + composite pattern as
+    _classify_v3(). thresholds default to V4_THRESHOLD_DEFAULTS (NOT
+    BACKTEST-FIT, §2)."""
+    t = {**V4_THRESHOLD_DEFAULTS, **(thresholds or {})}
+    composite = (leadership + conviction + entry_quality) / 3
+
+    if (leadership >= t["v4_elite_leadership_min"] and conviction >= t["v4_elite_conviction_min"]
+            and entry_quality >= t["v4_elite_entry_quality_min"] and composite >= t["v4_elite_composite_min"]):
+        return "ELITE"
+    if (leadership >= t["v4_execute_leadership_min"] and conviction >= t["v4_execute_conviction_min"]
+            and entry_quality >= t["v4_execute_entry_quality_min"] and composite >= t["v4_execute_composite_min"]):
+        return "EXECUTE"
+    if (leadership >= t["v4_watch_leadership_min"] and conviction >= t["v4_watch_conviction_min"]
+            and entry_quality >= t["v4_watch_entry_quality_min"]):
+        return "WATCH"
+    return "SKIP"
+
+
+def classify_tier_v4(leadership: int, conviction: int, entry_quality: int,
+                      thresholds: Optional[dict] = None) -> str:
+    """CV4 base-funnel tier classifier — same AND-gated floor + composite
+    pattern as classify_tier_v3(). thresholds default to
+    V4_THRESHOLD_DEFAULTS (NOT BACKTEST-FIT, §2). NOT wired into
+    `Recommendation` anywhere through Phase 6 — Phase 7 only, and only if
+    Phases 4-6 support it (§4/§6)."""
+    t = {**V4_THRESHOLD_DEFAULTS, **(thresholds or {})}
+    composite = (leadership + conviction + entry_quality) / 3
+
+    if (leadership >= t["v4_actionable_leadership_min"] and conviction >= t["v4_actionable_conviction_min"]
+            and entry_quality >= t["v4_actionable_entry_quality_min"] and composite >= t["v4_actionable_composite_min"]):
+        return "Actionable"
+    if (leadership >= t["v4_watch_leadership_min"] and conviction >= t["v4_watch_conviction_min"]
+            and entry_quality >= t["v4_watch_entry_quality_min"]):
+        return "Watch"
+    return "Skip"
+
+
+def compute_conviction_v4(
+    r: "BarResult",
+    thesis_direction: str = "BULLISH",
+    smc_state=None,
+    swing_label: Optional[str] = None,
+    current_price: Optional[float] = None,
+    settings: Optional[dict] = None,
+) -> ConvictionV4:
+    """
+    Compute Conviction Score v4 (CV4/SMC redesign) from an existing
+    BarResult. Three orthogonal 0-100 scores (§1.1) — Leadership,
+    Conviction, Entry Quality — each reading the shared SMCState through
+    its own lookup table/decay curve (§1.5).
+
+    thesis_direction : "BULLISH" or "BEARISH" — Live Scanner passes
+        "BULLISH" (its detectors are long-only today); DORE passes its own
+        Stage 1 `directional_intent` (§1.6/§1.7).
+    smc_state : utils.smc_engine.SMCState for this bar, or None (degrades
+        every SMC-dependent component to its SMC-NEUTRAL value — never an
+        error, never a gate).
+    swing_label : current HH/HL/LH/LL/EH/EL label for Structural Price
+        Quality's swing-alone component (§1.2); None -> that sub-component
+        scores 0 rather than fabricating a value.
+    current_price : for Entry Quality's Extension/Chase Risk FVG-zone
+        distance sub-factor; defaults to r.entry_ref/r.entry if omitted.
+    settings : optional; forwarded to classify_tier_v4()/_classify_v4() as
+        threshold overrides (V4_THRESHOLD_DEFAULTS, NOT BACKTEST-FIT).
+    """
+    leadership,    ls_subs = _leadership_v4(r, smc_state=smc_state, swing_label=swing_label)
+    conviction,    cv_subs = _conviction_v4(r, thesis_direction=thesis_direction, smc_state=smc_state)
+    entry_quality, eq_subs = _entry_quality_v4(r, smc_state=smc_state, current_price=current_price)
+
+    composite = (leadership + conviction + entry_quality) / 3
+    signal = _classify_v4(leadership, conviction, entry_quality, thresholds=settings)
+
+    return ConvictionV4(
+        leadership=leadership, conviction=conviction, entry_quality=entry_quality,
+        composite=composite, signal_class=signal,
+        ls_relative_strength        = ls_subs["ls_relative_strength"],
+        ls_trend_strength           = ls_subs["ls_trend_strength"],
+        ls_trend_persistence        = ls_subs["ls_trend_persistence"],
+        ls_market_sector_leadership = ls_subs["ls_market_sector_leadership"],
+        ls_participation_volume     = ls_subs["ls_participation_volume"],
+        ls_structural_price_quality = ls_subs["ls_structural_price_quality"],
+        cv_directional_trend  = cv_subs["cv_directional_trend"],
+        cv_momentum            = cv_subs["cv_momentum"],
+        cv_relative_strength   = cv_subs["cv_relative_strength"],
+        cv_volume               = cv_subs["cv_volume"],
+        cv_market_regime        = cv_subs["cv_market_regime"],
+        cv_smc_confirmation     = cv_subs["cv_smc_confirmation"],
+        cv_setup_pattern         = cv_subs["cv_setup_pattern"],
+        eq_trend_alignment      = eq_subs["eq_trend_alignment"],
+        eq_momentum_timing      = eq_subs["eq_momentum_timing"],
+        eq_smc_entry_structure  = eq_subs["eq_smc_entry_structure"],
+        eq_price_location        = eq_subs["eq_price_location"],
+        eq_volume_execution      = eq_subs["eq_volume_execution"],
+        eq_extension_chase_risk  = eq_subs["eq_extension_chase_risk"],
+        leadership_grade    = _grade(leadership),
+        conviction_grade    = _grade(conviction),
+        entry_quality_grade = _grade(entry_quality),
+        smc_direction     = smc_state.direction if smc_state is not None else "NEUTRAL",
+        smc_state_label   = smc_state.state if smc_state is not None else "NEUTRAL",
+        smc_evidence_tier = smc_state.evidence_tier if smc_state is not None else 0,
+        smc_age_bars      = smc_state.age_bars if smc_state is not None else 0,
+        smc_fvg_retest    = smc_state.fvg_retest if smc_state is not None else "none",
+        thesis_direction  = thesis_direction,
     )

@@ -1373,6 +1373,42 @@ def score_stock(
     if r is None:
         return {}
 
+    # ── CV4/SMC shadow scoring input (Phase 2, masterscanner_scoring_
+    # redesign_FINAL.md §2/§4) — compute once per symbol here where `df`
+    # (raw OHLC) is available; SMCState for the latest bar is handed to
+    # compute_conviction_v4() below. Wrapped defensively: any failure here
+    # must never affect CV1/Recommendation — CV4 is diagnostic-only
+    # through Phase 6 (zero production impact, §4).
+    _cv4_smc_state = None
+    _cv4_swing_label = None
+    try:
+        from utils.smc_engine import compute_smc_state
+        from utils.swing_structure import compute_swing_labels
+        from utils.structural_levels import causal_pivot_series
+        _smc_states = compute_smc_state(df, lb=params.pvt_lb if hasattr(params, "pvt_lb") else 20)
+        _cv4_smc_state = _smc_states[-1] if _smc_states else None
+        _ph, _pl = causal_pivot_series(df["high"], df["low"], lb=params.pvt_lb if hasattr(params, "pvt_lb") else 20)
+        _swing_df = compute_swing_labels(_ph, _pl)
+        _cv4_swing_label = _swing_df["label_ffill"].iloc[-1] if len(_swing_df) else None
+    except Exception:
+        _cv4_smc_state = None
+        _cv4_swing_label = None
+
+    # [Production wiring, 2026-08-14] SMC now feeds decision_engine's
+    # Extension/Chase Risk (Primary use, per explicit direction) via
+    # BarResult.smc_state (additive field, added Phase 2). Setting it here
+    # — BEFORE compute_decision() runs below — is the entire integration:
+    # decision_engine._extension() reads r.smc_state itself; no other
+    # change needed at this call site. This affects DE's Extension/
+    # Lifecycle/Stage output for real, on purpose. It does NOT affect CV1
+    # or Recommendation — those are computed from `cv1` above and never
+    # read r.smc_state (see compute_decision() docstring: CV1 is the sole
+    # source of truth for Recommendation; DE no longer produces one).
+    # Same fail-safe convention as the CV4 block above: any failure above
+    # already left _cv4_smc_state=None, which _extension() treats as
+    # SMC-NEUTRAL, never an error.
+    r.smc_state = _cv4_smc_state
+
     # ── 52-week high/low breadth flags ────────────────────────────
     # [Market Breadth panel, 2026-07] "Near 52W high/low" is a classic
     # breadth stat but nothing upstream computed it — CV1/DE/Five Pillars
@@ -1545,7 +1581,7 @@ def score_stock(
     cv1 = None
     try:
         from utils.conviction_score_v1 import compute_conviction_v3
-        cv1 = compute_conviction_v3(r, settings=settings)
+        cv1 = compute_conviction_v3(r, settings=settings, smc_state=r.smc_state)
         result.update({
             "CV1_Leadership":    cv1.leadership,
             "CV1_Conviction":    cv1.conviction,
@@ -1591,6 +1627,60 @@ def score_stock(
     except Exception:
         cv1 = None   # Decision Engine call below is skipped entirely for this symbol —
                      # see compute_decision(mode="production") requirement below
+
+    # ── CV4 shadow scoring (Phase 2, masterscanner_scoring_redesign_FINAL.md
+    # §2/§4) — writes CV4_* columns for comparison only. Recommendation
+    # remains sourced from CV1 above; nothing here can affect it. thesis_
+    # direction="BULLISH" because Live Scanner's detectors are long-only
+    # today (see compute_conviction_v4()'s docstring). Wrapped defensively:
+    # a CV4 failure must never break the scan row.
+    try:
+        from utils.conviction_score_v1 import compute_conviction_v4
+        cv4 = compute_conviction_v4(
+            r, thesis_direction="BULLISH",
+            smc_state=_cv4_smc_state, swing_label=_cv4_swing_label,
+            current_price=r.entry_ref or r.entry, settings=settings,
+        )
+        result.update({
+            "CV4_Leadership":    cv4.leadership,
+            "CV4_Conviction":    cv4.conviction,
+            "CV4_EntryQuality":  cv4.entry_quality,
+            "CV4_Composite":     cv4.composite,
+            "CV4_SignalClass":   cv4.signal_class,
+            "CV4_LS_Grade":      cv4.leadership_grade,
+            "CV4_CV_Grade":      cv4.conviction_grade,
+            "CV4_EQ_Grade":      cv4.entry_quality_grade,
+            # SMC pass-through for display/debug
+            "CV4_SMC_Direction":     cv4.smc_direction,
+            "CV4_SMC_State":         cv4.smc_state_label,
+            "CV4_SMC_EvidenceTier":  cv4.smc_evidence_tier,
+            "CV4_SMC_AgeBars":       cv4.smc_age_bars,
+            "CV4_SMC_FvgRetest":     cv4.smc_fvg_retest,
+            # Leadership sub-scores
+            "_cv4_ls_rs":          cv4.ls_relative_strength,
+            "_cv4_ls_trend":       cv4.ls_trend_strength,
+            "_cv4_ls_persist":     cv4.ls_trend_persistence,
+            "_cv4_ls_mktsector":   cv4.ls_market_sector_leadership,
+            "_cv4_ls_participation": cv4.ls_participation_volume,
+            "_cv4_ls_structural":  cv4.ls_structural_price_quality,
+            # Conviction sub-scores
+            "_cv4_cv_directional": cv4.cv_directional_trend,
+            "_cv4_cv_momentum":    cv4.cv_momentum,
+            "_cv4_cv_rs":          cv4.cv_relative_strength,
+            "_cv4_cv_volume":      cv4.cv_volume,
+            "_cv4_cv_regime":      cv4.cv_market_regime,
+            "_cv4_cv_smc":         cv4.cv_smc_confirmation,
+            "_cv4_cv_setup":       cv4.cv_setup_pattern,
+            # Entry Quality sub-scores
+            "_cv4_eq_trend":       cv4.eq_trend_alignment,
+            "_cv4_eq_momentum":    cv4.eq_momentum_timing,
+            "_cv4_eq_smc":         cv4.eq_smc_entry_structure,
+            "_cv4_eq_location":    cv4.eq_price_location,
+            "_cv4_eq_volume":      cv4.eq_volume_execution,
+            "_cv4_eq_extension":   cv4.eq_extension_chase_risk,
+        })
+    except Exception:
+        pass   # CV4 is diagnostic-only through Phase 6 — never break the scan row over it
 
     # ── Decision Engine — Extension / Lifecycle / Trend Quality / R:R ──
     # [Scanner Refactor] No longer produces a Recommendation — CV1 +
