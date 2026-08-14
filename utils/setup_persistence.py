@@ -775,8 +775,9 @@ def enrich_scanner_row(
     pre_breakout      : [2026-08-07, SG request; formula updated 2026-08-14]
                         when True, this row already passed the Pre-Breakout
                         Active Trigger check — see `_is_pre_breakout_qualified()`
-                        for the exact formula (SQUEEZE=="RELEASED" AND
-                        VOL_RATIO>=1.5 AND CONVICTION>=60 AND RSI>55) — at
+                        for the exact formula (trend_up AND SQUEEZE=="RELEASED"
+                        AND VOL_RATIO>=1.5 AND CONVICTION>=60 AND
+                        55<RSI<=70) — at
                         the call site — mint a plan off THAT signal, tagged
                         source="PB", instead of requiring the Recommendation
                         tier to reach Actionable/Execute/Elite first. Still
@@ -925,17 +926,23 @@ def _is_pre_breakout_qualified(row_dict: dict) -> bool:
     setup plan (see enrich_scanner_row()'s `pre_breakout` param / the
     "persist entries which are released from Pre-Breakout" request).
 
-    [2026-08-14, explicit user direction] Replaces the previous
-    trend_up AND squeeze_release AND 45<=RSI<=70 gate with an explicit,
-    four-factor AND-gated trigger:
+    [2026-08-14, explicit user direction; guardrails restored 2026-08-14
+    same day — see review below] Adds four new factors on TOP OF the
+    original basic Pre-Breakout qualification (trend_up AND squeeze_release
+    AND RSI band), rather than replacing it:
 
         Active Trigger =
-              (SQUEEZE == "RELEASED")
+              (trend_up)
+          AND (SQUEEZE == "RELEASED")
           AND (VOL_RATIO >= 1.5x)
           AND (CONVICTION >= 60)
-          AND (RSI > 55)
+          AND (55 < RSI <= 70)
 
     Mapped onto fields already present on the scanner row:
+      trend_up               -> row_dict["_trend_up"], falling back to
+                                TrendPhase != "NONE" — same basic-
+                                qualification check as pages/scanner.py's
+                                `_is_pre_breakout` tab filter.
       SQUEEZE == "RELEASED" -> row_dict["_squeeze_release"] is True —
                                 the BB squeeze firing on this bar, same
                                 boolean the Pre-Breakout tab's own
@@ -956,32 +963,45 @@ def _is_pre_breakout_qualified(row_dict: dict) -> bool:
                                 "RSI" for any row source that only
                                 carries the display column.
 
-    Deliberately NOT gated on trend_up or an upper RSI band anymore —
-    those are replaced outright by the stricter VOL_RATIO/CONVICTION
-    requirements above and a strict RSI > 55 floor (no ceiling). Still
+    [2026-08-14 review] An earlier version of this function dropped
+    trend_up entirely and removed the RSI upper bound, replacing the
+    basic qualification outright instead of tightening it. That let a
+    non-trending, already-extended stock (e.g. RSI 90, no trend) mint a
+    "PB" plan without ever appearing on the Pre-Breakout tab, since this
+    function is the sole gate in enrich_scanner_dataframe() and is not
+    otherwise scoped to tab members. trend_up and the RSI <= 70 ceiling
+    are restored so a PB-sourced plan stays scoped to "still coiling,
+    about to move" stocks — matching pages/scanner.py's `_is_pre_breakout`
+    — with VOL_RATIO/CONVICTION/RSI-floor layered on as an additional,
+    stricter mint-time trigger on top of that basic qualification. Still
     bypasses _FREEZE_CATEGORIES the same way the old gate did (see
     enrich_scanner_row()'s docstring) — Pre-Breakout stocks are
     routinely WATCH/SKIP tier by design, so gating on Recommendation
     would mean this could never fire.
 
-    NOTE: this is now DIFFERENT from pages/scanner.py's `_is_pre_breakout`
-    (the Pre-Breakout TAB's own, deliberately broader display filter,
-    which still shows squeeze_on OR squeeze_release across a wider RSI
-    band for browsing) — that tab filter is a "what to watch" list, this
-    function is "when to actually mint a trade plan". They are no longer
-    meant to be kept identical; only this function implements the Active
-    Trigger formula above.
+    Kept in sync by design with pages/scanner.py's `_is_pre_breakout`
+    (the Pre-Breakout TAB's own display filter) on the trend_up/squeeze/
+    RSI-band basic qualification; VOL_RATIO and CONVICTION are additional
+    mint-time-only requirements not present on the tab filter, so a
+    symbol can appear on the tab without yet qualifying for a plan, but
+    a plan can never mint for a symbol that isn't tab-qualified. If you
+    change the basic qualification in one place, change it in the other
+    — kept duplicated on purpose so utils/ has no dependency on pages/.
     """
+    trend_up = bool(row_dict.get("_trend_up", False)) or (
+        str(row_dict.get("TrendPhase", "NONE")).upper() != "NONE"
+    )
     squeeze_released = bool(row_dict.get("_squeeze_release", False))
     vol_ratio  = float(row_dict.get("_vol_ratio") or 0)
     conviction = float(row_dict.get("CV1_Conviction", row_dict.get("Conviction", 0)) or 0)
     rsi_val    = float(row_dict.get("_rsi") or row_dict.get("RSI") or 0)
 
     return (
-        squeeze_released
+        trend_up
+        and squeeze_released
         and vol_ratio  >= 1.5
         and conviction >= 60
-        and rsi_val    > 55
+        and 55 < rsi_val <= 70
     )
 
 
