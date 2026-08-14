@@ -772,9 +772,11 @@ def enrich_scanner_row(
                         instead of only ever seeing `current_price`.
                         Defaults to `current_price` (old point-sample
                         behaviour) when not supplied.
-    pre_breakout      : [2026-08-07, SG request] when True, this row already
-                        passed the Pre-Breakout tab's own qualifying check
-                        (trend_up AND squeeze_release AND 45<=RSI<=70) at
+    pre_breakout      : [2026-08-07, SG request; formula updated 2026-08-14]
+                        when True, this row already passed the Pre-Breakout
+                        Active Trigger check — see `_is_pre_breakout_qualified()`
+                        for the exact formula (SQUEEZE=="RELEASED" AND
+                        VOL_RATIO>=1.5 AND CONVICTION>=60 AND RSI>55) — at
                         the call site — mint a plan off THAT signal, tagged
                         source="PB", instead of requiring the Recommendation
                         tier to reach Actionable/Execute/Elite first. Still
@@ -821,9 +823,10 @@ def enrich_scanner_row(
     #
     # [2026-08-07, SG request] The PB path bypasses the tier gate on
     # purpose — Pre-Breakout is deliberately "coiled and about to move,
-    # not already moved" (see pages/scanner.py's _is_pre_breakout), so
-    # its stocks are routinely WATCH/SKIP tier, never Actionable. Gating
-    # PB on _FREEZE_CATEGORIES would mean it could never fire.
+    # not already moved" (see `_is_pre_breakout_qualified()`'s Active
+    # Trigger formula above), so its stocks are routinely WATCH/SKIP
+    # tier, never Actionable. Gating PB on _FREEZE_CATEGORIES would mean
+    # it could never fire.
     source_for_new_plan = "LS"
     should_create = (
         recommendation in _FREEZE_CATEGORIES
@@ -918,22 +921,68 @@ def enrich_scanner_row(
 
 def _is_pre_breakout_qualified(row_dict: dict) -> bool:
     """
-    Same criteria as pages/scanner.py's `_is_pre_breakout` (Pre-Breakout
-    tab filter): trend_up AND squeeze_release AND 45 <= RSI <= 70.
-    Deliberately narrower than the tab's own display filter — the tab
-    also shows squeeze_on (still coiling, hasn't fired), but a plan
-    should only mint once the squeeze has actually RELEASED, matching
-    the "persist entries which are released from Pre-Breakout" request.
-    Kept here (not imported from pages/scanner.py) so utils/ has no
-    dependency on pages/ — the two checks are duplicated on purpose;
-    if you change one, change the other.
+    Pre-Breakout ACTIVE TRIGGER — the mint-time gate for a PB-sourced
+    setup plan (see enrich_scanner_row()'s `pre_breakout` param / the
+    "persist entries which are released from Pre-Breakout" request).
+
+    [2026-08-14, explicit user direction] Replaces the previous
+    trend_up AND squeeze_release AND 45<=RSI<=70 gate with an explicit,
+    four-factor AND-gated trigger:
+
+        Active Trigger =
+              (SQUEEZE == "RELEASED")
+          AND (VOL_RATIO >= 1.5x)
+          AND (CONVICTION >= 60)
+          AND (RSI > 55)
+
+    Mapped onto fields already present on the scanner row:
+      SQUEEZE == "RELEASED" -> row_dict["_squeeze_release"] is True —
+                                the BB squeeze firing on this bar, same
+                                boolean the Pre-Breakout tab's own
+                                squeeze_release boost tag reads.
+      VOL_RATIO              -> row_dict["_vol_ratio"] — today's volume
+                                vs its rolling average, same field the
+                                tab's "vol_surge" boost tag reads.
+      CONVICTION              -> row_dict["CV1_Conviction"] — CV1's
+                                production Conviction score (0-100),
+                                already computed earlier in the same
+                                scan cycle (utils/scanner_engine.py
+                                writes this before setup persistence
+                                runs). Falls back to a bare "Conviction"
+                                key for any row source that only
+                                carries a display column under that
+                                name.
+      RSI                    -> row_dict["_rsi"], falling back to
+                                "RSI" for any row source that only
+                                carries the display column.
+
+    Deliberately NOT gated on trend_up or an upper RSI band anymore —
+    those are replaced outright by the stricter VOL_RATIO/CONVICTION
+    requirements above and a strict RSI > 55 floor (no ceiling). Still
+    bypasses _FREEZE_CATEGORIES the same way the old gate did (see
+    enrich_scanner_row()'s docstring) — Pre-Breakout stocks are
+    routinely WATCH/SKIP tier by design, so gating on Recommendation
+    would mean this could never fire.
+
+    NOTE: this is now DIFFERENT from pages/scanner.py's `_is_pre_breakout`
+    (the Pre-Breakout TAB's own, deliberately broader display filter,
+    which still shows squeeze_on OR squeeze_release across a wider RSI
+    band for browsing) — that tab filter is a "what to watch" list, this
+    function is "when to actually mint a trade plan". They are no longer
+    meant to be kept identical; only this function implements the Active
+    Trigger formula above.
     """
-    trend_up = bool(row_dict.get("_trend_up", False)) or (
-        str(row_dict.get("TrendPhase", "NONE")).upper() != "NONE"
+    squeeze_released = bool(row_dict.get("_squeeze_release", False))
+    vol_ratio  = float(row_dict.get("_vol_ratio") or 0)
+    conviction = float(row_dict.get("CV1_Conviction", row_dict.get("Conviction", 0)) or 0)
+    rsi_val    = float(row_dict.get("_rsi") or row_dict.get("RSI") or 0)
+
+    return (
+        squeeze_released
+        and vol_ratio  >= 1.5
+        and conviction >= 60
+        and rsi_val    > 55
     )
-    squeeze_release = bool(row_dict.get("_squeeze_release", False))
-    rsi_val = float(row_dict.get("_rsi") or row_dict.get("RSI") or 0)
-    return trend_up and squeeze_release and 45 <= rsi_val <= 70
 
 
 def enrich_scanner_dataframe(
