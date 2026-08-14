@@ -782,6 +782,7 @@ def _setup_plan_from_row(row: dict) -> "object":
         closed_at                 = str(row.get("closed_at", "") or ""),
         invalidation_reason      = row.get("invalidation_reason",    "") or "",
         invalidated_date          = str(row.get("invalidated_date",   "") or ""),
+        source                    = row.get("source") or "LS",
     )
 
 
