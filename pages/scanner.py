@@ -3182,22 +3182,68 @@ def _render_pre_breakout_tab(records: list, df: pd.DataFrame, mode: str) -> None
 # `source` selector (yfinance/upstox) is unrelated to this — that toggle
 # controls the historical OHLCV fetch for scoring, not the live strip.
 # ── FIVE PILLARS TAB (embedded, 2026-08-14 SG request) ──────────────
-# Pulled in from the standalone pages/five_pillars.py page. Reuses that
-# module's CSS/table-rendering/promotion-engine helpers directly (no
-# logic duplicated here) so the scoring/formatting stays in exactly one
-# place — only the layout differs from the standalone page:
+# Pulled in from the former standalone pages/five_pillars.py page (that
+# page's own nav entry was removed from app.py per [2026-08-14 SG
+# request] — the module file itself is kept, unchanged, purely as a
+# shared library: this tab still reuses its CSS/promotion-engine/
+# per-cell-rendering helpers directly (no logic duplicated here) so the
+# scoring/formatting stays in exactly one place.
 #   - single tab, no Elite/Execute/Watch/Developing/Avoid sub-tabs
-#   - Elite/Execute/Watch shown as three side-by-side columns
+#   - single merged table (no column split) — Elite/Execute/Watch rows
+#     together, differentiated by a "State" badge column
 #   - Developing and Avoid are NOT shown at all (by design — this is a
 #     "what's close to actionable" view, not a full-universe ranking)
 #   - the classification-count card grid is removed
-# NOTE: the standalone "five_pillar Scanner" nav page (pages/five_pillars.py)
-# still exists unchanged — it still shows all 5 classes via its own
-# tabs + the card grid. Flagging this rather than deleting it silently:
-# if you want that separate nav entry removed now that this tab covers
-# the same data, say so and I'll pull it from app.py's st.navigation.
+#   - no Sort by control — table sorts by Final Score, highest first
 import pages.five_pillars as _fp_mod
-from utils.pillar_engine import CLASS_ELITE, CLASS_EXECUTE, CLASS_WATCH, CLASS_AVOID
+from utils.pillar_engine import (
+    CLASS_ELITE, CLASS_EXECUTE, CLASS_WATCH, CLASS_AVOID,
+    PTS_STRUCTURE, PTS_ACCEPTANCE, PTS_REVERSAL, PTS_LEADERSHIP, PTS_MOMENTUM,
+)
+
+_FP_TAB_CLASSES = (CLASS_ELITE, CLASS_EXECUTE, CLASS_WATCH)
+
+
+def _build_five_pillars_merged_table_html(df: pd.DataFrame) -> str:
+    """Elite/Execute/Watch rows together in one table, State column
+    (via pages.five_pillars._class_badge) replacing the old column
+    split. Reuses the same per-cell helpers pages/five_pillars.py's own
+    _build_table_html() uses — only the header/row assembly differs
+    (adds the State column, drops nothing else)."""
+    if df.empty:
+        return '<div class="fp-empty"><div class="icn">📡</div>No candidates in this scan.</div>'
+
+    headers = [
+        "Stock", "State", "Final", "LTP", "Chg%", "Leadership", "Structure",
+        "Opp Bonus", "Momentum", "Acceptance", "RSI", "Entry", "SL", "T1", "T2",
+    ]
+    header_html = "".join(f"<th>{h}</th>" for h in headers)
+
+    rows_html = ""
+    for _, row in df.iterrows():
+        sym = row.get("Stock", "—")
+        ltp = row.get("CMP", row.get("Entry"))
+        cells  = f'<td class="fp-stock">{_fp_mod._tv_link(sym)}</td>'
+        cells += _fp_mod._class_badge(row.get("FP_EffectiveClass", ""))
+        cells += _fp_mod._final_score_cell(row.get("FP_FinalScore"))
+        cells += _fp_mod._num_cell(ltp)
+        cells += _fp_mod._pct_cell(row.get("%Chg"))
+        cells += _fp_mod._pillar_bar(row.get("FP_Leadership"), PTS_LEADERSHIP)
+        cells += _fp_mod._pillar_bar(row.get("FP_Structure"), PTS_STRUCTURE)
+        cells += _fp_mod._pillar_bar(row.get("FP_Reversal"), PTS_REVERSAL)
+        cells += _fp_mod._pillar_bar(row.get("FP_Momentum"), PTS_MOMENTUM)
+        cells += _fp_mod._pillar_bar(row.get("FP_Acceptance"), PTS_ACCEPTANCE)
+        cells += _fp_mod._num_cell(row.get("_fp_rsi_val"), "{:.0f}")
+        cells += _fp_mod._num_cell(row.get("Entry"))
+        cells += _fp_mod._num_cell(row.get("SL"))
+        cells += _fp_mod._num_cell(row.get("T1"))
+        cells += _fp_mod._num_cell(row.get("T2"))
+        rows_html += f"<tr>{cells}</tr>"
+
+    return (
+        f'<div class="fp-table-wrap"><table class="fp-table">'
+        f'<thead><tr>{header_html}</tr></thead><tbody>{rows_html}</tbody></table></div>'
+    )
 
 
 def _render_five_pillars_tab(df_aug: pd.DataFrame) -> None:
@@ -3216,12 +3262,12 @@ def _render_five_pillars_tab(df_aug: pd.DataFrame) -> None:
         return
 
     # ── Promotion Engine — Execute -> Elite (same computation as the
-    #    standalone page; cached onto df_aug so it only runs once per
-    #    scan even though this tab's content block runs on every rerun
-    #    of Live Scanner, not just when this tab is the active one —
-    #    st.tabs() content isn't lazy. See other lazy-tab call sites
-    #    (st.segmented_control/st.radio) if this needs to be deferred
-    #    later for performance. ────────────────────────────────────
+    #    former standalone page; cached onto df_aug so it only runs once
+    #    per scan even though this tab's content block runs on every
+    #    rerun of Live Scanner, not just when this tab is the active
+    #    one — st.tabs() content isn't lazy. See other lazy-tab call
+    #    sites (st.segmented_control/st.radio) if this needs to be
+    #    deferred later for performance. ─────────────────────────────
     if "FP_EffectiveClass" not in df_aug.columns:
         _promo_cols = {"FP_Elite": [], "FP_EffectiveClass": []}
         for _, _r in df_aug.iterrows():
@@ -3233,43 +3279,15 @@ def _render_five_pillars_tab(df_aug: pd.DataFrame) -> None:
         for _col, _vals in _promo_cols.items():
             df_aug[_col] = _vals
 
-    # ── Sort control ─────────────────────────────────────────────
-    sort_by = st.selectbox(
-        "Sort by",
-        ["Final Score ↓", "Structure ↓", "Acceptance ↓", "Opp Bonus ↓",
-         "Leadership ↓", "Momentum ↓"],
-        key="fp_sort_by_scanner_tab",
-    )
-    sort_map = {
-        "Final Score ↓": "FP_FinalScore", "Structure ↓": "FP_Structure",
-        "Acceptance ↓": "FP_Acceptance", "Opp Bonus ↓": "FP_Reversal",
-        "Leadership ↓": "FP_Leadership", "Momentum ↓": "FP_Momentum",
-    }
-    sort_field = sort_map.get(sort_by, "FP_FinalScore")
-
-    # ── Elite / Execute / Watch as three side-by-side columns ──────
-    # Developing and Avoid deliberately excluded from this tab.
-    _cols_spec = [
-        (CLASS_ELITE,   "🌟 Elite"),
-        (CLASS_EXECUTE, "⚡ Execute"),
-        (CLASS_WATCH,   "👁 Watch"),
-    ]
-    col_elite, col_execute, col_watch = st.columns(3)
-    for (cls, heading), col in zip(_cols_spec, (col_elite, col_execute, col_watch)):
-        with col:
-            color, _, note = _fp_mod._CLASS_STYLE[cls]
-            subset = df_aug[df_aug["FP_EffectiveClass"] == cls].copy()
-            st.markdown(
-                f'<div style="font-size:13px;font-weight:700;color:{color};'
-                f'margin-bottom:2px;">{heading} ({len(subset)})</div>'
-                f'<div style="font-size:10px;color:#8b949e;margin-bottom:8px;">{note}</div>',
-                unsafe_allow_html=True,
-            )
-            if subset.empty:
-                st.caption(f"No {heading.split(' ',1)[1]} candidates in this scan.")
-                continue
-            subset = subset.sort_values(sort_field, ascending=False)
-            st.markdown(_fp_mod._build_table_html(subset), unsafe_allow_html=True)
+    # ── Single merged table — Elite/Execute/Watch rows together,
+    #    State column carries the badge. Developing/Avoid excluded.
+    #    Sorted by Final Score, highest first (no sort control). ─────
+    subset = df_aug[df_aug["FP_EffectiveClass"].isin(_FP_TAB_CLASSES)].copy()
+    if subset.empty:
+        st.info("No Elite / Execute / Watch candidates in this scan.")
+        return
+    subset = subset.sort_values("FP_FinalScore", ascending=False)
+    st.markdown(_build_five_pillars_merged_table_html(subset), unsafe_allow_html=True)
 
 
 def _sc_counts_html(df: pd.DataFrame) -> str:
