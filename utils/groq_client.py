@@ -38,7 +38,7 @@ GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 # Llama 3.3 70B — best quality/speed tradeoff on Groq's free tier for a
 # classification task like this. Falls back to a smaller/faster model via
 # GROQ_MODEL in secrets if you hit rate limits or want lower latency.
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_MODEL = "openai/gpt-oss-20b"
 
 
 @st.cache_resource(show_spinner=False)
