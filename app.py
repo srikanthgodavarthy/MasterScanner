@@ -286,7 +286,6 @@ from pages.diagnostic    import render as render_diagnostic
 from pages.lifecycle     import render as render_lifecycle
 from pages.history       import render as render_history
 from pages.agent          import render as render_agent
-from pages.five_pillars  import render as render_five_pillars
 from pages.cci_master    import render as render_cci_master
 from pages.portfolio     import render as render_portfolio
 from pages.data_source_check import render as render_data_source_check
@@ -354,11 +353,9 @@ def _page_sectors():
 def _page_scanner():
     render_scanner(settings)
 
-def _page_five_pillar():
-    render_five_pillars(settings)
-
 def _page_backtest():
     render_backtest(settings)
+
 
 def _page_lifecycle():
     render_lifecycle()
@@ -412,7 +409,6 @@ pg = st.navigation(
         st.Page(_page_dashboard,    title="Dashboard",            icon="🖥️", default=True),
         _page_sectors_obj,
         st.Page(_page_scanner,      title="Live Scanner",         icon="📡"),
-        st.Page(_page_five_pillar, title="five_pillar Scanner", icon="📍"),
         st.Page(_page_backtest,     title="Backtest Engine",      icon="📈"),
         st.Page(_page_lifecycle,    title="Lifecycle",            icon="🔄"),
         st.Page(_page_history,      title="History",              icon="📊"),
