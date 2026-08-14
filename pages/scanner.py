@@ -2294,6 +2294,48 @@ def _sc_table_badge(signal_class: str, tooltip_key: str = "Signal Class") -> str
     )
 
 
+# [2026-08-14, explicit user direction] Display-only qualifier for the SMC
+# structural gate. WAIT_FOR_RETEST / CONFLICT / STRUCTURAL_INVALIDATION all
+# correctly collapse to the SKIP tier through the existing, untouched
+# classify_tier_v3() ladder — that ladder has no "WAIT" tier and this does
+# not add one. This qualifier changes NOTHING about the Recommendation
+# value; it only annotates *why* a SKIP happened, using the
+# eq_structural_state / CV1_StructuralState field the entry-quality gate
+# already computes (see utils/conviction_score_v1.py
+# classify_structural_state()). VALID_ENTRY_ZONE gets no qualifier — it
+# never restricts the Recommendation, so there is nothing to explain.
+_STRUCTURAL_STATE_QUALIFIER = {
+    "WAIT_FOR_RETEST":         ("#f0883e", "⏳ Wait for Retest"),
+    "CONFLICT":                ("#8b949e", "◐ Conflict"),
+    "STRUCTURAL_INVALIDATION": ("#f85149", "✕ Invalidated"),
+    "EXTENDED_CHASING":        ("#eab308", "⤴ Extended"),
+}
+
+
+def _recommendation_cell(rec: str, structural_state: str | None = None) -> str:
+    """
+    Recommendation badge (unchanged _sc_table_badge output) plus an
+    optional SMC structural-state qualifier chip, shown ONLY when the
+    Recommendation is SKIP and a restrictive structural state produced
+    it — surfaces the distinction between "wait for retest", "conflicting
+    evidence", and "structurally invalidated" without altering the
+    Recommendation value itself or touching classify_tier_v3()/
+    promotion_engine.py.
+    """
+    cell = _sc_table_badge(rec, tooltip_key="Recommendation")
+    qual = _STRUCTURAL_STATE_QUALIFIER.get(str(structural_state or "").strip())
+    if qual and str(rec).strip().upper() == "SKIP":
+        color, label = qual
+        qual_html = (
+            f'<span style="margin-left:4px;font-size:9px;color:{color};'
+            f'background:{color}14;border:1px solid {color}30;border-radius:3px;'
+            f'padding:1px 4px;white-space:nowrap" '
+            f'title="SMC structural gate capped Entry Quality">{label}</span>'
+        )
+        cell = cell.replace("</td>", qual_html + "</td>")
+    return cell
+
+
 def _freshness_badge(setup_age_str: str) -> str:
     """Render a colour-coded freshness badge from the SetupAge string."""
     s = str(setup_age_str or "").strip()
@@ -2537,7 +2579,10 @@ def _render_html_table(df: pd.DataFrame) -> str:
             elif c == "Signal Class":
                 cells += _sc_table_badge(str(val) if val is not None else "")
             elif c == "Recommendation":
-                cells += _sc_table_badge(str(val).upper() if val is not None else "", tooltip_key="Recommendation")
+                cells += _recommendation_cell(
+                    str(val).upper() if val is not None else "",
+                    row.get("CV1_StructuralState"),
+                )
             elif c in ("Stoch↑", "LL✓", "VWAP↺", "Inst✓"):
                 rec = str(row.get("Recommendation", "")).strip().lower()
                 cells += _promo_signal_cell(val) if rec in ("actionable", "execute", "elite") else '<td class="col-num" style="color:var(--muted)">—</td>'
