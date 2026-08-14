@@ -155,11 +155,24 @@ def detect_bos(close: pd.Series, ph_causal: pd.Series, pl_causal: pd.Series) -> 
     Break of Structure: a confirmed close beyond the most recent confirmed
     swing extreme *in the direction of the prevailing trend* (continuation).
 
+    [FIXED 2026-08-14 — correctness bug] BOS must be a single EVENT (the
+    transition bar), not a persistent condition. Returns True only at the
+    bar where the close crosses from <= the pivot to > it (bullish) or
+    from >= to < (bearish) — evaluated against whichever pivot value is
+    authoritative as-of bar i, so a pivot-level change mid-sequence still
+    produces at most one fresh event, never a re-fired one for a level
+    price already cleared. Previously this returned True on EVERY bar
+    where price simply remained beyond the same pivot, which silently
+    reset last_bull_break_i/last_bear_break_i (and therefore age_bars)
+    back to 0 on every subsequent bar — freshness decay never actually
+    decayed for as long as the trend held. See
+    tests/test_smc_engine.py::test_bos_is_event_not_persistent_condition.
+
     Returns (bull_bos, bear_bos) boolean Series.
-      bull_bos[i]: close[i] closes above the last confirmed pivot high as-of i.
-      bear_bos[i]: close[i] closes below the last confirmed pivot low as-of i.
-    Direction-vs-trend disambiguation (continuation vs CHoCH) happens in
-    compute_smc_state(), using the swing label sequence.
+      bull_bos[i]: close[i-1] <= pivot AND close[i] > pivot (pivot = last
+                   confirmed pivot high as-of i).
+      bear_bos[i]: close[i-1] >= pivot AND close[i] < pivot (pivot = last
+                   confirmed pivot low as-of i).
     """
     n = len(close)
     bull_bos = np.zeros(n, dtype=bool)
@@ -173,9 +186,15 @@ def detect_bos(close: pd.Series, ph_causal: pd.Series, pl_causal: pd.Series) -> 
                 last_ph = ph_vals[i - 1]
             if not np.isnan(pl_vals[i - 1]):
                 last_pl = pl_vals[i - 1]
-        if not np.isnan(last_ph) and cl[i] > last_ph:
+
+        if i == 0:
+            continue   # no previous close to compare against -> no event possible
+
+        prev_close = cl[i - 1]
+
+        if not np.isnan(last_ph) and prev_close <= last_ph and cl[i] > last_ph:
             bull_bos[i] = True
-        if not np.isnan(last_pl) and cl[i] < last_pl:
+        if not np.isnan(last_pl) and prev_close >= last_pl and cl[i] < last_pl:
             bear_bos[i] = True
 
     return (pd.Series(bull_bos, index=close.index),
@@ -347,6 +366,40 @@ def compute_smc_state(
     This is the single function every consumer (Live Scanner's CV4 wiring
     in scanner_engine.py, DORE's Stage 2.5) calls to get evidence_tier /
     fvg_retest / age_bars — never re-derived independently downstream.
+
+    [CORRECTNESS PASS 2026-08-14] Fixes 5 identified bugs, all reproduced
+    and confirmed against the pre-fix implementation before this pass:
+      1. BOS was a persistent condition (see detect_bos()'s docstring) —
+         fixed there; this function inherits the fix automatically since
+         it only ever consumes bull_bos/bear_bos's boolean output.
+      2. FVG tracking used ONE shared active_fvg_* set of variables, so a
+         bearish FVG forming after a bullish one silently overwrote it —
+         fixed below with two independent trackers
+         (active_bull_fvg_*/active_bear_fvg_*), each consulted only when
+         it matches the bar's determined direction.
+      3. An FVG-only setup (no sweep/break, tier 1) with a genuinely
+         bullish FVG fell through to the `else` branch of an incomplete
+         if/elif direction chain and was silently labeled BEARISH — fixed
+         by giving the FVG-only case its own explicit direction
+         determination from which FVG (bull/bear) is actually fresh.
+      4. That same FVG-only case set event_i = i (current bar) instead of
+         the FVG's own creation bar, so age_bars was permanently stuck at
+         0 and freshness decay never applied — fixed by using the
+         matched FVG's own creation index as event_i.
+      5. fvg_high/fvg_low/fvg_retest were exposed on the returned
+         SMCState even when has_fvg was False (the FVG had aged past
+         lookback_bars) — confirmed to leak into production
+         (utils.extension_shared._fvg_zone_distance_component() only
+         checked `fvg_high is None`, not `has_fvg`, so a 70-bar-stale FVG
+         was penalizing Extension/Chase Risk at full severity). Fixed by
+         zeroing fvg_high/fvg_low/fvg_retest to None/None/FVG_NONE
+         whenever the direction-matched FVG is not within lookback_bars.
+    See tests/test_smc_engine.py for a regression test per bug.
+
+    No architectural change: still one evidence_tier via the same
+    _evidence_tier() lookup table, still causal, still no lookahead, still
+    a single SMCState per bar. SMC remains a bounded supporting layer, not
+    a second trend engine.
     """
     high, low, close, open_ = df["high"], df["low"], df["close"], df["open"]
     n = len(df)
@@ -381,7 +434,10 @@ def compute_smc_state(
     last_bear_break_i = -10**9
     last_bull_disp_i = -10**9
     last_bear_disp_i = -10**9
-    active_fvg_high, active_fvg_low, active_fvg_is_bull, active_fvg_i = None, None, None, -10**9
+    # [FIX 2] Two INDEPENDENT FVG trackers — a fresh FVG in one direction
+    # must never overwrite or be shadowed by one in the other direction.
+    active_bull_fvg_high, active_bull_fvg_low, active_bull_fvg_i = None, None, -10**9
+    active_bear_fvg_high, active_bear_fvg_low, active_bear_fvg_i = None, None, -10**9
 
     for i in range(n):
         if bull_sweep.iat[i]:
@@ -397,15 +453,9 @@ def compute_smc_state(
         if bear_disp.iat[i]:
             last_bear_disp_i = i
         if bull_fvg.iat[i]:
-            active_fvg_high, active_fvg_low = fvg_high_s.iat[i], fvg_low_s.iat[i]
-            active_fvg_is_bull, active_fvg_i = True, i
-        elif bear_fvg.iat[i]:
-            active_fvg_high, active_fvg_low = fvg_high_s.iat[i], fvg_low_s.iat[i]
-            active_fvg_is_bull, active_fvg_i = False, i
-
-        fvg_status = FVG_NONE
-        if active_fvg_high is not None and (i - active_fvg_i) <= lookback_bars:
-            fvg_status = fvg_retest_status(close, active_fvg_high, active_fvg_low, active_fvg_is_bull, i)
+            active_bull_fvg_high, active_bull_fvg_low, active_bull_fvg_i = fvg_high_s.iat[i], fvg_low_s.iat[i], i
+        if bear_fvg.iat[i]:
+            active_bear_fvg_high, active_bear_fvg_low, active_bear_fvg_i = fvg_high_s.iat[i], fvg_low_s.iat[i], i
 
         bull_recent_sweep = (i - last_bull_sweep_i) <= lookback_bars
         bear_recent_sweep = (i - last_bear_sweep_i) <= lookback_bars
@@ -413,11 +463,15 @@ def compute_smc_state(
         bear_recent_break = (i - last_bear_break_i) <= lookback_bars
         bull_recent_disp = (i - last_bull_disp_i) <= lookback_bars
         bear_recent_disp = (i - last_bear_disp_i) <= lookback_bars
-        has_recent_fvg = active_fvg_high is not None and (i - active_fvg_i) <= lookback_bars
+        has_recent_bull_fvg = active_bull_fvg_high is not None and (i - active_bull_fvg_i) <= lookback_bars
+        has_recent_bear_fvg = active_bear_fvg_high is not None and (i - active_bear_fvg_i) <= lookback_bars
 
         # Directional conflict: both bullish and bearish sweeps/breaks
         # active within the same lookback window -> CONFLICT, tier forced
         # to 0, never averaged into a leaking mid-tier value (§1.5).
+        # [FIX 5] No FVG (of either direction) is exposed in CONFLICT —
+        # direction is ambiguous, so there is no thesis to interpret an
+        # FVG zone against.
         bull_active = bull_recent_sweep or bull_recent_break
         bear_active = bear_recent_sweep or bear_recent_break
 
@@ -427,8 +481,8 @@ def compute_smc_state(
                 age_bars=0, fvg_retest=FVG_NONE,
                 has_sweep=True, has_bos=bool(bull_bos.iat[i] or bear_bos.iat[i]),
                 has_choch=bool(bull_choch.iat[i] or bear_choch.iat[i]),
-                has_displacement=False, has_fvg=has_recent_fvg,
-                fvg_high=active_fvg_high, fvg_low=active_fvg_low,
+                has_displacement=False, has_fvg=False,
+                fvg_high=None, fvg_low=None,
             ))
             continue
 
@@ -438,16 +492,48 @@ def compute_smc_state(
             has_disp = bull_recent_disp
             is_choch = bool(bull_choch.iat[last_bull_break_i]) if bull_recent_break and last_bull_break_i >= 0 else False
             event_i = max(x for x in (last_bull_sweep_i, last_bull_break_i) if x > -10**9)
+            has_recent_fvg = has_recent_bull_fvg
+            fvg_high, fvg_low, fvg_i, fvg_is_bull = active_bull_fvg_high, active_bull_fvg_low, active_bull_fvg_i, True
         elif bear_active:
             direction = BEARISH
             has_sweep, has_break = bear_recent_sweep, bear_recent_break
             has_disp = bear_recent_disp
             is_choch = bool(bear_choch.iat[last_bear_break_i]) if bear_recent_break and last_bear_break_i >= 0 else False
             event_i = max(x for x in (last_bear_sweep_i, last_bear_break_i) if x > -10**9)
+            has_recent_fvg = has_recent_bear_fvg
+            fvg_high, fvg_low, fvg_i, fvg_is_bull = active_bear_fvg_high, active_bear_fvg_low, active_bear_fvg_i, False
         else:
-            direction = DIR_NEUTRAL
+            # [FIX 3] FVG-only case: no sweep/break in either direction.
+            # Direction must come from WHICH FVG is actually fresh, never
+            # default into an unrelated branch. Both fresh simultaneously
+            # with zero other evidence is genuinely ambiguous -> NEUTRAL
+            # (conservative: no directional edge asserted from two
+            # opposing gaps alone), same as neither being fresh.
             has_sweep, has_break, has_disp, is_choch = False, False, False, False
-            event_i = i
+            if has_recent_bull_fvg and not has_recent_bear_fvg:
+                direction = BULLISH
+                has_recent_fvg = True
+                fvg_high, fvg_low, fvg_i, fvg_is_bull = active_bull_fvg_high, active_bull_fvg_low, active_bull_fvg_i, True
+                event_i = fvg_i   # [FIX 4] the FVG's own creation bar, not `i`
+            elif has_recent_bear_fvg and not has_recent_bull_fvg:
+                direction = BEARISH
+                has_recent_fvg = True
+                fvg_high, fvg_low, fvg_i, fvg_is_bull = active_bear_fvg_high, active_bear_fvg_low, active_bear_fvg_i, False
+                event_i = fvg_i   # [FIX 4]
+            else:
+                direction = DIR_NEUTRAL
+                has_recent_fvg = False
+                fvg_high, fvg_low, fvg_i, fvg_is_bull = None, None, -10**9, None
+                event_i = i
+
+        # [FIX 5] Only compute/expose fvg_status and the zone bounds when
+        # the direction-matched FVG is actually within lookback_bars;
+        # otherwise the zone is stale and must not leak downstream.
+        if has_recent_fvg:
+            fvg_status = fvg_retest_status(close, fvg_high, fvg_low, fvg_is_bull, i)
+        else:
+            fvg_status = FVG_NONE
+            fvg_high, fvg_low = None, None
 
         fvg_retest_active = fvg_status in (FVG_IN_ZONE,)
         tier = _evidence_tier(
@@ -488,7 +574,7 @@ def compute_smc_state(
             has_sweep=bool(has_sweep), has_bos=bool(bull_bos.iat[i] or bear_bos.iat[i]),
             has_choch=bool(bull_choch.iat[i] or bear_choch.iat[i]),
             has_displacement=bool(has_disp), has_fvg=bool(has_recent_fvg),
-            fvg_high=active_fvg_high, fvg_low=active_fvg_low,
+            fvg_high=fvg_high, fvg_low=fvg_low,
         ))
 
     return states
