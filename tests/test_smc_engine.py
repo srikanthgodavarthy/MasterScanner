@@ -131,7 +131,11 @@ def test_detect_bos_bullish_and_bearish():
 
     bull_bos, bear_bos = detect_bos(close, ph_causal, pl_causal)
     assert bull_bos.iloc[2] == True     # close 106 > last confirmed ph 105
-    assert bear_bos.iloc[3] == False    # last confirmed pl (95) is bar3's OWN confirmation — not usable same-bar
+    # [2026-08-15 fix] pl_causal[3]=95 is confirmed AT bar 3 itself, and is
+    # causally valid to test against bar 3's own close immediately (see
+    # detect_bos()'s docstring) -- prev_close(106) >= 95 and close(90) < 95
+    # is a genuine same-bar break, not a same-bar-unusable non-event.
+    assert bear_bos.iloc[3] == True     # close 90 < newly-confirmed pl 95, same bar
     # bar 4 would need to exist to test post-confirmation break; confirm no
     # false positive fires before a pivot is confirmed.
     assert not bull_bos.iloc[0]

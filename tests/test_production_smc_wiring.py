@@ -102,30 +102,34 @@ def test_compute_conviction_v1_and_v2_never_receive_smc_state():
 
 
 # ══════════════════════════════════════════════════════════════════
-#  Genuine positive/negative signal, magnitude bounds
+#  [2026-08-15] SMC-as-additive-score superseded by the canonical
+#  structural-state gate (utils.smc_engine.classify_structural_state()) —
+#  see _smc_entry_confirmation_adjustment()'s docstring. These two tests
+#  used to assert genuine +/- bounds on eq_smc_confirmation; they now
+#  assert the permanent no-op contract instead, so this file still
+#  documents (and would catch a regression of) the double-counting this
+#  architecture change was explicitly meant to remove.
 # ══════════════════════════════════════════════════════════════════
 
-def test_strong_fresh_confirmation_gives_bounded_positive_adjustment():
+def test_strong_fresh_confirmation_no_longer_adjusts_entry_quality():
     r = _base_bar()
     smc_strong = SMCState(direction=BULLISH, state=BULLISH_CONTINUATION, evidence_tier=4,
                            age_bars=0, fvg_retest="in_zone", has_sweep=True, has_bos=True,
                            has_displacement=True, has_fvg=True, fvg_high=105, fvg_low=100)
     total, subs = _entry_quality(r, smc_state=smc_strong)
-    assert subs["eq_smc_confirmation"] > 0
-    assert subs["eq_smc_confirmation"] <= 12   # documented bound ~+11 max
+    assert subs["eq_smc_confirmation"] == 0
     total_none, _ = _entry_quality(r, smc_state=None)
-    assert total > total_none
+    assert total == total_none   # SMC now only acts via the structural gate, never the score
 
 
-def test_chased_late_entry_gives_bounded_negative_adjustment():
+def test_chased_late_entry_no_longer_adjusts_entry_quality():
     r = _base_bar()
     smc_chased = SMCState(direction=BULLISH, state=LIQUIDITY_SWEEP, evidence_tier=1,
                            age_bars=0, fvg_retest="through_filled", has_sweep=True, has_fvg=True)
     total, subs = _entry_quality(r, smc_state=smc_chased)
-    assert subs["eq_smc_confirmation"] < 0
-    assert subs["eq_smc_confirmation"] >= -6   # documented bound
+    assert subs["eq_smc_confirmation"] == 0
     total_none, _ = _entry_quality(r, smc_state=None)
-    assert total < total_none
+    assert total == total_none   # EXTENDED_CHASING is now handled by the gate, not a score penalty
 
 
 def test_adjustment_never_dominates_the_frozen_ladder():
@@ -160,15 +164,18 @@ def test_extended_trend_phase_cap_cannot_be_escaped_by_smc():
 #  compute_conviction_v3 (CV1's production entry point) threading
 # ══════════════════════════════════════════════════════════════════
 
-def test_compute_conviction_v3_threads_smc_state_through():
+def test_compute_conviction_v3_threads_smc_state_through_as_noop():
+    # [2026-08-15] compute_conviction_v3 still accepts smc_state (used
+    # elsewhere for CV4 threading / API compatibility) but it no longer
+    # changes entry_quality — see _smc_entry_confirmation_adjustment().
     r = _base_bar()
     smc_strong = SMCState(direction=BULLISH, state=BULLISH_CONTINUATION, evidence_tier=4,
                            age_bars=0, fvg_retest="in_zone", has_sweep=True, has_bos=True,
                            has_displacement=True, has_fvg=True, fvg_high=105, fvg_low=100)
     cv3_none = compute_conviction_v3(r, smc_state=None)
     cv3_smc = compute_conviction_v3(r, smc_state=smc_strong)
-    assert cv3_smc.entry_quality > cv3_none.entry_quality
-    assert cv3_smc.eq_smc_confirmation > 0
+    assert cv3_smc.entry_quality == cv3_none.entry_quality
+    assert cv3_smc.eq_smc_confirmation == 0
     assert cv3_none.eq_smc_confirmation == 0
     # Leadership/Conviction untouched by this wiring
     assert cv3_smc.leadership == cv3_none.leadership
