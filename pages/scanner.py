@@ -3685,6 +3685,19 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
         return (f'<span style="color:{color};font-weight:700;">{sign}{_fmt_money(pnl_rupees)}</span> '
                 f'{pct_html}')
 
+    def _fmt_excursion(row, premium_key, pct_key):
+        # [MFE/MAE tracking] Shared formatter for both MFE and MAE cells
+        # — same Decimal/float-safety and "—" until first ACTIVE tick"
+        # rules as _fmt_pnl above, just without the P&L sign convention
+        # (an excursion premium is a level, not a gain/loss by itself;
+        # the % alongside it already carries the color).
+        val = row.get(premium_key)
+        pct = row.get(pct_key)
+        if val in (None, "") or pd.isna(val):
+            return '<span style="color:var(--muted)">—</span>'
+        pct_html = _fmt_pct_chg(pct) if pct is not None and not pd.isna(pct) else ""
+        return f'{_fmt_money(val)} {pct_html}'.strip()
+
     def _fmt_last_seen(row):
         # [2026-08-08, SG request] Short TIME-only stamp (no date) — the
         # adjacent Days Active column already carries "how long ago" in
@@ -3725,8 +3738,14 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
     # a secondary/audit detail once a plan is open — every row here is
     # OPEN by definition, see this function's docstring) and Source
     # added right after Direction.
+    # [MFE/MAE tracking] MFE/MAE placed right after P&L — both are
+    # read off the SAME long-premium-position math as P&L (higher
+    # premium = favorable for CE and PE alike), so keeping them
+    # adjacent to P&L reads more naturally than tucking them at the
+    # end past Status.
     headers = ["Symbol", "Direction", "Source", "Strike", "Expiry", "Entry (Locked)", "Stop Loss",
-               "Target 1", "Target 2", "Last Known Premium", "P&L", "Last Seen", "Days Active", "Status"]
+               "Target 1", "Target 2", "Last Known Premium", "P&L", "MFE", "MAE",
+               "Last Seen", "Days Active", "Status"]
 
     rows_html = []
     for _, r in df.iterrows():
@@ -3744,6 +3763,8 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
             f'<td>{_fmt_money(r.get("saved_target2"))}</td>',
             f'<td>{_fmt_last_premium(r)}</td>',
             f'<td>{_fmt_pnl(r)}</td>',
+            f'<td>{_fmt_excursion(r, "mfe_premium", "mfe_pct")}</td>',
+            f'<td>{_fmt_excursion(r, "mae_premium", "mae_pct")}</td>',
             f'<td>{_fmt_last_seen(r)}</td>',
             f'<td>{_fmt_text(r.get("plan_age_days"))}d</td>',
             f'<td>{r.get("plan_status_label", "—")}</td>',
