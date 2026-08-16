@@ -1303,6 +1303,79 @@ def _primary_blocker(r, result: dict) -> str:
     return f"Setup Building — composite {int(composite)} (need {_comp_floor})"
 
 
+RECOMMENDATION_LADDER = ["Skip", "Watch", "Developing", "Actionable", "Execute", "Elite"]
+RECOMMENDATION_RANK = {name: i for i, name in enumerate(RECOMMENDATION_LADDER)}
+
+# [Structural gate wiring, 2026-08-15] downgrade-only cap each canonical
+# SMC structural state applies to Recommendation — see
+# apply_smc_structural_gate()'s docstring for why this lives here (tier
+# vocabulary is MasterScanner-specific) rather than in
+# utils.smc_engine.classify_structural_state() (direction/evidence-only,
+# app-agnostic).
+def apply_smc_structural_gate(
+    final_tier: str, smc_state, order_block, thesis_direction: str | None = None,
+):
+    """
+    Applies the canonical SMC structural state (utils.smc_engine.
+    classify_structural_state()) as a DOWNGRADE-ONLY cap on an already-
+    computed Recommendation tier. Never upgrades — a VALID_ENTRY_ZONE
+    read never pushes a Watch to Actionable on its own; it only ever
+    lets whatever Base Entry Quality / natural score / Promo Score
+    already decided pass through unchanged.
+
+    Call this AFTER any natural-score/Promo-Score max() so a high CV1
+    composite or a Promo Score upgrade cannot bypass the cap — calling
+    it before such a max() (as the older, unrelated ENABLE_STRUCTURAL_
+    GATE hard_stop/lifecycle block does) leaves it bypassable.
+
+    Parameters
+    ----------
+    final_tier : str
+        The Recommendation tier computed so far (must be one of
+        RECOMMENDATION_LADDER).
+    smc_state : utils.smc_engine.SMCState or None
+    order_block : utils.smc_engine.OrderBlock or None
+    thesis_direction : str or None
+        Defaults to utils.smc_engine.BULLISH (Live Scanner is long-only
+        today) when None.
+
+    Returns
+    -------
+    (capped_tier: str, decision: StructuralDecision | None)
+        decision is None only if classify_structural_state() itself
+        raised (fails open — a gate bug must never block a
+        Recommendation entirely; final_tier passes through unchanged
+        in that case).
+    """
+    from utils.smc_engine import (
+        classify_structural_state, BULLISH,
+        STRUCTURAL_INVALIDATION, STRUCTURAL_CONFLICT,
+        STRUCTURAL_EXTENDED_CHASING, STRUCTURAL_WAIT_FOR_RETEST,
+    )
+    try:
+        decision = classify_structural_state(
+            smc_state, order_block=order_block,
+            thesis_direction=thesis_direction or BULLISH,
+        )
+    except Exception:
+        return final_tier, None
+
+    cap = {
+        STRUCTURAL_INVALIDATION:     "Skip",
+        STRUCTURAL_CONFLICT:         "Watch",
+        STRUCTURAL_EXTENDED_CHASING: "Watch",
+        STRUCTURAL_WAIT_FOR_RETEST:  "Developing",
+    }.get(decision.state)
+
+    if cap is None:
+        return final_tier, decision   # VALID_ENTRY_ZONE — no cap
+
+    final_rank = RECOMMENDATION_RANK.get(final_tier, 0)
+    cap_rank = RECOMMENDATION_RANK[cap]
+    capped_tier = final_tier if cap_rank >= final_rank else cap
+    return capped_tier, decision
+
+
 def score_stock(
     df:       pd.DataFrame,
     nifty:    pd.Series,
@@ -1381,18 +1454,29 @@ def score_stock(
     # through Phase 6 (zero production impact, §4).
     _cv4_smc_state = None
     _cv4_swing_label = None
+    _order_block = None   # freshest BULLISH OrderBlock, long-only scanner — see below
     try:
-        from utils.smc_engine import compute_smc_state
+        from utils.smc_engine import compute_smc_state, detect_order_blocks
         from utils.swing_structure import compute_swing_labels
         from utils.structural_levels import causal_pivot_series
-        _smc_states = compute_smc_state(df, lb=params.pvt_lb if hasattr(params, "pvt_lb") else 20)
+        _pvt_lb = params.pvt_lb if hasattr(params, "pvt_lb") else 20
+        _smc_states = compute_smc_state(df, lb=_pvt_lb)
         _cv4_smc_state = _smc_states[-1] if _smc_states else None
-        _ph, _pl = causal_pivot_series(df["high"], df["low"], lb=params.pvt_lb if hasattr(params, "pvt_lb") else 20)
+        _ph, _pl = causal_pivot_series(df["high"], df["low"], lb=_pvt_lb)
         _swing_df = compute_swing_labels(_ph, _pl)
         _cv4_swing_label = _swing_df["label_ffill"].iloc[-1] if len(_swing_df) else None
+        # [Structural gate wiring, 2026-08-15] Live Scanner is long-only
+        # (see compute_conviction_v4()'s own docstring on that constraint)
+        # so only the bullish OB series is needed here — bull_obs[-1] is
+        # the freshest unmitigated bullish OrderBlock as of the latest
+        # bar, or None if none exists (a normal, common case, not an
+        # error — see detect_order_blocks()'s docstring).
+        _bull_obs, _ = detect_order_blocks(df, lb=_pvt_lb)
+        _order_block = _bull_obs[-1] if _bull_obs else None
     except Exception:
         _cv4_smc_state = None
         _cv4_swing_label = None
+        _order_block = None
 
     # [Production wiring, 2026-08-14] SMC now feeds decision_engine's
     # Extension/Chase Risk (Primary use, per explicit direction) via
@@ -1408,6 +1492,8 @@ def score_stock(
     # already left _cv4_smc_state=None, which _extension() treats as
     # SMC-NEUTRAL, never an error.
     r.smc_state = _cv4_smc_state
+    r.order_block = _order_block   # [2026-08-15, structural gate] see scanner_engine's
+                                    # final_tier clamp below — the ONLY other reader.
 
     # ── 52-week high/low breadth flags ────────────────────────────
     # [Market Breadth panel, 2026-07] "Near 52W high/low" is a classic
@@ -1861,8 +1947,8 @@ def score_stock(
         # landed on; Promo Score is additive on top and is only ever
         # non-zero when base_tier == "Actionable" (evaluate_promotion's own
         # internal gate — untouched here).
-        _LADDER = ["Skip", "Watch", "Developing", "Actionable", "Execute", "Elite"]
-        _RANK = {name: i for i, name in enumerate(_LADDER)}
+        _LADDER = RECOMMENDATION_LADDER
+        _RANK = RECOMMENDATION_RANK
         base_rank = _RANK.get(base_tier, 0)
         natural_rank = {"ELITE": 5, "EXECUTE": 4}.get(cv1.signal_class, 0)
         promo_rank = _RANK.get(promo.tier, 0) if (promo.applicable and promo.promoted) else 0
@@ -1870,11 +1956,52 @@ def score_stock(
         final_rank = max(base_rank, natural_rank, promo_rank)
         final_tier = _LADDER[final_rank]
 
+        # ── SMC STRUCTURAL GATE [2026-08-15 SG request] ──────────────
+        # Applied HERE — after natural/promo are already folded into
+        # final_rank — specifically so it CANNOT be bypassed by a high
+        # natural CV1 score or a Promo Score upgrade.
+        #
+        # Pre-existing ENABLE_STRUCTURAL_GATE bypass: FOUND
+        #   Location: this function, "STRUCTURAL GATE (opt-in...)" block
+        #             immediately above (hard_stop/t4_hard_stop and
+        #             Lifecycle AVOID/EXTENDED checks), which clamps
+        #             base_tier BEFORE the natural/promo max() a few
+        #             lines below it — so a high natural_rank or
+        #             promo_rank can still outrank that clamp.
+        #   Status:   FLAGGED — NOT FIXED.
+        #   Reason:   Pre-existing behavior, present before this SMC
+        #             wiring work; explicitly out of scope per 2026-08-15
+        #             scope clarification. Execution ordering (hard_stop/
+        #             lifecycle -> structural gate -> natural/promo max),
+        #             the ENABLE_STRUCTURAL_GATE flag's existing
+        #             semantics, and the lifecycle/promotion logic itself
+        #             are all preserved unmodified by this change. The
+        #             SMC structural gate added here is a separate,
+        #               independent mechanism (applied after final_rank,
+        #             not before base_tier) — it does not touch, replace,
+        #             or extend the existing gate's ordering.
+        final_tier, _smc_structural = apply_smc_structural_gate(final_tier, r.smc_state, r.order_block)
+        final_rank = _RANK[final_tier]
+
+        result["SMC_Structural_State"]      = _smc_structural.state if _smc_structural else None
+        result["SMC_Structural_Action"]     = _smc_structural.action if _smc_structural else None
+        result["SMC_Structural_Reason"]     = _smc_structural.reason if _smc_structural else None
+        result["SMC_Invalidation_Level"]    = _smc_structural.invalidation_level if _smc_structural else None
+        result["SMC_OB_Proximal"]           = r.order_block.proximal if r.order_block else None
+        result["SMC_OB_Distal"]             = r.order_block.distal if r.order_block else None
+        result["SMC_Direction"]             = r.smc_state.direction if r.smc_state else None
+        result["SMC_Entry_Zone"]            = r.smc_state.fvg_retest if r.smc_state else None
+        result["Base_Entry_Score"]          = cv1.entry_quality
+
         result["_structural_gate_blocked"] = _gate_reason
         result["_structural_gate_on"] = _structural_gate_on
 
         result["CV1_SignalClass"]    = cv1.signal_class   # v3-weighted (_classify_v3) as of 2026-07 — no longer v1's frozen label
         result["Tier"]               = base_tier           # pre-promotion CV1 tier
+        # [Section 7] "Recommendation" IS Final_Recommendation/Final_Entry_State
+        # — the project's existing field for exactly that meaning. Not
+        # duplicated under another name (spec's own instruction against
+        # "duplicate fields with slightly different meanings").
         result["Recommendation"]     = final_tier           # Skip|Watch|Developing|Actionable|Execute|Elite
         # "Promoted" means Promo Score/timing is the reason final_tier is
         # above where base_tier + natural score would have landed on their

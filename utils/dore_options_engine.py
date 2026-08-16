@@ -55,6 +55,8 @@ from typing import Optional, Sequence
 
 import pandas as pd
 
+from utils.smc_engine import BULLISH, OrderBlock   # noqa: F401 (OrderBlock imported for type use)
+
 logger = logging.getLogger(__name__)
 
 
@@ -782,6 +784,23 @@ class OptionTradePlan:
     cv4_smc_state:          Optional[str]   = None
     cv4_smc_fvg_retest:     Optional[str]   = None
 
+    # [Structural strike wiring, 2026-08-15, DORE §10] Order-Block-
+    # anchored strike selection diagnostics. structural_state is one of
+    # utils.smc_engine's five STRUCTURAL_* constants, or the explicit
+    # safe sentinel "STRUCTURAL_DATA_UNAVAILABLE" (Section 11) when
+    # open_prices wasn't supplied to compute_dore_trade_plan() or no
+    # Order Block existed for this direction. structural_anchor_strike
+    # is only set (non-None) when the Conservative candidate's strike
+    # was actually overridden by the OB proximal line — None means
+    # conservative.strike is still select_strikes()'s own volatility-
+    # based value, never a silently-fabricated structural one.
+    structural_state:          Optional[str]   = None
+    structural_reason:         Optional[str]   = None
+    structural_anchor_strike:  Optional[float] = None
+    ob_proximal:                Optional[float] = None
+    ob_distal:                  Optional[float] = None
+    structural_invalidation_level: Optional[float] = None
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -1195,6 +1214,321 @@ def select_strikes(
 
 
 # ══════════════════════════════════════════════════════════════════
+#  STRUCTURAL (SMC/Order-Block-anchored) STRIKE SELECTION — net-new.
+#
+#  select_strikes() above stays untouched (it's the existing Delta-free
+#  but still purely statistical expected_move x capture_ratio model,
+#  and other callers depend on its exact output shape). The two
+#  functions below are an ADDITIVE alternative selection path that
+#  anchors strikes to utils.smc_engine.OrderBlock proximal/distal
+#  lines and to a target liquidity level (a prior swing high/low or an
+#  unmitigated FVG edge) instead of a Delta or a volatility step.
+# ══════════════════════════════════════════════════════════════════
+
+class ChainDataError(Exception):
+    """Raised when an OptionChainSnapshot doesn't carry enough real
+    premium data to price a structurally-anchored leg. Distinct from a
+    hard_reject() reason string (which ranks/skips a whole symbol) —
+    this signals a data problem the caller must handle explicitly
+    (retry, skip this symbol, fall back to select_strikes()), not a
+    quality judgment about the setup itself."""
+
+
+def _nearest_priced_strike(
+    target_price: float, chain: "OptionChainSnapshot", dir_: str,
+    max_steps: int = 20,
+) -> float:
+    """
+    Rounds target_price to the chain's strike_interval, then walks
+    outward in both directions (in strike_interval steps, nearest
+    first) until it finds a strike that actually has a usable premium
+    quote for `dir_` in chain.strike_premiums. A structurally "correct"
+    strike the chain has no data for is useless to a caller that needs
+    to price the leg — better to hand back the nearest strike that
+    genuinely has a quote than a number that will fail downstream.
+
+    Raises ChainDataError if no priced strike is found within
+    max_steps * chain.strike_interval of the target.
+    """
+    if chain.strike_interval <= 0:
+        raise ChainDataError("OptionChainSnapshot.strike_interval must be > 0")
+    if not chain.strike_premiums:
+        raise ChainDataError("OptionChainSnapshot has no strike_premiums data")
+
+    base = _round_to_strike(target_price, chain.strike_interval)
+    premium_field = "ce_premium" if dir_ == CE else "pe_premium"
+
+    def _has_quote(strike: float) -> bool:
+        row = chain.strike_premiums.get(strike) or chain.strike_premiums.get(round(strike, 2))
+        return bool(row) and row.get(premium_field) is not None
+
+    if _has_quote(base):
+        return base
+
+    for step in range(1, max_steps + 1):
+        for candidate in (base + step * chain.strike_interval, base - step * chain.strike_interval):
+            if _has_quote(candidate):
+                return candidate
+
+    raise ChainDataError(
+        f"No priced {dir_} strike found within {max_steps} steps of {base} "
+        f"(interval={chain.strike_interval})"
+    )
+
+
+def _approx_intrinsic(strike: float, underlying_price: float, dir_: str) -> float:
+    """Approximate intrinsic value if the underlying were at
+    underlying_price at/near expiry — the same approximation
+    select_strikes()'s caller (_build_candidate) already uses for
+    reward-to-target, reused here for reward-to-liquidity-target and
+    for the structural stop's approximate premium loss."""
+    if dir_ == CE:
+        return max(0.0, underlying_price - strike)
+    return max(0.0, strike - underlying_price)
+
+
+def select_structural_long_strike(
+    sig: "MasterScannerSignal",
+    chain: "OptionChainSnapshot",
+    dir_: str,
+    order_block: "OrderBlock",
+    settings: "DoreOptionsSettings",
+) -> StrikeCandidate:
+    """
+    Selects the long-option strike by anchoring to an Order Block's
+    PROXIMAL line (utils.smc_engine.OrderBlock.proximal) instead of a
+    static Delta or a volatility-step offset. Rationale: the proximal
+    line is where price would need to retest for the institutional
+    footprint the OB represents to still be "live" — entering there
+    (rather than at whatever strike a fixed Delta happens to land on)
+    means paying for the option nearer the actual structural entry,
+    not an arbitrary statistical offset.
+
+    Parameters
+    ----------
+    sig : MasterScannerSignal
+        Normalized scan row for the underlying. current_price is used
+        only as a sanity check (direction consistency), never as the
+        anchor itself.
+    chain : OptionChainSnapshot
+        Must have strike_interval > 0 and at least one priced strike
+        for `dir_` within the search radius of the OB's proximal line,
+        or ChainDataError is raised.
+    dir_ : str
+        CE or PE. Must agree with order_block.direction (BULLISH -> CE,
+        BEARISH -> PE) — a long call anchored to a bearish OB (or vice
+        versa) is a contradiction, not something to silently coerce.
+    order_block : OrderBlock
+        From utils.smc_engine.detect_order_blocks(); must be the
+        caller's most recent UNMITIGATED block for this direction —
+        this function does not check mitigated/tested itself (the
+        caller decides what "still valid" means for its own use case).
+    settings : DoreOptionsSettings
+        Passed through only so this function's signature matches
+        select_strikes()'s for interchangeability; no threshold here
+        is currently sourced from it.
+
+    Returns
+    -------
+    StrikeCandidate
+        strike is the nearest chain strike (with real premium data) to
+        order_block.proximal. probability_of_profit and delta_approx
+        are left at neutral placeholders (0.0) — this selection method
+        does not model probability the way select_strikes()'s
+        expected-move approach does; callers that need POP should
+        still call select_strikes() alongside this for that figure.
+
+    Raises
+    ------
+    ValueError
+        order_block is None, or dir_ doesn't match order_block.direction.
+    ChainDataError
+        chain has no usable premium data near the proximal line.
+    """
+    if order_block is None:
+        raise ValueError("select_structural_long_strike requires a real OrderBlock, got None")
+    expected_dir = CE if order_block.direction == BULLISH else PE
+    if dir_ != expected_dir:
+        raise ValueError(
+            f"dir_={dir_!r} contradicts order_block.direction={order_block.direction!r} "
+            f"(expected {expected_dir!r})"
+        )
+
+    strike = _nearest_priced_strike(order_block.proximal, chain, dir_)
+    row = chain.strike_premiums.get(strike) or chain.strike_premiums.get(round(strike, 2))
+    quote = PremiumQuote.from_chain_row(row or {}, dir_)
+    if quote.ltp is None:
+        raise ChainDataError(f"Strike {strike} has no {dir_} premium quote in the chain snapshot")
+
+    risk = quote.ltp
+    reward = None
+    rr = None
+    intrinsic_at_target = _approx_intrinsic(strike, sig.target_price, dir_)
+    if risk:
+        reward = round(max(0.0, intrinsic_at_target - risk), 2)
+        rr = round(reward / risk, 2) if risk else None
+
+    return StrikeCandidate(
+        label="Structural",
+        strike=strike,
+        premium=risk,
+        probability_of_profit=0.0,
+        delta_approx=0.0,
+        risk=risk,
+        reward=reward,
+        risk_reward_ratio=rr,
+    )
+
+
+@dataclass
+class DebitSpreadPlan:
+    """A two-leg debit spread anchored to SMC structure: long leg near
+    an Order Block's proximal line, short leg near a target liquidity
+    level (a prior swing high/low or an unmitigated FVG edge), with the
+    OB's distal line as the explicit structural invalidation stop."""
+    symbol:                str
+    direction:              str    # CE (bull call spread) or PE (bull... bear put spread)
+    long_strike:            float
+    short_strike:           float
+    long_premium:           Optional[float]
+    short_premium:          Optional[float]
+    net_debit:              Optional[float]     # max loss per share, if both legs priced
+    max_profit:             Optional[float]      # per share, at/beyond the short strike
+    risk_reward_ratio:       Optional[float]
+    structural_stop_price:   float               # order_block.distal — underlying-level invalidation
+    liquidity_target_price:  float               # anchor used for the short leg
+    reasons:                list = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def build_debit_spread(
+    sig: "MasterScannerSignal",
+    chain: "OptionChainSnapshot",
+    dir_: str,
+    order_block: "OrderBlock",
+    liquidity_target_price: float,
+    settings: "DoreOptionsSettings",
+    min_risk_reward: float = 1.5,
+) -> DebitSpreadPlan:
+    """
+    Builds a debit spread (bull call spread for CE, bear put spread for
+    PE) with both legs anchored to SMC structure instead of Delta:
+
+      - Long leg  : nearest priced strike to order_block.proximal
+                    (same anchor as select_structural_long_strike()).
+      - Short leg : nearest priced strike to `liquidity_target_price`
+                    — the caller supplies this (a prior swing high/low
+                    from utils.structural_levels.causal_pivot_series,
+                    or an unmitigated FVG edge from
+                    utils.smc_engine.compute_smc_state) rather than
+                    this function inventing a liquidity level itself;
+                    the SMC engine already owns that detection.
+      - Structural invalidation stop : order_block.distal, verbatim —
+                    if the underlying closes beyond it, the OB is
+                    mitigated and the spread's thesis is dead,
+                    independent of the spread's own P&L at that moment.
+
+    Parameters
+    ----------
+    sig, chain, dir_, order_block, settings : see
+        select_structural_long_strike() — identical contract.
+    liquidity_target_price : float
+        Underlying price level the short leg is anchored to. Must sit
+        beyond the long leg in the trade's direction (above it for CE,
+        below it for PE) or ValueError is raised — a short leg on the
+        wrong side of the long leg isn't a debit spread.
+    min_risk_reward : float, default 1.5
+        If both legs price successfully and the computed
+        max_profit/net_debit ratio is below this, the returned plan
+        still contains the full pricing (never silently hidden) but
+        `reasons` carries an explicit below-threshold flag so the
+        caller can filter it out — this function ranks/reports, it
+        does not gate (same soft-fail convention as
+        qualification_score() elsewhere in this module).
+
+    Raises
+    ------
+    ValueError
+        order_block is None, dir_ contradicts order_block.direction,
+        or liquidity_target_price is on the wrong side of the OB.
+    ChainDataError
+        Either leg has no priced strike in the chain within the
+        default search radius.
+    """
+    if order_block is None:
+        raise ValueError("build_debit_spread requires a real OrderBlock, got None")
+    expected_dir = CE if order_block.direction == BULLISH else PE
+    if dir_ != expected_dir:
+        raise ValueError(
+            f"dir_={dir_!r} contradicts order_block.direction={order_block.direction!r} "
+            f"(expected {expected_dir!r})"
+        )
+    if dir_ == CE and liquidity_target_price <= order_block.proximal:
+        raise ValueError(
+            f"liquidity_target_price ({liquidity_target_price}) must be above the OB proximal "
+            f"line ({order_block.proximal}) for a bull call spread"
+        )
+    if dir_ == PE and liquidity_target_price >= order_block.proximal:
+        raise ValueError(
+            f"liquidity_target_price ({liquidity_target_price}) must be below the OB proximal "
+            f"line ({order_block.proximal}) for a bear put spread"
+        )
+
+    long_strike = _nearest_priced_strike(order_block.proximal, chain, dir_)
+    short_strike = _nearest_priced_strike(liquidity_target_price, chain, dir_)
+    if long_strike == short_strike:
+        raise ChainDataError(
+            f"Long and short legs resolved to the same strike ({long_strike}) — chain "
+            f"strike_interval ({chain.strike_interval}) is too coarse for this OB/target pair"
+        )
+
+    long_row = chain.strike_premiums.get(long_strike) or chain.strike_premiums.get(round(long_strike, 2))
+    short_row = chain.strike_premiums.get(short_strike) or chain.strike_premiums.get(round(short_strike, 2))
+    long_quote = PremiumQuote.from_chain_row(long_row or {}, dir_)
+    short_quote = PremiumQuote.from_chain_row(short_row or {}, dir_)
+
+    reasons: list[str] = []
+    net_debit = max_profit = rr = None
+    if long_quote.ltp is None:
+        reasons.append(f"Missing {dir_} premium quote for long strike {long_strike}")
+    if short_quote.ltp is None:
+        reasons.append(f"Missing {dir_} premium quote for short strike {short_strike}")
+
+    if long_quote.ltp is not None and short_quote.ltp is not None:
+        net_debit = round(long_quote.ltp - short_quote.ltp, 2)
+        width = abs(short_strike - long_strike)
+        max_profit = round(width - net_debit, 2) if net_debit is not None else None
+        if net_debit and net_debit > 0 and max_profit is not None:
+            rr = round(max_profit / net_debit, 2)
+            if rr < min_risk_reward:
+                reasons.append(
+                    f"R:R {rr} below min_risk_reward {min_risk_reward} — structural levels "
+                    f"don't support a favorable spread at this width"
+                )
+        elif net_debit is not None and net_debit <= 0:
+            reasons.append(
+                f"Net debit {net_debit} <= 0 — short leg premium exceeds long leg; not a debit spread"
+            )
+
+    return DebitSpreadPlan(
+        symbol=sig.symbol,
+        direction=dir_,
+        long_strike=long_strike,
+        short_strike=short_strike,
+        long_premium=long_quote.ltp,
+        short_premium=short_quote.ltp,
+        net_debit=net_debit,
+        max_profit=max_profit,
+        risk_reward_ratio=rr,
+        structural_stop_price=order_block.distal,
+        liquidity_target_price=liquidity_target_price,
+        reasons=reasons,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
 #  STAGE 6 — Premium Validation (Improvement #4: real bid/ask/volume/
 #  OI/last-trade-time contract, LTP-vs-close kept only as a fallback)
 # ══════════════════════════════════════════════════════════════════
@@ -1372,10 +1706,23 @@ def compute_dore_trade_plan(
     iv: Optional[IVContext] = None,
     high_prices: Optional[Sequence[float]] = None,
     low_prices: Optional[Sequence[float]] = None,
+    open_prices: Optional[Sequence[float]] = None,
 ):
     """Runs the full pipeline for one symbol and returns an
     OptionTradePlan (default output, Improvement #9) or a
     DoreRejection for the small set of hard-reject failures only.
+
+    open_prices : [Structural strike wiring, 2026-08-15] optional —
+        needed ONLY for the Order-Block-anchored structural strike
+        read (utils.smc_engine.detect_order_blocks() needs a candle's
+        open to classify it bull/bear). Omitting it does not reject
+        the plan — select_strikes()'s existing volatility-based
+        selection is unaffected either way; the plan's structural_state
+        is simply set to "STRUCTURAL_DATA_UNAVAILABLE" and
+        conservative/primary/aggressive strikes stay exactly as
+        select_strikes() already produced them (Section 11: explicit
+        safe state, never a silent fallback AND never a fabricated
+        structural level).
     """
     settings = settings or DORE_OPTIONS_DEFAULTS
     sig = MasterScannerSignal.from_scan_row(
@@ -1395,6 +1742,77 @@ def compute_dore_trade_plan(
     chain = OptionChainSnapshot.from_upstox(option_data, dte)
 
     strikes = select_strikes(sig, dte, dir_, confidence, settings, strike_interval=chain.strike_interval, iv=iv)
+    _pre_structural_conservative_strike = strikes[CONSERVATIVE]["strike"]
+
+    # ── STRUCTURAL STRIKE ANCHOR [2026-08-15 SG request, DORE §9] ──────
+    # Overrides ONLY the Conservative strike (the existing 3-tier
+    # system's closest-to-spot candidate — the natural analog of "the
+    # long strike" the spec asks to anchor) with the freshest bullish/
+    # bearish Order Block's proximal line, when one is available and
+    # not mitigated. select_strikes()'s Balanced/Aggressive candidates
+    # and its own Conservative fallback value are left completely
+    # untouched — this never rewrites select_strikes() itself (Section
+    # 6/14: preserve existing Entry Quality / avoid broad rewrites),
+    # it only substitutes one already-existing candidate's strike
+    # number before _build_candidate() prices it against the real chain.
+    #
+    # Explicit safe states (Section 11) — never a silent fallback and
+    # never a fabricated level:
+    #   STRUCTURAL_DATA_UNAVAILABLE : no open_prices given, or no OB
+    #                                  exists for this direction/window.
+    #                                  strikes[CONSERVATIVE] left as
+    #                                  select_strikes()'s own value.
+    #   STRUCTURAL_INVALIDATION     : an OB exists but is mitigated —
+    #                                  its proximal line is a dead
+    #                                  reference, not used as an anchor.
+    #                                  strikes[CONSERVATIVE] left as
+    #                                  select_strikes()'s own value;
+    #                                  structural_state surfaces this
+    #                                  so callers can choose to reject
+    #                                  the whole plan on it.
+    _structural_state = "STRUCTURAL_DATA_UNAVAILABLE"
+    _structural_reason = "no_open_prices" if open_prices is None else "insufficient_bars"
+    _ob_for_dir = None
+    _structural_decision = None
+    if open_prices is not None and len(open_prices) >= 5 and high_prices and low_prices:
+        try:
+            from utils.smc_engine import (
+                detect_order_blocks, compute_smc_state, classify_structural_state,
+                BULLISH as _SMC_BULLISH, BEARISH as _SMC_BEARISH,
+                STRUCTURAL_INVALIDATION as _SI, STRUCTURAL_VALID_ENTRY_ZONE as _VEZ,
+            )
+            n_ = min(len(open_prices), len(high_prices), len(low_prices), len(close_prices))
+            _ob_df = pd.DataFrame({
+                "open":  list(open_prices)[-n_:], "high": list(high_prices)[-n_:],
+                "low":   list(low_prices)[-n_:],   "close": list(close_prices)[-n_:],
+            })
+            _thesis_dir = _SMC_BULLISH if dir_ == CE else _SMC_BEARISH
+            _bull_obs, _bear_obs = detect_order_blocks(_ob_df, lb=min(20, max(2, n_ // 4)))
+            _ob_for_dir = (_bull_obs if _thesis_dir == _SMC_BULLISH else _bear_obs)[-1]
+            _smc_states = compute_smc_state(_ob_df, lb=min(20, max(2, n_ // 4)))
+            _smc_latest = _smc_states[-1] if _smc_states else None
+            _structural_decision = classify_structural_state(
+                _smc_latest, order_block=_ob_for_dir, thesis_direction=_thesis_dir,
+            )
+            _structural_state = _structural_decision.state
+            _structural_reason = _structural_decision.reason
+            if _ob_for_dir is not None and _structural_state not in (_SI,):
+                # Anchor Conservative to the OB proximal line — walk to
+                # the nearest strike the chain actually prices, same
+                # helper build_debit_spread()/select_structural_long_
+                # strike() already use, so this never selects an
+                # unavailable/non-tradable strike (Section 9's explicit
+                # requirement).
+                try:
+                    _anchor_strike = _nearest_priced_strike(_ob_for_dir.proximal, chain, dir_)
+                    strikes[CONSERVATIVE] = {**strikes[CONSERVATIVE], "strike": _anchor_strike}
+                except ChainDataError:
+                    pass   # chain has nothing near the anchor -- keep select_strikes()'s own value, don't fabricate one
+        except Exception:
+            _structural_state = "STRUCTURAL_DATA_UNAVAILABLE"
+            _structural_reason = "structural_read_failed"
+            _ob_for_dir = None
+            _structural_decision = None
 
     candidates: dict[str, StrikeCandidate] = {}
     all_reasons: list[str] = []
@@ -1511,6 +1929,18 @@ def compute_dore_trade_plan(
         cv4_smc_evidence_tier=sig.cv4_smc_evidence_tier,
         cv4_smc_state=sig.cv4_smc_state,
         cv4_smc_fvg_retest=sig.cv4_smc_fvg_retest,
+        # [Structural strike wiring, 2026-08-15]
+        structural_state=_structural_state,
+        structural_reason=_structural_reason,
+        structural_anchor_strike=(
+            _ob_for_dir.proximal if (_ob_for_dir is not None and strikes[CONSERVATIVE]["strike"] != _pre_structural_conservative_strike)
+            else None
+        ),
+        ob_proximal=_ob_for_dir.proximal if _ob_for_dir is not None else None,
+        ob_distal=_ob_for_dir.distal if _ob_for_dir is not None else None,
+        structural_invalidation_level=(
+            _structural_decision.invalidation_level if _structural_decision is not None else None
+        ),
     )
 
 

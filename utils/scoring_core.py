@@ -408,6 +408,13 @@ class BarResult:
     # None smc_state as SMC-NEUTRAL/tier-0, never as an error.
     smc_state: object = None   # Optional["utils.smc_engine.SMCState"] — object to avoid a hard import cycle
 
+    # [Structural gate wiring, 2026-08-15] freshest BULLISH OrderBlock for
+    # this symbol/bar (utils.smc_engine.detect_order_blocks()'s bull_obs
+    # series, latest entry), when scanner_engine.py's SMC block computed
+    # one. Same None-is-neutral convention as smc_state above — a symbol
+    # with no active Order Block is the common case, not an error.
+    order_block: object = None   # Optional["utils.smc_engine.OrderBlock"]
+
     # Recent volatility expansion ratio — recent-ATR / baseline-ATR.
     # 1.0 = neutral/no expansion (the default below). NOT YET populated by
     # compute_bar()'s indicator pipeline as of Phase 2/3; consumers

@@ -458,6 +458,27 @@ def _conviction(r: "BarResult") -> tuple[int, dict]:
 
 def _smc_entry_confirmation_adjustment(smc_state) -> int:
     """
+    [SUPERSEDED, 2026-08-15 SG request — "SMC must not simply be another
+    additive scoring component... it should act as a structural
+    validity/state layer after Base Entry Quality."] This function was
+    the SECONDARY production role of SMC from 2026-08-14: a small,
+    bounded (-2..+11) additive adjustment folded into Entry Quality.
+    That created exactly the double-counting risk the 2026-08-15
+    architecture review flagged — the same SMC evidence would otherwise
+    influence both the SCORE (here) and the new structural GATE
+    (utils.smc_engine.classify_structural_state(), applied after the
+    final tier ladder in scanner_engine.py). Per that review's explicit
+    instruction ("Prefer Base Score = quality of setup; SMC State =
+    structural permission/restriction... rather than Base Score + SMC
+    Score"), this function is now a permanent no-op — kept (not
+    deleted) only so _entry_quality()'s call site and this function's
+    existing test coverage don't need to change, and so the bounded
+    -2..+11 behavior this docstring describes below is still documented
+    for anyone diffing against pre-2026-08-15 history. The single
+    source of truth for SMC's effect on a live Recommendation is now
+    STRUCTURAL_ACTION in utils/smc_engine.py.
+
+    ── Original docstring (2026-08-14), kept for historical reference ──
     SECONDARY production role of SMC (explicit user direction, 2026-08-14):
     a small, BOUNDED confirmation adjustment to CV1's Entry Quality —
     never a replacement of the existing frozen ladder, never large enough
@@ -499,19 +520,10 @@ def _smc_entry_confirmation_adjustment(smc_state) -> int:
     smc_state is None, evidence_tier == 0, state == CONFLICT, or
     direction != BULLISH -> 0 (exact no-op in every one of these cases).
     """
-    if smc_state is None:
-        return 0
-    if smc_state.state == "CONFLICT":
-        return 0   # ambiguous evidence -> no opinion, not a penalty
-    if smc_state.direction != "BULLISH":
-        return 0   # CV1 is long-only; non-bullish SMC direction is not a
-                   # confirmation signal for a long entry, but also not
-                   # automatically disqualifying -- stay neutral, don't gate
-    if smc_state.evidence_tier == 0:
-        return 0   # no meaningful evidence either way -- the common case,
-                   # must be a true no-op, not a penalty (see docstring)
-    score = smc_entry_structure_score(smc_state)   # 0-25, tier>=1 guaranteed here
-    return round((score - 4) * 0.5)
+    return 0   # [2026-08-15] permanently neutralized — see docstring above
+               # for the full original bounded-adjustment logic this used
+               # to run; superseded by utils.smc_engine.classify_structural_
+               # state() as the sole SMC-to-recommendation mechanism.
 
 
 def _entry_quality(r: "BarResult", smc_state=None) -> tuple[int, dict]:
