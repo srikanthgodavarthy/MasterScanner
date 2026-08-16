@@ -2202,6 +2202,22 @@ def score_stock(
     try:
         category = result.get("Recommendation", result.get("Category", "Avoid"))
         blocker = _primary_blocker(r, result)
+        # [Fix, 2026-08-16] When the SMC structural gate actually capped
+        # this row's Recommendation (state isn't VALID_ENTRY_ZONE, i.e.
+        # apply_smc_structural_gate() changed something), that reason
+        # belongs in front of whatever CV1/DE blocker text already
+        # existed — the structural cap is the reason a trader's own
+        # score didn't clear, so it's the primary explanation. Previously
+        # SMC_Structural_State/_Reason were computed and written to the
+        # row but never surfaced anywhere in the UI — a trader could see
+        # a Watch-capped stock with zero explanation.
+        _smc_state = result.get("SMC_Structural_State")
+        _smc_reason = result.get("SMC_Structural_Reason")
+        if _smc_state and _smc_state != "VALID_ENTRY_ZONE":
+            _smc_text = f"SMC {_smc_state.replace('_', ' ').title()}"
+            if _smc_reason:
+                _smc_text += f" ({_smc_reason.replace('_', ' ')})"
+            blocker = f"{_smc_text} · {blocker}" if blocker else _smc_text
         result["Primary Blocker"] = blocker if category not in ("Elite Opportunity", "High Conviction", "Actionable") else ""
     except Exception:
         pass

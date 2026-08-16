@@ -333,8 +333,18 @@ def top_dore_trade_plans(
             closes = df["close"].tail(max(ohlcv_bars, 30)).tolist() if "close" in df else []
             highs = df["high"].tail(max(ohlcv_bars, 30)).tolist() if "high" in df else None
             lows = df["low"].tail(max(ohlcv_bars, 30)).tolist() if "low" in df else None
+            # [Fix, 2026-08-16] opens was never extracted — meant
+            # open_prices=None reached compute_dore_trade_plan() on every
+            # call, which forces structural_state="STRUCTURAL_DATA_
+            # UNAVAILABLE" unconditionally (detect_order_blocks() needs
+            # a candle's open to classify it bull/bear). The OB-anchored
+            # strike selection wired 2026-08-15 was therefore dead in
+            # production — every live plan fell through to select_
+            # strikes()'s pre-existing volatility-based Conservative
+            # value regardless of what structure actually looked like.
+            opens = df["open"].tail(max(ohlcv_bars, 30)).tolist() if "open" in df else None
         else:
-            closes, highs, lows = [], None, None
+            closes, highs, lows, opens = [], None, None, None
 
         if not closes:
             rejections.append(DoreRejection(symbol, "Stage2_EMA_Momentum", "No OHLCV history available"))
@@ -348,7 +358,7 @@ def top_dore_trade_plans(
         result = compute_dore_trade_plan(
             scan_row, closes, option_data, dte=dte, settings=settings,
             symbol=symbol, market_regime=regime, iv=iv_ctx,
-            high_prices=highs, low_prices=lows,
+            high_prices=highs, low_prices=lows, open_prices=opens,
         )
         if isinstance(result, OptionTradePlan):
             # [2026-08-08, SG request] "PB" when this symbol only made

@@ -703,11 +703,21 @@ class OptionTradePlan:
     expiry:               str
     dte:                  int
 
-    primary:              StrikeCandidate      # Balanced — the default trade
+    primary:              StrikeCandidate      # Balanced, UNLESS is_structurally_anchored is
+                                                 # True — then this IS the OB-anchored Conservative
+                                                 # candidate (see is_structurally_anchored below)
     conservative:         StrikeCandidate
     aggressive:           StrikeCandidate
 
     entry_zone:           tuple                # (low, high) premium band
+    # [2026-08-16] SECONDARY CAPITAL PROTECTION STOP — a fixed % loss on
+    # the option's own premium (settings.stop_loss_premium_pct),
+    # independent of the underlying's price structure. This is a risk
+    # ceiling, not the thesis check — see structural_invalidation_level
+    # below for the PRIMARY THESIS STOP. A position can hit this stop
+    # while the underlying structure is still fully intact (elevated IV/
+    # theta decay), and can survive well past a premium-only stop while
+    # the underlying has already broken structure the wrong way.
     stop_loss:            Optional[float]
     target1:              Optional[float]
     target2:              Optional[float]
@@ -797,8 +807,26 @@ class OptionTradePlan:
     structural_state:          Optional[str]   = None
     structural_reason:         Optional[str]   = None
     structural_anchor_strike:  Optional[float] = None
+    # [Fix, 2026-08-16] Explicit flag — True only when `primary` itself
+    # IS the structurally-anchored candidate (Conservative, anchored to
+    # OB proximal). Previously a caller had to infer this by comparing
+    # structural_anchor_strike to primary.strike; this makes "is the
+    # recommended trade actually structure-anchored" a direct read.
+    is_structurally_anchored:  bool            = False
     ob_proximal:                Optional[float] = None
     ob_distal:                  Optional[float] = None
+    # [2026-08-16] PRIMARY THESIS STOP — the underlying-price level (OB
+    # distal line) whose breach means the structural thesis this trade
+    # was anchored to is dead, independent of stop_loss's premium-%
+    # ceiling above. Populated whenever an Order Block was found for
+    # this direction (ob_distal, verbatim) — not only when it has
+    # already been breached; a still-valid plan surfaces this so a
+    # caller (portfolio monitoring, UI) can watch for the underlying
+    # reaching it as an exit trigger distinct from the option's own
+    # premium stop. If the underlying already breached it at plan-
+    # creation time, STRUCTURAL_INVALIDATION rejects the plan outright
+    # (see the rejection check above) — this field is never populated
+    # on an already-dead thesis, only on a live one to watch.
     structural_invalidation_level: Optional[float] = None
 
     def to_dict(self) -> dict:
@@ -1765,11 +1793,12 @@ def compute_dore_trade_plan(
     #   STRUCTURAL_INVALIDATION     : an OB exists but is mitigated —
     #                                  its proximal line is a dead
     #                                  reference, not used as an anchor.
-    #                                  strikes[CONSERVATIVE] left as
-    #                                  select_strikes()'s own value;
-    #                                  structural_state surfaces this
-    #                                  so callers can choose to reject
-    #                                  the whole plan on it.
+    #                                  [Fix, 2026-08-16] This now REJECTS
+    #                                  the whole plan (DoreRejection,
+    #                                  below) rather than merely being
+    #                                  surfaced as a diagnostic field —
+    #                                  see the rejection check right
+    #                                  after this block.
     _structural_state = "STRUCTURAL_DATA_UNAVAILABLE"
     _structural_reason = "no_open_prices" if open_prices is None else "insufficient_bars"
     _ob_for_dir = None
@@ -1814,6 +1843,43 @@ def compute_dore_trade_plan(
             _ob_for_dir = None
             _structural_decision = None
 
+    # [Fix, 2026-08-16] STRUCTURAL_INVALIDATION must actually reject the
+    # plan, not just populate a diagnostic field. Previously the code
+    # computed and stored structural_state/ob_distal/structural_
+    # invalidation_level but still proceeded to build and return a full
+    # OptionTradePlan regardless — a mitigated Order Block (the thesis
+    # this whole structural anchor exists to validate) had zero effect
+    # on whether the plan actually got recommended. This makes DORE
+    # symmetric with the Live Scanner gate, where STRUCTURAL_INVALIDATION
+    # already forces Skip regardless of score (apply_smc_structural_gate()
+    # in scanner_engine.py). Only fires when the structural read actually
+    # ran and produced a real STRUCTURAL_INVALIDATION verdict — never for
+    # STRUCTURAL_DATA_UNAVAILABLE (open_prices missing/insufficient),
+    # which is deliberately a silent no-op, not a rejection.
+    if _structural_state == "STRUCTURAL_INVALIDATION":
+        return DoreRejection(
+            sig.symbol, "StructuralInvalidation",
+            f"Order Block distal line breached (proximal={_ob_for_dir.proximal:.2f}, "
+            f"distal={_ob_for_dir.distal:.2f}) — structural thesis invalidated"
+            if _ob_for_dir is not None else "Structural thesis invalidated",
+        )
+
+    # [Fix, 2026-08-16 — Option A] When the structural anchor was actually
+    # applied to Conservative (an unmitigated OB existed and anchoring
+    # succeeded against the real chain), CONSERVATIVE becomes the PRIMARY
+    # recommendation — entry zone, stop, targets, POP, and R:R all derive
+    # from the structurally-anchored strike, not from Balanced's own
+    # independent volatility-based value. Previously the OB anchor only
+    # ever touched the Conservative candidate while `primary` stayed
+    # hardcoded to Balanced, so the anchor had no effect on the actual
+    # recommended trade at all — this was the single biggest gap in the
+    # 2026-08-15 wiring. Falls back to Balanced exactly as before whenever
+    # no anchor was applied (STRUCTURAL_DATA_UNAVAILABLE, no OB for this
+    # direction, or STRUCTURAL_INVALIDATION — which now rejects the plan
+    # outright above, so it never reaches this line anyway).
+    _anchor_applied = strikes[CONSERVATIVE]["strike"] != _pre_structural_conservative_strike
+    _primary_label = CONSERVATIVE if _anchor_applied else BALANCED
+
     candidates: dict[str, StrikeCandidate] = {}
     all_reasons: list[str] = []
     primary_premium_quality = primary_oi_quality = 0.0
@@ -1826,7 +1892,7 @@ def compute_dore_trade_plan(
         candidates[label] = candidate
         if ok:
             any_ok = True
-        if label == BALANCED:
+        if label == _primary_label:
             primary_premium_quality, primary_oi_quality = premium_quality, oi_quality
             primary_quote = quote
             all_reasons.extend(reasons)
@@ -1834,10 +1900,10 @@ def compute_dore_trade_plan(
     if not any_ok:
         return DoreRejection(sig.symbol, "NoLiquidity", "No candidate strike cleared premium/OI liquidity checks")
 
-    expiry_suit = _expiry_suitability(dte, candidates[BALANCED].probability_of_profit)
+    expiry_suit = _expiry_suitability(dte, candidates[_primary_label].probability_of_profit)
     score = final_score(sig, mom, primary_oi_quality, expiry_suit, primary_premium_quality, settings)
 
-    primary = candidates[BALANCED]
+    primary = candidates[_primary_label]
     entry_low = entry_high = None
     if primary.premium:
         entry_low = round(primary.premium * (1 - settings.entry_zone_band_pct), 2)
@@ -1865,7 +1931,8 @@ def compute_dore_trade_plan(
          f"Blended Conviction {sig.conviction:.0f}", f"Entry Quality {sig.entry_quality:.0f}",
          f"Qualification Score {qual_score:.0f}"]
         + direction_reasons
-        + [f"Expected Move supports {primary.strike:g} {dir_} (Balanced)"]
+        + [f"Expected Move supports {primary.strike:g} {dir_} "
+           f"({'Structural anchor' if _anchor_applied else 'Balanced'})"]
         + all_reasons
     )
 
@@ -1929,13 +1996,11 @@ def compute_dore_trade_plan(
         cv4_smc_evidence_tier=sig.cv4_smc_evidence_tier,
         cv4_smc_state=sig.cv4_smc_state,
         cv4_smc_fvg_retest=sig.cv4_smc_fvg_retest,
-        # [Structural strike wiring, 2026-08-15]
+        # [Structural strike wiring, 2026-08-15; primary promotion 2026-08-16]
         structural_state=_structural_state,
         structural_reason=_structural_reason,
-        structural_anchor_strike=(
-            _ob_for_dir.proximal if (_ob_for_dir is not None and strikes[CONSERVATIVE]["strike"] != _pre_structural_conservative_strike)
-            else None
-        ),
+        structural_anchor_strike=_ob_for_dir.proximal if _anchor_applied else None,
+        is_structurally_anchored=_anchor_applied,
         ob_proximal=_ob_for_dir.proximal if _ob_for_dir is not None else None,
         ob_distal=_ob_for_dir.distal if _ob_for_dir is not None else None,
         structural_invalidation_level=(
