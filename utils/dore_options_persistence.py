@@ -357,6 +357,27 @@ class DoreOptionsPlan:
     last_premium:        Optional[float] = None
     last_seen_at:         str   = ""
 
+    # [MFE/MAE tracking] Maximum Favorable/Adverse Excursion — the best
+    # and worst premium this contract has actually traded at since entry
+    # triggered (i.e. since entry_locked was frozen), independent of
+    # where it currently sits. Long-premium-position math throughout
+    # this module treats a HIGHER premium as favorable for both CE and
+    # PE (you're long the option either way) — same convention
+    # last_drift_pct/_fmt_pnl already use — so mfe_premium is a running
+    # MAX and mae_premium a running MIN of every current_premium
+    # observed while is_active(). Both start unset (None) until the
+    # first ACTIVE cycle, then are seeded from entry_locked and updated
+    # from there — see _update_mfe_mae(). Like last_premium, these are
+    # a "last known extreme" (only updated on cycles this contract is
+    # actually reproduced), never fabricated. Frozen the instant the
+    # plan CLOSES (updated one final time on the closing tick's premium,
+    # then never touched again) — a historical fact about the trade's
+    # life, matching t1_hit_at's sticky pattern.
+    mfe_premium:         Optional[float] = None
+    mfe_at:               str   = ""
+    mae_premium:         Optional[float] = None
+    mae_at:               str   = ""
+
     status:              str   = DoreOptionsPlanStatus.TRACKED
     closed_at:           str   = ""
     closed_reason:       str   = ""
@@ -474,6 +495,16 @@ class DoreOptionsPlan:
             "entry_underlying":    self.entry_underlying,
             "last_premium":        self.last_premium,
             "last_seen_at":        self.last_seen_at or None,
+            # [MFE/MAE tracking] Additive-only, nullable — see the
+            # dataclass field comments above. mfe_at/mae_at are "" (not
+            # None) to match every other *_at text/timestamp column's
+            # existing empty-default convention in this same dict
+            # (entry_triggered_at, t1_hit_at) rather than introducing a
+            # new nullability style just for these two.
+            "mfe_premium":         self.mfe_premium,
+            "mfe_at":              self.mfe_at or None,
+            "mae_premium":         self.mae_premium,
+            "mae_at":              self.mae_at or None,
             "status":              _sval(self.status),
             "closed_at":           self.closed_at or None,
             "closed_reason":       self.closed_reason,
@@ -623,6 +654,58 @@ def _drift_pct(current_premium: Optional[float], entry_locked: Optional[float]) 
         return round((current_premium - entry_locked) / entry_locked * 100, 2)
     except Exception:
         return None
+
+
+def _mfe_mae_pct(extreme_premium: Optional[float], entry_locked: Optional[float]) -> Optional[float]:
+    """Same numerator/denominator convention as _drift_pct — % move of
+    the MFE/MAE premium off the frozen entry_locked. Kept as a separate
+    derived helper (not stored) rather than persisting mfe_pct/mae_pct
+    columns alongside mfe_premium/mae_premium, matching this module's
+    existing "derive at read time" pattern for last_drift_pct."""
+    return _drift_pct(extreme_premium, entry_locked)
+
+
+def _update_mfe_mae(locked: "DoreOptionsPlan", current_premium: Optional[float]) -> None:
+    """Updates locked.mfe_premium/mae_premium (running max/min) from
+    this cycle's current_premium, in place. Call once per cycle for
+    every ACTIVE plan, BEFORE any exit-check branch below (so the tick
+    that actually triggers a close is still captured as this trade's
+    final MFE/MAE candidate — same reasoning as last_premium being
+    updated ahead of the close-event branches).
+
+    Long-premium-position convention (see class docstring): a HIGHER
+    premium is favorable for both CE and PE, so mfe_premium is a
+    running MAX and mae_premium a running MIN. Seeded from entry_locked
+    on the first ACTIVE tick (a trade's own entry is neither favorable
+    nor adverse yet — it's the starting point both extremes are
+    measured from), then only ever widened, never narrowed.
+
+    No-op (leaves both fields untouched) when current_premium is None
+    this cycle — same "don't blank out a perfectly good previous
+    reading on a transient miss" rule last_premium already follows —
+    or when entry_locked isn't set yet (shouldn't happen inside an
+    is_active() branch, but fails soft rather than seeding from a
+    missing entry).
+    """
+    if current_premium is None:
+        return
+    try:
+        current_premium = float(current_premium)
+        if locked.mfe_premium is None or locked.mae_premium is None:
+            seed = float(locked.entry_locked) if locked.entry_locked is not None else current_premium
+            if locked.mfe_premium is None:
+                locked.mfe_premium = seed
+            if locked.mae_premium is None:
+                locked.mae_premium = seed
+        if current_premium > float(locked.mfe_premium):
+            locked.mfe_premium = current_premium
+            locked.mfe_at = _now_iso()
+        if current_premium < float(locked.mae_premium):
+            locked.mae_premium = current_premium
+            locked.mae_at = _now_iso()
+    except Exception:
+        logger.exception("[dore_options_persistence] _update_mfe_mae failed for %s — left untouched this cycle",
+                          getattr(locked, "plan_id", "?"))
 
 
 def _plan_status_label(days_active: int, created_date: str, just_minted: bool, created_at: str = "") -> str:
@@ -1067,6 +1150,14 @@ def enrich_trade_plans_with_persistence(
             drift = _drift_pct(current_premium, locked.entry_locked)
 
             if locked.is_active():
+                # [MFE/MAE tracking] Updated first, ahead of every exit-
+                # check branch below, so a cycle that closes the plan
+                # (structural invalidation / SL / T2 / age-out) still
+                # gets this tick's premium folded into the trade's final
+                # MFE/MAE before status flips to CLOSED. See
+                # _update_mfe_mae()'s own docstring.
+                _update_mfe_mae(locked, current_premium)
+
                 # [Structural SMC trade geometry, 2026-08-16, DORE §3]
                 # Distal-line thesis invalidation — an ADDITIONAL,
                 # independent exit alongside the existing premium stop-
@@ -1401,6 +1492,16 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
                 "saved_target2": plan.target2_locked,
                 "last_premium": plan.last_premium,
                 "last_drift_pct": _drift_pct(plan.last_premium, plan.entry_locked),
+                # [MFE/MAE tracking] mfe_pct/mae_pct derived here at read
+                # time from the persisted extremes, same pattern as
+                # last_drift_pct above — see _mfe_mae_pct()'s docstring.
+                # Naturally None for anything not yet ACTIVE, same as
+                # entry_locked/last_drift_pct (no entry yet to measure
+                # an excursion from).
+                "mfe_premium": plan.mfe_premium,
+                "mfe_pct": _mfe_mae_pct(plan.mfe_premium, plan.entry_locked),
+                "mae_premium": plan.mae_premium,
+                "mae_pct": _mfe_mae_pct(plan.mae_premium, plan.entry_locked),
                 "last_seen_at": plan.last_seen_at,
                 "created_date": plan.created_date,
                 "plan_age_days": days_active,

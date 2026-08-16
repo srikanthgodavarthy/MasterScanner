@@ -1056,6 +1056,13 @@ def _dore_options_plan_from_row(row: dict) -> "object":
         entry_underlying     = row.get("entry_underlying"),
         last_premium         = row.get("last_premium"),
         last_seen_at         = str(row.get("last_seen_at", "") or ""),
+        # [MFE/MAE tracking] Absent on rows written before this
+        # migration; reads back as None/"" for those, same additive-
+        # only pattern as every other post-hoc column above.
+        mfe_premium          = row.get("mfe_premium"),
+        mfe_at               = str(row.get("mfe_at", "") or ""),
+        mae_premium          = row.get("mae_premium"),
+        mae_at               = str(row.get("mae_at", "") or ""),
         # [2026-08-12] A legacy row's status column literally says
         # 'OPEN' — DoreOptionsPlan.is_active()/is_open() both already
         # treat that value as equivalent to ACTIVE (see
@@ -1762,6 +1769,12 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
 
     last_premium                 numeric(12,2),
     last_seen_at                  timestamptz,
+    -- [MFE/MAE tracking] see DORE_OPTIONS_PLANS_MFE_MAE_MIGRATION_SQL
+    -- below for the ALTER TABLE form against an existing deployment.
+    mfe_premium                   numeric(12,2),
+    mfe_at                        timestamptz,
+    mae_premium                   numeric(12,2),
+    mae_at                        timestamptz,
 
     -- [2026-08-12] TRACKED / WAITING_FOR_ENTRY / ENTRY_READY /
     -- IN_ENTRY_ZONE / ACTIVE / CLOSED (legacy rows may still say OPEN —
@@ -1835,6 +1848,20 @@ ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS t1_hit_at timestamptz;
 
 DORE_OPTIONS_PLANS_ENTRY_UNDERLYING_MIGRATION_SQL = """
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS entry_underlying numeric(12,2);
+"""
+
+# [MFE/MAE tracking] Run once against an existing dore_options_plans
+# table. Purely additive/nullable — no existing row or query is
+# affected; every pre-existing OPEN row simply has these four columns
+# NULL until its next refresh cycle, at which point _update_mfe_mae()
+# seeds them from that row's own entry_locked (see that function's
+# docstring) — never backfilled/fabricated for cycles that already
+# passed.
+DORE_OPTIONS_PLANS_MFE_MAE_MIGRATION_SQL = """
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS mfe_premium numeric(12,2);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS mfe_at      timestamptz;
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS mae_premium numeric(12,2);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS mae_at      timestamptz;
 """
 
 DORE_OPTIONS_PLANS_CV4_MIGRATION_SQL = """
