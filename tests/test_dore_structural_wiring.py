@@ -169,24 +169,59 @@ def test_structural_anchor_applied_when_fresh_unmitigated_ob_exists():
     assert plan.ob_distal < plan.ob_proximal   # bullish OB: distal (low) below proximal
 
 
-def test_structural_invalidation_never_used_as_anchor():
-    """When the freshest OB is mitigated, structural_anchor_strike must
-    stay None (Section 11: never anchor to a broken structural level),
-    even though ob_proximal/ob_distal are still surfaced for diagnostics.
-    Verifies the OB is actually still DETECTED (proximal/distal present)
-    but marked mitigated -- not just silently absent, which would make
-    this test pass vacuously."""
-    open_, high, low, close, ob_low = _mitigated_bull_ob_ohlc(n=61)
+def test_primary_recommendation_promoted_to_structural_anchor_not_balanced():
+    """[2026-08-16, Option A] When the anchor is applied, primary must
+    BE the anchored candidate (same strike as Conservative), not stay
+    hardcoded to Balanced -- this is the fix for the gap where the OB
+    anchor changed Conservative but the actual recommended trade
+    (entry/stop/targets/POP/R:R) kept coming from an unrelated Balanced
+    strike."""
+    open_, high, low, close, ob_low = _bull_ob_ohlc(n=60)
     row = _base_row(close[-1], bullish=True)
     plan = compute_dore_trade_plan(
         row, close, _option_data_for(close[-1]), dte=14, symbol="TESTCO", market_regime="bullish",
         high_prices=high, low_prices=low, open_prices=open_,
     )
     assert isinstance(plan, OptionTradePlan), f"got rejection: {plan}"
-    assert plan.structural_state == "STRUCTURAL_INVALIDATION", plan.structural_state
-    assert plan.ob_proximal is not None    # still surfaced for diagnostics
-    assert plan.ob_distal is not None
-    assert plan.structural_anchor_strike is None   # never anchored to a broken level
+    assert plan.is_structurally_anchored is True
+    assert plan.primary.strike == plan.conservative.strike
+    assert plan.primary.strike != plan.aggressive.strike   # sanity: not a degenerate all-equal chain
+    # Entry/stop/targets must derive from THIS strike's real premium,
+    # not silently from a different (Balanced) candidate's premium.
+    assert plan.entry_zone[0] is not None
+    assert plan.stop_loss is not None
+
+
+def test_primary_falls_back_to_balanced_when_not_anchored():
+    """No open_prices -> no anchor -> primary must stay Balanced, exactly
+    as before this fix -- confirms the promotion is conditional, not
+    unconditional."""
+    close = list(100 * (1.01 ** np.arange(60)))
+    row = _base_row(close[-1], bullish=True)
+    plan = compute_dore_trade_plan(
+        row, close, _option_data_for(close[-1]), dte=14, symbol="TESTCO", market_regime="bullish",
+    )
+    assert isinstance(plan, OptionTradePlan), f"got rejection: {plan}"
+    assert plan.is_structurally_anchored is False
+    assert plan.structural_anchor_strike is None
+
+
+def test_structural_invalidation_rejects_the_plan():
+    """[2026-08-16] STRUCTURAL_INVALIDATION now REJECTS the whole plan
+    (DoreRejection), not merely a diagnostic field on an OptionTradePlan
+    that still gets recommended. Confirms the OB was genuinely detected
+    (the rejection reason cites real proximal/distal numbers) rather
+    than silently absent, which would make this test pass vacuously."""
+    open_, high, low, close, ob_low = _mitigated_bull_ob_ohlc(n=61)
+    row = _base_row(close[-1], bullish=True)
+    plan = compute_dore_trade_plan(
+        row, close, _option_data_for(close[-1]), dte=14, symbol="TESTCO", market_regime="bullish",
+        high_prices=high, low_prices=low, open_prices=open_,
+    )
+    assert isinstance(plan, DoreRejection), f"expected rejection, got: {plan}"
+    assert plan.stage == "StructuralInvalidation"
+    assert "distal" in plan.reason.lower()
+    assert "99.4" in plan.reason   # the actual distal value, not a generic message
 
 
 def test_never_selects_a_strike_missing_from_the_chain():
@@ -265,11 +300,10 @@ def test_pe_side_structural_data_unavailable_without_open_prices():
     assert plan.structural_anchor_strike is None
 
 
-def test_pe_side_mitigation_visible_and_never_anchored():
-    """Mirror of test_structural_invalidation_never_used_as_anchor for
-    the bearish side -- a mitigated bearish OB (price closes back ABOVE
-    the distal/high line) must surface STRUCTURAL_INVALIDATION and never
-    be used as the strike anchor."""
+def test_pe_side_mitigation_also_rejects():
+    """Mirror of test_structural_invalidation_rejects_the_plan for the
+    bearish side -- a mitigated bearish OB (price closes back ABOVE the
+    distal/high line) must also reject, not just surface a diagnostic."""
     open_, high, low, close, ob_high = _bear_ob_ohlc(n=60)
     mitigate_close = ob_high + 2.0
     open_ = open_ + [close[-1]]
@@ -281,8 +315,5 @@ def test_pe_side_mitigation_visible_and_never_anchored():
         row, close, _option_data_for(close[-1]), dte=14, symbol="TESTCO", market_regime="bearish",
         high_prices=high, low_prices=low, open_prices=open_,
     )
-    assert isinstance(plan, OptionTradePlan), f"got rejection: {plan}"
-    if plan.direction == "PE":
-        assert plan.structural_state == "STRUCTURAL_INVALIDATION", plan.structural_state
-        assert plan.ob_proximal is not None
-        assert plan.structural_anchor_strike is None
+    assert isinstance(plan, DoreRejection), f"expected rejection, got: {plan}"
+    assert plan.stage == "StructuralInvalidation"
