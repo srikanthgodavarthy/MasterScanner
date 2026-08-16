@@ -122,6 +122,33 @@ def nearest_resistance(ph_causal: pd.Series, i: int, price: float,
 
 
 # ══════════════════════════════════════════════════════════════════
+#  1b. NEAREST SUPPORT  [Structural SMC trade geometry, 2026-08-16]
+#  Symmetric mirror of nearest_resistance() above, for the bearish/PE
+#  side of structural target discovery (utils.dore_options_engine's
+#  DORE §4 "Implement structural target discovery" — bearish liquidity
+#  target = nearest confirmed swing low below price). Added here rather
+#  than duplicated in dore_options_engine.py since it's the exact same
+#  causal-pivot contract as nearest_resistance(), just mirrored on
+#  price direction and the low/pl_causal series.
+# ══════════════════════════════════════════════════════════════════
+
+def nearest_support(pl_causal: pd.Series, i: int, price: float,
+                     lookback_bars: int = 252) -> float | None:
+    """
+    Closest confirmed-as-of-bar-i swing low strictly below `price`,
+    searched over the trailing `lookback_bars` window. None if no
+    qualifying pivot exists (e.g. price already below all recent lows —
+    genuinely no nearby underlying structure, not a data gap).
+    """
+    start = max(0, i - lookback_bars)
+    window = pl_causal.iloc[start:i + 1].dropna()
+    below = window[window < price]
+    if below.empty:
+        return None
+    return float(below.max())   # closest support = largest low below price
+
+
+# ══════════════════════════════════════════════════════════════════
 #  2. MEASURED MOVE
 # ══════════════════════════════════════════════════════════════════
 

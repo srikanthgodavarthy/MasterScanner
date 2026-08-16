@@ -11,11 +11,18 @@ fixture-builder shape this file borrows.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from utils.dore_options_engine import compute_dore_trade_plan, OptionTradePlan, DoreRejection
+from utils.dore_options_engine import (
+    compute_dore_trade_plan, OptionTradePlan, DoreRejection, DoreOptionsSettings,
+    _discover_structural_target, _validate_structural_geometry, _structural_premium_ceiling,
+    STRUCTURAL_TARGET_LIQUIDITY, STRUCTURAL_TARGET_FVG, STRUCTURAL_TARGET_TECHNICAL_FALLBACK,
+    CE, PE,
+)
 
 
 def _option_data_for(current_price, pcr=1.3):
@@ -317,3 +324,296 @@ def test_pe_side_mitigation_also_rejects():
     )
     assert isinstance(plan, DoreRejection), f"expected rejection, got: {plan}"
     assert plan.stage == "StructuralInvalidation"
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Structural SMC trade geometry (entry/invalidation/target/RR)
+#  [2026-08-16, DORE §3-§7] — fixtures below extend _bull_ob_ohlc/
+#  _bear_ob_ohlc with a retrace-then-rally (resp. bounce-then-selloff)
+#  leg so the series ends on a clean EMA9/21-confirmed CE (resp. PE)
+#  direction() read while price sits BELOW (resp. ABOVE) a second,
+#  confirmed swing pivot that acts as the liquidity target — i.e. a
+#  case where the structural target is still genuinely ahead of price,
+#  unlike _bull_ob_ohlc/_bear_ob_ohlc's own fixtures where the impulse
+#  leg already runs straight through any nearby swing structure.
+# ══════════════════════════════════════════════════════════════════
+
+def _bull_ob_settle_ohlc(lb=20, base=100.0, jump=103.0, dip=99.8,
+                          rally_end=101.3, rally_bars=30):
+    pivot_bar = 2 * lb
+    ob_bar = pivot_bar + lb + 2
+    close = [base + np.sin(i / 3) * 0.15 for i in range(ob_bar)]
+    open_ = [c - 0.03 for c in close]
+    high = [c + 0.15 for c in close]
+    low = [c - 0.15 for c in close]
+    close[pivot_bar] = base + 1.5; open_[pivot_bar] = base + 1.3
+    high[pivot_bar] = base + 1.6; low[pivot_bar] = base + 1.0
+    ob_open, ob_close = close[ob_bar - 1] + 0.1, close[ob_bar - 1] - 0.5
+    open_[ob_bar - 1], close[ob_bar - 1] = ob_open, ob_close
+    high[ob_bar - 1] = ob_open + 0.15
+    low[ob_bar - 1] = ob_close - 0.15
+    open_.append(ob_close + 0.2); close.append(jump)
+    high.append(jump + 0.3); low.append(open_[-1] - 0.1)
+    for k in range(lb):   # retrace down to `dip`
+        frac = (k + 1) / lb
+        c = jump + (dip - jump) * frac
+        open_.append(c + 0.03); close.append(c); high.append(c + 0.15); low.append(c - 0.15)
+    for k in range(rally_bars):   # rally back up to rally_end, below the pivot high
+        frac = (k + 1) / rally_bars
+        c = dip + (rally_end - dip) * frac
+        open_.append(c - 0.05); close.append(c); high.append(c + 0.15); low.append(c - 0.15)
+    return open_, high, low, close
+
+
+def _bear_ob_settle_ohlc(lb=20, base=100.0, jump=97.0, bounce=100.2,
+                          rally_end=98.7, rally_bars=30):
+    pivot_bar = 2 * lb
+    ob_bar = pivot_bar + lb + 2
+    close = [base + np.sin(i / 3) * 0.15 for i in range(ob_bar)]
+    open_ = [c + 0.03 for c in close]
+    high = [c + 0.15 for c in close]
+    low = [c - 0.15 for c in close]
+    close[pivot_bar] = base - 1.5; open_[pivot_bar] = base - 1.3
+    high[pivot_bar] = base - 1.0; low[pivot_bar] = base - 1.6
+    ob_open, ob_close = close[ob_bar - 1] - 0.1, close[ob_bar - 1] + 0.5
+    open_[ob_bar - 1], close[ob_bar - 1] = ob_open, ob_close
+    low[ob_bar - 1] = ob_open - 0.15
+    high[ob_bar - 1] = ob_close + 0.15
+    open_.append(ob_close - 0.2); close.append(jump)
+    low.append(jump - 0.3); high.append(open_[-1] + 0.1)
+    for k in range(lb):   # bounce back up to `bounce`
+        frac = (k + 1) / lb
+        c = jump + (bounce - jump) * frac
+        open_.append(c + 0.05); close.append(c); high.append(c + 0.15); low.append(c - 0.15)
+    for k in range(rally_bars):   # sell back off to rally_end, above the pivot low
+        frac = (k + 1) / rally_bars
+        c = bounce + (rally_end - bounce) * frac
+        open_.append(c + 0.05); close.append(c); high.append(c + 0.15); low.append(c - 0.15)
+    return open_, high, low, close
+
+
+def test_structural_geometry_populated_for_valid_bullish_ob():
+    """DORE §6 — a real OB + a confirmed swing-high liquidity target
+    ahead of price must populate the full structural geometry (entry
+    reference == OB proximal, target == the swing high, correctly-
+    signed risk/reward, RR = reward/risk) on the live OptionTradePlan,
+    not merely on an unused helper."""
+    open_, high, low, close = _bull_ob_settle_ohlc()
+    row = _base_row(close[-1], bullish=True)
+    plan = compute_dore_trade_plan(
+        row, close, _option_data_for(close[-1]), dte=14, symbol="TESTCO", market_regime="bullish",
+        high_prices=high, low_prices=low, open_prices=open_,
+    )
+    assert isinstance(plan, OptionTradePlan), f"got rejection: {plan}"
+    assert plan.direction == CE
+    assert plan.structural_available is True
+    assert plan.structural_entry_reference == pytest.approx(plan.ob_proximal)
+    assert plan.structural_target_type == STRUCTURAL_TARGET_LIQUIDITY
+    assert plan.structural_target_price > plan.structural_entry_reference   # CE target above entry
+    assert plan.structural_invalidation_level < plan.structural_entry_reference   # CE invalidation below entry
+    assert plan.structural_risk == pytest.approx(
+        abs(plan.structural_entry_reference - plan.structural_invalidation_level), abs=0.01)
+    assert plan.structural_reward == pytest.approx(
+        abs(plan.structural_target_price - plan.structural_entry_reference), abs=0.01)
+    assert plan.structural_risk_reward == pytest.approx(
+        plan.structural_reward / plan.structural_risk, abs=0.01)
+    assert any("Structural target" in r for r in plan.reasons)
+
+
+def test_structural_geometry_populated_for_valid_bearish_ob():
+    """Mirror of the above for the PE side — target below entry,
+    invalidation above entry, same RR contract."""
+    open_, high, low, close = _bear_ob_settle_ohlc()
+    row = _base_row(close[-1], bullish=False)
+    plan = compute_dore_trade_plan(
+        row, close, _option_data_for(close[-1]), dte=14, symbol="TESTCO", market_regime="bearish",
+        high_prices=high, low_prices=low, open_prices=open_,
+    )
+    assert isinstance(plan, OptionTradePlan), f"got rejection: {plan}"
+    assert plan.direction == PE
+    assert plan.structural_available is True
+    assert plan.structural_target_type == STRUCTURAL_TARGET_LIQUIDITY
+    assert plan.structural_target_price < plan.structural_entry_reference   # PE target below entry
+    assert plan.structural_invalidation_level > plan.structural_entry_reference   # PE invalidation above entry
+    assert plan.structural_risk_reward > 0
+
+
+def test_structural_rr_gate_suppresses_plan_below_minimum_ce():
+    """DORE §7 — a real, correctly-ordered structural geometry with an
+    RR below settings.min_structural_rr must reject the WHOLE plan
+    (DoreRejection), not merely annotate a low score."""
+    open_, high, low, close = _bull_ob_settle_ohlc()
+    row = _base_row(close[-1], bullish=True)
+    strict = DoreOptionsSettings(min_structural_rr=50.0)
+    plan = compute_dore_trade_plan(
+        row, close, _option_data_for(close[-1]), dte=14, symbol="TESTCO", market_regime="bullish",
+        high_prices=high, low_prices=low, open_prices=open_, settings=strict,
+    )
+    assert isinstance(plan, DoreRejection), f"expected rejection, got: {plan}"
+    assert plan.stage == "StructuralRiskReward"
+    assert "below minimum" in plan.reason
+
+
+def test_structural_rr_gate_suppresses_plan_below_minimum_pe():
+    open_, high, low, close = _bear_ob_settle_ohlc()
+    row = _base_row(close[-1], bullish=False)
+    strict = DoreOptionsSettings(min_structural_rr=50.0)
+    plan = compute_dore_trade_plan(
+        row, close, _option_data_for(close[-1]), dte=14, symbol="TESTCO", market_regime="bearish",
+        high_prices=high, low_prices=low, open_prices=open_, settings=strict,
+    )
+    assert isinstance(plan, DoreRejection), f"expected rejection, got: {plan}"
+    assert plan.stage == "StructuralRiskReward"
+
+
+def test_structural_rr_gate_allows_plan_above_minimum():
+    """A generous (easily-cleared) min_structural_rr must let the exact
+    same geometry through as a normal OptionTradePlan — confirms the
+    gate is a real threshold check, not an unconditional reject."""
+    open_, high, low, close = _bull_ob_settle_ohlc()
+    row = _base_row(close[-1], bullish=True)
+    lenient = DoreOptionsSettings(min_structural_rr=0.1)
+    plan = compute_dore_trade_plan(
+        row, close, _option_data_for(close[-1]), dte=14, symbol="TESTCO", market_regime="bullish",
+        high_prices=high, low_prices=low, open_prices=open_, settings=lenient,
+    )
+    assert isinstance(plan, OptionTradePlan), f"got rejection: {plan}"
+    assert plan.structural_available is True
+
+
+def test_missing_structural_geometry_never_triggers_rr_rejection():
+    """DORE §7 — a candidate with NO usable SMC structure (no open_
+    prices at all here) must never be rejected by the Structural R:R
+    gate, no matter how strict min_structural_rr is — the gate only
+    ever fires when STRUCTURAL_AVAILABLE. Legacy DORE behavior only."""
+    close = list(100 * (1.01 ** np.arange(60)))
+    row = _base_row(close[-1], bullish=True)
+    very_strict = DoreOptionsSettings(min_structural_rr=999.0)
+    plan = compute_dore_trade_plan(
+        row, close, _option_data_for(close[-1]), dte=14, symbol="TESTCO", market_regime="bullish",
+        settings=very_strict,
+    )
+    assert isinstance(plan, OptionTradePlan), f"got unexpected rejection: {plan}"
+    assert plan.structural_available is False
+    assert plan.structural_risk_reward is None
+
+
+def test_structural_target_capping_applied_to_target1_and_target2():
+    """DORE §5 — when the structurally-anchored Conservative candidate
+    IS the primary recommendation and the structural target maps to a
+    lower premium ceiling than the existing premium-% targets, target1/
+    target2 must be capped down to it (never raised, never overwritten
+    when unavailable)."""
+    open_, high, low, close = _bull_ob_settle_ohlc()
+    row = _base_row(close[-1], bullish=True)
+    row["ATR"] = close[-1] * 0.06   # widen so select_strikes' own Conservative
+                                     # would otherwise differ from the OB anchor,
+                                     # exercising the real anchor-then-cap path
+    plan = compute_dore_trade_plan(
+        row, close, _option_data_for(close[-1]), dte=14, symbol="TESTCO", market_regime="bullish",
+        high_prices=high, low_prices=low, open_prices=open_,
+    )
+    assert isinstance(plan, OptionTradePlan), f"got rejection: {plan}"
+    assert plan.is_structurally_anchored is True
+    assert plan.structural_target_price is not None
+    uncapped_target2 = round(plan.primary.premium * (1 + DoreOptionsSettings().target2_premium_pct), 2)
+    assert plan.target2 < uncapped_target2
+    assert any("capp" in r.lower() for r in plan.reasons)
+
+
+def test_structural_target_not_capped_when_structural_data_unavailable():
+    """DORE §5 fallback — no structural target -> target1/target2 stay
+    exactly at their existing premium-% values, never touched."""
+    close = list(100 * (1.01 ** np.arange(60)))
+    row = _base_row(close[-1], bullish=True)
+    plan = compute_dore_trade_plan(
+        row, close, _option_data_for(close[-1]), dte=14, symbol="TESTCO", market_regime="bullish",
+    )
+    assert isinstance(plan, OptionTradePlan), f"got rejection: {plan}"
+    assert plan.structural_target_price is None
+    expected_target1 = round(plan.primary.premium * (1 + DoreOptionsSettings().target1_premium_pct), 2)
+    expected_target2 = round(plan.primary.premium * (1 + DoreOptionsSettings().target2_premium_pct), 2)
+    assert plan.target1 == expected_target1
+    assert plan.target2 == expected_target2
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Pure unit tests for the new helper functions — deterministic,
+#  don't depend on OB-detection fixture geometry lining up exactly.
+# ══════════════════════════════════════════════════════════════════
+
+def test_discover_structural_target_prefers_liquidity_over_fvg():
+    ph = pd.Series([np.nan, 105.0, np.nan, np.nan])
+    pl = pd.Series([np.nan, np.nan, np.nan, np.nan])
+    smc = SimpleNamespace(direction="BULLISH", fvg_high=103.0, fvg_low=101.0)
+    price, kind = _discover_structural_target(CE, 100.0, smc, ph, pl, 3, 110.0)
+    assert (price, kind) == (105.0, STRUCTURAL_TARGET_LIQUIDITY)
+
+
+def test_discover_structural_target_falls_back_to_fvg():
+    ph = pd.Series([np.nan, np.nan, np.nan, np.nan])
+    pl = pd.Series([np.nan, np.nan, np.nan, np.nan])
+    smc = SimpleNamespace(direction="BULLISH", fvg_high=103.0, fvg_low=101.0)
+    price, kind = _discover_structural_target(CE, 100.0, smc, ph, pl, 3, 110.0)
+    assert (price, kind) == (103.0, STRUCTURAL_TARGET_FVG)
+
+
+def test_discover_structural_target_falls_back_to_technical():
+    ph = pd.Series([np.nan, np.nan, np.nan, np.nan])
+    pl = pd.Series([np.nan, np.nan, np.nan, np.nan])
+    price, kind = _discover_structural_target(CE, 100.0, None, ph, pl, 3, 110.0)
+    assert (price, kind) == (110.0, STRUCTURAL_TARGET_TECHNICAL_FALLBACK)
+
+
+def test_discover_structural_target_returns_none_when_nothing_usable():
+    """A technical target on the WRONG side of entry (below entry for
+    a CE thesis) must never be returned — explicit 'no target' instead
+    of a fabricated/backwards one."""
+    ph = pd.Series([np.nan, np.nan, np.nan, np.nan])
+    pl = pd.Series([np.nan, np.nan, np.nan, np.nan])
+    price, kind = _discover_structural_target(CE, 100.0, None, ph, pl, 3, 95.0)
+    assert (price, kind) == (None, None)
+
+
+def test_validate_structural_geometry_ce():
+    assert _validate_structural_geometry(CE, entry_reference=100.0,
+                                          invalidation_level=98.0, target_price=105.0) is True
+    # invalidation above entry -- invalid for a CE thesis
+    assert _validate_structural_geometry(CE, entry_reference=100.0,
+                                          invalidation_level=101.0, target_price=105.0) is False
+    # target below entry -- invalid for a CE thesis
+    assert _validate_structural_geometry(CE, entry_reference=100.0,
+                                          invalidation_level=98.0, target_price=99.0) is False
+
+
+def test_validate_structural_geometry_pe():
+    assert _validate_structural_geometry(PE, entry_reference=100.0,
+                                          invalidation_level=102.0, target_price=95.0) is True
+    assert _validate_structural_geometry(PE, entry_reference=100.0,
+                                          invalidation_level=99.0, target_price=95.0) is False
+    assert _validate_structural_geometry(PE, entry_reference=100.0,
+                                          invalidation_level=102.0, target_price=101.0) is False
+
+
+def test_structural_premium_ceiling_none_when_target_behind_price():
+    """Target already behind/at current price in this direction ->
+    None, never a fabricated (and nonsensically LOW) cap."""
+    ceiling = _structural_premium_ceiling(
+        strike=100.0, current_underlying_price=110.0, structural_target_price=105.0,
+        dir_=CE, current_premium=2.0,
+    )
+    assert ceiling is None
+
+
+def test_structural_premium_ceiling_computes_intrinsic_delta():
+    ceiling = _structural_premium_ceiling(
+        strike=100.0, current_underlying_price=101.0, structural_target_price=103.0,
+        dir_=CE, current_premium=1.5,
+    )
+    # intrinsic(103,100)=3, intrinsic(101,100)=1 -> delta=2 -> ceiling=3.5
+    assert ceiling == pytest.approx(3.5)
+
+
+def test_structural_premium_ceiling_none_without_inputs():
+    assert _structural_premium_ceiling(100.0, 101.0, None, CE, 1.5) is None
+    assert _structural_premium_ceiling(100.0, 101.0, 103.0, CE, None) is None

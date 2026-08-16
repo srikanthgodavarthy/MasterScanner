@@ -198,8 +198,25 @@ class DoreOptionsSettings:
     target2_premium_pct:   float = 1.00   # T2 = premium * (1 + this)
     entry_zone_band_pct:   float = 0.05   # +/- band around LTP for the entry zone
 
+    # ── Structural SMC trade geometry [2026-08-16, DORE §7] ──────
+    # Minimum acceptable Structural R:R (Reward/Risk on the UNDERLYING
+    # scale — structural_entry_reference/invalidation/target — distinct
+    # from the option-premium risk_reward_ratio above). Only ever
+    # applied as a gate when STRUCTURAL_AVAILABLE is True (a real,
+    # correctly-ordered OB + target geometry exists for this plan) —
+    # see compute_dore_trade_plan()'s structural block. A candidate
+    # with no usable SMC structure is never rejected by this setting;
+    # it simply never reaches the check (legacy DORE behavior, §7).
+    min_structural_rr: float = 1.3
+
 
 DORE_OPTIONS_DEFAULTS = DoreOptionsSettings()
+
+# structural_target_type vocabulary [DORE §4] — populated on
+# OptionTradePlan.structural_target_type whenever STRUCTURAL_AVAILABLE.
+STRUCTURAL_TARGET_LIQUIDITY          = "LIQUIDITY"
+STRUCTURAL_TARGET_FVG                = "FVG"
+STRUCTURAL_TARGET_TECHNICAL_FALLBACK = "TECHNICAL_FALLBACK"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -829,6 +846,36 @@ class OptionTradePlan:
     # on an already-dead thesis, only on a live one to watch.
     structural_invalidation_level: Optional[float] = None
 
+    # [Structural SMC trade geometry, 2026-08-16, DORE §6/§9] Full
+    # underlying-scale structural trade geometry — entry reference,
+    # target (liquidity pool / unmitigated FVG boundary / technical
+    # fallback), and the resulting Structural R:R. All None/False
+    # (STRUCTURAL_AVAILABLE == structural_risk_reward is not None)
+    # whenever no Order Block exists for this direction, the target
+    # discovery found nothing usable, or the geometry didn't validate
+    # (CE: invalidation < entry < target; PE: target < entry <
+    # invalidation) — never fabricated, and never gates a plan that
+    # has none of this data (see min_structural_rr's docstring). These
+    # are frozen once here at mint time and never recomputed by live
+    # monitoring (utils.dore_options_persistence) — see that module's
+    # DoreOptionsPlan fields of the same name.
+    structural_entry_reference:  Optional[float] = None   # == ob_proximal when an OB anchor exists
+    structural_target_price:     Optional[float] = None
+    structural_target_type:      Optional[str]   = None   # LIQUIDITY | FVG | TECHNICAL_FALLBACK
+    structural_risk:             Optional[float] = None   # abs(entry_reference - invalidation_level)
+    structural_reward:           Optional[float] = None   # abs(target_price - entry_reference)
+    structural_risk_reward:      Optional[float] = None   # reward / risk
+
+    @property
+    def structural_available(self) -> bool:
+        """STRUCTURAL_AVAILABLE (DORE §7) — True only when a full,
+        correctly-ordered structural geometry (entry/invalidation/
+        target/RR) was actually derived for this plan. Computed as a
+        property (not a stored field) so it can never drift out of
+        sync with structural_risk_reward, the one field it's defined
+        in terms of."""
+        return self.structural_risk_reward is not None
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -1313,6 +1360,121 @@ def _approx_intrinsic(strike: float, underlying_price: float, dir_: str) -> floa
     if dir_ == CE:
         return max(0.0, underlying_price - strike)
     return max(0.0, strike - underlying_price)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  STRUCTURAL SMC TRADE GEOMETRY  [2026-08-16, DORE §3-§7]
+#  Underlying-scale entry/invalidation/target/RR — a distinct layer
+#  from select_structural_long_strike()/build_debit_spread() above
+#  (which are strike/premium selection helpers, not currently called
+#  from compute_dore_trade_plan()'s production path). Everything below
+#  IS wired into compute_dore_trade_plan() and therefore affects the
+#  real single-leg OptionTradePlan every live scan cycle produces.
+# ══════════════════════════════════════════════════════════════════
+
+def _discover_structural_target(
+    dir_: str,
+    entry_reference: float,
+    smc_latest: Optional["object"],
+    ph_causal: "pd.Series",
+    pl_causal: "pd.Series",
+    as_of_bar: int,
+    technical_fallback_price: Optional[float],
+) -> tuple[Optional[float], Optional[str]]:
+    """
+    DORE §4 — nearest meaningful target in the trade direction, in this
+    priority order:
+      1. Nearest opposing/relevant liquidity pool (confirmed swing
+         high/low from utils.structural_levels' causal pivot series —
+         "opposing" in the sense of being the structure price would
+         run into, above entry for CE / below entry for PE).
+      2. Nearest appropriate unmitigated FVG boundary — the direction-
+         matched FVG zone utils.smc_engine.compute_smc_state() is
+         already tracking (SMCState.fvg_high/fvg_low), when it sits on
+         the correct side of entry_reference.
+      3. Existing technical target (MasterScannerSignal.target_price),
+         when it too sits on the correct side of entry_reference —
+         never returned blindly if it would put the target on the
+         WRONG side (that's a downgrade to "no usable target", not a
+         fabricated one).
+
+    Returns (price, type) where type is one of STRUCTURAL_TARGET_*, or
+    (None, None) if nothing on the correct side of entry_reference was
+    found at any priority level — an explicit "no usable structural
+    target" result, never a fabricated one (mirrors this module's
+    STRUCTURAL_DATA_UNAVAILABLE convention elsewhere).
+    """
+    from utils.structural_levels import nearest_resistance, nearest_support
+
+    if dir_ == CE:
+        liquidity = nearest_resistance(ph_causal, as_of_bar, entry_reference)
+        if liquidity is not None:
+            return liquidity, STRUCTURAL_TARGET_LIQUIDITY
+        if (smc_latest is not None and getattr(smc_latest, "fvg_high", None) is not None
+                and smc_latest.fvg_high > entry_reference):
+            return float(smc_latest.fvg_high), STRUCTURAL_TARGET_FVG
+        if technical_fallback_price is not None and technical_fallback_price > entry_reference:
+            return float(technical_fallback_price), STRUCTURAL_TARGET_TECHNICAL_FALLBACK
+        return None, None
+    else:
+        liquidity = nearest_support(pl_causal, as_of_bar, entry_reference)
+        if liquidity is not None:
+            return liquidity, STRUCTURAL_TARGET_LIQUIDITY
+        if (smc_latest is not None and getattr(smc_latest, "fvg_low", None) is not None
+                and smc_latest.fvg_low < entry_reference):
+            return float(smc_latest.fvg_low), STRUCTURAL_TARGET_FVG
+        if technical_fallback_price is not None and technical_fallback_price < entry_reference:
+            return float(technical_fallback_price), STRUCTURAL_TARGET_TECHNICAL_FALLBACK
+        return None, None
+
+
+def _validate_structural_geometry(
+    dir_: str, entry_reference: float, invalidation_level: float, target_price: float,
+) -> bool:
+    """
+    DORE §6 — direction-aware ordering check. CE requires
+    invalidation < entry < target; PE requires target < entry <
+    invalidation. An incorrectly-ordered structure (e.g. the
+    "target" sitting on the wrong side of entry, or the invalidation
+    level sitting past the target) is never silently accepted as
+    absolute-value risk/reward — see this function's caller, which
+    treats a False return as "no usable structural geometry" rather
+    than computing a misleading RR from mis-ordered levels.
+    """
+    if dir_ == CE:
+        return invalidation_level < entry_reference < target_price
+    return target_price < entry_reference < invalidation_level
+
+
+def _structural_premium_ceiling(
+    strike: float, current_underlying_price: float, structural_target_price: Optional[float],
+    dir_: str, current_premium: Optional[float],
+) -> Optional[float]:
+    """
+    DORE §5 — maps the structural target (an UNDERLYING price level)
+    onto an approximate premium ceiling, using the same intrinsic-value
+    approximation _approx_intrinsic() already uses elsewhere in this
+    module (Section 5's explicit instruction: reuse the existing
+    option-pricing/target architecture rather than inventing a
+    simplistic direct underlying-points-to-premium-points conversion).
+
+    Returns None (never a fabricated cap) when:
+      - structural_target_price or current_premium is unavailable, or
+      - the structural target's intrinsic value at expiry is not
+        actually ABOVE the current intrinsic value — i.e. the
+        structural target is already behind/at the current underlying
+        price in this direction, which would produce a cap below the
+        current premium (nonsensical as a target ceiling, not a
+        legitimate downgrade).
+    """
+    if structural_target_price is None or current_premium is None:
+        return None
+    intrinsic_now = _approx_intrinsic(strike, current_underlying_price, dir_)
+    intrinsic_at_structural_target = _approx_intrinsic(strike, structural_target_price, dir_)
+    delta = intrinsic_at_structural_target - intrinsic_now
+    if delta <= 0:
+        return None
+    return round(current_premium + delta, 2)
 
 
 def select_structural_long_strike(
@@ -1803,6 +1965,18 @@ def compute_dore_trade_plan(
     _structural_reason = "no_open_prices" if open_prices is None else "insufficient_bars"
     _ob_for_dir = None
     _structural_decision = None
+    # [Structural SMC trade geometry, 2026-08-16, DORE §3-§7] — entry
+    # reference / target / RR, computed alongside the existing OB-anchor
+    # read above (same _ob_df/_smc_latest, no duplicate SMC calculation
+    # — DORE §8's "one source of truth" requirement). All stay None/
+    # False until a full, correctly-ordered geometry is actually found;
+    # never fabricated, never gates a plan that has none of this.
+    _structural_entry_reference = None
+    _structural_target_price = None
+    _structural_target_type = None
+    _structural_risk = None
+    _structural_reward = None
+    _structural_risk_reward = None
     if open_prices is not None and len(open_prices) >= 5 and high_prices and low_prices:
         try:
             from utils.smc_engine import (
@@ -1810,15 +1984,17 @@ def compute_dore_trade_plan(
                 BULLISH as _SMC_BULLISH, BEARISH as _SMC_BEARISH,
                 STRUCTURAL_INVALIDATION as _SI, STRUCTURAL_VALID_ENTRY_ZONE as _VEZ,
             )
+            from utils.structural_levels import causal_pivot_series
             n_ = min(len(open_prices), len(high_prices), len(low_prices), len(close_prices))
             _ob_df = pd.DataFrame({
                 "open":  list(open_prices)[-n_:], "high": list(high_prices)[-n_:],
                 "low":   list(low_prices)[-n_:],   "close": list(close_prices)[-n_:],
             })
+            _lb = min(20, max(2, n_ // 4))
             _thesis_dir = _SMC_BULLISH if dir_ == CE else _SMC_BEARISH
-            _bull_obs, _bear_obs = detect_order_blocks(_ob_df, lb=min(20, max(2, n_ // 4)))
+            _bull_obs, _bear_obs = detect_order_blocks(_ob_df, lb=_lb)
             _ob_for_dir = (_bull_obs if _thesis_dir == _SMC_BULLISH else _bear_obs)[-1]
-            _smc_states = compute_smc_state(_ob_df, lb=min(20, max(2, n_ // 4)))
+            _smc_states = compute_smc_state(_ob_df, lb=_lb)
             _smc_latest = _smc_states[-1] if _smc_states else None
             _structural_decision = classify_structural_state(
                 _smc_latest, order_block=_ob_for_dir, thesis_direction=_thesis_dir,
@@ -1837,11 +2013,44 @@ def compute_dore_trade_plan(
                     strikes[CONSERVATIVE] = {**strikes[CONSERVATIVE], "strike": _anchor_strike}
                 except ChainDataError:
                     pass   # chain has nothing near the anchor -- keep select_strikes()'s own value, don't fabricate one
+
+            # ── Structural target discovery + RR (DORE §4/§6) ───────
+            # entry_reference is the OB proximal line itself (the
+            # underlying-level anchor) whenever an OB was found for
+            # this direction — independent of whether _nearest_priced_
+            # strike() above actually succeeded in overriding the
+            # Conservative strike; that's a strike-selection nuance,
+            # the structural read on the underlying is unaffected by a
+            # ChainDataError there.
+            if _ob_for_dir is not None:
+                _ph_causal, _pl_causal = causal_pivot_series(_ob_df["high"], _ob_df["low"], lb=_lb)
+                _structural_entry_reference = _ob_for_dir.proximal
+                _invalidation_level = _ob_for_dir.distal
+                _tgt_price, _tgt_type = _discover_structural_target(
+                    dir_, _structural_entry_reference, _smc_latest,
+                    _ph_causal, _pl_causal, n_ - 1, sig.target_price,
+                )
+                if _tgt_price is not None and _validate_structural_geometry(
+                    dir_, _structural_entry_reference, _invalidation_level, _tgt_price,
+                ):
+                    _risk = abs(_structural_entry_reference - _invalidation_level)
+                    if _risk > 0:
+                        _structural_target_price = _tgt_price
+                        _structural_target_type = _tgt_type
+                        _structural_risk = round(_risk, 2)
+                        _structural_reward = round(abs(_tgt_price - _structural_entry_reference), 2)
+                        _structural_risk_reward = round(_structural_reward / _structural_risk, 2)
         except Exception:
             _structural_state = "STRUCTURAL_DATA_UNAVAILABLE"
             _structural_reason = "structural_read_failed"
             _ob_for_dir = None
             _structural_decision = None
+            _structural_entry_reference = None
+            _structural_target_price = None
+            _structural_target_type = None
+            _structural_risk = None
+            _structural_reward = None
+            _structural_risk_reward = None
 
     # [Fix, 2026-08-16] STRUCTURAL_INVALIDATION must actually reject the
     # plan, not just populate a diagnostic field. Previously the code
@@ -1862,6 +2071,24 @@ def compute_dore_trade_plan(
             f"Order Block distal line breached (proximal={_ob_for_dir.proximal:.2f}, "
             f"distal={_ob_for_dir.distal:.2f}) — structural thesis invalidated"
             if _ob_for_dir is not None else "Structural thesis invalidated",
+        )
+
+    # [Structural SMC trade geometry, 2026-08-16, DORE §7] Structural
+    # R:R gate — ONLY fires when STRUCTURAL_AVAILABLE (a full,
+    # correctly-ordered entry/invalidation/target geometry was actually
+    # derived above). A candidate with no usable SMC structure (no OB,
+    # no discoverable target, or mis-ordered geometry) NEVER reaches
+    # this check — it falls straight through to legacy DORE behavior,
+    # per §7's explicit "no SMC structure -> legacy DORE behavior"
+    # requirement. This is a strict downgrade-only gate, symmetric with
+    # the STRUCTURAL_INVALIDATION rejection above — never an upgrade.
+    if _structural_risk_reward is not None and _structural_risk_reward < settings.min_structural_rr:
+        return DoreRejection(
+            sig.symbol, "StructuralRiskReward",
+            f"Structural R:R {_structural_risk_reward:.2f} below minimum "
+            f"{settings.min_structural_rr:.2f} (entry={_structural_entry_reference:.2f}, "
+            f"target={_structural_target_price:.2f} [{_structural_target_type}], "
+            f"risk={_structural_risk:.2f}, reward={_structural_reward:.2f})",
         )
 
     # [Fix, 2026-08-16 — Option A] When the structural anchor was actually
@@ -1913,6 +2140,28 @@ def compute_dore_trade_plan(
     target1 = round(primary.premium * (1 + settings.target1_premium_pct), 2) if primary.premium else None
     target2 = round(primary.premium * (1 + settings.target2_premium_pct), 2) if primary.premium else None
 
+    # [Structural SMC trade geometry, 2026-08-16, DORE §5] FVG/liquidity
+    # target capping — only when a real structural target was found
+    # AND the primary candidate actually has a premium to cap (never
+    # blindly overwrites T1/T2 when structural data is unavailable; the
+    # baseline premium-% targets above are left exactly as they were,
+    # per §5's explicit fallback requirement). Cap is downgrade-only —
+    # min() against the existing target — never raises a target past
+    # what select_strikes()'s own volatility-based projection already
+    # produced.
+    _structural_target_capped = False
+    if _structural_target_price is not None and primary.premium:
+        _premium_ceiling = _structural_premium_ceiling(
+            primary.strike, sig.current_price, _structural_target_price, dir_, primary.premium,
+        )
+        if _premium_ceiling is not None:
+            if target1 is not None and _premium_ceiling < target1:
+                target1 = round(_premium_ceiling, 2)
+                _structural_target_capped = True
+            if target2 is not None and _premium_ceiling < target2:
+                target2 = round(_premium_ceiling, 2)
+                _structural_target_capped = True
+
     # 2026-07-31: Current Premium / Premium %Chg — the option contract's
     # own move today, distinct from the underlying's %Chg. prev_close
     # here is the CONTRACT's prior-close premium (PremiumQuote.prev_close,
@@ -1934,6 +2183,10 @@ def compute_dore_trade_plan(
         + [f"Expected Move supports {primary.strike:g} {dir_} "
            f"({'Structural anchor' if _anchor_applied else 'Balanced'})"]
         + all_reasons
+        + ([f"Structural target {_structural_target_price:g} [{_structural_target_type}] "
+            f"— Structural R:R {_structural_risk_reward:.2f}"]
+           if _structural_risk_reward is not None else [])
+        + (["Target capped by structural liquidity/FVG boundary"] if _structural_target_capped else [])
     )
 
     # [DORE Integration, 2026-07-31] Leadership / Technical Recommendation
@@ -2006,6 +2259,13 @@ def compute_dore_trade_plan(
         structural_invalidation_level=(
             _structural_decision.invalidation_level if _structural_decision is not None else None
         ),
+        # [Structural SMC trade geometry, 2026-08-16, DORE §6/§9]
+        structural_entry_reference=_structural_entry_reference,
+        structural_target_price=_structural_target_price,
+        structural_target_type=_structural_target_type,
+        structural_risk=_structural_risk,
+        structural_reward=_structural_reward,
+        structural_risk_reward=_structural_risk_reward,
     )
 
 

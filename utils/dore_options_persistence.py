@@ -281,6 +281,10 @@ CLOSE_REASON_TARGET_2    = "TARGET_2"
 CLOSE_REASON_TIMEOUT     = "TIMEOUT"
 CLOSE_REASON_EXPIRY      = "EXPIRY"
 CLOSE_REASON_INVALIDATED = "INVALIDATED"
+# [Structural SMC trade geometry, 2026-08-16, DORE §3] Distal-line
+# thesis invalidation — see enrich_trade_plans_with_persistence()'s
+# live-monitoring loop below for where this actually fires.
+CLOSE_REASON_STRUCTURAL_INVALIDATION = "STRUCTURAL_INVALIDATION"
 
 
 def _sval(status) -> str:
@@ -400,6 +404,33 @@ class DoreOptionsPlan:
     cv4_smc_state_at_mint:       str = ""    # e.g. BULLISH_CONTINUATION, LIQUIDITY_SWEEP, ...
     cv4_smc_fvg_retest_at_mint:  str = ""    # none | in_zone | through_unfilled | through_filled
 
+    # [Structural SMC trade geometry, 2026-08-16, DORE §6/§8/§9] Full
+    # underlying-scale structural trade geometry, captured ONCE at mint
+    # time from OptionTradePlan.structural_* (utils.dore_options_engine)
+    # — same frozen-snapshot pattern as the cv4_*_at_mint fields above
+    # and source/entry_locked/sl_locked/etc.: DORE §8's explicit "freeze
+    # the structural levels used for the decision... do not recompute a
+    # different OB/FVG/liquidity structure during monitoring" requirement.
+    # All None on any plan whose OptionTradePlan.structural_available was
+    # False at mint time (no OB, no target found, or bad geometry) — this
+    # module never re-derives them, and never fabricates a value here
+    # that compute_dore_trade_plan() itself didn't produce.
+    #
+    # structural_invalidation_level is the one field of this group that
+    # is ALSO load-bearing after mint — see enrich_trade_plans_with_
+    # persistence()'s live-monitoring loop, which closes an ACTIVE plan
+    # with CLOSE_REASON_STRUCTURAL_INVALIDATION the first cycle the live
+    # underlying price crosses it. The rest (entry_reference/target/
+    # risk/reward/RR) are audit/display fields only — nothing in this
+    # module's control flow reads them to gate anything.
+    structural_entry_reference:    Optional[float] = None
+    structural_invalidation_level: Optional[float] = None
+    structural_target_price:       Optional[float] = None
+    structural_target_type:        str = ""    # LIQUIDITY | FVG | TECHNICAL_FALLBACK
+    structural_risk:               Optional[float] = None
+    structural_reward:             Optional[float] = None
+    structural_risk_reward:        Optional[float] = None
+
     @property
     def contract_key(self) -> str:
         return f"{self.symbol.upper()}|{self.direction}|{self.strike:.1f}|{self.expiry}"
@@ -467,6 +498,16 @@ class DoreOptionsPlan:
             "cv4_smc_evidence_tier_at_mint":self.cv4_smc_evidence_tier_at_mint,
             "cv4_smc_state_at_mint":        self.cv4_smc_state_at_mint or "",
             "cv4_smc_fvg_retest_at_mint":   self.cv4_smc_fvg_retest_at_mint or "",
+            # Structural SMC trade geometry (DORE §6/§8/§9) — see the
+            # dataclass field comments above. All Optional/blank-default,
+            # additive-only, same as the cv4_*_at_mint block above.
+            "structural_entry_reference":    self.structural_entry_reference,
+            "structural_invalidation_level": self.structural_invalidation_level,
+            "structural_target_price":       self.structural_target_price,
+            "structural_target_type":        self.structural_target_type or "",
+            "structural_risk":               self.structural_risk,
+            "structural_reward":             self.structural_reward,
+            "structural_risk_reward":        self.structural_risk_reward,
         }
 
 
@@ -796,6 +837,14 @@ def enrich_trade_plans_with_persistence(
 
             row = p.to_dict()
             current_premium = getattr(p, "current_premium", None)
+            # [Structural SMC trade geometry, 2026-08-16, DORE §3] Live
+            # underlying spot, surfaced onto the row by utils.dore_live_
+            # state's _live_quote_for_plan() (the only caller of this
+            # function — see that module). None on any cycle the live
+            # quote fetch itself failed; the structural-invalidation
+            # check below is a strict no-op whenever this is None, same
+            # as every other Optional-guarded check in this loop.
+            current_underlying = row.get("live_underlying_price")
             # [2026-08-12] Computed unconditionally (used both for the
             # Level 1 mint gate below AND to refresh confidence_at_entry
             # on an already-tracked, not-yet-active plan every cycle it's
@@ -918,6 +967,22 @@ def enrich_trade_plans_with_persistence(
                     cv4_smc_evidence_tier_at_mint=row.get("cv4_smc_evidence_tier"),
                     cv4_smc_state_at_mint=row.get("cv4_smc_state") or "",
                     cv4_smc_fvg_retest_at_mint=row.get("cv4_smc_fvg_retest") or "",
+                    # [Structural SMC trade geometry, 2026-08-16, DORE §6/
+                    # §8/§9] Frozen once at mint time from this cycle's
+                    # OptionTradePlan.structural_* — never recomputed by
+                    # this module afterward (§8's "frozen structural
+                    # geometry" requirement). None/"" on every field when
+                    # the mint-cycle plan had no usable structural
+                    # geometry (structural_available == False) — same
+                    # additive-only, non-gating pattern as the cv4_*_at_
+                    # mint fields above.
+                    structural_entry_reference=row.get("structural_entry_reference"),
+                    structural_invalidation_level=row.get("structural_invalidation_level"),
+                    structural_target_price=row.get("structural_target_price"),
+                    structural_target_type=row.get("structural_target_type") or "",
+                    structural_risk=row.get("structural_risk"),
+                    structural_reward=row.get("structural_reward"),
+                    structural_risk_reward=row.get("structural_risk_reward"),
                 )
                 just_minted = True
                 open_now[key] = locked
@@ -1002,6 +1067,46 @@ def enrich_trade_plans_with_persistence(
             drift = _drift_pct(current_premium, locked.entry_locked)
 
             if locked.is_active():
+                # [Structural SMC trade geometry, 2026-08-16, DORE §3]
+                # Distal-line thesis invalidation — an ADDITIONAL,
+                # independent exit alongside the existing premium stop-
+                # loss below, never a replacement for it. Checked FIRST
+                # among this cycle's exit checks (whichever fires first
+                # wins via the `continue` below, so only one close event
+                # is ever recorded per cycle — no duplicates). Uses
+                # locked.structural_invalidation_level — the level
+                # FROZEN at mint time (§8) — never a level recomputed
+                # from this cycle's fresh SMC read, so a plan's own
+                # thesis can't silently drift underneath it while it's
+                # being monitored. A no-op whenever either input is
+                # missing: existing plans minted before this feature (or
+                # any plan whose mint-time OptionTradePlan had no usable
+                # OB for its direction) simply have structural_
+                # invalidation_level == None and are completely
+                # unaffected — legacy behavior preserved exactly.
+                if (current_underlying is not None
+                        and locked.structural_invalidation_level is not None):
+                    _breached = (
+                        current_underlying <= locked.structural_invalidation_level
+                        if locked.direction == "CE" else
+                        current_underlying >= locked.structural_invalidation_level
+                    )
+                    if _breached:
+                        if current_premium is not None:
+                            locked.last_premium = current_premium
+                        locked.last_seen_at = _now_iso()
+                        locked.status = DoreOptionsPlanStatus.CLOSED
+                        locked.closed_at = _now_iso()
+                        locked.closed_reason = (
+                            f"Structural thesis invalidated — underlying {current_underlying:.2f} "
+                            f"crossed OB distal {locked.structural_invalidation_level:.2f}"
+                        )
+                        locked.closed_reason_code = CLOSE_REASON_STRUCTURAL_INVALIDATION
+                        updated_plans.append(locked)
+                        _record_dore_final_outcome(locked)
+                        enriched_rows.append(p.to_dict())
+                        continue
+
                 # [2026-08-05, SG request] Detect T1 the moment it's
                 # reached and freeze it — sticky, never cleared even if
                 # premium later falls back below target1_locked. This is

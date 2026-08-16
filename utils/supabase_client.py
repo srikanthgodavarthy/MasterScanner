@@ -1080,6 +1080,22 @@ def _dore_options_plan_from_row(row: dict) -> "object":
         cv4_smc_evidence_tier_at_mint  = row.get("cv4_smc_evidence_tier_at_mint"),
         cv4_smc_state_at_mint          = row.get("cv4_smc_state_at_mint", "") or "",
         cv4_smc_fvg_retest_at_mint     = row.get("cv4_smc_fvg_retest_at_mint", "") or "",
+        # [Structural SMC trade geometry, 2026-08-16, DORE §6/§8/§9] —
+        # see DoreOptionsPlan's field comments. Absent on rows written
+        # before this migration; reads back as None/"" for those, same
+        # additive-only, non-gating pattern as the cv4_*_at_mint block
+        # above. structural_invalidation_level round-trips here exactly
+        # like sl_locked/target1_locked/target2_locked above — it's what
+        # lets a plan reloaded from a fresh Streamlit session (not just
+        # the in-process one that minted it) still auto-close on a
+        # distal breach.
+        structural_entry_reference    = row.get("structural_entry_reference"),
+        structural_invalidation_level = row.get("structural_invalidation_level"),
+        structural_target_price       = row.get("structural_target_price"),
+        structural_target_type        = row.get("structural_target_type", "") or "",
+        structural_risk                = row.get("structural_risk"),
+        structural_reward              = row.get("structural_reward"),
+        structural_risk_reward         = row.get("structural_risk_reward"),
     )
 
 
@@ -1780,6 +1796,22 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
     cv4_smc_state_at_mint          text        NOT NULL DEFAULT '',
     cv4_smc_fvg_retest_at_mint     text        NOT NULL DEFAULT '',
 
+    -- [Structural SMC trade geometry, 2026-08-16, DORE §6/§8/§9] Full
+    -- underlying-scale structural trade geometry, frozen once at mint
+    -- time — see utils.dore_options_persistence.DoreOptionsPlan's field
+    -- comments. structural_invalidation_level is also load-bearing at
+    -- read time (live-monitoring auto-close, see that module); the rest
+    -- are audit/display fields only. All nullable/empty-default,
+    -- non-gating for existing rows — same additive-only pattern as the
+    -- cv4_*_at_mint columns above.
+    structural_entry_reference     numeric(12,2),
+    structural_invalidation_level  numeric(12,2),
+    structural_target_price        numeric(12,2),
+    structural_target_type         text        NOT NULL DEFAULT '',
+    structural_risk                numeric(12,2),
+    structural_reward              numeric(12,2),
+    structural_risk_reward         numeric(6,2),
+
     updated_at                   timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_dore_options_plans_symbol ON dore_options_plans(symbol);
@@ -1818,6 +1850,27 @@ ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS cv4_signal_class_at_mint
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS cv4_smc_evidence_tier_at_mint integer;
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS cv4_smc_state_at_mint text NOT NULL DEFAULT '';
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS cv4_smc_fvg_retest_at_mint text NOT NULL DEFAULT '';
+"""
+
+# [Structural SMC trade geometry, 2026-08-16, DORE §6/§8/§9] Run once
+# against an existing dore_options_plans table. Purely additive/nullable
+# (or empty-string-default for the text column, matching source's/the
+# cv4_*_at_mint text columns' own convention above) — no existing row or
+# query is affected. structural_invalidation_level is the one column
+# among these that's actually read by live monitoring (utils.
+# dore_options_persistence.enrich_trade_plans_with_persistence()) once
+# populated; every existing row simply has it NULL until its plan is
+# re-minted, which is a complete no-op for that row (see that function's
+# "current_underlying is not None and locked.structural_invalidation_
+# level is not None" guard) — never a NOT NULL constraint, per spec.
+DORE_OPTIONS_PLANS_STRUCTURAL_GEOMETRY_MIGRATION_SQL = """
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS structural_entry_reference numeric(12,2);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS structural_invalidation_level numeric(12,2);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS structural_target_price numeric(12,2);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS structural_target_type text NOT NULL DEFAULT '';
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS structural_risk numeric(12,2);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS structural_reward numeric(12,2);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS structural_risk_reward numeric(6,2);
 """
 
 # [2026-08-12, two-level lifecycle refactor] Run this once against an

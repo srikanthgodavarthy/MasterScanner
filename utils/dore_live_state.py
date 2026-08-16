@@ -248,6 +248,18 @@ def _live_quote_for_plan(plan: dict, quote: Optional[dict], spot: Optional[float
         "probability_of_profit": pop,
         "entry_trigger_status": _entry_trigger_status(current_premium, entry_zone),
         "current_risk_reward": _current_risk_reward(current_premium, plan.get("stop_loss"), plan.get("target1")),
+        # [Structural SMC trade geometry, 2026-08-16, DORE §3] The
+        # underlying's live spot for THIS refresh cycle — fetched
+        # unconditionally above for both fresh and carried-forward plans
+        # (see refresh_dore_live_state's own docstring on why spot is
+        # always refetched), just never previously surfaced into the
+        # merged plan+live dict. This is the ONE thing utils.
+        # dore_options_persistence.enrich_trade_plans_with_persistence()
+        # needs to evaluate a live structural-invalidation (OB distal)
+        # breach against — see that module's live-monitoring loop. None
+        # whenever this cycle's spot fetch itself failed, same as every
+        # other Optional field here.
+        "live_underlying_price": float(spot) if spot else None,
     }
 
 
