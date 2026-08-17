@@ -105,7 +105,29 @@ of those loops.
 
 from __future__ import annotations
 
+# ── glibc malloc-arena cap [2026-08-17] ─────────────────────────────
+# Mirrors app.py's fix — this is a SEPARATE process (see module
+# docstring above: `python -m scheduler.scan_worker`, never imports
+# app.py), so app.py's mallopt() call doesn't help it at all. This is
+# the actual process every RSS/malloc_trim/skip_cycle log line in the
+# RAM investigation came from, so it needs its own cap, not just a
+# log line confirming the env var. Placed before the `import pandas`
+# below (and before logging.basicConfig() further down, in main()) —
+# as early in this process's life as possible, same reasoning as
+# app.py's comment: MALLOC_ARENA_MAX the env var is read by glibc at
+# the first malloc() call, which can happen before any of our own code
+# runs, so mallopt() at runtime is the reliable equivalent regardless
+# of how early this line executes relative to that.
+try:
+    import ctypes
+    _libc = ctypes.CDLL("libc.so.6")
+    M_ARENA_MAX = -8  # glibc mallopt() param constant
+    _libc.mallopt(M_ARENA_MAX, 2)
+except (OSError, AttributeError):
+    pass  # non-glibc platform (e.g. local macOS dev) — no-op, harmless
+
 import logging
+import os
 import threading
 import time
 import traceback
@@ -944,6 +966,22 @@ def main():
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    # [2026-08-17, SG request] Confirms MALLOC_ARENA_MAX / MALLOC_TRIM_THRESHOLD_
+    # actually reached THIS process's environment (this is the standalone
+    # scan_worker process, separate from app.py's Streamlit process — see
+    # module docstring). Placed here, not at module import time above,
+    # because logging.basicConfig() hadn't run yet up there — a log call
+    # before this line has no handler and silently vanishes. Doesn't prove
+    # glibc read these before its first malloc() (no pure-Python way to
+    # check that), but a None here means Streamlit Cloud's Secrets never
+    # reached this process's environment at all, which is the first thing
+    # to rule out. The mallopt() call above the imports is the actual fix
+    # for MALLOC_ARENA_MAX regardless of what this logs; MALLOC_TRIM_THRESHOLD_
+    # has no code-level mallopt() equivalent added yet, so for that one
+    # this log is the only signal we have.
+    logger.info("malloc tuning: ARENA_MAX=%s TRIM_THRESHOLD=%s",
+                os.environ.get("MALLOC_ARENA_MAX"), os.environ.get("MALLOC_TRIM_THRESHOLD_"))
 
     # [Architecture review C3 fix, 2026-07-25] Claim exclusive ownership
     # of the scan loops before starting anything. Blocks (polling) if
