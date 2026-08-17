@@ -55,7 +55,27 @@ from utils.scan_state import load_snapshot_meta, load_snapshot_payload
 # dore_technical_plans) with headroom for a version or two of overlap
 # during rollover — not meant to grow without bound as versions churn
 # over days, hence the cap rather than leaving it unbounded.
-_MAX_ENTRIES = 12
+#
+# [2026-08-17, RAM investigation] 12 was sized assuming slow, roughly
+# daily version churn across 5 sections sharing ONE combined LRU cache
+# (both _cached_payload and _cached_dataframe are single functions —
+# their max_entries cap is global across every section's keys, not
+# per-section). live_scanner breaks that assumption: scheduler/
+# scan_worker.py upserts a new "live_scanner" version once per batch
+# (~10x per ~5min cycle, not once), so it alone can burn through most
+# or all of the 12 slots within a single cycle — confirmed via
+# utils.memory_profiler's sched_payload_cache stats, which showed
+# live_scanner's hit_rate parked at 11-20% (constant new-version
+# misses) while dore_technical_plans (genuinely slow-churn) sat at
+# 86-94%. Each live_scanner entry is a ~4-5MB, 538-row DataFrame (or
+# the equivalent-sized payload dict behind it), so a nearly-full 12-slot
+# cache of those, held process-wide and shared by every open browser
+# tab, was a real, steadily-refreshed chunk of retained memory — not
+# gc-eligible garbage, since st.cache_data's LRU keeps every entry
+# reachable until it's evicted. Lowered so live_scanner's high churn
+# can't pin more than a few full snapshots at once; slow sections still
+# get all the rollover headroom they need at this size.
+_MAX_ENTRIES = 3
 
 
 @st.cache_data(max_entries=_MAX_ENTRIES, show_spinner=False)
