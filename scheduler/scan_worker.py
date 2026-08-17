@@ -575,7 +575,7 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                   5-minute cycle.
     """
     from utils.scan_state import save_snapshot, load_snapshot_payload_cached
-    from utils.live_scanner_job import compute_live_scan_batch, build_regime_context_for_cycle
+    from utils.live_scanner_job import compute_live_scan_batch, build_regime_context_for_cycle, fetch_cycle_nifty_series
     from utils.regime_engine import apply_regime_layer
     from utils.scanner_engine import NIFTY500_SYMBOLS
     from utils.supabase_client import save_scan_snapshot, archive_daily_scan
@@ -675,8 +675,25 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
 
         cycle_started = time.time()
 
+        # [2026-08-17 duplicate-index fix] Fetch Nifty ONCE for the whole
+        # cycle and reuse it for both the regime context and every batch
+        # below, instead of each of the ~10 compute_live_scan_batch() calls
+        # independently hitting fetch_nifty()'s 60s cache (and occasionally
+        # missing it, triggering its own live yfinance re-fetch). A single
+        # flaky yfinance response — most often a duplicate-dated row —
+        # used to corrupt just the one unlucky batch's Nifty benchmark,
+        # crashing leadership_prescreen() for that batch's ~50 symbols
+        # only, while other batches on cached/clean data succeeded. One
+        # shared, already-deduped fetch removes that per-batch lottery.
+        cycle_nifty_series = None
         try:
-            regime_ctx = build_regime_context_for_cycle()
+            cycle_nifty_series = fetch_cycle_nifty_series()
+        except Exception:
+            logger.exception("[live_scanner] cycle-level Nifty fetch failed — "
+                              "batches will each fetch their own copy instead")
+
+        try:
+            regime_ctx = build_regime_context_for_cycle(nifty_series=cycle_nifty_series)
         except Exception:
             logger.exception("[live_scanner] regime context fetch failed — reusing previous cycle's regime")
             regime_ctx = None
@@ -726,7 +743,7 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                 df_raw = None
                 df_batch = None
                 try:
-                    df_raw = compute_live_scan_batch(chunk, settings={"workers": max_workers})
+                    df_raw = compute_live_scan_batch(chunk, settings={"workers": max_workers}, nifty_series=cycle_nifty_series)
                     df_batch = apply_regime_layer(df_raw, regime_ctx) if (regime_ctx and df_raw is not None and not df_raw.empty) else df_raw
                     n_ok = 0
                     for rec in _live_scan_records(df_batch):
