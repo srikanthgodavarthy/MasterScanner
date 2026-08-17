@@ -3192,10 +3192,34 @@ def render(settings: dict | None = None):
     # First load of the session (or a manual click) is synchronous;
     # _dash_scan_autorefresh() above then keeps it current in the
     # background without the user needing to click Refresh.
-    ctrl1, ctrl2 = st.columns([1, 5])
+    ctrl1, ctrl2, ctrl3 = st.columns([1, 1, 4])
     with ctrl1:
         _refresh = st.button("🔄 Refresh", key="btn_dash_refresh",
                               help="Reload the latest completed scan from Supabase")
+    with ctrl2:
+        # [2026-08-17] Small diagnostics trigger for check_data_readiness.py
+        # (repo root) — runs it in-process (redirecting its print() output
+        # into an expander) instead of asking anyone to shell in and run
+        # `python check_data_readiness.py` by hand.
+        if st.button("🩺 Data Readiness", key="btn_data_readiness",
+                      help="Run check_data_readiness.py — outcome_checkpoints / "
+                           "entry-snapshot row counts and readiness verdict"):
+            import io
+            import contextlib
+            import check_data_readiness
+            _out = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(_out):
+                    check_data_readiness.main()
+            except SystemExit:
+                pass  # main() calls sys.exit(1) on a hard failure — output up to that point is still useful
+            except Exception as e:
+                _out.write(f"\nDiagnostic failed: {e}")
+            st.session_state["data_readiness_output"] = _out.getvalue()
+
+    if st.session_state.get("data_readiness_output"):
+        with st.expander("🩺 Data Readiness Diagnostics", expanded=True):
+            st.code(st.session_state["data_readiness_output"], language="text")
     if _refresh or "dash_scan_df" not in st.session_state:
         from utils.snapshot_cache import get_snapshot, get_snapshot_df
         _full = get_snapshot("live_scanner")
