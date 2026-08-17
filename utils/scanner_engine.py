@@ -2504,11 +2504,29 @@ def run_scanner(
         if row:
             results.append(row)
     if pending:
+        # [2026-08-17] Cancel what we can. A future that's still QUEUED
+        # (its worker thread hasn't started it yet) can be cancelled
+        # cleanly — that drops its reference to the submitted args (df,
+        # sector_series) immediately instead of leaving them queued
+        # indefinitely behind whatever's actually stuck. A future that's
+        # already RUNNING can't be force-cancelled (Python threads have
+        # no safe preemption), so cancel() returns False for those and we
+        # just count them — they'll keep occupying one of the pool's
+        # fixed worker slots until they finish on their own, but that's
+        # bounded by _SCORER_POOL_WORKERS rather than unbounded.
         stuck = [futures[f] for f in pending]
+        cancelled = 0
+        running = 0
+        for fut in pending:
+            if fut.cancel():
+                cancelled += 1
+            else:
+                running += 1
         _log.warning(
-            "scanner_engine: %d symbol(s) still scoring after %ss — skipping "
-            "for this run (last-good values elsewhere are unaffected): %s",
-            len(pending), _SCORE_WAIT_TIMEOUT_S, stuck,
+            "scanner_engine: %d symbol(s) still scoring after %ss — "
+            "%d cancelled before starting, %d still running (last-good "
+            "values elsewhere are unaffected): %s",
+            len(pending), _SCORE_WAIT_TIMEOUT_S, cancelled, running, stuck,
         )
 
     if not results:
