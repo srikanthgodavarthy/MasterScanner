@@ -203,7 +203,17 @@ def archive_daily_scan(df: pd.DataFrame, metadata: Optional[dict] = None) -> boo
     run_ts = datetime.now(timezone.utc).isoformat()
 
     try:
-        safe_df = df.astype(object).where(pd.notnull(df), None)
+        # [2026-08-17] This is THE serialization boundary for the archive
+        # table — full universe, every column, one immutable JSON row per
+        # trading day (the largest single matrix this module writes out).
+        # Downcast float64/int64 columns to their smallest safe dtype
+        # here, before the astype(object) upcast below (which would make
+        # a downcast a no-op) — see json_sanitize.prepare_output_payload()'s
+        # docstring for why this stays scoped to boundaries like this one
+        # rather than applied earlier in the scan pipeline.
+        from utils.json_sanitize import prepare_output_payload
+        safe_df = prepare_output_payload(df)
+        safe_df = safe_df.astype(object).where(pd.notnull(safe_df), None)
         records = json.loads(safe_df.to_json(orient="records", date_format="iso"))
     except Exception as exc:
         logger.error("archive_daily_scan: serialization failed: %s", exc)

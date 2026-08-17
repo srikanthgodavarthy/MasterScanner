@@ -22,8 +22,14 @@ source, with column-level diagnostics) and utils/scan_state.py's
 save_snapshot() (the safety net for every other producer) for how this
 module gets used.
 
-Two layers, on purpose
-----------------------
+Three steps, on purpose
+------------------------
+0. prepare_output_payload() — OPTIONAL, boundary-only dtype downcast
+   (float64/int64 -> smallest safe dtype). Not a sanitization step (NaN/
+   inf pass through unchanged) — purely a size reduction for the payload
+   about to be serialized. See its own docstring for why it's scoped to
+   the boundary only, and call it before, never after, sanitize_dataframe()
+   (which upcasts to `object` and would make downcast a no-op).
 1. sanitize_dataframe() — run by each producer (fo_scan, and anywhere else
    building a payload from a DataFrame) BEFORE .to_dict("records"). Pure
    by default — see that function's docstring for why logging moved out
@@ -126,6 +132,71 @@ def find_invalid_columns_by_source(df: pd.DataFrame, source_col: str) -> dict:
                 partial.setdefault(group_name, {})[col] = n_invalid
 
     return {"structural": structural, "partial": partial, "group_sizes": group_sizes}
+
+
+def prepare_output_payload(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Downcast float64/int64 columns to the smallest dtype that still holds
+    every value, immediately before a DataFrame leaves the process —
+    Supabase payload (`.to_dict("records")` / `.to_json(...)`), a disk
+    snapshot, or a UI table. Safe to call on an empty/None DataFrame
+    (no-op, returned unchanged).
+
+    [2026-08-17, batch-memory audit] Deliberately narrow in scope.
+    Earlier RAM-profiling of live_scanner (see utils/memory_profiler.py,
+    utils/native_memory_probe.py) found overall DataFrame memory is low —
+    the RSS pressure comes from glibc's malloc high-water mark during
+    peak allocation bursts (see scheduler/scan_worker.py's per-batch
+    cleanup and utils.scan_health_monitor._malloc_trim_reclaim()), not
+    from oversized dtypes sitting in memory long-term. Downcasting every
+    intermediate DataFrame everywhere would be low-leverage churn for
+    that problem and would risk silently narrowing a column some
+    mid-pipeline computation still needs int64/float64 precision for
+    (e.g. an accumulator that could overflow int32, or a ratio that needs
+    float64 headroom before rounding). Applying it ONLY at the
+    serialization boundary — right before a full-universe matrix like
+    live_scanner's ~(n_symbols, n_columns) output goes out over the wire
+    or to disk — gets the memory/bandwidth win on the largest, longest-
+    lived artifact without touching any in-flight computation.
+
+    Call this BEFORE sanitize_dataframe(), not after: sanitize_dataframe()
+    upcasts every column to `object` (so it can hold Python None in place
+    of NaN), and pd.to_numeric(..., downcast=...) is a no-op on an object
+    dtype column.
+    """
+    if df is None or df.empty:
+        return df
+
+    # [2026-08-17, peak-allocation follow-up] Rebuild column-by-column
+    # instead of `df.copy()` + in-place reassignment. The naive
+    # copy-then-shrink approach allocates a full, still-undowncast
+    # duplicate of `df` BEFORE any column narrows — i.e. it briefly
+    # DOUBLES peak memory at exactly the call site meant to reduce it.
+    # Building a new dict of Series (pd.to_numeric() already returns a
+    # freshly allocated, narrower array for numeric columns; non-numeric
+    # columns are referenced, not copied, since they're never written to
+    # here) avoids that transient double-width peak.
+    #
+    # This also avoids a correctness trap the naive copy-free version
+    # would have: assigning into `df[cols] = ...` in place mutates the
+    # CALLER's DataFrame — fine for the two current call sites (the
+    # `df` isn't read again afterward), but this function is documented
+    # for reuse (Supabase payload / disk snapshot / UI table), and a UI
+    # caller plausibly still holds and reuses that same reference
+    # elsewhere in the same rerun. Returning a genuinely new object
+    # keeps that contract (input untouched, output is what changed)
+    # without paying the double-peak cost.
+    out = {}
+    for col in df.columns:
+        s = df[col]
+        if s.dtype == "float64":
+            out[col] = pd.to_numeric(s, downcast="float")
+        elif s.dtype == "int64":
+            out[col] = pd.to_numeric(s, downcast="integer")
+        else:
+            out[col] = s
+
+    return pd.DataFrame(out, index=df.index)
 
 
 def sanitize_dataframe(df: pd.DataFrame, df_name: str = "dataframe", log_warnings: bool = False) -> pd.DataFrame:
