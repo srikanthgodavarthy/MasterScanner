@@ -1,38 +1,21 @@
-# ── glibc malloc-arena cap [2026-08-17, RAM-fragmentation fix] ─────────────
-# Root cause of the "RSS climbs to 700-850MB and dore_live_state keeps
-# skip_cycle-ing" pattern: NOT a Python object leak (memory_profiler's own
-# gc-tracked object totals stayed under ~90MB the whole session) but glibc
-# malloc arena fragmentation. This app runs ~9 concurrent threads (4
-# ThreadPoolExecutor workers + market_intelligence/dore_live_state/
-# retention/live_scanner scheduler threads) doing bursty allocate/free
-# cycles (per-symbol DataFrames, per-batch option chains). Each thread can
-# get its own glibc arena (default cap: 8 x num_cores), and freed memory
-# inside a per-thread arena isn't returned to the OS or reused by other
-# threads — it just accumulates as "freed but held" pages, which is exactly
-# what scan_health_monitor.py's malloc_trim(0) reclaims (50-170MB per call
-# in production logs) without touching a single live object.
-#
-# MALLOC_ARENA_MAX env var is the textbook fix, but glibc reads it during
-# ptmalloc_init() on the FIRST malloc call in the process — which can
-# happen before Python code ever runs (interpreter startup itself
-# allocates). Setting it via os.environ here is too late to be guaranteed
-# to take effect. mallopt() is the reliable code-level equivalent: it
-# reconfigures the SAME parameter (M_ARENA_MAX) directly at runtime, and
-# unlike the env var it's safe to call any time — it just caps arena count
-# for all FUTURE arena creation from this point on. Belt-and-braces: also
-# set MALLOC_ARENA_MAX=2 in Streamlit Cloud's app Advanced Settings (env
-# vars there ARE applied before the process starts), so both paths agree.
-try:
-    import ctypes
-    _libc = ctypes.CDLL("libc.so.6")
-    M_ARENA_MAX = -8  # glibc mallopt() param constant
-    _libc.mallopt(M_ARENA_MAX, 2)
-except (OSError, AttributeError):
-    pass  # non-glibc platform (e.g. local macOS dev) — no-op, harmless
+# ── glibc malloc tuning [2026-08-17, RAM investigation] ────────────────────
+# M_ARENA_MAX + M_TRIM_THRESHOLD, applied via utils/malloc_tuning.py — see
+# that module's docstring for the full root-cause writeup and why this is
+# a deliberately narrow, two-lever experiment (no M_MMAP_THRESHOLD yet).
+# Applied here, before streamlit/pandas import, for the earliest possible
+# effect. ROOT has to go on sys.path first — this is the very first import
+# in the file, so utils/ isn't importable without it yet.
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from utils.malloc_tuning import apply_malloc_tuning, log_malloc_tuning_state
+_malloc_tuning_result = apply_malloc_tuning()
 
 import streamlit as st
-import sys
-import os
 import gzip
 import io
 import logging
@@ -40,10 +23,6 @@ import logging.handlers
 import requests
 import pandas as pd
 from dotenv import load_dotenv
-
-ROOT = os.path.dirname(os.path.abspath(__file__))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
 
 # 2026-07-20: nothing in this codebase ever called logging.basicConfig()
 # (or any other handler/level setup) anywhere — the root logger's default
@@ -81,6 +60,13 @@ if not logging.getLogger().handlers:
     # were — instead the logger itself is fully disabled here so nothing
     # it emits, at any level, ever reaches a handler.
     logging.getLogger("httpx").disabled = True
+
+# [2026-08-17] Explicit startup verification for the malloc tuning applied
+# at the very top of this file, before any handler existed to log it —
+# see utils/malloc_tuning.py's docstring on why mallopt()'s own return
+# code (captured in _malloc_tuning_result above), not just the env vars,
+# is the real signal this process's allocator is actually tuned.
+log_malloc_tuning_state(logging.getLogger("app"), _malloc_tuning_result)
 
 load_dotenv()  # picks up UPSTOX_ACCESS_TOKEN from a local .env if present
 
