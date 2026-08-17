@@ -875,6 +875,16 @@ def leadership_prescreen(
     if len(df) < min_bars or len(nifty) < min_bars:
         return True   # not enough history to prescreen safely — let it through
 
+    # [2026-08-17 duplicate-index fix] nifty.reindex() below raises
+    # "cannot reindex on an axis with duplicate labels" if `nifty`'s own
+    # index isn't unique (a duplicate df.index as the reindex TARGET is
+    # harmless — pandas just emits repeated rows — it's the SOURCE object,
+    # here `nifty`, that must be unique). fetch_nifty() now dedupes before
+    # caching, but this stays as a cheap defensive check in case `nifty`
+    # ever arrives from a path that doesn't go through fetch_nifty().
+    if nifty.index.duplicated().any():
+        nifty = nifty[~nifty.index.duplicated(keep="last")].sort_index()
+
     c = df["close"]
     n = nifty.reindex(df.index).ffill()
 

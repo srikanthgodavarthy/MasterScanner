@@ -42,7 +42,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-def _run_batch(symbols: list, settings: dict | None) -> pd.DataFrame:
+def _run_batch(symbols: list, settings: dict | None, nifty_series=None) -> pd.DataFrame:
     from utils.scanner_engine import run_scanner, NIFTY500_SYMBOLS
 
     settings = dict(settings or {})
@@ -56,32 +56,60 @@ def _run_batch(symbols: list, settings: dict | None) -> pd.DataFrame:
         cci_os=settings.get("cci_os", -100),
         max_workers=settings.get("workers", 10),
         source="yfinance",
+        nifty_series=nifty_series,
     )
 
 
-def compute_live_scan_batch(symbols: list, settings: dict | None = None) -> pd.DataFrame:
+def compute_live_scan_batch(symbols: list, settings: dict | None = None, nifty_series=None) -> pd.DataFrame:
     """
     Raw two-phase scan (fetch + score) for a single batch of symbols,
     WITHOUT the regime layer. See module docstring. Returns df_raw, or
     an empty DataFrame on failure/no-data.
+
+    nifty_series: [2026-08-17] Optional pre-fetched Nifty close Series
+    for the whole cycle — see run_scanner()'s docstring for why. When
+    omitted, run_scanner() falls back to its own fetch_nifty() call
+    (previous per-batch behaviour, unchanged for callers that don't
+    have a cycle-level series to share, e.g. compute_live_scan() below).
     """
-    df_raw = _run_batch(symbols, settings)
+    df_raw = _run_batch(symbols, settings, nifty_series=nifty_series)
     return df_raw if df_raw is not None else pd.DataFrame()
 
 
-def build_regime_context_for_cycle(settings: dict | None = None):
+def fetch_cycle_nifty_series():
+    """
+    [2026-08-17] Fetch Nifty once for the whole live-scanner cycle, so
+    scheduler/scan_worker.py can pass the SAME Series into both
+    build_regime_context_for_cycle() and every compute_live_scan_batch()
+    call in that cycle, instead of each of those independently hitting
+    fetch_nifty()'s 60s cache and occasionally re-fetching. See
+    run_scanner()'s nifty_series docstring for the duplicate-index
+    incident this closes off. fetch_nifty() itself already dedupes any
+    duplicate-dated rows before returning.
+    """
+    from utils.scanner_engine import fetch_nifty
+    return fetch_nifty("1y")
+
+
+def build_regime_context_for_cycle(settings: dict | None = None, nifty_series=None):
     """
     Fetches Nifty once and classifies the current regime
     (TREND/RANGE/VOLATILE). Meant to be called ONCE per live-scanner
     cycle (every 5 min) and the returned context reused across every
     batch in that cycle via utils.regime_engine.apply_regime_layer(df, ctx)
     — not re-fetched per batch.
+
+    nifty_series: [2026-08-17] Optional pre-fetched Series (e.g. from
+    fetch_cycle_nifty_series()) so the regime context and every scan
+    batch in the cycle score against the exact same Nifty data. Falls
+    back to fetching its own copy if omitted, unchanged from before.
     """
     from utils.scanner_engine import fetch_nifty
     from utils.regime_engine import build_regime_context
 
     settings = dict(settings or {})
-    nifty_series = fetch_nifty("1y")
+    if nifty_series is None:
+        nifty_series = fetch_nifty("1y")
     return build_regime_context(
         nifty=nifty_series,
         execute_threshold=settings.get("execute_threshold", 70),

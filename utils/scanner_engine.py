@@ -703,13 +703,28 @@ def fetch_nifty(period: str = "1y", source: str = "yfinance") -> pd.Series:
     source="upstox" fetches via upstox_client.fetch_index_ohlcv_upstox("NIFTY"),
     falling back to yfinance (same fail-soft convention used throughout
     this app) if that comes back empty.
+
+    [2026-08-17 duplicate-index fix] yfinance occasionally hands back two
+    rows for the same trading date (a known flakiness, usually around a
+    still-forming/restated intraday bar) — Upstox has shown the same
+    behaviour on rare reconnects. Every caller downstream treats this
+    Series as having a unique daily index (leadership_prescreen()'s
+    nifty.reindex(df.index) in utils/scoring_core.py is the one that
+    actually crashes on it: reindex() raises "cannot reindex on an axis
+    with duplicate labels" when the SOURCE object's index isn't unique,
+    which is exactly what a duplicated nifty index is). Deduping once
+    here, before the cache stores the result, protects every caller in
+    one place instead of requiring each of them to defend against it.
     """
     if source == "upstox":
         try:
             from utils.upstox_client import fetch_index_ohlcv_upstox
             df = fetch_index_ohlcv_upstox("NIFTY", period)
             if not df.empty:
-                return df["close"].rename("nifty")
+                nifty = df["close"].rename("nifty")
+                if nifty.index.duplicated().any():
+                    nifty = nifty[~nifty.index.duplicated(keep="last")].sort_index()
+                return nifty
         except Exception:
             pass
         # fall through to yfinance below
@@ -718,6 +733,8 @@ def fetch_nifty(period: str = "1y", source: str = "yfinance") -> pd.Series:
         if not df.empty:
             nifty = df["Close"].rename("nifty")
             nifty.index = _strip_tz(pd.to_datetime(nifty.index))
+            if nifty.index.duplicated().any():
+                nifty = nifty[~nifty.index.duplicated(keep="last")].sort_index()
             return nifty
     except Exception:
         pass
@@ -2287,6 +2304,7 @@ def run_scanner(
     progress_cb       = None,
     source:      str  = "yfinance",
     source_warn_cb    = None,
+    nifty_series: "pd.Series | None" = None,
 ) -> pd.DataFrame:
     """
     Two-phase scanner.
@@ -2301,6 +2319,20 @@ def run_scanner(
     symbols are filled in from yfinance rather than dropped, and
     source_warn_cb(str) — if given — is called so the caller can surface
     what happened without failing the whole scan.
+
+    nifty_series: [2026-08-17] Optional pre-fetched Nifty close Series.
+    When omitted, run_scanner() calls fetch_nifty() itself as before
+    (fine for one-shot callers like the manual "Run Scan" button, which
+    only ever calls run_scanner() once). scheduler/scan_worker.py's live
+    scanner instead calls run_scanner() once per ~50-symbol sub-batch —
+    letting each of those calls independently hit fetch_nifty()'s 60s
+    cache meant every batch had its own chance of landing on a cache
+    miss and re-fetching, so a single flaky yfinance response (e.g. a
+    duplicate-dated row) only ever corrupted the one batch unlucky
+    enough to trigger the miss, rather than the whole cycle failing
+    identically everywhere (which would have been easier to notice).
+    Passing one already-fetched, already-deduped Series in for the whole
+    cycle removes that per-batch lottery entirely.
     """
     def _warn(msg: str) -> None:
         if source_warn_cb:
@@ -2384,7 +2416,8 @@ def run_scanner(
     except Exception:
         pass   # non-fatal — fall back to cached OHLCV
 
-    nifty_series = fetch_nifty("1y", source=fetch_source)
+    if nifty_series is None:
+        nifty_series = fetch_nifty("1y", source=fetch_source)
     regime_val   = nifty_regime(nifty_series)   # bull / bear / neutral — computed once
 
     # Inject regime into settings so ScoringParams picks it up
