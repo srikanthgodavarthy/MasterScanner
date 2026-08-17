@@ -105,27 +105,43 @@ class MallocTuningResult(NamedTuple):
     available: bool  # False on non-glibc platforms (e.g. local macOS dev)
 
 
+# [2026-08-17] Process-level memoization. app.py is Streamlit's entry
+# SCRIPT, not a plain imported module — Streamlit re-execs its top-level
+# code on every rerun (every widget interaction), so a bare top-level
+# `apply_malloc_tuning()` call in app.py runs once per rerun, not once
+# per process. app.py's own globals don't survive a rerun, but this
+# module does (it stays cached in sys.modules once imported), so the
+# guard has to live here, not at the call site. First call actually
+# touches ctypes/mallopt; every call after that — however many reruns —
+# just returns the cached result.
+_cached_result: MallocTuningResult | None = None
+
+
 def apply_malloc_tuning() -> MallocTuningResult:
     """
     Apply the M_ARENA_MAX / M_TRIM_THRESHOLD mallopt() tuning to the
-    CURRENT process. Idempotent and cheap — safe to call more than once
-    (e.g. once at module-import time for the earliest possible effect,
-    and the SAME captured result reused later purely for logging once a
-    handler exists — see log_malloc_tuning_state()). Re-calling this
-    function itself is harmless (mallopt() just re-applies the same
-    value) but isn't necessary; callers should call it once and reuse
-    the returned result.
+    CURRENT process. Memoized at module level — mallopt() actually runs
+    exactly once per process, on the first call; every subsequent call
+    (e.g. from app.py re-executing its top-level code on each Streamlit
+    rerun) just returns that first call's cached MallocTuningResult
+    instead of re-touching ctypes/libc. Safe to call from as many
+    places/reruns as needed.
 
     Returns a MallocTuningResult reflecting mallopt()'s own return code
-    for THIS call — not env var presence, not a guess — since that
-    return code is the ground truth for whether the allocator actually
-    accepted the value.
+    from the call that actually ran — not env var presence, not a
+    guess — since that return code is the ground truth for whether the
+    allocator actually accepted the value.
     """
+    global _cached_result
+    if _cached_result is not None:
+        return _cached_result
+
     try:
         libc = ctypes.CDLL("libc.so.6")
     except OSError:
         # Non-glibc platform (e.g. local macOS dev) — no-op, harmless.
-        return MallocTuningResult(False, False, available=False)
+        _cached_result = MallocTuningResult(False, False, available=False)
+        return _cached_result
 
     arena_ok = False
     trim_ok = False
@@ -137,7 +153,8 @@ def apply_malloc_tuning() -> MallocTuningResult:
         trim_ok = bool(libc.mallopt(_M_TRIM_THRESHOLD, TRIM_THRESHOLD_VALUE))
     except AttributeError:
         pass
-    return MallocTuningResult(arena_ok, trim_ok, available=True)
+    _cached_result = MallocTuningResult(arena_ok, trim_ok, available=True)
+    return _cached_result
 
 
 def log_malloc_tuning_state(logger: logging.Logger, result: MallocTuningResult) -> None:
