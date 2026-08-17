@@ -106,18 +106,25 @@ of those loops.
 from __future__ import annotations
 
 # ── glibc malloc-arena cap [2026-08-17] ─────────────────────────────
-# Mirrors app.py's fix — this is a SEPARATE process (see module
-# docstring above: `python -m scheduler.scan_worker`, never imports
-# app.py), so app.py's mallopt() call doesn't help it at all. This is
-# the actual process every RSS/malloc_trim/skip_cycle log line in the
-# RAM investigation came from, so it needs its own cap, not just a
-# log line confirming the env var. Placed before the `import pandas`
-# below (and before logging.basicConfig() further down, in main()) —
-# as early in this process's life as possible, same reasoning as
-# app.py's comment: MALLOC_ARENA_MAX the env var is read by glibc at
-# the first malloc() call, which can happen before any of our own code
-# runs, so mallopt() at runtime is the reliable equivalent regardless
-# of how early this line executes relative to that.
+# Mirrors app.py's fix. This module gets loaded two different ways
+# depending on deployment:
+#   1. Standalone: `python -m scheduler.scan_worker` — its own OS
+#      process, never imports app.py, so app.py's mallopt() call never
+#      runs for it.
+#   2. In-process: utils/inprocess_scheduler.py imports FROM this
+#      module (see its start_background_scans()) and runs the same
+#      loop functions as threads inside app.py's own Streamlit process
+#      — confirmed from a real deploy log, 2026-08-17, showing
+#      "In-process scheduler: started market_intelligence thread"
+#      alongside this module's own "scan_worker:"-prefixed log lines.
+# In case (2), app.py's mallopt() call already covers this process —
+# but this cap is placed at MODULE level specifically so it's a no-op
+# double-apply there (harmless) and the actual fix in case (1), rather
+# than depending on every current and future entrypoint remembering to
+# call it. Every RSS/malloc_trim/skip_cycle log line examined in the
+# RAM investigation came from a process running these loop functions,
+# so this cap needs to be active regardless of which of the two ways
+# got them running.
 try:
     import ctypes
     _libc = ctypes.CDLL("libc.so.6")
@@ -135,6 +142,25 @@ import traceback
 import pandas as pd
 
 logger = logging.getLogger("scan_worker")
+
+# [2026-08-17, SG request] Confirms MALLOC_ARENA_MAX / MALLOC_TRIM_THRESHOLD_
+# visibility to whichever process actually loaded this module. Deliberately
+# at MODULE level (not only inside main() below) — a real deploy log
+# (2026-08-17) showed this app running the in-process scheduler path (see
+# the comment above the mallopt() call), where main() never executes at
+# all, so a main()-only log line is permanently silent for that topology.
+#
+# This call is only actually VISIBLE for the in-process path: app.py's
+# logging.basicConfig() has already run by the time it imports
+# utils.inprocess_scheduler (which imports this module), so a handler
+# already exists here. For the standalone path (`python -m
+# scheduler.scan_worker`), this exact line runs BEFORE main()'s own
+# basicConfig() call below — no handler exists yet, so THIS call is
+# silently dropped there (verified directly, not assumed) — which is
+# fine, because main()'s duplicate call, after its own basicConfig(),
+# covers that path instead. Between the two, exactly one always fires.
+logger.info("malloc tuning (module load): ARENA_MAX=%s TRIM_THRESHOLD=%s",
+            os.environ.get("MALLOC_ARENA_MAX"), os.environ.get("MALLOC_TRIM_THRESHOLD_"))
 
 # ── Live Scanner sub-scheduler tuning ─────────────────────────────────
 LIVE_SCANNER_INTERVAL_SECS  = 300   # full-universe cycle target (5 min)
