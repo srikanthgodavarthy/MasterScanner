@@ -1,3 +1,35 @@
+# ── glibc malloc-arena cap [2026-08-17, RAM-fragmentation fix] ─────────────
+# Root cause of the "RSS climbs to 700-850MB and dore_live_state keeps
+# skip_cycle-ing" pattern: NOT a Python object leak (memory_profiler's own
+# gc-tracked object totals stayed under ~90MB the whole session) but glibc
+# malloc arena fragmentation. This app runs ~9 concurrent threads (4
+# ThreadPoolExecutor workers + market_intelligence/dore_live_state/
+# retention/live_scanner scheduler threads) doing bursty allocate/free
+# cycles (per-symbol DataFrames, per-batch option chains). Each thread can
+# get its own glibc arena (default cap: 8 x num_cores), and freed memory
+# inside a per-thread arena isn't returned to the OS or reused by other
+# threads — it just accumulates as "freed but held" pages, which is exactly
+# what scan_health_monitor.py's malloc_trim(0) reclaims (50-170MB per call
+# in production logs) without touching a single live object.
+#
+# MALLOC_ARENA_MAX env var is the textbook fix, but glibc reads it during
+# ptmalloc_init() on the FIRST malloc call in the process — which can
+# happen before Python code ever runs (interpreter startup itself
+# allocates). Setting it via os.environ here is too late to be guaranteed
+# to take effect. mallopt() is the reliable code-level equivalent: it
+# reconfigures the SAME parameter (M_ARENA_MAX) directly at runtime, and
+# unlike the env var it's safe to call any time — it just caps arena count
+# for all FUTURE arena creation from this point on. Belt-and-braces: also
+# set MALLOC_ARENA_MAX=2 in Streamlit Cloud's app Advanced Settings (env
+# vars there ARE applied before the process starts), so both paths agree.
+try:
+    import ctypes
+    _libc = ctypes.CDLL("libc.so.6")
+    M_ARENA_MAX = -8  # glibc mallopt() param constant
+    _libc.mallopt(M_ARENA_MAX, 2)
+except (OSError, AttributeError):
+    pass  # non-glibc platform (e.g. local macOS dev) — no-op, harmless
+
 import streamlit as st
 import sys
 import os
