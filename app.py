@@ -294,6 +294,22 @@ with st.expander("🔌 Upstox Pilot Check (token sanity test)", expanded=False):
                         else:
                             st.warning("Empty response — market may be closed or instrument_key is stale.")
 
+with st.expander("🔬 Memory Diagnostics (temporary — RAM investigation)", expanded=False):
+    if st.button("🔬 Capture Memory Snapshot"):
+        import gc
+        import psutil
+        from utils.memory_profiler import run_memory_profile
+        from utils.native_memory_probe import full_report
+
+        gc.collect()
+        profile_report = run_memory_profile()
+        native_report = full_report()
+        rss_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+
+        st.success(f"Memory snapshot captured. Current RSS: {rss_mb:.1f} MB")
+        st.caption("Full detail also written to the app logs (see `memory_profiler` / `native_memory_probe` loggers).")
+        st.json({"process_profile": profile_report, "native_probe": native_report})
+
 from pages.dashboard     import render as render_dashboard
 from pages.sectors       import render as render_sectors
 from pages.scanner       import render as render_scanner
