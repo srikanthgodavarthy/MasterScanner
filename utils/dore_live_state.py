@@ -545,9 +545,41 @@ def refresh_dore_live_state(cfg=None) -> dict:
     # field's actual published shape (True for carried-forward rows,
     # absent for fresh ones — unchanged).
     if "_carried_forward" in df.columns:
-        df["_source_label"] = df["_carried_forward"].map(
-            lambda v: "carried_forward_open" if v is True else "fresh_stage1"
-        )
+        # [Fix, 2026-08-17] "fresh_stage1" was one label covering two
+        # genuinely different row shapes: a WAITING (not-yet-triggered)
+        # candidate and an ACTIVE (entry-locked) one. entry_locked,
+        # drift_pct, plan_age_days, and risk_reward_ratio are only ever
+        # populated by enrich_trade_plans_with_persistence() once a plan
+        # has actually triggered — a WAITING row structurally lacks them,
+        # same as a carried-forward row structurally lacks
+        # risk_reward_ratio. Splitting on entry_locked here (in addition
+        # to the existing carried_forward split) lets those four columns
+        # land in "structural" (100% NaN within the WAITING sub-group —
+        # expected, INFO) instead of "partial" (some-but-not-all NaN
+        # across the mixed WAITING+ACTIVE fresh_stage1 group — logged as
+        # a false-alarm WARNING every cycle that a WAITING/ACTIVE mix was
+        # present, which is every cycle with at least one untriggered
+        # plan). Purely a diagnostic-grouping change — doesn't touch
+        # which rows get persisted or what values they carry.
+        def _label(row) -> str:
+            # pd.notna() + bool() here, not `row["_carried_forward"] is
+            # True` — matches the same NaN-safety reasoning as the
+            # entry_locked check below, and doesn't depend on pandas
+            # keeping this column as Python bool/object dtype rather
+            # than upcasting (e.g. if a future row shape ever mixes in
+            # a NaN here too, `is True` would silently misclassify it
+            # the same way bare truthiness did for entry_locked).
+            carried = row.get("_carried_forward")
+            if pd.notna(carried) and bool(carried):
+                return "carried_forward_open"
+            entry_locked = row.get("entry_locked")
+            return (
+                "fresh_stage1_active"
+                if pd.notna(entry_locked)
+                else "fresh_stage1_waiting"
+            )
+
+        df["_source_label"] = df.apply(_label, axis=1)
         breakdown = find_invalid_columns_by_source(df, "_source_label")
         df = df.drop(columns=["_source_label"])
     else:
