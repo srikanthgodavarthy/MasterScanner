@@ -29,6 +29,27 @@ warnings.filterwarnings("ignore")
 # fetch_ohlcv` call sites keep working unchanged.
 from utils.market_data import fetch_ohlcv, _strip_tz  # noqa: F401  (re-export)
 
+# [2026-08-17] Persistent, module-level scorer pool — reused across every
+# run_scanner() call instead of spun up fresh per batch (10x/cycle, every
+# 5 min). The old per-call ThreadPoolExecutor(max_workers=...) combined
+# with shutdown(wait=False) meant that any symbol whose score_stock() call
+# ran past _SCORE_WAIT_TIMEOUT_S left its worker thread running in the
+# background *forever* (Python can't force-kill a thread) — and every one
+# of those leaked threads pinned its whole closure (all_data for the
+# batch, _sector_frames, nifty_series, ...) in memory. Across many cycles
+# this showed up as steadily climbing RSS, duplicate multi-MB DataFrames
+# retained simultaneously in utils.memory_profiler's dataframe dump, and
+# a linearly growing weakref (ReferenceType) count — see RAM investigation
+# notes. A single long-lived pool means a stuck symbol still only costs
+# one permanently-busy worker slot (bounded, not unbounded growth), and
+# process() below (in run_scanner()) narrows what gets captured so a
+# stuck future pins one symbol's frame instead of the entire batch's
+# all_data dict.
+_SCORER_POOL_WORKERS = 6
+_scorer_pool = ThreadPoolExecutor(
+    max_workers=_SCORER_POOL_WORKERS, thread_name_prefix="scorer-pool"
+)
+
 _log = logging.getLogger(__name__)
 
 try:
@@ -2408,16 +2429,18 @@ def run_scanner(
             _sector_frames = {}
             sector_benchmark_for_symbol = None  # noqa: F811 — degrade to no sector RS if this fails
 
-    def process(sym):
-        df = all_data.get(sym, pd.DataFrame())
-        if df.empty:
+    # [2026-08-17] Narrowed closure: only pull the one symbol's frame and
+    # sector series out of the batch-wide dicts *before* submitting, so a
+    # future that never finishes (see _scorer_pool note above) pins one
+    # DataFrame instead of keeping the entire batch's `all_data` dict (and
+    # `_sector_frames`, `nifty_series`, `effective_settings`, etc.) alive
+    # via the closure for as long as that leaked thread happens to live.
+    def process(sym, df, sector_series):
+        if df is None or df.empty:
             return None
-        _sector_series = None
-        if sector_benchmark_for_symbol is not None:
-            _sector_series = sector_benchmark_for_symbol(_sector_frames, sym)
         row = score_stock(df, nifty_series, settings=effective_settings,
                           cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
-                          symbol=sym, sector_series=_sector_series)
+                          symbol=sym, sector_series=sector_series)
         if row:
             row["Stock"] = sym
         return row
@@ -2430,50 +2453,63 @@ def run_scanner(
     # timeout issue documented on yf_download_with_retry() above — that
     # risk lives earlier, in the get_live_history_cached() fetch loop, and
     # isn't addressed by this change. This is defense-in-depth for THIS
-    # executor specifically: previously a single stuck future would block
+    # pool specifically: previously a single stuck future would block
     # every other future's result from ever being collected, since
     # as_completed()/fut.result() have no timeout — one bad symbol could
     # silently stall the whole scan (and, via _run_live_scanner_loop,
     # every future batch) forever. Now a stuck symbol just gets skipped
     # for this run (logged, not silently dropped) while every other
     # symbol's already-finished result still gets collected and returned.
+    #
+    # [2026-08-17] Submits to the persistent module-level _scorer_pool
+    # instead of a fresh ThreadPoolExecutor per call — see the pool's
+    # definition near the top of this file for why. No shutdown() here:
+    # the pool outlives this function call by design, across every batch
+    # and every cycle. A permanently-stuck future just occupies one of the
+    # pool's max_workers slots forever; with max_workers fixed, the worst
+    # case is bounded (at most _SCORER_POOL_WORKERS symbols ever
+    # permanently stuck at once) instead of growing without limit.
     _SCORE_WAIT_TIMEOUT_S = 45
-    exe = ThreadPoolExecutor(max_workers=max_workers)
-    try:
-        futures = {exe.submit(process, s): s for s in symbols}
-        finished, pending = wait(futures, timeout=_SCORE_WAIT_TIMEOUT_S)
-        for fut in finished:
-            done += 1
-            if progress_cb:
-                progress_cb(
-                    0.5 + 0.5 * done / total,
-                    text=f"Scoring stocks — {done}/{total}",
-                )
-            try:
-                row = fut.result()
-            except Exception:
-                _log.exception("scanner_engine: score_stock failed for %s", futures[fut])
-                row = None
-            if row:
-                results.append(row)
-        if pending:
-            stuck = [futures[f] for f in pending]
-            _log.warning(
-                "scanner_engine: %d symbol(s) still scoring after %ss — skipping "
-                "for this run (last-good values elsewhere are unaffected): %s",
-                len(pending), _SCORE_WAIT_TIMEOUT_S, stuck,
+    futures = {
+        _scorer_pool.submit(
+            process,
+            s,
+            all_data.get(s),
+            sector_benchmark_for_symbol(_sector_frames, s)
+            if sector_benchmark_for_symbol is not None else None,
+        ): s
+        for s in symbols
+    }
+    # No try/finally around this section anymore — the old `finally:
+    # exe.shutdown(wait=False)` existed only to tear down the per-call
+    # executor without blocking on stuck workers. _scorer_pool is
+    # module-level and persistent (see its definition near the top of
+    # this file), reused across every batch/cycle, so there is nothing to
+    # shut down here. A pending/stuck future just keeps occupying one of
+    # the pool's fixed worker slots (bounded — see the pool's own
+    # comment) until it eventually finishes on its own.
+    finished, pending = wait(futures, timeout=_SCORE_WAIT_TIMEOUT_S)
+    for fut in finished:
+        done += 1
+        if progress_cb:
+            progress_cb(
+                0.5 + 0.5 * done / total,
+                text=f"Scoring stocks — {done}/{total}",
             )
-    finally:
-        # wait=False: don't let a stuck thread hold up returning from
-        # run_scanner() the way the old `with ThreadPoolExecutor(...) as exe`
-        # block would have (its __exit__ calls shutdown(wait=True) by
-        # default, which would silently re-introduce the same unbounded
-        # block the wait(timeout=...) above was meant to avoid). Any
-        # genuinely stuck worker thread keeps running in the background
-        # until it finishes on its own (Python can't force-kill a running
-        # thread) — harmless here since it only ever tries to append to a
-        # local `results` list that's already been returned by then.
-        exe.shutdown(wait=False)
+        try:
+            row = fut.result()
+        except Exception:
+            _log.exception("scanner_engine: score_stock failed for %s", futures[fut])
+            row = None
+        if row:
+            results.append(row)
+    if pending:
+        stuck = [futures[f] for f in pending]
+        _log.warning(
+            "scanner_engine: %d symbol(s) still scoring after %ss — skipping "
+            "for this run (last-good values elsewhere are unaffected): %s",
+            len(pending), _SCORE_WAIT_TIMEOUT_S, stuck,
+        )
 
     if not results:
         return pd.DataFrame()
