@@ -142,43 +142,7 @@ def _wait_for_spacing():
         _yf_last_call_ts = time.monotonic()
 
 
-def _prune_multitasking_tasks() -> None:
-    """[Thread-leak fix, 2026-08-17] yfinance's batch downloader still
-    uses the `multitasking` package internally for threads=True (see
-    multitasking/__init__.py's `task` decorator). Every worker thread it
-    spawns is unnamed (default `Thread-N` from Python's own counter —
-    this is what shows up as `Thread-507..Thread-512` in a thread dump
-    after the process has been running a while: not 500 threads alive
-    at once, but confirmation that ~500 of these have been *created*
-    over the process lifetime) and gets permanently appended to
-    `multitasking.config["TASKS"]` — a module-level list that NOTHING
-    in the library ever prunes, not even its own `wait_for_tasks()`
-    (which only polls `is_alive()` against local copies, never touches
-    `config["TASKS"]` itself). Every completed download thread — plus
-    its closure over that call's args/kwargs — is held forever, for
-    the life of the process. This directly explains the steadily
-    climbing `ReferenceType` GC-tracked count seen in memory_profiler
-    across scan cycles, and is a separate leak from (additive to) the
-    arena-fragmentation RAM issue already fixed via mallopt().
-
-    Call this after every yf_download_with_retry() attempt (success or
-    failure — either way the spawned threads are done running, since
-    yf.download() itself blocks until its batch completes) to drop
-    references to tasks that have finished, so they can actually be
-    garbage collected instead of sitting in that list forever. Safe to
-    call even if `multitasking` isn't importable or its shape changes
-    in a future version — never raises, worst case this becomes a
-    no-op and the leak returns rather than crashing a scan cycle.
-    """
-    try:
-        import multitasking
-        tasks = multitasking.config["TASKS"]
-        multitasking.config["TASKS"] = [t for t in tasks if t is not None and t.is_alive()]
-    except Exception:
-        pass
-
-
-
+def yf_download_with_retry(tickers, **kwargs):
     """
     Thin wrapper around yf.download() that adds:
       - a bounded per-attempt timeout,
@@ -238,19 +202,6 @@ def _prune_multitasking_tasks() -> None:
                 time.sleep(backoff)
             attempt += 1
             continue
-        finally:
-            # [Thread-leak fix, 2026-08-17] fires on EVERY attempt — success,
-            # caught exception (even the ones that `continue` above), or an
-            # uncaught one — because `finally` always runs when control
-            # leaves this try/except, regardless of which path. Each
-            # yf.download(threads=True) call is exactly where
-            # multitasking's leaked Thread objects get created (see
-            # _prune_multitasking_tasks()'s own docstring), so pruning
-            # right after each attempt — rather than only once when this
-            # function finally returns — keeps the list from growing
-            # across the retries within a single call too, not just
-            # across separate calls.
-            _prune_multitasking_tasks()
 
         # No exception raised — but Yahoo's soft rate-limit/block on cloud
         # IPs frequently comes back as an ordinary 200 response with zero
