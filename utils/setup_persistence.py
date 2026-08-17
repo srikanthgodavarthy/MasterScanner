@@ -772,12 +772,13 @@ def enrich_scanner_row(
                         instead of only ever seeing `current_price`.
                         Defaults to `current_price` (old point-sample
                         behaviour) when not supplied.
-    pre_breakout      : [2026-08-07, SG request; formula updated 2026-08-14]
-                        when True, this row already passed the Pre-Breakout
-                        Active Trigger check — see `_is_pre_breakout_qualified()`
-                        for the exact formula (trend_up AND SQUEEZE=="RELEASED"
-                        AND VOL_RATIO>=1.5 AND CONVICTION>=60 AND
-                        55<RSI<=70) — at
+    pre_breakout      : [2026-08-07, SG request; formula updated 2026-08-14,
+                        re-ranked 2026-08-17] when True, this row already
+                        passed the Pre-Breakout Active Trigger check — see
+                        `_classify_active_trigger_phase()` for the ranked
+                        formula (PRE_BREAKOUT_ACTIVE: SQZ-still-on + vol/
+                        momentum/conviction confirmed, OR BREAKOUT_ACTIVE:
+                        RELEASED + same confirmation) computed at
                         the call site — mint a plan off THAT signal, tagged
                         source="PB", instead of requiring the Recommendation
                         tier to reach Actionable/Execute/Elite first. Still
@@ -920,88 +921,121 @@ def enrich_scanner_row(
 #  BATCH ENRICHMENT  (called by run_scanner after all rows computed)
 # ══════════════════════════════════════════════════════════════════
 
+_ACTIVE_TRIGGER_PHASES = (
+    "PRE_BREAKOUT_ACTIVE",  # Rank 1 — coiling + volume/momentum confirmed
+    "BREAKOUT_ACTIVE",      # Rank 2 — squeeze just released + confirmed
+    "BUILDING",             # Rank 3 — coiling, not yet confirmed
+    "WATCH",                # Rank 4 — released, not yet confirmed
+    "NONE",                 # doesn't qualify for a phase at all
+)
+
+
+def _classify_active_trigger_phase(row_dict: dict) -> str:
+    """
+    Rank a scanner row into one of the four Active Trigger phases.
+
+    [2026-08-17, SG request] Replaces the old single RELEASED-only gate.
+    The scanner's real objective isn't "the squeeze was released" — it's
+    catching the point where compression + institutional participation
+    (volume) + bullish momentum (RSI) + sufficient conviction are all
+    converging. A squeeze that's still coiling (SQZ) but already showing
+    that volume/momentum/conviction confirmation is an EARLIER, higher-
+    priority read on the same setup than waiting for RELEASED to print —
+    so it now outranks RELEASED instead of being ignored until RELEASED
+    fires.
+
+        confirmed = (VOL_RATIO > 1.5) AND (CONVICTION > 60) AND (RSI > 55)
+
+        Rank 1  PRE_BREAKOUT_ACTIVE  (⭐ "PRE-BREAKOUT ACTIVE")
+            = trend_up AND squeeze_on      AND confirmed
+        Rank 2  BREAKOUT_ACTIVE       (🚀 "BREAKOUT ACTIVE")
+            = trend_up AND squeeze_released AND confirmed
+        Rank 3  BUILDING
+            = trend_up AND squeeze_on      AND NOT confirmed
+        Rank 4  WATCH
+            = trend_up AND squeeze_released AND NOT confirmed
+
+    trend_up is kept as a hard requirement on every rank (not just the
+    two "Active" ranks) — this is the same guardrail restored on
+    2026-08-14 (see git history) to keep this function's output scoped
+    to stocks that also pass pages/scanner.py's `_is_pre_breakout` tab
+    filter (trend_up AND (squeeze_on OR squeeze_release) AND 45<=RSI<=70).
+    Dropping it here would let a non-trending stock reach BUILDING/WATCH
+    (and, upstream, PRE_BREAKOUT_ACTIVE/BREAKOUT_ACTIVE) without ever
+    appearing on the tab, which is the exact bug that guardrail exists
+    to prevent — see `_is_pre_breakout_qualified()` below.
+
+    NOTE the RSI condition here is a plain floor (RSI > 55), not the
+    45<=RSI<=70 band the basic tab qualification uses — this matches
+    the formula as specified for this ranking. A confirmed row with
+    RSI > 70 (already extended) will therefore rank as PRE_BREAKOUT_
+    ACTIVE/BREAKOUT_ACTIVE here even though it falls outside the tab's
+    45-70 display band. If that's not intended, add an explicit
+    `and rsi_val <= 70` to `confirmed` below to keep this in lockstep
+    with the tab filter the way the old RSI<=70 ceiling did.
+
+    Mapped onto fields already present on the scanner row:
+      trend_up   -> row_dict["_trend_up"], falling back to
+                    TrendPhase != "NONE".
+      squeeze_on -> row_dict["_squeeze_on"] — still coiling, not fired.
+      squeeze_released -> row_dict["_squeeze_release"] — the BB squeeze
+                    firing on this bar.
+      VOL_RATIO  -> row_dict["_vol_ratio"] — same field the tab's
+                    "vol_surge" boost tag reads.
+      CONVICTION -> row_dict["CV1_Conviction"], falling back to a bare
+                    "Conviction" key.
+      RSI        -> row_dict["_rsi"], falling back to "RSI".
+
+    Kept in sync by design with pages/scanner.py's `_is_pre_breakout`
+    (the Pre-Breakout TAB's own display filter) on the trend_up/squeeze
+    basic qualification. If you change that basic qualification in one
+    place, change it in the other — kept duplicated on purpose so
+    utils/ has no dependency on pages/.
+    """
+    trend_up = bool(row_dict.get("_trend_up", False)) or (
+        str(row_dict.get("TrendPhase", "NONE")).upper() != "NONE"
+    )
+    if not trend_up:
+        return "NONE"
+
+    squeeze_on       = bool(row_dict.get("_squeeze_on", False))
+    squeeze_released = bool(row_dict.get("_squeeze_release", False))
+    vol_ratio  = float(row_dict.get("_vol_ratio") or 0)
+    conviction = float(row_dict.get("CV1_Conviction", row_dict.get("Conviction", 0)) or 0)
+    rsi_val    = float(row_dict.get("_rsi") or row_dict.get("RSI") or 0)
+
+    confirmed = vol_ratio > 1.5 and conviction > 60 and rsi_val > 55
+
+    if squeeze_on and confirmed:
+        return "PRE_BREAKOUT_ACTIVE"
+    if squeeze_released and confirmed:
+        return "BREAKOUT_ACTIVE"
+    if squeeze_on:
+        return "BUILDING"
+    if squeeze_released:
+        return "WATCH"
+    return "NONE"
+
+
 def _is_pre_breakout_qualified(row_dict: dict) -> bool:
     """
     Pre-Breakout ACTIVE TRIGGER — the mint-time gate for a PB-sourced
     setup plan (see enrich_scanner_row()'s `pre_breakout` param / the
     "persist entries which are released from Pre-Breakout" request).
 
-    [2026-08-14, explicit user direction; guardrails restored 2026-08-14
-    same day — see review below] Adds four new factors on TOP OF the
-    original basic Pre-Breakout qualification (trend_up AND squeeze_release
-    AND RSI band), rather than replacing it:
+    [2026-08-17, SG request] Now a thin wrapper over
+    `_classify_active_trigger_phase()`: a plan mints for EITHER of the
+    two confirmed ranks, not just RELEASED —
 
-        Active Trigger =
-              (trend_up)
-          AND (SQUEEZE == "RELEASED")
-          AND (VOL_RATIO >= 1.5x)
-          AND (CONVICTION >= 60)
-          AND (55 < RSI <= 70)
+        PRE_BREAKOUT_ACTIVE (SQZ + volume/momentum/conviction confirmed)
+        BREAKOUT_ACTIVE      (RELEASED + volume/momentum/conviction confirmed)
 
-    Mapped onto fields already present on the scanner row:
-      trend_up               -> row_dict["_trend_up"], falling back to
-                                TrendPhase != "NONE" — same basic-
-                                qualification check as pages/scanner.py's
-                                `_is_pre_breakout` tab filter.
-      SQUEEZE == "RELEASED" -> row_dict["_squeeze_release"] is True —
-                                the BB squeeze firing on this bar, same
-                                boolean the Pre-Breakout tab's own
-                                squeeze_release boost tag reads.
-      VOL_RATIO              -> row_dict["_vol_ratio"] — today's volume
-                                vs its rolling average, same field the
-                                tab's "vol_surge" boost tag reads.
-      CONVICTION              -> row_dict["CV1_Conviction"] — CV1's
-                                production Conviction score (0-100),
-                                already computed earlier in the same
-                                scan cycle (utils/scanner_engine.py
-                                writes this before setup persistence
-                                runs). Falls back to a bare "Conviction"
-                                key for any row source that only
-                                carries a display column under that
-                                name.
-      RSI                    -> row_dict["_rsi"], falling back to
-                                "RSI" for any row source that only
-                                carries the display column.
-
-    [2026-08-14 review] An earlier version of this function dropped
-    trend_up entirely and removed the RSI upper bound, replacing the
-    basic qualification outright instead of tightening it. That let a
-    non-trending, already-extended stock (e.g. RSI 90, no trend) mint a
-    "PB" plan without ever appearing on the Pre-Breakout tab, since this
-    function is the sole gate in enrich_scanner_dataframe() and is not
-    otherwise scoped to tab members. trend_up and the RSI <= 70 ceiling
-    are restored so a PB-sourced plan stays scoped to "still coiling,
-    about to move" stocks — matching pages/scanner.py's `_is_pre_breakout`
-    — with VOL_RATIO/CONVICTION/RSI-floor layered on as an additional,
-    stricter mint-time trigger on top of that basic qualification. Still
-    bypasses _FREEZE_CATEGORIES the same way the old gate did (see
-    enrich_scanner_row()'s docstring) — Pre-Breakout stocks are
-    routinely WATCH/SKIP tier by design, so gating on Recommendation
-    would mean this could never fire.
-
-    Kept in sync by design with pages/scanner.py's `_is_pre_breakout`
-    (the Pre-Breakout TAB's own display filter) on the trend_up/squeeze/
-    RSI-band basic qualification; VOL_RATIO and CONVICTION are additional
-    mint-time-only requirements not present on the tab filter, so a
-    symbol can appear on the tab without yet qualifying for a plan, but
-    a plan can never mint for a symbol that isn't tab-qualified. If you
-    change the basic qualification in one place, change it in the other
-    — kept duplicated on purpose so utils/ has no dependency on pages/.
+    BUILDING (unconfirmed SQZ) and WATCH (unconfirmed RELEASED) do not
+    mint a plan — same as before, an unconfirmed row is still just
+    "on the tab", not yet an Active Trigger.
     """
-    trend_up = bool(row_dict.get("_trend_up", False)) or (
-        str(row_dict.get("TrendPhase", "NONE")).upper() != "NONE"
-    )
-    squeeze_released = bool(row_dict.get("_squeeze_release", False))
-    vol_ratio  = float(row_dict.get("_vol_ratio") or 0)
-    conviction = float(row_dict.get("CV1_Conviction", row_dict.get("Conviction", 0)) or 0)
-    rsi_val    = float(row_dict.get("_rsi") or row_dict.get("RSI") or 0)
-
-    return (
-        trend_up
-        and squeeze_released
-        and vol_ratio  >= 1.5
-        and conviction >= 60
-        and 55 < rsi_val <= 70
+    return _classify_active_trigger_phase(row_dict) in (
+        "PRE_BREAKOUT_ACTIVE", "BREAKOUT_ACTIVE",
     )
 
 
@@ -1065,11 +1099,17 @@ def enrich_scanner_dataframe(
         bar_low  = float(row_dict.get(low_col,  0) or 0) if has_low_col  else None
         bar_high = float(row_dict.get(high_col, 0) or 0) if has_high_col else None
 
+        active_trigger_phase = _classify_active_trigger_phase(row_dict)
         enriched, plan_out, was_updated = enrich_scanner_row(
             row_dict, plan, first_s, cur_price,
             bar_low=bar_low, bar_high=bar_high,
-            pre_breakout=_is_pre_breakout_qualified(row_dict),
+            pre_breakout=active_trigger_phase in ("PRE_BREAKOUT_ACTIVE", "BREAKOUT_ACTIVE"),
         )
+        # Ranked phase (PRE_BREAKOUT_ACTIVE > BREAKOUT_ACTIVE > BUILDING >
+        # WATCH > NONE) exposed on the row so UI layers (e.g. the
+        # Pre-Breakout tab in pages/scanner.py) can render/sort on it
+        # without recomputing — see _classify_active_trigger_phase().
+        enriched["ActiveTriggerPhase"] = active_trigger_phase
         rows_out.append(enriched)
         if was_updated:
             updated_plans.append(plan_out)
