@@ -159,6 +159,12 @@ LIVE_SCANNER_BATCH_COOLDOWN_SECS = 1.5   # brief pause between batches, just
 # was fragmented up to close), then at most every _IDLE_TRIM_COOLDOWN_SECS
 # for the rest of the pause, so the process is fully trimmed well before
 # should_scheduler_run() flips back to True at next market open.
+#
+# [2026-08-17] live_scanner runs on its own dedicated thread
+# (_run_live_scanner_loop), not through _run_loop, so it has its own
+# should_scheduler_run() poll and its own call to this function at its
+# own paused-branch — same shared lock/cooldown, so it's a fourth
+# caller of the same gate, not a fourth independent timer.
 _IDLE_TRIM_COOLDOWN_SECS = 900   # 15 min
 _IDLE_TRIM_LOCK = threading.Lock()
 _last_idle_trim_ts: float = 0.0
@@ -427,7 +433,7 @@ def _live_scan_records(df: pd.DataFrame) -> list[dict]:
     # utils.scan_state.save_snapshot()'s own generic safety net would have
     # caught it too, but sanitizing at the source gives column-level
     # diagnostics instead of a generic warning.
-    from utils.json_sanitize import find_invalid_columns, sanitize_dataframe
+    from utils.json_sanitize import find_invalid_columns, sanitize_dataframe, prepare_output_payload
 
     invalid = find_invalid_columns(df)
     if invalid:
@@ -435,6 +441,14 @@ def _live_scan_records(df: pd.DataFrame) -> list[dict]:
             "[live_scanner] invalid numeric values (NaN/inf) detected "
             "before snapshot save: %s", invalid,
         )
+    # [2026-08-17] Downcast at THIS boundary — this df is the full-width
+    # scored batch (every indicator/CV1/DORE column) about to be
+    # serialized for the Supabase live_scanner_state upsert — and BEFORE
+    # sanitize_dataframe(), which upcasts to `object` and would make the
+    # downcast a no-op. See prepare_output_payload()'s docstring for why
+    # this stays boundary-only rather than applied earlier in the
+    # pipeline.
+    df = prepare_output_payload(df)
     safe = sanitize_dataframe(df, "live_scanner")
     return safe.to_dict("records")
 
@@ -620,6 +634,19 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                             "skipping cycles until it resumes")
                 was_paused = True
             logger.debug("[live_scanner] system_state is paused (backtest/maintenance) — skipping this cycle")
+            # [2026-08-17, idle-trim audit] live_scanner runs on its own
+            # dedicated thread (_run_live_scanner_loop), NOT through the
+            # shared _run_loop() that market_intelligence/fo_scan/
+            # dore_live_state use — so without this call it was the one
+            # loop that never benefited from _idle_trim_if_due() during
+            # market-hours-paused stretches, despite being the heaviest
+            # allocator (LIVE_SCANNER_MAX_WORKERS=4, the sustained hot
+            # path the MALLOC_ARENA_MAX=2 deployment note above is sized
+            # against) and therefore the most likely source of the arena
+            # fragmentation this reclaims. Same shared cooldown/lock as
+            # the other three loops, so this doesn't cause extra
+            # malloc_trim churn on top of theirs.
+            _idle_trim_if_due()
             time.sleep(5)
             continue
         if was_paused:
@@ -687,6 +714,17 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             batch_started = time.time()
             batch_records: dict[str, dict] = {}
             if chunk:
+                # [Explicit batch-lifetime scoping, 2026-08-17] df_raw/
+                # df_batch are the only large (n_symbols x n_indicator-
+                # columns) objects this batch allocates — the analogues of
+                # raw_history/indicator_data in a fetch->compute->score
+                # pipeline (compute_live_scan_batch does both fetch and
+                # score in one call here; see utils/live_scanner_job.py).
+                # Pre-declared None so the `del` in `finally` below is
+                # always safe, including when compute_live_scan_batch()
+                # itself raises before df_batch is ever assigned.
+                df_raw = None
+                df_batch = None
                 try:
                     df_raw = compute_live_scan_batch(chunk, settings={"workers": max_workers})
                     df_batch = apply_regime_layer(df_raw, regime_ctx) if (regime_ctx and df_raw is not None and not df_raw.empty) else df_raw
@@ -703,6 +741,25 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                     logger.exception(
                         "[live_scanner] batch %d/%d failed — those %d symbol(s) keep their last-good "
                         "values and will be retried next cycle", batch_i + 1, n_batches, len(chunk))
+                finally:
+                    # Guarantee df_raw/df_batch are unreachable before the
+                    # NEXT batch's compute_live_scan_batch() call allocates
+                    # its own — otherwise Batch N's frames stay alive
+                    # (via these locals) right up until Batch N+1's names
+                    # are rebound, so glibc's malloc arena sees the two
+                    # batches' peaks overlap and expands the heap
+                    # high-water mark to fit both instead of reusing Batch
+                    # N's freed pages. Everything actually needed past
+                    # this point (`merged`, `batch_records`) is already a
+                    # small dict of plain Python scalars extracted above,
+                    # not a reference into df_raw/df_batch, so this is
+                    # safe. See utils.scan_health_monitor.
+                    # _malloc_trim_reclaim() for the matching allocator-
+                    # side mitigation (returns freed arena pages to the
+                    # OS) and native_memory_probe.py for how the two were
+                    # diagnosed as separate problems.
+                    del df_raw
+                    del df_batch
 
             # If a manual "Run Scan" (pages/scanner.py) wrote a fresh
             # full-universe snapshot since our last batch, our in-memory
@@ -791,6 +848,23 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             # scheduler/thread — which is the whole point of the
             # integration (see module docstring's Cadence section).
             if batch_i == _dore_trigger_batch_i:
+                # [Explicit lifetime scoping, 2026-08-17] Same issue as
+                # df_raw/df_batch above, on a longer fuse: this `if` only
+                # executes ONCE per 5-minute cycle, but `dore_result` and
+                # `technical_plans` are locals of _run_live_scanner_loop's
+                # single, never-returning `while True:` frame — without
+                # an explicit del, they'd stay reachable for the REST of
+                # this cycle's remaining batches AND every idle/sleep tick
+                # in between, right up until this same `if` branch
+                # rebinds them next cycle. dore_result in particular can
+                # hold a full options-chain-shaped payload per F&O-
+                # eligible symbol (utils/dore_options_scan.py,
+                # utils/dore_options_engine.py) — the kind of object this
+                # cleanup pass is about. Pre-declared None so the
+                # `finally` is safe even if compute_dore_technical_plans()
+                # itself raises before dore_result is ever assigned.
+                dore_result = None
+                technical_plans = None
                 try:
                     from utils.dore_options_scan import compute_dore_technical_plans
                     dore_result = compute_dore_technical_plans(live_pool=dict(merged))
@@ -806,6 +880,9 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                     logger.exception("[live_scanner] DORE Technical Engine failed this cycle "
                                       "(non-fatal — dore_live_state keeps refreshing against last "
                                       "cycle's technical plans until this succeeds again)")
+                finally:
+                    del dore_result
+                    del technical_plans
 
         # end of batches loop
 
