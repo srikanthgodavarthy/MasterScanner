@@ -3434,17 +3434,16 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
         entry = row.get("entry_locked")
         drift = row.get("drift_pct")
         if entry in (None, "") or pd.isna(entry):
-            # [2026-08-10 fix] entry_locked is None either because this
-            # row is fresh/below MIN_CONFIDENCE_TO_ACTIVATE (nothing to
-            # explain), OR because it cleared the confidence floor but
-            # was still blocked from minting a locked plan by duplicate-
-            # suppression or the portfolio cap (see
-            # enrich_trade_plans_with_persistence in
-            # utils/dore_options_persistence.py) — that function already
-            # stamps row["blocked_reason"] in the latter case, but this
-            # dash used to swallow it silently. Surface it as a tooltip
-            # so e.g. "confidence 71 but no Saved Entry" is explainable
-            # at a glance instead of looking like a data gap.
+            # [2026-08-18] Same-symbol/direction duplicates are no longer
+            # a case that reaches this row at all — a second setup on a
+            # stock that already has an open plan is dropped in
+            # enrich_trade_plans_with_persistence() before it's ever
+            # returned, so there's nothing here to explain for that case
+            # anymore. entry_locked can still be None for two other
+            # reasons though: the row is fresh/below MIN_CONFIDENCE_TO_
+            # TRACK (nothing to explain — plain "—"), or it cleared that
+            # floor but the portfolio cap or the pre-breakout guard is
+            # holding it back (blocked_reason set — shown as a tooltip).
             reason = row.get("blocked_reason")
             if reason:
                 return (f'<span style="color:var(--muted);cursor:help;" '
