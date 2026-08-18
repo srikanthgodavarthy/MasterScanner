@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from datetime import datetime, date, timezone
 from typing import Optional
 
@@ -1116,19 +1118,33 @@ def _dore_options_plan_from_row(row: dict) -> "object":
     )
 
 
-def load_open_dore_options_plans() -> dict:
-    """Return every currently-open DORE Options plan — ANY non-CLOSED
-    lifecycle stage (TRACKED / WAITING_FOR_ENTRY / ENTRY_READY /
-    IN_ENTRY_ZONE / ACTIVE, plus the legacy OPEN value) — as
-    {contract_key: DoreOptionsPlan}.
+# [Egress fix, 2026-08-18] load_open_dore_options_plans() below is a
+# SELECT * over ~113 columns (see _dore_options_plan_from_row) and was
+# being called with zero caching from FOUR independent call sites with
+# no awareness of each other:
+#   - utils/dore_live_state.py       (Stage 2 scheduler, every 60s)
+#   - utils/dore_options_scan.py     (Stage 1 scheduler, every cycle —
+#                                      and only to read .symbol off each
+#                                      plan, discarding the other ~112
+#                                      fields immediately)
+#   - pages/dashboard.py             (every dashboard render)
+#   - pages/scanner.py               (every Active Plans tab render)
+# Open plans don't change every tick (locking/closing a plan is a rare
+# event relative to a 60s scan cadence), so a short TTL cache here
+# collapses all four call sites onto one shared full-row fetch per TTL
+# window instead of four independent ones. Plain dict + lock rather than
+# st.cache_data: this module is imported from both the Streamlit process
+# and the standalone scheduler thread (dore_live_state.py /
+# dore_options_scan.py), and st.cache_data is only reliably safe from a
+# real Streamlit runtime — see utils.snapshot_cache's module docstring
+# for why the equivalent snapshot caching there deliberately avoids
+# importing streamlit into anything the scheduler touches.
+_OPEN_DORE_PLANS_TTL_S = 30
+_open_dore_plans_cache_lock = threading.Lock()
+_open_dore_plans_cache: dict = {"ts": 0.0, "plans": {}}
 
-    [2026-08-12, two-level lifecycle refactor] Was `WHERE status = 'OPEN'`
-    under the old single-step model, where OPEN was the only non-CLOSED
-    value that ever existed. Now there are several non-CLOSED statuses,
-    so this selects everything EXCEPT CLOSED instead of matching one
-    literal value — this is what lets a merely-TRACKED candidate survive
-    a temporary scan disappearance exactly like an ACTIVE plan already
-    did (see utils.dore_options_persistence's PERSISTENCE REQUIREMENTS)."""
+
+def _load_open_dore_options_plans_uncached() -> dict:
     if not db.is_available():
         return {}
     try:
@@ -1143,6 +1159,82 @@ def load_open_dore_options_plans() -> dict:
     except Exception as exc:
         logger.error("load_open_dore_options_plans failed: %s", exc)
         return {}
+
+
+def load_open_dore_options_plans() -> dict:
+    """Return every currently-open DORE Options plan — ANY non-CLOSED
+    lifecycle stage (TRACKED / WAITING_FOR_ENTRY / ENTRY_READY /
+    IN_ENTRY_ZONE / ACTIVE, plus the legacy OPEN value) — as
+    {contract_key: DoreOptionsPlan}.
+
+    [2026-08-12, two-level lifecycle refactor] Was `WHERE status = 'OPEN'`
+    under the old single-step model, where OPEN was the only non-CLOSED
+    value that ever existed. Now there are several non-CLOSED statuses,
+    so this selects everything EXCEPT CLOSED instead of matching one
+    literal value — this is what lets a merely-TRACKED candidate survive
+    a temporary scan disappearance exactly like an ACTIVE plan already
+    did (see utils.dore_options_persistence's PERSISTENCE REQUIREMENTS).
+
+    [2026-08-18] TTL-cached at _OPEN_DORE_PLANS_TTL_S — see the block
+    comment above _OPEN_DORE_PLANS_TTL_S for why. Callers that only need
+    symbols, not full plan objects, should use
+    load_open_dore_options_plan_symbols() instead — see that function's
+    docstring.
+    """
+    now = time.monotonic()
+    with _open_dore_plans_cache_lock:
+        if now - _open_dore_plans_cache["ts"] < _OPEN_DORE_PLANS_TTL_S:
+            return _open_dore_plans_cache["plans"]
+
+    plans = _load_open_dore_options_plans_uncached()
+
+    with _open_dore_plans_cache_lock:
+        _open_dore_plans_cache["ts"] = now
+        _open_dore_plans_cache["plans"] = plans
+    return plans
+
+
+# [Egress fix, 2026-08-18] Narrow companion to load_open_dore_options_plans()
+# for callers that only need symbols (e.g. dore_options_scan.py's shortlist
+# exemption at its "open_plan_symbols" call site), kept on its own TTL/lock
+# so a caller that only wants symbols never pays for the full ~113-column
+# fetch+parse just to read .symbol off each plan.
+_OPEN_DORE_PLAN_SYMBOLS_TTL_S = 30
+_open_dore_plan_symbols_cache_lock = threading.Lock()
+_open_dore_plan_symbols_cache: dict = {"ts": 0.0, "symbols": set()}
+
+
+def load_open_dore_options_plan_symbols() -> set:
+    """Return the set of symbols with any currently-open (non-CLOSED)
+    DORE Options plan — SELECT symbol only, instead of the ~113 columns
+    load_open_dore_options_plans() pulls to build full DoreOptionsPlan
+    objects. Use this instead of
+    `{p.symbol for p in load_open_dore_options_plans().values()}` whenever
+    the full plan objects aren't otherwise needed — that pattern was
+    pulling the entire row width over the wire for a value it immediately
+    discarded.
+    """
+    now = time.monotonic()
+    with _open_dore_plan_symbols_cache_lock:
+        if now - _open_dore_plan_symbols_cache["ts"] < _OPEN_DORE_PLAN_SYMBOLS_TTL_S:
+            return _open_dore_plan_symbols_cache["symbols"]
+
+    if not db.is_available():
+        symbols: set = set()
+    else:
+        try:
+            rows = db.fetch_all(
+                "SELECT symbol FROM dore_options_plans WHERE status != %s", ("CLOSED",)
+            )
+            symbols = {r["symbol"] for r in (rows or []) if r.get("symbol")}
+        except Exception as exc:
+            logger.error("load_open_dore_options_plan_symbols failed: %s", exc)
+            symbols = set()
+
+    with _open_dore_plan_symbols_cache_lock:
+        _open_dore_plan_symbols_cache["ts"] = now
+        _open_dore_plan_symbols_cache["symbols"] = symbols
+    return symbols
 
 
 def load_recently_closed_dore_options_plans(limit: int = 15) -> pd.DataFrame:

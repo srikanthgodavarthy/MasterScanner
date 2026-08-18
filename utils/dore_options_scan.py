@@ -481,13 +481,14 @@ def compute_dore_technical_plans(cfg: Optional[DoreOptionsSettings] = None,
     # for_option_chain's docstrings. Best-effort: if Supabase is down
     # or this raises for any reason, fall through with no exemptions
     # rather than fail the whole scan cycle over it.
+    # [Egress fix, 2026-08-18] Was load_open_dore_options_plans() — a
+    # SELECT * over ~113 columns — just to read .symbol off each plan and
+    # discard the rest. load_open_dore_options_plan_symbols() does the
+    # same narrow-column query directly, TTL-cached the same way.
     open_plan_symbols: set = set()
     try:
-        from utils.supabase_client import load_open_dore_options_plans
-        open_plan_symbols = {
-            plan.symbol for plan in load_open_dore_options_plans().values()
-            if getattr(plan, "symbol", None)
-        }
+        from utils.supabase_client import load_open_dore_options_plan_symbols
+        open_plan_symbols = load_open_dore_options_plan_symbols()
     except Exception:
         logger.exception("[dore_options_scan] could not load open plan symbols for shortlist "
                           "exemption (non-fatal, shortlist falls back to score-only this cycle)")
