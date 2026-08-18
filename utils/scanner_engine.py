@@ -116,6 +116,7 @@ _YF_RATELIMIT_BASE_S = 20  # base cooldown for rate-limit errors (exponential: 2
 
 _yf_call_lock  = threading.Lock()   # serializes spacing + protects _yf_last_call_ts
 _yf_last_call_ts = 0.0
+_multitasking_tasks_lock = threading.Lock()  # protects multitasking.config["TASKS"] pruning below — deliberately separate from _yf_call_lock, which _wait_for_spacing() holds *during* time.sleep(); sharing it would make pruning block on an unrelated multi-second sleep
 
 
 def _is_locked_db_error(exc: Exception) -> bool:
@@ -172,8 +173,21 @@ def _prune_multitasking_tasks() -> None:
     """
     try:
         import multitasking
-        tasks = multitasking.config["TASKS"]
-        multitasking.config["TASKS"] = [t for t in tasks if t is not None and t.is_alive()]
+        with _multitasking_tasks_lock:
+            # [2026-08-18] Dedicated lock (NOT _yf_call_lock — see its
+            # definition above for why) because multitasking.config["TASKS"]
+            # is a single process-global list shared by every
+            # yf_download_with_retry() caller (live scanner's history fetch,
+            # backtest engine, setup-plan recovery). Without a lock, two
+            # callers finishing yf.download() at nearly the same instant can
+            # race: both read the list, both build a filtered copy, and
+            # whichever writes second silently drops whatever task the
+            # other caller's *own* concurrent yf.download() had just
+            # appended in between — not a crash, but a real dropped
+            # reference that undercounts multitasking's own bookkeeping for
+            # a download that's still genuinely running.
+            tasks = multitasking.config["TASKS"]
+            multitasking.config["TASKS"] = [t for t in tasks if t is not None and t.is_alive()]
     except Exception:
         pass
 
