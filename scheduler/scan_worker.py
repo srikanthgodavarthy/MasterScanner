@@ -508,6 +508,7 @@ def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
     from utils.scan_state import prune_all_snapshots
     from utils.supabase_client import prune_scan_snapshot_tables, prune_oi_and_premium_history
     from utils.system_state import should_scheduler_run
+    from utils import db
 
     logger.info("[retention] loop starting, every %ss", interval_secs)
     was_paused = False
@@ -547,6 +548,18 @@ def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
             logger.info("[retention] pruned snapshot tables: %s", results)
         except Exception:
             logger.exception("[retention] prune_all_snapshots failed (non-fatal — retrying next cycle)")
+
+        # [Egress instrumentation, 2026-08-18] Piggybacks on this loop's
+        # existing hourly tick rather than adding a new thread — logs
+        # which tables are dominating this process's estimated read
+        # bytes since it started (or since the last reset_fetch_stats()
+        # call). See utils.db.get_fetch_stats()'s docstring for what the
+        # numbers do/don't mean.
+        try:
+            db.log_fetch_stats()
+        except Exception:
+            logger.exception("[retention] log_fetch_stats failed (non-fatal)")
+
         time.sleep(interval_secs)
 
 
