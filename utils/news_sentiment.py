@@ -87,7 +87,7 @@ _BATCH_SIZE = 15
 # Override via GROQ_NEWS_MODEL in secrets if you want to point this at
 # something else (or back at 70b) without touching groq_client.py's
 # shared default.
-_NEWS_MODEL = "llama3.1-8b-instant"
+_NEWS_MODEL = "openai/gpt-oss-20b"
 
 # Summaries are stored at up to 280 chars (utils/news_feed.py) for
 # display, but the classifier doesn't need that much to judge direction/
