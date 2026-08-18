@@ -102,6 +102,131 @@ def _gc_object_counts() -> dict:
     }
 
 
+_DEAD_REF_SAMPLE_N = 12  # how many dead weakref.ref objects to run
+                          # gc.get_referrers() on per snapshot — kept small
+                          # since get_referrers() walks the whole heap per
+                          # call; this only needs to be enough to spot a
+                          # dominant container, not exhaustive
+
+
+def _find_container_owner(container) -> str | None:
+    """Given a list/set/dict that's a referrer of a dead ref, tries one
+    more hop up gc.get_referrers() to name the object that OWNS it — e.g.
+    for `self.tracked = [...]`, the naive expectation is
+    gc.get_referrers(the_list) returning the instance's __dict__, then
+    one further hop to the instance. In practice CPython 3.11+'s
+    per-instance dict optimization (managed / "inline values" dicts) can
+    surface the owning INSTANCE directly here instead, with no
+    intermediate dict at all — confirmed empirically, this is actually
+    the common case, not the dict-hop one. Handles both shapes. Returns
+    None if no owner is found (bare local/module-level list with nothing
+    else referencing it), in which case the caller falls back to
+    describing the container itself."""
+    try:
+        for owner in gc.get_referrers(container):
+            if owner is container:
+                continue
+            if isinstance(owner, dict):
+                mod_name = owner.get("__name__")
+                if isinstance(mod_name, str) and sys.modules.get(mod_name) is not None \
+                        and sys.modules[mod_name].__dict__ is owner:
+                    return f"module:{mod_name}"
+                for inst in gc.get_referrers(owner):
+                    if isinstance(inst, dict):
+                        continue
+                    return f"instance:{type(inst).__module__}.{type(inst).__name__}"
+                continue
+            if isinstance(owner, (list, set, tuple, frozenset)):
+                continue  # another container incidentally holding a ref
+                          # to this one (e.g. a frame-local var during
+                          # this very walk) — not a meaningful "owner"
+            if type(owner).__name__ == "frame":
+                continue
+            # Anything else at this point is very likely the actual
+            # instance whose attribute `container` is — see docstring.
+            owner_type = type(owner)
+            if owner_type.__module__ not in ("builtins", "types", "gc"):
+                return f"instance:{owner_type.__module__}.{owner_type.__name__}"
+    except Exception:
+        pass
+    return None
+
+
+def _describe_referrer(r) -> str:
+    """[2026-08-18, dead-weakref follow-up] Turns one gc.get_referrers()
+    result into a short, log-safe label identifying WHAT is holding it,
+    not just its type — a bare 'dict' or 'list' tells us nothing on its
+    own. Two cases matter:
+
+      - r is a dict that turns out to be a module's own __dict__ (has a
+        '__name__' key resolving to a real module) → label it
+        'module:<name>', which is exactly what we need if some
+        module-level list/cache is the leak.
+      - r is a dict that's an INSTANCE's __dict__ (the common case for
+        `self._something.append(weakref.ref(x))` inside a class) → CPython
+        doesn't hand us the instance directly from get_referrers() on the
+        dead ref; the instance's __dict__ dict is what's returned. Walk
+        one more level (get_referrers on that dict) to find the actual
+        object whose __dict__ it is, so the label names the owning class,
+        not just 'dict'.
+
+    Anything else (list, deque, frame, etc.) gets type name + a truncated
+    repr — enough to grep for in the source without dumping arbitrary
+    heap content into logs."""
+    try:
+        if isinstance(r, dict):
+            mod_name = r.get("__name__")
+            if isinstance(mod_name, str) and sys.modules.get(mod_name) is not None \
+                    and sys.modules[mod_name].__dict__ is r:
+                return f"module:{mod_name}"
+            # Likely an instance's __dict__ — find the instance that owns it.
+            for owner in gc.get_referrers(r):
+                if isinstance(owner, dict):
+                    continue  # skip other dicts (e.g. locals()) that happen to hold this dict
+                owner_type = type(owner).__name__
+                owner_module = type(owner).__module__
+                return f"instance:{owner_module}.{owner_type}"
+            return "dict:(owner not found)"
+        if isinstance(r, (list, set)):
+            owner = _find_container_owner(r)
+            base = f"{type(r).__name__}(len={len(r)}):{repr(r)[:80]}"
+            return f"{owner} -> {base}" if owner else base
+        return f"{type(r).__name__}:{repr(r)[:80]}"
+    except Exception as e:
+        return f"<describe_referrer failed: {e}>"
+
+
+def _sample_dead_ref_referrers(dead_refs_sample: list) -> list:
+    """Runs gc.get_referrers() on a small SAMPLE of dead weakref.ref
+    objects (passed in from the same heap walk that classified them dead,
+    so this doesn't need a second full gc.get_objects() pass) and returns
+    a Counter-style most_common list of what's holding them. A dead ref
+    with no referrers at all means nothing is holding it — it'll be
+    swept on the next GC pass and isn't the leak; a dead ref with a real
+    referrer (a list, an instance attribute) that keeps showing up across
+    snapshots IS the leak, and this names the container directly instead
+    of leaving it to be inferred from alive-referent types."""
+    labels: Counter = Counter()
+    for ref in dead_refs_sample:
+        try:
+            referrers = gc.get_referrers(ref)
+        except Exception:
+            continue
+        if not referrers:
+            labels["<no referrers — orphaned, will be swept>"] += 1
+            continue
+        for r in referrers:
+            # `dead_refs_sample` itself is a referrer of every ref in it —
+            # self-referential noise from the sampling mechanism, not a
+            # real finding. Skip it by identity so it never masks the
+            # actual container (confirmed empirically: without this, a
+            # synthetic single-leak repro showed the sampling list itself
+            # tied for first place alongside the real one).
+            if r is dead_refs_sample:
+                continue
+            labels[_describe_referrer(r)] += 1
+    return labels.most_common(_TOP_N)
+
 def _weakref_referent_breakdown() -> dict:
     """[2026-08-18, RAM investigation follow-up] `_gc_object_counts()`'s
     top-by-count list shows plain 'ReferenceType' (weakref.ref) objects
@@ -137,12 +262,21 @@ def _weakref_referent_breakdown() -> dict:
     by_referent_type: Counter = Counter()
     dead = 0
     alive = 0
+    dead_refs_sample: list = []
     for o in gc.get_objects():
         if type(o) is not weakref.ref:
             continue
         referent = o()
         if referent is None:
             dead += 1
+            # Keep a bounded sample as we go — cheaper than a second
+            # gc.get_objects() pass just to re-find dead refs afterward,
+            # and small enough that holding these extra references for
+            # the rest of this function's lifetime doesn't skew the count
+            # (they're weakref.ref objects themselves, not their dead
+            # referents — holding one costs nothing and revives nothing).
+            if len(dead_refs_sample) < _DEAD_REF_SAMPLE_N:
+                dead_refs_sample.append(o)
         else:
             alive += 1
             by_referent_type[type(referent).__name__] += 1
@@ -151,12 +285,15 @@ def _weakref_referent_breakdown() -> dict:
         pivot_cache_live_entries = len(_pivot_caches) if _pivot_caches is not None else 0
     except Exception:
         pivot_cache_live_entries = None
+    dead_ref_referrers = _sample_dead_ref_referrers(dead_refs_sample) if dead_refs_sample else []
     return {
         "plain_weakref_total": dead + alive,
         "plain_weakref_dead": dead,
         "plain_weakref_alive": alive,
         "alive_by_referent_type": by_referent_type.most_common(_TOP_N),
         "pivot_cache_live_entries": pivot_cache_live_entries,
+        "dead_ref_referrers_sample_n": len(dead_refs_sample),
+        "dead_ref_referrers": dead_ref_referrers,
     }
 
 
@@ -548,6 +685,17 @@ def run_memory_profile() -> dict:
         weakref_stats["plain_weakref_alive"], weakref_stats["pivot_cache_live_entries"],
         weakref_stats["alive_by_referent_type"],
     )
+    if weakref_stats["dead_ref_referrers"]:
+        # [2026-08-18] Only logs when the dead-ref sample actually found
+        # something holding onto it — names the container (module-level
+        # list, an instance's class, etc.) directly, so the NEXT snapshot
+        # this fires on is the one to go straight to the source file for,
+        # instead of re-deriving it from the alive-referent-type breakdown.
+        logger.info(
+            "[memory_profiler] dead-ref referrers (sample n=%d of %d dead): %s",
+            weakref_stats["dead_ref_referrers_sample_n"], weakref_stats["plain_weakref_dead"],
+            weakref_stats["dead_ref_referrers"],
+        )
     if df_np_stats["top_dataframes"]:
         logger.info("[memory_profiler] top %d dataframes: %s", _TOP_N, df_np_stats["top_dataframes"])
     if cache_stats.get("available"):
