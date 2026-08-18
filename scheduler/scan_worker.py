@@ -105,60 +105,14 @@ of those loops.
 
 from __future__ import annotations
 
-# ── glibc malloc tuning [2026-08-17, RAM investigation] ─────────────
-# M_ARENA_MAX + M_TRIM_THRESHOLD, applied via the shared utils/
-# malloc_tuning.py helper — see that module's docstring for the full
-# root-cause writeup and why this is a deliberately narrow, two-lever
-# experiment. This module gets loaded two different ways depending on
-# deployment:
-#   1. Standalone: `python -m scheduler.scan_worker` — its own OS
-#      process, never imports app.py, so app.py's apply_malloc_tuning()
-#      call never runs for it.
-#   2. In-process: utils/inprocess_scheduler.py imports FROM this
-#      module (see its start_background_scans()) and runs the same
-#      loop functions as threads inside app.py's own Streamlit process
-#      — confirmed from a real deploy log, 2026-08-17, showing
-#      "In-process scheduler: started market_intelligence thread"
-#      alongside this module's own "scan_worker:"-prefixed log lines.
-# In case (2), app.py's call already covers this process — but this is
-# placed at MODULE level specifically so it's a harmless no-op re-apply
-# there and the actual fix in case (1), rather than depending on every
-# current and future entrypoint remembering to call it. Every RSS/
-# malloc_trim/skip_cycle log line examined in the RAM investigation
-# came from a process running these loop functions, so this needs to be
-# active regardless of which of the two ways got them running.
 import logging
-import os
 import threading
 import time
 import traceback
 
-from utils.malloc_tuning import apply_malloc_tuning, log_malloc_tuning_state
-_malloc_tuning_result = apply_malloc_tuning()
-
 import pandas as pd
 
 logger = logging.getLogger("scan_worker")
-
-# [2026-08-17, SG request] Explicit startup verification, reusing the
-# SAME mallopt() result captured above (not re-applying) — see
-# utils/malloc_tuning.py's docstring on why mallopt()'s own return code,
-# not just the env vars, is the real signal. Deliberately at MODULE
-# level (not only inside main() below) — a real deploy log (2026-08-17)
-# showed this app running the in-process scheduler path (see the
-# comment above), where main() never executes at all, so a main()-only
-# log line is permanently silent for that topology.
-#
-# This call is only actually VISIBLE for the in-process path: app.py's
-# logging.basicConfig() has already run by the time it imports
-# utils.inprocess_scheduler (which imports this module), so a handler
-# already exists here. For the standalone path (`python -m
-# scheduler.scan_worker`), this exact line runs BEFORE main()'s own
-# basicConfig() call below — no handler exists yet, so THIS call is
-# silently dropped there (verified directly, not assumed) — which is
-# fine, because main()'s call below, after its own basicConfig(), covers
-# that path instead. Between the two, exactly one always fires.
-log_malloc_tuning_state(logger, _malloc_tuning_result)
 
 # ── Live Scanner sub-scheduler tuning ─────────────────────────────────
 LIVE_SCANNER_INTERVAL_SECS  = 300   # full-universe cycle target (5 min)
@@ -364,7 +318,9 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
                 continue
 
         try:
-            raw = compute_fn()
+            from utils.scan_health_monitor import job_memory_delta
+            with job_memory_delta(name):
+                raw = compute_fn()
             payload, row_count = to_payload(raw)
             scan_id = save_snapshot(section, payload=payload, row_count=row_count, status="completed")
             if scan_id:
@@ -393,10 +349,22 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
 
 # ── Market Intelligence — every 30s ──────────────────────────────────
 def _market_intelligence_compute():
-    from utils.scan_state import load_snapshot_payload_cached
+    # [2026-08-18] load_snapshot_payload_cached() deliberately NOT used
+    # here — "live_scanner" is a _STATE_SECTIONS table (see utils/
+    # scan_state.py's Trinity migration note), whose "version" is
+    # state_meta.updated_at, bumped on EVERY sub-batch upsert (~10x per
+    # 5-min cycle, ~every 80s). This poll runs every 180s, so the
+    # version has always moved since the last read — a guaranteed
+    # cache miss every single time (confirmed: sched_payload_cache
+    # [live_scanner] sat at hit_rate=0% in production). Every miss still
+    # pays a real ~4.2s payload fetch either way; going through the
+    # wrapper just adds a doomed extra meta round-trip and a cache
+    # entry that's stale before it's even stored. load_snapshot_payload()
+    # does the exact same fetch without that overhead.
+    from utils.scan_state import load_snapshot_payload
     from utils.market_intelligence import compute_market_intelligence
 
-    live = load_snapshot_payload_cached("live_scanner")
+    live = load_snapshot_payload("live_scanner")
     df_aug = pd.DataFrame((live or {}).get("payload", {}).get("data", [])) if live else pd.DataFrame()
     return compute_market_intelligence(df_aug=df_aug)
 
@@ -789,7 +757,9 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                 df_raw = None
                 df_batch = None
                 try:
-                    df_raw = compute_live_scan_batch(chunk, settings={"workers": max_workers}, nifty_series=cycle_nifty_series)
+                    from utils.scan_health_monitor import job_memory_delta
+                    with job_memory_delta(f"live_scanner_batch[{batch_i + 1}/{n_batches}]"):
+                        df_raw = compute_live_scan_batch(chunk, settings={"workers": max_workers}, nifty_series=cycle_nifty_series)
                     df_batch = apply_regime_layer(df_raw, regime_ctx) if (regime_ctx and df_raw is not None and not df_raw.empty) else df_raw
                     n_ok = 0
                     for rec in _live_scan_records(df_batch):
@@ -990,16 +960,6 @@ def main():
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-
-    # [2026-08-17, SG request] Explicit startup verification for the
-    # standalone `python -m scheduler.scan_worker` path — the module-level
-    # call above ran before this process's logging.basicConfig(), so it
-    # had no handler and was silently dropped (verified, not assumed).
-    # This is the SAME captured mallopt() result, not a re-apply — see
-    # utils/malloc_tuning.py's docstring on why the return code, not just
-    # the env vars, is the real signal both M_ARENA_MAX and
-    # M_TRIM_THRESHOLD are actually applied to this process.
-    log_malloc_tuning_state(logger, _malloc_tuning_result)
 
     # [Architecture review C3 fix, 2026-07-25] Claim exclusive ownership
     # of the scan loops before starting anything. Blocks (polling) if
