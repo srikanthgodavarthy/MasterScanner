@@ -102,6 +102,64 @@ def _gc_object_counts() -> dict:
     }
 
 
+def _weakref_referent_breakdown() -> dict:
+    """[2026-08-18, RAM investigation follow-up] `_gc_object_counts()`'s
+    top-by-count list shows plain 'ReferenceType' (weakref.ref) objects
+    climbing steadily every snapshot with no plateau, even though that
+    count is taken right after gc.collect() — so it isn't just uncollected
+    garbage awaiting a sweep, something really is holding these (or their
+    referents) alive.
+
+    First ruled out utils.scoring_core._pivot_caches (a WeakValueDictionary,
+    called out in that module's own 'FIX' comment as keyed on id(ia)):
+    WeakValueDictionary's entries are backed by weakref.KeyedRef, a
+    DISTINCT subclass — type(o).__name__ is 'KeyedRef', not 'ReferenceType'
+    (confirmed empirically: a bare WeakValueDictionary insert produces
+    exactly one 'KeyedRef' object, zero additional 'ReferenceType' ones).
+    Since the profiler's own top-by-count list never shows a 'KeyedRef'
+    bucket, _pivot_caches isn't the (or at least isn't the dominant)
+    source — this function exists to find what actually is, instead of
+    guessing further.
+
+    For every live PLAIN weakref.ref in the heap (deliberately
+    `type(o) is weakref.ref`, excluding KeyedRef/proxy subclasses so this
+    stays scoped to exactly the bucket that's actually growing), records
+    whether it's dead (referent already collected — the ref object itself
+    is inert but still a real, counted Python object until whatever
+    container is holding IT gets cleared) or alive, and if alive, what
+    type its referent is. A high dead-ref fraction pointing at one
+    dominant referent type is the signature of a list/cache somewhere
+    appending weakref.ref(x) and never pruning entries whose target has
+    already died — as opposed to pandas' own internal per-Index/per-Series
+    weakref use (which should track live DataFrame count, not exceed it
+    indefinitely once that count itself has plateaued)."""
+    import weakref
+    by_referent_type: Counter = Counter()
+    dead = 0
+    alive = 0
+    for o in gc.get_objects():
+        if type(o) is not weakref.ref:
+            continue
+        referent = o()
+        if referent is None:
+            dead += 1
+        else:
+            alive += 1
+            by_referent_type[type(referent).__name__] += 1
+    try:
+        from utils.scoring_core import _pivot_caches
+        pivot_cache_live_entries = len(_pivot_caches) if _pivot_caches is not None else 0
+    except Exception:
+        pivot_cache_live_entries = None
+    return {
+        "plain_weakref_total": dead + alive,
+        "plain_weakref_dead": dead,
+        "plain_weakref_alive": alive,
+        "alive_by_referent_type": by_referent_type.most_common(_TOP_N),
+        "pivot_cache_live_entries": pivot_cache_live_entries,
+    }
+
+
 def _dataframe_and_ndarray_scan() -> dict:
     """Walks the live heap once for both pandas.DataFrame and
     numpy.ndarray objects (one gc.get_objects() call shared between them
@@ -457,6 +515,7 @@ def run_memory_profile() -> dict:
     t0 = time.time()
     rss_mb = _rss_mb()
     gc_stats = _gc_object_counts()
+    weakref_stats = _weakref_referent_breakdown()
     df_np_stats = _dataframe_and_ndarray_scan()
     cache_stats = _cache_stats()
     session_stats = _session_state_stats()
@@ -482,6 +541,13 @@ def run_memory_profile() -> dict:
     logger.info("[memory_profiler] threads by name prefix: %s", thread_stats["by_name_prefix"])
     logger.info("[memory_profiler] top gc types by shallow bytes: %s", gc_stats["top_by_shallow_bytes"])
     logger.info("[memory_profiler] top gc types by count: %s", gc_stats["top_by_count"])
+    logger.info(
+        "[memory_profiler] plain weakrefs: total=%d dead=%d alive=%d "
+        "pivot_cache_live_entries=%s | alive by referent type: %s",
+        weakref_stats["plain_weakref_total"], weakref_stats["plain_weakref_dead"],
+        weakref_stats["plain_weakref_alive"], weakref_stats["pivot_cache_live_entries"],
+        weakref_stats["alive_by_referent_type"],
+    )
     if df_np_stats["top_dataframes"]:
         logger.info("[memory_profiler] top %d dataframes: %s", _TOP_N, df_np_stats["top_dataframes"])
     if cache_stats.get("available"):
@@ -513,6 +579,7 @@ def run_memory_profile() -> dict:
     return {
         "rss_mb": rss_mb,
         "gc": gc_stats,
+        "weakrefs": weakref_stats,
         "dataframes_ndarrays": df_np_stats,
         "cache": cache_stats,
         "session_state": session_stats,
