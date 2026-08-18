@@ -50,9 +50,12 @@ between calls. On a transient hit, the dead connection is discarded
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import os
+import re
 import threading
+import time
 from contextlib import contextmanager
 from decimal import Decimal
 from typing import Any, Optional, Sequence
@@ -182,6 +185,127 @@ def _run(fn, max_retries: int = 2):
     raise last_exc  # pragma: no cover — unreachable, satisfies linters
 
 
+# [Egress instrumentation, 2026-08-18] Approximate per-table read-volume
+# counters, added to turn "which query is actually driving the Neon
+# network-transfer cap" from a guess into a number, after fixing
+# load_open_dore_options_plans() blind. Hooked into fetch_all()/
+# execute_returning() — the two chokepoints every SELECT-shaped read in
+# the app funnels through (utils/scan_state.py, utils/supabase_client.py,
+# utils/system_state.py, utils/event_cache.py all call these, not psycopg2
+# directly) — so this covers every table without needing a call site
+# change anywhere else.
+#
+# What this measures: len(json.dumps(rows)) for each result set. That's
+# an ESTIMATE of payload size, not the true Postgres wire-protocol byte
+# count (which has its own binary framing, column metadata, etc. — and
+# which is also not 1:1 with what Neon bills as "network transfer," since
+# that also includes connection/TLS overhead this can't see). Treat the
+# numbers as relative — which tables dominate, and by roughly how much —
+# not as a reconciliation against the Neon billing page.
+#
+# Deliberately NOT using @st.cache_data or anything Streamlit-specific:
+# this module is imported by the standalone scheduler process
+# (scheduler/scan_worker.py) same as utils/scan_state.py, so it stays a
+# plain dict + lock like utils.scan_state's own _sched_payload_cache.
+_QUERY_STATS_LOCK = threading.Lock()
+_QUERY_STATS: dict[str, dict[str, int]] = {}
+_QUERY_STATS_STARTED_AT = time.time()
+
+# Matches the table name out of "FROM x", "INTO x", or "UPDATE x" —
+# covers every SELECT/INSERT-RETURNING/UPDATE-RETURNING shape actually
+# used by fetch_all()/execute_returning() call sites in this codebase.
+# Falls back to "unlabeled" for anything it can't parse (e.g. a function
+# call via call_function()) rather than raising — this is diagnostics,
+# it should never be the thing that breaks a real query.
+_TABLE_NAME_RE = re.compile(
+    r"\bFROM\s+([a-zA-Z_][a-zA-Z0-9_.]*)|\bINTO\s+([a-zA-Z_][a-zA-Z0-9_.]*)"
+    r"|\bUPDATE\s+([a-zA-Z_][a-zA-Z0-9_.]*)",
+    re.IGNORECASE,
+)
+
+
+def _label_for_query(query: str) -> str:
+    m = _TABLE_NAME_RE.search(query)
+    if not m:
+        return "unlabeled"
+    return next((g for g in m.groups() if g), "unlabeled")
+
+
+def _record_fetch(query: str, rows: list[dict], kind: str = "read") -> None:
+    try:
+        n_bytes = len(json.dumps(rows, default=str).encode("utf-8"))
+    except Exception:
+        # Never let a stats-estimation bug take down a real query path.
+        n_bytes = 0
+    label = _label_for_query(query)
+    with _QUERY_STATS_LOCK:
+        s = _QUERY_STATS.setdefault(label, {"calls": 0, "rows": 0, "bytes": 0})
+        s["calls"] += 1
+        s["rows"] += len(rows)
+        s["bytes"] += n_bytes
+        if kind == "write_returning":
+            # write-returning payloads (INSERT/UPDATE ... RETURNING) are
+            # real egress too, but a different cost center from read
+            # fan-out — keep them visibly separate rather than silently
+            # folded into the same "reads" bucket callers are trying to
+            # cut down.
+            s.setdefault("write_returning_calls", 0)
+            s["write_returning_calls"] += 1
+
+
+def get_fetch_stats() -> dict:
+    """Snapshot of estimated bytes/rows/calls read per table (by label)
+    since process start or the last reset_fetch_stats() call. Call this
+    from a diagnostics page, a one-off script, or a log line — e.g.:
+
+        from utils import db
+        stats = db.get_fetch_stats()
+        for label, s in sorted(stats["by_label"].items(),
+                                key=lambda kv: -kv[1]["bytes"]):
+            print(f"{label:30s} {s['bytes']/1e6:8.2f} MB  "
+                  f"{s['calls']:6d} calls  {s['rows']:8d} rows")
+
+    Note this is PER PROCESS — the scheduler process and each Streamlit
+    session process keep independent counters, so add them up across
+    whichever processes you care about rather than expecting one number.
+    """
+    with _QUERY_STATS_LOCK:
+        elapsed = time.time() - _QUERY_STATS_STARTED_AT
+        return {
+            "since_epoch_s": _QUERY_STATS_STARTED_AT,
+            "elapsed_s": elapsed,
+            "by_label": {k: dict(v) for k, v in _QUERY_STATS.items()},
+        }
+
+
+def reset_fetch_stats() -> None:
+    """Clears the counters and restarts the elapsed-time clock — useful
+    right before a deliberate before/after comparison (e.g. right after
+    deploying a caching fix, to measure its effect over the next hour
+    without yesterday's numbers mixed in)."""
+    global _QUERY_STATS_STARTED_AT
+    with _QUERY_STATS_LOCK:
+        _QUERY_STATS.clear()
+        _QUERY_STATS_STARTED_AT = time.time()
+
+
+def log_fetch_stats(top_n: int = 8) -> None:
+    """Logs the top_n tables by estimated bytes read so far, largest
+    first. Meant to be called periodically (see scheduler/scan_worker.py's
+    retention loop) so the numbers show up in normal logs rather than
+    needing a separate diagnostics session."""
+    stats = get_fetch_stats()
+    ranked = sorted(stats["by_label"].items(), key=lambda kv: -kv[1]["bytes"])
+    lines = [
+        f"{label}: {s['bytes']/1e6:.2f}MB over {s['calls']} call(s), {s['rows']} row(s)"
+        for label, s in ranked[:top_n]
+    ]
+    logger.info(
+        "[egress-stats] top tables by estimated read bytes over last %.0fs: %s",
+        stats["elapsed_s"], "; ".join(lines) if lines else "(no reads recorded yet)",
+    )
+
+
 def fetch_all(query: str, params: Sequence = ()) -> list[dict]:
     """SELECT returning all rows as a list of dicts (column name -> value).
     jsonb columns come back already parsed into Python dict/list, matching
@@ -191,7 +315,9 @@ def fetch_all(query: str, params: Sequence = ()) -> list[dict]:
     def _do(conn):
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(query, params)
-            return [dict(r) for r in cur.fetchall()]
+            rows = [dict(r) for r in cur.fetchall()]
+            _record_fetch(query, rows)
+            return rows
     return _run(_do)
 
 
@@ -218,7 +344,9 @@ def execute_returning(query: str, params: Sequence = ()) -> list[dict]:
             cur.execute(query, params)
             if cur.description is None:
                 return []
-            return [dict(r) for r in cur.fetchall()]
+            rows = [dict(r) for r in cur.fetchall()]
+            _record_fetch(query, rows, kind="write_returning")
+            return rows
     return _run(_do)
 
 
