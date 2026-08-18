@@ -956,31 +956,21 @@ def enrich_trade_plans_with_persistence(
                     continue
 
                 # [Sprint 1 — Duplicate Suppression, extends 2026-08-05
-                # SG request] Same symbol + same direction (CE/PE),
-                # still open, hasn't hit T1 — normally blocks a second
-                # mint. But if THIS candidate is materially better
-                # (confidence_score clears the blocker's
-                # confidence_at_entry by MATERIALLY_BETTER_MARGIN or
-                # more), retire the weaker duplicate and let the
-                # stronger one take its place instead of just rejecting
-                # the new one outright.
-                dup = _blocking_open_plan(symbol, direction, key, open_now)
-                if dup is not None:
-                    if confidence_score >= dup.confidence_at_entry + MATERIALLY_BETTER_MARGIN:
-                        dup.status = DoreOptionsPlanStatus.CLOSED
-                        dup.closed_at = _now_iso()
-                        dup.closed_reason = (
-                            f"Superseded by stronger same-symbol/direction setup "
-                            f"({confidence_score:.0f} vs {dup.confidence_at_entry:.0f})"
-                        )
-                        dup.closed_reason_code = CLOSE_REASON_INVALIDATED
-                        updated_plans.append(dup)
-                        open_now.pop(dup.contract_key, None)
-                        _record_dore_final_outcome(dup)
-                    else:
-                        row["blocked_reason"] = "Existing active plan on this symbol/direction hasn't hit T1 yet"
-                        enriched_rows.append(row)
-                        continue
+                # SG request] [2026-08-18, simplified] Same symbol + same
+                # direction (CE/PE) already has an open plan (any
+                # non-CLOSED status) — hard block, no exceptions. Was
+                # previously allowed to be superseded by a "materially
+                # better" new candidate (retiring the weaker one); that
+                # override is gone — a second setup on the same stock is
+                # never shown as a Live Scan recommendation at all while
+                # the first one is still open, regardless of how much
+                # stronger its confidence is. The blocked candidate is
+                # dropped outright (not appended to enriched_rows), so it
+                # never renders as a "—ⓘ" row needing a hover tooltip to
+                # explain itself — it's simply not there until the
+                # existing plan closes (T1/SL/expiry/manual).
+                if _blocking_open_plan(symbol, direction, key, open_now) is not None:
+                    continue
 
                 # [Sprint 1 — Portfolio Manager / Quality Ranking,
                 # 2026-08-05] Book is full: only let a new candidate in
