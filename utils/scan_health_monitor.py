@@ -43,6 +43,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -152,6 +153,55 @@ def record_cycle_result(job_name: str, ok: bool) -> None:
         rec.last_completed_at = time.time()
         rec.last_ok = ok
         rec.consecutive_failures = 0 if ok else rec.consecutive_failures + 1
+
+
+# ─── Per-job memory delta [2026-08-18] ──────────────────────────────────
+# The existing memory_profiler snapshots (see utils/memory_profiler.py)
+# are opportunistic, throttled point-in-time samples — they show what
+# RSS happened to be whenever the profiler's own interval last elapsed,
+# not "how much did THIS job's execution actually cost." With four
+# independently-scheduled background threads (market_intelligence 180s,
+# dore_live_state 60s, live_scanner 300s, retention 3600s) all able to
+# run concurrently — see main()'s thread startup, no mutex between
+# them — a profiler sample taken mid-overlap can't tell you which job
+# (or which combination) produced a given jump. This wraps ONE job's
+# actual compute_fn() call with a before/after RSS reading, so growth
+# can be attributed to a specific job's specific cycle instead of
+# inferred from timing correlation.
+#
+# Deliberately cheap: one psutil.Process().memory_info().rss read
+# before, one after — no malloc_trim, no gc scan, no tracemalloc. Safe
+# to leave on permanently (unlike the full memory_profiler, which is
+# opt-in via MASTERSCANNER_MEMORY_PROFILE=1 because its gc-object walk
+# is comparatively expensive).
+_JOB_DELTA_LOG_THRESHOLD_MB = 5.0   # skip the log line for noise-level deltas
+
+
+@contextmanager
+def job_memory_delta(job_name: str):
+    """Logs [job_memory] <job_name>: <delta>MB (<before>MB -> <after>MB)
+    for the wrapped block, at INFO if the delta is >= threshold (a real
+    allocation worth knowing about) or DEBUG otherwise (so the signal
+    isn't drowned by every sub-5MB cycle when tailing logs at INFO)."""
+    if not _PSUTIL_AVAILABLE:
+        yield
+        return
+    try:
+        before = psutil.Process().memory_info().rss / (1024 * 1024)
+    except Exception:
+        before = None
+    try:
+        yield
+    finally:
+        if before is not None:
+            try:
+                after = psutil.Process().memory_info().rss / (1024 * 1024)
+                delta = after - before
+                level = logging.INFO if abs(delta) >= _JOB_DELTA_LOG_THRESHOLD_MB else logging.DEBUG
+                logger.log(level, "[job_memory] %s: %+.1fMB (%.0fMB -> %.0fMB)",
+                           job_name, delta, before, after)
+            except Exception:
+                logger.exception("job_memory_delta(%s): post-read failed (non-fatal)", job_name)
 
 
 def check_health(job_name: str) -> HealthDecision:
