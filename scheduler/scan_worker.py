@@ -449,7 +449,25 @@ def _live_scan_records(df: pd.DataFrame) -> list[dict]:
     # diagnostics instead of a generic warning.
     from utils.json_sanitize import find_invalid_columns, sanitize_dataframe, prepare_output_payload
 
-    invalid = find_invalid_columns(df)
+    # [2026-08-21] These three are set to None ON PURPOSE in
+    # utils.scanner_engine (search "if r.order_block else None" / "if
+    # _smc_structural else None") whenever a stock has no currently
+    # active SMC order block / structural gate state — a normal,
+    # expected condition for any stock without a live order block right
+    # now, not a computation gap. Flagged here every cycle as a false
+    # "invalid numeric value" WARNING before this exclusion, drowning
+    # out genuine ratio-divided-by-zero style bugs elsewhere in the same
+    # log line. Excluded from this check for that reason only — they
+    # still go through prepare_output_payload()/sanitize_dataframe()
+    # below exactly like every other column, so None still round-trips
+    # to the DB as NULL as intended.
+    _LIVE_SCANNER_STRUCTURALLY_OPTIONAL_COLS = {
+        "SMC_Invalidation_Level", "SMC_OB_Proximal", "SMC_OB_Distal",
+    }
+    invalid = {
+        col: n for col, n in find_invalid_columns(df).items()
+        if col not in _LIVE_SCANNER_STRUCTURALLY_OPTIONAL_COLS
+    }
     if invalid:
         logger.warning(
             "[live_scanner] invalid numeric values (NaN/inf) detected "
