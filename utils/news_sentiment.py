@@ -85,19 +85,23 @@ _BATCH_SIZE = 15
 # Rather than fight other Groq usage for the same 100k TPD pool, news
 # classification runs on a smaller/cheaper model with its own headroom.
 #
-# 2026-08-21: moved off openai/gpt-oss-20b onto llama-3.1-8b-instant.
-# gpt-oss-20b is a reasoning model -- its chain-of-thought and the final
-# JSON answer share one max_tokens budget, and on a full 15-item batch
-# the reasoning could eat the whole thing, leaving nothing valid to
-# parse (Groq's json_validate_failed with an empty failed_generation).
-# reasoning_effort="low" + reasoning_format="hidden" papered over this,
-# but llama-3.1-8b-instant has no reasoning step at all, so there's
-# nothing to starve the JSON output -- removes the failure mode instead
-# of budgeting around it. Also on Groq's free tier, cheap/fast, and on
-# its own token pool separate from 70b. Override via GROQ_NEWS_MODEL in
-# secrets if you want to point this at something else (or back at 70b)
-# without touching groq_client.py's shared default.
-_NEWS_MODEL = "llama-3.1-8b-instant"
+# 2026-08-21 (superseded, see below): moved off openai/gpt-oss-20b
+# onto llama-3.1-8b-instant to dodge gpt-oss-20b's reasoning-token
+# truncation (json_validate_failed with empty failed_generation on a
+# full 15-item batch). Reverted same-day: llama-3.1-8b-instant turned
+# out to be a Groq-deprecated model (announced 2026-06-17, hard
+# shutdown 2026-08-16) -- it now 404s with "does not exist or you do
+# not have access to it" rather than being merely rate-limited or
+# slow. Groq's own deprecation guidance for llama-3.1-8b-instant is to
+# migrate back to openai/gpt-oss-20b, so that's where this landed.
+# The ACTUAL fix for the original truncation problem is the
+# reasoning_effort="low" + reasoning_format="hidden" params on the
+# client.chat.completions.create() call below (kept this time, not
+# stripped out with the model swap) -- gpt-oss-20b is a reasoning
+# model, so without those two params its chain-of-thought competes
+# with the JSON answer for the max_tokens budget and can starve it out
+# entirely on a full batch.
+_NEWS_MODEL = "openai/gpt-oss-20b"
 
 # Summaries are stored at up to 280 chars (utils/news_feed.py) for
 # display, but the classifier doesn't need that much to judge direction/
@@ -197,19 +201,32 @@ def _classify_batch(texts: list[str]) -> list[dict]:
             ],
             response_format={"type": "json_object"},
             temperature=0.1,
-            max_tokens=1800,
+            max_tokens=3000,
+            # gpt-oss-20b is a reasoning model -- without these, its
+            # chain-of-thought competes with the JSON answer for the
+            # max_tokens budget, and on a full 15-item batch it can burn
+            # through the budget mid-thought, leaving nothing valid to
+            # parse. That surfaces as Groq's json_validate_failed with an
+            # empty failed_generation (not a prompt/schema problem, just
+            # truncation). "low" effort + hiding the reasoning tokens
+            # from the response keeps the whole budget for the actual
+            # answer. (Re-added 2026-08-21 after the llama-3.1-8b-instant
+            # detour above got reverted -- these two lines are the actual
+            # fix for the original truncation issue.)
+            reasoning_effort="low",
+            reasoning_format="hidden",
         )
         payload = json.loads(resp.choices[0].message.content)
         raw_results = payload.get("results", [])
 
         # 2026-07-19 fix: match results back to inputs by the model's
-        # "index" field, not list position. A lighter model (this runs on
-        # llama-3.1-8b-instant, see _NEWS_MODEL) occasionally drops or
-        # merges one item out of a batch -- if we trusted position, every
-        # item AFTER the dropped one would silently shift and come back
-        # attributed to the wrong headline (confidently wrong, not just
-        # missing). Index-matching means a dropped item only affects
-        # itself; everything else stays correctly attributed.
+        # "index" field, not list position. A lighter/smaller model (see
+        # _NEWS_MODEL) occasionally drops or merges one item out of a
+        # batch -- if we trusted position, every item AFTER the dropped
+        # one would silently shift and come back attributed to the wrong
+        # headline (confidently wrong, not just missing). Index-matching
+        # means a dropped item only affects itself; everything else
+        # stays correctly attributed.
         by_index: dict[int, dict] = {}
         for r in raw_results:
             idx = r.get("index")
