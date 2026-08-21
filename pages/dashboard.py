@@ -1290,7 +1290,7 @@ _CSS = """
      single line regardless of AM/PM width. Sector/Stock/Confidence/
      Recommendation/Current State also nudged up slightly so labels and
      pills aren't flush against their column edges. */
-  grid-template-columns: 76px 84px 92px 100px 104px 144px 132px 1fr 96px;
+  grid-template-columns: 76px 84px 104px 100px 104px 144px 132px 1fr 96px;
   column-gap: 0;
   /* 2026-07-19: top-align, not center — rows with a wrapped stock-chip
      line or an event-type line under Impact are taller than plain rows;
@@ -1334,7 +1334,18 @@ _CSS = """
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block;
 }
 .ni-headline:hover { text-decoration: underline; }
-.ni-stocks { display: flex; flex-wrap: wrap; gap: 4px; }
+.ni-stocks { display: flex; flex-wrap: wrap; gap: 8px; }
+/* 2026-08-21 [readability]: each matched symbol + its %chg badge now
+   stacks in its own column (symbol on top, %chg beneath) instead of
+   running inline — with 2+ symbols on one row the old inline layout
+   crowded a badge right up against the next chip with no separation. */
+.ni-stock-cell { display: flex; flex-direction: column; gap: 2px; align-items: flex-start; }
+/* _daychg_badge() carries an inline margin-left:5px meant for sitting
+   right after text on the same line — not appropriate now that it's
+   stacked on its own line beneath the chip. !important overrides that
+   inline style without touching _daychg_badge() itself (shared by Top
+   Gainers etc., where the inline-flow margin is still correct). */
+.ni-stock-cell span { margin-left: 0 !important; }
 .ni-symbol-chip {
   display: inline-block; padding: 1px 6px; border-radius: 4px;
   background: rgba(88,166,255,0.12); border: 1px solid rgba(88,166,255,0.35);
@@ -1352,11 +1363,23 @@ _CSS = """
    than a filled/bordered pill — Recommendation keeps the pill treatment
    below since that's still a badge-like decision, whereas Impact reads
    more like a labeled fact. */
-.ni-impact-text { font-size: 12px; font-weight: 700; white-space: nowrap; }
+.ni-impact-text { font-size: 12px; font-weight: 700; white-space: nowrap; display: flex; align-items: center; }
 .ni-impact-pos { color: var(--green); }
 .ni-impact-neg { color: var(--red); }
 .ni-impact-neu { color: var(--muted); }
 .ni-impact-limit { color: #d29922; }
+
+/* 2026-08-21 [readability]: small solid dot ahead of the Impact word —
+   same impact_class driving both, so dot and text color always agree.
+   A stronger at-a-glance scan cue down the column; no new signal. */
+.ni-impact-dot {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  margin-right: 6px; flex-shrink: 0;
+}
+.ni-impact-dot.ni-impact-pos { background: var(--green); }
+.ni-impact-dot.ni-impact-neg { background: var(--red); }
+.ni-impact-dot.ni-impact-neu { background: var(--muted); }
+.ni-impact-dot.ni-impact-limit { background: #d29922; }
 
 .ni-pill {
   display: inline-block; padding: 3px 11px; border-radius: 12px;
@@ -1447,7 +1470,7 @@ _CSS = """
      any phone screen; scope the scroll to the panel itself rather than
      letting it overflow the page or silently clip columns. */
   .ni-panel { overflow-x: auto; }
-  .ni-grid { min-width: 860px; }
+  .ni-grid { min-width: 872px; }
 }
 
 @media (max-width: 480px) {
@@ -2968,8 +2991,19 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
         # the scan table itself uses — blank if nothing matched, i.e. a
         # market-wide story with no single stock behind it).
         sector_label = item.get("sector") or "Market"
+        # 2026-08-21 [readability]: symbol + %chg now stack (symbol on
+        # top, %chg on its own line beneath) instead of running inline
+        # side by side — with 2+ matched symbols the old inline layout
+        # let %chg badges crowd right up against the next symbol with no
+        # visual separation. _tv_link() itself is unchanged (still used
+        # elsewhere inline, e.g. Top Gainers) — the stacking is done here
+        # by wrapping each symbol's link + badge in its own flex-column
+        # cell.
         stock_chips_html = (
-            "".join(_tv_link(s, css_class="ni-symbol-chip", pct_chg=_chg_lookup.get(str(s))) for s in symbols[:4])
+            "".join(
+                f'<div class="ni-stock-cell">{_tv_link(s, css_class="ni-symbol-chip")}{_daychg_badge(_chg_lookup.get(str(s)))}</div>'
+                for s in symbols[:4]
+            )
             if symbols else '<span class="ni-rec-dash">—</span>'
         )
         # 2026-07-18 FIX: item["published"] is UTC (see news_feed.py) —
@@ -2985,12 +3019,18 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
         horizon = item.get("horizon")
         row_tooltip = item.get("impact_note", "") + (f" · {horizon} effect" if horizon else "")
 
+        # 2026-08-21 [readability]: small colored dot ahead of the Impact
+        # word — reuses the exact same impact_class color already driving
+        # the text color, so the dot and word always agree; purely a
+        # stronger at-a-glance scan cue down the column, no new signal.
+        impact_dot_html = f'<span class="ni-impact-dot {impact_class}"></span>'
+
         rows.append(f"""
 <div class="ni-grid ni-row" title="{row_tooltip}">
   <div class="ni-time">{time_label}</div>
   <div class="ni-sector">{sector_label}</div>
   <div class="ni-stocks">{stock_chips_html}</div>
-  <div class="ni-impact-stack"><span class="ni-impact-text {impact_class}">{impact_label}</span>{impact_extra}</div>
+  <div class="ni-impact-stack"><span class="ni-impact-text {impact_class}">{impact_dot_html}{impact_label}</span>{impact_extra}</div>
   <div>{confidence_html}</div>
   <div>{rec_pill_html}</div>
   <div>{state_html}</div>
