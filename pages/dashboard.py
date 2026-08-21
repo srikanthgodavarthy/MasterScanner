@@ -2765,6 +2765,34 @@ _MARKET_INTEL_REFRESH_SECS = 180  # [2026-07-25 ops fix] was 30 — matches the
 
 @st.fragment(run_every=_MARKET_INTEL_REFRESH_SECS)
 def _market_intelligence_fragment():
+    # [2026-08-21] Market-hours short-circuit. This fragment's own
+    # run_every keeps Streamlit re-executing it on a timer for as long as
+    # a browser tab is open, independent of system_state's LIVE/BACKTEST/
+    # MAINTENANCE mode banner above and independent of whether the
+    # background scan_worker loops are paused for market hours (see
+    # utils/system_state.py's should_scheduler_run() / _scheduler_heartbeat
+    # _gate_open()). Left unguarded, that meant every open tab kept
+    # hitting Neon via load_snapshot_meta()/get_snapshot() every tick
+    # nights/weekends, which alone was enough to stop the compute
+    # endpoint from ever seeing 5 idle minutes and autosuspending.
+    #
+    # Deliberately checks is_market_hours_ist() directly rather than
+    # should_scheduler_run() — same reasoning as
+    # _scheduler_heartbeat_gate_open()'s docstring: should_scheduler_run()
+    # carries LIVE/BACKTEST/MAINTENANCE self-heal logic unrelated to a
+    # plain "should this UI panel poll right now" check, and reusing it
+    # here risks the same unwanted side effect that function's docstring
+    # warns against. Renders the last cached payload (already in
+    # session_state from the last in-hours tick) instead of blanking the
+    # panel — this only stops the *polling*, not the display.
+    from utils.time_utils import is_market_hours_ist
+    if not is_market_hours_ist():
+        payload = st.session_state.get("mi_snapshot_payload")
+        if not payload:
+            st.caption("Market Intelligence: outside market hours — background scans "
+                       "are paused, nothing scanned yet this session.")
+        return
+
     from utils.scan_state import load_snapshot_meta
     from utils.snapshot_cache import get_snapshot
 
@@ -3189,6 +3217,17 @@ _DASH_AUTOREFRESH_SECS = 60  # [2026-07-25 ops fix] was 30. live_scanner only
 
 @st.fragment(run_every=_DASH_AUTOREFRESH_SECS)
 def _dash_scan_autorefresh():
+    # [2026-08-21] Market-hours short-circuit — same reasoning as
+    # _market_intelligence_fragment()'s comment above. Without this, an
+    # open tab keeps polling load_snapshot_meta()/get_snapshot_df()
+    # every _DASH_AUTOREFRESH_SECS regardless of market hours, which was
+    # enough on its own to keep the Neon compute endpoint from ever
+    # autosuspending. Leaves dash_scan_df exactly as last set — render()
+    # below already handles a stale/last-good df fine.
+    from utils.time_utils import is_market_hours_ist
+    if not is_market_hours_ist():
+        return
+
     from utils.scan_state import load_snapshot_meta
     from utils.snapshot_cache import get_snapshot, get_snapshot_df
 
