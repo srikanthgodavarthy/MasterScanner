@@ -108,7 +108,7 @@ from utils.outcome_tracking import record_final_outcome
 # Used below to decide whether a Pre-Breakout-origin plan (source == "PB",
 # see DoreOptionsPlan.source's docstring) has actually earned the right to
 # activate, or is still just coiling.
-from utils.dore_options_engine import SETUP_BREAKOUT
+from utils.dore_options_engine import SETUP_BREAKOUT, DORE_OPTIONS_DEFAULTS
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +139,8 @@ def _final_outcome_for_closed_reason(closed_reason: str) -> str:
         return "MANUAL_EXIT"
     if "target 2" in r or "target2" in r:
         return "T2_HIT"
+    if "thesis invalidated" in r:
+        return "THESIS_INVALIDATION"
     if "invalidated" in r:
         return "MANUAL_EXIT"
     return "MANUAL_EXIT"
@@ -196,6 +198,27 @@ MIN_CONFIDENCE_TO_TRACK = 70
 # Backward-compatible alias — some call sites/tests may still reference
 # the old name. Do not use in new code.
 MIN_CONFIDENCE_TO_ACTIVATE = MIN_CONFIDENCE_TO_TRACK
+
+
+def _min_confidence_to_track(dte: Optional[int], settings=DORE_OPTIONS_DEFAULTS) -> float:
+    """[2026-08-21, gamma-zone strike selection] Returns the flat
+    MIN_CONFIDENCE_TO_TRACK unless enable_gamma_zone_strike_selection
+    is on AND dte falls in the 0-2 or 3-5 DTE bucket, in which case a
+    stricter floor applies (gamma_min_confidence_to_track_0_2_dte /
+    _3_5_dte) — reserving the highest-leverage, highest-variance
+    near-ATM/near-expiry bucket for the best signals only ("early
+    birds with highest confidence"), rather than admitting it at the
+    same bar as every other trade. dte=None (unknown) always falls
+    back to the flat gate — never guesses a bucket from missing data."""
+    if not getattr(settings, "enable_gamma_zone_strike_selection", False) or dte is None:
+        return MIN_CONFIDENCE_TO_TRACK
+    from utils.dore_options_engine import expiry_bucket
+    bucket = expiry_bucket(dte)
+    if bucket == "0-2":
+        return settings.gamma_min_confidence_to_track_0_2_dte
+    if bucket == "3-5":
+        return settings.gamma_min_confidence_to_track_3_5_dte
+    return MIN_CONFIDENCE_TO_TRACK
 
 # [Sprint 1 — Portfolio Admission, 2026-08-05] Hard cap on simultaneously
 # OPEN DORE Options plans. Once at cap, a new candidate can still mint —
@@ -404,6 +427,21 @@ class DoreOptionsPlan:
     # cycle's technical read differs.
     source:              str   = ""
 
+    # [2026-08-20, DORE flow review] Frozen execution/thesis evidence.
+    # These fields make the 24-SL forensic audit queryable from the plan
+    # itself: DTE bucket, EMA state used for activation, and why the plan
+    # did/didn't activate. They are observational except for the two guards
+    # explicitly consumed by the lifecycle code below.
+    dte_bucket:                 str = ""
+    activation_ema9:            Optional[float] = None
+    activation_ema21:           Optional[float] = None
+    activation_momentum_score:  Optional[float] = None
+    activation_trigger_type:    str = ""
+    activation_reason:          str = ""
+    activation_blocked_reason:  str = ""
+    thesis_invalidation_level:  Optional[float] = None
+    thesis_exit_enabled:        bool = True
+
     # [Phase 3, masterscanner_scoring_redesign_FINAL.md §2/§4 —
     # "DORE CV4/SMC persistence"] CV4EvidenceResult (utils.dore_engine.
     # stage2_5_cv4_evidence()) captured ONCE at mint time, same frozen-
@@ -519,6 +557,15 @@ class DoreOptionsPlan:
             # (the dataclass default), so this hits on every refresh of
             # any pre-existing open plan until they're closed out.
             "source":              self.source or "",
+            "dte_bucket":          self.dte_bucket or "",
+            "activation_ema9":    self.activation_ema9,
+            "activation_ema21":   self.activation_ema21,
+            "activation_momentum_score": self.activation_momentum_score,
+            "activation_trigger_type": self.activation_trigger_type or "",
+            "activation_reason":  self.activation_reason or "",
+            "activation_blocked_reason": self.activation_blocked_reason or "",
+            "thesis_invalidation_level": self.thesis_invalidation_level,
+            "thesis_exit_enabled": bool(self.thesis_exit_enabled),
             # Phase 3 CV4/SMC mint-time snapshot (§2/§4) — non-gating,
             # additive-only. See dataclass field comments above.
             "cv4_leadership_at_mint":       self.cv4_leadership_at_mint,
@@ -867,6 +914,71 @@ def _count_active(existing_plans: dict) -> int:
     return sum(1 for p in existing_plans.values() if p.is_active())
 
 
+def _underlying_activation_confirmation(row: dict, current_underlying: Optional[float]) -> tuple[bool, str]:
+    """Require the LIVE underlying to confirm the frozen Stage-1 EMA thesis.
+
+    Premium entering the +/- entry band is deliberately insufficient. This
+    guard uses only values already computed by Stage 1 (EMA9/EMA21) plus the
+    current underlying quote supplied by Stage 2; it performs no OHLCV/EMA
+    recomputation and therefore does not add a second technical pipeline.
+    """
+    if not DORE_OPTIONS_DEFAULTS.require_underlying_confirmation:
+        return True, "Underlying confirmation disabled by settings"
+    if current_underlying is None:
+        return False, "Live underlying price unavailable"
+    ema9 = row.get("activation_ema9")
+    ema21 = row.get("activation_ema21")
+    direction = row.get("direction") or ""
+    if ema9 is None or ema21 is None:
+        return False, "Stage-1 EMA9/EMA21 evidence unavailable"
+    try:
+        spot = float(current_underlying)
+        ema9 = float(ema9)
+        ema21 = float(ema21)
+        buffer = float(DORE_OPTIONS_DEFAULTS.activation_underlying_ema_buffer_pct) / 100.0
+    except (TypeError, ValueError):
+        return False, "Invalid Stage-1/live underlying confirmation data"
+    if direction == "CE":
+        if ema9 <= ema21:
+            return False, f"EMA alignment lost for CE (EMA9={ema9:.2f} <= EMA21={ema21:.2f})"
+        trigger = ema9 * (1.0 + buffer)
+        if spot < trigger:
+            return False, f"Underlying {spot:.2f} below CE activation EMA9 trigger {trigger:.2f}"
+    elif direction == "PE":
+        if ema9 >= ema21:
+            return False, f"EMA alignment lost for PE (EMA9={ema9:.2f} >= EMA21={ema21:.2f})"
+        trigger = ema9 * (1.0 - buffer)
+        if spot > trigger:
+            return False, f"Underlying {spot:.2f} above PE activation EMA9 trigger {trigger:.2f}"
+    else:
+        return False, f"Unsupported DORE direction {direction!r}"
+    return True, "Underlying EMA9/EMA21 confirmation passed"
+
+
+def _ema_thesis_breached(row: dict, current_underlying: Optional[float]) -> tuple[bool, str]:
+    """Return whether the frozen Stage-1 EMA9 thesis has been invalidated."""
+    if not DORE_OPTIONS_DEFAULTS.enable_ema_thesis_exit:
+        return False, ""
+    if current_underlying is None:
+        return False, ""
+    level = row.get("thesis_invalidation_level") or row.get("activation_ema9")
+    ema21 = row.get("activation_ema21")
+    direction = row.get("direction") or ""
+    if level is None or ema21 is None:
+        return False, ""
+    try:
+        spot = float(current_underlying)
+        level = float(level)
+        ema21 = float(ema21)
+    except (TypeError, ValueError):
+        return False, ""
+    if direction == "CE" and spot <= level:
+        return True, f"CE thesis invalidated: underlying {spot:.2f} <= frozen EMA9 {level:.2f}"
+    if direction == "PE" and spot >= level:
+        return True, f"PE thesis invalidated: underlying {spot:.2f} >= frozen EMA9 {level:.2f}"
+    return False, ""
+
+
 def enrich_trade_plans_with_persistence(
     plans: list,
     existing_plans: dict,
@@ -951,7 +1063,7 @@ def enrich_trade_plans_with_persistence(
                 # the mint path (this `else` branch); an already-tracked
                 # plan (the `if` branch above) is exempt and keeps being
                 # monitored regardless of later confidence fluctuation.
-                if confidence_score < MIN_CONFIDENCE_TO_TRACK:
+                if confidence_score < _min_confidence_to_track(row.get("dte")):
                     enriched_rows.append(row)   # still shown as a Live Scan recommendation, just not tracked
                     continue
 
@@ -1024,6 +1136,15 @@ def enrich_trade_plans_with_persistence(
                     confidence_at_entry=confidence_score,
                     status=DoreOptionsPlanStatus.TRACKED,
                     source=row.get("source") or "",
+                    dte_bucket=row.get("dte_bucket") or "",
+                    activation_ema9=row.get("activation_ema9"),
+                    activation_ema21=row.get("activation_ema21"),
+                    activation_momentum_score=row.get("activation_momentum_score"),
+                    activation_trigger_type=row.get("activation_trigger_type") or "UNDERLYING_EMA_CONFIRMATION",
+                    activation_reason="",
+                    activation_blocked_reason="",
+                    thesis_invalidation_level=row.get("thesis_invalidation_level"),
+                    thesis_exit_enabled=bool(row.get("thesis_exit_enabled", True)),
                     # [Phase 3, §2/§4] Captured at mint time IF the caller
                     # already ran utils.dore_engine.stage2_5_cv4_evidence()
                     # for this cycle and put its result on `row` — that
@@ -1083,8 +1204,15 @@ def enrich_trade_plans_with_persistence(
                 # confidence was high (CRITICAL BEHAVIOR CHANGE / target
                 # architecture).
                 # ══════════════════════════════════════════════════
-                in_zone = bool(execution_ok) and current_premium is not None \
+                premium_in_zone = bool(is_fresh and execution_ok) and current_premium is not None \
                     and _ez_lo is not None and _ez_hi is not None and _ez_lo <= current_premium <= _ez_hi
+                underlying_ok, underlying_reason = _underlying_activation_confirmation(row, current_underlying)
+                in_zone = premium_in_zone and underlying_ok
+                if premium_in_zone and not underlying_ok:
+                    row["blocked_reason"] = underlying_reason
+                    locked.activation_blocked_reason = underlying_reason
+                elif premium_in_zone:
+                    locked.activation_blocked_reason = ""
 
                 # ══════════════════════════════════════════════════
                 # [2026-08-12, PRE_BREAKOUT activation guard] Explicit
@@ -1124,6 +1252,10 @@ def enrich_trade_plans_with_persistence(
                     locked.confidence_at_entry = confidence_score
                     locked.status = DoreOptionsPlanStatus.ACTIVE
                     locked.entry_triggered_at = _now_iso()
+                    locked.activation_reason = (
+                        "Premium entry zone + underlying EMA9/EMA21 confirmation"
+                    )
+                    locked.activation_blocked_reason = ""
                     just_activated = True
                 else:
                     # Still pre-active. Keep SL/T1/T2 dynamic — refreshed
@@ -1187,6 +1319,26 @@ def enrich_trade_plans_with_persistence(
                         _record_dore_final_outcome(locked)
                         enriched_rows.append(p.to_dict())
                         continue
+
+                # [2026-08-20, DORE flow review §3] Frozen EMA thesis exit.
+                # Checked after structural invalidation (which has higher
+                # exit priority), but before the premium SL. Once the
+                # underlying loses the Stage-1 EMA9 thesis, the option
+                # position is no longer allowed to wait for a potentially
+                # much wider premium stop.
+                thesis_breached, thesis_reason = _ema_thesis_breached(row, current_underlying)
+                if thesis_breached and locked.thesis_exit_enabled:
+                    if current_premium is not None:
+                        locked.last_premium = current_premium
+                    locked.last_seen_at = _now_iso()
+                    locked.status = DoreOptionsPlanStatus.CLOSED
+                    locked.closed_at = _now_iso()
+                    locked.closed_reason = thesis_reason
+                    locked.closed_reason_code = "THESIS_INVALIDATION"
+                    updated_plans.append(locked)
+                    _record_dore_final_outcome(locked)
+                    enriched_rows.append(p.to_dict())
+                    continue
 
                 # [2026-08-05, SG request] Detect T1 the moment it's
                 # reached and freeze it — sticky, never cleared even if

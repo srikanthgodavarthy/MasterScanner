@@ -167,6 +167,82 @@ class DoreOptionsSettings:
     high_confidence_capture_cap_threshold: float = 70.0
     long_dte_high_confidence_target_pct:  float = 0.05   # 5% of spot
 
+    # [2026-08-21, gamma-zone strike selection, SG request] OFF by
+    # default — same non-gating opt-in pattern as
+    # enable_cv4_opportunity_weight (utils.dore_settings /
+    # utils.dore_engine): with this False, select_strikes() and
+    # _effective_capture_ratio() behave EXACTLY as before (every line
+    # above this block, untouched). Flip True only after this has been
+    # validated against enough live closed-trade history.
+    #
+    # Rationale (see chat/design note, not yet a doc file): SG's traded
+    # experience is that the SAME underlying move (e.g. +3%) is worth
+    # very different premium % depending on how close to expiry it
+    # happens — a modest ~20-30% premium gain early in the cycle (10+
+    # DTE, low gamma, roughly delta-linear) vs. 150%+ in the final week
+    # (0-2 DTE, gamma concentrated at/near the strike). That payoff only
+    # exists if the strike is close enough for a realistic move to
+    # reach it — a strike sitting 5-8% away with 2-4 days left gets NONE
+    # of that convexity, it just decays on schedule (theta bleed).
+    #
+    # The pre-existing capture_ratio_*_dte / confidence_capture_adjust_
+    # max / long_dte_high_confidence_target_pct trio does the OPPOSITE
+    # of this: capture_ratio_0_2_dte (0.85) is the HIGHEST of the four
+    # buckets (pushes furthest from ATM exactly when DTE is shortest),
+    # confidence pushes the strike FURTHER out as confidence rises, and
+    # the only OTM ceiling (long_dte_high_confidence_target_pct) is
+    # gated to dte > long_dte_days — it explicitly excludes every
+    # short-DTE trade. Empirically (Neon dore_options_plans, 32 closed
+    # STOP_LOSS/TIMEOUT plans, 2026-08-18..21): measured strike offset
+    # vs. spot-at-entry clustered 2.9%-8.4% even at DTE 4-7, with no
+    # tightening as expiry approached.
+    #
+    # This block replaces that trio with a DTE-graduated ladder that
+    # tightens toward ATM as DTE shrinks (gamma_capture_ratio_*) and
+    # applies an OTM ceiling at EVERY bucket, not just dte > 10
+    # (gamma_max_offset_pct_*). It also flips the confidence adjustment
+    # (gamma_confidence_pulls_toward_atm) so a strong short-DTE signal
+    # buys the RIGHT to take the leveraged near-ATM bet, rather than
+    # licensing an even-further-OTM strike — and raises the confidence
+    # floor required to mint a short-DTE plan at all
+    # (gamma_min_confidence_to_track_*), so the highest-leverage,
+    # highest-variance bucket is reserved for the best signals ("early
+    # birds with highest confidence"), matching Trinity's stated goal.
+    enable_gamma_zone_strike_selection: bool = True
+
+    # DTE-graduated capture ratio, same 0-2/3-5/6-10/>10 buckets as
+    # capture_ratio_*_dte above but INCREASING with DTE (opposite
+    # ordering) — tight near ATM close to expiry, room to breathe early
+    # in the cycle where the payoff is closer to linear anyway.
+    gamma_capture_ratio_0_2_dte:   float = 0.30
+    gamma_capture_ratio_3_5_dte:   float = 0.50
+    gamma_capture_ratio_6_10_dte:  float = 0.65
+    gamma_capture_ratio_gt_10_dte: float = 0.75
+
+    # OTM ceiling as a flat % of spot, applied at EVERY DTE bucket
+    # (unlike long_dte_high_confidence_target_pct, which only fires for
+    # dte > long_dte_days). Tightest near expiry, loosest far from it.
+    gamma_max_offset_pct_0_2_dte:   float = 0.020   # 2.0% of spot
+    gamma_max_offset_pct_3_5_dte:   float = 0.030   # 3.0% of spot
+    gamma_max_offset_pct_6_10_dte:  float = 0.045   # 4.5% of spot
+    gamma_max_offset_pct_gt_10_dte: float = 0.060   # 6.0% of spot
+
+    # When True (and enable_gamma_zone_strike_selection is True), a
+    # higher confidence score PULLS the strike toward ATM instead of
+    # pushing it further out — inverts confidence_capture_adjust_max's
+    # sign, scaled by how short the DTE is (full pull at 0-2 DTE,
+    # tapering to no pull at/after long_dte_days, where the original
+    # "reach further on a strong setup" behavior still makes sense).
+    gamma_confidence_pulls_toward_atm: bool = True
+
+    # Stricter MIN_CONFIDENCE_TO_TRACK for the two shortest DTE
+    # buckets only (checked by the caller, utils.dore_options_
+    # persistence — this module only exposes the thresholds). Leaves
+    # the existing flat MIN_CONFIDENCE_TO_TRACK=70 gate untouched for
+    # dte > 5 and whenever this whole feature is disabled.
+    gamma_min_confidence_to_track_0_2_dte: float = 80.0
+    gamma_min_confidence_to_track_3_5_dte: float = 78.0
+
     # ── Stage 6: Premium Validation ─────────────────────────────
     premium_atr_min_mult: float = 0.05      # premium too low relative to ATR (floor check)
     premium_move_max_mult: float = 0.55     # premium too high relative to Expected Move
@@ -193,10 +269,63 @@ class DoreOptionsSettings:
     w_expiry_suitability: float = 5.0
 
     # ── Stage 9: Trade Plan construction ─────────────────────────
-    stop_loss_premium_pct: float = 0.35   # SL = premium * (1 - this)
-    target1_premium_pct:   float = 0.50   # T1 = premium * (1 + this)
-    target2_premium_pct:   float = 1.00   # T2 = premium * (1 + this)
+    # [2026-08-20, SG-requested pipeline review, DORE flow review §5]
+    # SL/T1/T2 used to be ONE flat premium-% regardless of DTE — a
+    # 2-DTE candidate and a 14-DTE candidate got the identical -35%/
+    # +50%/+100% thresholds, despite select_strikes() one stage
+    # earlier already computing a DTE-scaled capture_ratio (see
+    # capture_ratio_0_2_dte etc. above) for the STRIKE offset. Live
+    # trade history (Neon dore_options_plans, 44 closed plans,
+    # 2026-08-07..20, all minted before this change) confirmed this
+    # mismatch empirically: avg strike 4.85% OTM, avg SL -35.0%/avg T1
+    # +50.0%/avg T2 +100.0% (exactly the old flat constants), but avg
+    # MFE ever reached was only +16.2% (median +7.9%) — the flat T1/T2
+    # were essentially unreachable for the short-DTE trades that
+    # dominate this book, while the flat SL got tagged reliably
+    # (56.8% of all closes) because nothing scaled down the risk
+    # distance to match the reduced time for premium to develop.
+    #
+    # Bucketed the same way as capture_ratio (0-2/3-5/6-10/>10 DTE,
+    # via expiry_bucket() — see _stop_loss_premium_pct()/
+    # _target1_premium_pct()/_target2_premium_pct() below). The >10
+    # bucket is left at the OLD flat values (0.35/0.50/1.00) as the
+    # conservative anchor — that's the one DTE range with enough time
+    # for a 50-100% premium move to be plausible, so it's the least
+    # likely of the four buckets to have been wrong under the old flat
+    # scheme. Shorter buckets scale down from there.
+    #
+    # This is a FIRST-PASS calibration, not a backtested optimum — the
+    # 44-trade sample above didn't break down MFE by DTE bucket
+    # specifically (that data wasn't captured granularly enough), so
+    # these are reasoned, monotonic starting points meant to be
+    # tightened with more closed-trade history (see the mfe_ceiling_
+    # table/pillar_outcome_correlation analytics modules referenced
+    # elsewhere for exactly this kind of future calibration work) —
+    # not treated as final.
+    stop_loss_premium_pct_0_2_dte:   float = 0.22   # SL = premium * (1 - this)
+    stop_loss_premium_pct_3_5_dte:   float = 0.28
+    stop_loss_premium_pct_6_10_dte:  float = 0.32
+    stop_loss_premium_pct_gt_10_dte: float = 0.35   # = old flat default
+
+    target1_premium_pct_0_2_dte:   float = 0.18     # T1 = premium * (1 + this)
+    target1_premium_pct_3_5_dte:   float = 0.28
+    target1_premium_pct_6_10_dte:  float = 0.40
+    target1_premium_pct_gt_10_dte: float = 0.50     # = old flat default
+
+    target2_premium_pct_0_2_dte:   float = 0.32     # T2 = premium * (1 + this)
+    target2_premium_pct_3_5_dte:   float = 0.50
+    target2_premium_pct_6_10_dte:  float = 0.75
+    target2_premium_pct_gt_10_dte: float = 1.00     # = old flat default
+
     entry_zone_band_pct:   float = 0.05   # +/- band around LTP for the entry zone
+
+    # [2026-08-20, DORE flow review §3] Premium location is NOT sufficient
+    # to activate a trade. Stage 2 must also confirm that the live underlying
+    # is still aligned with the frozen Stage-1 EMA9/EMA21 thesis. This is a
+    # management/activation guard, not a new Stage-1 score.
+    require_underlying_confirmation: bool = True
+    activation_underlying_ema_buffer_pct: float = 0.0
+    enable_ema_thesis_exit: bool = True
 
     # ── Structural SMC trade geometry [2026-08-16, DORE §7] ──────
     # Minimum acceptable Structural R:R (Reward/Risk on the UNDERLYING
@@ -727,9 +856,11 @@ class OptionTradePlan:
     aggressive:           StrikeCandidate
 
     entry_zone:           tuple                # (low, high) premium band
-    # [2026-08-16] SECONDARY CAPITAL PROTECTION STOP — a fixed % loss on
-    # the option's own premium (settings.stop_loss_premium_pct),
-    # independent of the underlying's price structure. This is a risk
+    # [2026-08-16] SECONDARY CAPITAL PROTECTION STOP — a DTE-bucketed
+    # % loss on the option's own premium (settings.stop_loss_premium_
+    # pct_*_dte — see that field's docstring; was a single flat % for
+    # every DTE until 2026-08-20), independent of the underlying's
+    # price structure. This is a risk
     # ceiling, not the thesis check — see structural_invalidation_level
     # below for the PRIMARY THESIS STOP. A position can hit this stop
     # while the underlying structure is still fully intact (elevated IV/
@@ -750,6 +881,16 @@ class OptionTradePlan:
     target_price:         float
     current_price:        float
     market_regime:        Optional[str]
+
+    # [2026-08-20, DORE flow review §3] Frozen Stage-1 execution evidence.
+    # These values are persisted with the technical plan so Stage 2 can
+    # require live-underlying confirmation without re-running EMA logic.
+    activation_ema9:           Optional[float] = None
+    activation_ema21:          Optional[float] = None
+    activation_momentum_score: Optional[float] = None
+    activation_trigger_type:   Optional[str] = None
+    thesis_invalidation_level: Optional[float] = None
+    dte_bucket:                Optional[str] = None
 
     # 2026-07-31: current option premium (== primary.premium, restated at
     # the top level so table renderers don't have to reach into the
@@ -788,6 +929,14 @@ class OptionTradePlan:
     # shortlist a candidate came from. Short-form only — see
     # pages/scanner.py's Source column for the badge rendering.
     source:                 Optional[str] = None
+    # Horizon-specific shadow evidence for the intended ~2-day option hold.
+    dore_2d_direction:       Optional[float] = None
+    dore_2d_acceleration:    Optional[float] = None
+    dore_2d_expansion:       Optional[float] = None
+    dore_2d_room_to_move:    Optional[float] = None
+    dore_2d_option_viability: Optional[float] = None
+    dore_2d_move_potential:  Optional[float] = None
+    dore_2d_class:           Optional[str] = None
     reasons:              list = field(default_factory=list)
 
     # [Phase 4, masterscanner_scoring_redesign_FINAL.md §2/§4 — "close
@@ -1143,6 +1292,39 @@ def _base_capture_ratio(dte: int, settings: DoreOptionsSettings) -> float:
     }[expiry_bucket(dte)]
 
 
+# [2026-08-20, DORE flow review §5] DTE-bucketed SL/T1/T2 lookups —
+# see DoreOptionsSettings' stop_loss_premium_pct_*/target1_premium_
+# pct_*/target2_premium_pct_* docstring above for why these replaced
+# the old flat, DTE-blind constants. Same bucket lookup pattern as
+# _base_capture_ratio() above, deliberately — SL/T1/T2 should scale
+# with the same DTE granularity the strike offset already does.
+def _stop_loss_premium_pct(dte: int, settings: DoreOptionsSettings) -> float:
+    return {
+        "0-2":  settings.stop_loss_premium_pct_0_2_dte,
+        "3-5":  settings.stop_loss_premium_pct_3_5_dte,
+        "6-10": settings.stop_loss_premium_pct_6_10_dte,
+        ">10":  settings.stop_loss_premium_pct_gt_10_dte,
+    }[expiry_bucket(dte)]
+
+
+def _target1_premium_pct(dte: int, settings: DoreOptionsSettings) -> float:
+    return {
+        "0-2":  settings.target1_premium_pct_0_2_dte,
+        "3-5":  settings.target1_premium_pct_3_5_dte,
+        "6-10": settings.target1_premium_pct_6_10_dte,
+        ">10":  settings.target1_premium_pct_gt_10_dte,
+    }[expiry_bucket(dte)]
+
+
+def _target2_premium_pct(dte: int, settings: DoreOptionsSettings) -> float:
+    return {
+        "0-2":  settings.target2_premium_pct_0_2_dte,
+        "3-5":  settings.target2_premium_pct_3_5_dte,
+        "6-10": settings.target2_premium_pct_6_10_dte,
+        ">10":  settings.target2_premium_pct_gt_10_dte,
+    }[expiry_bucket(dte)]
+
+
 # ══════════════════════════════════════════════════════════════════
 #  STAGE 5 — Expected Move + Target blend -> Strike Selection
 #  (Improvement #2: uses Target, Expected Move, ATR, Conviction, Entry
@@ -1150,11 +1332,38 @@ def _base_capture_ratio(dte: int, settings: DoreOptionsSettings) -> float:
 #  (Improvement #5: returns Conservative / Balanced / Aggressive.)
 # ══════════════════════════════════════════════════════════════════
 
+def _gamma_base_capture_ratio(dte: int, settings: DoreOptionsSettings) -> float:
+    """Same bucket lookup as _base_capture_ratio(), but sourced from the
+    gamma_capture_ratio_*_dte ladder (increases with DTE — tight near
+    ATM close to expiry). Only ever called when
+    enable_gamma_zone_strike_selection is True."""
+    return {
+        "0-2":  settings.gamma_capture_ratio_0_2_dte,
+        "3-5":  settings.gamma_capture_ratio_3_5_dte,
+        "6-10": settings.gamma_capture_ratio_6_10_dte,
+        ">10":  settings.gamma_capture_ratio_gt_10_dte,
+    }[expiry_bucket(dte)]
+
+
+def _gamma_max_offset_pct(dte: int, settings: DoreOptionsSettings) -> float:
+    """OTM ceiling (as a fraction of spot) for the given DTE bucket,
+    from the gamma_max_offset_pct_*_dte ladder. Unlike
+    long_dte_high_confidence_target_pct, this applies at every bucket,
+    not only dte > long_dte_days."""
+    return {
+        "0-2":  settings.gamma_max_offset_pct_0_2_dte,
+        "3-5":  settings.gamma_max_offset_pct_3_5_dte,
+        "6-10": settings.gamma_max_offset_pct_6_10_dte,
+        ">10":  settings.gamma_max_offset_pct_gt_10_dte,
+    }[expiry_bucket(dte)]
+
+
 def _effective_capture_ratio(
     sig: MasterScannerSignal, dte: int, confidence: float,
     settings: DoreOptionsSettings, iv: Optional[IVContext] = None,
 ) -> float:
-    base = _base_capture_ratio(dte, settings)
+    _gamma_on = getattr(settings, "enable_gamma_zone_strike_selection", False)
+    base = _gamma_base_capture_ratio(dte, settings) if _gamma_on else _base_capture_ratio(dte, settings)
 
     # Blend in how far the Target sits relative to the Expected Move —
     # "use both Target and Expected Move" (Improvement #2).
@@ -1165,10 +1374,21 @@ def _effective_capture_ratio(
     blended = base * (1 - settings.target_blend_weight) + target_pull * settings.target_blend_weight
 
     # Confidence (Conviction + Entry Quality + EMA Momentum, via the
-    # Stage-3 `confidence` score) nudges the ratio: strong setups can
-    # reach a bit further, weak ones stay closer to ATM.
+    # Stage-3 `confidence` score) nudges the ratio. Default behavior:
+    # strong setups can reach a bit further, weak ones stay closer to
+    # ATM. [2026-08-21, gamma-zone] When enabled AND
+    # gamma_confidence_pulls_toward_atm is True, this is INVERTED and
+    # scaled by DTE proximity — a strong short-DTE signal pulls the
+    # strike TOWARD ATM (to actually sit in the gamma zone) instead of
+    # pushing it further out; the pull tapers to zero at/after
+    # long_dte_days, where the original "reach further" logic still
+    # applies unchanged.
     confidence_adjust = ((confidence - 50.0) / 50.0) * settings.confidence_capture_adjust_max
-    blended += confidence_adjust
+    if _gamma_on and settings.gamma_confidence_pulls_toward_atm:
+        dte_proximity = max(0.0, min(1.0, 1.0 - (dte / max(1, settings.long_dte_days))))
+        blended -= 2.0 * confidence_adjust * dte_proximity
+    else:
+        blended += confidence_adjust
 
     # Market regime (reused from MasterScanner, never recomputed).
     if sig.market_regime in settings.regime_capture_adjust:
@@ -1220,6 +1440,16 @@ def select_strikes(
             and confidence >= settings.high_confidence_capture_cap_threshold
             and sig.current_price > 0):
         max_offset = sig.current_price * settings.long_dte_high_confidence_target_pct
+
+    # [2026-08-21, gamma-zone strike selection] When enabled, this
+    # REPLACES the dte-> long_dte_days-only ceiling above with a cap
+    # that applies at every DTE bucket, tightest near expiry — see
+    # enable_gamma_zone_strike_selection's docstring. Takes the
+    # tighter of the two if both would otherwise apply (never loosens
+    # an already-set cap).
+    if getattr(settings, "enable_gamma_zone_strike_selection", False) and sig.current_price > 0:
+        gamma_cap = sig.current_price * _gamma_max_offset_pct(dte, settings)
+        max_offset = gamma_cap if max_offset is None else min(max_offset, gamma_cap)
 
     out: dict[str, dict] = {}
     for label, scale in scales.items():
@@ -1965,6 +2195,19 @@ def compute_dore_trade_plan(
     _structural_reason = "no_open_prices" if open_prices is None else "insufficient_bars"
     _ob_for_dir = None
     _structural_decision = None
+    # [Fix, 2026-08-21, Issue 1] Explicit flag, set True ONLY at the
+    # instant the override below actually succeeds. Previously this was
+    # inferred after the fact by comparing strikes[CONSERVATIVE]["strike"]
+    # to _pre_structural_conservative_strike — a false-negative trap:
+    # whenever the OB proximal line's nearest priced strike happened to
+    # equal what select_strikes() already picked (a real, not-uncommon
+    # coincidence on coarse strike_interval underlyings), the numeric
+    # comparison saw "unchanged" and silently reported NO anchor applied
+    # (is_structurally_anchored=False, primary stayed Balanced, reasons
+    # said "Balanced" not "Structural anchor") even though the anchor
+    # genuinely fired. Tracking the actual event, not its numeric
+    # side-effect, makes this correct regardless of coincidental equality.
+    _anchor_applied = False
     # [Structural SMC trade geometry, 2026-08-16, DORE §3-§7] — entry
     # reference / target / RR, computed alongside the existing OB-anchor
     # read above (same _ob_df/_smc_latest, no duplicate SMC calculation
@@ -2011,8 +2254,68 @@ def compute_dore_trade_plan(
                 try:
                     _anchor_strike = _nearest_priced_strike(_ob_for_dir.proximal, chain, dir_)
                     strikes[CONSERVATIVE] = {**strikes[CONSERVATIVE], "strike": _anchor_strike}
+                    _anchor_applied = True
                 except ChainDataError:
                     pass   # chain has nothing near the anchor -- keep select_strikes()'s own value, don't fabricate one
+
+                # [Fix, 2026-08-21, Issue 3] Structural selection used to
+                # stop at Conservative — Balanced/Aggressive stayed on
+                # select_strikes()'s independent, unrelated volatility-
+                # offset basis, so the three tiers could end up
+                # internally inconsistent (e.g. the "Conservative"
+                # anchor sitting FARTHER from spot than "Aggressive",
+                # since an OB proximal line has no relationship at all
+                # to expected_move x capture_ratio). When the anchor is
+                # applied, rescale Balanced/Aggressive's offsets so the
+                # whole ladder stays anchored to the SAME structural
+                # reference, preserving their original relative spacing
+                # (conservative_capture_scale : 1.0 : aggressive_capture_
+                # scale) — just measured from the anchor's offset instead
+                # of the volatility-model Conservative's offset. Downgrade
+                # -only / never-fabricate, same as everywhere else in this
+                # block: any ChainDataError walking a rescaled offset to a
+                # real priced strike leaves that tier exactly as
+                # select_strikes() produced it.
+                #
+                # [Fix, 2026-08-21, SIGNED ladder] An OB proximal line has
+                # no obligation to sit OTM — it can land ITM relative to
+                # dir_ (e.g. below spot for a CE). The first version of
+                # this rescale used abs(anchor_strike - spot) and then
+                # always projected further OTM (spot + offset for CE,
+                # spot - offset for PE), which silently flipped Balanced/
+                # Aggressive onto the OPPOSITE side of spot from an ITM
+                # anchor — exactly backwards for a strategy whose whole
+                # edge is the ITM/ATM/OTM distinction on a short ~2-day
+                # hold. Using the SIGNED offset (anchor_strike - spot,
+                # keeping its sign) and adding that signed, scaled value
+                # straight onto spot keeps Balanced/Aggressive on the
+                # SAME side of spot as the anchor itself — ITM anchor ->
+                # ITM ladder, OTM anchor -> OTM ladder — just scaled
+                # further along that same direction, matching what the
+                # unsigned version only did when the anchor happened to
+                # be OTM to begin with.
+                if _anchor_applied:
+                    _anchor_signed_offset = _anchor_strike - sig.current_price
+                    _base_scale = max(settings.conservative_capture_scale, 1e-6)
+                    for _label, _orig_scale in (
+                        (BALANCED, 1.0),
+                        (AGGRESSIVE, settings.aggressive_capture_scale),
+                    ):
+                        _rescaled_signed_offset = _anchor_signed_offset * (_orig_scale / _base_scale)
+                        _raw = sig.current_price + _rescaled_signed_offset
+                        try:
+                            _tier_strike = _nearest_priced_strike(_raw, chain, dir_)
+                        except ChainDataError:
+                            continue   # keep select_strikes()'s own value for this tier
+                        _tier_offset = abs(_tier_strike - sig.current_price)
+                        strikes[_label] = {
+                            **strikes[_label],
+                            "strike": _tier_strike,
+                            "offset": round(_tier_offset, 2),
+                            "probability_of_profit": round(
+                                _probability_of_profit(_tier_offset, sig.expected_move), 1
+                            ),
+                        }
 
             # ── Structural target discovery + RR (DORE §4/§6) ───────
             # entry_reference is the OB proximal line itself (the
@@ -2104,28 +2407,61 @@ def compute_dore_trade_plan(
     # no anchor was applied (STRUCTURAL_DATA_UNAVAILABLE, no OB for this
     # direction, or STRUCTURAL_INVALIDATION — which now rejects the plan
     # outright above, so it never reaches this line anyway).
-    _anchor_applied = strikes[CONSERVATIVE]["strike"] != _pre_structural_conservative_strike
+    # [Fix, 2026-08-21, Issue 1] _anchor_applied is now the explicit flag
+    # set above at the moment the override actually happened — no longer
+    # inferred by comparing strike numbers (see that flag's docstring for
+    # why the comparison was unreliable).
     _primary_label = CONSERVATIVE if _anchor_applied else BALANCED
 
     candidates: dict[str, StrikeCandidate] = {}
     all_reasons: list[str] = []
+    # [2026-08-20, DORE flow review §3] Captured per-label now (not
+    # just the primary's) SPECIFICALLY so the any_ok=False branch below
+    # can report which check each candidate actually failed, instead of
+    # the old generic message that discarded this. That generic message
+    # was the reason NIFTY/SENSEX/BANKNIFTY's live NoLiquidity rejections
+    # (confirmed via Neon, every cycle) couldn't be root-caused from the
+    # persisted snapshot alone — nothing more granular ever got written
+    # anywhere. This changes ONLY the rejection's diagnostic detail;
+    # every threshold/check in _build_candidate() is unchanged.
+    per_label_reasons: dict[str, list[str]] = {}
+    per_label_ok: dict[str, bool] = {}
     primary_premium_quality = primary_oi_quality = 0.0
     primary_quote: Optional[PremiumQuote] = None
-    any_ok = False
     for label in (CONSERVATIVE, BALANCED, AGGRESSIVE):
         candidate, reasons, premium_quality, oi_quality, ok, quote = _build_candidate(
             label, strikes[label], dir_, chain, sig, settings,
         )
         candidates[label] = candidate
-        if ok:
-            any_ok = True
+        per_label_reasons[label] = reasons
+        per_label_ok[label] = ok
         if label == _primary_label:
             primary_premium_quality, primary_oi_quality = premium_quality, oi_quality
             primary_quote = quote
             all_reasons.extend(reasons)
 
-    if not any_ok:
-        return DoreRejection(sig.symbol, "NoLiquidity", "No candidate strike cleared premium/OI liquidity checks")
+    # [Fix, 2026-08-21, Issue 2] Must gate on the candidate that's
+    # actually about to become `primary` — the trade DORE recommends,
+    # with its own entry zone / stop / targets / POP all derived from
+    # its premium. Previously this checked `any_ok` (true if ANY of the
+    # three labels cleared liquidity), so a plan could sail through with
+    # Conservative and Balanced both failing premium/OI checks purely
+    # because Aggressive happened to pass — even when _primary_label was
+    # Conservative or Balanced, i.e. the recommended strike itself never
+    # cleared liquidity at all. Checking specifically per_label_ok[
+    # _primary_label] closes that gap; the other two tiers remaining
+    # unliquid is a legitimate, surfaced state (their StrikeCandidate
+    # premium/risk/reward simply come back None), not a rejection reason.
+    if not per_label_ok[_primary_label]:
+        detail = " | ".join(
+            f"{label}: {'; '.join(per_label_reasons[label]) or 'no reason recorded'}"
+            for label in (CONSERVATIVE, BALANCED, AGGRESSIVE)
+        )
+        return DoreRejection(
+            sig.symbol, "NoLiquidity",
+            f"Primary candidate ({_primary_label}, strike {strikes[_primary_label]['strike']:g}) "
+            f"failed premium/OI liquidity checks — {detail}",
+        )
 
     expiry_suit = _expiry_suitability(dte, candidates[_primary_label].probability_of_profit)
     score = final_score(sig, mom, primary_oi_quality, expiry_suit, primary_premium_quality, settings)
@@ -2136,9 +2472,12 @@ def compute_dore_trade_plan(
         entry_low = round(primary.premium * (1 - settings.entry_zone_band_pct), 2)
         entry_high = round(primary.premium * (1 + settings.entry_zone_band_pct), 2)
 
-    stop_loss = round(primary.premium * (1 - settings.stop_loss_premium_pct), 2) if primary.premium else None
-    target1 = round(primary.premium * (1 + settings.target1_premium_pct), 2) if primary.premium else None
-    target2 = round(primary.premium * (1 + settings.target2_premium_pct), 2) if primary.premium else None
+    # [2026-08-20, DORE flow review §5] DTE-bucketed, not flat — see
+    # DoreOptionsSettings' stop_loss_premium_pct_*/target1_premium_
+    # pct_*/target2_premium_pct_* docstring for why.
+    stop_loss = round(primary.premium * (1 - _stop_loss_premium_pct(dte, settings)), 2) if primary.premium else None
+    target1 = round(primary.premium * (1 + _target1_premium_pct(dte, settings)), 2) if primary.premium else None
+    target2 = round(primary.premium * (1 + _target2_premium_pct(dte, settings)), 2) if primary.premium else None
 
     # [Structural SMC trade geometry, 2026-08-16, DORE §5] FVG/liquidity
     # target capping — only when a real structural target was found
@@ -2189,6 +2528,25 @@ def compute_dore_trade_plan(
         + (["Target capped by structural liquidity/FVG boundary"] if _structural_target_capped else [])
     )
 
+    # ── 2-day move-potential shadow metric ───────────────────────
+    # Reuses Stage 1/2/6/7 evidence; does not alter qualification, strike
+    # selection, activation, risk, or final production confidence.
+    try:
+        from utils.horizon_opportunity import dore_2d_move_potential
+        _room = 100.0
+        if sig.current_price and sig.target_price:
+            _room = min(100.0, abs(sig.target_price - sig.current_price) / max(abs(sig.current_price), 1e-9) * 500.0)
+        _viability = (float(primary_oi_quality) + float(primary_premium_quality)) / 2.0
+        _spread_widening = bool(mom.bullish and mom.ema9 > mom.ema21 and mom.ema9_slope_pct > 0) or bool((not mom.bullish) and mom.ema9 < mom.ema21 and mom.ema9_slope_pct < 0)
+        _dore_2d = dore_2d_move_potential(
+            momentum_score=mom.momentum_score, acceleration=mom.ema9_acceleration,
+            ema_spread_widening=_spread_widening, setup_score=sig.setup_conviction,
+            volume_ratio=sig.vol_ratio, room_score=_room, option_viability=_viability,
+            direction_aligned=(dir_ == CE and mom.bullish) or (dir_ == PE and not mom.bullish),
+        )
+    except Exception:
+        _dore_2d = {}
+
     # [DORE Integration, 2026-07-31] Leadership / Technical Recommendation
     # — plain-language restatements of state already computed above
     # (EmaMomentum.bullish and the final confidence score), persisted
@@ -2227,6 +2585,12 @@ def compute_dore_trade_plan(
         target_price=sig.target_price,
         current_price=sig.current_price,
         market_regime=sig.market_regime,
+        activation_ema9=round(mom.ema9, 4),
+        activation_ema21=round(mom.ema21, 4),
+        activation_momentum_score=mom.momentum_score,
+        activation_trigger_type="UNDERLYING_EMA_CONFIRMATION",
+        thesis_invalidation_level=round(mom.ema9, 4),
+        dte_bucket=expiry_bucket(dte),
         current_premium=primary.premium,
         premium_prev_close=premium_prev_close,
         premium_change_pct=premium_change_pct,
@@ -2237,6 +2601,7 @@ def compute_dore_trade_plan(
         pullback_score=sig.pullback_score,
         breakout_score=sig.breakout_score,
         continuation_score=sig.continuation_score,
+        **_dore_2d,
         reasons=reasons,
         # [Phase 4, §2/§4] CV4/SMC shadow evidence — pure pass-through
         # from sig (MasterScannerSignal), never recomputed here. See
