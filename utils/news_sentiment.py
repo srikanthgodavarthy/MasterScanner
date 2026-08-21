@@ -84,10 +84,20 @@ _BATCH_SIZE = 15
 # headline is a heavy, recurring consumer of that budget all on its own.
 # Rather than fight other Groq usage for the same 100k TPD pool, news
 # classification runs on a smaller/cheaper model with its own headroom.
-# Override via GROQ_NEWS_MODEL in secrets if you want to point this at
-# something else (or back at 70b) without touching groq_client.py's
-# shared default.
-_NEWS_MODEL = "openai/gpt-oss-20b"
+#
+# 2026-08-21: moved off openai/gpt-oss-20b onto llama-3.1-8b-instant.
+# gpt-oss-20b is a reasoning model -- its chain-of-thought and the final
+# JSON answer share one max_tokens budget, and on a full 15-item batch
+# the reasoning could eat the whole thing, leaving nothing valid to
+# parse (Groq's json_validate_failed with an empty failed_generation).
+# reasoning_effort="low" + reasoning_format="hidden" papered over this,
+# but llama-3.1-8b-instant has no reasoning step at all, so there's
+# nothing to starve the JSON output -- removes the failure mode instead
+# of budgeting around it. Also on Groq's free tier, cheap/fast, and on
+# its own token pool separate from 70b. Override via GROQ_NEWS_MODEL in
+# secrets if you want to point this at something else (or back at 70b)
+# without touching groq_client.py's shared default.
+_NEWS_MODEL = "llama-3.1-8b-instant"
 
 # Summaries are stored at up to 280 chars (utils/news_feed.py) for
 # display, but the classifier doesn't need that much to judge direction/
@@ -187,18 +197,7 @@ def _classify_batch(texts: list[str]) -> list[dict]:
             ],
             response_format={"type": "json_object"},
             temperature=0.1,
-            max_tokens=3000,
-            # gpt-oss-20b is a reasoning model -- without these, its
-            # chain-of-thought competes with the JSON answer for the
-            # max_tokens budget, and on a full 15-item batch it can burn
-            # through the budget mid-thought, leaving nothing valid to
-            # parse. That surfaces as Groq's json_validate_failed with an
-            # empty failed_generation (not a prompt/schema problem, just
-            # truncation). "low" effort + hiding the reasoning tokens
-            # from the response keeps the whole budget for the actual
-            # answer.
-            reasoning_effort="low",
-            reasoning_format="hidden",
+            max_tokens=1800,
         )
         payload = json.loads(resp.choices[0].message.content)
         raw_results = payload.get("results", [])
