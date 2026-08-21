@@ -187,7 +187,18 @@ def _classify_batch(texts: list[str]) -> list[dict]:
             ],
             response_format={"type": "json_object"},
             temperature=0.1,
-            max_tokens=1800,
+            max_tokens=3000,
+            # gpt-oss-20b is a reasoning model -- without these, its
+            # chain-of-thought competes with the JSON answer for the
+            # max_tokens budget, and on a full 15-item batch it can burn
+            # through the budget mid-thought, leaving nothing valid to
+            # parse. That surfaces as Groq's json_validate_failed with an
+            # empty failed_generation (not a prompt/schema problem, just
+            # truncation). "low" effort + hiding the reasoning tokens
+            # from the response keeps the whole budget for the actual
+            # answer.
+            reasoning_effort="low",
+            reasoning_format="hidden",
         )
         payload = json.loads(resp.choices[0].message.content)
         raw_results = payload.get("results", [])
