@@ -544,7 +544,23 @@ def refresh_dore_live_state(cfg=None) -> dict:
     # is sanitized/persisted so it never changes the "_carried_forward"
     # field's actual published shape (True for carried-forward rows,
     # absent for fresh ones — unchanged).
-    if "_carried_forward" in df.columns:
+    if not df.empty:
+        # [Fix, 2026-08-21] Was gated on `"_carried_forward" in
+        # df.columns` — but that column only exists on rows that WERE
+        # actually carried forward (see the mint site above, which sets
+        # "_carried_forward": True only on those rows and never adds the
+        # key to fresh ones). A cycle with zero open plans carried
+        # forward (e.g. before anything has triggered yet) has NO row
+        # with that key at all, so the column is absent from df even
+        # though _label() below handles that case fine via row.get().
+        # That dropped every such cycle into the flat, source-blind
+        # find_invalid_columns() fallback below, which doesn't know
+        # fresh_stage1_waiting rows structurally lack entry_locked/
+        # drift_pct/risk_reward_ratio/plan_age_days/t1_hit_at — exactly
+        # the false-alarm WARNING the 2026-08-17 fix below was written
+        # to prevent, just re-opened for the all-fresh case. Gating on
+        # `not df.empty` instead runs the same source-aware split every
+        # cycle regardless of whether any row happens to carry that key.
         # [Fix, 2026-08-17] "fresh_stage1" was one label covering two
         # genuinely different row shapes: a WAITING (not-yet-triggered)
         # candidate and an ACTIVE (entry-locked) one. entry_locked,
@@ -600,9 +616,12 @@ def refresh_dore_live_state(cfg=None) -> dict:
                 breakdown["structural"],
             )
     else:
-        # No "_carried_forward" column present (e.g. every row this cycle
-        # happens to be one source) — fall back to the flat, source-blind
-        # check rather than silently skipping validation.
+        # df was empty this cycle (no rows at all) — nothing to check.
+        # This branch is now only reachable when df.empty (see the
+        # 2026-08-21 fix above); the source-aware split runs for every
+        # non-empty cycle regardless of row source mix. find_invalid_columns
+        # on an empty df is a safe no-op (returns {}) — kept as a call
+        # rather than skipped so the code path stays uniform.
         invalid = find_invalid_columns(df)
         if invalid:
             logger.warning("[dore_live_state] invalid numeric values (NaN/inf) before snapshot save — %s", invalid)
