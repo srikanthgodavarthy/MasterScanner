@@ -27,3 +27,11 @@ psutil>=5.9.0  # ADDED 2026-07-27: RAM/CPU checks for utils/scan_health_monitor.
                 # (self-protecting live_scanner in-process loop). Cross-platform
                 # (Windows/Mac/Linux) — deliberately not stdlib `resource`, which
                 # is POSIX-only and unusable for local dev/testing off-Linux.
+groq>=1.6.0  # PINNED 2026-08-21: utils/news_sentiment.py's _classify_batch() passes
+             # reasoning_effort="low" + reasoning_format="hidden" to
+             # chat.completions.create() (the actual fix for gpt-oss-20b's
+             # chain-of-thought starving out the JSON answer on a full batch —
+             # see that file's comments). Older groq SDKs don't accept those two
+             # kwargs and raise TypeError: unexpected keyword argument, which
+             # _classify_batch() catches and fails soft into "Unclassified" for
+             # every headline — no crash, but silently loses the truncation fix.
