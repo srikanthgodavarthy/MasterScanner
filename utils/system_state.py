@@ -144,6 +144,11 @@ _LIVE_DEFAULT = {
     "manual_override_until": None,
     "scheduler_owner": None,
     "scheduler_owner_heartbeat_at": None,
+    # Fail-open to True (gate ON / restricted to market hours) — the
+    # cheaper, safer default. See get_market_hours_gate_enabled() /
+    # set_market_hours_gate_enabled() and the Settings page's System
+    # tab ("Restrict scanning to market hours").
+    "market_hours_gate_enabled": True,
 }
 
 # [Architecture review C3 fix, 2026-07-25] Scheduler ownership lock tuning.
@@ -272,16 +277,36 @@ def should_scheduler_run() -> bool:
     dore_live_state every 30-60s, live_scanner every 5min) was running
     this same 24/7 regardless of market hours, keeping the Neon compute
     endpoint permanently active and burning free-tier CU-hrs nights and
-    weekends for zero new data. Set MARKET_HOURS_GATE_ENABLED=0 in the
-    environment to disable (e.g. to let a scanner run after-hours for
-    manual testing/debugging) without a code change.
+    weekends for zero new data.
+
+    [2026-08-21] The gate on/off flag is now DB-backed (system_state.
+    market_hours_gate_enabled) instead of env-var-only, so it can be
+    flipped from the Settings page's System tab ("Restrict scanning to
+    market hours") without a redeploy — every process polling this
+    function (scheduler/scan_worker.py, utils.inprocess_scheduler)
+    picks up the change on its next cycle-boundary check. The
+    MARKET_HOURS_GATE_ENABLED env var still works as a hard override
+    for ops (e.g. an emergency "stop burning CU-hrs" knob that doesn't
+    depend on Neon/the app being reachable): explicit "0" forces the
+    gate OFF and explicit "1" forces it ON, regardless of what's
+    stored in the DB; leave it unset (the default) to let the Settings-
+    page toggle control it.
     """
-    if os.environ.get("MARKET_HOURS_GATE_ENABLED", "1") != "0":
+    state = get_system_state()
+
+    env_override = os.environ.get("MARKET_HOURS_GATE_ENABLED")
+    if env_override == "0":
+        gate_enabled = False
+    elif env_override == "1":
+        gate_enabled = True
+    else:
+        gate_enabled = bool(state.get("market_hours_gate_enabled", True))
+
+    if gate_enabled:
         from utils.time_utils import is_market_hours_ist
         if not is_market_hours_ist():
             return False
 
-    state = get_system_state()
     if state["mode"] == "LIVE":
         return True
 
@@ -310,6 +335,65 @@ def manual_override_active(section: str) -> bool:
         return False
     until = _parse_ts(state.get("manual_override_until"))
     return until is not None and _now() < until
+
+
+# ─── READ/WRITE: market-hours gate toggle ──────────────────────────────
+
+def get_market_hours_gate_enabled() -> bool:
+    """
+    True (the default) means the scheduler loops only run during NSE
+    market hours (see should_scheduler_run()). False means they run
+    24/7, including pre-/post-market and weekends. Backs the Settings
+    page's System tab ("Restrict scanning to market hours") checkbox.
+
+    Fails open to True (restricted) if Neon is unreachable — the
+    cheaper/safer default, same reasoning as get_system_state().
+    """
+    state = get_system_state()
+    return bool(state.get("market_hours_gate_enabled", True))
+
+
+def set_market_hours_gate_enabled(enabled: bool) -> None:
+    """
+    Persist the Settings-page market-hours-gate toggle. Every process
+    that calls should_scheduler_run() re-reads this from Neon at each
+    cycle boundary, so a standalone `python -m scheduler.scan_worker`
+    process picks up a change made from the Streamlit UI within one
+    cycle — no redeploy or env var change needed. Non-fatal if Neon is
+    briefly unreachable (logged, not raised) — the caller's checkbox
+    will simply not persist until the next successful save.
+    """
+    if not db.is_available():
+        logger.warning(
+            "set_market_hours_gate_enabled(%s) skipped — Neon unavailable",
+            enabled,
+        )
+        return
+    try:
+        db.execute(
+            """UPDATE system_state SET market_hours_gate_enabled = %s,
+               updated_at = %s WHERE id = 1""",
+            (bool(enabled), _now().isoformat()),
+        )
+    except Exception as exc:
+        if "market_hours_gate_enabled" in str(exc) and "column" in str(exc).lower():
+            # Column doesn't exist yet on this deployment — the
+            # ALTER TABLE ... ADD COLUMN IF NOT EXISTS in SCHEMA_SQL
+            # below hasn't been run against this Neon project yet.
+            if "market_hours_gate_column" not in _MIGRATION_WARNING_LOGGED:
+                _MIGRATION_WARNING_LOGGED.add("market_hours_gate_column")
+                logger.error(
+                    "=" * 70 + "\n"
+                    "MIGRATION REQUIRED: system_state.market_hours_gate_enabled "
+                    "column does not exist yet.\n"
+                    "Run the SQL in utils/system_state.py's SCHEMA_SQL once "
+                    "against Neon (psql \"$NEON_DATABASE_URL\" -f schema.sql, or "
+                    "the Neon SQL Editor). The Settings-page toggle will not "
+                    "persist until then — this message will not repeat.\n"
+                    + "=" * 70
+                )
+        else:
+            logger.exception("set_market_hours_gate_enabled(%s) failed", enabled)
 
 
 # ─── WRITE: manual override ────────────────────────────────────────────
@@ -694,6 +778,12 @@ CREATE TABLE IF NOT EXISTS system_state (
 -- from before this fix — safe to re-run.
 ALTER TABLE system_state ADD COLUMN IF NOT EXISTS scheduler_owner text;
 ALTER TABLE system_state ADD COLUMN IF NOT EXISTS scheduler_owner_heartbeat_at timestamptz;
+
+-- 2026-08-21: DB-backed market-hours gate toggle, controllable from the
+-- Settings page's System tab instead of only the MARKET_HOURS_GATE_ENABLED
+-- env var. TRUE (default) preserves existing behavior — scheduler loops
+-- restricted to NSE market hours. See should_scheduler_run().
+ALTER TABLE system_state ADD COLUMN IF NOT EXISTS market_hours_gate_enabled boolean NOT NULL DEFAULT true;
 
 -- Seed the singleton row if it doesn't exist yet.
 INSERT INTO system_state (id, mode) VALUES (1, 'LIVE')
