@@ -4019,6 +4019,28 @@ def _dore_options_panel():
     st.markdown('<div class="ti-panel-title" style="margin-top:0.6rem;">🎯 DORE OPTIONS ENGINE</div>',
                 unsafe_allow_html=True)
 
+    # [2026-08-21] Market-hours short-circuit — same fix as
+    # pages/dashboard.py's _market_intelligence_fragment() /
+    # _dash_scan_autorefresh(), applied here too since this panel's
+    # own st.fragment(run_every=60) was missed in that first pass and
+    # kept polling load_snapshot_meta()/get_snapshot() every 60s with
+    # this page open regardless of market hours — on its own enough to
+    # keep the Neon compute endpoint from ever autosuspending. Skips
+    # only the poll; still renders whatever's already cached in
+    # session_state from the last in-hours tick.
+    from utils.time_utils import is_market_hours_ist
+    if not is_market_hours_ist():
+        dore_opt_payload = st.session_state.get("dore_live_state_payload") or {}
+        if not dore_opt_payload:
+            st.caption("DORE Options Engine: outside market hours — background scans "
+                       "are paused, nothing scanned yet this session.")
+        # else: fall through to rendering below with whatever's cached —
+        # but skip the meta-poll entirely either way, which is the whole
+        # point of this gate.
+        _skip_poll = True
+    else:
+        _skip_poll = False
+
     # ── DORE Live State (Stage 2) — same cheap meta-then-payload poll
     # pattern as the rest of this page's snapshot panels, now backed by
     # the shared version-keyed cache (utils/snapshot_cache.py) instead of
@@ -4026,15 +4048,19 @@ def _dore_options_panel():
     # (Technical) snapshot when Stage 2 hasn't produced anything yet
     # (e.g. right after a deploy, before its first 60s tick) so the page
     # shows the technical read instead of nothing.
-    dore_opt_meta = load_snapshot_meta("dore_live_state")
-    if dore_opt_meta is not None and dore_opt_meta.get("version") != st.session_state.get("dore_live_state_version"):
-        dore_opt_full = get_snapshot("dore_live_state")
-        if dore_opt_full is not None:
-            st.session_state["dore_live_state_version"] = dore_opt_full.get("version")
-            st.session_state["dore_live_state_payload"] = dore_opt_full.get("payload") or {}
+    if not _skip_poll:
+        dore_opt_meta = load_snapshot_meta("dore_live_state")
+        if dore_opt_meta is not None and dore_opt_meta.get("version") != st.session_state.get("dore_live_state_version"):
+            dore_opt_full = get_snapshot("dore_live_state")
+            if dore_opt_full is not None:
+                st.session_state["dore_live_state_version"] = dore_opt_full.get("version")
+                st.session_state["dore_live_state_payload"] = dore_opt_full.get("payload") or {}
 
     dore_opt_payload = st.session_state.get("dore_live_state_payload") or {}
     dore_opt_df = pd.DataFrame(dore_opt_payload.get("live_state") or [])
+
+    if dore_opt_df.empty and _skip_poll:
+        return
 
     dore_tech_meta = None
     dore_opt_rejections = []
