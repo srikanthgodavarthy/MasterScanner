@@ -1281,8 +1281,16 @@ _CSS = """
      Stock / Impact / Confidence / Recommendation / Headline / Source.
      Headline moved to the wide trailing slot (1fr) since it's the only
      variable-length field; everything left of it is a fixed-width
-     label/badge column. */
-  grid-template-columns: 54px 80px 86px 98px 100px 140px 128px 1fr 90px;
+     label/badge column.
+     2026-08-21 [readability]: TIME widened 54px→76px — at 54px the
+     "11:28 AM" mono-font label had no room and wrapped onto two lines
+     inside its cell (fine on its own, but it made every OTHER cell in
+     that row baseline-misalign against neighboring rows, which read as
+     messy). 76px + white-space:nowrap on .ni-time below guarantees a
+     single line regardless of AM/PM width. Sector/Stock/Confidence/
+     Recommendation/Current State also nudged up slightly so labels and
+     pills aren't flush against their column edges. */
+  grid-template-columns: 76px 84px 92px 100px 104px 144px 132px 1fr 96px;
   column-gap: 0;
   /* 2026-07-19: top-align, not center — rows with a wrapped stock-chip
      line or an event-type line under Impact are taller than plain rows;
@@ -1293,15 +1301,16 @@ _CSS = """
   align-items: start;
 }
 .ni-head {
-  font-size: 9.5px; font-weight: 700; letter-spacing: 0.04em;
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.05em;
   text-transform: uppercase; color: var(--muted);
-  padding: 7px 0;
+  padding: 9px 0;
   background: rgba(255,255,255,0.035);
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
 }
+.ni-head > div:last-child { text-align: right; }
 .ni-row {
-  padding: 9px 0;
+  padding: 11px 0;
   border-bottom: 1px solid var(--border);
 }
 /* 2026-07-19: real table feel — a light vertical rule between columns
@@ -1309,12 +1318,17 @@ _CSS = """
    tracks across a row instead of the columns blurring together. Applied
    to every grid cell via the shared .ni-grid > div selector rather than
    per-column classes, so it holds even as columns get added/reordered. */
-.ni-grid > div { border-right: 1px solid var(--border); padding: 0 10px; }
-.ni-grid > div:first-child { padding-left: 2px; }
+.ni-grid > div { border-right: 1px solid var(--border); padding: 0 12px; }
+.ni-grid > div:first-child { padding-left: 4px; }
 .ni-grid > div:last-child { border-right: none; padding-right: 0; }
 .ni-row:nth-of-type(even) { background: rgba(255,255,255,0.018); }
 .ni-row:last-child { border-bottom: none; }
-.ni-time { font-size: 11px; font-family: var(--mono); color: var(--muted); }
+.ni-row:hover { background: rgba(255,255,255,0.045); }
+.ni-time {
+  font-size: 11.5px; font-family: var(--mono); color: var(--muted);
+  white-space: nowrap; /* 2026-08-21: was wrapping "11:28 AM" to two lines */
+  font-variant-numeric: tabular-nums; /* digits line up column-to-column */
+}
 .ni-headline {
   font-size: 12.5px; font-weight: 600; color: var(--text); text-decoration: none;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block;
@@ -1433,7 +1447,7 @@ _CSS = """
      any phone screen; scope the scroll to the panel itself rather than
      letting it overflow the page or silently clip columns. */
   .ni-panel { overflow-x: auto; }
-  .ni-grid { min-width: 720px; }
+  .ni-grid { min-width: 860px; }
 }
 
 @media (max-width: 480px) {
@@ -3082,7 +3096,7 @@ def _news_impact_panel():
 
     header_html = """
 <div class="ni-grid ni-head">
-  <div>TIME</div><div>SECTOR</div><div>STOCK(S)</div><div>IMPACT</div><div>CONFIDENCE</div><div>RECOMMENDATION</div><div>CURRENT STATE</div><div>HEADLINE</div><div></div>
+  <div>TIME</div><div>SECTOR</div><div>STOCK(S)</div><div>IMPACT</div><div>CONFIDENCE</div><div>RECOMMENDATION</div><div>CURRENT STATE</div><div>HEADLINE</div><div>SOURCE</div>
 </div>"""
     # 2026-07-28: was behind an st.expander("Show detailed news impact
     # table …") — now always rendered open, per request.
