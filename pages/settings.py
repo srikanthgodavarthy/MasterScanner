@@ -10,6 +10,8 @@ query params, then read them. Actually simplest: use st.radio with CSS override 
 hide Streamlit's native radio styling and inject our own chip appearance.
 """
 
+import os
+
 import streamlit as st
 import pandas as pd
 
@@ -1048,6 +1050,62 @@ def _tab_system() -> None:
         "Five Pillars and Scanner (Decision Engine) use different scoring "
         "logic — pick whichever you're actively iterating on."
     )
+
+    # ── Scan Scheduling — market-hours gate ─────────────────────────
+    # Controls utils.system_state.should_scheduler_run()'s market-hours
+    # gate. DB-backed (system_state.market_hours_gate_enabled), not
+    # session_state — this needs to reach scheduler/scan_worker.py (a
+    # standalone process, when deployed that way) and
+    # utils.inprocess_scheduler alike, neither of which shares this
+    # page's Streamlit session. Every process re-checks it at its own
+    # cycle boundary, so a change here takes effect within one cycle
+    # (up to ~5 min for the live_scanner sub-scheduler), no redeploy.
+    with st.expander("⏱️ Scan Scheduling", expanded=False):
+        from utils.system_state import (
+            get_market_hours_gate_enabled, set_market_hours_gate_enabled,
+        )
+        _env_override = os.environ.get("MARKET_HOURS_GATE_ENABLED")
+        _gate_on = get_market_hours_gate_enabled()
+
+        _label("Restrict background scanning to NSE market hours")
+        restrict = st.checkbox(
+            "Restrict background scanning to NSE market hours "
+            "(09:15\u201315:30 IST, Mon\u2013Fri)",
+            value=_gate_on,
+            key="w_market_hours_gate",
+            disabled=_env_override in ("0", "1"),
+            label_visibility="collapsed",
+        )
+        st.caption(
+            "On (default): the background scan worker — Market Intelligence, "
+            "F&O/DORE, and the Live Scanner sub-scheduler — pauses outside "
+            "market hours to avoid burning Neon compute for zero new data. "
+            "Off: it keeps scanning post-market, pre-market, and on "
+            "weekends too — useful for after-hours testing/debugging, but "
+            "runs the scan worker (and Neon usage) 24/7."
+        )
+
+        if _env_override in ("0", "1"):
+            st.warning(
+                f"MARKET_HOURS_GATE_ENABLED={_env_override} is set in the "
+                "deployment environment and overrides this checkbox until "
+                "it's removed.",
+                icon="⚠️",
+            )
+        else:
+            if restrict != _gate_on:
+                set_market_hours_gate_enabled(restrict)
+                st.success(
+                    "✅ Saved — the scan worker will pick this up at its "
+                    "next cycle boundary."
+                )
+                st.rerun()
+            if not _gate_on:
+                st.info(
+                    "Post-market scanning is currently **ON** — the scan "
+                    "worker is running outside NSE market hours too.",
+                    icon="ℹ️",
+                )
 
     # Connection status
     if supabase_ok:
