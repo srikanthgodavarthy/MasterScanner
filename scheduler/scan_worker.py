@@ -259,7 +259,35 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
                 was_paused = True
             logger.debug("[%s] system_state is paused (backtest/maintenance) — skipping this tick", name)
             _idle_trim_if_due()
-            time.sleep(5)
+            # [2026-08-22] Was time.sleep(5) — that alone meant this loop
+            # issued a fresh `SELECT * FROM system_state` (get_system_state()
+            # has no caching) every 5s, 24/7, including the entire
+            # market-hours-gated stretch (nights/weekends) this gate exists
+            # to save Neon compute during. With 3 loops sharing this
+            # function plus live_scanner's own identical poll, that's ~48
+            # queries/min hitting Neon nonstop.
+            #
+            # A first pass bumped this to 60s, which helps but is NOT
+            # enough on its own: Neon's compute auto-suspends only after a
+            # stretch with ZERO activity, and a query every 60s never lets
+            # that stretch reach the suspend threshold (~5 min on a
+            # Launch-plan endpoint) — the endpoint stays continuously
+            # "active" the whole time the Streamlit process itself is
+            # running, market hours or not. Confirmed directly via the
+            # Neon console: compute showed continuously allocated for ~9
+            # hours straight through a Saturday, with the market-hours
+            # gate correctly blocking every actual scan the whole time —
+            # this poll alone was the only thing still touching Neon.
+            #
+            # 600s (10 min) is deliberately longer than that suspend
+            # window, so Neon gets an actual chance to go idle between
+            # polls instead of being kept perpetually warm by our own
+            # check-in. Worst case this delays noticing "market just
+            # opened" (or a Settings-page gate toggle) by up to 10 min —
+            # harmless; nothing here has a sub-minute freshness
+            # requirement, same reasoning the retention loop already used
+            # for its own 60s idle poll below.
+            time.sleep(600)
             continue
         if was_paused:
             logger.info("[%s] system_state resumed — running cycles normally again", name)
@@ -540,13 +568,20 @@ def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
                 logger.info("[retention] system_state paused (backtest/maintenance/market-hours) — "
                             "skipping prune cycles until it resumes")
                 was_paused = True
-            # Coarser poll than the 5s used by _run_loop/_run_live_scanner_loop
-            # on purpose — pruning has no freshness requirement, so there's no
-            # benefit to noticing "market just opened" within 5s the way a
-            # live scan does. 60s keeps this thread's own idle-CPU footprint
-            # negligible without adding any meaningful delay to the first
-            # post-open prune.
-            time.sleep(60)
+            # Coarser poll than the 5s that used to be used by
+            # _run_loop/_run_live_scanner_loop on purpose — pruning has no
+            # freshness requirement, so there's no benefit to noticing
+            # "market just opened" within seconds the way a live scan does.
+            # [2026-08-22] Bumped 60s -> 600s (10 min), same reasoning as
+            # the fix just applied to _run_loop/_run_live_scanner_loop
+            # above: 60s alone still queries Neon more often than its
+            # compute auto-suspend window, so this loop was quietly doing
+            # the same thing those two used to do at 5s — never letting
+            # the endpoint see enough idle time to actually suspend during
+            # a market-hours-paused stretch. 600s is longer than that
+            # suspend window and still adds no meaningful delay to the
+            # first post-open prune.
+            time.sleep(600)
             continue
         if was_paused:
             logger.info("[retention] system_state resumed — running prune cycles normally again")
@@ -692,7 +727,13 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             # the other three loops, so this doesn't cause extra
             # malloc_trim churn on top of theirs.
             _idle_trim_if_due()
-            time.sleep(5)
+            # [2026-08-22] Was time.sleep(5), same fix and reasoning as
+            # _run_loop above — bumped to 600s (10 min), deliberately
+            # longer than Neon's compute auto-suspend window, so the two
+            # loops together stop being the reason the endpoint never
+            # sees enough idle time to actually suspend during
+            # market-hours-paused stretches.
+            time.sleep(600)
             continue
         if was_paused:
             logger.info("[live_scanner] system_state resumed — running cycles normally again")
