@@ -213,8 +213,27 @@ def _classify_batch(texts: list[str]) -> list[dict]:
             # answer. (Re-added 2026-08-21 after the llama-3.1-8b-instant
             # detour above got reverted -- these two lines are the actual
             # fix for the original truncation issue.)
-            reasoning_effort="low",
-            reasoning_format="hidden",
+            #
+            # [2026-08-22 fix] reasoning_format is a Groq-only param --
+            # the `openai` package's Completions.create() has a fixed,
+            # typed signature (this client is the OpenAI SDK pointed at
+            # Groq's OpenAI-compatible endpoint, see utils/groq_client.py
+            # module docstring, not the `groq` package), and it doesn't
+            # recognize reasoning_format at all -- passing it as a direct
+            # kwarg raised "Completions.create() got an unexpected
+            # keyword argument 'reasoning_format'" locally, before any
+            # request reached Groq, silently disabling classification on
+            # every call. reasoning_effort happens to also be a real
+            # OpenAI param (for their own o-series models) so it slipped
+            # through fine either way, but extra_body is the correct
+            # (and future-proof) way to pass provider-specific params
+            # through this SDK regardless -- it bypasses the SDK's own
+            # validation and goes straight into the request body Groq
+            # actually receives.
+            extra_body={
+                "reasoning_effort": "low",
+                "reasoning_format": "hidden",
+            },
         )
         payload = json.loads(resp.choices[0].message.content)
         raw_results = payload.get("results", [])
