@@ -259,7 +259,21 @@ def _run_loop(name: str, section: str, interval_secs: int, compute_fn, to_payloa
                 was_paused = True
             logger.debug("[%s] system_state is paused (backtest/maintenance) — skipping this tick", name)
             _idle_trim_if_due()
-            time.sleep(5)
+            # [2026-08-22] Was time.sleep(5) — that meant this loop alone
+            # issued a fresh `SELECT * FROM system_state` (get_system_state()
+            # has no caching) every 5s, 24/7, including the entire
+            # market-hours-gated stretch (nights/weekends) this gate exists
+            # to save Neon compute during. With 3 loops sharing this
+            # function plus live_scanner's own identical 5s poll, that's
+            # ~48 queries/min hitting Neon nonstop — enough continuous
+            # traffic to prevent the compute endpoint from ever
+            # auto-suspending, which defeated the entire point of the
+            # market-hours gate (confirmed via Neon console: compute
+            # showing active/allocated through a Saturday morning with no
+            # scan activity). 60s matches the retention loop's existing
+            # reasoning below — no scan has a freshness requirement tight
+            # enough to need noticing "market just opened" within 5s vs 60s.
+            time.sleep(60)
             continue
         if was_paused:
             logger.info("[%s] system_state resumed — running cycles normally again", name)
@@ -692,7 +706,12 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             # the other three loops, so this doesn't cause extra
             # malloc_trim churn on top of theirs.
             _idle_trim_if_due()
-            time.sleep(5)
+            # [2026-08-22] Was time.sleep(5) — see the matching comment in
+            # _run_loop above for the full reasoning (this was the 4th of
+            # 4 loops independently polling should_scheduler_run() every
+            # 5s while paused, keeping Neon compute perpetually awake
+            # through market-closed stretches).
+            time.sleep(60)
             continue
         if was_paused:
             logger.info("[live_scanner] system_state resumed — running cycles normally again")
