@@ -373,9 +373,25 @@ def _cache_stats() -> dict:
     except Exception as e:
         return {"available": False, "reason": f"get_stats() failed ({e.__class__.__name__})"}
 
+    def _flatten(stats):
+        # [2026-08-24] As of Streamlit 1.62, {Data,Resource}Caches.get_stats()
+        # returns dict[family_name, list[CacheStat]] (keyed by stat "family",
+        # e.g. CACHE_MEMORY_FAMILY) instead of the flat list[CacheStat] this
+        # code was originally written against. Iterating a dict yields its
+        # string keys, not CacheStat objects — which is why every getattr()
+        # below was silently falling through to "?"/0 on every call: the
+        # attribute lookups were correct, but `s` was a family-name string,
+        # never a CacheStat. Handle both shapes defensively.
+        if isinstance(stats, dict):
+            flat = []
+            for family_stats in stats.values():
+                flat.extend(family_stats)
+            return flat
+        return list(stats)
+
     def _summarize(stats):
         by_cache: Counter = Counter()
-        for s in stats:
+        for s in _flatten(stats):
             # CacheStat has category_name / cache_name / byte_length across
             # the Streamlit versions this has been checked against; fall
             # back defensively if a field is renamed.
