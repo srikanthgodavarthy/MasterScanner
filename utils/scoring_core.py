@@ -670,28 +670,35 @@ def build_indicators(
     ph_causal, pl_causal = causal_pivot_series(h, l, params.pvt_lb)
 
     # ── P3: Cache numpy arrays for fast scalar access ─────────────
-    _c_arr    = c.values.astype(np.float64)
-    _h_arr    = h.values.astype(np.float64)
-    _l_arr    = l.values.astype(np.float64)
-    _cci_arr  = cci_s.values.astype(np.float64)
-    _e20_arr  = e20.values.astype(np.float64)
-    _e50_arr  = e50.values.astype(np.float64)
-    _e200_arr = e200.values.astype(np.float64)
-    _atr_arr  = atr_s.values.astype(np.float64)
-    _vol_arr  = v.values.astype(np.float64)
-    _vavg_arr = vol_avg.values.astype(np.float64)
-    _adx_arr  = adx_s.values.astype(np.float64)
-    _nifty_arr = nifty_aligned.values.astype(np.float64)
-    _sector_arr = sector_aligned.values.astype(np.float64) if sector_aligned is not None else None
+    # [2026-08-24] float32, not float64: these are read-only scalar-access
+    # shadows of Series that pandas already computed in float64 above (ema/
+    # rsi/atr/cci/adx/etc. all ran at full precision before this point) —
+    # downcasting here only affects the copy compute_bar() indexes into per
+    # bar, not the indicator math itself. float32's ~7 significant digits
+    # is far more than needed for NSE price/indicator comparisons (0-100
+    # oscillator ranges, prices up to ~1e5), so this is precision-safe.
+    _c_arr    = c.values.astype(np.float32)
+    _h_arr    = h.values.astype(np.float32)
+    _l_arr    = l.values.astype(np.float32)
+    _cci_arr  = cci_s.values.astype(np.float32)
+    _e20_arr  = e20.values.astype(np.float32)
+    _e50_arr  = e50.values.astype(np.float32)
+    _e200_arr = e200.values.astype(np.float32)
+    _atr_arr  = atr_s.values.astype(np.float32)
+    _vol_arr  = v.values.astype(np.float32)
+    _vavg_arr = vol_avg.values.astype(np.float32)
+    _adx_arr  = adx_s.values.astype(np.float32)
+    _nifty_arr = nifty_aligned.values.astype(np.float32)
+    _sector_arr = sector_aligned.values.astype(np.float32) if sector_aligned is not None else None
 
     # PERF-6: the remaining series compute_bar() reads by index every bar.
     # squeeze_series is bool; keep it bool (not float) to skip a cast.
-    _o_arr            = o.values.astype(np.float64)
-    _rsi_arr          = rsi_s.values.astype(np.float64)
-    _atr_sma20_arr    = atr_sma20.values.astype(np.float64)
-    _atr_sma_comp_arr = atr_sma_comp.values.astype(np.float64)
-    _cloud_top_arr    = cloud_top.values.astype(np.float64)
-    _cloud_bottom_arr = cloud_bottom.values.astype(np.float64)
+    _o_arr            = o.values.astype(np.float32)
+    _rsi_arr          = rsi_s.values.astype(np.float32)
+    _atr_sma20_arr    = atr_sma20.values.astype(np.float32)
+    _atr_sma_comp_arr = atr_sma_comp.values.astype(np.float32)
+    _cloud_top_arr    = cloud_top.values.astype(np.float32)
+    _cloud_bottom_arr = cloud_bottom.values.astype(np.float32)
     _squeeze_arr      = squeeze_series.values.astype(bool)
 
     return IndicatorArrays(
