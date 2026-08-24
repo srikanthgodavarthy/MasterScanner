@@ -45,10 +45,59 @@ from utils.market_data import fetch_ohlcv, _strip_tz  # noqa: F401  (re-export)
 # process() below (in run_scanner()) narrows what gets captured so a
 # stuck future pins one symbol's frame instead of the entire batch's
 # all_data dict.
-_SCORER_POOL_WORKERS = 6
-_scorer_pool = ThreadPoolExecutor(
-    max_workers=_SCORER_POOL_WORKERS, thread_name_prefix="scorer-pool"
-)
+#
+# [2026-08-24, RAM/CPU audit] The above fix made the pool persistent but
+# ALSO silently made it a fixed size (_SCORER_POOL_WORKERS=6), regardless
+# of what any caller asked for — run_scanner()'s own `max_workers`
+# parameter (still accepted, still threaded all the way down from
+# scheduler/scan_worker.py's LIVE_SCANNER_MAX_WORKERS=4,
+# utils/inprocess_scheduler.py's INPROCESS_LIVE_SCANNER_MAX_WORKERS=2,
+# and pages/scanner.py's manual "Run Scan" button's 10) became dead code
+# from that day forward: every caller, on every deployment tier, always
+# got exactly 6 concurrent scoring threads no matter what it passed in.
+# That's the opposite of the tunable-per-deployment-tier design
+# LIVE_SCANNER_MAX_WORKERS/INPROCESS_LIVE_SCANNER_MAX_WORKERS were built
+# for (see scheduler/scan_worker.py's own comment on why the in-process
+# tier deliberately runs lighter, sharing the container's CPU with the
+# Streamlit UI) — and a likely contributor to the CPU 97-100% warnings
+# seen on the in-process tier, which asked for 2 workers and silently got
+# 6 (further multiplied by whatever concurrency scheduler/scan_worker.py
+# itself runs batches at).
+#
+# Fix: key the persistent-pool cache by size instead of hardcoding one
+# size. Each distinct max_workers value used across the app's lifetime
+# (in practice: 2, 4, 10 — three call sites, three sizes) gets its OWN
+# persistent pool, created once and reused forever after — same bounded-
+# growth guarantee as the single-pool design above (a stuck future still
+# only ever pins one of THAT pool's fixed worker slots), but now actually
+# honors the caller's requested concurrency instead of every caller
+# silently sharing one 6-worker pool. This does NOT reintroduce the
+# original per-call-executor leak: pools are cached by size and never
+# torn down, so the leaked-thread scenario the 2026-08-17 fix addressed
+# still cannot happen.
+_SCORER_POOL_WORKERS = 6   # fallback only — used when a caller omits max_workers entirely
+_scorer_pools: dict[int, ThreadPoolExecutor] = {}
+_scorer_pools_lock = threading.Lock()
+
+
+def _get_scorer_pool(max_workers: int) -> ThreadPoolExecutor:
+    """Returns the persistent ThreadPoolExecutor sized to `max_workers`,
+    creating it once per distinct size and reusing it on every later call
+    with the same size — see the module-level comment above this
+    function's neighboring _scorer_pools_lock/_scorer_pools for why this
+    replaced the single fixed-size _scorer_pool."""
+    max_workers = int(max_workers) if max_workers else _SCORER_POOL_WORKERS
+    pool = _scorer_pools.get(max_workers)
+    if pool is not None:
+        return pool
+    with _scorer_pools_lock:
+        pool = _scorer_pools.get(max_workers)
+        if pool is None:
+            pool = ThreadPoolExecutor(
+                max_workers=max_workers, thread_name_prefix=f"scorer-pool-{max_workers}"
+            )
+            _scorer_pools[max_workers] = pool
+        return pool
 
 _log = logging.getLogger(__name__)
 
@@ -2558,17 +2607,20 @@ def run_scanner(
     # for this run (logged, not silently dropped) while every other
     # symbol's already-finished result still gets collected and returned.
     #
-    # [2026-08-17] Submits to the persistent module-level _scorer_pool
-    # instead of a fresh ThreadPoolExecutor per call — see the pool's
-    # definition near the top of this file for why. No shutdown() here:
-    # the pool outlives this function call by design, across every batch
-    # and every cycle. A permanently-stuck future just occupies one of the
-    # pool's max_workers slots forever; with max_workers fixed, the worst
-    # case is bounded (at most _SCORER_POOL_WORKERS symbols ever
-    # permanently stuck at once) instead of growing without limit.
+    # [2026-08-17] Submits to a persistent module-level scorer pool
+    # instead of a fresh ThreadPoolExecutor per call — see the pool
+    # cache's definition near the top of this file for why. No
+    # shutdown() here: the pool outlives this function call by design,
+    # across every batch and every cycle. A permanently-stuck future
+    # just occupies one of the pool's max_workers slots forever; with
+    # max_workers fixed (per size — see _get_scorer_pool()), the worst
+    # case is bounded (at most `max_workers` symbols ever permanently
+    # stuck at once for that size's pool) instead of growing without
+    # limit.
     _SCORE_WAIT_TIMEOUT_S = 45
+    _pool = _get_scorer_pool(max_workers)
     futures = {
-        _scorer_pool.submit(
+        _pool.submit(
             process,
             s,
             all_data.get(s),
@@ -2579,11 +2631,12 @@ def run_scanner(
     }
     # No try/finally around this section anymore — the old `finally:
     # exe.shutdown(wait=False)` existed only to tear down the per-call
-    # executor without blocking on stuck workers. _scorer_pool is
-    # module-level and persistent (see its definition near the top of
-    # this file), reused across every batch/cycle, so there is nothing to
-    # shut down here. A pending/stuck future just keeps occupying one of
-    # the pool's fixed worker slots (bounded — see the pool's own
+    # executor without blocking on stuck workers. _pool is one of the
+    # persistent, size-keyed pools in _scorer_pools (see top of file),
+    # reused across every batch/cycle that requests this same
+    # max_workers, so there is nothing to shut down here. A
+    # pending/stuck future just keeps occupying one of the pool's
+    # fixed worker slots (bounded — see the pool's own
     # comment) until it eventually finishes on its own.
     finished, pending = wait(futures, timeout=_SCORE_WAIT_TIMEOUT_S)
     for fut in finished:
@@ -2610,7 +2663,7 @@ def run_scanner(
         # no safe preemption), so cancel() returns False for those and we
         # just count them — they'll keep occupying one of the pool's
         # fixed worker slots until they finish on their own, but that's
-        # bounded by _SCORER_POOL_WORKERS rather than unbounded.
+        # bounded by that pool's max_workers rather than unbounded.
         stuck = [futures[f] for f in pending]
         cancelled = 0
         running = 0

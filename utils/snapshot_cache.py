@@ -120,7 +120,14 @@ def _cached_payload(section: str, version) -> Optional[dict]:
 def _cached_dataframe(section: str, version, records_key: str) -> pd.DataFrame:
     payload = _cached_payload(section, version)
     records = ((payload or {}).get("payload") or {}).get(records_key, [])
-    return pd.DataFrame(records)
+    df = pd.DataFrame(records)
+    # [2026-08-24, RAM audit follow-up] Same downcast-at-the-cached-
+    # builder fix as _live_scanner_slim_payload_and_df_ttl() below —
+    # see its comment for why this needs to happen here, inside the
+    # @st.cache_data function, rather than at each page's session_state
+    # assignment site.
+    from utils.json_sanitize import prepare_output_payload
+    return prepare_output_payload(df)
 
 
 @st.cache_data(ttl=_LIVE_SCANNER_TTL_S, max_entries=1, show_spinner=False)
@@ -179,6 +186,24 @@ def _live_scanner_slim_payload_and_df_ttl(records_key: str) -> tuple[Optional[di
     payload_section = raw.get("payload") or {}
     records = payload_section.get(records_key, [])
     df = pd.DataFrame(records)
+    # [2026-08-24, RAM audit follow-up] Downcast HERE, inside the
+    # @st.cache_data-wrapped builder, not at each individual page's
+    # session_state assignment. st.cache_data deep-copies its return
+    # value on every call to protect the shared cache from caller-side
+    # mutation — so every one of get_snapshot_df("live_scanner")'s
+    # callers (pages/scanner.py, pages/dashboard.py x2,
+    # pages/sectors.py, pages/five_pillars.py) was independently
+    # receiving its own full float64/object-width copy of this
+    # ~(555, ~335) frame, on top of the one canonical copy already
+    # sitting in Streamlit's cache store, then stashing THAT copy into
+    # st.session_state (per-browser-session, never cleared on page
+    # navigation) — see utils.json_sanitize.prepare_output_payload's
+    # own docstring for the boundary-only downcast philosophy this
+    # follows. Downcasting the canonical cached copy here means every
+    # later .copy() st.cache_data makes is already narrow, fixing every
+    # downstream call site at once instead of patching each separately.
+    from utils.json_sanitize import prepare_output_payload
+    df = prepare_output_payload(df)
     slim = dict(raw)
     slim["payload"] = {k: v for k, v in payload_section.items() if k != records_key}
     return slim, df
@@ -192,7 +217,6 @@ def _live_scanner_payload_ttl() -> Optional[dict]:
 def _live_scanner_dataframe_ttl(records_key: str) -> pd.DataFrame:
     _slim, df = _live_scanner_slim_payload_and_df_ttl(records_key)
     return df
-
 
 def get_snapshot(section: str) -> Optional[dict]:
     """

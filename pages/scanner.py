@@ -4194,6 +4194,9 @@ def render(settings: dict | None = None):
         if _snap:
             _df = get_snapshot_df("live_scanner")
             if not _df.empty:
+                # [2026-08-24] Already downcast at the source — see
+                # utils.snapshot_cache._live_scanner_slim_payload_and_df_ttl()
+                # — no need to repeat prepare_output_payload() here.
                 st.session_state["scan_df"]      = _df
                 st.session_state["last_scan_df"] = st.session_state["scan_df"]
                 _created_at = _snap.get("created_at", "")
@@ -4257,6 +4260,7 @@ def render(settings: dict | None = None):
 
         _source_warnings = []
         with st.spinner("Running scanner…"):
+            from utils.json_sanitize import prepare_output_payload
             df_raw = run_scanner(
                 symbols,
                 settings       = effective,
@@ -4315,8 +4319,8 @@ def render(settings: dict | None = None):
         except Exception:
             pass
 
-        st.session_state["scan_df"]       = df_aug
-        st.session_state["last_scan_df"]  = df_aug   # Sprint 2: lifecycle page reads this
+        st.session_state["scan_df"]       = prepare_output_payload(df_aug)
+        st.session_state["last_scan_df"]  = st.session_state["scan_df"]   # Sprint 2: lifecycle page reads this
         st.session_state["regime_ctx"]    = regime_ctx
         st.session_state["scan_summary"]  = regime_summary(df_aug, regime_ctx)
         st.session_state["scan_time"]     = _now_ist().strftime("%Y-%m-%d %H:%M:%S")

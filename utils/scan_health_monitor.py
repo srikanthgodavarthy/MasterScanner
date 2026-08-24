@@ -73,7 +73,17 @@ except ImportError:
 # somewhere with a different budget — see scheduler/scan_worker.py's
 # module docstring on tunable concurrency for the same per-deployment-
 # tier philosophy.
-RAM_WARN_MB = 700     # skip this cycle above this resident-memory level
+RAM_WARN_MB = 750     # skip this cycle above this resident-memory level
+                        # [2026-08-24] Bumped from 700 — reported steady-
+                        # state RSS on this workload is 650-740MB, so 700
+                        # was tripping "slow_down" during entirely normal
+                        # operation, not just genuine pressure. Combined
+                        # with this branch now also malloc_trim'ing (see
+                        # below), a transient blip into the low 700s that
+                        # trims back down no longer needs the threshold
+                        # bumped further — 750 leaves real headroom above
+                        # the normal steady state while still firing
+                        # meaningfully before RAM_CRITICAL_MB.
 RAM_CRITICAL_MB = 850  # skip AND log at error level — getting close to
                         # the container ceiling
 CPU_WARN_PCT = 85.0     # system-wide CPU%, sampled non-blocking
@@ -274,8 +284,36 @@ def check_health(job_name: str) -> HealthDecision:
                     job_name, reclaimed, ram_mb,
                 )
         elif ram_mb >= RAM_WARN_MB:
-            action = "slow_down"
-            reasons.append(f"RAM {ram_mb:.0f}MB >= warn {RAM_WARN_MB}MB")
+            # [2026-08-24, RAM audit follow-up] Previously this branch
+            # only logged a warning — the only place that ever called
+            # _malloc_trim_reclaim() was the RAM_CRITICAL_MB branch above,
+            # 150MB higher. Reported steady-state RSS on this workload
+            # (650-740MB) sits ABOVE RAM_WARN_MB but has never once
+            # reached RAM_CRITICAL_MB, so malloc_trim was never actually
+            # firing in production — see _malloc_trim_reclaim's docstring
+            # (42-59% of RSS measured reclaimable on this workload's
+            # fragmented-arena pattern). Same "safe to call
+            # unconditionally, only returns already-freed pages" argument
+            # applies here as in the critical branch above.
+            reclaimed = _malloc_trim_reclaim()
+            if reclaimed > 0:
+                try:
+                    ram_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+                except Exception:
+                    logger.exception("scan_health_monitor: post-trim RAM re-check failed (non-fatal)")
+
+            if ram_mb >= RAM_WARN_MB:
+                action = "slow_down"
+                reasons.append(
+                    f"RAM {ram_mb:.0f}MB >= warn {RAM_WARN_MB}MB"
+                    + (f" (post-trim, reclaimed {reclaimed:.0f}MB)" if reclaimed > 0 else "")
+                )
+            else:
+                logger.info(
+                    "[scan_health_monitor] %s -> proceed (RAM was >= warn, "
+                    "malloc_trim reclaimed %.0fMB, now %.0fMB)",
+                    job_name, reclaimed, ram_mb,
+                )
 
         if cpu_pct >= CPU_WARN_PCT and action != "skip_cycle":
             action = "slow_down"

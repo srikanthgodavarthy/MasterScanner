@@ -26,7 +26,7 @@ Exactly two levers, applied together, on purpose
                                  back to the OS, so freed pages don't sit
                                  in the arena's top chunk waiting for
                                  scan_health_monitor's reactive
-                                 malloc_trim(0) (gated at RAM_WARN_MB=700,
+                                 malloc_trim(0) (gated at RAM_WARN_MB=750,
                                  at most every 10 min via
                                  native_memory_probe) to catch them.
 
