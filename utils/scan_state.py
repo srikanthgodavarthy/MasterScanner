@@ -880,6 +880,7 @@ BEGIN
         WHEN 'market_intelligence_snapshots' THEN 'version'
         WHEN 'dore_options_scan_snapshots'   THEN 'version'
         WHEN 'dore_technical_plans_snapshots' THEN 'version'
+        WHEN 'index_dore_snapshots'           THEN 'version'
         WHEN 'scan_snapshots'                THEN 'run_at'
         WHEN 'scan_daily_archive'            THEN 'trading_date'
         WHEN 'sector_snapshots'              THEN 'scan_date'
