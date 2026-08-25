@@ -1558,6 +1558,17 @@ def score_stock(
         full scan universe's history.
     """
     if df.empty or len(df) < 210:
+        # [2026-08-25 diagnostic] Previously silent — this is a STRICTER
+        # gate than get_live_history_cached's own min_bars=60 filter
+        # (utils/history_store.py), so a symbol can pass the fetch stage
+        # with 60-209 bars and still vanish here with zero log trace,
+        # right before merging into the Live Scanner / NSE Top Gainers
+        # snapshot. Logging by symbol (when known) is what makes that
+        # case distinguishable from "no OHLCV fetched at all".
+        _log.warning(
+            "score_stock: dropping %s — only %d bar(s) of history (need >= 210)",
+            symbol or "<unknown symbol>", len(df),
+        )
         return {}
 
     from utils.scoring_core import ScoringParams, build_indicators, compute_bar, leadership_prescreen
@@ -2677,6 +2688,24 @@ def run_scanner(
             "%d cancelled before starting, %d still running (last-good "
             "values elsewhere are unaffected): %s",
             len(pending), _SCORE_WAIT_TIMEOUT_S, cancelled, running, stuck,
+        )
+
+    # [2026-08-25 diagnostic] Single authoritative "who's missing this
+    # batch" summary — every prior log line above (extraction failures,
+    # min_bars drops, score_stock's 210-bar gate, this timeout block) only
+    # covers ONE path a symbol can fall out through. This diffs the
+    # symbols actually requested against the ones that made it into
+    # `results`, so a symbol lost through a path with no logging at all
+    # (or a path added later that nobody thought to log) still shows up
+    # here instead of just quietly not being in the merged snapshot.
+    scored_syms = {r.get("Stock") for r in results if r}
+    unaccounted = set(symbols) - scored_syms
+    if unaccounted:
+        _log.warning(
+            "scanner_engine: run_scanner returning %d/%d symbols this batch — "
+            "%d unaccounted for (see history_store/score_stock/timeout warnings "
+            "above for the specific reason per symbol, if logged): %s",
+            len(scored_syms), len(symbols), len(unaccounted), sorted(unaccounted),
         )
 
     if not results:

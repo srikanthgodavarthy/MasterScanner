@@ -816,7 +816,34 @@ def get_live_history_cached(
         result = {s: state["data"][s] for s in symbols if s in state["data"]}
 
     if min_bars:
+        pre_filter_keys = set(result.keys())
         result = {s: df for s, df in result.items() if len(df) >= min_bars}
+        thin = pre_filter_keys - result.keys()
+        if thin:
+            # [2026-08-25 diagnostic] Previously silent — a symbol landing
+            # here (present in the RAM/disk cache but with fewer than
+            # min_bars rows) simply vanished from the scanner's `all_data`
+            # for the rest of run_scanner(), no log line anywhere. Logging
+            # it here is what makes "why is symbol X missing from the Live
+            # Scanner / NSE Top Gainers" answerable from the deploy log
+            # instead of requiring a manual _local_load()/_meta_load() probe.
+            logger.warning(
+                "history_store: %d symbol(s) dropped by min_bars=%d filter "
+                "(cached history too short — check for a stuck/failing tail "
+                "fetch or a genuinely new listing): %s",
+                len(thin), min_bars, sorted(thin),
+            )
+    missing = set(symbols) - result.keys()
+    if missing:
+        # Symbols requested but absent from `result` even before the
+        # min_bars filter — get_history() returned nothing for them at all
+        # (see history_store: extraction-failure / empty-frame ERROR logs
+        # from _raw_fetch_yfinance for the specific reason, if any fired).
+        logger.warning(
+            "history_store: %d symbol(s) requested but not returned by "
+            "get_live_history_cached at all (source=%s): %s",
+            len(missing), source, sorted(missing),
+        )
     return result
 
 
