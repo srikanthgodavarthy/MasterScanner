@@ -1906,7 +1906,25 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
     expiries = sorted({e for e in opt[expiry_col].astype(str) if e >= today_str})
     if not expiries:
         return None
-    expiry = expiries[0]
+    # [2026-08-25] Roll past 0-DTE (today's own expiry) for single-stock
+    # options. Unlike the index path (fetch_nearest_expiry/fetch_next_
+    # expiry + stage5b's CURRENT_WEEK/NEXT_WEEK gate in dore_engine.py),
+    # stocks were never given an equivalent rollover — dore_engine.py:592
+    # documents stocks as assumed MONTHLY, so this 0-DTE case only shows
+    # up once a month (today) and had no handling. On expiry day itself,
+    # same-day OPTSTK premiums decay toward the tick floor for anything
+    # that isn't deep ITM regardless of the underlying's ATR, which is
+    # what was mass-failing validate_premium()'s "too low vs ATR" check
+    # in DORE's rejections (18/25 rejections one cycle, all real chains/
+    # OI, none of them a data-availability problem). DORE's own
+    # _exit_before_expiry_rule() already mandates exiting 0-2 DTE
+    # positions same day, so there's no reason to source a NEW entry
+    # from an expiry that would need to be closed within hours anyway —
+    # skip straight to the next available OPTSTK expiry instead.
+    if len(expiries) > 1 and expiries[0] == today_str:
+        expiry = expiries[1]
+    else:
+        expiry = expiries[0]
 
     chain = _get_option_chain_with_retry(instrument_key, expiry)
     if not chain:
