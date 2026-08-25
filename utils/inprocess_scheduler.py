@@ -224,11 +224,29 @@ def start_background_scans() -> bool:
         # coexist with manual reruns.
         INPROCESS_LIVE_SCANNER_MAX_WORKERS = 2          # vs. standalone's 4
         INPROCESS_LIVE_SCANNER_BATCH_COOLDOWN_SECS = 3.0  # vs. standalone's 1.5
+        # [2026-08-25] vs. standalone's 50 (scheduler/scan_worker.py's
+        # LIVE_SCANNER_BATCH_SIZE). With only 2 scoring workers (above)
+        # and run_scanner()'s fixed 45s scoring-wait timeout
+        # (utils/scanner_engine.py's _SCORE_WAIT_TIMEOUT_S), a 50-symbol
+        # batch structurally can't finish in time: 50 symbols / 2 workers
+        # is ~25 symbols/worker, which at a few seconds of scoring each
+        # already exceeds 45s, so the tail of every batch got silently
+        # cancelled — observed in production as batches consistently
+        # completing only ~30-42/50 symbols and a live_scanner cycle
+        # merging just 375/500 of the universe. Standalone's 4 workers
+        # don't hit this ceiling at batch_size=50, so this is scoped to
+        # the in-process tier only rather than lowering the shared
+        # LIVE_SCANNER_BATCH_SIZE constant both tiers default to — see
+        # that constant's own comment for the DB-write-count tradeoff
+        # (more, smaller batches means more state_meta/live_scanner_state
+        # upsert round trips per cycle, not more total data written).
+        INPROCESS_LIVE_SCANNER_BATCH_SIZE = 25          # vs. standalone's 50
 
         t_live_scanner = threading.Thread(
             target=_run_live_scanner_loop,
             kwargs={
                 "max_workers": INPROCESS_LIVE_SCANNER_MAX_WORKERS,
+                "batch_size": INPROCESS_LIVE_SCANNER_BATCH_SIZE,
                 "batch_cooldown_secs": INPROCESS_LIVE_SCANNER_BATCH_COOLDOWN_SECS,
                 "owner_event": hb_thread.lost_ownership,
             },
@@ -237,8 +255,10 @@ def start_background_scans() -> bool:
         t_live_scanner.start()
         logger.info(
             "In-process scheduler: started live_scanner thread (every %ss, "
-            "max_workers=%d, batch_cooldown=%.1fs, ring-buffer-capped at %d bars)",
+            "max_workers=%d, batch_size=%d, batch_cooldown=%.1fs, "
+            "ring-buffer-capped at %d bars)",
             LIVE_SCANNER_INTERVAL_SECS, INPROCESS_LIVE_SCANNER_MAX_WORKERS,
+            INPROCESS_LIVE_SCANNER_BATCH_SIZE,
             INPROCESS_LIVE_SCANNER_BATCH_COOLDOWN_SECS, RING_BUFFER_MAX_BARS,
         )
 
