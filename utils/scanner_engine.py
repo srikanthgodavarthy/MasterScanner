@@ -1565,7 +1565,20 @@ def score_stock(
         # right before merging into the Live Scanner / NSE Top Gainers
         # snapshot. Logging by symbol (when known) is what makes that
         # case distinguishable from "no OHLCV fetched at all".
-        _log.warning(
+        #
+        # [2026-08-25 fix] Deliberately calling logging.getLogger(__name__)
+        # here instead of using the module-level `_log` name directly —
+        # this function has two `import logging as _log` statements
+        # further down (decision-engine / pillar-engine failure handlers),
+        # and Python's function-wide static scoping means ANY assignment
+        # to `_log` anywhere in this function body — even one that
+        # executes later, on a different code path — makes `_log` a
+        # local variable for the ENTIRE function, including this earlier
+        # reference. That shadowing caused an UnboundLocalError in
+        # production the first time this branch actually fired (symbol:
+        # MEESHO). getLogger(__name__) returns the exact same logger
+        # `_log` refers to at module scope, without touching that name.
+        logging.getLogger(__name__).warning(
             "score_stock: dropping %s — only %d bar(s) of history (need >= 210)",
             symbol or "<unknown symbol>", len(df),
         )
