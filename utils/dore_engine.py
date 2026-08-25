@@ -3147,6 +3147,75 @@ def build_dore_input_for_index(
     )
 
 
+def compute_index_dore(index_key: str, ohlcv, oi: dict, ce_pe_chg: tuple,
+                        dore_cfg: "DORESettings", avail_capital: float,
+                        lot_sizes: dict, existing_positions) -> Optional[dict]:
+    """Full index-level DORE 2.0 read (Stage 1-5 + position sizing) for
+    one of NIFTY / SENSEX / BANKNIFTY, as a JSON-safe dict.
+
+    [2026-08-25] Moved here from utils.market_intelligence._index_dore —
+    market_intelligence's job is assembling the Market Intelligence
+    panel (breadth/regime/index snapshots), not running the DORE
+    pipeline itself. DORE's own module is the right owner of "what does
+    a DORE read for an index look like", including the position-sizing
+    step that turns a DOREResult into lots/quantity/capital-at-risk.
+    Callers (utils.market_intelligence, scheduler/scan_worker.py) just
+    consume this and slot the dict into their own index_cards payload.
+    Returns None (non-fatal, logged) on any failure — same fail-soft
+    contract the old _index_dore had.
+    """
+    try:
+        from utils.dore_fo_screener import execution_features_from_intraday_5m
+        from utils.upstox_client import fetch_index_intraday_5m_upstox
+        from utils.oi_snapshot_store import record_and_diff_premium
+        from utils.position_sizing import size_position, PortfolioContext, PositionSizingSettings
+
+        intraday_5m = fetch_index_intraday_5m_upstox(index_key)
+        exec_features = execution_features_from_intraday_5m(intraday_5m, dore_cfg)
+        ce_chg, pe_chg = ce_pe_chg
+        ce_premium = oi.get("ce_premium", 0.0)
+        pe_premium = oi.get("pe_premium", 0.0)
+        # 2026-08-06: record_and_diff_premium() now also returns a rolling-
+        # average growth rate (ce/pe_avg_growth_pct) — see utils/fo_scan.py's
+        # mirror of this same call for the fuller comment.
+        (ce_prem_prev, ce_prem_prev2, pe_prem_prev, pe_prem_prev2,
+         ce_avg_growth_pct, pe_avg_growth_pct) = record_and_diff_premium(
+            index_key, ce_premium, pe_premium)
+        atm_chain_row = {
+            "atm_strike": oi.get("atm_strike") or 0.0,
+            "ce_premium": ce_premium, "pe_premium": pe_premium,
+            "ce_premium_prev": ce_prem_prev, "ce_premium_prev2": ce_prem_prev2,
+            "pe_premium_prev": pe_prem_prev, "pe_premium_prev2": pe_prem_prev2,
+            "ce_premium_avg_growth_pct": ce_avg_growth_pct,
+            "pe_premium_avg_growth_pct": pe_avg_growth_pct,
+            "ce_oi": oi.get("ce_oi", 0.0), "pe_oi": oi.get("pe_oi", 0.0),
+            "ce_oi_change": ce_chg, "pe_oi_change": pe_chg,
+            "pcr": oi.get("pcr", 1.0), "expiry": oi.get("expiry", ""),
+        }
+        dore_input = build_dore_input_for_index(
+            index_key, ohlcv, oi, atm_chain_row=atm_chain_row, execution_features=exec_features,
+        )
+        if not dore_input:
+            return None
+        result = compute_dore(dore_input, dore_cfg)
+        out = result.as_dict()
+        ctx = PortfolioContext(
+            available_capital=avail_capital, existing_positions=existing_positions,
+            lot_size=lot_sizes.get(index_key, 1), sector=None,
+        )
+        sized = size_position(result, ctx, PositionSizingSettings(), symbol=index_key)
+        out["lots"] = sized.lots
+        out["quantity"] = sized.quantity
+        out["capital_at_risk"] = sized.capital_at_risk
+        out["capital_at_risk_pct"] = sized.capital_at_risk_pct
+        out["sizing_blocked"] = sized.blocked
+        out["sizing_reason"] = sized.block_reasons[-1] if sized.block_reasons else ""
+        return out
+    except Exception:
+        logger.exception("DORE 2.0 computation failed for %s (non-fatal)", index_key)
+        return None
+
+
 # ══════════════════════════════════════════════════════════════════
 #  STAGE 0/1/2 FUNNEL — see utils.dore_fo_screener for the batched,
 #  cost-aware orchestration across the full F&O universe (Daily

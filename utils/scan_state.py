@@ -94,6 +94,14 @@ _TABLES = {
     # "dore_live_state" removed from this map [2026-08-04] — see
     # _STATE_SECTIONS below, same reason as "live_scanner".
     "dore_technical_plans":  "dore_technical_plans_snapshots",
+    # [2026-08-25] Indices' own DORE 2.0 read — see
+    # utils.market_intelligence.compute_all_index_dore's docstring and
+    # scheduler/scan_worker.py's "index_dore" job (60s cadence, same as
+    # dore_live_state below). A plain snapshot table, not a
+    # _STATE_SECTIONS symbol-keyed one: the whole payload is just 3
+    # keys (NIFTY/SENSEX/BANKNIFTY), the same small-dict shape
+    # "market_intelligence" already uses, not a per-symbol record list.
+    "index_dore":            "index_dore_snapshots",
 }
 
 _META_COLUMNS = "scan_id, created_at, status, version, row_count, error"
@@ -829,6 +837,21 @@ CREATE TABLE IF NOT EXISTS dore_technical_plans_snapshots (
     payload    jsonb
 );
 CREATE INDEX IF NOT EXISTS idx_dore_tp_snap_version ON dore_technical_plans_snapshots(version DESC);
+
+-- [2026-08-25] Indices' own DORE 2.0 read (NIFTY/SENSEX/BANKNIFTY),
+-- written every 60s by scheduler/scan_worker.py's "index_dore" job —
+-- see utils.market_intelligence.compute_all_index_dore's docstring.
+CREATE TABLE IF NOT EXISTS index_dore_snapshots (
+    id         bigserial   PRIMARY KEY,
+    scan_id    uuid        NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    status     text        NOT NULL DEFAULT 'completed',
+    version    bigint      NOT NULL,
+    row_count  integer     NOT NULL DEFAULT 0,
+    error      text,
+    payload    jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_index_dore_snap_version ON index_dore_snapshots(version DESC);
 
 -- ── Retention [Architecture review H1 fix, 2026-07-25] ─────────────────
 -- Deletes all but the most recent p_keep rows (by version) from ONE of
