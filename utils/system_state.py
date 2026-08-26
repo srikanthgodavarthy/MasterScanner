@@ -451,6 +451,7 @@ def set_market_hours_gate_enabled(enabled: bool) -> None:
                updated_at = %s WHERE id = 1""",
             (bool(enabled), _now().isoformat()),
         )
+        _invalidate_state_cache()
     except Exception as exc:
         if "market_hours_gate_enabled" in str(exc) and "column" in str(exc).lower():
             # Column doesn't exist yet on this deployment — the
@@ -492,6 +493,7 @@ def set_manual_override(section: str, ttl_secs: int = 90) -> None:
                manual_override_until = %s, updated_at = %s WHERE id = 1""",
             (section, until, _now().isoformat()),
         )
+        _invalidate_state_cache()
     except Exception:
         logger.exception("set_manual_override(%s) failed (non-fatal)", section)
 
@@ -509,6 +511,7 @@ def clear_manual_override(section: str) -> None:
                WHERE id = 1 AND manual_override_section = %s""",
             (_now().isoformat(), section),
         )
+        _invalidate_state_cache()
     except Exception:
         logger.exception("clear_manual_override(%s) failed (non-fatal)", section)
 
@@ -520,6 +523,7 @@ def _acquire_backtest_lock() -> None:
         return
     try:
         db.call_function("acquire_backtest_lock")
+        _invalidate_state_cache()
     except Exception:
         logger.exception("acquire_backtest_lock function call failed — backtest will run "
                           "without a pause lock (scheduler contention possible)")
@@ -530,6 +534,7 @@ def _release_backtest_lock() -> None:
         return
     try:
         db.call_function("release_backtest_lock")
+        _invalidate_state_cache()
     except Exception:
         logger.exception("release_backtest_lock function call failed — system_state may "
                           "stay wedged in BACKTEST mode until the heartbeat "
@@ -551,6 +556,7 @@ def _force_reset_to_live() -> None:
                heartbeat_at = NULL, updated_at = %s WHERE id = 1""",
             (_now().isoformat(),),
         )
+        _invalidate_state_cache()
     except Exception:
         logger.exception("_force_reset_to_live() failed")
 
