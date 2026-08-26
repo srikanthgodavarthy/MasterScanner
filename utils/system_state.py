@@ -236,23 +236,99 @@ def _parse_ts(val) -> Optional[datetime]:
 
 # ─── READ ───────────────────────────────────────────────────────────────
 
-def get_system_state() -> dict:
+# [Ops fix, 2026-08-26] Process-wide cache for get_system_state().
+#
+# scheduler/scan_worker.py runs 5 independent loop threads
+# (market_intelligence, dore_live_state, index_dore, live_scanner,
+# retention), and every one of them calls should_scheduler_run() ->
+# get_system_state() at its own cycle boundary — including the 600s
+# "are we still paused?" poll each does outside market hours (see that
+# file's 2026-08-22 comment on _run_loop). Each loop's 600s timer is
+# independent and drifts against the others as each cycle's actual
+# compute takes a different amount of time, so in aggregate the 5
+# uncached pollers were still touching Neon far more often than once
+# per 600s — confirmed via the Neon console showing compute
+# continuously allocated overnight, and via the SSL-dropped-connection
+# retry warnings in utils.db logged whenever a poll landed right after
+# Neon suspended in one of the rare gaps between them.
+#
+# Fix: cache the row for _STATE_CACHE_TTL_SECS, guarded by a lock that's
+# held across the actual DB call on a miss (not just the cache check).
+# Whichever of the 5 loops asks first after the cache goes stale pays
+# for one real Neon round trip; every other thread that asks — whether
+# it was already waiting on the lock or wakes up anywhere in the next
+# ~9 minutes — gets that same cached answer for free. This is what
+# actually lets Neon's compute go fully idle outside market hours,
+# rather than relying on 5 independent timers happening to stay out of
+# each other's way.
+_STATE_CACHE_LOCK = threading.Lock()
+_STATE_CACHE: Optional[dict] = None
+_STATE_CACHE_AT: float = 0.0
+# Deliberately a little under the 600s per-loop poll interval so the
+# cache still refreshes at least once within any single loop's own
+# pause tick, rather than exactly matching it and racing on rounding.
+_STATE_CACHE_TTL_SECS = 540
+
+
+def _invalidate_state_cache() -> None:
+    """Call right after any write to the system_state row, so a
+    same-process caller (e.g. the Settings page toggling the
+    market-hours gate, then immediately re-checking
+    should_scheduler_run()) sees its own write immediately instead of
+    waiting out the cache TTL. Other processes still pick it up on
+    their next cache expiry — up to _STATE_CACHE_TTL_SECS later, which
+    is fine, nothing here has a sub-minute freshness requirement (same
+    reasoning as the 600s poll interval this cache backs)."""
+    global _STATE_CACHE, _STATE_CACHE_AT
+    with _STATE_CACHE_LOCK:
+        _STATE_CACHE = None
+        _STATE_CACHE_AT = 0.0
+
+
+def get_system_state(force_refresh: bool = False) -> dict:
     """
     Returns the singleton row, or the LIVE-shaped default if Neon is
     unavailable or the row doesn't exist yet — fail-open, see module
     docstring. Never returns None so callers don't need a None-check on
     every field access.
+
+    Cached process-wide for _STATE_CACHE_TTL_SECS (see that constant's
+    comment) — pass force_refresh=True to bypass the cache and hit Neon
+    directly (e.g. right after this same process performs a write and
+    needs to observe it immediately, though _invalidate_state_cache()
+    already covers every write helper in this module).
     """
-    if not db.is_available():
-        return dict(_LIVE_DEFAULT)
-    try:
-        row = db.fetch_one("SELECT * FROM system_state WHERE id = 1 LIMIT 1")
-        if not row:
+    global _STATE_CACHE, _STATE_CACHE_AT
+
+    if not force_refresh:
+        with _STATE_CACHE_LOCK:
+            if _STATE_CACHE is not None and (time.time() - _STATE_CACHE_AT) < _STATE_CACHE_TTL_SECS:
+                return dict(_STATE_CACHE)
+
+    # Miss (or forced): hold the lock across the actual DB call too, not
+    # just the check above. This serializes concurrent misses from
+    # multiple threads into one real query instead of a thundering herd
+    # all hitting Neon at once right when the cache expires — whichever
+    # thread gets here first does the fetch; the rest see the freshly
+    # populated cache via the double-check below and never touch Neon.
+    with _STATE_CACHE_LOCK:
+        if not force_refresh and _STATE_CACHE is not None and (time.time() - _STATE_CACHE_AT) < _STATE_CACHE_TTL_SECS:
+            return dict(_STATE_CACHE)
+
+        if not db.is_available():
             return dict(_LIVE_DEFAULT)
-        return row
-    except Exception:
-        logger.exception("get_system_state() failed — failing open to LIVE")
-        return dict(_LIVE_DEFAULT)
+        try:
+            row = db.fetch_one("SELECT * FROM system_state WHERE id = 1 LIMIT 1")
+            result = dict(row) if row else dict(_LIVE_DEFAULT)
+        except Exception:
+            logger.exception("get_system_state() failed — failing open to LIVE")
+            # Deliberately NOT cached — a transient failure shouldn't
+            # lock in a fail-open reading for the next 9 minutes.
+            return dict(_LIVE_DEFAULT)
+
+        _STATE_CACHE = dict(result)
+        _STATE_CACHE_AT = time.time()
+        return dict(result)
 
 
 def should_scheduler_run() -> bool:
