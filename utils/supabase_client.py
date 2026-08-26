@@ -114,9 +114,23 @@ def save_scan_snapshot(df: pd.DataFrame, label: str = "") -> bool:
         return False
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def load_scan_history(limit: int = 10) -> pd.DataFrame:
     """
     Returns the N most-recent distinct scan run timestamps + their top rows.
+
+    [2026-08-26, SG-flagged slowness review] Was the one uncached DB
+    call left in this module's scan-facing path — every other read here
+    (load_sector_snapshot_history, etc.) already carries a TTL. Its only
+    caller, add_streak_column() in scanner_engine.py, is invoked once
+    per manual "Run Scan" click from pages/scanner.py, so this was
+    firing a fresh `SELECT * ... LIMIT {limit*50}` (up to 2,500 rows)
+    against Neon on every single scan — even back-to-back scans
+    seconds apart got no benefit from each other. 30s TTL (not 300s,
+    unlike the sector-snapshot read above) because scan_snapshots is
+    written to far more frequently and a stale streak read would show
+    the wrong recent-tier history; still collapses any burst of clicks
+    or reruns within the same half-minute into one DB hit.
     """
     if not db.is_available():
         return pd.DataFrame()

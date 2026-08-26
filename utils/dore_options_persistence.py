@@ -108,7 +108,7 @@ from utils.outcome_tracking import record_final_outcome
 # Used below to decide whether a Pre-Breakout-origin plan (source == "PB",
 # see DoreOptionsPlan.source's docstring) has actually earned the right to
 # activate, or is still just coiling.
-from utils.dore_options_engine import SETUP_BREAKOUT, DORE_OPTIONS_DEFAULTS
+from utils.dore_options_engine import SETUP_BREAKOUT, DORE_OPTIONS_DEFAULTS, is_index_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +219,23 @@ def _min_confidence_to_track(dte: Optional[int], settings=DORE_OPTIONS_DEFAULTS)
     if bucket == "3-5":
         return settings.gamma_min_confidence_to_track_3_5_dte
     return MIN_CONFIDENCE_TO_TRACK
+
+
+def _is_executable(symbol: str, dte: Optional[int], settings=DORE_OPTIONS_DEFAULTS) -> bool:
+    """[2026-08-25, SG request] Tradability floor, separate from and
+    checked alongside _min_confidence_to_track — a real broker
+    restriction (single-stock options can't be freshly bought within
+    settings.min_dte_stock_options days of expiry), not a quality/
+    confidence judgment. No confidence score should be able to override
+    this, so it's a hard boolean, not a threshold that scales with
+    signal strength. Index options (NIFTY/SENSEX/BANKNIFTY) are exempt
+    — cash-settled, no such restriction applies. dte=None (unknown)
+    passes — same fail-open convention as _min_confidence_to_track's
+    dte=None case, since we don't want a missing DTE read to silently
+    block otherwise-good candidates."""
+    if dte is None or is_index_symbol(symbol):
+        return True
+    return dte >= getattr(settings, "min_dte_stock_options", 2)
 
 # [Sprint 1 — Portfolio Admission, 2026-08-05] Hard cap on simultaneously
 # OPEN DORE Options plans. Once at cap, a new candidate can still mint —
@@ -1065,6 +1082,18 @@ def enrich_trade_plans_with_persistence(
                 # monitored regardless of later confidence fluctuation.
                 if confidence_score < _min_confidence_to_track(row.get("dte")):
                     enriched_rows.append(row)   # still shown as a Live Scan recommendation, just not tracked
+                    continue
+
+                # [2026-08-25, SG request] Tradability gate — checked
+                # separately from and after the confidence gate above,
+                # since it's a broker-execution fact, not a signal-
+                # quality one. A candidate can clear MIN_CONFIDENCE_TO_
+                # TRACK comfortably and still be un-executable; still
+                # surfaced in the Live Scan (so the setup itself is
+                # visible for reference) but never minted into a
+                # trackable plan.
+                if not _is_executable(symbol, row.get("dte")):
+                    enriched_rows.append(row)
                     continue
 
                 # [Sprint 1 — Duplicate Suppression, extends 2026-08-05

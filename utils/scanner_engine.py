@@ -3007,6 +3007,21 @@ def compute_scan_streaks(
     Returns
     -------
     dict {symbol: streak_count}  — only symbols with streak >= 1 included.
+
+    [2026-08-26, SG-flagged slowness review] Rewritten from a nested
+    Python loop (for each symbol, for each of the n_scans runs, filter
+    that run's DataFrame down to this symbol's rows via boolean
+    indexing — up to symbols × n_scans separate pandas filter calls,
+    ~5,000 on a 500-symbol universe at n_scans=10) to a single
+    groupby/pivot + vectorized numpy pass. Same output for the same
+    input — verified in isolation against the old implementation on
+    the current scan_snapshots shape — just without re-scanning a
+    DataFrame from scratch for every (symbol, run) pair. The "stop
+    counting at the first non-qualifying run" behavior (a streak is
+    CONSECUTIVE from the most recent scan backward, not a total count)
+    is preserved via cumprod: multiplying a 0/1 row left-to-right zeroes
+    out everything after the first miss, so summing the row gives
+    exactly the length of the leading run of qualifying scans.
     """
     if not scan_history:
         return {}
@@ -3016,34 +3031,54 @@ def compute_scan_streaks(
     if sym_col not in df.columns or tier_col not in df.columns:
         return {}
 
-    # Group by scan run (if there is a run_at column, use it; else use positional order)
+    # Group by scan run (if there is a run_at column, use it; else use
+    # positional order) — same "first n_scans distinct runs, in the
+    # order they appear in df" semantics as the old groupby(sort=False)
+    # + list-slice, just without materializing a DataFrame per run.
     run_col = "run_at" if "run_at" in df.columns else None
     if run_col:
-        runs = [grp for _, grp in df.groupby(run_col, sort=False)]
+        run_order = df[run_col].drop_duplicates().tolist()[:n_scans]
+        if not run_order:
+            return {}
+        run_index = {run_val: i for i, run_val in enumerate(run_order)}
+        df = df[df[run_col].isin(run_index)].copy()
+        df["_run_idx"] = df[run_col].map(run_index)
+        n_runs = len(run_order)
     else:
-        # treat each row as its own run (legacy)
-        runs = [df.iloc[[i]] for i in range(len(df))]
+        # legacy: each row is its own run, row position IS the run index
+        df = df.iloc[:n_scans].copy()
+        df["_run_idx"] = range(len(df))
+        n_runs = len(df)
 
-    # Keep only the most recent n_scans
-    runs = runs[:n_scans]
+    if n_runs == 0:
+        return {}
 
-    # For each symbol track consecutive streak from most recent scan back
-    all_symbols = df[sym_col].unique()
-    streaks: dict[str, int] = {}
+    qualifies = df[tier_col].isin(count_tiers)
+    hits = df.loc[qualifies, [sym_col, "_run_idx"]]
+    if hits.empty:
+        return {}
 
-    for sym in all_symbols:
-        streak = 0
-        for run_df in runs:
-            sym_rows = run_df[run_df[sym_col] == sym]
-            appeared = not sym_rows.empty and sym_rows[tier_col].isin(count_tiers).any()
-            if appeared:
-                streak += 1
-            else:
-                break   # consecutive streak broken
-        if streak >= 1:
-            streaks[sym] = streak
+    # symbol x run_idx boolean grid — True wherever that symbol
+    # qualified in that run. Column 0 = most recent scan.
+    grid = (
+        hits.assign(_hit=True)
+            .pivot_table(index=sym_col, columns="_run_idx", values="_hit",
+                         aggfunc="any", fill_value=False)
+            .reindex(columns=range(n_runs), fill_value=False)
+    )
 
-    return streaks
+    # cumprod along the run axis: once a run is False (miss), every
+    # later (older) column on that row becomes 0 too, so the row sum
+    # is exactly the consecutive leading-True count — the streak.
+    streak_counts = np.cumprod(grid.to_numpy(dtype=int), axis=1).sum(axis=1)
+
+    return {
+        str(sym): int(count)
+        for sym, count in zip(grid.index, streak_counts)
+        if count >= 1
+    }
+
+
 
 
 def add_streak_column(

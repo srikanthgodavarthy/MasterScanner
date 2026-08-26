@@ -243,6 +243,22 @@ class DoreOptionsSettings:
     gamma_min_confidence_to_track_0_2_dte: float = 80.0
     gamma_min_confidence_to_track_3_5_dte: float = 78.0
 
+    # [2026-08-25, SG request — broker execution constraint] Single-
+    # stock (non-index) options can't be freshly bought this close to
+    # expiry on SG's broker — a T-1 (and in practice sometimes T-2)
+    # restriction tied to physical-settlement compliance on NSE stock
+    # options. This is a TRADABILITY floor, distinct from every
+    # confidence/quality gate above it: a candidate can be a genuinely
+    # excellent 0-1 DTE signal (see the IDEA 14CE +700% case that
+    # prompted this) and still be un-executable, so no confidence score
+    # should be able to override it. Checked via is_index_symbol() —
+    # index options (NIFTY/SENSEX/BANKNIFTY) are cash-settled and carry
+    # no such restriction, so this floor does not apply to them.
+    # Applies to MINTING only (utils.dore_options_persistence), same
+    # scope as MIN_CONFIDENCE_TO_TRACK — an already-tracked plan that
+    # ages into the blackout window is left alone, not force-closed.
+    min_dte_stock_options: int = 2
+
     # ── Stage 6: Premium Validation ─────────────────────────────
     premium_atr_min_mult: float = 0.05      # premium too low relative to ATR (floor check)
     premium_move_max_mult: float = 0.55     # premium too high relative to Expected Move
@@ -1281,6 +1297,20 @@ def expiry_bucket(dte: int) -> str:
     if dte <= 10:
         return "6-10"
     return ">10"
+
+
+# [2026-08-25, SG request] Local index list — deliberately not imported
+# from utils.dore_options_scan/dore_fo_screener/fo_scan (which each keep
+# their own copy), to preserve this module's fully independent
+# dependency graph — see the module docstring. Index options (NIFTY/
+# SENSEX/BANKNIFTY) are cash-settled and don't carry the single-stock
+# T-1 execution restriction is_index_symbol() exists to route around
+# (see min_dte_stock_options below).
+_INDICES = ("NIFTY", "SENSEX", "BANKNIFTY")
+
+
+def is_index_symbol(symbol: str) -> bool:
+    return (symbol or "").strip().upper() in _INDICES
 
 
 def _base_capture_ratio(dte: int, settings: DoreOptionsSettings) -> float:
