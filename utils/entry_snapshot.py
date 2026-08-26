@@ -79,27 +79,47 @@ def build_live_scanner_entry_snapshot(scanner_row: dict, setup_id: str, symbol: 
 
     Field list matches DORE_LIVE_SCANNER_AUDIT.md P0 #2 "Live Scanner"
     capture list exactly.
+
+    [2026-08-26 field-name fix] Every lookup below except "ADX" was
+    reading a key that scanner_engine.py's scanner_row never actually
+    writes (e.g. "RS_Market"/"EMA_Slope"/"VolumeRatio") — this function
+    has been silently capturing ADX only (and mislabeling `direction`
+    off the Recommendation fallback) since it was written. Corrected to
+    the real scanner_row keys, preferring the CV1-native "_cv1_*"
+    sub-scores (same engine/instant as leadership/conviction/entry_quality
+    above) over any raw/legacy equivalent where both exist. Output dict
+    keys are UNCHANGED — this only fixes what each one reads from, so no
+    DB schema/migration is needed.
+
+    "setup_type" and "direction" have no real source anywhere in
+    scanner_row (no Long/Short field, no setup-type classification) —
+    left as "" here rather than silently mislabeled from Recommendation.
+    "momentum_score" also has no CV1-native equivalent (only the
+    separate Five Pillars "FP_Momentum"/"FP_RelMomentum", a different
+    scoring system) — left None rather than mixing systems; revisit if
+    a CV1 momentum sub-score gets added, or if pulling FP_Momentum in
+    here is actually wanted.
     """
     g = scanner_row.get
     return {
         "setup_id": setup_id,
         "symbol": symbol,
         "captured_at": _now_iso(),
-        "direction": str(g("Direction", g("Recommendation", "")) or ""),
-        "setup_type": str(g("SetupType", g("Setup_Type", "")) or ""),
+        "direction": "",     # [2026-08-26] no real source — see docstring; do not fall back to Recommendation
+        "setup_type": "",    # [2026-08-26] no real source — see docstring
 
         "leadership_score": _f(g("CV1_Leadership", g("Legacy_Leadership", g("DE_Leadership")))),
         "conviction_score": _f(g("CV1_Conviction", g("Legacy_Conviction", g("DE_Conviction")))),
         "entry_quality_score": _f(g("CV1_EntryQuality", g("Legacy_EntryQuality", g("DE_EntryQuality")))),
 
-        "trend_structure": str(g("TrendStructure", g("Structure", "")) or ""),
+        "trend_structure": str(g("_cv1_cv_structure", "") or ""),
         "adx": _f(g("ADX")),
-        "ema_slope": _f(g("EMA_Slope", g("EMASlope"))),
-        "rs_market": _f(g("RS_Market", g("RSMarket"))),
-        "rs_sector": _f(g("RS_Sector", g("RSSector"))),
-        "rs_momentum": _f(g("RS_Momentum", g("RSMomentum"))),
-        "volume_ratio": _f(g("VolumeRatio", g("RelVolume", g("Volume_Ratio")))),
-        "momentum_score": _f(g("Momentum", g("MomentumScore"))),
+        "ema_slope": _f(g("_cv1_ls_slope")),
+        "rs_market": _f(g("_cv1_ls_rs_market")),
+        "rs_sector": _f(g("_cv1_ls_rs_sector")),
+        "rs_momentum": _f(g("_cv1_ls_rs_momentum")),
+        "volume_ratio": _f(g("_vol_ratio")),
+        "momentum_score": None,  # [2026-08-26] no CV1-native source — see docstring
 
         "underlying_price": _f(g("EntryRef", g("Entry"))),
 
