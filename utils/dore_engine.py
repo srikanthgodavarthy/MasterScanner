@@ -2736,16 +2736,30 @@ def stage5b_strike_and_expiry(
     )
     is_weekly_underlying = inp.symbol.upper() in _WEEKLY_EXPIRY_SYMBOLS
     if is_weekly_underlying:
-        # Index weekly options: fetch_oi_resistance() genuinely offers a
-        # this-week-vs-next-week choice, so CURRENT_WEEK/NEXT_WEEK are
-        # both real, fetchable contracts.
-        if scalp_ok:
-            expiry = "CURRENT_WEEK"
-            reasons.append(f"{inp.days_to_expiry}d to expiry + strong Execution Score "
-                            f"({execution_score:.0f}) — current-week scalp justified")
-        else:
-            expiry = "NEXT_WEEK"
-            reasons.append(f"{inp.days_to_expiry}d to expiry — using next week to protect capital")
+        # [Fix, 2026-08-26, SG request] Indices always trade the
+        # current-week weekly contract — the CURRENT_WEEK/NEXT_WEEK
+        # scalp-to-protect-capital switch below was a stock-derived
+        # convention that doesn't apply to how indices are actually
+        # traded here. Previously, when `scalp_ok` was False (weak
+        # Execution Score and/or DTE past the scalp window), this
+        # branch would silently roll the recommendation to NEXT_WEEK
+        # — a genuinely different contract from the one on-screen —
+        # which is what produced an Entry/SL/Target premium that
+        # didn't correspond to the current-week contract being traded
+        # (see the 2026-08-26 strike_chain_next wiring fix above/in
+        # utils.market_intelligence — that fix made NEXT_WEEK price
+        # off the REAL next-week chain when chosen, but per SG,
+        # NEXT_WEEK should never be chosen for indices at all). Always
+        # CURRENT_WEEK now; `scalp_ok`/Execution Score still feed
+        # `reasons` for visibility, they just no longer change the
+        # expiry choice for index weeklies.
+        expiry = "CURRENT_WEEK"
+        reasons.append(
+            f"{inp.days_to_expiry}d to expiry — index weeklies always trade the current-week "
+            f"contract (Execution Score {execution_score:.0f}"
+            + (", scalp-qualified" if scalp_ok else ", not scalp-qualified — no effect on expiry choice")
+            + ")"
+        )
     else:
         # Individual-stock options (OPTSTK) are monthly-only on NSE.
         # fetch_stock_atm_option() only ever fetches the ONE nearest
@@ -3123,6 +3137,20 @@ def build_dore_input_for_index(
     iv_percentile: Optional[float] = None,
     event_risk_today: bool = False,
     option_intel: Optional[dict] = None,
+    atm_chain_row_next: Optional[dict] = None,   # [Fix, 2026-08-26, SG report]
+                                                  # see this param's docstring on
+                                                  # build_dore_input() — was never
+                                                  # threaded through this index
+                                                  # wrapper, so strike_chain_next
+                                                  # was always empty for every
+                                                  # index, unlike utils.fo_scan.py's
+                                                  # equivalent (fixed 2026-07-30).
+                                                  # A NEXT_WEEK recommendation for
+                                                  # an index was therefore pricing
+                                                  # off nothing real — see
+                                                  # compute_index_dore()'s matching
+                                                  # 2026-08-26 fix for where this
+                                                  # gets populated.
 ) -> Optional[DOREInput]:
     """Index-level convenience wrapper: derives Stage 1's Trend features
     from the index's own daily OHLCV via compute_trend_features(), then
@@ -3144,12 +3172,14 @@ def build_dore_input_for_index(
         iv_percentile=iv_percentile,
         event_risk_today=event_risk_today,
         option_intel=option_intel,
+        atm_chain_row_next=atm_chain_row_next,
     )
 
 
 def compute_index_dore(index_key: str, ohlcv, oi: dict, ce_pe_chg: tuple,
                         dore_cfg: "DORESettings", avail_capital: float,
-                        lot_sizes: dict, existing_positions) -> Optional[dict]:
+                        lot_sizes: dict, existing_positions,
+                        oi_next: Optional[dict] = None) -> Optional[dict]:
     """Full index-level DORE 2.0 read (Stage 1-5 + position sizing) for
     one of NIFTY / SENSEX / BANKNIFTY, as a JSON-safe dict.
 
@@ -3163,6 +3193,21 @@ def compute_index_dore(index_key: str, ohlcv, oi: dict, ce_pe_chg: tuple,
     consume this and slot the dict into their own index_cards payload.
     Returns None (non-fatal, logged) on any failure — same fail-soft
     contract the old _index_dore had.
+
+    oi_next : [Fix, 2026-08-26, SG report] optional — the SECOND-nearest
+        weekly expiry's fetch_oi_resistance() read (same shape as `oi`),
+        i.e. utils.upstox_client.fetch_oi_resistance(index_key,
+        expiry_date=fetch_next_expiry(index_key)). Without this, a
+        NEXT_WEEK recommendation (stage5b_strike_and_expiry's capital-
+        protection branch, which routinely fires for index weeklies
+        near expiry) had strike_chain_next permanently empty and priced
+        off nothing real — confirmed live on SENSEX (Entry premium
+        showing well below the current week's own intraday low).
+        utils.fo_scan.py's parallel pipeline fixed this same gap on
+        2026-07-30 (see fetch_oi_resistance()'s docstring); this port
+        brings the Market Intelligence index-card path in line with it.
+        Omitting `oi_next` degrades gracefully — strike_chain_next is
+        simply empty again, exactly the pre-fix behavior — never fatal.
     """
     try:
         from utils.dore_fo_screener import execution_features_from_intraday_5m
@@ -3192,8 +3237,15 @@ def compute_index_dore(index_key: str, ohlcv, oi: dict, ce_pe_chg: tuple,
             "ce_oi_change": ce_chg, "pe_oi_change": pe_chg,
             "pcr": oi.get("pcr", 1.0), "expiry": oi.get("expiry", ""),
         }
+        # [Fix, 2026-08-26] Same shape as atm_chain_row, but sourced from
+        # the SECOND-nearest weekly chain — only strike_premiums is
+        # actually consumed downstream (build_dore_input's
+        # atm_chain_row_next -> DOREInput.strike_chain_next), so nothing
+        # else needs deriving here.
+        atm_chain_row_next = {"strike_premiums": (oi_next or {}).get("strike_premiums") or {}}
         dore_input = build_dore_input_for_index(
             index_key, ohlcv, oi, atm_chain_row=atm_chain_row, execution_features=exec_features,
+            atm_chain_row_next=atm_chain_row_next,
         )
         if not dore_input:
             return None
