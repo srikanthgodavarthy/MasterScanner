@@ -460,6 +460,7 @@ def top_dore_trade_plans(
             logger.exception("[dore_options_scan] %s failed — skipping this cycle", symbol)
             rejections.append(DoreRejection(symbol, "Exception", "Unhandled error — see logs"))
 
+    _plans_before_indices = len(plans)
     for symbol in index_symbols:
         try:
             opt = fetch_oi_resistance(symbol) or None
@@ -467,6 +468,34 @@ def top_dore_trade_plans(
         except Exception:
             logger.exception("[dore_options_scan] %s (index) failed — skipping this cycle", symbol)
             rejections.append(DoreRejection(symbol, "Exception", "Unhandled error — see logs"))
+
+    # [Diagnostic, 2026-08-26, SG report — SENSEX missing from DORE
+    # output despite reaching this pipeline] _process() success/reject
+    # is otherwise completely silent for indices (only exceptions are
+    # logged above) — no way to tell from logs alone whether an index
+    # produced a plan that then got filtered OUT downstream by pages/
+    # scanner.py's `confidence_score >= 70` display cutoff (silently,
+    # via pd.to_numeric's errors="coerce" -> NaN -> NaN>=70 is False if
+    # confidence_score came back missing/non-numeric) versus never
+    # producing a plan at all. Logs every index's outcome explicitly:
+    # confidence_score if a plan was produced, or which DoreRejection
+    # reason if not — so the *next* cycle's log settles this instead of
+    # guessing from silence.
+    _index_plans = plans[_plans_before_indices:]
+    _index_plan_symbols = {p.symbol for p in _index_plans}
+    for _idx_sym in index_symbols:
+        _plan = next((p for p in _index_plans if p.symbol == _idx_sym), None)
+        if _plan is not None:
+            logger.info(
+                "[dore_options_scan] index outcome: %s -> PLAN produced, confidence_score=%r",
+                _idx_sym, getattr(_plan, "confidence_score", None),
+            )
+        else:
+            _rej = next((r for r in rejections if r.symbol == _idx_sym), None)
+            logger.info(
+                "[dore_options_scan] index outcome: %s -> NO PLAN, reason=%r",
+                _idx_sym, (_rej.reason if _rej else "unknown — not in rejections list either"),
+            )
 
     ranked = rank_recommendations(plans)
 
