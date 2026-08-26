@@ -69,6 +69,86 @@ logger = logging.getLogger(__name__)
 _INDICES = ("NIFTY", "SENSEX", "BANKNIFTY")
 
 
+def _build_index_scan_rows(settings: Optional[dict] = None) -> dict:
+    """[Fix, 2026-08-26, SG report] NIFTY/SENSEX/BANKNIFTY were never
+    reaching this pipeline at all: `live_pool` is seeded from the
+    "live_scanner" snapshot, and utils.scanner_engine's own scan
+    universe (NIFTY500_SYMBOLS) is a pure equity list — indices are
+    only ever touched there as regime/context inputs (fetch_index_
+    quote / fetch_index_ohlcv_upstox for the dashboard cards and the
+    Nifty-regime classifier), never as scannable symbols in their own
+    right. So `index_symbols = [s for s in live_pool if s in
+    _INDICES]` further down in this module was silently empty every
+    cycle — not rejected, never even attempted, and neither a plan
+    nor a DoreRejection ever got produced or persisted for them. (A
+    2026-08-20 comment in utils.dore_options_engine describing
+    NIFTY/SENSEX/BANKNIFTY NoLiquidity rejections "confirmed via Neon,
+    every cycle" reflects an earlier state of the world, before the
+    live_scanner universe was narrowed to equities-only — that path
+    has been silently dead since.)
+
+    This builds one real scan row per index by running the SAME
+    scorer real stocks go through — utils.scanner_engine.score_stock()
+    — against each index's own daily OHLCV (utils.scanner_engine.
+    fetch_nifty_ohlcv/fetch_sensex_ohlcv/fetch_banknifty_ohlcv, source=
+    "upstox", same provider the rest of DORE already uses), benchmarked
+    against the Nifty close series exactly as run_scanner() does for
+    every stock. score_stock() needs >=210 daily bars; period="1y" is
+    already what run_scanner() requests for stocks, kept identical here
+    so index rows carry genuinely comparable Conviction/EntryQuality/
+    TrendPhase fields instead of synthetic placeholders.
+
+    Returns {symbol: row} for whichever indices scored successfully —
+    never raises; a single index's OHLCV/scoring failure is logged and
+    that index is simply omitted this cycle (fail-soft, matching every
+    other per-symbol failure path in this module).
+    """
+    from utils.scanner_engine import (
+        fetch_nifty, fetch_nifty_ohlcv, fetch_sensex_ohlcv,
+        fetch_banknifty_ohlcv, score_stock,
+    )
+
+    rows: dict = {}
+    try:
+        nifty_series = fetch_nifty(period="1y", source="upstox")
+    except Exception:
+        logger.exception("[dore_options_scan] index scan rows: fetch_nifty benchmark failed — "
+                          "skipping index injection this cycle")
+        return rows
+    if nifty_series is None or nifty_series.empty:
+        logger.warning("[dore_options_scan] index scan rows: empty Nifty benchmark series — "
+                        "skipping index injection this cycle")
+        return rows
+
+    _fetchers = {
+        "NIFTY": lambda: fetch_nifty_ohlcv(period="1y", source="upstox"),
+        "SENSEX": lambda: fetch_sensex_ohlcv(period="1y", source="upstox"),
+        "BANKNIFTY": lambda: fetch_banknifty_ohlcv(period="1y", source="upstox"),
+    }
+    for idx, fetch_fn in _fetchers.items():
+        try:
+            df = fetch_fn()
+            if df is None or df.empty:
+                logger.warning("[dore_options_scan] index scan rows: %s OHLCV fetch "
+                                "returned empty — skipping this cycle", idx)
+                continue
+            row = score_stock(df, nifty_series, settings=settings, symbol=idx)
+            if not row:
+                logger.warning("[dore_options_scan] index scan rows: score_stock produced "
+                                "nothing for %s (likely <210 bars) — skipping this cycle", idx)
+                continue
+            row["Stock"] = idx
+            rows[idx] = row
+        except Exception:
+            logger.exception("[dore_options_scan] index scan rows: scoring failed for %s — "
+                              "skipping this cycle", idx)
+
+    if rows:
+        logger.info("[dore_options_scan] index scan rows: built %d/%d index rows (%s)",
+                    len(rows), len(_fetchers), ", ".join(sorted(rows)))
+    return rows
+
+
 # ══════════════════════════════════════════════════════════════════
 #  Small local helpers (kept local, not imported from utils.dore_engine,
 #  to keep this engine's dependency graph fully independent — see the
@@ -432,6 +512,31 @@ def compute_dore_technical_plans(cfg: Optional[DoreOptionsSettings] = None,
         live_pool = {r.get("Stock") or r.get("Symbol"): r for r in records if (r.get("Stock") or r.get("Symbol"))}
     else:
         live_pool = dict(live_pool)
+
+    # [Fix, 2026-08-26, SG report] Inject NIFTY/SENSEX/BANKNIFTY rows
+    # directly — see _build_index_scan_rows()'s docstring for why they
+    # are never present in `live_pool` on either path above (neither
+    # the live_scanner snapshot nor scheduler/scan_worker.py's
+    # F&O-eligible batch ever contains them; scanner_engine's own scan
+    # universe is equities-only). Only fills in indices actually
+    # missing from live_pool this cycle — never overwrites a caller-
+    # supplied index row if one is ever present.
+    _missing_indices = [s for s in _INDICES if s not in live_pool]
+    if _missing_indices:
+        try:
+            # score_stock()'s `settings` expects the Scanner's OWN
+            # settings dict (pages/settings.py -> ScoringParams.
+            # from_settings) — NOT `cfg` (DoreOptionsSettings, a
+            # different/incompatible shape used only by DORE's options
+            # engine below). Deliberately omitted here: score_stock()
+            # falls back to its legacy-kwarg defaults, the exact same
+            # defaults run_scanner() itself falls back to when no UI
+            # settings dict has been saved yet.
+            index_rows = _build_index_scan_rows()
+            for sym, row in index_rows.items():
+                live_pool[sym] = row
+        except Exception:
+            logger.exception("[dore_options_scan] index row injection failed this cycle (non-fatal)")
 
     # [2026-08-03, SG request] DORE only trades options, so it should
     # only ever rank/shortlist the subset of live_scanner's ~500-symbol
