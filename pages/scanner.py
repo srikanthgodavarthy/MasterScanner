@@ -4674,8 +4674,24 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
                         )
                     with _etgl2:
                         show_skip = st.checkbox("Show SKIP candidates", value=show_skip, key="chk_show_skip")
-                    if summary.get("regime") != "TREND":
-                        st.info(f"Execute gate restricted — market regime is {summary.get('regime', '?')}.")
+                    # [2026-08-28 fix] `summary` (st.session_state["scan_summary"])
+                    # is only ever populated by a manual "Run Scan" click in
+                    # THIS session (see render() above) — the DB-load path
+                    # deliberately leaves it as {} (see that path's own
+                    # 2026-08-24 comment), since the persisted live_scanner
+                    # snapshot only carries `data`, not `summary`/regime_ctx.
+                    # That comment claimed an empty summary "just skips the
+                    # regime-gate info banner" — it didn't: summary.get(
+                    # "regime") is None when empty, and None != "TREND" is
+                    # True, so this unconditionally fell into the "restricted"
+                    # branch and rendered "market regime is ?." even when we
+                    # have no idea what the regime actually is (e.g. right
+                    # after opening the app, before ever clicking Run Scan).
+                    # `if summary and ...` actually skips it in that case,
+                    # falling through to the plain "no candidates" message —
+                    # matching what was already intended/documented.
+                    if summary and summary.get("regime") != "TREND":
+                        st.info(f"Execute gate restricted — market regime is {summary['regime']}.")
                     else:
                         st.info(f"No {sc_label} candidates in this scan.")
                 else:
