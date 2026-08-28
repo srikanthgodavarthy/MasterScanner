@@ -348,40 +348,32 @@ def should_scheduler_run() -> bool:
     [2026-08-07] Market-hours gate: on top of the LIVE/BACKTEST/
     MAINTENANCE mode check, LIVE mode itself now also requires the NSE
     session to be open (utils.time_utils.is_market_hours_ist(), 09:15-
-    15:30 IST +/- buffer, Mon-Fri). Added because every scan loop in
-    scheduler/scan_worker.py (market_intelligence/fo_scan/
-    dore_live_state every 30-60s, live_scanner every 5min) was running
-    this same 24/7 regardless of market hours, keeping the Neon compute
-    endpoint permanently active and burning free-tier CU-hrs nights and
-    weekends for zero new data.
+    15:30 IST +/- buffer, Mon-Fri).
 
-    [2026-08-21] The gate on/off flag is now DB-backed (system_state.
-    market_hours_gate_enabled) instead of env-var-only, so it can be
-    flipped from the Settings page's System tab ("Restrict scanning to
-    market hours") without a redeploy — every process polling this
-    function (scheduler/scan_worker.py, utils.inprocess_scheduler)
-    picks up the change on its next cycle-boundary check. The
-    MARKET_HOURS_GATE_ENABLED env var still works as a hard override
-    for ops (e.g. an emergency "stop burning CU-hrs" knob that doesn't
-    depend on Neon/the app being reachable): explicit "0" forces the
-    gate OFF and explicit "1" forces it ON, regardless of what's
-    stored in the DB; leave it unset (the default) to let the Settings-
-    page toggle control it.
+    [2026-08-21 / 2026-08-26] The gate flag became DB-backed, then got a
+    process-wide 540s cache (_STATE_CACHE) once 5 independent loop
+    threads uncached-polling it turned out to keep Neon's compute
+    permanently active nights/weekends (see _STATE_CACHE's comment).
+
+    [2026-08-27] That cache still meant one real Neon query roughly
+    every 9 minutes, 24/7. This is the "stop completely outside market
+    hours" version: is_market_hours_ist() is checked FIRST, using only
+    the free, long-TTL-cached gate flag (_resolve_gate_enabled_cheap())
+    — no `system_state` row read at all. If the gate is on and we're
+    outside market hours, the answer is unconditionally False regardless
+    of mode/heartbeat/manual_override (a BACKTEST or MAINTENANCE lock
+    doesn't change whether live scanning should run outside market
+    hours), so there is nothing further worth reading from Neon on this
+    path. The `system_state` row (and its own 540s cache) is only
+    touched when the gate is off, or we're actually inside market hours
+    — i.e. only when a real decision needs real state.
     """
-    state = get_system_state()
-
-    env_override = os.environ.get("MARKET_HOURS_GATE_ENABLED")
-    if env_override == "0":
-        gate_enabled = False
-    elif env_override == "1":
-        gate_enabled = True
-    else:
-        gate_enabled = bool(state.get("market_hours_gate_enabled", True))
-
-    if gate_enabled:
+    if _resolve_gate_enabled_cheap():
         from utils.time_utils import is_market_hours_ist
         if not is_market_hours_ist():
             return False
+
+    state = get_system_state()
 
     if state["mode"] == "LIVE":
         return True
@@ -415,12 +407,81 @@ def manual_override_active(section: str) -> bool:
 
 # ─── READ/WRITE: market-hours gate toggle ──────────────────────────────
 
+# [2026-08-27] Second, longer-lived cache — deliberately separate from
+# _STATE_CACHE above. The 540s cache got should_scheduler_run() down to
+# one shared Neon query per ~9 minutes while paused, which is good but
+# isn't "stop completely" — it still queries on every cache expiry, 24/7,
+# gate on or off. But look at what should_scheduler_run() actually does
+# with the row once it has it: when the gate is ON and we're outside
+# market hours, the answer is False no matter what mode/heartbeat/
+# manual_override say — a BACKTEST or MAINTENANCE lock doesn't change
+# whether live scanning should be off outside market hours anyway. So on
+# that path, `system_state` doesn't need to be read AT ALL: the only two
+# facts that matter are is_market_hours_ist() (pure wall-clock, zero I/O)
+# and market_hours_gate_enabled — and that flag only changes when someone
+# flips the Settings-page checkbox, which happens in-process and can
+# invalidate this cache directly (_invalidate_gate_cache(), called from
+# set_market_hours_gate_enabled() below) instead of needing to be
+# re-polled. A generous TTL is kept as a fallback only, to eventually
+# notice an out-of-band change (e.g. a direct SQL edit from outside this
+# app) without needing a restart.
+_GATE_CACHE_LOCK = threading.Lock()
+_GATE_ENABLED_CACHE: Optional[bool] = None
+_GATE_ENABLED_CACHE_AT: float = 0.0
+_GATE_ENABLED_CACHE_TTL_SECS = 6 * 3600  # 6h fallback refresh; see comment above
+
+
+def _invalidate_gate_cache() -> None:
+    global _GATE_ENABLED_CACHE, _GATE_ENABLED_CACHE_AT
+    with _GATE_CACHE_LOCK:
+        _GATE_ENABLED_CACHE = None
+        _GATE_ENABLED_CACHE_AT = 0.0
+
+
+def _resolve_gate_enabled_cheap() -> bool:
+    """
+    Resolve market_hours_gate_enabled, avoiding a Neon read whenever
+    possible. Used only by should_scheduler_run()'s hot path — anything
+    that needs a guaranteed-fresh value (e.g. the Settings page itself
+    rendering the checkbox) should keep using get_market_hours_gate_enabled()
+    below instead, which always reflects the current process's own last
+    write/read.
+    """
+    env_override = os.environ.get("MARKET_HOURS_GATE_ENABLED")
+    if env_override == "0":
+        return False
+    if env_override == "1":
+        return True
+
+    global _GATE_ENABLED_CACHE, _GATE_ENABLED_CACHE_AT
+    with _GATE_CACHE_LOCK:
+        if _GATE_ENABLED_CACHE is not None and (time.time() - _GATE_ENABLED_CACHE_AT) < _GATE_ENABLED_CACHE_TTL_SECS:
+            return _GATE_ENABLED_CACHE
+
+    # Cache miss — this process's first call ever, or the rare 6h
+    # fallback refresh. This is the one Neon read this whole design still
+    # allows while paused, and it happens at most once per 6h (or once
+    # per process start, whichever is more frequent — i.e. every reboot).
+    state = get_system_state()
+    value = bool(state.get("market_hours_gate_enabled", True))
+    with _GATE_CACHE_LOCK:
+        _GATE_ENABLED_CACHE = value
+        _GATE_ENABLED_CACHE_AT = time.time()
+    return value
+
+
 def get_market_hours_gate_enabled() -> bool:
     """
     True (the default) means the scheduler loops only run during NSE
     market hours (see should_scheduler_run()). False means they run
     24/7, including pre-/post-market and weekends. Backs the Settings
     page's System tab ("Restrict scanning to market hours") checkbox.
+
+    Deliberately always reads through get_system_state() (the 540s
+    cache), NOT the longer-lived gate-only cache used internally by
+    should_scheduler_run() — this is what renders the actual checkbox
+    state, so it should track a same-process write within seconds, not
+    hours.
 
     Fails open to True (restricted) if Neon is unreachable — the
     cheaper/safer default, same reasoning as get_system_state().
@@ -452,6 +513,7 @@ def set_market_hours_gate_enabled(enabled: bool) -> None:
             (bool(enabled), _now().isoformat()),
         )
         _invalidate_state_cache()
+        _invalidate_gate_cache()
     except Exception as exc:
         if "market_hours_gate_enabled" in str(exc) and "column" in str(exc).lower():
             # Column doesn't exist yet on this deployment — the
