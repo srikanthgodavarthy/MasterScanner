@@ -2416,10 +2416,11 @@ def score_stock(
 _BATCH_SIZE = 150
 
 
-def _missing_today_bar(data: dict, symbols) -> tuple:
+def _missing_today_bar(data: dict, symbols, source: str = "yfinance",
+                        max_live_age_seconds: float | None = 90.0) -> tuple:
     """
     Single authoritative definition of "does this symbol's cached history
-    already include a bar dated today". This used to be inlined inside
+    need a live price fetch right now". This used to be inlined inside
     run_scanner() as a one-off list comprehension; pulled out so that
     history_store.update_live_cache() (which needs to know exactly which
     symbols were live-patched, to scope its background parquet flush) can
@@ -2429,13 +2430,46 @@ def _missing_today_bar(data: dict, symbols) -> tuple:
     EOD history need a NETWORK re-fetch, e.g. due to age or a corporate
     action) — that one is owned entirely by history_store.py and is
     untouched by this function.
+
+    Two symbols are flagged:
+      1. No bar dated today at all (never live-patched this session) —
+         the original check.
+      2. [CMP/LTP staleness fix] A bar dated today EXISTS, but it was
+         live-patched more than `max_live_age_seconds` ago. Without this,
+         once a symbol got its first live-patched bar of the day, its
+         index date == today forever after, so this function stopped
+         selecting it for every later scan cycle — CMP/LTP froze at
+         whatever price came in on that first patch (often right at
+         market open) instead of refreshing every cycle. Set
+         max_live_age_seconds=None to disable this check and restore the
+         old date-only behavior.
     """
     from datetime import date as _date
     today = pd.Timestamp(_date.today())
-    return tuple(
-        sym for sym in symbols
-        if sym in data and data[sym].index[-1].normalize() < today
+
+    has_today = [sym for sym in symbols if sym in data]
+    missing = tuple(
+        sym for sym in has_today if data[sym].index[-1].normalize() < today
     )
+
+    if max_live_age_seconds is None:
+        return missing
+
+    # Only symbols that DO have today's bar are candidates for the
+    # staleness check — symbols already in `missing` are covered above.
+    has_today_bar = [
+        sym for sym in has_today if data[sym].index[-1].normalize() == today
+    ]
+    if not has_today_bar:
+        return missing
+
+    from utils.history_store import get_live_fetch_age
+    ages = get_live_fetch_age(source, has_today_bar)
+    stale = tuple(
+        sym for sym in has_today_bar
+        if sym not in ages or ages[sym] > max_live_age_seconds
+    )
+    return tuple(dict.fromkeys(missing + stale))
 
 
 def run_scanner(
@@ -2539,7 +2573,7 @@ def run_scanner(
     # FIX: only call _fetch_live_prices when today's bar is missing from the
     # batch download (avoids a duplicate 500-symbol yf.download on most runs).
     try:
-        stale_syms = _missing_today_bar(all_data, symbols)
+        stale_syms = _missing_today_bar(all_data, symbols, source=fetch_source)
         if stale_syms:
             if use_upstox:
                 from utils.upstox_client import fetch_batch_today_ohlc_upstox

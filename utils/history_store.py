@@ -707,6 +707,32 @@ def get_history(
 # scanner_engine.py, which already has that logic).
 _live_cache: dict = {}   # {source: {"data": {symbol: DataFrame}, "loaded_date": date}}
 _LIVE_CACHE_LOCK = threading.Lock()
+
+# [Live-price staleness fix] Today's-bar presence (checked via
+# get_live_history_cached's "loaded_date"/index-date logic) only tells you
+# a symbol has SOME bar dated today — not when that bar's price was last
+# actually refreshed from a live quote. Once a symbol got its first
+# live-patched bar of the day, scanner_engine._missing_today_bar() stopped
+# re-selecting it for the rest of the session, so CMP/LTP froze at
+# whatever price came in on that first patch (e.g. near market open).
+# This tracks a wall-clock timestamp per (source, symbol) for the last
+# time update_live_cache() actually wrote a live-patched bar, so staleness
+# can be judged by "how long ago" instead of just "is there a bar for
+# today at all".
+_live_fetch_ts: dict = {}   # {source: {symbol: epoch_seconds}}
+
+
+def get_live_fetch_age(source: str, symbols) -> dict:
+    """
+    Returns {symbol: seconds_since_last_live_patch} for symbols that have
+    been live-patched at least once this process. A symbol absent from
+    the result has never been live-patched (still needs an initial fetch,
+    handled the existing way via the today's-bar-missing check).
+    """
+    now = time.time()
+    with _LIVE_CACHE_LOCK:
+        ts_map = _live_fetch_ts.get(source, {})
+        return {s: now - ts_map[s] for s in symbols if s in ts_map}
 _flush_executor = _BoundedThreadPoolExecutor(
     max_workers=2, max_queue=20, thread_name_prefix="history-flush",
 )   # [Architecture review H2 fix] max_queue=20 ~= 2 full live_scanner
@@ -895,6 +921,21 @@ def update_live_cache(source: str, patched: dict, dirty_symbols) -> None:
     dirty = set(dirty_symbols) & set(patched.keys())
     if not dirty:
         return
+
+    # Stamp every symbol whose bar actually changed this call — this is
+    # what get_live_fetch_age() reads to judge staleness by elapsed time
+    # instead of by calendar date. Reset alongside the RAM cache's own
+    # daily rollover so a new day starts with a clean slate.
+    # Stale timestamps from a prior day are harmless: a symbol without
+    # today's bar yet is still caught by _missing_today_bar()'s date
+    # check before get_live_fetch_age() is ever consulted for it, so an
+    # old timestamp just gets overwritten on that symbol's first patch
+    # of the new day — no explicit reset needed here.
+    now = time.time()
+    with _LIVE_CACHE_LOCK:
+        ts_map = _live_fetch_ts.setdefault(source, {})
+        for sym in dirty:
+            ts_map[sym] = now
 
     def _flush():
         for sym in dirty:
