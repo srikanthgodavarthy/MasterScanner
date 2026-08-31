@@ -14,6 +14,7 @@ import streamlit as st
 import requests
 import io
 import logging
+from dataclasses import replace as _dataclass_replace
 import time
 import random
 import threading
@@ -1566,32 +1567,59 @@ def score_stock(
         scan, not per symbol) since score_stock() has no access to the
         full scan universe's history.
     """
-    if df.empty or len(df) < 210:
-        # [2026-08-25 diagnostic] Previously silent — this is a STRICTER
-        # gate than get_live_history_cached's own min_bars=60 filter
-        # (utils/history_store.py), so a symbol can pass the fetch stage
-        # with 60-209 bars and still vanish here with zero log trace,
-        # right before merging into the Live Scanner / NSE Top Gainers
-        # snapshot. Logging by symbol (when known) is what makes that
-        # case distinguishable from "no OHLCV fetched at all".
-        #
-        # [2026-08-25 fix] Deliberately calling logging.getLogger(__name__)
-        # here instead of using the module-level `_log` name directly —
-        # this function has two `import logging as _log` statements
-        # further down (decision-engine / pillar-engine failure handlers),
-        # and Python's function-wide static scoping means ANY assignment
-        # to `_log` anywhere in this function body — even one that
-        # executes later, on a different code path — makes `_log` a
-        # local variable for the ENTIRE function, including this earlier
-        # reference. That shadowing caused an UnboundLocalError in
-        # production the first time this branch actually fired (symbol:
-        # MEESHO). getLogger(__name__) returns the exact same logger
-        # `_log` refers to at module scope, without touching that name.
-        logging.getLogger(__name__).warning(
-            "score_stock: dropping %s — only %d bar(s) of history (need >= 210)",
-            symbol or "<unknown symbol>", len(df),
+    # Full-history gate — EMA200 (the default slow EMA that trend
+    # structure/ema_alignment/ema20_pct_dist etc. all derive from) needs
+    # roughly 200 bars to stabilize; 210 keeps a small buffer.
+    _FULL_HISTORY_MIN_BARS = 210
+
+    # [Recent-listing fallback, 2026-08-31] A symbol below the full-history
+    # gate but at least this many bars gets scored anyway, with a slow EMA
+    # SCALED DOWN to fit its actual history instead of a real EMA200 —
+    # rather than being dropped outright until it accumulates ~10 months
+    # of trading days (210 bars). Below this floor, even a scaled EMA is
+    # too short-window/noisy to call a trend read at all, so those still
+    # drop exactly as before. Recently-listed names (IPOs) are the
+    # motivating case (e.g. GROWW/EMMVEE/LENSKART/MEESHO/PINELABS as of
+    # 2026-08 — all had 175-205 bars, just under the 210 gate).
+    _RECENT_LISTING_MIN_BARS   = 70
+    _RECENT_LISTING_EMA_BUFFER = 10   # same buffer ratio as the 200/210 gate
+
+    is_recent_listing = False
+    if df.empty or len(df) < _FULL_HISTORY_MIN_BARS:
+        if df.empty or len(df) < _RECENT_LISTING_MIN_BARS:
+            # [2026-08-25 diagnostic] Previously silent — this is a STRICTER
+            # gate than get_live_history_cached's own min_bars=60 filter
+            # (utils/history_store.py), so a symbol can pass the fetch stage
+            # with 60-209 bars and still vanish here with zero log trace,
+            # right before merging into the Live Scanner / NSE Top Gainers
+            # snapshot. Logging by symbol (when known) is what makes that
+            # case distinguishable from "no OHLCV fetched at all".
+            #
+            # [2026-08-25 fix] Deliberately calling logging.getLogger(__name__)
+            # here instead of using the module-level `_log` name directly —
+            # this function has two `import logging as _log` statements
+            # further down (decision-engine / pillar-engine failure handlers),
+            # and Python's function-wide static scoping means ANY assignment
+            # to `_log` anywhere in this function body — even one that
+            # executes later, on a different code path — makes `_log` a
+            # local variable for the ENTIRE function, including this earlier
+            # reference. That shadowing caused an UnboundLocalError in
+            # production the first time this branch actually fired (symbol:
+            # MEESHO). getLogger(__name__) returns the exact same logger
+            # `_log` refers to at module scope, without touching that name.
+            logging.getLogger(__name__).warning(
+                "score_stock: dropping %s — only %d bar(s) of history "
+                "(need >= %d, or >= %d for a reduced-history read)",
+                symbol or "<unknown symbol>", len(df),
+                _FULL_HISTORY_MIN_BARS, _RECENT_LISTING_MIN_BARS,
+            )
+            return {}
+        is_recent_listing = True
+        logging.getLogger(__name__).info(
+            "score_stock: scoring %s with a reduced-history read — %d bar(s) "
+            "(< %d full-history gate) — slow EMA scaled down accordingly",
+            symbol or "<unknown symbol>", len(df), _FULL_HISTORY_MIN_BARS,
         )
-        return {}
 
     from utils.scoring_core import ScoringParams, build_indicators, compute_bar, leadership_prescreen
 
@@ -1601,6 +1629,18 @@ def score_stock(
         params = ScoringParams(
             cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
             pvt_lb=pvt_lb, atr_prox=atr_prox,
+        )
+
+    if is_recent_listing:
+        # Scale the slow EMA down to fit the available history, keeping
+        # the same buffer ratio the full-history gate uses (e.g. 150 bars
+        # -> ema_slow_period=140). Fast/mid EMAs (20/50 by default) are
+        # left untouched since they're already well inside the available
+        # window at the 70-bar floor. Never scales UP past whatever
+        # ema_slow_period the caller/settings already specified.
+        _scaled_slow = max(60, len(df) - _RECENT_LISTING_EMA_BUFFER)
+        params = _dataclass_replace(
+            params, ema_slow_period=min(params.ema_slow_period, _scaled_slow)
         )
 
     # Staged elimination, stage 1: cheap Leadership-only check BEFORE the
@@ -2405,6 +2445,12 @@ def score_stock(
         result["Primary Blocker"] = blocker if category not in ("Elite Opportunity", "High Conviction", "Actionable") else ""
     except Exception:
         pass
+
+    # [Recent-listing fallback, 2026-08-31] Surface the reduced-history
+    # read so downstream UI (Live Scanner / Dashboard) can flag it rather
+    # than presenting it with the same confidence as a symbol scored
+    # against a real EMA200 — see the ema_slow_period scaling above.
+    result["reduced_history"] = is_recent_listing
 
     return result
 
