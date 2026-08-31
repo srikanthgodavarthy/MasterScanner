@@ -2723,6 +2723,34 @@ def run_scanner(
             "values elsewhere are unaffected): %s",
             len(pending), _SCORE_WAIT_TIMEOUT_S, cancelled, running, stuck,
         )
+        # [2026-08-31, root-cause diagnostic] The `running` count above
+        # only ever told us THAT a thread was stuck, never WHERE. Every
+        # explanation ruled out by static reading (network calls, sleeps,
+        # infinite loops, JIT compile locks — see commit message) leaves
+        # a genuine hang as the remaining possibility, and a genuine hang
+        # in this persistent, never-recreated pool (_scorer_pools —
+        # see _get_scorer_pool() above) doesn't just cost this run: it
+        # permanently consumes one worker slot for the rest of the
+        # process's life, since a RUNNING future can never be
+        # force-cancelled. That's the actual mechanism worth confirming —
+        # dumping every scorer-pool thread's current Python stack frame
+        # the moment this fires turns "some symbol hung, no idea why"
+        # into an exact file/line the next time this warning appears,
+        # instead of another round of static guessing.
+        if running:
+            import sys as _sys
+            import traceback as _tb
+            _frames = _sys._current_frames()
+            _live_threads = {t.ident: t.name for t in threading.enumerate()}
+            for _tid, _frame in _frames.items():
+                _tname = _live_threads.get(_tid, "")
+                if _tname.startswith("scorer-pool-"):
+                    _stack = "".join(_tb.format_stack(_frame))
+                    _log.warning(
+                        "scanner_engine: stuck-thread stack dump for %s (thread id %s) — "
+                        "this is WHERE that worker slot is permanently pinned, not just "
+                        "that it is:\n%s", _tname, _tid, _stack,
+                    )
 
     # [2026-08-25 diagnostic] Single authoritative "who's missing this
     # batch" summary — every prior log line above (extraction failures,
