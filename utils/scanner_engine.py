@@ -2179,6 +2179,10 @@ def score_stock(
 
         final_rank = max(base_rank, natural_rank, promo_rank)
         final_tier = _LADDER[final_rank]
+        _pre_structural_gate_tier = final_tier   # [fast-winner audit fix] captured
+        # BEFORE apply_smc_structural_gate() so the Primary Blocker text below
+        # can tell a causal downgrade apart from a no-op cap — see that block's
+        # comment for why this matters.
 
         # ── SMC STRUCTURAL GATE [2026-08-15 SG request] ──────────────
         # Applied HERE — after natural/promo are already folded into
@@ -2435,9 +2439,23 @@ def score_stock(
         # SMC_Structural_State/_Reason were computed and written to the
         # row but never surfaced anywhere in the UI — a trader could see
         # a Watch-capped stock with zero explanation.
+        #
+        # [Fix, fast-winner audit] The check below used to be purely
+        # "state != VALID_ENTRY_ZONE", which prepends the SMC reason even
+        # when apply_smc_structural_gate()'s cap was a no-op (e.g. the row
+        # was already Skip from the Leadership/Conviction AND-gate, and a
+        # CONFLICT cap to "Watch" can't lower it any further). That made
+        # SMC look like a co-equal rejection cause on rows where it never
+        # actually changed the outcome. Now only fires when the gate
+        # provably changed the tier (_pre_structural_gate_tier vs. the
+        # post-gate rank actually written to Recommendation) — see the
+        # scanner audit ("Primary Blocker labeling bug") for the analysis.
         _smc_state = result.get("SMC_Structural_State")
         _smc_reason = result.get("SMC_Structural_Reason")
-        if _smc_state and _smc_state != "VALID_ENTRY_ZONE":
+        _post_gate_rank = RECOMMENDATION_RANK.get(result.get("Recommendation"), 0)
+        _pre_gate_rank = RECOMMENDATION_RANK.get(_pre_structural_gate_tier, 0)
+        _gate_was_causal = _post_gate_rank < _pre_gate_rank
+        if _smc_state and _smc_state != "VALID_ENTRY_ZONE" and _gate_was_causal:
             _smc_text = f"SMC {_smc_state.replace('_', ' ').title()}"
             if _smc_reason:
                 _smc_text += f" ({_smc_reason.replace('_', ' ')})"
