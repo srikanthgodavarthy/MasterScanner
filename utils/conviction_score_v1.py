@@ -1135,6 +1135,70 @@ def classify_tier_v3(leadership: int, conviction: int, entry_quality: int,
     return "Skip"
 
 
+# [Fast-winner audit, 2026-09-01] Watch's Leadership floor when
+# utils.scoring_core.has_early_momentum_signal() fires — i.e. a fresh
+# breakout/reversal is confirmed by REAL evidence (fresh_base_breakout /
+# compression_break, or trend_up + volume + improving RS) even though
+# _leadership()'s medium-term RS/trend read hasn't caught up yet. NOT
+# backtest-validated — same status as the Developing-tier floors above
+# when they were first added; needs a live-shadow validation pass (see
+# classify_tier_v3_shadow_early_momentum()'s docstring) before promotion.
+V3_WATCH_LEADERSHIP_MIN_EARLY_MOMENTUM = 30
+
+
+def classify_tier_v3_shadow_early_momentum(
+    leadership: int, conviction: int, entry_quality: int, early_momentum: bool,
+    thresholds: Optional[dict] = None,
+) -> str:
+    """
+    SHADOW-ONLY diagnostic variant of classify_tier_v3() — NOT called by
+    score_stock() to produce the live "Recommendation" column; it only
+    feeds a separate "Recommendation_EarlyMomentumShadow" diagnostic
+    column so Kavitha can measure how often/how well the override would
+    have reclassified a row before ever wiring it into production.
+
+    classify_tier_v3()/_leadership()/compute_conviction_v3() are FROZEN
+    (see the module banner above compute_conviction_v4() below) — this
+    function is a deliberate, separate COPY of classify_tier_v3()'s logic,
+    not an edit to it, so the frozen function is untouched byte-for-byte.
+    The only behavioral difference: when `early_momentum` is True, Watch's
+    Leadership floor is relaxed to V3_WATCH_LEADERSHIP_MIN_EARLY_MOMENTUM
+    instead of the real v3_watch_leadership_min. Developing/Actionable/
+    Execute/Elite floors are untouched even when early_momentum is True —
+    a fresh mover can reach Watch on structural evidence alone, but still
+    has to earn Developing/Actionable the normal way once Leadership's
+    medium-term read actually catches up. Conviction and Entry Quality
+    floors are never relaxed by this override at any tier.
+
+    early_momentum : utils.scoring_core.has_early_momentum_signal(r) for
+                      this bar — pass False to reproduce classify_tier_v3()
+                      exactly (useful for regression-testing this function
+                      against the real one on ordinary rows).
+    thresholds : same meaning/keys as classify_tier_v3() — merged over
+                 V3_THRESHOLD_DEFAULTS the same way.
+    """
+    t = {**V3_THRESHOLD_DEFAULTS, **(thresholds or {})}
+    composite = (leadership + conviction + entry_quality) / 3
+
+    if (leadership >= t["v3_actionable_leadership_min"]
+            and conviction >= t["v3_actionable_conviction_min"]
+            and entry_quality >= t["v3_actionable_entry_quality_min"]
+            and composite  >= t["v3_actionable_composite_min"]):
+        return "Actionable"
+    if (leadership >= t["v3_developing_leadership_min"]
+            and conviction >= t["v3_developing_conviction_min"]
+            and entry_quality >= t["v3_developing_entry_quality_min"]
+            and composite >= t["v3_developing_composite_min"]):
+        return "Developing"
+    watch_ls_floor = (V3_WATCH_LEADERSHIP_MIN_EARLY_MOMENTUM if early_momentum
+                       else t["v3_watch_leadership_min"])
+    if (leadership    >= watch_ls_floor
+            and conviction    >= t["v3_watch_conviction_min"]
+            and entry_quality >= t["v3_watch_entry_quality_min"]):
+        return "Watch"
+    return "Skip"
+
+
 @dataclass
 class ConvictionV3(ConvictionV1):
     """Same shape as ConvictionV1 — composite is an equal-weight (1/3 each) average."""

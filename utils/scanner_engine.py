@@ -7,6 +7,7 @@ All scoring logic lives in utils/scoring_core.py (compute_bar / BarResult).
 score_stock() here is now a thin wrapper: build_indicators → compute_bar(i=-1).
 """
 
+from typing import Optional
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -1355,27 +1356,60 @@ def nifty_regime(nifty: pd.Series) -> str:
 #  SCORE_STOCK  — thin wrapper around scoring_core.compute_bar
 # ══════════════════════════════════════════════════════════════════
 
-def _primary_blocker(r, result: dict) -> str:
+def _primary_blocker(r, result: dict, settings: Optional[dict] = None) -> str:
     """
-    Identify the single most important reason a stock is not Actionable.
+    Identify the single most important reason a stock did not reach a
+    higher Recommendation tier.
 
     Called from score_stock() after compute_decision() — has access to both
     the raw BarResult (r) and the full result dict (DecisionScores fields
     already merged in). Decision engine is kept regime-agnostic; this lives
     here in the scanner layer.
 
+    [Fix, fast-winner audit — replaces the old "Category"-keyed dispatch]
+    The old version branched on result.get("Category", ...) — a key that
+    score_stock() never actually writes into `result` (only "Recommendation",
+    "Tier", and "CV1_SignalClass" are set; "Category" always fell back to
+    its "Avoid" default). That silently disabled every category-specific
+    branch below (Extended/Leader special-casing, the Actionable-or-better
+    early return) for every row, and — independently — the floor this
+    function compared against was hardcoded to Actionable's regardless of
+    which tier's AND-gate actually produced the row's real Recommendation
+    (classify_tier_v3()). A Skip row (failed Watch's 50/50/50 gate) and a
+    Watch row (failed Developing's 70/55/80/55 gate) were both graded
+    against Actionable's 70/60/80/60 floors, which is a different gate
+    than the one that actually fired — so the text could describe a
+    pillar that had already cleared its *real* floor (e.g. "Weak
+    Leadership (69)" on a row where Leadership only needed to clear
+    Watch's 50 floor to produce that Skip).
+
+    Fixed properly here, not just re-labeled:
+      1. Reads "Recommendation" (Skip|Watch|Developing|Actionable|Execute|
+         Elite — classify_tier_v3()'s real output) as the category signal,
+         with "Category" kept only as a fallback for legacy/cached rows.
+      2. Reads "Lifecycle" (decision_engine._classify_stage()'s AVOID/
+         EXTENDED/ACTIONABLE/SETUP_BUILDING/LEADER) for the Extended/Leader
+         special cases — the vocabulary those cases actually check against.
+      3. Maps Recommendation to the NEXT tier up in classify_tier_v3()'s
+         ladder and grades against THAT tier's own floors (with its own
+         composite requirement, or lack of one for Watch) — not always
+         Actionable's.
+      4. Merges `settings` into V3_THRESHOLD_DEFAULTS the same way
+         classify_tier_v3(thresholds=settings) does upstream, so a Settings
+         override can't make this text disagree with the gate that actually
+         ran.
+
     Returns a short human-readable string, or "" for Actionable/better.
     """
-    category = result.get("Category", "Avoid")
+    from utils.conviction_score_v1 import V3_THRESHOLD_DEFAULTS
+    t = {**V3_THRESHOLD_DEFAULTS, **(settings or {})}
 
-    # Nothing to block for already-actionable stocks
-    if category in ("Elite Opportunity", "High Conviction", "Actionable"):
+    recommendation = str(result.get("Recommendation", result.get("Category", "Skip")))
+    lifecycle = str(result.get("Lifecycle", "") or "").upper()
+
+    # Nothing to block for already-actionable-or-better stocks.
+    if recommendation in ("Actionable", "Execute", "Elite"):
         return ""
-
-    # Extended is its own blocker — show it directly
-    if category == "Extended":
-        ext = int(result.get("Extension", result.get("Legacy_EntryQuality", result.get("DE_EntryQuality", 0))) or 0)
-        return f"Extended ({ext}) — wait for pullback to EMA/Fib"
 
     # Pull scores — use CV1 (v3: equal-weight 1/3/1/3/1/3 composite, live
     # since 2026-07) for Leadership; fall back to Legacy_* (diagnostic-only,
@@ -1392,29 +1426,43 @@ def _primary_blocker(r, result: dict) -> str:
     if not composite:
         composite = (ls + cv + eq) / 3
 
-    from utils.conviction_score_v1 import V3_THRESHOLD_DEFAULTS as _T
-    _ls_floor   = _T["v3_actionable_leadership_min"]
-    _cv_floor   = _T["v3_actionable_conviction_min"]
-    _comp_floor = _T["v3_actionable_composite_min"]
+    # Extended is a tier-agnostic override — a stock that's run too far
+    # doesn't need its Leadership/Conviction picked apart; the extension
+    # itself is why it's capped, regardless of which AND-gate it also fails.
+    if lifecycle == "EXTENDED" or ext >= 60:
+        return f"Extended ({int(ext)}) — wait for pullback to EMA/Fib"
 
-    # Priority 1: Leadership gate — aligned with classify_tier_v3()'s
-    # Actionable floor. v3 has been the live gate since 2026-07; this
-    # blocker message must match whatever tier logic actually decided
-    # the Category, or the "why not Actionable" text lies about the
-    # real reason.
-    if ls < _ls_floor:
+    # The tier ladder classify_tier_v3() actually walks — map this row's
+    # Recommendation to the NEXT gate up, i.e. the specific AND-gate it
+    # failed to clear. Watch's gate has no composite requirement (only
+    # Developing/Actionable add one) — see classify_tier_v3().
+    _NEXT_GATE = {
+        "Skip":       ("Watch",      "v3_watch_leadership_min",      "v3_watch_conviction_min",      "v3_watch_entry_quality_min",      None),
+        "Watch":      ("Developing", "v3_developing_leadership_min", "v3_developing_conviction_min", "v3_developing_entry_quality_min", "v3_developing_composite_min"),
+        "Developing": ("Actionable", "v3_actionable_leadership_min", "v3_actionable_conviction_min", "v3_actionable_entry_quality_min", "v3_actionable_composite_min"),
+    }
+    gate_name, ls_key, cv_key, eq_key, comp_key = _NEXT_GATE.get(
+        recommendation,
+        # Unrecognized/legacy Category value (e.g. old cached "Avoid") —
+        # fall back to Actionable rather than silently guessing Watch.
+        ("Actionable", "v3_actionable_leadership_min", "v3_actionable_conviction_min",
+         "v3_actionable_entry_quality_min", "v3_actionable_composite_min"),
+    )
+    ls_floor   = t[ls_key]
+    cv_floor   = t[cv_key]
+    eq_floor   = t[eq_key]
+    comp_floor = t[comp_key] if comp_key else None
+
+    # Priority 1: Leadership gate — graded against the tier this row
+    # actually needed to clear, not always Actionable's.
+    if ls < ls_floor:
         ls_rs   = int(result.get("_ds_ls_rs",   result.get("_de_ls_rs",   0)) or 0)
         ls_trend= int(result.get("_ds_ls_trend", result.get("_de_ls_trend",0)) or 0)
         detail = "trend below EMA" if ls_trend < 20 else "RS below market"
-        return f"Weak Leadership ({int(ls)}) — {detail}"
+        return f"Weak Leadership ({int(ls)}, need {int(ls_floor)} for {gate_name}) — {detail}"
 
-    # Priority 2: Extension (if high, entry quality doesn't matter)
-    if ext >= 60:
-        return f"Extended ({int(ext)}) — wait for pullback"
-
-    # Priority 3: Conviction gate — v3's Actionable floor (equal-weight
-    # composite, backtest-fit 2026-07).
-    if cv < _cv_floor:
+    # Priority 2: Conviction gate.
+    if cv < cv_floor:
         # Prefer CV1's cv_fib_zone which accounts for both pullback AND
         # continuation paths (stock above Fib 61.8% / above pivot high).
         # Fall back to DE cv_fib (now also updated with continuation path).
@@ -1426,15 +1474,14 @@ def _primary_blocker(r, result: dict) -> str:
             sub = "ADX not confirming trend"
         else:
             sub = f"DE score {int(cv)}"
-        return f"Low Conviction ({int(cv)}) — {sub}"
+        return f"Low Conviction ({int(cv)}, need {int(cv_floor)} for {gate_name}) — {sub}"
 
-    # Priority 4: v3 has no standalone Entry Quality floor — EQ only
-    # enters the decision via its equal-weight (1/3) composite share. So
-    # once Leadership and Conviction clear their floors, the remaining
-    # blocker (if any) is the composite itself falling short of v3's
-    # Actionable bar, which in practice is almost always an Entry Quality
-    # drag since LS/CV already passed their own floors above.
-    if composite < _comp_floor:
+    # Priority 3: Entry Quality gate. Watch's AND-gate checks EQ directly
+    # (v3_watch_entry_quality_min) — unlike Developing/Actionable, where EQ
+    # only enters via the composite share (Priority 4 below). Checking EQ
+    # itself here (rather than assuming it's folded into composite) is what
+    # makes a Skip row's text correct: Watch has no composite floor at all.
+    if eq < eq_floor:
         eq_ema = int(result.get("_ds_eq_ema20_dist", result.get("_cv1_eq_ema20", 0)) or 0)
         eq_piv = int(result.get("_ds_eq_pivot_dist", result.get("_cv1_eq_piv",  0)) or 0)
         if eq_ema < 10:
@@ -1443,12 +1490,17 @@ def _primary_blocker(r, result: dict) -> str:
             sub = "too far above pivot"
         else:
             sub = f"EQ score {int(eq)}"
-        # composite is now unrounded (see conviction_score_v1.py) — show one
+        return f"Low Entry Quality ({int(eq)}, need {int(eq_floor)} for {gate_name}) — {sub}"
+
+    # Priority 4: composite floor (Developing/Actionable gates only — Watch
+    # has none, so comp_floor is None there and this is skipped entirely).
+    if comp_floor is not None and composite < comp_floor:
+        # composite is unrounded (see conviction_score_v1.py) — show one
         # decimal so this can't read as self-contradictory (e.g. "Composite
         # 60 (need 60)" while still being the rejection reason).
-        return f"Composite {composite:.1f} (need {_comp_floor}) — Low Entry Quality ({int(eq)}) — {sub}"
+        return f"Composite {composite:.1f} (need {comp_floor} for {gate_name}) — every pillar clears its own floor but the blended score doesn't"
 
-    # Priority 5: CCI momentum not confirmed
+    # Priority 5: CCI momentum not confirmed — tier-agnostic tiebreaker.
     try:
         cci_val = float(getattr(r, "cur_cci", None) or result.get("_cci_raw", 0) or 0)
         if cci_val < 0:
@@ -1456,12 +1508,17 @@ def _primary_blocker(r, result: dict) -> str:
     except (TypeError, ValueError):
         pass
 
-    # Leader / Setup Building with everything borderline — all v3 floors
-    # (LS/CV/composite Actionable floors) already passed above, so this is
-    # a genuine "everything is borderline-adequate" state, not a specific gate.
-    if category == "Leader":
-        return f"Leader — DE conviction {int(cv)} (need {_cv_floor}) · await base"
-    return f"Setup Building — composite {int(composite)} (need {_comp_floor})"
+    # Leader — high Leadership, base still building. Only reachable once
+    # this tier's own LS/CV/EQ/composite floors are all confirmed clear
+    # above, so it's a genuine "borderline everywhere" state.
+    if lifecycle == "LEADER":
+        return f"Leader — DE conviction {int(cv)} (need {int(cv_floor)}) · await base"
+
+    # Every floor for the gate this row supposedly failed actually clears
+    # on these scores — Recommendation and the live scores disagree (stale
+    # cache row, or a settings change since this row was scored). Say so
+    # rather than inventing a plausible-sounding but false reason.
+    return f"{recommendation} — clears {gate_name}'s floors on current scores; check for stale settings/cache"
 
 
 RECOMMENDATION_LADDER = ["Skip", "Watch", "Developing", "Actionable", "Execute", "Elite"]
@@ -2231,6 +2288,31 @@ def score_stock(
         # duplicated under another name (spec's own instruction against
         # "duplicate fields with slightly different meanings").
         result["Recommendation"]     = final_tier           # Skip|Watch|Developing|Actionable|Execute|Elite
+
+        # ── Early-Momentum SHADOW diagnostic (fast-winner audit, 2026-09-01) ──
+        # Does NOT touch Recommendation above — classify_tier_v3()/_leadership()
+        # are frozen (see conviction_score_v1.py module banner). This measures
+        # how often utils.scoring_core.has_early_momentum_signal() would have
+        # moved a Skip to Watch, so the override can be validated on live scans
+        # before ever being considered for production — same posture as
+        # _prescreen_mismatch below. A real day-1 mover getting picked up here
+        # while final_tier stays Skip is the expected, useful case; it is NOT
+        # written into Recommendation/Action/Primary Blocker.
+        try:
+            from utils.scoring_core import has_early_momentum_signal
+            from utils.conviction_score_v1 import classify_tier_v3_shadow_early_momentum
+            _early_mom = has_early_momentum_signal(r)
+            _shadow_tier = classify_tier_v3_shadow_early_momentum(
+                cv1.leadership, cv1.conviction, cv1.entry_quality, _early_mom, thresholds=settings,
+            )
+            result["_early_momentum_signal"]          = _early_mom
+            result["Recommendation_EarlyMomentumShadow"] = _shadow_tier
+            result["_early_momentum_mismatch"] = (
+                _early_mom and RECOMMENDATION_RANK.get(_shadow_tier, 0) > RECOMMENDATION_RANK.get(final_tier, 0)
+            )
+        except Exception:
+            pass   # diagnostic-only — a failure here must never affect Recommendation
+
         # "Promoted" means Promo Score/timing is the reason final_tier is
         # above where base_tier + natural score would have landed on their
         # own (promo_rank strictly ahead of both) — not just "timing
@@ -2428,8 +2510,13 @@ def score_stock(
     # blocker text silently graded against invisible DE numbers instead of
     # the scores the user was actually looking at.
     try:
+        # [Fix, fast-winner audit] "Elite Opportunity"/"High Conviction" are
+        # legacy DE Category strings that classify_tier_v3()'s Recommendation
+        # never actually produces (it emits "Elite"/"Execute"). That mismatch
+        # meant this guard only ever matched "Actionable", leaving Execute/
+        # Elite rows to fall through and get a spurious blocker written below.
         category = result.get("Recommendation", result.get("Category", "Avoid"))
-        blocker = _primary_blocker(r, result)
+        blocker = _primary_blocker(r, result, settings)
         # [Fix, 2026-08-16] When the SMC structural gate actually capped
         # this row's Recommendation (state isn't VALID_ENTRY_ZONE, i.e.
         # apply_smc_structural_gate() changed something), that reason
@@ -2460,7 +2547,7 @@ def score_stock(
             if _smc_reason:
                 _smc_text += f" ({_smc_reason.replace('_', ' ')})"
             blocker = f"{_smc_text} · {blocker}" if blocker else _smc_text
-        result["Primary Blocker"] = blocker if category not in ("Elite Opportunity", "High Conviction", "Actionable") else ""
+        result["Primary Blocker"] = blocker if category not in ("Elite Opportunity", "High Conviction", "Actionable", "Execute", "Elite") else ""
     except Exception:
         pass
 

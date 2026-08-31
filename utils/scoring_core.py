@@ -971,6 +971,61 @@ def leadership_prescreen(
     return True
 
 
+def has_early_momentum_signal(r: "BarResult", vol_ratio_floor: float = 2.0) -> bool:
+    """
+    Real-data equivalent of leadership_prescreen()'s early-momentum
+    override (see that function's docstring for the full rationale) — the
+    same "fresh breakout/reversal whose medium-term RS/trend hasn't caught
+    up yet" structural blind spot, but read off the real, already-computed
+    BarResult fields instead of leadership_prescreen()'s cheap raw-df
+    approximations (which only exist to decide whether to run
+    build_indicators() at all, before any of these fields exist).
+
+    [Fast-winner audit, 2026-09-01] Added because leadership_prescreen()'s
+    override only ever protects the cheap PRE-screen stage from eliminating
+    a fresh mover before build_indicators() runs — it is never consulted by
+    classify_tier_v3()'s real, backtest-calibrated Leadership floor
+    downstream. A stock can clear the prescreen (proceed to full CV1
+    scoring) and still get Skip'd by classify_tier_v3() because
+    _leadership()'s real score (RS composite, trend age, persistent
+    strength, EMA20 slope — all medium-term reads) is genuinely low on
+    day one of a real move. That's the mechanism behind fast winners like
+    ATHERENERG/CYIENT (both +6%+ same-day) still showing Skip.
+
+    DELIBERATELY NOT wired into _leadership()/classify_tier_v3()/
+    compute_conviction_v3() directly — those are explicitly FROZEN (see
+    the module banner above compute_conviction_v4() in
+    conviction_score_v1.py: "nothing above this comment is touched").
+    This function only PRODUCES the signal; utils.scanner_engine.score_stock()
+    wires it into a SHADOW-only diagnostic column
+    (Recommendation_EarlyMomentumShadow / _early_momentum_mismatch), not
+    into the live Recommendation — same pattern as _prescreen_mismatch and
+    CV4 shadow scoring. See that docstring's caution: "Validate the
+    false-negative rate... before trusting this in a live scan" — this is
+    the validation step, not a silent gating change.
+
+    Fires when EITHER:
+      - a REAL breakout is confirmed (fresh_base_breakout or
+        compression_break — pivot/pattern-based, stronger evidence than
+        leadership_prescreen()'s N-day rolling-high/low proxy, which only
+        exists because build_indicators() hasn't run yet at that stage), OR
+      - trend has already flipped up (trend_up) AND volume is expanding
+        (vol_ratio >= vol_ratio_floor) AND relative strength is improving
+        (rs_momentum > 0, i.e. r.rs_composite trending toward strength even
+        if not there yet) — the real-data analogue of the prescreen's
+        EMA9/21-cross + volume + RS-slope structural_bullish/bearish check.
+
+    Returns bool. Long-only today (mirrors fresh_base_breakout's framing);
+    revisit the trend_up branch if/when short setups are scored here.
+    """
+    if getattr(r, "fresh_base_breakout", False) or getattr(r, "compression_break", False):
+        return True
+    vol_ratio = float(getattr(r, "vol_ratio", 1.0) or 1.0)
+    rs_momentum = float(getattr(r, "rs_momentum", 0.0) or 0.0)
+    trend_up = bool(getattr(r, "trend_up", False))
+    return trend_up and vol_ratio >= vol_ratio_floor and rs_momentum > 0
+
+
 def compute_bar(
     ia:             IndicatorArrays,
     i:              int,
