@@ -2076,9 +2076,8 @@ def compute_bar(
     )
     acc_score = norm_score + (20 if is_tier1_prime else 0) + (10 if qualified else 0)
     hard_stop = trend_down and below_cloud and norm_score < 30
-    pct_chg = (round((cur_c - prev_close) / prev_close * 100, 2)
-           if prev_close and pd.notna(prev_close) and pd.notna(cur_c)
-           else 0.0)
+    pct_chg   = round((cur_c - prev_close) / prev_close * 100, 2) if prev_close else 0.0
+    # pct_chg = (round((cur_c - prev_close) / prev_close * 100, 2) if prev_close and pd.notna(prev_close) and pd.notna(cur_c) else 0.0)
 
     high_prob_buy = trend_up and in_golden and norm_score >= 55 and any_buy
 
