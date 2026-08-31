@@ -132,7 +132,7 @@ LIVE_SCANNER_BATCH_SIZE     = 100   # symbols scored per sub-batch
                                      # [job_memory] log line after this change — if
                                      # per-batch delta grows uncomfortably, dial this
                                      # back down rather than raising max_workers too.
-LIVE_SCANNER_MAX_WORKERS    = 4     # ThreadPoolExecutor size for BACKGROUND
+LIVE_SCANNER_MAX_WORKERS    = 6     # ThreadPoolExecutor size for BACKGROUND
                                      # scans specifically — deliberately lower
                                      # than the manual "Run Scan" button's
                                      # default of 10 (utils/live_scanner_job.py
@@ -150,6 +150,21 @@ LIVE_SCANNER_MAX_WORKERS    = 4     # ThreadPoolExecutor size for BACKGROUND
                                      # Re-added 2026-07-24 after being pulled
                                      # out along with the broken v4 revert —
                                      # this constant never depended on v4.
+                                     #
+                                     # [2026-08-31, latency Tier 2] Raised from 4
+                                     # to 6 — a modest step, not a jump to the
+                                     # manual button's 10, since this pool runs
+                                     # every cycle unattended. This speeds up the
+                                     # CPU-bound scoring phase (the score=Ys half
+                                     # of the "run_scanner timing" log line added
+                                     # earlier), at the cost of higher peak CPU
+                                     # alongside the Streamlit UI thread. Watch
+                                     # for the "contact support" CPU-quota warning
+                                     # and the [job_memory] delta after this
+                                     # change; if either regresses, drop back to
+                                     # 4-5 rather than pushing workers higher —
+                                     # this constant was deliberately halved once
+                                     # already for exactly that reason (see above).
 LIVE_SCANNER_BATCH_COOLDOWN_SECS = 1.5   # brief pause between batches, just
                                      # enough for CPU usage to settle between
                                      # bursts instead of the worker threads
