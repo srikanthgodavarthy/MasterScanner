@@ -734,7 +734,7 @@ def _create_plan(
     # otherwise-valid plan.
     try:
         from utils.entry_snapshot import build_live_scanner_entry_snapshot, save_live_scanner_entry_snapshot
-        save_live_scanner_entry_snapshot(build_live_scanner_entry_snapshot(scanner_row, setup_id, symbol))
+        save_live_scanner_entry_snapshot(build_live_scanner_entry_snapshot(scanner_row, setup_id, symbol, source=source))
     except Exception:
         logger.exception("[setup_persistence] entry-snapshot capture failed for setup_id=%s "
                           "(non-fatal — plan itself is still minted)", setup_id)

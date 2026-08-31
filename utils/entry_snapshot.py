@@ -70,7 +70,8 @@ def _f(v: Any) -> Optional[float]:
 #  LIVE SCANNER ENTRY SNAPSHOT
 # ══════════════════════════════════════════════════════════════════
 
-def build_live_scanner_entry_snapshot(scanner_row: dict, setup_id: str, symbol: str) -> dict:
+def build_live_scanner_entry_snapshot(scanner_row: dict, setup_id: str, symbol: str,
+                                       source: str = "LS") -> dict:
     """Build (but do not save) the immutable entry snapshot for one
     Live Scanner / Pre-Breakout plan, from the exact scanner_row that
     utils.setup_persistence._create_plan() minted the plan from — i.e.
@@ -91,10 +92,24 @@ def build_live_scanner_entry_snapshot(scanner_row: dict, setup_id: str, symbol: 
     keys are UNCHANGED — this only fixes what each one reads from, so no
     DB schema/migration is needed.
 
-    "setup_type" and "direction" have no real source anywhere in
-    scanner_row (no Long/Short field, no setup-type classification) —
-    left as "" here rather than silently mislabeled from Recommendation.
-    "momentum_score" also has no CV1-native equivalent (only the
+    [2026-08-31] "direction" and "setup_type" now get real values instead
+    of "":
+      - direction — Live Scanner's own detectors are long-only (see
+        scanner_engine.py's `thesis_direction="BULLISH"` comment); every
+        plan minted through this path is a long. Hardcoding "LONG" here
+        is not a guess, it reflects an actual invariant of this engine —
+        NOT the Recommendation/tier label ("Watch"/"Skip"/...), which is
+        a different concept and was the original mislabeling bug.
+      - setup_type — derived from `source`, the same "LS"/"PB" value
+        `_create_plan()` already threads through the whole mint path
+        (SetupPlan.source): "PB" (Pre-Breakout tab, minted off a
+        squeeze_release signal before the stock even reaches an
+        Actionable tier) -> "PRE_BREAKOUT"; "LS" (normal Actionable/
+        Execute/Elite promotion) -> "BREAKOUT". This is coarser than a
+        true PULLBACK/BREAKOUT/CONTINUATION classification (which this
+        engine doesn't compute), but it is a real distinction the code
+        already tracks, not an invented one.
+    "momentum_score" still has no CV1-native equivalent (only the
     separate Five Pillars "FP_Momentum"/"FP_RelMomentum", a different
     scoring system) — left None rather than mixing systems; revisit if
     a CV1 momentum sub-score gets added, or if pulling FP_Momentum in
@@ -105,8 +120,8 @@ def build_live_scanner_entry_snapshot(scanner_row: dict, setup_id: str, symbol: 
         "setup_id": setup_id,
         "symbol": symbol,
         "captured_at": _now_iso(),
-        "direction": "",     # [2026-08-26] no real source — see docstring; do not fall back to Recommendation
-        "setup_type": "",    # [2026-08-26] no real source — see docstring
+        "direction": "LONG",                                          # [2026-08-31] see docstring — Live Scanner is long-only
+        "setup_type": "PRE_BREAKOUT" if source == "PB" else "BREAKOUT",  # [2026-08-31] see docstring — derived from mint source
 
         "leadership_score": _f(g("CV1_Leadership", g("Legacy_Leadership", g("DE_Leadership")))),
         "conviction_score": _f(g("CV1_Conviction", g("Legacy_Conviction", g("DE_Conviction")))),
