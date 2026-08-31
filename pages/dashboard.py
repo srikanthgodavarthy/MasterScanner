@@ -1620,9 +1620,31 @@ def _daychg_badge(pct_chg) -> str:
     )
 
 
-def _tv_link(symbol: str, css_class: str = "tv-link", pct_chg=None) -> str:
+def _reduced_history_badge(reduced_history) -> str:
+    """[2026-08-31] Dashboard-local twin of pages/scanner.py's badge of
+    the same name — see that copy's docstring. Flags symbols scored via
+    score_stock()'s recent-listing fallback (utils/scanner_engine.py):
+    a scaled-down slow EMA instead of a real EMA200, typically for
+    recent IPOs under the 210-bar full-history gate. Kept as a separate
+    local copy rather than a cross-page import since dashboard.py and
+    scanner.py each already keep their own local _tv_link/_daychg_badge
+    for the same reason (see this file's own _tv_link docstring)."""
+    if not reduced_history:
+        return ""
+    return (
+        '<span style="color:#d29922;font-size:10px;font-weight:700;'
+        'margin-left:5px;white-space:nowrap;border:1px solid rgba(210,153,34,0.35);'
+        'background:rgba(210,153,34,0.10);border-radius:4px;padding:1px 5px;" '
+        'title="Recent listing — scored with a reduced-history read (shortened '
+        'slow EMA instead of EMA200); trend structure is less reliable than a '
+        'fully-seasoned symbol.">NEW</span>'
+    )
+
+
+def _tv_link(symbol: str, css_class: str = "tv-link", pct_chg=None, reduced_history=None) -> str:
     """Return an anchor that opens TradingView NSE chart in a new tab,
-    optionally followed by a small color-graded day %chg badge."""
+    optionally followed by a small color-graded day %chg badge and a
+    reduced-history badge for recent listings."""
     # TradingView NSE symbol format: NSE:SYMBOLNAME
     tv_sym = f"NSE:{symbol.upper().replace('.NS', '').replace('-EQ', '')}"
     url = f"https://www.tradingview.com/chart/?symbol={tv_sym}"
@@ -1630,6 +1652,7 @@ def _tv_link(symbol: str, css_class: str = "tv-link", pct_chg=None) -> str:
         f'<a class="{css_class}" href="{url}" target="_blank" '
         f'title="Open {symbol} on TradingView">{symbol}</a>'
         f'{_daychg_badge(pct_chg)}'
+        f'{_reduced_history_badge(reduced_history)}'
     )
 
 
@@ -2587,7 +2610,7 @@ def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
         price = _current_price(r)
         rows_html += (
             "<tr>"
-            f'<td><span class="sr-sector-name" style="font-weight:700;" title="{symbol}">{_tv_link(str(symbol)) if symbol != "—" else symbol}</span></td>'
+            f'<td><span class="sr-sector-name" style="font-weight:700;" title="{symbol}">{_tv_link(str(symbol), reduced_history=r.get("reduced_history")) if symbol != "—" else symbol}</span></td>'
             f'<td class="{"sr-pos" if chg >= 0 else "sr-neg"}">{"+" if chg >= 0 else ""}{chg:.2f}%</td>'
             f"<td>{f'{price:,.2f}' if price is not None else '—'}</td>"
             f"<td>{f'{float(entry):,.2f}' if entry not in (None, '') and pd.notna(entry) else '—'}</td>"

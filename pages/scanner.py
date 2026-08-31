@@ -1519,9 +1519,31 @@ def _daychg_badge(pct_chg) -> str:
     )
 
 
-def _tv_link(symbol: str, css_class: str = "tv-link", pct_chg=None) -> str:
+def _reduced_history_badge(reduced_history) -> str:
+    """[2026-08-31] Small badge for symbols scored via score_stock()'s
+    recent-listing fallback (utils/scanner_engine.py) — a scaled-down
+    slow EMA instead of a real EMA200, because the symbol has under 210
+    bars of history (typically a recent IPO). Meant to sit right next to
+    a stock name so this class of read is visibly distinguished from a
+    normal, full-history score rather than blending in silently. Returns
+    "" for anything falsy so callers never have to special-case a
+    missing/False value (older cached rows won't have this key at all)."""
+    if not reduced_history:
+        return ""
+    return (
+        '<span style="color:#d29922;font-size:10px;font-weight:700;'
+        'margin-left:5px;white-space:nowrap;border:1px solid rgba(210,153,34,0.35);'
+        'background:rgba(210,153,34,0.10);border-radius:4px;padding:1px 5px;" '
+        'title="Recent listing — scored with a reduced-history read (shortened '
+        'slow EMA instead of EMA200); trend structure is less reliable than a '
+        'fully-seasoned symbol.">NEW</span>'
+    )
+
+
+def _tv_link(symbol: str, css_class: str = "tv-link", pct_chg=None, reduced_history=None) -> str:
     """Return an anchor that opens TradingView NSE chart in a new tab,
-    optionally followed by a small color-graded day %chg badge."""
+    optionally followed by a small color-graded day %chg badge and a
+    reduced-history badge for recent listings."""
     # TradingView NSE symbol format: NSE:SYMBOLNAME
     tv_sym = f"NSE:{symbol.upper().replace('.NS', '').replace('-EQ', '')}"
     url = f"https://www.tradingview.com/chart/?symbol={tv_sym}"
@@ -1529,6 +1551,7 @@ def _tv_link(symbol: str, css_class: str = "tv-link", pct_chg=None) -> str:
         f'<a class="{css_class}" href="{url}" target="_blank" '
         f'title="Open {symbol} on TradingView">{symbol}</a>'
         f'{_daychg_badge(pct_chg)}'
+        f'{_reduced_history_badge(reduced_history)}'
     )
 
 
@@ -2552,7 +2575,7 @@ def _render_html_table(df: pd.DataFrame) -> str:
         cells = f'<td class="col-rank">{rank}</td>'
         stock_sym = row.get("Stock", "—")
         cells += (
-            f'<td class="col-stock">{_tv_link(str(stock_sym), pct_chg=row.get("%Chg")) if stock_sym != "—" else "—"}</td>'
+            f'<td class="col-stock">{_tv_link(str(stock_sym), pct_chg=row.get("%Chg"), reduced_history=row.get("reduced_history")) if stock_sym != "—" else "—"}</td>'
         )
 
         for c in cols:
@@ -3115,7 +3138,7 @@ def _render_pre_breakout_tab(records: list, df: pd.DataFrame, mode: str) -> None
         rows_html += (
             f'<tr>'
             f'<td class="col-rank">{rank}</td>'
-            f'<td class="col-stock">{_tv_link(sym, pct_chg=r.get("%Change") or r.get("%Chg"))}</td>'
+            f'<td class="col-stock">{_tv_link(sym, pct_chg=r.get("%Change") or r.get("%Chg"), reduced_history=r.get("reduced_history"))}</td>'
             + _pb_score(r.get("Score"))
             + sq_cell
             + _pb_num(rsi, "{:.0f}")
