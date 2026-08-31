@@ -371,7 +371,9 @@ def top_dore_trade_plans(
     expiry / no liquidity) for symbols that didn't produce a plan.
     """
     from utils.upstox_client import fetch_batch_stock_atm_options_upstox, fetch_oi_resistance
-    from utils.scanner_engine import fetch_batch_ohlcv
+    from utils.scanner_engine import (
+        fetch_batch_ohlcv, fetch_nifty_ohlcv, fetch_sensex_ohlcv, fetch_banknifty_ohlcv,
+    )
 
     settings = _load_settings(cfg)
     iv_lookup = iv_lookup or {}
@@ -399,6 +401,45 @@ def top_dore_trade_plans(
     # only the cache key -- fetch_batch_ohlcv returns a dict, so the
     # order of stock_symbols never mattered to its output.
     ohlcv_map = fetch_batch_ohlcv(tuple(sorted(stock_symbols)), period="3mo") if stock_symbols else {}
+
+    # [Fix, 2026-08-31, SG report] NIFTY/SENSEX/BANKNIFTY were reaching
+    # the index loop below via live_pool (see _build_index_scan_rows(),
+    # the 2026-08-26 fix), but ohlcv_map above is built ONLY from
+    # stock_symbols via fetch_batch_ohlcv() — a stock-ticker batch
+    # fetcher that never receives the index symbols. _process() looks
+    # up closes/highs/lows/opens purely via ohlcv_map.get(symbol), so
+    # every index hit `if not closes:` and was rejected every cycle
+    # with "No OHLCV history available", regardless of what
+    # _build_index_scan_rows() had already fetched for scoring (that
+    # OHLCV is used to compute the scan row there and then discarded —
+    # it was never threaded through to this function's ohlcv_map).
+    # Fetch each index's own OHLCV via its dedicated fetcher (same
+    # source="upstox" convention the rest of this module already uses
+    # for indices) and merge it in here, fail-soft per index so one
+    # index's fetch failure doesn't block the others or the stock loop.
+    _index_ohlcv_fetchers = {
+        "NIFTY": lambda: fetch_nifty_ohlcv(period="3mo", source="upstox"),
+        "SENSEX": lambda: fetch_sensex_ohlcv(period="3mo", source="upstox"),
+        "BANKNIFTY": lambda: fetch_banknifty_ohlcv(period="3mo", source="upstox"),
+    }
+    for _idx_sym in index_symbols:
+        _fetch_fn = _index_ohlcv_fetchers.get(_idx_sym)
+        if _fetch_fn is None:
+            continue
+        try:
+            _idx_df = _fetch_fn()
+            if _idx_df is not None and not _idx_df.empty:
+                ohlcv_map[_idx_sym] = _idx_df
+            else:
+                logger.warning(
+                    "[dore_options_scan] index OHLCV fetch returned empty for %s", _idx_sym,
+                )
+        except Exception:
+            logger.exception(
+                "[dore_options_scan] index OHLCV fetch failed for %s — "
+                "it will fall through to the 'No OHLCV history available' rejection this cycle",
+                _idx_sym,
+            )
 
     plans: list[OptionTradePlan] = []
     rejections: list[DoreRejection] = []
