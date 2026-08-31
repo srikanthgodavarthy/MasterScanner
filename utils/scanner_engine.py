@@ -188,6 +188,15 @@ def _wait_for_spacing():
         now = time.monotonic()
         wait = _YF_MIN_SPACING_S - (now - _yf_last_call_ts)
         if wait > 0:
+            # [2026-08-31 profiling] This lock is process-wide and was
+            # previously silent — a batch stuck here looks identical in
+            # the logs to a batch stuck on a slow network call. Only log
+            # non-trivial waits (>0.1s) to avoid spamming every call.
+            if wait > 0.1:
+                logging.getLogger(__name__).info(
+                    "_wait_for_spacing: throttled %.2fs (global %ss min-spacing lock)",
+                    wait, _YF_MIN_SPACING_S,
+                )
             time.sleep(wait)
         _yf_last_call_ts = time.monotonic()
 
@@ -2499,6 +2508,12 @@ def run_scanner(
     # cci_master_engine, fetch_batch_ohlcv), is unaffected.
     from utils.history_store import get_live_history_cached, update_live_cache
 
+    # [2026-08-31 profiling] Coarse fetch-vs-score timing split, added to
+    # find where a batch's total time (already logged one level up in
+    # scheduler/scan_worker.py) is actually going. Additive only — no
+    # behavior change.
+    _t_fetch_start = time.time()
+
     all_data: dict = {}
     fallback_syms: set = set()   # symbols served via yfinance fallback during an upstox scan
     for batch_i, start in enumerate(range(0, total, _BATCH_SIZE)):
@@ -2556,6 +2571,12 @@ def run_scanner(
     if nifty_series is None:
         nifty_series = fetch_nifty("1y", source=fetch_source)
     regime_val   = nifty_regime(nifty_series)   # bull / bear / neutral — computed once
+
+    # [2026-08-31 profiling] End of fetch phase (OHLCV batches + live-price
+    # patch + Nifty fetch) — everything above this line is network-bound;
+    # everything below is the scoring phase (CPU-bound + bounded wait).
+    _fetch_phase_s = time.time() - _t_fetch_start
+    _t_score_start = time.time()
 
     # Inject regime into settings so ScoringParams picks it up
     effective_settings = dict(settings) if settings else {}
@@ -2720,6 +2741,19 @@ def run_scanner(
             "above for the specific reason per symbol, if logged): %s",
             len(scored_syms), len(symbols), len(unaccounted), sorted(unaccounted),
         )
+
+    # [2026-08-31 profiling] Single-line fetch/score split for this
+    # run_scanner() call, so a slow batch can be attributed to network
+    # (fetch_phase_s — includes any _wait_for_spacing throttling, logged
+    # separately above) vs CPU/timeout (score_phase_s) at a glance,
+    # without cross-referencing multiple warning lines. Additive only.
+    _score_phase_s = time.time() - _t_score_start
+    _log.info(
+        "scanner_engine: run_scanner timing — fetch=%.1fs score=%.1fs total=%.1fs "
+        "(%d symbols, %d fetch batch(es) of <=%d)",
+        _fetch_phase_s, _score_phase_s, _fetch_phase_s + _score_phase_s,
+        total, n_batches, _BATCH_SIZE,
+    )
 
     if not results:
         return pd.DataFrame()

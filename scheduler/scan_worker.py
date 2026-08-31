@@ -116,7 +116,22 @@ logger = logging.getLogger("scan_worker")
 
 # ── Live Scanner sub-scheduler tuning ─────────────────────────────────
 LIVE_SCANNER_INTERVAL_SECS  = 300   # full-universe cycle target (5 min)
-LIVE_SCANNER_BATCH_SIZE     = 50    # symbols scored per sub-batch
+LIVE_SCANNER_BATCH_SIZE     = 100   # symbols scored per sub-batch
+                                     # [2026-08-31, latency fix] Raised from 50.
+                                     # Halving the batch count halves the
+                                     # cumulative LIVE_SCANNER_BATCH_COOLDOWN_SECS
+                                     # paid per cycle (was up to 10x1.5s=15s for a
+                                     # 500-symbol universe, now ~5x1.5s=7.5s), on
+                                     # top of removing the per-batch priority-wait
+                                     # checkpoint above. Trade-off: each sub-batch's
+                                     # peak RAM (df_raw/df_batch, see the
+                                     # job_memory_delta-wrapped block below) roughly
+                                     # doubles, and a single stuck/slow batch now
+                                     # affects 100 symbols' worth of last-good data
+                                     # instead of 50 if it fails outright. Watch the
+                                     # [job_memory] log line after this change — if
+                                     # per-batch delta grows uncomfortably, dial this
+                                     # back down rather than raising max_workers too.
 LIVE_SCANNER_MAX_WORKERS    = 4     # ThreadPoolExecutor size for BACKGROUND
                                      # scans specifically — deliberately lower
                                      # than the manual "Run Scan" button's
@@ -784,6 +799,29 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
 
         cycle_started = time.time()
 
+        # [2026-08-31, latency fix] Moved from per-batch to once per cycle.
+        # Previously wait_for_priority() ran before EVERY sub-batch — if a
+        # cycle spanned DORE's up-to-60s priority window, every batch that
+        # started during it could stall, repeatedly, within the same
+        # cycle (the profiling added just before this change confirmed
+        # this was a real, non-trivial source of latency, not just a
+        # theoretical one). Batches already run back-to-back once
+        # started (see comment below), so checking once at the cycle
+        # boundary — still a natural boundary, never mid-batch — gets the
+        # same "never barge in mid-batch" guarantee with at most ONE
+        # stall per cycle instead of up to N. Trade-off: live_scanner can
+        # now hold the CPU/network for an entire (typically well-under-
+        # 5-minute) cycle once it starts, rather than yielding to DORE
+        # between every sub-batch — acceptable given DORE only needs 60s
+        # out of every 240s and gets first refusal at every cycle's start.
+        from utils.scan_priority import wait_for_priority
+        _t_priority_start = time.time()
+        wait_for_priority("live_scanner", max_wait_secs=min(interval_secs, 240))
+        _priority_wait_s = time.time() - _t_priority_start
+        if _priority_wait_s > 0.5:
+            logger.info("[live_scanner] cycle waited %.1fs for priority window before starting",
+                        _priority_wait_s)
+
         # [2026-08-17 duplicate-index fix] Fetch Nifty ONCE for the whole
         # cycle and reuse it for both the regime context and every batch
         # below, instead of each of the ~10 compute_live_scan_batch() calls
@@ -829,13 +867,8 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                             batch_i + 1, n_batches)
                 break
 
-            # [2026-08-03, SG request] Bounded wait for live_scanner's
-            # 3-minute priority window before starting the next batch —
-            # never mid-batch. Capped well under one full cycle so a
-            # coordinator hiccup can't stall live_scanner past its own
-            # interval_secs. See utils/scan_priority.py.
-            from utils.scan_priority import wait_for_priority
-            wait_for_priority("live_scanner", max_wait_secs=min(interval_secs, 240))
+            # [2026-08-31] Priority-window wait now happens once at the
+            # cycle boundary (above), not per batch — see that comment.
 
             batch_started = time.time()
             batch_records: dict[str, dict] = {}
