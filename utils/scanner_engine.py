@@ -1356,7 +1356,8 @@ def nifty_regime(nifty: pd.Series) -> str:
 #  SCORE_STOCK  — thin wrapper around scoring_core.compute_bar
 # ══════════════════════════════════════════════════════════════════
 
-def _primary_blocker(r, result: dict, settings: Optional[dict] = None) -> str:
+def _primary_blocker(r, result: dict, settings: Optional[dict] = None,
+                      recommendation_override: Optional[str] = None) -> str:
     """
     Identify the single most important reason a stock did not reach a
     higher Recommendation tier.
@@ -1399,12 +1400,27 @@ def _primary_blocker(r, result: dict, settings: Optional[dict] = None) -> str:
          override can't make this text disagree with the gate that actually
          ran.
 
+    [Fix, follow-up to fast-winner audit — same day] recommendation_override:
+    apply_smc_structural_gate() can cap final_tier BELOW what LS/CV/EQ alone
+    earned (e.g. Developing capped to Watch on a genuine SMC conflict). That
+    cap is already surfaced separately, up front, by the SMC-prefix logic at
+    the call site. Left unaware of it, this function would grade the row
+    against Watch→Developing's gate (using the POST-cap Recommendation),
+    find LS/CV/EQ already clear Developing's floors, and fall through to the
+    "stale settings/cache" message — implying a data problem when the real
+    explanation is the SMC cap already stated in the prefix. Pass the
+    PRE-gate tier here (_pre_structural_gate_tier) whenever the SMC gate was
+    causal, so this function explains why the *uncapped* tier didn't go
+    higher, and the redundant/misleading stale-cache text doesn't fire under
+    an SMC cap. Defaults to result["Recommendation"] when not provided,
+    preserving prior behavior for non-SMC-capped rows.
+
     Returns a short human-readable string, or "" for Actionable/better.
     """
     from utils.conviction_score_v1 import V3_THRESHOLD_DEFAULTS
     t = {**V3_THRESHOLD_DEFAULTS, **(settings or {})}
 
-    recommendation = str(result.get("Recommendation", result.get("Category", "Skip")))
+    recommendation = str(recommendation_override or result.get("Recommendation", result.get("Category", "Skip")))
     lifecycle = str(result.get("Lifecycle", "") or "").upper()
 
     # Nothing to block for already-actionable-or-better stocks.
@@ -2516,7 +2532,24 @@ def score_stock(
         # meant this guard only ever matched "Actionable", leaving Execute/
         # Elite rows to fall through and get a spurious blocker written below.
         category = result.get("Recommendation", result.get("Category", "Avoid"))
-        blocker = _primary_blocker(r, result, settings)
+
+        # [Fix, follow-up to fast-winner audit — same day] Determine SMC
+        # gate causality BEFORE calling _primary_blocker(), not after, so
+        # we can tell it to grade against the PRE-gate tier when the gate
+        # actually capped this row. Otherwise it grades against the
+        # POST-gate Recommendation, finds LS/CV/EQ already clear the next
+        # gate up, and reports "stale settings/cache" on a row that's
+        # perfectly explained by the SMC cap already in the prefix below.
+        _smc_state = result.get("SMC_Structural_State")
+        _smc_reason = result.get("SMC_Structural_Reason")
+        _post_gate_rank = RECOMMENDATION_RANK.get(result.get("Recommendation"), 0)
+        _pre_gate_rank = RECOMMENDATION_RANK.get(_pre_structural_gate_tier, 0)
+        _gate_was_causal = _post_gate_rank < _pre_gate_rank
+
+        blocker = _primary_blocker(
+            r, result, settings,
+            recommendation_override=(_pre_structural_gate_tier if _gate_was_causal else None),
+        )
         # [Fix, 2026-08-16] When the SMC structural gate actually capped
         # this row's Recommendation (state isn't VALID_ENTRY_ZONE, i.e.
         # apply_smc_structural_gate() changed something), that reason
@@ -2537,11 +2570,6 @@ def score_stock(
         # provably changed the tier (_pre_structural_gate_tier vs. the
         # post-gate rank actually written to Recommendation) — see the
         # scanner audit ("Primary Blocker labeling bug") for the analysis.
-        _smc_state = result.get("SMC_Structural_State")
-        _smc_reason = result.get("SMC_Structural_Reason")
-        _post_gate_rank = RECOMMENDATION_RANK.get(result.get("Recommendation"), 0)
-        _pre_gate_rank = RECOMMENDATION_RANK.get(_pre_structural_gate_tier, 0)
-        _gate_was_causal = _post_gate_rank < _pre_gate_rank
         if _smc_state and _smc_state != "VALID_ENTRY_ZONE" and _gate_was_causal:
             _smc_text = f"SMC {_smc_state.replace('_', ' ').title()}"
             if _smc_reason:
