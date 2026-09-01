@@ -37,6 +37,8 @@ from utils.backtest_engine import (
     generate_signals_historical,
     simulate_trades,
 )
+from utils.scoring_core import ScoringParams, build_indicators, compute_bar
+from utils.sector_map import build_sector_benchmark_frames, sector_benchmark_for_symbol
 
 from utils.time_utils import now_ist as _now_ist, IST as _IST
 
@@ -137,8 +139,158 @@ def _fetch_ohlcv(symbols: list[str], years: int, progress_cb) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MERGE: signals + trades
+#  RS vs SECTOR CALIBRATION — standalone, read-only, own button.
+#  Diagnoses "Leadership weakness after enabling RS vs Sector": _leadership()
+#  in utils/conviction_score_v1.py scores RS vs Sector with the SAME
+#  breakpoint ladder as RS vs Market, but rs_vs_sector (stock vs its own
+#  leave-one-out sector-peer average) is naturally far more tightly/zero-
+#  centered distributed than rs_composite (stock vs the whole Nifty index),
+#  so reusing those cutoffs systematically depresses the RS-vs-Sector
+#  sub-score — and therefore the whole Leadership score — for most stocks
+#  the moment enable_sector_rs is turned on. This runs the exact same
+#  build_indicators()+compute_bar() pipeline score_stock() uses internally,
+#  pulls the RAW ratios (before they're bucketed into points), and proposes
+#  new breakpoints matched by percentile rank rather than guessed.
 # ══════════════════════════════════════════════════════════════════════════════
+
+_EXISTING_MARKET_LADDER = [(0.15, 12), (0.10, 10), (0.05, 8), (0.03, 6), (0.00, 4), (-0.03, 2)]
+_EXISTING_SECTOR_PTS    = [10, 8, 7, 5, 3, 1]  # point values for each rung (unchanged by this)
+
+
+def render_rs_sector_calibration():
+    with st.expander("📐 RS vs Sector — Threshold Calibration", expanded=False):
+        st.markdown(
+            "<span style='color:#64748b;font-size:0.82rem;'>"
+            "Read-only. Runs the live scoring pipeline across the universe, today, "
+            "and compares the raw rs_vs_sector distribution to rs_composite (RS vs "
+            "Market) — the two currently share the same breakpoint ladder in "
+            "<code>_leadership()</code>, which is very likely why Leadership scores "
+            "dropped after enabling sector RS. No scoring code is modified here."
+            "</span>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("")
+
+        cal_c1, cal_c2 = st.columns(2)
+        with cal_c1:
+            cal_n = st.slider("Universe size (symbols)", 50, 500, 150, step=50,
+                               key="cal_universe_n",
+                               help="Smaller = faster test run. Full 500 for a production-grade read.")
+        with cal_c2:
+            cal_years = st.selectbox("History", [1, 2], index=0, key="cal_years")
+
+        run_cal = st.button("▶ Run Calibration", key="btn_run_rs_sector_cal")
+        if not run_cal:
+            st.info("Click **▶ Run Calibration** to pull today's rs_vs_sector distribution.")
+            return
+
+        cal_symbols = list(NIFTY500_SYMBOLS)[:cal_n]
+
+        prog = st.progress(0, text="📥 Fetching Nifty index…")
+        nifty = _fetch_nifty(years=cal_years)
+        if nifty.empty:
+            prog.empty()
+            st.error("❌ Nifty fetch failed — cannot compute RS. Check network access.")
+            return
+
+        def _cal_fetch_prog(k, total, msg):
+            prog.progress(min(0.05 + 0.30 * (k / total), 0.35), text=f"📥 Fetching OHLCV… {msg}")
+
+        history = _fetch_ohlcv(cal_symbols, cal_years, _cal_fetch_prog)
+        if not history:
+            prog.empty()
+            st.error("❌ No OHLCV data retrieved. Check network access.")
+            return
+
+        prog.progress(0.4, text="🏭 Building sector benchmark frames…")
+        close_by_symbol = {s: d["close"] for s, d in history.items() if d is not None and not d.empty}
+        frames = build_sector_benchmark_frames(close_by_symbol)
+
+        params = ScoringParams()
+        rs_composite_vals, rs_sector_vals = [], []
+        unavailable = 0
+        symbols_scored = list(history.items())
+        for k, (sym, df) in enumerate(symbols_scored, 1):
+            if k % 25 == 0:
+                prog.progress(min(0.4 + 0.55 * (k / len(symbols_scored)), 0.95),
+                              text=f"⚙️ Scoring… {k}/{len(symbols_scored)}")
+            if df is None or df.empty or len(df) < 70:
+                continue
+            sector_series = sector_benchmark_for_symbol(frames, sym)
+            try:
+                ia = build_indicators(df, nifty, params, sector_series=sector_series)
+                r = compute_bar(ia, i=-1, params=params)
+            except Exception:
+                continue
+            if r is None:
+                continue
+            rs_composite_vals.append(r.rs_composite)
+            if r.rs_sector_available:
+                rs_sector_vals.append(r.rs_vs_sector)
+            else:
+                unavailable += 1
+
+        prog.progress(1.0, text="✅ Done")
+        prog.empty()
+
+        rc   = pd.Series(rs_composite_vals, dtype=float)
+        rsec = pd.Series(rs_sector_vals, dtype=float)
+        if rc.empty or rsec.empty:
+            st.error("❌ Not enough scored symbols to compute a distribution "
+                      "(check that enable_sector_rs is on and sector peers resolved).")
+            return
+
+        st.success(f"✅ Scored **{len(rc)}** symbols. rs_vs_sector unavailable for "
+                    f"**{unavailable}** (thin/unmapped sector).", icon="✅")
+
+        # ── Percentile table ──────────────────────────────────────────────
+        pcts = [5, 10, 25, 50, 75, 90, 95]
+        pct_df = pd.DataFrame({
+            "Percentile": [f"{p}th" for p in pcts],
+            "rs_composite (vs Market)": [round(rc.quantile(p / 100), 4) for p in pcts],
+            "rs_vs_sector (vs Peers)":  [round(rsec.quantile(p / 100), 4) for p in pcts],
+        })
+        st.markdown("**Distribution comparison**")
+        st.dataframe(pct_df, width='stretch', hide_index=True)
+
+        # ── % clearing each existing threshold ───────────────────────────
+        clear_rows = []
+        for cutoff, _pts in _EXISTING_MARKET_LADDER:
+            clear_rows.append({
+                "Threshold": f"> {cutoff}",
+                "% clearing it — rs_composite": round((rc > cutoff).mean() * 100, 1),
+                "% clearing it — rs_vs_sector": round((rsec > cutoff).mean() * 100, 1),
+            })
+        st.markdown("**Same cutoffs, very different pass rates** — this is the mismatch")
+        st.dataframe(pd.DataFrame(clear_rows), width='stretch', hide_index=True)
+
+        # ── Proposed percentile-rank-matched breakpoints ─────────────────
+        proposed = []
+        for (cutoff, _pts), pts in zip(_EXISTING_MARKET_LADDER, _EXISTING_SECTOR_PTS):
+            target_frac = (rc > cutoff).mean()
+            new_cutoff = float(rsec.quantile(1 - target_frac)) if 0 < target_frac < 1 else cutoff
+            proposed.append((round(new_cutoff, 4), pts, round(target_frac * 100, 1)))
+
+        st.markdown("**Proposed RS vs Sector ladder** (percentile-rank matched, "
+                     "not guessed — replaces `_leadership()`'s block in "
+                     "`utils/conviction_score_v1.py` ~line 230, and the analogous "
+                     "block in `_leadership_v4()`)")
+        code_lines = []
+        for i, (cutoff, pts, frac) in enumerate(proposed):
+            kw = "if  " if i == 0 else "elif"
+            code_lines.append(f"    {kw} rsec > {cutoff:<8}: ls_rs_sector = {pts:<3}  "
+                               f"# matches {frac}% of stocks (was rsec > "
+                               f"{_EXISTING_MARKET_LADDER[i][0]})")
+        code_lines.append("    else:                    ls_rs_sector = 0")
+        st.code("\n".join(code_lines), language="python")
+
+        st.caption(
+            "⚠️ One day's snapshot. RS distributions shift with market regime "
+            "(trending vs choppy) — re-run this on a couple of different days "
+            "before committing these numbers to scoring code."
+        )
+
+
 
 def _build_merged(
     symbols:   list[str],
@@ -522,6 +674,9 @@ def render(settings=None):
         unsafe_allow_html=True,
     )
     st.markdown("")
+
+    render_rs_sector_calibration()
+    st.markdown("---")
 
     # ── Settings ─────────────────────────────────────────────────────────────
     with st.expander("⚙️ Diagnostic Settings", expanded=True):
