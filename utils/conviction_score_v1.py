@@ -215,7 +215,18 @@ def _leadership(r: "BarResult") -> tuple[int, dict]:
     else:            ls_rs_market = 0
 
     # ── 1b. RS vs Sector (0-10) ──────────────────────────────────────
-    # Same shape of ladder as RS vs Market, applied to r.rs_vs_sector.
+    # Percentile-rank-matched ladder (calibrated via diagnostic.py's RS
+    # vs Sector — Threshold Calibration tool, 2026-09-01 run). rs_vs_sector
+    # (leave-one-out sector-peer average) is far more tightly/zero-centered
+    # distributed than rs_composite (vs whole Nifty), so the old ladder
+    # reused RS-vs-Market's cutoffs verbatim and systematically depressed
+    # this sub-score for most stocks. These cutoffs instead match each
+    # rung's original RS-vs-Market pass-rate against the actual rs_vs_sector
+    # distribution — same selectivity, different scale. NOT yet backtest-
+    # validated against Leadership-tier trade outcomes (PF/win-rate) — only
+    # distribution-matched from a single day's snapshot; re-verify via the
+    # diagnostic tool's backtest path across a couple of market regimes
+    # before treating these as final.
     # If no sector benchmark was wired in for this symbol (rs_sector_
     # available=False — see scoring_core.build_indicators/sector_map.
     # build_sector_benchmark_series), award a flat neutral half-credit
@@ -227,13 +238,13 @@ def _leadership(r: "BarResult") -> tuple[int, dict]:
         ls_rs_sector = 5
     else:
         rsec = r.rs_vs_sector
-        if   rsec > 0.15:  ls_rs_sector = 10
-        elif rsec > 0.10:  ls_rs_sector = 8
-        elif rsec > 0.05:  ls_rs_sector = 7
-        elif rsec > 0.03:  ls_rs_sector = 5
-        elif rsec > 0.00:  ls_rs_sector = 3
-        elif rsec > -0.03: ls_rs_sector = 1
-        else:              ls_rs_sector = 0
+        if   rsec > 0.0973:  ls_rs_sector = 10  # matches 20.0% of stocks (was rsec > 0.15)
+        elif rsec > 0.0441:  ls_rs_sector = 8   # matches 29.4% of stocks (was rsec > 0.1)
+        elif rsec > -0.0055: ls_rs_sector = 7   # matches 44.5% of stocks (was rsec > 0.05)
+        elif rsec > -0.0168: ls_rs_sector = 5   # matches 49.2% of stocks (was rsec > 0.03)
+        elif rsec > -0.0533: ls_rs_sector = 3   # matches 59.6% of stocks (was rsec > 0.0)
+        elif rsec > -0.0878: ls_rs_sector = 1   # matches 69.8% of stocks (was rsec > -0.03)
+        else:                ls_rs_sector = 0
 
     # ── 1c. RS Consistency (0-5) ─────────────────────────────────────
     # r.rs_consistency: 0-1 fraction — how directionally aligned rs1/
@@ -1449,17 +1460,20 @@ def _leadership_v4(r: "BarResult", smc_state=None, swing_label: Optional[str] = 
     elif rc > -0.03: rs_market = 2
     else:            rs_market = 0
 
+    # Percentile-rank-matched ladder — see _leadership()'s "RS vs Sector"
+    # comment above for the full rationale; same calibration applied here
+    # (2026-09-01, diagnostic.py RS vs Sector — Threshold Calibration).
     if not r.rs_sector_available:
         rs_sector = 5
     else:
         rsec = r.rs_vs_sector
-        if   rsec > 0.15:  rs_sector = 10
-        elif rsec > 0.10:  rs_sector = 8
-        elif rsec > 0.05:  rs_sector = 7
-        elif rsec > 0.03:  rs_sector = 5
-        elif rsec > 0.00:  rs_sector = 3
-        elif rsec > -0.03: rs_sector = 1
-        else:              rs_sector = 0
+        if   rsec > 0.0973:  rs_sector = 10  # matches 20.0% of stocks (was rsec > 0.15)
+        elif rsec > 0.0441:  rs_sector = 8   # matches 29.4% of stocks (was rsec > 0.1)
+        elif rsec > -0.0055: rs_sector = 7   # matches 44.5% of stocks (was rsec > 0.05)
+        elif rsec > -0.0168: rs_sector = 5   # matches 49.2% of stocks (was rsec > 0.03)
+        elif rsec > -0.0533: rs_sector = 3   # matches 59.6% of stocks (was rsec > 0.0)
+        elif rsec > -0.0878: rs_sector = 1   # matches 69.8% of stocks (was rsec > -0.03)
+        else:                rs_sector = 0
 
     rs_consistency = round(r.rs_consistency * 5)
     mom = r.rs_momentum
@@ -1511,12 +1525,22 @@ def _leadership_v4(r: "BarResult", smc_state=None, swing_label: Optional[str] = 
         mkt += 4
     elif r.nifty_regime_val == "bearish" and r.trend_up:
         mkt += 1   # leading despite a hostile regime — real, but discounted
+    # Cutoffs below reuse the SAME percentile-rank mapping computed for
+    # _leadership()'s RS-vs-Sector ladder (2026-09-01 diagnostic.py run):
+    # this block's original 0.10/0.03/0.0 cutoffs are three of the six
+    # rungs from the market-scaled ladder, so the tool's existing matched-
+    # rsec pairs apply directly — no new calibration run needed.
+    #   old cutoff 0.10 -> rsec > 0.0441  (29.4% pass rate)
+    #   old cutoff 0.03 -> rsec > -0.0168 (49.2% pass rate)
+    #   old cutoff 0.00 -> rsec > -0.0533 (59.6% pass rate)
+    # Same caveat as _leadership(): distribution-matched, not yet
+    # backtest-validated against outcomes.
     if r.rs_sector_available:
-        if r.rs_vs_sector > 0.10:
+        if r.rs_vs_sector > 0.0441:
             mkt += 8
-        elif r.rs_vs_sector > 0.03:
+        elif r.rs_vs_sector > -0.0168:
             mkt += 5
-        elif r.rs_vs_sector > 0.0:
+        elif r.rs_vs_sector > -0.0533:
             mkt += 2
     else:
         mkt += 4   # flat neutral credit, same convention as rs_sector above
