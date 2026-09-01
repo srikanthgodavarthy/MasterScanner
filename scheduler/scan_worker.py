@@ -706,6 +706,16 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                   at the cycle boundary and between batches so a lost
                   lock stops this loop within one batch, not one full
                   5-minute cycle.
+
+    Settings persistence [2026-09]: at the top of every cycle this
+    loop re-reads the Settings page's persisted overrides (see
+    utils/settings_state.py) and merges them onto pages.settings.
+    DEFAULTS, so compute_live_scan_batch() below runs with whatever
+    cci_len/execute_threshold/t1_*/ENABLE_*/ema_*/v3_*/promo_* values
+    were last saved from the Settings page, instead of always using
+    module-level defaults regardless of what a user configured. Only
+    "workers" stays pinned to this loop's own max_workers — see
+    LIVE_SCANNER_MAX_WORKERS's comment.
     """
     from utils.scan_state import save_snapshot, load_snapshot_payload_cached
     from utils.live_scanner_job import compute_live_scan_batch, build_regime_context_for_cycle, fetch_cycle_nifty_series
@@ -713,6 +723,8 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
     from utils.scanner_engine import NIFTY500_SYMBOLS
     from utils.supabase_client import save_scan_snapshot, archive_daily_scan
     from utils.system_state import should_scheduler_run, manual_override_active, clear_manual_override
+    from utils.settings_state import get_effective_settings
+    from pages.settings import DEFAULTS as SETTINGS_DEFAULTS
     if health_checks:
         from utils.scan_health_monitor import check_health, record_cycle_result
 
@@ -792,6 +804,24 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             logger.info("[live_scanner] system_state resumed — running cycles normally again")
             was_paused = False
 
+        # [Settings persistence, 2026-09] Re-read the Settings page's
+        # persisted overrides (utils/settings_state.py) at the top of
+        # every cycle, not just once at process startup — this is a
+        # standalone process with no Streamlit session of its own, so
+        # this is the ONLY way it ever finds out about a Settings-page
+        # change (cci_len/execute_threshold/t1_*/t2_*/ic_* thresholds,
+        # ENABLE_* flags, ema_* periods, v3_* tier gates, promo_*
+        # thresholds, ...). get_effective_settings() is cached for 60s
+        # (see that module), so this is at most one Neon round trip per
+        # minute shared across every process that calls it, not one per
+        # 5-minute cycle per loop thread. "workers" is deliberately
+        # re-pinned to this loop's own max_workers afterward — see
+        # LIVE_SCANNER_MAX_WORKERS's module-level comment on why
+        # background concurrency stays independent of whatever the
+        # manual "Run Scan" button's worker count is set to.
+        cycle_settings = get_effective_settings(SETTINGS_DEFAULTS)
+        cycle_settings["workers"] = max_workers
+
         effective_cooldown = batch_cooldown_secs
         if health_checks:
             decision = check_health("live_scanner")
@@ -855,7 +885,7 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                               "batches will each fetch their own copy instead")
 
         try:
-            regime_ctx = build_regime_context_for_cycle(nifty_series=cycle_nifty_series)
+            regime_ctx = build_regime_context_for_cycle(settings=cycle_settings, nifty_series=cycle_nifty_series)
         except Exception:
             logger.exception("[live_scanner] regime context fetch failed — reusing previous cycle's regime")
             regime_ctx = None
@@ -902,7 +932,7 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                 try:
                     from utils.scan_health_monitor import job_memory_delta
                     with job_memory_delta(f"live_scanner_batch[{batch_i + 1}/{n_batches}]"):
-                        df_raw = compute_live_scan_batch(chunk, settings={"workers": max_workers}, nifty_series=cycle_nifty_series)
+                        df_raw = compute_live_scan_batch(chunk, settings=cycle_settings, nifty_series=cycle_nifty_series)
                     df_batch = apply_regime_layer(df_raw, regime_ctx) if (regime_ctx and df_raw is not None and not df_raw.empty) else df_raw
                     n_ok = 0
                     for rec in _live_scan_records(df_batch):
