@@ -21,6 +21,10 @@ from utils.supabase_client import (
     load_scan_history, _is_available, SCHEMA_SQL,
 )
 from utils.scanner_engine import NIFTY500_SYMBOLS
+from utils.settings_state import (
+    get_persisted_settings, save_setting,
+    SCHEMA_SQL as SETTINGS_SCHEMA_SQL,
+)
 
 # ══════════════════════════════════════════════════════════════════
 #  DEFAULTS
@@ -320,8 +324,48 @@ div[data-testid="stSlider"] div[role="slider"] {
 def _g(key, default=None):
     return st.session_state.get(key, DEFAULTS.get(key, default))
 
+def _hydrate_persisted_settings() -> None:
+    """
+    Seeds THIS session's st.session_state from Neon's persisted
+    Settings overrides (utils.settings_state) the first time the
+    Settings page renders in it — so a brand-new browser tab/session
+    (or a redeploy that wipes in-memory state) shows the last values
+    actually saved, not a reset back to DEFAULTS. Runs once per
+    session (guarded by "_settings_hydrated"); subsequent reruns of
+    this page in the same session leave session_state alone so a
+    user's in-progress, not-yet-committed widget edits are never
+    silently overwritten by a background refetch.
+
+    Also seeds "_persisted_settings_cache", the snapshot _s() diffs
+    against below to decide whether a given render actually changed a
+    key (and therefore needs to write to Neon) or is just re-applying
+    the same value Streamlit always re-passes into every widget on
+    every rerun.
+    """
+    if st.session_state.get("_settings_hydrated"):
+        return
+    persisted = get_persisted_settings()
+    for k, v in persisted.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+    st.session_state["_persisted_settings_cache"] = dict(persisted)
+    st.session_state["_settings_hydrated"] = True
+
 def _s(key, val):
     st.session_state[key] = val
+    # Persist to Neon too, but only on an ACTUAL change — pages/
+    # settings.py's tab functions re-run (and re-call _s() for every
+    # key) on every Streamlit rerun of this page, not just when the
+    # user touches that particular widget, so writing unconditionally
+    # here would fire one Neon UPDATE per settings key on every single
+    # rerun. Diffing against "_persisted_settings_cache" (the last
+    # known-persisted value, falling back to DEFAULTS for a key that's
+    # never been saved before) means Neon only gets touched when a
+    # value genuinely differs from what's already there.
+    cache = st.session_state.setdefault("_persisted_settings_cache", {})
+    if cache.get(key, DEFAULTS.get(key)) != val:
+        save_setting(key, val)
+        cache[key] = val
 
 def _label(text: str) -> None:
     st.markdown(f'<span class="f-label">{text}</span>', unsafe_allow_html=True)
@@ -1257,6 +1301,12 @@ def _tab_system() -> None:
 
     with st.expander("🗄️ Database schema", expanded=False):
         st.code(SCHEMA_SQL, language="sql")
+        st.caption(
+            "Settings persistence (utils/settings_state.py) — run this once "
+            "too, so Settings-page changes survive across sessions and reach "
+            "scheduler/scan_worker.py:"
+        )
+        st.code(SETTINGS_SCHEMA_SQL, language="sql")
 
     with st.expander("🕐 Scan history", expanded=False):
         if st.button("Load last 10 runs", key="btn_hist"):
@@ -1304,6 +1354,7 @@ def _tab_system() -> None:
 # ══════════════════════════════════════════════════════════════════
 
 def render() -> dict:
+    _hydrate_persisted_settings()
     st.markdown(_CSS, unsafe_allow_html=True)
 
     st.markdown(
