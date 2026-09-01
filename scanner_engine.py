@@ -1,0 +1,3414 @@
+"""
+utils/scanner_engine.py
+────────────────────────
+Trinity — data fetch, indicator primitives, and live scanner.
+
+All scoring logic lives in utils/scoring_core.py (compute_bar / BarResult).
+score_stock() here is now a thin wrapper: build_indicators → compute_bar(i=-1).
+"""
+
+from typing import Optional
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import streamlit as st
+import requests
+import io
+import logging
+from dataclasses import replace as _dataclass_replace
+import time
+import random
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait
+import warnings
+warnings.filterwarnings("ignore")
+
+# fetch_ohlcv/_strip_tz now live in utils/market_data.py (2026-07-24) —
+# that module has no NSE/regime dependencies, so pages that only need
+# single-symbol OHLCV (pages/portfolio.py) can import from there directly
+# instead of pulling in this module's import-time NSE constituent fetch.
+# Re-exported here so existing `from utils.scanner_engine import
+# fetch_ohlcv` call sites keep working unchanged.
+from utils.market_data import fetch_ohlcv, _strip_tz  # noqa: F401  (re-export)
+
+# [2026-08-17] Persistent, module-level scorer pool — reused across every
+# run_scanner() call instead of spun up fresh per batch (10x/cycle, every
+# 5 min). The old per-call ThreadPoolExecutor(max_workers=...) combined
+# with shutdown(wait=False) meant that any symbol whose score_stock() call
+# ran past _SCORE_WAIT_TIMEOUT_S left its worker thread running in the
+# background *forever* (Python can't force-kill a thread) — and every one
+# of those leaked threads pinned its whole closure (all_data for the
+# batch, _sector_frames, nifty_series, ...) in memory. Across many cycles
+# this showed up as steadily climbing RSS, duplicate multi-MB DataFrames
+# retained simultaneously in utils.memory_profiler's dataframe dump, and
+# a linearly growing weakref (ReferenceType) count — see RAM investigation
+# notes. A single long-lived pool means a stuck symbol still only costs
+# one permanently-busy worker slot (bounded, not unbounded growth), and
+# process() below (in run_scanner()) narrows what gets captured so a
+# stuck future pins one symbol's frame instead of the entire batch's
+# all_data dict.
+#
+# [2026-08-24, RAM/CPU audit] The above fix made the pool persistent but
+# ALSO silently made it a fixed size (_SCORER_POOL_WORKERS=6), regardless
+# of what any caller asked for — run_scanner()'s own `max_workers`
+# parameter (still accepted, still threaded all the way down from
+# scheduler/scan_worker.py's LIVE_SCANNER_MAX_WORKERS=4,
+# utils/inprocess_scheduler.py's INPROCESS_LIVE_SCANNER_MAX_WORKERS=2,
+# and pages/scanner.py's manual "Run Scan" button's 10) became dead code
+# from that day forward: every caller, on every deployment tier, always
+# got exactly 6 concurrent scoring threads no matter what it passed in.
+# That's the opposite of the tunable-per-deployment-tier design
+# LIVE_SCANNER_MAX_WORKERS/INPROCESS_LIVE_SCANNER_MAX_WORKERS were built
+# for (see scheduler/scan_worker.py's own comment on why the in-process
+# tier deliberately runs lighter, sharing the container's CPU with the
+# Streamlit UI) — and a likely contributor to the CPU 97-100% warnings
+# seen on the in-process tier, which asked for 2 workers and silently got
+# 6 (further multiplied by whatever concurrency scheduler/scan_worker.py
+# itself runs batches at).
+#
+# Fix: key the persistent-pool cache by size instead of hardcoding one
+# size. Each distinct max_workers value used across the app's lifetime
+# (in practice: 2, 4, 10 — three call sites, three sizes) gets its OWN
+# persistent pool, created once and reused forever after — same bounded-
+# growth guarantee as the single-pool design above (a stuck future still
+# only ever pins one of THAT pool's fixed worker slots), but now actually
+# honors the caller's requested concurrency instead of every caller
+# silently sharing one 6-worker pool. This does NOT reintroduce the
+# original per-call-executor leak: pools are cached by size and never
+# torn down, so the leaked-thread scenario the 2026-08-17 fix addressed
+# still cannot happen.
+_SCORER_POOL_WORKERS = 6   # fallback only — used when a caller omits max_workers entirely
+_scorer_pools: dict[int, ThreadPoolExecutor] = {}
+_scorer_pools_lock = threading.Lock()
+
+
+def _get_scorer_pool(max_workers: int) -> ThreadPoolExecutor:
+    """Returns the persistent ThreadPoolExecutor sized to `max_workers`,
+    creating it once per distinct size and reusing it on every later call
+    with the same size — see the module-level comment above this
+    function's neighboring _scorer_pools_lock/_scorer_pools for why this
+    replaced the single fixed-size _scorer_pool."""
+    max_workers = int(max_workers) if max_workers else _SCORER_POOL_WORKERS
+    pool = _scorer_pools.get(max_workers)
+    if pool is not None:
+        return pool
+    with _scorer_pools_lock:
+        pool = _scorer_pools.get(max_workers)
+        if pool is None:
+            pool = ThreadPoolExecutor(
+                max_workers=max_workers, thread_name_prefix=f"scorer-pool-{max_workers}"
+            )
+            _scorer_pools[max_workers] = pool
+        return pool
+
+_log = logging.getLogger(__name__)
+
+try:
+    # Present in recent yfinance releases; lets us give rate-limit errors
+    # their own (much longer) backoff instead of treating them the same
+    # as a generic network blip. Not all versions expose this, so we fall
+    # back to string-matching the exception message if the import fails.
+    from yfinance.exceptions import YFRateLimitError as _YFRateLimitError
+except Exception:
+    _YFRateLimitError = None
+
+
+# ══════════════════════════════════════════════════════════════════
+#  YFINANCE RETRY WRAPPER
+# ══════════════════════════════════════════════════════════════════
+# 2026-07-15: batch fetches (scanner + backtest) had no timeout and no
+# retry, so a single stalled/rate-limited yf.download() call could hang
+# the whole run indefinitely with zero visible progress (yfinance's
+# underlying curl_cffi session has a known bug where `timeout` is not
+# always honored — see ranaroussi/yfinance and lexiforest/curl_cffi
+# issue trackers). This wrapper bounds each attempt and gives up loudly
+# after a few tries instead of hanging silently.
+#
+# 2026-07-15 (later same day) — COLD-CACHE HARDENING:
+# The above was enough for the normal "small tail fetch per symbol"
+# workload, but a cold cache (fresh redeploy, or history-cache Storage
+# bucket not yet populated) sends ALL symbols through need_full at once
+# — 10 batches of 50 tickers, each internally multi-threaded by
+# yf.download(threads=True). That load pattern surfaced two failure
+# modes that never showed up under the normal light workload:
+#
+#   1. YFRateLimitError — Yahoo throttles bursts of concurrent batch
+#      calls. Treating this the same as a generic exception (5s/10s/15s
+#      backoff) isn't enough; rate limits need a longer, escalating
+#      cooldown or the very next attempt just gets limited again.
+#   2. sqlite3.OperationalError("database is locked") — yfinance keeps a
+#      local SQLite cache (tz/cookie data) that multiple threads across
+#      concurrent batches can hit at once. This is transient (the lock
+#      clears in milliseconds) but needs its own short retry rather than
+#      the full linear backoff, and benefits from serializing calls
+#      rather than letting every batch fire at the same instant.
+#
+# Two changes address this without touching any caller's contract
+# (still fail-soft, still returns an empty DataFrame, never raises):
+#   - A process-wide minimum spacing between successive yf.download()
+#     *attempts* (not just retries), enforced via a lock + shared
+#     timestamp, so a cold-cache run's 10+ batches don't all slam Yahoo
+#     back-to-back.
+#   - Error-type-aware backoff: rate limits get a longer exponential
+#     cooldown; "database is locked" gets a short jittered retry and
+#     forces threads=False on its next attempt (avoids re-triggering the
+#     same concurrent-write race); anything else keeps the original
+#     linear backoff.
+
+_YF_TIMEOUT       = 30    # seconds per attempt
+_YF_MAX_RETRIES   = 3
+_YF_BACKOFF_S     = 5     # base linear backoff for generic errors (5s, 10s, 15s...)
+
+_YF_MIN_SPACING_S = 2.0   # minimum gap enforced between successive yf.download calls,
+                          # process-wide — smooths out bursty cold-cache batch loops
+_YF_LOCK_RETRY_S  = 0.5   # base backoff for "database is locked" (short + jittered)
+_YF_LOCK_MAX_TRY  = 5     # locked-db is transient; worth a few extra quick attempts
+_YF_RATELIMIT_BASE_S = 20  # base cooldown for rate-limit errors (exponential: 20s, 40s, 80s...)
+
+_yf_call_lock  = threading.Lock()   # serializes spacing + protects _yf_last_call_ts
+_yf_last_call_ts = 0.0
+_multitasking_tasks_lock = threading.Lock()  # protects multitasking.config["TASKS"] pruning below — deliberately separate from _yf_call_lock, which _wait_for_spacing() holds *during* time.sleep(); sharing it would make pruning block on an unrelated multi-second sleep
+
+
+def _is_locked_db_error(exc: Exception) -> bool:
+    return "database is locked" in str(exc).lower()
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    if _YFRateLimitError is not None and isinstance(exc, _YFRateLimitError):
+        return True
+    msg = str(exc).lower()
+    return "rate limit" in msg or "too many requests" in msg
+
+
+def _wait_for_spacing():
+    """Blocks the caller (if needed) so consecutive yf.download() attempts
+    across the whole process are never closer together than
+    _YF_MIN_SPACING_S. Cheap no-op once the process has been idle a bit."""
+    global _yf_last_call_ts
+    with _yf_call_lock:
+        now = time.monotonic()
+        wait = _YF_MIN_SPACING_S - (now - _yf_last_call_ts)
+        if wait > 0:
+            # [2026-08-31 profiling] This lock is process-wide and was
+            # previously silent — a batch stuck here looks identical in
+            # the logs to a batch stuck on a slow network call. Only log
+            # non-trivial waits (>0.1s) to avoid spamming every call.
+            if wait > 0.1:
+                logging.getLogger(__name__).info(
+                    "_wait_for_spacing: throttled %.2fs (global %ss min-spacing lock)",
+                    wait, _YF_MIN_SPACING_S,
+                )
+            time.sleep(wait)
+        _yf_last_call_ts = time.monotonic()
+
+
+def _prune_multitasking_tasks() -> None:
+    """[Thread-leak fix, 2026-08-17] yfinance's batch downloader still
+    uses the `multitasking` package internally for threads=True (see
+    multitasking/__init__.py's `task` decorator). Every worker thread it
+    spawns is unnamed (default `Thread-N` from Python's own counter —
+    this is what shows up as `Thread-507..Thread-512` in a thread dump
+    after the process has been running a while: not 500 threads alive
+    at once, but confirmation that ~500 of these have been *created*
+    over the process lifetime) and gets permanently appended to
+    `multitasking.config["TASKS"]` — a module-level list that NOTHING
+    in the library ever prunes, not even its own `wait_for_tasks()`
+    (which only polls `is_alive()` against local copies, never touches
+    `config["TASKS"]` itself). Every completed download thread — plus
+    its closure over that call's args/kwargs — is held forever, for
+    the life of the process. This directly explains the steadily
+    climbing `ReferenceType` GC-tracked count seen in memory_profiler
+    across scan cycles, and is a separate leak from (additive to) the
+    arena-fragmentation RAM issue already fixed via mallopt().
+
+    Call this after every yf_download_with_retry() attempt (success or
+    failure — either way the spawned threads are done running, since
+    yf.download() itself blocks until its batch completes) to drop
+    references to tasks that have finished, so they can actually be
+    garbage collected instead of sitting in that list forever. Safe to
+    call even if `multitasking` isn't importable or its shape changes
+    in a future version — never raises, worst case this becomes a
+    no-op and the leak returns rather than crashing a scan cycle.
+    """
+    try:
+        import multitasking
+        with _multitasking_tasks_lock:
+            # [2026-08-18] Dedicated lock (NOT _yf_call_lock — see its
+            # definition above for why) because multitasking.config["TASKS"]
+            # is a single process-global list shared by every
+            # yf_download_with_retry() caller (live scanner's history fetch,
+            # backtest engine, setup-plan recovery). Without a lock, two
+            # callers finishing yf.download() at nearly the same instant can
+            # race: both read the list, both build a filtered copy, and
+            # whichever writes second silently drops whatever task the
+            # other caller's *own* concurrent yf.download() had just
+            # appended in between — not a crash, but a real dropped
+            # reference that undercounts multitasking's own bookkeeping for
+            # a download that's still genuinely running.
+            tasks = multitasking.config["TASKS"]
+            multitasking.config["TASKS"] = [t for t in tasks if t is not None and t.is_alive()]
+    except Exception:
+        pass
+
+
+
+def yf_download_with_retry(tickers, **kwargs):
+    """
+    Thin wrapper around yf.download() that adds:
+      - a bounded per-attempt timeout,
+      - process-wide minimum spacing between calls (avoids bursty
+        cold-cache runs hammering Yahoo all at once),
+      - error-aware backoff: rate limits get a long exponential cooldown,
+        "database is locked" gets a short jittered retry (with
+        threads=False forced on the retry to stop the concurrent-write
+        race that caused it), everything else keeps the original linear
+        backoff.
+
+    Returns an empty DataFrame (never raises) if all attempts fail,
+    matching the existing fail-soft behaviour of fetch_batch_ohlcv /
+    _fetch_bt_batch / history_store._raw_fetch.
+    """
+    kwargs.setdefault("timeout", _YF_TIMEOUT)
+    last_exc = None
+    lock_retry_count = 0
+    attempt = 1
+    max_total_attempts = _YF_MAX_RETRIES + _YF_LOCK_MAX_TRY  # locked-db retries are extra, not counted against the normal budget
+
+    while attempt <= max_total_attempts:
+        _wait_for_spacing()
+        try:
+            result = yf.download(tickers, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+
+            if _is_locked_db_error(exc) and lock_retry_count < _YF_LOCK_MAX_TRY:
+                lock_retry_count += 1
+                # Force single-threaded on retry — concurrent threads writing
+                # to yfinance's local SQLite cache is the actual cause here.
+                kwargs["threads"] = False
+                backoff = _YF_LOCK_RETRY_S * lock_retry_count + random.uniform(0, 0.5)
+                _log.warning(
+                    "yf.download hit a locked local cache (attempt %d/%d, retrying "
+                    "single-threaded in %.1fs): %s",
+                    lock_retry_count, _YF_LOCK_MAX_TRY, backoff, exc,
+                )
+                time.sleep(backoff)
+                continue   # doesn't consume a normal `attempt` slot
+
+            if _is_rate_limit_error(exc):
+                backoff = _YF_RATELIMIT_BASE_S * (2 ** (attempt - 1))
+                _log.warning(
+                    "yf.download rate-limited (attempt %d/%d, cooling down %ds): %s",
+                    attempt, _YF_MAX_RETRIES, backoff, exc,
+                )
+            else:
+                backoff = _YF_BACKOFF_S * attempt
+                _log.warning(
+                    "yf.download attempt %d/%d failed (%s): %s",
+                    attempt, _YF_MAX_RETRIES, type(exc).__name__, exc,
+                )
+
+            if attempt < _YF_MAX_RETRIES:
+                time.sleep(backoff)
+            attempt += 1
+            continue
+        finally:
+            # [Thread-leak fix, 2026-08-17] fires on EVERY attempt — success,
+            # caught exception (even the ones that `continue` above), or an
+            # uncaught one — because `finally` always runs when control
+            # leaves this try/except, regardless of which path. Each
+            # yf.download(threads=True) call is exactly where
+            # multitasking's leaked Thread objects get created (see
+            # _prune_multitasking_tasks()'s own docstring), so pruning
+            # right after each attempt — rather than only once when this
+            # function finally returns — keeps the list from growing
+            # across the retries within a single call too, not just
+            # across separate calls.
+            _prune_multitasking_tasks()
+
+        # No exception raised — but Yahoo's soft rate-limit/block on cloud
+        # IPs frequently comes back as an ordinary 200 response with zero
+        # rows rather than a raised error, especially during market hours
+        # under load. That failure mode used to be accepted as "no data"
+        # on attempt 1 with no backoff at all, since `return` exited the
+        # loop unconditionally on any non-exception result. Confirmed live
+        # via the Data Source Check page: a liquid, actively-traded symbol
+        # returned 0 bars from yf.download with nothing logged as an error.
+        # Treat an empty result the same as a rate-limit error — same
+        # exponential cooldown — before accepting it as genuinely empty.
+        if result is None or result.empty:
+            backoff = _YF_RATELIMIT_BASE_S * (2 ** (attempt - 1))
+            last_exc = last_exc or RuntimeError(
+                "yf.download returned empty with no exception (possible soft rate-limit/block)"
+            )
+            _log.warning(
+                "yf.download returned empty with no exception (attempt %d/%d) — "
+                "treating as a possible soft rate-limit/block, cooling down %ds",
+                attempt, _YF_MAX_RETRIES, backoff,
+            )
+            if attempt < _YF_MAX_RETRIES:
+                time.sleep(backoff)
+            attempt += 1
+            continue
+
+        return result
+
+    _log.error("yf.download giving up after %d attempts: %s", attempt - 1, last_exc)
+    return pd.DataFrame()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  TIMEZONE HELPER — now utils/market_data._strip_tz, imported above
+# ══════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════
+#  INDICATOR PRIMITIVES  (imported by scoring_core and backtest)
+# ══════════════════════════════════════════════════════════════════
+
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+def sma(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period).mean()
+
+def rsi(series: pd.Series, period: int = 21) -> pd.Series:
+    delta    = series.diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
+    avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
+    rs       = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(com=period - 1, adjust=False).mean()
+
+def stochastic(high: pd.Series, low: pd.Series, close: pd.Series,
+                k_period: int = 14, d_period: int = 3, k_smooth: int = 1) -> tuple[pd.Series, pd.Series]:
+    """
+    Standard Stochastic Oscillator. %K = (C - LLn)/(HHn - LLn)*100, %D = SMA(%K, d).
+
+    ``k_smooth`` (default 1 = no smoothing) applies an extra SMA(k_smooth) to
+    the raw %K before %D is derived from it — this is what turns "Fast
+    Stochastic" into TradingView's default "Stochastic" ("Slow Stochastic")
+    study, whose %K Length / %K Smoothing / %D Smoothing inputs default to
+    14 / 3 / 3. Defaults to 1 here (no smoothing, i.e. raw %K) to keep every
+    existing caller's behavior byte-for-byte unchanged; pass k_smooth=3 to
+    match TradingView's out-of-the-box Stochastic exactly (see
+    utils.stoch_convergence.score_stochastic_convergence, and
+    utils.cci_stochastic_signal.SignalParams which already defaults to
+    k_period=14/d_period=3/smooth_k=3 — this mirrors that convention).
+
+    Single-owner home for this primitive (architecture cleanup): it used to
+    be a private copy (_stochastic) living only inside utils/pillar_engine.py.
+    Moved here, next to the other shared indicator primitives (ema/sma/rsi/
+    atr/cci), so utils/scoring_core.py (the main scanner engine) can use the
+    real Stochastic Oscillator too instead of not having one at all.
+    pillar_engine now imports this function rather than defining its own.
+    """
+    hh    = high.rolling(k_period).max()
+    ll    = low.rolling(k_period).min()
+    rng   = (hh - ll).replace(0, np.nan)
+    raw_k = (close - ll) / rng * 100
+    k     = raw_k.rolling(k_smooth).mean() if k_smooth > 1 else raw_k
+    d     = k.rolling(d_period).mean()
+    return k, d
+
+
+
+def cci(close: pd.Series, period: int = 20) -> pd.Series:
+    """Vectorised CCI — significantly faster than the original Python loop."""
+    sma_s = close.rolling(period).mean()
+    # mean absolute deviation (vectorised rolling via apply on numpy)
+    mad_s = close.rolling(period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
+    mad_s = mad_s.replace(0, np.nan)
+    return (close - sma_s) / (0.015 * mad_s)
+
+def highest(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period).max()
+
+def lowest(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period).min()
+
+def pivot_high(high: pd.Series, lb: int) -> pd.Series:
+    roll_max = high.rolling(2 * lb + 1, center=True, min_periods=2 * lb + 1).max()
+    return high.where(high == roll_max)
+
+def pivot_low(low: pd.Series, lb: int) -> pd.Series:
+    roll_min = low.rolling(2 * lb + 1, center=True, min_periods=2 * lb + 1).min()
+    return low.where(low == roll_min)
+
+def ichimoku(high: pd.Series, low: pd.Series):
+    tenkan   = (highest(high, 9)  + lowest(low, 9))  / 2
+    kijun    = (highest(high, 26) + lowest(low, 26)) / 2
+    senkou_a = (tenkan + kijun) / 2
+    senkou_b = (highest(high, 52) + lowest(low, 52)) / 2
+    return tenkan, kijun, senkou_a, senkou_b
+
+def last_value(series: pd.Series) -> float:
+    valid = series.dropna()
+    return float(valid.iloc[-1]) if not valid.empty else np.nan
+
+
+# ══════════════════════════════════════════════════════════════════
+#  HARMONIC / ABCD  (shared via scoring_core._get_pivots)
+# ══════════════════════════════════════════════════════════════════
+
+TOLERANCE = 0.03
+
+def _in_range(val, target, tol=TOLERANCE):
+    return abs(val - target) <= tol
+
+def _retrace(a, b, c_):
+    leg1 = abs(b - a)
+    return np.nan if leg1 == 0 else abs(c_ - b) / leg1
+
+def _check_harmonic(xP, aP, bP, cP, dP, abR, bcLo, bcHi, cdR, xdR):
+    ab = _retrace(xP, aP, bP)
+    bc = _retrace(aP, bP, cP)
+    cd = _retrace(bP, cP, dP)
+    xd_den = abs(aP - xP)
+    xd = abs(dP - xP) / xd_den if xd_den != 0 else np.nan
+    if any(np.isnan(v) for v in [ab, bc, cd, xd]):
+        return False
+    return (
+        _in_range(ab, abR) and
+        bcLo - TOLERANCE <= bc <= bcHi + TOLERANCE and
+        _in_range(cd, cdR) and
+        _in_range(xd, xdR)
+    )
+
+def detect_pattern(xP, aP, bP, cP, dP):
+    if _check_harmonic(xP, aP, bP, cP, dP, 0.500, 0.382, 0.886, 3.618, 1.618): return "Crab"
+    if _check_harmonic(xP, aP, bP, cP, dP, 0.786, 0.382, 0.886, 1.618, 1.272): return "Butterfly"
+    if _check_harmonic(xP, aP, bP, cP, dP, 0.500, 0.382, 0.886, 1.618, 0.886): return "Bat"
+    if _check_harmonic(xP, aP, bP, cP, dP, 0.618, 0.382, 0.886, 1.272, 0.786): return "Gartley"
+    return ""
+
+def detect_harmonic(pivots_price, pivots_is_high):
+    if len(pivots_price) < 5:
+        return "", ""
+    dP, cP, bP, aP, xP = pivots_price[:5]
+    dH, cH, bH, aH, xH = pivots_is_high[:5]
+    if (not xH) and aH and (not bH) and cH and (not dH):
+        name = detect_pattern(xP, aP, bP, cP, dP)
+        if name: return "bull", name
+    if xH and (not aH) and bH and (not cH) and dH:
+        name = detect_pattern(xP, aP, bP, cP, dP)
+        if name: return "bear", name
+    return "", ""
+
+def detect_abcd(pivots_price, pivots_is_high, close_val, open_val, prev_high):
+    if len(pivots_price) < 4:
+        return False, False
+    dP, cP, bP, aP = pivots_price[:4]
+    dH, cH, bH, aH = pivots_is_high[:4]
+    bc_r = _retrace(aP, bP, cP)
+    cd_r = _retrace(bP, cP, dP)
+    if np.isnan(bc_r) or np.isnan(cd_r):
+        return False, False
+    valid_bc = _in_range(bc_r, 0.618) or _in_range(bc_r, 0.786)
+    valid_cd = _in_range(cd_r, 1.272) or _in_range(cd_r, 1.618)
+    abcd_bull = (not aH) and bH and (not cH) and (not dH) and valid_bc and valid_cd
+    valid_struct   = dP > cP and dP > bP and dP > aP
+    bearish_candle = (close_val < open_val) or (prev_high is not None and close_val < prev_high)
+    abcd_bear = aH and (not bH) and cH and (not dH) and valid_struct and bearish_candle and valid_bc and valid_cd
+    return abcd_bull, abcd_bear
+
+
+# ══════════════════════════════════════════════════════════════════
+#  NIFTY 500 SYMBOLS — hardcoded fallback (used if NSE CSV fetch fails)
+# ══════════════════════════════════════════════════════════════════
+
+_NIFTY500_FALLBACK = [
+    "360ONE","3MINDIA","ABB","ACC","AIAENG","APLAPOLLO","AUBANK","AARTIIND",
+    "AAVAS","ABBOTINDIA","ACE","ADANIENSOL","ADANIENT","ADANIGREEN","ADANIPORTS","ADANIPOWER",
+    "ATGL","AWL","ABCAPITAL","ABFRL","AEGISLOG","AETHER","AFFLE","AJANTPHARM",
+    "APLLTD","ALKEM","ALKYLAMINE","ALLCARGO","ALOKINDS","ARE&M","AMBER","AMBUJACEM",
+    "ANANDRATHI","ANGELONE","ANURAS","APARINDS","APOLLOHOSP","APOLLOTYRE","APTUS","ACI",
+    "ASAHIINDIA","ASHOKLEY","ASIANPAINT","ASTERDM","ASTRAZEN","ASTRAL","ATUL","AUROPHARMA",
+    "AVANTIFEED","DMART","AXISBANK","BEML","BLS","BSE","BAJAJ-AUTO","BAJFINANCE",
+    "BAJAJFINSV","BAJAJHLDNG","BALAMINES","BALKRISIND","BALRAMCHIN","BANDHANBNK","BANKBARODA","BANKINDIA",
+    "MAHABANK","BATAINDIA","BAYERCROP","BERGEPAINT","BDL","BEL","BHARATFORG","BHEL",
+    "BPCL","BHARTIARTL","BIKAJI","BIOCON","BIRLACORPN","BSOFT","BLUEDART","BLUESTARCO",
+    "BBTC","BORORENEW","BOSCHLTD","BRIGADE","BRITANNIA","MAPMYINDIA","CCL","CESC",
+    "CGPOWER","CIEINDIA","CRISIL","CSBBANK","CAMPUS","CANFINHOME","CANBK","CAPLIPOINT",
+    "CGCL","CARBORUNIV","CASTROLIND","CEATLTD","CELLO","CENTRALBK","CDSL","CENTURYPLY",
+    "ABREL","CERA","CHALET","CHAMBLFERT","CHEMPLASTS","CHENNPETRO","CHOLAHLDNG","CHOLAFIN",
+    "CIPLA","CUB","CLEAN","COALINDIA","COCHINSHIP","COFORGE","COLPAL","CAMS",
+    "CONCORDBIO","CONCOR","COROMANDEL","CRAFTSMAN","CREDITACC","CROMPTON","CUMMINSIND","CYIENT",
+    "DCMSHRIRAM","DLF","DOMS","DABUR","DALBHARAT","DATAPATTNS","DEEPAKFERT","DEEPAKNTR",
+    "DELHIVERY","DEVYANI","DIVISLAB","DIXON","LALPATHLAB","DRREDDY","EIDPARRY","EIHOTEL",
+    "EPL","EASEMYTRIP","EICHERMOT","ELECON","ELGIEQUIP","EMAMILTD","ENDURANCE","ENGINERSIN",
+    "EQUITASBNK","ERIS","ESCORTS","ETERNAL","EXIDEIND","FDC","NYKAA","FEDERALBNK","FACT",
+    "FINEORG","FINCABLES","FINPIPE","FSL","FIVESTAR","FORTIS","GAIL","GMMPFAUDLR",
+    "GMRAIRPORT","GRSE","GICRE","GILLETTE","GLAND","GLAXO","ALIVUS","GLENMARK",
+    "MEDANTA","GPIL","GODFRYPHLP","GODREJCP","GODREJIND","GODREJPROP","GRANULES","GRAPHITE",
+    "GRASIM","GESHIP","GRINDWELL","GAEL","FLUOROCHEM","GUJGASLTD","GMDCLTD","GNFC",
+    "GPPL","GSFC","GSPL","HEG","HBLENGINE","HCLTECH","HDFCAMC","HDFCBANK",
+    "HDFCLIFE","HFCL","HAPPSTMNDS","HAPPYFORGE","HAVELLS","HEROMOTOCO","HSCL","HINDALCO",
+    "HAL","HINDCOPPER","HINDPETRO","HINDUNILVR","HINDZINC","POWERINDIA","HOMEFIRST","HONASA",
+    "HONAUT","HUDCO","ICICIBANK","ICICIGI","ICICIPRULI","IDBI","IDFCFIRSTB",
+    "IFCI","IIFL","IRB","IRCON","ITC","ITI","INDIACEM","INDIAMART",
+    "INDIANB","IEX","INDHOTEL","IOC","IOB","IRCTC","IRFC","INDIGOPNTS",
+    "IGL","INDUSTOWER","INDUSINDBK","NAUKRI","INFY","INOXWIND","INTELLECT","INDIGO",
+    "IPCALAB","JBCHEPHARM","JKCEMENT","JBMA","JKLAKSHMI","JKPAPER","JMFINANCIL","JSWENERGY",
+    "JSWINFRA","JSWSTEEL","JAIBALAJI","J&KBANK","JINDALSAW","JSL","JINDALSTEL","JIOFIN",
+    "JUBLFOOD","JUBLINGREA","JUBLPHARMA","JWL","JUSTDIAL","JYOTHYLAB","KPRMILL","KEI",
+    "KNRCON","KPITTECH","KRBL","KSB","KAJARIACER","KPIL","KALYANKJIL","KANSAINER",
+    "KARURVYSYA","KAYNES","KEC","KFINTECH","KOTAKBANK","KIMS","LTF","LTTS",
+    "LICHSGFIN","LTM","LT","LATENTVIEW","LAURUSLABS","LXCHEM","LEMONTREE","LICI",
+    "LINDEINDIA","LLOYDSME","LUPIN","MMTC","MRF","MTARTECH","LODHA","MGL",
+    "MAHSEAMLES","M&MFIN","M&M","MHRIL","MAHLIFE","MANAPPURAM","MRPL","MANKIND",
+    "MARICO","MARUTI","MASTEK","MFSL","MAXHEALTH","MAZDOCK","MEDPLUS","METROBRAND",
+    "METROPOLIS","MINDACORP","MSUMI","MOTILALOFS","MPHASIS","MCX","MUTHOOTFIN","NATCOPHARM",
+    "NBCC","NCC","NHPC","NLCINDIA","NMDC","NSLNISP","NTPC","NH",
+    "NATIONALUM","NAVINFLUOR","NESTLEIND","NETWORK18","NAM-INDIA","NUVAMA","NUVOCO","OBEROIRLTY",
+    "ONGC","OIL","OLECTRA","PAYTM","OFSS","POLICYBZR","PCBL","PIIND",
+    "PNBHOUSING","PNCINFRA","PVRINOX","PAGEIND","PATANJALI","PERSISTENT","PETRONET","PHOENIXLTD",
+    "PIDILITIND","PIRAMALFIN","PPLPHARMA","POLYMED","POLYCAB","POONAWALLA","PFC","POWERGRID",
+    "PRAJIND","PRESTIGE","PRINCEPIPE","PRSMJOHNSN","PGHH","PNB","QUESS","RRKABEL",
+    "RBLBANK","RECLTD","RHIM","RITES","RADICO","RVNL","RAILTEL","RAINBOW",
+    "RAJESHEXPO","RKFORGE","RCF","RATNAMANI","RTNINDIA","RAYMOND","REDINGTON","RELIANCE",
+    "RBA","ROUTE","SBFC","SBICARD","SBILIFE","SJVN","SKFINDIA","SRF",
+    "SAFARI","SAMMAANCAP","MOTHERSON","SANOFI","SAPPHIRE","SAREGAMA","SCHAEFFLER","SCHNEIDER",
+    "SHREECEM","RENUKA","SHRIRAMFIN","SHYAMMETL","SIEMENS","SIGNATURE","SOBHA","SOLARINDS",
+    "SONACOMS","SONATSOFTW","STARHEALTH","SBIN","SAIL","SWSOLAR","STLTECH","SUMICHEM",
+    "SPARC","SUNPHARMA","SUNTV","SUNDARMFIN","SUNDRMFAST","SUNTECK","SUPREMEIND","SUZLON",
+    "SYNGENE","TVSMOTOR","TATACAP","TATACHEM","TATACOMM","TCS","TATACONSUM","TATAELXSI",
+    "TATAPOWER","TATASTEEL","TATATECH","TECHM","TEJASNET","TITAN","TORNTPHARM","TORNTPOWER",
+    "TRENT","TRIDENT","TIINDIA","UPL","UTIAMC","ULTRACEMCO","UNIONBANK","UBL",
+    "VOLTAS","WELCORP","WELSPUNLIV","WIPRO","YESBANK","ZYDUSLIFE","ZYDUSWELL","ECLERX",
+    "TMCV","TMPV","EMCURE","GODIGIT","GRAVITA","IREDA","JKTYRE","JPPOWER","NTPCGREEN",
+    "JSWCEMENT","KIRLOSENG","LTFOODS","NEULANDLAB","NEWGEN","PFIZER","SCI",
+    "FORCEMOT","TEGA","TITAGARH","HDBFS","ICICIAMC","PIRAMALFIN","PWL",
+]
+
+_NSE_CSV_URL   = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
+_NSE_HOME_URL  = "https://www.nseindia.com"
+_NSE_HEADERS   = {
+    # NSE's edge blocks requests without a browser-like UA + referer, and
+    # requires cookies from a prior hit to the site root before the CSV
+    # endpoint will respond — a bare GET to the CSV URL alone 403s.
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/csv,application/csv,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/market-data/live-equity-market",
+}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_nifty500_constituents() -> list[str]:
+    """
+    Download the official Nifty 500 constituent list from NSE Indices and
+    cache it for 24h, so the scanner's universe stays in sync with index
+    reconstitutions instead of drifting from a hardcoded snapshot.
+
+    NSE's edge rejects bare requests to the CSV endpoint (403) unless the
+    session first hits the site root to pick up cookies, and expects a
+    browser-like User-Agent/Referer. On any failure — network error, non-200
+    status, unexpected schema, or a suspiciously short list — this falls
+    back to the last-known-good hardcoded snapshot (_NIFTY500_FALLBACK)
+    rather than let the scanner run with an empty or partial universe.
+
+    Returns
+    -------
+    list[str] — NSE trading symbols (no ".NS" suffix), e.g. "RELIANCE".
+    """
+    # 2026-07-24: this runs at import time via `NIFTY500_SYMBOLS =
+    # fetch_nifty500_constituents()` below — on a cold cache (first
+    # import in a fresh process) it's two live NSE round-trips before
+    # a single page can render. Timed explicitly (not just "probably
+    # slow") so app.log shows the real number on the next cold start
+    # instead of us guessing whether it's worth lazy-loading.
+    _t0 = time.time()
+    try:
+        session = requests.Session()
+        session.headers.update(_NSE_HEADERS)
+
+        # Prime cookies — NSE's CSV endpoint 403s without a prior hit to
+        # the site root in the same session.
+        _t_home0 = time.time()
+        session.get(_NSE_HOME_URL, timeout=10)
+        _log.info("fetch_nifty500_constituents: home-page cookie priming took %.2fs", time.time() - _t_home0)
+
+        _t_csv0 = time.time()
+        resp = session.get(_NSE_CSV_URL, timeout=10)
+        resp.raise_for_status()
+        _log.info("fetch_nifty500_constituents: CSV fetch took %.2fs", time.time() - _t_csv0)
+
+        df = pd.read_csv(io.StringIO(resp.text))
+
+        # Column name has been "Symbol" historically; guard against NSE
+        # tweaking casing/whitespace without warning.
+        sym_col = next(
+            (c for c in df.columns if c.strip().lower() == "symbol"), None
+        )
+        if sym_col is None:
+            raise ValueError(f"no 'Symbol' column in NSE CSV; got {list(df.columns)}")
+
+        symbols = (
+            df[sym_col]
+            .astype(str)
+            .str.strip()
+            .replace("", pd.NA)
+            .dropna()
+            .unique()
+            .tolist()
+        )
+
+        # Sanity floor — a real Nifty 500 file should be close to 500 rows;
+        # anything wildly short signals a malformed/partial download.
+        if len(symbols) < 450:
+            raise ValueError(f"NSE CSV returned only {len(symbols)} symbols, expected ~500")
+
+        _log.info("fetch_nifty500_constituents: succeeded, %d symbols, %.2fs total", len(symbols), time.time() - _t0)
+        return symbols
+
+    except Exception as e:
+        logging.warning(f"fetch_nifty500_constituents: NSE fetch failed ({e}); using hardcoded fallback")
+        _log.info("fetch_nifty500_constituents: fell back to hardcoded list, %.2fs total", time.time() - _t0)
+        return list(_NIFTY500_FALLBACK)
+
+
+# Resolved once at import time (st.cache_data works outside an active
+# Streamlit script run too — it just populates the cache). Every existing
+# `from utils.scanner_engine import NIFTY500_SYMBOLS` callsite keeps working
+# unchanged; they now get the NSE-sourced list when available.
+NIFTY500_SYMBOLS = fetch_nifty500_constituents()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DATA FETCHING
+# ══════════════════════════════════════════════════════════════════
+
+# fetch_ohlcv now lives in utils/market_data.py, imported above.
+
+@st.cache_data(ttl=30, max_entries=8, show_spinner=False)   # 30s TTL — live price patch
+def _fetch_live_prices(symbols: tuple) -> dict:
+    """
+    Fetch today's live bar (partial or complete) using period='5d', interval='1d'.
+    yfinance includes the current intraday bar in this period even during market hours.
+    Returns {sym: (today_date, open, high, low, close, volume)} or {} on failure.
+    """
+    if not symbols:
+        return {}
+    tickers = [f"{s}.NS" for s in symbols]
+    raw = yf_download_with_retry(tickers, period="5d", interval="1d",
+                                 auto_adjust=True, group_by="ticker",
+                                 threads=True, progress=False)
+    if raw.empty:
+        return {}
+
+    result = {}
+    single = len(tickers) == 1
+    for sym, ticker in zip(symbols, tickers):
+        try:
+            df = raw if single else raw[ticker]
+            df = df.dropna(how="all")
+            if df.empty:
+                continue
+            df.index   = _strip_tz(pd.to_datetime(df.index))
+            df.columns = [c.lower() for c in df.columns]
+            last = df.iloc[-1]
+            result[sym] = {
+                "date":   df.index[-1],
+                "open":   float(last["open"]),
+                "high":   float(last["high"]),
+                "low":    float(last["low"]),
+                "close":  float(last["close"]),
+                "volume": float(last["volume"]),
+            }
+        except Exception:
+            continue
+    return result
+
+
+def _patch_live_prices(data: dict, live: dict) -> dict:
+    """
+    Overwrite the last row of each symbol's OHLCV DataFrame with the live bar.
+    If today's date is already the last index, update in-place.
+    If today is a new date (market open, new day), append a new row.
+    """
+    from datetime import date
+    today = pd.Timestamp(date.today())
+
+    patched = {}
+    for sym, df in data.items():
+        if sym not in live:
+            patched[sym] = df
+            continue
+        lv = live[sym]
+        lv_date = pd.Timestamp(lv["date"]).normalize()
+        df_copy = df.copy()
+
+        if df_copy.index[-1].normalize() == lv_date:
+            # Same day — update last row with live data
+            df_copy.loc[df_copy.index[-1], "close"]  = lv["close"]
+            df_copy.loc[df_copy.index[-1], "high"]   = max(df_copy.iloc[-1]["high"],  lv["high"])
+            df_copy.loc[df_copy.index[-1], "low"]    = min(df_copy.iloc[-1]["low"],   lv["low"])
+            df_copy.loc[df_copy.index[-1], "volume"] = lv["volume"]
+        else:
+            # New day — append live bar
+            new_row = pd.DataFrame([{
+                "open":   lv["open"],
+                "high":   lv["high"],
+                "low":    lv["low"],
+                "close":  lv["close"],
+                "volume": lv["volume"],
+            }], index=[lv_date])
+            df_copy = pd.concat([df_copy, new_row])
+
+        patched[sym] = df_copy
+    return patched
+
+# period strings this app actually passes in, mapped to years for the cache.
+# Extend if a caller starts using a period not listed here.
+_PERIOD_TO_YEARS = {"3mo": 0.25, "6mo": 0.5, "1y": 1.0, "2y": 2.0, "5y": 5.0}
+
+
+@st.cache_data(ttl=60, max_entries=8, show_spinner=False)
+def fetch_batch_ohlcv(symbols: tuple, period: str = "1y", interval: str = "1d",
+                       source: str = "yfinance") -> dict:
+    """
+    2026-07-16: back on utils.history_store, now with Supabase disabled
+    (see history_store._supabase_storage()) rather than removed outright.
+    Without ANY cache, a full run re-downloads the whole `period` window
+    for every symbol on every click — that's what was actually making
+    things feel slow, not the network fetch itself. The local parquet tier
+    (same-session only, no Supabase round trip) gets that back: repeat
+    scans in one session only pay for a live-tail fetch, not a full
+    re-download. `interval` is assumed daily; history_store doesn't
+    support intraday caching.
+    """
+    if not symbols:
+        return {}
+    from utils.history_store import get_history
+    years = _PERIOD_TO_YEARS.get(period, 1.0)
+    return get_history(list(symbols), years=years, min_bars=60, source=source)
+
+@st.cache_data(ttl=60, max_entries=4, show_spinner=False)
+def fetch_nifty(period: str = "1y", source: str = "yfinance") -> pd.Series:
+    """
+    Fetch Nifty 50 close series for regime classification and as the
+    Relative Strength benchmark.
+
+    [2026-07-25 ops fix] Added the same @st.cache_data(ttl=60) its
+    sibling fetch_nifty_ohlcv() already had — this was previously
+    UNcached, so every caller (including utils/market_intelligence.py's
+    market_intelligence loop, which calls this every 30s) re-fetched a
+    full 1-year history from Upstox/yfinance on every single call, even
+    though nothing about a 1-year index history meaningfully changes
+    inside a 60-second window. A benchmark series used for RS/regime
+    doesn't need sub-minute freshness any more than fetch_nifty_ohlcv's
+    ADX input already didn't.
+
+    2026-07-16: added `source`. RS/regime is only a meaningful comparison
+    when the benchmark and the stock data come from the SAME provider
+    (adjusted-vs-raw closes move both series differently — see
+    history_store.py's module docstring on why yfinance/Upstox are never
+    mixed for a single symbol's cache; the same reasoning applies to
+    comparing a stock series against a benchmark series). run_scanner()
+    passes source=fetch_source (whatever the Scanner Data Source setting
+    resolved to) here for exactly that reason. Defaults to "yfinance" so
+    every other existing caller (Market Overview panel, anything not
+    explicitly passing source) is unaffected.
+
+    source="upstox" fetches via upstox_client.fetch_index_ohlcv_upstox("NIFTY"),
+    falling back to yfinance (same fail-soft convention used throughout
+    this app) if that comes back empty.
+
+    [2026-08-17 duplicate-index fix] yfinance occasionally hands back two
+    rows for the same trading date (a known flakiness, usually around a
+    still-forming/restated intraday bar) — Upstox has shown the same
+    behaviour on rare reconnects. Every caller downstream treats this
+    Series as having a unique daily index (leadership_prescreen()'s
+    nifty.reindex(df.index) in utils/scoring_core.py is the one that
+    actually crashes on it: reindex() raises "cannot reindex on an axis
+    with duplicate labels" when the SOURCE object's index isn't unique,
+    which is exactly what a duplicated nifty index is). Deduping once
+    here, before the cache stores the result, protects every caller in
+    one place instead of requiring each of them to defend against it.
+    """
+    if source == "upstox":
+        try:
+            from utils.upstox_client import fetch_index_ohlcv_upstox
+            df = fetch_index_ohlcv_upstox("NIFTY", period)
+            if not df.empty:
+                nifty = df["close"].rename("nifty")
+                if nifty.index.duplicated().any():
+                    nifty = nifty[~nifty.index.duplicated(keep="last")].sort_index()
+                return nifty
+        except Exception:
+            pass
+        # fall through to yfinance below
+    try:
+        df = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
+        if not df.empty:
+            nifty = df["Close"].rename("nifty")
+            nifty.index = _strip_tz(pd.to_datetime(nifty.index))
+            if nifty.index.duplicated().any():
+                nifty = nifty[~nifty.index.duplicated(keep="last")].sort_index()
+            return nifty
+    except Exception:
+        pass
+    return pd.Series(dtype=float)
+
+
+@st.cache_data(ttl=60, max_entries=4, show_spinner=False)
+def fetch_nifty_ohlcv(period: str = "1y", source: str = "yfinance") -> pd.DataFrame:
+    """
+    Fetch full OHLCV for Nifty 50 (^NSEI).
+    Used by regime_engine to compute a real Wilder ADX on the index
+    instead of the EMA-slope proxy, and by Market Intelligence's DORE
+    integration (which passes source="upstox" explicitly — see
+    fetch_nifty()'s docstring for why source consistency matters and
+    who passes what).
+    Returns an empty DataFrame on failure.
+    """
+    if source == "upstox":
+        try:
+            from utils.upstox_client import fetch_index_ohlcv_upstox
+            df = fetch_index_ohlcv_upstox("NIFTY", period)
+            if not df.empty:
+                return df
+        except Exception:
+            pass
+        # fall through to yfinance below
+    try:
+        df = yf.Ticker("^NSEI").history(period=period, auto_adjust=True)
+        if not df.empty:
+            df.index   = _strip_tz(pd.to_datetime(df.index))
+            df.columns = [c.lower() for c in df.columns]
+            return df[["open", "high", "low", "close", "volume"]]
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=60, max_entries=4, show_spinner=False)
+def fetch_sensex_ohlcv(period: str = "1y", source: str = "upstox") -> pd.DataFrame:
+    """
+    Fetch full OHLCV for BSE Sensex — the Sensex counterpart to
+    fetch_nifty_ohlcv(). Used exclusively by Market Intelligence (DORE for
+    the Sensex card) — Sensex is never a scanner benchmark, so this
+    defaults to source="upstox" per the Market Intelligence pipeline's
+    "always Upstox" rule, falling back to yfinance (^BSESN) only if the
+    Upstox fetch fails.
+
+    [2026-07-25 ops fix] Added @st.cache_data(ttl=60), matching
+    fetch_nifty_ohlcv() — this had NO caching at all before, so Market
+    Intelligence's 30s loop was re-fetching a full 1-year Sensex history
+    on every single cycle. See fetch_nifty()'s docstring for the same
+    fix applied there.
+
+    Returns an empty DataFrame on failure.
+    """
+    if source == "upstox":
+        try:
+            from utils.upstox_client import fetch_index_ohlcv_upstox
+            df = fetch_index_ohlcv_upstox("SENSEX", period)
+            if not df.empty:
+                return df
+        except Exception:
+            pass
+    try:
+        df = yf.Ticker("^BSESN").history(period=period, auto_adjust=True)
+        if not df.empty:
+            df.index   = _strip_tz(pd.to_datetime(df.index))
+            df.columns = [c.lower() for c in df.columns]
+            return df[["open", "high", "low", "close", "volume"]]
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=60, max_entries=4, show_spinner=False)
+def fetch_banknifty_ohlcv(period: str = "1y", source: str = "upstox") -> pd.DataFrame:
+    """
+    Fetch full OHLCV for Nifty Bank (^NSEBANK) — the Bank Nifty counterpart
+    to fetch_nifty_ohlcv()/fetch_sensex_ohlcv(). Used exclusively by Market
+    Intelligence (DORE for the new Bank Nifty card). Defaults to
+    source="upstox" per the Market Intelligence pipeline's "always Upstox"
+    rule, falling back to yfinance (^NSEBANK) only if the Upstox fetch fails.
+
+    [2026-07-25 ops fix] Added @st.cache_data(ttl=60) — see
+    fetch_sensex_ohlcv()'s docstring; same gap, same fix.
+
+    Returns an empty DataFrame on failure.
+    """
+    if source == "upstox":
+        try:
+            from utils.upstox_client import fetch_index_ohlcv_upstox
+            df = fetch_index_ohlcv_upstox("BANKNIFTY", period)
+            if not df.empty:
+                return df
+        except Exception:
+            pass
+    try:
+        df = yf.Ticker("^NSEBANK").history(period=period, auto_adjust=True)
+        if not df.empty:
+            df.index   = _strip_tz(pd.to_datetime(df.index))
+            df.columns = [c.lower() for c in df.columns]
+            return df[["open", "high", "low", "close", "volume"]]
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def compute_ema_levels(series: pd.Series) -> dict:
+    """
+    Given a daily close-price series (chronological, most-recent last),
+    compute EMA20/EMA50/EMA200 and whether the latest close trades above
+    each — feeds the small EMA badge row on each Market Overview index
+    card (mo-index-ema-row).
+
+    {"ema20": float, "above_ema20": bool,
+     "ema50": float, "above_ema50": bool,
+     "ema200": float, "above_ema200": bool}
+
+    A span is simply omitted (not backfilled with a misleading value) if
+    there isn't enough history for it yet — e.g. a freshly-listed index
+    or a short lookback would omit "ema200" but still show ema20/ema50.
+    Returns {} if the series is empty/too short for even EMA20.
+    """
+    if series is None or len(series) < 5:
+        return {}
+    s = series.dropna()
+    if s.empty:
+        return {}
+    last_price = float(s.iloc[-1])
+    out: dict = {}
+    for span, key in ((20, "ema20"), (50, "ema50"), (200, "ema200")):
+        if len(s) >= span:
+            ema_val = float(s.ewm(span=span, adjust=False).mean().iloc[-1])
+            out[key] = ema_val
+            out[f"above_{key}"] = last_price >= ema_val
+    return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_sensex_ema_levels() -> dict:
+    """
+    EMA20/EMA50/EMA200 for BSE Sensex, via compute_ema_levels().
+    Sensex isn't part of the regime-calc series like Nifty is (that one's
+    reused straight from fetch_nifty()), so this does its own 1y daily
+    fetch — reusing fetch_sensex_ohlcv() (Upstox by default, per Market
+    Intelligence's "always Upstox" rule, yfinance fallback on failure)
+    rather than a separate hardcoded yfinance call. Cached for 5 minutes
+    since these only move with each new daily close, not intraday.
+    Returns {} on fetch failure.
+    """
+    try:
+        daily = fetch_sensex_ohlcv("1y")
+        if daily.empty:
+            return {}
+        return compute_ema_levels(daily["close"])
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_banknifty_ema_levels() -> dict:
+    """
+    EMA20/EMA50/EMA200 for Nifty Bank, via compute_ema_levels(). Bank Nifty
+    counterpart to fetch_sensex_ema_levels() — same Upstox-by-default,
+    yfinance-fallback sourcing via fetch_banknifty_ohlcv().
+    Returns {} on fetch failure.
+    """
+    try:
+        daily = fetch_banknifty_ohlcv("1y")
+        if daily.empty:
+            return {}
+        return compute_ema_levels(daily["close"])
+    except Exception:
+        return {}
+
+
+def fetch_nifty_intraday_snapshot() -> dict:
+    """
+    Return today's Nifty 50 (^NSEI) snapshot for the Market Overview panel's
+    price card: live price, day %chg, today's Open/High/Low, previous close,
+    and an intraday price path for the sparkline.
+
+    {
+      "price": float, "pct_chg": float | None, "open": float, "high": float,
+      "low": float, "prev_close": float | None, "spark": list[float]
+    }
+
+    2026-07-16: price/pct_chg/open/high/low/prev_close now come from
+    Upstox's live index quote (upstox_client.fetch_index_quote("NIFTY"))
+    by default when it's available — real-time, vs. yfinance's ~15-min-
+    delayed index feed. yfinance is still used for the sparkline (Upstox's
+    historical-candle endpoint, as wired up in this app, only returns
+    daily-resolution bars — see _fetch_candles()'s date-only index — so it
+    can't produce an intraday path) and remains the full fallback (numbers
+    + spark) whenever the Upstox quote comes back None (token expired, not
+    entitled, request failed, etc.). fetch_index_quote() is itself
+    fail-soft, so this never raises even if Upstox is fully unreachable.
+
+    Same IST-aware "today" logic as fetch_nifty_live(). If the market hasn't
+    opened yet today (or intraday data can't be fetched at all), falls back
+    to the last completed daily bar for Open/High/Low/Close and the most
+    recent ~15 daily closes for the sparkline -- honest about showing
+    yesterday's shape rather than a blank card, same convention already
+    used for the sector sparkline fallback in pages/scanner.py.
+    """
+    import pytz
+    from utils.upstox_client import fetch_index_quote
+    _IST = pytz.timezone("Asia/Kolkata")
+
+    def _today_ist() -> pd.Timestamp:
+        return pd.Timestamp.now(tz=_IST).normalize().tz_localize(None)
+
+    out = {"price": 0.0, "pct_chg": None, "open": 0.0, "high": 0.0,
+           "low": 0.0, "prev_close": None, "spark": []}
+
+    ux = fetch_index_quote("NIFTY")   # live numbers, or None — spark always comes from yfinance below
+
+    got_spark = False
+    try:
+        df = yf.Ticker("^NSEI").history(period="2d", interval="1m", auto_adjust=True)
+        if not df.empty:
+            df.index = _strip_tz(pd.to_datetime(df.index))
+            today = _today_ist()
+            today_bars = df[df.index.normalize() == today]
+            if not today_bars.empty:
+                prev_bars  = df[df.index.normalize() < today]
+                prev_close = float(prev_bars["Close"].iloc[-1]) if not prev_bars.empty else None
+                price      = float(today_bars["Close"].iloc[-1])
+                out.update({
+                    "price":      price,
+                    "pct_chg":    round((price - prev_close) / prev_close * 100, 2) if prev_close else None,
+                    "open":       float(today_bars["Open"].iloc[0]),
+                    "high":       float(today_bars["High"].max()),
+                    "low":        float(today_bars["Low"].min()),
+                    "prev_close": prev_close,
+                    # Evenly-ish sampled closes across the session for the spark line
+                    "spark":      today_bars["Close"].tolist()[::max(1, len(today_bars)//60)],
+                })
+                got_spark = True
+    except Exception:
+        pass
+
+    # Market not yet open / intraday fetch failed — fall back to daily bars
+    if not got_spark:
+        try:
+            daily = yf.Ticker("^NSEI").history(period="1mo", auto_adjust=True)
+            if len(daily) >= 2:
+                last, prev = daily.iloc[-1], daily.iloc[-2]
+                last_close, prev_close = float(last["Close"]), float(prev["Close"])
+                out.update({
+                    "price":      last_close,
+                    "pct_chg":    round((last_close - prev_close) / prev_close * 100, 2) if prev_close else None,
+                    "open":       float(last["Open"]),
+                    "high":       float(last["High"]),
+                    "low":        float(last["Low"]),
+                    "prev_close": prev_close,
+                    "spark":      daily["Close"].tail(15).tolist(),
+                })
+        except Exception:
+            pass
+
+    if ux:
+        # Upstox numbers win whenever present — spark (yfinance-only) is
+        # untouched since ux never carries a "spark" key.
+        out.update({k: v for k, v in ux.items() if v is not None})
+
+    return out
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_sensex_intraday_snapshot() -> dict:
+    """
+    Return today's BSE Sensex (^BSESN) snapshot for the Market Overview
+    panel's SENSEX index card: live price, day %chg, today's Open/High/Low,
+    previous close, and an intraday price path for the sparkline. Mirrors
+    fetch_nifty_intraday_snapshot()'s shape exactly, including its
+    2026-07-16 Upstox-numbers-by-default behaviour (see that function's
+    docstring — same fetch_index_quote("SENSEX") overlay, yfinance still
+    owns the sparkline and is the full fallback if Upstox is unavailable).
+
+    {
+      "price": float, "pct_chg": float | None, "open": float, "high": float,
+      "low": float, "prev_close": float | None, "spark": list[float]
+    }
+
+    Same IST-aware "today" logic as fetch_nifty_intraday_snapshot(). Falls
+    back to the last completed daily bar for Open/High/Low/Close and the
+    most recent ~15 daily closes for the sparkline if the market hasn't
+    opened yet today or the intraday fetch fails — honest about showing
+    yesterday's shape rather than a blank card.
+    """
+    import pytz
+    from utils.upstox_client import fetch_index_quote
+    _IST = pytz.timezone("Asia/Kolkata")
+
+    def _today_ist() -> pd.Timestamp:
+        return pd.Timestamp.now(tz=_IST).normalize().tz_localize(None)
+
+    out = {"price": 0.0, "pct_chg": None, "open": 0.0, "high": 0.0,
+           "low": 0.0, "prev_close": None, "spark": []}
+
+    ux = fetch_index_quote("SENSEX")   # live numbers, or None — spark always comes from yfinance below
+
+    got_spark = False
+    try:
+        df = yf.Ticker("^BSESN").history(period="2d", interval="1m", auto_adjust=True)
+        if not df.empty:
+            df.index = _strip_tz(pd.to_datetime(df.index))
+            today = _today_ist()
+            today_bars = df[df.index.normalize() == today]
+            if not today_bars.empty:
+                prev_bars  = df[df.index.normalize() < today]
+                prev_close = float(prev_bars["Close"].iloc[-1]) if not prev_bars.empty else None
+                price      = float(today_bars["Close"].iloc[-1])
+                out.update({
+                    "price":      price,
+                    "pct_chg":    round((price - prev_close) / prev_close * 100, 2) if prev_close else None,
+                    "open":       float(today_bars["Open"].iloc[0]),
+                    "high":       float(today_bars["High"].max()),
+                    "low":        float(today_bars["Low"].min()),
+                    "prev_close": prev_close,
+                    "spark":      today_bars["Close"].tolist()[::max(1, len(today_bars)//60)],
+                })
+                got_spark = True
+    except Exception:
+        pass
+
+    # Market not yet open / intraday fetch failed — fall back to daily bars
+    if not got_spark:
+        try:
+            daily = yf.Ticker("^BSESN").history(period="1mo", auto_adjust=True)
+            if len(daily) >= 2:
+                last, prev = daily.iloc[-1], daily.iloc[-2]
+                last_close, prev_close = float(last["Close"]), float(prev["Close"])
+                out.update({
+                    "price":      last_close,
+                    "pct_chg":    round((last_close - prev_close) / prev_close * 100, 2) if prev_close else None,
+                    "open":       float(last["Open"]),
+                    "high":       float(last["High"]),
+                    "low":        float(last["Low"]),
+                    "prev_close": prev_close,
+                    "spark":      daily["Close"].tail(15).tolist(),
+                })
+        except Exception:
+            pass
+
+    if ux:
+        out.update({k: v for k, v in ux.items() if v is not None})
+
+    return out
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_banknifty_intraday_snapshot() -> dict:
+    """
+    Return today's Nifty Bank (^NSEBANK) snapshot for the Market Overview
+    panel's BANK NIFTY index card. Mirrors fetch_sensex_intraday_snapshot()
+    exactly — Upstox's live index quote (fetch_index_quote("BANKNIFTY"))
+    supplies price/pct_chg/OHLC by default, yfinance supplies the
+    sparkline and is the full fallback if Upstox is unavailable.
+
+    {
+      "price": float, "pct_chg": float | None, "open": float, "high": float,
+      "low": float, "prev_close": float | None, "spark": list[float]
+    }
+    """
+    import pytz
+    from utils.upstox_client import fetch_index_quote
+    _IST = pytz.timezone("Asia/Kolkata")
+
+    def _today_ist() -> pd.Timestamp:
+        return pd.Timestamp.now(tz=_IST).normalize().tz_localize(None)
+
+    out = {"price": 0.0, "pct_chg": None, "open": 0.0, "high": 0.0,
+           "low": 0.0, "prev_close": None, "spark": []}
+
+    ux = fetch_index_quote("BANKNIFTY")   # live numbers, or None — spark always comes from yfinance below
+
+    got_spark = False
+    try:
+        df = yf.Ticker("^NSEBANK").history(period="2d", interval="1m", auto_adjust=True)
+        if not df.empty:
+            df.index = _strip_tz(pd.to_datetime(df.index))
+            today = _today_ist()
+            today_bars = df[df.index.normalize() == today]
+            if not today_bars.empty:
+                prev_bars  = df[df.index.normalize() < today]
+                prev_close = float(prev_bars["Close"].iloc[-1]) if not prev_bars.empty else None
+                price      = float(today_bars["Close"].iloc[-1])
+                out.update({
+                    "price":      price,
+                    "pct_chg":    round((price - prev_close) / prev_close * 100, 2) if prev_close else None,
+                    "open":       float(today_bars["Open"].iloc[0]),
+                    "high":       float(today_bars["High"].max()),
+                    "low":        float(today_bars["Low"].min()),
+                    "prev_close": prev_close,
+                    "spark":      today_bars["Close"].tolist()[::max(1, len(today_bars)//60)],
+                })
+                got_spark = True
+    except Exception:
+        pass
+
+    # Market not yet open / intraday fetch failed — fall back to daily bars
+    if not got_spark:
+        try:
+            daily = yf.Ticker("^NSEBANK").history(period="1mo", auto_adjust=True)
+            if len(daily) >= 2:
+                last, prev = daily.iloc[-1], daily.iloc[-2]
+                last_close, prev_close = float(last["Close"]), float(prev["Close"])
+                out.update({
+                    "price":      last_close,
+                    "pct_chg":    round((last_close - prev_close) / prev_close * 100, 2) if prev_close else None,
+                    "open":       float(last["Open"]),
+                    "high":       float(last["High"]),
+                    "low":        float(last["Low"]),
+                    "prev_close": prev_close,
+                    "spark":      daily["Close"].tail(15).tolist(),
+                })
+        except Exception:
+            pass
+
+    if ux:
+        out.update({k: v for k, v in ux.items() if v is not None})
+
+    return out
+
+
+def fetch_nifty_live() -> tuple[float, float | None]:
+    """
+    Return (current_price, day_pct_change) for Nifty 50 (^NSEI).
+
+    Uses IST-aware date comparison so today_bars is always correct
+    regardless of server timezone (UTC on cloud, IST locally).
+    """
+    import pytz
+    _IST = pytz.timezone("Asia/Kolkata")
+
+    def _today_ist() -> pd.Timestamp:
+        """Return today's date in IST as a tz-naive Timestamp (midnight)."""
+        return pd.Timestamp.now(tz=_IST).normalize().tz_localize(None)
+
+    try:
+        # 2-day 1-min bars gives today's open and latest tick
+        df = yf.Ticker("^NSEI").history(period="2d", interval="1m", auto_adjust=True)
+        if df.empty:
+            return 0.0, None
+        df.index = _strip_tz(pd.to_datetime(df.index))
+        today = _today_ist()
+        today_bars = df[df.index.normalize() == today]
+        if today_bars.empty:
+            # Market not yet open — fall back to last two daily closes
+            daily = yf.Ticker("^NSEI").history(period="5d", auto_adjust=True)
+            if len(daily) >= 2:
+                last = float(daily["Close"].iloc[-1])
+                prev = float(daily["Close"].iloc[-2])
+                return last, round((last - prev) / prev * 100, 2)
+            return 0.0, None
+        current = float(today_bars["Close"].iloc[-1])
+        prev_day = df[df.index.normalize() < today]
+        prev_close = float(prev_day["Close"].iloc[-1]) if not prev_day.empty else None
+        pct = round((current - prev_close) / prev_close * 100, 2) if prev_close else None
+        return current, pct
+    except Exception:
+        return 0.0, None
+
+
+# ══════════════════════════════════════════════════════════════════
+#  NIFTY REGIME CLASSIFIER
+# ══════════════════════════════════════════════════════════════════
+
+def nifty_regime(nifty: pd.Series) -> str:
+    """
+    Classify Nifty as 'bull', 'bear', or 'neutral' based on price vs EMA50/EMA200.
+    Called once per scanner run; result injected into ScoringParams for all stocks.
+
+    bull   — price > EMA200 AND EMA50 > EMA200 (strong uptrend)
+    bear   — price < EMA200 AND EMA50 < EMA200 (downtrend)
+    neutral — mixed (e.g. EMA crossover in progress)
+    """
+    if nifty.empty or len(nifty) < 200:
+        return "neutral"
+    e50  = ema(nifty, 50)
+    e200 = ema(nifty, 200)
+    cur   = float(nifty.iloc[-1])
+    e50v  = float(e50.iloc[-1])
+    e200v = float(e200.iloc[-1])
+    if cur > e200v and e50v > e200v:
+        return "bull"
+    if cur < e200v and e50v < e200v:
+        return "bear"
+    return "neutral"
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SCORE_STOCK  — thin wrapper around scoring_core.compute_bar
+# ══════════════════════════════════════════════════════════════════
+
+def _primary_blocker(r, result: dict, settings: Optional[dict] = None,
+                      recommendation_override: Optional[str] = None) -> str:
+    """
+    Identify the single most important reason a stock did not reach a
+    higher Recommendation tier.
+
+    Called from score_stock() after compute_decision() — has access to both
+    the raw BarResult (r) and the full result dict (DecisionScores fields
+    already merged in). Decision engine is kept regime-agnostic; this lives
+    here in the scanner layer.
+
+    [Fix, fast-winner audit — replaces the old "Category"-keyed dispatch]
+    The old version branched on result.get("Category", ...) — a key that
+    score_stock() never actually writes into `result` (only "Recommendation",
+    "Tier", and "CV1_SignalClass" are set; "Category" always fell back to
+    its "Avoid" default). That silently disabled every category-specific
+    branch below (Extended/Leader special-casing, the Actionable-or-better
+    early return) for every row, and — independently — the floor this
+    function compared against was hardcoded to Actionable's regardless of
+    which tier's AND-gate actually produced the row's real Recommendation
+    (classify_tier_v3()). A Skip row (failed Watch's 50/50/50 gate) and a
+    Watch row (failed Developing's 70/55/80/55 gate) were both graded
+    against Actionable's 70/60/80/60 floors, which is a different gate
+    than the one that actually fired — so the text could describe a
+    pillar that had already cleared its *real* floor (e.g. "Weak
+    Leadership (69)" on a row where Leadership only needed to clear
+    Watch's 50 floor to produce that Skip).
+
+    Fixed properly here, not just re-labeled:
+      1. Reads "Recommendation" (Skip|Watch|Developing|Actionable|Execute|
+         Elite — classify_tier_v3()'s real output) as the category signal,
+         with "Category" kept only as a fallback for legacy/cached rows.
+      2. Reads "Lifecycle" (decision_engine._classify_stage()'s AVOID/
+         EXTENDED/ACTIONABLE/SETUP_BUILDING/LEADER) for the Extended/Leader
+         special cases — the vocabulary those cases actually check against.
+      3. Maps Recommendation to the NEXT tier up in classify_tier_v3()'s
+         ladder and grades against THAT tier's own floors (with its own
+         composite requirement, or lack of one for Watch) — not always
+         Actionable's.
+      4. Merges `settings` into V3_THRESHOLD_DEFAULTS the same way
+         classify_tier_v3(thresholds=settings) does upstream, so a Settings
+         override can't make this text disagree with the gate that actually
+         ran.
+
+    [Fix, follow-up to fast-winner audit — same day] recommendation_override:
+    apply_smc_structural_gate() can cap final_tier BELOW what LS/CV/EQ alone
+    earned (e.g. Developing capped to Watch on a genuine SMC conflict). That
+    cap is already surfaced separately, up front, by the SMC-prefix logic at
+    the call site. Left unaware of it, this function would grade the row
+    against Watch→Developing's gate (using the POST-cap Recommendation),
+    find LS/CV/EQ already clear Developing's floors, and fall through to the
+    "stale settings/cache" message — implying a data problem when the real
+    explanation is the SMC cap already stated in the prefix. Pass the
+    PRE-gate tier here (_pre_structural_gate_tier) whenever the SMC gate was
+    causal, so this function explains why the *uncapped* tier didn't go
+    higher, and the redundant/misleading stale-cache text doesn't fire under
+    an SMC cap. Defaults to result["Recommendation"] when not provided,
+    preserving prior behavior for non-SMC-capped rows.
+
+    Returns a short human-readable string, or "" for Actionable/better.
+    """
+    # [Phase 7 cutover, 2026-09-01] base_tier is now produced by
+    # classify_tier_v4(), whose funnel has only two rungs below Actionable
+    # (Skip, Watch — no "Developing"; see classify_tier_v4()'s docstring),
+    # unlike v3's four-rung ladder. Switched the threshold source and the
+    # _NEXT_GATE map below accordingly so this function's floors always
+    # match the gate that actually produced the row's Recommendation.
+    from utils.conviction_score_v1 import V4_THRESHOLD_DEFAULTS
+    t = {**V4_THRESHOLD_DEFAULTS, **(settings or {})}
+
+    recommendation = str(recommendation_override or result.get("Recommendation", result.get("Category", "Skip")))
+    lifecycle = str(result.get("Lifecycle", "") or "").upper()
+
+    # Nothing to block for already-actionable-or-better stocks.
+    if recommendation in ("Actionable", "Execute", "Elite"):
+        return ""
+
+    # Pull scores — use CV1 (v3: equal-weight 1/3/1/3/1/3 composite, live
+    # since 2026-07) for Leadership; fall back to Legacy_* (diagnostic-only,
+    # no longer DE production logic) when CV1 is absent, then to the old
+    # "DE_*" key name for rows/cache written before the rename.
+    ls  = float(result.get("CV1_Leadership",  result.get("Legacy_Leadership",   result.get("DE_Leadership",   0))) or 0)
+    cv  = float(result.get("CV1_Conviction",   result.get("Legacy_Conviction",   result.get("DE_Conviction",   0))) or 0)
+    eq  = float(result.get("CV1_EntryQuality", result.get("Legacy_EntryQuality", result.get("DE_EntryQuality", 0))) or 0)
+    ext = float(result.get("Extension",       0) or 0)
+    # v3 composite (equal-weight 1/3 each) — prefer the value CV3 already
+    # computed; recompute only as a fallback for rows/cache predating
+    # CV1_Composite.
+    composite = float(result.get("CV1_Composite", 0) or 0)
+    if not composite:
+        composite = (ls + cv + eq) / 3
+
+    # Extended is a tier-agnostic override — a stock that's run too far
+    # doesn't need its Leadership/Conviction picked apart; the extension
+    # itself is why it's capped, regardless of which AND-gate it also fails.
+    if lifecycle == "EXTENDED" or ext >= 60:
+        return f"Extended ({int(ext)}) — wait for pullback to EMA/Fib"
+
+    # The tier ladder classify_tier_v4() actually walks — map this row's
+    # Recommendation to the NEXT gate up, i.e. the specific AND-gate it
+    # failed to clear. Watch's gate has no composite requirement (only
+    # Actionable adds one) — see classify_tier_v4(). No "Developing" rung
+    # exists in v4's funnel (v3 had one; v4 collapsed it), so a cached row
+    # with the old "Developing" Recommendation (pre-cutover) falls back to
+    # grading against Actionable's floors below, same as any unrecognized
+    # legacy value.
+    _NEXT_GATE = {
+        "Skip":  ("Watch",      "v4_watch_leadership_min",      "v4_watch_conviction_min",      "v4_watch_entry_quality_min",      None),
+        "Watch": ("Actionable", "v4_actionable_leadership_min", "v4_actionable_conviction_min", "v4_actionable_entry_quality_min", "v4_actionable_composite_min"),
+    }
+    gate_name, ls_key, cv_key, eq_key, comp_key = _NEXT_GATE.get(
+        recommendation,
+        # Unrecognized/legacy Category value (e.g. old cached "Avoid", or a
+        # pre-cutover "Developing" row) — fall back to Actionable rather
+        # than silently guessing Watch.
+        ("Actionable", "v4_actionable_leadership_min", "v4_actionable_conviction_min",
+         "v4_actionable_entry_quality_min", "v4_actionable_composite_min"),
+    )
+    ls_floor   = t[ls_key]
+    cv_floor   = t[cv_key]
+    eq_floor   = t[eq_key]
+    comp_floor = t[comp_key] if comp_key else None
+
+    # Priority 1: Leadership gate — graded against the tier this row
+    # actually needed to clear, not always Actionable's.
+    if ls < ls_floor:
+        ls_rs   = int(result.get("_ds_ls_rs",   result.get("_de_ls_rs",   0)) or 0)
+        ls_trend= int(result.get("_ds_ls_trend", result.get("_de_ls_trend",0)) or 0)
+        detail = "trend below EMA" if ls_trend < 20 else "RS below market"
+        return f"Weak Leadership ({int(ls)}, need {int(ls_floor)} for {gate_name}) — {detail}"
+
+    # Priority 2: Conviction gate.
+    if cv < cv_floor:
+        # [Phase 7 cutover, 2026-09-01] CV4's Conviction has no separate
+        # fib-zone or ADX sub-score (its analog is the combined
+        # Setup/Pattern Evidence field, _cv4_cv_setup, 0-10) — the old
+        # "_cv1_cv_fib"/"_cv1_cv_adx" preference is dead on fresh scans and
+        # falls straight through to Decision Engine's _ds_* diagnostics
+        # below, kept only so old cached rows (pre-cutover) still read
+        # correctly.
+        cv_fib  = int(result.get("_cv1_cv_fib",  result.get("_ds_cv_fib",  0)) or 0)
+        cv_adx  = int(result.get("_ds_cv_pattern",      result.get("_cv1_cv_adx",  0)) or 0)
+        if cv_fib < 8:
+            sub = "no Fib setup / continuation"
+        elif cv_adx < 6:
+            sub = "ADX not confirming trend"
+        else:
+            sub = f"DE score {int(cv)}"
+        return f"Low Conviction ({int(cv)}, need {int(cv_floor)} for {gate_name}) — {sub}"
+
+    # Priority 3: Entry Quality gate. Watch's AND-gate checks EQ directly
+    # (v3_watch_entry_quality_min) — unlike Developing/Actionable, where EQ
+    # only enters via the composite share (Priority 4 below). Checking EQ
+    # itself here (rather than assuming it's folded into composite) is what
+    # makes a Skip row's text correct: Watch has no composite floor at all.
+    if eq < eq_floor:
+        # [Phase 7 cutover, 2026-09-01] CV4's Entry Quality has no separate
+        # EMA20-distance or pivot-distance sub-score of its own (its analog,
+        # _cv4_eq_location, blends pivot+fib into one 0-15 number) — the old
+        # "_cv1_eq_*" fallbacks are dead on fresh scans; DE's _ds_* fields
+        # (unchanged by this cutover) are the real source going forward,
+        # kept as primary here rather than the reverse.
+        eq_ema = int(result.get("_ds_eq_ema20_dist", result.get("_cv1_eq_ema20", 0)) or 0)
+        eq_piv = int(result.get("_ds_eq_pivot_dist", result.get("_cv1_eq_piv",  0)) or 0)
+        if eq_ema < 10:
+            sub = "too far above EMA20"
+        elif eq_piv < 8:
+            sub = "too far above pivot"
+        else:
+            sub = f"EQ score {int(eq)}"
+        return f"Low Entry Quality ({int(eq)}, need {int(eq_floor)} for {gate_name}) — {sub}"
+
+    # Priority 4: composite floor (Developing/Actionable gates only — Watch
+    # has none, so comp_floor is None there and this is skipped entirely).
+    if comp_floor is not None and composite < comp_floor:
+        # composite is unrounded (see conviction_score_v1.py) — show one
+        # decimal so this can't read as self-contradictory (e.g. "Composite
+        # 60 (need 60)" while still being the rejection reason).
+        return f"Composite {composite:.1f} (need {comp_floor} for {gate_name}) — every pillar clears its own floor but the blended score doesn't"
+
+    # Priority 5: CCI momentum not confirmed — tier-agnostic tiebreaker.
+    try:
+        cci_val = float(getattr(r, "cur_cci", None) or result.get("_cci_raw", 0) or 0)
+        if cci_val < 0:
+            return f"CCI Negative ({int(cci_val)}) — momentum not confirmed"
+    except (TypeError, ValueError):
+        pass
+
+    # Leader — high Leadership, base still building. Only reachable once
+    # this tier's own LS/CV/EQ/composite floors are all confirmed clear
+    # above, so it's a genuine "borderline everywhere" state.
+    if lifecycle == "LEADER":
+        return f"Leader — DE conviction {int(cv)} (need {int(cv_floor)}) · await base"
+
+    # Every floor for the gate this row supposedly failed actually clears
+    # on these scores — Recommendation and the live scores disagree (stale
+    # cache row, or a settings change since this row was scored). Say so
+    # rather than inventing a plausible-sounding but false reason.
+    return f"{recommendation} — clears {gate_name}'s floors on current scores; check for stale settings/cache"
+
+
+RECOMMENDATION_LADDER = ["Skip", "Watch", "Developing", "Actionable", "Execute", "Elite"]
+RECOMMENDATION_RANK = {name: i for i, name in enumerate(RECOMMENDATION_LADDER)}
+
+# [Structural gate wiring, 2026-08-15] downgrade-only cap each canonical
+# SMC structural state applies to Recommendation — see
+# apply_smc_structural_gate()'s docstring for why this lives here (tier
+# vocabulary is MasterScanner-specific) rather than in
+# utils.smc_engine.classify_structural_state() (direction/evidence-only,
+# app-agnostic).
+def apply_smc_structural_gate(
+    final_tier: str, smc_state, order_block, thesis_direction: str | None = None,
+):
+    """
+    Applies the canonical SMC structural state (utils.smc_engine.
+    classify_structural_state()) as a DOWNGRADE-ONLY cap on an already-
+    computed Recommendation tier. Never upgrades — a VALID_ENTRY_ZONE
+    read never pushes a Watch to Actionable on its own; it only ever
+    lets whatever Base Entry Quality / natural score / Promo Score
+    already decided pass through unchanged.
+
+    Call this AFTER any natural-score/Promo-Score max() so a high CV1
+    composite or a Promo Score upgrade cannot bypass the cap — calling
+    it before such a max() (as the older, unrelated ENABLE_STRUCTURAL_
+    GATE hard_stop/lifecycle block does) leaves it bypassable.
+
+    Parameters
+    ----------
+    final_tier : str
+        The Recommendation tier computed so far (must be one of
+        RECOMMENDATION_LADDER).
+    smc_state : utils.smc_engine.SMCState or None
+    order_block : utils.smc_engine.OrderBlock or None
+    thesis_direction : str or None
+        Defaults to utils.smc_engine.BULLISH (Live Scanner is long-only
+        today) when None.
+
+    Returns
+    -------
+    (capped_tier: str, decision: StructuralDecision | None)
+        decision is None only if classify_structural_state() itself
+        raised (fails open — a gate bug must never block a
+        Recommendation entirely; final_tier passes through unchanged
+        in that case).
+    """
+    from utils.smc_engine import (
+        classify_structural_state, BULLISH,
+        STRUCTURAL_INVALIDATION, STRUCTURAL_CONFLICT,
+        STRUCTURAL_EXTENDED_CHASING, STRUCTURAL_WAIT_FOR_RETEST,
+    )
+    try:
+        decision = classify_structural_state(
+            smc_state, order_block=order_block,
+            thesis_direction=thesis_direction or BULLISH,
+        )
+    except Exception:
+        return final_tier, None
+
+    cap = {
+        STRUCTURAL_INVALIDATION:     "Skip",
+        STRUCTURAL_CONFLICT:         "Watch",
+        STRUCTURAL_EXTENDED_CHASING: "Watch",
+        STRUCTURAL_WAIT_FOR_RETEST:  "Developing",
+    }.get(decision.state)
+
+    if cap is None:
+        return final_tier, decision   # VALID_ENTRY_ZONE — no cap
+
+    final_rank = RECOMMENDATION_RANK.get(final_tier, 0)
+    cap_rank = RECOMMENDATION_RANK[cap]
+    capped_tier = final_tier if cap_rank >= final_rank else cap
+    return capped_tier, decision
+
+
+def score_stock(
+    df:       pd.DataFrame,
+    nifty:    pd.Series,
+    settings: dict | None = None,
+    # legacy keyword args kept for backwards compatibility
+    cci_len:  int   = 20,
+    cci_ob:   int   = 100,
+    cci_os:   int   = -100,
+    pvt_lb:   int   = 20,
+    atr_prox: float = 0.3,
+    symbol:   str | None = None,
+    sector_series: "pd.Series | None" = None,
+) -> dict:
+    """
+    Evaluate the LATEST bar of df.
+    Returns a flat dict ready for the scanner table, or {} on failure.
+
+    settings dict (from pages/settings.py) takes priority over legacy kwargs.
+
+    symbol, sector_series : optional — Leadership redesign "RS vs Sector".
+        sector_series is a close-price benchmark Series for this symbol's
+        sector (see utils.sector_map.build_sector_benchmark_frames() /
+        sector_benchmark_for_symbol() for the leave-one-out peer-basket
+        builder used by the live scan loop). Purely additive: omit both
+        and scoring is unaffected — rs_vs_sector stays 0.0 /
+        rs_sector_available=False. `symbol` is otherwise unused here —
+        the caller builds sector_series itself (once per sector per
+        scan, not per symbol) since score_stock() has no access to the
+        full scan universe's history.
+    """
+    # Full-history gate — EMA200 (the default slow EMA that trend
+    # structure/ema_alignment/ema20_pct_dist etc. all derive from) needs
+    # roughly 200 bars to stabilize; 210 keeps a small buffer.
+    _FULL_HISTORY_MIN_BARS = 210
+
+    # [Recent-listing fallback, 2026-08-31] A symbol below the full-history
+    # gate but at least this many bars gets scored anyway, with a slow EMA
+    # SCALED DOWN to fit its actual history instead of a real EMA200 —
+    # rather than being dropped outright until it accumulates ~10 months
+    # of trading days (210 bars). Below this floor, even a scaled EMA is
+    # too short-window/noisy to call a trend read at all, so those still
+    # drop exactly as before. Recently-listed names (IPOs) are the
+    # motivating case (e.g. GROWW/EMMVEE/LENSKART/MEESHO/PINELABS as of
+    # 2026-08 — all had 175-205 bars, just under the 210 gate).
+    _RECENT_LISTING_MIN_BARS   = 70
+    _RECENT_LISTING_EMA_BUFFER = 10   # same buffer ratio as the 200/210 gate
+
+    is_recent_listing = False
+    if df.empty or len(df) < _FULL_HISTORY_MIN_BARS:
+        if df.empty or len(df) < _RECENT_LISTING_MIN_BARS:
+            # [2026-08-25 diagnostic] Previously silent — this is a STRICTER
+            # gate than get_live_history_cached's own min_bars=60 filter
+            # (utils/history_store.py), so a symbol can pass the fetch stage
+            # with 60-209 bars and still vanish here with zero log trace,
+            # right before merging into the Live Scanner / NSE Top Gainers
+            # snapshot. Logging by symbol (when known) is what makes that
+            # case distinguishable from "no OHLCV fetched at all".
+            #
+            # [2026-08-25 fix] Deliberately calling logging.getLogger(__name__)
+            # here instead of using the module-level `_log` name directly —
+            # this function has two `import logging as _log` statements
+            # further down (decision-engine / pillar-engine failure handlers),
+            # and Python's function-wide static scoping means ANY assignment
+            # to `_log` anywhere in this function body — even one that
+            # executes later, on a different code path — makes `_log` a
+            # local variable for the ENTIRE function, including this earlier
+            # reference. That shadowing caused an UnboundLocalError in
+            # production the first time this branch actually fired (symbol:
+            # MEESHO). getLogger(__name__) returns the exact same logger
+            # `_log` refers to at module scope, without touching that name.
+            logging.getLogger(__name__).warning(
+                "score_stock: dropping %s — only %d bar(s) of history "
+                "(need >= %d, or >= %d for a reduced-history read)",
+                symbol or "<unknown symbol>", len(df),
+                _FULL_HISTORY_MIN_BARS, _RECENT_LISTING_MIN_BARS,
+            )
+            return {}
+        is_recent_listing = True
+        logging.getLogger(__name__).info(
+            "score_stock: scoring %s with a reduced-history read — %d bar(s) "
+            "(< %d full-history gate) — slow EMA scaled down accordingly",
+            symbol or "<unknown symbol>", len(df), _FULL_HISTORY_MIN_BARS,
+        )
+
+    from utils.scoring_core import ScoringParams, build_indicators, compute_bar, leadership_prescreen
+
+    if settings:
+        params = ScoringParams.from_settings(settings)
+    else:
+        params = ScoringParams(
+            cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
+            pvt_lb=pvt_lb, atr_prox=atr_prox,
+        )
+
+    if is_recent_listing:
+        # Scale the slow EMA down to fit the available history, keeping
+        # the same buffer ratio the full-history gate uses (e.g. 150 bars
+        # -> ema_slow_period=140). Fast/mid EMAs (20/50 by default) are
+        # left untouched since they're already well inside the available
+        # window at the 70-bar floor. Never scales UP past whatever
+        # ema_slow_period the caller/settings already specified.
+        _scaled_slow = max(60, len(df) - _RECENT_LISTING_EMA_BUFFER)
+        params = _dataclass_replace(
+            params, ema_slow_period=min(params.ema_slow_period, _scaled_slow)
+        )
+
+    # Staged elimination, stage 1: cheap Leadership-only check BEFORE the
+    # expensive full indicator build (ADX/BB/KC/CCI/pivots/fib). Re-added
+    # 2026-07-24 alongside leadership_prescreen() itself — see that
+    # function's docstring in utils/scoring_core.py. This gate is
+    # independent of the CV1 version in use (v3, currently) — it runs
+    # before CV1 is ever computed.
+    #
+    # prescreen_diagnostic (settings key, default False): validation mode
+    # for calibrating the prescreen before trusting it unattended. When on,
+    # a prescreen REJECT does NOT skip the full build — every symbol gets
+    # fully scored either way, and the result row is tagged with
+    # _prescreen_pass / _prescreen_mismatch so you can check, after a scan,
+    # whether the prescreen ever rejected something that would have scored
+    # Watch-or-better on full CV1. Costs the full scan time (no speedup)
+    # while diagnostic mode is on — turn it off once mismatches are ~0%
+    # across a few live scans to get the actual time saving.
+    diagnostic    = bool((settings or {}).get("prescreen_diagnostic", False))
+    prescreen_ok  = leadership_prescreen(df, nifty)
+    if not prescreen_ok and not diagnostic:
+        return {}
+
+    ia = build_indicators(df, nifty, params, sector_series=sector_series)
+    r  = compute_bar(ia, i=-1, params=params)   # -1 = latest bar
+
+    if r is None:
+        return {}
+
+    # ── CV4/SMC shadow scoring input (Phase 2, masterscanner_scoring_
+    # redesign_FINAL.md §2/§4) — compute once per symbol here where `df`
+    # (raw OHLC) is available; SMCState for the latest bar is handed to
+    # compute_conviction_v4() below. Wrapped defensively: any failure here
+    # must never affect CV1/Recommendation — CV4 is diagnostic-only
+    # through Phase 6 (zero production impact, §4).
+    _cv4_smc_state = None
+    _cv4_swing_label = None
+    _order_block = None   # freshest BULLISH OrderBlock, long-only scanner — see below
+    try:
+        from utils.smc_engine import compute_smc_state, detect_order_blocks
+        from utils.swing_structure import compute_swing_labels
+        from utils.structural_levels import causal_pivot_series
+        _pvt_lb = params.pvt_lb if hasattr(params, "pvt_lb") else 20
+        _smc_states = compute_smc_state(df, lb=_pvt_lb)
+        _cv4_smc_state = _smc_states[-1] if _smc_states else None
+        _ph, _pl = causal_pivot_series(df["high"], df["low"], lb=_pvt_lb)
+        _swing_df = compute_swing_labels(_ph, _pl)
+        _cv4_swing_label = _swing_df["label_ffill"].iloc[-1] if len(_swing_df) else None
+        # [Structural gate wiring, 2026-08-15] Live Scanner is long-only
+        # (see compute_conviction_v4()'s own docstring on that constraint)
+        # so only the bullish OB series is needed here — bull_obs[-1] is
+        # the freshest unmitigated bullish OrderBlock as of the latest
+        # bar, or None if none exists (a normal, common case, not an
+        # error — see detect_order_blocks()'s docstring).
+        _bull_obs, _ = detect_order_blocks(df, lb=_pvt_lb)
+        _order_block = _bull_obs[-1] if _bull_obs else None
+    except Exception:
+        _cv4_smc_state = None
+        _cv4_swing_label = None
+        _order_block = None
+
+    # [Production wiring, 2026-08-14] SMC now feeds decision_engine's
+    # Extension/Chase Risk (Primary use, per explicit direction) via
+    # BarResult.smc_state (additive field, added Phase 2). Setting it here
+    # — BEFORE compute_decision() runs below — is the entire integration:
+    # decision_engine._extension() reads r.smc_state itself; no other
+    # change needed at this call site. This affects DE's Extension/
+    # Lifecycle/Stage output for real, on purpose. It does NOT affect CV1
+    # or Recommendation — those are computed from `cv1` above and never
+    # read r.smc_state (see compute_decision() docstring: CV1 is the sole
+    # source of truth for Recommendation; DE no longer produces one).
+    # Same fail-safe convention as the CV4 block above: any failure above
+    # already left _cv4_smc_state=None, which _extension() treats as
+    # SMC-NEUTRAL, never an error.
+    r.smc_state = _cv4_smc_state
+    r.order_block = _order_block   # [2026-08-15, structural gate] see scanner_engine's
+                                    # final_tier clamp below — the ONLY other reader.
+
+    # ── 52-week high/low breadth flags ────────────────────────────
+    # [Market Breadth panel, 2026-07] "Near 52W high/low" is a classic
+    # breadth stat but nothing upstream computed it — CV1/DE/Five Pillars
+    # all work off EMA distance, not the rolling 1y extreme. df already
+    # carries >=210 daily bars (guarded above), so derive it here directly
+    # off close, using a 2% tolerance band since exact new highs/lows are
+    # rare on any given day and the panel wants "near the extreme", not a
+    # literal all-time-max tick.
+    try:
+        _close_col   = "close" if "close" in df.columns else "Close"
+        _closes_1y   = df[_close_col].tail(252)
+        _cur_close   = float(_closes_1y.iloc[-1])
+        _hi_52w      = float(_closes_1y.max())
+        _lo_52w      = float(_closes_1y.min())
+        _near_52w_hi = _hi_52w > 0 and _cur_close >= _hi_52w * 0.98
+        _near_52w_lo = _lo_52w > 0 and _cur_close <= _lo_52w * 1.02
+    except Exception:
+        _near_52w_hi = False
+        _near_52w_lo = False
+
+    result = {
+        "_near_52w_high": _near_52w_hi,
+        "_near_52w_low":  _near_52w_lo,
+        # ── display columns ──────────────────────────────────────
+        "Stock":        None,
+        "Tier":         r.tier,
+        "AccTier":      r.acc_tier,
+        "AccScore":     r.acc_score,
+        "_elite_tier":  r.elite_tier,
+        "TrendPhase":   r.trend_phase,
+        "BuyType":      r.buy_type,
+        "_cci_rising":  r.cci_rising,
+        "FreshBase":    r.fresh_base_breakout,
+        "TrendAge":     r.trend_age_bars,
+        "TrendFresh":   r.trend_freshness,
+        "RS_Top10":     r.rs_top_decile,
+        "RS1m":         round(r.rs1 * 100, 2),
+        "RS3m":         round(r.rs3 * 100, 2),
+        "RS6m":         round(r.rs6 * 100, 2),
+        "RScomp":       round(r.rs_composite * 100, 2),
+        "Score":        r.norm_score,
+        "Action":       r.action,
+        "Setup":        r.setup,
+        "Buy Type":     r.buy_type,
+        "CCI":          round(r.cur_cci),
+        "CCI State":    r.cci_state,
+        "CCI Sig":      r.cci_signal,
+        "Qual":         r.qual_icon,
+        "%Chg":         r.pct_chg,
+        "Entry":        r.entry,
+        "SL":           r.sl,
+        "T1":           r.t1,
+        "T2":           r.t2,
+        "T3":           r.t3,
+        # [Architecture review C1/H4/H5 fix, 2026-07-25] "Entry" above is
+        # the clean DISPLAY price (unpadded signal close) and stays
+        # that way for the UI. These three are new, separate columns:
+        # EntryRef is the price SL/T1/T2 were actually computed from
+        # (what a locked trade plan's entry should be anchored to — H4),
+        # and Low/High are this bar's real traded range, used by the
+        # lifecycle engine to detect SL/T1/T2 crossings correctly (C1)
+        # instead of overloading "Entry" as a live-price feed (H5).
+        "EntryRef":     r.entry_ref,
+        "Low":          r.cur_low,
+        "High":         r.cur_high,
+        # ── internals ────────────────────────────────────────────
+        "_qualified":           r.qualified,
+        "_persistent_strength": r.persistent_strength,
+        "_high_prob":           r.high_prob,
+        "_in_golden":           r.in_golden,
+        "_in_golden_relaxed":   r.in_golden_relaxed,
+        "_in_golden_cci":       r.in_golden_cci,
+        "_above_cloud":         r.above_cloud,
+        "_inside_cloud":        r.inside_cloud,
+        "_allow_cloud":         r.allow_cloud,
+        "_ema_alignment":       r.ema_alignment,
+        "_trend_structure":     r.trend_structure,
+        "_squeeze_on":          r.squeeze_on,
+        "_squeeze_release":     r.squeeze_release,
+        "_compression_break":   r.compression_break,
+        "_cci_momentum_break":  r.cci_momentum_break,
+        "_trend_up":            r.trend_up,
+        "_harm_bull":           r.harm_bull,
+        "_abcd_bull":           r.abcd_bull,
+        "_any_buy":             r.any_buy,
+        "_tier1_prime":         r.tier1_prime,
+        "_tier2_momentum":      r.tier2_momentum,
+        "_recent_cci_rec":      r.recent_cci_recovery,
+        "_hard_stop":           r.hard_stop,
+        "_t2_compression":      r.t2_compression,
+        "_t2_fib_qual":         r.t2_fib_qual,
+        "_t2_fib_cci":          r.t2_fib_cci,
+        "_t2_harmonic":         r.t2_harmonic,
+        "_t2_abcd":             r.t2_abcd,
+        "_t2_cci_break":        r.t2_cci_break,
+        "_t3_near_golden":      r.t3_near_golden,
+        "_t3_cci_rec":          r.t3_cci_rec,
+        "_t3_cloud_test":       r.t3_cloud_test,
+        "_t3_ema_conv":         r.t3_ema_conv,
+        "_t4_hard_stop":        r.t4_hard_stop,
+        "_t4_fib_resist":       r.t4_fib_resist,
+        "_t4_downtrend":        r.t4_downtrend,
+        "_rsi":                 r.cur_rsi,
+        "_mom1":                r.mom1,
+        "_mom3":                r.mom3,
+        "_mom6":                r.mom6,
+        "_cci_raw":             r.cur_cci,
+        "_fib618":              r.fib618,
+        "_fib500":              r.fib500,
+        "_fib382":              r.fib382,
+        "_nifty_regime":        r.nifty_regime_val,
+        "_vol_ratio":           round(r.vol_ratio, 3),
+        # ── NEW: Tier-1 strength fields ──────────────────────────
+        "RS":           round(r.rs_val * 100, 2),   # pct vs Nifty, 5-bar
+        "ADX":          round(r.adx_val, 1),
+        "EMA Slope":    round(r.ema20_slope, 2),
+        "_rs_positive": r.rs_positive,
+        "_strength_ok": r.strength_ok,
+        # ── LL Opportunity + Stochastic Convergence (migrated from Five
+        #    Pillars — native scanner fields now, not just FP_* display-only
+        #    columns; already folded into Score/Action above). See
+        #    utils/ll_opportunity.py and utils/stoch_convergence.py.
+        "LL_Actionable":     r.ll_actionable,
+        "LL_Defended":       r.ll_defended,
+        "LL_DistanceATR":    r.ll_distance_atr,
+        "LL_Price":          r.ll_price,
+        "LL_BonusPts":       r.ll_bonus_pts,
+        "StochK":            r.stoch_k,
+        "StochD":            r.stoch_d,
+        "Stoch_Reignition":  r.stoch_reignition,
+        "Stoch_BarsSinceReignition": r.stoch_bars_since_reignition,
+        "Stoch_Confluence":  r.stoch_confluence,
+        "Stoch_BonusPts":    r.stoch_bonus_pts,
+        "OpportunityBonus":  r.opportunity_bonus_pts,
+        # Suggestion 3: Tier-1 path audit
+        "T1Path":       r.t1_path,
+        # Suggestion 2: score components (kept as _internal — not shown in table)
+        "_score_components": r.score_components,
+        # Suggestion 4: raw BarResult for typed regime engine extraction
+        "_bar_result":  r,
+        # 2026-07-20: real always-on ATR(14) for the current bar — unlike
+        # r.atr_at_setup (0.0 on any bar without an active setup trigger,
+        # which is most bars most of the time), this is populated every
+        # bar. Needed by utils.dore_fo_screener so stock-level DORE runs
+        # get the same real ATR the index path already pulls via
+        # ia.atr_s.iloc[-1] in utils.dore_engine.build_dore_input_for_index
+        # — without it, Stage 3/4 (Premium Quality / Corridor) silently
+        # zero out for any stock with no live setup on this bar.
+        "_atr_current": float(ia.atr_s.iloc[-1]),
+    }
+
+    # ── Conviction Score v3 — LIVE (2026-07, replaces v1) ─────────
+    # v3 composite: Leadership 20% / Conviction 50% / Entry Quality 30%,
+    # with tier/signal floors relaxed relative to v1 (25/25/50) so the
+    # weighted composite carries more of the qualification decision —
+    # see utils/conviction_score_v1.py classify_tier_v3()/_classify_v3()
+    # for the full rationale. Sub-factor scoring itself (_leadership(),
+    # _conviction(), _entry_quality()) is UNCHANGED from v1 — only the
+    # composite blend and tier/signal thresholds differ.
+    # v1 (compute_conviction_v1/classify_tier, 25/25/50) remains frozen
+    # and importable directly for back-comparison; it's simply no
+    # longer what feeds the live Recommendation as of this change.
+    # Pure re-mapping of existing BarResult fields — zero new indicators.
+    # Produces: CV1_Leadership, CV1_Conviction, CV1_EntryQuality, CV1_SignalClass
+    # and all sub-score internals for the detail-view breakdown panel.
+    # [Scanner Refactor] Runs BEFORE the Decision Engine below so its
+    # quality scores can be handed to compute_decision() for Lifecycle
+    # staging — this is the single source of truth for quality everywhere,
+    # including the objective Lifecycle stage, not just the Recommendation.
+    #
+    # [Phase 7 cutover, 2026-09-01] Source swapped from compute_conviction_v3
+    # (CV1_* naming/legacy v3 composite+thresholds) to compute_conviction_v4
+    # (SMC-woven Leadership/Conviction/Entry Quality — see conviction_score_v1.py
+    # ConvictionV4 docstring and canonical_scores.py's CV4 commentary for the
+    # anti-double-counting design). The "cv1" local var name and "CV1_*"/
+    # "CV1_LS_Grade" result keys are kept as-is on purpose: canonical_scores.
+    # to_canonical() and ~10 other consumers (decision_engine, DORE,
+    # lifecycle_engine, entry_snapshot, setup_persistence, agent_tools,
+    # pages/scanner.py, pages/dashboard.py) key off these exact column
+    # names — renaming them is a separate follow-up, not required for this
+    # cutover. compute_conviction_v3/classify_tier_v3 are no longer called
+    # anywhere in production after this change (still present in
+    # conviction_score_v1.py, importable directly for back-comparison).
+    cv1 = None
+    try:
+        from utils.conviction_score_v1 import compute_conviction_v4
+        cv1 = compute_conviction_v4(
+            r, thesis_direction="BULLISH",
+            smc_state=_cv4_smc_state, swing_label=_cv4_swing_label,
+            current_price=r.entry_ref or r.entry, settings=settings,
+        )
+        result.update({
+            "CV1_Leadership":    cv1.leadership,
+            "CV1_Conviction":    cv1.conviction,
+            "CV1_EntryQuality":  cv1.entry_quality,
+            "CV1_Composite":     cv1.composite,
+            "CV1_SignalClass":   cv1.signal_class,
+            # Staged-elimination diagnostic tags (see prescreen_diagnostic
+            # above). _prescreen_mismatch=True means the cheap prescreen
+            # would have rejected this symbol before full scoring, but the
+            # full score actually reached Watch-or-better — a false
+            # negative that would silently drop a real setup from the scan
+            # once diagnostic mode is turned off and the prescreen goes live
+            # as the actual filter. Check this column is ~0% across a few
+            # scans before relying on the prescreen unattended.
+            "_prescreen_pass":     prescreen_ok,
+            "_prescreen_mismatch": (not prescreen_ok) and cv1.signal_class in ("WATCH", "EXECUTE", "ELITE"),
+            # Grade labels
+            "CV1_LS_Grade":      cv1.leadership_grade,
+            "CV1_CV_Grade":      cv1.conviction_grade,
+            "CV1_EQ_Grade":      cv1.entry_quality_grade,
+            # Leadership sub-scores (V4 shape — see ConvictionV4; NOT the old
+            # v1/v3 RS/age/slope breakdown, so keys are renamed rather than
+            # force-fit into the old _cv1_* names. pages/scanner.py's detail
+            # breakdown panel and utils/entry_snapshot.py still read the old
+            # names via fallback chains and need a follow-up pass — flagged,
+            # not fixed in this cutover).
+            "_cv4_ls_rs":            cv1.ls_relative_strength,
+            "_cv4_ls_trend":         cv1.ls_trend_strength,
+            "_cv4_ls_persist":       cv1.ls_trend_persistence,
+            "_cv4_ls_mktsector":     cv1.ls_market_sector_leadership,
+            "_cv4_ls_participation": cv1.ls_participation_volume,
+            "_cv4_ls_structural":    cv1.ls_structural_price_quality,
+            # Conviction sub-scores
+            "_cv4_cv_directional":   cv1.cv_directional_trend,
+            "_cv4_cv_momentum":      cv1.cv_momentum,
+            "_cv4_cv_rs":            cv1.cv_relative_strength,
+            "_cv4_cv_volume":        cv1.cv_volume,
+            "_cv4_cv_regime":        cv1.cv_market_regime,
+            "_cv4_cv_smc":           cv1.cv_smc_confirmation,
+            "_cv4_cv_setup":         cv1.cv_setup_pattern,
+            # Entry Quality sub-scores
+            "_cv4_eq_trend":         cv1.eq_trend_alignment,
+            "_cv4_eq_momentum":      cv1.eq_momentum_timing,
+            "_cv4_eq_smc":           cv1.eq_smc_entry_structure,
+            "_cv4_eq_location":      cv1.eq_price_location,
+            "_cv4_eq_volume":        cv1.eq_volume_execution,
+            "_cv4_eq_extension":     cv1.eq_extension_chase_risk,
+            # SMC pass-through for display/debug (previously CV4-shadow-only)
+            "CV4_SMC_Direction":     cv1.smc_direction,
+            "CV4_SMC_State":         cv1.smc_state_label,
+            "CV4_SMC_EvidenceTier":  cv1.smc_evidence_tier,
+            "CV4_SMC_AgeBars":       cv1.smc_age_bars,
+            "CV4_SMC_FvgRetest":     cv1.smc_fvg_retest,
+        })
+    except Exception:
+        cv1 = None   # Decision Engine call below is skipped entirely for this symbol —
+                     # see compute_decision(mode="production") requirement below
+
+    # [Phase 7 cutover, 2026-09-01] The former "CV4 shadow scoring" block
+    # that lived here (a second compute_conviction_v4() call writing
+    # CV4_* columns for comparison against CV1_*) has been removed — CV4
+    # IS the production score now (computed once, above), so a duplicate
+    # call would have just doubled compute cost and produced CV4_* columns
+    # that trivially equal CV1_*. If a comparison view against the old
+    # v3 scoring is ever needed again, call compute_conviction_v3()
+    # directly (still present, frozen, in conviction_score_v1.py).
+
+    # ── Decision Engine — Extension / Lifecycle / Trend Quality / R:R ──
+    # [Scanner Refactor] No longer produces a Recommendation — CV1 +
+    # Promotion Engine (below) own that entirely. What's left is the
+    # things they don't cover: Extension, the objective Lifecycle stage
+    # (classified from CV1's scores when available), Trend Quality, R:R,
+    # and the explainability panel. See utils/decision_engine.py docstring.
+    ds = None   # ensure defined even if compute_decision() below raises
+    try:
+        from utils.decision_engine import compute_decision
+        if cv1 is None:
+            # CV1 failed above — there is no legitimate production Lifecycle
+            # read without it (compute_decision(mode="production") requires
+            # CV1's scores and will not silently substitute the legacy
+            # ones). Leave ds=None; downstream treats this the same as any
+            # other Decision Engine failure — logged, Extension/Lifecycle/
+            # TrendQuality/RR absent for this symbol.
+            raise RuntimeError("CV1 unavailable — skipping compute_decision(mode='production')")
+        ds = compute_decision(
+            r, settings or {},
+            cv1_leadership    = cv1.leadership,
+            cv1_conviction    = cv1.conviction,
+            cv1_entry_quality = cv1.entry_quality,
+            mode="production",
+        )
+        result.update({
+            "Legacy_Leadership":    ds.legacy_leadership,     # diagnostic only — feeds ConvictionGap
+            "Legacy_Conviction":    ds.legacy_conviction,      # no longer represents DE production logic —
+            "Legacy_EntryQuality":  ds.legacy_entry_quality,   # consumers read this key, falling back to old "DE_*"
+            "Extension":     ds.extension,
+            "Lifecycle":     ds.lifecycle,     # objective stock state, classified from CV1 + Extension
+            "RR":            ds.risk_reward,
+            # ── Bars-since-setup banding (key question: "Can I still enter today?")
+            "BarsBand":      ds.bars_band,         # "Actionable" | "Late" | "Extended"
+            "BarsSince":     ds.bars_since_setup,
+            "MoveSince":     ds.price_move_since_setup,
+            "EMA20Dist":     ds.ema20_pct_dist,
+            "EMA50Dist":     ds.ema50_pct_dist,
+            "PivotDist":     ds.pivot_high_dist,
+            # Sub-scores stored as internals for detail view
+            "_ds_ls_trend":      ds.ls_trend,
+            "_ds_ls_rs":         ds.ls_rs,
+            "_ds_ls_momentum":   ds.ls_momentum,
+            "_ds_ls_volume":     ds.ls_volume,
+            "_ds_ls_freshness":  ds.ls_freshness,
+            "_ds_cv_pattern":    ds.cv_pattern,
+            "_ds_cv_fib":        ds.cv_fib,
+            "_ds_cv_compression":ds.cv_compression,
+            "_ds_cv_rs_lead":    ds.cv_rs_lead,
+            # New entry quality measured sub-scores
+            "_ds_eq_ema20_dist": ds.eq_ema20_dist,
+            "_ds_eq_ema50_dist": ds.eq_ema50_dist,
+            "_ds_eq_pivot_dist": ds.eq_pivot_dist,
+            "_ds_eq_move_since": ds.eq_move_since,
+            "_ds_eq_bars_since": ds.eq_bars_since,
+            # New extension measured sub-scores
+            "_ds_ex_ema20_dist": ds.ex_ema20_dist,
+            "_ds_ex_ema50_dist": ds.ex_ema50_dist,
+            "_ds_ex_pivot_dist": ds.ex_pivot_dist,
+            "_ds_ex_move_since": ds.ex_move_since,
+            "_ds_ex_bars_since": ds.ex_bars_since,
+            # Trend Quality Score (Sprint 1)
+            "TrendQuality":          ds.trend_quality,
+            "_ds_tq_age":            ds.tq_age,
+            "_ds_tq_align":          ds.tq_align,
+            "_ds_tq_rs":             ds.tq_rs,
+            "_ds_tq_pullback":       ds.tq_pullback,
+            # Explainability (Sprint 1) — stored as JSON strings for DataFrame compat
+            "_explain_included":     "|".join(ds.why_included)   if ds.why_included   else "",
+            "_explain_not_higher":   "|".join(ds.why_not_higher) if ds.why_not_higher else "",
+            "_explain_risks":        "|".join(ds.risk_factors)   if ds.risk_factors   else "",
+            # ── Sub-score breakdown for DE Leadership factor attribution ─────────
+            "_de_ls_trend":   ds.ls_trend,      # EMA structure + cloud (0-35) — biggest bucket
+            "_de_ls_rs":      ds.ls_rs,         # RS composite (0-30)
+            "_de_ls_momentum":ds.ls_momentum,   # mom3/mom6 % returns (0-15)
+            "_de_ls_volume":  ds.ls_volume,     # vol_ratio sponsorship (0-10)
+            "_de_ls_freshness":ds.ls_freshness, # trend freshness decay (0-10)
+        })
+    except Exception as _de_exc:           # DE failure: log, never silently swallow
+        import logging as _log
+        _log.warning(
+            "[decision_engine] compute_decision() failed for symbol — "
+            "Extension/Lifecycle/TrendQuality/RR will be absent. "
+            "Error: %s", _de_exc, exc_info=True
+        )
+
+    # ── RECOMMENDATION FUNNEL (CV1 quality → Execute/Elite) ──
+    # CV1 is the single source of truth for quality. classify_tier_v3()
+    # (equal-weight 1/3 each composite, decile-backtest calibrated 2026-07,
+    # replaces
+    # v1's classify_tier) maps its three scores to the base funnel:
+    #     Skip → Watch → Developing → Actionable
+    # An Actionable setup reaches Execute/Elite by its OWN natural V3
+    # score first (cv1.signal_class / _classify_v3, off the same
+    # composite) — that is the qualifying condition, not the Promotion
+    # Engine. Promo Score/timing is additive only: it can carry an
+    # Actionable setup one rung further (never required, never a gate,
+    # never a demotion, never creates Watch/Developing/Skip on its own).
+    # This Recommendation is the ONLY recommendation shown anywhere in
+    # the app.
+    try:
+        if cv1 is None:
+            raise RuntimeError("CV1 unavailable — cannot classify Recommendation")
+
+        from utils.conviction_score_v1 import classify_tier_v4
+        from utils.promotion_engine import evaluate_promotion
+
+        # [Phase 7 cutover, 2026-09-01] classify_tier_v3 → classify_tier_v4.
+        # V4's threshold keys are namespaced "v4_*" (V4_THRESHOLD_DEFAULTS)
+        # so they don't collide with any v3-tuned keys left in `settings`;
+        # anything under those v4_ keys should be reviewed/backtest-fit
+        # before relying on it in production (classify_tier_v4()'s own
+        # docstring: its defaults are NOT backtest-fit, unlike v3's, which
+        # were decile-calibrated against the 1,732-trade validation set).
+        base_tier = classify_tier_v4(cv1.leadership, cv1.conviction, cv1.entry_quality, thresholds=settings)
+
+        # ── UNIVERSE-WIDE PROMO BYPASS [2026-07-29] ──
+        # Evaluate timing signals on EVERY symbol, not just ones CV1 has
+        # already qualified as Actionable. If Promo Score clears the
+        # Execute/Elite bar (with its own R:R gate) on its own, that's
+        # sufficient — the symbol goes straight to action even if
+        # base_tier is Skip/Watch/Developing (CV1 never vetted its
+        # Leadership/Conviction/Entry Quality). This is a deliberate,
+        # requested trade-off: pure timing confirmation, no quality
+        # floor. A stock can reach Execute/Elite here on stochastic +
+        # VWAP + LL + volume signals alone. See promotion_engine.py's
+        # `bypass_tier_gate` docstring.
+        _promo_bypass = evaluate_promotion(
+            r, base_tier, ia=ia, settings=settings or {}, bypass_tier_gate=True
+        )
+        if _promo_bypass.bypassed and _promo_bypass.promoted:
+            promo = _promo_bypass
+        else:
+            promo = evaluate_promotion(r, base_tier, ia=ia, settings=settings or {})
+
+        # ── STRUCTURAL GATE (opt-in — default False for A/B backtesting) ──
+        # Decision Engine computes hard structural failure conditions and
+        # an independent Lifecycle read (which factors in its own fuller
+        # Extension model — volume-climax discount, breakout-elite path —
+        # not just CV1's blunter EQ-embedded extension penalty). When
+        # enabled, honor those before Promotion Engine evaluates timing:
+        #   - hard_stop / t4_hard_stop  → structural failure, force Skip
+        #   - Lifecycle == EXTENDED     → chase risk Decision Engine caught
+        #                                 that CV1's EQ cap didn't fully
+        #                                 capture → downgrade, don't promote
+        #   - Lifecycle == AVOID        → Decision Engine's own composite
+        #                                 disagrees this is viable at all
+        # This only ever downgrades base_tier; it can never upgrade one.
+        # Flag: settings["ENABLE_STRUCTURAL_GATE"] (default False). Run the
+        # backtest with it on vs off before flipping the default — this
+        # changes which setups reach Execute/Elite, so it needs its own
+        # pass through the existing 1,732-trade validation set first.
+        _gate_reason = ""
+        _structural_gate_on = bool((settings or {}).get("ENABLE_STRUCTURAL_GATE", False))
+        if _structural_gate_on and base_tier == "Actionable":
+            if getattr(r, "t4_hard_stop", False) or getattr(r, "hard_stop", False):
+                base_tier = "Skip"
+                _gate_reason = "hard_stop"
+            elif ds is not None and ds.lifecycle == "AVOID":
+                base_tier = "Watch"
+                _gate_reason = "lifecycle=AVOID"
+            elif ds is not None and ds.lifecycle == "EXTENDED":
+                base_tier = "Watch"
+                _gate_reason = "lifecycle=EXTENDED"
+
+        # ── NATURAL V3 SCORE → EXECUTE/ELITE (not gated by Promo Score) ──
+        # cv1.signal_class (_classify_v3) independently qualifies EXECUTE/
+        # ELITE straight off the equal-weight composite + its own floors — it
+        # was being computed into CV1_SignalClass but never consulted here,
+        # so a naturally-qualifying setup sat capped at Actionable (or even
+        # Developing — see below) unless Promotion Engine's *timing*
+        # signals also happened to fire. Promo Score was never meant to be
+        # a gate on this path — Entry Quality already hard-caps at 35 under
+        # EXTENDED trend_phase, so extension risk is already priced into
+        # the natural score. Promo Score/timing can still carry a setup one
+        # rung further (e.g. a naturally-Execute setup that also times
+        # perfectly → Elite); it just can't be required to reach
+        # Execute/Elite in the first place.
+        #
+        # Natural EXECUTE's composite floor (>=60) sits BELOW base funnel's
+        # Actionable floor (>=65) even though both share the same
+        # leadership>=40/conviction>=55 floors — so a setup can legitimately
+        # earn natural EXECUTE/ELITE while base_tier is still "Developing".
+        # The natural score always wins regardless of which rung base_tier
+        # landed on; Promo Score is additive on top and is only ever
+        # non-zero when base_tier == "Actionable" (evaluate_promotion's own
+        # internal gate — untouched here).
+        _LADDER = RECOMMENDATION_LADDER
+        _RANK = RECOMMENDATION_RANK
+        base_rank = _RANK.get(base_tier, 0)
+        natural_rank = {"ELITE": 5, "EXECUTE": 4}.get(cv1.signal_class, 0)
+        promo_rank = _RANK.get(promo.tier, 0) if (promo.applicable and promo.promoted) else 0
+
+        final_rank = max(base_rank, natural_rank, promo_rank)
+        final_tier = _LADDER[final_rank]
+        _pre_structural_gate_tier = final_tier   # [fast-winner audit fix] captured
+        # BEFORE apply_smc_structural_gate() so the Primary Blocker text below
+        # can tell a causal downgrade apart from a no-op cap — see that block's
+        # comment for why this matters.
+
+        # ── SMC STRUCTURAL GATE [2026-08-15 SG request] ──────────────
+        # Applied HERE — after natural/promo are already folded into
+        # final_rank — specifically so it CANNOT be bypassed by a high
+        # natural CV1 score or a Promo Score upgrade.
+        #
+        # Pre-existing ENABLE_STRUCTURAL_GATE bypass: FOUND
+        #   Location: this function, "STRUCTURAL GATE (opt-in...)" block
+        #             immediately above (hard_stop/t4_hard_stop and
+        #             Lifecycle AVOID/EXTENDED checks), which clamps
+        #             base_tier BEFORE the natural/promo max() a few
+        #             lines below it — so a high natural_rank or
+        #             promo_rank can still outrank that clamp.
+        #   Status:   FLAGGED — NOT FIXED.
+        #   Reason:   Pre-existing behavior, present before this SMC
+        #             wiring work; explicitly out of scope per 2026-08-15
+        #             scope clarification. Execution ordering (hard_stop/
+        #             lifecycle -> structural gate -> natural/promo max),
+        #             the ENABLE_STRUCTURAL_GATE flag's existing
+        #             semantics, and the lifecycle/promotion logic itself
+        #             are all preserved unmodified by this change. The
+        #             SMC structural gate added here is a separate,
+        #               independent mechanism (applied after final_rank,
+        #             not before base_tier) — it does not touch, replace,
+        #             or extend the existing gate's ordering.
+        final_tier, _smc_structural = apply_smc_structural_gate(final_tier, r.smc_state, r.order_block)
+        final_rank = _RANK[final_tier]
+
+        result["SMC_Structural_State"]      = _smc_structural.state if _smc_structural else None
+        result["SMC_Structural_Action"]     = _smc_structural.action if _smc_structural else None
+        result["SMC_Structural_Reason"]     = _smc_structural.reason if _smc_structural else None
+        result["SMC_Invalidation_Level"]    = _smc_structural.invalidation_level if _smc_structural else None
+        result["SMC_OB_Proximal"]           = r.order_block.proximal if r.order_block else None
+        result["SMC_OB_Distal"]             = r.order_block.distal if r.order_block else None
+        result["SMC_Direction"]             = r.smc_state.direction if r.smc_state else None
+        result["SMC_Entry_Zone"]            = r.smc_state.fvg_retest if r.smc_state else None
+        result["Base_Entry_Score"]          = cv1.entry_quality
+
+        result["_structural_gate_blocked"] = _gate_reason
+        result["_structural_gate_on"] = _structural_gate_on
+
+        result["CV1_SignalClass"]    = cv1.signal_class   # v3-weighted (_classify_v3) as of 2026-07 — no longer v1's frozen label
+        result["Tier"]               = base_tier           # pre-promotion CV1 tier
+        # [Section 7] "Recommendation" IS Final_Recommendation/Final_Entry_State
+        # — the project's existing field for exactly that meaning. Not
+        # duplicated under another name (spec's own instruction against
+        # "duplicate fields with slightly different meanings").
+        result["Recommendation"]     = final_tier           # Skip|Watch|Developing|Actionable|Execute|Elite
+
+        # ── Early-Momentum SHADOW diagnostic (fast-winner audit, 2026-09-01) ──
+        # Does NOT touch Recommendation above — classify_tier_v3()/_leadership()
+        # are frozen (see conviction_score_v1.py module banner). This measures
+        # how often utils.scoring_core.has_early_momentum_signal() would have
+        # moved a Skip to Watch, so the override can be validated on live scans
+        # before ever being considered for production — same posture as
+        # _prescreen_mismatch below. A real day-1 mover getting picked up here
+        # while final_tier stays Skip is the expected, useful case; it is NOT
+        # written into Recommendation/Action/Primary Blocker.
+        try:
+            from utils.scoring_core import has_early_momentum_signal
+            from utils.conviction_score_v1 import classify_tier_v3_shadow_early_momentum
+            _early_mom = has_early_momentum_signal(r)
+            _shadow_tier = classify_tier_v3_shadow_early_momentum(
+                cv1.leadership, cv1.conviction, cv1.entry_quality, _early_mom, thresholds=settings,
+            )
+            result["_early_momentum_signal"]          = _early_mom
+            result["Recommendation_EarlyMomentumShadow"] = _shadow_tier
+            result["_early_momentum_mismatch"] = (
+                _early_mom and RECOMMENDATION_RANK.get(_shadow_tier, 0) > RECOMMENDATION_RANK.get(final_tier, 0)
+            )
+        except Exception:
+            pass   # diagnostic-only — a failure here must never affect Recommendation
+
+        # "Promoted" means Promo Score/timing is the reason final_tier is
+        # above where base_tier + natural score would have landed on their
+        # own (promo_rank strictly ahead of both) — not just "timing
+        # signals happened to fire on a setup that would've gotten here
+        # anyway via base_tier or natural score".
+        result["Promoted"]           = bool(
+            promo.applicable and promo.promoted
+            and promo_rank > max(base_rank, natural_rank)
+        )
+        result["PromoScore"]         = promo.promo_score
+        # True only when this symbol reached Execute/Elite via the
+        # universe-wide bypass — i.e. CV1 never classified it Actionable
+        # (base_tier was Skip/Watch/Developing) and timing signals alone
+        # carried it. Distinguish these in any UI/export that cares —
+        # they never had Leadership/Conviction/Entry Quality vetted.
+        result["PromotedByBypass"]   = bool(promo.bypassed and promo.promoted)
+        result["PromoRR"]            = promo.risk_reward
+        result["Promo_StochUp"]      = promo.stoch_up
+        result["Promo_LLConfirmed"]  = promo.ll_confirmed
+        result["Promo_VWAPReversal"] = promo.vwap_reversal
+        result["Promo_Institutional"]= promo.institutional
+        result["_promo_reasons"]     = "|".join(promo.reasons) if promo.reasons else ""
+        result["_promo_blocked"]     = "|".join(promo.blocked) if promo.blocked else ""
+
+        # ── ACTION GATE ─────────────────────────────────────────────
+        # The original Action column (✅ BUY / 👁 WATCH / ⛔ SKIP) was
+        # assigned purely from norm_score in compute_bar(), with zero
+        # reference to CV1. Reconcile Action with the final Recommendation
+        # tier so the two never disagree.
+        #   Actionable / Execute / Elite → keep/upgrade to BUY
+        #   Developing / Watch           → cap at WATCH
+        #   Skip                         → cap at SKIP
+        _action_raw = result.get("Action", r.action)
+        result["_action_raw"] = _action_raw          # for diagnostics
+
+        if final_tier in ("Actionable", "Execute", "Elite"):
+            gated_action = _action_raw
+        elif final_tier in ("Developing", "Watch"):
+            gated_action = "👁 WATCH" if _action_raw == "✅ BUY" else _action_raw
+        else:  # Skip
+            gated_action = "⛔ SKIP" if _action_raw in ("✅ BUY", "👁 WATCH") else _action_raw
+
+        result["Action"] = gated_action
+
+    except Exception:
+        pass   # non-critical; Action column retains norm_score value
+
+    # ── Five Pillars Ranking Engine ───────────────────────────────
+    # Standalone additive model (Structure/Acceptance/Leadership/Momentum/
+    # Risk). Reuses the already-built IndicatorArrays (ia) — no re-fetch,
+    # no recomputation of EMA/RSI/ATR. Adds VWAP + Fixed Range Volume
+    # Profile (POC/VAH/VAL) and Stochastic Oscillator, which don't exist
+    # anywhere else in the engine.
+    #
+    # NOTE (architecture cleanup): this FP_*/_fp_* block is display-only —
+    # it feeds pages/five_pillars.py and nothing else; it does NOT influence
+    # Score/Action/Conviction above. Its Stochastic Oscillator and LL Spring
+    # (Reversal pillar) detectors are now the same shared, single-owner
+    # implementations (utils.scanner_engine.stochastic, utils.ll_opportunity)
+    # that scoring_core.compute_bar() uses natively above to produce the
+    # LL_*/Stoch_* columns and fold them into Score/Action — so the two
+    # engines can no longer silently disagree on what a "Stochastic
+    # Convergence" or "LL Opportunity" is, only on how heavily each one
+    # weights it.
+    try:
+        from utils.pillar_engine import compute_pillars_from_ia
+        fp = compute_pillars_from_ia(df, ia, cfg=settings or {})
+        if not fp.error:
+            result.update({
+                "FP_Structure":   fp.structure_score,
+                "FP_Acceptance":  fp.acceptance_score,
+                "FP_Reversal":    fp.reversal_score,
+                "FP_Leadership":  fp.leadership_score,
+                "FP_Momentum":    fp.momentum_score,
+                "FP_Risk":        fp.risk_penalty,
+                "FP_FinalScore":  fp.final_score,
+                "FP_Class":       fp.classification,
+                "FP_ClassNote":   fp.classification_note,
+                # Structure internals (20 pts — EMA alignment/slope + HH/HL only)
+                "_fp_ema_stack":       fp.s_ema_stack,
+                "_fp_ema20_rising":    fp.s_ema20_rising,
+                "_fp_ema50_rising":    fp.s_ema50_rising,
+                "_fp_ema200_rising":   fp.s_ema200_rising,
+                "_fp_price_above_e20": fp.s_price_above_e20,
+                "FP_SwingLabel":       fp.s_swing_label,
+                "_fp_hh_hl_intact":    fp.s_hh_hl_intact,
+                "_fp_no_breakdown":    fp.s_no_breakdown,
+                # Acceptance internals (25 pts — VWAP + Volume Profile + OBV)
+                "FP_VWAP":        round(fp.vwap, 2),
+                "FP_POC":         round(fp.poc, 2),
+                "FP_VAH":         round(fp.vah, 2),
+                "FP_VAL":         round(fp.val, 2),
+                "_fp_above_poc":            fp.a_above_poc,
+                "_fp_above_vwap":            fp.a_above_vwap,
+                "_fp_accepted_above_va":      fp.a_accepted_above_va,
+                "_fp_holding_above_zone":      fp.a_holding_above_zone,
+                "_fp_obv_trend_rising":         fp.a_obv_trend_rising,
+                "_fp_obv_leading_price":         fp.a_obv_leading_price,
+                "FP_OBV":                            round(fp.obv_value, 0),
+                # Opportunity Quality Bonus internals (10 pts, layered on
+                # the 90pt base — formerly "LL Elite Bonus")
+                "_fp_r_actionable_ll":              fp.r_actionable_ll,
+                "_fp_r_ll_defended":                  fp.r_ll_defended,
+                "_fp_r_distance_atr_ok":                fp.r_distance_atr_ok,
+                "_fp_r_distance_atr_pts":                 fp.r_distance_atr_pts,
+                "_fp_r_high_volume_confirmation":         fp.r_high_volume_confirmation,
+                "FP_LLPrice":                                  round(fp.r_ll_price, 2),
+                "FP_LLPriorLow":                                round(fp.r_prior_low_price, 2),
+                "FP_LLBarsToReclaim":                            fp.r_bars_to_reclaim,
+                "_fp_r_bars_since_reclaim":                      fp.r_bars_since_reclaim,
+                "_fp_r_vertical_extension":                      fp.r_vertical_extension,
+                "FP_LLDistanceATR":                                fp.r_distance_atr,
+                "FP_LLConfidence":                                   fp.r_confidence,
+                # Leadership internals (13 pts)
+                "FP_RS1m":        fp.rs_1m,
+                "FP_RS3m":        fp.rs_3m,
+                "FP_RS6m":        fp.rs_6m,
+                "FP_RelMomentum": fp.rel_momentum,
+                "_fp_l_rs_pts":     fp.l_rs_pts,
+                "_fp_l_mom_pts":     fp.l_mom_pts,
+                "_fp_l_sector_pts":   fp.l_sector_pts,
+                # Momentum internals (35 pts — today's trigger only)
+                "FP_StochK":         fp.stoch_k,
+                "FP_StochD":         fp.stoch_d,
+                "_fp_stoch_cross_up":            fp.stoch_cross_up,
+                "_fp_rsi_val":                     fp.rsi_val,
+                "_fp_rsi_above_50":                 fp.rsi_above_50,
+                "_fp_vwap_reaction_pts":              fp.m_vwap_reaction_pts,
+                "_fp_returned_above_vwap":             fp.m_returned_above_vwap,
+                "_fp_fresh_stoch_reignition":            fp.m_fresh_stoch_reignition,
+                "_fp_breakout_confirmed":                 fp.m_breakout_confirmed,
+                "_fp_volume_expansion":                    fp.m_volume_expansion,
+                "_fp_reaction_score":                       fp.m_reaction_score,
+                # VWAP Reclaim pattern diagnostics (now real values)
+                "_fp_vwap_touch_found":    fp.m_vwap_touch_found,
+                "_fp_touch_bar":           fp.m_touch_bar,
+                "_fp_touch_distance_atr":  fp.m_touch_distance_atr,
+                "_fp_reaction_strength":   fp.m_reaction_strength,
+                "_fp_confluence":          fp.m_confluence,
+                "_fp_pattern_age":         fp.m_pattern_age,
+                "_fp_vwap_rising":         fp.m_vwap_rising,
+                # Independent Risk Engine internals (max -20 deduction)
+                "_fp_risk_ema20_extension":   fp.risk_ema20_extension,
+                "_fp_risk_atr_extension":      fp.risk_atr_extension,
+                "_fp_risk_exhaustion_candle":   fp.risk_exhaustion_candle,
+                "_fp_risk_parabolic_move":       fp.risk_parabolic_move,
+                "_fp_risk_climactic_volume":      fp.risk_climactic_volume,
+                "FP_DistEMA20Pct": fp.dist_from_ema20_pct,
+                "FP_ATRExtension": fp.atr_extension,
+            })
+    except Exception as _fp_exc:
+        import logging as _log
+        _log.warning(
+            "[pillar_engine] compute_pillars_from_ia() failed for symbol — "
+            "FP_* columns will be absent. Error: %s", _fp_exc, exc_info=True
+        )
+
+    # ── Conviction Gap diagnostic field ──────────────────────────
+    # ConvictionGap = CV1_Conviction - Legacy_Conviction
+    # Positive  → CV1 sees more structural quality than the legacy formula (common in
+    #             momentum runners with RS/CCI strength but no Fib zone or compression setup).
+    #             These stocks now receive Category='Leader' instead of 'Avoid'.
+    # Near zero → both formulas agree; Category and CV1_SignalClass should align.
+    # Negative  → legacy formula sees more than CV1 (rare; signals a pattern-heavy bar without RS).
+    try:
+        cv1_cv = result.get("CV1_Conviction")
+        de_cv  = result.get("Legacy_Conviction", result.get("DE_Conviction"))
+        if cv1_cv is not None and de_cv is not None:
+            gap = int(cv1_cv) - int(de_cv)
+            result["ConvictionGap"] = gap
+            # Profile interpretation:
+            #   Runner     (gap >= +25) — CV1 sees RS/CCI momentum; DE finds no Fib/compression base.
+            #                             These stocks move on continuation energy, not structure.
+            #                             If backtests show Runners timeout more than Aligned,
+            #                             DE is protecting you. If equal, DE Conviction is too strict.
+            #   Aligned    (-24 to +24) — both engines agree; Category and CV1_SignalClass should match.
+            #   Base Builder (gap <= -25) — DE finds pattern/compression structure CV1 hasn't picked up yet.
+            #                             Rare. Worth watching — base may be forming before RS kicks in.
+            if gap >= 25:
+                result["ConvictionProfile"] = "Runner"
+            elif gap <= -25:
+                result["ConvictionProfile"] = "Base Builder"
+            else:
+                result["ConvictionProfile"] = "Aligned"
+    except Exception:
+        pass
+
+    # ── Primary Blocker ──────────────────────────────────────────
+    # Computed here (scanner layer) because it needs both DecisionScores and
+    # the raw BarResult.  Decision engine is kept regime-agnostic.
+    # NOTE: must run AFTER the CV1 block above — _primary_blocker() prefers
+    # CV1_Leadership/CV1_Conviction/CV1_EntryQuality (the values shown in the
+    # UI table) and falls back to the legacy DE scores only if CV1 failed.
+    # Running it earlier meant those CV1_* lookups always missed, so the
+    # blocker text silently graded against invisible DE numbers instead of
+    # the scores the user was actually looking at.
+    try:
+        # [Fix, fast-winner audit] "Elite Opportunity"/"High Conviction" are
+        # legacy DE Category strings that classify_tier_v3()'s Recommendation
+        # never actually produces (it emits "Elite"/"Execute"). That mismatch
+        # meant this guard only ever matched "Actionable", leaving Execute/
+        # Elite rows to fall through and get a spurious blocker written below.
+        category = result.get("Recommendation", result.get("Category", "Avoid"))
+
+        # [Fix, follow-up to fast-winner audit — same day] Determine SMC
+        # gate causality BEFORE calling _primary_blocker(), not after, so
+        # we can tell it to grade against the PRE-gate tier when the gate
+        # actually capped this row. Otherwise it grades against the
+        # POST-gate Recommendation, finds LS/CV/EQ already clear the next
+        # gate up, and reports "stale settings/cache" on a row that's
+        # perfectly explained by the SMC cap already in the prefix below.
+        _smc_state = result.get("SMC_Structural_State")
+        _smc_reason = result.get("SMC_Structural_Reason")
+        _post_gate_rank = RECOMMENDATION_RANK.get(result.get("Recommendation"), 0)
+        _pre_gate_rank = RECOMMENDATION_RANK.get(_pre_structural_gate_tier, 0)
+        _gate_was_causal = _post_gate_rank < _pre_gate_rank
+
+        blocker = _primary_blocker(
+            r, result, settings,
+            recommendation_override=(_pre_structural_gate_tier if _gate_was_causal else None),
+        )
+        # [Fix, 2026-08-16] When the SMC structural gate actually capped
+        # this row's Recommendation (state isn't VALID_ENTRY_ZONE, i.e.
+        # apply_smc_structural_gate() changed something), that reason
+        # belongs in front of whatever CV1/DE blocker text already
+        # existed — the structural cap is the reason a trader's own
+        # score didn't clear, so it's the primary explanation. Previously
+        # SMC_Structural_State/_Reason were computed and written to the
+        # row but never surfaced anywhere in the UI — a trader could see
+        # a Watch-capped stock with zero explanation.
+        #
+        # [Fix, fast-winner audit] The check below used to be purely
+        # "state != VALID_ENTRY_ZONE", which prepends the SMC reason even
+        # when apply_smc_structural_gate()'s cap was a no-op (e.g. the row
+        # was already Skip from the Leadership/Conviction AND-gate, and a
+        # CONFLICT cap to "Watch" can't lower it any further). That made
+        # SMC look like a co-equal rejection cause on rows where it never
+        # actually changed the outcome. Now only fires when the gate
+        # provably changed the tier (_pre_structural_gate_tier vs. the
+        # post-gate rank actually written to Recommendation) — see the
+        # scanner audit ("Primary Blocker labeling bug") for the analysis.
+        if _smc_state and _smc_state != "VALID_ENTRY_ZONE" and _gate_was_causal:
+            _smc_text = f"SMC {_smc_state.replace('_', ' ').title()}"
+            if _smc_reason:
+                _smc_text += f" ({_smc_reason.replace('_', ' ')})"
+            blocker = f"{_smc_text} · {blocker}" if blocker else _smc_text
+        result["Primary Blocker"] = blocker if category not in ("Elite Opportunity", "High Conviction", "Actionable", "Execute", "Elite") else ""
+    except Exception:
+        pass
+
+    # [Recent-listing fallback, 2026-08-31] Surface the reduced-history
+    # read so downstream UI (Live Scanner / Dashboard) can flag it rather
+    # than presenting it with the same confidence as a symbol scored
+    # against a real EMA200 — see the ema_slow_period scaling above.
+    result["reduced_history"] = is_recent_listing
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
+#  BATCH SCANNER
+# ══════════════════════════════════════════════════════════════════
+
+_BATCH_SIZE = 150
+
+
+def _missing_today_bar(data: dict, symbols, source: str = "yfinance",
+                        max_live_age_seconds: float | None = 90.0) -> tuple:
+    """
+    Single authoritative definition of "does this symbol's cached history
+    need a live price fetch right now". This used to be inlined inside
+    run_scanner() as a one-off list comprehension; pulled out so that
+    history_store.update_live_cache() (which needs to know exactly which
+    symbols were live-patched, to scope its background parquet flush) can
+    reuse the identical check rather than a second, potentially-diverging
+    copy of it. This is a distinct question from
+    history_store.get_history()'s own staleness check (does the cached
+    EOD history need a NETWORK re-fetch, e.g. due to age or a corporate
+    action) — that one is owned entirely by history_store.py and is
+    untouched by this function.
+
+    Two symbols are flagged:
+      1. No bar dated today at all (never live-patched this session) —
+         the original check.
+      2. [CMP/LTP staleness fix] A bar dated today EXISTS, but it was
+         live-patched more than `max_live_age_seconds` ago. Without this,
+         once a symbol got its first live-patched bar of the day, its
+         index date == today forever after, so this function stopped
+         selecting it for every later scan cycle — CMP/LTP froze at
+         whatever price came in on that first patch (often right at
+         market open) instead of refreshing every cycle. Set
+         max_live_age_seconds=None to disable this check and restore the
+         old date-only behavior.
+    """
+    from datetime import date as _date
+    today = pd.Timestamp(_date.today())
+
+    has_today = [sym for sym in symbols if sym in data]
+    missing = tuple(
+        sym for sym in has_today if data[sym].index[-1].normalize() < today
+    )
+
+    if max_live_age_seconds is None:
+        return missing
+
+    # Only symbols that DO have today's bar are candidates for the
+    # staleness check — symbols already in `missing` are covered above.
+    has_today_bar = [
+        sym for sym in has_today if data[sym].index[-1].normalize() == today
+    ]
+    if not has_today_bar:
+        return missing
+
+    from utils.history_store import get_live_fetch_age
+    ages = get_live_fetch_age(source, has_today_bar)
+    stale = tuple(
+        sym for sym in has_today_bar
+        if sym not in ages or ages[sym] > max_live_age_seconds
+    )
+    return tuple(dict.fromkeys(missing + stale))
+
+
+def run_scanner(
+    symbols:     list,
+    settings:    dict | None = None,
+    cci_len:     int  = 20,
+    cci_ob:      int  = 100,
+    cci_os:      int  = -100,
+    max_workers: int  = 5,   # [Blunt RAM fix, 2026-08-03] was 10 -- see utils/upstox_client.py's
+                              # _MAX_WORKERS comment for the reasoning (halved every fetch pool
+                              # to cut peak concurrent native-buffer memory).
+    progress_cb       = None,
+    source:      str  = "yfinance",
+    source_warn_cb    = None,
+    nifty_series: "pd.Series | None" = None,
+) -> pd.DataFrame:
+    """
+    Two-phase scanner.
+    Nifty regime is computed once here from live data, then injected into
+    the settings dict so every score_stock() call uses the same value
+    without redundant per-stock computation.
+
+    source: "yfinance" (default) or "upstox". Upstox has no multi-symbol
+    historical-candle endpoint, so utils.upstox_client fetches per-symbol
+    concurrently; if it comes back empty for any symbol in a batch (token
+    expired, rate-limited, unresolved instrument_key, etc.) those specific
+    symbols are filled in from yfinance rather than dropped, and
+    source_warn_cb(str) — if given — is called so the caller can surface
+    what happened without failing the whole scan.
+
+    nifty_series: [2026-08-17] Optional pre-fetched Nifty close Series.
+    When omitted, run_scanner() calls fetch_nifty() itself as before
+    (fine for one-shot callers like the manual "Run Scan" button, which
+    only ever calls run_scanner() once). scheduler/scan_worker.py's live
+    scanner instead calls run_scanner() once per ~50-symbol sub-batch —
+    letting each of those calls independently hit fetch_nifty()'s 60s
+    cache meant every batch had its own chance of landing on a cache
+    miss and re-fetching, so a single flaky yfinance response (e.g. a
+    duplicate-dated row) only ever corrupted the one batch unlucky
+    enough to trigger the miss, rather than the whole cycle failing
+    identically everywhere (which would have been easier to notice).
+    Passing one already-fetched, already-deduped Series in for the whole
+    cycle removes that per-batch lottery entirely.
+    """
+    def _warn(msg: str) -> None:
+        if source_warn_cb:
+            try:
+                source_warn_cb(msg)
+            except Exception:
+                pass
+
+    use_upstox = source == "upstox"
+    if use_upstox:
+        from utils.upstox_client import is_token_expired
+        if is_token_expired():
+            _warn("Upstox token appears expired (tokens expire 3:30 AM IST daily) — using Yahoo Finance for this scan instead.")
+            use_upstox = False
+
+    total     = len(symbols)
+    n_batches = max(1, (total + _BATCH_SIZE - 1) // _BATCH_SIZE)
+    fetch_source = "upstox" if use_upstox else "yfinance"
+
+    # 2026-07-16: fetch_batch_ohlcv() (st.cache_data(ttl=60) over
+    # get_history()) replaced with history_store.get_live_history_cached()
+    # here — a RAM-resident cache that only calls get_history() (i.e. only
+    # touches disk) once per process per calendar day in the common case,
+    # instead of on every ~60s TTL miss for the whole universe. See
+    # history_store.py's "LIVE (RAM) CACHE FOR THE SCANNER" section.
+    # get_history() itself, and every other caller of it (backtest_engine,
+    # cci_master_engine, fetch_batch_ohlcv), is unaffected.
+    from utils.history_store import get_live_history_cached, update_live_cache
+
+    # [2026-08-31 profiling] Coarse fetch-vs-score timing split, added to
+    # find where a batch's total time (already logged one level up in
+    # scheduler/scan_worker.py) is actually going. Additive only — no
+    # behavior change.
+    _t_fetch_start = time.time()
+
+    all_data: dict = {}
+    fallback_syms: set = set()   # symbols served via yfinance fallback during an upstox scan
+    for batch_i, start in enumerate(range(0, total, _BATCH_SIZE)):
+        chunk      = tuple(symbols[start: start + _BATCH_SIZE])
+        batch_data = get_live_history_cached(list(chunk), years=1.0, min_bars=60, source=fetch_source)
+        if use_upstox:
+            missing = [s for s in chunk if s not in batch_data]
+            if missing:
+                fallback = get_live_history_cached(list(missing), years=1.0, min_bars=60, source="yfinance")
+                if fallback:
+                    _warn(f"Upstox had no data for {len(fallback)} symbol(s) this batch — used Yahoo Finance instead.")
+                    fallback_syms.update(fallback.keys())
+                batch_data.update(fallback)
+        all_data.update(batch_data)
+        if progress_cb:
+            progress_cb(
+                0.5 * (batch_i + 1) / n_batches,
+                text=f"Fetching data — batch {batch_i + 1}/{n_batches} "
+                     f"({len(all_data)}/{total} symbols, {fetch_source})",
+            )
+
+    # ── Patch live prices (today's intraday bar) ──────────────────
+    # FIX: only call _fetch_live_prices when today's bar is missing from the
+    # batch download (avoids a duplicate 500-symbol yf.download on most runs).
+    try:
+        stale_syms = _missing_today_bar(all_data, symbols, source=fetch_source)
+        if stale_syms:
+            if use_upstox:
+                from utils.upstox_client import fetch_batch_today_ohlc_upstox
+                live_prices = fetch_batch_today_ohlc_upstox(list(stale_syms))
+                missing_live = [s for s in stale_syms if s not in live_prices]
+                if missing_live:
+                    live_prices.update(_fetch_live_prices(tuple(missing_live)))
+            else:
+                live_prices = _fetch_live_prices(stale_syms)
+            all_data    = _patch_live_prices(all_data, live_prices)
+
+            # Persist the live-patched bars back into the RAM cache so a
+            # later scan THIS SESSION doesn't need to re-patch symbols that
+            # already have today's bar, and schedule a background parquet
+            # flush for just the changed symbols. Split by actual source —
+            # symbols served via the yfinance fallback above must land in
+            # the yfinance RAM/disk bucket, never the upstox one (mixing
+            # adjusted/unadjusted closes would corrupt the tail-merge; see
+            # history_store.py's module docstring).
+            primary_syms = tuple(s for s in stale_syms if s not in fallback_syms)
+            fb_syms      = tuple(s for s in stale_syms if s in fallback_syms)
+            if primary_syms:
+                update_live_cache(fetch_source, all_data, primary_syms)
+            if fb_syms:
+                update_live_cache("yfinance", all_data, fb_syms)
+    except Exception:
+        pass   # non-fatal — fall back to cached OHLCV
+
+    if nifty_series is None:
+        nifty_series = fetch_nifty("1y", source=fetch_source)
+    regime_val   = nifty_regime(nifty_series)   # bull / bear / neutral — computed once
+
+    # [2026-08-31 profiling] End of fetch phase (OHLCV batches + live-price
+    # patch + Nifty fetch) — everything above this line is network-bound;
+    # everything below is the scoring phase (CPU-bound + bounded wait).
+    _fetch_phase_s = time.time() - _t_fetch_start
+    _t_score_start = time.time()
+
+    # Inject regime into settings so ScoringParams picks it up
+    effective_settings = dict(settings) if settings else {}
+    effective_settings["nifty_regime_val"] = regime_val
+    # nifty_regime_filter already in settings from the UI toggle (defaults False)
+
+    results = []
+    done    = 0
+
+    # ── Leadership redesign: sector benchmarks, computed once per scan ──
+    # Peer-basket proxy (see utils.sector_map.build_sector_benchmark_frames
+    # docstring for why — no real sector-index feed is wired into this
+    # app). Built once from data already in `all_data`, no extra fetches.
+    # LEAVE-ONE-OUT: sector_benchmark_for_symbol() excludes each symbol's
+    # own rebased column before averaging, so a stock is never partially
+    # benchmarked against its own price. A symbol whose sector has fewer
+    # than 2 usable peers in this batch simply gets no sector_series ->
+    # rs_vs_sector stays neutral/unavailable for it, same as before this
+    # redesign.
+    #
+    # OFF BY DEFAULT (opt-in via settings["enable_sector_rs"]=True).
+    # 2026-08-06 incident: an earlier version of this block rebased each
+    # peer's FULL multi-year close history for up to ~300 symbols (20
+    # sectors x 15-peer cap) every scan cycle, causing a large RAM spike
+    # and scans being skipped in production — the whole redesign was
+    # reverted (a244b5d) as a result. build_sector_benchmark_frames() now
+    # trims each peer to a bounded recent window (lookback_bars, default
+    # 210) before rebasing, which fixes the memory blowup — kept opt-in
+    # until validated under real production load.
+    _sector_frames = {}
+    sector_benchmark_for_symbol = None
+    if effective_settings.get("enable_sector_rs", False):
+        try:
+            from utils.sector_map import build_sector_benchmark_frames, sector_benchmark_for_symbol
+            _close_by_symbol = {
+                s: d["close"] for s, d in all_data.items()
+                if d is not None and not d.empty and "close" in d.columns
+            }
+            _sector_frames = build_sector_benchmark_frames(_close_by_symbol)
+        except Exception:
+            _sector_frames = {}
+            sector_benchmark_for_symbol = None  # noqa: F811 — degrade to no sector RS if this fails
+
+    # [2026-08-17] Narrowed closure: only pull the one symbol's frame and
+    # sector series out of the batch-wide dicts *before* submitting, so a
+    # future that never finishes (see _scorer_pool note above) pins one
+    # DataFrame instead of keeping the entire batch's `all_data` dict (and
+    # `_sector_frames`, `nifty_series`, `effective_settings`, etc.) alive
+    # via the closure for as long as that leaked thread happens to live.
+    def process(sym, df, sector_series):
+        if df is None or df.empty:
+            return None
+        row = score_stock(df, nifty_series, settings=effective_settings,
+                          cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
+                          symbol=sym, sector_series=sector_series)
+        if row:
+            row["Stock"] = sym
+        return row
+
+    # 2026-07-24: bounded wait, not unbounded as_completed(). score_stock()
+    # itself makes no network calls (pure pandas/numpy on data already
+    # fetched into all_data above), so a hang here would have to come from
+    # something pathological in the scoring path itself (e.g. malformed/
+    # degenerate OHLCV for one symbol) rather than the yfinance/curl_cffi
+    # timeout issue documented on yf_download_with_retry() above — that
+    # risk lives earlier, in the get_live_history_cached() fetch loop, and
+    # isn't addressed by this change. This is defense-in-depth for THIS
+    # pool specifically: previously a single stuck future would block
+    # every other future's result from ever being collected, since
+    # as_completed()/fut.result() have no timeout — one bad symbol could
+    # silently stall the whole scan (and, via _run_live_scanner_loop,
+    # every future batch) forever. Now a stuck symbol just gets skipped
+    # for this run (logged, not silently dropped) while every other
+    # symbol's already-finished result still gets collected and returned.
+    #
+    # [2026-08-17] Submits to a persistent module-level scorer pool
+    # instead of a fresh ThreadPoolExecutor per call — see the pool
+    # cache's definition near the top of this file for why. No
+    # shutdown() here: the pool outlives this function call by design,
+    # across every batch and every cycle. A permanently-stuck future
+    # just occupies one of the pool's max_workers slots forever; with
+    # max_workers fixed (per size — see _get_scorer_pool()), the worst
+    # case is bounded (at most `max_workers` symbols ever permanently
+    # stuck at once for that size's pool) instead of growing without
+    # limit.
+    _SCORE_WAIT_TIMEOUT_S = 45
+    _pool = _get_scorer_pool(max_workers)
+    futures = {
+        _pool.submit(
+            process,
+            s,
+            all_data.get(s),
+            sector_benchmark_for_symbol(_sector_frames, s)
+            if sector_benchmark_for_symbol is not None else None,
+        ): s
+        for s in symbols
+    }
+    # No try/finally around this section anymore — the old `finally:
+    # exe.shutdown(wait=False)` existed only to tear down the per-call
+    # executor without blocking on stuck workers. _pool is one of the
+    # persistent, size-keyed pools in _scorer_pools (see top of file),
+    # reused across every batch/cycle that requests this same
+    # max_workers, so there is nothing to shut down here. A
+    # pending/stuck future just keeps occupying one of the pool's
+    # fixed worker slots (bounded — see the pool's own
+    # comment) until it eventually finishes on its own.
+    finished, pending = wait(futures, timeout=_SCORE_WAIT_TIMEOUT_S)
+    for fut in finished:
+        done += 1
+        if progress_cb:
+            progress_cb(
+                0.5 + 0.5 * done / total,
+                text=f"Scoring stocks — {done}/{total}",
+            )
+        try:
+            row = fut.result()
+        except Exception:
+            _log.exception("scanner_engine: score_stock failed for %s", futures[fut])
+            row = None
+        if row:
+            results.append(row)
+    if pending:
+        # [2026-08-17] Cancel what we can. A future that's still QUEUED
+        # (its worker thread hasn't started it yet) can be cancelled
+        # cleanly — that drops its reference to the submitted args (df,
+        # sector_series) immediately instead of leaving them queued
+        # indefinitely behind whatever's actually stuck. A future that's
+        # already RUNNING can't be force-cancelled (Python threads have
+        # no safe preemption), so cancel() returns False for those and we
+        # just count them — they'll keep occupying one of the pool's
+        # fixed worker slots until they finish on their own, but that's
+        # bounded by that pool's max_workers rather than unbounded.
+        stuck = [futures[f] for f in pending]
+        cancelled = 0
+        running = 0
+        for fut in pending:
+            if fut.cancel():
+                cancelled += 1
+            else:
+                running += 1
+        _log.warning(
+            "scanner_engine: %d symbol(s) still scoring after %ss — "
+            "%d cancelled before starting, %d still running (last-good "
+            "values elsewhere are unaffected): %s",
+            len(pending), _SCORE_WAIT_TIMEOUT_S, cancelled, running, stuck,
+        )
+        # [2026-08-31, root-cause diagnostic] The `running` count above
+        # only ever told us THAT a thread was stuck, never WHERE. Every
+        # explanation ruled out by static reading (network calls, sleeps,
+        # infinite loops, JIT compile locks — see commit message) leaves
+        # a genuine hang as the remaining possibility, and a genuine hang
+        # in this persistent, never-recreated pool (_scorer_pools —
+        # see _get_scorer_pool() above) doesn't just cost this run: it
+        # permanently consumes one worker slot for the rest of the
+        # process's life, since a RUNNING future can never be
+        # force-cancelled. That's the actual mechanism worth confirming —
+        # dumping every scorer-pool thread's current Python stack frame
+        # the moment this fires turns "some symbol hung, no idea why"
+        # into an exact file/line the next time this warning appears,
+        # instead of another round of static guessing.
+        if running:
+            import sys as _sys
+            import traceback as _tb
+            _frames = _sys._current_frames()
+            _live_threads = {t.ident: t.name for t in threading.enumerate()}
+            for _tid, _frame in _frames.items():
+                _tname = _live_threads.get(_tid, "")
+                if _tname.startswith("scorer-pool-"):
+                    _stack = "".join(_tb.format_stack(_frame))
+                    _log.warning(
+                        "scanner_engine: stuck-thread stack dump for %s (thread id %s) — "
+                        "this is WHERE that worker slot is permanently pinned, not just "
+                        "that it is:\n%s", _tname, _tid, _stack,
+                    )
+
+    # [2026-08-25 diagnostic] Single authoritative "who's missing this
+    # batch" summary — every prior log line above (extraction failures,
+    # min_bars drops, score_stock's 210-bar gate, this timeout block) only
+    # covers ONE path a symbol can fall out through. This diffs the
+    # symbols actually requested against the ones that made it into
+    # `results`, so a symbol lost through a path with no logging at all
+    # (or a path added later that nobody thought to log) still shows up
+    # here instead of just quietly not being in the merged snapshot.
+    scored_syms = {r.get("Stock") for r in results if r}
+    unaccounted = set(symbols) - scored_syms
+    if unaccounted:
+        _log.warning(
+            "scanner_engine: run_scanner returning %d/%d symbols this batch — "
+            "%d unaccounted for (see history_store/score_stock/timeout warnings "
+            "above for the specific reason per symbol, if logged): %s",
+            len(scored_syms), len(symbols), len(unaccounted), sorted(unaccounted),
+        )
+
+    # [2026-08-31 profiling] Single-line fetch/score split for this
+    # run_scanner() call, so a slow batch can be attributed to network
+    # (fetch_phase_s — includes any _wait_for_spacing throttling, logged
+    # separately above) vs CPU/timeout (score_phase_s) at a glance,
+    # without cross-referencing multiple warning lines. Additive only.
+    _score_phase_s = time.time() - _t_score_start
+    _log.info(
+        "scanner_engine: run_scanner timing — fetch=%.1fs score=%.1fs total=%.1fs "
+        "(%d symbols, %d fetch batch(es) of <=%d)",
+        _fetch_phase_s, _score_phase_s, _fetch_phase_s + _score_phase_s,
+        total, n_batches, _BATCH_SIZE,
+    )
+
+    if not results:
+        return pd.DataFrame()
+
+    df_out = pd.DataFrame(results)
+    df_out = df_out.sort_values("Score", ascending=False).reset_index(drop=True)
+    df_out.index += 1
+
+    # ── RS Universe Ranking ───────────────────────────────────────
+    # Percentile rank within scanned universe. Top 10% = RS leaders.
+    if "RScomp" in df_out.columns and len(df_out) > 1:
+        try:
+            from scipy.stats import rankdata
+            raw_ranks         = rankdata(df_out["RScomp"].fillna(0).values, method="average")
+            df_out["RS_Rank"] = (raw_ranks / len(raw_ranks) * 100).round(1)
+            df_out["RS_Top10"]= df_out["RS_Rank"] >= 90
+        except Exception:
+            df_out["RS_Rank"] = 50.0
+            df_out["RS_Top10"]= False
+    else:
+        df_out["RS_Rank"] = 50.0
+        df_out["RS_Top10"]= False
+
+    # ── Setup Persistence (frozen trade plans) ────────────────────
+    # Entry / SL / Targets are LOCKED on first Actionable detection.
+    # Subsequent scans READ frozen levels — no daily drift.
+    df_out = _enrich_with_setup_persistence(df_out, all_data, fetch_source=fetch_source)
+
+    return df_out
+
+
+def _enrich_with_setup_persistence(
+    df_out: pd.DataFrame,
+    all_data: dict | None = None,
+    fetch_source: str = "yfinance",
+) -> pd.DataFrame:
+    """
+    Load existing setup plans from Supabase, enrich the scanner DataFrame
+    with frozen trade levels and lifecycle metadata, then persist any new
+    or updated plans back to Supabase.
+
+    Designed to be a silent no-op when Supabase is unavailable.
+    All errors are caught and logged; scanner output is never blocked.
+
+    2026-08-03 [Active-setup coverage fix]: a symbol that already has an
+    OPEN plan (WAITING/ACTIVE/T1_HIT) but drops out of df_out this run —
+    e.g. score_stock() raised, its future got skipped by the 45s bounded
+    wait, or its OHLCV came back empty/stale — used to mean its plan
+    never got re-evaluated against current price at all this run. It
+    just sat frozen until a future scan happened to succeed for that
+    symbol again, which could be indefinitely on a chronically flaky
+    symbol. That's the root cause behind plans stuck in WAITING (or
+    ACTIVE) long after price has clearly moved past entry/SL/T1.
+    Every OPEN-plan symbol must go through lifecycle evaluation every
+    run regardless of whether the full scoring pipeline succeeded for
+    it — scoring failure can drop a symbol from the *displayed* scanner
+    table, but never from plan-lifecycle advancement, as long as we
+    still have a raw price bar for it in `all_data` (already fetched by
+    run_scanner — no extra network calls here). Recovered symbols are
+    NOT added to df_out (the scanner table's appearance/columns are
+    unchanged); they only advance/persist plan state, which the Active
+    Plans / lifecycle dashboard reads straight from Supabase.
+    """
+    try:
+        from utils.supabase_client import (
+            load_open_setup_plans,
+            load_first_seen,
+            upsert_setup_plans_batch,
+            upsert_first_seen,
+        )
+        from utils.setup_persistence import enrich_scanner_dataframe
+        import logging as _log
+        _logger = _log.getLogger(__name__)
+
+        # Load existing OPEN plans (WAITING/ACTIVE/T1_HIT) + first-seen dates.
+        # WAITING plans must be included here too — otherwise a plan that
+        # hasn't triggered yet would never get re-evaluated against the
+        # next day's price and could sit stale forever.
+        existing_plans = load_open_setup_plans()    # {symbol: SetupPlan}
+        first_seen_map = load_first_seen()           # {symbol: "YYYY-MM-DD"}
+
+        # Record first-seen for new entrants before enrichment.
+        # NOTE: reads "Recommendation" first, falling back to "Category" —
+        # matching what enrich_scanner_row() itself uses to decide whether
+        # to mint a plan. ("Category" alone is rarely populated on this
+        # dict; Recommendation is the field decision_engine.py actually sets.)
+        new_symbols = [
+            (str(row.get("Stock", "")), str(row.get("Recommendation", row.get("Category", ""))))
+            for _, row in df_out.iterrows()
+            if str(row.get("Stock", "")).upper() not in first_seen_map
+        ]
+        if new_symbols:
+            upsert_first_seen(new_symbols)
+            from datetime import date as _d
+            today_str = _d.today().isoformat()
+            for sym, _ in new_symbols:
+                first_seen_map[sym.upper()] = today_str
+
+        # Count symbols qualifying for plan creation before enrichment.
+        # This is diagnostic only — the actual creation decision is made
+        # inside enrich_scanner_row(), which is recommendation-aware ONLY
+        # at creation time and never again afterwards.
+        from utils.setup_persistence import _FREEZE_CATEGORIES
+        qualifying_symbols = [
+            str(row.get("Stock", "")).upper()
+            for _, row in df_out.iterrows()
+            if str(row.get("Recommendation", row.get("Category", ""))) in _FREEZE_CATEGORIES
+        ]
+        _logger.info(
+            "[SETUP PLAN SCAN] total_rows=%d  qualifying_symbols=%d  categories=%s",
+            len(df_out),
+            len(qualifying_symbols),
+            list(_FREEZE_CATEGORIES),
+        )
+        if qualifying_symbols:
+            _logger.info("[SETUP PLAN SCAN] qualifying_list=%s", qualifying_symbols)
+
+        # Enrich DataFrame
+        # [Architecture review C1 fix, 2026-07-25] df_out now also carries
+        # "Low"/"High" columns (this bar's actual traded range — see the
+        # BarResult.cur_low/cur_high plumbing in scoring_core.py).
+        # enrich_scanner_dataframe()'s low_col/high_col default to those
+        # column names, so SL/T1/T2 crossings are checked against the
+        # real bar range rather than only the single "Entry" price.
+        enriched_df, updated_plans = enrich_scanner_dataframe(
+            df_out,
+            existing_plans,
+            first_seen_map,
+            price_col="Entry",
+        )
+
+        # ── Recovery pass: OPEN-plan symbols missing from df_out ───────
+        # See the "Active-setup coverage fix" note in this function's
+        # docstring. `existing_plans` was mutated in-place by
+        # enrich_scanner_dataframe() above for every symbol IT saw, so
+        # anything still not reflected is exactly the set that dropped
+        # out of the scan this run despite having an open plan.
+        scanned_syms = set(
+            str(s).upper().strip() for s in df_out.get("Stock", pd.Series(dtype=str))
+        )
+        orphaned_syms = [
+            sym for sym, plan in existing_plans.items()
+            if sym not in scanned_syms and plan is not None and plan.is_open()
+        ]
+        recovered_count = 0
+        if orphaned_syms:
+            from utils.setup_persistence import enrich_scanner_row
+
+            # [Fix, 2026-08-11] `all_data` here is scoped to THIS single
+            # call — e.g. one ~50-symbol batch of scheduler/scan_worker.py's
+            # live_scanner sub-scheduler, not the full universe. An
+            # orphaned symbol is (by definition) NOT in this batch, so
+            # all_data.get(sym) was structurally always None for every
+            # orphaned symbol in the batched path — this recovery pass
+            # never actually recovered anything there (confirmed live:
+            # advanced_with_available_price_data=0 on every batch,
+            # every cycle). utils.history_store.get_live_history_cached()
+            # is a process-wide RAM cache that accumulates across batches
+            # (and across cycles, refreshed once/day) via the same
+            # get_live_history_cached()/update_live_cache() calls
+            # run_scanner() already makes — so for any orphaned symbol
+            # not in THIS batch's all_data, fall back to that shared
+            # cache instead of giving up. Falls back to yfinance for
+            # anything Upstox doesn't have cached, mirroring the
+            # primary/fallback pattern the main fetch loop above uses.
+            recovery_cache: dict = {}
+            missing_from_all_data = [s for s in orphaned_syms if all_data is None or s not in all_data]
+            if missing_from_all_data:
+                from utils.history_store import get_live_history_cached
+                try:
+                    recovery_cache = get_live_history_cached(
+                        missing_from_all_data, years=1.0, min_bars=0, source=fetch_source,
+                    )
+                except Exception:
+                    _logger.exception("[SETUP PLAN RECOVERY] get_live_history_cached(%s) failed — "
+                                       "non-fatal, falling back to no price data for these symbols", fetch_source)
+                    recovery_cache = {}
+                still_missing = [s for s in missing_from_all_data if s not in recovery_cache]
+                if still_missing and fetch_source != "yfinance":
+                    try:
+                        recovery_cache.update(get_live_history_cached(
+                            still_missing, years=1.0, min_bars=0, source="yfinance",
+                        ))
+                    except Exception:
+                        _logger.exception("[SETUP PLAN RECOVERY] yfinance fallback fetch failed — non-fatal")
+
+            for sym in orphaned_syms:
+                bar_df = (all_data or {}).get(sym)
+                if bar_df is None or bar_df.empty:
+                    bar_df = recovery_cache.get(sym)
+                if bar_df is None or bar_df.empty:
+                    continue   # genuinely no price data anywhere — nothing to advance against
+                try:
+                    last_bar = bar_df.iloc[-1]
+                    last_close = float(last_bar.get("Close", last_bar.get("close", 0)) or 0)
+                    last_low   = float(last_bar.get("Low",   last_bar.get("low",   0)) or 0)
+                    last_high  = float(last_bar.get("High",  last_bar.get("high",  0)) or 0)
+                except Exception:
+                    continue
+                if last_close <= 0:
+                    continue
+                stub_row = {"Stock": sym, "Entry": last_close}
+                _, plan_out, was_updated = enrich_scanner_row(
+                    stub_row,
+                    existing_plans[sym],
+                    first_seen_map.get(sym, ""),
+                    current_price=last_close,
+                    bar_low=last_low or None,
+                    bar_high=last_high or None,
+                )
+                existing_plans[sym] = plan_out
+                if was_updated:
+                    updated_plans.append(plan_out)
+                    recovered_count += 1
+        if orphaned_syms:
+            _logger.info(
+                "[SETUP PLAN RECOVERY] open_plan_symbols_missing_from_scan=%d  "
+                "advanced_with_available_price_data=%d  symbols=%s",
+                len(orphaned_syms), recovered_count, orphaned_syms,
+            )
+
+        # Persist changed plans back to Supabase.
+        # New plans are minted in status=WAITING (not ACTIVE — that now
+        # specifically means "entry triggered"), so a freshly-created
+        # plan is identified by WAITING + first_actionable_date == today.
+        _today_str = __import__("datetime").date.today().isoformat()
+        new_plans   = [
+            p for p in updated_plans
+            if p.status == "WAITING" and p.first_actionable_date == _today_str
+        ]
+        other_plans = [p for p in updated_plans if p not in new_plans]
+        _logger.info(
+            "[SETUP PLAN PERSIST] updated_total=%d  new_inserts=%d  status_changes=%d",
+            len(updated_plans), len(new_plans), len(other_plans),
+        )
+
+        if updated_plans:
+            plan_dicts = [p.to_db_dict() for p in updated_plans]
+            upsert_setup_plans_batch(plan_dicts)
+
+        return enriched_df
+
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            "setup_persistence enrichment skipped: %s", exc
+        )
+        for col in ["SetupID", "FirstSeen", "FirstActionable", "DaysActive",
+                    "PlanStatus", "LockedRecommendation", "ActivatedAt", "T1HitAt", "ClosedAt",
+                    "EntryLocked", "SLLocked", "T1Locked",
+                    "T2Locked", "T3Locked", "SetupAge", "TradePlanStatus",
+                    "EntryDriftPct"]:
+            if col not in df_out.columns:
+                df_out[col] = ""
+        return df_out
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SUGGESTION 11: SCAN PERSISTENCE COUNTER
+#  Count consecutive scans a symbol has appeared in Elite/Tier-1.
+#  Requires Supabase scan history.  Returns a dict {symbol: streak}.
+# ══════════════════════════════════════════════════════════════════
+
+def compute_scan_streaks(
+    scan_history: "list[dict]",
+    tier_col:     str = "tier",
+    sym_col:      str = "symbol",
+    count_tiers:  tuple = ("Elite", "Tier 1"),
+    n_scans:      int   = 10,
+) -> "dict[str, int]":
+    """
+    Given a list of scan snapshot dicts (newest first), return
+    {symbol: consecutive_streak} counting the number of the most
+    recent scans in which the symbol appeared in a qualifying tier.
+
+    Parameters
+    ----------
+    scan_history : list of dicts, each dict has sym_col and tier_col keys.
+                   Ordered newest → oldest (as returned by load_scan_history).
+    tier_col     : column name for tier string in each snapshot row.
+    sym_col      : column name for symbol string.
+    count_tiers  : tuple of tier strings that count toward a streak.
+    n_scans      : how many recent scans to look back (default 10).
+
+    Returns
+    -------
+    dict {symbol: streak_count}  — only symbols with streak >= 1 included.
+
+    [2026-08-26, SG-flagged slowness review] Rewritten from a nested
+    Python loop (for each symbol, for each of the n_scans runs, filter
+    that run's DataFrame down to this symbol's rows via boolean
+    indexing — up to symbols × n_scans separate pandas filter calls,
+    ~5,000 on a 500-symbol universe at n_scans=10) to a single
+    groupby/pivot + vectorized numpy pass. Same output for the same
+    input — verified in isolation against the old implementation on
+    the current scan_snapshots shape — just without re-scanning a
+    DataFrame from scratch for every (symbol, run) pair. The "stop
+    counting at the first non-qualifying run" behavior (a streak is
+    CONSECUTIVE from the most recent scan backward, not a total count)
+    is preserved via cumprod: multiplying a 0/1 row left-to-right zeroes
+    out everything after the first miss, so summing the row gives
+    exactly the length of the leading run of qualifying scans.
+    """
+    if not scan_history:
+        return {}
+
+    import pandas as pd
+    df = pd.DataFrame(scan_history)
+    if sym_col not in df.columns or tier_col not in df.columns:
+        return {}
+
+    # Group by scan run (if there is a run_at column, use it; else use
+    # positional order) — same "first n_scans distinct runs, in the
+    # order they appear in df" semantics as the old groupby(sort=False)
+    # + list-slice, just without materializing a DataFrame per run.
+    run_col = "run_at" if "run_at" in df.columns else None
+    if run_col:
+        run_order = df[run_col].drop_duplicates().tolist()[:n_scans]
+        if not run_order:
+            return {}
+        run_index = {run_val: i for i, run_val in enumerate(run_order)}
+        df = df[df[run_col].isin(run_index)].copy()
+        df["_run_idx"] = df[run_col].map(run_index)
+        n_runs = len(run_order)
+    else:
+        # legacy: each row is its own run, row position IS the run index
+        df = df.iloc[:n_scans].copy()
+        df["_run_idx"] = range(len(df))
+        n_runs = len(df)
+
+    if n_runs == 0:
+        return {}
+
+    qualifies = df[tier_col].isin(count_tiers)
+    hits = df.loc[qualifies, [sym_col, "_run_idx"]]
+    if hits.empty:
+        return {}
+
+    # symbol x run_idx boolean grid — True wherever that symbol
+    # qualified in that run. Column 0 = most recent scan.
+    grid = (
+        hits.assign(_hit=True)
+            .pivot_table(index=sym_col, columns="_run_idx", values="_hit",
+                         aggfunc="any", fill_value=False)
+            .reindex(columns=range(n_runs), fill_value=False)
+    )
+
+    # cumprod along the run axis: once a run is False (miss), every
+    # later (older) column on that row becomes 0 too, so the row sum
+    # is exactly the consecutive leading-True count — the streak.
+    streak_counts = np.cumprod(grid.to_numpy(dtype=int), axis=1).sum(axis=1)
+
+    return {
+        str(sym): int(count)
+        for sym, count in zip(grid.index, streak_counts)
+        if count >= 1
+    }
+
+
+
+
+def add_streak_column(
+    df_scan:      "pd.DataFrame",
+    scan_history: "list[dict]",
+    n_scans:      int = 10,
+) -> "pd.DataFrame":
+    """
+    Add a 'Streak' column to a scanner result DataFrame.
+    Streak = number of recent consecutive scans the stock appeared in T1/Elite.
+    """
+    streaks = compute_scan_streaks(scan_history, n_scans=n_scans)
+    df_scan = df_scan.copy()
+    df_scan["Streak"] = df_scan["Stock"].map(streaks).fillna(0).astype(int)
+    return df_scan
+
+
+# ══════════════════════════════════════════════════════════════════
+#  COLOUR HELPERS
+# ══════════════════════════════════════════════════════════════════
+
+def score_color(score: int) -> str:
+    if score >= 85: return "#16a34a"
+    if score >= 75: return "#22c55e"
+    if score >= 65: return "#4ade80"
+    if score >= 50: return "#f59e0b"
+    return "#ef4444"
+
+def action_color(action: str) -> str:
+    if "BUY"   in action: return "#16a34a"
+    if "WATCH" in action: return "#f59e0b"
+    return "#ef4444"
+
+def cci_color(cci_val: float, ob: int = 100, os: int = -100) -> str:
+    if cci_val >= ob: return "#ef4444"
+    if cci_val <= os: return "#22c55e"
+    return "#3b82f6"
+
+def acc_tier_color(t: str) -> tuple:
+    return {
+        "T1★": ("#4c1d95", "#c4b5fd"),
+        "A":   ("#1e3a5f", "#60a5fa"),
+        "B":   ("#14532d", "#4ade80"),
+        "C":   ("#78350f", "#fcd34d"),
+        "D":   ("#1c1917", "#78716c"),
+    }.get(t, ("#1c1917", "#78716c"))
