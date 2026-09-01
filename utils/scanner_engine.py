@@ -1417,8 +1417,14 @@ def _primary_blocker(r, result: dict, settings: Optional[dict] = None,
 
     Returns a short human-readable string, or "" for Actionable/better.
     """
-    from utils.conviction_score_v1 import V3_THRESHOLD_DEFAULTS
-    t = {**V3_THRESHOLD_DEFAULTS, **(settings or {})}
+    # [Phase 7 cutover, 2026-09-01] base_tier is now produced by
+    # classify_tier_v4(), whose funnel has only two rungs below Actionable
+    # (Skip, Watch — no "Developing"; see classify_tier_v4()'s docstring),
+    # unlike v3's four-rung ladder. Switched the threshold source and the
+    # _NEXT_GATE map below accordingly so this function's floors always
+    # match the gate that actually produced the row's Recommendation.
+    from utils.conviction_score_v1 import V4_THRESHOLD_DEFAULTS
+    t = {**V4_THRESHOLD_DEFAULTS, **(settings or {})}
 
     recommendation = str(recommendation_override or result.get("Recommendation", result.get("Category", "Skip")))
     lifecycle = str(result.get("Lifecycle", "") or "").upper()
@@ -1448,21 +1454,25 @@ def _primary_blocker(r, result: dict, settings: Optional[dict] = None,
     if lifecycle == "EXTENDED" or ext >= 60:
         return f"Extended ({int(ext)}) — wait for pullback to EMA/Fib"
 
-    # The tier ladder classify_tier_v3() actually walks — map this row's
+    # The tier ladder classify_tier_v4() actually walks — map this row's
     # Recommendation to the NEXT gate up, i.e. the specific AND-gate it
     # failed to clear. Watch's gate has no composite requirement (only
-    # Developing/Actionable add one) — see classify_tier_v3().
+    # Actionable adds one) — see classify_tier_v4(). No "Developing" rung
+    # exists in v4's funnel (v3 had one; v4 collapsed it), so a cached row
+    # with the old "Developing" Recommendation (pre-cutover) falls back to
+    # grading against Actionable's floors below, same as any unrecognized
+    # legacy value.
     _NEXT_GATE = {
-        "Skip":       ("Watch",      "v3_watch_leadership_min",      "v3_watch_conviction_min",      "v3_watch_entry_quality_min",      None),
-        "Watch":      ("Developing", "v3_developing_leadership_min", "v3_developing_conviction_min", "v3_developing_entry_quality_min", "v3_developing_composite_min"),
-        "Developing": ("Actionable", "v3_actionable_leadership_min", "v3_actionable_conviction_min", "v3_actionable_entry_quality_min", "v3_actionable_composite_min"),
+        "Skip":  ("Watch",      "v4_watch_leadership_min",      "v4_watch_conviction_min",      "v4_watch_entry_quality_min",      None),
+        "Watch": ("Actionable", "v4_actionable_leadership_min", "v4_actionable_conviction_min", "v4_actionable_entry_quality_min", "v4_actionable_composite_min"),
     }
     gate_name, ls_key, cv_key, eq_key, comp_key = _NEXT_GATE.get(
         recommendation,
-        # Unrecognized/legacy Category value (e.g. old cached "Avoid") —
-        # fall back to Actionable rather than silently guessing Watch.
-        ("Actionable", "v3_actionable_leadership_min", "v3_actionable_conviction_min",
-         "v3_actionable_entry_quality_min", "v3_actionable_composite_min"),
+        # Unrecognized/legacy Category value (e.g. old cached "Avoid", or a
+        # pre-cutover "Developing" row) — fall back to Actionable rather
+        # than silently guessing Watch.
+        ("Actionable", "v4_actionable_leadership_min", "v4_actionable_conviction_min",
+         "v4_actionable_entry_quality_min", "v4_actionable_composite_min"),
     )
     ls_floor   = t[ls_key]
     cv_floor   = t[cv_key]
@@ -1479,9 +1489,13 @@ def _primary_blocker(r, result: dict, settings: Optional[dict] = None,
 
     # Priority 2: Conviction gate.
     if cv < cv_floor:
-        # Prefer CV1's cv_fib_zone which accounts for both pullback AND
-        # continuation paths (stock above Fib 61.8% / above pivot high).
-        # Fall back to DE cv_fib (now also updated with continuation path).
+        # [Phase 7 cutover, 2026-09-01] CV4's Conviction has no separate
+        # fib-zone or ADX sub-score (its analog is the combined
+        # Setup/Pattern Evidence field, _cv4_cv_setup, 0-10) — the old
+        # "_cv1_cv_fib"/"_cv1_cv_adx" preference is dead on fresh scans and
+        # falls straight through to Decision Engine's _ds_* diagnostics
+        # below, kept only so old cached rows (pre-cutover) still read
+        # correctly.
         cv_fib  = int(result.get("_cv1_cv_fib",  result.get("_ds_cv_fib",  0)) or 0)
         cv_adx  = int(result.get("_ds_cv_pattern",      result.get("_cv1_cv_adx",  0)) or 0)
         if cv_fib < 8:
@@ -1498,6 +1512,12 @@ def _primary_blocker(r, result: dict, settings: Optional[dict] = None,
     # itself here (rather than assuming it's folded into composite) is what
     # makes a Skip row's text correct: Watch has no composite floor at all.
     if eq < eq_floor:
+        # [Phase 7 cutover, 2026-09-01] CV4's Entry Quality has no separate
+        # EMA20-distance or pivot-distance sub-score of its own (its analog,
+        # _cv4_eq_location, blends pivot+fib into one 0-15 number) — the old
+        # "_cv1_eq_*" fallbacks are dead on fresh scans; DE's _ds_* fields
+        # (unchanged by this cutover) are the real source going forward,
+        # kept as primary here rather than the reverse.
         eq_ema = int(result.get("_ds_eq_ema20_dist", result.get("_cv1_eq_ema20", 0)) or 0)
         eq_piv = int(result.get("_ds_eq_pivot_dist", result.get("_cv1_eq_piv",  0)) or 0)
         if eq_ema < 10:
@@ -1959,12 +1979,30 @@ def score_stock(
     # and all sub-score internals for the detail-view breakdown panel.
     # [Scanner Refactor] Runs BEFORE the Decision Engine below so its
     # quality scores can be handed to compute_decision() for Lifecycle
-    # staging — CV1 is the single source of truth for quality everywhere,
+    # staging — this is the single source of truth for quality everywhere,
     # including the objective Lifecycle stage, not just the Recommendation.
+    #
+    # [Phase 7 cutover, 2026-09-01] Source swapped from compute_conviction_v3
+    # (CV1_* naming/legacy v3 composite+thresholds) to compute_conviction_v4
+    # (SMC-woven Leadership/Conviction/Entry Quality — see conviction_score_v1.py
+    # ConvictionV4 docstring and canonical_scores.py's CV4 commentary for the
+    # anti-double-counting design). The "cv1" local var name and "CV1_*"/
+    # "CV1_LS_Grade" result keys are kept as-is on purpose: canonical_scores.
+    # to_canonical() and ~10 other consumers (decision_engine, DORE,
+    # lifecycle_engine, entry_snapshot, setup_persistence, agent_tools,
+    # pages/scanner.py, pages/dashboard.py) key off these exact column
+    # names — renaming them is a separate follow-up, not required for this
+    # cutover. compute_conviction_v3/classify_tier_v3 are no longer called
+    # anywhere in production after this change (still present in
+    # conviction_score_v1.py, importable directly for back-comparison).
     cv1 = None
     try:
-        from utils.conviction_score_v1 import compute_conviction_v3
-        cv1 = compute_conviction_v3(r, settings=settings, smc_state=r.smc_state)
+        from utils.conviction_score_v1 import compute_conviction_v4
+        cv1 = compute_conviction_v4(
+            r, thesis_direction="BULLISH",
+            smc_state=_cv4_smc_state, swing_label=_cv4_swing_label,
+            current_price=r.entry_ref or r.entry, settings=settings,
+        )
         result.update({
             "CV1_Leadership":    cv1.leadership,
             "CV1_Conviction":    cv1.conviction,
@@ -1974,7 +2012,7 @@ def score_stock(
             # Staged-elimination diagnostic tags (see prescreen_diagnostic
             # above). _prescreen_mismatch=True means the cheap prescreen
             # would have rejected this symbol before full scoring, but the
-            # full CV1 score actually reached Watch-or-better — a false
+            # full score actually reached Watch-or-better — a false
             # negative that would silently drop a real setup from the scan
             # once diagnostic mode is turned off and the prescreen goes live
             # as the actual filter. Check this column is ~0% across a few
@@ -1985,85 +2023,52 @@ def score_stock(
             "CV1_LS_Grade":      cv1.leadership_grade,
             "CV1_CV_Grade":      cv1.conviction_grade,
             "CV1_EQ_Grade":      cv1.entry_quality_grade,
-            # Leadership sub-scores
-            "_cv1_ls_rs":        cv1.ls_rs_composite,
-            "_cv1_ls_rs_market": cv1.ls_rs_market,
-            "_cv1_ls_rs_sector": cv1.ls_rs_sector,
-            "_cv1_ls_rs_consistency": cv1.ls_rs_consistency,
-            "_cv1_ls_rs_momentum":   cv1.ls_rs_momentum,
-            "_cv1_ls_age":       cv1.ls_trend_age,
-            "_cv1_ls_ps":        cv1.ls_persistent_strength,
-            "_cv1_ls_slope":     cv1.ls_ema20_slope,
+            # Leadership sub-scores (V4 shape — see ConvictionV4; NOT the old
+            # v1/v3 RS/age/slope breakdown, so keys are renamed rather than
+            # force-fit into the old _cv1_* names. pages/scanner.py's detail
+            # breakdown panel and utils/entry_snapshot.py still read the old
+            # names via fallback chains and need a follow-up pass — flagged,
+            # not fixed in this cutover).
+            "_cv4_ls_rs":            cv1.ls_relative_strength,
+            "_cv4_ls_trend":         cv1.ls_trend_strength,
+            "_cv4_ls_persist":       cv1.ls_trend_persistence,
+            "_cv4_ls_mktsector":     cv1.ls_market_sector_leadership,
+            "_cv4_ls_participation": cv1.ls_participation_volume,
+            "_cv4_ls_structural":    cv1.ls_structural_price_quality,
             # Conviction sub-scores
-            "_cv1_cv_structure": cv1.cv_trend_structure,
-            "_cv1_cv_fib":       cv1.cv_fib_zone,
-            "_cv1_cv_adx":       cv1.cv_adx,
-            "_cv1_cv_volume":    cv1.cv_volume,
-            "_cv1_cv_squeeze":   cv1.cv_squeeze,
+            "_cv4_cv_directional":   cv1.cv_directional_trend,
+            "_cv4_cv_momentum":      cv1.cv_momentum,
+            "_cv4_cv_rs":            cv1.cv_relative_strength,
+            "_cv4_cv_volume":        cv1.cv_volume,
+            "_cv4_cv_regime":        cv1.cv_market_regime,
+            "_cv4_cv_smc":           cv1.cv_smc_confirmation,
+            "_cv4_cv_setup":         cv1.cv_setup_pattern,
             # Entry Quality sub-scores
-            "_cv1_eq_ema20":     cv1.eq_ema20_dist,
-            "_cv1_eq_ema50":     cv1.eq_ema50_dist,
-            "_cv1_eq_pivot":     cv1.eq_pivot_dist,
-            "_cv1_eq_move":      cv1.eq_move_since_setup,
-            "_cv1_eq_bars":      cv1.eq_bars_since_setup,
+            "_cv4_eq_trend":         cv1.eq_trend_alignment,
+            "_cv4_eq_momentum":      cv1.eq_momentum_timing,
+            "_cv4_eq_smc":           cv1.eq_smc_entry_structure,
+            "_cv4_eq_location":      cv1.eq_price_location,
+            "_cv4_eq_volume":        cv1.eq_volume_execution,
+            "_cv4_eq_extension":     cv1.eq_extension_chase_risk,
+            # SMC pass-through for display/debug (previously CV4-shadow-only)
+            "CV4_SMC_Direction":     cv1.smc_direction,
+            "CV4_SMC_State":         cv1.smc_state_label,
+            "CV4_SMC_EvidenceTier":  cv1.smc_evidence_tier,
+            "CV4_SMC_AgeBars":       cv1.smc_age_bars,
+            "CV4_SMC_FvgRetest":     cv1.smc_fvg_retest,
         })
     except Exception:
         cv1 = None   # Decision Engine call below is skipped entirely for this symbol —
                      # see compute_decision(mode="production") requirement below
 
-    # ── CV4 shadow scoring (Phase 2, masterscanner_scoring_redesign_FINAL.md
-    # §2/§4) — writes CV4_* columns for comparison only. Recommendation
-    # remains sourced from CV1 above; nothing here can affect it. thesis_
-    # direction="BULLISH" because Live Scanner's detectors are long-only
-    # today (see compute_conviction_v4()'s docstring). Wrapped defensively:
-    # a CV4 failure must never break the scan row.
-    try:
-        from utils.conviction_score_v1 import compute_conviction_v4
-        cv4 = compute_conviction_v4(
-            r, thesis_direction="BULLISH",
-            smc_state=_cv4_smc_state, swing_label=_cv4_swing_label,
-            current_price=r.entry_ref or r.entry, settings=settings,
-        )
-        result.update({
-            "CV4_Leadership":    cv4.leadership,
-            "CV4_Conviction":    cv4.conviction,
-            "CV4_EntryQuality":  cv4.entry_quality,
-            "CV4_Composite":     cv4.composite,
-            "CV4_SignalClass":   cv4.signal_class,
-            "CV4_LS_Grade":      cv4.leadership_grade,
-            "CV4_CV_Grade":      cv4.conviction_grade,
-            "CV4_EQ_Grade":      cv4.entry_quality_grade,
-            # SMC pass-through for display/debug
-            "CV4_SMC_Direction":     cv4.smc_direction,
-            "CV4_SMC_State":         cv4.smc_state_label,
-            "CV4_SMC_EvidenceTier":  cv4.smc_evidence_tier,
-            "CV4_SMC_AgeBars":       cv4.smc_age_bars,
-            "CV4_SMC_FvgRetest":     cv4.smc_fvg_retest,
-            # Leadership sub-scores
-            "_cv4_ls_rs":          cv4.ls_relative_strength,
-            "_cv4_ls_trend":       cv4.ls_trend_strength,
-            "_cv4_ls_persist":     cv4.ls_trend_persistence,
-            "_cv4_ls_mktsector":   cv4.ls_market_sector_leadership,
-            "_cv4_ls_participation": cv4.ls_participation_volume,
-            "_cv4_ls_structural":  cv4.ls_structural_price_quality,
-            # Conviction sub-scores
-            "_cv4_cv_directional": cv4.cv_directional_trend,
-            "_cv4_cv_momentum":    cv4.cv_momentum,
-            "_cv4_cv_rs":          cv4.cv_relative_strength,
-            "_cv4_cv_volume":      cv4.cv_volume,
-            "_cv4_cv_regime":      cv4.cv_market_regime,
-            "_cv4_cv_smc":         cv4.cv_smc_confirmation,
-            "_cv4_cv_setup":       cv4.cv_setup_pattern,
-            # Entry Quality sub-scores
-            "_cv4_eq_trend":       cv4.eq_trend_alignment,
-            "_cv4_eq_momentum":    cv4.eq_momentum_timing,
-            "_cv4_eq_smc":         cv4.eq_smc_entry_structure,
-            "_cv4_eq_location":    cv4.eq_price_location,
-            "_cv4_eq_volume":      cv4.eq_volume_execution,
-            "_cv4_eq_extension":   cv4.eq_extension_chase_risk,
-        })
-    except Exception:
-        pass   # CV4 is diagnostic-only through Phase 6 — never break the scan row over it
+    # [Phase 7 cutover, 2026-09-01] The former "CV4 shadow scoring" block
+    # that lived here (a second compute_conviction_v4() call writing
+    # CV4_* columns for comparison against CV1_*) has been removed — CV4
+    # IS the production score now (computed once, above), so a duplicate
+    # call would have just doubled compute cost and produced CV4_* columns
+    # that trivially equal CV1_*. If a comparison view against the old
+    # v3 scoring is ever needed again, call compute_conviction_v3()
+    # directly (still present, frozen, in conviction_score_v1.py).
 
     # ── Decision Engine — Extension / Lifecycle / Trend Quality / R:R ──
     # [Scanner Refactor] No longer produces a Recommendation — CV1 +
@@ -2168,10 +2173,17 @@ def score_stock(
         if cv1 is None:
             raise RuntimeError("CV1 unavailable — cannot classify Recommendation")
 
-        from utils.conviction_score_v1 import classify_tier_v3
+        from utils.conviction_score_v1 import classify_tier_v4
         from utils.promotion_engine import evaluate_promotion
 
-        base_tier = classify_tier_v3(cv1.leadership, cv1.conviction, cv1.entry_quality, thresholds=settings)
+        # [Phase 7 cutover, 2026-09-01] classify_tier_v3 → classify_tier_v4.
+        # V4's threshold keys are namespaced "v4_*" (V4_THRESHOLD_DEFAULTS)
+        # so they don't collide with any v3-tuned keys left in `settings`;
+        # anything under those v4_ keys should be reviewed/backtest-fit
+        # before relying on it in production (classify_tier_v4()'s own
+        # docstring: its defaults are NOT backtest-fit, unlike v3's, which
+        # were decile-calibrated against the 1,732-trade validation set).
+        base_tier = classify_tier_v4(cv1.leadership, cv1.conviction, cv1.entry_quality, thresholds=settings)
 
         # ── UNIVERSE-WIDE PROMO BYPASS [2026-07-29] ──
         # Evaluate timing signals on EVERY symbol, not just ones CV1 has

@@ -92,6 +92,22 @@ def build_live_scanner_entry_snapshot(scanner_row: dict, setup_id: str, symbol: 
     keys are UNCHANGED — this only fixes what each one reads from, so no
     DB schema/migration is needed.
 
+    [Phase 7 cutover, 2026-09-01] scanner_row's sub-scores are now CV4's
+    (see scanner_engine.py), which does NOT expose rs_market/rs_sector/
+    rs_momentum or a standalone ema_slope as separate fields — CV4's
+    Relative Strength (_cv4_ls_rs) and Trend Strength (_cv4_ls_trend)
+    fold those inputs into single combined numbers internally (see
+    _leadership_v4() in conviction_score_v1.py). Rather than read a
+    now-nonexistent key and silently persist None with no trace, these
+    four fields are explicitly set to None below, same convention as
+    momentum_score's existing "no CV1-native equivalent" note. If a
+    future column expects these to be populated again, they'd need to
+    come off a new v4 sub-score breakdown, not a renamed old one — v4's
+    internal split isn't returned to the caller. trend_structure keeps a
+    real value: _cv4_cv_directional is CV4's closest analog (Directional
+    Trend — trend_up/ema_alignment/cloud position, 0-20) to v1's
+    cv_trend_structure, though the scale and exact inputs differ.
+
     [2026-08-31] "direction" and "setup_type" now get real values instead
     of "":
       - direction — Live Scanner's own detectors are long-only (see
@@ -127,12 +143,12 @@ def build_live_scanner_entry_snapshot(scanner_row: dict, setup_id: str, symbol: 
         "conviction_score": _f(g("CV1_Conviction", g("Legacy_Conviction", g("DE_Conviction")))),
         "entry_quality_score": _f(g("CV1_EntryQuality", g("Legacy_EntryQuality", g("DE_EntryQuality")))),
 
-        "trend_structure": str(g("_cv1_cv_structure", "") or ""),
+        "trend_structure": str(g("_cv4_cv_directional", "") or ""),  # [2026-09-01] CV4's Directional Trend — closest analog, not identical
         "adx": _f(g("ADX")),
-        "ema_slope": _f(g("_cv1_ls_slope")),
-        "rs_market": _f(g("_cv1_ls_rs_market")),
-        "rs_sector": _f(g("_cv1_ls_rs_sector")),
-        "rs_momentum": _f(g("_cv1_ls_rs_momentum")),
+        "ema_slope": None,     # [2026-09-01] no CV4-native equivalent — folded into _cv4_ls_trend, see docstring
+        "rs_market": None,     # [2026-09-01] no CV4-native equivalent — folded into _cv4_ls_rs, see docstring
+        "rs_sector": None,     # [2026-09-01] no CV4-native equivalent — folded into _cv4_ls_rs, see docstring
+        "rs_momentum": None,   # [2026-09-01] no CV4-native equivalent — folded into _cv4_ls_rs, see docstring
         "volume_ratio": _f(g("_vol_ratio")),
         "momentum_score": None,  # [2026-08-26] no CV1-native source — see docstring
 
