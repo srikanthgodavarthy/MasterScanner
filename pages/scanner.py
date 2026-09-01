@@ -1657,140 +1657,132 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
 
     # ── Factor definitions ─────────────────────────────────────────
     # (df_col, short_label, max_pts, dim_color, tooltip_lines)
+    #
+    # [Phase 7 cutover, 2026-09-01] Rewired from CV1(v3)'s sub-factor shape
+    # to CV4's (utils/conviction_score_v1.py _leadership_v4()/_conviction_v4()/
+    # _entry_quality_v4() — locked weights per §1.2/§1.3/§1.4). CV4's factor
+    # set and max-points are genuinely different from v1/v3's, not a
+    # relabeling — a stock's SMC evidence now feeds Conviction and Entry
+    # Quality directly (see cv_smc_confirmation / eq_smc_entry_structure
+    # below), which had no v1/v3 equivalent.
     FACTORS = [
-        # ── LEADERSHIP (purple) ────────────────────────────────────
-        ("_cv1_ls_rs_market", "RS vs Market", 12, "#a371f7",
-         "Multi-TF relative strength vs Nifty 50 (^NSEI)\n"
-         "RS > 0.15  →  +12 pts  (strong outperformance)\n"
-         "RS 0.10–0.15 →  +10 pts\n"
-         "RS 0.05–0.10 →  +8 pts\n"
-         "RS 0.03–0.05 →  +6 pts\n"
-         "RS 0.00–0.03 →  +4 pts\n"
-         "RS −0.03–0.00 → +2 pts\n"
-         "RS < −0.03   →   0 pts  (lagging the index)"),
+        # ── LEADERSHIP (purple) — locked weights: RS 30, Trend Strength 25,
+        # Trend Persistence 15, Market/Sector Leadership 15,
+        # Participation/Volume 10, Structural Price Quality 5 ───────────
+        ("_cv4_ls_rs", "Relative Strength", 30, "#a371f7",
+         "RS vs market + RS vs sector + RS consistency + RS momentum\n"
+         "(reuses v1's validated RS sub-ladder: 12+10+5+3 = 30 max)\n"
+         "Strong outperformance across market/sector/consistency/\n"
+         "acceleration → up to +30 pts; lagging the index → 0 pts"),
 
-        ("_cv1_ls_rs_sector", "RS vs Sector", 10, "#a371f7",
-         "Multi-TF relative strength vs the stock's sector benchmark\n"
-         "(leave-one-out peer basket — see utils.sector_map)\n"
-         "Same breakpoint ladder as RS vs Market, scaled to 10 pts.\n"
-         "Flat 5 pts (neutral) if no sector benchmark is available yet\n"
-         "(RS vs Sector is OFF by default — enable in Settings)."),
+        ("_cv4_ls_trend", "Trend Strength", 25, "#a371f7",
+         "EMA alignment/cloud position (structure) + ADX (quality) +\n"
+         "EMA20 slope (velocity)\n"
+         "trend_up → +6, ema_alignment → +6, above_cloud → +5\n"
+         "(inside_cloud → +2 instead)\n"
+         "ADX ≥ 40 → +6, ADX 30–40 → +4, ADX 25–30 → +2\n"
+         "EMA20 slope > 0.3 → +2, slope > 0 → +1"),
 
-        ("_cv1_ls_rs_consistency", "RS Consistency", 5, "#a371f7",
-         "How directionally aligned RS is across 20D/50D/100D-style\n"
-         "lookbacks (1-month / 3-month / 6-month vs Nifty)\n"
-         "All three lookbacks agree in direction → up to +5 pts\n"
-         "Mixed/conflicting signs across lookbacks →  0 pts"),
+        ("_cv4_ls_persist", "Trend Persistence", 15, "#a371f7",
+         "Same sweet-spot age ladder as v1's Trend Age, rescaled 0–25→0–15\n"
+         "21–50 bars →  +15 pts  ★ sweet-spot\n"
+         "6–20 or 51–100 bars → +5 pts (young/maturing)\n"
+         "0–5 or > 100 bars → 0 pts (too early / extended)"),
 
-        ("_cv1_ls_rs_momentum", "RS Momentum", 3, "#a371f7",
-         "Is composite RS improving vs ~2 weeks ago (acceleration)?\n"
-         "Improving > 0.03 → +3 pts\n"
-         "Improving 0.01–0.03 → +2 pts\n"
-         "Improving 0–0.01 → +1 pt\n"
-         "Flat or fading → 0 pts"),
+        ("_cv4_ls_mktsector", "Market/Sector Leadership", 15, "#a371f7",
+         "Rewards leadership CONTEXT (regime alignment + sector standing),\n"
+         "not raw RS magnitude\n"
+         "Bullish regime + trend_up → +7 (neutral regime → +4,\n"
+         "bearish regime but still trending up → +1)\n"
+         "+ up to 8 more from RS-vs-sector percentile-rank bands"),
 
-        ("_cv1_ls_age", "Trend Age", 25, "#a371f7",
-         "Bars since trend started (EMA structure)\n"
-         "21–50 bars  →  +25 pts  ★ sweet-spot (PF 1.45, WR 51%)\n"
-         "6–20 bars   →  +8 pts   (young, acceptable)\n"
-         "51–100 bars →  +8 pts   (maturing, edge fades)\n"
-         "> 100 bars  →   0 pts   (extended, PF 0.72)\n"
-         "0–5 bars    →   0 pts   (too early)"),
+        ("_cv4_ls_participation", "Participation/Volume", 10, "#a371f7",
+         "Volume vs 20-bar average, rescaled from v1's 0–15 ladder (×2/3)\n"
+         "Vol ≥ 2.5× → +10, 2.0–2.5× → +8, 1.5–2.0× → +5\n"
+         "1.2–1.5× → +3, 1.0–1.2× → +1, < 1.0× → 0"),
 
-        ("_cv1_ls_ps", "Pers. Strength", 15, "#a371f7",
-         "Persistent momentum: stock must outperform on both lookbacks\n"
-         "mom3 > 8% AND mom6 > 12%  →  +15 pts\n"
-         "Either condition fails     →   0 pts\n"
-         "(3-bar and 6-bar price momentum vs own prior close)"),
+        ("_cv4_ls_structural", "Structural Price Quality", 5, "#a371f7",
+         "Up to 3/5 from swing structure alone (HH/HL genuine new high/\n"
+         "low; EH/EL tie-retest → +1), independent of SMC.\n"
+         "+2 MORE only if SMC direction agrees with the existing trend\n"
+         "AND SMC evidence_tier ≥ 3 — SMC only ever ADDS here, never\n"
+         "subtracts from or gates Leadership."),
 
-        ("_cv1_ls_slope", "EMA20 Slope", 10, "#a371f7",
-         "5-bar velocity of EMA20 (trend acceleration)\n"
-         "Slope > 0.3  →  +10 pts  (strong upward angle)\n"
-         "Slope 0–0.3  →   +5 pts  (positive but shallow)\n"
-         "Slope ≤ 0    →    0 pts  (flat or falling)"),
+        # ── CONVICTION (green) — locked weights: Directional Trend 20,
+        # Momentum 20, Relative Strength (directional) 15,
+        # Volume/Participation 10, Market Regime 10, SMC Structure
+        # Confirmation 15, Setup/Pattern Evidence 10 ─────────────────────
+        ("_cv4_cv_directional", "Directional Trend", 20, "#3fb950",
+         "Trend structure, signed by thesis direction (long-only here)\n"
+         "trend_up AND ema_alignment → +12\n"
+         "above_cloud → +8 (inside_cloud → +3 instead)"),
 
-        # ── CONVICTION (green) ─────────────────────────────────────
-        ("_cv1_cv_structure", "Trend Struct", 30, "#3fb950",
-         "EMA alignment + Ichimoku cloud position\n"
-         "trend_up (price > EMA20 > EMA50)  → +10 pts\n"
-         "ema_alignment (EMA20 > EMA50)     → +10 pts\n"
-         "above_cloud                       →  +7 pts\n"
-         "inside_cloud (transitional)       →  +3 pts\n"
-         "all four confirmed (full pillar)  →  +3 pts bonus\n"
-         "Max: 30 pts"),
+        ("_cv4_cv_momentum", "Momentum", 20, "#3fb950",
+         "DIRECTIONAL — no abs(): only momentum in the thesis's favor\n"
+         "scores; opposing momentum scores 0\n"
+         "3-bar move > 8%/4%/0% → +10/+6/+2\n"
+         "6-bar move > 12%/6%/0% → +10/+6/+2"),
 
-        ("_cv1_cv_fib", "Fib Pullback", 25, "#3fb950",
-         "Price retracement depth into Fibonacci zone\n"
-         "in_golden (50–61.8% retrace)       → +25 pts  ★ ideal\n"
-         "in_golden_relaxed (38.2–61.8%)     → +18 pts\n"
-         "near_golden (approaching zone)     →  +8 pts\n"
-         "+5 bonus if CCI also oversold in zone (confluence)\n"
-         "+3 bonus if volume < 0.8× avg during pullback\n"
-         "(controlled retracement = quality entry)"),
+        ("_cv4_cv_rs", "Relative Strength (directional)", 15, "#3fb950",
+         "RS momentum signed by thesis — improving RS in the thesis's\n"
+         "favor scores; RS improving against it scores 0\n"
+         "> 0.03 → +15, > 0.01 → +10, > 0.00 → +5, else 0"),
 
-        ("_cv1_cv_adx", "ADX Strength", 20, "#3fb950",
-         "ADX(14) of the individual stock (directional strength / conviction)\n"
-         "ADX ≥ 40    →  +20 pts  (strong trend, PF 1.41)\n"
-         "ADX 30–40   →  +12 pts\n"
-         "ADX 25–30   →   +5 pts  (dead zone)\n"
-         "ADX < 25    →    0 pts  (no trend)"),
+        ("_cv4_cv_volume", "Volume/Participation", 10, "#3fb950",
+         "Today's volume vs 20-bar average\n"
+         "Vol ≥ 2.5× → +10, 2.0–2.5× → +8, 1.5–2.0× → +6\n"
+         "1.2–1.5× → +3, 1.0–1.2× → +1, < 1.0× → 0"),
 
-        ("_cv1_cv_volume", "Vol Sponsor", 15, "#3fb950",
-         "Today's volume vs 20-bar average (institutional sponsorship)\n"
-         "Vol ≥ 2.5×  →  +15 pts  (strong sponsorship)\n"
-         "Vol 2.0–2.5× → +12 pts\n"
-         "Vol 1.5–2.0× →  +8 pts\n"
-         "Vol 1.2–1.5× →  +5 pts\n"
-         "Vol 1.0–1.2× →  +2 pts\n"
-         "Vol < 1.0×   →   0 pts  (below-avg volume, no sponsorship)"),
+        ("_cv4_cv_regime", "Market Regime (thesis-relative)", 10, "#3fb950",
+         "Symmetric table — an opposing regime is a PENALTY, not automatic\n"
+         "disqualification (some setups trade counter-regime)\n"
+         "Regime matches thesis → +10, neutral → +5, opposes thesis → +1"),
 
-        ("_cv1_cv_squeeze", "Squeeze", 5, "#3fb950",
-         "Bollinger Band / Keltner Channel compression release\n"
-         "squeeze_release (BB just broke outside KC) → +5 pts\n"
-         "squeeze_on (BB still inside KC)            → +3 pts\n"
-         "No squeeze                                 →  0 pts\n"
-         "Note: PF 0.69 in backtest — minimal weight (v8.1)"),
+        ("_cv4_cv_smc", "SMC Structure Confirmation", 15, "#3fb950",
+         "EXACT formula — 0 unless SMC direction matches thesis AND state\n"
+         "isn't CONFLICT. Evidence tier 0–4 → base 0/3/7/12/15, then\n"
+         "decayed by a SLOW freshness multiplier as the structure ages\n"
+         "(thesis stays informed even as evidence ages — see\n"
+         "smc_freshness.py)."),
 
-        # ── ENTRY QUALITY (amber) ──────────────────────────────────
-        ("_cv1_eq_ema20", "EMA20 Dist", 30, "#d29922",
-         "% distance of price above EMA20 (entry tightness)\n"
-         "≤ 2%   →  +30 pts  ★ excellent (near EMA20 support)\n"
-         "2–4%   →  +22 pts\n"
-         "4–6%   →  +14 pts\n"
-         "6–10%  →   +6 pts  (stretched)\n"
-         "> 10%  →    0 pts  (too extended from EMA20)\n"
-         "Below EMA20 (pullback in progress) → +10 pts"),
+        ("_cv4_cv_setup", "Setup/Pattern Evidence", 10, "#3fb950",
+         "Fib zone / CCI recovery / squeeze release confirmation signals\n"
+         "in_golden or in_golden_relaxed → +5\n"
+         "recent_cci_recovery or cci_rising → +3\n"
+         "squeeze_release → +2 (squeeze_on → +1 instead)"),
 
-        ("_cv1_eq_pivot", "Pivot Dist", 20, "#d29922",
-         "% distance from last 20-bar pivot high\n"
-         "≤ −2%  (below pivot)  →  +20 pts  ★ ideal — still building\n"
-         "−2 to +0.5% (at pivot) → +16 pts  — breaking out\n"
-         "0.5–2% (just past)     → +10 pts  — acceptable\n"
-         "2–4%   (running)       →  +4 pts\n"
-         "> 4%   (chasing)       →   0 pts"),
+        # ── ENTRY QUALITY (amber) — locked weights: Trend Alignment 20,
+        # Momentum Timing 15, SMC Entry Structure 25, Price Location 15,
+        # Volume/Execution 10, Extension/Chase Risk 15 (subtractive) ────
+        ("_cv4_eq_trend", "Trend Alignment", 20, "#d29922",
+         "trend_up → +8, ema_alignment → +8, above_cloud → +4"),
 
-        ("_cv1_eq_move", "Price Move", 20, "#d29922",
-         "% price move since the setup trigger bar fired\n"
-         "≤ 0.5% →  +20 pts  ★ barely moved — full opportunity ahead\n"
-         "0.5–1.5% → +16 pts\n"
-         "1.5–3.0% → +10 pts  (meaningful portion consumed)\n"
-         "3.0–5.0% →  +3 pts  (at or near T1 target)\n"
-         "> 5.0%  →   0 pts  (opportunity may have passed)"),
+        ("_cv4_eq_momentum", "Momentum Timing", 15, "#d29922",
+         "Is momentum firing NOW, not just present\n"
+         "cci_momentum_break → +15, recent_cci_recovery → +10,\n"
+         "cci_rising → +5, else 0"),
 
-        ("_cv1_eq_ema50", "EMA50 Dist", 15, "#d29922",
-         "% distance of price above EMA50 (structural support depth)\n"
-         "≤ 5%   →  +15 pts  ★ strong support nearby\n"
-         "5–10%  →  +10 pts\n"
-         "10–15% →   +5 pts\n"
-         "15–20% →   +2 pts\n"
-         "> 20%  →    0 pts  (structurally extended)"),
+        ("_cv4_eq_smc", "SMC Entry Structure", 25, "#d29922",
+         "EXACT formula, SMC's single largest weighted sub-component.\n"
+         "Evidence tier 0–4 → base 0/4/10/16/20, FVG-retest adjustment\n"
+         "(in_zone +5, through_unfilled −3, through_filled −8), then\n"
+         "decayed by a FAST freshness multiplier (a stale entry\n"
+         "contributes nothing to \"enter now\" — see smc_freshness.py)."),
 
-        ("_cv1_eq_bars", "Bars Setup", 15, "#d29922",
-         "Signal freshness — bars elapsed since setup trigger\n"
-         "ATR band 'Actionable' (0–3 bars)  →  +15 pts\n"
-         "ATR band 'Late'       (4–7 bars)  →   +6 pts\n"
-         "ATR band 'Extended'   (8+ bars)   →    0 pts\n"
-         "(ATR-normalised band is v9 primary metric)"),
+        ("_cv4_eq_location", "Price Location", 15, "#d29922",
+         "Pivot/Fib positioning — timing, not trend\n"
+         "≤ −2% from pivot high → +8, −2 to +0.5% → +6, +0.5 to +2% → +3\n"
+         "in_golden → +7, in_golden_relaxed → +5, above_fib786 → +2"),
+
+        ("_cv4_eq_volume", "Volume/Execution", 10, "#d29922",
+         "Vol ≥ 2.0× → +10, 1.5–2.0× → +7, 1.2–1.5× → +4\n"
+         "1.0–1.2× → +1, < 1.0× → 0"),
+
+        ("_cv4_eq_extension", "Extension/Chase Risk", 15, "#d29922",
+         "SUBTRACTIVE — shared with decision_engine._extension() via\n"
+         "extension_shared.compute_extension_penalty(). Full 15 pts at\n"
+         "zero chase-risk severity, decaying toward 0 as severity rises\n"
+         "(too far extended from entry to chase safely)."),
     ]
 
     # Filter to columns that actually exist in this df
