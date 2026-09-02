@@ -30,6 +30,7 @@ warnings.filterwarnings("ignore")
 # Re-exported here so existing `from utils.scanner_engine import
 # fetch_ohlcv` call sites keep working unchanged.
 from utils.market_data import fetch_ohlcv, _strip_tz  # noqa: F401  (re-export)
+from utils.build_info import CODE_VERSION  # [2026-09-02] stamped into every scan row — see module docstring
 
 # [2026-08-17] Persistent, module-level scorer pool — reused across every
 # run_scanner() call instead of spun up fresh per batch (10x/cycle, every
@@ -1923,6 +1924,15 @@ def score_stock(
         "_fib500":              r.fib500,
         "_fib382":              r.fib382,
         "_nifty_regime":        r.nifty_regime_val,
+        # [2026-09-02] Which commit actually produced this row — see
+        # utils/build_info.py. Born from a real incident: a fix landed on
+        # `main` days before scan_daily_archive showed any sign of it,
+        # because scheduler/scan_worker.py (or its in-process fallback) is
+        # a long-lived process that a `git pull` alone does not reload —
+        # only a restart does. Stamping this here makes "is fix X actually
+        # live" a one-line SQL check against real data forever, instead of
+        # something that needs re-diagnosing from scratch every time.
+        "_code_version":        CODE_VERSION,
         "_vol_ratio":           round(r.vol_ratio, 3),
         # ── NEW: Tier-1 strength fields ──────────────────────────
         "RS":           round(r.rs_val * 100, 2),   # pct vs Nifty, 5-bar
