@@ -1740,11 +1740,17 @@ def _entry_quality_v4(r: "BarResult", smc_state=None, current_price: Optional[fl
     15 (subtractive — via extension_shared.compute_extension_penalty(),
     shared with decision_engine._extension() per §2).
     """
-    # ── Trend Alignment (0-20) ────────────────────────────────────────
+    # ── Trend Alignment (0-20) — EQ-specific TIMING read via the EMA9/21
+    # fast pair, deliberately NOT reusing trend_up/ema_alignment/above_cloud
+    # (Leadership's core structural-quality inputs) or trend_age/extension
+    # (owned by ls_trend_persistence / eq_extension_chase_risk respectively).
+    # Diagnostic finding: r=0.937-0.959 correlation with Leadership's
+    # ls_trend_strength traced to EQ reusing the SAME trend_up/ema_alignment
+    # flags Leadership uses; this replaces that shared input entirely. ────
     ta = 0
-    if r.trend_up:        ta += 8
-    if r.ema_alignment:   ta += 8
-    if r.above_cloud:     ta += 4
+    if r.ema9_bullish:        ta += 10   # fast cross confirms bullish posture
+    if r.price_above_ema9:    ta += 6    # price leading the fast average
+    if r.ema9_spread_accel > 0: ta += 4  # fast/slow gap widening — accelerating
     eq_trend_alignment = min(ta, 20)
 
     # ── Momentum Timing (0-15) — is momentum firing NOW, not just present

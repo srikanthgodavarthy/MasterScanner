@@ -247,6 +247,9 @@ class BarResult:
     rs_val:       float = 0.0   # raw RS vs Nifty (5-bar)
     adx_val:      float = 0.0   # ADX(14)
     ema20_slope:  float = 0.0   # EMA20[i] - EMA20[i-5], normalised by price
+    ema9_bullish: bool  = False  # EMA9 > EMA21 — fast pair, EQ-specific (see eq_trend_alignment)
+    price_above_ema9: bool = False  # close > EMA9 — immediate momentum posture
+    ema9_spread_accel: float = 0.0  # (E9-E21 spread now) - (spread 2 bars ago), % of E21
     rs_positive:  bool  = False  # rs_val > t1_rs_min
     strength_ok:  bool  = False  # ADX or EMA slope gate passed
 
@@ -446,6 +449,8 @@ class IndicatorArrays:
     e20:          pd.Series
     e50:          pd.Series
     e200:         pd.Series
+    e9:           pd.Series   # EMA9 — fast pair w/ e21, EQ-specific short-term timing read
+    e21:          pd.Series   # EMA21 — deliberately separate from e20/e50's medium-term read
     rsi_s:        pd.Series
     atr_s:        pd.Series
     cci_s:        pd.Series
@@ -489,6 +494,8 @@ class IndicatorArrays:
     _e20_arr: np.ndarray = None
     _e50_arr: np.ndarray = None
     _e200_arr: np.ndarray = None
+    _e9_arr:  np.ndarray = None
+    _e21_arr: np.ndarray = None
     _atr_arr: np.ndarray = None
     _vol_arr: np.ndarray = None
     _vavg_arr: np.ndarray = None
@@ -607,6 +614,8 @@ def build_indicators(
     e20  = ema(c, params.ema_fast_period)
     e50  = ema(c, params.ema_mid_period)
     e200 = ema(c, params.ema_slow_period)
+    e9   = ema(c, 9)    # EQ-specific fast pair — deliberately separate from
+    e21  = ema(c, 21)   # e20/e50's medium-term structural read (see compute_bar)
     rsi_s    = rsi(c, 21)
     atr_s    = atr(h, l, c, 14)
     cci_s    = cci(c, params.cci_len)
@@ -686,6 +695,8 @@ def build_indicators(
     _e20_arr  = e20.values.astype(np.float32)
     _e50_arr  = e50.values.astype(np.float32)
     _e200_arr = e200.values.astype(np.float32)
+    _e9_arr   = e9.values.astype(np.float32)
+    _e21_arr  = e21.values.astype(np.float32)
     _atr_arr  = atr_s.values.astype(np.float32)
     _vol_arr  = v.values.astype(np.float32)
     _vavg_arr = vol_avg.values.astype(np.float32)
@@ -705,7 +716,7 @@ def build_indicators(
 
     return IndicatorArrays(
         c=c, h=h, l=l, o=o, v=v,
-        e20=e20, e50=e50, e200=e200,
+        e20=e20, e50=e50, e200=e200, e9=e9, e21=e21,
         rsi_s=rsi_s, atr_s=atr_s, cci_s=cci_s, adx_s=adx_s,
         vol_avg=vol_avg, atr_sma20=atr_sma20, atr_sma_comp=atr_sma_comp,
         bb_upper=bb_upper, bb_lower=bb_lower,
@@ -719,6 +730,7 @@ def build_indicators(
         swing_labels_full=swing_labels_full,
         _c_arr=_c_arr, _h_arr=_h_arr, _l_arr=_l_arr, _cci_arr=_cci_arr,
         _e20_arr=_e20_arr, _e50_arr=_e50_arr, _e200_arr=_e200_arr,
+        _e9_arr=_e9_arr, _e21_arr=_e21_arr,
         _atr_arr=_atr_arr, _vol_arr=_vol_arr, _vavg_arr=_vavg_arr,
         _adx_arr=_adx_arr, _nifty_arr=_nifty_arr, _sector_arr=_sector_arr,
         _o_arr=_o_arr, _rsi_arr=_rsi_arr, _atr_sma20_arr=_atr_sma20_arr,
@@ -1070,6 +1082,7 @@ def compute_bar(
 
     ca   = ia._c_arr;   ha  = ia._h_arr;   la  = ia._l_arr
     e20a = ia._e20_arr; e50a= ia._e50_arr; e200a=ia._e200_arr
+    e9a  = ia._e9_arr;  e21a= ia._e21_arr
     atrl = ia._atr_arr; ccil= ia._cci_arr; vola = ia._vol_arr
     vavga= ia._vavg_arr; adxa= ia._adx_arr
     # PERF-6: previously-uncovered arrays (were falling back to .iloc)
@@ -1087,6 +1100,8 @@ def compute_bar(
     cur_e20  = e20a[i]  if e20a is not None else float(ia.e20.iloc[i])
     cur_e50  = e50a[i]  if e50a is not None else float(ia.e50.iloc[i])
     cur_e200 = e200a[i] if e200a is not None else float(ia.e200.iloc[i])
+    cur_e9   = e9a[i]   if e9a   is not None else float(ia.e9.iloc[i])
+    cur_e21  = e21a[i]  if e21a  is not None else float(ia.e21.iloc[i])
     cur_r    = rsia[i]  if rsia  is not None else float(ia.rsi_s.iloc[i])
     cur_v    = vola[i]  if vola  is not None else float(v.iloc[i])
     cur_atr  = atrl[i]  if atrl  is not None else float(ia.atr_s.iloc[i])
@@ -1117,6 +1132,22 @@ def compute_bar(
         ema20_slope = (cur_e20 - e20_5ago) / e20_5ago * 100 if e20_5ago > 0 else 0.0
     else:
         ema20_slope = 0.0
+
+    # ── EMA9/21 FAST PAIR (EQ-specific timing read) ─────────────────
+    # Deliberately separate from the EMA20/50 medium-term structure used
+    # by Leadership/Conviction — see build_indicators()'s e9/e21 comment.
+    ema9_bullish = cur_e9 > cur_e21
+    price_above_ema9 = cur_c > cur_e9
+    if i >= 2:
+        e9_2ago  = e9a[i - 2]  if e9a  is not None else float(ia.e9.iloc[i - 2])
+        e21_2ago = e21a[i - 2] if e21a is not None else float(ia.e21.iloc[i - 2])
+        spread_now  = cur_e9 - cur_e21
+        spread_2ago = e9_2ago - e21_2ago
+        ema9_spread_accel = (
+            (spread_now - spread_2ago) / cur_e21 * 100 if cur_e21 > 0 else 0.0
+        )
+    else:
+        ema9_spread_accel = 0.0
 
     # ── TREND ─────────────────────────────────────────────────────
     trend_up   = cur_c > cur_e200 and cur_e20 > cur_e50
@@ -2278,6 +2309,9 @@ def compute_bar(
         rs_val       = round(rs_composite, 4),   # composite RS (primary ranking value)
         adx_val      = round(cur_adx, 1),
         ema20_slope  = round(ema20_slope, 3),
+        ema9_bullish = ema9_bullish,
+        price_above_ema9 = price_above_ema9,
+        ema9_spread_accel = round(ema9_spread_accel, 4),
         rs_positive  = rs_positive,
         strength_ok  = strength_ok,
         # booleans
