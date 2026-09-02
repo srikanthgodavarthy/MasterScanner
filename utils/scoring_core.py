@@ -300,6 +300,8 @@ class BarResult:
 
     # ── Volume ───────────────────────────────────────────────────
     vol_ratio:          float = 1.0
+    vol_ratio_5d_avg:   float = 1.0   # mean vol_ratio, trailing 5 bars — persistence read (Leadership)
+    vol_ratio_trigger_max: float = 1.0  # max vol_ratio over the same window recent_cci_recovery scans (Entry Quality)
     trend_phase:        str   = "NONE"   # EMERGING | ESTABLISHED | EXTENDED | NONE
 
     # ── Suggestion 2: Score component audit ──────────────────────
@@ -1282,11 +1284,32 @@ def compute_bar(
     # CCI recovery — cross above OS within t1_cci_window bars (fresh signal only).
     # NOTE: kept as a true parameter — callers set this via ScoringParams; default is 2.
     _cci_win = params.t1_cci_window
+    _recovery_window = range(max(1, i - _cci_win + 1), i + 1)
     recent_cci_recovery = any(
         float(ia.cci_s.iloc[j - 1]) <= params.cci_os and
         float(ia.cci_s.iloc[j])     >  params.cci_os
-        for j in range(max(1, i - _cci_win + 1), i + 1)
+        for j in _recovery_window
     )
+
+    # ── Volume: point-in-time vol_ratio at an arbitrary bar j, reusing the
+    # same vol/vol_avg arrays already resolved for cur_v/cur_vavg above. ──
+    def _vol_ratio_at(j: int) -> float:
+        vj    = vola[j]  if vola  is not None else float(v.iloc[j])
+        vavgj = vavga[j] if vavga is not None else float(ia.vol_avg.iloc[j])
+        return (vj / vavgj) if vavgj > 0 else 0.0
+
+    # Leadership's "is participation persisting" read — mean vol_ratio over
+    # the trailing 5 bars (not just today's snapshot).
+    _persist_window = range(max(0, i - 4), i + 1)
+    vol_ratio_5d_avg = sum(_vol_ratio_at(j) for j in _persist_window) / len(_persist_window)
+
+    # Entry Quality's "did the actual trigger have participation" read — max
+    # vol_ratio over the SAME window recent_cci_recovery scans, so this
+    # collapses to today's vol_ratio when the trigger fired today
+    # (cci_momentum_break) and only looks back when the trigger is the
+    # short-lookback recovery case.
+    vol_ratio_trigger_max = max(_vol_ratio_at(j) for j in _recovery_window)
+
 
     # CCI momentum expansion (Tier 2)
     cci_momentum_break = cur_cci > params.cci_ob and cur_cci > prev_cci
@@ -2298,6 +2321,8 @@ def compute_bar(
         t4_fib_resist   = (near_ext127 or near_ext161),
         t4_downtrend    = (trend_down and below_cloud),
         vol_ratio           = (cur_v / cur_vavg) if cur_vavg > 0 else 1.0,
+        vol_ratio_5d_avg    = vol_ratio_5d_avg,
+        vol_ratio_trigger_max = vol_ratio_trigger_max,
         # FIX: fields declared in BarResult but missing from return — silently returned defaults
         rs1                 = round(rs1, 4),
         rs3                 = round(rs3, 4),

@@ -1546,9 +1546,11 @@ def _leadership_v4(r: "BarResult", smc_state=None, swing_label: Optional[str] = 
         mkt += 4   # flat neutral credit, same convention as rs_sector above
     ls_market_sector = min(mkt, 15)
 
-    # ── Participation/Volume (0-10) — vol_ratio sponsorship ladder,
-    # rescaled from v1 Conviction's 0-15 volume ladder (×2/3). ──────────
-    vr = r.vol_ratio
+    # ── Participation/Volume (0-10) — PERSISTENCE read, not a snapshot:
+    # mean vol_ratio over the trailing 5 bars, distinct from Conviction's
+    # instantaneous read below (same ladder shape, rescaled from v1's 0-15
+    # ladder ×2/3, applied to the smoothed input instead of today's bar). ──
+    vr = r.vol_ratio_5d_avg
     if   vr >= 2.5:  vol_raw = 15
     elif vr >= 2.0:  vol_raw = 12
     elif vr >= 1.5:  vol_raw = 8
@@ -1766,8 +1768,12 @@ def _entry_quality_v4(r: "BarResult", smc_state=None, current_price: Optional[fl
     elif r.above_fib786: pl_ += 2
     eq_price_location = min(pl_, 15)
 
-    # ── Volume/Execution (0-10) ─────────────────────────────────────
-    vr = r.vol_ratio
+    # ── Volume/Execution (0-10) — participation AT THE TRIGGER, not just
+    # today: max vol_ratio over the same short lookback window Momentum
+    # Timing's recent_cci_recovery scans. Collapses to today's vol_ratio
+    # when the trigger is cci_momentum_break (fires today); only looks
+    # back when the trigger is the recovery case. ─────────────────────
+    vr = r.vol_ratio_trigger_max
     if   vr >= 2.0:  ve = 10
     elif vr >= 1.5:  ve = 7
     elif vr >= 1.2:  ve = 4
