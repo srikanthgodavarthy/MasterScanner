@@ -272,6 +272,13 @@ class BarResult:
     in_golden:           bool = False
     in_golden_relaxed:   bool = False
     in_golden_cci:       bool = False
+    # Short-window (1x pvt_lb) golden-pocket read — EQ_PriceLocation's own
+    # structural-position signal, distinct from in_golden/in_golden_relaxed
+    # (3x pvt_lb swing range, which cv_setup_pattern reads). Fixes the
+    # cv_setup_pattern <-> eq_price_location correlation (r=0.835) traced to
+    # both pillars sharing the same golden-zone flags as their dominant term.
+    in_golden_near:         bool = False
+    in_golden_relaxed_near: bool = False
     above_fib786:        bool = False   # price above 78.6% retracement — shallow zone / near-reclaim
     above_cloud:         bool = False
     inside_cloud:        bool = False
@@ -1317,6 +1324,30 @@ def compute_bar(
     near_ext127 = abs(cur_c - fib_ext127) < cur_atr * ap
     near_ext161 = abs(cur_c - fib_ext161) < cur_atr * ap
 
+    # ── Short-window (1x pvt_lb) golden pocket — same swing-range/Fib math
+    # as above, but over the SAME shorter window pivot_high_dist already
+    # uses (a few lines below), not the 3x-lb3 swing range in_golden reads.
+    # "Is price in the recent micro-pullback pocket" vs CV_SetupPattern's
+    # "is price in the broader multi-swing pullback pocket" — a genuinely
+    # different structural read, not a relabeling of the same one. ──────
+    win_s1 = max(0, i - params.pvt_lb)
+    sw_hi1 = float(np.max(ha[win_s1:i + 1])) if ha is not None else float(h.iloc[win_s1:i + 1].max())
+    sw_lo1 = float(np.min(la[win_s1:i + 1])) if la is not None else float(l.iloc[win_s1:i + 1].min())
+    rng1   = sw_hi1 - sw_lo1
+
+    fib382_1 = sw_hi1 - rng1 * (params.t1_fib_hi / 100.0)
+    fib500_1 = sw_hi1 - rng1 * 0.500
+    fib618_1 = sw_hi1 - rng1 * (params.t1_fib_lo / 100.0)
+
+    in_golden_near = (
+        cur_c >= fib618_1 - cur_atr * ap and
+        cur_c <= fib500_1 + cur_atr * ap
+    )
+    in_golden_relaxed_near = (
+        cur_c >= fib618_1 - cur_atr * ap and
+        cur_c <= fib382_1 + cur_atr * ap
+    )
+
     # ── CCI SIGNALS ────────────────────────────────────────────────
     cci_cross_up_os = prev_cci <= params.cci_os and cur_cci > params.cci_os
     cci_cross_dn_ob = prev_cci >= params.cci_ob and cur_cci < params.cci_ob
@@ -2350,6 +2381,8 @@ def compute_bar(
         in_golden           = in_golden,
         in_golden_relaxed   = in_golden_relaxed,
         in_golden_cci       = in_golden_cci,
+        in_golden_near         = in_golden_near,
+        in_golden_relaxed_near = in_golden_relaxed_near,
         above_fib786        = above_fib786,
         above_cloud         = above_cloud,
         inside_cloud        = inside_cloud,

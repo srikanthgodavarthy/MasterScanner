@@ -1794,14 +1794,21 @@ def _entry_quality_v4(r: "BarResult", smc_state=None, current_price: Optional[fl
     # (SMC pillar inconsistency fix, 2026-09-02 — see docstring above) ──
     eq_smc_entry_structure = smc_entry_structure_score(smc_state, thesis_direction)
 
-    # ── Price Location (0-15) — pivot/fib positioning, timing not trend ─
+    # ── Price Location (0-15) — pivot/fib positioning, timing not trend.
+    # Golden-zone term uses in_golden_near/in_golden_relaxed_near (1x pvt_lb
+    # swing range) rather than cv_setup_pattern's in_golden/in_golden_relaxed
+    # (3x pvt_lb) — same window pivot_high_dist above already uses. Fixes
+    # the cv_setup_pattern <-> eq_price_location correlation (r=0.835)
+    # traced to both sharing the same golden-zone flags as their dominant
+    # term. Same 0-15 budget/weight-shape as before; only the underlying
+    # swing-range window changed. ───────────────────────────────────────
     pl_ = 0
     pvtd = r.pivot_high_dist
     if pvtd <= -2.0: pl_ += 8
     elif pvtd <= 0.5: pl_ += 6
     elif pvtd <= 2.0: pl_ += 3
-    if r.in_golden: pl_ += 7
-    elif r.in_golden_relaxed: pl_ += 5
+    if r.in_golden_near: pl_ += 7
+    elif r.in_golden_relaxed_near: pl_ += 5
     elif r.above_fib786: pl_ += 2
     eq_price_location = min(pl_, 15)
 
