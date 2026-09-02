@@ -1519,11 +1519,11 @@ def _leadership_v4(r: "BarResult", smc_state=None, swing_label: Optional[str] = 
     # standing), not the RS magnitude itself. No sub-formula specified in
     # §1.2 beyond the weight; documented design choice. ─────────────────
     mkt = 0
-    if r.nifty_regime_val == "bullish" and r.trend_up:
+    if r.nifty_regime_val == "bull" and r.trend_up:
         mkt += 7
     elif r.nifty_regime_val == "neutral":
         mkt += 4
-    elif r.nifty_regime_val == "bearish" and r.trend_up:
+    elif r.nifty_regime_val == "bear" and r.trend_up:
         mkt += 1   # leading despite a hostile regime — real, but discounted
     # Cutoffs below reuse the SAME percentile-rank mapping computed for
     # _leadership()'s RS-vs-Sector ladder (2026-09-01 diagnostic.py run):
@@ -1597,8 +1597,8 @@ def _market_regime_score_v4(r: "BarResult", thesis_direction: str) -> int:
     legitimately trade counter-regime.
     """
     regime = (r.nifty_regime_val or "neutral").lower()
-    is_bull_regime = regime == "bullish"
-    is_bear_regime = regime == "bearish"
+    is_bull_regime = regime == "bull"
+    is_bear_regime = regime == "bear"
 
     if thesis_direction == "BULLISH":
         if is_bull_regime:  return 10
