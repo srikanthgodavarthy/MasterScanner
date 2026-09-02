@@ -1637,18 +1637,26 @@ def _conviction_v4(r: "BarResult", thesis_direction: str = "BULLISH", smc_state=
     """
     bullish = thesis_direction == "BULLISH"
 
-    # ── Directional Trend (0-20) — trend structure, signed by thesis ──
+    # ── Directional Trend (0-20) — real-time directional-trend read, signed
+    # by thesis. [TREND TRIPLE-COUNTING FIX, 2026-09-02 — explicit user
+    # direction] Previously built from trend_up/ema_alignment/above_cloud/
+    # inside_cloud — the exact same structural flags Leadership's
+    # ls_trend_strength reads (Pearson r=0.937-0.959 in the diagnostic
+    # capture). Rebuilt on EMA50 medium-term slope + price-vs-EMA50 + ADX
+    # momentum (r.price_above_ema50 / r.ema50_slope_accel / r.adx_rising —
+    # see scoring_core.BarResult), deliberately not reusing Leadership's
+    # long-term e200/e20/e50 structural gate or EQ's EMA9/21 fast pair. ADX
+    # itself is a direction-agnostic magnitude, so adx_rising (trend
+    # strengthening) credits both thesis directions equally, gated by price
+    # position relative to EMA50 for direction. ─────────────────────────
     dt = 0
-    aligned_up = r.trend_up and r.ema_alignment
-    aligned_down = r.trend_down and r.ema_alignment
     if bullish:
-        if aligned_up:       dt += 12
-        if r.above_cloud:    dt += 8
-        elif r.inside_cloud: dt += 3
+        if r.price_above_ema50:       dt += 8
+        if r.ema50_slope_accel > 0:   dt += 8
     else:
-        if aligned_down:      dt += 12
-        if r.trend_down and not r.above_cloud and not r.inside_cloud: dt += 8
-        elif r.inside_cloud: dt += 3
+        if not r.price_above_ema50:   dt += 8
+        if r.ema50_slope_accel < 0:   dt += 8
+    if r.adx_rising: dt += 4
     cv_directional_trend = min(dt, 20)
 
     # ── Momentum (0-20) — DIRECTIONAL, no abs(): a bullish thesis is only

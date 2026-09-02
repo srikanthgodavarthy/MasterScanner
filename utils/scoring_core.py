@@ -250,6 +250,15 @@ class BarResult:
     ema9_bullish: bool  = False  # EMA9 > EMA21 — fast pair, EQ-specific (see eq_trend_alignment)
     price_above_ema9: bool = False  # close > EMA9 — immediate momentum posture
     ema9_spread_accel: float = 0.0  # (E9-E21 spread now) - (spread 2 bars ago), % of E21
+    # Conviction-specific directional-trend read (see cv_directional_trend in
+    # conviction_score_v1.py) — deliberately distinct from both Leadership's
+    # trend_up/ema_alignment/above_cloud structural gate (long-term, e200/e20/e50)
+    # and EQ's ema9_bullish/price_above_ema9 fast-pair timing read (e9/e21).
+    # Reuses the existing e50 array with a longer 8-bar lookback and an
+    # ADX-momentum (not level) read, no new indicator series required.
+    price_above_ema50: bool = False   # close > EMA50 — a level Leadership never tests directly
+    ema50_slope_accel: float = 0.0    # EMA50[i]-EMA50[i-8], normalised by EMA50[i-8], % — 8-bar, distinct lookback from ema20_slope(5) and ema9_spread_accel(2)
+    adx_rising: bool = False          # ADX[i] > ADX[i-3] — trend strengthening NOW, not just a static level threshold
     rs_positive:  bool  = False  # rs_val > t1_rs_min
     strength_ok:  bool  = False  # ADX or EMA slope gate passed
 
@@ -1148,6 +1157,23 @@ def compute_bar(
         )
     else:
         ema9_spread_accel = 0.0
+
+    # ── EMA50 MEDIUM READ + ADX MOMENTUM (Conviction-specific directional-
+    # trend read, see cv_directional_trend) — deliberately distinct from
+    # Leadership's trend_up/ema_alignment/above_cloud structural gate and
+    # from EQ's EMA9/21 fast pair (see BarResult field comments). ────────
+    price_above_ema50 = cur_c > cur_e50
+    if i >= 8:
+        e50_8ago = e50a[i - 8] if e50a is not None else float(ia.e50.iloc[i - 8])
+        ema50_slope_accel = (cur_e50 - e50_8ago) / e50_8ago * 100 if e50_8ago > 0 else 0.0
+    else:
+        ema50_slope_accel = 0.0
+    if i >= 3:
+        adx_3ago = adxa[i - 3] if adxa is not None else float(ia.adx_s.iloc[i - 3])
+        adx_3ago = 0.0 if np.isnan(adx_3ago) else adx_3ago
+        adx_rising = cur_adx > adx_3ago
+    else:
+        adx_rising = False
 
     # ── TREND ─────────────────────────────────────────────────────
     trend_up   = cur_c > cur_e200 and cur_e20 > cur_e50
@@ -2312,6 +2338,9 @@ def compute_bar(
         ema9_bullish = ema9_bullish,
         price_above_ema9 = price_above_ema9,
         ema9_spread_accel = round(ema9_spread_accel, 4),
+        price_above_ema50 = price_above_ema50,
+        ema50_slope_accel = round(ema50_slope_accel, 4),
+        adx_rising = adx_rising,
         rs_positive  = rs_positive,
         strength_ok  = strength_ok,
         # booleans
