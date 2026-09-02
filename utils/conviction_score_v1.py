@@ -1721,10 +1721,26 @@ def _conviction_v4(r: "BarResult", thesis_direction: str = "BULLISH", smc_state=
 #  ENTRY QUALITY v4 (§1.4) — SMC's strongest influence
 # ══════════════════════════════════════════════════════════════════
 
-def smc_entry_structure_score(smc_state) -> int:
+def smc_entry_structure_score(smc_state, thesis_direction: str = "BULLISH") -> int:
     """EXACT formula per §1.4. FAST freshness decay (a stale entry
-    contributes nothing to "enter now") — see smc_freshness.py."""
-    if smc_state is None:
+    contributes nothing to "enter now") — see smc_freshness.py.
+
+    [SMC PILLAR INCONSISTENCY FIX, 2026-09-02 — explicit user direction]
+    Diagnostic finding (cv4_analysis_handoff): this function used to score
+    evidence_tier/fvg_retest with NO direction check at all, while
+    Conviction's smc_conviction_score() requires smc_state.direction ==
+    thesis_direction (and zeroes on CONFLICT). That meant EQ would give full
+    credit to, e.g., a strong BEARISH structural break as "entry structure"
+    for a BULLISH thesis — real evidence, wrong direction for the trade being
+    scored. Same directional gate as Conviction now applied here: no
+    evidence, opposite-direction evidence, or CONFLICT all score 0. This is
+    a genuine behavior change (previously-nonzero scores on
+    direction-mismatched SMC states now score 0) — not just a relabeling.
+    thesis_direction defaults to "BULLISH" only to preserve the old
+    positional-call signature; the real value is always threaded in from
+    compute_conviction_v4() below.
+    """
+    if smc_state is None or smc_state.direction != thesis_direction or smc_state.state == "CONFLICT":
         return 0
     base = {0: 0, 1: 4, 2: 10, 3: 16, 4: 20}[smc_state.evidence_tier]
     retest_adj = {"none": 0, "in_zone": 5, "through_unfilled": -3, "through_filled": -8}[smc_state.fvg_retest]
@@ -1732,13 +1748,19 @@ def smc_entry_structure_score(smc_state) -> int:
     return round(max(0, min(raw * entry_freshness_multiplier(smc_state.age_bars), 25)))
 
 
-def _entry_quality_v4(r: "BarResult", smc_state=None, current_price: Optional[float] = None) -> tuple[int, dict]:
+def _entry_quality_v4(r: "BarResult", smc_state=None, current_price: Optional[float] = None,
+                       thesis_direction: str = "BULLISH") -> tuple[int, dict]:
     """
     Returns (0-100, sub_scores_dict). Locked weights (§1.4): Trend
     Alignment 20, Momentum Timing 15, SMC Entry Structure 25 (exact
     formula), Price Location 15, Volume/Execution 10, Extension/Chase Risk
     15 (subtractive — via extension_shared.compute_extension_penalty(),
     shared with decision_engine._extension() per §2).
+
+    thesis_direction : "BULLISH" or "BEARISH" — forwarded to
+        smc_entry_structure_score() so SMC Entry Structure is gated the same
+        way Conviction's SMC Structure Confirmation is (see that function's
+        docstring — SMC pillar inconsistency fix, 2026-09-02).
     """
     # ── Trend Alignment (0-20) — EQ-specific TIMING read via the EMA9/21
     # fast pair, deliberately NOT reusing trend_up/ema_alignment/above_cloud
@@ -1760,8 +1782,9 @@ def _entry_quality_v4(r: "BarResult", smc_state=None, current_price: Optional[fl
     else: mt = 0
     eq_momentum_timing = min(mt, 15)
 
-    # ── SMC Entry Structure (0-25) — EXACT formula §1.4 ────────────────
-    eq_smc_entry_structure = smc_entry_structure_score(smc_state)
+    # ── SMC Entry Structure (0-25) — EXACT formula §1.4, direction-gated
+    # (SMC pillar inconsistency fix, 2026-09-02 — see docstring above) ──
+    eq_smc_entry_structure = smc_entry_structure_score(smc_state, thesis_direction)
 
     # ── Price Location (0-15) — pivot/fib positioning, timing not trend ─
     pl_ = 0
@@ -1907,7 +1930,8 @@ def compute_conviction_v4(
     """
     leadership,    ls_subs = _leadership_v4(r, smc_state=smc_state, swing_label=swing_label)
     conviction,    cv_subs = _conviction_v4(r, thesis_direction=thesis_direction, smc_state=smc_state)
-    entry_quality, eq_subs = _entry_quality_v4(r, smc_state=smc_state, current_price=current_price)
+    entry_quality, eq_subs = _entry_quality_v4(r, smc_state=smc_state, current_price=current_price,
+                                                thesis_direction=thesis_direction)
 
     composite = (leadership + conviction + entry_quality) / 3
     signal = _classify_v4(leadership, conviction, entry_quality, thresholds=settings)
