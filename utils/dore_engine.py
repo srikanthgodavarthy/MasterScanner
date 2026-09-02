@@ -627,6 +627,55 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 100.0) -> float:
     return max(lo, min(hi, x))
 
 
+def compute_futures_basis(futures_ltp: float, spot_ltp: float,
+                           days_to_expiry: float) -> dict:
+    """Futures-vs-spot basis (DORE_FUTURES_MIGRATION_PLAN.md §3 item 4) —
+    a pure function, not yet called from any stage. Lands in PR1
+    (data-layer) ahead of Stage 1's futures rewrite (PR2), which will be
+    the first real caller, via the new fut_price/price pair on
+    DOREInput.
+
+    Placed here rather than in utils/upstox_client.py because this is
+    scoring/derived logic, not a data fetch — upstox_client.py's futures
+    fetchers (fetch_futures_ohlcv_upstox() etc.) hand back raw LTPs;
+    turning two LTPs and a day-count into a basis reading belongs with
+    the rest of DORE's pure-function scoring helpers (_pct_score(),
+    _weighted(), ...) in this module instead.
+
+    Returns {"basis_pts", "basis_pct", "basis_annualized_pct"}:
+      - basis_pts: futures_ltp - spot_ltp, in price points. Positive =
+        contango (futures trading above spot, the normal state absent a
+        strong bearish/dividend effect), negative = backwardation.
+      - basis_pct: basis_pts / spot_ltp * 100.
+      - basis_annualized_pct: basis_pct annualized by days_to_expiry
+        (basis_pct * 365 / days_to_expiry) — lets a small basis close to
+        expiry and a larger basis far from expiry be compared on the same
+        footing, same reasoning as an annualized bond yield. None if
+        days_to_expiry <= 0 (expiry day / already expired — the
+        annualization is undefined, not just noisy, at that point).
+
+    Fail-soft on degenerate inputs (spot_ltp <= 0) rather than raising —
+    every value comes back 0.0 (or None for the annualized field), same
+    "return a safe neutral rather than blow up the caller" convention
+    every other DORE pure-function helper in this module follows.
+    """
+    if spot_ltp <= 0:
+        return {"basis_pts": 0.0, "basis_pct": 0.0, "basis_annualized_pct": None}
+
+    basis_pts = futures_ltp - spot_ltp
+    basis_pct = basis_pts / spot_ltp * 100.0
+
+    basis_annualized_pct = None
+    if days_to_expiry and days_to_expiry > 0:
+        basis_annualized_pct = basis_pct * 365.0 / days_to_expiry
+
+    return {
+        "basis_pts": round(basis_pts, 2),
+        "basis_pct": round(basis_pct, 3),
+        "basis_annualized_pct": round(basis_annualized_pct, 2) if basis_annualized_pct is not None else None,
+    }
+
+
 # Premium Behaviour's confidence curve — replaces the old flat "avg
 # growth >= 1.5% -> pass, else fail" cliff (2026-08-06). Anchor points
 # are (avg %/interval, confidence 0-100); _interp_score() piecewise-

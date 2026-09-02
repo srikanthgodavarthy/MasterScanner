@@ -1774,16 +1774,256 @@ def fetch_option_contract_intraday_candles(symbol: str, leg: str, strike: float,
     return _fetch_intraday_candles(instrument_key, unit="minutes", interval="5")
 
 
+_INDEX_FUTURES_NAME_CANDIDATES = {
+    # 2026-09: Upstox's FUTIDX `name` values for the three indices Stage 0
+    # covers alongside stock futures — DORE_FUTURES_MIGRATION_PLAN.md's
+    # universe is NIFTY/SENSEX/BANKNIFTY + F&O-eligible stocks, and
+    # resolve_futures_instrument_key() below needs to resolve ALL of them,
+    # not just the FUTSTK stock case _stock_futures_contracts() covers.
+    # Multiple candidates per index because (same lesson as
+    # fo_eligible_symbols()'s name/tradingsymbol mismatches) Upstox's own
+    # `name` column for index derivatives isn't always the display name a
+    # caller would guess — try each until one has FUTIDX rows.
+    "NIFTY":     ["NIFTY", "NIFTY 50"],
+    "BANKNIFTY": ["BANKNIFTY", "NIFTY BANK", "BANK NIFTY"],
+    "SENSEX":    ["SENSEX"],
+}
+
+
+def _index_futures_contracts(index: str) -> pd.DataFrame:
+    """FUTIDX rows for `index` (one of the _INDEX_FUTURES_NAME_CANDIDATES
+    keys) — the index counterpart to _stock_futures_contracts(). Tries
+    each name candidate in turn and returns the first non-empty match;
+    empty DataFrame if none of them hit (fail-soft, same contract as the
+    stock-side helper)."""
+    df = load_fo_instrument_master()
+    type_col = _fo_column(df, "instrument_type", "instrumenttype")
+    name_col = _fo_column(df, "name", "underlying_symbol", "asset_symbol")
+    if type_col is None or name_col is None:
+        return pd.DataFrame()
+    is_futidx = df[type_col].astype(str).str.upper() == "FUTIDX"
+    name_upper = df[name_col].astype(str).str.strip().str.upper()
+    for candidate in _INDEX_FUTURES_NAME_CANDIDATES.get(index.upper(), [index.upper()]):
+        match = df[is_futidx & (name_upper == candidate)]
+        if not match.empty:
+            return match
+    return pd.DataFrame()
+
+
 def resolve_futures_instrument_key(symbol: str) -> Optional[str]:
-    """Nearest-expiry FUTSTK instrument_key for `symbol`, or None if the
-    stock has no listed futures contract."""
+    """Nearest-expiry futures instrument_key for `symbol` — FUTSTK for an
+    individual stock, FUTIDX for "NIFTY"/"BANKNIFTY"/"SENSEX". None if
+    there's no listed futures contract for it (fail-soft, matching every
+    other resolver in this module).
+
+    2026-09: extended to also try the index side
+    (_index_futures_contracts()) when the stock lookup comes back empty —
+    originally FUTSTK-only, but DORE_FUTURES_MIGRATION_PLAN.md's Stage 0
+    universe includes the three indices, and Stage 1's new Futures Market
+    State needs a futures read for ALL of Stage 0's universe, not just its
+    ~180-220 F&O-eligible stocks.
+    """
     contracts = _stock_futures_contracts(symbol)
+    if contracts.empty:
+        contracts = _index_futures_contracts(symbol)
     expiry_col = _fo_column(contracts, "expiry")
     key_col = _fo_column(contracts, "instrument_key")
     if contracts.empty or expiry_col is None or key_col is None:
         return None
     contracts = contracts.sort_values(expiry_col)
     return contracts.iloc[0][key_col]
+
+
+# ══════════════════════════════════════════════════════════════════
+#  FUTURES OHLCV — daily + intraday candles for the current nearest-
+#  expiry contract (DORE_FUTURES_MIGRATION_PLAN.md PR1)
+# ══════════════════════════════════════════════════════════════════
+#
+# NO ROLL ADJUSTMENT, BY DESIGN. Every fetch below resolves to ONE
+# specific instrument_key (the current nearest-expiry contract, via
+# resolve_futures_instrument_key()) and asks Upstox's historical-candle
+# endpoint for that instrument_key's own candles. Because a monthly
+# FUTSTK/FUTIDX contract's instrument_key is unique to that contract,
+# Upstox can only return bars that actually exist for it — i.e. from
+# that contract's own listing date (the day after the prior month's
+# expiry) to today. There is no multi-contract stitching happening here,
+# so there is no rollover gap to adjust for: the "gap at every rollover"
+# problem the v1 migration plan (§7 Q1) raised only exists if you splice
+# consecutive months' candles into one continuous series, which this
+# migration explicitly decided against (options-buying, not futures
+# trading — no P&L-continuity reason to build that). The tradeoff this
+# accepts instead: a freshly-listed contract genuinely only has a few
+# days of history until it's ~3-4 weeks old, which is too short for a
+# converged EMA21/ADX. That's a real, disclosed limitation — Stage 1
+# (PR2) is expected to treat a short history as low-confidence rather
+# than compute a distorted score off it, the same "don't silently score
+# missing data as neutral" pattern ExecutionResult/PreBreakoutResult
+# already use for their own components_used counts. This module does
+# NOT enforce a minimum bar count itself (unlike fetch_ohlcv_upstox()'s
+# 60-bar floor) — a contract's whole life is often shorter than that
+# floor, so imposing it here would make every futures fetch look like a
+# failure. Bar-count-adequacy is a Stage 1 scoring decision, not a
+# data-layer one.
+
+MIN_BARS_FOR_FUTURES_TREND = 15   # advisory floor for Stage 1 (PR2) to
+                                   # gate EMA21/ADX-dependent sub-scores
+                                   # on — NOT enforced by the fetchers
+                                   # below, see module note above.
+
+_FUTURES_LOOKBACK_DAYS = 45   # calendar days. NOT a `period` string like
+                               # fetch_ohlcv_upstox()'s "3mo"/"1y" —
+                               # deliberately no such parameter exists on
+                               # the futures fetchers below. A "how much
+                               # history do you want" knob implies you can
+                               # meaningfully ask for more or less; you
+                               # can't, once resolve_futures_instrument_key()
+                               # has already pinned the request to ONE
+                               # specific, short-lived instrument_key — a
+                               # monthly contract's entire life (listing to
+                               # expiry) is ~28-31 calendar days, so asking
+                               # for "3mo" (or any other spot-shaped period)
+                               # would silently do nothing except send a
+                               # wider-than-necessary from_date. 45 days is
+                               # sized to comfortably cover one full monthly
+                               # cycle's calendar-day length plus a few
+                               # days' buffer for weekends/holidays inside
+                               # it — not to imply "up to 45 candles will
+                               # come back" (a mid-cycle contract still
+                               # returns at most its own ~20-25 trading days).
+
+
+@st.cache_data(ttl=1800, max_entries=40, show_spinner=False)
+def fetch_futures_ohlcv_upstox(symbol: str, interval: str = "1d") -> pd.DataFrame:
+    """Daily candle history for `symbol`'s current nearest-expiry futures
+    contract (FUTSTK for a stock, FUTIDX for "NIFTY"/"BANKNIFTY"/
+    "SENSEX") — the futures counterpart to fetch_ohlcv_upstox(), same
+    [open,high,low,close,volume] lowercase-column/naive-date-index
+    contract, same @st.cache_data pattern, same TTL tier as the daily-
+    bars path (30min — a contract's daily bars are as immutable
+    intraday as the spot ones fetch_ohlcv_upstox() already caches this
+    way).
+
+    NO ROLL ADJUSTMENT — see the module-level note above. UNLIKE
+    fetch_ohlcv_upstox(), there is no `period` parameter here: the
+    lookback window is the fixed internal `_FUTURES_LOOKBACK_DAYS`
+    constant, not a caller-chosen string. A spot-shaped "3mo"/"1y" period
+    would be misleading on a futures fetch — resolve_futures_instrument_key()
+    has already pinned this call to one specific contract before any date
+    range is built, so the amount of history that comes back is bounded
+    by that contract's own ~1-month life regardless of what's asked for.
+    Only daily ("1d") is wired up, mirroring fetch_ohlcv_upstox()'s own
+    interval restriction.
+
+    Empty DataFrame if `symbol` has no listed futures contract or the
+    fetch itself fails — NOT gated on a minimum bar count (unlike the
+    spot fetcher's 60-bar floor), since a legitimately fresh contract can
+    have well under that many bars and still be the only futures read
+    available. Callers needing a "is this enough history" gate should
+    check len(df) against MIN_BARS_FOR_FUTURES_TREND themselves.
+    """
+    if interval != "1d":
+        raise NotImplementedError("fetch_futures_ohlcv_upstox currently only supports interval='1d'")
+
+    instrument_key = resolve_futures_instrument_key(symbol)
+    if instrument_key is None:
+        logger.warning("[fetch_futures_ohlcv_upstox] could not resolve a futures instrument_key "
+                        "for %r — no listed FUTSTK/FUTIDX contract found", symbol)
+        return pd.DataFrame()
+
+    to_date = date.today()
+    from_date = to_date - timedelta(days=_FUTURES_LOOKBACK_DAYS)
+
+    return _fetch_candles(instrument_key, from_date, to_date, unit="days", interval="1")
+
+
+def fetch_futures_intraday_5m_upstox(symbol: str) -> pd.DataFrame:
+    """5-minute OHLCV for `symbol`'s current nearest-expiry futures
+    contract, warm-up history + today's session stitched into one
+    continuous series — the futures counterpart to
+    fetch_stock_intraday_5m_upstox()/fetch_index_intraday_5m_upstox(),
+    reusing the exact same _fetch_intraday_5m_by_key() core those two
+    already share (it's instrument-key-generic). Feeds Stage 1's
+    execution sub-block (fut_vwap/fut_orb_high/fut_orb_low/
+    fut_fresh_crossover — see DOREInput's fut_* fields).
+
+    Same fail-soft contract as the spot intraday fetchers: empty
+    DataFrame if there's no futures contract for `symbol`, outside
+    market hours, or on any failure — NOT cached itself, same reasoning
+    as fetch_stock_intraday_5m_upstox() (batch callers should cache at
+    the batch level, see fetch_batch_futures_ohlcv_upstox() below).
+
+    Same no-roll-adjustment note as fetch_futures_ohlcv_upstox() applies
+    here too, though it matters less in practice — a 5-minute warm-up
+    window (_INTRADAY_EMA_WARMUP_DAYS = 5 trading days) rarely spans a
+    monthly expiry, and on the rare day it would, this simply returns
+    whatever the current contract's instrument_key actually has, same
+    fail-soft behavior as a freshly-listed contract's short daily history.
+    """
+    instrument_key = resolve_futures_instrument_key(symbol)
+    if instrument_key is None:
+        return pd.DataFrame()
+    return _fetch_intraday_5m_by_key(instrument_key)
+
+
+def fetch_batch_futures_ohlcv_upstox(symbols: list, interval: str = "1d",
+                                      progress_cb=None) -> dict:
+    """Concurrent per-symbol futures daily-OHLCV fetch — the futures
+    counterpart to fetch_batch_ohlcv_upstox(), same ThreadPoolExecutor +
+    per-request throttle pattern (there's no multi-symbol historical-
+    candle call to batch these into, on the futures side either). Needed
+    because Stage 0's screener (utils.dore_fo_screener.py) has to build
+    Stage 1's futures trend read for the whole daily candidate pool, not
+    one symbol at a time.
+
+    No `period` parameter, matching fetch_futures_ohlcv_upstox() — see
+    that function's docstring and the `_FUTURES_LOOKBACK_DAYS` module
+    note for why a spot-shaped period string doesn't apply here.
+
+    Returns {symbol: df} for symbols that resolved to a futures
+    instrument_key AND returned at least one candle — a symbol is simply
+    absent otherwise (no listed contract, fetch failure, or a brand-new
+    contract with literally zero candles yet), same fail-soft-per-symbol
+    contract as fetch_batch_ohlcv_upstox(). Deliberately NOT filtered on
+    MIN_BARS_FOR_FUTURES_TREND here — that's a Stage 1 scoring decision
+    (see the module note above `fetch_futures_ohlcv_upstox()`), not a
+    reason to drop a symbol from the batch result entirely.
+    """
+    if not symbols:
+        return {}
+    if is_token_expired():
+        logger.warning("Upstox token likely expired (past 3:30 AM IST) — skipping futures fetch")
+        return {}
+
+    unresolved = [s for s in symbols if resolve_futures_instrument_key(s) is None]
+    if unresolved:
+        logger.warning("[fetch_batch_futures_ohlcv_upstox] %d/%d symbols have NO futures instrument_key "
+                        "match (no listed FUTSTK/FUTIDX contract?) — examples: %s",
+                        len(unresolved), len(symbols), unresolved[:10])
+
+    result: dict = {}
+    done = 0
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(fetch_futures_ohlcv_upstox, sym, interval): sym
+            for sym in symbols
+        }
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                df = fut.result()
+                if not df.empty:
+                    result[sym] = df
+            except Exception as exc:
+                logger.warning("Upstox futures fetch failed for %s: %s", sym, exc)
+            done += 1
+            if progress_cb:
+                progress_cb(done, len(symbols))
+    logger.info("[fetch_batch_futures_ohlcv_upstox] %d/%d symbols returned usable futures OHLCV "
+                "(%d had no futures instrument_key match, %d resolved but the candle fetch itself "
+                "failed/returned zero rows — likely a just-listed contract, see module note above)",
+                len(result), len(symbols), len(unresolved),
+                len(symbols) - len(result) - len(unresolved))
+    return result
 
 
 @st.cache_data(ttl=60, max_entries=8, show_spinner=False)
