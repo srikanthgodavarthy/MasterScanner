@@ -932,7 +932,15 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                 try:
                     from utils.scan_health_monitor import job_memory_delta
                     with job_memory_delta(f"live_scanner_batch[{batch_i + 1}/{n_batches}]"):
-                        df_raw = compute_live_scan_batch(chunk, settings=cycle_settings, nifty_series=cycle_nifty_series)
+                        # [2026-09-03] enrich_setup_persistence=False — this
+                        # batched call used to also run setup-plan
+                        # persistence (2 Supabase reads + a recovery pass
+                        # that's a structural no-op at batch scope — see
+                        # run_scanner()'s docstring) on every single batch,
+                        # 20x/cycle. Skipped here; done once, cycle-level,
+                        # below "# end of batches loop" instead.
+                        df_raw = compute_live_scan_batch(chunk, settings=cycle_settings, nifty_series=cycle_nifty_series,
+                                                          enrich_setup_persistence=False)
                     df_batch = apply_regime_layer(df_raw, regime_ctx) if (regime_ctx and df_raw is not None and not df_raw.empty) else df_raw
                     n_ok = 0
                     for rec in _live_scan_records(df_batch):
@@ -1091,6 +1099,38 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                     del technical_plans
 
         # end of batches loop
+
+        # [2026-09-03] Setup-plan persistence (frozen trade plans:
+        # Entry/SL/Targets locked on first Actionable detection), moved
+        # here from inside every batch's run_scanner() call — see
+        # run_scanner()'s enrich_setup_persistence docstring for why
+        # running it 20x/cycle (once per ~25-symbol batch) was both
+        # wasteful (2 Supabase reads every time) and unable to actually
+        # recover anything (that pass needs to see symbols outside its
+        # own batch, which by definition it can't at batch scope).
+        # Running it ONCE here, after every batch this cycle has already
+        # gone through history_store.get_live_history_cached() and
+        # landed in its shared, process-wide RAM cache, means the
+        # recovery pass's own get_live_history_cached(missing_from_all_
+        # data, ...) fallback (see utils/scanner_engine.py's
+        # _enrich_with_setup_persistence) now actually has a chance of
+        # finding an orphaned symbol's data — RAM cache hit, not a
+        # network fetch — instead of being a guaranteed no-op every
+        # time. all_data=None here is deliberate: at cycle level there's
+        # no single batch's fetch dict to hand it, so every orphaned
+        # symbol goes through that RAM-cache fallback uniformly.
+        try:
+            full_df = pd.DataFrame(list(merged.values()))
+            if not full_df.empty:
+                from utils.scanner_engine import _enrich_with_setup_persistence
+                full_df = _enrich_with_setup_persistence(full_df, all_data=None, fetch_source="yfinance")
+                for rec in full_df.to_dict("records"):
+                    key = _row_key(rec)
+                    if key:
+                        merged[key] = rec
+        except Exception:
+            logger.exception("[live_scanner] cycle-level setup-plan persistence failed (non-fatal — "
+                              "frozen trade levels retry next cycle)")
 
         # scan_snapshots: still a genuine "legacy" table, kept as-is for
         # history.py/validation.py's streak calculation — unaffected by
