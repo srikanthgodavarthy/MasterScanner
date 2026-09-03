@@ -92,15 +92,23 @@ BEARISH = "BEARISH"
 NEUTRAL = "NEUTRAL"
 ALL_DIRECTIONAL_INTENTS = {BULLISH, BEARISH, NEUTRAL}
 
-# NSE lists weekly options only on these three (NIFTY/SENSEX weekly, plus
-# BANKNIFTY historically) — every other underlying (individual stocks,
-# OPTSTK) only has MONTHLY contracts. fetch_stock_atm_option() only ever
-# fetches ONE nearest expiry (expiries[0] — this month's) for stocks, so
+# NSE/BSE list weekly options only on NIFTY (NSE, weekly) and SENSEX
+# (BSE, weekly) — every other underlying, including BANKNIFTY, is
+# monthly-only. SEBI's Oct 2024 circular restricted weekly expiry to
+# ONE index per exchange, effective 20 Nov 2024; BANKNIFTY's own weekly
+# contracts were discontinued that same date (last BANKNIFTY weekly
+# expiry: 20 Nov 2024) and it now trades monthly + quarterly only, same
+# as individual stocks (OPTSTK). fetch_stock_atm_option() only ever
+# fetches ONE nearest expiry (expiries[0] — this month's) for stocks —
 # there is no second "next week" chain to fall back to the way there is
-# for indices; stage5b_strike_and_expiry() uses this to pick the right
-# label instead of applying the weekly CURRENT_WEEK/NEXT_WEEK vocabulary
-# to a monthly-only contract (2026-07-27 fix — see its docstring).
-_WEEKLY_EXPIRY_SYMBOLS = {"NIFTY", "SENSEX", "BANKNIFTY"}
+# for NIFTY/SENSEX; stage5b_strike_and_expiry() uses this set to pick
+# the right label instead of applying the weekly CURRENT_WEEK/NEXT_WEEK
+# vocabulary to a monthly-only contract (2026-07-27 fix — see its
+# docstring). BANKNIFTY removed 2026-09-03 — it was still in this set
+# claiming CURRENT_WEEK/NEXT_WEEK-eligible over a year after its weekly
+# contract stopped existing; see the else-branch below for the
+# resulting fix (it now takes the same MONTHLY path as OPTSTK).
+_WEEKLY_EXPIRY_SYMBOLS = {"NIFTY", "SENSEX"}
 
 READY_NOW         = "READY_NOW"
 BREAKOUT_PENDING  = "BREAKOUT_PENDING"
@@ -2810,22 +2818,29 @@ def stage5b_strike_and_expiry(
             + ")"
         )
     else:
-        # Individual-stock options (OPTSTK) are monthly-only on NSE.
-        # fetch_stock_atm_option() only ever fetches the ONE nearest
-        # (current-month) expiry — there is no second "next week" chain
-        # behind it — so labeling this NEXT_WEEK when Execution Score is
-        # weak would claim a contract that was never actually fetched,
-        # and the strike/premium shown would silently still be the
-        # current month's. Always label it what it actually is; a weak
-        # Execution Score this close to expiry becomes a reason/warning
-        # about theta risk instead of a fabricated rollover.
+        # Monthly-only underlyings: individual-stock options (OPTSTK) —
+        # always were — and, as of 2026-09-03, BANKNIFTY too (see
+        # _WEEKLY_EXPIRY_SYMBOLS above — its weekly contract was
+        # discontinued 20 Nov 2024; it's been monthly+quarterly-only
+        # since). Both fetch_stock_atm_option() and the index OI/chain
+        # fetch only ever pull the ONE nearest (current-month) expiry
+        # for these — there is no second "next week" chain behind it —
+        # so labeling this NEXT_WEEK when Execution Score is weak would
+        # claim a contract that was never actually fetched, and the
+        # strike/premium shown would silently still be the current
+        # month's. Always label it what it actually is; a weak Execution
+        # Score this close to expiry becomes a reason/warning about
+        # theta risk instead of a fabricated rollover.
         expiry = "MONTHLY"
+        _is_stock = inp.symbol.upper() not in {"NIFTY", "SENSEX", "BANKNIFTY"}
+        _underlying_desc = "stock option" if _is_stock else "monthly-only index (no weekly contract)"
         if inp.days_to_expiry <= cfg.expiry_days_scalp_max and not scalp_ok:
             reasons.append(f"{inp.days_to_expiry}d to expiry on the current-month contract with "
                             f"Execution Score={execution_score:.0f} — meaningful theta-decay risk this "
-                            f"close to expiry; no next-month chain to roll into for a stock option")
+                            f"close to expiry; no next-month chain to roll into for a {_underlying_desc}")
         else:
-            reasons.append(f"{inp.days_to_expiry}d to expiry — current-month contract (stocks are monthly-only on NSE)")
+            reasons.append(f"{inp.days_to_expiry}d to expiry — current-month contract "
+                            f"({_underlying_desc.capitalize()}, monthly-only on NSE)")
     return strike_type, expiry, suggested_strike, itm_steps, reasons
 
 
