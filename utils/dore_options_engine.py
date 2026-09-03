@@ -804,12 +804,21 @@ class OptionChainSnapshot:
 
 @dataclass
 class PremiumQuote:
-    """Improvement #4 — the real contract Premium Validation is built
-    for. bid/ask/volume/oi/last_trade_time are all optional today
-    because the live feed (utils.upstox_client) doesn't expose them
-    yet; when it does, pass them in and validate_premium() will use
-    the real spread/volume checks automatically instead of falling
-    back to the LTP-vs-close heuristic."""
+    """The real contract Premium Validation is built for.
+
+    bid/ask/volume/oi are populated from utils.upstox_client's option-
+    chain fetch (fetch_oi_resistance() for indices, fetch_stock_atm_
+    option() for stocks) as of 2026-09-03 — see those functions'
+    strike_premiums dict for where ce_bid/ce_ask/ce_volume (and pe_*)
+    actually come from. Before that date bid/ask were never read out of
+    Upstox's response, so has_real_spread_data was structurally always
+    False and validate_premium() always used the LTP-vs-close fallback
+    below instead of a real spread/volume check. last_trade_time is
+    still not exposed by the feed — has_real_spread_data doesn't depend
+    on it. None here means Upstox didn't quote a two-sided market for
+    that strike (illiquid/far OTM) — has_real_spread_data treats that
+    the same as a genuine zero, both fall back to the LTP-vs-close
+    check below."""
     ltp:             Optional[float] = None
     prev_close:      Optional[float] = None
     bid:             Optional[float] = None
