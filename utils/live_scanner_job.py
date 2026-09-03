@@ -42,7 +42,8 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-def _run_batch(symbols: list, settings: dict | None, nifty_series=None) -> pd.DataFrame:
+def _run_batch(symbols: list, settings: dict | None, nifty_series=None,
+                enrich_setup_persistence: bool = True) -> pd.DataFrame:
     from utils.scanner_engine import run_scanner, NIFTY500_SYMBOLS
 
     settings = dict(settings or {})
@@ -57,10 +58,12 @@ def _run_batch(symbols: list, settings: dict | None, nifty_series=None) -> pd.Da
         max_workers=settings.get("workers", 10),
         source="yfinance",
         nifty_series=nifty_series,
+        enrich_setup_persistence=enrich_setup_persistence,
     )
 
 
-def compute_live_scan_batch(symbols: list, settings: dict | None = None, nifty_series=None) -> pd.DataFrame:
+def compute_live_scan_batch(symbols: list, settings: dict | None = None, nifty_series=None,
+                             enrich_setup_persistence: bool = True) -> pd.DataFrame:
     """
     Raw two-phase scan (fetch + score) for a single batch of symbols,
     WITHOUT the regime layer. See module docstring. Returns df_raw, or
@@ -71,8 +74,15 @@ def compute_live_scan_batch(symbols: list, settings: dict | None = None, nifty_s
     omitted, run_scanner() falls back to its own fetch_nifty() call
     (previous per-batch behaviour, unchanged for callers that don't
     have a cycle-level series to share, e.g. compute_live_scan() below).
+
+    enrich_setup_persistence: [2026-09-03] Default True, matching prior
+    behavior. scheduler/scan_worker.py's live_scanner sub-scheduler
+    passes False here (batched calls) and instead runs setup-plan
+    persistence once per cycle — see run_scanner()'s own docstring for
+    why a per-batch call can't usefully do this itself.
     """
-    df_raw = _run_batch(symbols, settings, nifty_series=nifty_series)
+    df_raw = _run_batch(symbols, settings, nifty_series=nifty_series,
+                         enrich_setup_persistence=enrich_setup_persistence)
     return df_raw if df_raw is not None else pd.DataFrame()
 
 

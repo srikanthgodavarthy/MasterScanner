@@ -1756,12 +1756,34 @@ def score_stock(
     diagnostic    = bool((settings or {}).get("prescreen_diagnostic", False))
     prescreen_ok  = leadership_prescreen(df, nifty)
     if not prescreen_ok and not diagnostic:
+        # [2026-09-03 diagnostic] Previously silent — this is a routine,
+        # expected rejection (most of the universe fails leadership
+        # prescreen most cycles by design), but with zero log trace it was
+        # indistinguishable from a genuine loss in run_scanner()'s
+        # "unaccounted for" summary. debug-level (not warning): this fires
+        # constantly and isn't itself actionable, it's just what makes the
+        # "unaccounted for" list explainable after the fact.
+        logging.getLogger(__name__).debug(
+            "score_stock: %s rejected by leadership_prescreen (expected filter, not a data loss)",
+            symbol or "<unknown symbol>",
+        )
         return {}
 
     ia = build_indicators(df, nifty, params, sector_series=sector_series)
     r  = compute_bar(ia, i=-1, params=params)   # -1 = latest bar
 
     if r is None:
+        # [2026-09-03 diagnostic] Also previously silent. Unlike the
+        # prescreen reject above, compute_bar() returning None on a
+        # symbol that already passed prescreen/indicator-build is NOT
+        # expected — this one is worth a warning so it's distinguishable
+        # from routine prescreen filtering in the same "unaccounted for"
+        # summary.
+        logging.getLogger(__name__).warning(
+            "score_stock: compute_bar returned None for %s after indicator build "
+            "(passed prescreen — unexpected, check for malformed/degenerate OHLCV)",
+            symbol or "<unknown symbol>",
+        )
         return {}
 
     # ── CV4/SMC shadow scoring input (Phase 2, masterscanner_scoring_
@@ -2686,9 +2708,11 @@ def run_scanner(
     source:      str  = "yfinance",
     source_warn_cb    = None,
     nifty_series: "pd.Series | None" = None,
+    enrich_setup_persistence: bool = True,
 ) -> pd.DataFrame:
     """
     Two-phase scanner.
+
     Nifty regime is computed once here from live data, then injected into
     the settings dict so every score_stock() call uses the same value
     without redundant per-stock computation.
@@ -2714,6 +2738,22 @@ def run_scanner(
     identically everywhere (which would have been easier to notice).
     Passing one already-fetched, already-deduped Series in for the whole
     cycle removes that per-batch lottery entirely.
+
+    enrich_setup_persistence: [2026-09-03] Default True — matches every
+    prior caller's behavior (pages/scanner.py's manual "Run Scan",
+    compute_live_scan()'s full-universe call). Set False for a
+    sub-batch call in a larger cycle (scheduler/scan_worker.py's
+    live_scanner sub-scheduler): _enrich_with_setup_persistence() does
+    two Supabase reads (load_open_setup_plans/load_first_seen) plus an
+    orphaned-plan recovery pass every time it runs, and that recovery
+    pass is structurally a no-op when `all_data` is scoped to one
+    ~25-symbol batch instead of the full universe (see that function's
+    own 2026-08-11 comment — confirmed live: 0 symbols ever recovered
+    this way). Running it once per batch (20x/cycle) paid that cost
+    repeatedly for zero benefit; the caller should instead run it once,
+    after every batch's data has landed in history_store's shared RAM
+    cache, so the recovery pass can actually succeed — see
+    scheduler/scan_worker.py's end-of-cycle call.
     """
     def _warn(msg: str) -> None:
         if source_warn_cb:
@@ -3043,7 +3083,11 @@ def run_scanner(
     # ── Setup Persistence (frozen trade plans) ────────────────────
     # Entry / SL / Targets are LOCKED on first Actionable detection.
     # Subsequent scans READ frozen levels — no daily drift.
-    df_out = _enrich_with_setup_persistence(df_out, all_data, fetch_source=fetch_source)
+    # [2026-09-03] Now conditional — see enrich_setup_persistence's own
+    # docstring above for why a batched cycle caller skips this here
+    # and calls it once, cycle-level, instead.
+    if enrich_setup_persistence:
+        df_out = _enrich_with_setup_persistence(df_out, all_data, fetch_source=fetch_source)
 
     return df_out
 

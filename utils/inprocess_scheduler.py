@@ -222,7 +222,21 @@ def start_background_scans() -> bool:
         # change) — that path is unaffected and coexists fine with
         # this loop, exactly as market_intelligence/fo_scan already
         # coexist with manual reruns.
-        INPROCESS_LIVE_SCANNER_MAX_WORKERS = 2          # vs. standalone's 4
+        # [2026-09-03] Bumped 2 -> 3. At batch_size=25 (below), 2 workers
+        # meant ~12.5 symbols/worker; with score_stock() doing real
+        # pandas/numpy work per symbol (indicator build + multi-pillar
+        # scoring, not a trivial computation — see score_stock()'s own
+        # docstring/body in utils/scanner_engine.py), that was still
+        # landing close enough to _SCORE_WAIT_TIMEOUT_S's 45s ceiling to
+        # risk the same tail-cancellation this batch_size cut was
+        # originally meant to fix (see batch_size's comment below). 3
+        # workers brings that down to ~8.3 symbols/worker, trading a bit
+        # more UI resource contention (still well under standalone's 4)
+        # for headroom against the timeout instead of reducing
+        # batch_size further, which would mean more, smaller batches and
+        # more state_meta/live_scanner_state upsert round trips per
+        # cycle (see batch_size's comment below).
+        INPROCESS_LIVE_SCANNER_MAX_WORKERS = 3          # vs. standalone's 4
         INPROCESS_LIVE_SCANNER_BATCH_COOLDOWN_SECS = 3.0  # vs. standalone's 1.5
         # [2026-08-25] vs. standalone's 50 (scheduler/scan_worker.py's
         # LIVE_SCANNER_BATCH_SIZE). With only 2 scoring workers (above)
@@ -240,6 +254,8 @@ def start_background_scans() -> bool:
         # that constant's own comment for the DB-write-count tradeoff
         # (more, smaller batches means more state_meta/live_scanner_state
         # upsert round trips per cycle, not more total data written).
+        # [2026-09-03] max_workers above went 2 -> 3, so this no longer
+        # needs to carry the full timeout margin alone.
         INPROCESS_LIVE_SCANNER_BATCH_SIZE = 25          # vs. standalone's 50
 
         t_live_scanner = threading.Thread(
