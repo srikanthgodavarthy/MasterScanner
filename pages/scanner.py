@@ -2752,12 +2752,23 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
     """
     📋 Active Plans — the operational trading dashboard.
 
-    Shows every OPEN SetupPlan (Waiting / Active / T1 Hit) regardless of
+    Shows every ENTERED SetupPlan (Active / T1 Hit) regardless of
     what the scanner currently recommends for that stock today. This is
     the entire point of separating Trade Lifecycle from Scanner
     Recommendation: a stock can fall to SKIP in today's scan and this
     plan will still sit here, untouched, until price hits SL/target or
     a trader manually closes it.
+
+    WAITING (pre-entry, not yet triggered) plans are deliberately
+    excluded from this tab — "Active Setups" means a trade is actually
+    open, not merely minted and pending entry. This only changes what
+    this tab displays: load_open_setup_plans()/is_open()/open_states()
+    (used by scanner_engine.py for duplicate-plan prevention and entry-
+    trigger monitoring) are untouched and still treat WAITING as open —
+    those plans are still being tracked and watched for entry, just not
+    surfaced here. Mirrors the same TRACKED/MONITORING vs ACTIVE split
+    utils.dore_options_persistence._lifecycle_group() already applies to
+    the DORE Options Active Plans tab below.
 
     "Original Recommendation" is the locked thesis from the day the plan
     was minted. "Current Recommendation" is today's live scanner read for
@@ -2778,8 +2789,12 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
     from utils.setup_persistence import compute_pnl_pct
 
     open_plans = preloaded_plans if preloaded_plans is not None else load_open_setup_plans()
+    # Active Setups = entered only (ACTIVE/T1_HIT) — WAITING plans are
+    # pre-entry and excluded here (see docstring above).
+    open_plans = {sym: plan for sym, plan in open_plans.items()
+                  if str(getattr(plan, "status", "")).upper() in ("ACTIVE", "T1_HIT")}
     if not open_plans:
-        st.info("No open trade plans right now. A plan is minted automatically the first time a stock reaches Actionable, Execute, or Elite (source LS) — or the first time a Pre-Breakout squeeze releases (source PB).")
+        st.info("No active (entered) trade plans right now. A plan is minted automatically the first time a stock reaches Actionable, Execute, or Elite (source LS) — or the first time a Pre-Breakout squeeze releases (source PB) — and moves to Active once price triggers entry.")
         return
 
     # Look up today's live price + current recommendation for symbols
@@ -2817,14 +2832,12 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
 
     rows_df = pd.DataFrame(rows)
 
-    # ── Summary stat row ────────────────────────────────────────────
-    n_waiting = int((rows_df["Status"] == "WAITING").sum())
+    # ── Summary stat row — WAITING dropped (this tab no longer shows
+    # pre-entry plans, so it would always read 0) ───────────────────
     n_active  = int((rows_df["Status"] == "ACTIVE").sum())
     n_t1      = int((rows_df["Status"] == "T1_HIT").sum())
     st.markdown(
         '<div style="display:flex;gap:24px;margin-bottom:10px;font-family:var(--mono);">'
-        f'<div><span style="font-size:18px;font-weight:700;color:#58a6ff">{n_waiting}</span> '
-        f'<span style="font-size:10px;color:var(--muted)">WAITING</span></div>'
         f'<div><span style="font-size:18px;font-weight:700;color:#3fb950">{n_active}</span> '
         f'<span style="font-size:10px;color:var(--muted)">ACTIVE</span></div>'
         f'<div><span style="font-size:18px;font-weight:700;color:#a371f7">{n_t1}</span> '
@@ -3946,6 +3959,20 @@ def _render_dore_options_active_plans_tab() -> None:
     _render_active_plans_tab (equity SetupPlan) vs the main scanner
     table. See utils/dore_options_persistence.py's module docstring for
     the full rationale.
+
+    Filtered to lifecycle_group == "ACTIVE" (entry actually locked) —
+    TRACKED (Level 1, not yet executable) and MONITORING (Level 2,
+    watching for entry: WAITING_FOR_ENTRY/ENTRY_READY/IN_ENTRY_ZONE) are
+    excluded, matching "Active Setups" on the equity side excluding
+    WAITING. This mirrors the SAME filter pages/dashboard.py's "ACTIVE
+    OPTIONS PLANS" card already applies (see its comment there) — this
+    tab previously showed all open_plans unfiltered, inconsistent with
+    that card's own definition of "active." Only changes what this tab
+    displays: load_open_dore_options_plans() itself (used by
+    utils/dore_live_state.py and dore_options_scan.py for duplicate-plan
+    prevention and entry monitoring) is untouched and still returns
+    every non-CLOSED plan — TRACKED/MONITORING plans are still being
+    watched, just not surfaced in this tab.
     """
     try:
         from utils.supabase_client import load_open_dore_options_plans, _is_available
@@ -3966,9 +3993,14 @@ def _render_dore_options_active_plans_tab() -> None:
                  "the live scan.")
         return
 
-    rows = active_plan_rows(open_plans)
+    rows = [r for r in active_plan_rows(open_plans) if r.get("lifecycle_group") == "ACTIVE"]
+    if not rows:
+        st.info("No ACTIVE DORE plans right now — TRACKED/MONITORING candidates aren't shown "
+                 "in this tab (entry hasn't triggered yet).")
+        return
+
     rows_df = pd.DataFrame(rows)
-    st.caption(f"{len(rows_df)} open plan(s) — independent of whether this cycle's live scan "
+    st.caption(f"{len(rows_df)} active plan(s) (entry locked) — independent of whether this cycle's live scan "
                "reproduced the contract. Auto-closes once the contract's own expiry passes.")
     st.markdown(_dore_options_active_plans_table_html(rows_df), unsafe_allow_html=True)
 
@@ -4614,6 +4646,14 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
     try:
         from utils.supabase_client import load_open_setup_plans as _load_open_plans_for_count
         _open_plans_preview = _load_open_plans_for_count()
+        # Tab count must match _render_active_plans_tab's own definition
+        # (entered only — ACTIVE/T1_HIT, WAITING excluded). load_open_setup_plans()
+        # itself is left returning WAITING too — scanner_engine.py's dedup/
+        # monitoring logic still needs it — so filter only here, at display.
+        _open_plans_preview = {
+            sym: plan for sym, plan in _open_plans_preview.items()
+            if str(getattr(plan, "status", "")).upper() in ("ACTIVE", "T1_HIT")
+        }
     except Exception:
         _open_plans_preview = {}
 
