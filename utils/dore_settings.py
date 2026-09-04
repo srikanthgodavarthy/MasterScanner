@@ -93,6 +93,44 @@ DORE_DEFAULTS: dict = {
     "w_trend_rsi":                20.0,
     "w_trend_volume":             10.0,   # relative volume
 
+    # ── Stage 1: Futures Market State (PR2, DORE_FUTURES_MIGRATION_PLAN_v2.md) ─
+    # Flag-gated NEW Stage 1 daily-directional source, off the current
+    # nearest-expiry futures contract's own OHLCV (PR1's no-roll
+    # fetchers) instead of spot — a confirmation layer, not a
+    # replacement (§1.4 recommendation #2). Default OFF, same
+    # "flag-gated new stage, later PR flips the default" pattern
+    # enable_sector_rs/enable_cv4_opportunity_weight used. See
+    # stage1_futures_market_state() in dore_engine.py.
+    "use_futures_market_state": False,
+    # DORE's own copy of utils.upstox_client.MIN_BARS_FOR_FUTURES_TREND
+    # — kept here rather than imported, so dore_engine.py stays free of
+    # any upstox_client/streamlit dependency (the same "pure, testable
+    # without live credentials" property PR1's sandbox verification
+    # relied on). Keep these two in sync by hand if either changes.
+    "fut_min_bars_for_trend":      15,
+    # Sub-weights (must sum to 100). §1.6: trend+momentum+volume (the
+    # first five, same shape as w_trend_* above) keep ~70% of the
+    # composite — scaled down proportionally from w_trend_*'s
+    # 30/20/20/20/10 — with OI/basis/execution (new confirmation-layer
+    # ingredients spot Stage 1 never had) taking the remaining 30%,
+    # 10 each.
+    "w_fut_ema_alignment":         21.0,
+    "w_fut_ema_slope":             14.0,
+    "w_fut_adx":                   14.0,
+    "w_fut_rsi":                   14.0,
+    "w_fut_volume":                 7.0,
+    "w_fut_oi":                    10.0,
+    "w_fut_basis":                 10.0,
+    "w_fut_execution":             10.0,
+    # Basis sub-score anchors — compute_futures_basis()'s (PR1)
+    # basis_annualized_pct mapped [backwardation_bear_pct,
+    # contango_bull_pct] -> [0, 100]. A monthly index/stock future
+    # normally trades at a modest positive (contango) annualized basis;
+    # a materially NEGATIVE annualized basis (backwardation) is the
+    # unusual/bearish tell, not the midpoint.
+    "fut_basis_backwardation_bear_pct": -3.0,
+    "fut_basis_contango_bull_pct":       8.0,
+
     # ── Stage 2: Execution Engine (Execution State) ──────────────
     # Intraday read, batched refresh every 1-2 min. Cached intraday only.
     "execution_ready_min":        70.0,   # Execution Score >= this -> READY_NOW
@@ -403,6 +441,19 @@ class DORESettings:
     w_trend_adx: float = 20.0
     w_trend_rsi: float = 20.0
     w_trend_volume: float = 10.0
+
+    use_futures_market_state: bool = False
+    fut_min_bars_for_trend: int = 15
+    w_fut_ema_alignment: float = 21.0
+    w_fut_ema_slope: float = 14.0
+    w_fut_adx: float = 14.0
+    w_fut_rsi: float = 14.0
+    w_fut_volume: float = 7.0
+    w_fut_oi: float = 10.0
+    w_fut_basis: float = 10.0
+    w_fut_execution: float = 10.0
+    fut_basis_backwardation_bear_pct: float = -3.0
+    fut_basis_contango_bull_pct: float = 8.0
 
     execution_ready_min: float = 70.0
     execution_breakout_min: float = 55.0
