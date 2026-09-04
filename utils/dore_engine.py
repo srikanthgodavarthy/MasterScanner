@@ -92,23 +92,15 @@ BEARISH = "BEARISH"
 NEUTRAL = "NEUTRAL"
 ALL_DIRECTIONAL_INTENTS = {BULLISH, BEARISH, NEUTRAL}
 
-# NSE/BSE list weekly options only on NIFTY (NSE, weekly) and SENSEX
-# (BSE, weekly) — every other underlying, including BANKNIFTY, is
-# monthly-only. SEBI's Oct 2024 circular restricted weekly expiry to
-# ONE index per exchange, effective 20 Nov 2024; BANKNIFTY's own weekly
-# contracts were discontinued that same date (last BANKNIFTY weekly
-# expiry: 20 Nov 2024) and it now trades monthly + quarterly only, same
-# as individual stocks (OPTSTK). fetch_stock_atm_option() only ever
-# fetches ONE nearest expiry (expiries[0] — this month's) for stocks —
+# NSE lists weekly options only on these three (NIFTY/SENSEX weekly, plus
+# BANKNIFTY historically) — every other underlying (individual stocks,
+# OPTSTK) only has MONTHLY contracts. fetch_stock_atm_option() only ever
+# fetches ONE nearest expiry (expiries[0] — this month's) for stocks, so
 # there is no second "next week" chain to fall back to the way there is
-# for NIFTY/SENSEX; stage5b_strike_and_expiry() uses this set to pick
-# the right label instead of applying the weekly CURRENT_WEEK/NEXT_WEEK
-# vocabulary to a monthly-only contract (2026-07-27 fix — see its
-# docstring). BANKNIFTY removed 2026-09-03 — it was still in this set
-# claiming CURRENT_WEEK/NEXT_WEEK-eligible over a year after its weekly
-# contract stopped existing; see the else-branch below for the
-# resulting fix (it now takes the same MONTHLY path as OPTSTK).
-_WEEKLY_EXPIRY_SYMBOLS = {"NIFTY", "SENSEX"}
+# for indices; stage5b_strike_and_expiry() uses this to pick the right
+# label instead of applying the weekly CURRENT_WEEK/NEXT_WEEK vocabulary
+# to a monthly-only contract (2026-07-27 fix — see its docstring).
+_WEEKLY_EXPIRY_SYMBOLS = {"NIFTY", "SENSEX", "BANKNIFTY"}
 
 READY_NOW         = "READY_NOW"
 BREAKOUT_PENDING  = "BREAKOUT_PENDING"
@@ -303,6 +295,51 @@ class DOREInput:
 
     # ── Stage 4 (Risk Engine) — event/volatility risk inputs ─────────
     event_risk_today:  bool = False             # major macro/earnings event flagged for today
+
+    # ── Stage 1 (Futures Market State) — PR2, DORE_FUTURES_MIGRATION_PLAN_v2.md.
+    #    Populated from the current nearest-expiry futures contract's own
+    #    OHLCV/OI/5-minute chart (fetch_futures_ohlcv_upstox() et al.,
+    #    PR1 — NO roll adjustment, see that module's note). ONLY read by
+    #    stage1_futures_market_state() (gated behind
+    #    cfg.use_futures_market_state) — compute_effective_bias()'s
+    #    intraday blend and check_intraday_reversal_alert() stay
+    #    spot-only per the migration plan's §1.4 decision (b); these
+    #    fields are never consumed there. fut_available=False (the
+    #    default) is the normal state for any caller that hasn't wired
+    #    the futures fetch in yet, or a symbol with no listed futures
+    #    contract at all (fail-soft, matching resolve_futures_instrument_key()).
+    fut_available:       bool = False    # a futures contract was resolvable this poll
+    fut_ltp:             float = 0.0
+    fut_prev_close:      float = 0.0     # prior daily close on the SAME contract — feeds the
+                                           # OI long-buildup/short-buildup/covering/unwinding read
+    fut_ema9:            float = 0.0
+    fut_ema21:           float = 0.0
+    fut_ema9_slope_pct:  float = 0.0
+    fut_adx:              float = 0.0
+    fut_rsi:              float = 50.0
+    fut_atr:              float = 0.0
+    fut_rel_volume:       float = 1.0
+    fut_bars_available:   int = 0        # len() of the futures daily OHLCV actually returned —
+                                           # gates EMA21/ADX/RSI sub-scores against
+                                           # cfg.fut_min_bars_for_trend rather than silently
+                                           # scoring a too-short contract history as neutral
+    fut_oi:               float = 0.0
+    fut_oi_change:        float = 0.0    # today's OI change on the futures contract, absolute
+                                           # contracts (not %) — NOT currently populated by any
+                                           # fetcher (fetch_futures_snapshot_batch() returns only
+                                           # a point-in-time OI, no change-over-time tracker yet,
+                                           # unlike options' oi_snapshot_store) — see PR2 handoff.
+                                           # Left at 0.0/unsupplied, the OI sub-score is simply
+                                           # skipped (see stage1_futures_market_state()).
+    fut_days_to_expiry:   int = 0
+    # Same-day evidence on the FUTURES contract's own 5-minute chart
+    # (fetch_futures_intraday_5m_upstox(), PR1) — feeds
+    # stage1_futures_market_state()'s OWN execution sub-score only. This
+    # is a distinct read from Stage 2a's spot execution/VWAP fields
+    # above; neither is derived from the other.
+    fut_vwap:              float = 0.0
+    fut_fresh_crossover:   bool = False
+    fut_fresh_crossunder:  bool = False
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -617,6 +654,21 @@ class DOREResult:
     watch_quality: str = ""     # "WATCH_QUALIFIED" | "WATCH_WEAK" | ""
     waiting_for:    str = ""     # "WAITING FOR: <primary missing condition>" | ""
 
+    # [PR2, DORE_FUTURES_MIGRATION_PLAN_v2.md] Diagnostic-only —
+    # surfaces Stage 1's NEW futures-sourced read (stage1_futures_market_state(),
+    # gated behind cfg.use_futures_market_state) alongside the always-
+    # computed spot Stage 1 above, WITHOUT changing what
+    # directional_intent/trend_score display (those stay spot,
+    # unchanged). futures_market_state_available mirrors whether the
+    # futures read was actually usable this poll (False whenever the
+    # flag is off, or no futures contract was resolvable) — when True,
+    # this is also what fed compute_effective_bias()'s `trend` argument
+    # this poll instead of spot Stage 1.
+    futures_market_state_available:      bool = False
+    futures_market_state_score:          float = 50.0
+    futures_directional_intent:          str = NEUTRAL
+    futures_market_state_low_confidence: bool = False
+
     def as_dict(self) -> dict:
         d = asdict(self)
         # Back-compat aliases for callers/persisted rows still reading the
@@ -843,6 +895,38 @@ class TrendResult:
     """Stage 1 output — Directional Intent (RFC-001 §7)."""
     trend_score: float
     directional_intent: str
+    reasons: tuple = ()
+
+
+@dataclass(frozen=True)
+class FuturesMarketStateResult:
+    """New Stage 1 output (PR2, DORE_FUTURES_MIGRATION_PLAN_v2.md) — the
+    futures-sourced counterpart to TrendResult, only computed when
+    cfg.use_futures_market_state is True. Confirmation-layer design
+    (§1.4 recommendation #2): trend/momentum/volume carry the same ~70%
+    combined weight stage1_trend_engine()'s five sub-scores do today
+    (computed off the futures contract's own OHLCV instead of spot),
+    with OI/basis/execution as three NEW ingredients spot's Stage 1
+    never had (§1.6). See stage1_futures_market_state().
+
+    market_state_score/directional_intent are what compute_dore()
+    substitutes for TrendResult.trend_score/directional_intent as
+    compute_effective_bias()'s `trend` argument (and
+    check_intraday_reversal_alert()'s directional_intent argument) when
+    the flag is on AND data_available is True — NOT read by
+    compute_effective_bias()'s own same-day evidence blend, which stays
+    spot per §1.4's decision (b).
+    """
+    market_state_score: float = 50.0
+    directional_intent: str = NEUTRAL
+    data_available:      bool = False   # False when inp.fut_available is False this poll —
+                                          # compute_dore() falls back to spot Stage 1 entirely
+    low_confidence:       bool = False   # True when fut_bars_available < cfg.fut_min_bars_for_trend
+                                          # — EMA21/ADX/RSI sub-scores were excluded from the
+                                          # blend, not computed off too-short history
+    oi_score:             float = 50.0
+    basis_score:          float = 50.0
+    execution_score:      float = 50.0
     reasons: tuple = ()
 
 
@@ -1129,6 +1213,173 @@ def stage1_trend_engine(inp: DOREInput, cfg: DORESettings) -> TrendResult:
 
     reasons += _gate_lines(checks)
     return TrendResult(trend_score=trend_score, directional_intent=intent, reasons=tuple(reasons))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  STAGE 1 — FUTURES MARKET STATE  (PR2, flag-gated, confirmation layer)
+# ══════════════════════════════════════════════════════════════════
+
+def stage1_futures_market_state(inp: DOREInput, cfg: DORESettings) -> FuturesMarketStateResult:
+    """Futures-sourced Stage 1 (PR2, DORE_FUTURES_MIGRATION_PLAN_v2.md
+    §1.3/§1.6) — a confirmation layer, not a replacement trend engine
+    (§1.4 recommendation #2): trend/momentum/volume mirror
+    stage1_trend_engine()'s own EMA-alignment/slope/ADX/RSI/volume
+    blend, computed off the CURRENT nearest-expiry futures contract's
+    own OHLCV (inp.fut_*, populated from fetch_futures_ohlcv_upstox() —
+    no roll adjustment, PR1) instead of spot, plus three ingredients
+    spot's Stage 1 never had:
+      - OI: long-buildup / short-buildup / short-covering / long-
+        unwinding, read off fut_oi_change's sign against the contract's
+        own day's price direction (fut_ltp vs fut_prev_close) — standard
+        futures OI-price interpretation. Currently near-always skipped
+        in production (see DOREInput.fut_oi_change's docstring — no
+        fetcher populates it yet); PR3's OI/price-divergence work on
+        Stage 3 is the more rigorous long-term home for this read.
+      - Basis: compute_futures_basis()'s (PR1) annualized futures-vs-
+        spot premium — normal contango reads neutral-to-bullish,
+        backwardation reads bearish.
+      - Execution: VWAP side + fresh EMA cross on the futures
+        contract's OWN 5-minute chart (fut_vwap/fut_fresh_crossover/
+        fut_fresh_crossunder) — a distinct read from Stage 2a's spot
+        execution score; neither is derived from the other.
+
+    Only meaningful when cfg.use_futures_market_state is True
+    (compute_dore() gates the call) — fail-soft to a neutral,
+    data_available=False result when inp.fut_available is False (no
+    resolvable futures contract for this symbol this poll), so
+    compute_dore() can fall back to spot Stage 1 rather than silently
+    scoring missing data as a real directional read.
+    """
+    if not inp.fut_available:
+        return FuturesMarketStateResult(
+            data_available=False,
+            reasons=("Futures contract not available for this symbol/poll — "
+                      "Stage 1 falls back to spot Trend Engine",),
+        )
+
+    reasons: list[str] = []
+    low_confidence = 0 < inp.fut_bars_available < cfg.fut_min_bars_for_trend
+    if low_confidence:
+        reasons.append(f"Futures contract has only {inp.fut_bars_available} bar(s) of history "
+                        f"(< {cfg.fut_min_bars_for_trend:.0f} floor) — EMA21/ADX/RSI sub-scores "
+                        f"excluded, not scored at a distorted/neutral value")
+
+    parts: list[tuple[float, float]] = []
+
+    # ── trend/momentum — same shape as stage1_trend_engine(), off the
+    #    futures contract's own OHLCV ────────────────────────────────
+    if not low_confidence:
+        fut_ema_bull = inp.fut_ema9 > inp.fut_ema21 > 0
+        fut_ema_bear = 0 < inp.fut_ema9 < inp.fut_ema21
+        if fut_ema_bull:
+            ema_align_score = 100.0
+            reasons.append("Futures EMA9 above EMA21 — bullish stack")
+        elif fut_ema_bear:
+            ema_align_score = 0.0
+            reasons.append("Futures EMA9 below EMA21 — bearish stack")
+        else:
+            ema_align_score = 50.0
+            reasons.append("Futures EMA9/EMA21 flat or not supplied")
+        parts.append((ema_align_score, cfg.w_fut_ema_alignment))
+
+        slope = inp.fut_ema9_slope_pct
+        if abs(slope) < cfg.trend_ema_slope_flat_pct:
+            slope_score = 50.0
+        else:
+            slope_score = _pct_score(slope, -cfg.trend_ema_slope_flat_pct * 8.0, cfg.trend_ema_slope_flat_pct * 8.0)
+        reasons.append(f"Futures EMA9 slope={slope:.3f}%/bar")
+        parts.append((slope_score, cfg.w_fut_ema_slope))
+
+        adx_score = _pct_score(inp.fut_adx, 10.0, max(cfg.trend_adx_ceiling, cfg.trend_adx_min * 1.5))
+        reasons.append(f"Futures ADX={inp.fut_adx:.1f}")
+        parts.append((adx_score, cfg.w_fut_adx))
+
+        rsi_score = _pct_score(inp.fut_rsi, cfg.trend_rsi_bear_max, cfg.trend_rsi_bull_min)
+        reasons.append(f"Futures RSI={inp.fut_rsi:.1f}")
+        parts.append((rsi_score, cfg.w_fut_rsi))
+
+    # ── volume — not gated on low_confidence; a fresh contract still
+    #    has SOME relative-volume read from whatever bars it does have ─
+    vol_score = _pct_score(inp.fut_rel_volume, cfg.trend_rel_volume_min * 0.5, cfg.trend_rel_volume_min * 1.5)
+    reasons.append(f"Futures Relative Volume={inp.fut_rel_volume:.2f}x")
+    parts.append((vol_score, cfg.w_fut_volume))
+
+    # ── OI: long-buildup / short-buildup / short-covering / long-
+    #    unwinding, off fut_oi_change + the contract's own day's price
+    #    direction ───────────────────────────────────────────────────
+    oi_score = 50.0
+    if inp.fut_oi_change != 0.0 and inp.fut_ltp > 0 and inp.fut_prev_close > 0:
+        price_up = inp.fut_ltp > inp.fut_prev_close
+        oi_up = inp.fut_oi_change > 0
+        if price_up and oi_up:
+            oi_score, oi_label = 100.0, "Long Buildup"
+        elif price_up and not oi_up:
+            oi_score, oi_label = 65.0, "Short Covering"
+        elif not price_up and oi_up:
+            oi_score, oi_label = 0.0, "Short Buildup"
+        else:
+            oi_score, oi_label = 35.0, "Long Unwinding"
+        reasons.append(f"Futures OI read: {oi_label} (OI {inp.fut_oi_change:+.0f}, "
+                        f"price {'up' if price_up else 'down'} vs prior close)")
+        parts.append((oi_score, cfg.w_fut_oi))
+    else:
+        reasons.append("Futures OI change or prior close not supplied — OI read skipped")
+
+    # ── Basis: compute_futures_basis()'s (PR1) annualized futures-vs-
+    #    spot premium — normal contango is neutral-to-mildly-bullish,
+    #    backwardation reads bearish ────────────────────────────────
+    basis_score = 50.0
+    if inp.fut_ltp > 0 and inp.price > 0:
+        basis = compute_futures_basis(inp.fut_ltp, inp.price, inp.fut_days_to_expiry or inp.days_to_expiry)
+        ann = basis["basis_annualized_pct"]
+        if ann is not None:
+            basis_score = _pct_score(ann, cfg.fut_basis_backwardation_bear_pct, cfg.fut_basis_contango_bull_pct)
+            reasons.append(f"Futures basis={basis['basis_pct']:+.2f}% (annualized {ann:+.1f}%)")
+            parts.append((basis_score, cfg.w_fut_basis))
+        else:
+            reasons.append("Futures basis: days_to_expiry unavailable — annualization skipped, "
+                            "basis excluded from blend")
+    else:
+        reasons.append("Futures LTP or spot price not supplied — basis read skipped")
+
+    # ── Execution: VWAP side + fresh EMA cross on the futures
+    #    contract's OWN 5-minute chart ────────────────────────────────
+    exec_parts: list[tuple[float, float]] = []
+    if inp.fut_ltp > 0 and inp.fut_vwap > 0:
+        exec_parts.append((100.0 if inp.fut_ltp > inp.fut_vwap else 0.0, 60.0))
+    if inp.fut_fresh_crossover:
+        exec_parts.append((100.0, 40.0))
+    elif inp.fut_fresh_crossunder:
+        exec_parts.append((0.0, 40.0))
+    if exec_parts:
+        execution_score = _weighted(exec_parts)
+        reasons.append(f"Futures execution (VWAP/fresh cross)={execution_score:.0f}")
+        parts.append((execution_score, cfg.w_fut_execution))
+    else:
+        execution_score = 50.0
+        reasons.append("Futures VWAP/fresh-cross not supplied — execution read skipped")
+
+    market_state_score = _weighted(parts) if parts else 50.0
+
+    if market_state_score >= cfg.trend_bullish_score_min:
+        intent = BULLISH
+    elif market_state_score <= cfg.trend_bearish_score_max:
+        intent = BEARISH
+    else:
+        intent = NEUTRAL
+
+    reasons.append(f"Futures Market State Score={market_state_score:.1f} -> {intent}")
+
+    return FuturesMarketStateResult(
+        market_state_score=market_state_score,
+        directional_intent=intent,
+        data_available=True,
+        low_confidence=low_confidence,
+        oi_score=oi_score,
+        basis_score=basis_score,
+        execution_score=execution_score,
+        reasons=tuple(reasons),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2818,29 +3069,22 @@ def stage5b_strike_and_expiry(
             + ")"
         )
     else:
-        # Monthly-only underlyings: individual-stock options (OPTSTK) —
-        # always were — and, as of 2026-09-03, BANKNIFTY too (see
-        # _WEEKLY_EXPIRY_SYMBOLS above — its weekly contract was
-        # discontinued 20 Nov 2024; it's been monthly+quarterly-only
-        # since). Both fetch_stock_atm_option() and the index OI/chain
-        # fetch only ever pull the ONE nearest (current-month) expiry
-        # for these — there is no second "next week" chain behind it —
-        # so labeling this NEXT_WEEK when Execution Score is weak would
-        # claim a contract that was never actually fetched, and the
-        # strike/premium shown would silently still be the current
-        # month's. Always label it what it actually is; a weak Execution
-        # Score this close to expiry becomes a reason/warning about
-        # theta risk instead of a fabricated rollover.
+        # Individual-stock options (OPTSTK) are monthly-only on NSE.
+        # fetch_stock_atm_option() only ever fetches the ONE nearest
+        # (current-month) expiry — there is no second "next week" chain
+        # behind it — so labeling this NEXT_WEEK when Execution Score is
+        # weak would claim a contract that was never actually fetched,
+        # and the strike/premium shown would silently still be the
+        # current month's. Always label it what it actually is; a weak
+        # Execution Score this close to expiry becomes a reason/warning
+        # about theta risk instead of a fabricated rollover.
         expiry = "MONTHLY"
-        _is_stock = inp.symbol.upper() not in {"NIFTY", "SENSEX", "BANKNIFTY"}
-        _underlying_desc = "stock option" if _is_stock else "monthly-only index (no weekly contract)"
         if inp.days_to_expiry <= cfg.expiry_days_scalp_max and not scalp_ok:
             reasons.append(f"{inp.days_to_expiry}d to expiry on the current-month contract with "
                             f"Execution Score={execution_score:.0f} — meaningful theta-decay risk this "
-                            f"close to expiry; no next-month chain to roll into for a {_underlying_desc}")
+                            f"close to expiry; no next-month chain to roll into for a stock option")
         else:
-            reasons.append(f"{inp.days_to_expiry}d to expiry — current-month contract "
-                            f"({_underlying_desc.capitalize()}, monthly-only on NSE)")
+            reasons.append(f"{inp.days_to_expiry}d to expiry — current-month contract (stocks are monthly-only on NSE)")
     return strike_type, expiry, suggested_strike, itm_steps, reasons
 
 
@@ -2855,8 +3099,38 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     cfg = settings or DORESettings.from_dict(DORE_DEFAULTS)
 
     trend = stage1_trend_engine(inp, cfg)
-    reversal_alert = check_intraday_reversal_alert(inp, cfg, trend.directional_intent)
-    effective_bias = compute_effective_bias(inp, cfg, trend, reversal_alert)
+
+    # [PR2, DORE_FUTURES_MIGRATION_PLAN_v2.md §1.4; PR2.5 revised the
+    # gating] Futures Market State — a new Stage 1 daily-directional
+    # source. ALWAYS computed (cheap — pure math over inp.fut_*, no
+    # fetch of its own) so its diagnostics land on DOREResult and are
+    # observable even while the flag is off (PR2.5's whole point — watch
+    # real futures reads on indices before letting them influence a
+    # live recommendation). Only its EFFECT — substituting for spot
+    # Stage 1 as compute_effective_bias()'s `trend` argument AND
+    # check_intraday_reversal_alert()'s directional_intent argument — is
+    # gated behind cfg.use_futures_market_state (default False) AND
+    # requires a futures contract actually being available this poll.
+    # Spot Stage 1 (`trend` above) is STILL always what
+    # DOREResult.directional_intent/trend_score display (unchanged), and
+    # it's the automatic fallback whenever the futures read isn't
+    # available for this symbol/poll — fail-soft, a name missing its
+    # futures wiring must not silently go directionless.
+    # compute_effective_bias()'s own intraday blend and
+    # check_intraday_reversal_alert() are UNCHANGED, spot, in both flag
+    # states (§1.4 decision (b) — same-day options-buying timing tracks
+    # the underlying's own print, not the futures contract's).
+    futures_state = stage1_futures_market_state(inp, cfg)
+    daily_source = trend
+    if cfg.use_futures_market_state and futures_state.data_available:
+        daily_source = TrendResult(
+            trend_score=futures_state.market_state_score,
+            directional_intent=futures_state.directional_intent,
+            reasons=futures_state.reasons,
+        )
+
+    reversal_alert = check_intraday_reversal_alert(inp, cfg, daily_source.directional_intent)
+    effective_bias = compute_effective_bias(inp, cfg, daily_source, reversal_alert)
     effective_intent = effective_bias.effective_intent
 
     # [2026-08-11, DORE_DUAL_CONFIRMATION] Two independent Stage 2 paths
@@ -2935,7 +3209,8 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     if direction is not None and not deriv.premium_strengthening:
         warnings.append("Premium Behaviour not confirmed — option premium hasn't started strengthening yet")
 
-    reasons = (list(trend.reasons) + list(effective_bias.reasons) + list(execution.reasons)
+    reasons = (list(trend.reasons) + list(futures_state.reasons)
+               + list(effective_bias.reasons) + list(execution.reasons)
                + list(pre_breakout.reasons) + list(deriv.reasons)
                + list(oi_intel.reasons) + list(risk.reasons) + list(opportunity.reasons) + strike_reasons
                + list(trade_plan.reasons))
@@ -2997,6 +3272,10 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
         warnings=warnings,
         watch_quality=watch_explanation.watch_quality,
         waiting_for=watch_explanation.waiting_for,
+        futures_market_state_available=futures_state.data_available,
+        futures_market_state_score=round(futures_state.market_state_score, 1),
+        futures_directional_intent=futures_state.directional_intent,
+        futures_market_state_low_confidence=futures_state.low_confidence,
     )
 
     return result
@@ -3088,6 +3367,94 @@ def compute_trend_features(daily_df, cfg: Optional[DORESettings] = None) -> dict
         return {}
 
 
+def compute_futures_trend_features(fut_daily_df, cfg: Optional[DORESettings] = None) -> dict:
+    """Futures counterpart to compute_trend_features() — same EMA9/
+    EMA21/ADX/RSI/ATR/relative-volume extraction, off a futures
+    contract's own daily OHLCV (fetch_futures_ohlcv_upstox(), PR1)
+    instead of spot.
+
+    Deliberately NOT a call to compute_trend_features() with a smaller
+    min-length check bolted on: that function's internal rolling windows
+    (14-bar ADX/RSI/ATR, 20-bar relative-volume) are sized for spot's
+    multi-month history and would silently return all-NaN (-> 0.0/50.0
+    fallback) on a mid-cycle futures contract's ~15-25 bars. This
+    version scales every rolling window down to whatever history is
+    actually available (capped at the same 14/20-bar ceiling spot uses).
+
+    Unlike compute_trend_features()'s `len(daily_df) < 30` cutoff, this
+    only requires >= 2 bars to return SOMETHING (a fresh contract's very
+    first days still get an EMA/slope read) — it does NOT itself decide
+    "is this enough history to trust"; that's stage1_futures_market_state()'s
+    job, via cfg.fut_min_bars_for_trend and the returned fut_bars_available
+    count, same "don't silently score missing data as neutral" pattern
+    used throughout dore_engine.py. Returns {} only on a hard failure or
+    fewer than 2 bars (can't compute even a 1-bar slope).
+    """
+    if fut_daily_df is None or len(fut_daily_df) < 2:
+        return {}
+    try:
+        import pandas as pd
+        cfg = cfg or DORESettings()
+        n = len(fut_daily_df)
+
+        def _window(ceiling: int) -> int:
+            return max(2, min(ceiling, n - 1))
+
+        close = fut_daily_df["close"].astype(float)
+        high = fut_daily_df["high"].astype(float)
+        low = fut_daily_df["low"].astype(float)
+        volume = fut_daily_df["volume"].astype(float) if "volume" in fut_daily_df.columns else None
+
+        ema9 = close.ewm(span=cfg.ema_fast_period, adjust=False).mean()
+        ema21 = close.ewm(span=cfg.ema_slow_period, adjust=False).mean()
+        ema9_prev = ema9.iloc[-2] if len(ema9) > 1 else ema9.iloc[-1]
+        ema9_slope_pct = ((ema9.iloc[-1] - ema9_prev) / ema9_prev * 100.0) if ema9_prev else 0.0
+
+        rsi_w = _window(14)
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(rsi_w).mean()
+        loss = (-delta.clip(upper=0)).rolling(rsi_w).mean()
+        rs = gain / loss.replace(0, 1e-9)
+        rsi = 100 - (100 / (1 + rs))
+
+        atr_w = _window(14)
+        tr = pd.concat([
+            (high - low),
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs(),
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(atr_w).mean()
+
+        plus_dm = (high.diff()).clip(lower=0)
+        minus_dm = (-low.diff()).clip(lower=0)
+        plus_di = 100 * (plus_dm.rolling(atr_w).mean() / atr.replace(0, 1e-9))
+        minus_di = 100 * (minus_dm.rolling(atr_w).mean() / atr.replace(0, 1e-9))
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-9)
+        adx = dx.rolling(atr_w).mean()
+
+        rel_volume = 1.0
+        if volume is not None and n >= 3:
+            vol_w = _window(20)
+            avg_vol = volume.rolling(vol_w).mean().iloc[-1]
+            rel_volume = float(volume.iloc[-1] / avg_vol) if avg_vol else 1.0
+
+        return {
+            "fut_ema9": float(ema9.iloc[-1]),
+            "fut_ema21": float(ema21.iloc[-1]),
+            "fut_ema9_slope_pct": float(ema9_slope_pct),
+            "fut_adx": float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 0.0,
+            "fut_rsi": float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50.0,
+            "fut_atr": float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else 0.0,
+            "fut_rel_volume": rel_volume,
+            "fut_ltp": float(close.iloc[-1]),
+            "fut_prev_close": float(close.iloc[-2]) if n > 1 else 0.0,
+            "fut_bars_available": n,
+        }
+    except Exception:
+        logger.exception("compute_futures_trend_features failed")
+        return {}
+
+
 def build_dore_input(
     symbol: str,
     price: float,
@@ -3112,6 +3479,23 @@ def build_dore_input(
                                                     #  indices only. Feeds strike_chain_next so a NEXT_WEEK
                                                     #  recommendation prices off the actual NEXT_WEEK
                                                     #  contract instead of the current week's.
+    futures_trend_features: Optional[dict] = None,   # [PR2] output of compute_futures_trend_features(),
+                                                        # or equivalent — {"fut_ema9", "fut_ema21",
+                                                        # "fut_ema9_slope_pct", "fut_adx", "fut_rsi",
+                                                        # "fut_atr", "fut_rel_volume", "fut_ltp",
+                                                        # "fut_prev_close", "fut_bars_available"}.
+                                                        # None/{} -> fut_available stays False and Stage 1's
+                                                        # futures read is skipped for this symbol (fail-soft).
+    futures_snapshot: Optional[dict] = None,          # [PR2] e.g. fetch_futures_snapshot_batch()'s per-symbol
+                                                        # dict — {"ltp", "oi", "oi_change"?, "volume", "expiry"}.
+                                                        # "oi_change" is accepted but not currently populated by
+                                                        # any fetcher (see DOREInput.fut_oi_change's docstring) —
+                                                        # forward-compatible once an OI-change tracker exists.
+                                                        # Also the fallback source for fut_ltp/fut_available
+                                                        # when futures_trend_features wasn't supplied.
+    futures_execution_features: Optional[dict] = None,  # [PR2] {"fut_vwap", "fut_fresh_crossover",
+                                                        # "fut_fresh_crossunder"} — off the futures contract's
+                                                        # own 5-minute chart (fetch_futures_intraday_5m_upstox()).
 ) -> DOREInput:
     """Adapter that assembles a DOREInput purely from Market Data Layer
     objects — no MasterScanner score is read anywhere in this function
@@ -3124,7 +3508,14 @@ def build_dore_input(
     oi_resistance = oi_resistance or {}
     option_intel = option_intel or {}
     atm_chain_row_next = atm_chain_row_next or {}
+    futures_trend_features = futures_trend_features or {}
+    futures_snapshot = futures_snapshot or {}
+    futures_execution_features = futures_execution_features or {}
     nearest_expiry = oi_resistance.get("expiry", "") or atm_chain_row.get("expiry", "")
+
+    fut_ltp = futures_trend_features.get("fut_ltp", 0.0) or futures_snapshot.get("ltp", 0.0)
+    fut_available = bool(fut_ltp)
+    fut_expiry = futures_snapshot.get("expiry", "")
 
     return DOREInput(
         symbol=symbol,
@@ -3189,6 +3580,24 @@ def build_dore_input(
         iv_compression=option_intel.get("iv_compression"),
         iv_skew=option_intel.get("iv_skew"),
         term_structure_slope=option_intel.get("term_structure_slope"),
+
+        fut_available=fut_available,
+        fut_ltp=fut_ltp,
+        fut_prev_close=futures_trend_features.get("fut_prev_close", 0.0),
+        fut_ema9=futures_trend_features.get("fut_ema9", 0.0),
+        fut_ema21=futures_trend_features.get("fut_ema21", 0.0),
+        fut_ema9_slope_pct=futures_trend_features.get("fut_ema9_slope_pct", 0.0),
+        fut_adx=futures_trend_features.get("fut_adx", 0.0),
+        fut_rsi=futures_trend_features.get("fut_rsi", 50.0),
+        fut_atr=futures_trend_features.get("fut_atr", 0.0),
+        fut_rel_volume=futures_trend_features.get("fut_rel_volume", 1.0),
+        fut_bars_available=futures_trend_features.get("fut_bars_available", 0),
+        fut_oi=futures_snapshot.get("oi", 0.0),
+        fut_oi_change=futures_snapshot.get("oi_change", 0.0),
+        fut_days_to_expiry=_days_to_expiry(fut_expiry) if fut_expiry else 0,
+        fut_vwap=futures_execution_features.get("fut_vwap", 0.0),
+        fut_fresh_crossover=futures_execution_features.get("fut_fresh_crossover", False),
+        fut_fresh_crossunder=futures_execution_features.get("fut_fresh_crossunder", False),
     )
 
 
@@ -3215,6 +3624,9 @@ def build_dore_input_for_index(
                                                   # compute_index_dore()'s matching
                                                   # 2026-08-26 fix for where this
                                                   # gets populated.
+    futures_trend_features: Optional[dict] = None,   # [PR2] see build_dore_input()'s matching param
+    futures_snapshot: Optional[dict] = None,          # [PR2] see build_dore_input()'s matching param
+    futures_execution_features: Optional[dict] = None,  # [PR2] see build_dore_input()'s matching param
 ) -> Optional[DOREInput]:
     """Index-level convenience wrapper: derives Stage 1's Trend features
     from the index's own daily OHLCV via compute_trend_features(), then
@@ -3237,6 +3649,9 @@ def build_dore_input_for_index(
         event_risk_today=event_risk_today,
         option_intel=option_intel,
         atm_chain_row_next=atm_chain_row_next,
+        futures_trend_features=futures_trend_features,
+        futures_snapshot=futures_snapshot,
+        futures_execution_features=futures_execution_features,
     )
 
 
@@ -3307,9 +3722,53 @@ def compute_index_dore(index_key: str, ohlcv, oi: dict, ce_pe_chg: tuple,
         # atm_chain_row_next -> DOREInput.strike_chain_next), so nothing
         # else needs deriving here.
         atm_chain_row_next = {"strike_premiums": (oi_next or {}).get("strike_premiums") or {}}
+
+        # [PR2.5, DORE_FUTURES_MIGRATION_PLAN_v2.md — indices only, per
+        # the "stocks deferred, index wiring in scope" decision] Best-
+        # effort futures read for this index's own current-month
+        # contract. Wrapped in its own try/except, deliberately separate
+        # from the outer one: this function has been live (Market
+        # Intelligence panel, index_dore job, 60s) since before this
+        # addition, and a futures-fetch hiccup must never take down the
+        # existing spot DORE read — it just leaves futures_trend_features/
+        # futures_execution_features empty, DOREInput.fut_available stays
+        # False, and stage1_futures_market_state() fails soft exactly as
+        # designed (see compute_dore()). Known gaps, not bugs: no OI (
+        # fetch_futures_snapshot_batch() is FUTSTK-only, no index path —
+        # futures_snapshot stays {}, the OI sub-score is simply excluded,
+        # same as any symbol missing it); fut_days_to_expiry is left at
+        # its DOREInput default (0) rather than looked up here, so the
+        # basis sub-score's annualization falls back to the index
+        # OPTION's own (weekly) days_to_expiry — an approximation, since
+        # the future's own (monthly) expiry can differ — rather than the
+        # contract's real DTE; no batch fetcher needed (3 indices, direct
+        # calls, same judgment PR1 made for fetch_oi_resistance()).
+        futures_trend_features: dict = {}
+        futures_execution_features: dict = {}
+        try:
+            from utils.upstox_client import fetch_futures_ohlcv_upstox, fetch_futures_intraday_5m_upstox
+
+            fut_daily = fetch_futures_ohlcv_upstox(index_key)
+            futures_trend_features = compute_futures_trend_features(fut_daily, dore_cfg)
+
+            fut_intraday_5m = fetch_futures_intraday_5m_upstox(index_key)
+            if fut_intraday_5m is not None and not fut_intraday_5m.empty:
+                fut_exec_raw = execution_features_from_intraday_5m(fut_intraday_5m, dore_cfg)
+                if fut_exec_raw:
+                    futures_execution_features = {
+                        "fut_vwap": fut_exec_raw.get("vwap", 0.0),
+                        "fut_fresh_crossover": fut_exec_raw.get("fresh_crossover", False),
+                        "fut_fresh_crossunder": fut_exec_raw.get("fresh_crossunder", False),
+                    }
+        except Exception:
+            logger.warning("[DORE:%s] index futures fetch failed (non-fatal — spot Stage 1 unaffected, "
+                            "futures_market_state_available will read False)", index_key, exc_info=True)
+
         dore_input = build_dore_input_for_index(
             index_key, ohlcv, oi, atm_chain_row=atm_chain_row, execution_features=exec_features,
             atm_chain_row_next=atm_chain_row_next,
+            futures_trend_features=futures_trend_features,
+            futures_execution_features=futures_execution_features,
         )
         if not dore_input:
             return None
