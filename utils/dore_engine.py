@@ -3731,25 +3731,39 @@ def compute_index_dore(index_key: str, ohlcv, oi: dict, ce_pe_chg: tuple,
         # Intelligence panel, index_dore job, 60s) since before this
         # addition, and a futures-fetch hiccup must never take down the
         # existing spot DORE read — it just leaves futures_trend_features/
-        # futures_execution_features empty, DOREInput.fut_available stays
-        # False, and stage1_futures_market_state() fails soft exactly as
-        # designed (see compute_dore()). Known gaps, not bugs: no OI (
-        # fetch_futures_snapshot_batch() is FUTSTK-only, no index path —
-        # futures_snapshot stays {}, the OI sub-score is simply excluded,
-        # same as any symbol missing it); fut_days_to_expiry is left at
-        # its DOREInput default (0) rather than looked up here, so the
-        # basis sub-score's annualization falls back to the index
-        # OPTION's own (weekly) days_to_expiry — an approximation, since
-        # the future's own (monthly) expiry can differ — rather than the
-        # contract's real DTE; no batch fetcher needed (3 indices, direct
-        # calls, same judgment PR1 made for fetch_oi_resistance()).
+        # futures_execution_features/futures_snapshot empty,
+        # DOREInput.fut_available stays False, and
+        # stage1_futures_market_state() fails soft exactly as designed
+        # (see compute_dore()). Known gap, not a bug: no OI
+        # (fetch_futures_snapshot_batch() is FUTSTK-only, no index path —
+        # the OI sub-score is simply excluded, same as any symbol
+        # missing it).
+        #
+        # [PR2.5 follow-up, 2026-09] fut_days_to_expiry now populated via
+        # resolve_futures_instrument_expiry() — previously left at 0,
+        # which meant stage1_futures_market_state()'s basis annualization
+        # silently fell back to the index OPTION's own (weekly)
+        # days_to_expiry. Confirmed live that this was materially wrong
+        # for NIFTY specifically (weekly options, monthly-only futures
+        # post the SEBI weekly-expiry consolidation): a ~4-day fallback
+        # DTE was blowing a +0.53% raw basis up to +48.4% annualized,
+        # vs BANKNIFTY's ~8.5% off a DTE that happened to already be
+        # monthly-cadence. Using the future's own real expiry fixes both.
         futures_trend_features: dict = {}
         futures_execution_features: dict = {}
+        futures_snapshot: dict = {}
         try:
-            from utils.upstox_client import fetch_futures_ohlcv_upstox, fetch_futures_intraday_5m_upstox
+            from utils.upstox_client import (
+                fetch_futures_ohlcv_upstox, fetch_futures_intraday_5m_upstox,
+                resolve_futures_instrument_expiry,
+            )
 
             fut_daily = fetch_futures_ohlcv_upstox(index_key)
             futures_trend_features = compute_futures_trend_features(fut_daily, dore_cfg)
+
+            fut_expiry = resolve_futures_instrument_expiry(index_key)
+            if fut_expiry:
+                futures_snapshot = {"expiry": fut_expiry}
 
             fut_intraday_5m = fetch_futures_intraday_5m_upstox(index_key)
             if fut_intraday_5m is not None and not fut_intraday_5m.empty:
@@ -3768,6 +3782,7 @@ def compute_index_dore(index_key: str, ohlcv, oi: dict, ce_pe_chg: tuple,
             index_key, ohlcv, oi, atm_chain_row=atm_chain_row, execution_features=exec_features,
             atm_chain_row_next=atm_chain_row_next,
             futures_trend_features=futures_trend_features,
+            futures_snapshot=futures_snapshot,
             futures_execution_features=futures_execution_features,
         )
         if not dore_input:

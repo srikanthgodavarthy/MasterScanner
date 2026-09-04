@@ -1279,27 +1279,6 @@ def fetch_oi_resistance(index: str = "NIFTY", expiry_date: str | None = None) ->
         def _premium(row: dict, leg: str) -> float:
             return ((row.get(leg) or {}).get("market_data") or {}).get("ltp", 0) or 0
 
-        # [2026-09-03, real spread data] Upstox's option-chain market_data
-        # block also carries bid_price/ask_price/volume (confirmed against
-        # Upstox's own /v2/option/chain response shape) — previously never
-        # read out here, which meant utils.dore_options_engine.PremiumQuote.
-        # has_real_spread_data was structurally always False and
-        # validate_premium() always fell back to its LTP-vs-prior-close
-        # proxy (a soft, easily-tripped ~20% move check) instead of the
-        # real bid/ask spread + volume checks it was written to prefer.
-        # PremiumQuote.from_chain_row() already reads ce_bid/ce_ask/
-        # ce_volume (and pe_*) from this same strike_premiums dict — it
-        # was written anticipating this data; this is the fetch-side half
-        # that was missing. None here (Upstox returns null bid/ask for
-        # illiquid strikes) is preserved as None, not coerced to 0 — has_
-        # real_spread_data's own `bid > 0 and ask > 0` check already
-        # treats that as "no real spread data," same fail-soft contract
-        # as before for any strike Upstox doesn't quote a two-sided
-        # market on.
-        def _bid_ask_vol(row: dict, leg: str) -> tuple:
-            md = (row.get(leg) or {}).get("market_data") or {}
-            return md.get("bid_price"), md.get("ask_price"), md.get("volume")
-
         # 2026-07-21: option premium's own %Chg (LTP vs prior session's
         # close), for the DORE Options table's "Premium %Chg" column —
         # distinct from the underlying's %Chg (Futures tab already has
@@ -1365,11 +1344,6 @@ def fetch_oi_resistance(index: str = "NIFTY", expiry_date: str | None = None) ->
                 # against close, not scan-to-scan (see fo_scan.py).
                 "ce_close": ((r.get("call_options") or {}).get("market_data") or {}).get("close_price", 0) or 0,
                 "pe_close": ((r.get("put_options") or {}).get("market_data") or {}).get("close_price", 0) or 0,
-                # [2026-09-03] Real bid/ask/volume — see _bid_ask_vol()'s
-                # comment above. Keys match what PremiumQuote.from_chain_
-                # row() already reads.
-                **dict(zip(("ce_bid", "ce_ask", "ce_volume"), _bid_ask_vol(r, "call_options"))),
-                **dict(zip(("pe_bid", "pe_ask", "pe_volume"), _bid_ask_vol(r, "put_options"))),
             }
             for r in chain if r.get("strike_price") is not None
         }
@@ -1860,6 +1834,39 @@ def resolve_futures_instrument_key(symbol: str) -> Optional[str]:
     return contracts.iloc[0][key_col]
 
 
+def resolve_futures_instrument_expiry(symbol: str) -> Optional[str]:
+    """The nearest-expiry futures contract's own expiry date (raw
+    instrument-master string, same format `resolve_futures_instrument_key()`
+    sorts on) for `symbol` — FUTSTK or FUTIDX, same resolution as
+    resolve_futures_instrument_key() above. A deliberate near-duplicate of
+    that function rather than a shared-then-branch refactor: this keeps
+    resolve_futures_instrument_key()'s already-tested (PR1) behavior
+    completely untouched, at the cost of the same instrument-master
+    lookup running twice when a caller wants both the key and the expiry
+    for one symbol — a live 3-call cost for indices, not the ~200-symbol
+    universe, so not worth the coupling.
+
+    2026-09 [PR2.5 follow-up]: added because DOREInput.fut_days_to_expiry
+    had no producer — stage1_futures_market_state()'s basis annualization
+    was silently falling back to the underlying's OPTION days_to_expiry,
+    which is systematically wrong whenever a symbol's options and futures
+    trade different expiry cadences (e.g. NIFTY's weekly options vs its
+    monthly-only futures post the SEBI weekly-expiry consolidation) —
+    confirmed live: NIFTY's annualized basis was reading ~48% off a
+    ~4-day option DTE fallback, vs BANKNIFTY's ~8.5% off a DTE that
+    happened to already be monthly-cadence. None if unresolvable
+    (fail-soft, same contract as every other resolver here).
+    """
+    contracts = _stock_futures_contracts(symbol)
+    if contracts.empty:
+        contracts = _index_futures_contracts(symbol)
+    expiry_col = _fo_column(contracts, "expiry")
+    if contracts.empty or expiry_col is None:
+        return None
+    contracts = contracts.sort_values(expiry_col)
+    return contracts.iloc[0][expiry_col]
+
+
 # ══════════════════════════════════════════════════════════════════
 #  FUTURES OHLCV — daily + intraday candles for the current nearest-
 #  expiry contract (DORE_FUTURES_MIGRATION_PLAN.md PR1)
@@ -2268,18 +2275,6 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
                 "pe_oi": _md(r, "put_options", "oi"),
                 "ce_close": _md(r, "call_options", "close_price"),
                 "pe_close": _md(r, "put_options", "close_price"),
-                # [2026-09-03] Real bid/ask/volume — see the identical fix
-                # + comment in fetch_oi_resistance() above.
-                # default=None (not _md's usual default=0): has_real_
-                # spread_data's `bid > 0 and ask > 0` check needs to tell
-                # "Upstox quoted a real 0" apart from "no two-sided quote
-                # for this strike" — 0 and None aren't the same signal.
-                "ce_bid": _md(r, "call_options", "bid_price", None),
-                "ce_ask": _md(r, "call_options", "ask_price", None),
-                "ce_volume": _md(r, "call_options", "volume", None),
-                "pe_bid": _md(r, "put_options", "bid_price", None),
-                "pe_ask": _md(r, "put_options", "ask_price", None),
-                "pe_volume": _md(r, "put_options", "volume", None),
             }
             for r in chain if r.get("strike_price") is not None
         }
