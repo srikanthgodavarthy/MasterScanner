@@ -1887,19 +1887,47 @@ _INDEX_FUTURES_SOURCE = {
 }
 
 
+# Which literal instrument_type value(s) mean "this row is a futures
+# contract" per source file. NSE's file distinguishes FUTSTK (stock)
+# from FUTIDX (index); BSE's does NOT — its own instrument_type
+# distribution (logged by load_bse_instrument_master(), confirmed live:
+# {'CE': 6703, 'PE': 6703, 'F': 6559, 'B': 1827, 'G': 1130, 'X': 1127,
+# 'A': 699, 'XT': 449, 'M': 386, 'T': 231}) has a single generic "F" for
+# every futures contract regardless of underlying, and its other values
+# (B/G/X/A/XT/M/T) are BSE equity-segment GROUP codes (A/B/T/M-group,
+# trade-to-trade, SME, etc.) that have nothing to do with derivatives —
+# an entirely different vocabulary from NSE's, not just a different file
+# location. _index_futures_contracts() below was still hardcoding the
+# NSE-only literal "FUTIDX" even after being pointed at the BSE file, so
+# it kept matching zero rows there too. "FUT" is included defensively
+# alongside "F" in case Upstox varies the exact label (same reasoning as
+# _INDEX_FUTURES_NAME_CANDIDATES having multiple name guesses per index).
+_INDEX_FUTURES_TYPE_LABELS = {
+    "NSE": {"FUTIDX"},
+    "BSE": {"F", "FUT"},
+}
+
+
 def _index_futures_contracts(index: str) -> pd.DataFrame:
     """FUTIDX rows for `index` (one of the _INDEX_FUTURES_NAME_CANDIDATES
     keys) — the index counterpart to _stock_futures_contracts(). Picks
-    the right source file per _INDEX_FUTURES_SOURCE (NSE vs BSE), then
-    tries each name candidate in turn and returns the first non-empty
-    match; empty DataFrame if none of them hit (fail-soft, same contract
-    as the stock-side helper).
+    the right source file per _INDEX_FUTURES_SOURCE (NSE vs BSE) AND the
+    right futures instrument_type label(s) for that source (see
+    _INDEX_FUTURES_TYPE_LABELS — the two files don't share a vocabulary),
+    then tries each name candidate in turn and returns the first
+    non-empty match; empty DataFrame if none of them hit (fail-soft,
+    same contract as the stock-side helper).
 
     2026-09: previously always read load_fo_instrument_master() (NSE-
     only) regardless of index, which meant no SENSEX name candidate
     could ever match — SENSEX futures are listed on BSE, not NSE, so the
     row simply wasn't in the file being searched. See
     _BSE_INSTRUMENT_MASTER_URL's comment for the full story.
+
+    2026-09 [follow-up]: fixing the file alone wasn't enough — even
+    reading the BSE file, this was still filtering on the literal
+    "FUTIDX", which is an NSE-only label. See _INDEX_FUTURES_TYPE_LABELS
+    above for what BSE actually uses instead.
     """
     source = _INDEX_FUTURES_SOURCE.get(index.upper(), "NSE")
     df = load_bse_instrument_master() if source == "BSE" else load_fo_instrument_master()
@@ -1907,13 +1935,56 @@ def _index_futures_contracts(index: str) -> pd.DataFrame:
     name_col = _fo_column(df, "name", "underlying_symbol", "asset_symbol")
     if type_col is None or name_col is None:
         return pd.DataFrame()
-    is_futidx = df[type_col].astype(str).str.upper() == "FUTIDX"
+    fut_labels = _INDEX_FUTURES_TYPE_LABELS.get(source, {"FUTIDX"})
+    is_fut = df[type_col].astype(str).str.upper().isin(fut_labels)
     name_upper = df[name_col].astype(str).str.strip().str.upper()
     for candidate in _INDEX_FUTURES_NAME_CANDIDATES.get(index.upper(), [index.upper()]):
-        match = df[is_futidx & (name_upper == candidate)]
+        match = df[is_fut & (name_upper == candidate)]
         if not match.empty:
             return match
     return pd.DataFrame()
+
+
+def _normalize_expiry_value(raw) -> Optional[str]:
+    """Coerce one instrument-master row's `expiry` value to
+    "YYYY-MM-DD", the only shape dore_engine._days_to_expiry() accepts
+    (it does `datetime.strptime(expiry_str[:10], "%Y-%m-%d")` inside a
+    bare except-return-0). Added because BSE.json.gz's schema is
+    visibly NOT a copy of NSE.csv.gz's (extra fields like asset_key,
+    weekly, cas_eligible — see load_bse_instrument_master()), so its
+    `expiry` column's exact type/format hasn't been confirmed against
+    live data here, and Upstox's own community forum has reported epoch-
+    millisecond `expiry` values in some of their JSON instrument files
+    before. Without this, a numeric-epoch expiry would silently produce
+    fut_days_to_expiry=0 via that bare except — reintroducing the exact
+    "silently falls back to the option's own DTE" bug this whole PR2.5
+    line of fixes exists to close, just moved one layer deeper (past a
+    resolved SENSEX row instead of a missing one).
+
+    Handles: an already-correct "YYYY-MM-DD" (or longer ISO) string
+    unchanged; a numeric epoch in seconds or milliseconds (disambiguated
+    by magnitude); anything else logs a one-time warning and returns
+    None so the caller's existing None-handling applies rather than
+    silently mis-annualizing.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        s = raw.strip()
+        return s[:10] if len(s) >= 10 else (s or None)
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        try:
+            # Milliseconds if it's a big number (post-2001 dates in ms
+            # are ~13 digits; the same date in seconds is ~10 digits).
+            seconds = raw / 1000.0 if raw > 10**12 else float(raw)
+            return datetime.utcfromtimestamp(seconds).strftime("%Y-%m-%d")
+        except Exception:
+            logger.warning("[_normalize_expiry_value] numeric expiry %r out of range — "
+                            "returning None rather than guessing", raw)
+            return None
+    logger.warning("[_normalize_expiry_value] unrecognized expiry type %s (%r) — "
+                    "returning None rather than guessing", type(raw).__name__, raw)
+    return None
 
 
 def resolve_futures_instrument_key(symbol: str) -> Optional[str]:
@@ -1970,7 +2041,7 @@ def resolve_futures_instrument_expiry(symbol: str) -> Optional[str]:
     if contracts.empty or expiry_col is None:
         return None
     contracts = contracts.sort_values(expiry_col)
-    return contracts.iloc[0][expiry_col]
+    return _normalize_expiry_value(contracts.iloc[0][expiry_col])
 
 
 # ══════════════════════════════════════════════════════════════════
