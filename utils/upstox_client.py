@@ -60,6 +60,28 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://api.upstox.com"
 _INSTRUMENT_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz"
 
+# 2026-09 [SENSEX-futures fix]: Upstox publishes instrument files PER
+# EXCHANGE, not one universal file — NSE.csv.gz never has, and never will
+# have, a BSE-listed row in it. SENSEX derivatives (both futures AND
+# options) trade on BSE's F&O segment (exchange code "BFO", per Upstox's
+# own exchange appendix), which is bundled inside the BSE file, not NSE's.
+# _index_futures_contracts() below was searching NSE.csv.gz for a SENSEX
+# FUTIDX row under every name variant we could think of
+# (_INDEX_FUTURES_NAME_CANDIDATES) and always came up empty — not because
+# the name guess was wrong, but because the row was never in that file to
+# begin with. Confirmed against Upstox's docs (upstox.com/developer/
+# api-documentation/instruments): there is no separate per-segment BFO
+# file; BSE.json.gz is the one that carries it.
+#
+# JSON, not CSV: Upstox's docs also flag the CSV instrument files as
+# deprecated in favour of JSON ("Use Instruments data in JSON format
+# instead of CSV... The CSV format for instruments files is being
+# deprecated."). NSE.csv.gz above is left as-is (it's still live and
+# everything else in this module depends on its exact column names), but
+# this new BSE loader is added directly in JSON to avoid immediately
+# inheriting a format Upstox has already announced is going away.
+_BSE_INSTRUMENT_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz"
+
 # period strings this app passes around, mapped to a lookback in days.
 # Extend if a caller starts using a period not listed here (mirrors
 # scanner_engine._PERIOD_TO_YEARS).
@@ -237,6 +259,48 @@ def load_nse_instrument_master() -> pd.DataFrame:
                         "blank/truncated before; expected tens of thousands of rows for the full "
                         "NSE instrument set. Downstream universes (fo_eligible_symbols(), "
                         "resolve_instrument_key()) will be built from this same undersized data.", len(df))
+    return df
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_bse_instrument_master() -> pd.DataFrame:
+    """Downloads Upstox's BSE instrument master — the BSE counterpart to
+    load_nse_instrument_master() above, added specifically so
+    _index_futures_contracts() can find SENSEX's FUTIDX (and, if ever
+    needed, OPTIDX) rows, which live here and NOT in the NSE file (see
+    the _BSE_INSTRUMENT_MASTER_URL comment for why). Deliberately its own
+    separate cached function rather than a parameter on the NSE loader:
+    the two files are unrelated downloads with unrelated refresh/failure
+    modes, and every other caller of load_nse_instrument_master() only
+    ever wants NSE-listed rows (stocks, NIFTY, BANKNIFTY) — merging them
+    into one dataframe would make every existing `name`-based lookup in
+    this module a little more likely to collide across exchanges for no
+    benefit to those callers.
+
+    JSON (not CSV, see module-level comment above) — parsed the same
+    defensive way as the NSE loader: lowercase columns, log row count +
+    instrument_type distribution, warn on a suspiciously small file.
+    """
+    resp = requests.get(_BSE_INSTRUMENT_MASTER_URL, timeout=15)
+    resp.raise_for_status()
+    with gzip.open(io.BytesIO(resp.content)) as f:
+        df = pd.read_json(f)
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    type_col = next((c for c in ("instrument_type", "instrumenttype") if c in df.columns), None)
+    logger.info("[BSEInstrumentMaster] downloaded %d rows, %d bytes gzipped, columns=%s",
+                len(df), len(resp.content), list(df.columns))
+    if type_col is not None:
+        counts = df[type_col].astype(str).str.upper().value_counts()
+        logger.info("[BSEInstrumentMaster] instrument_type distribution (top 10): %s",
+                    counts.head(10).to_dict())
+    else:
+        logger.warning("[BSEInstrumentMaster] no instrument_type/instrumenttype column found at all — "
+                        "columns were: %s", list(df.columns))
+    if len(df) < 100:
+        logger.warning("[BSEInstrumentMaster] only %d rows — unexpectedly small for a full BSE "
+                        "instrument set. SENSEX futures/options resolution will be built from this "
+                        "same undersized data.", len(df))
     return df
 
 
@@ -1812,13 +1876,33 @@ _INDEX_FUTURES_NAME_CANDIDATES = {
 }
 
 
+# Which instrument-master loader each index's FUTIDX rows actually live
+# in. NIFTY/BANKNIFTY are NSE-listed (load_fo_instrument_master(), the
+# existing NSE file); SENSEX is BSE-listed (load_bse_instrument_master(),
+# added above) — see the _BSE_INSTRUMENT_MASTER_URL comment for why this
+# split exists. Anything not listed here defaults to the NSE file, same
+# as every stock symbol.
+_INDEX_FUTURES_SOURCE = {
+    "SENSEX": "BSE",
+}
+
+
 def _index_futures_contracts(index: str) -> pd.DataFrame:
     """FUTIDX rows for `index` (one of the _INDEX_FUTURES_NAME_CANDIDATES
-    keys) — the index counterpart to _stock_futures_contracts(). Tries
-    each name candidate in turn and returns the first non-empty match;
-    empty DataFrame if none of them hit (fail-soft, same contract as the
-    stock-side helper)."""
-    df = load_fo_instrument_master()
+    keys) — the index counterpart to _stock_futures_contracts(). Picks
+    the right source file per _INDEX_FUTURES_SOURCE (NSE vs BSE), then
+    tries each name candidate in turn and returns the first non-empty
+    match; empty DataFrame if none of them hit (fail-soft, same contract
+    as the stock-side helper).
+
+    2026-09: previously always read load_fo_instrument_master() (NSE-
+    only) regardless of index, which meant no SENSEX name candidate
+    could ever match — SENSEX futures are listed on BSE, not NSE, so the
+    row simply wasn't in the file being searched. See
+    _BSE_INSTRUMENT_MASTER_URL's comment for the full story.
+    """
+    source = _INDEX_FUTURES_SOURCE.get(index.upper(), "NSE")
+    df = load_bse_instrument_master() if source == "BSE" else load_fo_instrument_master()
     type_col = _fo_column(df, "instrument_type", "instrumenttype")
     name_col = _fo_column(df, "name", "underlying_symbol", "asset_symbol")
     if type_col is None or name_col is None:
