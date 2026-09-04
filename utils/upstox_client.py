@@ -1344,6 +1344,28 @@ def fetch_oi_resistance(index: str = "NIFTY", expiry_date: str | None = None) ->
                 # against close, not scan-to-scan (see fo_scan.py).
                 "ce_close": ((r.get("call_options") or {}).get("market_data") or {}).get("close_price", 0) or 0,
                 "pe_close": ((r.get("put_options") or {}).get("market_data") or {}).get("close_price", 0) or 0,
+                # [2026-09 fix] bid_price/ask_price are already present in
+                # this SAME market_data block Upstox returns (confirmed
+                # against Upstox's own /v2/option/chain docs) — were
+                # simply never extracted. dore_options_engine.py's
+                # PremiumQuote.from_chain_row() has been reading exactly
+                # these key names (ce_bid/ce_ask/pe_bid/pe_ask) since it
+                # was written; until now they were always absent, so
+                # validate_premium() always fell back to its blunt
+                # LTP-vs-prior-close heuristic (premium_fallback_max_move_pct,
+                # a flat 20%) instead of a real spread/volume check —
+                # which was rejecting every near-expiry index candidate on
+                # any session with real intraday movement (confirmed live,
+                # 2026-09-04: NIFTY/SENSEX/BANKNIFTY all <1% moves, but
+                # near-ATM weekly premiums swung 20-48% from gamma, well
+                # past the 20% fallback threshold). 0/None when Upstox
+                # itself doesn't have a two-sided quote for an illiquid
+                # strike — has_real_spread_data's own `> 0` check already
+                # handles that fail-soft, no extra guard needed here.
+                "ce_bid": ((r.get("call_options") or {}).get("market_data") or {}).get("bid_price", 0) or 0,
+                "ce_ask": ((r.get("call_options") or {}).get("market_data") or {}).get("ask_price", 0) or 0,
+                "pe_bid": ((r.get("put_options") or {}).get("market_data") or {}).get("bid_price", 0) or 0,
+                "pe_ask": ((r.get("put_options") or {}).get("market_data") or {}).get("ask_price", 0) or 0,
             }
             for r in chain if r.get("strike_price") is not None
         }
@@ -2275,6 +2297,16 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
                 "pe_oi": _md(r, "put_options", "oi"),
                 "ce_close": _md(r, "call_options", "close_price"),
                 "pe_close": _md(r, "put_options", "close_price"),
+                # [2026-09 fix] see the identical fix/comment in
+                # fetch_oi_resistance() above — bid_price/ask_price are
+                # already in this same market_data block, just weren't
+                # extracted, which meant validate_premium() always used
+                # its blunt LTP-vs-prior-close fallback (20% flat
+                # threshold) instead of a real spread check.
+                "ce_bid": _md(r, "call_options", "bid_price"),
+                "ce_ask": _md(r, "call_options", "ask_price"),
+                "pe_bid": _md(r, "put_options", "bid_price"),
+                "pe_ask": _md(r, "put_options", "ask_price"),
             }
             for r in chain if r.get("strike_price") is not None
         }
