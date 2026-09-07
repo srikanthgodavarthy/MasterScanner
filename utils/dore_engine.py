@@ -89,6 +89,14 @@ logger = logging.getLogger(__name__)
 
 BULLISH = "BULLISH"
 BEARISH = "BEARISH"
+
+# [PR4] The three indices Stage 0's universe always includes
+# (utils.dore_fo_screener.stage0_universe()) — duplicated here rather
+# than imported from utils.fo_scan/utils.dore_fo_screener (both import
+# FROM this module; importing back would be circular). Used only to
+# scope cfg.use_futures_market_state_indices_only's staged rollout
+# (see compute_dore()) — not a universe definition in its own right.
+_INDEX_SYMBOLS = ("NIFTY", "SENSEX", "BANKNIFTY")
 NEUTRAL = "NEUTRAL"
 ALL_DIRECTIONAL_INTENTS = {BULLISH, BEARISH, NEUTRAL}
 
@@ -3169,7 +3177,8 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     # live recommendation). Only its EFFECT — substituting for spot
     # Stage 1 as compute_effective_bias()'s `trend` argument AND
     # check_intraday_reversal_alert()'s directional_intent argument — is
-    # gated behind cfg.use_futures_market_state (default False) AND
+    # gated behind cfg.use_futures_market_state (True as of PR4) AND
+    # cfg.use_futures_market_state_indices_only's scope check below AND
     # requires a futures contract actually being available this poll.
     # Spot Stage 1 (`trend` above) is STILL always what
     # DOREResult.directional_intent/trend_score display (unchanged), and
@@ -3180,9 +3189,18 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     # check_intraday_reversal_alert() are UNCHANGED, spot, in both flag
     # states (§1.4 decision (b) — same-day options-buying timing tracks
     # the underlying's own print, not the futures contract's).
+    # [PR4] Master flag now True (see dore_settings.py), but the actual
+    # effect is scoped to indices only for now via
+    # use_futures_market_state_indices_only (default True) — a stock
+    # symbol falls through to spot exactly as if the master flag were
+    # still False, until that scope flag is turned off in a later PR.
+    futures_scope_ok = (
+        not cfg.use_futures_market_state_indices_only
+        or inp.symbol in _INDEX_SYMBOLS
+    )
     futures_state = stage1_futures_market_state(inp, cfg)
     daily_source = trend
-    if cfg.use_futures_market_state and futures_state.data_available:
+    if cfg.use_futures_market_state and futures_scope_ok and futures_state.data_available:
         daily_source = TrendResult(
             trend_score=futures_state.market_state_score,
             directional_intent=futures_state.directional_intent,

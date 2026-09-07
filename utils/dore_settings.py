@@ -97,11 +97,28 @@ DORE_DEFAULTS: dict = {
     # Flag-gated NEW Stage 1 daily-directional source, off the current
     # nearest-expiry futures contract's own OHLCV (PR1's no-roll
     # fetchers) instead of spot — a confirmation layer, not a
-    # replacement (§1.4 recommendation #2). Default OFF, same
-    # "flag-gated new stage, later PR flips the default" pattern
-    # enable_sector_rs/enable_cv4_opportunity_weight used. See
-    # stage1_futures_market_state() in dore_engine.py.
-    "use_futures_market_state": False,
+    # replacement (§1.4 recommendation #2).
+    # [PR4, 2026-09-07] Flipped True — but see
+    # use_futures_market_state_indices_only immediately below, which
+    # scopes the actual effect to indices only for now. Internal Stage 1
+    # sub-weights (w_fut_*) and Stage 3's futures-divergence read (PR3)
+    # have not yet been validated against live data for individual
+    # stocks; indices are the lower-risk, lower-count (3 symbols) surface
+    # to observe first. Same "flag-gated new stage, later PR flips the
+    # default" pattern enable_sector_rs/enable_cv4_opportunity_weight
+    # used. See stage1_futures_market_state() in dore_engine.py.
+    "use_futures_market_state": True,
+    # [PR4] Staged-rollout scope for the flag above. True (default):
+    # compute_dore()'s use_futures_market_state effect only fires for
+    # inp.symbol in dore_engine._INDEX_SYMBOLS (NIFTY/BANKNIFTY/SENSEX)
+    # — every stock still falls through to spot Stage 1 regardless of
+    # the master flag, exactly as if use_futures_market_state were still
+    # False for them. Set False once stock-level results have been
+    # observed for long enough to trust the w_fut_*/basis/divergence
+    # reads on individual names too (PR4's own follow-up, not scoped
+    # here) — this is the switch that removes the "indices first" guard
+    # rail, not a second independent on/off toggle.
+    "use_futures_market_state_indices_only": True,
     # DORE's own copy of utils.upstox_client.MIN_BARS_FOR_FUTURES_TREND
     # — kept here rather than imported, so dore_engine.py stays free of
     # any upstox_client/streamlit dependency (the same "pure, testable
@@ -477,7 +494,8 @@ class DORESettings:
     w_trend_rsi: float = 20.0
     w_trend_volume: float = 10.0
 
-    use_futures_market_state: bool = False
+    use_futures_market_state: bool = True
+    use_futures_market_state_indices_only: bool = True
     fut_min_bars_for_trend: int = 15
     w_fut_ema_alignment: float = 21.0
     w_fut_ema_slope: float = 14.0
