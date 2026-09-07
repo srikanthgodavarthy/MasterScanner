@@ -62,6 +62,22 @@ MOMENTUM_MIN_VOL_RATIO = 1.5   # today's volume vs 20-bar avg
 MOMENTUM_TOP_N_RANK    = 20    # OR: must rank in today's top N gainers
                                 # (either this or the flat %chg floor
                                 # above qualifies — see is_momentum_qualified)
+                                #
+                                # [2026-09-07] NOT currently exercised by
+                                # the live scanner path. scanner_engine.py's
+                                # _enrich_with_momentum_persistence() calls
+                                # is_momentum_qualified() with rank_today=
+                                # None, because production's run_scanner()
+                                # processes ~25-symbol batches (confirmed
+                                # from deployed logs), and a rank computed
+                                # from one batch isn't a day-wide rank — see
+                                # that function's docstring for the full
+                                # writeup. This constant/parameter still
+                                # works correctly if a caller has a genuine
+                                # full-day frame (e.g. an offline pass over
+                                # scan_daily_archive after all batches for
+                                # the day have completed) — it just isn't
+                                # wired to one yet.
 
 # ATR multiples for the frozen trade levels. Tighter and faster than
 # LS/PB's structural swing levels on purpose — see the 5-day aging

@@ -3374,13 +3374,39 @@ def _enrich_with_momentum_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
 
     Designed to be a silent no-op when Supabase is unavailable, same
     contract as _enrich_with_setup_persistence().
+
+    [2026-09-07, bug found from production logs] `run_scanner()` — the
+    function this is called from — runs once per ~25-symbol batch in
+    production (scan_worker's live_scanner sub-scheduler processes 501
+    symbols as 21 batches of ~25, confirmed from deployed logs showing
+    "run_scanner returning X/25 symbols this batch" per batch). This
+    function's `df_out` is therefore ONE BATCH, never the full day's
+    universe. The original version of this function ranked `df_out`'s
+    "%Chg" locally and used that as a second qualification path
+    alongside the flat %chg floor (MOMENTUM_TOP_N_RANK) — but "top 20 of
+    a 25-symbol batch" is true for 80% of any batch, so that rank check
+    was not a real filter in production; it was silently near-always-
+    true. Caught by reading a real deployed log, not by inspection or
+    the unit tests written earlier (those called this function directly
+    with small hand-built DataFrames, which never exercised the real
+    batched call path from run_scanner() and so never surfaced this).
+    Fixed by dropping the rank-based path from live qualification
+    entirely — momentum_engine.is_momentum_qualified() is still called
+    with rank_today=None here, same as score_stock()'s provisional
+    check, so qualification now rests solely on the volume-confirmed
+    %chg floor (MOMENTUM_MIN_PCT_CHG + MOMENTUM_MIN_VOL_RATIO), which is
+    correct regardless of batch boundaries. A genuine day-wide rank
+    check would need to run AFTER all 21 batches complete (e.g. off
+    scan_snapshots/scan_daily_archive once a day's scan is done) rather
+    than per-batch inside run_scanner() — not implemented here; left as
+    a follow-up rather than solved partially/incorrectly in this pass.
     """
     import logging as _log
     _logger = _log.getLogger(__name__)
 
     _mom_cols = ["MomSetupID", "MomPlanStatus", "MomEntryLocked", "MomSLLocked",
                  "MomT1Locked", "MomT2Locked", "MomSetupAge", "MomTradePlanStatus",
-                 "MomQualifiedFinal", "MomRank"]
+                 "MomQualifiedFinal"]
 
     try:
         from utils.supabase_client import (
@@ -3402,12 +3428,12 @@ def _enrich_with_momentum_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
                                                                           # scan category" is source-
                                                                           # agnostic by its own definition
 
-        # Day-wide rank of today's %Chg (1 = biggest gainer) — this is
-        # the piece score_stock() couldn't compute per-symbol (it only
-        # ever sees one symbol at a time). This is the FINAL
-        # qualification check; the "MomQualified" column from
-        # score_stock() was provisional (pct_chg-floor path only).
-        rank_series = df_out["%Chg"].fillna(-999).rank(ascending=False, method="min").astype(int)
+        # [2026-09-07] No rank-based qualification here — see this
+        # function's docstring. df_out is one ~25-symbol batch in
+        # production, not the day's full universe, so a rank computed
+        # from it would not mean what MOMENTUM_TOP_N_RANK intends.
+        # Qualification below rests solely on the batch-independent
+        # volume-confirmed %chg floor (rank_today=None throughout).
 
         today_str = __import__("datetime").date.today().isoformat()
         updated_plans = []
@@ -3422,12 +3448,10 @@ def _enrich_with_momentum_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
                     mom_out_cols[c].append("")
                 continue
 
-            rank_today = int(rank_series.loc[idx]) if idx in rank_series.index else None
-
             final = is_momentum_qualified(
                 pct_chg=row.get("%Chg", 0), vol_ratio=row.get("VolRatio", 0),
                 close=row.get("Entry", 0), day_high=row.get("High", 0), day_low=row.get("Low", 0),
-                rank_today=rank_today, top_n_rank=MOMENTUM_TOP_N_RANK,
+                rank_today=None, top_n_rank=MOMENTUM_TOP_N_RANK,
             )
             if final.qualified:
                 qualified_count += 1
@@ -3459,7 +3483,6 @@ def _enrich_with_momentum_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
             mom_out_cols["MomSetupAge"].append(plan_out.setup_age)
             mom_out_cols["MomTradePlanStatus"].append(plan_out.trade_plan_status)
             mom_out_cols["MomQualifiedFinal"].append(final.qualified)
-            mom_out_cols["MomRank"].append(rank_today)
 
         for c in _mom_cols:
             df_out[c] = mom_out_cols[c]
