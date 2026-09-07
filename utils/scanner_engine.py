@@ -2771,6 +2771,7 @@ def run_scanner(
     source:      str  = "yfinance",
     source_warn_cb    = None,
     nifty_series: "pd.Series | None" = None,
+    enrich_setup_persistence: bool = True,
 ) -> pd.DataFrame:
     """
     Two-phase scanner.
@@ -2799,6 +2800,19 @@ def run_scanner(
     identically everywhere (which would have been easier to notice).
     Passing one already-fetched, already-deduped Series in for the whole
     cycle removes that per-batch lottery entirely.
+
+    enrich_setup_persistence: [2026-09-03] Default True (one-shot callers
+    like the manual "Run Scan" button keep prior behavior — persistence
+    runs inline, once, on the whole universe). scheduler/scan_worker.py's
+    live-scanner sub-scheduler passes False here because it calls
+    run_scanner() once per ~25-symbol batch: running
+    _enrich_with_setup_persistence()/_enrich_with_momentum_persistence()
+    at that scope 20x/cycle was both wasteful (repeated Supabase reads)
+    and unable to actually recover/qualify anything, since those passes
+    need visibility across the full scanned universe, not just one
+    batch. scan_worker.py instead runs both, once, at cycle level on the
+    merged ~501-symbol frame after every batch has completed — see the
+    "end of batches loop" comments there.
     """
     def _warn(msg: str) -> None:
         if source_warn_cb:
@@ -3128,15 +3142,20 @@ def run_scanner(
     # ── Setup Persistence (frozen trade plans) ────────────────────
     # Entry / SL / Targets are LOCKED on first Actionable detection.
     # Subsequent scans READ frozen levels — no daily drift.
-    df_out = _enrich_with_setup_persistence(df_out, all_data, fetch_source=fetch_source)
-
+    #
     # ── Momentum Persistence (independent setup source) ────────────
     # [2026-09-05, SG request] Deliberately a SEPARATE call, not folded
     # into _enrich_with_setup_persistence() above — that function (and
     # enrich_scanner_row() inside it) is the CV4/Recommendation-gated
     # path; Momentum must never route through it. See
     # _enrich_with_momentum_persistence()'s docstring below for why.
-    df_out = _enrich_with_momentum_persistence(df_out)
+    #
+    # [2026-09-03] Both skipped here when enrich_setup_persistence=False
+    # — see this function's docstring. scheduler/scan_worker.py runs
+    # both itself, once, at cycle level on the full merged universe.
+    if enrich_setup_persistence:
+        df_out = _enrich_with_setup_persistence(df_out, all_data, fetch_source=fetch_source)
+        df_out = _enrich_with_momentum_persistence(df_out)
 
     return df_out
 
