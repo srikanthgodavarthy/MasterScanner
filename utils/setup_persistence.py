@@ -102,7 +102,31 @@ _FREEZE_CATEGORIES = {"Elite", "Execute", "Actionable"}
 # is force-closed at the next scan that observes it, so a position can't
 # sit open indefinitely just because price never touched either level.
 # See _advance_lifecycle_step()'s ACTIVE/T1_HIT branches below.
-MAX_SETUP_AGE_DAYS = 20
+#
+# [2026-09-05, SG request — Momentum bucket] Per-source lookup instead
+# of one flat constant. LS/PB keep their original 20-day window
+# unchanged (same value, same behaviour, zero regression). MOM gets a
+# much shorter 5-day window on purpose — momentum/gap setups decay
+# fast; leaving one open for 20 days like a swing trade would just let
+# a dead gap-and-fade sit there. Any source not listed here falls back
+# to the LS/PB default via .get(), so a future new source can't
+# accidentally get an unbounded holding period just by being absent
+# from this dict.
+MAX_SETUP_AGE_DAYS_BY_SOURCE = {
+    "LS":  20,
+    "PB":  20,
+    "MOM": 5,
+}
+_DEFAULT_MAX_SETUP_AGE_DAYS = 20
+
+def _max_setup_age_days(source: str) -> int:
+    return MAX_SETUP_AGE_DAYS_BY_SOURCE.get(str(source or "LS"), _DEFAULT_MAX_SETUP_AGE_DAYS)
+
+# Deprecated alias — kept only so any external/legacy code still
+# reading the old flat constant name doesn't hard-crash on import.
+# Nothing in this module reads it anymore; all four call sites below
+# now go through _max_setup_age_days(plan.source) instead.
+MAX_SETUP_AGE_DAYS = _DEFAULT_MAX_SETUP_AGE_DAYS
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -327,14 +351,32 @@ class SetupPlan:
 #  SETUP ID  — deterministic, collision-resistant
 # ══════════════════════════════════════════════════════════════════
 
-def _make_setup_id(symbol: str, first_actionable_date: str) -> str:
+def _make_setup_id(symbol: str, first_actionable_date: str, source: str = "LS") -> str:
     """
-    Deterministic setup ID: SHA1(symbol|date)[:12].
-    Stable across scanner restarts — same symbol + same date always produces
-    the same ID. If a stock re-enters Actionable after a plan closes/expires,
-    the new date produces a new ID (a fresh plan, not a resurrection).
+    Deterministic setup ID: SHA1(symbol|date|source)[:12].
+    Stable across scanner restarts — same symbol + same date + same
+    source always produces the same ID. If a stock re-enters Actionable
+    after a plan closes/expires, the new date produces a new ID (a
+    fresh plan, not a resurrection).
+
+    [2026-09-05, SG request — Momentum bucket, collision fix] `source`
+    is now part of the hash. Without it, an LS plan and a same-day MOM
+    plan minted on the same symbol would hash to the IDENTICAL ID (old
+    formula only used symbol|date) — since setup_id is the upsert key,
+    the second mint would silently overwrite the first plan's DB row
+    instead of the two coexisting as independent plans, exactly the bug
+    the independent-source requirement was meant to avoid. Caught by
+    testing the actual mint path before calling this wired in, not by
+    inspection alone.
+
+    Existing stored rows are UNAFFECTED — a plan's setup_id is computed
+    once at mint time and only ever referenced afterward (advance_
+    lifecycle() etc. never recompute it), so this change only affects
+    IDs for plans minted from this point forward. Old LS/PB rows keep
+    their pre-existing IDs (computed under the old symbol|date-only
+    formula) forever; there is no migration to run.
     """
-    raw = f"{symbol.upper().strip()}|{first_actionable_date}"
+    raw = f"{symbol.upper().strip()}|{first_actionable_date}|{str(source or 'LS').upper().strip()}"
     return hashlib.sha1(raw.encode()).hexdigest()[:12]
 
 
@@ -355,23 +397,28 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _format_setup_age(days: int, status: str) -> str:
+def _format_setup_age(days: int, status: str, source: str = "LS") -> str:
     """
     Human-readable age/status label for the freshness badge.
       WAITING  0-3d   → "🟢 Fresh (Nd)"
       WAITING  4-7d   → "🟡 Late (Nd)"
-      WAITING  8-20d  → "🟠 Aging (Nd)"
+      WAITING  8-Nd   → "🟠 Aging (Nd)"   (N = that source's aging window)
       ACTIVE          → "🟢 Active (Nd)"
       T1_HIT          → "🎯 T1 Hit (Nd)"
       CLOSED          → "⚪ Closed (Nd)"
       EXPIRED         → "🔴 Expired (Nd)"
+
+    [2026-09-05] Takes `source` so the EXPIRED cutoff below uses that
+    source's own aging window (LS/PB=20d, MOM=5d) instead of one flat
+    constant. Defaults to "LS" for any old call site not yet passing
+    source through — identical 20d behaviour to before this change.
     """
     s = _sval(status)
     if s == SetupPlanStatus.NO_PLAN:
         return "—"
     if s == SetupPlanStatus.CLOSED:
         return f"⚪ Closed ({days}d)"
-    if s == SetupPlanStatus.EXPIRED or days > MAX_SETUP_AGE_DAYS:
+    if s == SetupPlanStatus.EXPIRED or days > _max_setup_age_days(source):
         return f"🔴 Expired ({days}d)"
     if s == SetupPlanStatus.T1_HIT:
         return f"🎯 T1 Hit ({days}d)"
@@ -463,7 +510,7 @@ def _advance_lifecycle_step(
             plan.status, plan.status_reason = SetupPlanStatus.ACTIVE, reason
             plan.activated_at = today_str
             return True, reason
-        if days > MAX_SETUP_AGE_DAYS:
+        if days > _max_setup_age_days(plan.source):
             reason = f"Expired after {days}d — entry never triggered"
             plan.status, plan.status_reason = SetupPlanStatus.EXPIRED, reason
             plan.closed_at = today_str
@@ -490,7 +537,9 @@ def _advance_lifecycle_step(
         # longer just sits open indefinitely because price never touched
         # either level. Checked last (after SL/T1) so a genuine same-day
         # SL/T1 cross always takes priority over the age-out.
-        if days > MAX_SETUP_AGE_DAYS:
+        # [2026-09-05] Per-source window — MOM plans age out in 5d, LS/PB
+        # unchanged at 20d.
+        if days > _max_setup_age_days(plan.source):
             reason = f"Auto-closed after {days}d — max holding period reached (SL/T1 not hit)"
             plan.status, plan.status_reason = SetupPlanStatus.CLOSED, reason
             plan.closed_at = today_str
@@ -515,7 +564,8 @@ def _advance_lifecycle_step(
         # 2026-07-30: same age-out as the ACTIVE branch above, for the
         # trailing remainder after T1 — otherwise a plan that hit T1 but
         # never reaches T2 or SL on the remainder could run forever too.
-        if days > MAX_SETUP_AGE_DAYS:
+        # [2026-09-05] Per-source window, same as the two branches above.
+        if days > _max_setup_age_days(plan.source):
             reason = f"Auto-closed after {days}d — max holding period reached (T2/SL not hit on remainder)"
             plan.status, plan.status_reason = SetupPlanStatus.CLOSED, reason
             plan.closed_at = today_str
@@ -656,7 +706,7 @@ def _create_plan(
     _create_plan() doesn't return a plan — that fallback existed for the
     "should_create was False" case and works identically here).
     """
-    setup_id = _make_setup_id(symbol, today_str)
+    setup_id = _make_setup_id(symbol, today_str, source)
 
     # [Architecture review H4 fix, 2026-07-25] Lock the price SL/T1/T2
     # were actually computed relative to (EntryRef — scoring_core.py's
@@ -845,7 +895,7 @@ def enrich_scanner_row(
     # ── 3. Compute display fields on whatever plan we ended up with ─
     if plan is not None:
         plan.days_active       = _compute_days_active(plan.first_actionable_date)
-        plan.setup_age          = _format_setup_age(plan.days_active, plan.status)
+        plan.setup_age          = _format_setup_age(plan.days_active, plan.status, plan.source)
         plan.trade_plan_status  = _trade_plan_label(plan)
     else:
         plan = SetupPlan(
@@ -915,6 +965,160 @@ def enrich_scanner_row(
                               plan.setup_id)
 
     return scanner_row, plan, plan_was_updated
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MOMENTUM  — an independent setup source, NOT a CV4 qualification
+#  path
+# ══════════════════════════════════════════════════════════════════
+#
+# [2026-09-05, SG request] Deliberately separate from enrich_scanner_row()
+# above. LS and PB are both, at bottom, "CV4 says this is a good stock"
+# paths — LS waits for the Recommendation tier to clear _FREEZE_CATEGORIES,
+# PB jumps the gun on a squeeze_release ahead of that tier, but both are
+# reads of the SAME underlying CV4-scored row. Momentum is a different
+# opportunity type entirely — "this stock is moving fast RIGHT NOW",
+# judged purely off today's %chg / volume / VWAP, with zero dependency on
+# CV4, Leadership, Conviction, Entry Quality, or Recommendation. Threading
+# a `momentum: bool` flag through enrich_scanner_row() (as originally
+# sketched) would have made Momentum look like a third CV4 branch when
+# it isn't one — this function exists so that coupling never happens.
+#
+# The ONLY things this function shares with enrich_scanner_row() are the
+# generic, source-blind data-layer pieces: the SetupPlan dataclass,
+# _create_plan() (mint), and advance_lifecycle() (price/entry/sl/target/
+# age state machine) — none of which read Recommendation/CV4 either, so
+# sharing them isn't a coupling regression.
+#
+# Trade-level computation for MOM plans (ATR-based entry/SL/T1/T2) lives
+# in utils/momentum_engine.py, NOT here — this function only mints/
+# advances the plan from whatever levels are already on `momentum_row`.
+
+def enrich_momentum_row(
+    momentum_row:        dict,
+    existing_plan:        Optional["SetupPlan"],
+    momentum_qualified:   bool,
+    first_seen_date:      str = "",
+    current_price:        float = 0.0,
+    bar_low:               float | None = None,
+    bar_high:               float | None = None,
+) -> tuple[dict, Optional["SetupPlan"], bool]:
+    """
+    Momentum's equivalent of enrich_scanner_row() — independent on
+    purpose (see module note above). Attaches setup-persistence fields
+    to a momentum candidate row dict.
+
+    Parameters
+    ----------
+    momentum_row        : one row dict from utils.momentum_engine —
+                           must already carry Entry/SL/T1/T2 (ATR-based,
+                           computed by that module, never by CV4/
+                           trade_levels.py) plus "Stock".
+    existing_plan        : SetupPlan loaded from DB for this symbol
+                            with source == "MOM", or None. Never pass an
+                            LS/PB plan here — Momentum has its own plan
+                            per symbol, independent of any LS/PB plan
+                            that may also be open on the same symbol.
+    momentum_qualified   : True iff utils.momentum_engine judged this
+                            row a momentum candidate today (top-N %chg +
+                            volume-ratio confirmation + still above
+                            VWAP). This is the ONLY gate on plan
+                            creation — no Recommendation/tier check, by
+                            design.
+    first_seen_date, current_price, bar_low, bar_high : same contract as
+                            enrich_scanner_row().
+
+    Returns
+    -------
+    (enriched_row, plan, plan_was_updated) — same shape as
+    enrich_scanner_row() so both can feed the same UI row-rendering code.
+    """
+    today_str = date.today().isoformat()
+    symbol    = str(momentum_row.get("Stock", "")).upper().strip()
+
+    plan_was_updated = False
+    plan = existing_plan
+
+    # ── 1. Advance the lifecycle of any existing OPEN MOM plan ──────
+    #      Identical price/entry/sl/target/age machinery as LS/PB — this
+    #      part of the system was already source-blind, so sharing it
+    #      is not a coupling regression.
+    if plan is not None and plan.is_open():
+        changed, _ = advance_lifecycle(
+            plan, current_price, today_str,
+            bar_low=bar_low, bar_high=bar_high,
+        )
+        if changed:
+            plan_was_updated = True
+
+    # ── 2. Mint a new MOM plan — gated ONLY on momentum_qualified,
+    #      never on Recommendation/CV4/tier. ─────────────────────────
+    should_create = momentum_qualified and (plan is None or plan.is_terminal())
+    if should_create:
+        plan = _create_plan(symbol, momentum_row, first_seen_date, today_str, source="MOM")
+        plan_was_updated = True
+
+    # ── 3. Compute display fields ────────────────────────────────────
+    if plan is not None:
+        plan.days_active       = _compute_days_active(plan.first_actionable_date)
+        plan.setup_age          = _format_setup_age(plan.days_active, plan.status, plan.source)
+        plan.trade_plan_status  = _trade_plan_label(plan)
+    else:
+        plan = SetupPlan(
+            symbol             = symbol,
+            source             = "MOM",
+            status             = SetupPlanStatus.NO_PLAN,
+            first_seen_date    = first_seen_date or today_str,
+            setup_age          = "—",
+            trade_plan_status  = "No plan yet",
+        )
+
+    # ── 4. Attach plan fields to the row dict — same field names as
+    #      enrich_scanner_row() so the Momentum UI tab can reuse the
+    #      same row-rendering code as Active Setups. ──────────────────
+    momentum_row["SetupID"]              = plan.setup_id
+    momentum_row["FirstSeen"]            = plan.first_seen_date
+    momentum_row["FirstActionable"]      = plan.first_actionable_date
+    momentum_row["DaysActive"]            = plan.days_active
+    momentum_row["PlanStatus"]            = _sval(plan.status)
+    momentum_row["ActivatedAt"]           = plan.activated_at
+    momentum_row["T1HitAt"]               = plan.t1_hit_at
+    momentum_row["ClosedAt"]              = plan.closed_at
+
+    if plan.is_open() and plan.setup_id:
+        momentum_row["EntryLocked"] = plan.entry_locked
+        momentum_row["SLLocked"]    = plan.sl_locked
+        momentum_row["T1Locked"]    = plan.t1_locked
+        momentum_row["T2Locked"]    = plan.t2_locked
+    else:
+        momentum_row["EntryLocked"] = momentum_row.get("Entry", 0)
+        momentum_row["SLLocked"]    = momentum_row.get("SL",    0)
+        momentum_row["T1Locked"]    = momentum_row.get("T1",    0)
+        momentum_row["T2Locked"]    = momentum_row.get("T2",    0)
+
+    momentum_row["SetupAge"]        = plan.setup_age
+    momentum_row["TradePlanStatus"] = plan.trade_plan_status
+
+    # Same forward-outcome hook as enrich_scanner_row() — reuses
+    # "LIVE_SCANNER" as the outcome_tracking table's own source tag
+    # (that column distinguishes equity/underlying tracking from DORE
+    # options tracking; it is unrelated to the LS/PB/MOM setup_plans.source
+    # column and MOM belongs on the equity side of that split, same as LS/PB).
+    if plan.is_open() and plan.setup_id and plan.entry_locked and plan.created_at:
+        try:
+            from utils.outcome_tracking import update_forward_outcome
+            update_forward_outcome(
+                plan_key=plan.setup_id, source="LIVE_SCANNER", symbol=symbol,
+                entry_timestamp=plan.created_at,
+                entry_underlying=plan.entry_locked, entry_premium=None,
+                current_underlying=current_price or None, current_premium=None,
+                direction="",
+            )
+        except Exception:
+            logger.exception("[setup_persistence] outcome-tracking update failed for setup_id=%s (non-fatal)",
+                              plan.setup_id)
+
+    return momentum_row, plan, plan_was_updated
 
 
 # ══════════════════════════════════════════════════════════════════

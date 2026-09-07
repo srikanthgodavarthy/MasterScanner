@@ -1862,6 +1862,31 @@ def score_stock(
         _near_52w_hi = False
         _near_52w_lo = False
 
+    # [2026-09-05, SG request] Momentum evaluation — deliberately reads
+    # ONLY r.pct_chg / r.vol_ratio / r.cur_low / r.cur_high / r.entry /
+    # r.atr_at_setup below, never r.tier / r.action / r.norm_score / any
+    # other CV4-derived field on `r`. utils.momentum_engine has zero
+    # import of conviction_score_v1, so this call is the raw-data hop
+    # from BarResult into the plain dict that module actually consumes.
+    # rank_today is left None here — this function scores one symbol at
+    # a time with no visibility into the day's full cross-symbol
+    # ranking, so MomQualified below is a provisional per-symbol read
+    # (pct_chg-floor path only). The batch pass in
+    # _enrich_with_momentum_persistence() re-checks qualification with
+    # the true day-wide rank once the full scan frame exists, and that
+    # re-check — not this one — is what actually gates plan creation.
+    try:
+        from utils.momentum_engine import evaluate_momentum_row
+        _mom_candidate, _mom_row = evaluate_momentum_row(
+            symbol="", pct_chg=r.pct_chg, vol_ratio=r.vol_ratio,
+            close=r.entry, day_high=r.cur_high, day_low=r.cur_low,
+            atr_at_setup=r.atr_at_setup, rank_today=None,
+        )
+    except Exception:
+        from utils.momentum_engine import MomentumCandidate
+        _mom_candidate = MomentumCandidate(False, "momentum evaluation failed")
+        _mom_row = {"Entry": 0.0, "SL": 0.0, "T1": 0.0, "T2": 0.0}
+
     result = {
         "_near_52w_high": _near_52w_hi,
         "_near_52w_low":  _near_52w_lo,
@@ -1907,6 +1932,14 @@ def score_stock(
         "EntryRef":     r.entry_ref,
         "Low":          r.cur_low,
         "High":         r.cur_high,
+        "MomQualified": _mom_candidate.qualified,
+        "MomReason":    _mom_candidate.reason,
+        "VolRatio":     round(float(r.vol_ratio or 0.0), 2),
+        "AtrAtSetup":   round(float(r.atr_at_setup or 0.0), 4),
+        "MomEntry":     _mom_row["Entry"],
+        "MomSL":        _mom_row["SL"],
+        "MomT1":        _mom_row["T1"],
+        "MomT2":        _mom_row["T2"],
         # ── internals ────────────────────────────────────────────
         "_qualified":           r.qualified,
         "_persistent_strength": r.persistent_strength,
@@ -3074,6 +3107,14 @@ def run_scanner(
     # Subsequent scans READ frozen levels — no daily drift.
     df_out = _enrich_with_setup_persistence(df_out, all_data, fetch_source=fetch_source)
 
+    # ── Momentum Persistence (independent setup source) ────────────
+    # [2026-09-05, SG request] Deliberately a SEPARATE call, not folded
+    # into _enrich_with_setup_persistence() above — that function (and
+    # enrich_scanner_row() inside it) is the CV4/Recommendation-gated
+    # path; Momentum must never route through it. See
+    # _enrich_with_momentum_persistence()'s docstring below for why.
+    df_out = _enrich_with_momentum_persistence(df_out)
+
     return df_out
 
 
@@ -3301,6 +3342,152 @@ def _enrich_with_setup_persistence(
             if col not in df_out.columns:
                 df_out[col] = ""
         return df_out
+
+
+def _enrich_with_momentum_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
+    """
+    Momentum's equivalent of _enrich_with_setup_persistence() above —
+    deliberately a SEPARATE function, not a branch inside it.
+
+    [2026-09-05, SG request] MOM is an independent setup source, not
+    another CV4 qualification path. This function never imports or
+    calls enrich_scanner_row() and never reads Recommendation/Category/
+    Tier/Score — the only scanner_row fields it touches are the ones
+    score_stock() already computed independently of CV4: "%Chg",
+    "VolRatio", "AtrAtSetup", "Low", "High", "Entry", and the provisional
+    "MomQualified"/"MomEntry"/"MomSL"/"MomT1"/"MomT2" columns (see the
+    momentum block added to score_stock()'s result dict).
+
+    It also loads and persists MOM plans through
+    load_open_setup_plans_by_source("MOM") / SetupPlan(source="MOM"),
+    NOT the shared load_open_setup_plans() dict _enrich_with_setup_
+    persistence() uses — that dict is keyed by symbol alone across all
+    sources, so a symbol with both an open LS plan and an open MOM plan
+    could not be represented in it simultaneously. Keeping this on its
+    own source-scoped loader/dict is what makes that coexistence work.
+
+    Output columns are all "Mom"-prefixed (MomSetupID, MomPlanStatus,
+    MomEntryLocked, ...) — deliberately distinct from the unprefixed
+    SetupID/PlanStatus/EntryLocked columns _enrich_with_setup_
+    persistence() already wrote, so the two sources' plan state on the
+    same symbol never collide or overwrite each other in df_out.
+
+    Designed to be a silent no-op when Supabase is unavailable, same
+    contract as _enrich_with_setup_persistence().
+    """
+    import logging as _log
+    _logger = _log.getLogger(__name__)
+
+    _mom_cols = ["MomSetupID", "MomPlanStatus", "MomEntryLocked", "MomSLLocked",
+                 "MomT1Locked", "MomT2Locked", "MomSetupAge", "MomTradePlanStatus",
+                 "MomQualifiedFinal", "MomRank"]
+
+    try:
+        from utils.supabase_client import (
+            load_open_setup_plans_by_source,
+            load_first_seen,
+            upsert_setup_plans_batch,
+        )
+        from utils.setup_persistence import enrich_momentum_row
+        from utils.momentum_engine import is_momentum_qualified, MOMENTUM_TOP_N_RANK
+
+        if "Stock" not in df_out.columns or df_out.empty:
+            for col in _mom_cols:
+                df_out[col] = ""
+            return df_out
+
+        existing_mom_plans = load_open_setup_plans_by_source("MOM")   # {symbol: SetupPlan}
+        first_seen_map      = load_first_seen()                        # shared across sources —
+                                                                          # "earliest date seen in ANY
+                                                                          # scan category" is source-
+                                                                          # agnostic by its own definition
+
+        # Day-wide rank of today's %Chg (1 = biggest gainer) — this is
+        # the piece score_stock() couldn't compute per-symbol (it only
+        # ever sees one symbol at a time). This is the FINAL
+        # qualification check; the "MomQualified" column from
+        # score_stock() was provisional (pct_chg-floor path only).
+        rank_series = df_out["%Chg"].fillna(-999).rank(ascending=False, method="min").astype(int)
+
+        today_str = __import__("datetime").date.today().isoformat()
+        updated_plans = []
+        qualified_count = 0
+
+        mom_out_cols = {c: [] for c in _mom_cols}
+
+        for idx, row in df_out.iterrows():
+            symbol = str(row.get("Stock", "")).upper().strip()
+            if not symbol:
+                for c in _mom_cols:
+                    mom_out_cols[c].append("")
+                continue
+
+            rank_today = int(rank_series.loc[idx]) if idx in rank_series.index else None
+
+            final = is_momentum_qualified(
+                pct_chg=row.get("%Chg", 0), vol_ratio=row.get("VolRatio", 0),
+                close=row.get("Entry", 0), day_high=row.get("High", 0), day_low=row.get("Low", 0),
+                rank_today=rank_today, top_n_rank=MOMENTUM_TOP_N_RANK,
+            )
+            if final.qualified:
+                qualified_count += 1
+
+            momentum_row = {
+                "Stock": symbol,
+                "Entry": row.get("MomEntry", 0), "EntryRef": row.get("MomEntry", 0),
+                "SL": row.get("MomSL", 0), "T1": row.get("MomT1", 0), "T2": row.get("MomT2", 0),
+            }
+            _, plan_out, was_updated = enrich_momentum_row(
+                momentum_row,
+                existing_mom_plans.get(symbol),
+                final.qualified,
+                first_seen_date=first_seen_map.get(symbol, ""),
+                current_price=float(row.get("Entry", 0) or 0),
+                bar_low=float(row.get("Low", 0) or 0) or None,
+                bar_high=float(row.get("High", 0) or 0) or None,
+            )
+            existing_mom_plans[symbol] = plan_out
+            if was_updated:
+                updated_plans.append(plan_out)
+
+            mom_out_cols["MomSetupID"].append(plan_out.setup_id)
+            mom_out_cols["MomPlanStatus"].append(_str_status(plan_out.status))
+            mom_out_cols["MomEntryLocked"].append(plan_out.entry_locked if plan_out.is_open() else momentum_row["Entry"])
+            mom_out_cols["MomSLLocked"].append(plan_out.sl_locked if plan_out.is_open() else momentum_row["SL"])
+            mom_out_cols["MomT1Locked"].append(plan_out.t1_locked if plan_out.is_open() else momentum_row["T1"])
+            mom_out_cols["MomT2Locked"].append(plan_out.t2_locked if plan_out.is_open() else momentum_row["T2"])
+            mom_out_cols["MomSetupAge"].append(plan_out.setup_age)
+            mom_out_cols["MomTradePlanStatus"].append(plan_out.trade_plan_status)
+            mom_out_cols["MomQualifiedFinal"].append(final.qualified)
+            mom_out_cols["MomRank"].append(rank_today)
+
+        for c in _mom_cols:
+            df_out[c] = mom_out_cols[c]
+
+        _logger.info(
+            "[MOMENTUM SCAN] total_rows=%d  qualified_today=%d  updated_plans=%d",
+            len(df_out), qualified_count, len(updated_plans),
+        )
+
+        if updated_plans:
+            upsert_setup_plans_batch([p.to_db_dict() for p in updated_plans])
+
+        return df_out
+
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).warning("momentum_persistence enrichment skipped: %s", exc)
+        for col in _mom_cols:
+            if col not in df_out.columns:
+                df_out[col] = ""
+        return df_out
+
+
+def _str_status(status) -> str:
+    """Local helper — SetupPlanStatus enum members stringify as
+    'SetupPlanStatus.ACTIVE' under plain str(); this matches the
+    _sval() helper already used inside utils.setup_persistence."""
+    return getattr(status, "value", str(status or ""))
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -816,6 +816,13 @@ def load_open_setup_plans() -> dict:
     """
     Return every OPEN setup plan (status IN WAITING/ACTIVE/T1_HIT) as a
     dict: {symbol: SetupPlan}.
+
+    NOTE: keyed by symbol alone, across ALL sources (LS/PB/MOM) combined
+    — a symbol with two simultaneously-open plans from different sources
+    can only occupy one slot here. Callers that need to track a
+    source's plans independently of the others (e.g. a MOM plan
+    alongside an already-open LS plan on the same symbol) must use
+    load_open_setup_plans_by_source() instead — see that function.
     """
     if not db.is_available():
         return {}
@@ -833,6 +840,35 @@ def load_open_setup_plans() -> dict:
         return result
     except Exception as exc:
         logger.error("load_open_setup_plans failed: %s", exc)
+        return {}
+
+
+def load_open_setup_plans_by_source(source: str) -> dict:
+    """
+    [2026-09-05, SG request — Momentum bucket] Same shape as
+    load_open_setup_plans() above ({symbol: SetupPlan}, OPEN statuses
+    only) but scoped to a single source column value (e.g. "MOM"). Exists
+    so a MOM plan and an LS/PB plan on the same symbol can be tracked in
+    two separate dicts rather than colliding in one symbol-keyed dict —
+    load_open_setup_plans() alone cannot represent both being open on
+    the same symbol at once.
+    """
+    if not db.is_available():
+        return {}
+    try:
+        rows = db.fetch_all(
+            "SELECT * FROM setup_plans WHERE status = ANY(%s) AND source = %s",
+            (["WAITING", "ACTIVE", "T1_HIT"], source),
+        )
+        if not rows:
+            return {}
+        result = {}
+        for row in rows:
+            plan = _setup_plan_from_row(row)
+            result[plan.symbol] = plan
+        return result
+    except Exception as exc:
+        logger.error("load_open_setup_plans_by_source(%s) failed: %s", source, exc)
         return {}
 
 
