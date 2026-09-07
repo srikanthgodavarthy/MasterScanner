@@ -1132,6 +1132,37 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             logger.exception("[live_scanner] cycle-level setup-plan persistence failed (non-fatal — "
                               "frozen trade levels retry next cycle)")
 
+        # [2026-09-07, bug found from production logs] Momentum (MOM)
+        # persistence — added here for the same reason
+        # _enrich_with_setup_persistence() runs at this cycle level and
+        # not only inside run_scanner()'s per-batch call above: the
+        # earlier per-batch-only wiring (still present inside
+        # run_scanner() itself, same as setup persistence) meant
+        # _enrich_with_momentum_persistence()'s qualification/rank logic
+        # only ever saw one ~25-symbol batch, never the full day's
+        # universe — see that function's own docstring for the batch-
+        # scoping bug already fixed there. Running it again here, once,
+        # on the full merged 501-symbol frame, is what actually gives it
+        # cycle-wide visibility, exactly mirroring the setup-persistence
+        # pattern immediately above. Confirmed missing before this fix by
+        # querying a live deploy's scan_daily_archive row directly: it
+        # had zero Mom*/VolRatio/AtrAtSetup keys at all (not even
+        # blank/False — the keys didn't exist), while SetupID/SLLocked/
+        # T1Locked (setup-persistence's own columns) were present and
+        # correctly populated.
+        try:
+            full_df = pd.DataFrame(list(merged.values()))
+            if not full_df.empty:
+                from utils.scanner_engine import _enrich_with_momentum_persistence
+                full_df = _enrich_with_momentum_persistence(full_df)
+                for rec in full_df.to_dict("records"):
+                    key = _row_key(rec)
+                    if key:
+                        merged[key] = rec
+        except Exception:
+            logger.exception("[live_scanner] cycle-level momentum persistence failed (non-fatal — "
+                              "MOM plans retry next cycle)")
+
         # scan_snapshots: still a genuine "legacy" table, kept as-is for
         # history.py/validation.py's streak calculation — unaffected by
         # the 2026-07-25 architecture change below.
