@@ -105,6 +105,27 @@ class DoreOptionsSettings:
     ema_accel_lookback: int = 3     # window for 2nd-derivative / acceleration reads
     swing_lookback: int = 5         # bars scanned for consecutive HH/LL streak
 
+    # [Futures confirmation, DORE_FUTURES_MIGRATION_PLAN_v2.md Option A,
+    # 2026-09-07] On by default as of the PR4-equivalent flip — same
+    # staged-rollout pattern utils.dore_engine.DORESettings.
+    # use_futures_market_state went through before its own PR4 flip.
+    # When True AND a caller-supplied futures OHLCV
+    # series is long enough for ema_momentum() (same min_len gate as the
+    # spot read — no separate threshold), direction() below uses the
+    # FUTURES contract's own EMA9/21 cross instead of the underlying's,
+    # for the CE/PE call ONLY. Everything else stays on the spot read:
+    # qualification_score() (mom.momentum_score — a candidate-quality/
+    # ranking input, not a directional one), select_strikes(), hard_reject(),
+    # and the structural OB-anchor system all keep using the spot
+    # EmaMomentum exactly as before, unconditionally. This mirrors
+    # utils.dore_engine's own Stage 1/Stage 2a split (DORE_FUTURES_
+    # MIGRATION_PLAN_v2.md §1.4): futures is a daily-directional
+    # confirmation layer, never a substitute for same-day execution
+    # timing on the underlying. Fail-soft: no futures series supplied,
+    # or too short to compute EMA9/21 on -> direction() silently uses
+    # the spot mom, identical to this flag being off.
+    use_futures_confirmation: bool = True
+
     # ── Stage 3: Confidence modifiers ───────────────────────────
     rsi_bull_min: float = 55.0
     rsi_bear_max: float = 45.0
@@ -1039,6 +1060,21 @@ class OptionTradePlan:
     structural_risk:             Optional[float] = None   # abs(entry_reference - invalidation_level)
     structural_reward:           Optional[float] = None   # abs(target_price - entry_reference)
     structural_risk_reward:      Optional[float] = None   # reward / risk
+
+    # [Futures confirmation, DORE_FUTURES_MIGRATION_PLAN_v2.md Option A,
+    # 2026-09-07] Diagnostics for the direction()-only substitution
+    # described on DoreOptionsSettings.use_futures_confirmation — never
+    # gates the plan, purely observational so a caller/UI can tell
+    # whether a plan's direction came from the futures contract's own
+    # EMA9/21 cross or the underlying's.
+    futures_confirmation_used:   bool            = False  # True only when the futures-sourced
+                                                             # EmaMomentum was actually substituted
+                                                             # in for direction() this call.
+    futures_directional_agreement: Optional[bool] = None  # None when futures_confirmation_used is
+                                                             # False (nothing to compare); otherwise
+                                                             # True/False = whether the futures-only
+                                                             # EMA9/21 cross agrees with the spot
+                                                             # underlying's own cross this same call.
 
     @property
     def structural_available(self) -> bool:
@@ -2166,6 +2202,9 @@ def compute_dore_trade_plan(
     high_prices: Optional[Sequence[float]] = None,
     low_prices: Optional[Sequence[float]] = None,
     open_prices: Optional[Sequence[float]] = None,
+    futures_close_prices: Optional[Sequence[float]] = None,
+    futures_high_prices: Optional[Sequence[float]] = None,
+    futures_low_prices: Optional[Sequence[float]] = None,
 ):
     """Runs the full pipeline for one symbol and returns an
     OptionTradePlan (default output, Improvement #9) or a
@@ -2182,6 +2221,20 @@ def compute_dore_trade_plan(
         select_strikes() already produced them (Section 11: explicit
         safe state, never a silent fallback AND never a fabricated
         structural level).
+
+    futures_close_prices/futures_high_prices/futures_low_prices :
+        [Futures confirmation, DORE_FUTURES_MIGRATION_PLAN_v2.md
+        Option A, 2026-09-07] optional — the futures contract's own
+        daily OHLCV (current nearest-expiry contract; no roll
+        adjustment, same convention as utils.dore_engine's PR1).
+        Used ONLY when settings.use_futures_confirmation is True, and
+        ONLY to compute a second EmaMomentum reused for the direction()
+        call in place of the spot one — see that setting's docstring
+        for exactly which stages this does and doesn't affect. Omitting
+        these (or settings.use_futures_confirmation being False, or the
+        series being too short for ema_momentum()'s own min_len gate)
+        is fail-soft: direction() falls through to the spot mom exactly
+        as if this parameter didn't exist.
     """
     settings = settings or DORE_OPTIONS_DEFAULTS
     sig = MasterScannerSignal.from_scan_row(
@@ -2197,7 +2250,22 @@ def compute_dore_trade_plan(
         return DoreRejection(sig.symbol, "Stage2_EMA_Momentum", "Insufficient price history for EMA9/21")
 
     qual_score = qualification_score(sig, mom, settings)
-    dir_, confidence, direction_reasons = direction(sig, mom, settings, adx=adx)
+
+    # [Futures confirmation, DORE_FUTURES_MIGRATION_PLAN_v2.md Option A]
+    # See use_futures_confirmation's docstring — fail-soft, direction-
+    # only substitution. qual_score above and select_strikes()/hard_reject()
+    # below all keep using the spot `mom` unconditionally, matching
+    # utils.dore_engine's Stage 1/Stage 2a split.
+    futures_mom = None
+    if settings.use_futures_confirmation and futures_close_prices:
+        futures_mom = ema_momentum(futures_close_prices, settings,
+                                    high=futures_high_prices, low=futures_low_prices)
+    futures_confirmation_used = futures_mom is not None
+    futures_directional_agreement = (futures_mom.bullish == mom.bullish) if futures_confirmation_used else None
+    dir_, confidence, direction_reasons = direction(
+        sig, futures_mom if futures_confirmation_used else mom, settings, adx=adx)
+    if futures_confirmation_used:
+        direction_reasons = ["Futures-confirmed: " + r for r in direction_reasons]
     chain = OptionChainSnapshot.from_upstox(option_data, dte)
 
     strikes = select_strikes(sig, dte, dir_, confidence, settings, strike_interval=chain.strike_interval, iv=iv)
@@ -2591,8 +2659,16 @@ def compute_dore_trade_plan(
     # (EmaMomentum.bullish and the final confidence score), persisted
     # as DORE Technical Plan fields per the integration spec. Neither
     # is a new calculation.
-    leadership = f"Bullish (EMA9>EMA21, {mom.momentum_score:.0f})" if mom.bullish \
-        else f"Bearish (EMA9<EMA21, {mom.momentum_score:.0f})"
+    # [Futures confirmation, 2026-09-07] Uses whichever EmaMomentum
+    # actually decided dir_ above (futures_mom when
+    # futures_confirmation_used, else the spot mom) — NOT unconditionally
+    # mom — so this string can never contradict dir_ (e.g. showing
+    # "Bullish" on a PE plan because the futures contract's own cross
+    # disagreed with the spot underlying's).
+    _leadership_mom = futures_mom if futures_confirmation_used else mom
+    _leadership_src = "Futures" if futures_confirmation_used else "EMA9/21"
+    leadership = f"Bullish ({_leadership_src}, {mom.momentum_score:.0f})" if _leadership_mom.bullish \
+        else f"Bearish ({_leadership_src}, {mom.momentum_score:.0f})"
 
     if score >= 75:
         conf_tier = "High Confidence"
@@ -2670,6 +2746,10 @@ def compute_dore_trade_plan(
         structural_risk=_structural_risk,
         structural_reward=_structural_reward,
         structural_risk_reward=_structural_risk_reward,
+        # [Futures confirmation, DORE_FUTURES_MIGRATION_PLAN_v2.md
+        # Option A, 2026-09-07]
+        futures_confirmation_used=futures_confirmation_used,
+        futures_directional_agreement=futures_directional_agreement,
     )
 
 

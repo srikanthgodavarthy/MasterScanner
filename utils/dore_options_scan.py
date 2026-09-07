@@ -444,6 +444,40 @@ def top_dore_trade_plans(
     plans: list[OptionTradePlan] = []
     rejections: list[DoreRejection] = []
 
+    # [Futures confirmation, DORE_FUTURES_MIGRATION_PLAN_v2.md Option A,
+    # 2026-09-07] Same fail-soft, best-effort shape as the spot ohlcv_map
+    # built above — a symbol missing here simply means
+    # compute_dore_trade_plan() falls through to spot-only direction()
+    # for it this cycle (settings.use_futures_confirmation's own
+    # docstring), never a rejection. Stocks: fetch_batch_futures_ohlcv_upstox()
+    # (built in utils.dore_engine's PR1, concurrent — same fetcher
+    # utils/fo_scan.py's DORE 2.0 pipeline uses). Indices: no batch path
+    # (FUTIDX isn't covered by the stock batch fetcher — same constraint
+    # noted throughout utils.dore_engine's futures work), so one
+    # sequential fetch per index, same as the ohlcv_map index loop above.
+    futures_ohlcv_map: dict = {}
+    if settings.use_futures_confirmation:
+        try:
+            from utils.upstox_client import fetch_batch_futures_ohlcv_upstox, fetch_futures_ohlcv_upstox
+            if stock_symbols:
+                futures_ohlcv_map.update(fetch_batch_futures_ohlcv_upstox(stock_symbols))
+            for _idx_sym in index_symbols:
+                try:
+                    _fut_idx_df = fetch_futures_ohlcv_upstox(_idx_sym)
+                    if _fut_idx_df is not None and not _fut_idx_df.empty:
+                        futures_ohlcv_map[_idx_sym] = _fut_idx_df
+                except Exception:
+                    logger.warning(
+                        "[dore_options_scan] futures OHLCV fetch failed for index %s "
+                        "(non-fatal — falls through to spot direction() for it this cycle)",
+                        _idx_sym, exc_info=True,
+                    )
+        except Exception:
+            logger.warning(
+                "[dore_options_scan] futures OHLCV batch fetch failed (non-fatal — every "
+                "symbol falls through to spot direction() this cycle)", exc_info=True,
+            )
+
     def _process(symbol: str, scan_row: dict, option_data: Optional[dict]):
         if option_data is None:
             rejections.append(DoreRejection(symbol, "HardReject", "Missing option chain"))
@@ -471,6 +505,14 @@ def top_dore_trade_plans(
             rejections.append(DoreRejection(symbol, "Stage2_EMA_Momentum", "No OHLCV history available"))
             return
 
+        fut_df = futures_ohlcv_map.get(symbol)
+        if fut_df is not None and not fut_df.empty:
+            fut_closes = fut_df["close"].tail(max(ohlcv_bars, 30)).tolist() if "close" in fut_df else None
+            fut_highs = fut_df["high"].tail(max(ohlcv_bars, 30)).tolist() if "high" in fut_df else None
+            fut_lows = fut_df["low"].tail(max(ohlcv_bars, 30)).tolist() if "low" in fut_df else None
+        else:
+            fut_closes, fut_highs, fut_lows = None, None, None
+
         dte = _days_to_expiry(option_data.get("expiry", ""))
         regime = scan_row.get("regime") or scan_row.get("_nifty_regime") or scan_row.get("MarketRegime")
         iv_row = iv_lookup.get(symbol)
@@ -480,6 +522,7 @@ def top_dore_trade_plans(
             scan_row, closes, option_data, dte=dte, settings=settings,
             symbol=symbol, market_regime=regime, iv=iv_ctx,
             high_prices=highs, low_prices=lows, open_prices=opens,
+            futures_close_prices=fut_closes, futures_high_prices=fut_highs, futures_low_prices=fut_lows,
         )
         if isinstance(result, OptionTradePlan):
             # [2026-08-08, SG request] "PB" when this symbol only made
