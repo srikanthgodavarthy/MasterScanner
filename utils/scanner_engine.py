@@ -1905,6 +1905,14 @@ def score_stock(
         "T1":           r.t1,
         "T2":           r.t2,
         "T3":           r.t3,
+        # [Adaptive targets, 2026-09-07] Fixed-R fallback's own extension
+        # band, needed downstream by setup_persistence._create_plan() to
+        # recompute T1/T2/T3 via utils.adaptive_target_engine the same way
+        # backtest_engine.py already does. Wasn't previously exposed on the
+        # scanner row at all — added here rather than reusing "BarsBand"
+        # (a different concept: bars-since-setup staleness, not ATR
+        # extension from entry).
+        "ExtScoreATR":  r.extension_score_atr,
         # [Architecture review C1/H4/H5 fix, 2026-07-25] "Entry" above is
         # the clean DISPLAY price (unpadded signal close) and stays
         # that way for the UI. These three are new, separate columns:
