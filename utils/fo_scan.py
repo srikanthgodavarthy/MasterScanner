@@ -38,6 +38,7 @@ import pandas as pd
 from utils.dore_engine import (
     DOREInput, compute_dore, compute_trend_features, build_dore_input, build_underlying_trade_plan,
     stage1_trend_engine, stage2_execution_engine, stage2b_pre_breakout_confirmation,
+    fetch_symbol_futures_daily_and_execution_features,
     BULLISH, BEARISH, NEUTRAL, NOT_READY,
 )
 from utils.dore_settings import DORESettings
@@ -473,7 +474,10 @@ def compute_fo_opportunities(
     see utils.option_chain_diagnostics.get_option_chain_stats().
     """
     cfg = _load_settings(cfg)
-    from utils.upstox_client import fetch_oi_resistance, fetch_batch_stock_atm_options_upstox, fetch_next_expiry
+    from utils.upstox_client import (
+        fetch_oi_resistance, fetch_batch_stock_atm_options_upstox, fetch_next_expiry,
+        fetch_futures_snapshot_batch, resolve_futures_instrument_expiry,
+    )
     from utils.oi_snapshot_store import record_and_diff, record_and_diff_premium
     from utils.option_chain_diagnostics import reset_option_chain_stats, get_option_chain_stats
 
@@ -514,6 +518,19 @@ def compute_fo_opportunities(
     # fetch_oi_resistance() per-symbol below; batching 3 calls isn't
     # worth the complexity.
     stock_atm_options = fetch_batch_stock_atm_options_upstox(stock_symbols, progress_cb=progress_cb) if stock_symbols else {}
+
+    # [DORE_FUTURES_MIGRATION_PLAN_v2.md — stock wiring] Batched near-
+    # month futures LTP/OI/expiry for every shortlisted stock symbol —
+    # same one-call-per-batch shape as stock_atm_options above, on the
+    # existing fetch_futures_snapshot_batch() (PR1). Only used to fill
+    # DOREInput.fut_days_to_expiry/fut_oi/fut_oi_change (oi_change isn't
+    # actually populated by this endpoint yet — see build_dore_input()'s
+    # futures_snapshot docstring; the OI sub-score stays excluded until
+    # PR3's OI-change tracker exists, same as indices). The daily-OHLCV/
+    # intraday-5m trend+execution read is fetched per symbol below via
+    # fetch_symbol_futures_daily_and_execution_features() — no batch
+    # fetcher exists for those yet (PR1 only batched the snapshot quote).
+    stock_futures_snapshot = fetch_futures_snapshot_batch(tuple(stock_symbols)) if stock_symbols else {}
 
     _avail_capital, _lot_sizes, _existing_positions = _load_position_sizing_inputs()
     _sizing_cfg = PositionSizingSettings()
@@ -605,11 +622,42 @@ def compute_fo_opportunities(
             logger.exception("[DORE Stage3] option-chain fetch failed for %s", symbol)
             continue
 
+        # [DORE_FUTURES_MIGRATION_PLAN_v2.md — stock wiring] Own
+        # try/except, deliberately separate from the option-chain fetch
+        # above (same reasoning as utils.dore_engine.compute_index_dore()'s
+        # matching block): a futures-data hiccup for this symbol must
+        # never cost it its spot DORE read. Indices go through this same
+        # branch now too — previously ONLY utils.market_intelligence's
+        # compute_index_dore() path (Market Intelligence panel) had
+        # futures wiring; this pipeline (compute_fo_scan(), the live
+        # scheduler entry point — see scheduler/scan_worker.py) did not,
+        # for either indices or stocks.
+        futures_trend_features, futures_execution_features = {}, {}
+        futures_snapshot: dict = {}
+        try:
+            futures_trend_features, futures_execution_features = (
+                fetch_symbol_futures_daily_and_execution_features(symbol, cfg))
+            if symbol in _INDICES:
+                # No batch snapshot source for FUTIDX (fetch_futures_snapshot_batch()
+                # is FUTSTK-only) — just the expiry, same as compute_index_dore().
+                fut_expiry = resolve_futures_instrument_expiry(symbol)
+                if fut_expiry:
+                    futures_snapshot = {"expiry": fut_expiry}
+            else:
+                futures_snapshot = stock_futures_snapshot.get(symbol) or {}
+        except Exception:
+            logger.warning("[DORE Stage3] futures fetch failed for %s (non-fatal — spot Stage 1 "
+                            "unaffected, futures_market_state_available will read False)",
+                            symbol, exc_info=True)
+
         dore_input = build_dore_input(
             symbol=symbol, price=row["price"], trend_features=row.get("trend_features"),
             execution_features=row.get("execution_features"),
             atm_chain_row=atm_chain_row, oi_resistance=oi_resistance_like,
             atm_chain_row_next=atm_chain_row_next,
+            futures_trend_features=futures_trend_features,
+            futures_snapshot=futures_snapshot,
+            futures_execution_features=futures_execution_features,
         )
         result = compute_dore(dore_input, cfg)
         _persist_reversal_alert(symbol, result)

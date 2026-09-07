@@ -3455,6 +3455,54 @@ def compute_futures_trend_features(fut_daily_df, cfg: Optional[DORESettings] = N
         return {}
 
 
+def fetch_symbol_futures_daily_and_execution_features(symbol: str, cfg: "DORESettings") -> tuple:
+    """Best-effort per-symbol futures daily-OHLCV + 5-minute execution
+    read — the (futures_trend_features, futures_execution_features)
+    pair build_dore_input() expects, minus futures_snapshot (callers
+    supply that separately: fetch_futures_snapshot_batch() for stocks,
+    resolve_futures_instrument_expiry() for indices — see each call
+    site).
+
+    Factored out of compute_index_dore()'s original inline index-only
+    block [PR2.5] so utils.fo_scan's stock pipeline (compute_fo_scan(),
+    the live scheduler entry point — see scheduler/scan_worker.py) can
+    share the exact same fail-soft contract instead of re-implementing
+    it: any fetch/compute failure here is caught and logged, never
+    raised, and returns ({}, {}) — DOREInput.fut_available then stays
+    False and stage1_futures_market_state() falls back to spot Stage 1
+    for this symbol/poll (see that function's docstring). A futures-data
+    hiccup on one symbol must never take down its (or any other
+    symbol's) spot DORE read.
+
+    Works for both FUTSTK (stocks) and FUTIDX (NIFTY/BANKNIFTY/SENSEX)
+    since fetch_futures_ohlcv_upstox()/fetch_futures_intraday_5m_upstox()
+    (PR1) already resolve either instrument type generically.
+    """
+    futures_trend_features: dict = {}
+    futures_execution_features: dict = {}
+    try:
+        from utils.dore_fo_screener import execution_features_from_intraday_5m
+        from utils.upstox_client import fetch_futures_ohlcv_upstox, fetch_futures_intraday_5m_upstox
+
+        fut_daily = fetch_futures_ohlcv_upstox(symbol)
+        futures_trend_features = compute_futures_trend_features(fut_daily, cfg)
+
+        fut_intraday_5m = fetch_futures_intraday_5m_upstox(symbol)
+        if fut_intraday_5m is not None and not fut_intraday_5m.empty:
+            fut_exec_raw = execution_features_from_intraday_5m(fut_intraday_5m, cfg)
+            if fut_exec_raw:
+                futures_execution_features = {
+                    "fut_vwap": fut_exec_raw.get("vwap", 0.0),
+                    "fut_fresh_crossover": fut_exec_raw.get("fresh_crossover", False),
+                    "fut_fresh_crossunder": fut_exec_raw.get("fresh_crossunder", False),
+                }
+    except Exception:
+        logger.warning("[DORE:%s] futures fetch failed (non-fatal — spot Stage 1 unaffected, "
+                        "futures_market_state_available will read False)", symbol, exc_info=True)
+        return {}, {}
+    return futures_trend_features, futures_execution_features
+
+
 def build_dore_input(
     symbol: str,
     price: float,
@@ -3723,60 +3771,42 @@ def compute_index_dore(index_key: str, ohlcv, oi: dict, ce_pe_chg: tuple,
         # else needs deriving here.
         atm_chain_row_next = {"strike_premiums": (oi_next or {}).get("strike_premiums") or {}}
 
-        # [PR2.5, DORE_FUTURES_MIGRATION_PLAN_v2.md — indices only, per
-        # the "stocks deferred, index wiring in scope" decision] Best-
-        # effort futures read for this index's own current-month
-        # contract. Wrapped in its own try/except, deliberately separate
-        # from the outer one: this function has been live (Market
-        # Intelligence panel, index_dore job, 60s) since before this
-        # addition, and a futures-fetch hiccup must never take down the
-        # existing spot DORE read — it just leaves futures_trend_features/
-        # futures_execution_features/futures_snapshot empty,
-        # DOREInput.fut_available stays False, and
-        # stage1_futures_market_state() fails soft exactly as designed
-        # (see compute_dore()). Known gap, not a bug: no OI
-        # (fetch_futures_snapshot_batch() is FUTSTK-only, no index path —
-        # the OI sub-score is simply excluded, same as any symbol
-        # missing it).
+        # [PR2.5, DORE_FUTURES_MIGRATION_PLAN_v2.md] Best-effort futures
+        # read for this index's own current-month contract, via the
+        # shared fetch_symbol_futures_daily_and_execution_features() —
+        # same fail-soft contract as utils.fo_scan's stock pipeline
+        # (that pipeline was the "stocks deferred" gap this refactor
+        # closes; both now go through one code path). A futures-fetch
+        # hiccup here must never take down the existing spot DORE read
+        # — it just leaves futures_trend_features/futures_execution_features/
+        # futures_snapshot empty, DOREInput.fut_available stays False,
+        # and stage1_futures_market_state() fails soft exactly as
+        # designed (see compute_dore()). Known gap, not a bug: no OI for
+        # indices specifically (fetch_futures_snapshot_batch() is
+        # FUTSTK-only, no index path — the OI sub-score is simply
+        # excluded here, same as any symbol missing it).
         #
-        # [PR2.5 follow-up, 2026-09] fut_days_to_expiry now populated via
-        # resolve_futures_instrument_expiry() — previously left at 0,
-        # which meant stage1_futures_market_state()'s basis annualization
-        # silently fell back to the index OPTION's own (weekly)
-        # days_to_expiry. Confirmed live that this was materially wrong
-        # for NIFTY specifically (weekly options, monthly-only futures
-        # post the SEBI weekly-expiry consolidation): a ~4-day fallback
-        # DTE was blowing a +0.53% raw basis up to +48.4% annualized,
-        # vs BANKNIFTY's ~8.5% off a DTE that happened to already be
-        # monthly-cadence. Using the future's own real expiry fixes both.
-        futures_trend_features: dict = {}
-        futures_execution_features: dict = {}
+        # [PR2.5 follow-up, 2026-09] fut_days_to_expiry populated below
+        # via resolve_futures_instrument_expiry() — previously left at
+        # 0, which meant stage1_futures_market_state()'s basis
+        # annualization silently fell back to the index OPTION's own
+        # (weekly) days_to_expiry. Confirmed live that this was
+        # materially wrong for NIFTY specifically (weekly options,
+        # monthly-only futures post the SEBI weekly-expiry
+        # consolidation): a ~4-day fallback DTE was blowing a +0.53% raw
+        # basis up to +48.4% annualized, vs BANKNIFTY's ~8.5% off a DTE
+        # that happened to already be monthly-cadence. Using the
+        # future's own real expiry fixes both.
+        futures_trend_features, futures_execution_features = (
+            fetch_symbol_futures_daily_and_execution_features(index_key, dore_cfg))
         futures_snapshot: dict = {}
         try:
-            from utils.upstox_client import (
-                fetch_futures_ohlcv_upstox, fetch_futures_intraday_5m_upstox,
-                resolve_futures_instrument_expiry,
-            )
-
-            fut_daily = fetch_futures_ohlcv_upstox(index_key)
-            futures_trend_features = compute_futures_trend_features(fut_daily, dore_cfg)
-
+            from utils.upstox_client import resolve_futures_instrument_expiry
             fut_expiry = resolve_futures_instrument_expiry(index_key)
             if fut_expiry:
                 futures_snapshot = {"expiry": fut_expiry}
-
-            fut_intraday_5m = fetch_futures_intraday_5m_upstox(index_key)
-            if fut_intraday_5m is not None and not fut_intraday_5m.empty:
-                fut_exec_raw = execution_features_from_intraday_5m(fut_intraday_5m, dore_cfg)
-                if fut_exec_raw:
-                    futures_execution_features = {
-                        "fut_vwap": fut_exec_raw.get("vwap", 0.0),
-                        "fut_fresh_crossover": fut_exec_raw.get("fresh_crossover", False),
-                        "fut_fresh_crossunder": fut_exec_raw.get("fresh_crossunder", False),
-                    }
         except Exception:
-            logger.warning("[DORE:%s] index futures fetch failed (non-fatal — spot Stage 1 unaffected, "
-                            "futures_market_state_available will read False)", index_key, exc_info=True)
+            logger.warning("[DORE:%s] futures expiry resolution failed (non-fatal)", index_key, exc_info=True)
 
         dore_input = build_dore_input_for_index(
             index_key, ohlcv, oi, atm_chain_row=atm_chain_row, execution_features=exec_features,
