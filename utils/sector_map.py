@@ -408,7 +408,7 @@ def build_sector_stats(df: pd.DataFrame,
     empty = pd.DataFrame(columns=["Sector", "AvgChg", "Leaders", "StockCount",
                                    "Advancing", "Declining", "OppScore", "Trend",
                                    "EliteCount", "ExecuteCount", "WatchCount",
-                                   "NetInflowCr"])
+                                   "NetInflowCr", "AvgLeadership"])
     if df is None or df.empty or symbol_col not in df.columns:
         return empty
 
@@ -431,6 +431,24 @@ def build_sector_stats(df: pd.DataFrame,
     has_vol_ratio = "_vol_ratio" in work.columns
     if has_vol_ratio:
         work["_vr"] = pd.to_numeric(work["_vol_ratio"], errors="coerce")
+
+    # [Sector leadership, wired 2026-09-07] Same CV1 -> Legacy -> DE
+    # fallback chain used everywhere else a per-stock Leadership score is
+    # read (e.g. utils/setup_persistence.py's _create_plan()). Previously
+    # no leadership aggregate existed anywhere in this function at all —
+    # sector_rotation.build_sector_snapshot_rows() hardcoded
+    # avg_leadership=None with a "filled by caller if available" comment,
+    # but no caller ever could, since this was the only place that could
+    # compute it and never did. That silently zeroed out leadership_delta
+    # (sector_rotation.py's _delta() call), which is 30% of the
+    # RotationStrength composite behind the Leadership Rotation panel.
+    _leadership_col = next(
+        (c for c in ("CV1_Leadership", "Legacy_Leadership", "DE_Leadership") if c in work.columns),
+        None,
+    )
+    has_leadership = _leadership_col is not None
+    if has_leadership:
+        work["_leadership"] = pd.to_numeric(work[_leadership_col], errors="coerce")
 
     rows = []
     for sector, grp in work.groupby("_sector"):
@@ -470,19 +488,25 @@ def build_sector_stats(df: pd.DataFrame,
         else:
             net_inflow = 0.0
 
+        if has_leadership and grp["_leadership"].notna().any():
+            avg_leadership = round(float(grp["_leadership"].mean()), 1)
+        else:
+            avg_leadership = None
+
         rows.append({
-            "Sector":       sector,
-            "AvgChg":       avg_chg,
-            "Leaders":      int(grp["_is_leader"].sum()),
-            "StockCount":   n,
-            "Advancing":    int((grp["_chg"] > 0).sum()) if has_chg else 0,
-            "Declining":    int((grp["_chg"] < 0).sum()) if has_chg else 0,
-            "OppScore":     opp_score,
-            "Trend":        trend,
-            "EliteCount":   elite_ct,
-            "ExecuteCount": execute_ct,
-            "WatchCount":   watch_ct,
-            "NetInflowCr":  round(net_inflow, 1),
+            "Sector":        sector,
+            "AvgChg":        avg_chg,
+            "Leaders":       int(grp["_is_leader"].sum()),
+            "StockCount":    n,
+            "Advancing":     int((grp["_chg"] > 0).sum()) if has_chg else 0,
+            "Declining":     int((grp["_chg"] < 0).sum()) if has_chg else 0,
+            "OppScore":      opp_score,
+            "Trend":         trend,
+            "EliteCount":    elite_ct,
+            "ExecuteCount":  execute_ct,
+            "WatchCount":    watch_ct,
+            "NetInflowCr":   round(net_inflow, 1),
+            "AvgLeadership": avg_leadership,
         })
 
     out = pd.DataFrame(rows)

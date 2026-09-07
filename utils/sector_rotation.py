@@ -339,7 +339,16 @@ def build_sector_snapshot_rows(sector_stats: pd.DataFrame, scan_date) -> list[di
             "sector": str(r["Sector"]),
             "scan_date": scan_date,
             "avg_chg": float(r.get("AvgChg", 0.0)),
-            "avg_leadership": None,  # filled by caller if a leadership column is available
+            # [Wired 2026-09-07] utils/sector_map.build_sector_stats() now
+            # computes this (CV1_Leadership mean per sector, same fallback
+            # chain as everywhere else). Previously always None here — see
+            # that function's comments for what that silently zeroed out
+            # in this module's own leadership_delta / RotationStrength.
+            "avg_leadership": (
+                float(r["AvgLeadership"])
+                if "AvgLeadership" in r and pd.notna(r["AvgLeadership"])
+                else None
+            ),
             "opp_score": float(r.get("OppScore", 0.0)),
             "elite_count": int(r.get("EliteCount", 0)),
             "execute_count": int(r.get("ExecuteCount", 0)),
