@@ -477,7 +477,7 @@ def compute_fo_opportunities(
     from utils.upstox_client import (
         fetch_oi_resistance, fetch_batch_stock_atm_options_upstox, fetch_next_expiry,
         fetch_futures_snapshot_batch, resolve_futures_instrument_expiry,
-        fetch_single_futures_oi_upstox,
+        fetch_single_futures_oi_upstox, fetch_batch_futures_ohlcv_upstox,
     )
     from utils.oi_snapshot_store import record_and_diff, record_and_diff_premium, record_and_diff_value
     from utils.option_chain_diagnostics import reset_option_chain_stats, get_option_chain_stats
@@ -532,6 +532,21 @@ def compute_fo_opportunities(
     # fetch_symbol_futures_daily_and_execution_features() — no batch
     # fetcher exists for those yet (PR1 only batched the snapshot quote).
     stock_futures_snapshot = fetch_futures_snapshot_batch(tuple(stock_symbols)) if stock_symbols else {}
+
+    # [PR3, drift #2 fix] fetch_batch_futures_ohlcv_upstox() was built in
+    # PR1 specifically for this — a concurrent per-symbol daily-OHLCV
+    # fetch for the whole shortlisted pool — but had zero callers until
+    # now; the stock wiring added in PR2.5 was fetching futures OHLCV
+    # sequentially, one symbol at a time, inside the loop below via
+    # fetch_symbol_futures_daily_and_execution_features(). Pre-fetching
+    # the whole shortlist here, concurrently, and passing each symbol's
+    # frame into that function (its new fut_daily_df param) removes N
+    # sequential HTTP round-trips from the per-symbol loop, same
+    # ThreadPoolExecutor pattern stock_atm_options above already uses.
+    # Intraday 5m execution features are unaffected — no batch fetcher
+    # exists for those (see fetch_batch_futures_ohlcv_upstox()'s own
+    # docstring), so that fetch stays per-symbol inside the loop.
+    stock_futures_daily = fetch_batch_futures_ohlcv_upstox(stock_symbols) if stock_symbols else {}
 
     _avail_capital, _lot_sizes, _existing_positions = _load_position_sizing_inputs()
     _sizing_cfg = PositionSizingSettings()
@@ -637,7 +652,8 @@ def compute_fo_opportunities(
         futures_snapshot: dict = {}
         try:
             futures_trend_features, futures_execution_features = (
-                fetch_symbol_futures_daily_and_execution_features(symbol, cfg))
+                fetch_symbol_futures_daily_and_execution_features(
+                    symbol, cfg, fut_daily_df=stock_futures_daily.get(symbol)))
             if symbol in _INDICES:
                 # [PR3] fetch_futures_snapshot_batch() is FUTSTK-only (see
                 # its own docstring) — indices previously got NO OI here

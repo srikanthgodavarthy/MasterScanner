@@ -3515,7 +3515,9 @@ def compute_futures_trend_features(fut_daily_df, cfg: Optional[DORESettings] = N
         return {}
 
 
-def fetch_symbol_futures_daily_and_execution_features(symbol: str, cfg: "DORESettings") -> tuple:
+def fetch_symbol_futures_daily_and_execution_features(
+    symbol: str, cfg: "DORESettings", fut_daily_df=None,
+) -> tuple:
     """Best-effort per-symbol futures daily-OHLCV + 5-minute execution
     read — the (futures_trend_features, futures_execution_features)
     pair build_dore_input() expects, minus futures_snapshot (callers
@@ -3537,6 +3539,21 @@ def fetch_symbol_futures_daily_and_execution_features(symbol: str, cfg: "DORESet
     Works for both FUTSTK (stocks) and FUTIDX (NIFTY/BANKNIFTY/SENSEX)
     since fetch_futures_ohlcv_upstox()/fetch_futures_intraday_5m_upstox()
     (PR1) already resolve either instrument type generically.
+
+    `fut_daily_df` [PR3, drift #2 fix]: optional pre-fetched daily-OHLCV
+    frame (e.g. one entry of fetch_batch_futures_ohlcv_upstox()'s
+    result dict). When supplied, this function's own
+    fetch_futures_ohlcv_upstox(symbol) call is skipped entirely — lets a
+    caller with many symbols (fo_scan.py's stock loop) fetch the whole
+    shortlist's daily OHLCV CONCURRENTLY once, upfront, instead of this
+    function re-fetching it sequentially, one HTTP round-trip per
+    symbol, inside the existing per-symbol loop. When None (the
+    default — indices' call site, at most 3 symbols, not worth
+    batching), falls back to the original single-symbol fetch exactly
+    as before. The 5-minute intraday/execution read is UNCHANGED either
+    way — no batch fetcher exists for that (see
+    fetch_batch_futures_ohlcv_upstox()'s own docstring), so it's always
+    fetched here, per symbol.
     """
     futures_trend_features: dict = {}
     futures_execution_features: dict = {}
@@ -3544,7 +3561,7 @@ def fetch_symbol_futures_daily_and_execution_features(symbol: str, cfg: "DORESet
         from utils.dore_fo_screener import execution_features_from_intraday_5m
         from utils.upstox_client import fetch_futures_ohlcv_upstox, fetch_futures_intraday_5m_upstox
 
-        fut_daily = fetch_futures_ohlcv_upstox(symbol)
+        fut_daily = fut_daily_df if fut_daily_df is not None else fetch_futures_ohlcv_upstox(symbol)
         futures_trend_features = compute_futures_trend_features(fut_daily, cfg)
 
         fut_intraday_5m = fetch_futures_intraday_5m_upstox(symbol)
