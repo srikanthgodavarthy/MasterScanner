@@ -108,17 +108,20 @@ DORE_DEFAULTS: dict = {
     # default" pattern enable_sector_rs/enable_cv4_opportunity_weight
     # used. See stage1_futures_market_state() in dore_engine.py.
     "use_futures_market_state": True,
-    # [PR4] Staged-rollout scope for the flag above. True (default):
+    # [PR4] Staged-rollout scope for the flag above. When True,
     # compute_dore()'s use_futures_market_state effect only fires for
     # inp.symbol in dore_engine._INDEX_SYMBOLS (NIFTY/BANKNIFTY/SENSEX)
-    # — every stock still falls through to spot Stage 1 regardless of
-    # the master flag, exactly as if use_futures_market_state were still
-    # False for them. Set False once stock-level results have been
-    # observed for long enough to trust the w_fut_*/basis/divergence
-    # reads on individual names too (PR4's own follow-up, not scoped
-    # here) — this is the switch that removes the "indices first" guard
-    # rail, not a second independent on/off toggle.
-    "use_futures_market_state_indices_only": True,
+    # — every stock falls through to spot Stage 1 regardless of the
+    # master flag, exactly as if use_futures_market_state were still
+    # False for them.
+    # [PR4 follow-up, 2026-09-07] Flipped False — the "indices first"
+    # guard rail is now lifted; use_futures_market_state's effect
+    # (futures-sourced daily trend feeding compute_effective_bias(), plus
+    # Stage 3's futures-divergence read) now applies to F&O stocks the
+    # same as indices, not just NIFTY/BANKNIFTY/SENSEX. This is the
+    # switch this flag's own docstring called out as PR4's deferred
+    # follow-up, not a second independent on/off toggle.
+    "use_futures_market_state_indices_only": False,
     # DORE's own copy of utils.upstox_client.MIN_BARS_FOR_FUTURES_TREND
     # — kept here rather than imported, so dore_engine.py stays free of
     # any upstox_client/streamlit dependency (the same "pure, testable
@@ -495,7 +498,7 @@ class DORESettings:
     w_trend_volume: float = 10.0
 
     use_futures_market_state: bool = True
-    use_futures_market_state_indices_only: bool = True
+    use_futures_market_state_indices_only: bool = False
     fut_min_bars_for_trend: int = 15
     w_fut_ema_alignment: float = 21.0
     w_fut_ema_slope: float = 14.0

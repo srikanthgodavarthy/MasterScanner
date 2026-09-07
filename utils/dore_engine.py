@@ -3189,11 +3189,14 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
     # check_intraday_reversal_alert() are UNCHANGED, spot, in both flag
     # states (§1.4 decision (b) — same-day options-buying timing tracks
     # the underlying's own print, not the futures contract's).
-    # [PR4] Master flag now True (see dore_settings.py), but the actual
-    # effect is scoped to indices only for now via
-    # use_futures_market_state_indices_only (default True) — a stock
-    # symbol falls through to spot exactly as if the master flag were
-    # still False, until that scope flag is turned off in a later PR.
+    # [PR4, then PR4 follow-up 2026-09-07] Master flag True (see
+    # dore_settings.py). use_futures_market_state_indices_only originally
+    # scoped this to indices-only while stock-level w_fut_*/divergence
+    # reads were unvalidated; now False by default, so every F&O symbol
+    # (stock or index) gets the futures-sourced daily read, not just
+    # NIFTY/BANKNIFTY/SENSEX. Left as a real settings flag (not deleted)
+    # so it stays available as an instant rollback to indices-only
+    # without touching this function again.
     futures_scope_ok = (
         not cfg.use_futures_market_state_indices_only
         or inp.symbol in _INDEX_SYMBOLS
