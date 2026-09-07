@@ -2665,8 +2665,8 @@ def stage5_opportunity_engine(
     # reads opportunity_score at all, so it is unaffected either way.
     _cv4_weight = cfg.w_opp_cv4_evidence if getattr(cfg, "enable_cv4_opportunity_weight", False) else 0.0
     opportunity_score = _weighted([
-        (trend_conviction,          cfg.w_opp_trend),
-        (execution_score,           cfg.w_opp_execution),
+        (trend_conviction,          cfg.w_opp_directional_state),
+        (execution_score,           cfg.w_opp_execution_timing),
         (derivative_confidence,     cfg.w_opp_derivatives),
         (option_intelligence_score, cfg.w_opp_option_intelligence),
         (risk_quality,              cfg.w_opp_risk),

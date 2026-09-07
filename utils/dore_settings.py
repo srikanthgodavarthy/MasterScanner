@@ -363,8 +363,28 @@ DORE_DEFAULTS: dict = {
     # Weighted score components (Section 10 of the spec) — must sum to 100.
     # Rebalanced 2026-07-21 (RFC-001: DORE 3.0) to make room for Option
     # Intelligence as a first-class input; placeholder split, not re-fit.
-    "w_opp_trend":                25.0,
-    "w_opp_execution":            20.0,
+    #
+    # Renamed 2026-09 (DORE_FUTURES_MIGRATION_PLAN_v2.md §1.6/§5.2):
+    # w_opp_trend -> w_opp_directional_state, w_opp_execution ->
+    # w_opp_execution_timing. Pure rename, same 25.0/20.0 values, no
+    # behavioral change — corrects the plan doc's original assumption
+    # that these were "Stage 1's old two weights" due for a single
+    # merged w_opp_futures_market_state once Stage 1 went futures-
+    # capable. They're not: w_opp_directional_state weights
+    # trend_conviction, derived from effective_bias.blended_score — the
+    # DAILY/structural read that DOES switch to futures-sourced when
+    # use_futures_market_state is on (§1.4). w_opp_execution_timing
+    # weights Stage 2a's own execution_score — the SAME-DAY execution
+    # read that §1.4 deliberately keeps spot-only in BOTH flag states,
+    # forever (same-day options-buying timing tracks the underlying's
+    # own print, not the futures contract's). Merging them into one
+    # weight would blend "is there a decent setup" (futures-capable)
+    # with "is now a good moment to act on it" (always spot) into a
+    # single number — a real change to what the Opportunity Score means,
+    # not just a rename. Kept as two terms instead; renamed only so the
+    # settings names describe what they actually weight.
+    "w_opp_directional_state":    25.0,
+    "w_opp_execution_timing":     20.0,
     "w_opp_derivatives":          25.0,
     "w_opp_option_intelligence":  20.0,
     "w_opp_risk":                 10.0,
@@ -567,8 +587,8 @@ class DORESettings:
     w_risk_theta_iv: float = 20.0
     w_risk_liquidity: float = 20.0
 
-    w_opp_trend: float = 25.0
-    w_opp_execution: float = 20.0
+    w_opp_directional_state: float = 25.0
+    w_opp_execution_timing: float = 20.0
     w_opp_derivatives: float = 25.0
     w_opp_option_intelligence: float = 20.0
     w_opp_risk: float = 10.0
