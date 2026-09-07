@@ -170,6 +170,30 @@ _yf_call_lock  = threading.Lock()   # serializes spacing + protects _yf_last_cal
 _yf_last_call_ts = 0.0
 _multitasking_tasks_lock = threading.Lock()  # protects multitasking.config["TASKS"] pruning below — deliberately separate from _yf_call_lock, which _wait_for_spacing() holds *during* time.sleep(); sharing it would make pruning block on an unrelated multi-second sleep
 
+# [Cross-contamination fix, 2026-09-03] Serializes the actual yf.download()
+# network call itself, process-wide — deliberately separate from
+# _yf_call_lock/_wait_for_spacing(). _wait_for_spacing() only throttles how
+# often callers may *start* an attempt: it acquires _yf_call_lock, sleeps if
+# needed, stamps _yf_last_call_ts, and releases the lock — yf.download()
+# itself then runs OUTSIDE that lock. That leaves a window where a second
+# caller (any of the four scheduler threads, or the synchronous
+# [SETUP PLAN RECOVERY] single-symbol fallback in run_scanner()) can pass
+# the spacing check and start its OWN yf.download() while a first call is
+# still in flight (a batch can take 2-30s+, especially mid-retry).
+# yfinance's threads=True downloader collects per-ticker results into its
+# own module-level shared state rather than something scoped per-call, so
+# two genuinely-concurrent yf.download() calls can cross-contaminate each
+# other's returned DataFrame. Confirmed live 2026-09-03: a lone "NIACL"
+# chunk-of-1 recovery fetch came back holding a different concurrent
+# batch's "KPRMILL" data under raw.columns — caught only by luck (a
+# KeyError on the ticker lookup) rather than silently scoring NIACL off
+# KPRMILL's price history. Held ONLY around the yf.download() call itself
+# (see yf_download_with_retry() below) — never around retry/backoff
+# sleeps — so one caller's rate-limit cooldown can't stall every other
+# caller's next attempt; it only guarantees no two downloads are ever
+# in flight at the same instant.
+_yf_download_lock = threading.Lock()
+
 
 def _is_locked_db_error(exc: Exception) -> bool:
     return "database is locked" in str(exc).lower()
@@ -279,7 +303,12 @@ def yf_download_with_retry(tickers, **kwargs):
     while attempt <= max_total_attempts:
         _wait_for_spacing()
         try:
-            result = yf.download(tickers, **kwargs)
+            # Serialized against every other concurrent caller (see
+            # _yf_download_lock's own comment above) — closes the window
+            # where _wait_for_spacing() has already released its lock but
+            # this attempt's actual network call hasn't started yet.
+            with _yf_download_lock:
+                result = yf.download(tickers, **kwargs)
         except Exception as exc:
             last_exc = exc
 
@@ -740,6 +769,22 @@ def _patch_live_prices(data: dict, live: dict) -> dict:
     Overwrite the last row of each symbol's OHLCV DataFrame with the live bar.
     If today's date is already the last index, update in-place.
     If today is a new date (market open, new day), append a new row.
+
+    [2026-09-07, bug found from production logs] The append branch used
+    to only compare lv_date against the LAST row's date — if that
+    assumption is ever wrong (index not sorted, or today's date already
+    present somewhere other than the tail for any reason), it would
+    blindly append a second row for a date already in the index,
+    producing a duplicate-dated row. That fed straight into
+    utils.structural_levels.causal_pivot_series() downstream, which
+    requires a unique index and crashed outright for several symbols in
+    production (JINDALSTEL, KEI, JUBLFOOD, KAYNES, MANAPPURAM, INDIGO
+    seen in one deploy's logs) — score_stock() failed for each, not
+    silently degraded. Now explicitly checks whether lv_date exists
+    ANYWHERE in the index before appending, updating that row in place
+    instead if so. Paired with a defensive dedup at the actual crash site
+    in causal_pivot_series() itself, in case some other path still
+    produces a duplicate this doesn't catch.
     """
     from datetime import date
     today = pd.Timestamp(date.today())
@@ -753,12 +798,19 @@ def _patch_live_prices(data: dict, live: dict) -> dict:
         lv_date = pd.Timestamp(lv["date"]).normalize()
         df_copy = df.copy()
 
-        if df_copy.index[-1].normalize() == lv_date:
-            # Same day — update last row with live data
-            df_copy.loc[df_copy.index[-1], "close"]  = lv["close"]
-            df_copy.loc[df_copy.index[-1], "high"]   = max(df_copy.iloc[-1]["high"],  lv["high"])
-            df_copy.loc[df_copy.index[-1], "low"]    = min(df_copy.iloc[-1]["low"],   lv["low"])
-            df_copy.loc[df_copy.index[-1], "volume"] = lv["volume"]
+        existing_pos = df_copy.index.get_indexer([lv_date]) if df_copy.index.is_unique else None
+        lv_date_present = (existing_pos is not None and existing_pos[0] != -1) or \
+                           (existing_pos is None and lv_date in df_copy.index)
+
+        if df_copy.index[-1].normalize() == lv_date or lv_date_present:
+            # Same day (whether at the tail or, defensively, anywhere
+            # else in the index) — update that row with live data instead
+            # of appending a second one.
+            target_idx = df_copy.index[-1] if df_copy.index[-1].normalize() == lv_date else lv_date
+            df_copy.loc[target_idx, "close"]  = lv["close"]
+            df_copy.loc[target_idx, "high"]   = max(df_copy.loc[target_idx, "high"],  lv["high"])
+            df_copy.loc[target_idx, "low"]    = min(df_copy.loc[target_idx, "low"],   lv["low"])
+            df_copy.loc[target_idx, "volume"] = lv["volume"]
         else:
             # New day — append live bar
             new_row = pd.DataFrame([{
@@ -1643,7 +1695,6 @@ def score_stock(
     atr_prox: float = 0.3,
     symbol:   str | None = None,
     sector_series: "pd.Series | None" = None,
-    prescreen_reject_sink: "set | None" = None,
 ) -> dict:
     """
     Evaluate the LATEST bar of df.
@@ -1661,19 +1712,6 @@ def score_stock(
         the caller builds sector_series itself (once per sector per
         scan, not per symbol) since score_stock() has no access to the
         full scan universe's history.
-
-    prescreen_reject_sink : optional — a plain `set` the caller owns (see
-        run_scanner()'s `_prescreen_rejected`). If given, `symbol` is added
-        to it when leadership_prescreen() rejects this stock — a routine,
-        expected filter, not a data loss (see the debug log right below).
-        Lets run_scanner()'s final "unaccounted for" summary tell "every
-        missing symbol was just prescreen filtering" apart from a genuine,
-        unexplained loss, without re-deriving prescreen's own logic there.
-        `set.add()` from multiple scorer-pool threads is safe under the
-        GIL for this use (no read-modify-write, just inserts) — no lock
-        needed. Omit for callers outside run_scanner() (e.g. tests,
-        one-off scoring) — prescreen rejection is still silent-by-design
-        for them, just without the tracking.
     """
     # Full-history gate — EMA200 (the default slow EMA that trend
     # structure/ema_alignment/ema20_pct_dist etc. all derive from) needs
@@ -1770,36 +1808,12 @@ def score_stock(
     diagnostic    = bool((settings or {}).get("prescreen_diagnostic", False))
     prescreen_ok  = leadership_prescreen(df, nifty)
     if not prescreen_ok and not diagnostic:
-        # [2026-09-03 diagnostic] Previously silent — this is a routine,
-        # expected rejection (most of the universe fails leadership
-        # prescreen most cycles by design), but with zero log trace it was
-        # indistinguishable from a genuine loss in run_scanner()'s
-        # "unaccounted for" summary. debug-level (not warning): this fires
-        # constantly and isn't itself actionable, it's just what makes the
-        # "unaccounted for" list explainable after the fact.
-        logging.getLogger(__name__).debug(
-            "score_stock: %s rejected by leadership_prescreen (expected filter, not a data loss)",
-            symbol or "<unknown symbol>",
-        )
-        if prescreen_reject_sink is not None and symbol:
-            prescreen_reject_sink.add(symbol)
         return {}
 
     ia = build_indicators(df, nifty, params, sector_series=sector_series)
     r  = compute_bar(ia, i=-1, params=params)   # -1 = latest bar
 
     if r is None:
-        # [2026-09-03 diagnostic] Also previously silent. Unlike the
-        # prescreen reject above, compute_bar() returning None on a
-        # symbol that already passed prescreen/indicator-build is NOT
-        # expected — this one is worth a warning so it's distinguishable
-        # from routine prescreen filtering in the same "unaccounted for"
-        # summary.
-        logging.getLogger(__name__).warning(
-            "score_stock: compute_bar returned None for %s after indicator build "
-            "(passed prescreen — unexpected, check for malformed/degenerate OHLCV)",
-            symbol or "<unknown symbol>",
-        )
         return {}
 
     # ── CV4/SMC shadow scoring input (Phase 2, masterscanner_scoring_
@@ -1871,6 +1885,31 @@ def score_stock(
         _near_52w_hi = False
         _near_52w_lo = False
 
+    # [2026-09-05, SG request] Momentum evaluation — deliberately reads
+    # ONLY r.pct_chg / r.vol_ratio / r.cur_low / r.cur_high / r.entry /
+    # r.atr_at_setup below, never r.tier / r.action / r.norm_score / any
+    # other CV4-derived field on `r`. utils.momentum_engine has zero
+    # import of conviction_score_v1, so this call is the raw-data hop
+    # from BarResult into the plain dict that module actually consumes.
+    # rank_today is left None here — this function scores one symbol at
+    # a time with no visibility into the day's full cross-symbol
+    # ranking, so MomQualified below is a provisional per-symbol read
+    # (pct_chg-floor path only). The batch pass in
+    # _enrich_with_momentum_persistence() re-checks qualification with
+    # the true day-wide rank once the full scan frame exists, and that
+    # re-check — not this one — is what actually gates plan creation.
+    try:
+        from utils.momentum_engine import evaluate_momentum_row
+        _mom_candidate, _mom_row = evaluate_momentum_row(
+            symbol="", pct_chg=r.pct_chg, vol_ratio=r.vol_ratio,
+            close=r.entry, day_high=r.cur_high, day_low=r.cur_low,
+            atr_at_setup=r.atr_at_setup, rank_today=None,
+        )
+    except Exception:
+        from utils.momentum_engine import MomentumCandidate
+        _mom_candidate = MomentumCandidate(False, "momentum evaluation failed")
+        _mom_row = {"Entry": 0.0, "SL": 0.0, "T1": 0.0, "T2": 0.0}
+
     result = {
         "_near_52w_high": _near_52w_hi,
         "_near_52w_low":  _near_52w_lo,
@@ -1905,14 +1944,6 @@ def score_stock(
         "T1":           r.t1,
         "T2":           r.t2,
         "T3":           r.t3,
-        # [Adaptive targets, 2026-09-07] Fixed-R fallback's own extension
-        # band, needed downstream by setup_persistence._create_plan() to
-        # recompute T1/T2/T3 via utils.adaptive_target_engine the same way
-        # backtest_engine.py already does. Wasn't previously exposed on the
-        # scanner row at all — added here rather than reusing "BarsBand"
-        # (a different concept: bars-since-setup staleness, not ATR
-        # extension from entry).
-        "ExtScoreATR":  r.extension_score_atr,
         # [Architecture review C1/H4/H5 fix, 2026-07-25] "Entry" above is
         # the clean DISPLAY price (unpadded signal close) and stays
         # that way for the UI. These three are new, separate columns:
@@ -1924,6 +1955,14 @@ def score_stock(
         "EntryRef":     r.entry_ref,
         "Low":          r.cur_low,
         "High":         r.cur_high,
+        "MomQualified": _mom_candidate.qualified,
+        "MomReason":    _mom_candidate.reason,
+        "VolRatio":     round(float(r.vol_ratio or 0.0), 2),
+        "AtrAtSetup":   round(float(r.atr_at_setup or 0.0), 4),
+        "MomEntry":     _mom_row["Entry"],
+        "MomSL":        _mom_row["SL"],
+        "MomT1":        _mom_row["T1"],
+        "MomT2":        _mom_row["T2"],
         # ── internals ────────────────────────────────────────────
         "_qualified":           r.qualified,
         "_persistent_strength": r.persistent_strength,
@@ -2732,11 +2771,9 @@ def run_scanner(
     source:      str  = "yfinance",
     source_warn_cb    = None,
     nifty_series: "pd.Series | None" = None,
-    enrich_setup_persistence: bool = True,
 ) -> pd.DataFrame:
     """
     Two-phase scanner.
-
     Nifty regime is computed once here from live data, then injected into
     the settings dict so every score_stock() call uses the same value
     without redundant per-stock computation.
@@ -2762,22 +2799,6 @@ def run_scanner(
     identically everywhere (which would have been easier to notice).
     Passing one already-fetched, already-deduped Series in for the whole
     cycle removes that per-batch lottery entirely.
-
-    enrich_setup_persistence: [2026-09-03] Default True — matches every
-    prior caller's behavior (pages/scanner.py's manual "Run Scan",
-    compute_live_scan()'s full-universe call). Set False for a
-    sub-batch call in a larger cycle (scheduler/scan_worker.py's
-    live_scanner sub-scheduler): _enrich_with_setup_persistence() does
-    two Supabase reads (load_open_setup_plans/load_first_seen) plus an
-    orphaned-plan recovery pass every time it runs, and that recovery
-    pass is structurally a no-op when `all_data` is scoped to one
-    ~25-symbol batch instead of the full universe (see that function's
-    own 2026-08-11 comment — confirmed live: 0 symbols ever recovered
-    this way). Running it once per batch (20x/cycle) paid that cost
-    repeatedly for zero benefit; the caller should instead run it once,
-    after every batch's data has landed in history_store's shared RAM
-    cache, so the recovery pass can actually succeed — see
-    scheduler/scan_worker.py's end-of-cycle call.
     """
     def _warn(msg: str) -> None:
         if source_warn_cb:
@@ -2919,15 +2940,6 @@ def run_scanner(
             _sector_frames = {}
             sector_benchmark_for_symbol = None  # noqa: F811 — degrade to no sector RS if this fails
 
-    # [2026-09-03] Per-run sink for prescreen-rejected symbols — populated
-    # from inside score_stock() (called on scorer-pool worker threads; a
-    # bare set.add() with no read-modify-write is GIL-safe here, see
-    # score_stock()'s own docstring for prescreen_reject_sink). Consulted
-    # by the "unaccounted for" summary below to downgrade that log's
-    # severity when every missing symbol is just routine prescreen
-    # filtering, not a genuine loss.
-    _prescreen_rejected: set = set()
-
     # [2026-08-17] Narrowed closure: only pull the one symbol's frame and
     # sector series out of the batch-wide dicts *before* submitting, so a
     # future that never finishes (see _scorer_pool note above) pins one
@@ -2939,8 +2951,7 @@ def run_scanner(
             return None
         row = score_stock(df, nifty_series, settings=effective_settings,
                           cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
-                          symbol=sym, sector_series=sector_series,
-                          prescreen_reject_sink=_prescreen_rejected)
+                          symbol=sym, sector_series=sector_series)
         if row:
             row["Stock"] = sym
         return row
@@ -3072,23 +3083,11 @@ def run_scanner(
     scored_syms = {r.get("Stock") for r in results if r}
     unaccounted = set(symbols) - scored_syms
     if unaccounted:
-        # [2026-09-03] Not every "unaccounted for" symbol is equally
-        # interesting — most of the universe fails leadership_prescreen
-        # most cycles by design (see score_stock()'s prescreen_reject_sink
-        # docstring). If prescreen fully explains this batch's gap, that's
-        # routine and not worth a WARNING; only symbols prescreen can't
-        # account for are a genuine, unexplained loss worth flagging.
-        _explained   = unaccounted & _prescreen_rejected
-        _unexplained = unaccounted - _prescreen_rejected
-        _level = _log.warning if _unexplained else _log.info
-        _level(
+        _log.warning(
             "scanner_engine: run_scanner returning %d/%d symbols this batch — "
-            "%d unaccounted for (%d prescreen-rejected as expected, %d unexplained — "
-            "see history_store/score_stock/timeout warnings above for the specific "
-            "reason per symbol, if logged): unexplained=%s prescreen=%s",
-            len(scored_syms), len(symbols), len(unaccounted),
-            len(_explained), len(_unexplained),
-            sorted(_unexplained), sorted(_explained),
+            "%d unaccounted for (see history_store/score_stock/timeout warnings "
+            "above for the specific reason per symbol, if logged): %s",
+            len(scored_syms), len(symbols), len(unaccounted), sorted(unaccounted),
         )
 
     # [2026-08-31 profiling] Single-line fetch/score split for this
@@ -3129,11 +3128,15 @@ def run_scanner(
     # ── Setup Persistence (frozen trade plans) ────────────────────
     # Entry / SL / Targets are LOCKED on first Actionable detection.
     # Subsequent scans READ frozen levels — no daily drift.
-    # [2026-09-03] Now conditional — see enrich_setup_persistence's own
-    # docstring above for why a batched cycle caller skips this here
-    # and calls it once, cycle-level, instead.
-    if enrich_setup_persistence:
-        df_out = _enrich_with_setup_persistence(df_out, all_data, fetch_source=fetch_source)
+    df_out = _enrich_with_setup_persistence(df_out, all_data, fetch_source=fetch_source)
+
+    # ── Momentum Persistence (independent setup source) ────────────
+    # [2026-09-05, SG request] Deliberately a SEPARATE call, not folded
+    # into _enrich_with_setup_persistence() above — that function (and
+    # enrich_scanner_row() inside it) is the CV4/Recommendation-gated
+    # path; Momentum must never route through it. See
+    # _enrich_with_momentum_persistence()'s docstring below for why.
+    df_out = _enrich_with_momentum_persistence(df_out)
 
     return df_out
 
@@ -3362,6 +3365,175 @@ def _enrich_with_setup_persistence(
             if col not in df_out.columns:
                 df_out[col] = ""
         return df_out
+
+
+def _enrich_with_momentum_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
+    """
+    Momentum's equivalent of _enrich_with_setup_persistence() above —
+    deliberately a SEPARATE function, not a branch inside it.
+
+    [2026-09-05, SG request] MOM is an independent setup source, not
+    another CV4 qualification path. This function never imports or
+    calls enrich_scanner_row() and never reads Recommendation/Category/
+    Tier/Score — the only scanner_row fields it touches are the ones
+    score_stock() already computed independently of CV4: "%Chg",
+    "VolRatio", "AtrAtSetup", "Low", "High", "Entry", and the provisional
+    "MomQualified"/"MomEntry"/"MomSL"/"MomT1"/"MomT2" columns (see the
+    momentum block added to score_stock()'s result dict).
+
+    It also loads and persists MOM plans through
+    load_open_setup_plans_by_source("MOM") / SetupPlan(source="MOM"),
+    NOT the shared load_open_setup_plans() dict _enrich_with_setup_
+    persistence() uses — that dict is keyed by symbol alone across all
+    sources, so a symbol with both an open LS plan and an open MOM plan
+    could not be represented in it simultaneously. Keeping this on its
+    own source-scoped loader/dict is what makes that coexistence work.
+
+    Output columns are all "Mom"-prefixed (MomSetupID, MomPlanStatus,
+    MomEntryLocked, ...) — deliberately distinct from the unprefixed
+    SetupID/PlanStatus/EntryLocked columns _enrich_with_setup_
+    persistence() already wrote, so the two sources' plan state on the
+    same symbol never collide or overwrite each other in df_out.
+
+    Designed to be a silent no-op when Supabase is unavailable, same
+    contract as _enrich_with_setup_persistence().
+
+    [2026-09-07, bug found from production logs] `run_scanner()` — the
+    function this is called from — runs once per ~25-symbol batch in
+    production (scan_worker's live_scanner sub-scheduler processes 501
+    symbols as 21 batches of ~25, confirmed from deployed logs showing
+    "run_scanner returning X/25 symbols this batch" per batch). This
+    function's `df_out` is therefore ONE BATCH, never the full day's
+    universe. The original version of this function ranked `df_out`'s
+    "%Chg" locally and used that as a second qualification path
+    alongside the flat %chg floor (MOMENTUM_TOP_N_RANK) — but "top 20 of
+    a 25-symbol batch" is true for 80% of any batch, so that rank check
+    was not a real filter in production; it was silently near-always-
+    true. Caught by reading a real deployed log, not by inspection or
+    the unit tests written earlier (those called this function directly
+    with small hand-built DataFrames, which never exercised the real
+    batched call path from run_scanner() and so never surfaced this).
+    Fixed by dropping the rank-based path from live qualification
+    entirely — momentum_engine.is_momentum_qualified() is still called
+    with rank_today=None here, same as score_stock()'s provisional
+    check, so qualification now rests solely on the volume-confirmed
+    %chg floor (MOMENTUM_MIN_PCT_CHG + MOMENTUM_MIN_VOL_RATIO), which is
+    correct regardless of batch boundaries. A genuine day-wide rank
+    check would need to run AFTER all 21 batches complete (e.g. off
+    scan_snapshots/scan_daily_archive once a day's scan is done) rather
+    than per-batch inside run_scanner() — not implemented here; left as
+    a follow-up rather than solved partially/incorrectly in this pass.
+    """
+    import logging as _log
+    _logger = _log.getLogger(__name__)
+
+    _mom_cols = ["MomSetupID", "MomPlanStatus", "MomEntryLocked", "MomSLLocked",
+                 "MomT1Locked", "MomT2Locked", "MomSetupAge", "MomTradePlanStatus",
+                 "MomQualifiedFinal"]
+
+    try:
+        from utils.supabase_client import (
+            load_open_setup_plans_by_source,
+            load_first_seen,
+            upsert_setup_plans_batch,
+        )
+        from utils.setup_persistence import enrich_momentum_row
+        from utils.momentum_engine import is_momentum_qualified, MOMENTUM_TOP_N_RANK
+
+        if "Stock" not in df_out.columns or df_out.empty:
+            for col in _mom_cols:
+                df_out[col] = ""
+            return df_out
+
+        existing_mom_plans = load_open_setup_plans_by_source("MOM")   # {symbol: SetupPlan}
+        first_seen_map      = load_first_seen()                        # shared across sources —
+                                                                          # "earliest date seen in ANY
+                                                                          # scan category" is source-
+                                                                          # agnostic by its own definition
+
+        # [2026-09-07] No rank-based qualification here — see this
+        # function's docstring. df_out is one ~25-symbol batch in
+        # production, not the day's full universe, so a rank computed
+        # from it would not mean what MOMENTUM_TOP_N_RANK intends.
+        # Qualification below rests solely on the batch-independent
+        # volume-confirmed %chg floor (rank_today=None throughout).
+
+        today_str = __import__("datetime").date.today().isoformat()
+        updated_plans = []
+        qualified_count = 0
+
+        mom_out_cols = {c: [] for c in _mom_cols}
+
+        for idx, row in df_out.iterrows():
+            symbol = str(row.get("Stock", "")).upper().strip()
+            if not symbol:
+                for c in _mom_cols:
+                    mom_out_cols[c].append("")
+                continue
+
+            final = is_momentum_qualified(
+                pct_chg=row.get("%Chg", 0), vol_ratio=row.get("VolRatio", 0),
+                close=row.get("Entry", 0), day_high=row.get("High", 0), day_low=row.get("Low", 0),
+                rank_today=None, top_n_rank=MOMENTUM_TOP_N_RANK,
+            )
+            if final.qualified:
+                qualified_count += 1
+
+            momentum_row = {
+                "Stock": symbol,
+                "Entry": row.get("MomEntry", 0), "EntryRef": row.get("MomEntry", 0),
+                "SL": row.get("MomSL", 0), "T1": row.get("MomT1", 0), "T2": row.get("MomT2", 0),
+            }
+            _, plan_out, was_updated = enrich_momentum_row(
+                momentum_row,
+                existing_mom_plans.get(symbol),
+                final.qualified,
+                first_seen_date=first_seen_map.get(symbol, ""),
+                current_price=float(row.get("Entry", 0) or 0),
+                bar_low=float(row.get("Low", 0) or 0) or None,
+                bar_high=float(row.get("High", 0) or 0) or None,
+            )
+            existing_mom_plans[symbol] = plan_out
+            if was_updated:
+                updated_plans.append(plan_out)
+
+            mom_out_cols["MomSetupID"].append(plan_out.setup_id)
+            mom_out_cols["MomPlanStatus"].append(_str_status(plan_out.status))
+            mom_out_cols["MomEntryLocked"].append(plan_out.entry_locked if plan_out.is_open() else momentum_row["Entry"])
+            mom_out_cols["MomSLLocked"].append(plan_out.sl_locked if plan_out.is_open() else momentum_row["SL"])
+            mom_out_cols["MomT1Locked"].append(plan_out.t1_locked if plan_out.is_open() else momentum_row["T1"])
+            mom_out_cols["MomT2Locked"].append(plan_out.t2_locked if plan_out.is_open() else momentum_row["T2"])
+            mom_out_cols["MomSetupAge"].append(plan_out.setup_age)
+            mom_out_cols["MomTradePlanStatus"].append(plan_out.trade_plan_status)
+            mom_out_cols["MomQualifiedFinal"].append(final.qualified)
+
+        for c in _mom_cols:
+            df_out[c] = mom_out_cols[c]
+
+        _logger.info(
+            "[MOMENTUM SCAN] total_rows=%d  qualified_today=%d  updated_plans=%d",
+            len(df_out), qualified_count, len(updated_plans),
+        )
+
+        if updated_plans:
+            upsert_setup_plans_batch([p.to_db_dict() for p in updated_plans])
+
+        return df_out
+
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).warning("momentum_persistence enrichment skipped: %s", exc)
+        for col in _mom_cols:
+            if col not in df_out.columns:
+                df_out[col] = ""
+        return df_out
+
+
+def _str_status(status) -> str:
+    """Local helper — SetupPlanStatus enum members stringify as
+    'SetupPlanStatus.ACTIVE' under plain str(); this matches the
+    _sval() helper already used inside utils.setup_persistence."""
+    return getattr(status, "value", str(status or ""))
 
 
 # ══════════════════════════════════════════════════════════════════

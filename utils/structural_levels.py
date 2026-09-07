@@ -74,7 +74,32 @@ def causal_pivot_series(high: pd.Series, low: pd.Series, lb: int = 20) -> tuple[
     Returns (ph, pl) — NaN where not a confirmed pivot, price where it is,
     with the confirmation lag baked in (values "appear" lb bars later than
     center=True would place them).
+
+    [2026-09-07, bug found from production logs] `high`/`low` are the raw
+    per-symbol history — occasionally arrives with a duplicate-dated row
+    (confirmed possible: pages/data_source_check.py already checks
+    yf_df.index.duplicated()/ux_df.index.duplicated() as a known,
+    flaggable yfinance/upstox anomaly, though this function itself had no
+    guard). high.index.get_indexer(valid_ph.index) below requires a
+    unique index and raised pandas.errors.InvalidIndexError in production
+    for several symbols (JINDALSTEL, KEI, JUBLFOOD, KAYNES, MANAPPURAM,
+    INDIGO seen in one deploy's logs) — score_stock() failed outright for
+    each, not silently degraded. Deduping here (keep last — the most
+    recently fetched/live-patched row for that date) fixes the crash
+    regardless of which upstream step introduced the duplicate; see also
+    the hardened day-rollover check in scanner_engine._patch_live_prices(),
+    a plausible contributing cause this also guards against independently.
     """
+    if not high.index.is_unique or not low.index.is_unique:
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            "causal_pivot_series: duplicate index entries found (high: %d dup, "
+            "low: %d dup) — deduping, keeping the last occurrence of each date",
+            int(high.index.duplicated().sum()), int(low.index.duplicated().sum()),
+        )
+        high = high[~high.index.duplicated(keep="last")]
+        low  = low[~low.index.duplicated(keep="last")]
+
     roll_max = high.rolling(2 * lb + 1, center=True, min_periods=2 * lb + 1).max()
     roll_min = low.rolling(2 * lb + 1,  center=True, min_periods=2 * lb + 1).min()
     ph = high.where(high == roll_max).astype(float)
