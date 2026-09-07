@@ -290,11 +290,26 @@ DORE_DEFAULTS: dict = {
     # oi_writing (25->20), pcr (15->13), premium_quality (15->12);
     # base_strength and corridor left untouched.
     "w_deriv_oi_writing":         20.0,   # long/short build-up, unwinding, covering
-    "w_deriv_pcr":                13.0,
+    "w_deriv_pcr":                8.0,    # 13.0 -> 8.0 (PR3, see w_deriv_futures_divergence below)
     "w_deriv_base_strength":      10.0,   # OI stacked helpful-side vs hostile-side
     "w_deriv_premium_quality":    12.0,   # value + liquidity + spread (behaviour split out below)
     "w_deriv_premium_behavior":   30.0,   # has the premium itself turned/started rising (2026-08-06: 20 -> 30)
-    "w_deriv_corridor":           15.0,   # room to run before the next OI wall
+    "w_deriv_corridor":           10.0,   # room to run before the next OI wall (15.0 -> 10.0, PR3)
+    # [PR3, DORE_FUTURES_MIGRATION_PLAN_v2.md §3] Does the FUTURES
+    # contract's own OI-price positioning (long/short buildup vs
+    # covering/unwinding — same classification stage1_futures_market_
+    # state()'s OI sub-score uses) agree with the OPTIONS-chain writing
+    # read (w_deriv_oi_writing) for this direction? A genuine setup
+    # should show both derivative markets leaning the same way; futures
+    # positioning diverging from options writing is exactly the kind of
+    # confirmation-layer disagreement Stage 3 exists to catch (RFC-001
+    # §7's "does the options market confirm this trade?", extended here
+    # to the futures market too). 10.0 taken from w_deriv_pcr (-5.0) and
+    # w_deriv_corridor (-5.0) — both were the two least execution-
+    # critical sub-scores (a static ATR-distance read and a chain-wide
+    # ratio, vs this being contract-specific fresh positioning) — total
+    # stays 100.
+    "w_deriv_futures_divergence": 10.0,
 
     # ── Stage 3.5: Option Intelligence (RFC-001: DORE 3.0) ────────
     # "Is this option contract worth buying?" — independent of direction.
@@ -546,11 +561,12 @@ class DORESettings:
     gate_now_on_premium_behavior: bool = True
     premium_behavior_score_gate: float = 70.0
     w_deriv_oi_writing: float = 20.0
-    w_deriv_pcr: float = 13.0
+    w_deriv_pcr: float = 8.0
     w_deriv_base_strength: float = 10.0
     w_deriv_premium_quality: float = 12.0
     w_deriv_premium_behavior: float = 30.0
-    w_deriv_corridor: float = 15.0
+    w_deriv_corridor: float = 10.0
+    w_deriv_futures_divergence: float = 10.0
 
     oi_iv_rank_cheap_max: float = 25.0
     oi_iv_rank_expensive_min: float = 70.0

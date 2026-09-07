@@ -477,8 +477,9 @@ def compute_fo_opportunities(
     from utils.upstox_client import (
         fetch_oi_resistance, fetch_batch_stock_atm_options_upstox, fetch_next_expiry,
         fetch_futures_snapshot_batch, resolve_futures_instrument_expiry,
+        fetch_single_futures_oi_upstox,
     )
-    from utils.oi_snapshot_store import record_and_diff, record_and_diff_premium
+    from utils.oi_snapshot_store import record_and_diff, record_and_diff_premium, record_and_diff_value
     from utils.option_chain_diagnostics import reset_option_chain_stats, get_option_chain_stats
 
     # Reset once per Stage-3 pass so diagnostics reflect THIS scan
@@ -522,12 +523,12 @@ def compute_fo_opportunities(
     # [DORE_FUTURES_MIGRATION_PLAN_v2.md — stock wiring] Batched near-
     # month futures LTP/OI/expiry for every shortlisted stock symbol —
     # same one-call-per-batch shape as stock_atm_options above, on the
-    # existing fetch_futures_snapshot_batch() (PR1). Only used to fill
-    # DOREInput.fut_days_to_expiry/fut_oi/fut_oi_change (oi_change isn't
-    # actually populated by this endpoint yet — see build_dore_input()'s
-    # futures_snapshot docstring; the OI sub-score stays excluded until
-    # PR3's OI-change tracker exists, same as indices). The daily-OHLCV/
-    # intraday-5m trend+execution read is fetched per symbol below via
+    # existing fetch_futures_snapshot_batch() (PR1). Fills
+    # DOREInput.fut_days_to_expiry/fut_oi directly; fut_oi_change is
+    # derived below per-symbol via record_and_diff_value() (PR3 — this
+    # endpoint itself only ever returns the absolute OI level, never a
+    # delta). The daily-OHLCV/intraday-5m trend+execution read is
+    # fetched per symbol below via
     # fetch_symbol_futures_daily_and_execution_features() — no batch
     # fetcher exists for those yet (PR1 only batched the snapshot quote).
     stock_futures_snapshot = fetch_futures_snapshot_batch(tuple(stock_symbols)) if stock_symbols else {}
@@ -638,13 +639,31 @@ def compute_fo_opportunities(
             futures_trend_features, futures_execution_features = (
                 fetch_symbol_futures_daily_and_execution_features(symbol, cfg))
             if symbol in _INDICES:
-                # No batch snapshot source for FUTIDX (fetch_futures_snapshot_batch()
-                # is FUTSTK-only) — just the expiry, same as compute_index_dore().
+                # [PR3] fetch_futures_snapshot_batch() is FUTSTK-only (see
+                # its own docstring) — indices previously got NO OI here
+                # at all, only the expiry. fetch_single_futures_oi_upstox()
+                # (PR3) closes that gap with one quote call per index (at
+                # most 3/cycle), same reasoning as their option-chain
+                # fetch staying per-symbol rather than batched.
                 fut_expiry = resolve_futures_instrument_expiry(symbol)
-                if fut_expiry:
-                    futures_snapshot = {"expiry": fut_expiry}
+                futures_snapshot = {"expiry": fut_expiry} if fut_expiry else {}
+                fut_oi = fetch_single_futures_oi_upstox(symbol)
+                if fut_oi is not None:
+                    futures_snapshot["oi"] = fut_oi
+                    futures_snapshot["oi_change"] = record_and_diff_value(f"FUT_{symbol}", fut_oi)
             else:
-                futures_snapshot = stock_futures_snapshot.get(symbol) or {}
+                futures_snapshot = dict(stock_futures_snapshot.get(symbol) or {})
+                if futures_snapshot.get("oi") is not None:
+                    # [PR3] oi_change was previously never populated here —
+                    # build_dore_input()'s own docstring flagged this as
+                    # "accepted but not currently populated by any
+                    # fetcher". record_and_diff_value() already existed
+                    # and is used for exactly this in the Futures-tab
+                    # screener (utils.dore_fo_screener.top_futures_
+                    # opportunities()) — same day-rollover baseline
+                    # tracker, just wired into the live DORE funnel too.
+                    futures_snapshot["oi_change"] = record_and_diff_value(
+                        f"FUT_{symbol}", futures_snapshot["oi"])
         except Exception:
             logger.warning("[DORE Stage3] futures fetch failed for %s (non-fatal — spot Stage 1 "
                             "unaffected, futures_market_state_available will read False)",

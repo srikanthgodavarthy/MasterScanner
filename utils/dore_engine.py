@@ -325,12 +325,17 @@ class DOREInput:
                                            # scoring a too-short contract history as neutral
     fut_oi:               float = 0.0
     fut_oi_change:        float = 0.0    # today's OI change on the futures contract, absolute
-                                           # contracts (not %) — NOT currently populated by any
-                                           # fetcher (fetch_futures_snapshot_batch() returns only
-                                           # a point-in-time OI, no change-over-time tracker yet,
-                                           # unlike options' oi_snapshot_store) — see PR2 handoff.
-                                           # Left at 0.0/unsupplied, the OI sub-score is simply
-                                           # skipped (see stage1_futures_market_state()).
+                                           # contracts (not %). [PR3] Populated by callers via
+                                           # utils.oi_snapshot_store.record_and_diff_value() —
+                                           # fetch_futures_snapshot_batch()/fetch_single_futures_
+                                           # oi_upstox() only ever return a point-in-time level,
+                                           # same day-rollover baseline tracker options'
+                                           # ce_oi_change/pe_oi_change already use. Left at 0.0 on
+                                           # a symbol's first poll of the day (no baseline yet) or
+                                           # if the futures fetch failed — both the Stage 1 OI
+                                           # sub-score (stage1_futures_market_state()) and Stage
+                                           # 3's futures-OI-divergence read treat 0.0 as "skipped",
+                                           # not "flat OI".
     fut_days_to_expiry:   int = 0
     # Same-day evidence on the FUTURES contract's own 5-minute chart
     # (fetch_futures_intraday_5m_upstox(), PR1) — feeds
@@ -1015,9 +1020,10 @@ class DerivativeResult:
     corridor_score: float
     upside_room_score: float
     downside_room_score: float
-    resistance: float
-    support: float
-    expected_move: float
+    futures_oi_divergence_score: float = 50.0    # [PR3] see stage3_derivative_intelligence()
+    resistance: float = 0.0
+    support: float = 0.0
+    expected_move: float = 0.0
     reasons: tuple = ()
 
 
@@ -1231,10 +1237,11 @@ def stage1_futures_market_state(inp: DOREInput, cfg: DORESettings) -> FuturesMar
       - OI: long-buildup / short-buildup / short-covering / long-
         unwinding, read off fut_oi_change's sign against the contract's
         own day's price direction (fut_ltp vs fut_prev_close) — standard
-        futures OI-price interpretation. Currently near-always skipped
-        in production (see DOREInput.fut_oi_change's docstring — no
-        fetcher populates it yet); PR3's OI/price-divergence work on
-        Stage 3 is the more rigorous long-term home for this read.
+        futures OI-price interpretation. [PR3] fut_oi_change is now
+        populated live for both indices and stocks (see fo_scan.py's
+        record_and_diff_value() wiring) — this still reads 0.0/skipped
+        on a symbol's first poll of the day (no baseline yet), same as
+        options' ce_oi_change/pe_oi_change on their own first poll.
       - Basis: compute_futures_basis()'s (PR1) annualized futures-vs-
         spot premium — normal contango reads neutral-to-bullish,
         backwardation reads bearish.
@@ -2127,6 +2134,57 @@ def stage3_derivative_intelligence(
         (base_strength_score, cfg.w_deriv_base_strength),
     ])
 
+    # ── Futures OI/price divergence (PR3, DORE_FUTURES_MIGRATION_
+    #    PLAN_v2.md §3/§4) — does the FUTURES contract's own OI-price
+    #    positioning agree with the OPTIONS-chain writing read above?
+    #    Same four-way buildup classification stage1_futures_market_
+    #    state()'s OI sub-score uses (long-buildup/short-buildup/short-
+    #    covering/long-unwinding off fut_oi_change's sign vs fut_ltp
+    #    vs fut_prev_close), just re-purposed here as a CONFIRMATION
+    #    check against `direction` rather than a standalone directional
+    #    score. Neutral (50.0) — not excluded from the weighted blend,
+    #    same "still counts, just uninformative" pattern spread_score/
+    #    premium_quality_score use above — whenever fut_oi_change reads
+    #    0.0 (a symbol's first poll of the day, no baseline yet, or the
+    #    futures fetch failed this cycle; see DOREInput.fut_oi_change's
+    #    docstring) or there's no directional intent to confirm against.
+    futures_oi_divergence_score = 50.0
+    if direction is not None and inp.fut_available and inp.fut_oi_change != 0.0 \
+            and inp.fut_ltp > 0 and inp.fut_prev_close > 0:
+        fut_price_up = inp.fut_ltp > inp.fut_prev_close
+        fut_oi_up = inp.fut_oi_change > 0
+        if fut_price_up and fut_oi_up:
+            fut_buildup = "Long Buildup"
+        elif fut_price_up and not fut_oi_up:
+            fut_buildup = "Short Covering"
+        elif not fut_price_up and fut_oi_up:
+            fut_buildup = "Short Buildup"
+        else:
+            fut_buildup = "Long Unwinding"
+
+        # direction == "CE" -> bullish thesis: Long Buildup confirms it
+        # outright (fresh long positioning), Short Covering is a weaker
+        # same-side confirm (shorts exiting, not new longs), Long
+        # Unwinding is a soft warning (longs themselves exiting), Short
+        # Buildup is an outright contradiction (fresh short conviction
+        # against a bullish options thesis). Mirrored for "PE".
+        _CONFIRM_MAP = {
+            "CE": {"Long Buildup": 100.0, "Short Covering": 65.0,
+                   "Long Unwinding": 35.0, "Short Buildup": 0.0},
+            "PE": {"Short Buildup": 100.0, "Long Unwinding": 65.0,
+                   "Short Covering": 35.0, "Long Buildup": 0.0},
+        }
+        futures_oi_divergence_score = _CONFIRM_MAP[direction][fut_buildup]
+        if futures_oi_divergence_score >= 65.0:
+            reasons.append(f"Futures OI confirms {direction}: {fut_buildup} "
+                            f"(fut OI {inp.fut_oi_change:+.0f})")
+        elif futures_oi_divergence_score <= 35.0:
+            reasons.append(f"Futures OI diverges from {direction}: {fut_buildup} "
+                            f"(fut OI {inp.fut_oi_change:+.0f}) — contradicts the options-chain read")
+    else:
+        reasons.append("Futures OI change/contract not available this cycle — "
+                        "OI divergence read skipped")
+
     # ── Premium quality (liquidity / spread — NOT valuation, NOT ──────
     #    behaviour). RFC-001 §7: Stage 3 "Must not evaluate option
     #    pricing" — the premium-vs-ATR-ceiling richness read that used
@@ -2296,10 +2354,11 @@ def stage3_derivative_intelligence(
         corridor_score = _weighted([(upside_room_score, 50.0), (downside_room_score, 50.0)])
 
     confidence = _weighted([
-        (oi_structure_score,      cfg.w_deriv_oi_writing + cfg.w_deriv_pcr + cfg.w_deriv_base_strength),
-        (premium_quality_score,   cfg.w_deriv_premium_quality),
-        (premium_behavior_score,  cfg.w_deriv_premium_behavior),
-        (corridor_score,          cfg.w_deriv_corridor),
+        (oi_structure_score,          cfg.w_deriv_oi_writing + cfg.w_deriv_pcr + cfg.w_deriv_base_strength),
+        (premium_quality_score,       cfg.w_deriv_premium_quality),
+        (premium_behavior_score,      cfg.w_deriv_premium_behavior),
+        (corridor_score,              cfg.w_deriv_corridor),
+        (futures_oi_divergence_score, cfg.w_deriv_futures_divergence),
     ])
 
     logger.debug("[DORE:%s] Stage3 reasons=%s", inp.symbol, reasons)
@@ -2313,6 +2372,7 @@ def stage3_derivative_intelligence(
         corridor_score=corridor_score,
         upside_room_score=upside_room_score,
         downside_room_score=downside_room_score,
+        futures_oi_divergence_score=futures_oi_divergence_score,
         resistance=resistance,
         support=support,
         expected_move=expected_move,
@@ -3536,11 +3596,14 @@ def build_dore_input(
                                                         # futures read is skipped for this symbol (fail-soft).
     futures_snapshot: Optional[dict] = None,          # [PR2] e.g. fetch_futures_snapshot_batch()'s per-symbol
                                                         # dict — {"ltp", "oi", "oi_change"?, "volume", "expiry"}.
-                                                        # "oi_change" is accepted but not currently populated by
-                                                        # any fetcher (see DOREInput.fut_oi_change's docstring) —
-                                                        # forward-compatible once an OI-change tracker exists.
-                                                        # Also the fallback source for fut_ltp/fut_available
-                                                        # when futures_trend_features wasn't supplied.
+                                                        # [PR3] "oi_change" is now populated by callers via
+                                                        # utils.oi_snapshot_store.record_and_diff_value() before
+                                                        # this function is called (see fo_scan.py's live loop) —
+                                                        # no fetcher returns a delta natively, so it's always
+                                                        # derived upstream, same pattern as ce_oi_change/
+                                                        # pe_oi_change on atm_chain_row. Also the fallback source
+                                                        # for fut_ltp/fut_available when futures_trend_features
+                                                        # wasn't supplied.
     futures_execution_features: Optional[dict] = None,  # [PR2] {"fut_vwap", "fut_fresh_crossover",
                                                         # "fut_fresh_crossunder"} — off the futures contract's
                                                         # own 5-minute chart (fetch_futures_intraday_5m_upstox()).

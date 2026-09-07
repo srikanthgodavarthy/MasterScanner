@@ -2313,6 +2313,28 @@ def fetch_futures_snapshot_batch(symbols: tuple) -> dict:
     return result
 
 
+def fetch_single_futures_oi_upstox(symbol: str) -> Optional[float]:
+    """OI for a single futures contract, generic across FUTSTK/FUTIDX via
+    resolve_futures_instrument_key(). fetch_futures_snapshot_batch() above
+    only handles FUTSTK (see its own docstring) — the three indices' own
+    OI was never fetched anywhere in the live pipeline before PR3, only
+    their expiry (fo_scan.py's index branch built futures_snapshot =
+    {"expiry": ...} and nothing else). One instrument_key, one quote —
+    not worth a batch endpoint for at most 3 symbols (NIFTY/BANKNIFTY/
+    SENSEX), same call-count reasoning already applied to their option
+    chain fetch. Returns None on any resolution/fetch failure (fail-soft,
+    same contract as every other fetcher in this module).
+    """
+    key = resolve_futures_instrument_key(symbol)
+    if key is None:
+        return None
+    quotes = _fetch_quotes_batch([key])
+    quote = quotes.get(key)
+    if quote is None:
+        return None
+    return float(quote.get("oi", 0) or 0)
+
+
 @st.cache_data(ttl=60, max_entries=40, show_spinner=False)
 def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
     """
