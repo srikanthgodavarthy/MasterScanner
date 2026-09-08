@@ -2486,33 +2486,28 @@ def _active_setups_zero_days_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
     from utils.setup_persistence import compute_pnl_pct, _compute_days_active
 
     try:
-        from utils.supabase_client import load_open_setup_plans_by_source, _is_available
+        from utils.supabase_client import load_open_setup_plans, _is_available
         if not _is_available():
             plans = []
         else:
-            # [2026-09-08 fix — SG report: SYRMA/GVT&D/SPLPETRO duplicated]
-            # Was: load_open_setup_plans() (no source filter — "oldest
-            # open plan per symbol, any source") + load_open_setup_plans_
-            # by_source("MOM"). For any symbol whose oldest/only open
-            # plan happens to be MOM-sourced, load_open_setup_plans()
-            # returns that same MOM plan (it doesn't know to exclude MOM
-            # — its docstring says "every OPEN setup plan", the "LS + PB"
-            # inline comment here was simply wrong), so it landed in both
-            # lists. Filtering MOM out of that call's result instead of
-            # replacing it wouldn't be safe either: when a symbol has
-            # BOTH an open LS/PB and an open MOM plan and the MOM one is
-            # older, load_open_setup_plans()'s one-row-per-symbol dedup
-            # picks the MOM row as that symbol's sole representative,
-            # silently dropping the still-open LS/PB plan from the dict
-            # entirely — filtering the MOM row back out then would lose
-            # it altogether rather than double-counting it. Explicit
-            # per-source calls sidestep the ambiguity: LS and PB are
-            # minted as mutually exclusive sources per symbol, so this
-            # can't itself introduce a new duplicate.
-            ls  = list(load_open_setup_plans_by_source("LS").values())
-            pb  = list(load_open_setup_plans_by_source("PB").values())
-            mom = list(load_open_setup_plans_by_source("MOM").values())
-            plans = ls + pb + mom
+            # [2026-09-08, SG request — revert to match Scanner page]
+            # Was: explicit LS + PB + MOM per-source union, to stop
+            # SYRMA/GVT&D/SPLPETRO/PPLPHARMA appearing twice here. That
+            # fix was real (load_open_setup_plans() alone landed the
+            # same MOM plan in both lists it was being combined with)
+            # but over-corrected: it made this widget show BOTH open
+            # plans on a symbol like PPLPHARMA (PB @ 229.14, MOM @
+            # 228.00) side by side, while the Scanner page's own Active
+            # Setups tab (_render_active_plans_tab, pages/scanner.py)
+            # has always used plain load_open_setup_plans() — one row
+            # per symbol, oldest plan wins, any other open plan on that
+            # symbol silently not shown there. Per SG: match that
+            # behaviour here too, rather than have this widget show more
+            # than the Scanner page does for the same symbol. The
+            # oldest-wins collapse plus the Source badge below (now
+            # shows whichever source actually won) is what makes
+            # PPLPHARMA read as one row instead of two again.
+            plans = list(load_open_setup_plans().values())
     except Exception:
         logger.exception("Dashboard Active Setups (0 Days) card failed to load plans (non-fatal)")
         plans = []
@@ -2544,6 +2539,7 @@ def _active_setups_zero_days_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
         cmp_px = live.get("cmp", 0.0)
         rows.append({
             "Symbol":  sym,
+            "Source":  str(getattr(p, "source", "") or "LS").upper().strip(),
             "PctChg":  live.get("pct_chg"),
             "Entry":   getattr(p, "entry_locked", 0.0) or 0.0,
             "Drift":   compute_pnl_pct(getattr(p, "entry_locked", 0.0), cmp_px) if cmp_px else None,
@@ -2554,16 +2550,40 @@ def _active_setups_zero_days_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
     df["_sort"] = pd.to_numeric(df["PctChg"], errors="coerce")
     df = df.sort_values("_sort", ascending=False, na_position="last").head(top_n)
 
+    # [2026-09-08, SG request] Same badge colors as pages/scanner.py's
+    # own _ap_source_badge() (LS blue/PB orange/MOM purple/FP green) so
+    # a source reads the same everywhere in the app, not a local
+    # reinvention — this file has no existing badge helper to import
+    # from cross-page, so it's a small local copy of just the color map.
+    _SRC_COLOR = {
+        "PB":  "#f97316",
+        "MOM": "#a371f7",
+        "FP":  "#3fb950",
+    }
+    def _src_badge(src: str) -> str:
+        clr = _SRC_COLOR.get(src, "#58a6ff")   # default: LS
+        return (f'<span style="background:{clr};color:#0d1117;font-weight:700;'
+                f'font-size:9px;border-radius:3px;padding:0px 5px;">{src}</span>')
+
     rows_html = ""
     for _, r in df.iterrows():
         chg = r["PctChg"]
         chg_ok = chg is not None and pd.notna(chg)
         drift_ok = r["Drift"] is not None and pd.notna(r["Drift"])
+        # [2026-09-08, SG request] "there is one duplication" (PPLPHARMA
+        # showing twice) — confirmed via direct DB query this isn't a
+        # bug: PPLPHARMA genuinely has two separate open plans today
+        # (PB @ 229.14, MOM @ 228.00), which this table had no way to
+        # distinguish since it never showed Source at all. Combined
+        # Source+Entry cell below (source label, entry price right
+        # under it) makes that visible instead of removing the row —
+        # removing either row would hide a real open trade.
         rows_html += (
             "<tr>"
             f'<td><span class="sr-sector-name" style="font-weight:700;" title="{r["Symbol"]}">{_tv_link(r["Symbol"])}</span></td>'
             + (f'<td class="{"sr-pos" if chg >= 0 else "sr-neg"}">{"+" if chg >= 0 else ""}{chg:.2f}%</td>' if chg_ok else '<td style="color:#8b949e;">—</td>')
-            + f'<td>{f"{r["Entry"]:,.2f}" if r["Entry"] else "—"}</td>'
+            + (f'<td>{_src_badge(r["Source"])}<br>'
+               f'<span style="font-size:11px;">{f"{r["Entry"]:,.2f}" if r["Entry"] else "—"}</span></td>')
             + (f'<td class="{"sr-pos" if r["Drift"] >= 0 else "sr-neg"}">{"+" if r["Drift"] >= 0 else ""}{r["Drift"]:.2f}%</td>' if drift_ok else '<td style="color:#8b949e;" title="Not in today\'s scan">—</td>')
             + f'<td>{f"{r["Target"]:,.2f}" if r["Target"] else "—"}</td>'
             "</tr>"
@@ -2575,10 +2595,10 @@ def _active_setups_zero_days_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
       <div class="sr-panel-body">
       <table class="sr-table sr-table--snapshot">
         <colgroup>
-          <col style="width:26%"><col style="width:16%"><col style="width:19%">
+          <col style="width:24%"><col style="width:14%"><col style="width:20%">
           <col style="width:19%"><col style="width:20%">
         </colgroup>
-        <tr><th>SYMBOL</th><th>%CHG</th><th>ENTRY</th><th>DRIFT</th><th>TARGET</th></tr>
+        <tr><th>SYMBOL</th><th>%CHG</th><th>SOURCE / ENTRY</th><th>DRIFT</th><th>TARGET</th></tr>
         {rows_html}
       </table>
       </div>

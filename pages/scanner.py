@@ -2994,8 +2994,8 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
     # Entry/SL/T1 to find them.
     header = (
         '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th>'
-        '<th>CV4 Composite</th><th>Volume</th><th>CMP</th><th>Source</th>'
-        '<th>Entry (Oldest)</th><th>SL (CV4)</th><th>T1 (CV4)</th><th>PnL%</th>'
+        '<th>CV4 Composite</th><th>Volume</th><th>CMP</th><th>Source / Entry</th>'
+        '<th>SL (CV4)</th><th>T1 (CV4)</th><th>PnL%</th>'
         '<th>No of Days</th></tr>'
     )
     body = ""
@@ -3031,8 +3031,18 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             f'<td class="col-num">{r["CV4Composite"]:.1f}</td>'
             + _vol_cell
             + f'<td class="col-num">{_px(r["CurrentPrice"])}</td>'
-            f'<td>{_ap_source_badge(r["Source"], r["ContribSources"])}</td>'
-            f'<td class="col-num">{_px(r["Entry"])}</td>'
+            # [2026-09-08, SG request] Entry price shown directly under
+            # the Source badge(s), not a separate far-away column — one
+            # combined cell reads as "this source, at this locked
+            # entry" at a glance. Note: this row's Entry is the ONE
+            # frozen entry_locked value on the plan itself (oldest-
+            # plan-wins — see _corroborate_cross_source()'s docstring),
+            # the same number regardless of how many badges show here;
+            # a corroborating source's OWN computed entry isn't
+            # separately persisted per-source today (only whether it
+            # diverged, via ConflictFlag/ConflictReason above).
+            f'<td>{_ap_source_badge(r["Source"], r["ContribSources"])}<br>'
+            f'<span class="col-num" style="font-size:11px;">{_px(r["Entry"])}</span></td>'
             f'<td class="col-num">{_px(r["SL"])}</td>'
             f'<td class="col-num">{_px(r["T1"])}</td>'
             + _ap_pnl_cell(r["PnLPct"])
