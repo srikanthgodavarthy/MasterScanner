@@ -3811,14 +3811,23 @@ def compute_index_dore(index_key: str, ohlcv, oi: dict, ce_pe_chg: tuple,
     """Full index-level DORE 2.0 read (Stage 1-5 + position sizing) for
     one of NIFTY / SENSEX / BANKNIFTY, as a JSON-safe dict.
 
+    [Orphaned, 2026-09-08] Its only caller,
+    utils.market_intelligence.compute_all_index_dore(), was removed —
+    indices moved to the DORE Options tab (utils.dore_options_scan),
+    which never called this function. Left in place rather than deleted
+    since utils.fo_scan and this module's own compute_index_dore()-
+    adjacent helper (fetch_symbol_futures_daily_and_execution_features())
+    are unrelated and unaffected either way, but nothing calls this
+    function today — grep the repo to confirm before relying on it, and
+    consider deleting it in a dedicated cleanup pass (same category as
+    stage2_5_cv4_evidence()'s already-known dead-code status).
+
     [2026-08-25] Moved here from utils.market_intelligence._index_dore —
     market_intelligence's job is assembling the Market Intelligence
     panel (breadth/regime/index snapshots), not running the DORE
     pipeline itself. DORE's own module is the right owner of "what does
     a DORE read for an index look like", including the position-sizing
     step that turns a DOREResult into lots/quantity/capital-at-risk.
-    Callers (utils.market_intelligence, scheduler/scan_worker.py) just
-    consume this and slot the dict into their own index_cards payload.
     Returns None (non-fatal, logged) on any failure — same fail-soft
     contract the old _index_dore had.
 

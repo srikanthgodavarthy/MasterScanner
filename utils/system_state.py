@@ -238,23 +238,25 @@ def _parse_ts(val) -> Optional[datetime]:
 
 # [Ops fix, 2026-08-26] Process-wide cache for get_system_state().
 #
-# scheduler/scan_worker.py runs 5 independent loop threads
-# (market_intelligence, dore_live_state, index_dore, live_scanner,
-# retention), and every one of them calls should_scheduler_run() ->
+# scheduler/scan_worker.py runs 4 independent loop threads
+# (market_intelligence, dore_live_state, live_scanner, retention) —
+# was 5 until the "index_dore" job was removed 2026-09-08 (indices
+# moved to the DORE Options tab, see utils.market_intelligence's module
+# docstring) — and every one of them calls should_scheduler_run() ->
 # get_system_state() at its own cycle boundary — including the 600s
 # "are we still paused?" poll each does outside market hours (see that
 # file's 2026-08-22 comment on _run_loop). Each loop's 600s timer is
 # independent and drifts against the others as each cycle's actual
-# compute takes a different amount of time, so in aggregate the 5
-# uncached pollers were still touching Neon far more often than once
-# per 600s — confirmed via the Neon console showing compute
+# compute takes a different amount of time, so in aggregate the (then 5,
+# now 4) uncached pollers were still touching Neon far more often than
+# once per 600s — confirmed via the Neon console showing compute
 # continuously allocated overnight, and via the SSL-dropped-connection
 # retry warnings in utils.db logged whenever a poll landed right after
 # Neon suspended in one of the rare gaps between them.
 #
 # Fix: cache the row for _STATE_CACHE_TTL_SECS, guarded by a lock that's
 # held across the actual DB call on a miss (not just the cache check).
-# Whichever of the 5 loops asks first after the cache goes stale pays
+# Whichever loop asks first after the cache goes stale pays
 # for one real Neon round trip; every other thread that asks — whether
 # it was already waiting on the lock or wakes up anywhere in the next
 # ~9 minutes — gets that same cached answer for free. This is what

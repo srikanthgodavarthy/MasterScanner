@@ -428,7 +428,11 @@ def _market_intelligence_compute():
 
 
 def _market_intelligence_payload(raw: dict):
-    return raw, len((raw or {}).get("index_cards", []))
+    # [Removed, 2026-09-08] Used to count "index_cards" — see
+    # utils.market_intelligence's module docstring for why that key is
+    # gone. row_count here now just reflects whether a summary was
+    # produced at all (0 or 1), matching this job's now-summary-only shape.
+    return raw, (1 if (raw or {}).get("summary") else 0)
 
 
 # ── F&O Scan — every 60s ─────────────────────────────────────────────
@@ -457,26 +461,6 @@ def _dore_live_state_payload(raw: dict):
     return raw, len((raw or {}).get("live_state", []))
 
 
-# ── Index DORE 2.0 — every 60s ───────────────────────────────────────
-# [2026-08-25] Indices used to get their DORE 2.0 read bundled inline
-# inside the market_intelligence job itself (every 180s, full Stage
-# 1-5 recompute each time). Split out to its own job, on stocks' own
-# DORE-refresh cadence (60s, same as dore_live_state above), so
-# NIFTY/SENSEX/BANKNIFTY follow the identical "compute on a dedicated
-# schedule, write a snapshot, everyone else just reads it" shape stocks
-# already get — see utils.market_intelligence.compute_all_index_dore's
-# docstring. market_intelligence itself (still every 180s, since its
-# other fields — breadth/regime/OI/EMA — don't need 60s freshness) now
-# just reads whatever this job last wrote instead of recomputing DORE.
-def _index_dore_compute():
-    from utils.market_intelligence import compute_all_index_dore
-    return compute_all_index_dore()
-
-
-def _index_dore_payload(raw: dict):
-    return raw, sum(1 for v in (raw or {}).values() if v)
-
-
 # JOBS covers only the single-call jobs that run through the generic
 # _run_loop. live_scanner is intentionally NOT here — it runs via
 # _run_live_scanner_loop on its own dedicated thread (see main() and
@@ -498,10 +482,18 @@ JOBS = [
     # to "dore_technical_plans" (produced once per live_scanner cycle,
     # not by this job) and refreshes only market-dependent fields.
     ("dore_live_state",     "dore_live_state",     60,  _dore_live_state_compute,     _dore_live_state_payload),
-    # [2026-08-25] Indices' own DORE 2.0 read, on the same 60s cadence
-    # as dore_live_state above — see _index_dore_compute's comment.
-    ("index_dore",          "index_dore",          60,  _index_dore_compute,          _index_dore_payload),
+    # [Removed, 2026-09-08] "index_dore" job (utils.market_intelligence.
+    # compute_all_index_dore -> utils.dore_engine.compute_index_dore)
+    # used to live here — NIFTY/SENSEX/BANKNIFTY's own DORE 2.0 read,
+    # feeding the Market Intelligence page's index cards. Indices are
+    # already covered by the DORE Options engine's own live pipeline
+    # (utils.dore_options_scan.compute_dore_technical_plans, run every
+    # live_scanner cycle — see its own index_symbols handling) —
+    # running a second, independent DORE computation for the same three
+    # indices on its own 60s schedule was pure duplication once that
+    # engine existed. Indices now surface ONLY via the DORE Options tab.
 ]
+
 
 
 def _live_scan_records(df: pd.DataFrame) -> list[dict]:

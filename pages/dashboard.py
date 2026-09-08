@@ -1841,247 +1841,11 @@ def _dore_debug_html(dore: dict, reasons: list, warnings: list) -> str:
     ])
 
 
-def _index_card_html(label: str, snapshot: dict | None, oi: dict | None,
-                      grad_id: str, badge: str = "", ema: dict | None = None,
-                      dore: dict | None = None) -> str:
-    """
-    Render one equal-width Market Overview index card: EMA20/50/200 badge
-    row, live price, %chg, intraday sparkline, OHLC row, and nearest-expiry
-    CE/PE OI resistance (strike, OI, premium). Used identically for
-    NIFTY 50, SENSEX, and BANK NIFTY so all three stay visually symmetric.
-
-    snapshot: {"price", "pct_chg", "open", "high", "low", "prev_close",
-               "spark", "source"} — utils.scanner_engine index snapshot fns.
-    oi: {"expiry", "ce_strike", "ce_oi", "ce_premium",
-         "pe_strike", "pe_oi", "pe_premium"} — utils.upstox_client.
-         fetch_oi_resistance(). None/empty renders "—" throughout.
-    ema: {"ema20"/"above_ema20", "ema50"/"above_ema50",
-          "ema200"/"above_ema200"} — utils.scanner_engine.compute_ema_levels()
-          / fetch_sensex_ema_levels(). A span is simply skipped in the badge
-          row if it's missing (not enough history yet). None/empty hides
-          the whole row.
-    dore: utils.dore_engine.DOREResult.as_dict() — {"recommendation",
-          "confidence", "reasons", "warnings", ...}. None/empty hides the
-          whole DORE row (e.g. while an index BarResult couldn't be built
-          yet, or DORE hasn't been wired up in this deployment).
-    grad_id: unique sparkline gradient id (see _nifty_spark_svg).
-    badge: optional small right-aligned tag, e.g. "(delayed)".
-    """
-    snapshot = snapshot or {}
-    oi       = oi or {}
-    ema      = ema or {}
-
-    price      = snapshot.get("price", 0.0)
-    pct_chg    = snapshot.get("pct_chg")
-    open_px    = snapshot.get("open", 0.0)
-    high_px    = snapshot.get("high", 0.0)
-    low_px     = snapshot.get("low", 0.0)
-    prev_close = snapshot.get("prev_close")
-    spark_vals = snapshot.get("spark", [])
-
-    if pct_chg is not None:
-        up        = pct_chg >= 0
-        chg_color = "#3fb950" if up else "#f85149"
-        arrow     = "▲" if up else "▼"
-        pt_chg    = (price - prev_close) if prev_close else 0.0
-        chg_html  = (
-            f'<span style="color:{chg_color};font-weight:700;">'
-            f'{arrow} {"+" if up else ""}{pct_chg:.2f}%</span>'
-            f'<span style="color:var(--muted);font-weight:600;margin-left:6px;">'
-            f'({"+" if pt_chg >= 0 else ""}{pt_chg:,.1f})</span>'
-        )
-        spark_color = chg_color
-    else:
-        chg_html    = '<span style="color:var(--muted)">—</span>'
-        spark_color = "#8b949e"
-
-    price_str = f"{price:,.0f}" if price else "—"
-    spark_svg = _nifty_spark_svg(spark_vals, spark_color, width=88, height=32, grad_id=grad_id)
-
-    def _ohlc_item(lbl, val, color="var(--text)"):
-        txt = f"{val:,.0f}" if val else "—"
-        return (f'<div class="mo-index-ohlc-item"><div class="mo-index-ohlc-label">{lbl}</div>'
-                f'<div class="mo-index-ohlc-val" style="color:{color}">{txt}</div></div>')
-
-    ohlc_html = (
-        _ohlc_item("Open", open_px) +
-        _ohlc_item("High", high_px, "#3fb950") +
-        _ohlc_item("Low", low_px, "#f85149") +
-        _ohlc_item("Prev. Close", prev_close or 0)
-    )
-
-    def _oi_item(lbl, strike, oi_val, premium, color):
-        if strike is None:
-            val_html  = '<span style="color:var(--muted)">—</span>'
-            meta_html = ""
-        else:
-            oi_str    = f"{oi_val:,.0f}" if oi_val else "0"
-            prem_str  = f"₹{premium:,.2f}" if premium else "—"
-            val_html  = f'<span style="color:{color}">{strike:,.0f}</span>'
-            meta_html = f'<div class="mo-index-oi-meta">OI {oi_str} · Premium: {prem_str}</div>'
-        return (f'<div class="mo-index-oi-item"><div class="mo-index-oi-label">{lbl}</div>'
-                f'<div class="mo-index-oi-val">{val_html}</div>{meta_html}</div>')
-
-    oi_html = (
-        _oi_item("CE OI Resistance", oi.get("ce_strike"), oi.get("ce_oi"), oi.get("ce_premium"), "#f85149") +
-        _oi_item("PE OI Support",    oi.get("pe_strike"), oi.get("pe_oi"), oi.get("pe_premium"), "#3fb950")
-    )
-    expiry = oi.get("expiry", "")
-    pcr    = oi.get("pcr")
-    pcr_html = (
-        f' · PCR: <span style="color:{"#3fb950" if pcr >= 1 else "#f85149"};font-weight:700">{pcr:.2f}</span>'
-        if pcr is not None else ""
-    )
-    expiry_html = f"Nearest expiry: {expiry}{pcr_html}" if expiry else f"Nearest expiry: —{pcr_html}"
-    badge_html  = f'<span class="mo-index-badge">{badge}</span>' if badge else ""
-
-    ema_specs = (("EMA20", "ema20", "above_ema20"),
-                 ("EMA50", "ema50", "above_ema50"),
-                 ("EMA200", "ema200", "above_ema200"))
-    ema_items = []
-    for ema_lbl, val_key, ok_key in ema_specs:
-        if val_key not in ema:
-            continue
-        ema_ok    = bool(ema.get(ok_key))
-        ema_color = "#3fb950" if ema_ok else "#f85149"
-        ema_mark  = "✓" if ema_ok else "✕"
-        ema_items.append(
-            f'<div class="mo-index-ema-item" style="border-color:{ema_color}55">'
-            f'<div class="mo-index-ema-label">{ema_lbl}</div>'
-            f'<div class="mo-index-ema-val" style="color:{ema_color}">'
-            f'{ema[val_key]:,.0f} <span class="mo-index-ema-check">{ema_mark}</span></div>'
-            f'</div>'
-        )
-    ema_row_html = f'<div class="mo-index-ema-row">{"".join(ema_items)}</div>' if ema_items else ""
-
-    # Market Bias — reuses DORE's own Stage 1 output (stage1_market_bias(),
-    # already computed for the DORE recommendation below) rather than a
-    # second, separately-computed bias figure. BULLISH/BEARISH/NEUTRAL +
-    # the underlying 0-100 score.
-    bias_html = ""
-    if dore and dore.get("market_bias_label"):
-        _bias_lbl = dore["market_bias_label"]
-        _bias_val = dore.get("market_bias", 50.0)
-        _bias_color = {"BULLISH": "#3fb950", "BEARISH": "#f85149"}.get(_bias_lbl, "#8b949e")
-        bias_html = (
-            f'<span class="mo-index-badge" style="color:{_bias_color};border-color:{_bias_color}55;'
-            f'background:{_bias_color}14;margin-left:6px;">{_bias_lbl} {_bias_val:.0f}</span>'
-        )
-
-    dore_html = ""
-    if dore:
-        rec        = dore.get("recommendation", "WAIT")
-        conf       = dore.get("confidence", 0)
-        color, lbl = _DORE_BADGE_STYLE.get(rec, ("#8b949e", rec))
-        reasons    = dore.get("reasons") or []
-        warnings   = dore.get("warnings") or []
-        top_reason = reasons[-1] if reasons else ""   # Stage 5's own reason is appended last
-        tooltip    = " · ".join(reasons)[:500].replace('"', "'")
-        strike     = dore.get("suggested_strike")
-        strike_type = dore.get("recommended_strike_type")
-        strike_html = (
-            f'<span class="mo-index-dore-strike" style="color:var(--muted);margin-left:6px;">'
-            f'{strike:,.0f}{f" {strike_type}" if strike_type else ""}</span>'
-            if strike else ""
-        )
-        warn_html  = (
-            f'<div class="mo-index-dore-warn">⚠ {warnings[0]}</div>' if warnings else ""
-        )
-        # Intraday Reversal Alert (2026-07-22, see check_intraday_reversal_alert
-        # in dore_engine.py) — deliberately informational-only, never gates
-        # the recommendation, but it was ALSO never actually visible on this
-        # card: it's appended near the end of the `warnings` list above, and
-        # warn_html only ever renders warnings[0] — so any risk/OI warning
-        # ahead of it (very common) silently buried it. Reads the dedicated
-        # DOREResult fields directly instead of relying on warnings order, so
-        # a genuine big-move-against-trend day always shows up regardless of
-        # what else is in the warnings list.
-        reversal_html = ""
-        if dore.get("intraday_reversal_alert"):
-            _rev_pct = dore.get("intraday_reversal_move_pct", 0.0)
-            reversal_html = (
-                f'<div class="mo-index-dore-warn" style="color:#d29922;border-color:#d2992255;">'
-                f'⚡ Intraday Reversal Alert ({_rev_pct:+.2f}%) — {dore.get("intraday_reversal_reason", "")}'
-                f'</div>'
-            )
-        # Position Sizing (utils/position_sizing.py) — downstream of DORE,
-        # never re-deriving anything above. Only rendered when the card
-        # is actually holding a DOREResult with a resolvable sizing state
-        # (i.e. dore.get("lots") is present — a plain WAIT/NO_TRADE dict
-        # from an older cache without sizing fields just skips this row).
-        sizing_html = ""
-        if "lots" in dore:
-            if dore.get("sizing_blocked"):
-                _size_reason = dore.get("sizing_reason", "") or "blocked"
-                sizing_html = f'<div class="mo-index-dore-warn">🚫 Sizing: {_size_reason}</div>'
-            elif dore.get("lots"):
-                sizing_html = (
-                    f'<div class="mo-index-dore-reason">'
-                    f'{dore["lots"]} lot(s) · {dore.get("quantity", 0)} qty · '
-                    f'₹{dore.get("capital_at_risk", 0):,.0f} at risk '
-                    f'({dore.get("capital_at_risk_pct", 0):.1f}%)</div>'
-                )
-        # Built via list+join rather than an f-string with {warn_html} on
-        # its own line: when there are no warnings, warn_html is "" and an
-        # interpolated-empty line like "  \n" is a whitespace-only line —
-        # CommonMark treats that as blank, which terminates the raw-HTML
-        # block Streamlit's markdown parser opened at the top-level
-        # <div class="mo-index-card"> and makes everything after it
-        # (including sibling cards, since all three share one st.markdown
-        # call) fall back to indented-code-block parsing and render as
-        # literal escaped tags instead of HTML.
-        dore_html_parts = [
-            f'<div class="mo-index-dore-row" title="{tooltip}">'
-            f'<span class="mo-index-dore-badge" style="color:{color};border-color:{color}55;background:{color}14">{lbl}</span>'
-            f'<span class="mo-index-dore-conf" style="color:{color}">{conf:.0f}%</span>'
-            f'{strike_html}'
-            f'</div>',
-            f'<div class="mo-index-dore-reason">{top_reason}</div>',
-        ]
-        if warn_html:
-            dore_html_parts.append(warn_html)
-        if reversal_html:
-            dore_html_parts.append(reversal_html)
-        if sizing_html:
-            dore_html_parts.append(sizing_html)
-        dore_html_parts.append(_dore_debug_html(dore, reasons, warnings))
-        dore_html = "\n".join(dore_html_parts)
-
-    card_parts = [
-        '<div class="mo-index-card">',
-    ]
-    if ema_row_html:
-        card_parts.append(ema_row_html)
-    card_parts.append(f'<div class="mo-index-label"><span>{label}</span>{badge_html}{bias_html}</div>')
-    card_parts.append(
-        f'<div class="mo-index-row">'
-        f'<div><div class="mo-index-price">{price_str}</div>'
-        f'<div class="mo-index-chg">{chg_html}</div></div>'
-        f'{spark_svg}'
-        f'</div>'
-    )
-    card_parts.append(f'<div class="mo-index-ohlc-row">{ohlc_html}</div>')
-    card_parts.append(f'<div class="mo-index-oi-row">{oi_html}</div>')
-    card_parts.append(f'<div class="mo-index-expiry">{expiry_html}</div>')
-    if dore_html:
-        card_parts.append(dore_html)
-    card_parts.append('</div>')
-    return "\n".join(card_parts)
-
-
-def _index_cards_html(index_cards: list[dict]) -> str:
-    """The NIFTY 50 / SENSEX / BANK NIFTY index-card row, split out of
-    _market_overview_panel so it can be placed in the left column
-    (under the top strip) rather than bundled into the top strip itself."""
-    cards_html = "".join(
-        _index_card_html(
-            c.get("label", ""), c.get("snapshot"), c.get("oi"),
-            grad_id=f"moSpark{i}", badge=c.get("badge", ""), ema=c.get("ema"),
-            dore=c.get("dore"),
-        )
-        for i, c in enumerate(index_cards)
-    )
-    return f'<div class="mo-index-grid">{cards_html}</div>'
+# [Removed, 2026-09-08] _index_card_html()/_index_cards_html() — the
+# NIFTY/SENSEX/BANK NIFTY Market Overview card row — used to live here.
+# Deleted along with their only caller (see the "Full Sector Rotation
+# Analysis" render() section above) once indices moved to the DORE
+# Options tab; see utils.market_intelligence's module docstring.
 
 
 def _market_health_extra_cards_html(summary: dict, breadth: dict) -> str:
@@ -2131,10 +1895,11 @@ def _market_health_extra_cards_html(summary: dict, breadth: dict) -> str:
 def _market_overview_panel(summary: dict, breadth: dict, scan_time: str) -> str:
     """
     Full-width single row: Regime / Trend Strength / Market Breadth /
-    VIX / 52W Hi-Lo / EMA breadth. Index cards (NIFTY 50, SENSEX, BANK
-    NIFTY) are rendered separately via _index_cards_html() in the left
-    column, not inside this panel — see _market_health_extra_cards_html()
+    VIX / 52W Hi-Lo / EMA breadth — see _market_health_extra_cards_html()
     for the 52W Hi/Lo and EMA breadth cards folded into this row.
+    [Removed, 2026-09-08] Index cards (NIFTY 50, SENSEX, BANK NIFTY)
+    used to render separately in the left column — see
+    utils.market_intelligence's module docstring for why they're gone.
 
     2026-07-27: Sector Rotating In/Stable/Out counts and Today's Sector
     Flow were removed from this strip and from the right-sidebar
@@ -2844,7 +2609,6 @@ def _market_intelligence_fragment():
 
     summary     = payload.get("summary", {})
     breadth     = payload.get("breadth", {})
-    index_cards = payload.get("index_cards", [])
     scan_time   = ""
     _created_at = st.session_state.get("mi_snapshot_created_at", "")
     if _created_at:
@@ -2852,11 +2616,6 @@ def _market_intelligence_fragment():
             scan_time = pd.to_datetime(_created_at).tz_convert(_IST).strftime("%H:%M:%S")
         except Exception:
             scan_time = ""
-
-    # index_cards is stashed for the left column (_index_cards_html(), called
-    # separately in render()) rather than rendered inside this panel — see
-    # _market_overview_panel()'s docstring for why the two were split.
-    st.session_state["dash_index_cards"] = index_cards
 
     # 2026-07-27: this panel no longer shows Sector Rotating In/Stable/Out
     # or Today's Sector Flow (removed — see _market_overview_panel's
@@ -3487,28 +3246,27 @@ def render(settings: dict | None = None):
     #    "Full Sector Rotation Analysis" section further down. ──────────
     _market_intelligence_fragment()
 
-    # 2026-07-28: index cards were shrunk (smaller fonts/padding/
-    # sparkline, see .mo-index-card CSS) so NSE Top Gainers can sit to
-    # their right on the same row instead of its own row further down.
-    idx_col, gainers_col = st.columns([1.7, 1], gap="medium")
-    with idx_col:
-        st.markdown(_index_cards_html(st.session_state.get("dash_index_cards", [])),
-                    unsafe_allow_html=True)
-    with gainers_col:
-        st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
-        # [2026-08-05] Today's Sector Flow moved up to sit directly below
-        # Top Gainers in this same narrow column, rendered at compact=True
-        # (smaller padding/fonts, see _today_sector_flow_compact_html) so
-        # it fits without pushing the column much taller. Previously this
-        # lived in its own full-width row further down next to Live
-        # Scanner Snapshot — see that row below, now Snapshot-only.
-        from utils.sector_rotation import compute_sector_flow
-        _flow = compute_sector_flow(sector_stats)
-        st.markdown(_today_sector_flow_compact_html(_flow, rows=2, compact=True),
-                    unsafe_allow_html=True)
-        _sectors_page = settings.get("sectors_page")
-        if _sectors_page is not None:
-            st.page_link(_sectors_page, label="View full Sector Rotation Analysis →", icon="🧭")
+    # [Removed, 2026-09-08] The NIFTY/SENSEX/BANKNIFTY index-card row
+    # (_index_cards_html(), fed by the now-removed "index_dore" job —
+    # see utils.market_intelligence's module docstring) used to sit in
+    # a narrow left column here, with NSE Top Gainers to its right.
+    # Indices are DORE Options tab territory now; Top Gainers takes the
+    # full row instead of sharing it.
+    st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
+    # [2026-08-05] Today's Sector Flow moved up to sit directly below
+    # Top Gainers in this same narrow column, rendered at compact=True
+    # (smaller padding/fonts, see _today_sector_flow_compact_html) so
+    # it fits without pushing the column much taller. Previously this
+    # lived in its own full-width row further down next to Live
+    # Scanner Snapshot — see that row below, now Snapshot-only.
+    from utils.sector_rotation import compute_sector_flow
+    _flow = compute_sector_flow(sector_stats)
+    st.markdown(_today_sector_flow_compact_html(_flow, rows=2, compact=True),
+                unsafe_allow_html=True)
+    _sectors_page = settings.get("sectors_page")
+    if _sectors_page is not None:
+        st.page_link(_sectors_page, label="View full Sector Rotation Analysis →", icon="🧭")
+
 
     # [Dashboard/Scanner split] Scanner output (Elite/Execute/Actionable/
     # ... tables, Signal Class counts) and the DORE 2.0 F&O Opportunity
