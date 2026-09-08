@@ -2894,6 +2894,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             live_lookup[sym] = {
                 "cmp":         float(r.get("Entry", 0) or 0),
                 "current_rec": str(r.get("Recommendation", r.get("Category", ""))),
+                "composite":   float(r.get("CV1_Composite", 0) or 0),
                 "pct_chg":     float(r.get("%Chg", 0) or 0),
                 "vol_ratio":   float(r.get("VolRatio", 0) or 0),
             }
@@ -2914,12 +2915,10 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             "SL":           plan.sl_locked,
             "T1":           plan.t1_locked,
             "CurrentPrice": cmp_px,
+            "CV4Composite": live.get("composite", 0.0),
             "PnLPct":       compute_pnl_pct(plan.entry_locked, cmp_px) if cmp_px else None,
             "DaysActive":   _compute_days_active_safe(plan.first_actionable_date),
-            "OriginalRec":  plan.locked_recommendation,
             "CurrentRec":   live.get("current_rec", ""),
-            "OrigPctChg":   getattr(plan, "locked_pct_chg", 0.0) or 0.0,
-            "OrigVolRatio": getattr(plan, "locked_vol_ratio", 0.0) or 0.0,
             "CurPctChg":    live.get("pct_chg", 0.0),
             "CurVolRatio":  live.get("vol_ratio", 0.0),
         })
@@ -2954,8 +2953,8 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
     # ── Table ───────────────────────────────────────────────────────
     header = (
         '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th><th>CMP</th><th>Source</th>'
-        '<th>Entry (Oldest)</th><th>SL (CV4)</th><th>T1 (CV4)</th><th>PnL%</th>'
-        '<th>No of Days</th><th>Original Rec / Momentum</th><th>Current Rec / Momentum</th></tr>'
+        '<th>Entry (Oldest)</th><th>SL (CV4)</th><th>T1 (CV4)</th><th>CV4 Composite</th><th>PnL%</th>'
+        '<th>No of Days</th><th>Volume%</th></tr>'
     )
     body = ""
     for rank, (_, r) in enumerate(rows_df.iterrows(), 1):
@@ -2964,27 +2963,26 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
                 return f"₹{float(v):,.2f}" if float(v) > 0 else "—"
             except (TypeError, ValueError):
                 return "—"
-        # [2026-09-08, SG request] "Original Rec/Momentum" and "Current
-        # Rec/Momentum" can be misleading once a plan has more than one
-        # contributing source — e.g. an LS row's "Original Rec" badge is
-        # a CV1 tier, but if Momentum or Five Pillars later corroborated
-        # onto the same plan, that badge no longer represents the whole
-        # picture, and a genuine conflict_flag (see
-        # utils.setup_persistence._corroborate_cross_source()) means a
-        # later source's own entry/SL genuinely disagreed with the
-        # frozen levels. Collapse both columns into a single spanning
-        # conflict callout in that case rather than show a
-        # single-source badge that's no longer the full story.
+        # [2026-09-08, SG request] Original Rec/Momentum removed
+        # entirely — a locked-at-mint badge stops being a meaningful
+        # single number once a plan has more than one contributing
+        # source. Current Rec/Momentum replaced with a plain Volume%
+        # read (today's live vol_ratio, if the symbol's still in
+        # today's scan universe) — simpler and source-agnostic, unlike
+        # the old CV4-category-vs-Momentum-snapshot split that needed
+        # per-source branching. A genuine conflict_flag (see utils.
+        # setup_persistence._corroborate_cross_source()) still takes
+        # priority over the plain volume read in that cell — a later
+        # source's own entry/SL genuinely disagreeing with the frozen
+        # levels is more worth surfacing than this cycle's volume.
         if bool(r["ConflictFlag"]):
-            _rec_cells = (
-                f'<td colspan="2" style="color:#f85149;font-size:11px;" '
-                f'title="{r["ConflictReason"]}">⚠️ Conflict — {r["ConflictReason"]}</td>'
+            _vol_cell = (
+                f'<td style="color:#f85149;font-size:11px;" '
+                f'title="{r["ConflictReason"]}">⚠️ Conflict</td>'
             )
         else:
-            _rec_cells = (
-                f'<td>{_ap_orig_rec_badge(r["OriginalRec"], r["Source"], r["OrigPctChg"], r["OrigVolRatio"])}</td>'
-                f'<td>{_ap_current_rec_badge(r["CurrentRec"], r["Source"], r["CurPctChg"], r["CurVolRatio"])}</td>'
-            )
+            _vol_pct = r["CurVolRatio"] * 100.0
+            _vol_cell = f'<td class="col-num">{_vol_pct:,.0f}%</td>' if r["CurVolRatio"] else '<td class="col-num">—</td>'
         body += (
             f'<tr><td class="col-rank">{rank}</td>'
             f'<td class="col-stock">{_tv_link(r["Symbol"])}</td>'
@@ -2994,9 +2992,10 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             f'<td class="col-num">{_px(r["Entry"])}</td>'
             f'<td class="col-num">{_px(r["SL"])}</td>'
             f'<td class="col-num">{_px(r["T1"])}</td>'
+            f'<td class="col-num">{r["CV4Composite"]:.1f}</td>'
             + _ap_pnl_cell(r["PnLPct"])
             + f'<td class="col-num">{int(r["DaysActive"])}d</td>'
-            + _rec_cells
+            + _vol_cell
             + '</tr>'
         )
     st.markdown(
@@ -3020,20 +3019,12 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             with st.expander("🔬 Stock Breakdown Summary", expanded=False):
                 st.markdown(_ap_pills_html, unsafe_allow_html=True)
 
-    # ── Recommendation drift callout ───────────────────────────────
-    drifted = rows_df[
-        (rows_df["OriginalRec"] != "") & (rows_df["CurrentRec"] != "") &
-        (rows_df["OriginalRec"] != rows_df["CurrentRec"])
-    ]
-    if not drifted.empty:
-        with st.expander(f"📉 Recommendation has drifted on {len(drifted)} open plan(s)", expanded=False):
-            st.caption("These trades are still open purely on price/SL/target — the scanner's opinion of them has changed since they were locked. Useful for checking whether a scanner downgrade tends to predict trade failure.")
-            for _, r in drifted.iterrows():
-                st.markdown(
-                    f'<b>{_tv_link(r["Symbol"])}</b> — Original: {_ap_rec_badge(r["OriginalRec"])} '
-                    f'→ Current: {_ap_rec_badge(r["CurrentRec"])} · Status: {_ap_status_badge(r["Status"])}',
-                    unsafe_allow_html=True,
-                )
+    # [Removed, 2026-09-08 — SG request] "📉 Recommendation has drifted"
+    # callout used to live here, keyed off OriginalRec vs CurrentRec.
+    # Both columns are gone from this tab now (see header/body above) —
+    # Original Rec was removed entirely and Current Rec was replaced
+    # with a plain Volume% read, so there is no longer a "recommendation
+    # drift" concept left to detect here.
 
     # ── Manual exit control ─────────────────────────────────────────
     closeable = rows_df[rows_df["Status"].isin(["ACTIVE", "T1_HIT"])]
