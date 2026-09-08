@@ -3218,12 +3218,19 @@ def run_scanner(
     # path; Momentum must never route through it. See
     # _enrich_with_momentum_persistence()'s docstring below for why.
     #
-    # [2026-09-03] Both skipped here when enrich_setup_persistence=False
+    # ── Five Pillars Persistence (independent setup source) ─────────
+    # [2026-09-08, SG request] Same reasoning as Momentum immediately
+    # above — Five Pillars' own CLASS_EXECUTE gate must never route
+    # through the CV4/Recommendation-gated path either. See
+    # _enrich_with_five_pillars_persistence()'s docstring below.
+    #
+    # [2026-09-03] All three skipped here when enrich_setup_persistence=False
     # — see this function's docstring. scheduler/scan_worker.py runs
     # both itself, once, at cycle level on the full merged universe.
     if enrich_setup_persistence:
         df_out = _enrich_with_setup_persistence(df_out, all_data, fetch_source=fetch_source)
         df_out = _enrich_with_momentum_persistence(df_out)
+        df_out = _enrich_with_five_pillars_persistence(df_out)
 
     return df_out
 
@@ -3620,6 +3627,135 @@ def _enrich_with_momentum_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
         import logging as _log
         _log.getLogger(__name__).warning("momentum_persistence enrichment skipped: %s", exc)
         for col in _mom_cols:
+            if col not in df_out.columns:
+                df_out[col] = ""
+        return df_out
+
+
+def _enrich_with_five_pillars_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
+    """
+    Five Pillars' equivalent of _enrich_with_momentum_persistence() —
+    same structure, source="FP". [2026-09-08, SG request — LS/PB/MoM/
+    FivePillars single-symbol-persistent Active Setups]
+
+    Deliberately a separate call, not folded into
+    _enrich_with_setup_persistence() (the CV1/Recommendation-gated LS/PB
+    path) — Five Pillars must never route through that gate, same
+    reasoning _enrich_with_momentum_persistence()'s own docstring gives
+    for Momentum.
+
+    Qualification gate: base FP_Class (utils.pillar_engine, computed
+    inline in score_stock() above — see the "FP_*" columns attached
+    there) equals CLASS_EXECUTE. Deliberately the BASE class, not the
+    promoted CLASS_ELITE pages/five_pillars.py's own display-layer
+    evaluate_promotion() computes — that overlay needs `regime` context
+    only available at the full-scan-cycle level (apply_regime_layer()
+    runs in pages/scanner.py, after run_scanner() returns each batch),
+    not here per-batch. Execute alone is a sufficient, self-contained
+    qualification bar — the same precedent LS/PB and Momentum each set
+    independently (LS mints at Actionable/Execute/Elite, Momentum on its
+    own volume-confirmed floor; neither waits for a later display-layer
+    overlay either).
+
+    Skipped entirely (returns df_out unchanged, just like
+    pages/five_pillars.py's own "scan predates FP_FinalScore" guard) if
+    "FP_Class" isn't present — an old cached scan, or pillar_engine
+    itself failed for every row this batch (fp.error path above, see
+    that column's absence).
+
+    Uses the SAME shared Entry/SL/T1/T2 columns as the row's own CV4/
+    trade_levels.py-computed values — Five Pillars has no ATR-based
+    levels of its own the way Momentum does (see
+    enrich_five_pillars_row()'s own docstring for why this differs from
+    Momentum's separate ATR-based MomEntry/MomSL/etc.).
+    """
+    _fp_cols = ["FpSetupID", "FpPlanStatus", "FpEntryLocked", "FpSLLocked",
+                "FpT1Locked", "FpT2Locked", "FpSetupAge", "FpTradePlanStatus",
+                "FpQualifiedFinal"]
+
+    try:
+        if "Stock" not in df_out.columns or df_out.empty or "FP_Class" not in df_out.columns:
+            for col in _fp_cols:
+                df_out[col] = ""
+            return df_out
+
+        from utils.supabase_client import (
+            load_open_setup_plans_by_source,
+            load_open_setup_plans,
+            load_first_seen,
+            upsert_setup_plans_batch,
+        )
+        from utils.setup_persistence import enrich_five_pillars_row
+        from utils.pillar_engine import CLASS_EXECUTE
+
+        existing_fp_plans  = load_open_setup_plans_by_source("FP")   # {symbol: SetupPlan}
+        existing_all_plans = load_open_setup_plans()                  # {symbol: SetupPlan} — oldest across all sources
+        first_seen_map     = load_first_seen()
+
+        today_str = __import__("datetime").date.today().isoformat()
+        updated_plans = []
+        qualified_count = 0
+
+        fp_out_cols = {c: [] for c in _fp_cols}
+
+        for idx, row in df_out.iterrows():
+            symbol = str(row.get("Stock", "")).upper().strip()
+            if not symbol:
+                for c in _fp_cols:
+                    fp_out_cols[c].append("")
+                continue
+
+            fp_qualified = str(row.get("FP_Class", "")) == CLASS_EXECUTE
+            if fp_qualified:
+                qualified_count += 1
+
+            fp_row = {
+                "Stock": symbol,
+                "Entry": row.get("Entry", 0), "EntryRef": row.get("Entry", 0),
+                "SL": row.get("SL", 0), "T1": row.get("T1", 0), "T2": row.get("T2", 0),
+            }
+            _, plan_out, was_updated = enrich_five_pillars_row(
+                fp_row,
+                existing_fp_plans.get(symbol),
+                fp_qualified,
+                first_seen_date=first_seen_map.get(symbol, ""),
+                current_price=float(row.get("Entry", 0) or 0),
+                bar_low=float(row.get("Low", 0) or 0) or None,
+                bar_high=float(row.get("High", 0) or 0) or None,
+                cross_source_plan=existing_all_plans.get(symbol),
+            )
+            existing_fp_plans[symbol] = plan_out
+            if was_updated:
+                updated_plans.append(plan_out)
+
+            fp_out_cols["FpSetupID"].append(plan_out.setup_id)
+            fp_out_cols["FpPlanStatus"].append(_str_status(plan_out.status))
+            fp_out_cols["FpEntryLocked"].append(plan_out.entry_locked if plan_out.is_open() else fp_row["Entry"])
+            fp_out_cols["FpSLLocked"].append(plan_out.sl_locked if plan_out.is_open() else fp_row["SL"])
+            fp_out_cols["FpT1Locked"].append(plan_out.t1_locked if plan_out.is_open() else fp_row["T1"])
+            fp_out_cols["FpT2Locked"].append(plan_out.t2_locked if plan_out.is_open() else fp_row["T2"])
+            fp_out_cols["FpSetupAge"].append(plan_out.setup_age)
+            fp_out_cols["FpTradePlanStatus"].append(plan_out.trade_plan_status)
+            fp_out_cols["FpQualifiedFinal"].append(fp_qualified)
+
+        for c in _fp_cols:
+            df_out[c] = fp_out_cols[c]
+
+        import logging as _log
+        _log.getLogger(__name__).info(
+            "[FIVE PILLARS SCAN] total_rows=%d  qualified_today=%d  updated_plans=%d",
+            len(df_out), qualified_count, len(updated_plans),
+        )
+
+        if updated_plans:
+            upsert_setup_plans_batch([p.to_db_dict() for p in updated_plans])
+
+        return df_out
+
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).warning("five_pillars_persistence enrichment skipped: %s", exc)
+        for col in _fp_cols:
             if col not in df_out.columns:
                 df_out[col] = ""
         return df_out
