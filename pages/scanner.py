@@ -2746,29 +2746,75 @@ def _ap_rec_badge(rec: str, empty_label: str = "Not in today's scan") -> str:
     )
 
 
-def _ap_orig_rec_badge(rec: str, source: str = "") -> str:
-    """Original Recommendation badge — NOT the same fallback as
+def _mom_snapshot_badge(pct_chg: float, vol_ratio: float) -> str:
+    """Render a %chg / vol-ratio momentum snapshot as a small badge —
+    used for both Original and Current Momentum on MOM rows. Colour
+    reflects direction (green/red on %chg), not a CV4 category, since
+    there is no CV4 category to reflect here."""
+    color = "#3fb950" if pct_chg > 0 else ("#f85149" if pct_chg < 0 else "#8b949e")
+    sign  = "+" if pct_chg > 0 else ""
+    return (
+        f'<span style="background:rgba(0,0,0,0.3);border:1px solid {color}33;'
+        f'border-radius:4px;padding:2px 7px;font-size:10px;font-weight:600;'
+        f'color:{color};white-space:nowrap">{sign}{pct_chg:.1f}% · {vol_ratio:.1f}x vol</span>'
+    )
+
+
+def _ap_orig_rec_badge(rec: str, source: str = "", pct_chg: float = 0.0, vol_ratio: float = 0.0) -> str:
+    """Original Recommendation/Momentum badge — NOT the same fallback as
     _ap_rec_badge()'s default. "Not in today's scan" describes the
     *Current* Recommendation column's meaning (symbol has since fallen
     out of the live scan universe) and is factually wrong here: the
     Original Recommendation is a locked field, frozen forever at mint
     time, that never depends on "today's scan" at all.
 
-    A blank Original Recommendation instead means "this source never
-    minted a CV4 Recommendation to lock in the first place" — true by
-    design for MOM (Momentum) plans, which qualify on volume/rank
-    signals via utils.momentum_engine, never on CV1/CV4 (see
-    utils.setup_persistence's mint path: locked_recommendation is only
-    ever populated from the CV4-derived `recommendation` LS/PB pass in
-    a Recommendation). [2026-09-08 fix — was silently reusing
-    _ap_rec_badge()'s Current-column fallback text, which mismatched
-    the DB for every MOM row: confirmed via direct query against
-    setup_plans that every blank-locked_recommendation row has
-    source='MOM', none are actually missing from the scan.]
+    [2026-09-08, SG request] For MOM (Momentum) rows, this now renders
+    the actual Original Momentum snapshot (today's %chg / vol_ratio AT
+    MINT, captured by _create_plan() into locked_pct_chg/
+    locked_vol_ratio) instead of a placeholder string — a real,
+    source-native "original thesis" reading rather than a blank CV4
+    field with an explanatory label bolted on. Pre-migration MOM plans
+    that never had a chance to capture that snapshot (both fields still
+    0.0 — genuine 0/0 is not reachable for a qualified MOM candidate,
+    see momentum_engine's MOMENTUM_MIN_PCT_CHG/MIN_VOL_RATIO gates) fall
+    back to the old "No CV4 rec (Momentum entry)" text rather than
+    showing a misleading 0.0%/0.0x.
     """
-    label = ("No CV4 rec (Momentum entry)" if str(source or "").upper().strip() == "MOM"
-              else "No recommendation locked")
-    return _ap_rec_badge(rec, empty_label=label)
+    if str(source or "").upper().strip() == "MOM":
+        if pct_chg or vol_ratio:
+            return _mom_snapshot_badge(pct_chg, vol_ratio)
+        return _ap_rec_badge(rec, empty_label="No CV4 rec (Momentum entry)")
+    return _ap_rec_badge(rec, empty_label="No recommendation locked")
+
+
+def _ap_current_rec_badge(rec: str, source: str = "", pct_chg: float = 0.0, vol_ratio: float = 0.0) -> str:
+    """Current Recommendation/Momentum badge — source-aware, unlike a
+    plain `_ap_rec_badge(rec)` call.
+
+    For MOM (Momentum) plans, `rec` would otherwise be today's live CV4
+    Watch/Skip/etc. read for the symbol — but CV4's Leadership/
+    Extension logic structurally excludes stocks that already moved
+    today (see `_render_momentum_tab()`'s docstring), so a CV4 category
+    on a momentum row isn't a real "current opinion" of the trade; CV4
+    was never asked about it in the first place.
+
+    [2026-09-08, SG request] So instead of a CV4 category, or a
+    duplicate "No CV4 rec" placeholder that told you nothing had
+    changed, MOM rows now show the actual Current Momentum read —
+    today's live %chg/vol_ratio for the symbol if it's still in today's
+    scan universe, letting Original vs Current Momentum genuinely be
+    compared (has the move faded / is volume still confirming?) the
+    same way Original vs Current Recommendation does for LS/PB. If the
+    symbol has fallen out of today's scan universe entirely, falls back
+    to the same "Not in today's scan" text LS/PB rows use.
+
+    LS/PB rows are unaffected and keep the live CV4 Watch/Skip read.
+    """
+    if str(source or "").upper().strip() == "MOM":
+        if pct_chg or vol_ratio:
+            return _mom_snapshot_badge(pct_chg, vol_ratio)
+        return _ap_rec_badge("", empty_label="Not in today's scan")
+    return _ap_rec_badge(rec)
 
 
 def _ap_pnl_cell(pnl_pct: float) -> str:
@@ -2806,6 +2852,14 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
     that symbol (if it's still in today's scan universe) — shown purely
     so a drifting recommendation can be cross-referenced against trade
     outcomes; it is never used to alter the plan itself.
+
+    Both columns are source-aware for MOM (Momentum) rows: CV4 never
+    evaluates momentum theses (see utils.momentum_engine), so instead of
+    a CV4 category these columns show a real Original vs Current
+    Momentum snapshot (%chg / vol_ratio at mint vs today) — see
+    `_ap_orig_rec_badge()` / `_ap_current_rec_badge()`. Plans minted
+    before this snapshot existed fall back to "No CV4 rec (Momentum
+    entry)". LS/PB rows are unaffected either way.
     """
     try:
         from utils.supabase_client import load_open_setup_plans, close_setup_plan_manually, _is_available
@@ -2840,6 +2894,8 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             live_lookup[sym] = {
                 "cmp":         float(r.get("Entry", 0) or 0),
                 "current_rec": str(r.get("Recommendation", r.get("Category", ""))),
+                "pct_chg":     float(r.get("%Chg", 0) or 0),
+                "vol_ratio":   float(r.get("VolRatio", 0) or 0),
             }
 
     rows = []
@@ -2859,6 +2915,10 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             "DaysActive":   _compute_days_active_safe(plan.first_actionable_date),
             "OriginalRec":  plan.locked_recommendation,
             "CurrentRec":   live.get("current_rec", ""),
+            "OrigPctChg":   getattr(plan, "locked_pct_chg", 0.0) or 0.0,
+            "OrigVolRatio": getattr(plan, "locked_vol_ratio", 0.0) or 0.0,
+            "CurPctChg":    live.get("pct_chg", 0.0),
+            "CurVolRatio":  live.get("vol_ratio", 0.0),
         })
 
     rows_df = pd.DataFrame(rows)
@@ -2892,7 +2952,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
     header = (
         '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th><th>Source</th>'
         '<th>Entry</th><th>SL</th><th>T1</th><th>Current Price</th><th>PnL%</th>'
-        '<th>Days Active</th><th>Original Recommendation</th><th>Current Recommendation</th></tr>'
+        '<th>Days Active</th><th>Original Rec / Momentum</th><th>Current Rec / Momentum</th></tr>'
     )
     body = ""
     for rank, (_, r) in enumerate(rows_df.iterrows(), 1):
@@ -2912,8 +2972,8 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             f'<td class="col-num">{_px(r["CurrentPrice"])}</td>'
             + _ap_pnl_cell(r["PnLPct"])
             + f'<td class="col-num">{int(r["DaysActive"])}d</td>'
-            f'<td>{_ap_orig_rec_badge(r["OriginalRec"], r["Source"])}</td>'
-            f'<td>{_ap_rec_badge(r["CurrentRec"])}</td>'
+            f'<td>{_ap_orig_rec_badge(r["OriginalRec"], r["Source"], r["OrigPctChg"], r["OrigVolRatio"])}</td>'
+            f'<td>{_ap_current_rec_badge(r["CurrentRec"], r["Source"], r["CurPctChg"], r["CurVolRatio"])}</td>'
             '</tr>'
         )
     st.markdown(
