@@ -2907,6 +2907,9 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             "Symbol":       sym,
             "Status":       plan.status.upper(),
             "Source":       getattr(plan, "source", "LS") or "LS",
+            "ContribSources": getattr(plan, "contributing_sources", "") or "",
+            "ConflictFlag":   bool(getattr(plan, "conflict_flag", False)),
+            "ConflictReason": getattr(plan, "conflict_reason", "") or "",
             "Entry":        plan.entry_locked,
             "SL":           plan.sl_locked,
             "T1":           plan.t1_locked,
@@ -2950,9 +2953,9 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
 
     # ── Table ───────────────────────────────────────────────────────
     header = (
-        '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th><th>Source</th>'
-        '<th>Entry</th><th>SL</th><th>T1</th><th>Current Price</th><th>PnL%</th>'
-        '<th>Days Active</th><th>Original Rec / Momentum</th><th>Current Rec / Momentum</th></tr>'
+        '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th><th>CMP</th><th>Source</th>'
+        '<th>Entry (Oldest)</th><th>SL (CV4)</th><th>T1 (CV4)</th><th>PnL%</th>'
+        '<th>No of Days</th><th>Original Rec / Momentum</th><th>Current Rec / Momentum</th></tr>'
     )
     body = ""
     for rank, (_, r) in enumerate(rows_df.iterrows(), 1):
@@ -2961,25 +2964,61 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
                 return f"₹{float(v):,.2f}" if float(v) > 0 else "—"
             except (TypeError, ValueError):
                 return "—"
+        # [2026-09-08, SG request] "Original Rec/Momentum" and "Current
+        # Rec/Momentum" can be misleading once a plan has more than one
+        # contributing source — e.g. an LS row's "Original Rec" badge is
+        # a CV1 tier, but if Momentum or Five Pillars later corroborated
+        # onto the same plan, that badge no longer represents the whole
+        # picture, and a genuine conflict_flag (see
+        # utils.setup_persistence._corroborate_cross_source()) means a
+        # later source's own entry/SL genuinely disagreed with the
+        # frozen levels. Collapse both columns into a single spanning
+        # conflict callout in that case rather than show a
+        # single-source badge that's no longer the full story.
+        if bool(r["ConflictFlag"]):
+            _rec_cells = (
+                f'<td colspan="2" style="color:#f85149;font-size:11px;" '
+                f'title="{r["ConflictReason"]}">⚠️ Conflict — {r["ConflictReason"]}</td>'
+            )
+        else:
+            _rec_cells = (
+                f'<td>{_ap_orig_rec_badge(r["OriginalRec"], r["Source"], r["OrigPctChg"], r["OrigVolRatio"])}</td>'
+                f'<td>{_ap_current_rec_badge(r["CurrentRec"], r["Source"], r["CurPctChg"], r["CurVolRatio"])}</td>'
+            )
         body += (
             f'<tr><td class="col-rank">{rank}</td>'
             f'<td class="col-stock">{_tv_link(r["Symbol"])}</td>'
             f'<td>{_ap_status_badge(r["Status"])}</td>'
-            f'<td>{_ap_source_badge(r["Source"])}</td>'
+            f'<td class="col-num">{_px(r["CurrentPrice"])}</td>'
+            f'<td>{_ap_source_badge(r["Source"], r["ContribSources"])}</td>'
             f'<td class="col-num">{_px(r["Entry"])}</td>'
             f'<td class="col-num">{_px(r["SL"])}</td>'
             f'<td class="col-num">{_px(r["T1"])}</td>'
-            f'<td class="col-num">{_px(r["CurrentPrice"])}</td>'
             + _ap_pnl_cell(r["PnLPct"])
             + f'<td class="col-num">{int(r["DaysActive"])}d</td>'
-            f'<td>{_ap_orig_rec_badge(r["OriginalRec"], r["Source"], r["OrigPctChg"], r["OrigVolRatio"])}</td>'
-            f'<td>{_ap_current_rec_badge(r["CurrentRec"], r["Source"], r["CurPctChg"], r["CurVolRatio"])}</td>'
-            '</tr>'
+            + _rec_cells
+            + '</tr>'
         )
     st.markdown(
         f'<table class="ap-table"><thead>{header}</thead><tbody>{body}</tbody></table>',
         unsafe_allow_html=True,
     )
+
+    # ── CV4 Stock Breakdown Summary — every Active Setups symbol,
+    #    wrapped exactly like the Actionable tab's own "🔬 Stock
+    #    Breakdown Summary" expander (_perstock_breakdown_table()).
+    #    [2026-09-08, SG request] Matches df_aug rows by Symbol; a
+    #    symbol that's fallen out of today's scan universe entirely
+    #    (see this tab's own docstring on "Not in today's scan") simply
+    #    has no row to show here — its trade levels/status above are
+    #    unaffected either way, this is purely supplementary CV4 detail.
+    if df_aug is not None and not df_aug.empty and "Stock" in df_aug.columns:
+        _ap_symbols = set(rows_df["Symbol"].tolist())
+        _ap_breakdown_subset = df_aug[df_aug["Stock"].isin(_ap_symbols)]
+        _ap_pills_html = _perstock_breakdown_table(_ap_breakdown_subset)
+        if _ap_pills_html:
+            with st.expander("🔬 Stock Breakdown Summary", expanded=False):
+                st.markdown(_ap_pills_html, unsafe_allow_html=True)
 
     # ── Recommendation drift callout ───────────────────────────────
     drifted = rows_df[
@@ -3026,32 +3065,42 @@ def _compute_days_active_safe(first_actionable_date: str) -> int:
         return 0
 
 
-def _ap_source_badge(source: str) -> str:
+def _ap_source_badge(source: str, contributing_sources: str = "") -> str:
     """
-    LS/PB/MOM badge for the Active Setups table — same visual language as
-    the existing PB badge on the options plan tables (search "PB" /
-    "Pre-Breakout squeeze-release" elsewhere in this file for the
-    original), extended to equity setup_plans' source field.
+    LS/PB/MOM/FP badge(s) for the Active Setups table. [2026-09-08, SG
+    request — single-symbol-persistent Active Setups across LS/PB/MoM/
+    FivePillars] Now renders ONE badge per corroborating source, not
+    just the plan's original minting source — e.g. a plan minted by LS
+    that Momentum and Five Pillars later corroborated onto (see
+    utils.setup_persistence._corroborate_cross_source()) shows
+    "LS  MOM  FP" side by side, so it's visible at a glance that
+    multiple independent signals agree on this symbol, not just one.
+    `contributing_sources` is SetupPlan.contributing_sources verbatim
+    (comma-joined, e.g. "MOM,FP") — `source` (the plan's original
+    minting source) is always shown first and de-duplicated against it.
+    """
+    def _one_badge(src: str) -> str:
+        src = src.upper().strip()
+        if src == "PB":
+            return ('<span style="background:#f97316;color:#0d1117;font-weight:700;font-size:10px;'
+                    'border-radius:4px;padding:1px 6px;" title="Pre-Breakout squeeze-release">PB</span>')
+        if src == "MOM":
+            return ('<span style="background:#a371f7;color:#0d1117;font-weight:700;font-size:10px;'
+                    'border-radius:4px;padding:1px 6px;" title="Momentum — same-day volume/rank mover, independent of CV4">MOM</span>')
+        if src == "FP":
+            return ('<span style="background:#3fb950;color:#0d1117;font-weight:700;font-size:10px;'
+                    'border-radius:4px;padding:1px 6px;" title="Five Pillars — Structure/Acceptance/Reversal/Leadership/Momentum, independent of CV4">FP</span>')
+        return ('<span style="background:#21262d;color:var(--muted);font-weight:700;font-size:10px;'
+                'border-radius:4px;padding:1px 6px;" title="Live Scanner — Actionable/Execute/Elite promotion">LS</span>')
 
-    [2026-09-08 fix] This function only ever special-cased "PB" and fell
-    through to the "LS" badge for anything else — so every MOM
-    (Momentum) plan silently displayed as "LS" in this table, even
-    though setup_plans.source is correctly stored as 'MOM' in the DB
-    (confirmed via direct query). Note: this Active Setups table is
-    separate from the dedicated Momentum tab (_render_momentum_tab,
-    restored below) — a MOM plan can legitimately appear in BOTH once
-    it's triggered (Active Setups) and this badge needs to say so
-    correctly there too.
-    """
-    src = str(source or "LS").upper().strip()
-    if src == "PB":
-        return ('<span style="background:#f97316;color:#0d1117;font-weight:700;font-size:10px;'
-                'border-radius:4px;padding:1px 6px;" title="Pre-Breakout squeeze-release">PB</span>')
-    if src == "MOM":
-        return ('<span style="background:#a371f7;color:#0d1117;font-weight:700;font-size:10px;'
-                'border-radius:4px;padding:1px 6px;" title="Momentum — same-day volume/rank mover, independent of CV4">MOM</span>')
-    return ('<span style="background:#21262d;color:var(--muted);font-weight:700;font-size:10px;'
-            'border-radius:4px;padding:1px 6px;" title="Live Scanner — Actionable/Execute/Elite promotion">LS</span>')
+    primary = str(source or "LS").upper().strip()
+    all_srcs = [primary] + [s.strip().upper() for s in str(contributing_sources or "").split(",") if s.strip()]
+    seen, ordered = set(), []
+    for s in all_srcs:
+        if s and s not in seen:
+            seen.add(s)
+            ordered.append(s)
+    return " ".join(_one_badge(s) for s in ordered)
 
 
 def _render_momentum_tab(df_aug: pd.DataFrame) -> None:
