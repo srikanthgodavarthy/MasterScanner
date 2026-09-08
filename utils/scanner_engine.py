@@ -3521,6 +3521,7 @@ def _enrich_with_momentum_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
     try:
         from utils.supabase_client import (
             load_open_setup_plans_by_source,
+            load_open_setup_plans,
             load_first_seen,
             upsert_setup_plans_batch,
         )
@@ -3533,6 +3534,13 @@ def _enrich_with_momentum_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
             return df_out
 
         existing_mom_plans = load_open_setup_plans_by_source("MOM")   # {symbol: SetupPlan}
+        # [2026-09-08, SG request — single-symbol-persistent Active
+        # Setups] Oldest-open-plan-across-ALL-sources, for the mint
+        # decision in enrich_momentum_row() — see its cross_source_plan
+        # param docstring. Separate from existing_mom_plans above
+        # (still needed to advance an already-open MOM plan's own
+        # lifecycle unchanged).
+        existing_all_plans = load_open_setup_plans()                  # {symbol: SetupPlan}
         first_seen_map      = load_first_seen()                        # shared across sources —
                                                                           # "earliest date seen in ANY
                                                                           # scan category" is source-
@@ -3579,6 +3587,7 @@ def _enrich_with_momentum_persistence(df_out: pd.DataFrame) -> pd.DataFrame:
                 current_price=float(row.get("Entry", 0) or 0),
                 bar_low=float(row.get("Low", 0) or 0) or None,
                 bar_high=float(row.get("High", 0) or 0) or None,
+                cross_source_plan=existing_all_plans.get(symbol),
             )
             existing_mom_plans[symbol] = plan_out
             if was_updated:

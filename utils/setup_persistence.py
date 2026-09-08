@@ -275,6 +275,28 @@ class SetupPlan:
     locked_pct_chg:          float = 0.0
     locked_vol_ratio:        float = 0.0
 
+    # [2026-09-08, SG request — cross-source dedup] Single-symbol-persistent
+    # Active Setups. Only the OLDEST open plan for a symbol (across LS/PB/
+    # MOM) is ever minted/kept; a later source's signal on the same symbol
+    # no longer mints a second plan — it's folded into this plan instead.
+    #   contributing_sources — comma-joined source codes that have
+    #     corroborated this plan since it was minted, e.g. "LS,MOM". The
+    #     plan's own `source` (above) is always the first entry — this
+    #     field is ADDITIVE only, appended to on later corroboration,
+    #     never rewritten. Empty string means no other source has
+    #     corroborated yet (the common case).
+    #   conflict_flag / conflict_reason — set when a later source's own
+    #     computed entry/SL diverge meaningfully (>2%) from this plan's
+    #     already-frozen entry_locked/sl_locked. Per-plan trade levels are
+    #     NEVER overwritten by this — "oldest wins" is absolute — this is
+    #     purely a visible warning that a newer engine's read disagreed.
+    #     Cleared back to False/"" is NOT automatic; once flagged it stays
+    #     flagged for the life of the plan (a stale flag on a plan that's
+    #     about to close is harmless noise, not a correctness issue).
+    contributing_sources:    str   = ""
+    conflict_flag:           bool  = False
+    conflict_reason:         str   = ""
+
     # [2026-08-07, SG request] Where this plan was minted from — "LS"
     # (Live Scanner — the normal Actionable/Execute/Elite promotion path)
     # or "PB" (Pre-Breakout tab — minted early off a squeeze_release
@@ -358,6 +380,9 @@ class SetupPlan:
             "invalidation_reason":    self.invalidation_reason,
             "invalidated_date":       self.invalidated_date or None,
             "source":                 self.source or "LS",
+            "contributing_sources":   self.contributing_sources or "",
+            "conflict_flag":          bool(self.conflict_flag),
+            "conflict_reason":        self.conflict_reason or "",
         }
 
 
@@ -901,6 +926,52 @@ def _create_plan(
 #  ENRICH SCANNER ROW  — main integration point
 # ══════════════════════════════════════════════════════════════════
 
+def _corroborate_cross_source(plan: "SetupPlan", source: str, entry: float, sl: float) -> bool:
+    """
+    Record `source` as a corroborating signal on `plan` — the already-
+    open, oldest cross-source plan for this symbol — instead of minting
+    a second plan. [2026-09-08, SG request — single-symbol-persistent
+    Active Setups]
+
+    Idempotent: safe to call every scan cycle a corroborating source
+    keeps qualifying (appends to contributing_sources only once).
+    NEVER touches plan.entry_locked/sl_locked/t1_locked — "oldest plan's
+    levels always win" is absolute; this only sets an informational
+    conflict_flag when `source`'s own computed entry/SL diverge more
+    than 2% from the plan's already-frozen levels. conflict_flag is
+    sticky — once set it's never auto-cleared here (see SetupPlan.
+    conflict_flag's own docstring for why that's intentional).
+
+    Returns True iff `plan` was actually mutated this call (caller must
+    upsert it); False means source was already recorded and nothing new
+    to save.
+    """
+    changed = False
+    src = str(source or "").upper().strip()
+    existing_sources = {
+        s.strip().upper() for s in (plan.source, *plan.contributing_sources.split(","))
+        if s.strip()
+    }
+    if src and src not in existing_sources:
+        parts = [p for p in plan.contributing_sources.split(",") if p.strip()]
+        parts.append(src)
+        plan.contributing_sources = ",".join(parts)
+        changed = True
+
+    if not plan.conflict_flag and plan.entry_locked > 0 and entry > 0:
+        entry_diff_pct = abs(entry - plan.entry_locked) / plan.entry_locked
+        sl_diff_pct = abs(sl - plan.sl_locked) / plan.sl_locked if plan.sl_locked else 0.0
+        if entry_diff_pct > 0.02 or sl_diff_pct > 0.02:
+            plan.conflict_flag = True
+            plan.conflict_reason = (
+                f"{src} entry/SL diverges from {plan.source}'s frozen levels "
+                f"(entry {entry_diff_pct * 100:.1f}% off, SL {sl_diff_pct * 100:.1f}% off)"
+            )
+            changed = True
+
+    return changed
+
+
 def enrich_scanner_row(
     scanner_row:      dict,
     existing_plan:    Optional["SetupPlan"],
@@ -992,6 +1063,26 @@ def enrich_scanner_row(
     if not should_create and pre_breakout and (plan is None or plan.is_terminal()):
         should_create = True
         source_for_new_plan = "PB"
+
+    # [2026-09-08, SG request — single-symbol-persistent Active Setups]
+    # `plan` here is the OLDEST open plan for this symbol across ALL
+    # sources (load_open_setup_plans() resolves that now — see its
+    # 2026-09-08 comment), so should_create above already correctly
+    # stays False whenever ANY source's plan is open, not just an LS
+    # one. What was missing: nothing recorded that a second source ALSO
+    # qualified today. If we would have minted (should_create True) but
+    # didn't purely because a plan from a DIFFERENT, still-open source
+    # already exists, corroborate onto it instead of silently dropping
+    # the signal — this is the actual dedup behaviour (oldest plan's
+    # levels always win; a later source just gets folded in).
+    if (should_create and plan is not None and plan.is_open()
+            and plan.source.upper() != source_for_new_plan):
+        _entry_ref = float(scanner_row.get("EntryRef", 0) or 0)
+        _entry = _entry_ref if _entry_ref > 0 else float(scanner_row.get("Entry", 0) or 0)
+        _sl = float(scanner_row.get("SL", 0) or 0)
+        if _corroborate_cross_source(plan, source_for_new_plan, _entry, _sl):
+            plan_was_updated = True
+        should_create = False
 
     if should_create:
         plan = _create_plan(symbol, scanner_row, first_seen_date, today_str, source=source_for_new_plan)
@@ -1107,6 +1198,7 @@ def enrich_momentum_row(
     current_price:        float = 0.0,
     bar_low:               float | None = None,
     bar_high:               float | None = None,
+    cross_source_plan:     Optional["SetupPlan"] = None,
 ) -> tuple[dict, Optional["SetupPlan"], bool]:
     """
     Momentum's equivalent of enrich_scanner_row() — independent on
@@ -1120,10 +1212,7 @@ def enrich_momentum_row(
                            computed by that module, never by CV4/
                            trade_levels.py) plus "Stock".
     existing_plan        : SetupPlan loaded from DB for this symbol
-                            with source == "MOM", or None. Never pass an
-                            LS/PB plan here — Momentum has its own plan
-                            per symbol, independent of any LS/PB plan
-                            that may also be open on the same symbol.
+                            with source == "MOM", or None.
     momentum_qualified   : True iff utils.momentum_engine judged this
                             row a momentum candidate today (top-N %chg +
                             volume-ratio confirmation + still above
@@ -1132,6 +1221,22 @@ def enrich_momentum_row(
                             design.
     first_seen_date, current_price, bar_low, bar_high : same contract as
                             enrich_scanner_row().
+    cross_source_plan    : [2026-09-08, SG request — single-symbol-
+                            persistent Active Setups] the OLDEST open
+                            plan for this symbol across ALL sources
+                            (from load_open_setup_plans(), not the
+                            MOM-scoped `existing_plan` above), or None.
+                            Supersedes the old "Momentum has its own
+                            plan per symbol, independent of any LS/PB
+                            plan" behaviour — if an LS/PB plan already
+                            owns this symbol, MOM corroborates onto it
+                            (via _corroborate_cross_source()) instead of
+                            minting a second, independent MOM plan.
+                            Only consulted when `existing_plan` (a MOM
+                            plan specifically) is None — an already-open
+                            MOM plan on this symbol still advances its
+                            own lifecycle exactly as before; this param
+                            only affects the MINT decision.
 
     Returns
     -------
@@ -1157,9 +1262,19 @@ def enrich_momentum_row(
             plan_was_updated = True
 
     # ── 2. Mint a new MOM plan — gated ONLY on momentum_qualified,
-    #      never on Recommendation/CV4/tier. ─────────────────────────
+    #      never on Recommendation/CV4/tier. Unless a DIFFERENT source
+    #      already has this symbol open (cross_source_plan), in which
+    #      case corroborate onto it instead — see the param docstring.
     should_create = momentum_qualified and (plan is None or plan.is_terminal())
-    if should_create:
+    if (should_create and cross_source_plan is not None and cross_source_plan.is_open()
+            and cross_source_plan.source.upper() != "MOM"):
+        _entry = float(momentum_row.get("EntryRef", momentum_row.get("Entry", 0)) or 0)
+        _sl = float(momentum_row.get("SL", 0) or 0)
+        if _corroborate_cross_source(cross_source_plan, "MOM", _entry, _sl):
+            plan_was_updated = True
+        plan = cross_source_plan
+        should_create = False
+    elif should_create:
         plan = _create_plan(symbol, momentum_row, first_seen_date, today_str, source="MOM")
         plan_was_updated = True
 
@@ -1177,6 +1292,7 @@ def enrich_momentum_row(
             setup_age          = "—",
             trade_plan_status  = "No plan yet",
         )
+
 
     # ── 4. Attach plan fields to the row dict — same field names as
     #      enrich_scanner_row() so the Momentum UI tab can reuse the

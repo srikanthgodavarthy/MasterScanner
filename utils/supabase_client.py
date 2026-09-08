@@ -802,6 +802,9 @@ def _setup_plan_from_row(row: dict) -> "object":
         locked_extension         = int(row.get("locked_extension",   0) or 0),
         locked_pct_chg           = float(row.get("locked_pct_chg",   0) or 0),
         locked_vol_ratio         = float(row.get("locked_vol_ratio", 0) or 0),
+        contributing_sources     = row.get("contributing_sources") or "",
+        conflict_flag            = bool(row.get("conflict_flag") or False),
+        conflict_reason          = row.get("conflict_reason") or "",
         status                   = _normalize_legacy_status(row.get("status", "WAITING")),
         status_reason            = row.get("status_reason") or row.get("invalidation_reason", "") or "",
         created_at                = str(row.get("created_at", "") or ""),
@@ -819,12 +822,19 @@ def load_open_setup_plans() -> dict:
     Return every OPEN setup plan (status IN WAITING/ACTIVE/T1_HIT) as a
     dict: {symbol: SetupPlan}.
 
-    NOTE: keyed by symbol alone, across ALL sources (LS/PB/MOM) combined
-    — a symbol with two simultaneously-open plans from different sources
-    can only occupy one slot here. Callers that need to track a
-    source's plans independently of the others (e.g. a MOM plan
-    alongside an already-open LS plan on the same symbol) must use
-    load_open_setup_plans_by_source() instead — see that function.
+    [2026-09-08, SG request — single-symbol-persistent Active Setups]
+    Explicitly resolves cross-source collisions oldest-plan-wins by
+    created_at, rather than the previous accidental last-row-in-result-
+    set-wins behaviour (Postgres row order was never guaranteed to
+    correlate with created_at, so which plan LS's own lifecycle-advance
+    logic operated on for a multi-source symbol was effectively
+    non-deterministic before this fix — a real data-integrity gap, not
+    just a display one). This is a pure read-side safety net; the
+    actual dedup decision (never minting a second plan in the first
+    place) lives in enrich_scanner_row()/mint_or_advance_momentum_plan()
+    — see those functions' 2026-09-08 comments. This fallback only
+    matters for plans that predate that fix, or any edge case where two
+    open plans still exist on one symbol.
     """
     if not db.is_available():
         return {}
@@ -835,10 +845,12 @@ def load_open_setup_plans() -> dict:
         )
         if not rows:
             return {}
-        result = {}
+        result: dict = {}
         for row in rows:
             plan = _setup_plan_from_row(row)
-            result[plan.symbol] = plan
+            existing = result.get(plan.symbol)
+            if existing is None or (plan.created_at or "") < (existing.created_at or ""):
+                result[plan.symbol] = plan
         return result
     except Exception as exc:
         logger.error("load_open_setup_plans failed: %s", exc)
@@ -2124,6 +2136,17 @@ UPDATE setup_plans SET closed_at = invalidated_date::timestamptz
 MOMENTUM_TRACKING_MIGRATION_SQL = """
 ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS locked_pct_chg   numeric(8,2) NOT NULL DEFAULT 0;
 ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS locked_vol_ratio numeric(8,2) NOT NULL DEFAULT 0;
+"""
+
+# [2026-09-08, SG request — single-symbol-persistent Active Setups]
+# Run this once against the live DB before deploying the cross-source
+# dedup change in utils.setup_persistence (enrich_scanner_row() / the
+# MOM mint path) — those write contributing_sources/conflict_flag/
+# conflict_reason on every upsert, so the columns must exist first.
+CROSS_SOURCE_DEDUP_MIGRATION_SQL = """
+ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS contributing_sources text NOT NULL DEFAULT '';
+ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS conflict_flag        boolean NOT NULL DEFAULT false;
+ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS conflict_reason      text NOT NULL DEFAULT '';
 """
 
 LIFECYCLE_TRANSITIONS_MIGRATION_SQL = """
