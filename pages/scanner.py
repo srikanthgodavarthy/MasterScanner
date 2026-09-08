@@ -2726,18 +2726,49 @@ def _ap_status_badge(status: str) -> str:
     return f'<span class="trade-status-badge {css}">{label}</span>'
 
 
-def _ap_rec_badge(rec: str) -> str:
+def _ap_rec_badge(rec: str, empty_label: str = "Not in today's scan") -> str:
     """Recommendation badge — reuses the same colour scheme as the main
-    scanner table (_CAT_STYLE) so Original vs Current reads consistently."""
+    scanner table (_CAT_STYLE) so Original vs Current reads consistently.
+
+    `empty_label` is the text shown when `rec` is blank. Callers MUST pass
+    the label that's actually true for their column — see
+    `_ap_orig_rec_badge()` below for why "Not in today's scan" is wrong
+    for the Original Recommendation column specifically.
+    """
     rec = str(rec or "").strip()
     if not rec or rec in ("—", "nan", "None"):
-        return '<span style="color:var(--muted);font-size:10px">Not in today\'s scan</span>'
+        return f'<span style="color:var(--muted);font-size:10px">{empty_label}</span>'
     color, label = _CAT_STYLE.get(rec, ("#8b949e", rec))
     return (
         f'<span style="background:rgba(0,0,0,0.3);border:1px solid {color}33;'
         f'border-radius:4px;padding:2px 7px;font-size:10px;font-weight:600;'
         f'color:{color};white-space:nowrap">{label}</span>'
     )
+
+
+def _ap_orig_rec_badge(rec: str, source: str = "") -> str:
+    """Original Recommendation badge — NOT the same fallback as
+    _ap_rec_badge()'s default. "Not in today's scan" describes the
+    *Current* Recommendation column's meaning (symbol has since fallen
+    out of the live scan universe) and is factually wrong here: the
+    Original Recommendation is a locked field, frozen forever at mint
+    time, that never depends on "today's scan" at all.
+
+    A blank Original Recommendation instead means "this source never
+    minted a CV4 Recommendation to lock in the first place" — true by
+    design for MOM (Momentum) plans, which qualify on volume/rank
+    signals via utils.momentum_engine, never on CV1/CV4 (see
+    utils.setup_persistence's mint path: locked_recommendation is only
+    ever populated from the CV4-derived `recommendation` LS/PB pass in
+    a Recommendation). [2026-09-08 fix — was silently reusing
+    _ap_rec_badge()'s Current-column fallback text, which mismatched
+    the DB for every MOM row: confirmed via direct query against
+    setup_plans that every blank-locked_recommendation row has
+    source='MOM', none are actually missing from the scan.]
+    """
+    label = ("No CV4 rec (Momentum entry)" if str(source or "").upper().strip() == "MOM"
+              else "No recommendation locked")
+    return _ap_rec_badge(rec, empty_label=label)
 
 
 def _ap_pnl_cell(pnl_pct: float) -> str:
@@ -2881,7 +2912,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             f'<td class="col-num">{_px(r["CurrentPrice"])}</td>'
             + _ap_pnl_cell(r["PnLPct"])
             + f'<td class="col-num">{int(r["DaysActive"])}d</td>'
-            f'<td>{_ap_rec_badge(r["OriginalRec"])}</td>'
+            f'<td>{_ap_orig_rec_badge(r["OriginalRec"], r["Source"])}</td>'
             f'<td>{_ap_rec_badge(r["CurrentRec"])}</td>'
             '</tr>'
         )
@@ -2937,17 +2968,206 @@ def _compute_days_active_safe(first_actionable_date: str) -> int:
 
 def _ap_source_badge(source: str) -> str:
     """
-    LS/PB badge for the Active Setups table — same visual language as
+    LS/PB/MOM badge for the Active Setups table — same visual language as
     the existing PB badge on the options plan tables (search "PB" /
     "Pre-Breakout squeeze-release" elsewhere in this file for the
-    original), just extended to equity setup_plans' new source field.
+    original), extended to equity setup_plans' source field.
+
+    [2026-09-08 fix] This function only ever special-cased "PB" and fell
+    through to the "LS" badge for anything else — so every MOM
+    (Momentum) plan silently displayed as "LS" in this table, even
+    though setup_plans.source is correctly stored as 'MOM' in the DB
+    (confirmed via direct query). Note: this Active Setups table is
+    separate from the dedicated Momentum tab (_render_momentum_tab,
+    restored below) — a MOM plan can legitimately appear in BOTH once
+    it's triggered (Active Setups) and this badge needs to say so
+    correctly there too.
     """
     src = str(source or "LS").upper().strip()
     if src == "PB":
         return ('<span style="background:#f97316;color:#0d1117;font-weight:700;font-size:10px;'
                 'border-radius:4px;padding:1px 6px;" title="Pre-Breakout squeeze-release">PB</span>')
+    if src == "MOM":
+        return ('<span style="background:#a371f7;color:#0d1117;font-weight:700;font-size:10px;'
+                'border-radius:4px;padding:1px 6px;" title="Momentum — same-day volume/rank mover, independent of CV4">MOM</span>')
     return ('<span style="background:#21262d;color:var(--muted);font-weight:700;font-size:10px;'
             'border-radius:4px;padding:1px 6px;" title="Live Scanner — Actionable/Execute/Elite promotion">LS</span>')
+
+
+def _render_momentum_tab(df_aug: pd.DataFrame) -> None:
+    """
+    ⚡ Momentum — an independent setup source, NOT a CV4 tab.
+
+    [2026-09-05, SG request] Built after finding that every single
+    day's #1 NSE gainer (19/19 sessions checked) was tagged Skip by
+    CV4 — CV4's Leadership/Extension logic structurally excludes a
+    stock that already moved today, by design. This tab surfaces what
+    CV4 is built to exclude: symbols qualifying purely on today's
+    volume-confirmed %chg / day-rank, via utils.momentum_engine, with
+    zero dependency on Recommendation/Category/Score.
+
+    Deliberately shows WAITING plans too, unlike Active Setups (which
+    excludes WAITING on purpose — see that tab's docstring). Active
+    Setups treats "not yet entered" as "not yet a real trade"; here the
+    point is the opposite — a MOM candidate flagged today IS the thing
+    you'd want to see today, entered or not, before its 5-day window
+    (vs LS/PB's 20d) runs out. "CV4 Read" is shown per row purely as
+    cross-reference context (does CV4 happen to also like this stock,
+    e.g. an already-established leader having a big day) — it never
+    gates anything here and a Skip/blank CV4 read is completely normal
+    and expected for most rows in this tab.
+    """
+    try:
+        from utils.supabase_client import load_open_setup_plans_by_source, close_setup_plan_manually, _is_available
+    except Exception:
+        st.warning("Setup persistence isn't available right now.")
+        return
+
+    if not _is_available():
+        st.info("Supabase isn't configured, so Momentum plans can't be loaded. Trade lifecycle persistence requires Supabase.")
+        return
+
+    from utils.setup_persistence import compute_pnl_pct
+
+    open_plans = load_open_setup_plans_by_source("MOM")
+    if not open_plans:
+        st.info(
+            "No open Momentum plans right now. A MOM plan is minted independently of CV4/Recommendation — "
+            "purely off today's volume-confirmed %chg or day-rank (see utils.momentum_engine). "
+            "It ages out after 5 days if SL/T1/T2 is never hit (vs 20 days for LS/PB)."
+        )
+        return
+
+    # Today's %chg / vol ratio / CV4 read, for symbols still in today's
+    # scan universe — purely informational, same non-gating contract as
+    # _render_active_plans_tab()'s "Current Recommendation" column.
+    live_lookup = {}
+    if df_aug is not None and not df_aug.empty and "Stock" in df_aug.columns:
+        for _, r in df_aug.iterrows():
+            sym = str(r.get("Stock", "")).upper().strip()
+            live_lookup[sym] = {
+                "cmp":       float(r.get("Entry", 0) or 0),
+                "pct_chg":   float(r.get("%Chg", 0) or 0),
+                "vol_ratio": float(r.get("VolRatio", 0) or 0),
+                "cv4_read":  str(r.get("Recommendation", r.get("Category", ""))),
+            }
+
+    rows = []
+    for sym, plan in open_plans.items():
+        live   = live_lookup.get(sym, {})
+        cmp_px = live.get("cmp", 0.0)
+        rows.append({
+            "setup_id":     plan.setup_id,
+            "Symbol":       sym,
+            "Status":       str(getattr(plan.status, "value", plan.status) or "").upper(),
+            "Entry":        plan.entry_locked,
+            "SL":           plan.sl_locked,
+            "T1":           plan.t1_locked,
+            "T2":           plan.t2_locked,
+            "CurrentPrice": cmp_px,
+            "PnLPct":       compute_pnl_pct(plan.entry_locked, cmp_px) if cmp_px and plan.entry_locked else None,
+            "DaysActive":   _compute_days_active_safe(plan.first_actionable_date),
+            "PctChgToday":  live.get("pct_chg"),
+            "VolRatio":     live.get("vol_ratio"),
+            "CV4Read":      live.get("cv4_read", ""),
+        })
+
+    rows_df = pd.DataFrame(rows)
+
+    n_waiting = int((rows_df["Status"] == "WAITING").sum())
+    n_active  = int((rows_df["Status"] == "ACTIVE").sum())
+    n_t1      = int((rows_df["Status"] == "T1_HIT").sum())
+    st.markdown(
+        '<div style="display:flex;gap:24px;margin-bottom:10px;font-family:var(--mono);">'
+        f'<div><span style="font-size:18px;font-weight:700;color:#8b949e">{n_waiting}</span> '
+        f'<span style="font-size:10px;color:var(--muted)">WAITING</span></div>'
+        f'<div><span style="font-size:18px;font-weight:700;color:#3fb950">{n_active}</span> '
+        f'<span style="font-size:10px;color:var(--muted)">ACTIVE</span></div>'
+        f'<div><span style="font-size:18px;font-weight:700;color:#a371f7">{n_t1}</span> '
+        f'<span style="font-size:10px;color:var(--muted)">T1 HIT</span></div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption("5-day max hold (vs 20d for LS/PB) — momentum decays fast. Entry/SL/T1/T2 are ATR-based (1.5×/1.5×/3× ATR), not CV4's structural swing levels.")
+
+    sort_key = st.selectbox(
+        "Sort by", ["Days Active (low → high)", "PnL% ↓", "%Chg Today ↓", "Symbol A→Z"],
+        key="momentum_plans_sort", label_visibility="collapsed",
+    )
+    if sort_key == "PnL% ↓":
+        rows_df = rows_df.sort_values("PnLPct", ascending=False, na_position="last")
+    elif sort_key == "%Chg Today ↓":
+        rows_df = rows_df.sort_values("PctChgToday", ascending=False, na_position="last")
+    elif sort_key == "Symbol A→Z":
+        rows_df = rows_df.sort_values("Symbol")
+    else:
+        rows_df = rows_df.sort_values("DaysActive", ascending=True)
+
+    header = (
+        '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th>'
+        '<th>Entry</th><th>SL</th><th>T1</th><th>T2</th><th>Current Price</th><th>PnL%</th>'
+        '<th>Days Active</th><th>%Chg Today</th><th>Vol Ratio</th><th>CV4 Read (context only)</th></tr>'
+    )
+    body = ""
+    for rank, (_, r) in enumerate(rows_df.iterrows(), 1):
+        def _px(v):
+            try:
+                return f"₹{float(v):,.2f}" if float(v) > 0 else "—"
+            except (TypeError, ValueError):
+                return "—"
+        def _pct(v):
+            try:
+                fv = float(v)
+                color = "#3fb950" if fv > 0 else ("#f85149" if fv < 0 else "#8b949e")
+                return f'<td class="col-num" style="color:{color}">{fv:+.1f}%</td>'
+            except (TypeError, ValueError):
+                return '<td class="col-num" style="color:var(--muted)">—</td>'
+        def _ratio(v):
+            try:
+                return f'<td class="col-num">{float(v):.2f}x</td>'
+            except (TypeError, ValueError):
+                return '<td class="col-num">—</td>'
+        body += (
+            f'<tr><td class="col-rank">{rank}</td>'
+            f'<td class="col-stock">{_tv_link(r["Symbol"])}</td>'
+            f'<td>{_ap_status_badge(r["Status"])}</td>'
+            f'<td class="col-num">{_px(r["Entry"])}</td>'
+            f'<td class="col-num">{_px(r["SL"])}</td>'
+            f'<td class="col-num">{_px(r["T1"])}</td>'
+            f'<td class="col-num">{_px(r["T2"])}</td>'
+            f'<td class="col-num">{_px(r["CurrentPrice"])}</td>'
+            + _ap_pnl_cell(r["PnLPct"])
+            + f'<td class="col-num">{int(r["DaysActive"])}d</td>'
+            + _pct(r["PctChgToday"])
+            + _ratio(r["VolRatio"])
+            + f'<td>{_ap_rec_badge(r["CV4Read"])}</td>'
+            '</tr>'
+        )
+    st.markdown(
+        f'<table class="ap-table"><thead>{header}</thead><tbody>{body}</tbody></table>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Manual exit control — same pattern as Active Setups ──────────
+    closeable = rows_df[rows_df["Status"].isin(["WAITING", "ACTIVE", "T1_HIT"])]
+    with st.expander("🚪 Close a Momentum trade manually", expanded=False):
+        if closeable.empty:
+            st.caption("No open Momentum trades available to manually close.")
+        else:
+            sym_choice = st.selectbox(
+                "Trade to close", closeable["Symbol"].tolist(), key="mom_close_symbol",
+            )
+            reason = st.text_input(
+                "Reason (optional)", value="Manual exit", key="mom_close_reason",
+            )
+            if st.button("Close trade", key="mom_close_btn", type="primary"):
+                _row = closeable[closeable["Symbol"] == sym_choice].iloc[0]
+                ok = close_setup_plan_manually(_row["setup_id"], reason=reason or "Manual exit")
+                if ok:
+                    st.success(f"{sym_choice} closed.")
+                    st.rerun()
+                else:
+                    st.error(f"Could not close {sym_choice} — it may already be closed.")
 
 
 def _render_pre_breakout_tab(records: list, df: pd.DataFrame, mode: str) -> None:
@@ -4104,6 +4324,13 @@ def _dore_options_panel():
     # never entered), and `dore_opt_meta = dore_opt_meta or dore_tech_meta`
     # further down raised UnboundLocalError — the Aug 21 market-hours
     # short-circuit added the _skip_poll=True path without this.
+    #
+    # [2026-09-08 note] Re-applied by hand after 91e9328 accidentally
+    # reverted the Momentum tab (see commit history — 91e9328 uploaded a
+    # whole-file copy predating 757114e's "Add Momentum (MOM)" commit,
+    # netting -202/+12 lines despite its message describing only this
+    # one-line fix). This file restores 757114e's Momentum tab and
+    # reapplies just this fix on top, instead of losing the tab again.
     dore_opt_meta = None
     if not _skip_poll:
         dore_opt_meta = load_snapshot_meta("dore_live_state")
@@ -4234,40 +4461,66 @@ def render(settings: dict | None = None):
     settings = settings or {}
     supabase_ok = _is_available()
 
-    # ── Load last completed scan from Supabase on first render ───────
-    # [2026-07-28 fix] Previously scan_df only ever got set inside the
+    # ── Load last completed scan from Supabase, and keep it current ──
+    # [2026-07-28 fix] Originally: scan_df only ever got set inside the
     # `if run_btn:` block below, so a fresh browser session / page
     # reload / Streamlit rerun always started at "No scan data" even
-    # though live_scanner_snapshots already had a completed scan from
-    # this session or an earlier one — the same table pages/dashboard.py
-    # (_dash_scan_autorefresh / its own first-render block) reads from.
-    # Mirrors that pattern here so Scanner behaves the same way: only
-    # goes to Supabase once per session (scan_df not yet in
-    # session_state); a manual Run Scan afterwards always overwrites
-    # scan_df/scan_time itself regardless of what this loaded.
-    if "scan_df" not in st.session_state and supabase_ok:
-        from utils.snapshot_cache import get_snapshot, get_snapshot_df
-        _snap = get_snapshot("live_scanner")
-        if _snap:
-            _df = get_snapshot_df("live_scanner")
-            if not _df.empty:
-                # [2026-08-24] Already downcast at the source — see
-                # utils.snapshot_cache._live_scanner_slim_payload_and_df_ttl()
-                # — no need to repeat prepare_output_payload() here.
-                st.session_state["scan_df"]      = _df
-                st.session_state["last_scan_df"] = st.session_state["scan_df"]
-                _created_at = _snap.get("created_at", "")
-                st.session_state["scan_time"] = (
-                    pd.to_datetime(_created_at).tz_convert(_IST).strftime("%Y-%m-%d %H:%M:%S")
-                    if _created_at else ""
-                )
-                # summary/regime_ctx aren't part of this payload (only
-                # `data` is — see save_snapshot("live_scanner", ...) in
-                # the run_btn block below) — render_scan_results only
-                # reads summary.get(...) with safe defaults, so leaving
-                # it unset (empty dict) just skips the regime-gate info
-                # banner rather than erroring.
-                st.session_state["scan_loaded_from_db"] = True
+    # though live_scanner already had a completed scan from this session
+    # or an earlier one.
+    #
+    # [2026-09-08 fix — SG report: "Active Setups" Current Price/
+    # Recommendation stale] The 2026-07-28 fix over-corrected: it only
+    # ever loaded from Supabase ONCE per browser session
+    # (`"scan_df" not in st.session_state`), then never again for that
+    # tab's lifetime — a session left open just froze at whatever
+    # live_scanner looked like the moment the tab first loaded, even
+    # though the backing live_scanner_state table keeps upserting new
+    # data every ~5 min (confirmed live via direct Neon query). Every
+    # OTHER reader of this same table — pages/dashboard.py's
+    # _dash_scan_autorefresh() fragment — already solved this correctly
+    # with a cheap version check (load_snapshot_meta) instead of a
+    # once-ever gate. Mirrored here, WITHOUT adopting dashboard's
+    # st.fragment(run_every=...) timer + unscoped st.rerun() — that's a
+    # bigger behavior change (forces periodic full-page reruns / extra
+    # Neon reads even when idle) that this fix doesn't need: Streamlit
+    # already reruns render() on every user interaction, so checking the
+    # version on each of those reruns is enough to stop a tab from
+    # silently going stale, without adding a new background poll loop.
+    # A manual Run Scan below still always overwrites scan_df/scan_time
+    # regardless of what this loaded.
+    if supabase_ok:
+        from utils.scan_state import load_snapshot_meta
+        _meta = load_snapshot_meta("live_scanner")
+        _meta_version = _meta.get("version") if _meta else None
+        _stale_or_missing = (
+            "scan_df" not in st.session_state
+            or (_meta_version is not None
+                and _meta_version != st.session_state.get("scan_df_version"))
+        )
+        if _meta and _stale_or_missing:
+            from utils.snapshot_cache import get_snapshot, get_snapshot_df
+            _snap = get_snapshot("live_scanner")
+            if _snap:
+                _df = get_snapshot_df("live_scanner")
+                if not _df.empty:
+                    # [2026-08-24] Already downcast at the source — see
+                    # utils.snapshot_cache._live_scanner_slim_payload_and_df_ttl()
+                    # — no need to repeat prepare_output_payload() here.
+                    st.session_state["scan_df"]      = _df
+                    st.session_state["last_scan_df"] = st.session_state["scan_df"]
+                    st.session_state["scan_df_version"] = _snap.get("version")
+                    _created_at = _snap.get("created_at", "")
+                    st.session_state["scan_time"] = (
+                        pd.to_datetime(_created_at).tz_convert(_IST).strftime("%Y-%m-%d %H:%M:%S")
+                        if _created_at else ""
+                    )
+                    # summary/regime_ctx aren't part of this payload (only
+                    # `data` is — see save_snapshot("live_scanner", ...) in
+                    # the run_btn block below) — render_scan_results only
+                    # reads summary.get(...) with safe defaults, so leaving
+                    # it unset (empty dict) just skips the regime-gate info
+                    # banner rather than erroring.
+                    st.session_state["scan_loaded_from_db"] = True
 
     # ── Controls row ────────────────────────────────────────────
     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.2, 1, 4, 1])
@@ -4667,14 +4920,28 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
     except Exception:
         _open_plans_preview = {}
 
+    try:
+        # [2026-09-05, SG request] Independent source-scoped load — see
+        # load_open_setup_plans_by_source()'s docstring for why this
+        # can't reuse _load_open_plans_for_count()/_open_plans_preview
+        # above (that dict is keyed by symbol across ALL sources and
+        # would collide with an LS/PB plan open on the same symbol).
+        # Unlike Active Setups' count, WAITING is INCLUDED here — see
+        # _render_momentum_tab()'s docstring for why.
+        from utils.supabase_client import load_open_setup_plans_by_source as _load_mom_plans_for_count
+        _open_mom_plans_preview = _load_mom_plans_for_count("MOM")
+    except Exception:
+        _open_mom_plans_preview = {}
+
     tab_labels = [
         f"✅ Actionable ({len(elite_df) + len(execute_df) + len(actionable_df)})",
         f"🎯 Pre-Breakout ({len(pre_breakout_records)})",
         f"📋 Active Setups ({len(_open_plans_preview)})",
+        f"⚡ Momentum ({len(_open_mom_plans_preview)})",
         "🏛️ Five Pillars",
     ]
-    df_sets  = [pd.DataFrame(), pre_breakout_df, pd.DataFrame(), pd.DataFrame()]
-    set_keys = ["ELITE_EXEC_ACTIONABLE", "PRE_BREAKOUT", "ACTIVE_PLANS", "FIVE_PILLARS"]
+    df_sets  = [pd.DataFrame(), pre_breakout_df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()]
+    set_keys = ["ELITE_EXEC_ACTIONABLE", "PRE_BREAKOUT", "ACTIVE_PLANS", "MOMENTUM", "FIVE_PILLARS"]
 
     if show_skip:
         skip_df = _sc_df("Skip") if has_cv1 else pd.DataFrame()
@@ -4698,6 +4965,16 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
             #    today's scanner recommendation ───────────────────────────
             if sc_key == "ACTIVE_PLANS":
                 _render_active_plans_tab(df_aug, preloaded_plans=_open_plans_preview)
+                continue
+
+            # ── MOMENTUM: independent setup source, NOT a CV4 tab — see
+            #    _render_momentum_tab()'s docstring. Deliberately its own
+            #    branch rather than reusing ACTIVE_PLANS's renderer: this
+            #    tab shows WAITING plans too (Active Setups excludes them
+            #    on purpose), and every row's "CV4 Read" is informational
+            #    only, never a gate. ─────────────────────────────────────
+            if sc_key == "MOMENTUM":
+                _render_momentum_tab(df_aug)
                 continue
 
             # ── FIVE_PILLARS: Structure/Acceptance/Reversal/Leadership/
