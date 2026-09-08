@@ -2451,98 +2451,119 @@ def _today_sector_flow_compact_html(flow: dict, rows: int = 3, compact: bool = F
 # its tier drops. The full equity Active Plans tab (with status,
 # targets, R:R, multi-day history, etc.) stays on the Scanner page —
 # this is only a glance, not a replacement for it.
-def _live_scanner_snapshot_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
-    need = {"Stock", "%Chg", "EntryLocked", "EntryDriftPct", "PlanStatus"}
-    if df_aug is None or df_aug.empty or not need.issubset(df_aug.columns):
-        return ('<div class="sr-panel"><div class="sr-panel-title">LIVE SCANNER SNAPSHOT</div>'
-                '<div style="color:#8b949e;font-size:0.75rem;">No scan data yet.</div></div>')
+def _active_setups_zero_days_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
+    """
+    ACTIVE SETUPS (0 DAYS) — [2026-09-08, SG request] replaces the old
+    LIVE SCANNER SNAPSHOT card in this same dashboard slot.
 
-    work = df_aug.copy()
-    work["%Chg"] = pd.to_numeric(work["%Chg"], errors="coerce")
-    work = work.dropna(subset=["%Chg"])
+    The old card answered "what does CV4 currently rate highly" (any
+    row whose *live* Recommendation/Category tier is Elite/Execute/
+    Actionable right now) — that is a today's-tier read off the raw
+    scan, independent of whether a trade plan actually exists for it.
 
-    # Recommendation is the modern CV1 tier column; Category is the
-    # legacy fallback for cached scans predating that refactor — same
-    # split as pages/scanner.py's `has_cv1` check. A row qualifies here
-    # purely on CURRENT tier, not on whether a plan ever triggered.
-    if "Recommendation" in work.columns:
-        tier_col, actionable_vals = "Recommendation", {"Elite", "Execute", "Actionable"}
-    elif "Category" in work.columns:
-        tier_col, actionable_vals = "Category", {"Elite Opportunity", "High Conviction", "Actionable"}
-    else:
-        tier_col, actionable_vals = None, set()
+    This card answers a different question: "what setups did the
+    scanner actually mint and enter TODAY" — i.e. persisted setup_plans
+    (source LS/PB/MOM, same three sources pages/scanner.py's Active
+    Setups tab tracks) with status ACTIVE or T1_HIT (entered — WAITING
+    excluded, same "not yet a real trade" convention that tab uses) AND
+    days_active == 0 (first_actionable_date == today). Symbols whose
+    plan was minted on an earlier day never appear here even if still
+    open — that's what "Active Setups" (all days) is for.
 
-    work["_actionable_now"] = (
-        work[tier_col].astype(str).isin(actionable_vals) if tier_col else False
-    )
+    %CHG / current price come from df_aug (this cycle's live scan), by
+    symbol — "Not in today's scan" if the symbol has since fallen out
+    of the scan universe (mirrors _ap_rec_badge()'s empty_label default
+    on the Scanner page's Active Setups tab). DRIFT here is the price
+    move since the locked entry (compute_pnl_pct(entry_locked, live
+    price)) — for a plan that entered today, that IS the live trade's
+    running P&L, a more meaningful "drift" for a 0-day-old trade than
+    EntryDriftPct's "has the scanner's own entry level moved" concept
+    (which utils.setup_persistence computes only for LS/PB, never MOM,
+    so it can't cover all three sources here anyway). TARGET is
+    t1_locked, the same frozen T1 level the Scanner page's Active
+    Setups tab shows.
+    """
+    from utils.setup_persistence import compute_pnl_pct, _compute_days_active
 
-    # PlanStatus == ACTIVE is used only to break ties in sort order below
-    # (an already-triggered plan is the most actionable form of
-    # "actionable"), never as a separate inclusion path.
-    work["_is_active"] = work["PlanStatus"].astype(str).str.upper() == "ACTIVE"
+    try:
+        from utils.supabase_client import load_open_setup_plans, load_open_setup_plans_by_source, _is_available
+        if not _is_available():
+            plans = []
+        else:
+            ls_pb = list(load_open_setup_plans().values())          # LS + PB, keyed by symbol
+            mom   = list(load_open_setup_plans_by_source("MOM").values())
+            plans = ls_pb + mom
+    except Exception:
+        logger.exception("Dashboard Active Setups (0 Days) card failed to load plans (non-fatal)")
+        plans = []
 
-    work = work[work["_actionable_now"]]
+    zero_day = [
+        p for p in plans
+        if str(getattr(p, "status", "")).upper() in ("ACTIVE", "T1_HIT")
+        and _compute_days_active(getattr(p, "first_actionable_date", "")) == 0
+    ]
 
-    if work.empty:
-        return ('<div class="sr-panel"><div class="sr-panel-title">LIVE SCANNER SNAPSHOT</div>'
-                '<div style="color:#8b949e;font-size:0.75rem;">No actionable setups right now.</div></div>')
+    if not zero_day:
+        return ('<div class="sr-panel"><div class="sr-panel-title">ACTIVE SETUPS (0 DAYS)</div>'
+                '<div style="color:#8b949e;font-size:0.75rem;">No setup entered today yet — '
+                'see the Scanner page\'s Active Setups tab for all open trades.</div></div>')
 
-    # Open (triggered) setups first — already actionable in the fullest
-    # sense — then the rest ranked by score (CV1_Composite, same field
-    # pages/scanner.py's own _sc_df sorts by; falls back to Leadership,
-    # then %Chg if neither is present in this scan's columns).
-    score_col = (
-        "CV1_Composite" if "CV1_Composite" in work.columns
-        else "CV1_Leadership" if "CV1_Leadership" in work.columns
-        else "%Chg"
-    )
-    work[score_col] = pd.to_numeric(work[score_col], errors="coerce")
-    work = work.sort_values(
-        ["_is_active", score_col], ascending=[False, False], na_position="last"
-    ).head(top_n)
+    live_lookup = {}
+    if df_aug is not None and not df_aug.empty and "Stock" in df_aug.columns:
+        for _, r in df_aug.iterrows():
+            sym = str(r.get("Stock", "")).upper().strip()
+            live_lookup[sym] = {
+                "pct_chg": pd.to_numeric(r.get("%Chg"), errors="coerce"),
+                "cmp":     float(r.get("Entry", 0) or 0),
+            }
 
-    def _current_price(row):
-        # Same fallback chain as _nse_top_gainers_html's _ltp() next to
-        # this card, kept local since that one closes over its own
-        # `work` frame — no live re-fetch, just reads whichever price
-        # column this cycle's scan row already carries.
-        for col in ("LTP", "CMP", "Entry"):
-            if col in row and pd.notna(row.get(col)):
-                return float(row[col])
-        return None
+    rows = []
+    for p in zero_day:
+        sym  = str(getattr(p, "symbol", "")).upper().strip()
+        live = live_lookup.get(sym, {})
+        cmp_px = live.get("cmp", 0.0)
+        rows.append({
+            "Symbol":  sym,
+            "PctChg":  live.get("pct_chg"),
+            "Entry":   getattr(p, "entry_locked", 0.0) or 0.0,
+            "Drift":   compute_pnl_pct(getattr(p, "entry_locked", 0.0), cmp_px) if cmp_px else None,
+            "Target":  getattr(p, "t1_locked", 0.0) or 0.0,
+        })
+
+    df = pd.DataFrame(rows)
+    df["_sort"] = pd.to_numeric(df["PctChg"], errors="coerce")
+    df = df.sort_values("_sort", ascending=False, na_position="last").head(top_n)
 
     rows_html = ""
-    for _, r in work.iterrows():
-        symbol = r.get("Stock", "—")
-        chg = r["%Chg"]
-        entry = r.get("EntryLocked")
-        drift = r.get("EntryDriftPct")
-        drift_val = float(drift) if drift not in (None, "") and pd.notna(drift) else None
-        price = _current_price(r)
+    for _, r in df.iterrows():
+        chg = r["PctChg"]
+        chg_ok = chg is not None and pd.notna(chg)
+        drift_ok = r["Drift"] is not None and pd.notna(r["Drift"])
         rows_html += (
             "<tr>"
-            f'<td><span class="sr-sector-name" style="font-weight:700;" title="{symbol}">{_tv_link(str(symbol), reduced_history=r.get("reduced_history")) if symbol != "—" else symbol}</span></td>'
-            f'<td class="{"sr-pos" if chg >= 0 else "sr-neg"}">{"+" if chg >= 0 else ""}{chg:.2f}%</td>'
-            f"<td>{f'{price:,.2f}' if price is not None else '—'}</td>"
-            f"<td>{f'{float(entry):,.2f}' if entry not in (None, '') and pd.notna(entry) else '—'}</td>"
-            f'<td class="{"sr-pos" if (drift_val or 0) >= 0 else "sr-neg"}">{f"{"+" if drift_val >= 0 else ""}{drift_val:.2f}%" if drift_val is not None else "—"}</td>'
+            f'<td><span class="sr-sector-name" style="font-weight:700;" title="{r["Symbol"]}">{_tv_link(r["Symbol"])}</span></td>'
+            + (f'<td class="{"sr-pos" if chg >= 0 else "sr-neg"}">{"+" if chg >= 0 else ""}{chg:.2f}%</td>' if chg_ok else '<td style="color:#8b949e;">—</td>')
+            + f'<td>{f"{r["Entry"]:,.2f}" if r["Entry"] else "—"}</td>'
+            + (f'<td class="{"sr-pos" if r["Drift"] >= 0 else "sr-neg"}">{"+" if r["Drift"] >= 0 else ""}{r["Drift"]:.2f}%</td>' if drift_ok else '<td style="color:#8b949e;" title="Not in today\'s scan">—</td>')
+            + f'<td>{f"{r["Target"]:,.2f}" if r["Target"] else "—"}</td>'
             "</tr>"
         )
 
     return f"""
     <div class="sr-panel">
-      <div class="sr-panel-title">LIVE SCANNER SNAPSHOT</div>
+      <div class="sr-panel-title">ACTIVE SETUPS (0 DAYS)</div>
       <div class="sr-panel-body">
       <table class="sr-table sr-table--snapshot">
         <colgroup>
-          <col style="width:26%"><col style="width:16%"><col style="width:24%">
-          <col style="width:17%"><col style="width:17%">
+          <col style="width:26%"><col style="width:16%"><col style="width:19%">
+          <col style="width:19%"><col style="width:20%">
         </colgroup>
-        <tr><th>SYMBOL</th><th>%CHG</th><th>PRICE</th><th>ENTRY</th><th>DRIFT</th></tr>
+        <tr><th>SYMBOL</th><th>%CHG</th><th>ENTRY</th><th>DRIFT</th><th>TARGET</th></tr>
         {rows_html}
       </table>
       </div>
     </div>"""
+
 
 
 # ── ACTIVE OPTIONS PLANS (compact card) ─────────────────────────────
@@ -3440,15 +3461,19 @@ def render(settings: dict | None = None):
     # by Futures and Options. Dashboard stays focused on market-wide
     # context: Top Gainers, News, and Sector data below.
 
-    # ── Live Scanner Snapshot + Active Options Plans, side by side ────
+    # ── Active Setups (0 Days) + Active Options Plans, side by side ───
     # [2026-08-05] These two "what's currently open" cards now sit next
     # to each other (equity setups on the left, options plans on the
     # right) instead of stacking full-width one after another, with News
     # pushed below both — News is market-wide context, these two are the
     # "what did the scanner actually do" glance and read better together.
+    # [2026-09-08, SG request] Left card swapped from LIVE SCANNER
+    # SNAPSHOT (today's CV4 tier read, plan-independent) to ACTIVE
+    # SETUPS (0 DAYS) (persisted setup_plans minted+entered today) — see
+    # _active_setups_zero_days_html()'s docstring for the distinction.
     live_col, plans_col = st.columns([1, 1], gap="medium")
     with live_col:
-        st.markdown(_live_scanner_snapshot_html(df_aug), unsafe_allow_html=True)
+        st.markdown(_active_setups_zero_days_html(df_aug), unsafe_allow_html=True)
     with plans_col:
         st.markdown(_active_options_plans_html(), unsafe_allow_html=True)
 
