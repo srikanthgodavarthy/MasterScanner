@@ -2954,7 +2954,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
     header = (
         '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th><th>CMP</th><th>Source</th>'
         '<th>Entry (Oldest)</th><th>SL (CV4)</th><th>T1 (CV4)</th><th>CV4 Composite</th><th>PnL%</th>'
-        '<th>No of Days</th><th>Volume%</th></tr>'
+        '<th>No of Days</th><th>Volume</th></tr>'
     )
     body = ""
     for rank, (_, r) in enumerate(rows_df.iterrows(), 1):
@@ -2966,7 +2966,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
         # [2026-09-08, SG request] Original Rec/Momentum removed
         # entirely — a locked-at-mint badge stops being a meaningful
         # single number once a plan has more than one contributing
-        # source. Current Rec/Momentum replaced with a plain Volume%
+        # source. Current Rec/Momentum replaced with a plain Volume (vol_ratio) read
         # read (today's live vol_ratio, if the symbol's still in
         # today's scan universe) — simpler and source-agnostic, unlike
         # the old CV4-category-vs-Momentum-snapshot split that needed
@@ -2981,8 +2981,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
                 f'title="{r["ConflictReason"]}">⚠️ Conflict</td>'
             )
         else:
-            _vol_pct = r["CurVolRatio"] * 100.0
-            _vol_cell = f'<td class="col-num">{_vol_pct:,.0f}%</td>' if r["CurVolRatio"] else '<td class="col-num">—</td>'
+            _vol_cell = f'<td class="col-num">{r["CurVolRatio"]:.1f}x</td>' if r["CurVolRatio"] else '<td class="col-num">—</td>'
         body += (
             f'<tr><td class="col-rank">{rank}</td>'
             f'<td class="col-stock">{_tv_link(r["Symbol"])}</td>'
@@ -3023,7 +3022,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
     # callout used to live here, keyed off OriginalRec vs CurrentRec.
     # Both columns are gone from this tab now (see header/body above) —
     # Original Rec was removed entirely and Current Rec was replaced
-    # with a plain Volume% read, so there is no longer a "recommendation
+    # with a plain Volume (vol_ratio, e.g. "1.5x") read, so there is no longer a "recommendation
     # drift" concept left to detect here.
 
     # ── Manual exit control ─────────────────────────────────────────
