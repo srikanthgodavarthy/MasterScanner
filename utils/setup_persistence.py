@@ -1342,6 +1342,145 @@ def enrich_momentum_row(
     return momentum_row, plan, plan_was_updated
 
 
+def enrich_five_pillars_row(
+    fp_row:               dict,
+    existing_plan:        Optional["SetupPlan"],
+    fp_qualified:         bool,
+    first_seen_date:      str = "",
+    current_price:        float = 0.0,
+    bar_low:               float | None = None,
+    bar_high:               float | None = None,
+    cross_source_plan:     Optional["SetupPlan"] = None,
+) -> tuple[dict, Optional["SetupPlan"], bool]:
+    """
+    Five Pillars' equivalent of enrich_momentum_row() — same structure,
+    same corroborate-or-mint pattern, source="FP". [2026-09-08, SG
+    request — LS/PB/MoM/FivePillars single-symbol-persistent Active
+    Setups]
+
+    Parameters
+    ----------
+    fp_row               : one row dict from utils.pillar_engine's own
+                            scoring (attached onto the scanner's shared
+                            df_out by scanner_engine.py — see
+                            _enrich_with_five_pillars_persistence()) —
+                            must carry Entry/SL/T1/T2 plus "Stock". Note
+                            these are the SAME shared Entry/SL/T1/T2
+                            columns CV4/trade_levels.py already computed
+                            for this row (pages/five_pillars.py reads
+                            them directly with no FP-specific override
+                            either) — unlike Momentum, Five Pillars has
+                            no ATR-based levels of its own.
+    existing_plan        : SetupPlan loaded from DB for this symbol
+                            with source == "FP", or None.
+    fp_qualified         : True iff this row's base FP_Class (utils.
+                            pillar_engine, pre-promotion) is CLASS_EXECUTE
+                            (or the promoted CLASS_ELITE, when supplied).
+                            This is the ONLY gate on plan creation — no
+                            CV1/Recommendation check, by design, same as
+                            Momentum's own qualification is independent
+                            of CV4.
+    first_seen_date, current_price, bar_low, bar_high : same contract as
+                            enrich_scanner_row()/enrich_momentum_row().
+    cross_source_plan    : the OLDEST open plan for this symbol across
+                            ALL sources (from load_open_setup_plans()),
+                            or None — see enrich_momentum_row()'s own
+                            cross_source_plan docstring; identical
+                            corroborate-instead-of-mint behaviour here.
+
+    Returns
+    -------
+    (enriched_row, plan, plan_was_updated) — same shape as
+    enrich_scanner_row()/enrich_momentum_row().
+    """
+    today_str = date.today().isoformat()
+    symbol    = str(fp_row.get("Stock", "")).upper().strip()
+
+    plan_was_updated = False
+    plan = existing_plan
+
+    # ── 1. Advance the lifecycle of any existing OPEN FP plan ───────
+    if plan is not None and plan.is_open():
+        changed, _ = advance_lifecycle(
+            plan, current_price, today_str,
+            bar_low=bar_low, bar_high=bar_high,
+        )
+        if changed:
+            plan_was_updated = True
+
+    # ── 2. Mint a new FP plan — gated ONLY on fp_qualified, never on
+    #      CV4/Recommendation. Unless a DIFFERENT source already has
+    #      this symbol open (cross_source_plan), corroborate instead.
+    should_create = fp_qualified and (plan is None or plan.is_terminal())
+    if (should_create and cross_source_plan is not None and cross_source_plan.is_open()
+            and cross_source_plan.source.upper() != "FP"):
+        _entry = float(fp_row.get("EntryRef", fp_row.get("Entry", 0)) or 0)
+        _sl = float(fp_row.get("SL", 0) or 0)
+        if _corroborate_cross_source(cross_source_plan, "FP", _entry, _sl):
+            plan_was_updated = True
+        plan = cross_source_plan
+        should_create = False
+    elif should_create:
+        plan = _create_plan(symbol, fp_row, first_seen_date, today_str, source="FP")
+        plan_was_updated = True
+
+    # ── 3. Compute display fields ────────────────────────────────────
+    if plan is not None:
+        plan.days_active       = _compute_days_active(plan.first_actionable_date)
+        plan.setup_age          = _format_setup_age(plan.days_active, plan.status, plan.source)
+        plan.trade_plan_status  = _trade_plan_label(plan)
+    else:
+        plan = SetupPlan(
+            symbol             = symbol,
+            source             = "FP",
+            status             = SetupPlanStatus.NO_PLAN,
+            first_seen_date    = first_seen_date or today_str,
+            setup_age          = "—",
+            trade_plan_status  = "No plan yet",
+        )
+
+    # ── 4. Attach plan fields to the row dict — same field names as
+    #      enrich_scanner_row()/enrich_momentum_row(). ────────────────
+    fp_row["SetupID"]              = plan.setup_id
+    fp_row["FirstSeen"]            = plan.first_seen_date
+    fp_row["FirstActionable"]      = plan.first_actionable_date
+    fp_row["DaysActive"]            = plan.days_active
+    fp_row["PlanStatus"]            = _sval(plan.status)
+    fp_row["ActivatedAt"]           = plan.activated_at
+    fp_row["T1HitAt"]               = plan.t1_hit_at
+    fp_row["ClosedAt"]              = plan.closed_at
+
+    if plan.is_open() and plan.setup_id:
+        fp_row["EntryLocked"] = plan.entry_locked
+        fp_row["SLLocked"]    = plan.sl_locked
+        fp_row["T1Locked"]    = plan.t1_locked
+        fp_row["T2Locked"]    = plan.t2_locked
+    else:
+        fp_row["EntryLocked"] = fp_row.get("Entry", 0)
+        fp_row["SLLocked"]    = fp_row.get("SL",    0)
+        fp_row["T1Locked"]    = fp_row.get("T1",    0)
+        fp_row["T2Locked"]    = fp_row.get("T2",    0)
+
+    fp_row["SetupAge"]        = plan.setup_age
+    fp_row["TradePlanStatus"] = plan.trade_plan_status
+
+    if plan.is_open() and plan.setup_id and plan.entry_locked and plan.created_at:
+        try:
+            from utils.outcome_tracking import update_forward_outcome
+            update_forward_outcome(
+                plan_key=plan.setup_id, source="LIVE_SCANNER", symbol=symbol,
+                entry_timestamp=plan.created_at,
+                entry_underlying=plan.entry_locked, entry_premium=None,
+                current_underlying=current_price or None, current_premium=None,
+                direction="",
+            )
+        except Exception:
+            logger.exception("[setup_persistence] outcome-tracking update failed for setup_id=%s (non-fatal)",
+                              plan.setup_id)
+
+    return fp_row, plan, plan_was_updated
+
+
 # ══════════════════════════════════════════════════════════════════
 #  BATCH ENRICHMENT  (called by run_scanner after all rows computed)
 # ══════════════════════════════════════════════════════════════════
