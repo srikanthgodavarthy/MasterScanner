@@ -583,6 +583,25 @@ def top_dore_trade_plans(
 
     ranked = rank_recommendations(plans)
 
+    # [Futures confirmation observability, DORE_FUTURES_MIGRATION_PLAN_v2.md
+    # Option A, 2026-09-08] Nothing else in the app surfaces whether
+    # settings.use_futures_confirmation (dore_options_engine.py) is
+    # actually changing anything: futures_confirmation_used/
+    # futures_directional_agreement are persisted into this cycle's
+    # payload (OptionTradePlan.to_dict() is a plain asdict()) but never
+    # read back by any page. One aggregate line per cycle, so the hit/
+    # disagreement rate is checkable from logs alone without a UI change.
+    _fut_used = [p for p in ranked if getattr(p, "futures_confirmation_used", False)]
+    _fut_disagreed = [p for p in _fut_used if p.futures_directional_agreement is False]
+    logger.info(
+        "[dore_options_scan] futures confirmation: %d/%d plan(s) this cycle used the futures-"
+        "sourced EMA9/21 for direction() (settings.use_futures_confirmation=%s); "
+        "%d of those disagreed with the spot underlying's own cross%s",
+        len(_fut_used), len(ranked), settings.use_futures_confirmation, len(_fut_disagreed),
+        f" ({', '.join(p.symbol for p in _fut_disagreed[:10])}{', ...' if len(_fut_disagreed) > 10 else ''})"
+        if _fut_disagreed else "",
+    )
+
     # [DORE Integration, 2026-08-05] Entry-locking / Drift % used to be
     # computed HERE, every time this function ran (previously every 60s
     # on its own standalone schedule). That's now Stage 2's job — see
