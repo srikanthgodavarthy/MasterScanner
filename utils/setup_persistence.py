@@ -265,6 +265,16 @@ class SetupPlan:
     invalidation_reason:      str   = ""
     invalidated_date:          str   = ""
 
+    # [2026-09-08, SG request] Momentum-perspective snapshot at mint —
+    # ONLY ever populated for source="MOM" plans (LS/PB never call
+    # utils.momentum_engine, so these stay 0.0 for them, same contract
+    # as locked_leadership/etc. being 0 for MOM). Lets the Active Setups
+    # table show a real "Original Momentum" read (today's %chg/vol_ratio
+    # AT MINT) instead of a placeholder "No CV4 rec" string that told you
+    # nothing MOM-specific at all.
+    locked_pct_chg:          float = 0.0
+    locked_vol_ratio:        float = 0.0
+
     # [2026-08-07, SG request] Where this plan was minted from — "LS"
     # (Live Scanner — the normal Actionable/Execute/Elite promotion path)
     # or "PB" (Pre-Breakout tab — minted early off a squeeze_release
@@ -336,6 +346,8 @@ class SetupPlan:
             "locked_conviction":      self.locked_conviction,
             "locked_entry_quality":   self.locked_entry_quality,
             "locked_extension":       self.locked_extension,
+            "locked_pct_chg":         self.locked_pct_chg,
+            "locked_vol_ratio":       self.locked_vol_ratio,
             "status":                 _sval(self.status),
             "status_reason":          self.status_reason,
             "created_at":             self.created_at,
@@ -856,6 +868,13 @@ def _create_plan(
         locked_conviction      = int(scanner_row.get("CV1_Conviction",   scanner_row.get("Legacy_Conviction",   scanner_row.get("DE_Conviction",   0))) or 0),
         locked_entry_quality   = int(scanner_row.get("CV1_EntryQuality", scanner_row.get("Legacy_EntryQuality", scanner_row.get("DE_EntryQuality", 0))) or 0),
         locked_extension       = int(scanner_row.get("Extension",    0) or 0),
+        # MOM-only snapshot — see SetupPlan field docstring. scanner_row
+        # is a momentum_engine row for source="MOM" (carries "PctChg"/
+        # "VolRatio"), a CV4 scanner row for LS/PB (never carries those
+        # keys, so this is a no-op 0.0 for them — same fallback pattern
+        # as locked_leadership/etc. above).
+        locked_pct_chg          = float(scanner_row.get("PctChg",   0) or 0),
+        locked_vol_ratio        = float(scanner_row.get("VolRatio", 0) or 0),
         status                 = SetupPlanStatus.WAITING,
         status_reason           = "Plan created — awaiting entry trigger",
         created_at              = now_ts,

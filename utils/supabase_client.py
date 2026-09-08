@@ -800,6 +800,8 @@ def _setup_plan_from_row(row: dict) -> "object":
         locked_conviction        = int(row.get("locked_conviction",  0) or 0),
         locked_entry_quality     = int(row.get("locked_entry_quality",0) or 0),
         locked_extension         = int(row.get("locked_extension",   0) or 0),
+        locked_pct_chg           = float(row.get("locked_pct_chg",   0) or 0),
+        locked_vol_ratio         = float(row.get("locked_vol_ratio", 0) or 0),
         status                   = _normalize_legacy_status(row.get("status", "WAITING")),
         status_reason            = row.get("status_reason") or row.get("invalidation_reason", "") or "",
         created_at                = str(row.get("created_at", "") or ""),
@@ -2108,6 +2110,20 @@ UPDATE setup_plans SET status_reason = invalidation_reason
 UPDATE setup_plans SET status = 'CLOSED' WHERE status = 'INVALIDATED';
 UPDATE setup_plans SET closed_at = invalidated_date::timestamptz
   WHERE closed_at IS NULL AND invalidated_date IS NOT NULL;
+"""
+
+# [2026-09-08, SG request] Original vs Current Momentum tracking on the
+# Active Setups tab — run this once against the live DB before the
+# next MOM plan mints, or _create_plan()'s locked_pct_chg/
+# locked_vol_ratio writes will fail against the missing columns.
+# Existing MOM rows minted before this migration simply keep reading
+# back 0.0/0.0 for both (DEFAULT below) — pages/scanner.py's
+# _ap_orig_rec_badge() already treats that as "no snapshot captured
+# yet" and falls back to the old placeholder text for exactly those
+# rows, so no backfill is required.
+MOMENTUM_TRACKING_MIGRATION_SQL = """
+ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS locked_pct_chg   numeric(8,2) NOT NULL DEFAULT 0;
+ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS locked_vol_ratio numeric(8,2) NOT NULL DEFAULT 0;
 """
 
 LIFECYCLE_TRANSITIONS_MIGRATION_SQL = """
