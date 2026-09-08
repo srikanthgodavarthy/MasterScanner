@@ -1695,6 +1695,7 @@ def score_stock(
     atr_prox: float = 0.3,
     symbol:   str | None = None,
     sector_series: "pd.Series | None" = None,
+    prescreen_reject_sink: "set | None" = None,
 ) -> dict:
     """
     Evaluate the LATEST bar of df.
@@ -1712,6 +1713,24 @@ def score_stock(
         the caller builds sector_series itself (once per sector per
         scan, not per symbol) since score_stock() has no access to the
         full scan universe's history.
+
+    prescreen_reject_sink : optional — a plain `set` the caller owns (see
+        run_scanner()'s `_prescreen_rejected`). If given, `symbol` is added
+        to it when leadership_prescreen() rejects this stock — a routine,
+        expected filter, not a data loss (see the debug log right below).
+        Lets run_scanner()'s final "unaccounted for" summary tell "every
+        missing symbol was just prescreen filtering" apart from a genuine,
+        unexplained loss, without re-deriving prescreen's own logic there.
+        `set.add()` from multiple scorer-pool threads is safe under the
+        GIL for this use (no read-modify-write, just inserts) — no lock
+        needed. Omit for callers outside run_scanner() (e.g. tests,
+        one-off scoring) — prescreen rejection is still silent-by-design
+        for them, just without the tracking.
+        [Restored 2026-09-08 — this was accidentally reverted by d291321
+        (an unrelated InvalidIndexError/pivot-dedup fix that appears to
+        have been built against a pre-f7a1412 copy of this file, silently
+        undoing f7a1412's 2026-09-03 fix as a side effect). Re-added here
+        without touching d291321's actual index-dedup/day-rollover work.]
     """
     # Full-history gate — EMA200 (the default slow EMA that trend
     # structure/ema_alignment/ema20_pct_dist etc. all derive from) needs
@@ -1808,12 +1827,37 @@ def score_stock(
     diagnostic    = bool((settings or {}).get("prescreen_diagnostic", False))
     prescreen_ok  = leadership_prescreen(df, nifty)
     if not prescreen_ok and not diagnostic:
+        # [Restored 2026-09-08 — see prescreen_reject_sink's docstring
+        # above; accidentally reverted by d291321] Routine, expected
+        # rejection (most of the universe fails leadership prescreen most
+        # cycles by design), but with zero log trace it was
+        # indistinguishable from a genuine loss in run_scanner()'s
+        # "unaccounted for" summary. debug-level (not warning): this
+        # fires constantly and isn't itself actionable, it's just what
+        # makes the "unaccounted for" list explainable after the fact.
+        logging.getLogger(__name__).debug(
+            "score_stock: %s rejected by leadership_prescreen (expected filter, not a data loss)",
+            symbol or "<unknown symbol>",
+        )
+        if prescreen_reject_sink is not None and symbol:
+            prescreen_reject_sink.add(symbol)
         return {}
 
     ia = build_indicators(df, nifty, params, sector_series=sector_series)
     r  = compute_bar(ia, i=-1, params=params)   # -1 = latest bar
 
     if r is None:
+        # [Restored 2026-09-08 — accidentally reverted by d291321] Unlike
+        # the prescreen reject above, compute_bar() returning None on a
+        # symbol that already passed prescreen/indicator-build is NOT
+        # expected — this one is worth a warning so it's distinguishable
+        # from routine prescreen filtering in the same "unaccounted for"
+        # summary.
+        logging.getLogger(__name__).warning(
+            "score_stock: compute_bar returned None for %s after indicator build "
+            "(passed prescreen — unexpected, check for malformed/degenerate OHLCV)",
+            symbol or "<unknown symbol>",
+        )
         return {}
 
     # ── CV4/SMC shadow scoring input (Phase 2, masterscanner_scoring_
@@ -2954,6 +2998,16 @@ def run_scanner(
             _sector_frames = {}
             sector_benchmark_for_symbol = None  # noqa: F811 — degrade to no sector RS if this fails
 
+    # [Restored 2026-09-08 — see score_stock()'s prescreen_reject_sink
+    # docstring; accidentally reverted by d291321] Per-run sink for
+    # prescreen-rejected symbols — populated from inside score_stock()
+    # (called on scorer-pool worker threads; a bare set.add() with no
+    # read-modify-write is GIL-safe here). Consulted by the "unaccounted
+    # for" summary below to downgrade that log's severity when every
+    # missing symbol is just routine prescreen filtering, not a genuine
+    # loss.
+    _prescreen_rejected: set = set()
+
     # [2026-08-17] Narrowed closure: only pull the one symbol's frame and
     # sector series out of the batch-wide dicts *before* submitting, so a
     # future that never finishes (see _scorer_pool note above) pins one
@@ -2965,7 +3019,8 @@ def run_scanner(
             return None
         row = score_stock(df, nifty_series, settings=effective_settings,
                           cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
-                          symbol=sym, sector_series=sector_series)
+                          symbol=sym, sector_series=sector_series,
+                          prescreen_reject_sink=_prescreen_rejected)
         if row:
             row["Stock"] = sym
         return row
@@ -3097,11 +3152,24 @@ def run_scanner(
     scored_syms = {r.get("Stock") for r in results if r}
     unaccounted = set(symbols) - scored_syms
     if unaccounted:
-        _log.warning(
+        # [Restored 2026-09-08 — see prescreen_reject_sink's docstring;
+        # accidentally reverted by d291321] Not every "unaccounted for"
+        # symbol is equally interesting — most of the universe fails
+        # leadership_prescreen most cycles by design. If prescreen fully
+        # explains this batch's gap, that's routine and not worth a
+        # WARNING; only symbols prescreen can't account for are a
+        # genuine, unexplained loss worth flagging.
+        _explained   = unaccounted & _prescreen_rejected
+        _unexplained = unaccounted - _prescreen_rejected
+        _level = _log.warning if _unexplained else _log.info
+        _level(
             "scanner_engine: run_scanner returning %d/%d symbols this batch — "
-            "%d unaccounted for (see history_store/score_stock/timeout warnings "
-            "above for the specific reason per symbol, if logged): %s",
-            len(scored_syms), len(symbols), len(unaccounted), sorted(unaccounted),
+            "%d unaccounted for (%d prescreen-rejected as expected, %d unexplained — "
+            "see history_store/score_stock/timeout warnings above for the specific "
+            "reason per symbol, if logged): unexplained=%s prescreen=%s",
+            len(scored_syms), len(symbols), len(unaccounted),
+            len(_explained), len(_unexplained),
+            sorted(_unexplained), sorted(_explained),
         )
 
     # [2026-08-31 profiling] Single-line fetch/score split for this
