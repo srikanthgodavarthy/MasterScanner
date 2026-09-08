@@ -2486,13 +2486,33 @@ def _active_setups_zero_days_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
     from utils.setup_persistence import compute_pnl_pct, _compute_days_active
 
     try:
-        from utils.supabase_client import load_open_setup_plans, load_open_setup_plans_by_source, _is_available
+        from utils.supabase_client import load_open_setup_plans_by_source, _is_available
         if not _is_available():
             plans = []
         else:
-            ls_pb = list(load_open_setup_plans().values())          # LS + PB, keyed by symbol
-            mom   = list(load_open_setup_plans_by_source("MOM").values())
-            plans = ls_pb + mom
+            # [2026-09-08 fix — SG report: SYRMA/GVT&D/SPLPETRO duplicated]
+            # Was: load_open_setup_plans() (no source filter — "oldest
+            # open plan per symbol, any source") + load_open_setup_plans_
+            # by_source("MOM"). For any symbol whose oldest/only open
+            # plan happens to be MOM-sourced, load_open_setup_plans()
+            # returns that same MOM plan (it doesn't know to exclude MOM
+            # — its docstring says "every OPEN setup plan", the "LS + PB"
+            # inline comment here was simply wrong), so it landed in both
+            # lists. Filtering MOM out of that call's result instead of
+            # replacing it wouldn't be safe either: when a symbol has
+            # BOTH an open LS/PB and an open MOM plan and the MOM one is
+            # older, load_open_setup_plans()'s one-row-per-symbol dedup
+            # picks the MOM row as that symbol's sole representative,
+            # silently dropping the still-open LS/PB plan from the dict
+            # entirely — filtering the MOM row back out then would lose
+            # it altogether rather than double-counting it. Explicit
+            # per-source calls sidestep the ambiguity: LS and PB are
+            # minted as mutually exclusive sources per symbol, so this
+            # can't itself introduce a new duplicate.
+            ls  = list(load_open_setup_plans_by_source("LS").values())
+            pb  = list(load_open_setup_plans_by_source("PB").values())
+            mom = list(load_open_setup_plans_by_source("MOM").values())
+            plans = ls + pb + mom
     except Exception:
         logger.exception("Dashboard Active Setups (0 Days) card failed to load plans (non-fatal)")
         plans = []

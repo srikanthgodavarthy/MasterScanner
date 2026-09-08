@@ -1639,7 +1639,7 @@ def _safe_int(val, default: int = 0) -> int:
         return default
 
 
-def _perstock_breakdown_table(df: pd.DataFrame) -> str:
+def _perstock_breakdown_table(df: pd.DataFrame, dark: bool = False) -> str:
     """
     Render a scrollable sub-factor table for every stock in df.
 
@@ -1651,9 +1651,46 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
 
     Each column header shows the factor name + max weight; hovering reveals
     the exact scoring bands drawn directly from conviction_score_v1.py.
+
+    `dark`: [2026-09-08, SG request — "make stock breakdown to dark"]
+    This table has always rendered on the light "data table zone" surface
+    (--tbl-bg* vars, see the :root comment above) to match the Actionable/
+    Pre-Breakout tabs' white rich-results table it sits directly under —
+    intentional there. But the Active Setups tab (its OTHER call site,
+    _render_active_plans_tab) is dark-themed throughout — the ap-table
+    above this expander, the whole rest of that tab — so this same
+    light-surface table read as a jarring white box dropped into a dark
+    page there, not a deliberate two-tone design. Rather than flip the
+    hardcoded colors globally (which would also silently break the
+    Actionable tab's own intentional light surface), this now takes a
+    `dark` flag: default False keeps every existing call site (the
+    Actionable-family tabs) exactly as-is; only the Active Setups call
+    site opts in with dark=True.
     """
     if df.empty:
         return ""
+
+    # Palette — light branch is byte-for-byte the original hardcoded
+    # values (nothing changes for existing light-zone callers); dark
+    # branch reuses this file's own --bg1/--bg2/--border/--text/--muted
+    # tokens (see the :root block above) so it matches the Active Setups
+    # tab's own dark surface exactly, not an approximation of it.
+    if dark:
+        _surface   = "#161b22"   # --bg1
+        _surface2  = "#1c2333"   # --bg2 (alt row / thead)
+        _border    = "rgba(255,255,255,0.08)"   # --border
+        _border2   = "rgba(255,255,255,0.16)"   # heavier divider
+        _text      = "#e6edf3"   # --text
+        _muted     = "#8b949e"   # --muted
+        _track     = "rgba(255,255,255,0.06)"   # empty progress-bar track
+    else:
+        _surface   = "#ffffff"
+        _surface2  = "#f1f4f8"
+        _border    = "rgba(15,23,42,0.08)"
+        _border2   = "rgba(15,23,42,0.14)"
+        _text      = "var(--text)"
+        _muted     = "#64748b"
+        _track     = "rgba(15,23,42,0.06)"
 
     # ── Factor definitions ─────────────────────────────────────────
     # (df_col, short_label, max_pts, dim_color, tooltip_lines)
@@ -1802,8 +1839,8 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     group_header = '<tr>'
     # frozen cols: Stock + Signal + L + C + EQ = 5
     group_header += (
-        '<th colspan="5" style="background:#ffffff;position:sticky;left:0;z-index:3;'
-        'border-bottom:1px solid rgba(15,23,42,0.08);"></th>'
+        f'<th colspan="5" style="background:{_surface};position:sticky;left:0;z-index:3;'
+        f'border-bottom:1px solid {_border};"></th>'
     )
     for dim_name, dim_col, span in dim_spans:
         if span == 0:
@@ -1812,7 +1849,7 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
             f'<th colspan="{span}" style="text-align:center;font-size:9px;font-weight:700;'
             f'color:{dim_col};letter-spacing:0.1em;text-transform:uppercase;'
             f'border-bottom:2px solid {dim_col}44;padding:5px 4px 4px;'
-            f'background:#ffffff;">{dim_name}</th>'
+            f'background:{_surface};">{dim_name}</th>'
         )
     group_header += '</tr>'
 
@@ -1820,29 +1857,29 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
     factor_header = '<tr>'
     # Frozen: Stock
     factor_header += (
-        '<th style="position:sticky;left:0;z-index:3;background:#f1f4f8;'
-        'min-width:90px;padding:6px 10px 6px 12px;text-align:left;'
-        'font-size:10px;font-weight:600;color:#64748b;white-space:nowrap;'
-        'border-right:1px solid rgba(15,23,42,0.10);">Stock</th>'
+        f'<th style="position:sticky;left:0;z-index:3;background:{_surface2};'
+        f'min-width:90px;padding:6px 10px 6px 12px;text-align:left;'
+        f'font-size:10px;font-weight:600;color:{_muted};white-space:nowrap;'
+        f'border-right:1px solid {_border2};">Stock</th>'
     )
     # Frozen: Signal badge
     factor_header += (
-        '<th style="position:sticky;left:90px;z-index:3;background:#f1f4f8;'
-        'min-width:62px;padding:6px 8px;text-align:center;'
-        'font-size:10px;font-weight:600;color:#64748b;white-space:nowrap;'
-        'border-right:1px solid rgba(15,23,42,0.08);">Class</th>'
+        f'<th style="position:sticky;left:90px;z-index:3;background:{_surface2};'
+        f'min-width:62px;padding:6px 8px;text-align:center;'
+        f'font-size:10px;font-weight:600;color:{_muted};white-space:nowrap;'
+        f'border-right:1px solid {_border};">Class</th>'
     )
     # Frozen: L / C / EQ
     for lbl, clr in (("L", "#a371f7"), ("C", "#3fb950"), ("EQ", "#d29922")):
         factor_header += (
-            f'<th style="position:sticky;z-index:3;background:#f1f4f8;'
+            f'<th style="position:sticky;z-index:3;background:{_surface2};'
             f'min-width:32px;padding:6px 6px;text-align:center;'
             f'font-size:10px;font-weight:700;color:{clr};">{lbl}</th>'
         )
     # Frozen divider
     factor_header += (
-        '<th style="position:sticky;z-index:3;background:#f1f4f8;width:1px;'
-        'padding:0;border-right:2px solid rgba(15,23,42,0.14);"></th>'
+        f'<th style="position:sticky;z-index:3;background:{_surface2};width:1px;'
+        f'padding:0;border-right:2px solid {_border2};"></th>'
     )
 
     # One column per sub-factor with tooltip
@@ -1853,7 +1890,7 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
             f'text-align:center;font-size:9px;font-weight:600;color:{clr};'
             f'white-space:nowrap;cursor:help;border-bottom:2px solid {clr}33;">'
             f'{lbl}<br>'
-            f'<span style="font-size:8px;font-weight:400;color:#64748b">(+{mx})</span>'
+            f'<span style="font-size:8px;font-weight:400;color:{_muted}">(+{mx})</span>'
             f'</th>'
         )
     factor_header += '</tr>'
@@ -1871,7 +1908,7 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
         cv    = _safe_int(row.get("CV1_Conviction",   0))
         eq    = _safe_int(row.get("CV1_EntryQuality", 0))
         sc_c, _ = _SC_STYLE.get(sc.upper(), ("#94a3b8", sc))
-        row_bg = "#ffffff" if i % 2 == 0 else "#f8fafc"
+        row_bg = _surface if i % 2 == 0 else _surface2
 
         data_rows += f'<tr style="background:{row_bg}">'
 
@@ -1879,15 +1916,15 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
         data_rows += (
             f'<td style="position:sticky;left:0;background:{row_bg};'
             f'padding:6px 10px 6px 12px;font-size:11px;font-weight:700;'
-            f'color:var(--text);white-space:nowrap;z-index:2;'
-            f'border-right:1px solid rgba(15,23,42,0.10);">{stock}</td>'
+            f'color:{_text};white-space:nowrap;z-index:2;'
+            f'border-right:1px solid {_border2};">{stock}</td>'
         )
 
         # Frozen: Signal badge
         data_rows += (
             f'<td style="position:sticky;left:90px;background:{row_bg};'
             f'padding:5px 8px;text-align:center;z-index:2;'
-            f'border-right:1px solid rgba(15,23,42,0.08);">'
+            f'border-right:1px solid {_border};">'
             f'<span style="background:{sc_c}18;border:1px solid {sc_c}44;color:{sc_c};'
             f'font-size:9px;font-weight:700;border-radius:3px;padding:1px 5px;">{sc}</span>'
             f'</td>'
@@ -1905,7 +1942,7 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
         # Frozen divider
         data_rows += (
             f'<td style="position:sticky;background:{row_bg};z-index:2;'
-            f'width:1px;padding:0;border-right:2px solid rgba(15,23,42,0.14);"></td>'
+            f'width:1px;padding:0;border-right:2px solid {_border2};"></td>'
         )
 
         # Sub-factor cells
@@ -1913,15 +1950,15 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
             pts = _safe_int(row.get(col, 0))
             pct = int(pts / mx * 100) if mx > 0 else 0
             # Colour the bar: full = bright, partial = mid, zero = dark
-            bar_clr = clr if pct >= 60 else (clr + "99" if pct > 0 else "rgba(15,23,42,0.06)")
+            bar_clr = clr if pct >= 60 else (clr + "99" if pct > 0 else _track)
             data_rows += (
                 f'<td style="padding:5px 6px;text-align:center;min-width:72px;">'
                 # pts label
                 f'<div style="font-size:10px;font-weight:{"700" if pts > 0 else "400"};'
-                f'color:{"" + clr if pts > 0 else "#94a3b8"};margin-bottom:3px;">'
+                f'color:{"" + clr if pts > 0 else _muted};margin-bottom:3px;">'
                 f'{"+" if pts > 0 else ""}{pts}</div>'
                 # progress bar
-                f'<div style="height:4px;background:rgba(15,23,42,0.06);'
+                f'<div style="height:4px;background:{_track};'
                 f'border-radius:2px;overflow:hidden;">'
                 f'<div style="height:100%;width:{pct}%;background:{bar_clr};'
                 f'border-radius:2px;transition:width 0.3s;"></div>'
@@ -1936,13 +1973,13 @@ def _perstock_breakdown_table(df: pd.DataFrame) -> str:
 
     return f"""
 <div style="font-family:'JetBrains Mono','Fira Code',monospace;margin-top:10px;">
-  <div style="font-size:9px;font-weight:700;color:#64748b;letter-spacing:0.1em;
+  <div style="font-size:9px;font-weight:700;color:{_muted};letter-spacing:0.1em;
   text-transform:uppercase;margin-bottom:6px;">
   📊 Per-stock sub-factor breakdown — hover column headers for scoring conditions
   </div>
-  <div style="overflow-x:auto;border:1px solid rgba(15,23,42,0.08);border-radius:8px;">
-    <table style="border-collapse:collapse;width:100%;background:#ffffff;">
-      <thead style="background:#f1f4f8;">
+  <div style="overflow-x:auto;border:1px solid {_border};border-radius:8px;">
+    <table style="border-collapse:collapse;width:100%;background:{_surface};">
+      <thead style="background:{_surface2};">
         {group_header}
         {factor_header}
       </thead>
@@ -2951,10 +2988,15 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
         rows_df = rows_df.sort_values("DaysActive", ascending=True)
 
     # ── Table ───────────────────────────────────────────────────────
+    # [2026-09-08, SG request] CV4 Composite and Volume moved next to
+    # Status — the two "how strong/how confirmed is this setup right
+    # now" reads, so they're visible before scrolling past CMP/Source/
+    # Entry/SL/T1 to find them.
     header = (
-        '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th><th>CMP</th><th>Source</th>'
-        '<th>Entry (Oldest)</th><th>SL (CV4)</th><th>T1 (CV4)</th><th>CV4 Composite</th><th>PnL%</th>'
-        '<th>No of Days</th><th>Volume</th></tr>'
+        '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th>'
+        '<th>CV4 Composite</th><th>Volume</th><th>CMP</th><th>Source</th>'
+        '<th>Entry (Oldest)</th><th>SL (CV4)</th><th>T1 (CV4)</th><th>PnL%</th>'
+        '<th>No of Days</th></tr>'
     )
     body = ""
     for rank, (_, r) in enumerate(rows_df.iterrows(), 1):
@@ -2986,15 +3028,15 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             f'<tr><td class="col-rank">{rank}</td>'
             f'<td class="col-stock">{_tv_link(r["Symbol"])}</td>'
             f'<td>{_ap_status_badge(r["Status"])}</td>'
-            f'<td class="col-num">{_px(r["CurrentPrice"])}</td>'
+            f'<td class="col-num">{r["CV4Composite"]:.1f}</td>'
+            + _vol_cell
+            + f'<td class="col-num">{_px(r["CurrentPrice"])}</td>'
             f'<td>{_ap_source_badge(r["Source"], r["ContribSources"])}</td>'
             f'<td class="col-num">{_px(r["Entry"])}</td>'
             f'<td class="col-num">{_px(r["SL"])}</td>'
             f'<td class="col-num">{_px(r["T1"])}</td>'
-            f'<td class="col-num">{r["CV4Composite"]:.1f}</td>'
             + _ap_pnl_cell(r["PnLPct"])
             + f'<td class="col-num">{int(r["DaysActive"])}d</td>'
-            + _vol_cell
             + '</tr>'
         )
     st.markdown(
@@ -3013,7 +3055,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
     if df_aug is not None and not df_aug.empty and "Stock" in df_aug.columns:
         _ap_symbols = set(rows_df["Symbol"].tolist())
         _ap_breakdown_subset = df_aug[df_aug["Stock"].isin(_ap_symbols)]
-        _ap_pills_html = _perstock_breakdown_table(_ap_breakdown_subset)
+        _ap_pills_html = _perstock_breakdown_table(_ap_breakdown_subset, dark=True)
         if _ap_pills_html:
             with st.expander("🔬 Stock Breakdown Summary", expanded=False):
                 st.markdown(_ap_pills_html, unsafe_allow_html=True)
@@ -3080,7 +3122,14 @@ def _ap_source_badge(source: str, contributing_sources: str = "") -> str:
         if src == "FP":
             return ('<span style="background:#3fb950;color:#0d1117;font-weight:700;font-size:10px;'
                     'border-radius:4px;padding:1px 6px;" title="Five Pillars — Structure/Acceptance/Reversal/Leadership/Momentum, independent of CV4">FP</span>')
-        return ('<span style="background:#21262d;color:var(--muted);font-weight:700;font-size:10px;'
+        # [2026-09-08 fix — SG report: LS badge has no color like the
+        # others] Was falling through to a plain muted-gray badge with
+        # no distinct color at all, unlike PB/MOM/FP's own colors above
+        # — reused the same blue (#58a6ff) this file's DORE Options
+        # Engine panel already uses for its own "LS" badge (_fmt_source,
+        # ~line 3746) so "LS" reads the same color everywhere in this
+        # file, not just here.
+        return ('<span style="background:#58a6ff;color:#0d1117;font-weight:700;font-size:10px;'
                 'border-radius:4px;padding:1px 6px;" title="Live Scanner — Actionable/Execute/Elite promotion">LS</span>')
 
     primary = str(source or "LS").upper().strip()
