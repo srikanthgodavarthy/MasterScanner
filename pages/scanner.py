@@ -4907,101 +4907,34 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
         actionable_df = df_aug[df_aug[_rec_col].isin(["High Conviction", "Actionable"])].copy() if has_cat else pd.DataFrame()
 
     # ── SETUP_PRE_BREAKOUT detection ─────────────────────────────────────────────
-    # Rules: trend_up AND (squeeze_on OR squeeze_release) AND 45 <= RSI <= 70
-    # Boosts (optional): squeeze_release, fib_grade_good/excellent, harmonic_bull, vol_surge
-    # squeeze_on   = still coiling, volatility contracted, energy building (not fired yet)
-    # squeeze_release = the BB squeeze just fired — momentum burst starting, the
-    #                    breakout itself is just beginning to confirm
-    # RSI 45-70 keeps this from overlapping the already-overbought Actionable/
-    # Elite tiers on one side and outright weakness on the other — this tab is
-    # specifically "coiled and about to move", not "already moved" or "fading".
-    def _is_pre_breakout(row) -> bool:
-        trend_up = bool(row.get("_trend_up", False)) or (
-            str(row.get("TrendPhase", "NONE")).upper() != "NONE"
-        )
-        squeeze_on      = bool(row.get("_squeeze_on", False))
-        squeeze_release = bool(row.get("_squeeze_release", False))
-        rsi_val = float(row.get("_rsi") or row.get("RSI") or 0)
-        return trend_up and (squeeze_on or squeeze_release) and 45 <= rsi_val <= 70
-
-    def _pre_breakout_boosts(row) -> list:
-        """Return list of active boost tags for a PRE_BREAKOUT stock."""
-        boosts = []
-        if bool(row.get("_squeeze_release", False)):
-            boosts.append("squeeze_release")
-        elif bool(row.get("_squeeze_on", False)):
-            boosts.append("squeeze_on")
-        if bool(row.get("_in_golden", False)):
-            boosts.append("fib_grade_excellent")
-        elif bool(row.get("_in_golden_relaxed", False)):
-            boosts.append("fib_grade_good")
-        if bool(row.get("_harm_bull", False)):
-            boosts.append("harmonic_bull")
-        try:
-            if float(row.get("_vol_ratio") or 0) >= 1.5:
-                boosts.append("vol_surge")
-        except (TypeError, ValueError):
-            pass
-        return boosts
-
-    pre_breakout_records = []
-    if not df_aug.empty:
-        for _, row in df_aug.iterrows():
-            if _is_pre_breakout(row):
-                rec = row.to_dict()
-                rec["Setup"] = "PRE_BREAKOUT"
-                rec["_pre_breakout_boosts"] = _pre_breakout_boosts(row)
-                # Normalise field names for render_pre_breakout_tab compatibility
-                rec.setdefault("Symbol",        rec.get("Stock", ""))
-                rec.setdefault("LTP",           rec.get("CMP",   rec.get("Entry", 0)))
-                rec.setdefault("%Change",        rec.get("%Chg",  0))
-                rec.setdefault("InGolden",       rec.get("_in_golden", False))
-                rec.setdefault("TrendUp",        rec.get("_trend_up",
-                    str(rec.get("TrendPhase","NONE")).upper() != "NONE"))
-                rec.setdefault("ReadinessScore", rec.get("Score", 0))
-                rec.setdefault("RSI",            rec.get("_rsi", 0))
-                rec.setdefault("VolRatio",       rec.get("_vol_ratio", 0))
-                rec.setdefault("ATR",            0)
-                pre_breakout_records.append(rec)
-
-    pre_breakout_df = pd.DataFrame(pre_breakout_records) if pre_breakout_records else pd.DataFrame()
-
+    # [Removed, 2026-09-08 — SG request: single-symbol-persistent Active
+    # Setups] _is_pre_breakout()/_pre_breakout_boosts()/pre_breakout_records/
+    # pre_breakout_df used to live here, feeding the standalone
+    # 🎯 Pre-Breakout tab (live squeeze_release candidates, not-yet-minted).
+    # Dropped entirely per SG's explicit call — only minted/open plans
+    # matter now, and PB plans (once minted) show in Active Setups like
+    # every other source. The PB MINTING signal itself
+    # (_classify_active_trigger_phase() in utils/scanner_engine.py,
+    # feeding enrich_scanner_row()'s `pre_breakout` param) is UNCHANGED —
+    # only this tab's live-candidate DISCOVERY view is gone.
     try:
         from utils.supabase_client import load_open_setup_plans as _load_open_plans_for_count
+        # [2026-09-08] Now includes WAITING too — Active Setups is the
+        # single merged view of LS/PB/MOM (see _render_active_plans_tab's
+        # rewritten docstring), and Status is now a visible column
+        # rather than an implicit "entered only" filter.
         _open_plans_preview = _load_open_plans_for_count()
-        # Tab count must match _render_active_plans_tab's own definition
-        # (entered only — ACTIVE/T1_HIT, WAITING excluded). load_open_setup_plans()
-        # itself is left returning WAITING too — scanner_engine.py's dedup/
-        # monitoring logic still needs it — so filter only here, at display.
-        _open_plans_preview = {
-            sym: plan for sym, plan in _open_plans_preview.items()
-            if str(getattr(plan, "status", "")).upper() in ("ACTIVE", "T1_HIT")
-        }
     except Exception:
         _open_plans_preview = {}
 
-    try:
-        # [2026-09-05, SG request] Independent source-scoped load — see
-        # load_open_setup_plans_by_source()'s docstring for why this
-        # can't reuse _load_open_plans_for_count()/_open_plans_preview
-        # above (that dict is keyed by symbol across ALL sources and
-        # would collide with an LS/PB plan open on the same symbol).
-        # Unlike Active Setups' count, WAITING is INCLUDED here — see
-        # _render_momentum_tab()'s docstring for why.
-        from utils.supabase_client import load_open_setup_plans_by_source as _load_mom_plans_for_count
-        _open_mom_plans_preview = _load_mom_plans_for_count("MOM")
-    except Exception:
-        _open_mom_plans_preview = {}
-
     tab_labels = [
         f"✅ Actionable ({len(elite_df) + len(execute_df) + len(actionable_df)})",
-        f"🎯 Pre-Breakout ({len(pre_breakout_records)})",
         f"📋 Active Setups ({len(_open_plans_preview)})",
-        f"⚡ Momentum ({len(_open_mom_plans_preview)})",
         "🏛️ Five Pillars",
     ]
-    df_sets  = [pd.DataFrame(), pre_breakout_df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()]
-    set_keys = ["ELITE_EXEC_ACTIONABLE", "PRE_BREAKOUT", "ACTIVE_PLANS", "MOMENTUM", "FIVE_PILLARS"]
+    df_sets  = [pd.DataFrame(), pd.DataFrame(), pd.DataFrame()]
+    set_keys = ["ELITE_EXEC_ACTIONABLE", "ACTIVE_PLANS", "FIVE_PILLARS"]
+
 
     if show_skip:
         skip_df = _sc_df("Skip") if has_cv1 else pd.DataFrame()
@@ -5016,25 +4949,13 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
 
     for tab, df_subset, sc_key in zip(tabs, df_sets, set_keys):
         with tab:
-            # ── PRE_BREAKOUT tab gets its own rich renderer ──────────────────────
-            if sc_key == "PRE_BREAKOUT":
-                _render_pre_breakout_tab(pre_breakout_records, df_subset, "Swing")
-                continue
-
             # ── ACTIVE_PLANS: the Trade Lifecycle dashboard, independent of
-            #    today's scanner recommendation ───────────────────────────
+            #    today's scanner recommendation. Single merged view of
+            #    LS/PB/MOM — see _render_active_plans_tab()'s docstring
+            #    (2026-09-08 rewrite: was Active Setups + separate
+            #    Momentum + separate Pre-Breakout tabs). ─────────────
             if sc_key == "ACTIVE_PLANS":
                 _render_active_plans_tab(df_aug, preloaded_plans=_open_plans_preview)
-                continue
-
-            # ── MOMENTUM: independent setup source, NOT a CV4 tab — see
-            #    _render_momentum_tab()'s docstring. Deliberately its own
-            #    branch rather than reusing ACTIVE_PLANS's renderer: this
-            #    tab shows WAITING plans too (Active Setups excludes them
-            #    on purpose), and every row's "CV4 Read" is informational
-            #    only, never a gate. ─────────────────────────────────────
-            if sc_key == "MOMENTUM":
-                _render_momentum_tab(df_aug)
                 continue
 
             # ── FIVE_PILLARS: Structure/Acceptance/Reversal/Leadership/
