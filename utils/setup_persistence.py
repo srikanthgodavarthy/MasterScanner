@@ -970,6 +970,46 @@ def _set_source_entry(plan: "SetupPlan", source: str, entry: float) -> None:
         plan.source_entries = json.dumps(entries)
 
 
+def _backfill_missing_source_entry(plan: "SetupPlan", source: str, entry: float) -> bool:
+    """
+    [2026-09-09, SG request: "write into" source_entries for the gap
+    _corroborate_cross_source() itself leaves] A source only gets
+    _set_source_entry()'d inside _corroborate_cross_source(), which
+    only runs on the specific cycle a source corroborates — i.e. while
+    should_create's own re-qualification gate is True for that source
+    (see enrich_scanner_row()/enrich_momentum_row()/
+    enrich_five_pillars_row()'s "should_create" comments). A source
+    that corroborated once, then stopped re-qualifying (its own
+    Recommendation/momentum/FP_Class read moved on) permanently never
+    gets a second chance to write its entry if it missed the window —
+    confirmed live: SAILIFE/PFOCUS/SPLPETRO all show contributing but
+    with empty source_entries, and their current live FP_Class/
+    Recommendation reads are no longer qualifying, so
+    _corroborate_cross_source() itself will never fire for them again.
+
+    Call this unconditionally, every cycle, for a source that is
+    *already* on `plan` (its own row IS `plan.source`, or it's already
+    in `plan.contributing_sources`) regardless of whether it currently
+    re-qualifies — this is the ONLY path that can still close that gap
+    once should_create stops being True. Note the honesty caveat this
+    can't avoid: the entry written here is TODAY's live read for that
+    source, not a reconstruction of what its entry actually was on the
+    day it corroborated (that number was never persisted anywhere —
+    _set_source_entry()'s own guard silently no-op'd it then, and nothing
+    else recorded it) — best available number, not the original one.
+    """
+    src = str(source or "").upper().strip()
+    if not src or plan is None or not plan.is_open():
+        return False
+    is_party = (src == str(plan.source or "").upper().strip()
+                or src in {s.strip().upper() for s in plan.contributing_sources.split(",") if s.strip()})
+    if not is_party:
+        return False
+    before = plan.source_entries
+    _set_source_entry(plan, src, entry)
+    return plan.source_entries != before
+
+
 def _corroborate_cross_source(plan: "SetupPlan", source: str, entry: float, sl: float) -> bool:
     """
     Record `source` as a corroborating signal on `plan` — the already-
@@ -1136,6 +1176,16 @@ def enrich_scanner_row(
     if should_create:
         plan = _create_plan(symbol, scanner_row, first_seen_date, today_str, source=source_for_new_plan)
         plan_was_updated = True
+
+    # ── 2b. Opportunistic source_entries backfill — see
+    #        _backfill_missing_source_entry()'s docstring for why this
+    #        can't just live inside the should_create branch above.
+    if plan is not None and plan.is_open():
+        _entry_ref = float(scanner_row.get("EntryRef", 0) or 0)
+        _bf_entry = _entry_ref if _entry_ref > 0 else float(scanner_row.get("Entry", 0) or 0)
+        _bf_source = "PB" if pre_breakout else "LS"
+        if _backfill_missing_source_entry(plan, _bf_source, _bf_entry):
+            plan_was_updated = True
 
     # ── 3. Compute display fields on whatever plan we ended up with ─
     if plan is not None:
@@ -1327,6 +1377,13 @@ def enrich_momentum_row(
         plan = _create_plan(symbol, momentum_row, first_seen_date, today_str, source="MOM")
         plan_was_updated = True
 
+    # ── 2b. Opportunistic source_entries backfill — see
+    #        _backfill_missing_source_entry()'s docstring.
+    if plan is not None and plan.is_open():
+        _bf_entry = float(momentum_row.get("EntryRef", momentum_row.get("Entry", 0)) or 0)
+        if _backfill_missing_source_entry(plan, "MOM", _bf_entry):
+            plan_was_updated = True
+
     # ── 3. Compute display fields ────────────────────────────────────
     if plan is not None:
         plan.days_active       = _compute_days_active(plan.first_actionable_date)
@@ -1472,6 +1529,13 @@ def enrich_five_pillars_row(
     elif should_create:
         plan = _create_plan(symbol, fp_row, first_seen_date, today_str, source="FP")
         plan_was_updated = True
+
+    # ── 2b. Opportunistic source_entries backfill — see
+    #        _backfill_missing_source_entry()'s docstring.
+    if plan is not None and plan.is_open():
+        _bf_entry = float(fp_row.get("EntryRef", fp_row.get("Entry", 0)) or 0)
+        if _backfill_missing_source_entry(plan, "FP", _bf_entry):
+            plan_was_updated = True
 
     # ── 3. Compute display fields ────────────────────────────────────
     if plan is not None:
