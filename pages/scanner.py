@@ -2977,9 +2977,53 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
         unsafe_allow_html=True,
     )
 
+    # ── Today's vs Previous Days' setups ────────────────────────────
+    # [2026-09-08, SG request] Two tabs so a trader can see "what's new
+    # today" separately from "what's been running since before" without
+    # scrolling through one long merged list. DaysActive == 0 means
+    # first_actionable_date (entry-trigger date) is today; everything
+    # else has been open since some earlier session. Purely a display
+    # split — both tabs read from the SAME open_plans/rows_df, nothing
+    # about lifecycle, corroboration, or the manual-close control below
+    # changes; a plan simply moves from "Today's" to "Previous Days'"
+    # on its own the next calendar day, the same way DaysActive itself
+    # already increments.
+    today_tab, prev_tab = st.tabs(["🆕 Today's Setups", "📅 Previous Days' Setups"])
+    with today_tab:
+        _render_active_plans_table_body(
+            rows_df[rows_df["DaysActive"] == 0], df_aug, key_suffix="today",
+            empty_msg="No setups have triggered entry yet today.",
+        )
+    with prev_tab:
+        _render_active_plans_table_body(
+            rows_df[rows_df["DaysActive"] >= 1], df_aug, key_suffix="prev",
+            empty_msg="No setups carried over from a previous day are currently open.",
+        )
+
+
+def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
+                                     key_suffix: str, empty_msg: str) -> None:
+    """
+    The actual Active Setups table + CV4 breakdown + manual-close
+    control — factored out of _render_active_plans_tab() so it can be
+    rendered twice (Today's / Previous Days', see that function's
+    "Today's vs Previous Days'" section) against two different
+    pre-filtered slices of the same rows_df, without duplicating this
+    whole block. `key_suffix` keeps each tab's widgets (sort selectbox,
+    close-trade controls) on distinct Streamlit widget keys — reusing
+    the same key across both tabs would raise a DuplicateWidgetID error
+    the moment both tabs are mounted at once (Streamlit tabs render all
+    of their content up front, not lazily on click).
+    """
+    from utils.supabase_client import close_setup_plan_manually
+
+    if rows_df.empty:
+        st.caption(empty_msg)
+        return
+
     sort_key = st.selectbox(
         "Sort by", ["Days Active (low → high)", "PnL% ↓", "Symbol A→Z"],
-        key="active_plans_sort", label_visibility="collapsed",
+        key=f"active_plans_sort_{key_suffix}", label_visibility="collapsed",
     )
     if sort_key == "PnL% ↓":
         rows_df = rows_df.sort_values("PnLPct", ascending=False, na_position="last")
@@ -2995,7 +3039,8 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
     # Entry/SL/T1 to find them.
     header = (
         '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th>'
-        '<th>CV4 Composite</th><th>Volume</th><th>CMP</th><th>Source / Entry</th>'
+        '<th>CV4 Composite</th><th>Volume</th><th>CMP</th>'
+        '<th>CV4</th><th>PB</th><th>MOM</th><th>FP</th>'
         '<th>SL (CV4)</th><th>T1 (CV4)</th><th>PnL%</th>'
         '<th>No of Days</th></tr>'
     )
@@ -3006,18 +3051,6 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
                 return f"₹{float(v):,.2f}" if float(v) > 0 else "—"
             except (TypeError, ValueError):
                 return "—"
-        # [2026-09-08, SG request] Original Rec/Momentum removed
-        # entirely — a locked-at-mint badge stops being a meaningful
-        # single number once a plan has more than one contributing
-        # source. Current Rec/Momentum replaced with a plain Volume (vol_ratio) read
-        # read (today's live vol_ratio, if the symbol's still in
-        # today's scan universe) — simpler and source-agnostic, unlike
-        # the old CV4-category-vs-Momentum-snapshot split that needed
-        # per-source branching. A genuine conflict_flag (see utils.
-        # setup_persistence._corroborate_cross_source()) still takes
-        # priority over the plain volume read in that cell — a later
-        # source's own entry/SL genuinely disagreeing with the frozen
-        # levels is more worth surfacing than this cycle's volume.
         if bool(r["ConflictFlag"]):
             _vol_cell = (
                 f'<td style="color:#f85149;font-size:11px;" '
@@ -3032,19 +3065,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             f'<td class="col-num">{r["CV4Composite"]:.1f}</td>'
             + _vol_cell
             + f'<td class="col-num">{_px(r["CurrentPrice"])}</td>'
-            # [2026-09-08, SG request] Entry price shown individually
-            # per source badge, not one shared number under all of
-            # them — SetupPlan.entry_locked (r["Entry"]) is still the
-            # ONE frozen trade level ("oldest plan wins" is unchanged,
-            # see _corroborate_cross_source()'s docstring), but each
-            # contributing source's OWN computed entry is now also
-            # persisted (SetupPlan.source_entries, JSON {SRC: entry})
-            # and shown right under its own badge — see
-            # _ap_source_badges_with_entries(). A source missing from
-            # that map (pre-migration plans, or a source that
-            # corroborated before this field existed) falls back to
-            # r["Entry"] for that one badge only.
-            f'<td>{_ap_source_badges_with_entries(r["Source"], r["ContribSources"], r["SourceEntries"], r["Entry"])}</td>'
+            f'{_ap_per_source_cells(r["Source"], r["ContribSources"], r["SourceEntries"], r["Entry"])}'
             f'<td class="col-num">{_px(r["SL"])}</td>'
             f'<td class="col-num">{_px(r["T1"])}</td>'
             + _ap_pnl_cell(r["PnLPct"])
@@ -3056,14 +3077,9 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
         unsafe_allow_html=True,
     )
 
-    # ── CV4 Stock Breakdown Summary — every Active Setups symbol,
+    # ── CV4 Stock Breakdown Summary — every symbol in THIS slice,
     #    wrapped exactly like the Actionable tab's own "🔬 Stock
     #    Breakdown Summary" expander (_perstock_breakdown_table()).
-    #    [2026-09-08, SG request] Matches df_aug rows by Symbol; a
-    #    symbol that's fallen out of today's scan universe entirely
-    #    (see this tab's own docstring on "Not in today's scan") simply
-    #    has no row to show here — its trade levels/status above are
-    #    unaffected either way, this is purely supplementary CV4 detail.
     if df_aug is not None and not df_aug.empty and "Stock" in df_aug.columns:
         _ap_symbols = set(rows_df["Symbol"].tolist())
         _ap_breakdown_subset = df_aug[df_aug["Stock"].isin(_ap_symbols)]
@@ -3072,13 +3088,6 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             with st.expander("🔬 Stock Breakdown Summary", expanded=False):
                 st.markdown(_ap_pills_html, unsafe_allow_html=True)
 
-    # [Removed, 2026-09-08 — SG request] "📉 Recommendation has drifted"
-    # callout used to live here, keyed off OriginalRec vs CurrentRec.
-    # Both columns are gone from this tab now (see header/body above) —
-    # Original Rec was removed entirely and Current Rec was replaced
-    # with a plain Volume (vol_ratio, e.g. "1.5x") read, so there is no longer a "recommendation
-    # drift" concept left to detect here.
-
     # ── Manual exit control ─────────────────────────────────────────
     closeable = rows_df[rows_df["Status"].isin(["ACTIVE", "T1_HIT"])]
     with st.expander("🚪 Close a trade manually", expanded=False):
@@ -3086,12 +3095,12 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             st.caption("No ACTIVE or T1 Hit trades available to manually close. (WAITING plans resolve on their own via entry trigger or expiry.)")
         else:
             sym_choice = st.selectbox(
-                "Trade to close", closeable["Symbol"].tolist(), key="ap_close_symbol",
+                "Trade to close", closeable["Symbol"].tolist(), key=f"ap_close_symbol_{key_suffix}",
             )
             reason = st.text_input(
-                "Reason (optional)", value="Manual exit", key="ap_close_reason",
+                "Reason (optional)", value="Manual exit", key=f"ap_close_reason_{key_suffix}",
             )
-            if st.button("Close trade", key="ap_close_btn", type="primary"):
+            if st.button("Close trade", key=f"ap_close_btn_{key_suffix}", type="primary"):
                 _row = closeable[closeable["Symbol"] == sym_choice].iloc[0]
                 ok = close_setup_plan_manually(_row["setup_id"], reason=reason or "Manual exit")
                 if ok:
@@ -3218,6 +3227,56 @@ def _ap_source_badges_with_entries(source: str, contributing_sources: str, sourc
             f'<div style="margin-bottom:2px;">{_ap_one_source_badge(s)} '
             f'<span class="col-num" style="font-size:11px;">{_px(px)}</span></div>'
         )
+    return "".join(cells)
+
+
+def _ap_per_source_cells(source: str, contributing_sources: str, source_entries_json: str, fallback_entry: float) -> str:
+    """
+    Active Setups table's four individual per-source columns (CV4, PB,
+    MOM, FP) — [2026-09-08, SG request: "individual columns for each
+    source, tick when activated, entry price below"] replaces the
+    single stacked "Source / Entry" cell _ap_source_badges_with_entries()
+    rendered — same underlying data (SetupPlan.contributing_sources /
+    source_entries), just one column PER source instead of one combined
+    column with all badges stacked in it. A ✓ + that source's own entry
+    price appears in its column only if that source is actually
+    contributing to this plan (see _ap_ordered_sources()); every other
+    source's column for this row is a plain "—".
+
+    Returns four complete "<td>...</td>" cells concatenated, in the
+    fixed CV4/PB/MOM/FP header order — NOT a single cell's inner HTML,
+    unlike _ap_source_badges_with_entries() above. Caller must not wrap
+    this in its own extra <td> (see the table body loop above).
+    """
+    import json as _json
+    try:
+        entries = {str(k).upper(): float(v) for k, v in _json.loads(source_entries_json or "{}").items() if v}
+    except Exception:
+        entries = {}
+
+    def _px(v):
+        try:
+            return f"₹{float(v):,.2f}" if float(v) > 0 else "—"
+        except (TypeError, ValueError):
+            return "—"
+
+    active = set(_ap_ordered_sources(source, contributing_sources))
+    cells = []
+    for s in ("CV4", "PB", "MOM", "FP"):
+        # Internal source code for the LS/CV4 column is still "LS" in
+        # SetupPlan/DB (see _ap_one_source_badge()'s own docstring on
+        # why the DISPLAYED label is "CV4") — map the header name back
+        # to that internal code only for this lookup.
+        _src_code = "LS" if s == "CV4" else s
+        if _src_code in active:
+            px = entries.get(_src_code, fallback_entry)
+            cells.append(
+                f'<td class="col-num" style="text-align:center;">'
+                f'<div style="color:#3fb950;font-weight:700;">✓</div>'
+                f'<div style="font-size:11px;">{_px(px)}</div></td>'
+            )
+        else:
+            cells.append('<td class="col-num" style="text-align:center;color:var(--muted);">—</td>')
     return "".join(cells)
 
 
