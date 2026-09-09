@@ -282,7 +282,22 @@ class DoreOptionsSettings:
 
     # ── Stage 6: Premium Validation ─────────────────────────────
     premium_atr_min_mult: float = 0.05      # premium too low relative to ATR (floor check)
-    premium_move_max_mult: float = 0.55     # premium too high relative to Expected Move
+    # [Fix, 2026-09-09, SG report — index PE plans vanishing on a falling
+    # market] 0.55 was calibrated as if Expected Move (ATR * sqrt(DTE))
+    # tracked real ATM/near-ATM premium 1:1. It doesn't: it's a historical-
+    # vol proxy, while premium prices off (often richer, and on a trending
+    # day always higher) implied vol, plus genuine time value beyond the
+    # 1-sigma move this approximates. Confirmed live for SENSEX (8-9 DTE,
+    # falling ~0.6-0.9%/day): Expected Move sat frozen at 616.03 for over
+    # an hour while Conservative/Balanced/Aggressive premiums ranged
+    # 492-786 (0.80x-1.28x) — every single candidate rejected, every
+    # cycle, regardless of direction or how far the index moved, because
+    # 0.55x is *below* the ratio a normal ATM weekly premium prices at.
+    # This check's job is to catch garbage/stale quotes (e.g. a premium
+    # 10x Expected Move from a bad tick), not to fine-differentiate
+    # legitimately rich premiums on a volatile day — raised to a real
+    # sanity ceiling with headroom above the observed 1.28x.
+    premium_move_max_mult: float = 2.5      # premium too high relative to Expected Move
                                              # (Expected Move is already DTE-scaled via sqrt(DTE),
                                              # so this stays sane across both short and long expiries —
                                              # a raw-ATR ceiling would wrongly reject legitimate
@@ -304,6 +319,40 @@ class DoreOptionsSettings:
     w_oi_quality:         float = 15.0
     w_premium_quality:    float = 10.0
     w_expiry_suitability: float = 5.0
+
+    # [Fix, 2026-09-09, SG report] The weights above put 55% of the
+    # final score on sig.setup_conviction + sig.entry_quality — both
+    # pass-throughs from utils.scanner_engine.score_stock()'s equity
+    # CV1 pipeline (pullback/breakout/continuation formulas keyed off
+    # ADX bands, volume-ratio spikes, single-stock relative strength —
+    # see setup_aware_conviction()'s docstring). Confirmed live,
+    # 2026-09-09: NIFTY and BANKNIFTY minted an OptionTradePlan EVERY
+    # cycle for over an hour with confidence_score frozen at 34.8 and
+    # 29.8 respectively — never once above pages/scanner.py's 70
+    # display floor — while the index kept falling underneath them.
+    # That's not "no signal", it's this weighting structurally
+    # discounting the two signal types indices actually DO carry well
+    # (OI/PCR positioning, premium/IV behaviour) in favor of two an
+    # index register on only weakly (individual-stock-style momentum/
+    # volume-spike setups, and — for NIFTY specifically — relative
+    # strength computed against itself, see utils.dore_options_scan.
+    # _build_index_scan_rows()'s docstring, which pins that one
+    # contribution near zero every cycle regardless of market
+    # conditions). Applied via is_index_symbol() in final_score() —
+    # stocks are completely unaffected; only NIFTY/SENSEX/BANKNIFTY use
+    # this profile. Same total 100-weight budget, shifted off
+    # conviction/entry-quality and onto OI quality/premium quality/EMA
+    # momentum — the three inputs that are both independent of the
+    # equity setup formulas and directly reflect what the option chain
+    # itself is saying. Revisit with real backtested index P&L once
+    # enough index plans have cleared the (now-reachable) confidence
+    # floor to evaluate.
+    index_w_conviction:         float = 12.0
+    index_w_entry_quality:      float = 10.0
+    index_w_ema_momentum:       float = 23.0
+    index_w_oi_quality:         float = 28.0
+    index_w_premium_quality:    float = 20.0
+    index_w_expiry_suitability: float = 7.0
 
     # ── Stage 9: Trade Plan construction ─────────────────────────
     # [2026-08-20, SG-requested pipeline review, DORE flow review §5]
@@ -2116,14 +2165,30 @@ def final_score(
 ) -> float:
     """[Setup-Aware Conviction, 2026-08-06] Uses sig.setup_conviction,
     not the blended sig.conviction — see qualification_score()'s
-    docstring above for why."""
+    docstring above for why.
+
+    [Fix, 2026-09-09] NIFTY/SENSEX/BANKNIFTY use a separate weight
+    profile (index_w_*) — see DoreOptionsSettings.index_w_conviction's
+    docstring for why the stock weights structurally underscore
+    indices. is_index_symbol() gate only; every stock keeps using
+    w_conviction/w_entry_quality/etc. exactly as before."""
+    if is_index_symbol(sig.symbol):
+        w_conviction, w_entry_quality, w_ema_momentum, w_oi_quality, w_premium_quality, w_expiry_suitability = (
+            settings.index_w_conviction, settings.index_w_entry_quality, settings.index_w_ema_momentum,
+            settings.index_w_oi_quality, settings.index_w_premium_quality, settings.index_w_expiry_suitability,
+        )
+    else:
+        w_conviction, w_entry_quality, w_ema_momentum, w_oi_quality, w_premium_quality, w_expiry_suitability = (
+            settings.w_conviction, settings.w_entry_quality, settings.w_ema_momentum,
+            settings.w_oi_quality, settings.w_premium_quality, settings.w_expiry_suitability,
+        )
     score = (
-        sig.setup_conviction * settings.w_conviction +
-        sig.entry_quality     * settings.w_entry_quality +
-        mom.momentum_score    * settings.w_ema_momentum +
-        oi_quality            * settings.w_oi_quality +
-        premium_quality       * settings.w_premium_quality +
-        expiry_suitability    * settings.w_expiry_suitability
+        sig.setup_conviction * w_conviction +
+        sig.entry_quality     * w_entry_quality +
+        mom.momentum_score    * w_ema_momentum +
+        oi_quality            * w_oi_quality +
+        premium_quality       * w_premium_quality +
+        expiry_suitability    * w_expiry_suitability
     ) / 100.0
     return round(score, 1)
 

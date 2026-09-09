@@ -102,6 +102,22 @@ def _build_index_scan_rows(settings: Optional[dict] = None) -> dict:
     never raises; a single index's OHLCV/scoring failure is logged and
     that index is simply omitted this cycle (fail-soft, matching every
     other per-symbol failure path in this module).
+
+    [Known limitation, flagged 2026-09-09, not fixed here] All three
+    index rows — including NIFTY's own — are scored against
+    `nifty_series` (fetch_nifty()) as the relative-strength benchmark.
+    For SENSEX/BANKNIFTY that's a reasonable broad-market read; for the
+    NIFTY row itself it's self-comparison (RS vs itself = ~0 every
+    cycle), which quietly caps the RS-derived slice of setup_conviction
+    (see utils.dore_options_engine.setup_aware_conviction()) regardless
+    of real market conditions. Not patched here: swapping in SENSEX as
+    NIFTY's benchmark isn't a real fix (the two are ~99% correlated —
+    "RS vs SENSEX" is barely less degenerate than "RS vs itself"), and
+    special-casing NIFTY inside the equity conviction formulas is a
+    bigger, riskier change than this pass's scope. See
+    utils.dore_options_engine.DoreOptionsSettings.index_w_conviction's
+    docstring for the compensating fix that WAS applied (down-weighting
+    conviction/entry-quality for indices generally, in final_score()).
     """
     from utils.scanner_engine import (
         fetch_nifty, fetch_nifty_ohlcv, fetch_sensex_ohlcv,
