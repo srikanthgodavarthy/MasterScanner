@@ -312,7 +312,6 @@ with st.expander("🔬 Memory Diagnostics (temporary — RAM investigation)", ex
 
 from pages.dashboard     import render as render_dashboard
 from pages.sectors       import render as render_sectors
-from pages.scanner       import render as render_scanner
 from pages.backtest      import render as render_backtest
 from pages.settings      import render as render_settings
 from pages.validation    import render as render_validation
@@ -384,8 +383,13 @@ def _page_dashboard():
 def _page_sectors():
     render_sectors(settings)
 
-def _page_scanner():
-    render_scanner(settings)
+# [2026-09-09, SG request — "move the scanner page content to
+# dashboard itself"] _page_scanner (nav title "Live Scanner") removed.
+# pages.scanner.render() is no longer registered as its own st.Page —
+# pages/dashboard.py's render() now calls it directly instead (see that
+# file's own 2026-09-09 comment at the call site). Confirmed via grep
+# before this change that no other page st.page_link's/switch_page's to
+# a "scanner" nav entry, so nothing else in the app was pointing here.
 
 def _page_backtest():
     render_backtest(settings)
@@ -442,7 +446,6 @@ pg = st.navigation(
     [
         st.Page(_page_dashboard,    title="Dashboard",            icon="🖥️", default=True),
         _page_sectors_obj,
-        st.Page(_page_scanner,      title="Live Scanner",         icon="📡"),
         st.Page(_page_backtest,     title="Backtest Engine",      icon="📈"),
         st.Page(_page_lifecycle,    title="Lifecycle",            icon="🔄"),
         st.Page(_page_history,      title="History",              icon="📊"),
