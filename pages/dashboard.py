@@ -2392,6 +2392,26 @@ def _today_sector_flow_compact_html(flow: dict, rows: int = 3, compact: bool = F
     </div>""".strip()
 
 
+# 2026-07-23: rewritten to be event-aware. scheduler/scan_worker.py computes
+# ALL of this (live Nifty/Sensex/Bank Nifty quotes, EMA levels, OI resistance,
+# DORE 2.0 per index, regime classification, breadth) on its own 30s timer,
+# completely outside any Streamlit session — see utils/market_intelligence.py
+# for the extracted compute and utils/scan_state.py for the snapshot store.
+#
+# This fragment is now a pure read: poll cheap metadata every
+# _MARKET_INTEL_REFRESH_SECS, and only pull + re-render the (larger) full
+# payload when its version actually changed since the last tick. No Upstox
+# call, no DORE computation, and no regime classification happens in this
+# process anymore.
+_MARKET_INTEL_REFRESH_SECS = 180  # [2026-07-25 ops fix] was 30 — matches the
+                                   # producer's own interval (scheduler/scan_worker.py's
+                                   # JOBS list, also bumped 30->180 the same day, see
+                                   # its comment there for why). Polling every 30s
+                                   # against data that changes at most every 180s
+                                   # meant ~5 of every 6 metadata checks, per open
+                                   # browser session, could never find anything new.
+
+
 @st.fragment(run_every=_MARKET_INTEL_REFRESH_SECS)
 def _market_intelligence_fragment():
     # [2026-08-21] Market-hours short-circuit. This fragment's own
