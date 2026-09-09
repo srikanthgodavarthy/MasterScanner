@@ -195,12 +195,27 @@ MAX_DORE_OPTIONS_PLAN_AGE_DAYS = 2
 # governed by the entry-zone trigger, not by confidence at all.
 MIN_CONFIDENCE_TO_TRACK = 70
 
+# [2026-09-09, SG request] Separate, lower confidence floor for DORE
+# Indices (NIFTY/BANKNIFTY/SENSEX) — the flat 70 above was calibrated
+# for single-stock candidates and, per c2e4df9's own findings, had
+# NIFTY/BANKNIFTY minting a Live Scan row every cycle with
+# confidence_score frozen at 34.8/29.8, never once tracking. c2e4df9
+# already rebalanced final_score()'s index weight profile toward
+# option-chain-native inputs (OI quality, premium quality, EMA
+# momentum) instead of equity-momentum inputs indices don't register
+# well on; this lowers the resulting bar to match, rather than leaving
+# indices structurally unable to ever clear a stock-calibrated floor.
+# 50 is a floor choice, not derived from a specific backtest — revisit
+# once enough index plans have tracked/entered under it to judge hit
+# rate at this level.
+MIN_CONFIDENCE_TO_TRACK_INDEX = 50
+
 # Backward-compatible alias — some call sites/tests may still reference
 # the old name. Do not use in new code.
 MIN_CONFIDENCE_TO_ACTIVATE = MIN_CONFIDENCE_TO_TRACK
 
 
-def _min_confidence_to_track(dte: Optional[int], settings=DORE_OPTIONS_DEFAULTS) -> float:
+def _min_confidence_to_track(dte: Optional[int], symbol: str = "", settings=DORE_OPTIONS_DEFAULTS) -> float:
     """[2026-08-21, gamma-zone strike selection] Returns the flat
     MIN_CONFIDENCE_TO_TRACK unless enable_gamma_zone_strike_selection
     is on AND dte falls in the 0-2 or 3-5 DTE bucket, in which case a
@@ -209,7 +224,21 @@ def _min_confidence_to_track(dte: Optional[int], settings=DORE_OPTIONS_DEFAULTS)
     near-ATM/near-expiry bucket for the best signals only ("early
     birds with highest confidence"), rather than admitting it at the
     same bar as every other trade. dte=None (unknown) always falls
-    back to the flat gate — never guesses a bucket from missing data."""
+    back to the flat gate — never guesses a bucket from missing data.
+
+    [2026-09-09, SG request] `symbol` — when it's a DORE Index (NIFTY/
+    BANKNIFTY/SENSEX, per is_index_symbol()) — takes priority over all
+    of the above and returns MIN_CONFIDENCE_TO_TRACK_INDEX instead.
+    Gamma-zone's tighter DTE-bucket floors are a stock-only
+    calibration (see that feature's own settings names —
+    gamma_min_confidence_to_track_*_dte — never mention indices) built
+    on the equity-weighted score indices don't run through anymore
+    since c2e4df9's index weight profile; layering it on top of the
+    already-separate index floor would just be two stock-tuned numbers
+    stacked on a non-stock score. symbol="" (unknown/not passed) falls
+    back to the flat/gamma logic exactly as before this change."""
+    if symbol and is_index_symbol(symbol):
+        return MIN_CONFIDENCE_TO_TRACK_INDEX
     if not getattr(settings, "enable_gamma_zone_strike_selection", False) or dte is None:
         return MIN_CONFIDENCE_TO_TRACK
     from utils.dore_options_engine import expiry_bucket
@@ -1080,7 +1109,7 @@ def enrich_trade_plans_with_persistence(
                 # the mint path (this `else` branch); an already-tracked
                 # plan (the `if` branch above) is exempt and keeps being
                 # monitored regardless of later confidence fluctuation.
-                if confidence_score < _min_confidence_to_track(row.get("dte")):
+                if confidence_score < _min_confidence_to_track(row.get("dte"), symbol):
                     enriched_rows.append(row)   # still shown as a Live Scan recommendation, just not tracked
                     continue
 
