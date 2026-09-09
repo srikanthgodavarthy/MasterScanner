@@ -193,7 +193,7 @@ MAX_DORE_OPTIONS_PLAN_AGE_DAYS = 2
 # original 2026-08-08 value) now that tracking and entering are two
 # separate gates: 70 is the Level 1 (tracking) bar; Level 2 (entry) is
 # governed by the entry-zone trigger, not by confidence at all.
-MIN_CONFIDENCE_TO_TRACK = 70
+MIN_CONFIDENCE_TO_TRACK = 60
 
 # [2026-09-09, SG request] Separate, lower confidence floor for DORE
 # Indices (NIFTY/BANKNIFTY/SENSEX) — the flat 70 above was calibrated
