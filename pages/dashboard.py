@@ -2188,17 +2188,6 @@ _SR_CSS = """
    to each other in the same st.columns() row. */
 .sr-panel-body { max-height:296px; overflow-y:auto; overflow-x:auto; -webkit-overflow-scrolling:touch; }
 table.sr-table { width:100%; min-width:540px; table-layout:fixed; border-collapse:collapse; font-size:0.8rem; }
-/* [2026-08-12 fix] Active Options Plans got its own fixed-pixel <col>
-   widths (see _active_options_plans_html) instead of the shared
-   percentage-based ones, because percentage cols under table-layout:
-   fixed were getting squeezed below min-width on some mobile WebViews
-   instead of triggering .sr-panel-body's horizontal scroll — result
-   was clipped/truncated header and cell text ("PRE...", "HIND...")
-   with no way to scroll to see the rest. Pixel cols don't have that
-   failure mode. min-width raised to match the actual column-width sum
-   (78+36+56+58+72+50+72+60+72+72=626, +2px border fudge) so the table
-   never renders narrower than its own columns need. */
-table.sr-table--plans { min-width:628px; }
 table.sr-table th, table.sr-table td {
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
 }
@@ -2210,42 +2199,12 @@ table.sr-table td { padding:8px; border-bottom:1px solid #161d2c; vertical-align
    SCANNER) — columns 3-5 are the numeric ones, right-aligned + tabular-
    nums so magnitudes line up on their decimal point instead of ragging
    left like prose. Scoped to --gainers (rather than sr-table generally)
-   since the Live Scanner Snapshot and Active Options Plans tables below
-   have a different column count/shape and need their own alignment. */
+   since other .sr-table variants have their own column count/shape and
+   need their own alignment. */
 table.sr-table--gainers th:nth-child(1) { text-align:right; }
 table.sr-table--gainers td:nth-child(1) { text-align:right; }
 table.sr-table--gainers th:nth-child(3), table.sr-table--gainers th:nth-child(4), table.sr-table--gainers th:nth-child(5) { text-align:right; }
 table.sr-table--gainers td:nth-child(3), table.sr-table--gainers td:nth-child(4), table.sr-table--gainers td:nth-child(5) {
-  text-align:right; font-variant-numeric:tabular-nums;
-}
-
-/* Live Scanner Snapshot (SYMBOL / %CHG / PRICE / ENTRY / DRIFT) —
-   [2026-08-09] PRICE (LTP/CMP/Entry fallback) replaces SETUP AGE — all
-   of %CHG, PRICE, ENTRY, DRIFT are numeric, same column positions as
-   before so no nth-child change needed. */
-table.sr-table--snapshot th:nth-child(2), table.sr-table--snapshot th:nth-child(3), table.sr-table--snapshot th:nth-child(4), table.sr-table--snapshot th:nth-child(5) { text-align:right; }
-table.sr-table--snapshot td:nth-child(2), table.sr-table--snapshot td:nth-child(3), table.sr-table--snapshot td:nth-child(4), table.sr-table--snapshot td:nth-child(5) {
-  text-align:right; font-variant-numeric:tabular-nums;
-}
-
-/* Active Options Plans (SYMBOL / DIR / STRIKE / CONF / PREMIUM / PLAN /
-   ENTRY / DRIFT / STOP LOSS / TARGET 1) — everything from STRIKE on is
-   numeric except PLAN (a clock time). [2026-08-08] Card switched from
-   persisted/locked plans to the same DORE live-scan candidates
-   pages/scanner.py's Live Scan tab shows (short form) — see
-   _active_options_plans_html. [2026-08-09] Reordered to PREMIUM before
-   PLAN, added ENTRY/DRIFT (entry_locked / drift_pct, same fields the
-   Scanner page's own Live Scan tab already carries) — nth-child indices
-   below updated to match: STRIKE=3, CONF=4, PREMIUM=5, ENTRY=7,
-   DRIFT=8, STOP LOSS=9, TARGET 1=10. PLAN(6) stays left-aligned. */
-table.sr-table--plans th:nth-child(3), table.sr-table--plans th:nth-child(4),
-table.sr-table--plans th:nth-child(5), table.sr-table--plans th:nth-child(7),
-table.sr-table--plans th:nth-child(8), table.sr-table--plans th:nth-child(9),
-table.sr-table--plans th:nth-child(10) { text-align:right; }
-table.sr-table--plans td:nth-child(3), table.sr-table--plans td:nth-child(4),
-table.sr-table--plans td:nth-child(5), table.sr-table--plans td:nth-child(7),
-table.sr-table--plans td:nth-child(8), table.sr-table--plans td:nth-child(9),
-table.sr-table--plans td:nth-child(10) {
   text-align:right; font-variant-numeric:tabular-nums;
 }
 
@@ -2431,388 +2390,6 @@ def _today_sector_flow_compact_html(flow: dict, rows: int = 3, compact: bool = F
           {'+' if net >= 0 else ''}{net:.0f} Cr</b></span>
       </div>
     </div>""".strip()
-
-
-# ── LIVE SCANNER SNAPSHOT (compact card) ────────────────────────────
-# Compact preview of everything currently actionable — a single rule:
-# CURRENT tier is Elite/Execute/Actionable (Recommendation, or Category
-# for legacy cached scans — same split pages/scanner.py's own
-# has_cv1/_sc_df logic uses). [2026-08-09, SG request, simplified] This
-# used to also pull in any row with PlanStatus == ACTIVE regardless of
-# tier, on the theory that an open position is inherently "actionable" —
-# but a plan mints on Elite/Execute/Actionable and then tracks by price,
-# so its tier can decay to Watch/Skip while the position stays
-# technically ACTIVE. Pulling those in was the exact "still have non
-# actionable list" bug: e.g. GODREJPROP/FEDERALBNK/AEGISVOPAK/GODREJIND/
-# KARURVYSYA showing here while sitting at Watch/Skip tier. Tier alone
-# already covers both "live scanner just flagged this" and "this is an
-# active setup" — an ACTIVE plan whose tier is still Actionable+ passes
-# this filter same as before, it just no longer gets a free pass once
-# its tier drops. The full equity Active Plans tab (with status,
-# targets, R:R, multi-day history, etc.) stays on the Scanner page —
-# this is only a glance, not a replacement for it.
-def _active_setups_zero_days_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
-    """
-    ACTIVE SETUPS (0 DAYS) — [2026-09-08, SG request] replaces the old
-    LIVE SCANNER SNAPSHOT card in this same dashboard slot.
-
-    The old card answered "what does CV4 currently rate highly" (any
-    row whose *live* Recommendation/Category tier is Elite/Execute/
-    Actionable right now) — that is a today's-tier read off the raw
-    scan, independent of whether a trade plan actually exists for it.
-
-    This card answers a different question: "what setups did the
-    scanner actually mint and enter TODAY" — i.e. persisted setup_plans
-    (source LS/PB/MOM, same three sources pages/scanner.py's Active
-    Setups tab tracks) with status ACTIVE or T1_HIT (entered — WAITING
-    excluded, same "not yet a real trade" convention that tab uses) AND
-    days_active == 0 (first_actionable_date == today). Symbols whose
-    plan was minted on an earlier day never appear here even if still
-    open — that's what "Active Setups" (all days) is for.
-
-    %CHG / current price come from df_aug (this cycle's live scan), by
-    symbol — "Not in today's scan" if the symbol has since fallen out
-    of the scan universe (mirrors _ap_rec_badge()'s empty_label default
-    on the Scanner page's Active Setups tab). DRIFT here is the price
-    move since the locked entry (compute_pnl_pct(entry_locked, live
-    price)) — for a plan that entered today, that IS the live trade's
-    running P&L, a more meaningful "drift" for a 0-day-old trade than
-    EntryDriftPct's "has the scanner's own entry level moved" concept
-    (which utils.setup_persistence computes only for LS/PB, never MOM,
-    so it can't cover all three sources here anyway). TARGET is
-    t1_locked, the same frozen T1 level the Scanner page's Active
-    Setups tab shows.
-
-    [2026-09-08, SG request] SOURCE / ENTRY now shows one badge PER
-    contributing source (LS/CV4, PB, MOM, FP), each stacked with its
-    OWN individually-recorded entry price — matching pages/scanner.py's
-    _ap_source_badges_with_entries() exactly (same colours/labels/
-    fallback rule), not just the plan's single winning source/
-    entry_locked like before. Duplicated locally rather than imported
-    from pages.scanner — see the _SRC_COLOR comment below for why.
-    """
-    from utils.setup_persistence import compute_pnl_pct, _compute_days_active
-
-    try:
-        from utils.supabase_client import load_open_setup_plans, _is_available
-        if not _is_available():
-            plans = []
-        else:
-            # [2026-09-08, SG request — revert to match Scanner page]
-            # Was: explicit LS + PB + MOM per-source union, to stop
-            # SYRMA/GVT&D/SPLPETRO/PPLPHARMA appearing twice here. That
-            # fix was real (load_open_setup_plans() alone landed the
-            # same MOM plan in both lists it was being combined with)
-            # but over-corrected: it made this widget show BOTH open
-            # plans on a symbol like PPLPHARMA (PB @ 229.14, MOM @
-            # 228.00) side by side, while the Scanner page's own Active
-            # Setups tab (_render_active_plans_tab, pages/scanner.py)
-            # has always used plain load_open_setup_plans() — one row
-            # per symbol, oldest plan wins, any other open plan on that
-            # symbol silently not shown there. Per SG: match that
-            # behaviour here too, rather than have this widget show more
-            # than the Scanner page does for the same symbol. The
-            # oldest-wins collapse plus the Source badge below (now
-            # shows whichever source actually won) is what makes
-            # PPLPHARMA read as one row instead of two again.
-            plans = list(load_open_setup_plans().values())
-    except Exception:
-        logger.exception("Dashboard Active Setups (0 Days) card failed to load plans (non-fatal)")
-        plans = []
-
-    zero_day = [
-        p for p in plans
-        if str(getattr(p, "status", "")).upper() in ("ACTIVE", "T1_HIT")
-        and _compute_days_active(getattr(p, "first_actionable_date", "")) == 0
-    ]
-
-    if not zero_day:
-        return ('<div class="sr-panel"><div class="sr-panel-title">ACTIVE SETUPS (0 DAYS)</div>'
-                '<div style="color:#8b949e;font-size:0.75rem;">No setup entered today yet — '
-                'see the Scanner page\'s Active Setups tab for all open trades.</div></div>')
-
-    live_lookup = {}
-    if df_aug is not None and not df_aug.empty and "Stock" in df_aug.columns:
-        for _, r in df_aug.iterrows():
-            sym = str(r.get("Stock", "")).upper().strip()
-            live_lookup[sym] = {
-                "pct_chg": pd.to_numeric(r.get("%Chg"), errors="coerce"),
-                "cmp":     float(r.get("Entry", 0) or 0),
-            }
-
-    rows = []
-    for p in zero_day:
-        sym  = str(getattr(p, "symbol", "")).upper().strip()
-        live = live_lookup.get(sym, {})
-        cmp_px = live.get("cmp", 0.0)
-        rows.append({
-            "Symbol":  sym,
-            "Source":  str(getattr(p, "source", "") or "LS").upper().strip(),
-            "ContribSources": getattr(p, "contributing_sources", "") or "",
-            "SourceEntries":  getattr(p, "source_entries", "") or "",
-            "PctChg":  live.get("pct_chg"),
-            "Entry":   getattr(p, "entry_locked", 0.0) or 0.0,
-            "Drift":   compute_pnl_pct(getattr(p, "entry_locked", 0.0), cmp_px) if cmp_px else None,
-            "Target":  getattr(p, "t1_locked", 0.0) or 0.0,
-        })
-
-    df = pd.DataFrame(rows)
-    df["_sort"] = pd.to_numeric(df["PctChg"], errors="coerce")
-    df = df.sort_values("_sort", ascending=False, na_position="last").head(top_n)
-
-    # [2026-09-08, SG request] Same badge colors as pages/scanner.py's
-    # own _ap_source_badge() (LS blue/PB orange/MOM purple/FP green) so
-    # a source reads the same everywhere in the app, not a local
-    # reinvention — this file has no existing badge helper to import
-    # from cross-page, so it's a small local copy of just the color map.
-    _SRC_COLOR = {
-        "PB":  "#f97316",
-        "MOM": "#a371f7",
-        "FP":  "#3fb950",
-    }
-    # [2026-09-08, SG request] "LS" internal source code displays as
-    # "CV4" everywhere — same rename as pages/scanner.py's
-    # _ap_one_source_badge(), see that docstring for why. Internal
-    # source code (r["Source"], DB values, filters) is untouched.
-    _SRC_LABEL = {"LS": "CV4"}
-
-    def _src_badge(src: str) -> str:
-        clr = _SRC_COLOR.get(src, "#58a6ff")   # default: LS
-        label = _SRC_LABEL.get(src, src)
-        return (f'<span style="background:{clr};color:#0d1117;font-weight:700;'
-                f'font-size:9px;border-radius:3px;padding:0px 5px;">{label}</span>')
-
-    def _ordered_sources(source: str, contributing: str) -> list[str]:
-        primary = str(source or "LS").upper().strip()
-        all_srcs = [primary] + [s.strip().upper() for s in str(contributing or "").split(",") if s.strip()]
-        seen, ordered = set(), []
-        for s in all_srcs:
-            if s and s not in seen:
-                seen.add(s)
-                ordered.append(s)
-        return ordered
-
-    # [2026-09-08, SG request] One badge PER contributing source, each
-    # stacked with its OWN individually-recorded entry price — matches
-    # pages/scanner.py's _ap_source_badges_with_entries() (same
-    # colours/labels/fallback rule: a source missing from source_
-    # entries — plans that corroborated before this field existed —
-    # falls back to this plan's one shared entry_locked instead of a
-    # blank). Duplicated locally rather than imported cross-page — see
-    # the _SRC_COLOR comment further up for why.
-    def _source_badges_with_entries(source: str, contributing: str, source_entries_json: str, fallback_entry: float) -> str:
-        import json as _json
-        try:
-            entries = {str(k).upper(): float(v) for k, v in _json.loads(source_entries_json or "{}").items() if v}
-        except Exception:
-            entries = {}
-
-        def _epx(v):
-            try:
-                return f"{float(v):,.2f}" if float(v) > 0 else "—"
-            except (TypeError, ValueError):
-                return "—"
-
-        cells = []
-        for s in _ordered_sources(source, contributing):
-            px = entries.get(s, fallback_entry)
-            cells.append(
-                f'<div style="margin-bottom:2px;">{_src_badge(s)} '
-                f'<span style="font-size:11px;">{_epx(px)}</span></div>'
-            )
-        return "".join(cells)
-
-    rows_html = ""
-    for _, r in df.iterrows():
-        chg = r["PctChg"]
-        chg_ok = chg is not None and pd.notna(chg)
-        drift_ok = r["Drift"] is not None and pd.notna(r["Drift"])
-        # [2026-09-08, SG request] "there is one duplication" (PPLPHARMA
-        # showing twice) — confirmed via direct DB query this isn't a
-        # bug: PPLPHARMA genuinely has two separate open plans today
-        # (PB @ 229.14, MOM @ 228.00), which this table had no way to
-        # distinguish since it never showed Source at all. Combined
-        # Source+Entry cell below (one badge per contributing source,
-        # each with its own individually-recorded entry price) makes
-        # that visible instead of removing the row — removing either
-        # row would hide a real open trade.
-        rows_html += (
-            "<tr>"
-            f'<td><span class="sr-sector-name" style="font-weight:700;" title="{r["Symbol"]}">{_tv_link(r["Symbol"])}</span></td>'
-            + (f'<td class="{"sr-pos" if chg >= 0 else "sr-neg"}">{"+" if chg >= 0 else ""}{chg:.2f}%</td>' if chg_ok else '<td style="color:#8b949e;">—</td>')
-            + (f'<td>{_source_badges_with_entries(r["Source"], r["ContribSources"], r["SourceEntries"], r["Entry"])}</td>')
-            + (f'<td class="{"sr-pos" if r["Drift"] >= 0 else "sr-neg"}">{"+" if r["Drift"] >= 0 else ""}{r["Drift"]:.2f}%</td>' if drift_ok else '<td style="color:#8b949e;" title="Not in today\'s scan">—</td>')
-            + f'<td>{f"{r["Target"]:,.2f}" if r["Target"] else "—"}</td>'
-            "</tr>"
-        )
-
-    return f"""
-    <div class="sr-panel">
-      <div class="sr-panel-title">ACTIVE SETUPS (0 DAYS)</div>
-      <div class="sr-panel-body">
-      <table class="sr-table sr-table--snapshot">
-        <colgroup>
-          <col style="width:24%"><col style="width:14%"><col style="width:20%">
-          <col style="width:19%"><col style="width:20%">
-        </colgroup>
-        <tr><th>SYMBOL</th><th>%CHG</th><th>SOURCE / ENTRY</th><th>DRIFT</th><th>TARGET</th></tr>
-        {rows_html}
-      </table>
-      </div>
-    </div>"""
-
-
-
-# ── ACTIVE OPTIONS PLANS (compact card) ─────────────────────────────
-# [2026-08-12, SG request — reverted the 2026-08-08 change below] Back
-# to reading persisted/locked DoreOptionsPlan rows (Supabase "open
-# plans"), same source as pages/scanner.py's DORE Options Engine →
-# Active Plans tab, filtered to lifecycle_group == "ACTIVE" (entry
-# actually locked). The 2026-08-08 switch to the "dore_live_state" Live
-# Scan feed let looser-confidence and merely-"Triggered"-this-tick rows
-# leak into a card titled ACTIVE OPTIONS PLANS that never appeared on
-# either the Live Scan or Active Plans tabs — see the docstring on
-# _active_options_plans_html() below for the specific failure modes.
-# This card is now a compact, top-N subset of the Active Plans tab's
-# own ACTIVE rows — never a superset of what either Scanner tab shows.
-def _today_ist_date_str() -> str:
-    # Same UTC+5:30 day-boundary convention as
-    # utils.dore_options_persistence._today_str() (kept local rather than
-    # importing that module's private helper across module boundaries).
-    from datetime import datetime, timedelta
-    return (datetime.utcnow() + timedelta(hours=5, minutes=30)).date().isoformat()
-
-
-def _time_only_ist(iso_ts: str) -> str:
-    """'2026-08-05T09:15:32+00:00' -> '09:15'. Falls back to '—' on
-    missing/unparseable input."""
-    if not iso_ts:
-        return "—"
-    try:
-        import pytz
-        from datetime import datetime
-        dt = datetime.fromisoformat(str(iso_ts))
-        if dt.tzinfo is None:
-            from datetime import timezone
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(pytz.timezone("Asia/Kolkata")).strftime("%H:%M")
-    except Exception:
-        return "—"
-
-
-def _active_options_plans_html(top_n: int = 6) -> str:
-    # [2026-08-12 fix, SG report] This card was sourcing "dore_live_state"
-    # (Confidence >= 65 + entry_trigger_status == "Triggered"), which is
-    # the Scanner page's LIVE SCAN feed, not its ACTIVE PLANS feed. Two
-    # problems fell out of that: (1) the confidence floor here (65) was
-    # looser than Live Scan's own >=70 display floor, so a 66-69
-    # confidence row (e.g. FEDERALBNK/MCX at 69) could show here despite
-    # not appearing on Live Scan at all; (2) "Triggered" only means the
-    # live premium is CURRENTLY sitting inside the entry zone this tick —
-    # it is a snapshot condition, not a persisted position, so a row
-    # like HINDZINC's second strike could show as "Triggered" with no
-    # entry ever actually locked (Entry/Drift both "—"). Neither of
-    # those is what "ACTIVE OPTIONS PLANS" should mean. Switched to the
-    # SAME persisted source as the Scanner page's own Active Plans tab
-    # (utils.dore_options_persistence.active_plan_rows() over
-    # utils.supabase_client.load_open_dore_options_plans()), filtered to
-    # lifecycle_group == "ACTIVE" (entry actually locked) — this card
-    # now shows a strict subset of what that tab shows, never more.
-    from utils.supabase_client import load_open_dore_options_plans
-    from utils.dore_options_persistence import active_plan_rows
-
-    try:
-        open_plans = load_open_dore_options_plans()
-        rows = [r for r in active_plan_rows(open_plans) if r.get("lifecycle_group") == "ACTIVE"]
-    except Exception:
-        logger.exception("Dashboard Active Options Plans card failed to load (non-fatal)")
-        rows = []
-
-    if not rows:
-        return ('<div class="sr-panel"><div class="sr-panel-title">ACTIVE OPTIONS PLANS</div>'
-                '<div style="color:#8b949e;font-size:0.75rem;">No ACTIVE DORE plans right now — '
-                'see the Scanner page\'s Active Plans tab for TRACKED/MONITORING candidates.</div></div>')
-
-    df = pd.DataFrame(rows)
-    if "confidence_at_entry" in df.columns:
-        df = df.sort_values("confidence_at_entry", ascending=False, kind="stable")
-
-    def _money(v):
-        return f"₹{v:,.2f}" if v not in (None, "") and pd.notna(v) else "—"
-
-    def _conf_style(score):
-        if score is None or (isinstance(score, float) and pd.isna(score)):
-            return ("#8b949e", "⚪")
-        if score >= 75:
-            return ("#3fb950", "🟢")
-        if score >= 55:
-            return ("#58a6ff", "🔵")
-        return ("#8b949e", "⚪")
-
-    rows_html = ""
-    for _, r in df.head(top_n).iterrows():
-        direction = r.get("direction", "")
-        dir_color = "#3fb950" if direction == "CE" else "#f85149" if direction == "PE" else "#8b949e"
-        strike = r.get("strike")
-        strike_disp = f"{strike:,.0f}" if strike not in (None, "") and pd.notna(strike) else "—"
-        conf = r.get("confidence_at_entry")
-        conf_color, conf_dot = _conf_style(conf)
-        conf_disp = f"{conf:.0f}" if conf not in (None, "") and pd.notna(conf) else "—"
-        plan_time = _time_only_ist(r.get("entry_triggered_at"))
-        entry = r.get("entry_locked")
-        drift = r.get("last_drift_pct")
-        drift_val = float(drift) if drift not in (None, "") and pd.notna(drift) else None
-        rows_html += (
-            "<tr>"
-            f'<td style="font-weight:700;" title="{r.get("symbol", "—")}">{r.get("symbol", "—")}</td>'
-            f'<td style="color:{dir_color};font-weight:700;">{direction or "—"}</td>'
-            f"<td>{strike_disp}</td>"
-            f'<td><span style="color:{conf_color};font-weight:700;">{conf_dot} {conf_disp}</span></td>'
-            f"<td>{_money(r.get('last_premium'))}</td>"
-            f'<td title="Entry triggered at {plan_time} IST">{plan_time}</td>'
-            f"<td>{_money(entry)}</td>"
-            f'<td class="{"sr-pos" if (drift_val or 0) >= 0 else "sr-neg"}">{f"{"+" if drift_val >= 0 else ""}{drift_val:.2f}%" if drift_val is not None else "—"}</td>'
-            f"<td>{_money(r.get('saved_stop_loss'))}</td>"
-            f"<td>{_money(r.get('saved_target1'))}</td>"
-            "</tr>"
-        )
-
-    return f"""
-    <div class="sr-panel">
-      <div class="sr-panel-title">ACTIVE OPTIONS PLANS</div>
-      <div class="sr-panel-body">
-      <table class="sr-table sr-table--plans">
-        <colgroup>
-          <col style="width:78px"><col style="width:36px"><col style="width:56px"><col style="width:58px">
-          <col style="width:72px"><col style="width:50px"><col style="width:72px"><col style="width:60px">
-          <col style="width:72px"><col style="width:72px">
-        </colgroup>
-        <tr><th>SYMBOL</th><th>DIR</th><th>STRIKE</th><th>CONF</th>
-            <th>PREMIUM</th><th>PLAN</th><th>ENTRY</th><th>DRIFT</th>
-            <th>STOP LOSS</th><th>TARGET 1</th></tr>
-        {rows_html}
-      </table>
-    </div>"""
-
-
-# 2026-07-23: rewritten to be event-aware. scheduler/scan_worker.py computes
-# ALL of this (live Nifty/Sensex/Bank Nifty quotes, EMA levels, OI resistance,
-# DORE 2.0 per index, regime classification, breadth) on its own 30s timer,
-# completely outside any Streamlit session — see utils/market_intelligence.py
-# for the extracted compute and utils/scan_state.py for the snapshot store.
-#
-# This fragment is now a pure read: poll cheap metadata every
-# _MARKET_INTEL_REFRESH_SECS, and only pull + re-render the (larger) full
-# payload when its version actually changed since the last tick. No Upstox
-# call, no DORE computation, and no regime classification happens in this
-# process anymore.
-_MARKET_INTEL_REFRESH_SECS = 180  # [2026-07-25 ops fix] was 30 — matches the
-                                   # producer's own interval (scheduler/scan_worker.py's
-                                   # JOBS list, also bumped 30->180 the same day, see
-                                   # its comment there for why). Polling every 30s
-                                   # against data that changes at most every 180s
-                                   # meant ~5 of every 6 metadata checks, per open
-                                   # browser session, could never find anything new.
 
 
 @st.fragment(run_every=_MARKET_INTEL_REFRESH_SECS)
@@ -3551,28 +3128,35 @@ def render(settings: dict | None = None):
             st.page_link(_sectors_page, label="View full Sector Rotation Analysis →", icon="🧭")
 
 
-    # [Dashboard/Scanner split] Scanner output (Elite/Execute/Actionable/
-    # ... tables, Signal Class counts) and the DORE 2.0 F&O Opportunity
-    # Engine (Futures/Options tabs) now live on the Scanner page only —
-    # see pages/scanner.py render(), which shows Scanner output followed
-    # by Futures and Options. Dashboard stays focused on market-wide
-    # context: Top Gainers, News, and Sector data below.
-
-    # ── Active Setups (0 Days) + Active Options Plans, side by side ───
-    # [2026-08-05] These two "what's currently open" cards now sit next
-    # to each other (equity setups on the left, options plans on the
-    # right) instead of stacking full-width one after another, with News
-    # pushed below both — News is market-wide context, these two are the
-    # "what did the scanner actually do" glance and read better together.
-    # [2026-09-08, SG request] Left card swapped from LIVE SCANNER
-    # SNAPSHOT (today's CV4 tier read, plan-independent) to ACTIVE
-    # SETUPS (0 DAYS) (persisted setup_plans minted+entered today) — see
-    # _active_setups_zero_days_html()'s docstring for the distinction.
-    live_col, plans_col = st.columns([1, 1], gap="medium")
-    with live_col:
-        st.markdown(_active_setups_zero_days_html(df_aug), unsafe_allow_html=True)
-    with plans_col:
-        st.markdown(_active_options_plans_html(), unsafe_allow_html=True)
+    # [2026-09-09, SG request — "move the scanner page content to
+    # dashboard itself"] The standalone Scanner page (pages/scanner.py,
+    # nav title "Live Scanner") is removed from app.py's navigation
+    # entirely — its full render() (Run Scan controls, DB auto-load,
+    # the Active Setups table, and the DORE Options Engine panel) now
+    # runs HERE instead, replacing the two compact summary cards this
+    # used to show (ACTIVE SETUPS (0 DAYS) and ACTIVE OPTIONS PLANS —
+    # both now redundant: the real, full-detail versions of both are
+    # right below, not a cut-down snapshot of them).
+    #
+    # pages.scanner.render() manages its OWN session_state keys
+    # ("scan_df", "scan_time", "scan_df_version", "scan_loaded_from_db")
+    # and its own widget keys ("btn_run_scan", "chk_save_db",
+    # "sb_clear_cache", "detail_{sc_key}", etc.) — none of which
+    # collide with anything already used elsewhere in this file
+    # (confirmed via direct grep before this change), so this is a
+    # drop-in call, not a reimplementation. It also injects its own
+    # <style> block (_CSS) on every call — harmless if it overlaps any
+    # class name Dashboard's own CSS already defines (last one wins,
+    # same rule either way), not worth a special-case guard for.
+    #
+    # Scanner's df_aug (Yahoo Finance-sourced, its own "scan_df"
+    # session_state key) is completely separate from Dashboard's own
+    # df_aug above (Upstox-sourced, "dash_scan_df") — this call loads
+    # and renders Scanner's data independently; it does NOT reuse or
+    # depend on the `df_aug` variable already in scope in this
+    # function.
+    from pages.scanner import render as render_scanner_page
+    render_scanner_page(settings)
 
     # ── News. ────────────────────────────────────────────────────────
     # 2026-07-28: Top Gainers moved up next to the index cards (see
