@@ -4082,8 +4082,25 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
     # TO_ACTIVATE gate in enrich_trade_plans_with_persistence). Rows
     # below 70 are still ranked/scored internally, just not surfaced
     # here.
+    #
+    # [2026-09-09, SG request] Index rows (NIFTY/BANKNIFTY/SENSEX) use
+    # MIN_CONFIDENCE_TO_TRACK_INDEX (50) instead of the flat 70 —
+    # matching the same index-specific mint floor
+    # _min_confidence_to_track() now applies in dore_options_persistence
+    # (see that constant's docstring for why). Showing this table
+    # filtered at 70 for indices while the mint gate underneath had
+    # already dropped to 50 would hide exactly the rows that are now
+    # trackable — same bug shape as the display floor silently
+    # disagreeing with the mint floor before 2026-08-10 raised it to
+    # match in the first place.
     if "confidence_score" in df.columns:
-        df = df[pd.to_numeric(df["confidence_score"], errors="coerce") >= 70]
+        from utils.dore_options_engine import is_index_symbol
+        from utils.dore_options_persistence import MIN_CONFIDENCE_TO_TRACK, MIN_CONFIDENCE_TO_TRACK_INDEX
+        conf = pd.to_numeric(df["confidence_score"], errors="coerce")
+        floor = df.get("symbol", pd.Series("", index=df.index)).apply(
+            lambda s: MIN_CONFIDENCE_TO_TRACK_INDEX if is_index_symbol(s) else MIN_CONFIDENCE_TO_TRACK
+        )
+        df = df[conf >= floor]
 
     # [2026-08-08, SG request] Today-only — a row whose Plan was locked
     # on a previous day (and just happens to still be OPEN) is carryover,
@@ -4766,7 +4783,8 @@ def _dore_options_panel():
                            f"Live as of {_snap_ist_str} IST.")
             st.markdown(_dore_options_plan_table_html(dore_opt_df, scan_time=(dore_opt_meta or {}).get("created_at")),
                         unsafe_allow_html=True)
-            st.caption("Showing Confidence ≥ 70 only. 🟢 Confidence ≥75 · 🔵 ≥55–74 (n/a below 70 here) — "
+            st.caption("Showing Confidence ≥ 70 (stocks) / ≥ 50 (NIFTY/BANKNIFTY/SENSEX) only. "
+                       "🟢 Confidence ≥75 · 🔵 ≥55–74 (n/a below the source's own floor here) — "
                        "DORE's own final_score, blending qualification, direction strength, and "
                        "premium/liquidity validation into one ranking. Source: PB = Pre-Breakout "
                        "squeeze-release exemption, LS = ordinary Live Scanner ranking. Primary "
