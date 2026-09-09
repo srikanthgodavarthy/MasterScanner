@@ -805,6 +805,7 @@ def _setup_plan_from_row(row: dict) -> "object":
         contributing_sources     = row.get("contributing_sources") or "",
         conflict_flag            = bool(row.get("conflict_flag") or False),
         conflict_reason          = row.get("conflict_reason") or "",
+        source_entries           = row.get("source_entries") or "",
         status                   = _normalize_legacy_status(row.get("status", "WAITING")),
         status_reason            = row.get("status_reason") or row.get("invalidation_reason", "") or "",
         created_at                = str(row.get("created_at", "") or ""),
@@ -2147,6 +2148,19 @@ CROSS_SOURCE_DEDUP_MIGRATION_SQL = """
 ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS contributing_sources text NOT NULL DEFAULT '';
 ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS conflict_flag        boolean NOT NULL DEFAULT false;
 ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS conflict_reason      text NOT NULL DEFAULT '';
+"""
+
+# [2026-09-08, SG request] Individual entry price per contributing
+# source (LS/PB/MOM/FP) on the Active Setups table, instead of only
+# the one winning entry_locked. JSON-encoded text (e.g.
+# '{"LS": 228.0, "MOM": 230.5}') rather than jsonb — every other
+# semi-structured field on this table (conflict_reason, etc.) is plain
+# text too, so this keeps the column set consistent rather than mixing
+# types for one field. Run this once against the live DB before the
+# next plan mints or corroborates, or writes will fail on the missing
+# column.
+SOURCE_ENTRIES_MIGRATION_SQL = """
+ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS source_entries text NOT NULL DEFAULT '';
 """
 
 LIFECYCLE_TRANSITIONS_MIGRATION_SQL = """

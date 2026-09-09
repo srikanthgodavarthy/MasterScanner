@@ -77,6 +77,7 @@ This module is pure logic — no Streamlit, no yfinance.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from dataclasses import dataclass, field, asdict
 from datetime import date, datetime, timedelta, timezone
@@ -297,6 +298,19 @@ class SetupPlan:
     conflict_flag:           bool  = False
     conflict_reason:         str   = ""
 
+    # [2026-09-08, SG request] Individual entry price per contributing
+    # source. entry_locked (above) remains the ONE frozen trade level —
+    # "oldest plan wins" is unchanged — but traders also want to see
+    # what EACH source's own signal computed as entry, not just the
+    # winning one. JSON-encoded dict, e.g. '{"LS": 228.0, "MOM": 230.5}'.
+    # Seeded with {source: entry_locked} at mint (_create_plan), then
+    # added to (never overwritten) by _corroborate_cross_source() each
+    # time a new source corroborates. A source missing from this dict
+    # (pre-migration plans, or a source that corroborated before this
+    # field existed) simply has no individual price to show — the UI
+    # falls back to entry_locked for that badge only.
+    source_entries:          str   = ""
+
     # [2026-08-07, SG request] Where this plan was minted from — "LS"
     # (Live Scanner — the normal Actionable/Execute/Elite promotion path)
     # or "PB" (Pre-Breakout tab — minted early off a squeeze_release
@@ -383,6 +397,7 @@ class SetupPlan:
             "contributing_sources":   self.contributing_sources or "",
             "conflict_flag":          bool(self.conflict_flag),
             "conflict_reason":        self.conflict_reason or "",
+            "source_entries":         self.source_entries or "",
         }
 
 
@@ -905,6 +920,11 @@ def _create_plan(
         created_at              = now_ts,
         source                 = source,
     )
+    # Seed source_entries with the minting source's own entry — the
+    # first entry into what will grow into a per-source map as later
+    # sources corroborate (see _set_source_entry() / _corroborate_
+    # cross_source() above).
+    _set_source_entry(plan, source, entry)
 
     # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #2] Numeric validation
     # already passed (gate above, before this plan even minted) — capture
@@ -925,6 +945,30 @@ def _create_plan(
 # ══════════════════════════════════════════════════════════════════
 #  ENRICH SCANNER ROW  — main integration point
 # ══════════════════════════════════════════════════════════════════
+
+def _source_entries_dict(plan: "SetupPlan") -> dict:
+    """Parse plan.source_entries (JSON text) into a {SOURCE: entry} dict.
+    Never raises — a corrupt/empty field just yields {}."""
+    try:
+        raw = json.loads(plan.source_entries or "{}")
+        return {str(k).upper(): float(v) for k, v in raw.items() if v}
+    except Exception:
+        return {}
+
+
+def _set_source_entry(plan: "SetupPlan", source: str, entry: float) -> None:
+    """Record `source`'s own entry price on `plan`, additive — never
+    overwrites a source that's already recorded (each source's number
+    is set once, the first time it's seen, same immutability spirit as
+    entry_locked itself)."""
+    src = str(source or "").upper().strip()
+    if not src or entry <= 0:
+        return
+    entries = _source_entries_dict(plan)
+    if src not in entries:
+        entries[src] = round(float(entry), 2)
+        plan.source_entries = json.dumps(entries)
+
 
 def _corroborate_cross_source(plan: "SetupPlan", source: str, entry: float, sl: float) -> bool:
     """
@@ -956,6 +1000,11 @@ def _corroborate_cross_source(plan: "SetupPlan", source: str, entry: float, sl: 
         parts = [p for p in plan.contributing_sources.split(",") if p.strip()]
         parts.append(src)
         plan.contributing_sources = ",".join(parts)
+        changed = True
+
+    before = plan.source_entries
+    _set_source_entry(plan, src, entry)
+    if plan.source_entries != before:
         changed = True
 
     if not plan.conflict_flag and plan.entry_locked > 0 and entry > 0:
