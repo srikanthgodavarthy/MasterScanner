@@ -2949,6 +2949,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             "ConflictFlag":   bool(getattr(plan, "conflict_flag", False)),
             "ConflictReason": getattr(plan, "conflict_reason", "") or "",
             "Entry":        plan.entry_locked,
+            "SourceEntries": getattr(plan, "source_entries", "") or "",
             "SL":           plan.sl_locked,
             "T1":           plan.t1_locked,
             "CurrentPrice": cmp_px,
@@ -3031,18 +3032,19 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             f'<td class="col-num">{r["CV4Composite"]:.1f}</td>'
             + _vol_cell
             + f'<td class="col-num">{_px(r["CurrentPrice"])}</td>'
-            # [2026-09-08, SG request] Entry price shown directly under
-            # the Source badge(s), not a separate far-away column — one
-            # combined cell reads as "this source, at this locked
-            # entry" at a glance. Note: this row's Entry is the ONE
-            # frozen entry_locked value on the plan itself (oldest-
-            # plan-wins — see _corroborate_cross_source()'s docstring),
-            # the same number regardless of how many badges show here;
-            # a corroborating source's OWN computed entry isn't
-            # separately persisted per-source today (only whether it
-            # diverged, via ConflictFlag/ConflictReason above).
-            f'<td>{_ap_source_badge(r["Source"], r["ContribSources"])}<br>'
-            f'<span class="col-num" style="font-size:11px;">{_px(r["Entry"])}</span></td>'
+            # [2026-09-08, SG request] Entry price shown individually
+            # per source badge, not one shared number under all of
+            # them — SetupPlan.entry_locked (r["Entry"]) is still the
+            # ONE frozen trade level ("oldest plan wins" is unchanged,
+            # see _corroborate_cross_source()'s docstring), but each
+            # contributing source's OWN computed entry is now also
+            # persisted (SetupPlan.source_entries, JSON {SRC: entry})
+            # and shown right under its own badge — see
+            # _ap_source_badges_with_entries(). A source missing from
+            # that map (pre-migration plans, or a source that
+            # corroborated before this field existed) falls back to
+            # r["Entry"] for that one badge only.
+            f'<td>{_ap_source_badges_with_entries(r["Source"], r["ContribSources"], r["SourceEntries"], r["Entry"])}</td>'
             f'<td class="col-num">{_px(r["SL"])}</td>'
             f'<td class="col-num">{_px(r["T1"])}</td>'
             + _ap_pnl_cell(r["PnLPct"])
@@ -3107,6 +3109,58 @@ def _compute_days_active_safe(first_actionable_date: str) -> int:
         return 0
 
 
+def _ap_one_source_badge(src: str) -> str:
+    """Single LS/PB/MOM/FP colour badge — extracted out of
+    _ap_source_badge() so _ap_source_badges_with_entries() (below) can
+    reuse the exact same colours/tooltips per-badge instead of
+    duplicating them."""
+    src = src.upper().strip()
+    if src == "PB":
+        return ('<span style="background:#f97316;color:#0d1117;font-weight:700;font-size:10px;'
+                'border-radius:4px;padding:1px 6px;" title="Pre-Breakout squeeze-release">PB</span>')
+    if src == "MOM":
+        return ('<span style="background:#a371f7;color:#0d1117;font-weight:700;font-size:10px;'
+                'border-radius:4px;padding:1px 6px;" title="Momentum — same-day volume/rank mover, independent of CV4">MOM</span>')
+    if src == "FP":
+        return ('<span style="background:#3fb950;color:#0d1117;font-weight:700;font-size:10px;'
+                'border-radius:4px;padding:1px 6px;" title="Five Pillars — Structure/Acceptance/Reversal/Leadership/Momentum, independent of CV4">FP</span>')
+    # [2026-09-08 fix — SG report: LS badge has no color like the
+    # others] Was falling through to a plain muted-gray badge with
+    # no distinct color at all, unlike PB/MOM/FP's own colors above
+    # — reused the same blue (#58a6ff) this file's DORE Options
+    # Engine panel already uses for its own "LS" badge (_fmt_source,
+    # ~line 3746) so "LS" reads the same color everywhere in this
+    # file, not just here.
+    # [2026-09-08, SG request — "LS needs a good name as per logic"]
+    # Internal source code stays "LS" everywhere (DB rows, contributing_
+    # sources strings, load_open_setup_plans_by_source("LS"), etc.) —
+    # only the DISPLAYED label changes. "LS" (Live Scanner) was named
+    # after the mechanism that promotes a plan (a scan cycle running),
+    # not the signal logic, unlike PB/MOM/FP which are all named after
+    # their actual engine (Pre-Breakout squeeze, Momentum, Five
+    # Pillars). The engine LS actually promotes off is CV4's own
+    # Actionable/Execute/Elite tiers — the same "CV4 Composite" column
+    # sitting right next to this one in the table header — so "CV4" is
+    # the equivalent logic-named label for this source, same pattern as
+    # the other three.
+    return ('<span style="background:#58a6ff;color:#0d1117;font-weight:700;font-size:10px;'
+            'border-radius:4px;padding:1px 6px;" title="CV4 — Actionable/Execute/Elite tier promotion (internal source code: LS)">CV4</span>')
+
+
+def _ap_ordered_sources(source: str, contributing_sources: str = "") -> list[str]:
+    """Primary minting source first, then any corroborating sources,
+    de-duplicated — shared ordering logic between _ap_source_badge()
+    and _ap_source_badges_with_entries()."""
+    primary = str(source or "LS").upper().strip()
+    all_srcs = [primary] + [s.strip().upper() for s in str(contributing_sources or "").split(",") if s.strip()]
+    seen, ordered = set(), []
+    for s in all_srcs:
+        if s and s not in seen:
+            seen.add(s)
+            ordered.append(s)
+    return ordered
+
+
 def _ap_source_badge(source: str, contributing_sources: str = "") -> str:
     """
     LS/PB/MOM/FP badge(s) for the Active Setups table. [2026-09-08, SG
@@ -3120,36 +3174,51 @@ def _ap_source_badge(source: str, contributing_sources: str = "") -> str:
     `contributing_sources` is SetupPlan.contributing_sources verbatim
     (comma-joined, e.g. "MOM,FP") — `source` (the plan's original
     minting source) is always shown first and de-duplicated against it.
-    """
-    def _one_badge(src: str) -> str:
-        src = src.upper().strip()
-        if src == "PB":
-            return ('<span style="background:#f97316;color:#0d1117;font-weight:700;font-size:10px;'
-                    'border-radius:4px;padding:1px 6px;" title="Pre-Breakout squeeze-release">PB</span>')
-        if src == "MOM":
-            return ('<span style="background:#a371f7;color:#0d1117;font-weight:700;font-size:10px;'
-                    'border-radius:4px;padding:1px 6px;" title="Momentum — same-day volume/rank mover, independent of CV4">MOM</span>')
-        if src == "FP":
-            return ('<span style="background:#3fb950;color:#0d1117;font-weight:700;font-size:10px;'
-                    'border-radius:4px;padding:1px 6px;" title="Five Pillars — Structure/Acceptance/Reversal/Leadership/Momentum, independent of CV4">FP</span>')
-        # [2026-09-08 fix — SG report: LS badge has no color like the
-        # others] Was falling through to a plain muted-gray badge with
-        # no distinct color at all, unlike PB/MOM/FP's own colors above
-        # — reused the same blue (#58a6ff) this file's DORE Options
-        # Engine panel already uses for its own "LS" badge (_fmt_source,
-        # ~line 3746) so "LS" reads the same color everywhere in this
-        # file, not just here.
-        return ('<span style="background:#58a6ff;color:#0d1117;font-weight:700;font-size:10px;'
-                'border-radius:4px;padding:1px 6px;" title="Live Scanner — Actionable/Execute/Elite promotion">LS</span>')
 
-    primary = str(source or "LS").upper().strip()
-    all_srcs = [primary] + [s.strip().upper() for s in str(contributing_sources or "").split(",") if s.strip()]
-    seen, ordered = set(), []
-    for s in all_srcs:
-        if s and s not in seen:
-            seen.add(s)
-            ordered.append(s)
-    return " ".join(_one_badge(s) for s in ordered)
+    No per-source entry price here — see
+    _ap_source_badges_with_entries() for the Active Setups table's own
+    combined Source/Entry cell, which stacks each badge with its own
+    individual entry underneath. This plain version is kept for any
+    other caller that just wants the badges with no entry price at all.
+    """
+    return " ".join(_ap_one_source_badge(s) for s in _ap_ordered_sources(source, contributing_sources))
+
+
+def _ap_source_badges_with_entries(source: str, contributing_sources: str, source_entries_json: str, fallback_entry: float) -> str:
+    """
+    Active Setups table's "Source / Entry" cell — one badge per
+    contributing source (same order/colours as _ap_source_badge()),
+    each stacked directly above ITS OWN individual entry price, not one
+    shared number under every badge. [2026-09-08, SG request]
+
+    `source_entries_json` is SetupPlan.source_entries verbatim (JSON
+    text, e.g. '{"LS": 228.0, "MOM": 230.5}' — see utils.
+    setup_persistence._set_source_entry()/_source_entries_dict()).
+    `fallback_entry` is the plan's one frozen entry_locked — used for
+    any source in the badge row that ISN'T in that map yet (plans
+    minted/corroborated before this field existed), so every badge
+    always shows *some* price rather than a blank cell.
+    """
+    import json as _json
+    try:
+        entries = {str(k).upper(): float(v) for k, v in _json.loads(source_entries_json or "{}").items() if v}
+    except Exception:
+        entries = {}
+
+    def _px(v):
+        try:
+            return f"₹{float(v):,.2f}" if float(v) > 0 else "—"
+        except (TypeError, ValueError):
+            return "—"
+
+    cells = []
+    for s in _ap_ordered_sources(source, contributing_sources):
+        px = entries.get(s, fallback_entry)
+        cells.append(
+            f'<div style="margin-bottom:2px;">{_ap_one_source_badge(s)} '
+            f'<span class="col-num" style="font-size:11px;">{_px(px)}</span></div>'
+        )
+    return "".join(cells)
 
 
 def _render_momentum_tab(df_aug: pd.DataFrame) -> None:
@@ -4958,363 +5027,40 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
         if "Recommendation" in df_aug.columns else df_aug
     )
 
-    # ── Toggles ──────────────────────────────────────────────────
-    # Widgets now render inline next to the ACTIONABLE section label
-    # (below, inside the tab loop). Read the persisted values here so
-    # the SKIP-tab/validation-strip logic that runs before the tabs
-    # exist still sees the current toggle state.
-    val_mode  = st.session_state.get("chk_validation_mode", False)
-    show_skip = st.session_state.get("chk_show_skip", False)
-
-    # ── Split by Recommendation (CV1 tier + Promotion Engine) ──────
-    has_cv1 = "Recommendation" in df_aug.columns
-
-    # Tiers that never mint a Setup Plan on their own (_FREEZE_CATEGORIES
-    # = Elite/Execute/Actionable is the only trigger for plan creation,
-    # in setup_persistence.py). A Watch/Developing/Skip row showing an
-    # open plan can only mean it qualified for Actionable+ before, a plan
-    # was minted, and its score has since decayed — the plan is still
-    # legitimately open (tracked by price, not by current tier) but
-    # belongs in Active Plans, not here.
-    _PRE_ACTIONABLE_TIERS = {"Developing", "Watch", "Skip"}
-
-    def _sc_df(sc):
-        if not has_cv1:
-            return pd.DataFrame()
-        _base = df_aug[df_aug["Recommendation"] == sc].copy()
-        if sc in _PRE_ACTIONABLE_TIERS and "PlanStatus" in _base.columns:
-            _open_states = {"WAITING", "ACTIVE", "T1_HIT"}
-            _base = _base[~_base["PlanStatus"].astype(str).str.upper().isin(_open_states)]
-        # Default sort: Score (CV1_Composite) high → low.
-        if "CV1_Composite" in _base.columns:
-            _base = _base.sort_values("CV1_Composite", ascending=False)
-        elif "CV1_Leadership" in _base.columns:
-            _base = _base.sort_values("CV1_Leadership", ascending=False)
-        return _base
-
-    elite_df      = _sc_df("Elite")
-    execute_df    = _sc_df("Execute")
-    actionable_df = _sc_df("Actionable")
-
-    if not has_cv1:
-        # Legacy fallback for cached scans predating this refactor.
-        _rec_col   = "Category" if "Category" in df_aug.columns else None
-        has_cat    = _rec_col is not None
-        elite_df      = df_aug[df_aug[_rec_col] == "Elite Opportunity"].copy() if has_cat else pd.DataFrame()
-        execute_df    = pd.DataFrame()
-        actionable_df = df_aug[df_aug[_rec_col].isin(["High Conviction", "Actionable"])].copy() if has_cat else pd.DataFrame()
-
-    # ── SETUP_PRE_BREAKOUT detection ─────────────────────────────────────────────
-    # [Removed, 2026-09-08 — SG request: single-symbol-persistent Active
-    # Setups] _is_pre_breakout()/_pre_breakout_boosts()/pre_breakout_records/
-    # pre_breakout_df used to live here, feeding the standalone
-    # 🎯 Pre-Breakout tab (live squeeze_release candidates, not-yet-minted).
-    # Dropped entirely per SG's explicit call — only minted/open plans
-    # matter now, and PB plans (once minted) show in Active Setups like
-    # every other source. The PB MINTING signal itself
-    # (_classify_active_trigger_phase() in utils/scanner_engine.py,
-    # feeding enrich_scanner_row()'s `pre_breakout` param) is UNCHANGED —
-    # only this tab's live-candidate DISCOVERY view is gone.
+    # ── Active Setups only ───────────────────────────────────────────
+    # [2026-09-08, SG request] The ✅ Actionable tab (a raw CV4-tier
+    # read off this cycle's scan — Elite/Execute/Actionable rows,
+    # independent of whether a plan was ever minted; effectively "Live
+    # Scanner" output) and the 🏛️ Five Pillars tab (embedded copy of
+    # pages/five_pillars.py's own ranking) are both removed from this
+    # page. Active Setups (persisted LS/PB/MOM/FP setup_plans — see
+    # _render_active_plans_tab()'s docstring) is now the only thing
+    # this page shows; the Skip-tab toggle goes with it, since there's
+    # nothing left here for it to be a tab of.
+    #
+    # Five Pillars is NOT gone from the app — pages/five_pillars.py is
+    # still its own standalone page with its own nav entry; only the
+    # embedded read-only copy of it that used to live here is removed.
+    # elite_df/execute_df/actionable_df/_sc_df()/val_mode/show_skip and
+    # the whole Elite/Execute/Actionable/Skip/Five-Pillars rendering
+    # branch that used to follow this comment (validation strip,
+    # per-stock breakdown, promotion signals, watchlist, CSV download —
+    # all of it scoped to those now-removed tabs) are gone with them.
     try:
         from utils.supabase_client import load_open_setup_plans as _load_open_plans_for_count
-        # [2026-09-08] Now includes WAITING too — Active Setups is the
-        # single merged view of LS/PB/MOM (see _render_active_plans_tab's
-        # rewritten docstring), and Status is now a visible column
-        # rather than an implicit "entered only" filter.
+        # Includes WAITING too — Active Setups is the single merged
+        # view of LS/PB/MOM/FP, Status is a visible column rather than
+        # an implicit "entered only" filter.
         _open_plans_preview = _load_open_plans_for_count()
     except Exception:
         _open_plans_preview = {}
 
-    tab_labels = [
-        f"✅ Actionable ({len(elite_df) + len(execute_df) + len(actionable_df)})",
-        f"📋 Active Setups ({len(_open_plans_preview)})",
-        "🏛️ Five Pillars",
-    ]
-    df_sets  = [pd.DataFrame(), pd.DataFrame(), pd.DataFrame()]
-    set_keys = ["ELITE_EXEC_ACTIONABLE", "ACTIVE_PLANS", "FIVE_PILLARS"]
-
-
-    if show_skip:
-        skip_df = _sc_df("Skip") if has_cv1 else pd.DataFrame()
-        tab_labels.append(f"⛔ Skip ({len(skip_df)})")
-        df_sets.append(skip_df)
-        set_keys.append("SKIP")
-
     if not active_df.empty:
         st.markdown(_summary_cards(active_df), unsafe_allow_html=True)
 
-    tabs = st.tabs(tab_labels)
-
-    for tab, df_subset, sc_key in zip(tabs, df_sets, set_keys):
-        with tab:
-            # ── ACTIVE_PLANS: the Trade Lifecycle dashboard, independent of
-            #    today's scanner recommendation. Single merged view of
-            #    LS/PB/MOM — see _render_active_plans_tab()'s docstring
-            #    (2026-09-08 rewrite: was Active Setups + separate
-            #    Momentum + separate Pre-Breakout tabs). ─────────────
-            if sc_key == "ACTIVE_PLANS":
-                _render_active_plans_tab(df_aug, preloaded_plans=_open_plans_preview)
-                continue
-
-            # ── FIVE_PILLARS: Structure/Acceptance/Reversal/Leadership/
-            #    Momentum ranking, pulled in from the standalone
-            #    pages/five_pillars.py page per [2026-08-14 SG request].
-            #    Single tab, no Elite/Execute/Watch/Developing/Avoid
-            #    sub-tabs and no classification-count cards — see
-            #    _render_five_pillars_tab() below.
-            if sc_key == "FIVE_PILLARS":
-                _render_five_pillars_tab(df_aug)
-                continue
-
-            # ── ELITE_EXEC_ACTIONABLE: merged tab — Elite (highest
-            #    conviction), Execute (timing-confirmed, higher urgency)
-            #    and Actionable (quality-qualified, plan created, awaiting
-            #    trigger) are all shown together in one "Actionable" table,
-            #    highest tier first. Each row already carries its own
-            #    Recommendation badge (ELITE/EXECUTE/ACTIONABLE), so no
-            #    sub-filter is needed to tell them apart.
-            _merged_actionable = False
-
-            if sc_key == "ELITE_EXEC_ACTIONABLE":
-                _parts = [d for d in (elite_df, execute_df, actionable_df) if not d.empty]
-                df_subset = pd.concat(_parts, ignore_index=True) if _parts else pd.DataFrame()
-                sc_key = "ACTIONABLE"   # column-set + accent color for the merged view
-                _merged_actionable = True
-
-            sc_color, sc_label = _SC_STYLE.get(sc_key, ("#484f58", sc_key))
-            if sc_key == "ACTIONABLE" and _merged_actionable:
-                sc_label = "ACTIONABLE (ELITE / EXECUTE / ACTIONABLE)"
-
-            if df_subset.empty:
-                if sc_key == "ACTIONABLE" and _merged_actionable:
-                    _etgl1, _etgl2 = st.columns([2, 1.4])
-                    with _etgl1:
-                        val_mode = st.checkbox(
-                            "🔬 Validation mode — Signal Class vs legacy tier side-by-side",
-                            value=val_mode, key="chk_validation_mode",
-                        )
-                    with _etgl2:
-                        show_skip = st.checkbox("Show SKIP candidates", value=show_skip, key="chk_show_skip")
-                    # [2026-08-28 fix] `summary` (st.session_state["scan_summary"])
-                    # is only ever populated by a manual "Run Scan" click in
-                    # THIS session (see render() above) — the DB-load path
-                    # deliberately leaves it as {} (see that path's own
-                    # 2026-08-24 comment), since the persisted live_scanner
-                    # snapshot only carries `data`, not `summary`/regime_ctx.
-                    # That comment claimed an empty summary "just skips the
-                    # regime-gate info banner" — it didn't: summary.get(
-                    # "regime") is None when empty, and None != "TREND" is
-                    # True, so this unconditionally fell into the "restricted"
-                    # branch and rendered "market regime is ?." even when we
-                    # have no idea what the regime actually is (e.g. right
-                    # after opening the app, before ever clicking Run Scan).
-                    # `if summary and ...` actually skips it in that case,
-                    # falling through to the plain "no candidates" message —
-                    # matching what was already intended/documented.
-                    if summary and summary.get("regime") != "TREND":
-                        st.info(f"Execute gate restricted — market regime is {summary['regime']}.")
-                    else:
-                        st.info(f"No {sc_label} candidates in this scan.")
-                else:
-                    st.info(f"No {sc_label} candidates in this scan.")
-                continue
-
-            # Section label
-            if sc_key == "ACTIONABLE" and _merged_actionable:
-                lbl_col, tgl1, tgl2 = st.columns([2.4, 2, 1.4])
-                with lbl_col:
-                    st.markdown(
-                        f'<div class="section-label" style="border-left-color:{sc_color};color:{sc_color};">'
-                        f'{sc_label}</div>',
-                        unsafe_allow_html=True,
-                    )
-                with tgl1:
-                    val_mode = st.checkbox(
-                        "🔬 Validation mode — Signal Class vs legacy tier side-by-side",
-                        value=val_mode, key="chk_validation_mode",
-                    )
-                with tgl2:
-                    show_skip = st.checkbox("Show SKIP candidates", value=show_skip, key="chk_show_skip")
-            else:
-                st.markdown(
-                    f'<div class="section-label" style="border-left-color:{sc_color};color:{sc_color};">'
-                    f'{sc_label}</div>',
-                    unsafe_allow_html=True,
-                )
-
-            _show_detail = st.toggle("Detail view", value=False, key=f"detail_{sc_key}")
-
-            # Validation strip
-            if val_mode and ("Recommendation" in df_subset.columns or "Category" in df_subset.columns) and "CV1_SignalClass" in df_subset.columns:
-                _val_rec_col = "Recommendation" if "Recommendation" in df_subset.columns else "Category"
-                with st.expander("🔬 Validation: Signal Class vs legacy Category", expanded=True):
-                    st.markdown(
-                        '<div style="font-size:10px;color:#8b949e;margin-bottom:6px;">'
-                        'CV1 Signal Class (new) vs legacy Category (old) — one-cycle comparison only.'
-                        '</div>',
-                        unsafe_allow_html=True,
-                    )
-                    for _, vrow in df_subset.head(20).iterrows():
-                        st.markdown(
-                            _validation_row_html(
-                                str(vrow.get("Stock", "")),
-                                str(vrow.get("CV1_SignalClass", "WATCH")),
-                                str(vrow.get(_val_rec_col, "")),
-                            ),
-                            unsafe_allow_html=True,
-                        )
-
-            # ── Rich HTML table ──────────────────────────────────
-            disp = _build_display_df(df_subset, detail=_show_detail, sc_key=sc_key)
-            if "regime_tier" in disp.columns:
-                disp = disp.drop(columns=["regime_tier"])
-            st.markdown(_render_html_table(disp), unsafe_allow_html=True)
-
-            # ── Per-stock component table ─────────────────────────
-            _pills_html = _perstock_breakdown_table(df_subset)
-            if _pills_html:
-                with st.expander("🔬 Stock Breakdown Summary", expanded=False):
-                    st.markdown(_pills_html, unsafe_allow_html=True)
-
-            # ── Promotion signals — always visible, lightweight badges ──
-            # This is the ONLY place promotion timing is explained; there is
-            # no separate "Score Breakdown" or "Pillar Breakdown" page.
-            _promo_html = _promotion_signals_table(df_subset)
-            if _promo_html:
-                with st.expander("🚀 Promotion Signals", expanded=False):
-                    st.markdown(_promo_html, unsafe_allow_html=True)
-
-            # Setup Persistence detail (kept — this is trade-lifecycle state,
-            # not a competing scoring system)
-            if _show_detail and "SetupID" in df_subset.columns:
-                with st.expander("🗂️ Setup Persistence — individual stock"):
-                    _sel = df_subset["Stock"].tolist()[:10] if "Stock" in df_subset.columns else []
-                    _picked = st.selectbox("Select stock", _sel, key=f"breakdown_sel_{sc_key}")
-                    if _picked:
-                        _row = df_subset[df_subset["Stock"] == _picked].iloc[0]
-
-                        _setup_id   = str(_row.get("SetupID", ""))
-                        _plan_status= str(_row.get("PlanStatus", ""))
-                        _setup_age  = str(_row.get("SetupAge",  _row.get("Setup Age", "")))
-                        _tps        = str(_row.get("TradePlanStatus", _row.get("Plan Status", "")))
-                        _days_active= _row.get("DaysActive", 0)
-                        _drift_pct  = _row.get("EntryDriftPct", _row.get("Drift%", 0))
-
-                        _persist_header = (
-                            '<div style="margin:14px 0 6px;font-size:9px;font-weight:700;'
-                            'color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;">'
-                            '🗂️ Setup Persistence</div>'
-                        )
-                        _setup_meta = (
-                            f'<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">'
-                            f'<span style="font-size:10px;color:var(--muted)">ID:</span>'
-                            f'<code style="font-size:11px;background:var(--bg2);padding:2px 8px;border-radius:4px;'
-                            f'border:1px solid var(--border);color:var(--blue)">{_setup_id or "—"}</code>'
-                            f'<span style="margin-left:8px">{_freshness_badge(_setup_age)}</span>'
-                            f'<span style="margin-left:4px">{_trade_status_badge(_tps)}</span>'
-                            f'</div>'
-                        )
-
-                        try:
-                            _drift_v = float(_drift_pct)
-                            _dc = "#3fb950" if _drift_v < 0 else ("#f85149" if _drift_v > 2 else "#d29922")
-                            _ds = f'{"+" if _drift_v > 0 else ""}{_drift_v:.1f}%'
-                            _drift_html = (
-                                f'<span style="font-size:10px;color:var(--muted)">Entry Drift: </span>'
-                                f'<span style="font-size:11px;font-weight:700;color:{_dc}">{_ds}</span>'
-                                f'<span style="font-size:9px;color:var(--muted);margin-left:6px">'
-                                f'(live vs locked entry)</span>'
-                            )
-                        except (TypeError, ValueError):
-                            _drift_html = ""
-
-                        st.markdown(
-                            _persist_header + _setup_meta + _drift_html,
-                            unsafe_allow_html=True,
-                        )
-                        st.markdown(_locked_plan_panel(_row), unsafe_allow_html=True)
-                        st.markdown(_lifecycle_timeline_panel(plan_row=_row), unsafe_allow_html=True)
-
-            # Explainability panel (Sprint 1)
-            if _show_detail and "_explain_included" in df_subset.columns:
-                with st.expander("💡 Why this stock? — Explainability"):
-                    _sel2 = df_subset["Stock"].tolist()[:10] if "Stock" in df_subset.columns else []
-                    _picked2 = st.selectbox("Select stock", _sel2, key=f"explain_sel_{sc_key}")
-                    if _picked2:
-                        _erow = df_subset[df_subset["Stock"] == _picked2].iloc[0]
-                        _included   = [s for s in str(_erow.get("_explain_included",   "")).split("|") if s]
-                        _not_higher = [s for s in str(_erow.get("_explain_not_higher", "")).split("|") if s]
-                        _risks      = [s for s in str(_erow.get("_explain_risks",      "")).split("|") if s]
-                        tq          = _safe_int(_erow.get("TrendQuality", 0))
-
-                        st.markdown(
-                            f"<div style='background:#ffffff;border:1px solid rgba(15,23,42,0.08);"
-                            f"border-radius:8px;padding:14px;font-size:12px;'>",
-                            unsafe_allow_html=True,
-                        )
-
-                        # Trend Quality badge
-                        tq_color = "#22c55e" if tq >= 70 else ("#f59e0b" if tq >= 45 else "#ef4444")
-                        st.markdown(
-                            f"<div style='margin-bottom:10px;'>"
-                            f"<span style='font-size:10px;color:#8b949e;letter-spacing:0.08em;text-transform:uppercase;'>Trend Quality</span>"
-                            f"<span style='font-size:22px;font-weight:700;color:{tq_color};font-family:monospace;margin-left:8px;'>{tq}</span>"
-                            f"<span style='font-size:10px;color:#8b949e;'>/100</span></div>",
-                            unsafe_allow_html=True,
-                        )
-
-                        # ── Gap to promotion ────────────────────────────
-                        # For an Actionable setup, show what's missing to
-                        # reach Execute/Elite — sourced from the Promotion
-                        # Engine, not a second scoring calculation.
-                        _rec = str(_erow.get("Recommendation", ""))
-                        if _rec == "Actionable":
-                            _blocked = [s for s in str(_erow.get("_promo_blocked", "")).split("|") if s]
-                            _score   = _safe_int(_erow.get("PromoScore", 0))
-                            _rr      = float(_erow.get("PromoRR", 0) or 0)
-                            _gap_note = "  ·  ".join(_blocked) if _blocked else f"Promo Score {_score}/100, R:R {_rr:.1f}"
-                            st.markdown(
-                                "<div style='background:rgba(245,197,66,0.06);border:1px solid rgba(245,197,66,0.2);"
-                                "border-radius:6px;padding:8px 12px;margin-bottom:8px;font-size:11px;'"
-                                " title='Promotion Engine gate: Promo Score ≥75 + R:R ≥2.0 → Elite; "
-                                "Promo Score ≥50 + R:R ≥1.5 → Execute'>"
-                                "<span style='color:#f5c542;font-weight:700;'>🚀 Gap to Promotion</span>"
-                                f"<span style='color:#8b949e;margin-left:8px;'>{_gap_note}</span></div>",
-                                unsafe_allow_html=True,
-                            )
-                        elif _rec in ("Execute", "Elite"):
-                            st.success(f"This stock IS {_rec} — Promotion Engine has confirmed timing.")
-
-                        if _included:
-                            st.markdown("**✅ Why included:**")
-                            for item in _included:
-                                st.markdown(f"- {item}")
-                        if _not_higher:
-                            st.markdown("**🔼 Why not higher category:**")
-                            for item in _not_higher:
-                                st.markdown(f"- {item}")
-                        if _risks:
-                            st.markdown("**⚠️ Risk factors:**")
-                            for item in _risks:
-                                st.markdown(f"- {item}")
-                        if not _included and not _not_higher and not _risks and _rec not in ("Execute", "Elite"):
-                            st.info("No explainability data for this stock.")
-
-            # Watchlist
-            if supabase_ok and sc_key not in ("SKIP",):
-                with st.expander("➕ Add to Watchlist"):
-                    syms = df_subset["Stock"].tolist() if "Stock" in df_subset.columns else []
-                    sel  = st.multiselect("Select symbols", syms, key=f"wl_sel_{sc_key}")
-                    note = st.text_input("Note (optional)", key=f"wl_note_{sc_key}")
-                    if st.button("Add to Watchlist", key=f"wl_add_{sc_key}"):
-                        for s in sel:
-                            add_to_watchlist(s, note)
-                        st.success(f"Added {len(sel)} symbols to watchlist.")
-
-            # Download
-            csv = df_subset.to_csv(index=False)
-            st.download_button(
-                f"⬇️ Download {sc_key} CSV", data=csv,
-                file_name=f"scan_{sc_key.lower()}_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv", key=f"dl_{sc_key}",
-            )
+    st.markdown(
+        f'<div class="section-label" style="border-left-color:#58a6ff;color:#58a6ff;">'
+        f'📋 ACTIVE SETUPS ({len(_open_plans_preview)})</div>',
+        unsafe_allow_html=True,
+    )
+    _render_active_plans_tab(df_aug, preloaded_plans=_open_plans_preview)
