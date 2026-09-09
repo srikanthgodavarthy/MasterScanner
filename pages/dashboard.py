@@ -2560,10 +2560,16 @@ def _active_setups_zero_days_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
         "MOM": "#a371f7",
         "FP":  "#3fb950",
     }
+    # [2026-09-08, SG request] "LS" internal source code displays as
+    # "CV4" everywhere — same rename as pages/scanner.py's
+    # _ap_one_source_badge(), see that docstring for why. Internal
+    # source code (r["Source"], DB values, filters) is untouched.
+    _SRC_LABEL = {"LS": "CV4"}
     def _src_badge(src: str) -> str:
         clr = _SRC_COLOR.get(src, "#58a6ff")   # default: LS
+        label = _SRC_LABEL.get(src, src)
         return (f'<span style="background:{clr};color:#0d1117;font-weight:700;'
-                f'font-size:9px;border-radius:3px;padding:0px 5px;">{src}</span>')
+                f'font-size:9px;border-radius:3px;padding:0px 5px;">{label}</span>')
 
     rows_html = ""
     for _, r in df.iterrows():
