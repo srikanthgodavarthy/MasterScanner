@@ -637,12 +637,28 @@ _NSE_HEADERS   = {
 }
 
 
+# Symbols to drop even when NSE's own CSV lists them. NSE puts a stock
+# under a temporary "DUMMY<name>" trading symbol while a corporate action
+# (name/symbol change, merger, etc.) is settling — the underlying company
+# is still in the index, but that placeholder ticker has no real market
+# data anywhere (yfinance, brokers, etc. all 404/delist on it), so every
+# scan cycle burns a full 8-attempt exponential backoff (~5-6 min) on it
+# for nothing. Safe to drop: the real post-action symbol will appear in
+# the CSV on its own and doesn't need to be added here.
+# [2026-09-09] DUMMYHEG — HEG Ltd corporate action in progress.
+_EXCLUDED_SYMBOLS = {"DUMMYHEG"}
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_nifty500_constituents() -> list[str]:
     """
     Download the official Nifty 500 constituent list from NSE Indices and
     cache it for 24h, so the scanner's universe stays in sync with index
     reconstitutions instead of drifting from a hardcoded snapshot.
+
+    Symbols in _EXCLUDED_SYMBOLS are filtered out after fetch (see that
+    set's docstring) — applies to both the live NSE path and the
+    hardcoded fallback below.
 
     NSE's edge rejects bare requests to the CSV endpoint (403) unless the
     session first hits the site root to pick up cookies, and expects a
@@ -698,9 +714,13 @@ def fetch_nifty500_constituents() -> list[str]:
         )
 
         # Sanity floor — a real Nifty 500 file should be close to 500 rows;
-        # anything wildly short signals a malformed/partial download.
+        # anything wildly short signals a malformed/partial download. Check
+        # BEFORE excluding known-bad placeholders so the floor still reads
+        # NSE's actual row count, not our post-filter count.
         if len(symbols) < 450:
             raise ValueError(f"NSE CSV returned only {len(symbols)} symbols, expected ~500")
+
+        symbols = [s for s in symbols if s not in _EXCLUDED_SYMBOLS]
 
         _log.info("fetch_nifty500_constituents: succeeded, %d symbols, %.2fs total", len(symbols), time.time() - _t0)
         return symbols
@@ -708,7 +728,7 @@ def fetch_nifty500_constituents() -> list[str]:
     except Exception as e:
         logging.warning(f"fetch_nifty500_constituents: NSE fetch failed ({e}); using hardcoded fallback")
         _log.info("fetch_nifty500_constituents: fell back to hardcoded list, %.2fs total", time.time() - _t0)
-        return list(_NIFTY500_FALLBACK)
+        return [s for s in _NIFTY500_FALLBACK if s not in _EXCLUDED_SYMBOLS]
 
 
 # Resolved once at import time (st.cache_data works outside an active
