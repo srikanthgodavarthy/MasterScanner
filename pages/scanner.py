@@ -646,11 +646,30 @@ _CSS = """
 /* ── Active Plans tab table ── */
 .ap-table { width:100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
 .ap-table th {
-  text-align:left; padding:6px 8px; font-size:9px; font-weight:700; color:var(--muted);
+  text-align:left; padding:6px 8px; font-size:11px; font-weight:800; color:var(--text);
   letter-spacing:0.06em; text-transform:uppercase; border-bottom:1px solid var(--border);
 }
-.ap-table td { padding:6px 8px; border-bottom:1px solid var(--border); }
-.ap-table tr:hover { background: rgba(15,23,42,0.02); }
+.ap-table td { padding:6px 8px; border-bottom:1px solid var(--border); font-size:12px; }
+.ap-table td, .ap-table td * { font-size:12px !important; font-family: var(--mono) !important; }
+.ap-table tr:hover { filter: brightness(1.12); }
+/* [2026-09-09, SG request: "colors should be light... direction of
+   confidence"] Was four unrelated, fairly saturated hues (blue/orange/
+   purple/green) with no ordering relationship to each other. Replaced
+   with a single light-blue ramp, one hue at increasing opacity/border
+   strength, walking PB → MOM → FP → CV4 in that order — SG's assumed
+   typical hit sequence (PB fires first alone, MOM/FP corroborate,
+   CV4/LS's original Actionable read is the last, most-confirmed leg)
+   — so a darker/more visible row genuinely reads as "further along
+   that confirmation chain", not just "a different, unrelated source".
+   All four stay light (max 0.16 background alpha) per SG's request —
+   this is a confidence GRADIENT, not a return to solid/saturated
+   fills. Kept the base hue (#58a6ff) matching the LS/CV4 badge color
+   already used elsewhere in this file, rather than inventing a new
+   accent color with no other meaning in the app. */
+.ap-row-pb  { background: rgba(88,166,255,0.045); border-left: 3px solid rgba(88,166,255,0.35); }
+.ap-row-mom { background: rgba(88,166,255,0.08);  border-left: 3px solid rgba(88,166,255,0.5);  }
+.ap-row-fp  { background: rgba(88,166,255,0.12);  border-left: 3px solid rgba(88,166,255,0.65); }
+.ap-row-cv4 { background: rgba(88,166,255,0.16);  border-left: 3px solid #58a6ff; }
 
 /* ── Setup Lifecycle Timeline Panel ── */
 .lifecycle-panel {
@@ -2957,7 +2976,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             "PnLPct":       compute_pnl_pct(plan.entry_locked, cmp_px) if cmp_px else None,
             "DaysActive":   _compute_days_active_safe(plan.first_actionable_date),
             "CurrentRec":   live.get("current_rec", ""),
-            "CurPctChg":    live.get("pct_chg", 0.0),
+            "CurPctChg":    live.get("pct_chg") if live else None,
             "CurVolRatio":  live.get("vol_ratio", 0.0),
         })
 
@@ -3040,10 +3059,19 @@ def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
     header = (
         '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th>'
         '<th>CV4 Composite</th><th>Volume</th><th>CMP</th>'
-        '<th>CV4</th><th>PB</th><th>MOM</th><th>FP</th>'
+        '<th>PB</th><th>MOM</th><th>FP</th><th>CV4</th>'
         '<th>SL (CV4)</th><th>T1 (CV4)</th><th>PnL%</th>'
         '<th>No of Days</th></tr>'
     )
+    # [2026-09-09, SG request] Row tint by "latest source" — the plan's
+    # own r["Source"] field IS whichever source most recently owns this
+    # plan (the minting source, or the corroborating source if the plan
+    # was re-keyed onto it — see _corroborate_cross_source(), it never
+    # changes plan.source itself, so this reads the ORIGINAL minting
+    # source, not necessarily the most-recently-corroborating one; there
+    # is no separate "last touched by" field on SetupPlan today, this is
+    # the closest available proxy).
+    _ROW_CLASS = {"LS": "ap-row-cv4", "PB": "ap-row-pb", "MOM": "ap-row-mom", "FP": "ap-row-fp"}
     body = ""
     for rank, (_, r) in enumerate(rows_df.iterrows(), 1):
         def _px(v):
@@ -3058,9 +3086,10 @@ def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
             )
         else:
             _vol_cell = f'<td class="col-num">{r["CurVolRatio"]:.1f}x</td>' if r["CurVolRatio"] else '<td class="col-num">—</td>'
+        _row_class = _ROW_CLASS.get(str(r["Source"]).upper().strip(), "")
         body += (
-            f'<tr><td class="col-rank">{rank}</td>'
-            f'<td class="col-stock">{_tv_link(r["Symbol"])}</td>'
+            f'<tr class="{_row_class}"><td class="col-rank">{rank}</td>'
+            f'<td class="col-stock">{_tv_link(r["Symbol"], pct_chg=r["CurPctChg"])}</td>'
             f'<td>{_ap_status_badge(r["Status"])}</td>'
             f'<td class="col-num">{r["CV4Composite"]:.1f}</td>'
             + _vol_cell
@@ -3262,7 +3291,19 @@ def _ap_per_source_cells(source: str, contributing_sources: str, source_entries_
 
     active = set(_ap_ordered_sources(source, contributing_sources))
     cells = []
-    for s in ("CV4", "PB", "MOM", "FP"):
+    # [2026-09-09, SG request] Column order follows SG's assumed typical
+    # hit sequence — PB (pre-breakout coiling) fires first, then MOM
+    # (same-day volume mover) or FP (Five Pillars) corroborate, CV4
+    # (the original LS/Actionable read) last — rather than the
+    # alphabetical-ish CV4/PB/MOM/FP order this shipped with. Purely a
+    # column-order/display change; doesn't touch which source actually
+    # minted vs corroborated (that's still source/contributing_sources,
+    # unchanged) or _ap_ordered_sources()'s own minting-first ordering
+    # (that function is for the separate combined-badge callers —
+    # _ap_source_badge()/_ap_source_badges_with_entries() — which
+    # aren't used by this table anymore, only kept for any other
+    # caller wanting a single combined badge string).
+    for s in ("PB", "MOM", "FP", "CV4"):
         # Internal source code for the LS/CV4 column is still "LS" in
         # SetupPlan/DB (see _ap_one_source_badge()'s own docstring on
         # why the DISPLAYED label is "CV4") — map the header name back
@@ -3273,7 +3314,7 @@ def _ap_per_source_cells(source: str, contributing_sources: str, source_entries_
             cells.append(
                 f'<td class="col-num" style="text-align:center;">'
                 f'<div style="color:#3fb950;font-weight:700;">✓</div>'
-                f'<div style="font-size:11px;">{_px(px)}</div></td>'
+                f'<div>{_px(px)}</div></td>'
             )
         else:
             cells.append('<td class="col-num" style="text-align:center;color:var(--muted);">—</td>')
