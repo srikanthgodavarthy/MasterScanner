@@ -4102,6 +4102,24 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
         )
         df = df[conf >= floor]
 
+    # [2026-09-09, SG request] "Allow only BUY NOW" — confidence_score
+    # alone only says a candidate CLEARED the technical bar; it says
+    # nothing about whether NOW is actually the moment to enter. That's
+    # what entry_trigger_status carries (utils/dore_live_state.py's
+    # _entry_trigger_status): "Triggered" means the current live premium
+    # is inside the plan's own entry_zone right now; "Waiting" means the
+    # setup qualified but price hasn't reached the entry zone yet — i.e.
+    # exactly the gap between "well-scored" and "actually enterable now"
+    # that was letting Waiting rows sit in this table indistinguishable
+    # from Triggered ones. Only present on rows sourced from the
+    # "dore_live_state" (Stage 2) snapshot — rows still on the raw
+    # "dore_technical_plans" fallback (Stage 2 hasn't ticked yet this
+    # session) have no entry_trigger_status at all, and are kept as-is
+    # rather than filtered out on missing data.
+    if "entry_trigger_status" in df.columns:
+        trig = df["entry_trigger_status"]
+        df = df[trig.isna() | (trig == "") | (trig == "Triggered")]
+
     # [2026-08-08, SG request] Today-only — a row whose Plan was locked
     # on a previous day (and just happens to still be OPEN) is carryover,
     # not something this cycle's scan actually produced. Rows with no
@@ -4152,9 +4170,18 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
         df = df.drop(columns=["_sort_time"])
 
     if df.empty:
-        return '<div style="color:var(--muted);padding:8px;">No candidates with Confidence ≥ 70 today.</div>'
+        return ('<div style="color:var(--muted);padding:8px;">No candidates with Confidence ≥ 70 today '
+                'that are also Triggered (entry zone reached) right now.</div>')
 
-    headers = ["Symbol", "Direction", "Source", "Primary Strike", "Confidence", "Plan", "Current Premium",
+    def _fmt_trigger(row):
+        status = row.get("entry_trigger_status")
+        if status in (None, "") or (isinstance(status, float) and pd.isna(status)):
+            return '<span style="color:var(--muted);font-size:12px;">—</span>'
+        return ('<span style="color:#3fb950;font-weight:700;font-size:12px;">🟢 Triggered</span>'
+                if status == "Triggered" else
+                '<span style="color:#d29922;font-weight:600;font-size:12px;">⏳ Waiting</span>')
+
+    headers = ["Symbol", "Direction", "Source", "Primary Strike", "Confidence", "Trigger", "Plan", "Current Premium",
                "Entry Zone", "Stop Loss", "Target 1", "Target 2", "Saved Entry / Drift %", "POP %",
                "Expiry", "DTE"]
 
@@ -4179,6 +4206,7 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
             f'<td style="font-weight:700;">{strike_disp}</td>',
             f'<td style="white-space:nowrap;"><span style="color:{conf_color};font-weight:700;">'
             f'{conf_dot} {_fmt_score(conf)}</span></td>',
+            f'<td>{_fmt_trigger(r)}</td>',
             f'<td>{_fmt_plan_status(r)}</td>',
             f'<td>{_fmt_current_premium(r)}</td>',
             f'<td>{_fmt_entry_zone(r.get("entry_zone"))}</td>',
@@ -4783,7 +4811,9 @@ def _dore_options_panel():
                            f"Live as of {_snap_ist_str} IST.")
             st.markdown(_dore_options_plan_table_html(dore_opt_df, scan_time=(dore_opt_meta or {}).get("created_at")),
                         unsafe_allow_html=True)
-            st.caption("Showing Confidence ≥ 70 (stocks) / ≥ 50 (NIFTY/BANKNIFTY/SENSEX) only. "
+            st.caption("Showing Confidence ≥ 70 (stocks) / ≥ 50 (NIFTY/BANKNIFTY/SENSEX), AND Triggered "
+                       "(current premium inside the entry zone right now) only — Waiting candidates "
+                       "(qualified but not yet at their entry price) are hidden from this table. "
                        "🟢 Confidence ≥75 · 🔵 ≥55–74 (n/a below the source's own floor here) — "
                        "DORE's own final_score, blending qualification, direction strength, and "
                        "premium/liquidity validation into one ranking. Source: PB = Pre-Breakout "
