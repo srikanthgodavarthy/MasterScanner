@@ -2482,6 +2482,14 @@ def _active_setups_zero_days_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
     so it can't cover all three sources here anyway). TARGET is
     t1_locked, the same frozen T1 level the Scanner page's Active
     Setups tab shows.
+
+    [2026-09-08, SG request] SOURCE / ENTRY now shows one badge PER
+    contributing source (LS/CV4, PB, MOM, FP), each stacked with its
+    OWN individually-recorded entry price — matching pages/scanner.py's
+    _ap_source_badges_with_entries() exactly (same colours/labels/
+    fallback rule), not just the plan's single winning source/
+    entry_locked like before. Duplicated locally rather than imported
+    from pages.scanner — see the _SRC_COLOR comment below for why.
     """
     from utils.setup_persistence import compute_pnl_pct, _compute_days_active
 
@@ -2540,6 +2548,8 @@ def _active_setups_zero_days_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
         rows.append({
             "Symbol":  sym,
             "Source":  str(getattr(p, "source", "") or "LS").upper().strip(),
+            "ContribSources": getattr(p, "contributing_sources", "") or "",
+            "SourceEntries":  getattr(p, "source_entries", "") or "",
             "PctChg":  live.get("pct_chg"),
             "Entry":   getattr(p, "entry_locked", 0.0) or 0.0,
             "Drift":   compute_pnl_pct(getattr(p, "entry_locked", 0.0), cmp_px) if cmp_px else None,
@@ -2565,11 +2575,52 @@ def _active_setups_zero_days_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
     # _ap_one_source_badge(), see that docstring for why. Internal
     # source code (r["Source"], DB values, filters) is untouched.
     _SRC_LABEL = {"LS": "CV4"}
+
     def _src_badge(src: str) -> str:
         clr = _SRC_COLOR.get(src, "#58a6ff")   # default: LS
         label = _SRC_LABEL.get(src, src)
         return (f'<span style="background:{clr};color:#0d1117;font-weight:700;'
                 f'font-size:9px;border-radius:3px;padding:0px 5px;">{label}</span>')
+
+    def _ordered_sources(source: str, contributing: str) -> list[str]:
+        primary = str(source or "LS").upper().strip()
+        all_srcs = [primary] + [s.strip().upper() for s in str(contributing or "").split(",") if s.strip()]
+        seen, ordered = set(), []
+        for s in all_srcs:
+            if s and s not in seen:
+                seen.add(s)
+                ordered.append(s)
+        return ordered
+
+    # [2026-09-08, SG request] One badge PER contributing source, each
+    # stacked with its OWN individually-recorded entry price — matches
+    # pages/scanner.py's _ap_source_badges_with_entries() (same
+    # colours/labels/fallback rule: a source missing from source_
+    # entries — plans that corroborated before this field existed —
+    # falls back to this plan's one shared entry_locked instead of a
+    # blank). Duplicated locally rather than imported cross-page — see
+    # the _SRC_COLOR comment further up for why.
+    def _source_badges_with_entries(source: str, contributing: str, source_entries_json: str, fallback_entry: float) -> str:
+        import json as _json
+        try:
+            entries = {str(k).upper(): float(v) for k, v in _json.loads(source_entries_json or "{}").items() if v}
+        except Exception:
+            entries = {}
+
+        def _epx(v):
+            try:
+                return f"{float(v):,.2f}" if float(v) > 0 else "—"
+            except (TypeError, ValueError):
+                return "—"
+
+        cells = []
+        for s in _ordered_sources(source, contributing):
+            px = entries.get(s, fallback_entry)
+            cells.append(
+                f'<div style="margin-bottom:2px;">{_src_badge(s)} '
+                f'<span style="font-size:11px;">{_epx(px)}</span></div>'
+            )
+        return "".join(cells)
 
     rows_html = ""
     for _, r in df.iterrows():
@@ -2581,15 +2632,15 @@ def _active_setups_zero_days_html(df_aug: pd.DataFrame, top_n: int = 8) -> str:
         # bug: PPLPHARMA genuinely has two separate open plans today
         # (PB @ 229.14, MOM @ 228.00), which this table had no way to
         # distinguish since it never showed Source at all. Combined
-        # Source+Entry cell below (source label, entry price right
-        # under it) makes that visible instead of removing the row —
-        # removing either row would hide a real open trade.
+        # Source+Entry cell below (one badge per contributing source,
+        # each with its own individually-recorded entry price) makes
+        # that visible instead of removing the row — removing either
+        # row would hide a real open trade.
         rows_html += (
             "<tr>"
             f'<td><span class="sr-sector-name" style="font-weight:700;" title="{r["Symbol"]}">{_tv_link(r["Symbol"])}</span></td>'
             + (f'<td class="{"sr-pos" if chg >= 0 else "sr-neg"}">{"+" if chg >= 0 else ""}{chg:.2f}%</td>' if chg_ok else '<td style="color:#8b949e;">—</td>')
-            + (f'<td>{_src_badge(r["Source"])}<br>'
-               f'<span style="font-size:11px;">{f"{r["Entry"]:,.2f}" if r["Entry"] else "—"}</span></td>')
+            + (f'<td>{_source_badges_with_entries(r["Source"], r["ContribSources"], r["SourceEntries"], r["Entry"])}</td>')
             + (f'<td class="{"sr-pos" if r["Drift"] >= 0 else "sr-neg"}">{"+" if r["Drift"] >= 0 else ""}{r["Drift"]:.2f}%</td>' if drift_ok else '<td style="color:#8b949e;" title="Not in today\'s scan">—</td>')
             + f'<td>{f"{r["Target"]:,.2f}" if r["Target"] else "—"}</td>'
             "</tr>"
