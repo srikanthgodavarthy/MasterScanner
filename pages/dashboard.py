@@ -1414,6 +1414,45 @@ _CSS = """
 .ni-signal-confirm { color: var(--green); }
 .ni-signal-contradict { color: var(--red); }
 
+/* ── 2026-09-09: News Impact visual refresh + price-reaction context ── */
+
+/* Summary strip — sentiment counts + top sectors, sits above .ni-panel */
+.ni-summary-strip {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 14px; flex-wrap: wrap; padding: 0 4px 12px; font-size: 11.5px;
+}
+.ni-sum-counts { display: flex; gap: 16px; }
+.ni-sum-chip { font-weight: 600; white-space: nowrap; }
+.ni-sum-chip b { font-size: 13px; margin-right: 3px; }
+.ni-sum-sectors { display: flex; gap: 8px; flex-wrap: wrap; }
+.ni-sum-sector {
+  color: var(--muted); font-size: 10.5px; background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border); border-radius: 10px; padding: 2px 8px;
+  white-space: nowrap;
+}
+
+/* Card-row treatment — a sentiment-colored left accent on every row so
+   bullish/bearish reads down the column at a glance, plus a soft
+   rounded corner so each row feels like its own card rather than a flat
+   spreadsheet line. Kept subtle: existing padding/borders/hover/
+   alternating-tint rules are untouched, this only adds the accent. */
+.ni-row {
+  border-left: 3px solid transparent;
+  border-radius: 6px;
+}
+.ni-row.ni-row-pos   { border-left-color: var(--green); }
+.ni-row.ni-row-neg   { border-left-color: var(--red); }
+.ni-row.ni-row-neu   { border-left-color: var(--border); }
+.ni-row.ni-row-limit { border-left-color: #d29922; }
+
+.ni-event-icon { margin-right: 3px; }
+
+/* Per-symbol price-reaction context — tiny sparkline + "% since this
+   story broke" badge, stacked beneath the symbol chip + day-%chg. */
+.ni-reaction-wrap {
+  display: flex; align-items: center; gap: 4px; margin-top: 2px;
+}
+
 /* ══════════════════════════════════════════════════════════════════
    MOBILE — 2026-07-20. Two breakpoints: 640px (small tablet / large
    phone landscape) and 480px (phone portrait, the common case for this
@@ -2589,6 +2628,140 @@ def _news_ago(published) -> str:
         return ""
 
 
+# ── 2026-09-09: per-story price-reaction context ────────────────────
+# "How has the market actually reacted since this story broke" -- a
+# short sparkline of the primary matched symbol's recent daily closes,
+# plus the %change from the close on/just before the headline's date to
+# the latest available close. Deliberately scoped to daily closes (not
+# a backtested news-outcome study, which would need a much larger
+# historical news+price dataset than this app has) -- this answers "did
+# the stock actually move the way the read suggests" for THIS specific
+# story, using data already available via utils.market_data.
+
+_NI_EVENT_ICONS = {
+    "Earnings": "📊", "Order/Contract": "📝", "Regulatory/Legal": "⚖️",
+    "Rating/Brokerage": "🏦", "Promoter/Insider": "👤", "M&A": "🤝",
+    "Macro/Policy": "🌐", "Corporate Action": "🏢", "Other": "•",
+}
+
+_NI_ROW_SENT_CLASS = {
+    "Positive": "ni-row-pos", "Negative": "ni-row-neg",
+    "Neutral": "ni-row-neu", "RateLimited": "ni-row-limit",
+}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _ni_price_reaction(symbol: str, headline_date_str: str) -> dict | None:
+    """Cached: {"since_pct": float, "spark": [close, ...]} for `symbol`
+    around `headline_date_str` (YYYY-MM-DD, IST calendar date -- a plain
+    date string rather than the RSS entry's exact publish timestamp so
+    every headline from the same trading day shares one cache entry
+    instead of one per second). since_pct is the %change from the last
+    close on/before that date to the latest available close. Returns
+    None on any fetch/data failure -- callers render nothing rather than
+    a broken badge; this is supporting context, never load-bearing.
+    """
+    from utils.market_data import fetch_ohlcv
+    df = fetch_ohlcv(symbol, period="3mo", interval="1d")
+    if df is None or df.empty or "close" not in df.columns:
+        return None
+    closes = df["close"].dropna()
+    if len(closes) < 2:
+        return None
+    try:
+        headline_ts = pd.Timestamp(headline_date_str)
+    except Exception:
+        return None
+    prior = closes[closes.index.normalize() <= headline_ts.normalize()]
+    prior_close = prior.iloc[-1] if not prior.empty else closes.iloc[0]
+    latest_close = closes.iloc[-1]
+    if not prior_close or pd.isna(prior_close) or pd.isna(latest_close):
+        return None
+    since_pct = (latest_close - prior_close) / prior_close * 100
+    return {"since_pct": float(since_pct), "spark": closes.tail(12).tolist()}
+
+
+def _ni_sparkline_svg(values: list[float], color: str = "#8b949e",
+                       width: int = 52, height: int = 16) -> str:
+    """Tiny inline SVG sparkline -- deliberately small/muted so it reads
+    as supporting context next to a headline, not a competing focal
+    point. Same polyline approach as pages/history.py's _sparkline_svg
+    (kept as a separate local copy rather than a cross-page import, same
+    reasoning as this file's own _tv_link/_daychg_badge docstrings)."""
+    if not values or len(values) < 2:
+        return ""
+    mn, mx = min(values), max(values)
+    rng = mx - mn if mx != mn else 1.0
+    n = len(values)
+    pts = []
+    for i, v in enumerate(values):
+        x = i / (n - 1) * width
+        y = height - ((v - mn) / rng) * (height - 4) - 2
+        pts.append(f"{x:.1f},{y:.1f}")
+    polyline = " ".join(pts)
+    return (
+        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+        f'xmlns="http://www.w3.org/2000/svg" style="display:block;">'
+        f'<polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="1.3"/>'
+        f'</svg>'
+    )
+
+
+def _ni_reaction_html(reaction: dict | None) -> str:
+    """Sparkline + '<sign>X.XX% since' badge for one matched symbol, or
+    '' if no reaction context is available for it."""
+    if not reaction:
+        return ""
+    v = reaction["since_pct"]
+    color = "#3fb950" if v > 0 else "#f85149" if v < 0 else "#8b949e"
+    sign = "+" if v > 0 else ""
+    spark = _ni_sparkline_svg(reaction["spark"], color=color)
+    badge = (
+        f'<span style="color:{color};font-size:9px;font-weight:700;white-space:nowrap;" '
+        f'title="Price change since this story broke">{sign}{v:.2f}% since</span>'
+    )
+    return f'<div class="ni-reaction-wrap">{spark}{badge}</div>'
+
+
+def _news_summary_strip_html(items: list[dict]) -> str:
+    """At-a-glance strip above the table: sentiment counts across the
+    currently shown headlines, plus which sectors are showing up most --
+    lets you gauge 'is the tape net bullish or bearish right now' in one
+    glance before reading any individual row. Computed off the same
+    `items` list already rendered below -- no extra fetch/classification
+    cost."""
+    if not items:
+        return ""
+    counts = {"Positive": 0, "Negative": 0, "Neutral": 0}
+    sector_counts: dict[str, int] = {}
+    for it in items:
+        s = it.get("sentiment")
+        if s in counts:
+            counts[s] += 1
+        sec = it.get("sector")
+        if sec:
+            sector_counts[sec] = sector_counts.get(sec, 0) + 1
+    top_sectors = sorted(sector_counts.items(), key=lambda kv: -kv[1])[:4]
+
+    def _count_chip(label, n, color):
+        return f'<span class="ni-sum-chip" style="color:{color};"><b>{n}</b> {label}</span>'
+
+    chips = (
+        _count_chip("Bullish", counts["Positive"], "#3fb950")
+        + _count_chip("Bearish", counts["Negative"], "#f85149")
+        + _count_chip("Neutral", counts["Neutral"], "#8b949e")
+    )
+    sector_html = "".join(
+        f'<span class="ni-sum-sector">{sec} · {n}</span>' for sec, n in top_sectors
+    )
+    return (
+        '<div class="ni-summary-strip">'
+        f'<div class="ni-sum-counts">{chips}</div>'
+        + (f'<div class="ni-sum-sectors">{sector_html}</div>' if sector_html else "")
+        + '</div>'
+    )
+
+
 def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
     # Symbol -> %Chg lookup, built once, reused for every matched-ticker
     # chip below -- reuses the scan's own already-computed %Chg column
@@ -2627,8 +2800,10 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
         event_type = item.get("event_type")
         magnitude = item.get("magnitude")
         mag_class = f"ni-mag-{magnitude.lower()}" if magnitude else ""
+        event_icon = _NI_EVENT_ICONS.get(event_type, "")
         impact_extra = (
-            f'<span class="ni-event-type">{event_type}</span>' if event_type else ""
+            f'<span class="ni-event-type"><span class="ni-event-icon">{event_icon}</span>{event_type}</span>'
+            if event_type else ""
         )
         confidence_html = (
             f'<span class="ni-confidence {mag_class}">{magnitude}</span>'
@@ -2680,13 +2855,6 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
         # elsewhere inline, e.g. Top Gainers) — the stacking is done here
         # by wrapping each symbol's link + badge in its own flex-column
         # cell.
-        stock_chips_html = (
-            "".join(
-                f'<div class="ni-stock-cell">{_tv_link(s, css_class="ni-symbol-chip")}{_daychg_badge(_chg_lookup.get(str(s)))}</div>'
-                for s in symbols[:4]
-            )
-            if symbols else '<span class="ni-rec-dash">—</span>'
-        )
         # 2026-07-18 FIX: item["published"] is UTC (see news_feed.py) —
         # convert to IST before formatting, same as every other displayed
         # time in this app (_now_ist()), instead of printing the raw UTC
@@ -2695,6 +2863,28 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
             item["published"].astimezone(_IST).strftime("%I:%M %p")
             if item.get("published") else "—"
         )
+        headline_date_str = (
+            item["published"].astimezone(_IST).strftime("%Y-%m-%d")
+            if item.get("published") else None
+        )
+
+        # 2026-09-09: price-reaction context (sparkline + "% since this
+        # story broke") on the FIRST matched symbol only -- that's the
+        # story's primary subject; adding it to all 4 would be visual
+        # noise for a headline that's really about one stock, and blows
+        # up the fetch count for no added read.
+        cell_htmls = []
+        for si, s in enumerate(symbols[:4]):
+            reaction = (
+                _ni_price_reaction(str(s), headline_date_str)
+                if si == 0 and headline_date_str else None
+            )
+            cell_htmls.append(
+                f'<div class="ni-stock-cell">{_tv_link(s, css_class="ni-symbol-chip")}'
+                f'{_daychg_badge(_chg_lookup.get(str(s)))}'
+                f'{_ni_reaction_html(reaction)}</div>'
+            )
+        stock_chips_html = "".join(cell_htmls) if symbols else '<span class="ni-rec-dash">—</span>'
 
 
         horizon = item.get("horizon")
@@ -2705,9 +2895,10 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
         # the text color, so the dot and word always agree; purely a
         # stronger at-a-glance scan cue down the column, no new signal.
         impact_dot_html = f'<span class="ni-impact-dot {impact_class}"></span>'
+        row_sent_class = _NI_ROW_SENT_CLASS.get(sentiment, "ni-row-neu")
 
         rows.append(f"""
-<div class="ni-grid ni-row" title="{row_tooltip}">
+<div class="ni-grid ni-row {row_sent_class}" title="{row_tooltip}">
   <div class="ni-time">{time_label}</div>
   <div class="ni-sector">{sector_label}</div>
   <div class="ni-stocks">{stock_chips_html}</div>
@@ -2821,9 +3012,13 @@ def _news_impact_panel():
 </div>"""
     # 2026-07-28: was behind an st.expander("Show detailed news impact
     # table …") — now always rendered open, per request.
+    # 2026-09-09: summary strip (bullish/bearish/neutral counts + top
+    # sectors) added above the table -- a one-glance read of "is the tape
+    # net bullish or bearish right now" before scanning individual rows.
     st.markdown(
         '<div class="ni-title" style="margin-bottom:6px;">'
         'Detailed news impact (Confidence · Recommendation · Current State)</div>'
+        f'{_news_summary_strip_html(items[:_CLASSIFY_CAP])}'
         f'<div class="ni-panel">{header_html}'
         f'{_news_impact_rows_html(items[:_CLASSIFY_CAP], scan_df)}</div>',
         unsafe_allow_html=True,
