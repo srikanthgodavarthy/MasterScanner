@@ -761,6 +761,7 @@ def _fetch_live_prices(symbols: tuple) -> dict:
         return {}
 
     result = {}
+    dropped_partial = []
     single = len(tickers) == 1
     for sym, ticker in zip(symbols, tickers):
         try:
@@ -771,7 +772,7 @@ def _fetch_live_prices(symbols: tuple) -> dict:
             df.index   = _strip_tz(pd.to_datetime(df.index))
             df.columns = [c.lower() for c in df.columns]
             last = df.iloc[-1]
-            result[sym] = {
+            candidate = {
                 "date":   df.index[-1],
                 "open":   float(last["open"]),
                 "high":   float(last["high"]),
@@ -779,8 +780,36 @@ def _fetch_live_prices(symbols: tuple) -> dict:
                 "close":  float(last["close"]),
                 "volume": float(last["volume"]),
             }
+            # [2026-09-09] dropna(how="all") only catches a row that's NaN
+            # in EVERY column — it lets a PARTIAL row through (e.g. close
+            # populated but high/low not yet ticked), which is common on a
+            # still-forming intraday bar fetched via the multi-ticker batch
+            # path. float(nan) doesn't raise, so that NaN used to sail
+            # straight through into `result` and then get written onto the
+            # cached last bar by _patch_live_prices() — which is exactly
+            # what compute_bar()'s NaN guard (scoring_core.py) was silently
+            # tripping on for ~30% of the universe every scan cycle,
+            # logged only as an "unexpected" compute_bar-returned-None
+            # warning with no link back to this being the actual cause.
+            # Reject the whole quote here instead of patching a bad value
+            # in: the caller (_patch_live_prices) just falls back to
+            # yesterday's cached bar for this symbol this cycle, which is
+            # stale but never NaN.
+            if any(np.isnan(v) for v in (
+                candidate["open"], candidate["high"], candidate["low"],
+                candidate["close"], candidate["volume"],
+            )) or candidate["close"] <= 0:
+                dropped_partial.append(sym)
+                continue
+            result[sym] = candidate
         except Exception:
             continue
+    if dropped_partial:
+        _log.warning(
+            "_fetch_live_prices: dropped %d partial/NaN live quote(s) "
+            "(kept prior cached bar instead of patching a NaN value): %s",
+            len(dropped_partial), sorted(dropped_partial),
+        )
     return result
 
 
