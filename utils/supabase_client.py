@@ -1591,6 +1591,73 @@ def load_premium_history_snapshots() -> list[dict]:
         return []
 
 
+# ─── DORE IV HISTORY (daily ATM CE/PE IV, for iv_rank/iv_percentile) ──────────
+
+def save_iv_history_snapshot(rows: list[dict]) -> bool:
+    """Batch-upsert today's ATM CE/PE IV rows into dore_iv_history —
+    one row per (symbol, trade_date); a second call the same day
+    overwrites with the latest reading rather than inserting a
+    duplicate (same "last observation of the day wins" convention
+    utils.iv_history_store documents)."""
+    if not rows:
+        return True
+    if not db.is_available():
+        return False
+    try:
+        db.upsert_rows("dore_iv_history", rows, conflict_cols=["symbol", "trade_date"])
+        return True
+    except Exception as exc:
+        logger.error("save_iv_history_snapshot failed: %s", exc)
+        return False
+
+
+def load_iv_history(symbol: str, lookback_days: int = 252) -> list[dict]:
+    """Trailing daily ATM IV history for one symbol, oldest first,
+    EXCLUDING today (utils.iv_history_store.get_iv_rank_percentile()
+    is called with today's own freshly-fetched reading — it should
+    never rank/percentile today's value against a row that includes
+    itself). `lookback_days` is a calendar-day window (matches how
+    other retention here is expressed, e.g. prune_iv_history below),
+    not a strict trading-day count — a stock with 252 calendar days of
+    history has somewhat fewer than 252 trading-day observations, which
+    is fine for a rank/percentile read."""
+    if not db.is_available():
+        return []
+    try:
+        from datetime import timedelta as _td
+        today = date.today()
+        cutoff = (today - _td(days=lookback_days)).isoformat()
+        return db.fetch_all(
+            """SELECT trade_date, atm_iv, ce_iv, pe_iv FROM dore_iv_history
+               WHERE symbol = %s AND trade_date >= %s AND trade_date < %s
+               ORDER BY trade_date ASC""",
+            (symbol, cutoff, today.isoformat()),
+        )
+    except Exception as exc:
+        logger.warning("load_iv_history(%s) failed (non-fatal — no rank/percentile this call): %s", symbol, exc)
+        return []
+
+
+def prune_iv_history(keep_days: int = 400) -> Optional[int]:
+    """Deletes dore_iv_history rows older than `keep_days` calendar
+    days. 400, not 252 — a little slack past the ~1y rank/percentile
+    window so a symbol sitting right at the edge doesn't flicker
+    between having and not having a full year of history from one
+    day's retention run to the next."""
+    if not db.is_available():
+        return None
+    try:
+        from datetime import timezone as _tz, timedelta as _td
+        cutoff = (datetime.now(_tz.utc) - _td(days=keep_days)).date().isoformat()
+        n = db.execute("DELETE FROM dore_iv_history WHERE trade_date < %s", (cutoff,))
+        if n:
+            logger.info("prune_iv_history: deleted %s row(s) older than %s", n, cutoff)
+        return n
+    except Exception:
+        logger.exception("prune_iv_history failed (non-fatal)")
+        return None
+
+
 # ─── ROTATE FLAGS ─────────────────────────────────────────────────────────────
 
 def upsert_rotate_flags(flags: list[dict]) -> dict[str, str]:
@@ -2234,6 +2301,24 @@ CREATE TABLE IF NOT EXISTS dore_premium_history (
     pe_h3            numeric,
     updated_at       timestamptz NOT NULL DEFAULT now()
 );
+
+-- [2026-09-10, SG request: IV skew + IVContext] Daily ATM CE/PE IV
+-- history — one row per (symbol, trade_date), NOT the single-latest-
+-- row-per-key shape dore_oi_baseline/dore_premium_history use above.
+-- utils.iv_history_store.get_iv_rank_percentile() needs a genuine
+-- trailing window (up to a year of daily observations) to compute
+-- iv_rank/iv_percentile, unlike OI's same-day-only baseline reset or
+-- premium's 4-poll intraday window — see that module's own docstring.
+CREATE TABLE IF NOT EXISTS dore_iv_history (
+    symbol      text        NOT NULL,
+    trade_date  date        NOT NULL,
+    atm_iv      numeric,
+    ce_iv       numeric,
+    pe_iv       numeric,
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (symbol, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_dore_iv_history_symbol_date ON dore_iv_history(symbol, trade_date DESC);
 """
 
 SCHEMA_SQL += """

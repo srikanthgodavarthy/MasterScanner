@@ -798,6 +798,23 @@ def compute_dore_technical_plans(cfg: Optional[DoreOptionsSettings] = None,
                                squeeze_release_symbols=squeeze_release_symbols)
     rejections = df.attrs.get("dore_rejections", [])
 
+    # [IV history, 2026-09-10, SG request] Cycle-completion flush of
+    # this cycle's RAM-buffered ATM IV readings (recorded per-symbol
+    # inside compute_dore_trade_plan() as each candidate's option chain
+    # was fetched, above) — same "once per full scan cycle, not per
+    # symbol" placement utils.oi_snapshot_store.flush_to_supabase()
+    # documents for its own callers, just a NEW wiring point here since
+    # this pipeline (utils.dore_options_engine, live for both stocks
+    # and indices) never used oi_snapshot_store's OI/premium trackers
+    # in the first place — those are exclusively the dore_engine.py/
+    # fo_scan.py side's own mechanism. Fire-and-forget background
+    # thread; never blocks or fails this cycle.
+    try:
+        from utils.iv_history_store import flush_to_supabase as _flush_iv_history
+        _flush_iv_history()
+    except Exception:
+        logger.exception("[dore_technical] IV history flush failed to even start (non-fatal)")
+
     invalid = find_invalid_columns(df)
     if invalid:
         logger.warning("[dore_technical] invalid numeric values (NaN/inf) before snapshot save — %s", invalid)

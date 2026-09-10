@@ -197,6 +197,19 @@ class DoreOptionsSettings:
     iv_high_capture_adjust: float = -0.08   # high IV -> closer strikes
     iv_low_capture_adjust:  float = +0.05   # low IV -> further OTM allowed
 
+    # [2026-09-10, SG request: IV skew] Same-day ATM CE-vs-PE IV spread
+    # (percentage points) needed before OptionTradePlan.iv_skew_caution
+    # fires a note — see _iv_skew_caution()'s docstring for the two
+    # distinct cases (directional hedging-demand caution vs paying a
+    # rich vol premium on the leg being bought) this single threshold
+    # gates. Purely observational: never rejects a plan, never changes
+    # direction() or select_strikes()'s output — see that function's
+    # NON-GATING note. 3.0pp chosen as "clearly outside typical
+    # baseline put-skew noise" without a historical skew-of-skew series
+    # to calibrate against yet; revisit once dore_iv_history has enough
+    # depth to check empirically.
+    iv_skew_caution_threshold_pp: float = 3.0
+
     capture_ratio_floor: float = 0.15
     capture_ratio_ceiling: float = 0.95
 
@@ -881,6 +894,14 @@ class OptionChainSnapshot:
     pcr:             Optional[float] = None
     ce_wall_strike:  Optional[float] = None
     pe_wall_strike:  Optional[float] = None
+    # [2026-09-10, SG request: CE/PE IV] ATM-leg IV, straight from
+    # fetch_stock_atm_option()/fetch_oi_resistance()'s Greeks lookup —
+    # None whenever Upstox didn't return option_greeks for that leg
+    # (DORE's existing "unavailable, treat as neutral" convention, same
+    # as ce_delta/pe_delta upstream). Diagnostic only as of this change —
+    # see OptionTradePlan.iv_skew's docstring for what reads it.
+    ce_iv:           Optional[float] = None
+    pe_iv:           Optional[float] = None
 
     @staticmethod
     def from_upstox(option_data: dict, dte: int) -> "OptionChainSnapshot":
@@ -904,6 +925,12 @@ class OptionChainSnapshot:
             # ce_wall_strike/pe_wall_strike) is unchanged.
             ce_wall_strike=option_data.get("ce_wall_strike", option_data.get("ce_strike")),
             pe_wall_strike=option_data.get("pe_wall_strike", option_data.get("pe_strike")),
+            # [2026-09-10, SG request] Both fetch_stock_atm_option() and
+            # fetch_oi_resistance() now return these as separate keys
+            # (see utils.upstox_client's 2026-09-10 fix for the index
+            # side, which used to collapse them into one blended "iv").
+            ce_iv=option_data.get("ce_iv"),
+            pe_iv=option_data.get("pe_iv"),
         )
 
 
@@ -1169,6 +1196,36 @@ class OptionTradePlan:
                                                      # SMC read (order blocks + compute_smc_state) actually
                                                      # ran on this call, regardless of whether it ended up
                                                      # deciding dir_ or only gating/anchoring it.
+
+    # [IV skew, 2026-09-10, SG request] Same-day ATM CE-vs-PE IV spread
+    # — a genuinely different signal source from the SMC/futures/EMA
+    # direction reads above (options positioning/hedging flow, not
+    # price action), so this is a complementary cross-check, not a
+    # re-derivation of the same thing under a new name. NON-GATING,
+    # same as direction_source/structural_data_source above: never
+    # overrides dir_ or rejects a plan the way structural_state's
+    # STRUCTURAL_INVALIDATION does — purely a caveat surfaced next to
+    # the plan. None/None/None whenever chain.ce_iv or chain.pe_iv is
+    # unavailable (Upstox returned no Greeks this cycle) — never
+    # fabricated. See _iv_skew_caution()'s docstring for exactly what
+    # each of the two caution cases means.
+    iv_skew:                Optional[float] = None   # ce_iv - pe_iv, percentage points;
+                                                        # positive = calls relatively richer
+    iv_skew_caution:        Optional[str]   = None   # human-readable caution note, or None
+                                                        # when skew is within iv_skew_caution_threshold_pp
+                                                        # or either leg's IV is unavailable
+
+    # [IVContext activation, 2026-09-10, SG request] Diagnostics for
+    # whether this plan's select_strikes() call actually got a
+    # non-no-op IVContext this cycle — see utils.iv_history_store's
+    # module docstring for where iv_rank/iv_percentile come from.
+    # Restates IVContext's own two fields at the top level (same
+    # "callers shouldn't have to reach into a nested object" rationale
+    # as current_premium/leadership/etc. above) so utils/dore_options_
+    # persistence.py's row.get("iv_rank") pattern works without special-
+    # casing a nested dataclass — matches cv4_leadership etc.'s own note.
+    iv_rank:                 Optional[float] = None
+    iv_percentile:           Optional[float] = None
 
     @property
     def structural_available(self) -> bool:
@@ -1585,6 +1642,53 @@ def _probability_of_profit(offset: float, expected_move: float) -> float:
     simple/explainable — not a Black-Scholes delta model."""
     z = abs(offset) / expected_move if expected_move > 0 else 1.0
     return max(5.0, min(95.0, 100.0 * 0.5 * math.erfc(z / math.sqrt(2))))
+
+
+def _iv_skew_caution(ce_iv: Optional[float], pe_iv: Optional[float], dir_: str,
+                      settings: DoreOptionsSettings) -> Optional[str]:
+    """
+    Same-day ATM CE-vs-PE IV skew, read as a caveat against a plan's
+    direction — a genuinely different signal source from the SMC/
+    futures/EMA reads that decide dir_ (options positioning/hedging
+    flow, not price action). Returns None (no caution) when either
+    leg's IV is missing or the skew is within
+    settings.iv_skew_caution_threshold_pp of flat. NEVER changes dir_,
+    NEVER rejects the plan — purely a note surfaced alongside it (see
+    OptionTradePlan.iv_skew_caution's docstring).
+
+    Two distinct cases, both read off the same skew number:
+      1. DIRECTIONAL CAUTION — the OTHER leg's IV is materially
+         elevated (buying CE while PE IV is rich, or buying PE while
+         CE IV is rich): the options market is still pricing hedging
+         demand against the move this plan is betting on.
+      2. LEG-QUALITY CAUTION — the leg actually being bought is itself
+         materially richer than the other leg: buying that contract
+         means paying an elevated vol premium specifically on it,
+         independent of whether the direction call is right — this is
+         "is the specific contract worth buying", not "is the
+         direction right".
+    A skew in between (neither leg materially richer) or below
+    threshold in both directions returns None.
+    """
+    if ce_iv is None or pe_iv is None:
+        return None
+    skew = ce_iv - pe_iv   # positive = calls relatively richer
+    thresh = settings.iv_skew_caution_threshold_pp
+    if dir_ == CE:
+        if -skew >= thresh:
+            return (f"Put IV {pe_iv:.1f} vs Call IV {ce_iv:.1f} ({-skew:.1f}pp put skew) — "
+                     "options market still pricing hedging demand against this bullish move")
+        if skew >= thresh:
+            return (f"Call IV {ce_iv:.1f} vs Put IV {pe_iv:.1f} ({skew:.1f}pp) — "
+                     "paying an elevated vol premium on the leg being bought")
+    elif dir_ == PE:
+        if skew >= thresh:
+            return (f"Call IV {ce_iv:.1f} vs Put IV {pe_iv:.1f} ({skew:.1f}pp call skew) — "
+                     "options market still pricing hedging demand against this bearish move")
+        if -skew >= thresh:
+            return (f"Put IV {pe_iv:.1f} vs Call IV {ce_iv:.1f} ({-skew:.1f}pp) — "
+                     "paying an elevated vol premium on the leg being bought")
+    return None
 
 
 def select_strikes(
@@ -2473,6 +2577,38 @@ def compute_dore_trade_plan(
         direction_source = "Futures-EMA" if futures_confirmation_used else "Spot-EMA"
     chain = OptionChainSnapshot.from_upstox(option_data, dte)
 
+    # [IV skew + IVContext activation, 2026-09-10, SG request] ─────────
+    # Same-day skew caution is always computed (chain.ce_iv/pe_iv are
+    # either both present, one present, or both None — _iv_skew_caution
+    # handles all three, returning None whenever either leg is missing).
+    #
+    # IVContext self-population is gated on `iv is None` — i.e. only
+    # when the CALLER didn't already supply one. Preserves IVContext's
+    # original pluggable-override design intent (a future/test caller
+    # can still inject known values) while making this function
+    # self-sufficient for the live path: utils.dore_options_scan's
+    # top_dore_trade_plans() has no usable IV data at the point it would
+    # need to build its own iv_lookup (option chains aren't fetched
+    # until per-symbol, inside THIS function) — self-computing here,
+    # from the chain this call just fetched, sidesteps that chicken-
+    # and-egg staging problem entirely rather than requiring a second
+    # fetch pass upstream.
+    _iv_skew = (chain.ce_iv - chain.pe_iv) if (chain.ce_iv is not None and chain.pe_iv is not None) else None
+    _iv_skew_note = _iv_skew_caution(chain.ce_iv, chain.pe_iv, dir_, settings)
+    if iv is None:
+        _atm_iv = (
+            (chain.ce_iv + chain.pe_iv) / 2.0 if chain.ce_iv is not None and chain.pe_iv is not None
+            else chain.ce_iv if chain.ce_iv is not None else chain.pe_iv
+        )
+        try:
+            from utils.iv_history_store import get_iv_rank_percentile, record_iv
+            iv = get_iv_rank_percentile(sig.symbol, _atm_iv)
+            record_iv(sig.symbol, chain.ce_iv, chain.pe_iv)
+        except Exception:
+            logger.warning("[DORE Options:%s] IV history lookup/record failed (non-fatal, "
+                            "IVContext stays no-op this call)", sig.symbol, exc_info=True)
+            iv = IVContext()
+
     strikes = select_strikes(sig, dte, dir_, confidence, settings, strike_interval=chain.strike_interval, iv=iv)
     _pre_structural_conservative_strike = strikes[CONSERVATIVE]["strike"]
 
@@ -2837,6 +2973,7 @@ def compute_dore_trade_plan(
             f"— Structural R:R {_structural_risk_reward:.2f}"]
            if _structural_risk_reward is not None else [])
         + (["Target capped by structural liquidity/FVG boundary"] if _structural_target_capped else [])
+        + ([_iv_skew_note] if _iv_skew_note else [])
     )
 
     # ── 2-day move-potential shadow metric ───────────────────────
@@ -2960,6 +3097,11 @@ def compute_dore_trade_plan(
         # [SMC-on-Futures direction, 2026-09-10]
         direction_source=direction_source,
         structural_data_source=_smc_source,
+        # [IV skew + IVContext activation, 2026-09-10]
+        iv_skew=round(_iv_skew, 2) if _iv_skew is not None else None,
+        iv_skew_caution=_iv_skew_note,
+        iv_rank=iv.iv_rank if iv is not None else None,
+        iv_percentile=iv.iv_percentile if iv is not None else None,
     )
 
 
