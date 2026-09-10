@@ -461,6 +461,29 @@ def _dore_live_state_payload(raw: dict):
     return raw, len((raw or {}).get("live_state", []))
 
 
+# ── Index DORE 2.0 — every 60s ───────────────────────────────────────
+# [2026-09-09, SG request — restore, but keep it OUT of Market
+# Intelligence] Revives the job 2a6eb81 (2026-09-08) removed, on the
+# reasoning it was "pure duplication" of DORE Options' own index
+# coverage. Not quite: utils.dore_engine.py ("DORE 2.0") carries an
+# IV-crush/event-risk hard gate and a distinct Option Intelligence
+# Score stage that utils.dore_options_engine.py (the live Options
+# pipeline) doesn't have, plus the fuller weighted futures Stage 1
+# (PR1-PR4, 2026-09-02 to 09-07) that was built specifically onto
+# dore_engine.py at SG's original request — this job was its only live
+# caller. Points at utils.index_dore_job now (a fresh, standalone
+# module), NOT utils.market_intelligence — SG asked explicitly to
+# avoid re-coupling to Market Intelligence / the Dashboard index cards
+# this time; see that new module's own docstring for the full story.
+def _index_dore_compute():
+    from utils.index_dore_job import compute_all_index_dore
+    return compute_all_index_dore()
+
+
+def _index_dore_payload(raw: dict):
+    return raw, sum(1 for v in (raw or {}).values() if v)
+
+
 # JOBS covers only the single-call jobs that run through the generic
 # _run_loop. live_scanner is intentionally NOT here — it runs via
 # _run_live_scanner_loop on its own dedicated thread (see main() and
@@ -476,22 +499,30 @@ JOBS = [
     # (utils/scanner_engine.py), 180s keeps this comfortably fresh while
     # cutting sustained CPU/network load roughly 6x.
     ("market_intelligence", "market_intelligence", 180, _market_intelligence_compute, _market_intelligence_payload),
-    #("fo_scan",             "fo_scan",             60,  _fo_scan_compute,             _fo_scan_payload),
+    # [Restored, 2026-09-09, SG request] Stocks' own DORE 2.0 read
+    # (utils.fo_scan -> utils.dore_engine, the same richer engine —
+    # IV-crush hard gate, Option Intelligence Score, full weighted
+    # futures Stage 1 — that index_dore above was just restored to keep
+    # running for indices). Was commented out here since before the
+    # DORE Options Engine (utils.dore_options_scan) became the live
+    # stocks pipeline on 2026-07-31; that's unchanged — this doesn't
+    # replace it, just gets utils.fo_scan.compute_fo_scan() computing
+    # and persisting to its own "fo_scan" section again (fo_scan_
+    # snapshots — recreated in utils/scan_state.py, dropped 2026-08-03).
+    # No UI reads this section (removed from pages/scanner.py 2026-07-31,
+    # not restored) — standalone, same as index_dore.
+    ("fo_scan",             "fo_scan",             60,  _fo_scan_compute,             _fo_scan_payload),
     # [DORE Integration, 2026-08-05] Stage 2 (Live Market Refresh) — see
     # _dore_live_state_compute above. Reads whatever Stage 1 last wrote
     # to "dore_technical_plans" (produced once per live_scanner cycle,
     # not by this job) and refreshes only market-dependent fields.
     ("dore_live_state",     "dore_live_state",     60,  _dore_live_state_compute,     _dore_live_state_payload),
-    # [Removed, 2026-09-08] "index_dore" job (utils.market_intelligence.
-    # compute_all_index_dore -> utils.dore_engine.compute_index_dore)
-    # used to live here — NIFTY/SENSEX/BANKNIFTY's own DORE 2.0 read,
-    # feeding the Market Intelligence page's index cards. Indices are
-    # already covered by the DORE Options engine's own live pipeline
-    # (utils.dore_options_scan.compute_dore_technical_plans, run every
-    # live_scanner cycle — see its own index_symbols handling) —
-    # running a second, independent DORE computation for the same three
-    # indices on its own 60s schedule was pure duplication once that
-    # engine existed. Indices now surface ONLY via the DORE Options tab.
+    # [Restored, 2026-09-09] See _index_dore_compute's comment above —
+    # same 60s cadence as before, same "index_dore" snapshot section
+    # (index_dore_snapshots table — this was never dropped, only the
+    # job writing to it was), just sourced from utils.index_dore_job
+    # instead of utils.market_intelligence now.
+    ("index_dore",          "index_dore",          60,  _index_dore_compute,          _index_dore_payload),
 ]
 
 
