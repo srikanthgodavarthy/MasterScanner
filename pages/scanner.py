@@ -3267,10 +3267,17 @@ def _ap_per_source_cells(source: str, contributing_sources: str, source_entries_
     single stacked "Source / Entry" cell _ap_source_badges_with_entries()
     rendered — same underlying data (SetupPlan.contributing_sources /
     source_entries), just one column PER source instead of one combined
-    column with all badges stacked in it. A ✓ + that source's own entry
-    price appears in its column only if that source is actually
-    contributing to this plan (see _ap_ordered_sources()); every other
-    source's column for this row is a plain "—".
+    column with all badges stacked in it. That source's own entry price
+    appears in its column only if that source is actually contributing
+    to this plan (see _ap_ordered_sources()); every other source's
+    column for this row is a plain "—".
+
+    [2026-09-10, SG request: "make a color label on the entry price in
+    each source.. remove the tick mark"] The ✓ this originally rendered
+    above the price is gone — the price itself is now colored with that
+    source's own badge color (PB orange / MOM purple / FP green / CV4
+    blue) instead, so which source populated a cell is still visible at
+    a glance without a separate tick.
 
     Returns four complete "<td>...</td>" cells concatenated, in the
     fixed CV4/PB/MOM/FP header order — NOT a single cell's inner HTML,
@@ -3291,6 +3298,16 @@ def _ap_per_source_cells(source: str, contributing_sources: str, source_entries_
 
     active = set(_ap_ordered_sources(source, contributing_sources))
     cells = []
+    # [2026-09-10, SG request: "make a color label on the entry price in
+    # each source.. remove the tick mark"] Replaces the uniform green ✓
+    # every source used to render with (all four columns looked
+    # identical except for which one was populated) — the entry price
+    # itself is now colored per-source, using the exact same colors
+    # _ap_one_source_badge() already uses for that source's badge
+    # elsewhere in this file (PB orange / MOM purple / FP green /
+    # CV4 blue), so a glance at the color tells you which source this
+    # entry came from without needing the column header.
+    _SOURCE_COLOR = {"PB": "#f97316", "MOM": "#a371f7", "FP": "#3fb950", "LS": "#58a6ff"}
     # [2026-09-09, SG request] Column order follows SG's assumed typical
     # hit sequence — PB (pre-breakout coiling) fires first, then MOM
     # (same-day volume mover) or FP (Five Pillars) corroborate, CV4
@@ -3311,10 +3328,10 @@ def _ap_per_source_cells(source: str, contributing_sources: str, source_entries_
         _src_code = "LS" if s == "CV4" else s
         if _src_code in active:
             px = entries.get(_src_code, fallback_entry)
+            _color = _SOURCE_COLOR.get(_src_code, "#3fb950")
             cells.append(
                 f'<td class="col-num" style="text-align:center;">'
-                f'<div style="color:#3fb950;font-weight:700;">✓</div>'
-                f'<div>{_px(px)}</div></td>'
+                f'<div style="color:{_color};font-weight:700;">{_px(px)}</div></td>'
             )
         else:
             cells.append('<td class="col-num" style="text-align:center;color:var(--muted);">—</td>')
