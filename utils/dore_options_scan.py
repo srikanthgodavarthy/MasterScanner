@@ -815,6 +815,20 @@ def compute_dore_technical_plans(cfg: Optional[DoreOptionsSettings] = None,
     except Exception:
         logger.exception("[dore_technical] IV history flush failed to even start (non-fatal)")
 
+    # [IV/skew-shift leading signal, 2026-09-10, Phase 1] Same
+    # cycle-completion placement as the IV history flush directly
+    # above — drains this cycle's per-symbol intraday skew readings
+    # (recorded inside compute_dore_trade_plan() as each candidate's
+    # option chain was fetched) into the durable dore_iv_skew_log
+    # table Phase 2's correlation study will read from. Purely a
+    # logging/observability addition — does not touch anything that
+    # feeds df/rejections above.
+    try:
+        from utils.iv_intraday_store import flush_to_supabase as _flush_iv_intraday
+        _flush_iv_intraday()
+    except Exception:
+        logger.exception("[dore_technical] IV intraday skew log flush failed to even start (non-fatal)")
+
     invalid = find_invalid_columns(df)
     if invalid:
         logger.warning("[dore_technical] invalid numeric values (NaN/inf) before snapshot save — %s", invalid)

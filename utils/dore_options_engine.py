@@ -1236,6 +1236,25 @@ class OptionTradePlan:
     ce_iv:                   Optional[float] = None
     pe_iv:                   Optional[float] = None
 
+    # [IV/skew-shift leading signal, 2026-09-10, Phase 1 — OBSERVATION
+    # ONLY] Intraday skew MOVEMENT, as distinct from iv_skew above
+    # (which is only ever a same-cycle snapshot). Sourced from
+    # utils.iv_intraday_store.record_and_diff_skew() — see that
+    # module's docstring for the day-rollover baseline and the exact
+    # trend-label rule. NON-GATING: not read by qualification_score()/
+    # direction()/final_score()/hard_reject()/select_strikes() — same
+    # contract as direction_source/iv_skew/iv_rank above. Do not wire
+    # these into any score without an explicit, separate change (see
+    # utils.iv_intraday_store's PHASES note). All four are None
+    # whenever chain.ce_iv or chain.pe_iv was unavailable this cycle —
+    # never fabricated.
+    skew_opening_today:       Optional[float] = None   # today's first-observed ce_iv - pe_iv
+    skew_delta_since_open:    Optional[float] = None   # current skew - skew_opening_today
+    skew_delta_last_n_cycles: Optional[float] = None   # current skew - skew ~5 polls ago;
+                                                          # None until enough intraday history exists
+    skew_trend_vs_open:       Optional[str]   = None   # TOWARD_FLAT | AWAY_FROM_FLAT | INVERTED |
+                                                          # STABLE | OPENED_FLAT | None (no history yet)
+
     @property
     def structural_available(self) -> bool:
         """STRUCTURAL_AVAILABLE (DORE §7) — True only when a full,
@@ -2604,6 +2623,25 @@ def compute_dore_trade_plan(
     # fetch pass upstream.
     _iv_skew = (chain.ce_iv - chain.pe_iv) if (chain.ce_iv is not None and chain.pe_iv is not None) else None
     _iv_skew_note = _iv_skew_caution(chain.ce_iv, chain.pe_iv, dir_, settings)
+
+    # [IV/skew-shift leading signal, 2026-09-10, Phase 1 — OBSERVATION
+    # ONLY] Same non-fatal, best-effort pattern as the IVContext lookup
+    # right below: a tracking failure degrades to an all-None reading,
+    # never raises into the caller. Called unconditionally (not gated
+    # on `iv is None` the way IVContext is) — this is DORE's own
+    # intraday tracker, not a pluggable/override-able input, so there's
+    # no "caller already supplied one" case to preserve. See
+    # utils.iv_intraday_store's module docstring for why nothing here
+    # feeds a score.
+    try:
+        from utils.iv_intraday_store import record_and_diff_skew
+        _skew_reading = record_and_diff_skew(sig.symbol, chain.ce_iv, chain.pe_iv)
+    except Exception:
+        logger.warning("[DORE Options:%s] intraday skew tracking failed (non-fatal, "
+                        "observation fields stay None this call)", sig.symbol, exc_info=True)
+        from utils.iv_intraday_store import IntradaySkewReading
+        _skew_reading = IntradaySkewReading()
+
     if iv is None:
         _atm_iv = (
             (chain.ce_iv + chain.pe_iv) / 2.0 if chain.ce_iv is not None and chain.pe_iv is not None
@@ -3113,6 +3151,11 @@ def compute_dore_trade_plan(
         iv_percentile=iv.iv_percentile if iv is not None else None,
         ce_iv=chain.ce_iv,
         pe_iv=chain.pe_iv,
+        # [IV/skew-shift leading signal, 2026-09-10, Phase 1 — OBSERVATION ONLY]
+        skew_opening_today=_skew_reading.skew_opening_today,
+        skew_delta_since_open=_skew_reading.skew_delta_since_open,
+        skew_delta_last_n_cycles=_skew_reading.skew_delta_last_n_cycles,
+        skew_trend_vs_open=_skew_reading.skew_trend_vs_open,
     )
 
 

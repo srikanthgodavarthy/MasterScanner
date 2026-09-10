@@ -1605,6 +1605,90 @@ def load_premium_history_snapshots() -> list[dict]:
         return []
 
 
+# ─── DORE IV SKEW INTRADAY LOG (Phase 1 backtest feed) ────────────────────────
+
+def save_iv_skew_intraday_log(rows: list[dict]) -> bool:
+    """Append-only batch-insert of this cycle's intraday skew readings
+    into dore_iv_skew_log — see utils.iv_intraday_store.flush_to_
+    supabase()'s docstring for the call site/cadence. Plain INSERT,
+    never upsert: every reading is its own row (a symbol legitimately
+    gets many readings per day), so there's no natural conflict key
+    the way dore_iv_history's (symbol, trade_date) has."""
+    if not rows:
+        return True
+    if not db.is_available():
+        return False
+    try:
+        db.insert_rows("dore_iv_skew_log", rows)
+        return True
+    except Exception as exc:
+        logger.error("save_iv_skew_intraday_log failed: %s", exc)
+        return False
+
+
+def load_iv_skew_intraday_log(symbol: Optional[str] = None,
+                               start_date: Optional[str] = None,
+                               end_date: Optional[str] = None,
+                               limit: int = 20000) -> list[dict]:
+    """Query the intraday skew log — the feed Phase 2's correlation
+    study reads from. `start_date`/`end_date` are inclusive ISO date
+    strings matching the `trade_date` column; `symbol` filters to one
+    underlying when given, otherwise every symbol DORE has logged.
+    Returns oldest-first so a caller can walk the series
+    chronologically. `limit` guards against an unbounded pull
+    accidentally hammering Neon/Supabase — raise it explicitly for a
+    genuinely large backtest window."""
+    if not db.is_available():
+        return []
+    try:
+        clauses, params = [], []
+        if symbol:
+            clauses.append("symbol = %s")
+            params.append(symbol)
+        if start_date:
+            clauses.append("trade_date >= %s")
+            params.append(start_date)
+        if end_date:
+            clauses.append("trade_date <= %s")
+            params.append(end_date)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        return db.fetch_all(
+            f"""SELECT symbol, ts, trade_date, ce_iv, pe_iv, skew,
+                       skew_delta_since_open, skew_delta_last_n_cycles, skew_trend_vs_open
+                FROM dore_iv_skew_log {where}
+                ORDER BY ts ASC LIMIT %s""",
+            tuple(params),
+        )
+    except Exception as exc:
+        logger.warning("load_iv_skew_intraday_log failed: %s", exc)
+        return []
+
+
+def prune_iv_skew_intraday_log(keep_days: int = 120) -> Optional[int]:
+    """Deletes dore_iv_skew_log rows older than `keep_days` calendar
+    days (by trade_date). 120, not dore_iv_history's 400 — this table
+    writes roughly once per shortlisted symbol per ~5-minute options-
+    scan cycle rather than once a day per symbol, so it grows far
+    faster and a leading-indicator backtest doesn't need a full year
+    retained to be useful. Not wired into any scheduled prune job yet
+    — call manually (or from Settings, same as the other prune_*
+    helpers here) once this table's actual growth rate has been
+    observed in production."""
+    if not db.is_available():
+        return None
+    try:
+        from datetime import timezone as _tz, timedelta as _td
+        cutoff = (datetime.now(_tz.utc) - _td(days=keep_days)).date().isoformat()
+        n = db.execute("DELETE FROM dore_iv_skew_log WHERE trade_date < %s", (cutoff,))
+        if n:
+            logger.info("prune_iv_skew_intraday_log: deleted %s row(s) older than %s", n, cutoff)
+        return n
+    except Exception:
+        logger.exception("prune_iv_skew_intraday_log failed (non-fatal)")
+        return None
+
+
 # ─── DORE IV HISTORY (daily ATM CE/PE IV, for iv_rank/iv_percentile) ──────────
 
 def save_iv_history_snapshot(rows: list[dict]) -> bool:
@@ -2370,6 +2454,31 @@ CREATE TABLE IF NOT EXISTS dore_iv_history (
     PRIMARY KEY (symbol, trade_date)
 );
 CREATE INDEX IF NOT EXISTS idx_dore_iv_history_symbol_date ON dore_iv_history(symbol, trade_date DESC);
+
+-- [2026-09-10, IV/skew-shift leading signal, Phase 1] Append-only
+-- intraday ATM CE/PE IV-skew log — one row per (symbol, cycle) capture
+-- of what utils.iv_intraday_store.record_and_diff_skew() computed that
+-- cycle, kept so Phase 2 can later correlate skew moves against
+-- realized index/stock moves. Deliberately NOT keyed by (symbol,
+-- trade_date) the way dore_iv_history is above — that table wants one
+-- rank-worthy reading a day; this one needs the full intraday series.
+-- Higher write volume than the other DORE tables as a result (~1 row
+-- per shortlisted symbol per ~5-minute options-scan cycle, not once a
+-- day) — see prune_iv_skew_intraday_log() for retention.
+CREATE TABLE IF NOT EXISTS dore_iv_skew_log (
+    id                        bigserial   PRIMARY KEY,
+    symbol                    text        NOT NULL,
+    ts                        timestamptz NOT NULL DEFAULT now(),
+    trade_date                date        NOT NULL,
+    ce_iv                     numeric,
+    pe_iv                     numeric,
+    skew                      numeric,
+    skew_delta_since_open     numeric,
+    skew_delta_last_n_cycles  numeric,
+    skew_trend_vs_open        text
+);
+CREATE INDEX IF NOT EXISTS idx_dore_iv_skew_log_symbol_ts ON dore_iv_skew_log(symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_dore_iv_skew_log_trade_date ON dore_iv_skew_log(trade_date);
 """
 
 SCHEMA_SQL += """
