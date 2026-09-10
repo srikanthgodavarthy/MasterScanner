@@ -628,7 +628,7 @@ def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
     every other loop here.
     """
     from utils.scan_state import prune_all_snapshots
-    from utils.supabase_client import prune_scan_snapshot_tables, prune_oi_and_premium_history
+    from utils.supabase_client import prune_scan_snapshot_tables, prune_oi_and_premium_history, prune_iv_history
     from utils.system_state import should_scheduler_run
     from utils import db
 
@@ -674,6 +674,14 @@ def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
             # previously had no retention at all — see
             # prune_oi_and_premium_history()'s docstring.
             results.update(prune_oi_and_premium_history())
+            # [IV history, 2026-09-10, SG request] dore_iv_history keeps
+            # up to ~400 calendar days per symbol (utils.iv_history_store's
+            # rank/percentile window plus slack) — needs the same
+            # periodic prune the OI/premium tables above get, or it grows
+            # unbounded across every symbol DORE has ever shortlisted.
+            _n = prune_iv_history()
+            if _n is not None:
+                results["dore_iv_history"] = _n
             logger.info("[retention] pruned snapshot tables: %s", results)
         except Exception:
             logger.exception("[retention] prune_all_snapshots failed (non-fatal — retrying next cycle)")
