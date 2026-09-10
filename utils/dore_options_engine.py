@@ -1227,6 +1227,15 @@ class OptionTradePlan:
     iv_rank:                 Optional[float] = None
     iv_percentile:           Optional[float] = None
 
+    # [SG request] Raw same-day ATM leg IVs that iv_skew above is
+    # derived from — surfaced directly so callers/persistence don't
+    # have to reach into `chain` (which isn't itself available past
+    # this call) to see the actual CE/PE IV readings behind the skew
+    # number. None/None whenever chain.ce_iv/pe_iv was unavailable —
+    # same non-fabrication rule as iv_skew.
+    ce_iv:                   Optional[float] = None
+    pe_iv:                   Optional[float] = None
+
     @property
     def structural_available(self) -> bool:
         """STRUCTURAL_AVAILABLE (DORE §7) — True only when a full,
@@ -3102,6 +3111,8 @@ def compute_dore_trade_plan(
         iv_skew_caution=_iv_skew_note,
         iv_rank=iv.iv_rank if iv is not None else None,
         iv_percentile=iv.iv_percentile if iv is not None else None,
+        ce_iv=chain.ce_iv,
+        pe_iv=chain.pe_iv,
     )
 
 

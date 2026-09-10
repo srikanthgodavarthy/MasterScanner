@@ -536,6 +536,35 @@ class DoreOptionsPlan:
     structural_reward:             Optional[float] = None
     structural_risk_reward:        Optional[float] = None
 
+    # [IV + direction-source diagnostics, frozen at mint, 2026-09-10]
+    # OptionTradePlan.iv_skew/iv_rank/iv_percentile/direction_source/
+    # futures_confirmation_used/futures_directional_agreement captured
+    # ONCE at mint time — same frozen-snapshot pattern as the cv4_*_at_
+    # mint fields above: what DORE actually saw when it minted this
+    # plan is a historical fact about the plan, not a live value that
+    # should drift as later scan cycles re-run Stage 3.5/direction
+    # selection for the same underlying. NON-GATING: nothing reads
+    # these fields to decide entry/exit/status — they exist purely for
+    # post-mortem/live-state display and outcome attribution. All
+    # Optional/blank-default so existing rows and existing callers that
+    # don't pass them are unaffected (additive-only). iv_rank_at_mint/
+    # iv_percentile_at_mint are None whenever the symbol hadn't cleared
+    # iv_history_store._MIN_HISTORY_DAYS yet — that's the same "no
+    # value yet" case as everywhere else these two fields appear, not
+    # a persistence bug.
+    iv_skew_at_mint:                    Optional[float] = None
+    iv_skew_caution_at_mint:            str = ""
+    iv_rank_at_mint:                    Optional[float] = None
+    iv_percentile_at_mint:              Optional[float] = None
+    direction_source_at_mint:           str = ""    # SMC-Futures | SMC-Spot | Futures-EMA | Spot-EMA
+    futures_confirmation_used_at_mint:  bool = False
+    futures_directional_agreement_at_mint: Optional[bool] = None
+    # [SG request] Raw same-day ATM leg IVs behind iv_skew_at_mint —
+    # same frozen-at-mint, non-gating, additive-only pattern as the
+    # rest of this block.
+    ce_iv_at_mint:                      Optional[float] = None
+    pe_iv_at_mint:                      Optional[float] = None
+
     @property
     def contract_key(self) -> str:
         return f"{self.symbol.upper()}|{self.direction}|{self.strike:.1f}|{self.expiry}"
@@ -632,6 +661,18 @@ class DoreOptionsPlan:
             "structural_risk":               self.structural_risk,
             "structural_reward":             self.structural_reward,
             "structural_risk_reward":        self.structural_risk_reward,
+            # IV + direction-source diagnostics, frozen at mint — see
+            # dataclass field comments above. All Optional/blank-default,
+            # additive-only, same as the cv4_*_at_mint block above.
+            "iv_skew_at_mint":               self.iv_skew_at_mint,
+            "iv_skew_caution_at_mint":       self.iv_skew_caution_at_mint or "",
+            "iv_rank_at_mint":               self.iv_rank_at_mint,
+            "iv_percentile_at_mint":         self.iv_percentile_at_mint,
+            "direction_source_at_mint":      self.direction_source_at_mint or "",
+            "futures_confirmation_used_at_mint":    bool(self.futures_confirmation_used_at_mint),
+            "futures_directional_agreement_at_mint": self.futures_directional_agreement_at_mint,
+            "ce_iv_at_mint":                 self.ce_iv_at_mint,
+            "pe_iv_at_mint":                 self.pe_iv_at_mint,
         }
 
 
@@ -1235,6 +1276,21 @@ def enrich_trade_plans_with_persistence(
                     structural_risk=row.get("structural_risk"),
                     structural_reward=row.get("structural_reward"),
                     structural_risk_reward=row.get("structural_risk_reward"),
+                    # [IV + direction-source diagnostics, frozen at mint,
+                    # 2026-09-10] Same frozen-snapshot pattern as the
+                    # cv4_*_at_mint/structural_*_at_mint fields above —
+                    # `row` is this cycle's OptionTradePlan.to_dict(), so
+                    # these read straight off it under their un-suffixed
+                    # field names.
+                    iv_skew_at_mint=row.get("iv_skew"),
+                    iv_skew_caution_at_mint=row.get("iv_skew_caution") or "",
+                    iv_rank_at_mint=row.get("iv_rank"),
+                    iv_percentile_at_mint=row.get("iv_percentile"),
+                    direction_source_at_mint=row.get("direction_source") or "",
+                    futures_confirmation_used_at_mint=bool(row.get("futures_confirmation_used", False)),
+                    futures_directional_agreement_at_mint=row.get("futures_directional_agreement"),
+                    ce_iv_at_mint=row.get("ce_iv"),
+                    pe_iv_at_mint=row.get("pe_iv"),
                 )
                 just_minted = True
                 open_now[key] = locked

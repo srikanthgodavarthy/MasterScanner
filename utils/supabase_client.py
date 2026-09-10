@@ -1180,6 +1180,20 @@ def _dore_options_plan_from_row(row: dict) -> "object":
         structural_risk                = row.get("structural_risk"),
         structural_reward              = row.get("structural_reward"),
         structural_risk_reward         = row.get("structural_risk_reward"),
+        # [IV + direction-source diagnostics, frozen at mint, 2026-09-10]
+        # round-trip — see DoreOptionsPlan's field comments. Absent on
+        # rows written before this migration; reads back as None/""/
+        # False for those, same additive-only, non-gating pattern as
+        # the cv4_*_at_mint block above.
+        iv_skew_at_mint                = row.get("iv_skew_at_mint"),
+        iv_skew_caution_at_mint        = row.get("iv_skew_caution_at_mint", "") or "",
+        iv_rank_at_mint                = row.get("iv_rank_at_mint"),
+        iv_percentile_at_mint          = row.get("iv_percentile_at_mint"),
+        direction_source_at_mint       = row.get("direction_source_at_mint", "") or "",
+        futures_confirmation_used_at_mint      = bool(row.get("futures_confirmation_used_at_mint", False)),
+        futures_directional_agreement_at_mint  = row.get("futures_directional_agreement_at_mint"),
+        ce_iv_at_mint                   = row.get("ce_iv_at_mint"),
+        pe_iv_at_mint                   = row.get("pe_iv_at_mint"),
     )
 
 
@@ -2059,6 +2073,25 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
     structural_reward              numeric(12,2),
     structural_risk_reward         numeric(6,2),
 
+    -- [IV + direction-source diagnostics, frozen at mint, 2026-09-10]
+    -- OptionTradePlan.iv_skew/iv_rank/iv_percentile/direction_source/
+    -- futures_confirmation_used/futures_directional_agreement snapshot
+    -- — see utils.dore_options_persistence.DoreOptionsPlan's field
+    -- comments. Non-gating, additive-only, same pattern as the
+    -- cv4_*_at_mint columns above. iv_rank_at_mint/iv_percentile_at_mint
+    -- are NULL on any plan minted before the symbol had 20 trading
+    -- days of recorded IV history (iv_history_store._MIN_HISTORY_DAYS)
+    -- — expected, not a migration gap.
+    iv_skew_at_mint                 numeric(6,2),
+    iv_skew_caution_at_mint         text        NOT NULL DEFAULT '',
+    iv_rank_at_mint                 numeric(6,2),
+    iv_percentile_at_mint           numeric(6,2),
+    direction_source_at_mint        text        NOT NULL DEFAULT '',
+    futures_confirmation_used_at_mint       boolean     NOT NULL DEFAULT false,
+    futures_directional_agreement_at_mint   boolean,
+    ce_iv_at_mint                    numeric(6,2),
+    pe_iv_at_mint                    numeric(6,2),
+
     updated_at                   timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_dore_options_plans_symbol ON dore_options_plans(symbol);
@@ -2132,6 +2165,24 @@ ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS structural_target_type t
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS structural_risk numeric(12,2);
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS structural_reward numeric(12,2);
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS structural_risk_reward numeric(6,2);
+"""
+
+# [IV + direction-source diagnostics, frozen at mint, 2026-09-10] Run
+# once against an existing dore_options_plans table. Purely additive/
+# nullable (or empty-string/false-default for the text/boolean columns,
+# matching source's/the cv4_*_at_mint columns' own convention above) —
+# no existing row or query is affected. Every pre-existing row simply
+# has these seven columns NULL/''/false until its plan is re-minted.
+DORE_OPTIONS_PLANS_IV_DIRECTION_MIGRATION_SQL = """
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS iv_skew_at_mint numeric(6,2);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS iv_skew_caution_at_mint text NOT NULL DEFAULT '';
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS iv_rank_at_mint numeric(6,2);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS iv_percentile_at_mint numeric(6,2);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS direction_source_at_mint text NOT NULL DEFAULT '';
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS futures_confirmation_used_at_mint boolean NOT NULL DEFAULT false;
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS futures_directional_agreement_at_mint boolean;
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS ce_iv_at_mint numeric(6,2);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS pe_iv_at_mint numeric(6,2);
 """
 
 # [2026-08-12, two-level lifecycle refactor] Run this once against an
