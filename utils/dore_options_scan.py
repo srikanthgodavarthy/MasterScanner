@@ -472,7 +472,13 @@ def top_dore_trade_plans(
     # noted throughout utils.dore_engine's futures work), so one
     # sequential fetch per index, same as the ohlcv_map index loop above.
     futures_ohlcv_map: dict = {}
-    if settings.use_futures_confirmation:
+    # [SMC-on-Futures direction, 2026-09-10] Also fetched when
+    # use_smc_direction is on (independent of use_futures_confirmation)
+    # since the SMC structural read now prefers futures OHLC too — see
+    # DoreOptionsSettings.use_smc_direction's docstring. Both default
+    # True, so this is a no-op broadening in practice; kept as an OR so
+    # either flag alone is still enough to fetch the data it needs.
+    if settings.use_futures_confirmation or settings.use_smc_direction:
         try:
             from utils.upstox_client import fetch_batch_futures_ohlcv_upstox, fetch_futures_ohlcv_upstox
             if stock_symbols:
@@ -526,8 +532,16 @@ def top_dore_trade_plans(
             fut_closes = fut_df["close"].tail(max(ohlcv_bars, 30)).tolist() if "close" in fut_df else None
             fut_highs = fut_df["high"].tail(max(ohlcv_bars, 30)).tolist() if "high" in fut_df else None
             fut_lows = fut_df["low"].tail(max(ohlcv_bars, 30)).tolist() if "low" in fut_df else None
+            # [SMC-on-Futures direction, 2026-09-10] Needed so the SMC
+            # order-block read can run on futures candles — see
+            # compute_dore_trade_plan()'s futures_open_prices docstring.
+            # Missing 'open' (shouldn't happen for a real OHLCV frame,
+            # but mirrors the same defensive "in fut_df" check the other
+            # three columns already use) just falls through to spot for
+            # the SMC read, same fail-soft contract as the others.
+            fut_opens = fut_df["open"].tail(max(ohlcv_bars, 30)).tolist() if "open" in fut_df else None
         else:
-            fut_closes, fut_highs, fut_lows = None, None, None
+            fut_closes, fut_highs, fut_lows, fut_opens = None, None, None, None
 
         dte = _days_to_expiry(option_data.get("expiry", ""))
         regime = scan_row.get("regime") or scan_row.get("_nifty_regime") or scan_row.get("MarketRegime")
@@ -539,6 +553,7 @@ def top_dore_trade_plans(
             symbol=symbol, market_regime=regime, iv=iv_ctx,
             high_prices=highs, low_prices=lows, open_prices=opens,
             futures_close_prices=fut_closes, futures_high_prices=fut_highs, futures_low_prices=fut_lows,
+            futures_open_prices=fut_opens,
         )
         if isinstance(result, OptionTradePlan):
             # [2026-08-08, SG request] "PB" when this symbol only made

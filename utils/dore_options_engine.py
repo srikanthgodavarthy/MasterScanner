@@ -126,6 +126,41 @@ class DoreOptionsSettings:
     # the spot mom, identical to this flag being off.
     use_futures_confirmation: bool = True
 
+    # [SMC-on-Futures direction, 2026-09-10, SG request] Prior to this,
+    # the SMC structural read (Order Blocks / compute_smc_state, further
+    # below in compute_dore_trade_plan) only ever ran on the underlying's
+    # SPOT bars and only ever GATED a direction that the simple EMA9/21
+    # cross above had already decided (futures-sourced when
+    # use_futures_confirmation fired, spot otherwise) -- i.e. "actual
+    # structure" and "what decided CE/PE" were two different data series
+    # answering two different questions. When True, the SMC structural
+    # read itself (order blocks + compute_smc_state) is built from the
+    # FUTURES contract's own daily OHLC first (falling back to the spot
+    # OHLC only when no usable futures series is available this call --
+    # same fail-soft convention as use_futures_confirmation), and its
+    # own SMCState.direction becomes the CE/PE call whenever it clears
+    # smc_direction_min_evidence_tier -- retiring the EMA9/21 cross as
+    # the direction source for symbols where this fires. The EMA9/21
+    # cross (futures-confirmed when available, else spot) remains the
+    # automatic fallback whenever SMC has no real read (NEUTRAL
+    # direction, CONFLICT state, or insufficient bars) -- a symbol never
+    # goes directionless just because structure is ambiguous this poll.
+    # qual_score/select_strikes()/hard_reject() still use the spot `mom`
+    # unconditionally, exactly as before -- this flag only ever changes
+    # what decides dir_, and what data the OB-anchor/structural-target
+    # system downstream reads (same "one source of truth" -- the SMC
+    # read is computed once and reused for both).
+    use_smc_direction: bool = True
+    # SMCState.evidence_tier is 0-4 (TIER_LABELS: None/Weak/Moderate/
+    # Strong/Very Strong). 2 ("Moderate") is the floor used here --
+    # high enough that a lone weak signal (tier 1) never overrides the
+    # existing EMA-based direction on its own, low enough to actually
+    # fire on ordinary setups rather than only the rare tier-4 read.
+    # Tunable independently of min_structural_rr (that gate validates
+    # trade GEOMETRY once a direction exists; this one decides whether
+    # structure is trusted to SUPPLY the direction at all).
+    smc_direction_min_evidence_tier: int = 2
+
     # ── Stage 3: Confidence modifiers ───────────────────────────
     rsi_bull_min: float = 55.0
     rsi_bear_max: float = 45.0
@@ -1124,6 +1159,16 @@ class OptionTradePlan:
                                                              # True/False = whether the futures-only
                                                              # EMA9/21 cross agrees with the spot
                                                              # underlying's own cross this same call.
+
+    # [SMC-on-Futures direction, 2026-09-10] Diagnostics for
+    # DoreOptionsSettings.use_smc_direction -- purely observational,
+    # never gates the plan on their own (structural_state/
+    # is_structurally_anchored above already carry the gating effect).
+    direction_source:       Optional[str] = None  # "SMC-Futures" | "SMC-Spot" | "Futures-EMA" | "Spot-EMA"
+    structural_data_source: Optional[str] = None  # "Futures" | "Spot" | None -- which OHLC series the
+                                                     # SMC read (order blocks + compute_smc_state) actually
+                                                     # ran on this call, regardless of whether it ended up
+                                                     # deciding dir_ or only gating/anchoring it.
 
     @property
     def structural_available(self) -> bool:
@@ -2270,6 +2315,7 @@ def compute_dore_trade_plan(
     futures_close_prices: Optional[Sequence[float]] = None,
     futures_high_prices: Optional[Sequence[float]] = None,
     futures_low_prices: Optional[Sequence[float]] = None,
+    futures_open_prices: Optional[Sequence[float]] = None,
 ):
     """Runs the full pipeline for one symbol and returns an
     OptionTradePlan (default output, Improvement #9) or a
@@ -2300,6 +2346,19 @@ def compute_dore_trade_plan(
         series being too short for ema_momentum()'s own min_len gate)
         is fail-soft: direction() falls through to the spot mom exactly
         as if this parameter didn't exist.
+
+    futures_open_prices : [SMC-on-Futures direction, 2026-09-10]
+        optional -- the futures contract's own daily opens, same
+        convention/window as futures_close_prices. Needed ONLY so the
+        SMC structural read (order blocks + compute_smc_state, see
+        settings.use_smc_direction) can run on the futures contract's
+        OHLC instead of the underlying's spot OHLC (detect_order_blocks()
+        needs a candle's open to classify it bull/bear, same requirement
+        open_prices already has for the spot read). Omitting it while
+        futures_close/high/low_prices ARE supplied simply means the SMC
+        read falls back to spot OHLC (open_prices/high_prices/
+        low_prices/close_prices) for this call -- fail-soft, never a
+        rejection.
     """
     settings = settings or DORE_OPTIONS_DEFAULTS
     sig = MasterScannerSignal.from_scan_row(
@@ -2327,10 +2386,91 @@ def compute_dore_trade_plan(
                                     high=futures_high_prices, low=futures_low_prices)
     futures_confirmation_used = futures_mom is not None
     futures_directional_agreement = (futures_mom.bullish == mom.bullish) if futures_confirmation_used else None
-    dir_, confidence, direction_reasons = direction(
-        sig, futures_mom if futures_confirmation_used else mom, settings, adx=adx)
-    if futures_confirmation_used:
-        direction_reasons = ["Futures-confirmed: " + r for r in direction_reasons]
+
+    # ── SMC STRUCTURAL READ [2026-09-10, SG request, DoreOptionsSettings.
+    # use_smc_direction] ─────────────────────────────────────────────
+    # Computed ONCE here, before dir_ is decided, and reused verbatim by
+    # the STRUCTURAL STRIKE ANCHOR block below (same _ob_df/_lb/bull_obs/
+    # bear_obs/smc_states -- DORE §8's "one source of truth", now also
+    # covering which OHLC series the read runs on, not just avoiding a
+    # second detect_order_blocks() call). Futures OHLC is preferred over
+    # spot when a usable futures series was supplied (same fail-soft
+    # preference order as futures_mom above); spot is the automatic
+    # fallback so a symbol with no futures feed this cycle keeps getting
+    # exactly the pre-2026-09-10 spot-only structural read.
+    # NOTE: this data computation itself is unconditional (whenever a
+    # usable series exists) — it's the same read the pre-existing
+    # STRUCTURAL STRIKE ANCHOR block below always ran (previously always
+    # spot-only, never behind a settings flag); only whether its
+    # direction gets to DECIDE dir_ is gated by use_smc_direction just
+    # below. This keeps OB-anchoring/structural-gating working exactly
+    # as before even with use_smc_direction=False, just now preferring
+    # futures bars over spot when both are available.
+    _smc_source: Optional[str] = None          # "Futures" | "Spot" | None
+    _ob_df = None
+    _lb = None
+    _bull_obs: list = []
+    _bear_obs: list = []
+    _smc_states: list = []
+    _smc_latest = None
+    _smc_direction_signal: Optional[str] = None   # BULLISH | BEARISH | None (never NEUTRAL/CONFLICT)
+    _fut_n = min(len(futures_open_prices or []), len(futures_high_prices or []),
+                  len(futures_low_prices or []), len(futures_close_prices or []))
+    _spot_n = min(len(open_prices or []), len(high_prices or []),
+                  len(low_prices or []), len(close_prices or []))
+    if futures_open_prices is not None and futures_high_prices and futures_low_prices \
+            and futures_close_prices and _fut_n >= 5:
+        _smc_source = "Futures"
+        _smc_open, _smc_high, _smc_low, _smc_close, _smc_n = (
+            futures_open_prices, futures_high_prices, futures_low_prices, futures_close_prices, _fut_n)
+    elif open_prices is not None and high_prices and low_prices and _spot_n >= 5:
+        _smc_source = "Spot"
+        _smc_open, _smc_high, _smc_low, _smc_close, _smc_n = (
+            open_prices, high_prices, low_prices, close_prices, _spot_n)
+    else:
+        _smc_open = _smc_high = _smc_low = _smc_close = None
+        _smc_n = 0
+
+    if _smc_source is not None:
+        try:
+            from utils.smc_engine import (
+                detect_order_blocks, compute_smc_state,
+                BULLISH as _SMC_BULLISH, BEARISH as _SMC_BEARISH,
+            )
+            _ob_df = pd.DataFrame({
+                "open":  list(_smc_open)[-_smc_n:], "high": list(_smc_high)[-_smc_n:],
+                "low":   list(_smc_low)[-_smc_n:],   "close": list(_smc_close)[-_smc_n:],
+            })
+            _lb = min(20, max(2, _smc_n // 4))
+            _bull_obs, _bear_obs = detect_order_blocks(_ob_df, lb=_lb)
+            _smc_states = compute_smc_state(_ob_df, lb=_lb)
+            _smc_latest = _smc_states[-1] if _smc_states else None
+            if (settings.use_smc_direction and _smc_latest is not None
+                    and _smc_latest.direction in (_SMC_BULLISH, _SMC_BEARISH)
+                    and _smc_latest.evidence_tier >= settings.smc_direction_min_evidence_tier):
+                _smc_direction_signal = _smc_latest.direction
+        except Exception:
+            logger.warning("[DORE Options:%s] SMC structural read failed (non-fatal, "
+                            "falls through to EMA direction)", sig.symbol, exc_info=True)
+            _smc_source, _ob_df, _lb = None, None, None
+            _bull_obs, _bear_obs, _smc_states, _smc_latest = [], [], [], None
+
+    if _smc_direction_signal is not None:
+        from utils.smc_engine import BULLISH as _SMC_BULLISH
+        dir_ = CE if _smc_direction_signal == _SMC_BULLISH else PE
+        confidence = 25.0 + 18.75 * _smc_latest.evidence_tier   # tier 2->62.5 .. tier 4->100, same
+                                                                  # 0-100 confidence scale direction() uses
+        direction_reasons = [
+            f"SMC structural direction ({_smc_source}): {_smc_latest.state}, "
+            f"evidence tier {_smc_latest.evidence_tier}/4",
+        ]
+        direction_source = f"SMC-{_smc_source}"
+    else:
+        dir_, confidence, direction_reasons = direction(
+            sig, futures_mom if futures_confirmation_used else mom, settings, adx=adx)
+        if futures_confirmation_used:
+            direction_reasons = ["Futures-confirmed: " + r for r in direction_reasons]
+        direction_source = "Futures-EMA" if futures_confirmation_used else "Spot-EMA"
     chain = OptionChainSnapshot.from_upstox(option_data, dte)
 
     strikes = select_strikes(sig, dte, dir_, confidence, settings, strike_interval=chain.strike_interval, iv=iv)
@@ -2364,7 +2504,14 @@ def compute_dore_trade_plan(
     #                                  see the rejection check right
     #                                  after this block.
     _structural_state = "STRUCTURAL_DATA_UNAVAILABLE"
-    _structural_reason = "no_open_prices" if open_prices is None else "insufficient_bars"
+    # [SMC-on-Futures direction, 2026-09-10] _ob_df/_lb/_bull_obs/_bear_obs/
+    # _smc_states/_smc_latest were already computed above (futures-
+    # preferred, spot-fallback, same fail-soft rules) for the direction
+    # decision — reused verbatim here, never recomputed, so this block's
+    # "no_open_prices"/"insufficient_bars" reasons now correctly mean "no
+    # futures AND no spot bars were usable", not "no spot bars" alone.
+    _structural_reason = "no_open_prices" if (futures_open_prices is None and open_prices is None) \
+        else "insufficient_bars"
     _ob_for_dir = None
     _structural_decision = None
     # [Fix, 2026-08-21, Issue 1] Explicit flag, set True ONLY at the
@@ -2392,25 +2539,17 @@ def compute_dore_trade_plan(
     _structural_risk = None
     _structural_reward = None
     _structural_risk_reward = None
-    if open_prices is not None and len(open_prices) >= 5 and high_prices and low_prices:
+    if _ob_df is not None:
         try:
             from utils.smc_engine import (
-                detect_order_blocks, compute_smc_state, classify_structural_state,
+                classify_structural_state,
                 BULLISH as _SMC_BULLISH, BEARISH as _SMC_BEARISH,
                 STRUCTURAL_INVALIDATION as _SI, STRUCTURAL_VALID_ENTRY_ZONE as _VEZ,
             )
             from utils.structural_levels import causal_pivot_series
-            n_ = min(len(open_prices), len(high_prices), len(low_prices), len(close_prices))
-            _ob_df = pd.DataFrame({
-                "open":  list(open_prices)[-n_:], "high": list(high_prices)[-n_:],
-                "low":   list(low_prices)[-n_:],   "close": list(close_prices)[-n_:],
-            })
-            _lb = min(20, max(2, n_ // 4))
+            n_ = len(_ob_df)
             _thesis_dir = _SMC_BULLISH if dir_ == CE else _SMC_BEARISH
-            _bull_obs, _bear_obs = detect_order_blocks(_ob_df, lb=_lb)
             _ob_for_dir = (_bull_obs if _thesis_dir == _SMC_BULLISH else _bear_obs)[-1]
-            _smc_states = compute_smc_state(_ob_df, lb=_lb)
-            _smc_latest = _smc_states[-1] if _smc_states else None
             _structural_decision = classify_structural_state(
                 _smc_latest, order_block=_ob_for_dir, thesis_direction=_thesis_dir,
             )
@@ -2724,15 +2863,18 @@ def compute_dore_trade_plan(
     # (EmaMomentum.bullish and the final confidence score), persisted
     # as DORE Technical Plan fields per the integration spec. Neither
     # is a new calculation.
-    # [Futures confirmation, 2026-09-07] Uses whichever EmaMomentum
-    # actually decided dir_ above (futures_mom when
-    # futures_confirmation_used, else the spot mom) — NOT unconditionally
-    # mom — so this string can never contradict dir_ (e.g. showing
-    # "Bullish" on a PE plan because the futures contract's own cross
-    # disagreed with the spot underlying's).
-    _leadership_mom = futures_mom if futures_confirmation_used else mom
-    _leadership_src = "Futures" if futures_confirmation_used else "EMA9/21"
-    leadership = f"Bullish ({_leadership_src}, {mom.momentum_score:.0f})" if _leadership_mom.bullish \
+    # [Futures confirmation, 2026-09-07; SMC-on-Futures direction,
+    # 2026-09-10] Labels dir_ itself, not a separately-checked
+    # EmaMomentum.bullish — so this string can never contradict dir_,
+    # including when direction_source is SMC-Futures/SMC-Spot (in which
+    # case no EmaMomentum decided dir_ at all; mom.momentum_score is
+    # still shown as a diagnostic momentum reading, not the direction
+    # source).
+    _leadership_src = {
+        "SMC-Futures": "SMC/Futures", "SMC-Spot": "SMC/Spot",
+        "Futures-EMA": "Futures EMA9/21", "Spot-EMA": "EMA9/21",
+    }.get(direction_source, "EMA9/21")
+    leadership = f"Bullish ({_leadership_src}, {mom.momentum_score:.0f})" if dir_ == CE \
         else f"Bearish ({_leadership_src}, {mom.momentum_score:.0f})"
 
     if score >= 75:
@@ -2815,6 +2957,9 @@ def compute_dore_trade_plan(
         # Option A, 2026-09-07]
         futures_confirmation_used=futures_confirmation_used,
         futures_directional_agreement=futures_directional_agreement,
+        # [SMC-on-Futures direction, 2026-09-10]
+        direction_source=direction_source,
+        structural_data_source=_smc_source,
     )
 
 
