@@ -78,11 +78,20 @@ _TABLES = {
     "market_intelligence": "market_intelligence_snapshots",
     # "live_scanner" removed from this map [2026-08-04] — see _STATE_SECTIONS
     # below. It no longer writes an append-only snapshot table at all.
-    # "fo_scan" removed [2026-08-03] — fo_scan_snapshots dropped; the
-    # writer job was already commented out of scheduler/scan_worker.py's
-    # JOBS list and the reader removed from pages/scanner.py on 2026-07-31.
-    # Leaving this entry in would make prune_all_snapshots() try to prune
-    # a table that no longer exists on every retention cycle.
+    # [Restored, 2026-09-09, SG request] "fo_scan" was removed 2026-08-03
+    # (dropped table — dore_options_scan below had taken over as the
+    # live Options pipeline, same day this was re-added the index_dore
+    # job for the same underlying reason: utils.dore_engine.py's fuller
+    # Stage 1-5 read — hard gate, Option Intelligence Score, full
+    # weighted futures Stage 1 — isn't matched by dore_options_engine.py,
+    # on stocks any more than it was on indices. compute_fo_scan() itself
+    # (utils/fo_scan.py) was never deleted or broken — it just lost its
+    # table and its JOBS entry. No UI reads this section (the reader was
+    # separately removed from pages/scanner.py 2026-07-31 and SG hasn't
+    # asked for it back) — this just gets the computation running and
+    # persisted again, same "standalone, no re-coupling" shape as
+    # index_dore below.
+    "fo_scan":             "fo_scan_snapshots",
     # 2026-07-31: DORE Options Engine Integration — utils.dore_options_scan's
     # own snapshot section, deliberately separate from "fo_scan" (the
     # legacy utils.fo_scan/utils.dore_engine pipeline) so both can run
@@ -95,7 +104,7 @@ _TABLES = {
     # _STATE_SECTIONS below, same reason as "live_scanner".
     "dore_technical_plans":  "dore_technical_plans_snapshots",
     # [2026-08-25] Indices' own DORE 2.0 read — see
-    # utils.market_intelligence.compute_all_index_dore's docstring and
+    # utils.index_dore_job.compute_all_index_dore's docstring and
     # scheduler/scan_worker.py's "index_dore" job (60s cadence, same as
     # dore_live_state below). A plain snapshot table, not a
     # _STATE_SECTIONS symbol-keyed one: the whole payload is just 3
@@ -764,6 +773,24 @@ CREATE TABLE IF NOT EXISTS market_intelligence_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_mi_snap_version ON market_intelligence_snapshots(version DESC);
 
+-- [Restored, 2026-09-09, SG request] fo_scan_snapshots — dropped
+-- 2026-08-03 when dore_options_scan_snapshots took over as the live
+-- Options pipeline's table, re-created here identically (same shape
+-- as market_intelligence_snapshots above) now that utils.fo_scan's
+-- job is running again — see the "fo_scan" entry in _TABLES above for
+-- why.
+CREATE TABLE IF NOT EXISTS fo_scan_snapshots (
+    id         bigserial   PRIMARY KEY,
+    scan_id    uuid        NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    status     text        NOT NULL DEFAULT 'completed',
+    version    bigint      NOT NULL,
+    row_count  integer     NOT NULL DEFAULT 0,
+    error      text,
+    payload    jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_fo_snap_version ON fo_scan_snapshots(version DESC);
+
 -- ── Symbol-keyed state tables [2026-08-04 Trinity migration] ───────────
 -- One row per symbol, UPSERTed every producer cycle instead of appended.
 -- Replaces live_scanner_snapshots and dore_live_state_snapshots (both
@@ -878,6 +905,10 @@ DECLARE
 BEGIN
     order_col := CASE p_table
         WHEN 'market_intelligence_snapshots' THEN 'version'
+        -- [Restored, 2026-09-09] see fo_scan_snapshots' own restore
+        -- note above — table's back, so this needs to prune it again
+        -- instead of erroring every retention cycle.
+        WHEN 'fo_scan_snapshots'             THEN 'version'
         WHEN 'dore_options_scan_snapshots'   THEN 'version'
         WHEN 'dore_technical_plans_snapshots' THEN 'version'
         WHEN 'index_dore_snapshots'           THEN 'version'

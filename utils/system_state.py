@@ -238,11 +238,13 @@ def _parse_ts(val) -> Optional[datetime]:
 
 # [Ops fix, 2026-08-26] Process-wide cache for get_system_state().
 #
-# scheduler/scan_worker.py runs 4 independent loop threads
-# (market_intelligence, dore_live_state, live_scanner, retention) —
-# was 5 until the "index_dore" job was removed 2026-09-08 (indices
-# moved to the DORE Options tab, see utils.market_intelligence's module
-# docstring) — and every one of them calls should_scheduler_run() ->
+# scheduler/scan_worker.py runs 6 independent loop threads
+# (market_intelligence, dore_live_state, index_dore, fo_scan,
+# live_scanner, retention) — was 4 for one day (2026-09-08 to 09-09)
+# between index_dore's removal and restore, and fo_scan was off longer
+# still (2026-08-03 to 2026-09-09) — see scheduler/scan_worker.py's
+# _index_dore_compute/_fo_scan_compute comments for why both came
+# back — and every one of them calls should_scheduler_run() ->
 # get_system_state() at its own cycle boundary — including the 600s
 # "are we still paused?" poll each does outside market hours (see that
 # file's 2026-08-22 comment on _run_loop). Each loop's 600s timer is

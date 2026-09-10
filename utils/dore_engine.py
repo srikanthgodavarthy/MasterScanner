@@ -3811,16 +3811,18 @@ def compute_index_dore(index_key: str, ohlcv, oi: dict, ce_pe_chg: tuple,
     """Full index-level DORE 2.0 read (Stage 1-5 + position sizing) for
     one of NIFTY / SENSEX / BANKNIFTY, as a JSON-safe dict.
 
-    [Orphaned, 2026-09-08] Its only caller,
-    utils.market_intelligence.compute_all_index_dore(), was removed —
-    indices moved to the DORE Options tab (utils.dore_options_scan),
-    which never called this function. Left in place rather than deleted
-    since utils.fo_scan and this module's own compute_index_dore()-
-    adjacent helper (fetch_symbol_futures_daily_and_execution_features())
-    are unrelated and unaffected either way, but nothing calls this
-    function today — grep the repo to confirm before relying on it, and
-    consider deleting it in a dedicated cleanup pass (same category as
-    stage2_5_cv4_evidence()'s already-known dead-code status).
+    [Restored, 2026-09-09] Was orphaned 2026-09-08 to 09-09 (see git
+    history for the one-day gap) — its caller,
+    utils.market_intelligence.compute_all_index_dore(), was removed
+    when indices moved to the DORE Options tab. Now called again by
+    utils.index_dore_job.compute_all_index_dore() (a fresh, standalone
+    module — deliberately NOT market_intelligence.py again, per SG's
+    request) via scheduler/scan_worker.py's restored "index_dore" job.
+    See utils/index_dore_job.py's module docstring for the full story
+    on why this needed reviving: this function's fuller Stage 1-5
+    (IV-crush hard gate, Option Intelligence Score, the full weighted
+    futures Stage 1) isn't matched by utils.dore_options_engine.py's
+    live pipeline, which has none of those three things.
 
     [2026-08-25] Moved here from utils.market_intelligence._index_dore —
     market_intelligence's job is assembling the Market Intelligence
