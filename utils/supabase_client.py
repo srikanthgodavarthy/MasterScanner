@@ -1656,7 +1656,8 @@ def load_iv_skew_intraday_log(symbol: Optional[str] = None,
         params.append(limit)
         return db.fetch_all(
             f"""SELECT symbol, ts, trade_date, ce_iv, pe_iv, skew,
-                       skew_delta_since_open, skew_delta_last_n_cycles, skew_trend_vs_open
+                       skew_delta_since_open, skew_delta_last_n_cycles, skew_trend_vs_open,
+                       atr_move, iv_move, expected_move_source
                 FROM dore_iv_skew_log {where}
                 ORDER BY ts ASC LIMIT %s""",
             tuple(params),
@@ -2478,10 +2479,33 @@ CREATE TABLE IF NOT EXISTS dore_iv_skew_log (
     skew                      numeric,
     skew_delta_since_open     numeric,
     skew_delta_last_n_cycles  numeric,
-    skew_trend_vs_open        text
+    skew_trend_vs_open        text,
+    -- [2026-09-15, SG request: "how often does IV win"] atr_move/
+    -- iv_move are this SAME cycle's compute_dore_trade_plan() ATR-
+    -- based and IV-implied expected_move figures (points, not %) --
+    -- iv_move is populated whenever ce_iv/pe_iv/spot/dte allowed
+    -- computing it that cycle, REGARDLESS of whether it won or of
+    -- settings.use_iv_expected_move's value, so this table alone can
+    -- answer "how often would IV have won" even for a day the flag
+    -- was off. expected_move_source ('ATR'|'IV') is what actually got
+    -- used for sig.expected_move that cycle. All three NULL on rows
+    -- written before this migration, or on any future caller of
+    -- record_and_diff_skew() that doesn't pass them.
+    atr_move                  numeric,
+    iv_move                   numeric,
+    expected_move_source      text
 );
 CREATE INDEX IF NOT EXISTS idx_dore_iv_skew_log_symbol_ts ON dore_iv_skew_log(symbol, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_dore_iv_skew_log_trade_date ON dore_iv_skew_log(trade_date);
+"""
+
+# [2026-09-15, SG request: "how often does IV win"] Run once against
+# an existing dore_iv_skew_log table. Purely additive/nullable --
+# every pre-existing row simply has these three columns NULL.
+DORE_IV_SKEW_LOG_EXPECTED_MOVE_MIGRATION_SQL = """
+ALTER TABLE dore_iv_skew_log ADD COLUMN IF NOT EXISTS atr_move numeric;
+ALTER TABLE dore_iv_skew_log ADD COLUMN IF NOT EXISTS iv_move numeric;
+ALTER TABLE dore_iv_skew_log ADD COLUMN IF NOT EXISTS expected_move_source text;
 """
 
 SCHEMA_SQL += """

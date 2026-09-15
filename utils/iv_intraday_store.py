@@ -156,13 +156,28 @@ def _classify_skew_trend(opening_skew: float, current_skew: float) -> str:
 
 
 def _log_reading(symbol: str, trade_date: date, ce_iv: float, pe_iv: float,
-                  reading: "IntradaySkewReading") -> None:
+                  reading: "IntradaySkewReading",
+                  atr_move: Optional[float] = None, iv_move: Optional[float] = None,
+                  expected_move_source: Optional[str] = None) -> None:
     """Append one row to the outbox for the next flush_to_supabase()
     call. Called for every REAL reading record_and_diff_skew() produces
     (both the first-of-day and subsequent branches) — never for the
     all-None missing-data case, so the durable log never contains a
     fabricated row. See flush_to_supabase()'s docstring for where this
-    ends up."""
+    ends up.
+
+    atr_move/iv_move/expected_move_source : [2026-09-15, SG request —
+    "how often does IV win"] Optional pass-through of compute_dore_
+    trade_plan()'s own expected_move comparison for this same cycle —
+    this function has no way to compute these itself (it only ever
+    sees ce_iv/pe_iv, never spot/dte/ATR), so the caller supplies them.
+    All three stay None when the caller doesn't pass them (e.g. any
+    other future caller of record_and_diff_skew that isn't
+    compute_dore_trade_plan) — additive, never required. iv_move is
+    None whenever ce_iv/pe_iv/spot/dte didn't allow computing it that
+    cycle (see compute_dore_trade_plan's own fail-soft rule), NOT
+    necessarily whenever IV lost to ATR — check expected_move_source
+    to tell those apart."""
     with _LOG_LOCK:
         _pending_log_rows.append({
             "symbol": symbol,
@@ -174,6 +189,9 @@ def _log_reading(symbol: str, trade_date: date, ce_iv: float, pe_iv: float,
             "skew_delta_since_open": reading.skew_delta_since_open,
             "skew_delta_last_n_cycles": reading.skew_delta_last_n_cycles,
             "skew_trend_vs_open": reading.skew_trend_vs_open,
+            "atr_move": round(atr_move, 2) if atr_move is not None else None,
+            "iv_move": round(iv_move, 2) if iv_move is not None else None,
+            "expected_move_source": expected_move_source,
         })
 
 
@@ -220,7 +238,9 @@ def flush_to_supabase() -> None:
     _flush_executor.submit(_flush)
 
 
-def record_and_diff_skew(symbol: str, ce_iv: Optional[float], pe_iv: Optional[float]) -> IntradaySkewReading:
+def record_and_diff_skew(symbol: str, ce_iv: Optional[float], pe_iv: Optional[float],
+                          atr_move: Optional[float] = None, iv_move: Optional[float] = None,
+                          expected_move_source: Optional[str] = None) -> IntradaySkewReading:
     """Record this cycle's ce_iv/pe_iv-derived skew for `symbol` and
     return an IntradaySkewReading versus this calendar day's opening
     skew and versus _SKEW_HIST_DEPTH polls ago. Thread-safe; cheap;
@@ -228,6 +248,16 @@ def record_and_diff_skew(symbol: str, ce_iv: Optional[float], pe_iv: Optional[fl
     right alongside the existing chain.ce_iv/pe_iv-derived iv_skew
     computation in compute_dore_trade_plan() — see that call site's
     comment for why this lives next to it.
+
+    atr_move/iv_move/expected_move_source : [2026-09-15, SG request —
+    "how often does IV win"] Purely pass-through to _log_reading()'s
+    outbox row (see that function's docstring) — this function's own
+    skew tracking logic never reads them. Letting compute_dore_trade_
+    plan() piggyback its expected_move comparison on this function's
+    already-existing per-cycle log call, rather than adding a second
+    log call/table, gets a per-cycle (not per-mint) sample size for
+    "how often does the IV branch win" from day one instead of waiting
+    on rare mints.
 
     Returns an all-None IntradaySkewReading when either IV leg is
     missing this cycle (Upstox returned no Greeks) — never fabricates
@@ -260,7 +290,9 @@ def record_and_diff_skew(symbol: str, ce_iv: Optional[float], pe_iv: Optional[fl
                 skew_delta_last_n_cycles=None,
                 skew_trend_vs_open=None,
             )
-            _log_reading(symbol, today, ce_iv, pe_iv, reading)
+            _log_reading(symbol, today, ce_iv, pe_iv, reading,
+                         atr_move=atr_move, iv_move=iv_move,
+                         expected_move_source=expected_move_source)
             return reading
 
         opening_skew = state["opening_skew"]
@@ -284,7 +316,9 @@ def record_and_diff_skew(symbol: str, ce_iv: Optional[float], pe_iv: Optional[fl
             ),
             skew_trend_vs_open=skew_trend_vs_open,
         )
-        _log_reading(symbol, today, ce_iv, pe_iv, reading)
+        _log_reading(symbol, today, ce_iv, pe_iv, reading,
+                     atr_move=atr_move, iv_move=iv_move,
+                     expected_move_source=expected_move_source)
         return reading
 
 

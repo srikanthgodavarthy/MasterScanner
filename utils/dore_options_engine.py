@@ -2558,16 +2558,19 @@ def compute_dore_trade_plan(
     # and threaded onto OptionTradePlan / frozen at mint, so closed
     # trades can be backtested by which source drove their POP/targets.
     expected_move_source = "ATR"
+    _atr_expected_move = sig.expected_move
+    _iv_expected_move = None
     _ce_iv = option_data.get("ce_iv")
     _pe_iv = option_data.get("pe_iv")
-    if (
-        settings.use_iv_expected_move
-        and _ce_iv is not None and _pe_iv is not None
-        and sig.current_price > 0 and dte > 0
-    ):
+    if _ce_iv is not None and _pe_iv is not None and sig.current_price > 0 and dte > 0:
+        # Computed whenever data allows, independent of settings.
+        # use_iv_expected_move -- so the win-rate/near-miss logging
+        # below (record_and_diff_skew's atr_move/iv_move columns) has
+        # a real comparison even while the flag is off, without ever
+        # letting an off flag's computation affect sig.expected_move.
         _avg_iv = (float(_ce_iv) + float(_pe_iv)) / 2.0
         _iv_expected_move = sig.current_price * (_avg_iv / 100.0) * math.sqrt(dte / 365.0)
-        if _iv_expected_move > sig.expected_move:
+        if settings.use_iv_expected_move and _iv_expected_move > sig.expected_move:
             sig.expected_move = round(_iv_expected_move, 2)
             expected_move_source = "IV"
 
@@ -2709,7 +2712,16 @@ def compute_dore_trade_plan(
     # feeds a score.
     try:
         from utils.iv_intraday_store import record_and_diff_skew
-        _skew_reading = record_and_diff_skew(sig.symbol, chain.ce_iv, chain.pe_iv)
+        _skew_reading = record_and_diff_skew(
+            sig.symbol, chain.ce_iv, chain.pe_iv,
+            # [2026-09-15, "how often does IV win" logging] Piggybacks
+            # on this call's existing per-cycle outbox rather than a
+            # separate log table -- see record_and_diff_skew's own
+            # docstring for why these three params were added.
+            atr_move=_atr_expected_move,
+            iv_move=_iv_expected_move,
+            expected_move_source=expected_move_source,
+        )
     except Exception:
         logger.warning("[DORE Options:%s] intraday skew tracking failed (non-fatal, "
                         "observation fields stay None this call)", sig.symbol, exc_info=True)
