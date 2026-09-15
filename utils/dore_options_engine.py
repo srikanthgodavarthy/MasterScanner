@@ -607,7 +607,29 @@ class MasterScannerSignal:
 
         if expected_move is None:
             _dte = dte if dte and dte > 0 else 5
-            expected_move = round(atr * math.sqrt(_dte), 2)
+            # [2026-09-15, ATR/IV expected-move parity fix] `dte` here
+            # is CALENDAR days (utils.dore_options_scan._days_to_expiry's
+            # own docstring says so explicitly), but `atr` is a per-
+            # TRADING-day figure — a 14-period Wilder EWM of daily True
+            # Range computed over trading-day OHLC bars, where weekends/
+            # holidays simply have no row (see utils.scanner_engine.atr()).
+            # Applying sqrt(calendar_dte) directly treats non-trading
+            # weekend days as if ATR accrued through them too, overstating
+            # the ATR-implied move by roughly sqrt(7/5) for a holiday-free
+            # week (~19% for a ~27-calendar-day / ~19-trading-day expiry).
+            # Derate to an approximate trading-day count first — a flat
+            # 5/7 weekday fraction, not a real market-holiday calendar
+            # (the remaining holiday-vs-weekend gap is smaller and not
+            # worth a calendar dependency here).
+            #
+            # This fixes ONLY this ATR-based expected_move. The IV-
+            # implied branch in compute_dore_trade_plan() correctly
+            # keeps calendar-day dte/365 as-is — annualized IV is quoted
+            # against calendar days by market convention, so that side
+            # was never the bug (confirmed by checking atr's actual
+            # window before assuming otherwise).
+            _trading_dte = _dte * (5.0 / 7.0)
+            expected_move = round(atr * math.sqrt(_trading_dte), 2)
 
         # [Setup-Aware Conviction, 2026-08-06] see MasterScannerSignal's
         # field-block docstring — straight pass-through of columns
@@ -1249,12 +1271,12 @@ class OptionTradePlan:
     pe_iv:                   Optional[float] = None
 
     # [2026-09-15] Which branch actually produced this plan's
-    # expected_move — "ATR" (from_scan_row()'s atr*sqrt(dte), including
-    # whenever settings.use_iv_expected_move is False or IV data was
-    # unavailable) or "IV" (the IV-implied 1-SD move was strictly
-    # larger and got used instead). Lets closed-trade backtests split
-    # POP/target accuracy by source instead of treating expected_move
-    # as one undifferentiated number.
+    # expected_move — "ATR" (from_scan_row()'s atr*sqrt(trading_dte),
+    # including whenever settings.use_iv_expected_move is False or IV
+    # data was unavailable) or "IV" (the IV-implied 1-SD move was
+    # strictly larger and got used instead). Lets closed-trade
+    # backtests split POP/target accuracy by source instead of
+    # treating expected_move as one undifferentiated number.
     expected_move_source:    str = "ATR"
 
     # [IV/skew-shift leading signal, 2026-09-10, Phase 1 — OBSERVATION
@@ -2519,18 +2541,19 @@ def compute_dore_trade_plan(
     )
 
     # [IV-aware expected move, 2026-09-15, SG request] expected_move
-    # above is purely ATR-based (atr * sqrt(dte), see from_scan_row())
-    # — structurally blind to the options market's own priced-in
-    # volatility. Confirmed 2026-09-15 that ce_iv/pe_iv are already
-    # sitting in `option_data` at this point (the caller fetches the
-    # chain before this function runs — same fields that end up on
-    # OptionTradePlan.ce_iv/pe_iv below), just never fed into this
-    # calculation. Blends in the IV-implied 1-SD expected move (spot *
-    # avg_iv/100 * sqrt(dte/365) — the standard lognormal-approximation
-    # shape; no existing IV-annualization convention elsewhere in this
-    # file to match, so this introduces one) and takes whichever of
-    # the two is LARGER — never smaller. max(), not a blend/average,
-    # deliberately: a calm ATR reading must never suppress a genuinely
+    # above is purely ATR-based (atr * sqrt(trading_dte), see
+    # from_scan_row()) — structurally blind to the options market's
+    # own priced-in volatility. Confirmed 2026-09-15 that ce_iv/pe_iv
+    # are already sitting in `option_data` at this point (the caller
+    # fetches the chain before this function runs — same fields that
+    # end up on OptionTradePlan.ce_iv/pe_iv below), just never fed
+    # into this calculation. Blends in the IV-implied 1-SD expected
+    # move (spot * avg_iv/100 * sqrt(dte/365) — the standard
+    # lognormal-approximation shape; no existing IV-annualization
+    # convention elsewhere in this file to match, so this introduces
+    # one) and takes whichever of the two is LARGER — never smaller.
+    # max(), not a blend/average, deliberately: a calm ATR reading
+    # must never suppress a genuinely
     # larger IV-implied move, since an understated expected_move is
     # exactly what silently overstates POP and under-sizes targets —
     # the failure mode this was built to close.
