@@ -4198,9 +4198,35 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
                 if status == "Triggered" else
                 '<span style="color:#d29922;font-weight:600;font-size:12px;">⏳ Waiting</span>')
 
-    headers = ["Symbol", "Direction", "Source", "Primary Strike", "Confidence", "Trigger", "Plan", "Current Premium",
-               "Entry Zone", "Stop Loss", "Target 1", "Target 2", "Saved Entry / Drift %", "POP %",
-               "Expiry", "DTE"]
+    # [2026-09-15, SG request] Surface the IV/skew-shift Phase 1 fields
+    # (utils/iv_intraday_store.py — see handoff_dore_iv_skew_phase1.md)
+    # in the Live Scan table. Display-only: purely renders ce_iv/pe_iv
+    # and skew_trend_vs_open, does not read into any filter/sort/gate —
+    # Phase 1's non-gating constraint is unaffected by this.
+    _TREND_BADGE = {
+        "TOWARD_FLAT":   ("↘", "#58a6ff"),
+        "AWAY_FROM_FLAT": ("↗", "#d29922"),
+        "INVERTED":      ("⇅", "#f85149"),
+        "STABLE":        ("→", "#8b949e"),
+        "OPENED_FLAT":   ("·", "#8b949e"),
+    }
+
+    def _fmt_iv_skew(row):
+        direction = row.get("direction")
+        ce_iv, pe_iv = row.get("ce_iv"), row.get("pe_iv")
+        iv = ce_iv if direction == "CE" else pe_iv if direction == "PE" else None
+        if iv in (None, "") or pd.isna(iv):
+            return '<span style="color:var(--muted);font-size:12px;">—</span>'
+        trend = row.get("skew_trend_vs_open")
+        glyph, color = _TREND_BADGE.get(trend, ("", "var(--muted)"))
+        delta = row.get("skew_delta_since_open")
+        delta_txt = f" {glyph} {delta:+.1f}pp" if delta not in (None, "") and pd.notna(delta) and glyph else ""
+        return (f'<span style="font-size:12px;">{iv:.1f}'
+                f'<span style="color:{color};font-weight:600;">{delta_txt}</span></span>')
+
+    headers = ["Symbol", "Direction", "Source", "Primary Strike", "Confidence", "Trigger", "IV", "Plan",
+               "Current Premium", "Entry Zone", "Stop Loss", "Target 1", "Target 2", "Saved Entry / Drift %",
+               "POP %", "Expiry", "DTE"]
 
     rows_html = []
     for _, r in df.iterrows():
@@ -4224,6 +4250,7 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
             f'<td style="white-space:nowrap;"><span style="color:{conf_color};font-weight:700;">'
             f'{conf_dot} {_fmt_score(conf)}</span></td>',
             f'<td>{_fmt_trigger(r)}</td>',
+            f'<td>{_fmt_iv_skew(r)}</td>',
             f'<td>{_fmt_plan_status(r)}</td>',
             f'<td>{_fmt_current_premium(r)}</td>',
             f'<td>{_fmt_entry_zone(r.get("entry_zone"))}</td>',
