@@ -1447,8 +1447,12 @@ _CSS = """
 
 .ni-event-icon { margin-right: 3px; }
 
-/* Per-symbol price-reaction context — tiny sparkline + "% since this
-   story broke" badge, stacked beneath the symbol chip + day-%chg. */
+/* Per-symbol price-reaction context — "% since this story broke"
+   badge, stacked beneath the symbol chip + day-%chg. [2026-09-15]
+   Previously also had a tiny sparkline here; removed per request —
+   .ni-reaction-wrap kept as a flex wrapper since it still holds the
+   one badge span and any future re-add of the sparkline slots back
+   in without a CSS change. */
 .ni-reaction-wrap {
   display: flex; align-items: center; gap: 4px; margin-top: 2px;
 }
@@ -2708,19 +2712,31 @@ def _ni_sparkline_svg(values: list[float], color: str = "#8b949e",
 
 
 def _ni_reaction_html(reaction: dict | None) -> str:
-    """Sparkline + '<sign>X.XX% since' badge for one matched symbol, or
-    '' if no reaction context is available for it."""
+    """'<sign>X.XX% since' badge for one matched symbol, or '' if no
+    reaction context is available for it.
+
+    [2026-09-15, SG request: remove the graph] Previously rendered a
+    tiny sparkline (_ni_sparkline_svg) alongside this badge. Dropped
+    per request -- the News Impact table row is dense enough (TIME,
+    SECTOR, STOCK(S), IMPACT, CONFIDENCE, RECOMMENDATION, CURRENT
+    STATE, HEADLINE, SOURCE already) that the sparkline read as visual
+    noise rather than supporting context. _ni_sparkline_svg is left
+    in place (unused) rather than deleted, since pages/history.py has
+    its own separate _sparkline_svg copy and nothing else in this file
+    currently calls _ni_sparkline_svg -- easy to reinstate here if
+    wanted later, no data loss either way since `reaction["spark"]`
+    is still computed upstream.
+    """
     if not reaction:
         return ""
     v = reaction["since_pct"]
     color = "#3fb950" if v > 0 else "#f85149" if v < 0 else "#8b949e"
     sign = "+" if v > 0 else ""
-    spark = _ni_sparkline_svg(reaction["spark"], color=color)
     badge = (
         f'<span style="color:{color};font-size:9px;font-weight:700;white-space:nowrap;" '
         f'title="Price change since this story broke">{sign}{v:.2f}% since</span>'
     )
-    return f'<div class="ni-reaction-wrap">{spark}{badge}</div>'
+    return f'<div class="ni-reaction-wrap">{badge}</div>'
 
 
 def _news_summary_strip_html(items: list[dict]) -> str:
@@ -2863,26 +2879,28 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
             item["published"].astimezone(_IST).strftime("%I:%M %p")
             if item.get("published") else "—"
         )
-        headline_date_str = (
-            item["published"].astimezone(_IST).strftime("%Y-%m-%d")
-            if item.get("published") else None
-        )
 
-        # 2026-09-09: price-reaction context (sparkline + "% since this
-        # story broke") on the FIRST matched symbol only -- that's the
-        # story's primary subject; adding it to all 4 would be visual
-        # noise for a headline that's really about one stock, and blows
-        # up the fetch count for no added read.
+        # 2026-09-09: price-reaction context, on the FIRST matched
+        # symbol only. [2026-09-15, SG request: drop it] Removed --
+        # _ni_price_reaction() compared the close on/before the
+        # headline's date to the latest close using DAILY bars, but
+        # a fresh item's headline date is always today's IST date, so
+        # "close on/before today" and "latest close" resolved to the
+        # same daily bar (yesterday's) until today's close finalizes --
+        # same-day headlines could never show a nonzero %, structurally,
+        # not as a bug to patch. A real fix needs intraday price data
+        # wired into this cached function, which is more than this
+        # secondary badge was worth. _ni_price_reaction and
+        # _ni_sparkline_svg left in place (both already unused, the
+        # latter since the earlier sparkline-only removal) rather than
+        # deleted -- reinstate either if intraday data becomes
+        # available. The headline_date_str this fed is dropped too --
+        # nothing else in this loop consumed it.
         cell_htmls = []
-        for si, s in enumerate(symbols[:4]):
-            reaction = (
-                _ni_price_reaction(str(s), headline_date_str)
-                if si == 0 and headline_date_str else None
-            )
+        for s in symbols[:4]:
             cell_htmls.append(
                 f'<div class="ni-stock-cell">{_tv_link(s, css_class="ni-symbol-chip")}'
-                f'{_daychg_badge(_chg_lookup.get(str(s)))}'
-                f'{_ni_reaction_html(reaction)}</div>'
+                f'{_daychg_badge(_chg_lookup.get(str(s)))}</div>'
             )
         stock_chips_html = "".join(cell_htmls) if symbols else '<span class="ni-rec-dash">—</span>'
 
