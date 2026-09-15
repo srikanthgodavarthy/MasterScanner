@@ -1194,6 +1194,7 @@ def _dore_options_plan_from_row(row: dict) -> "object":
         futures_directional_agreement_at_mint  = row.get("futures_directional_agreement_at_mint"),
         ce_iv_at_mint                   = row.get("ce_iv_at_mint"),
         pe_iv_at_mint                   = row.get("pe_iv_at_mint"),
+        expected_move_source_at_mint    = row.get("expected_move_source_at_mint", "ATR") or "ATR",
     )
 
 
@@ -2175,6 +2176,7 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
     futures_directional_agreement_at_mint   boolean,
     ce_iv_at_mint                    numeric(6,2),
     pe_iv_at_mint                    numeric(6,2),
+    expected_move_source_at_mint     text        NOT NULL DEFAULT 'ATR',
 
     updated_at                   timestamptz NOT NULL DEFAULT now()
 );
@@ -2267,6 +2269,7 @@ ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS futures_confirmation_use
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS futures_directional_agreement_at_mint boolean;
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS ce_iv_at_mint numeric(6,2);
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS pe_iv_at_mint numeric(6,2);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS expected_move_source_at_mint text NOT NULL DEFAULT 'ATR';
 """
 
 # [2026-08-12, two-level lifecycle refactor] Run this once against an

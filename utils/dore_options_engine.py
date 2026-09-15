@@ -210,6 +210,18 @@ class DoreOptionsSettings:
     # depth to check empirically.
     iv_skew_caution_threshold_pp: float = 3.0
 
+    # [2026-09-15, SG request: kill switch for IV-blended expected_move]
+    # Gates the block in compute_dore_trade_plan() that overwrites
+    # sig.expected_move with max(atr_move, iv_implied_move) — see that
+    # block's own comment for the math and rationale. Default True
+    # (matches the behavior as originally landed, unguarded) so this
+    # commit is a no-op for existing callers; flip to False to fall
+    # back to pure-ATR expected_move (pre-2026-09-15 behavior) instantly,
+    # without touching the calculation code, if POP/targets need to be
+    # rolled back while the IV-blend math/impact is still being
+    # validated against real option-chain data.
+    use_iv_expected_move: bool = True
+
     capture_ratio_floor: float = 0.15
     capture_ratio_ceiling: float = 0.95
 
@@ -1235,6 +1247,15 @@ class OptionTradePlan:
     # same non-fabrication rule as iv_skew.
     ce_iv:                   Optional[float] = None
     pe_iv:                   Optional[float] = None
+
+    # [2026-09-15] Which branch actually produced this plan's
+    # expected_move — "ATR" (from_scan_row()'s atr*sqrt(dte), including
+    # whenever settings.use_iv_expected_move is False or IV data was
+    # unavailable) or "IV" (the IV-implied 1-SD move was strictly
+    # larger and got used instead). Lets closed-trade backtests split
+    # POP/target accuracy by source instead of treating expected_move
+    # as one undifferentiated number.
+    expected_move_source:    str = "ATR"
 
     # [IV/skew-shift leading signal, 2026-09-10, Phase 1 — OBSERVATION
     # ONLY] Intraday skew MOVEMENT, as distinct from iv_skew above
@@ -2497,6 +2518,59 @@ def compute_dore_trade_plan(
         scan_row, symbol=symbol, expected_move=expected_move, dte=dte, market_regime=market_regime,
     )
 
+    # [IV-aware expected move, 2026-09-15, SG request] expected_move
+    # above is purely ATR-based (atr * sqrt(dte), see from_scan_row())
+    # — structurally blind to the options market's own priced-in
+    # volatility. Confirmed 2026-09-15 that ce_iv/pe_iv are already
+    # sitting in `option_data` at this point (the caller fetches the
+    # chain before this function runs — same fields that end up on
+    # OptionTradePlan.ce_iv/pe_iv below), just never fed into this
+    # calculation. Blends in the IV-implied 1-SD expected move (spot *
+    # avg_iv/100 * sqrt(dte/365) — the standard lognormal-approximation
+    # shape; no existing IV-annualization convention elsewhere in this
+    # file to match, so this introduces one) and takes whichever of
+    # the two is LARGER — never smaller. max(), not a blend/average,
+    # deliberately: a calm ATR reading must never suppress a genuinely
+    # larger IV-implied move, since an understated expected_move is
+    # exactly what silently overstates POP and under-sizes targets —
+    # the failure mode this was built to close.
+    #
+    # Uses the AVERAGE of ce_iv/pe_iv, not the eventual recommended
+    # leg's own IV — direction() hasn't run yet here; sig.expected_move
+    # feeds INTO setup/direction scoring, not the reverse (confirmed
+    # setup_aware_conviction()'s three formulas don't reference
+    # expected_move at all, so mutating it here, before they run inside
+    # from_scan_row() -- no, AFTER from_scan_row() returns -- doesn't
+    # desync setup classification from the expected_move used below).
+    #
+    # Fail-soft: option_data missing either IV leg (Upstox didn't quote
+    # Greeks this cycle), non-positive spot, or non-positive dte all
+    # leave sig.expected_move exactly as from_scan_row() computed it —
+    # never fabricates an IV reading to force a blend.
+    #
+    # [2026-09-15] Gated behind settings.use_iv_expected_move (default
+    # True, so behavior is unchanged from how this landed) — flip to
+    # False for an instant rollback to pure-ATR expected_move without
+    # touching this calculation. expected_move_source records which
+    # branch actually won this call ("ATR" when the setting is off, IV
+    # unavailable, or ATR >= IV move; "IV" only when the IV-implied
+    # move was strictly larger and got used) — read by the caller below
+    # and threaded onto OptionTradePlan / frozen at mint, so closed
+    # trades can be backtested by which source drove their POP/targets.
+    expected_move_source = "ATR"
+    _ce_iv = option_data.get("ce_iv")
+    _pe_iv = option_data.get("pe_iv")
+    if (
+        settings.use_iv_expected_move
+        and _ce_iv is not None and _pe_iv is not None
+        and sig.current_price > 0 and dte > 0
+    ):
+        _avg_iv = (float(_ce_iv) + float(_pe_iv)) / 2.0
+        _iv_expected_move = sig.current_price * (_avg_iv / 100.0) * math.sqrt(dte / 365.0)
+        if _iv_expected_move > sig.expected_move:
+            sig.expected_move = round(_iv_expected_move, 2)
+            expected_move_source = "IV"
+
     reject = hard_reject(sig, option_data, settings)
     if reject:
         return DoreRejection(sig.symbol, "HardReject", reject)
@@ -3151,6 +3225,8 @@ def compute_dore_trade_plan(
         iv_percentile=iv.iv_percentile if iv is not None else None,
         ce_iv=chain.ce_iv,
         pe_iv=chain.pe_iv,
+        # [Kill-switch + source tracking, 2026-09-15]
+        expected_move_source=expected_move_source,
         # [IV/skew-shift leading signal, 2026-09-10, Phase 1 — OBSERVATION ONLY]
         skew_opening_today=_skew_reading.skew_opening_today,
         skew_delta_since_open=_skew_reading.skew_delta_since_open,

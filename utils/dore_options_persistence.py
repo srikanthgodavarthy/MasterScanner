@@ -564,6 +564,11 @@ class DoreOptionsPlan:
     # rest of this block.
     ce_iv_at_mint:                      Optional[float] = None
     pe_iv_at_mint:                      Optional[float] = None
+    # [2026-09-15] Frozen copy of OptionTradePlan.expected_move_source —
+    # "ATR" or "IV" — same rationale as the rest of this block: lets
+    # closed trades be backtested by which expected_move source actually
+    # drove their POP/targets at mint time.
+    expected_move_source_at_mint:      str = "ATR"
 
     @property
     def contract_key(self) -> str:
@@ -673,6 +678,7 @@ class DoreOptionsPlan:
             "futures_directional_agreement_at_mint": self.futures_directional_agreement_at_mint,
             "ce_iv_at_mint":                 self.ce_iv_at_mint,
             "pe_iv_at_mint":                 self.pe_iv_at_mint,
+            "expected_move_source_at_mint":  self.expected_move_source_at_mint or "ATR",
         }
 
 
@@ -1291,6 +1297,7 @@ def enrich_trade_plans_with_persistence(
                     futures_directional_agreement_at_mint=row.get("futures_directional_agreement"),
                     ce_iv_at_mint=row.get("ce_iv"),
                     pe_iv_at_mint=row.get("pe_iv"),
+                    expected_move_source_at_mint=row.get("expected_move_source") or "ATR",
                 )
                 just_minted = True
                 open_now[key] = locked
