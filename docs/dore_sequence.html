@@ -1,0 +1,53 @@
+<style>
+#seq svg .actor { rx: 8px; }
+#seq svg .messageLine0, #seq svg .messageLine1 { stroke-opacity: 0.6; }
+#seq svg .note { rx: 6px; }
+</style>
+<div id="seq"></div>
+<script type="module">
+import mermaid from 'https://esm.sh/mermaid@11/dist/mermaid.esm.min.mjs';
+const themeMode = document.documentElement.dataset.mode;
+const dark = themeMode ? themeMode === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+await document.fonts.ready;
+mermaid.initialize({
+  startOnLoad: false,
+  theme: 'base',
+  fontFamily: '"anthropic-sans", sans-serif',
+  themeVariables: {
+    darkMode: dark,
+    fontSize: '13px',
+    fontFamily: '"anthropic-sans", sans-serif',
+    lineColor: dark ? '#9c9a92' : '#73726c',
+    textColor: dark ? '#c2c0b6' : '#3d3d3a',
+  },
+});
+const src = `sequenceDiagram
+  participant Sched as Scheduler (60s)
+  participant Scan as dore_options_scan
+  participant Eng as compute_dore_trade_plan
+  participant Ups as Upstox
+  participant IVS as iv_history_store
+  participant DB as Neon
+  participant Mint as persistence (mint)
+
+  Sched->>Scan: run cycle
+  Scan->>Eng: per symbol
+  Eng->>Ups: fetch option chain
+  Ups-->>Eng: ce_iv, pe_iv
+  Eng->>Eng: SMC direction (futures OHLC)
+  Eng->>Eng: iv_skew + caution note
+  Eng->>IVS: get_iv_rank_percentile
+  IVS->>DB: load trailing IV history
+  DB-->>IVS: daily rows
+  IVS-->>Eng: IVContext (rank, pctile)
+  Eng->>Eng: select_strikes (capture ratio)
+  Eng->>Eng: expected_move = max(ATR, IV) [flag]
+  Eng-->>Scan: OptionTradePlan
+  Scan->>IVS: flush_to_supabase (once/cycle)
+  IVS->>DB: upsert today's IV
+  Note over Mint,DB: on promote to locked trade
+  Mint->>Mint: freeze *_at_mint fields
+  Mint->>DB: insert dore_options_plans`;
+const { svg } = await mermaid.render('seq-svg', src);
+document.getElementById('seq').innerHTML = svg;
+</script>
