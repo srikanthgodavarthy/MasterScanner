@@ -557,6 +557,14 @@ class DoreOptionsPlan:
     iv_rank_at_mint:                    Optional[float] = None
     iv_percentile_at_mint:              Optional[float] = None
     direction_source_at_mint:           str = ""    # SMC-Futures | SMC-Spot | Futures-EMA | Spot-EMA
+    # [Review fix, 2026-09-15] structural_data_source_at_mint was the
+    # one field this block's own docstring named (line ~540, "...
+    # direction_source/...") but never actually carried into the mint
+    # mapping below or to_dict() — sat right next to direction_source
+    # on OptionTradePlan itself, just missed when this block was built.
+    # Same frozen-at-mint, non-gating, additive-only contract as
+    # everything else here.
+    structural_data_source_at_mint:     str = ""    # "Futures" | "Spot" | ""
     futures_confirmation_used_at_mint:  bool = False
     futures_directional_agreement_at_mint: Optional[bool] = None
     # [SG request] Raw same-day ATM leg IVs behind iv_skew_at_mint —
@@ -674,6 +682,7 @@ class DoreOptionsPlan:
             "iv_rank_at_mint":               self.iv_rank_at_mint,
             "iv_percentile_at_mint":         self.iv_percentile_at_mint,
             "direction_source_at_mint":      self.direction_source_at_mint or "",
+            "structural_data_source_at_mint": self.structural_data_source_at_mint or "",
             "futures_confirmation_used_at_mint":    bool(self.futures_confirmation_used_at_mint),
             "futures_directional_agreement_at_mint": self.futures_directional_agreement_at_mint,
             "ce_iv_at_mint":                 self.ce_iv_at_mint,
@@ -1293,6 +1302,7 @@ def enrich_trade_plans_with_persistence(
                     iv_rank_at_mint=row.get("iv_rank"),
                     iv_percentile_at_mint=row.get("iv_percentile"),
                     direction_source_at_mint=row.get("direction_source") or "",
+                    structural_data_source_at_mint=row.get("structural_data_source") or "",
                     futures_confirmation_used_at_mint=bool(row.get("futures_confirmation_used", False)),
                     futures_directional_agreement_at_mint=row.get("futures_directional_agreement"),
                     ce_iv_at_mint=row.get("ce_iv"),

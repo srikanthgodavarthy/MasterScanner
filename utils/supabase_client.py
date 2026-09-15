@@ -1190,6 +1190,7 @@ def _dore_options_plan_from_row(row: dict) -> "object":
         iv_rank_at_mint                = row.get("iv_rank_at_mint"),
         iv_percentile_at_mint          = row.get("iv_percentile_at_mint"),
         direction_source_at_mint       = row.get("direction_source_at_mint", "") or "",
+        structural_data_source_at_mint = row.get("structural_data_source_at_mint", "") or "",
         futures_confirmation_used_at_mint      = bool(row.get("futures_confirmation_used_at_mint", False)),
         futures_directional_agreement_at_mint  = row.get("futures_directional_agreement_at_mint"),
         ce_iv_at_mint                   = row.get("ce_iv_at_mint"),
@@ -2173,6 +2174,7 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
     iv_rank_at_mint                 numeric(6,2),
     iv_percentile_at_mint           numeric(6,2),
     direction_source_at_mint        text        NOT NULL DEFAULT '',
+    structural_data_source_at_mint  text        NOT NULL DEFAULT '',
     futures_confirmation_used_at_mint       boolean     NOT NULL DEFAULT false,
     futures_directional_agreement_at_mint   boolean,
     ce_iv_at_mint                    numeric(6,2),
@@ -2266,6 +2268,7 @@ ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS iv_skew_caution_at_mint 
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS iv_rank_at_mint numeric(6,2);
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS iv_percentile_at_mint numeric(6,2);
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS direction_source_at_mint text NOT NULL DEFAULT '';
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS structural_data_source_at_mint text NOT NULL DEFAULT '';
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS futures_confirmation_used_at_mint boolean NOT NULL DEFAULT false;
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS futures_directional_agreement_at_mint boolean;
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS ce_iv_at_mint numeric(6,2);
