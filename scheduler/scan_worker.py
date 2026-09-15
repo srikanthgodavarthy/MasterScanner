@@ -499,30 +499,28 @@ JOBS = [
     # (utils/scanner_engine.py), 180s keeps this comfortably fresh while
     # cutting sustained CPU/network load roughly 6x.
     ("market_intelligence", "market_intelligence", 180, _market_intelligence_compute, _market_intelligence_payload),
-    # [Restored, 2026-09-09, SG request] Stocks' own DORE 2.0 read
-    # (utils.fo_scan -> utils.dore_engine, the same richer engine —
-    # IV-crush hard gate, Option Intelligence Score, full weighted
-    # futures Stage 1 — that index_dore above was just restored to keep
-    # running for indices). Was commented out here since before the
-    # DORE Options Engine (utils.dore_options_scan) became the live
-    # stocks pipeline on 2026-07-31; that's unchanged — this doesn't
-    # replace it, just gets utils.fo_scan.compute_fo_scan() computing
-    # and persisting to its own "fo_scan" section again (fo_scan_
-    # snapshots — recreated in utils/scan_state.py, dropped 2026-08-03).
-    # No UI reads this section (removed from pages/scanner.py 2026-07-31,
-    # not restored) — standalone, same as index_dore.
-    ("fo_scan",             "fo_scan",             60,  _fo_scan_compute,             _fo_scan_payload),
+    # [Disabled again, 2026-09-15, SG request] fo_scan and index_dore
+    # (both restored 2026-09-09, see _index_dore_compute's docstring
+    # above for why they were brought back) were confirmed today to be
+    # a real, measurable cost: both are standalone jobs nothing in the
+    # UI reads, yet both hit Upstox's option-chain endpoint every 60s —
+    # the SAME per-account/token rate-limit budget dore_live_state below
+    # (the actually-live pipeline) draws from. Traced from a scan_health_
+    # monitor RAM warning on index_dore plus a burst of option-chain 429s
+    # (NSE_INDEX|Nifty 50 rate-limited 6x within 12s, several stock
+    # symbols dropped after exhausting all 3 retries) — three concurrent
+    # 60s jobs contending for one Upstox token's budget. SG confirmed
+    # nothing currently depends on either job's output, so both are
+    # commented back out rather than deleted (same toggle pattern as
+    # 2026-07-25/2026-09-08/2026-09-09 above) — _fo_scan_compute/
+    # _index_dore_compute are left defined in case of a future restore.
+    # ("fo_scan",             "fo_scan",             60,  _fo_scan_compute,             _fo_scan_payload),
     # [DORE Integration, 2026-08-05] Stage 2 (Live Market Refresh) — see
     # _dore_live_state_compute above. Reads whatever Stage 1 last wrote
     # to "dore_technical_plans" (produced once per live_scanner cycle,
     # not by this job) and refreshes only market-dependent fields.
     ("dore_live_state",     "dore_live_state",     60,  _dore_live_state_compute,     _dore_live_state_payload),
-    # [Restored, 2026-09-09] See _index_dore_compute's comment above —
-    # same 60s cadence as before, same "index_dore" snapshot section
-    # (index_dore_snapshots table — this was never dropped, only the
-    # job writing to it was), just sourced from utils.index_dore_job
-    # instead of utils.market_intelligence now.
-    ("index_dore",          "index_dore",          60,  _index_dore_compute,          _index_dore_payload),
+    # ("index_dore",          "index_dore",          60,  _index_dore_compute,          _index_dore_payload),
 ]
 
 
