@@ -4545,6 +4545,7 @@ def _fetch_live_premiums_for_table(df: pd.DataFrame) -> "tuple[pd.DataFrame, int
         return df, 0
 
     from utils.upstox_client import fetch_open_plan_option_quotes
+    from utils.dore_live_state import _entry_trigger_status
 
     def _strike_of(row):
         primary = row.get("primary")
@@ -4592,6 +4593,19 @@ def _fetch_live_premiums_for_table(df: pd.DataFrame) -> "tuple[pd.DataFrame, int
         prev_close = q.get("prev_close")
         if prev_close:
             df.at[idx, "premium_change_pct"] = round((ltp - prev_close) / prev_close * 100, 2)
+        # [2026-09-16, SG report] entry_trigger_status was left as
+        # whatever the LAST FULL SCAN CYCLE computed -- comparing THAT
+        # cycle's premium to the entry zone -- while current_premium
+        # above gets refreshed on every render. The two could visibly
+        # disagree (badge says "Triggered" from 10+ minutes ago, but
+        # the live premium shown right next to it has since moved
+        # completely outside the entry zone), which read as nonsense
+        # since both numbers appear to be "now" in the same row.
+        # Recompute the badge against the SAME fresh ltp we just wrote
+        # above, so the two always describe the same point in time.
+        entry_zone = row.get("entry_zone")
+        if isinstance(entry_zone, (tuple, list)) and len(entry_zone) == 2:
+            df.at[idx, "entry_trigger_status"] = _entry_trigger_status(ltp, tuple(entry_zone))
         n_updated += 1
     return df, n_updated
 
