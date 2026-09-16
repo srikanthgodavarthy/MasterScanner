@@ -1796,6 +1796,20 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
                 "mfe_pct": _mfe_mae_pct(plan.mfe_premium, plan.entry_locked),
                 "mae_premium": plan.mae_premium,
                 "mae_pct": _mfe_mae_pct(plan.mae_premium, plan.entry_locked),
+                # [2026-09-16, SG request: add IV to Active Plans]
+                # Frozen-at-mint reading, same fields dore_options_
+                # persistence already persists for exactly this reason
+                # (see DoreOptionsPlan's ce_iv_at_mint/pe_iv_at_mint
+                # field comments) — this is "what IV was when DORE
+                # minted this plan," not a live re-fetch, matching
+                # last_premium's own "last known, not live" convention
+                # a few lines above (an extra live IV fetch per open
+                # plan has the same fetch-budget concern
+                # active_plan_rows' own docstring already raises for
+                # current_premium).
+                "ce_iv_at_mint": plan.ce_iv_at_mint,
+                "pe_iv_at_mint": plan.pe_iv_at_mint,
+                "iv_skew_at_mint": plan.iv_skew_at_mint,
                 "last_seen_at": plan.last_seen_at,
                 "created_date": plan.created_date,
                 "plan_age_days": days_active,

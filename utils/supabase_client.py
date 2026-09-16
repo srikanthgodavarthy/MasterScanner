@@ -1629,6 +1629,39 @@ def save_iv_skew_intraday_log(rows: list[dict]) -> bool:
         return False
 
 
+def load_latest_iv_skew_for_symbols(symbols: list[str]) -> dict:
+    """[2026-09-16, SG request: live-since-mint IV delta on the Active
+    Plans tab] Returns {symbol: {"ce_iv":.., "pe_iv":.., "ts":..}} —
+    the single most recent dore_iv_skew_log row per symbol, for
+    exactly the symbols passed in.
+
+    This is NOT a new live fetch — it reads the log DORE's normal scan
+    cadence already writes to on every cycle (record_and_diff_skew(),
+    wired into compute_dore_trade_plan()), so an open plan's IV-since-
+    mint delta comes for free as long as its symbol is still being
+    shortlisted by the ordinary scan. A symbol that dropped off the
+    shortlist after entry simply won't have a recent row here — the
+    caller falls back to showing no delta, same "don't fabricate a
+    live figure we don't actually have" rule as last_premium's own
+    "last known, not live" convention (see active_plan_rows'
+    docstring). Empty symbols list or no DB connection -> {}.
+    """
+    if not symbols or not db.is_available():
+        return {}
+    try:
+        rows = db.fetch_all(
+            """SELECT DISTINCT ON (symbol) symbol, ts, ce_iv, pe_iv
+               FROM dore_iv_skew_log
+               WHERE symbol = ANY(%s)
+               ORDER BY symbol, ts DESC""",
+            (list(symbols),),
+        )
+        return {r["symbol"]: {"ce_iv": r["ce_iv"], "pe_iv": r["pe_iv"], "ts": r["ts"]} for r in rows}
+    except Exception as exc:
+        logger.warning("load_latest_iv_skew_for_symbols failed: %s", exc)
+        return {}
+
+
 def load_iv_skew_intraday_log(symbol: Optional[str] = None,
                                start_date: Optional[str] = None,
                                end_date: Optional[str] = None,
