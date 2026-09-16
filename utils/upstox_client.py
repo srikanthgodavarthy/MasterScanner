@@ -1188,7 +1188,25 @@ def _get_option_chain_with_retry(instrument_key: str, expiry: str) -> Optional[l
         return None
     last_exc = None
     for attempt in range(1, _MAX_RETRIES + 1):
-        acquire_option_chain_slot()
+        # [2026-09-16 fix, SG-directed review] Was: acquire_option_chain_
+        # slot() unconditionally at the top of every attempt, including
+        # 429-retries. A 429 IS Upstox's own explicit "slow down" signal,
+        # and the exponential backoff below already sleeps in direct
+        # response to it — drawing ANOTHER token from our own 3 req/s
+        # bucket on top of that backoff double-throttles this one
+        # request while also burning a scarce shared slot a DIFFERENT,
+        # not-yet-attempted symbol could have used instead. Under real
+        # contention (today's log: 11 symbols failed after 3 full
+        # attempts, ~40+ 429-retries in one run) this let a handful of
+        # already-struggling symbols consume up to 3x their fair share
+        # of the shared budget on repeated retries, at the direct
+        # expense of fresh symbols never getting a first attempt in.
+        # Fix: only acquire a fresh token for the FIRST attempt and for
+        # non-429 retries (timeouts/connection errors below, which carry
+        # no explicit Upstox-provided wait signal, so our own bucket
+        # pacing is still the right conservative default for those).
+        if attempt == 1:
+            acquire_option_chain_slot()
         t0 = time.monotonic()
         try:
             resp = requests.get(
@@ -1214,6 +1232,7 @@ def _get_option_chain_with_retry(instrument_key: str, expiry: str) -> Optional[l
         except Exception as exc:
             record_request(time.monotonic() - t0)
             last_exc = exc
+            acquire_option_chain_slot()   # no Upstox-provided wait signal here — keep our own pacing
             time.sleep(_RETRY_BASE_S * attempt)
     record_failed(instrument_key)
     logger.warning("Upstox option-chain failed for %s after %d attempts: %s",

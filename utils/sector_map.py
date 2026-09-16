@@ -211,7 +211,7 @@ def get_sector(symbol: str) -> str:
 
 def build_sector_benchmark_series(symbol: str,
                                    close_by_symbol: dict,
-                                   max_peers: int = 15) -> "pd.Series | None":
+                                   max_peers: int = 60) -> "pd.Series | None":
     """
     Build a sector benchmark close-price series for `symbol`, for use as
     the `sector_series` param of utils.scoring_core.build_indicators()
@@ -233,7 +233,10 @@ def build_sector_benchmark_series(symbol: str,
                        cache). Only peers already present in this dict are
                        used — no new fetches are triggered here.
     max_peers       : cap on how many peers to average (perf guard on
-                       large sectors like Financials/IT).
+                       large sectors like Financials/IT). [2026-09-16
+                       fix] Was 15, same fixed-list-order truncation
+                       bias as build_sector_benchmark_frames() above
+                       (see its note) — raised to 60 to match.
 
     Returns None if the symbol's sector has no other peers present in
     close_by_symbol (e.g. thin universe, or a single-symbol backtest) —
@@ -271,7 +274,7 @@ def build_sector_benchmark_series(symbol: str,
     return basket if not basket.empty else None
 
 
-def build_sector_benchmark_frames(close_by_symbol: dict, max_peers: int = 15,
+def build_sector_benchmark_frames(close_by_symbol: dict, max_peers: int = 60,
                                    lookback_bars: int = 210) -> dict:
     """
     Batch version of build_sector_benchmark_series() — precomputes one
@@ -296,10 +299,42 @@ def build_sector_benchmark_frames(close_by_symbol: dict, max_peers: int = 15,
                        full length for ~300 symbols every scan is what
                        caused a real production RAM spike (see incident
                        2026-08-06) — hence lookback_bars below.
-    max_peers       : cap on peers PER SECTOR kept in the frame (perf
-                       guard on large sectors like Financials/IT) — the
-                       cap is applied before rebasing, so it bounds
-                       memory/compute the same way the old function did.
+    max_peers       : cap on peers PER SECTOR kept in the frame.
+                       [2026-09-16 fix, SG-directed review] Was 15 —
+                       filled in SECTOR_MAP's fixed list order (mostly
+                       alphabetical) and silently STOPPED once 15 peers
+                       were collected. 12 of ~21 sectors actually exceed
+                       15 members (Financials has 57, Pharma 36,
+                       Chemicals 33, IT 32, Auto/FMCG 31, Engineering 30,
+                       Banking/Consumer Durables 25...) — every symbol in
+                       any of those sectors was silently benchmarked
+                       against an arbitrary alphabetical-prefix subset of
+                       its real sector, never the whole thing, and a
+                       symbol positioned late in its sector's list
+                       (e.g. 3MINDIA at #27/30 in Engineering) could miss
+                       being in its OWN sector's frame entirely —
+                       sector_benchmark_for_symbol() then benchmarks it
+                       against a peer set with zero actual overlap with
+                       its real comparables (see that function's
+                       docstring for the exact fallback behavior this
+                       triggers). Root-caused during a review of the
+                       flagged CAPLIPOINT/3MINDIA/M&M score swings from
+                       the 2026-09 RS-vs-Sector threshold fix — those
+                       swings were never actually a "thin peer basket"
+                       problem (Pharma/Engineering/Auto are all large,
+                       well-populated sectors); they were this
+                       truncation bug. 60 comfortably covers every
+                       sector defined today (largest is 57) — this
+                       cap now only guards against SECTOR_MAP one day
+                       growing an outlier sector far past its current
+                       largest, not a real limit under normal use. The
+                       RAM concern this cap originally existed for
+                       (the 2026-08-06 incident) was about un-truncated
+                       multi-YEAR history, already independently solved
+                       by lookback_bars below — raising this to 60 adds
+                       at most ~90KB in the worst single sector (57
+                       peers x 210 rows x 8 bytes), nowhere near
+                       spike territory.
     lookback_bars   : each peer's close series is truncated to its LAST
                        `lookback_bars` rows before rebasing. RS vs Sector
                        only needs the same lookbacks as RS vs Market
