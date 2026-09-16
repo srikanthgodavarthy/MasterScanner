@@ -938,6 +938,34 @@ class OptionChainSnapshot:
     pe_iv:           Optional[float] = None
 
     @staticmethod
+    def _sane_iv(raw) -> Optional[float]:
+        """[2026-09-16, SG report] Discard an IV reading that's outside
+        any plausible real-market range rather than let a single bad
+        quote silently poison everything downstream of ce_iv/pe_iv --
+        iv_skew, iv_rank/iv_percentile, record_and_diff_skew's intraday
+        tracking, and the IV-blended expected_move all read from this
+        one field. Confirmed root cause: NAM-INDIA's CE leg returned
+        ce_iv~145% for 30+ minutes straight (pe_iv sat normally at
+        ~32% the whole time) -- almost certainly a wide-spread/illiquid
+        strike producing a garbage theoretical-IV calc from Upstox, not
+        a real market condition. 100% is the ceiling -- chosen because
+        every genuinely volatile name observed across two full trading
+        days of dore_iv_skew_log data (IDEA ~47%, ATHERENERG ~45%,
+        SOLARINDS ~47%) still sits well under it, so this only catches
+        clear garbage like the 145% case, not a real if unusually
+        volatile quote. Returns None (never clips to the ceiling) on
+        any out-of-range or unparseable value, so a discarded reading
+        is indistinguishable downstream from "Upstox didn't quote this
+        leg at all" -- the same fail-soft convention this field
+        already followed for missing data.
+        """
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return v if 0 < v <= 100 else None
+
+    @staticmethod
     def from_upstox(option_data: dict, dte: int) -> "OptionChainSnapshot":
         return OptionChainSnapshot(
             expiry=option_data.get("expiry", ""),
@@ -963,8 +991,8 @@ class OptionChainSnapshot:
             # fetch_oi_resistance() now return these as separate keys
             # (see utils.upstox_client's 2026-09-10 fix for the index
             # side, which used to collapse them into one blended "iv").
-            ce_iv=option_data.get("ce_iv"),
-            pe_iv=option_data.get("pe_iv"),
+            ce_iv=OptionChainSnapshot._sane_iv(option_data.get("ce_iv")),
+            pe_iv=OptionChainSnapshot._sane_iv(option_data.get("pe_iv")),
         )
 
 
