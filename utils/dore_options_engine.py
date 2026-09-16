@@ -2356,6 +2356,20 @@ def validate_oi_liquidity(
     score = 60.0
     reasons = ["Good liquidity"]
 
+    # [PCR conflict fix, 2026-09-16, SG request] The old else-branch
+    # conflated two very different situations under one "neutral-to-
+    # mixed" label + a flat -10: a genuinely ambiguous PCR (sitting
+    # between the two thresholds) vs. a PCR that actively clears the
+    # OPPOSITE direction's own bar (e.g. PE with PCR 1.16, which is
+    # past pcr_bullish_min=1.10 -- DORE's own definition of "supports
+    # CE"). The latter is real counter-evidence against the direction
+    # already chosen upstream (SMC futures-OHLC read, not PCR -- PCR
+    # never gates direction, only nudges this OI-quality sub-score),
+    # not an absence of confirming evidence, and deserved a bigger
+    # penalty + an honest label rather than being softened to the same
+    # "neutral-to-mixed" a truly in-between PCR gets. -20 mirrors the
+    # +20 reward for a supporting PCR (symmetric), vs -10 for genuine
+    # ambiguity.
     if chain.pcr is not None:
         if dir_ == CE and chain.pcr >= settings.pcr_bullish_min:
             score += 20
@@ -2363,8 +2377,20 @@ def validate_oi_liquidity(
         elif dir_ == PE and chain.pcr <= settings.pcr_bearish_max:
             score += 20
             reasons.append(f"PCR {chain.pcr:.2f} supports PE (call writing / resistance)")
+        elif dir_ == PE and chain.pcr >= settings.pcr_bullish_min:
+            score -= 20
+            reasons.append(
+                f"PCR {chain.pcr:.2f} CONFLICTS with PE (crosses CE-bullish bar "
+                f"{settings.pcr_bullish_min:.2f} -- put writers building support, not resistance)"
+            )
+        elif dir_ == CE and chain.pcr <= settings.pcr_bearish_max:
+            score -= 20
+            reasons.append(
+                f"PCR {chain.pcr:.2f} CONFLICTS with CE (crosses PE-bearish bar "
+                f"{settings.pcr_bearish_max:.2f} -- call writers building resistance, not support)"
+            )
         else:
-            score -= 10   # not decisive against the trade -> no hard reject, just a smaller bump
+            score -= 10   # genuinely ambiguous -- between both thresholds, no clear lean either way
             reasons.append(f"PCR {chain.pcr:.2f} neutral-to-mixed")
 
     wall = chain.ce_wall_strike if dir_ == CE else chain.pe_wall_strike
@@ -3068,6 +3094,45 @@ def compute_dore_trade_plan(
 
     expiry_suit = _expiry_suitability(dte, candidates[_primary_label].probability_of_profit)
     score = final_score(sig, mom, primary_oi_quality, expiry_suit, primary_premium_quality, settings)
+
+    # [PCR conflict -> forced demotion, indices only, 2026-09-16, SG
+    # request] Reviewed SMC vs. PCR as candidates for "senior" signal:
+    # SMC stays senior for DIRECTION (a structural read of the actual
+    # price object driving P&L, built to produce a clean binary call;
+    # PCR is an aggregate positioning ratio, not a directional-timing
+    # signal, and is easily distorted by hedging/rollover flows
+    # unrelated to directional view). But the existing weight profile
+    # already treats OI-quality (which houses PCR) as senior to
+    # conviction/momentum for INDICES specifically -- index_w_oi_
+    # quality=28 vs index_w_conviction=12, the reverse of the stock
+    # weights (w_conviction=30 vs w_oi_quality=15) -- because index
+    # options are dominated by large-lot institutional OI flow in a
+    # way single-stock OI generally isn't. So a PCR that actively
+    # clears the OPPOSITE direction's own threshold (the "CONFLICTS"
+    # reason from validate_oi_liquidity's fix earlier this session)
+    # gets real teeth ONLY on indices: forced demotion below
+    # MIN_CONFIDENCE_TO_TRACK_INDEX, guaranteed, regardless of how
+    # strong Conviction/EMA momentum score elsewhere -- a soft blended
+    # penalty could otherwise be diluted away by exactly those other
+    # factors. Deliberately a demotion (candidate still computed,
+    # still returned, just never clears the Confidence-floor/tracking
+    # bar), not a hard_reject() -- this is a thesis disagreement
+    # between two signals, not a liquidity/data-quality problem, and
+    # hard_reject() in this codebase is reserved for the latter. Stocks
+    # keep only the softer blended -20/-10 split from that same fix --
+    # single-stock OI/PCR isn't senior enough there to justify a floor
+    # override. Local import to avoid a circular import (dore_options_
+    # persistence.py already imports FROM this module).
+    if is_index_symbol(sig.symbol) and any(
+        "CONFLICTS" in str(r) for r in per_label_reasons[_primary_label]
+    ):
+        # Literal, not imported: importing utils.dore_options_persistence
+        # here would pull its whole module chain (-> utils.outcome_
+        # tracking -> psycopg2) into this otherwise persistence-free
+        # compute layer, on every index+conflict cycle, just to read one
+        # constant. Keep this synced with MIN_CONFIDENCE_TO_TRACK_INDEX
+        # in utils/dore_options_persistence.py if that ever changes.
+        score = min(score, 49.0)  # MIN_CONFIDENCE_TO_TRACK_INDEX (50) - 1
 
     primary = candidates[_primary_label]
     entry_low = entry_high = None

@@ -577,6 +577,18 @@ class DoreOptionsPlan:
     # closed trades be backtested by which expected_move source actually
     # drove their POP/targets at mint time.
     expected_move_source_at_mint:      str = "ATR"
+    # [2026-09-16, SG request] Frozen copy of whichever line in
+    # OptionTradePlan.reasons (Stage 7's validate_oi_liquidity — see
+    # the PCR conflict-vs-neutral fix on that function) contains the
+    # word "CONFLICTS" -- i.e. a PCR that actively clears the OPPOSITE
+    # direction's own threshold, not a merely ambiguous one. Empty
+    # string when there was no conflict (or PCR was unavailable this
+    # cycle). reasons itself isn't persisted (it's a list, and most of
+    # its lines are routine confirmations, not worth a column) — this
+    # captures only the one line worth surfacing to a trader looking
+    # at a closed/active plan later. Same frozen-at-mint, non-gating,
+    # additive-only contract as the rest of this block.
+    pcr_conflict_note_at_mint:          str = ""
 
     @property
     def contract_key(self) -> str:
@@ -688,6 +700,7 @@ class DoreOptionsPlan:
             "ce_iv_at_mint":                 self.ce_iv_at_mint,
             "pe_iv_at_mint":                 self.pe_iv_at_mint,
             "expected_move_source_at_mint":  self.expected_move_source_at_mint or "ATR",
+            "pcr_conflict_note_at_mint":     self.pcr_conflict_note_at_mint or "",
         }
 
 
@@ -1308,6 +1321,14 @@ def enrich_trade_plans_with_persistence(
                     ce_iv_at_mint=row.get("ce_iv"),
                     pe_iv_at_mint=row.get("pe_iv"),
                     expected_move_source_at_mint=row.get("expected_move_source") or "ATR",
+                    # [2026-09-16, SG request] See DoreOptionsPlan.
+                    # pcr_conflict_note_at_mint's own docstring above —
+                    # pulls the single "CONFLICTS" line (if any) out of
+                    # this cycle's reasons list, rather than persisting
+                    # the whole list.
+                    pcr_conflict_note_at_mint=next(
+                        (r for r in (row.get("reasons") or []) if "CONFLICTS" in str(r)), ""
+                    ),
                 )
                 just_minted = True
                 open_now[key] = locked
