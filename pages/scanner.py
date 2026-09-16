@@ -4036,8 +4036,18 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
             # TRACK (nothing to explain — plain "—"), or it cleared that
             # floor but the portfolio cap or the pre-breakout guard is
             # holding it back (blocked_reason set — shown as a tooltip).
+            # [2026-09-16, bug fix] `row` here is a pandas Series from
+            # df.iterrows() (see the DataFrame built a few lines above
+            # this table's render loop) -- when only SOME symbols' dicts
+            # carry a "blocked_reason" key, pandas back-fills every
+            # other row's column value with NaN, not None. `if reason:`
+            # alone treats float('nan') as truthy (bool(nan) is True in
+            # Python), so an unblocked row fell into this branch and
+            # rendered the literal string "nan" in the tooltip instead
+            # of the plain "—" below. pd.isna() catches both None and
+            # NaN; strings (real reasons) are untouched by it.
             reason = row.get("blocked_reason")
-            if reason:
+            if reason and not (isinstance(reason, float) and pd.isna(reason)):
                 return (f'<span style="color:var(--muted);cursor:help;" '
                         f'title="{_esc_attr(str(reason))}">— ⓘ</span>')
             return '<span style="color:var(--muted)">—</span>'
