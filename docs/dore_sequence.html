@@ -22,32 +22,58 @@ mermaid.initialize({
   },
 });
 const src = `sequenceDiagram
-  participant Sched as Scheduler (60s)
+  participant LS as live_scanner (~5min)
   participant Scan as dore_options_scan
   participant Eng as compute_dore_trade_plan
   participant Ups as Upstox
-  participant IVS as iv_history_store
+  participant IVH as iv_history_store
+  participant IVI as iv_intraday_store
   participant DB as Neon
+  participant Live as dore_live_state (60s)
   participant Mint as persistence (mint)
+  participant UI as scanner.py Live Scan
 
-  Sched->>Scan: run cycle
-  Scan->>Eng: per symbol
-  Eng->>Ups: fetch option chain
-  Ups-->>Eng: ce_iv, pe_iv
-  Eng->>Eng: SMC direction (futures OHLC)
-  Eng->>Eng: iv_skew + caution note
-  Eng->>IVS: get_iv_rank_percentile
-  IVS->>DB: load trailing IV history
-  DB-->>IVS: daily rows
-  IVS-->>Eng: IVContext (rank, pctile)
-  Eng->>Eng: select_strikes (capture ratio)
-  Eng->>Eng: expected_move = max(ATR, IV) [flag]
-  Eng-->>Scan: OptionTradePlan
-  Scan->>IVS: flush_to_supabase (once/cycle)
-  IVS->>DB: upsert today's IV
-  Note over Mint,DB: on promote to locked trade
-  Mint->>Mint: freeze *_at_mint fields
-  Mint->>DB: insert dore_options_plans`;
+  Note over LS,Scan: STAGE 1 — fires once per live_scanner cycle (~5 min), not on its own schedule
+  LS->>Scan: compute_dore_technical_plans(live_pool)
+  loop per F&O-eligible symbol + NIFTY/SENSEX/BANKNIFTY
+    Scan->>Eng: compute_dore_trade_plan
+    Eng->>Ups: fetch option chain
+    Ups-->>Eng: ce_iv, pe_iv
+    Eng->>Eng: SMC direction (futures OHLC)
+    Eng->>Eng: iv_skew + caution note
+    alt Scan already prefetched iv_lookup (normal path)
+      Scan-->>Eng: IVContext (rank, pctile)
+    else no prefetch available (fallback path)
+      Eng->>IVH: get_iv_rank_percentile
+      IVH->>DB: load trailing IV history
+      DB-->>IVH: daily rows
+      IVH-->>Eng: IVContext (rank, pctile)
+      Eng->>IVH: record_iv (today's ATM IV)
+    end
+    Eng->>Eng: select_strikes (capture ratio)
+    Eng->>Eng: expected_move = use_iv_expected_move? max(ATR[trading-day DTE], IV) : ATR [settings-gated]
+    Eng->>IVI: record_and_diff_skew(skew, atr_move, iv_move, expected_move_source)
+    Eng-->>Scan: OptionTradePlan
+  end
+  Scan->>IVH: flush_to_supabase (once/cycle)
+  IVH->>DB: upsert today's IV (dore_iv_history)
+  Scan->>IVI: flush_to_supabase (once/cycle)
+  IVI->>DB: insert readings (dore_iv_skew_log)
+  Scan-->>LS: dore_technical_plans snapshot
+
+  Note over Live,Mint: STAGE 2 — separate 60s job, reads whatever Stage 1 last wrote
+  Live->>Live: read dore_technical_plans
+  Live->>Ups: live premium + spot quote
+  Ups-->>Live: current_premium, spot
+  Live->>Live: entry_trigger_status (Triggered / Waiting)
+  Live->>Live: recompute POP, current risk:reward
+  alt promoted to locked trade
+    Live->>Mint: enrich_trade_plans_with_persistence
+    Mint->>Mint: freeze *_at_mint fields (incl. structural_data_source, expected_move_source)
+    Mint->>DB: insert/upsert dore_options_plans
+  end
+  Live-->>UI: dore_live_state snapshot
+  Note over UI: filters Confidence >=70(stocks)/50(indices) AND Triggered`;
 const { svg } = await mermaid.render('seq-svg', src);
 document.getElementById('seq').innerHTML = svg;
 </script>
