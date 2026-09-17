@@ -543,6 +543,21 @@ def compute_fo_opportunities(
                     "pcr": opt.get("pcr", 1.0), "expiry": opt.get("expiry", ""),
                     "atm_strike": opt.get("atm_strike") or 0.0,
                     "strike_interval": opt.get("strike_interval") or 0.0,
+                    # 2026-09 bugfix: this dict is built field-by-field
+                    # (unlike the stock branch below, which keeps the
+                    # WHOLE `opt` dict via dict(opt)) and was silently
+                    # dropping "iv"/"ce_delta"/"pe_delta", even though
+                    # fetch_oi_resistance() computes and returns all
+                    # three. build_dore_input()'s current_iv falls back
+                    # to atm_chain_row.get("iv") whenever option_intel
+                    # (never passed by this caller) doesn't have it, so
+                    # every index was reading current_iv as None while
+                    # stocks (dict(opt) keeps everything) were already
+                    # correct. This is why IV never displayed for
+                    # indices in DORE outputs.
+                    "iv": opt.get("iv"),
+                    "ce_delta": opt.get("ce_delta"),
+                    "pe_delta": opt.get("pe_delta"),
                 }
                 oi_resistance_like = {"ce_strike": opt.get("ce_strike"), "pe_strike": opt.get("pe_strike"),
                                        "expiry": opt.get("expiry")}
