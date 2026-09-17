@@ -197,6 +197,25 @@ class DoreOptionsSettings:
     iv_high_capture_adjust: float = -0.08   # high IV -> closer strikes
     iv_low_capture_adjust:  float = +0.05   # low IV -> further OTM allowed
 
+    # [IV Crush hard gate, 2026-09] utils.dore_engine's Stage 3.5 has an
+    # "Extreme IV Crush Risk" hard gate (oi_hard_gate_iv_rank=90) — but
+    # that gate lives in compute_dore()/DOREInput, a pipeline neither
+    # fo_scan.py nor dore_fo_screener.py's compute_fo_opportunities()
+    # ever reach live (both are dormant — see scheduler/scan_worker.py's
+    # commented-out JOBS entries), so the gate has never actually fired
+    # for a real plan. compute_dore_trade_plan() below is the pipeline
+    # that's actually live (called from utils.dore_options_scan.py every
+    # ~5min) and it already resolves a REAL IVContext via
+    # utils.iv_history_store.get_iv_rank_percentile() for every
+    # candidate — that data was only ever used as a soft capture-ratio
+    # nudge (iv_high_capture_adjust/iv_low_capture_adjust above), never
+    # as a reject. This adds the missing hard reject in the pipeline
+    # that's actually running, using the same threshold/semantics as
+    # dore_engine.py's gate (>= rank/percentile 90 -> reject) so the two
+    # stay conceptually aligned even though they're separate codepaths.
+    enable_iv_crush_hard_gate: bool = True
+    iv_crush_hard_gate_rank: float = 90.0
+
     # [2026-09-10, SG request: IV skew] Same-day ATM CE-vs-PE IV spread
     # (percentage points) needed before OptionTradePlan.iv_skew_caution
     # fires a note — see _iv_skew_caution()'s docstring for the two
@@ -2818,6 +2837,23 @@ def compute_dore_trade_plan(
             logger.warning("[DORE Options:%s] IV history lookup/record failed (non-fatal, "
                             "IVContext stays no-op this call)", sig.symbol, exc_info=True)
             iv = IVContext()
+
+    # [IV Crush hard gate, 2026-09] See enable_iv_crush_hard_gate's
+    # docstring above — this is the actually-live counterpart of
+    # dore_engine.py's Stage 3.5 "Extreme IV Crush Risk" trip-wire.
+    # iv_rank is preferred (matches dore_engine.py's own preference
+    # order); iv_percentile is the fallback when history is too short
+    # for a rank but long enough for a percentile. A no-op whenever
+    # neither is available (e.g. first few sessions of IV history for
+    # a symbol) — fails soft, never blocks a candidate on missing data.
+    if settings.enable_iv_crush_hard_gate:
+        _iv_gate_level = iv.iv_rank if iv.iv_rank is not None else iv.iv_percentile
+        if _iv_gate_level is not None and _iv_gate_level >= settings.iv_crush_hard_gate_rank:
+            return DoreRejection(
+                sig.symbol, "IVCrushRisk",
+                f"IV Rank/Percentile={_iv_gate_level:.0f} >= hard-gate floor "
+                f"({settings.iv_crush_hard_gate_rank:.0f}) — Extreme IV Crush Risk",
+            )
 
     strikes = select_strikes(sig, dte, dir_, confidence, settings, strike_interval=chain.strike_interval, iv=iv)
     _pre_structural_conservative_strike = strikes[CONSERVATIVE]["strike"]
