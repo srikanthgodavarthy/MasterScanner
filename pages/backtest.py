@@ -254,7 +254,7 @@ def render(settings=None):
             bt_shadow_no_gate = st.checkbox(
                 "⚠️ Shadow: disable admission gate (diagnostic only)",
                 value=False, key="bt_shadow_no_gate",
-                help="Simulates every setup regardless of tier/R:R gate, tagging each trade passed_gate=True/False plus its 5 Entry-Quality sub-scores (eq_ema20_dist, eq_pivot_dist, eq_move_since_setup, eq_ema50_dist, eq_bars_since_setup). Produces a wider-range dataset for component-level correlation/PF/expectancy analysis. Do NOT use this run's stats as a live-strategy result — it includes setups the real Scanner would reject."
+                help="Simulates every setup regardless of tier/R:R gate, tagging each trade passed_gate=True/False plus its 6 CV4 Entry-Quality sub-scores (eq_trend_alignment, eq_momentum_timing, eq_smc_entry_structure, eq_price_location, eq_volume_execution, eq_extension_chase_risk) and the SMC state it was scored against. Produces a wider-range dataset for component-level correlation/PF/expectancy analysis. Do NOT use this run's stats as a live-strategy result — it includes setups the real Scanner would reject."
             )
             if bt_shadow_no_gate:
                 st.caption("🔬 Shadow mode ON — this run's trade population is NOT what the live Scanner would recommend. Use only for the Entry Quality component audit.")
