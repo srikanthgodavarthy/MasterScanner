@@ -492,8 +492,10 @@ def render(settings: dict | None = None) -> None:
     # never covered it. Skip the write after-hours; sector_history (loaded
     # below, unconditionally) still lets this panel render from the last
     # persisted snapshot.
-    from utils.time_utils import is_market_hours_ist
-    if is_market_hours_ist():
+    # [2026-09-09, SG request] Settings-aware — was is_market_hours_ist()
+    # directly, ignoring the Settings market-hours checkbox.
+    from utils.system_state import market_hours_pause_active
+    if not market_hours_pause_active():
         try:
             _scan_date = pd.to_datetime(run_at).tz_convert(_IST).date() if run_at else today_ist()
             save_sector_snapshot(build_sector_snapshot_rows(sector_stats, _scan_date))

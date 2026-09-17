@@ -2468,17 +2468,22 @@ def _market_intelligence_fragment():
     # nights/weekends, which alone was enough to stop the compute
     # endpoint from ever seeing 5 idle minutes and autosuspending.
     #
-    # Deliberately checks is_market_hours_ist() directly rather than
-    # should_scheduler_run() — same reasoning as
-    # _scheduler_heartbeat_gate_open()'s docstring: should_scheduler_run()
-    # carries LIVE/BACKTEST/MAINTENANCE self-heal logic unrelated to a
-    # plain "should this UI panel poll right now" check, and reusing it
-    # here risks the same unwanted side effect that function's docstring
-    # warns against. Renders the last cached payload (already in
-    # session_state from the last in-hours tick) instead of blanking the
-    # panel — this only stops the *polling*, not the display.
-    from utils.time_utils import is_market_hours_ist
-    if not is_market_hours_ist():
+    # Checks market_hours_pause_active() rather than should_scheduler_run()
+    # — same reasoning as _scheduler_heartbeat_gate_open()'s docstring:
+    # should_scheduler_run() carries LIVE/BACKTEST/MAINTENANCE self-heal
+    # logic unrelated to a plain "should this UI panel poll right now"
+    # check, and reusing it here risks the same unwanted side effect that
+    # function's docstring warns against. Renders the last cached payload
+    # (already in session_state from the last in-hours tick) instead of
+    # blanking the panel — this only stops the *polling*, not the display.
+    #
+    # [2026-09-09, SG request] Was is_market_hours_ist() directly, which
+    # ignored the Settings "Restrict background scanning to NSE market
+    # hours" checkbox — turning that off to work after-hours left this
+    # panel stubbornly paused anyway. market_hours_pause_active() honours
+    # the checkbox (and its env override).
+    from utils.system_state import market_hours_pause_active
+    if market_hours_pause_active():
         payload = st.session_state.get("mi_snapshot_payload")
         if not payload:
             st.caption("Market Intelligence: outside market hours — background scans "
@@ -3090,8 +3095,10 @@ def _dash_scan_autorefresh():
     # enough on its own to keep the Neon compute endpoint from ever
     # autosuspending. Leaves dash_scan_df exactly as last set — render()
     # below already handles a stale/last-good df fine.
-    from utils.time_utils import is_market_hours_ist
-    if not is_market_hours_ist():
+    # [2026-09-09, SG request] Settings-aware — see
+    # _market_intelligence_fragment()'s comment; was is_market_hours_ist().
+    from utils.system_state import market_hours_pause_active
+    if market_hours_pause_active():
         return
 
     from utils.scan_state import load_snapshot_meta
@@ -3296,8 +3303,11 @@ def render(settings: dict | None = None):
         # back to sector_history (loaded below, unconditionally, so the
         # page itself still renders normally after-hours) rather than
         # persisting a snapshot dated to a scan that's hours old.
-        from utils.time_utils import is_market_hours_ist
-        if is_market_hours_ist():
+        # [2026-09-09, SG request] Settings-aware — was
+        # is_market_hours_ist() directly, so the Settings checkbox
+        # couldn't re-enable after-hours sector snapshot writes.
+        from utils.system_state import market_hours_pause_active
+        if not market_hours_pause_active():
             try:
                 # Use the scan's own date (parsed from run_at), not "today" —
                 # if the Dashboard is showing a stale scan (see the staleness

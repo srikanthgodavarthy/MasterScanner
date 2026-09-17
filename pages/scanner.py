@@ -45,7 +45,7 @@ layout is intentionally unchanged for now (see reference mockups for the
 eventual look; not attempted this phase).
 """
 
-import sys, os, math
+import sys, os, math, html
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import logging
@@ -4036,18 +4036,8 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
             # TRACK (nothing to explain — plain "—"), or it cleared that
             # floor but the portfolio cap or the pre-breakout guard is
             # holding it back (blocked_reason set — shown as a tooltip).
-            # [2026-09-16, bug fix] `row` here is a pandas Series from
-            # df.iterrows() (see the DataFrame built a few lines above
-            # this table's render loop) -- when only SOME symbols' dicts
-            # carry a "blocked_reason" key, pandas back-fills every
-            # other row's column value with NaN, not None. `if reason:`
-            # alone treats float('nan') as truthy (bool(nan) is True in
-            # Python), so an unblocked row fell into this branch and
-            # rendered the literal string "nan" in the tooltip instead
-            # of the plain "—" below. pd.isna() catches both None and
-            # NaN; strings (real reasons) are untouched by it.
             reason = row.get("blocked_reason")
-            if reason and not (isinstance(reason, float) and pd.isna(reason)):
+            if reason:
                 return (f'<span style="color:var(--muted);cursor:help;" '
                         f'title="{_esc_attr(str(reason))}">— ⓘ</span>')
             return '<span style="color:var(--muted)">—</span>'
@@ -4234,7 +4224,31 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
         return (f'<span style="font-size:12px;">{iv:.1f}'
                 f'<span style="color:{color};font-weight:600;">{delta_txt}</span></span>')
 
-    headers = ["Symbol", "Direction", "Source", "Primary Strike", "Confidence", "Trigger", "IV", "Plan",
+    # [2026-09-16, SG request] OptionTradePlan.reasons (Stage 6/7's
+    # premium + OI/liquidity validation notes -- includes the PCR
+    # supports/CONFLICTS/neutral-to-mixed line fixed above) already
+    # flows live into this table's row data (dore_technical_plans/
+    # dore_live_state's schema-flexible JSON snapshot), but was never
+    # rendered anywhere -- a real conflict like a PCR that clears the
+    # opposite direction's own threshold was previously invisible
+    # without reading source. A ⚠ badge (hover for the full reasons
+    # list) surfaces it without dedicating a wide column to prose.
+    def _fmt_notes(row):
+        reasons = row.get("reasons")
+        if reasons is None or (isinstance(reasons, float) and pd.isna(reasons)):
+            return '<span style="color:var(--muted);font-size:12px;">—</span>'
+        if not isinstance(reasons, (list, tuple)):
+            return '<span style="color:var(--muted);font-size:12px;">—</span>'
+        has_conflict = any("CONFLICTS" in str(r) for r in reasons)
+        tooltip = html.escape(" | ".join(str(r) for r in reasons))
+        if has_conflict:
+            return (f'<span title="{tooltip}" style="cursor:help;color:#f85149;'
+                     f'font-weight:700;font-size:13px;">⚠ Conflict</span>')
+        if not reasons:
+            return '<span style="color:var(--muted);font-size:12px;">—</span>'
+        return f'<span title="{tooltip}" style="cursor:help;color:var(--muted);font-size:12px;">ⓘ notes</span>'
+
+    headers = ["Symbol", "Direction", "Source", "Primary Strike", "Confidence", "Trigger", "IV", "Notes", "Plan",
                "Current Premium", "Entry Zone", "Stop Loss", "Target 1", "Target 2", "Saved Entry / Drift %",
                "POP %", "Expiry", "DTE"]
 
@@ -4261,6 +4275,7 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
             f'{conf_dot} {_fmt_score(conf)}</span></td>',
             f'<td>{_fmt_trigger(r)}</td>',
             f'<td>{_fmt_iv_skew(r)}</td>',
+            f'<td>{_fmt_notes(r)}</td>',
             f'<td>{_fmt_plan_status(r)}</td>',
             f'<td>{_fmt_current_premium(r)}</td>',
             f'<td>{_fmt_entry_zone(r.get("entry_zone"))}</td>',
@@ -4404,40 +4419,22 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
                     'border-radius:4px;padding:1px 6px;" title="Live Scanner">LS</span>')
         return '<span style="color:var(--muted)">—</span>'
 
-    def _fmt_iv_at_mint(row):
-        # [2026-09-16, SG request: add IV to Active Plans, then live-
-        # since-mint delta] Base value is still frozen-at-mint (this
-        # tab deliberately doesn't re-score — see this function's own
-        # docstring) — "what IV was when DORE minted this plan." The
-        # delta alongside it is NEW: live_ce_iv/live_pe_iv come from
-        # dore_iv_skew_log's most recent row for this symbol (see
-        # load_latest_iv_skew_for_symbols), not a fresh fetch this
-        # tab makes itself — so it's "—" (not fabricated) whenever the
-        # symbol has dropped off the live scan shortlist since entry
-        # and nothing recent exists to compare against. Same direction-
-        # picks-leg convention as the base value.
-        direction = row.get("direction")
-        ce_iv, pe_iv = row.get("ce_iv_at_mint"), row.get("pe_iv_at_mint")
-        iv = ce_iv if direction == "CE" else pe_iv if direction == "PE" else None
-        if iv in (None, "") or pd.isna(iv):
-            return '<span style="color:var(--muted);font-size:12px;">—</span>'
-        skew = row.get("iv_skew_at_mint")
-        skew_txt = (f' <span style="color:var(--muted);font-size:11px;">(skew {skew:+.1f})</span>'
-                    if skew not in (None, "") and pd.notna(skew) else "")
-        live_ce, live_pe = row.get("live_ce_iv"), row.get("live_pe_iv")
-        live_iv = live_ce if direction == "CE" else live_pe if direction == "PE" else None
-        delta_txt = ""
-        if live_iv not in (None, "") and pd.notna(live_iv):
-            delta = float(live_iv) - float(iv)
-            if abs(delta) >= 0.05:
-                color = "#3fb950" if delta > 0 else "#f85149"
-                arrow = "▲" if delta > 0 else "▼"
-                delta_txt = f' <span style="color:{color};font-weight:600;font-size:11px;">{arrow}{abs(delta):.1f}</span>'
-        return (f'<span style="font-size:12px;" title="IV at mint time (not live) vs most recent scan reading">'
-                f'{iv:.1f}{delta_txt}{skew_txt}</span>')
-
     if df.empty:
         return '<div style="color:var(--muted);padding:8px;">No open plans.</div>'
+
+    # [2026-09-16, SG request] pcr_conflict_note_at_mint (frozen at mint
+    # — see DoreOptionsPlan's own docstring) is the one line worth a
+    # trader knowing about later: whether the PCR at entry actively
+    # cleared the OPPOSITE direction's own threshold (a real conflict
+    # with this plan's direction), vs the routine "supports"/"neutral"
+    # notes which aren't persisted at all. Same ⚠ badge/hover pattern
+    # as the Live Scan tab's Notes column.
+    def _fmt_pcr_conflict(row):
+        note = row.get("pcr_conflict_note_at_mint")
+        if note in (None, "") or (isinstance(note, float) and pd.isna(note)):
+            return '<span style="color:var(--muted);font-size:12px;">—</span>'
+        return (f'<span title="{html.escape(str(note))}" style="cursor:help;color:#f85149;'
+                f'font-weight:700;font-size:13px;">⚠ Conflict</span>')
 
     # [2026-08-08, SG request] Status moved to the very last column (it's
     # a secondary/audit detail once a plan is open — every row here is
@@ -4448,10 +4445,7 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
     # premium = favorable for CE and PE alike), so keeping them
     # adjacent to P&L reads more naturally than tucking them at the
     # end past Status.
-    # [2026-09-16, SG request] IV placed right after Source — mirrors
-    # its position (right after the analogous Direction/Source/Strike
-    # block) in the Live Scan table's own column order.
-    headers = ["Symbol", "Direction", "Source", "IV", "Strike", "Expiry", "Entry (Locked)", "Stop Loss",
+    headers = ["Symbol", "Direction", "Source", "Notes", "Strike", "Expiry", "Entry (Locked)", "Stop Loss",
                "Target 1", "Target 2", "Last Known Premium", "P&L", "MFE", "MAE",
                "Last Seen", "Days Active", "Status"]
 
@@ -4463,7 +4457,7 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
             f'<td style="font-weight:700;">{_tv_link(r.get("symbol", "—"))}</td>',
             f'<td style="color:{dir_color};font-weight:700;">{_fmt_text(direction)}</td>',
             f'<td>{_fmt_source(r)}</td>',
-            f'<td>{_fmt_iv_at_mint(r)}</td>',
+            f'<td>{_fmt_pcr_conflict(r)}</td>',
             f'<td>{_tv_option_link(r.get("symbol", ""), direction, r.get("strike"), r.get("expiry", ""))}</td>',
             f'<td>{_fmt_text(r.get("expiry"))}</td>',
             f'<td style="font-weight:700;">{_fmt_money(r.get("entry_locked"))}</td>',
@@ -4581,7 +4575,6 @@ def _fetch_live_premiums_for_table(df: pd.DataFrame) -> "tuple[pd.DataFrame, int
         return df, 0
 
     from utils.upstox_client import fetch_open_plan_option_quotes
-    from utils.dore_live_state import _entry_trigger_status
 
     def _strike_of(row):
         primary = row.get("primary")
@@ -4629,19 +4622,6 @@ def _fetch_live_premiums_for_table(df: pd.DataFrame) -> "tuple[pd.DataFrame, int
         prev_close = q.get("prev_close")
         if prev_close:
             df.at[idx, "premium_change_pct"] = round((ltp - prev_close) / prev_close * 100, 2)
-        # [2026-09-16, SG report] entry_trigger_status was left as
-        # whatever the LAST FULL SCAN CYCLE computed -- comparing THAT
-        # cycle's premium to the entry zone -- while current_premium
-        # above gets refreshed on every render. The two could visibly
-        # disagree (badge says "Triggered" from 10+ minutes ago, but
-        # the live premium shown right next to it has since moved
-        # completely outside the entry zone), which read as nonsense
-        # since both numbers appear to be "now" in the same row.
-        # Recompute the badge against the SAME fresh ltp we just wrote
-        # above, so the two always describe the same point in time.
-        entry_zone = row.get("entry_zone")
-        if isinstance(entry_zone, (tuple, list)) and len(entry_zone) == 2:
-            df.at[idx, "entry_trigger_status"] = _entry_trigger_status(ltp, tuple(entry_zone))
         n_updated += 1
     return df, n_updated
 
@@ -4696,19 +4676,6 @@ def _render_dore_options_active_plans_tab() -> None:
         return
 
     rows_df = pd.DataFrame(rows)
-    # [2026-09-16, SG request: IV since-mint delta] Batched, one query
-    # for every symbol currently shown — reuses dore_iv_skew_log's
-    # already-running scan-cadence writes (see load_latest_iv_skew_
-    # for_symbols' docstring), not a new live fetch. Fail-soft: {} on
-    # any DB hiccup just means every row falls back to the frozen-
-    # at-mint-only display it already had.
-    try:
-        from utils.supabase_client import load_latest_iv_skew_for_symbols
-        _latest_iv = load_latest_iv_skew_for_symbols(rows_df["symbol"].dropna().unique().tolist())
-    except Exception:
-        _latest_iv = {}
-    rows_df["live_ce_iv"] = rows_df["symbol"].map(lambda s: (_latest_iv.get(s) or {}).get("ce_iv"))
-    rows_df["live_pe_iv"] = rows_df["symbol"].map(lambda s: (_latest_iv.get(s) or {}).get("pe_iv"))
     st.caption(f"{len(rows_df)} active plan(s) (entry locked) — independent of whether this cycle's live scan "
                "reproduced the contract. Auto-closes once the contract's own expiry passes.")
     st.markdown(_dore_options_active_plans_table_html(rows_df), unsafe_allow_html=True)
@@ -4784,8 +4751,9 @@ def _dore_options_panel():
     # keep the Neon compute endpoint from ever autosuspending. Skips
     # only the poll; still renders whatever's already cached in
     # session_state from the last in-hours tick.
-    from utils.time_utils import is_market_hours_ist
-    if not is_market_hours_ist():
+    # [2026-09-09, SG request] Settings-aware — was is_market_hours_ist().
+    from utils.system_state import market_hours_pause_active
+    if market_hours_pause_active():
         dore_opt_payload = st.session_state.get("dore_live_state_payload") or {}
         if not dore_opt_payload:
             st.caption("DORE Options Engine: outside market hours — background scans "
@@ -4913,9 +4881,11 @@ def _dore_options_panel():
                     f"{_snap_ist_str or '?'} IST ({_age_mins} min ago). "
                     + ("Market is currently closed, so this is expected — those are the last "
                        "known values before close."
-                       if not is_market_hours_ist() else
-                       "The scheduler appears to have stopped updating during market hours — "
-                       "check scan_worker/inprocess_scheduler health.")
+                       # [2026-09-09, SG request] Settings-aware, see pages/scanner.py.
+                       if market_hours_pause_active() else
+                       "The scheduler appears to have stopped updating during a period "
+                       "when scanning should be active — check scan_worker/"
+                       "inprocess_scheduler health.")
                     + (" Current Premium above is still fetched live on every page load, "
                        "independent of that cycle." if _live_fetch_ok else
                        " Current Premium could not be fetched live this time either — showing "
