@@ -494,6 +494,50 @@ def get_market_hours_gate_enabled() -> bool:
     return bool(state.get("market_hours_gate_enabled", True))
 
 
+def market_hours_pause_active() -> bool:
+    """
+    [2026-09-09, SG request: "few are depending on the settings button and
+    few are hardcoded — move everything to depend on the settings button"]
+
+    True means "we are currently paused for market hours" — i.e. the
+    Settings gate is ON *and* we're outside the NSE session. False means
+    "proceed" (either the gate is off, or the session is open).
+
+    This is the single question every non-scheduler caller should ask.
+    Before this existed, UI/page-level code (pages/dashboard.py,
+    pages/scanner.py, pages/sectors.py, utils/scanner.py) called
+    utils.time_utils.is_market_hours_ist() directly — pure wall-clock,
+    with no knowledge of the Settings checkbox. So switching "Restrict
+    background scanning to NSE market hours" OFF stopped the scheduler
+    loops from pausing, but every one of those UI paths stayed hardcoded
+    to pause anyway: after-hours testing still showed stale/paused
+    panels with nothing explaining why. Routing them through here makes
+    the checkbox mean the same thing everywhere.
+
+    Scheduler cycle-boundary loops should keep calling
+    should_scheduler_run() instead — it layers the LIVE/BACKTEST/
+    MAINTENANCE mode + heartbeat self-heal logic on top of this same
+    gate, which page rendering has no business triggering.
+
+    Uses get_market_hours_gate_enabled() (the 540s-cached read), not
+    _resolve_gate_enabled_cheap()'s 6h gate-only cache: a person
+    toggling the checkbox expects the UI to follow within seconds, and
+    these call sites are per-render, not hot-loop.
+    """
+    try:
+        if not get_market_hours_gate_enabled():
+            return False
+        from utils.time_utils import is_market_hours_ist
+        return not is_market_hours_ist()
+    except Exception:
+        # Fail toward the historical behaviour (pause outside market
+        # hours) rather than silently scanning 24/7 if Neon is briefly
+        # unreachable — same "cheaper, safer default" reasoning as
+        # get_system_state()/get_market_hours_gate_enabled().
+        from utils.time_utils import is_market_hours_ist
+        return not is_market_hours_ist()
+
+
 def set_market_hours_gate_enabled(enabled: bool) -> None:
     """
     Persist the Settings-page market-hours-gate toggle. Every process
@@ -801,10 +845,24 @@ def _scheduler_heartbeat_gate_open() -> bool:
     DIFFERENT field (system_state.heartbeat_at) than the one this class
     renews (scheduler_owner_heartbeat_at) — reusing it here would conflate
     two unrelated locks and could trigger _force_reset_to_live() as a side
-    effect of a plain heartbeat tick. Same MARKET_HOURS_GATE_ENABLED escape
-    hatch applies, for consistency with should_scheduler_run().
+    effect of a plain heartbeat tick.
+
+    [2026-09-09, SG request: "few are depending on the settings button and
+    few are hardcoded — move everything to depend on the settings button"]
+    Now resolves the gate flag through _resolve_gate_enabled_cheap(), the
+    same resolver should_scheduler_run() uses, instead of reading
+    MARKET_HOURS_GATE_ENABLED from the environment directly. The old env-
+    only check meant the Settings checkbox ("Restrict background scanning
+    to NSE market hours") silently did NOT control this thread: switching
+    it off to enable after-hours work left the heartbeat thread still
+    paused outside market hours, so a scan worker relying on a renewed
+    lock could lose ownership mid-session with nothing in the UI
+    explaining why. _resolve_gate_enabled_cheap() still honours the env
+    var as an override when set (0/1) — this only ADDS the DB-backed
+    setting as the source of truth when it isn't, matching every other
+    gate in this module.
     """
-    if os.environ.get("MARKET_HOURS_GATE_ENABLED", "1") != "0":
+    if _resolve_gate_enabled_cheap():
         from utils.time_utils import is_market_hours_ist
         return is_market_hours_ist()
     return True
