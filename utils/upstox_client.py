@@ -1483,6 +1483,19 @@ def fetch_oi_resistance(index: str = "NIFTY", expiry_date: str | None = None) ->
             "strike_interval": _derive_strike_interval(chain, atm_strike_val),
             "ce_delta":   ce_delta,
             "pe_delta":   pe_delta,
+            # 2026-09-16: ce_iv/pe_iv individually, alongside (not instead
+            # of) the collapsed "iv" average above. DORE's OptionChainSnapshot
+            # (utils.dore_options_engine) reads chain.ce_iv/chain.pe_iv
+            # directly for indices -- iv_crush_hard_gate and the iv-skew-
+            # shift tracking (utils.iv_intraday_store.record_and_diff_skew)
+            # both derive their reading from those two fields, not from a
+            # pre-averaged "iv" -- so collapsing them here left both silently
+            # unreachable for NIFTY/SENSEX/BANKNIFTY (None in, None out),
+            # even though this function computes both values right above.
+            # Stocks were unaffected: fetch_stock_atm_option() already
+            # returns "ce_iv"/"pe_iv" separately (see its own docstring).
+            "ce_iv":      ce_iv,
+            "pe_iv":      pe_iv,
             "iv":         round((ce_iv + pe_iv) / 2.0, 2) if (ce_iv is not None and pe_iv is not None) else (ce_iv or pe_iv),
         }
     except Exception:
