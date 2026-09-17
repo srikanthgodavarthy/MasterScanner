@@ -3,11 +3,18 @@
 A production-grade Streamlit application for scanning, scoring, backtesting, and
 managing positions across the Nifty 500 universe and its F&O (futures & options)
 segment. What began as a Pine Script indicator port has grown into a full
-multi-engine platform: a legacy points-based scanner, an independent F&O
-opportunity engine (DORE 2.0), a Five Pillars ranking system, a walk-forward
-backtester, a portfolio exit-management engine, and an LLM-assisted news
-intelligence panel — all persisted to Supabase and runnable unattended via a
-background scheduler.
+multi-engine platform: a legacy points-based scanner, an SMC-driven options
+engine (the **DORE Options Engine**), a Five Pillars ranking system, a
+walk-forward backtester, a portfolio exit-management engine, and an
+LLM-assisted news intelligence panel — all persisted to Supabase and runnable
+unattended via a background scheduler.
+
+> **Naming warning — two different engines are called "DORE".**
+> `utils/dore_options_engine.py` (the **DORE Options Engine**) is the live,
+> production F&O pipeline and the only one any UI reads. `utils/dore_engine.py`
+> (**DORE 2.0**, the older Stage 0–5b design) is retained for reference and
+> rollback only — its scheduler jobs are disabled and nothing in the app
+> consumes its output. See "DORE" below before changing either.
 
 ---
 
@@ -16,9 +23,10 @@ background scheduler.
 | Feature | Details |
 |---|---|
 | **Dashboard** | Landing page — index cards (SENSEX/NIFTY OHLCV + EMA20/50/200 badges), Market Intelligence and F&O Scan panels refreshed on their own `st.fragment` timers, kicks off background scan loops |
-| **Live Scanner** | Legacy points-based engine — EMA trend, RSI, volume, breakout, momentum, RS vs Nifty, and CCI signals, plus HTF-momentum "Qualification" gating |
+| **Live Scanner** | Legacy points-based engine — EMA trend, RSI, volume, breakout, momentum, RS vs Nifty, and CCI signals, plus HTF-momentum "Qualification" gating. **No longer its own nav entry** (2026-09-09) — `pages/scanner.py`'s `render()` is called directly by the Dashboard |
 | **Pre-Breakout Scanner (Five Pillars)** | Independent ranking engine — Structure / Acceptance / Leadership / Momentum / Risk pillars (30/25/20/15/10% weights) |
-| **DORE 2.0** | Architecturally independent F&O Opportunity Engine — see below |
+| **DORE Options Engine** | Live F&O options pipeline — SMC-on-futures direction, structural strike anchoring, IV/PCR gating. See below |
+| **Sectors** | Sector rotation / relative-strength view (`pages/sectors.py`) |
 | **Backtest Engine** | Walk-forward simulation on daily OHLCV with full PnL stats, threaded (not multiprocess) execution |
 | **Lifecycle** | Setup lifecycle tracking (Forming → Qualified → Executed → Exited, etc.) |
 | **History** | Historical scan/backtest browsing |
@@ -43,8 +51,11 @@ MasterScanner/
 │                                  # root logging setup, background-scheduler kickoff
 │
 ├── pages/
-│   ├── dashboard.py               # Landing page, index cards, Market Intelligence / F&O fragments
-│   ├── scanner.py                 # Legacy live scanner UI + table rendering
+│   ├── dashboard.py               # Landing page, index cards, Market Intelligence / F&O fragments;
+│   │                               # also calls pages/scanner.py's render() inline (2026-09-09)
+│   ├── scanner.py                 # Live scanner UI + DORE Options tables (Live Scan / Active Plans).
+│   │                               # NOT registered as its own st.Page — rendered by dashboard.py
+│   ├── sectors.py                 # Sector rotation / relative-strength view
 │   ├── five_pillars.py            # Pre-Breakout Scanner (Five Pillars ranking)
 │   ├── backtest.py                # Backtest UI + charts + trade log
 │   ├── lifecycle.py               # Setup lifecycle tracking
@@ -60,18 +71,26 @@ MasterScanner/
 ├── utils/                          # ~70 modules — engines, data clients, persistence
 │   ├── scanner_engine.py          # Legacy points-based scoring (Pine Script → Python origin)
 │   ├── scoring_core.py            # Core scoring/decision logic shared across engines
-│   ├── dore_engine.py             # DORE 2.0 — independent F&O Opportunity Engine
-│   ├── dore_settings.py           # All DORE thresholds/weights (nothing hardcoded in the engine)
-│   ├── dore_fo_screener.py        # DORE Stage 0 universe screener
-│   ├── dore_options_scan.py       # DORE two-stage integration — Stage 1 (Technical Plans):
-│   │                               # qualification/direction/strike selection, once per
-│   │                               # live_scanner cycle (~5min)
-│   ├── dore_live_state.py         # DORE two-stage integration — Stage 2 (Live Market
-│   │                               # Refresh): per-plan premium/quote refresh AND index-level
-│   │                               # (NIFTY/SENSEX/BANKNIFTY) DORE compute, every 60s — see
-│   │                               # its module docstring for the full Stage1/Stage2 split
-│   ├── dore_options_engine.py     # DORE options-specific scoring support
-│   ├── dore_options_persistence.py # Stage 1/2 plan persistence helpers
+│   ├── dore_options_engine.py     # ★ THE production F&O engine — compute_dore_trade_plan():
+│   │                               # SMC-on-futures direction, structural strike anchoring,
+│   │                               # premium/OI/IV/PCR validation, final scoring
+│   ├── dore_options_scan.py       # DORE Stage 1 (Technical Plans): fetches spot + futures
+│   │                               # OHLCV + option chain, calls the engine once per symbol
+│   │                               # per live_scanner cycle (~5min)
+│   ├── dore_live_state.py         # DORE Stage 2 (Live Market Refresh): per-plan premium/
+│   │                               # quote/entry-trigger refresh every 60s. Never re-decides
+│   │                               # direction — see its module docstring for the Stage1/2 split
+│   ├── dore_options_persistence.py # Plan minting / entry-lock / close lifecycle + persistence
+│   ├── smc_engine.py              # Smart Money Concepts — order blocks, BOS/CHoCH, liquidity
+│   │                               # sweeps, FVG; produces SMCState (direction + evidence_tier)
+│   ├── structural_levels.py       # Causal pivot series used by SMC/structural targets
+│   │
+│   │   # ── Legacy DORE 2.0 (reference/rollback only — no UI reads these) ──
+│   ├── dore_engine.py             # DORE 2.0 — the older Stage 0–5b Opportunity Engine
+│   ├── dore_settings.py           # DORE 2.0's thresholds/weights (NOT the Options Engine's,
+│   │                               # which uses DoreOptionsSettings inside dore_options_engine.py)
+│   ├── dore_fo_screener.py        # DORE 2.0 Stage 0 universe screener
+│   ├── index_dore_job.py          # DORE 2.0 index-level job — scheduler entry disabled
 │   ├── market_intelligence.py     # Market Intelligence compute — index snapshot/OI/EMA every
 │   │                               # cycle, regime/breadth classification; reads index-level
 │   │                               # DORE state from dore_live_state's snapshot rather than
@@ -102,6 +121,11 @@ MasterScanner/
 │   # fo_scan.py — legacy F&O pipeline, superseded by dore_options_scan.py /
 │   # dore_live_state.py above (2026-07-31). Its scheduler job is disabled
 │   # and its table dropped; kept in-tree for rollback reference only.
+│   #
+│   # utils/scanner.py — ⚠ STRAY DUPLICATE of pages/scanner.py, committed by
+│   # accident in a5a2721 (2026-09-16). Nothing imports it, it is not a
+│   # Streamlit page (only pages/ is auto-discovered), and it has already
+│   # drifted stale. Edit pages/scanner.py, never this one. Safe to delete.
 │
 │
 ├── scheduler/
@@ -193,8 +217,14 @@ unified score — see `docs/SCORING_SYSTEMS.md` for the full breakdown. At a hig
   "Qualification" layer (1m/3m/6m return thresholds + EMA trend structure).
 - **Five Pillars** (`pillar_engine.py`) — Structure (30%) / Acceptance (25%) / Leadership
   (20%) / Momentum (15%, Stochastic + RSI(14)) / Risk (10%).
-- **DORE 2.0** (`dore_engine.py`) — see below; entirely independent of the above two,
-  sharing only the market-data layer.
+- **DORE Options Engine** (`dore_options_engine.py`) — see below; entirely independent of
+  the above two, sharing only the market-data layer. (`dore_engine.py` / "DORE 2.0" is the
+  retired predecessor — not on the live path.)
+- **SMC** (`smc_engine.py`) — Smart Money Concepts structural read: order blocks, BOS/CHoCH,
+  liquidity sweeps, FVG, producing an `SMCState` with a direction and an `evidence_tier`
+  (0–4). Supplies DORE's direction and gates its structural targets.
+- **CV4** (`canonical_scores.py`) — the CV4 conviction/entry-quality/leadership scores that
+  superseded CV1/CV3 in the Phase 7 cutover.
 - **Portfolio exit scoring** (`portfolio_engine.py`) — a separate multi-factor system for
   *when to exit* an existing position, distinct from entry scoring.
 
@@ -203,35 +233,77 @@ Trade levels (Entry / SL / T1-T2-T3) are ATR- and structure-based; see
 
 ---
 
-## 🎯 DORE 2.0 — F&O Opportunity Engine
+## 🎯 DORE — F&O Options Engine
 
 DORE is architecturally independent of the scanners above — it shares **only** the
 market-data layer (OHLCV, option chain, symbol master), never scores or classifications.
-It separates "which way" from "is this the moment" as two independently-testable
-dimensions, then composes a recommendation from both:
+
+### Which engine is live
+
+| | **DORE Options Engine** (live) | **DORE 2.0** (retired) |
+|---|---|---|
+| Module | `utils/dore_options_engine.py` | `utils/dore_engine.py` |
+| Driven by | `dore_options_scan.py` (Stage 1) + `dore_live_state.py` (Stage 2) | `fo_scan.py`, `index_dore_job.py` |
+| Settings | `DoreOptionsSettings` (in-module) | `utils/dore_settings.py` |
+| Scheduler jobs | runs inside `live_scanner` + `dore_live_state` | `fo_scan`, `index_dore` — **both disabled** |
+| Read by any UI page? | **Yes** — Live Scan + Active Plans tabs | **No** — nothing consumes its output |
+
+DORE 2.0's Stage 0–5b design (Trend → Execution → Derivative → Option Intelligence →
+Risk → Opportunity → Strike/Expiry) is preserved in `dore_engine.py` for reference and
+rollback, but its scheduler entries were commented out (2026-09-15) after both jobs were
+traced to Upstox option-chain 429s — three concurrent 60s jobs contending for one token's
+rate-limit budget, for output nothing reads.
+
+### Live pipeline
 
 ```
-Stage 0   Universe                     (utils/dore_fo_screener.py)
-Stage 1   Trend Engine                 → Directional Intent (BULLISH/BEARISH/NEUTRAL)
-Stage 2   Execution Engine             → Execution State (READY_NOW/BREAKOUT_PENDING/WATCH/NOT_READY)
-Stage 3   Derivative Intelligence      → Derivative Confidence
-Stage 3.5 Option Intelligence          → is the CONTRACT worth buying, independent of direction
-Stage 4   Risk Engine                  → Risk Quality + hard gate (IV-crush / event-risk trip-wire)
-Stage 5   Opportunity Engine           → weighted Opportunity Score + composed Recommendation
-Stage 5b  Strike & Expiry Selection    → adaptive ATM/ITM strike optimizer + weekly/next-week expiry
+live_scanner cycle (~5min)
+  └─ dore_options_scan.py ── spot OHLCV + futures OHLCV (O/H/L/C) + option chain
+        └─ dore_options_engine.compute_dore_trade_plan()
+              │
+              ├─ Qualification score            (spot momentum — feeds ranking, not direction)
+              ├─ DIRECTION (CE/PE):
+              │     1. SMC structural read on FUTURES OHLC (order blocks + SMCState)
+              │        → decides direction when evidence_tier ≥ smc_direction_min_evidence_tier
+              │     2. fallback: EMA9/21 cross (futures-confirmed, else spot)
+              │     → recorded as direction_source: SMC-Futures | SMC-Spot | Futures-EMA | Spot-EMA
+              ├─ Structural anchor / geometry    (order-block-anchored entry/SL/target, R:R gate)
+              ├─ Strike selection                (chain-driven: premium, delta, strike_interval)
+              ├─ Premium + OI/liquidity validation (incl. PCR agreement/conflict)
+              ├─ IV gates                        (IV-crush hard gate, CE/PE skew caution)
+              └─ Final weighted score → OptionTradePlan
+        └─ rank_recommendations() → dore_technical_plans snapshot
+        └─ dore_options_persistence: mint / entry-lock / close → dore_options_plans
+
+dore_live_state cycle (60s)
+  └─ refreshes ONLY market-dependent fields on open plans
+     (premium, OI, IV, POP, drift %, entry_trigger_status). Never re-decides direction.
 ```
 
-Every threshold and weight lives in `utils/dore_settings.py` — nothing is hardcoded in
-`dore_engine.py`. The architecture is documented as "frozen" (Revision 3) pending any
-future RFC-driven change.
+**Direction is the only place futures data feeds the decision.** Everything downstream
+(structural anchor, strikes, validation, scoring) works off spot price levels and the
+option chain, keyed to whichever direction the SMC/EMA step settled on.
 
-> **Terminology note:** the Stage 0–5b pipeline above is DORE's internal *scoring*
-> pipeline — how a single opportunity gets evaluated. It's a separate axis from the
-> "Stage 1 / Stage 2" split mentioned under "Background Scheduling" (`dore_options_scan.py`
-> vs. `dore_live_state.py`), which is about *when/how often* things get recomputed —
-> Stage 1 runs the full pipeline above once per ~5min Live Scanner cycle to pick
-> qualification/direction/strike; Stage 2 refreshes only market-dependent fields
-> (premiums, index-level state) every ~60s without re-running Stage 0–5b.
+### Notable gates
+
+- **SMC-on-Futures direction** (`use_smc_direction`, default on) — the SMC read runs on the
+  futures contract's own OHLC, falling back to spot only when no usable futures series is
+  available. Fail-soft throughout: a symbol never goes directionless.
+- **PCR conflict → forced demotion, indices only** — a PCR that clears the *opposite*
+  direction's threshold scores `-20` and is labelled `CONFLICTS` (vs `-10` for genuinely
+  ambiguous). On indices that conflict additionally forces `score ≤ 49`, below
+  `MIN_CONFIDENCE_TO_TRACK_INDEX`, because the index weight profile already ranks
+  OI-quality above conviction (28 vs 12, the reverse of stocks). Stocks keep only the
+  softer blended penalty. SMC remains senior for *direction*; PCR never gates direction.
+- **IV-crush hard gate** (`enable_iv_crush_hard_gate`, trips at IV rank ≥ 90).
+- **CE/PE IV skew caution** (`iv_skew_caution_threshold_pp`, default 3.0pp) — both
+  `fetch_stock_atm_option()` (stocks) and `fetch_oi_resistance()` (indices) return
+  `ce_iv`/`pe_iv` separately; the index path used to collapse them into one blended
+  average and discard the skew.
+
+> **Terminology note:** "Stage 1 / Stage 2" refers to *cadence* (`dore_options_scan.py`
+> ~5min vs. `dore_live_state.py` ~60s), not to DORE 2.0's Stage 0–5b *scoring* stages.
+> The two numbering schemes are unrelated.
 
 ---
 
@@ -307,11 +379,21 @@ Both coordinate through an ownership lock in `utils/system_state.py`, so acciden
 running both in the same deployment is safe (one claims the lock, the other backs off)
 rather than silently double-executing every job.
 
-> **Note:** the legacy standalone F&O Scan job (`fo_scan.py`, ~60s) was superseded by the
-> DORE two-stage integration above (2026-07-31) and its scheduler entry is disabled.
+> **Note:** the two legacy DORE 2.0 jobs — `fo_scan` and `index_dore` (both ~60s) — are
+> **disabled** in `scheduler/scan_worker.py`'s `JOBS` list. Briefly restored 2026-09-09,
+> they were commented back out on 2026-09-15: nothing in the UI reads either one, yet both
+> hit Upstox's option-chain endpoint every 60s, drawing on the *same* per-token rate-limit
+> budget as `dore_live_state` (the actually-live pipeline). Traced from a `scan_health_monitor`
+> RAM warning plus a burst of 429s (NIFTY rate-limited 6× in 12s, several stocks dropped after
+> exhausting retries). Their compute functions are left defined for a future restore.
+>
 > Market Intelligence's cadence was slowed from an original 30s to 180s (2026-07-25) once
 > profiling showed the 30s interval was doing 3-4 full index OHLCV/OI fetches per call —
 > far more frequently than that data actually changes.
+>
+> **Market-hours pausing** goes through `utils/system_state.py`'s `market_hours_pause_active()`
+> (2026-09-09), which honours the Settings toggle — not a bare wall-clock
+> `is_market_hours_ist()` call. Use it for any new pause check.
 
 **Self-protection:** both loop mechanisms check `utils/scan_health_monitor.py` before each
 cycle and skip it (rather than risk an OOM kill) if resident memory or CPU is over a
