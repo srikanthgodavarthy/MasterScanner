@@ -33,7 +33,7 @@ _log = logging.getLogger(__name__)
 
 from utils.scanner_engine import _strip_tz, nifty_regime, ema, yf_download_with_retry
 from utils.decision_engine import _extension as _ext_fn
-from utils.conviction_score_v1 import compute_conviction_v3, classify_tier_v3, _classify_v3
+from utils.conviction_score_v1 import compute_conviction_v4, classify_tier_v4, _classify_v4
 from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
 from utils.adaptive_target_engine import AdaptiveTargetParams, compute_adaptive_targets, check_momentum_exit
 from utils.trade_levels import evaluate_bar_crossing, LevelCheck
@@ -168,8 +168,8 @@ def _target_category_for_backtest(leadership: int, conviction: int,
                                    entry_quality: int, extension: int) -> str:
     """
     Target-tier label for compute_adaptive_targets(), scoped to trades that
-    have ALREADY cleared the ADMISSION GATE above (classify_tier_v3()=="
-    Actionable" OR _classify_v3() in EXECUTE/ELITE, AND RR >= 2.0).
+    have ALREADY cleared the ADMISSION GATE above (classify_tier_v4()=="
+    Actionable" OR _classify_v4() in EXECUTE/ELITE, AND RR >= 2.0).
 
     decision_engine._classify_category() is NOT used here on purpose: its
     lowest non-"Avoid" bucket requires Leadership >= 70 and Conviction >= 50
@@ -232,6 +232,63 @@ def generate_signals_historical(
     signals   = []
     rejections = []   # v10: admission gate rejection log
     last_signal_bar = -999  # LOGIC-1: min cooldown between signals
+
+    # ── CV4/SMC inputs [2026-09-09, SG request: "align backtest with
+    # CV4"] ───────────────────────────────────────────────────────────
+    # The live Scanner cut over to compute_conviction_v4()/
+    # classify_tier_v4() on 2026-09-01 (Phase 7, see scanner_engine.py
+    # ~line 2174); this backtest was still admitting on CV3, so it was
+    # validating a formula production no longer uses — exactly the same
+    # class of drift the 2026-07 CV1 fix already corrected once before.
+    #
+    # CV4 needs two extra inputs CV3 didn't: an SMCState and a swing
+    # label, both per-bar. compute_smc_state()/compute_swing_labels()
+    # are computed ONCE over the full history here (they're vectorised
+    # and expensive per-call), then indexed per-bar inside the loop.
+    #
+    # CAUSALITY — this is the part that matters for a backtest: both
+    # series are causal by construction (compute_smc_state walks bars
+    # forward; causal_pivot_series/compute_swing_labels use only
+    # backward-looking pivots + ffill), so element [i] reflects only
+    # data available AT bar i. The live Scanner takes [-1] because
+    # "now" is its last bar; here we take [i] for the bar being
+    # evaluated. Taking [-1] in this loop would leak the future into
+    # every historical bar and silently inflate results.
+    #
+    # Wrapped defensively exactly as the live Scanner wraps it: any
+    # failure degrades to None, which compute_conviction_v4() handles
+    # as its documented SMC-NEUTRAL path — never an error, never a gate.
+    _bt_smc_states  = None
+    _bt_swing_labels = None
+    try:
+        from utils.smc_engine import compute_smc_state
+        from utils.swing_structure import compute_swing_labels
+        from utils.structural_levels import causal_pivot_series
+        _pvt_lb = params.pvt_lb if hasattr(params, "pvt_lb") else 20
+        _bt_smc_states = compute_smc_state(df, lb=_pvt_lb)
+        _ph, _pl = causal_pivot_series(df["high"], df["low"], lb=_pvt_lb)
+        _swing_df = compute_swing_labels(_ph, _pl)
+        _bt_swing_labels = _swing_df["label_ffill"] if len(_swing_df) else None
+    except Exception:
+        _bt_smc_states  = None
+        _bt_swing_labels = None
+
+    def _cv4_for_bar(_r, _i):
+        """CV4 for bar _i, with that bar's own SMC state/swing label.
+        Mirrors scanner_engine.py's live call (thesis_direction="BULLISH"
+        — this backtest, like the Live Scanner, is long-only; see
+        compute_conviction_v4()'s docstring on that constraint)."""
+        _smc = None
+        if _bt_smc_states is not None and _i < len(_bt_smc_states):
+            _smc = _bt_smc_states[_i]
+        _swing = None
+        if _bt_swing_labels is not None and _i < len(_bt_swing_labels):
+            _swing = _bt_swing_labels.iloc[_i]
+        return compute_conviction_v4(
+            _r, thesis_direction="BULLISH",
+            smc_state=_smc, swing_label=_swing,
+            current_price=(_r.entry_ref or _r.entry), settings=settings,
+        )
 
     # ── Dispatch state for signal_dispatch mode ───────────────────
     # A single mutable dict shared across all bar iterations for this symbol.
@@ -344,13 +401,13 @@ def generate_signals_historical(
         #elif r.extension_score_atr >= 2:
         #    _rejection_reason = "HIGH_EXTENSION_SCORE"
 
-        # ── Gates 2–3: CV1-scored gates (only if gate 1 passed) ────
-        # Compute CV1 once; reuse values for signal dict.
+        # ── Gates 2–3: CV4-scored gates (only if gate 1 passed) ────
+        # Compute CV4 once; reuse values for signal dict.
         # Initialise here so the rejection-log append below always has values.
         _eq_val, _rr, _ls_val, _cv_val = 0, 0.0, 0, 0
         _cv1 = None
         if not _rejection_reason:
-            _cv1    = compute_conviction_v3(r, settings=settings)
+            _cv1    = _cv4_for_bar(r, i)
             _ls_val = _cv1.leadership
             _cv_val = _cv1.conviction
             _eq_val = _cv1.entry_quality
@@ -365,13 +422,21 @@ def generate_signals_historical(
 
             # Gate 2: admission — same verdict the live Scanner would show.
             # base_tier=="Actionable" is the base funnel's own floor; the
-            # natural-score OR covers the Developing-but-natural-EXECUTE/
-            # ELITE band that base_tier alone would miss. Thresholds come
-            # from the same v3_* settings keys the live Scanner uses, so a
-            # backtest run against custom thresholds validates exactly
-            # what that configuration would have recommended.
-            _base_tier   = classify_tier_v3(_ls_val, _cv_val, _eq_val, thresholds=settings)
-            _natural_cls = _classify_v3(_ls_val, _cv_val, _eq_val, thresholds=settings)
+            # natural-score OR covers the band base_tier alone would miss.
+            # Thresholds come from the same settings keys the live Scanner
+            # passes to classify_tier_v4(), so a backtest run against
+            # custom thresholds validates exactly what that configuration
+            # would have recommended.
+            #
+            # [2026-09-09] v3 -> v4. NOTE the funnel shape changed with it:
+            # classify_tier_v4() has no "Developing" rung (only Skip/Watch
+            # below Actionable — see its docstring), so the v3-era comment
+            # about "the Developing-but-natural-EXECUTE/ELITE band" no
+            # longer describes a real tier here. The natural-score OR is
+            # kept anyway — _classify_v4() can still fire EXECUTE/ELITE
+            # independently of base_tier, same structural reason as before.
+            _base_tier   = classify_tier_v4(_ls_val, _cv_val, _eq_val, thresholds=settings)
+            _natural_cls = _classify_v4(_ls_val, _cv_val, _eq_val, thresholds=settings)
             if _base_tier != "Actionable" and _natural_cls not in ("EXECUTE", "ELITE"):
                 _rejection_reason = f"BELOW_ACTIONABLE (base={_base_tier}, natural={_natural_cls})"
             # Gate 3: Risk/Reward — independent backtest-specific quality
@@ -457,10 +522,10 @@ def generate_signals_historical(
             # shadow mode: fall through and still score/simulate this
             # setup so its outcome joins the diagnostic dataset, tagged
             # passed_gate=False below. Defensive: if a future gate 1 fired
-            # before CV1 was computed above, compute it now rather than
+            # before CV4 was computed above, compute it now rather than
             # let signals.append() below hit an undefined _cv1.
             if _cv1 is None:
-                _cv1 = compute_conviction_v3(r, settings=settings)
+                _cv1 = _cv4_for_bar(r, i)
 
         last_signal_bar = i
 
@@ -519,14 +584,34 @@ def generate_signals_historical(
             "t1":              _sig_t1,
             "t2":              _sig_t2,
             # ── Shadow diagnostic: EQ component audit (additive only) ──
+            # [2026-09-09] CV3 -> CV4. CV3's raw-distance EQ diagnostics
+            # (eq_ema20_dist/eq_ema50_dist/eq_pivot_dist/
+            # eq_move_since_setup/eq_bars_since_setup) do not exist on
+            # ConvictionV4 — v4's Entry Quality is built from six scored
+            # sub-components instead of raw distances (§1.1), so those
+            # field names would AttributeError here. Swapped for v4's
+            # actual sub-scores, which serve the same audit purpose
+            # (attributing an EQ number to its parts). Any downstream
+            # consumer keying on the old names needs updating with this;
+            # grep showed the shadow-diagnostic CSV is the only reader.
             "passed_gate":         _passed_gate,
             "gate_rejection_reason": _rejection_reason,
             "admitted_via_promo_bypass": _bypass_promoted,
-            "eq_ema20_dist":       _cv1.eq_ema20_dist,
-            "eq_ema50_dist":       _cv1.eq_ema50_dist,
-            "eq_pivot_dist":       _cv1.eq_pivot_dist,
-            "eq_move_since_setup": _cv1.eq_move_since_setup,
-            "eq_bars_since_setup": _cv1.eq_bars_since_setup,
+            "eq_trend_alignment":     _cv1.eq_trend_alignment,
+            "eq_momentum_timing":     _cv1.eq_momentum_timing,
+            "eq_smc_entry_structure": _cv1.eq_smc_entry_structure,
+            "eq_price_location":      _cv1.eq_price_location,
+            "eq_volume_execution":    _cv1.eq_volume_execution,
+            "eq_extension_chase_risk": _cv1.eq_extension_chase_risk,
+            # SMC context this bar was scored against — new under v4,
+            # and the thing that makes a v4 backtest result explainable
+            # (an EQ swing is usually an SMC state/tier swing).
+            "smc_state_label":     _cv1.smc_state_label,
+            "smc_evidence_tier":   _cv1.smc_evidence_tier,
+            "smc_direction":       _cv1.smc_direction,
+            "smc_fvg_retest":      _cv1.smc_fvg_retest,
+            "cv4_composite":       _cv1.composite,
+            "cv4_signal_class":    _cv1.signal_class,
             "t3":              _sig_t3,
             "t1_mult":         _t1m,
             "t2_mult":         _t2m,
@@ -1425,13 +1510,22 @@ def simulate_trades(
             "conviction_score":    int(sig.get("conviction_score",    0)),
             "entry_quality_score": int(sig.get("entry_quality_score", 0)),
             # ── Shadow diagnostic: EQ component audit (additive only) ──
+            # [2026-09-09] CV3 -> CV4 sub-score names — see the matching
+            # comment in generate_signals_historical()'s signals.append().
             "passed_gate":           bool(sig.get("passed_gate", True)),
             "gate_rejection_reason": str(sig.get("gate_rejection_reason", "")),
-            "eq_ema20_dist":         int(sig.get("eq_ema20_dist",       0)),
-            "eq_ema50_dist":         int(sig.get("eq_ema50_dist",       0)),
-            "eq_pivot_dist":         int(sig.get("eq_pivot_dist",       0)),
-            "eq_move_since_setup":   int(sig.get("eq_move_since_setup", 0)),
-            "eq_bars_since_setup":   int(sig.get("eq_bars_since_setup", 0)),
+            "eq_trend_alignment":     int(sig.get("eq_trend_alignment",     0)),
+            "eq_momentum_timing":     int(sig.get("eq_momentum_timing",     0)),
+            "eq_smc_entry_structure": int(sig.get("eq_smc_entry_structure", 0)),
+            "eq_price_location":      int(sig.get("eq_price_location",      0)),
+            "eq_volume_execution":    int(sig.get("eq_volume_execution",    0)),
+            "eq_extension_chase_risk": int(sig.get("eq_extension_chase_risk", 0)),
+            "smc_state_label":        str(sig.get("smc_state_label",  "") or ""),
+            "smc_evidence_tier":      int(sig.get("smc_evidence_tier", 0) or 0),
+            "smc_direction":          str(sig.get("smc_direction",    "") or ""),
+            "smc_fvg_retest":         str(sig.get("smc_fvg_retest",   "") or ""),
+            "cv4_composite":          float(sig.get("cv4_composite",   0) or 0),
+            "cv4_signal_class":       str(sig.get("cv4_signal_class", "") or ""),
             "structural_entry": bool(sig.get("structural_entry", False)),
             "tier1_prime":     bool(sig.get("tier1_prime",    False)),
             "tier2_momentum":  bool(sig.get("tier2_momentum", False)),
