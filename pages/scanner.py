@@ -4149,6 +4149,30 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
         created = df["plan_created_date"].astype(str)
         df = df[(created == "") | (created == "None") | (created == "nan") | (created == today_ist)]
 
+    # [2026-09-17, SG request] Locked-out entirely, not just same-day —
+    # "these aren't today's, stalled ones are rendering the premium
+    # value". The Today-only filter above only ever catches carryover
+    # from a PREVIOUS day; it does nothing about a plan minted earlier
+    # THIS SAME day that's still open. And almost everything that
+    # clears the confidence floor mints immediately (MIN_CONFIDENCE_TO_
+    # ACTIVATE == the same floor filtered above), so most Live Scan rows
+    # were, in practice, sitting here for hours -- live premium ticking
+    # against a frozen (mint-time) entry zone/targets, decaying hard
+    # (-46%, -75%...), looking like a fresh "Live Scan" pick when it's
+    # actually an already-committed position that belongs to Active
+    # Plans and nowhere else. Nothing is hidden overall -- every row
+    # dropped here is still fully visible, with the same live premium,
+    # in the Active Plans tab; this just stops the same info rendering
+    # in both places under two different framings. A locked row is any
+    # row with a plan_status_label (see _fmt_plan_status above) --
+    # unlocked/fresh candidates (no persisted plan yet) are the only
+    # ones this table shows now. Expect this table to be sparse most
+    # of the time as a direct, accepted consequence -- confirmed with
+    # SG rather than assumed, given how much it shrinks the table.
+    if "plan_status_label" in df.columns:
+        label = df["plan_status_label"]
+        df = df[label.isna() | (label.astype(str).isin(["", "None", "nan"]))]
+
     # [2026-08-10, SG request] Most recent Plan time first — this is now
     # the PRIMARY sort key, with confidence_score only as the tiebreaker
     # for same-timestamp rows. Previously confidence_score was primary
