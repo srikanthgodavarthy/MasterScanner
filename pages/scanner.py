@@ -4633,6 +4633,7 @@ def _fetch_live_premiums_for_table(df: pd.DataFrame) -> "tuple[pd.DataFrame, int
 
     df = df.copy()
     n_updated = 0
+    from utils.dore_live_state import _entry_trigger_status
     for idx, row in df.iterrows():
         strike = _strike_of(row)
         key = (row.get("symbol"), row.get("direction"), strike, row.get("expiry"))
@@ -4646,6 +4647,24 @@ def _fetch_live_premiums_for_table(df: pd.DataFrame) -> "tuple[pd.DataFrame, int
         prev_close = q.get("prev_close")
         if prev_close:
             df.at[idx, "premium_change_pct"] = round((ltp - prev_close) / prev_close * 100, 2)
+        # [2026-09-17, SG request] entry_trigger_status was left exactly
+        # as Stage 2 (dore_live_state, 60s cycle) last computed it,
+        # while current_premium above just got overwritten with a much
+        # fresher on-page-load quote -- the two can now describe
+        # different moments. Confirmed live: a row genuinely Triggered
+        # (premium inside entry_zone) at the last 60s tick can show a
+        # collapsed premium here moments later -- already through its
+        # own stop_loss -- while still displaying the stale "Triggered"
+        # badge from before the move, looking like a valid fresh
+        # recommendation. Recomputing here, with the SAME function
+        # Stage 2 itself uses (utils.dore_live_state._entry_trigger_
+        # status), keeps the two consistent again -- and since the
+        # Live Scan table's own Trigger filter (elsewhere in this file)
+        # already drops anything not "Triggered", a premium that's
+        # moved off the entry zone since the last cycle now correctly
+        # disappears from this table on the very next render, instead
+        # of lingering under a stale badge until Stage 2's next tick.
+        df.at[idx, "entry_trigger_status"] = _entry_trigger_status(ltp, row.get("entry_zone"))
         n_updated += 1
     return df, n_updated
 
