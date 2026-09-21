@@ -1409,6 +1409,23 @@ class DoreRejection:
     symbol: str
     stage:  str
     reason: str
+    # [2026-09-17, SG request] Quality signal for IVCrushRisk rejections
+    # specifically — "which of today's IV-crush-blocked symbols were
+    # otherwise good candidates?" wasn't answerable before this: by the
+    # time compute_dore_trade_plan() returns a DoreRejection, everything
+    # downstream of the hard gate (select_strikes(), full Conviction/
+    # Entry-Quality finalization) never ran, so nothing quality-related
+    # was ever persisted alongside a rejected symbol. sig.setup_conviction
+    # and sig.entry_quality are both already computed well BEFORE the IV
+    # gate check (see MasterScannerSignal's own construction earlier in
+    # this function), so capturing them here costs nothing extra — no
+    # new computation, just not discarding two numbers that already
+    # existed in scope. None for every other rejection stage (missing
+    # chain, no OHLCV, etc.) — this pair is genuinely undefined/not yet
+    # computed at those earlier bail-out points, so leaving them None
+    # there is correct, not an oversight.
+    setup_conviction: Optional[float] = None
+    entry_quality:    Optional[float] = None
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2853,6 +2870,8 @@ def compute_dore_trade_plan(
                 sig.symbol, "IVCrushRisk",
                 f"IV Rank/Percentile={_iv_gate_level:.0f} >= hard-gate floor "
                 f"({settings.iv_crush_hard_gate_rank:.0f}) — Extreme IV Crush Risk",
+                setup_conviction=sig.setup_conviction,
+                entry_quality=sig.entry_quality,
             )
 
     strikes = select_strikes(sig, dte, dir_, confidence, settings, strike_interval=chain.strike_interval, iv=iv)
