@@ -11,6 +11,8 @@ fixture-builder shape this file borrows.
 
 from __future__ import annotations
 
+from datetime import date as _date, timedelta as _timedelta
+
 from types import SimpleNamespace
 
 import numpy as np
@@ -25,6 +27,12 @@ from utils.dore_options_engine import (
 )
 
 
+# Relative to today, not a hard-coded date — see the same note in
+# tests/test_phase4_cv4_dore_integration.py (persistence refuses to mint a plan
+# for an already-expired contract).
+_FIXTURE_EXPIRY = (_date.today() + _timedelta(days=14)).isoformat()
+
+
 def _option_data_for(current_price, pcr=1.3):
     strikes = {}
     base_strike = round(current_price / 10) * 10
@@ -33,7 +41,7 @@ def _option_data_for(current_price, pcr=1.3):
         strikes[k] = {"ce_premium": max(0.3, 1.5 - abs(i) * 0.05), "pe_premium": max(0.3, 1.5 - abs(i) * 0.05),
                       "ce_oi": 500_000, "pe_oi": 500_000, "ce_close": 1.45, "pe_close": 1.45}
     return {
-        "expiry": "2026-08-27", "strike_interval": 10, "strike_premiums": strikes,
+        "expiry": _FIXTURE_EXPIRY, "strike_interval": 10, "strike_premiums": strikes,
         "total_ce_oi": 5_000_000, "total_pe_oi": 5_000_000, "pcr": pcr,
         "ce_wall_strike": base_strike + 100, "pe_wall_strike": base_strike - 100,
     }

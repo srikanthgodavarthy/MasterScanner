@@ -23,6 +23,8 @@ redesign scoring in this phase" / "Do not redesign the pseudo-bar adapter").
 
 from __future__ import annotations
 
+from datetime import date as _date, timedelta as _timedelta
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -37,6 +39,13 @@ from utils.dore_options_persistence import enrich_trade_plans_with_persistence
 # ══════════════════════════════════════════════════════════════════
 #  Synthetic fixture builders
 # ══════════════════════════════════════════════════════════════════
+
+# Relative to today, NOT a hard-coded date: enrich_trade_plans_with_persistence()
+# refuses to mint a plan for an already-expired contract, so a fixed calendar date
+# would silently turn these tests into "nothing minted" failures once it passes.
+# (`dte` is passed to compute_dore_trade_plan() separately; this is only the label.)
+_FIXTURE_EXPIRY = (_date.today() + _timedelta(days=14)).isoformat()
+
 
 def _strong_uptrend_close(n=60, rate=1.012):
     return list(100 * (rate ** np.arange(n)))
@@ -54,7 +63,7 @@ def _option_data_for(current_price, pcr=1.3):
         strikes[k] = {"ce_premium": 4.0, "pe_premium": 4.0, "ce_oi": 500_000, "pe_oi": 500_000,
                       "ce_close": 3.9, "pe_close": 3.9}
     return {
-        "expiry": "2026-08-27", "strike_interval": 50, "strike_premiums": strikes,
+        "expiry": _FIXTURE_EXPIRY, "strike_interval": 50, "strike_premiums": strikes,
         "total_ce_oi": 5_000_000, "total_pe_oi": 5_000_000, "pcr": pcr,
         "ce_wall_strike": base_strike + 100, "pe_wall_strike": base_strike - 100,
     }
