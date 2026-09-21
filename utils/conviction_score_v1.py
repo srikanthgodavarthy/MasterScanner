@@ -1423,6 +1423,14 @@ class ConvictionV4:
     smc_evidence_tier: int = 0
     smc_age_bars:      int = 0
     smc_fvg_retest:    str = "none"
+    # [2026-09-21, SG request] CONFLICT-only recency/composition
+    # pass-through — see SMCState's own docstring. None for every
+    # non-CONFLICT state, same as the source fields.
+    smc_conflict_bull_age_bars: Optional[int] = None
+    smc_conflict_bear_age_bars: Optional[int] = None
+    smc_conflict_bull_kind:     Optional[str] = None
+    smc_conflict_bear_kind:     Optional[str] = None
+    smc_conflict_fresher_side:  Optional[str] = None
 
     thesis_direction: str = "BULLISH"   # BULLISH | BEARISH — what this read was scored against
 
@@ -1981,5 +1989,10 @@ def compute_conviction_v4(
         smc_evidence_tier = smc_state.evidence_tier if smc_state is not None else 0,
         smc_age_bars      = smc_state.age_bars if smc_state is not None else 0,
         smc_fvg_retest    = smc_state.fvg_retest if smc_state is not None else "none",
+        smc_conflict_bull_age_bars = smc_state.conflict_bull_age_bars if smc_state is not None else None,
+        smc_conflict_bear_age_bars = smc_state.conflict_bear_age_bars if smc_state is not None else None,
+        smc_conflict_bull_kind     = smc_state.conflict_bull_kind if smc_state is not None else None,
+        smc_conflict_bear_kind     = smc_state.conflict_bear_kind if smc_state is not None else None,
+        smc_conflict_fresher_side  = smc_state.conflict_fresher_side if smc_state is not None else None,
         thesis_direction  = thesis_direction,
     )

@@ -88,6 +88,30 @@ class SMCState:
     fvg_high:         Optional[float] = None   # top of the relevant FVG zone
     fvg_low:          Optional[float] = None   # bottom of the relevant FVG zone
 
+    # [2026-09-21, SG request] CONFLICT-only diagnostic fields — see the
+    # "directional conflict" branch below. Every other state leaves
+    # these None; CONFLICT populates them instead of collapsing to the
+    # flat evidence_tier=0/direction=NEUTRAL every consumer already
+    # sees. Purely additive/observational — nothing reads these yet,
+    # so no existing behavior (gating, scoring, direction) changes.
+    # The backtest review (2026-09-21) that prompted this found
+    # CONFLICT dominates 72% of a 908-trade sample and performs in
+    # line with NEUTRAL (~44% win rate) precisely because the
+    # detection below (bull_active and bear_active within
+    # lookback_bars=60 -- ~a full quarter on daily bars) has zero
+    # regard for WHICH side is fresher or WHAT kind of evidence
+    # (sweep vs. BOS/CHoCH) triggered it -- a break from 58 bars ago
+    # counts identically to one from yesterday. These fields exist so
+    # a future backtest pass can test whether a "fresher side"
+    # actually differentiates CONFLICT winners from losers, which the
+    # existing exposed fields (uniformly flat across all 656 CONFLICT
+    # rows in that sample) cannot.
+    conflict_bull_age_bars: Optional[int] = None   # bars since freshest bullish evidence
+    conflict_bear_age_bars: Optional[int] = None   # bars since freshest bearish evidence
+    conflict_bull_kind:     Optional[str] = None   # "SWEEP" | "BREAK" | "SWEEP+BREAK"
+    conflict_bear_kind:     Optional[str] = None   # "SWEEP" | "BREAK" | "SWEEP+BREAK"
+    conflict_fresher_side:  Optional[str] = None   # "BULLISH" | "BEARISH" | "SIMULTANEOUS"
+
     def __post_init__(self):
         if self.state not in VALID_STATES:
             raise ValueError(f"SMCState.state {self.state!r} not in VALID_STATES")
@@ -515,6 +539,33 @@ def compute_smc_state(
         bear_active = bear_recent_sweep or bear_recent_break
 
         if bull_active and bear_active:
+            # [2026-09-21, SG request] Recover the recency/composition
+            # detail that used to just vanish here -- see SMCState's
+            # own docstring on these fields for the why. Freshest-per-
+            # side timing and which condition(s) contributed are both
+            # already sitting in this loop's own tracking variables;
+            # this only captures them before the branch below discards
+            # everything else.
+            _bull_kinds = []
+            if bull_recent_sweep:
+                _bull_kinds.append(("SWEEP", last_bull_sweep_i))
+            if bull_recent_break:
+                _bull_kinds.append(("BREAK", last_bull_break_i))
+            _bear_kinds = []
+            if bear_recent_sweep:
+                _bear_kinds.append(("SWEEP", last_bear_sweep_i))
+            if bear_recent_break:
+                _bear_kinds.append(("BREAK", last_bear_break_i))
+            _bull_freshest_i = max(idx for _, idx in _bull_kinds)
+            _bear_freshest_i = max(idx for _, idx in _bear_kinds)
+            _bull_age = i - _bull_freshest_i
+            _bear_age = i - _bear_freshest_i
+            if _bull_age < _bear_age:
+                _fresher = BULLISH
+            elif _bear_age < _bull_age:
+                _fresher = BEARISH
+            else:
+                _fresher = "SIMULTANEOUS"
             states.append(SMCState(
                 direction=DIR_NEUTRAL, state=CONFLICT, evidence_tier=0,
                 age_bars=0, fvg_retest=FVG_NONE,
@@ -522,6 +573,11 @@ def compute_smc_state(
                 has_choch=bool(bull_choch.iat[i] or bear_choch.iat[i]),
                 has_displacement=False, has_fvg=False,
                 fvg_high=None, fvg_low=None,
+                conflict_bull_age_bars=_bull_age,
+                conflict_bear_age_bars=_bear_age,
+                conflict_bull_kind="+".join(k for k, _ in _bull_kinds),
+                conflict_bear_kind="+".join(k for k, _ in _bear_kinds),
+                conflict_fresher_side=_fresher,
             ))
             continue
 

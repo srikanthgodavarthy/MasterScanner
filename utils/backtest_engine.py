@@ -610,6 +610,17 @@ def generate_signals_historical(
             "smc_evidence_tier":   _cv1.smc_evidence_tier,
             "smc_direction":       _cv1.smc_direction,
             "smc_fvg_retest":      _cv1.smc_fvg_retest,
+            # [2026-09-21, SG request] CONFLICT recency/composition —
+            # None on every non-CONFLICT row. Added specifically so a
+            # backtest export can test whether "fresher side" (or
+            # sweep-vs-break composition) differentiates CONFLICT
+            # winners from losers, which smc_evidence_tier/smc_direction
+            # can't (both flat across every CONFLICT row).
+            "smc_conflict_bull_age_bars": _cv1.smc_conflict_bull_age_bars,
+            "smc_conflict_bear_age_bars": _cv1.smc_conflict_bear_age_bars,
+            "smc_conflict_bull_kind":     _cv1.smc_conflict_bull_kind,
+            "smc_conflict_bear_kind":     _cv1.smc_conflict_bear_kind,
+            "smc_conflict_fresher_side":  _cv1.smc_conflict_fresher_side,
             "cv4_composite":       _cv1.composite,
             "cv4_signal_class":    _cv1.signal_class,
             "t3":              _sig_t3,
@@ -1524,6 +1535,11 @@ def simulate_trades(
             "smc_evidence_tier":      int(sig.get("smc_evidence_tier", 0) or 0),
             "smc_direction":          str(sig.get("smc_direction",    "") or ""),
             "smc_fvg_retest":         str(sig.get("smc_fvg_retest",   "") or ""),
+            "smc_conflict_bull_age_bars": sig.get("smc_conflict_bull_age_bars"),
+            "smc_conflict_bear_age_bars": sig.get("smc_conflict_bear_age_bars"),
+            "smc_conflict_bull_kind":     sig.get("smc_conflict_bull_kind"),
+            "smc_conflict_bear_kind":     sig.get("smc_conflict_bear_kind"),
+            "smc_conflict_fresher_side":  sig.get("smc_conflict_fresher_side"),
             "cv4_composite":          float(sig.get("cv4_composite",   0) or 0),
             "cv4_signal_class":       str(sig.get("cv4_signal_class", "") or ""),
             "structural_entry": bool(sig.get("structural_entry", False)),
