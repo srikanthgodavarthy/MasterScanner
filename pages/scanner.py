@@ -4935,8 +4935,55 @@ def _dore_options_panel():
                        "Targets are in PREMIUM rupees, not the underlying's price. This is a "
                        "screener, not an order ticket — confirm liquidity (bid/ask) before acting.")
             if dore_opt_rejections:
+                _rej_by_stage = {}
+                for _r in dore_opt_rejections:
+                    _rej_by_stage.setdefault(_r.get("stage", "Unknown"), []).append(_r)
+                _breakdown = ", ".join(f"{k}: {len(v)}" for k, v in sorted(_rej_by_stage.items(), key=lambda kv: -len(kv[1])))
                 st.caption(f"{len(dore_opt_rejections)} shortlisted candidate(s) hard-rejected "
-                           "this cycle (missing chain/OHLCV/liquidity) — not shown above.")
+                           f"this cycle — {_breakdown} — not shown above.")
+
+                # [2026-09-17, SG request] Closes the loop on the
+                # setup_conviction/entry_quality capture added to
+                # DoreRejection for exactly this — "which of today's
+                # IV-crush-blocked symbols were otherwise good
+                # candidates?" was previously unanswerable from the UI:
+                # the data reached this rejections list correctly but
+                # nothing here ever read past a bare count. "Good
+                # candidate blocked" uses the same >=70 bar as
+                # MIN_CONFIDENCE_TO_ACTIVATE/_TRACK elsewhere in this
+                # file, applied to setup_conviction and entry_quality
+                # individually (both need to clear it, not the average
+                # — a lopsided 95/40 isn't "good", it's one strong
+                # dimension propping up a weak other).
+                _iv_crush_rej = _rej_by_stage.get("IVCrushRisk", [])
+                if _iv_crush_rej:
+                    _n_good = sum(
+                        1 for r in _iv_crush_rej
+                        if (r.get("setup_conviction") or 0) >= 70 and (r.get("entry_quality") or 0) >= 70
+                    )
+                    with st.expander(
+                        f"⚠️ {len(_iv_crush_rej)} candidate(s) blocked by IV Crush Risk this cycle"
+                        + (f" — {_n_good} looked like good setups otherwise" if _n_good else ""),
+                    ):
+                        _rows = "".join(
+                            f'<tr><td>{_esc_attr(str(r.get("symbol","—")))}</td>'
+                            f'<td>{(r.get("setup_conviction") or 0):.0f}</td>'
+                            f'<td>{(r.get("entry_quality") or 0):.0f}</td>'
+                            f'<td>{"⚠️ Good setup, IV-blocked" if (r.get("setup_conviction") or 0) >= 70 and (r.get("entry_quality") or 0) >= 70 else "—"}</td>'
+                            f'<td style="color:var(--muted);font-size:11px;">{_esc_attr(str(r.get("reason","")))}</td></tr>'
+                            for r in sorted(
+                                _iv_crush_rej,
+                                key=lambda r: (r.get("setup_conviction") or 0) + (r.get("entry_quality") or 0),
+                                reverse=True,
+                            )
+                        )
+                        st.markdown(
+                            '<table style="width:100%;border-collapse:collapse;font-size:13px;">'
+                            '<tr style="color:var(--muted);text-align:left;">'
+                            '<th>Symbol</th><th>Setup Conviction</th><th>Entry Quality</th>'
+                            '<th>Flag</th><th>Reason</th></tr>' + _rows + '</table>',
+                            unsafe_allow_html=True,
+                        )
 
     with active_plans_tab:
         _render_dore_options_active_plans_tab()
