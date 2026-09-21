@@ -125,3 +125,52 @@ def test_cap_never_ranks_above_final_tier_it_was_given():
     )
     assert RECOMMENDATION_RANK[tier] <= RECOMMENDATION_RANK["Skip"]
     assert tier == "Skip"
+
+
+# ── conflict_caps_tier=False (2026-09-21) ─────────────────────────────────
+# Ambiguous two-sided CONFLICT (reason "smc_conflict_state") stops capping;
+# directional CONFLICT (reason "direction_mismatch") keeps capping at Watch.
+
+def test_default_still_caps_ambiguous_conflict_at_watch():
+    # Default argument preserves the original §13 behavior (see test 4).
+    tier, decision = apply_smc_structural_gate(
+        "Actionable", _smc(state=SMC_CONFLICT, direction="NEUTRAL", evidence_tier=0), None,
+    )
+    assert tier == "Watch"
+    assert decision.reason == "smc_conflict_state"
+
+
+def test_ambiguous_conflict_does_not_cap_when_flag_off():
+    for starting_tier in ("Actionable", "Execute", "Elite"):
+        tier, decision = apply_smc_structural_gate(
+            starting_tier, _smc(state=SMC_CONFLICT, direction="NEUTRAL", evidence_tier=0), None,
+            conflict_caps_tier=False,
+        )
+        assert tier == starting_tier
+        # decision is still reported unchanged for the SMC_Structural_* columns
+        assert decision.state == "CONFLICT"
+        assert decision.reason == "smc_conflict_state"
+
+
+def test_directional_conflict_still_caps_when_flag_off():
+    tier, decision = apply_smc_structural_gate(
+        "Elite", _smc(direction=BEARISH, evidence_tier=3, fvg_retest=FVG_IN_ZONE), None,
+        thesis_direction=BULLISH, conflict_caps_tier=False,
+    )
+    assert tier == "Watch"
+    assert decision.reason == "direction_mismatch"
+
+
+def test_flag_off_does_not_loosen_other_caps():
+    # Invalidation / extended-chasing / wait-for-retest are untouched.
+    t1, _ = apply_smc_structural_gate(
+        "Elite", _smc(evidence_tier=4, fvg_retest=FVG_IN_ZONE), _ob(mitigated=True),
+        conflict_caps_tier=False,
+    )
+    t2, _ = apply_smc_structural_gate(
+        "Elite", _smc(fvg_retest=FVG_THROUGH_FILLED), None, conflict_caps_tier=False,
+    )
+    t3, _ = apply_smc_structural_gate(
+        "Elite", _smc(state=WAITING_RETEST, fvg_retest=FVG_NONE), None, conflict_caps_tier=False,
+    )
+    assert (t1, t2, t3) == ("Skip", "Watch", "Developing")
