@@ -492,6 +492,26 @@ class DoreOptionsSettings:
     activation_underlying_ema_buffer_pct: float = 0.0
     enable_ema_thesis_exit: bool = True
 
+    # [2026-09-21, late-entry cutoff] No NEW activation (entry lock) at or
+    # after this IST wall-clock time. Motivation, from the first 11 closed
+    # plans: 4 of 11 were entered within ~90 minutes of the 15:30 close
+    # (13:59, 13:59, 14:35, 15:03 IST). Those plans get almost no intraday
+    # time to prove themselves before their first overnight gap, and the
+    # calendar-day timeout (MAX_DORE_OPTIONS_PLAN_AGE_DAYS) starts running
+    # regardless. The worst loss in the sample (POLICYBZR, entered 15:03,
+    # closed -57.6% vs a -36% stop) was exactly this case.
+    #
+    # This ONLY gates new entries. It does not change SL/T1/T2, the thesis
+    # exit, the timeout, or how any already-ACTIVE plan is managed, so
+    # backtest-vs-live outcome comparisons on exits are unaffected. It is
+    # also NOT overnight-gap protection: an entry at 10:00 is still held
+    # overnight. It just removes the entries with the least time to work.
+    # A blocked plan stays pre-active (activation_blocked_reason is set)
+    # and is re-evaluated on the next cycle, i.e. the following morning.
+    # Set enable_late_entry_cutoff=False to restore the old behavior.
+    enable_late_entry_cutoff: bool = True
+    late_entry_cutoff_ist: str = "14:30"   # "HH:MM", IST (NSE closes 15:30)
+
     # ── Structural SMC trade geometry [2026-08-16, DORE §7] ──────
     # Minimum acceptable Structural R:R (Reward/Risk on the UNDERLYING
     # scale — structural_entry_reference/invalidation/target — distinct

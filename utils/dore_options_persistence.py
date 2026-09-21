@@ -350,6 +350,12 @@ CLOSE_REASON_TARGET_2    = "TARGET_2"
 CLOSE_REASON_TIMEOUT     = "TIMEOUT"
 CLOSE_REASON_EXPIRY      = "EXPIRY"
 CLOSE_REASON_INVALIDATED = "INVALIDATED"
+# [2026-09-21] A plan that never entered (no locked entry) and is closed for
+# being stale (older than MAX_DORE_OPTIONS_PLAN_AGE_DAYS) or for its contract
+# having expired. Deliberately NOT mapped to an outcome_tracking outcome: a plan
+# that never traded has no win/loss/timeout to record, and writing one would
+# count it as a non-win in any outcome_final-based win rate.
+CLOSE_REASON_STALE_NO_ENTRY = "STALE_NO_ENTRY"
 # [Structural SMC trade geometry, 2026-08-16, DORE §3] Distal-line
 # thesis invalidation — see enrich_trade_plans_with_persistence()'s
 # live-monitoring loop below for where this actually fires.
@@ -1070,6 +1076,52 @@ def _underlying_activation_confirmation(row: dict, current_underlying: Optional[
     return True, "Underlying EMA9/EMA21 confirmation passed"
 
 
+def _ist_now() -> datetime:
+    """Current wall-clock time in IST. Its own function (rather than an
+    inline call) so tests can pin the clock without touching global time."""
+    from utils.time_utils import now_ist
+    return now_ist()
+
+
+_DEFAULT_LATE_ENTRY_CUTOFF = (14, 30)
+
+
+def _parse_hhmm(raw: str) -> tuple[int, int]:
+    """'14:30' -> (14, 30). Falls back to the default (with a warning) on a
+    malformed value rather than raising: this runs inside the live scan
+    cycle, and a typo in a setting must never take activation down."""
+    try:
+        hh, mm = str(raw).strip().split(":")
+        hh, mm = int(hh), int(mm)
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            raise ValueError(raw)
+        return hh, mm
+    except Exception:
+        logger.warning("[dore_options_persistence] invalid late_entry_cutoff_ist=%r — "
+                        "using %02d:%02d", raw, *_DEFAULT_LATE_ENTRY_CUTOFF)
+        return _DEFAULT_LATE_ENTRY_CUTOFF
+
+
+def _late_entry_blocked(now: Optional[datetime] = None) -> tuple[bool, str]:
+    """True (with a human-readable reason) when a NEW entry must not be
+    locked because the IST wall clock is at/after
+    DoreOptionsSettings.late_entry_cutoff_ist. Only ever consulted at the
+    activation decision — never for plans that are already ACTIVE.
+
+    `now` may be naive (treated as IST) or tz-aware (converted to IST).
+    """
+    if not DORE_OPTIONS_DEFAULTS.enable_late_entry_cutoff:
+        return False, ""
+    now = now or _ist_now()
+    from utils.time_utils import IST
+    now = now.replace(tzinfo=IST) if now.tzinfo is None else now.astimezone(IST)
+    hh, mm = _parse_hhmm(DORE_OPTIONS_DEFAULTS.late_entry_cutoff_ist)
+    if (now.hour, now.minute) >= (hh, mm):
+        return True, (f"Late-entry cutoff: no new entries at/after {hh:02d}:{mm:02d} IST "
+                       f"(now {now:%H:%M}) — overnight-gap risk, too little time to work")
+    return False, ""
+
+
 def _ema_thesis_breached(row: dict, current_underlying: Optional[float]) -> tuple[bool, str]:
     """Return whether the frozen Stage-1 EMA9 thesis has been invalidated."""
     if not DORE_OPTIONS_DEFAULTS.enable_ema_thesis_exit:
@@ -1180,6 +1232,15 @@ def enrich_trade_plans_with_persistence(
                 # monitored regardless of later confidence fluctuation.
                 if confidence_score < _min_confidence_to_track(row.get("dte"), symbol):
                     enriched_rows.append(row)   # still shown as a Live Scan recommendation, just not tracked
+                    continue
+
+                # [2026-09-21] Never mint a plan for a contract that has
+                # already expired. _is_expired() was previously consulted only
+                # by the not-reproduced cleanup pass at the bottom of this
+                # function, so nothing stopped a stale/foreign row from minting
+                # one (a NIFTY plan expiring 2026-09-15 was minted on 09-16).
+                if _is_expired(row.get("expiry") or getattr(p, "expiry", None), today):
+                    enriched_rows.append(row)
                     continue
 
                 # [2026-08-25, SG request] Tradability gate — checked
@@ -1366,6 +1427,18 @@ def enrich_trade_plans_with_persistence(
                 elif premium_in_zone:
                     locked.activation_blocked_reason = ""
 
+                # [2026-09-21] Late-entry cutoff — see DoreOptionsSettings.
+                # late_entry_cutoff_ist. Checked only when everything else
+                # would have activated, so a blocked_reason that already
+                # explains a more fundamental miss (premium/underlying) is
+                # never overwritten by this softer, time-of-day one.
+                if in_zone:
+                    _late, _late_reason = _late_entry_blocked()
+                    if _late:
+                        in_zone = False
+                        row["blocked_reason"] = _late_reason
+                        locked.activation_blocked_reason = _late_reason
+
                 # ══════════════════════════════════════════════════
                 # [2026-08-12, PRE_BREAKOUT activation guard] Explicit
                 # defensive gate — do NOT rely on the in_zone check above
@@ -1420,6 +1493,48 @@ def enrich_trade_plans_with_persistence(
                         locked.target2_locked = getattr(p, "target2", None)
                         locked.confidence_at_entry = confidence_score
                     locked.status = _classify_pre_active(execution_ok, is_fresh, current_premium, entry_zone)
+
+            # ══════════════════════════════════════════════════════
+            # [2026-09-21] STALE / EXPIRED PRE-ACTIVE PLANS.
+            # A pre-active plan that Stage 1 stops reproducing is carried
+            # forward by dore_live_state with entry_zone == (None, None), so it
+            # can never activate; and because that carried-forward row is
+            # "seen" every cycle, the not-reproduced cleanup pass at the bottom
+            # of this function skips it, while the inline age check further
+            # down only runs for ACTIVE plans. Net effect before this fix: such
+            # a plan stayed WAITING_FOR_ENTRY forever, even past its contract's
+            # expiry (observed: 12 of 19 open plans older than the 2-day cap,
+            # one 6 days past expiry).
+            #
+            # Scope, deliberately narrow:
+            #   - only pre-active plans (never an ACTIVE trade — those keep
+            #     their existing exits/timeouts untouched);
+            #   - only plans NOT reproduced this cycle (`not is_fresh`): a plan
+            #     Stage 1 still recommends is left alone, and a carried-forward
+            #     plan younger than the cap is left alone too, so a transient
+            #     Stage-1 miss (API error, shortlist rotation) can still revive
+            #     and activate exactly as before;
+            #   - closes with STALE_NO_ENTRY and records NO outcome_final row.
+            # ══════════════════════════════════════════════════════
+            if not locked.is_active() and not just_minted and not is_fresh:
+                _age_date, _ = _lifecycle_age_start(locked)
+                _expired = _is_expired(locked.expiry, today)
+                _stale = _is_stale_by_age(_age_date, today)
+                if _expired or _stale:
+                    if current_premium is not None:
+                        locked.last_premium = current_premium
+                    locked.last_seen_at = _now_iso()
+                    locked.status = DoreOptionsPlanStatus.CLOSED
+                    locked.closed_at = _now_iso()
+                    locked.closed_reason = (
+                        "Expired before entry" if _expired else
+                        f"Stale — never entered (open >= {MAX_DORE_OPTIONS_PLAN_AGE_DAYS}d, "
+                        f"no longer reproduced by Stage 1)"
+                    )
+                    locked.closed_reason_code = CLOSE_REASON_STALE_NO_ENTRY
+                    updated_plans.append(locked)
+                    enriched_rows.append(p.to_dict())   # keep enriched_rows 1:1 with input plans
+                    continue
 
             drift = _drift_pct(current_premium, locked.entry_locked)
 
