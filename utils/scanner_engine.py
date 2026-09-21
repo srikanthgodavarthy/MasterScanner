@@ -1670,6 +1670,7 @@ RECOMMENDATION_RANK = {name: i for i, name in enumerate(RECOMMENDATION_LADDER)}
 # app-agnostic).
 def apply_smc_structural_gate(
     final_tier: str, smc_state, order_block, thesis_direction: str | None = None,
+    conflict_caps_tier: bool = True,
 ):
     """
     Applies the canonical SMC structural state (utils.smc_engine.
@@ -1694,6 +1695,19 @@ def apply_smc_structural_gate(
     thesis_direction : str or None
         Defaults to utils.smc_engine.BULLISH (Live Scanner is long-only
         today) when None.
+    conflict_caps_tier : bool
+        Default True preserves the original §13 behavior (every
+        STRUCTURAL_CONFLICT caps at Watch). When False, ONLY the
+        *ambiguous* conflict (reason "smc_conflict_state" — both a
+        bullish and a bearish sweep/BOS/CHoCH inside compute_smc_state()'s
+        60-bar window) stops capping. A *directional* conflict (reason
+        "direction_mismatch" — real bearish evidence against the long
+        thesis) still caps at Watch either way. Reason: archive data
+        (2026-09-01..21) shows the ambiguous state on ~70% of the universe
+        every day, so as a hard cap it behaves as a near-universal Watch
+        cap rather than a signal — see the handoff doc. The decision is
+        still returned unchanged, so SMC_Structural_State/Reason columns
+        keep reporting CONFLICT; only the tier cap is skipped.
 
     Returns
     -------
@@ -1722,6 +1736,12 @@ def apply_smc_structural_gate(
         STRUCTURAL_EXTENDED_CHASING: "Watch",
         STRUCTURAL_WAIT_FOR_RETEST:  "Developing",
     }.get(decision.state)
+
+    # Ambiguous (two-sided) conflict only — see conflict_caps_tier above.
+    if (not conflict_caps_tier
+            and decision.state == STRUCTURAL_CONFLICT
+            and decision.reason == "smc_conflict_state"):
+        cap = None
 
     if cap is None:
         return final_tier, decision   # VALID_ENTRY_ZONE — no cap
@@ -2481,7 +2501,14 @@ def score_stock(
         #               independent mechanism (applied after final_rank,
         #             not before base_tier) — it does not touch, replace,
         #             or extend the existing gate's ordering.
-        final_tier, _smc_structural = apply_smc_structural_gate(final_tier, r.smc_state, r.order_block)
+        # [2026-09-21] settings["smc_conflict_caps_tier"] (default False):
+        # ambiguous two-sided CONFLICT no longer caps the tier — it was on
+        # ~70% of the universe daily, so the cap acted as a near-universal
+        # Watch cap. Set True to restore the original §13 behavior.
+        final_tier, _smc_structural = apply_smc_structural_gate(
+            final_tier, r.smc_state, r.order_block,
+            conflict_caps_tier=bool((settings or {}).get("smc_conflict_caps_tier", False)),
+        )
         final_rank = _RANK[final_tier]
 
         result["SMC_Structural_State"]      = _smc_structural.state if _smc_structural else None
