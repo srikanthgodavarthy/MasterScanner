@@ -518,6 +518,14 @@ class IndicatorArrays:
     _adx_arr:  np.ndarray = None
     _nifty_arr: np.ndarray = None
     _sector_arr: np.ndarray = None   # None when no sector benchmark available (see sector_aligned)
+    # Per-bar Nifty regime code, aligned to this symbol's own bar index:
+    # 1=bull, -1=bear, 0=neutral. None for the live scanner (single "as of
+    # now" read stays in params.nifty_regime_val, its original behaviour,
+    # unchanged). Populated only by the backtest path (see
+    # build_indicators(nifty_regime_series=...) below) so a bar entered in
+    # 2024 is gated by the regime AS OF 2024, not by whatever regime.py
+    # reads on the day the backtest happens to be run.
+    _nifty_regime_arr: np.ndarray = None
     # PERF-6: numpy shadows for series that were still hitting .iloc[i]
     # in compute_bar() every bar (P3 was only partially applied).
     _o_arr:        np.ndarray = None
@@ -603,6 +611,7 @@ def build_indicators(
     nifty:  pd.Series,
     params: ScoringParams,
     sector_series: "pd.Series | None" = None,
+    nifty_regime_series: "pd.Series | None" = None,
 ) -> IndicatorArrays:
     """
     Pre-compute every indicator Series for the full OHLCV history.
@@ -663,6 +672,19 @@ def build_indicators(
     _nifty  = nifty.copy()
     _nifty.index = _strip_tz(_nifty.index)
     nifty_aligned = _nifty.reindex(_c_idx, method="ffill")
+
+    # Per-bar regime (backtest only — see IndicatorArrays._nifty_regime_arr).
+    # nifty_regime_series is date-indexed str ("bull"/"bear"/"neutral"),
+    # one entry per Nifty trading day; ffill-align it to this symbol's own
+    # bar index exactly like nifty_aligned above, then code it for fast
+    # per-bar lookup in compute_bar().
+    _nifty_regime_arr = None
+    if nifty_regime_series is not None and len(nifty_regime_series) > 0:
+        _nrs = nifty_regime_series.copy()
+        _nrs.index = _strip_tz(_nrs.index)
+        _nrs_aligned = _nrs.reindex(_c_idx, method="ffill")
+        _code = {"bull": 1, "bear": -1}
+        _nifty_regime_arr = _nrs_aligned.map(lambda v: _code.get(v, 0)).values.astype(np.int8)
 
     # Sector alignment (tz-safe) — same pattern as Nifty above.
     # Left as None when the caller has no sector benchmark for this symbol;
@@ -749,6 +771,7 @@ def build_indicators(
         _e9_arr=_e9_arr, _e21_arr=_e21_arr,
         _atr_arr=_atr_arr, _vol_arr=_vol_arr, _vavg_arr=_vavg_arr,
         _adx_arr=_adx_arr, _nifty_arr=_nifty_arr, _sector_arr=_sector_arr,
+        _nifty_regime_arr=_nifty_regime_arr,
         _o_arr=_o_arr, _rsi_arr=_rsi_arr, _atr_sma20_arr=_atr_sma20_arr,
         _atr_sma_comp_arr=_atr_sma_comp_arr, _cloud_top_arr=_cloud_top_arr,
         _cloud_bottom_arr=_cloud_bottom_arr, _squeeze_arr=_squeeze_arr,
@@ -1843,9 +1866,19 @@ def compute_bar(
         score *= 0.90
 
     # ── TIER 1 PRIME GATE ─────────────────────────────────────────
+    # Per-bar regime when available (backtest path — see
+    # IndicatorArrays._nifty_regime_arr / build_indicators(nifty_regime_series=)):
+    # a trade entered in 2024 is gated by the regime as of 2024, not by
+    # today's regime applied retroactively. Falls back to the old
+    # single "as of now" scalar for the live scanner, where that reflects
+    # actual intent (today's regime, applied to today's scan).
+    if ia._nifty_regime_arr is not None:
+        _cur_nifty_regime = {1: "bull", -1: "bear", 0: "neutral"}[int(ia._nifty_regime_arr[i])]
+    else:
+        _cur_nifty_regime = params.nifty_regime_val
     nifty_allows = (
         not params.nifty_regime_filter or
-        params.nifty_regime_val == "bull"
+        _cur_nifty_regime == "bull"
     )
 
     # ── TIER 2 MOMENTUM GATE ──────────────────────────────────────
@@ -2358,7 +2391,7 @@ def compute_bar(
         mom3 = round(mom3, 1),
         mom6 = round(mom6, 1),
         fib618 = round(fib618) if not np.isnan(fib618) else 0,
-        nifty_regime_val = params.nifty_regime_val,
+        nifty_regime_val = _cur_nifty_regime,
         fib500 = round(fib500) if not np.isnan(fib500) else 0,
         fib382 = round(fib382) if not np.isnan(fib382) else 0,
         fib786 = round(fib786) if not np.isnan(fib786) else 0,

@@ -31,7 +31,7 @@ import logging
 
 _log = logging.getLogger(__name__)
 
-from utils.scanner_engine import _strip_tz, nifty_regime, ema, yf_download_with_retry
+from utils.scanner_engine import _strip_tz, nifty_regime, nifty_regime_series, ema, yf_download_with_retry
 from utils.decision_engine import _extension as _ext_fn
 from utils.conviction_score_v1 import (
     compute_conviction_v4, classify_tier_v4, _classify_v4,
@@ -231,7 +231,10 @@ def generate_signals_historical(
     else:
         params = ScoringParams(cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os)
 
-    ia      = build_indicators(df, nifty, params)
+    ia      = build_indicators(
+        df, nifty, params,
+        nifty_regime_series=(settings or {}).get("_nifty_regime_series"),
+    )
     signals   = []
     rejections = []   # v10: admission gate rejection log
     last_signal_bar = -999  # LOGIC-1: min cooldown between signals
@@ -766,7 +769,10 @@ def generate_signals_pre_breakout(
     else:
         params = ScoringParams()
 
-    ia = build_indicators(df, nifty, params)
+    ia = build_indicators(
+        df, nifty, params,
+        nifty_regime_series=(settings or {}).get("_nifty_regime_series"),
+    )
     signals = []
     last_signal_bar = -999  # same 3-bar cooldown as every other generator
 
@@ -1857,9 +1863,21 @@ def run_backtest(
     all_data = fetch_all_bt_data(symbols, years=3, progress_cb=_fetch_progress, source=source)
 
     nifty = _fetch_bt_nifty(years=3, source=source)    # cached 1h
-    regime_val         = nifty_regime(nifty)
-    effective_settings = dict(settings) if settings else {}
-    effective_settings["nifty_regime_val"] = regime_val
+    # [FIX 2026-09-22] Was: nifty_regime(nifty) -- ONE scalar read from the
+    # last bar (effectively "today"), stamped onto every trade regardless
+    # of entry date. A trade entered 2024-07-29 was being gated by today's
+    # regime, not the regime as of 2024-07-29. See investigation:
+    # tier1_prime/elite_tier were 0/558 on a run where they should have
+    # tracked ~45% like every prior run -- traced to this line.
+    # nifty_regime_val is kept (as the neutral fallback for the live
+    # scanner code path, unchanged) but the backtest now passes the full
+    # per-date series through so build_indicators() can gate each bar by
+    # ITS OWN date's regime. See IndicatorArrays._nifty_regime_arr.
+    regime_val          = nifty_regime(nifty)
+    nifty_regime_series_ = nifty_regime_series(nifty)
+    effective_settings  = dict(settings) if settings else {}
+    effective_settings["nifty_regime_val"]      = regime_val
+    effective_settings["_nifty_regime_series"]  = nifty_regime_series_
 
     # [v8.2] Build regime context once so every symbol's signals are filtered
     # by the same regime rules the live scanner applies.  Avoids calibration

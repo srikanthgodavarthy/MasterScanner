@@ -1454,6 +1454,32 @@ def nifty_regime(nifty: pd.Series) -> str:
     return "neutral"
 
 
+def nifty_regime_series(nifty: pd.Series) -> pd.Series:
+    """
+    Same classification as nifty_regime(), evaluated at every historical
+    bar instead of only the last one — for backtesting, where a trade
+    entered on date D must be gated by the regime AS OF D, not by
+    whatever nifty_regime() reads on the day the backtest happens to run.
+    (nifty_regime() itself is unchanged and still correct for the live
+    scanner, where "as of now" is exactly the intent.)
+
+    Returns a str Series ('bull'/'bear'/'neutral') aligned to nifty's own
+    index. The first 200 bars (insufficient EMA200 history) are 'neutral',
+    matching nifty_regime()'s short-history fallback.
+    """
+    if nifty.empty:
+        return pd.Series(dtype=object)
+    e50  = ema(nifty, 50)
+    e200 = ema(nifty, 200)
+    bull = (nifty > e200) & (e50 > e200)
+    bear = (nifty < e200) & (e50 < e200)
+    out = pd.Series("neutral", index=nifty.index, dtype=object)
+    out[bull] = "bull"
+    out[bear] = "bear"
+    out.iloc[:200] = "neutral"
+    return out
+
+
 # ══════════════════════════════════════════════════════════════════
 #  SCORE_STOCK  — thin wrapper around scoring_core.compute_bar
 # ══════════════════════════════════════════════════════════════════
