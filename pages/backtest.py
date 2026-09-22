@@ -259,6 +259,30 @@ def render(settings=None):
             if bt_shadow_no_gate:
                 st.caption("🔬 Shadow mode ON — this run's trade population is NOT what the live Scanner would recommend. Use only for the Entry Quality component audit.")
 
+            st.markdown("---")
+            bt_exp_modifier_on = st.checkbox(
+                "🧪 Experimental: CONFLICT sweep+break modifier",
+                value=False, key="bt_exp_modifier_on",
+                help="Backtest-only A/B. On CONFLICT bars where conflict_bull_kind == 'SWEEP+BREAK', adds the point value below to the chosen sub-score before admission floors are checked (only rechecks bars the raw gate would have rejected as BELOW_ACTIONABLE). Does NOT touch leadership/conviction/entry_quality/composite/signal_class for any other bar, live Scanner, or DORE. Rescued trades are flagged admitted_via_exp_modifier=True in the CSV — filter on that column to see only the incremental population."
+            )
+            if bt_exp_modifier_on:
+                _emc1, _emc2 = st.columns(2)
+                with _emc1:
+                    bt_exp_modifier_target = st.selectbox(
+                        "Gate target", ["leadership", "conviction", "entry_quality"],
+                        index=0, key="bt_exp_modifier_target",
+                        help="Which sub-score receives the points. 'leadership' rescued the most trades in the shadow-run simulation (9 vs 1-6 for the others)."
+                    )
+                with _emc2:
+                    bt_exp_modifier_points = st.number_input(
+                        "Points", min_value=0.5, max_value=10.0, value=2.0, step=0.5,
+                        key="bt_exp_modifier_points"
+                    )
+                st.caption("🔬 Experimental modifier ON — compare against a baseline run with this OFF, and judge only once admitted_via_exp_modifier has ~30+ True rows.")
+            else:
+                bt_exp_modifier_target = "leadership"
+                bt_exp_modifier_points = 2.0
+
         with _bc2:
             bt_min_score = st.slider("Min Score for Entry", 50, 100, 70, step=5, key="bt_min_score")
             bt_hold_days = st.slider("Max Hold Days", 5, 60, 20, step=5, key="bt_hold_days")
@@ -373,6 +397,11 @@ def render(settings=None):
         # above is explicitly ticked. See backtest_engine.py's admission
         # gate section for what this does.
         bt_settings["shadow_no_admission_gate"] = bool(bt_shadow_no_gate)
+        bt_settings["SMC_CONFLICT_SWEEP_BREAK_MODIFIER_ENABLED"]    = bool(bt_exp_modifier_on)
+        bt_settings["SMC_CONFLICT_SWEEP_BREAK_MODIFIER_POINTS"]     = float(bt_exp_modifier_points)
+        bt_settings["SMC_CONFLICT_SWEEP_BREAK_MODIFIER_GATE_TARGET"] = (
+            bt_exp_modifier_target if bt_exp_modifier_on else ""
+        )
 
         # Shared run timestamp so every incremental checkpoint save groups
         # under the same backtest_results.run_at value in Supabase.
