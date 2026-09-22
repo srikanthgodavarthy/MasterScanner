@@ -1365,6 +1365,73 @@ from utils.smc_freshness import conviction_freshness_multiplier, entry_freshness
 from utils.extension_shared import compute_extension_penalty
 
 
+# ── EXPERIMENTAL: CONFLICT sweep+break modifier [2026-09-21, SG request] ──
+# Motivated by backtest_20260921_2246.csv: among SMC state == CONFLICT rows,
+# conflict_bull_kind == "SWEEP+BREAK" (n=32) averaged +0.67R vs +0.09R for
+# the rest. In-sample, single window, wide bootstrap CI — a CANDIDATE
+# feature, NOT validated. Default OFF.
+#
+# When enabled, matching rows get SMC_CONFLICT_SWEEP_BREAK_MODIFIER_POINTS
+# recorded in ConvictionV4.experimental_modifier_pts and added to
+# ConvictionV4.composite_experimental. It deliberately does NOT touch
+# leadership / conviction / entry_quality / composite / signal_class, so
+# admission gates, tiering and DORE (which reads .composite) are unchanged
+# whether the flag is on or off. Both constants can be overridden per-call
+# through the `settings` dict passed to compute_conviction_v4() (same keys),
+# which lets a backtest A/B the modifier without editing this file.
+SMC_CONFLICT_SWEEP_BREAK_MODIFIER_ENABLED = False
+SMC_CONFLICT_SWEEP_BREAK_MODIFIER_POINTS  = 2.0
+
+# Opt-in BACKTEST-ONLY admission variant (read by backtest_engine's gate
+# from its `settings` dict; the live Scanner / DORE never read it).
+# "" = off (default). Otherwise the sub-score that receives the modifier
+# points before the admission floors are evaluated: "leadership",
+# "conviction" or "entry_quality". "composite" is deliberately NOT
+# allowed: every CV4 tier's per-score floors already imply a composite
+# above that tier's composite minimum (Actionable 63.3 > 60, Execute
+# 73.3 > 60, Elite 80 > 66), so a composite-only bump can never change a
+# verdict and the A/B would silently be a no-op.
+SMC_CONFLICT_SWEEP_BREAK_MODIFIER_GATE_TARGET = ""
+_GATE_TARGETS = ("leadership", "conviction", "entry_quality")
+
+
+def gate_scores_with_experimental_modifier(leadership: int, conviction: int,
+                                           entry_quality: int, pts: float,
+                                           settings: Optional[dict] = None):
+    """Return (leadership, conviction, entry_quality) with `pts` added to
+    the configured gate target (capped at 100). Unchanged when the target
+    is off or pts == 0. Raises ValueError on an unknown target so a typo
+    in an A/B config fails loudly instead of quietly running the baseline."""
+    target = (settings or {}).get("SMC_CONFLICT_SWEEP_BREAK_MODIFIER_GATE_TARGET",
+                                  SMC_CONFLICT_SWEEP_BREAK_MODIFIER_GATE_TARGET)
+    if not target or not pts:
+        return leadership, conviction, entry_quality
+    if target not in _GATE_TARGETS:
+        raise ValueError(
+            f"SMC_CONFLICT_SWEEP_BREAK_MODIFIER_GATE_TARGET={target!r}; "
+            f"expected one of {_GATE_TARGETS} or ''")
+    ls, cv_, eq = leadership, conviction, entry_quality
+    if target == "leadership":     ls  = min(100, ls  + pts)
+    elif target == "conviction":   cv_ = min(100, cv_ + pts)
+    else:                          eq  = min(100, eq  + pts)
+    return ls, cv_, eq
+
+
+def _conflict_sweep_break_modifier(smc_state, settings: Optional[dict] = None) -> float:
+    """Experimental points for CONFLICT rows whose bullish side is
+    SWEEP+BREAK; 0.0 when disabled or not matching. Never raises."""
+    cfg = settings or {}
+    enabled = cfg.get("SMC_CONFLICT_SWEEP_BREAK_MODIFIER_ENABLED",
+                      SMC_CONFLICT_SWEEP_BREAK_MODIFIER_ENABLED)
+    if not enabled or smc_state is None:
+        return 0.0
+    if (getattr(smc_state, "state", None) == "CONFLICT"
+            and getattr(smc_state, "conflict_bull_kind", None) == "SWEEP+BREAK"):
+        return float(cfg.get("SMC_CONFLICT_SWEEP_BREAK_MODIFIER_POINTS",
+                             SMC_CONFLICT_SWEEP_BREAK_MODIFIER_POINTS))
+    return 0.0
+
+
 @dataclass
 class ConvictionV4:
     """Three orthogonal 0-100 scores (§1.1) — NOT averaged into one blended
@@ -1431,6 +1498,12 @@ class ConvictionV4:
     smc_conflict_bull_kind:     Optional[str] = None
     smc_conflict_bear_kind:     Optional[str] = None
     smc_conflict_fresher_side:  Optional[str] = None
+
+    # EXPERIMENTAL (see SMC_CONFLICT_SWEEP_BREAK_MODIFIER_* above). Both
+    # are inert by default: pts == 0.0 and composite_experimental ==
+    # composite. Not read by any classifier or gate.
+    experimental_modifier_pts: float = 0.0
+    composite_experimental:    float = 0.0
 
     thesis_direction: str = "BULLISH"   # BULLISH | BEARISH — what this read was scored against
 
@@ -1958,6 +2031,7 @@ def compute_conviction_v4(
 
     composite = (leadership + conviction + entry_quality) / 3
     signal = _classify_v4(leadership, conviction, entry_quality, thresholds=settings)
+    _exp_pts = _conflict_sweep_break_modifier(smc_state, settings)
 
     return ConvictionV4(
         leadership=leadership, conviction=conviction, entry_quality=entry_quality,
@@ -1994,5 +2068,7 @@ def compute_conviction_v4(
         smc_conflict_bull_kind     = smc_state.conflict_bull_kind if smc_state is not None else None,
         smc_conflict_bear_kind     = smc_state.conflict_bear_kind if smc_state is not None else None,
         smc_conflict_fresher_side  = smc_state.conflict_fresher_side if smc_state is not None else None,
+        experimental_modifier_pts = _exp_pts,
+        composite_experimental    = min(100.0, composite + _exp_pts),
         thesis_direction  = thesis_direction,
     )
