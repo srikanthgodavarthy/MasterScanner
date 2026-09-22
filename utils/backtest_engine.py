@@ -33,7 +33,10 @@ _log = logging.getLogger(__name__)
 
 from utils.scanner_engine import _strip_tz, nifty_regime, ema, yf_download_with_retry
 from utils.decision_engine import _extension as _ext_fn
-from utils.conviction_score_v1 import compute_conviction_v4, classify_tier_v4, _classify_v4
+from utils.conviction_score_v1 import (
+    compute_conviction_v4, classify_tier_v4, _classify_v4,
+    gate_scores_with_experimental_modifier,
+)
 from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
 from utils.adaptive_target_engine import AdaptiveTargetParams, compute_adaptive_targets, check_momentum_exit
 from utils.trade_levels import evaluate_bar_crossing, LevelCheck
@@ -406,6 +409,7 @@ def generate_signals_historical(
         # Initialise here so the rejection-log append below always has values.
         _eq_val, _rr, _ls_val, _cv_val = 0, 0.0, 0, 0
         _cv1 = None
+        _exp_admit = False   # admitted only via the experimental CONFLICT modifier
         if not _rejection_reason:
             _cv1    = _cv4_for_bar(r, i)
             _ls_val = _cv1.leadership
@@ -437,7 +441,24 @@ def generate_signals_historical(
             # independently of base_tier, same structural reason as before.
             _base_tier   = classify_tier_v4(_ls_val, _cv_val, _eq_val, thresholds=settings)
             _natural_cls = _classify_v4(_ls_val, _cv_val, _eq_val, thresholds=settings)
-            if _base_tier != "Actionable" and _natural_cls not in ("EXECUTE", "ELITE"):
+            _raw_below   = (_base_tier != "Actionable"
+                            and _natural_cls not in ("EXECUTE", "ELITE"))
+            # [2026-09-21] OPT-IN A/B: CONFLICT sweep+break modifier applied
+            # to the admission floors. Off unless settings sets both
+            # SMC_CONFLICT_SWEEP_BREAK_MODIFIER_ENABLED and
+            # ..._GATE_TARGET, so the default path is byte-for-byte the
+            # gate above. _exp_admit marks trades that ONLY the modifier
+            # let through (raw verdict was BELOW_ACTIONABLE) — that set is
+            # the incremental population the A/B is meant to measure.
+            if _raw_below and _cv1.experimental_modifier_pts:
+                _g_ls, _g_cv, _g_eq = gate_scores_with_experimental_modifier(
+                    _ls_val, _cv_val, _eq_val, _cv1.experimental_modifier_pts, settings)
+                _adj_base = classify_tier_v4(_g_ls, _g_cv, _g_eq, thresholds=settings)
+                _adj_nat  = _classify_v4(_g_ls, _g_cv, _g_eq, thresholds=settings)
+                if _adj_base == "Actionable" or _adj_nat in ("EXECUTE", "ELITE"):
+                    _raw_below   = False
+                    _exp_admit   = True
+            if _raw_below:
                 _rejection_reason = f"BELOW_ACTIONABLE (base={_base_tier}, natural={_natural_cls})"
             # Gate 3: Risk/Reward — independent backtest-specific quality
             # bar; classify_tier_v3/_classify_v3 have no R:R component.
@@ -621,6 +642,9 @@ def generate_signals_historical(
             "smc_conflict_bull_kind":     _cv1.smc_conflict_bull_kind,
             "smc_conflict_bear_kind":     _cv1.smc_conflict_bear_kind,
             "smc_conflict_fresher_side":  _cv1.smc_conflict_fresher_side,
+            "exp_conflict_sb_pts":        _cv1.experimental_modifier_pts,
+            "admitted_via_exp_modifier":  _exp_admit,
+            "cv4_composite_experimental": _cv1.composite_experimental,
             "cv4_composite":       _cv1.composite,
             "cv4_signal_class":    _cv1.signal_class,
             "t3":              _sig_t3,
@@ -1540,6 +1564,9 @@ def simulate_trades(
             "smc_conflict_bull_kind":     sig.get("smc_conflict_bull_kind"),
             "smc_conflict_bear_kind":     sig.get("smc_conflict_bear_kind"),
             "smc_conflict_fresher_side":  sig.get("smc_conflict_fresher_side"),
+            "exp_conflict_sb_pts":        float(sig.get("exp_conflict_sb_pts", 0) or 0),
+            "admitted_via_exp_modifier":  bool(sig.get("admitted_via_exp_modifier", False)),
+            "cv4_composite_experimental": float(sig.get("cv4_composite_experimental", 0) or 0),
             "cv4_composite":          float(sig.get("cv4_composite",   0) or 0),
             "cv4_signal_class":       str(sig.get("cv4_signal_class", "") or ""),
             "structural_entry": bool(sig.get("structural_entry", False)),
