@@ -626,7 +626,10 @@ def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
     every other loop here.
     """
     from utils.scan_state import prune_all_snapshots
-    from utils.supabase_client import prune_scan_snapshot_tables, prune_oi_and_premium_history, prune_iv_history
+    from utils.supabase_client import (
+        prune_scan_snapshot_tables, prune_oi_and_premium_history, prune_iv_history,
+        prune_closed_dore_options_plans,
+    )
     from utils.system_state import should_scheduler_run
     from utils import db
 
@@ -680,6 +683,15 @@ def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
             _n = prune_iv_history()
             if _n is not None:
                 results["dore_iv_history"] = _n
+            # [2026-09-23, SG request] dore_options_plans keeps every
+            # CLOSED plan forever (no retention before this) — age
+            # those off 5 days after they closed, same hourly tick as
+            # the other prune_* calls above. See prune_closed_dore_
+            # options_plans()'s docstring for why this is safe (only
+            # ever deletes terminal CLOSED rows, gated on closed_at).
+            _n2 = prune_closed_dore_options_plans()
+            if _n2 is not None:
+                results["dore_options_plans"] = _n2
             logger.info("[retention] pruned snapshot tables: %s", results)
         except Exception:
             logger.exception("[retention] prune_all_snapshots failed (non-fatal — retrying next cycle)")
