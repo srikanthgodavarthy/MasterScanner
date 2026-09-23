@@ -1354,6 +1354,38 @@ def load_all_dore_options_plans(limit: int = 500) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def prune_closed_dore_options_plans(keep_days: int = 5) -> Optional[int]:
+    """[2026-09-23, SG request] Deletes dore_options_plans rows that are
+    CLOSED and whose closed_at is older than `keep_days`. Every CLOSED
+    row gets closed_at set at the moment it closes (see
+    utils.dore_options_persistence's close branches), so this is a
+    straight age-off — same shape as prune_iv_history()/prune_oi_and_
+    premium_history() above, just gated on status='CLOSED' as well as
+    the date cutoff so OPEN/ACTIVE/pre-active rows are never touched
+    regardless of how old created_date is. Non-CLOSED rows age out (or
+    not) via their own lifecycle in utils.dore_options_persistence —
+    this function only ever deletes terminal rows.
+    load_recently_closed_dore_options_plans()/load_all_dore_options_
+    plans() and any outcome-tracking table that already snapshotted a
+    closed plan (see _record_dore_final_outcome()) are unaffected —
+    this only prunes the live dore_options_plans row itself."""
+    if not db.is_available():
+        return None
+    try:
+        from datetime import timezone as _tz, timedelta as _td
+        cutoff = (datetime.now(_tz.utc) - _td(days=keep_days)).isoformat()
+        n = db.execute(
+            "DELETE FROM dore_options_plans WHERE status = %s AND closed_at < %s",
+            ("CLOSED", cutoff),
+        )
+        if n:
+            logger.info("prune_closed_dore_options_plans: deleted %s row(s) closed before %s", n, cutoff)
+        return n
+    except Exception:
+        logger.exception("prune_closed_dore_options_plans failed (non-fatal)")
+        return None
+
+
 def load_watchlist_enriched(lc_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Return the watchlist joined with the latest lifecycle state for each symbol.

@@ -1667,15 +1667,30 @@ def enrich_trade_plans_with_persistence(
                 # trigger, not at whenever this candidate first became
                 # TRACKED. See _lifecycle_age_start()'s docstring for the
                 # Day-0-tracked/Day-2-triggered scenario this fixes.
+                # [Expiry fix, 2026-09-23] This branch used to check ONLY
+                # _is_stale_by_age (the MAX_DORE_OPTIONS_PLAN_AGE_DAYS
+                # cap) — calendar expiry was checked ONLY in the not-
+                # reproduced cleanup pass below, which a still-reproduced
+                # contract (Stage 1 keeps recommending it every cycle,
+                # same reasoning as the age-out comment above) never
+                # reaches. Net effect before this fix: a 0/1-DTE contract
+                # that Stage 1 kept reproducing every cycle could stay
+                # ACTIVE straight through its own expiry day. Now checks
+                # both, same as the cleanup pass, so whichever fires
+                # first closes the plan.
                 _age_date, _ = _lifecycle_age_start(locked)
-                if not just_minted and _is_stale_by_age(_age_date, today):
+                _expired = _is_expired(locked.expiry, today)
+                if not just_minted and (_expired or _is_stale_by_age(_age_date, today)):
                     if current_premium is not None:
                         locked.last_premium = current_premium
                     locked.last_seen_at = _now_iso()
                     locked.status = DoreOptionsPlanStatus.CLOSED
                     locked.closed_at = _now_iso()
-                    locked.closed_reason = f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS}d)"
-                    locked.closed_reason_code = CLOSE_REASON_TIMEOUT
+                    locked.closed_reason = (
+                        "Expired" if _expired else
+                        f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS}d)"
+                    )
+                    locked.closed_reason_code = CLOSE_REASON_EXPIRY if _expired else CLOSE_REASON_TIMEOUT
                     updated_plans.append(locked)
                     _record_dore_final_outcome(locked)
                     enriched_rows.append(p.to_dict())   # still shown this cycle as a fresh recommendation, just no longer a tracked Active Plan

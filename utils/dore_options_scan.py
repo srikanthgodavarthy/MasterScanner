@@ -270,44 +270,56 @@ def _shortlist_score(row: dict, w: ShortlistWeights) -> float:
 
 # ══════════════════════════════════════════════════════════════════
 #  Shortlist — DORE reads every MasterScanner candidate (Improvement
-#  #1: no hard qualification gate), but the live option-chain fetch is
-#  the one genuinely expensive call, so only the top N candidates by a
-#  lightweight pre-rank reach it each cycle. This is a COST shortlist,
-#  not a quality filter — the goal is maximizing the odds the fetch
-#  budget lands on stocks actively moving *today*, not just stocks
-#  that scored well on a slower equity setup. Every candidate that
-#  doesn't make the cut this cycle is simply picked up again next
-#  cycle, same as DORE 2.0's max_option_chain_symbols.
+#  #1: no hard qualification gate). This used to also cap the live
+#  option-chain fetch to the top N candidates by a lightweight
+#  pre-rank each cycle, as a COST shortlist (not a quality filter) —
+#  the concern was Upstox 429s on the option-chain endpoint. That's no
+#  longer the binding constraint: `utils/upstox_client.py`'s option-
+#  chain fetcher has its own dedicated 3 req/s token-bucket rate
+#  limiter with retry/backoff (see `_get_option_chain_with_retry`),
+#  independent of the general 20 req/s candle/quote budget, so it's
+#  safe against 429s regardless of how many symbols are queued.
 #
-#  Pre-rank blends: Conviction, Entry Quality, today's %-move, volume
-#  expansion, and recent momentum (see ShortlistWeights / _shortlist_
-#  score above).
+#  [2026-09-23, SG request] `max_symbols=None` (the new default from
+#  `top_dore_trade_plans`) removes the cap entirely — every live-pool
+#  stock symbol reaches the option-chain fetch each cycle, rate-limited
+#  but not truncated. Passing an int restores the old score-based
+#  shortlist behavior (kept for callers who still want a cost cutoff,
+#  e.g. a constrained Upstox plan).
+#
+#  Pre-rank blends (only used when max_symbols is an int): Conviction,
+#  Entry Quality, today's %-move, volume expansion, and recent
+#  momentum (see ShortlistWeights / _shortlist_score above).
 #
 #  2026-08-02: `always_include` exempts symbols with an already-OPEN
-#  DoreOptionsPlan from this cost cutoff entirely. Before this, an open
-#  plan and a fresh candidate competed on identical terms — a plan
-#  minted on a strong day could later cool off on today's %-move/
-#  volume/momentum, drop out of the top N, and then NEVER get its
-#  last_premium/last_seen_at refreshed again (Active Plans tab shows
-#  "Never reproduced" / "—" indefinitely even though the position is
-#  still open — see utils/dore_options_persistence.py's docstrings).
-#  An open position isn't optional discovery work; its premium/P&L
-#  needs refreshing regardless of how it scores today. These symbols
-#  are added on top of the top-`max_symbols` cut, so they never
-#  displace a fresh candidate's slot and never count against the
-#  budget — this is a floor, not part of the ranked competition.
+#  DoreOptionsPlan from this cost cutoff entirely (only relevant when
+#  a cap is set — see above). Before this, an open plan and a fresh
+#  candidate competed on identical terms — a plan minted on a strong
+#  day could later cool off on today's %-move/volume/momentum, drop
+#  out of the top N, and then NEVER get its last_premium/last_seen_at
+#  refreshed again (Active Plans tab shows "Never reproduced" / "—"
+#  indefinitely even though the position is still open — see
+#  utils/dore_options_persistence.py's docstrings). An open position
+#  isn't optional discovery work; its premium/P&L needs refreshing
+#  regardless of how it scores today. These symbols are added on top
+#  of the top-`max_symbols` cut, so they never displace a fresh
+#  candidate's slot and never count against the budget — this is a
+#  floor, not part of the ranked competition.
 # ══════════════════════════════════════════════════════════════════
 
 def _shortlist_for_option_chain(
     live_pool: dict,
-    max_symbols: int,
+    max_symbols: Optional[int],
     weights: Optional[ShortlistWeights] = None,
     always_include: Optional[set] = None,
 ) -> list[str]:
     symbols = [s for s in live_pool.keys() if s not in _INDICES]
     always = {s for s in (always_include or ()) if s in live_pool and s not in _INDICES}
 
-    if len(symbols) <= max_symbols:
+    # No cap: every symbol reaches the option-chain fetch. `always`
+    # doesn't need special handling here — it's already a subset of
+    # `symbols` (or not in live_pool at all, filtered out above).
+    if max_symbols is None or len(symbols) <= max_symbols:
         return symbols
 
     w = weights or SHORTLIST_DEFAULTS
@@ -341,7 +353,7 @@ def _shortlist_for_option_chain(
 def top_dore_trade_plans(
     live_pool: dict,
     cfg: Optional[DoreOptionsSettings] = None,
-    max_option_chain_symbols: int = 25,
+    max_option_chain_symbols: Optional[int] = None,
     ohlcv_bars: int = 60,
     iv_lookup: Optional[dict] = None,
     shortlist_weights: Optional[ShortlistWeights] = None,
@@ -360,13 +372,21 @@ def top_dore_trade_plans(
         iv_lookup: optional symbol -> {"iv_rank": .., "iv_percentile": ..}
             — pluggable per Improvement #7; omit entirely until an IV
             engine exists, every symbol just gets IVContext() (no-op).
+        max_option_chain_symbols: [2026-09-23] None (default) removes
+            the shortlist cap — every live_pool stock symbol reaches
+            the option-chain fetch each cycle. Pass an int to restore
+            the old score-based cost shortlist. See _shortlist_for_
+            option_chain's docstring for why the cap is no longer
+            needed by default (dedicated 3 req/s token-bucket limiter
+            on the option-chain endpoint).
         open_plan_symbols: symbols with a currently-OPEN DoreOptionsPlan
             (from utils.supabase_client.load_open_dore_options_plans()).
             Exempted onto this cycle's option-chain shortlist regardless
             of score, so an open position's last_premium/last_seen_at
             keep refreshing even on days it wouldn't rank in the top
             `max_option_chain_symbols` — see _shortlist_for_option_
-            chain's docstring. Omit to keep the old score-only behavior.
+            chain's docstring. Only relevant when a cap is set; omit to
+            keep the old score-only behavior.
         squeeze_release_symbols: [2026-08-04] symbols whose Pre-Breakout
             scanner criteria (utils.scoring_core's BB-inside-KC squeeze
             just released — trend_up AND squeeze_release AND 45<=RSI<=70,
