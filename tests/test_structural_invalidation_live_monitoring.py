@@ -29,7 +29,18 @@ from utils.dore_options_persistence import (
     enrich_trade_plans_with_persistence,
 )
 
-SYMBOL, DIRECTION, STRIKE, EXPIRY = "TESTCO", "CE", 100.0, "2026-08-27"
+# [2026-09-23] EXPIRY used to be hardcoded to a fixed calendar date
+# ("2026-08-27"). That date has since passed, and utils.dore_options_
+# persistence's ACTIVE-plan auto-close now checks calendar expiry
+# inline (see the "[Expiry fix, 2026-09-23]" note in that module) —
+# so a stale hardcoded expiry would auto-close every fixture plan
+# here as "Expired" before any of the structural-invalidation/SL/
+# age branches this file actually means to test ever run. Computed
+# relative to "now" instead, same pattern as _RECENT_ENTRY below, so
+# this suite keeps isolating the branch each test names regardless of
+# when it's run.
+SYMBOL, DIRECTION, STRIKE = "TESTCO", "CE", 100.0
+EXPIRY = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%d")
 KEY = f"{SYMBOL}|{DIRECTION}|{STRIKE:.1f}|{EXPIRY}"
 
 # Entry time relative to "now" rather than hardcoded, so this plan never
