@@ -45,7 +45,7 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
-from utils.scanner_engine import NIFTY500_SYMBOLS, _strip_tz, nifty_regime
+from utils.scanner_engine import NIFTY500_SYMBOLS, _strip_tz, nifty_regime, nifty_regime_series
 from utils.backtest_engine import (
     _fetch_bt_batch, _fetch_bt_nifty, simulate_trades, fetch_all_bt_data
 )
@@ -105,7 +105,12 @@ def _generate_signals_validation(
     else:
         params = ScoringParams(cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os)
 
-    ia = build_indicators(df, nifty, params)
+    ia = build_indicators(
+        df, nifty, params,
+        # [FIX 2026-09-23] same fix as backtest_engine/ab_compare -- gate
+        # each historical bar by ITS OWN date's regime, not "today's".
+        nifty_regime_series=(settings or {}).get("_nifty_regime_series"),
+    )
     signals = []
     last_signal_bar = -999
 
@@ -240,7 +245,8 @@ def _run_validation(
     nifty      = _fetch_bt_nifty(years=3)
     regime_val = nifty_regime(nifty)
     eff = dict(settings) if settings else {}
-    eff["nifty_regime_val"] = regime_val
+    eff["nifty_regime_val"]     = regime_val
+    eff["_nifty_regime_series"] = nifty_regime_series(nifty)
 
     if progress_cb:
         progress_cb(0.15, f"Data ready — {len(all_data)} symbols")
