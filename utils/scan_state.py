@@ -590,6 +590,41 @@ def _save_state(
     try:
         if db_rows:
             db.upsert_rows(cfg["table"], db_rows, conflict_cols=[key_column])
+            # [2026-09-24 bugfix] Prune rows for keys NOT in this
+            # cycle's population. Upsert alone only ever adds/refreshes
+            # rows for keys present in the current `records` list -- a
+            # plan that closes, expires, or otherwise stops being
+            # emitted by the producer keeps its last-good row in this
+            # table forever, since nothing else ever visits that key
+            # again. Confirmed via a dore_live_state export going back
+            # a month with dozens of long-expired contracts still
+            # present, none of them still open.
+            #
+            # Scoped to db_rows' OWN keys (delete anything NOT in this
+            # batch), not a blanket "delete anything old" -- and gated
+            # inside `if db_rows:` so a cycle that upserts zero rows
+            # (all records skipped for missing keys, or an upstream
+            # producer bug) can never wipe the table. The other empty-
+            # payload case (status != "completed" / payload is None) is
+            # already excluded by the early return above this function.
+            current_keys = [r[key_column] for r in db_rows]
+            try:
+                deleted = db.execute(
+                    f"DELETE FROM {cfg['table']} WHERE {key_column} <> ALL(%s)",
+                    (current_keys,),
+                )
+                if deleted:
+                    logger.info(
+                        "_save_state(%s): pruned %d stale row(s) not present "
+                        "in this cycle's %d-row population",
+                        section, deleted, len(current_keys),
+                    )
+            except Exception:
+                # Non-fatal: the upsert above already succeeded, so this
+                # cycle's live rows are correct even if the prune fails.
+                # Worst case is the pre-existing staleness, not new
+                # damage -- never let a prune failure mask a good write.
+                logger.exception("_save_state(%s): stale-row prune failed (non-fatal)", section)
         db.upsert_rows(
             "state_meta",
             [{"section": section, "scan_id": scan_id, "status": "completed",
