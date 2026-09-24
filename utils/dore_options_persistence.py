@@ -285,6 +285,21 @@ MAX_ACTIVE_DORE_OPTIONS_PLANS = 10
 # both the Duplicate Suppression and Quality Ranking asks.
 MATERIALLY_BETTER_MARGIN = 15
 
+# [2026-09-24, SG request — win-rate review] Move the stop to breakeven
+# the instant T1 fires, instead of leaving sl_locked at its original
+# (much wider) flat level for the rest of the plan's life. Confirmed
+# live and against the 44-trade calibration sample: plans that reach
+# T1 but then get stopped out average +17.82% MFE before finishing at
+# -39.81% — a real, repeatable give-back, not noise (BANKNIFTY PE and
+# SOLARINDS PE were caught mid-reversal doing exactly this on
+# 2026-09-24: +42% and +45% MFE respectively, both giving it back
+# toward the original stop with nothing protecting the gain). Applied
+# once, the moment t1_hit_at is set (see the "if not locked.t1_hit_at"
+# block below) — never re-applied or re-widened afterward, and never
+# applied if it would LOWER the existing stop (a plan already stopped
+# in above breakeven by its own dynamic SL keeps the better level).
+ENABLE_BREAKEVEN_STOP_ON_T1_HIT = True
+
 
 class DoreOptionsPlanStatus(str, Enum):
     """[2026-08-12, two-level lifecycle refactor] Replaces the old
@@ -1618,6 +1633,20 @@ def enrich_trade_plans_with_persistence(
                         and locked.target1_locked is not None
                         and current_premium >= locked.target1_locked):
                     locked.t1_hit_at = _now_iso()
+                    # [2026-09-24 win-rate fix] See ENABLE_BREAKEVEN_STOP_
+                    # ON_T1_HIT's module-level docstring for why this
+                    # exists. Only raises sl_locked (never lowers it —
+                    # `max()` protects a plan whose dynamic SL was
+                    # already better than breakeven when it locked), and
+                    # only fires this one tick, right alongside t1_hit_at
+                    # itself going from unset to set — never re-touched
+                    # on later cycles, matching sl_locked's normal
+                    # frozen-at-mint-then-static lifecycle everywhere
+                    # else in this function.
+                    if (ENABLE_BREAKEVEN_STOP_ON_T1_HIT
+                            and locked.entry_locked is not None
+                            and locked.sl_locked is not None):
+                        locked.sl_locked = max(locked.sl_locked, locked.entry_locked)
 
                 # [2026-08-11, SG request] Stop-loss auto-close — checked
                 # ahead of Target 2 / age-based close below, so a
