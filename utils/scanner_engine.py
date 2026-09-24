@@ -1964,28 +1964,35 @@ def score_stock(
     _cv4_smc_state = None
     _cv4_swing_label = None
     _order_block = None   # freshest BULLISH OrderBlock, long-only scanner — see below
+    # [2026-09-24] Split into independent steps: previously ONE try/except
+    # reset all three outputs to None if ANY step raised, so a
+    # detect_order_blocks() failure silently discarded an already-valid
+    # SMC state and swing label. Each step now fails alone, and logs.
+    _pvt_lb = params.pvt_lb if hasattr(params, "pvt_lb") else 20
     try:
-        from utils.smc_engine import compute_smc_state, detect_order_blocks
-        from utils.swing_structure import compute_swing_labels
-        from utils.structural_levels import causal_pivot_series
-        _pvt_lb = params.pvt_lb if hasattr(params, "pvt_lb") else 20
+        from utils.smc_engine import compute_smc_state
         _smc_states = compute_smc_state(df, lb=_pvt_lb)
         _cv4_smc_state = _smc_states[-1] if _smc_states else None
+    except Exception:
+        _log.exception("score_stock: compute_smc_state failed for %s — SMC-neutral", symbol)
+    try:
+        from utils.swing_structure import compute_swing_labels
+        from utils.structural_levels import causal_pivot_series
         _ph, _pl = causal_pivot_series(df["high"], df["low"], lb=_pvt_lb)
         _swing_df = compute_swing_labels(_ph, _pl)
         _cv4_swing_label = _swing_df["label_ffill"].iloc[-1] if len(_swing_df) else None
+    except Exception:
+        _log.exception("score_stock: swing labels failed for %s — swing label None", symbol)
+    try:
+        from utils.smc_engine import detect_order_blocks
         # [Structural gate wiring, 2026-08-15] Live Scanner is long-only
-        # (see compute_conviction_v4()'s own docstring on that constraint)
-        # so only the bullish OB series is needed here — bull_obs[-1] is
-        # the freshest unmitigated bullish OrderBlock as of the latest
-        # bar, or None if none exists (a normal, common case, not an
-        # error — see detect_order_blocks()'s docstring).
+        # so only the bullish OB series is needed — bull_obs[-1] is the
+        # freshest unmitigated bullish OrderBlock, or None if none exists
+        # (a normal, common case, not an error).
         _bull_obs, _ = detect_order_blocks(df, lb=_pvt_lb)
         _order_block = _bull_obs[-1] if _bull_obs else None
     except Exception:
-        _cv4_smc_state = None
-        _cv4_swing_label = None
-        _order_block = None
+        _log.exception("score_stock: detect_order_blocks failed for %s — no order block", symbol)
 
     # [Production wiring, 2026-08-14] SMC now feeds decision_engine's
     # Extension/Chase Risk (Primary use, per explicit direction) via
@@ -2243,6 +2250,16 @@ def score_stock(
             "CV1_EntryQuality":  cv1.entry_quality,
             "CV1_Composite":     cv1.composite,
             "CV1_SignalClass":   cv1.signal_class,
+            # [2026-09-24] CV4_* aliases of the same values. The Sep-2 cutover
+            # moved CV4 under CV1_* but DORE (dore_options_engine.py) still
+            # reads CV4_Leadership/Conviction/EntryQuality/Composite/
+            # SignalClass, which nothing wrote — so DORE's cv4_* fields and
+            # cv4_signal_class_at_mint were always empty on live scans.
+            "CV4_Leadership":    cv1.leadership,
+            "CV4_Conviction":    cv1.conviction,
+            "CV4_EntryQuality":  cv1.entry_quality,
+            "CV4_Composite":     cv1.composite,
+            "CV4_SignalClass":   cv1.signal_class,
             # Staged-elimination diagnostic tags (see prescreen_diagnostic
             # above). _prescreen_mismatch=True means the cheap prescreen
             # would have rejected this symbol before full scoring, but the
@@ -2292,6 +2309,7 @@ def score_stock(
             "CV4_SMC_FvgRetest":     cv1.smc_fvg_retest,
         })
     except Exception:
+        _log.exception("score_stock: compute_conviction_v4 failed for %s", symbol)
         cv1 = None   # Decision Engine call below is skipped entirely for this symbol —
                      # see compute_decision(mode="production") requirement below
 
@@ -2550,7 +2568,7 @@ def score_stock(
         result["_structural_gate_blocked"] = _gate_reason
         result["_structural_gate_on"] = _structural_gate_on
 
-        result["CV1_SignalClass"]    = cv1.signal_class   # v3-weighted (_classify_v3) as of 2026-07 — no longer v1's frozen label
+        result["CV1_SignalClass"]    = cv1.signal_class   # holds the CV4 class (_classify_v4) since the 2026-09-01 cutover; name kept for consumers
         result["Tier"]               = base_tier           # pre-promotion CV1 tier
         # [Section 7] "Recommendation" IS Final_Recommendation/Final_Entry_State
         # — the project's existing field for exactly that meaning. Not
