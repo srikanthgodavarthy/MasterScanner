@@ -276,6 +276,7 @@ def refresh_dore_live_state(cfg=None) -> dict:
     from utils.json_sanitize import find_invalid_columns, find_invalid_columns_by_source, sanitize_dataframe
     from utils.supabase_client import load_open_dore_options_plans
     from utils.dore_options_engine import DORE_OPTIONS_DEFAULTS
+    from utils.dore_options_scan import _days_to_expiry
     import pandas as pd
 
     # [2026-08-07 bugfix] This used to return early (nothing refreshed
@@ -341,6 +342,21 @@ def refresh_dore_live_state(cfg=None) -> dict:
         if k in covered:
             continue   # Stage 1 already reproduced this contract this cycle — don't double up
         entry = db_plan.entry_locked or None
+        # [2026-09-24 bugfix, SG report] This dict never included "dte"
+        # — _TechPlanView.dte (self.dte = plan.get("dte", 0)) only
+        # covers in-process use; to_dict() returns {**self._plan,
+        # **self._live} verbatim, so a carried-forward row's persisted
+        # JSON simply never had a "dte" key at all (not even a stored 0
+        # — the key was absent), which read back as SQL NULL via
+        # record->>'dte'. Confirmed live: every carried-forward row in
+        # a production dore_live_state export showed dte=null while
+        # fresh Stage-1 rows (which DO carry "dte" from utils.
+        # dore_options_scan._days_to_expiry() at mint time) showed a
+        # real integer. Computed the same way here, from the plan's own
+        # locked expiry, so a carried-forward row's DTE is exactly as
+        # trustworthy as a fresh one's — same calendar-day count, just
+        # evaluated against IST "today" instead of at mint time.
+        _dte = _days_to_expiry(db_plan.expiry)
         # [2026-08-07] Synthesized from the plan's own LOCKED fields —
         # NOT from a fresh technical recompute (Stage 1 didn't reproduce
         # this one this cycle, that's the whole point). setup_type/
@@ -351,6 +367,7 @@ def refresh_dore_live_state(cfg=None) -> dict:
             "symbol": db_plan.symbol,
             "direction": db_plan.direction,
             "expiry": db_plan.expiry,
+            "dte": _dte,
             "primary": {"strike": db_plan.strike},
             # [2026-08-10 fix] db_plan.source is set once at mint time from
             # the OptionTradePlan.source that produced this entry (PB/LS —
