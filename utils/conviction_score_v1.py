@@ -1697,8 +1697,44 @@ def smc_conviction_score(smc_state, thesis_direction: str) -> int:
     """
     EXACT formula per §1.3. SLOW freshness decay (thesis stays informed
     even as the structural evidence ages) — see smc_freshness.py.
+
+    [2026-09-23, SG request] CONFLICT no longer means an unconditional 0.
+    A modest, direction-consistent credit applies when the ONE CONFLICT
+    sub-pattern validated across two independent backtest pulls is
+    present — conflict_bull_kind == "SWEEP+BREAK" (in-sample
+    backtest_20260921_2246.csv: +0.67R vs +0.09R for the rest of
+    CONFLICT, n=32; out-of-sample backtest_20260923_1629.csv: +0.408R vs
+    -0.046R for BREAK-only, n=89 vs n=114). Bearish thesis checks
+    conflict_bear_kind the same way, by consistency with this function's
+    existing directional-symmetry convention (dt/mo/rsm all flip by
+    thesis elsewhere in this file) — the bear side itself hasn't been
+    independently validated the same way, so treat that half as a
+    disciplined extension, not an equally-proven claim. Deliberately NOT
+    gated on conflict_fresher_side: that field showed no differentiation
+    in either backtest pull (48.9% vs 47.8% win rate), so requiring it
+    would add an untested constraint with no evidence behind it. Credit
+    = this function's own tier-1 base (3 of 15) — reuses an existing
+    rung of the tier system below rather than inventing a new number,
+    and stays well short of tier-2 (7) let alone a clean non-CONFLICT
+    read. No settings flag: compute_conviction_v4()'s CV4 composite has
+    ZERO production impact through Phase 6 regardless (see
+    V4_THRESHOLD_DEFAULTS's own docstring) — same blast radius as the
+    conflict_bull_age_bars/etc. fields this reads, which were already
+    additive-only. Independent of, and compatible with, the separate
+    SMC_CONFLICT_SWEEP_BREAK_MODIFIER_* experimental gate-rescue
+    mechanism above (that one bumps admission TOTALS post-hoc for bars
+    the raw gate would reject; this fixes the raw baseline itself for
+    the pattern already shown to deserve it).
     """
-    if smc_state is None or smc_state.direction != thesis_direction or smc_state.state == "CONFLICT":
+    if smc_state is None:
+        return 0
+    if smc_state.state == "CONFLICT":
+        matched = (
+            (thesis_direction == "BULLISH" and smc_state.conflict_bull_kind == "SWEEP+BREAK")
+            or (thesis_direction == "BEARISH" and smc_state.conflict_bear_kind == "SWEEP+BREAK")
+        )
+        return 3 if matched else 0
+    if smc_state.direction != thesis_direction:
         return 0
     base = {0: 0, 1: 3, 2: 7, 3: 12, 4: 15}[smc_state.evidence_tier]
     return round(base * conviction_freshness_multiplier(smc_state.age_bars))
@@ -1828,8 +1864,24 @@ def smc_entry_structure_score(smc_state, thesis_direction: str = "BULLISH") -> i
     thesis_direction defaults to "BULLISH" only to preserve the old
     positional-call signature; the real value is always threaded in from
     compute_conviction_v4() below.
+
+    [2026-09-23, SG request] CONFLICT no longer means an unconditional 0 —
+    see smc_conviction_score()'s docstring immediately above for the full
+    rationale and the two-backtest validation this credit is based on.
+    Same matching rule, same "not gated on conflict_fresher_side" reasoning.
+    Credit = this function's own tier-1 base (4 of 25) — the equivalent
+    rung to smc_conviction_score()'s 3-of-15, scaled to this function's
+    wider range, and still well short of tier-2 (10).
     """
-    if smc_state is None or smc_state.direction != thesis_direction or smc_state.state == "CONFLICT":
+    if smc_state is None:
+        return 0
+    if smc_state.state == "CONFLICT":
+        matched = (
+            (thesis_direction == "BULLISH" and smc_state.conflict_bull_kind == "SWEEP+BREAK")
+            or (thesis_direction == "BEARISH" and smc_state.conflict_bear_kind == "SWEEP+BREAK")
+        )
+        return 4 if matched else 0
+    if smc_state.direction != thesis_direction:
         return 0
     base = {0: 0, 1: 4, 2: 10, 3: 16, 4: 20}[smc_state.evidence_tier]
     retest_adj = {"none": 0, "in_zone": 5, "through_unfilled": -3, "through_filled": -8}[smc_state.fvg_retest]
