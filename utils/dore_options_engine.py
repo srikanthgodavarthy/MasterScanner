@@ -1337,6 +1337,16 @@ class OptionTradePlan:
     ce_iv:                   Optional[float] = None
     pe_iv:                   Optional[float] = None
 
+    # [DORE table columns, options-buying UI request] Raw options-chain
+    # PCR (Put/Call OI ratio) this plan was minted against — same value
+    # already read by hard_reject()/direction()'s PCR-conflict check
+    # (chain.pcr, settings.pcr_bullish_min/pcr_bearish_max), just also
+    # surfaced at the top level so table renderers/persistence don't have
+    # to reach into `chain` (not available past from_scan_row()) — same
+    # rationale as ce_iv/pe_iv above. None whenever chain.pcr was
+    # unavailable this cycle — never fabricated.
+    pcr:                     Optional[float] = None
+
     # [2026-09-15] Which branch actually produced this plan's
     # expected_move — "ATR" (from_scan_row()'s atr*sqrt(trading_dte),
     # including whenever settings.use_iv_expected_move is False or IV
@@ -3428,6 +3438,7 @@ def compute_dore_trade_plan(
         iv_percentile=iv.iv_percentile if iv is not None else None,
         ce_iv=chain.ce_iv,
         pe_iv=chain.pe_iv,
+        pcr=chain.pcr,
         # [Kill-switch + source tracking, 2026-09-15]
         expected_move_source=expected_move_source,
         # [IV/skew-shift leading signal, 2026-09-10, Phase 1 — OBSERVATION ONLY]

@@ -1197,6 +1197,7 @@ def _dore_options_plan_from_row(row: dict) -> "object":
         pe_iv_at_mint                   = row.get("pe_iv_at_mint"),
         expected_move_source_at_mint    = row.get("expected_move_source_at_mint", "ATR") or "ATR",
         pcr_conflict_note_at_mint       = row.get("pcr_conflict_note_at_mint", "") or "",
+        pcr_at_mint                     = row.get("pcr_at_mint"),
     )
 
 
@@ -2247,6 +2248,7 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
     pe_iv_at_mint                    numeric(6,2),
     expected_move_source_at_mint     text        NOT NULL DEFAULT 'ATR',
     pcr_conflict_note_at_mint        text        NOT NULL DEFAULT '',
+    pcr_at_mint                      numeric(6,2),
 
     updated_at                   timestamptz NOT NULL DEFAULT now()
 );
@@ -2342,6 +2344,7 @@ ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS ce_iv_at_mint numeric(6,
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS pe_iv_at_mint numeric(6,2);
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS expected_move_source_at_mint text NOT NULL DEFAULT 'ATR';
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS pcr_conflict_note_at_mint text NOT NULL DEFAULT '';
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS pcr_at_mint numeric(6,2);
 """
 
 # [2026-08-12, two-level lifecycle refactor] Run this once against an

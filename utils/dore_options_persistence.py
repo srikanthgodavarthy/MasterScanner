@@ -610,6 +610,13 @@ class DoreOptionsPlan:
     # at a closed/active plan later. Same frozen-at-mint, non-gating,
     # additive-only contract as the rest of this block.
     pcr_conflict_note_at_mint:          str = ""
+    # [DORE table columns, options-buying UI request] Frozen numeric PCR
+    # itself (OptionTradePlan.pcr, i.e. chain.pcr at mint) — same mint-
+    # time-frozen, additive-only contract as everything else in this
+    # block. pcr_conflict_note_at_mint above is the derived "did it
+    # conflict" text; this is the raw ratio the "Strike PCR" table
+    # column reads.
+    pcr_at_mint:                        Optional[float] = None
 
     @property
     def contract_key(self) -> str:
@@ -722,6 +729,7 @@ class DoreOptionsPlan:
             "pe_iv_at_mint":                 self.pe_iv_at_mint,
             "expected_move_source_at_mint":  self.expected_move_source_at_mint or "ATR",
             "pcr_conflict_note_at_mint":     self.pcr_conflict_note_at_mint or "",
+            "pcr_at_mint":                   self.pcr_at_mint,
         }
 
 
@@ -1405,6 +1413,7 @@ def enrich_trade_plans_with_persistence(
                     pcr_conflict_note_at_mint=next(
                         (r for r in (row.get("reasons") or []) if "CONFLICTS" in str(r)), ""
                     ),
+                    pcr_at_mint=row.get("pcr"),
                 )
                 just_minted = True
                 open_now[key] = locked
@@ -1969,6 +1978,7 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
                 "ce_iv_at_mint": plan.ce_iv_at_mint,
                 "pe_iv_at_mint": plan.pe_iv_at_mint,
                 "iv_skew_at_mint": plan.iv_skew_at_mint,
+                "pcr_at_mint": plan.pcr_at_mint,
                 "last_seen_at": plan.last_seen_at,
                 "created_date": plan.created_date,
                 "plan_age_days": days_active,
