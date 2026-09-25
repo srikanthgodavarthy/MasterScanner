@@ -60,7 +60,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from psycopg2.extras import Json
 
@@ -193,6 +193,9 @@ def save_snapshot(
     row_count: Optional[int] = None,
     status: str = "completed",
     error: Optional[str] = None,
+    *,
+    prune: bool = True,
+    prune_keys: Optional[Sequence] = None,
 ) -> Optional[str]:
     """
     Insert a new snapshot row for `section`. Returns the new scan_id (str)
@@ -209,9 +212,30 @@ def save_snapshot(
     JSON encoder rejects. `sanitize_for_json()` runs on every completed
     payload before insert as a safety net for every section, regardless
     of whether the producer already sanitized its own DataFrame.
+
+    prune / prune_keys : [2026-09-25 bugfix — see _save_state()'s own
+    comment on this] For a _STATE_SECTIONS table, every call after a
+    successful upsert deletes rows whose key isn't in THIS call's own
+    upserted keys, UNLESS overridden here. That's correct for a producer
+    that always calls once per cycle with its full population (e.g.
+    dore_live_state) — anything missing really did drop out and should
+    go. It is WRONG for a producer that calls multiple times per cycle
+    with only a slice of the population each time (live_scanner's
+    per-batch progressive saves): each batch's default prune would delete
+    every OTHER batch's rows, since only the last batch called ever
+    "wins" — this is exactly the bug that shipped 2026-09-24 and wiped
+    live_scanner_state down to its last batch every cycle.
+    Two ways to call this safely from a multi-call-per-cycle producer:
+      - `prune=False` on every call except the last one of the cycle;
+      - on that last call, `prune=True, prune_keys=<every key seen this
+        cycle across every call>` (NOT just that last call's own keys).
+    A single-shot producer needs neither param — the default (prune=True,
+    prune_keys=None, meaning "use this call's own upserted keys") is
+    exactly its previous, correct behavior.
     """
     if section in _STATE_SECTIONS:
-        return _save_state(section, payload, row_count, status, error)
+        return _save_state(section, payload, row_count, status, error,
+                           prune=prune, prune_keys=prune_keys)
 
     if not db.is_available():
         return None
@@ -470,6 +494,9 @@ def _save_state(
     row_count: Optional[int],
     status: str,
     error: Optional[str],
+    *,
+    prune: bool = True,
+    prune_keys: Optional[Sequence] = None,
 ) -> Optional[str]:
     cfg = _STATE_SECTIONS[section]
     if not db.is_available():
@@ -590,41 +617,65 @@ def _save_state(
     try:
         if db_rows:
             db.upsert_rows(cfg["table"], db_rows, conflict_cols=[key_column])
-            # [2026-09-24 bugfix] Prune rows for keys NOT in this
-            # cycle's population. Upsert alone only ever adds/refreshes
-            # rows for keys present in the current `records` list -- a
-            # plan that closes, expires, or otherwise stops being
-            # emitted by the producer keeps its last-good row in this
-            # table forever, since nothing else ever visits that key
-            # again. Confirmed via a dore_live_state export going back
-            # a month with dozens of long-expired contracts still
-            # present, none of them still open.
+            # [2026-09-24 bugfix, 2026-09-25 CORRECTED] Prune rows for keys
+            # NOT in the caller's population. Upsert alone only ever adds/
+            # refreshes rows for keys present in the current `records` list
+            # -- a plan that closes, expires, or otherwise stops being
+            # emitted by the producer keeps its last-good row in this table
+            # forever, since nothing else ever revisits that key. Confirmed
+            # via a dore_live_state export going back a month with dozens
+            # of long-expired contracts still present, none of them still
+            # open.
             #
-            # Scoped to db_rows' OWN keys (delete anything NOT in this
-            # batch), not a blanket "delete anything old" -- and gated
-            # inside `if db_rows:` so a cycle that upserts zero rows
-            # (all records skipped for missing keys, or an upstream
-            # producer bug) can never wipe the table. The other empty-
-            # payload case (status != "completed" / payload is None) is
-            # already excluded by the early return above this function.
-            current_keys = [r[key_column] for r in db_rows]
-            try:
-                deleted = db.execute(
-                    f"DELETE FROM {cfg['table']} WHERE {key_column} <> ALL(%s)",
-                    (current_keys,),
-                )
-                if deleted:
-                    logger.info(
-                        "_save_state(%s): pruned %d stale row(s) not present "
-                        "in this cycle's %d-row population",
-                        section, deleted, len(current_keys),
+            # [2026-09-25] The original version of this fix scoped the
+            # delete to db_rows' OWN keys unconditionally -- correct for a
+            # producer that calls once per cycle with its full population
+            # (dore_live_state), but WRONG for one that calls multiple
+            # times per cycle with only a slice each time (live_scanner's
+            # per-batch progressive saves, see scheduler/scan_worker.py's
+            # "Progressive snapshot after every batch" comment, in place
+            # since 2026-08-05 specifically so that upsert-only leaves
+            # every OTHER batch's rows untouched). Because this delete ran
+            # unconditionally after every batch's upsert, each batch wiped
+            # every symbol not in that one batch -- including every
+            # earlier batch from the SAME cycle -- so by the end of a
+            # multi-batch cycle only the last batch called survived in the
+            # table. Deployed 2026-09-24 ~15:35 IST; this is almost
+            # certainly why live_scanner_state (the Scanner Output table)
+            # went from the full F&O universe to near-empty overnight.
+            #
+            # Now opt-out via `prune=False` (skip entirely -- what a
+            # per-batch call other than the cycle's last should pass) and
+            # opt-in-with-a-different-key-set via `prune_keys` (what that
+            # last call should pass: every key seen across the WHOLE
+            # cycle, not just its own batch). Neither param is needed by a
+            # single-shot producer -- prune=True/prune_keys=None (the
+            # default) reduces to exactly the original, correct behavior:
+            # prune anything not in this call's own upserted keys.
+            #
+            # Still gated on `if db_rows:` (a cycle that upserts zero rows
+            # -- e.g. every record skipped for a missing key, or an
+            # upstream producer bug -- can never wipe the table via this
+            # path) and still non-fatal on its own failure.
+            if prune:
+                keys_to_keep = list(prune_keys) if prune_keys is not None else [r[key_column] for r in db_rows]
+                try:
+                    deleted = db.execute(
+                        f"DELETE FROM {cfg['table']} WHERE {key_column} <> ALL(%s)",
+                        (keys_to_keep,),
                     )
-            except Exception:
-                # Non-fatal: the upsert above already succeeded, so this
-                # cycle's live rows are correct even if the prune fails.
-                # Worst case is the pre-existing staleness, not new
-                # damage -- never let a prune failure mask a good write.
-                logger.exception("_save_state(%s): stale-row prune failed (non-fatal)", section)
+                    if deleted:
+                        logger.info(
+                            "_save_state(%s): pruned %d stale row(s) not present "
+                            "in the %d-key population being kept",
+                            section, deleted, len(keys_to_keep),
+                        )
+                except Exception:
+                    # Non-fatal: the upsert above already succeeded, so this
+                    # cycle's live rows are correct even if the prune fails.
+                    # Worst case is the pre-existing staleness, not new
+                    # damage -- never let a prune failure mask a good write.
+                    logger.exception("_save_state(%s): stale-row prune failed (non-fatal)", section)
         db.upsert_rows(
             "state_meta",
             [{"section": section, "scan_id": scan_id, "status": "completed",
