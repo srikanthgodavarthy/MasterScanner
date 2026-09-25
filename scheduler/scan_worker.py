@@ -1075,8 +1075,31 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             # explicitly.
             try:
                 records = list(batch_records.values())
-                scan_id = save_snapshot("live_scanner", payload={"data": records},
-                                         row_count=len(merged), status="completed")
+                # [2026-09-25 bugfix] utils.scan_state._save_state's stale-
+                # row prune (added 2026-09-24) deletes, after every upsert,
+                # any row whose key isn't in THIS call's own keys. Fine for
+                # a single full-population call; wrong here, where each
+                # batch only ever upserts its own slice — the prune was
+                # firing every batch and deleting every OTHER batch's rows,
+                # so only the last batch survived by the end of a cycle.
+                # Confirmed: live_scanner_state (Scanner Output) collapsed
+                # to near-empty overnight starting ~15:35 IST 2026-09-24,
+                # right after this shipped.
+                #
+                # Fix: skip the prune on every batch except the cycle's
+                # last, and on that last one prune against every key seen
+                # THIS CYCLE (`merged`, not `batch_records`) so a symbol
+                # that genuinely dropped out of this cycle's population
+                # (delisted, no longer F&O-eligible, etc.) still gets
+                # removed exactly as the 2026-09-24 fix intended — just
+                # once per cycle, correctly, instead of once per batch.
+                is_last_batch = (batch_i == n_batches - 1)
+                scan_id = save_snapshot(
+                    "live_scanner", payload={"data": records},
+                    row_count=len(merged), status="completed",
+                    prune=is_last_batch,
+                    prune_keys=list(merged.keys()) if is_last_batch else None,
+                )
                 if not scan_id:
                     logger.warning("[live_scanner] save_snapshot returned no scan_id (Supabase unavailable?)")
             except Exception:
