@@ -4446,54 +4446,81 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
     if df.empty:
         return '<div style="color:var(--muted);padding:8px;">No open plans.</div>'
 
+    def _fmt_iv(row):
+        # [DORE table columns, options-buying UI request] Single "IV"
+        # column reading whichever leg this plan's direction actually
+        # trades — CE plans show ce_iv_at_mint, PE plans show
+        # pe_iv_at_mint. Frozen-at-mint, same reasoning as
+        # _fmt_pcr()/every other "_at_mint" field already on this table.
+        direction = row.get("direction", "")
+        iv = row.get("ce_iv_at_mint") if direction == "CE" else row.get("pe_iv_at_mint")
+        if iv in (None, "") or pd.isna(iv):
+            return '<span style="color:var(--muted)">—</span>'
+        return f"{float(iv):.1f}%"
+
+    def _fmt_pcr(row):
+        pcr = row.get("pcr_at_mint")
+        if pcr in (None, "") or pd.isna(pcr):
+            return '<span style="color:var(--muted)">—</span>'
+        pcr = float(pcr)
+        # Same bullish/bearish read hard_reject()/direction() use —
+        # put-writing (PCR high) reads bullish, call-writing (PCR low)
+        # reads bearish; shown here purely as a quick visual cue, not a
+        # re-scoring of anything.
+        color = "#3fb950" if pcr >= 1.10 else "#f85149" if pcr <= 0.85 else "var(--text)"
+        return f'<span style="color:{color};">{pcr:.2f}</span>'
+
+    if df.empty:
+        return '<div style="color:var(--muted);padding:8px;">No open plans.</div>'
+
     # [2026-09-16, SG request] pcr_conflict_note_at_mint (frozen at mint
     # — see DoreOptionsPlan's own docstring) is the one line worth a
     # trader knowing about later: whether the PCR at entry actively
     # cleared the OPPOSITE direction's own threshold (a real conflict
     # with this plan's direction), vs the routine "supports"/"neutral"
     # notes which aren't persisted at all. Same ⚠ badge/hover pattern
-    # as the Live Scan tab's Notes column.
-    def _fmt_pcr_conflict(row):
+    # as the Live Scan tab's Notes column. Folded into the Strike PCR
+    # cell itself now (see cells below) rather than its own column, to
+    # match the requested column set exactly.
+    def _fmt_pcr_conflict_title(row):
         note = row.get("pcr_conflict_note_at_mint")
         if note in (None, "") or (isinstance(note, float) and pd.isna(note)):
-            return '<span style="color:var(--muted);font-size:12px;">—</span>'
-        return (f'<span title="{html.escape(str(note))}" style="cursor:help;color:#f85149;'
-                f'font-weight:700;font-size:13px;">⚠ Conflict</span>')
+            return ""
+        return f' title="{html.escape(str(note))}"'
 
-    # [2026-08-08, SG request] Status moved to the very last column (it's
-    # a secondary/audit detail once a plan is open — every row here is
-    # OPEN by definition, see this function's docstring) and Source
-    # added right after Direction.
-    # [MFE/MAE tracking] MFE/MAE placed right after P&L — both are
-    # read off the SAME long-premium-position math as P&L (higher
-    # premium = favorable for CE and PE alike), so keeping them
-    # adjacent to P&L reads more naturally than tucking them at the
-    # end past Status.
-    headers = ["Symbol", "Direction", "Source", "Notes", "Strike", "Expiry", "Entry (Locked)", "Stop Loss",
-               "Target 1", "Target 2", "Last Known Premium", "P&L", "MFE", "MAE",
-               "Last Seen", "Days Active", "Status"]
+    # [Options-buying UI request, column set locked to exactly this list
+    # — Symbol/Direction/Strike/Strike PCR/IV/Last Known Premium/Entry
+    # (Locked)/Stop Loss/Target 1/Target 2/P&L/Last Seen/Days Active/
+    # Expiry/Source/Status.] Notes/MFE/MAE dropped from the previous,
+    # wider column set to match this exactly — MFE/MAE excursion data is
+    # still persisted (DoreOptionsPlan.mfe_premium/mae_premium) and can
+    # be re-added as extra columns later if wanted; nothing about the
+    # underlying data was removed, only these two display columns.
+    headers = ["Symbol", "Direction", "Strike", "Strike PCR", "IV", "Last Known Premium",
+               "Entry (Locked)", "Stop Loss", "Target 1", "Target 2", "P&L",
+               "Last Seen", "Days Active", "Expiry", "Source", "Status"]
 
     rows_html = []
     for _, r in df.iterrows():
         direction = r.get("direction", "")
         dir_color = "#3fb950" if direction == "CE" else "#f85149" if direction == "PE" else "#8b949e"
+        conflict_title = _fmt_pcr_conflict_title(r)
         cells = [
             f'<td style="font-weight:700;">{_tv_link(r.get("symbol", "—"))}</td>',
             f'<td style="color:{dir_color};font-weight:700;">{_fmt_text(direction)}</td>',
-            f'<td>{_fmt_source(r)}</td>',
-            f'<td>{_fmt_pcr_conflict(r)}</td>',
             f'<td>{_tv_option_link(r.get("symbol", ""), direction, r.get("strike"), r.get("expiry", ""))}</td>',
-            f'<td>{_fmt_text(r.get("expiry"))}</td>',
+            f'<td{conflict_title} style="{"cursor:help;" if conflict_title else ""}">{_fmt_pcr(r)}</td>',
+            f'<td>{_fmt_iv(r)}</td>',
+            f'<td>{_fmt_last_premium(r)}</td>',
             f'<td style="font-weight:700;">{_fmt_money(r.get("entry_locked"))}</td>',
             f'<td>{_fmt_money(r.get("saved_stop_loss"))}</td>',
             f'<td>{_fmt_money(r.get("saved_target1"))}</td>',
             f'<td>{_fmt_money(r.get("saved_target2"))}</td>',
-            f'<td>{_fmt_last_premium(r)}</td>',
             f'<td>{_fmt_pnl(r)}</td>',
-            f'<td>{_fmt_excursion(r, "mfe_premium", "mfe_pct")}</td>',
-            f'<td>{_fmt_excursion(r, "mae_premium", "mae_pct")}</td>',
             f'<td>{_fmt_last_seen(r)}</td>',
             f'<td>{_fmt_text(r.get("plan_age_days"))}d</td>',
+            f'<td>{_fmt_text(r.get("expiry"))}</td>',
+            f'<td>{_fmt_source(r)}</td>',
             f'<td>{r.get("plan_status_label", "—")}</td>',
         ]
         rows_html.append(f'<tr class="ap-row">{"".join(cells)}</tr>')
@@ -4721,7 +4748,28 @@ def _render_dore_options_active_plans_tab() -> None:
     rows_df = pd.DataFrame(rows)
     st.caption(f"{len(rows_df)} active plan(s) (entry locked) — independent of whether this cycle's live scan "
                "reproduced the contract. Auto-closes once the contract's own expiry passes.")
-    st.markdown(_dore_options_active_plans_table_html(rows_df), unsafe_allow_html=True)
+
+    # [Options-buying UI request] Today's vs Previous Days' Setups tabs —
+    # same split/rationale as _render_active_plans_tab's equity table
+    # (see that function's "Today's vs Previous Days' setups" comment):
+    # plan_age_days == 0 means entry_triggered_at (or TRACKED mint, via
+    # _lifecycle_age_start()) is today, everything else has been open
+    # since an earlier session. Purely a display split of the SAME
+    # rows_df — a plan moves from "Today's" to "Previous Days'" on its
+    # own the next calendar day, same as plan_age_days itself.
+    today_tab, prev_tab = st.tabs(["🆕 Today's Setups", "📅 Previous Days' Setups"])
+    with today_tab:
+        today_df = rows_df[rows_df["plan_age_days"] == 0]
+        if today_df.empty:
+            st.caption("No DORE plans have triggered entry yet today.")
+        else:
+            st.markdown(_dore_options_active_plans_table_html(today_df), unsafe_allow_html=True)
+    with prev_tab:
+        prev_df = rows_df[rows_df["plan_age_days"] >= 1]
+        if prev_df.empty:
+            st.caption("No DORE setups carried over from a previous day are currently open.")
+        else:
+            st.markdown(_dore_options_active_plans_table_html(prev_df), unsafe_allow_html=True)
 
     # [Sprint 1 — Portfolio Admission UI, 2026-08-05] Recently Retired /
     # Closed panel, so Duplicate Suppression / Portfolio Manager
