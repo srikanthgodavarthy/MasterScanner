@@ -60,7 +60,7 @@ REQUIRED = ["symbol", "entry_date", "pnl_pct",
             "leadership_score", "conviction_score", "entry_quality_score"]
 
 # The live defaults (V4_THRESHOLD_DEFAULTS, "actionable" rung) for comparison.
-CURRENT = dict(ls=70, cv=60, eq=60, comp=60)
+CURRENT = dict(ls=70, cv=60, eq=60, comp=66)   # post-2026-09-28 architecture; was comp=60 (dead)
 
 
 # ── metrics ──────────────────────────────────────────────────────────────
@@ -145,8 +145,36 @@ def univariate(df: pd.DataFrame, bins: int = 5) -> None:
 
 # ── grid sweep (matrix form: masks are independent of pnl, so permutations are cheap)
 def _combos(grid: dict) -> np.ndarray:
-    return np.array(list(itertools.product(grid["ls"], grid["cv"], grid["eq"], grid["comp"])),
-                    dtype=float)
+    """(ls, cv, eq, comp) candidates with every DEAD composite collapsed.
+
+    A composite <= mean(floors) admits exactly the same trades as no composite,
+    so the original grid (comp in 0..60 against floors whose means were 30-70)
+    was mostly re-testing the floors-only model under different labels — it
+    could not say whether the composite mattered. Here comp is kept only where
+    it BINDS (comp > mean(floors)); otherwise it is replaced by mean(floors)
+    (== the floors-only model) and duplicates are dropped. Also drops combos
+    where the composite makes a floor dead (3*comp - 200 >= floor).
+    Columns: ls, cv, eq, comp, binding(0/1).
+    """
+    rows = []
+    for ls, cv, eq, comp in itertools.product(grid["ls"], grid["cv"], grid["eq"], grid["comp"]):
+        mean = (ls + cv + eq) / 3.0
+        forced = 3.0 * comp - 200.0
+        if comp > mean + 1e-9:
+            if forced > 0 and min(ls, cv, eq) <= forced:
+                continue                                  # composite makes a floor dead
+            rows.append((ls, cv, eq, comp, 1.0))
+        else:
+            rows.append((ls, cv, eq, mean, 0.0))          # floors-only representative
+    return np.unique(np.array(rows, dtype=float), axis=0)
+
+
+def _model_of(combos: np.ndarray) -> np.ndarray:
+    """'aggregate' (no floors, composite only) | 'floors' (composite dead/absent) |
+    'aggregate+floors' (both bind)."""
+    no_floors = (combos[:, 0] <= 0) & (combos[:, 1] <= 0) & (combos[:, 2] <= 0)
+    out = np.where(combos[:, 4] == 1.0, "aggregate+floors", "floors")
+    return np.where(no_floors & (combos[:, 4] == 1.0), "aggregate", out)
 
 
 def _masks(d: pd.DataFrame, combos: np.ndarray) -> np.ndarray:
@@ -193,7 +221,8 @@ def sweep(df: pd.DataFrame, holdout: float, grid: dict, min_n: int, min_syms: in
     ptr, pte = pnl[is_tr], pnl[~is_tr]
     S_tr, S_te = _grid_stats(Mtr, ptr, ohtr), _grid_stats(Mte, pte, ohte)
 
-    res = pd.DataFrame(dict(f_ls=combos[:, 0], f_cv=combos[:, 1], f_eq=combos[:, 2], f_comp=combos[:, 3]))
+    res = pd.DataFrame(dict(f_ls=combos[:, 0], f_cv=combos[:, 1], f_eq=combos[:, 2], f_comp=combos[:, 3],
+                            binding=combos[:, 4], model=_model_of(combos)))
     for nm, S in (("train", S_tr), ("test", S_te)):
         for k, v in S.items():
             res[f"{nm}_{k}"] = v
@@ -257,8 +286,10 @@ def main() -> None:
 
     univariate(df)
 
-    grid = dict(ls=[40, 50, 60, 70, 80], cv=[30, 40, 50, 60, 70],
-                eq=[20, 30, 40, 50, 60, 70], comp=[0, 40, 45, 50, 55, 60])
+    # 0 in a floor axis = "no floor on that pillar" so a pure-aggregate model is
+    # in the grid. comp values are absolute; dead ones are collapsed in _combos().
+    grid = dict(ls=[0, 40, 50, 60, 70, 80], cv=[0, 30, 40, 50, 60, 70],
+                eq=[0, 20, 30, 40, 50, 60, 70], comp=[0, 40, 45, 50, 55, 60, 65, 70, 75])
     res, train, test, perm = sweep(df, a.holdout, grid, a.min_n, a.min_syms, a.perms)
 
     print("\n=== Reference points ===")
@@ -273,6 +304,20 @@ def main() -> None:
               + (f", test mean={c.test_mean:+.2f}%" if c.test_n else " (admits nothing in test)"))
 
     elig = res[res.eligible].copy()
+
+    print("\n=== Model comparison (question 3: aggregate vs floors vs both) ===")
+    print("Best eligible combo per model, ranked on TRAIN mean; read the TEST columns. "
+          "Selection within each model is optimistic; the permutation test below is the honest check.")
+    rows = []
+    for mdl, g in elig.groupby("model"):
+        b = g.sort_values("train_mean", ascending=False).iloc[0]
+        rows.append(dict(model=mdl, n_combos=len(g), L=int(b.f_ls), C=int(b.f_cv), EQ=int(b.f_eq),
+                         comp=round(float(b.f_comp), 1), train_n=int(b.train_n), train_mean=b.train_mean,
+                         test_n=int(b.test_n), test_mean=b.test_mean))
+    if rows:
+        print(pd.DataFrame(rows).to_string(index=False, float_format=lambda v: f"{v:7.2f}"))
+        print("A composite is only worth having if 'aggregate+floors' beats 'floors' on TEST by more "
+              "than the selection noise; if not, prefer the simpler floors-only model.")
     if elig.empty:
         print("\nNo combo meets --min-n/--min-syms/test-size on this sample. "
               "Lower them or use a bigger sample.")

@@ -1981,70 +1981,188 @@ def _entry_quality_v4(r: "BarResult", smc_state=None, current_price: Optional[fl
 #  CLASSIFICATION — CV4  (thresholds NOT BACKTEST-FIT until Phase 6, §2)
 # ══════════════════════════════════════════════════════════════════
 
+# ── Threshold architecture (2026-09-28) ─────────────────────────────────────
+#
+# MODEL: "aggregate + component floors", stated once so the numbers below can
+# be checked against it instead of against each other.
+#
+#   A tier is reached iff   L >= f_L  AND  C >= f_C  AND  E >= f_E     (floors)
+#                     and   (L + C + E) / 3 >= K                       (aggregate)
+#
+# The floors say "no pillar may be weak"; the aggregate says "the three pillars
+# together must be strong enough". The two are only DISTINCT constraints when
+# K > mean(f_L, f_C, f_E): if K <= mean(floors), every point that clears the
+# floors already clears K, so K is dead. That was the state of the original
+# defaults (actionable K=60 vs floor-mean 63.3, execute 60 vs 73.3, elite 66 vs
+# 80). K is also dead-in-reverse if 3K - 200 >= some floor: the aggregate then
+# already forces that pillar above its floor, so the FLOOR is dead.
+# validate_v4_thresholds() checks both, plus tier nesting, and is asserted in
+# tests/test_cv4_threshold_architecture.py.
+#
+# WATCH is deliberately floors-only (triage: "nothing is weak"); it has no
+# composite key. Previously a v4_watch_composite_min key existed but was never
+# read by any classifier.
+#
+# The composite values below are PROVISIONAL: chosen only to satisfy the
+# invariants (binding, monotone, nested) with a small compensation slack, NOT
+# fitted to outcomes. Calibrate with scripts/cv4_floor_sweep.py before relying
+# on them. Floors are unchanged from the previous defaults.
+
+V4_TIER_ORDER = ("watch", "actionable", "execute", "elite")
+_V4_PILLARS   = ("leadership", "conviction", "entry_quality")
+
 V4_THRESHOLD_DEFAULTS = {
-    # NOT BACKTEST-FIT — provisional placeholders only, mirroring v3's
-    # funnel shape so CV4 is exercisable in Phase 2-4 shadow/comparison
-    # runs. Real thresholds are set in Phase 6 ONLY IF Phase 5's outcome
-    # attribution (§5) shows CV4/SMC explains the current loss pattern —
-    # per §4's binding constraint, no tuning to hit a target recommendation
-    # count, and CV4 has ZERO production impact through Phase 6 regardless
-    # of what these say (enable_cv4_opportunity_weight=False, Recommendation
-    # still sourced from CV1 — see scanner_engine.py/dore_settings.py).
-    "v4_watch_leadership_min":      50,
-    "v4_watch_conviction_min":      50,
-    "v4_watch_entry_quality_min":   50,
-    "v4_watch_composite_min":       50,
-    "v4_actionable_leadership_min": 70,
-    "v4_actionable_conviction_min": 60,
+    "v4_watch_leadership_min":         50,
+    "v4_watch_conviction_min":         50,
+    "v4_watch_entry_quality_min":      50,
+    "v4_actionable_leadership_min":    70,
+    "v4_actionable_conviction_min":    60,
     "v4_actionable_entry_quality_min": 60,
-    "v4_actionable_composite_min":  60,
-    "v4_execute_leadership_min":    80,
-    "v4_execute_conviction_min":    70,
-    "v4_execute_entry_quality_min": 70,
-    "v4_execute_composite_min":     60,
-    "v4_elite_leadership_min":      85,
-    "v4_elite_conviction_min":      75,
-    "v4_elite_entry_quality_min":   80,
-    "v4_elite_composite_min":       66,
+    "v4_actionable_composite_min":     66,   # was 60 (dead: floors already force >= 63.33)
+    "v4_execute_leadership_min":       80,
+    "v4_execute_conviction_min":       70,
+    "v4_execute_entry_quality_min":    70,
+    "v4_execute_composite_min":        76,   # was 60 (dead: floors already force >= 73.33)
+    "v4_elite_leadership_min":         85,
+    "v4_elite_conviction_min":         75,
+    "v4_elite_entry_quality_min":      80,
+    "v4_elite_composite_min":          82,   # was 66 (dead: floors already force >= 80.00)
 }
+
+_V4_EPS = 1e-9
+_v4_warned_overrides: set = set()
+
+
+def _v4_merge(thresholds: Optional[dict]) -> dict:
+    """Defaults + any v4_* overrides. Non-v4 keys (the caller often passes the
+    whole settings dict) are ignored."""
+    if not thresholds:
+        return dict(V4_THRESHOLD_DEFAULTS)
+    return {**V4_THRESHOLD_DEFAULTS,
+            **{k: v for k, v in thresholds.items() if k.startswith("v4_")}}
+
+
+def _v4_tier_params(t: dict, tier: str) -> tuple[tuple, Optional[float]]:
+    floors = tuple(t[f"v4_{tier}_{p}_min"] for p in _V4_PILLARS)
+    comp = t.get(f"v4_{tier}_composite_min")
+    return floors, (None if comp is None else float(comp))
+
+
+def v4_tier_passes(tier: str, leadership: float, conviction: float,
+                   entry_quality: float, thresholds: Optional[dict] = None) -> bool:
+    """The single definition of "does this (L, C, E) reach `tier`". Every CV4
+    classifier below delegates here so the tier relationships cannot diverge."""
+    t = _v4_merge(thresholds)
+    (fl, fc, fe), comp = _v4_tier_params(t, tier)
+    if leadership < fl or conviction < fc or entry_quality < fe:
+        return False
+    if comp is not None and (leadership + conviction + entry_quality) < 3.0 * comp - _V4_EPS:
+        return False
+    return True
+
+
+def v4_threshold_report(thresholds: Optional[dict] = None) -> list[dict]:
+    """Per-tier arithmetic of the threshold set: what the floors alone force
+    the aggregate to be, whether the composite adds anything, and how much a
+    strong pillar may compensate for a weaker one."""
+    t = _v4_merge(thresholds)
+    rows = []
+    for tier in V4_TIER_ORDER:
+        floors, comp = _v4_tier_params(t, tier)
+        mean = sum(floors) / 3.0
+        rows.append(dict(
+            tier=tier, floors=floors, floor_mean=mean, composite_min=comp,
+            effective_composite_min=mean if comp is None else max(comp, mean),
+            composite_binding=comp is not None and comp > mean + _V4_EPS,
+            compensation_slack=None if comp is None else comp - mean,
+            min_pillar_forced_by_composite=None if comp is None else 3.0 * comp - 200.0,
+            model="floors-only" if comp is None else "aggregate+floors",
+        ))
+    return rows
+
+
+def validate_v4_thresholds(thresholds: Optional[dict] = None) -> list[str]:
+    """Returns human-readable violations of the threshold-architecture
+    invariants (empty list == consistent):
+      1. every value in [0, 100]
+      2. composite is BINDING:  K > mean(floors)             (else K is dead)
+      3. floors are BINDING:    each floor > 3K - 200         (else the floor is dead)
+      4. floors non-decreasing up the ladder, per pillar
+      5. effective composite strictly increasing up the ladder
+    (4)+(5) make each higher tier's region a strict subset of the one below."""
+    t = _v4_merge(thresholds)
+    problems: list[str] = []
+    prev = None
+    for tier in V4_TIER_ORDER:
+        floors, comp = _v4_tier_params(t, tier)
+        for p, f in zip(_V4_PILLARS, floors):
+            if not (0 <= f <= 100):
+                problems.append(f"{tier}.{p} floor {f} outside [0,100]")
+        mean = sum(floors) / 3.0
+        if comp is not None:
+            if not (0 <= comp <= 100):
+                problems.append(f"{tier} composite_min {comp} outside [0,100]")
+            if comp <= mean + _V4_EPS:
+                problems.append(
+                    f"{tier} composite_min {comp:g} <= mean of floors {mean:.2f}: "
+                    f"never binds (every point clearing the floors already clears it)")
+            forced = 3.0 * comp - 200.0
+            for p, f in zip(_V4_PILLARS, floors):
+                if f <= forced + _V4_EPS and forced > 0:
+                    problems.append(
+                        f"{tier}.{p} floor {f} is implied by composite_min {comp:g} "
+                        f"(composite already forces {p} >= {forced:.1f})")
+        eff = mean if comp is None else max(comp, mean)
+        if prev is not None:
+            pfloors, peff, ptier = prev
+            for p, f, pf in zip(_V4_PILLARS, floors, pfloors):
+                if f < pf:
+                    problems.append(f"{tier}.{p} floor {f} < {ptier}.{p} floor {pf}: ladder not nested")
+            if eff <= peff + _V4_EPS:
+                problems.append(f"{tier} effective composite {eff:.2f} <= {ptier} {peff:.2f}: "
+                                f"tier adds no aggregate evidence over {ptier}")
+        prev = (floors, eff, tier)
+    return problems
+
+
+def _v4_warn_once_if_invalid(thresholds: Optional[dict]) -> None:
+    """Overrides (e.g. a persisted settings dict) can silently re-introduce a
+    dead threshold. Warn once per distinct override set; never raise — a bad
+    setting must not take the live scan down."""
+    if not thresholds:
+        return
+    ov = tuple(sorted((k, v) for k, v in thresholds.items() if k.startswith("v4_")))
+    if not ov or ov in _v4_warned_overrides:
+        return
+    _v4_warned_overrides.add(ov)
+    problems = validate_v4_thresholds(thresholds)
+    if problems:
+        import logging
+        logging.getLogger(__name__).warning(
+            "CV4 threshold overrides violate the threshold architecture: %s",
+            "; ".join(problems))
 
 
 def _classify_v4(leadership: int, conviction: int, entry_quality: int,
                   thresholds: Optional[dict] = None) -> str:
-    """CV4 signal classifier — same AND-gated floor + composite pattern as
-    _classify_v3(). thresholds default to V4_THRESHOLD_DEFAULTS (NOT
-    BACKTEST-FIT, §2)."""
-    t = {**V4_THRESHOLD_DEFAULTS, **(thresholds or {})}
-    composite = (leadership + conviction + entry_quality) / 3
-
-    if (leadership >= t["v4_elite_leadership_min"] and conviction >= t["v4_elite_conviction_min"]
-            and entry_quality >= t["v4_elite_entry_quality_min"] and composite >= t["v4_elite_composite_min"]):
-        return "ELITE"
-    if (leadership >= t["v4_execute_leadership_min"] and conviction >= t["v4_execute_conviction_min"]
-            and entry_quality >= t["v4_execute_entry_quality_min"] and composite >= t["v4_execute_composite_min"]):
-        return "EXECUTE"
-    if (leadership >= t["v4_watch_leadership_min"] and conviction >= t["v4_watch_conviction_min"]
-            and entry_quality >= t["v4_watch_entry_quality_min"]):
-        return "WATCH"
+    """CV4 signal_class: ELITE | EXECUTE | WATCH | SKIP. (There is no
+    ACTIONABLE label here — Actionable exists only in classify_tier_v4() —
+    kept as-is because downstream consumers key on these four strings.)"""
+    _v4_warn_once_if_invalid(thresholds)
+    for tier, label in (("elite", "ELITE"), ("execute", "EXECUTE"), ("watch", "WATCH")):
+        if v4_tier_passes(tier, leadership, conviction, entry_quality, thresholds):
+            return label
     return "SKIP"
 
 
 def classify_tier_v4(leadership: int, conviction: int, entry_quality: int,
                       thresholds: Optional[dict] = None) -> str:
-    """CV4 base-funnel tier classifier — same AND-gated floor + composite
-    pattern as classify_tier_v3(). thresholds default to
-    V4_THRESHOLD_DEFAULTS (NOT BACKTEST-FIT, §2). NOT wired into
-    `Recommendation` anywhere through Phase 6 — Phase 7 only, and only if
-    Phases 4-6 support it (§4/§6)."""
-    t = {**V4_THRESHOLD_DEFAULTS, **(thresholds or {})}
-    composite = (leadership + conviction + entry_quality) / 3
-
-    if (leadership >= t["v4_actionable_leadership_min"] and conviction >= t["v4_actionable_conviction_min"]
-            and entry_quality >= t["v4_actionable_entry_quality_min"] and composite >= t["v4_actionable_composite_min"]):
-        return "Actionable"
-    if (leadership >= t["v4_watch_leadership_min"] and conviction >= t["v4_watch_conviction_min"]
-            and entry_quality >= t["v4_watch_entry_quality_min"]):
-        return "Watch"
+    """CV4 base-funnel tier: Actionable | Watch | Skip. Same rung definitions
+    as _classify_v4 (both go through v4_tier_passes)."""
+    _v4_warn_once_if_invalid(thresholds)
+    for tier, label in (("actionable", "Actionable"), ("watch", "Watch")):
+        if v4_tier_passes(tier, leadership, conviction, entry_quality, thresholds):
+            return label
     return "Skip"
 
 
