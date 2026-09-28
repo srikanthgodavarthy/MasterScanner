@@ -1382,6 +1382,59 @@ from utils.extension_shared import compute_extension_penalty
 SMC_CONFLICT_SWEEP_BREAK_MODIFIER_ENABLED = False
 SMC_CONFLICT_SWEEP_BREAK_MODIFIER_POINTS  = 2.0
 
+# ── CONFIGURABLE: SMC ablation for Conviction's and Entry Quality's scores ──
+# Two SEPARATE switches, deliberately not one, because they answer different
+# questions:
+#
+#   settings["cv4_smc_scoring_enabled"]  (default True = unchanged)
+#       False = PURE ABLATION. Conviction's SMC term (0-15) and Entry
+#       Quality's SMC term (0-25) are excluded from those pillars' totals and
+#       NOTHING else changes: no rescale, no reweighting. Every other
+#       component keeps its weight, so
+#           total_off = total_on - smc_term   (always <= total_on)
+#       Disabling can therefore only LOWER or keep a pillar, never raise one.
+#       This answers "what is SMC's marginal contribution to CV4?" and is the
+#       switch to use for an SMC ablation A/B.
+#
+#   settings["cv4_smc_rescale_when_disabled"]  (default False)
+#       Only read when cv4_smc_scoring_enabled is False. True additionally
+#       rescales the remaining components up to a 0-100 scale
+#       (Conviction x100/85, Entry Quality x100/75). THIS IS NOT AN SMC
+#       ABLATION: it is a reweighting that inflates every candidate whether
+#       or not SMC ever contributed (a stock with non-SMC 60 and SMC 0 goes
+#       60 -> 70.6 on Conviction just because the flag is on), and it is
+#       exactly equivalent to lowering the tier floors on the non-SMC sum
+#       (Conviction >= 60 becomes >= 51 of 85; Entry Quality >= 60 becomes
+#       >= 45 of 75). Treat it as a threshold/model change, to be evaluated
+#       under CV4 threshold calibration, never as evidence about SMC. It is
+#       also the only setting that lifts Entry Quality's no-SMC ceiling
+#       (75) above Elite's EQ floor (80).
+#
+# Both default to today's behavior. Common to both:
+#   - smc_conviction_score()/smc_entry_structure_score() are still computed
+#     and their raw value is still reported in cv_smc_confirmation /
+#     eq_smc_entry_structure (nothing hidden); only the pillar TOTAL changes.
+#   - Individual sub-score fields keep their documented scale either way.
+#   - ConvictionV4.smc_scoring_enabled / smc_rescaled record which mode
+#     produced a row, so sum(sub-scores) != total is explainable.
+#   - Leadership is untouched (its SMC link is a 2-of-5-pt additive bonus).
+#   - The structural gate is a separate switch (smc_structural_gate_enabled
+#     in scanner_engine.py).
+# Motivation: SMC direction is bullish on only ~3-5% of the scanned universe
+# on a typical day, so the SMC slots are almost always 0.
+# NOT backtest-validated; same caveat as V4_THRESHOLD_DEFAULTS.
+CV4_SMC_SCORING_ENABLED_DEFAULT = True
+CV4_SMC_RESCALE_WHEN_DISABLED_DEFAULT = False
+
+
+def _smc_mode(settings: Optional[dict]) -> tuple[bool, bool]:
+    """(scoring_enabled, rescaled). rescaled is True only when scoring is
+    disabled AND cv4_smc_rescale_when_disabled is set."""
+    s = settings or {}
+    enabled = bool(s.get("cv4_smc_scoring_enabled", CV4_SMC_SCORING_ENABLED_DEFAULT))
+    rescale = bool(s.get("cv4_smc_rescale_when_disabled", CV4_SMC_RESCALE_WHEN_DISABLED_DEFAULT))
+    return enabled, (rescale and not enabled)
+
 # Opt-in BACKTEST-ONLY admission variant (read by backtest_engine's gate
 # from its `settings` dict; the live Scanner / DORE never read it).
 # "" = off (default). Otherwise the sub-score that receives the modifier
@@ -1506,6 +1559,12 @@ class ConvictionV4:
     composite_experimental:    float = 0.0
 
     thesis_direction: str = "BULLISH"   # BULLISH | BEARISH — what this read was scored against
+    # Which SMC mode produced this instance (see CV4_SMC_SCORING_ENABLED_DEFAULT's
+    # block). smc_scoring_enabled=False means cv_smc_confirmation and
+    # eq_smc_entry_structure were EXCLUDED from the totals; smc_rescaled=True
+    # additionally means the remaining components were rescaled to 0-100.
+    smc_scoring_enabled: bool = True
+    smc_rescaled: bool = False
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1740,7 +1799,8 @@ def smc_conviction_score(smc_state, thesis_direction: str) -> int:
     return round(base * conviction_freshness_multiplier(smc_state.age_bars))
 
 
-def _conviction_v4(r: "BarResult", thesis_direction: str = "BULLISH", smc_state=None) -> tuple[int, dict]:
+def _conviction_v4(r: "BarResult", thesis_direction: str = "BULLISH", smc_state=None,
+                    settings: Optional[dict] = None) -> tuple[int, dict]:
     """
     Returns (0-100, sub_scores_dict). Locked weights (§1.3): Directional
     Trend 20, Momentum 20 (directional, NO abs()), Relative Strength
@@ -1829,7 +1889,16 @@ def _conviction_v4(r: "BarResult", thesis_direction: str = "BULLISH", smc_state=
         elif r.squeeze_on: sp += 1
     cv_setup_pattern = min(sp, 10)
 
-    total = min(cv_directional_trend + cv_momentum + cv_rs + cv_vol + cv_regime + cv_smc + cv_setup_pattern, 100)
+    # cv4_smc_scoring_enabled / cv4_smc_rescale_when_disabled — see the block above
+    # CV4_SMC_SCORING_ENABLED_DEFAULT. cv_smc is reported either way.
+    _smc_on, _smc_rescaled = _smc_mode(settings)
+    _others = cv_directional_trend + cv_momentum + cv_rs + cv_vol + cv_regime + cv_setup_pattern  # max 85
+    if _smc_on:
+        total = min(_others + cv_smc, 100)
+    elif _smc_rescaled:
+        total = min(round(_others * (100 / 85)), 100)   # reweighting, NOT an ablation
+    else:
+        total = _others                                  # pure ablation: total_on - cv_smc
 
     return total, {
         "cv_directional_trend": cv_directional_trend,
@@ -1890,7 +1959,8 @@ def smc_entry_structure_score(smc_state, thesis_direction: str = "BULLISH") -> i
 
 
 def _entry_quality_v4(r: "BarResult", smc_state=None, current_price: Optional[float] = None,
-                       thesis_direction: str = "BULLISH") -> tuple[int, dict]:
+                       thesis_direction: str = "BULLISH",
+                       settings: Optional[dict] = None) -> tuple[int, dict]:
     """
     Returns (0-100, sub_scores_dict). Locked weights (§1.4): Trend
     Alignment 20, Momentum Timing 15, SMC Entry Structure 25 (exact
@@ -1963,8 +2033,18 @@ def _entry_quality_v4(r: "BarResult", smc_state=None, current_price: Optional[fl
     severity = pen["severity_0_100"]
     eq_extension_chase_risk = round(max(0.0, min(15.0, 15.0 * (1.0 - severity / 100.0))))
 
-    total = min(eq_trend_alignment + eq_momentum_timing + eq_smc_entry_structure
-                + eq_price_location + eq_volume_execution + eq_extension_chase_risk, 100)
+    # cv4_smc_scoring_enabled / cv4_smc_rescale_when_disabled — same switches and
+    # rationale as _conviction_v4. eq_smc_entry_structure is reported either way.
+    # Non-SMC max is 75 (20+15+15+10+15, Extension/Chase Risk's 15 included).
+    _smc_on, _smc_rescaled = _smc_mode(settings)
+    _others = (eq_trend_alignment + eq_momentum_timing + eq_price_location
+               + eq_volume_execution + eq_extension_chase_risk)  # max 75
+    if _smc_on:
+        total = min(_others + eq_smc_entry_structure, 100)
+    elif _smc_rescaled:
+        total = min(round(_others * (100 / 75)), 100)   # reweighting, NOT an ablation
+    else:
+        total = _others                                  # pure ablation: total_on - eq_smc
     total = max(total, 0)
 
     return total, {
@@ -2195,9 +2275,10 @@ def compute_conviction_v4(
         threshold overrides (V4_THRESHOLD_DEFAULTS, NOT BACKTEST-FIT).
     """
     leadership,    ls_subs = _leadership_v4(r, smc_state=smc_state, swing_label=swing_label)
-    conviction,    cv_subs = _conviction_v4(r, thesis_direction=thesis_direction, smc_state=smc_state)
+    conviction,    cv_subs = _conviction_v4(r, thesis_direction=thesis_direction, smc_state=smc_state,
+                                             settings=settings)
     entry_quality, eq_subs = _entry_quality_v4(r, smc_state=smc_state, current_price=current_price,
-                                                thesis_direction=thesis_direction)
+                                                thesis_direction=thesis_direction, settings=settings)
 
     composite = (leadership + conviction + entry_quality) / 3
     signal = _classify_v4(leadership, conviction, entry_quality, thresholds=settings)
@@ -2231,6 +2312,8 @@ def compute_conviction_v4(
         smc_direction     = smc_state.direction if smc_state is not None else "NEUTRAL",
         smc_state_label   = smc_state.state if smc_state is not None else "NEUTRAL",
         smc_evidence_tier = smc_state.evidence_tier if smc_state is not None else 0,
+        smc_scoring_enabled = _smc_mode(settings)[0],
+        smc_rescaled        = _smc_mode(settings)[1],
         smc_age_bars      = smc_state.age_bars if smc_state is not None else 0,
         smc_fvg_retest    = smc_state.fvg_retest if smc_state is not None else "none",
         smc_conflict_bull_age_bars = smc_state.conflict_bull_age_bars if smc_state is not None else None,

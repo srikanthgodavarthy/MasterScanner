@@ -2549,10 +2549,32 @@ def score_stock(
         # ambiguous two-sided CONFLICT no longer caps the tier — it was on
         # ~70% of the universe daily, so the cap acted as a near-universal
         # Watch cap. Set True to restore the original §13 behavior.
-        final_tier, _smc_structural = apply_smc_structural_gate(
+        #
+        # [2026-09-25, SG request] settings["smc_structural_gate_enabled"]
+        # (default True = unchanged today's behavior): master switch for the
+        # WHOLE SMC structural gate below, not just the ambiguous-conflict
+        # case smc_conflict_caps_tier covers. When False, NONE of
+        # INVALIDATION / CONFLICT (either kind) / EXTENDED_CHASING /
+        # WAIT_FOR_RETEST can cap final_tier — the decision is still
+        # computed and returned so SMC_Structural_State/Reason columns stay
+        # populated for observability, it just never touches final_tier.
+        # Distinct from, and independent of, the pre-existing
+        # ENABLE_STRUCTURAL_GATE flag above (Decision Engine lifecycle gate
+        # — a different mechanism entirely; see that flag's own comment).
+        # CAUTION: disabling this also removes STRUCTURAL_INVALIDATION's
+        # cap — i.e. a confirmed bearish break against this long thesis no
+        # longer forces Skip either. That is the riskiest single case to
+        # turn off; consider whether you actually want that before setting
+        # this False, as opposed to only smc_conflict_caps_tier above.
+        # NOT backtest-validated as an improvement — recommend an A/B
+        # backtest run (True vs False) before flipping the live default,
+        # same caveat as smc_conflict_caps_tier and cv4_smc_scoring_enabled.
+        _smc_gate_enabled = bool((settings or {}).get("smc_structural_gate_enabled", True))
+        _gated_tier, _smc_structural = apply_smc_structural_gate(
             final_tier, r.smc_state, r.order_block,
             conflict_caps_tier=bool((settings or {}).get("smc_conflict_caps_tier", False)),
         )
+        final_tier = _gated_tier if _smc_gate_enabled else final_tier
         final_rank = _RANK[final_tier]
 
         result["SMC_Structural_State"]      = _smc_structural.state if _smc_structural else None
