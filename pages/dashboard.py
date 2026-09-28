@@ -1701,6 +1701,17 @@ def _tv_link(symbol: str, css_class: str = "tv-link", pct_chg=None, reduced_hist
 
 # ── BREADTH STATS (used by Market Intelligence + Leadership Rotation) ──
 
+def _trend_direction(ema50_up: bool, ema200_up: bool) -> str:
+    """[2026-09-28] Direction for the Trend Strength card. ADX measures
+    trend INTENSITY only (a steep selloff scores as high as a steep
+    rally), so without this a strong downtrend shows a green "STRONG".
+    Keys on Nifty vs EMA50 — the same flag the regime's TREND gate uses
+    (utils/regime_engine.classify_regime) — so the card can't disagree
+    with the regime card. ema200_up is accepted for future use but not
+    needed to call direction."""
+    return "UP" if ema50_up else "DOWN"
+
+
 def _trend_strength_label(adx: float, adx_is_real: bool) -> str:
     """ADX-based trend-strength label — reuses the same >=25 threshold
     already gating the Execute regime check, so this can't disagree with
@@ -2109,8 +2120,20 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str) -> str:
 
     trend_label          = _trend_strength_label(adx, adx_is_real)
     vix_label, vix_color = _vix_band(vix)
-    trend_color = {"WEAK": "#f85149", "MODERATE": "#d29922", "STRONG": "#3fb950"}[trend_label]
     trend_pct   = {"WEAK": 33, "MODERATE": 66, "STRONG": 100}[trend_label]
+    # [2026-09-28] Direction-aware: ADX alone says how strong the move
+    # is, not which way. STRONG/MODERATE on a real ADX get an arrow, and
+    # a DOWN trend is drawn red instead of the intensity-only green/amber.
+    # WEAK (no trend) and proxy-ADX MODERATE stay direction-neutral.
+    trend_dir = _trend_direction(bool(ema50_up), bool(ema200_up))
+    _show_dir = adx_is_real and trend_label in ("STRONG", "MODERATE")
+    if _show_dir and trend_dir == "DOWN":
+        trend_color = "#f85149"
+    else:
+        trend_color = {"WEAK": "#f85149", "MODERATE": "#d29922", "STRONG": "#3fb950"}[trend_label]
+    trend_text = trend_label + ((" ↓" if trend_dir == "DOWN" else " ↑") if _show_dir else "")
+    trend_tip = ("Nifty ADX(14) for strength; arrow = Nifty above (↑) / below (↓) its EMA50. "
+                 "ADX measures how strong a move is, not its direction.")
 
     # ── Regime card ────────────────────────────────────────────────
     mkt_note = {
@@ -2131,8 +2154,8 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str) -> str:
     # ── Trend Strength card ────────────────────────────────────────
     trend_card = f"""
 <div class="mo-health-card">
-  <div class="mo-health-label" title="Based on Nifty ADX(14)">Trend Strength <span class="mo-info">ⓘ</span></div>
-  <div class="mo-health-value" style="color:{trend_color}">{trend_label}</div>
+  <div class="mo-health-label" title="{trend_tip}">Trend Strength <span class="mo-info">ⓘ</span></div>
+  <div class="mo-health-value" style="color:{trend_color}">{trend_text}</div>
   <div class="mo-bar-track"><div class="mo-bar-fill" style="width:{trend_pct}%;background:{trend_color}"></div></div>
 </div>"""
 
