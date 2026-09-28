@@ -91,16 +91,23 @@ def test_gate_target_typo_fails_loudly():
 
 
 def test_modifier_flips_a_near_miss_only_on_the_targeted_floor():
-    # 69/60/60 misses Actionable (leadership floor 70); +2 on leadership admits it,
-    # +2 on entry_quality does not.
-    assert cv.classify_tier_v4(69, 60, 60) != "Actionable"
+    # 69/66/65 misses ONLY Actionable's leadership floor (70); its aggregate 66.67 already
+    # clears the composite min (66). +2 on leadership admits it, +2 on entry_quality does not.
+    # (Was 69/60/60 while the composite was dead; with a binding composite that point's
+    # aggregate is 63 and a +2 floor rescue alone no longer admits it — intended.)
+    assert cv.classify_tier_v4(69, 66, 65) != "Actionable"
     tgt = lambda t: {"SMC_CONFLICT_SWEEP_BREAK_MODIFIER_GATE_TARGET": t}
-    assert cv.classify_tier_v4(*G(69, 60, 60, 2.0, tgt("leadership"))) == "Actionable"
-    assert cv.classify_tier_v4(*G(69, 60, 60, 2.0, tgt("entry_quality"))) != "Actionable"
+    assert cv.classify_tier_v4(*G(69, 66, 65, 2.0, tgt("leadership"))) == "Actionable"
+    assert cv.classify_tier_v4(*G(69, 66, 65, 2.0, tgt("entry_quality"))) != "Actionable"
 
 
-def test_composite_floor_never_binds_so_composite_target_would_be_noop():
+def test_composite_floor_now_binds_so_composite_gate_target_would_not_be_a_noop():
+    # Superseded 2026-09-28 (CV4 threshold architecture): this used to assert the
+    # opposite — floors' mean EXCEEDED the composite min, i.e. the composite could
+    # never bind. Defaults are now required to satisfy K > mean(floors); see
+    # tests/test_cv4_threshold_architecture.py. The modifier still only targets the
+    # three pillar floors ("composite" remains an invalid GATE_TARGET).
     t = cv.V4_THRESHOLD_DEFAULTS
     for tier in ("actionable", "execute", "elite"):
         floors = [t[f"v4_{tier}_{k}_min"] for k in ("leadership", "conviction", "entry_quality")]
-        assert sum(floors) / 3 > t[f"v4_{tier}_composite_min"]
+        assert sum(floors) / 3 < t[f"v4_{tier}_composite_min"]
