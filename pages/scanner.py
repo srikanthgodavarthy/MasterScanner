@@ -4845,13 +4845,10 @@ def _dore_options_panel():
     # [2026-09-09, SG request] Settings-aware — was is_market_hours_ist().
     from utils.system_state import market_hours_pause_active
     if market_hours_pause_active():
-        dore_opt_payload = st.session_state.get("dore_live_state_payload") or {}
-        if not dore_opt_payload:
-            st.caption("DORE Options Engine: outside market hours — background scans "
-                       "are paused, nothing scanned yet this session.")
-        # else: fall through to rendering below with whatever's cached —
-        # but skip the meta-poll entirely either way, which is the whole
-        # point of this gate.
+        # [2026-09-28] The "nothing scanned yet" caption was Live Scan
+        # copy; that tab is gone, and Active Plans (Supabase-backed)
+        # renders regardless — skip only the meta-poll, which is the
+        # whole point of this gate.
         _skip_poll = True
     else:
         _skip_poll = False
@@ -4891,169 +4888,15 @@ def _dore_options_panel():
     dore_opt_payload = st.session_state.get("dore_live_state_payload") or {}
     dore_opt_df = pd.DataFrame(dore_opt_payload.get("live_state") or [])
 
-    if dore_opt_df.empty and _skip_poll:
-        return
-
-    dore_tech_meta = None
-    dore_opt_rejections = []
-    if dore_opt_df.empty:
-        dore_tech_meta = load_snapshot_meta("dore_technical_plans")
-        if dore_tech_meta is not None and dore_tech_meta.get("version") != st.session_state.get("dore_technical_plans_version"):
-            dore_tech_full = get_snapshot("dore_technical_plans")
-            if dore_tech_full is not None:
-                st.session_state["dore_technical_plans_version"] = dore_tech_full.get("version")
-                st.session_state["dore_technical_plans_payload"] = dore_tech_full.get("payload") or {}
-        dore_tech_payload = st.session_state.get("dore_technical_plans_payload") or {}
-        dore_opt_df = pd.DataFrame(dore_tech_payload.get("technical_plans") or [])
-        dore_opt_rejections = dore_tech_payload.get("rejections") or []
-
-    dore_opt_meta = dore_opt_meta or dore_tech_meta
-
-    # 2026-08-01: split into Live Scan (this cycle's reproduced
-    # recommendations) vs Active Plans (every currently-OPEN locked
-    # entry, read straight from Supabase — see
-    # _render_dore_options_active_plans_tab's docstring).
-    live_scan_tab, active_plans_tab = st.tabs(["📡 Live Scan", "📋 Active Plans"])
-
-    with live_scan_tab:
-        if dore_opt_meta is None:
-            st.caption("DORE Options Engine: waiting for the first scheduled scan "
-                       "(the live_scanner cycle's DORE Technical Engine step, then "
-                       "the dore_live_state 60s refresh) — nothing to show yet.")
-        elif dore_opt_df.empty:
-            n_rej = len(dore_opt_rejections)
-            st.caption("No DORE Options trade plans right now — every shortlisted candidate "
-                       f"was hard-rejected this cycle ({n_rej} rejection(s): missing option "
-                       "chain, no OHLCV history, or no liquid strike found) or the live_scanner "
-                       "universe is currently empty.")
-        else:
-            # [Fix, 2026-08-11, SG report] "Current Premium" in this table is
-            # whatever dore_live_state's LAST successful refresh cycle
-            # captured — not a truly live tick on every render. Nothing
-            # here previously told the viewer how old that capture is, so
-            # after the scheduler stops (market close + buffer — see
-            # utils.time_utils.is_market_hours_ist — or any scheduler
-            # outage) the same numbers kept rendering under a "CURRENT
-            # PREMIUM" header with no visual difference from a genuinely
-            # fresh tick, which read as live when it wasn't (confirmed
-            # live: a frozen post-15:25-IST snapshot compared against a
-            # broker's own live quote panel later the same session).
-            # Surface the actual capture time and flag it when it's
-            # stale, so "Current Premium" is read as "as of HH:MM", not
-            # "right now".
-            _snap_time = (dore_opt_meta or {}).get("created_at")
-            _age_secs = None
-            if _snap_time is not None:
-                try:
-                    _snap_ts = pd.Timestamp(_snap_time)
-                    _snap_ts = _snap_ts.tz_localize("UTC") if _snap_ts.tzinfo is None else _snap_ts.tz_convert("UTC")
-                    _age_secs = (pd.Timestamp.now(tz="UTC") - _snap_ts).total_seconds()
-                except Exception:
-                    _age_secs = None
-            _snap_ist_str = None
-            if _snap_time is not None:
-                try:
-                    _t = pd.Timestamp(_snap_time)
-                    _t = _t.tz_localize("UTC") if _t.tzinfo is None else _t.tz_convert("UTC")
-                    _snap_ist_str = _t.tz_convert(_IST).strftime("%H:%M:%S")
-                except Exception:
-                    _snap_ist_str = None
-            # Stale threshold: generous multiple of the 60s dore_live_state
-            # cadence (utils.dore_live_state.refresh_dore_live_state) —
-            # flags a paused/dead scheduler without false-alarming on one
-            # slow cycle.
-            _STALE_AFTER_SECS = 5 * 60
-            dore_opt_df, _n_live_updated = _fetch_live_premiums_for_table(dore_opt_df)
-            _live_fetch_ok = _n_live_updated > 0
-            if _age_secs is not None and _age_secs >= _STALE_AFTER_SECS:
-                _age_mins = int(_age_secs // 60)
-                st.warning(
-                    f"⚠️ Confidence / Plan / Drift figures below are from the last scan cycle — "
-                    f"{_snap_ist_str or '?'} IST ({_age_mins} min ago). "
-                    + ("Market is currently closed, so this is expected — those are the last "
-                       "known values before close."
-                       # [2026-09-09, SG request] Settings-aware, see pages/scanner.py.
-                       if market_hours_pause_active() else
-                       "The scheduler appears to have stopped updating during a period "
-                       "when scanning should be active — check scan_worker/"
-                       "inprocess_scheduler health.")
-                    + (" Current Premium above is still fetched live on every page load, "
-                       "independent of that cycle." if _live_fetch_ok else
-                       " Current Premium could not be fetched live this time either — showing "
-                       "the last cached value."),
-                    icon="⚠️",
-                )
-            elif _snap_ist_str:
-                st.caption(f"Current Premium fetched live on this page load. Other fields as of "
-                           f"{_snap_ist_str} IST." if _live_fetch_ok else
-                           f"Live as of {_snap_ist_str} IST.")
-            st.markdown(_dore_options_plan_table_html(dore_opt_df, scan_time=(dore_opt_meta or {}).get("created_at")),
-                        unsafe_allow_html=True)
-            st.caption("Showing Confidence ≥ 70 (stocks) / ≥ 50 (NIFTY/BANKNIFTY/SENSEX), AND Triggered "
-                       "(current premium inside the entry zone right now) only — Waiting candidates "
-                       "(qualified but not yet at their entry price) are hidden from this table. "
-                       "🟢 Confidence ≥75 · 🔵 ≥55–74 (n/a below the source's own floor here) — "
-                       "DORE's own final_score, blending qualification, direction strength, and "
-                       "premium/liquidity validation into one ranking. Source: PB = Pre-Breakout "
-                       "squeeze-release exemption, LS = ordinary Live Scanner ranking. Primary "
-                       "Strike is the balanced pick; Conservative/Aggressive alternatives aren't "
-                       "shown here — see the full trade plan via utils.dore_options_engine."
-                       "OptionTradePlan.format_output() for those. Entry Zone / Stop Loss / "
-                       "Targets are in PREMIUM rupees, not the underlying's price. This is a "
-                       "screener, not an order ticket — confirm liquidity (bid/ask) before acting.")
-            if dore_opt_rejections:
-                _rej_by_stage = {}
-                for _r in dore_opt_rejections:
-                    _rej_by_stage.setdefault(_r.get("stage", "Unknown"), []).append(_r)
-                _breakdown = ", ".join(f"{k}: {len(v)}" for k, v in sorted(_rej_by_stage.items(), key=lambda kv: -len(kv[1])))
-                st.caption(f"{len(dore_opt_rejections)} shortlisted candidate(s) hard-rejected "
-                           f"this cycle — {_breakdown} — not shown above.")
-
-                # [2026-09-17, SG request] Closes the loop on the
-                # setup_conviction/entry_quality capture added to
-                # DoreRejection for exactly this — "which of today's
-                # IV-crush-blocked symbols were otherwise good
-                # candidates?" was previously unanswerable from the UI:
-                # the data reached this rejections list correctly but
-                # nothing here ever read past a bare count. "Good
-                # candidate blocked" uses the same >=70 bar as
-                # MIN_CONFIDENCE_TO_ACTIVATE/_TRACK elsewhere in this
-                # file, applied to setup_conviction and entry_quality
-                # individually (both need to clear it, not the average
-                # — a lopsided 95/40 isn't "good", it's one strong
-                # dimension propping up a weak other).
-                _iv_crush_rej = _rej_by_stage.get("IVCrushRisk", [])
-                if _iv_crush_rej:
-                    _n_good = sum(
-                        1 for r in _iv_crush_rej
-                        if (r.get("setup_conviction") or 0) >= 70 and (r.get("entry_quality") or 0) >= 70
-                    )
-                    with st.expander(
-                        f"⚠️ {len(_iv_crush_rej)} candidate(s) blocked by IV Crush Risk this cycle"
-                        + (f" — {_n_good} looked like good setups otherwise" if _n_good else ""),
-                    ):
-                        _rows = "".join(
-                            f'<tr><td>{_esc_attr(str(r.get("symbol","—")))}</td>'
-                            f'<td>{(r.get("setup_conviction") or 0):.0f}</td>'
-                            f'<td>{(r.get("entry_quality") or 0):.0f}</td>'
-                            f'<td>{"⚠️ Good setup, IV-blocked" if (r.get("setup_conviction") or 0) >= 70 and (r.get("entry_quality") or 0) >= 70 else "—"}</td>'
-                            f'<td style="color:var(--muted);font-size:11px;">{_esc_attr(str(r.get("reason","")))}</td></tr>'
-                            for r in sorted(
-                                _iv_crush_rej,
-                                key=lambda r: (r.get("setup_conviction") or 0) + (r.get("entry_quality") or 0),
-                                reverse=True,
-                            )
-                        )
-                        st.markdown(
-                            '<table style="width:100%;border-collapse:collapse;font-size:13px;">'
-                            '<tr style="color:var(--muted);text-align:left;">'
-                            '<th>Symbol</th><th>Setup Conviction</th><th>Entry Quality</th>'
-                            '<th>Flag</th><th>Reason</th></tr>' + _rows + '</table>',
-                            unsafe_allow_html=True,
-                        )
-
-    with active_plans_tab:
-        _render_dore_options_active_plans_tab()
+    # [2026-09-28, SG request] Outer "📡 Live Scan" / "📋 Active Plans" tabs
+    # removed — the DORE section now shows only the Today's Setups /
+    # Previous Days' Setups tabs (see _render_dore_options_active_plans_tab).
+    # The Live Scan table (_dore_options_plan_table_html) and its
+    # staleness/rejection captions are no longer rendered here; scanning
+    # and plan minting are unaffected (they run in the scheduler, not on
+    # render). Active plans come straight from Supabase, so this no
+    # longer early-returns when nothing is cached outside market hours.
+    _render_dore_options_active_plans_tab()
 
 
 def render(settings: dict | None = None):
