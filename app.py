@@ -323,58 +323,59 @@ from pages.cci_master    import render as render_cci_master
 from pages.portfolio     import render as render_portfolio
 from pages.data_source_check import render as render_data_source_check
 from utils.scanner_engine import NIFTY500_SYMBOLS
+from utils.settings_defaults import DEFAULTS
 
 ss = st.session_state
 settings = {
     "symbols":              ss.get("symbols",              NIFTY500_SYMBOLS),
-    "data_source":          ss.get("data_source",           "yfinance"),
-    "cci_len":              ss.get("cci_len",              20),
-    "cci_ob":               ss.get("cci_ob",               100),
-    "cci_os":               ss.get("cci_os",              -100),
-    "workers":              ss.get("workers",              10),
-    "hold_days":            ss.get("hold_days",            20),
-    "min_score":            ss.get("min_score",            70),
-    "auto_refresh":         ss.get("auto_refresh",         False),
-    "refresh_mins":         ss.get("refresh_mins",         5),
+    "data_source":          ss.get("data_source",           DEFAULTS["data_source"]),
+    "cci_len":              ss.get("cci_len",              DEFAULTS["cci_len"]),
+    "cci_ob":               ss.get("cci_ob",               DEFAULTS["cci_ob"]),
+    "cci_os":               ss.get("cci_os",              DEFAULTS["cci_os"]),
+    "workers":              ss.get("workers",              DEFAULTS["workers"]),
+    "hold_days":            ss.get("hold_days",            DEFAULTS["hold_days"]),
+    "min_score":            ss.get("min_score",            DEFAULTS["min_score"]),
+    "auto_refresh":         ss.get("auto_refresh",         DEFAULTS["auto_refresh"]),
+    "refresh_mins":         ss.get("refresh_mins",         DEFAULTS["refresh_mins"]),
     # Tier 1
-    "t1_mom3":              ss.get("t1_mom3",              8),
-    "t1_mom6":              ss.get("t1_mom6",              12),
-    "t1_fib_hi":            ss.get("t1_fib_hi",            38.2),
-    "t1_fib_lo":            ss.get("t1_fib_lo",            61.8),
-    "t1_cci_window":        ss.get("t1_cci_window",        5),
-    "t1_cloud":             ss.get("t1_cloud",             True),
-    "t1_squeeze_boost":     ss.get("t1_squeeze_boost",     True),
-    "t1_squeeze_pts":       ss.get("t1_squeeze_pts",       15),
-    "t1_no_squeeze_pts":    ss.get("t1_no_squeeze_pts",    5),
-    "t1_ps_weight":         ss.get("t1_ps_weight",         20),
-    "t1_ps_penalty":        ss.get("t1_ps_penalty",       -10),
+    "t1_mom3":              ss.get("t1_mom3",              DEFAULTS["t1_mom3"]),
+    "t1_mom6":              ss.get("t1_mom6",              DEFAULTS["t1_mom6"]),
+    "t1_fib_hi":            ss.get("t1_fib_hi",            DEFAULTS["t1_fib_hi"]),
+    "t1_fib_lo":            ss.get("t1_fib_lo",            DEFAULTS["t1_fib_lo"]),
+    "t1_cci_window":        ss.get("t1_cci_window",        DEFAULTS["t1_cci_window"]),
+    "t1_cloud":             ss.get("t1_cloud",             DEFAULTS["t1_cloud"]),
+    "t1_squeeze_boost":     ss.get("t1_squeeze_boost",     DEFAULTS["t1_squeeze_boost"]),
+    "t1_squeeze_pts":       ss.get("t1_squeeze_pts",       DEFAULTS["t1_squeeze_pts"]),
+    "t1_no_squeeze_pts":    ss.get("t1_no_squeeze_pts",    DEFAULTS["t1_no_squeeze_pts"]),
+    "t1_ps_weight":         ss.get("t1_ps_weight",         DEFAULTS["t1_ps_weight"]),
+    "t1_ps_penalty":        ss.get("t1_ps_penalty",       DEFAULTS["t1_ps_penalty"]),
     # Tier 2
-    "t2_comp_bars":         ss.get("t2_comp_bars",         10),
-    "t2_atr_ratio":         ss.get("t2_atr_ratio",         0.85),
-    "t2_vol_mult":          ss.get("t2_vol_mult",          1.2),
+    "t2_comp_bars":         ss.get("t2_comp_bars",         DEFAULTS["t2_comp_bars"]),
+    "t2_atr_ratio":         ss.get("t2_atr_ratio",         DEFAULTS["t2_atr_ratio"]),
+    "t2_vol_mult":          ss.get("t2_vol_mult",          DEFAULTS["t2_vol_mult"]),
     # Nifty regime (original gate)
-    "nifty_regime_filter":  ss.get("nifty_regime_filter",  False),
+    "nifty_regime_filter":  ss.get("nifty_regime_filter",  DEFAULTS["nifty_regime_filter"]),
     # Regime engine threshold
-    "execute_threshold":    ss.get("execute_threshold",    70),
+    "execute_threshold":    ss.get("execute_threshold",    DEFAULTS["execute_threshold"]),
     # Tier 1 strength gate
-    "t1_rs_min":            ss.get("t1_rs_min",            0.0),
-    "t1_adx_min":           ss.get("t1_adx_min",           20),
-    "t1_use_adx":           ss.get("t1_use_adx",           True),
+    "t1_rs_min":            ss.get("t1_rs_min",            DEFAULTS["t1_rs_min"]),
+    "t1_adx_min":           ss.get("t1_adx_min",           DEFAULTS["t1_adx_min"]),
+    "t1_use_adx":           ss.get("t1_use_adx",           DEFAULTS["t1_use_adx"]),
     # ── Institutional Continuation (VWAP Reclaim) — Five Pillars Momentum
     # pillar tuning. Previously defined on the Settings page but never
     # forwarded here, so they had no effect on the scanner or backtest.
-    "ic_enable_vwap_reclaim":    ss.get("ic_enable_vwap_reclaim",    True),
-    "ic_enable_vwap_stoch_conf": ss.get("ic_enable_vwap_stoch_conf", True),
-    "ic_vwap_touch_atr_mult":    ss.get("ic_vwap_touch_atr_mult",    0.25),
-    "ic_vwap_touch_lookback":    ss.get("ic_vwap_touch_lookback",    3),
-    "ic_reaction_max_atr":       ss.get("ic_reaction_max_atr",       1.5),
-    "ic_confluence_window":      ss.get("ic_confluence_window",      2),
-    "ic_require_ema_trend":      ss.get("ic_require_ema_trend",      True),
-    "ic_require_rising_vwap":    ss.get("ic_require_rising_vwap",    True),
-    "ic_require_bullish_return": ss.get("ic_require_bullish_return", True),
-    "ic_min_reaction_score":     ss.get("ic_min_reaction_score",     0),
+    "ic_enable_vwap_reclaim":    ss.get("ic_enable_vwap_reclaim",    DEFAULTS["ic_enable_vwap_reclaim"]),
+    "ic_enable_vwap_stoch_conf": ss.get("ic_enable_vwap_stoch_conf", DEFAULTS["ic_enable_vwap_stoch_conf"]),
+    "ic_vwap_touch_atr_mult":    ss.get("ic_vwap_touch_atr_mult",    DEFAULTS["ic_vwap_touch_atr_mult"]),
+    "ic_vwap_touch_lookback":    ss.get("ic_vwap_touch_lookback",    DEFAULTS["ic_vwap_touch_lookback"]),
+    "ic_reaction_max_atr":       ss.get("ic_reaction_max_atr",       DEFAULTS["ic_reaction_max_atr"]),
+    "ic_confluence_window":      ss.get("ic_confluence_window",      DEFAULTS["ic_confluence_window"]),
+    "ic_require_ema_trend":      ss.get("ic_require_ema_trend",      DEFAULTS["ic_require_ema_trend"]),
+    "ic_require_rising_vwap":    ss.get("ic_require_rising_vwap",    DEFAULTS["ic_require_rising_vwap"]),
+    "ic_require_bullish_return": ss.get("ic_require_bullish_return", DEFAULTS["ic_require_bullish_return"]),
+    "ic_min_reaction_score":     ss.get("ic_min_reaction_score",     DEFAULTS["ic_min_reaction_score"]),
     # ── Backtest engine default (Settings page → Backtest page) ──────
-    "bt_default_engine":         ss.get("bt_default_engine",         "scanner"),
+    "bt_default_engine":         ss.get("bt_default_engine",         DEFAULTS["bt_default_engine"]),
 }
 
 def _page_dashboard():
