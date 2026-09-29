@@ -32,6 +32,7 @@ import logging
 _log = logging.getLogger(__name__)
 
 from utils.scanner_engine import _strip_tz, nifty_regime, nifty_regime_series, ema, yf_download_with_retry
+from utils.settings_defaults import DEFAULTS
 from utils.decision_engine import _extension as _ext_fn
 from utils.conviction_score_v1 import (
     compute_conviction_v4, classify_tier_v4, _classify_v4,
@@ -468,7 +469,7 @@ def generate_signals_historical(
             # "backtest_min_rr" in settings overrides the 2.0 default in
             # either direction (this is a backtest population choice, not
             # a live trade-safety floor like Promotion Engine's R:R gates).
-            elif _rr < (settings or {}).get("backtest_min_rr", 2.0):
+            elif _rr < (settings or {}).get("backtest_min_rr", DEFAULTS["backtest_min_rr"]):
                 _rejection_reason = "POOR_RR"
 
         # ── UNIVERSE-WIDE PROMO BYPASS [2026-07-29] ──────────────────

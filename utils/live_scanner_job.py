@@ -39,6 +39,8 @@ import logging
 
 import pandas as pd
 
+from utils.settings_defaults import DEFAULTS
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,10 +54,10 @@ def _run_batch(symbols: list, settings: dict | None, nifty_series=None,
     return run_scanner(
         symbols,
         settings=settings,
-        cci_len=settings.get("cci_len", 20),
-        cci_ob=settings.get("cci_ob", 100),
-        cci_os=settings.get("cci_os", -100),
-        max_workers=settings.get("workers", 10),
+        cci_len=settings.get("cci_len", DEFAULTS["cci_len"]),
+        cci_ob=settings.get("cci_ob", DEFAULTS["cci_ob"]),
+        cci_os=settings.get("cci_os", DEFAULTS["cci_os"]),
+        max_workers=settings.get("workers", DEFAULTS["workers"]),
         source="yfinance",
         nifty_series=nifty_series,
         enrich_setup_persistence=enrich_setup_persistence,
@@ -122,7 +124,7 @@ def build_regime_context_for_cycle(settings: dict | None = None, nifty_series=No
         nifty_series = fetch_nifty("1y")
     return build_regime_context(
         nifty=nifty_series,
-        execute_threshold=settings.get("execute_threshold", 70),
+        execute_threshold=settings.get("execute_threshold", DEFAULTS["execute_threshold"]),
         auto_fetch_vix=True,
     )
 

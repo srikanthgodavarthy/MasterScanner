@@ -140,39 +140,52 @@ class ScoringParams:
 
     @classmethod
     def from_settings(cls, s: dict) -> "ScoringParams":
-        """Build from the settings dict produced by pages/settings.py."""
+        """Build from the settings dict produced by pages/settings.py (via
+        utils/settings_defaults.DEFAULTS — see that module's docstring).
+
+        [2026-09-29, production-issues pass] Every field's fallback (used
+        only when `s` is missing that key — e.g. diagnostic/script callers
+        that build a partial dict by hand) is now read off cls()'s own
+        dataclass default rather than a second, independently hand-typed
+        literal. Previously t1_cci_window's fallback here was 5 while the
+        dataclass default two lines up was 2 ("tight/fresh", per its own
+        comment) -- an as-shipped example of exactly the drift this
+        structurally forecloses for every field, not just that one. See
+        tests/test_settings_defaults_single_source.py.
+        """
+        _dc = cls()
         return cls(
-            cci_len          = int(s.get("cci_len",            20)),
-            cci_ob           = int(s.get("cci_ob",             100)),
-            cci_os           = int(s.get("cci_os",            -100)),
-            atr_prox         = float(s.get("atr_prox",          0.3)),
-            pvt_lb           = int(s.get("pvt_lb",              20)),
-            t1_mom3          = float(s.get("t1_mom3",            8.0)),
-            t1_mom6          = float(s.get("t1_mom6",           12.0)),
-            t1_fib_hi        = float(s.get("t1_fib_hi",         38.2)),
-            t1_fib_lo        = float(s.get("t1_fib_lo",         61.8)),
-            t1_cci_window    = int(s.get("t1_cci_window",        5)),
-            t1_cloud         = bool(s.get("t1_cloud",           True)),
-            t1_squeeze_boost = bool(s.get("t1_squeeze_boost",   True)),
-            t1_squeeze_pts   = int(s.get("t1_squeeze_pts",       2)),   # [v8.1] was 15
-            t1_no_squeeze_pts= int(s.get("t1_no_squeeze_pts",    0)),   # [v8.1] was 5
-            t1_ps_weight     = int(s.get("t1_ps_weight",        20)),
-            t1_ps_penalty    = int(s.get("t1_ps_penalty",      -10)),
-            t1_rs_min        = float(s.get("t1_rs_min",          0.0)),
-            t1_adx_min       = float(s.get("t1_adx_min",        20.0)),
-            t1_use_adx       = bool(s.get("t1_use_adx",         True)),
-            ema_fast_period  = int(s.get("ema_fast_period",     20)),
-            ema_mid_period   = int(s.get("ema_mid_period",      50)),
-            ema_slow_period  = int(s.get("ema_slow_period",     200)),
-            t2_comp_bars     = int(s.get("t2_comp_bars",        10)),
-            t2_atr_ratio     = float(s.get("t2_atr_ratio",      0.85)),
-            t2_vol_mult      = float(s.get("t2_vol_mult",        1.2)),
-            nifty_regime_filter = bool(s.get("nifty_regime_filter", False)),
-            nifty_regime_val    = str(s.get("nifty_regime_val",  "neutral")),
-            setup_age_mode      = str(s.get("setup_age_mode",    "legacy")),
-            enable_ll_stoch_bonus = bool(s.get("enable_ll_stoch_bonus", True)),
-            ll_bonus_max          = int(s.get("ll_bonus_max",     8)),
-            stoch_bonus_max       = int(s.get("stoch_bonus_max",  7)),
+            cci_len          = int(s.get("cci_len",            _dc.cci_len)),
+            cci_ob           = int(s.get("cci_ob",             _dc.cci_ob)),
+            cci_os           = int(s.get("cci_os",             _dc.cci_os)),
+            atr_prox         = float(s.get("atr_prox",         _dc.atr_prox)),
+            pvt_lb           = int(s.get("pvt_lb",              _dc.pvt_lb)),
+            t1_mom3          = float(s.get("t1_mom3",           _dc.t1_mom3)),
+            t1_mom6          = float(s.get("t1_mom6",           _dc.t1_mom6)),
+            t1_fib_hi        = float(s.get("t1_fib_hi",         _dc.t1_fib_hi)),
+            t1_fib_lo        = float(s.get("t1_fib_lo",         _dc.t1_fib_lo)),
+            t1_cci_window    = int(s.get("t1_cci_window",       _dc.t1_cci_window)),
+            t1_cloud         = bool(s.get("t1_cloud",           _dc.t1_cloud)),
+            t1_squeeze_boost = bool(s.get("t1_squeeze_boost",   _dc.t1_squeeze_boost)),
+            t1_squeeze_pts   = int(s.get("t1_squeeze_pts",      _dc.t1_squeeze_pts)),
+            t1_no_squeeze_pts= int(s.get("t1_no_squeeze_pts",   _dc.t1_no_squeeze_pts)),
+            t1_ps_weight     = int(s.get("t1_ps_weight",        _dc.t1_ps_weight)),
+            t1_ps_penalty    = int(s.get("t1_ps_penalty",       _dc.t1_ps_penalty)),
+            t1_rs_min        = float(s.get("t1_rs_min",         _dc.t1_rs_min)),
+            t1_adx_min       = float(s.get("t1_adx_min",        _dc.t1_adx_min)),
+            t1_use_adx       = bool(s.get("t1_use_adx",         _dc.t1_use_adx)),
+            ema_fast_period  = int(s.get("ema_fast_period",     _dc.ema_fast_period)),
+            ema_mid_period   = int(s.get("ema_mid_period",      _dc.ema_mid_period)),
+            ema_slow_period  = int(s.get("ema_slow_period",     _dc.ema_slow_period)),
+            t2_comp_bars     = int(s.get("t2_comp_bars",        _dc.t2_comp_bars)),
+            t2_atr_ratio     = float(s.get("t2_atr_ratio",      _dc.t2_atr_ratio)),
+            t2_vol_mult      = float(s.get("t2_vol_mult",       _dc.t2_vol_mult)),
+            nifty_regime_filter = bool(s.get("nifty_regime_filter", _dc.nifty_regime_filter)),
+            nifty_regime_val    = str(s.get("nifty_regime_val",  _dc.nifty_regime_val)),
+            setup_age_mode      = str(s.get("setup_age_mode",    _dc.setup_age_mode)),
+            enable_ll_stoch_bonus = bool(s.get("enable_ll_stoch_bonus", _dc.enable_ll_stoch_bonus)),
+            ll_bonus_max          = int(s.get("ll_bonus_max",     _dc.ll_bonus_max)),
+            stoch_bonus_max       = int(s.get("stoch_bonus_max",  _dc.stoch_bonus_max)),
         )
 
 

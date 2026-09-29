@@ -46,6 +46,7 @@ from utils.position_sizing import (
     size_position, PositionSizingSettings, PortfolioContext, ExistingPosition,
 )
 from utils.sector_map import get_sector
+from utils.settings_defaults import DEFAULTS
 
 logger = logging.getLogger(__name__)
 
@@ -79,12 +80,12 @@ def _load_position_sizing_inputs() -> tuple[float, dict, list[ExistingPosition]]
         from utils.position_sizing import load_existing_positions
 
         ss = st.session_state
-        available_capital = float(ss.get("available_capital", 0.0))
+        available_capital = float(ss.get("available_capital", DEFAULTS["available_capital"]))
         lot_sizes = {
-            "STOCK":     int(ss.get("stock_lot_size", 1)),
-            "NIFTY":     int(ss.get("nifty_lot_size", 1)),
-            "BANKNIFTY": int(ss.get("banknifty_lot_size", 1)),
-            "SENSEX":    int(ss.get("sensex_lot_size", 1)),
+            "STOCK":     int(ss.get("stock_lot_size", DEFAULTS["stock_lot_size"])),
+            "NIFTY":     int(ss.get("nifty_lot_size", DEFAULTS["nifty_lot_size"])),
+            "BANKNIFTY": int(ss.get("banknifty_lot_size", DEFAULTS["banknifty_lot_size"])),
+            "SENSEX":    int(ss.get("sensex_lot_size", DEFAULTS["sensex_lot_size"])),
         }
         positions = load_existing_positions()
         return available_capital, lot_sizes, positions
