@@ -14,6 +14,8 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
+
+from utils.settings_defaults import DEFAULTS
 import pandas as pd
 from datetime import datetime, timezone
 import plotly.graph_objects as go
@@ -159,7 +161,7 @@ def render(settings=None):
         "cci_master":   "📐 CCI Master",
         "pre_breakout": "🎯 Pre-Breakout (Scanner)",
     }
-    _default_source = _ENGINE_TO_SOURCE.get((settings or {}).get("bt_default_engine", "scanner"), "Custom")
+    _default_source = _ENGINE_TO_SOURCE.get((settings or {}).get("bt_default_engine", DEFAULTS["bt_default_engine"]), "Custom")
 
     src_col, badge_col = st.columns([3, 5])
     with src_col:
@@ -289,13 +291,13 @@ def render(settings=None):
             _row_cci = st.columns(3)
             with _row_cci[0]:
                 bt_cci_len = st.number_input("CCI Length", 5, 50,
-                    st.session_state.get("cci_len", 20), key="bt_cci_len")
+                    st.session_state.get("cci_len", DEFAULTS["cci_len"]), key="bt_cci_len")
             with _row_cci[1]:
                 bt_cci_ob = st.number_input("CCI OB", 50, 300,
-                    st.session_state.get("cci_ob", 100), key="bt_cci_ob")
+                    st.session_state.get("cci_ob", DEFAULTS["cci_ob"]), key="bt_cci_ob")
             with _row_cci[2]:
                 bt_cci_os = st.number_input("CCI OS", -300, 0,
-                    st.session_state.get("cci_os", -100), key="bt_cci_os")
+                    st.session_state.get("cci_os", DEFAULTS["cci_os"]), key="bt_cci_os")
             bt_save_db = st.checkbox("💾 Save to Supabase", True, key="bt_save_db")
 
     # ── Header ────────────────────────────────────────────────────────────────
@@ -442,7 +444,7 @@ def render(settings=None):
                     cci_os           = int(bt_cci_os),
                     min_score        = bt_min_score,
                     hold_days        = bt_hold_days,
-                    workers          = settings.get("workers", 10) if settings else 10,
+                    workers          = settings.get("workers", DEFAULTS["workers"]) if settings else DEFAULTS["workers"],
                     tier_filter      = bt_tier_filter,
                     buy_type_filter  = buy_type_filter,
                     rs_positive_only = bt_rs_positive_only,
@@ -450,7 +452,7 @@ def render(settings=None):
                     mode             = _bt_mode,
                     checkpoint_cb    = _bt_checkpoint,
                     checkpoint_every = 25,
-                    source           = settings.get("data_source", "yfinance") if settings else "yfinance",
+                    source           = settings.get("data_source", DEFAULTS["data_source"]) if settings else DEFAULTS["data_source"],
                 )
         except Exception as _bt_exc:
             # Previously an exception (or host kill) here left the run

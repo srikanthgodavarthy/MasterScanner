@@ -18,6 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import math
 import pandas as pd
+
+from utils.settings_defaults import DEFAULTS
 import streamlit as st
 
 from utils.cci_master_engine import (
@@ -433,7 +435,7 @@ def render(settings: dict | None = None):
         with st.spinner("Running CCI Master scan…"):
             df_out = run_cci_master_scan(
                 symbols=universe, params=params,
-                max_workers=settings.get("workers", 10),
+                max_workers=settings.get("workers", DEFAULTS["workers"]),
                 progress_cb=_cb,
             )
         prog.empty()

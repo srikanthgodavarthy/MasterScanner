@@ -57,6 +57,7 @@ from datetime import datetime
 from utils.time_utils import now_ist as _now_ist, IST as _IST, is_market_hours_ist
 
 from utils.scanner_engine  import run_scanner, fetch_nifty, NIFTY500_SYMBOLS
+from utils.settings_defaults import DEFAULTS
 from utils.regime_engine   import (
     build_regime_context,
     apply_regime_layer,
@@ -5017,10 +5018,10 @@ def render(settings: dict | None = None):
             df_raw = run_scanner(
                 symbols,
                 settings       = effective,
-                cci_len        = effective.get("cci_len",  20),
-                cci_ob         = effective.get("cci_ob",  100),
-                cci_os         = effective.get("cci_os", -100),
-                max_workers    = effective.get("workers",  10),
+                cci_len        = effective.get("cci_len",  DEFAULTS["cci_len"]),
+                cci_ob         = effective.get("cci_ob",  DEFAULTS["cci_ob"]),
+                cci_os         = effective.get("cci_os", DEFAULTS["cci_os"]),
+                max_workers    = effective.get("workers",  DEFAULTS["workers"]),
                 progress_cb    = _cb,
                 # [Dashboard/Scanner split] hardcoded — Scanner is Yahoo
                 # Finance only, always, regardless of any "data_source"
@@ -5057,7 +5058,7 @@ def render(settings: dict | None = None):
             nifty_series = fetch_nifty("1y")
             regime_ctx   = build_regime_context(
                 nifty             = nifty_series,
-                execute_threshold = effective.get("execute_threshold", 70),
+                execute_threshold = effective.get("execute_threshold", DEFAULTS["execute_threshold"]),
                 auto_fetch_vix    = True,
             )
             df_aug = apply_regime_layer(df_raw, regime_ctx)
