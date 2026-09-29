@@ -3128,12 +3128,20 @@ def compute_dore_trade_plan(
     # requirement. This is a strict downgrade-only gate, symmetric with
     # the STRUCTURAL_INVALIDATION rejection above — never an upgrade.
     if _structural_risk_reward is not None and _structural_risk_reward < settings.min_structural_rr:
+        # [2026-09-29, SG request] sig.setup_conviction/entry_quality are
+        # already computed well before this structural R:R check (same
+        # reasoning as the IVCrushRisk capture above) — capturing them here
+        # costs nothing extra and closes the gap that left every
+        # StructuralRiskReward row's setup_conviction/entry_quality NULL in
+        # Neon (confirmed via the 2026-09-29 production export).
         return DoreRejection(
             sig.symbol, "StructuralRiskReward",
             f"Structural R:R {_structural_risk_reward:.2f} below minimum "
             f"{settings.min_structural_rr:.2f} (entry={_structural_entry_reference:.2f}, "
             f"target={_structural_target_price:.2f} [{_structural_target_type}], "
             f"risk={_structural_risk:.2f}, reward={_structural_reward:.2f})",
+            setup_conviction=sig.setup_conviction,
+            entry_quality=sig.entry_quality,
         )
 
     # [Fix, 2026-08-16 — Option A] When the structural anchor was actually
@@ -3199,10 +3207,16 @@ def compute_dore_trade_plan(
             f"{label}: {'; '.join(per_label_reasons[label]) or 'no reason recorded'}"
             for label in (CONSERVATIVE, BALANCED, AGGRESSIVE)
         )
+        # [2026-09-29, SG request] Same fix as StructuralRiskReward above:
+        # sig.setup_conviction/entry_quality already exist in scope by this
+        # point, so pass them through instead of leaving this stage's rows
+        # permanently NULL in Neon.
         return DoreRejection(
             sig.symbol, "NoLiquidity",
             f"Primary candidate ({_primary_label}, strike {strikes[_primary_label]['strike']:g}) "
             f"failed premium/OI liquidity checks — {detail}",
+            setup_conviction=sig.setup_conviction,
+            entry_quality=sig.entry_quality,
         )
 
     expiry_suit = _expiry_suitability(dte, candidates[_primary_label].probability_of_profit)

@@ -625,3 +625,75 @@ def test_structural_premium_ceiling_computes_intrinsic_delta():
 def test_structural_premium_ceiling_none_without_inputs():
     assert _structural_premium_ceiling(100.0, 101.0, None, CE, 1.5) is None
     assert _structural_premium_ceiling(100.0, 101.0, 103.0, CE, None) is None
+
+
+# ── setup_conviction/entry_quality passthrough on NoLiquidity/StructuralRiskReward ──
+# [2026-09-29, SG request] These two stages left setup_conviction/entry_quality
+# NULL on every row in Neon (confirmed against a real production export) even
+# though sig.setup_conviction/sig.entry_quality already exist in scope at both
+# call sites — same situation the IVCrushRisk rejection already handles
+# correctly. StructuralInvalidation is intentionally left out of scope here.
+
+def _illiquid_option_data_for(current_price, pcr=1.3):
+    """Same shape as _option_data_for() but every strike's OI sits below
+    DoreOptionsSettings.min_strike_oi (50,000), and the bid/ask-derived
+    ce_close/pe_close are set far enough from the mid to trip the spread
+    check too -- reproducing the real NoLiquidity rejections in the
+    2026-09-29 production export (strike OI ~100-46,000, spreads 3.8%-45%)."""
+    strikes = {}
+    base_strike = round(current_price / 10) * 10
+    for i in range(-20, 21):
+        k = float(base_strike + i * 10)
+        premium = max(0.3, 1.5 - abs(i) * 0.05)
+        strikes[k] = {"ce_premium": premium, "pe_premium": premium,
+                      "ce_oi": 1_000, "pe_oi": 1_000,
+                      "ce_close": premium * 1.5, "pe_close": premium * 1.5}
+    return {
+        "expiry": _FIXTURE_EXPIRY, "strike_interval": 10, "strike_premiums": strikes,
+        "total_ce_oi": 50_000, "total_pe_oi": 50_000, "pcr": pcr,
+        "ce_wall_strike": base_strike + 100, "pe_wall_strike": base_strike - 100,
+    }
+
+
+def test_no_liquidity_rejection_carries_setup_conviction_and_entry_quality():
+    row = _base_row(100.0, bullish=True)
+    close = [100.0] * 60   # plain list, not ndarray -- close_prices or [] below is ambiguous on an array
+    plan = compute_dore_trade_plan(
+        row, close, _illiquid_option_data_for(100.0), dte=14, symbol="TESTCO",
+        market_regime="bullish",
+    )
+    assert isinstance(plan, DoreRejection), f"expected NoLiquidity rejection, got: {plan}"
+    assert plan.stage == "NoLiquidity"
+    # _base_row's CV1_Conviction=90/CV1_EntryQuality=88 feed sig.setup_conviction/
+    # sig.entry_quality by construction -- both must now be real, non-null numbers,
+    # not the DoreRejection field defaults (0.0/None).
+    assert plan.setup_conviction is not None and plan.setup_conviction > 0
+    assert plan.entry_quality is not None and plan.entry_quality > 0
+
+
+def test_structural_rr_gate_rejection_carries_setup_conviction_and_entry_quality_ce():
+    open_, high, low, close = _bull_ob_settle_ohlc()
+    row = _base_row(close[-1], bullish=True)
+    strict = DoreOptionsSettings(min_structural_rr=50.0)
+    plan = compute_dore_trade_plan(
+        row, close, _option_data_for(close[-1]), dte=14, symbol="TESTCO", market_regime="bullish",
+        high_prices=high, low_prices=low, open_prices=open_, settings=strict,
+    )
+    assert isinstance(plan, DoreRejection), f"expected rejection, got: {plan}"
+    assert plan.stage == "StructuralRiskReward"
+    assert plan.setup_conviction is not None and plan.setup_conviction > 0
+    assert plan.entry_quality is not None and plan.entry_quality > 0
+
+
+def test_structural_rr_gate_rejection_carries_setup_conviction_and_entry_quality_pe():
+    open_, high, low, close = _bear_ob_settle_ohlc()
+    row = _base_row(close[-1], bullish=False)
+    strict = DoreOptionsSettings(min_structural_rr=50.0)
+    plan = compute_dore_trade_plan(
+        row, close, _option_data_for(close[-1]), dte=14, symbol="TESTCO", market_regime="bearish",
+        high_prices=high, low_prices=low, open_prices=open_, settings=strict,
+    )
+    assert isinstance(plan, DoreRejection), f"expected rejection, got: {plan}"
+    assert plan.stage == "StructuralRiskReward"
+    assert plan.setup_conviction is not None and plan.setup_conviction > 0
+    assert plan.entry_quality is not None and plan.entry_quality > 0
