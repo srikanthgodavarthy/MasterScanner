@@ -648,6 +648,15 @@ _NSE_HEADERS   = {
 # [2026-09-09] DUMMYHEG — HEG Ltd corporate action in progress.
 _EXCLUDED_SYMBOLS = {"DUMMYHEG"}
 
+# [2026-09-30] Liquidity/tradability floor. Avg daily turnover (INR
+# crores) below this over LIQUIDITY_FLOOR_LOOKBACK_BARS bars rejects a
+# symbol before scoring — see process()'s use of these in the scan
+# loop below. 0 disables the floor entirely (effective_settings can
+# override via "min_avg_turnover_cr"). NOT backtest-fit — a first-pass
+# value pending calibration, same caveat as V4_THRESHOLD_DEFAULTS.
+DEFAULT_MIN_AVG_TURNOVER_CR = 5.0
+LIQUIDITY_FLOOR_LOOKBACK_BARS = 20
+
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_nifty500_constituents() -> list[str]:
@@ -3159,6 +3168,35 @@ def run_scanner(
     def process(sym, df, sector_series):
         if df is None or df.empty:
             return None
+        # [2026-09-30] Liquidity/tradability floor — added at SG's
+        # request. Rejects illiquid Nifty 500 constituents BEFORE they
+        # ever reach score_stock()/CV4, the same "reject cheap, before
+        # the full indicator build" shape as leadership_prescreen()
+        # below. This is deliberately NOT in smc_engine.py:
+        # detect_liquidity_sweep() there is structural/SMC liquidity
+        # (stop-hunt wicks past a swing extreme) — an unrelated concept
+        # that only shares the word "liquidity" with this check.
+        # min_avg_turnover_cr is in crores of rupees/day (avg close *
+        # avg volume over the trailing window), not a raw volume count,
+        # so one setting works across symbols at very different price
+        # levels instead of needing a per-symbol volume floor.
+        _min_turnover_cr = effective_settings.get(
+            "min_avg_turnover_cr", DEFAULT_MIN_AVG_TURNOVER_CR)
+        if _min_turnover_cr > 0:
+            _win = min(len(df), LIQUIDITY_FLOOR_LOOKBACK_BARS)
+            _avg_turnover_cr = (
+                (df["close"].tail(_win) * df["volume"].tail(_win)).mean()
+                / 1e7  # rupees -> crores
+            )
+            if pd.isna(_avg_turnover_cr) or _avg_turnover_cr < _min_turnover_cr:
+                _prescreen_rejected.add(sym)
+                _log.info(
+                    "process: %s rejected by liquidity floor "
+                    "(avg turnover %.2fcr < %.2fcr over %d bars)",
+                    sym, 0.0 if pd.isna(_avg_turnover_cr) else _avg_turnover_cr,
+                    _min_turnover_cr, _win,
+                )
+                return None
         row = score_stock(df, nifty_series, settings=effective_settings,
                           cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
                           symbol=sym, sector_series=sector_series,

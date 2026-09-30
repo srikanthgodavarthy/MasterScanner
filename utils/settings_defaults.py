@@ -60,6 +60,12 @@ DEFAULTS = {
     # incident note in scanner_engine.py's scan loop for why. Turn on only
     # after confirming RAM/scan-time is acceptable for your deployment.
     "enable_sector_rs":  False,
+    # ── Liquidity/tradability floor (utils/scanner_engine.py process()) ──
+    # Avg daily turnover in INR crores, trailing 20 bars, below which a
+    # Nifty 500 constituent is rejected before scoring. 0 disables. NOT
+    # a substitute for a circuit-limit or ASM/GSM surveillance check —
+    # neither is implemented anywhere in this pipeline yet.
+    "min_avg_turnover_cr": 5.0,
     # ── EMA periods — DORE Engine (utils/dore_settings.py DORESettings) ────
     # Mirrors, at the UI layer, the ema_fast_period/ema_slow_period keys
     # inside st.session_state["dore_settings"] — see the "EMA Periods —
@@ -114,18 +120,55 @@ DEFAULTS = {
     "ic_require_ema_trend":      True,
     "ic_require_rising_vwap":    True,
     "ic_require_bullish_return": True,
+    # [2026-09-30] Confirmed dead at this default: pillar_engine.py gates
+    # on `reaction_str < ic_min_reaction_score`, and reaction_str
+    # (utils/continuation_patterns.py) is a 0-100 normalised score that
+    # can never go negative — so a floor of 0 can never reject anything.
+    # Left at 0 rather than picking an arbitrary nonzero value myself,
+    # since raising it changes which VWAP-reclaim setups confirm. Pick a
+    # real floor (e.g. requires backtesting reaction_str's distribution
+    # on confirmed reclaims) before this setting does anything.
     "ic_min_reaction_score":     0,
     "ic_momentum_weight":        15,
     "ic_confluence_weight":      10,
     # ── Backtest engine default (Backtest page reads this to pick its
     # initial Signal Source; still overridable per-run on that page) ──
     "bt_default_engine":         "scanner",
-    # ── CV1 v3 tier / signal thresholds (see utils/conviction_score_v1.py
-    # V3_THRESHOLD_DEFAULTS — decile-backtest calibrated, 2026-07. This
-    # dict is the UI-side mirror of that module's defaults; keep them in
-    # sync manually whenever conviction_score_v1.py's defaults change,
-    # since this dict's values win whenever a key is present (which is
-    # always, for keys not yet touched by the user — see _g()/_s() below).
+    # ── CV4 tier / signal thresholds (see utils/conviction_score_v1.py
+    # V4_THRESHOLD_DEFAULTS) — the Live Scanner's ACTUAL live gate since
+    # July 2026. [2026-09-30 fix] These 16 keys were never mirrored here
+    # despite the v3 block below being carried over verbatim during the
+    # "single source of truth" settings consolidation — meaning the real
+    # live floors had no Settings-page control and no default anyone
+    # could see outside conviction_score_v1.py itself. Keep in sync
+    # manually whenever V4_THRESHOLD_DEFAULTS changes; this dict's
+    # values win whenever a key is present (see _g()/_s() in
+    # pages/settings.py).
+    "v4_watch_leadership_min":         50,
+    "v4_watch_conviction_min":         50,
+    "v4_watch_entry_quality_min":      50,
+    "v4_actionable_leadership_min":    70,
+    "v4_actionable_conviction_min":    60,
+    "v4_actionable_entry_quality_min": 60,
+    "v4_actionable_composite_min":     66,
+    "v4_execute_leadership_min":       80,
+    "v4_execute_conviction_min":       70,
+    "v4_execute_entry_quality_min":    70,
+    "v4_execute_composite_min":        76,
+    "v4_elite_leadership_min":         85,
+    "v4_elite_conviction_min":         75,
+    "v4_elite_entry_quality_min":      80,
+    "v4_elite_composite_min":          82,
+    # ── LEGACY — CV1 v3 tier / signal thresholds (see utils/conviction_score_v1.py
+    # V3_THRESHOLD_DEFAULTS — decile-backtest calibrated, 2026-07). The Live
+    # Scanner has run on CV4 (v4_* above) since July 2026; these v3_* keys
+    # now only feed the backtest engine's legacy v3 comparison path, NOT
+    # live scoring. Kept for that path rather than removed — do not treat
+    # as tunable knobs for the live scanner. This dict is the UI-side
+    # mirror of that module's defaults; keep them in sync manually
+    # whenever conviction_score_v1.py's defaults change, since this
+    # dict's values win whenever a key is present (which is always, for
+    # keys not yet touched by the user — see _g()/_s() below).
     "v3_watch_leadership_min":      50,
     "v3_watch_conviction_min":      50,
     "v3_watch_entry_quality_min":   50,
