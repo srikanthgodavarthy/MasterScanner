@@ -1208,16 +1208,53 @@ _SWAP_FACTOR_LABELS = [
 ]
 
 
+# [2026-09-30] Tiers a rotate candidate must clear to be recommended at
+# all — see _best_swap()'s category gate below. Skip is never eligible
+# regardless of its leadership score.
+_ROTATE_QUALIFYING_TIERS = {"Watch", "Actionable", "Execute", "Elite"}
+
+
 def _best_swap(row: dict, live_metrics: pd.DataFrame, held_symbols: set, excluded_symbols: set) -> dict | None:
     """Best not-held, not-already-recommended symbol to swap into for a
     weak/expensive-to-hold position, plus a swap score (scan-score delta)
     and the factor tags that drove the delta (top improvements only).
     excluded_symbols accumulates across calls so each weak holding gets a
-    distinct suggestion instead of every row pointing at the same top pick."""
+    distinct suggestion instead of every row pointing at the same top pick.
+
+    [2026-09-30] Ranking metric investigated and settled on "score"
+    (norm_score, the original CCI/Five-Pillars-era composite — see
+    utils/scoring_core.py) deliberately, not CV1_Leadership, after
+    checking both against real history for the BEML/LENSKART rotate
+    call (2026-09-29):
+      - BEML: leadership and norm_score moved together across six
+        weeks (e.g. 09-08: L73/score86, 09-21: L68/score78) — no real
+        disagreement between the two metrics for this symbol.
+      - LENSKART: leadership sat nearly flat for six weeks (63, 63,
+        63, 63, 70, 71) while norm_score genuinely swung (68, 81, 70,
+        68, 68, 70, 79) tracking real Conviction/EntryQuality
+        movement that Leadership alone was blind to. SG's call,
+        confirmed against this data: norm_score is the more
+        responsive ranking signal among names that have already
+        cleared a basic quality floor — it was built to catch early
+        ignition (cci_rising, squeeze_release, compression_break),
+        which is exactly the "early wins" case Leadership (a
+        trend-persistence/quality metric) under-weights.
+      - What WAS broken, and stays fixed: norm_score was being used
+        with NO quality floor at all — a Skip-tier symbol (CV4's
+        Leadership/Conviction/EntryQuality AND-gate, 70/60/60) could
+        still top the ranking on norm_score alone and get recommended.
+        _ROTATE_QUALIFYING_TIERS below excludes Skip before norm_score
+        ever gets to rank anything, so a high-norm_score/CV4-Skip
+        symbol (the failure mode this whole investigation started
+        from) can no longer be a rotate target — but among symbols
+        that already clear Watch-or-better, norm_score's
+        responsiveness is kept as the tiebreaker on purpose."""
     if live_metrics is None or live_metrics.empty or "score" not in live_metrics.columns:
         return None
     exclude = held_symbols | excluded_symbols
     pool = live_metrics[~live_metrics["symbol"].astype(str).str.upper().isin(exclude)]
+    if "category" in pool.columns:
+        pool = pool[pool["category"].isin(_ROTATE_QUALIFYING_TIERS)]
     if pool.empty:
         return None
     pool = pool.sort_values("score", ascending=False)
