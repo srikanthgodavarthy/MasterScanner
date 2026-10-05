@@ -84,7 +84,7 @@ from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
 
-from utils.adaptive_target_engine import AdaptiveTargetParams, compute_adaptive_targets
+from utils.adaptive_target_engine import AdaptiveTargetParams, compute_adaptive_targets, target_category
 
 logger = logging.getLogger(__name__)
 
@@ -777,16 +777,13 @@ def close_plan_manually(plan: "SetupPlan", reason: str = "Manual exit") -> bool:
 # so the floor tier here is "Setup Building" (== Actionable's base
 # multiples), never "Avoid".
 def _target_category_for_live(leadership: int, conviction: int,
-                               entry_quality: int, extension: int) -> str:
-    if extension >= 60:
-        return "Extended"
-    if leadership >= 90 and conviction >= 90 and entry_quality >= 80 and extension <= 25:
-        return "Elite Opportunity"
-    if leadership >= 80 and conviction >= 80 and entry_quality >= 60 and extension <= 35:
-        return "High Conviction"
-    if leadership >= 70 and conviction >= 60 and entry_quality >= 60 and extension <= 40:
-        return "Actionable"
-    return "Setup Building"
+                               entry_quality: int, extension: int,
+                               thresholds: Optional[dict] = None) -> str:
+    # [Audit P0 #7, 2026-10-05] Thin wrapper over the single CV4-aligned
+    # definition in utils.adaptive_target_engine.target_category(); the
+    # hard-coded 90/90/80 | 80/80/60 | 70/60/60 copy that lived here (and in
+    # backtest_engine) had drifted from the CV4 tier floors.
+    return target_category(leadership, conviction, entry_quality, extension, thresholds)
 
 
 # ══════════════════════════════════════════════════════════════════

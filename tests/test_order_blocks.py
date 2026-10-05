@@ -71,12 +71,72 @@ def test_bullish_order_block_visible_as_mitigated_on_the_break_bar():
     assert bull_obs2[7].mitigated is True
 
 
-def test_bullish_order_block_clears_the_bar_after_mitigation():
+def test_bullish_order_block_clears_once_price_reclaims_distal():
+    """Bar 8 closes back above the distal line (108.8 > 99.5): the break is
+    undone, so the invalidation clears."""
     df = _bull_ob_df()
     df2 = df.copy()
     df2.loc[7, ["open", "high", "low", "close"]] = [100.0, 100.1, 98.5, 98.8]
     bull_obs2, _ = detect_order_blocks(df2, lb=1, lookback_bars=60)
-    assert bull_obs2[8] is None   # cleared one bar after the visible mitigation bar
+    assert bull_obs2[8] is None
+
+
+def _extend_below_distal(df, n_extra):
+    """Bar 7 breaks the OB (close 98.8 < distal 99.5); then n_extra more bars
+    that keep closing BELOW the distal line (no reclaim)."""
+    rows = [[100.0, 100.1, 98.5, 98.8]] + [[98.8, 99.0, 98.0, 98.5]] * n_extra
+    out = df.iloc[:7].copy()
+    add = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+    return pd.concat([out, add], ignore_index=True)
+
+
+def test_bullish_invalidation_persists_until_reclaimed():
+    """Audit P0 #5: STRUCTURAL_INVALIDATION used to be visible for exactly one
+    bar. A scan that did not run on the breach bar never saw it."""
+    df = _extend_below_distal(_bull_ob_df(), n_extra=6)
+    bull_obs, _ = detect_order_blocks(df, lb=1, lookback_bars=60)
+    for i in range(7, len(df)):
+        assert bull_obs[i] is not None, f"invalidation vanished at bar {i}"
+        assert bull_obs[i].mitigated is True
+
+
+def test_bullish_invalidation_reaches_the_classifier_on_a_later_bar():
+    from utils.smc_engine import classify_structural_state, STRUCTURAL_INVALIDATION
+    df = _extend_below_distal(_bull_ob_df(), n_extra=4)
+    bull_obs, _ = detect_order_blocks(df, lb=1, lookback_bars=60)
+    d = classify_structural_state(None, order_block=bull_obs[-1], thesis_direction=BULLISH)
+    assert d.state == STRUCTURAL_INVALIDATION
+
+
+def test_persistent_invalidation_still_ages_out():
+    df = _extend_below_distal(_bull_ob_df(), n_extra=12)
+    bull_obs, _ = detect_order_blocks(df, lb=1, lookback_bars=6)
+    assert bull_obs[-1] is None   # aged past lookback_bars
+
+
+def test_persistent_invalidation_is_replaced_by_a_fresh_bos():
+    df = _extend_below_distal(_bull_ob_df(), n_extra=2)
+    # a fresh bullish BOS on a new bar must replace the dead block outright
+    pad = pd.DataFrame([[98.4, 98.6, 97.9, 98.0],    # a down candle (new OB candle)
+                        [98.2, 120.0, 98.1, 119.0]], # displacement above the 102 pivot
+                       columns=["open", "high", "low", "close"])
+    df = pd.concat([df, pad], ignore_index=True)
+    bull_obs, _ = detect_order_blocks(df, lb=1, lookback_bars=60)
+    last = bull_obs[-1]
+    assert last is None or last.mitigated is False
+
+
+def test_bearish_invalidation_persists_until_reclaimed():
+    df = _bull_ob_df()
+    # mirror the whole frame around 200 so the bullish OB becomes a bearish one
+    m = pd.DataFrame({"open": 200 - df["open"], "high": 200 - df["low"],
+                      "low": 200 - df["high"], "close": 200 - df["close"]})
+    m = _extend_below_distal(df, 6)
+    m = pd.DataFrame({"open": 200 - m["open"], "high": 200 - m["low"],
+                      "low": 200 - m["high"], "close": 200 - m["close"]})
+    _, bear_obs = detect_order_blocks(m, lb=1, lookback_bars=60)
+    for i in range(7, len(m)):
+        assert bear_obs[i] is not None and bear_obs[i].mitigated is True
 
 
 def test_no_order_block_when_no_opposite_candle_within_lookback():

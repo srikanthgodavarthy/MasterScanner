@@ -1485,6 +1485,104 @@ def _conflict_sweep_break_modifier(smc_state, settings: Optional[dict] = None) -
     return 0.0
 
 
+# ══════════════════════════════════════════════════════════════════
+#  CV4 DE-DUPLICATION  (audit 2026-10-05, P1 #8-#13)
+# ══════════════════════════════════════════════════════════════════
+#
+# The audit's per-parameter sweep (the real _leadership_v4/_conviction_v4/
+# _entry_quality_v4 swept field by field) found the same underlying variable
+# scored in more than one pillar, so one market fact moved several pillars at
+# once and the three scores were not the "orthogonal" read §1.1 promises:
+#
+#   rs_momentum   Leadership RS (3)          AND Conviction RS (15)   -> kept in Conviction
+#   nifty regime  Leadership Market/Sector(7) AND Conviction Regime(10) -> kept in Conviction
+#   today's vol   Conviction Volume (10)     AND EQ Volume/Execution(10), identical on a
+#                 breakout (trigger max == today)                       -> kept in EQ
+#   CCI recovery  Conviction Setup/Pattern(3) AND EQ Momentum Timing   -> kept in EQ
+#   EMA20>EMA50   Leadership trend_up (6)    AND ema_alignment (6)     -> counted once
+#
+# Each duplicate is REMOVED from the pillar that does not own it, and the
+# surviving components of that pillar are scaled by k = 100 / (100 - removed)
+# so the pillar still spans 0-100 and the tier floors keep their meaning
+# (a perfect stock still scores 100; nothing is silently made harder). Every
+# surviving sub-score is scaled individually, so sub-scores still SUM to the
+# pillar total and the SMC ablation identity (total_off == total_on - smc
+# term) still holds exactly.
+#
+# Leadership additionally: the missing-sector credit is cut (was +9, now +5 —
+# see _SECTOR_MISSING_*), and the trend-persistence ladder no longer cliffs
+# to 0 for trends older than 100 bars.
+#
+# NOT BACKTEST-FIT: like the floors, the scale factors are arithmetic, not
+# fitted. Each change has a legacy switch (settings key = the name below, set
+# True to restore the old behaviour) so it can be A/B'd:
+CV4_LEGACY_DEFAULTS = {
+    "cv4_legacy_ls_rs_momentum":        False,  # True: rs_momentum also scored in Leadership RS (+3)
+    "cv4_legacy_ls_regime":             False,  # True: nifty regime also scored in Leadership Market/Sector (+7)
+    "cv4_legacy_ls_trend_overlap":      False,  # True: trend_up(6)+ema_alignment(6) double-count EMA20>EMA50
+    "cv4_legacy_cv_volume":             False,  # True: today's volume also scored in Conviction (+10)
+    "cv4_legacy_cv_cci":                False,  # True: CCI recovery/rising also scored in Conviction Setup (+3)
+    "cv4_legacy_ls_trend_age":          False,  # True: old ladder (0 pts for >100 bars, same as a new trend)
+    "cv4_legacy_sector_missing_credit": False,  # True: missing sector data earns 5+4=9 pts
+}
+_LS_REGIME_PTS, _LS_RS_MOMENTUM_PTS, _LS_TREND_OVERLAP_PTS = 7, 3, 2
+_CV_VOLUME_PTS, _CV_CCI_PTS = 10, 3
+
+# Missing sector data must not out-score an actual (even mediocre) sector read.
+# Credit = the "weak but not failing" rung of each ladder (rs_sector rsec>-0.0533
+# -> 3; market/sector rsec>-0.0533 -> 2), i.e. 5 total vs the legacy 9, which
+# beat every read below the median (and equalled a 59th-percentile read).
+SECTOR_MISSING_RS_PTS_DEFAULT  = 3
+SECTOR_MISSING_MKT_PTS_DEFAULT = 2
+_SECTOR_MISSING_LEGACY_RS_PTS, _SECTOR_MISSING_LEGACY_MKT_PTS = 5, 4
+
+
+def _legacy(settings: Optional[dict], key: str) -> bool:
+    return bool((settings or {}).get(key, CV4_LEGACY_DEFAULTS[key]))
+
+
+def cv4_weight_profile(settings: Optional[dict] = None) -> dict:
+    """Pillar scale factors implied by the active de-duplication switches.
+    With every legacy switch True this returns k=1 everywhere and the
+    pre-audit weights (Conviction non-SMC max 85)."""
+    ls_removed = ((0 if _legacy(settings, "cv4_legacy_ls_regime") else _LS_REGIME_PTS)
+                  + (0 if _legacy(settings, "cv4_legacy_ls_rs_momentum") else _LS_RS_MOMENTUM_PTS)
+                  + (0 if _legacy(settings, "cv4_legacy_ls_trend_overlap") else _LS_TREND_OVERLAP_PTS))
+    cv_removed = ((0 if _legacy(settings, "cv4_legacy_cv_volume") else _CV_VOLUME_PTS)
+                  + (0 if _legacy(settings, "cv4_legacy_cv_cci") else _CV_CCI_PTS))
+    ls_max, cv_max = 100 - ls_removed, 100 - cv_removed
+    cv_others_max = 85 - cv_removed                     # Conviction max WITHOUT the SMC term
+    return dict(
+        ls_removed=ls_removed, ls_max=ls_max, k_ls=100.0 / ls_max,
+        cv_removed=cv_removed, cv_max=cv_max, k_cv=100.0 / cv_max,
+        cv_others_max=cv_others_max,
+        # factor for cv4_smc_rescale_when_disabled: others (already scaled by
+        # k_cv) -> 0-100. Equals 100/85 when nothing is de-duplicated.
+        cv_rescale_factor=cv_max / cv_others_max,
+    )
+
+
+def _sc(value: float, k: float) -> int:
+    """Scale one sub-score by its pillar factor (rounded, never negative)."""
+    return max(0, int(round(value * k)))
+
+
+# Trend-persistence ladder (0-15 pts). Piecewise-linear through these knots so
+# there is no cliff: the old step ladder paid 0 for >100 bars — exactly what a
+# brand-new (<=5 bar) trend earned — and jumped 5 -> 15 at 21 bars. A mature
+# trend is still a trend; it is worth less than the sweet spot, not nothing.
+_TREND_AGE_KNOTS = ((0, 0.0), (5, 0.0), (20, 5.0), (30, 15.0), (50, 15.0), (100, 5.0), (200, 2.0))
+
+
+def _trend_persistence_pts(age: float) -> float:
+    if age <= _TREND_AGE_KNOTS[0][0]:
+        return _TREND_AGE_KNOTS[0][1]
+    for (x0, y0), (x1, y1) in zip(_TREND_AGE_KNOTS, _TREND_AGE_KNOTS[1:]):
+        if age <= x1:
+            return y0 + (y1 - y0) * (age - x0) / (x1 - x0)
+    return _TREND_AGE_KNOTS[-1][1]
+
+
 @dataclass
 class ConvictionV4:
     """Three orthogonal 0-100 scores (§1.1) — NOT averaged into one blended
@@ -1571,12 +1669,21 @@ class ConvictionV4:
 #  LEADERSHIP v4 (§1.2) — SMC is a modifier, never a requirement
 # ══════════════════════════════════════════════════════════════════
 
-def _leadership_v4(r: "BarResult", smc_state=None, swing_label: Optional[str] = None) -> tuple[int, dict]:
+def _leadership_v4(r: "BarResult", smc_state=None, swing_label: Optional[str] = None,
+                   settings: Optional[dict] = None) -> tuple[int, dict]:
     """
-    Returns (0-100, sub_scores_dict). Locked weights (§1.2):
+    Returns (0-100, sub_scores_dict). Nominal weights (§1.2):
       Relative Strength 30, Trend Strength 25, Trend Persistence 15,
       Market/Sector Leadership 15, Participation/Volume 10,
       Structural Price Quality 5.
+
+    [Audit 2026-10-05] Three inputs this pillar used to share with another
+    pillar are no longer scored here (rs_momentum -> Conviction, nifty regime
+    -> Conviction, and the EMA20>EMA50 condition is counted once instead of
+    twice across trend_up/ema_alignment); the surviving components are scaled
+    by cv4_weight_profile()["k_ls"] so the pillar still spans 0-100 and its
+    sub-scores still sum to the total. The nominal weights above are therefore
+    the LEGACY weights (restorable with the cv4_legacy_* switches).
 
     A stock with strong RS/sector-RS/trend/persistence/participation can
     reach 90+ with SMC fully NEUTRAL (§1.2) — SMC never subtracts from or
@@ -1591,6 +1698,8 @@ def _leadership_v4(r: "BarResult", smc_state=None, swing_label: Optional[str] = 
     # ── Relative Strength (0-30) — reuses v1's validated RS sub-ladder
     # (market12 + sector10 + consistency5 + momentum3 = 30), unchanged
     # math, just relabeled to this component's name. ──────────────────
+    prof = cv4_weight_profile(settings)
+    k = prof["k_ls"]
     rc = r.rs_composite
     if   rc > 0.15:  rs_market = 12
     elif rc > 0.10:  rs_market = 10
@@ -1600,11 +1709,24 @@ def _leadership_v4(r: "BarResult", smc_state=None, swing_label: Optional[str] = 
     elif rc > -0.03: rs_market = 2
     else:            rs_market = 0
 
+    # [Audit P0 #2, 2026-10-05] Missing sector data used to earn a flat 5 here
+    # PLUS a flat 4 in Market/Sector below = +9 free points, more than any
+    # sector read below the median (a genuinely bad read earns 0). Missing
+    # data is now credited at the "weak but not failing" rung (3 + 2 = 5), so
+    # it can never beat a neutral read and does not manufacture Leadership.
+    # Overridable: ls_sector_missing_rs_pts / ls_sector_missing_mkt_pts.
+    _cfg = settings or {}
+    if _legacy(settings, "cv4_legacy_sector_missing_credit"):
+        _miss_rs, _miss_mkt = _SECTOR_MISSING_LEGACY_RS_PTS, _SECTOR_MISSING_LEGACY_MKT_PTS
+    else:
+        _miss_rs = _cfg.get("ls_sector_missing_rs_pts", SECTOR_MISSING_RS_PTS_DEFAULT)
+        _miss_mkt = _cfg.get("ls_sector_missing_mkt_pts", SECTOR_MISSING_MKT_PTS_DEFAULT)
+
     # Percentile-rank-matched ladder — see _leadership()'s "RS vs Sector"
     # comment above for the full rationale; same calibration applied here
     # (2026-09-01, diagnostic.py RS vs Sector — Threshold Calibration).
     if not r.rs_sector_available:
-        rs_sector = 5
+        rs_sector = _miss_rs
     else:
         rsec = r.rs_vs_sector
         if   rsec > 0.0973:  rs_sector = 10  # matches 20.0% of stocks (was rsec > 0.15)
@@ -1616,21 +1738,36 @@ def _leadership_v4(r: "BarResult", smc_state=None, swing_label: Optional[str] = 
         else:                rs_sector = 0
 
     rs_consistency = round(r.rs_consistency * 5)
-    mom = r.rs_momentum
-    if   mom > 0.03: rs_momentum = 3
-    elif mom > 0.01: rs_momentum = 2
-    elif mom > 0.00: rs_momentum = 1
-    else:            rs_momentum = 0
+    # [Audit P1 #8] rs_momentum is Conviction's (15 pts, thesis-signed). Scoring
+    # it here too made one variable worth 18 pts across two pillars.
+    rs_momentum = 0
+    if _legacy(settings, "cv4_legacy_ls_rs_momentum"):
+        mom = r.rs_momentum
+        if   mom > 0.03: rs_momentum = 3
+        elif mom > 0.01: rs_momentum = 2
+        elif mom > 0.00: rs_momentum = 1
 
-    ls_rs = min(rs_market + rs_sector + rs_consistency + rs_momentum, 30)
+    ls_rs_raw = min(rs_market + rs_sector + rs_consistency + rs_momentum, 30)
 
     # ── Trend Strength (0-25) — SMC-independent trend-quality read: EMA
     # alignment/cloud position (structure) + ADX (quality) + EMA20 slope
     # (velocity). No sub-formula specified in §1.2 beyond the weight; this
     # blend mirrors v1's validated trend-quality signals. ──────────────
     ts = 0
-    if r.trend_up:        ts += 6
-    if r.ema_alignment:   ts += 6
+    if _legacy(settings, "cv4_legacy_ls_trend_overlap"):
+        if r.trend_up:        ts += 6
+        if r.ema_alignment:   ts += 6
+    else:
+        # [Audit P1 #12] trend_up (close>EMA200 & EMA20>EMA50) and
+        # ema_alignment (EMA20>EMA50 & EMA50 rising) both contain EMA20>EMA50;
+        # scoring both at 6 paid that one condition twice. It is now credited
+        # once (6, if either flag holds) and each flag adds only its OWN
+        # unique condition (2 each): max 10 instead of 12.
+        if r.trend_up or r.ema_alignment: ts += 6
+        if r.trend_up:                    ts += 2   # unique: close above EMA200
+        if r.ema_alignment:               ts += 2   # unique: EMA50 rising
+    # above_cloud / inside_cloud: independence from the EMA flags is still a
+    # HYPOTHESIS — measured by scripts/cv4_validation_audit.py before any change.
     if r.above_cloud:     ts += 5
     elif r.inside_cloud:  ts += 2
     adx = r.adx_val
@@ -1640,31 +1777,38 @@ def _leadership_v4(r: "BarResult", smc_state=None, swing_label: Optional[str] = 
     slope = r.ema20_slope
     if   slope > 0.3: ts += 2
     elif slope > 0:   ts += 1
-    ls_trend_strength = min(ts, 25)
+    ls_trend_strength_raw = min(ts, 25)
 
     # ── Trend Persistence (0-15) — same sweet-spot age ladder v1 used for
     # Leadership's Trend Age, rescaled 0-25 -> 0-15 (×0.6, locked-weight
     # rescale, not a re-derivation of the ladder shape). ────────────────
     age = r.trend_age_bars
-    if   age == 0:   age_raw = 0
-    elif age <= 5:   age_raw = 0
-    elif age <= 20:  age_raw = 8
-    elif age <= 50:  age_raw = 25   # sweet-spot
-    elif age <= 100: age_raw = 8
-    else:            age_raw = 0
-    ls_trend_persistence = round(age_raw * 0.6)   # 0-15
+    if _legacy(settings, "cv4_legacy_ls_trend_age"):
+        if   age == 0:   age_raw = 0
+        elif age <= 5:   age_raw = 0
+        elif age <= 20:  age_raw = 8
+        elif age <= 50:  age_raw = 25   # sweet-spot
+        elif age <= 100: age_raw = 8
+        else:            age_raw = 0    # <- cliff: same as a brand-new trend
+        ls_trend_persistence_raw = round(age_raw * 0.6)   # 0-15
+    else:
+        # [Audit P1 #13] continuous ladder, see _TREND_AGE_KNOTS.
+        ls_trend_persistence_raw = round(_trend_persistence_pts(age))
 
     # ── Market/Sector Leadership (0-15) — distinct from the raw RS number
     # above: rewards LEADERSHIP CONTEXT (regime alignment + genuine sector
     # standing), not the RS magnitude itself. No sub-formula specified in
     # §1.2 beyond the weight; documented design choice. ─────────────────
     mkt = 0
-    if r.nifty_regime_val == "bull" and r.trend_up:
-        mkt += 7
-    elif r.nifty_regime_val == "neutral":
-        mkt += 4
-    elif r.nifty_regime_val == "bear" and r.trend_up:
-        mkt += 1   # leading despite a hostile regime — real, but discounted
+    # [Audit P1 #9] Market regime is Conviction's (thesis-relative, 10 pts).
+    # Scoring it here as well meant a regime flip moved two pillars together.
+    if _legacy(settings, "cv4_legacy_ls_regime"):
+        if r.nifty_regime_val == "bull" and r.trend_up:
+            mkt += 7
+        elif r.nifty_regime_val == "neutral":
+            mkt += 4
+        elif r.nifty_regime_val == "bear" and r.trend_up:
+            mkt += 1   # leading despite a hostile regime — real, but discounted
     # Cutoffs below reuse the SAME percentile-rank mapping computed for
     # _leadership()'s RS-vs-Sector ladder (2026-09-01 diagnostic.py run):
     # this block's original 0.10/0.03/0.0 cutoffs are three of the six
@@ -1683,8 +1827,8 @@ def _leadership_v4(r: "BarResult", smc_state=None, swing_label: Optional[str] = 
         elif r.rs_vs_sector > -0.0533:
             mkt += 2
     else:
-        mkt += 4   # flat neutral credit, same convention as rs_sector above
-    ls_market_sector = min(mkt, 15)
+        mkt += _miss_mkt   # see the sector-missing note above (was a flat +4)
+    ls_market_sector_raw = min(mkt, 15)
 
     # ── Participation/Volume (0-10) — PERSISTENCE read, not a snapshot:
     # mean vol_ratio over the trailing 5 bars, distinct from Conviction's
@@ -1697,7 +1841,7 @@ def _leadership_v4(r: "BarResult", smc_state=None, swing_label: Optional[str] = 
     elif vr >= 1.2:  vol_raw = 5
     elif vr >= 1.0:  vol_raw = 2
     else:            vol_raw = 0
-    ls_participation = round(vol_raw * (10 / 15))
+    ls_participation_raw = round(vol_raw * (10 / 15))
 
     # ── Structural Price Quality (0-5) — EXACT split per §1.2: up to 3/5
     # from swing structure alone (HH/HL), independent of any SMC event;
@@ -1713,7 +1857,16 @@ def _leadership_v4(r: "BarResult", smc_state=None, swing_label: Optional[str] = 
         if smc_state.direction == existing_trend_dir and smc_state.direction != "NEUTRAL" \
                 and smc_state.evidence_tier >= 3:
             spq += 2
-    ls_structural_price_quality = min(spq, 5)
+    ls_structural_price_quality_raw = min(spq, 5)
+
+    # Scale every surviving component by the pillar factor (1.0 when nothing is
+    # de-duplicated) so the pillar still spans 0-100 and sub-scores sum to it.
+    ls_rs                       = _sc(ls_rs_raw, k)
+    ls_trend_strength           = _sc(ls_trend_strength_raw, k)
+    ls_trend_persistence        = _sc(ls_trend_persistence_raw, k)
+    ls_market_sector            = _sc(ls_market_sector_raw, k)
+    ls_participation            = _sc(ls_participation_raw, k)
+    ls_structural_price_quality = _sc(ls_structural_price_quality_raw, k)
 
     total = min(ls_rs + ls_trend_strength + ls_trend_persistence
                 + ls_market_sector + ls_participation + ls_structural_price_quality, 100)
@@ -1811,8 +1964,18 @@ def _conviction_v4(r: "BarResult", thesis_direction: str = "BULLISH", smc_state=
     thesis_direction: "BULLISH" or "BEARISH" — what this read is being
     scored FOR. Momentum/RS/Directional-Trend all flip sign for a bearish
     thesis (symmetric CE/PE, §1.3) rather than using abs().
+
+    [Audit 2026-10-05] Two inputs owned by Entry Quality are no longer scored
+    here: today's volume (EQ's Volume/Execution reads the trigger-bar max,
+    which IS today's volume on a breakout) and the CCI recovery/rising part of
+    Setup/Pattern (EQ's Momentum Timing scores the same CCI state). Surviving
+    components are scaled by cv4_weight_profile()["k_cv"] so the pillar still
+    spans 0-100. Nominal weights above are the LEGACY weights
+    (cv4_legacy_cv_volume / cv4_legacy_cv_cci restore them).
     """
     bullish = thesis_direction == "BULLISH"
+    prof = cv4_weight_profile(settings)
+    k = prof["k_cv"]
 
     # ── Directional Trend (0-20) — real-time directional-trend read, signed
     # by thesis. [TREND TRIPLE-COUNTING FIX, 2026-09-02 — explicit user
@@ -1860,13 +2023,16 @@ def _conviction_v4(r: "BarResult", thesis_direction: str = "BULLISH", smc_state=
     else:            cv_rs = 0
 
     # ── Volume/Participation (0-10) ──────────────────────────────────
-    vr = r.vol_ratio
-    if   vr >= 2.5:  cv_vol = 10
-    elif vr >= 2.0:  cv_vol = 8
-    elif vr >= 1.5:  cv_vol = 6
-    elif vr >= 1.2:  cv_vol = 3
-    elif vr >= 1.0:  cv_vol = 1
-    else:            cv_vol = 0
+    # [Audit P1 #10] Owned by Entry Quality (trigger-bar volume). Reported as 0
+    # unless the legacy switch restores it.
+    cv_vol = 0
+    if _legacy(settings, "cv4_legacy_cv_volume"):
+        vr = r.vol_ratio
+        if   vr >= 2.5:  cv_vol = 10
+        elif vr >= 2.0:  cv_vol = 8
+        elif vr >= 1.5:  cv_vol = 6
+        elif vr >= 1.2:  cv_vol = 3
+        elif vr >= 1.0:  cv_vol = 1
 
     # ── Market Regime, thesis-relative (0-10) — EXACT table §1.3 ───────
     cv_regime = _market_regime_score_v4(r, thesis_direction)
@@ -1880,7 +2046,8 @@ def _conviction_v4(r: "BarResult", thesis_direction: str = "BULLISH", smc_state=
     sp = 0
     if bullish:
         if r.in_golden or r.in_golden_relaxed: sp += 5
-        if r.recent_cci_recovery or r.cci_rising: sp += 3
+        # [Audit P1 #11] CCI recovery/rising is EQ Momentum Timing's input.
+        if _legacy(settings, "cv4_legacy_cv_cci") and (r.recent_cci_recovery or r.cci_rising): sp += 3
         if r.squeeze_release: sp += 2
         elif r.squeeze_on: sp += 1
     else:
@@ -1889,14 +2056,25 @@ def _conviction_v4(r: "BarResult", thesis_direction: str = "BULLISH", smc_state=
         elif r.squeeze_on: sp += 1
     cv_setup_pattern = min(sp, 10)
 
+    # Scale each surviving component (k == 1.0 when nothing is de-duplicated),
+    # so sub-scores still sum to the pillar total and the SMC ablation identity
+    # (total_off == total_on - cv_smc_confirmation) holds exactly.
+    cv_directional_trend = _sc(cv_directional_trend, k)
+    cv_momentum          = _sc(cv_momentum, k)
+    cv_rs                = _sc(cv_rs, k)
+    cv_vol               = _sc(cv_vol, k)
+    cv_regime            = _sc(cv_regime, k)
+    cv_smc               = _sc(cv_smc, k)
+    cv_setup_pattern     = _sc(cv_setup_pattern, k)
+
     # cv4_smc_scoring_enabled / cv4_smc_rescale_when_disabled — see the block above
     # CV4_SMC_SCORING_ENABLED_DEFAULT. cv_smc is reported either way.
     _smc_on, _smc_rescaled = _smc_mode(settings)
-    _others = cv_directional_trend + cv_momentum + cv_rs + cv_vol + cv_regime + cv_setup_pattern  # max 85
+    _others = cv_directional_trend + cv_momentum + cv_rs + cv_vol + cv_regime + cv_setup_pattern
     if _smc_on:
         total = min(_others + cv_smc, 100)
     elif _smc_rescaled:
-        total = min(round(_others * (100 / 85)), 100)   # reweighting, NOT an ablation
+        total = min(round(_others * prof["cv_rescale_factor"]), 100)   # reweighting, NOT an ablation
     else:
         total = _others                                  # pure ablation: total_on - cv_smc
 
@@ -1915,7 +2093,8 @@ def _conviction_v4(r: "BarResult", thesis_direction: str = "BULLISH", smc_state=
 #  ENTRY QUALITY v4 (§1.4) — SMC's strongest influence
 # ══════════════════════════════════════════════════════════════════
 
-def smc_entry_structure_score(smc_state, thesis_direction: str = "BULLISH") -> int:
+def smc_entry_structure_score(smc_state, thesis_direction: str = "BULLISH",
+                              gate_owns_failed_zone: bool = False) -> int:
     """EXACT formula per §1.4. FAST freshness decay (a stale entry
     contributes nothing to "enter now") — see smc_freshness.py.
 
@@ -1954,6 +2133,14 @@ def smc_entry_structure_score(smc_state, thesis_direction: str = "BULLISH") -> i
         return 0
     base = {0: 0, 1: 4, 2: 10, 3: 16, 4: 20}[smc_state.evidence_tier]
     retest_adj = {"none": 0, "in_zone": 5, "through_unfilled": -3, "through_filled": -8}[smc_state.fvg_retest]
+    # [Audit P0 #6, 2026-10-05] ONE consequence per event. A failed zone
+    # (through_filled) used to be punished three times: here (-8), again in
+    # the extension penalty's FVG-distance term, and by the Watch cap. When
+    # the structural gate is active it OWNS this event (the cap is the
+    # consequence), so the score stops also charging for it; when the gate is
+    # switched off (A/B) the -8 stays, so the event is never free.
+    if gate_owns_failed_zone and smc_state.fvg_retest == "through_filled":
+        retest_adj = 0
     raw = max(0, min(base + retest_adj, 25))
     return round(max(0, min(raw * entry_freshness_multiplier(smc_state.age_bars), 25)))
 
@@ -1995,7 +2182,10 @@ def _entry_quality_v4(r: "BarResult", smc_state=None, current_price: Optional[fl
 
     # ── SMC Entry Structure (0-25) — EXACT formula §1.4, direction-gated
     # (SMC pillar inconsistency fix, 2026-09-02 — see docstring above) ──
-    eq_smc_entry_structure = smc_entry_structure_score(smc_state, thesis_direction)
+    eq_smc_entry_structure = smc_entry_structure_score(
+        smc_state, thesis_direction,
+        gate_owns_failed_zone=bool((settings or {}).get("smc_structural_gate_enabled", True)),
+    )
 
     # ── Price Location (0-15) — pivot/fib positioning, timing not trend.
     # Golden-zone term uses in_golden_near/in_golden_relaxed_near (1x pvt_lb
@@ -2274,7 +2464,8 @@ def compute_conviction_v4(
     settings : optional; forwarded to classify_tier_v4()/_classify_v4() as
         threshold overrides (V4_THRESHOLD_DEFAULTS, NOT BACKTEST-FIT).
     """
-    leadership,    ls_subs = _leadership_v4(r, smc_state=smc_state, swing_label=swing_label)
+    leadership,    ls_subs = _leadership_v4(r, smc_state=smc_state, swing_label=swing_label,
+                                            settings=settings)
     conviction,    cv_subs = _conviction_v4(r, thesis_direction=thesis_direction, smc_state=smc_state,
                                              settings=settings)
     entry_quality, eq_subs = _entry_quality_v4(r, smc_state=smc_state, current_price=current_price,

@@ -39,7 +39,7 @@ from utils.conviction_score_v1 import (
     gate_scores_with_experimental_modifier,
 )
 from utils.scoring_core   import ScoringParams, IndicatorArrays, build_indicators, compute_bar
-from utils.adaptive_target_engine import AdaptiveTargetParams, compute_adaptive_targets, check_momentum_exit
+from utils.adaptive_target_engine import AdaptiveTargetParams, compute_adaptive_targets, check_momentum_exit, target_category, compute_traded_geometry
 from utils.trade_levels import evaluate_bar_crossing, LevelCheck
 from utils.structural_levels import structural_ceiling
 from utils.regime_engine  import (
@@ -169,33 +169,13 @@ def fetch_all_bt_data(symbols: list, years: int = 3, progress_cb=None,
 # ══════════════════════════════════════════════════════════════════
 
 def _target_category_for_backtest(leadership: int, conviction: int,
-                                   entry_quality: int, extension: int) -> str:
-    """
-    Target-tier label for compute_adaptive_targets(), scoped to trades that
-    have ALREADY cleared the ADMISSION GATE above (classify_tier_v4()=="
-    Actionable" OR _classify_v4() in EXECUTE/ELITE, AND RR >= 2.0).
-
-    decision_engine._classify_category() is NOT used here on purpose: its
-    lowest non-"Avoid" bucket requires Leadership >= 70 and Conviction >= 50
-    -- stricter than this gate's floor -- so most gate-passed trades fell
-    through to "Avoid" and got the tightest target tier (T1=1.25R) despite
-    having already been judged good enough to trade. That function is still
-    correct for the live scanner, which classifies the *entire* universe
-    (including stocks that would never pass this gate); it's just the wrong
-    tool once a binary pass/fail admission decision has already been made.
-
-    Anything reaching this function passed the gate, so the floor tier here
-    is "Setup Building" (== Actionable's base multiples), never "Avoid".
-    """
-    if extension >= 60:
-        return "Extended"
-    if leadership >= 90 and conviction >= 90 and entry_quality >= 80 and extension <= 25:
-        return "Elite Opportunity"
-    if leadership >= 80 and conviction >= 80 and entry_quality >= 60 and extension <= 35:
-        return "High Conviction"
-    if leadership >= 70 and conviction >= 60 and entry_quality >= 60 and extension <= 40:
-        return "Actionable"
-    return "Setup Building"
+                                   entry_quality: int, extension: int,
+                                   thresholds: dict | None = None) -> str:
+    """Thin wrapper over utils.adaptive_target_engine.target_category() — the
+    single CV4-aligned definition (audit P0 #7, 2026-10-05). Anything reaching
+    this has already cleared the admission gate, so the floor tier is "Setup
+    Building" (Actionable's base multiples), never "Avoid"."""
+    return target_category(leadership, conviction, entry_quality, extension, thresholds)
 
 
 def generate_signals_historical(
@@ -427,6 +407,25 @@ def generate_signals_historical(
             _risk_amt = max(_entry - _sl, 0.001)
             _reward   = _t2 - _entry if _t2 > _entry else (_t1 - _entry if _t1 > _entry else 0)
             _rr       = round(_reward / _risk_amt, 2) if _risk_amt > 0 else 0.0
+            _rr_fixed = _rr
+            # [Audit P0 #3, 2026-10-05] Gate 3 below used to test scoring_core's
+            # fixed T2 geometry (R:R >= 3.08 by construction => POOR_RR could
+            # never fire), while the trade below is simulated on the ADAPTIVE
+            # targets. Gate on the traded geometry instead; fall back to the
+            # fixed value only when no valid traded geometry exists (adaptive
+            # disabled / entry <= SL), which is then the geometry actually used.
+            try:
+                _tg = compute_traded_geometry(
+                    entry_ref=round(r.entry * 1.005, 2), sl=r.sl,
+                    leadership=_ls_val, conviction=_cv_val, entry_quality=_eq_val,
+                    extension=_ext_fn(r)[0], trend_age_bars=r.trend_age_bars,
+                    extension_score_atr=r.extension_score_atr,
+                    ema20_pct_dist=r.ema20_pct_dist, settings=settings or {},
+                )
+            except Exception:
+                _tg = None
+            if _tg is not None:
+                _rr = _tg.rr_t2
 
             # Gate 2: admission — same verdict the live Scanner would show.
             # base_tier=="Actionable" is the base funnel's own floor; the
@@ -495,7 +494,15 @@ def generate_signals_historical(
         # for this call so "today" inside evaluate_promotion() really
         # means bar i, not the end of the dataset.
         _bypass_promoted = False
-        if _rejection_reason.startswith("BELOW_ACTIONABLE"):
+        # [Audit P0 #1] same Leadership floor / kill-switch as the live Scanner
+        # (utils.scanner_engine.PROMO_BYPASS_MIN_LEADERSHIP_DEFAULT).
+        _bp_cfg = settings or {}
+        _bypass_allowed = (
+            bool(_bp_cfg.get("promo_bypass_enabled", True))
+            and _cv1 is not None
+            and _cv1.leadership >= _bp_cfg.get("promo_bypass_min_leadership", 50)
+        )
+        if _rejection_reason.startswith("BELOW_ACTIONABLE") and _bypass_allowed:
             from utils.promotion_engine import evaluate_promotion as _eval_promo_bypass
 
             class _CausalIA:
@@ -508,6 +515,7 @@ def generate_signals_historical(
             _promo_bypass = _eval_promo_bypass(
                 r, _base_tier, ia=_ia_causal, settings=settings or {},
                 bypass_tier_gate=True,
+                risk_reward_override=_rr if _rr and _rr > 0 else None,
             )
             if _promo_bypass.promoted:
                 _bypass_promoted = True
@@ -557,7 +565,7 @@ def generate_signals_historical(
         # ── v12: Adaptive targets ────────────────────────────────
         _at_params   = AdaptiveTargetParams.from_settings(settings or {})
         _ext_score   = _ext_fn(r)[0]
-        _category    = _target_category_for_backtest(_ls_val, _cv_val, _eq_val, _ext_score)
+        _category    = _target_category_for_backtest(_ls_val, _cv_val, _eq_val, _ext_score, settings)
         if _at_params.enabled:
             _entry_pad = round(r.entry * 1.005, 2)
             _risk      = max(_entry_pad - r.sl, 0.01)
@@ -676,6 +684,15 @@ def generate_signals_historical(
             "rs_val":          r.rs_val,
             "rs3":             r.rs3,
             "rs_composite":    r.rs_composite,
+            # [Audit 2026-10-05, additive diagnostics — no scoring effect] raw
+            # inputs needed by scripts/cv4_validation_audit.py to test the
+            # "validate before removal" items (#16 rs_vs_sector, #17 EMA/cloud).
+            "rs_vs_sector":        r.rs_vs_sector,
+            "rs_sector_available": r.rs_sector_available,
+            "trend_up":            r.trend_up,
+            "ema_alignment":       r.ema_alignment,
+            "above_cloud":         r.above_cloud,
+            "inside_cloud":        r.inside_cloud,
             "rs_top_decile":   r.rs_top_decile,
             "fresh_base":      r.fresh_base_breakout,
             "trend_age_bars":  r.trend_age_bars,
@@ -1585,6 +1602,12 @@ def simulate_trades(
             "rs_val":          float(sig.get("rs_val", 0.0)),
             "rs3":             float(sig.get("rs3", 0.0)),
             "rs_composite":    float(sig.get("rs_composite", 0.0)),
+            "rs_vs_sector":        float(sig.get("rs_vs_sector", 0.0) or 0.0),
+            "rs_sector_available": bool(sig.get("rs_sector_available", False)),
+            "trend_up":            bool(sig.get("trend_up", False)),
+            "ema_alignment":       bool(sig.get("ema_alignment", False)),
+            "above_cloud":         bool(sig.get("above_cloud", False)),
+            "inside_cloud":        bool(sig.get("inside_cloud", False)),
             "rs_top_decile":   bool(sig.get("rs_top_decile", False)),
             "fresh_base":      bool(sig.get("fresh_base", False)),
             "trend_age_bars":  int(sig.get("trend_age_bars", 0)),

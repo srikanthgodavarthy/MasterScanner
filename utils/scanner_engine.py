@@ -1703,6 +1703,20 @@ RECOMMENDATION_RANK = {name: i for i, name in enumerate(RECOMMENDATION_LADDER)}
 # vocabulary is MasterScanner-specific) rather than in
 # utils.smc_engine.classify_structural_state() (direction/evidence-only,
 # app-agnostic).
+# Leadership floor for the universe-wide promo bypass (audit P0 #1, 2026-10-05).
+PROMO_BYPASS_MIN_LEADERSHIP_DEFAULT = 50
+
+
+def promo_bypass_allowed(leadership: float, settings: Optional[dict] = None) -> bool:
+    """May the universe-wide promo bypass be evaluated for a stock with this
+    Leadership? Shared by the live Scanner (score_stock) so the rule lives in
+    one place; backtest_engine applies the identical rule inline."""
+    cfg = settings or {}
+    if not bool(cfg.get("promo_bypass_enabled", True)):
+        return False
+    return leadership >= cfg.get("promo_bypass_min_leadership", PROMO_BYPASS_MIN_LEADERSHIP_DEFAULT)
+
+
 def apply_smc_structural_gate(
     final_tier: str, smc_state, order_block, thesis_direction: str | None = None,
     conflict_caps_tier: bool = True,
@@ -1755,7 +1769,8 @@ def apply_smc_structural_gate(
     from utils.smc_engine import (
         classify_structural_state, BULLISH,
         STRUCTURAL_INVALIDATION, STRUCTURAL_CONFLICT,
-        STRUCTURAL_EXTENDED_CHASING, STRUCTURAL_WAIT_FOR_RETEST,
+        STRUCTURAL_EXTENDED_CHASING, STRUCTURAL_ZONE_FAILED,
+        STRUCTURAL_WAIT_FOR_RETEST,
     )
     try:
         decision = classify_structural_state(
@@ -1768,7 +1783,8 @@ def apply_smc_structural_gate(
     cap = {
         STRUCTURAL_INVALIDATION:     "Skip",
         STRUCTURAL_CONFLICT:         "Watch",
-        STRUCTURAL_EXTENDED_CHASING: "Watch",
+        STRUCTURAL_EXTENDED_CHASING: "Watch",   # legacy label, kept so old rows still map
+        STRUCTURAL_ZONE_FAILED:      "Watch",   # price closed through the whole FVG (was mislabelled EXTENDED_CHASING)
         STRUCTURAL_WAIT_FOR_RETEST:  "Developing",
     }.get(decision.state)
 
@@ -2367,6 +2383,10 @@ def score_stock(
             "BarsSince":     ds.bars_since_setup,
             "MoveSince":     ds.price_move_since_setup,
             "EMA20Dist":     ds.ema20_pct_dist,
+            # [Audit, 2026-10-05] Was never written, yet setup_persistence's
+            # adaptive targets read it (default 0 == "Fresh" -> +0.25R on EVERY
+            # live plan; the "Extended" -0.5R could never fire).
+            "ExtScoreATR":   getattr(r, "extension_score_atr", 0),
             "EMA50Dist":     ds.ema50_pct_dist,
             "PivotDist":     ds.pivot_high_dist,
             # Sub-scores stored as internals for detail view
@@ -2457,13 +2477,49 @@ def score_stock(
         # floor. A stock can reach Execute/Elite here on stochastic +
         # VWAP + LL + volume signals alone. See promotion_engine.py's
         # `bypass_tier_gate` docstring.
-        _promo_bypass = evaluate_promotion(
-            r, base_tier, ia=ia, settings=settings or {}, bypass_tier_gate=True
-        )
-        if _promo_bypass.bypassed and _promo_bypass.promoted:
+        # [Audit P0 #1, 2026-10-05] The bypass is now floored on Leadership.
+        # With no floor, any two of four timing signals (stoch<=40 re-ignition,
+        # defended LL spring, VWAP reclaim, volume) lifted a base-Skip stock to
+        # Execute — those are all bounce signatures, i.e. bottom-fishing in weak
+        # stocks, with only the SMC gate left as a guard. Leadership >= 50 keeps
+        # the bypass for stocks that are at least mid-pack leaders (the case the
+        # 2026-07-29 change was meant for) and shuts out the weak tail.
+        # promo_bypass_min_leadership=0 restores the old "no floor" behaviour;
+        # promo_bypass_enabled=False turns the bypass off entirely (A/B arm).
+        # Measure it with the AdmittedViaPromoBypass column below.
+        _cfg = settings or {}
+        _bypass_allowed = promo_bypass_allowed(cv1.leadership, _cfg)
+
+        # [Audit P0 #3] R:R on the geometry that will really be traded.
+        _traded_rr = None
+        try:
+            from utils.adaptive_target_engine import compute_traded_geometry
+            _tg = compute_traded_geometry(
+                entry_ref=float(getattr(r, "entry", 0) or 0), sl=float(getattr(r, "sl", 0) or 0),
+                leadership=cv1.leadership, conviction=cv1.conviction,
+                entry_quality=cv1.entry_quality,
+                extension=int(getattr(ds, "extension", 0) or 0) if ds is not None else 0,
+                trend_age_bars=int(getattr(r, "trend_age_bars", 0) or 0),
+                extension_score_atr=int(getattr(r, "extension_score_atr", 0) or 0),
+                ema20_pct_dist=float(getattr(r, "ema20_pct_dist", 0.0) or 0.0),
+                settings=_cfg,
+            )
+            if _tg is not None:
+                _traded_rr = _tg.rr_t2
+        except Exception:
+            _traded_rr = None   # fall back to fixed geometry (what is traded when adaptive is off)
+
+        _promo_bypass = None
+        if _bypass_allowed:
+            _promo_bypass = evaluate_promotion(
+                r, base_tier, ia=ia, settings=_cfg, bypass_tier_gate=True,
+                risk_reward_override=_traded_rr,
+            )
+        if _promo_bypass is not None and _promo_bypass.bypassed and _promo_bypass.promoted:
             promo = _promo_bypass
         else:
-            promo = evaluate_promotion(r, base_tier, ia=ia, settings=settings or {})
+            promo = evaluate_promotion(r, base_tier, ia=ia, settings=_cfg,
+                                       risk_reward_override=_traded_rr)
 
         # ── STRUCTURAL GATE (opt-in — default False for A/B backtesting) ──
         # Decision Engine computes hard structural failure conditions and
@@ -2647,7 +2703,14 @@ def score_stock(
         # carried it. Distinguish these in any UI/export that cares —
         # they never had Leadership/Conviction/Entry Quality vetted.
         result["PromotedByBypass"]   = bool(promo.bypassed and promo.promoted)
+        # Stricter than PromotedByBypass: the bypass is what actually decided
+        # the outcome (promo rank strictly beats both the base tier and the
+        # natural class). This is the population the A/B should measure.
+        result["AdmittedViaPromoBypass"] = bool(
+            promo.bypassed and promo.promoted and promo_rank > max(base_rank, natural_rank)
+        )
         result["PromoRR"]            = promo.risk_reward
+        result["PromoRRBasis"]       = promo.risk_reward_basis
         result["Promo_StochUp"]      = promo.stoch_up
         result["Promo_LLConfirmed"]  = promo.ll_confirmed
         result["Promo_VWAPReversal"] = promo.vwap_reversal

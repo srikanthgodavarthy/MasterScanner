@@ -377,7 +377,15 @@ DORE_DEFAULTS: dict = {
     "risk_premium_stop_min_pct":  15.0,   # stop can never be closer than this % of premium (was the ~0 bug)
     "risk_premium_stop_max_pct":  60.0,   # stop can never be further than this % of premium
     "risk_rr_min":                 1.5,   # minimum acceptable Reward:Risk on Target 1
-    "risk_rr_good":                2.5,   # R:R at/above this scores a full 100
+    "risk_rr_good":                2.5,   # (legacy) T1-based full-score R:R — see risk_rr_t2_full
+    # [Audit P1 #15, 2026-10-05] Target1 is BUILT at exactly 1.5x the stop, so a
+    # T1-based score with risk_rr_min=1.5 was 0 for ~97% of plans: the 35%-weight
+    # R:R term of Risk Quality never contributed and capped it at 65. The term now
+    # scores Target2's R:R: risk_rr_min (T1's built multiple) -> 0, this value
+    # (T2's built multiple, 3.0x) -> 100. It moves only when a real OI wall pulls
+    # a target in below its fixed multiple, i.e. it measures how much of the
+    # planned reward survives the option chain's structure.
+    "risk_rr_t2_full":             3.0,
     "risk_theta_days_scalp_max":     1,   # days-to-expiry <= this = meaningful theta-decay exposure
     "risk_liquidity_min_oi":    50_000,   # OI floor reused as a risk (exit-cleanly) factor
     "risk_spread_max_pct":         3.0,   # spread ceiling reused as a risk (exit-cleanly) factor
@@ -613,6 +621,7 @@ class DORESettings:
     risk_premium_stop_max_pct: float = 60.0
     risk_rr_min: float = 1.5
     risk_rr_good: float = 2.5
+    risk_rr_t2_full: float = 3.0
     risk_theta_days_scalp_max: int = 1
     risk_liquidity_min_oi: float = 50_000
     risk_spread_max_pct: float = 3.0

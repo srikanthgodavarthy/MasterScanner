@@ -44,7 +44,16 @@ W_EMA20_DISTANCE      = 20
 W_PIVOT_DISTANCE      = 15
 W_BARS_SINCE_TRIGGER  = 15
 W_FVG_ZONE_DISTANCE   = 15
-W_EXPANSION_MAGNITUDE = 10
+# [Audit P1 #14, 2026-10-05] W_EXPANSION_MAGNITUDE (10) and its component were
+# DELETED. They were backed by BarResult.atr_expansion_ratio, which no production
+# code ever assigned (default 1.0 -> always 0 points), so the six-factor model
+# was really five factors whose weights sum to 90, not 100. (Its legacy alias
+# key "ex_momentum" is still returned, as a constant 0, because
+# decision_engine.DecisionScores reads it.) Deleting is
+# output-identical; severity was already capped at 90 before the trend-phase
+# modifiers. The weights are deliberately NOT rescaled to 100 — that would inflate
+# every severity by 11% and silently re-tune Extension. If an ATR-expansion read is
+# wanted, wire a real ratio AND validate it (scripts/cv4_validation_audit.py).
 
 
 def _atr_extension_component(r: "BarResult") -> int:
@@ -116,6 +125,15 @@ def _fvg_zone_distance_component(r: "BarResult", smc_state: Optional["SMCState"]
     symbol SMC has no opinion on)."""
     if smc_state is None or smc_state.fvg_high is None or smc_state.fvg_low is None:
         return 0
+    # [Audit P0 #6, 2026-10-05] A through_filled zone is a FAILED zone, not a
+    # chase: price is on the far side of it after closing through it. That
+    # event is already charged by smc_entry_structure_score()'s retest term
+    # (or, with the structural gate on, by the Watch cap). Charging distance
+    # from it here as well was the third penalty for one event. Distance from
+    # a zone price has run AWAY from (through_unfilled) is genuine chase risk
+    # and is still measured.
+    if getattr(smc_state, "fvg_retest", None) == "through_filled":
+        return 0
     price = current_price if current_price is not None else getattr(r, "entry_ref", None) or getattr(r, "entry", 0.0)
     if not price:
         return 0
@@ -131,21 +149,6 @@ def _fvg_zone_distance_component(r: "BarResult", smc_state: Optional["SMCState"]
     return W_FVG_ZONE_DISTANCE
 
 
-def _expansion_magnitude_component(r: "BarResult") -> int:
-    """Recent expansion magnitude (0-10) — how much recent volatility has
-    expanded vs its baseline. Backed by `atr_expansion_ratio` (new,
-    additive BarResult field — see scoring_core.py). Not yet populated by
-    compute_bar()'s indicator pipeline as of Phase 2; defaults to 1.0
-    (neutral / no expansion) until that wiring is scheduled, so this
-    factor degrades gracefully to 0 rather than fabricating a penalty."""
-    ratio = getattr(r, "atr_expansion_ratio", 1.0)
-    if ratio <= 1.3:
-        return 0
-    if ratio <= 1.8:
-        return round(W_EXPANSION_MAGNITUDE * 0.5)
-    return W_EXPANSION_MAGNITUDE
-
-
 def compute_extension_penalty(
     r: "BarResult",
     smc_state: Optional["SMCState"] = None,
@@ -154,7 +157,7 @@ def compute_extension_penalty(
     """
     Single shared Extension/Chase Risk measurement (§1.4/§2).
 
-    Returns a dict with the six named sub-factors, a canonical
+    Returns a dict with the five named sub-factors, a canonical
     `severity_0_100` (higher = more extended/chase risk = avoid), the
     trend-phase modifier and fresh-base hard cap applied (moved in from
     the pre-existing `_extension()` so both consumers get the same
@@ -167,9 +170,8 @@ def compute_extension_penalty(
     pivot    = _pivot_distance_component(r)
     bars     = _bars_since_trigger_component(r)
     fvg_dist = _fvg_zone_distance_component(r, smc_state, current_price)
-    expand   = _expansion_magnitude_component(r)
 
-    total = atr_ext + ema20 + pivot + bars + fvg_dist + expand
+    total = atr_ext + ema20 + pivot + bars + fvg_dist
 
     # Trend-phase modifier (moved in from the pre-existing _extension()).
     trend_phase = getattr(r, "trend_phase", "NONE")
@@ -193,7 +195,6 @@ def compute_extension_penalty(
         "pivot_distance":       pivot,
         "bars_since_trigger":   bars,
         "fvg_zone_distance":    fvg_dist,
-        "expansion_magnitude":  expand,
         "severity_0_100":       total,
         # legacy aliases consumed by decision_engine.DecisionScores today —
         # approximate mappings, documented in the change summary.
@@ -204,6 +205,6 @@ def compute_extension_penalty(
         "ex_bars_since":  bars,
         "ex_ema_dist":    ema20,
         "ex_trend_phase": (20 if trend_phase == "EXTENDED" else (15 if trend_phase == "NONE" else 0)),
-        "ex_momentum":    expand,
+        "ex_momentum":    0,            # was the expansion factor (always 0 — see W_ note above); key kept for decision_engine
         "ex_days":        bars,
     }

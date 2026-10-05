@@ -73,6 +73,23 @@ PARAMETERS (all overridable via settings dict)
   adaptive_t1_floor         float  1.0    — absolute minimum T1 multiple
   adaptive_t1_ceiling       float  3.0    — absolute maximum T1 multiple
   max_adjustment            float  0.75   — cap on total context adjustment
+  adaptive_trend_age_bonus  bool   False  — the "+0.25R when trend_age < 40" adjustor
+                                            (OFF since the 2026-10-05 audit: it rewarded
+                                            exactly the young trends Leadership's Trend
+                                            Persistence scores 0 for — see the note at
+                                            the adjustor below)
+
+AUDIT 2026-10-05 (see docs/CV4_AUDIT_FIXES.md)
+──────────────────────────────────────────────
+  * target_category() is the ONE place a (Leadership, Conviction, Entry Quality,
+    Extension) tuple becomes a target tier, and it now uses the CV4 tier floors
+    (conviction_score_v1.v4_tier_passes). The old hard-coded 90/90/80 "Elite
+    Opportunity" test needed Conviction >= 90, above the 85 ceiling a stock
+    without SMC evidence can reach, so a CV4-Elite stock landed in "High
+    Conviction" and the Elite targets were unreachable.
+  * compute_traded_geometry() builds the targets a plan will actually trade, so
+    the Promotion Engine's R:R gate can be evaluated on them instead of on the
+    fixed 1.5R/3R/5R geometry that the live path replaces afterwards.
 """
 
 from __future__ import annotations
@@ -111,6 +128,7 @@ class AdaptiveTargetParams:
     t1_floor:               float = 1.00   # absolute minimum T1 multiple
     t1_ceiling:             float = 3.00   # absolute maximum T1 multiple
     max_adjustment:         float = 0.75   # total delta cap in either direction
+    trend_age_bonus:        bool  = False  # "+0.25R when trend_age < 40" — off since the 2026-10-05 audit
 
     @classmethod
     def from_settings(cls, s: dict) -> "AdaptiveTargetParams":
@@ -120,6 +138,7 @@ class AdaptiveTargetParams:
             t1_floor              = float(s.get("adaptive_t1_floor",        1.00)),
             t1_ceiling            = float(s.get("adaptive_t1_ceiling",      3.00)),
             max_adjustment        = float(s.get("adaptive_max_adjustment",  0.75)),
+            trend_age_bonus       = bool(s.get("adaptive_trend_age_bonus",  False)),
         )
 
 
@@ -207,7 +226,15 @@ def compute_adaptive_targets(
         reasons.append(f"ExtScore={extension_score_atr}(Extended) → -0.5R")
 
     # ── 3. Context adjustments (increase) ───────────────────────
-    if trend_age_bars < 40:
+    # [Audit 2026-10-05] OFF by default. This stretched targets for young
+    # trends (< 40 bars), while Leadership's Trend Persistence pays 0 points
+    # for a trend of <= 5 bars and only ramps to its maximum by ~30: the two
+    # layers disagreed about whether a young trend is a strength. The live
+    # record sided with Leadership — 0 of 61 closed plans ever hit T1 at 1.5R,
+    # and a typical fresh Actionable was being given 2.0R/4.0R/6.7R. Switch on
+    # with settings["adaptive_trend_age_bonus"] only if a backtest says so
+    # (scripts/cv4_validation_audit.py reports the evidence).
+    if params.trend_age_bonus and trend_age_bars < 40:
         delta += _STEP
         reasons.append(f"TrendAge<{trend_age_bars}b → +0.25R")
 
@@ -246,6 +273,112 @@ def compute_adaptive_targets(
         category  = category,
         adjustment= round(delta, 3),
         reasons   = reasons,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+#  TARGET CATEGORY  (single definition, CV4-aligned)
+# ══════════════════════════════════════════════════════════════════
+
+# Extension ceilings per tier — unchanged from the pre-audit tables. Extension
+# is still a separate read from Entry Quality's chase-risk points, so a stock
+# can clear a tier's L/C/E floors yet be too stretched to deserve its targets.
+_EXT_CAP_ELITE, _EXT_CAP_HIGH, _EXT_CAP_ACTIONABLE, _EXT_EXTENDED = 25, 35, 40, 60
+
+
+def target_category(leadership: int, conviction: int, entry_quality: int, extension: int,
+                    thresholds: dict | None = None) -> str:
+    """
+    Target tier for compute_adaptive_targets(), derived from the CV4 tier floors.
+
+    Mapping: CV4 Elite -> "Elite Opportunity", CV4 Execute -> "High Conviction",
+    CV4 Actionable -> "Actionable", otherwise "Setup Building" (== Actionable's
+    base multiples). ``extension >= 60`` is "Extended" regardless.
+
+    [Audit P0 #7, 2026-10-05] This replaces two byte-identical copies
+    (backtest_engine._target_category_for_backtest and
+    setup_persistence._target_category_for_live) that hard-coded
+    90/90/80 | 80/80/60 | 70/60/60 — thresholds that had drifted away from the
+    CV4 floors (Elite 85/75/80, Execute 80/70/70, Actionable 70/60/60). In
+    particular "Elite Opportunity" required Conviction >= 90, which a stock
+    with no SMC evidence cannot reach (its Conviction ceiling is 85), so a
+    stock the classifier called Elite was given High Conviction targets.
+
+    ``thresholds`` takes the same settings dict classify_tier_v4() accepts
+    (v4_* keys), so a re-calibrated floor moves the target tiers with it.
+    """
+    # Imported lazily: conviction_score_v1 is numpy-light and Streamlit-free, but
+    # this module is imported at load by setup_persistence (headless scheduler).
+    from utils.conviction_score_v1 import v4_tier_passes
+
+    if extension >= _EXT_EXTENDED:
+        return "Extended"
+    if extension <= _EXT_CAP_ELITE and v4_tier_passes("elite", leadership, conviction, entry_quality, thresholds):
+        return "Elite Opportunity"
+    if extension <= _EXT_CAP_HIGH and v4_tier_passes("execute", leadership, conviction, entry_quality, thresholds):
+        return "High Conviction"
+    if extension <= _EXT_CAP_ACTIONABLE and v4_tier_passes("actionable", leadership, conviction, entry_quality, thresholds):
+        return "Actionable"
+    return "Setup Building"
+
+
+@dataclass
+class TradedGeometry:
+    """The entry/SL/targets a plan will actually trade, and the R:R of THAT
+    geometry (not of scoring_core's fixed 1.5R/3R/5R placeholders)."""
+    targets:  AdaptiveTargets
+    entry:    float
+    sl:       float
+    risk:     float
+    rr_t1:    float
+    rr_t2:    float
+    category: str
+
+
+def compute_traded_geometry(
+    *,
+    entry_ref: float,
+    sl: float,
+    leadership: int,
+    conviction: int,
+    entry_quality: int,
+    extension: int,
+    trend_age_bars: int = 0,
+    extension_score_atr: int = 0,
+    ema20_pct_dist: float = 0.0,
+    settings: dict | None = None,
+) -> "TradedGeometry | None":
+    """
+    Targets + R:R exactly as setup_persistence._create_plan() will lock them:
+    same entry reference (scoring_core's padded close), same real SL, same
+    category and same adjustors. Returns None when no valid geometry exists
+    (entry <= SL) or adaptive targets are disabled — callers then fall back to
+    the fixed-geometry R:R, which is the geometry actually traded in that case.
+
+    [Audit P0 #3, 2026-10-05] The Promotion Engine's R:R gate was evaluated on
+    scoring_core's fixed T2 = pad + 3*rk, so R:R = 3 + 0.02*close/risk — over
+    400k draws the minimum was 3.08 and it passed 100% against every
+    min_risk_reward option and the Elite gate. The live path then REPLACES those
+    targets with adaptive ones, so the gate was testing a trade nobody takes.
+    """
+    settings = settings or {}
+    params = AdaptiveTargetParams.from_settings(settings)
+    risk = float(entry_ref or 0) - float(sl or 0)
+    if not params.enabled or entry_ref <= 0 or sl <= 0 or risk <= 0:
+        return None
+    category = target_category(leadership, conviction, entry_quality, extension, settings)
+    at = compute_adaptive_targets(
+        entry=entry_ref, risk=risk, category=category,
+        leadership=leadership, conviction=conviction, entry_quality=entry_quality,
+        extension=extension, trend_age_bars=trend_age_bars,
+        extension_score_atr=extension_score_atr, ema20_pct_dist=ema20_pct_dist,
+        params=params,
+    )
+    return TradedGeometry(
+        targets=at, entry=entry_ref, sl=sl, risk=risk,
+        rr_t1=round((at.t1 - entry_ref) / risk, 2),
+        rr_t2=round((at.t2 - entry_ref) / risk, 2),
+        category=category,
     )
 
 

@@ -816,38 +816,71 @@ def detect_order_blocks(
         # first bar mitigation was detected (visible) vs. a later bar
         # (clear to None, same as before).
         if active_bull is not None and i >= active_bull.bos_bar:
-            was_already_mitigated = active_bull.mitigated
-            still_mitigated = bool(was_already_mitigated or (close.iat[i] < active_bull.distal))
-            still_tested = bool(active_bull.tested or (
-                not still_mitigated and low.iat[i] <= active_bull.proximal
-            ))
             age = i - active_bull.bos_bar
-            if was_already_mitigated or age > lookback_bars:
-                active_bull = None
-            elif still_mitigated or still_tested != active_bull.tested or age != active_bull.age_bars:
-                active_bull = OrderBlock(
-                    direction=active_bull.direction, origin_bar=active_bull.origin_bar,
-                    bos_bar=active_bull.bos_bar, proximal=active_bull.proximal,
-                    distal=active_bull.distal, mitigated=still_mitigated,
-                    tested=still_tested, age_bars=age,
-                )
+            if active_bull.mitigated:
+                # [Fix, 2026-10-05, audit P0 #5] PERSISTENT INVALIDATION.
+                # A mitigated block used to be visible for exactly ONE bar
+                # and then cleared to None, so STRUCTURAL_INVALIDATION (the
+                # only hard Skip in the gate) fired only if a scan happened
+                # to run on the breach bar itself — a skipped scan, a
+                # restart, or a weekend meant a broken thesis was never
+                # rejected. It now stays visible (mitigated=True) until:
+                #   (a) price RECLAIMS the distal line (close back at/above
+                #       it) — the break is undone, the block is dead;
+                #   (b) a fresh BOS replaces it (handled at the top of the
+                #       loop, unchanged); or
+                #   (c) it ages past lookback_bars.
+                if close.iat[i] >= active_bull.distal or age > lookback_bars:
+                    active_bull = None
+                elif age != active_bull.age_bars:
+                    active_bull = OrderBlock(
+                        direction=active_bull.direction, origin_bar=active_bull.origin_bar,
+                        bos_bar=active_bull.bos_bar, proximal=active_bull.proximal,
+                        distal=active_bull.distal, mitigated=True,
+                        tested=active_bull.tested, age_bars=age,
+                    )
+            else:
+                still_mitigated = bool(close.iat[i] < active_bull.distal)
+                still_tested = bool(active_bull.tested or (
+                    not still_mitigated and low.iat[i] <= active_bull.proximal
+                ))
+                if age > lookback_bars:
+                    active_bull = None
+                elif still_mitigated or still_tested != active_bull.tested or age != active_bull.age_bars:
+                    active_bull = OrderBlock(
+                        direction=active_bull.direction, origin_bar=active_bull.origin_bar,
+                        bos_bar=active_bull.bos_bar, proximal=active_bull.proximal,
+                        distal=active_bull.distal, mitigated=still_mitigated,
+                        tested=still_tested, age_bars=age,
+                    )
 
         if active_bear is not None and i >= active_bear.bos_bar:
-            was_already_mitigated = active_bear.mitigated
-            still_mitigated = bool(was_already_mitigated or (close.iat[i] > active_bear.distal))
-            still_tested = bool(active_bear.tested or (
-                not still_mitigated and high.iat[i] >= active_bear.proximal
-            ))
             age = i - active_bear.bos_bar
-            if was_already_mitigated or age > lookback_bars:
-                active_bear = None
-            elif still_mitigated or still_tested != active_bear.tested or age != active_bear.age_bars:
-                active_bear = OrderBlock(
-                    direction=active_bear.direction, origin_bar=active_bear.origin_bar,
-                    bos_bar=active_bear.bos_bar, proximal=active_bear.proximal,
-                    distal=active_bear.distal, mitigated=still_mitigated,
-                    tested=still_tested, age_bars=age,
-                )
+            if active_bear.mitigated:
+                # Mirror of the bullish persistent-invalidation rule above.
+                if close.iat[i] <= active_bear.distal or age > lookback_bars:
+                    active_bear = None
+                elif age != active_bear.age_bars:
+                    active_bear = OrderBlock(
+                        direction=active_bear.direction, origin_bar=active_bear.origin_bar,
+                        bos_bar=active_bear.bos_bar, proximal=active_bear.proximal,
+                        distal=active_bear.distal, mitigated=True,
+                        tested=active_bear.tested, age_bars=age,
+                    )
+            else:
+                still_mitigated = bool(close.iat[i] > active_bear.distal)
+                still_tested = bool(active_bear.tested or (
+                    not still_mitigated and high.iat[i] >= active_bear.proximal
+                ))
+                if age > lookback_bars:
+                    active_bear = None
+                elif still_mitigated or still_tested != active_bear.tested or age != active_bear.age_bars:
+                    active_bear = OrderBlock(
+                        direction=active_bear.direction, origin_bar=active_bear.origin_bar,
+                        bos_bar=active_bear.bos_bar, proximal=active_bear.proximal,
+                        distal=active_bear.distal, mitigated=still_mitigated,
+                        tested=still_tested, age_bars=age,
+                    )
 
         bull_obs.append(active_bull)
         bear_obs.append(active_bear)
@@ -879,13 +912,27 @@ def detect_order_blocks(
 
 STRUCTURAL_VALID_ENTRY_ZONE  = "VALID_ENTRY_ZONE"
 STRUCTURAL_WAIT_FOR_RETEST   = "WAIT_FOR_RETEST"
-STRUCTURAL_EXTENDED_CHASING  = "EXTENDED_CHASING"
+STRUCTURAL_EXTENDED_CHASING  = "EXTENDED_CHASING"   # LEGACY label — see STRUCTURAL_ZONE_FAILED
+STRUCTURAL_ZONE_FAILED       = "ZONE_FAILED"
 STRUCTURAL_CONFLICT          = "CONFLICT"
 STRUCTURAL_INVALIDATION      = "STRUCTURAL_INVALIDATION"
 
+# [Fix, 2026-10-05, audit P0 #6 "mislabel"] fvg_retest == through_filled means
+# price traded back through the ENTIRE zone and out the far side — for a
+# bullish FVG, price fell BELOW it. That is a FAILED zone (the imbalance that
+# supported the thesis has been used up/negated), not "chasing". The old gate
+# called it EXTENDED_CHASING, which both mis-described the event in every
+# diagnostic/UI column and left the genuine chase case (through_unfilled,
+# price ran away from the zone without retesting) with no structural label.
+# The classifier now emits ZONE_FAILED for through_filled, with the SAME
+# Watch cap EXTENDED_CHASING carried — no tier-behaviour change, only an
+# accurate name. EXTENDED_CHASING stays defined and in STRUCTURAL_STATES
+# because persisted rows (setup plans, DORE plans) already carry that string
+# and consumers must keep recognising it; the classifier no longer produces it.
 STRUCTURAL_STATES = {
     STRUCTURAL_VALID_ENTRY_ZONE, STRUCTURAL_WAIT_FOR_RETEST,
-    STRUCTURAL_EXTENDED_CHASING, STRUCTURAL_CONFLICT, STRUCTURAL_INVALIDATION,
+    STRUCTURAL_EXTENDED_CHASING, STRUCTURAL_ZONE_FAILED,
+    STRUCTURAL_CONFLICT, STRUCTURAL_INVALIDATION,
 }
 
 # Recommendation-layer action each state maps to. Live Scanner/DORE
@@ -894,7 +941,8 @@ STRUCTURAL_STATES = {
 STRUCTURAL_ACTION = {
     STRUCTURAL_VALID_ENTRY_ZONE:  "ALLOW",     # defer to Base Entry Score
     STRUCTURAL_WAIT_FOR_RETEST:   "WAIT",
-    STRUCTURAL_EXTENDED_CHASING:  "SUPPRESS",
+    STRUCTURAL_EXTENDED_CHASING:  "SUPPRESS",   # legacy
+    STRUCTURAL_ZONE_FAILED:       "SUPPRESS",
     STRUCTURAL_CONFLICT:          "WATCH",
     STRUCTURAL_INVALIDATION:      "REJECT",
 }
@@ -904,8 +952,8 @@ STRUCTURAL_ACTION = {
 # should walk this list in order and take the first match.
 STRUCTURAL_PRECEDENCE = [
     STRUCTURAL_INVALIDATION, STRUCTURAL_CONFLICT,
-    STRUCTURAL_EXTENDED_CHASING, STRUCTURAL_WAIT_FOR_RETEST,
-    STRUCTURAL_VALID_ENTRY_ZONE,
+    STRUCTURAL_ZONE_FAILED, STRUCTURAL_EXTENDED_CHASING,
+    STRUCTURAL_WAIT_FOR_RETEST, STRUCTURAL_VALID_ENTRY_ZONE,
 ]
 
 
@@ -964,11 +1012,15 @@ def classify_structural_state(
          adjustment(), which treats direction mismatch as neutral for
          *scoring* purposes — that function answers a different
          question and is unaffected by this one).
-      3. EXTENDED_CHASING — fvg_retest == FVG_THROUGH_FILLED (price has
-         already run through and past the zone) with direction agreeing
-         with thesis — late/chased, matching-direction evidence.
+      3. ZONE_FAILED — fvg_retest == FVG_THROUGH_FILLED: price traded back
+         through the ENTIRE zone and out the far side (a bullish FVG with
+         price below it). The imbalance behind the thesis is negated.
+         (Previously mislabelled EXTENDED_CHASING — see the constant block.)
       4. WAIT_FOR_RETEST — smc_state.state == "WAITING_RETEST" (a real
          FVG exists, direction agrees, but price hasn't retested it yet).
+         NOT when fvg_retest == FVG_IN_ZONE: that means the retest is
+         happening NOW, which is exactly what this state waits for — it
+         resolves to VALID_ENTRY_ZONE (reason "fvg_retest_in_zone").
       5. VALID_ENTRY_ZONE — everything else, INCLUDING evidence_tier==0
          (no evidence at all — the common case; see conviction_score_v1's
          own docstring on why "no opinion" must never default to a
@@ -1036,14 +1088,24 @@ def classify_structural_state(
             reason="direction_mismatch", invalidation_level=invalidation_level,
         )
 
-    # 3. EXTENDED_CHASING
+    # 3. ZONE_FAILED (was mislabelled EXTENDED_CHASING)
     if smc_state.fvg_retest == FVG_THROUGH_FILLED:
         return StructuralDecision(
-            state=STRUCTURAL_EXTENDED_CHASING, action=STRUCTURAL_ACTION[STRUCTURAL_EXTENDED_CHASING],
+            state=STRUCTURAL_ZONE_FAILED, action=STRUCTURAL_ACTION[STRUCTURAL_ZONE_FAILED],
             reason="fvg_through_filled", invalidation_level=invalidation_level,
         )
 
-    # 4. WAIT_FOR_RETEST
+    # 4. WAIT_FOR_RETEST — [Fix, 2026-10-05, audit P0 #4] only while the
+    # retest has NOT started. An FVG-only state (the weakest evidence tier,
+    # worth 3 C / 4 E points) used to stay WAIT_FOR_RETEST — capped at
+    # Developing — even with price sitting inside the zone, i.e. the weakest
+    # evidence carried the harshest veto at the very moment its own
+    # condition was satisfied.
+    if smc_state.state == WAITING_RETEST and smc_state.fvg_retest == FVG_IN_ZONE:
+        return StructuralDecision(
+            state=STRUCTURAL_VALID_ENTRY_ZONE, action=STRUCTURAL_ACTION[STRUCTURAL_VALID_ENTRY_ZONE],
+            reason="fvg_retest_in_zone", invalidation_level=invalidation_level,
+        )
     if smc_state.state == WAITING_RETEST:
         return StructuralDecision(
             state=STRUCTURAL_WAIT_FOR_RETEST, action=STRUCTURAL_ACTION[STRUCTURAL_WAIT_FOR_RETEST],

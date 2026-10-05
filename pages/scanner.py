@@ -2380,7 +2380,8 @@ _STRUCTURAL_STATE_QUALIFIER = {
     "WAIT_FOR_RETEST":         ("#f0883e", "⏳ Wait for Retest"),
     "CONFLICT":                ("#8b949e", "◐ Conflict"),
     "STRUCTURAL_INVALIDATION": ("#f85149", "✕ Invalidated"),
-    "EXTENDED_CHASING":        ("#eab308", "⤴ Extended"),
+    "EXTENDED_CHASING":        ("#eab308", "⤴ Extended"),     # legacy rows
+    "ZONE_FAILED":             ("#eab308", "✕ Zone Failed"),  # price closed through the whole FVG
 }
 
 

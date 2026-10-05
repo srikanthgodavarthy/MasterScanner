@@ -449,13 +449,8 @@ class BarResult:
     # with no active Order Block is the common case, not an error.
     order_block: object = None   # Optional["utils.smc_engine.OrderBlock"]
 
-    # Recent volatility expansion ratio — recent-ATR / baseline-ATR.
-    # 1.0 = neutral/no expansion (the default below). NOT YET populated by
-    # compute_bar()'s indicator pipeline as of Phase 2/3; consumers
-    # (utils/extension_shared.py) must degrade gracefully (treat 1.0 as
-    # "no signal", never fabricate a penalty) until that wiring is
-    # scheduled — see extension_shared.py's _expansion_magnitude_component().
-    atr_expansion_ratio: float = 1.0
+    # (atr_expansion_ratio removed 2026-10-05, audit P1 #14: never assigned in
+    #  production; see the note in utils/extension_shared.py.)
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -159,8 +159,19 @@ def test_rescale_total_is_scaled_others_only(smc):
     r, s = _strong_bar(), (None if smc is None else _bull_smc())
     total_cv, subs_cv = cv._conviction_v4(r, smc_state=s, settings=OFF_RS)
     total_eq, subs_eq = cv._entry_quality_v4(r, smc_state=s, settings=OFF_RS)
-    assert total_cv == min(round(_others_cv(subs_cv) * (100 / 85)), 100)
+    # Conviction's rescale factor follows the de-duplicated weight profile
+    # (100/85 only when every cv4_legacy_* switch is on); EQ is unchanged.
+    f_cv = cv.cv4_weight_profile(OFF_RS)["cv_rescale_factor"]
+    assert total_cv == min(round(_others_cv(subs_cv) * f_cv), 100)
     assert total_eq == min(round(_others_eq(subs_eq) * (100 / 75)), 100)
+
+
+def test_rescale_factor_is_100_over_85_under_the_legacy_profile():
+    legacy = {**OFF_RS, **{k: True for k in cv.CV4_LEGACY_DEFAULTS}}
+    assert cv.cv4_weight_profile(legacy)["cv_rescale_factor"] == pytest.approx(100 / 85)
+    r, s = _strong_bar(), _bull_smc()
+    total, subs = cv._conviction_v4(r, smc_state=s, settings=legacy)
+    assert total == min(round(_others_cv(subs) * (100 / 85)), 100)
 
 
 def test_rescale_inflates_a_candidate_whose_smc_term_is_zero():

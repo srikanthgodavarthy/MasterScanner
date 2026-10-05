@@ -378,6 +378,14 @@ class TradePlan:
         return abs(self.entry - self.stop_loss)
 
     @property
+    def reward_to_risk_t2(self) -> float:
+        """R:R to Target2 off this plan's own entry/SL (see reward_to_risk)."""
+        risk = self.risk_per_unit
+        if risk <= 1e-9:
+            return 0.0
+        return abs(self.target2 - self.entry) / risk
+
+    @property
     def reward_to_risk(self) -> float:
         """R:R computed off THIS plan's own entry/SL/Target1 spread — the
         one Stage 4's Risk Engine reads (Section 8), never re-derived
@@ -2015,7 +2023,7 @@ def _dore_input_to_pseudo_bar(inp: DOREInput, trend: TrendResult):
         # read, exactly like a None smc_state does elsewhere.
         pivot_high_dist=0.0, ema20_pct_dist=0.0, ema50_pct_dist=0.0,
         bars_since_setup_actual=-1, atr_band="Actionable",
-        extension_atr=0.0, atr_expansion_ratio=1.0,
+        extension_atr=0.0,
         trend_phase="ESTABLISHED" if ema_alignment else "NONE",
         fresh_base_breakout=False, compression_break=inp.compression,
         entry_ref=inp.price, entry=inp.price,
@@ -2623,8 +2631,12 @@ def stage4_risk_engine(
 
     # ── Reward:Risk off the TradePlan's own entry/SL/Target1 spread ──
     rr = trade_plan.reward_to_risk
-    rr_score = _pct_score(rr, cfg.risk_rr_min, cfg.risk_rr_good)
-    reasons.append(f"Reward:Risk (Target1)={rr:.2f} (stop={trade_plan.stop_loss}, entry={trade_plan.entry})")
+    # [Audit P1 #15, 2026-10-05] Score Target2's R:R, not Target1's: T1 is built
+    # at exactly risk_rr_min x the stop, so the old score was 0 for ~97% of plans
+    # and the 35%-weight term never contributed. See dore_settings risk_rr_t2_full.
+    rr_t2 = trade_plan.reward_to_risk_t2
+    rr_score = _pct_score(rr_t2, cfg.risk_rr_min, getattr(cfg, "risk_rr_t2_full", 3.0))
+    reasons.append(f"Reward:Risk (Target1)={rr:.2f}, (Target2)={rr_t2:.2f} (stop={trade_plan.stop_loss}, entry={trade_plan.entry})")
     if rr < cfg.risk_rr_min:
         warnings.append(f"Reward:Risk={rr:.2f} below the {cfg.risk_rr_min:.1f} floor")
 

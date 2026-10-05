@@ -294,7 +294,6 @@ def _extension(r: "BarResult") -> tuple[int, dict]:
         # for the CV4-vs-DE comparison view added in Phase 4)
         "ex_atr_extension":      pen["atr_extension"],
         "ex_fvg_zone_distance":  pen["fvg_zone_distance"],
-        "ex_expansion_magnitude":pen["expansion_magnitude"],
     }
     return total, subs
 

@@ -182,6 +182,11 @@ class PromotionResult:
     stoch_vwap_confluent: bool = False
 
     risk_reward:    float = 0.0
+    # "traded" = computed on the adaptive T2 + real SL the plan will actually
+    # trade (caller passed risk_reward_override); "fixed" = scoring_core's
+    # placeholder T2 = pad + 3*rk geometry, which is >= 3.08 by construction
+    # and so can never fail a gate (audit P0 #3, 2026-10-05).
+    risk_reward_basis: str = "fixed"
     rr_ok_execute:  bool = False
     rr_ok_elite:    bool = False
 
@@ -259,6 +264,7 @@ def evaluate_promotion(
     ia=None,
     settings: Optional[dict] = None,
     bypass_tier_gate: bool = False,
+    risk_reward_override: Optional[float] = None,
 ) -> PromotionResult:
     """
     Evaluate whether an Actionable setup should be promoted to
@@ -353,7 +359,17 @@ def evaluate_promotion(
     # All thresholds in this module (Promo Score and R:R alike) are now
     # treated the same way: a plain override via `settings`, adjustable
     # in either direction, falling back to the module default when absent.
-    res.risk_reward = _risk_reward(r)
+    # [Audit P0 #3, 2026-10-05] Prefer the R:R of the geometry that will really
+    # be traded (adaptive T2 / real SL — see adaptive_target_engine
+    # .compute_traded_geometry). scoring_core's fixed T2 = pad + 3*rk with rk
+    # clamped to 1.5-2.5 ATR gives R:R = 3 + 0.02*close/risk: min 3.08 over 400k
+    # random draws, so the gate passed 100% against every min_risk_reward option
+    # and the Elite gate — and the live path replaces that geometry afterwards.
+    if risk_reward_override is not None and risk_reward_override > 0:
+        res.risk_reward = float(risk_reward_override)
+        res.risk_reward_basis = "traded"
+    else:
+        res.risk_reward = _risk_reward(r)
     min_rr_execute = resolve_min_rr_execute(settings)
     res.rr_ok_execute = res.risk_reward >= min_rr_execute
     min_rr_elite = settings.get("promo_min_rr_elite", MIN_RR_ELITE)
