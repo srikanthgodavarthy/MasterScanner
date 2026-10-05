@@ -122,6 +122,21 @@ MAX_SETUP_AGE_DAYS_BY_SOURCE = {
 }
 _DEFAULT_MAX_SETUP_AGE_DAYS = 20
 
+# [2026-10-05, SG request] Pre-Breakout (PB) and Momentum (MOM) are
+# switched OFF as setup sources. Live results (Aug 19 → Oct 5, 2026):
+# MOM 124 closed trades, ~4% ever reached T1, avg -0.16R to -0.32R;
+# PB 10 closed, 0 winners, avg -0.74R to -1.0R. LS (the CV1/CV4
+# Actionable path) is kept.
+#
+# These flags only gate MINTING (and cross-source corroboration, which
+# lives in the same branches) plus the Active Setups display. Any PB/MOM
+# plan that is already open keeps advancing through
+# advance_lifecycle() unchanged so its outcome is still recorded —
+# nothing is closed or deleted by flipping these. Set a flag back to
+# True to restore that source completely (mint + display).
+ENABLE_PB_SOURCE  = False
+ENABLE_MOM_SOURCE = False
+
 def _max_setup_age_days(source: str) -> int:
     return MAX_SETUP_AGE_DAYS_BY_SOURCE.get(str(source or "LS"), _DEFAULT_MAX_SETUP_AGE_DAYS)
 
@@ -276,6 +291,14 @@ class SetupPlan:
     locked_pct_chg:          float = 0.0
     locked_vol_ratio:        float = 0.0
 
+    # [2026-10-05, SG request] scoring_core norm_score (0-100) frozen at
+    # mint — the scanner's "Score" column. Display/analysis only: it does
+    # NOT gate minting (that is Recommendation in _FREEZE_CATEGORIES).
+    # Stored so a later outcome analysis can test whether norm_score at
+    # entry predicts results, the way locked_entry_quality was tested.
+    # 0 for MOM rows and for plans minted before this field existed.
+    locked_norm_score:       int   = 0
+
     # [2026-09-08, SG request — cross-source dedup] Single-symbol-persistent
     # Active Setups. Only the OLDEST open plan for a symbol (across LS/PB/
     # MOM) is ever minted/kept; a later source's signal on the same symbol
@@ -384,6 +407,7 @@ class SetupPlan:
             "locked_extension":       self.locked_extension,
             "locked_pct_chg":         self.locked_pct_chg,
             "locked_vol_ratio":       self.locked_vol_ratio,
+            "locked_norm_score":      self.locked_norm_score,
             "status":                 _sval(self.status),
             "status_reason":          self.status_reason,
             "created_at":             self.created_at,
@@ -915,6 +939,9 @@ def _create_plan(
         # as locked_leadership/etc. above).
         locked_pct_chg          = float(scanner_row.get("PctChg",   0) or 0),
         locked_vol_ratio        = float(scanner_row.get("VolRatio", 0) or 0),
+        # LS/PB scanner rows carry "Score" (scoring_core norm_score, set
+        # in scanner_engine.score_stock()); MOM rows don't, so 0 there.
+        locked_norm_score       = int(float(scanner_row.get("Score", 0) or 0)),
         status                 = SetupPlanStatus.WAITING,
         status_reason           = "Plan created — awaiting entry trigger",
         created_at              = now_ts,
@@ -1149,7 +1176,8 @@ def enrich_scanner_row(
         recommendation in _FREEZE_CATEGORIES
         and (plan is None or plan.is_terminal())
     )
-    if not should_create and pre_breakout and (plan is None or plan.is_terminal()):
+    if (ENABLE_PB_SOURCE and not should_create and pre_breakout
+            and (plan is None or plan.is_terminal())):
         should_create = True
         source_for_new_plan = "PB"
 
@@ -1183,7 +1211,7 @@ def enrich_scanner_row(
     if plan is not None and plan.is_open():
         _entry_ref = float(scanner_row.get("EntryRef", 0) or 0)
         _bf_entry = _entry_ref if _entry_ref > 0 else float(scanner_row.get("Entry", 0) or 0)
-        _bf_source = "PB" if pre_breakout else "LS"
+        _bf_source = "PB" if (pre_breakout and ENABLE_PB_SOURCE) else "LS"
         if _backfill_missing_source_entry(plan, _bf_source, _bf_entry):
             plan_was_updated = True
 
@@ -1364,7 +1392,11 @@ def enrich_momentum_row(
     #      never on Recommendation/CV4/tier. Unless a DIFFERENT source
     #      already has this symbol open (cross_source_plan), in which
     #      case corroborate onto it instead — see the param docstring.
-    should_create = momentum_qualified and (plan is None or plan.is_terminal())
+    # [2026-10-05, SG request] MOM minting + corroboration disabled —
+    # see ENABLE_MOM_SOURCE. Step 1 above still advances any already-open
+    # MOM plan to its natural outcome.
+    should_create = (ENABLE_MOM_SOURCE and momentum_qualified
+                     and (plan is None or plan.is_terminal()))
     if (should_create and cross_source_plan is not None and cross_source_plan.is_open()
             and cross_source_plan.source.upper() != "MOM"):
         _entry = float(momentum_row.get("EntryRef", momentum_row.get("Entry", 0)) or 0)

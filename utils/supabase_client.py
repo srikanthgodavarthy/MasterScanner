@@ -802,6 +802,7 @@ def _setup_plan_from_row(row: dict) -> "object":
         locked_extension         = int(row.get("locked_extension",   0) or 0),
         locked_pct_chg           = float(row.get("locked_pct_chg",   0) or 0),
         locked_vol_ratio         = float(row.get("locked_vol_ratio", 0) or 0),
+        locked_norm_score        = int(float(row.get("locked_norm_score", 0) or 0)),
         contributing_sources     = row.get("contributing_sources") or "",
         conflict_flag            = bool(row.get("conflict_flag") or False),
         conflict_reason          = row.get("conflict_reason") or "",
@@ -2417,6 +2418,17 @@ UPDATE setup_plans SET closed_at = invalidated_date::timestamptz
 MOMENTUM_TRACKING_MIGRATION_SQL = """
 ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS locked_pct_chg   numeric(8,2) NOT NULL DEFAULT 0;
 ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS locked_vol_ratio numeric(8,2) NOT NULL DEFAULT 0;
+"""
+
+# [2026-10-05, SG request] norm_score frozen at mint (SetupPlan.
+# locked_norm_score). RUN THIS ONCE AGAINST THE LIVE DB BEFORE DEPLOYING
+# the code that writes it: SetupPlan.to_db_dict() now includes
+# locked_norm_score on every upsert, so with the column missing every
+# setup_plans batch write fails (same failure mode as the earlier
+# *_MIGRATION_SQL blocks). Existing rows read back 0 (DEFAULT) — no
+# backfill needed or possible, norm_score wasn't stored at their mint.
+NORM_SCORE_MIGRATION_SQL = """
+ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS locked_norm_score integer NOT NULL DEFAULT 0;
 """
 
 # [2026-09-08, SG request — single-symbol-persistent Active Setups]
