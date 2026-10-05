@@ -2952,9 +2952,28 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
                 "cmp":         float(r.get("Entry", 0) or 0),
                 "current_rec": str(r.get("Recommendation", r.get("Category", ""))),
                 "composite":   float(r.get("CV1_Composite", 0) or 0),
+                # [2026-10-05, SG request] scoring_core norm_score (0-100),
+                # surfaced by scanner_engine as the "Score" column.
+                "norm_score":  float(r.get("Score", 0) or 0),
                 "pct_chg":     float(r.get("%Chg", 0) or 0),
                 "vol_ratio":   float(r.get("VolRatio", 0) or 0),
             }
+
+    # [2026-10-05, SG request] PB and MOM are removed from the scanner
+    # output — see utils.setup_persistence.ENABLE_PB_SOURCE/ENABLE_MOM_SOURCE.
+    # Already-open PB/MOM plans keep advancing in the background (so their
+    # outcomes are still recorded) but are not shown here.
+    from utils.setup_persistence import ENABLE_PB_SOURCE, ENABLE_MOM_SOURCE
+    _hidden_sources = set()
+    if not ENABLE_PB_SOURCE:
+        _hidden_sources.add("PB")
+    if not ENABLE_MOM_SOURCE:
+        _hidden_sources.add("MOM")
+    open_plans = {sym: plan for sym, plan in open_plans.items()
+                  if (getattr(plan, "source", "LS") or "LS").upper().strip() not in _hidden_sources}
+    if not open_plans:
+        st.info("No active (entered) trade plans right now. A plan is minted automatically the first time a stock reaches Actionable, Execute, or Elite (source LS) and moves to Active once price triggers entry.")
+        return
 
     rows = []
     for sym, plan in open_plans.items():
@@ -2974,6 +2993,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             "T1":           plan.t1_locked,
             "CurrentPrice": cmp_px,
             "CV4Composite": live.get("composite", 0.0),
+            "NormScore":    live.get("norm_score", 0.0),
             "PnLPct":       compute_pnl_pct(plan.entry_locked, cmp_px) if cmp_px else None,
             "DaysActive":   _compute_days_active_safe(plan.first_actionable_date),
             "CurrentRec":   live.get("current_rec", ""),
@@ -3042,11 +3062,13 @@ def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
         return
 
     sort_key = st.selectbox(
-        "Sort by", ["Days Active (low → high)", "PnL% ↓", "Symbol A→Z"],
+        "Sort by", ["Days Active (low → high)", "PnL% ↓", "Norm Score ↓", "Symbol A→Z"],
         key=f"active_plans_sort_{key_suffix}", label_visibility="collapsed",
     )
     if sort_key == "PnL% ↓":
         rows_df = rows_df.sort_values("PnLPct", ascending=False, na_position="last")
+    elif sort_key == "Norm Score ↓":
+        rows_df = rows_df.sort_values("NormScore", ascending=False)
     elif sort_key == "Symbol A→Z":
         rows_df = rows_df.sort_values("Symbol")
     else:
@@ -3059,8 +3081,10 @@ def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
     # Entry/SL/T1 to find them.
     header = (
         '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th>'
-        '<th>CV4 Composite</th><th>Volume</th><th>CMP</th>'
-        '<th>PB</th><th>MOM</th><th>FP</th><th>CV4</th>'
+        '<th>CV4 Composite</th>'
+        '<th title="scoring_core norm_score (0-100)">Norm Score</th>'
+        '<th>Volume</th><th>CMP</th>'
+        '<th>FP</th><th>CV4</th>'
         '<th>SL (CV4)</th><th>T1 (CV4)</th><th>PnL%</th>'
         '<th>No of Days</th></tr>'
     )
@@ -3093,6 +3117,7 @@ def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
             f'<td class="col-stock">{_tv_link(r["Symbol"], pct_chg=r["CurPctChg"])}</td>'
             f'<td>{_ap_status_badge(r["Status"])}</td>'
             f'<td class="col-num">{r["CV4Composite"]:.1f}</td>'
+            f'<td class="col-num">{r["NormScore"]:.0f}</td>'
             + _vol_cell
             + f'<td class="col-num">{_px(r["CurrentPrice"])}</td>'
             f'{_ap_per_source_cells(r["Source"], r["ContribSources"], r["SourceEntries"], r["Entry"])}'
@@ -3321,7 +3346,13 @@ def _ap_per_source_cells(source: str, contributing_sources: str, source_entries_
     # _ap_source_badge()/_ap_source_badges_with_entries() — which
     # aren't used by this table anymore, only kept for any other
     # caller wanting a single combined badge string).
-    for s in ("PB", "MOM", "FP", "CV4"):
+    # [2026-10-05, SG request] PB/MOM columns dropped while those sources
+    # are disabled (utils.setup_persistence.ENABLE_*_SOURCE); the table
+    # header in _render_active_plans_table_body() matches.
+    from utils.setup_persistence import ENABLE_PB_SOURCE, ENABLE_MOM_SOURCE
+    _cols = [c for c in ("PB", "MOM", "FP", "CV4")
+             if not ((c == "PB" and not ENABLE_PB_SOURCE) or (c == "MOM" and not ENABLE_MOM_SOURCE))]
+    for s in _cols:
         # Internal source code for the LS/CV4 column is still "LS" in
         # SetupPlan/DB (see _ap_one_source_badge()'s own docstring on
         # why the DISPLAYED label is "CV4") — map the header name back
