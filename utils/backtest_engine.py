@@ -418,7 +418,7 @@ def generate_signals_historical(
                 _tg = compute_traded_geometry(
                     entry_ref=round(r.entry * 1.005, 2), sl=r.sl,
                     leadership=_ls_val, conviction=_cv_val, entry_quality=_eq_val,
-                    extension=_ext_fn(r)[0], trend_age_bars=r.trend_age_bars,
+                    extension=_ext_fn(r, settings)[0], trend_age_bars=r.trend_age_bars,
                     extension_score_atr=r.extension_score_atr,
                     ema20_pct_dist=r.ema20_pct_dist, settings=settings or {},
                 )
@@ -564,7 +564,7 @@ def generate_signals_historical(
 
         # ── v12: Adaptive targets ────────────────────────────────
         _at_params   = AdaptiveTargetParams.from_settings(settings or {})
-        _ext_score   = _ext_fn(r)[0]
+        _ext_score   = _ext_fn(r, settings)[0]
         _category    = _target_category_for_backtest(_ls_val, _cv_val, _eq_val, _ext_score, settings)
         if _at_params.enabled:
             _entry_pad = round(r.entry * 1.005, 2)

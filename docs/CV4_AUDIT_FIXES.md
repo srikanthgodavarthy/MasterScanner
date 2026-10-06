@@ -36,7 +36,7 @@ provable no-op for outputs. **Nothing here is backtest-validated.** Read
 | 11 | CCI dup | **Fixed** | Removed from Conviction Setup/Pattern; Entry Quality owns it. |
 | 12 | EMA/trend/cloud overlap | **Partly fixed** | `trend_up`/`ema_alignment` share EMA20>EMA50: counted once. `above_cloud` independence is **unvalidated** (item 17). |
 | 13 | trend-age discontinuity | **Fixed** | Continuous ladder; a >100-bar trend no longer scores the same as a new one. |
-| 14 | `atr_expansion_ratio` | **Deleted** | Output-identical (it was always 0). Weights now sum to 90, not rescaled. |
+| 14 | `atr_expansion_ratio` | **Deleted, weights rescaled** | Deleting the dead factor was output-identical but left the five extension weights summing to 90; they are now rescaled to exactly 100 (28/22/17/17/16). That part **is** a behaviour change — see "Extension weights" below. `ext_legacy_weights` restores 25/20/15/15/15. |
 | 15 | DORE `rr_score` | **Fixed** | Scores Target2's R:R (`risk_rr_t2_full`, default 3.0). |
 | 16 | `rs_vs_sector` | **Not removed — tooling** | `empirical` mode, with a power guard. |
 | 17 | EMA/cloud independence | **Not changed — tooling** | `empirical` mode (phi + outcome by flag combination). |
@@ -70,6 +70,44 @@ intent; `cv4_smc_rescale_when_disabled` is the existing (inflating) lever.
 **Same fact, counted twice (item 18).** Conviction and Entry Quality read the
 same `evidence_tier`. A fresh tier-4 read is worth up to 17 Conviction and 25
 Entry Quality points. Not changed, because removing one half is a recalibration.
+
+## Extension weights (item 14 follow-up)
+
+Deleting the dead ATR-expansion factor left five factors summing to 90, so a stock
+extended on *every* factor scored severity 90 (before the flat trend-phase add-on),
+and Entry Quality's chase-risk term (`15 × (1 − severity/100)`) could never reach 0
+from the factors alone. The weights are now 28/22/17/17/16 = 100: proportional
+(×100/90), integers, largest-remainder rounding (naive rounding gives 101). The
+three tied remainders (pivot, bars, fvg) compete for two slots; **fvg yields**
+because it is the only factor that is 0 by construction when SMC has no zone. That
+tie-break is a judgement call, not a measurement. The +20/+15 trend-phase add-on is
+a flat term and was not scaled.
+
+**This moves scores.** Same bar, measured over a uniform grid of 1,080 factor-level
+combinations (not real-world frequencies, so read it as direction and size, not as
+population effects):
+
+| | before → after |
+|---|---|
+| severity, mean change | +4.9 (range +0 … +10) |
+| all five factors maxed | 90 → 100 |
+| severity ≥ 60 ("Extended" in `target_category` / `decision_engine`) | 46% → 56% of combos |
+| severity ≤ 40 (Actionable extension cap) | 19% → 15% |
+| severity ≤ 35 (High Conviction cap) | 13% → 10% |
+| severity ≤ 25 (Elite cap) | 5% → 4% |
+| `eq_extension_chase_risk`, mean change | −0.7 points (range −2 … 0) |
+
+Expect slightly more stocks classed "Extended", fewer under each tier's extension
+cap, and Entry Quality about 0.7 points lower on average — enough to move a stock
+sitting near an EQ floor. The 25/35/40/60 thresholds were **not** rescaled; I do
+not know whether they were tuned against the 90-sum reality or the 100-sum design,
+so I kept them as written. If they were tuned against live output, scale them by
+0.9 or set `ext_legacy_weights`.
+
+`ext_legacy_weights=True` is verified byte-identical to the pre-change module over
+46,080 combinations of band × EMA20 × pivot × bars × zone × phase × price × fresh-base
+(excluding the `through_filled` zone cases, whose change in item 6 is intentional).
+The key reaches both consumers (Entry Quality and `decision_engine`/backtest).
 
 ## Failed-zone handling (item 6)
 

@@ -226,7 +226,7 @@ from utils.legacy_scoring_diagnostic import (
 #    61-100→ Extended   (do not chase)
 # ══════════════════════════════════════════════════════════════════
 
-def _extension(r: "BarResult") -> tuple[int, dict]:
+def _extension(r: "BarResult", settings: dict | None = None) -> tuple[int, dict]:
     """Returns (0-100, sub_scores_dict).  Higher = more extended = avoid.
 
     [Redirected 2026-08-13 per masterscanner_scoring_redesign_FINAL.md §2/§3]
@@ -277,7 +277,7 @@ def _extension(r: "BarResult") -> tuple[int, dict]:
     # entry_ref/entry, matching extension_shared's existing fallback.
     smc_state = getattr(r, "smc_state", None)
     current_price = getattr(r, "entry_ref", None) or getattr(r, "entry", None)
-    pen = compute_extension_penalty(r, smc_state=smc_state, current_price=current_price)
+    pen = compute_extension_penalty(r, smc_state=smc_state, current_price=current_price, settings=settings)
     total = int(round(pen["severity_0_100"]))
     subs = {
         "ex_ema20_dist":  pen["ex_ema20_dist"],
@@ -751,7 +751,7 @@ def compute_decision(
     legacy_leadership,    ls_subs  = _legacy_leadership_fn(r)
     legacy_conviction,    cv_subs  = _legacy_conviction_fn(r, settings)
     legacy_entry_quality, eq_subs, rr = _legacy_entry_quality_fn(r)
-    extension,     ex_subs  = _extension(r)
+    extension,     ex_subs  = _extension(r, settings)
 
     # ── Trend Quality Score (Sprint 1) ────────────────────────────
     tq_score, tq_subs = _trend_quality(r)

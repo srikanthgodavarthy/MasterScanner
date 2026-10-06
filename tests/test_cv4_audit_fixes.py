@@ -427,3 +427,73 @@ def test_portfolio_page_does_not_feed_days_held_in_as_trend_age():
     src = open(os.path.join(os.path.dirname(__file__), "..", "pages", "portfolio.py"), encoding="utf-8").read()
     assert "trend_age_bars=result.days_held" not in src
     assert "trend_age_bars=NEUTRAL_TREND_AGE_BARS" in src and "extension_score_atr=NEUTRAL_EXTENSION_SCORE_ATR" in src
+
+
+# ── Extension weights sum to 100 (follow-up to P1 #14) ──────────────────────
+import itertools
+from utils import extension_shared as _ext
+from utils.decision_engine import _extension as _de_extension
+
+_LEG_EXT = {"ext_legacy_weights": True}
+
+
+def _all_factors_maxed():
+    r = _bar(atr_band="Extended", ema20_pct_dist=20.0, pivot_high_dist=9.0,
+             bars_since_setup_actual=20, trend_phase="ESTABLISHED")
+    smc = SMCState(direction="BULLISH", state=BULLISH_CONTINUATION, evidence_tier=3, age_bars=1,
+                   fvg_retest="through_unfilled", has_fvg=True, fvg_high=100.0, fvg_low=99.0)
+    return r, smc
+
+
+def test_extension_weights_sum_to_100_and_legacy_to_90():
+    assert sum(_ext.EXT_WEIGHTS.values()) == 100
+    assert sum(_ext.EXT_WEIGHTS_LEGACY.values()) == 90
+    assert (_ext.W_ATR_EXTENSION, _ext.W_EMA20_DISTANCE, _ext.W_PIVOT_DISTANCE,
+            _ext.W_BARS_SINCE_TRIGGER, _ext.W_FVG_ZONE_DISTANCE) == (28, 22, 17, 17, 16)
+
+
+def test_a_bar_extended_on_every_factor_now_reaches_severity_100_not_90():
+    r, smc = _all_factors_maxed()
+    new = compute_extension_penalty(r, smc, current_price=150.0)
+    old = compute_extension_penalty(r, smc, current_price=150.0, settings=_LEG_EXT)
+    assert new["severity_0_100"] == 100 and old["severity_0_100"] == 90
+    comps = ("atr_extension", "ema20_distance", "pivot_distance", "bars_since_trigger", "fvg_zone_distance")
+    assert [new[c] for c in comps] == [28, 22, 17, 17, 16]                  # each factor at its full weight
+    assert [old[c] for c in comps] == [25, 20, 15, 15, 15]
+
+
+def test_factor_ordering_is_preserved_by_the_rescale():
+    w = _ext.EXT_WEIGHTS
+    assert w["atr"] > w["ema20"] > w["pivot"] >= w["bars"] > w["fvg"]
+
+
+def test_rescale_never_lowers_severity_for_any_bar():
+    zones = [None, SMCState(direction="BULLISH", state=BULLISH_CONTINUATION, evidence_tier=3, age_bars=1,
+                            fvg_retest="through_unfilled", has_fvg=True, fvg_high=100.0, fvg_low=99.0)]
+    for band, ema, piv, bss, z, phase in itertools.product(("Actionable", "Late", "Extended"), (1, 3, 5, 8, 12),
+                                                          (0, 1, 3, 5), (-1, 5, 9), zones,
+                                                          ("ESTABLISHED", "NONE", "EXTENDED")):
+        r = _bar(atr_band=band, ema20_pct_dist=ema, pivot_high_dist=piv, bars_since_setup_actual=bss,
+                 trend_phase=phase)
+        kw = dict(smc_state=z, current_price=150.0 if z else None)
+        assert (compute_extension_penalty(r, **kw)["severity_0_100"]
+                >= compute_extension_penalty(r, settings=_LEG_EXT, **kw)["severity_0_100"])
+
+
+def test_legacy_switch_reaches_both_consumers():
+    r = _bar(atr_band="Extended", ema20_pct_dist=8.0, pivot_high_dist=3.0, bars_since_setup_actual=9,
+             trend_phase="ESTABLISHED")
+    # decision_engine's 0-100 Extension score (feeds target_category and the gates)
+    assert _de_extension(r)[0] > _de_extension(r, _LEG_EXT)[0]
+    assert _de_extension(r, {})[0] == _de_extension(r)[0]                    # absent key == rescaled default
+    # Entry Quality's chase-risk term (subtractive, 15 pts)
+    eq_new = cv._entry_quality_v4(r)[1]["eq_extension_chase_risk"]
+    eq_old = cv._entry_quality_v4(r, settings=_LEG_EXT)[1]["eq_extension_chase_risk"]
+    assert eq_new < eq_old
+
+
+def test_chase_risk_term_can_now_reach_zero_from_the_factors_alone():
+    r, smc = _all_factors_maxed()
+    assert cv._entry_quality_v4(r, smc_state=smc, current_price=150.0)[1]["eq_extension_chase_risk"] == 0
+    assert cv._entry_quality_v4(r, smc_state=smc, current_price=150.0,
+                                settings=_LEG_EXT)[1]["eq_extension_chase_risk"] >= 1   # old ceiling: 1.5 -> 2

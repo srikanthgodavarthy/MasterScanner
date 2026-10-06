@@ -39,71 +39,90 @@ if TYPE_CHECKING:
 
 
 # ── PROVISIONAL sub-factor weights (sum to 100) — Phase 6 calibration ──────
-W_ATR_EXTENSION       = 25
-W_EMA20_DISTANCE      = 20
-W_PIVOT_DISTANCE      = 15
-W_BARS_SINCE_TRIGGER  = 15
-W_FVG_ZONE_DISTANCE   = 15
-# [Audit P1 #14, 2026-10-05] W_EXPANSION_MAGNITUDE (10) and its component were
-# DELETED. They were backed by BarResult.atr_expansion_ratio, which no production
-# code ever assigned (default 1.0 -> always 0 points), so the six-factor model
-# was really five factors whose weights sum to 90, not 100. (Its legacy alias
-# key "ex_momentum" is still returned, as a constant 0, because
-# decision_engine.DecisionScores reads it.) Deleting is
-# output-identical; severity was already capped at 90 before the trend-phase
-# modifiers. The weights are deliberately NOT rescaled to 100 — that would inflate
-# every severity by 11% and silently re-tune Extension. If an ATR-expansion read is
-# wanted, wire a real ratio AND validate it (scripts/cv4_validation_audit.py).
+#
+# [Audit P1 #14 + follow-up, 2026-10-05] The original six-factor model had a 10-pt
+# ATR-expansion factor backed by BarResult.atr_expansion_ratio, which no production
+# code ever assigned (always 0 pts). Deleting it left five factors summing to 90, so
+# a stock extended on EVERY factor still scored severity 90 (before the flat
+# trend-phase add-on) and Entry Quality's chase-risk term could never reach 0 from
+# the factors alone. The five weights are now scaled to sum to exactly 100.
+#
+# Method: proportional (x100/90), integers, largest-remainder rounding. Naive
+# rounding gives 28+22+17+17+17 = 101. The three tied .67 remainders (pivot, bars,
+# fvg) compete for two slots; fvg yields because it is the only factor that is 0 by
+# construction whenever SMC has no zone, so it is the least universally informative.
+#
+# NOT behaviour-neutral: severity rises by ~11% for the same bar (see
+# docs/CV4_AUDIT_FIXES.md for the measured effect on the 25/35/40/60 thresholds and
+# on eq_extension_chase_risk). Set settings["ext_legacy_weights"]=True to restore the
+# 90-sum weights exactly.
+EXT_WEIGHTS_LEGACY = {"atr": 25, "ema20": 20, "pivot": 15, "bars": 15, "fvg": 15}   # sum 90
+EXT_WEIGHTS        = {"atr": 28, "ema20": 22, "pivot": 17, "bars": 17, "fvg": 16}   # sum 100
+assert sum(EXT_WEIGHTS.values()) == 100 and sum(EXT_WEIGHTS_LEGACY.values()) == 90
+
+# Module constants = the CURRENT (rescaled) weights, kept for importers/docs.
+W_ATR_EXTENSION      = EXT_WEIGHTS["atr"]
+W_EMA20_DISTANCE     = EXT_WEIGHTS["ema20"]
+W_PIVOT_DISTANCE     = EXT_WEIGHTS["pivot"]
+W_BARS_SINCE_TRIGGER = EXT_WEIGHTS["bars"]
+W_FVG_ZONE_DISTANCE  = EXT_WEIGHTS["fvg"]
+# (Its legacy alias key "ex_momentum" is still returned as a constant 0 because
+# decision_engine.DecisionScores reads it.)
 
 
-def _atr_extension_component(r: "BarResult") -> int:
-    """ATR-normalised extension (0-25) — how many ATRs price has moved
+def extension_weights(settings: Optional[dict] = None) -> dict:
+    """Active factor weights: rescaled (sum 100) unless ext_legacy_weights is set."""
+    return EXT_WEIGHTS_LEGACY if bool((settings or {}).get("ext_legacy_weights", False)) else EXT_WEIGHTS
+
+
+def _atr_extension_component(r: "BarResult", w: int = W_ATR_EXTENSION) -> int:
+    """ATR-normalised extension (0-w) — how many ATRs price has moved
     since the setup trigger. Uses the existing v9 PRIMARY freshness
     metric (r.extension_atr / r.atr_band) rather than re-deriving it."""
     band = getattr(r, "atr_band", "Actionable")
     if band == "Actionable":
         return 0
     if band == "Late":
-        return round(W_ATR_EXTENSION * 0.5)
+        return round(w * 0.5)
     if band == "Extended":
-        return W_ATR_EXTENSION
+        return w
     # Fallback to the raw ATR-multiple if atr_band is unavailable.
     ext = getattr(r, "extension_atr", 0.0)
     if ext <= 1.0:
         return 0
     if ext <= 2.5:
-        return round(W_ATR_EXTENSION * 0.5)
-    return W_ATR_EXTENSION
+        return round(w * 0.5)
+    return w
 
 
-def _ema20_distance_component(r: "BarResult") -> int:
-    """EMA20 % distance (0-20)."""
+def _ema20_distance_component(r: "BarResult", w: int = W_EMA20_DISTANCE) -> int:
+    """EMA20 % distance (0-w)."""
     d = r.ema20_pct_dist
     if d <= 2.0:
         return 0
     if d <= 4.0:
-        return round(W_EMA20_DISTANCE * 0.30)
+        return round(w * 0.30)
     if d <= 6.0:
-        return round(W_EMA20_DISTANCE * 0.60)
+        return round(w * 0.60)
     if d <= 10.0:
-        return round(W_EMA20_DISTANCE * 0.85)
-    return W_EMA20_DISTANCE
+        return round(w * 0.85)
+    return w
 
 
-def _pivot_distance_component(r: "BarResult") -> int:
-    """Breakout/pivot distance (0-15) — % past last pivot high."""
+def _pivot_distance_component(r: "BarResult", w: int = W_PIVOT_DISTANCE) -> int:
+    """Breakout/pivot distance (0-w) — % past last pivot high."""
     d = r.pivot_high_dist
     if d <= 0.5:
         return 0
     if d <= 2.0:
-        return round(W_PIVOT_DISTANCE * 0.30)
+        return round(w * 0.30)
     if d <= 4.0:
-        return round(W_PIVOT_DISTANCE * 0.65)
-    return W_PIVOT_DISTANCE
+        return round(w * 0.65)
+    return w
 
 
-def _bars_since_trigger_component(r: "BarResult") -> int:
-    """Bars-since-trigger (0-15). NOTE: the pre-existing _extension()
+def _bars_since_trigger_component(r: "BarResult", w: int = W_BARS_SINCE_TRIGGER) -> int:
+    """Bars-since-trigger (0-w). NOTE: the pre-existing _extension()
     deliberately excluded this to avoid double-counting with Entry
     Quality's eq_bars_since sub-factor. Including it here is a direct,
     disclosed consequence of the user's decision to follow the spec's
@@ -114,13 +133,13 @@ def _bars_since_trigger_component(r: "BarResult") -> int:
     if bss <= 3:
         return 0
     if bss <= 7:
-        return round(W_BARS_SINCE_TRIGGER * 0.5)
-    return W_BARS_SINCE_TRIGGER
+        return round(w * 0.5)
+    return w
 
 
 def _fvg_zone_distance_component(r: "BarResult", smc_state: Optional["SMCState"],
-                                  current_price: Optional[float]) -> int:
-    """Distance from the active SMC retest/FVG zone (0-15). No SMC
+                                  current_price: Optional[float], w: int = W_FVG_ZONE_DISTANCE) -> int:
+    """Distance from the active SMC retest/FVG zone (0-w). No SMC
     evidence or no zone available -> 0 (this factor cannot penalize a
     symbol SMC has no opinion on)."""
     if smc_state is None or smc_state.fvg_high is None or smc_state.fvg_low is None:
@@ -143,16 +162,17 @@ def _fvg_zone_distance_component(r: "BarResult", smc_state: Optional["SMCState"]
         return 0   # inside the zone — no chase risk from this factor
     dist_in_zone_widths = abs(price - zone_mid) / zone_width
     if dist_in_zone_widths <= 1.0:
-        return round(W_FVG_ZONE_DISTANCE * 0.4)
+        return round(w * 0.4)
     if dist_in_zone_widths <= 2.5:
-        return round(W_FVG_ZONE_DISTANCE * 0.75)
-    return W_FVG_ZONE_DISTANCE
+        return round(w * 0.75)
+    return w
 
 
 def compute_extension_penalty(
     r: "BarResult",
     smc_state: Optional["SMCState"] = None,
     current_price: Optional[float] = None,
+    settings: Optional[dict] = None,
 ) -> dict:
     """
     Single shared Extension/Chase Risk measurement (§1.4/§2).
@@ -165,11 +185,12 @@ def compute_extension_penalty(
     `decision_engine.py`'s DecisionScores fields keep receiving values
     without needing their own field names changed.
     """
-    atr_ext  = _atr_extension_component(r)
-    ema20    = _ema20_distance_component(r)
-    pivot    = _pivot_distance_component(r)
-    bars     = _bars_since_trigger_component(r)
-    fvg_dist = _fvg_zone_distance_component(r, smc_state, current_price)
+    w = extension_weights(settings)
+    atr_ext  = _atr_extension_component(r, w["atr"])
+    ema20    = _ema20_distance_component(r, w["ema20"])
+    pivot    = _pivot_distance_component(r, w["pivot"])
+    bars     = _bars_since_trigger_component(r, w["bars"])
+    fvg_dist = _fvg_zone_distance_component(r, smc_state, current_price, w["fvg"])
 
     total = atr_ext + ema20 + pivot + bars + fvg_dist
 

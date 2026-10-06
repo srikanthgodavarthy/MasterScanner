@@ -2219,7 +2219,7 @@ def _entry_quality_v4(r: "BarResult", smc_state=None, current_price: Optional[fl
     eq_volume_execution = ve
 
     # ── Extension/Chase Risk (15 pts, SUBTRACTIVE) — shared function ──
-    pen = compute_extension_penalty(r, smc_state=smc_state, current_price=current_price)
+    pen = compute_extension_penalty(r, smc_state=smc_state, current_price=current_price, settings=settings)
     severity = pen["severity_0_100"]
     eq_extension_chase_risk = round(max(0.0, min(15.0, 15.0 * (1.0 - severity / 100.0))))
 
