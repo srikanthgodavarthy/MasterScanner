@@ -8,6 +8,8 @@ not here.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from utils import conviction_score_v1 as cv
@@ -402,3 +404,26 @@ def test_score_stock_passes_traded_rr_when_a_trade_geometry_exists(monkeypatch, 
     # no levels -> no override -> evaluate_promotion falls back to the fixed geometry
     without = [c for _, calls in out for c in calls if not c["entry"]]
     assert all(c["override"] is None for c in without)
+
+
+# ── pages/portfolio.py: neutral context for unknown trend age / extension ────
+
+def test_neutral_context_fires_no_adjustor_even_with_the_bonus_enabled():
+    from utils.adaptive_target_engine import NEUTRAL_TREND_AGE_BARS, NEUTRAL_EXTENSION_SCORE_ATR
+    at = compute_adaptive_targets(entry=100, risk=4, category="Actionable", leadership=75, conviction=65,
+                                  entry_quality=65, extension=10, trend_age_bars=NEUTRAL_TREND_AGE_BARS,
+                                  extension_score_atr=NEUTRAL_EXTENSION_SCORE_ATR, ema20_pct_dist=0.0,
+                                  params=AdaptiveTargetParams(trend_age_bonus=True))
+    assert at.reasons == [] and at.t1_mult == pytest.approx(1.5)   # Actionable base, untouched
+
+
+def test_the_engine_defaults_are_not_neutral_which_is_why_callers_must_pass_them():
+    at = compute_adaptive_targets(entry=100, risk=4, category="Actionable", leadership=75, conviction=65,
+                                  entry_quality=65)
+    assert at.t1_mult > 1.5 and any("Fresh" in r for r in at.reasons)   # default == "Fresh" reward
+
+
+def test_portfolio_page_does_not_feed_days_held_in_as_trend_age():
+    src = open(os.path.join(os.path.dirname(__file__), "..", "pages", "portfolio.py"), encoding="utf-8").read()
+    assert "trend_age_bars=result.days_held" not in src
+    assert "trend_age_bars=NEUTRAL_TREND_AGE_BARS" in src and "extension_score_atr=NEUTRAL_EXTENSION_SCORE_ATR" in src

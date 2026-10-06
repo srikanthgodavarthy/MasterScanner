@@ -276,6 +276,16 @@ def compute_adaptive_targets(
     )
 
 
+# Context a caller does NOT have. compute_adaptive_targets() treats its defaults as
+# real readings (trend_age_bars=0 -> "young trend"; extension_score_atr=0 -> "Fresh",
+# +0.25R), so a caller with no such information must pass these NEUTRAL values
+# instead of leaving the defaults or passing a stand-in. Neutral = inside the band
+# where no adjustor fires (trend age 40-100 bars; extension score 1 = "Late" has no
+# adjustment, only 0 rewards and >=2 penalises).
+NEUTRAL_TREND_AGE_BARS = 60
+NEUTRAL_EXTENSION_SCORE_ATR = 1
+
+
 # ══════════════════════════════════════════════════════════════════
 #  TARGET CATEGORY  (single definition, CV4-aligned)
 # ══════════════════════════════════════════════════════════════════

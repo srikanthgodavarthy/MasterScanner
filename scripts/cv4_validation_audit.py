@@ -313,6 +313,52 @@ def empirical(path: str, min_n: int = 40) -> None:
         print("  RULE: an adjustor that stretches T1 should come with a HIGHER mean outcome, not just fewer"
               "\n  T1 hits. If T1-reach falls and the outcome is not better, leave it off.")
 
+    structural_ceiling_evidence(df, out_col, min_n)
+
+
+def structural_ceiling_evidence(df, out_col: str, min_n: int = 40) -> None:
+    """Evidence for a REAL R:R gate (audit #3 follow-up). The traded-geometry gate is
+    repaired but, because adaptive T2 R:R is never below 2.0, it still cannot fail at the
+    default settings: R:R is set by the category's multiples, not by the market. A gate
+    that measures the market would use the distance to overhead structure. The backtest
+    logs structural_ceiling_r (nearest of resistance / measured move / 3-ATR envelope) but
+    does not enforce it. This reports whether it predicts anything before anyone does."""
+    print("\n" + "=" * 78 + "\n#3+  structural ceiling — would gating on it help?\n" + "=" * 78)
+    need = ["structural_ceiling_r", "structural_ceiling_source", "mfe_r", "t1_mult", out_col]
+    if not _need(df, need, "#3+"):
+        return
+    d = df.dropna(subset=["structural_ceiling_r", "mfe_r", "t1_mult"]).copy()
+    d["t1_reached"] = d["mfe_r"] >= d["t1_mult"]
+    print(f"  usable rows: {len(d)}")
+    if len(d) < min_n:
+        print(f"  INCONCLUSIVE — fewer than {min_n} rows.")
+        return
+    print("  by ceiling source (the 3-ATR envelope is ALWAYS available, so it dominates whenever no\n"
+          "  real resistance sits closer — a gate on it mostly measures stop width in ATRs):")
+    g = d.groupby("structural_ceiling_source").agg(n=("t1_reached", "size"), median_ceiling_r=("structural_ceiling_r", "median"),
+                                                   t1_reached=("t1_reached", "mean"), mean_outcome=(out_col, "mean"))
+    print(g.to_string(float_format=lambda x: f"{x:.2f}"))
+    real = d[d["structural_ceiling_source"].isin(["resistance", "measured_move"])]
+    print(f"\n  trades whose nearest ceiling is REAL structure (resistance/measured move): {len(real)} of {len(d)}")
+    if len(real) < min_n:
+        print("  INCONCLUSIVE for a gate on real structure — too few such trades.")
+        return
+    real = real.assign(bucket=pd_cut(real["structural_ceiling_r"]))
+    print(real.groupby("bucket", observed=True).agg(n=("t1_reached", "size"), t1_reached=("t1_reached", "mean"),
+                                                    mean_outcome=(out_col, "mean")).to_string(float_format=lambda x: f"{x:.2f}"))
+    lo = real[real["structural_ceiling_r"] < 1.5]
+    hi = real[real["structural_ceiling_r"] >= 1.5]
+    if len(lo) >= 10 and len(hi) >= 10:
+        print(f"  ceiling < 1.5R: T1 reached {lo['t1_reached'].mean():.0%}, outcome {lo[out_col].mean():+.2f}  |  "
+              f">= 1.5R: {hi['t1_reached'].mean():.0%}, {hi[out_col].mean():+.2f}")
+    print("  RULE: build a ceiling gate only if trades with a close REAL ceiling both reach T1 less often"
+          "\n  AND earn a lower outcome than the rest, on enough trades. Otherwise a gate is a guess.")
+
+
+def pd_cut(series):
+    import pandas as pd
+    return pd.cut(series, bins=[-np.inf, 1.0, 1.5, 2.0, np.inf], labels=["<1.0R", "1.0-1.5R", "1.5-2.0R", ">=2.0R"])
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

@@ -87,3 +87,43 @@ def test_missing_columns_are_reported_not_guessed(tmp_path, capsys):
     audit.empirical(str(f))
     out = capsys.readouterr().out
     assert out.count("SKIPPED") >= 2 and "SUPPORTS" not in out
+
+
+# ── #3+ structural-ceiling evidence ─────────────────────────────────────────
+
+def _ceiling_csv(path, n, p_real, planted=True, seed=3):
+    g = np.random.default_rng(seed)
+    src = g.choice(["atr_envelope", "resistance", "measured_move"], n,
+                   p=[1 - p_real, p_real * .7, p_real * .3])
+    ceil = np.where(src == "atr_envelope", g.uniform(1.0, 2.0, n), g.uniform(0.5, 4.0, n))
+    mfe = np.abs(g.normal(0.6 + (0.45 * ceil * (src != "atr_envelope") if planted else 0.9), 0.7))
+    pd.DataFrame(dict(symbol=g.integers(0, 80, n), structural_ceiling_r=ceil, structural_ceiling_source=src,
+                      mfe_r=mfe, t1_mult=1.5, r_multiple=np.where(mfe >= 1.5, 1.2, -0.6) + g.normal(0, .3, n),
+                      rs_composite=0.0, rs_vs_sector=0.0, rs_sector_available=False, trend_up=True,
+                      ema_alignment=True, above_cloud=True, target_notes="")).to_csv(path, index=False)
+
+
+def test_ceiling_evidence_surfaces_a_real_effect_of_close_resistance(tmp_path, capsys):
+    f = tmp_path / "c.csv"
+    _ceiling_csv(f, n=900, p_real=0.5)
+    audit.empirical(str(f))
+    line = next(l for l in capsys.readouterr().out.splitlines() if "ceiling < 1.5R" in l)
+    near, far = line.split("|")
+    pct = lambda s: int(s.split("T1 reached ")[1].split("%")[0]) if "T1 reached" in s else int(s.split(":")[1].split("%")[0])
+    assert pct(near) + 20 < pct(far)           # planted: close ceiling hurts T1 reach by a wide margin
+
+
+def test_ceiling_evidence_refuses_to_conclude_on_too_few_real_structure_trades(tmp_path, capsys):
+    f = tmp_path / "c.csv"
+    _ceiling_csv(f, n=300, p_real=0.05)        # ~15 trades with real structure, below min_n=40
+    audit.empirical(str(f))
+    out = capsys.readouterr().out
+    assert "INCONCLUSIVE for a gate on real structure" in out
+    assert "ceiling < 1.5R" not in out
+
+
+def test_ceiling_evidence_warns_that_the_atr_envelope_dominates(tmp_path, capsys):
+    f = tmp_path / "c.csv"
+    _ceiling_csv(f, n=900, p_real=0.5)
+    audit.empirical(str(f))
+    assert "ALWAYS available" in capsys.readouterr().out

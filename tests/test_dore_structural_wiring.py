@@ -22,6 +22,7 @@ import pytest
 from utils.dore_options_engine import (
     compute_dore_trade_plan, OptionTradePlan, DoreRejection, DoreOptionsSettings,
     _discover_structural_target, _validate_structural_geometry, _structural_premium_ceiling,
+    _target1_premium_pct, _target2_premium_pct,
     STRUCTURAL_TARGET_LIQUIDITY, STRUCTURAL_TARGET_FVG, STRUCTURAL_TARGET_TECHNICAL_FALLBACK,
     CE, PE,
 )
@@ -524,7 +525,7 @@ def test_structural_target_capping_applied_to_target1_and_target2():
     assert isinstance(plan, OptionTradePlan), f"got rejection: {plan}"
     assert plan.is_structurally_anchored is True
     assert plan.structural_target_price is not None
-    uncapped_target2 = round(plan.primary.premium * (1 + DoreOptionsSettings().target2_premium_pct), 2)
+    uncapped_target2 = round(plan.primary.premium * (1 + _target2_premium_pct(14, DoreOptionsSettings())), 2)
     assert plan.target2 < uncapped_target2
     assert any("capp" in r.lower() for r in plan.reasons)
 
@@ -539,8 +540,8 @@ def test_structural_target_not_capped_when_structural_data_unavailable():
     )
     assert isinstance(plan, OptionTradePlan), f"got rejection: {plan}"
     assert plan.structural_target_price is None
-    expected_target1 = round(plan.primary.premium * (1 + DoreOptionsSettings().target1_premium_pct), 2)
-    expected_target2 = round(plan.primary.premium * (1 + DoreOptionsSettings().target2_premium_pct), 2)
+    expected_target1 = round(plan.primary.premium * (1 + _target1_premium_pct(14, DoreOptionsSettings())), 2)
+    expected_target2 = round(plan.primary.premium * (1 + _target2_premium_pct(14, DoreOptionsSettings())), 2)
     assert plan.target1 == expected_target1
     assert plan.target2 == expected_target2
 

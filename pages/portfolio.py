@@ -54,7 +54,9 @@ from utils.portfolio_engine import suggest_add  # entry-side "top up a winner" j
 from utils.exit_intelligence_engine import (
     ExitIntelligenceConfig, compute_exit_strength, DISPLAY_FACTOR_DIRECTION, RECOMMENDATION_LABEL, _atr,
 )
-from utils.adaptive_target_engine import compute_adaptive_targets
+from utils.adaptive_target_engine import (
+    compute_adaptive_targets, NEUTRAL_TREND_AGE_BARS, NEUTRAL_EXTENSION_SCORE_ATR,
+)
 from utils.lifecycle_engine import STAGE_META
 from utils.market_data import fetch_ohlcv, fetch_previous_close  # lightweight — no scanner/NSE-universe import cost
 
@@ -710,7 +712,15 @@ def _compute_row(pos: dict, cfg: ExitIntelligenceConfig, live_metrics: pd.DataFr
             leadership=int(current_leadership or pos.get("locked_leadership") or 0),
             conviction=int(current_conviction or pos.get("locked_conviction") or 0),
             entry_quality=int(_lm_get(lm_row, "entry_quality") or 0),
-            trend_age_bars=result.days_held,
+            # [Fix, 2026-10-05] This used to feed days_held in as the trend age.
+            # Days since ENTRY is not the trend's age: a position held >100 days
+            # was charged the engine's "old trend" -0.25R, and a new one could earn
+            # the young-trend bonus. A position record stores neither the trend age
+            # nor the entry-time extension, and the engine's defaults would be read
+            # as real ("Fresh" -> +0.25R on every position), so pass NEUTRAL context:
+            # the targets then reflect only category + L/C/EQ, nothing invented.
+            trend_age_bars=NEUTRAL_TREND_AGE_BARS,
+            extension_score_atr=NEUTRAL_EXTENSION_SCORE_ATR,
         )
     rr = round((targets.t3 - result.price) / risk_per_share, 2) if (targets and risk_per_share) else None
     t1_hit = bool(targets and result.price >= targets.t1)

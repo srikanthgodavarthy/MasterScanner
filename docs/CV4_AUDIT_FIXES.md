@@ -96,24 +96,53 @@ A hard cap for the real chase case is an option I did not add.
   and the Extended −0.5R could never fire.** This probably explains the
   2.0R/4.0R/6.7R targets the audit saw. Fixed (one line). Live targets for
   genuinely late entries will now be shorter than before.
-* `pages/portfolio.py` passes `days_held` as `trend_age_bars` to the target
-  engine. **Not fixed** — it is a separate page and I did not want to widen the
-  change. It should pass the trend age.
+* `pages/portfolio.py` fed `days_held` (days since entry) into the target engine
+  as the trend's age, so a position held >100 days was charged the "old trend"
+  −0.25R, and the call left `extension_score_atr` at its default 0, which the
+  engine reads as "Fresh" (+0.25R on every position). A position record stores
+  neither value, so it now passes **neutral** context
+  (`NEUTRAL_TREND_AGE_BARS`, `NEUTRAL_EXTENSION_SCORE_ATR`: inside the band where
+  no adjustor fires). Visible effect: portfolio T1/T2/T3 lose the spurious
+  +0.25R "Fresh" bonus, so `t1_hit` (which gates ADD suggestions) can flip to
+  true slightly earlier. Not fixed: recomputing targets from *current* scores
+  rather than the plan's locked ones, a separate design question.
 
-## Pre-existing failures (not caused by this work)
+## Pre-existing test failures (fixed)
 
-`tests/test_dore_structural_wiring.py` — 2 tests fail at baseline
-(`DoreOptionsSettings` has no `target1_premium_pct` / `target2_premium_pct`; the
-error suggests per-DTE variants such as `target2_premium_pct_0_2_dte` replaced
-them — I did not investigate further). Untouched.
+Two tests in `tests/test_dore_structural_wiring.py` failed at baseline: they read
+`DoreOptionsSettings().target1_premium_pct` / `target2_premium_pct`, which no
+longer exist — production buckets targets by DTE through
+`_target1_premium_pct(dte, settings)` / `_target2_premium_pct(...)`. A stale test,
+not a product bug; the tests now call those helpers with the fixture's `dte=14`.
+No production code changed.
 
-## Test coverage — and its limits
+## Test coverage
 
-360 pass, 2 pre-existing failures. New: `tests/test_cv4_audit_fixes.py` (pins each
-finding; includes forced-bypass end-to-end tests through `score_stock`, which I
-mutation-checked by breaking the floor and the R:R override and confirming the
-matching tests fail) and `tests/test_cv4_validation_audit.py`.
+380 pass, 0 fail. New files: `tests/test_cv4_audit_fixes.py` (each finding, plus
+forced-bypass end-to-end tests through `score_stock`), `tests/test_backtest_audit_wiring.py`
+(the backtest loop: bypass floor, kill-switch, traded-R:R gate in both directions,
+fixed-geometry fallback, bypass receiving the traded R:R) and
+`tests/test_cv4_validation_audit.py`. The live and backtest wiring tests were
+mutation-checked: each behaviour was broken on purpose (floor removed, R:R override
+dropped, gate reverted to the fixed geometry, kill-switch ignored) and the matching
+tests failed.
 
-Not covered: the backtest loop's bypass floor and traded-R:R gate are changed
-but have **no dedicated test** (only one existing test matches "backtest"). They mirror the
-live code and import cleanly. Treat them as unverified until a backtest is run.
+Limits: the backtest tests stub the indicator build, the bar scorer and the CV4
+call so one candidate bar is fully controlled; they prove the gating logic, not that
+real price history produces the bars you expect. `scripts/cv4_validation_audit.py`'s
+empirical mode is verified on synthetic data with planted effects only — it has not
+seen a real trades export.
+
+## What was deliberately NOT built
+
+**A gate on the structural ceiling.** `structural_ceiling` returns the nearest of
+resistance, measured move and a 3-ATR envelope. The envelope is always available and
+sits at 3 ATR while stops are 1.5–2.5 ATR, so a naive "ceiling R:R >= minimum" gate
+mostly measures stop width and would reject nearly everything at 2R. The repo's own
+comments call the ceiling uncalibrated and "not yet enforced". Instead,
+`empirical` mode now reports (section `#3+`) whether a close *real* ceiling
+(resistance / measured move) predicts lower T1 reach and outcomes, and refuses to
+conclude on too few such trades. Build the gate only if that evidence supports it.
+
+**The two design decisions** — Elite requiring SMC, and Conviction/Entry Quality
+reading the same `evidence_tier` — are yours to make; see above.
