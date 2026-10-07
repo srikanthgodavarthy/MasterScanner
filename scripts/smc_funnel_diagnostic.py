@@ -96,7 +96,8 @@ def analyse_symbol(symbol: str, df: pd.DataFrame, days: int,
             raise AssertionError(
                 f"{symbol} bar {i}: derived conflict={derived_conflict} but engine "
                 f"state={st.state} — raw-flag logic no longer mirrors the engine")
-        eq = smc_entry_structure_score(st, "BULLISH")
+        # live default: smc_structural_gate_enabled=True -> the gate owns a failed FVG zone, so EQ does not also charge -8
+        eq = smc_entry_structure_score(st, "BULLISH", gate_owns_failed_zone=True)
         cv = smc_conviction_score(st, "BULLISH")
 
         if engine_conflict:
