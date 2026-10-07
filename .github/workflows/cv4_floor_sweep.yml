@@ -1,0 +1,65 @@
+# CV4 floor sweep — READ-ONLY, manual trigger only.
+# Runs scripts/cv4_floor_sweep.py on a trades CSV that YOU commit to the repo
+# (default backtests/trades.csv — export it from the Backtest page, mode
+# "scanner", with "shadow_no_admission_gate" ON). Pandas/numpy only; touches no
+# database and no secrets. Report appears on the run's Summary page.
+name: CV4 floor sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      csv_path:
+        description: "Path of the trades CSV inside the repo"
+        default: "backtests/trades.csv"
+      holdout:
+        description: "Fraction of latest trades held out as TEST"
+        default: "0.4"
+      min_n:
+        description: "Min TRAIN trades per floor combo"
+        default: "30"
+      min_syms:
+        description: "Min distinct TRAIN symbols per combo"
+        default: "15"
+      min_rr:
+        description: "R:R filter (0 = off)"
+        default: "2.0"
+      perms:
+        description: "Permutations for the selection test (0 = skip)"
+        default: "300"
+      top:
+        description: "Rows to show"
+        default: "15"
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pandas numpy
+      - name: Check trades CSV exists
+        run: |
+          if [ ! -f "${{ inputs.csv_path }}" ]; then
+            echo "::error::Trades CSV not found at ${{ inputs.csv_path }}. Commit it to the repo first (Add file > Upload files)."
+            exit 1
+          fi
+          echo "rows: $(($(wc -l < "${{ inputs.csv_path }}") - 1))"
+      - name: Run floor sweep
+        run: |
+          mkdir -p sweep_out
+          python scripts/cv4_floor_sweep.py "${{ inputs.csv_path }}" \
+            --holdout "${{ inputs.holdout }}" \
+            --min-n "${{ inputs.min_n }}" \
+            --min-syms "${{ inputs.min_syms }}" \
+            --min-rr "${{ inputs.min_rr }}" \
+            --perms "${{ inputs.perms }}" \
+            --top "${{ inputs.top }}" \
+            --out sweep_out/sweep_results.csv | tee sweep_out/report.txt
+          { echo '```'; cat sweep_out/report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cv4-floor-sweep
+          path: sweep_out/
