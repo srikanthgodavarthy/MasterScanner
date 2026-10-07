@@ -697,22 +697,144 @@ def _tab_advanced() -> None:
                  "backtest's own population filter (utils/backtest_engine.py Gate 3).")
         _s("backtest_min_rr", float(bt_min_rr))
 
-    # ── CV1 v3 tier / signal thresholds & Promotion Engine ───────
-    with st.expander("CV1 v3 — Tier & Promotion thresholds", expanded=False):
+    # ── CV4 tier thresholds, promotion engine & audit switches ───
+    # CV4 (utils/conviction_score_v1.py V4_THRESHOLD_DEFAULTS) is the LIVE
+    # gate: classify_tier_v4() only ever reads "v4_*" keys. The v3 grid
+    # that used to sit here wrote "v3_*" keys that the live scanner never
+    # reads, so editing it silently did nothing.
+    with st.expander("CV4 — Tier & Promotion thresholds (LIVE)", expanded=False):
         st.markdown(
-            "<small style='color:#8b949e'>These are PLACEHOLDER THRESHOLDS "
-            "(utils/conviction_score_v1.py) — proportionally scaled, not yet "
-            "re-validated against a real v3 score distribution. Edit any cell "
-            "below; changes apply on next Run Scan or Backtest.</small>",
+            "<small style='color:#8b949e'>These are the floors the Live Scanner "
+            "and Run Scan actually use (<code>classify_tier_v4</code>). Defaults are "
+            "NOT backtest-fit. Changes apply on next Run Scan or Backtest.</small>",
             unsafe_allow_html=True,
         )
-
-        # ── Tier floor table — strict AND across all four columns per row
-        # (see classify_tier_v3() / _classify_v3() in utils/conviction_score_v1.py).
-        # Replaces the old slider-per-field layout with a single editable
-        # grid so all four tiers are visible and editable at once.
         st.markdown("**Tier floors** (Leadership / Conviction / Entry Quality / Composite — AND-gated per row)")
 
+        _V4_TIER_ROWS = ["Elite", "Execute", "Actionable"]
+        _V4_TIER_KEY  = {"Elite": "elite", "Execute": "execute", "Actionable": "actionable"}
+        _v4_tier_df = pd.DataFrame(
+            {
+                "Leadership":    [int(_g(f"v4_{_V4_TIER_KEY[r]}_leadership_min"))    for r in _V4_TIER_ROWS],
+                "Conviction":    [int(_g(f"v4_{_V4_TIER_KEY[r]}_conviction_min"))    for r in _V4_TIER_ROWS],
+                "Entry Quality": [int(_g(f"v4_{_V4_TIER_KEY[r]}_entry_quality_min")) for r in _V4_TIER_ROWS],
+                "Composite":     [int(_g(f"v4_{_V4_TIER_KEY[r]}_composite_min"))     for r in _V4_TIER_ROWS],
+            },
+            index=_V4_TIER_ROWS,
+        )
+        _v4_edited = st.data_editor(
+            _v4_tier_df,
+            key="de_v4_tier_floors",
+            width='stretch',
+            column_config={
+                col: st.column_config.NumberColumn(col, min_value=0, max_value=100, step=1)
+                for col in _v4_tier_df.columns
+            },
+        )
+        for _r in _V4_TIER_ROWS:
+            _tk = _V4_TIER_KEY[_r]
+            _s(f"v4_{_tk}_leadership_min",    int(_v4_edited.loc[_r, "Leadership"]))
+            _s(f"v4_{_tk}_conviction_min",    int(_v4_edited.loc[_r, "Conviction"]))
+            _s(f"v4_{_tk}_entry_quality_min", int(_v4_edited.loc[_r, "Entry Quality"]))
+            _s(f"v4_{_tk}_composite_min",     int(_v4_edited.loc[_r, "Composite"]))
+        _ar = _v4_edited.loc["Actionable"]
+        _implied = (_ar["Leadership"] + _ar["Conviction"] + _ar["Entry Quality"]) / 3
+        st.caption(
+            f"Composite is the equal-weight mean of the three pillars. Actionable's "
+            f"per-pillar floors already imply a composite of {_implied:.1f}; a "
+            f"Composite floor above that is the binding one."
+        )
+
+        _divider()
+        st.markdown("**Watch floor** (base funnel — strict AND across all three)")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            _label("Watch: Leadership ≥")
+            v = st.number_input("Watch Leadership", 0, 100, int(_g("v4_watch_leadership_min")),
+                step=5, key="ni_v4_watch_ls", label_visibility="collapsed")
+            _s("v4_watch_leadership_min", int(v))
+        with c2:
+            _label("Watch: Conviction ≥")
+            v = st.number_input("Watch Conviction", 0, 100, int(_g("v4_watch_conviction_min")),
+                step=5, key="ni_v4_watch_cv", label_visibility="collapsed")
+            _s("v4_watch_conviction_min", int(v))
+        with c3:
+            _label("Watch: Entry Quality ≥")
+            v = st.number_input("Watch Entry Quality", 0, 100, int(_g("v4_watch_entry_quality_min")),
+                step=5, key="ni_v4_watch_eq", label_visibility="collapsed")
+            _s("v4_watch_entry_quality_min", int(v))
+
+        _divider()
+        st.markdown(
+            "**Promotion Engine** (utils/promotion_engine.py) — Promo Score "
+            "and R:R thresholds are all plain overrides, freely adjustable "
+            "in either direction."
+        )
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            _label("Execute Promo Score ≥")
+            v = st.slider("Promo Execute", 0, 100, int(_g("promo_execute_score_min")),
+                step=5, key="sl_promo_exec", label_visibility="collapsed")
+            _s("promo_execute_score_min", int(v))
+        with c2:
+            _label("Elite Promo Score ≥")
+            v = st.slider("Promo Elite", 0, 100, int(_g("promo_elite_score_min")),
+                step=5, key="sl_promo_elite", label_visibility="collapsed")
+            _s("promo_elite_score_min", int(v))
+        with c3:
+            _label("Elite R:R ≥")
+            v = st.slider("Promo Elite RR", 1.0, 5.0, float(_g("promo_min_rr_elite")),
+                step=0.1, key="sl_promo_elite_rr", label_visibility="collapsed")
+            _s("promo_min_rr_elite", float(v))
+
+        _divider()
+        st.markdown("**Universe-wide promo bypass** (2026-10-05 audit)")
+        st.caption(
+            "The bypass lets timing signals (stoch / LL spring / VWAP / volume) lift a "
+            "stock to Execute/Elite without the quality floors. Since the audit it "
+            "requires Leadership ≥ the value below; 0 restores the old no-floor behaviour."
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            _label("Enable promo bypass")
+            v = st.toggle("Promo bypass", value=bool(_g("promo_bypass_enabled", True)),
+                key="w_promo_bypass_enabled")
+            _s("promo_bypass_enabled", bool(v))
+        with c2:
+            _label("Bypass min Leadership")
+            v = st.number_input("Bypass min Leadership", 0, 100,
+                int(_g("promo_bypass_min_leadership", 50)), step=5,
+                key="ni_promo_bypass_min_ls", label_visibility="collapsed")
+            _s("promo_bypass_min_leadership", int(v))
+
+    with st.expander("CV4 — audit A/B switches (restore pre-2026-10-05 scoring)", expanded=False):
+        st.caption(
+            "Each switch ON restores the old behaviour exactly. All CV4 de-dup "
+            "switches ON + extension legacy weights ON = byte-identical to the "
+            "pre-audit scorer. Use to test whether the audit changes are why "
+            "recommendations dried up."
+        )
+        _CV4_SWITCHES = [
+            ("cv4_legacy_ls_rs_momentum",        "Leadership also scores rs_momentum (+3)"),
+            ("cv4_legacy_ls_regime",             "Leadership also scores Nifty regime (+7)"),
+            ("cv4_legacy_ls_trend_overlap",      "Leadership double-counts EMA20>EMA50"),
+            ("cv4_legacy_cv_volume",             "Conviction also scores today's volume (+10)"),
+            ("cv4_legacy_cv_cci",                "Conviction also scores CCI recovery (+3)"),
+            ("cv4_legacy_ls_trend_age",          "Old stepped trend-age ladder"),
+            ("cv4_legacy_sector_missing_credit", "Missing sector data earns 9 pts (not 5)"),
+            ("ext_legacy_weights",               "Extension weights 25/20/15/15/15 (not 28/22/17/17/16)"),
+        ]
+        for _k, _lbl in _CV4_SWITCHES:
+            v = st.toggle(_lbl, value=bool(_g(_k, False)), key=f"w_{_k}")
+            _s(_k, bool(v))
+
+    with st.expander("Legacy CV1 v3 thresholds — backtest comparison only (NOT live)", expanded=False):
+        st.markdown(
+            "<small style='color:#f0883e'>These <code>v3_*</code> keys only feed the "
+            "backtest engine's legacy v3 comparison path. They do NOT affect the "
+            "Live Scanner or Run Scan.</small>",
+            unsafe_allow_html=True,
+        )
         _V3_TIER_ROWS = ["Elite", "Execute", "Actionable", "Developing"]
         _V3_TIER_KEY  = {"Elite": "elite", "Execute": "execute",
                          "Actionable": "actionable", "Developing": "developing"}
@@ -740,51 +862,17 @@ def _tab_advanced() -> None:
             _s(f"v3_{_tk}_conviction_min",    int(_v3_edited.loc[_r, "Conviction"]))
             _s(f"v3_{_tk}_entry_quality_min", int(_v3_edited.loc[_r, "Entry Quality"]))
             _s(f"v3_{_tk}_composite_min",     int(_v3_edited.loc[_r, "Composite"]))
-
-        _divider()
-        st.markdown(
-            "**Promotion Engine** (utils/promotion_engine.py) — Promo Score "
-            "and R:R thresholds are all plain overrides, freely adjustable "
-            "in either direction."
-        )
         c1, c2, c3 = st.columns(3)
-        with c1:
-            _label("Execute Promo Score ≥")
-            v = st.slider("Promo Execute", 0, 100, int(_g("promo_execute_score_min")),
-                step=5, key="sl_promo_exec", label_visibility="collapsed")
-            _s("promo_execute_score_min", int(v))
-        with c2:
-            _label("Elite Promo Score ≥")
-            v = st.slider("Promo Elite", 0, 100, int(_g("promo_elite_score_min")),
-                step=5, key="sl_promo_elite", label_visibility="collapsed")
-            _s("promo_elite_score_min", int(v))
-        with c3:
-            _label("Elite R:R ≥")
-            v = st.slider("Promo Elite RR", 1.0, 5.0, float(_g("promo_min_rr_elite")),
-                step=0.1, key="sl_promo_elite_rr", label_visibility="collapsed")
-            _s("promo_min_rr_elite", float(v))
-
-        # ── Watch — the one tier not in the table above (no Composite
-        # column shown; base-funnel entry point). Left as plain, always-
-        # visible number inputs since it's just three values.
-        _divider()
-        st.markdown("**Watch floor** (base funnel — strict AND across all three, per decile backtest)")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            _label("Watch: Leadership ≥")
-            v = st.number_input("Watch Leadership", 0, 100, int(_g("v3_watch_leadership_min")),
-                step=5, key="ni_v3_watch_ls", label_visibility="collapsed")
-            _s("v3_watch_leadership_min", int(v))
-        with c2:
-            _label("Watch: Conviction ≥")
-            v = st.number_input("Watch Conviction", 0, 100, int(_g("v3_watch_conviction_min")),
-                step=5, key="ni_v3_watch_cv", label_visibility="collapsed")
-            _s("v3_watch_conviction_min", int(v))
-        with c3:
-            _label("Watch: Entry Quality ≥")
-            v = st.number_input("Watch Entry Quality", 0, 100, int(_g("v3_watch_entry_quality_min")),
-                step=5, key="ni_v3_watch_eq", label_visibility="collapsed")
-            _s("v3_watch_entry_quality_min", int(v))
+        for _col, _lab, _k, _nk in (
+            (c1, "Watch: Leadership ≥", "v3_watch_leadership_min", "ni_v3_watch_ls"),
+            (c2, "Watch: Conviction ≥", "v3_watch_conviction_min", "ni_v3_watch_cv"),
+            (c3, "Watch: Entry Quality ≥", "v3_watch_entry_quality_min", "ni_v3_watch_eq"),
+        ):
+            with _col:
+                _label(_lab)
+                v = st.number_input(_lab, 0, 100, int(_g(_k)), step=5, key=_nk,
+                                    label_visibility="collapsed")
+                _s(_k, int(v))
 
     # ── Institutional Continuation (VWAP Reclaim) ────────────────
     with st.expander("Institutional Continuation", expanded=False):
@@ -1295,6 +1383,30 @@ def render() -> dict:
         "ic_momentum_weight":        ss.get("ic_momentum_weight",        DEFAULTS["ic_momentum_weight"]),
         "ic_confluence_weight":      ss.get("ic_confluence_weight",      DEFAULTS["ic_confluence_weight"]),
         "bt_default_engine":         ss.get("bt_default_engine",         DEFAULTS["bt_default_engine"]),
+        # ── CV4 tier thresholds / bypass / audit switches (LIVE) ─
+        "v4_watch_leadership_min": ss.get("v4_watch_leadership_min", DEFAULTS["v4_watch_leadership_min"]),
+        "v4_watch_conviction_min": ss.get("v4_watch_conviction_min", DEFAULTS["v4_watch_conviction_min"]),
+        "v4_watch_entry_quality_min": ss.get("v4_watch_entry_quality_min", DEFAULTS["v4_watch_entry_quality_min"]),
+        "v4_actionable_leadership_min": ss.get("v4_actionable_leadership_min", DEFAULTS["v4_actionable_leadership_min"]),
+        "v4_actionable_conviction_min": ss.get("v4_actionable_conviction_min", DEFAULTS["v4_actionable_conviction_min"]),
+        "v4_actionable_entry_quality_min": ss.get("v4_actionable_entry_quality_min", DEFAULTS["v4_actionable_entry_quality_min"]),
+        "v4_execute_leadership_min": ss.get("v4_execute_leadership_min", DEFAULTS["v4_execute_leadership_min"]),
+        "v4_execute_conviction_min": ss.get("v4_execute_conviction_min", DEFAULTS["v4_execute_conviction_min"]),
+        "v4_execute_entry_quality_min": ss.get("v4_execute_entry_quality_min", DEFAULTS["v4_execute_entry_quality_min"]),
+        "v4_elite_leadership_min": ss.get("v4_elite_leadership_min", DEFAULTS["v4_elite_leadership_min"]),
+        "v4_elite_conviction_min": ss.get("v4_elite_conviction_min", DEFAULTS["v4_elite_conviction_min"]),
+        "v4_elite_entry_quality_min": ss.get("v4_elite_entry_quality_min", DEFAULTS["v4_elite_entry_quality_min"]),
+        "v4_actionable_composite_min": ss.get("v4_actionable_composite_min", DEFAULTS["v4_actionable_composite_min"]),
+        "v4_execute_composite_min": ss.get("v4_execute_composite_min", DEFAULTS["v4_execute_composite_min"]),
+        "v4_elite_composite_min": ss.get("v4_elite_composite_min", DEFAULTS["v4_elite_composite_min"]),
+        "cv4_legacy_ls_rs_momentum": ss.get("cv4_legacy_ls_rs_momentum", DEFAULTS["cv4_legacy_ls_rs_momentum"]),
+        "cv4_legacy_ls_regime": ss.get("cv4_legacy_ls_regime", DEFAULTS["cv4_legacy_ls_regime"]),
+        "cv4_legacy_ls_trend_overlap": ss.get("cv4_legacy_ls_trend_overlap", DEFAULTS["cv4_legacy_ls_trend_overlap"]),
+        "cv4_legacy_cv_volume": ss.get("cv4_legacy_cv_volume", DEFAULTS["cv4_legacy_cv_volume"]),
+        "cv4_legacy_cv_cci": ss.get("cv4_legacy_cv_cci", DEFAULTS["cv4_legacy_cv_cci"]),
+        "cv4_legacy_ls_trend_age": ss.get("cv4_legacy_ls_trend_age", DEFAULTS["cv4_legacy_ls_trend_age"]),
+        "cv4_legacy_sector_missing_credit": ss.get("cv4_legacy_sector_missing_credit", DEFAULTS["cv4_legacy_sector_missing_credit"]),
+        **{k: ss[k] for k in ("promo_bypass_enabled", "promo_bypass_min_leadership", "ext_legacy_weights") if k in ss},
         # ── CV1 v3 tier / signal thresholds ──────────────────────
         "v3_watch_leadership_min":      ss.get("v3_watch_leadership_min",      DEFAULTS["v3_watch_leadership_min"]),
         "v3_watch_conviction_min":      ss.get("v3_watch_conviction_min",      DEFAULTS["v3_watch_conviction_min"]),

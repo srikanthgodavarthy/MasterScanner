@@ -159,6 +159,19 @@ DEFAULTS = {
     "v4_elite_conviction_min":         75,
     "v4_elite_entry_quality_min":      80,
     "v4_elite_composite_min":          82,
+    # ── CV4 audit (2026-10-05) switches — see docs/CV4_AUDIT_FIXES.md.
+    # Mirrors conviction_score_v1.CV4_LEGACY_DEFAULTS (all False = new behaviour).
+    # promo_bypass_enabled / promo_bypass_min_leadership / ext_legacy_weights are
+    # deliberately NOT here: their defaults live in scanner_engine / backtest_engine /
+    # extension_shared (guarded by test_settings_defaults_single_source); the Settings
+    # page supplies the same fallbacks locally and only emits them once set.
+    "cv4_legacy_ls_rs_momentum":        False,
+    "cv4_legacy_ls_regime":             False,
+    "cv4_legacy_ls_trend_overlap":      False,
+    "cv4_legacy_cv_volume":             False,
+    "cv4_legacy_cv_cci":                False,
+    "cv4_legacy_ls_trend_age":          False,
+    "cv4_legacy_sector_missing_credit": False,
     # ── LEGACY — CV1 v3 tier / signal thresholds (see utils/conviction_score_v1.py
     # V3_THRESHOLD_DEFAULTS — decile-backtest calibrated, 2026-07). The Live
     # Scanner has run on CV4 (v4_* above) since July 2026; these v3_* keys
