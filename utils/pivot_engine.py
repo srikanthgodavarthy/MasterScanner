@@ -160,26 +160,53 @@ class PivotCache:
     Rebuilds only when ph_series[i] or pl_series[i] is non-NaN (new pivot formed).
     Avoids re-scanning the full pivot series on every bar.
     """
-    __slots__ = ("_ph", "_pl", "_lb3", "_last_rebuild", "_prices", "_is_high", "__weakref__")
+    __slots__ = ("_ph", "_pl", "_lb3", "_lag", "_last_rebuild", "_last_end",
+                 "_prices", "_is_high", "__weakref__")
 
-    def __init__(self, ph_series: pd.Series, pl_series: pd.Series, pvt_lb: int):
+    def __init__(self, ph_series: pd.Series, pl_series: pd.Series, pvt_lb: int,
+                 confirm_lag: int = 0):
+        """
+        confirm_lag: number of bars a centered-window pivot needs after its own
+        bar before it can be known. build_pivot_series() marks bar j as a pivot
+        using bars j-lb..j+lb, so when the series is precomputed over the FULL
+        history (backtest) bar j is only legitimately visible from bar j+lb on.
+        Backtest callers MUST pass confirm_lag=pvt_lb. confirm_lag=0 keeps the
+        legacy behaviour; on a live final bar it is equivalent anyway, because
+        the last `lb` entries of the centered series are always NaN there.
+        """
         self._ph          = ph_series.values          # numpy array (float, NaN = not pivot)
         self._pl          = pl_series.values
         self._lb3         = pvt_lb * 3
+        self._lag         = max(0, int(confirm_lag))
         self._last_rebuild = -1
+        self._last_end    = -1
         self._prices:  list = []
         self._is_high: list = []
 
     def get(self, i: int) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
         """
-        Returns (prices_arr, is_high_arr) of up to 8 recent pivots, newest-first.
-        Only rebuilds the cache when bar i has a new pivot OR cache is empty.
+        Returns (prices_arr, is_high_arr) of up to 8 recent pivots, newest-first,
+        using only pivots confirmable at bar i (pivot bar j <= i - confirm_lag).
+        Rebuilds when a pivot became visible since the last call (any bar in
+        (last_end, i-lag]) or the cache is empty.
         """
-        ph_i = self._ph[i] if i < len(self._ph) else np.nan
-        pl_i = self._pl[i] if i < len(self._pl) else np.nan
+        end = i - self._lag
+        if end < 0:
+            return None, None
+        end = min(end, len(self._ph) - 1)
 
-        # New pivot detected at bar i — rebuild
-        if not np.isnan(ph_i) or not np.isnan(pl_i) or self._last_rebuild < 0:
+        if self._last_rebuild < 0:
+            need = True
+        else:
+            lo = self._last_end + 1
+            if end < self._last_end:                      # walked backwards: rebuild
+                need = True
+            elif end >= lo:
+                need = bool(np.any(~np.isnan(self._ph[lo:end + 1])) or
+                            np.any(~np.isnan(self._pl[lo:end + 1])))
+            else:
+                need = False
+        if need:
             self._rebuild(i)
 
         if len(self._prices) < 4:
@@ -192,8 +219,9 @@ class PivotCache:
 
     def _rebuild(self, i: int):
         win_start  = max(0, i - self._lb3)
-        ph_win     = self._ph[win_start: i + 1]
-        pl_win     = self._pl[win_start: i + 1]
+        win_end    = min(i - self._lag, len(self._ph) - 1)   # last CONFIRMED bar
+        ph_win     = self._ph[win_start: win_end + 1]
+        pl_win     = self._pl[win_start: win_end + 1]
 
         pivots = []
         for j in range(len(ph_win) - 1, -1, -1):
@@ -208,3 +236,4 @@ class PivotCache:
         self._prices   = [p[0] for p in pivots]
         self._is_high  = [p[1] for p in pivots]
         self._last_rebuild = i
+        self._last_end     = win_end

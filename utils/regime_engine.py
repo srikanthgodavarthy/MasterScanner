@@ -599,6 +599,84 @@ def build_regime_context(
 
 
 # ══════════════════════════════════════════════════════════════════
+#  AS-OF-BAR REGIME CONTEXT  — for HISTORICAL scoring (backtest)
+# ══════════════════════════════════════════════════════════════════
+
+def build_regime_context_asof(
+    nifty:             pd.Series,
+    asof=None,
+    vix_series:        Optional[pd.Series] = None,
+    execute_threshold: float = 70.0,
+    force_execute:     bool  = False,
+) -> RegimeContext:
+    """
+    Causal RegimeContext for ONE historical bar: depends exclusively on
+    nifty[:asof] (inclusive) and, optionally, vix_series[:asof].
+
+    Why this exists: build_regime_context() is documented "call ONCE per scan
+    run" and (a) classifies from the *final* Nifty bar, (b) fetches TODAY's
+    India VIX, and (c) fetches TODAY's Wilder ADX. Applying that single object
+    to a 2024 bar classifies it with 2026 information. This function reuses the
+    same classify_regime()/_nifty_momentum() logic on the truncated series so
+    there is no second regime implementation to drift.
+
+    Intentional differences from the live context (cannot be avoided without
+    historical data the backtest does not have):
+      * ADX is the EMA-slope proxy computed from the as-of Nifty series
+        (adx_is_real=False), not a real Wilder ADX.
+      * VIX is the as-of value of `vix_series` when one is supplied, otherwise
+        classify_regime()'s neutral 16.0 default (so VOLATILE can never fire).
+
+    asof: label (Timestamp) or None for "the last bar of `nifty`".
+    """
+    n = nifty if asof is None else nifty.loc[:asof]
+    vix = None
+    if vix_series is not None and len(vix_series) > 0:
+        v = vix_series if asof is None else vix_series.loc[:asof]
+        v = v.dropna()
+        if len(v) > 0:
+            vix = float(v.iloc[-1])
+
+    regime, vix_used, adx_used, a50, a200, ema50_val, ema200_val = classify_regime(n, vix, None)
+    nifty_mom3, nifty_mom6 = _nifty_momentum(n)
+    return RegimeContext(
+        regime             = regime,
+        vix                = vix_used,
+        adx_proxy          = adx_used,
+        nifty_above_ema50  = a50,
+        nifty_above_ema200 = a200,
+        nifty_mom3         = nifty_mom3,
+        nifty_mom6         = nifty_mom6,
+        category_weights   = REGIME_WEIGHTS[regime],
+        execute_threshold  = execute_threshold,
+        force_execute      = force_execute,
+        adx_is_real        = False,
+        nifty_ema50_val    = ema50_val,
+        nifty_ema200_val   = ema200_val,
+    )
+
+
+def build_regime_context_series(
+    nifty:             pd.Series,
+    vix_series:        Optional[pd.Series] = None,
+    execute_threshold: float = 70.0,
+    force_execute:     bool  = False,
+) -> pd.Series:
+    """
+    One causal RegimeContext per Nifty bar (object Series indexed like `nifty`).
+    ctx_series.iloc[k] == build_regime_context_asof(nifty.iloc[:k+1]).
+    Compute once per backtest run (the index is shared by every symbol).
+    """
+    out = [
+        build_regime_context_asof(
+            nifty.iloc[: k + 1], None, vix_series, execute_threshold, force_execute,
+        )
+        for k in range(len(nifty))
+    ]
+    return pd.Series(out, index=nifty.index, dtype=object)
+
+
+# ══════════════════════════════════════════════════════════════════
 #  APPLY REGIME LAYER  — main entry point
 # ══════════════════════════════════════════════════════════════════
 

@@ -1266,7 +1266,16 @@ def render(settings=None):
         csv_bt = trades_df.to_csv(index=False)
         st.download_button(
             "⬇️ Download Trade Log CSV", data=csv_bt,
-            file_name=f"backtest_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
+            # "_causal" marks runs produced after the 2026-10 causality fixes
+            # (as-of regime, confirmed-only pivots, signal-time geometry) so they
+            # can never be mistaken for the earlier, lookahead-affected CSVs.
+            # A shadow run (some rows failed the gate) also gets "_shadow_ab".
+            file_name=(
+                f"backtest_{_now_ist().strftime('%Y%m%d_%H%M')}_causal"
+                + ("_shadow_ab" if ("passed_gate" in trades_df.columns
+                                     and not trades_df["passed_gate"].astype(bool).all()) else "")
+                + ".csv"
+            ),
             mime="text/csv", key="btn_dl_bt_csv",
         )
 

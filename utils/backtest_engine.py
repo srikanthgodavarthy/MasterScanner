@@ -44,6 +44,7 @@ from utils.trade_levels import evaluate_bar_crossing, LevelCheck
 from utils.structural_levels import structural_ceiling
 from utils.regime_engine  import (
     build_regime_context, RegimeContext,
+    build_regime_context_series,
     bar_result_to_row, compute_composite, _classify_tier,
 )
 
@@ -189,7 +190,8 @@ def generate_signals_historical(
     tier_filter:     str   = "Both",
     buy_type_filter: list  | None = None,
     rs_positive_only: bool = False,
-    regime_ctx:      "RegimeContext | None" = None,   # [v8.2] regime filter
+    regime_ctx:      "RegimeContext | None" = None,   # REMOVED for history -- see below
+    regime_ctx_series: "pd.Series | None" = None,     # [causal] per-bar RegimeContext
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Walk-forward signal scan over full history.
@@ -205,6 +207,21 @@ def generate_signals_historical(
     """
     if df.empty or len(df) < 210:
         return pd.DataFrame(), pd.DataFrame()
+
+    if regime_ctx is not None:
+        # build_regime_context() is a single "whole scan run" object derived
+        # from the FINAL Nifty bar plus today's VIX/ADX. Using it to classify
+        # historical bars is lookahead. Callers must pass regime_ctx_series
+        # (utils.regime_engine.build_regime_context_series) instead.
+        raise ValueError(
+            "generate_signals_historical(regime_ctx=...) is not causal for "
+            "historical bars; pass regime_ctx_series=build_regime_context_series(nifty)"
+        )
+    _rctx_arr = None
+    if regime_ctx_series is not None and len(regime_ctx_series) > 0:
+        # as-of alignment: each stock bar takes the context of the latest Nifty
+        # bar <= its own date (forward-fill only -- never backwards).
+        _rctx_arr = regime_ctx_series.reindex(df.index, method="ffill").to_numpy(dtype=object)
 
     if settings:
         params    = ScoringParams.from_settings(settings)
@@ -288,6 +305,16 @@ def generate_signals_historical(
         if r is None:
             continue
 
+        # [Audit P1 #4 -- live/backtest wiring defect] The live Scanner sets
+        # r.smc_state BEFORE decision_engine._extension() runs
+        # (scanner_engine.score_stock: "r.smc_state = _cv4_smc_state"), and
+        # _extension() reads it for the FVG/extension penalty that feeds the
+        # target category and the traded R:R below. The backtest never set it,
+        # so every historical bar was extension-scored SMC-neutral. SMC state
+        # at [i] is verified as-of-bar-i causal (tests/test_backtest_causality).
+        if _bt_smc_states is not None and i < len(_bt_smc_states):
+            r.smc_state = _bt_smc_states[i]
+
         # LOGIC-1: enforce minimum 3-bar cooldown between signals on same symbol
         if i - last_signal_bar < 3:
             continue
@@ -330,12 +357,13 @@ def generate_signals_historical(
         # regime engine would mark as "Skip" — these are the same signals that
         # the scanner suppresses at live scan time.  Wiring this here ensures
         # backtest population matches scanner population for threshold calibration.
-        if regime_ctx is not None:
+        _ctx_i = _rctx_arr[i] if _rctx_arr is not None else None
+        if _ctx_i is not None and not (isinstance(_ctx_i, float) and _ctx_i != _ctx_i):
             _rd              = bar_result_to_row(r)
-            _, _, _composite = compute_composite(_rd, regime_ctx.regime, regime_ctx)
-            _rtier           = _classify_tier(_rd, regime_ctx.regime, _composite,
-                                              regime_ctx.execute_threshold,
-                                              force_execute=regime_ctx.force_execute)
+            _, _, _composite = compute_composite(_rd, _ctx_i.regime, _ctx_i)
+            _rtier           = _classify_tier(_rd, _ctx_i.regime, _composite,
+                                              _ctx_i.execute_threshold,
+                                              force_execute=_ctx_i.force_execute)
             if _rtier == "Skip":
                 continue   # regime says avoid — do not create trade signal
         if buy_type_filter and r.buy_type not in buy_type_filter:
@@ -379,6 +407,11 @@ def generate_signals_historical(
         #  Engine calls are skipped entirely if an early gate already fires.
         # ══════════════════════════════════════════════════════════
         _rejection_reason: str = ""
+        # Diagnostics persisted on every signal/trade row (defaults so rows that
+        # are rejected before CV4 runs still carry well-defined values).
+        _base_tier:   str = ""
+        _natural_cls: str = ""
+        _promo_bypass = None
 
         # ── Gate 1: structural extension / staleness ──────────────
         if r.atr_band == "Extended":
@@ -630,6 +663,25 @@ def generate_signals_historical(
             "passed_gate":         _passed_gate,
             "gate_rejection_reason": _rejection_reason,
             "admitted_via_promo_bypass": _bypass_promoted,
+            # [Audit P1 #3] promotion/admission provenance -- one name per
+            # concept, carried unchanged signal dict -> trade row -> CSV.
+            #   base_tier          classify_tier_v4(): Skip|Watch|Actionable|...
+            #   natural_cv4_class  _classify_v4(): the class the L/C/E earn on
+            #                      their own, before any promotion bypass
+            #   cv4_signal_class   (existing) ConvictionV4.signal_class
+            #   final_tier         tier the trade was actually admitted at:
+            #                      the promotion tier when the bypass admitted it,
+            #                      else base_tier / natural class, "Rejected" when
+            #                      the gate rejected it (shadow rows)
+            "base_tier":              _base_tier,
+            "natural_cv4_class":      _natural_cls,
+            "promo_score":            int(_promo_bypass.promo_score) if _promo_bypass is not None else 0,
+            "promo_rr":               float(_promo_bypass.risk_reward) if _promo_bypass is not None else 0.0,
+            "promo_rr_basis":         str(_promo_bypass.risk_reward_basis) if _promo_bypass is not None else "",
+            "final_tier":             ("Rejected" if not _passed_gate else
+                                       (str(_promo_bypass.tier) if _bypass_promoted else
+                                        (_base_tier if _base_tier == "Actionable" else
+                                         str(_natural_cls).title()))),
             "eq_trend_alignment":     _cv1.eq_trend_alignment,
             "eq_momentum_timing":     _cv1.eq_momentum_timing,
             "eq_smc_entry_structure": _cv1.eq_smc_entry_structure,
@@ -1345,6 +1397,8 @@ def simulate_trades(
     momentum_exit_enabled: bool = False,   # kept for call-site compatibility;
                                             # unused now that trades close in
                                             # full at T1 (see docstring).
+    geometry: str = "signal_time",
+    allow_overlap: bool = False,
 ) -> pd.DataFrame:
     """
     Single-target exit model: each trade closes in full the moment T1 is
@@ -1355,7 +1409,31 @@ def simulate_trades(
     utils/adaptive_target_engine.py). T2/T3 are still computed and kept on
     the trade row for reference only; they no longer drive any exit
     decision, and there is no breakeven-trail-and-hold-for-T2 step.
+
+    geometry (Scanner / Five-Pillars signals; CCI-Master always uses its own
+    absolute swing levels):
+      "signal_time" (default)  the plan the signal published at the close of the
+                               signal bar -- SL / T1 / T2 / T3 are the signal's
+                               absolute price levels, untouched. Execution is
+                               still the NEXT OPEN, so risk-per-share for R is
+                               measured from that open; a gap through SL skips
+                               the trade and a gap at/over T1 skips it (no
+                               margin left). Faithful to what the live plan
+                               would have shown.
+      "rescaled_open"          LEGACY. Re-derives SL (half the entry gap) and
+                               T1/T2 (= open + risk x multiple) from the next
+                               open. This moves the published levels with the
+                               gap, so a gap-up inflates T1 in price terms and a
+                               gap-down tightens SL -- the backtest then trades
+                               a plan the live scanner never showed.
     """
+    # allow_overlap: every signal is simulated independently of the symbol's
+    # other trades. REQUIRED for cohort A/B work (e.g. Norm vs CV4): with the
+    # default one-open-trade-per-symbol rule, whether a CV4-Actionable signal
+    # becomes a trade depends on an earlier, possibly lower-quality, signal's
+    # trade still being open -- so cohorts would not be the same opportunities.
+    if geometry not in ("signal_time", "rescaled_open"):
+        raise ValueError(f"simulate_trades: unknown geometry {geometry!r}")
     if signals.empty or df_full.empty:
         return pd.DataFrame()
 
@@ -1378,7 +1456,7 @@ def simulate_trades(
         entry_signal_date = sig["date"]
 
         # BUG-2 fix: strict < so a signal on the exact exit date is NOT blocked
-        if entry_signal_date < blocked_until:
+        if not allow_overlap and entry_signal_date < blocked_until:
             continue
 
         # searchsorted("right") gives the first position strictly after
@@ -1417,8 +1495,17 @@ def simulate_trades(
             _t1m = float(sig.get("t1_mult", 1.5))
             _t2m = float(sig.get("t2_mult", 3.0))
             _t3m = float(sig.get("t3_mult", 5.0))
+        elif geometry == "signal_time":
+            # ── Scanner / Five Pillars: the signal-time plan, as published ──
+            sl   = round(sig_sl, 2)
+            t1   = round(sig_t1, 2)
+            t2   = round(sig_t2, 2)
+            rk   = max(entry_price - sl, 0.01)     # realised risk from the actual open
+            _t1m = float(sig.get("t1_mult", 1.5))
+            _t2m = float(sig.get("t2_mult", 3.0))
+            _t3m = float(sig.get("t3_mult", 5.0))
         else:
-            # ── Scanner / Five Pillars mode: rescale from padded-close to open ──
+            # ── LEGACY "rescaled_open": rescale from padded-close to open ──
             scale = (entry_price - sig_sl) / (sig_t1 - sig_sl) if (sig_t1 - sig_sl) > 0 else 1.0
             sl = sig_sl + (entry_price - sig_en) * 0.5   # shift SL by half the gap
             sl = round(min(sl, sig_sl + abs(entry_price - sig_en)), 2)  # cap shift
@@ -1447,7 +1534,8 @@ def simulate_trades(
         # full the moment T1 is hit. t2/t3 are still computed and recorded
         # on the trade row purely for reference/analysis (e.g. "how much
         # further could this have run"), never for the exit decision.
-        t3 = round(entry_price + rk * _t3m, 2)
+        t3 = (round(sig_t3, 2) if (geometry == "signal_time" and not _is_cci_mode)
+              else round(entry_price + rk * _t3m, 2))
 
         # CCI Master: cap window at native EXIT signal if it arrives before hold_days
         if _is_cci_mode and _cci_exit_date is not None:
@@ -1593,6 +1681,13 @@ def simulate_trades(
             "cv4_composite_experimental": float(sig.get("cv4_composite_experimental", 0) or 0),
             "cv4_composite":          float(sig.get("cv4_composite",   0) or 0),
             "cv4_signal_class":       str(sig.get("cv4_signal_class", "") or ""),
+            "admitted_via_promo_bypass": bool(sig.get("admitted_via_promo_bypass", False)),
+            "base_tier":              str(sig.get("base_tier", "") or ""),
+            "natural_cv4_class":      str(sig.get("natural_cv4_class", "") or ""),
+            "promo_score":            int(sig.get("promo_score", 0) or 0),
+            "promo_rr":               float(sig.get("promo_rr", 0.0) or 0.0),
+            "promo_rr_basis":         str(sig.get("promo_rr_basis", "") or ""),
+            "final_tier":             str(sig.get("final_tier", "") or ""),
             "structural_entry": bool(sig.get("structural_entry", False)),
             "tier1_prime":     bool(sig.get("tier1_prime",    False)),
             "tier2_momentum":  bool(sig.get("tier2_momentum", False)),
@@ -1701,7 +1796,7 @@ def _score_symbol_worker(
     tier_filter:            str,
     buy_type_filter:        list | None,
     rs_positive_only:       bool,
-    regime_ctx:             "RegimeContext | None",
+    regime_ctx_series:      "pd.Series | None",
     hold_days:              int,
     momentum_exit_enabled:  bool,
     fp_cfg:                 dict,
@@ -1746,11 +1841,18 @@ def _score_symbol_worker(
             tier_filter      = tier_filter,
             buy_type_filter  = buy_type_filter,
             rs_positive_only = rs_positive_only,
-            regime_ctx       = regime_ctx,
+            regime_ctx_series = regime_ctx_series,
         )
 
     trades = simulate_trades(sym, df, sigs, hold_days=hold_days,
-                             momentum_exit_enabled=momentum_exit_enabled)
+                             momentum_exit_enabled=momentum_exit_enabled,
+                             geometry=str(effective_settings.get("bt_geometry_mode", "signal_time")),
+                             # Shadow runs exist for cohort studies; independent
+                             # opportunities (no open-trade blocking) are the
+                             # default there. Explicit bt_allow_overlap wins.
+                             allow_overlap=bool(effective_settings.get(
+                                 "bt_allow_overlap",
+                                 effective_settings.get("shadow_no_admission_gate", False))))
     if not rejs.empty:
         rejs.insert(0, "symbol", sym)
     if not trades.empty:
@@ -1908,12 +2010,20 @@ def run_backtest(
     # mismatch between scanner population (regime-filtered) and backtest
     # population (previously unfiltered).
     _apply_regime = bool(effective_settings.get("bt_regime_filter", True))
-    _regime_ctx: "RegimeContext | None" = None
+    # [causal fix] One RegimeContext PER Nifty bar, each built from nifty[:k+1]
+    # only (build_regime_context_series). The previous single
+    # build_regime_context(nifty) used the final bar + today's VIX/ADX to gate
+    # every historical bar. Optional historical VIX can be supplied through
+    # settings["_vix_series"]; without it the as-of VIX is the neutral default.
+    _regime_ctx_series: "pd.Series | None" = None
     if _apply_regime:
         try:
-            _regime_ctx = build_regime_context(nifty, source=source)
+            _regime_ctx_series = build_regime_context_series(
+                nifty, vix_series=effective_settings.get("_vix_series"),
+            )
         except Exception:
-            _regime_ctx = None   # graceful fallback: no regime filter
+            _log.exception("run_backtest: as-of regime series failed -- regime filter OFF")
+            _regime_ctx_series = None
 
     if progress_cb:
         progress_cb(0.15, f"Data ready — {len(all_data)} symbols")
@@ -1969,7 +2079,7 @@ def run_backtest(
                 _score_symbol_worker,
                 s, all_data[s], nifty, mode, effective_settings,
                 cci_len, cci_ob, cci_os, min_score, tier_filter,
-                buy_type_filter, rs_positive_only, _regime_ctx,
+                buy_type_filter, rs_positive_only, _regime_ctx_series,
                 hold_days, momentum_exit_enabled, _fp_cfg,
             ): s
             for s in valid_symbols

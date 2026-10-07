@@ -796,7 +796,7 @@ def build_indicators(
 import weakref as _weakref
 _pivot_caches: "_weakref.WeakValueDictionary" = None   # lazily initialised
 
-def _get_pivot_cache(ia):
+def _get_pivot_cache(ia, confirm_lag: int = 0):
     global _pivot_caches
     from utils.pivot_engine import PivotCache
     if _pivot_caches is None:
@@ -804,7 +804,11 @@ def _get_pivot_cache(ia):
     key = id(ia)
     cache = _pivot_caches.get(key)
     if cache is None:
-        cache = PivotCache(ia.ph_series, ia.pl_series, 20)
+        # confirm_lag: ph_series/pl_series are CENTERED-window pivots over the
+        # full history, so bar j is only knowable from bar j+lb on. Without the
+        # lag a historical bar i would see pivots confirmed up to lb bars in
+        # its own future (harmonic/ABCD leak). No-op on a live final bar.
+        cache = PivotCache(ia.ph_series, ia.pl_series, 20, confirm_lag=confirm_lag)
         _pivot_caches[key] = cache
     return cache
 
@@ -821,7 +825,7 @@ def _get_pivots(ia: IndicatorArrays, i: int, pvt_lb: int):
     if pvt_lb < 2 or i < pvt_lb * 2:
         return [], [], False, False, False, False
 
-    cache = _get_pivot_cache(ia)
+    cache = _get_pivot_cache(ia, confirm_lag=pvt_lb)
     pv_prices_arr, pv_is_high_arr = cache.get(i)
 
     if pv_prices_arr is None or len(pv_prices_arr) < 4:
@@ -1951,13 +1955,31 @@ def compute_bar(
             try:
                 from utils.ll_opportunity import score_ll_opportunity
                 _swing_labels = getattr(ia, "swing_labels_full", None)
+                # CAUSALITY: ia.ph_series/pl_series/swing_labels_full are built
+                # from CENTERED windows over the full history, so a pivot at bar
+                # j is only knowable from bar j+pvt_lb on. Slicing [0:i+1] would
+                # expose pivots (and the labels derived from them) confirmed by
+                # bars AFTER i. Blank/truncate the last pvt_lb bars -- the same
+                # cutoff the Five-Pillars path applies. No-op for a live final
+                # bar (the centered series is already NaN there).
+                _lag = int(params.pvt_lb)
+                _ph_v = _pl_v = None
+                if ia.ph_series is not None and ia.pl_series is not None:
+                    _ph_v = ia.ph_series.iloc[_sl].copy()
+                    _pl_v = ia.pl_series.iloc[_sl].copy()
+                    if _lag > 0 and len(_ph_v) > 0:
+                        _ph_v.iloc[-_lag:] = float("nan")
+                        _pl_v.iloc[-_lag:] = float("nan")
+                _lbl_v = None
+                if _swing_labels is not None:
+                    _lbl_v = _swing_labels.iloc[0: max(0, i + 1 - _lag)]
                 _ll_sig = score_ll_opportunity(
                     close=ia.c.iloc[_sl], low=ia.l.iloc[_sl], volume=ia.v.iloc[_sl],
-                    ph_series=ia.ph_series.iloc[_sl] if ia.ph_series is not None else None,
-                    pl_series=ia.pl_series.iloc[_sl] if ia.pl_series is not None else None,
+                    ph_series=_ph_v,
+                    pl_series=_pl_v,
                     atr_s=ia.atr_s.iloc[_sl], vol_avg=ia.vol_avg.iloc[_sl],
                     max_bonus=params.ll_bonus_max,
-                    precomputed_labels=_swing_labels.iloc[_sl] if _swing_labels is not None else None,
+                    precomputed_labels=_lbl_v,
                 )
                 ll_actionable   = _ll_sig.actionable_ll
                 ll_defended     = _ll_sig.ll_defended
