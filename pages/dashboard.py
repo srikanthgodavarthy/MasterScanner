@@ -85,6 +85,7 @@ from utils.sector_map      import build_sector_stats
 
 REGIME_COLORS = {
     "TREND":    ("#3fb950", "#0d1117", "#1a3a1a"),
+    "DOWNTREND": ("#ff7b72", "#0d1117", "#2d1010"),
     "RANGE":    ("#f5c542", "#0d1117", "#2d2200"),
     "VOLATILE": ("#f85149", "#0d1117", "#2d0a0a"),
 }
@@ -2140,11 +2141,12 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str) -> str:
     # ── Regime card ────────────────────────────────────────────────
     mkt_note = {
         "TREND":    "Trending market · Full position sizing active.",
+        "DOWNTREND": "Downtrend · Execute gate closed · Half position sizing cap.",
         "RANGE":    "Range-bound market · Gate restricted · Half position sizing.",
         "VOLATILE": "Volatile market · Execute gate closed · No new positions.",
     }.get(r, "Regime not computed yet — waiting for market data.")
     _why = summary.get("regime_reason")
-    if _why and r in ("RANGE", "VOLATILE"):
+    if _why and r in ("RANGE", "VOLATILE", "DOWNTREND"):
         mkt_note += f" ({_why})"
     regime_card = f"""
 <div class="mo-health-card mo-regime-card">

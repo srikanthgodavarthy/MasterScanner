@@ -6,7 +6,7 @@ Regime-conditional scoring engine for Trinity.
 Architecture:
     Market Regime (VIX + ADX + Nifty EMA slopes)
         ↓
-    TREND / RANGE / VOLATILE
+    TREND / DOWNTREND / RANGE / VOLATILE
         ↓
     Adaptive Category Weights
         ↓
@@ -182,6 +182,16 @@ REGIME_WEIGHTS: dict[str, dict[str, float]] = {
         "Volume":    0.10,
         "Quality":   0.30,
     },
+    # [2026-10-08] DOWNTREND: confirmed bear trend (ADX>25, below EMA50 &
+    # EMA200). Same category weights as RANGE so scoring is unchanged from
+    # before this state existed -- only the label/reporting differs.
+    "DOWNTREND": {
+        "Trend":     0.15,
+        "Momentum":  0.20,
+        "Structure": 0.25,
+        "Volume":    0.10,
+        "Quality":   0.30,
+    },
     "VOLATILE": {
         "Trend":     0.10,
         "Momentum":  0.15,
@@ -204,6 +214,7 @@ for _r, _w in REGIME_WEIGHTS.items():
 #  TREND   + score < 45  → 0.25
 #  RANGE   + score ≥ 65  → 0.50  (half max)
 #  RANGE   + score < 65  → 0.25
+#  DOWNTREND             → same as RANGE (execute gate is closed anyway)
 #  VOLATILE              → 0.00  (no new positions)
 # ══════════════════════════════════════════════════════════════════
 
@@ -215,7 +226,7 @@ def position_size_multiplier(regime: str, composite: float) -> float:
         if composite >= 60: return 0.75
         if composite >= 45: return 0.50
         return 0.25
-    # RANGE
+    # RANGE / DOWNTREND
     if composite >= 65: return 0.50
     return 0.25
 
@@ -488,6 +499,7 @@ def classify_regime(
     Priority:
       VIX > 22              → VOLATILE
       ADX > 25 + EMA50↑ + EMA200↑ + VIX ≤ 22  → TREND  (full bull structure)
+      ADX > 25 + below EMA50 + below EMA200 + VIX ≤ 22 → DOWNTREND
       otherwise             → RANGE
 
     Notes:
@@ -524,6 +536,15 @@ def classify_regime(
     # FIX: nifty_a200 added — TREND only in confirmed bull structure (above both EMAs).
     if vix_val <= 22.0 and adx_val > 25.0 and nifty_a50 and nifty_a200:
         return "TREND", vix_val, adx_val, nifty_a50, nifty_a200, ema50_val, ema200_val
+
+    # [2026-10-08] Confirmed bear trend: strong ADX with price under BOTH
+    # EMAs. Previously this fell into RANGE and read "Range-bound market"
+    # while Trend Strength said STRONG down. nifty_a50/a200 are False when
+    # <200 bars are available, so require real EMA levels (>0) to avoid
+    # calling a short-history series a downtrend.
+    if (adx_val > 25.0 and ema50_val > 0 and ema200_val > 0
+            and not nifty_a50 and not nifty_a200):
+        return "DOWNTREND", vix_val, adx_val, nifty_a50, nifty_a200, ema50_val, ema200_val
 
     return "RANGE", vix_val, adx_val, nifty_a50, nifty_a200, ema50_val, ema200_val
 
@@ -689,7 +710,7 @@ def apply_regime_layer(
 
     New columns
     -----------
-    regime           str    TREND / RANGE / VOLATILE
+    regime           str    TREND / DOWNTREND / RANGE / VOLATILE
     composite_score  float  0–100 regime-weighted
     regime_tier      str    Tier-1 / Tier-2 / Watch / Skip
     execute_flag     bool   True for Tier-1/2 in TREND only
@@ -787,6 +808,8 @@ def regime_summary(df_aug: pd.DataFrame, ctx: RegimeContext) -> dict:
         _reason = "ADX>25, above EMA50 & EMA200"
     elif ctx.regime == "VOLATILE":
         _reason = f"VIX {ctx.vix:.1f} > 22"
+    elif ctx.regime == "DOWNTREND":
+        _reason = "ADX>25, below EMA50 & EMA200"
     else:
         _fails = []
         if not ctx.adx_proxy > 25.0:

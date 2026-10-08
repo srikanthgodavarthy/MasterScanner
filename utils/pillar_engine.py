@@ -947,7 +947,7 @@ def evaluate_promotion(row, regime: str | None = None) -> PromotionResult:
         the FP_* / _fp_* column names wired in utils/scanner_engine.py.
     Both key spellings are checked so this works from either call site.
 
-    `regime`: "TREND" | "RANGE" | "VOLATILE" | None — market-wide regime
+    `regime`: "TREND" | "DOWNTREND" | "RANGE" | "VOLATILE" | None — market-wide regime
     from utils.regime_engine. If the caller already has it (e.g. the
     "regime" column apply_regime_layer() attaches to df_aug), pass it
     explicitly; otherwise it's read from a "regime"/"Regime" key on

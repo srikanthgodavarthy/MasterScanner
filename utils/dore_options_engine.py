@@ -76,6 +76,7 @@ AGGRESSIVE   = "Aggressive"
 REGIME_TREND    = "TREND"
 REGIME_RANGE    = "RANGE"
 REGIME_VOLATILE = "VOLATILE"
+REGIME_DOWNTREND = "DOWNTREND"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -187,6 +188,7 @@ class DoreOptionsSettings:
     regime_capture_adjust: dict = field(default_factory=lambda: {
         REGIME_TREND:    +0.05,   # allow more aggressive OTM in a trending tape
         REGIME_RANGE:    -0.05,   # pull toward ATM in a range
+        REGIME_DOWNTREND: -0.05,  # same as RANGE (was RANGE before DOWNTREND existed)
         REGIME_VOLATILE: -0.08,   # pull toward ATM when the tape is volatile
     })
 
