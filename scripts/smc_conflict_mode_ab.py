@@ -15,8 +15,8 @@ settings (DEFAULTS + the one override) on IDENTICAL data (price/Nifty fetches
 are memoised in-process, so it's one download and no data drift between arms).
 
 USAGE (needs network access to your price source):
-    python scripts/smc_conflict_mode_ab.py                       # 150 symbols
-    python scripts/smc_conflict_mode_ab.py --symbols 500 --out ab_out
+    python scripts/smc_conflict_mode_ab.py --universe nifty500 --symbols 500 --out ab_out
+    python scripts/smc_conflict_mode_ab.py --universe all_nse --out ab_out
     python scripts/smc_conflict_mode_ab.py --shadow              # same signals, both arms,
                                                                  # compare ADMITTED subset
     python scripts/smc_conflict_mode_ab.py --source upstox
@@ -193,9 +193,69 @@ def run_arm(be, mode: str, symbols: list, args) -> pd.DataFrame:
     return trades
 
 
+def _normalise_nse_symbol(value: str) -> str:
+    s = str(value).strip().upper()
+    if not s:
+        return ""
+    # NSE equity symbols are passed to the backtest as Yahoo-style .NS symbols.
+    return s if s.endswith(".NS") else f"{s}.NS"
+
+
+def _load_nse_equity_universe() -> list[str]:
+    """Load the current NSE equity security master.
+
+    The NSE CSV is intentionally fetched at runtime rather than hard-coded.
+    We keep only normal equity symbols and remove obvious non-equity rows.
+    """
+    import io
+    import requests
+
+    url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/csv,*/*",
+        "Referer": "https://www.nseindia.com/",
+    }
+    r = requests.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
+    df = pd.read_csv(io.BytesIO(r.content))
+
+    if "SYMBOL" not in df.columns:
+        raise RuntimeError("NSE equity master did not contain SYMBOL column")
+
+    symbols = []
+    for raw in df["SYMBOL"].dropna():
+        sym = _normalise_nse_symbol(raw)
+        if sym:
+            symbols.append(sym)
+
+    # Stable order makes the A/B universe reproducible.
+    return sorted(set(symbols))
+
+
+def _resolve_universe(name: str, limit: int) -> tuple[list[str], str]:
+    if name == "nifty500":
+        from utils.scanner_engine import NIFTY500_SYMBOLS
+        symbols = list(dict.fromkeys(NIFTY500_SYMBOLS))
+    elif name == "all_nse":
+        symbols = _load_nse_liquid_universe()
+    elif name == "all_nse":
+        symbols = _load_nse_equity_universe()
+    else:
+        raise ValueError(f"unknown universe: {name}")
+
+    available = len(symbols)
+    if limit and limit > 0:
+        symbols = symbols[:limit]
+
+    return symbols, f"{name} (resolved={available}, selected={len(symbols)})"
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--symbols", type=int, default=150, help="first N of NIFTY500_SYMBOLS")
+    ap.add_argument("--symbols", type=int, default=0, help="maximum symbols to use; 0 means all symbols in the selected universe")
+    ap.add_argument("--universe", default="all_nse", choices=["nifty500", "all_nse"],
+                    help="symbol universe: nifty500, nse_liquid, or all_nse")
     ap.add_argument("--hold-days", type=int, default=20)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--source", default="yfinance", choices=["yfinance", "upstox"])
@@ -207,14 +267,18 @@ def main(argv=None) -> int:
     import utils.backtest_engine as be
 
     if args.synthetic:
-        data, nifty = _synthetic_data(min(args.symbols, 40))
+        requested = args.symbols if args.symbols > 0 else 40
+        data, nifty = _synthetic_data(min(requested, 40))
         symbols = list(data)
+        universe_label = f"synthetic (resolved={len(symbols)}, selected={len(symbols)})"
         be.fetch_all_bt_data = lambda syms, years=3, progress_cb=None, source="yfinance": data
         be._fetch_bt_nifty = lambda years=3, source="yfinance": nifty
         print(f"[synthetic] {len(symbols)} generated symbols -- pipeline check only, results are meaningless")
     else:
-        from utils.scanner_engine import NIFTY500_SYMBOLS
-        symbols = list(NIFTY500_SYMBOLS)[: args.symbols]
+        symbols, universe_label = _resolve_universe(args.universe, args.symbols)
+        if not symbols:
+            raise RuntimeError(f"Universe '{args.universe}' resolved to zero symbols")
+        print(f"Universe: {universe_label}")
         # Memoise the fetches so both arms see byte-identical data (and one download).
         _orig_fetch, _orig_nifty = be.fetch_all_bt_data, be._fetch_bt_nifty
         _cache: dict = {}
@@ -241,7 +305,7 @@ def main(argv=None) -> int:
     for mode, f in frames.items():
         f.to_csv(os.path.join(args.out, f"trades_{mode}.csv"), index=False)
     res = analyse(frames["legacy"], frames["confirmed_break"], shadow=args.shadow)
-    report = format_report(res)
+    report = f"Universe: {universe_label}\nRequested limit: {args.symbols if args.symbols else 'all'}\n\n" + format_report(res)
     print(report)
     with open(os.path.join(args.out, "report.txt"), "w") as fh:
         fh.write(report)
