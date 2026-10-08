@@ -1,0 +1,161 @@
+name: SMC Conflict Mode A/B
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Number of symbols to scan"
+        required: true
+        type: string
+        default: "150"
+
+      hold_days:
+        description: "Maximum holding period in days"
+        required: true
+        type: string
+        default: "20"
+
+      workers:
+        description: "Number of backtest workers"
+        required: true
+        type: string
+        default: "8"
+
+      source:
+        description: "Historical data source"
+        required: true
+        type: choice
+        options:
+          - yfinance
+        default: yfinance
+
+jobs:
+  smc-conflict-ab:
+    name: Legacy vs Confirmed Break
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 90
+
+    env:
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      # ------------------------------------------------------------
+      # 1. Checkout repository
+      # ------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------
+      # 2. Python
+      # ------------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # ------------------------------------------------------------
+      # 3. Install dependencies
+      # ------------------------------------------------------------
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ------------------------------------------------------------
+      # 4. Verify Python environment
+      # ------------------------------------------------------------
+      - name: Verify environment
+        shell: bash
+        run: |
+          python --version
+          pip --version
+
+      # ------------------------------------------------------------
+      # 5. Run controlled A/B
+      #
+      # IMPORTANT:
+      # The script itself forces:
+      #
+      #   Run A = legacy
+      #   Run B = confirmed_break
+      #
+      # Do NOT modify DEFAULTS or production settings.
+      # ------------------------------------------------------------
+      - name: Run SMC conflict-mode A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p smc_conflict_ab_out
+
+          python scripts/smc_conflict_mode_ab.py \
+            --symbols "${{ inputs.symbols }}" \
+            --hold-days "${{ inputs.hold_days }}" \
+            --workers "${{ inputs.workers }}" \
+            --source "${{ inputs.source }}" \
+            --out smc_conflict_ab_out
+
+      # ------------------------------------------------------------
+      # 6. Display generated files
+      # ------------------------------------------------------------
+      - name: List A/B outputs
+        shell: bash
+        run: |
+          echo "=== SMC Conflict A/B output ==="
+          find smc_conflict_ab_out \
+            -maxdepth 2 \
+            -type f \
+            -print \
+            | sort
+
+      # ------------------------------------------------------------
+      # 7. Publish report to GitHub Actions summary
+      #
+      # This makes the result visible directly on the workflow page.
+      # ------------------------------------------------------------
+      - name: Publish A/B report
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPORT="smc_conflict_ab_out/report.txt"
+
+          if [ -f "$REPORT" ]; then
+            {
+              echo "## SMC Conflict Mode A/B"
+              echo
+              echo "**Symbols:** ${{ inputs.symbols }}"
+              echo
+              echo "**Hold days:** ${{ inputs.hold_days }}"
+              echo
+              echo "**Workers:** ${{ inputs.workers }}"
+              echo
+              echo "**Source:** ${{ inputs.source }}"
+              echo
+              echo '```text'
+              cat "$REPORT"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::report.txt was not generated"
+          fi
+
+      # ------------------------------------------------------------
+      # 8. Upload complete A/B artifacts
+      #
+      # Keep the raw CSVs and report so we can inspect:
+      #   - legacy
+      #   - confirmed_break
+      #   - added_by_flip
+      #   - dropped_by_flip
+      # ------------------------------------------------------------
+      - name: Upload A/B results
+        uses: actions/upload-artifact@v4
+        with:
+          name: smc-conflict-mode-ab
+          path: smc_conflict_ab_out/
+          if-no-files-found: error
+          retention-days: 30
