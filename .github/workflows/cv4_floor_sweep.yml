@@ -2,7 +2,7 @@
 # Runs scripts/cv4_floor_sweep.py on a trades CSV that YOU commit to the repo
 # (default backtests/trades.csv — export it from the Backtest page, mode
 # "scanner", with "shadow_no_admission_gate" ON). Pandas/numpy only; touches no
-# database and no secrets. Report appears on the run's Summary page.
+# database and no secrets. Report (and any error text) appears on the run's Summary page.
 name: CV4 floor sweep
 
 on:
@@ -39,7 +39,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pandas numpy
+      - run: pip install pandas numpy scipy   # scipy: pandas' Spearman correlation needs it
       - name: Check trades CSV exists
         run: |
           if [ ! -f "${{ inputs.csv_path }}" ]; then
@@ -48,6 +48,7 @@ jobs:
           fi
           echo "rows: $(($(wc -l < "${{ inputs.csv_path }}") - 1))"
       - name: Run floor sweep
+        shell: bash   # bash -eo pipefail: a crash fails the step instead of being hidden by tee
         run: |
           mkdir -p sweep_out
           python scripts/cv4_floor_sweep.py "${{ inputs.csv_path }}" \
@@ -57,7 +58,7 @@ jobs:
             --min-rr "${{ inputs.min_rr }}" \
             --perms "${{ inputs.perms }}" \
             --top "${{ inputs.top }}" \
-            --out sweep_out/sweep_results.csv | tee sweep_out/report.txt
+            --out sweep_out/sweep_results.csv 2>&1 | tee sweep_out/report.txt
           { echo '```'; cat sweep_out/report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
