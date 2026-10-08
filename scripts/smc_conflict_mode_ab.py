@@ -173,7 +173,7 @@ def _synthetic_data(n_sym: int, years: int = 3, seed: int = 7):
         close = 100 * np.exp(np.cumsum(ret))
         open_ = np.r_[close[0], close[:-1]] * (1 + rng.normal(0, 0.003, len(idx)))
         span = np.abs(rng.normal(0, 0.018, len(idx))) * close
-        data[f"SYN{i}.NS"] = pd.DataFrame({
+        data[f"SYN{i}"] = pd.DataFrame({
             "open": open_, "high": np.maximum(open_, close) + span * rng.uniform(.1, 1, len(idx)),
             "low": np.minimum(open_, close) - span * rng.uniform(.1, 1, len(idx)), "close": close,
             "volume": rng.integers(1_000_000, 5_000_000, len(idx)).astype(float)}, index=idx)
@@ -197,8 +197,11 @@ def _normalise_nse_symbol(value: str) -> str:
     s = str(value).strip().upper()
     if not s:
         return ""
-    # NSE equity symbols are passed to the backtest as Yahoo-style .NS symbols.
-    return s if s.endswith(".NS") else f"{s}.NS"
+    # The backtest engine's contract is BARE symbols (NIFTY500_SYMBOLS style):
+    # _fetch_bt_batch() appends ".NS" itself when building Yahoo tickers, and
+    # the Upstox path keys on the bare trading symbol. Passing "ACC.NS" made
+    # it download "ACC.NS.NS" (all 404 / "possibly delisted"), so strip it.
+    return s[:-3] if s.endswith(".NS") else s
 
 
 def _load_nse_equity_universe() -> list[str]:

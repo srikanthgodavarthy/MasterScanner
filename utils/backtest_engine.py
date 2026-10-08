@@ -68,7 +68,9 @@ def _fetch_bt_batch(symbols: tuple, years: int = 3) -> dict:
     end   = datetime.now(timezone.utc) + timedelta(days=1)
     start = end - timedelta(days=years * 365 + 10)
 
-    tickers = [f"{s}.NS" for s in symbols]
+    # Idempotent: a symbol that already carries ".NS" must not become
+    # "X.NS.NS" (silent 404s, empty frame, then a pointless retry cooldown).
+    tickers = [s if str(s).upper().endswith(".NS") else f"{s}.NS" for s in symbols]
     raw = yf_download_with_retry(
         tickers,
         start       = start.strftime("%Y-%m-%d"),
