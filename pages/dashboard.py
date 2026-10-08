@@ -2109,7 +2109,9 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str) -> str:
     rotation content — counts, flow, timeline, breadth, momentum scores —
     now lives in that one place instead of being split across three.
     """
-    r = summary.get("regime", "RANGE")
+    # [2026-10-08] No silent "RANGE" default: an empty summary means the
+    # regime was not computed, which must not read as a real Range call.
+    r = summary.get("regime") or "N/A"
     regime_color, _, _ = REGIME_COLORS.get(r, ("#8b949e", "#0d1117", "#1e293b"))
 
     adx         = float(summary.get("adx", 0))
@@ -2140,7 +2142,10 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str) -> str:
         "TREND":    "Trending market · Full position sizing active.",
         "RANGE":    "Range-bound market · Gate restricted · Half position sizing.",
         "VOLATILE": "Volatile market · Execute gate closed · No new positions.",
-    }.get(r, "")
+    }.get(r, "Regime not computed yet — waiting for market data.")
+    _why = summary.get("regime_reason")
+    if _why and r in ("RANGE", "VOLATILE"):
+        mkt_note += f" ({_why})"
     regime_card = f"""
 <div class="mo-health-card mo-regime-card">
   <span class="mo-regime-icon">🎯</span>

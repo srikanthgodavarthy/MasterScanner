@@ -780,8 +780,26 @@ def regime_summary(df_aug: pd.DataFrame, ctx: RegimeContext) -> dict:
     avg_rs   = round(df_aug["rs_score"].mean(), 1) \
                if "rs_score" in df_aug.columns else 50.0
 
+    # [2026-10-08] Why this regime — RANGE is the residual bucket (any
+    # non-TREND, non-VOLATILE state, incl. pullbacks and downtrends), so
+    # say which TREND condition failed instead of always reading "range-bound".
+    if ctx.regime == "TREND":
+        _reason = "ADX>25, above EMA50 & EMA200"
+    elif ctx.regime == "VOLATILE":
+        _reason = f"VIX {ctx.vix:.1f} > 22"
+    else:
+        _fails = []
+        if not ctx.adx_proxy > 25.0:
+            _fails.append(f"ADX {ctx.adx_proxy:.1f} ≤ 25")
+        if not ctx.nifty_above_ema50:
+            _fails.append("below EMA50")
+        if not ctx.nifty_above_ema200:
+            _fails.append("below EMA200")
+        _reason = ", ".join(_fails) or "TREND conditions not met"
+
     return {
         "regime":          ctx.regime,
+        "regime_reason":   _reason,
         "vix":             round(ctx.vix, 2),
         "adx":             round(ctx.adx_proxy, 1),
         "nifty_ema50":     ctx.nifty_above_ema50,

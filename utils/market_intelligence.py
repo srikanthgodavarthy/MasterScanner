@@ -227,10 +227,19 @@ def compute_market_intelligence(df_aug: Optional[pd.DataFrame] = None,
     # ── Nifty regime — same Upstox-anchored call the old inline block made.
     try:
         nifty_series = fetch_nifty("1y", source="upstox")
+        # [2026-10-08] source="upstox" so the ADX(14) fetch uses the same
+        # provider as `nifty_series` (build_regime_context's own docstring
+        # requires this; it was defaulting to yfinance here). And the
+        # summary is built even when df_aug is empty (no live_scanner
+        # snapshot yet / just restarted): the regime itself comes from
+        # Nifty+VIX+ADX, never from df_aug — previously an empty df_aug
+        # produced summary={} and the Dashboard's summary.get("regime",
+        # "RANGE") default then showed RANGE regardless of the market.
         regime_ctx = build_regime_context(
             nifty=nifty_series, execute_threshold=execute_threshold, auto_fetch_vix=True,
+            source="upstox",
         )
-        summary = regime_summary(df_aug, regime_ctx) if not df_aug.empty else {}
+        summary = regime_summary(df_aug, regime_ctx)
     except Exception:
         logger.exception("Market intelligence regime computation failed (non-fatal)")
         summary = {}
