@@ -58,6 +58,7 @@ from utils.adaptive_target_engine import (
     compute_adaptive_targets, NEUTRAL_TREND_AGE_BARS, NEUTRAL_EXTENSION_SCORE_ATR,
 )
 from utils.lifecycle_engine import STAGE_META
+from utils.rotate_candidates import drop_stale_snapshots, pick_first_not_falling
 from utils.market_data import fetch_ohlcv, fetch_previous_close  # lightweight — no scanner/NSE-universe import cost
 
 from utils.time_utils import now_ist as _now_ist, today_ist as _today_ist, IST as _IST
@@ -647,8 +648,13 @@ def _get_live_scan_metrics() -> pd.DataFrame:
     Leadership/Conviction/EQ/RS/TS/Stage so the table, the exit engine's
     decay factors, and the Opportunity Cost Analyzer all activate without
     re-running a full scan here."""
-    if "portfolio_live_metrics" not in st.session_state:
+    # [2026-10-08] Was cached for the whole browser session (never
+    # refreshed); now re-read every 15 minutes.
+    _now = datetime.now().timestamp()
+    if ("portfolio_live_metrics" not in st.session_state
+            or _now - st.session_state.get("portfolio_live_metrics_ts", 0) > 900):
         st.session_state["portfolio_live_metrics"] = load_lifecycle_latest()
+        st.session_state["portfolio_live_metrics_ts"] = _now
     return st.session_state["portfolio_live_metrics"]
 
 
@@ -1224,6 +1230,25 @@ _SWAP_FACTOR_LABELS = [
 _ROTATE_QUALIFYING_TIERS = {"Watch", "Actionable", "Execute", "Elite"}
 
 
+def _candidate_today_pct(symbol: str) -> float | None:
+    """[2026-10-08] Live % change today for a rotate CANDIDATE, same
+    reference the holdings table uses (fetch_previous_close vs the latest
+    bar). None when it can't be determined — the gate then fails open."""
+    try:
+        prev = fetch_previous_close(symbol)
+        df = fetch_ohlcv(symbol, period="1y", interval="1d")
+        if df is None or df.empty:
+            return None
+        last = float(df["close"].iloc[-1])
+        if prev is None:
+            if len(df) < 2:
+                return None
+            prev = float(df["close"].iloc[-2])
+        return (last - float(prev)) / float(prev) * 100.0 if prev else None
+    except Exception:
+        return None
+
+
 def _best_swap(row: dict, live_metrics: pd.DataFrame, held_symbols: set, excluded_symbols: set) -> dict | None:
     """Best not-held, not-already-recommended symbol to swap into for a
     weak/expensive-to-hold position, plus a swap score (scan-score delta)
@@ -1265,10 +1290,16 @@ def _best_swap(row: dict, live_metrics: pd.DataFrame, held_symbols: set, exclude
     pool = live_metrics[~live_metrics["symbol"].astype(str).str.upper().isin(exclude)]
     if "category" in pool.columns:
         pool = pool[pool["category"].isin(_ROTATE_QUALIFYING_TIERS)]
+    # [2026-10-08] Two gates before ranking picks a winner — see
+    # utils/rotate_candidates.py: (1) snapshot freshness, (2) skip targets
+    # that are falling today (BEML was still the target while down ~5%).
+    pool = drop_stale_snapshots(pool)
     if pool.empty:
         return None
     pool = pool.sort_values("score", ascending=False)
-    alt = pool.iloc[0]
+    alt, _alt_today_pct = pick_first_not_falling(pool, _candidate_today_pct)
+    if alt is None:
+        return None
     cur_score = row.get("lm_score")
     alt_score = float(alt.get("score")) if pd.notna(alt.get("score")) else None
     if cur_score is None or alt_score is None:
