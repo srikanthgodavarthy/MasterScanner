@@ -238,7 +238,7 @@ def _resolve_universe(name: str, limit: int) -> tuple[list[str], str]:
         from utils.scanner_engine import NIFTY500_SYMBOLS
         symbols = list(dict.fromkeys(NIFTY500_SYMBOLS))
     elif name == "all_nse":
-        symbols = _load_nse_liquid_universe()
+        symbols = _load_nse_equity_universe()
     elif name == "all_nse":
         symbols = _load_nse_equity_universe()
     else:
