@@ -239,8 +239,6 @@ def _resolve_universe(name: str, limit: int) -> tuple[list[str], str]:
         symbols = list(dict.fromkeys(NIFTY500_SYMBOLS))
     elif name == "all_nse":
         symbols = _load_nse_equity_universe()
-    elif name == "all_nse":
-        symbols = _load_nse_equity_universe()
     else:
         raise ValueError(f"unknown universe: {name}")
 
@@ -255,7 +253,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--symbols", type=int, default=0, help="maximum symbols to use; 0 means all symbols in the selected universe")
     ap.add_argument("--universe", default="all_nse", choices=["nifty500", "all_nse"],
-                    help="symbol universe: nifty500, nse_liquid, or all_nse")
+                    help="symbol universe: nifty500 or all_nse")
     ap.add_argument("--hold-days", type=int, default=20)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--source", default="yfinance", choices=["yfinance", "upstox"])
@@ -279,6 +277,7 @@ def main(argv=None) -> int:
         if not symbols:
             raise RuntimeError(f"Universe '{args.universe}' resolved to zero symbols")
         print(f"Universe: {universe_label}")
+        print(f"Resolved universe sample: {symbols[:10]}")
         # Memoise the fetches so both arms see byte-identical data (and one download).
         _orig_fetch, _orig_nifty = be.fetch_all_bt_data, be._fetch_bt_nifty
         _cache: dict = {}
