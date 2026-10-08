@@ -4597,6 +4597,10 @@ def _dore_options_closed_plans_table_html(df: pd.DataFrame) -> str:
             color, bg, border = "#58a6ff", "rgba(88,166,255,0.10)", "rgba(88,166,255,0.28)"
         elif r.startswith("Retired"):
             color, bg, border = "#d29922", "rgba(210,153,34,0.12)", "rgba(210,153,34,0.3)"
+        elif r.startswith("Target"):
+            color, bg, border = "#3fb950", "rgba(63,185,80,0.10)", "rgba(63,185,80,0.28)"
+        elif r.startswith("Stop-loss"):
+            color, bg, border = "#f85149", "rgba(248,81,73,0.10)", "rgba(248,81,73,0.28)"
         elif r.startswith("Expired") or r.startswith("Max holding"):
             color, bg, border = "#8b949e", "rgba(139,148,158,0.10)", "rgba(139,148,158,0.28)"
         else:
@@ -4605,9 +4609,9 @@ def _dore_options_closed_plans_table_html(df: pd.DataFrame) -> str:
                 f'border:1px solid {border};border-radius:4px;padding:2px 8px;">{_fmt_text(r)}</span>')
 
     if df.empty:
-        return '<div style="color:var(--muted);padding:8px;">No plans have closed yet.</div>'
+        return '<div style="color:var(--muted);padding:8px;">No entered plans have closed yet.</div>'
 
-    headers = ["Symbol", "Direction", "Strike", "Expiry", "Confidence at Entry", "Closed", "Reason"]
+    headers = ["Symbol", "Direction", "Strike", "Expiry", "Confidence at Entry", "T1", "Closed", "Reason"]
     rows_html = []
     for _, r in df.iterrows():
         direction = r.get("direction", "")
@@ -4620,6 +4624,10 @@ def _dore_options_closed_plans_table_html(df: pd.DataFrame) -> str:
             f'<td>{_fmt_money(r.get("strike"))}</td>',
             f'<td>{_fmt_text(r.get("expiry"))}</td>',
             f'<td>{conf_str}</td>',
+            # [2026-10-08] T1 does NOT close a plan (sticky milestone, SL moves
+            # to breakeven) — surface it here so a later SL / timeout close
+            # is visibly "after T1" rather than looking like a plain loss.
+            f'<td style="color:#3fb950;font-weight:700;">{"✓" if (r.get("t1_hit_at") not in (None, "") and pd.notna(r.get("t1_hit_at"))) else "—"}</td>',
             f'<td>{_fmt_closed_at(r.get("closed_at"))}</td>',
             f'<td>{_reason_badge(r.get("closed_reason", ""))}</td>',
         ]
@@ -4814,7 +4822,7 @@ def _render_dore_options_active_plans_tab() -> None:
     try:
         from utils.supabase_client import load_recently_closed_dore_options_plans
         with st.expander("🗂️ Recently Retired / Closed Plans", expanded=False):
-            closed_df = load_recently_closed_dore_options_plans(limit=15)
+            closed_df = load_recently_closed_dore_options_plans(limit=30)
             st.markdown(_dore_options_closed_plans_table_html(closed_df), unsafe_allow_html=True)
     except Exception:
         logger.exception("[scanner] recently-closed DORE Options panel failed to render (non-fatal)")

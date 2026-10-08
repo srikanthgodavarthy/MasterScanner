@@ -1321,15 +1321,30 @@ def load_open_dore_options_plan_symbols() -> set:
     return symbols
 
 
-def load_recently_closed_dore_options_plans(limit: int = 15) -> pd.DataFrame:
+def load_recently_closed_dore_options_plans(limit: int = 15, entered_only: bool = True) -> pd.DataFrame:
     """[Sprint 1 — Portfolio Admission UI] Most recently CLOSED DORE
-    Options plans, newest first."""
+    Options plans, newest first.
+
+    [2026-10-08, SG request] entered_only (default True): only plans that
+    actually traded — entry_triggered_at set, or closed by a Stop-loss /
+    Target 2 (both only possible once ACTIVE, which also covers older rows
+    written before entry_triggered_at existed). Plans that never entered
+    ("Stale — never entered", "Expired before entry", superseded/retired
+    while still pre-entry) are excluded. Previously ONE stale sweep closed
+    13 never-entered plans in the same minute and, with ORDER BY closed_at
+    DESC LIMIT 15, pushed every real SL / T2 closure out of the table.
+    entered_only=False restores the old all-closures behavior."""
     if not db.is_available():
         return pd.DataFrame()
     try:
+        where = "status = %s"
+        if entered_only:
+            where += (" AND (entry_triggered_at IS NOT NULL"
+                      " OR closed_reason_code IN ('STOP_LOSS', 'TARGET_2'))"
+                      " AND COALESCE(closed_reason_code, '') <> 'STALE_NO_ENTRY'")
         rows = db.fetch_all(
-            """SELECT * FROM dore_options_plans WHERE status = %s
-               ORDER BY closed_at DESC LIMIT %s""",
+            f"SELECT * FROM dore_options_plans WHERE {where} "
+            "ORDER BY closed_at DESC LIMIT %s",
             ("CLOSED", limit),
         )
         if not rows:
