@@ -242,3 +242,97 @@ def score_ll_opportunity(
     sig.bonus_pts = min(raw, max_bonus)
 
     return sig
+
+
+def score_ll_opportunity_fast(
+    n: int,
+    close: np.ndarray, low: np.ndarray, volume: np.ndarray,
+    atr: np.ndarray, vol_avg: np.ndarray,
+    lidx: np.ndarray, lab: np.ndarray, pprice: np.ndarray,
+    m: int,
+    max_bonus: int = LL_DEFAULT_MAX_BONUS,
+    max_bars_to_reclaim: int = LL_MAX_BARS_TO_RECLAIM,
+) -> LLOpportunitySignal:
+    """
+    [PERF 2026-10-08] Numpy twin of score_ll_opportunity() + find_active_ll()
+    for the backtest walk: `n` = bars visible (i+1) for close/low/volume/atr/
+    vol_avg; `m` = rows of the full swing-label frame visible (the caller's
+    lag-truncated prefix); `lidx`/`lab`/`pprice` = positions of L-pivots,
+    labels and pivot prices of the FULL label frame, computed once per
+    symbol. Identical rules to the Series version (which stays the reference
+    implementation); pinned by tests/test_perf_equivalence.py.
+    """
+    sig = LLOpportunitySignal()
+
+    k = int(np.searchsorted(lidx, m, side="left"))   # L-pivots inside the visible prefix
+    if k < 2:
+        return sig
+    if lab[lidx[k - 1]] == "LL":
+        ll_pos, prior_pos = int(lidx[k - 1]), int(lidx[k - 2])
+    elif k >= 3 and lab[lidx[k - 2]] == "LL":
+        ll_pos, prior_pos = int(lidx[k - 2]), int(lidx[k - 3])
+    else:
+        return sig
+
+    ll_price        = float(pprice[ll_pos])
+    prior_low_price = float(pprice[prior_pos])
+
+    reclaimed, reclaim_bar, bars_to_reclaim = False, -1, -1
+    window_end = min(n - 1, ll_pos + max_bars_to_reclaim)
+    if window_end >= ll_pos:
+        hit = np.flatnonzero(close[ll_pos: window_end + 1] > prior_low_price)
+        if hit.size:
+            reclaim_bar = ll_pos + int(hit[0])
+            reclaimed, bars_to_reclaim = True, reclaim_bar - ll_pos
+
+    volume_confirmed = bool(reclaimed and float(volume[reclaim_bar]) > float(vol_avg[reclaim_bar]))
+
+    seg = low[ll_pos:n]
+    defended = bool(float(np.fmin.reduce(seg)) >= ll_price) if seg.size else False
+
+    sig.ll_price                 = ll_price
+    sig.prior_low_price          = prior_low_price
+    sig.bars_to_reclaim          = bars_to_reclaim
+    sig.actionable_ll            = reclaimed
+    sig.ll_defended              = defended
+    sig.high_volume_confirmation = volume_confirmed
+
+    def _sl(x):
+        x = float(x)
+        return x if x == x else 0.0
+
+    cur_atr = _sl(atr[n - 1])
+    if cur_atr > 0 and reclaimed:
+        sig.distance_atr    = (_sl(close[n - 1]) - sig.ll_price) / cur_atr
+        sig.distance_atr_ok = bool(0.3 <= sig.distance_atr <= 4.0)
+
+        if 0.3 <= sig.distance_atr < 1.0:
+            sig.distance_atr_pts = 4
+        elif 1.0 <= sig.distance_atr < 2.0:
+            sig.distance_atr_pts = 3
+        elif 2.0 <= sig.distance_atr < 3.0:
+            sig.distance_atr_pts = 2
+        elif 3.0 <= sig.distance_atr <= 4.0:
+            sig.distance_atr_pts = 1
+
+        if reclaim_bar >= 0:
+            sig.bars_since_reclaim = (n - 1) - reclaim_bar
+            if sig.bars_since_reclaim > 0:
+                pace = sig.distance_atr / sig.bars_since_reclaim
+                if sig.bars_since_reclaim <= 3 and pace > 0.35:
+                    sig.vertical_extension = True
+                    sig.distance_atr_pts = max(0, sig.distance_atr_pts - 1)
+
+    sig.confidence = 30
+    if volume_confirmed:                 sig.confidence += 30
+    if defended:                         sig.confidence += 20
+    if 0 <= bars_to_reclaim <= 3:        sig.confidence += 20
+    sig.confidence = min(sig.confidence, 100)
+
+    raw = 0
+    if sig.actionable_ll:            raw += 2
+    if sig.ll_defended:              raw += 2
+    raw += sig.distance_atr_pts
+    if sig.high_volume_confirmation: raw += 2
+    sig.bonus_pts = min(raw, max_bonus)
+    return sig

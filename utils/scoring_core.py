@@ -1091,6 +1091,66 @@ def has_early_momentum_signal(r: "BarResult", vol_ratio_floor: float = 2.0) -> b
     return trend_up and vol_ratio >= vol_ratio_floor and rs_momentum > 0
 
 
+class _PerfArrays:
+    """[PERF 2026-10-08] Per-symbol float64 numpy views used by compute_bar()
+    in place of per-bar pandas .iloc slicing. Cached on the IndicatorArrays
+    object (built once per symbol, not per bar). float64 on purpose: these
+    must reproduce what the pandas Series paths returned bit-for-bit (the
+    existing float32 *_arr caches are a different, already-shipped
+    approximation and are not touched)."""
+    __slots__ = ("c", "h", "l", "v", "atr", "vavg", "cci", "asmc",
+                 "k", "d", "vwap", "lidx", "lab", "pprice")
+
+
+def _perf_arrays(ia) -> "_PerfArrays":
+    pa = getattr(ia, "_perf64", None)
+    if pa is not None:
+        return pa
+    pa = _PerfArrays()
+    f = lambda s: s.to_numpy(dtype=np.float64)
+    pa.c, pa.h, pa.l, pa.v = f(ia.c), f(ia.h), f(ia.l), f(ia.v)
+    pa.atr, pa.vavg, pa.cci, pa.asmc = f(ia.atr_s), f(ia.vol_avg), f(ia.cci_s), f(ia.atr_sma_comp)
+    pa.k = pa.d = pa.vwap = None          # filled lazily (only if the bonus block runs)
+    pa.lidx = pa.lab = pa.pprice = None
+    try:
+        ia._perf64 = pa
+    except Exception:
+        pass
+    return pa
+
+
+def _perf_stoch(ia, pa):
+    if pa.k is None:
+        from utils.stoch_convergence import precompute_stoch_inputs
+        k, d, vw = precompute_stoch_inputs(ia.h, ia.l, ia.c, ia.v)
+        pa.k, pa.d, pa.vwap = (x.to_numpy(dtype=np.float64) for x in (k, d, vw))
+    return pa
+
+
+def _perf_ll(ia, pa):
+    """Fill the LL label arrays; returns False if no precomputed labels exist."""
+    if pa.lidx is None:
+        labels = getattr(ia, "swing_labels_full", None)
+        if labels is None:
+            return False
+        pa.lab    = labels["label"].to_numpy()
+        pa.pprice = labels["pivot_price"].to_numpy(dtype=np.float64)
+        pa.lidx   = np.flatnonzero(labels["pivot_type"].to_numpy() == "L")
+    return True
+
+
+def _slice_max(arr, a: int, b: int) -> float:
+    """float(Series.iloc[a:b].max()) on a float64 array (NaN-skipping; NaN if empty)."""
+    seg = arr[a:b]
+    return float(np.fmax.reduce(seg)) if seg.size else float("nan")
+
+
+def _slice_min(arr, a: int, b: int) -> float:
+    seg = arr[a:b]
+    return float(np.fmin.reduce(seg)) if seg.size else float("nan")
+
+
+
 def compute_bar(
     ia:             IndicatorArrays,
     i:              int,
@@ -1131,6 +1191,7 @@ def compute_bar(
     def _get(arr, series, idx):
         return arr[idx] if arr is not None else float(series.iloc[idx])
 
+    _pa  = _perf_arrays(ia)   # [PERF] float64 views, built once per symbol
     ca   = ia._c_arr;   ha  = ia._h_arr;   la  = ia._l_arr
     e20a = ia._e20_arr; e50a= ia._e50_arr; e200a=ia._e200_arr
     e9a  = ia._e9_arr;  e21a= ia._e21_arr
@@ -1408,9 +1469,10 @@ def compute_bar(
     # NOTE: kept as a true parameter — callers set this via ScoringParams; default is 2.
     _cci_win = params.t1_cci_window
     _recovery_window = range(max(1, i - _cci_win + 1), i + 1)
+    _cci64 = _pa.cci
     recent_cci_recovery = any(
-        float(ia.cci_s.iloc[j - 1]) <= params.cci_os and
-        float(ia.cci_s.iloc[j])     >  params.cci_os
+        float(_cci64[j - 1]) <= params.cci_os and
+        float(_cci64[j])     >  params.cci_os
         for j in _recovery_window
     )
 
@@ -1449,7 +1511,7 @@ def compute_bar(
         prev_atr_compressed = False
 
     comp_start       = max(0, i - comp)
-    compression_high = float(h.iloc[comp_start:i].max())
+    compression_high = _slice_max(_pa.h, comp_start, i)
     compression_break = prev_atr_compressed and cur_c > compression_high
 
     # ── SQUEEZE ────────────────────────────────────────────────────
@@ -1625,7 +1687,7 @@ def compute_bar(
         _f382  = _sw_hi - _rng * (params.t1_fib_hi / 100.0) if _rng > 0 else _sc
         _in_gr = (_sc >= _f618 and _sc <= _f382)
         _atr_j     = atrl[j] if atrl is not None else float(ia.atr_s.iloc[j])
-        _atr_sma_j = float(ia.atr_sma_comp.iloc[j])
+        _atr_sma_j = float(_pa.asmc[j])
         _atr_sma_j = _atr_j if np.isnan(_atr_sma_j) else _atr_sma_j
         _comp  = (_atr_j < _atr_sma_j * params.t2_atr_ratio) if _atr_sma_j > 0 else False
         _tr    = _sc > _se200 and _se20 > _se50
@@ -1807,7 +1869,7 @@ def compute_bar(
     # Breakout bonus REMOVED: rewards chasing, and SL is not structure-adjusted
     # for breakout entries. A stock at 10-bar high is already extended.
     # Keep only a small proximity bonus for stocks near but not AT highs.
-    hh = float(ia.c.iloc[max(0, i - 10):i].max()) if i >= 1 else cur_c
+    hh = _slice_max(_pa.c, max(0, i - 10), i) if i >= 1 else cur_c
     score += (5 if cur_c > hh * 0.98 and cur_c < hh * 1.01 else 0)  # near high, not breakout
     # Removed: score += 10 if cur_c > close[i-2]*1.01 (2-bar momentum — too noisy)
 
@@ -1963,32 +2025,45 @@ def compute_bar(
                 # cutoff the Five-Pillars path applies. No-op for a live final
                 # bar (the centered series is already NaN there).
                 _lag = int(params.pvt_lb)
-                _ph_v = _pl_v = None
-                _lbl_v = None
-                if _swing_labels is not None:
-                    _lbl_v = _swing_labels.iloc[0: max(0, i + 1 - _lag)]
-                if ia.ph_series is not None and ia.pl_series is not None:
-                    if _lbl_v is not None:
-                        # [PERF 2026-10-08] precomputed (already lag-truncated)
-                        # labels are supplied, so score_ll_opportunity never
-                        # reads ph/pl beyond a non-empty check -- skip the two
-                        # per-bar .copy() + NaN-blanking passes.
-                        _ph_v = ia.ph_series.iloc[_sl]
-                        _pl_v = ia.pl_series.iloc[_sl]
-                    else:
-                        _ph_v = ia.ph_series.iloc[_sl].copy()
-                        _pl_v = ia.pl_series.iloc[_sl].copy()
-                        if _lag > 0 and len(_ph_v) > 0:
-                            _ph_v.iloc[-_lag:] = float("nan")
-                            _pl_v.iloc[-_lag:] = float("nan")
-                _ll_sig = score_ll_opportunity(
-                    close=ia.c.iloc[_sl], low=ia.l.iloc[_sl], volume=ia.v.iloc[_sl],
-                    ph_series=_ph_v,
-                    pl_series=_pl_v,
-                    atr_s=ia.atr_s.iloc[_sl], vol_avg=ia.vol_avg.iloc[_sl],
-                    max_bonus=params.ll_bonus_max,
-                    precomputed_labels=_lbl_v,
-                )
+                if (_swing_labels is not None and ia.ph_series is not None
+                        and ia.pl_series is not None and _perf_ll(ia, _pa)):
+                    # [PERF 2026-10-08] numpy twin of score_ll_opportunity():
+                    # same rules on full-history float64 arrays + the lag-
+                    # truncated label prefix (m), no per-bar Series slicing.
+                    # Pinned to the Series version by tests/test_perf_equivalence.py.
+                    from utils.ll_opportunity import score_ll_opportunity_fast
+                    _ll_sig = score_ll_opportunity_fast(
+                        i + 1, _pa.c, _pa.l, _pa.v, _pa.atr, _pa.vavg,
+                        _pa.lidx, _pa.lab, _pa.pprice, max(0, i + 1 - _lag),
+                        max_bonus=params.ll_bonus_max,
+                    )
+                else:
+                    _ph_v = _pl_v = None
+                    _lbl_v = None
+                    if _swing_labels is not None:
+                        _lbl_v = _swing_labels.iloc[0: max(0, i + 1 - _lag)]
+                    if ia.ph_series is not None and ia.pl_series is not None:
+                        if _lbl_v is not None:
+                            # [PERF 2026-10-08] precomputed (already lag-truncated)
+                            # labels are supplied, so score_ll_opportunity never
+                            # reads ph/pl beyond a non-empty check -- skip the two
+                            # per-bar .copy() + NaN-blanking passes.
+                            _ph_v = ia.ph_series.iloc[_sl]
+                            _pl_v = ia.pl_series.iloc[_sl]
+                        else:
+                            _ph_v = ia.ph_series.iloc[_sl].copy()
+                            _pl_v = ia.pl_series.iloc[_sl].copy()
+                            if _lag > 0 and len(_ph_v) > 0:
+                                _ph_v.iloc[-_lag:] = float("nan")
+                                _pl_v.iloc[-_lag:] = float("nan")
+                    _ll_sig = score_ll_opportunity(
+                        close=ia.c.iloc[_sl], low=ia.l.iloc[_sl], volume=ia.v.iloc[_sl],
+                        ph_series=_ph_v,
+                        pl_series=_pl_v,
+                        atr_s=ia.atr_s.iloc[_sl], vol_avg=ia.vol_avg.iloc[_sl],
+                        max_bonus=params.ll_bonus_max,
+                        precomputed_labels=_lbl_v,
+                    )
                 ll_actionable   = _ll_sig.actionable_ll
                 ll_defended     = _ll_sig.ll_defended
                 ll_distance_atr = _ll_sig.distance_atr
@@ -2000,28 +2075,17 @@ def compute_bar(
 
         if i >= _stoch_min_bars:
             try:
-                from utils.stoch_convergence import (
-                    score_stochastic_convergence, precompute_stoch_inputs,
-                    STOCH_TAIL_BARS,
-                )
-                # [PERF 2026-10-08] %K/%D/VWAP are causal, so compute them once
-                # per symbol (cached on `ia`) and hand the scorer only the last
-                # STOCH_TAIL_BARS bars -- identical output, no per-bar rolling
-                # recompute over the whole prefix. touch_bar/cross_bar are
-                # bars-ago (relative to the end), so the tail window is safe.
-                _spre = getattr(ia, "_stoch_pre", None)
-                if _spre is None:
-                    _spre = precompute_stoch_inputs(ia.h, ia.l, ia.c, ia.v)
-                    try:
-                        ia._stoch_pre = _spre
-                    except Exception:
-                        pass
-                _tl = slice(max(0, i + 1 - STOCH_TAIL_BARS), i + 1)
-                _stoch_sig = score_stochastic_convergence(
-                    high=ia.h.iloc[_tl], low=ia.l.iloc[_tl], close=ia.c.iloc[_tl],
-                    volume=ia.v.iloc[_tl], atr_s=ia.atr_s.iloc[_tl],
+                from utils.stoch_convergence import score_stochastic_convergence_fast
+                # [PERF 2026-10-08] %K/%D/anchored-VWAP are causal, so they are
+                # computed once per symbol (cached on `ia`) and the scorer reads
+                # bar i straight off float64 arrays -- no per-bar Series slicing
+                # or rolling recompute. Numpy twin of
+                # score_stochastic_convergence(); pinned by
+                # tests/test_perf_equivalence.py.
+                _perf_stoch(ia, _pa)
+                _stoch_sig = score_stochastic_convergence_fast(
+                    i, _pa.h, _pa.l, _pa.c, _pa.atr, _pa.k, _pa.d, _pa.vwap,
                     max_bonus=params.stoch_bonus_max,
-                    pre=(_spre[0].iloc[_tl], _spre[1].iloc[_tl], _spre[2].iloc[_tl]),
                 )
                 stoch_k_v        = _stoch_sig.stoch_k
                 stoch_d_v        = _stoch_sig.stoch_d
@@ -2141,7 +2205,7 @@ def compute_bar(
     # ── SELL SIGNALS ──────────────────────────────────────────────
     pvt_lb_use       = min(params.pvt_lb, max(1, i // 4))
     ema_dn           = cur_e20 < cur_e50
-    recent_sw_hi     = float(h.iloc[max(0, i - pvt_lb_use * 2):i + 1].max())
+    recent_sw_hi     = _slice_max(_pa.h, max(0, i - pvt_lb_use * 2), i + 1)
     not_breaking_out = cur_c < recent_sw_hi * 1.005
     fib_sell_rej127  = prev_h >= fib_ext127 and cur_c < fib_ext127
     fib_sell_rej161  = prev_h >= fib_ext161 and cur_c < fib_ext161
@@ -2177,7 +2241,7 @@ def compute_bar(
     #     T1/T2 too far from entry, causing >70% TIMEOUT exits on NSE daily bars)
 
     # Swing-low based SL: lowest low of last pvt_lb bars, minus 0.5*ATR buffer
-    _sw_lo_sl = float(l.iloc[max(0, i - params.pvt_lb):i + 1].min()) - cur_atr * 0.5
+    _sw_lo_sl = _slice_min(_pa.l, max(0, i - params.pvt_lb), i + 1) - cur_atr * 0.5
 
     # ATR-based floor (never tighter than 1.5 ATR below padded entry)
     _atr_floor   = _entry_pad - cur_atr * 1.5
