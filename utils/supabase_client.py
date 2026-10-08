@@ -1245,6 +1245,21 @@ def _load_open_dore_options_plans_uncached() -> dict:
         return {}
 
 
+def invalidate_open_dore_plans_cache() -> None:
+    """[2026-10-08] Drop the open-plans TTL caches so a plan closed from the
+    UI (Active Plans -> Remove inactive) disappears on the very next render
+    instead of lingering up to _OPEN_DORE_PLANS_TTL_S seconds."""
+    with _open_dore_plans_cache_lock:
+        _open_dore_plans_cache["ts"] = 0.0
+        _open_dore_plans_cache["plans"] = {}
+    try:
+        with _open_dore_plan_symbols_cache_lock:
+            _open_dore_plan_symbols_cache["ts"] = 0.0
+            _open_dore_plan_symbols_cache["symbols"] = set()
+    except NameError:
+        pass
+
+
 def load_open_dore_options_plans() -> dict:
     """Return every currently-open DORE Options plan — ANY non-CLOSED
     lifecycle stage (TRACKED / WAITING_FOR_ENTRY / ENTRY_READY /

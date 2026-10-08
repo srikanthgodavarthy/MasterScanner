@@ -377,6 +377,39 @@ CLOSE_REASON_STALE_NO_ENTRY = "STALE_NO_ENTRY"
 CLOSE_REASON_STRUCTURAL_INVALIDATION = "STRUCTURAL_INVALIDATION"
 
 
+# [2026-10-08, SG request] Display status for the "Recently Retired / Closed
+# Plans" table. The persisted `status` is CLOSED for every row there (it is
+# the terminal state, and is_open() treats anything else as still monitored),
+# so it cannot distinguish a plan that finished on its own merits from one
+# that was invalidated or timed out. This derives the user-facing status
+# from closed_reason_code (falling back to the free-text closed_reason for
+# older rows written before the code existed) without touching persistence.
+DISPLAY_STATUS_CLOSED_SL = "Closed · SL"
+DISPLAY_STATUS_CLOSED_T1 = "Closed · T1"
+DISPLAY_STATUS_CLOSED_T2 = "Closed · T2"
+DISPLAY_STATUS_INACTIVE  = "Inactive"
+
+
+def closed_plan_display_status(closed_reason_code, closed_reason, t1_hit_at) -> str:
+    """Closed = the plan met T1, T2 or SL. Everything else (thesis /
+    structural invalidation, max holding period, contract expiry,
+    superseded / retired, never-entered stale) is Inactive.
+
+    Precedence: T2 and SL are explicit exits and win. Otherwise a plan that
+    had already hit T1 before it was timed out / invalidated is Closed · T1
+    (T1 is a sticky milestone, not an exit — see is_t1_hit()). No T1, no
+    T2, no SL -> Inactive."""
+    code = str(closed_reason_code or "").upper()
+    text = str(closed_reason or "").lower()
+    if code == CLOSE_REASON_TARGET_2 or "target 2" in text or "target2" in text:
+        return DISPLAY_STATUS_CLOSED_T2
+    if code == CLOSE_REASON_STOP_LOSS or "stop-loss" in text or "stop loss" in text:
+        return DISPLAY_STATUS_CLOSED_SL
+    if t1_hit_at not in (None, "") and str(t1_hit_at).lower() not in ("nan", "nat", "none"):
+        return DISPLAY_STATUS_CLOSED_T1
+    return DISPLAY_STATUS_INACTIVE
+
+
 def _sval(status) -> str:
     if isinstance(status, DoreOptionsPlanStatus):
         return status.value
@@ -1892,6 +1925,71 @@ def _lifecycle_group(status: str) -> str:
     return status
 
 
+INACTIVE_REASON_EXPIRED     = "Expired"
+INACTIVE_REASON_MAX_HOLDING = "Max holding expiry"
+
+
+def plan_inactive_reason(expiry: str, age_date: str, today: str) -> str:
+    """[2026-10-08, SG request] Read-time "should this open plan already be
+    Inactive?" check for the Active Plans table. Same two rules, in the same
+    order, as the auto-close sweep in enrich_trade_plans_with_persistence():
+    contract expired first, then _is_stale_by_age() from the lifecycle clock.
+
+    Why this exists: the sweep only runs when the scan worker cycles, so a
+    plan that has passed its max holding period (or its expiry) overnight /
+    over a weekend / while the worker is down is still non-CLOSED in the DB
+    and used to read "🟢 Active (3d ...)" until the next cycle closed it.
+    Returns "" when the plan is still within its window. Persistence is not
+    touched — the sweep remains the only thing that actually closes a plan.
+
+    Thesis (EMA9) invalidation is deliberately NOT evaluated here: it needs
+    the live underlying, which an open plan row doesn't carry. Those are
+    closed by the live cycle and appear in Recently Retired / Closed as
+    Inactive."""
+    if _is_expired(expiry, today):
+        return INACTIVE_REASON_EXPIRED
+    if _is_stale_by_age(age_date, today):
+        return INACTIVE_REASON_MAX_HOLDING
+    return ""
+
+
+def close_inactive_plans(open_plans: dict, contract_keys, today: Optional[str] = None) -> list:
+    """[2026-10-08, SG request] "Remove" action for the Active Plans table's
+    Inactive rows. Closes each named plan exactly the way the worker's sweep
+    would (same closed_reason text, closed_reason_code and final-outcome
+    record), so the plan leaves the Active table and lands in Recently
+    Retired / Closed as Inactive — nothing is deleted.
+
+    Safety: each plan is RE-CHECKED with plan_inactive_reason() against the
+    freshly loaded `open_plans` at click time. A key that is unknown, already
+    closed, or no longer past its limit is skipped, so a stale page, a double
+    click, or a race with the worker can never close a live plan.
+
+    Mutates the matching plans and returns only those it closed; the caller
+    persists them (upsert_dore_options_plans_batch) and invalidates the
+    open-plans cache."""
+    today = today or _today_str()
+    closed: list = []
+    for key in contract_keys or []:
+        plan = (open_plans or {}).get(key)
+        if plan is None or not plan.is_open():
+            continue
+        reason = plan_inactive_reason(plan.expiry, _lifecycle_age_start(plan)[0], today)
+        if not reason:
+            continue
+        plan.status = DoreOptionsPlanStatus.CLOSED
+        plan.closed_at = _now_iso()
+        if reason == INACTIVE_REASON_EXPIRED:
+            plan.closed_reason = "Expired"
+            plan.closed_reason_code = CLOSE_REASON_EXPIRY
+        else:
+            plan.closed_reason = f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS}d)"
+            plan.closed_reason_code = CLOSE_REASON_TIMEOUT
+        _record_dore_final_outcome(plan)
+        closed.append(plan)
+    return closed
+
+
 def _active_plan_status_label(status: str, days_active: int, created_date: str, created_at: str = "") -> str:
     # [2026-08-12] Now reflects the plan's REAL lifecycle status
     # (TRACKED/WAITING_FOR_ENTRY/ENTRY_READY/IN_ENTRY_ZONE/ACTIVE)
@@ -1938,6 +2036,12 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
             _age_date, _age_at = _lifecycle_age_start(plan)
             days_active = _compute_days_active(_age_date)
             status = _sval(plan.status)
+            _since = _to_ist_display(_age_at) if _age_at else _age_date
+            _inactive = plan_inactive_reason(plan.expiry, _age_date, _today_str())
+            if _inactive:
+                _label = f"⚪ Inactive · {_inactive} ({days_active}d · since {_since})"
+            else:
+                _label = _active_plan_status_label(status, days_active, _age_date, _age_at)
             rows.append({
                 "symbol": plan.symbol,
                 "direction": plan.direction,
@@ -1982,7 +2086,11 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
                 "last_seen_at": plan.last_seen_at,
                 "created_date": plan.created_date,
                 "plan_age_days": days_active,
-                "plan_status_label": _active_plan_status_label(status, days_active, _age_date, _age_at),
+                "plan_status_label": _label,
+                "plan_id": plan.plan_id,
+                "contract_key": plan.contract_key,
+                "is_inactive": bool(_inactive),
+                "inactive_reason": _inactive,
             })
         except Exception:
             logger.exception("[dore_options_persistence] active_plan_rows failed for one plan — skipped")

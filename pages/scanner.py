@@ -4554,7 +4554,10 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
             f'<td>{_fmt_text(r.get("plan_age_days"))}d</td>',
             f'<td>{_fmt_text(r.get("expiry"))}</td>',
             f'<td>{_fmt_source(r)}</td>',
-            f'<td>{r.get("plan_status_label", "—")}</td>',
+            # [2026-10-08] Plans past max holding / expiry that the worker
+            # hasn't swept yet read "⚪ Inactive · ..." (muted) instead of Active.
+            (f'<td style="color:#8b949e;">{r.get("plan_status_label", "—")}</td>'
+             if r.get("is_inactive") else f'<td>{r.get("plan_status_label", "—")}</td>'),
         ]
         rows_html.append(f'<tr class="ap-row">{"".join(cells)}</tr>')
 
@@ -4577,6 +4580,8 @@ def _dore_options_closed_plans_table_html(df: pd.DataFrame) -> str:
     reasons from that logic; "Expired" and "Max holding period" are the
     pre-existing auto-close reasons, shown here too for one consistent
     audit trail rather than splitting it across two tables."""
+    from utils.dore_options_persistence import closed_plan_display_status
+
     def _fmt_text(v):
         return v if v not in (None, "") and pd.notna(v) else "—"
 
@@ -4608,10 +4613,22 @@ def _dore_options_closed_plans_table_html(df: pd.DataFrame) -> str:
         return (f'<span style="color:{color};font-size:12px;background:{bg};'
                 f'border:1px solid {border};border-radius:4px;padding:2px 8px;">{_fmt_text(r)}</span>')
 
+    def _status_badge(status: str) -> str:
+        # Closed = met T1 / T2 / SL; Inactive = invalidated, max holding,
+        # expired, superseded/retired (see closed_plan_display_status()).
+        if status.endswith("SL"):
+            color, bg, border = "#f85149", "rgba(248,81,73,0.10)", "rgba(248,81,73,0.28)"
+        elif status.startswith("Closed"):
+            color, bg, border = "#3fb950", "rgba(63,185,80,0.10)", "rgba(63,185,80,0.28)"
+        else:
+            color, bg, border = "#8b949e", "rgba(139,148,158,0.10)", "rgba(139,148,158,0.28)"
+        return (f'<span style="color:{color};font-size:12px;font-weight:700;background:{bg};'
+                f'border:1px solid {border};border-radius:4px;padding:2px 8px;">{status}</span>')
+
     if df.empty:
         return '<div style="color:var(--muted);padding:8px;">No entered plans have closed yet.</div>'
 
-    headers = ["Symbol", "Direction", "Strike", "Expiry", "Confidence at Entry", "T1", "Closed", "Reason"]
+    headers = ["Symbol", "Direction", "Strike", "Expiry", "Confidence at Entry", "T1", "Closed", "Status", "Reason"]
     rows_html = []
     for _, r in df.iterrows():
         direction = r.get("direction", "")
@@ -4629,6 +4646,7 @@ def _dore_options_closed_plans_table_html(df: pd.DataFrame) -> str:
             # is visibly "after T1" rather than looking like a plain loss.
             f'<td style="color:#3fb950;font-weight:700;">{"✓" if (r.get("t1_hit_at") not in (None, "") and pd.notna(r.get("t1_hit_at"))) else "—"}</td>',
             f'<td>{_fmt_closed_at(r.get("closed_at"))}</td>',
+            f'<td>{_status_badge(closed_plan_display_status(r.get("closed_reason_code"), r.get("closed_reason"), r.get("t1_hit_at")))}</td>',
             f'<td>{_reason_badge(r.get("closed_reason", ""))}</td>',
         ]
         rows_html.append(f'<tr class="ap-row">{"".join(cells)}</tr>')
@@ -4737,6 +4755,54 @@ def _fetch_live_premiums_for_table(df: pd.DataFrame) -> "tuple[pd.DataFrame, int
     return df, n_updated
 
 
+def _remove_inactive_dore_plans(contract_keys: list) -> None:
+    """[2026-10-08, SG request] on_click handler for the Active Plans
+    "Remove" buttons. Reloads open plans UNCACHED, lets
+    close_inactive_plans() re-verify each one is still past max holding /
+    expiry, persists the ones it closed, then drops the open-plans cache so
+    the rows vanish on the rerun this click triggers. Runs as a callback
+    (before the rerun) so the very next render already reflects it."""
+    try:
+        from utils.supabase_client import (
+            _load_open_dore_options_plans_uncached, upsert_dore_options_plans_batch,
+            invalidate_open_dore_plans_cache,
+        )
+        from utils.dore_options_persistence import close_inactive_plans
+        closed = close_inactive_plans(_load_open_dore_options_plans_uncached(), contract_keys)
+        ok = bool(closed) and upsert_dore_options_plans_batch([p.to_db_dict() for p in closed])
+        invalidate_open_dore_plans_cache()
+        if ok:
+            st.toast(f"Removed {len(closed)} inactive plan(s) — see Recently Retired / Closed.", icon="🗑️")
+        elif closed:
+            st.toast("Couldn't save the removal — try again.", icon="⚠️")
+        else:
+            st.toast("Nothing to remove — plan is no longer inactive.", icon="ℹ️")
+    except Exception:
+        logger.exception("[scanner] remove inactive DORE plans failed (non-fatal)")
+        st.toast("Couldn't remove — see logs.", icon="⚠️")
+
+
+def _render_dore_inactive_remove_controls(rows_df: pd.DataFrame) -> None:
+    """Click-to-remove controls for Inactive rows (past max holding / expired)
+    of the Active Plans table. The table itself is static HTML (no click
+    handlers), so the buttons sit directly above it."""
+    if rows_df.empty or "is_inactive" not in rows_df.columns:
+        return
+    inactive = rows_df[rows_df["is_inactive"] == True]   # noqa: E712
+    if inactive.empty:
+        return
+    st.caption(f"⚪ {len(inactive)} inactive plan(s) — past max holding / expired. "
+               "Remove moves them to Recently Retired / Closed (nothing is deleted).")
+    keys_all = list(inactive["contract_key"])
+    st.button(f"🗑️ Remove all inactive ({len(keys_all)})", key="dore_rm_inactive_all",
+              on_click=_remove_inactive_dore_plans, args=(keys_all,))
+    for _, r in inactive.iterrows():
+        label = (f"✕ {r.get('symbol')} {r.get('direction')} {float(r.get('strike') or 0):g}"
+                 f" · {r.get('inactive_reason')}")
+        st.button(label, key=f"dore_rm_inactive_{r.get('plan_id')}",
+                  on_click=_remove_inactive_dore_plans, args=([r.get("contract_key")],))
+
+
 def _render_dore_options_active_plans_tab() -> None:
     """[2026-08-01] DORE Options Engine — Active Plans tab. Reads every
     currently-OPEN DoreOptionsPlan straight from Supabase
@@ -4798,6 +4864,7 @@ def _render_dore_options_active_plans_tab() -> None:
     # since an earlier session. Purely a display split of the SAME
     # rows_df — a plan moves from "Today's" to "Previous Days'" on its
     # own the next calendar day, same as plan_age_days itself.
+    _render_dore_inactive_remove_controls(rows_df)
     today_tab, prev_tab = st.tabs(["🆕 Today's Setups", "📅 Previous Days' Setups"])
     with today_tab:
         today_df = rows_df[rows_df["plan_age_days"] == 0]
