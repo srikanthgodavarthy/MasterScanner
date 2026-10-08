@@ -1964,15 +1964,23 @@ def compute_bar(
                 # bar (the centered series is already NaN there).
                 _lag = int(params.pvt_lb)
                 _ph_v = _pl_v = None
-                if ia.ph_series is not None and ia.pl_series is not None:
-                    _ph_v = ia.ph_series.iloc[_sl].copy()
-                    _pl_v = ia.pl_series.iloc[_sl].copy()
-                    if _lag > 0 and len(_ph_v) > 0:
-                        _ph_v.iloc[-_lag:] = float("nan")
-                        _pl_v.iloc[-_lag:] = float("nan")
                 _lbl_v = None
                 if _swing_labels is not None:
                     _lbl_v = _swing_labels.iloc[0: max(0, i + 1 - _lag)]
+                if ia.ph_series is not None and ia.pl_series is not None:
+                    if _lbl_v is not None:
+                        # [PERF 2026-10-08] precomputed (already lag-truncated)
+                        # labels are supplied, so score_ll_opportunity never
+                        # reads ph/pl beyond a non-empty check -- skip the two
+                        # per-bar .copy() + NaN-blanking passes.
+                        _ph_v = ia.ph_series.iloc[_sl]
+                        _pl_v = ia.pl_series.iloc[_sl]
+                    else:
+                        _ph_v = ia.ph_series.iloc[_sl].copy()
+                        _pl_v = ia.pl_series.iloc[_sl].copy()
+                        if _lag > 0 and len(_ph_v) > 0:
+                            _ph_v.iloc[-_lag:] = float("nan")
+                            _pl_v.iloc[-_lag:] = float("nan")
                 _ll_sig = score_ll_opportunity(
                     close=ia.c.iloc[_sl], low=ia.l.iloc[_sl], volume=ia.v.iloc[_sl],
                     ph_series=_ph_v,
@@ -1992,11 +2000,28 @@ def compute_bar(
 
         if i >= _stoch_min_bars:
             try:
-                from utils.stoch_convergence import score_stochastic_convergence
+                from utils.stoch_convergence import (
+                    score_stochastic_convergence, precompute_stoch_inputs,
+                    STOCH_TAIL_BARS,
+                )
+                # [PERF 2026-10-08] %K/%D/VWAP are causal, so compute them once
+                # per symbol (cached on `ia`) and hand the scorer only the last
+                # STOCH_TAIL_BARS bars -- identical output, no per-bar rolling
+                # recompute over the whole prefix. touch_bar/cross_bar are
+                # bars-ago (relative to the end), so the tail window is safe.
+                _spre = getattr(ia, "_stoch_pre", None)
+                if _spre is None:
+                    _spre = precompute_stoch_inputs(ia.h, ia.l, ia.c, ia.v)
+                    try:
+                        ia._stoch_pre = _spre
+                    except Exception:
+                        pass
+                _tl = slice(max(0, i + 1 - STOCH_TAIL_BARS), i + 1)
                 _stoch_sig = score_stochastic_convergence(
-                    high=ia.h.iloc[_sl], low=ia.l.iloc[_sl], close=ia.c.iloc[_sl],
-                    volume=ia.v.iloc[_sl], atr_s=ia.atr_s.iloc[_sl],
+                    high=ia.h.iloc[_tl], low=ia.l.iloc[_tl], close=ia.c.iloc[_tl],
+                    volume=ia.v.iloc[_tl], atr_s=ia.atr_s.iloc[_tl],
                     max_bonus=params.stoch_bonus_max,
+                    pre=(_spre[0].iloc[_tl], _spre[1].iloc[_tl], _spre[2].iloc[_tl]),
                 )
                 stoch_k_v        = _stoch_sig.stoch_k
                 stoch_d_v        = _stoch_sig.stoch_d

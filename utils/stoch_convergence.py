@@ -65,6 +65,29 @@ def _safe_at(series: pd.Series, idx: int, default: float = 0.0) -> float:
         return default
 
 
+# [PERF 2026-10-08] Everything score_stochastic_convergence() reads from its
+# inputs lives in the last few bars: the cross test needs [-2:], the VWAP
+# touch search looks back `lookback`+1 bars, and the stoch-confluence search
+# looks back `lookback`+2. TAIL_BARS is comfortably larger than that for any
+# sane `lookback`. %K/%D (rolling) and anchored VWAP (cumsum) are causal, so
+# computing them ONCE over the full history and slicing a tail is bit-for-bit
+# identical to recomputing them on every [0:i+1] prefix -- which is what the
+# backtest used to do on every bar.
+STOCH_TAIL_BARS = 12
+
+
+def precompute_stoch_inputs(high: pd.Series, low: pd.Series, close: pd.Series,
+                            volume: pd.Series,
+                            k_period: int = 4, d_period: int = 3, k_smooth: int = 3):
+    """Full-history (%K, %D, anchored VWAP) for score_stochastic_convergence(
+    ..., pre=...). Defaults mirror that function's own k/d/smooth defaults."""
+    k_s, d_s = stochastic(high, low, close, k_period=k_period,
+                          d_period=d_period, k_smooth=k_smooth)
+    vwap_typical = (high + low + close) / 3.0
+    vwap_series  = (vwap_typical * volume).cumsum() / volume.cumsum().replace(0, np.nan)
+    return k_s, d_s, vwap_series
+
+
 @dataclass
 class StochConvergenceSignal:
     stoch_k:              float = 0.0
@@ -111,6 +134,7 @@ def score_stochastic_convergence(
     k_period: int = 4,
     d_period: int = 3,
     k_smooth: int = 3,
+    pre: tuple | None = None,
 ) -> StochConvergenceSignal:
     """
     Grade "Stochastic Convergence" on a 0..max_bonus scale:
@@ -149,7 +173,14 @@ def score_stochastic_convergence(
     """
     sig = StochConvergenceSignal()
 
-    k_s, d_s = stochastic(high, low, close, k_period=k_period, d_period=d_period, k_smooth=k_smooth)
+    if pre is not None:
+        # Caller passes (k_s, d_s, vwap_series) already aligned to the same
+        # (tail) window as high/low/close/volume/atr_s -- see
+        # precompute_stoch_inputs() / STOCH_TAIL_BARS.
+        k_s, d_s, _pre_vwap = pre
+    else:
+        k_s, d_s = stochastic(high, low, close, k_period=k_period, d_period=d_period, k_smooth=k_smooth)
+        _pre_vwap = None
     n = len(k_s)
     cur_k  = _safe_last(k_s, default=50.0)
     cur_d  = _safe_last(d_s, default=50.0)
@@ -176,8 +207,11 @@ def score_stochastic_convergence(
             sig.reignition_kind       = "cross_down"
             sig.bars_since_reignition = 0
 
-    vwap_typical = (high + low + close) / 3.0
-    vwap_series  = (vwap_typical * volume).cumsum() / volume.cumsum().replace(0, np.nan)
+    if _pre_vwap is not None:
+        vwap_series = _pre_vwap
+    else:
+        vwap_typical = (high + low + close) / 3.0
+        vwap_series  = (vwap_typical * volume).cumsum() / volume.cumsum().replace(0, np.nan)
 
     reclaim = detect_vwap_reclaim(
         low=low, close=close, high=high, volume=volume, atr_s=atr_s,

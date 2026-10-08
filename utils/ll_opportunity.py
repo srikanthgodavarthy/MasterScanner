@@ -26,6 +26,7 @@ as before.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import numpy as np
 import pandas as pd
 
 from utils.swing_structure import compute_swing_labels
@@ -106,27 +107,37 @@ def find_active_ll(ph_series: pd.Series, pl_series: pd.Series,
         labels = precomputed_labels if precomputed_labels is not None else compute_swing_labels(ph_series, pl_series)
     except Exception:
         return None
-    lows = labels[labels["pivot_type"] == "L"]
-    if len(lows) < 2:
+    # [PERF 2026-10-08] `labels` is one row per bar, so the old
+    # `labels[labels["pivot_type"] == "L"]` boolean-indexed (copied) the whole
+    # prefix DataFrame on every bar, then built row Series with .iloc[-1][...]
+    # and re-hashed a fresh DatetimeIndex via get_loc() just to recover a
+    # position we already had. Same logic on numpy arrays: only the last
+    # three L-pivots are ever read.
+    _ptype = labels["pivot_type"].to_numpy()
+    _lidx  = np.flatnonzero(_ptype == "L")
+    if len(_lidx) < 2:
         return None
+    _lab    = labels["label"].to_numpy()
+    _pprice = labels["pivot_price"].to_numpy()
 
-    if lows.iloc[-1]["label"] == "LL":
-        active, prior = lows.iloc[-1], lows.iloc[-2]
-    elif len(lows) >= 3 and lows.iloc[-2]["label"] == "LL":
-        active, prior = lows.iloc[-2], lows.iloc[-3]
+    if _lab[_lidx[-1]] == "LL":
+        ll_bar_pos, prior_pos = int(_lidx[-1]), int(_lidx[-2])
+    elif len(_lidx) >= 3 and _lab[_lidx[-2]] == "LL":
+        ll_bar_pos, prior_pos = int(_lidx[-2]), int(_lidx[-3])
     else:
         return None
 
-    ll_bar_pos = labels.index.get_loc(active.name)
-    ll_price = float(active["pivot_price"])
-    prior_low_price = float(prior["pivot_price"])
+    ll_price = float(_pprice[ll_bar_pos])
+    prior_low_price = float(_pprice[prior_pos])
 
     reclaimed, reclaim_bar, bars_to_reclaim = False, -1, -1
     window_end = min(len(close) - 1, ll_bar_pos + max_bars_to_reclaim)
-    for j in range(ll_bar_pos, window_end + 1):
-        if float(close.iloc[j]) > prior_low_price:
+    if window_end >= ll_bar_pos:
+        _seg = close.to_numpy()[ll_bar_pos: window_end + 1]
+        _hit = np.flatnonzero(_seg > prior_low_price)   # NaN > x is False, same as float() path
+        if len(_hit):
+            j = ll_bar_pos + int(_hit[0])
             reclaimed, reclaim_bar, bars_to_reclaim = True, j, j - ll_bar_pos
-            break
 
     volume_confirmed = False
     if reclaimed and vol_avg is not None:
