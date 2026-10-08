@@ -1995,12 +1995,14 @@ def score_stock(
     # SMC state and swing label. Each step now fails alone, and logs.
     _pvt_lb = params.pvt_lb if hasattr(params, "pvt_lb") else 20
     try:
-        from utils.smc_engine import compute_smc_state
+        from utils.smc_engine import compute_smc_state, resolve_conflict_mode
         # [2026-10-08] settings["smc_conflict_mode"] ("legacy" default |
         # "confirmed_break") — see compute_smc_state()'s conflict_mode doc.
+        # resolve_conflict_mode(): DEFAULTS-backed, and an invalid value
+        # falls back with a warning instead of silently running SMC-neutral.
         _smc_states = compute_smc_state(
             df, lb=_pvt_lb,
-            conflict_mode=str((settings or {}).get("smc_conflict_mode", "legacy")),
+            conflict_mode=resolve_conflict_mode(settings),
         )
         _cv4_smc_state = _smc_states[-1] if _smc_states else None
     except Exception:

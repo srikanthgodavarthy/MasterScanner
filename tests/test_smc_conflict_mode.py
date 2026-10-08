@@ -78,3 +78,40 @@ def test_confirmed_break_lowers_conflict_rate_on_synthetic_data():
         tot += len(leg)
     assert new_n < leg_n
     print(f"synthetic CONFLICT rate legacy={leg_n/tot:.1%} confirmed_break={new_n/tot:.1%}")
+
+
+# ── resolve_conflict_mode: single DEFAULTS-backed reader ─────────────────────
+import logging
+from utils.smc_engine import resolve_conflict_mode
+from utils.settings_defaults import DEFAULTS
+
+
+def test_resolve_missing_key_uses_defaults_not_a_literal():
+    assert resolve_conflict_mode(None) == DEFAULTS["smc_conflict_mode"]
+    assert resolve_conflict_mode({}) == DEFAULTS["smc_conflict_mode"]
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("legacy", "legacy"), ("confirmed_break", "confirmed_break"),
+    ("  Confirmed_Break ", "confirmed_break"),     # whitespace / case tolerated
+])
+def test_resolve_valid_values(raw, expected):
+    assert resolve_conflict_mode({"smc_conflict_mode": raw}) == expected
+
+
+@pytest.mark.parametrize("bad", ["confirmed-break", "nope", "", 5, None])
+def test_resolve_invalid_falls_back_with_warning_never_raises(bad, caplog):
+    with caplog.at_level(logging.WARNING, logger="utils.smc_engine"):
+        out = resolve_conflict_mode({"smc_conflict_mode": bad})
+    assert out == DEFAULTS["smc_conflict_mode"]
+    if bad is not None:                       # None == "unset" -> silently default
+        assert any("smc_conflict_mode" in r.message for r in caplog.records)
+
+
+def test_bad_setting_no_longer_disables_smc_for_the_scan():
+    """Before: compute_smc_state(conflict_mode=<typo>) raised and score_stock's
+    broad except ran the symbol SMC-neutral. Now the resolved mode always works."""
+    df = _ohlc(1, n=300)
+    mode = resolve_conflict_mode({"smc_conflict_mode": "confirmed-break"})
+    states = compute_smc_state(df, conflict_mode=mode)          # must not raise
+    assert len(states) == len(df)

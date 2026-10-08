@@ -27,6 +27,7 @@ changes), per the FINAL spec's "leave untouched" list (§3).
 
 from __future__ import annotations
 
+import logging
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
@@ -393,6 +394,32 @@ def _evidence_tier(has_fvg: bool, has_sweep: bool, has_bos_or_choch: bool,
 CONFLICT_MODE_LEGACY          = "legacy"
 CONFLICT_MODE_CONFIRMED_BREAK = "confirmed_break"
 VALID_CONFLICT_MODES = {CONFLICT_MODE_LEGACY, CONFLICT_MODE_CONFIRMED_BREAK}
+
+
+def resolve_conflict_mode(settings: "dict | None") -> str:
+    """[2026-10-08] The ONE place settings["smc_conflict_mode"] is read.
+
+    - Missing key -> utils.settings_defaults.DEFAULTS["smc_conflict_mode"]
+      (single source of truth; callers used to hand-type "legacy", which
+      drifts the moment DEFAULTS changes — and is what
+      test_settings_defaults_single_source flags).
+    - Unknown value (typo / stale persisted override) -> logged warning and
+      the DEFAULTS value, NEVER an exception. compute_smc_state() raises on
+      an invalid mode; in score_stock() that was swallowed by a broad
+      try/except that then ran EVERY symbol "SMC-neutral", i.e. a one-letter
+      typo silently switched SMC off for the whole scan, and in the backtest
+      it dropped the SMC + swing-label block entirely.
+    """
+    from utils.settings_defaults import DEFAULTS
+    default = DEFAULTS["smc_conflict_mode"]
+    raw = (settings or {}).get("smc_conflict_mode", DEFAULTS["smc_conflict_mode"])
+    mode = str(raw).strip().lower() if raw is not None else default
+    if mode in VALID_CONFLICT_MODES:
+        return mode
+    logging.getLogger(__name__).warning(
+        "smc_conflict_mode=%r is not one of %s — using default %r",
+        raw, sorted(VALID_CONFLICT_MODES), default)
+    return default if default in VALID_CONFLICT_MODES else CONFLICT_MODE_LEGACY
 
 
 def compute_smc_state(

@@ -265,13 +265,13 @@ def generate_signals_historical(
     _bt_smc_states  = None
     _bt_swing_labels = None
     try:
-        from utils.smc_engine import compute_smc_state
+        from utils.smc_engine import compute_smc_state, resolve_conflict_mode
         from utils.swing_structure import compute_swing_labels
         from utils.structural_levels import causal_pivot_series
         _pvt_lb = params.pvt_lb if hasattr(params, "pvt_lb") else 20
         _bt_smc_states = compute_smc_state(
             df, lb=_pvt_lb,
-            conflict_mode=str((settings or {}).get("smc_conflict_mode", "legacy")),
+            conflict_mode=resolve_conflict_mode(settings),
         )
         _ph, _pl = causal_pivot_series(df["high"], df["low"], lb=_pvt_lb)
         _swing_df = compute_swing_labels(_ph, _pl)
