@@ -1996,7 +1996,12 @@ def score_stock(
     _pvt_lb = params.pvt_lb if hasattr(params, "pvt_lb") else 20
     try:
         from utils.smc_engine import compute_smc_state
-        _smc_states = compute_smc_state(df, lb=_pvt_lb)
+        # [2026-10-08] settings["smc_conflict_mode"] ("legacy" default |
+        # "confirmed_break") — see compute_smc_state()'s conflict_mode doc.
+        _smc_states = compute_smc_state(
+            df, lb=_pvt_lb,
+            conflict_mode=str((settings or {}).get("smc_conflict_mode", "legacy")),
+        )
         _cv4_smc_state = _smc_states[-1] if _smc_states else None
     except Exception:
         _log.exception("score_stock: compute_smc_state failed for %s — SMC-neutral", symbol)

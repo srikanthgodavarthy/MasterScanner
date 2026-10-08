@@ -60,6 +60,10 @@ DEFAULTS = {
     # incident note in scanner_engine.py's scan loop for why. Turn on only
     # after confirming RAM/scan-time is acceptable for your deployment.
     "enable_sector_rs":  False,
+    # SMC CONFLICT definition: "legacy" (any bull + any bear evidence in 60 bars)
+    # or "confirmed_break" (sweep-only side does not contest a break-confirmed
+    # side). Default legacy = unchanged; A/B backtest before flipping.
+    "smc_conflict_mode": "legacy",
     # ── Liquidity/tradability floor (utils/scanner_engine.py process()) ──
     # Avg daily turnover in INR crores, trailing 20 bars, below which a
     # Nifty 500 constituent is rejected before scoring. 0 disables. NOT

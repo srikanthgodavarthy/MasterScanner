@@ -390,9 +390,15 @@ def _evidence_tier(has_fvg: bool, has_sweep: bool, has_bos_or_choch: bool,
 #  MAIN ENTRY POINT
 # ══════════════════════════════════════════════════════════════════
 
+CONFLICT_MODE_LEGACY          = "legacy"
+CONFLICT_MODE_CONFIRMED_BREAK = "confirmed_break"
+VALID_CONFLICT_MODES = {CONFLICT_MODE_LEGACY, CONFLICT_MODE_CONFIRMED_BREAK}
+
+
 def compute_smc_state(
     df: pd.DataFrame, lb: int = 20, atr_col: str = "atr",
     lookback_bars: int = 60,
+    conflict_mode: str = CONFLICT_MODE_LEGACY,
 ) -> list[SMCState]:
     """
     Computes one SMCState per bar of `df`, causally (bar i only ever uses
@@ -437,7 +443,27 @@ def compute_smc_state(
     _evidence_tier() lookup table, still causal, still no lookahead, still
     a single SMCState per bar. SMC remains a bounded supporting layer, not
     a second trend engine.
+
+    conflict_mode (default "legacy" = exact pre-existing behavior, bit for
+    bit):
+      "legacy"          CONFLICT whenever ANY bullish evidence (sweep OR
+                        break) and ANY bearish evidence are both inside
+                        lookback_bars.
+      "confirmed_break" A side that has only an unconfirmed SWEEP (no
+                        BOS/CHoCH) no longer contests the opposite side
+                        when that opposite side HAS a confirmed break;
+                        the confirmed side owns the read. CONFLICT remains
+                        for (a) both sides break-confirmed — genuine two-
+                        sided structure — and (b) both sides sweep-only
+                        (nothing confirmed either way). Motivation: a
+                        single wick through a swing level that closes back
+                        is near-ubiquitous inside 60 daily bars, so under
+                        "legacy" it manufactures CONFLICT on most of the
+                        universe (78.7% of backtests/trades.csv rows; 64%
+                        of those CONFLICTs have a sweep-only bear side).
     """
+    if conflict_mode not in VALID_CONFLICT_MODES:
+        raise ValueError(f"conflict_mode {conflict_mode!r} not in {sorted(VALID_CONFLICT_MODES)}")
     high, low, close, open_ = df["high"], df["low"], df["close"], df["open"]
     n = len(df)
 
@@ -537,6 +563,18 @@ def compute_smc_state(
         # FVG zone against.
         bull_active = bull_recent_sweep or bull_recent_break
         bear_active = bear_recent_sweep or bear_recent_break
+
+        # [conflict_mode == "confirmed_break"] An unconfirmed (sweep-only)
+        # side does not contest a break-confirmed opposite side. Applied
+        # BEFORE the conflict test so the confirmed side flows through the
+        # ordinary single-direction branch below (its own sweep/break/
+        # displacement/FVG flags drive the tier; the dropped side's
+        # sweep is ignored, never mixed in).
+        if conflict_mode == CONFLICT_MODE_CONFIRMED_BREAK and bull_active and bear_active:
+            if bull_recent_break and not bear_recent_break:
+                bear_active = False
+            elif bear_recent_break and not bull_recent_break:
+                bull_active = False
 
         if bull_active and bear_active:
             # [2026-09-21, SG request] Recover the recency/composition
