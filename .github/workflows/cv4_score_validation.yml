@@ -1,0 +1,85 @@
+name: CV4 Score Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      universe:
+        description: "Universe"
+        required: true
+        default: "nifty500"
+        type: choice
+        options:
+          - nifty500
+          - all_nse
+      symbols:
+        description: "Maximum symbols; 0 = all symbols in selected universe"
+        required: true
+        default: "0"
+        type: string
+      years:
+        description: "Years of history"
+        required: true
+        default: "3"
+        type: string
+      stride:
+        description: "Score every Nth trading date (1 = every date, slower)"
+        required: true
+        default: "3"
+        type: string
+      conflict_mode:
+        description: "SMC conflict mode used when scoring"
+        required: true
+        default: "legacy"
+        type: choice
+        options:
+          - legacy
+          - confirmed_break
+      source:
+        description: "Price data source"
+        required: true
+        default: "yfinance"
+        type: choice
+        options:
+          - yfinance
+          - upstox
+
+jobs:
+  cv4-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run CV4 score validation
+        run: |
+          mkdir -p cv4_out
+          python scripts/cv4_score_validation.py --universe "${{ inputs.universe }}" --symbols "${{ inputs.symbols }}" --years "${{ inputs.years }}" --stride "${{ inputs.stride }}" --conflict-mode "${{ inputs.conflict_mode }}" --source "${{ inputs.source }}" --workers 2 --out cv4_out
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cv4-validation-${{ inputs.universe }}
+          path: cv4_out/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f cv4_out/report.txt ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat cv4_out/report.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
