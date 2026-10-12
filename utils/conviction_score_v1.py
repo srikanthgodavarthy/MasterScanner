@@ -1905,51 +1905,78 @@ def _market_regime_score_v4(r: "BarResult", thesis_direction: str) -> int:
         return 5
 
 
-def smc_conviction_score(smc_state, thesis_direction: str) -> int:
-    """
-    EXACT formula per §1.3. SLOW freshness decay (thesis stays informed
-    even as the structural evidence ages) — see smc_freshness.py.
+# ══════════════════════════════════════════════════════════════════
+#  SINGLE SMC SCORE INPUT: liquidity SWEEP + confirmed BREAK  [2026-10-12]
+# ══════════════════════════════════════════════════════════════════
+# WHY (evidence_vs_outcomes.py, 1,626 shadow trades, 2024-08..2026-10, run on
+# the post-causality-fix backtest): of 19 features tested only the SMC
+# sweep+break flag (smc_sb) and its 4-pt EQ credit (eq_smc, rho 0.97 with
+# smc_sb, i.e. the same signal) survived the Bonferroni correction with a
+# positive sign, and smc_sb was the only SMC model with out-of-sample signal
+# (test rho +0.083). A bare break (no sweep) was the mirror-image NEGATIVE
+# (rho -0.117, also Bonferroni-significant). In the CSV the flagged group is
+# "CONFLICT with conflict_bull_kind == SWEEP+BREAK" (n=611, +0.26R, 51% win)
+# vs the rest of CONFLICT (n=635, -0.06R). The tier ladder (weak FVG-only /
+# sweep-only / tier 3-4) and the FVG-retest adjustment were never shown to
+# predict returns, so they no longer feed the CV4 score.
+#
+# WHAT: ONE boolean -- is there a SWEEP *and* a confirmed BREAK on the side of
+# the thesis within the lookback window? -- worth a fixed credit in each of the
+# two pillars that read SMC (Conviction 3/15, Entry Quality 4/25). The
+# magnitudes are the pre-existing "tier-1 rung" credits those two functions
+# already gave the validated CONFLICT pattern (2026-09-23), so thresholds are
+# NOT re-tuned. A bare break, a sweep without a break, and an FVG-only read
+# all score 0; so does a state with no evidence, opposite-direction evidence,
+# or an ambiguous CONFLICT without a thesis-side sweep+break.
+#
+# KNOWN LIMITS (read before relying on this):
+#   * The validated sample is overwhelmingly the CONFLICT form (611 rows). The
+#     clean, non-CONFLICT bullish sweep+break (evidence_tier >= 3, direction
+#     == thesis) is included here because it IS a sweep+break, but only 68
+#     such rows exist and they were -0.06R. Treat that branch as untested.
+#   * Freshness decay (smc_freshness.py) no longer scales this credit: the
+#     validated CONFLICT branch never used it, and a second age knob would be
+#     one more unvalidated degree of freedom. Both branches are already bound
+#     by compute_smc_state()'s 60-bar lookback.
+#   * smc_conflict_mode must stay "legacy" (the default): "confirmed_break"
+#     rewrites exactly the bull-BREAK-vs-bear-SWEEP conflicts that scored
+#     worst (-0.07R) into clean bullish reads.
+SMC_SWEEP_BREAK_CONVICTION_PTS = 3    # of the 15 nominal Conviction SMC points
+SMC_SWEEP_BREAK_ENTRY_PTS      = 4    # of the 25 nominal Entry-Quality SMC points
 
-    [2026-09-23, SG request] CONFLICT no longer means an unconditional 0.
-    A modest, direction-consistent credit applies when the ONE CONFLICT
-    sub-pattern validated across two independent backtest pulls is
-    present — conflict_bull_kind == "SWEEP+BREAK" (in-sample
-    backtest_20260921_2246.csv: +0.67R vs +0.09R for the rest of
-    CONFLICT, n=32; out-of-sample backtest_20260923_1629.csv: +0.408R vs
-    -0.046R for BREAK-only, n=89 vs n=114). Bearish thesis checks
-    conflict_bear_kind the same way, by consistency with this function's
-    existing directional-symmetry convention (dt/mo/rsm all flip by
-    thesis elsewhere in this file) — the bear side itself hasn't been
-    independently validated the same way, so treat that half as a
-    disciplined extension, not an equally-proven claim. Deliberately NOT
-    gated on conflict_fresher_side: that field showed no differentiation
-    in either backtest pull (48.9% vs 47.8% win rate), so requiring it
-    would add an untested constraint with no evidence behind it. Credit
-    = this function's own tier-1 base (3 of 15) — reuses an existing
-    rung of the tier system below rather than inventing a new number,
-    and stays well short of tier-2 (7) let alone a clean non-CONFLICT
-    read. No settings flag: compute_conviction_v4()'s CV4 composite has
-    ZERO production impact through Phase 6 regardless (see
-    V4_THRESHOLD_DEFAULTS's own docstring) — same blast radius as the
-    conflict_bull_age_bars/etc. fields this reads, which were already
-    additive-only. Independent of, and compatible with, the separate
-    SMC_CONFLICT_SWEEP_BREAK_MODIFIER_* experimental gate-rescue
-    mechanism above (that one bumps admission TOTALS post-hoc for bars
-    the raw gate would reject; this fixes the raw baseline itself for
-    the pattern already shown to deserve it).
+
+def smc_sweep_break_present(smc_state, thesis_direction: str = "BULLISH") -> bool:
+    """True iff the thesis side shows a liquidity sweep AND a confirmed break.
+
+    CONFLICT: the thesis side's own kind must be exactly "SWEEP+BREAK"
+      (conflict_bull_kind for BULLISH, conflict_bear_kind for BEARISH). The
+      opposite side's kind is deliberately ignored -- not gated on
+      conflict_fresher_side (no differentiation in either backtest pull).
+    Non-CONFLICT: direction must equal the thesis and evidence_tier >= 3
+      (compute_smc_state()'s _evidence_tier() returns 3/4 only when sweep AND
+      BOS/CHoCH are both present on that side).
+    A bare break (tier 0 / kind "BREAK"), sweep-only (tier 2 / kind "SWEEP")
+    and FVG-only (tier 1) are all False.
     """
     if smc_state is None:
-        return 0
+        return False
     if smc_state.state == "CONFLICT":
-        matched = (
-            (thesis_direction == "BULLISH" and smc_state.conflict_bull_kind == "SWEEP+BREAK")
-            or (thesis_direction == "BEARISH" and smc_state.conflict_bear_kind == "SWEEP+BREAK")
-        )
-        return 3 if matched else 0
-    if smc_state.direction != thesis_direction:
-        return 0
-    base = {0: 0, 1: 3, 2: 7, 3: 12, 4: 15}[smc_state.evidence_tier]
-    return round(base * conviction_freshness_multiplier(smc_state.age_bars))
+        kind = (smc_state.conflict_bull_kind if thesis_direction == "BULLISH"
+                else smc_state.conflict_bear_kind if thesis_direction == "BEARISH"
+                else None)
+        return kind == "SWEEP+BREAK"
+    return smc_state.direction == thesis_direction and smc_state.evidence_tier >= 3
+
+
+def smc_conviction_score(smc_state, thesis_direction: str) -> int:
+    """SMC Structure Confirmation for the Conviction pillar (0 or 3 of 15).
+
+    [2026-10-12] Collapsed from the §1.3 evidence-tier ladder (3/7/12/15 x slow
+    freshness decay) to the single validated input, smc_sweep_break_present()
+    -- see the block above for the evidence, the limits, and why the CONFLICT
+    credit (3/15, 2026-09-23) is now the only credit. Signature unchanged.
+    """
+    return SMC_SWEEP_BREAK_CONVICTION_PTS if smc_sweep_break_present(smc_state, thesis_direction) else 0
 
 
 def _conviction_v4(r: "BarResult", thesis_direction: str = "BULLISH", smc_state=None,
@@ -2095,54 +2122,27 @@ def _conviction_v4(r: "BarResult", thesis_direction: str = "BULLISH", smc_state=
 
 def smc_entry_structure_score(smc_state, thesis_direction: str = "BULLISH",
                               gate_owns_failed_zone: bool = False) -> int:
-    """EXACT formula per §1.4. FAST freshness decay (a stale entry
-    contributes nothing to "enter now") — see smc_freshness.py.
+    """SMC Entry Structure for the Entry-Quality pillar (0 or 4 of 25).
 
-    [SMC PILLAR INCONSISTENCY FIX, 2026-09-02 — explicit user direction]
-    Diagnostic finding (cv4_analysis_handoff): this function used to score
-    evidence_tier/fvg_retest with NO direction check at all, while
-    Conviction's smc_conviction_score() requires smc_state.direction ==
-    thesis_direction (and zeroes on CONFLICT). That meant EQ would give full
-    credit to, e.g., a strong BEARISH structural break as "entry structure"
-    for a BULLISH thesis — real evidence, wrong direction for the trade being
-    scored. Same directional gate as Conviction now applied here: no
-    evidence, opposite-direction evidence, or CONFLICT all score 0. This is
-    a genuine behavior change (previously-nonzero scores on
-    direction-mismatched SMC states now score 0) — not just a relabeling.
-    thesis_direction defaults to "BULLISH" only to preserve the old
-    positional-call signature; the real value is always threaded in from
-    compute_conviction_v4() below.
+    [2026-10-12] Collapsed from the §1.4 evidence-tier ladder (4/10/16/20 +
+    FVG-retest adjustment x fast freshness decay) to the single validated
+    input, smc_sweep_break_present() -- see the block above
+    smc_conviction_score() for the evidence, limits and rationale. The 4 is
+    this function's pre-existing tier-1 rung, which already was the credit for
+    the validated CONFLICT sweep+break pattern (2026-09-23), so Entry Quality
+    totals and thresholds are not re-tuned.
 
-    [2026-09-23, SG request] CONFLICT no longer means an unconditional 0 —
-    see smc_conviction_score()'s docstring immediately above for the full
-    rationale and the two-backtest validation this credit is based on.
-    Same matching rule, same "not gated on conflict_fresher_side" reasoning.
-    Credit = this function's own tier-1 base (4 of 25) — the equivalent
-    rung to smc_conviction_score()'s 3-of-15, scaled to this function's
-    wider range, and still well short of tier-2 (10).
+    Signature unchanged. `gate_owns_failed_zone` is now ignored: the FVG-retest
+    adjustment it controlled (through_filled -8) no longer exists in the score.
+    "Late / already ran through the zone" is still penalised by the FVG-distance
+    term in extension_shared.compute_extension_penalty() and capped by the
+    structural gate (apply_smc_structural_gate), so the event is not free.
+
+    Behavior change vs. before: direction-matched clean tiers 1-2 now score 0
+    (were 4/10), tier 3-4 now 4 (were 16-25), the retest bonus/penalty and the
+    freshness multiplier are gone.
     """
-    if smc_state is None:
-        return 0
-    if smc_state.state == "CONFLICT":
-        matched = (
-            (thesis_direction == "BULLISH" and smc_state.conflict_bull_kind == "SWEEP+BREAK")
-            or (thesis_direction == "BEARISH" and smc_state.conflict_bear_kind == "SWEEP+BREAK")
-        )
-        return 4 if matched else 0
-    if smc_state.direction != thesis_direction:
-        return 0
-    base = {0: 0, 1: 4, 2: 10, 3: 16, 4: 20}[smc_state.evidence_tier]
-    retest_adj = {"none": 0, "in_zone": 5, "through_unfilled": -3, "through_filled": -8}[smc_state.fvg_retest]
-    # [Audit P0 #6, 2026-10-05] ONE consequence per event. A failed zone
-    # (through_filled) used to be punished three times: here (-8), again in
-    # the extension penalty's FVG-distance term, and by the Watch cap. When
-    # the structural gate is active it OWNS this event (the cap is the
-    # consequence), so the score stops also charging for it; when the gate is
-    # switched off (A/B) the -8 stays, so the event is never free.
-    if gate_owns_failed_zone and smc_state.fvg_retest == "through_filled":
-        retest_adj = 0
-    raw = max(0, min(base + retest_adj, 25))
-    return round(max(0, min(raw * entry_freshness_multiplier(smc_state.age_bars), 25)))
+    return SMC_SWEEP_BREAK_ENTRY_PTS if smc_sweep_break_present(smc_state, thesis_direction) else 0
 
 
 def _entry_quality_v4(r: "BarResult", smc_state=None, current_price: Optional[float] = None,

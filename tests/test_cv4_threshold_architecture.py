@@ -249,9 +249,16 @@ def test_entry_quality_ceiling_without_smc_is_below_the_elite_floor():
     eq_no_smc, _ = cv._entry_quality_v4(_bar(), smc_state=None)
     assert eq_no_smc <= 75 < D["v4_elite_entry_quality_min"]          # 20+15+0+15+10+15
     assert D["v4_execute_entry_quality_min"] <= 75                    # Execute does not require SMC on EQ
+    # [2026-10-12] SMC is one flag worth a flat 4/25 in Entry Quality, so even
+    # with sweep+break present the EQ ceiling is 79 -- ONE POINT UNDER the Elite
+    # floor (80). Natural CV4 ELITE is therefore unreachable on the frozen
+    # thresholds (EXECUTE is unaffected). This pins that arithmetic on purpose:
+    # if Elite should stay reachable, change v4_elite_entry_quality_min or the
+    # SMC weight deliberately -- do not just edit this assertion.
     eq_smc, subs = cv._entry_quality_v4(_bar(), smc_state=_smc())
-    assert subs["eq_smc_entry_structure"] >= 20
-    assert eq_smc >= D["v4_elite_entry_quality_min"]
+    assert subs["eq_smc_entry_structure"] == cv.SMC_SWEEP_BREAK_ENTRY_PTS
+    assert eq_smc == eq_no_smc + cv.SMC_SWEEP_BREAK_ENTRY_PTS
+    assert eq_smc < D["v4_elite_entry_quality_min"]
 
 
 def test_conviction_and_leadership_ceilings_without_smc_clear_every_floor():

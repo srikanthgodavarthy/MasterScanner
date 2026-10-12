@@ -202,16 +202,17 @@ def test_expansion_magnitude_factor_is_gone_but_alias_key_remains():
 
 
 def test_failed_zone_has_exactly_one_consequence_whichever_way_the_gate_is_set():
+    # [2026-10-12] The SMC score is now ONE flag (sweep+break present -> flat
+    # 4). The FVG-retest adjustment (through_filled -8) was removed from the
+    # score, so a failed zone neither adds nor removes SMC points whichever way
+    # the gate flag is set; its single consequence is the structural gate's
+    # Watch cap (and the extension FVG-distance term, see the test above).
     smc = _failed_zone_smc()
     clean = SMCState(direction="BULLISH", state=BULLISH_CONTINUATION, evidence_tier=3, age_bars=1, fvg_retest="none")
     gate_on  = cv.smc_entry_structure_score(smc, "BULLISH", gate_owns_failed_zone=True)
     gate_off = cv.smc_entry_structure_score(smc, "BULLISH", gate_owns_failed_zone=False)
     base     = cv.smc_entry_structure_score(clean, "BULLISH")
-    assert gate_on == base                 # the Watch cap is the consequence
-    assert gate_off < base                 # no gate -> the score must still charge for it
-    # the -8 is applied to the tier base BEFORE the freshness multiplier, so the
-    # visible drop is 8 * multiplier (age 1 -> 0.875 for this state), not a flat 8.
-    assert base - gate_off == pytest.approx(8 * (base / 16), abs=1)
+    assert gate_on == gate_off == base == cv.SMC_SWEEP_BREAK_ENTRY_PTS
 
 
 # ── P0 #7  target category follows CV4 floors ───────────────────────────────

@@ -34,16 +34,22 @@ def test_entry_quality_ceiling_without_smc_is_below_the_elite_floor(arch, settin
 
 
 @pytest.mark.parametrize("arch", ["breakout", "pullback"])
-def test_a_fresh_tier3_smc_read_makes_elite_reachable(arch):
+def test_a_fresh_tier3_smc_read_reaches_execute_but_not_elite(arch):
+    # [2026-10-12] SMC is a single sweep+break flag (flat 3/15 Conviction, 4/25
+    # Entry Quality), so the best bar reaches EXECUTE, not ELITE (EQ ceiling 79
+    # < Elite floor 80; see test_cv4_threshold_architecture). Intentional,
+    # pending a decision on the Elite floor -- not an accident to be "fixed" here.
     L = audit._best_bar(arch, "L", _smc(3))[0]
     C = audit._best_bar(arch, "C", _smc(3))[0]
     E = audit._best_bar(arch, "E", _smc(3))[0]
-    assert cv._classify_v4(L, C, E) == "ELITE"
+    assert cv._classify_v4(L, C, E) == "EXECUTE"
 
 
 def test_both_pillars_still_reach_100_when_inputs_are_maximal():
-    # the de-duplication rescale must not shrink the scale
-    assert audit._best_bar("pullback", "C", _smc(4))[0] >= 95
+    # the de-duplication rescale must not shrink the scale. [2026-10-12] SMC is
+    # now worth 3 (not 15) Conviction points, so the maximal Conviction bar is
+    # 85, not >=95; Leadership is unaffected.
+    assert audit._best_bar("pullback", "C", _smc(4))[0] >= 85
     assert audit._best_bar("pullback", "L", None)[0] >= 90
 
 
