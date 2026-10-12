@@ -1,0 +1,55 @@
+# Evidence vs outcomes — SMC vs PCA vs EM vs CV4 pillars.  READ-ONLY, manual trigger.
+# Downloads daily prices from Yahoo, recomputes nse-scanner's PCA and EM at each
+# backtest trade's SIGNAL bar (bars strictly before entry_date: no look-ahead), and
+# tests which evidence predicts realised pnl, with symbol-clustered intervals, a
+# multiple-testing correction and an out-of-sample incremental check.
+# Needs backtests/trades.csv (the shadow-mode export) in the repo. No secrets, no DB.
+name: Evidence vs outcomes
+
+on:
+  workflow_dispatch:
+    inputs:
+      csv_path:
+        description: "Trades CSV path inside the repo"
+        default: "backtests/trades.csv"
+      limit:
+        description: "Max symbols to fetch (0 = all)"
+        default: "0"
+      sleep:
+        description: "Seconds between Yahoo fetches (raise if many fail)"
+        default: "0.25"
+      mode:
+        description: "nse-scanner mode: Swing or Positional"
+        default: "Swing"
+
+jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pandas numpy yfinance
+      - name: Self-test (causality + planted-effect check)
+        run: python scripts/evidence_vs_outcomes.py --selftest --boot 1000 --out /tmp/selftest_out
+      - name: Check trades CSV exists
+        run: |
+          if [ ! -f "${{ inputs.csv_path }}" ]; then
+            echo "::error::Trades CSV not found at ${{ inputs.csv_path }}"
+            exit 1
+          fi
+      - name: Run evidence analysis
+        shell: bash
+        run: |
+          python scripts/evidence_vs_outcomes.py "${{ inputs.csv_path }}" \
+            --limit "${{ inputs.limit }}" \
+            --sleep "${{ inputs.sleep }}" \
+            --mode "${{ inputs.mode }}" \
+            --out evidence_out
+          cat evidence_out/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: evidence-vs-outcomes
+          path: evidence_out/
