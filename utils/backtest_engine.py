@@ -282,6 +282,22 @@ def generate_signals_historical(
         _bt_smc_states  = None
         _bt_swing_labels = None
 
+    # [2026-10-12] OPT-IN live-parity SMC structural gate (default OFF).
+    # The live Scanner applies scanner_engine.apply_smc_structural_gate() to
+    # final_tier (invalidation -> Skip, zone-failed/ambiguous-conflict ->
+    # Watch, wait-for-retest -> Developing); the backtest never did, so that
+    # live-default-ON mechanism was unmeasured. detect_order_blocks() returns
+    # the freshest unmitigated OB as-of every bar (truncation-invariance is
+    # asserted in tests/test_backtest_smc_structural_gate.py), so indexing it
+    # at bar i is causal -- same value live sees on its final bar.
+    _bt_bull_obs = None
+    if bool((settings or {}).get("bt_apply_smc_structural_gate", False)):
+        try:
+            from utils.smc_engine import detect_order_blocks as _detect_obs
+            _bt_bull_obs, _ = _detect_obs(df, lb=(params.pvt_lb if hasattr(params, "pvt_lb") else 20))
+        except Exception:
+            _bt_bull_obs = None   # fails open, exactly like the live gate
+
     def _cv4_for_bar(_r, _i):
         """CV4 for bar _i, with that bar's own SMC state/swing label.
         Mirrors scanner_engine.py's live call (thesis_direction="BULLISH"
@@ -572,6 +588,31 @@ def generate_signals_historical(
         # _cv1 is always computed by the time we reach this point —
         # there is no code path where a rejection fires before CV1 runs.
         _shadow_no_gate = bool((settings or {}).get("shadow_no_admission_gate", False))
+
+        # ── OPT-IN: live SMC structural gate (default OFF) ───────────
+        # Applied AFTER promotion/bypass, to bars that would otherwise be
+        # admitted, with the same downgrade-only caps and the same
+        # smc_conflict_caps_tier default (False) as the live Scanner. A bar is
+        # rejected when the capped tier falls below Actionable. The state is
+        # written to the `smc_structural_state` column of every candidate that
+        # reaches this point while the gate is ON; with the flag OFF the
+        # column is blank and behaviour is byte-identical to before.
+        _smc_struct_state = ""
+        if (not _rejection_reason) and (settings or {}).get("bt_apply_smc_structural_gate", False):
+            from utils.scanner_engine import apply_smc_structural_gate as _gate_fn, RECOMMENDATION_RANK as _RR
+            _pre_tier = (str(_promo_bypass.tier) if _bypass_promoted
+                         else ("Actionable" if _base_tier == "Actionable"
+                               else str(_natural_cls).title()))
+            _ob_i = (_bt_bull_obs[i] if (_bt_bull_obs is not None and i < len(_bt_bull_obs)) else None)
+            _gated_tier, _decision = _gate_fn(
+                _pre_tier, getattr(r, "smc_state", None), _ob_i,
+                conflict_caps_tier=bool((settings or {}).get("smc_conflict_caps_tier", False)),
+            )
+            if _decision is not None:
+                _smc_struct_state = str(_decision.state)
+            if _RR.get(_gated_tier, 0) < _RR["Actionable"]:
+                _rejection_reason = f"SMC_STRUCTURAL ({_smc_struct_state} -> {_gated_tier})"
+
         _passed_gate    = not bool(_rejection_reason)
 
         if _rejection_reason:
@@ -711,6 +752,7 @@ def generate_signals_historical(
             "smc_conflict_bull_kind":     _cv1.smc_conflict_bull_kind,
             "smc_conflict_bear_kind":     _cv1.smc_conflict_bear_kind,
             "smc_conflict_fresher_side":  _cv1.smc_conflict_fresher_side,
+            "smc_structural_state":       _smc_struct_state,
             "exp_conflict_sb_pts":        _cv1.experimental_modifier_pts,
             "admitted_via_exp_modifier":  _exp_admit,
             "cv4_composite_experimental": _cv1.composite_experimental,
@@ -1681,6 +1723,7 @@ def simulate_trades(
             "smc_conflict_bull_kind":     sig.get("smc_conflict_bull_kind"),
             "smc_conflict_bear_kind":     sig.get("smc_conflict_bear_kind"),
             "smc_conflict_fresher_side":  sig.get("smc_conflict_fresher_side"),
+            "smc_structural_state":       str(sig.get("smc_structural_state", "") or ""),
             "exp_conflict_sb_pts":        float(sig.get("exp_conflict_sb_pts", 0) or 0),
             "admitted_via_exp_modifier":  bool(sig.get("admitted_via_exp_modifier", False)),
             "cv4_composite_experimental": float(sig.get("cv4_composite_experimental", 0) or 0),
