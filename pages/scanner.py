@@ -3042,6 +3042,46 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
         )
 
 
+# [2026-10-12, SG request] The "FP" source column is hidden from the Active
+# Setups table (display only -- FP plans are still minted/tracked; only the
+# column is not drawn). Header and cells both read _ap_source_columns() so the
+# two can no longer drift apart, as the old hardcoded <th>FP</th><th>CV4</th>
+# header would have the moment PB/MOM were re-enabled.
+_AP_SHOW_FP_COLUMN = False
+
+
+def _ap_source_columns() -> list[str]:
+    """Visible per-source entry columns, in display order."""
+    from utils.setup_persistence import ENABLE_PB_SOURCE, ENABLE_MOM_SOURCE
+    cols = []
+    for c in ("PB", "MOM", "FP", "CV4"):
+        if c == "PB" and not ENABLE_PB_SOURCE:
+            continue
+        if c == "MOM" and not ENABLE_MOM_SOURCE:
+            continue
+        if c == "FP" and not _AP_SHOW_FP_COLUMN:
+            continue
+        cols.append(c)
+    return cols
+
+
+def _ap_volume_cell(vol_ratio, conflict_flag=False, conflict_reason="") -> str:
+    """Volume cell for the Active Setups table. [2026-10-12, SG request]
+    Always shows the volume ratio -- it used to be replaced by a red
+    "Conflict" label on conflicted plans, hiding the number. The conflict is
+    still available as a hover tooltip on the cell."""
+    try:
+        v = float(vol_ratio)
+        txt = f"{v:.1f}x" if (math.isfinite(v) and v > 0) else "—"
+    except (TypeError, ValueError):
+        txt = "—"
+    tip = ""
+    if conflict_flag:
+        reason = html.escape(str(conflict_reason or "Conflict"), quote=True)
+        tip = f' title="Conflict: {reason}"'
+    return f'<td class="col-num"{tip}>{txt}</td>'
+
+
 def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
                                      key_suffix: str, empty_msg: str) -> None:
     """
@@ -3085,8 +3125,8 @@ def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
         '<th>CV4 Composite</th>'
         '<th title="scoring_core norm_score (0-100)">Norm Score</th>'
         '<th>Volume</th><th>CMP</th>'
-        '<th>FP</th><th>CV4</th>'
-        '<th>SL (CV4)</th><th>T1 (CV4)</th><th>PnL%</th>'
+        + "".join(f"<th>{_c}</th>" for _c in _ap_source_columns())
+        + '<th>SL (CV4)</th><th>T1 (CV4)</th><th>PnL%</th>'
         '<th>No of Days</th></tr>'
     )
     # [2026-09-09, SG request] Row tint by "latest source" — the plan's
@@ -3105,13 +3145,7 @@ def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
                 return f"₹{float(v):,.2f}" if float(v) > 0 else "—"
             except (TypeError, ValueError):
                 return "—"
-        if bool(r["ConflictFlag"]):
-            _vol_cell = (
-                f'<td style="color:#f85149;font-size:11px;" '
-                f'title="{r["ConflictReason"]}">⚠️ Conflict</td>'
-            )
-        else:
-            _vol_cell = f'<td class="col-num">{r["CurVolRatio"]:.1f}x</td>' if r["CurVolRatio"] else '<td class="col-num">—</td>'
+        _vol_cell = _ap_volume_cell(r["CurVolRatio"], r["ConflictFlag"], r["ConflictReason"])
         _row_class = _ROW_CLASS.get(str(r["Source"]).upper().strip(), "")
         body += (
             f'<tr class="{_row_class}"><td class="col-rank">{rank}</td>'
@@ -3350,9 +3384,7 @@ def _ap_per_source_cells(source: str, contributing_sources: str, source_entries_
     # [2026-10-05, SG request] PB/MOM columns dropped while those sources
     # are disabled (utils.setup_persistence.ENABLE_*_SOURCE); the table
     # header in _render_active_plans_table_body() matches.
-    from utils.setup_persistence import ENABLE_PB_SOURCE, ENABLE_MOM_SOURCE
-    _cols = [c for c in ("PB", "MOM", "FP", "CV4")
-             if not ((c == "PB" and not ENABLE_PB_SOURCE) or (c == "MOM" and not ENABLE_MOM_SOURCE))]
+    _cols = _ap_source_columns()   # single source of truth shared with the table header
     for s in _cols:
         # Internal source code for the LS/CV4 column is still "LS" in
         # SetupPlan/DB (see _ap_one_source_badge()'s own docstring on
