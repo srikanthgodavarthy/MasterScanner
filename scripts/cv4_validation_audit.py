@@ -59,7 +59,7 @@ _PILLAR_FIELDS = (
     "compression_break ema20_pct_dist extension_atr fresh_base_breakout trend_phase "
     "bars_since_setup_actual"
 ).split()
-_NUM_GRID = (-0.3, -0.1, -0.03, 0.0, 0.01, 0.02, 0.03, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0,
+_NUM_GRID = (-10.0, -5.0, -2.0, -1.0, -0.3, -0.1, -0.03, 0.0, 0.01, 0.02, 0.03, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0,
              5.0, 10.0, 20.0, 30.0, 35.0, 45.0, 60.0, 100.0)
 # Mutually exclusive evidence that cannot coexist on one bar, fixed per archetype
 # (this is the audit's finding #4: a breakout cannot also be a golden-pocket pullback).
@@ -67,6 +67,15 @@ _ARCHETYPE_FIXED = {
     "breakout": dict(cci_momentum_break=True, in_golden=False, in_golden_near=False,
                      in_golden_relaxed=False, in_golden_relaxed_near=False, recent_cci_recovery=False),
     "pullback": dict(cci_momentum_break=False),
+}
+
+
+# [2026-10-13] Per-field domains. The shared grid had no pivot distance below -0.3 (the
+# Price Location +8 rung needs <= -2.0) and let rs_consistency take values outside its
+# 0-1 range, so reported ceilings were off by a few points.
+_FIELD_GRID = {
+    "pivot_high_dist": (-10.0, -5.0, -2.5, -2.0, -1.0, -0.3, 0.0, 0.5, 1.0, 2.0, 5.0, 10.0),
+    "rs_consistency":  (0.0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0),
 }
 
 
@@ -94,6 +103,8 @@ def _maximise(pillar_fn, archetype: str, passes: int = 3):
                 cands = [0, 3, 10, 20, 30, 40, 50, 80, 120, 300]
             elif f == "trend_phase":
                 cands = ["NONE", "EMERGING", "ESTABLISHED", "EXTENDED"]
+            elif f in _FIELD_GRID:
+                cands = _FIELD_GRID[f]
             else:
                 cands = _NUM_GRID
             for c in cands:

@@ -27,8 +27,10 @@ def _both(smc, thesis="BULLISH"):
     return cv.smc_conviction_score(smc, thesis), cv.smc_entry_structure_score(smc, thesis)
 
 
-def test_constants_are_the_pre_existing_tier1_rungs():
-    assert (C_PTS, E_PTS) == (3, 4)
+def test_constants():
+    # Conviction 3 is the pre-existing tier-1 rung. Entry Quality was 4 (bff15d0) and was
+    # raised to 10 on 2026-10-13 so the EQ ceiling (75 + 10) clears the Elite floor (80).
+    assert (C_PTS, E_PTS) == (3, 10)
 
 
 @pytest.mark.parametrize("kind,expected", [("SWEEP+BREAK", True), ("BREAK", False), ("SWEEP", False), (None, False)])

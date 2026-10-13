@@ -1922,7 +1922,7 @@ def _market_regime_score_v4(r: "BarResult", thesis_direction: str) -> int:
 #
 # WHAT: ONE boolean -- is there a SWEEP *and* a confirmed BREAK on the side of
 # the thesis within the lookback window? -- worth a fixed credit in each of the
-# two pillars that read SMC (Conviction 3/15, Entry Quality 4/25). The
+# two pillars that read SMC (Conviction 3/15, Entry Quality 10/25 since 2026-10-13). The
 # magnitudes are the pre-existing "tier-1 rung" credits those two functions
 # already gave the validated CONFLICT pattern (2026-09-23), so thresholds are
 # NOT re-tuned. A bare break, a sweep without a break, and an FVG-only read
@@ -1942,7 +1942,16 @@ def _market_regime_score_v4(r: "BarResult", thesis_direction: str) -> int:
 #     rewrites exactly the bull-BREAK-vs-bear-SWEEP conflicts that scored
 #     worst (-0.07R) into clean bullish reads.
 SMC_SWEEP_BREAK_CONVICTION_PTS = 3    # of the 15 nominal Conviction SMC points
-SMC_SWEEP_BREAK_ENTRY_PTS      = 4    # of the 25 nominal Entry-Quality SMC points
+# [2026-10-13] 4 -> 10. The 4-pt credit (bff15d0) shrank Entry Quality's SMC
+# budget from 25 to 4, taking the EQ ceiling from 100 to 79 -- one point under
+# the Elite floor (v4_elite_entry_quality_min = 80), so natural Elite became
+# unreachable (the non-SMC EQ components max out at 75). bff15d0 said totals were
+# "not re-tuned", true of the credit but not of the 25-pt budget that shrank.
+# 10 puts the EQ ceiling at 85: Elite needs the sweep+break flag AND >= 70 of the
+# 75 non-SMC points, i.e. a genuinely clean entry rather than a perfect one.
+# This is a calibration choice, not a measured one; the single knob to revisit is
+# this constant (tests/test_cv4_breakdown_labels.py pins "Elite is reachable").
+SMC_SWEEP_BREAK_ENTRY_PTS      = 10   # Entry-Quality SMC points (nominal budget 25)
 
 
 def smc_sweep_break_present(smc_state, thesis_direction: str = "BULLISH") -> bool:
@@ -2122,15 +2131,16 @@ def _conviction_v4(r: "BarResult", thesis_direction: str = "BULLISH", smc_state=
 
 def smc_entry_structure_score(smc_state, thesis_direction: str = "BULLISH",
                               gate_owns_failed_zone: bool = False) -> int:
-    """SMC Entry Structure for the Entry-Quality pillar (0 or 4 of 25).
+    """SMC Entry Structure for the Entry-Quality pillar (0 or SMC_SWEEP_BREAK_ENTRY_PTS).
 
     [2026-10-12] Collapsed from the §1.4 evidence-tier ladder (4/10/16/20 +
     FVG-retest adjustment x fast freshness decay) to the single validated
     input, smc_sweep_break_present() -- see the block above
     smc_conviction_score() for the evidence, limits and rationale. The 4 is
     this function's pre-existing tier-1 rung, which already was the credit for
-    the validated CONFLICT sweep+break pattern (2026-09-23), so Entry Quality
-    totals and thresholds are not re-tuned.
+    the validated CONFLICT sweep+break pattern (2026-09-23); it was raised to 10
+    on 2026-10-13 so the Entry Quality ceiling (75 + 10 = 85) clears the Elite
+    floor again -- see SMC_SWEEP_BREAK_ENTRY_PTS.
 
     Signature unchanged. `gate_owns_failed_zone` is now ignored: the FVG-retest
     adjustment it controlled (through_filled -8) no longer exists in the score.
@@ -2139,7 +2149,7 @@ def smc_entry_structure_score(smc_state, thesis_direction: str = "BULLISH",
     structural gate (apply_smc_structural_gate), so the event is not free.
 
     Behavior change vs. before: direction-matched clean tiers 1-2 now score 0
-    (were 4/10), tier 3-4 now 4 (were 16-25), the retest bonus/penalty and the
+    (were 4/10), tier 3-4 now score the flat credit (were 16-25), the retest bonus/penalty and the
     freshness multiplier are gone.
     """
     return SMC_SWEEP_BREAK_ENTRY_PTS if smc_sweep_break_present(smc_state, thesis_direction) else 0

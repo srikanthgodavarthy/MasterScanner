@@ -58,6 +58,7 @@ from utils.time_utils import now_ist as _now_ist, IST as _IST, is_market_hours_i
 
 from utils.scanner_engine  import run_scanner, fetch_nifty, NIFTY500_SYMBOLS
 from utils.settings_defaults import DEFAULTS
+from utils.cv4_breakdown_spec import build_factors as _cv4_breakdown_factors
 from utils.regime_engine   import (
     build_regime_context,
     apply_regime_layer,
@@ -1659,7 +1660,8 @@ def _safe_int(val, default: int = 0) -> int:
         return default
 
 
-def _perstock_breakdown_table(df: pd.DataFrame, dark: bool = False) -> str:
+def _perstock_breakdown_table(df: pd.DataFrame, dark: bool = False,
+                              settings: dict | None = None) -> str:
     """
     Render a scrollable sub-factor table for every stock in df.
 
@@ -1669,8 +1671,10 @@ def _perstock_breakdown_table(df: pd.DataFrame, dark: bool = False) -> str:
     Scrollable right: one column per sub-factor, each cell = pts label +
                       a narrow progress-bar filled to pts/max_pts %.
 
-    Each column header shows the factor name + max weight; hovering reveals
-    the exact scoring bands drawn directly from conviction_score_v1.py.
+    Each column header shows the factor name + its MEASURED maximum; hovering
+    reveals the scoring bands, with every amount probed from the live
+    conviction_score_v1.py functions (`settings` = the scoring settings, so
+    cv4_legacy_* overrides are reflected).
 
     `dark`: [2026-09-08, SG request — "make stock breakdown to dark"]
     This table has always rendered on the light "data table zone" surface
@@ -1715,132 +1719,18 @@ def _perstock_breakdown_table(df: pd.DataFrame, dark: bool = False) -> str:
     # ── Factor definitions ─────────────────────────────────────────
     # (df_col, short_label, max_pts, dim_color, tooltip_lines)
     #
-    # [Phase 7 cutover, 2026-09-01] Rewired from CV1(v3)'s sub-factor shape
-    # to CV4's (utils/conviction_score_v1.py _leadership_v4()/_conviction_v4()/
-    # _entry_quality_v4() — locked weights per §1.2/§1.3/§1.4). CV4's factor
-    # set and max-points are genuinely different from v1/v3's, not a
-    # relabeling — a stock's SMC evidence now feeds Conviction and Entry
-    # Quality directly (see cv_smc_confirmation / eq_smc_entry_structure
-    # below), which had no v1/v3 equivalent.
-    FACTORS = [
-        # ── LEADERSHIP (purple) — locked weights: RS 30, Trend Strength 25,
-        # Trend Persistence 15, Market/Sector Leadership 15,
-        # Participation/Volume 10, Structural Price Quality 5 ───────────
-        ("_cv4_ls_rs", "Relative Strength", 30, "#a371f7",
-         "RS vs market + RS vs sector + RS consistency + RS momentum\n"
-         "(reuses v1's validated RS sub-ladder: 12+10+5+3 = 30 max)\n"
-         "Strong outperformance across market/sector/consistency/\n"
-         "acceleration → up to +30 pts; lagging the index → 0 pts"),
-
-        ("_cv4_ls_trend", "Trend Strength", 25, "#a371f7",
-         "EMA alignment/cloud position (structure) + ADX (quality) +\n"
-         "EMA20 slope (velocity)\n"
-         "trend_up → +6, ema_alignment → +6, above_cloud → +5\n"
-         "(inside_cloud → +2 instead)\n"
-         "ADX ≥ 40 → +6, ADX 30–40 → +4, ADX 25–30 → +2\n"
-         "EMA20 slope > 0.3 → +2, slope > 0 → +1"),
-
-        ("_cv4_ls_persist", "Trend Persistence", 15, "#a371f7",
-         "Same sweet-spot age ladder as v1's Trend Age, rescaled 0–25→0–15\n"
-         "21–50 bars →  +15 pts  ★ sweet-spot\n"
-         "6–20 or 51–100 bars → +5 pts (young/maturing)\n"
-         "0–5 or > 100 bars → 0 pts (too early / extended)"),
-
-        ("_cv4_ls_mktsector", "Market/Sector Leadership", 15, "#a371f7",
-         "Rewards leadership CONTEXT (regime alignment + sector standing),\n"
-         "not raw RS magnitude\n"
-         "Bullish regime + trend_up → +7 (neutral regime → +4,\n"
-         "bearish regime but still trending up → +1)\n"
-         "+ up to 8 more from RS-vs-sector percentile-rank bands"),
-
-        ("_cv4_ls_participation", "Participation/Volume", 10, "#a371f7",
-         "Volume vs 20-bar average, rescaled from v1's 0–15 ladder (×2/3)\n"
-         "Vol ≥ 2.5× → +10, 2.0–2.5× → +8, 1.5–2.0× → +5\n"
-         "1.2–1.5× → +3, 1.0–1.2× → +1, < 1.0× → 0"),
-
-        ("_cv4_ls_structural", "Structural Price Quality", 5, "#a371f7",
-         "Up to 3/5 from swing structure alone (HH/HL genuine new high/\n"
-         "low; EH/EL tie-retest → +1), independent of SMC.\n"
-         "+2 MORE only if SMC direction agrees with the existing trend\n"
-         "AND SMC evidence_tier ≥ 3 — SMC only ever ADDS here, never\n"
-         "subtracts from or gates Leadership."),
-
-        # ── CONVICTION (green) — locked weights: Directional Trend 20,
-        # Momentum 20, Relative Strength (directional) 15,
-        # Volume/Participation 10, Market Regime 10, SMC Structure
-        # Confirmation 15, Setup/Pattern Evidence 10 ─────────────────────
-        ("_cv4_cv_directional", "Directional Trend", 20, "#3fb950",
-         "Trend structure, signed by thesis direction (long-only here)\n"
-         "trend_up AND ema_alignment → +12\n"
-         "above_cloud → +8 (inside_cloud → +3 instead)"),
-
-        ("_cv4_cv_momentum", "Momentum", 20, "#3fb950",
-         "DIRECTIONAL — no abs(): only momentum in the thesis's favor\n"
-         "scores; opposing momentum scores 0\n"
-         "3-bar move > 8%/4%/0% → +10/+6/+2\n"
-         "6-bar move > 12%/6%/0% → +10/+6/+2"),
-
-        ("_cv4_cv_rs", "Relative Strength (directional)", 15, "#3fb950",
-         "RS momentum signed by thesis — improving RS in the thesis's\n"
-         "favor scores; RS improving against it scores 0\n"
-         "> 0.03 → +15, > 0.01 → +10, > 0.00 → +5, else 0"),
-
-        ("_cv4_cv_volume", "Volume/Participation", 10, "#3fb950",
-         "Today's volume vs 20-bar average\n"
-         "Vol ≥ 2.5× → +10, 2.0–2.5× → +8, 1.5–2.0× → +6\n"
-         "1.2–1.5× → +3, 1.0–1.2× → +1, < 1.0× → 0"),
-
-        ("_cv4_cv_regime", "Market Regime (thesis-relative)", 10, "#3fb950",
-         "Symmetric table — an opposing regime is a PENALTY, not automatic\n"
-         "disqualification (some setups trade counter-regime)\n"
-         "Regime matches thesis → +10, neutral → +5, opposes thesis → +1"),
-
-        ("_cv4_cv_smc", "SMC Structure Confirmation", 15, "#3fb950",
-         "EXACT formula — 0 unless SMC direction matches thesis AND state\n"
-         "isn't CONFLICT. Evidence tier 0–4 → base 0/3/7/12/15, then\n"
-         "decayed by a SLOW freshness multiplier as the structure ages\n"
-         "(thesis stays informed even as evidence ages — see\n"
-         "smc_freshness.py)."),
-
-        ("_cv4_cv_setup", "Setup/Pattern Evidence", 10, "#3fb950",
-         "Fib zone / CCI recovery / squeeze release confirmation signals\n"
-         "in_golden or in_golden_relaxed → +5\n"
-         "recent_cci_recovery or cci_rising → +3\n"
-         "squeeze_release → +2 (squeeze_on → +1 instead)"),
-
-        # ── ENTRY QUALITY (amber) — locked weights: Trend Alignment 20,
-        # Momentum Timing 15, SMC Entry Structure 25, Price Location 15,
-        # Volume/Execution 10, Extension/Chase Risk 15 (subtractive) ────
-        ("_cv4_eq_trend", "Trend Alignment", 20, "#d29922",
-         "trend_up → +8, ema_alignment → +8, above_cloud → +4"),
-
-        ("_cv4_eq_momentum", "Momentum Timing", 15, "#d29922",
-         "Is momentum firing NOW, not just present\n"
-         "cci_momentum_break → +15, recent_cci_recovery → +10,\n"
-         "cci_rising → +5, else 0"),
-
-        ("_cv4_eq_smc", "SMC Entry Structure", 25, "#d29922",
-         "EXACT formula, SMC's single largest weighted sub-component.\n"
-         "Evidence tier 0–4 → base 0/4/10/16/20, FVG-retest adjustment\n"
-         "(in_zone +5, through_unfilled −3, through_filled −8), then\n"
-         "decayed by a FAST freshness multiplier (a stale entry\n"
-         "contributes nothing to \"enter now\" — see smc_freshness.py)."),
-
-        ("_cv4_eq_location", "Price Location", 15, "#d29922",
-         "Pivot/Fib positioning — timing, not trend\n"
-         "≤ −2% from pivot high → +8, −2 to +0.5% → +6, +0.5 to +2% → +3\n"
-         "in_golden → +7, in_golden_relaxed → +5, above_fib786 → +2"),
-
-        ("_cv4_eq_volume", "Volume/Execution", 10, "#d29922",
-         "Vol ≥ 2.0× → +10, 1.5–2.0× → +7, 1.2–1.5× → +4\n"
-         "1.0–1.2× → +1, < 1.0× → 0"),
-
-        ("_cv4_eq_extension", "Extension/Chase Risk", 15, "#d29922",
-         "SUBTRACTIVE — shared with decision_engine._extension() via\n"
-         "extension_shared.compute_extension_penalty(). Full 15 pts at\n"
-         "zero chase-risk severity, decaying toward 0 as severity rises\n"
-         "(too far extended from entry to chase safely)."),
-    ]
+    # [2026-10-13] Derived from the live scoring code, not restated here. Each
+    # max is MEASURED by driving _leadership_v4/_conviction_v4/_entry_quality_v4
+    # and every "+N" in a tooltip is probed from them (see
+    # utils/cv4_score_budget.py, utils/cv4_breakdown_spec.py), so the table
+    # follows cv4_weight_profile() scale factors, the cv4_legacy_* switches and
+    # SMC_SWEEP_BREAK_*_PTS. The hand-written copy that used to live here had
+    # drifted after the CV4 de-duplication audit and the bff15d0 SMC collapse
+    # (labels summed to 100/100/100; real ceilings were 100/85/79).
+    # tests/test_cv4_breakdown_labels.py fails if a label drifts again.
+    # Components whose measured max is 0 (e.g. Conviction Volume, removed in
+    # the audit) are omitted rather than shown as 0/0.
+    FACTORS = _cv4_breakdown_factors(settings)
 
     # Filter to columns that actually exist in this df
     avail = [(col, lbl, mx, clr, tip)
@@ -1968,7 +1858,7 @@ def _perstock_breakdown_table(df: pd.DataFrame, dark: bool = False) -> str:
         # Sub-factor cells
         for col, _, mx, clr, _ in avail:
             pts = _safe_int(row.get(col, 0))
-            pct = int(pts / mx * 100) if mx > 0 else 0
+            pct = min(100, int(pts / mx * 100)) if mx > 0 else 0
             # Colour the bar: full = bright, partial = mid, zero = dark
             bar_clr = clr if pct >= 60 else (clr + "99" if pct > 0 else _track)
             data_rows += (
@@ -2883,7 +2773,8 @@ def _ap_pnl_cell(pnl_pct: float) -> str:
     return f'<td class="col-num" style="color:{color};font-weight:700">{sign}{pnl_pct:.1f}%</td>'
 
 
-def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None = None) -> None:
+def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None = None,
+                             settings: dict | None = None) -> None:
     """
     📋 Active Plans — the operational trading dashboard.
 
@@ -3033,12 +2924,13 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
     with today_tab:
         _render_active_plans_table_body(
             rows_df[rows_df["DaysActive"] == 0], df_aug, key_suffix="today",
-            empty_msg="No setups have triggered entry yet today.",
+            empty_msg="No setups have triggered entry yet today.", settings=settings,
         )
     with prev_tab:
         _render_active_plans_table_body(
             rows_df[rows_df["DaysActive"] >= 1], df_aug, key_suffix="prev",
             empty_msg="No setups carried over from a previous day are currently open.",
+            settings=settings,
         )
 
 
@@ -3083,7 +2975,8 @@ def _ap_volume_cell(vol_ratio, conflict_flag=False, conflict_reason="") -> str:
 
 
 def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
-                                     key_suffix: str, empty_msg: str) -> None:
+                                     key_suffix: str, empty_msg: str,
+                                     settings: dict | None = None) -> None:
     """
     The actual Active Setups table + CV4 breakdown + manual-close
     control — factored out of _render_active_plans_tab() so it can be
@@ -3173,7 +3066,7 @@ def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
     if df_aug is not None and not df_aug.empty and "Stock" in df_aug.columns:
         _ap_symbols = set(rows_df["Symbol"].tolist())
         _ap_breakdown_subset = df_aug[df_aug["Stock"].isin(_ap_symbols)]
-        _ap_pills_html = _perstock_breakdown_table(_ap_breakdown_subset, dark=True)
+        _ap_pills_html = _perstock_breakdown_table(_ap_breakdown_subset, dark=True, settings=settings)
         if _ap_pills_html:
             with st.expander("🔬 Stock Breakdown Summary", expanded=False):
                 st.markdown(_ap_pills_html, unsafe_allow_html=True)
@@ -5419,4 +5312,4 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
         f'📋 ACTIVE SETUPS ({len(_open_plans_preview)})</div>',
         unsafe_allow_html=True,
     )
-    _render_active_plans_tab(df_aug, preloaded_plans=_open_plans_preview)
+    _render_active_plans_tab(df_aug, preloaded_plans=_open_plans_preview, settings=settings)
