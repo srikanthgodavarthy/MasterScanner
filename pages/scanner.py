@@ -2773,6 +2773,22 @@ def _ap_pnl_cell(pnl_pct: float) -> str:
     return f'<td class="col-num" style="color:{color};font-weight:700">{sign}{pnl_pct:.1f}%</td>'
 
 
+def _fresh_pct_chg(row) -> "float | None":
+    """%Chg for display. While the market is open, a row whose last bar is not
+    today's means the live quote was dropped and the scan fell back to yesterday's
+    cached bar, so %Chg is yesterday's move (seen: PVRINOX +4.31% while the stock
+    was -1.2%). Return None (shown blank) instead of a wrong number. Rows without
+    BarDate (older scans) are passed through unchanged."""
+    try:
+        v = float(row.get("%Chg", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    bd = row.get("BarDate")
+    if bd and is_market_hours_ist() and str(bd) != str(_now_ist().date()):
+        return None
+    return v
+
+
 def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None = None,
                              settings: dict | None = None) -> None:
     """
@@ -2847,7 +2863,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
                 # [2026-10-05, SG request] scoring_core norm_score (0-100),
                 # surfaced by scanner_engine as the "Score" column.
                 "norm_score":  float(r.get("Score", 0) or 0),
-                "pct_chg":     float(r.get("%Chg", 0) or 0),
+                "pct_chg":     _fresh_pct_chg(r),
                 "vol_ratio":   float(r.get("VolRatio", 0) or 0),
             }
 
@@ -3349,7 +3365,7 @@ def _render_momentum_tab(df_aug: pd.DataFrame) -> None:
             sym = str(r.get("Stock", "")).upper().strip()
             live_lookup[sym] = {
                 "cmp":       float(r.get("Entry", 0) or 0),
-                "pct_chg":   float(r.get("%Chg", 0) or 0),
+                "pct_chg":   _fresh_pct_chg(r),
                 "vol_ratio": float(r.get("VolRatio", 0) or 0),
                 "cv4_read":  str(r.get("Recommendation", r.get("Category", ""))),
             }

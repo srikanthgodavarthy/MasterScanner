@@ -2117,6 +2117,10 @@ def score_stock(
         "CCI Sig":      r.cci_signal,
         "Qual":         r.qual_icon,
         "%Chg":         r.pct_chg,
+        # [2026-10-13] Date of the bar %Chg was computed on. If a live quote was
+        # dropped (NaN/partial) the scan keeps yesterday's cached bar, and %Chg is
+        # then YESTERDAY's move; the page uses this to avoid showing it as today's.
+        "BarDate":      (str(pd.Timestamp(df.index[-1]).date()) if len(df) else None),
         "Entry":        r.entry,
         "SL":           r.sl,
         "T1":           r.t1,
