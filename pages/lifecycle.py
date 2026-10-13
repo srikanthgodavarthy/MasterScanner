@@ -28,6 +28,15 @@ import streamlit as st
 import pandas as pd
 from datetime import date, datetime
 from utils.time_utils import now_ist as _now_ist, IST as _IST
+from utils.pct_change import (
+    daychg_badge as _daychg_badge,
+    reduced_history_badge as _reduced_history_badge,
+    tv_link as _tv_link,
+    fresh_pct_chg as _fresh_pct_chg,
+    freshen_scan_df as _freshen_scan_df,
+    pct_lookup as _pct_lookup,
+)
+
 
 from utils.lifecycle_engine import (
     STAGE_META, STAGE_FORMING, STAGE_EMERGING, STAGE_SETUP,
@@ -499,7 +508,7 @@ def render():
     
     # ── Check if we have in-session scan data ────────────────────────
     # Scanner page stores latest results in st.session_state["last_scan_df"]
-    _session_scan: pd.DataFrame | None = st.session_state.get("last_scan_df")
+    _session_scan: pd.DataFrame | None = _freshen_scan_df(st.session_state.get("last_scan_df"))
     
     # Pull persisted latest from DB (empty if DB unavailable)
     lc_df = _load_latest() if db_ok else pd.DataFrame()
@@ -536,33 +545,8 @@ def render():
     # rather than triggering new network calls.
     _lc_chg_lookup: dict = {}
     if _session_scan is not None and not _session_scan.empty and "Stock" in _session_scan.columns and "%Chg" in _session_scan.columns:
-        _lc_chg_lookup = dict(
-            zip(_session_scan["Stock"].astype(str), pd.to_numeric(_session_scan["%Chg"], errors="coerce"))
-        )
+        _lc_chg_lookup = {k: (float("nan") if v is None else v) for k, v in _pct_lookup(_session_scan).items()}
 
-    def _daychg_badge(pct_chg) -> str:
-        """Small color-graded day %chg badge shown next to a symbol.
-        Returns "" when no live figure is available for that symbol."""
-        if pct_chg is None:
-            return ""
-        try:
-            v = float(pct_chg)
-        except (TypeError, ValueError):
-            return ""
-        if pd.isna(v):
-            return ""
-        if v > 0:
-            arrow = "▲"
-            color = "#2ea043" if v >= 3 else "#3fb950" if v >= 1 else "#56d364"
-        elif v < 0:
-            arrow = "▼"
-            color = "#f85149" if v <= -1 else "#ff7b72"
-        else:
-            arrow, color = "•", "#8b949e"
-        return (
-            f'<span style="color:{color};font-size:10px;font-weight:700;'
-            f'margin-left:5px;white-space:nowrap;">{arrow}{v:+.2f}%</span>'
-        )
 
     # ══════════════════════════════════════════════════════════════════
     #  TABS
@@ -1078,7 +1062,7 @@ def render():
 
         # ── Fallback: pull from session scan df ───────────────────────
         if _fp_df.empty:
-            _sess = st.session_state.get("last_scan_df")
+            _sess = _freshen_scan_df(st.session_state.get("last_scan_df"))
             if _sess is not None and not _sess.empty and "SetupID" in _sess.columns:
                 # Any row with a real SetupID has a frozen plan, regardless
                 # of which lifecycle state it's currently in.

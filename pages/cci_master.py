@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import math
 import pandas as pd
 
+from utils.pct_change import tv_link as _tv_link, fresh_pct_chg as _fresh_pct_chg, freshen_scan_df as _freshen_scan_df
 from utils.settings_defaults import DEFAULTS
 import streamlit as st
 
@@ -105,10 +106,6 @@ def _is_valid_num(v) -> bool:
         return False
 
 
-def _tv_link(symbol: str) -> str:
-    tv_sym = f"NSE:{str(symbol).upper().replace('.NS', '').replace('-EQ', '')}"
-    url = f"https://www.tradingview.com/chart/?symbol={tv_sym}"
-    return f'<a href="{url}" target="_blank" title="Open {symbol} on TradingView">{symbol}</a>'
 
 
 def _pct_cell(val) -> str:
@@ -303,9 +300,9 @@ def _build_table_html(df: pd.DataFrame) -> str:
 
     rows_html = ""
     for _, row in df.iterrows():
-        cells  = f'<td class="cci-stock">{_tv_link(row.get("Stock", "—"))}</td>'
+        cells  = f'<td class="cci-stock">{_tv_link(row.get("Stock", "—"), css_class="cci-tv", row=row)}</td>'
         cells += _num_cell(row.get("Close"))
-        cells += _pct_cell(row.get("%Chg"))
+        cells += _pct_cell(_fresh_pct_chg(row))
         cells += _cci_cell(row.get("CCI"))
         cells += _state_cell(str(row.get("State", "-")))
         cells += _signal_cell(str(row.get("Signal", "-")))

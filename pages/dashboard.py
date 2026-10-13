@@ -78,6 +78,15 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 from utils.time_utils import now_ist as _now_ist, today_ist, IST as _IST
+from utils.pct_change import (
+    daychg_badge as _daychg_badge,
+    reduced_history_badge as _reduced_history_badge,
+    tv_link as _tv_link,
+    fresh_pct_chg as _fresh_pct_chg,
+    freshen_scan_df as _freshen_scan_df,
+    pct_lookup as _pct_lookup,
+)
+
 
 from utils.sector_map      import build_sector_stats
 
@@ -1638,66 +1647,10 @@ def _th_tooltip(label: str, col_key: str) -> str:
     return f'<th>{label}</th>'
 
 
-def _daychg_badge(pct_chg) -> str:
-    """Small color-graded day %chg badge, meant to sit right next to a
-    stock name wherever one is rendered. Color intensity scales with the
-    size of the move; returns "" (no badge) when pct_chg is missing."""
-    if pct_chg is None:
-        return ""
-    try:
-        v = float(pct_chg)
-    except (TypeError, ValueError):
-        return ""
-    if pd.isna(v):
-        return ""
-    if v > 0:
-        arrow = "▲"
-        color = "#2ea043" if v >= 3 else "#3fb950" if v >= 1 else "#56d364"
-    elif v < 0:
-        arrow = "▼"
-        color = "#f85149" if v <= -1 else "#ff7b72"
-    else:
-        arrow, color = "•", "#8b949e"
-    return (
-        f'<span style="color:{color};font-size:10px;font-weight:700;'
-        f'margin-left:5px;white-space:nowrap;">{arrow}{v:+.2f}%</span>'
-    )
 
 
-def _reduced_history_badge(reduced_history) -> str:
-    """[2026-08-31] Dashboard-local twin of pages/scanner.py's badge of
-    the same name — see that copy's docstring. Flags symbols scored via
-    score_stock()'s recent-listing fallback (utils/scanner_engine.py):
-    a scaled-down slow EMA instead of a real EMA200, typically for
-    recent IPOs under the 210-bar full-history gate. Kept as a separate
-    local copy rather than a cross-page import since dashboard.py and
-    scanner.py each already keep their own local _tv_link/_daychg_badge
-    for the same reason (see this file's own _tv_link docstring)."""
-    if not reduced_history:
-        return ""
-    return (
-        '<span style="color:#d29922;font-size:10px;font-weight:700;'
-        'margin-left:5px;white-space:nowrap;border:1px solid rgba(210,153,34,0.35);'
-        'background:rgba(210,153,34,0.10);border-radius:4px;padding:1px 5px;" '
-        'title="Recent listing — scored with a reduced-history read (shortened '
-        'slow EMA instead of EMA200); trend structure is less reliable than a '
-        'fully-seasoned symbol.">NEW</span>'
-    )
 
 
-def _tv_link(symbol: str, css_class: str = "tv-link", pct_chg=None, reduced_history=None) -> str:
-    """Return an anchor that opens TradingView NSE chart in a new tab,
-    optionally followed by a small color-graded day %chg badge and a
-    reduced-history badge for recent listings."""
-    # TradingView NSE symbol format: NSE:SYMBOLNAME
-    tv_sym = f"NSE:{symbol.upper().replace('.NS', '').replace('-EQ', '')}"
-    url = f"https://www.tradingview.com/chart/?symbol={tv_sym}"
-    return (
-        f'<a class="{css_class}" href="{url}" target="_blank" '
-        f'title="Open {symbol} on TradingView">{symbol}</a>'
-        f'{_daychg_badge(pct_chg)}'
-        f'{_reduced_history_badge(reduced_history)}'
-    )
 
 
 # ── BREADTH STATS (used by Market Intelligence + Leadership Rotation) ──
@@ -2380,7 +2333,7 @@ def _nse_top_gainers_html(df_aug: pd.DataFrame, top_n: int = 5) -> str:
         rows_html += (
             "<tr>"
             f"<td style='color:#8b949e;'>{i}</td>"
-            f'<td><span class="sr-sector-name" style="font-weight:700;" title="{symbol}">{_tv_link(str(symbol)) if symbol != "—" else symbol}</span></td>'
+            f'<td><span class="sr-sector-name" style="font-weight:700;" title="{symbol}">{_tv_link(str(symbol), row=r) if symbol != "—" else symbol}</span></td>'
             f"<td>{f'{ltp:,.2f}' if ltp is not None else '—'}</td>"
             f'<td class="{"sr-pos" if chg >= 0 else "sr-neg"}">{"+" if chg >= 0 else ""}{chg:.2f}%</td>'
             f"<td>{f'{vr:.1f}x' if vr is not None else '—'}</td>"
@@ -2819,7 +2772,7 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
     # (utils.scoring_core), so no extra fetch per headline.
     _chg_lookup: dict = {}
     if scan_df is not None and not scan_df.empty and "Stock" in scan_df.columns and "%Chg" in scan_df.columns:
-        _chg_lookup = dict(zip(scan_df["Stock"].astype(str), pd.to_numeric(scan_df["%Chg"], errors="coerce")))
+        _chg_lookup = _pct_lookup(scan_df)
 
     rows = []
     for item in items:
@@ -2990,7 +2943,7 @@ def _news_impact_compact_rows_html(items: list[dict]) -> str:
             item["published"].astimezone(_IST).strftime("%I:%M") if item.get("published") else "—"
         )
         recommendation = item.get("recommendation")
-        state = _resolve_current_state(symbols, st.session_state.get("dash_scan_df", pd.DataFrame()))
+        state = _resolve_current_state(symbols, _freshen_scan_df(st.session_state.get("dash_scan_df", pd.DataFrame())))
         tooltip = item.get("impact_note", "")
         if recommendation:
             tooltip += f" · Rec: {recommendation}"
@@ -3057,7 +3010,7 @@ def _news_impact_panel():
             "tagging (free at console.groq.com) — showing raw headlines only."
         )
 
-    scan_df = st.session_state.get("dash_scan_df", pd.DataFrame())
+    scan_df = _freshen_scan_df(st.session_state.get("dash_scan_df", pd.DataFrame()))
 
     header_html = """
 <div class="ni-grid ni-head">
@@ -3235,7 +3188,7 @@ def render(settings: dict | None = None):
 
     _dash_scan_autorefresh()
 
-    df_aug = st.session_state.get("dash_scan_df", pd.DataFrame())
+    df_aug = _freshen_scan_df(st.session_state.get("dash_scan_df", pd.DataFrame()))
     run_at = st.session_state.get("dash_scan_run_at", "")
 
     scan_time = ""

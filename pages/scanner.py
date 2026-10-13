@@ -55,6 +55,15 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 from utils.time_utils import now_ist as _now_ist, IST as _IST, is_market_hours_ist
+from utils.pct_change import (
+    daychg_badge as _daychg_badge,
+    reduced_history_badge as _reduced_history_badge,
+    tv_link as _tv_link,
+    fresh_pct_chg as _fresh_pct_chg,
+    freshen_scan_df as _freshen_scan_df,
+    pct_lookup as _pct_lookup,
+)
+
 
 from utils.scanner_engine  import run_scanner, fetch_nifty, NIFTY500_SYMBOLS
 from utils.settings_defaults import DEFAULTS
@@ -1512,68 +1521,10 @@ def _th_tooltip(label: str, col_key: str) -> str:
     return f'<th>{label}</th>'
 
 
-def _daychg_badge(pct_chg) -> str:
-    """Small color-graded day %chg badge, meant to sit right next to a
-    stock name wherever one is rendered. Color intensity scales with the
-    size of the move (light for <1%, mid for 1-3%, strong for 3%+);
-    returns "" (no badge) when pct_chg is missing so callers never have
-    to special-case an unavailable value."""
-    if pct_chg is None:
-        return ""
-    try:
-        v = float(pct_chg)
-    except (TypeError, ValueError):
-        return ""
-    if pd.isna(v):
-        return ""
-    if v > 0:
-        arrow = "▲"
-        color = "#2ea043" if v >= 3 else "#3fb950" if v >= 1 else "#56d364"
-    elif v < 0:
-        arrow = "▼"
-        color = "#f85149" if v <= -3 else "#f85149" if v <= -1 else "#ff7b72"
-    else:
-        arrow, color = "•", "#8b949e"
-    return (
-        f'<span style="color:{color};font-size:10px;font-weight:700;'
-        f'margin-left:5px;white-space:nowrap;">{arrow}{v:+.2f}%</span>'
-    )
 
 
-def _reduced_history_badge(reduced_history) -> str:
-    """[2026-08-31] Small badge for symbols scored via score_stock()'s
-    recent-listing fallback (utils/scanner_engine.py) — a scaled-down
-    slow EMA instead of a real EMA200, because the symbol has under 210
-    bars of history (typically a recent IPO). Meant to sit right next to
-    a stock name so this class of read is visibly distinguished from a
-    normal, full-history score rather than blending in silently. Returns
-    "" for anything falsy so callers never have to special-case a
-    missing/False value (older cached rows won't have this key at all)."""
-    if not reduced_history:
-        return ""
-    return (
-        '<span style="color:#d29922;font-size:10px;font-weight:700;'
-        'margin-left:5px;white-space:nowrap;border:1px solid rgba(210,153,34,0.35);'
-        'background:rgba(210,153,34,0.10);border-radius:4px;padding:1px 5px;" '
-        'title="Recent listing — scored with a reduced-history read (shortened '
-        'slow EMA instead of EMA200); trend structure is less reliable than a '
-        'fully-seasoned symbol.">NEW</span>'
-    )
 
 
-def _tv_link(symbol: str, css_class: str = "tv-link", pct_chg=None, reduced_history=None) -> str:
-    """Return an anchor that opens TradingView NSE chart in a new tab,
-    optionally followed by a small color-graded day %chg badge and a
-    reduced-history badge for recent listings."""
-    # TradingView NSE symbol format: NSE:SYMBOLNAME
-    tv_sym = f"NSE:{symbol.upper().replace('.NS', '').replace('-EQ', '')}"
-    url = f"https://www.tradingview.com/chart/?symbol={tv_sym}"
-    return (
-        f'<a class="{css_class}" href="{url}" target="_blank" '
-        f'title="Open {symbol} on TradingView">{symbol}</a>'
-        f'{_daychg_badge(pct_chg)}'
-        f'{_reduced_history_badge(reduced_history)}'
-    )
 
 
 def _tv_option_symbol(symbol: str, direction: str, strike, expiry: str) -> str:
@@ -2515,7 +2466,7 @@ def _render_html_table(df: pd.DataFrame) -> str:
         cells = f'<td class="col-rank">{rank}</td>'
         stock_sym = row.get("Stock", "—")
         cells += (
-            f'<td class="col-stock">{_tv_link(str(stock_sym), pct_chg=row.get("%Chg"), reduced_history=row.get("reduced_history")) if stock_sym != "—" else "—"}</td>'
+            f'<td class="col-stock">{_tv_link(str(stock_sym), row=row) if stock_sym != "—" else "—"}</td>'
         )
 
         for c in cols:
@@ -2773,20 +2724,6 @@ def _ap_pnl_cell(pnl_pct: float) -> str:
     return f'<td class="col-num" style="color:{color};font-weight:700">{sign}{pnl_pct:.1f}%</td>'
 
 
-def _fresh_pct_chg(row) -> "float | None":
-    """%Chg for display. While the market is open, a row whose last bar is not
-    today's means the live quote was dropped and the scan fell back to yesterday's
-    cached bar, so %Chg is yesterday's move (seen: PVRINOX +4.31% while the stock
-    was -1.2%). Return None (shown blank) instead of a wrong number. Rows without
-    BarDate (older scans) are passed through unchanged."""
-    try:
-        v = float(row.get("%Chg", 0) or 0)
-    except (TypeError, ValueError):
-        return None
-    bd = row.get("BarDate")
-    if bd and is_market_hours_ist() and str(bd) != str(_now_ist().date()):
-        return None
-    return v
 
 
 def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None = None,
@@ -3681,7 +3618,7 @@ def _render_pre_breakout_tab(records: list, df: pd.DataFrame, mode: str) -> None
         rows_html += (
             f'<tr>'
             f'<td class="col-rank">{rank}</td>'
-            f'<td class="col-stock">{_tv_link(sym, pct_chg=r.get("%Change") or r.get("%Chg"), reduced_history=r.get("reduced_history"))}</td>'
+            f'<td class="col-stock">{_tv_link(sym, row=r)}</td>'
             + _pb_score(r.get("Score"))
             + sq_cell
             + _pb_num(rsi, "{:.0f}")
@@ -3789,11 +3726,11 @@ def _build_five_pillars_merged_table_html(df: pd.DataFrame) -> str:
     for _, row in df.iterrows():
         sym = row.get("Stock", "—")
         ltp = row.get("CMP", row.get("Entry"))
-        cells  = f'<td class="fp-stock">{_fp_mod._tv_link(sym)}</td>'
+        cells  = f'<td class="fp-stock">{_tv_link(sym, css_class="fp-tv", row=row)}</td>'
         cells += _fp_mod._class_badge(row.get("FP_EffectiveClass", ""))
         cells += _fp_mod._final_score_cell(row.get("FP_FinalScore"))
         cells += _fp_mod._num_cell(ltp)
-        cells += _fp_mod._pct_cell(row.get("%Chg"))
+        cells += _fp_mod._pct_cell(_fresh_pct_chg(row))
         cells += _fp_mod._pillar_bar(row.get("FP_Leadership"), PTS_LEADERSHIP)
         cells += _fp_mod._pillar_bar(row.get("FP_Structure"), PTS_STRUCTURE)
         cells += _fp_mod._pillar_bar(row.get("FP_Reversal"), PTS_REVERSAL)
@@ -5266,6 +5203,7 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
     own controls-row logic (run_btn, save_db, etc.) depends on.
     """
     summary = summary or {}
+    df_aug = _freshen_scan_df(df_aug)   # single source of day %Chg: stale/NaN -> blank everywhere below
     if supabase_ok is None:
         from utils.supabase_client import _is_available
         supabase_ok = _is_available()

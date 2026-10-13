@@ -31,6 +31,7 @@ import streamlit as st
 
 from utils.time_utils import now_ist as _now_ist, today_ist, IST as _IST
 from utils.sector_map import build_sector_stats
+from utils.pct_change import freshen_scan_df as _freshen_scan_df
 
 logger = logging.getLogger(__name__)
 
@@ -473,7 +474,7 @@ def render(settings: dict | None = None) -> None:
             st.session_state["dash_scan_df"] = pd.DataFrame()
             st.session_state["dash_scan_run_at"] = ""
 
-    df_aug = st.session_state.get("dash_scan_df", pd.DataFrame())
+    df_aug = _freshen_scan_df(st.session_state.get("dash_scan_df", pd.DataFrame()))
     run_at = st.session_state.get("dash_scan_run_at", "")
 
     if df_aug.empty:

@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import streamlit as st
 import pandas as pd
 
+from utils.pct_change import tv_link as _tv_link, fresh_pct_chg as _fresh_pct_chg, freshen_scan_df as _freshen_scan_df
 from utils.pillar_engine import (
     CLASS_ELITE, CLASS_EXECUTE, CLASS_WATCH, CLASS_DEVELOPING, CLASS_AVOID,
     PTS_STRUCTURE, PTS_ACCEPTANCE, PTS_REVERSAL, PTS_LEADERSHIP, PTS_MOMENTUM,
@@ -194,10 +195,6 @@ def _class_badge(cls: str) -> str:
     )
 
 
-def _tv_link(symbol: str) -> str:
-    tv_sym = f"NSE:{str(symbol).upper().replace('.NS', '').replace('-EQ', '')}"
-    url = f"https://www.tradingview.com/chart/?symbol={tv_sym}"
-    return f'<a href="{url}" target="_blank" title="Open {symbol} on TradingView">{symbol}</a>'
 
 
 def _num_cell(val, fmt="{:.2f}") -> str:
@@ -212,7 +209,7 @@ def _pct_cell(val) -> str:
     v = float(val)
     color = "#3fb950" if v >= 0 else "#f85149"
     sign = "+" if v > 0 else ""
-    return f'<td style="color:{color}">{sign}{v:.1f}%</td>'
+    return f'<td style="color:{color}">{sign}{v:.2f}%</td>'
 
 
 def _build_table_html(df: pd.DataFrame) -> str:
@@ -232,10 +229,10 @@ def _build_table_html(df: pd.DataFrame) -> str:
         # the signal-close Entry price (same fallback pattern used
         # elsewhere in the app, e.g. pages/scanner.py's LTP normalisation).
         ltp = row.get("CMP", row.get("Entry"))
-        cells  = f'<td class="fp-stock">{_tv_link(sym)}</td>'
+        cells  = f'<td class="fp-stock">{_tv_link(sym, css_class="fp-tv", row=row)}</td>'
         cells += _final_score_cell(row.get("FP_FinalScore"))
         cells += _num_cell(ltp)
-        cells += _pct_cell(row.get("%Chg"))
+        cells += _pct_cell(_fresh_pct_chg(row))
         cells += _pillar_bar(row.get("FP_Leadership"), PTS_LEADERSHIP)
         cells += _pillar_bar(row.get("FP_Structure"), PTS_STRUCTURE)
         cells += _pillar_bar(row.get("FP_Reversal"), PTS_REVERSAL)
@@ -274,7 +271,7 @@ def _detail_breakdown(row: pd.Series) -> str:
         v = fmt.format(val) if _is_valid_num(val) else "—"
         return f'<span class="fp-sh-item">{label}<b>{v}</b></span>'
 
-    chg = row.get("%Chg", None)
+    chg = _fresh_pct_chg(row)
     chg_color = "var(--green)" if _is_valid_num(chg) and float(chg) >= 0 else "var(--red)"
     html += (
         '<div class="fp-stock-header">'
@@ -672,7 +669,7 @@ def render(settings: dict | None = None):
                         )
                     st.session_state["scan_loaded_from_db"] = True
 
-    df_aug = st.session_state.get("scan_df", pd.DataFrame())
+    df_aug = _freshen_scan_df(st.session_state.get("scan_df", pd.DataFrame()))
 
     _last_scan_stamp = st.session_state.get("scan_time", "")
     if _last_scan_stamp:

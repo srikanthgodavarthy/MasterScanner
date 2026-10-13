@@ -62,6 +62,8 @@ from utils.rotate_candidates import drop_stale_snapshots, pick_first_not_falling
 from utils.market_data import fetch_ohlcv, fetch_previous_close  # lightweight — no scanner/NSE-universe import cost
 
 from utils.time_utils import now_ist as _now_ist, today_ist as _today_ist, IST as _IST
+from utils.pct_change import daychg_badge as _daychg_badge, tv_link as _tv_link
+
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -92,43 +94,8 @@ _TREND_BADGE = {
 }
 
 
-def _daychg_badge(pct_chg) -> str:
-    """Small color-graded day %chg badge, meant to sit right next to a
-    stock name wherever one is rendered. Color intensity scales with the
-    size of the move; returns "" (no badge) when pct_chg is missing."""
-    if pct_chg is None:
-        return ""
-    try:
-        v = float(pct_chg)
-    except (TypeError, ValueError):
-        return ""
-    if pd.isna(v):
-        return ""
-    if v > 0:
-        arrow = "▲"
-        color = "#2ea043" if v >= 3 else "#3fb950" if v >= 1 else "#56d364"
-    elif v < 0:
-        arrow = "▼"
-        color = "#f85149" if v <= -1 else "#ff7b72"
-    else:
-        arrow, color = "•", "#8b949e"
-    return (
-        f'<span style="color:{color};font-size:10px;font-weight:700;'
-        f'margin-left:5px;white-space:nowrap;">{arrow}{v:+.2f}%</span>'
-    )
 
 
-def _tv_link(symbol: str, css_class: str = "tv-link", pct_chg=None) -> str:
-    """Return an anchor that opens TradingView NSE chart in a new tab.
-    Same helper/link format as pages/dashboard.py and pages/scanner.py,
-    optionally followed by a small color-graded day %chg badge."""
-    tv_sym = f"NSE:{str(symbol).upper().replace('.NS', '').replace('-EQ', '')}"
-    url = f"https://www.tradingview.com/chart/?symbol={tv_sym}"
-    return (
-        f'<a class="{css_class}" href="{url}" target="_blank" '
-        f'title="Open {symbol} on TradingView">{symbol}</a>'
-        f'{_daychg_badge(pct_chg)}'
-    )
 
 
 def _md(html: str):
