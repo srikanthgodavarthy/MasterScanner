@@ -5215,6 +5215,7 @@ def render(settings: dict | None = None):
         summary=st.session_state.get("scan_summary", {}),
         scan_time=st.session_state.get("scan_time", ""),
         supabase_ok=supabase_ok,
+        settings=settings,
     )
 
     # ── Signal Class counts ("Scanner Summary") ─────────────────────────
@@ -5232,7 +5233,8 @@ def render(settings: dict | None = None):
 
 
 def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
-                         scan_time: str = "", supabase_ok: bool | None = None) -> None:
+                         scan_time: str = "", supabase_ok: bool | None = None,
+                         settings: dict | None = None) -> None:
     """
     Renders the Elite/Execute/Actionable/Developing/Fib-Pullback/Active-
     Setups tabbed results table for an already-scanned df_aug — no Run
