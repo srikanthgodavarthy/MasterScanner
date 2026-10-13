@@ -611,7 +611,23 @@ def get_history(
         else:
             result[sym] = df
             last_date = df.index.max().date()
-            tail_start = last_date + timedelta(days=1)
+            # [2026-10-13] Re-fetch the LAST cached day when it is before
+            # today, instead of starting the day after it.
+            # _raw_fetch_yfinance() requests data through end+1 day, so a
+            # tail fetch made during a session returns (and this function
+            # persists to disk + Supabase) that day's still-forming bar. The
+            # old `last_date + 1` start then never looked at that day again:
+            # its partial close stayed in the cache as history until the next
+            # full refresh (_FULL_REFRESH_DAYS, 7 days) and became tomorrow's
+            # prev_close, so %Chg (and ATR/EMA/volume-ratio inputs) were
+            # wrong -- seen on PVRINOX (+4.94% shown while down ~1.2%).
+            # Overlapping rows are replaced (keep="last" below). When
+            # last_date == today nothing is re-fetched, as before: today's bar
+            # belongs to the live patch (update_live_cache()), and tomorrow's
+            # sync heals it. No extra network calls vs. before: a symbol is
+            # only selected here when last_date < today, which already
+            # triggered a tail fetch.
+            tail_start = last_date if last_date < today else last_date + timedelta(days=1)
             if tail_start <= today:
                 need_tail[sym] = tail_start
 
