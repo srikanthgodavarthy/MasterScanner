@@ -804,6 +804,24 @@ def _fetch_live_prices(symbols: tuple) -> dict:
             # in: the caller (_patch_live_prices) just falls back to
             # yesterday's cached bar for this symbol this cycle, which is
             # stale but never NaN.
+            # [2026-10-13] Repair before rejecting: a still-forming bar often has a
+            # valid close + volume but NaN open/high/low (yfinance multi-ticker
+            # batch). Dropping it left the symbol on yesterday's cached bar, so
+            # %Chg/price showed YESTERDAY's move as today's (PVRINOX +4.31% while
+            # -1.2% on the day). Fill the missing OHLC from the valid prices so
+            # the bar is internally consistent; only close+volume are required.
+            _c, _v = candidate["close"], candidate["volume"]
+            if not (np.isnan(_c) or _c <= 0 or np.isnan(_v)):
+                _known = [x for x in (candidate["open"], candidate["high"],
+                                      candidate["low"], _c) if not np.isnan(x)]
+                if np.isnan(candidate["open"]):
+                    candidate["open"] = _c
+                if np.isnan(candidate["high"]):
+                    candidate["high"] = max(_known)
+                if np.isnan(candidate["low"]):
+                    candidate["low"] = min(_known)
+                candidate["high"] = max(candidate["high"], candidate["open"], _c)
+                candidate["low"]  = min(candidate["low"],  candidate["open"], _c)
             if any(np.isnan(v) for v in (
                 candidate["open"], candidate["high"], candidate["low"],
                 candidate["close"], candidate["volume"],
@@ -1816,6 +1834,7 @@ def score_stock(
     symbol:   str | None = None,
     sector_series: "pd.Series | None" = None,
     prescreen_reject_sink: "set | None" = None,
+    bypass_prescreen: bool = False,
 ) -> dict:
     """
     Evaluate the LATEST bar of df.
@@ -1946,7 +1965,9 @@ def score_stock(
     # across a few live scans to get the actual time saving.
     diagnostic    = bool((settings or {}).get("prescreen_diagnostic", False))
     prescreen_ok  = leadership_prescreen(df, nifty)
-    if not prescreen_ok and not diagnostic:
+    # bypass_prescreen: symbols with an open SetupPlan must always be fully scored
+    # (live price/PnL/recommendation for Active Setups) even if they no longer pass.
+    if not prescreen_ok and not diagnostic and not bypass_prescreen:
         # [Restored 2026-09-08 — see prescreen_reject_sink's docstring
         # above; accidentally reverted by d291321] Routine, expected
         # rejection (most of the universe fails leadership prescreen most
@@ -3027,6 +3048,27 @@ def _missing_today_bar(data: dict, symbols, source: str = "yfinance",
     return tuple(dict.fromkeys(missing + stale))
 
 
+_OPEN_PLAN_SYMS_CACHE: dict = {"t": 0.0, "syms": frozenset()}
+
+
+def _open_plan_symbols(ttl: float = 60.0) -> frozenset:
+    """Symbols with an open SetupPlan (Waiting/Active/T1 Hit). They bypass the
+    liquidity floor and leadership prescreen so Active Setups always has a fully
+    scored live row. Best-effort: any failure -> empty set (normal filtering)."""
+    import time as _t
+    now = _t.time()
+    if now - _OPEN_PLAN_SYMS_CACHE["t"] < ttl:
+        return _OPEN_PLAN_SYMS_CACHE["syms"]
+    try:
+        from utils.supabase_client import load_open_setup_plans
+        syms = frozenset(str(k).upper().replace(".NS", "").strip()
+                         for k in (load_open_setup_plans() or {}))
+    except Exception:
+        syms = frozenset()
+    _OPEN_PLAN_SYMS_CACHE.update(t=now, syms=syms)
+    return syms
+
+
 def run_scanner(
     symbols:     list,
     settings:    dict | None = None,
@@ -3239,9 +3281,12 @@ def run_scanner(
     # DataFrame instead of keeping the entire batch's `all_data` dict (and
     # `_sector_frames`, `nifty_series`, `effective_settings`, etc.) alive
     # via the closure for as long as that leaked thread happens to live.
+    _open_syms = _open_plan_symbols()
+
     def process(sym, df, sector_series):
         if df is None or df.empty:
             return None
+        _is_open = str(sym).upper().replace(".NS", "") in _open_syms
         # [2026-09-30] Liquidity/tradability floor — added at SG's
         # request. Rejects illiquid Nifty 500 constituents BEFORE they
         # ever reach score_stock()/CV4, the same "reject cheap, before
@@ -3256,7 +3301,7 @@ def run_scanner(
         # levels instead of needing a per-symbol volume floor.
         _min_turnover_cr = effective_settings.get(
             "min_avg_turnover_cr", DEFAULT_MIN_AVG_TURNOVER_CR)
-        if _min_turnover_cr > 0:
+        if _min_turnover_cr > 0 and not _is_open:
             _win = min(len(df), LIQUIDITY_FLOOR_LOOKBACK_BARS)
             _avg_turnover_cr = (
                 (df["close"].tail(_win) * df["volume"].tail(_win)).mean()
@@ -3274,7 +3319,8 @@ def run_scanner(
         row = score_stock(df, nifty_series, settings=effective_settings,
                           cci_len=cci_len, cci_ob=cci_ob, cci_os=cci_os,
                           symbol=sym, sector_series=sector_series,
-                          prescreen_reject_sink=_prescreen_rejected)
+                          prescreen_reject_sink=_prescreen_rejected,
+                          bypass_prescreen=_is_open)
         if row:
             row["Stock"] = sym
         return row
