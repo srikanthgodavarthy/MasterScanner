@@ -429,7 +429,11 @@ def _score_one_symbol(symbol: str, df: pd.DataFrame, params: CCIMasterParams) ->
 
     close = float(last["close"])
     prev_close = float(computed.iloc[-2]["close"]) if len(computed) >= 2 else close
-    chg_pct = ((close - prev_close) / prev_close * 100.0) if prev_close else 0.0
+    # NaN (not 0.0) when there is no usable previous close, so the page shows "—"
+    # instead of a fake flat day.
+    chg_pct = (((close - prev_close) / prev_close * 100.0)
+               if (len(computed) >= 2 and prev_close and math.isfinite(prev_close))
+               else float("nan"))
 
     # ── Trade levels (SL / T1 / T2 / T3 / RR) ───────────────────
     # Compute ATR on the underlying df, then derive swing-based levels.

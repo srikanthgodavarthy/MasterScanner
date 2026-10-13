@@ -99,6 +99,17 @@ class MomentumCandidate:
     rank_today:    Optional[int] = None
 
 
+def _finite_or_zero(v) -> float:
+    """float(v), with None/NaN/inf/garbage -> 0.0. `float(v or 0.0)` lets NaN
+    through (NaN is truthy), which would then be persisted as locked_pct_chg.
+    A missing %Chg can never clear the pct floor, so 0.0 keeps behaviour identical."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if f == f and f not in (float("inf"), float("-inf")) else 0.0
+
+
 def is_momentum_qualified(
     pct_chg:      float,
     vol_ratio:    float,
@@ -125,11 +136,11 @@ def is_momentum_qualified(
          (caller doesn't have the day's full ranking handy) still works
          off the flat floor alone.
     """
-    pct_chg   = float(pct_chg or 0.0)
-    vol_ratio = float(vol_ratio or 0.0)
-    close     = float(close or 0.0)
-    day_high  = float(day_high or 0.0)
-    day_low   = float(day_low or 0.0)
+    pct_chg   = _finite_or_zero(pct_chg)
+    vol_ratio = _finite_or_zero(vol_ratio)
+    close     = _finite_or_zero(close)
+    day_high  = _finite_or_zero(day_high)
+    day_low   = _finite_or_zero(day_low)
 
     if vol_ratio < min_vol_ratio:
         return MomentumCandidate(False, f"vol_ratio {vol_ratio:.2f} < {min_vol_ratio}",
@@ -225,6 +236,6 @@ def evaluate_momentum_row(
     )
     levels = compute_momentum_levels(close=close, atr_at_setup=atr_at_setup)
     row = {"Stock": str(symbol).upper().strip(), **levels,
-           "PctChg": round(float(pct_chg or 0.0), 2),
-           "VolRatio": round(float(vol_ratio or 0.0), 2)}
+           "PctChg": round(_finite_or_zero(pct_chg), 2),
+           "VolRatio": round(_finite_or_zero(vol_ratio), 2)}
     return candidate, row

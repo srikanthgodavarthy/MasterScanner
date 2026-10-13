@@ -243,7 +243,9 @@ class BarResult:
     qual_icon:  str = "✖"
     cci_state:  str = "BEAR"
     cci_signal: str = "-"
-    pct_chg:    float = 0.0
+    # NaN = unknown (no usable previous close). 0.0 would be indistinguishable
+    # from a genuinely flat day; consumers must treat non-finite as "no data".
+    pct_chg:    float = float("nan")
 
     # ── Raw indicator values (for display / debug) ───────────────
     cur_cci:    float = 0.0
@@ -1237,6 +1239,7 @@ def compute_bar(
     prev_cci   = ccil[i-1]  if (ccil  is not None and i >= 1) else cur_cci
     prev_h     = ha[i-1]    if (ha    is not None and i >= 1) else cur_c
     prev_close = ca[i-1]    if (ca    is not None and i >= 1) else cur_c
+    _has_prev_close = ca is not None and i >= 1   # False => %Chg is unknown, not 0
 
     # ── EMA20 SLOPE (5-bar, normalised) ───────────────────────────
     if i >= 5:
@@ -2395,7 +2398,11 @@ def compute_bar(
     acc_score = norm_score + (20 if is_tier1_prime else 0) + (10 if qualified else 0)
     hard_stop = trend_down and below_cloud and norm_score < 30
     #pct_chg   = round((cur_c - prev_close) / prev_close * 100, 2) if prev_close else 0.0
-    pct_chg = (round((cur_c - prev_close) / prev_close * 100, 2) if prev_close and pd.notna(prev_close) and pd.notna(cur_c) else 0.0)
+    # Unknown (first bar / missing or zero prev close) -> NaN, never 0.0: a silent
+    # 0.0 rendered as a real flat day and counted as "unchanged" in breadth stats.
+    pct_chg = (round((cur_c - prev_close) / prev_close * 100, 2)
+               if (_has_prev_close and prev_close and pd.notna(prev_close) and pd.notna(cur_c))
+               else float("nan"))
 
     high_prob_buy = trend_up and in_golden and norm_score >= 55 and any_buy
 

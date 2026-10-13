@@ -58,6 +58,7 @@ from typing import Optional
 
 import pandas as pd
 
+from utils.pct_change import fresh_pct_chg, to_finite
 from utils.dore_options_engine import (
     DoreOptionsSettings, DORE_OPTIONS_DEFAULTS, IVContext,
     compute_dore_trade_plan, rank_recommendations,
@@ -244,7 +245,12 @@ def _shortlist_score(row: dict, w: ShortlistWeights) -> float:
     eq = float(row.get("CV1_EntryQuality") or row.get("EntryQuality") or 0.0)
 
     # Today's % move — magnitude matters (up or down), not direction.
-    pct_move = abs(float(row.get("%Chg") or row.get("PctChange") or 0.0))
+    # fresh_pct_chg: NaN/stale-bar -> None (NaN is truthy, so the old `a or b`
+    # chain let it through and poisoned the score); a real 0.0 is kept.
+    _chg = fresh_pct_chg(row)
+    if _chg is None and to_finite(row.get("%Chg")) is None and to_finite(row.get("%Change")) is None:
+        _chg = to_finite(row.get("PctChange"))
+    pct_move = abs(_chg or 0.0)
     # 0% -> 0, 5%+ move -> saturates at 1.0.
     pct_move_norm = _clamp01(pct_move / 5.0) * 100
 
