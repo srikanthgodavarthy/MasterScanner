@@ -55,6 +55,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 from utils.time_utils import now_ist as _now_ist, IST as _IST, is_market_hours_ist
+from utils.plan_exit_status import ACTION_RANK, RANK_UNKNOWN, exit_pill_html, exit_summary_html
 from utils.pct_change import (
     daychg_badge as _daychg_badge,
     reduced_history_badge as _reduced_history_badge,
@@ -2759,6 +2760,57 @@ def _resolve_plan_quote(live: dict, sym: str):
     return cmp_px, pct
 
 
+def _exit_cfg_for_plans():
+    """Same exit config the Portfolio page uses (its session copy if the user
+    has tuned it there, else the engine default) so both pages agree."""
+    from utils.exit_intelligence_engine import ExitIntelligenceConfig
+    return st.session_state.get("portfolio_exit_cfg") or ExitIntelligenceConfig()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _plan_exit_status(symbol: str, entry_price: float, initial_stop: float,
+                      entry_date: str, cfg_sig: str, category: str = "",
+                      lm_score: float = -1.0, t1_price: float = 0.0,
+                      t1_hit: bool = False, _cfg=None) -> dict:
+    """Exit / ADD read for one open setup (cached 5 min per symbol/entry/stop/
+    config/category/score/T1). cfg_sig keys the cache on the config; _cfg is the
+    object itself (underscore = not hashed); lm_score < 0 means "not in today's
+    scan". See utils.plan_exit_status."""
+    from utils.market_data import fetch_ohlcv
+    from utils.plan_exit_status import evaluate_exit
+    try:
+        df = fetch_ohlcv(symbol, period="1y", interval="1d")
+    except Exception:
+        df = None
+    return evaluate_exit(
+        symbol, entry_price, initial_stop, entry_date or None, df, _cfg,
+        category=category or None, lm_score=(lm_score if lm_score >= 0 else None),
+        t1_price=t1_price or None, t1_hit=t1_hit,
+    )
+
+
+def _resolve_plan_exit(plan, live: dict | None = None) -> dict:
+    """Exit / ADD read for a plan; {} when it holds no position yet (WAITING
+    etc.). `live` is today's scan row for the symbol (its norm_score gates ADD
+    exactly as the Portfolio page's live scan score does); absent -> no gate."""
+    from utils.plan_exit_status import is_open_status, plan_entry_date
+    from utils.pct_change import to_finite
+    if not is_open_status(plan.status):
+        return {}
+    cfg = _exit_cfg_for_plans()
+    score = to_finite((live or {}).get("norm_score"))
+    status = str(getattr(plan.status, "value", plan.status) or "").upper()
+    return _plan_exit_status(
+        str(plan.symbol), float(plan.entry_locked or 0), float(plan.sl_locked or 0),
+        plan_entry_date(plan.activated_at, plan.created_at, plan.first_actionable_date) or "",
+        repr(cfg),
+        category=str(plan.locked_recommendation or plan.locked_category or ""),
+        lm_score=round(score) if score is not None else -1.0,
+        t1_price=float(plan.t1_locked or 0), t1_hit=(status == "T1_HIT"),
+        _cfg=cfg,
+    )
+
+
 def _ap_num(v, fmt: str) -> str:
     """Format a score cell; "—" for None/NaN (symbol not in the scan)."""
     from utils.pct_change import to_finite
@@ -2880,6 +2932,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
         live   = live_lookup.get(sym, {})
         in_scan = bool(live)
         cmp_px, cur_pct = _resolve_plan_quote(live, sym)
+        _exit = _resolve_plan_exit(plan, live)
         rows.append({
             "setup_id":     plan.setup_id,
             "Symbol":       sym,
@@ -2901,6 +2954,8 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             "DaysActive":   _compute_days_active_safe(plan.first_actionable_date),
             "CurrentRec":   live.get("current_rec", ""),
             "CurPctChg":    cur_pct,
+            "ExitInfo":     _exit,
+            "ExitRank":     ACTION_RANK.get(_exit.get("action"), RANK_UNKNOWN),
             "CurVolRatio":  live.get("vol_ratio", 0.0),
         })
 
@@ -2916,7 +2971,8 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
         f'<span style="font-size:10px;color:var(--muted)">ACTIVE</span></div>'
         f'<div><span style="font-size:18px;font-weight:700;color:#a371f7">{n_t1}</span> '
         f'<span style="font-size:10px;color:var(--muted)">T1 HIT</span></div>'
-        '</div>',
+        + exit_summary_html([(i or {}).get("action") for i in rows_df["ExitInfo"]])
+        + '</div>',
         unsafe_allow_html=True,
     )
 
@@ -3007,13 +3063,15 @@ def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
         return
 
     sort_key = st.selectbox(
-        "Sort by", ["Days Active (low → high)", "PnL% ↓", "Norm Score ↓", "Symbol A→Z"],
+        "Sort by", ["Days Active (low → high)", "PnL% ↓", "Norm Score ↓", "Exit status (urgent first)", "Symbol A→Z"],
         key=f"active_plans_sort_{key_suffix}", label_visibility="collapsed",
     )
     if sort_key == "PnL% ↓":
         rows_df = rows_df.sort_values("PnLPct", ascending=False, na_position="last")
     elif sort_key == "Norm Score ↓":
         rows_df = rows_df.sort_values("NormScore", ascending=False)
+    elif sort_key == "Exit status (urgent first)":
+        rows_df = rows_df.sort_values(["ExitRank", "DaysActive"], ascending=[True, True])
     elif sort_key == "Symbol A→Z":
         rows_df = rows_df.sort_values("Symbol")
     else:
@@ -3026,6 +3084,7 @@ def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
     # Entry/SL/T1 to find them.
     header = (
         '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th>'
+        '<th title="Exit Intelligence Engine — the same read as the Portfolio page (EXIT / REDUCE / HOLD / ADD)">Exit</th>'
         '<th>CV4 Composite</th>'
         '<th title="scoring_core norm_score (0-100)">Norm Score</th>'
         '<th>Volume</th><th>CMP</th>'
@@ -3055,7 +3114,8 @@ def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
             f'<tr class="{_row_class}"><td class="col-rank">{rank}</td>'
             f'<td class="col-stock">{_tv_link(r["Symbol"], pct_chg=r["CurPctChg"])}</td>'
             f'<td>{_ap_status_badge(r["Status"])}</td>'
-            f'<td class="col-num">{_ap_num(r["CV4Composite"], ".1f")}</td>'
+            + exit_pill_html(r["ExitInfo"])
+            + f'<td class="col-num">{_ap_num(r["CV4Composite"], ".1f")}</td>'
             f'<td class="col-num">{_ap_num(r["NormScore"], ".0f")}</td>'
             + _vol_cell
             + f'<td class="col-num">{_px(r["CurrentPrice"])}</td>'
@@ -3369,6 +3429,7 @@ def _render_momentum_tab(df_aug: pd.DataFrame) -> None:
     for sym, plan in open_plans.items():
         live   = live_lookup.get(sym, {})
         cmp_px, cur_pct = _resolve_plan_quote(live, sym)
+        _exit = _resolve_plan_exit(plan, live)
         rows.append({
             "setup_id":     plan.setup_id,
             "Symbol":       sym,
@@ -3381,6 +3442,8 @@ def _render_momentum_tab(df_aug: pd.DataFrame) -> None:
             "PnLPct":       compute_pnl_pct(plan.entry_locked, cmp_px) if cmp_px > 0 and plan.entry_locked else None,
             "DaysActive":   _compute_days_active_safe(plan.first_actionable_date),
             "PctChgToday":  cur_pct,
+            "ExitInfo":     _exit,
+            "ExitRank":     ACTION_RANK.get(_exit.get("action"), RANK_UNKNOWN),
             "VolRatio":     live.get("vol_ratio"),
             "CV4Read":      live.get("cv4_read", ""),
         })
@@ -3398,19 +3461,22 @@ def _render_momentum_tab(df_aug: pd.DataFrame) -> None:
         f'<span style="font-size:10px;color:var(--muted)">ACTIVE</span></div>'
         f'<div><span style="font-size:18px;font-weight:700;color:#a371f7">{n_t1}</span> '
         f'<span style="font-size:10px;color:var(--muted)">T1 HIT</span></div>'
-        '</div>',
+        + exit_summary_html([(i or {}).get("action") for i in rows_df["ExitInfo"]])
+        + '</div>',
         unsafe_allow_html=True,
     )
     st.caption("5-day max hold (vs 20d for LS/PB) — momentum decays fast. Entry/SL/T1/T2 are ATR-based (1.5×/1.5×/3× ATR), not CV4's structural swing levels.")
 
     sort_key = st.selectbox(
-        "Sort by", ["Days Active (low → high)", "PnL% ↓", "%Chg Today ↓", "Symbol A→Z"],
+        "Sort by", ["Days Active (low → high)", "PnL% ↓", "%Chg Today ↓", "Exit status (urgent first)", "Symbol A→Z"],
         key="momentum_plans_sort", label_visibility="collapsed",
     )
     if sort_key == "PnL% ↓":
         rows_df = rows_df.sort_values("PnLPct", ascending=False, na_position="last")
     elif sort_key == "%Chg Today ↓":
         rows_df = rows_df.sort_values("PctChgToday", ascending=False, na_position="last")
+    elif sort_key == "Exit status (urgent first)":
+        rows_df = rows_df.sort_values(["ExitRank", "DaysActive"], ascending=[True, True])
     elif sort_key == "Symbol A→Z":
         rows_df = rows_df.sort_values("Symbol")
     else:
@@ -3418,6 +3484,7 @@ def _render_momentum_tab(df_aug: pd.DataFrame) -> None:
 
     header = (
         '<tr><th>#</th><th class="col-stock">Symbol</th><th>Status</th>'
+        '<th title="Exit Intelligence Engine — the same read as the Portfolio page (EXIT / REDUCE / HOLD / ADD)">Exit</th>'
         '<th>Entry</th><th>SL</th><th>T1</th><th>T2</th><th>Current Price</th><th>PnL%</th>'
         '<th>Days Active</th><th>%Chg Today</th><th>Vol Ratio</th><th>CV4 Read (context only)</th></tr>'
     )
@@ -3442,9 +3509,10 @@ def _render_momentum_tab(df_aug: pd.DataFrame) -> None:
                 return '<td class="col-num">—</td>'
         body += (
             f'<tr><td class="col-rank">{rank}</td>'
-            f'<td class="col-stock">{_tv_link(r["Symbol"])}</td>'
+            f'<td class="col-stock">{_tv_link(r["Symbol"], pct_chg=r["PctChgToday"])}</td>'
             f'<td>{_ap_status_badge(r["Status"])}</td>'
-            f'<td class="col-num">{_px(r["Entry"])}</td>'
+            + exit_pill_html(r["ExitInfo"])
+            + f'<td class="col-num">{_px(r["Entry"])}</td>'
             f'<td class="col-num">{_px(r["SL"])}</td>'
             f'<td class="col-num">{_px(r["T1"])}</td>'
             f'<td class="col-num">{_px(r["T2"])}</td>'

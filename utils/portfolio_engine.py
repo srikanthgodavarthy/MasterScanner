@@ -1133,7 +1133,12 @@ def suggest_add(current_category: Optional[str], unrealized_pct: float,
         it as a live opportunity today (score >= 60) rather than a stale
         snapshot that's since moved past its window.
     """
-    strong_categories = {"Elite Opportunity", "High Conviction", "Actionable"}
+    # Legacy names (the Portfolio page's "Entry category" picker) AND the tier
+    # names scanner setup plans are frozen with ("Elite" / "Execute" /
+    # "Actionable", utils.setup_persistence._FREEZE_CATEGORIES). Without the
+    # latter, a plan minted at Elite/Execute -- the strongest tiers -- could
+    # never be flagged ADD.
+    strong_categories = {"Elite Opportunity", "High Conviction", "Actionable", "Elite", "Execute"}
     return (
         unrealized_pct > 0
         and not exit_result.structure_break
