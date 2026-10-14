@@ -1095,7 +1095,41 @@ def fetch_banknifty_ohlcv(period: str = "1y", source: str = "upstox") -> pd.Data
     return pd.DataFrame()
 
 
-def compute_ema_levels(series: pd.Series) -> dict:
+def _with_live_bar(s: pd.Series, live_price) -> pd.Series:
+    """Return s with today's bar set to the live price (market hours only).
+
+    The EMA badge row sits next to a LIVE price on the same card, but the
+    cached daily series usually ends on the previous close, so a badge could
+    read "below EMA20" while the card's own price was above it (Bank Nifty
+    55,466 vs EMA20 55,425 showed a red X). If the last bar is today's it is
+    replaced; if it is an earlier day, today's bar is appended. Outside market
+    hours the series is returned unchanged (it already holds the final close,
+    and a weekend/holiday append would double-count the last bar).
+    """
+    from utils.pct_change import to_finite
+    from utils.time_utils import is_market_hours_ist, now_ist
+    lp = to_finite(live_price)
+    if lp is None or lp <= 0 or s.empty or not isinstance(s.index, pd.DatetimeIndex):
+        return s
+    if not is_market_hours_ist():
+        return s
+    today = pd.Timestamp(now_ist().date())
+    last_ts = pd.Timestamp(s.index[-1])
+    if last_ts.tzinfo is not None:
+        last_ts = last_ts.tz_localize(None)
+    last_day = last_ts.normalize()
+    if last_day > today:
+        return s
+    out = s.copy()
+    if last_day == today:
+        out.iloc[-1] = lp
+    else:
+        ts = today if s.index.tz is None else today.tz_localize(s.index.tz)
+        out.loc[ts] = lp
+    return out
+
+
+def compute_ema_levels(series: pd.Series, live_price=None) -> dict:
     """
     Given a daily close-price series (chronological, most-recent last),
     compute EMA20/EMA50/EMA200 and whether the latest close trades above
@@ -1105,6 +1139,10 @@ def compute_ema_levels(series: pd.Series) -> dict:
     {"ema20": float, "above_ema20": bool,
      "ema50": float, "above_ema50": bool,
      "ema200": float, "above_ema200": bool}
+
+    live_price: when given (and the market is open) it is used as today's
+    bar, so the above/below flags agree with the live price shown on the
+    card — see _with_live_bar().
 
     A span is simply omitted (not backfilled with a misleading value) if
     there isn't enough history for it yet — e.g. a freshly-listed index
@@ -1116,6 +1154,7 @@ def compute_ema_levels(series: pd.Series) -> dict:
     s = series.dropna()
     if s.empty:
         return {}
+    s = _with_live_bar(s, live_price)
     last_price = float(s.iloc[-1])
     out: dict = {}
     for span, key in ((20, "ema20"), (50, "ema50"), (200, "ema200")):
@@ -1127,39 +1166,48 @@ def compute_ema_levels(series: pd.Series) -> dict:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_sensex_ema_levels() -> dict:
+def _sensex_daily_closes() -> pd.Series:
+    """Cached 1y Sensex daily closes (Upstox by default, yfinance fallback).
+    Cached separately from the EMA maths so a changing live price doesn't
+    defeat the cache key."""
+    try:
+        daily = fetch_sensex_ohlcv("1y")
+        return pd.Series(dtype=float) if daily.empty else daily["close"]
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _banknifty_daily_closes() -> pd.Series:
+    """Cached 1y Nifty Bank daily closes — see _sensex_daily_closes()."""
+    try:
+        daily = fetch_banknifty_ohlcv("1y")
+        return pd.Series(dtype=float) if daily.empty else daily["close"]
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def fetch_sensex_ema_levels(live_price=None) -> dict:
     """
-    EMA20/EMA50/EMA200 for BSE Sensex, via compute_ema_levels().
-    Sensex isn't part of the regime-calc series like Nifty is (that one's
-    reused straight from fetch_nifty()), so this does its own 1y daily
-    fetch — reusing fetch_sensex_ohlcv() (Upstox by default, per Market
-    Intelligence's "always Upstox" rule, yfinance fallback on failure)
-    rather than a separate hardcoded yfinance call. Cached for 5 minutes
-    since these only move with each new daily close, not intraday.
+    EMA20/EMA50/EMA200 for BSE Sensex, via compute_ema_levels(). The daily
+    history is cached for 5 minutes; the EMA maths is cheap and is redone per
+    call so live_price (the price shown on the card) can be folded in.
     Returns {} on fetch failure.
     """
     try:
-        daily = fetch_sensex_ohlcv("1y")
-        if daily.empty:
-            return {}
-        return compute_ema_levels(daily["close"])
+        return compute_ema_levels(_sensex_daily_closes(), live_price=live_price)
     except Exception:
         return {}
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_banknifty_ema_levels() -> dict:
+def fetch_banknifty_ema_levels(live_price=None) -> dict:
     """
-    EMA20/EMA50/EMA200 for Nifty Bank, via compute_ema_levels(). Bank Nifty
-    counterpart to fetch_sensex_ema_levels() — same Upstox-by-default,
-    yfinance-fallback sourcing via fetch_banknifty_ohlcv().
+    EMA20/EMA50/EMA200 for Nifty Bank — Bank Nifty counterpart to
+    fetch_sensex_ema_levels() (see there for the live_price rationale).
     Returns {} on fetch failure.
     """
     try:
-        daily = fetch_banknifty_ohlcv("1y")
-        if daily.empty:
-            return {}
-        return compute_ema_levels(daily["close"])
+        return compute_ema_levels(_banknifty_daily_closes(), live_price=live_price)
     except Exception:
         return {}
 

@@ -2716,7 +2716,62 @@ def _ap_current_rec_badge(rec: str, source: str = "", pct_chg: float = 0.0, vol_
     return _ap_rec_badge(rec)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _plan_fallback_quote(symbol: str) -> dict:
+    """Last-known price and day change for an open plan whose symbol is MISSING
+    from the current scan (the live scanner saves progressively, and a symbol
+    can also fail scoring). Without this the row showed no price, "nan%" PnL
+    and no %Chg badge. Uses the same cached daily history the scanner uses to
+    advance the plan. Returns {} when nothing usable, else
+    {"cmp": float, "pct_chg": float | None}. pct_chg is None when the last bar
+    is not today's while the market is open (stale — same rule as everywhere,
+    utils.pct_change)."""
+    try:
+        from utils.market_data import fetch_ohlcv
+        from utils.pct_change import is_stale_bar, to_finite
+        df = fetch_ohlcv(symbol, period="1y", interval="1d")
+        if df is None or df.empty:
+            return {}
+        last = to_finite(df["close"].iloc[-1])
+        if last is None or last <= 0:
+            return {}
+        pct = None
+        if len(df) >= 2 and not is_stale_bar(df.index[-1]):
+            prev = to_finite(df["close"].iloc[-2])
+            if prev and prev > 0:
+                pct = round((last - prev) / prev * 100.0, 2)
+        return {"cmp": last, "pct_chg": pct}
+    except Exception:
+        return {}
+
+
+def _resolve_plan_quote(live: dict, sym: str):
+    """(cmp, day %Chg) for an open-plan row: the scan row when it has a usable
+    price, else the last-known quote — one rule for every plan table."""
+    from utils.pct_change import to_finite
+    cmp_px = to_finite(live.get("cmp")) or 0.0 if live else 0.0
+    pct = live.get("pct_chg") if live else None
+    if cmp_px <= 0:
+        fb = _plan_fallback_quote(sym)
+        cmp_px = fb.get("cmp") or 0.0
+        if pct is None:
+            pct = fb.get("pct_chg")
+    return cmp_px, pct
+
+
+def _ap_num(v, fmt: str) -> str:
+    """Format a score cell; "—" for None/NaN (symbol not in the scan)."""
+    from utils.pct_change import to_finite
+    f = to_finite(v)
+    return "—" if f is None else format(f, fmt)
+
+
 def _ap_pnl_cell(pnl_pct: float) -> str:
+    # A DataFrame turns None into NaN in a float column, and `nan is None` is
+    # False — NaN used to fall through and render as "nan%" (PVRINOX/GLAND/
+    # PETRONET, 2026-10-14). to_finite maps None/NaN/inf/garbage to None.
+    from utils.pct_change import to_finite
+    pnl_pct = to_finite(pnl_pct)
     if pnl_pct is None:
         return '<td class="col-num" style="color:var(--muted)">—</td>'
     color = "#3fb950" if pnl_pct > 0 else ("#f85149" if pnl_pct < 0 else "#8b949e")
@@ -2823,7 +2878,8 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
     rows = []
     for sym, plan in open_plans.items():
         live   = live_lookup.get(sym, {})
-        cmp_px = live.get("cmp", 0.0)
+        in_scan = bool(live)
+        cmp_px, cur_pct = _resolve_plan_quote(live, sym)
         rows.append({
             "setup_id":     plan.setup_id,
             "Symbol":       sym,
@@ -2837,12 +2893,14 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             "SL":           plan.sl_locked,
             "T1":           plan.t1_locked,
             "CurrentPrice": cmp_px,
-            "CV4Composite": live.get("composite", 0.0),
-            "NormScore":    live.get("norm_score", 0.0),
-            "PnLPct":       compute_pnl_pct(plan.entry_locked, cmp_px) if cmp_px else None,
+            # None (not 0.0) when the symbol isn't in the scan: a fake 0.0
+            # composite/score reads as a real, terrible score.
+            "CV4Composite": live.get("composite") if in_scan else None,
+            "NormScore":    live.get("norm_score") if in_scan else None,
+            "PnLPct":       compute_pnl_pct(plan.entry_locked, cmp_px) if cmp_px > 0 else None,
             "DaysActive":   _compute_days_active_safe(plan.first_actionable_date),
             "CurrentRec":   live.get("current_rec", ""),
-            "CurPctChg":    live.get("pct_chg") if live else None,
+            "CurPctChg":    cur_pct,
             "CurVolRatio":  live.get("vol_ratio", 0.0),
         })
 
@@ -2997,8 +3055,8 @@ def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
             f'<tr class="{_row_class}"><td class="col-rank">{rank}</td>'
             f'<td class="col-stock">{_tv_link(r["Symbol"], pct_chg=r["CurPctChg"])}</td>'
             f'<td>{_ap_status_badge(r["Status"])}</td>'
-            f'<td class="col-num">{r["CV4Composite"]:.1f}</td>'
-            f'<td class="col-num">{r["NormScore"]:.0f}</td>'
+            f'<td class="col-num">{_ap_num(r["CV4Composite"], ".1f")}</td>'
+            f'<td class="col-num">{_ap_num(r["NormScore"], ".0f")}</td>'
             + _vol_cell
             + f'<td class="col-num">{_px(r["CurrentPrice"])}</td>'
             f'{_ap_per_source_cells(r["Source"], r["ContribSources"], r["SourceEntries"], r["Entry"])}'
@@ -3310,7 +3368,7 @@ def _render_momentum_tab(df_aug: pd.DataFrame) -> None:
     rows = []
     for sym, plan in open_plans.items():
         live   = live_lookup.get(sym, {})
-        cmp_px = live.get("cmp", 0.0)
+        cmp_px, cur_pct = _resolve_plan_quote(live, sym)
         rows.append({
             "setup_id":     plan.setup_id,
             "Symbol":       sym,
@@ -3320,9 +3378,9 @@ def _render_momentum_tab(df_aug: pd.DataFrame) -> None:
             "T1":           plan.t1_locked,
             "T2":           plan.t2_locked,
             "CurrentPrice": cmp_px,
-            "PnLPct":       compute_pnl_pct(plan.entry_locked, cmp_px) if cmp_px and plan.entry_locked else None,
+            "PnLPct":       compute_pnl_pct(plan.entry_locked, cmp_px) if cmp_px > 0 and plan.entry_locked else None,
             "DaysActive":   _compute_days_active_safe(plan.first_actionable_date),
-            "PctChgToday":  live.get("pct_chg"),
+            "PctChgToday":  cur_pct,
             "VolRatio":     live.get("vol_ratio"),
             "CV4Read":      live.get("cv4_read", ""),
         })
@@ -3371,12 +3429,12 @@ def _render_momentum_tab(df_aug: pd.DataFrame) -> None:
             except (TypeError, ValueError):
                 return "—"
         def _pct(v):
-            try:
-                fv = float(v)
-                color = "#3fb950" if fv > 0 else ("#f85149" if fv < 0 else "#8b949e")
-                return f'<td class="col-num" style="color:{color}">{fv:+.1f}%</td>'
-            except (TypeError, ValueError):
+            from utils.pct_change import to_finite
+            fv = to_finite(v)          # NaN/None -> "—" (float(nan) used to render "+nan%")
+            if fv is None:
                 return '<td class="col-num" style="color:var(--muted)">—</td>'
+            color = "#3fb950" if fv > 0 else ("#f85149" if fv < 0 else "#8b949e")
+            return f'<td class="col-num" style="color:{color}">{fv:+.2f}%</td>'
         def _ratio(v):
             try:
                 return f'<td class="col-num">{float(v):.2f}x</td>'

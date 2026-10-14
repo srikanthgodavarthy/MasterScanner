@@ -58,7 +58,10 @@ from utils.adaptive_target_engine import (
     compute_adaptive_targets, NEUTRAL_TREND_AGE_BARS, NEUTRAL_EXTENSION_SCORE_ATR,
 )
 from utils.lifecycle_engine import STAGE_META
-from utils.rotate_candidates import drop_stale_snapshots, pick_first_not_falling
+from utils.rotate_candidates import (
+    drop_stale_snapshots, pick_first_not_falling, build_live_metrics,
+    ROTATE_MAX_AGE_VS_TODAY_DAYS,
+)
 from utils.market_data import fetch_ohlcv, fetch_previous_close  # lightweight — no scanner/NSE-universe import cost
 
 from utils.time_utils import now_ist as _now_ist, today_ist as _today_ist, IST as _IST
@@ -610,17 +613,45 @@ def _bought_form():
 #  DATA
 # ══════════════════════════════════════════════════════════════════
 
+def _snapshot_scan_date():
+    """IST calendar date the live-scanner snapshot was CREATED, or None if it
+    can't be determined. Deliberately not "today": a weekend/holiday snapshot
+    must not be passed off as fresh."""
+    try:
+        from utils.snapshot_cache import get_snapshot
+        full = get_snapshot("live_scanner")
+        ts = pd.to_datetime((full or {}).get("created_at"), errors="coerce", utc=True)
+        if pd.isna(ts):
+            return None
+        return ts.tz_convert("Asia/Kolkata").date()
+    except Exception:
+        return None
+
+
 def _get_live_scan_metrics() -> pd.DataFrame:
-    """Latest saved lifecycle snapshot per symbol — used to pull current
-    Leadership/Conviction/EQ/RS/TS/Stage so the table, the exit engine's
-    decay factors, and the Opportunity Cost Analyzer all activate without
-    re-running a full scan here."""
-    # [2026-10-08] Was cached for the whole browser session (never
-    # refreshed); now re-read every 15 minutes.
+    """Current per-symbol Leadership/Conviction/EQ/RS/TS/Stage/score/category
+    for the table, the exit engine's decay factors, the Opportunity Cost
+    Analyzer and ROTATE target selection.
+
+    [2026-10-14] Primary source is now the CURRENT live-scanner snapshot (the
+    one the dashboard and Active Setups read). It used to be lifecycle_states
+    alone, which only a manual "Run Scan" writes: ROTATE recommended BEML /
+    TEGA / PFOCUS from a 2026-09-21 Watch snapshot while today's scan had all
+    three at Skip. lifecycle_states is kept as a fallback for symbols missing
+    from the live snapshot, with their own (older) scan_date so the rotate
+    freshness gate can reject them. See utils.rotate_candidates.
+    """
     _now = datetime.now().timestamp()
     if ("portfolio_live_metrics" not in st.session_state
-            or _now - st.session_state.get("portfolio_live_metrics_ts", 0) > 900):
-        st.session_state["portfolio_live_metrics"] = load_lifecycle_latest()
+            or _now - st.session_state.get("portfolio_live_metrics_ts", 0) > 300):
+        try:
+            from utils.snapshot_cache import get_snapshot_df
+            snap_df = get_snapshot_df("live_scanner")
+        except Exception:
+            snap_df = pd.DataFrame()
+        st.session_state["portfolio_live_metrics"] = build_live_metrics(
+            snap_df, load_lifecycle_latest(), _snapshot_scan_date()
+        )
         st.session_state["portfolio_live_metrics_ts"] = _now
     return st.session_state["portfolio_live_metrics"]
 
@@ -1206,6 +1237,11 @@ def _candidate_today_pct(symbol: str) -> float | None:
         df = fetch_ohlcv(symbol, period="1y", interval="1d")
         if df is None or df.empty:
             return None
+        # A last bar that isn't today's (while the market is open) would make
+        # this yesterday's move — same stale-bar rule as everywhere else.
+        from utils.pct_change import is_stale_bar
+        if is_stale_bar(df.index[-1]):
+            return None
         last = float(df["close"].iloc[-1])
         if prev is None:
             if len(df) < 2:
@@ -1251,20 +1287,35 @@ def _best_swap(row: dict, live_metrics: pd.DataFrame, held_symbols: set, exclude
         from) can no longer be a rotate target — but among symbols
         that already clear Watch-or-better, norm_score's
         responsiveness is kept as the tiebreaker on purpose."""
-    if live_metrics is None or live_metrics.empty or "score" not in live_metrics.columns:
+    # Fail CLOSED: without the tier column the Watch+ gate cannot be applied,
+    # and silently skipping it would let Skip-tier names through.
+    if (live_metrics is None or live_metrics.empty
+            or "score" not in live_metrics.columns
+            or "category" not in live_metrics.columns):
         return None
     exclude = held_symbols | excluded_symbols
     pool = live_metrics[~live_metrics["symbol"].astype(str).str.upper().isin(exclude)]
-    if "category" in pool.columns:
-        pool = pool[pool["category"].isin(_ROTATE_QUALIFYING_TIERS)]
+    pool = pool[pool["category"].isin(_ROTATE_QUALIFYING_TIERS)]
     # [2026-10-08] Two gates before ranking picks a winner — see
     # utils/rotate_candidates.py: (1) snapshot freshness, (2) skip targets
     # that are falling today (BEML was still the target while down ~5%).
-    pool = drop_stale_snapshots(pool)
+    # [2026-10-14] Freshness is measured against TODAY, not the newest row in
+    # the table: lifecycle_states can go weeks unwritten, which made every old
+    # row look "fresh" relative to its own newest row.
+    pool = drop_stale_snapshots(pool, max_age_days=ROTATE_MAX_AGE_VS_TODAY_DAYS,
+                                reference_date=_today_ist())
     if pool.empty:
         return None
     pool = pool.sort_values("score", ascending=False)
-    alt, _alt_today_pct = pick_first_not_falling(pool, _candidate_today_pct)
+    # Day change: the freshness-checked value from the same snapshot (single
+    # source, utils.pct_change) first; a network lookup only when unknown.
+    _pct_snap = {}
+    if "pct_chg_today" in pool.columns:
+        for _sym, _v in zip(pool["symbol"].astype(str), pool["pct_chg_today"]):
+            if pd.notna(_v):
+                _pct_snap[_sym] = float(_v)
+    alt, _alt_today_pct = pick_first_not_falling(
+        pool, lambda sym: _pct_snap[sym] if sym in _pct_snap else _candidate_today_pct(sym))
     if alt is None:
         return None
     cur_score = row.get("lm_score")

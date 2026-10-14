@@ -155,15 +155,17 @@ def _index_snapshot(index_key: str):
     return snap or {}
 
 
-def _index_ema_levels(index_key: str) -> dict:
+def _index_ema_levels(index_key: str, live_price=None) -> dict:
+    """EMA levels + above/below flags. live_price is the price shown on the
+    same card, so the flags can't contradict it (see compute_ema_levels())."""
     try:
         if index_key == "NIFTY":
             from utils.scanner_engine import fetch_nifty, compute_ema_levels
             series = fetch_nifty("1y", source="upstox")
-            return compute_ema_levels(series) if series is not None else {}
+            return compute_ema_levels(series, live_price=live_price) if series is not None else {}
         fn_name = {"SENSEX": "fetch_sensex_ema_levels", "BANKNIFTY": "fetch_banknifty_ema_levels"}[index_key]
         from utils import scanner_engine
-        return getattr(scanner_engine, fn_name)()
+        return getattr(scanner_engine, fn_name)(live_price)
     except Exception:
         return {}
 
@@ -250,7 +252,7 @@ def compute_market_intelligence(df_aug: Optional[pd.DataFrame] = None,
     for index_key, label in _INDEX_DEFS:
         try:
             snapshot = _index_snapshot(index_key)
-            ema = _index_ema_levels(index_key)
+            ema = _index_ema_levels(index_key, (snapshot or {}).get("price"))
             oi = _index_oi(index_key)
         except Exception:
             logger.exception("[market_intelligence] %s index card failed (non-fatal)", index_key)
