@@ -2983,6 +2983,7 @@ def _news_impact_panel():
     try:
         from utils.news_feed import fetch_all_news
         from utils.news_sentiment import tag_news, enrich_symbols
+        from utils.news_filter import split_recaps, collect_new_items
         from utils.groq_client import _is_available as _groq_available
     except Exception as exc:
         # feedparser not yet installed (requirements.txt just changed) or
@@ -2991,17 +2992,32 @@ def _news_impact_panel():
         return
 
     _CLASSIFY_CAP = 10
+    _MIN_SHOWN = 6        # if recaps leave fewer rows than this, classify one more batch
+    _MAX_ROUNDS = 2       # hard bound on Groq calls per refresh (each batch is cached 30 min)
 
     with st.spinner("Fetching news…"):
         raw_items = fetch_all_news()
         symbol_tagged = enrich_symbols(raw_items)  # cheap, no Groq cost
+        # [2026-10-14] Trim news that only reports something already done.
+        # Layer 1 (free regex on the title) runs BEFORE classification, so
+        # live price-update pages, market wraps and bare "shares jump X%"
+        # headlines cost no Groq tokens and never take one of the capped slots.
+        symbol_tagged, hidden_items = split_recaps(symbol_tagged)
         stock_specific = [it for it in symbol_tagged if it.get("symbols")]
         market_wide = [it for it in symbol_tagged if not it.get("symbols")]
-        prioritized = (stock_specific + market_wide)[:_CLASSIFY_CAP]
-        items = tag_news(prioritized)
+        pool = stock_specific + market_wide
+        # Layer 2: the classifier's own status flag ("Recap") catches what
+        # regex can't see; a further batch is classified (bounded) when too
+        # few rows survive. See utils.news_filter.collect_new_items.
+        items, _llm_hidden = collect_new_items(
+            pool, tag_news, cap=_CLASSIFY_CAP, min_shown=_MIN_SHOWN, max_rounds=_MAX_ROUNDS)
+        hidden_items = hidden_items + _llm_hidden
 
     if not items:
-        st.caption("No headlines available right now — feeds may be temporarily unreachable.")
+        if hidden_items:
+            st.caption(f"No new headlines right now — {len(hidden_items)} recap headlines hidden.")
+        else:
+            st.caption("No headlines available right now — feeds may be temporarily unreachable.")
         return
 
     if not _groq_available():
@@ -3029,6 +3045,11 @@ def _news_impact_panel():
         f'{_news_impact_rows_html(items[:_CLASSIFY_CAP], scan_df)}</div>',
         unsafe_allow_html=True,
     )
+    if hidden_items:
+        # Say what was trimmed instead of dropping rows silently.
+        with st.expander(f"{len(hidden_items)} recap headlines hidden", expanded=False):
+            for _h in hidden_items:
+                st.caption(f"{_h.get('hidden_reason', 'recap')} · {_h.get('title', '')}")
 
 
 

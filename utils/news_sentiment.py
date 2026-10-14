@@ -123,6 +123,12 @@ _HORIZONS = ("Immediate", "Days", "Weeks")
 # headline suggest" with "what does the scanner currently say about this
 # stock" -- two different questions that happened to share a column.
 _RECOMMENDATIONS = ("BUY", "HOLD", "AVOID")
+# [2026-10-14] "New" = fresh information the market may not have digested;
+# "Recap" = reports something ALREADY done (completed price move, live
+# price-update page, market wrap, results already announced and reacted to).
+# The panel hides Recap items (utils/news_filter.py). Default is "New":
+# when in doubt, show it.
+_STATUSES = ("New", "Recap")
 
 _SYSTEM_PROMPT = f"""You are a terse financial news classifier for Indian equity markets.
 For each headline (with a short summary, when available) you are given,
@@ -135,6 +141,7 @@ Return ONLY a JSON object of the form:
   "magnitude": "High" | "Medium" | "Low",
   "horizon": "Immediate" | "Days" | "Weeks",
   "recommendation": "BUY" | "HOLD" | "AVOID",
+  "status": "New" | "Recap",
   "note": "<=15 words"}}, ...]}}
 
 Rules:
@@ -158,6 +165,13 @@ Rules:
   bullish trigger worth acting on. AVOID = a clear bearish trigger, stay
   away / exit. HOLD = informational, mixed, low-magnitude, or not
   actionable on its own.
+- "status": "Recap" = the headline only reports something that has ALREADY
+  happened and is already in the price: a completed price move ("shares
+  jump 7%"), a live price-update page, a market wrap/closing report, results
+  already announced and reacted to, or a summary of past performance, with
+  no new catalyst. "New" = new information, an announcement, a forward-looking
+  event, an order/contract, guidance, a regulatory action, or an analyst
+  action the market has not yet digested. If unsure, use "New".
 - "note": a terse reason (max 15 words), not a restatement of the headline.
 - No markdown, no commentary outside the JSON object."""
 
@@ -184,7 +198,7 @@ def _classify_batch(texts: list[str]) -> list[dict]:
         cap" look identical in the UI -- no way to tell them apart)."""
     fallback = [
         {"sentiment": "Unclassified", "event_type": None, "magnitude": None,
-         "horizon": None, "recommendation": None, "note": ""}
+         "horizon": None, "recommendation": None, "status": None, "note": ""}
         for _ in texts
     ]
 
@@ -278,12 +292,17 @@ def _classify_batch(texts: list[str]) -> list[dict]:
                     "Positive": "BUY", "Negative": "AVOID", "Neutral": "HOLD",
                 }.get(sentiment)
 
+            status = str(r.get("status", "")).strip().title()
+            if status not in _STATUSES:
+                status = "New"   # fail open: never hide a headline on a bad/missing flag
+
             by_index[idx] = {
                 "sentiment": sentiment,
                 "event_type": event_type,
                 "magnitude": magnitude,
                 "horizon": horizon,
                 "recommendation": recommendation,
+                "status": status,
                 "note": str(r.get("note", "")).strip()[:140],
             }
 
@@ -308,7 +327,7 @@ def _classify_batch(texts: list[str]) -> list[dict]:
             logger.warning("news_sentiment: Groq rate-limited: %s", exc)
             return [
                 {"sentiment": "RateLimited", "event_type": None, "magnitude": None,
-                 "horizon": None, "recommendation": None,
+                 "horizon": None, "recommendation": None, "status": None,
                  "note": "Groq token limit reached — retry later"}
                 for _ in texts
             ]
@@ -362,6 +381,8 @@ def tag_news(items: list[dict]) -> list[dict]:
                          THIS headline alone -- deliberately independent of
                          any scan state; see pages/scanner.py "Current
                          State" column for the scan-tier-based view)
+      - status:         'New' | 'Recap' | None  (Recap = reports something already
+                         done; the News Impact panel hides these, see utils/news_filter.py)
       - impact_note:    str
 
     Classification is skipped (all items 'Unclassified', other fields None)
@@ -391,6 +412,7 @@ def tag_news(items: list[dict]) -> list[dict]:
             item["magnitude"] = None
             item["horizon"] = None
             item["recommendation"] = None
+            item["status"] = None
             item["impact_note"] = "Groq API key not configured"
         return enriched
 
@@ -403,6 +425,7 @@ def tag_news(items: list[dict]) -> list[dict]:
         item["magnitude"] = cls["magnitude"]
         item["horizon"] = cls["horizon"]
         item["recommendation"] = cls["recommendation"]
+        item["status"] = cls.get("status")
         item["impact_note"] = cls["note"]
 
     return enriched
