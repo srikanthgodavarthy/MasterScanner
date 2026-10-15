@@ -1263,6 +1263,58 @@ _CSS = """
      them; scrolling is the honest fix vs. silently losing columns. */
   overflow-x: auto;
 }
+/* ── Card-style news feed (replaces the 9-column grid rows) ───────────────
+   One card per headline: headline first, one muted meta line, then impact +
+   tickers; a single action slot on the right. Height follows the text, not
+   the number of tickers. Colours come from the theme variables so the light
+   theme override keeps working. */
+.ni-panel.nf-panel { padding: 10px 12px; overflow-x: visible; }
+.nf-card {
+  display: flex; gap: 14px; align-items: flex-start;
+  background: var(--bg2); border: 1px solid var(--border); border-left-width: 3px;
+  border-radius: 0; padding: 10px 12px; margin-bottom: 6px;
+}
+.nf-card.nf-pos { border-left-color: var(--green); }
+.nf-card.nf-neg { border-left-color: var(--red); }
+.nf-card.nf-neu { border-left-color: var(--muted); }
+.nf-card.nf-limit { border-left-color: var(--amber); }
+.nf-main { flex: 1; min-width: 0; }
+.nf-headline {
+  display: block; font-size: 14px; font-weight: 600; line-height: 1.4;
+  color: var(--text); text-decoration: none; margin-bottom: 3px;
+}
+.nf-headline:hover { text-decoration: underline; }
+.nf-meta { font-size: 11.5px; color: var(--muted); margin-bottom: 7px; }
+.nf-meta .nf-when { color: var(--text); font-weight: 600; }
+.nf-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.nf-impact {
+  font-size: 12px; font-weight: 700; padding: 2px 9px; border-radius: 4px;
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+}
+.nf-impact.nf-pos { color: var(--green); background: rgba(63,185,80,0.12); }
+.nf-impact.nf-neg { color: var(--red);   background: rgba(248,81,73,0.12); }
+.nf-impact.nf-neu { color: var(--muted); background: rgba(139,148,158,0.12); }
+.nf-impact.nf-limit { color: var(--amber); background: rgba(210,153,34,0.12); }
+.nf-chip {
+  display: inline-flex; align-items: baseline; gap: 2px; white-space: nowrap;
+  border: 1px solid var(--border); border-radius: 4px; padding: 1px 7px; font-size: 12px;
+}
+.nf-chip .nf-sym { font-weight: 700; }
+.nf-act { flex: none; width: 108px; text-align: right; }
+.nf-act-pill {
+  display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .04em;
+  padding: 3px 11px; border-radius: 999px;
+}
+.nf-act-pill.nf-buy   { color: var(--green); background: rgba(63,185,80,0.14);  border: 1px solid rgba(63,185,80,0.4); }
+.nf-act-pill.nf-avoid { color: var(--red);   background: rgba(248,81,73,0.14);  border: 1px solid rgba(248,81,73,0.4); }
+.nf-none { font-size: 12px; color: var(--muted); }
+.nf-sub { font-size: 10.5px; color: var(--muted); margin-top: 3px; }
+.nf-state { margin-top: 6px; font-size: 10.5px; color: var(--muted); }
+.nf-state .ni-pill { font-size: 10px; padding: 1px 7px; }
+@media (max-width: 640px) {
+  .nf-card { flex-direction: column; gap: 6px; }
+  .nf-act { width: auto; text-align: left; }
+}
 .ni-title {
   font-size: 12px;
   font-weight: 700;
@@ -2920,6 +2972,92 @@ def _news_impact_rows_html(items: list[dict], scan_df: pd.DataFrame) -> str:
     return "".join(rows)
 
 
+def _news_impact_cards_html(items: list[dict], scan_df: pd.DataFrame) -> str:
+    """Card-style News Impact feed. Same data, same classification and the same
+    scan cross-checks as the old grid (_news_impact_rows_html, left in place),
+    re-laid-out: headline first; impact and confidence merged into one badge;
+    the separate Recommendation column collapsed into a single action slot that
+    only speaks when there is a real signal (see utils.news_card.action_view);
+    matched tickers wrap in one row; times carry Yesterday / date. Feed text is
+    HTML-escaped (headlines come from third-party RSS)."""
+    from html import escape
+    from utils.news_card import action_view, when_label
+
+    _chg_lookup: dict = {}
+    if scan_df is not None and not scan_df.empty and "Stock" in scan_df.columns and "%Chg" in scan_df.columns:
+        _chg_lookup = _pct_lookup(scan_df)
+
+    cards = []
+    for item in items:
+        symbols = item.get("symbols", [])
+        sentiment = item.get("sentiment")
+        css = {"Positive": "nf-pos", "Negative": "nf-neg", "Neutral": "nf-neu",
+               "RateLimited": "nf-limit"}.get(sentiment, "nf-neu")
+        impact_word = {"Positive": "Positive", "Negative": "Negative", "Neutral": "Neutral",
+                       "RateLimited": "Limited"}.get(sentiment, "N/A")
+        magnitude = item.get("magnitude")
+        impact_text = f"{impact_word} · {magnitude}" if magnitude else impact_word
+
+        event_type = item.get("event_type")
+        event_html = (f'{_NI_EVENT_ICONS.get(event_type, "")} {escape(str(event_type))}'.strip()
+                      if event_type else "")
+        meta_bits = [f'<span class="nf-when">{escape(when_label(item.get("published")))}</span>',
+                     escape(str(item.get("source", "")))]
+        if symbols and item.get("sector"):
+            meta_bits.append(escape(str(item["sector"])))
+        elif not symbols:
+            meta_bits.append("Market-wide")
+        if event_html:
+            meta_bits.append(event_html)
+        meta = " · ".join(b for b in meta_bits if b)
+
+        chips = "".join(
+            f'<span class="nf-chip">{_tv_link(s, css_class="nf-sym", pct_chg=_chg_lookup.get(str(s)))}</span>'
+            for s in symbols[:6]
+        )
+
+        act = action_view(item.get("recommendation"), magnitude)
+        if act["kind"] in ("buy", "avoid"):
+            act_html = f'<span class="nf-act-pill nf-{act["kind"]}">{act["label"]}</span>'
+        else:
+            act_html = f'<span class="nf-none">{act["label"]}</span>'
+        if act["sub"]:
+            act_html += f'<div class="nf-sub">{act["sub"]}</div>'
+
+        # Scan cross-check, unchanged in meaning: the scan's own tier for the
+        # symbol and whether this headline's raw read agrees with it.
+        state = _resolve_current_state(symbols, scan_df)
+        check = _news_evidence_check(item.get("recommendation"), state)
+        state_html = ""
+        if state:
+            state_html = (
+                f'<div class="nf-state">Scan: <span class="ni-pill" style="background:{state[1]}22;'
+                f'border:1px solid {state[1]}66;color:{state[1]}">{escape(str(state[0]))}</span>'
+                + (f' <span class="ni-signal-check {check[1]}" title="{escape(check[2])}">{check[0]}</span>'
+                   if check else "")
+                + '</div>'
+            )
+
+        horizon = item.get("horizon")
+        tip = escape(str(item.get("impact_note", "") or "")
+                     + (f" · {horizon} effect" if horizon else "")
+                     + (f" · Model read: {act['raw']}" if act["raw"] else ""), quote=True)
+        link = escape(str(item.get("link", "")), quote=True)
+        title = escape(str(item.get("title", "")))
+
+        cards.append(
+            f'<div class="nf-card {css}" title="{tip}">'
+            f'<div class="nf-main">'
+            f'<a class="nf-headline" href="{link}" target="_blank" rel="noopener">{title}</a>'
+            f'<div class="nf-meta">{meta}</div>'
+            f'<div class="nf-row"><span class="nf-impact {css}">{escape(impact_text)}</span>{chips}</div>'
+            f'</div>'
+            f'<div class="nf-act">{act_html}{state_html}</div>'
+            f'</div>'
+        )
+    return "".join(cards)
+
+
 def _news_impact_compact_rows_html(items: list[dict]) -> str:
     """Compact TIME / STOCK / IMPACT / EVENT row — matches the reference
     sidebar's News Impact Alerts design. Recommendation/Current State/
@@ -2997,7 +3135,8 @@ def _news_impact_panel():
 
     with st.spinner("Fetching news…"):
         raw_items = fetch_all_news()
-        symbol_tagged = enrich_symbols(raw_items)  # cheap, no Groq cost
+        from utils.news_card import dedupe_items
+        symbol_tagged = dedupe_items(enrich_symbols(raw_items))  # cheap, no Groq cost; one story via two feeds shows once
         # [2026-10-14] Trim news that only reports something already done.
         # Layer 1 (free regex on the title) runs BEFORE classification, so
         # live price-update pages, market wraps and bare "shares jump X%"
@@ -3028,10 +3167,6 @@ def _news_impact_panel():
 
     scan_df = _freshen_scan_df(st.session_state.get("dash_scan_df", pd.DataFrame()))
 
-    header_html = """
-<div class="ni-grid ni-head">
-  <div>TIME</div><div>SECTOR</div><div>STOCK(S)</div><div>IMPACT</div><div>CONFIDENCE</div><div>RECOMMENDATION</div><div>CURRENT STATE</div><div>HEADLINE</div><div>SOURCE</div>
-</div>"""
     # 2026-07-28: was behind an st.expander("Show detailed news impact
     # table …") — now always rendered open, per request.
     # 2026-09-09: summary strip (bullish/bearish/neutral counts + top
@@ -3041,8 +3176,8 @@ def _news_impact_panel():
         '<div class="ni-title" style="margin-bottom:6px;">'
         'Detailed news impact (Confidence · Recommendation · Current State)</div>'
         f'{_news_summary_strip_html(items[:_CLASSIFY_CAP])}'
-        f'<div class="ni-panel">{header_html}'
-        f'{_news_impact_rows_html(items[:_CLASSIFY_CAP], scan_df)}</div>',
+        f'<div class="ni-panel nf-panel">'
+        f'{_news_impact_cards_html(items[:_CLASSIFY_CAP], scan_df)}</div>',
         unsafe_allow_html=True,
     )
     if hidden_items:
