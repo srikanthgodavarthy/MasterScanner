@@ -30,7 +30,9 @@ def _check_harmonic_nb(xP, aP, bP, cP, dP,
     bc = leg_bc / leg_ab
     cd = leg_cd / leg_bc
     xd_den = abs(aP - xP)
-    xd = abs(dP - xP) / xd_den if xd_den > 0 else 999.0
+    # [audit fix] xd is D's retracement/extension OF XA measured from A (Gartley 0.786, Bat 0.886,
+    # Butterfly 1.272, Crab 1.618). It was |D-X|/XA, which no textbook bullish pattern satisfies.
+    xd = abs(aP - dP) / xd_den if xd_den > 0 else 999.0
     return (
         abs(ab - abR)  <= tol and
         bcLo - tol     <= bc <= bcHi + tol and
@@ -164,7 +166,7 @@ class PivotCache:
                  "_prices", "_is_high", "__weakref__")
 
     def __init__(self, ph_series: pd.Series, pl_series: pd.Series, pvt_lb: int,
-                 confirm_lag: int = 0):
+                 confirm_lag: int = 0, window_mult: int = 3):
         """
         confirm_lag: number of bars a centered-window pivot needs after its own
         bar before it can be known. build_pivot_series() marks bar j as a pivot
@@ -176,7 +178,7 @@ class PivotCache:
         """
         self._ph          = ph_series.values          # numpy array (float, NaN = not pivot)
         self._pl          = pl_series.values
-        self._lb3         = pvt_lb * 3
+        self._lb3         = pvt_lb * int(window_mult)   # window_mult=3 keeps the historical 3*lb
         self._lag         = max(0, int(confirm_lag))
         self._last_rebuild = -1
         self._last_end    = -1

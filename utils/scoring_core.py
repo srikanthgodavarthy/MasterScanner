@@ -59,6 +59,11 @@ class ScoringParams:
     # Fibonacci
     atr_prox: float = 0.3      # ATR multiplier for zone proximity
     pvt_lb:   int   = 20       # pivot lookback
+    # Harmonic/ABCD pivot window, in multiples of pvt_lb. 3 = historical behaviour (a 60-bar
+    # window of which only 41 bars hold CONFIRMED pivots => at most 2 highs + 2 lows, so harmonic
+    # (5 pivots) and ABCD (3 lows) can never fire on untied data). >= 4 makes them structurally
+    # possible, which RAISES scores -- backtest before enabling. See compute_bar_legacy_score_audit.md.
+    pattern_pivot_window_mult: int = 3
 
     # Tier 1 — persistent_strength
     t1_mom3:  float = 8.0      # mom3 > threshold (%)
@@ -160,6 +165,7 @@ class ScoringParams:
             cci_os           = int(s.get("cci_os",             _dc.cci_os)),
             atr_prox         = float(s.get("atr_prox",         _dc.atr_prox)),
             pvt_lb           = int(s.get("pvt_lb",              _dc.pvt_lb)),
+            pattern_pivot_window_mult = int(s.get("pattern_pivot_window_mult", _dc.pattern_pivot_window_mult)),
             t1_mom3          = float(s.get("t1_mom3",           _dc.t1_mom3)),
             t1_mom6          = float(s.get("t1_mom6",           _dc.t1_mom6)),
             t1_fib_hi        = float(s.get("t1_fib_hi",         _dc.t1_fib_hi)),
@@ -798,24 +804,27 @@ def build_indicators(
 import weakref as _weakref
 _pivot_caches: "_weakref.WeakValueDictionary" = None   # lazily initialised
 
-def _get_pivot_cache(ia, confirm_lag: int = 0):
+def _get_pivot_cache(ia, confirm_lag: int = 0, pvt_lb: int = 20, window_mult: int = 3):
     global _pivot_caches
     from utils.pivot_engine import PivotCache
     if _pivot_caches is None:
         _pivot_caches = _weakref.WeakValueDictionary()
-    key = id(ia)
+    key = (id(ia), int(pvt_lb), int(window_mult), int(confirm_lag))
     cache = _pivot_caches.get(key)
     if cache is None:
         # confirm_lag: ph_series/pl_series are CENTERED-window pivots over the
         # full history, so bar j is only knowable from bar j+lb on. Without the
         # lag a historical bar i would see pivots confirmed up to lb bars in
         # its own future (harmonic/ABCD leak). No-op on a live final bar.
-        cache = PivotCache(ia.ph_series, ia.pl_series, 20, confirm_lag=confirm_lag)
+        # [audit fix] was a hardcoded 20: ph_series/pl_series are built with params.pvt_lb
+        # (build_indicators), so the cache window must use the same lookback.
+        cache = PivotCache(ia.ph_series, ia.pl_series, pvt_lb, confirm_lag=confirm_lag,
+                           window_mult=window_mult)
         _pivot_caches[key] = cache
     return cache
 
 
-def _get_pivots(ia: IndicatorArrays, i: int, pvt_lb: int):
+def _get_pivots(ia: IndicatorArrays, i: int, pvt_lb: int, window_mult: int = 3):
     """
     P1/P4/P5 optimised pivot + pattern detection.
       P1: reads precomputed pivot series (no per-bar slice)
@@ -827,7 +836,7 @@ def _get_pivots(ia: IndicatorArrays, i: int, pvt_lb: int):
     if pvt_lb < 2 or i < pvt_lb * 2:
         return [], [], False, False, False, False
 
-    cache = _get_pivot_cache(ia, confirm_lag=pvt_lb)
+    cache = _get_pivot_cache(ia, confirm_lag=pvt_lb, pvt_lb=pvt_lb, window_mult=window_mult)
     pv_prices_arr, pv_is_high_arr = cache.get(i)
 
     if pv_prices_arr is None or len(pv_prices_arr) < 4:
@@ -1796,7 +1805,7 @@ def compute_bar(
         i >= params.pvt_lb * 2                 # enough history for pivots
     )
     if _may_need_pivots:
-        _, _, harm_bull, harm_bear, abcd_bull, abcd_bear = _get_pivots(ia, i, params.pvt_lb)
+        _, _, harm_bull, harm_bear, abcd_bull, abcd_bear = _get_pivots(ia, i, params.pvt_lb, params.pattern_pivot_window_mult)
     else:
         harm_bull = harm_bear = abcd_bull = abcd_bear = False
 
@@ -1937,6 +1946,7 @@ def compute_bar(
 
     # Trend phase modifier
     # ESTABLISHED = no adjustment  |  EMERGING = 10% haircut  |  EXTENDED = 30% penalty
+    _score_pre_phase = score          # [audit fix] kept so the audit dict can report the haircut correctly
     if trend_phase == 'EXTENDED':
         score *= 0.70
     elif trend_phase == 'EMERGING':
@@ -2270,7 +2280,7 @@ def compute_bar(
         "near_high":        (5 if cur_c > hh * 0.98 and cur_c < hh * 1.01 else 0),
         "rs_composite":     (30 if rs_composite > 0.15 else 25 if rs_composite > 0.10 else 20 if rs_composite > 0.05 else 5 if rs_composite > 0.00 else -10 if rs_composite < -0.03 else 0),  # [v8.1]
         "fresh_base":       15 if fresh_base_breakout else 0,
-        "trend_age":        (-5 if trend_age_bars == 0 or trend_age_bars <= 5 else 5 if trend_age_bars <= 20 else 20 if trend_age_bars <= 50 else 0 if trend_age_bars <= 100 else -10),  # [v8.1] was trend_freshness
+        "trend_age":        (0 if trend_age_bars == 0 else -5 if trend_age_bars <= 5 else 5 if trend_age_bars <= 20 else 20 if trend_age_bars <= 50 else 0 if trend_age_bars <= 100 else -10),  # [v8.1] was trend_freshness
         "in_golden":        15 if in_golden else 0,
         "fib_ext_penalty":  (-20 if near_ext127 else -30 if near_ext161 else 0),
         "momentum":         (20 if mom3 > 20 and mom6 > 20 else 10 if mom3 > 10 and mom6 > 10 else 5 if mom3 > 5 and mom6 > 5 else 0),
@@ -2282,7 +2292,7 @@ def compute_bar(
         "below_cloud":      -15 if below_cloud else 0,
         "squeeze":          (params.t1_squeeze_pts if squeeze_release else (params.t1_no_squeeze_pts if not squeeze_on else 0)) if params.t1_squeeze_boost else 0,
         "cci_rising":       8 if cci_rising else 0,
-        "phase_modifier":   round(score * (0.70 - 1) if trend_phase == "EXTENDED" else score * (0.90 - 1) if trend_phase == "EMERGING" else 0, 1),
+        "phase_modifier":   round(_score_pre_phase * (0.70 - 1) if trend_phase == "EXTENDED" else _score_pre_phase * (0.90 - 1) if trend_phase == "EMERGING" else 0, 1),
         "ll_opportunity_bonus":     ll_bonus,      # layered on norm_score, not the raw score above
         "stoch_convergence_bonus": stoch_bonus,    # layered on norm_score, not the raw score above
     }
