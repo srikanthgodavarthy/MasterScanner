@@ -2613,6 +2613,7 @@ def compute_dore_trade_plan(
     futures_high_prices: Optional[Sequence[float]] = None,
     futures_low_prices: Optional[Sequence[float]] = None,
     futures_open_prices: Optional[Sequence[float]] = None,
+    calendar_dte: Optional[int] = None,
 ):
     """Runs the full pipeline for one symbol and returns an
     OptionTradePlan (default output, Improvement #9) or a
@@ -2707,14 +2708,18 @@ def compute_dore_trade_plan(
     _iv_expected_move = None
     _ce_iv = option_data.get("ce_iv")
     _pe_iv = option_data.get("pe_iv")
-    if _ce_iv is not None and _pe_iv is not None and sig.current_price > 0 and dte > 0:
+    # [2026-10-19] `dte` may be holiday-adjusted (utils.nse_calendar) for
+    # bucketing; annualised IV is quoted per CALENDAR day, so the IV move
+    # uses calendar_dte when the caller supplies it.
+    _iv_dte = calendar_dte if calendar_dte is not None else dte
+    if _ce_iv is not None and _pe_iv is not None and sig.current_price > 0 and _iv_dte > 0:
         # Computed whenever data allows, independent of settings.
         # use_iv_expected_move -- so the win-rate/near-miss logging
         # below (record_and_diff_skew's atr_move/iv_move columns) has
         # a real comparison even while the flag is off, without ever
         # letting an off flag's computation affect sig.expected_move.
         _avg_iv = (float(_ce_iv) + float(_pe_iv)) / 2.0
-        _iv_expected_move = sig.current_price * (_avg_iv / 100.0) * math.sqrt(dte / 365.0)
+        _iv_expected_move = sig.current_price * (_avg_iv / 100.0) * math.sqrt(_iv_dte / 365.0)
         if settings.use_iv_expected_move and _iv_expected_move > sig.expected_move:
             sig.expected_move = round(_iv_expected_move, 2)
             expected_move_source = "IV"

@@ -285,6 +285,7 @@ class DOREInput:
     highest_pe_oi_strike: float = 0.0   # nearest PE "wall" (support)
     nearest_expiry:   str = ""
     days_to_expiry:   int = 0
+    calendar_days_to_expiry: int = 0   # 0 -> fall back to days_to_expiry; used for annualised maths (IV move)
 
     # ── Stage 3.5 (Option Intelligence) — is the CONTRACT worth buying,
     #    independent of direction (RFC-001 §7). Nothing here may carry
@@ -345,6 +346,7 @@ class DOREInput:
                                            # 3's futures-OI-divergence read treat 0.0 as "skipped",
                                            # not "flat OI".
     fut_days_to_expiry:   int = 0
+    fut_calendar_days_to_expiry: int = 0   # 0 -> fall back to fut_days_to_expiry; used for basis annualisation
     # Same-day evidence on the FUTURES contract's own 5-minute chart
     # (fetch_futures_intraday_5m_upstox(), PR1) — feeds
     # stage1_futures_market_state()'s OWN execution sub-score only. This
@@ -1353,7 +1355,9 @@ def stage1_futures_market_state(inp: DOREInput, cfg: DORESettings) -> FuturesMar
     #    backwardation reads bearish ────────────────────────────────
     basis_score = 50.0
     if inp.fut_ltp > 0 and inp.price > 0:
-        basis = compute_futures_basis(inp.fut_ltp, inp.price, inp.fut_days_to_expiry or inp.days_to_expiry)
+        basis = compute_futures_basis(inp.fut_ltp, inp.price,
+                                      inp.fut_calendar_days_to_expiry or inp.calendar_days_to_expiry
+                                      or inp.fut_days_to_expiry or inp.days_to_expiry)
         ann = basis["basis_annualized_pct"]
         if ann is not None:
             basis_score = _pct_score(ann, cfg.fut_basis_backwardation_bear_pct, cfg.fut_basis_contango_bull_pct)
@@ -2517,9 +2521,9 @@ def stage3_5_option_intelligence(
     # ── Pricing: does the IV-implied move cover the distance to the ──
     #    technical target the underlying actually needs to travel?
     iv_expected_move = None
-    if inp.current_iv is not None and inp.current_iv > 0 and inp.days_to_expiry > 0:
+    if inp.current_iv is not None and inp.current_iv > 0 and (inp.calendar_days_to_expiry or inp.days_to_expiry) > 0:
         iv_expected_move = round(
-            inp.price * (inp.current_iv / 100.0) * ((inp.days_to_expiry / 365.0) ** 0.5), 2
+            inp.price * (inp.current_iv / 100.0) * (((inp.calendar_days_to_expiry or inp.days_to_expiry) / 365.0) ** 0.5), 2
         )
         reasons.append(f"IV Expected Move={iv_expected_move:.2f} vs ATR Expected Move={atr_expected_move:.2f}")
 
@@ -3379,17 +3383,15 @@ def compute_dore(inp: DOREInput, settings: Optional[DORESettings] = None) -> DOR
 # ══════════════════════════════════════════════════════════════════
 
 def _days_to_expiry(expiry_str: str) -> int:
-    """Calendar-day count from today (IST) to `expiry_str` ("YYYY-MM-DD").
-    Returns 0 if unparseable/blank/past."""
-    if not expiry_str:
-        return 0
-    try:
-        from datetime import datetime, timedelta
-        now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        exp = datetime.strptime(expiry_str[:10], "%Y-%m-%d")
-        return max((exp.date() - now_ist.date()).days, 0)
-    except Exception:
-        return 0
+    """Holiday-adjusted days to expiry — delegates to utils.nse_calendar
+    (the single DTE implementation shared with utils.dore_options_scan)."""
+    from utils.nse_calendar import days_to_expiry
+    return days_to_expiry(expiry_str)
+
+
+def _calendar_days_to_expiry(expiry_str: str) -> int:
+    from utils.nse_calendar import calendar_days_to_expiry
+    return calendar_days_to_expiry(expiry_str)
 
 
 def compute_trend_features(daily_df, cfg: Optional[DORESettings] = None) -> dict:
@@ -3729,6 +3731,7 @@ def build_dore_input(
         highest_pe_oi_strike=oi_resistance.get("pe_strike", 0.0),
         nearest_expiry=nearest_expiry,
         days_to_expiry=_days_to_expiry(nearest_expiry),
+        calendar_days_to_expiry=_calendar_days_to_expiry(nearest_expiry),
 
         iv_percentile=atm_chain_row.get("iv_percentile", oi_resistance.get("iv_percentile", iv_percentile)),
         event_risk_today=event_risk_today,
@@ -3756,6 +3759,7 @@ def build_dore_input(
         fut_oi=futures_snapshot.get("oi", 0.0),
         fut_oi_change=futures_snapshot.get("oi_change", 0.0),
         fut_days_to_expiry=_days_to_expiry(fut_expiry) if fut_expiry else 0,
+        fut_calendar_days_to_expiry=_calendar_days_to_expiry(fut_expiry) if fut_expiry else 0,
         fut_vwap=futures_execution_features.get("fut_vwap", 0.0),
         fut_fresh_crossover=futures_execution_features.get("fut_fresh_crossover", False),
         fut_fresh_crossunder=futures_execution_features.get("fut_fresh_crossunder", False),

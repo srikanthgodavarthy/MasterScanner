@@ -172,17 +172,22 @@ def _build_index_scan_rows(settings: Optional[dict] = None) -> dict:
 #  module docstring in utils/dore_options_engine.py).
 # ══════════════════════════════════════════════════════════════════
 
+def _ist_today():
+    from utils.nse_calendar import ist_today
+    return ist_today()
+
+
+def _calendar_days_to_expiry(expiry_str: str) -> int:
+    """Delegates to utils.nse_calendar (the single DTE implementation)."""
+    from utils.nse_calendar import calendar_days_to_expiry
+    return calendar_days_to_expiry(expiry_str)
+
+
 def _days_to_expiry(expiry_str: str) -> int:
-    """Calendar-day count from today (IST) to `expiry_str` ("YYYY-MM-DD").
-    Returns 0 if unparseable/blank/past."""
-    if not expiry_str:
-        return 0
-    try:
-        now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        exp = datetime.strptime(str(expiry_str)[:10], "%Y-%m-%d")
-        return max((exp.date() - now_ist.date()).days, 0)
-    except Exception:
-        return 0
+    """Holiday-adjusted days to expiry — delegates to utils.nse_calendar
+    (the single DTE implementation). See that module for semantics."""
+    from utils.nse_calendar import days_to_expiry
+    return days_to_expiry(expiry_str)
 
 
 def _load_settings(cfg: Optional[DoreOptionsSettings]) -> DoreOptionsSettings:
@@ -570,12 +575,13 @@ def top_dore_trade_plans(
             fut_closes, fut_highs, fut_lows, fut_opens = None, None, None, None
 
         dte = _days_to_expiry(option_data.get("expiry", ""))
+        calendar_dte = _calendar_days_to_expiry(option_data.get("expiry", ""))
         regime = scan_row.get("regime") or scan_row.get("_nifty_regime") or scan_row.get("MarketRegime")
         iv_row = iv_lookup.get(symbol)
         iv_ctx = IVContext(**iv_row) if iv_row else None
 
         result = compute_dore_trade_plan(
-            scan_row, closes, option_data, dte=dte, settings=settings,
+            scan_row, closes, option_data, dte=dte, calendar_dte=calendar_dte, settings=settings,
             symbol=symbol, market_regime=regime, iv=iv_ctx,
             high_prices=highs, low_prices=lows, open_prices=opens,
             futures_close_prices=fut_closes, futures_high_prices=fut_highs, futures_low_prices=fut_lows,

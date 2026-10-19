@@ -292,8 +292,8 @@ def build_dore_stage5_entry_snapshot(fo_scan_row: dict, setup_id: str, symbol: s
     try:
         expiry_date = g("Expiry Date")
         if expiry_date:
-            from datetime import date as _date
-            dte = (datetime.fromisoformat(str(expiry_date)).date() - _date.today()).days
+            from utils.nse_calendar import days_to_expiry as _dte_fn
+            dte = _dte_fn(expiry_date)
     except Exception:
         dte = None
 
