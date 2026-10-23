@@ -119,3 +119,20 @@ def test_feed_text_is_escaped(cards):
                         impact_note='" onmouseover="x', event_type="<i>x</i>")])
     assert "<script>" not in html and "<img" not in html and "<b>src" not in html and "<i>x" not in html
     assert "&lt;script&gt;" in html and 'onmouseover="x' not in html
+
+
+def test_split_by_sentiment_groups_and_orders_by_magnitude():
+    from utils.news_card import split_by_sentiment
+    items = [
+        {"title": "a", "sentiment": "Positive", "magnitude": "Low"},
+        {"title": "b", "sentiment": "Negative", "magnitude": "High"},
+        {"title": "c", "sentiment": "Positive", "magnitude": "High"},
+        {"title": "d", "sentiment": "Neutral", "magnitude": "Low"},
+        {"title": "e", "sentiment": "Positive", "magnitude": "Low"},
+        {"title": "f", "sentiment": "RateLimited"},
+        {"title": "g"},
+    ]
+    pos, neg, other = split_by_sentiment(items)
+    assert [i["title"] for i in pos] == ["c", "a", "e"]   # High first, then input order
+    assert [i["title"] for i in neg] == ["b"]
+    assert [i["title"] for i in other] == ["d", "f", "g"]

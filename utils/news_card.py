@@ -84,3 +84,25 @@ def dedupe_items(items: Iterable[dict]) -> "list[dict]":
             seen.add(k)
         out.append(it)
     return out
+
+
+_MAG_RANK = {"High": 0, "Medium": 1, "Low": 2}
+
+
+def split_by_sentiment(items: Iterable[dict]) -> "tuple[list[dict], list[dict], list[dict]]":
+    """(positive, negative, other) for the two-column News Impact view.
+
+    `other` is everything that is not a clear Positive/Negative read (Neutral,
+    Unclassified, RateLimited, missing). Within each of positive/negative the
+    strongest reads come first (High > Medium > Low); the sort is stable, so
+    equal-magnitude items keep the input's newest-first order."""
+    pos: list = []
+    neg: list = []
+    other: list = []
+    for it in items:
+        s = it.get("sentiment")
+        (pos if s == "Positive" else neg if s == "Negative" else other).append(it)
+    rank = lambda it: _MAG_RANK.get(it.get("magnitude"), 3)
+    pos.sort(key=rank)
+    neg.sort(key=rank)
+    return pos, neg, other

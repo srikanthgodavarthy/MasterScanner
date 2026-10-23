@@ -1315,6 +1315,24 @@ _CSS = """
   .nf-card { flex-direction: column; gap: 6px; }
   .nf-act { width: auto; text-align: left; }
 }
+/* Two-column view: Positive left, Negative right. Cards stack their action
+   slot under the text because each column is only half the panel wide. */
+.nf-split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-items: start; }
+.nf-col-h {
+  font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  padding: 0 2px 6px; margin-bottom: 8px; border-bottom: 2px solid var(--border);
+}
+.nf-col-h.nf-pos { color: var(--green); border-bottom-color: var(--green); }
+.nf-col-h.nf-neg { color: var(--red);   border-bottom-color: var(--red); }
+.nf-split .nf-card { flex-direction: column; gap: 6px; }
+.nf-split .nf-act { width: auto; text-align: left; }
+.nf-empty { font-size: 12px; color: var(--muted); padding: 8px 2px; }
+.nf-other { margin-top: 10px; }
+.nf-other > summary {
+  cursor: pointer; font-size: 12px; font-weight: 700; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--muted); padding: 6px 2px;
+}
+@media (max-width: 900px) { .nf-split { grid-template-columns: 1fr; } }
 .ni-title {
   font-size: 12px;
   font-weight: 700;
@@ -3058,6 +3076,32 @@ def _news_impact_cards_html(items: list[dict], scan_df: pd.DataFrame) -> str:
     return "".join(cards)
 
 
+def _news_impact_split_html(items: list[dict], scan_df: pd.DataFrame) -> str:
+    """Two-column News Impact view: Positive on the left, Negative on the
+    right, strongest reads first. Neutral / unclassified items sit in a
+    collapsed section underneath so they don't dilute the two columns. Reuses
+    _news_impact_cards_html for each card, so badges, chips and the scan
+    cross-check are identical to the single-feed view."""
+    from utils.news_card import split_by_sentiment
+
+    pos, neg, other = split_by_sentiment(items)
+
+    def _col(cls: str, label: str, col_items: list[dict]) -> str:
+        body = (_news_impact_cards_html(col_items, scan_df) if col_items
+                else f'<div class="nf-empty">No {label.lower()} headlines right now.</div>')
+        return (f'<div class="nf-col"><div class="nf-col-h {cls}">{label} · {len(col_items)}</div>'
+                f'{body}</div>')
+
+    html = ('<div class="nf-split">'
+            + _col("nf-pos", "Positive", pos)
+            + _col("nf-neg", "Negative", neg)
+            + '</div>')
+    if other:
+        html += (f'<details class="nf-other"><summary>Neutral / unclassified · {len(other)}</summary>'
+                 f'{_news_impact_cards_html(other, scan_df)}</details>')
+    return html
+
+
 def _news_impact_compact_rows_html(items: list[dict]) -> str:
     """Compact TIME / STOCK / IMPACT / EVENT row — matches the reference
     sidebar's News Impact Alerts design. Recommendation/Current State/
@@ -3185,12 +3229,18 @@ def _news_impact_panel():
     # 2026-09-09: summary strip (bullish/bearish/neutral counts + top
     # sectors) added above the table -- a one-glance read of "is the tape
     # net bullish or bearish right now" before scanning individual rows.
+    # [2026-10-23, SG request] Layout switch: Positive | Negative columns
+    # (default) or the original single newest-first feed.
+    _view = st.radio("News layout", ["Positive | Negative", "Single feed"],
+                     horizontal=True, key="news_impact_view", label_visibility="collapsed")
+    _shown = items[:_CLASSIFY_CAP]
+    _body = (_news_impact_split_html(_shown, scan_df) if _view == "Positive | Negative"
+             else _news_impact_cards_html(_shown, scan_df))
     st.markdown(
         '<div class="ni-title" style="margin-bottom:6px;">'
         'Detailed news impact (Confidence · Recommendation · Current State)</div>'
-        f'{_news_summary_strip_html(items[:_CLASSIFY_CAP])}'
-        f'<div class="ni-panel nf-panel">'
-        f'{_news_impact_cards_html(items[:_CLASSIFY_CAP], scan_df)}</div>',
+        f'{_news_summary_strip_html(_shown)}'
+        f'<div class="ni-panel nf-panel">{_body}</div>',
         unsafe_allow_html=True,
     )
     if hidden_items:
