@@ -238,77 +238,81 @@ def _resolve_instrument_key(trading_symbol: str) -> str | None:
     return matches.iloc[0]["instrument_key"]
 
 
-with st.expander("🔌 Upstox Pilot Check (token sanity test)", expanded=False):
-    stock_name = st.text_input(
-        "Stock name (NSE trading symbol)",
-        value="RELIANCE",
-        help="e.g. RELIANCE, TCS, INFY, HDFCBANK — change this to test a different stock.",
-    )
-    if st.button("Test Upstox Connection"):
-        token = _get_upstox_token()
-        if not token:
-            st.error(
-                "No UPSTOX_ACCESS_TOKEN found. Add it to .streamlit/secrets.toml "
-                "as UPSTOX_ACCESS_TOKEN = \"...\" or to a local .env file, then rerun."
-            )
-        else:
-            # Masked debug info — never prints the real token, just enough
-            # to catch a truncated/corrupted paste. A genuine Upstox JWT
-            # access token is typically 300+ chars.
-            st.caption(f"Loaded token: {len(token)} chars, ends in ...{token[-6:]}")
-            if len(token) < 200:
-                st.warning(
-                    "This looks shorter than a normal Upstox access token — "
-                    "it may have gotten truncated when pasted into secrets.toml/.env."
+def _render_diagnostic_expanders():
+    """Temporary tooling (Upstox token check, RAM snapshot). Defined here but
+    called AFTER the page renders (see bottom of file) so it no longer sits
+    above every page, including the Dashboard's first screen."""
+    with st.expander("🔌 Upstox Pilot Check (token sanity test)", expanded=False):
+        stock_name = st.text_input(
+            "Stock name (NSE trading symbol)",
+            value="RELIANCE",
+            help="e.g. RELIANCE, TCS, INFY, HDFCBANK — change this to test a different stock.",
+        )
+        if st.button("Test Upstox Connection"):
+            token = _get_upstox_token()
+            if not token:
+                st.error(
+                    "No UPSTOX_ACCESS_TOKEN found. Add it to .streamlit/secrets.toml "
+                    "as UPSTOX_ACCESS_TOKEN = \"...\" or to a local .env file, then rerun."
                 )
-            headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
-
-            # Step 1 — confirm the token itself is valid
-            profile_resp = requests.get("https://api.upstox.com/v2/user/profile", headers=headers, timeout=10)
-            if profile_resp.status_code != 200:
-                st.error(f"Token check failed ({profile_resp.status_code}): {profile_resp.text}")
             else:
-                profile = profile_resp.json().get("data", {})
-                st.success(f"Token valid — logged in as {profile.get('user_name', 'unknown')} ({profile.get('broker', 'UPSTOX')})")
-
-                # Step 2 — resolve the stock name to an instrument_key, then fetch LTP
-                with st.spinner(f"Resolving {stock_name} and fetching LTP..."):
-                    instrument_key = _resolve_instrument_key(stock_name)
-                if not instrument_key:
-                    st.warning(f"Could not find '{stock_name}' in the NSE instrument master. Check the spelling.")
-                else:
-                    ltp_resp = requests.get(
-                        "https://api.upstox.com/v3/market-quote/ltp",
-                        headers=headers,
-                        params={"instrument_key": instrument_key},
-                        timeout=10,
+                # Masked debug info — never prints the real token, just enough
+                # to catch a truncated/corrupted paste. A genuine Upstox JWT
+                # access token is typically 300+ chars.
+                st.caption(f"Loaded token: {len(token)} chars, ends in ...{token[-6:]}")
+                if len(token) < 200:
+                    st.warning(
+                        "This looks shorter than a normal Upstox access token — "
+                        "it may have gotten truncated when pasted into secrets.toml/.env."
                     )
-                    if ltp_resp.status_code != 200:
-                        st.error(f"LTP fetch failed ({ltp_resp.status_code}): {ltp_resp.text}")
+                headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+
+                # Step 1 — confirm the token itself is valid
+                profile_resp = requests.get("https://api.upstox.com/v2/user/profile", headers=headers, timeout=10)
+                if profile_resp.status_code != 200:
+                    st.error(f"Token check failed ({profile_resp.status_code}): {profile_resp.text}")
+                else:
+                    profile = profile_resp.json().get("data", {})
+                    st.success(f"Token valid — logged in as {profile.get('user_name', 'unknown')} ({profile.get('broker', 'UPSTOX')})")
+
+                    # Step 2 — resolve the stock name to an instrument_key, then fetch LTP
+                    with st.spinner(f"Resolving {stock_name} and fetching LTP..."):
+                        instrument_key = _resolve_instrument_key(stock_name)
+                    if not instrument_key:
+                        st.warning(f"Could not find '{stock_name}' in the NSE instrument master. Check the spelling.")
                     else:
-                        data = ltp_resp.json().get("data", {})
-                        if data:
-                            quote = next(iter(data.values()))
-                            st.metric(f"{stock_name} LTP", f"₹{quote.get('last_price')}")
-                            st.caption(f"instrument_key: {instrument_key}")
+                        ltp_resp = requests.get(
+                            "https://api.upstox.com/v3/market-quote/ltp",
+                            headers=headers,
+                            params={"instrument_key": instrument_key},
+                            timeout=10,
+                        )
+                        if ltp_resp.status_code != 200:
+                            st.error(f"LTP fetch failed ({ltp_resp.status_code}): {ltp_resp.text}")
                         else:
-                            st.warning("Empty response — market may be closed or instrument_key is stale.")
+                            data = ltp_resp.json().get("data", {})
+                            if data:
+                                quote = next(iter(data.values()))
+                                st.metric(f"{stock_name} LTP", f"₹{quote.get('last_price')}")
+                                st.caption(f"instrument_key: {instrument_key}")
+                            else:
+                                st.warning("Empty response — market may be closed or instrument_key is stale.")
 
-with st.expander("🔬 Memory Diagnostics (temporary — RAM investigation)", expanded=False):
-    if st.button("🔬 Capture Memory Snapshot"):
-        import gc
-        import psutil
-        from utils.memory_profiler import run_memory_profile
-        from utils.native_memory_probe import full_report
+    with st.expander("🔬 Memory Diagnostics (temporary — RAM investigation)", expanded=False):
+        if st.button("🔬 Capture Memory Snapshot"):
+            import gc
+            import psutil
+            from utils.memory_profiler import run_memory_profile
+            from utils.native_memory_probe import full_report
 
-        gc.collect()
-        profile_report = run_memory_profile()
-        native_report = full_report()
-        rss_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+            gc.collect()
+            profile_report = run_memory_profile()
+            native_report = full_report()
+            rss_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
 
-        st.success(f"Memory snapshot captured. Current RSS: {rss_mb:.1f} MB")
-        st.caption("Full detail also written to the app logs (see `memory_profiler` / `native_memory_probe` loggers).")
-        st.json({"process_profile": profile_report, "native_probe": native_report})
+            st.success(f"Memory snapshot captured. Current RSS: {rss_mb:.1f} MB")
+            st.caption("Full detail also written to the app logs (see `memory_profiler` / `native_memory_probe` loggers).")
+            st.json({"process_profile": profile_report, "native_probe": native_report})
 
 from pages.dashboard     import render as render_dashboard
 from pages.sectors       import render as render_sectors
@@ -461,6 +465,9 @@ pg = st.navigation(
     position="top",   # matches the original inline-controls look (sidebar stays collapsed)
 )
 pg.run()
+
+# [2026-10-23, SG request] Diagnostic expanders live at the bottom of the page.
+_render_diagnostic_expanders()
 
 # See the "2026-07-29 bugfix" comment near the top of this file for why
 # this moved here from pages/dashboard.py.

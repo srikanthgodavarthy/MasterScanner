@@ -3542,6 +3542,41 @@ def render(settings: dict | None = None):
     #    "Full Sector Rotation Analysis" section further down. ──────────
     _market_intelligence_fragment()
 
+    # [2026-10-23, SG request — layout] "Act now" first: Run Scan, Active Setups
+    # and the DORE Options Engine (all rendered by pages.scanner.render) now sit
+    # directly under the Market Overview strip, above the index cards / Top
+    # Gainers row and the news panel. Pure reorder — nothing here reads state
+    # that the index/gainers row sets, and vice versa.
+    # [2026-09-09, SG request — "move the scanner page content to
+    # dashboard itself"] The standalone Scanner page (pages/scanner.py,
+    # nav title "Live Scanner") is removed from app.py's navigation
+    # entirely — its full render() (Run Scan controls, DB auto-load,
+    # the Active Setups table, and the DORE Options Engine panel) now
+    # runs HERE instead, replacing the two compact summary cards this
+    # used to show (ACTIVE SETUPS (0 DAYS) and ACTIVE OPTIONS PLANS —
+    # both now redundant: the real, full-detail versions of both are
+    # right below, not a cut-down snapshot of them).
+    #
+    # pages.scanner.render() manages its OWN session_state keys
+    # ("scan_df", "scan_time", "scan_df_version", "scan_loaded_from_db")
+    # and its own widget keys ("btn_run_scan", "chk_save_db",
+    # "sb_clear_cache", "detail_{sc_key}", etc.) — none of which
+    # collide with anything already used elsewhere in this file
+    # (confirmed via direct grep before this change), so this is a
+    # drop-in call, not a reimplementation. It also injects its own
+    # <style> block (_CSS) on every call — harmless if it overlaps any
+    # class name Dashboard's own CSS already defines (last one wins,
+    # same rule either way), not worth a special-case guard for.
+    #
+    # Scanner's df_aug (Yahoo Finance-sourced, its own "scan_df"
+    # session_state key) is completely separate from Dashboard's own
+    # df_aug above (Upstox-sourced, "dash_scan_df") — this call loads
+    # and renders Scanner's data independently; it does NOT reuse or
+    # depend on the `df_aug` variable already in scope in this
+    # function.
+    from pages.scanner import render as render_scanner_page
+    render_scanner_page(settings)
+
     # [Restored, 2026-09-08 — SG correction: "moved DORE off, not index
     # visibility off"] The NIFTY/SENSEX/BANKNIFTY index-card row is back
     # in its narrow left column, NSE Top Gainers to its right — same
@@ -3573,35 +3608,6 @@ def render(settings: dict | None = None):
             st.page_link(_sectors_page, label="View full Sector Rotation Analysis →", icon="🧭")
 
 
-    # [2026-09-09, SG request — "move the scanner page content to
-    # dashboard itself"] The standalone Scanner page (pages/scanner.py,
-    # nav title "Live Scanner") is removed from app.py's navigation
-    # entirely — its full render() (Run Scan controls, DB auto-load,
-    # the Active Setups table, and the DORE Options Engine panel) now
-    # runs HERE instead, replacing the two compact summary cards this
-    # used to show (ACTIVE SETUPS (0 DAYS) and ACTIVE OPTIONS PLANS —
-    # both now redundant: the real, full-detail versions of both are
-    # right below, not a cut-down snapshot of them).
-    #
-    # pages.scanner.render() manages its OWN session_state keys
-    # ("scan_df", "scan_time", "scan_df_version", "scan_loaded_from_db")
-    # and its own widget keys ("btn_run_scan", "chk_save_db",
-    # "sb_clear_cache", "detail_{sc_key}", etc.) — none of which
-    # collide with anything already used elsewhere in this file
-    # (confirmed via direct grep before this change), so this is a
-    # drop-in call, not a reimplementation. It also injects its own
-    # <style> block (_CSS) on every call — harmless if it overlaps any
-    # class name Dashboard's own CSS already defines (last one wins,
-    # same rule either way), not worth a special-case guard for.
-    #
-    # Scanner's df_aug (Yahoo Finance-sourced, its own "scan_df"
-    # session_state key) is completely separate from Dashboard's own
-    # df_aug above (Upstox-sourced, "dash_scan_df") — this call loads
-    # and renders Scanner's data independently; it does NOT reuse or
-    # depend on the `df_aug` variable already in scope in this
-    # function.
-    from pages.scanner import render as render_scanner_page
-    render_scanner_page(settings)
 
     # ── News. ────────────────────────────────────────────────────────
     # 2026-07-28: Top Gainers moved up next to the index cards (see
