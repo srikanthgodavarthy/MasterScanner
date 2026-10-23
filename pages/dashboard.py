@@ -1033,10 +1033,11 @@ _CSS = """
    separate expander was dropped as a duplicate of the VIX/Trend
    Strength cards, see _market_overview_panel's docstring). */
 .mo-health-row-6 { grid-template-columns: 1.3fr 0.9fr 0.9fr 0.7fr 0.9fr 0.9fr; }
-.mo-health-row-7 { grid-template-columns: 1.3fr 0.9fr 0.9fr 0.7fr 0.9fr 0.9fr 1.7fr; }
+.mo-health-row-7 { grid-template-columns: 1.5fr .8fr .9fr .9fr .75fr .75fr 1.5fr; }
+.mo-health-row-7 > * { min-width: 0; }
 @media (max-width: 1300px) { .mo-health-row { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 1300px) { .mo-health-row-6, .mo-health-row-7 { grid-template-columns: repeat(3, 1fr); } }
-@media (max-width: 900px)  { .mo-health-row-6, .mo-health-row-7 { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 1300px) { .mo-health-row-6, .mo-health-row-7 { grid-template-columns: repeat(3, 1fr) !important; } }
+@media (max-width: 900px)  { .mo-health-row-6, .mo-health-row-7 { grid-template-columns: repeat(2, 1fr) !important; } }
 @media (max-width: 700px)  { .mo-health-row { grid-template-columns: 1fr; } }
 .mo-flow-card { display: flex; flex-direction: column; }
 .mo-flow-cols { display: flex; gap: 14px; flex: 1; }
@@ -2240,10 +2241,21 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
 </div>"""
 
     # ── Standalone VIX card ──────────────────────────────────────────
+    # Today's change vs previous close. A rising VIX is bad for longs, so up = red.
+    vix_chg = summary.get("vix_chg_pct")
+    if vix_chg is None:
+        vix_chg_html = ""
+    else:
+        _vc = "#f85149" if vix_chg > 0 else "#3fb950" if vix_chg < 0 else "#8b949e"
+        _va = "▲" if vix_chg > 0 else "▼" if vix_chg < 0 else "•"
+        _vp = summary.get("vix_prev")
+        _vt = f"Previous close {_vp:.2f}" if _vp else "Change vs previous close"
+        vix_chg_html = (f' <span title="{_vt}" style="font-size:12px;font-weight:600;color:{_vc}">'
+                        f'{_va} {vix_chg:+.2f}%</span>')
     vix_card = f"""
 <div class="mo-health-card">
   <div class="mo-health-label">VIX</div>
-  <div class="mo-health-value" style="color:{vix_color}">{vix:.1f}</div>
+  <div class="mo-health-value" style="color:{vix_color}">{vix:.1f}{vix_chg_html}</div>
   <div class="mo-mini-label" style="margin-top:2px;color:{vix_color};">{vix_label} · {"BEAR" if vix >= 18 else "BULL"}</div>
 </div>"""
 
@@ -2265,14 +2277,18 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
     scan_chip = f'<span class="mo-scan-chip">Last scan: <b>{scan_time} IST</b></span>' if scan_time else ""
 
     row_cls = "mo-health-row-6"
+    row_style = ""
     if flow:
         health_html += _market_flow_card_html(flow)
         row_cls = "mo-health-row-7"
+        # Inline so the seven tracks always win over any stylesheet rule and the
+        # row stays on ONE line (the flow card used to wrap onto a second row).
+        row_style = ' style="grid-template-columns:1.5fr .8fr .9fr .9fr .75fr .75fr 1.5fr"'
 
     return f"""
 <div class="mo-panel">
   <div class="mo-title">MARKET OVERVIEW ⓘ {scan_chip}</div>
-  <div class="mo-health-row {row_cls}">{health_html}</div>
+  <div class="mo-health-row {row_cls}"{row_style}>{health_html}</div>
 </div>
 """
 

@@ -549,16 +549,46 @@ def classify_regime(
     return "RANGE", vix_val, adx_val, nifty_a50, nifty_a200, ema50_val, ema200_val
 
 
-def fetch_india_vix() -> float:
-    """Fetch live India VIX from yfinance (^INDIAVIX). Returns 16.0 on failure."""
+_VIX_CACHE: dict = {"ts": 0.0, "val": None}
+_VIX_CACHE_TTL_S = 60
+
+
+def _india_vix_closes() -> "tuple[float, Optional[float]] | None":
+    """(latest close, previous close) of ^INDIAVIX, or None on failure.
+    Cached for 60s so fetch_india_vix() and fetch_india_vix_change() share one
+    yfinance call per refresh cycle. During the session the latest row is
+    today's live value and the one before it is yesterday's close."""
+    import time
+    now = time.time()
+    if _VIX_CACHE["val"] is not None and now - _VIX_CACHE["ts"] < _VIX_CACHE_TTL_S:
+        return _VIX_CACHE["val"]
     try:
         import yfinance as yf
         df = yf.Ticker("^INDIAVIX").history(period="5d", auto_adjust=True)
-        if not df.empty:
-            return float(df["Close"].dropna().iloc[-1])
+        closes = df["Close"].dropna() if not df.empty else None
+        if closes is not None and len(closes):
+            val = (float(closes.iloc[-1]),
+                   float(closes.iloc[-2]) if len(closes) >= 2 else None)
+            _VIX_CACHE.update(ts=now, val=val)
+            return val
     except Exception:
         pass
-    return 16.0
+    return None
+
+
+def fetch_india_vix() -> float:
+    """Fetch live India VIX from yfinance (^INDIAVIX). Returns 16.0 on failure."""
+    res = _india_vix_closes()
+    return res[0] if res else 16.0
+
+
+def fetch_india_vix_change() -> "tuple[float, float] | None":
+    """(previous close, % change today) for India VIX, or None if unavailable."""
+    res = _india_vix_closes()
+    if not res or not res[1]:
+        return None
+    last, prev = res
+    return prev, (last - prev) / prev * 100.0
 
 
 # ══════════════════════════════════════════════════════════════════

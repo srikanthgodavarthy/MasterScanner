@@ -246,6 +246,16 @@ def compute_market_intelligence(df_aug: Optional[pd.DataFrame] = None,
         logger.exception("Market intelligence regime computation failed (non-fatal)")
         summary = {}
 
+    # [2026-10-23] India VIX day-over-day change for the Market Overview VIX card.
+    try:
+        from utils.regime_engine import fetch_india_vix_change
+        _chg = fetch_india_vix_change()
+        if _chg is not None and summary is not None:
+            summary["vix_prev"] = round(_chg[0], 2)
+            summary["vix_chg_pct"] = round(_chg[1], 2)
+    except Exception:
+        logger.exception("VIX change lookup failed (non-fatal)")
+
     breadth = compute_breadth_stats(df_aug)
 
     index_cards = []
