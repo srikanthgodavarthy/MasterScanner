@@ -260,6 +260,15 @@ def _build_pattern_table() -> list[tuple[re.Pattern, str]]:
 
 _PATTERN_TABLE = _build_pattern_table()
 
+# "MCX gold", "MCX silver", "MCX crude" name the commodity venue, not the
+# exchange operator (MCX the stock). Skip the MCX symbol in that context.
+_MCX_COMMODITY_CONTEXT = re.compile(
+    r"\bMCX\s+(?:gold|silver|crude|copper|zinc|lead|nickel|aluminium|aluminum|"
+    r"natural\s+gas|futures|commodity|commodities|price|prices|rate|rates)\b"
+    r"|\b(?:gold|silver|crude|copper|futures)\b.{0,15}\bon\s+MCX\b",
+    re.IGNORECASE,
+)
+
 
 def match_symbols(text: str) -> list[str]:
     """
@@ -277,6 +286,8 @@ def match_symbols(text: str) -> list[str]:
         if symbol in seen:
             continue
         if pattern.search(text):
+            if symbol == "MCX" and _MCX_COMMODITY_CONTEXT.search(text):
+                continue
             hits.append(symbol)
             seen.add(symbol)
     return hits

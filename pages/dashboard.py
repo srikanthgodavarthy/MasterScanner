@@ -3152,6 +3152,19 @@ def _news_impact_panel():
             pool, tag_news, cap=_CLASSIFY_CAP, min_shown=_MIN_SHOWN, max_rounds=_MAX_ROUNDS)
         hidden_items = hidden_items + _llm_hidden
 
+    # [2026-10-23] Say why a source is missing instead of silently omitting it.
+    try:
+        from utils.news_feed import FEED_STATUS
+        _bad = {k: v for k, v in FEED_STATUS.items() if not v["ok"] or v["kept"] == 0}
+        if _bad:
+            with st.expander(f"News sources: {len(_bad)} of {len(FEED_STATUS)} returned nothing fresh"):
+                for _src, _v in _bad.items():
+                    _why = _v["error"] or (f"{_v['fetched']} items, all older than 48h"
+                                           + (f" (newest {_v['newest']:%d %b %H:%M} UTC)" if _v["newest"] else ""))
+                    st.caption(f"**{_src}** — {_why}")
+    except Exception:
+        pass
+
     if not items:
         if hidden_items:
             st.caption(f"No new headlines right now — {len(hidden_items)} recap headlines hidden.")

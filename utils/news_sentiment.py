@@ -362,7 +362,14 @@ def enrich_symbols(items: list[dict]) -> list[dict]:
     even though only ~10 are ever shown)."""
     enriched = []
     for item in items:
-        symbols = match_symbols(f"{item['title']} {item.get('summary', '')}")
+        # [2026-10-23] Match the HEADLINE ONLY. The RSS summary was being
+        # scanned too, and ET/Moneycontrol summaries routinely name other
+        # stocks in passing (roundups, "also read", index movers, MCX
+        # commodity quotes), so a Kaynes story got tagged BAJFINANCE, a
+        # Swiggy F&O story SIEMENS, a gold/silver story MCX. The headline
+        # is what the card shows, so the chips must be about it. A headline
+        # naming no mapped company is correctly market-wide / untagged.
+        symbols = match_symbols(str(item.get("title") or ""))
         sector = get_sector(symbols[0]) if symbols else None
         enriched.append({**item, "symbols": symbols, "sector": sector})
     return enriched
