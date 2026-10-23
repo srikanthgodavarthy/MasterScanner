@@ -1033,9 +1033,10 @@ _CSS = """
    separate expander was dropped as a duplicate of the VIX/Trend
    Strength cards, see _market_overview_panel's docstring). */
 .mo-health-row-6 { grid-template-columns: 1.3fr 0.9fr 0.9fr 0.7fr 0.9fr 0.9fr; }
+.mo-health-row-7 { grid-template-columns: 1.3fr 0.9fr 0.9fr 0.7fr 0.9fr 0.9fr 1.7fr; }
 @media (max-width: 1300px) { .mo-health-row { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 1300px) { .mo-health-row-6 { grid-template-columns: repeat(3, 1fr); } }
-@media (max-width: 900px)  { .mo-health-row-6 { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 1300px) { .mo-health-row-6, .mo-health-row-7 { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 900px)  { .mo-health-row-6, .mo-health-row-7 { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 700px)  { .mo-health-row { grid-template-columns: 1fr; } }
 .mo-flow-card { display: flex; flex-direction: column; }
 .mo-flow-cols { display: flex; gap: 14px; flex: 1; }
@@ -2117,7 +2118,45 @@ def _market_health_extra_cards_html(summary: dict, breadth: dict) -> str:
     return hilo_card + ema_card
 
 
-def _market_overview_panel(summary: dict, breadth: dict, scan_time: str) -> str:
+def _market_flow_card_html(flow: dict, rows: int = 2) -> str:
+    """Today's Sector Flow as the last card of the Market Overview row.
+    Inflow lists only sectors with a positive net flow and outflow only
+    negative ones -- the old standalone card padded its outflow column with
+    positive values (e.g. Textiles "43 Cr" in red) when fewer than `rows`
+    sectors were actually negative."""
+    from html import escape
+    inflow = [(n, v) for n, v in flow.get("inflow", []) if (v or 0) > 0][:rows]
+    outflow = [(n, v) for n, v in flow.get("outflow", []) if (v or 0) < 0][:rows]
+
+    def _rows(items, arrow, color, sign):
+        out = "".join(
+            f'<div class="mo-flow-row"><span title="{escape(str(n))}">{arrow} {escape(str(n))}</span>'
+            f'<span style="color:{color}">{sign}{v:.0f} Cr</span></div>'
+            for n, v in items
+        )
+        return out + '<div class="mo-flow-row">&nbsp;</div>' * (rows - len(items))
+
+    net = flow.get("net", 0) or 0
+    net_color = "#3fb950" if net >= 0 else "#f85149"
+    return f"""
+<div class="mo-health-card mo-flow-card">
+  <div class="mo-health-label">SECTOR FLOW <span style="font-weight:400;opacity:.7">(net, today)</span></div>
+  <div class="mo-flow-cols">
+    <div class="mo-flow-col">
+      <div class="mo-flow-col-title" style="color:#3fb950">INFLOW</div>
+      {_rows(inflow, "↑", "#3fb950", "+")}
+    </div>
+    <div class="mo-flow-col">
+      <div class="mo-flow-col-title" style="color:#f85149">OUTFLOW</div>
+      {_rows(outflow, "↓", "#f85149", "")}
+    </div>
+  </div>
+  <div class="mo-flow-net">Net: <b style="color:{net_color}">{'+' if net >= 0 else ''}{net:.0f} Cr</b></div>
+</div>"""
+
+
+def _market_overview_panel(summary: dict, breadth: dict, scan_time: str,
+                           flow: dict | None = None) -> str:
     """
     Full-width single row: Regime / Trend Strength / Market Breadth /
     VIX / 52W Hi-Lo / EMA breadth. Index cards (NIFTY 50, SENSEX, BANK
@@ -2225,10 +2264,15 @@ def _market_overview_panel(summary: dict, breadth: dict, scan_time: str) -> str:
 
     scan_chip = f'<span class="mo-scan-chip">Last scan: <b>{scan_time} IST</b></span>' if scan_time else ""
 
+    row_cls = "mo-health-row-6"
+    if flow:
+        health_html += _market_flow_card_html(flow)
+        row_cls = "mo-health-row-7"
+
     return f"""
 <div class="mo-panel">
   <div class="mo-title">MARKET OVERVIEW ⓘ {scan_chip}</div>
-  <div class="mo-health-row mo-health-row-6">{health_html}</div>
+  <div class="mo-health-row {row_cls}">{health_html}</div>
 </div>
 """
 
@@ -2593,7 +2637,9 @@ def _market_intelligence_fragment():
     # or Today's Sector Flow (removed — see _market_overview_panel's
     # docstring), so this fragment no longer needs df_aug/sector data at
     # all, just the summary/breadth snapshot payload.
-    st.markdown(_market_overview_panel(summary, breadth, scan_time), unsafe_allow_html=True)
+    st.markdown(_market_overview_panel(summary, breadth, scan_time,
+                                       flow=st.session_state.get("dash_sector_flow")),
+                unsafe_allow_html=True)
 
 # ── NEWS IMPACT — ET + Moneycontrol headlines, free-LLM sentiment tag ──
 # ── NEWS IMPACT — ET + Moneycontrol headlines, free-LLM sentiment tag ──
@@ -3360,34 +3406,10 @@ def render(settings: dict | None = None):
     # First load of the session (or a manual click) is synchronous;
     # _dash_scan_autorefresh() above then keeps it current in the
     # background without the user needing to click Refresh.
-    ctrl1, ctrl2, ctrl3 = st.columns([1, 1, 4])
-    with ctrl1:
-        _refresh = st.button("🔄 Refresh", key="btn_dash_refresh",
-                              help="Reload the latest completed scan from Supabase")
-    with ctrl2:
-        # [2026-08-17] Small diagnostics trigger for check_data_readiness.py
-        # (repo root) — runs it in-process (redirecting its print() output
-        # into an expander) instead of asking anyone to shell in and run
-        # `python check_data_readiness.py` by hand.
-        if st.button("🩺 Data Readiness", key="btn_data_readiness",
-                      help="Run check_data_readiness.py — outcome_checkpoints / "
-                           "entry-snapshot row counts and readiness verdict"):
-            import io
-            import contextlib
-            import check_data_readiness
-            _out = io.StringIO()
-            try:
-                with contextlib.redirect_stdout(_out):
-                    check_data_readiness.main()
-            except SystemExit:
-                pass  # main() calls sys.exit(1) on a hard failure — output up to that point is still useful
-            except Exception as e:
-                _out.write(f"\nDiagnostic failed: {e}")
-            st.session_state["data_readiness_output"] = _out.getvalue()
-
-    if st.session_state.get("data_readiness_output"):
-        with st.expander("🩺 Data Readiness Diagnostics", expanded=True):
-            st.code(st.session_state["data_readiness_output"], language="text")
+    # [2026-10-23, SG request] Refresh and Data Readiness buttons removed.
+    # _dash_scan_autorefresh() below already polls for new completed scans, so
+    # the first-load branch is the only synchronous load that remains.
+    _refresh = False
     if _refresh or "dash_scan_df" not in st.session_state:
         from utils.snapshot_cache import get_snapshot, get_snapshot_df
         _full = get_snapshot("live_scanner")
@@ -3450,29 +3472,28 @@ def render(settings: dict | None = None):
             icon="🕒",
         )
 
-    with ctrl2:
-        if run_at:
-            _stale_badge = ""
-            if scan_age_mins is not None and scan_age_mins >= _LIVE_SCANNER_STALE_WARN_MINS:
-                _age_txt = f"{scan_age_mins / 60:.1f}h" if scan_age_mins >= 90 else f"{scan_age_mins:.0f}m"
-                _stale_badge = (
-                    f" &nbsp;·&nbsp; <span style='color:#d29922;font-weight:600;' "
-                    f"title='Live Scanner has not produced a newer completed scan in "
-                    f"over {_LIVE_SCANNER_STALE_WARN_MINS} minutes'>🕒 {_age_txt} old</span>"
-                )
-            st.markdown(
-                f"<div style='padding:0.55rem 0;color:#8b949e;font-size:0.78rem;'>"
-                f"Showing latest completed scan · <b style='color:var(--text)'>{len(df_aug)}</b> symbols"
-                f" &nbsp;·&nbsp; {scan_time} IST &nbsp;·&nbsp; Source: <b style='color:var(--text)'>Scanner (Yahoo Finance)</b>"
-                f"{_stale_badge}</div>",
-                unsafe_allow_html=True,
+    if run_at:
+        _stale_badge = ""
+        if scan_age_mins is not None and scan_age_mins >= _LIVE_SCANNER_STALE_WARN_MINS:
+            _age_txt = f"{scan_age_mins / 60:.1f}h" if scan_age_mins >= 90 else f"{scan_age_mins:.0f}m"
+            _stale_badge = (
+                f" &nbsp;·&nbsp; <span style='color:#d29922;font-weight:600;' "
+                f"title='Live Scanner has not produced a newer completed scan in "
+                f"over {_LIVE_SCANNER_STALE_WARN_MINS} minutes'>🕒 {_age_txt} old</span>"
             )
-        else:
-            st.markdown(
-                "<div style='padding:0.55rem 0;color:#8b949e;font-size:0.78rem;'>"
-                "No completed scan found yet — run one on the Scanner page.</div>",
-                unsafe_allow_html=True,
-            )
+        st.markdown(
+            f"<div style='padding:0.2rem 0 0.4rem;color:#8b949e;font-size:0.78rem;'>"
+            f"Showing latest completed scan · <b style='color:var(--text)'>{len(df_aug)}</b> symbols"
+            f" &nbsp;·&nbsp; {scan_time} IST &nbsp;·&nbsp; Source: <b style='color:var(--text)'>Scanner (Yahoo Finance)</b>"
+            f"{_stale_badge}</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            "<div style='padding:0.2rem 0 0.4rem;color:#8b949e;font-size:0.78rem;'>"
+            "No completed scan found yet — run one on the Scanner page.</div>",
+            unsafe_allow_html=True,
+        )
 
     # ── Background scanners ─────────────────────────────────────────────
     # [2026-07-29 bugfix] Used to be kicked off HERE, which meant the
@@ -3540,7 +3561,37 @@ def render(settings: dict | None = None):
     #    Upstox, on its own refresh timer, independent of everything
     #    below. Sector-related content no longer lives here — see the
     #    "Full Sector Rotation Analysis" section further down. ──────────
+    # [2026-10-23] Sector flow is shown inside the Market Overview card, which is
+    # rendered by the self-refreshing fragment below -- hand it the flow through
+    # session_state (the fragment has no df_aug of its own).
+    from utils.sector_rotation import compute_sector_flow
+    st.session_state["dash_sector_flow"] = compute_sector_flow(sector_stats)
     _market_intelligence_fragment()
+
+    # [2026-10-23, SG request] Index cards (+ Top Gainers) directly below the
+    # Market Overview strip, above Run Scan / Active Setups / DORE.
+    # [Restored, 2026-09-08 — SG correction: "moved DORE off, not index
+    # visibility off"] The NIFTY/SENSEX/BANKNIFTY index-card row is back
+    # in its narrow left column, NSE Top Gainers to its right — same
+    # layout as before the 2026-09-08 removal. index_cards now comes from
+    # utils.market_intelligence's own 180s cadence directly (no separate
+    # "index_dore" job, no "dore" field — see that module's docstring);
+    # indices' DORE recommendation itself stays DORE-Options-tab-only.
+    # 2026-07-28: index cards were shrunk (smaller fonts/padding/
+    # sparkline, see .mo-index-card CSS) so NSE Top Gainers can sit to
+    # their right on the same row instead of its own row further down.
+    idx_col, gainers_col = st.columns([1.7, 1], gap="medium")
+    with idx_col:
+        st.markdown(_index_cards_html(st.session_state.get("dash_index_cards", [])),
+                    unsafe_allow_html=True)
+    with gainers_col:
+        st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
+
+    # [2026-10-23, SG request] Today's Sector Flow now lives inside the Market
+    # Overview card (far right); the full-analysis link sits under the row.
+    _sectors_page = settings.get("sectors_page")
+    if _sectors_page is not None:
+        st.page_link(_sectors_page, label="View full Sector Rotation Analysis →", icon="🧭")
 
     # [2026-10-23, SG request — layout] "Act now" first: Run Scan, Active Setups
     # and the DORE Options Engine (all rendered by pages.scanner.render) now sit
@@ -3576,38 +3627,6 @@ def render(settings: dict | None = None):
     # function.
     from pages.scanner import render as render_scanner_page
     render_scanner_page(settings)
-
-    # [Restored, 2026-09-08 — SG correction: "moved DORE off, not index
-    # visibility off"] The NIFTY/SENSEX/BANKNIFTY index-card row is back
-    # in its narrow left column, NSE Top Gainers to its right — same
-    # layout as before the 2026-09-08 removal. index_cards now comes from
-    # utils.market_intelligence's own 180s cadence directly (no separate
-    # "index_dore" job, no "dore" field — see that module's docstring);
-    # indices' DORE recommendation itself stays DORE-Options-tab-only.
-    # 2026-07-28: index cards were shrunk (smaller fonts/padding/
-    # sparkline, see .mo-index-card CSS) so NSE Top Gainers can sit to
-    # their right on the same row instead of its own row further down.
-    idx_col, gainers_col = st.columns([1.7, 1], gap="medium")
-    with idx_col:
-        st.markdown(_index_cards_html(st.session_state.get("dash_index_cards", [])),
-                    unsafe_allow_html=True)
-    with gainers_col:
-        st.markdown(_nse_top_gainers_html(df_aug), unsafe_allow_html=True)
-        # [2026-08-05] Today's Sector Flow moved up to sit directly below
-        # Top Gainers in this same narrow column, rendered at compact=True
-        # (smaller padding/fonts, see _today_sector_flow_compact_html) so
-        # it fits without pushing the column much taller. Previously this
-        # lived in its own full-width row further down next to Live
-        # Scanner Snapshot — see that row below, now Snapshot-only.
-        from utils.sector_rotation import compute_sector_flow
-        _flow = compute_sector_flow(sector_stats)
-        st.markdown(_today_sector_flow_compact_html(_flow, rows=2, compact=True),
-                    unsafe_allow_html=True)
-        _sectors_page = settings.get("sectors_page")
-        if _sectors_page is not None:
-            st.page_link(_sectors_page, label="View full Sector Rotation Analysis →", icon="🧭")
-
-
 
     # ── News. ────────────────────────────────────────────────────────
     # 2026-07-28: Top Gainers moved up next to the index cards (see

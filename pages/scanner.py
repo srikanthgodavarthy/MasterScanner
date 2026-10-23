@@ -1924,45 +1924,6 @@ def _promotion_signals_table(df: pd.DataFrame) -> str:
     )
 
 
-# ── SUMMARY CARDS ─────────────────────────────────────────────────
-
-def _summary_cards(df: pd.DataFrame) -> str:
-    def _avg(col):
-        if col in df.columns:
-            vals = pd.to_numeric(df[col], errors="coerce").dropna()
-            return int(round(vals.mean())) if len(vals) else 0
-        return 0
-
-    # [Scanner Refactor] CV1 is the single source of truth for setup quality —
-    # these headline cards used to average the legacy scoring formula
-    # (Legacy_Leadership/Legacy_Conviction/Legacy_EntryQuality, née
-    # DE_Leadership/DE_Conviction/DE_EntryQuality), which could paint a
-    # different quality picture than the CV1 + Promotion Engine numbers
-    # actually driving the Recommendation column below. Extension still
-    # comes from the Decision Engine since that's a distinct concern (has
-    # the move already run too far?) that CV1/Promotion don't measure.
-    cards = [
-        ("Leadership",    _avg("CV1_Leadership"),   False, "Market relative strength",   "Leadership"),
-        ("Conviction",    _avg("CV1_Conviction"),   False, "Likelihood to hit target",   "Conviction"),
-        ("Entry Quality", _avg("CV1_EntryQuality"), False, "Good entry right now?",      "Entry Quality"),
-        ("Extension",     _avg("Extension"),        True,  "Move already missed",        None),
-    ]
-    html = '<div class="card-grid">'
-    for title, val, invert, sub, tkey in cards:
-        threshold = _SCORE_THRESHOLDS.get(tkey) if tkey else None
-        color = _score_color(val, invert, threshold=threshold)
-        html += (
-            f'<div class="score-card">'
-            f'<div class="sc-title">{title}</div>'
-            f'<div class="sc-value" style="color:{color}">{val}</div>'
-            f'{_bar(val, color)}'
-            f'<div class="sc-sub">{sub}</div>'
-            f'</div>'
-        )
-    html += '</div>'
-    return html
-
-
 # ── BREADTH STATS (used by Market Intelligence + Leadership Rotation) ──
 
 _RENAME_MAP_FULL = {
@@ -5386,8 +5347,8 @@ def render_scan_results(df_aug: "pd.DataFrame", summary: dict | None = None,
     except Exception:
         _open_plans_preview = {}
 
-    if not active_df.empty:
-        st.markdown(_summary_cards(active_df), unsafe_allow_html=True)
+    # [2026-10-23, SG request] Leadership / Conviction / Entry Quality / Extension
+    # summary cards removed from the Dashboard (see git history for _summary_cards).
 
     st.markdown(
         f'<div class="section-label" style="border-left-color:#58a6ff;color:#58a6ff;">'
