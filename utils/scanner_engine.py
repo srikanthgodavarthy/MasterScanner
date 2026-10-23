@@ -1869,6 +1869,109 @@ def apply_smc_structural_gate(
     return capped_tier, decision
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Decision trail  [P1 review 2.1 / 2.3 — additive, diagnostic only]
+# ─────────────────────────────────────────────────────────────────────────────
+# Records, per row, what each tier-deciding stage did, with STABLE reason codes, so a
+# symbol that passes one layer and is capped by another is attributable in the data.
+# It READS values score_stock already computed; it changes no tier, score or action.
+#
+#   Decision_Trail        "CV4=Actionable;DE_GATE=OFF;NATURAL=EXECUTE;PROMOTION=NOT_APPLICABLE;
+#                          COMPOSE=Execute@NATURAL;SMC_GATE=DOWNGRADED:Watch;ACTION=CAPPED"
+#   Decision_Reason_Codes "|"-joined, ONLY non-pass outcomes (empty = nothing capped or blocked)
+DECISION_REASON_CODES = frozenset({
+    "CV4_BELOW_ACTIONABLE",
+    "DE_GATE_HARD_STOP", "DE_GATE_LIFECYCLE_AVOID", "DE_GATE_LIFECYCLE_EXTENDED",
+    "PROMO_NOT_PROMOTED",
+    "SMC_GATE_DOWNGRADED", "SMC_GATE_DISABLED_WOULD_DOWNGRADE",
+    "ACTION_CAPPED_BY_TIER",
+    "TIER_ASSEMBLY_ERROR", "DECISION_TRAIL_ERROR",
+})
+_DE_GATE_CODES = {
+    "hard_stop":          "DE_GATE_HARD_STOP",
+    "lifecycle=AVOID":    "DE_GATE_LIFECYCLE_AVOID",
+    "lifecycle=EXTENDED": "DE_GATE_LIFECYCLE_EXTENDED",
+}
+
+
+def build_decision_trail(
+    *,
+    cv4_base_tier: str,          # classify_tier_v4 result BEFORE the Decision-Engine gate edits it
+    de_gate_on: bool,            # ENABLE_STRUCTURAL_GATE
+    de_gate_reason: str,         # "", "hard_stop", "lifecycle=AVOID", "lifecycle=EXTENDED"
+    natural_class: str | None,   # cv1.signal_class (CV4 natural class)
+    base_rank: int, natural_rank: int, promo_rank: int,
+    promo_applicable: bool, promo_promoted: bool, promo_bypassed: bool, promo_tier: str | None,
+    pre_gate_tier: str,          # max(base, natural, promotion), before the SMC gate
+    final_tier: str,             # after the SMC gate (== Recommendation)
+    smc_gate_enabled: bool,
+    smc_gate_would_be_tier: str,  # what the SMC gate returned, even when disabled
+    action_raw: str, action_final: str,
+) -> dict:
+    """Pure function: stage results + stable reason codes. No side effects."""
+    actionable = RECOMMENDATION_RANK["Actionable"]
+    top = max(base_rank, natural_rank, promo_rank)
+    sources = [n for n, rk in (("BASE", base_rank), ("NATURAL", natural_rank), ("PROMOTION", promo_rank))
+               if rk == top and top > 0]
+    uplifted = bool(promo_promoted and promo_rank > max(base_rank, natural_rank))
+
+    stages, codes = [f"CV4={cv4_base_tier}"], []
+    if RECOMMENDATION_RANK.get(cv4_base_tier, 0) < actionable:
+        codes.append("CV4_BELOW_ACTIONABLE")
+
+    if not de_gate_on:
+        stages.append("DE_GATE=OFF")
+    elif de_gate_reason:
+        stages.append(f"DE_GATE=APPLIED:{de_gate_reason}")
+        if de_gate_reason in _DE_GATE_CODES:
+            codes.append(_DE_GATE_CODES[de_gate_reason])
+    else:
+        stages.append("DE_GATE=PASS")
+
+    stages.append(f"NATURAL={natural_class or 'NONE'}")
+
+    if not promo_applicable:
+        stages.append("PROMOTION=NOT_APPLICABLE")
+    elif uplifted:
+        stages.append(f"PROMOTION={'BYPASS_PROMOTED' if promo_bypassed else 'PROMOTED'}:{promo_tier}")
+    elif promo_promoted:
+        stages.append("PROMOTION=PROMOTED_NO_UPLIFT")
+    else:
+        stages.append("PROMOTION=NOT_PROMOTED")
+        codes.append("PROMO_NOT_PROMOTED")
+
+    stages.append(f"COMPOSE={pre_gate_tier}@{'+'.join(sources) or 'NONE'}")
+
+    would_downgrade = smc_gate_would_be_tier != pre_gate_tier
+    if smc_gate_enabled:
+        changed = final_tier != pre_gate_tier
+        stages.append(f"SMC_GATE=DOWNGRADED:{final_tier}" if changed else "SMC_GATE=UNCHANGED")
+        if changed:
+            codes.append("SMC_GATE_DOWNGRADED")
+    else:
+        changed = False
+        stages.append(f"SMC_GATE=DISABLED_WOULD_DOWNGRADE:{smc_gate_would_be_tier}" if would_downgrade
+                      else "SMC_GATE=DISABLED")
+        if would_downgrade:
+            codes.append("SMC_GATE_DISABLED_WOULD_DOWNGRADE")
+
+    capped = action_final != action_raw
+    stages.append("ACTION=CAPPED" if capped else "ACTION=UNCHANGED")
+    if capped:
+        codes.append("ACTION_CAPPED_BY_TIER")
+
+    return {
+        "Decision_Trail":        ";".join(stages),
+        "Decision_Reason_Codes": "|".join(codes),
+        "Tier_CV4_Raw":          cv4_base_tier,
+        "Pre_Gate_Tier":         pre_gate_tier,
+        "SMC_Gate_Enabled":      bool(smc_gate_enabled),
+        "SMC_Gate_Changed_Tier": bool(changed),
+        "SMC_Gate_Would_Be_Tier": smc_gate_would_be_tier,
+        "Final_Tier_Source":     "+".join(sources) or "NONE",
+    }
+
+
 def score_stock(
     df:       pd.DataFrame,
     nifty:    pd.Series,
@@ -2545,6 +2648,7 @@ def score_stock(
         # docstring: its defaults are NOT backtest-fit, unlike v3's, which
         # were decile-calibrated against the 1,732-trade validation set).
         base_tier = classify_tier_v4(cv1.leadership, cv1.conviction, cv1.entry_quality, thresholds=settings)
+        _base_tier_cv4 = base_tier          # [decision trail] CV4 tier before the Decision-Engine gate edits it
 
         # ── UNIVERSE-WIDE PROMO BYPASS [2026-07-29] ──
         # Evaluate timing signals on EVERY symbol, not just ones CV1 has
@@ -2818,8 +2922,26 @@ def score_stock(
 
         result["Action"] = gated_action
 
-    except Exception:
-        pass   # non-critical; Action column retains norm_score value
+        # ── Decision trail [P1 review 2.1/2.3] — additive, diagnostic, never affects tier/action ──
+        try:
+            result.update(build_decision_trail(
+                cv4_base_tier=_base_tier_cv4, de_gate_on=_structural_gate_on, de_gate_reason=_gate_reason,
+                natural_class=cv1.signal_class,
+                base_rank=base_rank, natural_rank=natural_rank, promo_rank=promo_rank,
+                promo_applicable=bool(promo.applicable), promo_promoted=bool(promo.promoted),
+                promo_bypassed=bool(promo.bypassed), promo_tier=promo.tier,
+                pre_gate_tier=_pre_structural_gate_tier, final_tier=final_tier,
+                smc_gate_enabled=_smc_gate_enabled, smc_gate_would_be_tier=_gated_tier,
+                action_raw=_action_raw, action_final=gated_action,
+            ))
+        except Exception:
+            result["Decision_Reason_Codes"] = "DECISION_TRAIL_ERROR"
+
+    except Exception as _tier_exc:
+        # Behaviour unchanged: non-critical, Action column retains norm_score value.
+        # [P1 review 2.1] The failure is no longer invisible: it is recorded on the row.
+        result["Decision_Reason_Codes"] = "TIER_ASSEMBLY_ERROR"
+        result["_tier_assembly_error"] = f"{type(_tier_exc).__name__}: {_tier_exc}"
 
     # ── Five Pillars Ranking Engine ───────────────────────────────
     # Standalone additive model (Structure/Acceptance/Leadership/Momentum/
