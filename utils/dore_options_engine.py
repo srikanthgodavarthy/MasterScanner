@@ -578,6 +578,31 @@ class DoreOptionsSettings:
     # against real outcomes.
     greeks_scenario_max_gamma_share: float = 0.25
 
+    # [2026-10-26] Unit self-check. Upstox's docs don't state vega's or
+    # theta's unit; DORE assumes vega per 1 IV POINT and theta per
+    # CALENDAR day (what the test reference uses). Each read is compared
+    # with a Black-Scholes (r=0) value from the same row's own IV/spot/
+    # strike/days. A ratio near 100 (vega) or near 365 (theta) means the
+    # feed is on a different scale and the read is rejected
+    # ("vega_unit"/"theta_unit") instead of silently mispricing the IV
+    # and decay terms. Wide band on purpose: it only has to separate
+    # x1 from x100, not validate Upstox's model. Needs >= this many
+    # calendar days to expiry (BS Greeks are noisy at expiry).
+    greeks_unit_check_min_dte: int = 2
+    greeks_unit_check_max_ratio: float = 25.0
+    # BS full-reprice cross-check: used in place of the Taylor estimate
+    # when that estimate is unreliable or the hold reaches this fraction
+    # of the days left to expiry.
+    greeks_bs_hold_dte_frac: float = 0.5
+    # Time basis of the feed's THETA. "calendar" = premium decay per
+    # calendar day (DORE's assumption); "trading" = per trading session
+    # (decay is then concentrated on sessions: ~365/252 = 1.45x larger,
+    # and weekends/holidays carry none). Upstox doesn't document it, so
+    # every plan records the MEASURED basis (theta_basis_measured, from a
+    # chain-wide median ratio to Black-Scholes) and a mismatch with this
+    # setting is logged and flagged -- it is never switched automatically.
+    greeks_theta_basis: str = "calendar"
+
     # ── Greeks reachability gate [2026-10-23, Phase 2 -- DEFAULT OFF] ──
     # The first Greek-driven DECISION, and deliberately the narrowest one:
     # a veto (never a score nudge) when the contract's own Greeks say the
@@ -1278,10 +1303,109 @@ def _required_move(delta_abs: float, gamma: float, need: float) -> float:
     return (-delta_abs + math.sqrt(delta_abs * delta_abs + 2.0 * gamma * need)) / gamma
 
 
+def _bs_price(spot: float, strike: float, years: float, vol: float, dir_: str) -> float:
+    """Black-Scholes (r=0) price. years<=0 -> intrinsic."""
+    if years <= 1e-9 or vol <= 0 or spot <= 0 or strike <= 0:
+        return _approx_intrinsic(strike, spot, dir_)
+    d1 = (math.log(spot / strike) + 0.5 * vol * vol * years) / (vol * math.sqrt(years))
+    d2 = d1 - vol * math.sqrt(years)
+    N = lambda x: 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+    if dir_ == CE:
+        return spot * N(d1) - strike * N(d2)
+    return strike * N(-d2) - spot * N(-d1)
+
+
+_TRADING_THETA_SCALE = 365.0 / 252.0
+
+
+def _theta_days(hold: float, basis: str) -> float:
+    """Days over which `theta` accrues in a hold of `hold` calendar days:
+    the hold itself for a per-calendar-day theta; the number of exchange
+    sessions in it for a per-trading-day theta (nse_calendar)."""
+    if basis == "trading":
+        from utils.nse_calendar import ist_today, trading_sessions_in_window
+        return float(trading_sessions_in_window(ist_today(), hold))
+    return float(hold)
+
+
+def greeks_unit_check(g: "GreeksQuote", dir_: str, spot: float, strike: float,
+                      calendar_dte: Optional[int], settings: "DoreOptionsSettings",
+                      years: Optional[float] = None) -> tuple:
+    """-> (reject_code_or_None, {"vega_ratio":..,"theta_ratio":..}).
+    Compares the feed's vega/theta with Black-Scholes from the same row
+    (see greeks_unit_check_* settings). Skips (None, {}) when it can't be
+    done soundly: no IV/spot/strike, too close to expiry, or a BS value
+    too small to divide by. Only a gross scale mismatch rejects."""
+    try:
+        T = years if years is not None else (calendar_dte / 365.0 if calendar_dte is not None else None)
+        if (T is None or T * 365.0 < settings.greeks_unit_check_min_dte
+                or not g.iv or g.iv <= 0 or spot <= 0 or strike <= 0):
+            return None, {}
+        vol = g.iv / 100.0
+        d1 = (math.log(spot / strike) + 0.5 * vol * vol * T) / (vol * math.sqrt(T))
+        bs_vega = spot * math.exp(-0.5 * d1 * d1) / math.sqrt(2 * math.pi) * math.sqrt(T) / 100.0
+        bs_theta = _bs_price(spot, strike, max(T - 1 / 365.0, 1e-9), vol, dir_) - _bs_price(spot, strike, T, vol, dir_)
+        out, why = {}, None
+        lim = float(settings.greeks_unit_check_max_ratio)
+        if bs_vega > 1e-6 and g.vega > 0:
+            r = g.vega / bs_vega
+            out["vega_ratio"] = round(r, 2)
+            if r >= lim or r <= 1.0 / lim:
+                why = "vega_unit"
+        if why is None and bs_theta < -1e-6 and g.theta < 0:
+            r = g.theta / bs_theta
+            if getattr(settings, "greeks_theta_basis", "calendar") == "trading":
+                r /= _TRADING_THETA_SCALE
+            out["theta_ratio"] = round(r, 2)
+            if r >= lim or r <= 1.0 / lim:
+                why = "theta_unit"
+        return why, out
+    except Exception:
+        return None, {}
+
+
+def greeks_theta_basis_probe(strike_premiums: dict, dir_: str, spot: float,
+                             years: Optional[float], settings: "DoreOptionsSettings") -> dict:
+    """Chain-wide measurement of the feed's theta time basis. Takes the
+    ~7 strikes nearest spot (|moneyness| <= 3%) on the thesis side, forms
+    feed_theta / BS_theta(per calendar day, r=0, strike's own IV) and
+    classifies the MEDIAN: ~1.0 -> "calendar"; ~1.45 (365/252) ->
+    "trading"; anything else -> "unclear". Bands are wide enough to absorb
+    Upstox's r != 0 (~10% at short DTE) but still separate 1.0 from 1.45.
+    Returns {} when it can't be measured (no years, < 3 usable strikes,
+    <2 days left). Pure measurement -- nothing here changes a decision."""
+    try:
+        if not strike_premiums or years is None or years * 365.0 < settings.greeks_unit_check_min_dte or spot <= 0:
+            return {}
+        p = "ce" if dir_ == CE else "pe"
+        ratios = []
+        for k, row in strike_premiums.items():
+            K = float(k)
+            if abs(K / spot - 1.0) > 0.03:
+                continue
+            th, iv = row.get(f"{p}_theta"), row.get(f"{p}_iv")
+            if th is None or iv is None or not (0 < float(iv) < 100) or float(th) >= 0:
+                continue
+            vol = float(iv) / 100.0
+            bs_th = _bs_price(spot, K, max(years - 1 / 365.0, 1e-9), vol, dir_) - _bs_price(spot, K, years, vol, dir_)
+            if bs_th < -1e-6:
+                ratios.append(float(th) / bs_th)
+        if len(ratios) < 3:
+            return {}
+        ratios.sort()
+        med = ratios[len(ratios) // 2]
+        basis = "calendar" if 0.75 <= med <= 1.25 else ("trading" if 1.25 < med <= 1.75 else "unclear")
+        return {"theta_ratio_med": round(med, 2), "theta_basis_measured": basis, "theta_probe_n": len(ratios)}
+    except Exception:
+        return {}
+
+
 def evaluate_candidate_greeks(
     row: dict, dir_: str, premium: Optional[float], strike: float,
     sig: "MasterScannerSignal", settings: "DoreOptionsSettings",
     proxy_delta: Optional[float] = None,
+    calendar_dte: Optional[int] = None,
+    years_to_expiry: Optional[float] = None,
 ) -> Optional[dict]:
     """Compact, JSON-safe Greeks read + scenario estimate for ONE
     candidate strike. Returns None when the chain row carried no Greeks
@@ -1302,10 +1426,27 @@ def evaluate_candidate_greeks(
     if bad:
         return {"ok": False, "why": bad}
     spot = float(sig.current_price or 0.0)
+    _unit_bad, _unit_ratios = greeks_unit_check(g, dir_, spot, float(strike), calendar_dte, settings, years=years_to_expiry)
+    if _unit_bad:
+        return {"ok": False, "why": _unit_bad, **_unit_ratios}
     if not premium or premium <= 0 or spot <= 0:
         return {"ok": False, "why": "no_premium_or_spot"}
 
     hold = max(0.1, float(settings.greeks_scenario_hold_days))
+    # The hold can't outlast the contract: cap at calendar days to expiry
+    # (when known and > 0), otherwise theta/gamma get extrapolated past
+    # expiry.
+    # [expiry-aware] prefer FRACTIONAL time to the 15:30 IST expiry close
+    # (years_to_expiry) over the integer day count: on expiry morning
+    # that is ~0.25 day, not 0, so the BS reprice still runs.
+    if years_to_expiry is not None and years_to_expiry > 0:
+        _cal = years_to_expiry * 365.0
+    else:
+        _cal = float(calendar_dte) if (calendar_dte is not None and calendar_dte > 0) else None
+    if _cal is not None:
+        hold = max(0.05, min(hold, _cal))
+    _basis = getattr(settings, "greeks_theta_basis", "calendar")
+    _tdays = _theta_days(hold, _basis)
     atr = float(sig.atr or 0.0)
     iv_daily = spot * (g.iv / 100.0) * math.sqrt(1.0 / 365.0) if g.iv else 0.0
     sigma_daily = max(atr, iv_daily)
@@ -1317,7 +1458,7 @@ def evaluate_candidate_greeks(
 
     def _scn(spot_move: float, iv_shift: float) -> dict:
         floor = _approx_intrinsic(strike, spot + spot_move, dir_)
-        return estimate_premium_scenario(premium, g, spot_move, hold, iv_shift, floor)
+        return estimate_premium_scenario(premium, g, spot_move, _tdays, iv_shift, floor)
 
     fav = _scn(sgn * move, 0.0)
     stall = _scn(0.0, 0.0)
@@ -1326,10 +1467,29 @@ def evaluate_candidate_greeks(
     def _pct(x: float) -> float:
         return round((x / premium - 1.0) * 100.0, 1)
 
-    theta_cost = abs(g.theta) * hold
+    theta_cost = abs(g.theta) * _tdays
     be_move = _required_move(abs(g.delta), g.gamma, theta_cost)
     _den = abs(fav["delta_pnl"]) + fav["gamma_pnl"]
     _gamma_share = (fav["gamma_pnl"] / _den) if _den > 0 else 0.0
+    _reliable = bool(_gamma_share <= float(settings.greeks_scenario_max_gamma_share))
+
+    # Full Black-Scholes reprice (strike's own IV, r=0). Replaces the
+    # Taylor numbers when they can't be trusted: unreliable gamma_share,
+    # or the hold covers >= greeks_bs_hold_dte_frac of the days left.
+    _method, _bs = "taylor", None
+    if _cal is not None and g.iv and g.iv > 0:
+        vol = g.iv / 100.0
+        yrs_left = max(_cal - hold, 0.0) / 365.0
+        def _bs_pct(spot_move, iv_shift):
+            px = _bs_price(spot + spot_move, float(strike), yrs_left, max(vol + iv_shift / 100.0, 0.01), dir_)
+            return round((px / premium - 1.0) * 100.0, 1)
+        _bs = {"fav": _bs_pct(sgn * move, 0.0), "stall": _bs_pct(0.0, 0.0),
+               "adv": _bs_pct(-sgn * move, -float(settings.greeks_scenario_adverse_iv_shift_pts))}
+        if (not _reliable) or hold >= float(settings.greeks_bs_hold_dte_frac) * _cal:
+            _method = "bs"
+    _fav_pct, _stall_pct, _adv_pct = _pct(fav["premium"]), _pct(stall["premium"]), _pct(adv["premium"])
+    if _method == "bs":
+        _fav_pct, _stall_pct, _adv_pct = _bs["fav"], _bs["stall"], _bs["adv"]
     return {
         "ok": True,
         "delta": round(g.delta, 4), "gamma": round(g.gamma, 5),
@@ -1339,14 +1499,21 @@ def evaluate_candidate_greeks(
         "vega_pct_pt": round(g.vega / premium * 100.0, 2),
         "sigma_src": "IV" if iv_daily > atr else "ATR",
         "sigma_hold": round(sigma_hold, 2),
-        "hold_days": hold,
-        "fav_pct": _pct(fav["premium"]),
+        "hold_days": round(hold, 3),
+        "theta_days": _tdays,
+        "years_left": round(_cal / 365.0, 5) if _cal is not None else None,
+        "fav_pct": _fav_pct,
+        "fav_pct_taylor": _pct(fav["premium"]),
+        "method": _method,
+        "bs_fav_pct": _bs["fav"] if _bs else None,
+        "bs_err_pts": round(_pct(fav["premium"]) - _bs["fav"], 1) if _bs else None,
+        **_unit_ratios,
         "fav_pct_ex_gamma": _pct(fav["premium_ex_gamma"]),
         "gamma_pct": round(fav["gamma_pnl"] / premium * 100.0, 1),
         "gamma_share": round(_gamma_share, 2),
-        "reliable": bool(_gamma_share <= float(settings.greeks_scenario_max_gamma_share)),
-        "stall_pct": _pct(stall["premium"]),
-        "adv_pct": _pct(adv["premium"]),
+        "reliable": _reliable,
+        "stall_pct": _stall_pct,
+        "adv_pct": _adv_pct,
         # How big a thesis-direction move (in hold-window sigmas) it takes
         # just to pay for the theta bled over the hold -- <1 means a
         # one-sigma move comfortably covers decay, >1 means it doesn't.
@@ -1383,7 +1550,7 @@ def _plan_level_greeks(cg: Optional[dict], premium: Optional[float],
     sigma_hold = cg.get("sigma_hold") or 0.0
     if sigma_hold <= 0:
         return out
-    theta_cost = abs(cg["theta"]) * cg["hold_days"]
+    theta_cost = abs(cg["theta"]) * cg.get("theta_days", cg["hold_days"])
     for name, tgt in (("t1", target1), ("t2", target2)):
         if tgt is None:
             continue
@@ -2880,7 +3047,9 @@ def _exit_before_expiry_rule(dte: int) -> str:
 
 
 def _build_candidate(label: str, strike_data: dict, dir_: str, chain: OptionChainSnapshot,
-                      sig: MasterScannerSignal, settings: DoreOptionsSettings) -> tuple[StrikeCandidate, list[str], float, float, bool, PremiumQuote]:
+                      sig: MasterScannerSignal, settings: DoreOptionsSettings,
+                      calendar_dte: Optional[int] = None,
+                      years_to_expiry: Optional[float] = None) -> tuple[StrikeCandidate, list[str], float, float, bool, PremiumQuote]:
     """Builds one StrikeCandidate + its own OI/premium reasons, premium
     quality and OI quality (needed by Stage 8 for the Balanced/primary
     leg only, but computed uniformly for all three). Also returns the
@@ -2914,6 +3083,8 @@ def _build_candidate(label: str, strike_data: dict, dir_: str, chain: OptionChai
             greeks = evaluate_candidate_greeks(
                 row, dir_, premium, strike, sig, settings,
                 proxy_delta=strike_data["probability_of_profit"] / 100.0,
+                calendar_dte=calendar_dte,
+                years_to_expiry=years_to_expiry,
             )
         except Exception:
             logger.warning("[DORE Options:%s] Greeks diagnostics failed for %s (non-fatal)",
@@ -3525,6 +3696,11 @@ def compute_dore_trade_plan(
     # persisted snapshot alone — nothing more granular ever got written
     # anywhere. This changes ONLY the rejection's diagnostic detail;
     # every threshold/check in _build_candidate() is unchanged.
+    try:
+        from utils.nse_calendar import years_to_expiry as _yte
+        _yrs_left = _yte(chain.expiry)
+    except Exception:
+        _yrs_left = None
     per_label_reasons: dict[str, list[str]] = {}
     per_label_ok: dict[str, bool] = {}
     primary_premium_quality = primary_oi_quality = 0.0
@@ -3532,6 +3708,8 @@ def compute_dore_trade_plan(
     for label in (CONSERVATIVE, BALANCED, AGGRESSIVE):
         candidate, reasons, premium_quality, oi_quality, ok, quote = _build_candidate(
             label, strikes[label], dir_, chain, sig, settings,
+            calendar_dte=(calendar_dte if calendar_dte is not None else dte),
+            years_to_expiry=_yrs_left,
         )
         candidates[label] = candidate
         per_label_reasons[label] = reasons
@@ -3653,6 +3831,16 @@ def compute_dore_trade_plan(
     if settings.enable_greeks_diagnostics and primary.greeks is not None:
         try:
             _plan_greeks = _plan_level_greeks(primary.greeks, primary.premium, target1, target2)
+            _probe = greeks_theta_basis_probe(chain.strike_premiums, dir_, float(sig.current_price or 0.0),
+                                              _yrs_left, settings)
+            if _probe and _plan_greeks:
+                _plan_greeks = {**_plan_greeks, **_probe}
+                _cfg = getattr(settings, "greeks_theta_basis", "calendar")
+                if _probe["theta_basis_measured"] not in (_cfg, "unclear"):
+                    _plan_greeks["theta_basis_mismatch"] = True
+                    logger.warning("[DORE Options:%s] feed theta looks %s-basis (median ratio %.2f) but "
+                                   "greeks_theta_basis=%s -- verify with scripts/verify_upstox_greeks_units.py",
+                                   sig.symbol, _probe["theta_basis_measured"], _probe["theta_ratio_med"], _cfg)
         except Exception:
             logger.warning("[DORE Options:%s] plan-level Greeks diagnostics failed (non-fatal)",
                            sig.symbol, exc_info=True)

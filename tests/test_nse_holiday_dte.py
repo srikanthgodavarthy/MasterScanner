@@ -32,7 +32,8 @@ def test_is_trading_day():
 
 
 def test_scan_helpers_use_ist_today():
-    with mock.patch.object(scan, "_ist_today", return_value=date(2026, 10, 19)):
+    import utils.nse_calendar as _cal
+    with mock.patch.object(_cal, "ist_today", return_value=date(2026, 10, 19)):
         assert scan._days_to_expiry("2026-10-22") == 2
         assert scan._calendar_days_to_expiry("2026-10-22") == 3
         assert scan._days_to_expiry("") == 0

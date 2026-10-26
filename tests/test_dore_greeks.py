@@ -411,3 +411,143 @@ def test_gate_never_vetoes_on_unreliable_or_missing_greeks():
     off = _plan_with(theta=-0.9, settings=DoreOptionsSettings(enable_greeks_gate=True, greeks_gate_max_be_sigma=0.0,
                                                               enable_greeks_diagnostics=False))
     assert isinstance(off, OptionTradePlan)
+
+
+# ── 2026-10-26: unit self-check + BS cross-check + hold cap ────────────
+from utils.dore_options_engine import greeks_unit_check, _bs_price  # noqa: E402
+
+
+def _atm_row(dte, strike_off=0.0, vega_scale=1.0, theta_scale=1.0, vol=0.14, S=25000.0):
+    K = S + strike_off
+    P, g, th, v = _bs(S, K, dte / 365.0, vol, "C")[0], None, None, None
+    P, d, gm, th, vg = _bs(S, K, dte / 365.0, vol, "C")
+    row = {"ce_delta": d, "ce_gamma": gm, "ce_theta": th * theta_scale,
+           "ce_vega": vg * vega_scale, "ce_iv": vol * 100}
+    return row, P, K, S
+
+
+class _S2:
+    current_price = 25000.0
+    atr = 150.0
+
+
+def test_unit_check_accepts_per_point_and_rejects_x100_vega():
+    s = DoreOptionsSettings()
+    row, P, K, S = _atm_row(5)
+    sig = _S2(); sig.current_price = S
+    ok = evaluate_candidate_greeks(row, CE, P, K, sig, s, calendar_dte=5)
+    assert ok["ok"] and 0.5 < ok["vega_ratio"] < 2.0
+    row2, *_ = _atm_row(5, vega_scale=100.0)
+    bad = evaluate_candidate_greeks(row2, CE, P, K, sig, s, calendar_dte=5)
+    assert bad == {**bad, "ok": False, "why": "vega_unit"}
+
+
+def test_unit_check_rejects_per_year_theta():
+    s = DoreOptionsSettings()
+    row, P, K, S = _atm_row(5, theta_scale=365.0)
+    sig = _S2(); sig.current_price = S
+    # theta*365 would also exceed premium -> either guard may fire first
+    bad = evaluate_candidate_greeks(row, CE, P, K, sig, s, calendar_dte=5)
+    assert bad["ok"] is False and bad["why"] in ("theta_unit", "theta_exceeds_premium")
+
+
+def test_unit_check_skipped_near_expiry_or_without_dte():
+    s = DoreOptionsSettings()
+    g = GreeksQuote(delta=0.5, gamma=0.01, theta=-5, vega=999.0, iv=14.0)
+    assert greeks_unit_check(g, CE, 25000.0, 25000.0, None, s) == (None, {})
+    assert greeks_unit_check(g, CE, 25000.0, 25000.0, 1, s) == (None, {})
+    assert greeks_unit_check(g, CE, 25000.0, 25000.0, 5, s)[0] == "vega_unit"
+
+
+def test_hold_is_capped_at_days_to_expiry_and_bs_replaces_taylor_when_unreliable():
+    s = DoreOptionsSettings()
+    row, P, K, S = _atm_row(2, strike_off=300.0)   # short-dated OTM: Taylor overshoots badly
+    sig = _S2(); sig.current_price = S
+    r = evaluate_candidate_greeks(row, CE, P, K, sig, s, calendar_dte=2)
+    assert r["ok"] and r["hold_days"] == 2.0
+    assert r["reliable"] is False and r["method"] == "bs"
+    assert r["fav_pct"] == r["bs_fav_pct"]
+    assert r["fav_pct_taylor"] > r["fav_pct"] + 50      # Taylor was the wrong one
+    row1, P1, K1, _ = _atm_row(1)
+    r1 = evaluate_candidate_greeks(row1, CE, P1, K1, sig, s, calendar_dte=1)
+    assert r1["ok"] and r1["hold_days"] == 1.0         # never longer than the contract
+
+
+def test_taylor_kept_when_reliable_and_hold_short_vs_dte():
+    s = DoreOptionsSettings()
+    row, P, K, S = _atm_row(30, strike_off=0.0)
+    sig = _S2(); sig.current_price = S
+    r = evaluate_candidate_greeks(row, CE, P, K, sig, s, calendar_dte=30)
+    assert r["method"] == "taylor" and r["reliable"] is True
+    assert abs(r["bs_err_pts"]) < 3.0
+
+
+def test_no_gamma_double_count():
+    g = GreeksQuote(delta=0.5, gamma=0.004, theta=-8.0, vega=9.0, iv=14.0)
+    r = estimate_premium_scenario(40.0, g, 100.0, 2.0, -2.0, 0.0)
+    assert r["premium"] == pytest.approx(40 + r["delta_pnl"] + r["gamma_pnl"] + r["theta_pnl"] + r["vega_pnl"])
+    assert r["premium"] - r["premium_ex_gamma"] == pytest.approx(r["gamma_pnl"])
+
+
+# ── 2026-10-26b: fractional expiry time, theta-basis probe ─────────────
+from datetime import date as _d, datetime as _dt
+from utils.dore_options_engine import greeks_theta_basis_probe
+from utils.nse_calendar import years_to_expiry, trading_sessions_in_window
+
+
+def test_years_to_expiry_is_fractional_to_1530_ist():
+    # expiry morning 09:30 IST -> 6 hours left, not 0 days
+    y = years_to_expiry("2026-10-22", now_ist=_dt(2026, 10, 22, 9, 30))
+    assert y == pytest.approx(6 / 24 / 365.0)
+    assert years_to_expiry("2026-10-22", now_ist=_dt(2026, 10, 22, 16, 0)) == 0.0
+    assert years_to_expiry("", now_ist=_dt(2026, 10, 22)) is None
+    assert years_to_expiry("junk") is None
+
+
+def test_trading_sessions_in_window_skips_weekends_and_holidays():
+    assert trading_sessions_in_window(_d(2026, 10, 19), 2) == 1   # Mon, Tue(Dussehra closed)
+    assert trading_sessions_in_window(_d(2026, 10, 23), 2) == 1   # Fri, Sat
+    assert trading_sessions_in_window(_d(2026, 10, 21), 2) == 2   # Wed, Thu
+
+
+def _chain_rows(theta_scale, S=25000.0, dte=5, vol=0.14):
+    sp = {}
+    for k in range(-10, 11):
+        K = S + k * 50
+        P, d, gm, th, vg = _bs(S, K, dte / 365.0, vol, "C")
+        sp[K] = {"ce_theta": th * theta_scale, "ce_iv": vol * 100}
+    return sp
+
+
+def test_theta_probe_classifies_calendar_trading_and_unclear():
+    s = DoreOptionsSettings()
+    y = 5 / 365.0
+    assert greeks_theta_basis_probe(_chain_rows(1.0), CE, 25000.0, y, s)["theta_basis_measured"] == "calendar"
+    assert greeks_theta_basis_probe(_chain_rows(365 / 252), CE, 25000.0, y, s)["theta_basis_measured"] == "trading"
+    assert greeks_theta_basis_probe(_chain_rows(3.0), CE, 25000.0, y, s)["theta_basis_measured"] == "unclear"
+    assert greeks_theta_basis_probe(_chain_rows(1.0), CE, 25000.0, 1 / 365.0, s) == {}   # too close to expiry
+    assert greeks_theta_basis_probe({}, CE, 25000.0, y, s) == {}
+
+
+def test_expiry_morning_still_gets_a_full_reprice():
+    s = DoreOptionsSettings()
+    S, K = 25000.0, 25100.0
+    y = 6 / 24 / 365.0                                   # 09:30 IST on expiry day
+    P = _bs_price(S, K, y, 0.14, CE)
+    row = {"ce_delta": 0.3, "ce_gamma": 0.004, "ce_theta": -P * 0.5, "ce_vega": 1.0, "ce_iv": 14.0}
+    sig = _S2(); sig.current_price = S
+    r = evaluate_candidate_greeks(row, CE, max(P, 1.0), K, sig, s, calendar_dte=0, years_to_expiry=y)
+    assert r["ok"] and r["method"] == "bs" and r["hold_days"] <= y * 365 + 1e-6
+    assert r["years_left"] == pytest.approx(y, abs=1e-4)
+
+
+def test_trading_basis_uses_sessions_not_calendar_days_for_theta():
+    from unittest import mock
+    import utils.nse_calendar as cal
+    s = DoreOptionsSettings(); s.greeks_theta_basis = "trading"
+    row, P, K, S = _atm_row(10, theta_scale=365 / 252)   # feed on a per-trading-day basis
+    sig = _S2(); sig.current_price = S
+    with mock.patch.object(cal, "ist_today", return_value=_d(2026, 10, 23)):   # Friday -> Fri,Sat = 1 session
+        r = evaluate_candidate_greeks(row, CE, P, K, sig, s, calendar_dte=10, years_to_expiry=10 / 365.0)
+    assert r["ok"] and r["theta_days"] == 1.0
+    assert 0.8 < r["theta_ratio"] < 1.25                 # unit check de-scaled by 365/252

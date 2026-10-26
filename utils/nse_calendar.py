@@ -16,7 +16,9 @@ left out: only some sources list it and it is in the past.
 """
 from __future__ import annotations
 
+import math
 from datetime import date, datetime, timedelta
+from typing import Optional
 
 NSE_WEEKDAY_HOLIDAYS = frozenset({
     # 2026
@@ -103,3 +105,32 @@ def days_to_expiry(expiry) -> int:
         return holiday_adjusted_days(ist_today(), _to_date(expiry))
     except Exception:
         return calendar_days_to_expiry(expiry)
+
+
+# ── Expiry-aware time (fractional) ────────────────────────────────────
+NSE_EXPIRY_TIME_IST = (15, 30)   # derivatives expire at the 15:30 IST close
+
+
+def years_to_expiry(expiry, now_ist: Optional[datetime] = None) -> Optional[float]:
+    """Fractional years from now (IST) to the 15:30 IST expiry close, on a
+    calendar basis (BS convention). 0.0 once past; None if blank/unparseable.
+    Unlike days_to_expiry this is NOT an integer: on expiry morning it is
+    ~0.25 day, not 0, which is what option repricing needs."""
+    if not expiry:
+        return None
+    try:
+        d = _to_date(expiry)
+        end = datetime(d.year, d.month, d.day, *NSE_EXPIRY_TIME_IST)
+        now = now_ist or (datetime.utcnow() + timedelta(hours=5, minutes=30))
+        return max((end - now).total_seconds(), 0.0) / (365.0 * 86400.0)
+    except Exception:
+        return None
+
+
+def trading_sessions_in_window(start: date, days: float) -> int:
+    """Trading days d with start <= d < start + ceil(days). `start` counts
+    if it is a trading day — i.e. how many exchange sessions a position
+    entered on `start` sits through in a hold of `days` calendar days.
+    Used to turn a PER-TRADING-DAY theta into hold decay."""
+    n = int(math.ceil(max(days, 0.0)))
+    return sum(1 for i in range(n) if is_trading_day(start + timedelta(days=i)))
