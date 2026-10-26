@@ -67,6 +67,23 @@ FEATURES = (
 
 
 # ── data shaping (pure; no DB) ──────────────────────────────────────────
+def _is_set(v) -> bool:
+    """True when a nullable timestamp/text column actually holds a value.
+
+    `bool(v)` is NOT safe here: once any row in a column holds a datetime, pandas
+    stores the column as datetime64 and a missing value becomes NaT, and
+    bool(pd.NaT) / bool(float("nan")) are both True. Treat None, NaN, NaT and an
+    empty/blank string all as "not set"."""
+    if v is None:
+        return False
+    try:
+        if pd.isna(v):
+            return False
+    except (TypeError, ValueError):      # array-likes etc.: fall through to the text check
+        pass
+    return str(v).strip() != ""
+
+
 def greeks_rows_from_plans(snap_ts, plans: Iterable[dict]) -> list[dict]:
     """Flatten one snapshot's technical_plans into one row per plan that
     carries a usable Greeks read. `snap_ts` is the snapshot timestamp."""
@@ -125,7 +142,7 @@ def match_closed_plans(greeks_df: pd.DataFrame, plans_df: pd.DataFrame,
             "last_premium": p.get("last_premium"),
             "closed_reason_code": p.get("closed_reason_code") or "",
             "closed_reason": p.get("closed_reason") or "",
-            "t1_hit": bool(p.get("t1_hit_at")),
+            "t1_hit": _is_set(p.get("t1_hit_at")),
         })
         out.append(row)
     df = pd.DataFrame(out)
@@ -291,8 +308,10 @@ SELECT s.created_at AS snap_ts,
        e->'primary'->>'strike' AS strike, e->>'expiry' AS expiry,
        e->>'confidence_score' AS confidence, e->>'dte' AS dte,
        e->'greeks' AS greeks
-FROM dore_technical_plans_snapshots s,
-     jsonb_array_elements(s.payload->'technical_plans') e
+FROM dore_technical_plans_snapshots s
+CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(s.payload->'technical_plans') = 'array'
+             THEN s.payload->'technical_plans' ELSE '[]'::jsonb END) AS e
 WHERE s.created_at BETWEEN %s AND %s
   AND e->>'symbol' = ANY(%s)
   AND jsonb_typeof(e->'greeks') = 'object'

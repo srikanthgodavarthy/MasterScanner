@@ -120,3 +120,71 @@ def test_rule_sweep_refuses_to_endorse_small_samples():
     s = ga.rule_sweep(df, "be_sigma", [1.0], min_n=30).iloc[0]
     assert s["status"].startswith("INSUFFICIENT") and s["net_pct_gain"] > 0       # looks great, still not endorsed
     assert ga.rule_sweep(pd.DataFrame(), "be_sigma", [1.0]).empty
+
+
+# ──────────────────────────────────────────────────────────────────
+#  regressions found in review of cb1d3c2
+# ──────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("value,expected", [
+    (None, False), (float("nan"), False), (pd.NaT, False), ("", False), ("   ", False),
+    (pd.Timestamp("2026-10-26T04:30:00Z"), True), ("2026-10-26T04:30:00Z", True),
+])
+def test_is_set_treats_every_missing_shape_as_not_set(value, expected):
+    assert ga._is_set(value) is expected
+
+
+def test_t1_hit_is_correct_when_the_column_is_datetime_with_NaT():
+    """bool(pd.NaT) is True. Once ANY closed plan has a t1_hit_at timestamp, pandas makes the column
+    datetime64 and every never-hit plan becomes NaT -- which used to count as a T1 hit."""
+    g = pd.DataFrame(ga.greeks_rows_from_plans("2026-10-26T04:10:00Z", [_snap_plan()]))
+    hit = pd.Timestamp("2026-10-26T05:00:00Z")
+    plans = pd.concat([
+        _plans_df("2026-10-26T04:00:00Z", plan_id=f"p{i}", t1_hit_at=v)
+        for i, v in enumerate([hit, None, None, None])
+    ], ignore_index=True)
+    plans["t1_hit_at"] = pd.to_datetime(plans["t1_hit_at"], utc=True)      # the DB driver's shape
+    assert str(plans["t1_hit_at"].dtype).startswith("datetime64")
+    m = ga.match_closed_plans(g, plans)
+    assert m["t1_hit"].tolist() == [True, False, False, False]
+
+
+@pytest.mark.parametrize("missing", [None, float("nan"), ""])
+def test_t1_hit_false_for_each_plain_missing_value(missing):
+    g = pd.DataFrame(ga.greeks_rows_from_plans("2026-10-26T04:10:00Z", [_snap_plan()]))
+    m = ga.match_closed_plans(g, _plans_df("2026-10-26T04:00:00Z", t1_hit_at=missing))
+    assert m["t1_hit"].tolist() == [False]
+
+
+def test_snapshot_sql_guards_non_array_technical_plans():
+    """jsonb_array_elements() raises 'cannot extract elements from a scalar' for a JSON null/object,
+    which aborts the whole report. The query must only expand real arrays."""
+    sql = " ".join(ga._SNAP_SQL.split())
+    assert "jsonb_typeof(s.payload->'technical_plans') = 'array'" in sql
+    assert "CROSS JOIN LATERAL jsonb_array_elements" in sql
+
+
+@pytest.mark.skipif(not __import__("os").environ.get("TEST_DATABASE_URL"),
+                    reason="set TEST_DATABASE_URL to run the SQL against a real Postgres (uses a TEMP table)")
+def test_snapshot_sql_survives_malformed_payloads_on_real_postgres():
+    import datetime as dt
+    import os
+    import psycopg2
+    import psycopg2.extras
+    good = {"technical_plans": [{"symbol": "ABC", "direction": "CE", "expiry": "2026-10-29", "confidence_score": 70,
+                                 "dte": 3, "primary": {"strike": 100}, "greeks": {"ok": True, "delta": 0.5}}]}
+    payloads = [good, {}, {"technical_plans": None}, {"technical_plans": {"unexpected": "object"}},
+                {"technical_plans": [{"symbol": "ABC", "primary": {"strike": 100}, "greeks": None}]}]
+    conn = psycopg2.connect(os.environ["TEST_DATABASE_URL"])
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # TEMP table shadows the real one for this session only; dropped on disconnect
+        cur.execute("CREATE TEMP TABLE dore_technical_plans_snapshots (created_at timestamptz, payload jsonb)")
+        base = dt.datetime(2026, 10, 26, 10, 0, tzinfo=dt.timezone.utc)
+        for i, p in enumerate(payloads):
+            cur.execute("INSERT INTO dore_technical_plans_snapshots VALUES (%s, %s)",
+                        (base + dt.timedelta(minutes=5 * i), psycopg2.extras.Json(p)))
+        cur.execute(ga._SNAP_SQL, (base - dt.timedelta(hours=1), base + dt.timedelta(hours=1), ["ABC"]))
+        rows = cur.fetchall()
+        assert len(rows) == 1 and isinstance(rows[0]["greeks"], dict) and rows[0]["greeks"]["ok"] is True
+    finally:
+        conn.close()
