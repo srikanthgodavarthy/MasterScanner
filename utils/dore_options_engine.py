@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import math
 import logging
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace as _dc_replace
 from typing import Optional, Sequence
 
 import pandas as pd
@@ -524,6 +524,82 @@ class DoreOptionsSettings:
     # with no usable SMC structure is never rejected by this setting;
     # it simply never reaches the check (legacy DORE behavior, §7).
     min_structural_rr: float = 1.3
+
+    # ── Greeks diagnostics [2026-10-23, SG request: Greeks Phase 1] ──
+    # OBSERVATION ONLY. Reads the real per-strike Delta/Gamma/Theta/Vega
+    # Upstox already returns in the option-chain response and runs a
+    # second-order premium scenario estimator (see
+    # estimate_premium_scenario()) on every candidate. NOTHING here feeds
+    # qualification_score()/direction()/final_score()/hard_reject()/
+    # select_strikes()/SL/T1/T2 -- the result only rides on
+    # StrikeCandidate.greeks / OptionTradePlan.greeks so it lands in the
+    # technical_plans snapshot, where utils.greeks_attribution can measure
+    # what each Greek actually explains in closed-trade outcomes BEFORE
+    # any of it is allowed to influence a decision. Wiring any of it into
+    # a score or gate is a separate, explicit change (same contract as
+    # iv_skew/skew_* above). Set False to skip the computation entirely.
+    enable_greeks_diagnostics: bool = True
+
+    # Scenario horizon in CALENDAR days -- mirrors
+    # MAX_DORE_OPTIONS_PLAN_AGE_DAYS (2) in utils.dore_options_persistence,
+    # which is also calendar-day based and matches Upstox's per-calendar-
+    # day theta. Kept as a literal default here (not imported) for the
+    # same reason the PCR-conflict floor is: importing the persistence
+    # module would pull psycopg2 into this compute layer. Keep in sync.
+    greeks_scenario_hold_days: float = 2.0
+
+    # Size of the favorable/adverse underlying move, in units of the
+    # hold-window 1-sigma move: sigma_daily * sqrt(hold_days), where
+    # sigma_daily = max(ATR, IV-implied daily move) -- the same
+    # "never understate the move" max() convention as use_iv_expected_
+    # move. 1.0 = a one-sigma move over the hold window.
+    greeks_scenario_move_sigma: float = 1.0
+
+    # IV points lost in the ADVERSE scenario only (favorable and stall
+    # assume IV unchanged, so Vega's contribution is isolated to the
+    # downside case it is meant to size). PROVISIONAL -- not calibrated
+    # against realized IV behaviour yet; the Vega term is reported as its
+    # own component precisely so it can be re-sized from data.
+    greeks_scenario_adverse_iv_shift_pts: float = 2.0
+
+    # Reliability cut-off for the scenario estimate. The estimator uses
+    # Greeks frozen at entry, but gamma and theta both move as the
+    # underlying approaches the strike and expiry nears, so it overshoots
+    # on far-OTM / short-dated strikes (theta bleeding 15%+ of premium
+    # per day). gamma_share = gamma_pnl / (|delta_pnl| + gamma_pnl) in the
+    # favorable scenario measures how much of the estimate is
+    # extrapolated convexity rather than first-order delta. Checked
+    # against a Black-Scholes reference grid (vol 22-45%, 3-30 DTE,
+    # strikes 0-6% OTM, a 1-sigma/2-day move; 86 cases): every case whose
+    # estimate was off by more than 10 points of entry premium had
+    # gamma_share >= 0.26, and a 0.25 cut-off passed none of them (it also
+    # flagged 3 of 64 good cases). PROVISIONAL -- derived from a synthetic
+    # grid, not from live fills; utils.greeks_attribution re-checks it
+    # against real outcomes.
+    greeks_scenario_max_gamma_share: float = 0.25
+
+    # ── Greeks reachability gate [2026-10-23, Phase 2 -- DEFAULT OFF] ──
+    # The first Greek-driven DECISION, and deliberately the narrowest one:
+    # a veto (never a score nudge) when the contract's own Greeks say the
+    # trade cannot work within the hold window. It is a lever, not a
+    # tuned parameter -- default OFF until utils.greeks_attribution
+    # .rule_sweep() shows, on real post-deploy closed plans, that it would
+    # have avoided more loss than it forwent in wins (historical Greeks
+    # can't be reconstructed reliably enough to test it earlier: Black-
+    # Scholes fed the stored IV/DTE misses recorded premiums by 0.3x-2.6x).
+    # Fail-open by construction: it only ever acts on a usable (ok) AND
+    # reliable Greeks read, so missing/garbage/extrapolated Greeks can
+    # never veto a plan. Requires enable_greeks_diagnostics.
+    enable_greeks_gate: bool = False
+    # be_sigma = sigmas of hold-window move needed merely to pay for the
+    # theta bled over the hold. > 1.0 means even a full one-sigma move in
+    # the thesis direction leaves the option worth less than entry.
+    greeks_gate_max_be_sigma: float = 1.0
+    # t1_sigma_req = sigmas of move needed to actually deliver T1 (IV flat,
+    # theta paid). 2.0 sigma is roughly a 5% chance of being touched inside
+    # the hold window (2 x P(Z > 2)) -- the point where T1 is a hope, not
+    # a plan. First-principles values, not fitted to outcomes.
+    greeks_gate_max_t1_sigma: float = 2.0
 
 
 DORE_OPTIONS_DEFAULTS = DoreOptionsSettings()
@@ -1082,6 +1158,245 @@ class PremiumQuote:
 
 
 # ══════════════════════════════════════════════════════════════════
+#  GREEKS  [2026-10-23, SG request: Greeks Phase 1 — OBSERVATION ONLY]
+#
+#  Delta / Gamma / Theta / Vega as reported by Upstox for the exact
+#  strike DORE is evaluating, plus a second-order premium scenario
+#  estimator built on them. Units follow Upstox's option_greeks block:
+#    delta : premium change per 1 unit of underlying (signed; puts < 0)
+#    gamma : change in delta per 1 unit of underlying (>= 0)
+#    theta : premium change per CALENDAR day (<= 0 for a long option)
+#    vega  : premium change per 1 point of IV (>= 0)
+#    iv    : percent, e.g. 32.5
+#  Rho is not in Upstox's REST chain (WebSocket feed only) and is
+#  immaterial over a <= 2-day hold; Beta is market context, not an
+#  option Greek -- neither is handled here.
+# ══════════════════════════════════════════════════════════════════
+
+@dataclass
+class GreeksQuote:
+    delta: Optional[float] = None
+    gamma: Optional[float] = None
+    theta: Optional[float] = None
+    vega:  Optional[float] = None
+    iv:    Optional[float] = None
+
+    @staticmethod
+    def from_chain_row(row: dict, dir_: str) -> "GreeksQuote":
+        """Reads ce_*/pe_* keys written by utils.upstox_client.
+        _strike_greeks_fields(). Non-numeric / non-finite values become
+        None -- never coerced to 0, which would read as a real reading."""
+        if not row:
+            return GreeksQuote()
+        p = "ce" if dir_ == CE else "pe"
+
+        def _f(k):
+            v = row.get(f"{p}_{k}")
+            if v is None or isinstance(v, bool):
+                return None
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return None
+            return v if math.isfinite(v) else None
+
+        return GreeksQuote(
+            delta=_f("delta"), gamma=_f("gamma"), theta=_f("theta"), vega=_f("vega"),
+            iv=OptionChainSnapshot._sane_iv(_f("iv")),
+        )
+
+    @property
+    def has_any(self) -> bool:
+        return any(v is not None for v in (self.delta, self.gamma, self.theta, self.vega, self.iv))
+
+    def check(self, dir_: str, premium: Optional[float]) -> Optional[str]:
+        """None when the quote is safe to reprice with, else a short
+        machine-readable reason code. Illiquid strikes produce garbage
+        theoretical Greeks (the NAM-INDIA 145% IV episode, and Upstox's
+        own docs show a 262% IV row), so a quote is rejected rather than
+        repaired -- no guessing at what a bad number 'should' have been."""
+        if None in (self.delta, self.gamma, self.theta, self.vega):
+            return "incomplete"
+        if abs(self.delta) < 0.01 or abs(self.delta) > 1.0:
+            return "delta_range"
+        if (dir_ == CE and self.delta < 0) or (dir_ == PE and self.delta > 0):
+            return "delta_sign"
+        if self.gamma < 0:
+            return "gamma_negative"
+        if self.vega < 0:
+            return "vega_negative"
+        if self.theta > 0:
+            return "theta_positive"
+        if premium and abs(self.theta) > premium:
+            return "theta_exceeds_premium"
+        return None
+
+
+def estimate_premium_scenario(
+    premium: float, g: GreeksQuote, spot_move: float, days: float,
+    iv_shift_pts: float = 0.0, intrinsic_floor: float = 0.0,
+) -> dict:
+    """Second-order Taylor repricing of a LONG option:
+
+        P' = P + delta*dS + 0.5*gamma*dS^2 + theta*days + vega*dIV
+
+    spot_move is SIGNED (positive = underlying up) so one formula covers
+    calls and puts -- a put's negative delta times a negative move is a
+    gain. Each term is returned separately so a caller can see what every
+    Greek contributed (this is how Gamma's marginal effect is measured:
+    premium vs premium_ex_gamma). The result is floored at
+    intrinsic_floor (an option can't trade below intrinsic) and at 0.
+
+    Valid for moves up to roughly one sigma of the hold window; beyond
+    that gamma itself changes and the estimate is indicative only (see
+    tests/test_dore_greeks.py for the measured error against a full
+    Black-Scholes reprice)."""
+    delta_pnl = g.delta * spot_move
+    gamma_pnl = 0.5 * g.gamma * spot_move * spot_move
+    theta_pnl = g.theta * days
+    vega_pnl = g.vega * iv_shift_pts
+    floor = max(0.0, intrinsic_floor)
+    raw = premium + delta_pnl + gamma_pnl + theta_pnl + vega_pnl
+    raw_ex_gamma = premium + delta_pnl + theta_pnl + vega_pnl
+    return {
+        "premium": max(raw, floor),
+        "premium_ex_gamma": max(raw_ex_gamma, floor),
+        "delta_pnl": delta_pnl, "gamma_pnl": gamma_pnl,
+        "theta_pnl": theta_pnl, "vega_pnl": vega_pnl,
+        "floored": raw < floor,
+    }
+
+
+def _required_move(delta_abs: float, gamma: float, need: float) -> float:
+    """Underlying move (thesis direction, >= 0) that makes the delta+
+    gamma terms alone produce `need` premium: solves
+    0.5*gamma*x^2 + |delta|*x = need."""
+    if need <= 0:
+        return 0.0
+    if gamma <= 1e-12:
+        return need / delta_abs
+    return (-delta_abs + math.sqrt(delta_abs * delta_abs + 2.0 * gamma * need)) / gamma
+
+
+def evaluate_candidate_greeks(
+    row: dict, dir_: str, premium: Optional[float], strike: float,
+    sig: "MasterScannerSignal", settings: "DoreOptionsSettings",
+    proxy_delta: Optional[float] = None,
+) -> Optional[dict]:
+    """Compact, JSON-safe Greeks read + scenario estimate for ONE
+    candidate strike. Returns None when the chain row carried no Greeks
+    at all (keeps snapshots small), {"ok": False, "why": code} when it
+    carried Greeks that failed GreeksQuote.check() (so data quality is
+    itself measurable), else the full read.
+
+    Scenarios (hold = settings.greeks_scenario_hold_days, move =
+    greeks_scenario_move_sigma * sigma_daily * sqrt(hold)):
+      favorable : underlying moves `move` in the thesis direction, IV flat
+      stall     : underlying flat, IV flat  -> pure theta bleed
+      adverse   : underlying moves `move` against, IV -adverse_iv_shift
+    *_pct values are % change vs the entry premium."""
+    g = GreeksQuote.from_chain_row(row, dir_)
+    if not g.has_any:
+        return None
+    bad = g.check(dir_, premium)
+    if bad:
+        return {"ok": False, "why": bad}
+    spot = float(sig.current_price or 0.0)
+    if not premium or premium <= 0 or spot <= 0:
+        return {"ok": False, "why": "no_premium_or_spot"}
+
+    hold = max(0.1, float(settings.greeks_scenario_hold_days))
+    atr = float(sig.atr or 0.0)
+    iv_daily = spot * (g.iv / 100.0) * math.sqrt(1.0 / 365.0) if g.iv else 0.0
+    sigma_daily = max(atr, iv_daily)
+    if sigma_daily <= 0:
+        return {"ok": False, "why": "no_sigma"}
+    sigma_hold = sigma_daily * math.sqrt(hold)
+    move = float(settings.greeks_scenario_move_sigma) * sigma_hold
+    sgn = 1.0 if dir_ == CE else -1.0
+
+    def _scn(spot_move: float, iv_shift: float) -> dict:
+        floor = _approx_intrinsic(strike, spot + spot_move, dir_)
+        return estimate_premium_scenario(premium, g, spot_move, hold, iv_shift, floor)
+
+    fav = _scn(sgn * move, 0.0)
+    stall = _scn(0.0, 0.0)
+    adv = _scn(-sgn * move, -float(settings.greeks_scenario_adverse_iv_shift_pts))
+
+    def _pct(x: float) -> float:
+        return round((x / premium - 1.0) * 100.0, 1)
+
+    theta_cost = abs(g.theta) * hold
+    be_move = _required_move(abs(g.delta), g.gamma, theta_cost)
+    _den = abs(fav["delta_pnl"]) + fav["gamma_pnl"]
+    _gamma_share = (fav["gamma_pnl"] / _den) if _den > 0 else 0.0
+    return {
+        "ok": True,
+        "delta": round(g.delta, 4), "gamma": round(g.gamma, 5),
+        "theta": round(g.theta, 4), "vega": round(g.vega, 4),
+        "iv": round(g.iv, 2) if g.iv is not None else None,
+        "theta_pct_day": round(abs(g.theta) / premium * 100.0, 2),
+        "vega_pct_pt": round(g.vega / premium * 100.0, 2),
+        "sigma_src": "IV" if iv_daily > atr else "ATR",
+        "sigma_hold": round(sigma_hold, 2),
+        "hold_days": hold,
+        "fav_pct": _pct(fav["premium"]),
+        "fav_pct_ex_gamma": _pct(fav["premium_ex_gamma"]),
+        "gamma_pct": round(fav["gamma_pnl"] / premium * 100.0, 1),
+        "gamma_share": round(_gamma_share, 2),
+        "reliable": bool(_gamma_share <= float(settings.greeks_scenario_max_gamma_share)),
+        "stall_pct": _pct(stall["premium"]),
+        "adv_pct": _pct(adv["premium"]),
+        # How big a thesis-direction move (in hold-window sigmas) it takes
+        # just to pay for the theta bled over the hold -- <1 means a
+        # one-sigma move comfortably covers decay, >1 means it doesn't.
+        "be_sigma": round(be_move / sigma_hold, 2),
+        # Real chain |delta| minus DORE's POP-as-delta proxy
+        # (StrikeCandidate.delta_approx) -- measures how good that proxy is.
+        "delta_vs_proxy": round(abs(g.delta) - proxy_delta, 3) if proxy_delta is not None else None,
+    }
+
+
+# Keys kept on the NON-primary candidates in the persisted plan. The full
+# read lives once, on OptionTradePlan.greeks; repeating it on every tier
+# made the technical_plans snapshot ~45% larger per plan (measured), and
+# that snapshot is re-read by the UI constantly, so it's an egress cost.
+_TIER_GREEKS_KEYS = ("ok", "why", "delta", "theta_pct_day", "fav_pct", "adv_pct", "reliable")
+
+
+def _slim_tier_greeks(g: Optional[dict]) -> Optional[dict]:
+    if not g:
+        return g
+    return {k: g[k] for k in _TIER_GREEKS_KEYS if k in g}
+
+
+def _plan_level_greeks(cg: Optional[dict], premium: Optional[float],
+                       target1: Optional[float], target2: Optional[float]) -> Optional[dict]:
+    """Adds target-reachability to the primary candidate's Greeks read:
+    how many hold-window sigmas the underlying must move (delta+gamma
+    terms, IV flat) to pay for the theta bled AND deliver T1/T2. This is
+    the direct, per-trade version of the flat-target mismatch found in
+    the 2026-08-20 flow review (median MFE +7.9% vs T1 +50%)."""
+    if not cg or not cg.get("ok") or not premium or premium <= 0:
+        return cg
+    out = dict(cg)
+    sigma_hold = cg.get("sigma_hold") or 0.0
+    if sigma_hold <= 0:
+        return out
+    theta_cost = abs(cg["theta"]) * cg["hold_days"]
+    for name, tgt in (("t1", target1), ("t2", target2)):
+        if tgt is None:
+            continue
+        gain = tgt - premium
+        out[f"{name}_gain_pct"] = round(gain / premium * 100.0, 1)
+        out[f"{name}_sigma_req"] = round(
+            _required_move(abs(cg["delta"]), cg["gamma"], gain + theta_cost) / sigma_hold, 2)
+    if target1 is not None:
+        out["t1_ok_fav"] = bool(cg["fav_pct"] >= (target1 / premium - 1.0) * 100.0)
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════
 #  OUTPUT
 # ══════════════════════════════════════════════════════════════════
 
@@ -1095,6 +1410,10 @@ class StrikeCandidate:
     risk:                  Optional[float]     # premium paid (max loss, long options)
     reward:                Optional[float]     # approx reward to Target Price
     risk_reward_ratio:     Optional[float]
+    # [2026-10-23, Greeks Phase 1 -- OBSERVATION ONLY, NON-GATING] see
+    # evaluate_candidate_greeks(). None when the chain carried no Greeks
+    # for this strike or settings.enable_greeks_diagnostics is False.
+    greeks:                Optional[dict] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1376,6 +1695,16 @@ class OptionTradePlan:
                                                           # None until enough intraday history exists
     skew_trend_vs_open:       Optional[str]   = None   # TOWARD_FLAT | AWAY_FROM_FLAT | INVERTED |
                                                           # STABLE | OPENED_FLAT | None (no history yet)
+
+    # [2026-10-23, Greeks Phase 1 -- OBSERVATION ONLY, NON-GATING] The
+    # primary candidate's Greeks read plus target reachability (how many
+    # hold-window sigmas the underlying must move to deliver T1/T2 after
+    # paying the theta bled) -- see _plan_level_greeks(). Not read by
+    # qualification_score()/direction()/final_score()/hard_reject()/
+    # select_strikes()/SL/T1/T2 and must not be wired into any of them
+    # without an explicit, separate change backed by
+    # utils.greeks_attribution's measurements. None when unavailable.
+    greeks:                   Optional[dict] = None
 
     @property
     def structural_available(self) -> bool:
@@ -2577,6 +2906,20 @@ def _build_candidate(label: str, strike_data: dict, dir_: str, chain: OptionChai
         reward = round(max(0.0, intrinsic_at_target - premium), 2)
         rr = round(reward / risk, 2) if risk else None
 
+    # [2026-10-23, Greeks Phase 1] Observation only -- fail-soft, never
+    # touches `ok`, quality scores, risk/reward or anything else above.
+    greeks = None
+    if settings.enable_greeks_diagnostics and premium_ok and premium and row:
+        try:
+            greeks = evaluate_candidate_greeks(
+                row, dir_, premium, strike, sig, settings,
+                proxy_delta=strike_data["probability_of_profit"] / 100.0,
+            )
+        except Exception:
+            logger.warning("[DORE Options:%s] Greeks diagnostics failed for %s (non-fatal)",
+                           sig.symbol, label, exc_info=True)
+            greeks = None
+
     candidate = StrikeCandidate(
         label=label,
         strike=strike,
@@ -2586,6 +2929,7 @@ def _build_candidate(label: str, strike_data: dict, dir_: str, chain: OptionChai
         risk=risk,
         reward=reward,
         risk_reward_ratio=rr,
+        greeks=greeks,
     )
     ok = premium_ok and oi_ok
     return candidate, (premium_reasons + oi_reasons), premium_quality, oi_quality, ok, quote
@@ -3303,6 +3647,33 @@ def compute_dore_trade_plan(
                 target2 = round(_premium_ceiling, 2)
                 _structural_target_capped = True
 
+    # [2026-10-23, Greeks Phase 1 -- OBSERVATION ONLY] Computed AFTER the
+    # structural cap so it reflects the T1/T2 the plan actually ships.
+    _plan_greeks = None
+    if settings.enable_greeks_diagnostics and primary.greeks is not None:
+        try:
+            _plan_greeks = _plan_level_greeks(primary.greeks, primary.premium, target1, target2)
+        except Exception:
+            logger.warning("[DORE Options:%s] plan-level Greeks diagnostics failed (non-fatal)",
+                           sig.symbol, exc_info=True)
+
+    # [2026-10-23, Phase 2 -- DEFAULT OFF] Greeks reachability gate; see
+    # DoreOptionsSettings.enable_greeks_gate for the rationale and why it
+    # fails open. Runs after targets are final so T1 reflects what ships.
+    if (settings.enable_greeks_gate and _plan_greeks and _plan_greeks.get("ok")
+            and _plan_greeks.get("reliable")):
+        _gate_why = []
+        _be = _plan_greeks.get("be_sigma")
+        if _be is not None and _be > settings.greeks_gate_max_be_sigma:
+            _gate_why.append(f"theta needs a {_be:.2f}-sigma move just to break even "
+                             f"(max {settings.greeks_gate_max_be_sigma:g})")
+        _t1s = _plan_greeks.get("t1_sigma_req")
+        if _t1s is not None and _t1s > settings.greeks_gate_max_t1_sigma:
+            _gate_why.append(f"T1 needs a {_t1s:.2f}-sigma move inside the hold window "
+                             f"(max {settings.greeks_gate_max_t1_sigma:g})")
+        if _gate_why:
+            return DoreRejection(sig.symbol, "GreeksGate", "; ".join(_gate_why))
+
     # 2026-07-31: Current Premium / Premium %Chg — the option contract's
     # own move today, distinct from the underlying's %Chg. prev_close
     # here is the CONTRACT's prior-close premium (PremiumQuote.prev_close,
@@ -3382,9 +3753,13 @@ def compute_dore_trade_plan(
         direction=dir_,
         expiry=chain.expiry,
         dte=dte,
-        primary=primary,
-        conservative=candidates[CONSERVATIVE],
-        aggressive=candidates[AGGRESSIVE],
+        # [2026-10-23] Greeks persist once, on OptionTradePlan.greeks (a
+        # superset of the primary's read): the primary candidate carries
+        # none, the other two a handful of comparison fields. The gate and
+        # the harness only read plan.greeks.
+        primary=_dc_replace(primary, greeks=None) if primary.greeks is not None else primary,
+        conservative=_dc_replace(candidates[CONSERVATIVE], greeks=_slim_tier_greeks(candidates[CONSERVATIVE].greeks)),
+        aggressive=_dc_replace(candidates[AGGRESSIVE], greeks=_slim_tier_greeks(candidates[AGGRESSIVE].greeks)),
         entry_zone=(entry_low, entry_high),
         stop_loss=stop_loss,
         target1=target1,
@@ -3467,6 +3842,8 @@ def compute_dore_trade_plan(
         skew_delta_since_open=_skew_reading.skew_delta_since_open,
         skew_delta_last_n_cycles=_skew_reading.skew_delta_last_n_cycles,
         skew_trend_vs_open=_skew_reading.skew_trend_vs_open,
+        # [2026-10-23, Greeks Phase 1 -- OBSERVATION ONLY]
+        greeks=_plan_greeks,
     )
 
 

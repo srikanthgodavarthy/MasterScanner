@@ -1240,6 +1240,55 @@ def _get_option_chain_with_retry(instrument_key: str, expiry: str) -> Optional[l
     return None
 
 
+# [2026-10-23, SG request: Greeks integration, Phase 1] Per-strike Greeks
+# capture. Upstox's option-chain response already carries
+# `option_greeks` {delta, gamma, theta, vega, iv, pop} on every leg of
+# every strike, in the SAME response both chain parsers below already
+# fetch -- before this, only the ATM leg's delta/iv were read (see
+# _greeks() inside each parser) and the rest was discarded. No extra
+# API call. Rho is NOT in this REST response at all (it only exists in
+# Upstox's WebSocket option_greeks feed), so there is nothing to
+# capture for it here.
+#
+# Bounded to strikes within +/-15% of spot: strike_premiums is held in
+# memory for every shortlisted symbol every cycle (RAM growth is a known
+# concern on this deployment), and DORE's selected strikes sit well
+# inside that band (the gamma-zone offset caps top out at single-digit
+# % of spot). Far-wing strikes carry the least reliable Greeks anyway.
+# When spot is unknown the band can't be applied, so nothing is dropped.
+_GREEKS_CAPTURE_MAX_MONEYNESS = 0.15
+_GREEK_KEYS = ("delta", "gamma", "theta", "vega", "iv")
+
+
+def _strike_greeks_fields(row: dict, spot: Optional[float]) -> dict:
+    """Flat {ce_delta, ce_gamma, ce_theta, ce_vega, ce_iv, pe_*} for one
+    chain row, or {} when the strike is outside the capture band or
+    neither leg carries a usable `option_greeks` block. Values pass
+    through untouched (None when a field is missing/non-numeric) --
+    sanity-checking happens downstream in
+    dore_options_engine.GreeksQuote, which has the direction context a
+    raw parser doesn't. Keys live INSIDE a strike_premiums row, so the
+    ce_iv/pe_iv here are per-strike and do not collide with the
+    top-level ATM ce_iv/pe_iv in the returned chain dict."""
+    try:
+        strike = row.get("strike_price")
+        if spot and strike is not None and spot > 0:
+            if abs(float(strike) / float(spot) - 1.0) > _GREEKS_CAPTURE_MAX_MONEYNESS:
+                return {}
+        out: dict = {}
+        any_val = False
+        for leg, prefix in (("call_options", "ce"), ("put_options", "pe")):
+            g = (row.get(leg) or {}).get("option_greeks") or {}
+            for k in _GREEK_KEYS:
+                v = g.get(k)
+                v = float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+                out[f"{prefix}_{k}"] = v
+                any_val = any_val or v is not None
+        return out if any_val else {}
+    except Exception:
+        return {}
+
+
 def _derive_strike_interval(chain: list, atm_strike: Optional[float]) -> float:
     """Real listed strike interval for THIS symbol's THIS expiry, read
     straight off the live chain — not guessed from a static per-symbol
@@ -1417,6 +1466,7 @@ def fetch_oi_resistance(index: str = "NIFTY", expiry_date: str | None = None) ->
         # to the reference strike's premium (see fo_scan.py's premium
         # lookup). Rounding both sides of the lookup to the same precision
         # removes that class of miss.
+        _greeks_spot = next((r.get("underlying_spot_price") for r in chain if r.get("underlying_spot_price")), None)
         strike_premiums = {
             round(r.get("strike_price"), 2): {
                 "ce_premium": _premium(r, "call_options"),
@@ -1449,6 +1499,12 @@ def fetch_oi_resistance(index: str = "NIFTY", expiry_date: str | None = None) ->
                 "ce_ask": ((r.get("call_options") or {}).get("market_data") or {}).get("ask_price", 0) or 0,
                 "pe_bid": ((r.get("put_options") or {}).get("market_data") or {}).get("bid_price", 0) or 0,
                 "pe_ask": ((r.get("put_options") or {}).get("market_data") or {}).get("ask_price", 0) or 0,
+                # [2026-10-23, Greeks Phase 1] per-strike delta/gamma/
+                # theta/vega/iv for both legs (near-spot band only) --
+                # see _strike_greeks_fields()'s docstring. Additive: no
+                # existing key above is touched, and DORE treats absent
+                # Greeks as "unavailable", never as zero.
+                **_strike_greeks_fields(r, _greeks_spot),
             }
             for r in chain if r.get("strike_price") is not None
         }
@@ -2516,6 +2572,9 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
                 "ce_ask": _md(r, "call_options", "ask_price"),
                 "pe_bid": _md(r, "put_options", "bid_price"),
                 "pe_ask": _md(r, "put_options", "ask_price"),
+                # [2026-10-23, Greeks Phase 1] see the identical addition
+                # in fetch_oi_resistance() and _strike_greeks_fields().
+                **_strike_greeks_fields(r, spot),
             }
             for r in chain if r.get("strike_price") is not None
         }
