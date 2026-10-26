@@ -181,8 +181,10 @@ def test_reliable_flag_separates_atm_from_far_otm_short_dated():
     s = DoreOptionsSettings()
     atm = _quote(100.0, 100.0, 30, 0.30, "C")
     far = _quote(100.0, 104.0, 3, 0.30, "C")
-    a = evaluate_candidate_greeks(_row(atm, CE), CE, round(atm[0], 2), 100.0, _Sig(100, 1.9), s)
-    f = evaluate_candidate_greeks(_row(far, CE), CE, round(far[0], 2), 104.0, _Sig(100, 1.9), s)
+    # expiry supplied: with no expiry the Taylor read is (correctly) flagged
+    # unbounded/unreliable regardless of gamma share -- see the P1 tests below.
+    a = evaluate_candidate_greeks(_row(atm, CE), CE, round(atm[0], 2), 100.0, _Sig(100, 1.9), s, calendar_dte=30)
+    f = evaluate_candidate_greeks(_row(far, CE), CE, round(far[0], 2), 104.0, _Sig(100, 1.9), s, calendar_dte=3)
     assert a["reliable"] is True and a["gamma_share"] < 0.25
     assert f["reliable"] is False and f["gamma_share"] > 0.25
 
@@ -551,3 +553,156 @@ def test_trading_basis_uses_sessions_not_calendar_days_for_theta():
         r = evaluate_candidate_greeks(row, CE, P, K, sig, s, calendar_dte=10, years_to_expiry=10 / 365.0)
     assert r["ok"] and r["theta_days"] == 1.0
     assert 0.8 < r["theta_ratio"] < 1.25                 # unit check de-scaled by 365/252
+
+
+# ── 2026-10-27: theta-basis mismatch is withheld, unbounded Taylor is flagged ──
+from utils.dore_options_engine import theta_basis_verdict, _THETA_SCALED_KEYS
+
+
+def test_theta_verdict_true_false_none():
+    s = DoreOptionsSettings()                       # configured = calendar
+    y = 5 / 365.0
+    cal = greeks_theta_basis_probe(_chain_rows(1.0), CE, 25000.0, y, s)
+    trd = greeks_theta_basis_probe(_chain_rows(365 / 252), CE, 25000.0, y, s)
+    unc = greeks_theta_basis_probe(_chain_rows(3.0), CE, 25000.0, y, s)
+    assert theta_basis_verdict(cal, s)["theta_verified"] is True
+    assert theta_basis_verdict(trd, s)["theta_verified"] is False
+    assert theta_basis_verdict(unc, s)["theta_verified"] is None      # not contradicted, not confirmed
+    assert theta_basis_verdict({}, s) == {"theta_verified": None}
+    assert theta_basis_verdict(None, s) == {"theta_verified": None}
+
+
+def _atm_with_verdict(theta_scale, cfg_basis):
+    s = DoreOptionsSettings(); s.greeks_theta_basis = cfg_basis
+    row, P, K, S = _atm_row(10, theta_scale=theta_scale)
+    sig = _S2(); sig.current_price = S
+    y = 10 / 365.0
+    verdict = theta_basis_verdict(greeks_theta_basis_probe(_chain_rows(theta_scale, S=S, dte=10), CE, S, y, s), s)
+    return s, row, P, K, sig, y, verdict
+
+
+def test_mismatch_withholds_theta_scaled_fields_and_falls_back_to_bs():
+    # feed is per-TRADING-day but the setting says calendar
+    s, row, P, K, sig, y, v = _atm_with_verdict(365 / 252, "calendar")
+    assert v["theta_verified"] is False
+    r = evaluate_candidate_greeks(row, CE, P, K, sig, s, calendar_dte=10, years_to_expiry=y, theta_verdict=v)
+    assert r["ok"] and r["theta_verified"] is False and r["theta_basis_mismatch"] is True
+    assert r["reliable"] is False
+    for k in _THETA_SCALED_KEYS:
+        assert r[k] is None, k
+    # scenario comes from the BS reprice (never touches feed theta), not Taylor
+    assert r["method"] == "bs" and r["method_reason"] == "theta_basis_mismatch"
+    assert r["fav_pct"] == r["bs_fav_pct"]
+    assert r["stall_pct"] is not None and r["adv_pct"] is not None
+
+
+def test_mismatch_without_bs_inputs_is_unavailable_not_a_wrong_number():
+    s, row, P, K, sig, y, v = _atm_with_verdict(365 / 252, "calendar")
+    r = evaluate_candidate_greeks(row, CE, P, K, sig, s, calendar_dte=None, years_to_expiry=None, theta_verdict=v)
+    assert r["method"] == "unavailable" and r["theta_verified"] is False
+    assert r["fav_pct"] is None and r["stall_pct"] is None and r["adv_pct"] is None
+
+
+def test_matching_basis_is_verified_and_unchanged():
+    s, row, P, K, sig, y, v = _atm_with_verdict(1.0, "calendar")
+    r = evaluate_candidate_greeks(row, CE, P, K, sig, s, calendar_dte=10, years_to_expiry=y, theta_verdict=v)
+    base = evaluate_candidate_greeks(row, CE, P, K, sig, s, calendar_dte=10, years_to_expiry=y)
+    assert r["theta_verified"] is True and "theta_basis_mismatch" not in r
+    assert r["fav_pct"] == base["fav_pct"] and r["stall_pct"] == base["stall_pct"]
+    assert r["be_sigma"] is not None and r["theta_pct_day"] is not None
+
+
+def test_plan_level_skips_sigma_req_when_theta_unverified():
+    s, row, P, K, sig, y, v = _atm_with_verdict(365 / 252, "calendar")
+    cg = evaluate_candidate_greeks(row, CE, P, K, sig, s, calendar_dte=10, years_to_expiry=y, theta_verdict=v)
+    out = _plan_level_greeks(cg, P, round(P * 1.2, 2), round(P * 1.5, 2))
+    assert out["t1_sigma_req"] is None and out["t2_sigma_req"] is None
+    assert out["t1_gain_pct"] is not None
+
+
+def test_unreliable_taylor_with_unknown_expiry_is_unavailable():
+    s = DoreOptionsSettings()
+    far = _quote(100.0, 104.0, 3, 0.30, "C")          # gamma-dominated => Taylor unreliable
+    r = evaluate_candidate_greeks(_row(far, CE), CE, round(far[0], 2), 104.0, _Sig(100, 1.9), s)
+    assert r["ok"] and r["method"] == "unavailable" and r["method_reason"] == "unreliable_taylor_no_bs"
+    assert r["reliable"] is False and r["unbounded"] is True
+    assert r["fav_pct"] is None and r["stall_pct"] is None and r["adv_pct"] is None
+
+
+def test_reliable_taylor_with_unknown_expiry_is_marked_unbounded():
+    s = DoreOptionsSettings()
+    atm = _quote(100.0, 100.0, 30, 0.30, "C")
+    r = evaluate_candidate_greeks(_row(atm, CE), CE, round(atm[0], 2), 100.0, _Sig(100, 1.9), s)
+    assert r["method"] == "taylor_unbounded" and r["unbounded"] is True
+    assert r["reliable"] is False                      # consumers (gate/attribution) must not act on it
+    assert r["fav_pct"] is not None                    # still shown, as an approximation
+
+
+def test_known_expiry_is_bounded_and_unchanged():
+    s = DoreOptionsSettings()
+    atm = _quote(100.0, 100.0, 30, 0.30, "C")
+    r = evaluate_candidate_greeks(_row(atm, CE), CE, round(atm[0], 2), 100.0, _Sig(100, 1.9), s, calendar_dte=30)
+    assert r["method"] == "taylor" and r["unbounded"] is False and r["reliable"] is True
+
+
+def test_gate_never_acts_on_theta_unverified_read():
+    # gate preconditions: ok AND reliable AND theta_verified is not False
+    s, row, P, K, sig, y, v = _atm_with_verdict(365 / 252, "calendar")
+    r = evaluate_candidate_greeks(row, CE, P, K, sig, s, calendar_dte=10, years_to_expiry=y, theta_verdict=v)
+    assert not (r["ok"] and r["reliable"] and r["theta_verified"] is not False)
+
+
+def _plan_with_theta_scale(theta_scale, settings, years=14 / 365.0):
+    """End to end through compute_dore_trade_plan: chain theta = BS theta x scale."""
+    from unittest import mock
+    import utils.nse_calendar as cal
+    close = list(100 * (1.01 ** np.arange(60)))
+    S = close[-1]
+    od = _option_data(S)
+    # Finer strikes than the shared fixture: the theta probe only looks at
+    # strikes within 3% of spot and needs >= 3 of them (a real chain has many).
+    base = round(S / 2) * 2
+    tmpl = od["strike_premiums"][float(round(S / 10) * 10)]
+    sp = {}
+    for i in range(-20, 21):
+        k = float(base + i * 2)
+        row = dict(tmpl)
+        row["ce_premium"] = row["pe_premium"] = max(0.3, 1.5 - abs(i) * 0.05)
+        P, d, gm, th, vg = _bs(S, k, years, 0.30, "C")
+        row["ce_theta"] = th * theta_scale
+        P, d, gm, th, vg = _bs(S, k, years, 0.31, "P")
+        row["pe_theta"] = th * theta_scale
+        sp[k] = row
+    od["strike_premiums"] = sp
+    od["strike_interval"] = 2
+    with mock.patch.object(cal, "years_to_expiry", return_value=years):
+        return compute_dore_trade_plan(_scan_row(S), close, od, dte=14, symbol="TESTCO",
+                                       market_regime="bullish", settings=settings)
+
+
+def test_e2e_mismatch_marks_plan_unverified_and_withholds_theta_fields():
+    plan = _plan_with_theta_scale(365 / 252, DoreOptionsSettings(greeks_theta_basis="calendar"))
+    assert isinstance(plan, OptionTradePlan), f"fixture rejected: {plan}"
+    g = plan.greeks
+    assert g["theta_basis_measured"] == "trading"
+    assert g["theta_verified"] is False and g["theta_basis_mismatch"] is True
+    assert g["reliable"] is False
+    assert g["be_sigma"] is None and g["t1_sigma_req"] is None and g["t2_sigma_req"] is None
+    assert g["method"] in ("bs", "unavailable")
+
+
+def test_e2e_matching_basis_is_verified():
+    plan = _plan_with_theta_scale(1.0, DoreOptionsSettings(greeks_theta_basis="calendar"))
+    assert isinstance(plan, OptionTradePlan), f"fixture rejected: {plan}"
+    assert plan.greeks["theta_verified"] is True and "theta_basis_mismatch" not in plan.greeks
+    assert plan.greeks["be_sigma"] is not None
+
+
+def test_e2e_gate_cannot_veto_on_unverified_theta():
+    # Gate thresholds set so tight that ANY trusted read would veto; the
+    # theta-mismatched read must still pass (fail-open), the verified one must not.
+    tight = dict(enable_greeks_gate=True, greeks_gate_max_be_sigma=0.0001, greeks_gate_max_t1_sigma=0.0001)
+    bad = _plan_with_theta_scale(365 / 252, DoreOptionsSettings(greeks_theta_basis="calendar", **tight))
+    assert isinstance(bad, OptionTradePlan), f"unverified read was vetoed: {bad}"
+    good = _plan_with_theta_scale(1.0, DoreOptionsSettings(greeks_theta_basis="calendar", **tight))
+    assert not isinstance(good, OptionTradePlan) or good.greeks.get("reliable") is not True

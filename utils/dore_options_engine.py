@@ -601,6 +601,11 @@ class DoreOptionsSettings:
     # every plan records the MEASURED basis (theta_basis_measured, from a
     # chain-wide median ratio to Black-Scholes) and a mismatch with this
     # setting is logged and flagged -- it is never switched automatically.
+    # On a contradicted basis (theta_verified=False) every theta-scaled
+    # number is WITHHELD (None) and the scenario is taken from the full BS
+    # reprice (which never uses the feed's theta) or marked unavailable;
+    # the read is also marked reliable=False so the gate and attribution
+    # cannot act on it. See theta_basis_verdict().
     greeks_theta_basis: str = "calendar"
 
     # ── Greeks reachability gate [2026-10-23, Phase 2 -- DEFAULT OFF] ──
@@ -1400,12 +1405,42 @@ def greeks_theta_basis_probe(strike_premiums: dict, dir_: str, spot: float,
         return {}
 
 
+def theta_basis_verdict(probe: Optional[dict], settings: "DoreOptionsSettings") -> dict:
+    """Turns greeks_theta_basis_probe()'s measurement into a verdict the
+    scenario estimator can act on.
+
+    theta_verified:
+      True  -- measured basis == configured greeks_theta_basis
+      False -- measured a DIFFERENT, unambiguous basis (calendar vs
+               trading): every theta-scaled number would be off by ~1.45x
+               (more on weekends), so those numbers must not be used
+      None  -- not measurable (<3 usable strikes, too close to expiry) or
+               \"unclear\": nothing contradicts the setting, but nothing
+               confirms it either. Left fail-open, as before.
+    Pure function; never switches the configured basis automatically."""
+    cfg = getattr(settings, "greeks_theta_basis", "calendar")
+    if not probe:
+        return {"theta_verified": None}
+    m = probe.get("theta_basis_measured")
+    if m in ("calendar", "trading"):
+        return {**probe, "theta_verified": m == cfg}
+    return {**probe, "theta_verified": None}
+
+
+# Fields that are a function of the feed's theta scaled by days and are NOT
+# re-derivable from Black-Scholes. Withheld (None) when the chain contradicts
+# the configured theta basis. (fav/stall/adv are handled separately: they
+# fall back to the full BS reprice, which never touches the feed's theta.)
+_THETA_SCALED_KEYS = ("fav_pct_taylor", "fav_pct_ex_gamma", "bs_err_pts", "be_sigma", "theta_pct_day")
+
+
 def evaluate_candidate_greeks(
     row: dict, dir_: str, premium: Optional[float], strike: float,
     sig: "MasterScannerSignal", settings: "DoreOptionsSettings",
     proxy_delta: Optional[float] = None,
     calendar_dte: Optional[int] = None,
     years_to_expiry: Optional[float] = None,
+    theta_verdict: Optional[dict] = None,
 ) -> Optional[dict]:
     """Compact, JSON-safe Greeks read + scenario estimate for ONE
     candidate strike. Returns None when the chain row carried no Greeks
@@ -1488,9 +1523,32 @@ def evaluate_candidate_greeks(
         if (not _reliable) or hold >= float(settings.greeks_bs_hold_dte_frac) * _cal:
             _method = "bs"
     _fav_pct, _stall_pct, _adv_pct = _pct(fav["premium"]), _pct(stall["premium"]), _pct(adv["premium"])
-    if _method == "bs":
+    _tv = (theta_verdict or {}).get("theta_verified")
+    _theta_bad = _tv is False
+    _method_reason = None
+    if _theta_bad:
+        # The chain says the feed's theta is on a different time basis than
+        # greeks_theta_basis, so every Taylor number is mis-scaled. The BS
+        # reprice doesn't use the feed's theta at all, so it is the only
+        # honest scenario source; without it the scenario is unavailable.
+        _reliable = False
+        _method_reason = "theta_basis_mismatch"
+        _method = "bs" if _bs else "unavailable"
+    elif _bs is None and not _reliable:
+        # Unreliable Taylor (gamma-dominated) and nothing to replace it
+        # with (no expiry or no IV): do not present it as a fallback.
+        _method, _method_reason = "unavailable", "unreliable_taylor_no_bs"
+    elif _cal is None:
+        # Taylor with no expiry cap: theta/gamma are extrapolated for a hold
+        # that may outlast the contract. Show it, but as an unbounded
+        # approximation that downstream consumers must not act on.
+        _method, _method_reason, _reliable = "taylor_unbounded", "expiry_unknown", False
+    if _method == "bs" and _bs:
         _fav_pct, _stall_pct, _adv_pct = _bs["fav"], _bs["stall"], _bs["adv"]
-    return {
+    elif _method == "unavailable":
+        _fav_pct = _stall_pct = _adv_pct = None
+
+    _out = {
         "ok": True,
         "delta": round(g.delta, 4), "gamma": round(g.gamma, 5),
         "theta": round(g.theta, 4), "vega": round(g.vega, 4),
@@ -1521,7 +1579,17 @@ def evaluate_candidate_greeks(
         # Real chain |delta| minus DORE's POP-as-delta proxy
         # (StrikeCandidate.delta_approx) -- measures how good that proxy is.
         "delta_vs_proxy": round(abs(g.delta) - proxy_delta, 3) if proxy_delta is not None else None,
+        "method_reason": _method_reason,
+        "unbounded": bool(_cal is None),
+        "theta_verified": _tv,
+        "theta_basis_configured": _basis,
+        **{k: v for k, v in (theta_verdict or {}).items() if k != "theta_verified"},
     }
+    if _theta_bad:
+        _out["theta_basis_mismatch"] = True
+        for _k in _THETA_SCALED_KEYS:
+            _out[_k] = None
+    return _out
 
 
 # Keys kept on the NON-primary candidates in the persisted plan. The full
@@ -1551,14 +1619,17 @@ def _plan_level_greeks(cg: Optional[dict], premium: Optional[float],
     if sigma_hold <= 0:
         return out
     theta_cost = abs(cg["theta"]) * cg.get("theta_days", cg["hold_days"])
+    _theta_ok = cg.get("theta_verified") is not False
     for name, tgt in (("t1", target1), ("t2", target2)):
         if tgt is None:
             continue
         gain = tgt - premium
         out[f"{name}_gain_pct"] = round(gain / premium * 100.0, 1)
-        out[f"{name}_sigma_req"] = round(
+        # sigma_req embeds the theta cost; withheld when theta is untrusted.
+        out[f"{name}_sigma_req"] = (round(
             _required_move(abs(cg["delta"]), cg["gamma"], gain + theta_cost) / sigma_hold, 2)
-    if target1 is not None:
+            if _theta_ok else None)
+    if target1 is not None and cg.get("fav_pct") is not None:
         out["t1_ok_fav"] = bool(cg["fav_pct"] >= (target1 / premium - 1.0) * 100.0)
     return out
 
@@ -3049,7 +3120,8 @@ def _exit_before_expiry_rule(dte: int) -> str:
 def _build_candidate(label: str, strike_data: dict, dir_: str, chain: OptionChainSnapshot,
                       sig: MasterScannerSignal, settings: DoreOptionsSettings,
                       calendar_dte: Optional[int] = None,
-                      years_to_expiry: Optional[float] = None) -> tuple[StrikeCandidate, list[str], float, float, bool, PremiumQuote]:
+                      years_to_expiry: Optional[float] = None,
+                      theta_verdict: Optional[dict] = None) -> tuple[StrikeCandidate, list[str], float, float, bool, PremiumQuote]:
     """Builds one StrikeCandidate + its own OI/premium reasons, premium
     quality and OI quality (needed by Stage 8 for the Balanced/primary
     leg only, but computed uniformly for all three). Also returns the
@@ -3085,6 +3157,7 @@ def _build_candidate(label: str, strike_data: dict, dir_: str, chain: OptionChai
                 proxy_delta=strike_data["probability_of_profit"] / 100.0,
                 calendar_dte=calendar_dte,
                 years_to_expiry=years_to_expiry,
+                theta_verdict=theta_verdict,
             )
         except Exception:
             logger.warning("[DORE Options:%s] Greeks diagnostics failed for %s (non-fatal)",
@@ -3701,6 +3774,19 @@ def compute_dore_trade_plan(
         _yrs_left = _yte(chain.expiry)
     except Exception:
         _yrs_left = None
+    # [theta-basis verdict] Measured ONCE per plan and BEFORE any candidate
+    # is evaluated, so every scenario number is built knowing whether the
+    # feed's theta basis agrees with greeks_theta_basis. Fail-soft: any
+    # error -> no verdict -> theta_verified=None (unverified, fail-open).
+    _theta_verdict: dict = {}
+    if settings.enable_greeks_diagnostics:
+        try:
+            _theta_verdict = theta_basis_verdict(
+                greeks_theta_basis_probe(chain.strike_premiums, dir_, float(sig.current_price or 0.0),
+                                         _yrs_left, settings), settings)
+        except Exception:
+            logger.warning("[DORE Options:%s] theta-basis probe failed (non-fatal)", sig.symbol, exc_info=True)
+            _theta_verdict = {}
     per_label_reasons: dict[str, list[str]] = {}
     per_label_ok: dict[str, bool] = {}
     primary_premium_quality = primary_oi_quality = 0.0
@@ -3710,6 +3796,7 @@ def compute_dore_trade_plan(
             label, strikes[label], dir_, chain, sig, settings,
             calendar_dte=(calendar_dte if calendar_dte is not None else dte),
             years_to_expiry=_yrs_left,
+            theta_verdict=_theta_verdict,
         )
         candidates[label] = candidate
         per_label_reasons[label] = reasons
@@ -3831,15 +3918,13 @@ def compute_dore_trade_plan(
     if settings.enable_greeks_diagnostics and primary.greeks is not None:
         try:
             _plan_greeks = _plan_level_greeks(primary.greeks, primary.premium, target1, target2)
-            _probe = greeks_theta_basis_probe(chain.strike_premiums, dir_, float(sig.current_price or 0.0),
-                                              _yrs_left, settings)
-            if _probe and _plan_greeks:
-                _plan_greeks = {**_plan_greeks, **_probe}
+            _probe = _theta_verdict
+            if _probe.get("theta_basis_measured") and _plan_greeks:
                 _cfg = getattr(settings, "greeks_theta_basis", "calendar")
-                if _probe["theta_basis_measured"] not in (_cfg, "unclear"):
-                    _plan_greeks["theta_basis_mismatch"] = True
+                if _probe.get("theta_verified") is False:
                     logger.warning("[DORE Options:%s] feed theta looks %s-basis (median ratio %.2f) but "
-                                   "greeks_theta_basis=%s -- verify with scripts/verify_upstox_greeks_units.py",
+                                   "greeks_theta_basis=%s -- theta-scaled scenario fields WITHHELD; "
+                                   "verify with scripts/verify_upstox_greeks_units.py",
                                    sig.symbol, _probe["theta_basis_measured"], _probe["theta_ratio_med"], _cfg)
         except Exception:
             logger.warning("[DORE Options:%s] plan-level Greeks diagnostics failed (non-fatal)",
@@ -3849,7 +3934,7 @@ def compute_dore_trade_plan(
     # DoreOptionsSettings.enable_greeks_gate for the rationale and why it
     # fails open. Runs after targets are final so T1 reflects what ships.
     if (settings.enable_greeks_gate and _plan_greeks and _plan_greeks.get("ok")
-            and _plan_greeks.get("reliable")):
+            and _plan_greeks.get("reliable") and _plan_greeks.get("theta_verified") is not False):
         _gate_why = []
         _be = _plan_greeks.get("be_sigma")
         if _be is not None and _be > settings.greeks_gate_max_be_sigma:
