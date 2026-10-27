@@ -191,17 +191,12 @@ def _days_to_expiry(expiry_str: str) -> int:
 
 
 def _load_settings(cfg: Optional[DoreOptionsSettings]) -> DoreOptionsSettings:
-    if cfg is not None:
-        return cfg
-    try:
-        import streamlit as st
-        # Mirrors utils/fo_scan.py's _load_settings() pattern — reads a
-        # dedicated session_state key so this engine's thresholds are
-        # tunable from Settings without touching DORE 2.0's own config.
-        overrides = st.session_state.get("dore_options_settings", {})
-        return DoreOptionsSettings(**overrides) if overrides else DORE_OPTIONS_DEFAULTS
-    except Exception:
-        return DORE_OPTIONS_DEFAULTS
+    # [Audit 2026-10-27] Removed the st.session_state["dore_options_settings"]
+    # override: nothing ever wrote it, and the persistence/live-state layers
+    # read DORE_OPTIONS_DEFAULTS directly, so an override could only ever have
+    # reached the scan stage and left the rest of the lifecycle on defaults.
+    # Pass `cfg` explicitly (tests/backtests) or change the defaults.
+    return cfg if cfg is not None else DORE_OPTIONS_DEFAULTS
 
 
 @dataclass

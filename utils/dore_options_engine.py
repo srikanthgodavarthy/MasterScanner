@@ -87,12 +87,14 @@ REGIME_DOWNTREND = "DOWNTREND"
 class DoreOptionsSettings:
     """All tunable thresholds for the redesigned DORE engine."""
 
-    # ── Stage 1: Qualification Score weights (soft ranking, NOT a
-    #    filter — Improvement #1). Only used to rank/sort candidates
-    #    and to lightly bias strike aggressiveness; never rejects.
-    w_qual_conviction:    float = 0.45
-    w_qual_entry_quality: float = 0.35
-    w_qual_ema_momentum:  float = 0.20
+    # ── Tracking floors (single source of truth) ────────────────
+    # Minimum final confidence_score for a plan to be TRACKED. Used by
+    # utils.dore_options_persistence (minting), pages/scanner.py (display)
+    # and the index PCR-conflict demotion in compute_dore_trade_plan(), all
+    # through track_floor() / these fields -- never literals.
+    # Stock 0-2 / 3-5 DTE use gamma_min_confidence_to_track_* below instead.
+    min_confidence_to_track:       float = 65.0
+    min_confidence_to_track_index: float = 50.0
 
     # ── Hard-reject gates (obvious failures only) ───────────────
     min_valid_price: float = 0.01
@@ -171,6 +173,10 @@ class DoreOptionsSettings:
     # Base "Desired Capture" from the original spec example (0.70 for
     # 6-10 DTE and, per the worked example, also representative of the
     # >10 DTE case at 12 DTE / 70%).
+    # LEGACY FALLBACK (audit 2026-10-27): these four are read only by
+    # _base_capture_ratio(), i.e. only when enable_gamma_zone_strike_selection
+    # is False. While gamma-zone selection is on (default) the live controls
+    # are gamma_capture_ratio_*. Delete both the flag and this set together.
     capture_ratio_0_2_dte:   float = 0.85
     capture_ratio_3_5_dte:   float = 0.80
     capture_ratio_6_10_dte:  float = 0.70
@@ -740,6 +746,14 @@ class MasterScannerSignal:
     cv4_smc_evidence_tier:  Optional[int]   = None
     cv4_smc_state:          Optional[str]   = None    # e.g. BULLISH_CONTINUATION, LIQUIDITY_SWEEP, ...
     cv4_smc_fvg_retest:     Optional[str]   = None    # none | in_zone | through_unfilled | through_filled
+
+    # [Audit 2026-10-27] expected_move as computed BEFORE the IV blend in
+    # compute_dore_trade_plan(). validate_premium()'s "premium too high" check
+    # uses this, not the IV-inflated expected_move: a premium is ~0.40x the IV
+    # move at any DTE/IV, so against the IV move the 2.5x ceiling could never
+    # fire and rich premiums raised their own acceptance bar. 0.0 = not set
+    # (validate_premium falls back to expected_move).
+    atr_expected_move:      float = 0.0
 
     @staticmethod
     def from_scan_row(
@@ -2055,21 +2069,23 @@ class DoreRejection:
 # ══════════════════════════════════════════════════════════════════
 
 def qualification_score(sig: MasterScannerSignal, mom: "EmaMomentum", settings: DoreOptionsSettings) -> float:
-    """Every candidate that reaches DORE gets scored, not filtered.
-    Ranking (rank_recommendations()) uses this instead of a hard
-    Conviction/Entry-Quality gate.
+    """DIAGNOSTIC ONLY (audit 2026-10-27). Not read by rank_recommendations()
+    (which sorts on confidence_score), select_strikes(), any gate or any
+    persistence floor. It is stored on the plan (qualification_score, and as
+    entry_snapshot's derivatives_score) so setup quality can be compared with
+    the final score in analytics.
 
-    [Setup-Aware Conviction, 2026-08-06, argmax rewrite 2026-08-07] Uses
-    sig.setup_conviction (the highest of the three independently-
-    computed setup scores — see setup_aware_conviction() above) instead
-    of utils.conviction_score_v1's blended sig.conviction, so a strong
-    breakout/continuation candidate is judged on its own type's scale
-    rather than one that structurally favors pullbacks."""
+    It is the conviction / entry-quality / EMA-momentum slice of final_score(),
+    renormalised to 100 using the STOCK weights (w_conviction, w_entry_quality,
+    w_ema_momentum) -- there is no separate weight set to drift away from the
+    final score. Uses sig.setup_conviction (see setup_aware_conviction())."""
+    w = (settings.w_conviction, settings.w_entry_quality, settings.w_ema_momentum)
+    total = sum(w) or 1.0
     score = (
-        sig.setup_conviction * settings.w_qual_conviction +
-        sig.entry_quality    * settings.w_qual_entry_quality +
-        mom.momentum_score   * settings.w_qual_ema_momentum
-    )
+        sig.setup_conviction * w[0] +
+        sig.entry_quality    * w[1] +
+        mom.momentum_score   * w[2]
+    ) / total
     return round(max(0.0, min(100.0, score)), 1)
 
 
@@ -2203,6 +2219,14 @@ def ema_momentum(close: Sequence[float], settings: DoreOptionsSettings,
 
 def direction(sig: MasterScannerSignal, mom: EmaMomentum, settings: DoreOptionsSettings,
               adx: Optional[float] = None) -> tuple[str, float, list[str]]:
+    """EMA-cross CE/PE call plus a direction `confidence` (0-100).
+
+    That confidence feeds STRIKE SELECTION only (capture-ratio nudge, the
+    long-DTE cap threshold, the gamma pull toward ATM). It is NOT part of
+    final_score()/confidence_score and never touches a tracking floor, so the
+    RSI/ADX modifiers here cannot double-count into the plan score. When
+    use_smc_direction fires, confidence comes from SMC evidence tier instead
+    and this function's RSI/ADX modifiers are skipped."""
     reasons: list[str] = []
     dir_ = CE if mom.bullish else PE
     reasons.append("EMA9 above EMA21" if mom.bullish else "EMA9 below EMA21")
@@ -2260,6 +2284,26 @@ def expiry_bucket(dte: int) -> str:
 # T-1 execution restriction is_index_symbol() exists to route around
 # (see min_dte_stock_options below).
 _INDICES = ("NIFTY", "SENSEX", "BANKNIFTY")
+
+
+def track_floor(symbol: str = "", dte: Optional[int] = None,
+                settings: Optional[DoreOptionsSettings] = None) -> float:
+    """The ONE confidence floor for tracking a plan (and for showing a
+    candidate that could be tracked). Index symbols use
+    min_confidence_to_track_index; stocks use the DTE-bucketed gamma floors at
+    0-2 / 3-5 DTE when gamma-zone selection is on; everything else (and
+    dte=None) uses min_confidence_to_track."""
+    st = settings or DORE_OPTIONS_DEFAULTS
+    if symbol and is_index_symbol(symbol):
+        return st.min_confidence_to_track_index
+    if not st.enable_gamma_zone_strike_selection or dte is None:
+        return st.min_confidence_to_track
+    bucket = expiry_bucket(int(dte))
+    if bucket == "0-2":
+        return st.gamma_min_confidence_to_track_0_2_dte
+    if bucket == "3-5":
+        return st.gamma_min_confidence_to_track_3_5_dte
+    return st.min_confidence_to_track
 
 
 def is_index_symbol(symbol: str) -> bool:
@@ -2994,8 +3038,11 @@ def validate_premium(
     atr = sig.atr or 0.0
     if atr > 0 and premium < atr * settings.premium_atr_min_mult:
         return False, premium, 0.0, [f"Premium {premium:.2f} too low vs ATR {atr:.2f}"]
-    if sig.expected_move > 0 and premium > sig.expected_move * settings.premium_move_max_mult:
-        return False, premium, 0.0, [f"Premium {premium:.2f} too high vs Expected Move {sig.expected_move:.2f}"]
+    # ATR-based move on purpose (see MasterScannerSignal.atr_expected_move):
+    # the IV-blended expected_move scales with the premium it would judge.
+    ref_move = sig.atr_expected_move if sig.atr_expected_move > 0 else sig.expected_move
+    if ref_move > 0 and premium > ref_move * settings.premium_move_max_mult:
+        return False, premium, 0.0, [f"Premium {premium:.2f} too high vs ATR Expected Move {ref_move:.2f}"]
 
     reasons = ["Efficient premium relative to ATR"]
     quality = 70.0
@@ -3316,6 +3363,7 @@ def compute_dore_trade_plan(
     # trades can be backtested by which source drove their POP/targets.
     expected_move_source = "ATR"
     _atr_expected_move = sig.expected_move
+    sig.atr_expected_move = _atr_expected_move
     _iv_expected_move = None
     _ce_iv = option_data.get("ce_iv")
     _pe_iv = option_data.get("pe_iv")
@@ -3892,13 +3940,9 @@ def compute_dore_trade_plan(
     if is_index_symbol(sig.symbol) and any(
         "CONFLICTS" in str(r) for r in per_label_reasons[_primary_label]
     ):
-        # Literal, not imported: importing utils.dore_options_persistence
-        # here would pull its whole module chain (-> utils.outcome_
-        # tracking -> psycopg2) into this otherwise persistence-free
-        # compute layer, on every index+conflict cycle, just to read one
-        # constant. Keep this synced with MIN_CONFIDENCE_TO_TRACK_INDEX
-        # in utils/dore_options_persistence.py if that ever changes.
-        score = min(score, 49.0)  # MIN_CONFIDENCE_TO_TRACK_INDEX (50) - 1
+        # Read from settings (same field the persistence layer and UI use via
+        # track_floor()), so the demotion can never drift from the floor.
+        score = min(score, settings.min_confidence_to_track_index - 1.0)
 
     primary = candidates[_primary_label]
     entry_low = entry_high = None

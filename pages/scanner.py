@@ -4109,11 +4109,16 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
     # disagreeing with the mint floor before 2026-08-10 raised it to
     # match in the first place.
     if "confidence_score" in df.columns:
-        from utils.dore_options_engine import is_index_symbol
-        from utils.dore_options_persistence import MIN_CONFIDENCE_TO_TRACK, MIN_CONFIDENCE_TO_TRACK_INDEX
+        # [Audit 2026-10-27] Same track_floor() the persistence layer mints
+        # with, including the DTE-bucketed stock floors (80 at 0-2 DTE, 78 at
+        # 3-5 DTE) -- the old flat 65/50 showed rows that could never track.
+        from utils.dore_options_engine import track_floor
         conf = pd.to_numeric(df["confidence_score"], errors="coerce")
-        floor = df.get("symbol", pd.Series("", index=df.index)).apply(
-            lambda s: MIN_CONFIDENCE_TO_TRACK_INDEX if is_index_symbol(s) else MIN_CONFIDENCE_TO_TRACK
+        _sym = df["symbol"] if "symbol" in df.columns else pd.Series("", index=df.index)
+        _dte = pd.to_numeric(df["dte"], errors="coerce") if "dte" in df.columns else pd.Series(float("nan"), index=df.index)
+        floor = pd.Series(
+            [track_floor(str(s or ""), None if pd.isna(d) else int(d)) for s, d in zip(_sym, _dte)],
+            index=df.index, dtype="float64",
         )
         df = df[conf >= floor]
 
@@ -4209,8 +4214,9 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
         df = df.drop(columns=["_sort_time"])
 
     if df.empty:
-        return ('<div style="color:var(--muted);padding:8px;">No candidates with Confidence ≥ 70 today '
-                'that are also Triggered (entry zone reached) right now.</div>')
+        return ('<div style="color:var(--muted);padding:8px;">No unlocked candidates are above their tracking '
+                'confidence floor (65 stocks, 50 indices, 78-80 for stocks within 5 days of expiry) and '
+                'Triggered (entry zone reached) right now. Plans already minted are in Active Plans.</div>')
 
     def _fmt_trigger(row):
         status = row.get("entry_trigger_status")
