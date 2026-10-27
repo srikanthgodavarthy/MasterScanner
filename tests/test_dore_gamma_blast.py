@@ -432,7 +432,10 @@ def test_active_table_formatter_blast_watch_none_and_legacy():
     assert "BLAST 74" in b and "\u26a0" in b and "total loss" in b
     w = f({"gamma_blast_level_at_mint": "WATCH", "gamma_blast_score_at_mint": 58.0})
     assert "watch 58" in w and "BLAST" not in w
-    for row in ({"gamma_blast_level_at_mint": "NONE"}, {}, {"gamma_blast_level_at_mint": ""},
-                {"gamma_blast_level_at_mint": float("nan")}):
-        assert ">--<" in f(row)
+    # "evaluated, no setup" and "never evaluated" must LOOK different
+    none = f({"gamma_blast_level_at_mint": "NONE", "gamma_blast_score_at_mint": 44.0})
+    assert ">none<" in none and ">--<" not in none and "44" in none
+    for row in ({}, {"gamma_blast_level_at_mint": ""}, {"gamma_blast_level_at_mint": float("nan")}):
+        legacy = f(row)
+        assert ">--<" in legacy and "none" not in legacy.replace("Not evaluated", "") and "Not evaluated" in legacy
     assert "BLAST" in f({"gamma_blast_level_at_mint": "BLAST", "gamma_blast_score_at_mint": float("nan")})
