@@ -1085,6 +1085,13 @@ def close_fo_setup_plan_manually(setup_id: str, reason: str = "Manual exit") -> 
 
 # ─── DORE OPTIONS ENGINE PLANS (locked entry premium — DORE Options tab) ──────
 
+# Observation-only columns that arrive via hand-run migrations; see the
+# fallback in upsert_dore_options_plans_batch().
+_DORE_OPTIONAL_COLUMNS = (
+    "gamma_blast_level_at_mint", "gamma_blast_score_at_mint", "gamma_blast_risk_at_mint",
+)
+
+
 def upsert_dore_options_plans_batch(plans: list[dict]) -> bool:
     """Persist a batch of DoreOptionsPlan dicts (to_db_dict() output).
     Upserts on plan_id. Returns True if all batches succeeded."""
@@ -1099,12 +1106,31 @@ def upsert_dore_options_plans_batch(plans: list[dict]) -> bool:
         return v
 
     clean = [{k: _safe(v) for k, v in p.items()} for p in plans]
-    try:
+
+    def _write(rows):
         batch_size = 200
-        for i in range(0, len(clean), batch_size):
-            db.upsert_rows("dore_options_plans", clean[i:i + batch_size], conflict_cols=["plan_id"])
+        for i in range(0, len(rows), batch_size):
+            db.upsert_rows("dore_options_plans", rows[i:i + batch_size], conflict_cols=["plan_id"])
+
+    try:
+        _write(clean)
         return True
     except Exception as exc:
+        # [2026-10-26] Columns added by a hand-run migration. If the code is
+        # deployed first, every mint would fail on "column ... does not
+        # exist" -- retry WITHOUT the optional observation-only columns so
+        # plan tracking keeps working, and say so loudly.
+        optional = tuple(_DORE_OPTIONAL_COLUMNS)
+        if any(c in str(exc) for c in optional):
+            logger.warning("dore_options_plans is missing optional column(s) %s -- run "
+                           "DORE_OPTIONS_PLANS_GAMMA_BLAST_MIGRATION_SQL; retrying without them",
+                           [c for c in optional if c in str(exc)])
+            try:
+                _write([{k: v for k, v in r.items() if k not in optional} for r in clean])
+                return True
+            except Exception as exc2:
+                logger.error("upsert_dore_options_plans_batch retry failed: %s", exc2)
+                return False
         logger.error("upsert_dore_options_plans_batch failed: %s", exc)
         return False
 
@@ -1190,6 +1216,9 @@ def _dore_options_plan_from_row(row: dict) -> "object":
         iv_skew_caution_at_mint        = row.get("iv_skew_caution_at_mint", "") or "",
         iv_rank_at_mint                = row.get("iv_rank_at_mint"),
         iv_percentile_at_mint          = row.get("iv_percentile_at_mint"),
+        gamma_blast_level_at_mint      = row.get("gamma_blast_level_at_mint", "") or "",
+        gamma_blast_score_at_mint      = row.get("gamma_blast_score_at_mint"),
+        gamma_blast_risk_at_mint       = row.get("gamma_blast_risk_at_mint", "") or "",
         direction_source_at_mint       = row.get("direction_source_at_mint", "") or "",
         structural_data_source_at_mint = row.get("structural_data_source_at_mint", "") or "",
         futures_confirmation_used_at_mint      = bool(row.get("futures_confirmation_used_at_mint", False)),
@@ -2271,6 +2300,9 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
     iv_skew_caution_at_mint         text        NOT NULL DEFAULT '',
     iv_rank_at_mint                 numeric(6,2),
     iv_percentile_at_mint           numeric(6,2),
+    gamma_blast_level_at_mint       text        NOT NULL DEFAULT '',
+    gamma_blast_score_at_mint       numeric(6,1),
+    gamma_blast_risk_at_mint        text        NOT NULL DEFAULT '',
     direction_source_at_mint        text        NOT NULL DEFAULT '',
     structural_data_source_at_mint  text        NOT NULL DEFAULT '',
     futures_confirmation_used_at_mint       boolean     NOT NULL DEFAULT false,
@@ -2410,6 +2442,18 @@ ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS pcr_at_mint numeric(6,2)
 #      below — it is deliberately commented out by default since it's
 #      optional, not required for correctness:
 #   UPDATE dore_options_plans SET status = 'ACTIVE' WHERE status = 'OPEN';
+# [2026-10-26, SG request] Gamma-blast read frozen at mint (observation
+# only; utils/dore_gamma_blast.py). RUN THIS BEFORE DEPLOYING THE CODE THAT
+# WRITES THESE COLUMNS -- migrations here are applied by hand (psql / Neon
+# SQL Editor). upsert_dore_options_plans_batch() has a fallback that retries
+# without these columns if they are missing, so a late migration degrades
+# to "no blast on minted plans" instead of breaking minting -- but run it.
+DORE_OPTIONS_PLANS_GAMMA_BLAST_MIGRATION_SQL = """
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS gamma_blast_level_at_mint text NOT NULL DEFAULT '';
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS gamma_blast_score_at_mint numeric(6,1);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS gamma_blast_risk_at_mint text NOT NULL DEFAULT '';
+"""
+
 DORE_OPTIONS_PLANS_LIFECYCLE_MIGRATION_SQL = """
 ALTER TABLE dore_options_plans ALTER COLUMN entry_locked DROP NOT NULL;
 ALTER TABLE dore_options_plans ALTER COLUMN entry_locked DROP DEFAULT;

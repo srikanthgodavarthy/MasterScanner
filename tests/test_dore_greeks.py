@@ -294,6 +294,9 @@ def _scan_row(price, bullish=True):
 def _strip_greeks(d):
     d = dict(d)
     d.pop("greeks", None)
+    d.pop("gamma_blast", None)       # derived FROM the Greeks read, observation only (utils/dore_gamma_blast.py)
+    if isinstance(d.get("reasons"), list):
+        d["reasons"] = [r for r in d["reasons"] if not str(r).startswith("Gamma blast")]
     for k in ("primary", "conservative", "aggressive"):
         if isinstance(d.get(k), dict):
             d[k] = {kk: vv for kk, vv in d[k].items() if kk != "greeks"}

@@ -52,6 +52,7 @@ MATCH_TOLERANCE = pd.Timedelta(minutes=45)
 # flattened out of OptionTradePlan.greeks; abs_delta is derived.
 FEATURES = (
     "abs_delta",        # Delta   -- how directional the contract is
+    "blast_score",      # Gamma blast detector score (0-100; utils/dore_gamma_blast.py)
     "gamma_share",      # Gamma   -- share of the favorable estimate that is convexity
     "gamma_pct",        # Gamma   -- convexity gain in the favorable scenario, % of premium
     "theta_pct_day",    # Theta   -- daily decay as % of premium
@@ -100,6 +101,10 @@ def greeks_rows_from_plans(snap_ts, plans: Iterable[dict]) -> list[dict]:
             "confidence": p.get("confidence_score"), "dte": p.get("dte"),
         }
         row.update({f"g_{k}": v for k, v in g.items()})
+        _gb = p.get("gamma_blast")          # utils/dore_gamma_blast.py read, when present
+        if isinstance(_gb, dict):
+            row["g_blast_score"] = _gb.get("score")
+            row["g_blast_level"] = _gb.get("level")
         rows.append(row)
     return rows
 

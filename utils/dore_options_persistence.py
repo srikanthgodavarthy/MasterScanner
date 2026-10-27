@@ -416,6 +416,29 @@ def _sval(status) -> str:
     return str(status or "")
 
 
+
+def _blast_at_mint(row) -> dict:
+    """[2026-10-26, SG request] Gamma-blast read (utils/dore_gamma_blast.py),
+    frozen onto the plan at mint so Active Plans and closed-trade analysis
+    can show/slice it after the technical snapshot has moved on. `row` is
+    this cycle's OptionTradePlan.to_dict(). OBSERVATION ONLY -- nothing
+    downstream gates on it. Never raises; absent/odd input -> blanks."""
+    out = {"gamma_blast_level_at_mint": "", "gamma_blast_score_at_mint": None,
+           "gamma_blast_risk_at_mint": ""}
+    try:
+        gb = row.get("gamma_blast") if hasattr(row, "get") else None
+        if isinstance(gb, dict):
+            if gb.get("level") in ("NONE", "WATCH", "BLAST"):
+                out["gamma_blast_level_at_mint"] = gb["level"]
+            sc = gb.get("score")
+            if isinstance(sc, (int, float)) and not isinstance(sc, bool) and sc == sc:
+                out["gamma_blast_score_at_mint"] = round(float(sc), 1)
+            out["gamma_blast_risk_at_mint"] = ",".join(str(x) for x in (gb.get("risk_flags") or []))
+    except Exception:
+        pass
+    return out
+
+
 @dataclass
 class DoreOptionsPlan:
     """One frozen (symbol, direction, strike, expiry) entry — premium-
@@ -610,6 +633,14 @@ class DoreOptionsPlan:
     iv_skew_caution_at_mint:            str = ""
     iv_rank_at_mint:                    Optional[float] = None
     iv_percentile_at_mint:              Optional[float] = None
+    # [2026-10-26, SG request] Gamma-blast read frozen at mint -- level
+    # (NONE|WATCH|BLAST, "" when the detector didn't run or the plan was
+    # minted before this migration), score, and risk flags
+    # (e.g. "total_loss_if_stalls"). Additive-only, observation-only, same
+    # contract as the iv_*_at_mint block above.
+    gamma_blast_level_at_mint:          str = ""
+    gamma_blast_score_at_mint:          Optional[float] = None
+    gamma_blast_risk_at_mint:           str = ""
     direction_source_at_mint:           str = ""    # SMC-Futures | SMC-Spot | Futures-EMA | Spot-EMA
     # [Review fix, 2026-09-15] structural_data_source_at_mint was the
     # one field this block's own docstring named (line ~540, "...
@@ -754,6 +785,9 @@ class DoreOptionsPlan:
             "iv_skew_caution_at_mint":       self.iv_skew_caution_at_mint or "",
             "iv_rank_at_mint":               self.iv_rank_at_mint,
             "iv_percentile_at_mint":         self.iv_percentile_at_mint,
+            "gamma_blast_level_at_mint":     self.gamma_blast_level_at_mint or "",
+            "gamma_blast_score_at_mint":     self.gamma_blast_score_at_mint,
+            "gamma_blast_risk_at_mint":      self.gamma_blast_risk_at_mint or "",
             "direction_source_at_mint":      self.direction_source_at_mint or "",
             "structural_data_source_at_mint": self.structural_data_source_at_mint or "",
             "futures_confirmation_used_at_mint":    bool(self.futures_confirmation_used_at_mint),
@@ -1431,6 +1465,7 @@ def enrich_trade_plans_with_persistence(
                     iv_skew_caution_at_mint=row.get("iv_skew_caution") or "",
                     iv_rank_at_mint=row.get("iv_rank"),
                     iv_percentile_at_mint=row.get("iv_percentile"),
+                    **_blast_at_mint(row),
                     direction_source_at_mint=row.get("direction_source") or "",
                     structural_data_source_at_mint=row.get("structural_data_source") or "",
                     futures_confirmation_used_at_mint=bool(row.get("futures_confirmation_used", False)),
@@ -2082,6 +2117,9 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
                 "ce_iv_at_mint": plan.ce_iv_at_mint,
                 "pe_iv_at_mint": plan.pe_iv_at_mint,
                 "iv_skew_at_mint": plan.iv_skew_at_mint,
+                "gamma_blast_level_at_mint": plan.gamma_blast_level_at_mint,
+                "gamma_blast_score_at_mint": plan.gamma_blast_score_at_mint,
+                "gamma_blast_risk_at_mint": plan.gamma_blast_risk_at_mint,
                 "pcr_at_mint": plan.pcr_at_mint,
                 "last_seen_at": plan.last_seen_at,
                 "created_date": plan.created_date,

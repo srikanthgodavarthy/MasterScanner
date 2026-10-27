@@ -4270,6 +4270,36 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
             return '<span style="color:var(--muted);font-size:12px;">—</span>'
         return f'<span title="{tooltip}" style="cursor:help;color:var(--muted);font-size:12px;">ⓘ notes</span>'
 
+    def _fmt_blast_badge(row):
+        # Gamma-blast read (utils/dore_gamma_blast.py) -- OBSERVATION ONLY.
+        # BLAST = convexity, a likely large move and affordable decay line
+        # up on the primary strike; WATCH = most of it does. Hover for the
+        # score and why. Nothing here changes a plan or its ranking.
+        gb = row.get("gamma_blast")
+        if not isinstance(gb, dict) or gb.get("level") not in ("BLAST", "WATCH"):
+            return ""
+        i = gb.get("inputs") or {}
+        tip = [f"Gamma blast {gb.get('level')} - score {gb.get('score')}"]
+        if i.get("days_left") is not None:
+            tip.append(f"{i['days_left']}d to expiry")
+        if i.get("fav_pct") is not None:
+            tip.append(f"+{i['fav_pct']}% on a 1-sigma move")
+        if i.get("stall_pct") is not None:
+            tip.append(f"{i['stall_pct']}% if it stalls")
+        if gb.get("capped_by"):
+            tip.append(f"capped: {gb['capped_by']}")
+        if "total_loss_if_stalls" in (gb.get("risk_flags") or []):
+            tip.append("RISK: total loss if the underlying stalls")
+        tip.append("observation only - not part of the score")
+        tooltip = html.escape(" | ".join(tip))
+        if gb.get("level") == "BLAST":
+            _risk = " \u26a0" if "total_loss_if_stalls" in (gb.get("risk_flags") or []) else ""
+            return (f'<span title="{tooltip}" style="cursor:help;color:#d29922;font-weight:700;'
+                    f'font-size:13px;margin-right:6px;white-space:nowrap;">'
+                    f'\u26a1 BLAST {_fmt_score(gb.get("score"))}{_risk}</span>')
+        return (f'<span title="{tooltip}" style="cursor:help;color:var(--muted);font-size:12px;'
+                f'margin-right:6px;white-space:nowrap;">\u26a1 watch {_fmt_score(gb.get("score"))}</span>')
+
     headers = ["Symbol", "Direction", "Source", "Primary Strike", "Confidence", "Trigger", "IV", "Notes", "Plan",
                "Current Premium", "Entry Zone", "Stop Loss", "Target 1", "Target 2", "Saved Entry / Drift %",
                "POP %", "Expiry", "DTE"]
@@ -4297,7 +4327,7 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
             f'{conf_dot} {_fmt_score(conf)}</span></td>',
             f'<td>{_fmt_trigger(r)}</td>',
             f'<td>{_fmt_iv_skew(r)}</td>',
-            f'<td>{_fmt_notes(r)}</td>',
+            f'<td>{_fmt_blast_badge(r)}{_fmt_notes(r)}</td>',
             f'<td>{_fmt_plan_status(r)}</td>',
             f'<td>{_fmt_current_premium(r)}</td>',
             f'<td>{_fmt_entry_zone(r.get("entry_zone"))}</td>',
@@ -4331,6 +4361,30 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
         '.tv-link:hover{color:#58a6ff;border-bottom-color:#58a6ff;}'
         '</style>'
     )
+
+
+def _fmt_blast_at_mint_html(row) -> str:
+    """Gamma-blast read frozen at mint (utils/dore_gamma_blast.py) for the
+    Active Plans / Closed tables. OBSERVATION ONLY. Blank for plans minted
+    before the migration or when the detector didn't run; NONE reads '--'."""
+    import html as _html
+    lvl = row.get("gamma_blast_level_at_mint")
+    if lvl not in ("BLAST", "WATCH", "NONE"):
+        return '<span style="color:var(--muted)">--</span>'
+    sc = row.get("gamma_blast_score_at_mint")
+    sc_txt = "" if sc in (None, "") or pd.isna(sc) else f" {float(sc):.0f}"
+    risk = row.get("gamma_blast_risk_at_mint") or ""
+    tip = _html.escape(f"Gamma blast {lvl}{sc_txt} at mint"
+                       + (" | RISK: total loss if the underlying stalls" if "total_loss_if_stalls" in str(risk) else "")
+                       + " | observation only")
+    if lvl == "BLAST":
+        warn = " \u26a0" if "total_loss_if_stalls" in str(risk) else ""
+        return (f'<span title="{tip}" style="cursor:help;color:#d29922;font-weight:700;'
+                f'white-space:nowrap;">\u26a1 BLAST{sc_txt}{warn}</span>')
+    if lvl == "WATCH":
+        return (f'<span title="{tip}" style="cursor:help;color:var(--muted);white-space:nowrap;">'
+                f'\u26a1 watch{sc_txt}</span>')
+    return '<span style="color:var(--muted)">--</span>'
 
 
 def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
@@ -4494,7 +4548,7 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
     # still persisted (DoreOptionsPlan.mfe_premium/mae_premium) and can
     # be re-added as extra columns later if wanted; nothing about the
     # underlying data was removed, only these two display columns.
-    headers = ["Symbol", "Direction", "Strike", "Strike PCR", "IV", "Last Known Premium",
+    headers = ["Symbol", "Direction", "Strike", "Strike PCR", "IV", "Blast", "Last Known Premium",
                "Entry (Locked)", "Stop Loss", "Target 1", "Target 2", "P&L",
                "Last Seen", "Days Active", "Expiry", "Source", "Status"]
 
@@ -4509,6 +4563,7 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
             f'<td>{_tv_option_link(r.get("symbol", ""), direction, r.get("strike"), r.get("expiry", ""))}</td>',
             f'<td{conflict_title} style="{"cursor:help;" if conflict_title else ""}">{_fmt_pcr(r)}</td>',
             f'<td>{_fmt_iv(r)}</td>',
+            f'<td>{_fmt_blast_at_mint_html(r)}</td>',
             f'<td>{_fmt_last_premium(r)}</td>',
             f'<td style="font-weight:700;">{_fmt_money(r.get("entry_locked"))}</td>',
             f'<td>{_fmt_money(r.get("saved_stop_loss"))}</td>',
@@ -4593,7 +4648,7 @@ def _dore_options_closed_plans_table_html(df: pd.DataFrame) -> str:
     if df.empty:
         return '<div style="color:var(--muted);padding:8px;">No entered plans have closed yet.</div>'
 
-    headers = ["Symbol", "Direction", "Strike", "Expiry", "Confidence at Entry", "T1", "Closed", "Status", "Reason"]
+    headers = ["Symbol", "Direction", "Strike", "Expiry", "Confidence at Entry", "Blast at Entry", "T1", "Closed", "Status", "Reason"]
     rows_html = []
     for _, r in df.iterrows():
         direction = r.get("direction", "")
@@ -4606,6 +4661,7 @@ def _dore_options_closed_plans_table_html(df: pd.DataFrame) -> str:
             f'<td>{_fmt_money(r.get("strike"))}</td>',
             f'<td>{_fmt_text(r.get("expiry"))}</td>',
             f'<td>{conf_str}</td>',
+            f'<td>{_fmt_blast_at_mint_html(r)}</td>',
             # [2026-10-08] T1 does NOT close a plan (sticky milestone, SL moves
             # to breakeven) — surface it here so a later SL / timeout close
             # is visibly "after T1" rather than looking like a plain loss.

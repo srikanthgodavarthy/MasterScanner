@@ -631,6 +631,23 @@ class DoreOptionsSettings:
     # a plan. First-principles values, not fitted to outcomes.
     greeks_gate_max_t1_sigma: float = 2.0
 
+    # [2026-10-26, SG request -- OBSERVATION ONLY, NON-GATING] Gamma-blast
+    # detector (utils/dore_gamma_blast.py): flags near-the-money, short-dated
+    # strikes where convexity, a likely large underlying move and affordable
+    # decay line up. Writes OptionTradePlan.gamma_blast and a reasons line;
+    # nothing here touches score, strikes, SL/T1/T2 or any gate. Thresholds
+    # are judgement calls, not backtested -- validate with
+    # utils.greeks_attribution before ever letting it influence a decision.
+    enable_gamma_blast:           bool  = True
+    gamma_blast_max_days:         float = 3.0    # beyond this: not in the gamma regime
+    gamma_blast_max_moneyness_pct: float = 1.2   # |strike/spot - 1| ceiling
+    gamma_blast_min_gamma_pct:    float = 8.0    # convexity gain (% of premium) floor
+    gamma_blast_full_gamma_pct:   float = 30.0   # convexity gain that scores 100
+    gamma_blast_max_iv_rank:      float = 80.0   # IV rank at/above which it is ineligible
+    gamma_blast_watch_score:      float = 50.0
+    gamma_blast_blast_score:      float = 70.0
+    gamma_blast_min_move_score:   float = 50.0   # BLAST needs a likely large move: below this it is capped at WATCH
+
 
 DORE_OPTIONS_DEFAULTS = DoreOptionsSettings()
 
@@ -1943,6 +1960,12 @@ class OptionTradePlan:
     # without an explicit, separate change backed by
     # utils.greeks_attribution's measurements. None when unavailable.
     greeks:                   Optional[dict] = None
+
+    # [2026-10-26, SG request -- OBSERVATION ONLY, NON-GATING] Gamma-blast
+    # read for the primary strike -- see utils/dore_gamma_blast.py for the
+    # definition, components and why it is non-gating. level is NONE |
+    # WATCH | BLAST. None when disabled or when the detector failed.
+    gamma_blast:              Optional[dict] = None
 
     @property
     def structural_available(self) -> bool:
@@ -3947,6 +3970,37 @@ def compute_dore_trade_plan(
         if _gate_why:
             return DoreRejection(sig.symbol, "GreeksGate", "; ".join(_gate_why))
 
+    # [2026-10-26, SG request] Gamma-blast detection -- OBSERVATION ONLY.
+    # Runs on the final plan state (post structural cap), reads only what is
+    # already computed, and never alters a decision.
+    _gamma_blast = None
+    _gb_line = None
+    if getattr(settings, "enable_gamma_blast", False):
+        try:
+            from utils.dore_gamma_blast import evaluate_gamma_blast, move_likelihood, summarize
+            _yl = (_plan_greeks or {}).get("years_left")
+            if _yl is None:
+                try:
+                    from utils.nse_calendar import years_to_expiry as _yte_gb
+                    _yl = _yte_gb(chain.expiry)
+                except Exception:
+                    _yl = None
+            _mv = move_likelihood(dir_, mom, high_prices, low_prices, close_prices,
+                                  sig.atr, sig.current_price, sig.target_price)
+            _gamma_blast = evaluate_gamma_blast(
+                direction=dir_, spot=sig.current_price, strike=primary.strike, years_left=_yl,
+                greeks=_plan_greeks, move=_mv,
+                iv_rank=(iv.iv_rank if (iv is not None and iv.iv_rank is not None)
+                         else (iv.iv_percentile if iv is not None else None)),
+                settings=settings,
+            )
+            if _gamma_blast.get("level") == "BLAST":
+                _gb_line = summarize(_gamma_blast)   # spliced into `reasons` below
+        except Exception:
+            logger.warning("[DORE Options:%s] gamma-blast detection failed (non-fatal)",
+                           sig.symbol, exc_info=True)
+            _gamma_blast = _gb_line = None
+
     # 2026-07-31: Current Premium / Premium %Chg — the option contract's
     # own move today, distinct from the underlying's %Chg. prev_close
     # here is the CONTRACT's prior-close premium (PremiumQuote.prev_close,
@@ -3973,6 +4027,7 @@ def compute_dore_trade_plan(
            if _structural_risk_reward is not None else [])
         + (["Target capped by structural liquidity/FVG boundary"] if _structural_target_capped else [])
         + ([_iv_skew_note] if _iv_skew_note else [])
+        + ([_gb_line] if _gb_line else [])
     )
 
     # ── 2-day move-potential shadow metric ───────────────────────
@@ -4117,6 +4172,7 @@ def compute_dore_trade_plan(
         skew_trend_vs_open=_skew_reading.skew_trend_vs_open,
         # [2026-10-23, Greeks Phase 1 -- OBSERVATION ONLY]
         greeks=_plan_greeks,
+        gamma_blast=_gamma_blast,
     )
 
 
