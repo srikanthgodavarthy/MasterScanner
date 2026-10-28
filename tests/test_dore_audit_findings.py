@@ -121,3 +121,99 @@ def test_ui_floor_uses_track_floor():
     assert "track_floor(" in code
     assert "MIN_CONFIDENCE_TO_TRACK_INDEX if is_index_symbol" not in code
     assert "Confidence ≥ 70" not in code
+
+
+# ── F5, production-shaped: scanner display vs persistence ────────
+# Rows reaching pages/scanner.py's Live Scan table are OptionTradePlan.to_dict()
+# dicts (carried-forward rows from dore_live_state add the same "dte" key, see
+# utils/dore_live_state.py). The DTE field is "dte" (int) -- the same key
+# enrich_trade_plans_with_persistence reads via row.get("dte").
+
+
+def _live_scan_row(symbol, dte, conf):
+    return {"symbol": symbol, "dte": dte, "confidence_score": float(conf),
+            "entry_trigger_status": "Triggered", "plan_status_label": None}
+
+
+def _displayed(rows):
+    pytest.importorskip("streamlit")
+    import warnings
+    warnings.filterwarnings("ignore")
+    import pandas as pd
+    import pages.scanner as sc
+    # Presence of the symbol in the rendered table; independent of the
+    # empty-state wording. Callers pass a single row (or check html directly).
+    return rows[0]["symbol"] in sc._dore_options_plan_table_html(pd.DataFrame(rows))
+
+
+def _tracked(symbol, dte, conf):
+    """Persistence's mint decision: confidence floor AND the stock-option
+    tradability floor (enrich_trade_plans_with_persistence)."""
+    return conf >= per._min_confidence_to_track(dte, symbol) and per._is_executable(symbol, dte)
+
+
+def test_dte_field_is_the_real_plan_field():
+    names = {f.name for f in dataclasses.fields(eng.OptionTradePlan)}
+    assert {"symbol", "dte", "confidence_score"} <= names
+    ann = {f.name: f.type for f in dataclasses.fields(eng.OptionTradePlan)}["dte"]
+    assert ann in (int, "int")
+
+
+# (symbol, dte, floor persistence applies)
+FLOOR_CASES = [
+    ("RELIANCE", 1, 80.0), ("RELIANCE", 4, 78.0), ("RELIANCE", 8, 65.0),
+    ("NIFTY", 1, 50.0), ("NIFTY", 4, 50.0), ("BANKNIFTY", 8, 50.0),
+]
+
+
+@pytest.mark.parametrize("sym,dte,floor", FLOOR_CASES)
+def test_display_floor_equals_persistence_floor_at_the_boundary(sym, dte, floor):
+    assert per._min_confidence_to_track(dte, sym) == floor
+    below = _live_scan_row(sym, dte, floor - 1)
+    at = _live_scan_row(sym, dte, floor)
+    assert _displayed([below]) is False
+    assert _displayed([at]) is True
+    # Same decision persistence makes on the confidence floor alone.
+    assert (below["confidence_score"] >= per._min_confidence_to_track(dte, sym)) is False
+    assert (at["confidence_score"] >= per._min_confidence_to_track(dte, sym)) is True
+
+
+def test_display_matches_tracking_for_each_stock_dte_and_index():
+    """Every (symbol, dte, confidence) cell: shown on the Live Scan table <=>
+    clears persistence's confidence floor. The 1-DTE stock row is the one
+    intentional exception handled in the next test."""
+    for sym, dte, floor in FLOOR_CASES:
+        for conf in (floor - 1, floor, floor + 10):
+            shown = _displayed([_live_scan_row(sym, dte, conf)])
+            assert shown == (conf >= per._min_confidence_to_track(dte, sym)), (sym, dte, conf)
+            if not (sym == "RELIANCE" and dte == 1):
+                assert shown == _tracked(sym, dte, conf), (sym, dte, conf)
+
+
+def test_one_dte_stock_is_displayed_but_never_minted_by_design():
+    """min_dte_stock_options=2 (broker T-1 restriction): a 1-DTE stock row at
+    confidence 85 clears the floor and is shown "for reference" but
+    persistence will not mint it. Indices are exempt."""
+    assert _displayed([_live_scan_row("RELIANCE", 1, 85)]) is True
+    assert _tracked("RELIANCE", 1, 85) is False
+    assert _tracked("NIFTY", 1, 85) is True
+
+
+def test_mixed_frame_with_missing_dte_uses_the_flat_floor():
+    """A frame containing a None dte turns the column into float64 (NaN). The
+    float DTEs must bucket the same way and the NaN row takes the flat floor,
+    exactly like persistence's dte=None path."""
+    rows = [
+        _live_scan_row("RELIANCE", 1, 79), _live_scan_row("TCS", 4, 77),
+        _live_scan_row("INFY", 8, 66), _live_scan_row("SBIN", None, 66),
+        _live_scan_row("NIFTY", 1, 50),
+    ]
+    pytest.importorskip("streamlit")
+    import pandas as pd
+    import pages.scanner as sc
+    html = sc._dore_options_plan_table_html(pd.DataFrame(rows))
+    for sym in ("INFY", "SBIN", "NIFTY"):
+        assert sym in html
+    for sym in ("RELIANCE", "TCS"):          # 79 < 80 at 1 DTE, 77 < 78 at 4 DTE
+        assert sym not in html
+    assert per._min_confidence_to_track(None, "SBIN") == D.min_confidence_to_track

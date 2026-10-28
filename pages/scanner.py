@@ -4371,28 +4371,17 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
 
 def _fmt_blast_at_mint_html(row) -> str:
     """Gamma-blast read frozen at mint (utils/dore_gamma_blast.py) for the
-    Active Plans / Closed tables. OBSERVATION ONLY.
-      BLAST / WATCH  -> badge with score (BLAST adds a warning mark when the
-                        plan loses nearly everything if the underlying stalls)
-      NONE           -> muted "none": the detector RAN at mint and found no
-                        setup (e.g. outside the <=3-day / near-the-money window)
-      blank / legacy -> muted "--": it never ran for this plan (minted before
-                        the feature shipped, or the detector was off)
-    The two muted states are deliberately different: "none" and "--" used to
-    look identical, so a column full of dashes could not say whether the
-    feature was wired up at all."""
+    Active Plans / Closed tables. OBSERVATION ONLY. Blank for plans minted
+    before the migration or when the detector didn't run; NONE reads '--'."""
     import html as _html
     lvl = row.get("gamma_blast_level_at_mint")
     if lvl not in ("BLAST", "WATCH", "NONE"):
-        return ('<span title="Not evaluated: this plan was minted before gamma-blast detection '
-                'was added, or the detector was off" style="cursor:help;color:var(--muted)">--</span>')
+        return '<span style="color:var(--muted)">--</span>'
     sc = row.get("gamma_blast_score_at_mint")
     sc_txt = "" if sc in (None, "") or pd.isna(sc) else f" {float(sc):.0f}"
     risk = row.get("gamma_blast_risk_at_mint") or ""
     tip = _html.escape(f"Gamma blast {lvl}{sc_txt} at mint"
                        + (" | RISK: total loss if the underlying stalls" if "total_loss_if_stalls" in str(risk) else "")
-                       + (" | evaluated, no setup: outside the 3-day / near-the-money window, "
-                          "or the components were too weak" if lvl == "NONE" else "")
                        + " | observation only")
     if lvl == "BLAST":
         warn = " \u26a0" if "total_loss_if_stalls" in str(risk) else ""
@@ -4401,7 +4390,7 @@ def _fmt_blast_at_mint_html(row) -> str:
     if lvl == "WATCH":
         return (f'<span title="{tip}" style="cursor:help;color:var(--muted);white-space:nowrap;">'
                 f'\u26a1 watch{sc_txt}</span>')
-    return f'<span title="{tip}" style="cursor:help;color:var(--muted);">none</span>'
+    return '<span style="color:var(--muted)">--</span>'
 
 
 def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
