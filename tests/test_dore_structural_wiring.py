@@ -192,11 +192,16 @@ def test_primary_recommendation_promoted_to_structural_anchor_not_balanced():
     anchor changed Conservative but the actual recommended trade
     (entry/stop/targets/POP/R:R) kept coming from an unrelated Balanced
     strike."""
+    # [Audit 2026-10-27] This test is about primary-promotion mechanics, and
+    # _bull_ob_ohlc puts the OB ~16% below spot, which the default anchor
+    # distance cap would (correctly) skip at 14 DTE. Cap off here; the cap
+    # itself is covered in tests/test_dore_audit_findings.py.
     open_, high, low, close, ob_low = _bull_ob_ohlc(n=60)
     row = _base_row(close[-1], bullish=True)
     plan = compute_dore_trade_plan(
         row, close, _option_data_for(close[-1]), dte=14, symbol="TESTCO", market_regime="bullish",
         high_prices=high, low_prices=low, open_prices=open_,
+        settings=DoreOptionsSettings(enable_structural_anchor_distance_cap=False),
     )
     assert isinstance(plan, OptionTradePlan), f"got rejection: {plan}"
     assert plan.is_structurally_anchored is True

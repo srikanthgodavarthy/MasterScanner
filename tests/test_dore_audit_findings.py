@@ -217,3 +217,202 @@ def test_mixed_frame_with_missing_dte_uses_the_flat_floor():
     for sym in ("RELIANCE", "TCS"):          # 79 < 80 at 1 DTE, 77 < 78 at 4 DTE
         assert sym not in html
     assert per._min_confidence_to_track(None, "SBIN") == D.min_confidence_to_track
+
+
+# ── F7: delta-scaled exits for deep-ITM primaries ────────────────
+def test_delta_exit_scale_matches_the_sonacoms_row():
+    """750 CE locked at 113.00, spot ~861.4, |delta| 0.95 (7.2x leverage)."""
+    scale, lev = eng._delta_exit_scale(113.0, 861.4, 0.95, D)
+    assert lev == pytest.approx(7.24, abs=0.01)
+    assert scale == D.delta_exit_min_scale == 0.5     # 7.24/15 = 0.48 -> floored
+    sl = round(113.0 * (1 - D.stop_loss_premium_pct_gt_10_dte * scale), 2)
+    t1 = round(113.0 * (1 + D.target1_premium_pct_gt_10_dte * scale), 2)
+    t2 = round(113.0 * (1 + D.target2_premium_pct_gt_10_dte * scale), 2)
+    assert (sl, t1, t2) == (93.22, 141.25, 169.5)     # was 73.45 / 169.5 / 226.0
+
+
+@pytest.mark.parametrize("premium,spot,delta,expect_scale", [
+    (113.0, 861.4, 0.95, 0.5),          # deep ITM -> scaled (floored)
+    (60.0, 861.4, 0.90, 0.8616),        # moderate: 12.92x / 15 = 0.861
+    (21.7, 861.4, 0.80, 1.0),           # delta at threshold but 31.8x leverage -> no scaling
+    (21.7, 861.4, 0.45, 1.0),           # OTM-ish delta below threshold
+    (113.0, 861.4, None, 1.0),          # no valid chain delta -> fail open
+    (None, 861.4, 0.95, 1.0),
+    (113.0, 0.0, 0.95, 1.0),
+])
+def test_delta_exit_scale_table(premium, spot, delta, expect_scale):
+    scale, _ = eng._delta_exit_scale(premium, spot, delta, D)
+    assert scale == pytest.approx(expect_scale, abs=1e-3)
+    assert 0.0 < scale <= 1.0
+
+
+def test_delta_exit_scale_never_exceeds_one_and_respects_the_switch():
+    off = dataclasses.replace(D, enable_delta_scaled_exits=False)
+    assert eng._delta_exit_scale(113.0, 861.4, 0.95, off) == (1.0, None)
+    for prem in (1.0, 5.0, 50.0, 400.0):
+        s, _ = eng._delta_exit_scale(prem, 861.4, 0.95, D)
+        assert D.delta_exit_min_scale <= s <= 1.0
+
+
+@pytest.mark.parametrize("row,dir_,expect", [
+    ({"ce_delta": 0.95}, "CE", 0.95),
+    ({"pe_delta": -0.92}, "PE", 0.92),
+    ({"ce_delta": -0.95}, "CE", None),     # wrong sign
+    ({"pe_delta": 0.9}, "PE", None),
+    ({"ce_delta": 1.4}, "CE", None),       # out of range
+    ({"ce_delta": 0.001}, "CE", None),
+    ({"ce_delta": float("nan")}, "CE", None),
+    ({"ce_delta": None}, "CE", None),
+    ({}, "CE", None),
+    (None, "CE", None),
+])
+def test_chain_delta_is_validated_and_fails_open(row, dir_, expect):
+    assert eng._valid_chain_abs_delta(row, dir_) == expect
+
+
+def _deep_itm_plan(settings, delta=0.95, premium=25.0):
+    import numpy as np
+    from tests import test_dore_greeks as tg
+    close = list(100 * (1.01 ** np.arange(60)))
+    od = tg._option_data(close[-1])
+    for row in od["strike_premiums"].values():
+        row.update({"ce_premium": premium, "ce_close": premium * 0.97, "ce_delta": delta,
+                    "pe_premium": premium, "pe_close": premium * 0.97,
+                    "pe_delta": None if delta is None else -delta})
+    return eng.compute_dore_trade_plan(
+        tg._scan_row(close[-1], True), close, od, dte=14, symbol="TESTCO",
+        market_regime="bullish", settings=settings)
+
+
+def test_deep_itm_primary_gets_scaled_exits_in_a_full_plan():
+    on = _deep_itm_plan(eng.DoreOptionsSettings())
+    off = _deep_itm_plan(eng.DoreOptionsSettings(enable_delta_scaled_exits=False))
+    assert isinstance(on, eng.OptionTradePlan) and isinstance(off, eng.OptionTradePlan)
+    prem = on.primary.premium
+    assert prem == off.primary.premium
+    scale, lev = eng._delta_exit_scale(prem, 100 * 1.01 ** 59, 0.95, D)
+    assert scale < 1.0
+    sl_pct = eng._stop_loss_premium_pct(14, D)
+    assert off.stop_loss == round(prem * (1 - sl_pct), 2)
+    assert on.stop_loss == round(prem * (1 - sl_pct * scale), 2)
+    assert on.stop_loss > off.stop_loss                       # tighter stop in premium terms
+    assert on.target2 < off.target2 or on.target2 == off.target2   # never further out
+    assert any("Exits delta-scaled" in r for r in on.reasons)
+    assert not any("Exits delta-scaled" in r for r in off.reasons)
+
+
+def test_otm_primary_exits_are_unchanged_by_the_feature():
+    from tests import test_dore_greeks as tg
+    on = tg._plan(eng.DoreOptionsSettings(), True)
+    off = tg._plan(eng.DoreOptionsSettings(enable_delta_scaled_exits=False), True)
+    assert (on.stop_loss, on.target1, on.target2) == (off.stop_loss, off.target1, off.target2)
+    assert on.to_dict() == off.to_dict()
+
+
+def test_scaled_exits_do_not_depend_on_greeks_diagnostics():
+    a = _deep_itm_plan(eng.DoreOptionsSettings(enable_greeks_diagnostics=True))
+    b = _deep_itm_plan(eng.DoreOptionsSettings(enable_greeks_diagnostics=False))
+    assert (a.stop_loss, a.target1, a.target2) == (b.stop_loss, b.target1, b.target2)
+
+
+def test_missing_chain_delta_falls_back_to_plain_premium_exits():
+    base = _deep_itm_plan(eng.DoreOptionsSettings(enable_delta_scaled_exits=False))
+    nod = _deep_itm_plan(eng.DoreOptionsSettings(), delta=None)
+    assert (nod.stop_loss, nod.target1, nod.target2) == (base.stop_loss, base.target1, base.target2)
+
+
+# ── F7b: structural-anchor distance cap ──────────────────────────
+def _anchor_plan(fixture, bullish=True, cap=True, dte=14):
+    import warnings
+    warnings.filterwarnings("ignore")
+    from tests import test_dore_structural_wiring as tsw
+    o, h, l, c = fixture[:4]
+    return eng.compute_dore_trade_plan(
+        tsw._base_row(c[-1], bullish), c, tsw._option_data_for(c[-1]), dte=dte, symbol="TESTCO",
+        market_regime="bullish" if bullish else "bearish",
+        high_prices=h, low_prices=l, open_prices=o,
+        settings=eng.DoreOptionsSettings(enable_structural_anchor_distance_cap=cap)), c[-1]
+
+
+def _far_bull():
+    from tests import test_dore_structural_wiring as tsw
+    return tsw._bull_ob_ohlc(n=60)
+
+
+def _far_bear():
+    from tests import test_dore_structural_wiring as tsw
+    return tsw._bear_ob_ohlc(n=60)
+
+
+def _near_bull():
+    from tests import test_dore_structural_wiring as tsw
+    return tsw._bull_ob_settle_ohlc()
+
+
+def test_far_ce_anchor_is_skipped_by_default_and_primary_stays_balanced():
+    plan, spot = _anchor_plan(_far_bull())
+    assert isinstance(plan, eng.OptionTradePlan)
+    assert abs(plan.ob_proximal - spot) / spot > D.gamma_max_offset_pct_gt_10_dte    # ~17% away, cap 6%
+    assert plan.is_structurally_anchored is False
+    assert plan.structural_anchor_strike is None
+    assert plan.primary.label == eng.BALANCED
+    assert plan.primary.strike >= spot - 1e-9          # no ITM strike from the volatility tiers
+    assert any("Structural anchor" in r and "skipped" in r and "cap for 14 DTE" in r for r in plan.reasons)
+
+
+def test_skipping_the_anchor_keeps_the_structural_read():
+    """Only the strike snap is skipped: OB levels, structural target and risk
+    geometry are still on the plan."""
+    on, _ = _anchor_plan(_far_bull(), cap=True)
+    off, _ = _anchor_plan(_far_bull(), cap=False)
+    for f in ("ob_proximal", "ob_distal", "structural_target_price", "structural_invalidation_level",
+              "structural_entry_reference", "structural_risk_reward", "structural_state"):
+        assert getattr(on, f) == getattr(off, f), f
+
+
+def test_kill_switch_restores_the_unbounded_anchor():
+    plan, spot = _anchor_plan(_far_bull(), cap=False)
+    assert plan.is_structurally_anchored is True
+    assert plan.primary.strike == plan.conservative.strike
+    assert plan.primary.strike < spot                   # the deep-ITM CE
+
+
+def test_near_anchor_is_kept_with_the_cap_on():
+    plan, spot = _anchor_plan(_near_bull())
+    assert abs(plan.ob_proximal - spot) / spot < D.gamma_max_offset_pct_gt_10_dte
+    assert plan.is_structurally_anchored is True
+    assert not any("skipped" in r and "Structural anchor" in r for r in plan.reasons)
+
+
+def test_far_pe_anchor_is_skipped_too():
+    plan, spot = _anchor_plan(_far_bear(), bullish=False)
+    assert isinstance(plan, eng.OptionTradePlan) and plan.direction == "PE"
+    assert abs(plan.ob_proximal - spot) / spot > D.gamma_max_offset_pct_gt_10_dte
+    assert plan.is_structurally_anchored is False
+    assert plan.primary.strike <= spot + 1e-9           # PE from volatility tiers: at/below spot
+    off, _ = _anchor_plan(_far_bear(), bullish=False, cap=False)
+    assert off.is_structurally_anchored is True and off.primary.strike > spot
+
+
+@pytest.mark.parametrize("dte,field,tight,loose", [
+    (14, "gamma_max_offset_pct_gt_10_dte", 0.005, 0.02),
+    (9,  "gamma_max_offset_pct_6_10_dte",  0.005, 0.02),
+    (4,  "gamma_max_offset_pct_3_5_dte",   0.005, 0.02),
+    (1,  "gamma_max_offset_pct_0_2_dte",   0.005, 0.02),
+])
+def test_anchor_cap_is_read_from_the_contracts_own_dte_bucket(dte, field, tight, loose):
+    """Near OB sits ~1.1% from spot. Tightening only the bucket the contract
+    falls in (0.5%) skips the anchor; loosening it (2%) keeps it."""
+    import warnings
+    warnings.filterwarnings("ignore")
+    from tests import test_dore_structural_wiring as tsw
+    o, h, l, c = _near_bull()
+
+    def run(val):
+        st = dataclasses.replace(D, **{field: val})
+        return eng.compute_dore_trade_plan(
+            tsw._base_row(c[-1], True), c, tsw._option_data_for(c[-1]), dte=dte, symbol="TESTCO",
+            market_regime="bullish", high_prices=h, low_prices=l, open_prices=o, settings=st)
+
+    assert run(tight).is_structurally_anchored is False
+    assert run(loose).is_structurally_anchored is True

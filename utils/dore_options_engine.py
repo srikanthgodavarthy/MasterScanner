@@ -490,6 +490,42 @@ class DoreOptionsSettings:
     target2_premium_pct_6_10_dte:  float = 0.75
     target2_premium_pct_gt_10_dte: float = 1.00     # = old flat default
 
+    # [Audit 2026-10-27, F7] Delta-scaled exits for deep-ITM primaries.
+    # The premium-% exits above are sized for out-of-the-money leverage. A
+    # deep-ITM primary (typically a structural order-block anchor far below
+    # spot for a CE) has |delta| ~0.9+ and a large premium, so the same
+    # percentages demand a much larger UNDERLYING move (e.g. a 750 CE at
+    # spot ~861: SL -4.9% / T1 +6.7% / T2 +13.3% of spot, versus -1.8 / +3.0
+    # / +5.1% for a 2%-OTM strike at the same expiry).
+    # When enable_delta_scaled_exits is on, the real chain |delta| of the
+    # primary strike is >= delta_exit_min_abs_delta, and its leverage
+    # L = |delta| * spot / premium is below delta_exit_reference_leverage,
+    # SL/T1/T2 percentages are all multiplied by
+    #     scale = clamp(L / delta_exit_reference_leverage, delta_exit_min_scale, 1.0)
+    # which sets each exit's underlying distance to pct * spot / reference
+    # leverage (delta-linear), floored so exits never collapse. Scale-down
+    # only; never touches strikes with |delta| below the threshold or without
+    # a valid chain delta (fails open to the plain premium-% exits).
+    # delta_exit_reference_leverage (15x) is a judgement, not a fitted value:
+    # ~ a 2%-OTM strike at ~26 DTE (about 18x). Calibrate on closed plans.
+    # [Audit 2026-10-27, F7b] Structural-anchor distance cap. The order-block
+    # anchor replaces the volatility-based Conservative strike with the
+    # nearest priced strike to the OB proximal line, and used to do so at ANY
+    # distance (SONACOMS 750 CE at spot ~861, 26 DTE, ~13% ITM, where the
+    # expected-move selection gives ~900-910). With this on, an anchor whose
+    # strike is farther from spot than the same DTE-bucket distance cap the
+    # normal tiers use (gamma_max_offset_pct_*: 2% / 3% / 4.5% / 6% of spot)
+    # is skipped: the plan keeps select_strikes()' own tiers and primary
+    # stays Balanced (is_structurally_anchored False). Only the strike snap
+    # is skipped; the OB's invalidation level, structural target and R:R gate
+    # are unaffected. Kill switch: set False for the old unbounded anchor.
+    enable_structural_anchor_distance_cap: bool = True
+
+    enable_delta_scaled_exits:       bool  = True
+    delta_exit_min_abs_delta:        float = 0.80
+    delta_exit_reference_leverage:   float = 15.0
+    delta_exit_min_scale:            float = 0.50
+
     entry_zone_band_pct:   float = 0.05   # +/- band around LTP for the entry zone
 
     # [2026-08-20, DORE flow review §3] Premium location is NOT sufficient
@@ -2352,6 +2388,39 @@ def _target2_premium_pct(dte: int, settings: DoreOptionsSettings) -> float:
     }[expiry_bucket(dte)]
 
 
+def _valid_chain_abs_delta(row: Optional[dict], dir_: str) -> Optional[float]:
+    """|delta| of the leg from the raw chain row, or None when it is missing,
+    non-finite, out of (0.01, 1.0], or on the wrong side for dir_ (same
+    sanity bounds as GreeksQuote.check). Read straight from the row, NOT from
+    primary.greeks, so exits do not depend on enable_greeks_diagnostics."""
+    if not row:
+        return None
+    d = GreeksQuote.from_chain_row(row, dir_).delta
+    if d is None:
+        return None
+    if abs(d) < 0.01 or abs(d) > 1.0:
+        return None
+    if (dir_ == CE and d < 0) or (dir_ == PE and d > 0):
+        return None
+    return abs(d)
+
+
+def _delta_exit_scale(premium: Optional[float], spot: float, abs_delta: Optional[float],
+                      settings: DoreOptionsSettings) -> tuple[float, Optional[float]]:
+    """(scale, leverage). scale == 1.0 means the plain premium-% exits apply.
+    See DoreOptionsSettings.enable_delta_scaled_exits."""
+    if (not getattr(settings, "enable_delta_scaled_exits", False)
+            or abs_delta is None or abs_delta < settings.delta_exit_min_abs_delta
+            or not premium or premium <= 0 or not spot or spot <= 0):
+        return 1.0, None
+    leverage = abs_delta * spot / premium
+    ref = settings.delta_exit_reference_leverage
+    if ref <= 0 or leverage >= ref:
+        return 1.0, leverage
+    scale = max(settings.delta_exit_min_scale, min(1.0, leverage / ref))
+    return scale, leverage
+
+
 # ══════════════════════════════════════════════════════════════════
 #  STAGE 5 — Expected Move + Target blend -> Strike Selection
 #  (Improvement #2: uses Target, Expected Move, ATR, Conviction, Entry
@@ -3624,6 +3693,7 @@ def compute_dore_trade_plan(
     # genuinely fired. Tracking the actual event, not its numeric
     # side-effect, makes this correct regardless of coincidental equality.
     _anchor_applied = False
+    _anchor_skipped_note: Optional[str] = None
     # [Structural SMC trade geometry, 2026-08-16, DORE §3-§7] — entry
     # reference / target / RR, computed alongside the existing OB-anchor
     # read above (same _ob_df/_smc_latest, no duplicate SMC calculation
@@ -3661,8 +3731,18 @@ def compute_dore_trade_plan(
                 # requirement).
                 try:
                     _anchor_strike = _nearest_priced_strike(_ob_for_dir.proximal, chain, dir_)
-                    strikes[CONSERVATIVE] = {**strikes[CONSERVATIVE], "strike": _anchor_strike}
-                    _anchor_applied = True
+                    _anchor_cap = sig.current_price * _gamma_max_offset_pct(dte, settings)
+                    _anchor_dist = abs(_anchor_strike - sig.current_price)
+                    if (getattr(settings, "enable_structural_anchor_distance_cap", False)
+                            and sig.current_price > 0 and _anchor_dist > _anchor_cap):
+                        # Too far from spot for this expiry: keep select_strikes()'s tiers.
+                        _anchor_skipped_note = (
+                            f"Structural anchor {_anchor_strike:g} skipped: "
+                            f"{_anchor_dist / sig.current_price * 100:.1f}% from spot exceeds the "
+                            f"{_gamma_max_offset_pct(dte, settings) * 100:.1f}% cap for {dte} DTE")
+                    else:
+                        strikes[CONSERVATIVE] = {**strikes[CONSERVATIVE], "strike": _anchor_strike}
+                        _anchor_applied = True
                 except ChainDataError:
                     pass   # chain has nothing near the anchor -- keep select_strikes()'s own value, don't fabricate one
 
@@ -3953,9 +4033,14 @@ def compute_dore_trade_plan(
     # [2026-08-20, DORE flow review §5] DTE-bucketed, not flat — see
     # DoreOptionsSettings' stop_loss_premium_pct_*/target1_premium_
     # pct_*/target2_premium_pct_* docstring for why.
-    stop_loss = round(primary.premium * (1 - _stop_loss_premium_pct(dte, settings)), 2) if primary.premium else None
-    target1 = round(primary.premium * (1 + _target1_premium_pct(dte, settings)), 2) if primary.premium else None
-    target2 = round(primary.premium * (1 + _target2_premium_pct(dte, settings)), 2) if primary.premium else None
+    # [Audit 2026-10-27, F7] Deep-ITM primaries get delta-scaled exits (see
+    # DoreOptionsSettings.enable_delta_scaled_exits); scale == 1.0 otherwise.
+    _prim_row = chain.strike_premiums.get(primary.strike) or chain.strike_premiums.get(round(primary.strike, 2))
+    _exit_delta = _valid_chain_abs_delta(_prim_row, dir_)
+    _exit_scale, _exit_leverage = _delta_exit_scale(primary.premium, sig.current_price, _exit_delta, settings)
+    stop_loss = round(primary.premium * (1 - _stop_loss_premium_pct(dte, settings) * _exit_scale), 2) if primary.premium else None
+    target1 = round(primary.premium * (1 + _target1_premium_pct(dte, settings) * _exit_scale), 2) if primary.premium else None
+    target2 = round(primary.premium * (1 + _target2_premium_pct(dte, settings) * _exit_scale), 2) if primary.premium else None
 
     # [Structural SMC trade geometry, 2026-08-16, DORE §5] FVG/liquidity
     # target capping — only when a real structural target was found
@@ -4070,6 +4155,9 @@ def compute_dore_trade_plan(
             f"— Structural R:R {_structural_risk_reward:.2f}"]
            if _structural_risk_reward is not None else [])
         + (["Target capped by structural liquidity/FVG boundary"] if _structural_target_capped else [])
+        + ([_anchor_skipped_note] if _anchor_skipped_note else [])
+        + ([f"Exits delta-scaled x{_exit_scale:.2f} (|delta| {_exit_delta:.2f}, {_exit_leverage:.1f}x leverage "
+            f"vs {settings.delta_exit_reference_leverage:g}x reference)"] if _exit_scale < 1.0 else [])
         + ([_iv_skew_note] if _iv_skew_note else [])
         + ([_gb_line] if _gb_line else [])
     )
