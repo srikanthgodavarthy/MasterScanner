@@ -4486,20 +4486,85 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
             ist_str = _fmt_text(ts)[11:16] or _fmt_text(ts)
         return f'<span style="color:var(--muted);font-size:11px;">{ist_str}</span>'
 
-    def _fmt_source(row):
-        # [2026-08-08, SG request] "PB" (Pre-Breakout squeeze-release
-        # exemption) vs "LS" (ordinary Live Scanner ranking) — captured
-        # once at mint time, see DoreOptionsPlan.source's docstring.
-        src = row.get("source")
-        if src == "PB":
-            return ('<span style="color:#d29922;font-weight:700;font-size:11px;'
-                    'background:rgba(210,153,34,0.12);border:1px solid rgba(210,153,34,0.3);'
-                    'border-radius:4px;padding:1px 6px;" title="Pre-Breakout squeeze-release">PB</span>')
-        if src == "LS":
-            return ('<span style="color:#58a6ff;font-weight:700;font-size:11px;'
-                    'background:rgba(88,166,255,0.10);border:1px solid rgba(88,166,255,0.28);'
-                    'border-radius:4px;padding:1px 6px;" title="Live Scanner">LS</span>')
-        return '<span style="color:var(--muted)">—</span>'
+    def _f(v):
+        """Float or None (handles None/NaN/Decimal/blank)."""
+        try:
+            if v is None or v == "" or (isinstance(v, float) and pd.isna(v)):
+                return None
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    _DASH = '<span style="color:var(--muted)">—</span>'
+
+    def _fmt_confidence(row):
+        # [2026-10-28, SG request] confidence_at_entry = the plan's most
+        # recent confidence_score (refreshed each fresh cycle while pre-
+        # active, frozen at activation). Same bands as the Live Scan table.
+        c = _f(row.get("confidence_at_entry"))
+        if not c:                      # 0.0 is the dataclass default, i.e. never set
+            return _DASH
+        color, dot = (("#3fb950", "🟢") if c >= 75 else ("#58a6ff", "🔵") if c >= 55
+                      else ("#d29922", "🟡") if c >= 35 else ("#8b949e", "⚪"))
+        return f'<span style="color:{color};font-weight:700;white-space:nowrap;">{dot} {c:.0f}</span>'
+
+    def _fmt_expected_move(row):
+        # Underlying's 1-SD expected move (rupees, % of spot) frozen at mint,
+        # signed/coloured by the plan's direction (CE up, PE down).
+        em = _f(row.get("expected_move_at_mint"))
+        if em is None:
+            return _DASH
+        up = row.get("direction") == "CE"
+        color = "#3fb950" if up else "#f85149"
+        pct = _f(row.get("expected_move_pct_at_mint"))
+        pct_txt = f" ({pct:.1f}%)" if pct is not None else ""
+        tip = ("Expected 1-SD move of the underlying over the plan horizon, as of mint "
+               "(ATR- or IV-based, whichever was larger)")
+        return (f'<span style="color:{color};white-space:nowrap;" title="{html.escape(tip)}">'
+                f'{"+" if up else "−"}₹{em:,.0f}{pct_txt}</span>')
+
+    def _fmt_theta(row):
+        # ₹/day at mint. Withheld when the chain contradicted the configured
+        # theta basis (theta_verified False) -- that is where theta_verified
+        # is visible: hover any Theta cell.
+        tv = row.get("greeks_theta_verified_at_mint")
+        th = _f(row.get("greeks_theta_at_mint"))
+        if tv is False:
+            return ('<span style="color:#d29922;cursor:help;" title="Theta withheld: the feed\'s theta '
+                    'time-basis contradicts greeks_theta_basis (theta_verified = False). Run '
+                    'scripts/verify_upstox_greeks_units.py.">⚠ —</span>')
+        if th is None:
+            return _DASH
+        state = {True: "verified (feed basis matches setting)", None: "not measurable at mint"}.get(tv, "unknown")
+        return (f'<span style="cursor:help;" title="Theta in ₹ per day at mint. Basis check: {state}.">'
+                f'{th:,.2f}</span>')
+
+    def _fmt_gamma(row):
+        g = _f(row.get("greeks_gamma_at_mint"))
+        if g is None:
+            return _DASH
+        return (f'<span style="cursor:help;" title="Gamma at mint: change in delta per ₹1 move in the underlying">'
+                f'{g:.5f}</span>')
+
+    def _fmt_greeks_fav(row):
+        # Premium change if the underlying moves 1 sigma in the thesis
+        # direction over the hold window (greeks_scenario_* settings), at mint.
+        f = _f(row.get("greeks_fav_pct_at_mint"))
+        method = row.get("greeks_method_at_mint") or "n/a"
+        if f is None:
+            return ('<span style="color:var(--muted);cursor:help;" '
+                    f'title="Scenario unavailable (method: {html.escape(str(method))})">—</span>')
+        reliable = row.get("greeks_reliable_at_mint")
+        color = "#3fb950" if f >= 0 else "#f85149"
+        note = "" if reliable is not False else (
+            " NOT reliable (gamma-dominated, unbounded expiry or unverified theta basis): approximation only.")
+        tip = html.escape(f"Premium change in the favourable-move scenario (+1σ over the hold window), "
+                          f"method: {method}.{note}")
+        if reliable is False:
+            return (f'<span style="color:{color};opacity:.65;font-style:italic;cursor:help;" title="{tip}">'
+                    f'~{"+" if f >= 0 else ""}{f:.0f}%</span>')
+        return (f'<span style="color:{color};font-weight:600;cursor:help;" title="{tip}">'
+                f'{"+" if f >= 0 else ""}{f:.0f}%</span>')
 
     if df.empty:
         return '<div style="color:var(--muted);padding:8px;">No open plans.</div>'
@@ -4554,9 +4619,23 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
     # still persisted (DoreOptionsPlan.mfe_premium/mae_premium) and can
     # be re-added as extra columns later if wanted; nothing about the
     # underlying data was removed, only these two display columns.
-    headers = ["Symbol", "Direction", "Strike", "Strike PCR", "IV", "Blast", "Last Known Premium",
-               "Entry (Locked)", "Stop Loss", "Target 1", "Target 2", "P&L",
-               "Last Seen", "Days Active", "Expiry", "Source", "Status"]
+    # [2026-10-28, SG request] Column set: Symbol, Direction, Strike, Strike
+    # PCR, Confidence Score, Expected Stock Move, IV, Theta, Gamma, Greeks
+    # scenario favourable move, Blast, Last Known Premium, Entry (Locked),
+    # Stop Loss, Target 1, Target 2, P&L, Last Seen, Days Active, Expiry.
+    # Source and Status columns removed. The inactive/expired signal that
+    # the Status column carried now shows as a dimmed row + row tooltip.
+    headers = [
+        ("Symbol", ""), ("Direction", ""), ("Strike", ""), ("Strike PCR", ""),
+        ("Confidence Score", "DORE confidence_score (latest seen / at activation)"),
+        ("Expected Stock Move", "1-SD expected move of the underlying at mint"),
+        ("IV", ""), ("Theta", "₹/day at mint; hover a cell for the theta-basis check"),
+        ("Gamma", "Per ₹1 move in the underlying, at mint"),
+        ("Greeks Fav. Move", "Greeks scenario favourable move: premium change if the underlying moves +1σ in the thesis direction over the hold window"),
+        ("Blast", ""), ("Last Known Premium", ""),
+        ("Entry (Locked)", ""), ("Stop Loss", ""), ("Target 1", ""), ("Target 2", ""), ("P&L", ""),
+        ("Last Seen", ""), ("Days Active", ""), ("Expiry", ""),
+    ]
 
     rows_html = []
     for _, r in df.iterrows():
@@ -4568,7 +4647,12 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
             f'<td style="color:{dir_color};font-weight:700;">{_fmt_text(direction)}</td>',
             f'<td>{_tv_option_link(r.get("symbol", ""), direction, r.get("strike"), r.get("expiry", ""))}</td>',
             f'<td{conflict_title} style="{"cursor:help;" if conflict_title else ""}">{_fmt_pcr(r)}</td>',
+            f'<td>{_fmt_confidence(r)}</td>',
+            f'<td>{_fmt_expected_move(r)}</td>',
             f'<td>{_fmt_iv(r)}</td>',
+            f'<td>{_fmt_theta(r)}</td>',
+            f'<td>{_fmt_gamma(r)}</td>',
+            f'<td>{_fmt_greeks_fav(r)}</td>',
             f'<td>{_fmt_blast_at_mint_html(r)}</td>',
             f'<td>{_fmt_last_premium(r)}</td>',
             f'<td style="font-weight:700;">{_fmt_money(r.get("entry_locked"))}</td>',
@@ -4579,15 +4663,19 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
             f'<td>{_fmt_last_seen(r)}</td>',
             f'<td>{_fmt_text(r.get("plan_age_days"))}d</td>',
             f'<td>{_fmt_text(r.get("expiry"))}</td>',
-            f'<td>{_fmt_source(r)}</td>',
-            # [2026-10-08] Plans past max holding / expiry that the worker
-            # hasn't swept yet read "⚪ Inactive · ..." (muted) instead of Active.
-            (f'<td style="color:#8b949e;">{r.get("plan_status_label", "—")}</td>'
-             if r.get("is_inactive") else f'<td>{r.get("plan_status_label", "—")}</td>'),
         ]
-        rows_html.append(f'<tr class="ap-row">{"".join(cells)}</tr>')
+        # The Status column is gone, so a plan past max holding / expiry that
+        # the worker hasn't swept yet is dimmed and keeps its status text as
+        # a row tooltip instead of silently looking like a live plan.
+        row_attrs = ' class="ap-row"'
+        if r.get("is_inactive"):
+            row_attrs = (' class="ap-row" style="opacity:.55;" '
+                         f'title="{html.escape(str(r.get("plan_status_label") or ""))}"')
+        rows_html.append(f'<tr{row_attrs}>{"".join(cells)}</tr>')
 
-    header_html = "".join(f'<th>{h}</th>' for h in headers)
+    header_html = "".join(
+        (f'<th title="{html.escape(tip)}" style="cursor:help;">{h}</th>' if tip else f'<th>{h}</th>')
+        for h, tip in headers)
     return (
         '<div style="overflow-x:auto;">'
         f'<table class="ap-table"><thead><tr>{header_html}</tr></thead>'

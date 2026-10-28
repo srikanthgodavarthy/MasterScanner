@@ -397,6 +397,48 @@ def _blast_at_mint(row) -> dict:
     return out
 
 
+def _greeks_at_mint(row) -> dict:
+    """[2026-10-28, SG request] Expected stock move + the primary strike's
+    Greeks read, frozen onto the plan at mint so Active Plans can show them
+    after the live snapshot has moved on. `row` is this cycle's
+    OptionTradePlan.to_dict(). OBSERVATION ONLY -- nothing gates on it.
+    Never raises; absent/odd input -> blanks (None / "").
+
+    Theta is deliberately stored as None when the chain contradicted the
+    configured theta basis (theta_verified is False): a mis-scaled theta
+    must not be persisted as if it were a fact. fav_pct is already BS-derived
+    or None in that case (see evaluate_candidate_greeks)."""
+    out = {"expected_move_at_mint": None, "expected_move_pct_at_mint": None,
+           "greeks_theta_at_mint": None, "greeks_gamma_at_mint": None,
+           "greeks_fav_pct_at_mint": None, "greeks_method_at_mint": "",
+           "greeks_reliable_at_mint": None, "greeks_theta_verified_at_mint": None}
+
+    def _num(v):
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v else None
+
+    try:
+        if not hasattr(row, "get"):
+            return out
+        em, px = _num(row.get("expected_move")), _num(row.get("current_price"))
+        if em is not None:
+            out["expected_move_at_mint"] = round(abs(em), 2)
+            if px:
+                out["expected_move_pct_at_mint"] = round(abs(em) / px * 100.0, 3)
+        g = row.get("greeks")
+        if isinstance(g, dict) and g.get("ok"):
+            tv = g.get("theta_verified")
+            out["greeks_theta_verified_at_mint"] = tv if isinstance(tv, bool) else None
+            out["greeks_theta_at_mint"] = None if tv is False else _num(g.get("theta"))
+            out["greeks_gamma_at_mint"] = _num(g.get("gamma"))
+            out["greeks_fav_pct_at_mint"] = _num(g.get("fav_pct"))
+            out["greeks_method_at_mint"] = str(g.get("method") or "")
+            rel = g.get("reliable")
+            out["greeks_reliable_at_mint"] = rel if isinstance(rel, bool) else None
+    except Exception:
+        pass
+    return out
+
+
 @dataclass
 class DoreOptionsPlan:
     """One frozen (symbol, direction, strike, expiry) entry — premium-
@@ -639,6 +681,20 @@ class DoreOptionsPlan:
     # conflict" text; this is the raw ratio the "Strike PCR" table
     # column reads.
     pcr_at_mint:                        Optional[float] = None
+    # [2026-10-28, SG request] Frozen at mint, observation-only -- see
+    # _greeks_at_mint(). expected_move_* is the underlying's 1-SD move
+    # (rupees, and % of spot at mint); greeks_* is the primary strike's
+    # read: theta (None when the theta basis was contradicted), gamma, and
+    # fav_pct = premium change in the favourable-move scenario (+1 sigma
+    # over the hold window, see greeks_scenario_* settings).
+    expected_move_at_mint:              Optional[float] = None
+    expected_move_pct_at_mint:          Optional[float] = None
+    greeks_theta_at_mint:               Optional[float] = None
+    greeks_gamma_at_mint:               Optional[float] = None
+    greeks_fav_pct_at_mint:             Optional[float] = None
+    greeks_method_at_mint:              str = ""
+    greeks_reliable_at_mint:            Optional[bool] = None
+    greeks_theta_verified_at_mint:      Optional[bool] = None
 
     @property
     def contract_key(self) -> str:
@@ -755,6 +811,14 @@ class DoreOptionsPlan:
             "expected_move_source_at_mint":  self.expected_move_source_at_mint or "ATR",
             "pcr_conflict_note_at_mint":     self.pcr_conflict_note_at_mint or "",
             "pcr_at_mint":                   self.pcr_at_mint,
+            "expected_move_at_mint":         self.expected_move_at_mint,
+            "expected_move_pct_at_mint":     self.expected_move_pct_at_mint,
+            "greeks_theta_at_mint":          self.greeks_theta_at_mint,
+            "greeks_gamma_at_mint":          self.greeks_gamma_at_mint,
+            "greeks_fav_pct_at_mint":        self.greeks_fav_pct_at_mint,
+            "greeks_method_at_mint":         self.greeks_method_at_mint or "",
+            "greeks_reliable_at_mint":       self.greeks_reliable_at_mint,
+            "greeks_theta_verified_at_mint": self.greeks_theta_verified_at_mint,
         }
 
 
@@ -1424,6 +1488,7 @@ def enrich_trade_plans_with_persistence(
                     iv_rank_at_mint=row.get("iv_rank"),
                     iv_percentile_at_mint=row.get("iv_percentile"),
                     **_blast_at_mint(row),
+                    **_greeks_at_mint(row),
                     direction_source_at_mint=row.get("direction_source") or "",
                     structural_data_source_at_mint=row.get("structural_data_source") or "",
                     futures_confirmation_used_at_mint=bool(row.get("futures_confirmation_used", False)),
@@ -2079,6 +2144,14 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
                 "gamma_blast_score_at_mint": plan.gamma_blast_score_at_mint,
                 "gamma_blast_risk_at_mint": plan.gamma_blast_risk_at_mint,
                 "pcr_at_mint": plan.pcr_at_mint,
+                "expected_move_at_mint": plan.expected_move_at_mint,
+                "expected_move_pct_at_mint": plan.expected_move_pct_at_mint,
+                "greeks_theta_at_mint": plan.greeks_theta_at_mint,
+                "greeks_gamma_at_mint": plan.greeks_gamma_at_mint,
+                "greeks_fav_pct_at_mint": plan.greeks_fav_pct_at_mint,
+                "greeks_method_at_mint": plan.greeks_method_at_mint,
+                "greeks_reliable_at_mint": plan.greeks_reliable_at_mint,
+                "greeks_theta_verified_at_mint": plan.greeks_theta_verified_at_mint,
                 "last_seen_at": plan.last_seen_at,
                 "created_date": plan.created_date,
                 "plan_age_days": days_active,

@@ -1090,6 +1090,16 @@ def close_fo_setup_plan_manually(setup_id: str, reason: str = "Manual exit") -> 
 _DORE_OPTIONAL_COLUMNS = (
     "gamma_blast_level_at_mint", "gamma_blast_score_at_mint", "gamma_blast_risk_at_mint",
 )
+# [2026-10-28] Second group: expected move + Greeks at mint, added by
+# DORE_OPTIONS_PLANS_GREEKS_MIGRATION_SQL. Kept as its own group (not merged
+# into the tuple above) so a half-migrated database only loses the group
+# whose migration hasn't been run, never the other one's data.
+_DORE_GREEKS_OPTIONAL_COLUMNS = (
+    "expected_move_at_mint", "expected_move_pct_at_mint", "greeks_theta_at_mint",
+    "greeks_gamma_at_mint", "greeks_fav_pct_at_mint", "greeks_method_at_mint",
+    "greeks_reliable_at_mint", "greeks_theta_verified_at_mint",
+)
+_DORE_OPTIONAL_COLUMN_GROUPS = (_DORE_OPTIONAL_COLUMNS, _DORE_GREEKS_OPTIONAL_COLUMNS)
 
 
 def upsert_dore_options_plans_batch(plans: list[dict]) -> bool:
@@ -1119,19 +1129,30 @@ def upsert_dore_options_plans_batch(plans: list[dict]) -> bool:
         # [2026-10-26] Columns added by a hand-run migration. If the code is
         # deployed first, every mint would fail on "column ... does not
         # exist" -- retry WITHOUT the optional observation-only columns so
-        # plan tracking keeps working, and say so loudly.
-        optional = tuple(_DORE_OPTIONAL_COLUMNS)
-        if any(c in str(exc) for c in optional):
-            logger.warning("dore_options_plans is missing optional column(s) %s -- run "
-                           "DORE_OPTIONS_PLANS_GAMMA_BLAST_MIGRATION_SQL; retrying without them",
-                           [c for c in optional if c in str(exc)])
+        # plan tracking keeps working, and say so loudly. [2026-10-28] Per
+        # migration group: only the group named in the error is dropped.
+        dropped: set = set()
+        last_exc = exc
+        for _ in range(len(_DORE_OPTIONAL_COLUMN_GROUPS)):
+            missing = [g for g in _DORE_OPTIONAL_COLUMN_GROUPS
+                       if any(c in str(last_exc) for c in g) and not set(g) <= dropped]
+            if not missing:
+                break
+            for g in missing:
+                dropped.update(g)
+                logger.warning("dore_options_plans is missing optional column(s) %s -- run "
+                               "DORE_OPTIONS_PLANS_GAMMA_BLAST_MIGRATION_SQL / "
+                               "DORE_OPTIONS_PLANS_GREEKS_MIGRATION_SQL; retrying without them",
+                               [c for c in g if c in str(last_exc)] or list(g))
             try:
-                _write([{k: v for k, v in r.items() if k not in optional} for r in clean])
+                _write([{k: v for k, v in r.items() if k not in dropped} for r in clean])
                 return True
             except Exception as exc2:
-                logger.error("upsert_dore_options_plans_batch retry failed: %s", exc2)
-                return False
-        logger.error("upsert_dore_options_plans_batch failed: %s", exc)
+                last_exc = exc2
+        if dropped:
+            logger.error("upsert_dore_options_plans_batch retry failed: %s", last_exc)
+        else:
+            logger.error("upsert_dore_options_plans_batch failed: %s", exc)
         return False
 
 
@@ -1228,6 +1249,14 @@ def _dore_options_plan_from_row(row: dict) -> "object":
         expected_move_source_at_mint    = row.get("expected_move_source_at_mint", "ATR") or "ATR",
         pcr_conflict_note_at_mint       = row.get("pcr_conflict_note_at_mint", "") or "",
         pcr_at_mint                     = row.get("pcr_at_mint"),
+        expected_move_at_mint           = row.get("expected_move_at_mint"),
+        expected_move_pct_at_mint       = row.get("expected_move_pct_at_mint"),
+        greeks_theta_at_mint            = row.get("greeks_theta_at_mint"),
+        greeks_gamma_at_mint            = row.get("greeks_gamma_at_mint"),
+        greeks_fav_pct_at_mint          = row.get("greeks_fav_pct_at_mint"),
+        greeks_method_at_mint           = row.get("greeks_method_at_mint", "") or "",
+        greeks_reliable_at_mint         = row.get("greeks_reliable_at_mint"),
+        greeks_theta_verified_at_mint   = row.get("greeks_theta_verified_at_mint"),
     )
 
 
@@ -2312,6 +2341,14 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
     expected_move_source_at_mint     text        NOT NULL DEFAULT 'ATR',
     pcr_conflict_note_at_mint        text        NOT NULL DEFAULT '',
     pcr_at_mint                      numeric(6,2),
+    expected_move_at_mint            numeric(12,2),
+    expected_move_pct_at_mint        numeric(8,3),
+    greeks_theta_at_mint             numeric(12,4),
+    greeks_gamma_at_mint             numeric(12,6),
+    greeks_fav_pct_at_mint           numeric(8,1),
+    greeks_method_at_mint            text        NOT NULL DEFAULT '',
+    greeks_reliable_at_mint          boolean,
+    greeks_theta_verified_at_mint    boolean,
 
     updated_at                   timestamptz NOT NULL DEFAULT now()
 );
@@ -2408,6 +2445,21 @@ ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS pe_iv_at_mint numeric(6,
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS expected_move_source_at_mint text NOT NULL DEFAULT 'ATR';
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS pcr_conflict_note_at_mint text NOT NULL DEFAULT '';
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS pcr_at_mint numeric(6,2);
+"""
+
+# [2026-10-28, SG request] Expected stock move + Greeks (theta/gamma/favourable-
+# scenario move) frozen at mint, shown on the Active Plans table. Additive and
+# idempotent; the app tolerates these columns being absent (see
+# _DORE_OPTIONAL_COLUMNS) so the code can be deployed before this is run.
+DORE_OPTIONS_PLANS_GREEKS_MIGRATION_SQL = """
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS expected_move_at_mint numeric(12,2);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS expected_move_pct_at_mint numeric(8,3);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS greeks_theta_at_mint numeric(12,4);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS greeks_gamma_at_mint numeric(12,6);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS greeks_fav_pct_at_mint numeric(8,1);
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS greeks_method_at_mint text NOT NULL DEFAULT '';
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS greeks_reliable_at_mint boolean;
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS greeks_theta_verified_at_mint boolean;
 """
 
 # [2026-08-12, two-level lifecycle refactor] Run this once against an
