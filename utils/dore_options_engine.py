@@ -620,6 +620,24 @@ class DoreOptionsSettings:
     # against real outcomes.
     greeks_scenario_max_gamma_share: float = 0.25
 
+    # [2026-10-28 review] Which daily sigma sizes the scenario's "1 sigma"
+    # move. ATR is a mean true RANGE, not a standard deviation (a Brownian
+    # day's expected range is ~1.6 sigma), so max(ATR, IV-daily) overstated
+    # the move whenever ATR won: TCS at ATR 3.0% of spot gave a 4.3% "1 sigma"
+    # 2-day move and ~+121%, against ~+49% on the IV-implied move.
+    #   "iv"  (default): IV-implied daily sigma; ATR / greeks_atr_to_sigma_ratio
+    #                    only when the strike has no IV.
+    #   "max" : legacy max(ATR, IV-daily) -- rollback.
+    # Observation-only: the scenario gates nothing.
+    greeks_scenario_sigma_source: str   = "iv"
+    greeks_atr_to_sigma_ratio:    float = 1.4
+
+    # [2026-10-28 review] Flag (never veto) a plan whose ATR-implied move is
+    # >= this multiple of the IV-implied move: one inflated ATR bar then sets
+    # expected_move (the engine takes the larger of the two). TCS: ATR move
+    # 319 vs IV move ~191 (1.7x).
+    atr_iv_divergence_note_ratio: float = 1.5
+
     # [2026-10-26] Unit self-check. Upstox's docs don't state vega's or
     # theta's unit; DORE assumes vega per 1 IV POINT and theta per
     # CALENDAR day (what the test reference uses). Each read is compared
@@ -1551,7 +1569,14 @@ def evaluate_candidate_greeks(
     _tdays = _theta_days(hold, _basis)
     atr = float(sig.atr or 0.0)
     iv_daily = spot * (g.iv / 100.0) * math.sqrt(1.0 / 365.0) if g.iv else 0.0
-    sigma_daily = max(atr, iv_daily)
+    if getattr(settings, "greeks_scenario_sigma_source", "iv") == "max":
+        sigma_daily = max(atr, iv_daily)                       # legacy
+        _sigma_src = "IV" if iv_daily > atr else "ATR"
+    elif iv_daily > 0:
+        sigma_daily, _sigma_src = iv_daily, "IV"
+    else:
+        sigma_daily = atr / max(float(getattr(settings, "greeks_atr_to_sigma_ratio", 1.4)), 1.0)
+        _sigma_src = "ATR/ratio"
     if sigma_daily <= 0:
         return {"ok": False, "why": "no_sigma"}
     sigma_hold = sigma_daily * math.sqrt(hold)
@@ -1622,7 +1647,7 @@ def evaluate_candidate_greeks(
         "iv": round(g.iv, 2) if g.iv is not None else None,
         "theta_pct_day": round(abs(g.theta) / premium * 100.0, 2),
         "vega_pct_pt": round(g.vega / premium * 100.0, 2),
-        "sigma_src": "IV" if iv_daily > atr else "ATR",
+        "sigma_src": _sigma_src,
         "sigma_hold": round(sigma_hold, 2),
         "hold_days": round(hold, 3),
         "theta_days": _tdays,
@@ -3322,6 +3347,20 @@ def _build_candidate(label: str, strike_data: dict, dir_: str, chain: OptionChai
 #  ORCHESTRATION — the full pipeline for one symbol
 # ══════════════════════════════════════════════════════════════════
 
+def _atr_iv_divergence_note(atr_move: Optional[float], iv_move: Optional[float],
+                            settings: "DoreOptionsSettings") -> Optional[str]:
+    """Observation-only note when the ATR-implied expected move is far above
+    the IV-implied one. None when either is missing or below the ratio."""
+    ratio = float(getattr(settings, "atr_iv_divergence_note_ratio", 0.0) or 0.0)
+    if not atr_move or not iv_move or atr_move <= 0 or iv_move <= 0 or ratio <= 0:
+        return None
+    r = atr_move / iv_move
+    if r < ratio:
+        return None
+    return (f"ATR move {atr_move:.0f} is {r:.1f}x the IV-implied move {iv_move:.0f} -- expected move may "
+            f"be inflated by a recent range spike; check the latest bars")
+
+
 def compute_dore_trade_plan(
     scan_row: dict,
     close_prices: Sequence[float],
@@ -3452,6 +3491,7 @@ def compute_dore_trade_plan(
             sig.expected_move = round(_iv_expected_move, 2)
             expected_move_source = "IV"
 
+    _atr_iv_note = _atr_iv_divergence_note(_atr_expected_move, _iv_expected_move, settings)
     reject = hard_reject(sig, option_data, settings)
     if reject:
         return DoreRejection(sig.symbol, "HardReject", reject)
@@ -4158,6 +4198,7 @@ def compute_dore_trade_plan(
         + ([_anchor_skipped_note] if _anchor_skipped_note else [])
         + ([f"Exits delta-scaled x{_exit_scale:.2f} (|delta| {_exit_delta:.2f}, {_exit_leverage:.1f}x leverage "
             f"vs {settings.delta_exit_reference_leverage:g}x reference)"] if _exit_scale < 1.0 else [])
+        + ([_atr_iv_note] if _atr_iv_note else [])
         + ([_iv_skew_note] if _iv_skew_note else [])
         + ([_gb_line] if _gb_line else [])
     )

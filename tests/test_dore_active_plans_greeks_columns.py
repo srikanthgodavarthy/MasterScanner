@@ -40,6 +40,9 @@ GREEKS_OK = {"ok": True, "theta": -12.4, "gamma": 0.00042, "fav_pct": 38.6, "met
 NEW_COLS = ("expected_move_at_mint", "expected_move_pct_at_mint", "greeks_theta_at_mint",
             "greeks_gamma_at_mint", "greeks_fav_pct_at_mint", "greeks_method_at_mint",
             "greeks_reliable_at_mint", "greeks_theta_verified_at_mint")
+# Third optional-column group (own migration): the stock price the expected move points to.
+PRICE_COLS = ("expected_price_at_mint",)
+ALL_AT_MINT_KEYS = NEW_COLS + PRICE_COLS
 
 
 # ── _greeks_at_mint ──────────────────────────────────────────────────────────
@@ -66,7 +69,7 @@ def test_theta_is_not_persisted_when_basis_contradicted():
 ])
 def test_greeks_at_mint_never_raises_and_never_fabricates(row):
     o = _greeks_at_mint(row)
-    assert set(o) == set(NEW_COLS)
+    assert set(o) == set(ALL_AT_MINT_KEYS)
     assert o["greeks_theta_at_mint"] is None and o["greeks_fav_pct_at_mint"] is None
     assert o["expected_move_at_mint"] is None
     assert not any(isinstance(v, float) and math.isnan(v) for v in o.values())
@@ -187,11 +190,13 @@ def _headers(html_):
 
 def test_columns_are_exactly_the_requested_set_in_order_without_source_or_status():
     h = _headers(sc._dore_options_active_plans_table_html(_df()))
-    assert h == ["Symbol", "Direction", "Strike", "Strike PCR", "Confidence Score", "Expected Stock Move",
-                 "IV", "Theta", "Gamma", "Greeks Fav. Move", "Blast", "Last Known Premium",
+    assert h == ["Symbol", "Direction", "Strike", "Confidence Score", "Strike PCR", "Expected Stock Move",
+                 "IV", "Theta", "Gamma", "Blast", "Last Known Premium",
                  "Entry (Locked)", "Stop Loss", "Target 1", "Target 2", "P&L", "Last Seen",
                  "Days Active", "Expiry"]
     assert "Source" not in h and "Status" not in h
+    assert "Greeks Fav. Move" not in h                                 # removed: redundant with the targets
+    assert h.index("Confidence Score") < h.index("Strike PCR")        # swapped
 
 
 def test_every_row_has_one_cell_per_header():
@@ -203,16 +208,45 @@ def test_every_row_has_one_cell_per_header():
 def test_cells_render_the_new_values():
     out = sc._dore_options_active_plans_table_html(_df())
     assert "69" in out and "🔵" in out                                # confidence, 55-74 band
-    assert "+₹142 (1.5%)" in out or "+₹142 (1.4%)" in out            # CE => up, rupees + % of spot
+    assert "±₹142 (1.5%)" in out or "±₹142 (1.4%)" in out            # a +/- band: rupees + % of spot
     assert "-4.30" in out                                              # theta ₹/day
     assert "0.00231" in out                                            # gamma
-    assert "+42%" in out                                               # favourable scenario
+    assert "+42%" not in out and "Fav" not in out                      # scenario column is gone
     assert ">LS<" not in out and "PB</span>" not in out                # no Source badge
 
 
-def test_pe_plan_expected_move_is_signed_down():
-    out = sc._dore_options_active_plans_table_html(_df(direction="PE"))
-    assert "−₹142" in out
+def test_expected_move_falls_back_to_a_band_when_the_price_was_not_recorded():
+    """Plans minted before expected_price_at_mint existed: no exact level to show."""
+    for d in ("CE", "PE"):
+        out = sc._dore_options_active_plans_table_html(_df(direction=d))
+        assert "±₹142" in out and "predates the exact price" in out
+
+
+def test_expected_move_shows_the_definite_price_in_the_plans_direction():
+    ce = sc._dore_options_active_plans_table_html(_df(direction="CE", expected_price_at_mint=10042.0))
+    assert "▲ ₹10,042.00" in ce and ("+₹142 (1.5%)" in ce or "+₹142 (1.4%)" in ce) and "#3fb950" in ce
+    assert "spot at mint ₹9,900.00 + ₹142" in ce and "opposite side of the band is ₹9,758.00" in ce
+    pe = sc._dore_options_active_plans_table_html(_df(direction="PE", expected_price_at_mint=9758.0))
+    assert "▼ ₹9,758.00" in pe and ("−₹142 (1.5%)" in pe or "−₹142 (1.4%)" in pe) and "spot at mint ₹9,900.00 − ₹142" in pe
+    assert "opposite side of the band is ₹10,042.00" in pe
+
+
+def test_entry_time_sits_under_the_locked_price_in_ist_without_a_date():
+    out = sc._dore_options_active_plans_table_html(_df(entry_triggered_at="2026-10-28T04:39:00+00:00"))
+    assert "₹19.50<div" in out and ">10:09</div>" in out               # time sits directly under the price; 04:39 UTC = 10:09 IST
+    assert "2026-10-28T" not in out.split("<tbody>")[1]
+    bare = sc._dore_options_active_plans_table_html(_df())
+    assert 'title="Entry time (IST)"' not in bare                      # no stamp -> no empty sub-line
+    naive = sc._dore_options_active_plans_table_html(_df(entry_triggered_at="2026-10-28 04:39:00"))
+    assert ">10:09</div>" in naive                                     # naive stamps are read as UTC
+
+
+def test_price_is_persisted_at_mint_above_spot_for_ce_and_below_for_pe():
+    ce = _greeks_at_mint({"expected_move": 319.0, "current_price": 2454.0, "direction": "CE"})
+    pe = _greeks_at_mint({"expected_move": 319.0, "current_price": 2454.0, "direction": "PE"})
+    assert ce["expected_price_at_mint"] == 2773.0 and pe["expected_price_at_mint"] == 2135.0
+    assert _greeks_at_mint({"expected_move": 319.0, "current_price": 2454.0})["expected_price_at_mint"] is None
+    assert _greeks_at_mint({"expected_move": 319.0, "direction": "CE"})["expected_price_at_mint"] is None
 
 
 def test_theta_withheld_and_flagged_when_basis_unverified():
@@ -220,7 +254,6 @@ def test_theta_withheld_and_flagged_when_basis_unverified():
         greeks_theta_at_mint=None, greeks_theta_verified_at_mint=False,
         greeks_reliable_at_mint=False, greeks_fav_pct_at_mint=21.0, greeks_method_at_mint="bs"))
     assert "theta_verified = False" in out and "⚠" in out
-    assert "~+21%" in out                                              # shown, but marked approximate
 
 
 def test_missing_greeks_render_dashes_not_nan_or_zero():

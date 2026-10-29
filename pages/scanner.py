@@ -4371,12 +4371,14 @@ def _dore_options_plan_table_html(df: pd.DataFrame, scan_time=None) -> str:
 
 def _fmt_blast_at_mint_html(row) -> str:
     """Gamma-blast read frozen at mint (utils/dore_gamma_blast.py) for the
-    Active Plans / Closed tables. OBSERVATION ONLY. Blank for plans minted
-    before the migration or when the detector didn't run; NONE reads '--'."""
+    Active Plans / Closed tables. OBSERVATION ONLY. "--" = never evaluated
+    (plan minted before the migration, or the detector didn't run);
+    "none" = evaluated, no setup."""
     import html as _html
     lvl = row.get("gamma_blast_level_at_mint")
     if lvl not in ("BLAST", "WATCH", "NONE"):
-        return '<span style="color:var(--muted)">--</span>'
+        return ('<span style="color:var(--muted);cursor:help;" title="Not evaluated: the plan was minted '
+                'before gamma-blast detection existed, or the detector did not run">--</span>')
     sc = row.get("gamma_blast_score_at_mint")
     sc_txt = "" if sc in (None, "") or pd.isna(sc) else f" {float(sc):.0f}"
     risk = row.get("gamma_blast_risk_at_mint") or ""
@@ -4390,7 +4392,9 @@ def _fmt_blast_at_mint_html(row) -> str:
     if lvl == "WATCH":
         return (f'<span title="{tip}" style="cursor:help;color:var(--muted);white-space:nowrap;">'
                 f'\u26a1 watch{sc_txt}</span>')
-    return '<span style="color:var(--muted)">--</span>'
+    # NONE = evaluated, no setup. Shown as "none" (score in the tooltip) so it
+    # reads differently from "--" (never evaluated, above).
+    return f'<span title="{tip}" style="cursor:help;color:var(--muted);">none</span>'
 
 
 def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
@@ -4508,20 +4512,68 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
                       else ("#d29922", "🟡") if c >= 35 else ("#8b949e", "⚪"))
         return f'<span style="color:{color};font-weight:700;white-space:nowrap;">{dot} {c:.0f}</span>'
 
+    def _pre_mint_dash(what, row):
+        # Blank because the plan predates the capture (nothing is recoverable),
+        # versus blank because this plan's chain Greeks were unavailable at mint.
+        if _f(row.get("expected_move_at_mint")) is None:
+            tip = f"{what} was not recorded: this plan was minted before it was captured at mint."
+        else:
+            tip = f"{what} unavailable at mint (chain Greeks missing or failed the unit/validity checks)."
+        return f'<span style="color:var(--muted);cursor:help;" title="{html.escape(tip)}">—</span>'
+
+    def _plan_cal_days(row):
+        """Calendar days from mint to expiry, or None."""
+        try:
+            d0 = datetime.fromisoformat(str(row.get("created_date"))[:10]).date()
+            d1 = datetime.fromisoformat(str(row.get("expiry"))[:10]).date()
+            n = (d1 - d0).days
+            return n if n > 0 else None
+        except Exception:
+            return None
+
     def _fmt_expected_move(row):
-        # Underlying's 1-SD expected move (rupees, % of spot) frozen at mint,
-        # signed/coloured by the plan's direction (CE up, PE down).
+        # The definite stock price the expected move points to, in the plan's
+        # direction (CE: above spot, PE: below), frozen at mint, with the
+        # distance underneath. Plans minted before the price was captured fall
+        # back to the +/- band: a level cannot be recovered exactly from a
+        # rounded percentage.
         em = _f(row.get("expected_move_at_mint"))
         if em is None:
-            return _DASH
-        up = row.get("direction") == "CE"
-        color = "#3fb950" if up else "#f85149"
+            return _pre_mint_dash("Expected move", row)
         pct = _f(row.get("expected_move_pct_at_mint"))
+        price = _f(row.get("expected_price_at_mint"))
+        direction = row.get("direction")
+        src = row.get("expected_move_source_at_mint") or "ATR"
+        days = _plan_cal_days(row)
         pct_txt = f" ({pct:.1f}%)" if pct is not None else ""
-        tip = ("Expected 1-SD move of the underlying over the plan horizon, as of mint "
-               "(ATR- or IV-based, whichever was larger)")
-        return (f'<span style="color:{color};white-space:nowrap;" title="{html.escape(tip)}">'
-                f'{"+" if up else "−"}₹{em:,.0f}{pct_txt}</span>')
+        iv = _f(row.get("ce_iv_at_mint") if direction == "CE" else row.get("pe_iv_at_mint"))
+        parts = []
+        if price is not None and direction in ("CE", "PE"):
+            up = direction == "CE"
+            spot = price - em if up else price + em
+            other = spot - em if up else spot + em
+            color = "#3fb950" if up else "#f85149"
+            parts.append(
+                f"Stock price the expected move points to in this plan's direction "
+                f"({'above' if up else 'below'} spot): spot at mint ₹{spot:,.2f} {'+' if up else '−'} ₹{em:,.0f}"
+                + (f", over the life to expiry ({days} days)" if days else ", over the life to expiry") + ". "
+                f"The opposite side of the band is ₹{other:,.2f}. A 1-SD-style range, not a forecast.")
+            head = (f'<span style="color:{color};font-weight:600;">{"▲" if up else "▼"} ₹{price:,.2f}</span>'
+                    f'<div style="font-size:11px;font-weight:400;color:var(--muted);">'
+                    f'{"+" if up else "−"}₹{em:,.0f}{pct_txt}</div>')
+        else:
+            parts.append(f"A ±₹{em:,.0f} band around spot at mint over the life to expiry"
+                         + (f" ({days} days)" if days else "")
+                         + ". This plan predates the exact price being recorded; not a forecast of direction.")
+            head = f'±₹{em:,.0f}{pct_txt}'
+        parts.append(f"Source: {src} (the engine takes the larger of the ATR-based and IV-based move).")
+        if days:
+            parts.append(f"Same basis over a 2-day hold: about ₹{em * (2.0 / days) ** 0.5:,.0f}.")
+        if iv and pct:
+            spot_est = em / (pct / 100.0)
+            parts.append(f"IV-implied 2-day move at {iv:.1f}% IV: about ₹{spot_est * iv / 100.0 * (2.0 / 365.0) ** 0.5:,.0f}.")
+        return (f'<span style="white-space:nowrap;cursor:help;" title="{html.escape(" ".join(parts))}">'
+                f'{head}</span>')
 
     def _fmt_theta(row):
         # ₹/day at mint. Withheld when the chain contradicted the configured
@@ -4534,7 +4586,7 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
                     'time-basis contradicts greeks_theta_basis (theta_verified = False). Run '
                     'scripts/verify_upstox_greeks_units.py.">⚠ —</span>')
         if th is None:
-            return _DASH
+            return _pre_mint_dash("Theta", row)
         state = {True: "verified (feed basis matches setting)", None: "not measurable at mint"}.get(tv, "unknown")
         return (f'<span style="cursor:help;" title="Theta in ₹ per day at mint. Basis check: {state}.">'
                 f'{th:,.2f}</span>')
@@ -4542,29 +4594,9 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
     def _fmt_gamma(row):
         g = _f(row.get("greeks_gamma_at_mint"))
         if g is None:
-            return _DASH
+            return _pre_mint_dash("Gamma", row)
         return (f'<span style="cursor:help;" title="Gamma at mint: change in delta per ₹1 move in the underlying">'
                 f'{g:.5f}</span>')
-
-    def _fmt_greeks_fav(row):
-        # Premium change if the underlying moves 1 sigma in the thesis
-        # direction over the hold window (greeks_scenario_* settings), at mint.
-        f = _f(row.get("greeks_fav_pct_at_mint"))
-        method = row.get("greeks_method_at_mint") or "n/a"
-        if f is None:
-            return ('<span style="color:var(--muted);cursor:help;" '
-                    f'title="Scenario unavailable (method: {html.escape(str(method))})">—</span>')
-        reliable = row.get("greeks_reliable_at_mint")
-        color = "#3fb950" if f >= 0 else "#f85149"
-        note = "" if reliable is not False else (
-            " NOT reliable (gamma-dominated, unbounded expiry or unverified theta basis): approximation only.")
-        tip = html.escape(f"Premium change in the favourable-move scenario (+1σ over the hold window), "
-                          f"method: {method}.{note}")
-        if reliable is False:
-            return (f'<span style="color:{color};opacity:.65;font-style:italic;cursor:help;" title="{tip}">'
-                    f'~{"+" if f >= 0 else ""}{f:.0f}%</span>')
-        return (f'<span style="color:{color};font-weight:600;cursor:help;" title="{tip}">'
-                f'{"+" if f >= 0 else ""}{f:.0f}%</span>')
 
     if df.empty:
         return '<div style="color:var(--muted);padding:8px;">No open plans.</div>'
@@ -4593,6 +4625,23 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
         color = "#3fb950" if pcr >= 1.10 else "#f85149" if pcr <= 0.85 else "var(--text)"
         return f'<span style="color:{color};">{pcr:.2f}</span>'
 
+    def _fmt_entry_locked(row):
+        # Locked entry premium with the IST time the trade was entered
+        # underneath (time only, as in Last Seen). entry_triggered_at is a UTC ISO stamp.
+        price = _fmt_money(row.get("entry_locked"))
+        ts = row.get("entry_triggered_at")
+        t = ""
+        if ts not in (None, "") and not (isinstance(ts, float) and pd.isna(ts)):
+            try:
+                dt = pd.to_datetime(ts)
+                dt = dt.tz_localize("UTC") if dt.tzinfo is None else dt
+                t = dt.tz_convert(_IST).strftime("%H:%M")
+            except Exception:
+                t = ""
+        sub = (f'<div style="font-size:11px;font-weight:400;color:var(--muted);" '
+               f'title="Entry time (IST)">{t}</div>') if t else ""
+        return f"{price}{sub}"
+
     if df.empty:
         return '<div style="color:var(--muted);padding:8px;">No open plans.</div>'
 
@@ -4619,21 +4668,23 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
     # still persisted (DoreOptionsPlan.mfe_premium/mae_premium) and can
     # be re-added as extra columns later if wanted; nothing about the
     # underlying data was removed, only these two display columns.
-    # [2026-10-28, SG request] Column set: Symbol, Direction, Strike, Strike
-    # PCR, Confidence Score, Expected Stock Move, IV, Theta, Gamma, Greeks
-    # scenario favourable move, Blast, Last Known Premium, Entry (Locked),
+    # [2026-10-28, SG request] Column set: Symbol, Direction, Strike,
+    # Confidence Score, Strike PCR, Expected Stock Move (a definite price in
+    # the plan's direction), IV, Theta, Gamma, Blast, Last Known Premium,
+    # Entry (Locked) with the entry time under the price,
     # Stop Loss, Target 1, Target 2, P&L, Last Seen, Days Active, Expiry.
     # Source and Status columns removed. The inactive/expired signal that
     # the Status column carried now shows as a dimmed row + row tooltip.
     headers = [
-        ("Symbol", ""), ("Direction", ""), ("Strike", ""), ("Strike PCR", ""),
+        ("Symbol", ""), ("Direction", ""), ("Strike", ""),
         ("Confidence Score", "DORE confidence_score (latest seen / at activation)"),
-        ("Expected Stock Move", "1-SD expected move of the underlying at mint"),
+        ("Strike PCR", ""),
+        ("Expected Stock Move", "Stock price the 1-SD-style expected move points to in the plan's direction (CE above spot, PE below), to expiry, frozen at mint. Hover for the horizon, source and 2-day equivalent."),
         ("IV", ""), ("Theta", "₹/day at mint; hover a cell for the theta-basis check"),
         ("Gamma", "Per ₹1 move in the underlying, at mint"),
-        ("Greeks Fav. Move", "Greeks scenario favourable move: premium change if the underlying moves +1σ in the thesis direction over the hold window"),
         ("Blast", ""), ("Last Known Premium", ""),
-        ("Entry (Locked)", ""), ("Stop Loss", ""), ("Target 1", ""), ("Target 2", ""), ("P&L", ""),
+        ("Entry (Locked)", "Locked entry premium; entry time (IST) underneath"),
+        ("Stop Loss", ""), ("Target 1", ""), ("Target 2", ""), ("P&L", ""),
         ("Last Seen", ""), ("Days Active", ""), ("Expiry", ""),
     ]
 
@@ -4646,16 +4697,15 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
             f'<td style="font-weight:700;">{_tv_link(r.get("symbol", "—"))}</td>',
             f'<td style="color:{dir_color};font-weight:700;">{_fmt_text(direction)}</td>',
             f'<td>{_tv_option_link(r.get("symbol", ""), direction, r.get("strike"), r.get("expiry", ""))}</td>',
-            f'<td{conflict_title} style="{"cursor:help;" if conflict_title else ""}">{_fmt_pcr(r)}</td>',
             f'<td>{_fmt_confidence(r)}</td>',
+            f'<td{conflict_title} style="{"cursor:help;" if conflict_title else ""}">{_fmt_pcr(r)}</td>',
             f'<td>{_fmt_expected_move(r)}</td>',
             f'<td>{_fmt_iv(r)}</td>',
             f'<td>{_fmt_theta(r)}</td>',
             f'<td>{_fmt_gamma(r)}</td>',
-            f'<td>{_fmt_greeks_fav(r)}</td>',
             f'<td>{_fmt_blast_at_mint_html(r)}</td>',
             f'<td>{_fmt_last_premium(r)}</td>',
-            f'<td style="font-weight:700;">{_fmt_money(r.get("entry_locked"))}</td>',
+            f'<td style="font-weight:700;">{_fmt_entry_locked(r)}</td>',
             f'<td>{_fmt_money(r.get("saved_stop_loss"))}</td>',
             f'<td>{_fmt_money(r.get("saved_target1"))}</td>',
             f'<td>{_fmt_money(r.get("saved_target2"))}</td>',

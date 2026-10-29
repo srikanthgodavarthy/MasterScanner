@@ -134,3 +134,25 @@ def trading_sessions_in_window(start: date, days: float) -> int:
     Used to turn a PER-TRADING-DAY theta into hold decay."""
     n = int(math.ceil(max(days, 0.0)))
     return sum(1 for i in range(n) if is_trading_day(start + timedelta(days=i)))
+
+
+def trading_days_between(start: date, end: date) -> int:
+    """Exchange sessions d with start < d <= end (0 if end is not after
+    start). The unit a plan's holding-period limit is counted in: a
+    Friday entry has 1 elapsed session on Monday, not 3 calendar days."""
+    if end <= start:
+        return 0
+    return sum(1 for i in range(1, (end - start).days + 1) if is_trading_day(start + timedelta(days=i)))
+
+
+def date_n_trading_days_before(end: date, n: int) -> date:
+    """A trading date d with trading_days_between(d, end) == n (n >= 0),
+    whether or not `end` itself is a session. For fixtures and diagnostics."""
+    d, need = end, max(int(n), 0)
+    while need > 0:
+        if is_trading_day(d):
+            need -= 1
+        d -= timedelta(days=1)
+    while not is_trading_day(d):
+        d -= timedelta(days=1)
+    return d

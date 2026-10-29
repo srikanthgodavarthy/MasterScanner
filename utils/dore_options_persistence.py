@@ -170,6 +170,11 @@ def _record_dore_final_outcome(plan: "DoreOptionsPlan") -> None:
 # to 2 and made unconditional (age alone, not "never triggered") per
 # SG's request.
 MAX_DORE_OPTIONS_PLAN_AGE_DAYS = 2
+# [2026-10-28 review] The unit is now TRADING SESSIONS elapsed since the age
+# clock started (see _is_stale_by_age), not calendar days. With calendar days a
+# Friday entry was closed at Monday's first cycle (3 calendar days) and a
+# Thursday entry too: they got roughly one session, while Mon-Wed entries got
+# two. The name is kept for import compatibility.
 
 # [2026-08-12, two-level lifecycle refactor] Confidence floor for
 # LEVEL 1 — "is this opportunity good enough to remember and monitor?"
@@ -411,7 +416,8 @@ def _greeks_at_mint(row) -> dict:
     out = {"expected_move_at_mint": None, "expected_move_pct_at_mint": None,
            "greeks_theta_at_mint": None, "greeks_gamma_at_mint": None,
            "greeks_fav_pct_at_mint": None, "greeks_method_at_mint": "",
-           "greeks_reliable_at_mint": None, "greeks_theta_verified_at_mint": None}
+           "greeks_reliable_at_mint": None, "greeks_theta_verified_at_mint": None,
+           "expected_price_at_mint": None}
 
     def _num(v):
         return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v else None
@@ -424,6 +430,12 @@ def _greeks_at_mint(row) -> dict:
             out["expected_move_at_mint"] = round(abs(em), 2)
             if px:
                 out["expected_move_pct_at_mint"] = round(abs(em) / px * 100.0, 3)
+                # The definite stock price the expected move points to, in the
+                # plan's direction: spot + move for a CE, spot - move for a PE.
+                # Stored (not re-derived from the rounded pct) so the level is exact.
+                _dir = str(row.get("direction") or "").upper()
+                if _dir in ("CE", "PE"):
+                    out["expected_price_at_mint"] = round(px + abs(em) if _dir == "CE" else px - abs(em), 2)
         g = row.get("greeks")
         if isinstance(g, dict) and g.get("ok"):
             tv = g.get("theta_verified")
@@ -695,6 +707,9 @@ class DoreOptionsPlan:
     greeks_method_at_mint:              str = ""
     greeks_reliable_at_mint:            Optional[bool] = None
     greeks_theta_verified_at_mint:      Optional[bool] = None
+    # [2026-10-28 review] The stock price the expected move points to in the
+    # plan's direction (spot +/- expected_move_at_mint), frozen at mint.
+    expected_price_at_mint:             Optional[float] = None
 
     @property
     def contract_key(self) -> str:
@@ -819,6 +834,7 @@ class DoreOptionsPlan:
             "greeks_method_at_mint":         self.greeks_method_at_mint or "",
             "greeks_reliable_at_mint":       self.greeks_reliable_at_mint,
             "greeks_theta_verified_at_mint": self.greeks_theta_verified_at_mint,
+            "expected_price_at_mint":        self.expected_price_at_mint,
         }
 
 
@@ -859,9 +875,12 @@ def _today_str() -> str:
 
 
 def _compute_days_active(created_date: str) -> int:
+    """Calendar days since created_date, measured against the IST date (the
+    clock created_date itself is stamped with), not the server's local date --
+    the two differ for ~5.5 h around IST midnight on a UTC host."""
     try:
         d0 = date.fromisoformat(str(created_date)[:10])
-        return (date.today() - d0).days
+        return (date.fromisoformat(_today_str()) - d0).days
     except Exception:
         return 0
 
@@ -876,12 +895,13 @@ def _is_expired(expiry: str, today: str) -> bool:
 
 
 def _is_stale_by_age(created_date: str, today: str, max_days: int = MAX_DORE_OPTIONS_PLAN_AGE_DAYS) -> bool:
-    """True once a locked plan has been open >= max_days calendar days,
+    """True once a locked plan has been open >= max_days TRADING SESSIONS,
     regardless of expiry or whether it ever triggered — see
     MAX_DORE_OPTIONS_PLAN_AGE_DAYS' docstring."""
     try:
         d0 = date.fromisoformat(str(created_date)[:10])
-        return (date.fromisoformat(today) - d0).days >= max_days
+        from utils.nse_calendar import trading_days_between
+        return trading_days_between(d0, date.fromisoformat(today)) >= max_days
     except Exception:
         return False
 
@@ -1384,42 +1404,10 @@ def enrich_trade_plans_with_persistence(
                 if _blocking_open_plan(symbol, direction, key, open_now) is not None:
                     continue
 
-                # [Sprint 1 — Portfolio Manager / Quality Ranking,
-                # 2026-08-05] Book is full: only let a new candidate in
-                # by retiring the single weakest ACTIVE plan, and only
-                # when it clears that plan's confidence_at_entry by
-                # MATERIALLY_BETTER_MARGIN. Otherwise the candidate is
-                # rejected — shown as an ordinary Live Scan row, never
-                # tracked. [2026-08-12] Counts ACTIVE (entered) plans
-                # only, not merely-tracked candidates — see
-                # _count_active()'s docstring.
-                if _count_active(open_now) >= MAX_ACTIVE_DORE_OPTIONS_PLANS:
-                    weakest = _find_weakest_open_plan(open_now)
-                    if weakest is not None and confidence_score >= weakest[1].confidence_at_entry + MATERIALLY_BETTER_MARGIN:
-                        weakest_key, weakest_plan = weakest
-                        weakest_plan.status = DoreOptionsPlanStatus.CLOSED
-                        weakest_plan.closed_at = _now_iso()
-                        weakest_plan.closed_reason = (
-                            f"Retired — portfolio full, replaced by stronger candidate "
-                            f"({confidence_score:.0f} vs {weakest_plan.confidence_at_entry:.0f})"
-                        )
-                        weakest_plan.closed_reason_code = CLOSE_REASON_INVALIDATED
-                        updated_plans.append(weakest_plan)
-                        open_now.pop(weakest_key, None)
-                        _record_dore_final_outcome(weakest_plan)
-                    else:
-                        row["blocked_reason"] = f"Portfolio full ({MAX_ACTIVE_DORE_OPTIONS_PLANS} active) — no materially weaker plan to replace"
-                        enriched_rows.append(row)
-                        continue
-
-                # Fresh contract (or the prior entry for this exact key
-                # had already been closed) — mint a new LEVEL 1 TRACKED
-                # plan. [2026-08-12] Entry is deliberately NOT locked
-                # here — entry_locked stays None until Level 2 actually
-                # triggers below. sl/target1/target2 are captured as this
-                # cycle's CURRENT (dynamic) levels, refreshed every cycle
-                # until the plan goes ACTIVE, at which point whatever
-                # they hold is frozen.
+                # [Sprint 1 — Portfolio Manager, 2026-08-05; moved 2026-10-28]
+                # The portfolio cap is enforced at ACTIVATION (see the
+                # in_zone block below), not here: minting a TRACKED candidate
+                # takes no capital slot (_count_active counts ACTIVE plans).
                 locked = DoreOptionsPlan(
                     plan_id=_make_plan_id(symbol, direction, strike, expiry, today),
                     symbol=symbol,
@@ -1583,6 +1571,32 @@ def enrich_trade_plans_with_persistence(
                         "before entry is allowed"
                     )
 
+                if in_zone and _count_active(open_now) >= MAX_ACTIVE_DORE_OPTIONS_PLANS:
+                    # [2026-10-28 review] Capacity is checked where the slot is
+                    # actually taken -- the ACTIVE transition -- not when a
+                    # candidate is merely minted TRACKED. Before, a TRACKED
+                    # candidate that might never activate could retire a live,
+                    # entered trade, and the cap was never re-checked at
+                    # activation (so more than MAX plans could be active).
+                    weakest = _find_weakest_open_plan(open_now)   # ACTIVE plans only; `locked` is not one yet
+                    if weakest is not None and confidence_score >= weakest[1].confidence_at_entry + MATERIALLY_BETTER_MARGIN:
+                        weakest_key, weakest_plan = weakest
+                        weakest_plan.status = DoreOptionsPlanStatus.CLOSED
+                        weakest_plan.closed_at = _now_iso()
+                        weakest_plan.closed_reason = (
+                            f"Retired — portfolio full, replaced by stronger candidate "
+                            f"({confidence_score:.0f} vs {weakest_plan.confidence_at_entry:.0f})"
+                        )
+                        weakest_plan.closed_reason_code = CLOSE_REASON_INVALIDATED
+                        updated_plans.append(weakest_plan)
+                        open_now.pop(weakest_key, None)
+                        _record_dore_final_outcome(weakest_plan)
+                    else:
+                        in_zone = False
+                        _full = (f"Portfolio full ({MAX_ACTIVE_DORE_OPTIONS_PLANS} active) — "
+                                 f"no materially weaker plan to replace")
+                        row["blocked_reason"] = _full
+                        locked.activation_blocked_reason = _full
                 if in_zone:
                     locked.entry_locked = current_premium
                     locked.entry_underlying = row.get("current_price")
@@ -1643,7 +1657,7 @@ def enrich_trade_plans_with_persistence(
                     locked.closed_at = _now_iso()
                     locked.closed_reason = (
                         "Expired before entry" if _expired else
-                        f"Stale — never entered (open >= {MAX_DORE_OPTIONS_PLAN_AGE_DAYS}d, "
+                        f"Stale — never entered (open >= {MAX_DORE_OPTIONS_PLAN_AGE_DAYS} sessions, "
                         f"no longer reproduced by Stage 1)"
                     )
                     locked.closed_reason_code = CLOSE_REASON_STALE_NO_ENTRY
@@ -1817,7 +1831,7 @@ def enrich_trade_plans_with_persistence(
                     locked.closed_at = _now_iso()
                     locked.closed_reason = (
                         "Expired" if _expired else
-                        f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS}d)"
+                        f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS} sessions)"
                     )
                     locked.closed_reason_code = CLOSE_REASON_EXPIRY if _expired else CLOSE_REASON_TIMEOUT
                     updated_plans.append(locked)
@@ -1948,7 +1962,7 @@ def enrich_trade_plans_with_persistence(
             # off its TRACKED mint date if it's actually ACTIVE.
             plan.status = DoreOptionsPlanStatus.CLOSED
             plan.closed_at = _now_iso()
-            plan.closed_reason = f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS}d)"
+            plan.closed_reason = f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS} sessions)"
             plan.closed_reason_code = CLOSE_REASON_TIMEOUT
             updated_plans.append(plan)
             _record_dore_final_outcome(plan)
@@ -2041,7 +2055,7 @@ def close_inactive_plans(open_plans: dict, contract_keys, today: Optional[str] =
             plan.closed_reason = "Expired"
             plan.closed_reason_code = CLOSE_REASON_EXPIRY
         else:
-            plan.closed_reason = f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS}d)"
+            plan.closed_reason = f"Max holding period ({MAX_DORE_OPTIONS_PLAN_AGE_DAYS} sessions)"
             plan.closed_reason_code = CLOSE_REASON_TIMEOUT
         _record_dore_final_outcome(plan)
         closed.append(plan)
@@ -2152,6 +2166,7 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
                 "greeks_method_at_mint": plan.greeks_method_at_mint,
                 "greeks_reliable_at_mint": plan.greeks_reliable_at_mint,
                 "greeks_theta_verified_at_mint": plan.greeks_theta_verified_at_mint,
+                "expected_price_at_mint": plan.expected_price_at_mint,
                 "last_seen_at": plan.last_seen_at,
                 "created_date": plan.created_date,
                 "plan_age_days": days_active,
