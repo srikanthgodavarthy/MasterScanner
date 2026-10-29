@@ -1099,7 +1099,13 @@ _DORE_GREEKS_OPTIONAL_COLUMNS = (
     "greeks_gamma_at_mint", "greeks_fav_pct_at_mint", "greeks_method_at_mint",
     "greeks_reliable_at_mint", "greeks_theta_verified_at_mint",
 )
-_DORE_OPTIONAL_COLUMN_GROUPS = (_DORE_OPTIONAL_COLUMNS, _DORE_GREEKS_OPTIONAL_COLUMNS)
+# [2026-10-28 review] Third group: the stock price the expected move points to,
+# added by DORE_OPTIONS_PLANS_EXPECTED_PRICE_MIGRATION_SQL. Its own group so a
+# database that has the second migration but not this one keeps persisting
+# expected move / theta / gamma.
+_DORE_EXPECTED_PRICE_OPTIONAL_COLUMNS = ("expected_price_at_mint",)
+_DORE_OPTIONAL_COLUMN_GROUPS = (_DORE_OPTIONAL_COLUMNS, _DORE_GREEKS_OPTIONAL_COLUMNS,
+                                _DORE_EXPECTED_PRICE_OPTIONAL_COLUMNS)
 
 
 def upsert_dore_options_plans_batch(plans: list[dict]) -> bool:
@@ -1142,7 +1148,8 @@ def upsert_dore_options_plans_batch(plans: list[dict]) -> bool:
                 dropped.update(g)
                 logger.warning("dore_options_plans is missing optional column(s) %s -- run "
                                "DORE_OPTIONS_PLANS_GAMMA_BLAST_MIGRATION_SQL / "
-                               "DORE_OPTIONS_PLANS_GREEKS_MIGRATION_SQL; retrying without them",
+                               "DORE_OPTIONS_PLANS_GREEKS_MIGRATION_SQL / "
+                               "DORE_OPTIONS_PLANS_EXPECTED_PRICE_MIGRATION_SQL; retrying without them",
                                [c for c in g if c in str(last_exc)] or list(g))
             try:
                 _write([{k: v for k, v in r.items() if k not in dropped} for r in clean])
@@ -1257,6 +1264,7 @@ def _dore_options_plan_from_row(row: dict) -> "object":
         greeks_method_at_mint           = row.get("greeks_method_at_mint", "") or "",
         greeks_reliable_at_mint         = row.get("greeks_reliable_at_mint"),
         greeks_theta_verified_at_mint   = row.get("greeks_theta_verified_at_mint"),
+        expected_price_at_mint          = row.get("expected_price_at_mint"),
     )
 
 
@@ -2349,6 +2357,7 @@ CREATE TABLE IF NOT EXISTS dore_options_plans (
     greeks_method_at_mint            text        NOT NULL DEFAULT '',
     greeks_reliable_at_mint          boolean,
     greeks_theta_verified_at_mint    boolean,
+    expected_price_at_mint           numeric(12,2),
 
     updated_at                   timestamptz NOT NULL DEFAULT now()
 );
@@ -2460,6 +2469,14 @@ ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS greeks_fav_pct_at_mint n
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS greeks_method_at_mint text NOT NULL DEFAULT '';
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS greeks_reliable_at_mint boolean;
 ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS greeks_theta_verified_at_mint boolean;
+"""
+
+# [2026-10-28 review] The stock price the expected move points to in the plan's
+# direction (spot +/- expected move), frozen at mint. Additive and idempotent;
+# the app drops this group (see _DORE_EXPECTED_PRICE_OPTIONAL_COLUMNS) until it
+# is run, and Active Plans then falls back to showing the +/- band.
+DORE_OPTIONS_PLANS_EXPECTED_PRICE_MIGRATION_SQL = """
+ALTER TABLE dore_options_plans ADD COLUMN IF NOT EXISTS expected_price_at_mint numeric(12,2);
 """
 
 # [2026-08-12, two-level lifecycle refactor] Run this once against an
