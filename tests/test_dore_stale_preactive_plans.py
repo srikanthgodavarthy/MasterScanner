@@ -46,8 +46,21 @@ def _key(expiry):
 
 
 def _ts(days_old):
-    t = datetime.now(timezone.utc) - timedelta(days=days_old)
+    """days_old = exchange sessions elapsed (see _session_dt)."""
+    t = _session_dt(days_old)
     return t.strftime("%Y-%m-%d"), t.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+def _session_dt(n_sessions):
+    """UTC datetime at 10:00 on the trading date that is `n_sessions` exchange
+    sessions before the IST 'today' persistence uses. MAX_DORE_OPTIONS_PLAN_AGE_DAYS
+    counts sessions (not calendar days), so fixtures must too -- otherwise
+    these tests would pass or fail depending on the weekday they run on."""
+    from datetime import date as _date
+    from utils.nse_calendar import date_n_trading_days_before
+    from utils.dore_options_persistence import _today_str
+    d = date_n_trading_days_before(_date.fromisoformat(_today_str()), n_sessions)
+    return datetime(d.year, d.month, d.day, 10, 0, tzinfo=timezone.utc)
 
 
 def _waiting_plan(days_old, expiry=FUTURE_EXPIRY):
