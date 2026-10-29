@@ -4397,6 +4397,49 @@ def _fmt_blast_at_mint_html(row) -> str:
     return f'<span title="{tip}" style="cursor:help;color:var(--muted);">none</span>'
 
 
+def _expected_price_view(row):
+    """The stock TARGET the plan's expected move points to, in the plan's
+    direction -- CE: spot + move (above), PE: spot - move (below) -- with the
+    move and a SIGNED percentage that match that price by construction
+    (pct = (price - spot) / spot). Returns a dict (price, spot, em, pct, up,
+    approx) or None when it cannot be stated.
+
+    Plans minted before expected_price_at_mint existed have no stored price,
+    but the move (2 dp) and its percentage of spot (3 dp, numeric(8,3)) are
+    stored, so spot = move / (pct/100) is recoverable to well under 0.1% --
+    about +/-₹0.2 on the dearest stock. Those rows are returned with
+    approx=True (price rounded to the 0.05 tick) so the UI can say so,
+    instead of falling back to a direction-less +/- band."""
+    def _n(v):
+        try:
+            if v is None or v == "" or isinstance(v, bool):
+                return None
+            f = float(v)
+            return f if (f == f and abs(f) != float("inf")) else None
+        except (TypeError, ValueError):
+            return None
+    em, pct, price = _n(row.get("expected_move_at_mint")), _n(row.get("expected_move_pct_at_mint")), \
+        _n(row.get("expected_price_at_mint"))
+    direction = row.get("direction")
+    if em is None or em <= 0 or direction not in ("CE", "PE"):
+        return None
+    up = direction == "CE"
+    approx = False
+    if price is not None:
+        spot = price - em if up else price + em
+    elif pct is not None and pct > 0:
+        spot = em / (pct / 100.0)
+        price = round((spot + em if up else spot - em) / 0.05) * 0.05
+        approx = True
+    else:
+        return None
+    if spot <= 0:
+        return None
+    # pct is always re-derived from the displayed price, so price and % can never disagree
+    return {"price": price, "spot": spot, "em": em,
+            "pct": (price - spot) / spot * 100.0, "up": up, "approx": approx}
+
+
 def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
     """[2026-08-01] DORE Options Engine — Active Plans tab. Renders every
     currently-OPEN DoreOptionsPlan (utils.dore_options_persistence.
@@ -4532,45 +4575,52 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
             return None
 
     def _fmt_expected_move(row):
-        # The definite stock price the expected move points to, in the plan's
+        # The stock TARGET the expected move points to, in the plan's
         # direction (CE: above spot, PE: below), frozen at mint, with the
-        # distance underneath. Plans minted before the price was captured fall
-        # back to the +/- band: a level cannot be recovered exactly from a
-        # rounded percentage.
+        # signed move and percentage underneath -- see _expected_price_view
+        # (older rows get the price reconstructed from the stored move and
+        # percentage, flagged "~").
         em = _f(row.get("expected_move_at_mint"))
         if em is None:
             return _pre_mint_dash("Expected move", row)
-        pct = _f(row.get("expected_move_pct_at_mint"))
-        price = _f(row.get("expected_price_at_mint"))
-        direction = row.get("direction")
+        view = _expected_price_view(row)
         src = row.get("expected_move_source_at_mint") or "ATR"
         days = _plan_cal_days(row)
-        pct_txt = f" ({pct:.1f}%)" if pct is not None else ""
+        direction = row.get("direction")
         iv = _f(row.get("ce_iv_at_mint") if direction == "CE" else row.get("pe_iv_at_mint"))
         parts = []
-        if price is not None and direction in ("CE", "PE"):
-            up = direction == "CE"
-            spot = price - em if up else price + em
-            other = spot - em if up else spot + em
+        if view is not None:
+            up, price, spot = view["up"], view["price"], view["spot"]
+            sgn = "+" if up else "−"        # true minus, as everywhere else in this table
             color = "#3fb950" if up else "#f85149"
+            other = spot - em if up else spot + em
             parts.append(
-                f"Stock price the expected move points to in this plan's direction "
-                f"({'above' if up else 'below'} spot): spot at mint ₹{spot:,.2f} {'+' if up else '−'} ₹{em:,.0f}"
+                f"Stock price the expected move points to in this plan's direction ({'above' if up else 'below'} spot): spot at mint "
+                f"₹{spot:,.2f} {sgn} ₹{em:,.0f} = ₹{price:,.2f} ({sgn}{abs(view['pct']):.1f}%)"
                 + (f", over the life to expiry ({days} days)" if days else ", over the life to expiry") + ". "
                 f"The opposite side of the band is ₹{other:,.2f}. A 1-SD-style range, not a forecast.")
-            head = (f'<span style="color:{color};font-weight:600;">{"▲" if up else "▼"} ₹{price:,.2f}</span>'
+            if view["approx"]:
+                parts.append("This plan was minted before the exact price was recorded; the target is "
+                             "reconstructed from the stored move and percentage (good to about "
+                             f"±₹0.2).")
+            head = (f'<span style="color:{color};font-weight:600;">{"▲" if up else "▼"} '
+                    f'{"~" if view["approx"] else ""}₹{price:,.2f}</span>'
                     f'<div style="font-size:11px;font-weight:400;color:var(--muted);">'
-                    f'{"+" if up else "−"}₹{em:,.0f}{pct_txt}</div>')
+                    f'{sgn}₹{em:,.0f} ({sgn}{abs(view["pct"]):.1f}%)</div>')
         else:
+            pct = _f(row.get("expected_move_pct_at_mint"))
+            pct_txt = f" ({pct:.1f}%)" if pct is not None else ""
             parts.append(f"A ±₹{em:,.0f} band around spot at mint over the life to expiry"
                          + (f" ({days} days)" if days else "")
-                         + ". This plan predates the exact price being recorded; not a forecast of direction.")
+                         + ". This plan predates the exact price being recorded and its spot cannot be "
+                           "recovered; not a forecast of direction.")
             head = f'±₹{em:,.0f}{pct_txt}'
         parts.append(f"Source: {src} (the engine takes the larger of the ATR-based and IV-based move).")
         if days:
             parts.append(f"Same basis over a 2-day hold: about ₹{em * (2.0 / days) ** 0.5:,.0f}.")
-        if iv and pct:
-            spot_est = em / (pct / 100.0)
+        pct_iv = _f(row.get("expected_move_pct_at_mint"))
+        if iv and pct_iv:
+            spot_est = em / (pct_iv / 100.0)
             parts.append(f"IV-implied 2-day move at {iv:.1f}% IV: about ₹{spot_est * iv / 100.0 * (2.0 / 365.0) ** 0.5:,.0f}.")
         return (f'<span style="white-space:nowrap;cursor:help;" title="{html.escape(" ".join(parts))}">'
                 f'{head}</span>')

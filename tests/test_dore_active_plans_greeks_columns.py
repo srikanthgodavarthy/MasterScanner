@@ -208,26 +208,40 @@ def test_every_row_has_one_cell_per_header():
 def test_cells_render_the_new_values():
     out = sc._dore_options_active_plans_table_html(_df())
     assert "69" in out and "🔵" in out                                # confidence, 55-74 band
-    assert "±₹142 (1.5%)" in out or "±₹142 (1.4%)" in out            # a +/- band: rupees + % of spot
+    # a legacy row (no stored price): the target is reconstructed in the plan's direction,
+    # with a SIGNED percentage that matches it
+    assert "▲ ~₹" in out and ("+₹142 (+1.5%)" in out or "+₹142 (+1.4%)" in out)
     assert "-4.30" in out                                              # theta ₹/day
     assert "0.00231" in out                                            # gamma
     assert "+42%" not in out and "Fav" not in out                      # scenario column is gone
     assert ">LS<" not in out and "PB</span>" not in out                # no Source badge
 
 
-def test_expected_move_falls_back_to_a_band_when_the_price_was_not_recorded():
-    """Plans minted before expected_price_at_mint existed: no exact level to show."""
+def test_legacy_rows_get_a_reconstructed_target_in_the_plans_direction():
+    """Plans minted before expected_price_at_mint existed: the price is recovered from the stored
+    move + percentage of spot (flagged ~), in the plan's direction, with a matching signed %."""
+    ce = sc._dore_options_active_plans_table_html(_df(direction="CE"))
+    assert "▲ ~₹" in ce and "minted before the exact price was recorded" in ce
+    assert "+₹142 (+1.5%)" in ce or "+₹142 (+1.4%)" in ce
+    pe = sc._dore_options_active_plans_table_html(_df(direction="PE"))
+    assert "▼ ~₹" in pe and ("−₹142 (−1.5%)" in pe or "−₹142 (−1.4%)" in pe)
+    for out in (ce, pe):
+        assert "±₹142" not in out                                  # no direction-less band shown
+
+
+def test_expected_move_falls_back_to_a_band_only_when_the_spot_cannot_be_recovered():
+    """No stored price AND no percentage of spot: nothing to reconstruct from."""
     for d in ("CE", "PE"):
-        out = sc._dore_options_active_plans_table_html(_df(direction=d))
+        out = sc._dore_options_active_plans_table_html(_df(direction=d, expected_move_pct_at_mint=None))
         assert "±₹142" in out and "predates the exact price" in out
 
 
 def test_expected_move_shows_the_definite_price_in_the_plans_direction():
     ce = sc._dore_options_active_plans_table_html(_df(direction="CE", expected_price_at_mint=10042.0))
-    assert "▲ ₹10,042.00" in ce and ("+₹142 (1.5%)" in ce or "+₹142 (1.4%)" in ce) and "#3fb950" in ce
+    assert "▲ ₹10,042.00" in ce and ("+₹142 (+1.5%)" in ce or "+₹142 (+1.4%)" in ce) and "#3fb950" in ce
     assert "spot at mint ₹9,900.00 + ₹142" in ce and "opposite side of the band is ₹9,758.00" in ce
     pe = sc._dore_options_active_plans_table_html(_df(direction="PE", expected_price_at_mint=9758.0))
-    assert "▼ ₹9,758.00" in pe and ("−₹142 (1.5%)" in pe or "−₹142 (1.4%)" in pe) and "spot at mint ₹9,900.00 − ₹142" in pe
+    assert "▼ ₹9,758.00" in pe and ("−₹142 (−1.5%)" in pe or "−₹142 (−1.4%)" in pe) and "spot at mint ₹9,900.00 − ₹142" in pe
     assert "opposite side of the band is ₹10,042.00" in pe
 
 

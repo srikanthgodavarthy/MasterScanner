@@ -224,7 +224,7 @@ def test_greeks_unavailable_at_mint_is_distinguished_from_pre_mint():
 def test_expected_move_cell_explains_horizon_and_two_day_equivalent():
     out = _html(expected_move_at_mint=319.0, expected_move_pct_at_mint=13.0, direction="CE",
                 expected_move_source_at_mint="ATR", expected_price_at_mint=2773.0)
-    assert "▲ ₹2,773.00" in out and "+₹319 (13.0%)" in out
+    assert "▲ ₹2,773.00" in out and "+₹319 (+13.0%)" in out
     assert "26 days" in out and "A 1-SD-style range, not a forecast" in out and "Source: ATR" in out
     two_day = 319.0 * math.sqrt(2 / 26)
     assert f"₹{two_day:,.0f}" in out                   # same basis over a 2-day hold
