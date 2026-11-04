@@ -4476,33 +4476,27 @@ def _fmt_blast_at_mint_html(row) -> str:
     return f'<span title="{tip}" style="cursor:help;color:var(--muted);">none</span>'
 
 
-# [2026-11-04, SG request] Strike Status. ATM = strike within this % of spot.
-# Plans don't store the chain's strike step, so a fixed band stands in for
-# "nearest strike to spot"; widen it if coarse-step stocks read OTM too often.
-_STRIKE_ATM_BAND_PCT = 1.0
+# [2026-11-04, SG request] Strike Status = where the plan is in its lifecycle:
+# ACTIVE (entry triggered, trade open), ENTRY (entry conditions are ready / the
+# premium is in the entry zone), WAITING (valid plan, not at entry yet).
+# TRACKED (instant-of-mint candidate) is not shown in this table.
+_STRIKE_STATUS_ORDER = {"ACTIVE": 0, "ENTRY": 1, "WAITING": 2}
+_STRIKE_STATUS_BY_PLAN_STATUS = {
+    "ACTIVE": "ACTIVE", "OPEN": "ACTIVE",
+    "ENTRY_READY": "ENTRY", "IN_ENTRY_ZONE": "ENTRY",
+    "WAITING_FOR_ENTRY": "WAITING",
+}
+_STRIKE_STATUS_STYLE = {
+    "ACTIVE":  ("#3fb950", "Entry triggered; the trade is open."),
+    "ENTRY":   ("#d29922", "Entry conditions are ready (or the premium is in the entry zone); entry has not been locked yet."),
+    "WAITING": ("#8b949e", "Valid plan still waiting: premium is outside the entry zone, or this cycle's scan did not reproduce it."),
+}
 
 
-def _strike_status(direction, strike, spot, atm_band_pct: float = _STRIKE_ATM_BAND_PCT):
-    """ITM / ATM / OTM of an option strike versus spot, or None if it cannot be
-    stated. CE is in the money when strike < spot, PE when strike > spot.
-    Returns {status, dist_pct, spot, strike}; dist_pct is the strike's
-    distance from spot as a % of spot, positive = OTM (strike beyond spot in
-    the plan's direction), negative = ITM."""
-    def _n(v):
-        try:
-            if v is None or v == "" or isinstance(v, bool):
-                return None
-            f = float(v)
-            return f if (f == f and abs(f) != float("inf")) else None
-        except (TypeError, ValueError):
-            return None
-    k, sp = _n(strike), _n(spot)
-    d = str(direction or "").upper()
-    if k is None or sp is None or k <= 0 or sp <= 0 or d not in ("CE", "PE"):
-        return None
-    dist = (k - sp) / sp * 100.0 if d == "CE" else (sp - k) / sp * 100.0
-    status = "ATM" if abs(dist) <= atm_band_pct else ("OTM" if dist > 0 else "ITM")
-    return {"status": status, "dist_pct": dist, "spot": sp, "strike": k}
+def _strike_status(plan_status):
+    """ACTIVE / ENTRY / WAITING for a DORE plan status, or None when the status
+    is not one this table shows (TRACKED, CLOSED, unknown)."""
+    return _STRIKE_STATUS_BY_PLAN_STATUS.get(str(getattr(plan_status, "value", plan_status) or "").upper().strip())
 
 
 def _expected_price_view(row):
@@ -4734,26 +4728,15 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
                 f'{head}</span>')
 
     def _fmt_strike_status(row):
-        # ITM / ATM / OTM of the strike vs spot at mint (frozen entry spot;
-        # older plans fall back to the spot recovered from the expected move).
-        spot = _f(row.get("entry_underlying"))
-        if not spot:
-            _v = _expected_price_view(row)
-            spot = _v["spot"] if _v else None
-        st_ = _strike_status(row.get("direction"), row.get("strike"), spot)
-        if st_ is None:
+        stt = _strike_status(row.get("status"))
+        if stt is None:
             return _DASH
-        color = {"ITM": "#3fb950", "ATM": "#d29922", "OTM": "#8b949e"}[st_["status"]]
-        d = st_["dist_pct"]
-        if st_["status"] == "ATM":
-            where = f"{abs(d):.1f}% from spot (ATM band ±{_STRIKE_ATM_BAND_PCT:g}%)"
-        else:
-            where = f"{abs(d):.1f}% {st_['status']}"
-        tip = (f"{row.get('direction')} strike ₹{st_['strike']:,.2f} vs spot at mint "
-               f"₹{st_['spot']:,.2f}: {where}. Status is at mint, not live.")
-        return (f'<span style="cursor:help;white-space:nowrap;" title="{html.escape(tip)}">'
-                f'<span style="color:{color};font-weight:700;">{st_["status"]}</span>'
-                f'<div style="font-size:11px;font-weight:400;color:var(--muted);">{abs(d):.1f}%</div></span>')
+        color, tip = _STRIKE_STATUS_STYLE[stt]
+        label = str(row.get("plan_status_label") or "")
+        if label:
+            tip = f"{tip} ({label})"
+        return (f'<span style="color:{color};font-weight:700;cursor:help;white-space:nowrap;" '
+                f'title="{html.escape(tip)}">{stt}</span>')
 
     def _fmt_theta(row):
         # ₹/day at mint. Withheld when the chain contradicted the configured
@@ -4857,7 +4840,7 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
     # the Status column carried now shows as a dimmed row + row tooltip.
     headers = [
         ("Symbol", ""), ("Direction", ""), ("Strike", ""),
-        ("Strike Status", "ITM / ATM / OTM of the strike versus spot when the plan was minted (CE: ITM below spot; PE: ITM above spot), with the distance from spot underneath. ATM = within ±1% of spot."),
+        ("Strike Status", "Where the plan is: ACTIVE (entry triggered), ENTRY (entry conditions ready / premium in the entry zone), WAITING (valid, not at entry yet)."),
         ("Confidence Score", "DORE confidence_score (latest seen / at activation)"),
         ("Strike PCR", ""),
         ("Expected Stock Move", "Stock price the 1-SD-style expected move points to in the plan's direction (CE above spot, PE below), to expiry, frozen at mint. Hover for the horizon, source and 2-day equivalent."),
@@ -5160,11 +5143,11 @@ def _render_dore_options_active_plans_tab() -> None:
     table. See utils/dore_options_persistence.py's module docstring for
     the full rationale.
 
-    Filtered to lifecycle_group == "ACTIVE" (entry actually locked) —
-    TRACKED (Level 1, not yet executable) and MONITORING (Level 2,
-    watching for entry: WAITING_FOR_ENTRY/ENTRY_READY/IN_ENTRY_ZONE) are
-    excluded, matching "Active Setups" on the equity side excluding
-    WAITING. This mirrors the SAME filter pages/dashboard.py's "ACTIVE
+    [2026-11-04, SG request] Shows ACTIVE (entry locked) plus the MONITORING
+    plans (WAITING_FOR_ENTRY -> "WAITING", ENTRY_READY/IN_ENTRY_ZONE ->
+    "ENTRY"), each tagged in the Strike Status column. TRACKED (Level 1, not
+    yet executable) is still excluded. (Previously ACTIVE-only, matching
+    "Active Setups" on the equity side excluding WAITING.) This mirrors the SAME filter pages/dashboard.py's "ACTIVE
     OPTIONS PLANS" card already applies (see its comment there) — this
     tab previously showed all open_plans unfiltered, inconsistent with
     that card's own definition of "active." Only changes what this tab
@@ -5193,14 +5176,22 @@ def _render_dore_options_active_plans_tab() -> None:
                  "the live scan.")
         return
 
-    rows = [r for r in active_plan_rows(open_plans) if r.get("lifecycle_group") == "ACTIVE"]
+    # [2026-11-04, SG request] Strike Status column: show ACTIVE plus the
+    # pre-entry MONITORING plans (WAITING / ENTRY). TRACKED stays hidden.
+    rows = [r for r in active_plan_rows(open_plans)
+            if r.get("lifecycle_group") in ("ACTIVE", "MONITORING") and _strike_status(r.get("status"))]
     if not rows:
-        st.info("No ACTIVE DORE plans right now — TRACKED/MONITORING candidates aren't shown "
-                 "in this tab (entry hasn't triggered yet).")
+        st.info("No ACTIVE, ENTRY or WAITING DORE plans right now — TRACKED candidates aren't shown "
+                 "in this tab.")
         return
+    # ACTIVE first, then ENTRY, then WAITING; newest-locked first within each
+    # (active_plan_rows already sorts newest first and sorted() is stable).
+    rows.sort(key=lambda r: _STRIKE_STATUS_ORDER[_strike_status(r.get("status"))])
 
     rows_df = pd.DataFrame(rows)
-    st.caption(f"{len(rows_df)} active plan(s) (entry locked) — independent of whether this cycle's live scan "
+    _n_by = rows_df["status"].map(_strike_status).value_counts()
+    st.caption(f"{int(_n_by.get('ACTIVE', 0))} active (entry locked), {int(_n_by.get('ENTRY', 0))} entry-ready, "
+               f"{int(_n_by.get('WAITING', 0))} waiting — independent of whether this cycle's live scan "
                "reproduced the contract. Auto-closes once the contract's own expiry passes.")
 
     # [Options-buying UI request] Today's vs Previous Days' Setups tabs —

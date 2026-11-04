@@ -301,33 +301,28 @@ def test_empty_df_message_unchanged():
 
 
 # ── Strike Status [2026-11-04] ───────────────────────────────────────────────
-def test_strike_status_ce_and_pe_moneyness():
+def test_strike_status_maps_lifecycle_to_active_entry_waiting():
     f = sc._strike_status
-    assert f("CE", 205, 195.95)["status"] == "OTM" and f("CE", 205, 195.95)["dist_pct"] > 4
-    assert f("CE", 180, 195.95)["status"] == "ITM" and f("CE", 180, 195.95)["dist_pct"] < 0
-    assert f("PE", 180, 195.95)["status"] == "OTM"      # PE is OTM when strike is BELOW spot
-    assert f("PE", 205, 195.95)["status"] == "ITM"
-    assert f("CE", 196, 195.95)["status"] == "ATM" and f("PE", 195, 195.95)["status"] == "ATM"
+    assert f("ACTIVE") == "ACTIVE" and f("OPEN") == "ACTIVE"
+    assert f("ENTRY_READY") == "ENTRY" and f("IN_ENTRY_ZONE") == "ENTRY"
+    assert f("WAITING_FOR_ENTRY") == "WAITING"
+    assert f("waiting_for_entry") == "WAITING"
+    for other in ("TRACKED", "CLOSED", "", None, "junk"):
+        assert f(other) is None
 
 
-def test_strike_status_unstatable_inputs():
-    f = sc._strike_status
-    for args in (("CE", None, 100), ("CE", 100, 0), ("XX", 100, 100), ("CE", float("nan"), 100), ("PE", 100, None)):
-        assert f(*args) is None
+def test_strike_status_cell_renders_each_state():
+    for status, label in (("ACTIVE", "ACTIVE"), ("ENTRY_READY", "ENTRY"),
+                          ("IN_ENTRY_ZONE", "ENTRY"), ("WAITING_FOR_ENTRY", "WAITING")):
+        out = sc._dore_options_active_plans_table_html(_df(status=status))
+        assert f">{label}<" in out, status
 
 
-def test_strike_status_cell_uses_entry_underlying_then_falls_back_to_expected_move():
-    # frozen spot present
-    out = sc._dore_options_active_plans_table_html(_df(entry_underlying=9000.0, strike=9500.0, direction="CE"))
-    assert ">OTM<" in out and "5.6%" in out
-    # no frozen spot: recovered from the stored move + pct (142 / 1.45% ~= 9793)
-    out2 = sc._dore_options_active_plans_table_html(_df(strike=9500.0, direction="CE"))
-    assert ">ITM<" in out2
-
-
-def test_strike_status_missing_everything_renders_dash():
-    out = sc._dore_options_active_plans_table_html(_df(strike=None, expected_move_at_mint=None,
-                                                       expected_move_pct_at_mint=None))
+def test_pre_entry_rows_render_without_entry_values_and_match_header_width():
+    out = sc._dore_options_active_plans_table_html(
+        _df(status="WAITING_FOR_ENTRY", entry_locked=None, last_premium=None, last_drift_pct=None,
+            saved_stop_loss=None, saved_target1=None, saved_target2=None))
+    assert ">WAITING<" in out
     assert out.split("<tbody>")[1].count("<td") == len(_headers(out))
 
 
