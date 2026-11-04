@@ -2841,7 +2841,7 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
         st.info("Supabase isn't configured, so Active Plans can't be loaded. Trade lifecycle persistence requires Supabase.")
         return
 
-    from utils.setup_persistence import compute_pnl_pct
+    from utils.setup_persistence import compute_pnl_pct, derive_trigger_label
 
     open_plans = preloaded_plans if preloaded_plans is not None else load_open_setup_plans()
     # Active Setups = entered only (ACTIVE/T1_HIT) — WAITING plans are
@@ -2870,6 +2870,9 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
                 "norm_score":  float(r.get("Score", 0) or 0),
                 "pct_chg":     _fresh_pct_chg(r),
                 "vol_ratio":   float(r.get("VolRatio", 0) or 0),
+                # [2026-11-04] live trigger read; only used when the plan has
+                # no frozen locked_trigger (plans minted before that field).
+                "trigger":     derive_trigger_label(r),
             }
 
     # [2026-10-05, SG request] PB and MOM are removed from the scanner
@@ -2918,6 +2921,9 @@ def _render_active_plans_tab(df_aug: pd.DataFrame, preloaded_plans: dict | None 
             "ExitInfo":     _exit,
             "ExitRank":     ACTION_RANK.get(_exit.get("action"), RANK_UNKNOWN),
             "CurVolRatio":  live.get("vol_ratio", 0.0),
+            "EntryTime":    _ap_entry_time(getattr(plan, "activated_at", ""), getattr(plan, "created_at", "")),
+            "Trigger":      (getattr(plan, "locked_trigger", "") or live.get("trigger", "") or ""),
+            "TriggerFrozen": bool(getattr(plan, "locked_trigger", "")),
         })
 
     rows_df = pd.DataFrame(rows)
@@ -2985,6 +2991,66 @@ def _ap_source_columns() -> list[str]:
     return cols
 
 
+# [2026-11-04, SG request] The per-source column keyed "CV4" is displayed as
+# "Entry". The internal key stays "CV4" (tests, _ap_per_source_cells and the
+# LS<->CV4 source mapping all use it); only the header text changes.
+_AP_SOURCE_HEADER_LABEL = {"CV4": "Entry"}
+
+
+def _ap_source_header_label(col: str) -> str:
+    return _AP_SOURCE_HEADER_LABEL.get(col, col)
+
+
+def _ap_parse_ts(v):
+    """Parse an ISO / Postgres timestamp string to an aware UTC datetime, or None."""
+    t = str(v or "").strip()
+    if len(t) < 10:
+        return None
+    try:
+        dt = datetime.fromisoformat(t.replace(" ", "T", 1).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        from datetime import timezone as _tz
+        dt = dt.replace(tzinfo=_tz.utc)
+    return dt
+
+
+def _ap_entry_time(activated_at, created_at) -> tuple[str, bool]:
+    """(HH:MM:SS IST, approx) for the Entry column.
+
+    Uses activated_at. Plans activated before 2026-11-04 stored only a date
+    there (midnight UTC, no real time); for those the plan's created_at time is
+    used when it is on the same day (a plan is normally minted and entered in
+    the same scan), flagged approx. Otherwise ("", False) -> the cell shows no
+    time rather than a made-up one."""
+    from utils.time_utils import IST
+    act = _ap_parse_ts(activated_at)
+    if act is not None and (act.hour, act.minute, act.second) != (0, 0, 0):
+        return act.astimezone(IST).strftime("%H:%M:%S"), False
+    cre = _ap_parse_ts(created_at)
+    if cre is not None and (act is None or cre.date() == act.date()):
+        return cre.astimezone(IST).strftime("%H:%M:%S"), True
+    return "", False
+
+
+def _ap_trigger_cell(trigger: str, frozen: bool = True) -> str:
+    """Trigger column cell: one pill per label (Breakout / PB / Fib ...).
+    `frozen` False = read from today's live scan row because the plan has no
+    saved trigger; shown dimmed with a tooltip."""
+    labels = [t.strip() for t in str(trigger or "").split(",") if t.strip()]
+    if not labels:
+        return '<td class="col-num" style="text-align:center;color:var(--muted);">—</td>'
+    tip = ("Trigger saved when the plan was minted" if frozen else
+           "Plan has no saved trigger; this is today's live scan read")
+    opacity = "" if frozen else "opacity:.6;"
+    pills = " ".join(
+        f'<span style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;'
+        f'font-weight:600;font-size:10px;border-radius:4px;padding:1px 6px;{opacity}">'
+        f'{html.escape(t)}</span>' for t in labels)
+    return f'<td style="text-align:center;" title="{tip}">{pills}</td>'
+
+
 def _ap_volume_cell(vol_ratio, conflict_flag=False, conflict_reason="") -> str:
     """Volume cell for the Active Setups table. [2026-10-12, SG request]
     Always shows the volume ratio -- it used to be replaced by a red
@@ -3049,7 +3115,8 @@ def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
         '<th>CV4 Composite</th>'
         '<th title="scoring_core norm_score (0-100)">Norm Score</th>'
         '<th>Volume</th><th>CMP</th>'
-        + "".join(f"<th>{_c}</th>" for _c in _ap_source_columns())
+        + "".join(f"<th>{_ap_source_header_label(_c)}</th>" for _c in _ap_source_columns())
+        + '<th title="What fired the entry, frozen when the plan was minted">Trigger</th>'
         + '<th>SL (CV4)</th><th>T1 (CV4)</th><th>PnL%</th>'
         '<th>No of Days</th></tr>'
     )
@@ -3080,7 +3147,8 @@ def _render_active_plans_table_body(rows_df: pd.DataFrame, df_aug: pd.DataFrame,
             f'<td class="col-num">{_ap_num(r["NormScore"], ".0f")}</td>'
             + _vol_cell
             + f'<td class="col-num">{_px(r["CurrentPrice"])}</td>'
-            f'{_ap_per_source_cells(r["Source"], r["ContribSources"], r["SourceEntries"], r["Entry"])}'
+            f'{_ap_per_source_cells(r["Source"], r["ContribSources"], r["SourceEntries"], r["Entry"], r["EntryTime"])}'
+            f'{_ap_trigger_cell(r["Trigger"], r["TriggerFrozen"])}'
             f'<td class="col-num">{_px(r["SL"])}</td>'
             f'<td class="col-num">{_px(r["T1"])}</td>'
             + _ap_pnl_cell(r["PnLPct"])
@@ -3245,7 +3313,8 @@ def _ap_source_badges_with_entries(source: str, contributing_sources: str, sourc
     return "".join(cells)
 
 
-def _ap_per_source_cells(source: str, contributing_sources: str, source_entries_json: str, fallback_entry: float) -> str:
+def _ap_per_source_cells(source: str, contributing_sources: str, source_entries_json: str, fallback_entry: float,
+                         entry_time: tuple = ("", False)) -> str:
     """
     Active Setups table's four individual per-source columns (CV4, PB,
     MOM, FP) — [2026-09-08, SG request: "individual columns for each
@@ -3319,9 +3388,19 @@ def _ap_per_source_cells(source: str, contributing_sources: str, source_entries_
         if _src_code in active:
             px = entries.get(_src_code, fallback_entry)
             _color = _SOURCE_COLOR.get(_src_code, "#3fb950")
+            # [2026-11-04, SG request] entry TIME (not date) beneath the price,
+            # on the CV4/"Entry" column only: the time belongs to the plan's
+            # entry, not to each corroborating source.
+            _t_html = ""
+            _et, _approx = entry_time if entry_time else ("", False)
+            if _src_code == "LS" and _et:
+                _t_tip = (' title="Approximate: plan creation time (entered before exact entry times were saved)"'
+                          if _approx else ' title="Time entry triggered (IST)"')
+                _t_html = (f'<div style="color:var(--muted);font-size:10px;font-weight:400;"{_t_tip}>'
+                           f'{"~" if _approx else ""}{_et}</div>')
             cells.append(
                 f'<td class="col-num" style="text-align:center;">'
-                f'<div style="color:{_color};font-weight:700;">{_px(px)}</div></td>'
+                f'<div style="color:{_color};font-weight:700;">{_px(px)}</div>{_t_html}</td>'
             )
         else:
             cells.append('<td class="col-num" style="text-align:center;color:var(--muted);">—</td>')

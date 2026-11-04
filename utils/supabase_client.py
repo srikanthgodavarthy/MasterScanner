@@ -727,6 +727,8 @@ def load_lifecycle_transitions(limit: int = 1000) -> pd.DataFrame:
 
 # ─── SETUP PLANS (frozen trade levels) ───────────────────────────────────────
 
+_SETUP_PLAN_TRIGGER_COL = "locked_trigger"
+
 def upsert_setup_plan(plan_dict: dict) -> bool:
     """
     Persist (insert or update) one SetupPlan to the setup_plans table.
@@ -749,6 +751,18 @@ def upsert_setup_plan(plan_dict: dict) -> bool:
         db.upsert_rows("setup_plans", [row], conflict_cols=["setup_id"])
         return True
     except Exception as exc:
+        # [2026-11-04] locked_trigger is added by TRIGGER_MIGRATION_SQL. If the
+        # code is deployed first, retry without it so plan saves keep working.
+        if _SETUP_PLAN_TRIGGER_COL in str(exc):
+            logger.warning("setup_plans is missing column %s -- run TRIGGER_MIGRATION_SQL; "
+                           "retrying without it", _SETUP_PLAN_TRIGGER_COL)
+            try:
+                db.upsert_rows("setup_plans",
+                               [{k: v for k, v in row.items() if k != _SETUP_PLAN_TRIGGER_COL}],
+                               conflict_cols=["setup_id"])
+                return True
+            except Exception as exc2:
+                exc = exc2
         logger.error("upsert_setup_plan failed: %s", exc)
         return False
 
@@ -767,12 +781,24 @@ def upsert_setup_plans_batch(plans: list[dict]) -> bool:
 
     clean = [{k: _safe(v) for k, v in p.items()} for p in plans]
 
-    try:
+    def _write(rows):
         batch_size = 200
-        for i in range(0, len(clean), batch_size):
-            db.upsert_rows("setup_plans", clean[i:i + batch_size], conflict_cols=["setup_id"])
+        for i in range(0, len(rows), batch_size):
+            db.upsert_rows("setup_plans", rows[i:i + batch_size], conflict_cols=["setup_id"])
+
+    try:
+        _write(clean)
         return True
     except Exception as exc:
+        # [2026-11-04] see upsert_setup_plan(): tolerate a missing locked_trigger column.
+        if _SETUP_PLAN_TRIGGER_COL in str(exc):
+            logger.warning("setup_plans is missing column %s -- run TRIGGER_MIGRATION_SQL; "
+                           "retrying without it", _SETUP_PLAN_TRIGGER_COL)
+            try:
+                _write([{k: v for k, v in r.items() if k != _SETUP_PLAN_TRIGGER_COL} for r in clean])
+                return True
+            except Exception as exc2:
+                exc = exc2
         logger.error("upsert_setup_plans_batch failed: %s", exc)
         return False
 
@@ -803,6 +829,7 @@ def _setup_plan_from_row(row: dict) -> "object":
         locked_pct_chg           = float(row.get("locked_pct_chg",   0) or 0),
         locked_vol_ratio         = float(row.get("locked_vol_ratio", 0) or 0),
         locked_norm_score        = int(float(row.get("locked_norm_score", 0) or 0)),
+        locked_trigger           = row.get("locked_trigger") or "",
         contributing_sources     = row.get("contributing_sources") or "",
         conflict_flag            = bool(row.get("conflict_flag") or False),
         conflict_reason          = row.get("conflict_reason") or "",
@@ -2572,6 +2599,16 @@ ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS locked_vol_ratio numeric(8,2) N
 # backfill needed or possible, norm_score wasn't stored at their mint.
 NORM_SCORE_MIGRATION_SQL = """
 ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS locked_norm_score integer NOT NULL DEFAULT 0;
+"""
+
+# [2026-11-04, SG request] Entry trigger label frozen at mint
+# (SetupPlan.locked_trigger -> Active Setups "Trigger" column). Unlike the
+# blocks above this one is OPTIONAL to run first: upsert_setup_plan(s_batch)
+# retry without the column if it is missing. Until it is run, triggers are not
+# saved and the table falls back to the live scan row's read. Existing rows
+# read back '' (DEFAULT); there is no backfill.
+TRIGGER_MIGRATION_SQL = """
+ALTER TABLE setup_plans ADD COLUMN IF NOT EXISTS locked_trigger text NOT NULL DEFAULT '';
 """
 
 # [2026-09-08, SG request — single-symbol-persistent Active Setups]
