@@ -2167,6 +2167,9 @@ def active_plan_rows(open_plans: dict) -> list[dict]:
                 "greeks_reliable_at_mint": plan.greeks_reliable_at_mint,
                 "greeks_theta_verified_at_mint": plan.greeks_theta_verified_at_mint,
                 "expected_price_at_mint": plan.expected_price_at_mint,
+                # [2026-11-04, SG request] spot at the instant entry was locked;
+                # used for the Strike Status (ITM/ATM/OTM) column.
+                "entry_underlying": plan.entry_underlying,
                 "last_seen_at": plan.last_seen_at,
                 "created_date": plan.created_date,
                 "plan_age_days": days_active,

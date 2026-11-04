@@ -4476,6 +4476,35 @@ def _fmt_blast_at_mint_html(row) -> str:
     return f'<span title="{tip}" style="cursor:help;color:var(--muted);">none</span>'
 
 
+# [2026-11-04, SG request] Strike Status. ATM = strike within this % of spot.
+# Plans don't store the chain's strike step, so a fixed band stands in for
+# "nearest strike to spot"; widen it if coarse-step stocks read OTM too often.
+_STRIKE_ATM_BAND_PCT = 1.0
+
+
+def _strike_status(direction, strike, spot, atm_band_pct: float = _STRIKE_ATM_BAND_PCT):
+    """ITM / ATM / OTM of an option strike versus spot, or None if it cannot be
+    stated. CE is in the money when strike < spot, PE when strike > spot.
+    Returns {status, dist_pct, spot, strike}; dist_pct is the strike's
+    distance from spot as a % of spot, positive = OTM (strike beyond spot in
+    the plan's direction), negative = ITM."""
+    def _n(v):
+        try:
+            if v is None or v == "" or isinstance(v, bool):
+                return None
+            f = float(v)
+            return f if (f == f and abs(f) != float("inf")) else None
+        except (TypeError, ValueError):
+            return None
+    k, sp = _n(strike), _n(spot)
+    d = str(direction or "").upper()
+    if k is None or sp is None or k <= 0 or sp <= 0 or d not in ("CE", "PE"):
+        return None
+    dist = (k - sp) / sp * 100.0 if d == "CE" else (sp - k) / sp * 100.0
+    status = "ATM" if abs(dist) <= atm_band_pct else ("OTM" if dist > 0 else "ITM")
+    return {"status": status, "dist_pct": dist, "spot": sp, "strike": k}
+
+
 def _expected_price_view(row):
     """The stock TARGET the plan's expected move points to, in the plan's
     direction -- CE: spot + move (above), PE: spot - move (below) -- with the
@@ -4704,6 +4733,28 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
         return (f'<span style="white-space:nowrap;cursor:help;" title="{html.escape(" ".join(parts))}">'
                 f'{head}</span>')
 
+    def _fmt_strike_status(row):
+        # ITM / ATM / OTM of the strike vs spot at mint (frozen entry spot;
+        # older plans fall back to the spot recovered from the expected move).
+        spot = _f(row.get("entry_underlying"))
+        if not spot:
+            _v = _expected_price_view(row)
+            spot = _v["spot"] if _v else None
+        st_ = _strike_status(row.get("direction"), row.get("strike"), spot)
+        if st_ is None:
+            return _DASH
+        color = {"ITM": "#3fb950", "ATM": "#d29922", "OTM": "#8b949e"}[st_["status"]]
+        d = st_["dist_pct"]
+        if st_["status"] == "ATM":
+            where = f"{abs(d):.1f}% from spot (ATM band ±{_STRIKE_ATM_BAND_PCT:g}%)"
+        else:
+            where = f"{abs(d):.1f}% {st_['status']}"
+        tip = (f"{row.get('direction')} strike ₹{st_['strike']:,.2f} vs spot at mint "
+               f"₹{st_['spot']:,.2f}: {where}. Status is at mint, not live.")
+        return (f'<span style="cursor:help;white-space:nowrap;" title="{html.escape(tip)}">'
+                f'<span style="color:{color};font-weight:700;">{st_["status"]}</span>'
+                f'<div style="font-size:11px;font-weight:400;color:var(--muted);">{abs(d):.1f}%</div></span>')
+
     def _fmt_theta(row):
         # ₹/day at mint. Withheld when the chain contradicted the configured
         # theta basis (theta_verified False) -- that is where theta_verified
@@ -4806,6 +4857,7 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
     # the Status column carried now shows as a dimmed row + row tooltip.
     headers = [
         ("Symbol", ""), ("Direction", ""), ("Strike", ""),
+        ("Strike Status", "ITM / ATM / OTM of the strike versus spot when the plan was minted (CE: ITM below spot; PE: ITM above spot), with the distance from spot underneath. ATM = within ±1% of spot."),
         ("Confidence Score", "DORE confidence_score (latest seen / at activation)"),
         ("Strike PCR", ""),
         ("Expected Stock Move", "Stock price the 1-SD-style expected move points to in the plan's direction (CE above spot, PE below), to expiry, frozen at mint. Hover for the horizon, source and 2-day equivalent."),
@@ -4826,6 +4878,7 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
             f'<td style="font-weight:700;">{_tv_link(r.get("symbol", "—"))}</td>',
             f'<td style="color:{dir_color};font-weight:700;">{_fmt_text(direction)}</td>',
             f'<td>{_tv_option_link(r.get("symbol", ""), direction, r.get("strike"), r.get("expiry", ""))}</td>',
+            f'<td>{_fmt_strike_status(r)}</td>',
             f'<td>{_fmt_confidence(r)}</td>',
             f'<td{conflict_title} style="{"cursor:help;" if conflict_title else ""}">{_fmt_pcr(r)}</td>',
             f'<td>{_fmt_expected_move(r)}</td>',

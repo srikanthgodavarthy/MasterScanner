@@ -190,7 +190,7 @@ def _headers(html_):
 
 def test_columns_are_exactly_the_requested_set_in_order_without_source_or_status():
     h = _headers(sc._dore_options_active_plans_table_html(_df()))
-    assert h == ["Symbol", "Direction", "Strike", "Confidence Score", "Strike PCR", "Expected Stock Move",
+    assert h == ["Symbol", "Direction", "Strike", "Strike Status", "Confidence Score", "Strike PCR", "Expected Stock Move",
                  "IV", "Theta", "Gamma", "Blast", "Last Known Premium",
                  "Entry (Locked)", "Stop Loss", "Target 1", "Target 2", "P&L", "Last Seen",
                  "Days Active", "Expiry"]
@@ -298,3 +298,45 @@ def test_inactive_plan_is_dimmed_and_keeps_its_status_text_as_a_tooltip():
 
 def test_empty_df_message_unchanged():
     assert "No open plans" in sc._dore_options_active_plans_table_html(pd.DataFrame())
+
+
+# ── Strike Status [2026-11-04] ───────────────────────────────────────────────
+def test_strike_status_ce_and_pe_moneyness():
+    f = sc._strike_status
+    assert f("CE", 205, 195.95)["status"] == "OTM" and f("CE", 205, 195.95)["dist_pct"] > 4
+    assert f("CE", 180, 195.95)["status"] == "ITM" and f("CE", 180, 195.95)["dist_pct"] < 0
+    assert f("PE", 180, 195.95)["status"] == "OTM"      # PE is OTM when strike is BELOW spot
+    assert f("PE", 205, 195.95)["status"] == "ITM"
+    assert f("CE", 196, 195.95)["status"] == "ATM" and f("PE", 195, 195.95)["status"] == "ATM"
+
+
+def test_strike_status_unstatable_inputs():
+    f = sc._strike_status
+    for args in (("CE", None, 100), ("CE", 100, 0), ("XX", 100, 100), ("CE", float("nan"), 100), ("PE", 100, None)):
+        assert f(*args) is None
+
+
+def test_strike_status_cell_uses_entry_underlying_then_falls_back_to_expected_move():
+    # frozen spot present
+    out = sc._dore_options_active_plans_table_html(_df(entry_underlying=9000.0, strike=9500.0, direction="CE"))
+    assert ">OTM<" in out and "5.6%" in out
+    # no frozen spot: recovered from the stored move + pct (142 / 1.45% ~= 9793)
+    out2 = sc._dore_options_active_plans_table_html(_df(strike=9500.0, direction="CE"))
+    assert ">ITM<" in out2
+
+
+def test_strike_status_missing_everything_renders_dash():
+    out = sc._dore_options_active_plans_table_html(_df(strike=None, expected_move_at_mint=None,
+                                                       expected_move_pct_at_mint=None))
+    assert out.split("<tbody>")[1].count("<td") == len(_headers(out))
+
+
+def test_expected_stock_move_is_one_sided_in_the_plan_direction():
+    """CE target = spot + move, PE target = spot - move; the move is NOT halved or netted."""
+    ce = sc._expected_price_view({"direction": "CE", "expected_move_at_mint": 18.0,
+                                  "expected_move_pct_at_mint": 9.186, "expected_price_at_mint": 213.95})
+    pe = sc._expected_price_view({"direction": "PE", "expected_move_at_mint": 18.0,
+                                  "expected_move_pct_at_mint": 9.186, "expected_price_at_mint": 177.95})
+    assert ce["spot"] == pytest.approx(195.95) and ce["price"] == pytest.approx(213.95) and ce["pct"] > 0
+    assert pe["spot"] == pytest.approx(195.95) and pe["price"] == pytest.approx(177.95) and pe["pct"] < 0
+    assert abs(ce["price"] - ce["spot"]) == pytest.approx(18.0)       # full move, not 18/2
