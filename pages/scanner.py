@@ -4499,6 +4499,18 @@ def _strike_status(plan_status):
     return _STRIKE_STATUS_BY_PLAN_STATUS.get(str(getattr(plan_status, "value", plan_status) or "").upper().strip())
 
 
+def _dore_row_listed(row) -> bool:
+    """[2026-11-04, SG request] Which plans the DORE Active Plans table lists:
+    ACTIVE (entered) plans always; ENTRY plans only when their Blast is active
+    (gamma_blast_level_at_mint == "BLAST"); WAITING and TRACKED never."""
+    stt = _strike_status(row.get("status"))
+    if stt == "ACTIVE":
+        return True
+    if stt == "ENTRY":
+        return str(row.get("gamma_blast_level_at_mint") or "").upper().strip() == "BLAST"
+    return False
+
+
 def _expected_price_view(row):
     """The stock TARGET the plan's expected move points to, in the plan's
     direction -- CE: spot + move (above), PE: spot - move (below) -- with the
@@ -5143,10 +5155,10 @@ def _render_dore_options_active_plans_tab() -> None:
     table. See utils/dore_options_persistence.py's module docstring for
     the full rationale.
 
-    [2026-11-04, SG request] Shows ACTIVE (entry locked) plus the MONITORING
-    plans (WAITING_FOR_ENTRY -> "WAITING", ENTRY_READY/IN_ENTRY_ZONE ->
-    "ENTRY"), each tagged in the Strike Status column. TRACKED (Level 1, not
-    yet executable) is still excluded. (Previously ACTIVE-only, matching
+    [2026-11-04, SG request] Shows ACTIVE (entry locked) plans, plus ENTRY
+    plans (ENTRY_READY/IN_ENTRY_ZONE) only while their Blast is active, each
+    tagged in the Strike Status column. WAITING_FOR_ENTRY and TRACKED are
+    excluded. (Previously ACTIVE-only, matching
     "Active Setups" on the equity side excluding WAITING.) This mirrors the SAME filter pages/dashboard.py's "ACTIVE
     OPTIONS PLANS" card already applies (see its comment there) — this
     tab previously showed all open_plans unfiltered, inconsistent with
@@ -5176,22 +5188,20 @@ def _render_dore_options_active_plans_tab() -> None:
                  "the live scan.")
         return
 
-    # [2026-11-04, SG request] Strike Status column: show ACTIVE plus the
-    # pre-entry MONITORING plans (WAITING / ENTRY). TRACKED stays hidden.
-    rows = [r for r in active_plan_rows(open_plans)
-            if r.get("lifecycle_group") in ("ACTIVE", "MONITORING") and _strike_status(r.get("status"))]
+    # [2026-11-04, SG request] ACTIVE plans, plus ENTRY plans with Blast
+    # active. WAITING and TRACKED are not listed (see _dore_row_listed).
+    rows = [r for r in active_plan_rows(open_plans) if _dore_row_listed(r)]
     if not rows:
-        st.info("No ACTIVE, ENTRY or WAITING DORE plans right now — TRACKED candidates aren't shown "
-                 "in this tab.")
+        st.info("No ACTIVE plans, and no ENTRY plans with an active Blast, right now.")
         return
-    # ACTIVE first, then ENTRY, then WAITING; newest-locked first within each
+    # ACTIVE first, then ENTRY; newest-locked first within each
     # (active_plan_rows already sorts newest first and sorted() is stable).
     rows.sort(key=lambda r: _STRIKE_STATUS_ORDER[_strike_status(r.get("status"))])
 
     rows_df = pd.DataFrame(rows)
     _n_by = rows_df["status"].map(_strike_status).value_counts()
-    st.caption(f"{int(_n_by.get('ACTIVE', 0))} active (entry locked), {int(_n_by.get('ENTRY', 0))} entry-ready, "
-               f"{int(_n_by.get('WAITING', 0))} waiting — independent of whether this cycle's live scan "
+    st.caption(f"{int(_n_by.get('ACTIVE', 0))} active (entry locked), {int(_n_by.get('ENTRY', 0))} entry-ready "
+               "with Blast active — independent of whether this cycle's live scan "
                "reproduced the contract. Auto-closes once the contract's own expiry passes.")
 
     # [Options-buying UI request] Today's vs Previous Days' Setups tabs —

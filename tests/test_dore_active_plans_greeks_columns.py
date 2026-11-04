@@ -335,3 +335,17 @@ def test_expected_stock_move_is_one_sided_in_the_plan_direction():
     assert ce["spot"] == pytest.approx(195.95) and ce["price"] == pytest.approx(213.95) and ce["pct"] > 0
     assert pe["spot"] == pytest.approx(195.95) and pe["price"] == pytest.approx(177.95) and pe["pct"] < 0
     assert abs(ce["price"] - ce["spot"]) == pytest.approx(18.0)       # full move, not 18/2
+
+
+def test_table_lists_active_always_entry_only_with_blast_and_never_waiting():
+    f = sc._dore_row_listed
+    assert f({"status": "ACTIVE", "gamma_blast_level_at_mint": "NONE"})          # entered trades never vanish
+    assert f({"status": "ACTIVE"})
+    assert f({"status": "ENTRY_READY", "gamma_blast_level_at_mint": "BLAST"})
+    assert f({"status": "IN_ENTRY_ZONE", "gamma_blast_level_at_mint": "blast"})
+    assert not f({"status": "ENTRY_READY", "gamma_blast_level_at_mint": "WATCH"})
+    assert not f({"status": "ENTRY_READY", "gamma_blast_level_at_mint": "NONE"})
+    assert not f({"status": "ENTRY_READY"})
+    assert not f({"status": "WAITING_FOR_ENTRY", "gamma_blast_level_at_mint": "BLAST"})
+    assert not f({"status": "TRACKED", "gamma_blast_level_at_mint": "BLAST"})
+    assert not f({"status": "CLOSED", "gamma_blast_level_at_mint": "BLAST"})
