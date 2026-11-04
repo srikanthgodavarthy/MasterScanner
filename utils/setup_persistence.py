@@ -299,6 +299,12 @@ class SetupPlan:
     # 0 for MOM rows and for plans minted before this field existed.
     locked_norm_score:       int   = 0
 
+    # [2026-11-04, SG request] What fired the entry, frozen at mint from the
+    # scanner row (see derive_trigger_label()): e.g. "Breakout", "PB", "Fib",
+    # "Fib+CCI", "Harmonic". Comma-joined when several apply. Display/analysis
+    # only. "" for plans minted before this field existed and for MOM rows.
+    locked_trigger:          str   = ""
+
     # [2026-09-08, SG request — cross-source dedup] Single-symbol-persistent
     # Active Setups. Only the OLDEST open plan for a symbol (across LS/PB/
     # MOM) is ever minted/kept; a later source's signal on the same symbol
@@ -408,6 +414,7 @@ class SetupPlan:
             "locked_pct_chg":         self.locked_pct_chg,
             "locked_vol_ratio":       self.locked_vol_ratio,
             "locked_norm_score":      self.locked_norm_score,
+            "locked_trigger":         self.locked_trigger,
             "status":                 _sval(self.status),
             "status_reason":          self.status_reason,
             "created_at":             self.created_at,
@@ -469,6 +476,48 @@ def _compute_days_active(first_actionable_date: str) -> int:
         return (date.today() - d0).days
     except Exception:
         return 0
+
+
+# [2026-11-04, SG request] Trigger label for the Active Setups "Trigger"
+# column. Built only from fields the scanner row already carries
+# ("Buy Type", "T1Path", "FreshBase"); no new detection logic.
+_BUY_TYPE_TRIGGER = {
+    "Fib+CCI":    "Fib+CCI",
+    "Fib":        "Fib",
+    "Harm":       "Harmonic",
+    "ABCD":       "ABCD",
+    "CCIRise":    "CCI",
+    "CCI":        "CCI",
+    "CmpBrk":     "Breakout",   # compression breakout
+    "Norm":       "Norm",
+    "T1Pullback": "PB",         # Tier-1 structural pullback entry
+}
+_T1_PATH_TRIGGER = {"A": "PB", "B": "Norm", "C": "Breakout"}
+
+
+def derive_trigger_label(row) -> str:
+    """Comma-joined trigger label(s) for a scanner row, e.g. "Fib+CCI, Breakout".
+    Order: buy type, then Tier-1 path, then fresh-base breakout; duplicates
+    dropped. Returns "" when the row carries none of them. Never raises."""
+    try:
+        get = row.get
+    except AttributeError:
+        return ""
+    labels: list[str] = []
+
+    def _add(x):
+        if x and x not in labels:
+            labels.append(x)
+
+    try:
+        _add(_BUY_TYPE_TRIGGER.get(str(get("Buy Type", "") or "").strip()))
+        _add(_T1_PATH_TRIGGER.get(str(get("T1Path", "") or "").strip().upper()))
+        fb = get("FreshBase", False)
+        if fb is True or str(fb).strip().lower() in ("true", "1", "yes"):
+            _add("Breakout")
+    except Exception:
+        return ", ".join(labels)
+    return ", ".join(labels)
 
 
 def _now_iso() -> str:
@@ -586,7 +635,10 @@ def _advance_lifecycle_step(
         if cross.triggered and cross.label == "ENTRY":
             reason = f"Entry triggered at {cross.trigger_price:.2f}"
             plan.status, plan.status_reason = SetupPlanStatus.ACTIVE, reason
-            plan.activated_at = today_str
+            # [2026-11-04, SG request] Full UTC timestamp, not today_str: the
+            # Active Setups "Entry" column shows the time of entry. A bare date
+            # landed in the timestamptz column as 00:00 and lost the time.
+            plan.activated_at = _now_iso()
             return True, reason
         if days > _max_setup_age_days(plan.source):
             reason = f"Expired after {days}d — entry never triggered"
@@ -939,6 +991,7 @@ def _create_plan(
         # LS/PB scanner rows carry "Score" (scoring_core norm_score, set
         # in scanner_engine.score_stock()); MOM rows don't, so 0 there.
         locked_norm_score       = int(float(scanner_row.get("Score", 0) or 0)),
+        locked_trigger          = derive_trigger_label(scanner_row),
         status                 = SetupPlanStatus.WAITING,
         status_reason           = "Plan created — awaiting entry trigger",
         created_at              = now_ts,
