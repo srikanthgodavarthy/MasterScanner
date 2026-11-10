@@ -699,8 +699,16 @@ class DoreOptionsSettings:
     # are judgement calls, not backtested -- validate with
     # utils.greeks_attribution before ever letting it influence a decision.
     enable_gamma_blast:           bool  = True
-    gamma_blast_max_days:         float = 3.0    # beyond this: not in the gamma regime
-    gamma_blast_max_moneyness_pct: float = 1.2   # |strike/spot - 1| ceiling
+    # [2026-11-05, SG request] Limits relaxed from 3.0 days / 1.2% so Blast can
+    # evaluate the ~3-week, 2-7% OTM contracts DORE actually mints (the Nov
+    # 2026 closed-plan export: median 21 days out, strikes 1.6-6.5% from spot,
+    # so the old limits made every plan ineligible and the level was NONE for
+    # all 61 plans that had one). The time and moneyness ramps stretch with
+    # these, so scores run roughly 8-18 points higher than before; the 50/70
+    # level thresholds and the convexity floor are unchanged and still not
+    # backtested. A near-expiry ATM strike still scores highest on both ramps.
+    gamma_blast_max_days:         float = 30.0   # beyond this: not in the gamma regime
+    gamma_blast_max_moneyness_pct: float = 7.0   # |strike/spot - 1| ceiling
     gamma_blast_min_gamma_pct:    float = 8.0    # convexity gain (% of premium) floor
     gamma_blast_full_gamma_pct:   float = 30.0   # convexity gain that scores 100
     gamma_blast_max_iv_rank:      float = 80.0   # IV rank at/above which it is ineligible

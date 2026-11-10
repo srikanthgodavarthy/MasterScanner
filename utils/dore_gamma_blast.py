@@ -159,8 +159,8 @@ def evaluate_gamma_blast(*, direction: str, spot: Optional[float], strike: Optio
         components {name: 0-100 | None}
         inputs     the raw numbers behind them
     """
-    max_days = float(_g(settings, "gamma_blast_max_days", 3.0))
-    max_money = float(_g(settings, "gamma_blast_max_moneyness_pct", 1.2))
+    max_days = float(_g(settings, "gamma_blast_max_days", 30.0))
+    max_money = float(_g(settings, "gamma_blast_max_moneyness_pct", 7.0))
     min_gamma = float(_g(settings, "gamma_blast_min_gamma_pct", 8.0))
     full_gamma = float(_g(settings, "gamma_blast_full_gamma_pct", 30.0))
     max_ivr = float(_g(settings, "gamma_blast_max_iv_rank", 80.0))

@@ -106,9 +106,10 @@ def test_not_a_blast_without_a_likely_move_even_with_perfect_convexity():
 
 
 def test_ineligible_outside_the_gamma_regime_far_otm_or_rich_iv():
-    assert _eval(years_left=6 / 365.0)["level"] == NONE
-    assert "not in the gamma regime" in " ".join(_eval(years_left=6 / 365.0)["why"])
-    assert _eval(strike=25600.0)["level"] == NONE                      # 2.4% away
+    # [2026-11-05] limits relaxed to 30 days / 7% so ~3-week, 2-7% OTM plans can evaluate
+    assert _eval(years_left=45 / 365.0)["level"] == NONE
+    assert "not in the gamma regime" in " ".join(_eval(years_left=45 / 365.0)["why"])
+    assert _eval(strike=27000.0)["level"] == NONE                      # 8% away
     rich = _eval(iv_rank=85.0)
     assert rich["level"] == NONE and not rich["eligible"] and any("IV rank" in w for w in rich["why"])
     assert _eval(iv_rank=None)["eligible"]                              # unknown IV rank is not a veto
@@ -439,3 +440,21 @@ def test_active_table_formatter_blast_watch_none_and_legacy():
         legacy = f(row)
         assert ">--<" in legacy and "none" not in legacy.replace("Not evaluated", "") and "Not evaluated" in legacy
     assert "BLAST" in f({"gamma_blast_level_at_mint": "BLAST", "gamma_blast_score_at_mint": float("nan")})
+
+
+def test_three_week_otm_contract_is_now_evaluated_not_vetoed():
+    """The DORE-typical contract (21 days out, ~5% OTM) used to be ineligible on days and
+    moneyness alone; under the relaxed limits it is scored (eligibility is decided by
+    convexity / IV rank), and it scores well below a near-expiry ATM strike."""
+    far = _eval(years_left=21 / 365.0, strike=26250.0)                  # 5% OTM
+    near = _eval()
+    assert far["eligible"] and far["score"] is not None
+    assert far["components"]["time"] > 0 and far["components"]["moneyness"] > 0
+    assert far["score"] < near["score"]
+
+
+def test_relaxed_defaults_are_30_days_and_7_pct():
+    s = DoreOptionsSettings()
+    assert s.gamma_blast_max_days == 30.0 and s.gamma_blast_max_moneyness_pct == 7.0
+    assert s.gamma_blast_watch_score == 50.0 and s.gamma_blast_blast_score == 70.0
+    assert s.gamma_blast_min_gamma_pct == 8.0                           # convexity floor unchanged
