@@ -24,3 +24,33 @@ def _pin_dore_ist_clock(monkeypatch):
         return
     monkeypatch.setattr(persistence, "_ist_now",
                         lambda: datetime(2026, 9, 21, 11, 0, tzinfo=IST))
+
+
+@pytest.fixture
+def smc_on_legacy_defaults(monkeypatch):
+    """[2026-11-10] SMC was removed from the live equity scores: the module defaults are now
+    SMC scoring OFF + rescale ON + structural gate OFF. Tests written against the earlier
+    SMC-ON behaviour (pillar maxima, Leadership's SMC bonus, the FVG extension term, the
+    tier cap) use this fixture to pin the previous defaults. Tests of the NEW defaults live in
+    tests/test_cv4_smc_toggles.py and must NOT use it."""
+    from utils import conviction_score_v1 as cv
+    monkeypatch.setattr(cv, "CV4_SMC_SCORING_ENABLED_DEFAULT", True)
+    monkeypatch.setattr(cv, "CV4_SMC_RESCALE_WHEN_DISABLED_DEFAULT", False)
+    monkeypatch.setattr(cv, "SMC_STRUCTURAL_GATE_ENABLED_DEFAULT", True)
+    try:
+        from utils import cv4_score_budget as budget
+        for name in dir(budget):
+            fn = getattr(budget, name)
+            if hasattr(fn, "cache_clear"):
+                fn.cache_clear()
+    except Exception:
+        pass
+    yield
+    try:
+        from utils import cv4_score_budget as budget
+        for name in dir(budget):
+            fn = getattr(budget, name)
+            if hasattr(fn, "cache_clear"):
+                fn.cache_clear()
+    except Exception:
+        pass

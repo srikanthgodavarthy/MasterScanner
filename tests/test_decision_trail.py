@@ -23,6 +23,10 @@ from tests import test_cv4_smc_toggles as T
 from utils import scanner_engine as se
 from utils.scanner_engine import DECISION_REASON_CODES, RECOMMENDATION_RANK, build_decision_trail
 
+# [2026-11-10] these tests pin the earlier SMC-ON scoring behaviour (see tests/conftest.py)
+import pytest as _pytest_smc
+pytestmark = _pytest_smc.mark.usefixtures("smc_on_legacy_defaults")
+
 BASELINE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "decision_trail_baseline.json")
 R = RECOMMENDATION_RANK
 
@@ -137,6 +141,8 @@ class TestPureFunction:
 # ──────────────────────────────────────────────────────────────────
 #  2. score_stock integration
 # ──────────────────────────────────────────────────────────────────
+SMC_LEGACY = {"cv4_smc_scoring_enabled": True, "cv4_smc_rescale_when_disabled": False,
+              "smc_structural_gate_enabled": True}
 LOOSE = {"v4_actionable_leadership_min": 35, "v4_actionable_conviction_min": 25,
          "v4_actionable_entry_quality_min": 25, "v4_actionable_composite_min": 30}
 VARIANTS = {
@@ -162,7 +168,10 @@ def rows():
     for name, extra in VARIANTS.items():
         out[name] = []
         for k, df in enumerate(stocks):
-            s = {"prescreen_diagnostic": True}
+            # [2026-11-10] the stored pre-change baseline was produced with SMC scoring ON and
+            # the structural gate ON (the old defaults), so pin them explicitly -- this fixture
+            # is module-scoped and so cannot use the function-scoped legacy-defaults fixture.
+            s = {"prescreen_diagnostic": True, **SMC_LEGACY}
             s.update(extra)
             out[name].append(se.score_stock(df, nifty, settings=s, symbol=f"S{k}"))
     yield out

@@ -1423,8 +1423,24 @@ SMC_CONFLICT_SWEEP_BREAK_MODIFIER_POINTS  = 2.0
 # Motivation: SMC direction is bullish on only ~3-5% of the scanned universe
 # on a typical day, so the SMC slots are almost always 0.
 # NOT backtest-validated; same caveat as V4_THRESHOLD_DEFAULTS.
-CV4_SMC_SCORING_ENABLED_DEFAULT = True
-CV4_SMC_RESCALE_WHEN_DISABLED_DEFAULT = False
+#
+# [2026-11-10, SG request] SMC REMOVED from the live equity scores: SG sees no
+# benefit from it on the live scanner, so scoring is OFF and the remaining
+# components are rescaled to 0-100 (Conviction x100/85, Entry Quality x100/75;
+# Elite's EQ floor of 80 is unreachable without the rescale). Backtest and live
+# read these same defaults, so they stay in parity. Caveat recorded on purpose:
+# the 2026-10-12 backtest (1,585 trades) had a stable lift for the sweep+break
+# flag (50.7% vs 40.6% win, +0.23R vs -0.03R, same sign in both halves), which
+# this setting gives up; set CV4_SMC_SCORING_ENABLED_DEFAULT back to True (and
+# RESCALE back to False) -- or pass the settings keys -- to restore it. The
+# rescale is a reweighting, NOT an SMC ablation (see above): it raises every
+# candidate's Conviction/EQ, equivalent to lowering the tier floors on the
+# non-SMC points, so expect more candidates to clear the same floors.
+CV4_SMC_SCORING_ENABLED_DEFAULT = False
+CV4_SMC_RESCALE_WHEN_DISABLED_DEFAULT = True
+# Default of settings["smc_structural_gate_enabled"] (read by scanner_engine and by
+# _entry_quality_v4's gate_owns_failed_zone). OFF: SMC no longer caps live equity tiers.
+SMC_STRUCTURAL_GATE_ENABLED_DEFAULT = False
 
 
 def _smc_mode(settings: Optional[dict]) -> tuple[bool, bool]:
@@ -1852,7 +1868,7 @@ def _leadership_v4(r: "BarResult", smc_state=None, swing_label: Optional[str] = 
         spq += 3
     elif swing_label in ("EH", "EL"):
         spq += 1   # tie/retest — partial credit, not a genuine new high/low
-    if smc_state is not None:
+    if smc_state is not None and _smc_mode(settings)[0]:   # [2026-11-10] off with cv4_smc_scoring_enabled
         existing_trend_dir = "BULLISH" if r.trend_up else ("BEARISH" if r.trend_down else "NEUTRAL")
         if smc_state.direction == existing_trend_dir and smc_state.direction != "NEUTRAL" \
                 and smc_state.evidence_tier >= 3:
@@ -2194,7 +2210,7 @@ def _entry_quality_v4(r: "BarResult", smc_state=None, current_price: Optional[fl
     # (SMC pillar inconsistency fix, 2026-09-02 — see docstring above) ──
     eq_smc_entry_structure = smc_entry_structure_score(
         smc_state, thesis_direction,
-        gate_owns_failed_zone=bool((settings or {}).get("smc_structural_gate_enabled", True)),
+        gate_owns_failed_zone=bool((settings or {}).get("smc_structural_gate_enabled", SMC_STRUCTURAL_GATE_ENABLED_DEFAULT)),
     )
 
     # ── Price Location (0-15) — pivot/fib positioning, timing not trend.
@@ -2229,7 +2245,8 @@ def _entry_quality_v4(r: "BarResult", smc_state=None, current_price: Optional[fl
     eq_volume_execution = ve
 
     # ── Extension/Chase Risk (15 pts, SUBTRACTIVE) — shared function ──
-    pen = compute_extension_penalty(r, smc_state=smc_state, current_price=current_price, settings=settings)
+    pen = compute_extension_penalty(r, smc_state=(smc_state if _smc_mode(settings)[0] else None),
+                                    current_price=current_price, settings=settings)   # [2026-11-10] no SMC zone term when SMC scoring is off
     severity = pen["severity_0_100"]
     eq_extension_chase_risk = round(max(0.0, min(15.0, 15.0 * (1.0 - severity / 100.0))))
 

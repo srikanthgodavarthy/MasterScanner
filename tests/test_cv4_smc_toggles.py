@@ -17,7 +17,9 @@ CV4 SMC toggles (2026-09-28).
       False -> apply_smc_structural_gate()'s decision is still computed and
       reported, but can no longer change the tier.
 
-Default behavior (keys absent) must be identical to the pre-toggle behavior.
+[2026-11-10, SG request] DEFAULTS CHANGED: SMC scoring is now OFF with the rescale
+ON, and the structural gate is OFF (SMC removed from the live equity scores). Tests
+below that need the old behaviour pass it EXPLICITLY via ON / OFF / OFF_RS.
 """
 from __future__ import annotations
 
@@ -32,9 +34,16 @@ from utils import scanner_engine as se
 from utils.scoring_core import BarResult
 from utils.smc_engine import SMCState
 
-ON = {"cv4_smc_scoring_enabled": True}
-OFF = {"cv4_smc_scoring_enabled": False}                                  # pure ablation
-OFF_RS = {"cv4_smc_scoring_enabled": False, "cv4_smc_rescale_when_disabled": True}
+# Fully explicit so these tests do not depend on the (changed) defaults.
+ON = {"cv4_smc_scoring_enabled": True, "cv4_smc_rescale_when_disabled": False,
+      "smc_structural_gate_enabled": True}
+OFF = {"cv4_smc_scoring_enabled": False, "cv4_smc_rescale_when_disabled": False,
+       "smc_structural_gate_enabled": True}                                # pure ablation
+OFF_RS = {"cv4_smc_scoring_enabled": False, "cv4_smc_rescale_when_disabled": True,
+          "smc_structural_gate_enabled": True}
+# What an absent key means since 2026-11-10: SMC off, rescaled, gate off.
+NEW_DEFAULT = {"cv4_smc_scoring_enabled": False, "cv4_smc_rescale_when_disabled": True,
+               "smc_structural_gate_enabled": False}
 
 
 # ── fixtures ────────────────────────────────────────────────────────────
@@ -69,17 +78,36 @@ def _others_eq(subs: dict) -> int:
 
 
 # ── defaults ────────────────────────────────────────────────────────────
-def test_default_constant_is_enabled():
-    assert cv.CV4_SMC_SCORING_ENABLED_DEFAULT is True
+def test_default_constants_are_smc_off_and_rescaled():
+    """[2026-11-10] SMC removed from the live equity scores; flip these back to restore."""
+    assert cv.CV4_SMC_SCORING_ENABLED_DEFAULT is False
+    assert cv.CV4_SMC_RESCALE_WHEN_DISABLED_DEFAULT is True
+    assert cv._smc_mode(None) == (False, True) == cv._smc_mode({})
 
 
 @pytest.mark.parametrize("smc", [None, "bull"])
-def test_absent_key_equals_explicit_true(smc):
+def test_absent_key_equals_explicit_new_defaults(smc):
     r, s = _strong_bar(), (None if smc is None else _bull_smc())
-    assert cv._conviction_v4(r, smc_state=s) == cv._conviction_v4(r, smc_state=s, settings=ON)
-    assert cv._entry_quality_v4(r, smc_state=s) == cv._entry_quality_v4(r, smc_state=s, settings=ON)
+    assert cv._conviction_v4(r, smc_state=s) == cv._conviction_v4(r, smc_state=s, settings=OFF_RS)
+    assert cv._entry_quality_v4(r, smc_state=s) == cv._entry_quality_v4(r, smc_state=s, settings=OFF_RS)
     assert cv._conviction_v4(r, smc_state=s) == cv._conviction_v4(r, smc_state=s, settings={})
     assert cv._conviction_v4(r, smc_state=s) == cv._conviction_v4(r, smc_state=s, settings=None)
+
+
+def test_default_scores_ignore_the_smc_state_entirely():
+    """With SMC off by default, a bullish SMC read cannot change any pillar (incl. Leadership's
+    2-pt structure bonus and the extension FVG term)."""
+    r = _strong_bar()
+    a = cv.compute_conviction_v4(r, thesis_direction="BULLISH", smc_state=_bull_smc(), swing_label="HH", current_price=100.0)
+    b = cv.compute_conviction_v4(r, thesis_direction="BULLISH", smc_state=None, swing_label="HH", current_price=100.0)
+    assert (a.leadership, a.conviction, a.entry_quality, a.composite) == (b.leadership, b.conviction, b.entry_quality, b.composite)
+
+
+def test_leadership_smc_bonus_only_when_smc_scoring_enabled():
+    r = _strong_bar()
+    on = cv._leadership_v4(r, smc_state=_bull_smc(), swing_label="HH", settings=ON)[1]["ls_structural_price_quality"]
+    off = cv._leadership_v4(r, smc_state=_bull_smc(), swing_label="HH", settings=OFF_RS)[1]["ls_structural_price_quality"]
+    assert on >= off
 
 
 def test_enabled_total_is_plain_sum_including_smc():
@@ -148,7 +176,7 @@ def test_rescale_flag_is_inert_while_scoring_is_enabled():
     both = {"cv4_smc_scoring_enabled": True, "cv4_smc_rescale_when_disabled": True}
     assert cv._conviction_v4(r, smc_state=s, settings=both) == cv._conviction_v4(r, smc_state=s, settings=ON)
     assert cv._entry_quality_v4(r, smc_state=s, settings=both) == cv._entry_quality_v4(r, smc_state=s, settings=ON)
-    assert cv._smc_mode({"cv4_smc_rescale_when_disabled": True}) == (True, False)
+    assert cv._smc_mode({"cv4_smc_scoring_enabled": True, "cv4_smc_rescale_when_disabled": True}) == (True, False)
     assert cv._smc_mode(OFF) == (False, False)
     assert cv._smc_mode(OFF_RS) == (False, True)
 
@@ -233,8 +261,8 @@ def test_only_rescale_lifts_entry_quality_above_elites_floor_without_smc():
 def test_compute_conviction_v4_records_mode_and_leaves_leadership_alone():
     r, s = _strong_bar(), _bull_smc()
     kw = dict(thesis_direction="BULLISH", smc_state=s, swing_label="HH", current_price=100.0)
-    on = cv.compute_conviction_v4(r, **kw)
-    on_explicit = cv.compute_conviction_v4(r, settings=ON, **kw)
+    on = cv.compute_conviction_v4(r, settings=ON, **kw)
+    on_explicit = cv.compute_conviction_v4(r, settings=dict(ON), **kw)
     off = cv.compute_conviction_v4(r, settings=OFF, **kw)
     rs = cv.compute_conviction_v4(r, settings=OFF_RS, **kw)
     assert (on.smc_scoring_enabled, on.smc_rescaled) == (True, False) == (on_explicit.smc_scoring_enabled, on_explicit.smc_rescaled)
@@ -244,7 +272,7 @@ def test_compute_conviction_v4_records_mode_and_leaves_leadership_alone():
     assert off.leadership == on.leadership == rs.leadership      # Leadership untouched
     assert off.conviction < on.conviction and off.entry_quality < on.entry_quality   # SMC contributed here
     assert rs.conviction > off.conviction and rs.entry_quality > off.entry_quality
-    assert cv.compute_conviction_v4(r, settings={"unrelated": 1}, **kw) == on
+    assert cv.compute_conviction_v4(r, settings={"unrelated": 1}, **kw) == rs      # absent keys = new defaults (off + rescale)
 
 
 # ── end-to-end through score_stock ─────────────────────────────────────
@@ -289,35 +317,33 @@ def _score(df, nifty, extra=None, k=0):
     return se.score_stock(df, nifty, settings=s, symbol=f"S{k}")
 
 
-def test_score_stock_default_equals_explicit_true_for_both_flags(universe):
+def test_score_stock_default_equals_explicit_new_defaults(universe):
     nifty, stocks = universe
     keys = ["CV1_Leadership", "CV1_Conviction", "CV1_EntryQuality", "CV1_Composite",
             "Tier", "Recommendation", "SMC_Structural_State"]
     for k, df in enumerate(stocks[:15]):
         base = _score(df, nifty, k=k)
-        expl = _score(df, nifty, {"cv4_smc_scoring_enabled": True,
-                                  "cv4_smc_rescale_when_disabled": False,
-                                  "smc_structural_gate_enabled": True}, k=k)
+        expl = _score(df, nifty, dict(NEW_DEFAULT), k=k)
         assert base and expl
         assert {x: base.get(x) for x in keys} == {x: expl.get(x) for x in keys}
 
 
-def test_score_stock_pure_ablation_never_raises_and_only_moves_rows_with_smc(universe):
-    """Through score_stock: turning SMC scoring off never raises any pillar, and
-    leaves a pillar EXACTLY unchanged wherever its SMC term was already 0."""
+def test_score_stock_pure_ablation_removes_only_smc_credit(universe):
+    """Through score_stock: with SMC scoring off (no rescale), Conviction and Leadership can only
+    stay or drop, Conviction is unchanged wherever its SMC term was 0, and Entry Quality can drop
+    by at most its SMC term -- it can also RISE slightly, because [2026-11-10] the SMC FVG-zone
+    term of the extension penalty is no longer charged when SMC scoring is off."""
     nifty, stocks = universe
     lowered = 0
     for k, df in enumerate(stocks):
-        on = _score(df, nifty, k=k)
+        on = _score(df, nifty, ON, k=k)
         off = _score(df, nifty, OFF, k=k)
         assert on and off
-        assert off["CV1_Leadership"] == on["CV1_Leadership"]
+        assert off["CV1_Leadership"] <= on["CV1_Leadership"]          # 2-pt SMC bonus can only be lost
         assert off["CV1_Conviction"] <= on["CV1_Conviction"]
-        assert off["CV1_EntryQuality"] <= on["CV1_EntryQuality"]
+        assert off["CV1_EntryQuality"] >= on["CV1_EntryQuality"] - on["_cv4_eq_smc"]
         if on["_cv4_cv_smc"] == 0:
             assert off["CV1_Conviction"] == on["CV1_Conviction"]
-        if on["_cv4_eq_smc"] == 0:
-            assert off["CV1_EntryQuality"] == on["CV1_EntryQuality"]
         lowered += (off["CV1_Conviction"] < on["CV1_Conviction"]) + (off["CV1_EntryQuality"] < on["CV1_EntryQuality"])
     assert lowered > 0, "no stock in the fixture had an SMC term to ablate -> flag not exercised"
 
@@ -328,7 +354,7 @@ def test_score_stock_rescale_inflates_rows_whose_smc_term_is_zero(universe):
     nifty, stocks = universe
     raised = 0
     for k, df in enumerate(stocks):
-        on = _score(df, nifty, k=k)
+        on = _score(df, nifty, ON, k=k)
         rs = _score(df, nifty, OFF_RS, k=k)
         if on["_cv4_cv_smc"] == 0:
             assert rs["CV1_Conviction"] >= on["CV1_Conviction"]
@@ -340,8 +366,8 @@ def test_score_stock_rescale_inflates_rows_whose_smc_term_is_zero(universe):
 
 
 def test_score_stock_gate_toggle_controls_tier_cap(universe, monkeypatch):
-    """Stub the gate to force-cap every tier to Skip. Default and explicit True
-    must let it cap; False must ignore it. The decision columns stay populated."""
+    """Stub the gate to force-cap every tier to Skip. Explicit True must let it cap;
+    False and (since 2026-11-10) the DEFAULT must ignore it. The decision columns stay populated."""
     nifty, stocks = universe
     real_gate = se.apply_smc_structural_gate
 
@@ -361,8 +387,8 @@ def test_score_stock_gate_toggle_controls_tier_cap(universe, monkeypatch):
         default = _score(df, nifty, k=k)
         on = _score(df, nifty, {"smc_structural_gate_enabled": True}, k=k)
         off = _score(df, nifty, {"smc_structural_gate_enabled": False}, k=k)
-        assert default["Recommendation"] == "Skip" == on["Recommendation"]
-        assert off["Recommendation"] == ungated["Recommendation"]
+        assert on["Recommendation"] == "Skip"
+        assert default["Recommendation"] == off["Recommendation"] == ungated["Recommendation"]
         assert off["SMC_Structural_State"] == default["SMC_Structural_State"]
         assert off["SMC_Structural_State"] is not None
         checked += 1

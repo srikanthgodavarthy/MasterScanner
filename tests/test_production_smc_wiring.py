@@ -33,6 +33,10 @@ from utils.smc_engine import (
     BULLISH_CONTINUATION, LIQUIDITY_SWEEP, CONFLICT, NEUTRAL as SMC_NEUTRAL_STATE,
 )
 
+# [2026-11-10] these tests pin the earlier SMC-ON scoring behaviour (see tests/conftest.py)
+import pytest as _pytest_smc
+pytestmark = _pytest_smc.mark.usefixtures("smc_on_legacy_defaults")
+
 
 def _base_bar():
     r = BarResult()

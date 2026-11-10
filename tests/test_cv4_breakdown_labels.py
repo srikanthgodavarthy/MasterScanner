@@ -20,6 +20,10 @@ from utils import cv4_score_budget as bud
 from utils.cv4_breakdown_spec import build_factors
 from utils.scoring_core import BarResult
 
+# [2026-11-10] these tests pin the earlier SMC-ON scoring behaviour (see tests/conftest.py)
+import pytest as _pytest_smc
+pytestmark = _pytest_smc.mark.usefixtures("smc_on_legacy_defaults")
+
 ALL_LEGACY = {k: True for k in cv.CV4_LEGACY_DEFAULTS}
 PROFILES = {"default": {}, "all_legacy": ALL_LEGACY,
             "mixed": {"cv4_legacy_ls_regime": True, "cv4_legacy_cv_cci": True}}

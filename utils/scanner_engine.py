@@ -2818,7 +2818,10 @@ def score_stock(
         # NOT backtest-validated as an improvement — recommend an A/B
         # backtest run (True vs False) before flipping the live default,
         # same caveat as smc_conflict_caps_tier and cv4_smc_scoring_enabled.
-        _smc_gate_enabled = bool((settings or {}).get("smc_structural_gate_enabled", True))
+        # [2026-11-10, SG request] default OFF: SMC no longer influences live equity tiers.
+        from utils import conviction_score_v1 as _cv_mod
+        _smc_gate_enabled = bool((settings or {}).get("smc_structural_gate_enabled",
+                                                      _cv_mod.SMC_STRUCTURAL_GATE_ENABLED_DEFAULT))
         _gated_tier, _smc_structural = apply_smc_structural_gate(
             final_tier, r.smc_state, r.order_block,
             conflict_caps_tier=bool((settings or {}).get("smc_conflict_caps_tier", False)),

@@ -435,6 +435,10 @@ import itertools
 from utils import extension_shared as _ext
 from utils.decision_engine import _extension as _de_extension
 
+# [2026-11-10] these tests pin the earlier SMC-ON scoring behaviour (see tests/conftest.py)
+import pytest as _pytest_smc
+pytestmark = _pytest_smc.mark.usefixtures("smc_on_legacy_defaults")
+
 _LEG_EXT = {"ext_legacy_weights": True}
 
 

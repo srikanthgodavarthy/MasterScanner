@@ -25,6 +25,10 @@ import pytest
 
 import utils.conviction_score_v1 as cv
 
+# [2026-11-10] these tests pin the earlier SMC-ON scoring behaviour (see tests/conftest.py)
+import pytest as _pytest_smc
+pytestmark = _pytest_smc.mark.usefixtures("smc_on_legacy_defaults")
+
 D = cv.V4_THRESHOLD_DEFAULTS
 TIERS = cv.V4_TIER_ORDER                       # watch, actionable, execute, elite
 COMP_TIERS = ("actionable", "execute", "elite")

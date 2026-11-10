@@ -276,6 +276,11 @@ def _extension(r: "BarResult", settings: dict | None = None) -> tuple[int, dict]
     # as before this change). current_price defaults to the bar's own
     # entry_ref/entry, matching extension_shared's existing fallback.
     smc_state = getattr(r, "smc_state", None)
+    # [2026-11-10, SG request] SMC removed from live equity scores: no FVG/retest
+    # zone term in the extension penalty while cv4_smc_scoring_enabled is off.
+    from utils.conviction_score_v1 import _smc_mode
+    if not _smc_mode(settings)[0]:
+        smc_state = None
     current_price = getattr(r, "entry_ref", None) or getattr(r, "entry", None)
     pen = compute_extension_penalty(r, smc_state=smc_state, current_price=current_price, settings=settings)
     total = int(round(pen["severity_0_100"]))
