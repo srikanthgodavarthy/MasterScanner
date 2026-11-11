@@ -68,7 +68,7 @@ from utils.pct_change import (
 
 from utils.scanner_engine  import run_scanner, fetch_nifty, NIFTY500_SYMBOLS
 from utils.settings_defaults import DEFAULTS
-from utils.cv4_breakdown_spec import build_factors as _cv4_breakdown_factors
+from utils.cv4_breakdown_spec import build_factors as _cv4_breakdown_factors, display_scales as _cv4_display_scales
 from utils.regime_engine   import (
     build_regime_context,
     apply_regime_layer,
@@ -1683,6 +1683,9 @@ def _perstock_breakdown_table(df: pd.DataFrame, dark: bool = False,
     # Components whose measured max is 0 (e.g. Conviction Volume, removed in
     # the audit) are omitted rather than shown as 0/0.
     FACTORS = _cv4_breakdown_factors(settings)
+    # [2026-11-10] SMC removed from the live scores: Conviction / Entry Quality sub-scores
+    # are shown on the same rescaled 0-100 basis as their totals (empty dict = no rescale).
+    _SCALES = _cv4_display_scales(settings)
 
     # Filter to columns that actually exist in this df
     avail = [(col, lbl, mx, clr, tip)
@@ -1809,7 +1812,7 @@ def _perstock_breakdown_table(df: pd.DataFrame, dark: bool = False,
 
         # Sub-factor cells
         for col, _, mx, clr, _ in avail:
-            pts = _safe_int(row.get(col, 0))
+            pts = int(round(_safe_int(row.get(col, 0)) * _SCALES.get(col, 1.0)))
             pct = min(100, int(pts / mx * 100)) if mx > 0 else 0
             # Colour the bar: full = bright, partial = mid, zero = dark
             bar_clr = clr if pct >= 60 else (clr + "99" if pct > 0 else _track)
@@ -1833,11 +1836,18 @@ def _perstock_breakdown_table(df: pd.DataFrame, dark: bool = False,
     if not data_rows:
         return ""
 
+    _rescale_note = (
+        f'<span style="text-transform:none;letter-spacing:0;font-weight:400;">'
+        f'· SMC is no longer scored; Conviction and Entry Quality points are shown rescaled to '
+        f'their 0–100 totals (may differ from the total by a point or two from rounding)</span>'
+        if _SCALES else "")
+
     return f"""
 <div style="font-family:'JetBrains Mono','Fira Code',monospace;margin-top:10px;">
   <div style="font-size:9px;font-weight:700;color:{_muted};letter-spacing:0.1em;
   text-transform:uppercase;margin-bottom:6px;">
   📊 Per-stock sub-factor breakdown — hover column headers for scoring conditions
+  {_rescale_note}
   </div>
   <div style="overflow-x:auto;border:1px solid {_border};border-radius:8px;">
     <table style="border-collapse:collapse;width:100%;background:{_surface};">

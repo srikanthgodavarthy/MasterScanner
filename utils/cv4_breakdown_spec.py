@@ -25,15 +25,44 @@ from utils.cv4_score_budget import component_maxima, probe, sweep_break_smc
 PURPLE, GREEN, AMBER = "#a371f7", "#3fb950", "#d29922"
 
 
+def display_scales(settings: Optional[dict] = None) -> dict[str, float]:
+    """{df column: factor} the breakdown table multiplies a stored sub-score by.
+
+    1.0 everywhere unless SMC scoring is off AND cv4_smc_rescale_when_disabled is on
+    (the default since 2026-11-10). Then the pillar TOTAL is the non-SMC points
+    rescaled to 0-100 (Conviction x cv_rescale_factor, Entry Quality x100/75) while
+    the stored sub-scores keep their documented scale, so the table scales each
+    Conviction / Entry Quality sub-score by the same factor to add up to the total."""
+    _, rescaled = cv._smc_mode(settings)
+    if not rescaled:
+        return {}
+    f_cv = cv.cv4_weight_profile(settings)["cv_rescale_factor"]
+    f_eq = 100.0 / 75.0
+    from utils.cv4_score_budget import COMPONENTS
+    return {col: (f_cv if pillar == "C" else f_eq)
+            for col, (pillar, _) in COMPONENTS.items() if pillar in ("C", "E")}
+
+
 def build_factors(settings: Optional[dict] = None) -> list[tuple]:
     """[(df_col, label, max_pts, colour, tooltip)] in display order.
     Components whose measured maximum is 0 (removed from the score, e.g.
-    Conviction Volume after the audit) are omitted rather than shown as 0/0."""
-    maxima = component_maxima(settings)
+    Conviction Volume after the audit) are omitted rather than shown as 0/0.
+
+    [2026-11-10] With SMC scoring off the two SMC components (Conviction SMC,
+    Entry Quality SMC) are omitted too, and when the remaining points are rescaled
+    the maxima and every "+N" are shown on that rescaled scale (see display_scales)."""
+    smc_on, rescaled = cv._smc_mode(settings)
+    scales = display_scales(settings)
+    maxima = dict(component_maxima(settings))
+    if not smc_on:
+        maxima["_cv4_cv_smc"] = 0
+        maxima["_cv4_eq_smc"] = 0
+    for _c, _f in scales.items():
+        maxima[_c] = int(round(maxima[_c] * _f))
     prof = cv.cv4_weight_profile(settings)
 
     def p(col, **f):
-        return probe(col, settings, **f)
+        return int(round(probe(col, settings, **f) * scales.get(col, 1.0)))
 
     def gain(col, hi: dict, lo: dict):
         return p(col, **hi) - p(col, **lo)
@@ -45,9 +74,17 @@ def build_factors(settings: Optional[dict] = None) -> list[tuple]:
         return "" if abs(k - 1.0) < 1e-9 else f"\nAmounts include the ×{k:.2f} de-duplication rescale (cv4_weight_profile)"
 
     ls_note, cv_note = rescale_note(prof["k_ls"]), rescale_note(prof["k_cv"])
+    if rescaled:
+        _cv_extra = f"Shown ×{scales['_cv4_cv_directional']:.2f}: SMC is no longer scored, so Conviction's other points are rescaled to 0–100"
+        _eq_extra = f"Shown ×{scales['_cv4_eq_trend']:.2f}: SMC is no longer scored, so Entry Quality's other points are rescaled to 0–100"
+        cv_note = (cv_note + "\n" if cv_note else "\n") + _cv_extra
+    else:
+        _eq_extra = ""
     out = []
 
     def add(col, label, color, tip):
+        if color == AMBER and _eq_extra:
+            tip = tip + "\n" + _eq_extra
         if maxima[col] > 0:
             out.append((col, label, maxima[col], color, tip))
 
@@ -109,10 +146,14 @@ def build_factors(settings: Optional[dict] = None) -> list[tuple]:
 
     col = "_cv4_ls_structural"
     spq_base = {"trend_up": True}
+    if smc_on:
+        _spq_smc = (f"+{p(col, smc=sweep_break_smc(), **spq_base) - p(col, **spq_base)} MORE only if SMC direction agrees with the trend "
+                    "AND SMC evidence_tier ≥ 3\nSMC only ever adds here, never subtracts or gates")
+    else:
+        _spq_smc = "SMC is no longer scored here (removed from the live equity scores)"
     add(col, "Structural Price Quality", PURPLE,
         f"Swing structure: HH/HL → +{p(col, swing='HH')}, EH/EL tie-retest → +{p(col, swing='EH')}, independent of SMC\n"
-        f"+{p(col, smc=sweep_break_smc(), **spq_base) - p(col, **spq_base)} MORE only if SMC direction agrees with the trend "
-        "AND SMC evidence_tier ≥ 3\nSMC only ever adds here, never subtracts or gates"
+        + _spq_smc
         + ("\n" + ls_note.strip() if ls_note else ""))
 
     # ── CONVICTION ────────────────────────────────────────────────
