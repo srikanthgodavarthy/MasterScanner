@@ -1463,6 +1463,32 @@ def load_recently_closed_dore_options_plans(limit: int = 15, entered_only: bool 
         return pd.DataFrame()
 
 
+def load_recently_closed_never_entered_dore_options_plans(limit: int = 30) -> pd.DataFrame:
+    """[2026-11-10, SG report: a NIFTY recommendation vanished] CLOSED plans that never
+    entered -- exactly the complement of load_recently_closed_dore_options_plans(entered_only=True),
+    so every closed plan appears in one of the two tables. These ("Stale -- never entered",
+    "Expired before entry", superseded/retired while pre-entry) were deliberately kept out of the
+    entered table (2026-10-08: one stale sweep closed 13 plans in a minute and pushed every
+    real SL / T2 out), which left a recommendation that never triggered visible NOWHERE once it
+    closed. Shown in its own list so it cannot crowd out the traded plans."""
+    if not db.is_available():
+        return pd.DataFrame()
+    try:
+        rows = db.fetch_all(
+            "SELECT * FROM dore_options_plans WHERE status = %s AND NOT ("
+            "(entry_triggered_at IS NOT NULL OR closed_reason_code IN ('STOP_LOSS', 'TARGET_2'))"
+            " AND COALESCE(closed_reason_code, '') <> 'STALE_NO_ENTRY') "
+            "ORDER BY closed_at DESC LIMIT %s",
+            ("CLOSED", limit),
+        )
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows)
+    except Exception as exc:
+        logger.error("load_recently_closed_never_entered_dore_options_plans failed: %s", exc)
+        return pd.DataFrame()
+
+
 def load_all_dore_options_plans(limit: int = 500) -> pd.DataFrame:
     """All DORE Options locked entries (any status), for history/audit views."""
     if not db.is_available():

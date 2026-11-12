@@ -4490,22 +4490,25 @@ def _fmt_blast_at_mint_html(row) -> str:
 # ACTIVE (entry triggered, trade open), ENTRY (entry conditions are ready / the
 # premium is in the entry zone), WAITING (valid plan, not at entry yet).
 # TRACKED (instant-of-mint candidate) is not shown in this table.
-_STRIKE_STATUS_ORDER = {"ACTIVE": 0, "ENTRY": 1, "WAITING": 2}
+_STRIKE_STATUS_ORDER = {"ACTIVE": 0, "ENTRY": 1, "WAITING": 2, "TRACKED": 3}
 _STRIKE_STATUS_BY_PLAN_STATUS = {
     "ACTIVE": "ACTIVE", "OPEN": "ACTIVE",
     "ENTRY_READY": "ENTRY", "IN_ENTRY_ZONE": "ENTRY",
     "WAITING_FOR_ENTRY": "WAITING",
+    "TRACKED": "TRACKED",       # only ever shown in the "Pre-entry plans" panel, never the main table
 }
 _STRIKE_STATUS_STYLE = {
     "ACTIVE":  ("#3fb950", "Entry triggered; the trade is open."),
     "ENTRY":   ("#d29922", "Entry conditions are ready (or the premium is in the entry zone); entry has not been locked yet."),
     "WAITING": ("#8b949e", "Valid plan still waiting: premium is outside the entry zone, or this cycle's scan did not reproduce it."),
+    "TRACKED": ("#6e7681", "Candidate seen by the scan; not yet evaluated for entry."),
 }
 
 
 def _strike_status(plan_status):
-    """ACTIVE / ENTRY / WAITING for a DORE plan status, or None when the status
-    is not one this table shows (TRACKED, CLOSED, unknown)."""
+    """ACTIVE / ENTRY / WAITING / TRACKED for an open DORE plan status, or None for
+    anything else (CLOSED, unknown). The MAIN table lists only ACTIVE and Blast-active
+    ENTRY plans (see _dore_row_listed); the rest appear in the Pre-entry panel."""
     return _STRIKE_STATUS_BY_PLAN_STATUS.get(str(getattr(plan_status, "value", plan_status) or "").upper().strip())
 
 
@@ -4519,6 +4522,16 @@ def _dore_row_listed(row) -> bool:
     if stt == "ENTRY":
         return str(row.get("gamma_blast_level_at_mint") or "").upper().strip() == "BLAST"
     return False
+
+
+def _dore_split_rows(rows):
+    """(listed, pre_entry): `listed` are the rows the main Active Plans table shows
+    (_dore_row_listed); `pre_entry` is every other OPEN plan (WAITING, ENTRY without Blast,
+    TRACKED), ordered ENTRY, WAITING, TRACKED, so nothing open silently disappears."""
+    listed = [r for r in rows if _dore_row_listed(r)]
+    pre = [r for r in rows if not _dore_row_listed(r) and _strike_status(r.get("status"))]
+    pre.sort(key=lambda r: _STRIKE_STATUS_ORDER[_strike_status(r.get("status"))])
+    return listed, pre
 
 
 def _expected_price_view(row):
@@ -4920,7 +4933,7 @@ def _dore_options_active_plans_table_html(df: pd.DataFrame) -> str:
     )
 
 
-def _dore_options_closed_plans_table_html(df: pd.DataFrame) -> str:
+def _dore_options_closed_plans_table_html(df: pd.DataFrame, empty_msg: str = "No entered plans have closed yet.") -> str:
     """[Sprint 1 — Portfolio Admission UI, 2026-08-05] "Recently Retired /
     Closed" panel under the Active Plans tab. Surfaces closed_reason for
     each of the most recently CLOSED plans so the new Duplicate
@@ -4977,7 +4990,7 @@ def _dore_options_closed_plans_table_html(df: pd.DataFrame) -> str:
                 f'border:1px solid {border};border-radius:4px;padding:2px 8px;">{status}</span>')
 
     if df.empty:
-        return '<div style="color:var(--muted);padding:8px;">No entered plans have closed yet.</div>'
+        return f'<div style="color:var(--muted);padding:8px;">{empty_msg}</div>'
 
     headers = ["Symbol", "Direction", "Strike", "Expiry", "Confidence at Entry", "Blast at Entry", "T1", "Closed", "Status", "Reason"]
     rows_html = []
@@ -5192,63 +5205,80 @@ def _render_dore_options_active_plans_tab() -> None:
         return
 
     open_plans = load_open_dore_options_plans()
+    all_rows = active_plan_rows(open_plans) if open_plans else []
+    # [2026-11-10, SG report: NIFTY recommendation vanished] The Pre-entry and
+    # Retired panels below are rendered on EVERY path, including when nothing is
+    # listed above -- they used to sit after the early returns, so an empty main
+    # table also hid the Retired panel.
+    rows, pre_entry_rows = _dore_split_rows(all_rows)
+
     if not open_plans:
         st.info("No open DORE Options plans right now. A plan is locked automatically the "
                  "first time a contract (symbol + direction + strike + expiry) is seen by "
                  "the live scan.")
-        return
-
-    # [2026-11-04, SG request] ACTIVE plans, plus ENTRY plans with Blast
-    # active. WAITING and TRACKED are not listed (see _dore_row_listed).
-    rows = [r for r in active_plan_rows(open_plans) if _dore_row_listed(r)]
-    if not rows:
+    elif not rows:
+        # [2026-11-04, SG request] ACTIVE plans, plus ENTRY plans with Blast active.
         st.info("No ACTIVE plans, and no ENTRY plans with an active Blast, right now.")
-        return
-    # ACTIVE first, then ENTRY; newest-locked first within each
-    # (active_plan_rows already sorts newest first and sorted() is stable).
-    rows.sort(key=lambda r: _STRIKE_STATUS_ORDER[_strike_status(r.get("status"))])
+    else:
+        # ACTIVE first, then ENTRY; newest-locked first within each
+        # (active_plan_rows already sorts newest first and sorted() is stable).
+        rows.sort(key=lambda r: _STRIKE_STATUS_ORDER[_strike_status(r.get("status"))])
 
-    rows_df = pd.DataFrame(rows)
-    _n_by = rows_df["status"].map(_strike_status).value_counts()
-    st.caption(f"{int(_n_by.get('ACTIVE', 0))} active (entry locked), {int(_n_by.get('ENTRY', 0))} entry-ready "
-               "with Blast active — independent of whether this cycle's live scan "
-               "reproduced the contract. Auto-closes once the contract's own expiry passes.")
+        rows_df = pd.DataFrame(rows)
+        _n_by = rows_df["status"].map(_strike_status).value_counts()
+        st.caption(f"{int(_n_by.get('ACTIVE', 0))} active (entry locked), {int(_n_by.get('ENTRY', 0))} entry-ready "
+                   "with Blast active — independent of whether this cycle's live scan "
+                   "reproduced the contract. Auto-closes once the contract's own expiry passes.")
 
-    # [Options-buying UI request] Today's vs Previous Days' Setups tabs —
-    # same split/rationale as _render_active_plans_tab's equity table
-    # (see that function's "Today's vs Previous Days' setups" comment):
-    # plan_age_days == 0 means entry_triggered_at (or TRACKED mint, via
-    # _lifecycle_age_start()) is today, everything else has been open
-    # since an earlier session. Purely a display split of the SAME
-    # rows_df — a plan moves from "Today's" to "Previous Days'" on its
-    # own the next calendar day, same as plan_age_days itself.
-    _render_dore_inactive_remove_controls(rows_df)
-    today_tab, prev_tab = st.tabs(["🆕 Today's Setups", "📅 Previous Days' Setups"])
-    with today_tab:
-        today_df = rows_df[rows_df["plan_age_days"] == 0]
-        if today_df.empty:
-            st.caption("No DORE plans have triggered entry yet today.")
-        else:
-            st.markdown(_dore_options_active_plans_table_html(today_df), unsafe_allow_html=True)
-    with prev_tab:
-        prev_df = rows_df[rows_df["plan_age_days"] >= 1]
-        if prev_df.empty:
-            st.caption("No DORE setups carried over from a previous day are currently open.")
-        else:
-            st.markdown(_dore_options_active_plans_table_html(prev_df), unsafe_allow_html=True)
+        # [Options-buying UI request] Today's vs Previous Days' Setups tabs —
+        # same split/rationale as _render_active_plans_tab's equity table:
+        # plan_age_days == 0 means entry_triggered_at (or TRACKED mint, via
+        # _lifecycle_age_start()) is today, everything else has been open
+        # since an earlier session. Purely a display split of the SAME rows_df.
+        _render_dore_inactive_remove_controls(rows_df)
+        today_tab, prev_tab = st.tabs(["🆕 Today's Setups", "📅 Previous Days' Setups"])
+        with today_tab:
+            today_df = rows_df[rows_df["plan_age_days"] == 0]
+            if today_df.empty:
+                st.caption("No DORE plans have triggered entry yet today.")
+            else:
+                st.markdown(_dore_options_active_plans_table_html(today_df), unsafe_allow_html=True)
+        with prev_tab:
+            prev_df = rows_df[rows_df["plan_age_days"] >= 1]
+            if prev_df.empty:
+                st.caption("No DORE setups carried over from a previous day are currently open.")
+            else:
+                st.markdown(_dore_options_active_plans_table_html(prev_df), unsafe_allow_html=True)
 
-    # [Sprint 1 — Portfolio Admission UI, 2026-08-05] Recently Retired /
-    # Closed panel, so Duplicate Suppression / Portfolio Manager
-    # retirements (and the pre-existing Expired / Max-holding-period
-    # auto-closes) are visible instead of a plan just quietly vanishing
-    # from the Active list above. Own try/except + _is_available guard
-    # since this is a secondary panel — a failure here shouldn't take
-    # down the Active Plans table itself.
+    # Open plans hidden from the main table (WAITING / ENTRY without Blast / TRACKED).
+    if pre_entry_rows:
+        try:
+            with st.expander(f"👀 Pre-entry plans not shown above ({len(pre_entry_rows)})", expanded=False):
+                st.caption("Still open and being watched, but not entered yet: WAITING, ENTRY without an "
+                           "active Blast, or TRACKED. They move to the table above when entry triggers "
+                           "(and to Retired below if they expire first).")
+                st.markdown(_dore_options_active_plans_table_html(pd.DataFrame(pre_entry_rows)),
+                            unsafe_allow_html=True)
+        except Exception:
+            logger.exception("[scanner] DORE pre-entry panel failed to render (non-fatal)")
+
+    # [Sprint 1 — Portfolio Admission UI, 2026-08-05] Recently Retired / Closed
+    # panel, so Duplicate Suppression / Portfolio Manager retirements (and the
+    # pre-existing Expired / Max-holding-period auto-closes) are visible instead
+    # of a plan just quietly vanishing. Own try/except + _is_available guard: a
+    # failure here shouldn't take down the Active Plans table itself.
     try:
-        from utils.supabase_client import load_recently_closed_dore_options_plans
+        from utils.supabase_client import (load_recently_closed_dore_options_plans,
+                                           load_recently_closed_never_entered_dore_options_plans)
         with st.expander("🗂️ Recently Retired / Closed Plans", expanded=False):
             closed_df = load_recently_closed_dore_options_plans(limit=30)
             st.markdown(_dore_options_closed_plans_table_html(closed_df), unsafe_allow_html=True)
+            # [2026-11-10] Never-entered closures get their own list (they stay out of the
+            # traded list above so a stale sweep can't push real SL / T2 closures out).
+            st.markdown("**Never entered** — expired or superseded before entry (not traded)")
+            never_df = load_recently_closed_never_entered_dore_options_plans(limit=30)
+            st.markdown(_dore_options_closed_plans_table_html(
+                never_df, empty_msg="No never-entered plans have closed recently."), unsafe_allow_html=True)
     except Exception:
         logger.exception("[scanner] recently-closed DORE Options panel failed to render (non-fatal)")
 

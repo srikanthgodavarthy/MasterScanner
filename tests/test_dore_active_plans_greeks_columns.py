@@ -307,7 +307,8 @@ def test_strike_status_maps_lifecycle_to_active_entry_waiting():
     assert f("ENTRY_READY") == "ENTRY" and f("IN_ENTRY_ZONE") == "ENTRY"
     assert f("WAITING_FOR_ENTRY") == "WAITING"
     assert f("waiting_for_entry") == "WAITING"
-    for other in ("TRACKED", "CLOSED", "", None, "junk"):
+    assert f("TRACKED") == "TRACKED"                       # shown only in the Pre-entry panel
+    for other in ("CLOSED", "", None, "junk"):
         assert f(other) is None
 
 
@@ -349,3 +350,34 @@ def test_table_lists_active_always_entry_only_with_blast_and_never_waiting():
     assert not f({"status": "WAITING_FOR_ENTRY", "gamma_blast_level_at_mint": "BLAST"})
     assert not f({"status": "TRACKED", "gamma_blast_level_at_mint": "BLAST"})
     assert not f({"status": "CLOSED", "gamma_blast_level_at_mint": "BLAST"})
+
+
+def test_split_rows_nothing_open_disappears():
+    """[2026-11-10] A recommendation that is open but not listed in the main table must land in
+    the Pre-entry panel; the two lists together cover every open plan."""
+    rows = [
+        {"symbol": "A", "status": "ACTIVE"},
+        {"symbol": "B", "status": "ENTRY_READY", "gamma_blast_level_at_mint": "BLAST"},
+        {"symbol": "C", "status": "WAITING_FOR_ENTRY"},
+        {"symbol": "D", "status": "IN_ENTRY_ZONE", "gamma_blast_level_at_mint": "NONE"},
+        {"symbol": "E", "status": "TRACKED"},
+        {"symbol": "NIFTY", "status": "ENTRY_READY"},
+        {"symbol": "X", "status": "CLOSED"},
+    ]
+    listed, pre = sc._dore_split_rows(rows)
+    assert [r["symbol"] for r in listed] == ["A", "B"]
+    assert [r["symbol"] for r in pre] == ["D", "NIFTY", "C", "E"]        # ENTRY, ENTRY, WAITING, TRACKED
+    open_syms = {r["symbol"] for r in rows if r["status"] != "CLOSED"}
+    assert {r["symbol"] for r in listed} | {r["symbol"] for r in pre} == open_syms
+
+
+def test_pre_entry_rows_render_in_the_table_with_their_status():
+    for status, label in (("TRACKED", "TRACKED"), ("WAITING_FOR_ENTRY", "WAITING"), ("ENTRY_READY", "ENTRY")):
+        out = sc._dore_options_active_plans_table_html(_df(status=status, entry_locked=None))
+        assert f">{label}<" in out, status
+
+
+def test_closed_table_custom_empty_message():
+    out = sc._dore_options_closed_plans_table_html(pd.DataFrame(), empty_msg="nothing here")
+    assert "nothing here" in out
+    assert "No entered plans have closed yet." in sc._dore_options_closed_plans_table_html(pd.DataFrame())

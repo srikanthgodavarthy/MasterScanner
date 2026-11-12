@@ -25,3 +25,18 @@ def test_default_excludes_never_entered(monkeypatch):
 def test_entered_only_false_restores_all_closures(monkeypatch):
     (sql, params), _ = _run(monkeypatch, limit=15, entered_only=False)
     assert "STALE_NO_ENTRY" not in sql and "entry_triggered_at" not in sql
+
+
+def test_never_entered_loader_is_the_exact_complement(monkeypatch):
+    """[2026-11-10] A closed plan must appear in exactly one of the two tables."""
+    fake = _FakeDb(); monkeypatch.setattr(sc, "db", fake)
+    df = sc.load_recently_closed_never_entered_dore_options_plans(limit=30)
+    sql, params = fake.calls[0]
+    assert params == ("CLOSED", 30) and len(df) == 1
+    assert "NOT (" in sql and "entry_triggered_at IS NOT NULL" in sql
+    assert "'STOP_LOSS'" in sql and "'TARGET_2'" in sql and "STALE_NO_ENTRY" in sql
+    # same predicate text as the entered loader, negated
+    entered_sql = _run(monkeypatch, limit=30)[0][0]
+    for frag in ("entry_triggered_at IS NOT NULL", "closed_reason_code IN ('STOP_LOSS', 'TARGET_2')",
+                 "COALESCE(closed_reason_code, '') <> 'STALE_NO_ENTRY'"):
+        assert frag in entered_sql and frag in sql
