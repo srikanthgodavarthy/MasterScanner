@@ -715,6 +715,17 @@ class DoreOptionsSettings:
     gamma_blast_watch_score:      float = 50.0
     gamma_blast_blast_score:      float = 70.0
     gamma_blast_min_move_score:   float = 50.0   # BLAST needs a likely large move: below this it is capped at WATCH
+    # [2026-11-12, SG request] PROMOTION: an ENTRY-stage plan (valid structure, freshly
+    # reaffirmed this cycle, underlying EMA9 confirmation passing) is promoted to ACTIVE when
+    # its Gamma-Blast score is ABOVE this value even though the premium is outside the zone.
+    # This is the first place Blast influences a decision. The score weights are still
+    # judgement calls (NOT backtested) -- the activation_reason records every promotion so
+    # outcomes can be sliced by it. Promotion never bypasses: the late-entry cutoff, the
+    # Pre-Breakout guard, the portfolio cap, or Blast's own `eligible` preconditions
+    # (IV-rank ceiling, convexity floor, days/moneyness limits).
+    enable_blast_promotion:       bool  = True
+    blast_promotion_min_score:    float = 60.0   # strict: score > 60
+    blast_promotion_block_above_zone: bool = True  # don't chase a premium above the entry zone
 
 
 DORE_OPTIONS_DEFAULTS = DoreOptionsSettings()

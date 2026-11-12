@@ -1045,6 +1045,36 @@ def _lifecycle_label(status: str, days_active: int, since: str) -> str:
     return f"{label} ({days_active}d · since {since})"
 
 
+def _blast_promotion(row, execution_ok: bool, is_fresh: bool, current_premium,
+                     ez_hi) -> tuple:
+    """[2026-11-12, SG request] (promote, note). True when an ENTRY-stage plan
+    (valid structure AND freshly reaffirmed this cycle -- the same condition that
+    classifies ENTRY_READY / IN_ENTRY_ZONE) has a Gamma-Blast score ABOVE
+    blast_promotion_min_score. Uses THIS cycle's read (row["gamma_blast"]), not the
+    frozen at-mint copy, and requires Blast's own `eligible` flag so its IV-rank /
+    convexity / days / moneyness preconditions are never bypassed. Never raises."""
+    try:
+        if not getattr(DORE_OPTIONS_DEFAULTS, "enable_blast_promotion", False):
+            return False, ""
+        if not (execution_ok and is_fresh) or current_premium is None:
+            return False, ""
+        gb = row.get("gamma_blast") if hasattr(row, "get") else None
+        if not isinstance(gb, dict) or not gb.get("eligible"):
+            return False, ""
+        sc = gb.get("score")
+        if isinstance(sc, bool) or not isinstance(sc, (int, float)) or sc != sc:
+            return False, ""
+        floor = float(getattr(DORE_OPTIONS_DEFAULTS, "blast_promotion_min_score", 60.0))
+        if not sc > floor:
+            return False, ""
+        if (getattr(DORE_OPTIONS_DEFAULTS, "blast_promotion_block_above_zone", True)
+                and ez_hi is not None and current_premium > ez_hi):
+            return False, ""
+        return True, f"Gamma blast promotion (score {sc:.0f} > {floor:g}, level {gb.get('level')})"
+    except Exception:
+        return False, ""
+
+
 def _classify_pre_active(execution_ok: bool, is_fresh: bool,
                           current_premium: Optional[float], entry_zone) -> str:
     """[2026-08-12] Level-2 classification for a plan that hasn't
@@ -1530,6 +1560,22 @@ def enrich_trade_plans_with_persistence(
                 elif premium_in_zone:
                     locked.activation_blocked_reason = ""
 
+                # [2026-11-12, SG request] Gamma-Blast promotion: ENTRY -> ACTIVE
+                # when this cycle's Blast score is above blast_promotion_min_score.
+                # It relaxes ONLY the premium-zone condition. The underlying EMA9
+                # confirmation is deliberately still required: the thesis-invalidation
+                # rule closes an ACTIVE plan whose underlying is on the wrong side of
+                # its frozen EMA9, so promoting past that check would open the trade
+                # and close it again in the same cycle. Placed BEFORE the late-entry /
+                # Pre-Breakout / portfolio-cap guards below so each still applies.
+                blast_promoted = False
+                _promo, _promo_note = _blast_promotion(row, execution_ok, is_fresh, current_premium, _ez_hi)
+                if _promo and not in_zone and underlying_ok:
+                    in_zone = True
+                    blast_promoted = True
+                    row["blocked_reason"] = ""
+                    locked.activation_blocked_reason = ""
+
                 # [2026-09-21] Late-entry cutoff — see DoreOptionsSettings.
                 # late_entry_cutoff_ist. Checked only when everything else
                 # would have activated, so a blocked_reason that already
@@ -1607,7 +1653,8 @@ def enrich_trade_plans_with_persistence(
                     locked.status = DoreOptionsPlanStatus.ACTIVE
                     locked.entry_triggered_at = _now_iso()
                     locked.activation_reason = (
-                        "Premium entry zone + underlying EMA9/EMA21 confirmation"
+                        _promo_note if blast_promoted
+                        else "Premium entry zone + underlying EMA9/EMA21 confirmation"
                     )
                     locked.activation_blocked_reason = ""
                     just_activated = True
