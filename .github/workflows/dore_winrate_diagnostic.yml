@@ -6,7 +6,7 @@
 # Summary page and as a downloadable artifact.
 #
 # Data source (pick in the run form):
-#   db  — SELECTs from dore_options_plans using the repo secret NEON_DATABASE_URL (the pooled
+#   db  — SELECTs from dore_options_plans using the repo secret TINITYDB (the pooled
 #         Neon connection string; Settings > Secrets and variables > Actions). Only a SELECT is
 #         ever issued; nothing is written.
 #   csv — a CSV export of dore_options_plans that you commit to the repo; no secret needed.
@@ -56,10 +56,10 @@ jobs:
       - name: Check inputs
         shell: bash
         env:
-          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          NEON_DATABASE_URL: ${{ secrets.TINITYDB }}
         run: |
           if [ "${{ inputs.source }}" = "db" ] && [ -z "$NEON_DATABASE_URL" ]; then
-            echo "::error::source=db needs the NEON_DATABASE_URL repo secret (Settings > Secrets and variables > Actions), or run with source=csv."
+            echo "::error::source=db needs the TINITYDB repo secret (the Neon connection string) (Settings > Secrets and variables > Actions), or run with source=csv."
             exit 1
           fi
           if [ "${{ inputs.source }}" = "csv" ] && [ ! -f "${{ inputs.csv_path }}" ]; then
@@ -70,7 +70,7 @@ jobs:
       - name: Run diagnostic
         shell: bash
         env:
-          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          NEON_DATABASE_URL: ${{ secrets.TINITYDB }}
         run: |
           mkdir -p dore_wr_out
           if [ "${{ inputs.source }}" = "csv" ]; then
