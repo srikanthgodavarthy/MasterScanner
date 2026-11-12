@@ -1,0 +1,88 @@
+# DORE win-rate diagnostic — READ-ONLY, manual trigger only.
+# Runs scripts/dore_winrate_diagnostic.py over DORE's closed, actually-entered option plans
+# and prints win rate (Wilson 95% CI), break-even win rate from the SL/T1 geometry, expectancy
+# and the slices that explain them (close reason, direction, index vs stock, DTE, OTM distance,
+# confidence, Blast score, entry hour, time held, Blast promotion). Report appears on the run's
+# Summary page and as a downloadable artifact.
+#
+# Data source (pick in the run form):
+#   db  — SELECTs from dore_options_plans using the repo secret NEON_DATABASE_URL (the pooled
+#         Neon connection string; Settings > Secrets and variables > Actions). Only a SELECT is
+#         ever issued; nothing is written.
+#   csv — a CSV export of dore_options_plans that you commit to the repo; no secret needed.
+name: DORE win-rate diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Where to read closed plans from"
+        required: true
+        default: "db"
+        type: choice
+        options:
+          - db
+          - csv
+      csv_path:
+        description: "CSV path inside the repo (only used when source = csv)"
+        required: false
+        default: "backtests/dore_closed_plans.csv"
+        type: string
+      since:
+        description: "Only plans created on/after this date (db only, YYYY-MM-DD)"
+        required: true
+        default: "2026-10-01"
+        type: string
+      min_n:
+        description: "Cells with fewer trades than this are flagged low_n"
+        required: true
+        default: "8"
+        type: string
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pandas numpy psycopg2-binary
+
+      - name: Check inputs
+        shell: bash
+        env:
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+        run: |
+          if [ "${{ inputs.source }}" = "db" ] && [ -z "$NEON_DATABASE_URL" ]; then
+            echo "::error::source=db needs the NEON_DATABASE_URL repo secret (Settings > Secrets and variables > Actions), or run with source=csv."
+            exit 1
+          fi
+          if [ "${{ inputs.source }}" = "csv" ] && [ ! -f "${{ inputs.csv_path }}" ]; then
+            echo "::error::CSV not found at ${{ inputs.csv_path }}"
+            exit 1
+          fi
+
+      - name: Run diagnostic
+        shell: bash
+        env:
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+        run: |
+          mkdir -p dore_wr_out
+          if [ "${{ inputs.source }}" = "csv" ]; then
+            python scripts/dore_winrate_diagnostic.py --csv "${{ inputs.csv_path }}" --min-n "${{ inputs.min_n }}" \
+              | tee dore_wr_out/report.txt
+          else
+            python scripts/dore_winrate_diagnostic.py --since "${{ inputs.since }}" --min-n "${{ inputs.min_n }}" \
+              | tee dore_wr_out/report.txt
+          fi
+          { echo '## DORE win-rate diagnostic'; echo '```'; cat dore_wr_out/report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dore-winrate-diagnostic
+          path: dore_wr_out/
