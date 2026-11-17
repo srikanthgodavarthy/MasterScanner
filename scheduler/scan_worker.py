@@ -685,7 +685,8 @@ def _run_retention_loop(interval_secs: int = RETENTION_INTERVAL_SECS,
                 results["dore_iv_history"] = _n
             # [2026-09-23, SG request] dore_options_plans keeps every
             # CLOSED plan forever (no retention before this) — age
-            # those off 5 days after they closed, same hourly tick as
+            # those off DORE_CLOSED_PLAN_RETENTION_DAYS (90; was 5 until
+            # 2026-11-17, too short to learn from) after they closed, same hourly tick as
             # the other prune_* calls above. See prune_closed_dore_
             # options_plans()'s docstring for why this is safe (only
             # ever deletes terminal CLOSED rows, gated on closed_at).

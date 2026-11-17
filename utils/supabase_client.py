@@ -1505,9 +1505,19 @@ def load_all_dore_options_plans(limit: int = 500) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def prune_closed_dore_options_plans(keep_days: int = 5) -> Optional[int]:
+# [2026-11-17, SG request] Was 5 days. With only the last ~week of closed plans on hand,
+# nothing could be learned about WHY plans stop out (the 2026-11-17 review had 46 entered
+# plans and no history before Nov 10; the durable outcome table keeps only the outcome, no
+# features). 90 days keeps every closed plan's at-mint and at-entry columns for analysis.
+# Safe to lengthen: plan_id embeds the creation date, so an old closed row can never collide
+# with a newer plan on the same contract, and the UI loaders are LIMITed by closed_at DESC.
+DORE_CLOSED_PLAN_RETENTION_DAYS = 90
+
+
+def prune_closed_dore_options_plans(keep_days: int = DORE_CLOSED_PLAN_RETENTION_DAYS) -> Optional[int]:
     """[2026-09-23, SG request] Deletes dore_options_plans rows that are
-    CLOSED and whose closed_at is older than `keep_days`. Every CLOSED
+    CLOSED and whose closed_at is older than `keep_days` (default
+    DORE_CLOSED_PLAN_RETENTION_DAYS = 90; it was 5 until 2026-11-17). Every CLOSED
     row gets closed_at set at the moment it closes (see
     utils.dore_options_persistence's close branches), so this is a
     straight age-off — same shape as prune_iv_history()/prune_oi_and_
