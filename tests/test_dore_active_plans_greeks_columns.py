@@ -338,23 +338,23 @@ def test_expected_stock_move_is_one_sided_in_the_plan_direction():
     assert abs(ce["price"] - ce["spot"]) == pytest.approx(18.0)       # full move, not 18/2
 
 
-def test_table_lists_active_always_entry_only_with_blast_and_never_waiting():
+def test_table_lists_only_active_plans():
+    """[2026-11-17, SG request] ENTRY plans are no longer listed in the main table, Blast or not."""
     f = sc._dore_row_listed
     assert f({"status": "ACTIVE", "gamma_blast_level_at_mint": "NONE"})          # entered trades never vanish
     assert f({"status": "ACTIVE"})
-    assert f({"status": "ENTRY_READY", "gamma_blast_level_at_mint": "BLAST"})
-    assert f({"status": "IN_ENTRY_ZONE", "gamma_blast_level_at_mint": "blast"})
-    assert not f({"status": "ENTRY_READY", "gamma_blast_level_at_mint": "WATCH"})
-    assert not f({"status": "ENTRY_READY", "gamma_blast_level_at_mint": "NONE"})
-    assert not f({"status": "ENTRY_READY"})
+    assert f({"status": "OPEN"})                                                 # legacy open rows are ACTIVE
+    for status in ("ENTRY_READY", "IN_ENTRY_ZONE"):
+        for blast in ("BLAST", "blast", "WATCH", "NONE", None):
+            assert not f({"status": status, "gamma_blast_level_at_mint": blast}), (status, blast)
     assert not f({"status": "WAITING_FOR_ENTRY", "gamma_blast_level_at_mint": "BLAST"})
     assert not f({"status": "TRACKED", "gamma_blast_level_at_mint": "BLAST"})
     assert not f({"status": "CLOSED", "gamma_blast_level_at_mint": "BLAST"})
 
 
 def test_split_rows_nothing_open_disappears():
-    """[2026-11-10] A recommendation that is open but not listed in the main table must land in
-    the Pre-entry panel; the two lists together cover every open plan."""
+    """A recommendation that is open but not listed in the main table must land in the
+    Pre-entry panel; the two lists together cover every open plan."""
     rows = [
         {"symbol": "A", "status": "ACTIVE"},
         {"symbol": "B", "status": "ENTRY_READY", "gamma_blast_level_at_mint": "BLAST"},
@@ -365,10 +365,34 @@ def test_split_rows_nothing_open_disappears():
         {"symbol": "X", "status": "CLOSED"},
     ]
     listed, pre = sc._dore_split_rows(rows)
-    assert [r["symbol"] for r in listed] == ["A", "B"]
-    assert [r["symbol"] for r in pre] == ["D", "NIFTY", "C", "E"]        # ENTRY, ENTRY, WAITING, TRACKED
+    assert [r["symbol"] for r in listed] == ["A"]
+    assert [r["symbol"] for r in pre] == ["B", "D", "NIFTY", "C", "E"]           # ENTRY x3, WAITING, TRACKED
     open_syms = {r["symbol"] for r in rows if r["status"] != "CLOSED"}
     assert {r["symbol"] for r in listed} | {r["symbol"] for r in pre} == open_syms
+
+
+def test_latest_entry_time_sorts_first_to_the_second_across_formats():
+    rows = [
+        {"symbol": "OLD",   "entry_triggered_at": "2026-11-17T04:47:10+00:00"},   # 10:17:10 IST
+        {"symbol": "NONE",  "entry_triggered_at": ""},
+        {"symbol": "NEW",   "entry_triggered_at": "2026-11-17T05:09:05.123456+00:00"},
+        {"symbol": "MID",   "entry_triggered_at": "2026-11-17T10:30:00+05:30"},    # 05:00:00 UTC
+        {"symbol": "BAD",   "entry_triggered_at": "not-a-time"},
+        {"symbol": "MISSING"},
+        {"symbol": "SAME1", "entry_triggered_at": "2026-11-16T09:00:00+00:00"},
+        {"symbol": "SAME2", "entry_triggered_at": "2026-11-16T09:00:00+00:00"},
+    ]
+    out = [r["symbol"] for r in sc._dore_sort_latest_entry(rows)]
+    assert out[:3] == ["NEW", "MID", "OLD"]
+    assert out[3:5] == ["SAME1", "SAME2"]                       # ties keep their incoming order
+    assert set(out[5:]) == {"NONE", "BAD", "MISSING"}           # no usable entry time -> last
+
+
+def test_sort_does_not_mutate_input_and_handles_empty():
+    rows = [{"entry_triggered_at": "2026-11-17T04:00:00+00:00"}, {"entry_triggered_at": "2026-11-17T05:00:00+00:00"}]
+    before = list(rows)
+    sc._dore_sort_latest_entry(rows)
+    assert rows == before and sc._dore_sort_latest_entry([]) == []
 
 
 def test_pre_entry_rows_render_in_the_table_with_their_status():
@@ -381,3 +405,16 @@ def test_closed_table_custom_empty_message():
     out = sc._dore_options_closed_plans_table_html(pd.DataFrame(), empty_msg="nothing here")
     assert "nothing here" in out
     assert "No entered plans have closed yet." in sc._dore_options_closed_plans_table_html(pd.DataFrame())
+
+
+def test_rendered_table_keeps_latest_entry_first_order():
+    """The HTML table must not re-sort: rows come out in the order the page hands it
+    (latest entry time first after _dore_sort_latest_entry)."""
+    rows = [
+        _df(symbol="EARLY", entry_triggered_at="2026-11-17T04:47:10+00:00").iloc[0].to_dict(),
+        _df(symbol="LATEST", entry_triggered_at="2026-11-17T05:09:05+00:00").iloc[0].to_dict(),
+        _df(symbol="MIDDLE", entry_triggered_at="2026-11-17T05:00:00+00:00").iloc[0].to_dict(),
+    ]
+    out = sc._dore_options_active_plans_table_html(pd.DataFrame(sc._dore_sort_latest_entry(rows)))
+    pos = {s: out.index(s) for s in ("EARLY", "LATEST", "MIDDLE")}
+    assert pos["LATEST"] < pos["MIDDLE"] < pos["EARLY"]

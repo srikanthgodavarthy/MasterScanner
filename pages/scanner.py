@@ -4507,26 +4507,41 @@ _STRIKE_STATUS_STYLE = {
 
 def _strike_status(plan_status):
     """ACTIVE / ENTRY / WAITING / TRACKED for an open DORE plan status, or None for
-    anything else (CLOSED, unknown). The MAIN table lists only ACTIVE and Blast-active
-    ENTRY plans (see _dore_row_listed); the rest appear in the Pre-entry panel."""
+    anything else (CLOSED, unknown). The MAIN table lists only ACTIVE plans
+    (see _dore_row_listed); the rest appear in the Pre-entry panel."""
     return _STRIKE_STATUS_BY_PLAN_STATUS.get(str(getattr(plan_status, "value", plan_status) or "").upper().strip())
 
 
 def _dore_row_listed(row) -> bool:
-    """[2026-11-04, SG request] Which plans the DORE Active Plans table lists:
-    ACTIVE (entered) plans always; ENTRY plans only when their Blast is active
-    (gamma_blast_level_at_mint == "BLAST"); WAITING and TRACKED never."""
-    stt = _strike_status(row.get("status"))
-    if stt == "ACTIVE":
-        return True
-    if stt == "ENTRY":
-        return str(row.get("gamma_blast_level_at_mint") or "").upper().strip() == "BLAST"
-    return False
+    """Which plans the DORE Active Plans table lists: ACTIVE (entered) plans only.
+    [2026-11-17, SG request] ENTRY-status plans (entry-ready / premium in the entry zone, entry
+    not yet locked) are no longer listed here -- previously those with an active Blast were.
+    ENTRY, WAITING and TRACKED plans stay open and watched, and are shown in the collapsed
+    "Pre-entry plans" panel (see _dore_split_rows), so nothing open disappears."""
+    return _strike_status(row.get("status")) == "ACTIVE"
+
+
+def _dore_entry_time_key(row):
+    """Sort key for 'latest entry first': the plan's entry_triggered_at as a UTC timestamp
+    (negated so the newest sorts first). Rows with no / unparsable entry time sort last."""
+    raw = row.get("entry_triggered_at")
+    try:
+        ts = pd.to_datetime(raw, utc=True, errors="coerce") if raw not in (None, "") else pd.NaT
+    except Exception:
+        ts = pd.NaT
+    if pd.isna(ts):
+        return (1, 0.0)
+    return (0, -ts.timestamp())
+
+
+def _dore_sort_latest_entry(rows):
+    """Rows ordered by entry time, newest first (stable for ties; no-entry-time rows last)."""
+    return sorted(rows, key=_dore_entry_time_key)
 
 
 def _dore_split_rows(rows):
     """(listed, pre_entry): `listed` are the rows the main Active Plans table shows
-    (_dore_row_listed); `pre_entry` is every other OPEN plan (WAITING, ENTRY without Blast,
+    (_dore_row_listed); `pre_entry` is every other OPEN plan (ENTRY, WAITING,
     TRACKED), ordered ENTRY, WAITING, TRACKED, so nothing open silently disappears."""
     listed = [r for r in rows if _dore_row_listed(r)]
     pre = [r for r in rows if not _dore_row_listed(r) and _strike_status(r.get("status"))]
@@ -5178,10 +5193,10 @@ def _render_dore_options_active_plans_tab() -> None:
     table. See utils/dore_options_persistence.py's module docstring for
     the full rationale.
 
-    [2026-11-04, SG request] Shows ACTIVE (entry locked) plans, plus ENTRY
-    plans (ENTRY_READY/IN_ENTRY_ZONE) only while their Blast is active, each
-    tagged in the Strike Status column. WAITING_FOR_ENTRY and TRACKED are
-    excluded. (Previously ACTIVE-only, matching
+    [2026-11-17, SG request] Shows ACTIVE (entry locked) plans only, ordered by entry
+    time, newest first. ENTRY (ENTRY_READY/IN_ENTRY_ZONE), WAITING_FOR_ENTRY and TRACKED
+    plans are excluded here and listed in the Pre-entry panel. (Before this, ENTRY plans
+    with an active Blast were listed too.) (Previously ACTIVE-only, matching
     "Active Setups" on the equity side excluding WAITING.) This mirrors the SAME filter pages/dashboard.py's "ACTIVE
     OPTIONS PLANS" card already applies (see its comment there) — this
     tab previously showed all open_plans unfiltered, inconsistent with
@@ -5217,18 +5232,18 @@ def _render_dore_options_active_plans_tab() -> None:
                  "first time a contract (symbol + direction + strike + expiry) is seen by "
                  "the live scan.")
     elif not rows:
-        # [2026-11-04, SG request] ACTIVE plans, plus ENTRY plans with Blast active.
-        st.info("No ACTIVE plans, and no ENTRY plans with an active Blast, right now.")
+        # [2026-11-17, SG request] ACTIVE plans only; ENTRY plans live in the Pre-entry panel.
+        st.info("No ACTIVE plans right now.")
     else:
-        # ACTIVE first, then ENTRY; newest-locked first within each
-        # (active_plan_rows already sorts newest first and sorted() is stable).
-        rows.sort(key=lambda r: _STRIKE_STATUS_ORDER[_strike_status(r.get("status"))])
+        # [2026-11-17, SG request] Latest ENTRY TIME first (entry_triggered_at, to the
+        # second) -- previously ordered by created date only, so plans entered the same day
+        # were not ordered by when they actually triggered.
+        rows = _dore_sort_latest_entry(rows)
 
         rows_df = pd.DataFrame(rows)
-        _n_by = rows_df["status"].map(_strike_status).value_counts()
-        st.caption(f"{int(_n_by.get('ACTIVE', 0))} active (entry locked), {int(_n_by.get('ENTRY', 0))} entry-ready "
-                   "with Blast active — independent of whether this cycle's live scan "
-                   "reproduced the contract. Auto-closes once the contract's own expiry passes.")
+        st.caption(f"{len(rows_df)} active (entry locked), latest entry first — independent of whether "
+                   "this cycle's live scan reproduced the contract. Auto-closes once the contract's "
+                   "own expiry passes.")
 
         # [Options-buying UI request] Today's vs Previous Days' Setups tabs —
         # same split/rationale as _render_active_plans_tab's equity table:
@@ -5254,8 +5269,8 @@ def _render_dore_options_active_plans_tab() -> None:
     if pre_entry_rows:
         try:
             with st.expander(f"👀 Pre-entry plans not shown above ({len(pre_entry_rows)})", expanded=False):
-                st.caption("Still open and being watched, but not entered yet: WAITING, ENTRY without an "
-                           "active Blast, or TRACKED. They move to the table above when entry triggers "
+                st.caption("Still open and being watched, but not entered yet: ENTRY, WAITING, "
+                           "or TRACKED. They move to the table above when entry triggers "
                            "(and to Retired below if they expire first).")
                 st.markdown(_dore_options_active_plans_table_html(pd.DataFrame(pre_entry_rows)),
                             unsafe_allow_html=True)
