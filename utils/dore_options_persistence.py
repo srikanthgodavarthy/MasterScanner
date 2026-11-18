@@ -2109,6 +2109,46 @@ def close_inactive_plans(open_plans: dict, contract_keys, today: Optional[str] =
     return closed
 
 
+CLEARED_WAITING_REASON = "Cleared by user \u2014 waiting, never entered"
+
+
+def close_waiting_plans(open_plans: dict, contract_keys=None) -> list:
+    """[2026-11-17, SG request] "Clear all WAITING" action for the Pre-entry plans panel.
+    Closes WAITING_FOR_ENTRY plans (valid, premium outside the entry zone) so they leave the
+    panel and land in Recently Retired / Closed under "Never entered" -- nothing is deleted.
+
+    `contract_keys=None` clears every WAITING plan in `open_plans`; otherwise only the named ones.
+
+    Safety, re-checked per plan against the freshly loaded `open_plans` at click time: only a
+    plan that is STILL WAITING_FOR_ENTRY and has NEVER entered (no locked entry, no entry time)
+    is closed. ACTIVE, ENTRY_READY / IN_ENTRY_ZONE and TRACKED plans -- and anything unknown or
+    already closed -- are skipped, so a stale page, a double click or a race with the worker
+    (which may have just triggered entry) can never close a live or about-to-enter trade.
+
+    Closed with CLOSE_REASON_STALE_NO_ENTRY and deliberately NO final-outcome record: a plan
+    that never traded has no win/loss to record, and writing one would count it as a non-win in
+    any outcome_final-based win rate (same rule as the worker's own never-entered closes).
+
+    Mutates the matching plans and returns only those it closed; the caller persists them
+    (upsert_dore_options_plans_batch) and invalidates the open-plans cache."""
+    keys = list(open_plans) if contract_keys is None else list(contract_keys or [])
+    closed: list = []
+    for key in keys:
+        plan = (open_plans or {}).get(key)
+        if plan is None or not plan.is_open():
+            continue
+        if _sval(plan.status) != DoreOptionsPlanStatus.WAITING_FOR_ENTRY.value:
+            continue
+        if plan.entry_locked is not None or plan.entry_triggered_at:
+            continue
+        plan.status = DoreOptionsPlanStatus.CLOSED
+        plan.closed_at = _now_iso()
+        plan.closed_reason = CLEARED_WAITING_REASON
+        plan.closed_reason_code = CLOSE_REASON_STALE_NO_ENTRY
+        closed.append(plan)
+    return closed
+
+
 def _active_plan_status_label(status: str, days_active: int, created_date: str, created_at: str = "") -> str:
     # [2026-08-12] Now reflects the plan's REAL lifecycle status
     # (TRACKED/WAITING_FOR_ENTRY/ENTRY_READY/IN_ENTRY_ZONE/ACTIVE)

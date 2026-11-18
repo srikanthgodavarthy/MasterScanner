@@ -5162,6 +5162,32 @@ def _remove_inactive_dore_plans(contract_keys: list) -> None:
         st.toast("Couldn't remove — see logs.", icon="⚠️")
 
 
+def _clear_waiting_dore_plans() -> None:
+    """[2026-11-17, SG request] on_click handler for "Clear all WAITING" in the Pre-entry
+    panel. Reloads open plans UNCACHED, lets close_waiting_plans() re-verify each is still
+    WAITING and never entered, persists the ones it closed, then drops the open-plans cache so
+    the rows vanish on the rerun this click triggers."""
+    try:
+        from utils.supabase_client import (
+            _load_open_dore_options_plans_uncached, upsert_dore_options_plans_batch,
+            invalidate_open_dore_plans_cache,
+        )
+        from utils.dore_options_persistence import close_waiting_plans
+        closed = close_waiting_plans(_load_open_dore_options_plans_uncached())
+        ok = bool(closed) and upsert_dore_options_plans_batch([p.to_db_dict() for p in closed])
+        invalidate_open_dore_plans_cache()
+        if ok:
+            st.toast(f"Cleared {len(closed)} waiting plan(s) — see Recently Retired / Closed, Never entered.",
+                     icon="🧹")
+        elif closed:
+            st.toast("Couldn't save the clear — try again.", icon="⚠️")
+        else:
+            st.toast("Nothing to clear — no plan is waiting any more.", icon="ℹ️")
+    except Exception:
+        logger.exception("[scanner] clear waiting DORE plans failed (non-fatal)")
+        st.toast("Couldn't clear — see logs.", icon="⚠️")
+
+
 def _render_dore_inactive_remove_controls(rows_df: pd.DataFrame) -> None:
     """Click-to-remove controls for Inactive rows (past max holding / expired)
     of the Active Plans table. The table itself is static HTML (no click
@@ -5272,6 +5298,14 @@ def _render_dore_options_active_plans_tab() -> None:
                 st.caption("Still open and being watched, but not entered yet: ENTRY, WAITING, "
                            "or TRACKED. They move to the table above when entry triggers "
                            "(and to Retired below if they expire first).")
+                _n_waiting = sum(1 for r in pre_entry_rows if _strike_status(r.get("status")) == "WAITING")
+                if _n_waiting:
+                    st.button(f"🧹 Clear all WAITING ({_n_waiting})", key="dore_clear_waiting",
+                              on_click=_clear_waiting_dore_plans,
+                              help="Closes every WAITING plan that has not entered (nothing is deleted; they move "
+                                   "to Recently Retired / Closed > Never entered). ENTRY, TRACKED and ACTIVE "
+                                   "plans are never touched. A contract the live scan still produces can be "
+                                   "tracked again on a later cycle.")
                 st.markdown(_dore_options_active_plans_table_html(pd.DataFrame(pre_entry_rows)),
                             unsafe_allow_html=True)
         except Exception:
