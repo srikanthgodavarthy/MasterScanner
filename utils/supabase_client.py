@@ -886,6 +886,23 @@ def load_open_setup_plans() -> dict:
         return {}
 
 
+def load_all_open_setup_plans() -> list:
+    """[2026-11-18] EVERY open setup plan (WAITING / ACTIVE / T1_HIT) as a list -- no per-symbol
+    collapsing, unlike load_open_setup_plans() (oldest plan per symbol wins). Used by the
+    price-independent age sweep so duplicate or orphaned plans can't escape their window."""
+    if not db.is_available():
+        return []
+    try:
+        rows = db.fetch_all(
+            "SELECT * FROM setup_plans WHERE status = ANY(%s)",
+            (["WAITING", "ACTIVE", "T1_HIT"],),
+        )
+        return [_setup_plan_from_row(r) for r in (rows or [])]
+    except Exception as exc:
+        logger.error("load_all_open_setup_plans failed: %s", exc)
+        return []
+
+
 def load_open_setup_plans_by_source(source: str) -> dict:
     """
     [2026-09-05, SG request — Momentum bucket] Same shape as

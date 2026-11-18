@@ -1197,6 +1197,16 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
             logger.exception("[live_scanner] cycle-level setup-plan persistence failed (non-fatal — "
                               "frozen trade levels retry next cycle)")
 
+        # [2026-11-18] Price-independent age sweep: close/expire any open setup plan past its
+        # window even if its symbol had no price data this cycle (orphan recovery skips those)
+        # or was hidden behind an older plan on the same symbol. See
+        # utils.setup_persistence.sweep_stale_setup_plans().
+        try:
+            from utils.setup_persistence import sweep_stale_setup_plans
+            sweep_stale_setup_plans()
+        except Exception:
+            logger.exception("[live_scanner] setup-plan age sweep failed (non-fatal)")
+
         # [2026-09-07, bug found from production logs] Momentum (MOM)
         # persistence — added here for the same reason
         # _enrich_with_setup_persistence() runs at this cycle level and

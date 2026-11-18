@@ -756,6 +756,94 @@ def advance_lifecycle(
     return changed_any, last_reason
 
 
+# ══════════════════════════════════════════════════════════════════
+#  AGE SWEEP — price-independent max-holding enforcement
+# ══════════════════════════════════════════════════════════════════
+# [2026-11-18, SG question: "why does the scanner table hold plans beyond 20 days?"]
+# The max-holding / entry-expiry check lives inside _advance_lifecycle_step(), which only runs
+# when a plan is visited WITH price data: either its symbol is in the scan, or the orphan
+# recovery pass (scanner_engine._enrich_with_setup_persistence) finds history for it. That pass
+# does `continue` when no bars can be fetched (delisted / renamed / data outage), and
+# load_open_setup_plans() returns only ONE plan per symbol (oldest wins), so a second open plan
+# on the same symbol is never visited either. Either way an open plan could sit past its window
+# indefinitely, even though the age test needs only dates.
+#
+# This sweep applies exactly the age-out branches of the state machine, to EVERY open plan,
+# without needing a price. It deliberately does not evaluate SL/T1 (no price) and never touches a
+# plan inside its window, so normal lifecycle behaviour is unchanged; it only closes what the
+# state machine would itself have closed on its next price-bearing visit.
+
+def plan_age_days(plan: "SetupPlan", today: "date | None" = None) -> "int | None":
+    """Calendar age in days, from first_actionable_date -- or, if that is blank on an old/legacy
+    row, created_at, then activated_at. None when no usable date exists (such a plan is skipped,
+    never closed on a guess)."""
+    today = today or date.today()
+    for raw in (plan.first_actionable_date, plan.created_at, plan.activated_at):
+        try:
+            return (today - date.fromisoformat(str(raw)[:10])).days
+        except Exception:
+            continue
+    return None
+
+
+def age_out_stale_plan(plan: "SetupPlan", today_str: "str | None" = None) -> "tuple[bool, str]":
+    """Close/expire `plan` if it is OPEN and older than its source's window. Same transitions
+    and wording as _advance_lifecycle_step()'s age branches (so outcome mapping is identical:
+    "Auto-closed" -> TIMEOUT, WAITING -> EXPIRED), tagged '[age sweep]' for auditability.
+    Returns (changed, reason)."""
+    if not plan.is_open():
+        return False, ""
+    today_str = today_str or date.today().isoformat()
+    days = plan_age_days(plan, date.fromisoformat(today_str))
+    if days is None or days <= _max_setup_age_days(plan.source):
+        return False, ""
+    s = _sval(plan.status)
+    if s == SetupPlanStatus.WAITING:
+        reason = f"Expired after {days}d \u2014 entry never triggered [age sweep]"
+        plan.status = SetupPlanStatus.EXPIRED
+    elif s == SetupPlanStatus.T1_HIT:
+        reason = f"Auto-closed after {days}d \u2014 max holding period reached (T2/SL not hit on remainder) [age sweep]"
+        plan.status = SetupPlanStatus.CLOSED
+    else:  # ACTIVE
+        reason = f"Auto-closed after {days}d \u2014 max holding period reached (SL/T1 not hit) [age sweep]"
+        plan.status = SetupPlanStatus.CLOSED
+    plan.status_reason = reason
+    plan.closed_at = today_str
+    plan.days_active = days
+    _record_live_scanner_final_outcome(plan, reason)
+    return True, reason
+
+
+def sweep_aged_out_plans(plans, today_str: "str | None" = None) -> list:
+    """Apply age_out_stale_plan() to every plan in `plans`; return the ones that changed
+    (mutated in place) for the caller to persist."""
+    changed = []
+    for plan in plans or []:
+        try:
+            if age_out_stale_plan(plan, today_str)[0]:
+                changed.append(plan)
+        except Exception:
+            logger.exception("[setup_persistence] age sweep failed for %s", getattr(plan, "setup_id", "?"))
+    return changed
+
+
+def sweep_stale_setup_plans() -> int:
+    """Worker entry point: load EVERY open plan (not symbol-keyed), age out the overdue ones,
+    persist them, return how many were closed/expired. Non-fatal by design: returns 0 on any
+    failure so a DB hiccup can never break the scan cycle."""
+    try:
+        from utils.supabase_client import load_all_open_setup_plans, upsert_setup_plans_batch
+        changed = sweep_aged_out_plans(load_all_open_setup_plans())
+        if changed:
+            upsert_setup_plans_batch([p.to_db_dict() for p in changed])
+            logger.info("[SETUP AGE SWEEP] closed/expired %d overdue plan(s): %s", len(changed),
+                        ", ".join(f"{p.symbol}({p.source})" for p in changed))
+        return len(changed)
+    except Exception:
+        logger.exception("[SETUP AGE SWEEP] failed (non-fatal)")
+        return 0
+
+
 # [2026-08-10, DORE_LIVE_SCANNER_AUDIT P0 #3] Best-effort mapping from
 # _advance_lifecycle_step()'s free-text `reason` onto the audit's fixed
 # outcome vocabulary (T1_HIT/T2_HIT/SL_HIT/TIMEOUT/MANUAL_EXIT/EXPIRED).
