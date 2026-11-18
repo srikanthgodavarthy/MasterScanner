@@ -79,6 +79,7 @@ surfaced while the position is profitable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
@@ -161,6 +162,28 @@ class ExitIntelligenceConfig:
     # Thesis-check pass bar, as a fraction of each pillar's max
     thesis_pass_fraction: float = 0.6
 
+    # [2026-11-18 exit-criteria review] ── findings 1, 2 and 4 ──
+    # (1) STRUCTURE-BREAK CONFIRMATION. The hard EXIT override used to fire on a single
+    #     close at/below EMA20 once the latest swing low was lower than the one before
+    #     (12.9% of days in a simulated healthy uptrend; one -2.5% pullback day gave
+    #     REDUCE/EXIT 34% of the time). It now needs this many consecutive closes at/below
+    #     EMA20. 1 restores the old single-close behaviour.
+    structure_break_confirm_closes: int = 2
+    # (2) COMPLETED BARS ONLY. yfinance returns today's still-forming daily bar during the
+    #     session; candle, volume and momentum pillars were reading a half-finished day
+    #     (a mild mid-session dip changed the recommendation in 30% of cases). When True,
+    #     an in-progress bar is excluded from scoring; its last price is still used for the
+    #     stop / P&L override so a live stop breach is never missed. Session is treated as
+    #     complete from `session_complete_ist` (HHMM, IST) on a trading weekday.
+    score_on_completed_bars: bool = True
+    session_complete_ist:    int  = 1545
+    # (4) A REAL bearish RSI divergence: price at a fresh `divergence_lookback`-bar high
+    #     while RSI is at least `divergence_rsi_gap` points below where it stood at the
+    #     previous high. (The old test -- price up and RSI down vs 5 bars ago -- is not a
+    #     divergence and fired on 11% of healthy readings for -8 points.)
+    divergence_lookback: int   = 10
+    divergence_rsi_gap:  float = 2.0
+
 
 DEFAULT_CONFIG = ExitIntelligenceConfig()
 
@@ -209,6 +232,10 @@ class ExitIntelligenceResult:
 
     suggested_stop: Optional[float] = None
     suggested_stop_note: str = ""
+
+    # True when today's still-forming bar was left out of the score (see
+    # ExitIntelligenceConfig.score_on_completed_bars); `price` is then the live last price.
+    incomplete_bar_dropped: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -327,6 +354,33 @@ def _classify_swing_sequence(df: pd.DataFrame, lookback: int) -> tuple[str, bool
     return "HIGHER_LOW", False
 
 
+def _now_ist() -> datetime:
+    """Naive IST wall-clock now (the app runs on UTC servers)."""
+    return (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).replace(tzinfo=None)
+
+
+def drop_incomplete_bar(df: pd.DataFrame, now: Optional[datetime] = None,
+                        session_complete_ist: int = 1545) -> tuple:
+    """(df_without_in_progress_bar, live_price_or_None).
+
+    A daily bar dated TODAY is still forming while it is a trading weekday and the IST
+    clock is before `session_complete_ist` (HHMM). That bar is dropped and its last price
+    returned so the caller can keep using it for stop/P&L checks. Anything else -- a bar
+    from a previous day, a weekend run, a post-close run -- is left untouched.
+    `now` is naive IST (injectable for tests)."""
+    if df is None or df.empty:
+        return df, None
+    now = now or _now_ist()
+    try:
+        last_day = pd.Timestamp(df.index[-1]).tz_localize(None).date() if pd.Timestamp(df.index[-1]).tzinfo else pd.Timestamp(df.index[-1]).date()
+    except Exception:
+        return df, None
+    hhmm = now.hour * 100 + now.minute
+    if last_day == now.date() and now.weekday() < 5 and hhmm < session_complete_ist:
+        return df.iloc[:-1], float(df["close"].iloc[-1])
+    return df, None
+
+
 # ══════════════════════════════════════════════════════════════════
 #  PILLAR 1 — TREND INTEGRITY (0-30)
 # ══════════════════════════════════════════════════════════════════
@@ -382,7 +436,13 @@ def _pillar_trend_integrity(df: pd.DataFrame, cfg: ExitIntelligenceConfig):
         notes.append(f"EMA{cfg.ema_fast_period} {'rising' if ema20_rising else 'flattening/falling'}")
 
     score = min(cfg.trend_integrity_max, structure_pts + ema20_pts + ema50_pts + slope_pts)
-    hard_break = structure_break and not above20
+    n_confirm = max(1, int(cfg.structure_break_confirm_closes))
+    closes_at_or_below = bool(len(close) >= n_confirm and (
+        close.iloc[-n_confirm:].values <= ema20.iloc[-n_confirm:].values).all())
+    hard_break = structure_break and closes_at_or_below
+    if structure_break and not hard_break and not above20:
+        notes.append(f"lower swing low, but only {n_confirm - 1} or fewer close(s) under EMA{cfg.ema_fast_period}"
+                     f" -- break needs {n_confirm} (not confirmed)")
 
     return score, hard_break, "; ".join(notes), ema20_rising, ema50_rising, swing_label
 
@@ -428,9 +488,16 @@ def _pillar_momentum_decay(df: pd.DataFrame, cfg: ExitIntelligenceConfig):
     if k_last < k_prev and k_prev >= 80:
         score -= 3
         notes.append(f"Stochastic rollover from overbought ({k_prev:.0f}\u2192{k_last:.0f})")
-    if price_last > price_prev and rsi_last < rsi_prev:
-        score -= 8
-        notes.append("bearish RSI divergence (price up, RSI down)")
+    L = max(2, int(cfg.divergence_lookback))
+    if len(close) > L + 1:
+        win = close.iloc[-(L + 1):-1]
+        if price_last >= float(win.max()):
+            pos = int(np.argmax(win.values))
+            rsi_at_prior_high = float(rsi.iloc[-(L + 1) + pos])
+            if rsi_last <= rsi_at_prior_high - cfg.divergence_rsi_gap:
+                score -= 8
+                notes.append(f"bearish RSI divergence (new {L}-bar high, RSI {rsi_last:.0f} vs "
+                             f"{rsi_at_prior_high:.0f} at the prior high)")
 
     score = float(np.clip(score, 0, cfg.momentum_decay_max))
     if not notes:
@@ -714,6 +781,7 @@ def compute_exit_strength(
     prior_recommendation: Optional[str] = None,
     prior_exit_strength_score: Optional[float] = None,
     cfg: ExitIntelligenceConfig = DEFAULT_CONFIG,
+    now: Optional[datetime] = None,
 ) -> ExitIntelligenceResult:
     """
     df must have columns: open, high, low, close, volume (daily bars,
@@ -723,6 +791,14 @@ def compute_exit_strength(
     arguments — this engine has no opinion on why the position was
     bought, only on what its own chart is doing now.
     """
+    live_price, bar_dropped = None, False
+    if cfg.score_on_completed_bars and df is not None and not df.empty:
+        trimmed, live_price = drop_incomplete_bar(df, now, cfg.session_complete_ist)
+        if live_price is not None and len(trimmed) >= max(cfg.structure_lookback_bars, 30):
+            df, bar_dropped = trimmed, True
+        else:
+            live_price = None          # too little history left: score the full frame as before
+
     if df is None or df.empty or len(df) < max(cfg.structure_lookback_bars, 30):
         return ExitIntelligenceResult(
             symbol=symbol, exit_strength_score=50.0, recommendation="CAUTION",
@@ -754,7 +830,8 @@ def compute_exit_strength(
 
     raw_ess = float(np.clip(sum(pillar_scores.values()), 0, 100))
 
-    price = float(df["close"].iloc[-1])
+    last_close = float(df["close"].iloc[-1])                 # last COMPLETED close: what the pillars saw
+    price = float(live_price) if live_price else last_close   # live price: stop / P&L / R only
     unrealized_pct = (price - entry_price) / entry_price * 100 if entry_price else 0.0
 
     days_held = 0
@@ -819,7 +896,7 @@ def compute_exit_strength(
     ema20_last = float(_ema(close, cfg.ema_fast_period).iloc[-1])
     ema50_last = float(_ema(close, cfg.ema_slow_period).iloc[-1])
     trend_health, trend_detail = _trend_health_badge(
-        ema20_rising, ema50_rising, price > ema20_last, price > ema50_last, hard_break, swing_label
+        ema20_rising, ema50_rising, last_close > ema20_last, last_close > ema50_last, hard_break, swing_label
     )
 
     thesis_intact, thesis_checks = _build_thesis(
@@ -872,4 +949,5 @@ def compute_exit_strength(
         display_factors=display_factors,
         suggested_stop=suggested_stop,
         suggested_stop_note=stop_note,
+        incomplete_bar_dropped=bar_dropped,
     )

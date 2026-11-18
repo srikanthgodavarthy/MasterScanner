@@ -2742,7 +2742,7 @@ def _exit_cfg_for_plans():
 def _plan_exit_status(symbol: str, entry_price: float, initial_stop: float,
                       entry_date: str, cfg_sig: str, category: str = "",
                       lm_score: float = -1.0, t1_price: float = 0.0,
-                      t1_hit: bool = False, _cfg=None) -> dict:
+                      t1_hit: bool = False, _cfg=None, prior_rec: str = "") -> dict:
     """Exit / ADD read for one open setup (cached 5 min per symbol/entry/stop/
     config/category/score/T1). cfg_sig keys the cache on the config; _cfg is the
     object itself (underscore = not hashed); lm_score < 0 means "not in today's
@@ -2757,6 +2757,7 @@ def _plan_exit_status(symbol: str, entry_price: float, initial_stop: float,
         symbol, entry_price, initial_stop, entry_date or None, df, _cfg,
         category=category or None, lm_score=(lm_score if lm_score >= 0 else None),
         t1_price=t1_price or None, t1_hit=t1_hit,
+        prior_recommendation=prior_rec or None,
     )
 
 
@@ -2771,15 +2772,25 @@ def _resolve_plan_exit(plan, live: dict | None = None) -> dict:
     cfg = _exit_cfg_for_plans()
     score = to_finite((live or {}).get("norm_score"))
     status = str(getattr(plan.status, "value", plan.status) or "").upper()
-    return _plan_exit_status(
+    # [2026-11-18 exit-criteria review] Remember the last engine tier shown for this position
+    # (this browser session) and feed it back so the engine's hysteresis dead zone applies --
+    # in a simulated healthy uptrend the pill flipped on 14.8% of days without it, 7.7% with it.
+    # Safety-override EXITs (stop / structure break) are never stored as the prior.
+    prior_store = st.session_state.setdefault("plan_exit_prior", {})
+    pkey = f"{plan.symbol}|{float(plan.entry_locked or 0):.4f}|{float(plan.sl_locked or 0):.4f}"
+    info = _plan_exit_status(
         str(plan.symbol), float(plan.entry_locked or 0), float(plan.sl_locked or 0),
         plan_entry_date(plan.activated_at, plan.created_at, plan.first_actionable_date) or "",
         repr(cfg),
         category=str(plan.locked_recommendation or plan.locked_category or ""),
         lm_score=round(score) if score is not None else -1.0,
         t1_price=float(plan.t1_locked or 0), t1_hit=(status == "T1_HIT"),
-        _cfg=cfg,
+        _cfg=cfg, prior_rec=prior_store.get(pkey, ""),
     )
+    rec = (info or {}).get("recommendation")
+    if rec and not info.get("overridden"):
+        prior_store[pkey] = rec
+    return info
 
 
 def _ap_num(v, fmt: str) -> str:

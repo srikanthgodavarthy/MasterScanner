@@ -64,7 +64,8 @@ def evaluate_exit(symbol: str, entry_price: float, initial_stop: "float | None",
                   entry_date: "str | None", df: "pd.DataFrame | None",
                   cfg: "ExitIntelligenceConfig | None" = None,
                   category: "str | None" = None, lm_score: "float | None" = None,
-                  t1_price: "float | None" = None, t1_hit: bool = False) -> dict:
+                  t1_price: "float | None" = None, t1_hit: bool = False,
+                  prior_recommendation: "str | None" = None) -> dict:
     """Exit read for one open setup.
 
     Returns {"action": "STRONG ADD"|"ADD"|"HOLD"|"REDUCE"|"EXIT"|None,
@@ -72,6 +73,12 @@ def evaluate_exit(symbol: str, entry_price: float, initial_stop: "float | None",
     "price"}. action is None (not HOLD) when the engine had too little data to
     judge — a confident "HOLD" on no evidence is exactly what this column must
     not show.
+
+    `prior_recommendation` (the engine tier last shown for this position, e.g.
+    "HEALTHY") switches on the engine's hysteresis dead zone so the pill doesn't
+    flip HOLD<->REDUCE on ordinary day-to-day noise. Catastrophic-stop and
+    structure-break EXITs always bypass it. The result carries `recommendation`
+    (engine tier) and `overridden` so the caller can store the right prior.
 
     ADD rule = Portfolio page's: suggest_add(category, unrealized %, result,
     lm_score, t1_hit). `category` is the tier the plan was frozen with,
@@ -90,6 +97,7 @@ def evaluate_exit(symbol: str, entry_price: float, initial_stop: "float | None",
         res = compute_exit_strength(
             symbol=symbol, df=df, entry_price=entry, entry_date=entry_date,
             initial_stop=stop, cfg=cfg or ExitIntelligenceConfig(),
+            prior_recommendation=prior_recommendation,
         )
     except Exception:
         return none
@@ -119,6 +127,9 @@ def evaluate_exit(symbol: str, entry_price: float, initial_stop: "float | None",
         "reason": reason or RECOMMENDATION_LABEL.get(res.recommendation, res.recommendation),
         "structure_break": bool(res.structure_break),
         "price": float(res.price),
+        "recommendation": getattr(res, "recommendation", None),
+        "overridden": bool(getattr(res, "structure_break", False) or getattr(res, "catastrophic_stop", False)),
+        "completed_bars_only": bool(getattr(res, "incomplete_bar_dropped", False)),
     }
 
 
