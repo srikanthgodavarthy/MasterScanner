@@ -213,7 +213,19 @@ def _min_confidence_to_track(dte: Optional[int], symbol: str = "", settings=DORE
     return track_floor(symbol, dte, settings)
 
 
-def _is_executable(symbol: str, dte: Optional[int], settings=DORE_OPTIONS_DEFAULTS) -> bool:
+def _in_rollover_window(symbol: str, expiry, settings=DORE_OPTIONS_DEFAULTS, today=None) -> bool:
+    """[2026-11-18, SG request] True when `symbol` is a single stock and `expiry` is inside the
+    no-fresh-buy window (settings.stock_expiry_rollover_sessions trading sessions or fewer to
+    expiry -- by default from the trading day before expiry). Index options are exempt; a blank
+    or unparseable expiry is never "in the window"."""
+    if not expiry or not symbol or is_index_symbol(symbol):
+        return False
+    from utils.nse_calendar import in_stock_rollover_window
+    return in_stock_rollover_window(expiry, int(getattr(settings, "stock_expiry_rollover_sessions", 1)), today)
+
+
+def _is_executable(symbol: str, dte: Optional[int], settings=DORE_OPTIONS_DEFAULTS,
+                   expiry=None, today=None) -> bool:
     """[2026-08-25, SG request] Tradability floor, separate from and
     checked alongside _min_confidence_to_track — a real broker
     restriction (single-stock options can't be freshly bought within
@@ -224,7 +236,14 @@ def _is_executable(symbol: str, dte: Optional[int], settings=DORE_OPTIONS_DEFAUL
     — cash-settled, no such restriction applies. dte=None (unknown)
     passes — same fail-open convention as _min_confidence_to_track's
     dte=None case, since we don't want a missing DTE read to silently
-    block otherwise-good candidates."""
+    block otherwise-good candidates.
+
+    [2026-11-18, SG request] When `expiry` is given, a single stock's contract inside the
+    trading-session rollover window (see _in_rollover_window) is also not executable -- this is
+    the session-accurate form of the same broker rule (the DTE floor above counts calendar days
+    with weekends in, so it would let a Friday through before a Monday expiry)."""
+    if _in_rollover_window(symbol, expiry, settings, today):
+        return False
     if dte is None or is_index_symbol(symbol):
         return True
     return dte >= getattr(settings, "min_dte_stock_options", 2)
@@ -1413,7 +1432,7 @@ def enrich_trade_plans_with_persistence(
                 # surfaced in the Live Scan (so the setup itself is
                 # visible for reference) but never minted into a
                 # trackable plan.
-                if not _is_executable(symbol, row.get("dte")):
+                if not _is_executable(symbol, row.get("dte"), expiry=row.get("expiry") or getattr(p, "expiry", None)):
                     enriched_rows.append(row)
                     continue
 
@@ -1587,6 +1606,20 @@ def enrich_trade_plans_with_persistence(
                         in_zone = False
                         row["blocked_reason"] = _late_reason
                         locked.activation_blocked_reason = _late_reason
+
+                # [2026-11-18, SG request] No entry on a stock-option contract inside the
+                # broker's no-buy window (from the trading day before expiry). A still-tracked
+                # plan on the old contract must not flip to ENTRY/ACTIVE -- that would be a buy
+                # signal the broker rejects. Never touches an already-entered plan (this block
+                # only runs for plans that haven't entered) or index options.
+                if in_zone and _in_rollover_window(locked.symbol, locked.expiry):
+                    in_zone = False
+                    _roll_reason = (
+                        "Stock option expires within the broker's no-buy window (from the trading day "
+                        "before expiry) — DORE now recommends the next-month contract instead"
+                    )
+                    row["blocked_reason"] = _roll_reason
+                    locked.activation_blocked_reason = _roll_reason
 
                 # ══════════════════════════════════════════════════
                 # [2026-08-12, PRE_BREAKOUT activation guard] Explicit
@@ -2002,6 +2035,18 @@ def enrich_trade_plans_with_persistence(
             plan.closed_reason_code = CLOSE_REASON_EXPIRY
             updated_plans.append(plan)
             _record_dore_final_outcome(plan)
+        elif not plan.is_active() and _in_rollover_window(plan.symbol, plan.expiry):
+            # [2026-11-18, SG request] A never-entered plan (TRACKED / WAITING / ENTRY) on a stock
+            # contract that has rolled into the broker's no-buy window can never be entered; retire
+            # it so only the next-month recommendation remains. Entered plans (ACTIVE / T1_HIT)
+            # are NOT touched -- they keep their exits. STALE_NO_ENTRY and NO outcome record:
+            # it never traded, so it must not count as a non-win.
+            plan.status = DoreOptionsPlanStatus.CLOSED
+            plan.closed_at = _now_iso()
+            plan.closed_reason = ("Rolled — nearest expiry entered the broker's no-buy window "
+                                  "(from the trading day before expiry); next-month contract recommended instead")
+            plan.closed_reason_code = CLOSE_REASON_STALE_NO_ENTRY
+            updated_plans.append(plan)
         elif _is_stale_by_age(_lifecycle_age_start(plan)[0], today):
             # [Timeout fix, 2026-08-12] Same entry_triggered_at-anchored
             # clock as the in-loop ACTIVE age-out above — a plan that

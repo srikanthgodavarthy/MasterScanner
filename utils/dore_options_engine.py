@@ -367,6 +367,16 @@ class DoreOptionsSettings:
     # ages into the blackout window is left alone, not force-closed.
     min_dte_stock_options: int = 2
 
+    # [2026-11-18, SG request] ROLL TO NEXT MONTH inside the no-buy window. The floor above only
+    # blocks a symbol; this makes DORE recommend the NEXT monthly contract instead. A stock
+    # option's nearest expiry is skipped once this many TRADING SESSIONS or fewer remain until
+    # it (utils.nse_calendar.in_stock_rollover_window): 1 = from the trading day before expiry
+    # (expiry Friday -> Thursday onward uses next month; expiry Monday -> the Friday before).
+    # Counts sessions, so weekends and exchange holidays are handled. Index options are exempt.
+    # Also blocks ENTRY/ACTIVE promotion of a still-tracked plan on the old contract and retires
+    # never-entered plans stuck on it. Entered (ACTIVE / T1_HIT) plans are left alone.
+    stock_expiry_rollover_sessions: int = 1
+
     # ── Stage 6: Premium Validation ─────────────────────────────
     premium_atr_min_mult: float = 0.05      # premium too low relative to ATR (floor check)
     # [Fix, 2026-09-09, SG report — index PE plans vanishing on a falling

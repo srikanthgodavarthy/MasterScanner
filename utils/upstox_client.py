@@ -2462,11 +2462,30 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
              & (df[name_col].astype(str).str.strip().str.upper() == underlying_name)] if (type_col and name_col) else pd.DataFrame()
     if opt.empty or expiry_col is None:
         return None
-    today_str = date.today().isoformat()
+    from utils.nse_calendar import in_stock_rollover_window, ist_today
+    today_ist = ist_today()
+    today_str = today_ist.isoformat()
     expiries = sorted({e for e in opt[expiry_col].astype(str) if e >= today_str})
     if not expiries:
         return None
-    # [2026-08-25] Roll past 0-DTE (today's own expiry) for single-stock
+    # [2026-11-18, SG request] Roll to the NEXT MONTH from one trading day before expiry: the
+    # broker won't allow a fresh buy on a stock option that close to expiry, so a recommendation
+    # on it can never be acted on. Replaces the old rule below (skip only expiry day itself, and
+    # only via date.today(), the server's date rather than IST). If no later expiry is listed,
+    # the symbol has no recommendable contract -> None, never the un-buyable one.
+    # See DoreOptionsSettings.stock_expiry_rollover_sessions.
+    try:
+        from utils.dore_options_engine import DORE_OPTIONS_DEFAULTS
+        _window = int(getattr(DORE_OPTIONS_DEFAULTS, "stock_expiry_rollover_sessions", 1))
+    except Exception:
+        _window = 1
+    tradable = [e for e in expiries if not in_stock_rollover_window(e, _window, today_ist)]
+    if not tradable:
+        logger.info("fetch_stock_atm_option: %s has no stock expiry outside the T-%d no-buy window "
+                    "(nearest %s) — skipping", symbol, _window, expiries[0])
+        return None
+    expiry = tradable[0]
+    # [2026-08-25, superseded by the rollover above] Roll past 0-DTE (today's own expiry) for single-stock
     # options. Unlike the index path (fetch_nearest_expiry/fetch_next_
     # expiry + stage5b's CURRENT_WEEK/NEXT_WEEK gate in dore_engine.py),
     # stocks were never given an equivalent rollover — dore_engine.py:592
@@ -2481,11 +2500,6 @@ def fetch_stock_atm_option(symbol: str) -> Optional[dict]:
     # positions same day, so there's no reason to source a NEW entry
     # from an expiry that would need to be closed within hours anyway —
     # skip straight to the next available OPTSTK expiry instead.
-    if len(expiries) > 1 and expiries[0] == today_str:
-        expiry = expiries[1]
-    else:
-        expiry = expiries[0]
-
     chain = _get_option_chain_with_retry(instrument_key, expiry)
     if not chain:
         return None

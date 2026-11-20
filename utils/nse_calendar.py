@@ -107,6 +107,37 @@ def days_to_expiry(expiry) -> int:
         return calendar_days_to_expiry(expiry)
 
 
+# ── Stock-option rollover window ──────────────────────────────────────
+# [2026-11-18, SG request] Single-stock options can't be freshly bought on SG's broker from one
+# trading day before expiry. "One day prior" must mean one TRADING session -- a Monday expiry's
+# T-1 is the previous Friday, and an exchange holiday before expiry pulls it earlier -- so this
+# counts sessions, not calendar days (the DTE helpers above keep weekends in on purpose).
+
+def trading_sessions_to_expiry(expiry, today: Optional[date] = None) -> int:
+    """Exchange sessions d with today < d <= expiry (the expiry session itself counts). 0 once
+    expiry is today or past, or if `expiry` is blank/unparseable. Thursday before a Friday
+    expiry -> 1; Wednesday -> 2; Friday before a Monday expiry -> 1."""
+    if not expiry:
+        return 0
+    try:
+        return trading_days_between(today or ist_today(), _to_date(expiry))
+    except Exception:
+        return 0
+
+
+def in_stock_rollover_window(expiry, window_sessions: int = 1, today: Optional[date] = None) -> bool:
+    """True when a stock-option contract is inside the no-fresh-buy window: `window_sessions`
+    trading sessions (default 1 = the trading day before expiry, and expiry day) or fewer remain.
+    A blank/unparseable expiry is NOT in the window (fail-open, like the other expiry gates)."""
+    if not expiry:
+        return False
+    try:
+        _to_date(expiry)
+    except Exception:
+        return False
+    return trading_sessions_to_expiry(expiry, today) <= max(int(window_sessions), 0)
+
+
 # ── Expiry-aware time (fractional) ────────────────────────────────────
 NSE_EXPIRY_TIME_IST = (15, 30)   # derivatives expire at the 15:30 IST close
 
