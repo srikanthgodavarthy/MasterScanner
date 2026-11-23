@@ -729,6 +729,24 @@ class DoreOptionsPlan:
     # [2026-10-28 review] The stock price the expected move points to in the
     # plan's direction (spot +/- expected_move_at_mint), frozen at mint.
     expected_price_at_mint:             Optional[float] = None
+    # [2026-11-20, SG request] SHADOW PATH of a plan that has NOT entered. ~65% of plans never
+    # enter (95% of those "no longer reproduced by Stage 1"), and nothing recorded whether those
+    # ideas would have won or lost, so "are we missing winners or dodging losers?" was
+    # unanswerable. mint_* freeze the premium and the stop / T1 / T2 levels at mint; while the
+    # plan is pre-entry, pre_entry_hi / pre_entry_lo are the highest / lowest live premium seen
+    # (live quotes keep arriving even after Stage 1 stops reproducing the contract), and
+    # shadow_*_at is the FIRST time the premium touched each level -- so the order is known.
+    # Observation only: nothing reads these to decide anything. None / "" for plans minted
+    # before this existed and for index plans with no live premium.
+    mint_premium:                       Optional[float] = None
+    mint_sl:                            Optional[float] = None
+    mint_t1:                            Optional[float] = None
+    mint_t2:                            Optional[float] = None
+    pre_entry_hi:                       Optional[float] = None
+    pre_entry_lo:                       Optional[float] = None
+    shadow_sl_at:                       str = ""
+    shadow_t1_at:                       str = ""
+    shadow_t2_at:                       str = ""
 
     @property
     def contract_key(self) -> str:
@@ -854,6 +872,15 @@ class DoreOptionsPlan:
             "greeks_reliable_at_mint":       self.greeks_reliable_at_mint,
             "greeks_theta_verified_at_mint": self.greeks_theta_verified_at_mint,
             "expected_price_at_mint":        self.expected_price_at_mint,
+            "mint_premium":                  self.mint_premium,
+            "mint_sl":                       self.mint_sl,
+            "mint_t1":                       self.mint_t1,
+            "mint_t2":                       self.mint_t2,
+            "pre_entry_hi":                  self.pre_entry_hi,
+            "pre_entry_lo":                  self.pre_entry_lo,
+            "shadow_sl_at":                  self.shadow_sl_at or "",
+            "shadow_t1_at":                  self.shadow_t1_at or "",
+            "shadow_t2_at":                  self.shadow_t2_at or "",
         }
 
 
@@ -1025,6 +1052,52 @@ def _update_mfe_mae(locked: "DoreOptionsPlan", current_premium: Optional[float])
     except Exception:
         logger.exception("[dore_options_persistence] _update_mfe_mae failed for %s — left untouched this cycle",
                           getattr(locked, "plan_id", "?"))
+
+
+def _positive_float(v) -> Optional[float]:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if (f == f and f > 0 and f != float("inf")) else None
+
+
+def _mint_shadow_fields(p, row: dict, current_premium) -> dict:
+    """mint_* kwargs for a freshly minted plan: the premium this cycle (live quote, else the plan's
+    own primary premium) and the stop / targets of this cycle's technical plan."""
+    return {
+        "mint_premium": _positive_float(current_premium) or _positive_float((row or {}).get("premium")),
+        "mint_sl": _positive_float(getattr(p, "stop_loss", None)),
+        "mint_t1": _positive_float(getattr(p, "target1", None)),
+        "mint_t2": _positive_float(getattr(p, "target2", None)),
+    }
+
+
+def _track_pre_entry_path(locked: "DoreOptionsPlan", current_premium: Optional[float]) -> None:
+    """[2026-11-20] Shadow path for a plan that has not entered: running high / low of the live
+    premium and the first time it touched the mint stop / T1 / T2. In place, no-op once the plan
+    has entered (the real MFE/MAE take over), when there is no mint baseline (a plan minted before
+    this instrumentation) or when this cycle has no usable premium. Never raises."""
+    try:
+        if locked.entry_locked or locked.is_active() or locked.mint_premium is None:
+            return
+        px = _positive_float(current_premium)
+        if px is None:
+            return
+        if locked.pre_entry_hi is None or px > locked.pre_entry_hi:
+            locked.pre_entry_hi = px
+        if locked.pre_entry_lo is None or px < locked.pre_entry_lo:
+            locked.pre_entry_lo = px
+        now = _now_iso()
+        if not locked.shadow_sl_at and locked.mint_sl is not None and px <= locked.mint_sl:
+            locked.shadow_sl_at = now
+        if not locked.shadow_t1_at and locked.mint_t1 is not None and px >= locked.mint_t1:
+            locked.shadow_t1_at = now
+        if not locked.shadow_t2_at and locked.mint_t2 is not None and px >= locked.mint_t2:
+            locked.shadow_t2_at = now
+    except Exception:
+        logger.exception("[dore_options_persistence] _track_pre_entry_path failed for %s -- left untouched",
+                         getattr(locked, "plan_id", "?"))
 
 
 def _plan_status_label(days_active: int, created_date: str, just_minted: bool, created_at: str = "") -> str:
@@ -1542,6 +1615,7 @@ def enrich_trade_plans_with_persistence(
                         (r for r in (row.get("reasons") or []) if "CONFLICTS" in str(r)), ""
                     ),
                     pcr_at_mint=row.get("pcr"),
+                    **_mint_shadow_fields(p, row, current_premium),
                 )
                 just_minted = True
                 open_now[key] = locked
@@ -1937,6 +2011,7 @@ def enrich_trade_plans_with_persistence(
             # actually produced one; keep the prior value otherwise.
             if current_premium is not None:
                 locked.last_premium = current_premium
+            _track_pre_entry_path(locked, current_premium)     # [2026-11-20] no-op once entered
             locked.last_seen_at = _now_iso()
             updated_plans.append(locked)
 

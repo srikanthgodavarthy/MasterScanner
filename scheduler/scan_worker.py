@@ -1155,6 +1155,10 @@ def _run_live_scanner_loop(interval_secs: int = LIVE_SCANNER_INTERVAL_SECS,
                                         "no scan_id (Supabase unavailable?)")
                     logger.info("[live_scanner] DORE Technical Engine: %d plan(s) produced after "
                                 "F&O batch %d/%d", len(technical_plans), batch_i + 1, n_batches)
+                    # [2026-11-20] Which gates bind: one row per distinct (day, stage, reason,
+                    # symbol). Observation only; swallows its own errors.
+                    from utils.dore_gate_stats import record_gate_rejections
+                    record_gate_rejections(dore_result.get("rejections"))
                 except Exception:
                     logger.exception("[live_scanner] DORE Technical Engine failed this cycle "
                                       "(non-fatal — dore_live_state keeps refreshing against last "

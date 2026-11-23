@@ -671,6 +671,14 @@ def top_dore_trade_plans(
     # did against the option-chain snapshot fetched above.
     df = pd.DataFrame([p.to_dict() for p in ranked])
     df.attrs["dore_rejections"] = [r.__dict__ for r in rejections]
+    # [2026-11-20] Funnel counts for this cycle (observation only): how many symbols reached the
+    # option-chain stage, how many were hard-rejected, how many became a technical plan.
+    df.attrs["dore_funnel"] = {
+        "pool": len(live_pool) if live_pool is not None else None,
+        "chain_candidates": len(stock_symbols) + len(index_symbols),
+        "rejected": len(rejections),
+        "plans": len(ranked),
+    }
     return df
 
 
@@ -915,6 +923,7 @@ def compute_dore_technical_plans(cfg: Optional[DoreOptionsSettings] = None,
         "rejections": rejections,
         "diagnostics": {
             "universe_size": len(live_pool), "plans_produced": len(df),
+            "funnel": df.attrs.get("dore_funnel", {}),
             "open_plan_symbols_missing_this_cycle": sorted(missing) if missing else [],
         },
     }
