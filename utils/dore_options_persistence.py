@@ -255,7 +255,16 @@ def _is_executable(symbol: str, dte: Optional[int], settings=DORE_OPTIONS_DEFAUL
 # MATERIALLY_BETTER_MARGIN over that plan's confidence_at_entry. This is
 # what keeps the book from growing without bound and concentrates
 # capital in the strongest live ideas instead.
-MAX_ACTIVE_DORE_OPTIONS_PLANS = 10
+#
+# [2026-11-26, SG request] NO CAP by default. With 10 active plans and a +15 confidence bar to
+# replace the weakest, the book was full of stock plans at 64-69 (minted at >= 65) and a plan
+# would have needed ~80 to get in, so NIFTY / BANKNIFTY (confidence 58 / 66, index tracking floor
+# 50) sat IN_ENTRY_ZONE blocked with "Portfolio full" while meeting every entry condition. None =
+# unlimited: every plan whose entry triggers becomes ACTIVE and nothing is retired to make room.
+# Set an int (it was 10) to restore the cap AND the retire-the-weakest behaviour. Same-contract
+# duplicate suppression (_blocking_open_plan / MATERIALLY_BETTER_MARGIN) is separate, unchanged.
+# Note this lifts the only limit on simultaneous open option positions.
+MAX_ACTIVE_DORE_OPTIONS_PLANS: Optional[int] = None
 
 # Minimum confidence_score edge a new candidate must clear over an
 # existing OPEN plan's confidence_at_entry before it's allowed to
@@ -1724,7 +1733,8 @@ def enrich_trade_plans_with_persistence(
                         "before entry is allowed"
                     )
 
-                if in_zone and _count_active(open_now) >= MAX_ACTIVE_DORE_OPTIONS_PLANS:
+                _cap = MAX_ACTIVE_DORE_OPTIONS_PLANS
+                if in_zone and _cap is not None and _count_active(open_now) >= _cap:
                     # [2026-10-28 review] Capacity is checked where the slot is
                     # actually taken -- the ACTIVE transition -- not when a
                     # candidate is merely minted TRACKED. Before, a TRACKED
@@ -1746,7 +1756,7 @@ def enrich_trade_plans_with_persistence(
                         _record_dore_final_outcome(weakest_plan)
                     else:
                         in_zone = False
-                        _full = (f"Portfolio full ({MAX_ACTIVE_DORE_OPTIONS_PLANS} active) — "
+                        _full = (f"Portfolio full ({_cap} active) — "
                                  f"no materially weaker plan to replace")
                         row["blocked_reason"] = _full
                         locked.activation_blocked_reason = _full

@@ -122,6 +122,17 @@ def test_days_active_uses_the_ist_date(monkeypatch):
 
 
 # ── Portfolio cap enforced at activation ─────────────────────────
+# [2026-11-26] The cap is OFF by default now (MAX_ACTIVE_DORE_OPTIONS_PLANS = None). These tests
+# exercise the cap itself, so they switch it back on to the old value with the `capped` fixture;
+# the no-cap default has its own tests at the end of this section.
+CAP = 10
+
+
+@pytest.fixture
+def capped(monkeypatch):
+    monkeypatch.setattr(per, "MAX_ACTIVE_DORE_OPTIONS_PLANS", CAP)
+
+
 @pytest.fixture
 def clock_open(monkeypatch):
     """Pin the late-entry gate open so activation is reachable at any hour."""
@@ -154,16 +165,16 @@ def _candidate(conf):
                                        "premium_change_pct": None})
 
 
-def test_under_the_cap_the_candidate_activates_without_retiring_anything(clock_open):
-    held = _held(per.MAX_ACTIVE_DORE_OPTIONS_PLANS - 1, 80.0)
+def test_under_the_cap_the_candidate_activates_without_retiring_anything(clock_open, capped):
+    held = _held(CAP - 1, 80.0)
     _, upd = enrich_trade_plans_with_persistence([_candidate(88.0)], existing_plans=held)
     new = [p for p in upd if p.symbol == "TESTCO"][0]
     assert new.status == S.ACTIVE
     assert not clock_open and all(p.status == S.ACTIVE for p in held.values())
 
 
-def test_full_book_and_not_materially_better_blocks_activation_not_minting(clock_open):
-    held = _held(per.MAX_ACTIVE_DORE_OPTIONS_PLANS, 80.0)       # 88.0 < 80 + margin
+def test_full_book_and_not_materially_better_blocks_activation_not_minting(clock_open, capped):
+    held = _held(CAP, 80.0)       # 88.0 < 80 + margin
     assert 88.0 < 80.0 + per.MATERIALLY_BETTER_MARGIN
     _, upd = enrich_trade_plans_with_persistence([_candidate(88.0)], existing_plans=held)
     new = [p for p in upd if p.symbol == "TESTCO"][0]
@@ -172,8 +183,8 @@ def test_full_book_and_not_materially_better_blocks_activation_not_minting(clock
     assert not clock_open and all(p.status == S.ACTIVE for p in held.values())   # nobody evicted
 
 
-def test_full_book_and_materially_better_retires_the_weakest_at_activation(clock_open):
-    held = _held(per.MAX_ACTIVE_DORE_OPTIONS_PLANS, 60.0)
+def test_full_book_and_materially_better_retires_the_weakest_at_activation(clock_open, capped):
+    held = _held(CAP, 60.0)
     held["HELD3|CE|103.0|" + next(iter(held.values())).expiry].confidence_at_entry = 40.0   # clear weakest
     _, upd = enrich_trade_plans_with_persistence([_candidate(88.0)], existing_plans=held)
     new = [p for p in upd if p.symbol == "TESTCO"][0]
@@ -184,17 +195,37 @@ def test_full_book_and_materially_better_retires_the_weakest_at_activation(clock
     assert clock_open == retired
 
 
-def test_minting_a_tracked_candidate_never_evicts_while_activation_is_blocked(monkeypatch):
+def test_minting_a_tracked_candidate_never_evicts_while_activation_is_blocked(monkeypatch, capped):
     """Previously the cap check ran at MINT: a candidate that might never
     activate could retire a live, entered trade."""
     monkeypatch.setattr(per, "_late_entry_blocked", lambda now=None: (True, "pinned closed"))
     spy = []
     monkeypatch.setattr(per, "_record_dore_final_outcome", lambda p: spy.append(p))
-    held = _held(per.MAX_ACTIVE_DORE_OPTIONS_PLANS, 40.0)       # weak enough to be evicted at mint
+    held = _held(CAP, 40.0)       # weak enough to be evicted at mint
     _, upd = enrich_trade_plans_with_persistence([_candidate(95.0)], existing_plans=held)
     new = [p for p in upd if p.symbol == "TESTCO"][0]
     assert new.is_open() and new.status != S.ACTIVE
     assert not spy and all(p.status == S.ACTIVE for p in held.values())
+
+
+def test_default_has_no_cap_so_every_triggered_plan_enters_and_nobody_is_retired(clock_open):
+    """The case behind the change: a full-looking book (12 entered plans at 64.5) no longer stops a
+    66-confidence plan (BANKNIFTY's value) that meets every entry condition. (The harness symbol is
+    a stock, whose tracking floor is 65, so 58.3 would not even mint here.)"""
+    assert per.MAX_ACTIVE_DORE_OPTIONS_PLANS is None
+    held = _held(12, 64.5)
+    _, upd = enrich_trade_plans_with_persistence([_candidate(66.2)], existing_plans=held)
+    new = [p for p in upd if p.symbol == "TESTCO"][0]
+    assert new.status == S.ACTIVE and not (new.activation_blocked_reason or "")
+    assert not clock_open and all(p.status == S.ACTIVE for p in held.values())      # nothing retired
+    assert per._count_active({**held, new.contract_key: new}) == 13
+
+
+def test_the_cap_can_still_be_switched_back_on(clock_open, capped):
+    held = _held(CAP, 64.5)
+    _, upd = enrich_trade_plans_with_persistence([_candidate(66.2)], existing_plans=held)
+    new = [p for p in upd if p.symbol == "TESTCO"][0]
+    assert new.status != S.ACTIVE and "Portfolio full (10 active)" in (new.activation_blocked_reason or "")
 
 
 # ── Active Plans formatters ──────────────────────────────────────
