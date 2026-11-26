@@ -149,7 +149,15 @@ def _build_index_scan_rows(settings: Optional[dict] = None) -> dict:
                 logger.warning("[dore_options_scan] index scan rows: %s OHLCV fetch "
                                 "returned empty — skipping this cycle", idx)
                 continue
-            row = score_stock(df, nifty_series, settings=settings, symbol=idx)
+            # [2026-11-25] bypass_prescreen=True: score_stock()'s leadership prescreen exists to
+            # save compute across ~500 stocks by dropping weak relative-strength laggards. It must
+            # not gate three indices: a SENSEX/BANKNIFTY that lags Nifty AND is falling (RS
+            # composite <= -2% with EMA20 < EMA50) was rejected here -- and the early-momentum
+            # override can't rescue it, since index feeds carry no volume -- so the row came back
+            # empty and DORE never saw the index, exactly when a PE idea is wanted. (NIFTY is
+            # scored against itself, RS = 0, so it always passed; this affected the other two.)
+            # The full score is still computed; direction comes from DORE's own EMA momentum.
+            row = score_stock(df, nifty_series, settings=settings, symbol=idx, bypass_prescreen=True)
             if not row:
                 logger.warning("[dore_options_scan] index scan rows: score_stock produced "
                                 "nothing for %s (likely <210 bars) — skipping this cycle", idx)
