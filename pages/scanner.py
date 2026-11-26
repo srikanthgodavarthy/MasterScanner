@@ -4550,6 +4550,25 @@ def _dore_sort_latest_entry(rows):
     return sorted(rows, key=_dore_entry_time_key)
 
 
+# [2026-11-26, SG request] The portfolio cap was removed, so the number of ACTIVE plans is no longer
+# bounded at 10. The main table keeps its size: it shows the 10 most recent entries and anything
+# beyond that goes into a collapsed "More active plans" panel (every open position stays visible).
+DORE_ACTIVE_TABLE_MAX_ROWS = 10
+
+
+def _dore_split_overflow(rows, limit=DORE_ACTIVE_TABLE_MAX_ROWS):
+    """(shown, overflow): the first `limit` rows (callers pass them newest-entry-first) and the
+    rest. A falsy / non-positive limit shows everything."""
+    rows = list(rows)
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        return rows, []
+    if n <= 0 or len(rows) <= n:
+        return rows, []
+    return rows[:n], rows[n:]
+
+
 def _dore_split_rows(rows):
     """(listed, pre_entry): `listed` are the rows the main Active Plans table shows
     (_dore_row_listed); `pre_entry` is every other OPEN plan (ENTRY, WAITING,
@@ -5276,9 +5295,15 @@ def _render_dore_options_active_plans_tab() -> None:
         # second) -- previously ordered by created date only, so plans entered the same day
         # were not ordered by when they actually triggered.
         rows = _dore_sort_latest_entry(rows)
+        # [2026-11-26] Table size stays at DORE_ACTIVE_TABLE_MAX_ROWS; the rest are in the
+        # "More active plans" panel below. The remove controls still see every plan.
+        shown_rows, overflow_rows = _dore_split_overflow(rows)
 
-        rows_df = pd.DataFrame(rows)
-        st.caption(f"{len(rows_df)} active (entry locked), latest entry first — independent of whether "
+        all_df = pd.DataFrame(rows)
+        rows_df = pd.DataFrame(shown_rows)
+        _more = (f" — showing the {len(shown_rows)} latest, {len(overflow_rows)} more in the panel below"
+                 if overflow_rows else "")
+        st.caption(f"{len(all_df)} active (entry locked), latest entry first{_more} — independent of whether "
                    "this cycle's live scan reproduced the contract. Auto-closes once the contract's "
                    "own expiry passes.")
 
@@ -5287,7 +5312,7 @@ def _render_dore_options_active_plans_tab() -> None:
         # plan_age_days == 0 means entry_triggered_at (or TRACKED mint, via
         # _lifecycle_age_start()) is today, everything else has been open
         # since an earlier session. Purely a display split of the SAME rows_df.
-        _render_dore_inactive_remove_controls(rows_df)
+        _render_dore_inactive_remove_controls(all_df)
         today_tab, prev_tab = st.tabs(["🆕 Today's Setups", "📅 Previous Days' Setups"])
         with today_tab:
             today_df = rows_df[rows_df["plan_age_days"] == 0]
@@ -5301,6 +5326,15 @@ def _render_dore_options_active_plans_tab() -> None:
                 st.caption("No DORE setups carried over from a previous day are currently open.")
             else:
                 st.markdown(_dore_options_active_plans_table_html(prev_df), unsafe_allow_html=True)
+        if overflow_rows:
+            try:
+                with st.expander(f"➕ More active plans ({len(overflow_rows)})", expanded=False):
+                    st.caption(f"Entered positions beyond the {DORE_ACTIVE_TABLE_MAX_ROWS} most recent entries "
+                               "shown above. Same stops, targets and 2-session limit apply.")
+                    st.markdown(_dore_options_active_plans_table_html(pd.DataFrame(overflow_rows)),
+                                unsafe_allow_html=True)
+            except Exception:
+                logger.exception("[scanner] DORE more-active-plans panel failed to render (non-fatal)")
 
     # Open plans hidden from the main table (WAITING / ENTRY without Blast / TRACKED).
     if pre_entry_rows:
