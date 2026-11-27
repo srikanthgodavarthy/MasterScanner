@@ -1257,9 +1257,67 @@ def _blocking_open_plan(symbol: str, direction: str, this_key: str,
         # WAITING_FOR_ENTRY / ENTRY_READY candidate is just being
         # monitored, so it no longer blocks a fresh mint the way an
         # entered trade does.
-        if plan.is_active() and not plan.is_t1_hit():
+        # [2026-11-26, SG request] A new strike on the same stock may only become active once the
+        # current one is CLOSED. The old "not yet T1" exception (2026-08-05: "new plan on the same
+        # symbol only after hitting T1") is gone: an entered plan blocks for as long as it is open.
+        if plan.is_active():
             return plan
     return None
+
+
+def _active_sibling(symbol: str, direction: str, this_key: str,
+                    open_plans: dict) -> Optional[DoreOptionsPlan]:
+    """[2026-11-26, SG request: one strike per stock] Another ENTERED plan (any strike or expiry)
+    on this (symbol, direction), or None. Used at ACTIVATION: while it is open, a second strike on
+    the same stock stays pre-entry. CE and PE on one stock are opposite bets and do not block each
+    other (same rule as _blocking_open_plan)."""
+    sym = symbol.upper().strip()
+    for key, plan in (open_plans or {}).items():
+        if key == this_key or plan.symbol.upper().strip() != sym or plan.direction != direction:
+            continue
+        if plan.is_open() and plan.is_active():
+            return plan
+    return None
+
+
+def _one_strike_per_stock(open_plans: dict, updated_plans: list, reproduced_keys=frozenset()) -> int:
+    """[2026-11-26, SG request: "multiple strikes on same stock need to be removed"] End-of-cycle
+    pass over the open plans. Per (symbol, direction):
+      * an ENTERED plan owns the stock -> every not-yet-entered strike is closed;
+      * otherwise only ONE not-yet-entered strike is kept: the one the scan reproduced this cycle,
+        else the most recently created -- the others are closed.
+    Entered plans are never touched (several can already exist from before this rule; they run to
+    their own exits and nothing new joins them). A closed plan is STALE_NO_ENTRY with a
+    "Superseded" reason and NO final-outcome record: it never traded, so it must not count as a
+    non-win (same as the stale / rolled / cleared closes). Returns how many were closed."""
+    groups: dict = {}
+    for key, plan in (open_plans or {}).items():
+        if plan.is_open():
+            groups.setdefault((plan.symbol.upper().strip(), plan.direction), []).append((key, plan))
+    closed = 0
+    for (sym, direction), plans in groups.items():
+        entered = [pl for _, pl in plans if pl.is_active()]
+        pre = [(k, pl) for k, pl in plans if not pl.is_active()]
+        if not pre or (not entered and len(pre) < 2):
+            continue
+        if entered:
+            owner = max(entered, key=lambda pl: pl.entry_triggered_at or pl.created_at or "")
+            keep_key, why = None, f"{sym} {direction} {owner.strike:g} is ACTIVE -- one strike per stock"
+        else:
+            keep_key, keep_plan = max(
+                pre, key=lambda kp: (kp[0] in reproduced_keys, kp[1].created_at or "", kp[1].plan_id))
+            why = f"newer {sym} {direction} {keep_plan.strike:g} strike recommended -- one strike per stock"
+        for key, plan in pre:
+            if key == keep_key:
+                continue
+            plan.status = DoreOptionsPlanStatus.CLOSED
+            plan.closed_at = _now_iso()
+            plan.closed_reason = f"Superseded -- {why}"
+            plan.closed_reason_code = CLOSE_REASON_STALE_NO_ENTRY
+            if all(u is not plan for u in updated_plans):
+                updated_plans.append(plan)
+            closed += 1
+    return closed
 
 
 def _find_weakest_open_plan(existing_plans: dict) -> Optional[tuple[str, DoreOptionsPlan]]:
@@ -1733,6 +1791,18 @@ def enrich_trade_plans_with_persistence(
                         "before entry is allowed"
                     )
 
+                # [2026-11-26, SG request] One strike per stock: while another strike on this
+                # (symbol, direction) is ENTERED, this one stays pre-entry -- it can enter only
+                # after that one closes. Checked at activation (not only at mint) because several
+                # strikes can already be pre-entry together, or reach their zone in the same cycle.
+                _other = _active_sibling(symbol, direction, key, open_now) if in_zone else None
+                if _other is not None:
+                    in_zone = False
+                    _why = (f"{symbol} {direction} {_other.strike:g} is already ACTIVE — "
+                            f"a new strike can enter only after it closes")
+                    row["blocked_reason"] = _why
+                    locked.activation_blocked_reason = _why
+
                 _cap = MAX_ACTIVE_DORE_OPTIONS_PLANS
                 if in_zone and _cap is not None and _count_active(open_now) >= _cap:
                     # [2026-10-28 review] Capacity is checked where the slot is
@@ -2143,6 +2213,13 @@ def enrich_trade_plans_with_persistence(
             plan.closed_reason_code = CLOSE_REASON_TIMEOUT
             updated_plans.append(plan)
             _record_dore_final_outcome(plan)
+
+    # [2026-11-26, SG request] One strike per stock -- see _one_strike_per_stock(). Last, so it
+    # sees this cycle's mints and activations. Fail-soft: it must never lose the cycle's rows.
+    try:
+        _one_strike_per_stock(open_now, updated_plans, seen_keys)
+    except Exception:
+        logger.exception("[dore_options_persistence] one-strike-per-stock pass failed (non-fatal)")
 
     return enriched_rows, updated_plans
 

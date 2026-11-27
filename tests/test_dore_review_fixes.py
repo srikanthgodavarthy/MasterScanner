@@ -300,3 +300,114 @@ def test_expected_price_round_trips_through_mint_db_and_row(direction, sign):
     back = sb._dore_options_plan_from_row(plan.to_db_dict())
     assert back.expected_price_at_mint == expect
     assert per.active_plan_rows({back.contract_key: back})[0]["expected_price_at_mint"] == expect
+
+
+# ── [2026-11-26, SG request] One strike per stock ────────────────────────────
+# "multiple strikes on same stock need to be removed .. the new strike should be active only
+#  [once the] current strike is closed".
+def _own(strike, status=S.ACTIVE, direction=None, symbol=None, t1=False, created_at=None, plan_id="own"):
+    d = tc._plan_dict()
+    today = per._today_str()
+    at = created_at or f"{today}T04:30:00+00:00"
+    p = DoreOptionsPlan(
+        plan_id=plan_id, symbol=symbol or d["symbol"], direction=direction or d["direction"], strike=strike,
+        expiry=d["expiry"], created_date=today, created_at=at,
+        entry_locked=2.0 if status == S.ACTIVE else None, sl_locked=1.0, target1_locked=3.0, target2_locked=4.0,
+        confidence_at_entry=70.0, entry_triggered_at=at if status == S.ACTIVE else "", entry_underlying=100.0,
+        status=status)
+    if t1:
+        p.t1_hit_at = at
+    return p
+
+
+def _cand_strike():
+    return tc._plan_dict()["primary"]["strike"]
+
+
+def test_new_strike_is_not_even_minted_while_the_current_one_is_entered(clock_open):
+    own = _own(_cand_strike() + 50)
+    _, upd = enrich_trade_plans_with_persistence([_candidate(80.0)], existing_plans={own.contract_key: own})
+    assert not any(p.strike == _cand_strike() for p in upd)
+    assert own.status == S.ACTIVE and not clock_open
+
+
+def test_the_old_not_yet_t1_exception_is_gone_an_entered_plan_blocks_until_it_closes(clock_open):
+    own = _own(_cand_strike() + 50, t1=True)               # T1 already hit: used to unblock a new strike
+    assert per._blocking_open_plan(own.symbol, own.direction, "other|key", {own.contract_key: own}) is own
+    _, upd = enrich_trade_plans_with_persistence([_candidate(80.0)], existing_plans={own.contract_key: own})
+    assert not any(p.strike == _cand_strike() for p in upd)
+    own.status = S.CLOSED                                    # once it is closed the stock is free again
+    assert per._blocking_open_plan(own.symbol, own.direction, "other|key", {own.contract_key: own}) is None
+    _, upd2 = enrich_trade_plans_with_persistence([_candidate(80.0)], existing_plans={own.contract_key: own})
+    assert any(p.strike == _cand_strike() and p.status == S.ACTIVE for p in upd2)
+
+
+def test_a_pre_entry_strike_cannot_activate_while_another_strike_is_entered(clock_open):
+    """The activation gate (several strikes can be pre-entry together, so the mint block is not
+    enough): the candidate's own plan exists and is in its zone, but another strike is ACTIVE."""
+    d = tc._plan_dict()
+    waiting = _own(d["primary"]["strike"], status=S.WAITING_FOR_ENTRY, plan_id="wait")
+    own = _own(d["primary"]["strike"] + 50)
+    existing = {waiting.contract_key: waiting, own.contract_key: own}
+    _, upd = enrich_trade_plans_with_persistence([_candidate(80.0)], existing_plans=existing)
+    assert waiting.status != S.ACTIVE and not waiting.entry_locked           # never entered
+    assert own.status == S.ACTIVE
+    assert waiting.status == S.CLOSED and waiting.closed_reason.startswith("Superseded")
+    assert "ACTIVE" in waiting.closed_reason and waiting.closed_reason_code == per.CLOSE_REASON_STALE_NO_ENTRY
+    assert waiting in upd and not clock_open                                  # persisted; no outcome recorded
+
+
+def test_two_pre_entry_strikes_keep_only_the_one_the_scan_recommends_now(monkeypatch, clock_open):
+    monkeypatch.setattr(per, "_late_entry_blocked", lambda now=None: (True, "late"))   # nobody can activate
+    d = tc._plan_dict()
+    old = _own(d["primary"]["strike"] + 50, status=S.WAITING_FOR_ENTRY, plan_id="old",
+               created_at=f"{per._today_str()}T03:00:00+00:00")
+    _, upd = enrich_trade_plans_with_persistence([_candidate(80.0)], existing_plans={old.contract_key: old})
+    new = [p for p in upd if p.strike == d["primary"]["strike"]]
+    assert len(new) == 1 and new[0].is_open() and new[0].status != S.ACTIVE
+    assert old.status == S.CLOSED and "newer" in old.closed_reason and "recommended" in old.closed_reason
+    assert old.closed_reason_code == per.CLOSE_REASON_STALE_NO_ENTRY and not clock_open
+
+
+def test_legacy_duplicates_are_cleaned_up_without_touching_entered_plans():
+    a, b = _own(150.0, plan_id="a"), _own(160.0, plan_id="b")                  # two ENTERED strikes already open
+    w1, w2 = _own(170.0, S.WAITING_FOR_ENTRY, plan_id="w1"), _own(180.0, S.ENTRY_READY, plan_id="w2")
+    plans = {p.contract_key: p for p in (a, b, w1, w2)}
+    upd = []
+    assert per._one_strike_per_stock(plans, upd) == 2
+    assert a.status == b.status == S.ACTIVE                                     # open positions run to their exits
+    assert w1.status == w2.status == S.CLOSED and {id(x) for x in upd} == {id(w1), id(w2)}
+
+
+def test_one_strike_pass_keeps_the_reproduced_strike_then_the_newest():
+    p1 = _own(150.0, S.WAITING_FOR_ENTRY, plan_id="p1", created_at="2026-11-26T03:00:00+00:00")
+    p2 = _own(160.0, S.WAITING_FOR_ENTRY, plan_id="p2", created_at="2026-11-26T05:00:00+00:00")
+    p3 = _own(170.0, S.WAITING_FOR_ENTRY, plan_id="p3", created_at="2026-11-26T04:00:00+00:00")
+    plans = {p.contract_key: p for p in (p1, p2, p3)}
+    assert per._one_strike_per_stock(plans, [], reproduced_keys={p1.contract_key}) == 2
+    assert p1.is_open() and p2.status == p3.status == S.CLOSED                  # reproduced beats newer
+    q1 = _own(150.0, S.WAITING_FOR_ENTRY, plan_id="q1", created_at="2026-11-26T03:00:00+00:00")
+    q2 = _own(160.0, S.WAITING_FOR_ENTRY, plan_id="q2", created_at="2026-11-26T05:00:00+00:00")
+    assert per._one_strike_per_stock({q1.contract_key: q1, q2.contract_key: q2}, []) == 1
+    assert q2.is_open() and q1.status == S.CLOSED                                # nothing reproduced: newest wins
+
+
+def test_one_strike_is_per_stock_and_direction_and_ignores_closed_plans():
+    ce_active = _own(150.0, plan_id="ce")
+    pe_wait = _own(140.0, S.WAITING_FOR_ENTRY, direction="PE", plan_id="pe")        # opposite bet: separate
+    other = _own(150.0, S.WAITING_FOR_ENTRY, symbol="OTHERCO", plan_id="oth")       # another stock
+    lone = _own(150.0, S.WAITING_FOR_ENTRY, symbol="LONELY", plan_id="lone")
+    gone = _own(160.0, S.WAITING_FOR_ENTRY, plan_id="gone"); gone.status = S.CLOSED
+    plans = {p.contract_key: p for p in (ce_active, pe_wait, other, lone, gone)}
+    assert per._one_strike_per_stock(plans, []) == 0
+    assert all(p.is_open() for p in (ce_active, pe_wait, other, lone))
+    assert per._active_sibling(ce_active.symbol, "PE", "x", plans) is None
+    assert per._active_sibling(ce_active.symbol, "CE", ce_active.contract_key, plans) is None   # not itself
+    assert per._active_sibling(ce_active.symbol, "CE", "x", plans) is ce_active
+
+
+def test_one_strike_pass_is_a_noop_for_empty_and_never_raises_inside_the_cycle(clock_open, monkeypatch):
+    assert per._one_strike_per_stock({}, []) == 0 and per._one_strike_per_stock(None, []) == 0
+    monkeypatch.setattr(per, "_one_strike_per_stock", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    rows, upd = enrich_trade_plans_with_persistence([_candidate(80.0)], existing_plans={})
+    assert any(p.symbol == "TESTCO" for p in upd)                                 # the cycle still completes
